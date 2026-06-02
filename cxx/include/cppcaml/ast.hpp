@@ -70,8 +70,16 @@ struct Ptyp_var { std::string name; };
 struct Ptyp_arrow { ArgLabel label; CoreTypeBox dom; CoreTypeBox cod; };
 struct Ptyp_tuple { std::vector<CoreTypeBox> elems; };
 struct Ptyp_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
+struct Rtag { std::string name; bool constant; std::vector<CoreTypeBox> types; };
+struct Rinherit { CoreTypeBox ct; };
+using RowField = std::variant<Rtag, Rinherit>;
+struct Ptyp_variant {
+  std::vector<RowField> rows;
+  ClosedFlag closed = ClosedFlag::Closed;
+  std::optional<std::vector<std::string>> labels;  // `[< … > l]` present tags
+};
 struct CoreType {
-  std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr> desc;
+  std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr, Ptyp_variant> desc;
   Location loc;
 };
 
@@ -90,9 +98,14 @@ struct Ppat_record {
   std::vector<std::pair<LongidentLoc, PatBox>> fields;
   ClosedFlag closed = ClosedFlag::Closed;
 };
+struct Ppat_lazy { PatBox p; };
+struct Ppat_interval { Constant c1; Constant c2; };
+struct Ppat_variant { std::string label; std::optional<PatBox> arg; };
+struct Ppat_exception { PatBox p; };
 struct Pattern {
   std::variant<Ppat_any, Ppat_var, Ppat_constant, Ppat_tuple, Ppat_construct,
-               Ppat_or, Ppat_alias, Ppat_constraint, Ppat_record>
+               Ppat_or, Ppat_alias, Ppat_constraint, Ppat_record, Ppat_lazy,
+               Ppat_interval, Ppat_variant, Ppat_exception>
       desc;
   Location loc;
 };
@@ -129,6 +142,8 @@ struct Pexp_record {
 enum class DirectionFlag { Upto, Downto };
 struct Pexp_assert { ExprBox e; };
 struct Pexp_lazy { ExprBox e; };
+struct Pexp_variant { std::string label; std::optional<ExprBox> arg; };
+struct Pexp_newtype { StringLoc name; ExprBox body; };  // fun (type a) -> e
 struct Pexp_while { ExprBox cond; ExprBox body; };
 struct Pexp_for { Pattern var; ExprBox lo; ExprBox hi; DirectionFlag dir; ExprBox body; };
 struct Pexp_array { std::vector<ExprBox> elems; };
@@ -137,7 +152,8 @@ struct Expression {
   std::variant<Pexp_ident, Pexp_constant, Pexp_apply, Pexp_let, Pexp_function,
                Pexp_tuple, Pexp_ifthenelse, Pexp_construct, Pexp_match, Pexp_try,
                Pexp_sequence, Pexp_constraint, Pexp_field, Pexp_record,
-               Pexp_assert, Pexp_lazy, Pexp_while, Pexp_for, Pexp_array>
+               Pexp_assert, Pexp_lazy, Pexp_while, Pexp_for, Pexp_array,
+               Pexp_variant, Pexp_newtype>
       desc;
   Location loc;
 };
@@ -151,7 +167,8 @@ struct ValueBinding {
 };
 
 struct Pparam_val { Location loc; ArgLabel label; std::optional<ExprBox> default_; Pattern pat; };
-struct FunctionParam { std::variant<Pparam_val> desc; };
+struct Pparam_newtype { StringLoc name; Location loc; };  // (type a)
+struct FunctionParam { std::variant<Pparam_val, Pparam_newtype> desc; };
 
 struct Pfunction_body { ExprBox e; };
 struct Pfunction_cases { std::vector<Case> cases; Location loc; };  // attrs empty
@@ -195,6 +212,12 @@ struct ExtensionConstructor {
   Location loc;
 };
 struct TypeException { ExtensionConstructor ctor; };  // attributes empty
+struct TypeExtension {
+  LongidentLoc path;
+  std::vector<CoreTypeBox> params;
+  std::vector<ExtensionConstructor> ctors;
+  PrivateFlag priv = PrivateFlag::Public;
+};
 
 // --- primitives (external) ---
 struct PrimitiveDescription {
@@ -221,11 +244,12 @@ struct Pstr_value { RecFlag rf; std::vector<ValueBinding> bindings; };
 struct Pstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Pstr_open { OverrideFlag ovr; ModuleExpr expr; };
 struct Pstr_exception { TypeException exn; };
+struct Pstr_typext { TypeExtension ext; };
 struct Pstr_primitive { PrimitiveDescription prim; };
 struct Pstr_module { ModuleBinding binding; };
 struct StructureItem {
   std::variant<Pstr_eval, Pstr_value, Pstr_type, Pstr_open, Pstr_exception,
-               Pstr_primitive, Pstr_module>
+               Pstr_typext, Pstr_primitive, Pstr_module>
       desc;
   Location loc;
 };

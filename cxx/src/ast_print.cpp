@@ -94,6 +94,28 @@ struct Printer {
       line(j, "Ptyp_constr " + lid_loc(v->id));
       if (v->args.empty()) line(j, "[]");
       else { line(j, "["); for (auto& a : v->args) core_type(j + 1, *a); line(j, "]"); }
+    } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
+      line(j, std::string("Ptyp_variant closed=") + closed_flag(v->closed));
+      if (v->rows.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& row : v->rows) {
+          if (auto* rt = std::get_if<Rtag>(&row)) {
+            line(j + 1, "Rtag \"" + rt->name + "\" " + (rt->constant ? "true" : "false"));
+            if (rt->types.empty()) line(j + 2, "[]");
+            else { line(j + 2, "["); for (auto& c : rt->types) core_type(j + 3, *c); line(j + 2, "]"); }
+          } else {
+            line(j + 1, "Rinherit");
+            core_type(j + 2, *std::get<Rinherit>(row).ct);
+          }
+        }
+        line(j, "]");
+      }
+      if (v->labels) {
+        line(j, "Some");
+        if (v->labels->empty()) line(j + 1, "[]");
+        else { line(j + 1, "["); for (auto& s : *v->labels) line(j + 2, '"' + s + '"'); line(j + 1, "]"); }
+      } else line(j, "None");
     }
   }
 
@@ -166,6 +188,20 @@ struct Printer {
         for (auto& [lbl, pat] : v->fields) { line(j + 1, lid_loc(lbl)); pattern(j + 2, *pat); }
         line(j, "]");
       }
+    } else if (auto* v = std::get_if<Ppat_lazy>(&p.desc)) {
+      line(j, "Ppat_lazy");
+      pattern(j, *v->p);
+    } else if (auto* v = std::get_if<Ppat_interval>(&p.desc)) {
+      line(j, "Ppat_interval");
+      constant(j, v->c1);
+      constant(j, v->c2);
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      line(j, "Ppat_variant \"" + v->label + "\"");
+      if (v->arg) { line(j, "Some"); pattern(j + 1, **v->arg); }
+      else line(j, "None");
+    } else if (auto* v = std::get_if<Ppat_exception>(&p.desc)) {
+      line(j, "Ppat_exception");
+      pattern(j, *v->p);
     }
   }
 
@@ -272,6 +308,13 @@ struct Printer {
       line(j, "Pexp_array");
       if (v->elems.empty()) line(j, "[]");
       else { line(j, "["); for (auto& el : v->elems) expression(j + 1, *el); line(j, "]"); }
+    } else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) {
+      line(j, "Pexp_variant \"" + v->label + "\"");
+      if (v->arg) { line(j, "Some"); expression(j + 1, **v->arg); }
+      else line(j, "None");
+    } else if (auto* v = std::get_if<Pexp_newtype>(&e.desc)) {
+      line(j, "Pexp_newtype \"" + v->name.txt + "\"");
+      expression(j, *v->body);
     }
   }
 
@@ -289,6 +332,10 @@ struct Printer {
   }
 
   void function_param(int i, const FunctionParam& fp) {
+    if (auto* nt = std::get_if<Pparam_newtype>(&fp.desc)) {
+      line(i, "Pparam_newtype \"" + nt->name.txt + "\" " + loc(nt->loc));
+      return;
+    }
     auto& pv = std::get<Pparam_val>(fp.desc);
     line(i, "Pparam_val " + loc(pv.loc));
     arg_label(i + 1, pv.label);
@@ -400,6 +447,18 @@ struct Printer {
     line(i + 1, "ptyext_constructor =");
     extension_constructor(i + 2, e.ctor);
   }
+  void type_extension(int i, const TypeExtension& x) {
+    line(i, "type_extension");
+    int j = i + 1;
+    line(j, "ptyext_path = " + lid_loc(x.path));
+    line(j, "ptyext_params =");
+    if (x.params.empty()) line(j + 1, "[]");
+    else { line(j + 1, "["); for (auto& p : x.params) core_type(j + 2, *p); line(j + 1, "]"); }
+    line(j, "ptyext_constructors =");
+    if (x.ctors.empty()) line(j + 1, "[]");
+    else { line(j + 1, "["); for (auto& c : x.ctors) extension_constructor(j + 2, c); line(j + 1, "]"); }
+    line(j, std::string("ptyext_private = ") + private_flag(x.priv));
+  }
   void primitive_description(int i, const PrimitiveDescription& p) {
     line(i, "primitive_description " + str_loc(p.name) + " " + loc(p.loc));
     line(i + 1, "Pprim_decl");
@@ -440,6 +499,9 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_exception>(&s.desc)) {
       line(j, "Pstr_exception");
       type_exception(j, v->exn);
+    } else if (auto* v = std::get_if<Pstr_typext>(&s.desc)) {
+      line(j, "Pstr_typext");
+      type_extension(j, v->ext);
     } else if (auto* v = std::get_if<Pstr_primitive>(&s.desc)) {
       line(j, "Pstr_primitive");
       primitive_description(j, v->prim);

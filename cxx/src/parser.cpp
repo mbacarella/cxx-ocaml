@@ -387,6 +387,17 @@ class Parser {
       LongidentLoc cl = lid0(t.kind == Kind::TRUE ? "true" : "false", tokloc(t));
       return collect_app(mk_construct(cl, std::nullopt, cl.loc));
     }
+    if (cur().kind == Kind::BACKQUOTE) {  // polymorphic variant  `Tag [arg]
+      Token t = cur(); advance();
+      Token tag = cur(); advance();
+      if (is_atom_start(cur().kind)) {
+        ExprBox arg = parse_atom_postfix();
+        Location l = span(position(t.start), arg->loc.end);
+        return collect_app(E({Pexp_variant{tag.text, std::move(arg)}, l}));
+      }
+      return collect_app(
+          E({Pexp_variant{tag.text, std::nullopt}, span(position(t.start), position(tag.end))}));
+    }
     return collect_app(parse_atom_postfix());
   }
 
@@ -548,6 +559,20 @@ class Parser {
         while (cur().kind != Kind::MINUSGREATER) params.push_back(parse_param());
         expect(Kind::MINUSGREATER, "->");
         ExprBox body = parse_expr();
+        // `fun (type a) … -> e` with *only* newtype params is a Pexp_newtype chain.
+        bool all_newtype = !params.empty();
+        for (auto& p : params)
+          if (!std::holds_alternative<Pparam_newtype>(p.desc)) all_newtype = false;
+        if (all_newtype) {
+          ExprBox acc = std::move(body);
+          Position bend = acc->loc.end;
+          for (int i = static_cast<int>(params.size()) - 1; i >= 0; --i) {
+            auto& nt = std::get<Pparam_newtype>(params[i].desc);
+            Position s = (i == 0) ? position(t.start) : nt.loc.start;  // outermost from `fun`
+            acc = E({Pexp_newtype{nt.name, std::move(acc)}, Location{s, bend, i != 0}});
+          }
+          return acc;
+        }
         Location l = span(position(t.start), body->loc.end);
         auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
         return E({Pexp_function{std::move(params), std::move(fb)}, l});
@@ -665,7 +690,43 @@ class Parser {
       inner->loc = span(position(t.start), position(close.end));
       return inner;
     }
+    if (t.kind == Kind::LBRACKET || t.kind == Kind::LBRACKETGREATER ||
+        t.kind == Kind::LBRACKETLESS) {  // polymorphic variant type
+      advance();
+      ClosedFlag closed = (t.kind == Kind::LBRACKETGREATER) ? ClosedFlag::Open : ClosedFlag::Closed;
+      std::vector<RowField> rows;
+      if (cur().kind == Kind::BAR) advance();
+      rows.push_back(parse_row_field());
+      while (cur().kind == Kind::BAR) { advance(); rows.push_back(parse_row_field()); }
+      std::optional<std::vector<std::string>> labels;
+      if (cur().kind == Kind::GREATER) {  // [< … > `a `b]
+        advance();
+        std::vector<std::string> ls;
+        while (cur().kind == Kind::BACKQUOTE) { advance(); ls.push_back(cur().text); advance(); }
+        labels = std::move(ls);
+      }
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return box(CoreType{.desc = Ptyp_variant{std::move(rows), closed, std::move(labels)},
+                          .loc = span(position(t.start), position(c.end))});
+    }
     throw ParseError("expected a type", t.start);
+  }
+  RowField parse_row_field() {
+    if (cur().kind == Kind::BACKQUOTE) {
+      advance();
+      Token tag = cur();
+      advance();
+      std::vector<CoreTypeBox> types;
+      if (cur().kind == Kind::OF) {
+        advance();
+        if (cur().kind == Kind::AMPERSAND) advance();
+        types.push_back(parse_core_type());
+        while (cur().kind == Kind::AMPERSAND) { advance(); types.push_back(parse_core_type()); }
+      }
+      bool constant = types.empty();
+      return Rtag{tag.text, constant, std::move(types)};
+    }
+    return Rinherit{parse_core_type()};
   }
 
   // ---- patterns ----
@@ -678,7 +739,15 @@ class Parser {
       default: return false;
     }
   }
-  Pattern parse_pattern() { return parse_pat_alias(); }
+  Pattern parse_pattern() {
+    if (cur().kind == Kind::EXCEPTION) {
+      Token t = cur(); advance();
+      Pattern p = parse_pat_alias();
+      Location l = span(position(t.start), p.loc.end);
+      return Pattern{Ppat_exception{box(std::move(p))}, l};
+    }
+    return parse_pat_alias();
+  }
   Pattern parse_pat_alias() {
     Pattern p = parse_pat_or();
     while (cur().kind == Kind::AS) {
@@ -727,6 +796,23 @@ class Parser {
                    Location{ls, re, false}};
   }
   Pattern parse_pat_app() {
+    if (cur().kind == Kind::LAZY) {
+      Token t = cur(); advance();
+      Pattern arg = parse_simple_pattern();
+      Location l = span(position(t.start), arg.loc.end);
+      return Pattern{Ppat_lazy{box(std::move(arg))}, l};
+    }
+    if (cur().kind == Kind::BACKQUOTE) {
+      Token t = cur(); advance();
+      Token tag = cur(); advance();
+      if (is_simple_pattern_start(cur().kind)) {
+        Pattern arg = parse_simple_pattern();
+        Location l = span(position(t.start), arg.loc.end);
+        return Pattern{Ppat_variant{tag.text, box(std::move(arg))}, l};
+      }
+      return Pattern{Ppat_variant{tag.text, std::nullopt},
+                     span(position(t.start), position(tag.end))};
+    }
     if (cur().kind == Kind::UIDENT) {
       LongidentLoc cl = parse_longident_path();
       if (is_simple_pattern_start(cur().kind)) {
@@ -760,8 +846,21 @@ class Parser {
     switch (t.kind) {
       case Kind::UNDERSCORE: advance(); return {Ppat_any{}, tokloc(t)};
       case Kind::LIDENT: advance(); return {Ppat_var{StringLoc{t.text, tokloc(t)}}, tokloc(t)};
-      case Kind::INT: case Kind::FLOAT: case Kind::CHAR: case Kind::STRING:
-        advance(); return {Ppat_constant{const_of(t)}, tokloc(t)};
+      case Kind::INT: case Kind::FLOAT: case Kind::CHAR: case Kind::STRING: {
+        advance();
+        Constant c1 = const_of(t);
+        if (cur().kind == Kind::DOTDOT) {  // interval  c1 .. c2
+          advance();
+          Token t2 = cur();
+          if (t2.kind != Kind::INT && t2.kind != Kind::FLOAT &&
+              t2.kind != Kind::CHAR && t2.kind != Kind::STRING)
+            throw ParseError("expected constant in interval", t2.start);
+          advance();
+          return {Ppat_interval{std::move(c1), const_of(t2)},
+                  span(position(t.start), position(t2.end))};
+        }
+        return {Ppat_constant{std::move(c1)}, tokloc(t)};
+      }
       case Kind::TRUE: advance(); return ppat_construct0("true", tokloc(t));
       case Kind::FALSE: advance(); return ppat_construct0("false", tokloc(t));
       case Kind::UIDENT: { LongidentLoc cl = parse_longident_path();
@@ -859,8 +958,22 @@ class Parser {
     if (nm.kind != Kind::UIDENT) throw ParseError("expected constructor name", nm.start);
     advance();
     ConstructorArguments args = Pcstr_tuple{};
+    std::optional<CoreTypeBox> res;
     Position endp = position(nm.end);
-    if (cur().kind == Kind::OF) {
+    if (cur().kind == Kind::COLON) {  // GADT:  A : t1 * … * tn -> tres   (or  A : tres)
+      advance();
+      std::vector<CoreTypeBox> ts;
+      ts.push_back(parse_type_app());
+      while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
+      if (cur().kind == Kind::MINUSGREATER) {
+        advance();
+        res = parse_core_type();
+        args = Pcstr_tuple{std::move(ts)};
+      } else {
+        res = std::move(ts[0]);  // no arrow: the lone type is the result, no args
+      }
+      endp = (*res)->loc.end;
+    } else if (cur().kind == Kind::OF) {
       advance();
       if (cur().kind == Kind::LBRACE) {
         auto fs = parse_label_decls();
@@ -874,18 +987,69 @@ class Parser {
         args = Pcstr_tuple{std::move(ts)};
       }
     }
-    return ConstructorDecl{StringLoc{nm.text, tokloc(nm)}, std::move(args), std::nullopt,
+    return ConstructorDecl{StringLoc{nm.text, tokloc(nm)}, std::move(args), std::move(res),
                            span(start, endp)};
   }
-  TypeDeclaration parse_type_declaration(Position declStart) {
+  CoreTypeBox parse_type_param() {
+    if (cur().kind == Kind::PLUS || cur().kind == Kind::MINUS) advance();  // variance (dropped)
+    if (cur().kind == Kind::UNDERSCORE) {
+      Token u = cur(); advance();
+      return box(CoreType{Ptyp_any{}, tokloc(u)});
+    }
+    return parse_type_atom();  // 'a
+  }
+  std::vector<CoreTypeBox> parse_type_params() {
     std::vector<CoreTypeBox> params;
-    if (cur().kind == Kind::QUOTE) params.push_back(parse_type_atom());
-    else if (cur().kind == Kind::LPAREN) {
+    Kind k = cur().kind;
+    if (k == Kind::QUOTE || k == Kind::UNDERSCORE || k == Kind::PLUS || k == Kind::MINUS) {
+      params.push_back(parse_type_param());
+    } else if (k == Kind::LPAREN) {
       advance();
-      params.push_back(parse_core_type());
-      while (cur().kind == Kind::COMMA) { advance(); params.push_back(parse_core_type()); }
+      params.push_back(parse_type_param());
+      while (cur().kind == Kind::COMMA) { advance(); params.push_back(parse_type_param()); }
       expect(Kind::RPAREN, ")");
     }
+    return params;
+  }
+  ExtensionConstructor parse_ext_ctor(Position start) {
+    Token nm = cur();
+    if (nm.kind != Kind::UIDENT) throw ParseError("expected constructor name", nm.start);
+    advance();
+    std::variant<Pext_decl, Pext_rebind> kind;
+    Position endp = position(nm.end);
+    if (cur().kind == Kind::EQUAL) {  // rebind
+      advance();
+      LongidentLoc path = parse_longident_path();
+      endp = path.loc.end;
+      kind = Pext_rebind{path};
+    } else {
+      ConstructorArguments args = Pcstr_tuple{};
+      std::optional<CoreTypeBox> res;
+      if (cur().kind == Kind::COLON) {  // GADT-style
+        advance();
+        std::vector<CoreTypeBox> ts;
+        ts.push_back(parse_type_app());
+        while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
+        if (cur().kind == Kind::MINUSGREATER) { advance(); res = parse_core_type(); args = Pcstr_tuple{std::move(ts)}; }
+        else res = std::move(ts[0]);
+        endp = (*res)->loc.end;
+      } else if (cur().kind == Kind::OF) {
+        advance();
+        if (cur().kind == Kind::LBRACE) { args = Pcstr_record{parse_label_decls()}; endp = position(tokens_[idx_ - 1].end); }
+        else {
+          std::vector<CoreTypeBox> ts;
+          ts.push_back(parse_type_app());
+          while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
+          endp = ts.back()->loc.end;
+          args = Pcstr_tuple{std::move(ts)};
+        }
+      }
+      kind = Pext_decl{std::move(args), std::move(res)};
+    }
+    return ExtensionConstructor{StringLoc{nm.text, tokloc(nm)}, std::move(kind), span(start, endp)};
+  }
+  TypeDeclaration parse_type_declaration(Position declStart) {
+    std::vector<CoreTypeBox> params = parse_type_params();
     Token nm = cur();
     if (nm.kind != Kind::LIDENT) throw ParseError("expected type name", nm.start);
     advance();
@@ -895,7 +1059,10 @@ class Parser {
     if (cur().kind == Kind::EQUAL) {
       advance();
       if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
-      if (cur().kind == Kind::LBRACE) {
+      if (cur().kind == Kind::DOTDOT) {  // type t = ..  (extensible)
+        advance();
+        kind = Ptype_open{};
+      } else if (cur().kind == Kind::LBRACE) {
         kind = Ptype_record{parse_label_decls()};
       } else if (cur().kind == Kind::BAR || cur().kind == Kind::UIDENT) {
         // a constructor_declaration's loc includes its leading '|' (if any)
@@ -921,6 +1088,16 @@ class Parser {
   // ---- bindings ----
   FunctionParam parse_param() {
     Token t = cur();
+    // (type a)  locally abstract type parameter
+    if (t.kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
+      advance(); advance();  // ( type
+      Token id = cur();
+      if (id.kind != Kind::LIDENT) throw ParseError("expected type name", id.start);
+      advance();
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      return FunctionParam{Pparam_newtype{StringLoc{id.text, tokloc(id)},
+                                          span(position(t.start), position(c.end))}};
+    }
     // ~x  (labelled punning)
     if (t.kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {
       advance(); Token id = cur(); advance();
@@ -992,7 +1169,11 @@ class Parser {
     if (params.empty())
       return ValueBinding{std::move(namepat), std::move(body), std::move(constr)};
     // desugar `let f p.. = e` to a ghost Pexp_function spanning p[0]..e
-    Position fstart = std::get<Pparam_val>(params.front().desc).loc.start;
+    auto param_loc = [](const FunctionParam& p) {
+      if (auto* v = std::get_if<Pparam_val>(&p.desc)) return v->loc;
+      return std::get<Pparam_newtype>(p.desc).loc;
+    };
+    Position fstart = param_loc(params.front()).start;
     Location floc = span(fstart, body->loc.end, /*ghost=*/true);
     auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
     ExprBox fn = E({Pexp_function{std::move(params), std::move(fb)}, floc});
@@ -1028,14 +1209,39 @@ class Parser {
       advance();
       RecFlag rf = RecFlag::Recursive;  // `type` is recursive by default
       if (cur().kind == Kind::NONREC) { advance(); rf = RecFlag::Nonrecursive; }
+      Position d0 = position(t.start);
+      // disambiguate `type [params] path += …` (extension) from declarations
+      size_t save = idx_;
+      std::vector<CoreTypeBox> params = parse_type_params();
+      if (cur().kind == Kind::LIDENT || cur().kind == Kind::UIDENT) {
+        LongidentLoc path = parse_longident_path();
+        if (cur().kind == Kind::PLUSEQ) {
+          advance();
+          PrivateFlag priv = PrivateFlag::Public;
+          if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
+          std::vector<ExtensionConstructor> ctors;
+          Position cs = position(cur().start);  // first ctor: from leading '|' if present
+          if (cur().kind == Kind::BAR) advance();
+          ctors.push_back(parse_ext_ctor(cs));
+          while (cur().kind == Kind::BAR) {
+            Position bs = position(cur().start);
+            advance();
+            ctors.push_back(parse_ext_ctor(bs));
+          }
+          Location l = span(d0, position(tokens_[idx_ - 1].end));
+          return StructureItem{
+              Pstr_typext{TypeExtension{std::move(path), std::move(params), std::move(ctors), priv}}, l};
+        }
+      }
+      idx_ = save;  // not an extension: parse type declaration(s)
       std::vector<TypeDeclaration> decls;
-      decls.push_back(parse_type_declaration(position(t.start)));  // first decl: from `type`
+      decls.push_back(parse_type_declaration(d0));
       while (cur().kind == Kind::AND) {
-        Position ds = position(cur().start);  // subsequent decls: from `and`
+        Position ds = position(cur().start);
         advance();
         decls.push_back(parse_type_declaration(ds));
       }
-      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      Location l = span(d0, position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_type{rf, std::move(decls)}, l};
     }
     if (t.kind == Kind::OPEN) {
@@ -1049,35 +1255,8 @@ class Parser {
     }
     if (t.kind == Kind::EXCEPTION) {
       advance();
-      Token nm = cur();
-      if (nm.kind != Kind::UIDENT) throw ParseError("expected exception name", nm.start);
-      advance();
-      std::variant<Pext_decl, Pext_rebind> kind;
-      Position endp = position(nm.end);
-      if (cur().kind == Kind::EQUAL) {  // exception E = Path  (rebind)
-        advance();
-        LongidentLoc path = parse_longident_path();
-        endp = path.loc.end;
-        kind = Pext_rebind{path};
-      } else {
-        ConstructorArguments args = Pcstr_tuple{};
-        if (cur().kind == Kind::OF) {
-          advance();
-          if (cur().kind == Kind::LBRACE) {
-            args = Pcstr_record{parse_label_decls()};
-            endp = position(tokens_[idx_ - 1].end);
-          } else {
-            std::vector<CoreTypeBox> ts;
-            ts.push_back(parse_type_app());
-            while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
-            endp = ts.back()->loc.end;
-            args = Pcstr_tuple{std::move(ts)};
-          }
-        }
-        kind = Pext_decl{std::move(args), std::nullopt};
-      }
-      Location ctorloc = span(position(t.start), endp);  // includes the `exception` keyword
-      ExtensionConstructor ctor{StringLoc{nm.text, tokloc(nm)}, std::move(kind), ctorloc};
+      // extension_constructor loc spans the `exception` keyword
+      ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_exception{TypeException{std::move(ctor)}}, l};
     }

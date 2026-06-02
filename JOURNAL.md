@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **11.2%** corpus parity vs `ocamlc -dparsetree`. Covers the core expression/pattern/type-decl surface, list/cons/record literals & patterns, prefix/unary/labeled-arg/array/while/for/index expressions, **+ structure items: `exception` (decl & rebind), `external`, `module M = struct…end`/`= Path`, abstract types**. Climb so far: 2.5 → 5.2 → 9.8 → 11.2. Remaining tail leaders: harder patterns (47), GADT/poly-variant/extensible type decls (45), attributes/extensions, objects, first-class modules.
+- ◐ **Parser** — **13.2%** corpus parity vs `ocamlc -dparsetree`. Covers the core expression/pattern/type-decl/structure surface plus **GADTs, polymorphic variants (types/patterns/exprs), `type t = ..` & `type t += …` extensions, `_`/variance type params, lazy/interval/exception patterns, `(type a)` newtype params (`Pparam_newtype`/`Pexp_newtype`)**. Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2. Remaining tail: `let[@attr]`/attributes & extensions, effects, local modules (`let module`), objects, first-class modules.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -274,3 +274,18 @@ Added structure-level items (which gate whole files early), byte-validated:
 - Parity 9.8% → **11.2%** (45/400); "expected an expression" 162→**93**. Blocker
   profile shifted: harder patterns (47) and the type-decl tail (GADTs/poly-
   variants/extensible, 45) now lead; attributes/extensions next.
+
+### 2026-06-02 — GADTs/poly-variants/type-ext/newtypes → 13.2% (day 0 cont.)
+
+- **GADT constructors** (`A : t1 * … -> tres`), **`type t = ..`** (Ptype_open),
+  **`type t += C`** (Pstr_typext, disambiguated from declarations by `+=`),
+  **`_`/variance type params**.
+- **Polymorphic variants** end-to-end: types `[ \`X | \`Y of int ]` (Ptyp_variant
+  / Rtag), patterns and expressions (`Ppat_variant`/`Pexp_variant`).
+- **Harder patterns**: `lazy p`, `'a'..'z'` intervals, `exception p`.
+- **`(type a)` newtype params**: `Pparam_newtype` in let/fun-with-val-params, and
+  the special `fun (type a) … -> e` (only newtypes) → nested `Pexp_newtype` chain
+  (outermost real loc from `fun`, inner ones ghost). Fixed a crash where the
+  function-binding desugar assumed the first param was a `Pparam_val`.
+- Parity 12.5% → **13.2%** (53/400); parse-errors 236→211. Next tail: `let[@attr]`
+  item attributes (~13 files), effect patterns, `let module … in`, objects.
