@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **5.2%** corpus parity vs `ocamlc -dparsetree` (was 2.5%). Now covers: full patterns (var/any/constant/tuple/constructor/or/alias/constraint/unit/`[]`), `core_type` (var/constr/arrow/tuple), type declarations (variant/record/abbrev), `open`, `match`/`function`/`try`/`fun`, sequences, `begin..end`, constructors, `(e:t)`, field access. Next: records, list/cons literals, labeled args, `let x:t=`, GADTs, modules.
+- ◐ **Parser** — **5.5%** corpus parity vs `ocamlc -dparsetree`. Covers: full patterns + records/lists/cons patterns, `core_type`, type declarations (variant/record/abbrev), `open`, `match`/`function`/`try`/`fun`, sequences, `begin..end`, constructors, `(e:t)`, field access, **list literals + `::` (mktailexp ghost chains), records (`{…}`/`{e with}`), `let x:t=`**. The long tail (modules, objects, labeled args, `assert`/`while`/`for`, arrays, `.()`, attributes/extensions) keeps full-file parity climbing slowly even as building blocks land — the predicted parser long tail.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -225,3 +225,23 @@ Big expression/pattern/type batch, all byte-validated against `-dparsetree`:
 - Parity 2.5% → **5.2%**; parse-errors 383→331/400. Top remaining blockers:
   records, list/cons literals, `let x : t =`, GADT/extension type decls, modules,
   labeled args.
+
+### 2026-06-02 — lists / records / cons / constraints (day 0 cont.)
+
+- **List literals** `[e1;…;en]` and **cons** `a::b`: ported the `mktailexp`
+  desugaring exactly — right-assoc `Pexp_construct "::"` over ghost tuples, ghost
+  `::`/`[]` longident locs, the outermost expr carrying the real bracket span,
+  and the explicit-cons longident being the real `::` token. Same for patterns.
+- **Records**: `{ l = e; … }`, `{ e with … }`, punning (ghost label loc); record
+  **patterns** `{ l; _ }` with the open/closed flag.
+- **`let x : t = e`** value constraints (`Pvc_constraint`), incl. fixing the
+  val-ident-vs-pattern heuristic to fire on a following `:`.
+- All validated byte-for-byte on hand-built samples (lists/cons/records/field/
+  constraint/list+record patterns identical).
+- Corpus parity 5.2% → **5.5%** only, and "expected an expression" *rose*
+  (206→217): real files are long and use a long tail of constructs, so each new
+  feature mostly lets files parse *further* before the next gap. This is the
+  predicted parser long tail — building blocks are correct; full-file parity is
+  gated by the least-supported construct in each file. Next tail targets:
+  labeled/optional args, `assert`/`lazy`/`while`/`for`, arrays `[|…|]`, `.()`/`.[]`,
+  modules, exceptions/externals, attributes/extensions, GADT/poly-variant types.

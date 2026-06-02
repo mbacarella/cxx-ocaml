@@ -158,6 +158,14 @@ struct Printer {
       line(j, "Ppat_constraint");
       pattern(j, *v->p);
       core_type(j, *v->t);
+    } else if (auto* v = std::get_if<Ppat_record>(&p.desc)) {
+      line(j, std::string("Ppat_record ") + closed_flag(v->closed));
+      if (v->fields.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& [lbl, pat] : v->fields) { line(j + 1, lid_loc(lbl)); pattern(j + 2, *pat); }
+        line(j, "]");
+      }
     }
   }
 
@@ -234,6 +242,16 @@ struct Printer {
       line(j, "Pexp_field");
       expression(j, *v->e);
       line(j, lid_loc(v->field));  // longident_loc prints at i with no node header
+    } else if (auto* v = std::get_if<Pexp_record>(&e.desc)) {
+      line(j, "Pexp_record");
+      if (v->fields.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& [lbl, val] : v->fields) { line(j + 1, lid_loc(lbl)); expression(j + 2, *val); }
+        line(j, "]");
+      }
+      if (v->base) { line(j, "Some"); expression(j + 1, **v->base); }
+      else line(j, "None");
     }
   }
 
@@ -334,6 +352,7 @@ struct Printer {
       // list calls value_binding at i+1; <def> at i+1, its children at i+2.
       line(i + 1, "<def>");
       pattern(i + 2, vb.pat);
+      if (vb.constraint_) core_type(i + 2, **vb.constraint_);  // Pvc_constraint (bare core_type)
       expression(i + 2, *vb.expr);
     }
     line(i, "]");

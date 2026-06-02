@@ -122,6 +122,28 @@ class Parser {
   ExprBox mk_construct(LongidentLoc cl, std::optional<ExprBox> arg, Location l) {
     return E({Pexp_construct{.id = cl, .arg = std::move(arg)}, l});
   }
+  Location gloc(Position a, Position b) { return Location{a, b, true}; }
+
+  // [e1; ...; en] desugars right-assoc to (::) chains (mktailexp). The cons/tuple
+  // nodes are ghost; only the outermost expression carries the real bracket span.
+  ExprBox build_expr_list(std::vector<ExprBox>& elems, Position lb, Position rbS, Position rbE) {
+    ExprBox acc = mk_construct(lid0("[]", gloc(rbS, rbE)), std::nullopt, gloc(rbS, rbE));
+    for (int i = static_cast<int>(elems.size()) - 1; i >= 0; --i) {
+      Position es = elems[i]->loc.start;
+      Location gl = gloc(es, rbE);
+      std::vector<ExprBox> tup;
+      tup.push_back(std::move(elems[i]));
+      tup.push_back(std::move(acc));
+      acc = mk_construct(lid0("::", gl), E({Pexp_tuple{std::move(tup)}, gl}), gl);
+    }
+    acc->loc = Location{lb, rbE, false};  // outermost: real bracket span
+    return acc;
+  }
+  std::string lid_last_name(const Longident& l) {
+    if (auto* p = std::get_if<Lident>(&l.v)) return p->name;
+    if (auto* p = std::get_if<Ldot>(&l.v)) return p->name;
+    return "";
+  }
 
   // A dotted path; reports whether the final segment is uppercase (constructor)
   // vs lowercase (value/field).
@@ -201,7 +223,37 @@ class Parser {
           Location l = span(position(t.start), position(c.end));
           return mk_construct(lid0("[]", l), std::nullopt, l);
         }
-        throw ParseError("list literals not supported yet", t.start);
+        std::vector<ExprBox> elems;
+        elems.push_back(parse_expr_no_seq());
+        while (cur().kind == Kind::SEMI) {
+          advance();
+          if (cur().kind == Kind::RBRACKET) break;  // trailing ';'
+          elems.push_back(parse_expr_no_seq());
+        }
+        Token c = cur(); expect(Kind::RBRACKET, "]");
+        return build_expr_list(elems, position(t.start), position(c.start), position(c.end));
+      }
+      case Kind::LBRACE: {
+        advance();
+        std::optional<ExprBox> base;
+        if (is_atom_start(cur().kind) && cur().kind != Kind::RBRACE) {
+          size_t save = idx_;
+          ExprBox e = parse_atom_postfix();
+          if (cur().kind == Kind::WITH) { advance(); base = std::move(e); }
+          else idx_ = save;  // it was the first field label, not a base
+        }
+        std::vector<std::pair<LongidentLoc, ExprBox>> fields;
+        while (cur().kind != Kind::RBRACE) {
+          LongidentLoc lbl = parse_longident_path();
+          ExprBox val;
+          if (cur().kind == Kind::EQUAL) { advance(); val = parse_expr_no_seq(); }
+          else val = E({Pexp_ident{.id = lbl}, lbl.loc});  // punning { x }
+          fields.emplace_back(lbl, std::move(val));
+          if (cur().kind == Kind::SEMI) advance(); else break;
+        }
+        Token c = cur(); expect(Kind::RBRACE, "}");
+        return E({Pexp_record{std::move(fields), std::move(base)},
+                  span(position(t.start), position(c.end))});
       }
       case Kind::BEGIN: {
         advance();
@@ -252,6 +304,20 @@ class Parser {
   ExprBox parse_binop(int min_prec) {
     ExprBox left = parse_app();
     for (;;) {
+      // cons '::' is right-assoc at level 6 and builds a construct, not an apply.
+      if (cur().kind == Kind::COLONCOLON && 6 >= min_prec) {
+        Token optok = cur();
+        advance();
+        ExprBox right = parse_binop(6);
+        Position ls = left->loc.start, re = right->loc.end;
+        Location gl = gloc(ls, re);
+        std::vector<ExprBox> tup;
+        tup.push_back(std::move(left));
+        tup.push_back(std::move(right));
+        ExprBox tuple = E({Pexp_tuple{std::move(tup)}, gl});
+        left = mk_construct(lid0("::", tokloc(optok)), std::move(tuple), Location{ls, re, false});
+        continue;
+      }
       auto op = infix_op(cur());
       if (!op || op->prec < min_prec) break;
       Token optok = cur();
@@ -467,7 +533,7 @@ class Parser {
     switch (k) {
       case Kind::LIDENT: case Kind::UNDERSCORE: case Kind::LPAREN: case Kind::INT:
       case Kind::FLOAT: case Kind::CHAR: case Kind::STRING: case Kind::UIDENT:
-      case Kind::TRUE: case Kind::FALSE: case Kind::LBRACKET:
+      case Kind::TRUE: case Kind::FALSE: case Kind::LBRACKET: case Kind::LBRACE:
         return true;
       default: return false;
     }
@@ -496,14 +562,29 @@ class Parser {
     return p;
   }
   Pattern parse_pat_tuple() {
-    Pattern p = parse_pat_app();
+    Pattern p = parse_pat_cons();
     if (cur().kind != Kind::COMMA) return p;
     std::vector<PatBox> elems;
     Position s = p.loc.start;
     elems.push_back(box(std::move(p)));
-    while (cur().kind == Kind::COMMA) { advance(); elems.push_back(box(parse_pat_app())); }
+    while (cur().kind == Kind::COMMA) { advance(); elems.push_back(box(parse_pat_cons())); }
     Location l = span(s, elems.back()->loc.end);
     return Pattern{Ppat_tuple{std::move(elems), ClosedFlag::Closed}, l};
+  }
+  Pattern parse_pat_cons() {
+    Pattern p = parse_pat_app();
+    if (cur().kind != Kind::COLONCOLON) return p;
+    Token optok = cur();
+    advance();
+    Pattern r = parse_pat_cons();  // right-assoc
+    Position ls = p.loc.start, re = r.loc.end;
+    Location gl = gloc(ls, re);
+    std::vector<PatBox> tup;
+    tup.push_back(box(std::move(p)));
+    tup.push_back(box(std::move(r)));
+    Pattern tuple{Ppat_tuple{std::move(tup), ClosedFlag::Closed}, gl};
+    return Pattern{Ppat_construct{.id = lid0("::", tokloc(optok)), .arg = box(std::move(tuple))},
+                   Location{ls, re, false}};
   }
   Pattern parse_pat_app() {
     if (cur().kind == Kind::UIDENT) {
@@ -519,6 +600,20 @@ class Parser {
   }
   Pattern ppat_construct0(const char* name, Location l) {
     return Pattern{Ppat_construct{.id = LongidentLoc{.txt = {Lident{name}}, .loc = l}, .arg = std::nullopt}, l};
+  }
+  Pattern build_pat_list(std::vector<Pattern>& elems, Position lb, Position rbS, Position rbE) {
+    Pattern acc = ppat_construct0("[]", gloc(rbS, rbE));
+    for (int i = static_cast<int>(elems.size()) - 1; i >= 0; --i) {
+      Position es = elems[i].loc.start;
+      Location gl = gloc(es, rbE);
+      std::vector<PatBox> tup;
+      tup.push_back(box(std::move(elems[i])));
+      tup.push_back(box(std::move(acc)));
+      Pattern tuple{Ppat_tuple{std::move(tup), ClosedFlag::Closed}, gl};
+      acc = Pattern{Ppat_construct{.id = lid0("::", gl), .arg = box(std::move(tuple))}, gl};
+    }
+    acc.loc = Location{lb, rbE, false};
+    return acc;
   }
   Pattern parse_simple_pattern() {
     Token t = cur();
@@ -555,7 +650,41 @@ class Parser {
           Token c = cur(); advance();
           return ppat_construct0("[]", span(position(t.start), position(c.end)));
         }
-        throw ParseError("list patterns not supported yet", t.start);
+        std::vector<Pattern> elems;
+        elems.push_back(parse_pattern());
+        while (cur().kind == Kind::SEMI) {
+          advance();
+          if (cur().kind == Kind::RBRACKET) break;
+          elems.push_back(parse_pattern());
+        }
+        Token c = cur(); expect(Kind::RBRACKET, "]");
+        return build_pat_list(elems, position(t.start), position(c.start), position(c.end));
+      }
+      case Kind::LBRACE: {
+        advance();
+        std::vector<std::pair<LongidentLoc, PatBox>> fields;
+        ClosedFlag closed = ClosedFlag::Closed;
+        while (cur().kind != Kind::RBRACE) {
+          if (cur().kind == Kind::UNDERSCORE) {
+            advance(); closed = ClosedFlag::Open;
+            if (cur().kind == Kind::SEMI) advance();
+            break;
+          }
+          LongidentLoc lbl = parse_longident_path();
+          if (cur().kind == Kind::EQUAL) {
+            advance();
+            fields.emplace_back(lbl, box(parse_pattern()));
+          } else {
+            // punning { x }: the label longident is ghost; the var pattern is real
+            LongidentLoc glbl = lbl;
+            glbl.loc.ghost = true;
+            fields.emplace_back(glbl,
+                box(Pattern{Ppat_var{StringLoc{lid_last_name(lbl.txt), lbl.loc}}, lbl.loc}));
+          }
+          if (cur().kind == Kind::SEMI) advance(); else break;
+        }
+        Token c = cur(); expect(Kind::RBRACE, "}");
+        return {Ppat_record{std::move(fields), closed}, span(position(t.start), position(c.end))};
       }
       default: throw ParseError("unsupported pattern", t.start);
     }
@@ -659,12 +788,13 @@ class Parser {
   ValueBinding parse_value_binding() {
     // val_ident form (`let f p.. = e`) vs pattern form (`let pat = e`).
     bool val_ident = cur().kind == Kind::LIDENT &&
-                     (peek(1).kind == Kind::EQUAL || is_simple_pattern_start(peek(1).kind));
+                     (peek(1).kind == Kind::EQUAL || peek(1).kind == Kind::COLON ||
+                      is_simple_pattern_start(peek(1).kind));
     if (!val_ident) {
       Pattern pat = parse_pattern();
       expect(Kind::EQUAL, "=");
       ExprBox body = parse_expr();
-      return ValueBinding{std::move(pat), std::move(body)};
+      return ValueBinding{std::move(pat), std::move(body), std::nullopt};
     }
     Token nt = cur();
     advance();
@@ -672,17 +802,28 @@ class Parser {
     Pattern namepat{Ppat_var{StringLoc{nt.text, nl}}, nl};
 
     std::vector<FunctionParam> params;
-    while (cur().kind != Kind::EQUAL) params.push_back(parse_param());
+    while (cur().kind != Kind::EQUAL && cur().kind != Kind::COLON)
+      params.push_back(parse_param());
+    std::optional<CoreTypeBox> constr;
+    if (cur().kind == Kind::COLON) {
+      // `let x : t = e`  (simple value constraint). The function-with-return-type
+      // form (`let f x : t = e`) lowers differently; defer it.
+      if (!params.empty())
+        throw ParseError("constrained function binding not supported yet", cur().start);
+      advance();
+      constr = parse_core_type();
+    }
     expect(Kind::EQUAL, "=");
     ExprBox body = parse_expr();
 
-    if (params.empty()) return ValueBinding{std::move(namepat), std::move(body)};
+    if (params.empty())
+      return ValueBinding{std::move(namepat), std::move(body), std::move(constr)};
     // desugar `let f p.. = e` to a ghost Pexp_function spanning p[0]..e
     Position fstart = std::get<Pparam_val>(params.front().desc).loc.start;
     Location floc = span(fstart, body->loc.end, /*ghost=*/true);
     auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
     ExprBox fn = E({Pexp_function{std::move(params), std::move(fb)}, floc});
-    return ValueBinding{std::move(namepat), std::move(fn)};
+    return ValueBinding{std::move(namepat), std::move(fn), std::nullopt};
   }
 
   std::pair<RecFlag, std::vector<ValueBinding>> parse_value_bindings() {

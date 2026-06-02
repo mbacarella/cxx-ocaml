@@ -86,9 +86,13 @@ struct Ppat_construct { LongidentLoc id; std::optional<PatBox> arg; };  // vars 
 struct Ppat_or { PatBox l; PatBox r; };
 struct Ppat_alias { PatBox p; StringLoc name; };
 struct Ppat_constraint { PatBox p; CoreTypeBox t; };
+struct Ppat_record {
+  std::vector<std::pair<LongidentLoc, PatBox>> fields;
+  ClosedFlag closed = ClosedFlag::Closed;
+};
 struct Pattern {
   std::variant<Ppat_any, Ppat_var, Ppat_constant, Ppat_tuple, Ppat_construct,
-               Ppat_or, Ppat_alias, Ppat_constraint>
+               Ppat_or, Ppat_alias, Ppat_constraint, Ppat_record>
       desc;
   Location loc;
 };
@@ -118,11 +122,15 @@ struct Pexp_try { ExprBox e; std::vector<Case> cases; };
 struct Pexp_sequence { ExprBox e1; ExprBox e2; };
 struct Pexp_constraint { ExprBox e; CoreTypeBox t; };
 struct Pexp_field { ExprBox e; LongidentLoc field; };
+struct Pexp_record {
+  std::vector<std::pair<LongidentLoc, ExprBox>> fields;
+  std::optional<ExprBox> base;  // `{ e with ... }`
+};
 
 struct Expression {
   std::variant<Pexp_ident, Pexp_constant, Pexp_apply, Pexp_let, Pexp_function,
                Pexp_tuple, Pexp_ifthenelse, Pexp_construct, Pexp_match, Pexp_try,
-               Pexp_sequence, Pexp_constraint, Pexp_field>
+               Pexp_sequence, Pexp_constraint, Pexp_field, Pexp_record>
       desc;
   Location loc;
 };
@@ -132,7 +140,7 @@ struct Case { Pattern lhs; std::optional<ExprBox> guard; ExprBox rhs; };
 struct ValueBinding {
   Pattern pat;
   ExprBox expr;
-  // pvb_constraint omitted (None); attributes empty
+  std::optional<CoreTypeBox> constraint_;  // Pvc_constraint (simple `: t`); attributes empty
 };
 
 struct Pparam_val { Location loc; ArgLabel label; Pattern pat; };  // default omitted (None)
