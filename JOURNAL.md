@@ -84,7 +84,8 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ☐ Parser  ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
+- ◐ **Parser** — tracer bullet byte-identical vs `ocamlc -dparsetree`; **2.5%** corpus baseline (core fragment only: let-bindings, application, infix precedence, if/let-in, tuples, constants)
+- ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
 
@@ -93,10 +94,13 @@ Scoreboard (filled in as stages land, to check the predictions):
 | `parsing/lexer.mll` | 1040 | `cxx/src/lexer.cpp` + `include/cppcaml/{token,lexer}.hpp` | **100% token-parity** |
 | `utils/misc.ml` `Utf8_lexeme` (Latin-9 case/NFC) | ~300 | folded into `cxx/src/lexer.cpp` | done (the parts the lexer needs) |
 | `parsing/parser.mly` (%token decls) | 127 | `cxx/include/cppcaml/token.hpp` (124-kind enum) | done |
+| `parsing/parser.mly` (grammar) | 4429 | `cxx/src/parser.cpp` + `include/cppcaml/ast.hpp` | core fragment (2.5%) |
+| `parsing/printast.ml` (-dparsetree) | ~1050 | `cxx/src/ast_print.cpp` | fragment printers, byte-exact |
 
 **In-scope line conversion**
-- **~1340 / 183,121** hand-written compiler source lines = **~0.7%** converted.
-- (C++/oracle/harness written so far: 1,420 lines.)
+- **~1340 / 183,121** hand-written compiler source lines fully ported = **~0.7%**;
+  parser + printer fragment in progress on top.
+- (C++/oracle/harness written so far: ~2,110 lines.)
 
 **Lexer: done.** Closed the tail in one session by fixing two real bugs (`\x`
 escape `+5` off-by-one; DOTOP including the leading dot) and porting the deferred
@@ -178,3 +182,25 @@ a careful C++ port couldn't reproduce. The real test is still the typer.
 
 Next: start the **parser** — port `parsing/parser.mly` behavior, validate the AST
 against `ocamlc -dparsetree` over the testsuite corpus (new oracle in the harness).
+
+### 2026-06-02 — parser stage stood up; tracer bullet byte-identical (day 0 cont.)
+
+- New oracle: `ocamlc.opt -nostdlib -I stdlib -stop-after parsing -dparsetree`
+  (prints the Parsetree to stderr); harness `cxx/harness/parse_parity.sh`.
+- Built the AST (`cxx/include/cppcaml/ast.hpp`, `std::variant` per the data model
+  — first real use of it), a `printast.ml`-faithful printer (`ast_print.cpp`), and
+  a recursive-descent + Pratt parser (`parser.cpp`) with full position tracking
+  (line map → `[lnum,bol+col]`) and the `let f a b = e` → ghost `Pexp_function`
+  desugaring.
+- **Tracer bullet byte-identical**: `let x = 1 + 2` and `let f a b = a + b` match
+  `-dparsetree` exactly — node shapes, every location, ghost markers, operator
+  precedence, the `<def>`/`<arg>` framing. Two trivial printer fixes found by diff
+  (value-binding child indent off by one level; missing trailing `@.` newline).
+- Corpus baseline: **2.5%** (fragment only; 383/400 hit unsupported constructs).
+- The std::variant + unique_ptr-boxed AST model works cleanly; this is the lever
+  for widening the fragment.
+
+Next (widen the parser fragment, in rough corpus-impact order): patterns
+(tuples/constructors/records), `match`/`function`, type declarations (`Pstr_type`),
+`open`/`module`, constructor & record expressions, labels/optional args, then
+attributes/extensions. Each widens the `-dparsetree` parity dial.

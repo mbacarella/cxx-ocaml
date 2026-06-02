@@ -15,9 +15,14 @@ add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 # Core compiler library (grows one pipeline stage at a time).
 add_library(cppcaml_core
   src/token.cpp
-  src/lexer.cpp)
+  src/lexer.cpp
+  src/parser.cpp
+  src/ast_print.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 
 # Stage tools.
 add_executable(c++lex src/tools/cpplex_main.cpp)
 target_link_libraries(c++lex PRIVATE cppcaml_core)
+
+add_executable(c++parse src/tools/cppparse_main.cpp)
+target_link_libraries(c++parse PRIVATE cppcaml_core)
