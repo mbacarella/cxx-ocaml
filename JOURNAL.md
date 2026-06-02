@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — tracer bullet byte-identical vs `ocamlc -dparsetree`; **2.5%** corpus baseline (core fragment only: let-bindings, application, infix precedence, if/let-in, tuples, constants)
+- ◐ **Parser** — **5.2%** corpus parity vs `ocamlc -dparsetree` (was 2.5%). Now covers: full patterns (var/any/constant/tuple/constructor/or/alias/constraint/unit/`[]`), `core_type` (var/constr/arrow/tuple), type declarations (variant/record/abbrev), `open`, `match`/`function`/`try`/`fun`, sequences, `begin..end`, constructors, `(e:t)`, field access. Next: records, list/cons literals, labeled args, `let x:t=`, GADTs, modules.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -204,3 +204,24 @@ Next (widen the parser fragment, in rough corpus-impact order): patterns
 (tuples/constructors/records), `match`/`function`, type declarations (`Pstr_type`),
 `open`/`module`, constructor & record expressions, labels/optional args, then
 attributes/extensions. Each widens the `-dparsetree` parity dial.
+
+### 2026-06-02 — parser widened to 5.2% (day 0 cont.)
+
+Big expression/pattern/type batch, all byte-validated against `-dparsetree`:
+- **Patterns** (full): var/any/constant/tuple/constructor(+arg)/or/alias/constraint
+  /unit/`[]`; rewired let-bindings (val-ident vs pattern form) and params to use them.
+- **core_type**: var/any/constr(+qualified+args)/arrow/tuple/paren.
+- **Type declarations**: variant/record/abbreviation, with the fiddly locs nailed
+  (ptype_loc from the `type`/`and` keyword; constructor_decl loc includes its
+  leading `|`; label loc includes the trailing `;`; the `printast` quirk where a
+  field name prints with no newline so `core_type` runs onto its line).
+- **`open`**, and expressions: `match`/`function`/`try`/`fun`, sequences (`;`),
+  `begin..end`, constructors (nullary + one-arg, `true`/`false`/`()`/`[]`),
+  `(e : t)` constraints, record-field access.
+- Data-model note: `Longident` children moved from `unique_ptr` to `shared_ptr`
+  so `LongidentLoc` is *copyable* (it's immutable and passed by value into many
+  nodes); designated initializers used to defeat aggregate brace-elision into the
+  nested `LongidentLoc`.
+- Parity 2.5% → **5.2%**; parse-errors 383→331/400. Top remaining blockers:
+  records, list/cons literals, `let x : t =`, GADT/extension type decls, modules,
+  labeled args.

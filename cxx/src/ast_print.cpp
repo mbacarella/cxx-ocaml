@@ -67,8 +67,35 @@ struct Printer {
   std::string char_opt(const std::optional<char>& c) const {
     return c ? std::string("Some ") + *c : "None";
   }
+  static const char* closed_flag(ClosedFlag c) { return c == ClosedFlag::Closed ? "Closed" : "Open"; }
+  static const char* mutable_flag(MutableFlag m) { return m == MutableFlag::Mutable ? "Mutable" : "Immutable"; }
+  static const char* private_flag(PrivateFlag p) { return p == PrivateFlag::Private ? "Private" : "Public"; }
+  static const char* override_flag(OverrideFlag o) { return o == OverrideFlag::Override ? "Override" : "Fresh"; }
+  static const char* rec_flag(RecFlag r) { return r == RecFlag::Recursive ? "Rec" : "Nonrec"; }
 
   void line(int i, const std::string& s) { os << ind(i) << s << '\n'; }
+
+  void core_type(int i, const CoreType& t) {
+    line(i, "core_type " + loc(t.loc));
+    int j = i + 1;
+    if (std::holds_alternative<Ptyp_any>(t.desc)) line(j, "Ptyp_any");
+    else if (auto* v = std::get_if<Ptyp_var>(&t.desc)) line(j, "Ptyp_var " + v->name);
+    else if (auto* v = std::get_if<Ptyp_arrow>(&t.desc)) {
+      line(j, "Ptyp_arrow");
+      arg_label(j, v->label);
+      core_type(j, *v->dom);
+      core_type(j, *v->cod);
+    } else if (auto* v = std::get_if<Ptyp_tuple>(&t.desc)) {
+      line(j, "Ptyp_tuple");
+      line(j, "[");
+      for (auto& el : v->elems) { line(j + 1, "None"); core_type(j + 1, *el); }
+      line(j, "]");
+    } else if (auto* v = std::get_if<Ptyp_constr>(&t.desc)) {
+      line(j, "Ptyp_constr " + lid_loc(v->id));
+      if (v->args.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& a : v->args) core_type(j + 1, *a); line(j, "]"); }
+    }
+  }
 
   void constant(int i, const Constant& c) {
     line(i, "constant " + loc(c.loc));
@@ -106,6 +133,31 @@ struct Printer {
     else if (auto* v = std::get_if<Ppat_constant>(&p.desc)) {
       line(j, "Ppat_constant");
       constant(j, v->c);
+    } else if (auto* v = std::get_if<Ppat_tuple>(&p.desc)) {
+      os << ind(j) << "Ppat_tuple\n " << closed_flag(v->closed) << '\n';  // note: literal layout
+      line(j, "[");
+      for (auto& el : v->elems) { line(j + 1, "None"); pattern(j + 1, *el); }
+      line(j, "]");
+    } else if (auto* v = std::get_if<Ppat_construct>(&p.desc)) {
+      line(j, "Ppat_construct " + lid_loc(v->id));
+      if (v->arg) {
+        line(j, "Some");
+        line(j + 1, "[]");  // pcd_vars (locally abstract univars), empty in fragment
+        pattern(j + 1, **v->arg);
+      } else {
+        line(j, "None");
+      }
+    } else if (auto* v = std::get_if<Ppat_or>(&p.desc)) {
+      line(j, "Ppat_or");
+      pattern(j, *v->l);
+      pattern(j, *v->r);
+    } else if (auto* v = std::get_if<Ppat_alias>(&p.desc)) {
+      line(j, "Ppat_alias " + str_loc(v->name));
+      pattern(j, *v->p);
+    } else if (auto* v = std::get_if<Ppat_constraint>(&p.desc)) {
+      line(j, "Ppat_constraint");
+      pattern(j, *v->p);
+      core_type(j, *v->t);
     }
   }
 
@@ -158,7 +210,44 @@ struct Printer {
       expression(j, *v->then_);
       if (v->else_) { line(j, "Some"); expression(j + 1, **v->else_); }
       else line(j, "None");
+    } else if (auto* v = std::get_if<Pexp_construct>(&e.desc)) {
+      line(j, "Pexp_construct " + lid_loc(v->id));
+      if (v->arg) { line(j, "Some"); expression(j + 1, **v->arg); }
+      else line(j, "None");
+    } else if (auto* v = std::get_if<Pexp_match>(&e.desc)) {
+      line(j, "Pexp_match");
+      expression(j, *v->e);
+      cases(j, v->cases);
+    } else if (auto* v = std::get_if<Pexp_try>(&e.desc)) {
+      line(j, "Pexp_try");
+      expression(j, *v->e);
+      cases(j, v->cases);
+    } else if (auto* v = std::get_if<Pexp_sequence>(&e.desc)) {
+      line(j, "Pexp_sequence");
+      expression(j, *v->e1);
+      expression(j, *v->e2);
+    } else if (auto* v = std::get_if<Pexp_constraint>(&e.desc)) {
+      line(j, "Pexp_constraint");
+      expression(j, *v->e);
+      core_type(j, *v->t);
+    } else if (auto* v = std::get_if<Pexp_field>(&e.desc)) {
+      line(j, "Pexp_field");
+      expression(j, *v->e);
+      line(j, lid_loc(v->field));  // longident_loc prints at i with no node header
     }
+  }
+
+  void one_case(int i, const Case& c) {
+    line(i, "<case>");
+    pattern(i + 1, c.lhs);
+    if (c.guard) { line(i + 1, "<when>"); expression(i + 2, **c.guard); }
+    expression(i + 1, *c.rhs);
+  }
+  void cases(int i, const std::vector<Case>& cs) {
+    if (cs.empty()) { line(i, "[]"); return; }
+    line(i, "[");
+    for (auto& c : cs) one_case(i + 1, c);
+    line(i, "]");
   }
 
   void function_param(int i, const FunctionParam& fp) {
@@ -170,9 +259,72 @@ struct Printer {
   }
 
   void function_body(int i, const FunctionBody& b) {
-    auto& fb = std::get<Pfunction_body>(b.v);
-    line(i, "Pfunction_body");
-    expression(i + 1, *fb.e);
+    if (auto* fb = std::get_if<Pfunction_body>(&b.v)) {
+      line(i, "Pfunction_body");
+      expression(i + 1, *fb->e);
+    } else {
+      auto& fc = std::get<Pfunction_cases>(b.v);
+      line(i, "Pfunction_cases " + loc(fc.loc));
+      cases(i + 1, fc.cases);
+    }
+  }
+
+  void label_decl(int i, const LabelDecl& d) {
+    line(i, loc(d.loc));
+    line(i + 1, mutable_flag(d.mut));
+    os << ind(i + 1) << str_loc(d.name);  // no newline: core_type runs onto this line
+    core_type(i + 1, *d.type);
+  }
+  void ctor_args(int i, const ConstructorArguments& a) {
+    if (auto* t = std::get_if<Pcstr_tuple>(&a)) {
+      if (t->elems.empty()) { line(i, "[]"); return; }
+      line(i, "["); for (auto& e : t->elems) core_type(i + 1, *e); line(i, "]");
+    } else {
+      auto& r = std::get<Pcstr_record>(a);
+      if (r.fields.empty()) { line(i, "[]"); return; }
+      line(i, "["); for (auto& f : r.fields) label_decl(i + 1, f); line(i, "]");
+    }
+  }
+  void constructor_decl(int i, const ConstructorDecl& c) {
+    line(i, loc(c.loc));
+    line(i + 1, str_loc(c.name));
+    ctor_args(i + 1, c.args);
+    if (c.res) { line(i + 1, "Some"); core_type(i + 2, **c.res); }
+    else line(i + 1, "None");
+  }
+  void type_kind(int i, const TypeKind& k) {
+    if (std::holds_alternative<Ptype_abstract>(k)) line(i, "Ptype_abstract");
+    else if (std::holds_alternative<Ptype_open>(k)) line(i, "Ptype_open");
+    else if (auto* v = std::get_if<Ptype_variant>(&k)) {
+      line(i, "Ptype_variant");
+      if (v->ctors.empty()) line(i + 1, "[]");
+      else { line(i + 1, "["); for (auto& c : v->ctors) constructor_decl(i + 2, c); line(i + 1, "]"); }
+    } else {
+      auto& r = std::get<Ptype_record>(k);
+      line(i, "Ptype_record");
+      if (r.fields.empty()) line(i + 1, "[]");
+      else { line(i + 1, "["); for (auto& f : r.fields) label_decl(i + 2, f); line(i + 1, "]"); }
+    }
+  }
+  void type_declaration(int i, const TypeDeclaration& d) {
+    line(i, "type_declaration " + str_loc(d.name) + " " + loc(d.loc));
+    int j = i + 1;
+    line(j, "ptype_params =");
+    if (d.params.empty()) line(j + 1, "[]");
+    else { line(j + 1, "["); for (auto& p : d.params) core_type(j + 2, *p); line(j + 1, "]"); }
+    line(j, "ptype_constraints =");
+    line(j + 1, "[]");
+    line(j, "ptype_kind =");
+    type_kind(j + 1, d.kind);
+    line(j, std::string("ptype_private = ") + private_flag(d.priv));
+    line(j, "ptype_manifest =");
+    if (d.manifest) { line(j + 1, "Some"); core_type(j + 2, **d.manifest); }
+    else line(j + 1, "None");
+  }
+  void module_expr(int i, const ModuleExpr& m) {
+    line(i, "module_expr " + loc(m.loc));
+    auto& id = std::get<Pmod_ident>(m.desc);
+    line(i + 1, "Pmod_ident " + lid_loc(id.id));
   }
 
   void value_bindings(int i, const std::vector<ValueBinding>& l) {
@@ -194,8 +346,15 @@ struct Printer {
       line(j, "Pstr_eval");
       expression(j, *v->e);
     } else if (auto* v = std::get_if<Pstr_value>(&s.desc)) {
-      line(j, std::string("Pstr_value ") + (v->rf == RecFlag::Recursive ? "Rec" : "Nonrec"));
+      line(j, std::string("Pstr_value ") + rec_flag(v->rf));
       value_bindings(j, v->bindings);
+    } else if (auto* v = std::get_if<Pstr_type>(&s.desc)) {
+      line(j, std::string("Pstr_type ") + rec_flag(v->rf));
+      if (v->decls.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& d : v->decls) type_declaration(j + 1, d); line(j, "]"); }
+    } else if (auto* v = std::get_if<Pstr_open>(&s.desc)) {
+      line(j, std::string("Pstr_open ") + override_flag(v->ovr));
+      module_expr(j, v->expr);
     }
   }
 
