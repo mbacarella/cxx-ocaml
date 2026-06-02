@@ -326,7 +326,14 @@ class Parser {
     }
   }
 
-  ExprBox parse_atom_postfix() { return postfix_field(parse_atom()); }
+  ExprBox parse_atom_postfix() {
+    ExprBox e = postfix_field(parse_atom());
+    while (cur().kind == Kind::LBRACKETAT) {  // e [@attr]  -> pexp_attributes
+      advance();
+      e->attrs.push_back(parse_attribute_body());
+    }
+    return e;
+  }
 
   ExprBox ident_expr(const std::string& name, Location l) {
     return E({Pexp_ident{.id = lid0(name, l)}, l});
@@ -1140,6 +1147,14 @@ class Parser {
   }
 
   ValueBinding parse_value_binding() {
+    ValueBinding vb = parse_value_binding_core();
+    while (cur().kind == Kind::LBRACKETATAT) {  // trailing  [@@attr]
+      advance();
+      vb.attrs.push_back(parse_attribute_body());
+    }
+    return vb;
+  }
+  ValueBinding parse_value_binding_core() {
     // val_ident form (`let f p.. = e`) vs pattern form (`let pat = e`).
     bool val_ident = cur().kind == Kind::LIDENT &&
                      (peek(1).kind == Kind::EQUAL || peek(1).kind == Kind::COLON ||
@@ -1186,10 +1201,16 @@ class Parser {
 
   std::pair<RecFlag, std::vector<ValueBinding>> parse_value_bindings() {
     expect(Kind::LET, "let");
+    Attributes letattrs;  // `let[@attr] …`  -> attached to the first binding
+    while (cur().kind == Kind::LBRACKETAT) { advance(); letattrs.push_back(parse_attribute_body()); }
     RecFlag rf = RecFlag::Nonrecursive;
     if (cur().kind == Kind::REC) { advance(); rf = RecFlag::Recursive; }
     std::vector<ValueBinding> binds;
     binds.push_back(parse_value_binding());
+    if (!letattrs.empty()) {  // prepend the let-attrs before any trailing [@@attr]
+      for (auto& a : binds[0].attrs) letattrs.push_back(std::move(a));
+      binds[0].attrs = std::move(letattrs);
+    }
     while (cur().kind == Kind::AND) { advance(); binds.push_back(parse_value_binding()); }
     return {rf, std::move(binds)};
   }
@@ -1324,6 +1345,14 @@ class Parser {
       advance();
     }
     return name;
+  }
+  // parse the body of an attribute (the `[@`/`[@@` has already been consumed):
+  //   name payload ]   with a structure payload (PStr).
+  Attribute parse_attribute_body() {
+    std::string name = parse_attr_name();
+    Structure payload = parse_structure_until(Kind::RBRACKET);
+    expect(Kind::RBRACKET, "]");
+    return Attribute{std::move(name), std::move(payload)};
   }
 
   ModuleExpr parse_module_expr() {

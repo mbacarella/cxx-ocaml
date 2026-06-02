@@ -75,8 +75,16 @@ struct Printer {
 
   void line(int i, const std::string& s) { os << ind(i) << s << '\n'; }
 
+  void attributes(int i, const Attributes& attrs) {  // printast `attributes i`
+    for (auto& a : attrs) {
+      line(i + 1, "attribute \"" + a.name + "\"");
+      structure_list(i + 2, a.payload);  // payload PStr
+    }
+  }
+
   void core_type(int i, const CoreType& t) {
     line(i, "core_type " + loc(t.loc));
+    attributes(i, t.attrs);
     int j = i + 1;
     if (std::holds_alternative<Ptyp_any>(t.desc)) line(j, "Ptyp_any");
     else if (auto* v = std::get_if<Ptyp_var>(&t.desc)) line(j, "Ptyp_var " + v->name);
@@ -148,6 +156,7 @@ struct Printer {
 
   void pattern(int i, const Pattern& p) {
     line(i, "pattern " + loc(p.loc));
+    attributes(i, p.attrs);
     int j = i + 1;
     if (std::holds_alternative<Ppat_any>(p.desc)) line(j, "Ppat_any");
     else if (auto* v = std::get_if<Ppat_var>(&p.desc))
@@ -207,6 +216,7 @@ struct Printer {
 
   void expression(int i, const Expression& e) {
     line(i, "expression " + loc(e.loc));
+    attributes(i, e.attrs);
     int j = i + 1;
     if (auto* v = std::get_if<Pexp_ident>(&e.desc))
       line(j, "Pexp_ident " + lid_loc(v->id));
@@ -473,6 +483,7 @@ struct Printer {
     for (auto& vb : l) {
       // list calls value_binding at i+1; <def> at i+1, its children at i+2.
       line(i + 1, "<def>");
+      attributes(i + 2, vb.attrs);
       pattern(i + 2, vb.pat);
       if (vb.constraint_) core_type(i + 2, **vb.constraint_);  // Pvc_constraint (bare core_type)
       expression(i + 2, *vb.expr);

@@ -29,6 +29,13 @@ struct Location {
 template <class T>
 using Box = std::unique_ptr<T>;
 
+// Forward-declared early so attributes (whose payload is a structure) can be
+// threaded through expression/pattern/type/binding nodes.
+struct StructureItem;
+using Structure = std::vector<StructureItem>;
+struct Attribute { std::string name; Structure payload; };  // [@name payload] (PStr)
+using Attributes = std::vector<Attribute>;
+
 // --- Longident.t ---
 // Children are boxed with shared_ptr so Longident/LongidentLoc stay *copyable*
 // (they are immutable and routinely passed by value into several AST nodes).
@@ -81,6 +88,7 @@ struct Ptyp_variant {
 struct CoreType {
   std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr, Ptyp_variant> desc;
   Location loc;
+  Attributes attrs;
 };
 
 // --- patterns ---
@@ -108,6 +116,7 @@ struct Pattern {
                Ppat_interval, Ppat_variant, Ppat_exception>
       desc;
   Location loc;
+  Attributes attrs;
 };
 
 // --- expressions (fragment) ---
@@ -156,6 +165,7 @@ struct Expression {
                Pexp_variant, Pexp_newtype>
       desc;
   Location loc;
+  Attributes attrs;
 };
 
 struct Case { Pattern lhs; std::optional<ExprBox> guard; ExprBox rhs; };
@@ -163,7 +173,8 @@ struct Case { Pattern lhs; std::optional<ExprBox> guard; ExprBox rhs; };
 struct ValueBinding {
   Pattern pat;
   ExprBox expr;
-  std::optional<CoreTypeBox> constraint_;  // Pvc_constraint (simple `: t`); attributes empty
+  std::optional<CoreTypeBox> constraint_;  // Pvc_constraint (simple `: t`)
+  Attributes attrs;                        // pvb_attributes
 };
 
 struct Pparam_val { Location loc; ArgLabel label; std::optional<ExprBox> default_; Pattern pat; };
@@ -226,10 +237,6 @@ struct PrimitiveDescription {
   std::vector<std::string> prims;
   Location loc;
 };
-
-// --- structure (forward-declared: modules nest structures) ---
-struct StructureItem;
-using Structure = std::vector<StructureItem>;
 
 // --- module expressions (subset: M, struct…end) ---
 struct Pmod_ident { LongidentLoc id; };

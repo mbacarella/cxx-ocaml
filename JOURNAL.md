@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **43.0%** corpus parity vs `ocamlc -dparsetree`. Covers a broad expression/pattern/type-decl/structure surface incl. GADTs, polymorphic variants, type extensions, newtype params, floating attributes `[@@@…]` and item extensions `[%%…]` (`[%%expect]` unblocks the expect-tests). Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2 → **43.0** (the jump = fixing the `Pconst_string` content-location bug, which was wrong for *every* string constant). Remaining tail: `[@attr]`/`[@@attr]` node attributes, objects/classes, first-class modules, `let module`/`let open`, signatures.
+- ◐ **Parser** — **50.2%** corpus parity vs `ocamlc -dparsetree`. Broad expression/pattern/type-decl/structure surface incl. GADTs, polymorphic variants, type extensions, newtype params, attributes & extensions threaded through the AST (`let[@inline]`, `e [@attr]`, `[@@inline]`, `[@@@…]`, `[%%expect]`). Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2 → 43.0 → **50.2**. Remaining tail: objects/classes, first-class modules, `let module`/`let open` in expressions, `[%ext]`, signatures, `(module M)` patterns.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -306,3 +306,16 @@ Added structure-level items (which gate whole files early), byte-validated:
   bug was poisoning across the corpus. A clean illustration of the thesis: a
   single subtle, pervasive location detail, invisible until the oracle surfaced
   it, was suppressing a third of the corpus.
+
+### 2026-06-02 — node attributes → 50.2% (day 0 cont.)
+
+- Threaded `Attributes` (vector of `{name, structure payload}`) through the AST:
+  reorganized the header to forward-declare `Structure`/`Attribute` early, added
+  an `attrs` field to `Expression`/`Pattern`/`CoreType`/`ValueBinding`, and print
+  them in the exact positions (`pexp_attributes` after the expr loc line;
+  `pvb_attributes` inside `<def>` before the pattern, indented one deeper).
+- Parser: `e [@attr]` (postfix on atoms), `let[@inline] …` (after `let`, onto the
+  first binding), and trailing `let … = e [@@inline]` (onto that binding).
+- Parity 43.0% → **50.2%** (201/400); parse-errors 202→172. Past the halfway mark.
+  Tail now: objects/classes, first-class modules, `let module`/`let open` exprs,
+  `[%ext]` nodes, signatures, `(module M)` patterns.
