@@ -153,6 +153,9 @@ struct Pexp_assert { ExprBox e; };
 struct Pexp_lazy { ExprBox e; };
 struct Pexp_variant { std::string label; std::optional<ExprBox> arg; };
 struct Pexp_newtype { StringLoc name; ExprBox body; };  // fun (type a) -> e
+// fork-specific: `let open … in e`, `let module … in e`, `M.(e)` all lower to a
+// structure item scoped over an expression.
+struct Pexp_struct_item { Box<StructureItem> item; ExprBox body; };
 struct Pexp_while { ExprBox cond; ExprBox body; };
 struct Pexp_for { Pattern var; ExprBox lo; ExprBox hi; DirectionFlag dir; ExprBox body; };
 struct Pexp_array { std::vector<ExprBox> elems; };
@@ -162,7 +165,7 @@ struct Expression {
                Pexp_tuple, Pexp_ifthenelse, Pexp_construct, Pexp_match, Pexp_try,
                Pexp_sequence, Pexp_constraint, Pexp_field, Pexp_record,
                Pexp_assert, Pexp_lazy, Pexp_while, Pexp_for, Pexp_array,
-               Pexp_variant, Pexp_newtype>
+               Pexp_variant, Pexp_newtype, Pexp_struct_item>
       desc;
   Location loc;
   Attributes attrs;
@@ -256,10 +259,11 @@ struct Pstr_primitive { PrimitiveDescription prim; };
 struct Pstr_module { ModuleBinding binding; };
 struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
 struct Pstr_extension { std::string name; Structure payload; };  // [%%ext …]
+struct Pstr_include { ModuleExpr expr; };
 struct StructureItem {
   std::variant<Pstr_eval, Pstr_value, Pstr_type, Pstr_open, Pstr_exception,
                Pstr_typext, Pstr_primitive, Pstr_module, Pstr_attribute,
-               Pstr_extension>
+               Pstr_extension, Pstr_include>
       desc;
   Location loc;
 };

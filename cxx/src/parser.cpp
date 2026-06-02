@@ -523,6 +523,15 @@ class Parser {
     Token t = cur();
     switch (t.kind) {
       case Kind::LET: {
+        if (peek(1).kind == Kind::OPEN || peek(1).kind == Kind::MODULE) {
+          // let open M in e  /  let module M = me in e  -> Pexp_struct_item
+          advance();  // let
+          StructureItem si = parse_structure_item();
+          expect(Kind::IN, "in");
+          ExprBox body = parse_expr();
+          Location l = span(position(t.start), body->loc.end);
+          return E({Pexp_struct_item{box(std::move(si)), std::move(body)}, l});
+        }
         auto [rf, binds] = parse_value_bindings();
         expect(Kind::IN, "in");
         ExprBox body = parse_expr();
@@ -1219,6 +1228,12 @@ class Parser {
   StructureItem parse_structure_item() {
     Token t = cur();
     if (t.kind == Kind::LET) {
+      if (peek(1).kind == Kind::OPEN || peek(1).kind == Kind::MODULE) {
+        // let open/module … in …  is an expression statement
+        ExprBox e = parse_expr();
+        Location l = e->loc;
+        return StructureItem{Pstr_eval{std::move(e)}, l};
+      }
       size_t save = idx_;
       auto [rf, binds] = parse_value_bindings();
       if (cur().kind == Kind::IN) {  // it's actually a let-expression statement
@@ -1229,6 +1244,12 @@ class Parser {
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_value{rf, std::move(binds)}, l};
+    }
+    if (t.kind == Kind::INCLUDE) {
+      advance();
+      ModuleExpr me = parse_module_expr();
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return StructureItem{Pstr_include{std::move(me)}, l};
     }
     if (t.kind == Kind::TYPE) {
       advance();

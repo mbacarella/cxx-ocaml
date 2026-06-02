@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **50.2%** corpus parity vs `ocamlc -dparsetree`. Broad expression/pattern/type-decl/structure surface incl. GADTs, polymorphic variants, type extensions, newtype params, attributes & extensions threaded through the AST (`let[@inline]`, `e [@attr]`, `[@@inline]`, `[@@@…]`, `[%%expect]`). Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2 → 43.0 → **50.2**. Remaining tail: objects/classes, first-class modules, `let module`/`let open` in expressions, `[%ext]`, signatures, `(module M)` patterns.
+- ◐ **Parser** — **51.2%** corpus parity vs `ocamlc -dparsetree`. Broad expression/pattern/type-decl/structure surface incl. GADTs, polymorphic variants, type extensions, newtype params, attributes/extensions, `let open`/`let module … in` (this fork's `Pexp_struct_item`), `include`. Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2 → 43.0 → 50.2 → **51.2**. The tail has flattened (~1%/construct); remaining big-ticket subsystems: **functors + module types/signatures**, **objects/classes**, `[%ext]` nodes, `(module M)` first-class modules, `M.(e)`/`a.{i}` sugar.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -319,3 +319,21 @@ Added structure-level items (which gate whole files early), byte-validated:
 - Parity 43.0% → **50.2%** (201/400); parse-errors 202→172. Past the halfway mark.
   Tail now: objects/classes, first-class modules, `let module`/`let open` exprs,
   `[%ext]` nodes, signatures, `(module M)` patterns.
+
+### 2026-06-02 — open/include + a fork AST discovery → 51.2% (day 0 cont.)
+
+- `let open M in e` and `let module M = me in e` and `include M`. Discovered via
+  the oracle that **this fork replaced `Pexp_open`/`Pexp_letmodule` with a unified
+  `Pexp_struct_item of structure_item * expression`** — local opens/modules wrap a
+  structure item over the body. Modelled it directly (the oracle is the spec, not
+  upstream OCaml's AST). Matched the `Pstr_include` print quirk (no trailing
+  newline before `module_expr`).
+- Parity 50.2% → **51.2%** (205/400). Small (+4) — the long tail is now ~1% per
+  construct. The remaining proportional gains are in big subsystems (functors +
+  signatures, objects/classes), each a multi-hour push rather than a quick win.
+
+**State of the experiment (end of day 0):** lexer 100% (predicted 2–4 days, done
+in a session); parser at 51% of the testsuite corpus, up from a tracer bullet, via
+a long sequence of oracle-driven diffs. The recurring lesson: correct transcription
+is cheap; the leverage is in the few pervasive details (the string-loc bug, the
+`Pexp_struct_item` fork divergence) that only a differential oracle surfaces.

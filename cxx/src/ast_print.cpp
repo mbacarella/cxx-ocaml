@@ -325,6 +325,10 @@ struct Printer {
     } else if (auto* v = std::get_if<Pexp_newtype>(&e.desc)) {
       line(j, "Pexp_newtype \"" + v->name.txt + "\"");
       expression(j, *v->body);
+    } else if (auto* v = std::get_if<Pexp_struct_item>(&e.desc)) {
+      line(j, "Pexp_struct_item");
+      structure_item(j, *v->item);
+      expression(j, *v->body);
     }
   }
 
@@ -525,6 +529,9 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_extension>(&s.desc)) {
       line(j, "Pstr_extension \"" + v->name + "\"");
       structure_list(j, v->payload);  // extension payload at i
+    } else if (auto* v = std::get_if<Pstr_include>(&s.desc)) {
+      os << ind(j) << "Pstr_include";  // printast prints this with no trailing newline
+      module_expr(j, v->expr);
     }
   }
 
