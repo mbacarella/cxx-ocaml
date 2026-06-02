@@ -68,6 +68,149 @@ char char_for_backslash(char c) {
   }
 }
 
+// --- UTF-8 + Latin-9 identifier support (ports utils/misc.ml Utf8_lexeme) ---
+//
+// OCaml only admits Latin-9 letters (plus ASCII) in identifiers, via the fixed
+// table get_known_char. We port exactly that bounded set.
+
+enum class L9 { None, Upper, Lower };
+L9 latin9_case(int cp) {
+  if ((cp >= 0xc0 && cp <= 0xd6) || (cp >= 0xd8 && cp <= 0xde) ||
+      cp == 0x160 || cp == 0x17d || cp == 0x152 || cp == 0x178 || cp == 0x1e9e)
+    return L9::Upper;
+  if ((cp >= 0xe0 && cp <= 0xf6) || (cp >= 0xf8 && cp <= 0xfe) ||
+      cp == 0xdf || cp == 0xff || cp == 0x161 || cp == 0x17e || cp == 0x153)
+    return L9::Lower;
+  return L9::None;
+}
+bool uchar_is_uppercase(int cp) {
+  if (cp < 0x80) return cp >= 'A' && cp <= 'Z';
+  return latin9_case(cp) == L9::Upper;
+}
+bool uchar_valid_in_identifier(int cp, bool with_dot = false) {
+  if (cp < 0x80)
+    return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') ||
+           (cp >= '0' && cp <= '9') || cp == '_' || cp == '\'' ||
+           (with_dot && cp == '.');
+  return latin9_case(cp) != L9::None;
+}
+bool uchar_not_identifier_start(int cp) {
+  return (cp >= '0' && cp <= '9') || cp == '\'';
+}
+
+// Decode one UTF-8 scalar at s[i]. On a malformed lead/continuation, returns the
+// replacement scalar 0xFFFD with length 1 (mirrors Uchar.rep in validation).
+struct UDec { int cp; size_t len; };
+UDec utf8_decode(std::string_view s, size_t i) {
+  auto b = [&](size_t k) { return k < s.size() ? static_cast<unsigned char>(s[k]) : 0; };
+  unsigned c0 = b(i);
+  auto cont = [&](size_t k) { return b(k) >= 0x80 && b(k) <= 0xBF; };
+  if (c0 < 0x80) return {static_cast<int>(c0), 1};
+  if (c0 >= 0xC2 && c0 <= 0xDF && cont(i + 1))
+    return {static_cast<int>(((c0 & 0x1F) << 6) | (b(i + 1) & 0x3F)), 2};
+  if (c0 >= 0xE0 && c0 <= 0xEF && cont(i + 1) && cont(i + 2))
+    return {static_cast<int>(((c0 & 0x0F) << 12) | ((b(i + 1) & 0x3F) << 6) |
+                             (b(i + 2) & 0x3F)),
+            3};
+  if (c0 >= 0xF0 && c0 <= 0xF4 && cont(i + 1) && cont(i + 2) && cont(i + 3))
+    return {static_cast<int>(((c0 & 0x07) << 18) | ((b(i + 1) & 0x3F) << 12) |
+                             ((b(i + 2) & 0x3F) << 6) | (b(i + 3) & 0x3F)),
+            4};
+  return {0xFFFD, 1};  // invalid
+}
+
+void append_utf8(std::string& out, int cp) {
+  if (cp < 0x80) {
+    out += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    out += static_cast<char>(0xC0 | (cp >> 6));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    out += static_cast<char>(0xE0 | (cp >> 12));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    out += static_cast<char>(0xF0 | (cp >> 18));
+    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  }
+}
+
+bool is_scalar_value(int cp) {
+  return cp >= 0 && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
+}
+
+// NFD->NFC for the Latin-9 base+combining pairs (ports get_known_pair).
+int known_pair(char base, int comb) {
+  switch (comb) {
+    case 0x300:  // grave
+      switch (base) { case 'A': return 0xc0; case 'E': return 0xc8; case 'I': return 0xcc;
+        case 'O': return 0xd2; case 'U': return 0xd9; case 'a': return 0xe0; case 'e': return 0xe8;
+        case 'i': return 0xec; case 'o': return 0xf2; case 'u': return 0xf9; } break;
+    case 0x301:  // acute
+      switch (base) { case 'A': return 0xc1; case 'E': return 0xc9; case 'I': return 0xcd;
+        case 'O': return 0xd3; case 'U': return 0xda; case 'Y': return 0xdd; case 'a': return 0xe1;
+        case 'e': return 0xe9; case 'i': return 0xed; case 'o': return 0xf3; case 'u': return 0xfa;
+        case 'y': return 0xfd; } break;
+    case 0x302:  // circumflex
+      switch (base) { case 'A': return 0xc2; case 'E': return 0xca; case 'I': return 0xce;
+        case 'O': return 0xd4; case 'U': return 0xdb; case 'a': return 0xe2; case 'e': return 0xea;
+        case 'i': return 0xee; case 'o': return 0xf4; case 'u': return 0xfb; } break;
+    case 0x303:  // tilde
+      switch (base) { case 'A': return 0xc3; case 'N': return 0xd1; case 'O': return 0xd5;
+        case 'a': return 0xe3; case 'n': return 0xf1; case 'o': return 0xf5; } break;
+    case 0x308:  // diaeresis
+      switch (base) { case 'A': return 0xc4; case 'E': return 0xcb; case 'I': return 0xcf;
+        case 'O': return 0xd6; case 'U': return 0xdc; case 'Y': return 0x178; case 'a': return 0xe4;
+        case 'e': return 0xeb; case 'i': return 0xef; case 'o': return 0xf6; case 'u': return 0xfc;
+        case 'y': return 0xff; } break;
+    case 0x30a:  // ring
+      switch (base) { case 'A': return 0xc5; case 'a': return 0xe5; } break;
+    case 0x327:  // cedilla
+      switch (base) { case 'C': return 0xc7; case 'c': return 0xe7; } break;
+    case 0x30c:  // caron
+      switch (base) { case 'S': return 0x160; case 'Z': return 0x17d; case 's': return 0x161;
+        case 'z': return 0x17e; } break;
+  }
+  return -1;
+}
+
+// Normalize a UTF-8 string to NFC over the Latin-9 pairs. Returns (nfc, valid),
+// valid == false if any scalar is malformed/non-scalar (ports normalize).
+std::pair<std::string, bool> utf8_normalize(std::string_view s) {
+  if (s.empty()) return {"", true};
+  std::string out;
+  UDec d = utf8_decode(s, 0);
+  bool valid = d.cp != 0xFFFD && is_scalar_value(d.cp);
+  int prev = d.cp;
+  size_t i = d.len;
+  while (i < s.size()) {
+    UDec dn = utf8_decode(s, i);
+    valid = valid && dn.cp != 0xFFFD && is_scalar_value(dn.cp);
+    int comb = (prev >= 0 && prev < 256) ? known_pair(static_cast<char>(prev), dn.cp) : -1;
+    if (comb >= 0) {
+      prev = comb;
+    } else {
+      append_utf8(out, prev);
+      prev = dn.cp;
+    }
+    i += dn.len;
+  }
+  append_utf8(out, prev);
+  return {out, valid};
+}
+
+// Whether a normalized identifier string is all-lowercase (ports is_lowercase).
+bool ident_is_lowercase(std::string_view s) {
+  for (size_t i = 0; i < s.size();) {
+    UDec d = utf8_decode(s, i);
+    if (!uchar_valid_in_identifier(d.cp) || uchar_is_uppercase(d.cp)) return false;
+    i += d.len;
+  }
+  return true;
+}
+
 // The OCaml keyword table (lexer.mll all_keywords). Only the default edition is
 // modelled: every keyword whose "since" version is <= the language version is
 // active. For trunk all of these are active. Value tokens (lor/mod/...) map to
@@ -192,19 +335,11 @@ Token Lexer::raw_token() {
     return raw_token();
   }
 
-  if (is_lower(c)) return scan_ident_lower(start);
-  if (is_upper(c)) return scan_ident_upper(start);
-  if (static_cast<unsigned char>(c) >= 0xC0) {
-    // TODO: full UTF-8 extended identifiers w/ normalization + validation.
-    // Best-effort: consume a UTF-8 ident run and emit LIDENT.
-    pos_++;
-    while (!eof() &&
-           (is_identchar(cur()) || static_cast<unsigned char>(cur()) >= 0x80))
-      pos_++;
-    Token t = Token::make(Kind::LIDENT, start, pos_);
-    t.text = std::string(src_.substr(start, pos_ - start));
-    return t;
-  }
+  // raw identifier escape: "\#" before an identifier lets a keyword be used as
+  // a (lowercase) identifier.
+  if (c == '\\' && at(pos_ + 1) == '#') return scan_ident(start);
+  if (is_lower(c) || is_upper(c) || static_cast<unsigned char>(c) >= 0xC0)
+    return scan_ident(start);
   if (is_digit(c)) return scan_number(start);
   if (c == '"') return scan_string(start);
   if (c == '\'') return scan_char_or_quote(start);
@@ -270,39 +405,92 @@ std::vector<Token> Lexer::tokenize() {
   return out;
 }
 
-Token Lexer::scan_ident_lower(size_t start) {
-  pos_++;
-  while (!eof() && is_identchar(cur())) pos_++;
-  std::string name(src_.substr(start, pos_ - start));
+Token Lexer::scan_ident(size_t start) {
+  // Optional raw-identifier escape "\#": forces a lowercase identifier and
+  // bypasses the keyword table (e.g. \#and -> LIDENT "and"). The escape is part
+  // of the lexeme span but not of the identifier text.
+  bool raw_escape = false;
+  size_t name_start = start;
+  if (src_[pos_] == '\\' && at(pos_ + 1) == '#') {
+    raw_escape = true;
+    pos_ += 2;
+    name_start = pos_;
+  }
 
-  if (name == "_") return Token::make(Kind::UNDERSCORE, start, pos_);
+  // Consume identstart_ext identchar_ext* by byte pattern (matches the ocamllex
+  // regexp): a utf8 "char" is a lead byte 0xC0-0xFF + continuation 0x80-0xBF*.
+  bool has_utf8 = false;
+  auto consume_utf8 = [&](size_t p) -> size_t {
+    size_t q = p + 1;
+    while (q < src_.size() && static_cast<unsigned char>(src_[q]) >= 0x80 &&
+           static_cast<unsigned char>(src_[q]) <= 0xBF)
+      q++;
+    return q;
+  };
+  size_t p = pos_;
+  if (static_cast<unsigned char>(src_[p]) >= 0xC0) { has_utf8 = true; p = consume_utf8(p); }
+  else p++;  // ascii letter or '_'
+  while (p < src_.size()) {
+    unsigned char ch = src_[p];
+    if (is_identchar(static_cast<char>(ch))) p++;
+    else if (ch >= 0xC0) { has_utf8 = true; p = consume_utf8(p); }
+    else break;
+  }
+  pos_ = p;
+  std::string name(src_.substr(name_start, p - name_start));
 
-  // let-op / and-op: "let"/"and" immediately followed by kwdopchar.
-  if ((name == "let" || name == "and") && is_kwdopchar(cur())) {
-    size_t op_start = start;
-    pos_++;  // kwdopchar
-    while (!eof() && is_dotsymbolchar(cur())) pos_++;
-    Token t = Token::make(name == "let" ? Kind::LETOP : Kind::ANDOP, op_start, pos_);
-    t.text = std::string(src_.substr(op_start, pos_ - op_start));
+  if (!has_utf8) {
+    char c0 = name[0];
+    bool capitalized = (c0 >= 'A' && c0 <= 'Z');
+    if (raw_escape) {
+      if (capitalized) throw LexError("Capitalized raw identifier", start);
+      Token t = Token::make(Kind::LIDENT, start, pos_);
+      t.text = std::move(name);
+      return t;
+    }
+    if (capitalized) {
+      Token t = Token::make(Kind::UIDENT, start, pos_);
+      t.text = std::move(name);
+      return t;
+    }
+    if (name == "_") return Token::make(Kind::UNDERSCORE, start, pos_);
+    // let-op / and-op: "let"/"and" immediately followed by kwdopchar.
+    if ((name == "let" || name == "and") && is_kwdopchar(cur())) {
+      pos_++;  // kwdopchar
+      while (!eof() && is_dotsymbolchar(cur())) pos_++;
+      Token t = Token::make(name == "let" ? Kind::LETOP : Kind::ANDOP, start, pos_);
+      t.text = std::string(src_.substr(start, pos_ - start));
+      return t;
+    }
+    auto it = keyword_table().find(name);
+    if (it != keyword_table().end()) {
+      Token t = Token::make(it->second.kind, start, pos_);
+      if (it->second.text) t.text = it->second.text;  // INFIXOP keyword (mod, lsl, ...)
+      return t;
+    }
+    Token t = Token::make(Kind::LIDENT, start, pos_);
+    t.text = std::move(name);
     return t;
   }
 
-  auto it = keyword_table().find(name);
-  if (it != keyword_table().end()) {
-    Token t = Token::make(it->second.kind, start, pos_);
-    if (it->second.text) t.text = it->second.text;  // INFIXOP keyword (mod, lsl, ...)
-    return t;
+  // Extended (contains Latin-9 / utf8): normalize to NFC, validate, classify by
+  // capitalization of the first scalar.
+  auto [nfc, enc_ok] = utf8_normalize(name);
+  if (!enc_ok) throw LexError("Invalid encoding of identifier", name_start);
+  for (size_t i = 0; i < nfc.size();) {
+    UDec d = utf8_decode(nfc, i);
+    if (!uchar_valid_in_identifier(d.cp))
+      throw LexError("Invalid char in identifier", name_start);
+    if (i == 0 && uchar_not_identifier_start(d.cp))
+      throw LexError("Invalid ident start", name_start);
+    i += d.len;
   }
-  Token t = Token::make(Kind::LIDENT, start, pos_);
-  t.text = std::move(name);
-  return t;
-}
-
-Token Lexer::scan_ident_upper(size_t start) {
-  pos_++;
-  while (!eof() && is_identchar(cur())) pos_++;
-  Token t = Token::make(Kind::UIDENT, start, pos_);
-  t.text = std::string(src_.substr(start, pos_ - start));
+  UDec first = utf8_decode(nfc, 0);
+  bool capitalized = uchar_is_uppercase(first.cp);
+  if (raw_escape && capitalized) throw LexError("Capitalized raw identifier", start);
+  Kind k = (!raw_escape && capitalized) ? Kind::UIDENT : Kind::LIDENT;
+  Token t = Token::make(k, start, pos_);
+  t.text = std::move(nfc);
   return t;
 }
 
@@ -441,45 +629,34 @@ Token Lexer::scan_string(size_t start) {
         continue;
       }
       if (is_digit(e) && is_digit(at(pos_ + 2)) && is_digit(at(pos_ + 3))) {
-        store(static_cast<char>(100 * (e - '0') + 10 * (at(pos_ + 2) - '0') +
-                                (at(pos_ + 3) - '0')));
+        int v = 100 * (e - '0') + 10 * (at(pos_ + 2) - '0') + (at(pos_ + 3) - '0');
+        if (v > 255) throw LexError("Illegal decimal escape", pos_);  // out of 0-255
+        store(static_cast<char>(v));
         pos_ += 4;
         continue;
       }
-      if (e == 'o') {
-        store(static_cast<char>(64 * (at(pos_ + 2) - '0') + 8 * (at(pos_ + 3) - '0') +
-                                (at(pos_ + 4) - '0')));
+      if (e == 'o' && at(pos_ + 2) >= '0' && at(pos_ + 2) <= '7' &&
+          at(pos_ + 3) >= '0' && at(pos_ + 3) <= '7' && at(pos_ + 4) >= '0' &&
+          at(pos_ + 4) <= '7') {
+        int v = 64 * (at(pos_ + 2) - '0') + 8 * (at(pos_ + 3) - '0') + (at(pos_ + 4) - '0');
+        if (v > 255) throw LexError("Illegal octal escape", pos_);  // out of 0-255
+        store(static_cast<char>(v));
         pos_ += 5;
         continue;
       }
       if (e == 'x' && is_hex(at(pos_ + 2)) && is_hex(at(pos_ + 3))) {
         store(static_cast<char>(16 * digit_value(at(pos_ + 2)) + digit_value(at(pos_ + 3))));
-        pos_ += 5;
+        pos_ += 4;  // '\' 'x' H H
         continue;
       }
-      if (e == 'u' && at(pos_ + 2) == '{') {
-        // \u{HHH} -> UTF-8 encode the scalar value.
+      if (e == 'u' && at(pos_ + 2) == '{' && is_hex(at(pos_ + 3))) {
+        // \u{HHH} -> UTF-8 encode the scalar value (1..6 hex digits).
         size_t q = pos_ + 3;
-        int cp = 0;
-        while (is_hex(at(q))) { cp = cp * 16 + digit_value(at(q)); q++; }
-        // (assume well-formed '}'; TODO: validate scalar value range)
+        int cp = 0, ndig = 0;
+        while (is_hex(at(q))) { cp = cp * 16 + digit_value(at(q)); q++; ndig++; }
+        if (ndig > 6 || !is_scalar_value(cp)) throw LexError("Illegal \\u escape", pos_);
         if (at(q) == '}') q++;
-        // UTF-8 encode
-        if (cp < 0x80) {
-          store(static_cast<char>(cp));
-        } else if (cp < 0x800) {
-          store(static_cast<char>(0xC0 | (cp >> 6)));
-          store(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else if (cp < 0x10000) {
-          store(static_cast<char>(0xE0 | (cp >> 12)));
-          store(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-          store(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
-          store(static_cast<char>(0xF0 | (cp >> 18)));
-          store(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-          store(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-          store(static_cast<char>(0x80 | (cp & 0x3F)));
-        }
+        append_utf8(strbuf_, cp);
         pos_ = q;
         continue;
       }
@@ -561,6 +738,32 @@ void Lexer::scan_comment() {
       if (!eof()) pos_++;  // closing "
       continue;
     }
+    if (cur() == '{') {
+      // skip a quoted string {delim|...|delim} (incl. {%id|, {%%id|) so that
+      // "*)" inside it doesn't end the comment. Uses lax delimiter validation.
+      size_t p = pos_ + 1;
+      if (at(p) == '%') { p++; if (at(p) == '%') p++;
+        while (p < src_.size() && (is_identchar(src_[p]) || src_[p] == '.' ||
+                                   static_cast<unsigned char>(src_[p]) >= 0x80)) p++;
+        while (p < src_.size() && is_blank(src_[p])) p++;
+      }
+      size_t d0 = p;
+      while (p < src_.size() && ((src_[p] >= 'a' && src_[p] <= 'z') ||
+                                 (src_[p] >= 'A' && src_[p] <= 'Z') ||
+                                 static_cast<unsigned char>(src_[p]) >= 0x80)) p++;
+      if (p < src_.size() && src_[p] == '|') {
+        auto [delim, ok] = utf8_normalize(src_.substr(d0, p - d0));
+        if (ok && ident_is_lowercase(delim)) {
+          pos_ = p + 1;
+          std::string closer = "|" + delim + "}";
+          while (!eof() && !looking_at(closer)) pos_++;
+          if (!eof()) pos_ += closer.size();
+          continue;
+        }
+      }
+      pos_++;  // not a quoted string: '{' is an ordinary comment character
+      continue;
+    }
     pos_++;
   }
 }
@@ -617,21 +820,56 @@ Token Lexer::scan_optlabel_or_question(size_t start) {
 }
 
 Token Lexer::scan_brace(size_t start) {
-  // "{" delim_ext "|"  -> quoted string ;  "{<" -> LBRACELESS ; else LBRACE
-  // (TODO: {% extattrident | and {%% ... | quoted-string extensions)
+  auto is_delim_byte = [](unsigned char ch) {
+    // delim_ext = (lowercase | uppercase | utf8)* ; any high byte is utf8.
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch >= 0x80;
+  };
+
+  // Quoted-string extensions:
+  //   {%  extattrident [blank+ delim] |  ...  |delim}  -> QUOTED_STRING_EXPR
+  //   {%% extattrident [blank+ delim] |  ...  |delim}  -> QUOTED_STRING_ITEM
   if (looking_at("{%")) {
-    // best-effort: not yet supported; fall through to LBRACE-ish handling later.
-    // For now emit LBRACE and let the '%' be lexed next (will diverge; tracked).
-    // TODO: QUOTED_STRING_EXPR / QUOTED_STRING_ITEM.
+    bool item = looking_at("{%%");
+    size_t p = pos_ + (item ? 3 : 2);
+    size_t id_start = p;
+    // extattrident = ident_ext ('.' ident_ext)*
+    while (p < src_.size()) {
+      unsigned char ch = src_[p];
+      if (is_identchar(static_cast<char>(ch)) || ch == '.' || ch >= 0x80) p++;
+      else break;
+    }
+    std::string id(src_.substr(id_start, p - id_start));
+    std::string delim;
+    bool ok = false;
+    if (p < src_.size() && src_[p] == '|') { p++; ok = true; }  // empty delim
+    else {
+      while (p < src_.size() && is_blank(src_[p])) p++;
+      size_t d0 = p;
+      while (p < src_.size() && is_delim_byte(src_[p])) p++;
+      delim = std::string(src_.substr(d0, p - d0));
+      if (p < src_.size() && src_[p] == '|') { p++; ok = true; }
+    }
+    if (ok) {
+      pos_ = p;  // just past the opening '|'
+      Token t = scan_quoted_string(start, delim);
+      t.kind = item ? Kind::QUOTED_STRING_ITEM : Kind::QUOTED_STRING_EXPR;
+      t.ext_id = std::move(id);
+      t.delim = delim;  // Some delim (Some "" when empty)
+      return t;
+    }
+    // malformed extension head: fall back to LBRACE
+    pos_++;
+    return Token::make(Kind::LBRACE, start, pos_);
   }
-  // try delim_ext then '|'
+
+  // "{" delim_ext "|"  -> quoted string. The delimiter must normalize to a
+  // lowercase identifier (validate_delim), else it is an error.
   size_t p = pos_ + 1;
-  while (p < src_.size() &&
-         ((src_[p] >= 'a' && src_[p] <= 'z') || (src_[p] >= 'A' && src_[p] <= 'Z') ||
-          static_cast<unsigned char>(src_[p]) >= 0xC0))
-    p++;
+  while (p < src_.size() && is_delim_byte(src_[p])) p++;
   if (p < src_.size() && src_[p] == '|') {
-    std::string delim(src_.substr(pos_ + 1, p - (pos_ + 1)));
+    auto [delim, enc_ok] = utf8_normalize(src_.substr(pos_ + 1, p - (pos_ + 1)));
+    if (!enc_ok) throw LexError("Invalid encoding of delimiter", start);
+    if (!ident_is_lowercase(delim)) throw LexError("Non-lowercase delimiter", start);
     pos_ = p + 1;  // past '|'
     return scan_quoted_string(start, delim);
   }
@@ -641,7 +879,40 @@ Token Lexer::scan_brace(size_t start) {
 }
 
 Token Lexer::scan_hash(size_t start) {
-  // TODO: line directives (# <num> "<file>") at beginning of line.
+  // Line directive: at the beginning of a line,
+  //   # [ \t]* <num> [ \t]* "<file>" [^\n\r]*
+  // updates location and produces no token. An out-of-range <num> is an error.
+  bool at_bol = (start == 0) || (src_[start - 1] == '\n');
+  if (at_bol) {
+    size_t p = pos_ + 1;
+    while (p < src_.size() && (src_[p] == ' ' || src_[p] == '\t')) p++;
+    size_t num_start = p;
+    while (p < src_.size() && is_digit(src_[p])) p++;
+    if (p > num_start) {
+      size_t num_end = p;
+      while (p < src_.size() && (src_[p] == ' ' || src_[p] == '\t')) p++;
+      if (p < src_.size() && src_[p] == '"') {
+        size_t q = p + 1;
+        while (q < src_.size() && src_[q] != '"' && src_[q] != '\n' && src_[q] != '\r') q++;
+        if (q < src_.size() && src_[q] == '"') {
+          // matched a directive head; consume the rest of the line
+          size_t r = q + 1;
+          while (r < src_.size() && src_[r] != '\n' && src_[r] != '\r') r++;
+          // OCaml parses <num> with int_of_string (63-bit); overflow -> error.
+          std::string_view num = src_.substr(num_start, num_end - num_start);
+          size_t nz = num.find_first_not_of('0');
+          std::string_view sig = (nz == std::string_view::npos) ? "0" : num.substr(nz);
+          static constexpr std::string_view kMaxInt = "4611686018427387903";  // 2^62-1
+          bool overflow = sig.size() > kMaxInt.size() ||
+                          (sig.size() == kMaxInt.size() && sig > kMaxInt);
+          if (overflow) throw LexError("Invalid directive: line number out of range", num_start);
+          pos_ = r;            // location update is a no-op for byte offsets
+          return raw_token();  // directive produces no token; continue
+        }
+      }
+    }
+    // not a well-formed directive: fall through to HASH / HASHOP
+  }
   // "#" symbolchar_or_hash+ -> HASHOP ; else HASH
   if (is_symbolchar_or_hash(at(pos_ + 1))) {
     size_t q = pos_ + 1;
@@ -735,7 +1006,12 @@ Token Lexer::scan_symbol(size_t start) {
   bool use_open = open_len > ded_len;  // ties -> dedicated (earlier rule)
   if (use_open) {
     Token t = Token::make(open_kind, start, pos_ + open_len);
-    t.text = std::string(src_.substr(start, open_len));
+    // DOTOP captures the operator *after* the leading '.'; all other open-ended
+    // operators include their starter character.
+    if (open_kind == Kind::DOTOP)
+      t.text = std::string(src_.substr(start + 1, open_len - 1));
+    else
+      t.text = std::string(src_.substr(start, open_len));
     pos_ += open_len;
     return t;
   }

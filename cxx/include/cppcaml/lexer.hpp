@@ -47,8 +47,7 @@ class Lexer {
   bool looking_at(std::string_view s) const { return src_.substr(pos_).starts_with(s); }
 
   // --- sub-lexers (mirror the named rules in lexer.mll) ---
-  Token scan_ident_lower(size_t start);
-  Token scan_ident_upper(size_t start);
+  Token scan_ident(size_t start);  // ASCII + Latin-9 extended identifiers
   Token scan_number(size_t start);
   Token scan_char_or_quote(size_t start);
   Token scan_string(size_t start);     // after opening '"'

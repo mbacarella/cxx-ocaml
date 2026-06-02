@@ -72,7 +72,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 | Stage | Predicted | Actual | Notes |
 |---|---|---|---|
 | Foundations | 2–4 days | folded into lexer stage (day 0) | Token type + Location offsets done inline |
-| Lexer | 2–4 days | day 0: **98.2% parity**, tail open | maximal-munch + escapes correct on first build |
+| Lexer | 2–4 days | **day 0: 100% parity (1853/1853)** | beat the low end of the estimate |
 | Parser | 1.5–3 weeks | — | |
 | Typer | 1.5–4 months | — | |
 | Lambda | 3–6 weeks | — | |
@@ -83,24 +83,27 @@ Scoreboard (filled in as stages land, to check the predictions):
 ## Progress dashboard  (updated 2026-06-02)
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
-- ◐ **Lexer** — 98.2% token-identical vs trunk oracle (1819 / 1853 testsuite files byte-for-byte)
+- ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
 - ☐ Parser  ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
 
 | OCaml source | lines | C++ target | status |
 |---|---:|---|---|
-| `parsing/lexer.mll` | 1040 | `cxx/src/lexer.cpp` + `include/cppcaml/{token,lexer}.hpp` | 98.2% token-parity |
+| `parsing/lexer.mll` | 1040 | `cxx/src/lexer.cpp` + `include/cppcaml/{token,lexer}.hpp` | **100% token-parity** |
+| `utils/misc.ml` `Utf8_lexeme` (Latin-9 case/NFC) | ~300 | folded into `cxx/src/lexer.cpp` | done (the parts the lexer needs) |
 | `parsing/parser.mly` (%token decls) | 127 | `cxx/include/cppcaml/token.hpp` (124-kind enum) | done |
 
 **In-scope line conversion**
-- **1040 / 183,121** hand-written compiler source lines = **0.57%** converted.
-- (C++/oracle/harness written so far: 1,145 lines.)
+- **~1340 / 183,121** hand-written compiler source lines = **~0.7%** converted.
+- (C++/oracle/harness written so far: 1,420 lines.)
 
-**Lexer tail (the remaining ~1.8%)** — all in deferred areas, 0 over-accepts:
-UTF-8 extended idents + encoding validation; invalid-escape / `\u{}`-range
-error-path parity; `{%…|…|}` / `{%%…|…|}` quoted-string extensions; line
-directives `# n "file"`; a few exotic literals (lib-scanf, lib-bytes binary).
+**Lexer: done.** Closed the tail in one session by fixing two real bugs (`\x`
+escape `+5` off-by-one; DOTOP including the leading dot) and porting the deferred
+features (Latin-9 extended idents with NFD→NFC normalization & capitalization,
+`\u{}`/decimal/octal escape range checks, line directives with int-overflow,
+raw-ident `\#`, `{%…|`/`{%%…|` extensions, lowercase-delimiter validation,
+quoted-strings inside comments). 0 over-accepts throughout.
 
 ---
 
@@ -152,3 +155,26 @@ clang, `std::variant` `Token`) → port the lexer → wire the token-diff harnes
 
 Next: close the lexer tail (UTF-8 idents, error-path parity, quoted-string ext,
 line directives) toward ~100%, then start the parser (`-dparsetree` oracle).
+
+### 2026-06-02 — lexer to 100% (day 0 cont.)
+
+Closed all 34 remaining diffs to **100% token-parity (1853/1853)**, in order:
+- **Two real bugs** (the bulk): `\xHH` string escape advanced `pos_` by 5 not 4
+  (ate the next char → garbled bytes + cascade desyncs, ~11 files); DOTOP text
+  wrongly kept the leading `.` (`.!`→`DOTOP !`, ~7 files). 98.2%→99.1%.
+- **Deferred features ported:** Latin-9 extended identifiers — full `Utf8_lexeme`
+  port (UTF-8 decode, the `get_known_char` case table, `get_known_pair` NFD→NFC
+  normalization, capitalization → LIDENT/UIDENT, encoding validation); escape
+  range checks (`\999`, `\o777`, `\u{D800}` surrogate); line directives `# n "f"`
+  with 63-bit overflow detection; raw-ident escape `\#`; `{%id|`/`{%%id|` quoted-
+  string extensions; lowercase-delimiter validation; quoted strings inside
+  comments. 99.1%→99.7%→100%.
+- 0 over-accepts at every step (never accepted input the oracle rejected).
+
+Thesis read for the lexer: predicted 2–4 days, done in one session — the
+*mechanical* stage was exactly as cheap as the model said, even with the fiddly
+Unicode/error-path tail. The type system gave the OCaml original little here that
+a careful C++ port couldn't reproduce. The real test is still the typer.
+
+Next: start the **parser** — port `parsing/parser.mly` behavior, validate the AST
+against `ocamlc -dparsetree` over the testsuite corpus (new oracle in the harness).
