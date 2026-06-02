@@ -2,8 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This is the **OCaml compiler distribution** (the compilers, runtime, standard library, and core tools), here as a fork. The default branch for PRs is `rust-runtime-nightly`; `trunk` mirrors upstream OCaml development. `git remote` shows experimental `rust-runtime` branches — on `trunk` itself the runtime is the stock C runtime under `runtime/`.
-
 This is a self-bootstrapping compiler: pre-built bytecode images of `ocamlc`/`ocamllex` live in `boot/` and are used to compile a fresh compiler. See `BOOTSTRAP.adoc`.
 
 ## AI contribution policy
