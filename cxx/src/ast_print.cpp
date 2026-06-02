@@ -508,6 +508,12 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_module>(&s.desc)) {
       line(j, "Pstr_module");
       module_binding(j, v->binding);
+    } else if (auto* v = std::get_if<Pstr_attribute>(&s.desc)) {
+      line(j, "Pstr_attribute \"" + v->name + "\"");
+      structure_list(j, v->payload);
+    } else if (auto* v = std::get_if<Pstr_extension>(&s.desc)) {
+      line(j, "Pstr_extension \"" + v->name + "\"");
+      structure_list(j, v->payload);  // extension payload at i
     }
   }
 

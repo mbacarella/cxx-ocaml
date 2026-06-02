@@ -247,9 +247,12 @@ struct Pstr_exception { TypeException exn; };
 struct Pstr_typext { TypeExtension ext; };
 struct Pstr_primitive { PrimitiveDescription prim; };
 struct Pstr_module { ModuleBinding binding; };
+struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
+struct Pstr_extension { std::string name; Structure payload; };  // [%%ext …]
 struct StructureItem {
   std::variant<Pstr_eval, Pstr_value, Pstr_type, Pstr_open, Pstr_exception,
-               Pstr_typext, Pstr_primitive, Pstr_module>
+               Pstr_typext, Pstr_primitive, Pstr_module, Pstr_attribute,
+               Pstr_extension>
       desc;
   Location loc;
 };

@@ -117,7 +117,11 @@ class Parser {
       case Kind::INT:   return Constant{Pconst_integer{t.text, t.modifier}, l};
       case Kind::FLOAT: return Constant{Pconst_float{t.text, t.modifier}, l};
       case Kind::CHAR:  return Constant{Pconst_char{t.char_code}, l};
-      default:          return Constant{Pconst_string{t.text, l, t.delim}, l};  // STRING
+      default: {  // STRING: strloc is the *content* span (inside the quotes/delimiters)
+        size_t d = t.delim ? t.delim->size() + 2 : 1;  // {delim| … |delim}  or  " … "
+        Location strloc{position(t.start + d), position(t.end - d), false};
+        return Constant{Pconst_string{t.text, strloc, t.delim}, l};
+      }
     }
   }
 
@@ -1286,9 +1290,40 @@ class Parser {
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_module{ModuleBinding{std::move(name), std::move(me)}}, l};
     }
+    if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ name payload ]  (floating attribute)
+      advance();
+      std::string name = parse_attr_name();
+      Structure payload = parse_structure_until(Kind::RBRACKET);
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return StructureItem{Pstr_attribute{std::move(name), std::move(payload)},
+                           span(position(t.start), position(c.end))};
+    }
+    if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% name payload ]  (item extension)
+      advance();
+      std::string name = parse_attr_name();
+      Structure payload = parse_structure_until(Kind::RBRACKET);
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return StructureItem{Pstr_extension{std::move(name), std::move(payload)},
+                           span(position(t.start), position(c.end))};
+    }
     ExprBox e = parse_expr();
     Location l = e->loc;
     return StructureItem{Pstr_eval{std::move(e)}, l};
+  }
+
+  std::string parse_attr_name() {
+    Token first = cur();
+    if (first.kind != Kind::LIDENT && first.kind != Kind::UIDENT)
+      throw ParseError("expected attribute name", first.start);
+    advance();
+    std::string name = first.text;
+    while (cur().kind == Kind::DOT &&
+           (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
+      advance();
+      name += "." + cur().text;
+      advance();
+    }
+    return name;
   }
 
   ModuleExpr parse_module_expr() {

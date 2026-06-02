@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **13.2%** corpus parity vs `ocamlc -dparsetree`. Covers the core expression/pattern/type-decl/structure surface plus **GADTs, polymorphic variants (types/patterns/exprs), `type t = ..` & `type t += …` extensions, `_`/variance type params, lazy/interval/exception patterns, `(type a)` newtype params (`Pparam_newtype`/`Pexp_newtype`)**. Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2. Remaining tail: `let[@attr]`/attributes & extensions, effects, local modules (`let module`), objects, first-class modules.
+- ◐ **Parser** — **43.0%** corpus parity vs `ocamlc -dparsetree`. Covers a broad expression/pattern/type-decl/structure surface incl. GADTs, polymorphic variants, type extensions, newtype params, floating attributes `[@@@…]` and item extensions `[%%…]` (`[%%expect]` unblocks the expect-tests). Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2 → **43.0** (the jump = fixing the `Pconst_string` content-location bug, which was wrong for *every* string constant). Remaining tail: `[@attr]`/`[@@attr]` node attributes, objects/classes, first-class modules, `let module`/`let open`, signatures.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -289,3 +289,20 @@ Added structure-level items (which gate whole files early), byte-validated:
   function-binding desugar assumed the first param was a `Pparam_val`.
 - Parity 12.5% → **13.2%** (53/400); parse-errors 236→211. Next tail: `let[@attr]`
   item attributes (~13 files), effect patterns, `let module … in`, objects.
+
+### 2026-06-02 — attributes/extensions + the string-loc fix → 43% (day 0 cont.)
+
+- Floating attributes `[@@@attr …]` (Pstr_attribute) and item extensions
+  `[%%ext …]` (Pstr_extension), with a structure payload (PStr). `[%%expect …]`
+  is what gates the many expect-test files.
+- **The big one — a latent bug fixed:** `Pconst_string`'s `strloc` must be the
+  string's *content* span (inside the quotes / `{delim| … |delim}`), not the whole
+  token. It had been wrong for **every** string constant, but stayed hidden
+  because earlier parser samples had no string *constants* (only the lexer tests
+  exercised strings). The diff-vs-oracle harness caught it the moment a string
+  literal appeared in a parsed expression.
+- Result: parity **13.2% → 43.0%** (53 → 172/400) in one step. parse-errors barely
+  moved (211→202) — the gain was almost entirely near-miss diffs that the strloc
+  bug was poisoning across the corpus. A clean illustration of the thesis: a
+  single subtle, pervasive location detail, invisible until the oracle surfaced
+  it, was suppressing a third of the corpus.
