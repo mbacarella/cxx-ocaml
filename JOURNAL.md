@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **9.8%** corpus parity vs `ocamlc -dparsetree`. Covers the core expression/pattern/type-decl surface plus list/cons/record literals & patterns, `let x:t=`, **prefix ops, unary minus (incl. negative-literal folding), `assert`/`lazy`, labeled & optional args/params, arrays `[|…|]`, `while`/`for`, `.(i)`/`.[i]` access**. Remaining tail: modules/first-class modules, objects, GADT/extensible/poly-variant type decls, attributes/extensions, the harder patterns.
+- ◐ **Parser** — **11.2%** corpus parity vs `ocamlc -dparsetree`. Covers the core expression/pattern/type-decl surface, list/cons/record literals & patterns, prefix/unary/labeled-arg/array/while/for/index expressions, **+ structure items: `exception` (decl & rebind), `external`, `module M = struct…end`/`= Path`, abstract types**. Climb so far: 2.5 → 5.2 → 9.8 → 11.2. Remaining tail leaders: harder patterns (47), GADT/poly-variant/extensible type decls (45), attributes/extensions, objects, first-class modules.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -259,3 +259,18 @@ Ported a broad expression batch, each byte-validated against `-dparsetree`:
 - Also fixed `is_atom_start` to include `true`/`false`/`[`/`{`/`begin` (so they're
   collected as application arguments).
 - Parity **5.5% → 9.8%** (39/400); "expected an expression" 217→162.
+
+### 2026-06-02 — structure items → 11.2% (day 0 cont.)
+
+Added structure-level items (which gate whole files early), byte-validated:
+- **`exception E` / `exception E of …` / `exception E = Path`** (Pstr_exception →
+  type_exception → extension_constructor, Pext_decl/Pext_rebind; ctor loc spans
+  the `exception` keyword).
+- **`external f : t = "prim"`** (Pstr_primitive / Pprim_decl).
+- **`module M = struct … end` / `= Path`** (Pstr_module, Pmod_structure /
+  Pmod_ident) — required forward-declaring `Structure` (modules nest structures)
+  and a `parse_structure_until(stop)` shared by the top level and `struct…end`.
+- abstract `type t` already worked.
+- Parity 9.8% → **11.2%** (45/400); "expected an expression" 162→**93**. Blocker
+  profile shifted: harder patterns (47) and the type-decl tail (GADTs/poly-
+  variants/extensible, 45) now lead; attributes/extensions next.

@@ -186,19 +186,48 @@ struct TypeDeclaration {
   Location loc;  // ptype_constraints [] in fragment
 };
 
-// --- module expressions (subset: open M) ---
-struct Pmod_ident { LongidentLoc id; };
-struct ModuleExpr { std::variant<Pmod_ident> desc; Location loc; };
+// --- extension constructors / exceptions ---
+struct Pext_decl { ConstructorArguments args; std::optional<CoreTypeBox> res; };  // vars []
+struct Pext_rebind { LongidentLoc id; };
+struct ExtensionConstructor {
+  StringLoc name;
+  std::variant<Pext_decl, Pext_rebind> kind;
+  Location loc;
+};
+struct TypeException { ExtensionConstructor ctor; };  // attributes empty
 
-// --- structure ---
+// --- primitives (external) ---
+struct PrimitiveDescription {
+  StringLoc name;
+  CoreTypeBox type;
+  std::vector<std::string> prims;
+  Location loc;
+};
+
+// --- structure (forward-declared: modules nest structures) ---
+struct StructureItem;
+using Structure = std::vector<StructureItem>;
+
+// --- module expressions (subset: M, struct…end) ---
+struct Pmod_ident { LongidentLoc id; };
+struct Pmod_structure { Structure items; };
+struct ModuleExpr { std::variant<Pmod_ident, Pmod_structure> desc; Location loc; };
+struct StrOptLoc { std::optional<std::string> txt; Location loc; };  // module names (`_`)
+struct ModuleBinding { StrOptLoc name; ModuleExpr expr; };
+
+// --- structure items ---
 struct Pstr_eval { ExprBox e; };       // attributes empty
 struct Pstr_value { RecFlag rf; std::vector<ValueBinding> bindings; };
 struct Pstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Pstr_open { OverrideFlag ovr; ModuleExpr expr; };
+struct Pstr_exception { TypeException exn; };
+struct Pstr_primitive { PrimitiveDescription prim; };
+struct Pstr_module { ModuleBinding binding; };
 struct StructureItem {
-  std::variant<Pstr_eval, Pstr_value, Pstr_type, Pstr_open> desc;
+  std::variant<Pstr_eval, Pstr_value, Pstr_type, Pstr_open, Pstr_exception,
+               Pstr_primitive, Pstr_module>
+      desc;
   Location loc;
 };
-using Structure = std::vector<StructureItem>;
 
 }  // namespace cppcaml::ast

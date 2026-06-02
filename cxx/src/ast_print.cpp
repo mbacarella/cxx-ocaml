@@ -360,10 +360,52 @@ struct Printer {
     if (d.manifest) { line(j + 1, "Some"); core_type(j + 2, **d.manifest); }
     else line(j + 1, "None");
   }
+  std::string str_opt_loc(const StrOptLoc& s) const {
+    return '"' + (s.txt ? *s.txt : std::string("_")) + "\" " + loc(s.loc);
+  }
   void module_expr(int i, const ModuleExpr& m) {
     line(i, "module_expr " + loc(m.loc));
-    auto& id = std::get<Pmod_ident>(m.desc);
-    line(i + 1, "Pmod_ident " + lid_loc(id.id));
+    int j = i + 1;
+    if (auto* id = std::get_if<Pmod_ident>(&m.desc)) {
+      line(j, "Pmod_ident " + lid_loc(id->id));
+    } else {
+      auto& s = std::get<Pmod_structure>(m.desc);
+      line(j, "Pmod_structure");
+      structure_list(j, s.items);
+    }
+  }
+  void module_binding(int i, const ModuleBinding& b) {
+    line(i, str_opt_loc(b.name));
+    module_expr(i + 1, b.expr);
+  }
+  void ext_kind(int i, const std::variant<Pext_decl, Pext_rebind>& k) {
+    if (auto* d = std::get_if<Pext_decl>(&k)) {
+      line(i, "Pext_decl");
+      ctor_args(i + 1, d->args);
+      if (d->res) { line(i + 1, "Some"); core_type(i + 2, **d->res); }
+      else line(i + 1, "None");
+    } else {
+      line(i, "Pext_rebind");
+      line(i + 1, lid_loc(std::get<Pext_rebind>(k).id));
+    }
+  }
+  void extension_constructor(int i, const ExtensionConstructor& c) {
+    line(i, "extension_constructor " + loc(c.loc));
+    line(i + 1, "pext_name = \"" + c.name.txt + "\"");
+    line(i + 1, "pext_kind =");
+    ext_kind(i + 2, c.kind);
+  }
+  void type_exception(int i, const TypeException& e) {
+    line(i, "type_exception");
+    line(i + 1, "ptyext_constructor =");
+    extension_constructor(i + 2, e.ctor);
+  }
+  void primitive_description(int i, const PrimitiveDescription& p) {
+    line(i, "primitive_description " + str_loc(p.name) + " " + loc(p.loc));
+    line(i + 1, "Pprim_decl");
+    core_type(i + 2, *p.type);
+    if (p.prims.empty()) line(i + 2, "[]");
+    else { line(i + 2, "["); for (auto& s : p.prims) line(i + 3, '"' + s + '"'); line(i + 2, "]"); }
   }
 
   void value_bindings(int i, const std::vector<ValueBinding>& l) {
@@ -395,15 +437,25 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_open>(&s.desc)) {
       line(j, std::string("Pstr_open ") + override_flag(v->ovr));
       module_expr(j, v->expr);
+    } else if (auto* v = std::get_if<Pstr_exception>(&s.desc)) {
+      line(j, "Pstr_exception");
+      type_exception(j, v->exn);
+    } else if (auto* v = std::get_if<Pstr_primitive>(&s.desc)) {
+      line(j, "Pstr_primitive");
+      primitive_description(j, v->prim);
+    } else if (auto* v = std::get_if<Pstr_module>(&s.desc)) {
+      line(j, "Pstr_module");
+      module_binding(j, v->binding);
     }
   }
 
-  void structure(const Structure& s) {
-    if (s.empty()) { line(0, "[]"); return; }
-    line(0, "[");
-    for (auto& it : s) structure_item(1, it);
-    line(0, "]");
+  void structure_list(int i, const Structure& s) {
+    if (s.empty()) { line(i, "[]"); return; }
+    line(i, "[");
+    for (auto& it : s) structure_item(i + 1, it);
+    line(i, "]");
   }
+  void structure(const Structure& s) { structure_list(0, s); }
 };
 
 }  // namespace

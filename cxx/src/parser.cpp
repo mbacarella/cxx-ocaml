@@ -68,9 +68,10 @@ class Parser {
       if (src[i] == '\n') line_starts_.push_back(static_cast<int>(i + 1));
   }
 
-  Structure parse_structure() {
+  Structure parse_structure() { return parse_structure_until(Kind::TEOF); }
+  Structure parse_structure_until(Kind stop) {
     Structure items;
-    while (cur().kind != Kind::TEOF) {
+    while (cur().kind != Kind::TEOF && cur().kind != stop) {
       if (cur().kind == Kind::SEMISEMI) { advance(); continue; }
       items.push_back(parse_structure_item());
     }
@@ -1046,9 +1047,84 @@ class Parser {
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_open{ovr, std::move(me)}, l};
     }
+    if (t.kind == Kind::EXCEPTION) {
+      advance();
+      Token nm = cur();
+      if (nm.kind != Kind::UIDENT) throw ParseError("expected exception name", nm.start);
+      advance();
+      std::variant<Pext_decl, Pext_rebind> kind;
+      Position endp = position(nm.end);
+      if (cur().kind == Kind::EQUAL) {  // exception E = Path  (rebind)
+        advance();
+        LongidentLoc path = parse_longident_path();
+        endp = path.loc.end;
+        kind = Pext_rebind{path};
+      } else {
+        ConstructorArguments args = Pcstr_tuple{};
+        if (cur().kind == Kind::OF) {
+          advance();
+          if (cur().kind == Kind::LBRACE) {
+            args = Pcstr_record{parse_label_decls()};
+            endp = position(tokens_[idx_ - 1].end);
+          } else {
+            std::vector<CoreTypeBox> ts;
+            ts.push_back(parse_type_app());
+            while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
+            endp = ts.back()->loc.end;
+            args = Pcstr_tuple{std::move(ts)};
+          }
+        }
+        kind = Pext_decl{std::move(args), std::nullopt};
+      }
+      Location ctorloc = span(position(t.start), endp);  // includes the `exception` keyword
+      ExtensionConstructor ctor{StringLoc{nm.text, tokloc(nm)}, std::move(kind), ctorloc};
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return StructureItem{Pstr_exception{TypeException{std::move(ctor)}}, l};
+    }
+    if (t.kind == Kind::EXTERNAL) {
+      advance();
+      Token nm = cur();
+      if (nm.kind != Kind::LIDENT) throw ParseError("expected external name", nm.start);
+      advance();
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_core_type();
+      expect(Kind::EQUAL, "=");
+      std::vector<std::string> prims;
+      while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
+      if (prims.empty()) throw ParseError("expected primitive string", cur().start);
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      PrimitiveDescription pd{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l};
+      return StructureItem{Pstr_primitive{std::move(pd)}, l};
+    }
+    if (t.kind == Kind::MODULE && peek(1).kind != Kind::TYPE) {
+      advance();
+      StrOptLoc name;
+      if (cur().kind == Kind::UIDENT) { Token nm = cur(); advance(); name = StrOptLoc{nm.text, tokloc(nm)}; }
+      else if (cur().kind == Kind::UNDERSCORE) { Token nm = cur(); advance(); name = StrOptLoc{std::nullopt, tokloc(nm)}; }
+      else throw ParseError("expected module name", cur().start);
+      expect(Kind::EQUAL, "=");  // (functor params / module-type constraint deferred)
+      ModuleExpr me = parse_module_expr();
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return StructureItem{Pstr_module{ModuleBinding{std::move(name), std::move(me)}}, l};
+    }
     ExprBox e = parse_expr();
     Location l = e->loc;
     return StructureItem{Pstr_eval{std::move(e)}, l};
+  }
+
+  ModuleExpr parse_module_expr() {
+    Token t = cur();
+    if (t.kind == Kind::STRUCT) {
+      advance();
+      Structure items = parse_structure_until(Kind::END);
+      Token c = cur(); expect(Kind::END, "end");
+      return ModuleExpr{Pmod_structure{std::move(items)}, span(position(t.start), position(c.end))};
+    }
+    if (t.kind == Kind::UIDENT) {
+      LongidentLoc mp = parse_longident_path();
+      return ModuleExpr{.desc = Pmod_ident{.id = mp}, .loc = mp.loc};
+    }
+    throw ParseError("unsupported module expression", t.start);
   }
 };
 
