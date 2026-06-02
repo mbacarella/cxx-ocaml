@@ -1,0 +1,69 @@
+// Hand-written lexer for OCaml source, ported from parsing/lexer.mll.
+//
+// Produces the *filtered* token stream that the parser consumes: COMMENT, EOL
+// and DOCSTRING are recognised but dropped by next(), exactly as the OCaml
+// `Lexer.token` wrapper does. raw_token() exposes the unfiltered stream.
+#pragma once
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "cppcaml/token.hpp"
+
+namespace cppcaml {
+
+// Lexing error, mirrors lexer.mll's `Error of error * Location.t`. For now we
+// carry a message and the byte offset; structured error variants come later.
+struct LexError : std::runtime_error {
+  size_t pos;
+  LexError(std::string msg, size_t p)
+      : std::runtime_error(std::move(msg)), pos(p) {}
+};
+
+class Lexer {
+ public:
+  // `src` must outlive the lexer (we hold a view into it).
+  explicit Lexer(std::string_view src) : src_(src) {}
+
+  // Next parser-visible token (COMMENT/EOL/DOCSTRING skipped). Returns EOF
+  // repeatedly at end of input.
+  Token next();
+
+  // Unfiltered single step; may return COMMENT/EOL/DOCSTRING.
+  Token raw_token();
+
+  // Convenience: lex the whole buffer into the filtered token vector,
+  // terminated by an EOF token.
+  std::vector<Token> tokenize();
+
+ private:
+  std::string_view src_;
+  size_t pos_ = 0;
+
+  // --- cursor helpers ---
+  bool eof() const { return pos_ >= src_.size(); }
+  char cur() const { return pos_ < src_.size() ? src_[pos_] : '\0'; }
+  char at(size_t i) const { return i < src_.size() ? src_[i] : '\0'; }
+  bool looking_at(std::string_view s) const { return src_.substr(pos_).starts_with(s); }
+
+  // --- sub-lexers (mirror the named rules in lexer.mll) ---
+  Token scan_ident_lower(size_t start);
+  Token scan_ident_upper(size_t start);
+  Token scan_number(size_t start);
+  Token scan_char_or_quote(size_t start);
+  Token scan_string(size_t start);     // after opening '"'
+  Token scan_quoted_string(size_t start, const std::string& delim);  // after {delim|
+  void scan_comment();                 // after "(*", consumes through matching "*)"
+  Token scan_label_or_tilde(size_t start);
+  Token scan_optlabel_or_question(size_t start);
+  Token scan_brace(size_t start);      // '{', "{<", "{|...", "{%..."
+  Token scan_hash(size_t start);       // '#', directive, HASHOP
+  Token scan_symbol(size_t start);     // operators + symbolic punctuation
+
+  // string-literal accumulation buffer (lexer.mll's string_buffer)
+  std::string strbuf_;
+  void store(char c) { strbuf_.push_back(c); }
+  void store(std::string_view s) { strbuf_.append(s); }
+};
+
+}  // namespace cppcaml

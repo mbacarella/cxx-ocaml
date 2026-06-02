@@ -1,0 +1,7 @@
+# C++ build output
+build/
+
+# Oracle dumper: compiled OCaml artifacts + the native binary
+oracle/dump_tokens
+oracle/*.cm[iox]
+oracle/*.o
