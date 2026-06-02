@@ -252,6 +252,26 @@ struct Printer {
       }
       if (v->base) { line(j, "Some"); expression(j + 1, **v->base); }
       else line(j, "None");
+    } else if (auto* v = std::get_if<Pexp_assert>(&e.desc)) {
+      line(j, "Pexp_assert");
+      expression(j, *v->e);
+    } else if (auto* v = std::get_if<Pexp_lazy>(&e.desc)) {
+      line(j, "Pexp_lazy");
+      expression(j, *v->e);
+    } else if (auto* v = std::get_if<Pexp_while>(&e.desc)) {
+      line(j, "Pexp_while");
+      expression(j, *v->cond);
+      expression(j, *v->body);
+    } else if (auto* v = std::get_if<Pexp_for>(&e.desc)) {
+      line(j, std::string("Pexp_for ") + (v->dir == DirectionFlag::Upto ? "Up" : "Down"));
+      pattern(j, v->var);
+      expression(j, *v->lo);
+      expression(j, *v->hi);
+      expression(j, *v->body);
+    } else if (auto* v = std::get_if<Pexp_array>(&e.desc)) {
+      line(j, "Pexp_array");
+      if (v->elems.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& el : v->elems) expression(j + 1, *el); line(j, "]"); }
     }
   }
 
@@ -272,7 +292,8 @@ struct Printer {
     auto& pv = std::get<Pparam_val>(fp.desc);
     line(i, "Pparam_val " + loc(pv.loc));
     arg_label(i + 1, pv.label);
-    line(i + 1, "None");  // default expr (always None in fragment)
+    if (pv.default_) { line(i + 1, "Some"); expression(i + 2, **pv.default_); }
+    else line(i + 1, "None");
     pattern(i + 1, pv.pat);
   }
 

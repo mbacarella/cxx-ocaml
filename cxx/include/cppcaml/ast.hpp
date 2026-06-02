@@ -126,11 +126,18 @@ struct Pexp_record {
   std::vector<std::pair<LongidentLoc, ExprBox>> fields;
   std::optional<ExprBox> base;  // `{ e with ... }`
 };
+enum class DirectionFlag { Upto, Downto };
+struct Pexp_assert { ExprBox e; };
+struct Pexp_lazy { ExprBox e; };
+struct Pexp_while { ExprBox cond; ExprBox body; };
+struct Pexp_for { Pattern var; ExprBox lo; ExprBox hi; DirectionFlag dir; ExprBox body; };
+struct Pexp_array { std::vector<ExprBox> elems; };
 
 struct Expression {
   std::variant<Pexp_ident, Pexp_constant, Pexp_apply, Pexp_let, Pexp_function,
                Pexp_tuple, Pexp_ifthenelse, Pexp_construct, Pexp_match, Pexp_try,
-               Pexp_sequence, Pexp_constraint, Pexp_field, Pexp_record>
+               Pexp_sequence, Pexp_constraint, Pexp_field, Pexp_record,
+               Pexp_assert, Pexp_lazy, Pexp_while, Pexp_for, Pexp_array>
       desc;
   Location loc;
 };
@@ -143,7 +150,7 @@ struct ValueBinding {
   std::optional<CoreTypeBox> constraint_;  // Pvc_constraint (simple `: t`); attributes empty
 };
 
-struct Pparam_val { Location loc; ArgLabel label; Pattern pat; };  // default omitted (None)
+struct Pparam_val { Location loc; ArgLabel label; std::optional<ExprBox> default_; Pattern pat; };
 struct FunctionParam { std::variant<Pparam_val> desc; };
 
 struct Pfunction_body { ExprBox e; };

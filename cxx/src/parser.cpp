@@ -50,6 +50,9 @@ bool is_atom_start(Kind k) {
   switch (k) {
     case Kind::INT: case Kind::FLOAT: case Kind::CHAR: case Kind::STRING:
     case Kind::LIDENT: case Kind::UIDENT: case Kind::LPAREN:
+    case Kind::TRUE: case Kind::FALSE: case Kind::LBRACKET: case Kind::LBRACE:
+    case Kind::BANG: case Kind::PREFIXOP: case Kind::LBRACKETBAR:
+    case Kind::BEGIN:
       return true;
     default:
       return false;
@@ -167,13 +170,39 @@ class Parser {
   }
 
   // postfix record-field access  e.lbl (.lbl)*
+  ExprBox qualified_ident(const char* mod, const char* fn, Location l) {
+    Longident lid{Ldot{std::make_shared<Longident>(Longident{Lident{mod}}), fn}};
+    return E({Pexp_ident{.id = LongidentLoc{std::move(lid), l}}, l});
+  }
+  ExprBox indexed_get(ExprBox e, ExprBox idx, Position end, const char* mod) {
+    Position s = e->loc.start;
+    ExprBox fn = qualified_ident(mod, "get", Location{s, end, true});  // ghost ident
+    std::vector<std::pair<ArgLabel, ExprBox>> args;
+    args.emplace_back(Nolabel{}, std::move(e));
+    args.emplace_back(Nolabel{}, std::move(idx));
+    return E({Pexp_apply{std::move(fn), std::move(args)}, Location{s, end, false}});
+  }
   ExprBox postfix_field(ExprBox e) {
-    while (cur().kind == Kind::DOT && peek(1).kind == Kind::LIDENT) {
-      advance();
-      Token f = cur();
-      advance();
-      Location l = span(e->loc.start, position(f.end));
-      e = E({Pexp_field{std::move(e), lid0(f.text, tokloc(f))}, l});
+    for (;;) {
+      if (cur().kind == Kind::DOT && peek(1).kind == Kind::LIDENT) {
+        advance();
+        Token f = cur();
+        advance();
+        Location l = span(e->loc.start, position(f.end));
+        e = E({Pexp_field{std::move(e), lid0(f.text, tokloc(f))}, l});
+      } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {
+        advance(); advance();  // . (
+        ExprBox idx = parse_expr();
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        e = indexed_get(std::move(e), std::move(idx), position(c.end), "Array");
+      } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LBRACKET) {
+        advance(); advance();  // . [
+        ExprBox idx = parse_expr();
+        Token c = cur(); expect(Kind::RBRACKET, "]");
+        e = indexed_get(std::move(e), std::move(idx), position(c.end), "String");
+      } else {
+        break;
+      }
     }
     return e;
   }
@@ -262,6 +291,31 @@ class Parser {
         inner->loc = span(position(t.start), position(c.end));
         return inner;
       }
+      case Kind::BANG: case Kind::PREFIXOP: {
+        advance();
+        ExprBox arg = parse_atom_postfix();
+        Location opl = tokloc(t);
+        std::string nm = t.kind == Kind::BANG ? "!" : t.text;
+        ExprBox fn = E({Pexp_ident{.id = lid0(nm, opl)}, opl});
+        Position ae = arg->loc.end;
+        std::vector<std::pair<ArgLabel, ExprBox>> args;
+        args.emplace_back(Nolabel{}, std::move(arg));
+        return E({Pexp_apply{std::move(fn), std::move(args)}, span(position(t.start), ae)});
+      }
+      case Kind::LBRACKETBAR: {
+        advance();
+        std::vector<ExprBox> elems;
+        if (cur().kind != Kind::BARRBRACKET) {
+          elems.push_back(parse_expr_no_seq());
+          while (cur().kind == Kind::SEMI) {
+            advance();
+            if (cur().kind == Kind::BARRBRACKET) break;
+            elems.push_back(parse_expr_no_seq());
+          }
+        }
+        Token c = cur(); expect(Kind::BARRBRACKET, "|]");
+        return E({Pexp_array{std::move(elems)}, span(position(t.start), position(c.end))});
+      }
       default:
         throw ParseError("expected an expression", t.start);
     }
@@ -269,15 +323,49 @@ class Parser {
 
   ExprBox parse_atom_postfix() { return postfix_field(parse_atom()); }
 
+  ExprBox ident_expr(const std::string& name, Location l) {
+    return E({Pexp_ident{.id = lid0(name, l)}, l});
+  }
   ExprBox collect_app(ExprBox head) {
     std::vector<std::pair<ArgLabel, ExprBox>> args;
-    while (is_atom_start(cur().kind)) args.emplace_back(Nolabel{}, parse_atom_postfix());
+    for (;;) {
+      Kind k = cur().kind;
+      if (k == Kind::LABEL) {  // ~lbl:e
+        Token lt = cur(); advance();
+        args.emplace_back(Labelled{lt.text}, parse_atom_postfix());
+      } else if (k == Kind::OPTLABEL) {  // ?lbl:e
+        Token lt = cur(); advance();
+        args.emplace_back(Optional{lt.text}, parse_atom_postfix());
+      } else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x punning
+        advance(); Token id = cur(); advance();
+        args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id)));
+      } else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) {  // ?x punning
+        advance(); Token id = cur(); advance();
+        args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id)));
+      } else if (is_atom_start(k)) {
+        args.emplace_back(Nolabel{}, parse_atom_postfix());
+      } else {
+        break;
+      }
+    }
     if (args.empty()) return head;
     Location l = span(head->loc.start, args.back().second->loc.end);
     return E({Pexp_apply{std::move(head), std::move(args)}, l});
   }
 
   ExprBox parse_app() {
+    if (cur().kind == Kind::ASSERT) {
+      Token t = cur(); advance();
+      ExprBox arg = parse_atom_postfix();
+      Position ae = arg->loc.end;
+      return E({Pexp_assert{std::move(arg)}, span(position(t.start), ae)});
+    }
+    if (cur().kind == Kind::LAZY) {
+      Token t = cur(); advance();
+      ExprBox arg = parse_atom_postfix();
+      Position ae = arg->loc.end;
+      return E({Pexp_lazy{std::move(arg)}, span(position(t.start), ae)});
+    }
     // constructor application  Constr arg  -> Pexp_construct (not Pexp_apply)
     if (cur().kind == Kind::UIDENT) {
       PathResult pr = parse_dotted_path();
@@ -301,8 +389,33 @@ class Parser {
     return collect_app(parse_atom_postfix());
   }
 
+  ExprBox parse_unary() {
+    Token t = cur();
+    if (t.kind == Kind::MINUS || t.kind == Kind::MINUSDOT) {
+      // negative literal: fold `- <int/float literal>` into a signed constant.
+      if (peek(1).kind == Kind::INT || peek(1).kind == Kind::FLOAT) {
+        advance();
+        Token lit = cur(); advance();
+        Location cl = span(position(t.start), position(lit.end));
+        Constant c = (lit.kind == Kind::INT)
+                         ? Constant{Pconst_integer{"-" + lit.text, lit.modifier}, cl}
+                         : Constant{Pconst_float{"-" + lit.text, lit.modifier}, cl};
+        return E({Pexp_constant{std::move(c)}, cl});
+      }
+      // otherwise `- e` applies ~- / ~-. to an application
+      advance();
+      ExprBox arg = parse_app();
+      Position ae = arg->loc.end;
+      ExprBox fn = ident_expr(t.kind == Kind::MINUS ? "~-" : "~-.", tokloc(t));
+      std::vector<std::pair<ArgLabel, ExprBox>> args;
+      args.emplace_back(Nolabel{}, std::move(arg));
+      return E({Pexp_apply{std::move(fn), std::move(args)}, span(position(t.start), ae)});
+    }
+    return parse_app();
+  }
+
   ExprBox parse_binop(int min_prec) {
-    ExprBox left = parse_app();
+    ExprBox left = parse_unary();
     for (;;) {
       // cons '::' is right-assoc at level 6 and builds a construct, not an apply.
       if (cur().kind == Kind::COLONCOLON && 6 >= min_prec) {
@@ -349,7 +462,8 @@ class Parser {
     if (is_atom_start(k)) return true;
     switch (k) {
       case Kind::LET: case Kind::IF: case Kind::MATCH: case Kind::FUNCTION:
-      case Kind::TRY: case Kind::FUN: case Kind::BEGIN: case Kind::TRUE: case Kind::FALSE:
+      case Kind::TRY: case Kind::FUN: case Kind::WHILE: case Kind::FOR:
+      case Kind::ASSERT: case Kind::LAZY: case Kind::MINUS: case Kind::MINUSDOT:
         return true;
       default: return false;
     }
@@ -436,6 +550,31 @@ class Parser {
         Location l = span(position(t.start), body->loc.end);
         auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
         return E({Pexp_function{std::move(params), std::move(fb)}, l});
+      }
+      case Kind::WHILE: {
+        advance();
+        ExprBox cond = parse_expr();
+        expect(Kind::DO, "do");
+        ExprBox body = parse_expr();
+        Token c = cur(); expect(Kind::DONE, "done");
+        return E({Pexp_while{std::move(cond), std::move(body)},
+                  span(position(t.start), position(c.end))});
+      }
+      case Kind::FOR: {
+        advance();
+        Pattern var = parse_simple_pattern();
+        expect(Kind::EQUAL, "=");
+        ExprBox lo = parse_expr();
+        DirectionFlag dir;
+        if (cur().kind == Kind::TO) { dir = DirectionFlag::Upto; advance(); }
+        else if (cur().kind == Kind::DOWNTO) { dir = DirectionFlag::Downto; advance(); }
+        else throw ParseError("expected 'to' or 'downto'", cur().start);
+        ExprBox hi = parse_expr();
+        expect(Kind::DO, "do");
+        ExprBox body = parse_expr();
+        Token c = cur(); expect(Kind::DONE, "done");
+        return E({Pexp_for{std::move(var), std::move(lo), std::move(hi), dir, std::move(body)},
+                  span(position(t.start), position(c.end))});
       }
       default:
         return parse_tuple();
@@ -780,9 +919,42 @@ class Parser {
 
   // ---- bindings ----
   FunctionParam parse_param() {
+    Token t = cur();
+    // ~x  (labelled punning)
+    if (t.kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {
+      advance(); Token id = cur(); advance();
+      Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
+      Location loc = span(position(t.start), position(id.end));
+      return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p)}};
+    }
+    // ?x  (optional punning)
+    if (t.kind == Kind::QUESTION && peek(1).kind == Kind::LIDENT) {
+      advance(); Token id = cur(); advance();
+      Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
+      Location loc = span(position(t.start), position(id.end));
+      return FunctionParam{Pparam_val{loc, Optional{id.text}, std::nullopt, std::move(p)}};
+    }
+    // ?(x [: t] = e)  optional with default
+    if (t.kind == Kind::QUESTION && peek(1).kind == Kind::LPAREN) {
+      advance(); advance();  // ? (
+      Token id = cur();
+      if (id.kind != Kind::LIDENT) throw ParseError("expected label name", id.start);
+      advance();
+      Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
+      if (cur().kind == Kind::COLON) {
+        advance(); CoreTypeBox ty = parse_core_type();
+        Location pl = p.loc;
+        p = Pattern{Ppat_constraint{box(std::move(p)), std::move(ty)}, pl};
+      }
+      std::optional<ExprBox> def;
+      if (cur().kind == Kind::EQUAL) { advance(); def = parse_expr(); }
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      Location loc = span(position(t.start), position(c.end));
+      return FunctionParam{Pparam_val{loc, Optional{id.text}, std::move(def), std::move(p)}};
+    }
     Pattern p = parse_simple_pattern();
     Location l = p.loc;
-    return FunctionParam{Pparam_val{l, Nolabel{}, std::move(p)}};
+    return FunctionParam{Pparam_val{l, Nolabel{}, std::nullopt, std::move(p)}};
   }
 
   ValueBinding parse_value_binding() {

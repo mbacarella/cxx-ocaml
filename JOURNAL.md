@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **5.5%** corpus parity vs `ocamlc -dparsetree`. Covers: full patterns + records/lists/cons patterns, `core_type`, type declarations (variant/record/abbrev), `open`, `match`/`function`/`try`/`fun`, sequences, `begin..end`, constructors, `(e:t)`, field access, **list literals + `::` (mktailexp ghost chains), records (`{…}`/`{e with}`), `let x:t=`**. The long tail (modules, objects, labeled args, `assert`/`while`/`for`, arrays, `.()`, attributes/extensions) keeps full-file parity climbing slowly even as building blocks land — the predicted parser long tail.
+- ◐ **Parser** — **9.8%** corpus parity vs `ocamlc -dparsetree`. Covers the core expression/pattern/type-decl surface plus list/cons/record literals & patterns, `let x:t=`, **prefix ops, unary minus (incl. negative-literal folding), `assert`/`lazy`, labeled & optional args/params, arrays `[|…|]`, `while`/`for`, `.(i)`/`.[i]` access**. Remaining tail: modules/first-class modules, objects, GADT/extensible/poly-variant type decls, attributes/extensions, the harder patterns.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -245,3 +245,17 @@ Big expression/pattern/type batch, all byte-validated against `-dparsetree`:
   gated by the least-supported construct in each file. Next tail targets:
   labeled/optional args, `assert`/`lazy`/`while`/`for`, arrays `[|…|]`, `.()`/`.[]`,
   modules, exceptions/externals, attributes/extensions, GADT/poly-variant types.
+
+### 2026-06-02 — parser expression tail → 9.8% (day 0 cont.)
+
+Ported a broad expression batch, each byte-validated against `-dparsetree`:
+- **Prefix ops** (`!x`→apply `"!"`, PREFIXOP); **unary minus** with the two cases
+  OCaml distinguishes — `- <literal>` folds to a signed constant, `- e` applies
+  `~-`/`~-.` to an *application* (`-a*b`=`(~-a)*b`, `-f c`=`~-(f c)`).
+- **`assert`/`lazy`**, **arrays** `[|…|]`, **`while`/`for`** (with direction flag).
+- **Labeled & optional arguments** (`~x`, `~x:e`, `?x`, punning) and **params**
+  (`~x`, `?x`, `?(x=e)` with default expr — added the default slot to Pparam_val).
+- **`.(i)`/`.[i]`** → ghost `Array.get`/`String.get` apply.
+- Also fixed `is_atom_start` to include `true`/`false`/`[`/`{`/`begin` (so they're
+  collected as application arguments).
+- Parity **5.5% → 9.8%** (39/400); "expected an expression" 217→162.
