@@ -369,6 +369,7 @@ struct ModuleExpr {
                Pmod_apply_unit, Pmod_unpack>
       desc;
   Location loc;
+  Attributes attrs;  // pmod_attributes
 };
 struct ModuleBinding { StrOptLoc name; ModuleExpr expr; Attributes attrs; };
 

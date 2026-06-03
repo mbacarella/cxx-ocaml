@@ -719,6 +719,7 @@ struct Printer {
   }
   void module_expr(int i, const ModuleExpr& m) {
     line(i, "module_expr " + loc(m.loc));
+    attributes(i, m.attrs);  // pmod_attributes
     int j = i + 1;
     if (auto* id = std::get_if<Pmod_ident>(&m.desc)) {
       line(j, "Pmod_ident " + lid_loc(id->id));

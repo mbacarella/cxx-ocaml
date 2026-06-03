@@ -3002,6 +3002,10 @@ class Parser {
       me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))},
                       span(symstart, position(c.end))};
     }
+    while (cur().kind == Kind::LBRACKETAT) {  // me [@attr]  -> pmod_attributes
+      advance();
+      me.attrs.push_back(parse_attribute_body());
+    }
     return me;
   }
   ModuleExpr parse_module_expr_head() {
