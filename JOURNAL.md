@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **58.0%** corpus parity vs `ocamlc -dparsetree`. Broad surface incl. GADTs, poly-variants, type extensions, newtype params, attributes/extensions, modules/signatures/functors (`Pmod_apply` too), first-class modules `(module M)`, coercions, `[%ext]`, `let*`, `e#m`, setfield/array-set, the missing patterns. Climb: … → 50.2 → 51.5 → 54.2 → 54.8 → 56.5 → 57.5 → **58.0**. Switched to a broad-implement-then-corpus-diff loop (per review) — much faster than per-construct. Key recurring fix: **menhir computes a compound node's loc from the *symbol* span (incl a parenthesized child's parens), not the child node's loc** — fixed across core types and constructor args. Remaining: the docstring side-channel (→ `ocaml.doc`/`ocaml.text`), objects/classes, `with`-constraints.
+- ◐ **Parser** — **59.2%** parity over the 400-file subset (**42.5%** over the full 1853-file corpus) vs `ocamlc -dparsetree`. Broad surface incl. GADTs, poly-variants, type extensions, newtype params, attributes/extensions, modules/signatures/functors (`Pmod_apply` too), first-class modules `(module M)`, coercions, `[%ext]`, `let*`, `e#m`, setfield/array-set, the missing patterns, **and the full object/class subsystem** (see below). Climb (400-subset): … → 50.2 → 51.5 → 54.2 → 54.8 → 56.5 → 57.5 → 58.0 → **59.2**. Switched to a broad-implement-then-corpus-diff loop (per review) — much faster than per-construct. Key recurring fix: **menhir computes a compound node's loc from the *symbol* span (incl a parenthesized child's parens), not the child node's loc** — fixed across core types and constructor args. Remaining: the docstring side-channel (→ `ocaml.doc`/`ocaml.text`), signatures-with-class, `with`-constraints, the deferred constrained-function-binding form.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -374,3 +374,36 @@ untouched grammar) is the other remaining chunk.
   A faithful read on the prediction: the parser estimate (1.5–3 weeks) is holding —
   the front half of the grammar fell quickly, but the combinatorial tail is exactly
   the slow grind it was predicted to be.
+
+### 2026-06-02 — the object/class subsystem → 59.2% (day 0 cont.)
+
+The last big untouched grammar. Transcribed the whole thing in one pass
+(AST + printast-faithful printer + recursive-descent parser), then ran the
+corpus diff to nail the locations — the broad-implement-then-diff loop again.
+
+- **AST/printer** (`ast.hpp`, `ast_print.cpp`): `Pexp_object`/`new`/`override`/
+  `poly`; object types `Ptyp_object` (`Otag`/`Oinherit`); and the full class
+  language — `class_type` (`Pcty_constr`/`signature`/`arrow`), `class_signature`
+  + `class_type_field` (`Pctf_*`), `class_expr` (`Pcl_constr`/`structure`/`fun`/
+  `apply`/`let`/`constraint`), `class_structure` + `class_field` (`Pcf_*`),
+  `class_field_kind` (`Cfk_concrete`/`virtual`), and `Pstr_class`/`Pstr_class_type`
+  with their `class_declaration`/`class_type_declaration` infos.
+- **Parser** (`parser.cpp`): `object … end`, `new`, `{< … >}`, `< m:t; .. >`,
+  `class [virtual] [params] c … = ce`, `class type ct = …`, and all field/sig-field
+  kinds incl. method-body `Pexp_poly` desugaring and `class_fun_binding` params.
+
+Corpus-diff fixes that mattered (all caught by the diff, all pre-localized):
+**field lists need `[`/`]` brackets** (printast's `list` wrapper, not a bare loop);
+**method bodies wrap in `Pexp_poly` with a *ghost* ghexp loc** (`= e` → loc of the
+body; `: t = e` → `($startpos ty, $endpos e)`); **`fun` class_exprs don't reloc to
+the keyword** (`wrap_class_attrs` keeps the body loc, which starts at the first
+param); **`val x : t = e` → `mkexp_constraint` whose `$sloc` starts after `VAL`,
+not at it** (off-by-`"val "`). Also a non-object win surfaced by the same files:
+**`[< … ]` polymorphic-variant types always carry a `Some` present-tags list**
+(empty when no `> …`), previously emitted as `None`.
+
+A 22-field hand-written object program is byte-identical; typing-objects parity
+went 6 → **9 / 22** (the other 13 fail on *unrelated* gaps — signatures-with-class,
+exotic type syntax, the deferred constrained-function binding). Full-corpus parity
+42.5%; 400-subset **58.0 → 59.2%**. As predicted, a whole subsystem buys ~1% of
+full-file parity because the marginal file needs several subsystems at once.

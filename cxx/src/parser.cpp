@@ -53,6 +53,7 @@ bool is_atom_start(Kind k) {
     case Kind::TRUE: case Kind::FALSE: case Kind::LBRACKET: case Kind::LBRACE:
     case Kind::BANG: case Kind::PREFIXOP: case Kind::LBRACKETBAR:
     case Kind::BEGIN: case Kind::LBRACKETPERCENT: case Kind::BACKQUOTE:
+    case Kind::OBJECT: case Kind::NEW: case Kind::LBRACELESS:
       return true;
     default:
       return false;
@@ -344,6 +345,30 @@ class Parser {
         std::vector<std::pair<ArgLabel, ExprBox>> args;
         args.emplace_back(Nolabel{}, std::move(arg));
         return E({Pexp_apply{std::move(fn), std::move(args)}, span(position(t.start), ae)});
+      }
+      case Kind::OBJECT: {
+        advance();
+        ClassStructure cs = parse_class_structure_body();
+        Token c = cur(); expect(Kind::END, "end");
+        return E({Pexp_object{box(std::move(cs))}, span(position(t.start), position(c.end))});
+      }
+      case Kind::NEW: {
+        advance();
+        LongidentLoc id = parse_longident_path();
+        return E({Pexp_new{id}, span(position(t.start), id.loc.end)});
+      }
+      case Kind::LBRACELESS: {  // {< field [= e]; … >}
+        advance();
+        std::vector<std::pair<StringLoc, ExprBox>> fields;
+        while (cur().kind != Kind::GREATERRBRACE) {
+          Token nm = cur(); advance();
+          StringLoc name{nm.text, tokloc(nm)};
+          if (cur().kind == Kind::EQUAL) { advance(); fields.emplace_back(name, parse_expr_no_seq()); }
+          else fields.emplace_back(name, ident_expr(nm.text, name.loc));  // punning {< x >}
+          if (cur().kind == Kind::SEMI) advance(); else break;
+        }
+        Token c = cur(); expect(Kind::GREATERRBRACE, ">}");
+        return E({Pexp_override{std::move(fields)}, span(position(t.start), position(c.end))});
       }
       case Kind::LBRACKETBAR: {
         advance();
@@ -823,6 +848,8 @@ class Parser {
       rows.push_back(parse_row_field());
       while (cur().kind == Kind::BAR) { advance(); rows.push_back(parse_row_field()); }
       std::optional<std::vector<std::string>> labels;
+      // `[< … ]` always carries a present-tags list (Some, possibly empty).
+      if (t.kind == Kind::LBRACKETLESS) labels.emplace();
       if (cur().kind == Kind::GREATER) {  // [< … > `a `b]
         advance();
         std::vector<std::string> ls;
@@ -833,8 +860,29 @@ class Parser {
       return box(CoreType{.desc = Ptyp_variant{std::move(rows), closed, std::move(labels)},
                           .loc = span(position(t.start), position(c.end))});
     }
+    if (t.kind == Kind::LESS) {  // object type  < m : t; … [;] [..] >
+      advance();
+      std::vector<ObjectField> fields;
+      ClosedFlag closed = ClosedFlag::Closed;
+      while (cur().kind != Kind::GREATER) {
+        if (cur().kind == Kind::DOTDOT) { advance(); closed = ClosedFlag::Open; break; }
+        Token nm = cur();
+        if (nm.kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
+          advance(); advance();  // name :
+          CoreTypeBox ty = parse_possibly_poly_type();
+          fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty)});
+        } else {  // Oinherit: an inherited object type
+          fields.push_back(Oinherit{parse_core_type()});
+        }
+        if (cur().kind == Kind::SEMI) advance(); else break;
+      }
+      Token c = cur(); expect(Kind::GREATER, ">");
+      return box(CoreType{Ptyp_object{std::move(fields), closed},
+                          span(position(t.start), position(c.end))});
+    }
     throw ParseError("expected a type", t.start);
   }
+  CoreTypeBox parse_possibly_poly_type() { return parse_core_type(); }
   RowField parse_row_field() {
     if (cur().kind == Kind::BACKQUOTE) {
       advance();
@@ -1498,6 +1546,30 @@ class Parser {
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_module{ModuleBinding{std::move(name), std::move(me)}}, l};
     }
+    if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
+      Position kw = position(t.start);
+      advance(); advance();  // class type
+      std::vector<ClassTypeDeclaration> decls;
+      decls.push_back(parse_one_class_type_decl(kw));
+      while (cur().kind == Kind::AND) {
+        Position akw = position(cur().start); advance();
+        decls.push_back(parse_one_class_type_decl(akw));
+      }
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return StructureItem{Pstr_class_type{std::move(decls)}, l};
+    }
+    if (t.kind == Kind::CLASS) {
+      Position kw = position(t.start);
+      advance();
+      std::vector<ClassDeclaration> decls;
+      decls.push_back(parse_one_class_decl(kw));
+      while (cur().kind == Kind::AND) {
+        Position akw = position(cur().start); advance();
+        decls.push_back(parse_one_class_decl(akw));
+      }
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return StructureItem{Pstr_class{std::move(decls)}, l};
+    }
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ name payload ]  (floating attribute)
       advance();
       std::string name = parse_attr_name();
@@ -1660,6 +1732,426 @@ class Parser {
       return ModuleExpr{.desc = Pmod_ident{.id = mp}, .loc = mp.loc};
     }
     throw ParseError("unsupported module expression", t.start);
+  }
+
+  // ---- class language ----
+  void skip_item_attrs() { while (cur().kind == Kind::LBRACKETAT) { advance(); parse_attribute_body(); } }
+  void skip_post_attrs() { while (cur().kind == Kind::LBRACKETATAT) { advance(); parse_attribute_body(); } }
+
+  // formal/actual class params:  [ p1, p2, … ]   (brackets, comma-separated)
+  std::vector<CoreTypeBox> parse_class_params() {
+    std::vector<CoreTypeBox> params;
+    if (cur().kind != Kind::LBRACKET) return params;
+    advance();
+    params.push_back(parse_class_type_param());
+    while (cur().kind == Kind::COMMA) { advance(); params.push_back(parse_class_type_param()); }
+    expect(Kind::RBRACKET, "]");
+    return params;
+  }
+  CoreTypeBox parse_class_type_param() {  // [+|-|!] 'a
+    while (cur().kind == Kind::PLUS || cur().kind == Kind::MINUS || cur().kind == Kind::BANG)
+      advance();
+    return parse_type_atom();
+  }
+
+  ClassStructure parse_class_structure_body() {  // self pattern + fields, up to END
+    Pattern self;
+    if (cur().kind == Kind::LPAREN) {
+      Token lp = cur(); advance();
+      self = parse_pattern();
+      if (cur().kind == Kind::COLON) {
+        advance();
+        CoreTypeBox ty = parse_core_type();
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        self = Pattern{Ppat_constraint{box(std::move(self)), std::move(ty)},
+                       span(position(lp.start), position(c.end))};
+      } else {
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        self.loc = span(position(lp.start), position(c.end));  // reloc_pat
+      }
+    } else {
+      Position p = position(tokens_[idx_ - 1].end);  // ghpat at empty-rule position
+      self = Pattern{Ppat_any{}, Location{p, p, true}};
+    }
+    std::vector<ClassField> fields;
+    while (cur().kind != Kind::END && cur().kind != Kind::TEOF)
+      fields.push_back(parse_class_field());
+    return ClassStructure{std::move(self), std::move(fields)};
+  }
+
+  ClassField parse_class_field() {
+    Token t = cur();
+    Position fs = position(t.start);
+    if (t.kind == Kind::INHERIT) {
+      advance();
+      OverrideFlag ovr = OverrideFlag::Fresh;
+      if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
+      skip_item_attrs();
+      ClassExpr ce = parse_class_expr();
+      std::optional<StringLoc> as_;
+      if (cur().kind == Kind::AS) {
+        advance();
+        Token nm = cur(); expect(Kind::LIDENT, "identifier");
+        as_ = StringLoc{nm.text, tokloc(nm)};
+      }
+      skip_post_attrs();
+      return ClassField{Pcf_inherit{ovr, box(std::move(ce)), std::move(as_)},
+                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    if (t.kind == Kind::VAL) {
+      advance();
+      Position vstart = position(cur().start);  // `value` rule $sloc starts after VAL
+      OverrideFlag ovr = OverrideFlag::Fresh;
+      if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
+      skip_item_attrs();
+      MutableFlag mut = MutableFlag::Immutable;
+      bool virt = false;
+      for (;;) {
+        if (cur().kind == Kind::MUTABLE) { advance(); mut = MutableFlag::Mutable; }
+        else if (cur().kind == Kind::VIRTUAL) { advance(); virt = true; }
+        else break;
+      }
+      Token nm = cur(); advance();
+      StringLoc name{nm.text, tokloc(nm)};
+      ClassFieldKind kind;
+      if (virt) {
+        expect(Kind::COLON, ":");
+        kind = Cfk_virtual{parse_core_type()};
+      } else if (cur().kind == Kind::COLON) {
+        advance();
+        CoreTypeBox ty = parse_core_type();
+        expect(Kind::EQUAL, "=");
+        ExprBox e = parse_expr();
+        Location cl = span(vstart, e->loc.end);  // mkexp_constraint (mkexp) ~loc:$sloc
+        kind = Cfk_concrete{ovr, E({Pexp_constraint{std::move(e), std::move(ty)}, cl})};
+      } else {
+        expect(Kind::EQUAL, "=");
+        kind = Cfk_concrete{ovr, parse_expr()};
+      }
+      skip_post_attrs();
+      return ClassField{Pcf_val{name, mut, std::move(kind)},
+                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    if (t.kind == Kind::METHOD) {
+      advance();
+      OverrideFlag ovr = OverrideFlag::Fresh;
+      if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
+      skip_item_attrs();
+      PrivateFlag priv = PrivateFlag::Public;
+      bool virt = false;
+      for (;;) {
+        if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
+        else if (cur().kind == Kind::VIRTUAL) { advance(); virt = true; }
+        else break;
+      }
+      Token nm = cur(); advance();
+      StringLoc name{nm.text, tokloc(nm)};
+      ClassFieldKind kind;
+      if (virt) {
+        expect(Kind::COLON, ":");
+        kind = Cfk_virtual{parse_possibly_poly_type()};
+      } else if (cur().kind == Kind::COLON) {
+        advance();
+        Position ts = position(cur().start);  // $startpos of possibly_poly_type
+        CoreTypeBox ty = parse_possibly_poly_type();
+        expect(Kind::EQUAL, "=");
+        ExprBox e = parse_expr();
+        Location pl = span(ts, e->loc.end, /*ghost=*/true);  // ghexp Pexp_poly loc
+        kind = Cfk_concrete{ovr, E({Pexp_poly{std::move(e), std::move(ty)}, pl})};
+      } else {
+        // method m params… = e   ->  Pexp_poly(<fun>, None), loc = body's loc
+        std::vector<std::pair<Position, FunctionParam>> params;
+        while (cur().kind != Kind::EQUAL && cur().kind != Kind::COLON) {
+          Position ps = position(cur().start);
+          params.emplace_back(ps, parse_param());
+        }
+        std::optional<CoreTypeBox> rett;
+        if (cur().kind == Kind::COLON) { advance(); rett = parse_core_type(); }
+        expect(Kind::EQUAL, "=");
+        ExprBox body = parse_expr();
+        if (rett) {
+          Location cl = body->loc;
+          body = E({Pexp_constraint{std::move(body), std::move(*rett)}, cl});
+        }
+        if (!params.empty()) {
+          Position fstart = params.front().first;
+          Location floc = span(fstart, body->loc.end, true);
+          std::vector<FunctionParam> ps;
+          for (auto& pr : params) ps.push_back(std::move(pr.second));
+          auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
+          body = E({Pexp_function{std::move(ps), std::move(fb)}, floc});
+        }
+        Location pl = body->loc;
+        pl.ghost = true;  // ghexp Pexp_poly is always ghost
+        kind = Cfk_concrete{ovr, E({Pexp_poly{std::move(body), std::nullopt}, pl})};
+      }
+      skip_post_attrs();
+      return ClassField{Pcf_method{name, priv, std::move(kind)},
+                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    if (t.kind == Kind::CONSTRAINT) {
+      advance();
+      skip_item_attrs();
+      CoreTypeBox t1 = parse_core_type();
+      expect(Kind::EQUAL, "=");
+      CoreTypeBox t2 = parse_core_type();
+      skip_post_attrs();
+      return ClassField{Pcf_constraint{std::move(t1), std::move(t2)},
+                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    if (t.kind == Kind::INITIALIZER) {
+      advance();
+      skip_item_attrs();
+      ExprBox e = parse_expr();
+      skip_post_attrs();
+      return ClassField{Pcf_initializer{std::move(e)},
+                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    throw ParseError("unsupported class field", t.start);
+  }
+
+  ClassExpr parse_class_expr() {
+    Token t = cur();
+    if (t.kind == Kind::FUN) {
+      advance();
+      return parse_class_fun_def();  // wrap_class_attrs keeps body loc (spans from 1st param)
+    }
+    if (t.kind == Kind::LET) {
+      auto [rf, binds] = parse_value_bindings();
+      expect(Kind::IN, "in");
+      ClassExpr body = parse_class_expr();
+      return ClassExpr{Pcl_let{rf, std::move(binds), box(std::move(body))},
+                       span(position(t.start), body.loc.end), {}};
+    }
+    ClassExpr ce = parse_class_simple_expr();
+    std::vector<std::pair<ArgLabel, ExprBox>> args;
+    for (;;) {
+      Kind k = cur().kind;
+      if (k == Kind::LABEL) { Token lt = cur(); advance(); args.emplace_back(Labelled{lt.text}, parse_atom_postfix()); }
+      else if (k == Kind::OPTLABEL) { Token lt = cur(); advance(); args.emplace_back(Optional{lt.text}, parse_atom_postfix()); }
+      else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) { advance(); Token id = cur(); advance(); args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id))); }
+      else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) { advance(); Token id = cur(); advance(); args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id))); }
+      else if (is_atom_start(k)) args.emplace_back(Nolabel{}, parse_atom_postfix());
+      else break;
+    }
+    if (!args.empty()) {
+      Location l = span(ce.loc.start, args.back().second->loc.end);
+      ce = ClassExpr{Pcl_apply{box(std::move(ce)), std::move(args)}, l, {}};
+    }
+    return ce;
+  }
+
+  ClassExpr parse_class_fun_def() {  // simple_param… -> class_expr
+    Position ps = position(cur().start);
+    FunctionParam fp = parse_param();
+    auto& pv = std::get<Pparam_val>(fp.desc);
+    ClassExpr body;
+    if (cur().kind == Kind::MINUSGREATER) { advance(); body = parse_class_expr(); }
+    else body = parse_class_fun_def();
+    Location l = span(ps, body.loc.end);
+    return ClassExpr{Pcl_fun{pv.label, std::move(pv.default_), std::move(pv.pat), box(std::move(body))}, l, {}};
+  }
+
+  ClassExpr parse_class_simple_expr() {
+    Token t = cur();
+    if (t.kind == Kind::OBJECT) {
+      advance();
+      ClassStructure cs = parse_class_structure_body();
+      Token c = cur(); expect(Kind::END, "end");
+      return ClassExpr{Pcl_structure{std::move(cs)}, span(position(t.start), position(c.end)), {}};
+    }
+    if (t.kind == Kind::LPAREN) {
+      advance();
+      ClassExpr ce = parse_class_expr();
+      if (cur().kind == Kind::COLON) {
+        advance();
+        ClassType ct = parse_class_type();
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        return ClassExpr{Pcl_constraint{box(std::move(ce)), box(std::move(ct))},
+                         span(position(t.start), position(c.end)), {}};
+      }
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      return ce;  // parenthesized class expr keeps inner loc
+    }
+    // actual_class_parameters class_longident -> Pcl_constr
+    std::vector<CoreTypeBox> tys;
+    Position cs0 = position(t.start);
+    bool bracketed = (t.kind == Kind::LBRACKET);
+    if (bracketed) {
+      advance();
+      tys.push_back(parse_core_type());
+      while (cur().kind == Kind::COMMA) { advance(); tys.push_back(parse_core_type()); }
+      expect(Kind::RBRACKET, "]");
+    }
+    LongidentLoc id = parse_longident_path();
+    Location l = bracketed ? span(cs0, id.loc.end) : id.loc;
+    return ClassExpr{Pcl_constr{id, std::move(tys)}, l, {}};
+  }
+
+  ClassType parse_class_type() {
+    Token t = cur();
+    if (t.kind == Kind::LABEL || t.kind == Kind::OPTLABEL) {  // labelled arrow domain
+      ArgLabel label = t.kind == Kind::LABEL ? ArgLabel{Labelled{t.text}} : ArgLabel{Optional{t.text}};
+      advance();
+      CoreTypeBox dom = parse_type_tuple();
+      expect(Kind::MINUSGREATER, "->");
+      ClassType cod = parse_class_type();
+      return ClassType{Pcty_arrow{label, std::move(dom), box(std::move(cod))},
+                       span(position(t.start), cod.loc.end), {}};
+    }
+    if (t.kind == Kind::OBJECT) {
+      advance();
+      ClassSignature cs = parse_class_sig_body();
+      Token c = cur(); expect(Kind::END, "end");
+      return ClassType{Pcty_signature{std::move(cs)}, span(position(t.start), position(c.end)), {}};
+    }
+    if (t.kind == Kind::LBRACKET) {  // [tys] clty_longident
+      size_t save = idx_;
+      try {
+        advance();
+        std::vector<CoreTypeBox> tys;
+        tys.push_back(parse_core_type());
+        while (cur().kind == Kind::COMMA) { advance(); tys.push_back(parse_core_type()); }
+        expect(Kind::RBRACKET, "]");
+        LongidentLoc id = parse_longident_path();
+        return ClassType{Pcty_constr{id, std::move(tys)}, span(position(t.start), id.loc.end), {}};
+      } catch (const ParseError&) { idx_ = save; }
+    }
+    CoreTypeBox dom = parse_type_tuple();
+    if (cur().kind == Kind::MINUSGREATER) {
+      advance();
+      ClassType cod = parse_class_type();
+      return ClassType{Pcty_arrow{Nolabel{}, std::move(dom), box(std::move(cod))},
+                       span(position(t.start), cod.loc.end), {}};
+    }
+    if (auto* tc = std::get_if<Ptyp_constr>(&dom->desc))
+      return ClassType{Pcty_constr{tc->id, std::move(tc->args)}, dom->loc, {}};
+    throw ParseError("expected class type", t.start);
+  }
+
+  ClassSignature parse_class_sig_body() {  // self type + fields, up to END
+    CoreTypeBox self;
+    if (cur().kind == Kind::LPAREN) {
+      advance();
+      self = parse_core_type();
+      expect(Kind::RPAREN, ")");
+    } else {
+      Position p = position(tokens_[idx_ - 1].end);
+      self = box(CoreType{Ptyp_any{}, Location{p, p, true}});
+    }
+    std::vector<ClassTypeField> fields;
+    while (cur().kind != Kind::END && cur().kind != Kind::TEOF)
+      fields.push_back(parse_class_sig_field());
+    return ClassSignature{std::move(self), std::move(fields)};
+  }
+
+  ClassTypeField parse_class_sig_field() {
+    Token t = cur();
+    Position fs = position(t.start);
+    if (t.kind == Kind::INHERIT) {
+      advance();
+      skip_item_attrs();
+      ClassType ct = parse_class_type();
+      skip_post_attrs();
+      return ClassTypeField{Pctf_inherit{box(std::move(ct))},
+                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    if (t.kind == Kind::VAL) {
+      advance();
+      skip_item_attrs();
+      MutableFlag mut = MutableFlag::Immutable;
+      VirtualFlag virt = VirtualFlag::Concrete;
+      for (;;) {
+        if (cur().kind == Kind::MUTABLE) { advance(); mut = MutableFlag::Mutable; }
+        else if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
+        else break;
+      }
+      Token nm = cur(); advance();
+      StringLoc name{nm.text, tokloc(nm)};
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_core_type();
+      skip_post_attrs();
+      return ClassTypeField{Pctf_val{name, mut, virt, std::move(ty)},
+                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    if (t.kind == Kind::METHOD) {
+      advance();
+      skip_item_attrs();
+      PrivateFlag priv = PrivateFlag::Public;
+      VirtualFlag virt = VirtualFlag::Concrete;
+      for (;;) {
+        if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
+        else if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
+        else break;
+      }
+      Token nm = cur(); advance();
+      StringLoc name{nm.text, tokloc(nm)};
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_possibly_poly_type();
+      skip_post_attrs();
+      return ClassTypeField{Pctf_method{name, priv, virt, std::move(ty)},
+                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    if (t.kind == Kind::CONSTRAINT) {
+      advance();
+      skip_item_attrs();
+      CoreTypeBox t1 = parse_core_type();
+      expect(Kind::EQUAL, "=");
+      CoreTypeBox t2 = parse_core_type();
+      skip_post_attrs();
+      return ClassTypeField{Pctf_constraint{std::move(t1), std::move(t2)},
+                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
+    throw ParseError("unsupported class sig field", t.start);
+  }
+
+  // after `class` (or `and`) consumed; kw = the keyword's start position
+  ClassDeclaration parse_one_class_decl(Position kw) {
+    skip_item_attrs();
+    VirtualFlag virt = VirtualFlag::Concrete;
+    if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
+    std::vector<CoreTypeBox> params = parse_class_params();
+    Token nm = cur();
+    if (nm.kind != Kind::LIDENT) throw ParseError("expected class name", nm.start);
+    advance();
+    StringLoc name{nm.text, tokloc(nm)};
+    ClassExpr body = parse_class_fun_binding();
+    skip_post_attrs();
+    return ClassDeclaration{virt, std::move(params), std::move(name), std::move(body),
+                            span(kw, position(tokens_[idx_ - 1].end)), {}};
+  }
+  ClassExpr parse_class_fun_binding() {  // = ce | : ct = ce | param fun_binding
+    Token t = cur();
+    if (t.kind == Kind::EQUAL) { advance(); return parse_class_expr(); }
+    if (t.kind == Kind::COLON) {
+      advance();
+      ClassType ct = parse_class_type();
+      expect(Kind::EQUAL, "=");
+      ClassExpr ce = parse_class_expr();
+      return ClassExpr{Pcl_constraint{box(std::move(ce)), box(std::move(ct))},
+                       span(position(t.start), ce.loc.end), {}};
+    }
+    Position ps = position(t.start);
+    FunctionParam fp = parse_param();
+    auto& pv = std::get<Pparam_val>(fp.desc);
+    ClassExpr body = parse_class_fun_binding();
+    return ClassExpr{Pcl_fun{pv.label, std::move(pv.default_), std::move(pv.pat), box(std::move(body))},
+                     span(ps, body.loc.end), {}};
+  }
+  ClassTypeDeclaration parse_one_class_type_decl(Position kw) {
+    skip_item_attrs();
+    VirtualFlag virt = VirtualFlag::Concrete;
+    if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
+    std::vector<CoreTypeBox> params = parse_class_params();
+    Token nm = cur();
+    if (nm.kind != Kind::LIDENT) throw ParseError("expected class type name", nm.start);
+    advance();
+    StringLoc name{nm.text, tokloc(nm)};
+    expect(Kind::EQUAL, "=");
+    ClassType body = parse_class_type();
+    skip_post_attrs();
+    return ClassTypeDeclaration{virt, std::move(params), std::move(name), std::move(body),
+                                span(kw, position(tokens_[idx_ - 1].end)), {}};
   }
 };
 

@@ -124,6 +124,17 @@ struct Printer {
         if (v->labels->empty()) line(j + 1, "[]");
         else { line(j + 1, "["); for (auto& s : *v->labels) line(j + 2, '"' + s + '"'); line(j + 1, "]"); }
       } else line(j, "None");
+    } else if (auto* v = std::get_if<Ptyp_object>(&t.desc)) {
+      line(j, std::string("Ptyp_object ") + closed_flag(v->closed));
+      for (auto& f : v->fields) {
+        if (auto* ot = std::get_if<Otag>(&f)) {
+          line(j + 1, "method " + ot->name.txt);
+          core_type(j + 2, *ot->type);
+        } else {
+          line(j + 1, "Oinherit");
+          core_type(j + 2, *std::get<Oinherit>(f).type);
+        }
+      }
     }
   }
 
@@ -373,6 +384,24 @@ struct Printer {
       binding_op(j, v->let_);
       for (auto& b : v->ands) binding_op(j, b);
       expression(j, *v->body);
+    } else if (auto* v = std::get_if<Pexp_object>(&e.desc)) {
+      line(j, "Pexp_object");
+      class_structure(j, *v->cs);
+    } else if (auto* v = std::get_if<Pexp_poly>(&e.desc)) {
+      line(j, "Pexp_poly");
+      expression(j, *v->e);
+      if (v->t) { line(j, "Some"); core_type(j + 1, **v->t); }
+      else line(j, "None");
+    } else if (auto* v = std::get_if<Pexp_new>(&e.desc)) {
+      line(j, "Pexp_new " + lid_loc(v->id));
+    } else if (auto* v = std::get_if<Pexp_override>(&e.desc)) {
+      line(j, "Pexp_override");
+      if (v->fields.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& [nm, e2] : v->fields) { line(j + 1, "<override> " + str_loc(nm)); expression(j + 2, *e2); }
+        line(j, "]");
+      }
     }
   }
   void binding_op(int i, const BindingOp& b) {
@@ -541,6 +570,153 @@ struct Printer {
       module_expr(j, *a.arg);
     }
   }
+
+  // ---- class language ----
+  static const char* virtual_flag(VirtualFlag v) { return v == VirtualFlag::Virtual ? "Virtual" : "Concrete"; }
+  void class_type(int i, const ClassType& x) {
+    line(i, "class_type " + loc(x.loc));
+    attributes(i, x.attrs);
+    int j = i + 1;
+    if (auto* v = std::get_if<Pcty_constr>(&x.desc)) {
+      line(j, "Pcty_constr " + lid_loc(v->id));
+      if (v->args.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& a : v->args) core_type(j + 1, *a); line(j, "]"); }
+    } else if (auto* v = std::get_if<Pcty_signature>(&x.desc)) {
+      line(j, "Pcty_signature");
+      class_signature(j, v->cs);
+    } else {
+      auto& a = std::get<Pcty_arrow>(x.desc);
+      line(j, "Pcty_arrow");
+      arg_label(j, a.label);
+      core_type(j, *a.dom);
+      class_type(j, *a.cod);
+    }
+  }
+  void class_signature(int i, const ClassSignature& cs) {
+    line(i, "class_signature");
+    core_type(i + 1, *cs.self);
+    if (cs.fields.empty()) line(i + 1, "[]");
+    else { line(i + 1, "["); for (auto& f : cs.fields) class_type_field(i + 2, f); line(i + 1, "]"); }
+  }
+  void class_type_field(int i, const ClassTypeField& x) {
+    line(i, "class_type_field " + loc(x.loc));
+    int j = i + 1;
+    attributes(j, x.attrs);
+    if (auto* v = std::get_if<Pctf_inherit>(&x.desc)) {
+      line(j, "Pctf_inherit");
+      class_type(j, *v->ct);
+    } else if (auto* v = std::get_if<Pctf_val>(&x.desc)) {
+      line(j, "Pctf_val \"" + v->name.txt + "\" " + mutable_flag(v->mut) + " " + virtual_flag(v->virt));
+      core_type(j + 1, *v->type);
+    } else if (auto* v = std::get_if<Pctf_method>(&x.desc)) {
+      line(j, "Pctf_method \"" + v->name.txt + "\" " + private_flag(v->priv) + " " + virtual_flag(v->virt));
+      core_type(j + 1, *v->type);
+    } else {
+      auto& vc = std::get<Pctf_constraint>(x.desc);
+      line(j, "Pctf_constraint");
+      core_type(j + 1, *vc.t1);
+      core_type(j + 1, *vc.t2);
+    }
+  }
+  void class_field_kind(int i, const ClassFieldKind& k) {
+    if (auto* c = std::get_if<Cfk_concrete>(&k)) {
+      line(i, std::string("Concrete ") + override_flag(c->ovr));
+      expression(i, *c->e);
+    } else {
+      line(i, "Virtual");
+      core_type(i, *std::get<Cfk_virtual>(k).type);
+    }
+  }
+  void class_field(int i, const ClassField& x) {
+    line(i, "class_field " + loc(x.loc));
+    int j = i + 1;
+    attributes(j, x.attrs);
+    if (auto* v = std::get_if<Pcf_inherit>(&x.desc)) {
+      line(j, std::string("Pcf_inherit ") + override_flag(v->ovr));
+      class_expr(j + 1, *v->ce);
+      if (v->as_) { line(j + 1, "Some"); line(j + 2, str_loc(*v->as_)); } else line(j + 1, "None");
+    } else if (auto* v = std::get_if<Pcf_val>(&x.desc)) {
+      line(j, std::string("Pcf_val ") + mutable_flag(v->mut));
+      line(j + 1, str_loc(v->name));
+      class_field_kind(j + 1, v->kind);
+    } else if (auto* v = std::get_if<Pcf_method>(&x.desc)) {
+      line(j, std::string("Pcf_method ") + private_flag(v->priv));
+      line(j + 1, str_loc(v->name));
+      class_field_kind(j + 1, v->kind);
+    } else if (auto* v = std::get_if<Pcf_constraint>(&x.desc)) {
+      line(j, "Pcf_constraint");
+      core_type(j + 1, *v->t1);
+      core_type(j + 1, *v->t2);
+    } else {
+      auto& vi = std::get<Pcf_initializer>(x.desc);
+      line(j, "Pcf_initializer");
+      expression(j + 1, *vi.e);
+    }
+  }
+  void class_structure(int i, const ClassStructure& cs) {
+    line(i, "class_structure");
+    pattern(i + 1, cs.self);
+    if (cs.fields.empty()) line(i + 1, "[]");
+    else { line(i + 1, "["); for (auto& f : cs.fields) class_field(i + 2, f); line(i + 1, "]"); }
+  }
+  void class_expr(int i, const ClassExpr& x) {
+    line(i, "class_expr " + loc(x.loc));
+    attributes(i, x.attrs);
+    int j = i + 1;
+    if (auto* v = std::get_if<Pcl_constr>(&x.desc)) {
+      line(j, "Pcl_constr " + lid_loc(v->id));
+      if (v->args.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& a : v->args) core_type(j + 1, *a); line(j, "]"); }
+    } else if (auto* v = std::get_if<Pcl_structure>(&x.desc)) {
+      line(j, "Pcl_structure");
+      class_structure(j, v->cs);
+    } else if (auto* v = std::get_if<Pcl_fun>(&x.desc)) {
+      line(j, "Pcl_fun");
+      arg_label(j, v->label);
+      if (v->default_) { line(j, "Some"); expression(j + 1, **v->default_); } else line(j, "None");
+      pattern(j, v->pat);
+      class_expr(j, *v->body);
+    } else if (auto* v = std::get_if<Pcl_apply>(&x.desc)) {
+      line(j, "Pcl_apply");
+      class_expr(j, *v->ce);
+      if (v->args.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& [lbl, e] : v->args) { line(j + 1, "<arg>"); arg_label(j + 1, lbl); expression(j + 2, *e); } line(j, "]"); }
+    } else if (auto* v = std::get_if<Pcl_let>(&x.desc)) {
+      line(j, std::string("Pcl_let ") + rec_flag(v->rf));
+      value_bindings(j, v->bindings);
+      class_expr(j, *v->body);
+    } else {
+      auto& vk = std::get<Pcl_constraint>(x.desc);
+      line(j, "Pcl_constraint");
+      class_expr(j, *vk.ce);
+      class_type(j, *vk.ct);
+    }
+  }
+  void class_infos_params(int j, const std::vector<CoreTypeBox>& params) {
+    line(j, "pci_params =");
+    if (params.empty()) line(j + 1, "[]");
+    else { line(j + 1, "["); for (auto& p : params) core_type(j + 2, *p); line(j + 1, "]"); }
+  }
+  void class_declaration(int i, const ClassDeclaration& x) {
+    line(i, "class_declaration " + loc(x.loc));
+    attributes(i, x.attrs);
+    int j = i + 1;
+    line(j, std::string("pci_virt = ") + virtual_flag(x.virt));
+    class_infos_params(j, x.params);
+    line(j, "pci_name = " + str_loc(x.name));
+    line(j, "pci_expr =");
+    class_expr(j + 1, x.expr);
+  }
+  void class_type_declaration(int i, const ClassTypeDeclaration& x) {
+    line(i, "class_type_declaration " + loc(x.loc));
+    attributes(i, x.attrs);
+    int j = i + 1;
+    line(j, std::string("pci_virt = ") + virtual_flag(x.virt));
+    class_infos_params(j, x.params);
+    line(j, "pci_name = " + str_loc(x.name));
+    line(j, "pci_expr =");
+    class_type(j + 1, x.expr);
+  }
   void module_binding(int i, const ModuleBinding& b) {
     line(i, str_opt_loc(b.name));
     module_expr(i + 1, b.expr);
@@ -642,6 +818,14 @@ struct Printer {
       line(j, "Pstr_modtype " + str_loc(v->name));
       if (v->type) module_type(j + 1, *v->type);  // modtype_declaration: Some -> module_type(i+1)
       else line(j, "#abstract");
+    } else if (auto* v = std::get_if<Pstr_class>(&s.desc)) {
+      line(j, "Pstr_class");
+      if (v->decls.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& d : v->decls) class_declaration(j + 1, d); line(j, "]"); }
+    } else if (auto* v = std::get_if<Pstr_class_type>(&s.desc)) {
+      line(j, "Pstr_class_type");
+      if (v->decls.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& d : v->decls) class_type_declaration(j + 1, d); line(j, "]"); }
     }
   }
 

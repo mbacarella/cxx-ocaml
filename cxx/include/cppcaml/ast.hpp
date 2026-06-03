@@ -33,7 +33,8 @@ using Box = std::unique_ptr<T>;
 // threaded through expression/pattern/type/binding nodes.
 struct StructureItem;
 using Structure = std::vector<StructureItem>;
-struct ModuleExpr;  // (used by Pexp_pack, Pstr_include, …)
+struct ModuleExpr;     // (used by Pexp_pack, Pstr_include, …)
+struct ClassStructure;  // object … end  (used by Pexp_object)
 struct Attribute { std::string name; Structure payload; };  // [@name payload] (PStr)
 using Attributes = std::vector<Attribute>;
 
@@ -87,8 +88,14 @@ struct Ptyp_variant {
   ClosedFlag closed = ClosedFlag::Closed;
   std::optional<std::vector<std::string>> labels;  // `[< … > l]` present tags
 };
+struct Otag { StringLoc name; CoreTypeBox type; };
+struct Oinherit { CoreTypeBox type; };
+using ObjectField = std::variant<Otag, Oinherit>;
+struct Ptyp_object { std::vector<ObjectField> fields; ClosedFlag closed = ClosedFlag::Closed; };  // < m:t; .. >
 struct CoreType {
-  std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr, Ptyp_variant> desc;
+  std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr,
+               Ptyp_variant, Ptyp_object>
+      desc;
   Location loc;
   Attributes attrs;
 };
@@ -172,6 +179,10 @@ struct Pexp_pack { Box<ModuleExpr> me; };           // (module ME)
 struct Pexp_extension { std::string name; Structure payload; };  // [%id …]
 struct BindingOp { StringLoc op; Pattern pat; ExprBox exp; Location loc; };
 struct Pexp_letop { BindingOp let_; std::vector<BindingOp> ands; ExprBox body; };  // let* … in …
+struct Pexp_object { Box<ClassStructure> cs; };   // object … end
+struct Pexp_new { LongidentLoc id; };             // new M.c
+struct Pexp_override { std::vector<std::pair<StringLoc, ExprBox>> fields; };  // {< x = e >}
+struct Pexp_poly { ExprBox e; std::optional<CoreTypeBox> t; };  // method bodies
 struct Pexp_while { ExprBox cond; ExprBox body; };
 struct Pexp_for { Pattern var; ExprBox lo; ExprBox hi; DirectionFlag dir; ExprBox body; };
 struct Pexp_array { std::vector<ExprBox> elems; };
@@ -183,7 +194,8 @@ struct Expression {
                Pexp_assert, Pexp_lazy, Pexp_while, Pexp_for, Pexp_array,
                Pexp_variant, Pexp_newtype, Pexp_struct_item, Pexp_setfield,
                Pexp_setinstvar, Pexp_coerce, Pexp_send, Pexp_pack,
-               Pexp_extension, Pexp_letop>
+               Pexp_extension, Pexp_letop, Pexp_object, Pexp_new, Pexp_override,
+               Pexp_poly>
       desc;
   Location loc;
   Attributes attrs;
@@ -298,6 +310,72 @@ struct ModuleExpr {
 };
 struct ModuleBinding { StrOptLoc name; ModuleExpr expr; };
 
+// --- class language ---
+enum class VirtualFlag { Virtual, Concrete };
+struct ClassExpr;
+struct ClassType;
+using ClassExprBox = Box<ClassExpr>;
+using ClassTypeBox = Box<ClassType>;
+
+// class types
+struct ClassTypeField;
+struct ClassSignature { CoreTypeBox self; std::vector<ClassTypeField> fields; };
+struct Pcty_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
+struct Pcty_signature { ClassSignature cs; };
+struct Pcty_arrow { ArgLabel label; CoreTypeBox dom; ClassTypeBox cod; };
+struct ClassType {
+  std::variant<Pcty_constr, Pcty_signature, Pcty_arrow> desc;
+  Location loc;
+  Attributes attrs;
+};
+struct Pctf_inherit { ClassTypeBox ct; };
+struct Pctf_val { StringLoc name; MutableFlag mut; VirtualFlag virt; CoreTypeBox type; };
+struct Pctf_method { StringLoc name; PrivateFlag priv; VirtualFlag virt; CoreTypeBox type; };
+struct Pctf_constraint { CoreTypeBox t1; CoreTypeBox t2; };
+struct ClassTypeField {
+  std::variant<Pctf_inherit, Pctf_val, Pctf_method, Pctf_constraint> desc;
+  Location loc;
+  Attributes attrs;
+};
+
+// class expressions
+struct ClassField;
+struct ClassStructure { Pattern self; std::vector<ClassField> fields; };
+struct Pcl_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
+struct Pcl_structure { ClassStructure cs; };
+struct Pcl_fun { ArgLabel label; std::optional<ExprBox> default_; Pattern pat; ClassExprBox body; };
+struct Pcl_apply { ClassExprBox ce; std::vector<std::pair<ArgLabel, ExprBox>> args; };
+struct Pcl_let { RecFlag rf; std::vector<ValueBinding> bindings; ClassExprBox body; };
+struct Pcl_constraint { ClassExprBox ce; ClassTypeBox ct; };
+struct ClassExpr {
+  std::variant<Pcl_constr, Pcl_structure, Pcl_fun, Pcl_apply, Pcl_let, Pcl_constraint> desc;
+  Location loc;
+  Attributes attrs;
+};
+struct Cfk_virtual { CoreTypeBox type; };
+struct Cfk_concrete { OverrideFlag ovr; ExprBox e; };
+using ClassFieldKind = std::variant<Cfk_virtual, Cfk_concrete>;
+struct Pcf_inherit { OverrideFlag ovr; ClassExprBox ce; std::optional<StringLoc> as_; };
+struct Pcf_val { StringLoc name; MutableFlag mut; ClassFieldKind kind; };
+struct Pcf_method { StringLoc name; PrivateFlag priv; ClassFieldKind kind; };
+struct Pcf_constraint { CoreTypeBox t1; CoreTypeBox t2; };
+struct Pcf_initializer { ExprBox e; };
+struct ClassField {
+  std::variant<Pcf_inherit, Pcf_val, Pcf_method, Pcf_constraint, Pcf_initializer> desc;
+  Location loc;
+  Attributes attrs;
+};
+
+// class declarations (class_infos)
+struct ClassDeclaration {
+  VirtualFlag virt; std::vector<CoreTypeBox> params; StringLoc name;
+  ClassExpr expr; Location loc; Attributes attrs;
+};
+struct ClassTypeDeclaration {
+  VirtualFlag virt; std::vector<CoreTypeBox> params; StringLoc name;
+  ClassType expr; Location loc; Attributes attrs;
+};
+
 // --- structure items ---
 struct Pstr_eval { ExprBox e; };       // attributes empty
 struct Pstr_value { RecFlag rf; std::vector<ValueBinding> bindings; };
@@ -311,10 +389,13 @@ struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …
 struct Pstr_extension { std::string name; Structure payload; };  // [%%ext …]
 struct Pstr_include { ModuleExpr expr; };
 struct Pstr_modtype { StringLoc name; std::optional<ModuleType> type; };  // module type S = mty
+struct Pstr_class { std::vector<ClassDeclaration> decls; };
+struct Pstr_class_type { std::vector<ClassTypeDeclaration> decls; };
 struct StructureItem {
   std::variant<Pstr_eval, Pstr_value, Pstr_type, Pstr_open, Pstr_exception,
                Pstr_typext, Pstr_primitive, Pstr_module, Pstr_attribute,
-               Pstr_extension, Pstr_include, Pstr_modtype>
+               Pstr_extension, Pstr_include, Pstr_modtype, Pstr_class,
+               Pstr_class_type>
       desc;
   Location loc;
 };
