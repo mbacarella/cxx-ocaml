@@ -598,6 +598,10 @@ struct Printer {
     } else if (auto* v = std::get_if<Psig_include>(&s.desc)) {
       line(j, "Psig_include");
       module_type(j, v->mt);
+    } else if (auto* v = std::get_if<Psig_class>(&s.desc)) {
+      line(j, "Psig_class");
+      if (v->decls.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& d : v->decls) class_description(j + 1, d); line(j, "]"); }
     } else if (auto* v = std::get_if<Psig_class_type>(&s.desc)) {
       line(j, "Psig_class_type");
       if (v->decls.empty()) line(j, "[]");
@@ -826,6 +830,16 @@ struct Printer {
   }
   void class_type_declaration(int i, const ClassTypeDeclaration& x) {
     line(i, "class_type_declaration " + loc(x.loc));
+    attributes(i, x.attrs);
+    int j = i + 1;
+    line(j, std::string("pci_virt = ") + virtual_flag(x.virt));
+    class_infos_params(j, x.params);
+    line(j, "pci_name = " + str_loc(x.name));
+    line(j, "pci_expr =");
+    class_type(j + 1, x.expr);
+  }
+  void class_description(int i, const ClassTypeDeclaration& x) {
+    line(i, "class_description " + loc(x.loc));
     attributes(i, x.attrs);
     int j = i + 1;
     line(j, std::string("pci_virt = ") + virtual_flag(x.virt));

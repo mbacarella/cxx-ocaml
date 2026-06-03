@@ -2481,6 +2481,17 @@ class Parser {
       }
       return SignatureItem{Psig_class_type{std::move(decls)}, here()};
     }
+    if (t.kind == Kind::CLASS) {  // class c : ct [and …]  (class_description)
+      Position kw = position(t.start);
+      advance();
+      std::vector<ClassTypeDeclaration> decls;
+      decls.push_back(parse_one_class_description(kw));
+      while (cur().kind == Kind::AND) {
+        Position akw = position(cur().start); advance();
+        decls.push_back(parse_one_class_description(akw));
+      }
+      return SignatureItem{Psig_class{std::move(decls)}, here()};
+    }
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ …]
       advance();
       std::string name = parse_attr_name();
@@ -3005,6 +3016,22 @@ class Parser {
     advance();
     StringLoc name{nm.text, tokloc(nm)};
     expect(Kind::EQUAL, "=");
+    ClassType body = parse_class_type();
+    skip_post_attrs();
+    return ClassTypeDeclaration{virt, std::move(params), std::move(name), std::move(body),
+                                span(kw, position(tokens_[idx_ - 1].end)), {}};
+  }
+  // class_description: `class [virtual] [params] name : class_type` (signature item)
+  ClassTypeDeclaration parse_one_class_description(Position kw) {
+    skip_item_attrs();
+    VirtualFlag virt = VirtualFlag::Concrete;
+    if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
+    std::vector<CoreTypeBox> params = parse_class_params();
+    Token nm = cur();
+    if (nm.kind != Kind::LIDENT) throw ParseError("expected class name", nm.start);
+    advance();
+    StringLoc name{nm.text, tokloc(nm)};
+    expect(Kind::COLON, ":");
     ClassType body = parse_class_type();
     skip_post_attrs();
     return ClassTypeDeclaration{virt, std::move(params), std::move(name), std::move(body),
