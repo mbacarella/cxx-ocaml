@@ -129,17 +129,23 @@ class Parser {
 
   Structure parse_structure() { return parse_structure_until(Kind::TEOF); }
   Structure parse_structure_until(Kind stop) {
-    Structure items;
-    size_t structStart = cur().start;
-    emit_text(items, docs_.pre_extra, structStart);  // extra_str leading text
-    size_t lastEnd = structStart;
+    // Boundary positions for extra_str: first/last item, or (empty structure) the
+    // previous token's end ($startpos of an empty production).
+    size_t structBegin = idx_ > 0 ? tokens_[idx_ - 1].end : 0;
+    Structure body;
+    size_t firstStart = static_cast<size_t>(-1);
     while (cur().kind != Kind::TEOF && cur().kind != stop) {
       if (cur().kind == Kind::SEMISEMI) { advance(); continue; }
-      emit_text(items, docs_.floating, cur().start);  // text_str before each item
-      items.push_back(parse_structure_item());
-      lastEnd = items.back().loc.end.cnum;
+      if (firstStart == static_cast<size_t>(-1)) firstStart = cur().start;
+      emit_text(body, docs_.floating, cur().start);  // text_str before each item
+      body.push_back(parse_structure_item());
     }
-    emit_text(items, docs_.post_extra, lastEnd);  // extra_str trailing text
+    size_t startKey = firstStart != static_cast<size_t>(-1) ? firstStart : structBegin;
+    size_t endKey = idx_ > 0 ? tokens_[idx_ - 1].end : structBegin;  // last consumed token end
+    Structure items;
+    emit_text(items, docs_.pre_extra, startKey);  // extra_str leading text
+    for (auto& it : body) items.push_back(std::move(it));
+    emit_text(items, docs_.post_extra, endKey);  // extra_str trailing text
     return items;
   }
 
@@ -2052,17 +2058,21 @@ class Parser {
     }
   }
   Signature parse_signature_until(Kind stop) {
-    Signature items;
-    size_t sigStart = cur().start;
-    emit_text_sig(items, docs_.pre_extra, sigStart);
-    size_t lastEnd = sigStart;
+    size_t sigBegin = idx_ > 0 ? tokens_[idx_ - 1].end : 0;
+    Signature body;
+    size_t firstStart = static_cast<size_t>(-1);
     while (cur().kind != Kind::TEOF && cur().kind != stop) {
       if (cur().kind == Kind::SEMISEMI) { advance(); continue; }
-      emit_text_sig(items, docs_.floating, cur().start);
-      items.push_back(parse_signature_item());
-      lastEnd = items.back().loc.end.cnum;
+      if (firstStart == static_cast<size_t>(-1)) firstStart = cur().start;
+      emit_text_sig(body, docs_.floating, cur().start);
+      body.push_back(parse_signature_item());
     }
-    emit_text_sig(items, docs_.post_extra, lastEnd);
+    size_t startKey = firstStart != static_cast<size_t>(-1) ? firstStart : sigBegin;
+    size_t endKey = idx_ > 0 ? tokens_[idx_ - 1].end : sigBegin;
+    Signature items;
+    emit_text_sig(items, docs_.pre_extra, startKey);
+    for (auto& it : body) items.push_back(std::move(it));
+    emit_text_sig(items, docs_.post_extra, endKey);
     return items;
   }
   SignatureItem parse_signature_item() {
