@@ -2643,11 +2643,18 @@ class Parser {
     }
     if (t.kind == Kind::FUNCTOR) {
       advance();
-      FunctorParam param = parse_functor_param();
+      std::vector<std::pair<Position, FunctorParam>> args;  // functor (A)(B) -> me
+      while (cur().kind == Kind::LPAREN) {
+        Position ps = position(cur().start);
+        args.emplace_back(ps, parse_functor_param());
+      }
       expect(Kind::MINUSGREATER, "->");
-      ModuleExpr body = parse_module_expr();
-      return ModuleExpr{Pmod_functor{std::move(param), box(std::move(body))},
-                        span(position(t.start), body.loc.end)};
+      ModuleExpr me = parse_module_expr();
+      for (int i = static_cast<int>(args.size()) - 1; i >= 0; --i) {  // each loc starts at its '('
+        Location l = span(args[i].first, me.loc.end);
+        me = ModuleExpr{Pmod_functor{std::move(args[i].second), box(std::move(me))}, l};
+      }
+      return me;
     }
     if (t.kind == Kind::LPAREN) {
       advance();
