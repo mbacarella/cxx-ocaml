@@ -283,12 +283,13 @@ struct ExtensionConstructor {
   Location loc;
   Attributes attrs;
 };
-struct TypeException { ExtensionConstructor ctor; };  // attributes empty
+struct TypeException { ExtensionConstructor ctor; Attributes attrs; };  // ptyexn_attributes
 struct TypeExtension {
   LongidentLoc path;
   std::vector<CoreTypeBox> params;
   std::vector<ExtensionConstructor> ctors;
   PrivateFlag priv = PrivateFlag::Public;
+  Attributes attrs;  // ptyext_attributes
 };
 
 // --- primitives (external) ---

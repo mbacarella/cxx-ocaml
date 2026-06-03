@@ -929,11 +929,13 @@ struct Printer {
   }
   void type_exception(int i, const TypeException& e) {
     line(i, "type_exception");
+    attributes(i, e.attrs);  // ptyexn_attributes
     line(i + 1, "ptyext_constructor =");
     extension_constructor(i + 2, e.ctor);
   }
   void type_extension(int i, const TypeExtension& x) {
     line(i, "type_extension");
+    attributes(i, x.attrs);  // ptyext_attributes
     int j = i + 1;
     line(j, "ptyext_path = " + lid_loc(x.path));
     line(j, "ptyext_params =");

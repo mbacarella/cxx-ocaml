@@ -2411,9 +2411,11 @@ class Parser {
             advance();
             ctors.push_back(parse_ext_ctor(bs));
           }
+          Attributes extattrs;  // ptyext_attributes: `type t += C [@@attr]`
+          while (cur().kind == Kind::LBRACKETATAT) { advance(); extattrs.push_back(parse_attribute_body()); }
           Location l = span(d0, position(tokens_[idx_ - 1].end));
-          return StructureItem{
-              Pstr_typext{TypeExtension{std::move(path), std::move(params), std::move(ctors), priv}}, l};
+          return StructureItem{Pstr_typext{TypeExtension{std::move(path), std::move(params),
+                                                         std::move(ctors), priv, std::move(extattrs)}}, l};
         }
       }
       idx_ = save;  // not an extension: parse type declaration(s)
@@ -2441,9 +2443,11 @@ class Parser {
       advance();
       // extension_constructor loc spans the `exception` keyword
       ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
+      Attributes exnattrs;  // ptyexn_attributes: `exception E [@@attr]`
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); exnattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(ctor.attrs, l.start.cnum, l.end.cnum);
-      return StructureItem{Pstr_exception{TypeException{std::move(ctor)}}, l};
+      return StructureItem{Pstr_exception{TypeException{std::move(ctor), std::move(exnattrs)}}, l};
     }
     if (t.kind == Kind::EXTERNAL) {
       advance();
