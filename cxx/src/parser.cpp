@@ -2016,6 +2016,7 @@ class Parser {
     Position cs = position(cur().start);  // constructor loc includes a leading '|'
     if (cur().kind == Kind::BAR) advance();
     std::vector<ConstructorDecl> ctors;
+    if (cur().kind != Kind::UIDENT) return Ptype_variant{std::move(ctors)};  // `type t = |`
     ctors.push_back(parse_constructor_decl(cs));
     while (cur().kind == Kind::BAR) {
       Position bs = position(cur().start);
