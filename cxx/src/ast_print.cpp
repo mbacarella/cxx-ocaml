@@ -486,6 +486,7 @@ struct Printer {
   }
   void type_declaration(int i, const TypeDeclaration& d) {
     line(i, "type_declaration " + str_loc(d.name) + " " + loc(d.loc));
+    attributes(i, d.attrs);  // ptype_attributes (i+1)
     int j = i + 1;
     line(j, "ptype_params =");
     if (d.params.empty()) line(j + 1, "[]");
@@ -757,6 +758,7 @@ struct Printer {
   }
   void primitive_description(int i, const PrimitiveDescription& p) {
     line(i, "primitive_description " + str_loc(p.name) + " " + loc(p.loc));
+    attributes(i, p.attrs);  // value_description attributes (i+1)
     line(i + 1, "Pprim_decl");
     core_type(i + 2, *p.type);
     if (p.prims.empty()) line(i + 2, "[]");

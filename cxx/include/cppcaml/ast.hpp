@@ -245,6 +245,7 @@ struct TypeDeclaration {
   PrivateFlag priv = PrivateFlag::Public;
   std::optional<CoreTypeBox> manifest;
   Location loc;  // ptype_constraints [] in fragment
+  Attributes attrs;  // post-item attributes (`[@@unboxed]` …)
 };
 
 // --- extension constructors / exceptions ---
@@ -269,6 +270,7 @@ struct PrimitiveDescription {
   CoreTypeBox type;
   std::vector<std::string> prims;
   Location loc;
+  Attributes attrs;  // post-item attributes (`[@@noalloc]` …)
 };
 
 // --- module types / signatures ---

@@ -46,6 +46,34 @@ std::optional<OpInfo> infix_op(const Token& t) {
   }
 }
 
+// `( operator )` as a value identifier: maps the operator token to its name,
+// or returns nullopt if this token can't begin a parenthesized operator.
+std::optional<std::string> operator_name(const Token& t) {
+  switch (t.kind) {
+    case Kind::PREFIXOP: case Kind::HASHOP: case Kind::LETOP: case Kind::ANDOP:
+    case Kind::INFIXOP0: case Kind::INFIXOP1: case Kind::INFIXOP2:
+    case Kind::INFIXOP3: case Kind::INFIXOP4:
+      return t.text;
+    case Kind::BANG: return "!";
+    case Kind::PLUS: return "+";
+    case Kind::PLUSDOT: return "+.";
+    case Kind::PLUSEQ: return "+=";
+    case Kind::MINUS: return "-";
+    case Kind::MINUSDOT: return "-.";
+    case Kind::STAR: return "*";
+    case Kind::PERCENT: return "%";
+    case Kind::EQUAL: return "=";
+    case Kind::LESS: return "<";
+    case Kind::GREATER: return ">";
+    case Kind::OR: return "or";
+    case Kind::BARBAR: return "||";
+    case Kind::AMPERSAND: return "&";
+    case Kind::AMPERAMPER: return "&&";
+    case Kind::COLONEQUAL: return ":=";
+    default: return std::nullopt;
+  }
+}
+
 bool is_atom_start(Kind k) {
   switch (k) {
     case Kind::INT: case Kind::FLOAT: case Kind::CHAR: case Kind::STRING:
@@ -250,6 +278,14 @@ class Parser {
           if (cur().kind == Kind::COLON) { advance(); parse_module_type(); }  // package type discarded
           Token c = cur(); expect(Kind::RPAREN, ")");
           return E({Pexp_pack{box(std::move(me))}, span(position(t.start), position(c.end))});
+        }
+        if (peek(1).kind == Kind::RPAREN) {
+          if (auto op = operator_name(cur())) {  // (+), (>>=), (!), …  -> Pexp_ident
+            advance();
+            Token c = cur(); advance();  // RPAREN
+            Location l = span(position(t.start), position(c.end));  // spans the parens
+            return E({Pexp_ident{lid0(*op, l)}, l});
+          }
         }
         ExprBox inner = parse_expr();
         if (cur().kind == Kind::COLON) {
@@ -1055,6 +1091,14 @@ class Parser {
           Token c = cur(); expect(Kind::RPAREN, ")");
           return {Ppat_unpack{std::move(name)}, span(position(t.start), position(c.end))};
         }
+        if (peek(1).kind == Kind::RPAREN) {
+          if (auto op = operator_name(cur())) {  // (+) x = …  -> Ppat_var "+"
+            advance();
+            Token c = cur(); advance();  // RPAREN
+            Location l = span(position(t.start), position(c.end));
+            return {Ppat_var{StringLoc{*op, l}}, l};
+          }
+        }
         Pattern p = parse_pattern();
         if (cur().kind == Kind::COLON) {
           advance();
@@ -1291,9 +1335,11 @@ class Parser {
         manifest = parse_core_type();
       }
     }
+    Attributes attrs;
+    while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
     Location l = span(declStart, position(tokens_[idx_ - 1].end));
     return TypeDeclaration{StringLoc{nm.text, tokloc(nm)}, std::move(params),
-                           std::move(kind), priv, std::move(manifest), l};
+                           std::move(kind), priv, std::move(manifest), l, std::move(attrs)};
   }
 
   // ---- bindings ----
@@ -1355,20 +1401,31 @@ class Parser {
     return vb;
   }
   ValueBinding parse_value_binding_core() {
-    // val_ident form (`let f p.. = e`) vs pattern form (`let pat = e`).
-    bool val_ident = cur().kind == Kind::LIDENT &&
-                     (peek(1).kind == Kind::EQUAL || peek(1).kind == Kind::COLON ||
-                      is_simple_pattern_start(peek(1).kind));
+    // val_ident form (`let f p.. = e` / `let (+) p.. = e`) vs pattern form.
+    bool op_ident = cur().kind == Kind::LPAREN && operator_name(peek(1)) &&
+                    peek(2).kind == Kind::RPAREN;
+    bool val_ident = op_ident ||
+                     (cur().kind == Kind::LIDENT &&
+                      (peek(1).kind == Kind::EQUAL || peek(1).kind == Kind::COLON ||
+                       is_simple_pattern_start(peek(1).kind)));
     if (!val_ident) {
       Pattern pat = parse_pattern();
       expect(Kind::EQUAL, "=");
       ExprBox body = parse_expr();
       return ValueBinding{std::move(pat), std::move(body), std::nullopt};
     }
-    Token nt = cur();
-    advance();
-    Location nl = tokloc(nt);
-    Pattern namepat{Ppat_var{StringLoc{nt.text, nl}}, nl};
+    StringLoc name;
+    if (op_ident) {
+      Token lp = cur(); advance();
+      auto op = operator_name(cur()); advance();
+      Token c = cur(); advance();  // RPAREN
+      name = StringLoc{*op, span(position(lp.start), position(c.end))};
+    } else {
+      Token nt = cur(); advance();
+      name = StringLoc{nt.text, tokloc(nt)};
+    }
+    Location nl = name.loc;
+    Pattern namepat{Ppat_var{name}, nl};
 
     std::vector<FunctionParam> params;
     while (cur().kind != Kind::EQUAL && cur().kind != Kind::COLON)
@@ -1508,8 +1565,11 @@ class Parser {
       std::vector<std::string> prims;
       while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
       if (prims.empty()) throw ParseError("expected primitive string", cur().start);
+      Attributes pattrs;
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); pattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      PrimitiveDescription pd{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l};
+      PrimitiveDescription pd{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l,
+                              std::move(pattrs)};
       return StructureItem{Pstr_primitive{std::move(pd)}, l};
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
