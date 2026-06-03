@@ -1427,7 +1427,7 @@ class Parser {
       advance();
       bool save_sup = suppress_type_trailing_attr_;
       suppress_type_trailing_attr_ = false;  // a parenthesized type consumes its own attrs
-      CoreTypeBox inner = parse_core_type();
+      CoreTypeBox inner = parse_poly_type(/*ghost=*/false);  // ('a. t) is allowed in parens
       suppress_type_trailing_attr_ = save_sup;
       if (cur().kind == Kind::COMMA) {
         std::vector<CoreTypeBox> args;
@@ -1443,8 +1443,12 @@ class Parser {
         return box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
                             .loc = span(position(t.start), name.loc.end)});
       }
-      expect(Kind::RPAREN, ")");
-      return inner;  // core types keep the inner loc (no paren reloc, unlike exprs)
+      Token rp = cur(); expect(Kind::RPAREN, ")");
+      // core types keep the inner loc (no paren reloc) — except a parenthesised
+      // poly type `('a. t)`, which spans the parens.
+      if (std::holds_alternative<Ptyp_poly>(inner->desc))
+        inner->loc = span(position(t.start), position(rp.end));
+      return inner;
     }
     if (t.kind == Kind::LBRACKET || t.kind == Kind::LBRACKETGREATER ||
         t.kind == Kind::LBRACKETLESS) {  // polymorphic variant type
