@@ -1193,6 +1193,15 @@ class Parser {
       advance();
       return box(CoreType{Ptyp_var{nm.text}, span(position(t.start), position(nm.end))});
     }
+    if (t.kind == Kind::UIDENT && peek(1).kind == Kind::DOT && peek(2).kind == Kind::LPAREN) {
+      advance();  // module name (single-segment local open M.(t))
+      LongidentLoc mod_{{Lident{t.text}}, tokloc(t)};
+      advance(); advance();  // . (
+      CoreTypeBox inner = parse_core_type();
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      return box(CoreType{Ptyp_open{std::move(mod_), std::move(inner)},
+                          span(position(t.start), position(c.end))});
+    }
     if (t.kind == Kind::LIDENT || t.kind == Kind::UIDENT) {
       LongidentLoc name = parse_longident_path();
       return box(CoreType{.desc = Ptyp_constr{.id = name, .args = {}}, .loc = name.loc});

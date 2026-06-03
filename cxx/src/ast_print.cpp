@@ -114,6 +114,9 @@ struct Printer {
       for (auto& var : v->vars) s += " '" + var;  // typevars: ` 'a 'b`
       line(j, s);
       core_type(j, *v->type);
+    } else if (auto* v = std::get_if<Ptyp_open>(&t.desc)) {
+      line(j, "Ptyp_open \"" + lid_loc(v->mod_) + "\"");
+      core_type(j, *v->type);
     } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
       line(j, std::string("Ptyp_variant closed=") + closed_flag(v->closed));
       if (v->rows.empty()) line(j, "[]");
