@@ -241,11 +241,44 @@ struct PrimitiveDescription {
   Location loc;
 };
 
-// --- module expressions (subset: M, struct…end) ---
+struct StrOptLoc { std::optional<std::string> txt; Location loc; };  // module names (`_`)
+
+// --- module types / signatures ---
+struct ValueDescription { StringLoc name; CoreTypeBox type; Location loc; };
+struct SignatureItem;
+using Signature = std::vector<SignatureItem>;
+struct ModuleType;
+using ModuleTypeBox = Box<ModuleType>;
+struct Functor_unit {};
+struct Functor_named { StrOptLoc name; ModuleTypeBox type; };
+using FunctorParam = std::variant<Functor_unit, Functor_named>;
+struct Pmty_ident { LongidentLoc id; };
+struct Pmty_signature { Signature items; };
+struct Pmty_functor { FunctorParam param; ModuleTypeBox body; };
+struct ModuleType {
+  std::variant<Pmty_ident, Pmty_signature, Pmty_functor> desc;
+  Location loc;
+  Attributes attrs;
+};
+struct Psig_value { ValueDescription vd; };
+struct Psig_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
+struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; };
+struct Psig_module { ModuleDeclaration md; };
+struct SignatureItem {
+  std::variant<Psig_value, Psig_type, Psig_module> desc;
+  Location loc;
+};
+
+// --- module expressions ---
 struct Pmod_ident { LongidentLoc id; };
 struct Pmod_structure { Structure items; };
-struct ModuleExpr { std::variant<Pmod_ident, Pmod_structure> desc; Location loc; };
-struct StrOptLoc { std::optional<std::string> txt; Location loc; };  // module names (`_`)
+struct ModuleExpr;
+struct Pmod_functor { FunctorParam param; Box<ModuleExpr> body; };
+struct Pmod_constraint { Box<ModuleExpr> me; ModuleTypeBox mt; };
+struct ModuleExpr {
+  std::variant<Pmod_ident, Pmod_structure, Pmod_functor, Pmod_constraint> desc;
+  Location loc;
+};
 struct ModuleBinding { StrOptLoc name; ModuleExpr expr; };
 
 // --- structure items ---
@@ -260,10 +293,11 @@ struct Pstr_module { ModuleBinding binding; };
 struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
 struct Pstr_extension { std::string name; Structure payload; };  // [%%ext …]
 struct Pstr_include { ModuleExpr expr; };
+struct Pstr_modtype { StringLoc name; std::optional<ModuleType> type; };  // module type S = mty
 struct StructureItem {
   std::variant<Pstr_eval, Pstr_value, Pstr_type, Pstr_open, Pstr_exception,
                Pstr_typext, Pstr_primitive, Pstr_module, Pstr_attribute,
-               Pstr_extension, Pstr_include>
+               Pstr_extension, Pstr_include, Pstr_modtype>
       desc;
   Location loc;
 };

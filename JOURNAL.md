@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **51.2%** corpus parity vs `ocamlc -dparsetree`. Broad expression/pattern/type-decl/structure surface incl. GADTs, polymorphic variants, type extensions, newtype params, attributes/extensions, `let open`/`let module … in` (this fork's `Pexp_struct_item`), `include`. Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2 → 43.0 → 50.2 → **51.2**. The tail has flattened (~1%/construct); remaining big-ticket subsystems: **functors + module types/signatures**, **objects/classes**, `[%ext]` nodes, `(module M)` first-class modules, `M.(e)`/`a.{i}` sugar.
+- ◐ **Parser** — **51.5%** corpus parity vs `ocamlc -dparsetree`. Broad surface incl. GADTs, polymorphic variants, type extensions, newtype params, attributes/extensions, `let open`/`let module`, `include`, and the **module-type/signature/functor subsystem** (`module type S = sig…end`, `val`/`type` sig items, `module M : S = …` constraints, `module F (X:S) = …` functors). Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2 → 43.0 → 50.2 → 51.2 → **51.5**. Now in the *deep* tail: large subsystems each unblock very few *complete* files because the files using them are multi-construct. Remaining: objects/classes, `with`-constraints, `(module M)`, `[%ext]`, `M.(e)`/`a.{i}` sugar, sig `module`/`include`/`open`.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -337,3 +337,18 @@ in a session); parser at 51% of the testsuite corpus, up from a tracer bullet, v
 a long sequence of oracle-driven diffs. The recurring lesson: correct transcription
 is cheap; the leverage is in the few pervasive details (the string-loc bug, the
 `Pexp_struct_item` fork divergence) that only a differential oracle surfaces.
+
+### 2026-06-02 — module types / signatures / functors → 51.5% (day 0 cont.)
+
+- `module type S = sig … end` (`Pstr_modtype`, `Pmty_ident`/`Pmty_signature`/
+  `Pmty_functor`), signature items `val`/`type`/`module`, `module M : S = me`
+  (`Pmod_constraint`), and functors `module F (X:S) = me` (`Pmod_functor`).
+  m.ml byte-identical.
+- Parity 51.2% → **51.5%** (+1 file). The subsystem is large and correct but the
+  files exercising it are multi-construct, so completing one feature seldom
+  completes a whole file. This is the **deep tail**: from here, each large
+  subsystem buys ~0.3% of full-file parity, because the marginal file needs *all*
+  of {objects, with-constraints, first-class modules, exotic sugar, …} at once.
+  A faithful read on the prediction: the parser estimate (1.5–3 weeks) is holding —
+  the front half of the grammar fell quickly, but the combinatorial tail is exactly
+  the slow grind it was predicted to be.

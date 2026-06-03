@@ -424,15 +424,68 @@ struct Printer {
   std::string str_opt_loc(const StrOptLoc& s) const {
     return '"' + (s.txt ? *s.txt : std::string("_")) + "\" " + loc(s.loc);
   }
+  void value_description(int i, const ValueDescription& v) {
+    line(i, "value_description " + str_loc(v.name) + " " + loc(v.loc));
+    core_type(i + 1, *v.type);
+  }
+  void signature_item(int i, const SignatureItem& s) {
+    line(i, "signature_item " + loc(s.loc));
+    int j = i + 1;
+    if (auto* v = std::get_if<Psig_value>(&s.desc)) {
+      line(j, "Psig_value");
+      value_description(j, v->vd);
+    } else if (auto* v = std::get_if<Psig_type>(&s.desc)) {
+      line(j, std::string("Psig_type ") + rec_flag(v->rf));
+      if (v->decls.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& d : v->decls) type_declaration(j + 1, d); line(j, "]"); }
+    } else {
+      auto& pm = std::get<Psig_module>(s.desc);
+      line(j, "Psig_module " + str_opt_loc(pm.md.name));
+      module_type(j, *pm.md.type);
+    }
+  }
+  void module_type(int i, const ModuleType& m) {
+    line(i, "module_type " + loc(m.loc));
+    attributes(i, m.attrs);
+    int j = i + 1;
+    if (auto* v = std::get_if<Pmty_ident>(&m.desc)) {
+      line(j, "Pmty_ident " + lid_loc(v->id));
+    } else if (auto* v = std::get_if<Pmty_signature>(&m.desc)) {
+      line(j, "Pmty_signature");
+      if (v->items.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& si : v->items) signature_item(j + 1, si); line(j, "]"); }
+    } else {
+      auto& f = std::get<Pmty_functor>(m.desc);
+      if (auto* named = std::get_if<Functor_named>(&f.param)) {
+        line(j, "Pmty_functor " + str_opt_loc(named->name));
+        module_type(j, *named->type);
+      } else {
+        line(j, "Pmty_functor ()");
+      }
+      module_type(j, *f.body);
+    }
+  }
   void module_expr(int i, const ModuleExpr& m) {
     line(i, "module_expr " + loc(m.loc));
     int j = i + 1;
     if (auto* id = std::get_if<Pmod_ident>(&m.desc)) {
       line(j, "Pmod_ident " + lid_loc(id->id));
-    } else {
-      auto& s = std::get<Pmod_structure>(m.desc);
+    } else if (auto* s = std::get_if<Pmod_structure>(&m.desc)) {
       line(j, "Pmod_structure");
-      structure_list(j, s.items);
+      structure_list(j, s->items);
+    } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      if (auto* named = std::get_if<Functor_named>(&f->param)) {
+        line(j, "Pmod_functor " + str_opt_loc(named->name));
+        module_type(j, *named->type);
+      } else {
+        line(j, "Pmod_functor ()");
+      }
+      module_expr(j, *f->body);
+    } else {
+      auto& c = std::get<Pmod_constraint>(m.desc);
+      line(j, "Pmod_constraint");
+      module_expr(j, *c.me);
+      module_type(j, *c.mt);
     }
   }
   void module_binding(int i, const ModuleBinding& b) {
@@ -532,6 +585,10 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_include>(&s.desc)) {
       os << ind(j) << "Pstr_include";  // printast prints this with no trailing newline
       module_expr(j, v->expr);
+    } else if (auto* v = std::get_if<Pstr_modtype>(&s.desc)) {
+      line(j, "Pstr_modtype " + str_loc(v->name));
+      if (v->type) module_type(j + 1, *v->type);  // modtype_declaration: Some -> module_type(i+1)
+      else line(j, "#abstract");
     }
   }
 

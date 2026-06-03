@@ -1321,14 +1321,37 @@ class Parser {
       PrimitiveDescription pd{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l};
       return StructureItem{Pstr_primitive{std::move(pd)}, l};
     }
-    if (t.kind == Kind::MODULE && peek(1).kind != Kind::TYPE) {
+    if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
+      advance(); advance();  // module type
+      Token nm = cur();
+      if (nm.kind != Kind::UIDENT) throw ParseError("expected module type name", nm.start);
       advance();
-      StrOptLoc name;
-      if (cur().kind == Kind::UIDENT) { Token nm = cur(); advance(); name = StrOptLoc{nm.text, tokloc(nm)}; }
-      else if (cur().kind == Kind::UNDERSCORE) { Token nm = cur(); advance(); name = StrOptLoc{std::nullopt, tokloc(nm)}; }
-      else throw ParseError("expected module name", cur().start);
-      expect(Kind::EQUAL, "=");  // (functor params / module-type constraint deferred)
+      std::optional<ModuleType> mty;
+      if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return StructureItem{Pstr_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty)}, l};
+    }
+    if (t.kind == Kind::MODULE) {
+      advance();
+      StrOptLoc name = parse_module_name();
+      std::vector<std::pair<Position, FunctorParam>> params;
+      while (cur().kind == Kind::LPAREN) {
+        Position ps = position(cur().start);
+        params.emplace_back(ps, parse_functor_param());
+      }
+      std::optional<ModuleType> cmty;
+      Position colon_pos{};
+      if (cur().kind == Kind::COLON) { colon_pos = position(cur().start); advance(); cmty = parse_module_type(); }
+      expect(Kind::EQUAL, "=");
       ModuleExpr me = parse_module_expr();
+      if (cmty) {
+        Location cl = span(colon_pos, me.loc.end);
+        me = ModuleExpr{Pmod_constraint{box(std::move(me)), box(std::move(*cmty))}, cl};
+      }
+      for (int i = static_cast<int>(params.size()) - 1; i >= 0; --i) {
+        Location fl = span(params[i].first, me.loc.end);
+        me = ModuleExpr{Pmod_functor{std::move(params[i].second), box(std::move(me))}, fl};
+      }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_module{ModuleBinding{std::move(name), std::move(me)}}, l};
     }
@@ -1376,6 +1399,91 @@ class Parser {
     return Attribute{std::move(name), std::move(payload)};
   }
 
+  StrOptLoc parse_module_name() {
+    Token nm = cur();
+    if (nm.kind == Kind::UIDENT) { advance(); return StrOptLoc{nm.text, tokloc(nm)}; }
+    if (nm.kind == Kind::UNDERSCORE) { advance(); return StrOptLoc{std::nullopt, tokloc(nm)}; }
+    throw ParseError("expected module name", nm.start);
+  }
+  // ( X : S )  or  ( )
+  FunctorParam parse_functor_param() {
+    expect(Kind::LPAREN, "(");
+    if (cur().kind == Kind::RPAREN) { advance(); return Functor_unit{}; }
+    StrOptLoc name = parse_module_name();
+    expect(Kind::COLON, ":");
+    ModuleType mt = parse_module_type();
+    expect(Kind::RPAREN, ")");
+    return Functor_named{std::move(name), box(std::move(mt))};
+  }
+
+  ModuleType parse_module_type() {
+    Token t = cur();
+    if (t.kind == Kind::SIG) {
+      advance();
+      Signature items = parse_signature_until(Kind::END);
+      Token c = cur(); expect(Kind::END, "end");
+      return ModuleType{Pmty_signature{std::move(items)}, span(position(t.start), position(c.end)), {}};
+    }
+    if (t.kind == Kind::FUNCTOR) {
+      advance();
+      Position ps = position(cur().start);
+      FunctorParam param = parse_functor_param();
+      expect(Kind::MINUSGREATER, "->");
+      ModuleType body = parse_module_type();
+      return ModuleType{Pmty_functor{std::move(param), box(std::move(body))},
+                        span(position(t.start), body.loc.end), {}};
+    }
+    if (t.kind == Kind::UIDENT) {
+      LongidentLoc id = parse_longident_path();
+      return ModuleType{Pmty_ident{id}, id.loc, {}};
+    }
+    throw ParseError("unsupported module type", t.start);
+  }
+
+  Signature parse_signature_until(Kind stop) {
+    Signature items;
+    while (cur().kind != Kind::TEOF && cur().kind != stop) {
+      if (cur().kind == Kind::SEMISEMI) { advance(); continue; }
+      items.push_back(parse_signature_item());
+    }
+    return items;
+  }
+  SignatureItem parse_signature_item() {
+    Token t = cur();
+    if (t.kind == Kind::VAL) {
+      advance();
+      Token nm = cur();
+      if (nm.kind != Kind::LIDENT) throw ParseError("expected value name", nm.start);
+      advance();
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_core_type();
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return SignatureItem{Psig_value{ValueDescription{StringLoc{nm.text, tokloc(nm)}, std::move(ty), l}}, l};
+    }
+    if (t.kind == Kind::TYPE) {
+      advance();
+      RecFlag rf = RecFlag::Recursive;
+      if (cur().kind == Kind::NONREC) { advance(); rf = RecFlag::Nonrecursive; }
+      std::vector<TypeDeclaration> decls;
+      decls.push_back(parse_type_declaration(position(t.start)));
+      while (cur().kind == Kind::AND) {
+        Position ds = position(cur().start); advance();
+        decls.push_back(parse_type_declaration(ds));
+      }
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return SignatureItem{Psig_type{rf, std::move(decls)}, l};
+    }
+    if (t.kind == Kind::MODULE) {
+      advance();
+      StrOptLoc name = parse_module_name();
+      expect(Kind::COLON, ":");
+      ModuleType mt = parse_module_type();
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt))}}, l};
+    }
+    throw ParseError("unsupported signature item", t.start);
+  }
+
   ModuleExpr parse_module_expr() {
     Token t = cur();
     if (t.kind == Kind::STRUCT) {
@@ -1383,6 +1491,14 @@ class Parser {
       Structure items = parse_structure_until(Kind::END);
       Token c = cur(); expect(Kind::END, "end");
       return ModuleExpr{Pmod_structure{std::move(items)}, span(position(t.start), position(c.end))};
+    }
+    if (t.kind == Kind::FUNCTOR) {
+      advance();
+      FunctorParam param = parse_functor_param();
+      expect(Kind::MINUSGREATER, "->");
+      ModuleExpr body = parse_module_expr();
+      return ModuleExpr{Pmod_functor{std::move(param), box(std::move(body))},
+                        span(position(t.start), body.loc.end)};
     }
     if (t.kind == Kind::UIDENT) {
       LongidentLoc mp = parse_longident_path();
