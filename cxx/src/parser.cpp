@@ -1897,6 +1897,7 @@ class Parser {
   }
   CoreTypeBox parse_type_param() {
     if (cur().kind == Kind::PLUS || cur().kind == Kind::MINUS) advance();  // variance (dropped)
+    if (cur().kind == Kind::BANG) advance();  // injectivity `!` (dropped)
     if (cur().kind == Kind::UNDERSCORE) {
       Token u = cur(); advance();
       return box(CoreType{Ptyp_any{}, tokloc(u)});
@@ -1906,7 +1907,8 @@ class Parser {
   std::vector<CoreTypeBox> parse_type_params() {
     std::vector<CoreTypeBox> params;
     Kind k = cur().kind;
-    if (k == Kind::QUOTE || k == Kind::UNDERSCORE || k == Kind::PLUS || k == Kind::MINUS) {
+    if (k == Kind::QUOTE || k == Kind::UNDERSCORE || k == Kind::PLUS ||
+        k == Kind::MINUS || k == Kind::BANG) {
       params.push_back(parse_type_param());
     } else if (k == Kind::LPAREN) {
       advance();
@@ -2055,6 +2057,19 @@ class Parser {
       advance(); Token id = cur(); advance();
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location loc = span(position(t.start), position(id.end));
+      return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p)}};
+    }
+    // ~(x:t)  (labelled punning with a type constraint)
+    if (t.kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {
+      advance(); advance();  // ~ (
+      Token id = cur(); advance();
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_core_type();
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      Pattern var{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
+      Location pl = span(position(id.start), ty->loc.end);  // inner: x..type
+      Pattern p{Ppat_constraint{box(std::move(var)), std::move(ty)}, pl};
+      Location loc = span(position(t.start), position(c.end));  // ~..)
       return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p)}};
     }
     // ?x  (optional punning)
