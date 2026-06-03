@@ -840,7 +840,9 @@ class Parser {
     if (cur().kind == Kind::SEMI && expr_starts(peek(1).kind)) {
       advance();
       ExprBox e2 = parse_expr();
-      Location l = span(e->loc.start, e2->loc.end);
+      // grammar `expr SEMI seq_expr` spans $sloc, which includes a trailing `;`
+      // consumed by the right operand (tracked in last_seq_end_).
+      Location l = span(e->loc.start, last_seq_end_);
       return E({Pexp_sequence{std::move(e), std::move(e2)}, l});
     }
     // seq_expr: `expr SEMI` — a trailing `;` is part of the sequence expression.
