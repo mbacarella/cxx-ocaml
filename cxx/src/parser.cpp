@@ -156,6 +156,7 @@ class Parser {
   std::vector<int> line_starts_;
   size_t idx_ = 0;
   Position last_seq_end_{};  // end of the most recent parse_expr, incl. a trailing `;`
+  bool last_type_subst_ = false;  // most recent type decl used `:=` (substitution)
 
   const Token& cur() const { return tokens_[idx_]; }
   const Token& peek(size_t n) const {
@@ -1593,7 +1594,8 @@ class Parser {
     TypeKind kind = Ptype_abstract{};
     std::optional<CoreTypeBox> manifest;
     PrivateFlag priv = PrivateFlag::Public;
-    if (cur().kind == Kind::EQUAL) {
+    last_type_subst_ = (cur().kind == Kind::COLONEQUAL);  // `type t := …`
+    if (cur().kind == Kind::EQUAL || cur().kind == Kind::COLONEQUAL) {
       advance();
       if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
       // A `kind` (record/variant/open) starts with `{`, `..`, `|`, or an unqualified
@@ -2260,12 +2262,15 @@ class Parser {
       idx_ = save;
       std::vector<TypeDeclaration> decls;
       decls.push_back(parse_type_declaration(d0));
+      bool subst = last_type_subst_;  // `type t := …` (destructive substitution)
       while (cur().kind == Kind::AND) {
         Position ds = position(cur().start); advance();
         decls.push_back(parse_type_declaration(ds));
       }
       attach_docs(decls[0].attrs, d0.cnum, decls[0].loc.end.cnum);
-      return SignatureItem{Psig_type{rf, std::move(decls)}, span(d0, position(tokens_[idx_ - 1].end))};
+      Location tl = span(d0, position(tokens_[idx_ - 1].end));
+      if (subst) return SignatureItem{Psig_typesubst{std::move(decls)}, tl};
+      return SignatureItem{Psig_type{rf, std::move(decls)}, tl};
     }
     if (t.kind == Kind::EXCEPTION) {
       advance();

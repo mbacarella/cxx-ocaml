@@ -319,6 +319,7 @@ struct ModuleType {
 struct Psig_value { ValueDescription vd; };
 struct Psig_primitive { PrimitiveDescription pd; };  // external in a signature
 struct Psig_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
+struct Psig_typesubst { std::vector<TypeDeclaration> decls; };  // type t := …
 struct Psig_typext { TypeExtension ext; };
 struct Psig_exception { TypeException exn; };
 struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; };
@@ -330,9 +331,9 @@ struct Psig_class_type { std::vector<ClassTypeDeclaration> decls; };
 struct Psig_attribute { std::string name; Structure payload; };
 struct Psig_extension { std::string name; Structure payload; };
 struct SignatureItem {
-  std::variant<Psig_value, Psig_primitive, Psig_type, Psig_typext, Psig_exception,
-               Psig_module, Psig_modtype, Psig_open, Psig_include, Psig_class_type,
-               Psig_attribute, Psig_extension>
+  std::variant<Psig_value, Psig_primitive, Psig_type, Psig_typesubst, Psig_typext,
+               Psig_exception, Psig_module, Psig_modtype, Psig_open, Psig_include,
+               Psig_class_type, Psig_attribute, Psig_extension>
       desc;
   Location loc;
 };

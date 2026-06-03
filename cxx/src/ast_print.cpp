@@ -569,6 +569,10 @@ struct Printer {
       line(j, std::string("Psig_type ") + rec_flag(v->rf));
       if (v->decls.empty()) line(j, "[]");
       else { line(j, "["); for (auto& d : v->decls) type_declaration(j + 1, d); line(j, "]"); }
+    } else if (auto* v = std::get_if<Psig_typesubst>(&s.desc)) {
+      line(j, "Psig_typesubst");
+      if (v->decls.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& d : v->decls) type_declaration(j + 1, d); line(j, "]"); }
     } else if (auto* v = std::get_if<Psig_typext>(&s.desc)) {
       line(j, "Psig_typext");
       type_extension(j, v->ext);
