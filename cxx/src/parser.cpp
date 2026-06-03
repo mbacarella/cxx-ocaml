@@ -461,12 +461,30 @@ class Parser {
           Location l = span(position(t.start), position(c.end));
           return mk_construct(lid0("()", l), std::nullopt, l);
         }
-        if (cur().kind == Kind::MODULE) {  // (module ME [: S])  first-class module
+        if (cur().kind == Kind::MODULE) {  // (module ME [: S [with type …]])  first-class module
           advance();
           ModuleExpr me = parse_module_expr();
-          if (cur().kind == Kind::COLON) { advance(); parse_module_type(); }  // package type discarded
+          std::optional<Ptyp_package> pkg;
+          if (cur().kind == Kind::COLON) {
+            advance();
+            LongidentLoc path = parse_longident_path();
+            std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
+            if (cur().kind == Kind::WITH) {
+              advance();
+              for (;;) {
+                expect(Kind::TYPE, "type");
+                LongidentLoc lp = parse_longident_path();
+                expect(Kind::EQUAL, "=");
+                cons.emplace_back(lp, parse_core_type());
+                if (cur().kind == Kind::AND) { advance(); continue; }
+                break;
+              }
+            }
+            pkg = Ptyp_package{std::move(path), std::move(cons)};
+          }
           Token c = cur(); expect(Kind::RPAREN, ")");
-          return E({Pexp_pack{box(std::move(me))}, span(position(t.start), position(c.end))});
+          return E({Pexp_pack{box(std::move(me)), std::move(pkg)},
+                    span(position(t.start), position(c.end))});
         }
         {  // (+), (>>=), (!), (.%[]), …  -> Pexp_ident spanning the parens
           size_t save = idx_;

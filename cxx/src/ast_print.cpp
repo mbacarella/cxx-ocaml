@@ -425,7 +425,20 @@ struct Printer {
     } else if (auto* v = std::get_if<Pexp_pack>(&e.desc)) {
       line(j, "Pexp_pack");
       module_expr(j, *v->me);
-      line(j, "None");  // package type (deferred)
+      if (!v->pkg) { line(j, "None"); }
+      else {
+        line(j, "Some");
+        line(j + 2, "package_type " + lid_loc(v->pkg->path));
+        if (v->pkg->constraints.empty()) line(j + 2, "[]");
+        else {
+          line(j + 2, "[");
+          for (auto& [path, ct] : v->pkg->constraints) {
+            line(j + 3, "with type " + lid_loc(path));
+            core_type(j + 3, *ct);
+          }
+          line(j + 2, "]");
+        }
+      }
     } else if (auto* v = std::get_if<Pexp_extension>(&e.desc)) {
       line(j, "Pexp_extension \"" + v->name + "\"");
       structure_list(j, v->payload);

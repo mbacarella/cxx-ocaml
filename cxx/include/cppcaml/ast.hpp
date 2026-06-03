@@ -188,7 +188,7 @@ struct Pexp_setfield { ExprBox obj; LongidentLoc field; ExprBox value; };  // e.
 struct Pexp_setinstvar { StringLoc name; ExprBox value; };  // x <- e  (in objects)
 struct Pexp_coerce { ExprBox e; std::optional<CoreTypeBox> from; CoreTypeBox to_; };  // (e :> t)
 struct Pexp_send { ExprBox obj; StringLoc meth; };  // e # m
-struct Pexp_pack { Box<ModuleExpr> me; };           // (module ME)
+struct Pexp_pack { Box<ModuleExpr> me; std::optional<Ptyp_package> pkg; };  // (module ME [: S])
 struct Pexp_extension { std::string name; Structure payload; };  // [%id …]
 struct BindingOp { StringLoc op; Pattern pat; ExprBox exp; Location loc; };
 struct Pexp_letop { BindingOp let_; std::vector<BindingOp> ands; ExprBox body; };  // let* … in …
