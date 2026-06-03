@@ -565,6 +565,7 @@ struct Printer {
   void constructor_decl(int i, const ConstructorDecl& c) {
     line(i, loc(c.loc));
     line(i + 1, str_loc(c.name));
+    attributes(i, c.attrs);  // pcd_attributes (printed at i+1, after the name)
     ctor_args(i + 1, c.args);
     if (c.res) { line(i + 1, "Some"); core_type(i + 2, **c.res); }
     else line(i + 1, "None");

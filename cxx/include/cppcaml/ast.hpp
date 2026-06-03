@@ -255,6 +255,7 @@ struct ConstructorDecl {
   ConstructorArguments args;
   std::optional<CoreTypeBox> res;
   Location loc;  // pcd_vars [] in fragment
+  Attributes attrs;  // pcd_attributes (e.g. [@deprecated])
 };
 struct Ptype_abstract {};
 struct Ptype_variant { std::vector<ConstructorDecl> ctors; };

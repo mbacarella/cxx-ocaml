@@ -1922,8 +1922,11 @@ class Parser {
         args = Pcstr_tuple{std::move(ts)};
       }
     }
+    Attributes attrs;  // pcd_attributes: `A [@deprecated]`
+    while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
+    if (!attrs.empty()) endp = position(tokens_[idx_ - 1].end);
     return ConstructorDecl{StringLoc{nm.text, tokloc(nm)}, std::move(args), std::move(res),
-                           span(start, endp)};
+                           span(start, endp), std::move(attrs)};
   }
   CoreTypeBox parse_type_param() {
     if (cur().kind == Kind::PLUS || cur().kind == Kind::MINUS) advance();  // variance (dropped)
