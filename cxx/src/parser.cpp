@@ -2367,11 +2367,20 @@ class Parser {
     }
     if (t.kind == Kind::FUNCTOR) {
       advance();
-      FunctorParam param = parse_functor_param();
+      // `functor (A)(B) -> R` folds to nested Pmty_functor; each node's loc starts
+      // at *its* arg's `(` (mk_functor_typ uses the arg startpos, not `functor`).
+      std::vector<std::pair<Position, FunctorParam>> args;
+      while (cur().kind == Kind::LPAREN) {
+        Position ps = position(cur().start);
+        args.emplace_back(ps, parse_functor_param());
+      }
       expect(Kind::MINUSGREATER, "->");
-      ModuleType body = parse_module_type();
-      return ModuleType{Pmty_functor{std::move(param), box(std::move(body))},
-                        span(position(t.start), body.loc.end), {}};
+      ModuleType mty = parse_module_type();
+      for (int i = static_cast<int>(args.size()) - 1; i >= 0; --i) {
+        Location l = span(args[i].first, mty.loc.end);
+        mty = ModuleType{Pmty_functor{std::move(args[i].second), box(std::move(mty))}, l, {}};
+      }
+      return mty;
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE && peek(2).kind == Kind::OF) {
       advance(); advance(); advance();  // module type of
