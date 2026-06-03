@@ -115,7 +115,8 @@ struct Ppat_any {};
 struct Ppat_var { StringLoc name; };
 struct Ppat_constant { Constant c; };
 struct Ppat_tuple { std::vector<PatBox> elems; ClosedFlag closed = ClosedFlag::Closed; };
-struct Ppat_construct { LongidentLoc id; std::optional<PatBox> arg; };  // vars [] in fragment
+struct Ppat_construct { LongidentLoc id; std::optional<PatBox> arg;
+                        std::vector<StringLoc> vars; };  // Constr (type a b) pat
 struct Ppat_or { PatBox l; PatBox r; };
 struct Ppat_alias { PatBox p; StringLoc name; };
 struct Ppat_constraint { PatBox p; CoreTypeBox t; };

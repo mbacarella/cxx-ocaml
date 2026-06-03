@@ -947,14 +947,24 @@ class Parser {
       }
       case Kind::FUNCTION: {
         advance();
+        Attributes fattrs;  // `function[@attr] …`
+        while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
         std::vector<Case> cs = parse_cases();
         Position last = cs.back().rhs->loc.end;
         Location casesloc = span(position(t.start), last);
         auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
-        return E({Pexp_function{{}, std::nullopt, std::move(fb)}, span(position(t.start), last)});
+        ExprBox r = E({Pexp_function{{}, std::nullopt, std::move(fb)}, span(position(t.start), last)});
+        r->attrs = std::move(fattrs);
+        return r;
       }
       case Kind::FUN: {
         advance();
+        Attributes funattrs;  // `fun[@attr] …`  -> on the resulting expression
+        while (cur().kind == Kind::LBRACKETAT) { advance(); funattrs.push_back(parse_attribute_body()); }
+        auto withattrs = [&](ExprBox e) {
+          for (auto& a : funattrs) e->attrs.push_back(std::move(a));
+          return e;
+        };
         std::vector<FunctionParam> params;
         while (cur().kind != Kind::MINUSGREATER) parse_params_into(params);
         expect(Kind::MINUSGREATER, "->");
@@ -970,8 +980,8 @@ class Parser {
           Position last = cs.back().rhs->loc.end;
           Location casesloc = span(position(fkw.start), last);
           auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
-          return E({Pexp_function{std::move(params), std::nullopt, std::move(fb)},
-                    span(position(t.start), last)});
+          return withattrs(E({Pexp_function{std::move(params), std::nullopt, std::move(fb)},
+                              span(position(t.start), last)}));
         }
         ExprBox body = parse_expr();
         if (all_newtype) {
@@ -982,11 +992,11 @@ class Parser {
             Position s = (i == 0) ? position(t.start) : nt.loc.start;  // outermost from `fun`
             acc = E({Pexp_newtype{nt.name, std::move(acc)}, Location{s, bend, i != 0}});
           }
-          return acc;
+          return withattrs(std::move(acc));
         }
         Location l = span(position(t.start), body->loc.end);
         auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
-        return E({Pexp_function{std::move(params), std::nullopt, std::move(fb)}, l});
+        return withattrs(E({Pexp_function{std::move(params), std::nullopt, std::move(fb)}, l}));
       }
       case Kind::WHILE: {
         advance();
@@ -1374,10 +1384,19 @@ class Parser {
     }
     if (cur().kind == Kind::UIDENT) {
       LongidentLoc cl = parse_longident_path();
+      std::vector<StringLoc> vars;  // `Constr (type a b) pat` — existential univars
+      if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
+        advance(); advance();  // ( type
+        while (cur().kind == Kind::LIDENT) {
+          Token id = cur(); advance();
+          vars.push_back(StringLoc{id.text, tokloc(id)});
+        }
+        expect(Kind::RPAREN, ")");
+      }
       if (is_simple_pattern_start(cur().kind)) {
         Pattern arg = parse_simple_pattern();
         Location l = span(cl.loc.start, arg.loc.end);
-        return Pattern{Ppat_construct{.id = cl, .arg = box(std::move(arg))}, l};
+        return Pattern{Ppat_construct{.id = cl, .arg = box(std::move(arg)), .vars = std::move(vars)}, l};
       }
       return Pattern{Ppat_construct{.id = cl, .arg = std::nullopt}, cl.loc};
     }

@@ -205,7 +205,8 @@ struct Printer {
       line(j, "Ppat_construct " + lid_loc(v->id));
       if (v->arg) {
         line(j, "Some");
-        line(j + 1, "[]");  // pcd_vars (locally abstract univars), empty in fragment
+        if (v->vars.empty()) line(j + 1, "[]");  // existential locally-abstract univars
+        else { line(j + 1, "["); for (auto& var : v->vars) line(j + 2, str_loc(var)); line(j + 1, "]"); }
         pattern(j + 1, **v->arg);
       } else {
         line(j, "None");
