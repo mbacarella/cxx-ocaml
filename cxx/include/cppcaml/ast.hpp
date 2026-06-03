@@ -33,6 +33,7 @@ using Box = std::unique_ptr<T>;
 // threaded through expression/pattern/type/binding nodes.
 struct StructureItem;
 using Structure = std::vector<StructureItem>;
+struct ModuleExpr;  // (used by Pexp_pack, Pstr_include, …)
 struct Attribute { std::string name; Structure payload; };  // [@name payload] (PStr)
 using Attributes = std::vector<Attribute>;
 
@@ -48,6 +49,7 @@ struct Longident { std::variant<Lident, Ldot, Lapply> v; };
 struct LongidentLoc { Longident txt; Location loc; };
 
 struct StringLoc { std::string txt; Location loc; };
+struct StrOptLoc { std::optional<std::string> txt; Location loc; };  // names that may be `_`
 
 // --- constants ---
 struct Pconst_integer { std::string value; std::optional<char> suffix; };
@@ -110,10 +112,16 @@ struct Ppat_lazy { PatBox p; };
 struct Ppat_interval { Constant c1; Constant c2; };
 struct Ppat_variant { std::string label; std::optional<PatBox> arg; };
 struct Ppat_exception { PatBox p; };
+struct Ppat_array { std::vector<PatBox> elems; };
+struct Ppat_type { LongidentLoc id; };                  // #tconst
+struct Ppat_unpack { StrOptLoc name; };                 // (module M)  (package type deferred)
+struct Ppat_extension { std::string name; Structure payload; };  // [%id]
+struct Ppat_open { LongidentLoc mod_; PatBox p; };      // M.(P)
 struct Pattern {
   std::variant<Ppat_any, Ppat_var, Ppat_constant, Ppat_tuple, Ppat_construct,
                Ppat_or, Ppat_alias, Ppat_constraint, Ppat_record, Ppat_lazy,
-               Ppat_interval, Ppat_variant, Ppat_exception>
+               Ppat_interval, Ppat_variant, Ppat_exception, Ppat_array,
+               Ppat_type, Ppat_unpack, Ppat_extension, Ppat_open>
       desc;
   Location loc;
   Attributes attrs;
@@ -156,6 +164,14 @@ struct Pexp_newtype { StringLoc name; ExprBox body; };  // fun (type a) -> e
 // fork-specific: `let open … in e`, `let module … in e`, `M.(e)` all lower to a
 // structure item scoped over an expression.
 struct Pexp_struct_item { Box<StructureItem> item; ExprBox body; };
+struct Pexp_setfield { ExprBox obj; LongidentLoc field; ExprBox value; };  // e.l <- e2
+struct Pexp_setinstvar { StringLoc name; ExprBox value; };  // x <- e  (in objects)
+struct Pexp_coerce { ExprBox e; std::optional<CoreTypeBox> from; CoreTypeBox to_; };  // (e :> t)
+struct Pexp_send { ExprBox obj; StringLoc meth; };  // e # m
+struct Pexp_pack { Box<ModuleExpr> me; };           // (module ME)
+struct Pexp_extension { std::string name; Structure payload; };  // [%id …]
+struct BindingOp { StringLoc op; Pattern pat; ExprBox exp; Location loc; };
+struct Pexp_letop { BindingOp let_; std::vector<BindingOp> ands; ExprBox body; };  // let* … in …
 struct Pexp_while { ExprBox cond; ExprBox body; };
 struct Pexp_for { Pattern var; ExprBox lo; ExprBox hi; DirectionFlag dir; ExprBox body; };
 struct Pexp_array { std::vector<ExprBox> elems; };
@@ -165,7 +181,9 @@ struct Expression {
                Pexp_tuple, Pexp_ifthenelse, Pexp_construct, Pexp_match, Pexp_try,
                Pexp_sequence, Pexp_constraint, Pexp_field, Pexp_record,
                Pexp_assert, Pexp_lazy, Pexp_while, Pexp_for, Pexp_array,
-               Pexp_variant, Pexp_newtype, Pexp_struct_item>
+               Pexp_variant, Pexp_newtype, Pexp_struct_item, Pexp_setfield,
+               Pexp_setinstvar, Pexp_coerce, Pexp_send, Pexp_pack,
+               Pexp_extension, Pexp_letop>
       desc;
   Location loc;
   Attributes attrs;
@@ -240,8 +258,6 @@ struct PrimitiveDescription {
   std::vector<std::string> prims;
   Location loc;
 };
-
-struct StrOptLoc { std::optional<std::string> txt; Location loc; };  // module names (`_`)
 
 // --- module types / signatures ---
 struct ValueDescription { StringLoc name; CoreTypeBox type; Location loc; };

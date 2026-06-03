@@ -211,6 +211,22 @@ struct Printer {
     } else if (auto* v = std::get_if<Ppat_exception>(&p.desc)) {
       line(j, "Ppat_exception");
       pattern(j, *v->p);
+    } else if (auto* v = std::get_if<Ppat_array>(&p.desc)) {
+      line(j, "Ppat_array");
+      if (v->elems.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& el : v->elems) pattern(j + 1, *el); line(j, "]"); }
+    } else if (auto* v = std::get_if<Ppat_type>(&p.desc)) {
+      line(j, "Ppat_type");
+      line(j, lid_loc(v->id));
+    } else if (auto* v = std::get_if<Ppat_unpack>(&p.desc)) {
+      line(j, "Ppat_unpack " + str_opt_loc(v->name));
+      line(j, "None");  // package type (deferred)
+    } else if (auto* v = std::get_if<Ppat_extension>(&p.desc)) {
+      line(j, "Ppat_extension \"" + v->name + "\"");
+      structure_list(j, v->payload);
+    } else if (auto* v = std::get_if<Ppat_open>(&p.desc)) {
+      line(j, "Ppat_open \"" + lid_loc(v->mod_) + "\"");
+      pattern(j, *v->p);
     }
   }
 
@@ -329,7 +345,40 @@ struct Printer {
       line(j, "Pexp_struct_item");
       structure_item(j, *v->item);
       expression(j, *v->body);
+    } else if (auto* v = std::get_if<Pexp_setfield>(&e.desc)) {
+      line(j, "Pexp_setfield");
+      expression(j, *v->obj);
+      line(j, lid_loc(v->field));
+      expression(j, *v->value);
+    } else if (auto* v = std::get_if<Pexp_setinstvar>(&e.desc)) {
+      line(j, "Pexp_setinstvar " + str_loc(v->name));
+      expression(j, *v->value);
+    } else if (auto* v = std::get_if<Pexp_coerce>(&e.desc)) {
+      line(j, "Pexp_coerce");
+      expression(j, *v->e);
+      if (v->from) { line(j, "Some"); core_type(j + 1, **v->from); } else line(j, "None");
+      core_type(j, *v->to_);
+    } else if (auto* v = std::get_if<Pexp_send>(&e.desc)) {
+      line(j, "Pexp_send \"" + v->meth.txt + "\"");
+      expression(j, *v->obj);
+    } else if (auto* v = std::get_if<Pexp_pack>(&e.desc)) {
+      line(j, "Pexp_pack");
+      module_expr(j, *v->me);
+      line(j, "None");  // package type (deferred)
+    } else if (auto* v = std::get_if<Pexp_extension>(&e.desc)) {
+      line(j, "Pexp_extension \"" + v->name + "\"");
+      structure_list(j, v->payload);
+    } else if (auto* v = std::get_if<Pexp_letop>(&e.desc)) {
+      line(j, "Pexp_letop");
+      binding_op(j, v->let_);
+      for (auto& b : v->ands) binding_op(j, b);
+      expression(j, *v->body);
     }
+  }
+  void binding_op(int i, const BindingOp& b) {
+    os << ind(i) << "<binding_op> \"" << b.op.txt << "\" " << loc(b.loc);  // no newline
+    pattern(i + 1, b.pat);
+    expression(i + 1, *b.exp);
   }
 
   void one_case(int i, const Case& c) {
