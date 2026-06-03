@@ -1066,12 +1066,19 @@ class Parser {
   // includes a parenthesized child's parens), not the child node's own loc.
   CoreTypeBox parse_type_arrow() {
     Position symstart = position(cur().start);
+    // labeled/optional arrow domain: `?x:t -> …`, `~`-free `x:t -> …`
+    ArgLabel label = Nolabel{};
+    if (cur().kind == Kind::OPTLABEL) { label = Optional{cur().text}; advance(); }
+    else if (cur().kind == Kind::LABEL) { label = Labelled{cur().text}; advance(); }
+    else if (cur().kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
+      label = Labelled{cur().text}; advance(); advance();  // x :
+    }
     CoreTypeBox t = parse_type_tuple();
     if (cur().kind == Kind::MINUSGREATER) {
       advance();
       CoreTypeBox cod = parse_type_arrow();
       Location l = span(symstart, position(tokens_[idx_ - 1].end));
-      return box(CoreType{Ptyp_arrow{Nolabel{}, std::move(t), std::move(cod)}, l});
+      return box(CoreType{Ptyp_arrow{std::move(label), std::move(t), std::move(cod)}, l});
     }
     return t;
   }
