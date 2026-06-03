@@ -2676,6 +2676,10 @@ class Parser {
   }
   ModuleType parse_module_type_with() {
     ModuleType mt = parse_module_type_base();
+    while (cur().kind == Kind::LBRACKETAT) {  // mty [@attr]  -> pmty_attributes
+      advance();
+      mt.attrs.push_back(parse_attribute_body());
+    }
     while (cur().kind == Kind::WITH) {
       advance();
       std::vector<WithConstraint> cs;
