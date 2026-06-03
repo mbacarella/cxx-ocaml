@@ -1444,8 +1444,23 @@ class Parser {
       }
       case Kind::TRUE: advance(); return ppat_construct0("true", tokloc(t));
       case Kind::FALSE: advance(); return ppat_construct0("false", tokloc(t));
-      case Kind::UIDENT: { LongidentLoc cl = parse_longident_path();
-        return {Ppat_construct{.id = cl, .arg = std::nullopt}, cl.loc}; }
+      case Kind::UIDENT: {
+        LongidentLoc cl = parse_longident_path();
+        if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P)
+          advance(); advance();  // . (
+          Pattern inner = parse_pattern();
+          Token c = cur(); expect(Kind::RPAREN, ")");
+          return {Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
+        }
+        if (cur().kind == Kind::DOT &&
+            (peek(1).kind == Kind::LBRACKET || peek(1).kind == Kind::LBRACE)) {  // M.[…] / M.{…}
+          advance();  // .  (the bracket is the inner pattern's own delimiter)
+          Pattern inner = parse_simple_pattern();
+          Position end = inner.loc.end;
+          return {Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, end)};
+        }
+        return {Ppat_construct{.id = cl, .arg = std::nullopt}, cl.loc};
+      }
       case Kind::LPAREN: {
         advance();
         if (cur().kind == Kind::RPAREN) {
