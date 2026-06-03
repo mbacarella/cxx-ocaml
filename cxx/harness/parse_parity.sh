@@ -11,7 +11,9 @@ mapfile -t files < <(find testsuite/tests -name '*.ml' | sort)
 
 # Strip any warning preamble (e.g. bad-module-name on odd filenames) the oracle
 # prints to stderr before the dump; the parsetree always starts at a bare "[".
-oracle() { ./ocamlc.opt -nostdlib -I stdlib -stop-after parsing -dparsetree "$1" 2>&1 1>/dev/null | sed -n '/^\[$/,$p'; }
+# The parsetree dump starts at a line beginning with `[` — either `[` (non-empty
+# structure) or `[]` (empty structure).  Anchor on `^\[` to keep both.
+oracle() { ./ocamlc.opt -nostdlib -I stdlib -stop-after parsing -dparsetree "$1" 2>&1 1>/dev/null | sed -n '/^\[/,$p'; }
 
 total=0 match=0 cpp_err=0
 for f in "${files[@]}"; do
