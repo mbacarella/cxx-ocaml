@@ -42,6 +42,7 @@ std::optional<OpInfo> infix_op(const Token& t) {
     case Kind::PERCENT:    return OpInfo{8, false, "%"};
     case Kind::INFIXOP3:   return OpInfo{8, false, t.text};
     case Kind::INFIXOP4:   return OpInfo{9, true, t.text};
+    case Kind::HASHOP:     return OpInfo{10, false, t.text};  // `#...` (left-assoc, above all)
     default: return std::nullopt;
   }
 }
@@ -392,6 +393,35 @@ class Parser {
         while (cur().kind == Kind::COMMA) { advance(); idxs.push_back(parse_binop(0)); }
         Token c = cur(); expect(Kind::RBRACE, "}");
         e = bigarray_get(std::move(e), std::move(idxs), position(c.end));
+      } else if (cur().kind == Kind::DOTOP) {  // e.op(i) / e.op[i] / e.op{i;j} index-op get
+        Token dop = cur(); advance();
+        const char* openc; const char* closec; Kind closeK;
+        switch (cur().kind) {
+          case Kind::LPAREN:   openc = "("; closec = ")"; closeK = Kind::RPAREN;   break;
+          case Kind::LBRACKET: openc = "["; closec = "]"; closeK = Kind::RBRACKET; break;
+          case Kind::LBRACE:   openc = "{"; closec = "}"; closeK = Kind::RBRACE;   break;
+          default: throw ParseError("expected ( [ or { after index operator", cur().start);
+        }
+        advance();  // open bracket
+        std::vector<ExprBox> idxs;  // `;`-separated index list (expr_semi_list)
+        idxs.push_back(parse_expr_no_seq());
+        while (cur().kind == Kind::SEMI) { advance(); idxs.push_back(parse_expr_no_seq()); }
+        Token c = cur(); expect(closeK, closec);
+        Position end = position(c.end);
+        bool many = idxs.size() > 1;  // multi-index -> Pexp_array arg, name carries `;..`
+        std::string name = "." + dop.text + openc + (many ? ";.." : "") + closec;
+        Location gl{e->loc.start, end, true};  // ghost ident spans the whole get
+        ExprBox fn = E({Pexp_ident{lid0(name, gl)}, gl});
+        std::vector<std::pair<ArgLabel, ExprBox>> args;
+        Position objStart = e->loc.start;
+        args.emplace_back(Nolabel{}, std::move(e));
+        if (many) {
+          Location al{idxs.front()->loc.start, idxs.back()->loc.end, false};
+          args.emplace_back(Nolabel{}, E({Pexp_array{std::move(idxs)}, al}));
+        } else {
+          args.emplace_back(Nolabel{}, std::move(idxs.front()));
+        }
+        e = E({Pexp_apply{std::move(fn), std::move(args)}, Location{objStart, end, false}});
       } else if (cur().kind == Kind::HASH && peek(1).kind == Kind::LIDENT) {
         advance();  // #
         Token m = cur(); advance();
@@ -730,8 +760,17 @@ class Parser {
     }
     if (auto* ap = std::get_if<Pexp_apply>(&lhs->desc)) {
       if (auto* id = std::get_if<Pexp_ident>(&ap->fn->desc)) {
+        // user index-op get `.op(…)` -> set `.op(…)<-` with the rhs appended
         if (auto* lid = std::get_if<Lident>(&id->id.txt.v)) {
-          (void)lid;
+          const std::string& nm = lid->name;
+          if (nm.size() >= 3 && nm[0] == '.' &&
+              (nm.back() == ')' || nm.back() == ']' || nm.back() == '}')) {
+            Location gl{l.start, l.end, true};
+            ExprBox fn = E({Pexp_ident{lid0(nm + "<-", gl)}, gl});
+            std::vector<std::pair<ArgLabel, ExprBox>> args = std::move(ap->args);
+            args.emplace_back(Nolabel{}, std::move(rhs));
+            return E({Pexp_apply{std::move(fn), std::move(args)}, l});
+          }
         }
         // Array.get / String.get -> .set with the rhs appended
         std::string nm;
