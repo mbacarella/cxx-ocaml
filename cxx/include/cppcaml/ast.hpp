@@ -125,7 +125,7 @@ struct Ppat_variant { std::string label; std::optional<PatBox> arg; };
 struct Ppat_exception { PatBox p; };
 struct Ppat_array { std::vector<PatBox> elems; };
 struct Ppat_type { LongidentLoc id; };                  // #tconst
-struct Ppat_unpack { StrOptLoc name; };                 // (module M)  (package type deferred)
+struct Ppat_unpack { StrOptLoc name; std::optional<Ptyp_package> pkg; };  // (module M [: S])
 struct Ppat_extension { std::string name; Structure payload; };  // [%id]
 struct Ppat_open { LongidentLoc mod_; PatBox p; };      // M.(P)
 struct Ppat_effect { PatBox eff; PatBox cont; };        // effect P, k

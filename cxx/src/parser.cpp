@@ -1335,9 +1335,26 @@ class Parser {
           if (cur().kind == Kind::UIDENT) { Token nm = cur(); advance(); name = StrOptLoc{nm.text, tokloc(nm)}; }
           else if (cur().kind == Kind::UNDERSCORE) { Token nm = cur(); advance(); name = StrOptLoc{std::nullopt, tokloc(nm)}; }
           else throw ParseError("expected module name", cur().start);
-          if (cur().kind == Kind::COLON) { advance(); parse_module_type(); }
+          std::optional<Ptyp_package> pkg;
+          if (cur().kind == Kind::COLON) {  // (module M : S [with type t = u …])
+            advance();
+            LongidentLoc path = parse_longident_path();
+            std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
+            if (cur().kind == Kind::WITH) {
+              advance();
+              for (;;) {
+                expect(Kind::TYPE, "type");
+                LongidentLoc lp = parse_longident_path();
+                expect(Kind::EQUAL, "=");
+                cons.emplace_back(lp, parse_core_type());
+                if (cur().kind == Kind::AND) { advance(); continue; }
+                break;
+              }
+            }
+            pkg = Ptyp_package{std::move(path), std::move(cons)};
+          }
           Token c = cur(); expect(Kind::RPAREN, ")");
-          return {Ppat_unpack{std::move(name)}, span(position(t.start), position(c.end))};
+          return {Ppat_unpack{std::move(name), std::move(pkg)}, span(position(t.start), position(c.end))};
         }
         if (peek(1).kind == Kind::RPAREN) {
           if (auto op = operator_name(cur())) {  // (+) x = …  -> Ppat_var "+"
