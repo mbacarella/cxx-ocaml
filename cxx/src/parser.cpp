@@ -452,6 +452,11 @@ class Parser {
         Location l = pr.lid.loc;
         return E({Pexp_ident{.id = std::move(pr.lid)}, l});
       }
+      case Kind::BACKQUOTE: {  // `Tag as a simple expr (no argument) — e.g. an app arg
+        advance();
+        Token tag = cur(); advance();
+        return E({Pexp_variant{tag.text, std::nullopt}, span(position(t.start), position(tag.end))});
+      }
       case Kind::TRUE: advance(); return mk_construct(lid0("true", tokloc(t)), std::nullopt, tokloc(t));
       case Kind::FALSE: advance(); return mk_construct(lid0("false", tokloc(t)), std::nullopt, tokloc(t));
       case Kind::LPAREN: {
