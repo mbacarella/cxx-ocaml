@@ -652,22 +652,41 @@ class Parser {
 
   ExprBox parse_unary() {
     Token t = cur();
-    if (t.kind == Kind::MINUS || t.kind == Kind::MINUSDOT) {
-      // negative literal: fold `- <int/float literal>` into a signed constant.
-      if (peek(1).kind == Kind::INT || peek(1).kind == Kind::FLOAT) {
+    // A keyword-led expression (match/function/fun/try/if/let) appearing in
+    // operand position (e.g. the RHS of an infix operator) extends to the right
+    // and is a full expression — delegate to parse_expr_no_seq.
+    switch (t.kind) {
+      case Kind::MATCH: case Kind::FUNCTION: case Kind::FUN:
+      case Kind::TRY: case Kind::IF: case Kind::LET:
+        return parse_expr_no_seq();
+      default: break;
+    }
+    // Unary sign: subtractive {- -.} and additive {+ +.}.  Folds literals into a
+    // (possibly signed) constant per mkuminus/mkuplus; otherwise applies ~op.
+    if (t.kind == Kind::MINUS || t.kind == Kind::MINUSDOT ||
+        t.kind == Kind::PLUS  || t.kind == Kind::PLUSDOT) {
+      bool sub = (t.kind == Kind::MINUS || t.kind == Kind::MINUSDOT);
+      bool dot = (t.kind == Kind::MINUSDOT || t.kind == Kind::PLUSDOT);
+      const char* name = t.kind == Kind::MINUS ? "-" : t.kind == Kind::MINUSDOT ? "-."
+                       : t.kind == Kind::PLUS  ? "+" : "+.";
+      Kind nk = peek(1).kind;
+      // fold: subtractive folds `- INT` and `{- -.} FLOAT`; additive folds
+      // `+ INT` and `{+ +.} FLOAT`.  `-.`/`+.` of an INT does NOT fold.
+      bool fold = (nk == Kind::INT && !dot) || nk == Kind::FLOAT;
+      if (fold) {
         advance();
         Token lit = cur(); advance();
         Location cl = span(position(t.start), position(lit.end));
+        std::string txt = sub ? ("-" + lit.text) : lit.text;
         Constant c = (lit.kind == Kind::INT)
-                         ? Constant{Pconst_integer{"-" + lit.text, lit.modifier}, cl}
-                         : Constant{Pconst_float{"-" + lit.text, lit.modifier}, cl};
+                         ? Constant{Pconst_integer{txt, lit.modifier}, cl}
+                         : Constant{Pconst_float{txt, lit.modifier}, cl};
         return E({Pexp_constant{std::move(c)}, cl});
       }
-      // otherwise `- e` applies ~- / ~-. to an application
       advance();
       ExprBox arg = parse_app();
       Position ae = arg->loc.end;
-      ExprBox fn = ident_expr(t.kind == Kind::MINUS ? "~-" : "~-.", tokloc(t));
+      ExprBox fn = ident_expr(std::string("~") + name, tokloc(t));
       std::vector<std::pair<ArgLabel, ExprBox>> args;
       args.emplace_back(Nolabel{}, std::move(arg));
       return E({Pexp_apply{std::move(fn), std::move(args)}, span(position(t.start), ae)});
@@ -768,6 +787,7 @@ class Parser {
       case Kind::LET: case Kind::IF: case Kind::MATCH: case Kind::FUNCTION:
       case Kind::TRY: case Kind::FUN: case Kind::WHILE: case Kind::FOR:
       case Kind::ASSERT: case Kind::LAZY: case Kind::MINUS: case Kind::MINUSDOT:
+      case Kind::PLUS: case Kind::PLUSDOT:
         return true;
       default: return false;
     }
