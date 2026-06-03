@@ -643,6 +643,8 @@ struct Printer {
     int j = i + 1;
     if (auto* v = std::get_if<Pmty_ident>(&m.desc)) {
       line(j, "Pmty_ident " + lid_loc(v->id));
+    } else if (auto* v = std::get_if<Pmty_alias>(&m.desc)) {
+      line(j, "Pmty_alias " + lid_loc(v->id));
     } else if (auto* v = std::get_if<Pmty_signature>(&m.desc)) {
       line(j, "Pmty_signature");
       if (v->items.empty()) line(j, "[]");

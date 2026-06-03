@@ -317,8 +317,10 @@ struct Pwith_modsubst { LongidentLoc lid1; LongidentLoc lid2; };
 using WithConstraint = std::variant<Pwith_type, Pwith_typesubst, Pwith_module, Pwith_modsubst>;
 struct Pmty_with { ModuleTypeBox mt; std::vector<WithConstraint> constraints; };
 struct Pmty_typeof { ModuleExprBox me; };
+struct Pmty_alias { LongidentLoc id; };  // module B = A  (in a signature)
 struct ModuleType {
-  std::variant<Pmty_ident, Pmty_signature, Pmty_functor, Pmty_with, Pmty_typeof> desc;
+  std::variant<Pmty_ident, Pmty_signature, Pmty_functor, Pmty_with, Pmty_typeof,
+               Pmty_alias> desc;
   Location loc;
   Attributes attrs;
 };

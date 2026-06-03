@@ -2551,6 +2551,12 @@ class Parser {
     if (t.kind == Kind::MODULE) {
       advance();
       StrOptLoc name = parse_module_name();
+      if (cur().kind == Kind::EQUAL) {  // module B = A.C  (module alias)
+        advance();
+        LongidentLoc id = parse_longident_path();
+        ModuleType mt{Pmty_alias{id}, id.loc, {}};
+        return SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt))}}, here()};
+      }
       // module M (X:S) … : mty   (functor module declaration)
       std::vector<std::pair<Position, FunctorParam>> fparams;
       while (cur().kind == Kind::LPAREN) {
