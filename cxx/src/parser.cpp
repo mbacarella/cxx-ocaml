@@ -1647,6 +1647,19 @@ class Parser {
     }
     if (cur().kind == Kind::UIDENT) {
       LongidentLoc cl = parse_longident_path();
+      if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P) local open
+        advance(); advance();  // . (
+        Pattern inner = parse_pattern();
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
+      }
+      if (cur().kind == Kind::DOT &&
+          (peek(1).kind == Kind::LBRACKET || peek(1).kind == Kind::LBRACE)) {  // M.[…] / M.{…}
+        advance();
+        Pattern inner = parse_simple_pattern();
+        Position end = inner.loc.end;
+        return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, end)};
+      }
       std::vector<StringLoc> vars;  // `Constr (type a b) pat` — existential univars
       if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
         advance(); advance();  // ( type
