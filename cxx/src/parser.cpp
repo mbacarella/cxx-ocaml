@@ -861,9 +861,9 @@ class Parser {
 
   // One (possibly labeled) tuple element: `~x:e`, `~x` (punning), or `e`.
   std::pair<std::optional<std::string>, ExprBox> parse_labeled_tuple_elem() {
-    if (cur().kind == Kind::LABEL) {  // ~x:  -> label, value
+    if (cur().kind == Kind::LABEL) {  // ~x:v  -> label, value (value is simple_expr)
       Token lt = cur(); advance();
-      return {lt.text, parse_binop(0)};
+      return {lt.text, parse_atom_postfix()};
     }
     if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x  (punning)
       advance();
@@ -906,9 +906,23 @@ class Parser {
     // of the base-case reduction (i.e. the second element's end).
     if (firstPunned && elems.size() >= 2) elems[0]->loc.end = elems[1]->loc.end;
     Location l = span(s, elems.back()->loc.end);
-    bool any = false; for (auto& x : labels) if (x) any = true;
-    if (!any) labels.clear();  // ordinary tuple: keep labels empty (printer emits None)
-    return E({Pexp_tuple{std::move(elems), std::move(labels)}, l});
+    bool labeled = false; for (auto& x : labels) if (x) labeled = true;
+    if (!labeled) labels.clear();  // ordinary tuple: keep labels empty (printer emits None)
+    ExprBox tup = E({Pexp_tuple{std::move(elems), std::move(labels)}, l});
+    // A labeled tuple's element values are simple_expr, so a trailing `::` conses
+    // the *whole* tuple as the head (`(~a:x, ~b:y) :: l`).
+    if (labeled && cur().kind == Kind::COLONCOLON) {
+      Token optok = cur(); advance();
+      ExprBox right = parse_binop(6);
+      Position ls = tup->loc.start, re = right->loc.end;
+      Location gl = gloc(ls, re);
+      std::vector<ExprBox> ct;
+      ct.push_back(std::move(tup));
+      ct.push_back(std::move(right));
+      ExprBox consarg = E({Pexp_tuple{std::move(ct)}, gl});
+      return mk_construct(lid0("::", tokloc(optok)), std::move(consarg), Location{ls, re, false});
+    }
+    return tup;
   }
 
   static bool expr_starts(Kind k) {
