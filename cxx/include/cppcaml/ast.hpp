@@ -92,9 +92,13 @@ struct Otag { StringLoc name; CoreTypeBox type; };
 struct Oinherit { CoreTypeBox type; };
 using ObjectField = std::variant<Otag, Oinherit>;
 struct Ptyp_object { std::vector<ObjectField> fields; ClosedFlag closed = ClosedFlag::Closed; };  // < m:t; .. >
+struct Ptyp_package {  // (module S [with type t = u and …])
+  LongidentLoc path;
+  std::vector<std::pair<LongidentLoc, CoreTypeBox>> constraints;
+};
 struct CoreType {
   std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr,
-               Ptyp_variant, Ptyp_object>
+               Ptyp_variant, Ptyp_object, Ptyp_package>
       desc;
   Location loc;
   Attributes attrs;
@@ -206,11 +210,14 @@ struct Expression {
 
 struct Case { Pattern lhs; std::optional<ExprBox> guard; ExprBox rhs; };
 
+struct Pvc_constraint { std::vector<StringLoc> univars; CoreTypeBox typ; };  // `: [type a b.] t`
+struct Pvc_coercion { std::optional<CoreTypeBox> ground; CoreTypeBox coercion; };  // `: t :> t2`
+using ValueConstraint = std::variant<Pvc_constraint, Pvc_coercion>;
 struct ValueBinding {
   Pattern pat;
   ExprBox expr;
-  std::optional<CoreTypeBox> constraint_;  // Pvc_constraint (simple `: t`)
-  Attributes attrs;                        // pvb_attributes
+  std::optional<ValueConstraint> constraint_;  // pvb_constraint
+  Attributes attrs;                            // pvb_attributes
 };
 
 struct Pparam_val { Location loc; ArgLabel label; std::optional<ExprBox> default_; Pattern pat; };

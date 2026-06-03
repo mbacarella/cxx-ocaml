@@ -124,6 +124,15 @@ struct Printer {
         if (v->labels->empty()) line(j + 1, "[]");
         else { line(j + 1, "["); for (auto& s : *v->labels) line(j + 2, '"' + s + '"'); line(j + 1, "]"); }
       } else line(j, "None");
+    } else if (auto* v = std::get_if<Ptyp_package>(&t.desc)) {
+      line(j, "Ptyp_package");
+      line(j + 1, "package_type " + lid_loc(v->path));
+      if (v->constraints.empty()) line(j + 1, "[]");
+      else {
+        line(j + 1, "[");
+        for (auto& [path, ct] : v->constraints) { line(j + 2, "with type " + lid_loc(path)); core_type(j + 2, *ct); }
+        line(j + 1, "]");
+      }
     } else if (auto* v = std::get_if<Ptyp_object>(&t.desc)) {
       line(j, std::string("Ptyp_object ") + closed_flag(v->closed));
       for (auto& f : v->fields) {
@@ -776,6 +785,21 @@ struct Printer {
     else { line(i + 2, "["); for (auto& s : p.prims) line(i + 3, '"' + s + '"'); line(i + 2, "]"); }
   }
 
+  void value_constraint(int i, const ValueConstraint& vc) {
+    if (auto* c = std::get_if<Pvc_constraint>(&vc)) {
+      if (!c->univars.empty()) {  // `<type> "a" (loc) "b" (loc).`
+        std::string s = "<type>";
+        for (auto& u : c->univars) s += " " + str_loc(u);
+        line(i, s + ".");
+      }
+      core_type(i, *c->typ);
+    } else {
+      auto& co = std::get<Pvc_coercion>(vc);
+      line(i, "<coercion>");
+      if (co.ground) { line(i, "Some"); core_type(i + 1, **co.ground); } else line(i, "None");
+      core_type(i, *co.coercion);
+    }
+  }
   void value_bindings(int i, const std::vector<ValueBinding>& l) {
     if (l.empty()) { line(i, "[]"); return; }
     line(i, "[");
@@ -784,7 +808,7 @@ struct Printer {
       line(i + 1, "<def>");
       attributes(i + 2, vb.attrs);
       pattern(i + 2, vb.pat);
-      if (vb.constraint_) core_type(i + 2, **vb.constraint_);  // Pvc_constraint (bare core_type)
+      if (vb.constraint_) value_constraint(i + 2, *vb.constraint_);
       expression(i + 2, *vb.expr);
     }
     line(i, "]");

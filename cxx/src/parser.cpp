@@ -860,6 +860,25 @@ class Parser {
       LongidentLoc name = parse_longident_path();
       return box(CoreType{.desc = Ptyp_constr{.id = name, .args = {}}, .loc = name.loc});
     }
+    if (t.kind == Kind::LPAREN && peek(1).kind == Kind::MODULE) {  // (module S [with type …])
+      advance(); advance();  // ( module
+      LongidentLoc path = parse_longident_path();
+      std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
+      if (cur().kind == Kind::WITH) {
+        advance();
+        for (;;) {
+          expect(Kind::TYPE, "type");
+          LongidentLoc lp = parse_longident_path();
+          expect(Kind::EQUAL, "=");
+          cons.emplace_back(lp, parse_core_type());
+          if (cur().kind == Kind::AND) { advance(); continue; }
+          break;
+        }
+      }
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      return box(CoreType{Ptyp_package{std::move(path), std::move(cons)},
+                          span(position(t.start), position(c.end))});
+    }
     if (t.kind == Kind::LPAREN) {
       advance();
       CoreTypeBox inner = parse_core_type();
@@ -1472,26 +1491,38 @@ class Parser {
     std::vector<FunctionParam> params;
     while (cur().kind != Kind::EQUAL && cur().kind != Kind::COLON)
       params.push_back(parse_param());
-    std::optional<CoreTypeBox> constr;          // `let x : t = e`  (params empty)
+    std::optional<ValueConstraint> vconstr;     // `let x : t = e`  (params empty)
     std::optional<FunctionConstraint> fconstr;  // `let f p.. : t = e`  (return constraint)
     if (cur().kind == Kind::COLON) {
       advance();
-      CoreTypeBox ty = parse_core_type();
-      if (cur().kind == Kind::COLONGREATER) {  // : t :> t2
+      if (cur().kind == Kind::TYPE) {  // : type a b. t  (locally abstract univars)
         advance();
-        CoreTypeBox ty2 = parse_core_type();
-        fconstr = Pcoerce{std::move(ty), std::move(ty2)};
-      } else if (params.empty()) {
-        constr = std::move(ty);
+        std::vector<StringLoc> univars;
+        while (cur().kind == Kind::LIDENT) {
+          Token id = cur(); advance();
+          univars.push_back(StringLoc{id.text, tokloc(id)});
+        }
+        expect(Kind::DOT, ".");
+        vconstr = Pvc_constraint{std::move(univars), parse_core_type()};
       } else {
-        fconstr = Pconstraint{std::move(ty)};
+        CoreTypeBox ty = parse_core_type();
+        if (cur().kind == Kind::COLONGREATER) {  // : t :> t2
+          advance();
+          CoreTypeBox ty2 = parse_core_type();
+          if (params.empty()) vconstr = Pvc_coercion{std::move(ty), std::move(ty2)};
+          else fconstr = Pcoerce{std::move(ty), std::move(ty2)};
+        } else if (params.empty()) {
+          vconstr = Pvc_constraint{{}, std::move(ty)};
+        } else {
+          fconstr = Pconstraint{std::move(ty)};
+        }
       }
     }
     expect(Kind::EQUAL, "=");
     ExprBox body = parse_expr();
 
     if (params.empty() && !fconstr)
-      return ValueBinding{std::move(namepat), std::move(body), std::move(constr)};
+      return ValueBinding{std::move(namepat), std::move(body), std::move(vconstr)};
     // desugar `let f p.. [: t] = e` to a ghost Pexp_function spanning p[0]..e
     auto param_loc = [](const FunctionParam& p) {
       if (auto* v = std::get_if<Pparam_val>(&p.desc)) return v->loc;
