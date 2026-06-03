@@ -2428,6 +2428,11 @@ class Parser {
       LongidentLoc id = parse_longident_path();
       return ModuleType{Pmty_ident{id}, id.loc, {}};
     }
+    if (t.kind == Kind::LIDENT) {  // lowercase module-type name (module type t = …; M : t)
+      advance();
+      LongidentLoc id{{Lident{t.text}}, tokloc(t)};
+      return ModuleType{Pmty_ident{std::move(id)}, tokloc(t), {}};
+    }
     throw ParseError("unsupported module type", t.start);
   }
 
