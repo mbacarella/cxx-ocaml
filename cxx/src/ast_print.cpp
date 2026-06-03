@@ -102,6 +102,10 @@ struct Printer {
       line(j, "Ptyp_constr " + lid_loc(v->id));
       if (v->args.empty()) line(j, "[]");
       else { line(j, "["); for (auto& a : v->args) core_type(j + 1, *a); line(j, "]"); }
+    } else if (auto* v = std::get_if<Ptyp_class>(&t.desc)) {
+      line(j, "Ptyp_class " + lid_loc(v->id));
+      if (v->args.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& a : v->args) core_type(j + 1, *a); line(j, "]"); }
     } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
       line(j, std::string("Ptyp_variant closed=") + closed_flag(v->closed));
       if (v->rows.empty()) line(j, "[]");

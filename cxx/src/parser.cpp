@@ -1088,7 +1088,17 @@ class Parser {
   CoreTypeBox parse_type_app() {
     Position symstart = position(cur().start);
     CoreTypeBox t = parse_type_atom();
-    while (cur().kind == Kind::LIDENT || cur().kind == Kind::UIDENT) {
+    while (cur().kind == Kind::LIDENT || cur().kind == Kind::UIDENT ||
+           cur().kind == Kind::HASH) {
+      if (cur().kind == Kind::HASH) {  // [arg] #class
+        advance();
+        LongidentLoc name = parse_longident_path();
+        std::vector<CoreTypeBox> args;
+        args.push_back(std::move(t));
+        t = box(CoreType{.desc = Ptyp_class{.id = name, .args = std::move(args)},
+                         .loc = span(symstart, name.loc.end)});
+        continue;
+      }
       LongidentLoc name = parse_longident_path();
       std::vector<CoreTypeBox> args;
       args.push_back(std::move(t));
@@ -1114,6 +1124,11 @@ class Parser {
     if (t.kind == Kind::LIDENT || t.kind == Kind::UIDENT) {
       LongidentLoc name = parse_longident_path();
       return box(CoreType{.desc = Ptyp_constr{.id = name, .args = {}}, .loc = name.loc});
+    }
+    if (t.kind == Kind::HASH) {  // #class  (no type args)
+      advance();
+      LongidentLoc name = parse_longident_path();
+      return box(CoreType{Ptyp_class{name, {}}, span(position(t.start), name.loc.end)});
     }
     if (t.kind == Kind::LPAREN && peek(1).kind == Kind::MODULE) {  // (module S [with type …])
       advance(); advance();  // ( module
@@ -1142,7 +1157,12 @@ class Parser {
         args.push_back(std::move(inner));
         while (cur().kind == Kind::COMMA) { advance(); args.push_back(parse_core_type()); }
         expect(Kind::RPAREN, ")");
+        bool cls = cur().kind == Kind::HASH;  // (a,b) #class
+        if (cls) advance();
         LongidentLoc name = parse_longident_path();
+        if (cls)
+          return box(CoreType{Ptyp_class{name, std::move(args)},
+                              span(position(t.start), name.loc.end)});
         return box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
                             .loc = span(position(t.start), name.loc.end)});
       }
