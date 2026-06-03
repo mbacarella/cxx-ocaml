@@ -190,6 +190,7 @@ struct Pexp_object { Box<ClassStructure> cs; };   // object … end
 struct Pexp_new { LongidentLoc id; };             // new M.c
 struct Pexp_override { std::vector<std::pair<StringLoc, ExprBox>> fields; };  // {< x = e >}
 struct Pexp_poly { ExprBox e; std::optional<CoreTypeBox> t; };  // method bodies
+struct Pexp_unreachable {};  // refutation case  -> .
 struct Pexp_while { ExprBox cond; ExprBox body; };
 struct Pexp_for { Pattern var; ExprBox lo; ExprBox hi; DirectionFlag dir; ExprBox body; };
 struct Pexp_array { std::vector<ExprBox> elems; };
@@ -202,7 +203,7 @@ struct Expression {
                Pexp_variant, Pexp_newtype, Pexp_struct_item, Pexp_setfield,
                Pexp_setinstvar, Pexp_coerce, Pexp_send, Pexp_pack,
                Pexp_extension, Pexp_letop, Pexp_object, Pexp_new, Pexp_override,
-               Pexp_poly>
+               Pexp_poly, Pexp_unreachable>
       desc;
   Location loc;
   Attributes attrs;

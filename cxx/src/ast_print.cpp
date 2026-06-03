@@ -412,6 +412,8 @@ struct Printer {
       expression(j, *v->e);
       if (v->t) { line(j, "Some"); core_type(j + 1, **v->t); }
       else line(j, "None");
+    } else if (std::holds_alternative<Pexp_unreachable>(e.desc)) {
+      os << ind(j) << "Pexp_unreachable";  // printast: no trailing newline
     } else if (auto* v = std::get_if<Pexp_new>(&e.desc)) {
       line(j, "Pexp_new " + lid_loc(v->id));
     } else if (auto* v = std::get_if<Pexp_override>(&e.desc)) {

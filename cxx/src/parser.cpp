@@ -681,7 +681,13 @@ class Parser {
     std::optional<ExprBox> guard;
     if (cur().kind == Kind::WHEN) { advance(); guard = parse_expr(); }
     expect(Kind::MINUSGREATER, "->");
-    ExprBox rhs = parse_expr();
+    ExprBox rhs;
+    if (cur().kind == Kind::DOT) {  // refutation  -> .
+      Token d = cur(); advance();
+      rhs = E({Pexp_unreachable{}, tokloc(d)});
+    } else {
+      rhs = parse_expr();
+    }
     return Case{std::move(p), std::move(guard), std::move(rhs)};
   }
   std::vector<Case> parse_cases() {
@@ -885,6 +891,10 @@ class Parser {
       args.push_back(std::move(t));
       t = box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
                        .loc = span(symstart, name.loc.end)});
+    }
+    while (cur().kind == Kind::LBRACKETAT) {  // t [@attr]  -> ptyp_attributes
+      advance();
+      t->attrs.push_back(parse_attribute_body());
     }
     return t;
   }
