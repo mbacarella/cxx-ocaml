@@ -2180,6 +2180,14 @@ class Parser {
     Token c = cur(); advance();
     return StringLoc{*nm, span(position(lp.start), position(c.end))};
   }
+  // A value name: a plain `LIDENT`, or `( operator )`.
+  StringLoc parse_value_name() {
+    if (auto op = try_paren_operator()) return std::move(*op);
+    Token nm = cur();
+    if (nm.kind != Kind::LIDENT) throw ParseError("expected external name", nm.start);
+    advance();
+    return StringLoc{nm.text, tokloc(nm)};
+  }
   ValueBinding parse_value_binding_core() {
     // val_ident form (`let f p.. = e` / `let (+) p.. = e`) vs pattern form.
     std::optional<StringLoc> opname = try_paren_operator();  // consumes `( op )` on success
@@ -2402,11 +2410,9 @@ class Parser {
     }
     if (t.kind == Kind::EXTERNAL) {
       advance();
-      Token nm = cur();
-      if (nm.kind != Kind::LIDENT) throw ParseError("expected external name", nm.start);
-      advance();
+      StringLoc ename = parse_value_name();  // LIDENT or ( op )
       expect(Kind::COLON, ":");
-      CoreTypeBox ty = parse_core_type();
+      CoreTypeBox ty = parse_poly_type(/*ghost=*/false);  // external f : 'a. t = …
       expect(Kind::EQUAL, "=");
       std::vector<std::string> prims;
       while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
@@ -2415,7 +2421,7 @@ class Parser {
       while (cur().kind == Kind::LBRACKETATAT) { advance(); pattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(pattrs, l.start.cnum, l.end.cnum);
-      PrimitiveDescription pd{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l,
+      PrimitiveDescription pd{std::move(ename), std::move(ty), std::move(prims), l,
                               std::move(pattrs)};
       return StructureItem{Pstr_primitive{std::move(pd)}, l};
     }
@@ -2707,11 +2713,9 @@ class Parser {
     }
     if (t.kind == Kind::EXTERNAL) {
       advance();
-      Token nm = cur();
-      if (nm.kind != Kind::LIDENT) throw ParseError("expected external name", nm.start);
-      advance();
+      StringLoc ename = parse_value_name();  // LIDENT or ( op )
       expect(Kind::COLON, ":");
-      CoreTypeBox ty = parse_core_type();
+      CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
       expect(Kind::EQUAL, "=");
       std::vector<std::string> prims;
       while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
@@ -2721,7 +2725,7 @@ class Parser {
       Location l = here();
       attach_docs(attrs, l.start.cnum, l.end.cnum);
       return SignatureItem{Psig_primitive{PrimitiveDescription{
-          StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l, std::move(attrs)}}, l};
+          std::move(ename), std::move(ty), std::move(prims), l, std::move(attrs)}}, l};
     }
     if (t.kind == Kind::TYPE) {
       advance();
