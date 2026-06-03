@@ -750,34 +750,38 @@ class Parser {
 
   // ---- core types ----
   CoreTypeBox parse_core_type() { return parse_type_arrow(); }
+  // Compound type nodes take their location from the *symbol* span (which
+  // includes a parenthesized child's parens), not the child node's own loc.
   CoreTypeBox parse_type_arrow() {
+    Position symstart = position(cur().start);
     CoreTypeBox t = parse_type_tuple();
     if (cur().kind == Kind::MINUSGREATER) {
       advance();
       CoreTypeBox cod = parse_type_arrow();
-      Location l = span(t->loc.start, cod->loc.end);
+      Location l = span(symstart, position(tokens_[idx_ - 1].end));
       return box(CoreType{Ptyp_arrow{Nolabel{}, std::move(t), std::move(cod)}, l});
     }
     return t;
   }
   CoreTypeBox parse_type_tuple() {
+    Position symstart = position(cur().start);
     CoreTypeBox t = parse_type_app();
     if (cur().kind != Kind::STAR) return t;
     std::vector<CoreTypeBox> elems;
-    Position s = t->loc.start;
     elems.push_back(std::move(t));
     while (cur().kind == Kind::STAR) { advance(); elems.push_back(parse_type_app()); }
-    Location l = span(s, elems.back()->loc.end);
+    Location l = span(symstart, position(tokens_[idx_ - 1].end));
     return box(CoreType{Ptyp_tuple{std::move(elems)}, l});
   }
   CoreTypeBox parse_type_app() {
+    Position symstart = position(cur().start);
     CoreTypeBox t = parse_type_atom();
     while (cur().kind == Kind::LIDENT || cur().kind == Kind::UIDENT) {
       LongidentLoc name = parse_longident_path();
       std::vector<CoreTypeBox> args;
-      Position s = t->loc.start;
       args.push_back(std::move(t));
-      t = box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)}, .loc = span(s, name.loc.end)});
+      t = box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
+                       .loc = span(symstart, name.loc.end)});
     }
     return t;
   }
