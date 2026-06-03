@@ -984,8 +984,8 @@ class Parser {
     switch (t.kind) {
       case Kind::LET: {
         if (peek(1).kind == Kind::OPEN || peek(1).kind == Kind::MODULE ||
-            peek(1).kind == Kind::EXCEPTION) {
-          // let open M / let module M = me / let exception E, all `in e` -> Pexp_struct_item
+            peek(1).kind == Kind::EXCEPTION || peek(1).kind == Kind::TYPE) {
+          // let {open M|module M=…|exception E|type u=…} in e -> Pexp_struct_item
           advance();  // let
           StructureItem si = parse_structure_item();
           expect(Kind::IN, "in");
