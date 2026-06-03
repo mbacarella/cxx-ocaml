@@ -1788,7 +1788,65 @@ class Parser {
     return Functor_named{std::move(name), box(std::move(mt))};
   }
 
+  Location none_loc() const { return Location{Position{0, 0, -1}, Position{0, 0, -1}, true}; }
+
   ModuleType parse_module_type() {
+    ModuleType mt = parse_module_type_with();
+    if (cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
+      advance();
+      Position s = mt.loc.start;
+      ModuleType cod = parse_module_type();
+      FunctorParam param = Functor_named{StrOptLoc{std::nullopt, none_loc()}, box(std::move(mt))};
+      Location l = span(s, cod.loc.end);
+      return ModuleType{Pmty_functor{std::move(param), box(std::move(cod))}, l, {}};
+    }
+    return mt;
+  }
+  ModuleType parse_module_type_with() {
+    ModuleType mt = parse_module_type_base();
+    while (cur().kind == Kind::WITH) {
+      advance();
+      std::vector<WithConstraint> cs;
+      cs.push_back(parse_with_constraint());
+      while (cur().kind == Kind::AND) { advance(); cs.push_back(parse_with_constraint()); }
+      Position s = mt.loc.start;
+      Location l = span(s, position(tokens_[idx_ - 1].end));
+      mt = ModuleType{Pmty_with{box(std::move(mt)), std::move(cs)}, l, {}};
+    }
+    return mt;
+  }
+  WithConstraint parse_with_constraint() {
+    Token t = cur();
+    if (t.kind == Kind::TYPE) {
+      Position kw = position(t.start);
+      advance();
+      std::vector<CoreTypeBox> params = parse_type_params();
+      LongidentLoc lid = parse_longident_path();
+      bool subst = cur().kind == Kind::COLONEQUAL;
+      if (subst) advance(); else expect(Kind::EQUAL, "=");
+      PrivateFlag priv = PrivateFlag::Public;
+      if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
+      CoreTypeBox manifest = parse_core_type();
+      std::string lastnm = lid_last_name(lid.txt);
+      Location nameloc = span(position(lid.loc.end.cnum - static_cast<int>(lastnm.size())), lid.loc.end);
+      Location dl = span(kw, position(tokens_[idx_ - 1].end));
+      auto td = box(TypeDeclaration{StringLoc{lastnm, nameloc}, std::move(params), TypeKind{Ptype_abstract{}},
+                                    priv, std::move(manifest), dl, {}, {}});
+      if (subst) return Pwith_typesubst{std::move(lid), std::move(td)};
+      return Pwith_type{std::move(lid), std::move(td)};
+    }
+    if (t.kind == Kind::MODULE) {
+      advance();
+      LongidentLoc lid1 = parse_longident_path();
+      bool subst = cur().kind == Kind::COLONEQUAL;
+      if (subst) advance(); else expect(Kind::EQUAL, "=");
+      LongidentLoc lid2 = parse_longident_path();
+      if (subst) return Pwith_modsubst{std::move(lid1), std::move(lid2)};
+      return Pwith_module{std::move(lid1), std::move(lid2)};
+    }
+    throw ParseError("unsupported with constraint", t.start);
+  }
+  ModuleType parse_module_type_base() {
     Token t = cur();
     if (t.kind == Kind::SIG) {
       advance();
@@ -1798,12 +1856,23 @@ class Parser {
     }
     if (t.kind == Kind::FUNCTOR) {
       advance();
-      Position ps = position(cur().start);
       FunctorParam param = parse_functor_param();
       expect(Kind::MINUSGREATER, "->");
       ModuleType body = parse_module_type();
       return ModuleType{Pmty_functor{std::move(param), box(std::move(body))},
                         span(position(t.start), body.loc.end), {}};
+    }
+    if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE && peek(2).kind == Kind::OF) {
+      advance(); advance(); advance();  // module type of
+      ModuleExpr me = parse_module_expr();
+      return ModuleType{Pmty_typeof{box(std::move(me))}, span(position(t.start), me.loc.end), {}};
+    }
+    if (t.kind == Kind::LPAREN) {  // ( module_type )
+      advance();
+      ModuleType mt = parse_module_type();
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      mt.loc = span(position(t.start), position(c.end));  // reloc to parens
+      return mt;
     }
     if (t.kind == Kind::UIDENT) {
       LongidentLoc id = parse_longident_path();

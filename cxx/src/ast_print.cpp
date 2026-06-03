@@ -41,7 +41,7 @@ struct Printer {
   std::string ind(int i) const { return std::string((2 * i) % 72, ' '); }
 
   std::string pos(const Position& p, bool with_name) const {
-    std::string s = with_name ? fname : "";
+    std::string s = with_name ? (p.cnum == -1 ? "_none_" : fname) : "";  // Location.none
     s += '[' + std::to_string(p.lnum) + ',' + std::to_string(p.bol) + '+' +
          std::to_string(p.cnum - p.bol) + ']';
     return s;
@@ -591,15 +591,37 @@ struct Printer {
       line(j, "Pmty_signature");
       if (v->items.empty()) line(j, "[]");
       else { line(j, "["); for (auto& si : v->items) signature_item(j + 1, si); line(j, "]"); }
-    } else {
-      auto& f = std::get<Pmty_functor>(m.desc);
-      if (auto* named = std::get_if<Functor_named>(&f.param)) {
+    } else if (auto* f = std::get_if<Pmty_functor>(&m.desc)) {
+      if (auto* named = std::get_if<Functor_named>(&f->param)) {
         line(j, "Pmty_functor " + str_opt_loc(named->name));
         module_type(j, *named->type);
       } else {
         line(j, "Pmty_functor ()");
       }
-      module_type(j, *f.body);
+      module_type(j, *f->body);
+    } else if (auto* w = std::get_if<Pmty_with>(&m.desc)) {
+      line(j, "Pmty_with");
+      module_type(j, *w->mt);
+      if (w->constraints.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& c : w->constraints) with_constraint(j + 1, c); line(j, "]"); }
+    } else {
+      auto& to = std::get<Pmty_typeof>(m.desc);
+      line(j, "Pmty_typeof");
+      module_expr(j, *to.me);
+    }
+  }
+  void with_constraint(int i, const WithConstraint& w) {
+    if (auto* p = std::get_if<Pwith_type>(&w)) {
+      line(i, "Pwith_type " + lid_loc(p->lid));
+      type_declaration(i + 1, *p->td);
+    } else if (auto* p = std::get_if<Pwith_typesubst>(&w)) {
+      line(i, "Pwith_typesubst " + lid_loc(p->lid));
+      type_declaration(i + 1, *p->td);
+    } else if (auto* p = std::get_if<Pwith_module>(&w)) {
+      line(i, "Pwith_module " + lid_loc(p->lid1) + " = " + lid_loc(p->lid2));
+    } else {
+      auto& pm = std::get<Pwith_modsubst>(w);
+      line(i, "Pwith_modsubst " + lid_loc(pm.lid1) + " = " + lid_loc(pm.lid2));
     }
   }
   void module_expr(int i, const ModuleExpr& m) {
