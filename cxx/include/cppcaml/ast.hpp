@@ -248,14 +248,16 @@ struct Ptype_variant { std::vector<ConstructorDecl> ctors; };
 struct Ptype_record { std::vector<LabelDecl> fields; };
 struct Ptype_open {};
 using TypeKind = std::variant<Ptype_abstract, Ptype_variant, Ptype_record, Ptype_open>;
+struct TypeConstraint { CoreTypeBox t1; CoreTypeBox t2; Location loc; };  // constraint t1 = t2
 struct TypeDeclaration {
   StringLoc name;
   std::vector<CoreTypeBox> params;  // type_parameter (variance dropped)
   TypeKind kind;
   PrivateFlag priv = PrivateFlag::Public;
   std::optional<CoreTypeBox> manifest;
-  Location loc;  // ptype_constraints [] in fragment
+  Location loc;
   Attributes attrs;  // post-item attributes (`[@@unboxed]` …)
+  std::vector<TypeConstraint> constraints;  // ptype_constraints
 };
 
 // --- extension constructors / exceptions ---
@@ -284,7 +286,8 @@ struct PrimitiveDescription {
 };
 
 // --- module types / signatures ---
-struct ValueDescription { StringLoc name; CoreTypeBox type; Location loc; };
+struct ValueDescription { StringLoc name; CoreTypeBox type; Location loc; Attributes attrs; };
+struct ClassTypeDeclaration;  // defined in the class section below
 struct SignatureItem;
 using Signature = std::vector<SignatureItem>;
 struct ModuleType;
@@ -301,11 +304,23 @@ struct ModuleType {
   Attributes attrs;
 };
 struct Psig_value { ValueDescription vd; };
+struct Psig_primitive { PrimitiveDescription pd; };  // external in a signature
 struct Psig_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
+struct Psig_typext { TypeExtension ext; };
+struct Psig_exception { TypeException exn; };
 struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; };
 struct Psig_module { ModuleDeclaration md; };
+struct Psig_modtype { StringLoc name; std::optional<ModuleType> type; };  // module type S [= mty]
+struct Psig_open { OverrideFlag ovr; LongidentLoc id; };
+struct Psig_include { ModuleType mt; };
+struct Psig_class_type { std::vector<ClassTypeDeclaration> decls; };
+struct Psig_attribute { std::string name; Structure payload; };
+struct Psig_extension { std::string name; Structure payload; };
 struct SignatureItem {
-  std::variant<Psig_value, Psig_type, Psig_module> desc;
+  std::variant<Psig_value, Psig_primitive, Psig_type, Psig_typext, Psig_exception,
+               Psig_module, Psig_modtype, Psig_open, Psig_include, Psig_class_type,
+               Psig_attribute, Psig_extension>
+      desc;
   Location loc;
 };
 

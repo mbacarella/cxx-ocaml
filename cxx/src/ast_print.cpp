@@ -512,7 +512,16 @@ struct Printer {
     if (d.params.empty()) line(j + 1, "[]");
     else { line(j + 1, "["); for (auto& p : d.params) core_type(j + 2, *p); line(j + 1, "]"); }
     line(j, "ptype_constraints =");
-    line(j + 1, "[]");
+    if (d.constraints.empty()) line(j + 1, "[]");
+    else {
+      line(j + 1, "[");
+      for (auto& c : d.constraints) {
+        line(j + 2, "<constraint> " + loc(c.loc));
+        core_type(j + 3, *c.t1);
+        core_type(j + 3, *c.t2);
+      }
+      line(j + 1, "]");
+    }
     line(j, "ptype_kind =");
     type_kind(j + 1, d.kind);
     line(j, std::string("ptype_private = ") + private_flag(d.priv));
@@ -525,6 +534,7 @@ struct Printer {
   }
   void value_description(int i, const ValueDescription& v) {
     line(i, "value_description " + str_loc(v.name) + " " + loc(v.loc));
+    attributes(i, v.attrs);
     core_type(i + 1, *v.type);
   }
   void signature_item(int i, const SignatureItem& s) {
@@ -533,14 +543,42 @@ struct Printer {
     if (auto* v = std::get_if<Psig_value>(&s.desc)) {
       line(j, "Psig_value");
       value_description(j, v->vd);
+    } else if (auto* v = std::get_if<Psig_primitive>(&s.desc)) {
+      line(j, "Psig_primitive");
+      primitive_description(j, v->pd);
     } else if (auto* v = std::get_if<Psig_type>(&s.desc)) {
       line(j, std::string("Psig_type ") + rec_flag(v->rf));
       if (v->decls.empty()) line(j, "[]");
       else { line(j, "["); for (auto& d : v->decls) type_declaration(j + 1, d); line(j, "]"); }
+    } else if (auto* v = std::get_if<Psig_typext>(&s.desc)) {
+      line(j, "Psig_typext");
+      type_extension(j, v->ext);
+    } else if (auto* v = std::get_if<Psig_exception>(&s.desc)) {
+      line(j, "Psig_exception");
+      type_exception(j, v->exn);
+    } else if (auto* v = std::get_if<Psig_module>(&s.desc)) {
+      line(j, "Psig_module " + str_opt_loc(v->md.name));
+      module_type(j, *v->md.type);
+    } else if (auto* v = std::get_if<Psig_modtype>(&s.desc)) {
+      line(j, "Psig_modtype " + str_loc(v->name));
+      if (v->type) module_type(j + 1, *v->type);
+      else os << ind(j) << "#abstract";  // printast: no trailing newline
+    } else if (auto* v = std::get_if<Psig_open>(&s.desc)) {
+      line(j, "Psig_open " + std::string(override_flag(v->ovr)) + " " + lid_loc(v->id));
+    } else if (auto* v = std::get_if<Psig_include>(&s.desc)) {
+      line(j, "Psig_include");
+      module_type(j, v->mt);
+    } else if (auto* v = std::get_if<Psig_class_type>(&s.desc)) {
+      line(j, "Psig_class_type");
+      if (v->decls.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& d : v->decls) class_type_declaration(j + 1, d); line(j, "]"); }
+    } else if (auto* v = std::get_if<Psig_attribute>(&s.desc)) {
+      line(j, "Psig_attribute \"" + v->name + "\"");
+      structure_list(j, v->payload);
     } else {
-      auto& pm = std::get<Psig_module>(s.desc);
-      line(j, "Psig_module " + str_opt_loc(pm.md.name));
-      module_type(j, *pm.md.type);
+      auto& ve = std::get<Psig_extension>(s.desc);
+      line(j, "Psig_extension \"" + ve.name + "\"");
+      structure_list(j, ve.payload);
     }
   }
   void module_type(int i, const ModuleType& m) {
@@ -854,7 +892,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_modtype>(&s.desc)) {
       line(j, "Pstr_modtype " + str_loc(v->name));
       if (v->type) module_type(j + 1, *v->type);  // modtype_declaration: Some -> module_type(i+1)
-      else line(j, "#abstract");
+      else os << ind(j) << "#abstract";  // printast: no trailing newline
     } else if (auto* v = std::get_if<Pstr_class>(&s.desc)) {
       line(j, "Pstr_class");
       if (v->decls.empty()) line(j, "[]");

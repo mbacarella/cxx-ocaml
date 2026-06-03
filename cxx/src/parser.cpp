@@ -1364,11 +1364,21 @@ class Parser {
         }
       }
     }
+    std::vector<TypeConstraint> constraints;  // constraint t1 = t2 …
+    while (cur().kind == Kind::CONSTRAINT) {
+      advance();
+      CoreTypeBox t1 = parse_core_type();
+      expect(Kind::EQUAL, "=");
+      CoreTypeBox t2 = parse_core_type();
+      Location cl = span(t1->loc.start, position(tokens_[idx_ - 1].end));  // `t1 = t2` span
+      constraints.push_back(TypeConstraint{std::move(t1), std::move(t2), cl});
+    }
     Attributes attrs;
     while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
     Location l = span(declStart, position(tokens_[idx_ - 1].end));
     return TypeDeclaration{StringLoc{nm.text, tokloc(nm)}, std::move(params),
-                           std::move(kind), priv, std::move(manifest), l, std::move(attrs)};
+                           std::move(kind), priv, std::move(manifest), l, std::move(attrs),
+                           std::move(constraints)};
   }
 
   // ---- bindings ----
@@ -1804,36 +1814,146 @@ class Parser {
   }
   SignatureItem parse_signature_item() {
     Token t = cur();
+    auto here = [&] { return span(position(t.start), position(tokens_[idx_ - 1].end)); };
     if (t.kind == Kind::VAL) {
       advance();
       Token nm = cur();
-      if (nm.kind != Kind::LIDENT) throw ParseError("expected value name", nm.start);
+      if (nm.kind != Kind::LIDENT && nm.kind != Kind::LPAREN)
+        throw ParseError("expected value name", nm.start);
+      StringLoc vname;
+      if (nm.kind == Kind::LPAREN && operator_name(peek(1)) && peek(2).kind == Kind::RPAREN) {
+        advance(); auto op = operator_name(cur()); advance(); Token c = cur(); advance();
+        vname = StringLoc{*op, span(position(nm.start), position(c.end))};
+      } else { advance(); vname = StringLoc{nm.text, tokloc(nm)}; }
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_core_type();
+      Attributes attrs;
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+      Location l = here();
+      return SignatureItem{Psig_value{ValueDescription{std::move(vname), std::move(ty), l, std::move(attrs)}}, l};
+    }
+    if (t.kind == Kind::EXTERNAL) {
+      advance();
+      Token nm = cur();
+      if (nm.kind != Kind::LIDENT) throw ParseError("expected external name", nm.start);
       advance();
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_core_type();
-      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      return SignatureItem{Psig_value{ValueDescription{StringLoc{nm.text, tokloc(nm)}, std::move(ty), l}}, l};
+      expect(Kind::EQUAL, "=");
+      std::vector<std::string> prims;
+      while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
+      if (prims.empty()) throw ParseError("expected primitive string", cur().start);
+      Attributes attrs;
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+      Location l = here();
+      return SignatureItem{Psig_primitive{PrimitiveDescription{
+          StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l, std::move(attrs)}}, l};
     }
     if (t.kind == Kind::TYPE) {
       advance();
       RecFlag rf = RecFlag::Recursive;
       if (cur().kind == Kind::NONREC) { advance(); rf = RecFlag::Nonrecursive; }
+      Position d0 = position(t.start);
+      size_t save = idx_;
+      std::vector<CoreTypeBox> params = parse_type_params();
+      if (cur().kind == Kind::LIDENT || cur().kind == Kind::UIDENT) {  // type [params] path += …
+        LongidentLoc path = parse_longident_path();
+        if (cur().kind == Kind::PLUSEQ) {
+          advance();
+          PrivateFlag priv = PrivateFlag::Public;
+          if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
+          std::vector<ExtensionConstructor> ctors;
+          Position cs = position(cur().start);
+          if (cur().kind == Kind::BAR) advance();
+          ctors.push_back(parse_ext_ctor(cs));
+          while (cur().kind == Kind::BAR) {
+            Position bs = position(cur().start); advance();
+            ctors.push_back(parse_ext_ctor(bs));
+          }
+          Location l = here();
+          return SignatureItem{Psig_typext{TypeExtension{std::move(path), std::move(params),
+                                                         std::move(ctors), priv}}, l};
+        }
+      }
+      idx_ = save;
       std::vector<TypeDeclaration> decls;
-      decls.push_back(parse_type_declaration(position(t.start)));
+      decls.push_back(parse_type_declaration(d0));
       while (cur().kind == Kind::AND) {
         Position ds = position(cur().start); advance();
         decls.push_back(parse_type_declaration(ds));
       }
-      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      return SignatureItem{Psig_type{rf, std::move(decls)}, l};
+      return SignatureItem{Psig_type{rf, std::move(decls)}, span(d0, position(tokens_[idx_ - 1].end))};
+    }
+    if (t.kind == Kind::EXCEPTION) {
+      advance();
+      ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
+      Location l = here();
+      return SignatureItem{Psig_exception{TypeException{std::move(ctor)}}, l};
+    }
+    if (t.kind == Kind::OPEN) {
+      advance();
+      OverrideFlag ovr = OverrideFlag::Fresh;
+      if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
+      LongidentLoc id = parse_longident_path();
+      return SignatureItem{Psig_open{ovr, std::move(id)}, here()};
+    }
+    if (t.kind == Kind::INCLUDE) {
+      advance();
+      ModuleType mt = parse_module_type();
+      return SignatureItem{Psig_include{std::move(mt)}, here()};
+    }
+    if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
+      advance(); advance();  // module type
+      Token nm = cur();
+      if (nm.kind != Kind::UIDENT) throw ParseError("expected module type name", nm.start);
+      advance();
+      std::optional<ModuleType> mty;
+      if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
+      return SignatureItem{Psig_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty)}, here()};
     }
     if (t.kind == Kind::MODULE) {
       advance();
       StrOptLoc name = parse_module_name();
+      // module M (X:S) … : mty   (functor module declaration)
+      std::vector<std::pair<Position, FunctorParam>> fparams;
+      while (cur().kind == Kind::LPAREN) {
+        Position ps = position(cur().start);
+        fparams.emplace_back(ps, parse_functor_param());
+      }
       expect(Kind::COLON, ":");
       ModuleType mt = parse_module_type();
-      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      return SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt))}}, l};
+      for (int i = static_cast<int>(fparams.size()) - 1; i >= 0; --i) {
+        Location fl = span(fparams[i].first, mt.loc.end);
+        mt = ModuleType{Pmty_functor{std::move(fparams[i].second), box(std::move(mt))}, fl, {}};
+      }
+      return SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt))}}, here()};
+    }
+    if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
+      Position kw = position(t.start);
+      advance(); advance();
+      std::vector<ClassTypeDeclaration> decls;
+      decls.push_back(parse_one_class_type_decl(kw));
+      while (cur().kind == Kind::AND) {
+        Position akw = position(cur().start); advance();
+        decls.push_back(parse_one_class_type_decl(akw));
+      }
+      return SignatureItem{Psig_class_type{std::move(decls)}, here()};
+    }
+    if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ …]
+      advance();
+      std::string name = parse_attr_name();
+      Structure payload = parse_structure_until(Kind::RBRACKET);
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return SignatureItem{Psig_attribute{std::move(name), std::move(payload)},
+                           span(position(t.start), position(c.end))};
+    }
+    if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% …]
+      advance();
+      std::string name = parse_attr_name();
+      Structure payload = parse_structure_until(Kind::RBRACKET);
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return SignatureItem{Psig_extension{std::move(name), std::move(payload)},
+                           span(position(t.start), position(c.end))};
     }
     throw ParseError("unsupported signature item", t.start);
   }
