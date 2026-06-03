@@ -3171,21 +3171,17 @@ class Parser {
           Position ps = position(cur().start);
           params.emplace_back(ps, parse_param());
         }
-        std::optional<CoreTypeBox> rett;
-        if (cur().kind == Kind::COLON) { advance(); rett = parse_core_type(); }
+        std::optional<FunctionConstraint> fconstr;  // method return-type constraint
+        if (cur().kind == Kind::COLON) { advance(); fconstr = Pconstraint{parse_core_type()}; }
         expect(Kind::EQUAL, "=");
         ExprBox body = parse_expr();
-        if (rett) {
-          Location cl = body->loc;
-          body = E({Pexp_constraint{std::move(body), std::move(*rett)}, cl});
-        }
         if (!params.empty()) {
           Position fstart = params.front().first;
           Location floc = span(fstart, body->loc.end, true);
           std::vector<FunctionParam> ps;
           for (auto& pr : params) ps.push_back(std::move(pr.second));
           auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
-          body = E({Pexp_function{std::move(ps), std::nullopt, std::move(fb)}, floc});
+          body = E({Pexp_function{std::move(ps), std::move(fconstr), std::move(fb)}, floc});
         }
         Location pl = body->loc;
         pl.ghost = true;  // ghexp Pexp_poly is always ghost
