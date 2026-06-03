@@ -1661,15 +1661,21 @@ class Parser {
     Position endp = position(nm.end);
     if (cur().kind == Kind::COLON) {  // GADT:  A : t1 * … * tn -> tres   (or  A : tres)
       advance();
-      std::vector<CoreTypeBox> ts;
-      ts.push_back(parse_type_app());
-      while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
-      if (cur().kind == Kind::MINUSGREATER) {
-        advance();
+      if (cur().kind == Kind::LBRACE) {  // A : { fields } -> tres  (inline record)
+        args = Pcstr_record{parse_label_decls()};
+        expect(Kind::MINUSGREATER, "->");
         res = parse_core_type();
-        args = Pcstr_tuple{std::move(ts)};
       } else {
-        res = std::move(ts[0]);  // no arrow: the lone type is the result, no args
+        std::vector<CoreTypeBox> ts;
+        ts.push_back(parse_type_app());
+        while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
+        if (cur().kind == Kind::MINUSGREATER) {
+          advance();
+          res = parse_core_type();
+          args = Pcstr_tuple{std::move(ts)};
+        } else {
+          res = std::move(ts[0]);  // no arrow: the lone type is the result, no args
+        }
       }
       endp = position(tokens_[idx_ - 1].end);
     } else if (cur().kind == Kind::OF) {
