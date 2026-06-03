@@ -2707,7 +2707,7 @@ class Parser {
       return mt;
     }
     if (t.kind == Kind::UIDENT) {
-      LongidentLoc id = parse_longident_path();
+      LongidentLoc id = parse_type_path();  // may contain functor application F(N).S
       return ModuleType{Pmty_ident{id}, id.loc, {}};
     }
     if (t.kind == Kind::LIDENT) {  // lowercase module-type name (module type t = …; M : t)
