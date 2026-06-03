@@ -101,10 +101,11 @@ struct Ptyp_class { LongidentLoc id; std::vector<CoreTypeBox> args; };  // [args
 struct Ptyp_alias { CoreTypeBox type; std::string name; };  // (t as 'a)
 struct Ptyp_poly { std::vector<std::string> vars; CoreTypeBox type; };  // 'a 'b. t
 struct Ptyp_open { LongidentLoc mod_; CoreTypeBox type; };  // M.(t)
+struct Ptyp_functor { ArgLabel label; StringLoc name; Ptyp_package pkg; CoreTypeBox body; };  // (module M : T) -> t
 struct CoreType {
   std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr,
                Ptyp_variant, Ptyp_object, Ptyp_package, Ptyp_class, Ptyp_alias,
-               Ptyp_poly, Ptyp_open>
+               Ptyp_poly, Ptyp_open, Ptyp_functor>
       desc;
   Location loc;
   Attributes attrs;

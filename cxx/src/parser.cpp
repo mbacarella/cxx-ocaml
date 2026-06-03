@@ -1217,8 +1217,48 @@ class Parser {
   }
   // Compound type nodes take their location from the *symbol* span (which
   // includes a parenthesized child's parens), not the child node's own loc.
+  // package type body: `path [with type t = u and …]` (after `(module M :`).
+  Ptyp_package parse_package_type_body() {
+    LongidentLoc path = parse_longident_path();
+    std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
+    if (cur().kind == Kind::WITH) {
+      advance();
+      for (;;) {
+        expect(Kind::TYPE, "type");
+        LongidentLoc lp = parse_longident_path();
+        expect(Kind::EQUAL, "=");
+        cons.emplace_back(lp, parse_core_type());
+        if (cur().kind == Kind::AND) { advance(); continue; }
+        break;
+      }
+    }
+    return Ptyp_package{std::move(path), std::move(cons)};
+  }
   CoreTypeBox parse_type_arrow() {
     Position symstart = position(cur().start);
+    // modular explicit: `[label:](module M : pkg) -> codomain`  -> Ptyp_functor
+    {
+      size_t save = idx_;
+      ArgLabel flabel = Nolabel{};
+      if (cur().kind == Kind::LABEL) { flabel = Labelled{cur().text}; advance(); }
+      else if (cur().kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
+        flabel = Labelled{cur().text}; advance(); advance();
+      }
+      if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::MODULE &&
+          peek(2).kind == Kind::UIDENT && peek(3).kind == Kind::COLON) {
+        advance(); advance();  // ( module
+        Token nm = cur(); advance();  // M
+        expect(Kind::COLON, ":");
+        Ptyp_package pkg = parse_package_type_body();
+        expect(Kind::RPAREN, ")");
+        expect(Kind::MINUSGREATER, "->");
+        CoreTypeBox cod = parse_type_arrow();
+        Location l = span(symstart, position(tokens_[idx_ - 1].end));
+        return box(CoreType{Ptyp_functor{std::move(flabel), StringLoc{nm.text, tokloc(nm)},
+                                         std::move(pkg), std::move(cod)}, l});
+      }
+      idx_ = save;  // not a modular-explicit arrow
+    }
     // Leading label: `~x:`/`?x:` are unambiguously arrow labels; a bare `x:` is the
     // first tuple element's label *unless* an arrow follows (then it moves to the arrow).
     bool opt = false, must_arrow = false;

@@ -129,6 +129,21 @@ struct Printer {
     } else if (auto* v = std::get_if<Ptyp_open>(&t.desc)) {
       line(j, "Ptyp_open \"" + lid_loc(v->mod_) + "\"");
       core_type(j, *v->type);
+    } else if (auto* v = std::get_if<Ptyp_functor>(&t.desc)) {
+      line(j, "Ptyp_functor");
+      arg_label(j, v->label);
+      line(j, "\"" + v->name.txt + "\"");
+      line(j + 1, "package_type " + lid_loc(v->pkg.path));
+      if (v->pkg.constraints.empty()) line(j + 1, "[]");
+      else {
+        line(j + 1, "[");
+        for (auto& [path, ct] : v->pkg.constraints) {
+          line(j + 2, "with type " + lid_loc(path));
+          core_type(j + 2, *ct);
+        }
+        line(j + 1, "]");
+      }
+      core_type(j, *v->body);
     } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
       line(j, std::string("Ptyp_variant closed=") + closed_flag(v->closed));
       if (v->rows.empty()) line(j, "[]");
