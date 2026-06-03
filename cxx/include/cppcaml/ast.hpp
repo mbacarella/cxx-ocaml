@@ -241,7 +241,8 @@ enum class MutableFlag { Immutable, Mutable };
 enum class PrivateFlag { Public, Private };
 enum class OverrideFlag { Override, Fresh };
 
-struct LabelDecl { StringLoc name; MutableFlag mut; CoreTypeBox type; Location loc; };
+struct LabelDecl { StringLoc name; MutableFlag mut; CoreTypeBox type; Location loc;
+                   Attributes attrs; };  // pld_attributes (e.g. [@atomic])
 struct Pcstr_tuple { std::vector<CoreTypeBox> elems; };
 struct Pcstr_record { std::vector<LabelDecl> fields; };
 using ConstructorArguments = std::variant<Pcstr_tuple, Pcstr_record>;

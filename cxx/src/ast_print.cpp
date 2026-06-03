@@ -517,6 +517,7 @@ struct Printer {
 
   void label_decl(int i, const LabelDecl& d) {
     line(i, loc(d.loc));
+    attributes(i, d.attrs);  // pld_attributes (printed at i+1, before Mutable)
     line(i + 1, mutable_flag(d.mut));
     os << ind(i + 1) << str_loc(d.name);  // no newline: core_type runs onto this line
     core_type(i + 1, *d.type);

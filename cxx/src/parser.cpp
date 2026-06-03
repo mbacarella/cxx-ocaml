@@ -159,6 +159,7 @@ class Parser {
   Position last_seq_end_{};  // end of the most recent parse_expr, incl. a trailing `;`
   bool last_type_subst_ = false;  // most recent type decl used `:=` (substitution)
   std::optional<std::string> let_ext_;  // `let%ext …` extension name on the last let
+  bool suppress_type_trailing_attr_ = false;  // record-field type: `[@attr]` is the field's
 
   const Token& cur() const { return tokens_[idx_]; }
   const Token& peek(size_t n) const {
@@ -1177,10 +1178,11 @@ class Parser {
       t = box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
                        .loc = span(symstart, name.loc.end)});
     }
-    while (cur().kind == Kind::LBRACKETAT) {  // t [@attr]  -> ptyp_attributes
-      advance();
-      t->attrs.push_back(parse_attribute_body());
-    }
+    if (!suppress_type_trailing_attr_)
+      while (cur().kind == Kind::LBRACKETAT) {  // t [@attr]  -> ptyp_attributes
+        advance();
+        t->attrs.push_back(parse_attribute_body());
+      }
     return t;
   }
   CoreTypeBox parse_type_atom() {
@@ -1232,7 +1234,10 @@ class Parser {
     }
     if (t.kind == Kind::LPAREN) {
       advance();
+      bool save_sup = suppress_type_trailing_attr_;
+      suppress_type_trailing_attr_ = false;  // a parenthesized type consumes its own attrs
       CoreTypeBox inner = parse_core_type();
+      suppress_type_trailing_attr_ = save_sup;
       if (cur().kind == Kind::COMMA) {
         std::vector<CoreTypeBox> args;
         args.push_back(std::move(inner));
@@ -1631,13 +1636,17 @@ class Parser {
       if (nm.kind != Kind::LIDENT) throw ParseError("expected field name", nm.start);
       advance();
       expect(Kind::COLON, ":");
-      CoreTypeBox ty = parse_core_type();
+      suppress_type_trailing_attr_ = true;  // trailing `[@attr]` belongs to the field
+      CoreTypeBox ty = parse_possibly_poly_type();  // fields may carry a poly type
+      suppress_type_trailing_attr_ = false;
+      Attributes fattrs;  // pld_attributes: `field : t [@attr]`
+      while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
       // pld_loc includes the trailing ';' separator when present.
-      Position endp = ty->loc.end;
+      Position endp = position(tokens_[idx_ - 1].end);
       bool more = false;
       if (cur().kind == Kind::SEMI) { endp = position(cur().end); advance(); more = true; }
       fields.push_back(LabelDecl{StringLoc{nm.text, tokloc(nm)}, mut, std::move(ty),
-                                 span(position(start.start), endp)});
+                                 span(position(start.start), endp), std::move(fattrs)});
       if (!more) break;
     }
     expect(Kind::RBRACE, "}");
