@@ -1671,6 +1671,14 @@ class Parser {
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty)}, l};
     }
+    if (t.kind == Kind::MODULE && peek(1).kind == Kind::REC) {
+      advance(); advance();  // module rec
+      std::vector<ModuleBinding> binds;
+      binds.push_back(parse_module_binding_def());
+      while (cur().kind == Kind::AND) { advance(); binds.push_back(parse_module_binding_def()); }
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return StructureItem{Pstr_recmodule{std::move(binds)}, l};
+    }
     if (t.kind == Kind::MODULE) {
       advance();
       StrOptLoc name = parse_module_name();
@@ -1956,6 +1964,30 @@ class Parser {
                            span(position(t.start), position(c.end))};
     }
     throw ParseError("unsupported signature item", t.start);
+  }
+
+  // name [params] [: S] = me   (a binding in `module M …` / `module rec …`)
+  ModuleBinding parse_module_binding_def() {
+    StrOptLoc name = parse_module_name();
+    std::vector<std::pair<Position, FunctorParam>> params;
+    while (cur().kind == Kind::LPAREN) {
+      Position ps = position(cur().start);
+      params.emplace_back(ps, parse_functor_param());
+    }
+    std::optional<ModuleType> cmty;
+    Position colon_pos{};
+    if (cur().kind == Kind::COLON) { colon_pos = position(cur().start); advance(); cmty = parse_module_type(); }
+    expect(Kind::EQUAL, "=");
+    ModuleExpr me = parse_module_expr();
+    if (cmty) {
+      Location cl = span(colon_pos, me.loc.end);
+      me = ModuleExpr{Pmod_constraint{box(std::move(me)), box(std::move(*cmty))}, cl};
+    }
+    for (int i = static_cast<int>(params.size()) - 1; i >= 0; --i) {
+      Location fl = span(params[i].first, me.loc.end);
+      me = ModuleExpr{Pmod_functor{std::move(params[i].second), box(std::move(me))}, fl};
+    }
+    return ModuleBinding{std::move(name), std::move(me)};
   }
 
   ModuleExpr parse_module_expr() {

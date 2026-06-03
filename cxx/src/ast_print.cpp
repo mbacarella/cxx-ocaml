@@ -880,6 +880,10 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_module>(&s.desc)) {
       line(j, "Pstr_module");
       module_binding(j, v->binding);
+    } else if (auto* v = std::get_if<Pstr_recmodule>(&s.desc)) {
+      line(j, "Pstr_recmodule");
+      if (v->bindings.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& b : v->bindings) module_binding(j + 1, b); line(j, "]"); }
     } else if (auto* v = std::get_if<Pstr_attribute>(&s.desc)) {
       line(j, "Pstr_attribute \"" + v->name + "\"");
       structure_list(j, v->payload);
