@@ -1093,6 +1093,32 @@ class Parser {
     }
     return LongidentLoc{std::move(lid), span(position(first.start), position(last.end))};
   }
+  // A type/module path that may contain functor applications: F(X).t, M.F(A.B).u
+  LongidentLoc parse_type_path() {
+    Token first = cur();
+    advance();
+    Longident lid{Lident{first.text}};
+    Position start = position(first.start), end = position(first.end);
+    for (;;) {
+      if (cur().kind == Kind::LPAREN) {  // functor application F(Arg)
+        advance();
+        LongidentLoc arg = parse_type_path();
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        lid = Longident{Lapply{std::make_shared<Longident>(std::move(lid)),
+                               std::make_shared<Longident>(std::move(arg.txt))}};
+        end = position(c.end);
+      } else if (cur().kind == Kind::DOT &&
+                 (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
+        advance();
+        Token nm = cur(); advance();
+        lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
+        end = position(nm.end);
+      } else {
+        break;
+      }
+    }
+    return LongidentLoc{std::move(lid), span(start, end)};
+  }
 
   // ---- core types ----
   // poly_type: `'a 'b. t` -> ghost Ptyp_poly, else a plain core_type.  Used where
@@ -1172,7 +1198,7 @@ class Parser {
                          .loc = span(symstart, name.loc.end)});
         continue;
       }
-      LongidentLoc name = parse_longident_path();
+      LongidentLoc name = parse_type_path();  // `t F(X).u`
       std::vector<CoreTypeBox> args;
       args.push_back(std::move(t));
       t = box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
@@ -1205,7 +1231,7 @@ class Parser {
                           span(position(t.start), position(c.end))});
     }
     if (t.kind == Kind::LIDENT || t.kind == Kind::UIDENT) {
-      LongidentLoc name = parse_longident_path();
+      LongidentLoc name = parse_type_path();  // may contain functor application F(X).t
       return box(CoreType{.desc = Ptyp_constr{.id = name, .args = {}}, .loc = name.loc});
     }
     if (t.kind == Kind::HASH) {  // #class  (no type args)
@@ -1245,7 +1271,7 @@ class Parser {
         expect(Kind::RPAREN, ")");
         bool cls = cur().kind == Kind::HASH;  // (a,b) #class
         if (cls) advance();
-        LongidentLoc name = parse_longident_path();
+        LongidentLoc name = parse_type_path();
         if (cls)
           return box(CoreType{Ptyp_class{name, std::move(args)},
                               span(position(t.start), name.loc.end)});
@@ -1782,9 +1808,12 @@ class Parser {
       // A `kind` (record/variant/open) starts with `{`, `..`, `|`, or an unqualified
       // constructor (UIDENT not followed by `.`); otherwise it's a manifest type,
       // optionally followed by `= [private] kind` (variant/record redefinition).
+      // A leading UIDENT is a variant constructor unless it begins a manifest path:
+      // `M.t` (DOT) or a functor application `F(X).t` (LPAREN).
       bool kind_start = cur().kind == Kind::DOTDOT || cur().kind == Kind::LBRACE ||
                         cur().kind == Kind::BAR ||
-                        (cur().kind == Kind::UIDENT && peek(1).kind != Kind::DOT);
+                        (cur().kind == Kind::UIDENT && peek(1).kind != Kind::DOT &&
+                         peek(1).kind != Kind::LPAREN);
       if (kind_start) {
         kind = parse_type_kind_body();
       } else {
