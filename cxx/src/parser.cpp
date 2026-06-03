@@ -1723,6 +1723,11 @@ class Parser {
         }
         return {Ppat_constant{std::move(c1)}, c1loc};
       }
+      case Kind::BACKQUOTE: {  // `Tag as a simple pattern (no argument)
+        advance();
+        Token tag = cur(); advance();
+        return {Ppat_variant{tag.text, std::nullopt}, span(position(t.start), position(tag.end))};
+      }
       case Kind::TRUE: advance(); return ppat_construct0("true", tokloc(t));
       case Kind::FALSE: advance(); return ppat_construct0("false", tokloc(t));
       case Kind::UIDENT: {
