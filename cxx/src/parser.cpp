@@ -438,13 +438,14 @@ class Parser {
           Token c = cur(); expect(Kind::RPAREN, ")");
           return E({Pexp_pack{box(std::move(me))}, span(position(t.start), position(c.end))});
         }
-        if (peek(1).kind == Kind::RPAREN) {
-          if (auto op = operator_name(cur())) {  // (+), (>>=), (!), …  -> Pexp_ident
-            advance();
+        {  // (+), (>>=), (!), (.%[]), …  -> Pexp_ident spanning the parens
+          size_t save = idx_;
+          if (auto op = parse_operator_name_tokens(); op && cur().kind == Kind::RPAREN) {
             Token c = cur(); advance();  // RPAREN
-            Location l = span(position(t.start), position(c.end));  // spans the parens
+            Location l = span(position(t.start), position(c.end));
             return E({Pexp_ident{lid0(*op, l)}, l});
           }
+          idx_ = save;
         }
         ExprBox inner = parse_expr();
         if (cur().kind == Kind::COLON) {
@@ -1723,10 +1724,49 @@ class Parser {
     }
     return vb;
   }
+  // An operator name at cur(): a single-token operator, or a DOTOP index operator
+  // `.op( [;..] )` / `.op[ … ]` / `.op{ … }` with an optional `<-`.  Consumes the
+  // tokens on success (matching parser.mly's `operator` rule).
+  std::optional<std::string> parse_operator_name_tokens() {
+    Token t = cur();
+    if (t.kind == Kind::DOTOP) {
+      advance();
+      const char* openc; const char* closec; Kind closeK;
+      switch (cur().kind) {
+        case Kind::LPAREN:   openc = "("; closec = ")"; closeK = Kind::RPAREN;   break;
+        case Kind::LBRACKET: openc = "["; closec = "]"; closeK = Kind::RBRACKET; break;
+        case Kind::LBRACE:   openc = "{"; closec = "}"; closeK = Kind::RBRACE;   break;
+        default: return std::nullopt;
+      }
+      advance();
+      std::string mod;
+      if (cur().kind == Kind::SEMI && peek(1).kind == Kind::DOTDOT) {
+        advance(); advance(); mod = ";..";
+      }
+      if (cur().kind != closeK) return std::nullopt;
+      advance();
+      std::string suffix;
+      if (cur().kind == Kind::LESSMINUS) { advance(); suffix = "<-"; }
+      return "." + t.text + openc + mod + closec + suffix;
+    }
+    if (auto op = operator_name(t)) { advance(); return *op; }
+    return std::nullopt;
+  }
+  // Try to parse `( operator )` at cur(); on success returns the name+span and
+  // consumes it, otherwise leaves the position unchanged.
+  std::optional<StringLoc> try_paren_operator() {
+    if (cur().kind != Kind::LPAREN) return std::nullopt;
+    size_t save = idx_;
+    Token lp = cur(); advance();
+    auto nm = parse_operator_name_tokens();
+    if (!nm || cur().kind != Kind::RPAREN) { idx_ = save; return std::nullopt; }
+    Token c = cur(); advance();
+    return StringLoc{*nm, span(position(lp.start), position(c.end))};
+  }
   ValueBinding parse_value_binding_core() {
     // val_ident form (`let f p.. = e` / `let (+) p.. = e`) vs pattern form.
-    bool op_ident = cur().kind == Kind::LPAREN && operator_name(peek(1)) &&
-                    peek(2).kind == Kind::RPAREN;
+    std::optional<StringLoc> opname = try_paren_operator();  // consumes `( op )` on success
+    bool op_ident = opname.has_value();
     bool val_ident = op_ident ||
                      (cur().kind == Kind::LIDENT &&
                       (peek(1).kind == Kind::EQUAL || peek(1).kind == Kind::COLON ||
@@ -1752,10 +1792,7 @@ class Parser {
     }
     StringLoc name;
     if (op_ident) {
-      Token lp = cur(); advance();
-      auto op = operator_name(cur()); advance();
-      Token c = cur(); advance();  // RPAREN
-      name = StringLoc{*op, span(position(lp.start), position(c.end))};
+      name = std::move(*opname);  // `( op )` already consumed by try_paren_operator
     } else {
       Token nt = cur(); advance();
       name = StringLoc{nt.text, tokloc(nt)};
