@@ -1061,6 +1061,26 @@ class Parser {
   }
 
   // ---- core types ----
+  // poly_type: `'a 'b. t` -> ghost Ptyp_poly, else a plain core_type.  Used where
+  // an explicit universal quantifier is allowed (let/val/method/field annotations).
+  CoreTypeBox parse_poly_type() {
+    if (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
+      size_t save = idx_;
+      Position start = position(cur().start);
+      std::vector<std::string> vars;
+      while (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
+        advance(); vars.push_back(cur().text); advance();
+      }
+      if (cur().kind == Kind::DOT) {
+        advance();
+        CoreTypeBox inner = parse_core_type();
+        Location l{start, inner->loc.end, /*ghost=*/true};
+        return box(CoreType{Ptyp_poly{std::move(vars), std::move(inner)}, l});
+      }
+      idx_ = save;  // not `'a. …` — a plain type starting with a type variable
+    }
+    return parse_core_type();
+  }
   CoreTypeBox parse_core_type() {
     CoreTypeBox t = parse_type_arrow();
     while (cur().kind == Kind::AS && peek(1).kind == Kind::QUOTE) {  // (t as 'a)
@@ -1912,7 +1932,7 @@ class Parser {
         expect(Kind::DOT, ".");
         vconstr = Pvc_constraint{std::move(univars), parse_core_type()};
       } else {
-        CoreTypeBox ty = parse_core_type();
+        CoreTypeBox ty = parse_poly_type();  // allows `: 'a 'b. t` -> Ptyp_poly
         if (cur().kind == Kind::COLONGREATER) {  // : t :> t2
           advance();
           CoreTypeBox ty2 = parse_core_type();
