@@ -1045,7 +1045,13 @@ class Parser {
           return e;
         };
         std::vector<FunctionParam> params;
-        while (cur().kind != Kind::MINUSGREATER) parse_params_into(params);
+        while (cur().kind != Kind::MINUSGREATER && cur().kind != Kind::COLON)
+          parse_params_into(params);
+        std::optional<FunctionConstraint> fconstr;  // `fun p.. : atomic_type -> e`
+        if (cur().kind == Kind::COLON) {
+          advance();
+          fconstr = Pconstraint{parse_type_app()};  // atomic_type: no top-level arrow
+        }
         expect(Kind::MINUSGREATER, "->");
         // `fun (type a) … -> e` with *only* newtype params is a Pexp_newtype chain.
         bool all_newtype = !params.empty();
@@ -1059,7 +1065,7 @@ class Parser {
           Position last = cs.back().rhs->loc.end;
           Location casesloc = span(position(fkw.start), last);
           auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
-          return withattrs(E({Pexp_function{std::move(params), std::nullopt, std::move(fb)},
+          return withattrs(E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)},
                               span(position(t.start), last)}));
         }
         ExprBox body = parse_expr();
@@ -1075,7 +1081,7 @@ class Parser {
         }
         Location l = span(position(t.start), last_seq_end_);  // fun body is seq_expr
         auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
-        return withattrs(E({Pexp_function{std::move(params), std::nullopt, std::move(fb)}, l}));
+        return withattrs(E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)}, l}));
       }
       case Kind::WHILE: {
         advance();
