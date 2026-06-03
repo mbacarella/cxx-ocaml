@@ -911,11 +911,22 @@ class Parser {
         std::vector<FunctionParam> params;
         while (cur().kind != Kind::MINUSGREATER) params.push_back(parse_param());
         expect(Kind::MINUSGREATER, "->");
-        ExprBox body = parse_expr();
         // `fun (type a) … -> e` with *only* newtype params is a Pexp_newtype chain.
         bool all_newtype = !params.empty();
         for (auto& p : params)
           if (!std::holds_alternative<Pparam_newtype>(p.desc)) all_newtype = false;
+        // `fun params -> function cases` is one Pexp_function whose body is the
+        // Pfunction_cases directly (not a nested function under Pfunction_body).
+        if (!all_newtype && cur().kind == Kind::FUNCTION) {
+          Token fkw = cur(); advance();
+          std::vector<Case> cs = parse_cases();
+          Position last = cs.back().rhs->loc.end;
+          Location casesloc = span(position(fkw.start), last);
+          auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
+          return E({Pexp_function{std::move(params), std::nullopt, std::move(fb)},
+                    span(position(t.start), last)});
+        }
+        ExprBox body = parse_expr();
         if (all_newtype) {
           ExprBox acc = std::move(body);
           Position bend = acc->loc.end;
