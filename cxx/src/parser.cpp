@@ -1698,10 +1698,14 @@ class Parser {
         Pattern p = parse_pattern();
         if (cur().kind == Kind::COLON) {
           advance();
-          CoreTypeBox ty = parse_core_type();
+          CoreTypeBox ty = parse_poly_type(/*ghost=*/false);  // (pat : 'a. t) poly constraint
           Token c = cur(); expect(Kind::RPAREN, ")");
-          return {Ppat_constraint{box(std::move(p)), std::move(ty)},
-                  span(position(t.start), position(c.end))};
+          // a poly-type constraint takes the inner pat..type span; a plain type
+          // takes the parenthesised span.
+          Location l = std::holds_alternative<Ptyp_poly>(ty->desc)
+                           ? span(p.loc.start, ty->loc.end)
+                           : span(position(t.start), position(c.end));
+          return {Ppat_constraint{box(std::move(p)), std::move(ty)}, l};
         }
         Token c = cur(); expect(Kind::RPAREN, ")");
         p.loc = span(position(t.start), position(c.end));  // reloc to parens
@@ -2066,8 +2070,11 @@ class Parser {
       Location loc = span(position(t.start), position(c.end));
       return FunctionParam{Pparam_val{loc, Optional{id.text}, std::move(def), std::move(p)}};
     }
+    Position ps = position(cur().start);
     Pattern p = parse_simple_pattern();
-    Location l = p.loc;
+    // the param spans the (possibly parenthesised) pattern; a poly `(p:'a.t)` keeps
+    // its inner Ppat_constraint loc, so use the consumed-token span here.
+    Location l = span(ps, position(tokens_[idx_ - 1].end));
     return FunctionParam{Pparam_val{l, Nolabel{}, std::nullopt, std::move(p)}};
   }
 
