@@ -583,13 +583,15 @@ class Parser {
     }
   }
 
-  ExprBox parse_atom_postfix() {
-    ExprBox e = postfix_field(parse_atom());
-    while (cur().kind == Kind::LBRACKETAT) {  // e [@attr]  -> pexp_attributes
+  ExprBox attach_expr_attrs(ExprBox e) {  // e [@attr] …  -> pexp_attributes
+    while (cur().kind == Kind::LBRACKETAT) {
       advance();
       e->attrs.push_back(parse_attribute_body());
     }
     return e;
+  }
+  ExprBox parse_atom_postfix() {
+    return attach_expr_attrs(postfix_field(parse_atom()));
   }
 
   ExprBox ident_expr(const std::string& name, Location l) {
@@ -638,17 +640,18 @@ class Parser {
     // constructor application  Constr arg  -> Pexp_construct (not Pexp_apply)
     if (cur().kind == Kind::UIDENT) {
       PathResult pr = parse_dotted_path();
-      if (auto lo = try_local_open(pr)) return collect_app(postfix_field(std::move(*lo)));
+      if (auto lo = try_local_open(pr))
+        return collect_app(attach_expr_attrs(postfix_field(std::move(*lo))));
       if (pr.final_upper) {
         if (is_atom_start(cur().kind)) {
           ExprBox arg = parse_atom_postfix();
           Location l = span(pr.lid.loc.start, arg->loc.end);
           return collect_app(mk_construct(pr.lid, std::move(arg), l));
         }
-        return collect_app(mk_construct(pr.lid, std::nullopt, pr.lid.loc));
+        return collect_app(attach_expr_attrs(mk_construct(pr.lid, std::nullopt, pr.lid.loc)));
       }
       Location l = pr.lid.loc;
-      return collect_app(postfix_field(E({Pexp_ident{.id = std::move(pr.lid)}, l})));
+      return collect_app(attach_expr_attrs(postfix_field(E({Pexp_ident{.id = std::move(pr.lid)}, l}))));
     }
     if (cur().kind == Kind::TRUE || cur().kind == Kind::FALSE) {
       Token t = cur();
