@@ -812,6 +812,7 @@ struct Printer {
   }
   void module_binding(int i, const ModuleBinding& b) {
     line(i, str_opt_loc(b.name));
+    attributes(i, b.attrs);
     module_expr(i + 1, b.expr);
   }
   void ext_kind(int i, const std::variant<Pext_decl, Pext_rebind>& k) {
@@ -827,6 +828,7 @@ struct Printer {
   }
   void extension_constructor(int i, const ExtensionConstructor& c) {
     line(i, "extension_constructor " + loc(c.loc));
+    attributes(i, c.attrs);
     line(i + 1, "pext_name = \"" + c.name.txt + "\"");
     line(i + 1, "pext_kind =");
     ext_kind(i + 2, c.kind);

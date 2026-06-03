@@ -1779,6 +1779,7 @@ class Parser {
       // extension_constructor loc spans the `exception` keyword
       ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      attach_docs(ctor.attrs, l.start.cnum, l.end.cnum);
       return StructureItem{Pstr_exception{TypeException{std::move(ctor)}}, l};
     }
     if (t.kind == Kind::EXTERNAL) {
@@ -1795,6 +1796,7 @@ class Parser {
       Attributes pattrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); pattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      attach_docs(pattrs, l.start.cnum, l.end.cnum);
       PrimitiveDescription pd{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l,
                               std::move(pattrs)};
       return StructureItem{Pstr_primitive{std::move(pd)}, l};
@@ -1839,7 +1841,9 @@ class Parser {
         me = ModuleExpr{Pmod_functor{std::move(params[i].second), box(std::move(me))}, fl};
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      return StructureItem{Pstr_module{ModuleBinding{std::move(name), std::move(me)}}, l};
+      Attributes mattrs;
+      attach_docs(mattrs, l.start.cnum, l.end.cnum);
+      return StructureItem{Pstr_module{ModuleBinding{std::move(name), std::move(me), std::move(mattrs)}}, l};
     }
     if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
       Position kw = position(t.start);
@@ -2019,12 +2023,27 @@ class Parser {
     throw ParseError("unsupported module type", t.start);
   }
 
+  void emit_text_sig(Signature& items, const std::unordered_map<size_t, std::vector<Docstring>>& m,
+                     size_t key) {
+    auto it = m.find(key);
+    if (it == m.end()) return;
+    for (auto& d : it->second) {
+      Location l = span(position(d.start), position(d.end));
+      items.push_back(SignatureItem{Psig_attribute{"ocaml.text", doc_payload(d)}, l});
+    }
+  }
   Signature parse_signature_until(Kind stop) {
     Signature items;
+    size_t sigStart = cur().start;
+    emit_text_sig(items, docs_.pre_extra, sigStart);
+    size_t lastEnd = sigStart;
     while (cur().kind != Kind::TEOF && cur().kind != stop) {
       if (cur().kind == Kind::SEMISEMI) { advance(); continue; }
+      emit_text_sig(items, docs_.floating, cur().start);
       items.push_back(parse_signature_item());
+      lastEnd = items.back().loc.end.cnum;
     }
+    emit_text_sig(items, docs_.post_extra, lastEnd);
     return items;
   }
   SignatureItem parse_signature_item() {
@@ -2045,6 +2064,7 @@ class Parser {
       Attributes attrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
       Location l = here();
+      attach_docs(attrs, l.start.cnum, l.end.cnum);
       return SignatureItem{Psig_value{ValueDescription{std::move(vname), std::move(ty), l, std::move(attrs)}}, l};
     }
     if (t.kind == Kind::EXTERNAL) {
@@ -2061,6 +2081,7 @@ class Parser {
       Attributes attrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
       Location l = here();
+      attach_docs(attrs, l.start.cnum, l.end.cnum);
       return SignatureItem{Psig_primitive{PrimitiveDescription{
           StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(prims), l, std::move(attrs)}}, l};
     }
@@ -2097,12 +2118,14 @@ class Parser {
         Position ds = position(cur().start); advance();
         decls.push_back(parse_type_declaration(ds));
       }
+      attach_docs(decls[0].attrs, d0.cnum, decls[0].loc.end.cnum);
       return SignatureItem{Psig_type{rf, std::move(decls)}, span(d0, position(tokens_[idx_ - 1].end))};
     }
     if (t.kind == Kind::EXCEPTION) {
       advance();
       ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
       Location l = here();
+      attach_docs(ctor.attrs, l.start.cnum, l.end.cnum);
       return SignatureItem{Psig_exception{TypeException{std::move(ctor)}}, l};
     }
     if (t.kind == Kind::OPEN) {

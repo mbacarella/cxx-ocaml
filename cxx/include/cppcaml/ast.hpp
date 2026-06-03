@@ -269,6 +269,7 @@ struct ExtensionConstructor {
   StringLoc name;
   std::variant<Pext_decl, Pext_rebind> kind;
   Location loc;
+  Attributes attrs;
 };
 struct TypeException { ExtensionConstructor ctor; };  // attributes empty
 struct TypeExtension {
@@ -351,7 +352,7 @@ struct ModuleExpr {
       desc;
   Location loc;
 };
-struct ModuleBinding { StrOptLoc name; ModuleExpr expr; };
+struct ModuleBinding { StrOptLoc name; ModuleExpr expr; Attributes attrs; };
 
 // --- class language ---
 enum class VirtualFlag { Virtual, Concrete };
