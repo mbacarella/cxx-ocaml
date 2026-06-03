@@ -1061,7 +1061,19 @@ class Parser {
   }
 
   // ---- core types ----
-  CoreTypeBox parse_core_type() { return parse_type_arrow(); }
+  CoreTypeBox parse_core_type() {
+    CoreTypeBox t = parse_type_arrow();
+    while (cur().kind == Kind::AS && peek(1).kind == Kind::QUOTE) {  // (t as 'a)
+      advance();  // as
+      advance();  // '
+      Token id = cur();
+      if (id.kind != Kind::LIDENT) throw ParseError("expected type variable", id.start);
+      advance();
+      Location l = span(t->loc.start, position(id.end));
+      t = box(CoreType{Ptyp_alias{std::move(t), id.text}, l});
+    }
+    return t;
+  }
   // Compound type nodes take their location from the *symbol* span (which
   // includes a parenthesized child's parens), not the child node's own loc.
   CoreTypeBox parse_type_arrow() {

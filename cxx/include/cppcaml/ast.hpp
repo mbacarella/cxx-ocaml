@@ -97,9 +97,10 @@ struct Ptyp_package {  // (module S [with type t = u and …])
   std::vector<std::pair<LongidentLoc, CoreTypeBox>> constraints;
 };
 struct Ptyp_class { LongidentLoc id; std::vector<CoreTypeBox> args; };  // [args] #class
+struct Ptyp_alias { CoreTypeBox type; std::string name; };  // (t as 'a)
 struct CoreType {
   std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr,
-               Ptyp_variant, Ptyp_object, Ptyp_package, Ptyp_class>
+               Ptyp_variant, Ptyp_object, Ptyp_package, Ptyp_class, Ptyp_alias>
       desc;
   Location loc;
   Attributes attrs;
