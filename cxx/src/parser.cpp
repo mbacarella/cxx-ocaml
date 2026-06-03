@@ -280,6 +280,25 @@ class Parser {
     return make_local_open(pr.lid, std::move(inner), span(openStart, end));
   }
 
+  // A record-label longident: `(UIDENT.)* label`. The path continues only through
+  // uppercase module prefixes; the first lowercase component is the terminal label
+  // (so `r.a.b` is two field accesses, not a single label "a.b").
+  LongidentLoc parse_field_longident() {
+    Token first = cur();
+    advance();
+    Longident lid{Lident{first.text}};
+    Token last = first;
+    while (last.kind == Kind::UIDENT && cur().kind == Kind::DOT &&
+           (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
+      advance();
+      Token nm = cur();
+      advance();
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
+      last = nm;
+    }
+    return LongidentLoc{std::move(lid), span(position(first.start), position(last.end))};
+  }
+
   // postfix record-field access  e.lbl (.lbl)*
   ExprBox qualified_ident(const char* mod, const char* fn, Location l) {
     Longident lid{Ldot{std::make_shared<Longident>(Longident{Lident{mod}}), fn}};
@@ -324,8 +343,8 @@ class Parser {
     for (;;) {
       if (cur().kind == Kind::DOT &&
           (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
-        advance();  // .  (field may be a qualified path  e.M.f)
-        LongidentLoc field = parse_longident_path();
+        advance();  // .  (field label may be module-qualified: e.M.f)
+        LongidentLoc field = parse_field_longident();
         Location l = span(e->loc.start, field.loc.end);
         e = E({Pexp_field{std::move(e), std::move(field)}, l});
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {
