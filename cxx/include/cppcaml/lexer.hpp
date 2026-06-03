@@ -4,13 +4,28 @@
 // and DOCSTRING are recognised but dropped by next(), exactly as the OCaml
 // `Lexer.token` wrapper does. raw_token() exposes the unfiltered stream.
 #pragma once
+#include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "cppcaml/token.hpp"
 
 namespace cppcaml {
+
+// A `(** … *)` doc comment: body (delimiters stripped) and the comment's span.
+struct Docstring { std::string body; size_t start = 0; size_t end = 0; };
+
+// Docstring attachment tables, keyed by byte offset (cnum), built by the lexer's
+// token/EOL/docstring state machine (ports parsing/docstrings.ml + lexer.mll).
+//   pre[start]   -> ocaml.doc before the item starting there  (docs_pre)
+//   post[end]    -> ocaml.doc after the item ending there     (docs_post)
+//   floating[s]  -> ocaml.text items emitted before the item starting at s
+//   pre_extra[s] / post_extra[e] -> ocaml.text threaded at structure boundaries
+struct DocAttach {
+  std::unordered_map<size_t, std::vector<Docstring>> pre, post, floating, pre_extra, post_extra;
+};
 
 // Lexing error, mirrors lexer.mll's `Error of error * Location.t`. For now we
 // carry a message and the byte offset; structured error variants come later.
@@ -33,12 +48,18 @@ class Lexer {
   Token raw_token();
 
   // Convenience: lex the whole buffer into the filtered token vector,
-  // terminated by an EOF token.
+  // terminated by an EOF token. Also populates the docstring attachment tables.
   std::vector<Token> tokenize();
+
+  const DocAttach& doc_attach() const { return docs_; }
 
  private:
   std::string_view src_;
   size_t pos_ = 0;
+  DocAttach docs_;
+
+  bool is_doc_comment(size_t s, size_t e) const;
+  std::string doc_body(size_t s, size_t e) const;
 
   // --- cursor helpers ---
   bool eof() const { return pos_ >= src_.size(); }

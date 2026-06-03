@@ -346,6 +346,11 @@ Token Lexer::raw_token() {
   if (c == '(') {
     if (at(pos_ + 1) == '*') {
       scan_comment();
+      if (is_doc_comment(start, pos_)) {
+        Token t = Token::make(Kind::DOCSTRING, start, pos_);
+        t.text = doc_body(start, pos_);
+        return t;
+      }
       Token t = Token::make(Kind::COMMENT, start, pos_);
       return t;  // filtered out by next()
     }
@@ -395,12 +400,88 @@ Token Lexer::next() {
   }
 }
 
+// Is the comment src_[s..e) a docstring?  `(**` (but not `(***…`), or `(**)`.
+bool Lexer::is_doc_comment(size_t s, size_t e) const {
+  if (e - s < 4) return false;  // shortest doc is "(**)"
+  if (!(src_[s] == '(' && src_[s + 1] == '*' && src_[s + 2] == '*')) return false;
+  if (e - s == 4 && src_[s + 3] == ')') return true;  // (**) empty docstring
+  return src_[s + 3] != '*';                           // (***… is a plain comment
+}
+std::string Lexer::doc_body(size_t s, size_t e) const {
+  // content between the leading "(**" and trailing "*)"
+  size_t b = s + 3, en = e >= 2 ? e - 2 : s;
+  return en > b ? std::string(src_.substr(b, en - b)) : std::string();
+}
+
 std::vector<Token> Lexer::tokenize() {
+  // Ports lexer.mll's `token`/`attach` state machine: between consecutive real
+  // tokens, accumulate comments/EOLs/docstrings and route the docstrings into the
+  // pre/post/floating/extra tables (see DocAttach).
+  enum Lines { NoLine, NewLine, BlankLine };
+  // doc_state: Initial | After(a) | Before(a,f,b); lists are most-recent-first.
+  struct DS { int tag = 0; std::vector<Docstring> a, f, b; };  // 0=Initial 1=After 2=Before
+  auto rev = [](std::vector<Docstring> v) { std::reverse(v.begin(), v.end()); return v; };
+
   std::vector<Token> out;
+  size_t prev_end = 0;  // post_pos: end of the previous real token
   for (;;) {
-    Token t = next();
-    out.push_back(t);
-    if (t.kind == Kind::TEOF) break;
+    Lines lines = NoLine;
+    DS docs;
+    Token tok;
+    for (;;) {
+      Token rt = raw_token();
+      if (rt.kind == Kind::COMMENT) {
+        if (lines == NewLine) lines = NoLine;  // NoLine/BlankLine unchanged
+        continue;
+      }
+      if (rt.kind == Kind::EOL) {
+        lines = lines == NoLine ? NewLine : BlankLine;
+        continue;
+      }
+      if (rt.kind == Kind::DOCSTRING) {
+        Docstring d{rt.text, rt.start, rt.end};
+        bool blank = lines == BlankLine;
+        if (docs.tag == 0) {                       // Initial
+          if (!blank) { docs.tag = 1; docs.a = {d}; }
+          else { docs.tag = 2; docs.b = {d}; }
+        } else if (docs.tag == 1) {                // After(a)
+          if (!blank) docs.a.insert(docs.a.begin(), d);
+          else { docs.tag = 2; docs.b = {d}; /* f stays [] */ }
+        } else {                                   // Before(a,f,b)
+          if (!blank) docs.b.insert(docs.b.begin(), d);
+          else {  // f := b @ f ; b := [d]
+            std::vector<Docstring> nf = docs.b;
+            nf.insert(nf.end(), docs.f.begin(), docs.f.end());
+            docs.f = std::move(nf);
+            docs.b = {d};
+          }
+        }
+        lines = NoLine;
+        continue;
+      }
+      tok = rt;  // a real token: attach the accumulated docs and stop
+      break;
+    }
+    size_t pre_pos = tok.start;
+    bool blank = lines == BlankLine;
+    auto put = [&](std::unordered_map<size_t, std::vector<Docstring>>& m, size_t k,
+                   std::vector<Docstring> v) { if (!v.empty()) m[k] = std::move(v); };
+    if (docs.tag == 1) {  // After(a)
+      put(docs_.post, prev_end, rev(docs.a));
+      if (!blank) put(docs_.pre, pre_pos, docs.a);
+      else put(docs_.pre_extra, pre_pos, rev(docs.a));
+    } else if (docs.tag == 2) {  // Before(a,f,b)
+      put(docs_.post, prev_end, rev(docs.a));
+      std::vector<Docstring> fb = rev(docs.f);  // rev_append f (rev b) = rev f ++ rev b
+      { auto rb = rev(docs.b); fb.insert(fb.end(), rb.begin(), rb.end()); }
+      put(docs_.post_extra, prev_end, fb);
+      put(docs_.pre_extra, pre_pos, rev(docs.a));
+      if (!blank) { put(docs_.floating, pre_pos, rev(docs.f)); put(docs_.pre, pre_pos, docs.b); }
+      else put(docs_.floating, pre_pos, fb);
+    }
+    out.push_back(tok);
+    prev_end = tok.end;
+    if (tok.kind == Kind::TEOF) break;
   }
   return out;
 }

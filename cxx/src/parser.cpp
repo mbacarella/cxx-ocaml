@@ -91,25 +91,62 @@ bool is_atom_start(Kind k) {
 class Parser {
  public:
   explicit Parser(std::string_view src) : src_(src) {
-    tokens_ = Lexer(src).tokenize();
+    Lexer lex(src);
+    tokens_ = lex.tokenize();
+    docs_ = lex.doc_attach();
     line_starts_.push_back(0);
     for (size_t i = 0; i < src.size(); ++i)
       if (src[i] == '\n') line_starts_.push_back(static_cast<int>(i + 1));
   }
 
+  // --- docstrings (ocaml.doc / ocaml.text) ---
+  Structure doc_payload(const Docstring& d) {
+    Location l = span(position(d.start), position(d.end));
+    Constant c{Pconst_string{d.body, l, std::nullopt}, l};
+    StructureItem si{Pstr_eval{E({Pexp_constant{std::move(c)}, l})}, l};
+    Structure s; s.push_back(std::move(si));
+    return s;
+  }
+  Attribute doc_attr(const Docstring& d) { return Attribute{"ocaml.doc", doc_payload(d)}; }
+  // get_pre_docs / get_post_docs: the first docstring of the list, prepended/appended.
+  void attach_docs(Attributes& attrs, size_t startCnum, size_t endCnum) {
+    auto pit = docs_.pre.find(startCnum);
+    if (pit != docs_.pre.end() && !pit->second.empty())
+      attrs.insert(attrs.begin(), doc_attr(pit->second.front()));
+    auto qit = docs_.post.find(endCnum);
+    if (qit != docs_.post.end() && !qit->second.empty())
+      attrs.push_back(doc_attr(qit->second.front()));
+  }
+  void emit_text(Structure& items, const std::unordered_map<size_t, std::vector<Docstring>>& m,
+                 size_t key) {
+    auto it = m.find(key);
+    if (it == m.end()) return;
+    for (auto& d : it->second) {
+      Location l = span(position(d.start), position(d.end));
+      items.push_back(StructureItem{Pstr_attribute{"ocaml.text", doc_payload(d)}, l});
+    }
+  }
+
   Structure parse_structure() { return parse_structure_until(Kind::TEOF); }
   Structure parse_structure_until(Kind stop) {
     Structure items;
+    size_t structStart = cur().start;
+    emit_text(items, docs_.pre_extra, structStart);  // extra_str leading text
+    size_t lastEnd = structStart;
     while (cur().kind != Kind::TEOF && cur().kind != stop) {
       if (cur().kind == Kind::SEMISEMI) { advance(); continue; }
+      emit_text(items, docs_.floating, cur().start);  // text_str before each item
       items.push_back(parse_structure_item());
+      lastEnd = items.back().loc.end.cnum;
     }
+    emit_text(items, docs_.post_extra, lastEnd);  // extra_str trailing text
     return items;
   }
 
  private:
   std::string_view src_;
   std::vector<Token> tokens_;
+  DocAttach docs_;
   std::vector<int> line_starts_;
   size_t idx_ = 0;
 
@@ -1677,6 +1714,9 @@ class Parser {
         return StructureItem{Pstr_eval{std::move(e)}, l};
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      if (!binds.empty())  // docs attach to the first binding (post only if single)
+        attach_docs(binds[0].attrs, l.start.cnum,
+                    binds.size() == 1 ? l.end.cnum : static_cast<size_t>(-1));
       return StructureItem{Pstr_value{rf, std::move(binds)}, l};
     }
     if (t.kind == Kind::INCLUDE) {
@@ -1722,6 +1762,7 @@ class Parser {
         decls.push_back(parse_type_declaration(ds));
       }
       Location l = span(d0, position(tokens_[idx_ - 1].end));
+      attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
       return StructureItem{Pstr_type{rf, std::move(decls)}, l};
     }
     if (t.kind == Kind::OPEN) {
