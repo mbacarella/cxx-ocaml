@@ -1404,6 +1404,14 @@ class Parser {
       LongidentLoc name = parse_longident_path();
       return box(CoreType{Ptyp_class{name, {}}, span(position(t.start), name.loc.end)});
     }
+    if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]
+      advance();
+      std::string name = parse_attr_name();
+      Structure payload = parse_structure_until(Kind::RBRACKET);
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return box(CoreType{Ptyp_extension{std::move(name), std::move(payload)},
+                          span(position(t.start), position(c.end))});
+    }
     if (t.kind == Kind::LPAREN && peek(1).kind == Kind::MODULE) {  // (module S [with type …])
       advance(); advance();  // ( module
       LongidentLoc path = parse_longident_path();

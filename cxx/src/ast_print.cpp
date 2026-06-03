@@ -126,6 +126,9 @@ struct Printer {
       for (auto& var : v->vars) s += " '" + var;  // typevars: ` 'a 'b`
       line(j, s);
       core_type(j, *v->type);
+    } else if (auto* v = std::get_if<Ptyp_extension>(&t.desc)) {
+      line(j, "Ptyp_extension \"" + v->name + "\"");
+      structure_list(j, v->payload);
     } else if (auto* v = std::get_if<Ptyp_open>(&t.desc)) {
       line(j, "Ptyp_open \"" + lid_loc(v->mod_) + "\"");
       core_type(j, *v->type);
