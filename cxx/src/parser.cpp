@@ -956,7 +956,7 @@ class Parser {
       case Kind::FUN: {
         advance();
         std::vector<FunctionParam> params;
-        while (cur().kind != Kind::MINUSGREATER) params.push_back(parse_param());
+        while (cur().kind != Kind::MINUSGREATER) parse_params_into(params);
         expect(Kind::MINUSGREATER, "->");
         // `fun (type a) … -> e` with *only* newtype params is a Pexp_newtype chain.
         bool all_newtype = !params.empty();
@@ -1705,6 +1705,23 @@ class Parser {
     return k == Kind::LABEL || k == Kind::OPTLABEL || k == Kind::TILDE ||
            k == Kind::QUESTION || is_simple_pattern_start(k);
   }
+  // Parse one parameter group into `out`.  `(type a b c)` yields several newtype
+  // params sharing the parens location (ghost when there is more than one).
+  void parse_params_into(std::vector<FunctionParam>& out) {
+    if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
+      Token lp = cur(); advance(); advance();  // ( type
+      std::vector<Token> ids;
+      while (cur().kind == Kind::LIDENT) { ids.push_back(cur()); advance(); }
+      if (ids.empty()) throw ParseError("expected type name", cur().start);
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      bool ghost = ids.size() > 1;
+      Location pl{position(lp.start), position(c.end), ghost};
+      for (auto& id : ids)
+        out.push_back(FunctionParam{Pparam_newtype{StringLoc{id.text, tokloc(id)}, pl}});
+      return;
+    }
+    out.push_back(parse_param());
+  }
   FunctionParam parse_param() {
     Token t = cur();
     // (type a)  locally abstract type parameter
@@ -1868,7 +1885,7 @@ class Parser {
 
     std::vector<FunctionParam> params;
     while (cur().kind != Kind::EQUAL && cur().kind != Kind::COLON)
-      params.push_back(parse_param());
+      parse_params_into(params);
     std::optional<ValueConstraint> vconstr;     // `let x : t = e`  (params empty)
     std::optional<FunctionConstraint> fconstr;  // `let f p.. : t = e`  (return constraint)
     if (cur().kind == Kind::COLON) {
