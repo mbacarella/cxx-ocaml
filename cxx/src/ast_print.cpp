@@ -861,10 +861,15 @@ struct Printer {
 
   void value_constraint(int i, const ValueConstraint& vc) {
     if (auto* c = std::get_if<Pvc_constraint>(&vc)) {
-      if (!c->univars.empty()) {  // `<type> "a" (loc) "b" (loc).`
-        std::string s = "<type>";
-        for (auto& u : c->univars) s += " " + str_loc(u);
-        line(i, s + ".");
+      if (!c->univars.empty()) {
+        // printast emits each var via a Format `@ ` break, but uses literal `\n`
+        // elsewhere so Format's column counter never resets and every break fires:
+        // the first var stays on the `<type>` line, each subsequent var prints on
+        // its own line at column 0, and `.` follows the last var.
+        const auto& us = c->univars;
+        line(i, "<type> " + str_loc(us[0]) + (us.size() == 1 ? "." : ""));
+        for (size_t k = 1; k < us.size(); ++k)
+          line(0, str_loc(us[k]) + (k + 1 == us.size() ? "." : ""));
       }
       core_type(i, *c->typ);
     } else {
