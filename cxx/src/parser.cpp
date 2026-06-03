@@ -1667,9 +1667,22 @@ class Parser {
                        is_param_start(peek(1).kind)));
     if (!val_ident) {
       Pattern pat = parse_pattern();
+      // `let <pat> : t = e`  /  `let <pat> :> t = e`  — a binding-level constraint
+      // (printed as a separate core_type in <def>), not a Ppat_constraint.
+      std::optional<ValueConstraint> pconstr;
+      if (cur().kind == Kind::COLON) {
+        advance();
+        CoreTypeBox ty = parse_core_type();
+        if (cur().kind == Kind::COLONGREATER) {
+          advance();
+          pconstr = Pvc_coercion{std::move(ty), parse_core_type()};
+        } else {
+          pconstr = Pvc_constraint{{}, std::move(ty)};
+        }
+      }
       expect(Kind::EQUAL, "=");
       ExprBox body = parse_expr();
-      return ValueBinding{std::move(pat), std::move(body), std::nullopt};
+      return ValueBinding{std::move(pat), std::move(body), std::move(pconstr)};
     }
     StringLoc name;
     if (op_ident) {
