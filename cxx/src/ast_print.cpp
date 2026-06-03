@@ -75,6 +75,15 @@ struct Printer {
 
   void line(int i, const std::string& s) { os << ind(i) << s << '\n'; }
 
+  // labeled_tuple_element label: `Some\n "x"` or `None` (empty labels vec = all None)
+  void tuple_label(int i, const std::vector<std::optional<std::string>>& labels, size_t k) {
+    if (k < labels.size() && labels[k]) {
+      line(i, "Some");
+      line(i + 1, "\"" + *labels[k] + "\"");
+    } else {
+      line(i, "None");
+    }
+  }
   void attributes(int i, const Attributes& attrs) {  // printast `attributes i`
     for (auto& a : attrs) {
       line(i + 1, "attribute \"" + a.name + "\"");
@@ -96,7 +105,10 @@ struct Printer {
     } else if (auto* v = std::get_if<Ptyp_tuple>(&t.desc)) {
       line(j, "Ptyp_tuple");
       line(j, "[");
-      for (auto& el : v->elems) { line(j + 1, "None"); core_type(j + 1, *el); }
+      for (size_t k = 0; k < v->elems.size(); ++k) {
+        tuple_label(j + 1, v->labels, k);
+        core_type(j + 1, *v->elems[k]);
+      }
       line(j, "]");
     } else if (auto* v = std::get_if<Ptyp_constr>(&t.desc)) {
       line(j, "Ptyp_constr " + lid_loc(v->id));
@@ -202,7 +214,10 @@ struct Printer {
     } else if (auto* v = std::get_if<Ppat_tuple>(&p.desc)) {
       os << ind(j) << "Ppat_tuple\n " << closed_flag(v->closed) << '\n';  // note: literal layout
       line(j, "[");
-      for (auto& el : v->elems) { line(j + 1, "None"); pattern(j + 1, *el); }
+      for (size_t k = 0; k < v->elems.size(); ++k) {
+        tuple_label(j + 1, v->labels, k);
+        pattern(j + 1, *v->elems[k]);
+      }
       line(j, "]");
     } else if (auto* v = std::get_if<Ppat_construct>(&p.desc)) {
       line(j, "Ppat_construct " + lid_loc(v->id));
@@ -333,9 +348,9 @@ struct Printer {
     } else if (auto* v = std::get_if<Pexp_tuple>(&e.desc)) {
       line(j, "Pexp_tuple");
       line(j, "[");
-      for (auto& el : v->elems) {
-        line(j + 1, "None");  // labeled_tuple_element: label option
-        expression(j + 1, *el);
+      for (size_t k = 0; k < v->elems.size(); ++k) {
+        tuple_label(j + 1, v->labels, k);  // labeled_tuple_element: label option
+        expression(j + 1, *v->elems[k]);
       }
       line(j, "]");
     } else if (auto* v = std::get_if<Pexp_ifthenelse>(&e.desc)) {

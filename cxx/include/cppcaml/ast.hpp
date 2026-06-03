@@ -78,7 +78,8 @@ using CoreTypeBox = Box<CoreType>;
 struct Ptyp_any {};
 struct Ptyp_var { std::string name; };
 struct Ptyp_arrow { ArgLabel label; CoreTypeBox dom; CoreTypeBox cod; };
-struct Ptyp_tuple { std::vector<CoreTypeBox> elems; };
+struct Ptyp_tuple { std::vector<CoreTypeBox> elems;
+                    std::vector<std::optional<std::string>> labels; };  // empty = all None
 struct Ptyp_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
 struct Rtag { std::string name; bool constant; std::vector<CoreTypeBox> types; };
 struct Rinherit { CoreTypeBox ct; };
@@ -115,7 +116,8 @@ using PatBox = Box<Pattern>;
 struct Ppat_any {};
 struct Ppat_var { StringLoc name; };
 struct Ppat_constant { Constant c; };
-struct Ppat_tuple { std::vector<PatBox> elems; ClosedFlag closed = ClosedFlag::Closed; };
+struct Ppat_tuple { std::vector<PatBox> elems; ClosedFlag closed = ClosedFlag::Closed;
+                    std::vector<std::optional<std::string>> labels; };  // empty = all None
 struct Ppat_construct { LongidentLoc id; std::optional<PatBox> arg;
                         std::vector<StringLoc> vars; };  // Constr (type a b) pat
 struct Ppat_or { PatBox l; PatBox r; };
@@ -164,7 +166,8 @@ struct Pexp_function {
   std::optional<FunctionConstraint> constraint_;  // `: t` / `: t :> t2` return constraint
   Box<FunctionBody> body;
 };
-struct Pexp_tuple { std::vector<ExprBox> elems; };  // all labels None in fragment
+struct Pexp_tuple { std::vector<ExprBox> elems;
+                    std::vector<std::optional<std::string>> labels; };  // empty = all None
 struct Pexp_ifthenelse { ExprBox cond; ExprBox then_; std::optional<ExprBox> else_; };
 struct Case;
 struct Pexp_construct { LongidentLoc id; std::optional<ExprBox> arg; };

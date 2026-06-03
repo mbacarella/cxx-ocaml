@@ -859,15 +859,38 @@ class Parser {
     return left;
   }
 
+  // One (possibly labeled) tuple element: `~x:e`, `~x` (punning), or `e`.
+  std::pair<std::optional<std::string>, ExprBox> parse_labeled_tuple_elem() {
+    if (cur().kind == Kind::LABEL) {  // ~x:  -> label, value
+      Token lt = cur(); advance();
+      return {lt.text, parse_binop(0)};
+    }
+    if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x  (punning)
+      advance();
+      Token id = cur(); advance();
+      ExprBox e = E({Pexp_ident{LongidentLoc{{Lident{id.text}}, tokloc(id)}}, tokloc(id)});
+      return {id.text, std::move(e)};
+    }
+    return {std::nullopt, parse_binop(0)};
+  }
   ExprBox parse_tuple() {
-    ExprBox first = parse_binop(0);
-    if (cur().kind != Kind::COMMA) return first;
+    Position s = position(cur().start);
+    auto first = parse_labeled_tuple_elem();
+    if (cur().kind != Kind::COMMA) return std::move(first.second);  // single element
     std::vector<ExprBox> elems;
-    Position s = first->loc.start;
-    elems.push_back(std::move(first));
-    while (cur().kind == Kind::COMMA) { advance(); elems.push_back(parse_binop(0)); }
+    std::vector<std::optional<std::string>> labels;
+    elems.push_back(std::move(first.second));
+    labels.push_back(first.first);
+    while (cur().kind == Kind::COMMA) {
+      advance();
+      auto e = parse_labeled_tuple_elem();
+      elems.push_back(std::move(e.second));
+      labels.push_back(e.first);
+    }
     Location l = span(s, elems.back()->loc.end);
-    return E({Pexp_tuple{std::move(elems)}, l});
+    bool any = false; for (auto& x : labels) if (x) any = true;
+    if (!any) labels.clear();  // ordinary tuple: keep labels empty (printer emits None)
+    return E({Pexp_tuple{std::move(elems), std::move(labels)}, l});
   }
 
   static bool expr_starts(Kind k) {
@@ -1158,21 +1181,55 @@ class Parser {
   // includes a parenthesized child's parens), not the child node's own loc.
   CoreTypeBox parse_type_arrow() {
     Position symstart = position(cur().start);
-    // labeled/optional arrow domain: `?x:t -> …`, `~`-free `x:t -> …`
-    ArgLabel label = Nolabel{};
-    if (cur().kind == Kind::OPTLABEL) { label = Optional{cur().text}; advance(); }
-    else if (cur().kind == Kind::LABEL) { label = Labelled{cur().text}; advance(); }
+    // Leading label: `~x:`/`?x:` are unambiguously arrow labels; a bare `x:` is the
+    // first tuple element's label *unless* an arrow follows (then it moves to the arrow).
+    bool opt = false, must_arrow = false;
+    std::optional<std::string> firstLabel;
+    if (cur().kind == Kind::OPTLABEL) { firstLabel = cur().text; opt = true; must_arrow = true; advance(); }
+    else if (cur().kind == Kind::LABEL) { firstLabel = cur().text; must_arrow = true; advance(); }
     else if (cur().kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
-      label = Labelled{cur().text}; advance(); advance();  // x :
+      firstLabel = cur().text; advance(); advance();  // x :   (tentative tuple label)
     }
-    CoreTypeBox t = parse_type_tuple();
-    if (cur().kind == Kind::MINUSGREATER) {
+    CoreTypeBox first = parse_type_app();
+    std::vector<CoreTypeBox> elems;
+    std::vector<std::optional<std::string>> labels;
+    elems.push_back(std::move(first));
+    labels.push_back(must_arrow ? std::nullopt : firstLabel);  // ~x:/?x: are not tuple labels
+    while (cur().kind == Kind::STAR) {  // t * lab:t * …
       advance();
+      std::optional<std::string> elab;
+      if (cur().kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
+        elab = cur().text; advance(); advance();
+      }
+      elems.push_back(parse_type_app());
+      labels.push_back(elab);
+    }
+    bool is_tuple = elems.size() > 1;
+    auto clear_none = [](std::vector<std::optional<std::string>>& ls) {
+      for (auto& x : ls) if (x) return; ls.clear();
+    };
+    auto build_dom = [&]() -> CoreTypeBox {
+      if (!is_tuple) return std::move(elems[0]);
+      Location tl = span(elems.front()->loc.start, elems.back()->loc.end);
+      clear_none(labels);
+      return box(CoreType{Ptyp_tuple{std::move(elems), std::move(labels)}, tl});
+    };
+    if (must_arrow || cur().kind == Kind::MINUSGREATER) {
+      ArgLabel alabel = Nolabel{};
+      if (must_arrow) alabel = opt ? ArgLabel{Optional{*firstLabel}} : ArgLabel{Labelled{*firstLabel}};
+      else if (firstLabel) { alabel = Labelled{*firstLabel}; labels[0] = std::nullopt; }
+      CoreTypeBox dom = build_dom();
+      expect(Kind::MINUSGREATER, "->");
       CoreTypeBox cod = parse_type_arrow();
       Location l = span(symstart, position(tokens_[idx_ - 1].end));
-      return box(CoreType{Ptyp_arrow{std::move(label), std::move(t), std::move(cod)}, l});
+      return box(CoreType{Ptyp_arrow{std::move(alabel), std::move(dom), std::move(cod)}, l});
     }
-    return t;
+    if (is_tuple) {
+      Location tl = span(symstart, position(tokens_[idx_ - 1].end));
+      clear_none(labels);
+      return box(CoreType{Ptyp_tuple{std::move(elems), std::move(labels)}, tl});
+    }
+    return std::move(elems[0]);  // single type, no arrow (a lone `x:` label is dropped)
   }
   CoreTypeBox parse_type_tuple() {
     Position symstart = position(cur().start);
@@ -1402,15 +1459,39 @@ class Parser {
     }
     return p;
   }
+  // One (possibly labeled) tuple-pattern element: `~x:p`, `~x` (punning), or `p`.
+  std::pair<std::optional<std::string>, Pattern> parse_labeled_pat_elem() {
+    if (cur().kind == Kind::LABEL) {  // ~x:p
+      Token lt = cur(); advance();
+      return {lt.text, parse_pat_cons()};
+    }
+    if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x  (punning)
+      advance();
+      Token id = cur(); advance();
+      return {id.text, Pattern{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)}};
+    }
+    return {std::nullopt, parse_pat_cons()};
+  }
   Pattern parse_pat_tuple() {
-    Pattern p = parse_pat_cons();
-    if (cur().kind != Kind::COMMA) return p;
+    Position s = position(cur().start);
+    auto first = parse_labeled_pat_elem();
+    if (cur().kind != Kind::COMMA) return std::move(first.second);
     std::vector<PatBox> elems;
-    Position s = p.loc.start;
-    elems.push_back(box(std::move(p)));
-    while (cur().kind == Kind::COMMA) { advance(); elems.push_back(box(parse_pat_cons())); }
-    Location l = span(s, elems.back()->loc.end);
-    return Pattern{Ppat_tuple{std::move(elems), ClosedFlag::Closed}, l};
+    std::vector<std::optional<std::string>> labels;
+    ClosedFlag closed = ClosedFlag::Closed;
+    elems.push_back(box(std::move(first.second)));
+    labels.push_back(first.first);
+    while (cur().kind == Kind::COMMA) {
+      advance();
+      if (cur().kind == Kind::DOTDOT) { advance(); closed = ClosedFlag::Open; break; }  // (.., ..)
+      auto e = parse_labeled_pat_elem();
+      elems.push_back(box(std::move(e.second)));
+      labels.push_back(e.first);
+    }
+    Location l = span(s, position(tokens_[idx_ - 1].end));
+    bool any = false; for (auto& x : labels) if (x) any = true;
+    if (!any) labels.clear();
+    return Pattern{Ppat_tuple{std::move(elems), closed, std::move(labels)}, l};
   }
   Pattern parse_pat_cons() {
     Pattern p = parse_pat_app();
