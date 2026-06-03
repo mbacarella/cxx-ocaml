@@ -247,6 +247,10 @@ struct Printer {
     } else if (auto* v = std::get_if<Ppat_open>(&p.desc)) {
       line(j, "Ppat_open \"" + lid_loc(v->mod_) + "\"");
       pattern(j, *v->p);
+    } else if (auto* v = std::get_if<Ppat_effect>(&p.desc)) {
+      line(j, "Ppat_effect");
+      pattern(j, *v->eff);
+      pattern(j, *v->cont);
     }
   }
 
@@ -646,11 +650,17 @@ struct Printer {
       line(j, "Pmod_constraint");
       module_expr(j, *c->me);
       module_type(j, *c->mt);
-    } else {
-      auto& a = std::get<Pmod_apply>(m.desc);
+    } else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) {
       line(j, "Pmod_apply");
-      module_expr(j, *a.f);
-      module_expr(j, *a.arg);
+      module_expr(j, *a->f);
+      module_expr(j, *a->arg);
+    } else if (auto* a = std::get_if<Pmod_apply_unit>(&m.desc)) {
+      line(j, "Pmod_apply_unit");
+      module_expr(j, *a->f);
+    } else {
+      auto& u = std::get<Pmod_unpack>(m.desc);
+      line(j, "Pmod_unpack");
+      expression(j, *u.e);
     }
   }
 

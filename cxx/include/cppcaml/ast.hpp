@@ -128,11 +128,12 @@ struct Ppat_type { LongidentLoc id; };                  // #tconst
 struct Ppat_unpack { StrOptLoc name; };                 // (module M)  (package type deferred)
 struct Ppat_extension { std::string name; Structure payload; };  // [%id]
 struct Ppat_open { LongidentLoc mod_; PatBox p; };      // M.(P)
+struct Ppat_effect { PatBox eff; PatBox cont; };        // effect P, k
 struct Pattern {
   std::variant<Ppat_any, Ppat_var, Ppat_constant, Ppat_tuple, Ppat_construct,
                Ppat_or, Ppat_alias, Ppat_constraint, Ppat_record, Ppat_lazy,
                Ppat_interval, Ppat_variant, Ppat_exception, Ppat_array,
-               Ppat_type, Ppat_unpack, Ppat_extension, Ppat_open>
+               Ppat_type, Ppat_unpack, Ppat_extension, Ppat_open, Ppat_effect>
       desc;
   Location loc;
   Attributes attrs;
@@ -342,8 +343,12 @@ struct ModuleExpr;
 struct Pmod_functor { FunctorParam param; Box<ModuleExpr> body; };
 struct Pmod_constraint { Box<ModuleExpr> me; ModuleTypeBox mt; };
 struct Pmod_apply { Box<ModuleExpr> f; Box<ModuleExpr> arg; };  // F(X)
+struct Pmod_apply_unit { Box<ModuleExpr> f; };                  // F()
+struct Pmod_unpack { ExprBox e; };                             // (val e [: pkg])
 struct ModuleExpr {
-  std::variant<Pmod_ident, Pmod_structure, Pmod_functor, Pmod_constraint, Pmod_apply> desc;
+  std::variant<Pmod_ident, Pmod_structure, Pmod_functor, Pmod_constraint, Pmod_apply,
+               Pmod_apply_unit, Pmod_unpack>
+      desc;
   Location loc;
 };
 struct ModuleBinding { StrOptLoc name; ModuleExpr expr; };

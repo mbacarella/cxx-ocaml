@@ -1021,6 +1021,14 @@ class Parser {
     }
   }
   Pattern parse_pattern() {
+    if (cur().kind == Kind::EFFECT) {  // effect P, k  (effect handler pattern)
+      Token t = cur(); advance();
+      Pattern eff = parse_pat_app();
+      expect(Kind::COMMA, ",");
+      Pattern cont = parse_simple_pattern();
+      Location l = span(position(t.start), cont.loc.end);
+      return Pattern{Ppat_effect{box(std::move(eff)), box(std::move(cont))}, l};
+    }
     if (cur().kind == Kind::EXCEPTION) {
       Token t = cur(); advance();
       Pattern p = parse_pat_alias();
@@ -2114,8 +2122,13 @@ class Parser {
   ModuleExpr parse_module_expr() {
     Position symstart = position(cur().start);
     ModuleExpr me = parse_module_expr_head();
-    while (cur().kind == Kind::LPAREN) {  // F(X)  functor application
+    while (cur().kind == Kind::LPAREN) {  // F(X) / F()  functor application
       advance();
+      if (cur().kind == Kind::RPAREN) {  // F ()  generative application
+        Token c = cur(); advance();
+        me = ModuleExpr{Pmod_apply_unit{box(std::move(me))}, span(symstart, position(c.end))};
+        continue;
+      }
       ModuleExpr arg = parse_module_expr();
       Token c = cur(); expect(Kind::RPAREN, ")");
       me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))},
@@ -2138,6 +2151,33 @@ class Parser {
       ModuleExpr body = parse_module_expr();
       return ModuleExpr{Pmod_functor{std::move(param), box(std::move(body))},
                         span(position(t.start), body.loc.end)};
+    }
+    if (t.kind == Kind::LPAREN) {
+      advance();
+      if (cur().kind == Kind::VAL) {  // (val e [: pkg])  first-class module unpack
+        advance();
+        ExprBox e = parse_expr();
+        if (cur().kind == Kind::COLON) {
+          advance();
+          LongidentLoc pkgpath = parse_longident_path();
+          Location pkgloc = pkgpath.loc;
+          auto pkg = box(CoreType{Ptyp_package{std::move(pkgpath), {}}, pkgloc});
+          Location cl = span(e->loc.start, pkg->loc.end);
+          e = E({Pexp_constraint{std::move(e), std::move(pkg)}, cl});
+        }
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        return ModuleExpr{Pmod_unpack{std::move(e)}, span(position(t.start), position(c.end))};
+      }
+      ModuleExpr me = parse_module_expr();
+      if (cur().kind == Kind::COLON) {  // (me : mt)
+        advance();
+        ModuleType mt = parse_module_type();
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        return ModuleExpr{Pmod_constraint{box(std::move(me)), box(std::move(mt))},
+                          span(position(t.start), position(c.end))};
+      }
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      return me;  // grouping keeps inner loc
     }
     if (t.kind == Kind::UIDENT) {
       LongidentLoc mp = parse_longident_path();
