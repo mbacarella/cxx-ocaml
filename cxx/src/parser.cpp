@@ -155,6 +155,7 @@ class Parser {
   DocAttach docs_;
   std::vector<int> line_starts_;
   size_t idx_ = 0;
+  Position last_seq_end_{};  // end of the most recent parse_expr, incl. a trailing `;`
 
   const Token& cur() const { return tokens_[idx_]; }
   const Token& peek(size_t n) const {
@@ -825,8 +826,10 @@ class Parser {
     }
     // seq_expr: `expr SEMI` — a trailing `;` is part of the sequence expression.
     // It is consumed (extending the enclosing item's span) but does not enlarge
-    // the expression node's own location.
-    if (cur().kind == Kind::SEMI) advance();
+    // the expression node's own location; callers that need the post-`;` end use
+    // last_seq_end_.
+    if (cur().kind == Kind::SEMI) { last_seq_end_ = position(cur().end); advance(); }
+    else last_seq_end_ = e->loc.end;
     return e;
   }
 
@@ -1713,6 +1716,7 @@ class Parser {
     }
     expect(Kind::EQUAL, "=");
     ExprBox body = parse_expr();
+    Position bodyEnd = last_seq_end_;  // includes a trailing `;` if present
 
     if (params.empty() && !fconstr)
       return ValueBinding{std::move(namepat), std::move(body), std::move(vconstr)};
@@ -1722,7 +1726,7 @@ class Parser {
       return std::get<Pparam_newtype>(p.desc).loc;
     };
     Position fstart = params.empty() ? body->loc.start : param_loc(params.front()).start;
-    Location floc = span(fstart, body->loc.end, /*ghost=*/true);
+    Location floc = span(fstart, bodyEnd, /*ghost=*/true);
     auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
     ExprBox fn = E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)}, floc});
     return ValueBinding{std::move(namepat), std::move(fn), std::nullopt};
@@ -1889,8 +1893,9 @@ class Parser {
         Location fl = span(params[i].first, me.loc.end);
         me = ModuleExpr{Pmod_functor{std::move(params[i].second), box(std::move(me))}, fl};
       }
-      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       Attributes mattrs;
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); mattrs.push_back(parse_attribute_body()); }
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(mattrs, l.start.cnum, l.end.cnum);
       return StructureItem{Pstr_module{ModuleBinding{std::move(name), std::move(me), std::move(mattrs)}}, l};
     }
