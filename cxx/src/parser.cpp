@@ -1,3 +1,4 @@
+#include <set>
 // Recursive-descent + Pratt parser; see parser.hpp. Mirrors the menhir grammar's
 // node shapes, locations (incl. ghost locs for desugared function bindings), and
 // operator precedence, validated against `ocamlc -dparsetree`.
@@ -982,8 +983,9 @@ class Parser {
     Token t = cur();
     switch (t.kind) {
       case Kind::LET: {
-        if (peek(1).kind == Kind::OPEN || peek(1).kind == Kind::MODULE) {
-          // let open M in e  /  let module M = me in e  -> Pexp_struct_item
+        if (peek(1).kind == Kind::OPEN || peek(1).kind == Kind::MODULE ||
+            peek(1).kind == Kind::EXCEPTION) {
+          // let open M / let module M = me / let exception E, all `in e` -> Pexp_struct_item
           advance();  // let
           StructureItem si = parse_structure_item();
           expect(Kind::IN, "in");
@@ -1201,6 +1203,34 @@ class Parser {
       idx_ = save;  // not `'a. …` — a plain type starting with a type variable
     }
     return parse_core_type();
+  }
+  // Typ.varify_constructors: replace each nullary `Ptyp_constr (Lident n)` whose
+  // name is a locally-abstract newtype with the corresponding `Ptyp_var n`.
+  void varify(CoreType& t, const std::set<std::string>& names) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      if (c->args.empty()) {
+        if (auto* lid = std::get_if<Lident>(&c->id.txt.v)) {
+          if (names.count(lid->name)) { std::string nm = lid->name; t.desc = Ptyp_var{nm}; return; }
+        }
+      }
+      for (auto& a : c->args) varify(*a, names);
+    } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      varify(*a->dom, names); varify(*a->cod, names);
+    } else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : tu->elems) varify(*e, names);
+    } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+      varify(*al->type, names);
+    } else if (auto* po = std::get_if<Ptyp_poly>(&t.desc)) {
+      varify(*po->type, names);
+    } else if (auto* op = std::get_if<Ptyp_open>(&t.desc)) {
+      varify(*op->type, names);
+    } else if (auto* cl = std::get_if<Ptyp_class>(&t.desc)) {
+      for (auto& a : cl->args) varify(*a, names);
+    } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
+      for (auto& r : v->rows)
+        if (auto* tag = std::get_if<Rtag>(&r)) for (auto& ty : tag->types) varify(*ty, names);
+        else varify(*std::get<Rinherit>(r).ct, names);
+    }
   }
   CoreTypeBox parse_core_type() {
     CoreTypeBox t = parse_type_arrow();
@@ -3073,6 +3103,35 @@ class Parser {
       if (virt) {
         expect(Kind::COLON, ":");
         kind = Cfk_virtual{parse_possibly_poly_type()};
+      } else if (cur().kind == Kind::COLON && peek(1).kind == Kind::TYPE) {
+        // method m : type a b. T = e   ->   wrap_type_annotation desugaring
+        advance(); advance();  // : type
+        Position newtypeStart = position(cur().start);
+        std::vector<StringLoc> newtypes;
+        while (cur().kind == Kind::LIDENT) {
+          newtypes.push_back(StringLoc{cur().text, tokloc(cur())});
+          advance();
+        }
+        expect(Kind::DOT, ".");
+        size_t tsave = idx_;
+        CoreTypeBox T = parse_core_type();   // for the constraint (non-varified)
+        idx_ = tsave;
+        CoreTypeBox Tv = parse_core_type();  // re-parsed copy for the poly type
+        expect(Kind::EQUAL, "=");
+        ExprBox e = parse_expr();
+        Position bodyEnd = last_seq_end_;
+        Location innerLoc = span(name.loc.start, bodyEnd);  // $sloc (non-ghost)
+        ExprBox wrapped = E({Pexp_constraint{std::move(e), std::move(T)}, innerLoc});
+        for (int i = static_cast<int>(newtypes.size()) - 1; i >= 0; --i)
+          wrapped = E({Pexp_newtype{newtypes[i], std::move(wrapped)}, innerLoc});
+        std::set<std::string> nameset;
+        std::vector<std::string> varlist;
+        for (auto& n : newtypes) { nameset.insert(n.txt); varlist.push_back(n.txt); }
+        varify(*Tv, nameset);
+        Location polyTloc = innerLoc; polyTloc.ghost = true;
+        CoreTypeBox polyT = box(CoreType{Ptyp_poly{std::move(varlist), std::move(Tv)}, polyTloc});
+        Location pl = span(newtypeStart, bodyEnd, /*ghost=*/true);  // poly_exp_loc
+        kind = Cfk_concrete{ovr, E({Pexp_poly{std::move(wrapped), std::move(polyT)}, pl})};
       } else if (cur().kind == Kind::COLON) {
         advance();
         Position ts = position(cur().start);  // $startpos of possibly_poly_type
