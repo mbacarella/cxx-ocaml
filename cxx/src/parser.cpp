@@ -1464,6 +1464,11 @@ class Parser {
       ClosedFlag closed = (t.kind == Kind::LBRACKETGREATER) ? ClosedFlag::Open : ClosedFlag::Closed;
       std::vector<RowField> rows;
       if (cur().kind == Kind::BAR) advance();
+      if (cur().kind == Kind::RBRACKET) {  // `[> ]` / `[< ]` — empty row list
+        Token c = cur(); advance();
+        return box(CoreType{.desc = Ptyp_variant{std::move(rows), closed, std::nullopt},
+                            .loc = span(position(t.start), position(c.end))});
+      }
       rows.push_back(parse_row_field());
       while (cur().kind == Kind::BAR) { advance(); rows.push_back(parse_row_field()); }
       std::optional<std::vector<std::string>> labels;
