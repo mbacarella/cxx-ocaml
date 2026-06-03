@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **59.2%** parity over the 400-file subset (**42.5%** over the full 1853-file corpus) vs `ocamlc -dparsetree`. Broad surface incl. GADTs, poly-variants, type extensions, newtype params, attributes/extensions, modules/signatures/functors (`Pmod_apply` too), first-class modules `(module M)`, coercions, `[%ext]`, `let*`, `e#m`, setfield/array-set, the missing patterns, **and the full object/class subsystem** (see below). Climb (400-subset): … → 50.2 → 51.5 → 54.2 → 54.8 → 56.5 → 57.5 → 58.0 → **59.2**. Switched to a broad-implement-then-corpus-diff loop (per review) — much faster than per-construct. Key recurring fix: **menhir computes a compound node's loc from the *symbol* span (incl a parenthesized child's parens), not the child node's loc** — fixed across core types and constructor args. Remaining: the docstring side-channel (→ `ocaml.doc`/`ocaml.text`), signatures-with-class, `with`-constraints, the deferred constrained-function-binding form.
+- ◐ **Parser** — vs `ocamlc -dparsetree`, **two yardsticks**: **66.2%** over the 400-file subset (`parse_parity.sh 400`) and **50.2%** over the full 1853-file corpus (`parse_parity.sh 0`). *The full-corpus number is the honest one to track — the 400-subset is the first 400 files sorted, which skips much of the long-tail multi-feature files; quote both so the two are never confused.* Broad surface incl. GADTs, poly-variants, type extensions, newtype params, attributes/extensions, modules/signatures/functors (`Pmod_apply` too), first-class modules `(module M)` + package types `Ptyp_package`, coercions, `[%ext]`, `let*`, `e#m`, setfield/array-set, the missing patterns, the full **object/class** subsystem, parenthesised operators `(+)`, labelled/optional params, constrained function bindings, `let f : type a. …`, type manifest/kind redefinition + `constraint` clauses, the **signature** item subsystem, **recursive modules**, and module-type **with-constraints / `module type of` / functor arrows**. Full-corpus climb this session: 41.6 → 42.5 → 43.0 → 43.6 → 44.1 → 44.8 → 45.9 → 46.7 → 47.1 → 47.4 → 48.9 → **50.2**. Broad-implement-then-corpus-diff loop. Key recurring fix: **menhir computes a compound node's loc from the *symbol* span (incl a parenthesized child's parens), not the child node's loc**. Remaining: the docstring side-channel (→ `ocaml.doc`/`ocaml.text`), local opens `M.(e)`, type-with-attributes `(t [@attr])`, more module-expr forms, signatures-with-class.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -407,3 +407,29 @@ went 6 → **9 / 22** (the other 13 fail on *unrelated* gaps — signatures-with
 exotic type syntax, the deferred constrained-function binding). Full-corpus parity
 42.5%; 400-subset **58.0 → 59.2%**. As predicted, a whole subsystem buys ~1% of
 full-file parity because the marginal file needs several subsystems at once.
+
+### 2026-06-02 — widening blitz: full corpus 41.6 → 50.2% (day 0 cont.)
+
+A run of corpus-diff-driven batches, each surfaced pre-localised by the
+whole-1853-file diff scan (categorise PARSE_ERROR messages → fix the top bucket).
+Note on measurement: this session headlines the **full-corpus** number
+(`parse_parity.sh 0`), stricter than the historical 400-subset dashboard figure;
+both are now stated side-by-side above so they're never conflated again.
+
+Landed, in order, with the per-batch full-corpus delta:
+- parenthesised operators `(+)`/`(>>=)`/`(!)` in exprs, patterns, and `let (op) …`
+  bindings (guarded on a following `)`), +post-item attrs on `external`/type decls.
+- labelled/optional params `~l:p` / `?l:p` / `?l:(p=e)`; constrained function
+  bindings `let f p.. : t = e` and `: t :> t2` (new Pexp_function constraint field).
+- type body rework: manifest-vs-kind disambiguation + `= M.t = A | B` redefinition.
+- package types `(module S [with …])`; `let f : type a. t = e` value constraints
+  (the fork's `<type> …` univars list); `constraint t1 = t2` clauses.
+- the signature-item subsystem (external/typext/exception/open/include/modtype/
+  functor-decl/class-type/attr/extension); `#abstract` no-newline fix.
+- recursive modules `module rec` (+27 files — common).
+- module-type with-constraints, `module type of`, anonymous functor arrows.
+
+Recurring lesson reconfirmed: most wins are *transcription* against printast.ml +
+a loc rule, not algorithmic. The errors that remain are concentrated, not diffuse:
+local opens `M.(e)`, type-attributes `(t [@attr])`, residual module-expr forms,
+and the docstring side-channel — each its own small subsystem.
