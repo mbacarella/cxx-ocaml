@@ -530,11 +530,15 @@ struct Printer {
         line(j, "Pmod_functor ()");
       }
       module_expr(j, *f->body);
-    } else {
-      auto& c = std::get<Pmod_constraint>(m.desc);
+    } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
       line(j, "Pmod_constraint");
-      module_expr(j, *c.me);
-      module_type(j, *c.mt);
+      module_expr(j, *c->me);
+      module_type(j, *c->mt);
+    } else {
+      auto& a = std::get<Pmod_apply>(m.desc);
+      line(j, "Pmod_apply");
+      module_expr(j, *a.f);
+      module_expr(j, *a.arg);
     }
   }
   void module_binding(int i, const ModuleBinding& b) {

@@ -1628,6 +1628,18 @@ class Parser {
   }
 
   ModuleExpr parse_module_expr() {
+    Position symstart = position(cur().start);
+    ModuleExpr me = parse_module_expr_head();
+    while (cur().kind == Kind::LPAREN) {  // F(X)  functor application
+      advance();
+      ModuleExpr arg = parse_module_expr();
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))},
+                      span(symstart, position(c.end))};
+    }
+    return me;
+  }
+  ModuleExpr parse_module_expr_head() {
     Token t = cur();
     if (t.kind == Kind::STRUCT) {
       advance();

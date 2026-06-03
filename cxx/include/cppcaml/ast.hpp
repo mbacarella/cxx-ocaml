@@ -291,8 +291,9 @@ struct Pmod_structure { Structure items; };
 struct ModuleExpr;
 struct Pmod_functor { FunctorParam param; Box<ModuleExpr> body; };
 struct Pmod_constraint { Box<ModuleExpr> me; ModuleTypeBox mt; };
+struct Pmod_apply { Box<ModuleExpr> f; Box<ModuleExpr> arg; };  // F(X)
 struct ModuleExpr {
-  std::variant<Pmod_ident, Pmod_structure, Pmod_functor, Pmod_constraint> desc;
+  std::variant<Pmod_ident, Pmod_structure, Pmod_functor, Pmod_constraint, Pmod_apply> desc;
   Location loc;
 };
 struct ModuleBinding { StrOptLoc name; ModuleExpr expr; };
