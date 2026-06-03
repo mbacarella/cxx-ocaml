@@ -1135,7 +1135,7 @@ class Parser {
       } else {
         res = std::move(ts[0]);  // no arrow: the lone type is the result, no args
       }
-      endp = (*res)->loc.end;
+      endp = position(tokens_[idx_ - 1].end);
     } else if (cur().kind == Kind::OF) {
       advance();
       if (cur().kind == Kind::LBRACE) {
@@ -1146,7 +1146,7 @@ class Parser {
         std::vector<CoreTypeBox> ts;
         ts.push_back(parse_type_app());
         while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
-        endp = ts.back()->loc.end;
+        endp = position(tokens_[idx_ - 1].end);
         args = Pcstr_tuple{std::move(ts)};
       }
     }
@@ -1195,7 +1195,7 @@ class Parser {
         while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
         if (cur().kind == Kind::MINUSGREATER) { advance(); res = parse_core_type(); args = Pcstr_tuple{std::move(ts)}; }
         else res = std::move(ts[0]);
-        endp = (*res)->loc.end;
+        endp = position(tokens_[idx_ - 1].end);
       } else if (cur().kind == Kind::OF) {
         advance();
         if (cur().kind == Kind::LBRACE) { args = Pcstr_record{parse_label_decls()}; endp = position(tokens_[idx_ - 1].end); }
@@ -1203,7 +1203,7 @@ class Parser {
           std::vector<CoreTypeBox> ts;
           ts.push_back(parse_type_app());
           while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
-          endp = ts.back()->loc.end;
+          endp = position(tokens_[idx_ - 1].end);
           args = Pcstr_tuple{std::move(ts)};
         }
       }
