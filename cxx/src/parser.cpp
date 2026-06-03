@@ -157,6 +157,7 @@ class Parser {
   size_t idx_ = 0;
   Position last_seq_end_{};  // end of the most recent parse_expr, incl. a trailing `;`
   bool last_type_subst_ = false;  // most recent type decl used `:=` (substitution)
+  std::optional<std::string> let_ext_;  // `let%ext …` extension name on the last let
 
   const Token& cur() const { return tokens_[idx_]; }
   const Token& peek(size_t n) const {
@@ -1824,6 +1825,8 @@ class Parser {
 
   std::pair<RecFlag, std::vector<ValueBinding>> parse_value_bindings() {
     expect(Kind::LET, "let");
+    let_ext_ = std::nullopt;
+    if (cur().kind == Kind::PERCENT) { advance(); let_ext_ = parse_attr_name(); }  // let%ext
     Attributes letattrs;  // `let[@attr] …`  -> attached to the first binding
     while (cur().kind == Kind::LBRACKETAT) { advance(); letattrs.push_back(parse_attribute_body()); }
     RecFlag rf = RecFlag::Nonrecursive;
@@ -1834,7 +1837,17 @@ class Parser {
       for (auto& a : binds[0].attrs) letattrs.push_back(std::move(a));
       binds[0].attrs = std::move(letattrs);
     }
-    while (cur().kind == Kind::AND) { advance(); binds.push_back(parse_value_binding()); }
+    while (cur().kind == Kind::AND) {
+      advance();
+      Attributes andattrs;  // `and[@attr] …`  -> prepended to this binding
+      while (cur().kind == Kind::LBRACKETAT) { advance(); andattrs.push_back(parse_attribute_body()); }
+      ValueBinding vb = parse_value_binding();
+      if (!andattrs.empty()) {
+        for (auto& a : vb.attrs) andattrs.push_back(std::move(a));
+        vb.attrs = std::move(andattrs);
+      }
+      binds.push_back(std::move(vb));
+    }
     return {rf, std::move(binds)};
   }
 
@@ -1860,6 +1873,14 @@ class Parser {
       if (!binds.empty())  // docs attach to the first binding (post only if single)
         attach_docs(binds[0].attrs, l.start.cnum,
                     binds.size() == 1 ? l.end.cnum : static_cast<size_t>(-1));
+      if (let_ext_) {  // `let%ext …`  -> Pstr_extension over the (ghost-wrapped) let item
+        std::string ext = std::move(*let_ext_);
+        let_ext_ = std::nullopt;
+        Structure payload;
+        payload.push_back(StructureItem{Pstr_value{rf, std::move(binds)}, l});
+        return StructureItem{Pstr_extension{std::move(ext), std::move(payload)},
+                             Location{l.start, l.end, /*ghost=*/true}};
+      }
       return StructureItem{Pstr_value{rf, std::move(binds)}, l};
     }
     if (t.kind == Kind::INCLUDE) {
