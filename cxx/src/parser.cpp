@@ -442,6 +442,7 @@ class Parser {
       case Kind::BEGIN: {
         advance();
         ExprBox inner = parse_expr();
+        if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before end
         Token c = cur(); expect(Kind::END, "end");
         inner->loc = span(position(t.start), position(c.end));
         return inner;
@@ -826,6 +827,7 @@ class Parser {
         ExprBox cond = parse_expr();
         expect(Kind::DO, "do");
         ExprBox body = parse_expr();
+        if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before done
         Token c = cur(); expect(Kind::DONE, "done");
         return E({Pexp_while{std::move(cond), std::move(body)},
                   span(position(t.start), position(c.end))});
@@ -842,6 +844,7 @@ class Parser {
         ExprBox hi = parse_expr();
         expect(Kind::DO, "do");
         ExprBox body = parse_expr();
+        if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before done
         Token c = cur(); expect(Kind::DONE, "done");
         return E({Pexp_for{std::move(var), std::move(lo), std::move(hi), dir, std::move(body)},
                   span(position(t.start), position(c.end))});
