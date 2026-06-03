@@ -807,10 +807,8 @@ class Parser {
         return box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
                             .loc = span(position(t.start), name.loc.end)});
       }
-      Token close = cur();
       expect(Kind::RPAREN, ")");
-      inner->loc = span(position(t.start), position(close.end));
-      return inner;
+      return inner;  // core types keep the inner loc (no paren reloc, unlike exprs)
     }
     if (t.kind == Kind::LBRACKET || t.kind == Kind::LBRACKETGREATER ||
         t.kind == Kind::LBRACKETLESS) {  // polymorphic variant type
