@@ -184,6 +184,25 @@ class Parser {
     return Location{a, b, ghost};
   }
 
+  static bool is_const_pat_start(Kind k) {
+    return k == Kind::INT || k == Kind::FLOAT || k == Kind::CHAR ||
+           k == Kind::STRING || k == Kind::MINUS || k == Kind::PLUS;
+  }
+  // signed_constant: a constant optionally preceded by a {- +} sign (INT/FLOAT only).
+  Constant read_signed_constant() {
+    Token t = cur();
+    if (t.kind == Kind::MINUS || t.kind == Kind::PLUS) {
+      advance();
+      Token lit = cur(); advance();
+      Location cl = span(position(t.start), position(lit.end));
+      std::string txt = (t.kind == Kind::MINUS) ? "-" + lit.text : lit.text;
+      return (lit.kind == Kind::INT)
+                 ? Constant{Pconst_integer{txt, lit.modifier}, cl}
+                 : Constant{Pconst_float{txt, lit.modifier}, cl};
+    }
+    advance();
+    return const_of(t);
+  }
   Constant const_of(const Token& t) const {
     Location l = tokloc(t);
     switch (t.kind) {
@@ -1179,7 +1198,15 @@ class Parser {
     Pattern p = parse_pat_tuple();
     while (cur().kind == Kind::BAR) {
       advance();
-      Pattern r = parse_pat_tuple();
+      Pattern r;
+      if (cur().kind == Kind::EXCEPTION) {  // `p | exception q`
+        Token e = cur(); advance();
+        Pattern inner = parse_pat_tuple();
+        Position ie = inner.loc.end;
+        r = Pattern{Ppat_exception{box(std::move(inner))}, span(position(e.start), ie)};
+      } else {
+        r = parse_pat_tuple();
+      }
       Location l = span(p.loc.start, r.loc.end);
       p = Pattern{Ppat_or{box(std::move(p)), box(std::move(r))}, l};
     }
@@ -1261,20 +1288,23 @@ class Parser {
     switch (t.kind) {
       case Kind::UNDERSCORE: advance(); return {Ppat_any{}, tokloc(t)};
       case Kind::LIDENT: advance(); return {Ppat_var{StringLoc{t.text, tokloc(t)}}, tokloc(t)};
+      case Kind::MINUS: case Kind::PLUS:  // signed_constant: {- +} {INT FLOAT}
+        if (peek(1).kind != Kind::INT && peek(1).kind != Kind::FLOAT)
+          throw ParseError("unsupported pattern", t.start);
+        [[fallthrough]];
       case Kind::INT: case Kind::FLOAT: case Kind::CHAR: case Kind::STRING: {
-        advance();
-        Constant c1 = const_of(t);
+        Position cstart = position(t.start);
+        Constant c1 = read_signed_constant();
+        Location c1loc = c1.loc;
         if (cur().kind == Kind::DOTDOT) {  // interval  c1 .. c2
           advance();
-          Token t2 = cur();
-          if (t2.kind != Kind::INT && t2.kind != Kind::FLOAT &&
-              t2.kind != Kind::CHAR && t2.kind != Kind::STRING)
-            throw ParseError("expected constant in interval", t2.start);
-          advance();
-          return {Ppat_interval{std::move(c1), const_of(t2)},
-                  span(position(t.start), position(t2.end))};
+          if (!is_const_pat_start(cur().kind))
+            throw ParseError("expected constant in interval", cur().start);
+          Constant c2 = read_signed_constant();
+          return {Ppat_interval{std::move(c1), std::move(c2)},
+                  span(cstart, position(tokens_[idx_ - 1].end))};
         }
-        return {Ppat_constant{std::move(c1)}, tokloc(t)};
+        return {Ppat_constant{std::move(c1)}, c1loc};
       }
       case Kind::TRUE: advance(); return ppat_construct0("true", tokloc(t));
       case Kind::FALSE: advance(); return ppat_construct0("false", tokloc(t));
