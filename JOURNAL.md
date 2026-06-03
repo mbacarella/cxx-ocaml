@@ -84,7 +84,7 @@ Scoreboard (filled in as stages land, to check the predictions):
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
-- ◐ **Parser** — **51.5%** corpus parity vs `ocamlc -dparsetree`. Broad surface incl. GADTs, polymorphic variants, type extensions, newtype params, attributes/extensions, `let open`/`let module`, `include`, and the **module-type/signature/functor subsystem** (`module type S = sig…end`, `val`/`type` sig items, `module M : S = …` constraints, `module F (X:S) = …` functors). Climb: 2.5 → 5.2 → 9.8 → 11.2 → 13.2 → 43.0 → 50.2 → 51.2 → **51.5**. Now in the *deep* tail: large subsystems each unblock very few *complete* files because the files using them are multi-construct. Remaining: objects/classes, `with`-constraints, `(module M)`, `[%ext]`, `M.(e)`/`a.{i}` sugar, sig `module`/`include`/`open`.
+- ◐ **Parser** — **58.0%** corpus parity vs `ocamlc -dparsetree`. Broad surface incl. GADTs, poly-variants, type extensions, newtype params, attributes/extensions, modules/signatures/functors (`Pmod_apply` too), first-class modules `(module M)`, coercions, `[%ext]`, `let*`, `e#m`, setfield/array-set, the missing patterns. Climb: … → 50.2 → 51.5 → 54.2 → 54.8 → 56.5 → 57.5 → **58.0**. Switched to a broad-implement-then-corpus-diff loop (per review) — much faster than per-construct. Key recurring fix: **menhir computes a compound node's loc from the *symbol* span (incl a parenthesized child's parens), not the child node's loc** — fixed across core types and constructor args. Remaining: the docstring side-channel (→ `ocaml.doc`/`ocaml.text`), objects/classes, `with`-constraints.
 - ☐ Typer  ☐ Lambda  ☐ Bytecode  ☐ Native
 
 **Files converted (OCaml → C++)**
@@ -333,10 +333,32 @@ Added structure-level items (which gate whole files early), byte-validated:
   signatures, objects/classes), each a multi-hour push rather than a quick win.
 
 **State of the experiment (end of day 0):** lexer 100% (predicted 2–4 days, done
-in a session); parser at 51% of the testsuite corpus, up from a tracer bullet, via
+in a session); parser at 58% of the testsuite corpus, up from a tracer bullet, via
 a long sequence of oracle-driven diffs. The recurring lesson: correct transcription
 is cheap; the leverage is in the few pervasive details (the string-loc bug, the
-`Pexp_struct_item` fork divergence) that only a differential oracle surfaces.
+`Pexp_struct_item` fork divergence, the menhir symbol-vs-node loc rule) that only a
+differential oracle surfaces.
+
+### 2026-06-02 — methodology pivot + diff-fix loop → 58% (day 0 cont.)
+
+Per review feedback, switched from per-construct oracle round-trips to
+**transcribe broadly from parsetree.mli/printast.ml → run the whole corpus →
+batch-fix what the diff surfaces**. Much higher throughput (51.5 → 58.0 in the
+session's back half). Added in bulk: setfield/setinstvar/coerce/send/pack
+(first-class modules)/extension/letop expressions; array/type/unpack/extension
+patterns; `Pmod_apply`. Corpus-diff batch fixes: record-expr punning ghost label;
+`Array.set` whole-assignment span; harness strips the oracle warning preamble;
+and the big one — **menhir's symbol-vs-node loc rule** (a compound node's location
+spans its child *symbols* including their parens, while the child *node* loc
+excludes them), fixed across core types and constructor/extension declarations.
+
+The docstring side-channel (the original gap flagged at the lexer stage) is the
+next cluster: `(** … *)` adjacent to a decl → an `ocaml.doc` attribute on it
+(payload = comment text, delimiters stripped); a floating one →
+`Pstr_attribute "ocaml.text"`. Replicating it needs the parser to stop filtering
+`DOCSTRING` tokens and to re-implement lexer.mll's pre/post/floating attachment
+state machine — a real subsystem, deferred. Objects/classes (the last big
+untouched grammar) is the other remaining chunk.
 
 ### 2026-06-02 — module types / signatures / functors → 51.5% (day 0 cont.)
 
