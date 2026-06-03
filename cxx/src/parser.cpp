@@ -203,6 +203,46 @@ class Parser {
     return {LongidentLoc{std::move(lid), span(position(first.start), position(last.end))}, upper};
   }
 
+  // M.(e) / M.[…] / M.{…} / M.[|…|]  -> Pexp_struct_item over a ghost Pstr_open,
+  // except M.(op) which is just the qualified value identifier "M.op".
+  ExprBox make_local_open(const LongidentLoc& modpath, ExprBox body, Location whole) {
+    ModuleExpr me{Pmod_ident{modpath}, modpath.loc};
+    StructureItem si{Pstr_open{OverrideFlag::Fresh, std::move(me)}, none_loc()};
+    return E({Pexp_struct_item{box(std::move(si)), std::move(body)}, whole});
+  }
+  std::optional<ExprBox> try_local_open(const PathResult& pr) {
+    if (!pr.final_upper || cur().kind != Kind::DOT) return std::nullopt;
+    Kind k = peek(1).kind;
+    if (k != Kind::LPAREN && k != Kind::LBRACKET && k != Kind::LBRACE && k != Kind::LBRACKETBAR)
+      return std::nullopt;
+    advance();  // '.'
+    Position openStart = pr.lid.loc.start;
+    if (cur().kind == Kind::LPAREN) {
+      Token lp = cur();
+      if (operator_name(peek(1)) && peek(2).kind == Kind::RPAREN) {  // M.(op) -> "M.op"
+        advance();  // (
+        auto op = operator_name(cur()); advance();
+        Token c = cur(); advance();  // )
+        Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), *op}};
+        Location l = span(openStart, position(c.end));
+        return E({Pexp_ident{LongidentLoc{std::move(qual), l}}, l});
+      }
+      advance();  // (
+      ExprBox inner;
+      if (cur().kind == Kind::RPAREN) {  // M.()
+        Location ul = span(position(lp.start), position(cur().end));
+        inner = mk_construct(lid0("()", ul), std::nullopt, ul);
+      } else {
+        inner = parse_expr();
+      }
+      Token c = cur(); expect(Kind::RPAREN, ")");
+      return make_local_open(pr.lid, std::move(inner), span(openStart, position(c.end)));
+    }
+    ExprBox inner = parse_atom();  // M.[…] / M.{…} / M.[|…|]
+    Position end = inner->loc.end;
+    return make_local_open(pr.lid, std::move(inner), span(openStart, end));
+  }
+
   // postfix record-field access  e.lbl (.lbl)*
   ExprBox qualified_ident(const char* mod, const char* fn, Location l) {
     Longident lid{Ldot{std::make_shared<Longident>(Longident{Lident{mod}}), fn}};
@@ -259,6 +299,7 @@ class Parser {
       }
       case Kind::UIDENT: {
         PathResult pr = parse_dotted_path();
+        if (auto lo = try_local_open(pr)) return std::move(*lo);
         if (pr.final_upper) return mk_construct(pr.lid, std::nullopt, pr.lid.loc);
         Location l = pr.lid.loc;
         return E({Pexp_ident{.id = std::move(pr.lid)}, l});
@@ -480,6 +521,7 @@ class Parser {
     // constructor application  Constr arg  -> Pexp_construct (not Pexp_apply)
     if (cur().kind == Kind::UIDENT) {
       PathResult pr = parse_dotted_path();
+      if (auto lo = try_local_open(pr)) return collect_app(postfix_field(std::move(*lo)));
       if (pr.final_upper) {
         if (is_atom_start(cur().kind)) {
           ExprBox arg = parse_atom_postfix();
