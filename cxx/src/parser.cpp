@@ -871,11 +871,26 @@ class Parser {
       ExprBox e = E({Pexp_ident{LongidentLoc{{Lident{id.text}}, tokloc(id)}}, tokloc(id)});
       return {id.text, std::move(e)};
     }
+    if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {  // ~(x:t) punning+constraint
+      advance();  // ~
+      Token lp = cur(); advance();  // (
+      Token id = cur(); advance();
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_core_type();
+      Token rp = cur(); expect(Kind::RPAREN, ")");
+      ExprBox ide = E({Pexp_ident{LongidentLoc{{Lident{id.text}}, tokloc(id)}}, tokloc(id)});
+      Location cl = span(position(lp.start), position(rp.end));
+      elem_punned_constr_ = true;
+      return {id.text, E({Pexp_constraint{std::move(ide), std::move(ty)}, cl})};
+    }
     return {std::nullopt, parse_binop(0)};
   }
+  bool elem_punned_constr_ = false;  // last elem was `~(x:t)` (its loc-end quirk)
   ExprBox parse_tuple() {
     Position s = position(cur().start);
+    elem_punned_constr_ = false;
     auto first = parse_labeled_tuple_elem();
+    bool firstPunned = elem_punned_constr_;
     if (cur().kind != Kind::COMMA) return std::move(first.second);  // single element
     std::vector<ExprBox> elems;
     std::vector<std::optional<std::string>> labels;
@@ -887,6 +902,9 @@ class Parser {
       elems.push_back(std::move(e.second));
       labels.push_back(e.first);
     }
+    // menhir inlining quirk: a leading `~(x:t)` element's loc-end becomes the end
+    // of the base-case reduction (i.e. the second element's end).
+    if (firstPunned && elems.size() >= 2) elems[0]->loc.end = elems[1]->loc.end;
     Location l = span(s, elems.back()->loc.end);
     bool any = false; for (auto& x : labels) if (x) any = true;
     if (!any) labels.clear();  // ordinary tuple: keep labels empty (printer emits None)
@@ -1469,6 +1487,17 @@ class Parser {
       advance();
       Token id = cur(); advance();
       return {id.text, Pattern{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)}};
+    }
+    if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {  // ~(x:t) punning+constraint
+      advance();  // ~
+      Token lp = cur(); advance();  // (
+      Token id = cur(); advance();
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_core_type();
+      Token rp = cur(); expect(Kind::RPAREN, ")");
+      Pattern var{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
+      Location cl = span(position(lp.start), position(rp.end));
+      return {id.text, Pattern{Ppat_constraint{box(std::move(var)), std::move(ty)}, cl}};
     }
     return {std::nullopt, parse_pat_cons()};
   }
