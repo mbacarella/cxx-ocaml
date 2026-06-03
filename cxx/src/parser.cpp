@@ -1771,16 +1771,28 @@ class Parser {
       }
     }
     expect(Kind::EQUAL, "=");
+    auto param_loc = [](const FunctionParam& p) {
+      if (auto* v = std::get_if<Pparam_val>(&p.desc)) return v->loc;
+      return std::get<Pparam_newtype>(p.desc).loc;
+    };
+    // `let f p.. [: t] = function cases` desugars to a ghost Pexp_function whose
+    // body is the Pfunction_cases directly (not a nested function body).
+    if (cur().kind == Kind::FUNCTION && (!params.empty() || fconstr)) {
+      Token fkw = cur(); advance();
+      std::vector<Case> cs = parse_cases();
+      Position last = cs.back().rhs->loc.end;
+      Location casesloc = span(position(fkw.start), last);
+      auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
+      Location floc = span(param_loc(params.front()).start, last, /*ghost=*/true);
+      ExprBox fn = E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)}, floc});
+      return ValueBinding{std::move(namepat), std::move(fn), std::nullopt};
+    }
     ExprBox body = parse_expr();
     Position bodyEnd = last_seq_end_;  // includes a trailing `;` if present
 
     if (params.empty() && !fconstr)
       return ValueBinding{std::move(namepat), std::move(body), std::move(vconstr)};
     // desugar `let f p.. [: t] = e` to a ghost Pexp_function spanning p[0]..e
-    auto param_loc = [](const FunctionParam& p) {
-      if (auto* v = std::get_if<Pparam_val>(&p.desc)) return v->loc;
-      return std::get<Pparam_newtype>(p.desc).loc;
-    };
     Position fstart = params.empty() ? body->loc.start : param_loc(params.front()).start;
     Location floc = span(fstart, bodyEnd, /*ghost=*/true);
     auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
