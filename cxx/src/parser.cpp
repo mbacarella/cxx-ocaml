@@ -2201,7 +2201,8 @@ class Parser {
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // module type
       Token nm = cur();
-      if (nm.kind != Kind::UIDENT) throw ParseError("expected module type name", nm.start);
+      if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
+        throw ParseError("expected module type name", nm.start);
       advance();
       std::optional<ModuleType> mty;
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
@@ -2557,7 +2558,8 @@ class Parser {
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // module type
       Token nm = cur();
-      if (nm.kind != Kind::UIDENT) throw ParseError("expected module type name", nm.start);
+      if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
+        throw ParseError("expected module type name", nm.start);
       advance();
       std::optional<ModuleType> mty;
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
