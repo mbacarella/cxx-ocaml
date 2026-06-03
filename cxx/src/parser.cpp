@@ -1611,6 +1611,10 @@ class Parser {
   }
   Pattern parse_pat_cons() {
     Pattern p = parse_pat_app();
+    while (cur().kind == Kind::LBRACKETAT) {  // p [@attr]  -> ppat_attributes
+      advance();
+      p.attrs.push_back(parse_attribute_body());
+    }
     if (cur().kind != Kind::COLONCOLON) return p;
     Token optok = cur();
     advance();
