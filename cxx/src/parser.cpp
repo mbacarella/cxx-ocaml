@@ -1918,9 +1918,22 @@ class Parser {
     expect(Kind::RBRACE, "}");
     return fields;
   }
-  // A constructor name: UIDENT, or the keyword constructors `true`/`false`.
+  static bool is_ctor_name_start(Kind k, Kind k1) {
+    return k == Kind::UIDENT || k == Kind::TRUE || k == Kind::FALSE ||
+           (k == Kind::LBRACKET && k1 == Kind::RBRACKET) ||      // []
+           (k == Kind::LPAREN && k1 == Kind::COLONCOLON);        // (::)
+  }
+  // A constructor name: UIDENT, `true`/`false`, or the list constructors `[]`/`(::)`.
   StringLoc parse_constructor_name() {
     Token nm = cur();
+    if (nm.kind == Kind::LBRACKET && peek(1).kind == Kind::RBRACKET) {
+      advance(); Token c = cur(); advance();
+      return StringLoc{"[]", span(position(nm.start), position(c.end))};
+    }
+    if (nm.kind == Kind::LPAREN && peek(1).kind == Kind::COLONCOLON) {
+      advance(); advance(); Token c = cur(); expect(Kind::RPAREN, ")");
+      return StringLoc{"::", span(position(nm.start), position(c.end))};
+    }
     std::string text;
     if (nm.kind == Kind::UIDENT) text = nm.text;
     else if (nm.kind == Kind::TRUE) text = "true";
@@ -2043,8 +2056,8 @@ class Parser {
     Position cs = position(cur().start);  // constructor loc includes a leading '|'
     if (cur().kind == Kind::BAR) advance();
     std::vector<ConstructorDecl> ctors;
-    if (cur().kind != Kind::UIDENT && cur().kind != Kind::TRUE &&
-        cur().kind != Kind::FALSE) return Ptype_variant{std::move(ctors)};  // `type t = |`
+    if (!is_ctor_name_start(cur().kind, peek(1).kind))
+      return Ptype_variant{std::move(ctors)};  // `type t = |`
     ctors.push_back(parse_constructor_decl(cs));
     while (cur().kind == Kind::BAR) {
       Position bs = position(cur().start);
@@ -2073,6 +2086,8 @@ class Parser {
       bool kind_start = cur().kind == Kind::DOTDOT || cur().kind == Kind::LBRACE ||
                         cur().kind == Kind::BAR || cur().kind == Kind::TRUE ||
                         cur().kind == Kind::FALSE ||
+                        (cur().kind == Kind::LBRACKET && peek(1).kind == Kind::RBRACKET) ||
+                        (cur().kind == Kind::LPAREN && peek(1).kind == Kind::COLONCOLON) ||
                         (cur().kind == Kind::UIDENT && peek(1).kind != Kind::DOT &&
                          peek(1).kind != Kind::LPAREN);
       if (kind_start) {
