@@ -1986,7 +1986,11 @@ class Parser {
       }
       kind = Pext_decl{std::move(args), std::move(res)};
     }
-    return ExtensionConstructor{StringLoc{nm.text, tokloc(nm)}, std::move(kind), span(start, endp)};
+    Attributes attrs;  // pext_attributes: `A [@deprecated]`
+    while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
+    if (!attrs.empty()) endp = position(tokens_[idx_ - 1].end);
+    return ExtensionConstructor{StringLoc{nm.text, tokloc(nm)}, std::move(kind),
+                                span(start, endp), std::move(attrs)};
   }
   TypeKind parse_type_kind_body() {  // record / variant / open (cur at the kind start)
     if (cur().kind == Kind::DOTDOT) { advance(); return Ptype_open{}; }
