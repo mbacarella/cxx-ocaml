@@ -1913,13 +1913,22 @@ class Parser {
     expect(Kind::RBRACE, "}");
     return fields;
   }
-  ConstructorDecl parse_constructor_decl(Position start) {
+  // A constructor name: UIDENT, or the keyword constructors `true`/`false`.
+  StringLoc parse_constructor_name() {
     Token nm = cur();
-    if (nm.kind != Kind::UIDENT) throw ParseError("expected constructor name", nm.start);
+    std::string text;
+    if (nm.kind == Kind::UIDENT) text = nm.text;
+    else if (nm.kind == Kind::TRUE) text = "true";
+    else if (nm.kind == Kind::FALSE) text = "false";
+    else throw ParseError("expected constructor name", nm.start);
     advance();
+    return StringLoc{std::move(text), tokloc(nm)};
+  }
+  ConstructorDecl parse_constructor_decl(Position start) {
+    StringLoc cname = parse_constructor_name();
     ConstructorArguments args = Pcstr_tuple{};
     std::optional<CoreTypeBox> res;
-    Position endp = position(nm.end);
+    Position endp = cname.loc.end;
     if (cur().kind == Kind::COLON) {  // GADT:  A : t1 * … * tn -> tres   (or  A : tres)
       advance();
       if (cur().kind == Kind::LBRACE) {  // A : { fields } -> tres  (inline record)
@@ -1956,7 +1965,7 @@ class Parser {
     Attributes attrs;  // pcd_attributes: `A [@deprecated]`
     while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
     if (!attrs.empty()) endp = position(tokens_[idx_ - 1].end);
-    return ConstructorDecl{StringLoc{nm.text, tokloc(nm)}, std::move(args), std::move(res),
+    return ConstructorDecl{std::move(cname), std::move(args), std::move(res),
                            span(start, endp), std::move(attrs)};
   }
   CoreTypeBox parse_type_param() {
@@ -2029,7 +2038,8 @@ class Parser {
     Position cs = position(cur().start);  // constructor loc includes a leading '|'
     if (cur().kind == Kind::BAR) advance();
     std::vector<ConstructorDecl> ctors;
-    if (cur().kind != Kind::UIDENT) return Ptype_variant{std::move(ctors)};  // `type t = |`
+    if (cur().kind != Kind::UIDENT && cur().kind != Kind::TRUE &&
+        cur().kind != Kind::FALSE) return Ptype_variant{std::move(ctors)};  // `type t = |`
     ctors.push_back(parse_constructor_decl(cs));
     while (cur().kind == Kind::BAR) {
       Position bs = position(cur().start);
@@ -2056,7 +2066,8 @@ class Parser {
       // A leading UIDENT is a variant constructor unless it begins a manifest path:
       // `M.t` (DOT) or a functor application `F(X).t` (LPAREN).
       bool kind_start = cur().kind == Kind::DOTDOT || cur().kind == Kind::LBRACE ||
-                        cur().kind == Kind::BAR ||
+                        cur().kind == Kind::BAR || cur().kind == Kind::TRUE ||
+                        cur().kind == Kind::FALSE ||
                         (cur().kind == Kind::UIDENT && peek(1).kind != Kind::DOT &&
                          peek(1).kind != Kind::LPAREN);
       if (kind_start) {
