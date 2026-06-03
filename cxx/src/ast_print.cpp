@@ -275,7 +275,18 @@ struct Printer {
         for (auto& fp : v->params) function_param(j + 1, fp);
         line(j, "]");
       }
-      line(j, "None");  // type constraint (always None in fragment)
+      if (v->constraint_) {
+        line(j, "Some");
+        if (auto* pc = std::get_if<Pconstraint>(&*v->constraint_)) {
+          line(j + 1, "Pconstraint");
+          core_type(j + 2, *pc->type);
+        } else {
+          auto& co = std::get<Pcoerce>(*v->constraint_);
+          line(j + 1, "Pcoerce");
+          if (co.from) { line(j + 2, "Some"); core_type(j + 3, **co.from); } else line(j + 2, "None");
+          core_type(j + 2, *co.to_);
+        }
+      } else line(j, "None");
       function_body(j, *v->body);
     } else if (auto* v = std::get_if<Pexp_tuple>(&e.desc)) {
       line(j, "Pexp_tuple");

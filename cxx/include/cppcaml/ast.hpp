@@ -145,9 +145,12 @@ struct Pexp_ident { LongidentLoc id; };
 struct Pexp_constant { Constant c; };
 struct Pexp_apply { ExprBox fn; std::vector<std::pair<ArgLabel, ExprBox>> args; };
 struct Pexp_let { RecFlag rf; std::vector<ValueBinding> bindings; ExprBox body; };
+struct Pconstraint { CoreTypeBox type; };
+struct Pcoerce { std::optional<CoreTypeBox> from; CoreTypeBox to_; };
+using FunctionConstraint = std::variant<Pconstraint, Pcoerce>;
 struct Pexp_function {
   std::vector<FunctionParam> params;
-  // type constraint omitted in this fragment (always None)
+  std::optional<FunctionConstraint> constraint_;  // `: t` / `: t :> t2` return constraint
   Box<FunctionBody> body;
 };
 struct Pexp_tuple { std::vector<ExprBox> elems; };  // all labels None in fragment

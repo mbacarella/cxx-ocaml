@@ -713,7 +713,7 @@ class Parser {
         Position last = cs.back().rhs->loc.end;
         Location casesloc = span(position(t.start), last);
         auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
-        return E({Pexp_function{{}, std::move(fb)}, span(position(t.start), last)});
+        return E({Pexp_function{{}, std::nullopt, std::move(fb)}, span(position(t.start), last)});
       }
       case Kind::FUN: {
         advance();
@@ -737,7 +737,7 @@ class Parser {
         }
         Location l = span(position(t.start), body->loc.end);
         auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
-        return E({Pexp_function{std::move(params), std::move(fb)}, l});
+        return E({Pexp_function{std::move(params), std::nullopt, std::move(fb)}, l});
       }
       case Kind::WHILE: {
         advance();
@@ -1343,6 +1343,10 @@ class Parser {
   }
 
   // ---- bindings ----
+  static bool is_param_start(Kind k) {
+    return k == Kind::LABEL || k == Kind::OPTLABEL || k == Kind::TILDE ||
+           k == Kind::QUESTION || is_simple_pattern_start(k);
+  }
   FunctionParam parse_param() {
     Token t = cur();
     // (type a)  locally abstract type parameter
@@ -1368,6 +1372,34 @@ class Parser {
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location loc = span(position(t.start), position(id.end));
       return FunctionParam{Pparam_val{loc, Optional{id.text}, std::nullopt, std::move(p)}};
+    }
+    // ~lbl:pat   (labelled with explicit pattern)
+    if (t.kind == Kind::LABEL) {
+      advance();
+      Pattern p = parse_simple_pattern();
+      Location loc = span(position(t.start), p.loc.end);
+      return FunctionParam{Pparam_val{loc, Labelled{t.text}, std::nullopt, std::move(p)}};
+    }
+    // ?lbl:pat  or  ?lbl:(pat [: t] = e)   (optional with explicit pattern)
+    if (t.kind == Kind::OPTLABEL) {
+      advance();
+      if (cur().kind == Kind::LPAREN) {
+        advance();
+        Pattern p = parse_pattern();
+        if (cur().kind == Kind::COLON) {
+          advance(); CoreTypeBox ty = parse_core_type();
+          Location pl = p.loc;
+          p = Pattern{Ppat_constraint{box(std::move(p)), std::move(ty)}, pl};
+        }
+        std::optional<ExprBox> def;
+        if (cur().kind == Kind::EQUAL) { advance(); def = parse_expr(); }
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        Location loc = span(position(t.start), position(c.end));
+        return FunctionParam{Pparam_val{loc, Optional{t.text}, std::move(def), std::move(p)}};
+      }
+      Pattern p = parse_simple_pattern();
+      Location loc = span(position(t.start), p.loc.end);
+      return FunctionParam{Pparam_val{loc, Optional{t.text}, std::nullopt, std::move(p)}};
     }
     // ?(x [: t] = e)  optional with default
     if (t.kind == Kind::QUESTION && peek(1).kind == Kind::LPAREN) {
@@ -1407,7 +1439,7 @@ class Parser {
     bool val_ident = op_ident ||
                      (cur().kind == Kind::LIDENT &&
                       (peek(1).kind == Kind::EQUAL || peek(1).kind == Kind::COLON ||
-                       is_simple_pattern_start(peek(1).kind)));
+                       is_param_start(peek(1).kind)));
     if (!val_ident) {
       Pattern pat = parse_pattern();
       expect(Kind::EQUAL, "=");
@@ -1430,29 +1462,35 @@ class Parser {
     std::vector<FunctionParam> params;
     while (cur().kind != Kind::EQUAL && cur().kind != Kind::COLON)
       params.push_back(parse_param());
-    std::optional<CoreTypeBox> constr;
+    std::optional<CoreTypeBox> constr;          // `let x : t = e`  (params empty)
+    std::optional<FunctionConstraint> fconstr;  // `let f p.. : t = e`  (return constraint)
     if (cur().kind == Kind::COLON) {
-      // `let x : t = e`  (simple value constraint). The function-with-return-type
-      // form (`let f x : t = e`) lowers differently; defer it.
-      if (!params.empty())
-        throw ParseError("constrained function binding not supported yet", cur().start);
       advance();
-      constr = parse_core_type();
+      CoreTypeBox ty = parse_core_type();
+      if (cur().kind == Kind::COLONGREATER) {  // : t :> t2
+        advance();
+        CoreTypeBox ty2 = parse_core_type();
+        fconstr = Pcoerce{std::move(ty), std::move(ty2)};
+      } else if (params.empty()) {
+        constr = std::move(ty);
+      } else {
+        fconstr = Pconstraint{std::move(ty)};
+      }
     }
     expect(Kind::EQUAL, "=");
     ExprBox body = parse_expr();
 
-    if (params.empty())
+    if (params.empty() && !fconstr)
       return ValueBinding{std::move(namepat), std::move(body), std::move(constr)};
-    // desugar `let f p.. = e` to a ghost Pexp_function spanning p[0]..e
+    // desugar `let f p.. [: t] = e` to a ghost Pexp_function spanning p[0]..e
     auto param_loc = [](const FunctionParam& p) {
       if (auto* v = std::get_if<Pparam_val>(&p.desc)) return v->loc;
       return std::get<Pparam_newtype>(p.desc).loc;
     };
-    Position fstart = param_loc(params.front()).start;
+    Position fstart = params.empty() ? body->loc.start : param_loc(params.front()).start;
     Location floc = span(fstart, body->loc.end, /*ghost=*/true);
     auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
-    ExprBox fn = E({Pexp_function{std::move(params), std::move(fb)}, floc});
+    ExprBox fn = E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)}, floc});
     return ValueBinding{std::move(namepat), std::move(fn), std::nullopt};
   }
 
@@ -1939,7 +1977,7 @@ class Parser {
           std::vector<FunctionParam> ps;
           for (auto& pr : params) ps.push_back(std::move(pr.second));
           auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
-          body = E({Pexp_function{std::move(ps), std::move(fb)}, floc});
+          body = E({Pexp_function{std::move(ps), std::nullopt, std::move(fb)}, floc});
         }
         Location pl = body->loc;
         pl.ghost = true;  // ghexp Pexp_poly is always ghost
