@@ -1303,6 +1303,20 @@ class Parser {
     }
     return ExtensionConstructor{StringLoc{nm.text, tokloc(nm)}, std::move(kind), span(start, endp)};
   }
+  TypeKind parse_type_kind_body() {  // record / variant / open (cur at the kind start)
+    if (cur().kind == Kind::DOTDOT) { advance(); return Ptype_open{}; }
+    if (cur().kind == Kind::LBRACE) return Ptype_record{parse_label_decls()};
+    Position cs = position(cur().start);  // constructor loc includes a leading '|'
+    if (cur().kind == Kind::BAR) advance();
+    std::vector<ConstructorDecl> ctors;
+    ctors.push_back(parse_constructor_decl(cs));
+    while (cur().kind == Kind::BAR) {
+      Position bs = position(cur().start);
+      advance();
+      ctors.push_back(parse_constructor_decl(bs));
+    }
+    return Ptype_variant{std::move(ctors)};
+  }
   TypeDeclaration parse_type_declaration(Position declStart) {
     std::vector<CoreTypeBox> params = parse_type_params();
     Token nm = cur();
@@ -1314,25 +1328,21 @@ class Parser {
     if (cur().kind == Kind::EQUAL) {
       advance();
       if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
-      if (cur().kind == Kind::DOTDOT) {  // type t = ..  (extensible)
-        advance();
-        kind = Ptype_open{};
-      } else if (cur().kind == Kind::LBRACE) {
-        kind = Ptype_record{parse_label_decls()};
-      } else if (cur().kind == Kind::BAR || cur().kind == Kind::UIDENT) {
-        // a constructor_declaration's loc includes its leading '|' (if any)
-        Position cs = position(cur().start);
-        if (cur().kind == Kind::BAR) advance();
-        std::vector<ConstructorDecl> ctors;
-        ctors.push_back(parse_constructor_decl(cs));
-        while (cur().kind == Kind::BAR) {
-          Position bs = position(cur().start);
-          advance();
-          ctors.push_back(parse_constructor_decl(bs));
-        }
-        kind = Ptype_variant{std::move(ctors)};
+      // A `kind` (record/variant/open) starts with `{`, `..`, `|`, or an unqualified
+      // constructor (UIDENT not followed by `.`); otherwise it's a manifest type,
+      // optionally followed by `= [private] kind` (variant/record redefinition).
+      bool kind_start = cur().kind == Kind::DOTDOT || cur().kind == Kind::LBRACE ||
+                        cur().kind == Kind::BAR ||
+                        (cur().kind == Kind::UIDENT && peek(1).kind != Kind::DOT);
+      if (kind_start) {
+        kind = parse_type_kind_body();
       } else {
         manifest = parse_core_type();
+        if (cur().kind == Kind::EQUAL) {  // type t = manifest = [private] kind
+          advance();
+          if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
+          kind = parse_type_kind_body();
+        }
       }
     }
     Attributes attrs;
