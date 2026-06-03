@@ -823,6 +823,10 @@ class Parser {
       Location l = span(e->loc.start, e2->loc.end);
       return E({Pexp_sequence{std::move(e), std::move(e2)}, l});
     }
+    // seq_expr: `expr SEMI` — a trailing `;` is part of the sequence expression.
+    // It is consumed (extending the enclosing item's span) but does not enlarge
+    // the expression node's own location.
+    if (cur().kind == Kind::SEMI) advance();
     return e;
   }
 
