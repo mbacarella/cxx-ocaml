@@ -933,13 +933,13 @@ class Parser {
           StructureItem si = parse_structure_item();
           expect(Kind::IN, "in");
           ExprBox body = parse_expr();
-          Location l = span(position(t.start), body->loc.end);
+          Location l = span(position(t.start), last_seq_end_);  // seq_expr incl. trailing `;`
           return E({Pexp_struct_item{box(std::move(si)), std::move(body)}, l});
         }
         auto [rf, binds] = parse_value_bindings();
         expect(Kind::IN, "in");
         ExprBox body = parse_expr();
-        Location l = span(position(t.start), body->loc.end);
+        Location l = span(position(t.start), last_seq_end_);  // seq_expr incl. trailing `;`
         return E({Pexp_let{rf, std::move(binds), std::move(body)}, l});
       }
       case Kind::IF: {
@@ -1018,7 +1018,7 @@ class Parser {
           }
           return withattrs(std::move(acc));
         }
-        Location l = span(position(t.start), body->loc.end);
+        Location l = span(position(t.start), last_seq_end_);  // fun body is seq_expr
         auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
         return withattrs(E({Pexp_function{std::move(params), std::nullopt, std::move(fb)}, l}));
       }
@@ -1067,7 +1067,7 @@ class Parser {
         }
         expect(Kind::IN, "in");
         ExprBox body = parse_expr();
-        Location l = span(position(t.start), body->loc.end);
+        Location l = span(position(t.start), last_seq_end_);  // seq_expr incl. trailing `;`
         return E({Pexp_letop{std::move(letb), std::move(ands), std::move(body)}, l});
       }
       default:
