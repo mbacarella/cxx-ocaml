@@ -248,6 +248,33 @@ class Parser {
     Longident lid{Ldot{std::make_shared<Longident>(Longident{Lident{mod}}), fn}};
     return E({Pexp_ident{.id = LongidentLoc{std::move(lid), l}}, l});
   }
+  LongidentLoc lid_of_dotted(const std::string& s, Location l) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); ++i)
+      if (i == s.size() || s[i] == '.') { parts.push_back(s.substr(start, i - start)); start = i + 1; }
+    Longident lid{Lident{parts[0]}};
+    for (size_t i = 1; i < parts.size(); ++i)
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), parts[i]}};
+    return LongidentLoc{std::move(lid), l};
+  }
+  // a.{i[,j[,k]]}  ->  Bigarray.ArrayN.get a i [j [k]]  (Genarray for >3 indices)
+  ExprBox bigarray_get(ExprBox e, std::vector<ExprBox> idxs, Position end) {
+    Position s = e->loc.start;
+    Location gl{s, end, true};
+    int n = static_cast<int>(idxs.size());
+    const char* fn = n == 1 ? "Bigarray.Array1.get" : n == 2 ? "Bigarray.Array2.get"
+                   : n == 3 ? "Bigarray.Array3.get" : "Bigarray.Genarray.get";
+    ExprBox fnexpr = E({Pexp_ident{lid_of_dotted(fn, gl)}, gl});
+    std::vector<std::pair<ArgLabel, ExprBox>> args;
+    args.emplace_back(Nolabel{}, std::move(e));
+    if (n <= 3) {
+      for (auto& ix : idxs) args.emplace_back(Nolabel{}, std::move(ix));
+    } else {
+      args.emplace_back(Nolabel{}, E({Pexp_array{std::move(idxs)}, gl}));
+    }
+    return E({Pexp_apply{std::move(fnexpr), std::move(args)}, Location{s, end, false}});
+  }
   ExprBox indexed_get(ExprBox e, ExprBox idx, Position end, const char* mod) {
     Position s = e->loc.start;
     ExprBox fn = qualified_ident(mod, "get", Location{s, end, true});  // ghost ident
@@ -258,12 +285,12 @@ class Parser {
   }
   ExprBox postfix_field(ExprBox e) {
     for (;;) {
-      if (cur().kind == Kind::DOT && peek(1).kind == Kind::LIDENT) {
-        advance();
-        Token f = cur();
-        advance();
-        Location l = span(e->loc.start, position(f.end));
-        e = E({Pexp_field{std::move(e), lid0(f.text, tokloc(f))}, l});
+      if (cur().kind == Kind::DOT &&
+          (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
+        advance();  // .  (field may be a qualified path  e.M.f)
+        LongidentLoc field = parse_longident_path();
+        Location l = span(e->loc.start, field.loc.end);
+        e = E({Pexp_field{std::move(e), std::move(field)}, l});
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {
         advance(); advance();  // . (
         ExprBox idx = parse_expr();
@@ -274,6 +301,13 @@ class Parser {
         ExprBox idx = parse_expr();
         Token c = cur(); expect(Kind::RBRACKET, "]");
         e = indexed_get(std::move(e), std::move(idx), position(c.end), "String");
+      } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LBRACE) {
+        advance(); advance();  // . {   (bigarray indexing; commas separate indices)
+        std::vector<ExprBox> idxs;
+        idxs.push_back(parse_binop(0));
+        while (cur().kind == Kind::COMMA) { advance(); idxs.push_back(parse_binop(0)); }
+        Token c = cur(); expect(Kind::RBRACE, "}");
+        e = bigarray_get(std::move(e), std::move(idxs), position(c.end));
       } else if (cur().kind == Kind::HASH && peek(1).kind == Kind::LIDENT) {
         advance();  // #
         Token m = cur(); advance();
