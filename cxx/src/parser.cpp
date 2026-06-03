@@ -1907,8 +1907,8 @@ class Parser {
       advance();
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
-      LongidentLoc mp = parse_longident_path();
-      ModuleExpr me{.desc = Pmod_ident{.id = mp}, .loc = mp.loc};
+      // generalized open: `open <module_expr>` (path, `struct…end`, `M(X)`, …)
+      ModuleExpr me = parse_module_expr();
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_open{ovr, std::move(me)}, l};
     }
