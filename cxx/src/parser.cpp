@@ -1529,13 +1529,7 @@ class Parser {
       Location l = span(position(t.start), cont.loc.end);
       return Pattern{Ppat_effect{box(std::move(eff)), box(std::move(cont))}, l};
     }
-    if (cur().kind == Kind::EXCEPTION) {
-      Token t = cur(); advance();
-      Pattern p = parse_pat_alias();
-      Location l = span(position(t.start), p.loc.end);
-      return Pattern{Ppat_exception{box(std::move(p))}, l};
-    }
-    return parse_pat_alias();
+    return parse_pat_alias();  // `exception P` is handled as an or-pattern operand
   }
   Pattern parse_pat_alias() {
     Pattern p = parse_pat_or();
@@ -1549,19 +1543,22 @@ class Parser {
     }
     return p;
   }
+  // An or-pattern operand: `exception P` binds tighter than `|`, so it is an
+  // operand here (`exception P | Q` == `(exception P) | Q`).
+  Pattern parse_pat_or_operand() {
+    if (cur().kind == Kind::EXCEPTION) {
+      Token e = cur(); advance();
+      Pattern inner = parse_pat_tuple();
+      Position ie = inner.loc.end;
+      return Pattern{Ppat_exception{box(std::move(inner))}, span(position(e.start), ie)};
+    }
+    return parse_pat_tuple();
+  }
   Pattern parse_pat_or() {
-    Pattern p = parse_pat_tuple();
+    Pattern p = parse_pat_or_operand();
     while (cur().kind == Kind::BAR) {
       advance();
-      Pattern r;
-      if (cur().kind == Kind::EXCEPTION) {  // `p | exception q`
-        Token e = cur(); advance();
-        Pattern inner = parse_pat_tuple();
-        Position ie = inner.loc.end;
-        r = Pattern{Ppat_exception{box(std::move(inner))}, span(position(e.start), ie)};
-      } else {
-        r = parse_pat_tuple();
-      }
+      Pattern r = parse_pat_or_operand();
       Location l = span(p.loc.start, r.loc.end);
       p = Pattern{Ppat_or{box(std::move(p)), box(std::move(r))}, l};
     }
