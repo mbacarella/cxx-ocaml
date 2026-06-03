@@ -1063,7 +1063,7 @@ class Parser {
   // ---- core types ----
   // poly_type: `'a 'b. t` -> ghost Ptyp_poly, else a plain core_type.  Used where
   // an explicit universal quantifier is allowed (let/val/method/field annotations).
-  CoreTypeBox parse_poly_type() {
+  CoreTypeBox parse_poly_type(bool ghost) {
     if (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
       size_t save = idx_;
       Position start = position(cur().start);
@@ -1074,7 +1074,7 @@ class Parser {
       if (cur().kind == Kind::DOT) {
         advance();
         CoreTypeBox inner = parse_core_type();
-        Location l{start, inner->loc.end, /*ghost=*/true};
+        Location l{start, inner->loc.end, ghost};
         return box(CoreType{Ptyp_poly{std::move(vars), std::move(inner)}, l});
       }
       idx_ = save;  // not `'a. …` — a plain type starting with a type variable
@@ -1251,7 +1251,7 @@ class Parser {
     }
     throw ParseError("expected a type", t.start);
   }
-  CoreTypeBox parse_possibly_poly_type() { return parse_core_type(); }
+  CoreTypeBox parse_possibly_poly_type() { return parse_poly_type(/*ghost=*/false); }
   RowField parse_row_field() {
     if (cur().kind == Kind::BACKQUOTE) {
       advance();
@@ -1932,7 +1932,7 @@ class Parser {
         expect(Kind::DOT, ".");
         vconstr = Pvc_constraint{std::move(univars), parse_core_type()};
       } else {
-        CoreTypeBox ty = parse_poly_type();  // allows `: 'a 'b. t` -> Ptyp_poly
+        CoreTypeBox ty = parse_poly_type(true);  // allows `: 'a 'b. t` -> Ptyp_poly
         if (cur().kind == Kind::COLONGREATER) {  // : t :> t2
           advance();
           CoreTypeBox ty2 = parse_core_type();
@@ -2381,7 +2381,7 @@ class Parser {
         vname = StringLoc{*op, span(position(nm.start), position(c.end))};
       } else { advance(); vname = StringLoc{nm.text, tokloc(nm)}; }
       expect(Kind::COLON, ":");
-      CoreTypeBox ty = parse_core_type();
+      CoreTypeBox ty = parse_poly_type(false);
       Attributes attrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
       Location l = here();
