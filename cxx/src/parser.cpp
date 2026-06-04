@@ -1755,7 +1755,19 @@ class Parser {
       Location cl = span(position(lp.start), position(rp.end));
       return {id.text, Pattern{Ppat_constraint{box(std::move(var)), std::move(ty)}, cl}};
     }
-    return {std::nullopt, parse_pat_cons()};
+    Pattern p = parse_pat_cons();
+    // A (possibly chained) `as id` binds to *this* tuple element only when another
+    // element follows (a comma after the whole alias chain); a trailing alias binds
+    // the whole tuple instead (handled above parse_pat_tuple).
+    int k = 0;
+    while (peek(k).kind == Kind::AS && peek(k + 1).kind == Kind::LIDENT) k += 2;
+    if (k > 0 && peek(k).kind == Kind::COMMA)
+      for (int j = 0; j < k; j += 2) {
+        advance(); Token id = cur(); advance();
+        Location l = span(p.loc.start, position(id.end));
+        p = Pattern{Ppat_alias{box(std::move(p)), StringLoc{id.text, tokloc(id)}}, l};
+      }
+    return {std::nullopt, std::move(p)};
   }
   Pattern parse_pat_tuple() {
     Position s = position(cur().start);
