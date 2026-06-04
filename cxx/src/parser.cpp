@@ -1997,14 +1997,18 @@ class Parser {
   static bool is_ctor_name_start(Kind k, Kind k1) {
     return k == Kind::UIDENT || k == Kind::TRUE || k == Kind::FALSE ||
            (k == Kind::LBRACKET && k1 == Kind::RBRACKET) ||      // []
-           (k == Kind::LPAREN && k1 == Kind::COLONCOLON);        // (::)
+           (k == Kind::LPAREN && (k1 == Kind::COLONCOLON || k1 == Kind::RPAREN));  // (::) / ()
   }
-  // A constructor name: UIDENT, `true`/`false`, or the list constructors `[]`/`(::)`.
+  // A constructor name: UIDENT, `true`/`false`, or `[]`/`(::)`/`()`.
   StringLoc parse_constructor_name() {
     Token nm = cur();
     if (nm.kind == Kind::LBRACKET && peek(1).kind == Kind::RBRACKET) {
       advance(); Token c = cur(); advance();
       return StringLoc{"[]", span(position(nm.start), position(c.end))};
+    }
+    if (nm.kind == Kind::LPAREN && peek(1).kind == Kind::RPAREN) {  // ()
+      advance(); Token c = cur(); advance();
+      return StringLoc{"()", span(position(nm.start), position(c.end))};
     }
     if (nm.kind == Kind::LPAREN && peek(1).kind == Kind::COLONCOLON) {
       advance(); advance(); Token c = cur(); expect(Kind::RPAREN, ")");
@@ -2188,7 +2192,8 @@ class Parser {
                         cur().kind == Kind::BAR || cur().kind == Kind::TRUE ||
                         cur().kind == Kind::FALSE ||
                         (cur().kind == Kind::LBRACKET && peek(1).kind == Kind::RBRACKET) ||
-                        (cur().kind == Kind::LPAREN && peek(1).kind == Kind::COLONCOLON) ||
+                        (cur().kind == Kind::LPAREN && (peek(1).kind == Kind::COLONCOLON ||
+                                                        peek(1).kind == Kind::RPAREN)) ||
                         (cur().kind == Kind::UIDENT && peek(1).kind != Kind::DOT &&
                          peek(1).kind != Kind::LPAREN);
       if (kind_start) {
