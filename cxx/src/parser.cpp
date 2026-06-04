@@ -1165,10 +1165,12 @@ class Parser {
         // Pfunction_cases directly (not a nested function under Pfunction_body).
         if (!all_newtype && cur().kind == Kind::FUNCTION) {
           Token fkw = cur(); advance();
+          Attributes fnattrs;  // `function[@attr] …` — attaches to the Pfunction_cases
+          while (cur().kind == Kind::LBRACKETAT) { advance(); fnattrs.push_back(parse_attribute_body()); }
           std::vector<Case> cs = parse_cases();
           Position last = last_case_end_;
           Location casesloc = span(position(fkw.start), last);
-          auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
+          auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc, std::move(fnattrs)}});
           return withattrs(E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)},
                               span(position(t.start), last)}));
         }
@@ -2616,10 +2618,12 @@ class Parser {
     // body is the Pfunction_cases directly (not a nested function body).
     if (cur().kind == Kind::FUNCTION && (!params.empty() || fconstr)) {
       Token fkw = cur(); advance();
+      Attributes fattrs;  // `function[@attr] …` — attaches to the Pfunction_cases
+      while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
       std::vector<Case> cs = parse_cases();
       Position last = last_case_end_;
       Location casesloc = span(position(fkw.start), last);
-      auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
+      auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc, std::move(fattrs)}});
       Location floc = span(param_loc(params.front()).start, last, /*ghost=*/true);
       ExprBox fn = E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)}, floc});
       return ValueBinding{std::move(namepat), std::move(fn), std::nullopt};
@@ -2725,8 +2729,11 @@ class Parser {
     if (t.kind == Kind::INCLUDE) {
       advance();
       ModuleExpr me = parse_module_expr();
+      Attributes iattrs;  // pincl_attributes: `include M [@@attr]`
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); iattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      return StructureItem{Pstr_include{std::move(me)}, l};
+      attach_docs(iattrs, l.start.cnum, l.end.cnum);
+      return StructureItem{Pstr_include{std::move(me), std::move(iattrs)}, l};
     }
     if (t.kind == Kind::TYPE) {
       advance();
@@ -3223,7 +3230,11 @@ class Parser {
     if (t.kind == Kind::INCLUDE) {
       advance();
       ModuleType mt = parse_module_type();
-      return SignatureItem{Psig_include{std::move(mt)}, here()};
+      Attributes iattrs;  // pincl_attributes: `include S [@@attr]`
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); iattrs.push_back(parse_attribute_body()); }
+      Location l = here();
+      attach_docs(iattrs, l.start.cnum, l.end.cnum);
+      return SignatureItem{Psig_include{std::move(mt), std::move(iattrs)}, l};
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // module type
@@ -3352,7 +3363,9 @@ class Parser {
       Location fl = span(params[i].first, me.loc.end);
       me = ModuleExpr{Pmod_functor{std::move(params[i].second), box(std::move(me))}, fl};
     }
-    return ModuleBinding{std::move(name), std::move(me)};
+    Attributes mbattrs;  // pmb_attributes: `module rec M = … [@@attr]`
+    while (cur().kind == Kind::LBRACKETATAT) { advance(); mbattrs.push_back(parse_attribute_body()); }
+    return ModuleBinding{std::move(name), std::move(me), std::move(mbattrs)};
   }
 
   ModuleExpr parse_module_expr() {
@@ -3612,10 +3625,12 @@ class Parser {
         // Pfunction_cases), mirroring the let/fun desugaring.
         if (!params.empty() && cur().kind == Kind::FUNCTION) {
           Token fkw = cur(); advance();
+          Attributes fattrs;  // `function[@attr] …` — attaches to the Pfunction_cases
+          while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
           std::vector<Case> cs = parse_cases();
           Position last = last_case_end_;
           Location casesloc = span(position(fkw.start), last);
-          auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
+          auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc, std::move(fattrs)}});
           std::vector<FunctionParam> ps;
           for (auto& pr : params) ps.push_back(std::move(pr.second));
           Location floc = span(params.front().first, last, /*ghost=*/true);
@@ -3704,6 +3719,10 @@ class Parser {
       // even though `(ce)` itself keeps the inner loc.
       Location l = span(position(t.start), args.back().second->loc.end);
       ce = ClassExpr{Pcl_apply{box(std::move(ce)), std::move(args)}, l, {}};
+    }
+    while (cur().kind == Kind::LBRACKETAT) {  // class_expr [@attr]  (Cl.attr)
+      advance();
+      ce.attrs.push_back(parse_attribute_body());
     }
     return ce;
   }

@@ -250,7 +250,7 @@ struct Pparam_newtype { StringLoc name; Location loc; };  // (type a)
 struct FunctionParam { std::variant<Pparam_val, Pparam_newtype> desc; };
 
 struct Pfunction_body { ExprBox e; };
-struct Pfunction_cases { std::vector<Case> cases; Location loc; };  // attrs empty
+struct Pfunction_cases { std::vector<Case> cases; Location loc; Attributes attrs; };  // `function[@attr]`
 struct FunctionBody { std::variant<Pfunction_body, Pfunction_cases> v; };
 
 // --- type declarations ---
@@ -363,7 +363,7 @@ struct Psig_modtype { StringLoc name; std::optional<ModuleType> type; Attributes
 struct Psig_modtypesubst { StringLoc name; ModuleType type; };  // module type S := mty
 struct Psig_modsubst { StrOptLoc name; LongidentLoc manifest; };  // module M := X.Y
 struct Psig_open { OverrideFlag ovr; LongidentLoc id; };
-struct Psig_include { ModuleType mt; };
+struct Psig_include { ModuleType mt; Attributes attrs; };
 struct Psig_class { std::vector<ClassTypeDeclaration> decls; };  // class c : ct  (class_description)
 struct Psig_class_type { std::vector<ClassTypeDeclaration> decls; };
 struct Psig_attribute { std::string name; Structure payload; };
@@ -476,7 +476,7 @@ struct Pstr_module { ModuleBinding binding; };
 struct Pstr_recmodule { std::vector<ModuleBinding> bindings; };  // module rec A = … and B = …
 struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
 struct Pstr_extension { std::string name; Structure payload; };  // [%%ext …]
-struct Pstr_include { ModuleExpr expr; };
+struct Pstr_include { ModuleExpr expr; Attributes attrs; };
 struct Pstr_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S = mty
 struct Pstr_class { std::vector<ClassDeclaration> decls; };
 struct Pstr_class_type { std::vector<ClassTypeDeclaration> decls; };

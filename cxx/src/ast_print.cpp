@@ -555,6 +555,7 @@ struct Printer {
     } else {
       auto& fc = std::get<Pfunction_cases>(b.v);
       line(i, "Pfunction_cases " + loc(fc.loc));
+      attributes(i + 1, fc.attrs);  // `function[@attr]` attrs on the cases body
       cases(i + 1, fc.cases);
     }
   }
@@ -685,6 +686,7 @@ struct Printer {
       line(j, "Psig_open " + std::string(override_flag(v->ovr)) + " " + lid_loc(v->id));
     } else if (auto* v = std::get_if<Psig_include>(&s.desc)) {
       line(j, "Psig_include");
+      attributes(j, v->attrs);  // pincl_attributes
       module_type(j, v->mt);
     } else if (auto* v = std::get_if<Psig_class>(&s.desc)) {
       line(j, "Psig_class");
@@ -1088,6 +1090,7 @@ struct Printer {
       structure_list(j, v->payload);  // extension payload at i
     } else if (auto* v = std::get_if<Pstr_include>(&s.desc)) {
       os << ind(j) << "Pstr_include";  // printast prints this with no trailing newline
+      attributes(j, v->attrs);  // pincl_attributes
       module_expr(j, v->expr);
     } else if (auto* v = std::get_if<Pstr_modtype>(&s.desc)) {
       line(j, "Pstr_modtype " + str_loc(v->name));
