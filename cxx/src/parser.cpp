@@ -113,12 +113,14 @@ class Parser {
   // symbol_info: a doc comment following a field/constructor (`x : t (** doc *)`)
   // is appended as an `ocaml.doc` attribute.
   std::set<size_t> consumed_post_;  // post-doc keys already taken as an info doc
-  void append_info_doc(Attributes& attrs, size_t endCnum) {
+  bool append_info_doc(Attributes& attrs, size_t endCnum) {
     auto it = docs_.post.find(endCnum);
     if (it != docs_.post.end() && !it->second.empty()) {
       attrs.push_back(doc_attr(it->second.front()));
       consumed_post_.insert(endCnum);  // the enclosing decl must not reuse it
+      return true;
     }
+    return false;
   }
   void attach_docs(Attributes& attrs, size_t startCnum, size_t endCnum) {
     auto pit = docs_.pre.find(startCnum);
@@ -2010,11 +2012,17 @@ class Parser {
       suppress_type_trailing_attr_ = false;
       Attributes fattrs;  // pld_attributes: `field : t [@attr]`
       while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
-      append_info_doc(fattrs, tokens_[idx_ - 1].end);  // `field : t (** doc *)`
+      bool got_doc = append_info_doc(fattrs, tokens_[idx_ - 1].end);  // `field : t (** doc *)`
       // pld_loc includes the trailing ';' separator when present.
       Position endp = position(tokens_[idx_ - 1].end);
       bool more = false;
-      if (cur().kind == Kind::SEMI) { endp = position(cur().end); advance(); more = true; }
+      if (cur().kind == Kind::SEMI) {
+        endp = position(cur().end); advance(); more = true;
+        while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
+        // `field : t ; (** doc *)`  -> the doc after the `;` is the field's info doc
+        // (label_declaration_semi: rhs_info before semi, else symbol_info after).
+        if (!got_doc) append_info_doc(fattrs, tokens_[idx_ - 1].end);
+      }
       fields.push_back(LabelDecl{StringLoc{nm.text, tokloc(nm)}, mut, std::move(ty),
                                  span(position(start.start), endp), std::move(fattrs)});
       if (!more) break;
@@ -2844,6 +2852,7 @@ class Parser {
     return mt;
   }
   ModuleType parse_module_type_with() {
+    Position symstart = position(cur().start);  // $sloc start (the `(` of a paren'd base)
     ModuleType mt = parse_module_type_base();
     while (cur().kind == Kind::LBRACKETAT) {  // mty [@attr]  -> pmty_attributes
       advance();
@@ -2854,8 +2863,7 @@ class Parser {
       std::vector<WithConstraint> cs;
       cs.push_back(parse_with_constraint());
       while (cur().kind == Kind::AND) { advance(); cs.push_back(parse_with_constraint()); }
-      Position s = mt.loc.start;
-      Location l = span(s, position(tokens_[idx_ - 1].end));
+      Location l = span(symstart, position(tokens_[idx_ - 1].end));
       mt = ModuleType{Pmty_with{box(std::move(mt)), std::move(cs)}, l, {}};
     }
     return mt;
