@@ -2828,10 +2828,11 @@ class Parser {
   Location none_loc() const { return Location{Position{0, 0, -1}, Position{0, 0, -1}, true}; }
 
   ModuleType parse_module_type() {
+    Position symstart = position(cur().start);  // $sloc start (the `(` of a paren'd domain)
     ModuleType mt = parse_module_type_with();
     if (cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
       advance();
-      Position s = mt.loc.start;
+      Position s = symstart;
       ModuleType cod = parse_module_type();
       FunctorParam param = Functor_named{StrOptLoc{std::nullopt, none_loc()}, box(std::move(mt))};
       Location l = span(s, cod.loc.end);
@@ -2885,12 +2886,21 @@ class Parser {
       if (subst) return Pwith_typesubst{std::move(lid), std::move(td)};
       return Pwith_type{std::move(lid), std::move(td)};
     }
+    if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {  // with module type X [:=] mty
+      advance(); advance();  // module type
+      LongidentLoc lid = parse_longident_path();
+      bool subst = cur().kind == Kind::COLONEQUAL;
+      if (subst) advance(); else expect(Kind::EQUAL, "=");
+      ModuleType mty = parse_module_type();
+      if (subst) return Pwith_modtypesubst{std::move(lid), box(std::move(mty))};
+      return Pwith_modtype{std::move(lid), box(std::move(mty))};
+    }
     if (t.kind == Kind::MODULE) {
       advance();
       LongidentLoc lid1 = parse_longident_path();
       bool subst = cur().kind == Kind::COLONEQUAL;
       if (subst) advance(); else expect(Kind::EQUAL, "=");
-      LongidentLoc lid2 = parse_longident_path();
+      LongidentLoc lid2 = parse_type_path();  // rhs may be a functor app `F(List)`
       if (subst) return Pwith_modsubst{std::move(lid1), std::move(lid2)};
       return Pwith_module{std::move(lid1), std::move(lid2)};
     }
@@ -3374,6 +3384,9 @@ class Parser {
     }
     if (t.kind == Kind::METHOD) {
       advance();
+      // $sloc of the method body rule begins at override_flag (the `!`/attrs/
+      // `private`/`virtual`/label group after METHOD), used by wrap_type_annotation.
+      Position groupStart = position(cur().start);
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
       skip_item_attrs();
@@ -3407,7 +3420,7 @@ class Parser {
         expect(Kind::EQUAL, "=");
         ExprBox e = parse_expr();
         Position bodyEnd = last_seq_end_;
-        Location innerLoc = span(name.loc.start, bodyEnd);  // $sloc (non-ghost)
+        Location innerLoc = span(groupStart, bodyEnd);  // $sloc (from override_flag)
         ExprBox wrapped = E({Pexp_constraint{std::move(e), std::move(T)}, innerLoc});
         for (int i = static_cast<int>(newtypes.size()) - 1; i >= 0; --i)
           wrapped = E({Pexp_newtype{newtypes[i], std::move(wrapped)}, innerLoc});

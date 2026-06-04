@@ -733,9 +733,15 @@ struct Printer {
       type_declaration(i + 1, *p->td);
     } else if (auto* p = std::get_if<Pwith_module>(&w)) {
       line(i, "Pwith_module " + lid_loc(p->lid1) + " = " + lid_loc(p->lid2));
+    } else if (auto* p = std::get_if<Pwith_modsubst>(&w)) {
+      line(i, "Pwith_modsubst " + lid_loc(p->lid1) + " = " + lid_loc(p->lid2));
+    } else if (auto* p = std::get_if<Pwith_modtype>(&w)) {
+      line(i, "Pwith_modtype " + lid_loc(p->lid));
+      module_type(i + 1, *p->mty);
     } else {
-      auto& pm = std::get<Pwith_modsubst>(w);
-      line(i, "Pwith_modsubst " + lid_loc(pm.lid1) + " = " + lid_loc(pm.lid2));
+      auto& pm = std::get<Pwith_modtypesubst>(w);
+      line(i, "Pwith_modtypesubst " + lid_loc(pm.lid));
+      module_type(i + 1, *pm.mty);
     }
   }
   void module_expr(int i, const ModuleExpr& m) {

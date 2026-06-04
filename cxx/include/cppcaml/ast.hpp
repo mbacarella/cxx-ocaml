@@ -324,7 +324,10 @@ struct Pwith_type { LongidentLoc lid; Box<TypeDeclaration> td; };
 struct Pwith_typesubst { LongidentLoc lid; Box<TypeDeclaration> td; };
 struct Pwith_module { LongidentLoc lid1; LongidentLoc lid2; };
 struct Pwith_modsubst { LongidentLoc lid1; LongidentLoc lid2; };
-using WithConstraint = std::variant<Pwith_type, Pwith_typesubst, Pwith_module, Pwith_modsubst>;
+struct Pwith_modtype { LongidentLoc lid; Box<ModuleType> mty; };       // with module type X = mty
+struct Pwith_modtypesubst { LongidentLoc lid; Box<ModuleType> mty; };  // with module type X := mty
+using WithConstraint = std::variant<Pwith_type, Pwith_typesubst, Pwith_module, Pwith_modsubst,
+                                    Pwith_modtype, Pwith_modtypesubst>;
 struct Pmty_with { ModuleTypeBox mt; std::vector<WithConstraint> constraints; };
 struct Pmty_typeof { ModuleExprBox me; };
 struct Pmty_alias { LongidentLoc id; };  // module B = A  (in a signature)
