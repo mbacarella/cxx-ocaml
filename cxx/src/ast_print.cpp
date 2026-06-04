@@ -668,6 +668,7 @@ struct Printer {
       line(j, "Psig_modsubst " + str_opt_loc(v->name) + " = " + lid_loc(v->manifest));
     } else if (auto* v = std::get_if<Psig_modtype>(&s.desc)) {
       line(j, "Psig_modtype " + str_loc(v->name));
+      attributes(j, v->attrs);  // pmtd_attributes, before the module_type
       if (v->type) module_type(j + 1, *v->type);
       else os << ind(j) << "#abstract";  // printast: no trailing newline
     } else if (auto* v = std::get_if<Psig_open>(&s.desc)) {
@@ -1064,6 +1065,7 @@ struct Printer {
       module_expr(j, v->expr);
     } else if (auto* v = std::get_if<Pstr_modtype>(&s.desc)) {
       line(j, "Pstr_modtype " + str_loc(v->name));
+      attributes(j, v->attrs);  // pmtd_attributes, before the module_type
       if (v->type) module_type(j + 1, *v->type);  // modtype_declaration: Some -> module_type(i+1)
       else os << ind(j) << "#abstract";  // printast: no trailing newline
     } else if (auto* v = std::get_if<Pstr_class>(&s.desc)) {

@@ -343,7 +343,7 @@ struct Psig_exception { TypeException exn; };
 struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; };
 struct Psig_module { ModuleDeclaration md; };
 struct Psig_recmodule { std::vector<ModuleDeclaration> decls; };  // module rec M : … and N : …
-struct Psig_modtype { StringLoc name; std::optional<ModuleType> type; };  // module type S [= mty]
+struct Psig_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S [= mty]
 struct Psig_modtypesubst { StringLoc name; ModuleType type; };  // module type S := mty
 struct Psig_modsubst { StrOptLoc name; LongidentLoc manifest; };  // module M := X.Y
 struct Psig_open { OverrideFlag ovr; LongidentLoc id; };
@@ -460,7 +460,7 @@ struct Pstr_recmodule { std::vector<ModuleBinding> bindings; };  // module rec A
 struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
 struct Pstr_extension { std::string name; Structure payload; };  // [%%ext …]
 struct Pstr_include { ModuleExpr expr; };
-struct Pstr_modtype { StringLoc name; std::optional<ModuleType> type; };  // module type S = mty
+struct Pstr_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S = mty
 struct Pstr_class { std::vector<ClassDeclaration> decls; };
 struct Pstr_class_type { std::vector<ClassTypeDeclaration> decls; };
 struct StructureItem {

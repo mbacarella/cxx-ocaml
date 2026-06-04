@@ -2697,8 +2697,11 @@ class Parser {
       advance();
       std::optional<ModuleType> mty;
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
+      Attributes mtattrs;
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); mtattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      return StructureItem{Pstr_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty)}, l};
+      attach_docs(mtattrs, l.start.cnum, l.end.cnum);
+      return StructureItem{Pstr_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty), std::move(mtattrs)}, l};
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::REC) {
       advance(); advance();  // module rec
@@ -2745,6 +2748,7 @@ class Parser {
         decls.push_back(parse_one_class_type_decl(akw));
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
       return StructureItem{Pstr_class_type{std::move(decls)}, l};
     }
     if (t.kind == Kind::CLASS) {
@@ -2757,6 +2761,7 @@ class Parser {
         decls.push_back(parse_one_class_decl(akw));
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
       return StructureItem{Pstr_class{std::move(decls)}, l};
     }
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ name payload ]  (floating attribute)
@@ -3076,7 +3081,11 @@ class Parser {
       }
       std::optional<ModuleType> mty;
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
-      return SignatureItem{Psig_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty)}, here()};
+      Attributes mtattrs;
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); mtattrs.push_back(parse_attribute_body()); }
+      Location l = here();
+      attach_docs(mtattrs, l.start.cnum, l.end.cnum);
+      return SignatureItem{Psig_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty), std::move(mtattrs)}, l};
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::REC) {  // module rec M : mt and N : mt
       advance(); advance();  // module rec
