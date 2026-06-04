@@ -2218,12 +2218,12 @@ class Parser {
       Location loc = span(position(t.start), position(id.end));
       return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p)}};
     }
-    // ~(x:t)  (labelled punning with a type constraint)
+    // ~(x:t)  (labelled punning with a type constraint, possibly poly)
     if (t.kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {
       advance(); advance();  // ~ (
       Token id = cur(); advance();
       expect(Kind::COLON, ":");
-      CoreTypeBox ty = parse_core_type();
+      CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
       Token c = cur(); expect(Kind::RPAREN, ")");
       Pattern var{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location pl = span(position(id.start), ty->loc.end);  // inner: x..type
@@ -2274,8 +2274,8 @@ class Parser {
       advance();
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       if (cur().kind == Kind::COLON) {
-        advance(); CoreTypeBox ty = parse_core_type();
-        Location pl = p.loc;
+        advance(); CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
+        Location pl = span(p.loc.start, ty->loc.end);  // inner: x..type
         p = Pattern{Ppat_constraint{box(std::move(p)), std::move(ty)}, pl};
       }
       std::optional<ExprBox> def;
