@@ -110,12 +110,22 @@ class Parser {
   }
   Attribute doc_attr(const Docstring& d) { return Attribute{"ocaml.doc", doc_payload(d)}; }
   // get_pre_docs / get_post_docs: the first docstring of the list, prepended/appended.
+  // symbol_info: a doc comment following a field/constructor (`x : t (** doc *)`)
+  // is appended as an `ocaml.doc` attribute.
+  std::set<size_t> consumed_post_;  // post-doc keys already taken as an info doc
+  void append_info_doc(Attributes& attrs, size_t endCnum) {
+    auto it = docs_.post.find(endCnum);
+    if (it != docs_.post.end() && !it->second.empty()) {
+      attrs.push_back(doc_attr(it->second.front()));
+      consumed_post_.insert(endCnum);  // the enclosing decl must not reuse it
+    }
+  }
   void attach_docs(Attributes& attrs, size_t startCnum, size_t endCnum) {
     auto pit = docs_.pre.find(startCnum);
     if (pit != docs_.pre.end() && !pit->second.empty())
       attrs.insert(attrs.begin(), doc_attr(pit->second.front()));
     auto qit = docs_.post.find(endCnum);
-    if (qit != docs_.post.end() && !qit->second.empty())
+    if (qit != docs_.post.end() && !qit->second.empty() && !consumed_post_.count(endCnum))
       attrs.push_back(doc_attr(qit->second.front()));
   }
   void emit_text(Structure& items, const std::unordered_map<size_t, std::vector<Docstring>>& m,
@@ -1944,6 +1954,7 @@ class Parser {
       suppress_type_trailing_attr_ = false;
       Attributes fattrs;  // pld_attributes: `field : t [@attr]`
       while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
+      append_info_doc(fattrs, tokens_[idx_ - 1].end);  // `field : t (** doc *)`
       // pld_loc includes the trailing ';' separator when present.
       Position endp = position(tokens_[idx_ - 1].end);
       bool more = false;
@@ -2020,6 +2031,7 @@ class Parser {
     Attributes attrs;  // pcd_attributes: `A [@deprecated]`
     while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
     if (!attrs.empty()) endp = position(tokens_[idx_ - 1].end);
+    append_info_doc(attrs, tokens_[idx_ - 1].end);  // `A of t (** doc *)`
     return ConstructorDecl{std::move(cname), std::move(args), std::move(res),
                            span(start, endp), std::move(attrs)};
   }
