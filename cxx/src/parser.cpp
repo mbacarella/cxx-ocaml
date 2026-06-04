@@ -624,14 +624,23 @@ class Parser {
         std::vector<std::pair<LongidentLoc, ExprBox>> fields;
         while (cur().kind != Kind::RBRACE) {
           LongidentLoc lbl = parse_longident_path();
-          if (cur().kind == Kind::COLON) {  // `{ f : ty = e }` -> f = (e : ty)
+          if (cur().kind == Kind::COLON) {  // `{ f : ty [= e] }`
             Position colonPos = position(cur().start);
             advance();
             CoreTypeBox fty = parse_poly_type(/*ghost=*/false);
-            expect(Kind::EQUAL, "=");
-            ExprBox v = parse_expr_no_seq();
-            Location cl{colonPos, v->loc.end, false};
-            fields.emplace_back(lbl, E({Pexp_constraint{std::move(v), std::move(fty)}, cl}));
+            if (cur().kind == Kind::EQUAL) {  // `{ f : ty = e }` -> f = (e : ty)
+              advance();
+              ExprBox v = parse_expr_no_seq();
+              Location cl{colonPos, v->loc.end, false};
+              fields.emplace_back(lbl, E({Pexp_constraint{std::move(v), std::move(fty)}, cl}));
+            } else {  // `{ f : ty }` punning -> f = (f : ty); the label becomes ghost
+              LongidentLoc glbl = lbl;
+              glbl.loc.ghost = true;
+              LongidentLoc vid{{Lident{lid_last_name(lbl.txt)}}, lbl.loc};
+              ExprBox id = E({Pexp_ident{.id = std::move(vid)}, lbl.loc});
+              Location cl{lbl.loc.start, fty->loc.end, false};
+              fields.emplace_back(glbl, E({Pexp_constraint{std::move(id), std::move(fty)}, cl}));
+            }
           } else if (cur().kind == Kind::EQUAL) {
             advance();
             fields.emplace_back(lbl, parse_expr_no_seq());
