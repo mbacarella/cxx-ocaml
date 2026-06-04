@@ -2902,7 +2902,7 @@ class Parser {
       advance();
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
-      LongidentLoc id = parse_longident_path();
+      LongidentLoc id = parse_type_path();  // may contain functor application Set.Make(B)
       return SignatureItem{Psig_open{ovr, std::move(id)}, here()};
     }
     if (t.kind == Kind::INCLUDE) {
