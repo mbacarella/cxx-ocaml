@@ -1284,14 +1284,15 @@ class Parser {
     }
   }
   CoreTypeBox parse_core_type() {
+    Position symstart = position(cur().start);  // symbol span (incl. a parenthesized child's parens)
     CoreTypeBox t = parse_type_arrow();
-    while (cur().kind == Kind::AS && peek(1).kind == Kind::QUOTE) {  // (t as 'a)
+    while (cur().kind == Kind::AS && peek(1).kind == Kind::QUOTE) {  // t as 'a
       advance();  // as
       advance();  // '
       Token id = cur();
       if (id.kind != Kind::LIDENT) throw ParseError("expected type variable", id.start);
       advance();
-      Location l = span(t->loc.start, position(id.end));
+      Location l = span(symstart, position(id.end));
       t = box(CoreType{Ptyp_alias{std::move(t), id.text}, l});
     }
     return t;
