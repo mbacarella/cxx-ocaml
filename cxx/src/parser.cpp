@@ -577,10 +577,11 @@ class Parser {
           if (cur().kind == Kind::EQUAL) {
             advance();
             fields.emplace_back(lbl, parse_expr_no_seq());
-          } else {  // punning { x }: the label longident is ghost, value ident real
+          } else {  // punning { M.x }: label is the full path (ghost); value is `x`
             LongidentLoc glbl = lbl;
             glbl.loc.ghost = true;
-            fields.emplace_back(glbl, E({Pexp_ident{.id = lbl}, lbl.loc}));
+            LongidentLoc vid{{Lident{lid_last_name(lbl.txt)}}, lbl.loc};  // last name, full loc
+            fields.emplace_back(glbl, E({Pexp_ident{.id = std::move(vid)}, lbl.loc}));
           }
           if (cur().kind == Kind::SEMI) advance(); else break;
         }
