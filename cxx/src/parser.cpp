@@ -268,7 +268,10 @@ class Parser {
     Longident lid{Lident{first.text}};
     Token last = first;
     bool upper = first.kind == Kind::UIDENT;
-    while (cur().kind == Kind::DOT &&
+    // A value/constructor path continues only through uppercase module prefixes;
+    // once a lowercase value component is consumed the path is done, so a
+    // following `.Upper` is a (qualified) field access, e.g. `C.one.Complex.re`.
+    while (upper && cur().kind == Kind::DOT &&
            (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
       advance();
       Token nm = cur();
