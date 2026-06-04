@@ -158,6 +158,9 @@ class Parser {
     Structure items;
     emit_text(items, docs_.pre_extra, startKey);  // extra_str leading text
     for (auto& it : body) items.push_back(std::move(it));
+    // a pre-doc on the closing token of an empty `struct (** doc *) end` is
+    // floating text (ocaml.text); a trailing doc at EOF is not (extra_str drops it).
+    if (body.empty() && cur().kind != Kind::TEOF) emit_text(items, docs_.pre, cur().start);
     emit_text(items, docs_.post_extra, endKey);  // extra_str trailing text
     return items;
   }
@@ -2991,6 +2994,9 @@ class Parser {
     Signature items;
     emit_text_sig(items, docs_.pre_extra, startKey);
     for (auto& it : body) items.push_back(std::move(it));
+    // a pre-doc on the closing token (e.g. empty `sig (** doc *) end`) attaches to
+    // no item, so it is floating text (ocaml.text), not ocaml.doc.
+    if (body.empty() && cur().kind != Kind::TEOF) emit_text_sig(items, docs_.pre, cur().start);
     emit_text_sig(items, docs_.post_extra, endKey);
     return items;
   }
