@@ -1199,7 +1199,7 @@ class Parser {
       }
       case Kind::FOR: {
         advance();
-        Pattern var = parse_simple_pattern();
+        Pattern var = parse_pattern();  // grammar: `for pattern = …` (not just an ident)
         expect(Kind::EQUAL, "=");
         ExprBox lo = parse_expr();
         DirectionFlag dir;
