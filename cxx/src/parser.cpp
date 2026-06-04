@@ -2007,9 +2007,18 @@ class Parser {
     StringLoc cname = parse_constructor_name();
     ConstructorArguments args = Pcstr_tuple{};
     std::optional<CoreTypeBox> res;
+    std::vector<std::string> gvars;  // pcd_vars
     Position endp = cname.loc.end;
-    if (cur().kind == Kind::COLON) {  // GADT:  A : t1 * … * tn -> tres   (or  A : tres)
+    if (cur().kind == Kind::COLON) {  // GADT:  A : ['a 'b.] t1 * … -> tres
       advance();
+      if (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {  // pcd_vars: 'a 'b.
+        size_t save = idx_;
+        while (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
+          advance(); gvars.push_back(cur().text); advance();
+        }
+        if (cur().kind == Kind::DOT) advance();
+        else { idx_ = save; gvars.clear(); }
+      }
       if (cur().kind == Kind::LBRACE) {  // A : { fields } -> tres  (inline record)
         args = Pcstr_record{parse_label_decls()};
         expect(Kind::MINUSGREATER, "->");
@@ -2046,7 +2055,7 @@ class Parser {
     if (!attrs.empty()) endp = position(tokens_[idx_ - 1].end);
     append_info_doc(attrs, tokens_[idx_ - 1].end);  // `A of t (** doc *)`
     return ConstructorDecl{std::move(cname), std::move(args), std::move(res),
-                           span(start, endp), std::move(attrs)};
+                           span(start, endp), std::move(attrs), std::move(gvars)};
   }
   CoreTypeBox parse_type_param() {
     if (cur().kind == Kind::PLUS || cur().kind == Kind::MINUS) advance();  // variance (dropped)
