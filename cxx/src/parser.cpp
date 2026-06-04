@@ -24,8 +24,7 @@ struct OpInfo { int prec; bool right; std::string name; };
 // OCaml infix operator precedence/associativity (higher = binds tighter).
 std::optional<OpInfo> infix_op(const Token& t) {
   switch (t.kind) {
-    case Kind::COLONEQUAL: return OpInfo{1, true, ":="};
-    // note: `<-` (LESSMINUS) is assignment, not an operator — handled in parse_binop
+    // `:=` and `<-` bind looser than `,` (tuple) — handled in parse_assign, not here.
     case Kind::BARBAR:     return OpInfo{2, true, "||"};
     case Kind::AMPERSAND:  return OpInfo{3, true, "&"};
     case Kind::AMPERAMPER: return OpInfo{3, true, "&&"};
@@ -589,7 +588,9 @@ class Parser {
       }
       case Kind::BANG: case Kind::PREFIXOP: {
         advance();
-        ExprBox arg = parse_atom_postfix();
+        // prefix op applies to a *simple* expr; postfix `.f`/`#m` apply outside it
+        // (`!!e#m` == `(!!e)#m`).
+        ExprBox arg = parse_atom();
         Location opl = tokloc(t);
         std::string nm = t.kind == Kind::BANG ? "!" : t.text;
         ExprBox fn = E({Pexp_ident{.id = lid0(nm, opl)}, opl});
@@ -819,17 +820,31 @@ class Parser {
     }
     throw ParseError("invalid assignment target", lhs->loc.start.cnum);
   }
+  // `lhs := rhs` / `lhs <- rhs` — assignment, looser than `,` (tuple), right-assoc.
+  ExprBox parse_assign() {
+    ExprBox left = parse_tuple();
+    if (cur().kind == Kind::LESSMINUS) {
+      advance();
+      ExprBox right = parse_assign();
+      Location l = span(left->loc.start, right->loc.end);
+      return make_assignment(std::move(left), std::move(right), l);
+    }
+    if (cur().kind == Kind::COLONEQUAL) {
+      Token op = cur(); advance();
+      ExprBox right = parse_assign();
+      Location opl = tokloc(op);
+      ExprBox fn = E({Pexp_ident{LongidentLoc{{Lident{":="}}, opl}}, opl});
+      Location l = span(left->loc.start, right->loc.end);
+      std::vector<std::pair<ArgLabel, ExprBox>> args;
+      args.emplace_back(Nolabel{}, std::move(left));
+      args.emplace_back(Nolabel{}, std::move(right));
+      return E({Pexp_apply{std::move(fn), std::move(args)}, l});
+    }
+    return left;
+  }
   ExprBox parse_binop(int min_prec) {
     ExprBox left = parse_unary();
     for (;;) {
-      if (cur().kind == Kind::LESSMINUS && 1 >= min_prec) {  // assignment
-        advance();
-        Position ls = left->loc.start;
-        ExprBox right = parse_binop(1);
-        Location l = span(ls, right->loc.end);
-        left = make_assignment(std::move(left), std::move(right), l);
-        continue;
-      }
       // cons '::' is right-assoc at level 6 and builds a construct, not an apply.
       if (cur().kind == Kind::COLONCOLON && 6 >= min_prec) {
         Token optok = cur();
@@ -1156,7 +1171,7 @@ class Parser {
         return E({Pexp_letop{std::move(letb), std::move(ands), std::move(body)}, l});
       }
       default:
-        return parse_tuple();
+        return parse_assign();
     }
   }
 
