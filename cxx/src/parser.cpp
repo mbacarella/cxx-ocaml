@@ -1248,7 +1248,9 @@ class Parser {
       if (cur().kind == Kind::DOT) {
         advance();
         CoreTypeBox inner = parse_core_type();
-        Location l{start, inner->loc.end, ghost};
+        // $endpos extends to the body's last token (its `)` if parenthesized,
+        // since a parenthesized core_type keeps the inner loc).
+        Location l{start, position(tokens_[idx_ - 1].end), ghost};
         return box(CoreType{Ptyp_poly{std::move(vars), std::move(inner)}, l});
       }
       idx_ = save;  // not `'a. …` — a plain type starting with a type variable
@@ -3216,8 +3218,11 @@ class Parser {
       }
       expect(Kind::MINUSGREATER, "->");
       ModuleExpr me = parse_module_expr();
+      // $endpos extends to the body's last token (its closing `)` if the body is
+      // a parenthesized module_expr, which keeps the inner loc).
+      Position bodyEnd = position(tokens_[idx_ - 1].end);
       for (int i = static_cast<int>(args.size()) - 1; i >= 0; --i) {  // each loc starts at its '('
-        Location l = span(args[i].first, me.loc.end);
+        Location l = span(args[i].first, bodyEnd);
         me = ModuleExpr{Pmod_functor{std::move(args[i].second), box(std::move(me))}, l};
       }
       return me;
