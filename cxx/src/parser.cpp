@@ -3511,7 +3511,9 @@ class Parser {
       else break;
     }
     if (!args.empty()) {
-      Location l = span(ce.loc.start, args.back().second->loc.end);
+      // $sloc starts at the first token (the `(` of a parenthesized class_expr),
+      // even though `(ce)` itself keeps the inner loc.
+      Location l = span(position(t.start), args.back().second->loc.end);
       ce = ClassExpr{Pcl_apply{box(std::move(ce)), std::move(args)}, l, {}};
     }
     return ce;
