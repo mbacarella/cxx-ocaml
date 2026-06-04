@@ -2866,7 +2866,9 @@ class Parser {
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE && peek(2).kind == Kind::OF) {
       advance(); advance(); advance();  // module type of
       ModuleExpr me = parse_module_expr();
-      return ModuleType{Pmty_typeof{box(std::move(me))}, span(position(t.start), me.loc.end), {}};
+      // $sloc spans the module_expr *and* its trailing attributes
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      return ModuleType{Pmty_typeof{box(std::move(me))}, l, {}};
     }
     if (t.kind == Kind::LPAREN) {  // ( module_type )  -> inner unchanged (no paren reloc)
       advance();
