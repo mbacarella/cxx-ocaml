@@ -3028,6 +3028,11 @@ class Parser {
       if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
         throw ParseError("expected module type name", nm.start);
       advance();
+      if (cur().kind == Kind::COLONEQUAL) {  // module type S := mty
+        advance();
+        ModuleType mt = parse_module_type();
+        return SignatureItem{Psig_modtypesubst{StringLoc{nm.text, tokloc(nm)}, std::move(mt)}, here()};
+      }
       std::optional<ModuleType> mty;
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
       return SignatureItem{Psig_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty)}, here()};
