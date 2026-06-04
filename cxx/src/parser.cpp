@@ -2070,9 +2070,16 @@ class Parser {
     return ConstructorDecl{std::move(cname), std::move(args), std::move(res),
                            span(start, endp), std::move(attrs), std::move(gvars)};
   }
+  // variance/injectivity prefix tokens: + - ! and the lexer-fused +! -! (dropped).
+  static bool is_variance_tok(const Token& t) {
+    return t.kind == Kind::PLUS || t.kind == Kind::MINUS || t.kind == Kind::BANG ||
+           ((t.kind == Kind::INFIXOP2 || t.kind == Kind::INFIXOP1) &&
+            (t.text == "+!" || t.text == "-!"));
+  }
   CoreTypeBox parse_type_param() {
     if (cur().kind == Kind::PLUS || cur().kind == Kind::MINUS) advance();  // variance (dropped)
     if (cur().kind == Kind::BANG) advance();  // injectivity `!` (dropped)
+    if (is_variance_tok(cur()) && cur().kind != Kind::UNDERSCORE) advance();  // +! / -!
     if (cur().kind == Kind::UNDERSCORE) {
       Token u = cur(); advance();
       return box(CoreType{Ptyp_any{}, tokloc(u)});
@@ -2082,8 +2089,7 @@ class Parser {
   std::vector<CoreTypeBox> parse_type_params() {
     std::vector<CoreTypeBox> params;
     Kind k = cur().kind;
-    if (k == Kind::QUOTE || k == Kind::UNDERSCORE || k == Kind::PLUS ||
-        k == Kind::MINUS || k == Kind::BANG) {
+    if (k == Kind::QUOTE || k == Kind::UNDERSCORE || is_variance_tok(cur())) {
       params.push_back(parse_type_param());
     } else if (k == Kind::LPAREN) {
       advance();
