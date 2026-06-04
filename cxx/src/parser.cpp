@@ -3282,6 +3282,24 @@ class Parser {
         std::optional<FunctionConstraint> fconstr;  // method return-type constraint
         if (cur().kind == Kind::COLON) { advance(); fconstr = Pconstraint{parse_core_type()}; }
         expect(Kind::EQUAL, "=");
+        // `method m p.. = function cases` merges into one Pexp_function (params +
+        // Pfunction_cases), mirroring the let/fun desugaring.
+        if (!params.empty() && cur().kind == Kind::FUNCTION) {
+          Token fkw = cur(); advance();
+          std::vector<Case> cs = parse_cases();
+          Position last = last_case_end_;
+          Location casesloc = span(position(fkw.start), last);
+          auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
+          std::vector<FunctionParam> ps;
+          for (auto& pr : params) ps.push_back(std::move(pr.second));
+          Location floc = span(params.front().first, last, /*ghost=*/true);
+          ExprBox fn = E({Pexp_function{std::move(ps), std::move(fconstr), std::move(fb)}, floc});
+          Location pl = fn->loc; pl.ghost = true;
+          kind = Cfk_concrete{ovr, E({Pexp_poly{std::move(fn), std::nullopt}, pl})};
+          skip_post_attrs();
+          return ClassField{Pcf_method{name, priv, std::move(kind)},
+                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+        }
         ExprBox body = parse_expr();
         if (!params.empty()) {
           Position fstart = params.front().first;
