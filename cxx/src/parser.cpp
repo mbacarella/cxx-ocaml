@@ -590,10 +590,13 @@ class Parser {
       }
       case Kind::BEGIN: {
         advance();
+        Attributes battrs;  // `begin[@attr] … end` -> on the inner expression
+        while (cur().kind == Kind::LBRACKETAT) { advance(); battrs.push_back(parse_attribute_body()); }
         ExprBox inner = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before end
         Token c = cur(); expect(Kind::END, "end");
         inner->loc = span(position(t.start), position(c.end));
+        for (auto& a : battrs) inner->attrs.push_back(std::move(a));
         return inner;
       }
       case Kind::BANG: case Kind::PREFIXOP: {
