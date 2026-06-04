@@ -1445,6 +1445,16 @@ class Parser {
       return box(CoreType{Ptyp_open{std::move(mod_), std::move(inner)},
                           span(position(t.start), position(c.end))});
     }
+    if (t.kind == Kind::UIDENT && peek(1).kind == Kind::DOT &&
+        peek(2).kind == Kind::LBRACKET) {  // M.[…]  local-open polyvariant type
+      advance();  // M
+      LongidentLoc mod_{{Lident{t.text}}, tokloc(t)};
+      advance();  // .  (the `[` is the inner type's own delimiter)
+      CoreTypeBox inner = parse_type_atom();
+      Position end = inner->loc.end;
+      return box(CoreType{Ptyp_open{std::move(mod_), std::move(inner)},
+                          span(position(t.start), end)});
+    }
     if (t.kind == Kind::LIDENT || t.kind == Kind::UIDENT) {
       LongidentLoc name = parse_type_path();  // may contain functor application F(X).t
       return box(CoreType{.desc = Ptyp_constr{.id = name, .args = {}}, .loc = name.loc});
