@@ -2414,8 +2414,22 @@ class Parser {
 
     if (params.empty() && !fconstr)
       return ValueBinding{std::move(namepat), std::move(body), std::move(vconstr)};
-    // desugar `let f p.. [: t] = e` to a ghost Pexp_function spanning p[0]..e
     Position fstart = params.empty() ? body->loc.start : param_loc(params.front()).start;
+    // `let f (type a b) = e` with *only* newtype params desugars to a ghost
+    // Pexp_newtype chain (not a Pexp_function), like `fun (type a) -> e`.
+    bool all_newtype = !fconstr && !params.empty();
+    for (auto& p : params)
+      if (!std::holds_alternative<Pparam_newtype>(p.desc)) all_newtype = false;
+    if (all_newtype) {
+      ExprBox acc = std::move(body);
+      for (int i = static_cast<int>(params.size()) - 1; i >= 0; --i) {
+        auto& nt = std::get<Pparam_newtype>(params[i].desc);
+        Position s = (i == 0) ? fstart : param_loc(params[i]).start;
+        acc = E({Pexp_newtype{nt.name, std::move(acc)}, Location{s, bodyEnd, true}});
+      }
+      return ValueBinding{std::move(namepat), std::move(acc), std::nullopt};
+    }
+    // desugar `let f p.. [: t] = e` to a ghost Pexp_function spanning p[0]..e
     Location floc = span(fstart, bodyEnd, /*ghost=*/true);
     auto fb = box(FunctionBody{Pfunction_body{std::move(body)}});
     ExprBox fn = E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)}, floc});
