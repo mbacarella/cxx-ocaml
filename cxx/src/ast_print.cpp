@@ -657,6 +657,7 @@ struct Printer {
       type_exception(j, v->exn);
     } else if (auto* v = std::get_if<Psig_module>(&s.desc)) {
       line(j, "Psig_module " + str_opt_loc(v->md.name));
+      attributes(j, v->md.attrs);  // pmd_attributes, before the module_type
       module_type(j, *v->md.type);
     } else if (auto* v = std::get_if<Psig_recmodule>(&s.desc)) {
       line(j, "Psig_recmodule");

@@ -345,7 +345,7 @@ struct Psig_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Psig_typesubst { std::vector<TypeDeclaration> decls; };  // type t := …
 struct Psig_typext { TypeExtension ext; };
 struct Psig_exception { TypeException exn; };
-struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; };
+struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; Attributes attrs; };
 struct Psig_module { ModuleDeclaration md; };
 struct Psig_recmodule { std::vector<ModuleDeclaration> decls; };  // module rec M : … and N : …
 struct Psig_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S [= mty]

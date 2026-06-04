@@ -3244,7 +3244,12 @@ class Parser {
         Location fl = span(fparams[i].first, mt.loc.end);
         mt = ModuleType{Pmty_functor{std::move(fparams[i].second), box(std::move(mt))}, fl, {}};
       }
-      return SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt))}}, here()};
+      Attributes mdattrs;  // pmd_attributes: `module M : S [@@attr]`
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); mdattrs.push_back(parse_attribute_body()); }
+      Location l = here();
+      attach_docs(mdattrs, l.start.cnum, l.end.cnum);
+      return SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt)),
+                                                         std::move(mdattrs)}}, l};
     }
     if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
       Position kw = position(t.start);
@@ -3839,9 +3844,10 @@ class Parser {
     advance();
     StringLoc name{nm.text, tokloc(nm)};
     ClassExpr body = parse_class_fun_binding();
-    skip_post_attrs();
+    Attributes attrs;  // pci_attributes: `class c = e [@@attr]`
+    while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
     return ClassDeclaration{virt, std::move(params), std::move(name), std::move(body),
-                            span(kw, position(tokens_[idx_ - 1].end)), {}};
+                            span(kw, position(tokens_[idx_ - 1].end)), std::move(attrs)};
   }
   ClassExpr parse_class_fun_binding() {  // = ce | : ct = ce | param fun_binding
     Token t = cur();
@@ -3872,9 +3878,10 @@ class Parser {
     StringLoc name{nm.text, tokloc(nm)};
     expect(Kind::EQUAL, "=");
     ClassType body = parse_class_type();
-    skip_post_attrs();
+    Attributes attrs;  // pci_attributes: `class type c = ct [@@attr]`
+    while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
     return ClassTypeDeclaration{virt, std::move(params), std::move(name), std::move(body),
-                                span(kw, position(tokens_[idx_ - 1].end)), {}};
+                                span(kw, position(tokens_[idx_ - 1].end)), std::move(attrs)};
   }
   // class_description: `class [virtual] [params] name : class_type` (signature item)
   ClassTypeDeclaration parse_one_class_description(Position kw) {
