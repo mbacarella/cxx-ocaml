@@ -2194,9 +2194,14 @@ class Parser {
   }
   // variance/injectivity prefix tokens: + - ! and the lexer-fused +! -! (dropped).
   static bool is_variance_tok(const Token& t) {
-    return t.kind == Kind::PLUS || t.kind == Kind::MINUS || t.kind == Kind::BANG ||
-           ((t.kind == Kind::INFIXOP2 || t.kind == Kind::INFIXOP1) &&
-            (t.text == "+!" || t.text == "-!"));
+    if (t.kind == Kind::PLUS || t.kind == Kind::MINUS || t.kind == Kind::BANG) return true;
+    // fused variance/injectivity operators (see parser.mly type_variance):
+    if (t.kind == Kind::INFIXOP2 || t.kind == Kind::INFIXOP1)
+      return t.text == "+!" || t.text == "-!" || t.text == "+-" || t.text == "-+" ||
+             t.text == "+-!" || t.text == "-+!";
+    if (t.kind == Kind::PREFIXOP)
+      return t.text == "!+" || t.text == "!-" || t.text == "!+-" || t.text == "!-+";
+    return false;
   }
   CoreTypeBox parse_type_param() {
     if (cur().kind == Kind::PLUS || cur().kind == Kind::MINUS) advance();  // variance (dropped)
