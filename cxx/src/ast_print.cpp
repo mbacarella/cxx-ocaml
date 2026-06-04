@@ -834,11 +834,14 @@ struct Printer {
     } else if (auto* v = std::get_if<Pctf_method>(&x.desc)) {
       line(j, "Pctf_method \"" + v->name.txt + "\" " + private_flag(v->priv) + " " + virtual_flag(v->virt));
       core_type(j + 1, *v->type);
-    } else {
-      auto& vc = std::get<Pctf_constraint>(x.desc);
+    } else if (auto* v = std::get_if<Pctf_constraint>(&x.desc)) {
       line(j, "Pctf_constraint");
-      core_type(j + 1, *vc.t1);
-      core_type(j + 1, *vc.t2);
+      core_type(j + 1, *v->t1);
+      core_type(j + 1, *v->t2);
+    } else {
+      auto& va = std::get<Pctf_attribute>(x.desc);
+      line(j, "Pctf_attribute \"" + va.name + "\"");
+      structure_list(j, va.payload);
     }
   }
   void class_field_kind(int i, const ClassFieldKind& k) {
@@ -870,6 +873,9 @@ struct Printer {
       line(j, "Pcf_constraint");
       core_type(j + 1, *v->t1);
       core_type(j + 1, *v->t2);
+    } else if (auto* v = std::get_if<Pcf_attribute>(&x.desc)) {
+      line(j, "Pcf_attribute \"" + v->name + "\"");
+      structure_list(j, v->payload);
     } else {
       auto& vi = std::get<Pcf_initializer>(x.desc);
       line(j, "Pcf_initializer");

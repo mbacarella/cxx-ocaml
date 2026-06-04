@@ -418,8 +418,9 @@ struct Pctf_inherit { ClassTypeBox ct; };
 struct Pctf_val { StringLoc name; MutableFlag mut; VirtualFlag virt; CoreTypeBox type; };
 struct Pctf_method { StringLoc name; PrivateFlag priv; VirtualFlag virt; CoreTypeBox type; };
 struct Pctf_constraint { CoreTypeBox t1; CoreTypeBox t2; };
+struct Pctf_attribute { std::string name; Structure payload; };  // `[@@@attr]` in a class type
 struct ClassTypeField {
-  std::variant<Pctf_inherit, Pctf_val, Pctf_method, Pctf_constraint> desc;
+  std::variant<Pctf_inherit, Pctf_val, Pctf_method, Pctf_constraint, Pctf_attribute> desc;
   Location loc;
   Attributes attrs;
 };
@@ -448,8 +449,10 @@ struct Pcf_val { StringLoc name; MutableFlag mut; ClassFieldKind kind; };
 struct Pcf_method { StringLoc name; PrivateFlag priv; ClassFieldKind kind; };
 struct Pcf_constraint { CoreTypeBox t1; CoreTypeBox t2; };
 struct Pcf_initializer { ExprBox e; };
+struct Pcf_attribute { std::string name; Structure payload; };  // `[@@@attr]` in a class body
 struct ClassField {
-  std::variant<Pcf_inherit, Pcf_val, Pcf_method, Pcf_constraint, Pcf_initializer> desc;
+  std::variant<Pcf_inherit, Pcf_val, Pcf_method, Pcf_constraint, Pcf_initializer,
+               Pcf_attribute> desc;
   Location loc;
   Attributes attrs;
 };

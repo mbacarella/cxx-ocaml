@@ -3452,7 +3452,11 @@ class Parser {
 
   // ---- class language ----
   void skip_item_attrs() { while (cur().kind == Kind::LBRACKETAT) { advance(); parse_attribute_body(); } }
-  void skip_post_attrs() { while (cur().kind == Kind::LBRACKETATAT) { advance(); parse_attribute_body(); } }
+  Attributes last_post_attrs_;  // most recent skip_post_attrs() collection (for class fields)
+  void skip_post_attrs() {
+    last_post_attrs_.clear();
+    while (cur().kind == Kind::LBRACKETATAT) { advance(); last_post_attrs_.push_back(parse_attribute_body()); }
+  }
 
   // formal/actual class params:  [ p1, p2, … ]   (brackets, comma-separated)
   std::vector<CoreTypeBox> parse_class_params() {
@@ -3496,13 +3500,24 @@ class Parser {
   }
 
   ClassField parse_class_field() {
+    last_post_attrs_.clear();
     ClassField f = parse_class_field_core();
+    for (auto& a : last_post_attrs_) f.attrs.push_back(std::move(a));  // `field [@@attr]`
+    last_post_attrs_.clear();
     attach_docs(f.attrs, f.loc.start.cnum, f.loc.end.cnum);  // (** doc *) on the field
     return f;
   }
   ClassField parse_class_field_core() {
     Token t = cur();
     Position fs = position(t.start);
+    if (t.kind == Kind::LBRACKETATATAT) {  // [@@@attr]  -> Pcf_attribute (floating)
+      advance();
+      std::string name = parse_attr_name();
+      Structure payload = parse_structure_until(Kind::RBRACKET);
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return ClassField{Pcf_attribute{std::move(name), std::move(payload)},
+                        span(fs, position(c.end)), {}};
+    }
     if (t.kind == Kind::INHERIT) {
       advance();
       OverrideFlag ovr = OverrideFlag::Fresh;
@@ -3742,9 +3757,11 @@ class Parser {
     Token t = cur();
     if (t.kind == Kind::OBJECT) {
       advance();
+      Attributes oattrs;  // `object[@attr] …` -> attrs on the Pcl_structure
+      while (cur().kind == Kind::LBRACKETAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       ClassStructure cs = parse_class_structure_body();
       Token c = cur(); expect(Kind::END, "end");
-      return ClassExpr{Pcl_structure{std::move(cs)}, span(position(t.start), position(c.end)), {}};
+      return ClassExpr{Pcl_structure{std::move(cs)}, span(position(t.start), position(c.end)), std::move(oattrs)};
     }
     if (t.kind == Kind::LPAREN) {
       advance();
@@ -3806,9 +3823,11 @@ class Parser {
     }
     if (t.kind == Kind::OBJECT) {
       advance();
+      Attributes oattrs;  // `object[@attr] …` -> attrs on the Pcty_signature
+      while (cur().kind == Kind::LBRACKETAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       ClassSignature cs = parse_class_sig_body();
       Token c = cur(); expect(Kind::END, "end");
-      return ClassType{Pcty_signature{std::move(cs)}, span(position(t.start), position(c.end)), {}};
+      return ClassType{Pcty_signature{std::move(cs)}, span(position(t.start), position(c.end)), std::move(oattrs)};
     }
     if (t.kind == Kind::LBRACKET) {  // [tys] clty_longident
       size_t save = idx_;
@@ -3851,8 +3870,23 @@ class Parser {
   }
 
   ClassTypeField parse_class_sig_field() {
+    last_post_attrs_.clear();
+    ClassTypeField f = parse_class_sig_field_core();
+    for (auto& a : last_post_attrs_) f.attrs.push_back(std::move(a));  // `field [@@attr]`
+    last_post_attrs_.clear();
+    return f;
+  }
+  ClassTypeField parse_class_sig_field_core() {
     Token t = cur();
     Position fs = position(t.start);
+    if (t.kind == Kind::LBRACKETATATAT) {  // [@@@attr]  -> Pctf_attribute (floating)
+      advance();
+      std::string name = parse_attr_name();
+      Structure payload = parse_structure_until(Kind::RBRACKET);
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return ClassTypeField{Pctf_attribute{std::move(name), std::move(payload)},
+                            span(fs, position(c.end)), {}};
+    }
     if (t.kind == Kind::INHERIT) {
       advance();
       skip_item_attrs();
