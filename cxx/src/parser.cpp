@@ -1575,13 +1575,14 @@ class Parser {
       Token tag = cur();
       advance();
       std::vector<CoreTypeBox> types;
+      bool amp = false;  // `\`A of & t` is still a "constant" tag (empty-conjunction prefix)
       if (cur().kind == Kind::OF) {
         advance();
-        if (cur().kind == Kind::AMPERSAND) advance();
+        if (cur().kind == Kind::AMPERSAND) { advance(); amp = true; }
         types.push_back(parse_core_type());
         while (cur().kind == Kind::AMPERSAND) { advance(); types.push_back(parse_core_type()); }
       }
-      bool constant = types.empty();
+      bool constant = types.empty() || amp;
       return Rtag{tag.text, constant, std::move(types)};
     }
     return Rinherit{parse_core_type()};
@@ -2285,8 +2286,8 @@ class Parser {
         advance();
         Pattern p = parse_pattern();
         if (cur().kind == Kind::COLON) {
-          advance(); CoreTypeBox ty = parse_core_type();
-          Location pl = p.loc;
+          advance(); CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
+          Location pl = span(p.loc.start, ty->loc.end);  // inner: pat..type
           p = Pattern{Ppat_constraint{box(std::move(p)), std::move(ty)}, pl};
         }
         std::optional<ExprBox> def;
