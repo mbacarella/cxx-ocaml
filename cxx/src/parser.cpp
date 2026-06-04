@@ -2867,11 +2867,10 @@ class Parser {
       ModuleExpr me = parse_module_expr();
       return ModuleType{Pmty_typeof{box(std::move(me))}, span(position(t.start), me.loc.end), {}};
     }
-    if (t.kind == Kind::LPAREN) {  // ( module_type )
+    if (t.kind == Kind::LPAREN) {  // ( module_type )  -> inner unchanged (no paren reloc)
       advance();
       ModuleType mt = parse_module_type();
-      Token c = cur(); expect(Kind::RPAREN, ")");
-      mt.loc = span(position(t.start), position(c.end));  // reloc to parens
+      expect(Kind::RPAREN, ")");
       return mt;
     }
     if (t.kind == Kind::UIDENT) {
