@@ -2565,11 +2565,17 @@ class Parser {
     Pattern namepat{Ppat_var{name}, nl};
 
     std::vector<FunctionParam> params;
-    while (cur().kind != Kind::EQUAL && cur().kind != Kind::COLON)
+    while (cur().kind != Kind::EQUAL && cur().kind != Kind::COLON &&
+           cur().kind != Kind::COLONGREATER)
       parse_params_into(params);
     std::optional<ValueConstraint> vconstr;     // `let x : t = e`  (params empty)
     std::optional<FunctionConstraint> fconstr;  // `let f p.. : t = e`  (return constraint)
-    if (cur().kind == Kind::COLON) {
+    if (cur().kind == Kind::COLONGREATER) {  // `let f p.. :> t = e`  (coercion, no `from`)
+      advance();
+      CoreTypeBox ty2 = parse_core_type();
+      if (params.empty()) vconstr = Pvc_coercion{std::nullopt, std::move(ty2)};
+      else fconstr = Pcoerce{std::nullopt, std::move(ty2)};
+    } else if (cur().kind == Kind::COLON) {
       advance();
       if (cur().kind == Kind::TYPE) {  // : type a b. t  (locally abstract univars)
         advance();
