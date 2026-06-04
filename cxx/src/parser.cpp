@@ -3775,6 +3775,14 @@ class Parser {
   }
 
   ClassType parse_class_type() {
+    ClassType ct = parse_class_type_core();
+    while (cur().kind == Kind::LBRACKETAT) {  // class_type [@attr]  (Cty.attr)
+      advance();
+      ct.attrs.push_back(parse_attribute_body());
+    }
+    return ct;
+  }
+  ClassType parse_class_type_core() {
     Token t = cur();
     if (t.kind == Kind::LABEL || t.kind == Kind::OPTLABEL) {  // labelled arrow domain
       ArgLabel label = t.kind == Kind::LABEL ? ArgLabel{Labelled{t.text}} : ArgLabel{Optional{t.text}};
