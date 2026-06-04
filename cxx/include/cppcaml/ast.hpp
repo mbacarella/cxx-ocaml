@@ -345,6 +345,7 @@ struct Psig_module { ModuleDeclaration md; };
 struct Psig_recmodule { std::vector<ModuleDeclaration> decls; };  // module rec M : … and N : …
 struct Psig_modtype { StringLoc name; std::optional<ModuleType> type; };  // module type S [= mty]
 struct Psig_modtypesubst { StringLoc name; ModuleType type; };  // module type S := mty
+struct Psig_modsubst { StrOptLoc name; LongidentLoc manifest; };  // module M := X.Y
 struct Psig_open { OverrideFlag ovr; LongidentLoc id; };
 struct Psig_include { ModuleType mt; };
 struct Psig_class { std::vector<ClassTypeDeclaration> decls; };  // class c : ct  (class_description)
@@ -354,8 +355,8 @@ struct Psig_extension { std::string name; Structure payload; };
 struct SignatureItem {
   std::variant<Psig_value, Psig_primitive, Psig_type, Psig_typesubst, Psig_typext,
                Psig_exception, Psig_module, Psig_recmodule, Psig_modtype, Psig_modtypesubst,
-               Psig_open, Psig_include, Psig_class, Psig_class_type, Psig_attribute,
-               Psig_extension>
+               Psig_modsubst, Psig_open, Psig_include, Psig_class, Psig_class_type,
+               Psig_attribute, Psig_extension>
       desc;
   Location loc;
 };

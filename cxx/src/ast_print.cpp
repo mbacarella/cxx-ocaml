@@ -664,6 +664,8 @@ struct Printer {
     } else if (auto* v = std::get_if<Psig_modtypesubst>(&s.desc)) {
       line(j, "Psig_modtypesubst " + str_loc(v->name));
       module_type(j + 1, v->type);
+    } else if (auto* v = std::get_if<Psig_modsubst>(&s.desc)) {
+      line(j, "Psig_modsubst " + str_opt_loc(v->name) + " = " + lid_loc(v->manifest));
     } else if (auto* v = std::get_if<Psig_modtype>(&s.desc)) {
       line(j, "Psig_modtype " + str_loc(v->name));
       if (v->type) module_type(j + 1, *v->type);

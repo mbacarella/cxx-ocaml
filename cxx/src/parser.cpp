@@ -3053,6 +3053,11 @@ class Parser {
     if (t.kind == Kind::MODULE) {
       advance();
       StrOptLoc name = parse_module_name();
+      if (cur().kind == Kind::COLONEQUAL) {  // module M := X.Y  (module subst)
+        advance();
+        LongidentLoc id = parse_type_path();
+        return SignatureItem{Psig_modsubst{std::move(name), std::move(id)}, here()};
+      }
       if (cur().kind == Kind::EQUAL) {  // module B = A.C  (module alias)
         advance();
         LongidentLoc id = parse_longident_path();
