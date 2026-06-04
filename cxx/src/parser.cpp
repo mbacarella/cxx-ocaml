@@ -387,9 +387,66 @@ class Parser {
     args.emplace_back(Nolabel{}, std::move(idx));
     return E({Pexp_apply{std::move(fn), std::move(args)}, Location{s, end, false}});
   }
+  // `. M (. N)* .op` — a module path that terminates in a DOTOP index operator.
+  bool is_qualified_index_op() {
+    if (cur().kind != Kind::DOT || peek(1).kind != Kind::UIDENT) return false;
+    int k = 1;
+    for (;;) {
+      if (peek(k).kind != Kind::UIDENT) return false;
+      if (peek(k + 1).kind == Kind::DOTOP) return true;
+      if (peek(k + 1).kind == Kind::DOT && peek(k + 2).kind == Kind::UIDENT) { k += 2; continue; }
+      return false;
+    }
+  }
+  // index-op get `e.op[…]` (cur() is the DOTOP), optionally module-qualified `e.M.op[…]`.
+  ExprBox parse_dotop_index(ExprBox e, const std::vector<std::string>& mods) {
+    Token dop = cur(); advance();
+    const char* openc; const char* closec; Kind closeK;
+    switch (cur().kind) {
+      case Kind::LPAREN:   openc = "("; closec = ")"; closeK = Kind::RPAREN;   break;
+      case Kind::LBRACKET: openc = "["; closec = "]"; closeK = Kind::RBRACKET; break;
+      case Kind::LBRACE:   openc = "{"; closec = "}"; closeK = Kind::RBRACE;   break;
+      default: throw ParseError("expected ( [ or { after index operator", cur().start);
+    }
+    advance();  // open bracket
+    std::vector<ExprBox> idxs;  // `;`-separated index list (expr_semi_list)
+    idxs.push_back(parse_expr_no_seq());
+    while (cur().kind == Kind::SEMI) { advance(); idxs.push_back(parse_expr_no_seq()); }
+    Token c = cur(); expect(closeK, closec);
+    Position end = position(c.end);
+    bool many = idxs.size() > 1;  // multi-index -> Pexp_array arg, name carries `;..`
+    std::string name = "." + dop.text + openc + (many ? ";.." : "") + closec;
+    Location gl{e->loc.start, end, true};  // ghost ident spans the whole get
+    Longident lid{Lident{name}};  // `M.N.op` -> Ldot(M.N, ".op[…]")
+    if (!mods.empty()) {
+      Longident prefix{Lident{mods[0]}};
+      for (size_t i = 1; i < mods.size(); ++i)
+        prefix = Longident{Ldot{std::make_shared<Longident>(std::move(prefix)), mods[i]}};
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(prefix)), name}};
+    }
+    ExprBox fn = E({Pexp_ident{LongidentLoc{std::move(lid), gl}}, gl});
+    std::vector<std::pair<ArgLabel, ExprBox>> args;
+    Position objStart = e->loc.start;
+    args.emplace_back(Nolabel{}, std::move(e));
+    if (many) {
+      Location al{objStart, end, false};  // the multi-index array spans the whole `e.op[…]`
+      args.emplace_back(Nolabel{}, E({Pexp_array{std::move(idxs)}, al}));
+    } else {
+      args.emplace_back(Nolabel{}, std::move(idxs.front()));
+    }
+    return E({Pexp_apply{std::move(fn), std::move(args)}, Location{objStart, end, false}});
+  }
   ExprBox postfix_field(ExprBox e) {
     for (;;) {
-      if (cur().kind == Kind::DOT &&
+      if (is_qualified_index_op()) {  // e.M.op[i;j] — module-qualified index op (before field)
+        advance();  // .
+        std::vector<std::string> mods{cur().text};
+        advance();  // first UIDENT
+        while (cur().kind == Kind::DOT && peek(1).kind == Kind::UIDENT) {
+          advance(); mods.push_back(cur().text); advance();
+        }
+        e = parse_dotop_index(std::move(e), mods);  // cur() is now the DOTOP
+      } else if (cur().kind == Kind::DOT &&
           (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
         advance();  // .  (field label may be module-qualified: e.M.f)
         LongidentLoc field = parse_field_longident();
@@ -413,34 +470,7 @@ class Parser {
         Token c = cur(); expect(Kind::RBRACE, "}");
         e = bigarray_get(std::move(e), std::move(idxs), position(c.end));
       } else if (cur().kind == Kind::DOTOP) {  // e.op(i) / e.op[i] / e.op{i;j} index-op get
-        Token dop = cur(); advance();
-        const char* openc; const char* closec; Kind closeK;
-        switch (cur().kind) {
-          case Kind::LPAREN:   openc = "("; closec = ")"; closeK = Kind::RPAREN;   break;
-          case Kind::LBRACKET: openc = "["; closec = "]"; closeK = Kind::RBRACKET; break;
-          case Kind::LBRACE:   openc = "{"; closec = "}"; closeK = Kind::RBRACE;   break;
-          default: throw ParseError("expected ( [ or { after index operator", cur().start);
-        }
-        advance();  // open bracket
-        std::vector<ExprBox> idxs;  // `;`-separated index list (expr_semi_list)
-        idxs.push_back(parse_expr_no_seq());
-        while (cur().kind == Kind::SEMI) { advance(); idxs.push_back(parse_expr_no_seq()); }
-        Token c = cur(); expect(closeK, closec);
-        Position end = position(c.end);
-        bool many = idxs.size() > 1;  // multi-index -> Pexp_array arg, name carries `;..`
-        std::string name = "." + dop.text + openc + (many ? ";.." : "") + closec;
-        Location gl{e->loc.start, end, true};  // ghost ident spans the whole get
-        ExprBox fn = E({Pexp_ident{lid0(name, gl)}, gl});
-        std::vector<std::pair<ArgLabel, ExprBox>> args;
-        Position objStart = e->loc.start;
-        args.emplace_back(Nolabel{}, std::move(e));
-        if (many) {
-          Location al{idxs.front()->loc.start, idxs.back()->loc.end, false};
-          args.emplace_back(Nolabel{}, E({Pexp_array{std::move(idxs)}, al}));
-        } else {
-          args.emplace_back(Nolabel{}, std::move(idxs.front()));
-        }
-        e = E({Pexp_apply{std::move(fn), std::move(args)}, Location{objStart, end, false}});
+        e = parse_dotop_index(std::move(e), {});
       } else if (cur().kind == Kind::HASH && peek(1).kind == Kind::LIDENT) {
         advance();  // #
         Token m = cur(); advance();
@@ -808,14 +838,22 @@ class Parser {
     }
     if (auto* ap = std::get_if<Pexp_apply>(&lhs->desc)) {
       if (auto* id = std::get_if<Pexp_ident>(&ap->fn->desc)) {
-        // user index-op get `.op(…)` -> set `.op(…)<-` with the rhs appended
-        if (auto* lid = std::get_if<Lident>(&id->id.txt.v)) {
-          const std::string& nm = lid->name;
+        // user index-op get `.op(…)` -> set `.op(…)<-` with the rhs appended;
+        // possibly module-qualified `M.op` -> Ldot(M, ".op(…)<-").
+        {
+          std::string nm; const Ldot* dot = std::get_if<Ldot>(&id->id.txt.v);
+          if (auto* lid = std::get_if<Lident>(&id->id.txt.v)) nm = lid->name;
+          else if (dot) nm = dot->name;
           if (nm.size() >= 3 && nm[0] == '.' &&
               (nm.back() == ')' || nm.back() == ']' || nm.back() == '}')) {
             Location gl{l.start, l.end, true};
-            ExprBox fn = E({Pexp_ident{lid0(nm + "<-", gl)}, gl});
+            Longident newlid{Lident{nm + "<-"}};
+            if (dot) newlid = Longident{Ldot{dot->prefix, nm + "<-"}};
+            ExprBox fn = E({Pexp_ident{LongidentLoc{std::move(newlid), gl}}, gl});
             std::vector<std::pair<ArgLabel, ExprBox>> args = std::move(ap->args);
+            // a multi-index array arg's $sloc is the whole `e.op[…] <- v` rule.
+            if (args.size() >= 2 && std::holds_alternative<Pexp_array>(args[1].second->desc))
+              args[1].second->loc = Location{l.start, l.end, false};
             args.emplace_back(Nolabel{}, std::move(rhs));
             return E({Pexp_apply{std::move(fn), std::move(args)}, l});
           }
