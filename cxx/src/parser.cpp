@@ -483,7 +483,7 @@ class Parser {
           std::optional<Ptyp_package> pkg;
           if (cur().kind == Kind::COLON) {
             advance();
-            LongidentLoc path = parse_longident_path();
+            LongidentLoc path = parse_type_path();  // package path may be F(X).S
             std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
             if (cur().kind == Kind::WITH) {
               advance();
@@ -1296,7 +1296,7 @@ class Parser {
   // includes a parenthesized child's parens), not the child node's own loc.
   // package type body: `path [with type t = u and …]` (after `(module M :`).
   Ptyp_package parse_package_type_body() {
-    LongidentLoc path = parse_longident_path();
+    LongidentLoc path = parse_type_path();  // package path may be F(X).S
     std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
     if (cur().kind == Kind::WITH) {
       advance();
@@ -1461,7 +1461,7 @@ class Parser {
     }
     if (t.kind == Kind::LPAREN && peek(1).kind == Kind::MODULE) {  // (module S [with type …])
       advance(); advance();  // ( module
-      LongidentLoc path = parse_longident_path();
+      LongidentLoc path = parse_type_path();  // package path may be F(X).S
       std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
       if (cur().kind == Kind::WITH) {
         advance();
@@ -1832,7 +1832,7 @@ class Parser {
           std::optional<Ptyp_package> pkg;
           if (cur().kind == Kind::COLON) {  // (module M : S [with type t = u …])
             advance();
-            LongidentLoc path = parse_longident_path();
+            LongidentLoc path = parse_type_path();  // package path may be F(X).S
             std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
             if (cur().kind == Kind::WITH) {
               advance();
