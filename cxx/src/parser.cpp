@@ -1739,8 +1739,12 @@ class Parser {
     if (cur().kind == Kind::UIDENT) {
       LongidentLoc cl = parse_longident_path();
       if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P) local open
-        advance(); advance();  // . (
-        Pattern inner = parse_pattern();
+        advance();  // .
+        Token lp = cur(); advance();  // (
+        Pattern inner = (cur().kind == Kind::RPAREN)  // M.()  -> unit pattern
+                            ? ppat_unit_open(span(cl.loc.start, position(cur().end)),
+                                             span(position(lp.start), position(cur().end)))
+                            : parse_pattern();
         Token c = cur(); expect(Kind::RPAREN, ")");
         return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
       }
@@ -1772,6 +1776,11 @@ class Parser {
   }
   Pattern ppat_construct0(const char* name, Location l) {
     return Pattern{Ppat_construct{.id = LongidentLoc{.txt = {Lident{name}}, .loc = l}, .arg = std::nullopt}, l};
+  }
+  // M.()  -> unit pattern whose node loc spans the whole `M.()` but whose `()`
+  // name loc is just the parens (menhir $sloc quirk on the local-open rule).
+  Pattern ppat_unit_open(Location node_loc, Location name_loc) {
+    return Pattern{Ppat_construct{.id = LongidentLoc{.txt = {Lident{"()"}}, .loc = name_loc}, .arg = std::nullopt}, node_loc};
   }
   Pattern build_pat_list(std::vector<Pattern>& elems, Position lb, Position rbS, Position rbE) {
     Pattern acc = ppat_construct0("[]", gloc(rbS, rbE));
@@ -1820,8 +1829,12 @@ class Parser {
       case Kind::UIDENT: {
         LongidentLoc cl = parse_longident_path();
         if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P)
-          advance(); advance();  // . (
-          Pattern inner = parse_pattern();
+          advance();  // .
+          Token lp = cur(); advance();  // (
+          Pattern inner = (cur().kind == Kind::RPAREN)  // M.()  -> unit
+                              ? ppat_unit_open(span(cl.loc.start, position(cur().end)),
+                                               span(position(lp.start), position(cur().end)))
+                              : parse_pattern();
           Token c = cur(); expect(Kind::RPAREN, ")");
           return {Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
         }
