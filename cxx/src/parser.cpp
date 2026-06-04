@@ -37,6 +37,7 @@ std::optional<OpInfo> infix_op(const Token& t) {
     case Kind::PLUSDOT:    return OpInfo{7, false, "+."};
     case Kind::MINUS:      return OpInfo{7, false, "-"};
     case Kind::MINUSDOT:   return OpInfo{7, false, "-."};
+    case Kind::PLUSEQ:     return OpInfo{7, false, "+="};  // `+=` infix (e.g. `sz += n`)
     case Kind::INFIXOP2:   return OpInfo{7, false, t.text};
     case Kind::STAR:       return OpInfo{8, false, "*"};
     case Kind::PERCENT:    return OpInfo{8, false, "%"};
@@ -623,7 +624,15 @@ class Parser {
         std::vector<std::pair<LongidentLoc, ExprBox>> fields;
         while (cur().kind != Kind::RBRACE) {
           LongidentLoc lbl = parse_longident_path();
-          if (cur().kind == Kind::EQUAL) {
+          if (cur().kind == Kind::COLON) {  // `{ f : ty = e }` -> f = (e : ty)
+            Position colonPos = position(cur().start);
+            advance();
+            CoreTypeBox fty = parse_poly_type(/*ghost=*/false);
+            expect(Kind::EQUAL, "=");
+            ExprBox v = parse_expr_no_seq();
+            Location cl{colonPos, v->loc.end, false};
+            fields.emplace_back(lbl, E({Pexp_constraint{std::move(v), std::move(fty)}, cl}));
+          } else if (cur().kind == Kind::EQUAL) {
             advance();
             fields.emplace_back(lbl, parse_expr_no_seq());
           } else {  // punning { M.x }: label is the full path (ghost); value is `x`
