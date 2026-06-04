@@ -545,20 +545,7 @@ class Parser {
           std::optional<Ptyp_package> pkg;
           if (cur().kind == Kind::COLON) {
             advance();
-            LongidentLoc path = parse_type_path();  // package path may be F(X).S
-            std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
-            if (cur().kind == Kind::WITH) {
-              advance();
-              for (;;) {
-                expect(Kind::TYPE, "type");
-                LongidentLoc lp = parse_longident_path();
-                expect(Kind::EQUAL, "=");
-                cons.emplace_back(lp, parse_core_type());
-                if (cur().kind == Kind::AND) { advance(); continue; }
-                break;
-              }
-            }
-            pkg = Ptyp_package{std::move(path), std::move(cons)};
+            pkg = parse_package_type_maybe_paren();  // path [with type …], possibly parenthesised
           }
           Token c = cur(); expect(Kind::RPAREN, ")");
           return E({Pexp_pack{box(std::move(me)), std::move(pkg)},
@@ -1396,6 +1383,16 @@ class Parser {
       }
     }
     return Ptyp_package{std::move(path), std::move(cons)};
+  }
+  // A package type optionally wrapped in parens: `(module M : (S with type …))`.
+  Ptyp_package parse_package_type_maybe_paren() {
+    if (cur().kind == Kind::LPAREN) {
+      advance();
+      Ptyp_package p = parse_package_type_body();
+      expect(Kind::RPAREN, ")");
+      return p;
+    }
+    return parse_package_type_body();
   }
   CoreTypeBox parse_type_arrow() {
     Position symstart = position(cur().start);
@@ -3362,9 +3359,10 @@ class Parser {
         ExprBox e = parse_expr();
         if (cur().kind == Kind::COLON) {
           advance();
-          LongidentLoc pkgpath = parse_longident_path();
-          Location pkgloc = pkgpath.loc;
-          auto pkg = box(CoreType{Ptyp_package{std::move(pkgpath), {}}, pkgloc});
+          Position pkgStart = position(cur().start);
+          Ptyp_package body = parse_package_type_body();  // path [with type t = u and …]
+          Location pkgloc = span(pkgStart, position(tokens_[idx_ - 1].end));
+          auto pkg = box(CoreType{std::move(body), pkgloc});
           Location cl = span(e->loc.start, pkg->loc.end);
           e = E({Pexp_constraint{std::move(e), std::move(pkg)}, cl});
         }
