@@ -112,12 +112,13 @@ class Parser {
   // get_pre_docs / get_post_docs: the first docstring of the list, prepended/appended.
   // symbol_info: a doc comment following a field/constructor (`x : t (** doc *)`)
   // is appended as an `ocaml.doc` attribute.
-  std::set<size_t> consumed_post_;  // post-doc keys already taken as an info doc
+  std::unordered_map<size_t, size_t> consumed_post_;  // # post-docs already taken at a key
   bool append_info_doc(Attributes& attrs, size_t endCnum) {
     auto it = docs_.post.find(endCnum);
-    if (it != docs_.post.end() && !it->second.empty()) {
-      attrs.push_back(doc_attr(it->second.front()));
-      consumed_post_.insert(endCnum);  // the enclosing decl must not reuse it
+    size_t n = consumed_post_[endCnum];
+    if (it != docs_.post.end() && n < it->second.size()) {
+      attrs.push_back(doc_attr(it->second[n]));
+      consumed_post_[endCnum] = n + 1;  // the enclosing decl must not reuse it
       return true;
     }
     return false;
@@ -127,8 +128,11 @@ class Parser {
     if (pit != docs_.pre.end() && !pit->second.empty())
       attrs.insert(attrs.begin(), doc_attr(pit->second.front()));
     auto qit = docs_.post.find(endCnum);
-    if (qit != docs_.post.end() && !qit->second.empty() && !consumed_post_.count(endCnum))
-      attrs.push_back(doc_attr(qit->second.front()));
+    size_t n = consumed_post_[endCnum];
+    if (qit != docs_.post.end() && n < qit->second.size()) {
+      attrs.push_back(doc_attr(qit->second[n]));
+      consumed_post_[endCnum] = n + 1;
+    }
   }
   void emit_text(Structure& items, const std::unordered_map<size_t, std::vector<Docstring>>& m,
                  size_t key) {
@@ -2229,6 +2233,7 @@ class Parser {
     Attributes attrs;  // pext_attributes: `A [@deprecated]`
     while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
     if (!attrs.empty()) endp = position(tokens_[idx_ - 1].end);
+    append_info_doc(attrs, tokens_[idx_ - 1].end);  // `type e += A (** doc *)`
     return ExtensionConstructor{StringLoc{nm.text, tokloc(nm)}, std::move(kind),
                                 span(start, endp), std::move(attrs)};
   }
@@ -2687,6 +2692,7 @@ class Parser {
           Attributes extattrs;  // ptyext_attributes: `type t += C [@@attr]`
           while (cur().kind == Kind::LBRACKETATAT) { advance(); extattrs.push_back(parse_attribute_body()); }
           Location l = span(d0, position(tokens_[idx_ - 1].end));
+          attach_docs(extattrs, l.start.cnum, l.end.cnum);  // (** doc *) on the type extension
           return StructureItem{Pstr_typext{TypeExtension{std::move(path), std::move(params),
                                                          std::move(ctors), priv, std::move(extattrs)}}, l};
         }
