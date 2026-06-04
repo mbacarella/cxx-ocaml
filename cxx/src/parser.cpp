@@ -1754,6 +1754,12 @@ class Parser {
         advance();
         Pattern inner = parse_simple_pattern();
         Position end = inner.loc.end;
+        // `M.[]` (empty list) gets the whole-symbol $sloc on its inner node,
+        // like `M.()`; non-empty `M.[a;…]` keeps the list's own loc.
+        if (auto* c = std::get_if<Ppat_construct>(&inner.desc);
+            c && !c->arg && std::holds_alternative<Lident>(c->id.txt.v) &&
+            std::get<Lident>(c->id.txt.v).name == "[]")
+          inner.loc = span(cl.loc.start, end);
         return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, end)};
       }
       std::vector<StringLoc> vars;  // `Constr (type a b) pat` — existential univars
@@ -2497,13 +2503,24 @@ class Parser {
     if (params.empty() && !fconstr)
       return ValueBinding{std::move(namepat), std::move(body), std::move(vconstr)};
     Position fstart = params.empty() ? body->loc.start : param_loc(params.front()).start;
-    // `let f (type a b) = e` with *only* newtype params desugars to a ghost
-    // Pexp_newtype chain (not a Pexp_function), like `fun (type a) -> e`.
-    bool all_newtype = !fconstr && !params.empty();
+    // `let f (type a b) [: t] = e` with *only* newtype params desugars to a
+    // ghost Pexp_newtype chain (not a Pexp_function), like `fun (type a) -> e`.
+    // A return constraint wraps the body in a ghost Pexp_constraint/coerce
+    // (mkghost_newtype_function_body / all_params_as_newtypes in parser.mly).
+    bool all_newtype = !params.empty();
     for (auto& p : params)
       if (!std::holds_alternative<Pparam_newtype>(p.desc)) all_newtype = false;
     if (all_newtype) {
       ExprBox acc = std::move(body);
+      if (fconstr) {
+        Location cloc{acc->loc.start, acc->loc.end, /*ghost=*/true};
+        if (auto* pc = std::get_if<Pconstraint>(&*fconstr))
+          acc = E({Pexp_constraint{std::move(acc), std::move(pc->type)}, cloc});
+        else {
+          auto& co = std::get<Pcoerce>(*fconstr);
+          acc = E({Pexp_coerce{std::move(acc), std::move(co.from), std::move(co.to_)}, cloc});
+        }
+      }
       for (int i = static_cast<int>(params.size()) - 1; i >= 0; --i) {
         auto& nt = std::get<Pparam_newtype>(params[i].desc);
         Position s = (i == 0) ? fstart : param_loc(params[i]).start;
