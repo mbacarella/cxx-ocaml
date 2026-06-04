@@ -931,6 +931,11 @@ struct Printer {
   void ext_kind(int i, const std::variant<Pext_decl, Pext_rebind>& k) {
     if (auto* d = std::get_if<Pext_decl>(&k)) {
       line(i, "Pext_decl");
+      if (!d->vars.empty()) {
+        std::string s = "vars";
+        for (auto& v : d->vars) s += " '" + v;
+        line(i + 1, s);
+      }
       ctor_args(i + 1, d->args);
       if (d->res) { line(i + 1, "Some"); core_type(i + 2, **d->res); }
       else line(i + 1, "None");

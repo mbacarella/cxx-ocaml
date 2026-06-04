@@ -2094,8 +2094,17 @@ class Parser {
     } else {
       ConstructorArguments args = Pcstr_tuple{};
       std::optional<CoreTypeBox> res;
+      std::vector<std::string> gvars;
       if (cur().kind == Kind::COLON) {  // GADT-style
         advance();
+        if (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {  // 'a 'b.
+          size_t save = idx_;
+          while (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
+            advance(); gvars.push_back(cur().text); advance();
+          }
+          if (cur().kind == Kind::DOT) advance();
+          else { idx_ = save; gvars.clear(); }
+        }
         std::vector<CoreTypeBox> ts;
         ts.push_back(parse_type_app());
         while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
@@ -2113,7 +2122,7 @@ class Parser {
           args = Pcstr_tuple{std::move(ts)};
         }
       }
-      kind = Pext_decl{std::move(args), std::move(res)};
+      kind = Pext_decl{std::move(args), std::move(res), std::move(gvars)};
     }
     Attributes attrs;  // pext_attributes: `A [@deprecated]`
     while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }

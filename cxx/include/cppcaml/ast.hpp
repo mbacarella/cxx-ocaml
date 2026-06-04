@@ -277,7 +277,8 @@ struct TypeDeclaration {
 };
 
 // --- extension constructors / exceptions ---
-struct Pext_decl { ConstructorArguments args; std::optional<CoreTypeBox> res; };  // vars []
+struct Pext_decl { ConstructorArguments args; std::optional<CoreTypeBox> res;
+                   std::vector<std::string> vars; };  // A : 'a 'b. … -> t
 struct Pext_rebind { LongidentLoc id; };
 struct ExtensionConstructor {
   StringLoc name;
