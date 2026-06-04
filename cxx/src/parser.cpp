@@ -3341,6 +3341,11 @@ class Parser {
   }
 
   ClassField parse_class_field() {
+    ClassField f = parse_class_field_core();
+    attach_docs(f.attrs, f.loc.start.cnum, f.loc.end.cnum);  // (** doc *) on the field
+    return f;
+  }
+  ClassField parse_class_field_core() {
     Token t = cur();
     Position fs = position(t.start);
     if (t.kind == Kind::INHERIT) {
