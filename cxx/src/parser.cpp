@@ -1620,7 +1620,17 @@ class Parser {
   }
   Pattern parse_pat_or() {
     Pattern p = parse_pat_or_operand();
-    while (cur().kind == Kind::BAR) {
+    for (;;) {
+      // `operand as x | …` : the alias binds to this operand and the or continues
+      // (whereas a trailing `… as x` with no following `|` aliases the whole or).
+      if (cur().kind == Kind::AS && peek(1).kind == Kind::LIDENT &&
+          peek(2).kind == Kind::BAR) {
+        advance();
+        Token nm = cur(); advance();
+        Location l = span(p.loc.start, position(nm.end));
+        p = Pattern{Ppat_alias{box(std::move(p)), StringLoc{nm.text, tokloc(nm)}}, l};
+      }
+      if (cur().kind != Kind::BAR) break;
       advance();
       Pattern r = parse_pat_or_operand();
       Location l = span(p.loc.start, r.loc.end);
