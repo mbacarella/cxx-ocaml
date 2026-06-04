@@ -2920,6 +2920,19 @@ class Parser {
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
       return SignatureItem{Psig_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty)}, here()};
     }
+    if (t.kind == Kind::MODULE && peek(1).kind == Kind::REC) {  // module rec M : mt and N : mt
+      advance(); advance();  // module rec
+      std::vector<ModuleDeclaration> decls;
+      for (;;) {
+        StrOptLoc name = parse_module_name();
+        expect(Kind::COLON, ":");
+        ModuleType mt = parse_module_type();
+        decls.push_back(ModuleDeclaration{std::move(name), box(std::move(mt))});
+        if (cur().kind == Kind::AND) { advance(); continue; }
+        break;
+      }
+      return SignatureItem{Psig_recmodule{std::move(decls)}, here()};
+    }
     if (t.kind == Kind::MODULE) {
       advance();
       StrOptLoc name = parse_module_name();
