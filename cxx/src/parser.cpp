@@ -1729,6 +1729,12 @@ class Parser {
   }
   // One (possibly labeled) tuple-pattern element: `~x:p`, `~x` (punning), or `p`.
   std::pair<std::optional<std::string>, Pattern> parse_labeled_pat_elem() {
+    if (cur().kind == Kind::EXCEPTION) {  // a tuple element may be `exception p`
+      Token e = cur(); advance();
+      Pattern inner = parse_pat_cons();
+      Location l = span(position(e.start), inner.loc.end);
+      return {std::nullopt, Pattern{Ppat_exception{box(std::move(inner))}, l}};
+    }
     if (cur().kind == Kind::LABEL) {  // ~x:p
       Token lt = cur(); advance();
       return {lt.text, parse_pat_cons()};
