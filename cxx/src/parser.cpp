@@ -2929,9 +2929,23 @@ class Parser {
   //   name payload ]   with a structure payload (PStr).
   Attribute parse_attribute_body() {
     std::string name = parse_attr_name();
+    if (cur().kind == Kind::COLON) {  // `[@name : core_type]`  -> PTyp
+      advance();
+      CoreTypeBox ty = parse_core_type();
+      expect(Kind::RBRACKET, "]");
+      return Attribute{std::move(name), {}, std::move(ty), nullptr, nullptr};
+    }
+    if (cur().kind == Kind::QUESTION) {  // `[@name ? pat [when guard]]`  -> PPat
+      advance();
+      PatBox p = box(parse_pattern());
+      ExprBox g;
+      if (cur().kind == Kind::WHEN) { advance(); g = parse_expr(); }
+      expect(Kind::RBRACKET, "]");
+      return Attribute{std::move(name), {}, nullptr, std::move(p), std::move(g)};
+    }
     Structure payload = parse_structure_until(Kind::RBRACKET);
     expect(Kind::RBRACKET, "]");
-    return Attribute{std::move(name), std::move(payload)};
+    return Attribute{std::move(name), std::move(payload), nullptr, nullptr, nullptr};
   }
 
   StrOptLoc parse_module_name() {

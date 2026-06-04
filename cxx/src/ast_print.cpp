@@ -92,7 +92,11 @@ struct Printer {
   void attributes(int i, const Attributes& attrs) {  // printast `attributes i`
     for (auto& a : attrs) {
       line(i + 1, "attribute \"" + a.name + "\"");
-      structure_list(i + 2, a.payload);  // payload PStr
+      if (a.typ) core_type(i + 2, *a.typ);             // PTyp: `[@name : t]`
+      else if (a.pat) {                                // PPat: `[@name ? p [when g]]`
+        pattern(i + 2, *a.pat);
+        if (a.guard) { line(i + 2, "<when>"); expression(i + 2, *a.guard); }
+      } else structure_list(i + 2, a.payload);         // PStr
     }
   }
 

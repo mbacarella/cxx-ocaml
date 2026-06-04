@@ -36,7 +36,18 @@ struct StructureItem;
 using Structure = std::vector<StructureItem>;
 struct ModuleExpr;     // (used by Pexp_pack, Pstr_include, …)
 struct ClassStructure;  // object … end  (used by Pexp_object)
-struct Attribute { std::string name; Structure payload; };  // [@name payload] (PStr)
+struct CoreType;       // (attribute payloads: PTyp / PPat)
+struct Pattern;
+struct Expression;
+// An attribute payload is usually a structure (PStr).  `[@name : t]` is a PTyp
+// payload and `[@name ? p [when g]]` is a PPat payload (typ/pat non-null then).
+struct Attribute {
+  std::string name;
+  Structure payload;            // PStr
+  Box<CoreType> typ;            // PTyp: `[@name : t]`
+  Box<Pattern> pat;            // PPat: `[@name ? p]`
+  Box<Expression> guard;       // PPat guard: `[@name ? p when g]`
+};
 using Attributes = std::vector<Attribute>;
 
 // --- Longident.t ---
