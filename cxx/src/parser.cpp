@@ -886,6 +886,7 @@ class Parser {
     }
     return {std::nullopt, parse_binop(0)};
   }
+  Position last_case_end_{};  // end of last match/try arm (incl trailing ;)
   bool elem_punned_constr_ = false;  // last elem was `~(x:t)` (its loc-end quirk)
   // letop binding pattern: `p` or `p : t` (a ghost Ppat_constraint over `p : t`).
   Pattern parse_letop_binding_pat() {
@@ -958,11 +959,15 @@ class Parser {
     if (cur().kind == Kind::DOT) {  // refutation  -> .
       Token d = cur(); advance();
       rhs = E({Pexp_unreachable{}, tokloc(d)});
+      last_case_end_ = position(d.end);
     } else {
       rhs = parse_expr();
+      last_case_end_ = last_seq_end_;  // arm RHS is seq_expr: include a trailing `;`
     }
     return Case{std::move(p), std::move(guard), std::move(rhs)};
   }
+  // End of the last arm parsed (incl. a trailing `;` for a non-refutation arm).
+  Position last_arm_end(const std::vector<Case>&) { return last_case_end_; }
   std::vector<Case> parse_cases() {
     std::vector<Case> cs;
     if (cur().kind == Kind::BAR) advance();
@@ -1026,7 +1031,7 @@ class Parser {
         ExprBox e0 = parse_expr();
         expect(Kind::WITH, "with");
         std::vector<Case> cs = parse_cases();
-        Location l = span(position(t.start), cs.back().rhs->loc.end);
+        Location l = span(position(t.start), last_arm_end(cs));
         return E({Pexp_match{std::move(e0), std::move(cs)}, l});
       }
       case Kind::TRY: {
@@ -1034,7 +1039,7 @@ class Parser {
         ExprBox e0 = parse_expr();
         expect(Kind::WITH, "with");
         std::vector<Case> cs = parse_cases();
-        Location l = span(position(t.start), cs.back().rhs->loc.end);
+        Location l = span(position(t.start), last_arm_end(cs));
         return E({Pexp_try{std::move(e0), std::move(cs)}, l});
       }
       case Kind::FUNCTION: {
@@ -1042,7 +1047,7 @@ class Parser {
         Attributes fattrs;  // `function[@attr] …`
         while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
         std::vector<Case> cs = parse_cases();
-        Position last = cs.back().rhs->loc.end;
+        Position last = last_case_end_;
         Location casesloc = span(position(t.start), last);
         auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
         ExprBox r = E({Pexp_function{{}, std::nullopt, std::move(fb)}, span(position(t.start), last)});
@@ -1075,7 +1080,7 @@ class Parser {
         if (!all_newtype && cur().kind == Kind::FUNCTION) {
           Token fkw = cur(); advance();
           std::vector<Case> cs = parse_cases();
-          Position last = cs.back().rhs->loc.end;
+          Position last = last_case_end_;
           Location casesloc = span(position(fkw.start), last);
           auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
           return withattrs(E({Pexp_function{std::move(params), std::move(fconstr), std::move(fb)},
@@ -2382,7 +2387,7 @@ class Parser {
     if (cur().kind == Kind::FUNCTION && (!params.empty() || fconstr)) {
       Token fkw = cur(); advance();
       std::vector<Case> cs = parse_cases();
-      Position last = cs.back().rhs->loc.end;
+      Position last = last_case_end_;
       Location casesloc = span(position(fkw.start), last);
       auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
       Location floc = span(param_loc(params.front()).start, last, /*ghost=*/true);
