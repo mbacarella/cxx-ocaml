@@ -1297,6 +1297,15 @@ class Parser {
       Location l = span(symstart, position(id.end));
       t = box(CoreType{Ptyp_alias{std::move(t), id.text}, l});
     }
+    // Attributes attach only at the outermost core_type (grammar rule
+    // `core_type attribute`); the arrow codomain / tuple elements are
+    // attribute-free function_type/atomic_type, so e.g. `int -> float [@a]`
+    // binds `[@a]` to the whole arrow, not to `float`.
+    if (!suppress_type_trailing_attr_)
+      while (cur().kind == Kind::LBRACKETAT) {  // t [@attr]  -> ptyp_attributes
+        advance();
+        t->attrs.push_back(parse_attribute_body());
+      }
     return t;
   }
   // Compound type nodes take their location from the *symbol* span (which
@@ -1423,11 +1432,6 @@ class Parser {
       t = box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
                        .loc = span(symstart, name.loc.end)});
     }
-    if (!suppress_type_trailing_attr_)
-      while (cur().kind == Kind::LBRACKETAT) {  // t [@attr]  -> ptyp_attributes
-        advance();
-        t->attrs.push_back(parse_attribute_body());
-      }
     return t;
   }
   CoreTypeBox parse_type_atom() {
