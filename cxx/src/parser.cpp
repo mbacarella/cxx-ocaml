@@ -1745,7 +1745,8 @@ class Parser {
         return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
       }
       if (cur().kind == Kind::DOT &&
-          (peek(1).kind == Kind::LBRACKET || peek(1).kind == Kind::LBRACE)) {  // M.[…] / M.{…}
+          (peek(1).kind == Kind::LBRACKET || peek(1).kind == Kind::LBRACE ||
+           peek(1).kind == Kind::LBRACKETBAR)) {  // M.[…] / M.{…} / M.[|…|]
         advance();
         Pattern inner = parse_simple_pattern();
         Position end = inner.loc.end;
@@ -1825,7 +1826,8 @@ class Parser {
           return {Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
         }
         if (cur().kind == Kind::DOT &&
-            (peek(1).kind == Kind::LBRACKET || peek(1).kind == Kind::LBRACE)) {  // M.[…] / M.{…}
+            (peek(1).kind == Kind::LBRACKET || peek(1).kind == Kind::LBRACE ||
+           peek(1).kind == Kind::LBRACKETBAR)) {  // M.[…] / M.{…} / M.[|…|]
           advance();  // .  (the bracket is the inner pattern's own delimiter)
           Pattern inner = parse_simple_pattern();
           Position end = inner.loc.end;
