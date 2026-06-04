@@ -2078,7 +2078,23 @@ class Parser {
             break;
           }
           LongidentLoc lbl = parse_longident_path();
-          if (cur().kind == Kind::EQUAL) {
+          if (cur().kind == Kind::COLON) {  // `{ f : ty [= p] }`
+            Position colonPos = position(cur().start);
+            advance();
+            CoreTypeBox fty = parse_poly_type(/*ghost=*/false);
+            if (cur().kind == Kind::EQUAL) {  // `{ f : ty = p }` -> f = (p : ty)
+              advance();
+              PatBox p = box(parse_pattern());
+              Location cl{colonPos, p->loc.end, false};
+              fields.emplace_back(lbl, box(Pattern{Ppat_constraint{std::move(p), std::move(fty)}, cl}));
+            } else {  // `{ f : ty }` punning -> f = (f : ty); label becomes ghost
+              LongidentLoc glbl = lbl;
+              glbl.loc.ghost = true;
+              PatBox var = box(Pattern{Ppat_var{StringLoc{lid_last_name(lbl.txt), lbl.loc}}, lbl.loc});
+              Location cl{lbl.loc.start, fty->loc.end, false};
+              fields.emplace_back(glbl, box(Pattern{Ppat_constraint{std::move(var), std::move(fty)}, cl}));
+            }
+          } else if (cur().kind == Kind::EQUAL) {
             advance();
             fields.emplace_back(lbl, box(parse_pattern()));
           } else {
