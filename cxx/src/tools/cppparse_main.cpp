@@ -22,8 +22,9 @@ int main(int argc, char** argv) {
   std::string src = ss.str();
 
   try {
-    auto structure = cppcaml::parse_structure(src);
-    cppcaml::ast::print_dparsetree(structure, argv[1], std::cout);
+    std::vector<std::string> dirfiles;
+    auto structure = cppcaml::parse_structure(src, dirfiles);
+    cppcaml::ast::print_dparsetree(structure, argv[1], std::cout, dirfiles);
   } catch (const cppcaml::ParseError& e) {
     std::cout << "PARSE_ERROR\t" << e.pos << '\t' << e.what() << '\n';
     return 1;

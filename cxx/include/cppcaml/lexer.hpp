@@ -53,10 +53,15 @@ class Lexer {
 
   const DocAttach& doc_attach() const { return docs_; }
 
+  // `# N "file"` line directives, in source order (anchor = next line's start).
+  struct LineDirective { size_t anchor_cnum; int line; std::string file; };
+  const std::vector<LineDirective>& directives() const { return directives_; }
+
  private:
   std::string_view src_;
   size_t pos_ = 0;
   DocAttach docs_;
+  std::vector<LineDirective> directives_;
 
   bool is_doc_comment(size_t s, size_t e) const;
   std::string doc_body(size_t s, size_t e) const;

@@ -16,9 +16,10 @@ namespace cppcaml::ast {
 
 // --- positions & locations (mirror Lexing.position / Location.t) ---
 struct Position {
-  int lnum = 1;     // 1-based line
+  int lnum = 1;     // 1-based line (logical, honouring `# N "file"` directives)
   int bol = 0;      // byte offset of beginning of line
   int cnum = 0;     // byte offset of this position
+  int file_id = 0;  // 0 = the source path; >0 indexes a `# _ "file"` directive name
 };
 struct Location {
   Position start;

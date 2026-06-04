@@ -37,11 +37,16 @@ std::string ocaml_escape(std::string_view s) {
 struct Printer {
   std::ostream& os;
   std::string fname;
+  std::vector<std::string> dirfiles;  // file_id k>0 -> dirfiles[k-1]
 
   std::string ind(int i) const { return std::string((2 * i) % 72, ' '); }
 
+  const std::string& file_of(const Position& p) const {
+    if (p.file_id > 0 && p.file_id <= static_cast<int>(dirfiles.size())) return dirfiles[p.file_id - 1];
+    return fname;
+  }
   std::string pos(const Position& p, bool with_name) const {
-    std::string s = with_name ? (p.cnum == -1 ? "_none_" : fname) : "";  // Location.none
+    std::string s = with_name ? (p.cnum == -1 ? "_none_" : file_of(p)) : "";  // Location.none
     s += '[' + std::to_string(p.lnum) + ',' + std::to_string(p.bol) + '+' +
          std::to_string(p.cnum - p.bol) + ']';
     return s;
@@ -1096,8 +1101,9 @@ struct Printer {
 
 }  // namespace
 
-void print_dparsetree(const Structure& s, std::string_view fname, std::ostream& os) {
-  Printer p{os, std::string(fname)};
+void print_dparsetree(const Structure& s, std::string_view fname, std::ostream& os,
+                      const std::vector<std::string>& dirfiles) {
+  Printer p{os, std::string(fname), dirfiles};
   p.structure(s);
   os << '\n';  // driver flushes the dump with a trailing newline (@.)
 }

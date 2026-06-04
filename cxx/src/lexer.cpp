@@ -987,7 +987,12 @@ Token Lexer::scan_hash(size_t start) {
           bool overflow = sig.size() > kMaxInt.size() ||
                           (sig.size() == kMaxInt.size() && sig > kMaxInt);
           if (overflow) throw LexError("Invalid directive: line number out of range", num_start);
-          pos_ = r;            // location update is a no-op for byte offsets
+          // record the directive: subsequent lines are renumbered from <num> and
+          // attributed to "<file>".  Anchor at the start of the next line.
+          size_t anchor = (r < src_.size()) ? r + 1 : r;  // skip the trailing newline
+          directives_.push_back({anchor, static_cast<int>(std::stoll(std::string(sig))),
+                                 std::string(src_.substr(p + 1, q - (p + 1)))});
+          pos_ = r;            // byte offsets are unaffected
           return raw_token();  // directive produces no token; continue
         }
       }

@@ -98,7 +98,13 @@ class Parser {
     line_starts_.push_back(0);
     for (size_t i = 0; i < src.size(); ++i)
       if (src[i] == '\n') line_starts_.push_back(static_cast<int>(i + 1));
+    for (auto& d : lex.directives()) {  // `# N "file"` renumbering, source order
+      int fid = static_cast<int>(filenames_.size()) + 1;  // file_id 0 = the source path
+      filenames_.push_back(d.file);
+      dirs_.push_back({static_cast<int>(d.anchor_cnum), d.line, phys_line_index(d.anchor_cnum), fid});
+    }
   }
+  const std::vector<std::string>& directive_files() const { return filenames_; }
 
   // --- docstrings (ocaml.doc / ocaml.text) ---
   Structure doc_payload(const Docstring& d) {
@@ -174,6 +180,9 @@ class Parser {
   std::vector<Token> tokens_;
   DocAttach docs_;
   std::vector<int> line_starts_;
+  struct Directive { int anchor_cnum; int line; int phys_line; int file_id; };
+  std::vector<Directive> dirs_;        // `# N "file"` directives, source order
+  std::vector<std::string> filenames_; // file_id k>0 -> filenames_[k-1]
   size_t idx_ = 0;
   Position last_seq_end_{};  // end of the most recent parse_expr, incl. a trailing `;`
   bool last_type_subst_ = false;  // most recent type decl used `:=` (substitution)
@@ -191,14 +200,25 @@ class Parser {
     advance();
   }
 
-  Position position(size_t cnum) const {
+  int phys_line_index(size_t cnum) const {
     int lo = 0, hi = static_cast<int>(line_starts_.size()) - 1, ans = 0;
     while (lo <= hi) {
       int mid = (lo + hi) / 2;
       if (line_starts_[mid] <= static_cast<int>(cnum)) { ans = mid; lo = mid + 1; }
       else hi = mid - 1;
     }
-    return Position{ans + 1, line_starts_[ans], static_cast<int>(cnum)};
+    return ans;
+  }
+  Position position(size_t cnum) const {
+    int ans = phys_line_index(cnum);
+    Position p{ans + 1, line_starts_[ans], static_cast<int>(cnum), 0};
+    for (int i = static_cast<int>(dirs_.size()) - 1; i >= 0; --i)  // latest directive ≤ cnum
+      if (dirs_[i].anchor_cnum <= static_cast<int>(cnum)) {
+        p.lnum = dirs_[i].line + (ans - dirs_[i].phys_line);  // renumbered from N
+        p.file_id = dirs_[i].file_id;
+        break;
+      }
+    return p;
   }
   Location tokloc(const Token& t) const {
     return Location{position(t.start), position(t.end), false};
@@ -3849,5 +3869,11 @@ class Parser {
 }  // namespace
 
 Structure parse_structure(std::string_view src) { return Parser(src).parse_structure(); }
+Structure parse_structure(std::string_view src, std::vector<std::string>& directive_files) {
+  Parser p(src);
+  Structure s = p.parse_structure();
+  directive_files = p.directive_files();
+  return s;
+}
 
 }  // namespace cppcaml

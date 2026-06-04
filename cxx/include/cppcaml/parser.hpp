@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "cppcaml/ast.hpp"
 
@@ -16,10 +17,15 @@ struct ParseError : std::runtime_error {
 
 // Parse a compilation unit (.ml structure). `src` must outlive the call.
 ast::Structure parse_structure(std::string_view src);
+// Variant that also reports the filenames named by `# N "file"` directives
+// (in file_id order: directive_files[k] is file_id k+1).
+ast::Structure parse_structure(std::string_view src, std::vector<std::string>& directive_files);
 
 namespace ast {
 // Render a structure in `ocamlc -dparsetree` format (see ast_print.cpp).
-void print_dparsetree(const Structure& s, std::string_view fname, std::ostream& os);
+// `dirfiles` supplies the directive filenames (file_id>0); fname is file_id 0.
+void print_dparsetree(const Structure& s, std::string_view fname, std::ostream& os,
+                      const std::vector<std::string>& dirfiles = {});
 }  // namespace ast
 
 }  // namespace cppcaml
