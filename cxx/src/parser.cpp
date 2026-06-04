@@ -2779,11 +2779,20 @@ class Parser {
       PrivateFlag priv = PrivateFlag::Public;
       if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
       CoreTypeBox manifest = parse_core_type();
+      std::vector<TypeConstraint> constraints;  // `with type … constraint t1 = t2`
+      while (cur().kind == Kind::CONSTRAINT) {
+        advance();
+        CoreTypeBox c1 = parse_core_type();
+        expect(Kind::EQUAL, "=");
+        CoreTypeBox c2 = parse_core_type();
+        Location cl = span(c1->loc.start, position(tokens_[idx_ - 1].end));
+        constraints.push_back(TypeConstraint{std::move(c1), std::move(c2), cl});
+      }
       std::string lastnm = lid_last_name(lid.txt);
       Location nameloc = span(position(lid.loc.end.cnum - static_cast<int>(lastnm.size())), lid.loc.end);
       Location dl = span(kw, position(tokens_[idx_ - 1].end));
       auto td = box(TypeDeclaration{StringLoc{lastnm, nameloc}, std::move(params), TypeKind{Ptype_abstract{}},
-                                    priv, std::move(manifest), dl, {}, {}});
+                                    priv, std::move(manifest), dl, {}, std::move(constraints)});
       if (subst) return Pwith_typesubst{std::move(lid), std::move(td)};
       return Pwith_type{std::move(lid), std::move(td)};
     }
