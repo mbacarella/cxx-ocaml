@@ -2819,7 +2819,7 @@ class Parser {
         constraints.push_back(TypeConstraint{std::move(c1), std::move(c2), cl});
       }
       std::string lastnm = lid_last_name(lid.txt);
-      Location nameloc = span(position(lid.loc.end.cnum - static_cast<int>(lastnm.size())), lid.loc.end);
+      Location nameloc = lid.loc;  // `with type M.t` -> name "t", loc spans the full path
       Location dl = span(kw, position(tokens_[idx_ - 1].end));
       auto td = box(TypeDeclaration{StringLoc{lastnm, nameloc}, std::move(params), TypeKind{Ptype_abstract{}},
                                     priv, std::move(manifest), dl, {}, std::move(constraints)});
