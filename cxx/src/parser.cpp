@@ -3420,6 +3420,17 @@ class Parser {
       advance();
       return parse_class_fun_def();  // wrap_class_attrs keeps body loc (spans from 1st param)
     }
+    if (t.kind == Kind::LET && peek(1).kind == Kind::OPEN) {  // let open M in ce
+      advance(); advance();  // let open
+      OverrideFlag ovr = OverrideFlag::Fresh;
+      if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
+      LongidentLoc id = parse_type_path();
+      expect(Kind::IN, "in");
+      ClassExpr body = parse_class_expr();
+      Position end = body.loc.end;
+      return ClassExpr{Pcl_open{ovr, std::move(id), box(std::move(body))},
+                       span(position(t.start), end), {}};
+    }
     if (t.kind == Kind::LET) {
       auto [rf, binds] = parse_value_bindings();
       expect(Kind::IN, "in");

@@ -881,6 +881,9 @@ struct Printer {
       line(j, std::string("Pcl_let ") + rec_flag(v->rf));
       value_bindings(j, v->bindings);
       class_expr(j, *v->body);
+    } else if (auto* v = std::get_if<Pcl_open>(&x.desc)) {
+      line(j, std::string("Pcl_open ") + override_flag(v->ovr) + " " + lid_loc(v->id));
+      class_expr(j, *v->body);
     } else {
       auto& vk = std::get<Pcl_constraint>(x.desc);
       line(j, "Pcl_constraint");

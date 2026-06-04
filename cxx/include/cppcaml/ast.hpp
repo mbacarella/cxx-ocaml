@@ -413,8 +413,10 @@ struct Pcl_fun { ArgLabel label; std::optional<ExprBox> default_; Pattern pat; C
 struct Pcl_apply { ClassExprBox ce; std::vector<std::pair<ArgLabel, ExprBox>> args; };
 struct Pcl_let { RecFlag rf; std::vector<ValueBinding> bindings; ClassExprBox body; };
 struct Pcl_constraint { ClassExprBox ce; ClassTypeBox ct; };
+struct Pcl_open { OverrideFlag ovr; LongidentLoc id; ClassExprBox body; };  // let open M in ce
 struct ClassExpr {
-  std::variant<Pcl_constr, Pcl_structure, Pcl_fun, Pcl_apply, Pcl_let, Pcl_constraint> desc;
+  std::variant<Pcl_constr, Pcl_structure, Pcl_fun, Pcl_apply, Pcl_let, Pcl_constraint,
+               Pcl_open> desc;
   Location loc;
   Attributes attrs;
 };
