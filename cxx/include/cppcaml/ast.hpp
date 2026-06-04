@@ -397,8 +397,9 @@ struct ClassSignature { CoreTypeBox self; std::vector<ClassTypeField> fields; };
 struct Pcty_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
 struct Pcty_signature { ClassSignature cs; };
 struct Pcty_arrow { ArgLabel label; CoreTypeBox dom; ClassTypeBox cod; };
+struct Pcty_open { OverrideFlag ovr; LongidentLoc id; ClassTypeBox body; };  // let open M in ct
 struct ClassType {
-  std::variant<Pcty_constr, Pcty_signature, Pcty_arrow> desc;
+  std::variant<Pcty_constr, Pcty_signature, Pcty_arrow, Pcty_open> desc;
   Location loc;
   Attributes attrs;
 };

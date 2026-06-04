@@ -3739,6 +3739,17 @@ class Parser {
       return ClassType{Pcty_arrow{label, std::move(dom), box(std::move(cod))},
                        span(position(t.start), cod.loc.end), {}};
     }
+    if (t.kind == Kind::LET && peek(1).kind == Kind::OPEN) {  // let open M in ct
+      advance(); advance();  // let open
+      OverrideFlag ovr = OverrideFlag::Fresh;
+      if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
+      LongidentLoc id = parse_type_path();
+      expect(Kind::IN, "in");
+      ClassType body = parse_class_type();
+      Position end = body.loc.end;
+      return ClassType{Pcty_open{ovr, std::move(id), box(std::move(body))},
+                       span(position(t.start), end), {}};
+    }
     if (t.kind == Kind::OBJECT) {
       advance();
       ClassSignature cs = parse_class_sig_body();

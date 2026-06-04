@@ -798,6 +798,9 @@ struct Printer {
     } else if (auto* v = std::get_if<Pcty_signature>(&x.desc)) {
       line(j, "Pcty_signature");
       class_signature(j, v->cs);
+    } else if (auto* v = std::get_if<Pcty_open>(&x.desc)) {
+      line(j, std::string("Pcty_open ") + override_flag(v->ovr) + " " + lid_loc(v->id));
+      class_type(j, *v->body);
     } else {
       auto& a = std::get<Pcty_arrow>(x.desc);
       line(j, "Pcty_arrow");
