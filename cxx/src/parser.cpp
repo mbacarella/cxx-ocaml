@@ -1863,7 +1863,9 @@ class Parser {
         expect(Kind::RPAREN, ")");
       }
       if (is_simple_pattern_start(cur().kind)) {
-        Pattern arg = parse_simple_pattern();
+        // `C p` arg is a full `pattern` at prec_constr_appl, so `Some A _` is
+        // `Some (A _)`; but `C (type a) p` (vars present) restricts it to a simple pattern.
+        Pattern arg = vars.empty() ? parse_pat_app() : parse_simple_pattern();
         Location l = span(cl.loc.start, arg.loc.end);
         return Pattern{Ppat_construct{.id = cl, .arg = box(std::move(arg)), .vars = std::move(vars)}, l};
       }
