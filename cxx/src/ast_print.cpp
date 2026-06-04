@@ -481,7 +481,8 @@ struct Printer {
     } else if (auto* v = std::get_if<Pexp_letop>(&e.desc)) {
       line(j, "Pexp_letop");
       binding_op(j, v->let_);
-      for (auto& b : v->ands) binding_op(j, b);
+      if (v->ands.empty()) line(j, "[]");  // list i binding_op ands
+      else { line(j, "["); for (auto& b : v->ands) binding_op(j + 1, b); line(j, "]"); }
       expression(j, *v->body);
     } else if (auto* v = std::get_if<Pexp_object>(&e.desc)) {
       line(j, "Pexp_object");
@@ -506,7 +507,8 @@ struct Printer {
     }
   }
   void binding_op(int i, const BindingOp& b) {
-    os << ind(i) << "<binding_op> \"" << b.op.txt << "\" " << loc(b.loc);  // no newline
+    // printast: `<binding_op> "op" (op_loc) (pbop_loc)` then pattern/expr
+    os << ind(i) << "<binding_op> \"" << b.op.txt << "\" " << loc(b.op.loc) << " " << loc(b.loc);
     pattern(i + 1, b.pat);
     expression(i + 1, *b.exp);
   }

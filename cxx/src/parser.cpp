@@ -887,6 +887,17 @@ class Parser {
     return {std::nullopt, parse_binop(0)};
   }
   bool elem_punned_constr_ = false;  // last elem was `~(x:t)` (its loc-end quirk)
+  // letop binding pattern: `p` or `p : t` (a ghost Ppat_constraint over `p : t`).
+  Pattern parse_letop_binding_pat() {
+    Pattern p = parse_pattern();
+    if (cur().kind == Kind::COLON) {
+      advance();
+      CoreTypeBox ty = parse_core_type();
+      Location l = span(p.loc.start, ty->loc.end, /*ghost=*/true);
+      p = Pattern{Ppat_constraint{box(std::move(p)), std::move(ty)}, l};
+    }
+    return p;
+  }
   ExprBox parse_tuple() {
     Position s = position(cur().start);
     elem_punned_constr_ = false;
@@ -1112,25 +1123,31 @@ class Parser {
         return E({Pexp_for{std::move(var), std::move(lo), std::move(hi), dir, std::move(body)},
                   span(position(t.start), position(c.end))});
       }
-      case Kind::LETOP: {  // let* p = e0 [and* …] in e
+      case Kind::LETOP: {  // let* p [: t] = e0 [and* …] in e
         Token op = cur(); advance();
-        Pattern pat = parse_pattern();
+        Pattern pat = parse_letop_binding_pat();
+        Position letPatStart = pat.loc.start;
+        StringLoc letop_name{op.text, tokloc(op)};
         expect(Kind::EQUAL, "=");
         ExprBox e0 = parse_expr();
-        BindingOp letb{StringLoc{op.text, tokloc(op)}, std::move(pat), std::move(e0),
-                       span(position(op.start), position(tokens_[idx_ - 1].end))};
+        // each binding_op's pbop_loc follows menhir's $sloc: the let_ spans the whole
+        // letop (op..body), each and_ spans the let-pattern start..its own expr end.
         std::vector<BindingOp> ands;
         while (cur().kind == Kind::ANDOP) {
           Token aop = cur(); advance();
-          Pattern ap = parse_pattern();
+          Pattern ap = parse_letop_binding_pat();
           expect(Kind::EQUAL, "=");
           ExprBox ae = parse_expr();
+          Position aexpEnd = ae->loc.end;
           ands.push_back(BindingOp{StringLoc{aop.text, tokloc(aop)}, std::move(ap), std::move(ae),
-                                   span(position(aop.start), position(tokens_[idx_ - 1].end))});
+                                   span(letPatStart, aexpEnd)});
         }
         expect(Kind::IN, "in");
         ExprBox body = parse_expr();
-        Location l = span(position(t.start), last_seq_end_);  // seq_expr incl. trailing `;`
+        Position bodyEnd = last_seq_end_;
+        BindingOp letb{std::move(letop_name), std::move(pat), std::move(e0),
+                       span(position(op.start), bodyEnd)};
+        Location l = span(position(t.start), bodyEnd);
         return E({Pexp_letop{std::move(letb), std::move(ands), std::move(body)}, l});
       }
       default:
