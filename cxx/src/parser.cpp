@@ -2496,6 +2496,22 @@ class Parser {
     advance();
     return StringLoc{nm.text, tokloc(nm)};
   }
+  // `external f [: t] = path` alias target: a value path printed as a dotted string.
+  StringLoc parse_prim_alias() {
+    if (auto op = try_paren_operator()) return std::move(*op);  // ( + )
+    Token first = cur();
+    if (first.kind != Kind::LIDENT && first.kind != Kind::UIDENT)
+      throw ParseError("expected value identifier", first.start);
+    advance();
+    std::string s = first.text;
+    Token last = first;
+    while (last.kind == Kind::UIDENT && cur().kind == Kind::DOT &&
+           (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
+      advance(); Token nm = cur(); advance();
+      s += "." + nm.text; last = nm;
+    }
+    return StringLoc{s, span(position(first.start), position(last.end))};
+  }
   ValueBinding parse_value_binding_core() {
     // val_ident form (`let f p.. = e` / `let (+) p.. = e`) vs pattern form.
     std::optional<StringLoc> opname = try_paren_operator();  // consumes `( op )` on success
@@ -2753,18 +2769,22 @@ class Parser {
     if (t.kind == Kind::EXTERNAL) {
       advance();
       StringLoc ename = parse_value_name();  // LIDENT or ( op )
-      expect(Kind::COLON, ":");
-      CoreTypeBox ty = parse_poly_type(/*ghost=*/false);  // external f : 'a. t = …
+      CoreTypeBox ty;  // optional: absent in `external f = g`
+      if (cur().kind == Kind::COLON) { advance(); ty = parse_poly_type(/*ghost=*/false); }
       expect(Kind::EQUAL, "=");
       std::vector<std::string> prims;
-      while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
-      if (prims.empty()) throw ParseError("expected primitive string", cur().start);
+      std::optional<StringLoc> alias;
+      if (cur().kind == Kind::STRING)
+        while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
+      else
+        alias = parse_prim_alias();  // `external f [: t] = path`  (Pprim_alias)
+      if (prims.empty() && !alias) throw ParseError("expected primitive string", cur().start);
       Attributes pattrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); pattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(pattrs, l.start.cnum, l.end.cnum);
       PrimitiveDescription pd{std::move(ename), std::move(ty), std::move(prims), l,
-                              std::move(pattrs)};
+                              std::move(pattrs), std::move(alias)};
       return StructureItem{Pstr_primitive{std::move(pd)}, l};
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
@@ -3088,18 +3108,22 @@ class Parser {
     if (t.kind == Kind::EXTERNAL) {
       advance();
       StringLoc ename = parse_value_name();  // LIDENT or ( op )
-      expect(Kind::COLON, ":");
-      CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
+      CoreTypeBox ty;  // optional: absent in `external f = g`
+      if (cur().kind == Kind::COLON) { advance(); ty = parse_poly_type(/*ghost=*/false); }
       expect(Kind::EQUAL, "=");
       std::vector<std::string> prims;
-      while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
-      if (prims.empty()) throw ParseError("expected primitive string", cur().start);
+      std::optional<StringLoc> alias;
+      if (cur().kind == Kind::STRING)
+        while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
+      else
+        alias = parse_prim_alias();
+      if (prims.empty() && !alias) throw ParseError("expected primitive string", cur().start);
       Attributes attrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(attrs, l.start.cnum, l.end.cnum);
       return SignatureItem{Psig_primitive{PrimitiveDescription{
-          std::move(ename), std::move(ty), std::move(prims), l, std::move(attrs)}}, l};
+          std::move(ename), std::move(ty), std::move(prims), l, std::move(attrs), std::move(alias)}}, l};
     }
     if (t.kind == Kind::TYPE) {
       advance();

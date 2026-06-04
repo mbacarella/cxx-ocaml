@@ -993,6 +993,13 @@ struct Printer {
   void primitive_description(int i, const PrimitiveDescription& p) {
     line(i, "primitive_description " + str_loc(p.name) + " " + loc(p.loc));
     attributes(i, p.attrs);  // value_description attributes (i+1)
+    if (p.alias) {  // `external f [: t] = path`
+      line(i + 1, "Pprim_alias");
+      if (p.type) { line(i + 2, "Some"); core_type(i + 3, *p.type); }
+      else line(i + 2, "None");
+      line(i + 2, str_loc(*p.alias));
+      return;
+    }
     line(i + 1, "Pprim_decl");
     core_type(i + 2, *p.type);
     if (p.prims.empty()) line(i + 2, "[]");

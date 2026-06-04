@@ -299,10 +299,11 @@ struct TypeExtension {
 // --- primitives (external) ---
 struct PrimitiveDescription {
   StringLoc name;
-  CoreTypeBox type;
+  CoreTypeBox type;  // may be null for `external f = g` (Pprim_alias without a type)
   std::vector<std::string> prims;
   Location loc;
   Attributes attrs;  // post-item attributes (`[@@noalloc]` …)
+  std::optional<StringLoc> alias;  // `external f [: t] = path` -> Pprim_alias path
 };
 
 // --- module types / signatures ---
