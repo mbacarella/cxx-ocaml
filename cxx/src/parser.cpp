@@ -2566,6 +2566,8 @@ class Parser {
     }
     if (t.kind == Kind::TYPE) {
       advance();
+      Attributes typeattrs;  // `type[@attr] …`  -> on the first declaration
+      while (cur().kind == Kind::LBRACKETAT) { advance(); typeattrs.push_back(parse_attribute_body()); }
       RecFlag rf = RecFlag::Recursive;  // `type` is recursive by default
       if (cur().kind == Kind::NONREC) { advance(); rf = RecFlag::Nonrecursive; }
       Position d0 = position(t.start);
@@ -2604,6 +2606,8 @@ class Parser {
       }
       Location l = span(d0, position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
+      for (auto& a : decls[0].attrs) typeattrs.push_back(std::move(a));  // type[@attr] prefix
+      decls[0].attrs = std::move(typeattrs);
       return StructureItem{Pstr_type{rf, std::move(decls)}, l};
     }
     if (t.kind == Kind::OPEN) {
