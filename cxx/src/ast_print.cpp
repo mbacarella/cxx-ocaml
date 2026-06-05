@@ -1121,6 +1121,9 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_primitive>(&s.desc)) {
       line(j, "Pstr_primitive");
       primitive_description(j, v->prim);
+    } else if (auto* v = std::get_if<Pstr_val>(&s.desc)) {
+      line(j, "Pstr_val");
+      value_description(j, v->vd);
     } else if (auto* v = std::get_if<Pstr_module>(&s.desc)) {
       line(j, "Pstr_module");
       module_binding(j, v->binding);

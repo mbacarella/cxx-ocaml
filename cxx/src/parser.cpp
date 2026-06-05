@@ -3151,6 +3151,24 @@ class Parser {
       }
       return item;
     }
+    if (t.kind == Kind::VAL) {  // `val x : t` in a structure -> Pstr_val (fork feature)
+      advance();
+      std::optional<std::string> val_ext = take_ext();  // `val%ext …`
+      Attributes attrs = take_attrs();  // `val%ext[@attr] …` -> val_attributes (prefix)
+      StringLoc vname = parse_value_name();  // LIDENT or ( op )
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+      Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      attach_docs(attrs, l.start.cnum, l.end.cnum);
+      StructureItem item{Pstr_val{ValueDescription{std::move(vname), std::move(ty), l, std::move(attrs)}}, l};
+      if (val_ext) {  // `val%ext …` wraps the (ghost) Pstr_val in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*val_ext), std::move(ep)}, l};
+      }
+      return item;
+    }
     if (t.kind == Kind::EXTERNAL) {
       advance();
       std::optional<std::string> ext_ext = take_ext();  // `external%ext …`
@@ -4027,6 +4045,14 @@ class Parser {
     return parse_type_atom();
   }
 
+  void emit_class_text(std::vector<ClassField>& fields, size_t key) {
+    auto it = docs_.floating.find(key);
+    if (it == docs_.floating.end()) return;
+    for (auto& d : it->second) {
+      Location l = span(position(d.start), position(d.end));
+      fields.push_back(ClassField{Pcf_attribute{"ocaml.text", doc_payload(d)}, l, {}});
+    }
+  }
   ClassStructure parse_class_structure_body() {  // self pattern + fields, up to END
     Pattern self;
     if (cur().kind == Kind::LPAREN) {
@@ -4047,8 +4073,12 @@ class Parser {
       self = Pattern{Ppat_any{}, Location{p, p, true}};
     }
     std::vector<ClassField> fields;
-    while (cur().kind != Kind::END && cur().kind != Kind::TEOF)
+    while (cur().kind != Kind::END && cur().kind != Kind::TEOF) {
+      emit_class_text(fields, cur().start);  // floating `(** … *)` -> Pcf_attribute "ocaml.text"
+      if (cur().kind == Kind::END || cur().kind == Kind::TEOF) break;
       fields.push_back(parse_class_field());
+    }
+    emit_class_text(fields, cur().start);  // trailing floating text before `end`
     return ClassStructure{std::move(self), std::move(fields)};
   }
 
@@ -4447,9 +4477,21 @@ class Parser {
       self = box(CoreType{Ptyp_any{}, Location{p, p, true}});
     }
     std::vector<ClassTypeField> fields;
-    while (cur().kind != Kind::END && cur().kind != Kind::TEOF)
+    while (cur().kind != Kind::END && cur().kind != Kind::TEOF) {
+      emit_class_type_text(fields, cur().start);  // floating `(** … *)` -> Pctf_attribute "ocaml.text"
+      if (cur().kind == Kind::END || cur().kind == Kind::TEOF) break;
       fields.push_back(parse_class_sig_field());
+    }
+    emit_class_type_text(fields, cur().start);  // trailing floating text before `end`
     return ClassSignature{std::move(self), std::move(fields)};
+  }
+  void emit_class_type_text(std::vector<ClassTypeField>& fields, size_t key) {
+    auto it = docs_.floating.find(key);
+    if (it == docs_.floating.end()) return;
+    for (auto& d : it->second) {
+      Location l = span(position(d.start), position(d.end));
+      fields.push_back(ClassTypeField{Pctf_attribute{"ocaml.text", doc_payload(d)}, l, {}});
+    }
   }
 
   ClassTypeField parse_class_sig_field() {
@@ -4457,6 +4499,7 @@ class Parser {
     ClassTypeField f = parse_class_sig_field_core();
     for (auto& a : last_post_attrs_) f.attrs.push_back(std::move(a));  // `field [@@attr]`
     last_post_attrs_.clear();
+    attach_docs(f.attrs, f.loc.start.cnum, f.loc.end.cnum);  // (** doc *) on the field
     return f;
   }
   ClassTypeField parse_class_sig_field_core() {

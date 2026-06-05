@@ -497,6 +497,7 @@ struct Pstr_open { OverrideFlag ovr; ModuleExpr expr; Attributes attrs; };
 struct Pstr_exception { TypeException exn; };
 struct Pstr_typext { TypeExtension ext; };
 struct Pstr_primitive { PrimitiveDescription prim; };
+struct Pstr_val { ValueDescription vd; };  // `val x : t` in a structure (fork feature)
 struct Pstr_module { ModuleBinding binding; };
 struct Pstr_recmodule { std::vector<ModuleBinding> bindings; };  // module rec A = … and B = …
 struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
@@ -509,7 +510,7 @@ struct StructureItem {
   std::variant<Pstr_eval, Pstr_value, Pstr_type, Pstr_open, Pstr_exception,
                Pstr_typext, Pstr_primitive, Pstr_module, Pstr_attribute,
                Pstr_extension, Pstr_include, Pstr_modtype, Pstr_class,
-               Pstr_class_type, Pstr_recmodule>
+               Pstr_class_type, Pstr_recmodule, Pstr_val>
       desc;
   Location loc;
 };
