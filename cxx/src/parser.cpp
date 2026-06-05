@@ -3720,19 +3720,8 @@ class Parser {
       attach_docs(mtattrs, l.start.cnum, l.end.cnum);
       return wrap_sig_ext(SignatureItem{Psig_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty), std::move(mtattrs)}, l}, std::move(mt_ext));
     }
-    if (t.kind == Kind::MODULE && peek(1).kind == Kind::REC) {  // module rec M : mt and N : mt
-      advance(); advance();  // module rec
-      std::vector<ModuleDeclaration> decls;
-      for (;;) {
-        StrOptLoc name = parse_module_name();
-        expect(Kind::COLON, ":");
-        ModuleType mt = parse_module_type();
-        decls.push_back(ModuleDeclaration{std::move(name), box(std::move(mt))});
-        if (cur().kind == Kind::AND) { advance(); continue; }
-        break;
-      }
-      return SignatureItem{Psig_recmodule{std::move(decls)}, here()};
-    }
+    // plain `module rec …` is handled by the `module%ext rec` path below
+    // (take_ext yields none), which also captures per-declaration `[@@attr]`.
     if (t.kind == Kind::MODULE) {
       advance();
       std::optional<std::string> mod_ext = take_ext();  // `module%ext …`
