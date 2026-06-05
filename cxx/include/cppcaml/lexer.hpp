@@ -91,4 +91,8 @@ class Lexer {
   void store(std::string_view s) { strbuf_.append(s); }
 };
 
+// True if `s` is an OCaml keyword (matches Lexer.is_keyword); used by the printer
+// to escape type variables named like keywords (`'\#let`).
+bool is_ocaml_keyword(std::string_view s);
+
 }  // namespace cppcaml

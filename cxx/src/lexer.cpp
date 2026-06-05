@@ -302,6 +302,11 @@ const std::vector<std::pair<std::string_view, Kind>>& dedicated_symbols() {
 
 }  // namespace
 
+bool is_ocaml_keyword(std::string_view s) {
+  auto it = keyword_table().find(s);
+  return it != keyword_table().end();
+}
+
 Token Lexer::raw_token() {
   // Skip blanks and escaped newlines (which produce no token), per the
   // `blank+` and `'\\' newline` rules.

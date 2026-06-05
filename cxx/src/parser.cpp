@@ -835,6 +835,11 @@ class Parser {
       Token t = cur();
       advance();
       LongidentLoc cl = lid0(t.kind == Kind::TRUE ? "true" : "false", tokloc(t));
+      if (is_atom_start(cur().kind)) {  // `true arg` -> Pexp_construct(_, Some arg), not Pexp_apply
+        ExprBox arg = parse_atom_postfix();
+        Location l = span(cl.loc.start, arg->loc.end);
+        return collect_app(mk_construct(cl, std::move(arg), l));
+      }
       return collect_app(mk_construct(cl, std::nullopt, cl.loc));
     }
     if (cur().kind == Kind::BACKQUOTE) {  // polymorphic variant  `Tag [arg]
@@ -3319,8 +3324,9 @@ class Parser {
       }
       expect(Kind::MINUSGREATER, "->");
       ModuleType cod = parse_module_type();
+      Position pend = position(tokens_[idx_ - 1].end);  // $endpos: incl. a `)` around the codomain
       for (int i = static_cast<int>(args.size()) - 1; i >= 0; --i) {
-        Location l = span(args[i].first, cod.loc.end);
+        Location l = span(args[i].first, pend);
         cod = ModuleType{Pmty_functor{std::move(args[i].second), box(std::move(cod))}, l, {}};
       }
       return cod;
@@ -3331,7 +3337,7 @@ class Parser {
       Position s = symstart;
       ModuleType cod = parse_module_type();
       FunctorParam param = Functor_named{StrOptLoc{std::nullopt, none_loc()}, box(std::move(mt))};
-      Location l = span(s, cod.loc.end);
+      Location l = span(s, position(tokens_[idx_ - 1].end));  // $endpos: incl. a `)` around codomain
       return ModuleType{Pmty_functor{std::move(param), box(std::move(cod))}, l, {}};
     }
     return mt;

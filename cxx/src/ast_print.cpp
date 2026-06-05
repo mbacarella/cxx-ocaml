@@ -5,9 +5,19 @@
 #include <string_view>
 
 #include "cppcaml/ast.hpp"
+#include "cppcaml/lexer.hpp"
 
 namespace cppcaml::ast {
 namespace {
+
+// Pprintast.tyvar_of_name: render a type-variable name, escaping a keyword as
+// `'\#kw` and a name beginning with `'` with a leading space.
+std::string tyvar_of_name(const std::string& s) {
+  if (s.size() >= 2 && s[1] == '\'') return "' " + s;
+  if (cppcaml::is_ocaml_keyword(s)) return "'\\#" + s;
+  if (s == "_") return s;
+  return "'" + s;
+}
 
 // OCaml %S: quote + escape like String.escaped (also escapes '"').
 std::string ocaml_escape(std::string_view s) {
@@ -132,7 +142,7 @@ struct Printer {
       core_type(j, *v->type);
     } else if (auto* v = std::get_if<Ptyp_poly>(&t.desc)) {
       std::string s = "Ptyp_poly";
-      for (auto& var : v->vars) s += " '" + var;  // typevars: ` 'a 'b`
+      for (auto& var : v->vars) s += " " + tyvar_of_name(var);  // typevars: ` 'a 'b` (Pprintast.tyvar)
       line(j, s);
       core_type(j, *v->type);
     } else if (auto* v = std::get_if<Ptyp_extension>(&t.desc)) {
