@@ -3550,15 +3550,18 @@ class Parser {
     }
     if (t.kind == Kind::INCLUDE) {
       advance();
+      std::optional<std::string> ext = take_ext();  // `include%ext …`
+      Attributes iattrs = take_attrs();  // `include%ext[@attr] …` -> pincl_attributes (prefix)
       ModuleType mt = parse_module_type();
-      Attributes iattrs;  // pincl_attributes: `include S [@@attr]`
       while (cur().kind == Kind::LBRACKETATAT) { advance(); iattrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(iattrs, l.start.cnum, l.end.cnum);
-      return SignatureItem{Psig_include{std::move(mt), std::move(iattrs)}, l};
+      return wrap_sig_ext(SignatureItem{Psig_include{std::move(mt), std::move(iattrs)}, l}, std::move(ext));
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // module type
+      std::optional<std::string> mt_ext = take_ext();  // `module type%ext …`
+      Attributes mtattrs = take_attrs();  // `module type%ext[@attr] …` -> pmtd_attributes (prefix)
       Token nm = cur();
       if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
         throw ParseError("expected module type name", nm.start);
@@ -3566,15 +3569,14 @@ class Parser {
       if (cur().kind == Kind::COLONEQUAL) {  // module type S := mty
         advance();
         ModuleType mt = parse_module_type();
-        return SignatureItem{Psig_modtypesubst{StringLoc{nm.text, tokloc(nm)}, std::move(mt)}, here()};
+        return wrap_sig_ext(SignatureItem{Psig_modtypesubst{StringLoc{nm.text, tokloc(nm)}, std::move(mt)}, here()}, std::move(mt_ext));
       }
       std::optional<ModuleType> mty;
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
-      Attributes mtattrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); mtattrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(mtattrs, l.start.cnum, l.end.cnum);
-      return SignatureItem{Psig_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty), std::move(mtattrs)}, l};
+      return wrap_sig_ext(SignatureItem{Psig_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty), std::move(mtattrs)}, l}, std::move(mt_ext));
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::REC) {  // module rec M : mt and N : mt
       advance(); advance();  // module rec
@@ -3593,6 +3595,23 @@ class Parser {
       advance();
       std::optional<std::string> mod_ext = take_ext();  // `module%ext …`
       Attributes prefixattrs = take_attrs();  // `module%ext[@attr] …` -> pmd_attributes (prefix)
+      if (cur().kind == Kind::REC) {  // `module%ext[@attr] rec M : S and …`
+        advance();
+        std::vector<ModuleDeclaration> decls;
+        bool first = true;
+        for (;;) {
+          Attributes dattrs = first ? std::move(prefixattrs) : take_attrs();
+          first = false;
+          StrOptLoc nm = parse_module_name();
+          expect(Kind::COLON, ":");
+          ModuleType mt = parse_module_type();
+          while (cur().kind == Kind::LBRACKETATAT) { advance(); dattrs.push_back(parse_attribute_body()); }
+          decls.push_back(ModuleDeclaration{std::move(nm), box(std::move(mt)), std::move(dattrs)});
+          if (cur().kind == Kind::AND) { advance(); continue; }
+          break;
+        }
+        return wrap_sig_ext(SignatureItem{Psig_recmodule{std::move(decls)}, here()}, std::move(mod_ext));
+      }
       StrOptLoc name = parse_module_name();
       if (cur().kind == Kind::COLONEQUAL) {  // module M := X.Y  (module subst)
         advance();
