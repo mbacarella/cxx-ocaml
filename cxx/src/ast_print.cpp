@@ -684,6 +684,7 @@ struct Printer {
       else os << ind(j) << "#abstract";  // printast: no trailing newline
     } else if (auto* v = std::get_if<Psig_open>(&s.desc)) {
       line(j, "Psig_open " + std::string(override_flag(v->ovr)) + " " + lid_loc(v->id));
+      attributes(j, v->attrs);  // popen_attributes
     } else if (auto* v = std::get_if<Psig_include>(&s.desc)) {
       line(j, "Psig_include");
       attributes(j, v->attrs);  // pincl_attributes

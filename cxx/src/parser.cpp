@@ -3543,10 +3543,15 @@ class Parser {
     }
     if (t.kind == Kind::OPEN) {
       advance();
+      std::optional<std::string> ext = take_ext();  // `open%ext …`
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
+      Attributes oattrs = take_attrs();  // `open%ext[@attr] …` -> popen_attributes (prefix)
       LongidentLoc id = parse_type_path();  // may contain functor application Set.Make(B)
-      return SignatureItem{Psig_open{ovr, std::move(id)}, here()};
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); oattrs.push_back(parse_attribute_body()); }
+      Location l = here();
+      attach_docs(oattrs, l.start.cnum, l.end.cnum);
+      return wrap_sig_ext(SignatureItem{Psig_open{ovr, std::move(id), std::move(oattrs)}, l}, std::move(ext));
     }
     if (t.kind == Kind::INCLUDE) {
       advance();
@@ -3647,24 +3652,32 @@ class Parser {
     if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
       Position kw = position(t.start);
       advance(); advance();
+      std::optional<std::string> ext = take_ext();  // `class type%ext …`
+      Attributes prefix = take_attrs();
       std::vector<ClassTypeDeclaration> decls;
       decls.push_back(parse_one_class_type_decl(kw));
+      decls[0].attrs.insert(decls[0].attrs.begin(), std::make_move_iterator(prefix.begin()),
+                            std::make_move_iterator(prefix.end()));
       while (cur().kind == Kind::AND) {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_type_decl(akw));
       }
-      return SignatureItem{Psig_class_type{std::move(decls)}, here()};
+      return wrap_sig_ext(SignatureItem{Psig_class_type{std::move(decls)}, here()}, std::move(ext));
     }
     if (t.kind == Kind::CLASS) {  // class c : ct [and …]  (class_description)
       Position kw = position(t.start);
       advance();
+      std::optional<std::string> ext = take_ext();  // `class%ext …`
+      Attributes prefix = take_attrs();
       std::vector<ClassTypeDeclaration> decls;
       decls.push_back(parse_one_class_description(kw));
+      decls[0].attrs.insert(decls[0].attrs.begin(), std::make_move_iterator(prefix.begin()),
+                            std::make_move_iterator(prefix.end()));
       while (cur().kind == Kind::AND) {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_description(akw));
       }
-      return SignatureItem{Psig_class{std::move(decls)}, here()};
+      return wrap_sig_ext(SignatureItem{Psig_class{std::move(decls)}, here()}, std::move(ext));
     }
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ …]
       advance();
