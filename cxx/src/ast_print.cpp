@@ -164,6 +164,7 @@ struct Printer {
         for (auto& row : v->rows) {
           if (auto* rt = std::get_if<Rtag>(&row)) {
             line(j + 1, "Rtag \"" + rt->name + "\" " + (rt->constant ? "true" : "false"));
+            attributes(j + 2, rt->attrs);  // prf_attributes (printast: attributes (i+1))
             if (rt->types.empty()) line(j + 2, "[]");
             else { line(j + 2, "["); for (auto& c : rt->types) core_type(j + 3, *c); line(j + 2, "]"); }
           } else {
@@ -192,6 +193,7 @@ struct Printer {
       for (auto& f : v->fields) {
         if (auto* ot = std::get_if<Otag>(&f)) {
           line(j + 1, "method " + ot->name.txt);
+          attributes(j + 1, ot->attrs);  // pof_attributes (printast: attributes i)
           core_type(j + 2, *ot->type);
         } else {
           line(j + 1, "Oinherit");

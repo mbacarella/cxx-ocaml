@@ -1566,6 +1566,7 @@ class Parser {
       if (must_arrow) alabel = opt ? ArgLabel{Optional{*firstLabel}} : ArgLabel{Labelled{*firstLabel}};
       else if (firstLabel) { alabel = Labelled{*firstLabel}; labels[0] = std::nullopt; }
       CoreTypeBox dom = build_dom();
+      append_info_doc(dom->attrs, dom->loc.end.cnum);  // extra_rhs: `lab:t (** info *) -> …`
       expect(Kind::MINUSGREATER, "->");
       CoreTypeBox cod = parse_type_arrow();
       Location l = span(symstart, position(tokens_[idx_ - 1].end));
@@ -1751,7 +1752,18 @@ class Parser {
         if (nm.kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
           advance(); advance();  // name :
           CoreTypeBox ty = parse_possibly_poly_type();
-          fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty)});
+          size_t endType = tokens_[idx_ - 1].end;  // rhs_info $endpos($4): doc before the SEMI
+          Attributes attrs;
+          if (cur().kind == Kind::SEMI) {
+            // field_semi: prefer a doc before the `;`, else one after it (symbol_info $endpos)
+            if (!append_info_doc(attrs, endType)) { advance(); append_info_doc(attrs, tokens_[idx_ - 1].end); }
+            else advance();
+            fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(attrs)});
+            continue;
+          }
+          append_info_doc(attrs, endType);  // field (last, no semi): symbol_info $endpos
+          fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(attrs)});
+          break;
         } else {  // Oinherit: an inherited object type
           fields.push_back(Oinherit{parse_core_type()});
         }
@@ -1778,7 +1790,9 @@ class Parser {
         while (cur().kind == Kind::AMPERSAND) { advance(); types.push_back(parse_core_type()); }
       }
       bool constant = types.empty() || amp;
-      return Rtag{tag.text, constant, std::move(types)};
+      Attributes attrs;
+      append_info_doc(attrs, tokens_[idx_ - 1].end);  // `\`Tag … (** info *)`
+      return Rtag{tag.text, constant, std::move(types), std::move(attrs)};
     }
     return Rinherit{parse_core_type()};
   }
