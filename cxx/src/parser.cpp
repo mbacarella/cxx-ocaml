@@ -189,6 +189,8 @@ class Parser {
   bool last_type_subst_ = false;  // most recent type decl used `:=` (substitution)
   std::optional<std::string> let_ext_;  // `let%ext …` extension name on the last let
   bool letext_pun_ = false;  // inside a `let%ext` binding list, `let%ext x` puns to `x = x`
+  bool suppress_pat_cons_attr_ = false;  // one-shot: the next cons-pattern's trailing `[@attr]`
+                                         // belongs to an enclosing `exception P` (prec_constr_appl)
   bool suppress_type_trailing_attr_ = false;  // record-field type: `[@attr]` is the field's
 
   const Token& cur() const { return tokens_[idx_]; }
@@ -1901,10 +1903,14 @@ class Parser {
     if (cur().kind == Kind::EXCEPTION) {
       Token e = cur(); advance();
       std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // exception%ext[@attr]
+      bool save = suppress_pat_cons_attr_;
+      suppress_pat_cons_attr_ = true;  // a trailing `[@a]` binds to `exception P`, not P
       Pattern inner = parse_pat_tuple();
+      suppress_pat_cons_attr_ = save;
       Position ie = inner.loc.end;
-      return wrap_pat_ext(Pattern{Ppat_exception{box(std::move(inner))}, span(position(e.start), ie)},
-                          std::move(ext), std::move(attrs));
+      Pattern exc{Ppat_exception{box(std::move(inner))}, span(position(e.start), ie)};
+      while (cur().kind == Kind::LBRACKETAT) { advance(); exc.attrs.push_back(parse_attribute_body()); }
+      return wrap_pat_ext(std::move(exc), std::move(ext), std::move(attrs));
     }
     return parse_pat_tuple();
   }
@@ -1995,6 +2001,7 @@ class Parser {
     // A trailing `[@attr]` binds to the whole (lowest-precedence) cons pattern,
     // not to its rightmost operand: `a::b [@x]` is `(a::b)[@x]`.
     Pattern p = parse_pat_cons_core();
+    if (suppress_pat_cons_attr_) { suppress_pat_cons_attr_ = false; return p; }  // exception P [@a]
     while (cur().kind == Kind::LBRACKETAT) {  // p [@attr]  -> ppat_attributes
       advance();
       p.attrs.push_back(parse_attribute_body());
