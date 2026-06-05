@@ -1550,7 +1550,8 @@ class Parser {
     if (t.kind == Kind::QUOTE) {
       advance();
       Token nm = cur();
-      if (nm.kind != Kind::LIDENT) throw ParseError("expected type variable", nm.start);
+      if (nm.kind != Kind::LIDENT && nm.kind != Kind::UIDENT)  // `'a` or `'A_name`
+        throw ParseError("expected type variable", nm.start);
       advance();
       return box(CoreType{Ptyp_var{nm.text}, span(position(t.start), position(nm.end))});
     }
