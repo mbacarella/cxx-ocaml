@@ -2986,6 +2986,8 @@ class Parser {
     }
     if (t.kind == Kind::EXTERNAL) {
       advance();
+      std::optional<std::string> ext_ext = take_ext();  // `external%ext …`
+      Attributes pattrs = take_attrs();  // `external%ext[@attr] …` (item attrs, prefix)
       StringLoc ename = parse_value_name();  // LIDENT or ( op )
       CoreTypeBox ty;  // optional: absent in `external f = g`
       if (cur().kind == Kind::COLON) { advance(); ty = parse_poly_type(/*ghost=*/false); }
@@ -2997,13 +2999,18 @@ class Parser {
       else
         alias = parse_prim_alias();  // `external f [: t] = path`  (Pprim_alias)
       if (prims.empty() && !alias) throw ParseError("expected primitive string", cur().start);
-      Attributes pattrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); pattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(pattrs, l.start.cnum, l.end.cnum);
       PrimitiveDescription pd{std::move(ename), std::move(ty), std::move(prims), l,
                               std::move(pattrs), std::move(alias)};
-      return StructureItem{Pstr_primitive{std::move(pd)}, l};
+      StructureItem item{Pstr_primitive{std::move(pd)}, l};
+      if (ext_ext) {  // `external%ext …` wraps the (ghost) Pstr_primitive in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*ext_ext), std::move(ep)}, l};
+      }
+      return item;
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // module type
@@ -3067,28 +3074,48 @@ class Parser {
     if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
       Position kw = position(t.start);
       advance(); advance();  // class type
+      std::optional<std::string> ct_ext = take_ext();  // `class type%ext …`
+      Attributes prefixattrs = take_attrs();  // `class type%ext[@attr] …`
       std::vector<ClassTypeDeclaration> decls;
       decls.push_back(parse_one_class_type_decl(kw));
+      decls[0].attrs.insert(decls[0].attrs.begin(), std::make_move_iterator(prefixattrs.begin()),
+                            std::make_move_iterator(prefixattrs.end()));
       while (cur().kind == Kind::AND) {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_type_decl(akw));
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
-      return StructureItem{Pstr_class_type{std::move(decls)}, l};
+      StructureItem item{Pstr_class_type{std::move(decls)}, l};
+      if (ct_ext) {  // `class type%ext …` wraps the (ghost) Pstr_class_type in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*ct_ext), std::move(ep)}, l};
+      }
+      return item;
     }
     if (t.kind == Kind::CLASS) {
       Position kw = position(t.start);
       advance();
+      std::optional<std::string> class_ext = take_ext();  // `class%ext …`
+      Attributes prefixattrs = take_attrs();  // `class%ext[@attr] …` -> on the first decl
       std::vector<ClassDeclaration> decls;
       decls.push_back(parse_one_class_decl(kw));
+      decls[0].attrs.insert(decls[0].attrs.begin(), std::make_move_iterator(prefixattrs.begin()),
+                            std::make_move_iterator(prefixattrs.end()));
       while (cur().kind == Kind::AND) {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_decl(akw));
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
-      return StructureItem{Pstr_class{std::move(decls)}, l};
+      StructureItem item{Pstr_class{std::move(decls)}, l};
+      if (class_ext) {  // `class%ext …` wraps the (ghost) Pstr_class in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*class_ext), std::move(ep)}, l};
+      }
+      return item;
     }
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ name payload ]  (floating attribute)
       advance();
