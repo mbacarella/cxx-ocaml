@@ -1100,6 +1100,7 @@ struct Printer {
     int j = i + 1;
     if (auto* v = std::get_if<Pstr_eval>(&s.desc)) {
       line(j, "Pstr_eval");
+      attributes(j, v->attrs);  // printast prints Pstr_eval attributes before the expression
       expression(j, *v->e);
     } else if (auto* v = std::get_if<Pstr_value>(&s.desc)) {
       line(j, std::string("Pstr_value ") + rec_flag(v->rf));

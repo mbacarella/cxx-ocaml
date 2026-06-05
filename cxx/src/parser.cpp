@@ -874,7 +874,7 @@ class Parser {
     // and is a full expression — delegate to parse_expr_no_seq.
     switch (t.kind) {
       case Kind::MATCH: case Kind::FUNCTION: case Kind::FUN:
-      case Kind::TRY: case Kind::IF: case Kind::LET:
+      case Kind::TRY: case Kind::IF: case Kind::LET: case Kind::LETOP:
         return parse_expr_no_seq();
       default: break;
     }
@@ -3343,7 +3343,10 @@ class Parser {
     }
     ExprBox e = parse_expr();
     Location l = e->loc;
-    return StructureItem{Pstr_eval{std::move(e)}, l};
+    Attributes attrs;  // `e [@@attr]` -> Pstr_eval attributes (do not extend the item loc)
+    while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+    attach_docs(attrs, l.start.cnum, l.end.cnum);
+    return StructureItem{Pstr_eval{std::move(e), std::move(attrs)}, l};
   }
 
   std::string parse_attr_name() {

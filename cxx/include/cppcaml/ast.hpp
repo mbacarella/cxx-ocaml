@@ -490,7 +490,7 @@ struct ClassTypeDeclaration {
 };
 
 // --- structure items ---
-struct Pstr_eval { ExprBox e; };       // attributes empty
+struct Pstr_eval { ExprBox e; Attributes attrs; };  // `e [@@attr]` -> Pstr_eval attributes
 struct Pstr_value { RecFlag rf; std::vector<ValueBinding> bindings; };
 struct Pstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Pstr_open { OverrideFlag ovr; ModuleExpr expr; Attributes attrs; };
