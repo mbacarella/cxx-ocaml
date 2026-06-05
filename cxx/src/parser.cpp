@@ -3425,6 +3425,15 @@ class Parser {
     emit_text_sig(items, docs_.post_extra, endKey);
     return items;
   }
+  // `KEYWORD%ext …` signature item -> Psig_extension(ext, PSig [ghost item]).
+  SignatureItem wrap_sig_ext(SignatureItem item, std::optional<std::string> ext) {
+    if (!ext) return item;
+    Location outer{item.loc.start, item.loc.end, false};
+    item.loc.ghost = true;
+    ExtPayload ep; ep.is_sig = true; ep.sig = box(Signature{});
+    ep.sig->push_back(std::move(item));
+    return SignatureItem{Psig_extension{std::move(*ext), std::move(ep)}, outer};
+  }
   SignatureItem parse_signature_item() {
     Token t = cur();
     auto here = [&] { return span(position(t.start), position(tokens_[idx_ - 1].end)); };
@@ -3435,6 +3444,8 @@ class Parser {
     }
     if (t.kind == Kind::VAL) {
       advance();
+      std::optional<std::string> ext = take_ext();  // `val%ext …`
+      Attributes attrs = take_attrs();  // `val%ext[@attr] …` -> val_attributes (prefix)
       Token nm = cur();
       if (nm.kind != Kind::LIDENT && nm.kind != Kind::LPAREN)
         throw ParseError("expected value name", nm.start);
@@ -3445,14 +3456,14 @@ class Parser {
       } else { advance(); vname = StringLoc{nm.text, tokloc(nm)}; }
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_poly_type(false);
-      Attributes attrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(attrs, l.start.cnum, l.end.cnum);
-      return SignatureItem{Psig_value{ValueDescription{std::move(vname), std::move(ty), l, std::move(attrs)}}, l};
+      return wrap_sig_ext(SignatureItem{Psig_value{ValueDescription{std::move(vname), std::move(ty), l, std::move(attrs)}}, l}, std::move(ext));
     }
     if (t.kind == Kind::EXTERNAL) {
       advance();
+      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // external%ext[@attr]
       StringLoc ename = parse_value_name();  // LIDENT or ( op )
       CoreTypeBox ty;  // optional: absent in `external f = g`
       if (cur().kind == Kind::COLON) { advance(); ty = parse_poly_type(/*ghost=*/false); }
@@ -3464,15 +3475,16 @@ class Parser {
       else
         alias = parse_prim_alias();
       if (prims.empty() && !alias) throw ParseError("expected primitive string", cur().start);
-      Attributes attrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(attrs, l.start.cnum, l.end.cnum);
-      return SignatureItem{Psig_primitive{PrimitiveDescription{
-          std::move(ename), std::move(ty), std::move(prims), l, std::move(attrs), std::move(alias)}}, l};
+      return wrap_sig_ext(SignatureItem{Psig_primitive{PrimitiveDescription{
+          std::move(ename), std::move(ty), std::move(prims), l, std::move(attrs), std::move(alias)}}, l}, std::move(ext));
     }
     if (t.kind == Kind::TYPE) {
       advance();
+      std::optional<std::string> type_ext = take_ext();  // `type%ext …`
+      Attributes typeprefix = take_attrs();  // `type%ext[@attr] …` -> on the first decl
       RecFlag rf = RecFlag::Recursive;
       if (cur().kind == Kind::NONREC) { advance(); rf = RecFlag::Nonrecursive; }
       Position d0 = position(t.start);
@@ -3500,15 +3512,21 @@ class Parser {
       idx_ = save;
       std::vector<TypeDeclaration> decls;
       decls.push_back(parse_type_declaration(d0));
+      decls[0].attrs.insert(decls[0].attrs.begin(), std::make_move_iterator(typeprefix.begin()),
+                            std::make_move_iterator(typeprefix.end()));
       bool subst = last_type_subst_;  // `type t := …` (destructive substitution)
       while (cur().kind == Kind::AND) {
         Position ds = position(cur().start); advance();
-        decls.push_back(parse_type_declaration(ds));
+        Attributes andattrs = take_attrs();  // `and[@attr] …`
+        TypeDeclaration d = parse_type_declaration(ds);
+        d.attrs.insert(d.attrs.begin(), std::make_move_iterator(andattrs.begin()),
+                       std::make_move_iterator(andattrs.end()));
+        decls.push_back(std::move(d));
       }
       attach_docs(decls[0].attrs, d0.cnum, decls[0].loc.end.cnum);
       Location tl = span(d0, position(tokens_[idx_ - 1].end));
-      if (subst) return SignatureItem{Psig_typesubst{std::move(decls)}, tl};
-      return SignatureItem{Psig_type{rf, std::move(decls)}, tl};
+      if (subst) return wrap_sig_ext(SignatureItem{Psig_typesubst{std::move(decls)}, tl}, std::move(type_ext));
+      return wrap_sig_ext(SignatureItem{Psig_type{rf, std::move(decls)}, tl}, std::move(type_ext));
     }
     if (t.kind == Kind::EXCEPTION) {
       advance();
