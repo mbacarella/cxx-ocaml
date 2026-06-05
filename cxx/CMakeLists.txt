@@ -19,7 +19,9 @@ add_library(cppcaml_core
   src/parser.cpp
   src/ast_print.cpp
   src/marshal.cpp
-  src/cmi.cpp)
+  src/cmi.cpp
+  src/typer.cpp
+  src/typedtree_print.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 
 # Stage tools.
@@ -31,3 +33,6 @@ target_link_libraries(c++parse PRIVATE cppcaml_core)
 
 add_executable(c++cmi src/tools/cppcmi_main.cpp)
 target_link_libraries(c++cmi PRIVATE cppcaml_core)
+
+add_executable(c++type src/tools/cpptype_main.cpp)
+target_link_libraries(c++type PRIVATE cppcaml_core)
