@@ -595,6 +595,7 @@ struct Printer {
   void type_kind(int i, const TypeKind& k) {
     if (std::holds_alternative<Ptype_abstract>(k)) line(i, "Ptype_abstract");
     else if (std::holds_alternative<Ptype_open>(k)) line(i, "Ptype_open");
+    else if (auto* v = std::get_if<Ptype_external>(&k)) line(i, "Ptype_external \"" + v->s + "\"");
     else if (auto* v = std::get_if<Ptype_variant>(&k)) {
       line(i, "Ptype_variant");
       if (v->ctors.empty()) line(i + 1, "[]");

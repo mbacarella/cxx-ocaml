@@ -2453,6 +2453,12 @@ class Parser {
     if (cur().kind == Kind::EQUAL || cur().kind == Kind::COLONEQUAL) {
       advance();
       if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
+      if (cur().kind == Kind::EXTERNAL) {  // `type t = external "s"` (fork extension)
+        advance();
+        Token s = cur(); expect(Kind::STRING, "primitive string");
+        kind = Ptype_external{s.text};
+        // fall through to constraints/attrs handling below (skip kind/manifest)
+      } else {
       // A `kind` (record/variant/open) starts with `{`, `..`, `|`, or an unqualified
       // constructor (UIDENT not followed by `.`); otherwise it's a manifest type,
       // optionally followed by `= [private] kind` (variant/record redefinition).
@@ -2475,6 +2481,7 @@ class Parser {
           if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
           kind = parse_type_kind_body();
         }
+      }
       }
     }
     std::vector<TypeConstraint> constraints;  // constraint t1 = t2 …

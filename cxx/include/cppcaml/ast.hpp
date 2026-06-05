@@ -289,7 +289,8 @@ struct Ptype_abstract {};
 struct Ptype_variant { std::vector<ConstructorDecl> ctors; };
 struct Ptype_record { std::vector<LabelDecl> fields; };
 struct Ptype_open {};
-using TypeKind = std::variant<Ptype_abstract, Ptype_variant, Ptype_record, Ptype_open>;
+struct Ptype_external { std::string s; };  // `type t = external "foo"` (fork extension)
+using TypeKind = std::variant<Ptype_abstract, Ptype_variant, Ptype_record, Ptype_open, Ptype_external>;
 struct TypeConstraint { CoreTypeBox t1; CoreTypeBox t2; Location loc; };  // constraint t1 = t2
 struct TypeDeclaration {
   StringLoc name;
