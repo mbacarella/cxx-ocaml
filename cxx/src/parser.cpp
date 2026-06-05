@@ -3530,12 +3530,16 @@ class Parser {
     }
     if (t.kind == Kind::EXCEPTION) {
       advance();
+      std::optional<std::string> ext = take_ext();  // `exception%ext …`
+      Attributes prefixattrs = take_attrs();  // `exception%ext[@attr] X` -> on the constructor
       ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
+      ctor.attrs.insert(ctor.attrs.begin(), std::make_move_iterator(prefixattrs.begin()),
+                        std::make_move_iterator(prefixattrs.end()));
       Attributes exnattrs;  // ptyexn_attributes: `exception E [@@attr]`
       while (cur().kind == Kind::LBRACKETATAT) { advance(); exnattrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(ctor.attrs, l.start.cnum, l.end.cnum);
-      return SignatureItem{Psig_exception{TypeException{std::move(ctor), std::move(exnattrs)}}, l};
+      return wrap_sig_ext(SignatureItem{Psig_exception{TypeException{std::move(ctor), std::move(exnattrs)}}, l}, std::move(ext));
     }
     if (t.kind == Kind::OPEN) {
       advance();
@@ -3587,17 +3591,20 @@ class Parser {
     }
     if (t.kind == Kind::MODULE) {
       advance();
+      std::optional<std::string> mod_ext = take_ext();  // `module%ext …`
+      Attributes prefixattrs = take_attrs();  // `module%ext[@attr] …` -> pmd_attributes (prefix)
       StrOptLoc name = parse_module_name();
       if (cur().kind == Kind::COLONEQUAL) {  // module M := X.Y  (module subst)
         advance();
         LongidentLoc id = parse_type_path();
-        return SignatureItem{Psig_modsubst{std::move(name), std::move(id)}, here()};
+        return wrap_sig_ext(SignatureItem{Psig_modsubst{std::move(name), std::move(id)}, here()}, std::move(mod_ext));
       }
       if (cur().kind == Kind::EQUAL) {  // module B = A.C  (module alias)
         advance();
         LongidentLoc id = parse_longident_path();
         ModuleType mt{Pmty_alias{id}, id.loc, {}};
-        return SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt))}}, here()};
+        return wrap_sig_ext(SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt)),
+                            std::move(prefixattrs)}}, here()}, std::move(mod_ext));
       }
       // module M (X:S) … : mty   (functor module declaration)
       std::vector<std::pair<Position, FunctorParam>> fparams;
@@ -3611,12 +3618,12 @@ class Parser {
         Location fl = span(fparams[i].first, mt.loc.end);
         mt = ModuleType{Pmty_functor{std::move(fparams[i].second), box(std::move(mt))}, fl, {}};
       }
-      Attributes mdattrs;  // pmd_attributes: `module M : S [@@attr]`
+      Attributes mdattrs = std::move(prefixattrs);  // pmd_attributes: prefix `[@attr]`, then `[@@attr]`
       while (cur().kind == Kind::LBRACKETATAT) { advance(); mdattrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(mdattrs, l.start.cnum, l.end.cnum);
-      return SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt)),
-                                                         std::move(mdattrs)}}, l};
+      return wrap_sig_ext(SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt)),
+                                                         std::move(mdattrs)}}, l}, std::move(mod_ext));
     }
     if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
       Position kw = position(t.start);
