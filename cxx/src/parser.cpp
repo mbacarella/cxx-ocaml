@@ -3345,7 +3345,6 @@ class Parser {
     Location l = e->loc;
     Attributes attrs;  // `e [@@attr]` -> Pstr_eval attributes (do not extend the item loc)
     while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
-    attach_docs(attrs, l.start.cnum, l.end.cnum);
     return StructureItem{Pstr_eval{std::move(e), std::move(attrs)}, l};
   }
 
