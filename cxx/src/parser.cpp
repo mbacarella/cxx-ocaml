@@ -4134,6 +4134,12 @@ class Parser {
 
   ClassExpr parse_class_simple_expr() {
     Token t = cur();
+    if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pcl_extension
+      advance();
+      auto [name, payload] = parse_ext_body();
+      return ClassExpr{Pcl_extension{std::move(name), std::move(payload)},
+                       span(position(t.start), position(tokens_[idx_ - 1].end)), {}};
+    }
     if (t.kind == Kind::OBJECT) {
       advance();
       Attributes oattrs;  // `object[@attr] …` -> attrs on the Pcl_structure
@@ -4180,6 +4186,12 @@ class Parser {
   }
   ClassType parse_class_type_core() {
     Token t = cur();
+    if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pcty_extension
+      advance();
+      auto [name, payload] = parse_ext_body();
+      return ClassType{Pcty_extension{std::move(name), std::move(payload)},
+                       span(position(t.start), position(tokens_[idx_ - 1].end)), {}};
+    }
     if (t.kind == Kind::LABEL || t.kind == Kind::OPTLABEL) {  // labelled arrow domain
       ArgLabel label = t.kind == Kind::LABEL ? ArgLabel{Labelled{t.text}} : ArgLabel{Optional{t.text}};
       advance();

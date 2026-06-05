@@ -814,6 +814,9 @@ struct Printer {
     } else if (auto* v = std::get_if<Pcty_open>(&x.desc)) {
       line(j, std::string("Pcty_open ") + override_flag(v->ovr) + " " + lid_loc(v->id));
       class_type(j, *v->body);
+    } else if (auto* v = std::get_if<Pcty_extension>(&x.desc)) {
+      line(j, "Pcty_extension \"" + v->name + "\"");
+      ext_payload(j, v->payload);
     } else {
       auto& a = std::get<Pcty_arrow>(x.desc);
       line(j, "Pcty_arrow");
@@ -930,6 +933,9 @@ struct Printer {
     } else if (auto* v = std::get_if<Pcl_open>(&x.desc)) {
       line(j, std::string("Pcl_open ") + override_flag(v->ovr) + " " + lid_loc(v->id));
       class_expr(j, *v->body);
+    } else if (auto* v = std::get_if<Pcl_extension>(&x.desc)) {
+      line(j, "Pcl_extension \"" + v->name + "\"");
+      ext_payload(j, v->payload);
     } else {
       auto& vk = std::get<Pcl_constraint>(x.desc);
       line(j, "Pcl_constraint");

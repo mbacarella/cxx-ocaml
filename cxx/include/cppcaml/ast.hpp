@@ -424,8 +424,9 @@ struct Pcty_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
 struct Pcty_signature { ClassSignature cs; };
 struct Pcty_arrow { ArgLabel label; CoreTypeBox dom; ClassTypeBox cod; };
 struct Pcty_open { OverrideFlag ovr; LongidentLoc id; ClassTypeBox body; };  // let open M in ct
+struct Pcty_extension { std::string name; ExtPayload payload; };  // [%id]
 struct ClassType {
-  std::variant<Pcty_constr, Pcty_signature, Pcty_arrow, Pcty_open> desc;
+  std::variant<Pcty_constr, Pcty_signature, Pcty_arrow, Pcty_open, Pcty_extension> desc;
   Location loc;
   Attributes attrs;
 };
@@ -452,9 +453,10 @@ struct Pcl_apply { ClassExprBox ce; std::vector<std::pair<ArgLabel, ExprBox>> ar
 struct Pcl_let { RecFlag rf; std::vector<ValueBinding> bindings; ClassExprBox body; };
 struct Pcl_constraint { ClassExprBox ce; ClassTypeBox ct; };
 struct Pcl_open { OverrideFlag ovr; LongidentLoc id; ClassExprBox body; };  // let open M in ce
+struct Pcl_extension { std::string name; ExtPayload payload; };  // [%id]
 struct ClassExpr {
   std::variant<Pcl_constr, Pcl_structure, Pcl_fun, Pcl_apply, Pcl_let, Pcl_constraint,
-               Pcl_open> desc;
+               Pcl_open, Pcl_extension> desc;
   Location loc;
   Attributes attrs;
 };
