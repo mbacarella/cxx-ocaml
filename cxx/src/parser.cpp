@@ -1632,7 +1632,10 @@ class Parser {
       clear_none(labels);
       return box(CoreType{Ptyp_tuple{std::move(elems), std::move(labels)}, tl});
     }
-    return std::move(elems[0]);  // single type, no arrow (a lone `x:` label is dropped)
+    // a bare `x:` label is only valid before `*` (tuple) or `->` (arrow); a lone
+    // `(x : t)` is a singleton labeled tuple type, which is a syntax error.
+    if (firstLabel) throw ParseError("singleton labeled tuple type", symstart.cnum);
+    return std::move(elems[0]);  // single unlabeled type, no arrow
   }
   CoreTypeBox parse_type_tuple() {
     Position symstart = position(cur().start);
