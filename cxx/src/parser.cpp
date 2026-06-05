@@ -940,6 +940,9 @@ class Parser {
           Location gl{l.start, l.end, true};  // ghost ident spans `a.(i) <- v`
           ExprBox fn = E({Pexp_ident{.id = LongidentLoc{std::move(newlid), gl}}, gl});
           std::vector<std::pair<ArgLabel, ExprBox>> args = std::move(ap->args);
+          // a Genarray multi-index array arg's $sloc is the whole `a.{…} <- v` rule (ghost)
+          if (args.size() >= 2 && std::holds_alternative<Pexp_array>(args[1].second->desc))
+            args[1].second->loc = Location{l.start, l.end, true};
           args.emplace_back(Nolabel{}, std::move(rhs));
           return E({Pexp_apply{std::move(fn), std::move(args)}, l});
         }
@@ -4256,7 +4259,9 @@ class Parser {
     ClassExpr body;
     if (cur().kind == Kind::MINUSGREATER) { advance(); body = parse_class_expr(); }
     else body = parse_class_fun_def();
-    Location l = span(ps, body.loc.end);
+    // $sloc end is the body's last token (incl. a trailing `[@attr]`, which does
+    // not extend the body's own loc but is part of the fun production).
+    Location l = span(ps, position(tokens_[idx_ - 1].end));
     return ClassExpr{Pcl_fun{pv.label, std::move(pv.default_), std::move(pv.pat), box(std::move(body))}, l, {}};
   }
 
