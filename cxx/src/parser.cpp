@@ -3860,21 +3860,26 @@ class Parser {
   ModuleExpr parse_module_expr() {
     Position symstart = position(cur().start);
     ModuleExpr me = parse_module_expr_head();
-    while (cur().kind == Kind::LPAREN) {  // F(X) / F()  functor application
-      advance();
-      if (cur().kind == Kind::RPAREN) {  // F ()  generative application
-        Token c = cur(); advance();
-        me = ModuleExpr{Pmod_apply_unit{box(std::move(me))}, span(symstart, position(c.end))};
-        continue;
+    // Application and attributes interleave: `F [@a] (X)` is `(F [@a])` applied
+    // to `X` — an attributed module_expr can still be a functor.
+    for (;;) {
+      if (cur().kind == Kind::LPAREN) {  // F(X) / F()  functor application
+        advance();
+        if (cur().kind == Kind::RPAREN) {  // F ()  generative application
+          Token c = cur(); advance();
+          me = ModuleExpr{Pmod_apply_unit{box(std::move(me))}, span(symstart, position(c.end))};
+          continue;
+        }
+        ModuleExpr arg = parse_module_expr();
+        Token c = cur(); expect(Kind::RPAREN, ")");
+        me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))},
+                        span(symstart, position(c.end))};
+      } else if (cur().kind == Kind::LBRACKETAT) {  // me [@attr]  -> pmod_attributes
+        advance();
+        me.attrs.push_back(parse_attribute_body());
+      } else {
+        break;
       }
-      ModuleExpr arg = parse_module_expr();
-      Token c = cur(); expect(Kind::RPAREN, ")");
-      me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))},
-                      span(symstart, position(c.end))};
-    }
-    while (cur().kind == Kind::LBRACKETAT) {  // me [@attr]  -> pmod_attributes
-      advance();
-      me.attrs.push_back(parse_attribute_body());
     }
     return me;
   }
