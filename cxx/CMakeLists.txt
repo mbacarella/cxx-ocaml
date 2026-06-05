@@ -17,7 +17,9 @@ add_library(cppcaml_core
   src/token.cpp
   src/lexer.cpp
   src/parser.cpp
-  src/ast_print.cpp)
+  src/ast_print.cpp
+  src/marshal.cpp
+  src/cmi.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 
 # Stage tools.
@@ -26,3 +28,6 @@ target_link_libraries(c++lex PRIVATE cppcaml_core)
 
 add_executable(c++parse src/tools/cppparse_main.cpp)
 target_link_libraries(c++parse PRIVATE cppcaml_core)
+
+add_executable(c++cmi src/tools/cppcmi_main.cpp)
+target_link_libraries(c++cmi PRIVATE cppcaml_core)

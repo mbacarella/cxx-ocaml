@@ -1,0 +1,623 @@
+#include "cppcaml/cmi.hpp"
+
+#include <fstream>
+#include <iterator>
+
+namespace cppcaml::cmi {
+
+namespace {
+
+namespace m = marshal;
+
+// Walks a decoded Marshal arena and reconstructs Types structures on demand.
+class Decoder {
+public:
+  explicit Decoder(const m::Arena& arena) : arena_(arena) {}
+
+  // type_expr is the transient_expr record { desc; level; scope; id };
+  // field 0 is the type_desc.  Memoize by arena id so shared/cyclic graphs
+  // map to shared/cyclic C++ nodes.
+  TypePtr type(std::size_t id) {
+    auto it = memo_.find(id);
+    if (it != memo_.end()) return it->second;
+    auto t = std::make_shared<TypeExpr>();
+    memo_.emplace(id, t);
+    decode_desc(arena_[id].fields.at(0), *t);
+    return t;
+  }
+
+  // A signature is an OCaml list of signature_item; dispatch each item by its
+  // constructor tag.
+  Signature signature(std::size_t list_id) {
+    Signature out;
+    for (std::size_t cur = list_id; arena_[cur].kind == m::Value::Kind::Block &&
+                                    !arena_[cur].fields.empty();) {
+      const m::Value& cons = arena_[cur];  // tag 0, size 2: head :: tail
+      const m::Value& item = arena_[cons.fields[0]];
+      if (item.kind == m::Value::Kind::Block) {
+        switch (item.tag) {
+          case 0:  // Sig_value of Ident.t * value_description * visibility
+            if (item.fields.size() == 3) {
+              SigValue sv;
+              sv.name = ident(item.fields[0]).name;
+              // value_description.val_type is field 0 of the record.
+              sv.type = type(arena_[item.fields[1]].fields.at(0));
+              out.values.push_back(std::move(sv));
+            }
+            break;
+          case 1:  // Sig_type of Ident.t * type_declaration * rec_status * vis
+            if (item.fields.size() == 4) {
+              TypeDecl td = type_declaration(item.fields[1]);
+              td.name = ident(item.fields[0]).name;
+              out.types.push_back(std::move(td));
+            }
+            break;
+          case 2:  // Sig_typext of Ident * extension_constructor * status * vis
+            if (item.fields.size() == 4) {
+              ExtConstructor ec = ext_constructor(item.fields[1]);
+              ec.name = ident(item.fields[0]).name;
+              out.typexts.push_back(std::move(ec));
+            }
+            break;
+          case 3:  // Sig_module of Ident * presence * md * rec_status * vis
+            if (item.fields.size() == 5) {
+              ModuleDecl md;
+              md.name = ident(item.fields[0]).name;
+              // module_declaration.md_type is field 0 of the record.
+              md.type = module_type(arena_[item.fields[2]].fields.at(0));
+              out.modules.push_back(std::move(md));
+            }
+            break;
+          case 4:  // Sig_modtype of Ident * modtype_declaration * vis
+            if (item.fields.size() == 3) {
+              ModtypeDecl mtd;
+              mtd.name = ident(item.fields[0]).name;
+              // modtype_declaration.mtd_type is field 0: module_type option.
+              const m::Value& opt = arena_[arena_[item.fields[1]].fields.at(0)];
+              if (opt.kind == m::Value::Kind::Block && opt.tag == 0)
+                mtd.type = module_type(opt.fields.at(0));
+              out.modtypes.push_back(std::move(mtd));
+            }
+            break;
+          default:
+            break;  // Sig_class / Sig_class_type: not decoded yet
+        }
+      }
+      cur = cons.fields[1];  // tail
+    }
+    return out;
+  }
+
+  // module_type (typing/types.mli): Mty_ident / Mty_signature / Mty_functor /
+  // Mty_alias.
+  ModuleTypePtr module_type(std::size_t id) {
+    const m::Value& v = arena_[id];
+    auto mt = std::make_shared<ModuleType>();
+    switch (v.tag) {
+      case 0:  // Mty_ident of Path.t
+        mt->kind = ModuleType::Ident;
+        mt->path = path(v.fields.at(0));
+        break;
+      case 1:  // Mty_signature of signature
+        mt->kind = ModuleType::Sig;
+        mt->sig = std::make_shared<Signature>(signature(v.fields.at(0)));
+        break;
+      case 2:  // Mty_functor of functor_parameter * module_type
+        mt->kind = ModuleType::Functor;
+        functor_parameter(v.fields.at(0), *mt);
+        mt->functor_body = module_type(v.fields.at(1));
+        break;
+      case 3:  // Mty_alias of Path.t
+        mt->kind = ModuleType::Alias;
+        mt->path = path(v.fields.at(0));
+        break;
+      default:
+        break;
+    }
+    return mt;
+  }
+
+  void functor_parameter(std::size_t id, ModuleType& mt) {
+    const m::Value& v = arena_[id];
+    if (v.kind == m::Value::Kind::Int) {  // Unit
+      mt.functor_unit = true;
+      return;
+    }
+    // Named of Ident.t option * module_type
+    const m::Value& name_opt = arena_[v.fields.at(0)];
+    if (name_opt.kind == m::Value::Kind::Block && name_opt.tag == 0)
+      mt.functor_param = ident(name_opt.fields.at(0)).name;
+    mt.functor_param_type = module_type(v.fields.at(1));
+  }
+
+  ExtConstructor ext_constructor(std::size_t id) {
+    const m::Value& v = arena_[id];  // { ext_type_path; ext_type_params;
+                                     //   ext_args; ext_ret_type; ... }
+    ExtConstructor ec;
+    ec.type_path = path(v.fields.at(0));
+    const m::Value& args = arena_[v.fields.at(2)];
+    if (args.tag == 0) {  // Cstr_tuple
+      ec.args = type_list(args.fields.at(0));
+    } else {  // Cstr_record
+      ec.is_inline_record = true;
+      for (std::size_t cur = args.fields.at(0);
+           arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();) {
+        const m::Value& cons = arena_[cur];
+        ec.inline_record.push_back(label_decl(cons.fields[0]));
+        cur = cons.fields[1];
+      }
+    }
+    const m::Value& res = arena_[v.fields.at(3)];
+    if (res.kind == m::Value::Kind::Block && res.tag == 0)
+      ec.res = type(res.fields.at(0));
+    return ec;
+  }
+
+  // type_declaration record: { type_params; type_arity; type_kind;
+  // type_private; type_manifest; ... }.
+  TypeDecl type_declaration(std::size_t id) {
+    const m::Value& d = arena_[id];
+    TypeDecl td;
+    td.params = type_list(d.fields.at(0));
+    if (arena_[d.fields.at(1)].kind == m::Value::Kind::Int)
+      td.arity = static_cast<int>(arena_[d.fields[1]].i);
+    type_kind(d.fields.at(2), td);
+    // type_manifest : type_expr option (field 4).
+    const m::Value& man = arena_[d.fields.at(4)];
+    if (man.kind == m::Value::Kind::Block && man.tag == 0)
+      td.manifest = type(man.fields.at(0));
+    return td;
+  }
+
+  void type_kind(std::size_t id, TypeDecl& td) {
+    const m::Value& k = arena_[id];
+    if (k.kind == m::Value::Kind::Int) {  // Type_open (the only constant case)
+      td.kind = TypeDecl::Open;
+      return;
+    }
+    switch (k.tag) {
+      case 0:  // Type_abstract of type_origin
+        td.kind = TypeDecl::Abstract;
+        break;
+      case 1:  // Type_record of label_declaration list * record_representation
+        td.kind = TypeDecl::Record;
+        for (std::size_t cur = k.fields.at(0);
+             arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();) {
+          const m::Value& cons = arena_[cur];
+          td.labels.push_back(label_decl(cons.fields[0]));
+          cur = cons.fields[1];
+        }
+        break;
+      case 2:  // Type_variant of constructor_declaration list * variant_repr
+        td.kind = TypeDecl::Variant;
+        for (std::size_t cur = k.fields.at(0);
+             arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();) {
+          const m::Value& cons = arena_[cur];
+          td.ctors.push_back(ctor_decl(cons.fields[0]));
+          cur = cons.fields[1];
+        }
+        break;
+      case 3:  // Type_external of string
+        td.kind = TypeDecl::External;
+        td.external_name = arena_[k.fields.at(0)].str;
+        break;
+      default:
+        td.kind = TypeDecl::Abstract;
+        break;
+    }
+  }
+
+  LabelDecl label_decl(std::size_t id) {
+    const m::Value& v = arena_[id];  // { ld_id; ld_mutable; ld_atomic; ld_type; ...}
+    LabelDecl ld;
+    ld.name = ident(v.fields.at(0)).name;
+    ld.mutable_ = arena_[v.fields.at(1)].kind == m::Value::Kind::Int &&
+                  arena_[v.fields[1]].i != 0;  // mutable_flag: Mutable = 1
+    ld.type = type(v.fields.at(3));
+    return ld;
+  }
+
+  ConstructorDecl ctor_decl(std::size_t id) {
+    const m::Value& v = arena_[id];  // { cd_id; cd_args; cd_res; ... }
+    ConstructorDecl cd;
+    cd.name = ident(v.fields.at(0)).name;
+    const m::Value& args = arena_[v.fields.at(1)];  // constructor_arguments
+    if (args.tag == 0) {  // Cstr_tuple of type_expr list
+      cd.args = type_list(args.fields.at(0));
+    } else {  // Cstr_record of label_declaration list
+      cd.is_inline_record = true;
+      for (std::size_t cur = args.fields.at(0);
+           arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();) {
+        const m::Value& cons = arena_[cur];
+        cd.inline_record.push_back(label_decl(cons.fields[0]));
+        cur = cons.fields[1];
+      }
+    }
+    const m::Value& res = arena_[v.fields.at(2)];  // cd_res : type_expr option
+    if (res.kind == m::Value::Kind::Block && res.tag == 0)
+      cd.res = type(res.fields.at(0));
+    return cd;
+  }
+
+private:
+  Ident ident(std::size_t id) {
+    const m::Value& v = arena_[id];
+    Ident out;
+    out.kind = static_cast<Ident::Kind>(v.tag);
+    if (!v.fields.empty()) out.name = arena_[v.fields[0]].str;
+    if (v.fields.size() > 1 && arena_[v.fields[1]].kind == m::Value::Kind::Int)
+      out.stamp = arena_[v.fields[1]].i;
+    return out;
+  }
+
+  PathPtr path(std::size_t id) {
+    const m::Value& v = arena_[id];
+    auto p = std::make_shared<Path>();
+    p->kind = static_cast<Path::Kind>(v.tag);
+    switch (v.tag) {
+      case Path::Pident:
+        p->id = ident(v.fields.at(0));
+        break;
+      case Path::Pdot:
+        p->a = path(v.fields.at(0));
+        p->s = arena_[v.fields.at(1)].str;
+        break;
+      case Path::Papply:
+        p->a = path(v.fields.at(0));
+        p->b = path(v.fields.at(1));
+        break;
+      case Path::Pextra_ty:
+        p->a = path(v.fields.at(0));
+        break;
+      default:
+        break;
+    }
+    return p;
+  }
+
+  std::optional<std::string> opt_string(std::size_t id) {
+    const m::Value& v = arena_[id];
+    if (v.kind == m::Value::Kind::Int) return std::nullopt;  // None
+    return arena_[v.fields.at(0)].str;                       // Some s
+  }
+
+  std::vector<TypePtr> type_list(std::size_t id) {
+    std::vector<TypePtr> out;
+    for (std::size_t cur = id; arena_[cur].kind == m::Value::Kind::Block &&
+                               !arena_[cur].fields.empty();) {
+      const m::Value& cons = arena_[cur];
+      out.push_back(type(cons.fields[0]));
+      cur = cons.fields[1];
+    }
+    return out;
+  }
+
+  void decode_desc(std::size_t id, TypeExpr& t) {
+    const m::Value& d = arena_[id];
+    if (d.kind == m::Value::Kind::Int) {
+      // The only constant type_desc constructor is Tnil.
+      t.kind = (d.i == 0) ? TypeExpr::Tnil : TypeExpr::Other;
+      return;
+    }
+    switch (d.tag) {
+      case 0:  // Tvar of string option
+        t.kind = TypeExpr::Tvar;
+        t.name = opt_string(d.fields.at(0));
+        break;
+      case 1:  // Tarrow of arg_label * type_expr * type_expr * commutable
+        t.kind = TypeExpr::Tarrow;
+        decode_arg_label(d.fields.at(0), t);
+        t.dom = type(d.fields.at(1));
+        t.cod = type(d.fields.at(2));
+        break;
+      case 2:  // Ttuple of (string option * type_expr) list
+        t.kind = TypeExpr::Ttuple;
+        for (std::size_t cur = d.fields.at(0);
+             arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();) {
+          const m::Value& cons = arena_[cur];
+          const m::Value& pair = arena_[cons.fields[0]];  // (label opt, te)
+          t.elems.emplace_back(opt_string(pair.fields.at(0)), type(pair.fields.at(1)));
+          cur = cons.fields[1];
+        }
+        break;
+      case 3:  // Tconstr of Path.t * type_expr list * abbrev_memo ref
+        t.kind = TypeExpr::Tconstr;
+        t.path = path(d.fields.at(0));
+        t.args = type_list(d.fields.at(1));
+        break;
+      case 11:  // Texpand of type_expr * Path.t * type_expr list
+        t.kind = TypeExpr::Texpand;
+        t.link = type(d.fields.at(0));
+        t.path = path(d.fields.at(1));
+        t.args = type_list(d.fields.at(2));
+        break;
+      case 12:  // Tlink of type_expr
+        t.kind = TypeExpr::Tlink;
+        t.link = type(d.fields.at(0));
+        break;
+      case 13:  // Tsubst of type_expr * type_expr option
+        t.kind = TypeExpr::Tsubst;
+        t.link = type(d.fields.at(0));
+        break;
+      case 7:  // Tunivar of string option
+        t.kind = TypeExpr::Tunivar;
+        t.name = opt_string(d.fields.at(0));
+        break;
+      case 8:  // Tpoly of type_expr * type_expr list
+        t.kind = TypeExpr::Tpoly;
+        t.link = type(d.fields.at(0));
+        break;
+      default:
+        // Tobject/Tfield/Tvariant/Tpackage/Tfunctor: kind only for now.
+        switch (d.tag) {
+          case 4: t.kind = TypeExpr::Tobject; break;
+          case 5: t.kind = TypeExpr::Tfield; break;
+          case 6: t.kind = TypeExpr::Tvariant; break;
+          case 9: t.kind = TypeExpr::Tpackage; break;
+          case 10: t.kind = TypeExpr::Tfunctor; break;
+          default: t.kind = TypeExpr::Other; break;
+        }
+        break;
+    }
+  }
+
+  void decode_arg_label(std::size_t id, TypeExpr& t) {
+    const m::Value& v = arena_[id];
+    if (v.kind == m::Value::Kind::Int) {
+      t.label_kind = 0;  // Nolabel
+      return;
+    }
+    t.label_kind = v.tag == 0 ? 1 : 2;  // Labelled / Optional
+    t.label = arena_[v.fields.at(0)].str;
+  }
+
+  const m::Arena& arena_;
+  std::unordered_map<std::size_t, TypePtr> memo_;
+};
+
+}  // namespace
+
+CmiFile CmiFile::load(const std::string& filepath) {
+  std::ifstream in(filepath, std::ios::binary);
+  if (!in) throw m::Error("cannot open " + filepath);
+  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+
+  // Skip the cmi magic string and decode the header value (name, signature).
+  std::size_t off = 0;
+  for (; off + 4 <= bytes.size(); ++off)
+    if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
+        (bytes[off + 3] == 0xBE || bytes[off + 3] == 0xBF || bytes[off + 3] == 0xBD))
+      break;
+  if (off + 4 > bytes.size()) throw m::Error("no Marshal magic in " + filepath);
+
+  m::Arena arena;
+  std::size_t header = m::read_value(bytes.data(), bytes.size(), off, arena);
+  const m::Value& tuple = arena[header];  // (modname, signature)
+
+  Decoder dec(arena);
+  CmiFile cmi;
+  cmi.module_name_ = arena[tuple.fields.at(0)].str;
+  cmi.sig_ = dec.signature(tuple.fields.at(1));
+  return cmi;
+}
+
+const SigValue* CmiFile::find_value(const std::string& name) const {
+  for (const auto& v : sig_.values)
+    if (v.name == name) return &v;
+  return nullptr;
+}
+
+const TypeDecl* CmiFile::find_type(const std::string& name) const {
+  for (const auto& t : sig_.types)
+    if (t.name == name) return &t;
+  return nullptr;
+}
+
+const ModuleDecl* CmiFile::find_module(const std::string& name) const {
+  for (const auto& m : sig_.modules)
+    if (m.name == name) return &m;
+  return nullptr;
+}
+
+namespace {
+
+const TypeExpr* follow(const TypeExpr* t) {
+  while (t && (t->kind == TypeExpr::Tlink || t->kind == TypeExpr::Tsubst) && t->link)
+    t = t->link.get();
+  return t;
+}
+
+std::string path_last_name(const Path& p) {
+  switch (p.kind) {
+    case Path::Pident: return p.id.name;
+    case Path::Pdot: return p.s;
+    case Path::Papply:
+      return (p.a ? path_last_name(*p.a) : "?") + "(" +
+             (p.b ? path_last_name(*p.b) : "?") + ")";
+    case Path::Pextra_ty: return p.a ? path_last_name(*p.a) : "?";
+  }
+  return "?";
+}
+
+std::string path_full(const Path& p) {
+  switch (p.kind) {
+    case Path::Pident: return p.id.name;
+    case Path::Pdot: return (p.a ? path_full(*p.a) : "?") + "." + p.s;
+    case Path::Papply:
+      return (p.a ? path_full(*p.a) : "?") + "(" +
+             (p.b ? path_full(*p.b) : "?") + ")";
+    case Path::Pextra_ty: return p.a ? path_full(*p.a) : "?";
+  }
+  return "?";
+}
+
+void print_rec(const TypePtr& tp, std::string& out, bool arrow_paren);
+
+void print_args(const std::vector<TypePtr>& args, const Path& p, std::string& out) {
+  if (args.empty()) {
+    out += path_last_name(p);
+    return;
+  }
+  if (args.size() == 1) {
+    print_rec(args[0], out, true);
+    out += " ";
+    out += path_last_name(p);
+    return;
+  }
+  out += "(";
+  for (std::size_t k = 0; k < args.size(); ++k) {
+    if (k) out += ", ";
+    print_rec(args[k], out, false);
+  }
+  out += ") ";
+  out += path_last_name(p);
+}
+
+void print_rec(const TypePtr& tp, std::string& out, bool arrow_paren) {
+  const TypeExpr* t = follow(tp.get());
+  if (!t) { out += "_"; return; }
+  switch (t->kind) {
+    case TypeExpr::Tvar:
+      out += t->name ? "'" + *t->name : "'_";
+      break;
+    case TypeExpr::Tunivar:
+      out += t->name ? "'" + *t->name : "'_";
+      break;
+    case TypeExpr::Tarrow: {
+      if (arrow_paren) out += "(";
+      if (t->label_kind == 1) out += t->label + ":";
+      else if (t->label_kind == 2) out += "?" + t->label + ":";
+      // re-wrap the shared_ptr for recursion via the decoded children
+      print_rec(t->dom, out, true);
+      out += " -> ";
+      print_rec(t->cod, out, false);
+      if (arrow_paren) out += ")";
+      break;
+    }
+    case TypeExpr::Ttuple:
+      if (arrow_paren) out += "(";
+      for (std::size_t k = 0; k < t->elems.size(); ++k) {
+        if (k) out += " * ";
+        if (t->elems[k].first) out += *t->elems[k].first + ":";
+        print_rec(t->elems[k].second, out, true);
+      }
+      if (arrow_paren) out += ")";
+      break;
+    case TypeExpr::Tconstr:
+    case TypeExpr::Texpand:
+      if (t->path) print_args(t->args, *t->path, out);
+      else out += "?";
+      break;
+    case TypeExpr::Tpoly:
+      print_rec(t->link, out, arrow_paren);
+      break;
+    case TypeExpr::Tnil: out += "<nil>"; break;
+    case TypeExpr::Tobject: out += "<obj>"; break;
+    case TypeExpr::Tvariant: out += "[variant]"; break;
+    default: out += "<?>"; break;
+  }
+}
+
+}  // namespace
+
+std::string print_type(const TypePtr& t) {
+  std::string out;
+  print_rec(t, out, false);
+  return out;
+}
+
+std::string print_module_type(const ModuleType& mt) {
+  switch (mt.kind) {
+    case ModuleType::Ident:
+      return mt.path ? path_full(*mt.path) : "?";
+    case ModuleType::Alias:
+      return "(= " + (mt.path ? path_full(*mt.path) : "?") + ")";
+    case ModuleType::Sig: {
+      std::size_t nv = mt.sig ? mt.sig->values.size() : 0;
+      std::size_t nt = mt.sig ? mt.sig->types.size() : 0;
+      std::size_t nm = mt.sig ? mt.sig->modules.size() : 0;
+      return "sig <" + std::to_string(nv) + " val, " + std::to_string(nt) +
+             " type, " + std::to_string(nm) + " mod> end";
+    }
+    case ModuleType::Functor: {
+      std::string p = mt.functor_unit
+                          ? "()"
+                          : (mt.functor_param ? *mt.functor_param : "_") + " : " +
+                                (mt.functor_param_type
+                                     ? print_module_type(*mt.functor_param_type)
+                                     : "?");
+      return "functor (" + p + ") -> " +
+             (mt.functor_body ? print_module_type(*mt.functor_body) : "?");
+    }
+  }
+  return "?";
+}
+
+std::string print_type_decl(const TypeDecl& d) {
+  std::string out = "type ";
+  if (d.params.size() == 1) {
+    print_rec(d.params[0], out, true);
+    out += " ";
+  } else if (d.params.size() > 1) {
+    out += "(";
+    for (std::size_t k = 0; k < d.params.size(); ++k) {
+      if (k) out += ", ";
+      print_rec(d.params[k], out, false);
+    }
+    out += ") ";
+  }
+  out += d.name;
+  if (d.manifest) {
+    out += " = ";
+    out += print_type(d.manifest);
+  }
+  switch (d.kind) {
+    case TypeDecl::Record: {
+      out += " = { ";
+      for (std::size_t k = 0; k < d.labels.size(); ++k) {
+        if (k) out += "; ";
+        if (d.labels[k].mutable_) out += "mutable ";
+        out += d.labels[k].name + " : " + print_type(d.labels[k].type);
+      }
+      out += " }";
+      break;
+    }
+    case TypeDecl::Variant: {
+      out += " = ";
+      for (std::size_t k = 0; k < d.ctors.size(); ++k) {
+        if (k) out += " | ";
+        const ConstructorDecl& c = d.ctors[k];
+        out += c.name;
+        if (c.is_inline_record) {
+          out += " of { ";
+          for (std::size_t j = 0; j < c.inline_record.size(); ++j) {
+            if (j) out += "; ";
+            out += c.inline_record[j].name + " : " +
+                   print_type(c.inline_record[j].type);
+          }
+          out += " }";
+        } else if (!c.args.empty()) {
+          out += " of ";
+          for (std::size_t j = 0; j < c.args.size(); ++j) {
+            if (j) out += " * ";
+            out += print_type(c.args[j]);
+          }
+        }
+        if (c.res) out += " : " + print_type(c.res);  // GADT
+      }
+      break;
+    }
+    case TypeDecl::Open:
+      out += " = ..";
+      break;
+    case TypeDecl::External:
+      out += " = external \"" + d.external_name + "\"";
+      break;
+    case TypeDecl::Abstract:
+      break;
+  }
+  return out;
+}
+
+}  // namespace cppcaml::cmi
