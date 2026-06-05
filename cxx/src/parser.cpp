@@ -1643,13 +1643,13 @@ class Parser {
       return box(CoreType{Ptyp_var{nm.text}, span(position(t.start), position(nm.end))});
     }
     if (t.kind == Kind::UIDENT && peek(1).kind == Kind::DOT && peek(2).kind == Kind::LPAREN) {
-      advance();  // module name (single-segment local open M.(t))
+      advance();  // module name (single-segment local open M.(t) / M.(module S))
       LongidentLoc mod_{{Lident{t.text}}, tokloc(t)};
-      advance(); advance();  // . (
-      CoreTypeBox inner = parse_core_type();
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      advance();  // .  — the `(` opens a delimited_type_supporting_local_open
+      // The delimited type keeps its own parens: `(core_type)` or `(module S)`.
+      CoreTypeBox inner = parse_type_atom();
       return box(CoreType{Ptyp_open{std::move(mod_), std::move(inner)},
-                          span(position(t.start), position(c.end))});
+                          span(position(t.start), position(tokens_[idx_ - 1].end))});
     }
     if (t.kind == Kind::UIDENT && peek(1).kind == Kind::DOT &&
         peek(2).kind == Kind::LBRACKET) {  // M.[…]  local-open polyvariant type
