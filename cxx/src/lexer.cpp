@@ -936,6 +936,7 @@ Token Lexer::scan_brace(size_t start) {
       t.kind = item ? Kind::QUOTED_STRING_ITEM : Kind::QUOTED_STRING_EXPR;
       t.ext_id = std::move(id);
       t.delim = delim;  // Some delim (Some "" when empty)
+      t.content_start = p;  // byte offset of the content (just past `|`)
       return t;
     }
     // malformed extension head: fall back to LBRACE

@@ -514,6 +514,10 @@ class Parser {
       case Kind::INT: case Kind::FLOAT: case Kind::CHAR: case Kind::STRING:
         advance();
         return E({Pexp_constant{const_of(t)}, tokloc(t)});
+      case Kind::QUOTED_STRING_EXPR:  // {%ext|…|} -> Pexp_extension
+        advance();
+        return E({Pexp_extension{t.ext_id, quoted_payload(t)},
+                  span(position(t.start), position(t.end))});
       case Kind::LIDENT: {
         advance();
         Location l = tokloc(t);
@@ -1538,6 +1542,11 @@ class Parser {
   CoreTypeBox parse_type_atom() {
     Token t = cur();
     if (t.kind == Kind::UNDERSCORE) { advance(); return box(CoreType{Ptyp_any{}, tokloc(t)}); }
+    if (t.kind == Kind::QUOTED_STRING_EXPR) {  // {%ext|…|} -> Ptyp_extension
+      advance();
+      return box(CoreType{Ptyp_extension{t.ext_id, quoted_payload(t)},
+                          span(position(t.start), position(t.end))});
+    }
     if (t.kind == Kind::QUOTE) {
       advance();
       Token nm = cur();
@@ -1933,6 +1942,10 @@ class Parser {
     Token t = cur();
     switch (t.kind) {
       case Kind::UNDERSCORE: advance(); return {Ppat_any{}, tokloc(t)};
+      case Kind::QUOTED_STRING_EXPR:  // {%ext|…|} -> Ppat_extension
+        advance();
+        return {Ppat_extension{t.ext_id, quoted_payload(t)},
+                span(position(t.start), position(t.end))};
       case Kind::LIDENT: advance(); return {Ppat_var{StringLoc{t.text, tokloc(t)}}, tokloc(t)};
       case Kind::MINUS: case Kind::PLUS:  // signed_constant: {- +} {INT FLOAT}
         if (peek(1).kind != Kind::INT && peek(1).kind != Kind::FLOAT)
@@ -2743,8 +2756,24 @@ class Parser {
   }
 
   // ---- structure ----
+  // A quoted-string extension `{%…|content|}`: the payload is a ghost Pstr_eval
+  // holding the content as a string constant.
+  Structure quoted_payload(const Token& t) {
+    std::string delim = t.delim.value_or("");
+    Location strloc{position(t.content_start), position(t.end - (delim.size() + 2)), false};
+    Constant c{Pconst_string{t.text, strloc, t.delim}, strloc};
+    Location gl{position(t.start), position(t.end), /*ghost=*/true};
+    Structure payload;
+    payload.push_back(StructureItem{Pstr_eval{E({Pexp_constant{std::move(c)}, gl})}, gl});
+    return payload;
+  }
   StructureItem parse_structure_item() {
     Token t = cur();
+    if (t.kind == Kind::QUOTED_STRING_ITEM) {  // {%%ext|…|} -> Pstr_extension(ext, [string])
+      advance();
+      return StructureItem{Pstr_extension{t.ext_id, quoted_payload(t)},
+                           span(position(t.start), position(t.end))};
+    }
     if (t.kind == Kind::LET) {
       if (peek(1).kind == Kind::OPEN || peek(1).kind == Kind::MODULE) {
         // let open/module … in …  is an expression statement
@@ -3204,6 +3233,11 @@ class Parser {
   SignatureItem parse_signature_item() {
     Token t = cur();
     auto here = [&] { return span(position(t.start), position(tokens_[idx_ - 1].end)); };
+    if (t.kind == Kind::QUOTED_STRING_ITEM) {  // {%%ext|…|} -> Psig_extension
+      advance();
+      return SignatureItem{Psig_extension{t.ext_id, quoted_payload(t)},
+                           span(position(t.start), position(t.end))};
+    }
     if (t.kind == Kind::VAL) {
       advance();
       Token nm = cur();

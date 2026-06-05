@@ -68,6 +68,7 @@ struct Token {
   std::optional<char> modifier;      // INT/FLOAT trailing literal modifier (e.g. 'L','g')
   std::optional<std::string> delim;  // STRING/quoted-string delimiter (nullopt => "..." form)
   std::string ext_id;                // QUOTED_STRING_EXPR/ITEM extension identifier
+  size_t content_start = 0;          // QUOTED_STRING_*: byte offset of the content (after `|`)
   int char_code = -1;                // CHAR: byte value 0..255
 
   static Token make(Kind k, size_t s, size_t e) { return Token{k, s, e}; }
