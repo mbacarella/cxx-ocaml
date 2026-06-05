@@ -2898,6 +2898,7 @@ class Parser {
     }
     if (t.kind == Kind::TYPE) {
       advance();
+      std::optional<std::string> type_ext = take_ext();  // `type%ext …`
       Attributes typeattrs;  // `type[@attr] …`  -> on the first declaration
       while (cur().kind == Kind::LBRACKETAT) { advance(); typeattrs.push_back(parse_attribute_body()); }
       RecFlag rf = RecFlag::Recursive;  // `type` is recursive by default
@@ -2935,13 +2936,23 @@ class Parser {
       while (cur().kind == Kind::AND) {
         Position ds = position(cur().start);
         advance();
-        decls.push_back(parse_type_declaration(ds));
+        Attributes andattrs = take_attrs();  // `and[@attr] …` -> prefix on this declaration
+        TypeDeclaration d = parse_type_declaration(ds);
+        d.attrs.insert(d.attrs.begin(), std::make_move_iterator(andattrs.begin()),
+                       std::make_move_iterator(andattrs.end()));
+        decls.push_back(std::move(d));
       }
       Location l = span(d0, position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
       for (auto& a : decls[0].attrs) typeattrs.push_back(std::move(a));  // type[@attr] prefix
       decls[0].attrs = std::move(typeattrs);
-      return StructureItem{Pstr_type{rf, std::move(decls)}, l};
+      StructureItem item{Pstr_type{rf, std::move(decls)}, l};
+      if (type_ext) {  // `type%ext …` wraps the (ghost) Pstr_type in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*type_ext), std::move(ep)}, l};
+      }
+      return item;
     }
     if (t.kind == Kind::OPEN) {
       advance();
