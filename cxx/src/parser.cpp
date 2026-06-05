@@ -620,7 +620,7 @@ class Parser {
         std::optional<ExprBox> base;
         if (is_atom_start(cur().kind) && cur().kind != Kind::RBRACE) {
           size_t save = idx_;
-          ExprBox e = parse_atom_postfix();
+          ExprBox e = parse_app();  // the `{ e with … }` base may be an application (`f ()`)
           if (cur().kind == Kind::WITH) { advance(); base = std::move(e); }
           else idx_ = save;  // it was the first field label, not a base
         }
