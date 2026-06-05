@@ -302,6 +302,13 @@ class Parser {
     if (auto* p = std::get_if<Ldot>(&l.v)) return p->name;
     return "";
   }
+  // A type-constructor path must end in a lowercase identifier; a bare uppercase
+  // path (`int -> T`, `X.Y` as a type) is a syntax error.
+  void check_type_constr_path(const LongidentLoc& p) {
+    std::string nm = lid_last_name(p.txt);
+    if (!nm.empty() && std::isupper(static_cast<unsigned char>(nm[0])))
+      throw ParseError("not a valid type path", p.loc.start.cnum);
+  }
 
   // A dotted path; reports whether the final segment is uppercase (constructor)
   // vs lowercase (value/field).
@@ -1706,6 +1713,7 @@ class Parser {
     }
     if (t.kind == Kind::LIDENT || t.kind == Kind::UIDENT) {
       LongidentLoc name = parse_type_path();  // may contain functor application F(X).t
+      check_type_constr_path(name);  // a bare uppercase path is not a valid type
       return box(CoreType{.desc = Ptyp_constr{.id = name, .args = {}}, .loc = name.loc});
     }
     if (t.kind == Kind::HASH) {  // #class  (no type args)
