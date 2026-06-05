@@ -386,9 +386,10 @@ struct Pmod_constraint { Box<ModuleExpr> me; ModuleTypeBox mt; };
 struct Pmod_apply { Box<ModuleExpr> f; Box<ModuleExpr> arg; };  // F(X)
 struct Pmod_apply_unit { Box<ModuleExpr> f; };                  // F()
 struct Pmod_unpack { ExprBox e; };                             // (val e [: pkg])
+struct Pmod_extension { std::string name; Structure payload; };  // [%id …]
 struct ModuleExpr {
   std::variant<Pmod_ident, Pmod_structure, Pmod_functor, Pmod_constraint, Pmod_apply,
-               Pmod_apply_unit, Pmod_unpack>
+               Pmod_apply_unit, Pmod_unpack, Pmod_extension>
       desc;
   Location loc;
   Attributes attrs;  // pmod_attributes

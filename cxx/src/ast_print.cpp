@@ -784,6 +784,9 @@ struct Printer {
     } else if (auto* a = std::get_if<Pmod_apply_unit>(&m.desc)) {
       line(j, "Pmod_apply_unit");
       module_expr(j, *a->f);
+    } else if (auto* e = std::get_if<Pmod_extension>(&m.desc)) {
+      line(j, "Pmod_extension \"" + e->name + "\"");
+      structure_list(j, e->payload);
     } else {
       auto& u = std::get<Pmod_unpack>(m.desc);
       line(j, "Pmod_unpack");

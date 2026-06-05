@@ -3493,6 +3493,14 @@ class Parser {
   }
   ModuleExpr parse_module_expr_head() {
     Token t = cur();
+    if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pmod_extension
+      advance();
+      std::string name = parse_attr_name();
+      Structure payload = parse_structure_until(Kind::RBRACKET);
+      Token c = cur(); expect(Kind::RBRACKET, "]");
+      return ModuleExpr{Pmod_extension{std::move(name), std::move(payload)},
+                        span(position(t.start), position(c.end))};
+    }
     if (t.kind == Kind::STRUCT) {
       advance();
       Structure items = parse_structure_until(Kind::END);
