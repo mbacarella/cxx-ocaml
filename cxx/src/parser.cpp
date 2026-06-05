@@ -1832,11 +1832,15 @@ class Parser {
       if (cur().kind == Kind::OF) {
         advance();
         if (cur().kind == Kind::AMPERSAND) { advance(); amp = true; }
+        bool save_sup = suppress_type_trailing_attr_;
+        suppress_type_trailing_attr_ = true;  // amper_type_list: a trailing `[@a]` is the tag's
         types.push_back(parse_core_type());
         while (cur().kind == Kind::AMPERSAND) { advance(); types.push_back(parse_core_type()); }
+        suppress_type_trailing_attr_ = save_sup;
       }
       bool constant = types.empty() || amp;
-      Attributes attrs;
+      Attributes attrs;  // prf_attributes: explicit `[@a]` then an info docstring
+      while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
       append_info_doc(attrs, tokens_[idx_ - 1].end);  // `\`Tag … (** info *)`
       return Rtag{tag.text, constant, std::move(types), std::move(attrs)};
     }
@@ -3259,8 +3263,8 @@ class Parser {
       if (cur().kind == Kind::COLON) { colon_pos = position(cur().start); advance(); cmty = parse_module_type(); }
       expect(Kind::EQUAL, "=");
       ModuleExpr me = parse_module_expr();
-      if (cmty) {
-        Location cl = span(colon_pos, me.loc.end);
+      if (cmty) {  // $sloc runs to the last token, incl. a trailing `[@attr]` on me
+        Location cl = span(colon_pos, position(tokens_[idx_ - 1].end));
         me = ModuleExpr{Pmod_constraint{box(std::move(me)), box(std::move(*cmty))}, cl};
       }
       for (int i = static_cast<int>(params.size()) - 1; i >= 0; --i) {
@@ -3893,8 +3897,8 @@ class Parser {
     if (cur().kind == Kind::COLON) { colon_pos = position(cur().start); advance(); cmty = parse_module_type(); }
     expect(Kind::EQUAL, "=");
     ModuleExpr me = parse_module_expr();
-    if (cmty) {
-      Location cl = span(colon_pos, me.loc.end);
+    if (cmty) {  // $sloc runs to the last token, incl. a trailing `[@attr]` on me
+      Location cl = span(colon_pos, position(tokens_[idx_ - 1].end));
       me = ModuleExpr{Pmod_constraint{box(std::move(me)), box(std::move(*cmty))}, cl};
     }
     for (int i = static_cast<int>(params.size()) - 1; i >= 0; --i) {
