@@ -593,11 +593,9 @@ class Parser {
       }
       case Kind::LBRACKETPERCENT: {  // [%id payload]
         advance();
-        std::string name = parse_attr_name();
-        Structure payload = parse_structure_until(Kind::RBRACKET);
-        Token c = cur(); expect(Kind::RBRACKET, "]");
+        auto [name, payload] = parse_ext_body();
         return E({Pexp_extension{std::move(name), std::move(payload)},
-                  span(position(t.start), position(c.end))});
+                  span(position(t.start), position(tokens_[idx_ - 1].end))});
       }
       case Kind::LBRACKET: {
         advance();
@@ -1585,11 +1583,9 @@ class Parser {
     }
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]
       advance();
-      std::string name = parse_attr_name();
-      Structure payload = parse_structure_until(Kind::RBRACKET);
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      auto [name, payload] = parse_ext_body();
       return box(CoreType{Ptyp_extension{std::move(name), std::move(payload)},
-                          span(position(t.start), position(c.end))});
+                          span(position(t.start), position(tokens_[idx_ - 1].end))});
     }
     if (t.kind == Kind::LPAREN && peek(1).kind == Kind::MODULE) {  // (module S [with type …])
       advance(); advance();  // ( module
@@ -2084,11 +2080,9 @@ class Parser {
       }
       case Kind::LBRACKETPERCENT: {  // [%id payload]
         advance();
-        std::string name = parse_attr_name();
-        Structure payload = parse_structure_until(Kind::RBRACKET);
-        Token c = cur(); expect(Kind::RBRACKET, "]");
+        auto [name, payload] = parse_ext_body();
         return {Ppat_extension{std::move(name), std::move(payload)},
-                span(position(t.start), position(c.end))};
+                span(position(t.start), position(tokens_[idx_ - 1].end))};
       }
       case Kind::HASH: {  // #tconst
         advance();
@@ -2759,14 +2753,42 @@ class Parser {
   // ---- structure ----
   // A quoted-string extension `{%…|content|}`: the payload is a ghost Pstr_eval
   // holding the content as a string constant.
-  Structure quoted_payload(const Token& t) {
+  ExtPayload quoted_payload(const Token& t) {
     std::string delim = t.delim.value_or("");
     Location strloc{position(t.content_start), position(t.end - (delim.size() + 2)), false};
     Constant c{Pconst_string{t.text, strloc, t.delim}, strloc};
     Location gl{position(t.start), position(t.end), /*ghost=*/true};
-    Structure payload;
-    payload.push_back(StructureItem{Pstr_eval{E({Pexp_constant{std::move(c)}, gl})}, gl});
-    return payload;
+    ExtPayload ep;
+    ep.str.push_back(StructureItem{Pstr_eval{E({Pexp_constant{std::move(c)}, gl})}, gl});
+    return ep;
+  }
+  static bool is_sig_item_start(Kind k) {
+    return k == Kind::VAL || k == Kind::TYPE || k == Kind::MODULE || k == Kind::INCLUDE ||
+           k == Kind::EXCEPTION || k == Kind::OPEN || k == Kind::EXTERNAL || k == Kind::CLASS ||
+           k == Kind::LBRACKETPERCENTPERCENT || k == Kind::LBRACKETATATAT;
+  }
+  // Parse `[%id payload]` / `[%%id payload]` after the opening bracket is consumed:
+  // returns the name and the payload (PStr/PTyp/PSig/PPat per parser.mly `payload`).
+  std::pair<std::string, ExtPayload> parse_ext_body() {
+    std::string name = parse_attr_name();
+    ExtPayload ep;
+    if (cur().kind == Kind::COLON) {  // `: core_type` (PTyp) or `: signature` (PSig)
+      advance();
+      if (cur().kind == Kind::RBRACKET || is_sig_item_start(cur().kind)) {
+        ep.is_sig = true;
+        ep.sig = box(parse_signature_until(Kind::RBRACKET));
+      } else {
+        ep.typ = parse_core_type();
+      }
+    } else if (cur().kind == Kind::QUESTION) {  // `? pattern [when e]` (PPat)
+      advance();
+      ep.pat = box(parse_pattern());
+      if (cur().kind == Kind::WHEN) { advance(); ep.guard = parse_expr(); }
+    } else {  // structure (PStr)
+      ep.str = parse_structure_until(Kind::RBRACKET);
+    }
+    expect(Kind::RBRACKET, "]");
+    return {std::move(name), std::move(ep)};
   }
   StructureItem parse_structure_item() {
     Token t = cur();
@@ -2797,8 +2819,8 @@ class Parser {
       if (let_ext_) {  // `let%ext …`  -> Pstr_extension over the (ghost-wrapped) let item
         std::string ext = std::move(*let_ext_);
         let_ext_ = std::nullopt;
-        Structure payload;
-        payload.push_back(StructureItem{Pstr_value{rf, std::move(binds)}, l});
+        ExtPayload payload;
+        payload.str.push_back(StructureItem{Pstr_value{rf, std::move(binds)}, l});
         return StructureItem{Pstr_extension{std::move(ext), std::move(payload)},
                              Location{l.start, l.end, /*ghost=*/true}};
       }
@@ -2985,11 +3007,9 @@ class Parser {
     }
     if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% name payload ]  (item extension)
       advance();
-      std::string name = parse_attr_name();
-      Structure payload = parse_structure_until(Kind::RBRACKET);
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      auto [name, payload] = parse_ext_body();
       return StructureItem{Pstr_extension{std::move(name), std::move(payload)},
-                           span(position(t.start), position(c.end))};
+                           span(position(t.start), position(tokens_[idx_ - 1].end))};
     }
     ExprBox e = parse_expr();
     Location l = e->loc;
@@ -3153,6 +3173,12 @@ class Parser {
   }
   ModuleType parse_module_type_base() {
     Token t = cur();
+    if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pmty_extension
+      advance();
+      auto [name, payload] = parse_ext_body();
+      return ModuleType{Pmty_extension{std::move(name), std::move(payload)},
+                        span(position(t.start), position(tokens_[idx_ - 1].end)), {}};
+    }
     if (t.kind == Kind::SIG) {
       advance();
       Signature items = parse_signature_until(Kind::END);
@@ -3438,11 +3464,9 @@ class Parser {
     }
     if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% …]
       advance();
-      std::string name = parse_attr_name();
-      Structure payload = parse_structure_until(Kind::RBRACKET);
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      auto [name, payload] = parse_ext_body();
       return SignatureItem{Psig_extension{std::move(name), std::move(payload)},
-                           span(position(t.start), position(c.end))};
+                           span(position(t.start), position(tokens_[idx_ - 1].end))};
     }
     throw ParseError("unsupported signature item", t.start);
   }
@@ -3498,11 +3522,9 @@ class Parser {
     Token t = cur();
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pmod_extension
       advance();
-      std::string name = parse_attr_name();
-      Structure payload = parse_structure_until(Kind::RBRACKET);
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      auto [name, payload] = parse_ext_body();
       return ModuleExpr{Pmod_extension{std::move(name), std::move(payload)},
-                        span(position(t.start), position(c.end))};
+                        span(position(t.start), position(tokens_[idx_ - 1].end))};
     }
     if (t.kind == Kind::STRUCT) {
       advance();

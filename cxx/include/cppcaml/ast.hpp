@@ -34,11 +34,24 @@ using Box = std::unique_ptr<T>;
 // threaded through expression/pattern/type/binding nodes.
 struct StructureItem;
 using Structure = std::vector<StructureItem>;
+struct SignatureItem;
+using Signature = std::vector<SignatureItem>;
 struct ModuleExpr;     // (used by Pexp_pack, Pstr_include, …)
 struct ClassStructure;  // object … end  (used by Pexp_object)
 struct CoreType;       // (attribute payloads: PTyp / PPat)
 struct Pattern;
 struct Expression;
+// An extension/attribute payload (parser.mly `payload`): a structure (PStr), a
+// `: core_type` (PTyp), a `: signature` (PSig), or a `? pattern [when e]` (PPat).
+// Exactly one of {str non-empty / typ / sig / pat} describes the form.
+struct ExtPayload {
+  Structure str;            // PStr
+  Box<CoreType> typ;        // PTyp: `[%id : t]`
+  Box<Signature> sig;       // PSig: `[%id : <sig items>]`
+  Box<Pattern> pat;         // PPat: `[%id ? p]`
+  Box<Expression> guard;    // PPat guard: `[%id ? p when e]`
+  bool is_sig = false;      // distinguishes an empty PSig from an empty PStr
+};
 // An attribute payload is usually a structure (PStr).  `[@name : t]` is a PTyp
 // payload and `[@name ? p [when g]]` is a PPat payload (typ/pat non-null then).
 struct Attribute {
@@ -114,7 +127,7 @@ struct Ptyp_alias { CoreTypeBox type; std::string name; };  // (t as 'a)
 struct Ptyp_poly { std::vector<std::string> vars; CoreTypeBox type; };  // 'a 'b. t
 struct Ptyp_open { LongidentLoc mod_; CoreTypeBox type; };  // M.(t)
 struct Ptyp_functor { ArgLabel label; StringLoc name; Ptyp_package pkg; CoreTypeBox body; };  // (module M : T) -> t
-struct Ptyp_extension { std::string name; Structure payload; };  // [%id]
+struct Ptyp_extension { std::string name; ExtPayload payload; };  // [%id]
 struct CoreType {
   std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr,
                Ptyp_variant, Ptyp_object, Ptyp_package, Ptyp_class, Ptyp_alias,
@@ -148,7 +161,7 @@ struct Ppat_exception { PatBox p; };
 struct Ppat_array { std::vector<PatBox> elems; };
 struct Ppat_type { LongidentLoc id; };                  // #tconst
 struct Ppat_unpack { StrOptLoc name; std::optional<Ptyp_package> pkg; };  // (module M [: S])
-struct Ppat_extension { std::string name; Structure payload; };  // [%id]
+struct Ppat_extension { std::string name; ExtPayload payload; };  // [%id]
 struct Ppat_open { LongidentLoc mod_; PatBox p; };      // M.(P)
 struct Ppat_effect { PatBox eff; PatBox cont; };        // effect P, k
 struct Pattern {
@@ -207,7 +220,7 @@ struct Pexp_setinstvar { StringLoc name; ExprBox value; };  // x <- e  (in objec
 struct Pexp_coerce { ExprBox e; std::optional<CoreTypeBox> from; CoreTypeBox to_; };  // (e :> t)
 struct Pexp_send { ExprBox obj; StringLoc meth; };  // e # m
 struct Pexp_pack { Box<ModuleExpr> me; std::optional<Ptyp_package> pkg; };  // (module ME [: S])
-struct Pexp_extension { std::string name; Structure payload; };  // [%id …]
+struct Pexp_extension { std::string name; ExtPayload payload; };  // [%id …]
 struct BindingOp { StringLoc op; Pattern pat; ExprBox exp; Location loc; };
 struct Pexp_letop { BindingOp let_; std::vector<BindingOp> ands; ExprBox body; };  // let* … in …
 struct Pexp_object { Box<ClassStructure> cs; };   // object … end
@@ -344,9 +357,10 @@ using WithConstraint = std::variant<Pwith_type, Pwith_typesubst, Pwith_module, P
 struct Pmty_with { ModuleTypeBox mt; std::vector<WithConstraint> constraints; };
 struct Pmty_typeof { ModuleExprBox me; };
 struct Pmty_alias { LongidentLoc id; };  // module B = A  (in a signature)
+struct Pmty_extension { std::string name; ExtPayload payload; };  // [%id]
 struct ModuleType {
   std::variant<Pmty_ident, Pmty_signature, Pmty_functor, Pmty_with, Pmty_typeof,
-               Pmty_alias> desc;
+               Pmty_alias, Pmty_extension> desc;
   Location loc;
   Attributes attrs;
 };
@@ -367,7 +381,7 @@ struct Psig_include { ModuleType mt; Attributes attrs; };
 struct Psig_class { std::vector<ClassTypeDeclaration> decls; };  // class c : ct  (class_description)
 struct Psig_class_type { std::vector<ClassTypeDeclaration> decls; };
 struct Psig_attribute { std::string name; Structure payload; };
-struct Psig_extension { std::string name; Structure payload; };
+struct Psig_extension { std::string name; ExtPayload payload; };
 struct SignatureItem {
   std::variant<Psig_value, Psig_primitive, Psig_type, Psig_typesubst, Psig_typext,
                Psig_exception, Psig_module, Psig_recmodule, Psig_modtype, Psig_modtypesubst,
@@ -386,7 +400,7 @@ struct Pmod_constraint { Box<ModuleExpr> me; ModuleTypeBox mt; };
 struct Pmod_apply { Box<ModuleExpr> f; Box<ModuleExpr> arg; };  // F(X)
 struct Pmod_apply_unit { Box<ModuleExpr> f; };                  // F()
 struct Pmod_unpack { ExprBox e; };                             // (val e [: pkg])
-struct Pmod_extension { std::string name; Structure payload; };  // [%id …]
+struct Pmod_extension { std::string name; ExtPayload payload; };  // [%id …]
 struct ModuleExpr {
   std::variant<Pmod_ident, Pmod_structure, Pmod_functor, Pmod_constraint, Pmod_apply,
                Pmod_apply_unit, Pmod_unpack, Pmod_extension>
@@ -479,7 +493,7 @@ struct Pstr_primitive { PrimitiveDescription prim; };
 struct Pstr_module { ModuleBinding binding; };
 struct Pstr_recmodule { std::vector<ModuleBinding> bindings; };  // module rec A = … and B = …
 struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
-struct Pstr_extension { std::string name; Structure payload; };  // [%%ext …]
+struct Pstr_extension { std::string name; ExtPayload payload; };  // [%%ext …]
 struct Pstr_include { ModuleExpr expr; Attributes attrs; };
 struct Pstr_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S = mty
 struct Pstr_class { std::vector<ClassDeclaration> decls; };

@@ -95,7 +95,7 @@ struct Printer {
       if (a.typ) core_type(i + 2, *a.typ);             // PTyp: `[@name : t]`
       else if (a.pat) {                                // PPat: `[@name ? p [when g]]`
         pattern(i + 2, *a.pat);
-        if (a.guard) { line(i + 2, "<when>"); expression(i + 2, *a.guard); }
+        if (a.guard) { line(i + 2, "<when>"); expression(i + 3, *a.guard); }
       } else structure_list(i + 2, a.payload);         // PStr
     }
   }
@@ -137,7 +137,7 @@ struct Printer {
       core_type(j, *v->type);
     } else if (auto* v = std::get_if<Ptyp_extension>(&t.desc)) {
       line(j, "Ptyp_extension \"" + v->name + "\"");
-      structure_list(j, v->payload);
+      ext_payload(j, v->payload);
     } else if (auto* v = std::get_if<Ptyp_open>(&t.desc)) {
       line(j, "Ptyp_open \"" + lid_loc(v->mod_) + "\"");
       core_type(j, *v->type);
@@ -314,7 +314,7 @@ struct Printer {
       }
     } else if (auto* v = std::get_if<Ppat_extension>(&p.desc)) {
       line(j, "Ppat_extension \"" + v->name + "\"");
-      structure_list(j, v->payload);
+      ext_payload(j, v->payload);
     } else if (auto* v = std::get_if<Ppat_open>(&p.desc)) {
       line(j, "Ppat_open \"" + lid_loc(v->mod_) + "\"");
       pattern(j, *v->p);
@@ -486,7 +486,7 @@ struct Printer {
       }
     } else if (auto* v = std::get_if<Pexp_extension>(&e.desc)) {
       line(j, "Pexp_extension \"" + v->name + "\"");
-      structure_list(j, v->payload);
+      ext_payload(j, v->payload);
     } else if (auto* v = std::get_if<Pexp_letop>(&e.desc)) {
       line(j, "Pexp_letop");
       binding_op(j, v->let_);
@@ -702,7 +702,7 @@ struct Printer {
     } else {
       auto& ve = std::get<Psig_extension>(s.desc);
       line(j, "Psig_extension \"" + ve.name + "\"");
-      structure_list(j, ve.payload);
+      ext_payload(j, ve.payload);
     }
   }
   void module_type(int i, const ModuleType& m) {
@@ -713,6 +713,9 @@ struct Printer {
       line(j, "Pmty_ident " + lid_loc(v->id));
     } else if (auto* v = std::get_if<Pmty_alias>(&m.desc)) {
       line(j, "Pmty_alias " + lid_loc(v->id));
+    } else if (auto* v = std::get_if<Pmty_extension>(&m.desc)) {
+      line(j, "Pmod_extension \"" + v->name + "\"");  // printast.ml prints Pmty_extension as Pmod_extension
+      ext_payload(j, v->payload);
     } else if (auto* v = std::get_if<Pmty_signature>(&m.desc)) {
       line(j, "Pmty_signature");
       if (v->items.empty()) line(j, "[]");
@@ -786,7 +789,7 @@ struct Printer {
       module_expr(j, *a->f);
     } else if (auto* e = std::get_if<Pmod_extension>(&m.desc)) {
       line(j, "Pmod_extension \"" + e->name + "\"");
-      structure_list(j, e->payload);
+      ext_payload(j, e->payload);
     } else {
       auto& u = std::get<Pmod_unpack>(m.desc);
       line(j, "Pmod_unpack");
@@ -1096,7 +1099,7 @@ struct Printer {
       structure_list(j, v->payload);
     } else if (auto* v = std::get_if<Pstr_extension>(&s.desc)) {
       line(j, "Pstr_extension \"" + v->name + "\"");
-      structure_list(j, v->payload);  // extension payload at i
+      ext_payload(j, v->payload);  // extension payload at i
     } else if (auto* v = std::get_if<Pstr_include>(&s.desc)) {
       os << ind(j) << "Pstr_include";  // printast prints this with no trailing newline
       attributes(j, v->attrs);  // pincl_attributes
@@ -1122,6 +1125,21 @@ struct Printer {
     line(i, "[");
     for (auto& it : s) structure_item(i + 1, it);
     line(i, "]");
+  }
+  void signature_list(int i, const Signature& s) {
+    if (s.empty()) { line(i, "[]"); return; }
+    line(i, "[");
+    for (auto& it : s) signature_item(i + 1, it);
+    line(i, "]");
+  }
+  // An extension/attribute payload (PStr / PTyp / PSig / PPat).
+  void ext_payload(int i, const ExtPayload& p) {
+    if (p.typ) core_type(i, *p.typ);
+    else if (p.pat) {
+      pattern(i, *p.pat);
+      if (p.guard) { line(i, "<when>"); expression(i + 1, *p.guard); }
+    } else if (p.is_sig) signature_list(i, *p.sig);
+    else structure_list(i, p.str);
   }
   void structure(const Structure& s) { structure_list(0, s); }
 };
