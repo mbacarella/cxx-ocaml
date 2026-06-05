@@ -3263,12 +3263,16 @@ class Parser {
     }
     if (t.kind == Kind::SIG) {
       advance();
+      Attributes attrs = take_attrs();  // `sig[@attr] … end` -> pmty_attributes
       Signature items = parse_signature_until(Kind::END);
       Token c = cur(); expect(Kind::END, "end");
-      return ModuleType{Pmty_signature{std::move(items)}, span(position(t.start), position(c.end)), {}};
+      ModuleType m{Pmty_signature{std::move(items)}, span(position(t.start), position(c.end)), {}};
+      m.attrs = std::move(attrs);
+      return m;
     }
     if (t.kind == Kind::FUNCTOR) {
       advance();
+      Attributes attrs = take_attrs();  // `functor[@attr] …` -> on the outermost Pmty_functor
       // `functor (A)(B) -> R` folds to nested Pmty_functor; each node's loc starts
       // at *its* arg's `(` (mk_functor_typ uses the arg startpos, not `functor`).
       std::vector<std::pair<Position, FunctorParam>> args;
@@ -3282,14 +3286,18 @@ class Parser {
         Location l = span(args[i].first, mty.loc.end);
         mty = ModuleType{Pmty_functor{std::move(args[i].second), box(std::move(mty))}, l, {}};
       }
+      mty.attrs = std::move(attrs);
       return mty;
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE && peek(2).kind == Kind::OF) {
       advance(); advance(); advance();  // module type of
+      Attributes attrs = take_attrs();  // `module type of[@attr] M` -> pmty_attributes
       ModuleExpr me = parse_module_expr();
       // $sloc spans the module_expr *and* its trailing attributes
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      return ModuleType{Pmty_typeof{box(std::move(me))}, l, {}};
+      ModuleType m{Pmty_typeof{box(std::move(me))}, l, {}};
+      m.attrs = std::move(attrs);
+      return m;
     }
     if (t.kind == Kind::LPAREN) {  // ( module_type )  -> inner unchanged (no paren reloc)
       advance();
