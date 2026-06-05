@@ -188,6 +188,7 @@ class Parser {
   Position last_seq_end_{};  // end of the most recent parse_expr, incl. a trailing `;`
   bool last_type_subst_ = false;  // most recent type decl used `:=` (substitution)
   std::optional<std::string> let_ext_;  // `let%ext …` extension name on the last let
+  bool letext_pun_ = false;  // inside a `let%ext` binding list, `let%ext x` puns to `x = x`
   bool suppress_type_trailing_attr_ = false;  // record-field type: `[@attr]` is the field's
 
   const Token& cur() const { return tokens_[idx_]; }
@@ -1172,10 +1173,12 @@ class Parser {
           return E({Pexp_struct_item{box(std::move(si)), std::move(body)}, l});
         }
         auto [rf, binds] = parse_value_bindings();
+        std::optional<std::string> ext = std::move(let_ext_);  // `let%ext … in e`
+        let_ext_ = std::nullopt;
         expect(Kind::IN, "in");
         ExprBox body = parse_expr();
         Location l = span(position(t.start), last_seq_end_);  // seq_expr incl. trailing `;`
-        return E({Pexp_let{rf, std::move(binds), std::move(body)}, l});
+        return wrap_ext(E({Pexp_let{rf, std::move(binds), std::move(body)}, l}), std::move(ext));
       }
       case Kind::IF: {
         advance();
@@ -1304,21 +1307,29 @@ class Parser {
         return wrap_ext(E({Pexp_for{std::move(var), std::move(lo), std::move(hi), dir, std::move(body)},
                   span(position(t.start), position(c.end))}), std::move(ext), std::move(attrs));
       }
-      case Kind::LETOP: {  // let* p [: t] = e0 [and* …] in e
+      case Kind::LETOP: {  // let* p [: t] [= e0] [and* …] in e
         Token op = cur(); advance();
         Pattern pat = parse_letop_binding_pat();
         Position letPatStart = pat.loc.start;
         StringLoc letop_name{op.text, tokloc(op)};
-        expect(Kind::EQUAL, "=");
-        ExprBox e0 = parse_expr();
+        // `let* x [and* y]` (no `=`) is punning: the value is the ident `x`.
+        auto pun_value = [&](const Pattern& p) -> ExprBox {
+          auto* v = std::get_if<Ppat_var>(&p.desc);
+          if (!v) throw ParseError("expected =", cur().start);
+          return E({Pexp_ident{lid0(v->name.txt, p.loc)}, p.loc});
+        };
+        ExprBox e0;
+        if (cur().kind == Kind::EQUAL) { advance(); e0 = parse_expr(); }
+        else e0 = pun_value(pat);
         // each binding_op's pbop_loc follows menhir's $sloc: the let_ spans the whole
         // letop (op..body), each and_ spans the let-pattern start..its own expr end.
         std::vector<BindingOp> ands;
         while (cur().kind == Kind::ANDOP) {
           Token aop = cur(); advance();
           Pattern ap = parse_letop_binding_pat();
-          expect(Kind::EQUAL, "=");
-          ExprBox ae = parse_expr();
+          ExprBox ae;
+          if (cur().kind == Kind::EQUAL) { advance(); ae = parse_expr(); }
+          else ae = pun_value(ap);
           Position aexpEnd = ae->loc.end;
           ands.push_back(BindingOp{StringLoc{aop.text, tokloc(aop)}, std::move(ap), std::move(ae),
                                    span(letPatStart, aexpEnd)});
@@ -2698,8 +2709,15 @@ class Parser {
           pconstr = Pvc_constraint{{}, std::move(ty)};
         }
       }
-      expect(Kind::EQUAL, "=");
-      ExprBox body = parse_expr();
+      ExprBox body;
+      if (cur().kind != Kind::EQUAL && letext_pun_ && !pconstr) {  // `let%ext x` -> x = x
+        auto* v = std::get_if<Ppat_var>(&pat.desc);
+        if (!v) throw ParseError("expected =", cur().start);
+        body = E({Pexp_ident{lid0(v->name.txt, pat.loc)}, pat.loc});
+      } else {
+        expect(Kind::EQUAL, "=");
+        body = parse_expr();
+      }
       return ValueBinding{std::move(pat), std::move(body), std::move(pconstr)};
     }
     StringLoc name;
@@ -2809,6 +2827,8 @@ class Parser {
     expect(Kind::LET, "let");
     let_ext_ = std::nullopt;
     if (cur().kind == Kind::PERCENT) { advance(); let_ext_ = parse_attr_name(); }  // let%ext
+    bool saved_pun = letext_pun_;
+    letext_pun_ = let_ext_.has_value();  // `let%ext` bindings may pun (`let%ext x` = `x = x`)
     Attributes letattrs;  // `let[@attr] …`  -> attached to the first binding
     while (cur().kind == Kind::LBRACKETAT) { advance(); letattrs.push_back(parse_attribute_body()); }
     RecFlag rf = RecFlag::Nonrecursive;
@@ -2830,6 +2850,7 @@ class Parser {
       }
       binds.push_back(std::move(vb));
     }
+    letext_pun_ = saved_pun;
     return {rf, std::move(binds)};
   }
 
