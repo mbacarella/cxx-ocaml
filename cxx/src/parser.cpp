@@ -546,6 +546,7 @@ class Parser {
         }
         if (cur().kind == Kind::MODULE) {  // (module ME [: S [with type …]])  first-class module
           advance();
+          std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // (module%ext[@attr] …)
           ModuleExpr me = parse_module_expr();
           std::optional<Ptyp_package> pkg;
           if (cur().kind == Kind::COLON) {
@@ -553,8 +554,8 @@ class Parser {
             pkg = parse_package_type_maybe_paren();  // path [with type …], possibly parenthesised
           }
           Token c = cur(); expect(Kind::RPAREN, ")");
-          return E({Pexp_pack{box(std::move(me)), std::move(pkg)},
-                    span(position(t.start), position(c.end))});
+          return wrap_ext(E({Pexp_pack{box(std::move(me)), std::move(pkg)},
+                    span(position(t.start), position(c.end))}), std::move(ext), std::move(attrs));
         }
         {  // (+), (>>=), (!), (.%[]), …  -> Pexp_ident spanning the parens
           size_t save = idx_;
@@ -1135,11 +1136,12 @@ class Parser {
   ExprBox wrap_ext(ExprBox e, std::optional<std::string> ext, Attributes attrs = {}) {
     for (auto& a : attrs) e->attrs.push_back(std::move(a));
     if (!ext) return e;
+    Location outer{e->loc.start, e->loc.end, false};  // the Pexp_extension is not ghost
     Location gl{e->loc.start, e->loc.end, true};
     e->loc.ghost = true;  // the wrapped keyword-expr becomes a ghost
     ExtPayload ep;
     ep.str.push_back(StructureItem{Pstr_eval{std::move(e)}, gl});
-    return E({Pexp_extension{std::move(*ext), std::move(ep)}, gl});
+    return E({Pexp_extension{std::move(*ext), std::move(ep)}, outer});
   }
   ExprBox parse_expr_no_seq() {
     Token t = cur();
@@ -1627,6 +1629,7 @@ class Parser {
     }
     if (t.kind == Kind::LPAREN && peek(1).kind == Kind::MODULE) {  // (module S [with type …])
       advance(); advance();  // ( module
+      std::optional<std::string> pext = take_ext(); Attributes pattrs = take_attrs();  // (module%ext[@attr] …)
       LongidentLoc path = parse_type_path();  // package path may be F(X).S
       std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
       if (cur().kind == Kind::WITH) {
@@ -1641,8 +1644,16 @@ class Parser {
         }
       }
       Token c = cur(); expect(Kind::RPAREN, ")");
-      return box(CoreType{Ptyp_package{std::move(path), std::move(cons)},
+      CoreTypeBox pkg = box(CoreType{Ptyp_package{std::move(path), std::move(cons)},
                           span(position(t.start), position(c.end))});
+      for (auto& a : pattrs) pkg->attrs.push_back(std::move(a));
+      if (pext) {  // (module%ext …) -> Ptyp_extension(ext, PTyp(ghost package))
+        Location outer{pkg->loc.start, pkg->loc.end, false};
+        pkg->loc.ghost = true;
+        ExtPayload ep; ep.typ = std::move(pkg);
+        return box(CoreType{Ptyp_extension{std::move(*pext), std::move(ep)}, outer});
+      }
+      return pkg;
     }
     if (t.kind == Kind::LPAREN) {
       advance();
