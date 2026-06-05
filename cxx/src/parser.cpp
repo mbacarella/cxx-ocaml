@@ -2708,6 +2708,9 @@ class Parser {
         } else {
           pconstr = Pvc_constraint{{}, std::move(ty)};
         }
+      } else if (cur().kind == Kind::COLONGREATER) {  // `let <pat> :> t = e` (coercion, no `from`)
+        advance();
+        pconstr = Pvc_coercion{std::nullopt, parse_core_type()};
       }
       ExprBox body;
       if (cur().kind != Kind::EQUAL && letext_pun_ && !pconstr) {  // `let%ext x` -> x = x
