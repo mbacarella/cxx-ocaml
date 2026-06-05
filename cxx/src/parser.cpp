@@ -1115,6 +1115,21 @@ class Parser {
     return e;
   }
 
+  // `KEYWORD%ext …` -> Pexp_extension(ext, [ghost Pstr_eval(ghost keyword-expr)])
+  // (mkexp_attrs/wrap_exp_attrs).  Consumed right after the keyword token.
+  std::optional<std::string> take_ext() {
+    if (cur().kind != Kind::PERCENT) return std::nullopt;
+    advance();
+    return parse_attr_name();
+  }
+  ExprBox wrap_ext(ExprBox e, std::optional<std::string> ext) {
+    if (!ext) return e;
+    Location gl{e->loc.start, e->loc.end, true};
+    e->loc.ghost = true;  // the wrapped keyword-expr becomes a ghost
+    ExtPayload ep;
+    ep.str.push_back(StructureItem{Pstr_eval{std::move(e)}, gl});
+    return E({Pexp_extension{std::move(*ext), std::move(ep)}, gl});
+  }
   ExprBox parse_expr_no_seq() {
     Token t = cur();
     switch (t.kind) {
@@ -1137,6 +1152,7 @@ class Parser {
       }
       case Kind::IF: {
         advance();
+        std::optional<std::string> ext = take_ext();  // `if%ext …`
         ExprBox c = parse_expr();
         expect(Kind::THEN, "then");
         ExprBox th = parse_expr_no_seq();
@@ -1144,26 +1160,29 @@ class Parser {
         if (cur().kind == Kind::ELSE) { advance(); el = parse_expr_no_seq(); }
         Position end = el ? (*el)->loc.end : th->loc.end;
         Location l = span(position(t.start), end);
-        return E({Pexp_ifthenelse{std::move(c), std::move(th), std::move(el)}, l});
+        return wrap_ext(E({Pexp_ifthenelse{std::move(c), std::move(th), std::move(el)}, l}), std::move(ext));
       }
       case Kind::MATCH: {
         advance();
+        std::optional<std::string> ext = take_ext();  // `match%ext …`
         ExprBox e0 = parse_expr();
         expect(Kind::WITH, "with");
         std::vector<Case> cs = parse_cases();
         Location l = span(position(t.start), last_arm_end(cs));
-        return E({Pexp_match{std::move(e0), std::move(cs)}, l});
+        return wrap_ext(E({Pexp_match{std::move(e0), std::move(cs)}, l}), std::move(ext));
       }
       case Kind::TRY: {
         advance();
+        std::optional<std::string> ext = take_ext();  // `try%ext …`
         ExprBox e0 = parse_expr();
         expect(Kind::WITH, "with");
         std::vector<Case> cs = parse_cases();
         Location l = span(position(t.start), last_arm_end(cs));
-        return E({Pexp_try{std::move(e0), std::move(cs)}, l});
+        return wrap_ext(E({Pexp_try{std::move(e0), std::move(cs)}, l}), std::move(ext));
       }
       case Kind::FUNCTION: {
         advance();
+        std::optional<std::string> ext = take_ext();  // `function%ext …`
         Attributes fattrs;  // `function[@attr] …`
         while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
         std::vector<Case> cs = parse_cases();
@@ -1172,15 +1191,16 @@ class Parser {
         auto fb = box(FunctionBody{Pfunction_cases{std::move(cs), casesloc}});
         ExprBox r = E({Pexp_function{{}, std::nullopt, std::move(fb)}, span(position(t.start), last)});
         r->attrs = std::move(fattrs);
-        return r;
+        return wrap_ext(std::move(r), std::move(ext));
       }
       case Kind::FUN: {
         advance();
+        std::optional<std::string> ext = take_ext();  // `fun%ext …`
         Attributes funattrs;  // `fun[@attr] …`  -> on the resulting expression
         while (cur().kind == Kind::LBRACKETAT) { advance(); funattrs.push_back(parse_attribute_body()); }
         auto withattrs = [&](ExprBox e) {
           for (auto& a : funattrs) e->attrs.push_back(std::move(a));
-          return e;
+          return wrap_ext(std::move(e), ext);
         };
         std::vector<FunctionParam> params;
         while (cur().kind != Kind::MINUSGREATER && cur().kind != Kind::COLON)
@@ -1225,16 +1245,18 @@ class Parser {
       }
       case Kind::WHILE: {
         advance();
+        std::optional<std::string> ext = take_ext();  // `while%ext …`
         ExprBox cond = parse_expr();
         expect(Kind::DO, "do");
         ExprBox body = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before done
         Token c = cur(); expect(Kind::DONE, "done");
-        return E({Pexp_while{std::move(cond), std::move(body)},
-                  span(position(t.start), position(c.end))});
+        return wrap_ext(E({Pexp_while{std::move(cond), std::move(body)},
+                  span(position(t.start), position(c.end))}), std::move(ext));
       }
       case Kind::FOR: {
         advance();
+        std::optional<std::string> ext = take_ext();  // `for%ext …`
         Pattern var = parse_pattern();  // grammar: `for pattern = …` (not just an ident)
         expect(Kind::EQUAL, "=");
         ExprBox lo = parse_expr();
@@ -1247,8 +1269,8 @@ class Parser {
         ExprBox body = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before done
         Token c = cur(); expect(Kind::DONE, "done");
-        return E({Pexp_for{std::move(var), std::move(lo), std::move(hi), dir, std::move(body)},
-                  span(position(t.start), position(c.end))});
+        return wrap_ext(E({Pexp_for{std::move(var), std::move(lo), std::move(hi), dir, std::move(body)},
+                  span(position(t.start), position(c.end))}), std::move(ext));
       }
       case Kind::LETOP: {  // let* p [: t] = e0 [and* …] in e
         Token op = cur(); advance();
