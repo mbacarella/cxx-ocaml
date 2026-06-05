@@ -3724,6 +3724,12 @@ class Parser {
       return ClassField{Pcf_attribute{std::move(name), std::move(payload)},
                         span(fs, position(c.end)), {}};
     }
+    if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%%id]  -> Pcf_extension
+      advance();
+      auto [name, payload] = parse_ext_body();
+      return ClassField{Pcf_extension{std::move(name), std::move(payload)},
+                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+    }
     if (t.kind == Kind::INHERIT) {
       advance();
       OverrideFlag ovr = OverrideFlag::Fresh;
@@ -3904,7 +3910,10 @@ class Parser {
     Token t = cur();
     if (t.kind == Kind::FUN) {
       advance();
-      return parse_class_fun_def();  // wrap_class_attrs keeps body loc (spans from 1st param)
+      Attributes attrs = take_attrs();  // `fun[@attr] …` -> on the Pcl_fun
+      ClassExpr ce = parse_class_fun_def();  // wrap_class_attrs keeps body loc (from 1st param)
+      for (auto& a : attrs) ce.attrs.push_back(std::move(a));
+      return ce;
     }
     if (t.kind == Kind::LET && peek(1).kind == Kind::OPEN) {  // let open M in ce
       advance(); advance();  // let open
@@ -4092,6 +4101,12 @@ class Parser {
       Token c = cur(); expect(Kind::RBRACKET, "]");
       return ClassTypeField{Pctf_attribute{std::move(name), std::move(payload)},
                             span(fs, position(c.end)), {}};
+    }
+    if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%%id]  -> Pctf_extension
+      advance();
+      auto [name, payload] = parse_ext_body();
+      return ClassTypeField{Pctf_extension{std::move(name), std::move(payload)},
+                            span(fs, position(tokens_[idx_ - 1].end)), {}};
     }
     if (t.kind == Kind::INHERIT) {
       advance();
