@@ -679,6 +679,13 @@ class Parser {
         std::optional<std::string> ext = take_ext();  // `begin%ext … end`
         Attributes battrs;  // `begin[@attr] … end` -> on the inner expression
         while (cur().kind == Kind::LBRACKETAT) { advance(); battrs.push_back(parse_attribute_body()); }
+        if (cur().kind == Kind::END) {  // `begin end` -> unit, spanning begin..end
+          Token c = cur(); advance();
+          Location l = span(position(t.start), position(c.end));
+          ExprBox u = mk_construct(lid0("()", l), std::nullopt, l);
+          for (auto& a : battrs) u->attrs.push_back(std::move(a));
+          return wrap_ext(std::move(u), std::move(ext));
+        }
         ExprBox inner = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before end
         Token c = cur(); expect(Kind::END, "end");
@@ -1554,6 +1561,10 @@ class Parser {
     bool opt = false, must_arrow = false;
     std::optional<std::string> firstLabel;
     if (cur().kind == Kind::OPTLABEL) { firstLabel = cur().text; opt = true; must_arrow = true; advance(); }
+    else if (cur().kind == Kind::QUESTION && peek(1).kind == Kind::LIDENT &&
+             peek(2).kind == Kind::COLON) {  // spaced `? label : t -> …`
+      advance(); firstLabel = cur().text; advance(); advance(); opt = true; must_arrow = true;
+    }
     else if (cur().kind == Kind::LABEL) { firstLabel = cur().text; must_arrow = true; advance(); }
     else if (cur().kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
       firstLabel = cur().text; advance(); advance();  // x :   (tentative tuple label)
@@ -1847,15 +1858,28 @@ class Parser {
     }
     return parse_pat_alias();  // `exception P` is handled as an or-pattern operand
   }
+  // `as` alias name: a value identifier or a parenthesised operator (`as (+)`).
+  StringLoc parse_alias_name() {
+    Token t = cur();
+    if (t.kind == Kind::LIDENT) { advance(); return StringLoc{t.text, tokloc(t)}; }
+    if (t.kind == Kind::LPAREN) {
+      size_t save = idx_;
+      advance();
+      if (auto op = parse_operator_name_tokens(); op && cur().kind == Kind::RPAREN) {
+        Token c = cur(); advance();
+        return StringLoc{*op, span(position(t.start), position(c.end))};
+      }
+      idx_ = save;
+    }
+    throw ParseError("expected name after 'as'", t.start);
+  }
   Pattern parse_pat_alias() {
     Pattern p = parse_pat_or();
     while (cur().kind == Kind::AS) {
       advance();
-      Token nm = cur();
-      if (nm.kind != Kind::LIDENT) throw ParseError("expected name after 'as'", nm.start);
-      advance();
-      Location l = span(p.loc.start, position(nm.end));
-      p = Pattern{Ppat_alias{box(std::move(p)), StringLoc{nm.text, tokloc(nm)}}, l};
+      StringLoc nm = parse_alias_name();
+      Location l = span(p.loc.start, nm.loc.end);
+      p = Pattern{Ppat_alias{box(std::move(p)), nm}, l};
     }
     return p;
   }
@@ -2012,7 +2036,9 @@ class Parser {
       Token t = cur(); advance();
       Token tag = cur(); advance();
       if (is_simple_pattern_start(cur().kind)) {
-        Pattern arg = parse_simple_pattern();
+        // `\`Tag p` arg is a full `pattern` at prec_constr_appl, so `\`Tag Some x`
+        // is `\`Tag (Some x)` (mirrors the constructor-pattern arg below).
+        Pattern arg = parse_pat_app();
         Location l = span(position(t.start), arg.loc.end);
         return Pattern{Ppat_variant{tag.text, box(std::move(arg))}, l};
       }
@@ -3852,6 +3878,27 @@ class Parser {
     return ModuleBinding{std::move(name), std::move(me), std::move(mbattrs)};
   }
 
+  // `(val e [: pkg])` first-class module unpack; the `(` (at `lparenStart`) and
+  // the `val` keyword are already consumed-pending: cur() is `val`. Consumes the
+  // closing `)` and returns the Pmod_unpack spanning the parens.
+  ModuleExpr parse_unpack_after_lparen(Position lparenStart) {
+    advance();  // val
+    Attributes vattrs = take_attrs();  // `(val[@attr] e)` -> on the Pmod_unpack
+    ExprBox e = parse_expr();
+    if (cur().kind == Kind::COLON) {
+      advance();
+      Position pkgStart = position(cur().start);
+      Ptyp_package body = parse_package_type_body();  // path [with type t = u and …]
+      Location pkgloc = span(pkgStart, position(tokens_[idx_ - 1].end));
+      auto pkg = box(CoreType{std::move(body), pkgloc});
+      Location cl = span(e->loc.start, pkg->loc.end);
+      e = E({Pexp_constraint{std::move(e), std::move(pkg)}, cl});
+    }
+    Token c = cur(); expect(Kind::RPAREN, ")");
+    ModuleExpr m{Pmod_unpack{std::move(e)}, span(lparenStart, position(c.end))};
+    for (auto& a : vattrs) m.attrs.push_back(std::move(a));
+    return m;
+  }
   ModuleExpr parse_module_expr() {
     Position symstart = position(cur().start);
     ModuleExpr me = parse_module_expr_head();
@@ -3859,10 +3906,16 @@ class Parser {
     // to `X` — an attributed module_expr can still be a functor.
     for (;;) {
       if (cur().kind == Kind::LPAREN) {  // F(X) / F()  functor application
-        advance();
+        Token lp = cur(); advance();
         if (cur().kind == Kind::RPAREN) {  // F ()  generative application
           Token c = cur(); advance();
           me = ModuleExpr{Pmod_apply_unit{box(std::move(me))}, span(symstart, position(c.end))};
+          continue;
+        }
+        if (cur().kind == Kind::VAL) {  // F(val e [: pkg])  unpack argument
+          ModuleExpr arg = parse_unpack_after_lparen(position(lp.start));
+          Position ae = arg.loc.end;
+          me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))}, span(symstart, ae)};
           continue;
         }
         ModuleExpr arg = parse_module_expr();
@@ -3917,24 +3970,8 @@ class Parser {
     }
     if (t.kind == Kind::LPAREN) {
       advance();
-      if (cur().kind == Kind::VAL) {  // (val e [: pkg])  first-class module unpack
-        advance();
-        Attributes vattrs = take_attrs();  // `(val[@attr] e)` -> on the Pmod_unpack
-        ExprBox e = parse_expr();
-        if (cur().kind == Kind::COLON) {
-          advance();
-          Position pkgStart = position(cur().start);
-          Ptyp_package body = parse_package_type_body();  // path [with type t = u and …]
-          Location pkgloc = span(pkgStart, position(tokens_[idx_ - 1].end));
-          auto pkg = box(CoreType{std::move(body), pkgloc});
-          Location cl = span(e->loc.start, pkg->loc.end);
-          e = E({Pexp_constraint{std::move(e), std::move(pkg)}, cl});
-        }
-        Token c = cur(); expect(Kind::RPAREN, ")");
-        ModuleExpr m{Pmod_unpack{std::move(e)}, span(position(t.start), position(c.end))};
-        for (auto& a : vattrs) m.attrs.push_back(std::move(a));
-        return m;
-      }
+      if (cur().kind == Kind::VAL)  // (val e [: pkg])  first-class module unpack
+        return parse_unpack_after_lparen(position(t.start));
       ModuleExpr me = parse_module_expr();
       if (cur().kind == Kind::COLON) {  // (me : mt)
         advance();
@@ -4332,9 +4369,16 @@ class Parser {
       return ClassType{Pcty_extension{std::move(name), std::move(payload)},
                        span(position(t.start), position(tokens_[idx_ - 1].end)), {}};
     }
-    if (t.kind == Kind::LABEL || t.kind == Kind::OPTLABEL) {  // labelled arrow domain
-      ArgLabel label = t.kind == Kind::LABEL ? ArgLabel{Labelled{t.text}} : ArgLabel{Optional{t.text}};
-      advance();
+    if (t.kind == Kind::LABEL || t.kind == Kind::OPTLABEL ||
+        (t.kind == Kind::QUESTION && peek(1).kind == Kind::LIDENT &&
+         peek(2).kind == Kind::COLON)) {  // labelled arrow domain (incl. spaced `? label :`)
+      ArgLabel label;
+      if (t.kind == Kind::QUESTION) {  // spaced `? label : t -> ct`
+        advance(); label = ArgLabel{Optional{cur().text}}; advance(); advance();
+      } else {
+        label = t.kind == Kind::LABEL ? ArgLabel{Labelled{t.text}} : ArgLabel{Optional{t.text}};
+        advance();
+      }
       CoreTypeBox dom = parse_type_tuple();
       expect(Kind::MINUSGREATER, "->");
       ClassType cod = parse_class_type();
