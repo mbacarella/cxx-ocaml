@@ -2889,12 +2889,19 @@ class Parser {
     }
     if (t.kind == Kind::INCLUDE) {
       advance();
+      std::optional<std::string> inc_ext = take_ext();  // `include%ext …`
+      Attributes iattrs = take_attrs();  // `include%ext[@attr] …` -> pincl_attributes (prefix)
       ModuleExpr me = parse_module_expr();
-      Attributes iattrs;  // pincl_attributes: `include M [@@attr]`
       while (cur().kind == Kind::LBRACKETATAT) { advance(); iattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(iattrs, l.start.cnum, l.end.cnum);
-      return StructureItem{Pstr_include{std::move(me), std::move(iattrs)}, l};
+      StructureItem item{Pstr_include{std::move(me), std::move(iattrs)}, l};
+      if (inc_ext) {  // `include%ext …` wraps the (ghost) Pstr_include in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*inc_ext), std::move(ep)}, l};
+      }
+      return item;
     }
     if (t.kind == Kind::TYPE) {
       advance();
@@ -3024,17 +3031,24 @@ class Parser {
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // module type
+      std::optional<std::string> mt_ext = take_ext();  // `module type%ext …`
+      Attributes mtattrs = take_attrs();  // `module type%ext[@attr] …` -> pmtd_attributes (prefix)
       Token nm = cur();
       if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
         throw ParseError("expected module type name", nm.start);
       advance();
       std::optional<ModuleType> mty;
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
-      Attributes mtattrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); mtattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(mtattrs, l.start.cnum, l.end.cnum);
-      return StructureItem{Pstr_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty), std::move(mtattrs)}, l};
+      StructureItem item{Pstr_modtype{StringLoc{nm.text, tokloc(nm)}, std::move(mty), std::move(mtattrs)}, l};
+      if (mt_ext) {  // `module type%ext …` wraps the (ghost) Pstr_modtype in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*mt_ext), std::move(ep)}, l};
+      }
+      return item;
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::REC) {
       advance(); advance();  // module rec
