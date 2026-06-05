@@ -660,6 +660,7 @@ class Parser {
       }
       case Kind::BEGIN: {
         advance();
+        std::optional<std::string> ext = take_ext();  // `begin%ext … end`
         Attributes battrs;  // `begin[@attr] … end` -> on the inner expression
         while (cur().kind == Kind::LBRACKETAT) { advance(); battrs.push_back(parse_attribute_body()); }
         ExprBox inner = parse_expr();
@@ -667,7 +668,7 @@ class Parser {
         Token c = cur(); expect(Kind::END, "end");
         inner->loc = span(position(t.start), position(c.end));
         for (auto& a : battrs) inner->attrs.push_back(std::move(a));
-        return inner;
+        return wrap_ext(std::move(inner), std::move(ext));
       }
       case Kind::BANG: case Kind::PREFIXOP: {
         advance();
@@ -684,9 +685,11 @@ class Parser {
       }
       case Kind::OBJECT: {
         advance();
+        std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // object%ext[@attr]
         ClassStructure cs = parse_class_structure_body();
         Token c = cur(); expect(Kind::END, "end");
-        return E({Pexp_object{box(std::move(cs))}, span(position(t.start), position(c.end))});
+        return wrap_ext(E({Pexp_object{box(std::move(cs))}, span(position(t.start), position(c.end))}),
+                        std::move(ext), std::move(attrs));
       }
       case Kind::NEW: {
         advance();
@@ -783,15 +786,17 @@ class Parser {
   ExprBox parse_app() {
     if (cur().kind == Kind::ASSERT) {
       Token t = cur(); advance();
+      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // assert%ext[@attr]
       ExprBox arg = parse_atom_postfix();
       Position ae = arg->loc.end;
-      return E({Pexp_assert{std::move(arg)}, span(position(t.start), ae)});
+      return wrap_ext(E({Pexp_assert{std::move(arg)}, span(position(t.start), ae)}), std::move(ext), std::move(attrs));
     }
     if (cur().kind == Kind::LAZY) {
       Token t = cur(); advance();
+      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
       ExprBox arg = parse_atom_postfix();
       Position ae = arg->loc.end;
-      return E({Pexp_lazy{std::move(arg)}, span(position(t.start), ae)});
+      return wrap_ext(E({Pexp_lazy{std::move(arg)}, span(position(t.start), ae)}), std::move(ext), std::move(attrs));
     }
     // constructor application  Constr arg  -> Pexp_construct (not Pexp_apply)
     if (cur().kind == Kind::UIDENT) {
@@ -1774,9 +1779,11 @@ class Parser {
   Pattern parse_pat_or_operand() {
     if (cur().kind == Kind::EXCEPTION) {
       Token e = cur(); advance();
+      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // exception%ext[@attr]
       Pattern inner = parse_pat_tuple();
       Position ie = inner.loc.end;
-      return Pattern{Ppat_exception{box(std::move(inner))}, span(position(e.start), ie)};
+      return wrap_pat_ext(Pattern{Ppat_exception{box(std::move(inner))}, span(position(e.start), ie)},
+                          std::move(ext), std::move(attrs));
     }
     return parse_pat_tuple();
   }
@@ -1882,12 +1889,22 @@ class Parser {
     return Pattern{Ppat_construct{.id = lid0("::", tokloc(optok)), .arg = box(std::move(tuple))},
                    Location{ls, re, false}};
   }
+  // `KEYWORD%ext p` pattern -> Ppat_extension(ext, PPat(ghost p-with-attrs)).
+  Pattern wrap_pat_ext(Pattern p, std::optional<std::string> ext, Attributes attrs) {
+    for (auto& a : attrs) p.attrs.push_back(std::move(a));
+    if (!ext) return p;
+    Location outer{p.loc.start, p.loc.end, false};  // the Ppat_extension itself is not ghost
+    p.loc.ghost = true;                             // the wrapped pattern is ghost
+    ExtPayload ep; ep.pat = box(std::move(p));
+    return Pattern{Ppat_extension{std::move(*ext), std::move(ep)}, outer};
+  }
   Pattern parse_pat_app() {
     if (cur().kind == Kind::LAZY) {
       Token t = cur(); advance();
+      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
       Pattern arg = parse_simple_pattern();
       Location l = span(position(t.start), arg.loc.end);
-      return Pattern{Ppat_lazy{box(std::move(arg))}, l};
+      return wrap_pat_ext(Pattern{Ppat_lazy{box(std::move(arg))}, l}, std::move(ext), std::move(attrs));
     }
     if (cur().kind == Kind::BACKQUOTE) {
       Token t = cur(); advance();
