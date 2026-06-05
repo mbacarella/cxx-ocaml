@@ -3610,12 +3610,16 @@ class Parser {
     }
     if (t.kind == Kind::STRUCT) {
       advance();
+      Attributes sattrs = take_attrs();  // `struct[@attr] … end` -> on the Pmod_structure
       Structure items = parse_structure_until(Kind::END);
       Token c = cur(); expect(Kind::END, "end");
-      return ModuleExpr{Pmod_structure{std::move(items)}, span(position(t.start), position(c.end))};
+      ModuleExpr m{Pmod_structure{std::move(items)}, span(position(t.start), position(c.end))};
+      for (auto& a : sattrs) m.attrs.push_back(std::move(a));
+      return m;
     }
     if (t.kind == Kind::FUNCTOR) {
       advance();
+      Attributes attrs = take_attrs();  // `functor[@attr] …` -> on the outermost Pmod_functor
       std::vector<std::pair<Position, FunctorParam>> args;  // functor (A)(B) -> me
       while (cur().kind == Kind::LPAREN) {
         Position ps = position(cur().start);
@@ -3630,12 +3634,14 @@ class Parser {
         Location l = span(args[i].first, bodyEnd);
         me = ModuleExpr{Pmod_functor{std::move(args[i].second), box(std::move(me))}, l};
       }
+      for (auto& a : attrs) me.attrs.push_back(std::move(a));
       return me;
     }
     if (t.kind == Kind::LPAREN) {
       advance();
       if (cur().kind == Kind::VAL) {  // (val e [: pkg])  first-class module unpack
         advance();
+        Attributes vattrs = take_attrs();  // `(val[@attr] e)` -> on the Pmod_unpack
         ExprBox e = parse_expr();
         if (cur().kind == Kind::COLON) {
           advance();
@@ -3647,7 +3653,9 @@ class Parser {
           e = E({Pexp_constraint{std::move(e), std::move(pkg)}, cl});
         }
         Token c = cur(); expect(Kind::RPAREN, ")");
-        return ModuleExpr{Pmod_unpack{std::move(e)}, span(position(t.start), position(c.end))};
+        ModuleExpr m{Pmod_unpack{std::move(e)}, span(position(t.start), position(c.end))};
+        for (auto& a : vattrs) m.attrs.push_back(std::move(a));
+        return m;
       }
       ModuleExpr me = parse_module_expr();
       if (cur().kind == Kind::COLON) {  // (me : mt)
