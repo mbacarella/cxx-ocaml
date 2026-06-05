@@ -684,7 +684,11 @@ struct Printer {
       if (v->decls.empty()) line(j, "[]");
       else {
         line(j, "[");
-        for (auto& d : v->decls) { line(j + 1, str_opt_loc(d.name)); module_type(j + 2, *d.type); }
+        for (auto& d : v->decls) {
+          line(j + 1, str_opt_loc(d.name));
+          attributes(j + 1, d.attrs);  // pmd_attributes (module_declaration: attributes i)
+          module_type(j + 2, *d.type);
+        }
         line(j, "]");
       }
     } else if (auto* v = std::get_if<Psig_modtypesubst>(&s.desc)) {

@@ -1756,17 +1756,23 @@ class Parser {
         Token nm = cur();
         if (nm.kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
           advance(); advance();  // name :
+          bool save_sup = suppress_type_trailing_attr_;
+          suppress_type_trailing_attr_ = true;  // poly_type_no_attr: `[@attr]` belongs to the field
           CoreTypeBox ty = parse_possibly_poly_type();
-          size_t endType = tokens_[idx_ - 1].end;  // rhs_info $endpos($4): doc before the SEMI
-          Attributes attrs;
+          suppress_type_trailing_attr_ = save_sup;
+          Attributes attrs;  // $4: attributes right after the type
+          while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
+          size_t end4 = tokens_[idx_ - 1].end;  // rhs_info $endpos($4): doc before the SEMI
           if (cur().kind == Kind::SEMI) {
-            // field_semi: prefer a doc before the `;`, else one after it (symbol_info $endpos)
-            if (!append_info_doc(attrs, endType)) { advance(); append_info_doc(attrs, tokens_[idx_ - 1].end); }
-            else advance();
+            // field_semi: prefer a doc before the `;`, else one after $6 (symbol_info $endpos)
+            bool had = append_info_doc(attrs, end4);
+            advance();
+            while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }  // $6
+            if (!had) append_info_doc(attrs, tokens_[idx_ - 1].end);
             fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(attrs)});
             continue;
           }
-          append_info_doc(attrs, endType);  // field (last, no semi): symbol_info $endpos
+          append_info_doc(attrs, end4);  // field (last, no semi): symbol_info $endpos($4)
           fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(attrs)});
           break;
         } else {  // Oinherit: an inherited object type
@@ -1934,15 +1940,32 @@ class Parser {
     return Pattern{Ppat_tuple{std::move(elems), closed, std::move(labels)}, l};
   }
   Pattern parse_pat_cons() {
-    Pattern p = parse_pat_app();
+    // A trailing `[@attr]` binds to the whole (lowest-precedence) cons pattern,
+    // not to its rightmost operand: `a::b [@x]` is `(a::b)[@x]`.
+    Pattern p = parse_pat_cons_core();
     while (cur().kind == Kind::LBRACKETAT) {  // p [@attr]  -> ppat_attributes
       advance();
       p.attrs.push_back(parse_attribute_body());
     }
+    return p;
+  }
+  Pattern parse_pat_cons_core() {
+    Pattern p = parse_pat_app();
+    // An operand `[@attr]` binds to the operand only when a `::` follows it
+    // (`a [@x] :: b`); a trailing one (`a :: b [@x]`) belongs to the whole cons,
+    // so leave it for parse_pat_cons. Tentatively consume, roll back if no `::`.
+    if (cur().kind == Kind::LBRACKETAT) {
+      size_t save = idx_;
+      Attributes opattrs;
+      while (cur().kind == Kind::LBRACKETAT) { advance(); opattrs.push_back(parse_attribute_body()); }
+      if (cur().kind == Kind::COLONCOLON)
+        for (auto& a : opattrs) p.attrs.push_back(std::move(a));
+      else idx_ = save;
+    }
     if (cur().kind != Kind::COLONCOLON) return p;
     Token optok = cur();
     advance();
-    Pattern r = parse_pat_cons();  // right-assoc
+    Pattern r = parse_pat_cons_core();  // right-assoc; trailing attr handled by the caller
     Position ls = p.loc.start, re = r.loc.end;
     Location gl = gloc(ls, re);
     std::vector<PatBox> tup;
