@@ -1488,7 +1488,10 @@ class Parser {
         expect(Kind::TYPE, "type");
         LongidentLoc lp = parse_longident_path();
         expect(Kind::EQUAL, "=");
-        cons.emplace_back(lp, parse_core_type());
+        bool save_sup = suppress_type_trailing_attr_;
+        suppress_type_trailing_attr_ = true;  // with_constraint uses core_type_no_attr;
+        cons.emplace_back(lp, parse_core_type());  // a trailing `[@a]` is the package_type's
+        suppress_type_trailing_attr_ = save_sup;
         if (cur().kind == Kind::AND) { advance(); continue; }
         break;
       }
@@ -3380,6 +3383,11 @@ class Parser {
       Location l = span(symstart, position(tokens_[idx_ - 1].end));
       mt = ModuleType{Pmty_with{box(std::move(mt)), std::move(cs)}, l, {}};
     }
+    // `module_type [@attr]` after a `with`: attaches to the result, loc unchanged
+    while (cur().kind == Kind::LBRACKETAT) {
+      advance();
+      mt.attrs.push_back(parse_attribute_body());
+    }
     return mt;
   }
   WithConstraint parse_with_constraint() {
@@ -3393,7 +3401,10 @@ class Parser {
       if (subst) advance(); else expect(Kind::EQUAL, "=");
       PrivateFlag priv = PrivateFlag::Public;
       if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
-      CoreTypeBox manifest = parse_core_type();
+      bool save_sup = suppress_type_trailing_attr_;
+      suppress_type_trailing_attr_ = true;  // core_type_no_attr: a trailing `[@a]` is the
+      CoreTypeBox manifest = parse_core_type();  // enclosing module_type's, not the manifest's
+      suppress_type_trailing_attr_ = save_sup;
       std::vector<TypeConstraint> constraints;  // `with type … constraint t1 = t2`
       while (cur().kind == Kind::CONSTRAINT) {
         advance();
