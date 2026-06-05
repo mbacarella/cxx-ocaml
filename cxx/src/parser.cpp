@@ -1141,6 +1141,14 @@ class Parser {
 
   ExprBox parse_expr() {
     ExprBox e = parse_expr_no_seq();
+    if (cur().kind == Kind::SEMI && peek(1).kind == Kind::PERCENT) {  // `e1 ;%foo e2`
+      advance();  // ;
+      std::optional<std::string> ext = take_ext();  // %foo
+      ExprBox e2 = parse_expr();
+      Location l = span(e->loc.start, last_seq_end_);
+      ExprBox seq = E({Pexp_sequence{std::move(e), std::move(e2)}, l});
+      return wrap_ext(std::move(seq), std::move(ext));  // Pexp_extension over a ghost sequence
+    }
     if (cur().kind == Kind::SEMI && expr_starts(peek(1).kind)) {
       advance();
       ExprBox e2 = parse_expr();
