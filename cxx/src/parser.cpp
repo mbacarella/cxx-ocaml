@@ -2946,6 +2946,10 @@ class Parser {
     }
     if (t.kind == Kind::MODULE) {
       advance();
+      std::optional<std::string> mod_ext;  // `module%ext …`
+      if (cur().kind == Kind::PERCENT) { advance(); mod_ext = parse_attr_name(); }
+      Attributes itemattrs;  // `module%ext[@attr] …` -> pmb_attributes
+      while (cur().kind == Kind::LBRACKETAT) { advance(); itemattrs.push_back(parse_attribute_body()); }
       StrOptLoc name = parse_module_name();
       std::vector<std::pair<Position, FunctorParam>> params;
       while (cur().kind == Kind::LPAREN) {
@@ -2965,11 +2969,17 @@ class Parser {
         Location fl = span(params[i].first, me.loc.end);
         me = ModuleExpr{Pmod_functor{std::move(params[i].second), box(std::move(me))}, fl};
       }
-      Attributes mattrs;
+      Attributes mattrs = std::move(itemattrs);
       while (cur().kind == Kind::LBRACKETATAT) { advance(); mattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(mattrs, l.start.cnum, l.end.cnum);
-      return StructureItem{Pstr_module{ModuleBinding{std::move(name), std::move(me), std::move(mattrs)}}, l};
+      StructureItem item{Pstr_module{ModuleBinding{std::move(name), std::move(me), std::move(mattrs)}}, l};
+      if (mod_ext) {  // `module%ext …` wraps the (ghost) Pstr_module in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*mod_ext), std::move(ep)}, l};
+      }
+      return item;
     }
     if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
       Position kw = position(t.start);
