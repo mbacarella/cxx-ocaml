@@ -463,3 +463,41 @@ next fix, the heredoc nails the spec, the type system just stores the result. In
 words: the binding constraint on progress is **differential observation of the oracle**,
 not static typing. That's direct evidence for the project's hypothesis that strong
 types yield diminishing guidance once an agent has a tight oracle/feedback loop.
+
+### 2026-06-04 — parser tail 97.2 → 99.1% over-parseable (day 2 cont.)
+
+Continued the diff/parse-error bucket grind. Cleared, roughly in order: the
+paren-`$sloc` family extended (`Pcl_apply`/module-type-with/functor-body/`Ptyp_poly`);
+floating `ocaml.text` for an orphan doc before a closing `end` (but **not** at EOF —
+`t000.ml` is all-comments); multi-index dotop array spans the whole `e.op[…]` (+
+module-qualified index ops `a.M.%![…]`); `# N "file"` **line directives** (renumber +
+per-position filename via a new `file_id` on `Position`, threaded lexer→parser→printer);
+**primitive aliases** `external f [: t] = path` (`Pprim_alias`); package types with
+`with type … and …` in `(val/module : pkg)` incl. parenthesised; `exception` patterns
+as tuple elements; `with module type` constraints; record/record-pattern field type
+annotations `{ f : ty [= e] }` (+ punning `{ f : ty }`); `as` aliases on tuple elements
+(`(true as x, _)`, chained `(0 as y as z, x)` — bind to the element iff a comma follows);
+nested constructor-app pattern args (`Some A _` = `Some (A _)`); `for <pattern> = …`;
+bivariant/injective variance (`+-`, `!+`, …); coercion-only return `let f p.. :> t = e`;
+`Pcty_open` (`let open M in <class_type>`); post-item attrs on module/class/class-type
+decls; `Pcf_attribute`/`Pctf_attribute` + `object[@attr]` + field `[@@attr]`; PTyp/PPat
+**attribute payloads** `[@n : t]` / `[@n ? p when g]`; the `function[@attr]` attr lands on
+`Pfunction_cases`; `class_expr`/`class_type` trailing `[@attr]`; `~(x:t)` labeled-arg
+constraint + `{< x >}` override-punning ghost; `+=` infix; leading functor params in
+module types (`() -> R`, `(X:S) -> R`); **quoted-string extensions** `{%id|…|}` /
+`{%%id|…|}` (str/sig/expr/pat/type, with a `content_start` token field); `Pmod_extension`;
+uppercase type-variable names (`'A_name`); `#F(Int).c` functor-app class path; sig
+exception `[@@attr]`. Full-corpus 94.7 → **96.5** (1788/1853); over-parseable **99.1%**;
+real parse-errors down 91 → 61 (49 of those are correct rejections the oracle also makes).
+
+**Remaining tail (~12 real under-accepts), now genuinely diminishing.** Concentrated in
+three *exhaustive* syntax test files — `parsing/attributes.ml`, `parsetree/source.ml`,
+`parsing/extensions.ml` — each of which needs a stack of micro-nuances: **typed/sig/pat
+extension payloads** `[%id : t]` / `[%id : sig]` / `[%id ? p]` (the one coherent lever
+left: would need an `ExtPayload` variant on all `*_extension` nodes, mirroring what
+`Attribute` already carries), plus per-position attr placements (e.g. `(module M : T[@a])`
+has no attrs slot on the `Ptyp_package` inside `Pexp_pack`). The rest are fork/exotic:
+`Ptype_external` (`type t = external "t"`), `let class … in`, `? label : t -> t` (spaced
+optional-label arrow), `let module%foo[@foo]`, and `Comparable.(module S)` as a type
+(local-open package type). The over-accept bucket (oracle errors, we parse) is unchanged
+and low-ROI: `arrow_ambiguity.ml` and two `parse-errors/` files.
