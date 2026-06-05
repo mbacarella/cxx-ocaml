@@ -3024,6 +3024,26 @@ class Parser {
 
   ModuleType parse_module_type() {
     Position symstart = position(cur().start);  // $sloc start (the `(` of a paren'd domain)
+    // leading functor params with no `functor` keyword: `() -> R`, `(X : S) -> R`
+    auto is_fparam_start = [&] {
+      return cur().kind == Kind::LPAREN &&
+             (peek(1).kind == Kind::RPAREN ||
+              (peek(1).kind == Kind::UIDENT && peek(2).kind == Kind::COLON));
+    };
+    if (is_fparam_start()) {
+      std::vector<std::pair<Position, FunctorParam>> args;
+      while (is_fparam_start()) {
+        Position ps = position(cur().start);
+        args.emplace_back(ps, parse_functor_param());
+      }
+      expect(Kind::MINUSGREATER, "->");
+      ModuleType cod = parse_module_type();
+      for (int i = static_cast<int>(args.size()) - 1; i >= 0; --i) {
+        Location l = span(args[i].first, cod.loc.end);
+        cod = ModuleType{Pmty_functor{std::move(args[i].second), box(std::move(cod))}, l, {}};
+      }
+      return cod;
+    }
     ModuleType mt = parse_module_type_with();
     if (cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
       advance();
