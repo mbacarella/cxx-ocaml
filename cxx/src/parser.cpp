@@ -1116,7 +1116,9 @@ class Parser {
       last_case_end_ = position(d.end);
     } else {
       rhs = parse_expr();
-      last_case_end_ = last_seq_end_;  // arm RHS is seq_expr: include a trailing `;`
+      // $endpos of the arm: last token consumed — includes a trailing `;` and a
+      // trailing `[@attr]` on the body (which does not extend the body's own loc).
+      last_case_end_ = position(tokens_[idx_ - 1].end);
     }
     return Case{std::move(p), std::move(guard), std::move(rhs)};
   }
@@ -1516,7 +1518,11 @@ class Parser {
       expect(Kind::RPAREN, ")");
       return p;
     }
-    return parse_package_type_body();
+    Ptyp_package p = parse_package_type_body();
+    while (cur().kind == Kind::LBRACKETAT) {  // `module M : T [@a]` -> attrs on the package_type
+      advance(); p.attrs.push_back(parse_attribute_body());
+    }
+    return p;
   }
   CoreTypeBox parse_type_arrow() {
     Position symstart = position(cur().start);
