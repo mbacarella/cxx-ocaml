@@ -763,15 +763,18 @@ class Parser {
     return E({Pexp_ident{.id = lid0(name, l)}, l});
   }
   ExprBox collect_app(ExprBox head) {
+    // Arguments are `simple_expr` — they never carry a trailing `[@attr]` (a
+    // mid-application attribute is a syntax error). A `[@attr]` after the last
+    // argument binds to the whole application, consumed below.
     std::vector<std::pair<ArgLabel, ExprBox>> args;
     for (;;) {
       Kind k = cur().kind;
       if (k == Kind::LABEL) {  // ~lbl:e
         Token lt = cur(); advance();
-        args.emplace_back(Labelled{lt.text}, parse_atom_postfix());
+        args.emplace_back(Labelled{lt.text}, postfix_field(parse_atom()));
       } else if (k == Kind::OPTLABEL) {  // ?lbl:e
         Token lt = cur(); advance();
-        args.emplace_back(Optional{lt.text}, parse_atom_postfix());
+        args.emplace_back(Optional{lt.text}, postfix_field(parse_atom()));
       } else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x punning
         advance(); Token id = cur(); advance();
         args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id)));
@@ -790,14 +793,15 @@ class Parser {
         advance(); Token id = cur(); advance();
         args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id)));
       } else if (is_atom_start(k)) {
-        args.emplace_back(Nolabel{}, parse_atom_postfix());
+        args.emplace_back(Nolabel{}, postfix_field(parse_atom()));
       } else {
         break;
       }
     }
-    if (args.empty()) return head;
+    if (args.empty()) return attach_expr_attrs(std::move(head));  // `x [@attr]` (no args)
     Location l = span(head->loc.start, args.back().second->loc.end);
-    return E({Pexp_apply{std::move(head), std::move(args)}, l});
+    ExprBox app = E({Pexp_apply{std::move(head), std::move(args)}, l});
+    return attach_expr_attrs(std::move(app));  // `(f x)[@attr]`
   }
 
   ExprBox parse_app() {
@@ -2839,7 +2843,10 @@ class Parser {
       return ValueBinding{std::move(namepat), std::move(fn), std::nullopt};
     }
     ExprBox body = parse_expr();
-    Position bodyEnd = last_seq_end_;  // includes a trailing `;` if present
+    // $endpos of the body: the last token consumed, which includes a trailing
+    // `[@attr]` on the body (`let f x = e [@inline]`) — that attribute does not
+    // extend `e`'s own loc but is part of the function's $sloc.
+    Position bodyEnd = position(tokens_[idx_ - 1].end);
 
     if (params.empty() && !fconstr)
       return ValueBinding{std::move(namepat), std::move(body), std::move(vconstr)};
