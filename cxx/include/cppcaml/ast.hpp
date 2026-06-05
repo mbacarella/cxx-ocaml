@@ -486,7 +486,7 @@ struct ClassTypeDeclaration {
 struct Pstr_eval { ExprBox e; };       // attributes empty
 struct Pstr_value { RecFlag rf; std::vector<ValueBinding> bindings; };
 struct Pstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
-struct Pstr_open { OverrideFlag ovr; ModuleExpr expr; };
+struct Pstr_open { OverrideFlag ovr; ModuleExpr expr; Attributes attrs; };
 struct Pstr_exception { TypeException exn; };
 struct Pstr_typext { TypeExtension ext; };
 struct Pstr_primitive { PrimitiveDescription prim; };

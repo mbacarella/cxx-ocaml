@@ -1078,6 +1078,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Pstr_open>(&s.desc)) {
       line(j, std::string("Pstr_open ") + override_flag(v->ovr));
       module_expr(j, v->expr);
+      attributes(j, v->attrs);  // popen_attributes, after the module_expr
     } else if (auto* v = std::get_if<Pstr_exception>(&s.desc)) {
       line(j, "Pstr_exception");
       type_exception(j, v->exn);

@@ -2906,12 +2906,23 @@ class Parser {
     }
     if (t.kind == Kind::OPEN) {
       advance();
+      std::optional<std::string> open_ext;  // `open%ext …`
+      if (cur().kind == Kind::PERCENT) { advance(); open_ext = parse_attr_name(); }
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
+      Attributes oattrs;  // `open%ext[@attr] …`  (item attrs collected after the keyword)
+      while (cur().kind == Kind::LBRACKETAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       // generalized open: `open <module_expr>` (path, `struct…end`, `M(X)`, …)
       ModuleExpr me = parse_module_expr();
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      return StructureItem{Pstr_open{ovr, std::move(me)}, l};
+      StructureItem item{Pstr_open{ovr, std::move(me), std::move(oattrs)}, l};
+      if (open_ext) {  // `open%ext …` wraps the (ghost) Pstr_open in a Pstr_extension
+        item.loc.ghost = true;
+        ExtPayload ep; ep.str.push_back(std::move(item));
+        return StructureItem{Pstr_extension{std::move(*open_ext), std::move(ep)}, l};
+      }
+      return item;
     }
     if (t.kind == Kind::EXCEPTION) {
       advance();
