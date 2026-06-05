@@ -329,6 +329,20 @@ class Parser {
     Position openStart = pr.lid.loc.start;
     if (cur().kind == Kind::LPAREN) {
       Token lp = cur();
+      if (peek(1).kind == Kind::COLONCOLON && peek(2).kind == Kind::RPAREN) {  // M.(::) qualified cons
+        advance();  // (
+        advance();  // ::
+        Token c = cur(); advance();  // )
+        Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), "::"}};
+        Location cloc = span(openStart, position(c.end));
+        LongidentLoc ctorid{std::move(qual), cloc};
+        if (is_atom_start(cur().kind)) {  // `M.(::) arg`  -> constructor application
+          ExprBox arg = parse_atom_postfix();
+          Position ae = arg->loc.end;
+          return mk_construct(ctorid, std::move(arg), span(openStart, ae));
+        }
+        return mk_construct(ctorid, std::nullopt, cloc);
+      }
       if (operator_name(peek(1)) && peek(2).kind == Kind::RPAREN) {  // M.(op) -> "M.op"
         advance();  // (
         auto op = operator_name(cur()); advance();
@@ -1930,7 +1944,15 @@ class Parser {
     }
     if (cur().kind == Kind::UIDENT) {
       LongidentLoc cl = parse_longident_path();
-      if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P) local open
+      if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN &&
+          peek(2).kind == Kind::COLONCOLON && peek(3).kind == Kind::RPAREN) {  // M.(::) qualified cons
+        advance(); advance();  // . (
+        advance();  // ::
+        Token rp = cur(); advance();  // )
+        cl = LongidentLoc{Longident{Ldot{std::make_shared<Longident>(cl.txt), "::"}},
+                          span(cl.loc.start, position(rp.end))};
+        // fall through to the constructor-argument handling below
+      } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P) local open
         advance();  // .
         Token lp = cur(); advance();  // (
         Pattern inner = (cur().kind == Kind::RPAREN)  // M.()  -> unit pattern
