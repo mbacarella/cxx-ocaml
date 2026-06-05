@@ -709,8 +709,9 @@ class Parser {
       }
       case Kind::NEW: {
         advance();
+        std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // new%ext[@attr]
         LongidentLoc id = parse_longident_path();
-        return E({Pexp_new{id}, span(position(t.start), id.loc.end)});
+        return wrap_ext(E({Pexp_new{id}, span(position(t.start), id.loc.end)}), std::move(ext), std::move(attrs));
       }
       case Kind::LBRACELESS: {  // {< field [= e]; … >}
         advance();
@@ -2937,7 +2938,7 @@ class Parser {
     if (t.kind == Kind::INCLUDE) {
       advance();
       std::optional<std::string> inc_ext = take_ext();  // `include%ext …`
-      Attributes iattrs = take_attrs();  // `include%ext[@attr] …` -> pincl_attributes (prefix)
+      Attributes iattrs = take_attrs();  // `include%ext[@attr] …` -> pincl_attributes (prefix attrs1)
       ModuleExpr me = parse_module_expr();
       while (cur().kind == Kind::LBRACKETATAT) { advance(); iattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
@@ -2976,10 +2977,17 @@ class Parser {
             advance();
             ctors.push_back(parse_ext_ctor(bs));
           }
-          Attributes extattrs;  // ptyext_attributes: `type t += C [@@attr]`
+          Attributes extattrs = std::move(typeattrs);  // ptyext_attributes (prefix `[@attr]` first)
           while (cur().kind == Kind::LBRACKETATAT) { advance(); extattrs.push_back(parse_attribute_body()); }
           Location l = span(d0, position(tokens_[idx_ - 1].end));
           attach_docs(extattrs, l.start.cnum, l.end.cnum);  // (** doc *) on the type extension
+          if (type_ext) {  // `type%ext … += …` wraps the (ghost) Pstr_typext in a Pstr_extension
+            StructureItem item{Pstr_typext{TypeExtension{std::move(path), std::move(params),
+                                                         std::move(ctors), priv, std::move(extattrs)}},
+                               Location{l.start, l.end, true}};
+            ExtPayload ep; ep.str.push_back(std::move(item));
+            return StructureItem{Pstr_extension{std::move(*type_ext), std::move(ep), {}}, l};
+          }
           return StructureItem{Pstr_typext{TypeExtension{std::move(path), std::move(params),
                                                          std::move(ctors), priv, std::move(extattrs)}}, l};
         }
@@ -3553,9 +3561,19 @@ class Parser {
             Position bs = position(cur().start); advance();
             ctors.push_back(parse_ext_ctor(bs));
           }
-          Location l = here();
+          Attributes extattrs = std::move(typeprefix);  // ptyext_attributes (prefix `[@attr]` first)
+          while (cur().kind == Kind::LBRACKETATAT) { advance(); extattrs.push_back(parse_attribute_body()); }
+          Location l = span(d0, position(tokens_[idx_ - 1].end));
+          attach_docs(extattrs, l.start.cnum, l.end.cnum);
+          if (type_ext) {  // `type%ext … += …` wraps the (ghost) Psig_typext in a Psig_extension
+            SignatureItem item{Psig_typext{TypeExtension{std::move(path), std::move(params),
+                                                         std::move(ctors), priv, std::move(extattrs)}},
+                               Location{l.start, l.end, true}};
+            ExtPayload ep; ep.is_sig = true; ep.sig = box(Signature{}); ep.sig->push_back(std::move(item));
+            return SignatureItem{Psig_extension{std::move(*type_ext), std::move(ep)}, l};
+          }
           return SignatureItem{Psig_typext{TypeExtension{std::move(path), std::move(params),
-                                                         std::move(ctors), priv}}, l};
+                                                         std::move(ctors), priv, std::move(extattrs)}}, l};
         }
       }
       idx_ = save;
@@ -3605,7 +3623,7 @@ class Parser {
     if (t.kind == Kind::INCLUDE) {
       advance();
       std::optional<std::string> ext = take_ext();  // `include%ext …`
-      Attributes iattrs = take_attrs();  // `include%ext[@attr] …` -> pincl_attributes (prefix)
+      Attributes iattrs = take_attrs();  // `include%ext[@attr] …` -> pincl_attributes (prefix attrs1)
       ModuleType mt = parse_module_type();
       while (cur().kind == Kind::LBRACKETATAT) { advance(); iattrs.push_back(parse_attribute_body()); }
       Location l = here();
@@ -3873,6 +3891,11 @@ class Parser {
 
   // ---- class language ----
   void skip_item_attrs() { while (cur().kind == Kind::LBRACKETAT) { advance(); parse_attribute_body(); } }
+  Attributes take_item_attrs() {  // capture prefix `[@attr]` (e.g. `method[@foo] …`) instead of dropping
+    Attributes a;
+    while (cur().kind == Kind::LBRACKETAT) { advance(); a.push_back(parse_attribute_body()); }
+    return a;
+  }
   Attributes last_post_attrs_;  // most recent skip_post_attrs() collection (for class fields)
   void skip_post_attrs() {
     last_post_attrs_.clear();
@@ -3949,7 +3972,7 @@ class Parser {
       advance();
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       ClassExpr ce = parse_class_expr();
       std::optional<StringLoc> as_;
       if (cur().kind == Kind::AS) {
@@ -3959,14 +3982,14 @@ class Parser {
       }
       skip_post_attrs();
       return ClassField{Pcf_inherit{ovr, box(std::move(ce)), std::move(as_)},
-                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+                        span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     if (t.kind == Kind::VAL) {
       advance();
       Position vstart = position(cur().start);  // `value` rule $sloc starts after VAL
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       MutableFlag mut = MutableFlag::Immutable;
       bool virt = false;
       for (;;) {
@@ -3993,7 +4016,7 @@ class Parser {
       }
       skip_post_attrs();
       return ClassField{Pcf_val{name, mut, std::move(kind)},
-                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+                        span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     if (t.kind == Kind::METHOD) {
       advance();
@@ -4002,7 +4025,7 @@ class Parser {
       Position groupStart = position(cur().start);
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       PrivateFlag priv = PrivateFlag::Public;
       bool virt = false;
       for (;;) {
@@ -4081,7 +4104,7 @@ class Parser {
           kind = Cfk_concrete{ovr, E({Pexp_poly{std::move(fn), std::nullopt}, pl})};
           skip_post_attrs();
           return ClassField{Pcf_method{name, priv, std::move(kind)},
-                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+                            span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
         }
         ExprBox body = parse_expr();
         if (!params.empty()) {
@@ -4098,25 +4121,25 @@ class Parser {
       }
       skip_post_attrs();
       return ClassField{Pcf_method{name, priv, std::move(kind)},
-                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+                        span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     if (t.kind == Kind::CONSTRAINT) {
       advance();
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       CoreTypeBox t1 = parse_core_type();
       expect(Kind::EQUAL, "=");
       CoreTypeBox t2 = parse_core_type();
       skip_post_attrs();
       return ClassField{Pcf_constraint{std::move(t1), std::move(t2)},
-                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+                        span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     if (t.kind == Kind::INITIALIZER) {
       advance();
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       ExprBox e = parse_expr();
       skip_post_attrs();
       return ClassField{Pcf_initializer{std::move(e)},
-                        span(fs, position(tokens_[idx_ - 1].end)), {}};
+                        span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     throw ParseError("unsupported class field", t.start);
   }
@@ -4337,15 +4360,15 @@ class Parser {
     }
     if (t.kind == Kind::INHERIT) {
       advance();
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       ClassType ct = parse_class_type();
       skip_post_attrs();
       return ClassTypeField{Pctf_inherit{box(std::move(ct))},
-                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+                            span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     if (t.kind == Kind::VAL) {
       advance();
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       MutableFlag mut = MutableFlag::Immutable;
       VirtualFlag virt = VirtualFlag::Concrete;
       for (;;) {
@@ -4359,11 +4382,11 @@ class Parser {
       CoreTypeBox ty = parse_core_type();
       skip_post_attrs();
       return ClassTypeField{Pctf_val{name, mut, virt, std::move(ty)},
-                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+                            span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     if (t.kind == Kind::METHOD) {
       advance();
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       PrivateFlag priv = PrivateFlag::Public;
       VirtualFlag virt = VirtualFlag::Concrete;
       for (;;) {
@@ -4377,17 +4400,17 @@ class Parser {
       CoreTypeBox ty = parse_possibly_poly_type();
       skip_post_attrs();
       return ClassTypeField{Pctf_method{name, priv, virt, std::move(ty)},
-                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+                            span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     if (t.kind == Kind::CONSTRAINT) {
       advance();
-      skip_item_attrs();
+      Attributes ia = take_item_attrs();
       CoreTypeBox t1 = parse_core_type();
       expect(Kind::EQUAL, "=");
       CoreTypeBox t2 = parse_core_type();
       skip_post_attrs();
       return ClassTypeField{Pctf_constraint{std::move(t1), std::move(t2)},
-                            span(fs, position(tokens_[idx_ - 1].end)), {}};
+                            span(fs, position(tokens_[idx_ - 1].end)), std::move(ia)};
     }
     throw ParseError("unsupported class sig field", t.start);
   }

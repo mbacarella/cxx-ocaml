@@ -690,8 +690,8 @@ struct Printer {
       attributes(j, v->attrs);  // popen_attributes
     } else if (auto* v = std::get_if<Psig_include>(&s.desc)) {
       line(j, "Psig_include");
-      attributes(j, v->attrs);  // pincl_attributes
       module_type(j, v->mt);
+      attributes(j, v->attrs);  // pincl_attributes — printast prints these AFTER the module_type
     } else if (auto* v = std::get_if<Psig_class>(&s.desc)) {
       line(j, "Psig_class");
       if (v->decls.empty()) line(j, "[]");
