@@ -3319,9 +3319,11 @@ class Parser {
     if (t.kind == Kind::EXCEPTION) {
       advance();
       ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
+      Attributes exnattrs;  // ptyexn_attributes: `exception E [@@attr]`
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); exnattrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(ctor.attrs, l.start.cnum, l.end.cnum);
-      return SignatureItem{Psig_exception{TypeException{std::move(ctor)}}, l};
+      return SignatureItem{Psig_exception{TypeException{std::move(ctor), std::move(exnattrs)}}, l};
     }
     if (t.kind == Kind::OPEN) {
       advance();
