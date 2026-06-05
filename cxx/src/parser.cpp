@@ -698,7 +698,10 @@ class Parser {
           Token nm = cur(); advance();
           StringLoc name{nm.text, tokloc(nm)};
           if (cur().kind == Kind::EQUAL) { advance(); fields.emplace_back(name, parse_expr_no_seq()); }
-          else fields.emplace_back(name, ident_expr(nm.text, name.loc));  // punning {< x >}
+          else {  // punning {< x >}: the label loc is ghost, the value ident is real
+            StringLoc glbl = name; glbl.loc.ghost = true;
+            fields.emplace_back(glbl, ident_expr(nm.text, name.loc));
+          }
           if (cur().kind == Kind::SEMI) advance(); else break;
         }
         Token c = cur(); expect(Kind::GREATERRBRACE, ">}");
@@ -750,6 +753,17 @@ class Parser {
       } else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x punning
         advance(); Token id = cur(); advance();
         args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id)));
+      } else if (k == Kind::TILDE && peek(1).kind == Kind::LPAREN &&
+                 peek(2).kind == Kind::LIDENT && peek(3).kind == Kind::COLON) {  // ~(x : t)
+        advance();  // ~
+        Token lp = cur(); advance();  // (
+        Token id = cur(); advance();  // x
+        expect(Kind::COLON, ":");
+        CoreTypeBox ty = parse_core_type();
+        Token rp = cur(); expect(Kind::RPAREN, ")");
+        Location cl{position(lp.start), position(rp.end), false};
+        ExprBox v = E({Pexp_constraint{ident_expr(id.text, tokloc(id)), std::move(ty)}, cl});
+        args.emplace_back(Labelled{id.text}, std::move(v));
       } else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) {  // ?x punning
         advance(); Token id = cur(); advance();
         args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id)));
