@@ -1522,9 +1522,9 @@ class Parser {
     CoreTypeBox t = parse_type_atom();
     while (cur().kind == Kind::LIDENT || cur().kind == Kind::UIDENT ||
            cur().kind == Kind::HASH) {
-      if (cur().kind == Kind::HASH) {  // [arg] #class
+      if (cur().kind == Kind::HASH) {  // [arg] #class  (path may be a functor app F(X).c)
         advance();
-        LongidentLoc name = parse_longident_path();
+        LongidentLoc name = parse_type_path();
         std::vector<CoreTypeBox> args;
         args.push_back(std::move(t));
         t = box(CoreType{.desc = Ptyp_class{.id = name, .args = std::move(args)},
