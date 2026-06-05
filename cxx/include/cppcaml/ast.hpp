@@ -121,6 +121,7 @@ struct Ptyp_object { std::vector<ObjectField> fields; ClosedFlag closed = Closed
 struct Ptyp_package {  // (module S [with type t = u and …])
   LongidentLoc path;
   std::vector<std::pair<LongidentLoc, CoreTypeBox>> constraints;
+  Attributes attrs;  // `(module M : (S [@a]))` — attrs on the package_type itself
 };
 struct Ptyp_class { LongidentLoc id; std::vector<CoreTypeBox> args; };  // [args] #class
 struct Ptyp_alias { CoreTypeBox type; std::string name; };  // (t as 'a)

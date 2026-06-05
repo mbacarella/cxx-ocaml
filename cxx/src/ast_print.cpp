@@ -311,6 +311,7 @@ struct Printer {
           }
           line(j + 2, "]");
         }
+        attributes(j + 2, v->pkg->attrs);  // package_type attributes
       }
     } else if (auto* v = std::get_if<Ppat_extension>(&p.desc)) {
       line(j, "Ppat_extension \"" + v->name + "\"");
@@ -483,6 +484,7 @@ struct Printer {
           }
           line(j + 2, "]");
         }
+        attributes(j + 2, v->pkg->attrs);  // package_type attributes
       }
     } else if (auto* v = std::get_if<Pexp_extension>(&e.desc)) {
       line(j, "Pexp_extension \"" + v->name + "\"");
