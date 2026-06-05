@@ -703,6 +703,7 @@ struct Printer {
     } else {
       auto& ve = std::get<Psig_extension>(s.desc);
       line(j, "Psig_extension \"" + ve.name + "\"");
+      attributes(j, ve.attrs);  // item-extension attributes, before the payload
       ext_payload(j, ve.payload);
     }
   }
@@ -1113,6 +1114,7 @@ struct Printer {
       structure_list(j, v->payload);
     } else if (auto* v = std::get_if<Pstr_extension>(&s.desc)) {
       line(j, "Pstr_extension \"" + v->name + "\"");
+      attributes(j, v->attrs);  // item-extension attributes, before the payload
       ext_payload(j, v->payload);  // extension payload at i
     } else if (auto* v = std::get_if<Pstr_include>(&s.desc)) {
       os << ind(j) << "Pstr_include";  // printast prints this with no trailing newline

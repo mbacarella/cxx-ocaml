@@ -381,7 +381,7 @@ struct Psig_include { ModuleType mt; Attributes attrs; };
 struct Psig_class { std::vector<ClassTypeDeclaration> decls; };  // class c : ct  (class_description)
 struct Psig_class_type { std::vector<ClassTypeDeclaration> decls; };
 struct Psig_attribute { std::string name; Structure payload; };
-struct Psig_extension { std::string name; ExtPayload payload; };
+struct Psig_extension { std::string name; ExtPayload payload; Attributes attrs; };
 struct SignatureItem {
   std::variant<Psig_value, Psig_primitive, Psig_type, Psig_typesubst, Psig_typext,
                Psig_exception, Psig_module, Psig_recmodule, Psig_modtype, Psig_modtypesubst,
@@ -498,7 +498,7 @@ struct Pstr_primitive { PrimitiveDescription prim; };
 struct Pstr_module { ModuleBinding binding; };
 struct Pstr_recmodule { std::vector<ModuleBinding> bindings; };  // module rec A = … and B = …
 struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
-struct Pstr_extension { std::string name; ExtPayload payload; };  // [%%ext …]
+struct Pstr_extension { std::string name; ExtPayload payload; Attributes attrs; };  // [%%ext …]
 struct Pstr_include { ModuleExpr expr; Attributes attrs; };
 struct Pstr_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S = mty
 struct Pstr_class { std::vector<ClassDeclaration> decls; };

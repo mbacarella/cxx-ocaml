@@ -1163,8 +1163,12 @@ class Parser {
     switch (t.kind) {
       case Kind::LET: {
         if (peek(1).kind == Kind::OPEN || peek(1).kind == Kind::MODULE ||
-            peek(1).kind == Kind::EXCEPTION || peek(1).kind == Kind::TYPE) {
-          // let {open M|module M=…|exception E|type u=…} in e -> Pexp_struct_item
+            peek(1).kind == Kind::EXCEPTION || peek(1).kind == Kind::TYPE ||
+            peek(1).kind == Kind::EXTERNAL || peek(1).kind == Kind::CLASS ||
+            peek(1).kind == Kind::INCLUDE || peek(1).kind == Kind::LBRACKETPERCENTPERCENT ||
+            peek(1).kind == Kind::LBRACKETATATAT) {
+          // let {open|module|exception|type|external|class|include|[%%…]|[@@@…]} in e
+          //   -> Pexp_struct_item over the parsed structure item
           advance();  // let
           StructureItem si = parse_structure_item();
           expect(Kind::IN, "in");
@@ -3211,10 +3215,12 @@ class Parser {
       return StructureItem{Pstr_attribute{std::move(name), std::move(payload)},
                            span(position(t.start), position(c.end))};
     }
-    if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% name payload ]  (item extension)
+    if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% name payload ] [@@attr]  (item extension)
       advance();
       auto [name, payload] = parse_ext_body();
-      return StructureItem{Pstr_extension{std::move(name), std::move(payload)},
+      Attributes attrs;
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+      return StructureItem{Pstr_extension{std::move(name), std::move(payload), std::move(attrs)},
                            span(position(t.start), position(tokens_[idx_ - 1].end))};
     }
     ExprBox e = parse_expr();
@@ -3733,10 +3739,12 @@ class Parser {
       return SignatureItem{Psig_attribute{std::move(name), std::move(payload)},
                            span(position(t.start), position(c.end))};
     }
-    if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% …]
+    if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% …] [@@attr]
       advance();
       auto [name, payload] = parse_ext_body();
-      return SignatureItem{Psig_extension{std::move(name), std::move(payload)},
+      Attributes attrs;
+      while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+      return SignatureItem{Psig_extension{std::move(name), std::move(payload), std::move(attrs)},
                            span(position(t.start), position(tokens_[idx_ - 1].end))};
     }
     throw ParseError("unsupported signature item", t.start);
