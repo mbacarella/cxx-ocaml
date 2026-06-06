@@ -327,6 +327,38 @@ struct Checker {
       return eng.fresh_var();
     }
     if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return infer_pat(*lz->p);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      // Both branches bind the same variables; type them and unify.
+      TypePtr lt = infer_pat(*o->l), rt = infer_pat(*o->r);
+      try_unify(lt, rt);
+      return lt;
+    }
+    if (auto* pv = std::get_if<Ppat_variant>(&p.desc)) {
+      if (pv->arg) infer_pat(**pv->arg);  // bind arg vars; poly-variant type unknown
+      return eng.fresh_var();
+    }
+    if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) {
+      infer_pat(*ex->p);  // binds vars; matches an exn, independent of scrutinee
+      return eng.fresh_var();
+    }
+    if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
+      venv.emplace_back();
+      open_into(op->mod_.txt);
+      std::set<std::string> opened;  // names introduced by the open, not by the pat
+      for (auto& [k, v] : venv.back()) opened.insert(k);
+      TypePtr t = infer_pat(*op->p);
+      auto inner = std::move(venv.back());
+      venv.pop_back();
+      // hoist only the pattern's own bound vars; the opened names stay scoped out
+      for (auto& [k, v] : inner)
+        if (!opened.count(k)) venv.back()[k] = v;
+      return t;
+    }
+    if (auto* ef = std::get_if<Ppat_effect>(&p.desc)) {
+      infer_pat(*ef->eff);   // effect payload vars
+      infer_pat(*ef->cont);  // continuation k
+      return eng.fresh_var();
+    }
     return eng.fresh_var();
   }
 
