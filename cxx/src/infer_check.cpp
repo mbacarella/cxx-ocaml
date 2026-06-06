@@ -51,6 +51,8 @@ struct Checker {
   std::unordered_map<std::string, std::vector<std::string>> type_ctors;
   // match-expression node -> is-partial (the result we route back to the dump)
   std::unordered_map<const Expression*, bool> match_partial;
+  // local module name -> its exported value schemes (so open/include/M.x resolve)
+  std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modenv;
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
@@ -311,6 +313,15 @@ struct Checker {
       venv.back()[al->name.txt] = t;
       return t;
     }
+    if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& [lid, sub] : r->fields) infer_pat(*sub);  // bind field vars
+      return eng.fresh_var();
+    }
+    if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& el : a->elems) infer_pat(*el);
+      return eng.fresh_var();
+    }
+    if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return infer_pat(*lz->p);
     return eng.fresh_var();
   }
 
@@ -466,31 +477,103 @@ struct Checker {
     // complex pattern: unify and bind its vars monomorphically
     try_unify(infer_pat(p), te);
   }
+
+  // Bring a module's exported value schemes into the current scope (open M):
+  // local module from modenv, else a Stdlib submodule cmi.
+  void open_into(const Longident& m) {
+    if (auto* l = std::get_if<Lident>(&m.v)) {
+      auto it = modenv.find(l->name);
+      if (it != modenv.end()) {
+        for (auto& [k, v] : it->second) venv.back()[k] = v;
+        return;
+      }
+    }
+    load_open(m);  // stdlib submodule fallback
+  }
+
+  // The value exports of a module expression (value name -> scheme).
+  std::unordered_map<std::string, TypePtr> module_exports(const ModuleExpr& me) {
+    if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
+      venv.emplace_back();
+      process_items(ms->items);
+      auto exports = std::move(venv.back());
+      venv.pop_back();
+      return exports;
+    }
+    if (auto* mi = std::get_if<Pmod_ident>(&me.desc)) {
+      if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
+        auto it = modenv.find(l->name);
+        if (it != modenv.end()) return it->second;  // alias to a local module
+        // stdlib submodule: load its value schemes into a map
+        std::unordered_map<std::string, TypePtr> ex;
+        try {
+          auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + l->name + ".cmi");
+          for (auto& v : cmi.values()) {
+            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            ex[v.name] = from_cmi(v.type, memo);
+          }
+        } catch (...) {}
+        return ex;
+      }
+      return {};
+    }
+    if (auto* mc = std::get_if<Pmod_constraint>(&me.desc))
+      return module_exports(*mc->me);  // ignore the constraint sig for now
+    return {};  // functor / apply: deferred
+  }
+
+  // Process structure items into the current scope, populating modenv for
+  // submodules.  Per-item best-effort (a bad item doesn't abort the rest).
+  void process_items(const ast::Structure& items) {
+    for (auto& it : items) {
+      try {
+        if (auto* sv = std::get_if<Pstr_value>(&it.desc))
+          infer_bindings(sv->rf, sv->bindings);
+        else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
+          infer_expr(*ev->e);
+        else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
+          if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc))
+            open_into(mi->id.txt);
+        } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+          if (mb->binding.name.txt)
+            modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
+        } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
+          for (auto& [k, v] : module_exports(in->expr)) venv.back()[k] = v;
+        } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
+          if (pr->prim.type) {  // external f : t = "..." binds f : t
+            std::unordered_map<std::string, TypePtr> vars;
+            venv.back()[pr->prim.name.txt] = from_coretype(*pr->prim.type, vars);
+          }
+        }
+      } catch (const I::TypeError&) {
+      }
+    }
+  }
 };
 
 }  // namespace
 
-// Shared setup: register predef + all type-decl constructors, then run
-// best-effort inference over every top-level value binding / eval expression
-// (this is what populates ck.match_partial as it traverses).
-static void run_checker(Checker& ck, const ast::Structure& s) {
-  ck.register_predef_ctors();
-  for (auto& it : s)
+// Register variant constructors from type decls, recursing into local module
+// structures (a flat ctor namespace — best-effort, so `open M; A` resolves).
+static void register_types_rec(Checker& ck, const ast::Structure& s) {
+  for (auto& it : s) {
     if (auto* ty = std::get_if<Pstr_type>(&it.desc))
       for (auto& d : ty->decls) ck.register_type_decl(d);
-  for (auto& it : s) {
-    try {
-      if (auto* sv = std::get_if<Pstr_value>(&it.desc))
-        ck.infer_bindings(sv->rf, sv->bindings);
-      else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
-        ck.infer_expr(*ev->e);
-      else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
-        if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc))
-          ck.load_open(mi->id.txt);  // bring opened names into top-level scope
-      }
-    } catch (const I::TypeError&) {
+    else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+      const ModuleExpr* me = &mb->binding.expr;
+      while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
+      if (auto* ms = std::get_if<Pmod_structure>(&me->desc))
+        register_types_rec(ck, ms->items);
     }
   }
+}
+
+// Shared setup: register constructors, then run best-effort inference over the
+// structure (populating ck.match_partial and ck.errors as it traverses).
+static void run_checker(Checker& ck, const ast::Structure& s) {
+  ck.register_predef_ctors();
+  register_types_rec(ck, s);
+  ck.process_items(s);
 }
 
 std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
