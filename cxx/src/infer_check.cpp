@@ -82,6 +82,9 @@ struct Checker {
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modenv;
   // local functor name -> its body's exported value schemes (F(X) result)
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> functor_env;
+  // local module-type name -> its signature's value names (first-class modules):
+  // (val e : S) unpacks bring S's values into scope.
+  std::unordered_map<std::string, std::vector<std::string>> modtype_env;
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
@@ -299,6 +302,42 @@ struct Checker {
           for (auto& v : body->sig->values) out[v.name] = generic_var();
       }
     } catch (...) {}
+    return out;
+  }
+
+  // Collect the value (and external) names declared in a signature.
+  static void collect_sig_values(const ast::Signature& sig, std::vector<std::string>& out) {
+    for (auto& it : sig) {
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) out.push_back(v->vd.name.txt);
+      else if (auto* p = std::get_if<Psig_primitive>(&it.desc)) out.push_back(p->pd.name.txt);
+    }
+  }
+
+  // The value names of a module type, as fresh polymorphic schemes (so an
+  // unpack against it binds the names without introducing clashes): a local
+  // `module type S = sig ... end`, or an inline signature.
+  // A named module type's value names (fresh schemes), keyed by its path.
+  std::unordered_map<std::string, TypePtr> modtype_values_of(const Longident& path) {
+    std::unordered_map<std::string, TypePtr> out;
+    if (auto* l = std::get_if<Lident>(&path.v)) {
+      auto it = modtype_env.find(l->name);
+      if (it != modtype_env.end())
+        for (auto& n : it->second) out[n] = generic_var();
+    }
+    return out;
+  }
+
+  std::unordered_map<std::string, TypePtr> modtype_values(const ModuleType& mt) {
+    std::vector<std::string> names;
+    if (auto* mi = std::get_if<Pmty_ident>(&mt.desc)) {
+      return modtype_values_of(mi->id.txt);
+    } else if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) {
+      collect_sig_values(sg->items, names);
+    } else if (auto* mw = std::get_if<Pmty_with>(&mt.desc)) {
+      return modtype_values(*mw->mt);  // `S with type t = u`: same value names
+    }
+    std::unordered_map<std::string, TypePtr> out;
+    for (auto& n : names) out[n] = generic_var();
     return out;
   }
 
@@ -611,9 +650,10 @@ struct Checker {
       return eng.constr("array", {el});
     }
     if (auto* sti = std::get_if<Pexp_struct_item>(&e.desc)) {
+      // `let open M in e`, `let module M = ... in e`, `let exception ... in e`:
+      // process the item into a fresh scope, then type the body.
       venv.emplace_back();
-      if (auto* op = std::get_if<Pstr_open>(&sti->item->desc))
-        for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
+      process_item(*sti->item);
       TypePtr bt = infer_expr(*sti->body);
       venv.pop_back();
       return bt;
@@ -767,8 +807,19 @@ struct Checker {
     }
     if (auto* mi = std::get_if<Pmod_ident>(&me.desc))
       return resolve_module_values(mi->id.txt);  // local alias or stdlib (sub)module
-    if (auto* mc = std::get_if<Pmod_constraint>(&me.desc))
-      return module_exports(*mc->me);  // ignore the constraint sig for now
+    if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
+      auto inner = module_exports(*mc->me);
+      if (!inner.empty()) return inner;
+      return modtype_values(*mc->mt);  // e.g. `(val e : S)` parsed as a constraint
+    }
+    if (auto* mu = std::get_if<Pmod_unpack>(&me.desc)) {
+      // (val e : S ...): resolve S's value names from the expression's package type
+      const Expression* ie = mu->e.get();
+      if (auto* ct = std::get_if<Pexp_constraint>(&ie->desc))
+        if (auto* pk = std::get_if<Ptyp_package>(&ct->t->desc))
+          return modtype_values_of(pk->path.txt);
+      return {};
+    }
     if (auto* ma = std::get_if<Pmod_apply>(&me.desc))  // F(X): functor application
       if (auto* fi = std::get_if<Pmod_ident>(&ma->f->desc))
         return functor_result_values(fi->id.txt);
@@ -781,7 +832,11 @@ struct Checker {
   // Process structure items into the current scope, populating modenv for
   // submodules.  Per-item best-effort (a bad item doesn't abort the rest).
   void process_items(const ast::Structure& items) {
-    for (auto& it : items) {
+    for (auto& it : items) process_item(it);
+  }
+
+  void process_item(const StructureItem& it) {
+    {
       try {
         if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings);
@@ -819,6 +874,10 @@ struct Checker {
             std::unordered_map<std::string, TypePtr> vars;
             venv.back()[pr->prim.name.txt] = from_coretype(*pr->prim.type, vars);
           }
+        } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
+          if (mt->type)  // record a signature module type's value names for unpacks
+            if (auto* sg = std::get_if<Pmty_signature>(&mt->type->desc))
+              collect_sig_values(sg->items, modtype_env[mt->name.txt]);
         }
       } catch (const I::TypeError&) {
       }
