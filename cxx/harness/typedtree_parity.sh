@@ -37,7 +37,10 @@ oracle_raw() {
 # offsets have no "/NNN" form, and any "/NNN" in paths/string-constants is
 # identical on both sides, so the rewrite is symmetric and harmless.
 normalize() {
-  perl -pe 'BEGIN{%m=();$n=0} s{/(\d+)}{ "/" . ($m{$1} //= ++$n) }ge'
+  # Slurp mode: remap stamps over the whole file, then strip trailing whitespace
+  # (the oracle dump has a trailing blank line c++type doesn't; cmp on files
+  # would otherwise flag every file — $(...) used to hide this by stripping it).
+  perl -0777 -pe 'BEGIN{%m=();$n=0} s{/(\d+)}{ "/" . ($m{$1} //= ++$n) }ge; s/\s+\z//'
 }
 
 # Cache-build worker: write one file's raw oracle dump to the cache.
