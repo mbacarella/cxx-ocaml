@@ -304,6 +304,7 @@ struct Typer {
   tt::Pattern pattern(const Pattern& p) {
     tt::Pattern out;
     out.loc = p.loc;
+    out.attrs = &p.attrs;
     if (std::holds_alternative<Ppat_any>(p.desc)) {
       out.desc = tt::Tpat_any{};
     } else if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
@@ -365,6 +366,7 @@ struct Typer {
   tt::Expression expr(const Expression& e) {
     tt::Expression out;
     out.loc = e.loc;
+    out.attrs = &e.attrs;
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) {
       out.desc = tt::Texp_constant{c->c};
     } else if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
@@ -505,6 +507,7 @@ struct Typer {
     tt::ValueBinding out;
     out.expr = expr(*vb.expr);  // RHS typed before the pattern is bound (non-rec)
     out.pat = pattern(vb.pat);
+    out.attrs = &vb.attrs;
     return out;
   }
 
@@ -521,6 +524,7 @@ struct Typer {
         tt::ValueBinding b;
         b.pat = std::move(pats[i]);
         b.expr = expr(*vbs[i].expr);
+        b.attrs = &vbs[i].attrs;
         out.push_back(std::move(b));
       }
     } else {

@@ -5,9 +5,11 @@
 // stage where that model is exercised in earnest. The set of constructors grows
 // as the parser widens; today it covers the core expression/binding fragment.
 #pragma once
+#include <iosfwd>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -514,5 +516,12 @@ struct StructureItem {
       desc;
   Location loc;
 };
+
+// Print a structure (an attribute/extension PStr payload) in printast format at
+// the given indent — used by the typedtree printer, whose attribute payloads are
+// parsetree printed the printast way (filename only on the start position).
+void print_payload_structure(const Structure& s, int indent, std::ostream& os,
+                             std::string_view fname,
+                             const std::vector<std::string>& dirfiles);
 
 }  // namespace cppcaml::ast

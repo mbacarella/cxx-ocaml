@@ -1192,4 +1192,11 @@ void print_dparsetree(const Structure& s, std::string_view fname, std::ostream& 
   os << '\n';  // driver flushes the dump with a trailing newline (@.)
 }
 
+void print_payload_structure(const Structure& s, int indent, std::ostream& os,
+                             std::string_view fname,
+                             const std::vector<std::string>& dirfiles) {
+  Printer p{os, std::string(fname), dirfiles};
+  p.structure_list(indent, s);
+}
+
 }  // namespace cppcaml::ast

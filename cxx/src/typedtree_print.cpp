@@ -228,8 +228,18 @@ struct Printer {
     line(i, "]");
   }
 
+  // Mirrors printast/printtyped `attributes i`: each attribute prints at i+1,
+  // its payload at i+2.  Payloads are parsetree, printed the printast way.
+  void attributes(int i, const ast::Attributes& attrs) {
+    for (auto& a : attrs) {
+      line(i + 1, "attribute \"" + a.name + "\"");
+      ast::print_payload_structure(a.payload, i + 2, os, fname, dirfiles);
+    }
+  }
+
   void pattern(int i, const Pattern& p) {
     line(i, "pattern " + loc(p.loc));
+    if (p.attrs) attributes(i, *p.attrs);
     int j = i + 1;
     if (std::holds_alternative<Tpat_any>(p.desc)) {
       line(j, "Tpat_any");
@@ -286,6 +296,7 @@ struct Printer {
 
   void expression(int i, const Expression& e) {
     line(i, "expression " + loc(e.loc));
+    if (e.attrs) attributes(i, *e.attrs);
     int j = i + 1;
     if (auto* c = std::get_if<Texp_constant>(&e.desc)) {
       constant(j, "Texp_constant ", c->c);
@@ -406,6 +417,7 @@ struct Printer {
 
   void value_binding(int i, RecFlag rf, const ValueBinding& vb) {
     line(i, rf == RecFlag::Nonrecursive ? "<def>" : "<def_rec>");
+    if (vb.attrs) attributes(i + 1, *vb.attrs);
     pattern(i + 1, vb.pat);
     expression(i + 1, vb.expr);
   }

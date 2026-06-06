@@ -83,6 +83,7 @@ struct Pattern {
                Tpat_tuple, Tpat_exception, Tpat_or, Tpat_alias>
       desc;
   Location loc;
+  const ast::Attributes* attrs = nullptr;
 };
 
 // --- expressions ---
@@ -134,11 +135,13 @@ struct Expression {
                Texp_while>
       desc;
   Location loc;
+  const ast::Attributes* attrs = nullptr;
 };
 
 struct ValueBinding {
   Pattern pat;
   Expression expr;
+  const ast::Attributes* attrs = nullptr;
 };
 struct Case {
   Pattern lhs;
