@@ -39,6 +39,9 @@ struct Type {
   std::string arrow_lbl;     // Arrow: label name (when Labelled/Optional)
   std::vector<TypePtr> args; // Tuple / Constr
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
+  int stamp = 0;             // Constr: identity of a local type decl (0 = none).
+                             // Two constrs with distinct non-zero stamps are
+                             // distinct types even if their paths match.
 
   TypePtr link;              // Link: forwarding pointer (union-find)
 };
@@ -59,7 +62,7 @@ public:
   TypePtr any();  // the shared dynamic/unknown type
   TypePtr arrow(TypePtr dom, TypePtr cod, int label = 0, std::string lbl = "");
   TypePtr tuple(std::vector<TypePtr> elems);
-  TypePtr constr(std::string path, std::vector<TypePtr> args = {});
+  TypePtr constr(std::string path, std::vector<TypePtr> args = {}, int stamp = 0);
 
   // Follow Link chains to the representative (path-compressing).
   static TypePtr repr(TypePtr t);

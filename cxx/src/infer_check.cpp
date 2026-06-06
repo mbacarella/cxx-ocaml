@@ -74,6 +74,19 @@ struct Checker {
   std::set<std::string> gadt_types;
   std::set<std::string> gadt_ctors;  // constructor names belonging to a GADT
   std::unordered_map<std::string, int> type_arity;  // type name -> param count
+  // Type identity: each opaque (non-alias) local type declaration gets a unique
+  // stamp; tenv is the scoped type-name -> stamp environment (mirrors module
+  // scopes), so a shadowed `type t` resolves to the right identity.
+  int next_type_stamp_ = 1;
+  std::unordered_map<const TypeDeclaration*, int> type_stamp_;
+  std::vector<std::unordered_map<std::string, int>> tenv{{}};
+  int tenv_lookup(const std::string& name) {
+    for (auto it = tenv.rbegin(); it != tenv.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return f->second;
+    }
+    return 0;
+  }
   // constructors defined in more than one type: ambiguous without type-directed
   // disambiguation, so treated as unknown (a flat last-wins map picks wrong).
   std::set<std::string> ambiguous_ctors_;
@@ -220,7 +233,10 @@ struct Checker {
         expanding_.erase(nm);
         return r;
       }
-      return eng.constr(lid_full(c->id.txt), std::move(as));
+      // A bare reference to a local opaque type carries its identity stamp.
+      int stamp = 0;
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
+      return eng.constr(lid_full(c->id.txt), std::move(as), stamp);
     }
     return eng.fresh_var();
   }
@@ -566,6 +582,12 @@ struct Checker {
     check_type_vars(d);
     check_unboxed(d);
     type_arity[d.name.txt] = (int)d.params.size();
+    // Opaque types (variant/record/abstract-without-manifest) have a distinct
+    // identity; pure abbreviations are transparent (expanded), so unstamped.
+    bool opaque = std::holds_alternative<Ptype_variant>(d.kind) ||
+                  std::holds_alternative<Ptype_record>(d.kind) ||
+                  (std::holds_alternative<Ptype_abstract>(d.kind) && !d.manifest);
+    if (opaque) type_stamp_[&d] = next_type_stamp_++;
     if (d.manifest) {  // `type (params) t = <manifest>`: a type abbreviation
       std::vector<std::string> ps;
       for (auto& p : d.params)
@@ -587,7 +609,7 @@ struct Checker {
       std::unordered_map<std::string, TypePtr> vars;
       std::vector<TypePtr> params;
       for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
-      TypePtr result = eng.constr(d.name.txt, params);
+      TypePtr result = eng.constr(d.name.txt, params, type_stamp_[&d]);
       TypePtr scheme = result;
       if (auto* tup = std::get_if<Pcstr_tuple>(&c.args)) {
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
@@ -1140,10 +1162,43 @@ struct Checker {
     for (auto& b : bs) {
       eng.enter_level();
       TypePtr te = infer_expr(*b.expr);
+      // A declared type `let f : T = e`: check the inferred type's identities
+      // against T (a distinct local type used where another is declared is an
+      // error).  We only flag identity (stamp) clashes, not structural ones --
+      // structural inference is still incomplete, so unifying T into te would
+      // false-reject (e.g. array vs iarray); the identity layer is reliable.
+      if (b.constraint_)
+        if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_)) {
+          for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
+          std::unordered_map<std::string, TypePtr> vars;
+          if (strict && identity_clash(te, from_coretype(*pc->typ, vars)))
+            note_error("type constructor mismatch (distinct type identities)");
+        }
       eng.leave_level();
       eng.generalize(te);
       bind_pattern_scheme(b.pat, te);
     }
+  }
+
+  // Pure (no-mutation) check: do two types carry distinct local type identities
+  // at corresponding positions?  Used to apply a binding's declared type without
+  // the structural unification that incomplete inference would trip on.
+  static bool identity_clash(const TypePtr& a0, const TypePtr& b0) {
+    TypePtr a = I::Engine::repr(a0), b = I::Engine::repr(b0);
+    if (a->kind == I::Type::Kind::Constr && b->kind == I::Type::Kind::Constr) {
+      if (a->stamp && b->stamp && a->stamp != b->stamp) return true;
+      size_t n = std::min(a->args.size(), b->args.size());
+      for (size_t i = 0; i < n; ++i) if (identity_clash(a->args[i], b->args[i])) return true;
+      return false;
+    }
+    if (a->kind == I::Type::Kind::Arrow && b->kind == I::Type::Kind::Arrow)
+      return identity_clash(a->dom, b->dom) || identity_clash(a->cod, b->cod);
+    if (a->kind == I::Type::Kind::Tuple && b->kind == I::Type::Kind::Tuple) {
+      size_t n = std::min(a->args.size(), b->args.size());
+      for (size_t i = 0; i < n; ++i) if (identity_clash(a->args[i], b->args[i])) return true;
+      return false;
+    }
+    return false;
   }
 
   // Bind a let pattern's variables to a (generalized) type.
@@ -1166,7 +1221,9 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> module_exports(const ModuleExpr& me) {
     if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
       venv.emplace_back();
+      tenv.emplace_back();  // the module's type declarations are scoped here
       process_items(ms->items);
+      tenv.pop_back();
       auto exports = std::move(venv.back());
       venv.pop_back();
       return exports;
@@ -1212,7 +1269,11 @@ struct Checker {
   void process_item(const StructureItem& it) {
     {
       try {
-        if (auto* sv = std::get_if<Pstr_value>(&it.desc))
+        if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+          // bind these type names' identities in the current scope, in order
+          for (auto& d : ty->decls)
+            if (type_stamp_.count(&d)) tenv.back()[d.name.txt] = type_stamp_[&d];
+        } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings);
         else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
           infer_expr(*ev->e);

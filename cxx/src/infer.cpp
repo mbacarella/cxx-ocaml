@@ -36,11 +36,12 @@ TypePtr Engine::tuple(std::vector<TypePtr> elems) {
   t->id = next_id_++;
   return t;
 }
-TypePtr Engine::constr(std::string path, std::vector<TypePtr> args) {
+TypePtr Engine::constr(std::string path, std::vector<TypePtr> args, int stamp) {
   auto t = std::make_shared<Type>();
   t->kind = Type::Kind::Constr;
   t->path = std::move(path);
   t->args = std::move(args);
+  t->stamp = stamp;
   t->id = next_id_++;
   return t;
 }
@@ -122,6 +123,12 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       auto d = p.rfind('.');
       return d == std::string::npos ? p : p.substr(d + 1);
     };
+    // Distinct local type identities never unify, even with matching names (e.g.
+    // a shadowed `type t`).  This is the only place stamps tighten unification;
+    // unstamped constructors fall through to the name-based comparison, so it is
+    // purely additive and can't introduce a false rejection.
+    if (a->stamp && b->stamp && a->stamp != b->stamp)
+      throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     if (last(a->path) != last(b->path) || a->args.size() != b->args.size())
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     for (size_t i = 0; i < a->args.size(); ++i) unify(a->args[i], b->args[i]);
@@ -154,7 +161,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Constr: {
         std::vector<TypePtr> as;
         for (auto& a : t->args) as.push_back(copy(a));
-        return constr(t->path, std::move(as));
+        return constr(t->path, std::move(as), t->stamp);
       }
       case Type::Kind::Link:
         return copy(t);  // repr resolved; unreachable
