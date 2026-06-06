@@ -73,6 +73,9 @@ struct Checker {
   // refines types per branch, so branch results must not be cross-unified.
   std::set<std::string> gadt_types;
   std::set<std::string> gadt_ctors;  // constructor names belonging to a GADT
+  // constructors defined in more than one type: ambiguous without type-directed
+  // disambiguation, so treated as unknown (a flat last-wins map picks wrong).
+  std::set<std::string> ambiguous_ctors_;
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
@@ -436,8 +439,17 @@ struct Checker {
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
       }
+      if (ctors.count(c.name.txt)) ambiguous_ctors_.insert(c.name.txt);
       ctors[c.name.txt] = scheme;
     }
+  }
+
+  // Look up a constructor scheme, treating ambiguous (multiply-defined) names as
+  // unknown so they don't resolve to the wrong type and clash.
+  TypePtr* find_ctor(const std::string& name) {
+    if (ambiguous_ctors_.count(name)) return nullptr;
+    auto it = ctors.find(name);
+    return it == ctors.end() ? nullptr : &it->second;
   }
 
   // Split a (instantiated) constructor scheme into its argument types and result.
@@ -538,13 +550,13 @@ struct Checker {
       return eng.tuple(std::move(es));
     }
     if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
-      auto it = ctors.find(lid_last(k->id.txt));
-      if (it == ctors.end()) {
+      TypePtr* sch = find_ctor(lid_last(k->id.txt));
+      if (!sch) {
         if (k->arg) infer_pat(**k->arg);
         return eng.fresh_var();
       }
       TypePtr result;
-      auto ps = ctor_params(eng.instantiate(it->second), result);
+      auto ps = ctor_params(eng.instantiate(*sch), result);
       if (k->arg) {
         auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
         // A multi-argument constructor `B of t1*t2` (arity>1) destructures a
@@ -661,10 +673,10 @@ struct Checker {
       return eng.tuple(std::move(es));
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
-      auto it = ctors.find(lid_last(k->id.txt));
-      if (it == ctors.end()) { if (k->arg) infer_expr(**k->arg); return eng.fresh_var(); }
+      TypePtr* sch = find_ctor(lid_last(k->id.txt));
+      if (!sch) { if (k->arg) infer_expr(**k->arg); return eng.fresh_var(); }
       TypePtr result;
-      auto ps = ctor_params(eng.instantiate(it->second), result);
+      auto ps = ctor_params(eng.instantiate(*sch), result);
       if (k->arg) {
         auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
         if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
