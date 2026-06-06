@@ -161,18 +161,49 @@ struct Checker {
     return stdlib_;
   }
 
-  // `open M`: load M's exported value schemes (+ variant ctors) into the current
-  // scope so unqualified names resolve.  Stdlib submodules only, best-effort.
-  void load_open(const Longident& m) {
-    auto* l = std::get_if<Lident>(&m.v);
-    if (!l) return;
+  // Components of a (possibly qualified) module longident: Effect.Deep -> {Effect,Deep}.
+  static std::vector<std::string> mod_components(const Longident& m) {
+    std::vector<std::string> out;
+    std::function<void(const Longident&)> go = [&](const Longident& x) {
+      if (auto* l = std::get_if<Lident>(&x.v)) out.push_back(l->name);
+      else if (auto* d = std::get_if<Ldot>(&x.v)) { go(*d->prefix); out.push_back(d->name); }
+    };
+    go(m);
+    return out;
+  }
+
+  // Resolve a (possibly qualified) module path to its exported value schemes:
+  // a local top-level module from modenv, else a stdlib module/submodule walked
+  // through nested signatures (open Effect.Deep -> stdlib__Effect.cmi -> Deep).
+  std::unordered_map<std::string, TypePtr> resolve_module_values(const Longident& m) {
+    auto comps = mod_components(m);
+    if (comps.empty()) return {};
+    if (comps.size() == 1) {
+      auto it = modenv.find(comps[0]);
+      if (it != modenv.end()) return it->second;
+    }
+    std::unordered_map<std::string, TypePtr> out;
     try {
-      auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + l->name + ".cmi");
-      for (auto& v : cmi.values()) {
-        std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
-        venv.back()[v.name] = from_cmi(v.type, memo);
+      const std::string& head = comps[0];
+      auto cmi = (head == "Stdlib")
+                     ? cmi::CmiFile::load("stdlib/stdlib.cmi")
+                     : cmi::CmiFile::load("stdlib/stdlib__" + head + ".cmi");
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        if (md && md->type && md->type->kind == cmi::ModuleType::Sig && md->type->sig)
+          sig = md->type->sig.get();
+        else { sig = nullptr; }
       }
+      if (sig)
+        for (auto& v : sig->values) {
+          std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+          out[v.name] = from_cmi(v.type, memo);
+        }
     } catch (...) {}
+    return out;
   }
 
   void register_predef_ctors() {
@@ -470,7 +501,7 @@ struct Checker {
     if (auto* sti = std::get_if<Pexp_struct_item>(&e.desc)) {
       venv.emplace_back();
       if (auto* op = std::get_if<Pstr_open>(&sti->item->desc))
-        if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) load_open(mi->id.txt);
+        if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) open_into(mi->id.txt);
       TypePtr bt = infer_expr(*sti->body);
       venv.pop_back();
       return bt;
@@ -539,14 +570,7 @@ struct Checker {
   // Bring a module's exported value schemes into the current scope (open M):
   // local module from modenv, else a Stdlib submodule cmi.
   void open_into(const Longident& m) {
-    if (auto* l = std::get_if<Lident>(&m.v)) {
-      auto it = modenv.find(l->name);
-      if (it != modenv.end()) {
-        for (auto& [k, v] : it->second) venv.back()[k] = v;
-        return;
-      }
-    }
-    load_open(m);  // stdlib submodule fallback
+    for (auto& [k, v] : resolve_module_values(m)) venv.back()[k] = v;
   }
 
   // The value exports of a module expression (value name -> scheme).
@@ -558,23 +582,8 @@ struct Checker {
       venv.pop_back();
       return exports;
     }
-    if (auto* mi = std::get_if<Pmod_ident>(&me.desc)) {
-      if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
-        auto it = modenv.find(l->name);
-        if (it != modenv.end()) return it->second;  // alias to a local module
-        // stdlib submodule: load its value schemes into a map
-        std::unordered_map<std::string, TypePtr> ex;
-        try {
-          auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + l->name + ".cmi");
-          for (auto& v : cmi.values()) {
-            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
-            ex[v.name] = from_cmi(v.type, memo);
-          }
-        } catch (...) {}
-        return ex;
-      }
-      return {};
-    }
+    if (auto* mi = std::get_if<Pmod_ident>(&me.desc))
+      return resolve_module_values(mi->id.txt);  // local alias or stdlib (sub)module
     if (auto* mc = std::get_if<Pmod_constraint>(&me.desc))
       return module_exports(*mc->me);  // ignore the constraint sig for now
     return {};  // functor / apply: deferred
