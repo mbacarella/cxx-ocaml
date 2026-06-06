@@ -40,6 +40,154 @@ const std::unordered_map<std::string, long long>& predef_types() {
   return m;
 }
 
+// ---- format-string desugaring -------------------------------------------
+// DRAFT (written 2026-06-05, NOT yet built/verified — pending machine recovery).
+// A string literal in a format-typed position becomes
+//   CamlinternalFormatBasics.Format(fmt_tree, original_string)
+// where fmt_tree is a chain of CamlinternalFormatBasics constructors, all ghost
+// at the string's location.  Structure confirmed from `ocamlc -dtypedtree` on
+// `Printf.printf "%d\n" 1`.  Conservative: covers literal runs + the common
+// plain directives (No_padding/No_precision); ANYTHING with flags/width/
+// precision (e.g. %5d, %.3f, %ld, %a) makes `make` return null so the caller
+// leaves the argument as a plain string (the file stays a safe DIFF, no
+// regression).  TODO before relying on it: verify against the oracle, then add
+// padding/precision/%a/%t and unqualified (open Printf) detection.
+namespace fmtlib {
+inline std::string ns(const std::string& n) { return "CamlinternalFormatBasics." + n; }
+
+inline tt::ExprBox gctor(const std::string& n, std::vector<tt::ExprBox> args,
+                         const Location& g) {
+  auto e = std::make_unique<tt::Expression>();
+  e->loc = g;
+  e->desc = tt::Texp_construct{ns(n), std::move(args)};
+  return e;
+}
+inline tt::ExprBox gchar(unsigned char c, const Location& g) {
+  auto e = std::make_unique<tt::Expression>();
+  e->loc = g;
+  ast::Constant k;
+  k.loc = g;
+  ast::Pconst_char pc;
+  pc.code = c;
+  k.desc = pc;
+  e->desc = tt::Texp_constant{std::move(k)};
+  return e;
+}
+inline tt::ExprBox gstr(const std::string& s, const Location& g) {
+  auto e = std::make_unique<tt::Expression>();
+  e->loc = g;
+  ast::Constant k;
+  k.loc = g;
+  ast::Pconst_string ps;
+  ps.s = s;
+  ps.strloc = g;
+  k.desc = ps;
+  e->desc = tt::Texp_constant{std::move(k)};
+  return e;
+}
+
+// One plain directive `%<d>`; ok=false (and returns rest unchanged) for anything
+// not handled, so the caller bails out of converting this format.
+inline tt::ExprBox directive(char d, tt::ExprBox rest, const Location& g, bool& ok) {
+  ok = true;
+  auto intc = [&](const char* conv) {
+    std::vector<tt::ExprBox> a;
+    a.push_back(gctor(conv, {}, g));
+    a.push_back(gctor("No_padding", {}, g));
+    a.push_back(gctor("No_precision", {}, g));
+    a.push_back(std::move(rest));
+    return gctor("Int", std::move(a), g);
+  };
+  switch (d) {
+    case 'd': return intc("Int_d");
+    case 'i': return intc("Int_i");
+    case 'u': return intc("Int_u");
+    case 'x': return intc("Int_x");
+    case 'X': return intc("Int_X");
+    case 'o': return intc("Int_o");
+    case 's': {
+      std::vector<tt::ExprBox> a;
+      a.push_back(gctor("No_padding", {}, g));
+      a.push_back(std::move(rest));
+      return gctor("String", std::move(a), g);
+    }
+    case 'c': {
+      std::vector<tt::ExprBox> a;
+      a.push_back(std::move(rest));
+      return gctor("Char", std::move(a), g);
+    }
+    case 'b': {
+      std::vector<tt::ExprBox> a;
+      a.push_back(gctor("No_padding", {}, g));
+      a.push_back(std::move(rest));
+      return gctor("Bool", std::move(a), g);
+    }
+    case 'f': case 'e': case 'g': case 'E': case 'F': {
+      const char* fc = d == 'f' ? "Float_f" : d == 'e' ? "Float_e"
+                     : d == 'g' ? "Float_g" : d == 'E' ? "Float_E" : "Float_F";
+      std::vector<tt::ExprBox> a;
+      a.push_back(gctor(fc, {}, g));
+      a.push_back(gctor("No_padding", {}, g));
+      a.push_back(gctor("No_precision", {}, g));
+      a.push_back(std::move(rest));
+      return gctor("Float", std::move(a), g);
+    }
+    default: ok = false; return rest;
+  }
+}
+
+// Parse s[i..] into the fmt tree; null if it contains anything unsupported.
+inline tt::ExprBox parse(const std::string& s, size_t i, const Location& g) {
+  if (i >= s.size()) return gctor("End_of_format", {}, g);
+  if (s[i] == '%') {
+    if (i + 1 >= s.size()) return nullptr;
+    char d = s[i + 1];
+    if (d == '%') {
+      auto r = parse(s, i + 2, g);
+      if (!r) return nullptr;
+      return gctor("Char_literal", [&] { std::vector<tt::ExprBox> a; a.push_back(gchar('%', g)); a.push_back(std::move(r)); return a; }(), g);
+    }
+    if (d == '!') {
+      auto r = parse(s, i + 2, g);
+      if (!r) return nullptr;
+      std::vector<tt::ExprBox> a; a.push_back(std::move(r));
+      return gctor("Flush", std::move(a), g);
+    }
+    auto r = parse(s, i + 2, g);
+    if (!r) return nullptr;
+    bool ok;
+    auto e = directive(d, std::move(r), g, ok);
+    return ok ? std::move(e) : nullptr;
+  }
+  size_t k = i;
+  while (k < s.size() && s[k] != '%') ++k;
+  auto r = parse(s, k, g);
+  if (!r) return nullptr;
+  std::vector<tt::ExprBox> a;
+  if (k - i == 1) {
+    a.push_back(gchar(static_cast<unsigned char>(s[i]), g));
+    a.push_back(std::move(r));
+    return gctor("Char_literal", std::move(a), g);
+  }
+  a.push_back(gstr(s.substr(i, k - i), g));
+  a.push_back(std::move(r));
+  return gctor("String_literal", std::move(a), g);
+}
+
+// Build the CamlinternalFormatBasics.Format(...) wrapper, or null if the format
+// uses anything we don't yet desugar.
+inline tt::ExprBox make(const std::string& s, const Location& sloc) {
+  Location g = sloc;
+  g.ghost = true;
+  auto tree = parse(s, 0, g);
+  if (!tree) return nullptr;
+  std::vector<tt::ExprBox> a;
+  a.push_back(std::move(tree));
+  a.push_back(gstr(s, g));
+  return gctor("Format", std::move(a), sloc);  // outer wrapper keeps the real loc
+}
+}  // namespace fmtlib
+
 // Build the Stdlib path Stdlib!.name (Pdot over a global Stdlib ident).
 tt::Path stdlib_path(const std::string& name) {
   auto pre = std::make_shared<tt::Path>();
@@ -70,6 +218,24 @@ struct Typer {
     if (auto* p = std::get_if<Lident>(&x.v)) return p->name;
     if (auto* p = std::get_if<Ldot>(&x.v)) return p->name;
     return "?";
+  }
+
+  // Index of the format-string argument for a qualified Printf/Format/Scanf
+  // call (draft: qualified only, to avoid mis-converting shadowed names), or -1.
+  static int format_arg_index(const Longident& fn) {
+    auto* d = std::get_if<Ldot>(&fn.v);
+    if (!d) return -1;
+    std::string mod = lid_last(*d->prefix);
+    if (mod != "Printf" && mod != "Format" && mod != "Scanf") return -1;
+    const std::string& n = d->name;
+    if (n == "printf" || n == "eprintf" || n == "sprintf" || n == "asprintf" ||
+        n == "dprintf" || n == "scanf")
+      return 0;
+    if (n == "fprintf" || n == "ifprintf" || n == "bprintf" || n == "ksprintf" ||
+        n == "kprintf" || n == "kasprintf" || n == "sscanf" || n == "bscanf")
+      return 1;
+    if (n == "kfprintf" || n == "kbprintf") return 2;
+    return -1;
   }
 
   // Module-level `open M`: names exported by M resolve through M's path.
@@ -412,9 +578,21 @@ struct Typer {
     } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       tt::Texp_apply ap;
       ap.fn = std::make_unique<tt::Expression>(expr(*a->fn));
-      for (auto& [label, arg] : a->args)
-        ap.args.emplace_back(label,
-                             std::make_unique<tt::Expression>(expr(*arg)));
+      // Detect a format-string argument to a qualified printf/scanf-family call
+      // and desugar it to CamlinternalFormatBasics.Format(...).
+      int fmtidx = -1;
+      if (auto* fid = std::get_if<Pexp_ident>(&a->fn->desc))
+        fmtidx = format_arg_index(fid->id.txt);
+      for (size_t k = 0; k < a->args.size(); ++k) {
+        auto& [label, arg] = a->args[k];
+        tt::ExprBox av;
+        if (static_cast<int>(k) == fmtidx)
+          if (auto* cst = std::get_if<Pexp_constant>(&arg->desc))
+            if (auto* ps = std::get_if<ast::Pconst_string>(&cst->c.desc))
+              av = fmtlib::make(ps->s, arg->loc);
+        if (!av) av = std::make_unique<tt::Expression>(expr(*arg));
+        ap.args.emplace_back(label, std::move(av));
+      }
       out.desc = std::move(ap);
     } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
       out.desc = function(*f);
