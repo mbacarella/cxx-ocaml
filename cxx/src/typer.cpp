@@ -753,6 +753,18 @@ struct Typer {
         }
       }
       out.desc = std::move(tr);
+    } else if (auto* sti = std::get_if<Pexp_struct_item>(&e.desc)) {
+      // let module/open/exception … in e: the item's bindings scope to the body.
+      auto st = type_scope; auto md = module_scope; auto mt = modtype_scope;
+      auto fr = field_registry; auto op = opens;
+      push();
+      auto item = std::make_unique<tt::StructureItem>(structure_item(*sti->item));
+      auto body = std::make_unique<tt::Expression>(expr(*sti->body));
+      pop();
+      type_scope = std::move(st); module_scope = std::move(md);
+      modtype_scope = std::move(mt); field_registry = std::move(fr);
+      opens = std::move(op);
+      out.desc = tt::Texp_struct_item{std::move(item), std::move(body)};
     } else {
       throw TypeError("expr#" + std::to_string(e.desc.index()));
     }

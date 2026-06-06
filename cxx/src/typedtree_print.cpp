@@ -440,11 +440,15 @@ struct Printer {
       line(j + 1, "extended_expression =");
       if (r->extended) { line(j + 2, "Some"); expression(j + 3, **r->extended); }
       else line(j + 2, "None");
-    } else {
-      auto& fd = std::get<Texp_field>(e.desc);
+    } else if (auto* fd = std::get_if<Texp_field>(&e.desc)) {
       line(j, "Texp_field");
-      expression(j, *fd.record);
-      line(j, "\"" + fd.name + "\"");
+      expression(j, *fd->record);
+      line(j, "\"" + fd->name + "\"");
+    } else {
+      auto& si = std::get<Texp_struct_item>(e.desc);
+      line(j, "Texp_struct_item");
+      structure_item(j, *si.item);
+      expression(j, *si.body);
     }
   }
 
