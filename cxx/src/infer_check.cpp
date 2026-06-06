@@ -513,8 +513,9 @@ struct Checker {
     venv.emplace_back();
     std::vector<TypePtr> params;
     for (auto& fp : f.params) {
+      // (type a) introduces a locally-abstract type, not a value argument, so it
+      // contributes no arrow to the function's type.
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) params.push_back(infer_pat(pv->pat));
-      else params.push_back(eng.fresh_var());
     }
     TypePtr body;
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
