@@ -246,10 +246,21 @@ struct Printer {
         line(j, "]");
       }
       line(j, "None");  // existential (vars, type) annotation: always None here
-    } else {
-      auto& w = std::get<Tpat_value>(p.desc);
+    } else if (auto* w = std::get_if<Tpat_value>(&p.desc)) {
       line(j, "Tpat_value");
-      pattern(j, *w.inner);  // inner at same depth (printtyped: `pattern i`)
+      pattern(j, *w->inner);  // inner at same depth (printtyped: `pattern i`)
+    } else {
+      auto& tu = std::get<Tpat_tuple>(p.desc);
+      line(j, "Tpat_tuple");
+      if (tu.elems.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& [label, el] : tu.elems) {
+          line(j + 1, label ? "Label: Some \"" + *label + "\"" : "Label: None");
+          pattern(j + 1, *el);  // pattern at same depth as its Label
+        }
+        line(j, "]");
+      }
     }
   }
 
@@ -354,10 +365,14 @@ struct Printer {
       expression(j, *fo->lo);
       expression(j, *fo->hi);
       expression(j, *fo->body);
-    } else {
-      auto& lz = std::get<Texp_lazy>(e.desc);
+    } else if (auto* lz = std::get_if<Texp_lazy>(&e.desc)) {
       os << std::string(2 * j, ' ') << "Texp_lazy";  // run-on (no newline)
-      expression(j, *lz.e);
+      expression(j, *lz->e);
+    } else {
+      auto& wh = std::get<Texp_while>(e.desc);
+      line(j, "Texp_while");
+      expression(j, *wh.cond);
+      expression(j, *wh.body);
     }
   }
 

@@ -72,8 +72,13 @@ struct Tpat_construct {
   std::vector<PatBox> args;
 };
 struct Tpat_value { PatBox inner; };  // computation-pattern wrapper (match cases)
+struct Tpat_tuple {
+  std::vector<std::pair<std::optional<std::string>, PatBox>> elems;
+};
 struct Pattern {
-  std::variant<Tpat_any, Tpat_var, Tpat_constant, Tpat_construct, Tpat_value> desc;
+  std::variant<Tpat_any, Tpat_var, Tpat_constant, Tpat_construct, Tpat_value,
+               Tpat_tuple>
+      desc;
   Location loc;
 };
 
@@ -113,10 +118,12 @@ struct Texp_assert { ExprBox e; };
 enum class Direction { Up, Down };
 struct Texp_for { Ident var; Direction dir; ExprBox lo; ExprBox hi; ExprBox body; };
 struct Texp_lazy { ExprBox e; };
+struct Texp_while { ExprBox cond; ExprBox body; };
 struct Expression {
   std::variant<Texp_constant, Texp_ident, Texp_tuple, Texp_apply, Texp_function,
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
-               Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy>
+               Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
+               Texp_while>
       desc;
   Location loc;
 };

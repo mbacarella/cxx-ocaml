@@ -311,6 +311,12 @@ struct Typer {
         }
       }
       out.desc = std::move(tc);
+    } else if (auto* tu = std::get_if<Ppat_tuple>(&p.desc)) {
+      tt::Tpat_tuple tup;
+      for (auto& el : tu->elems)
+        tup.elems.emplace_back(std::nullopt,
+                               std::make_unique<tt::Pattern>(pattern(*el)));
+      out.desc = std::move(tup);
     } else {
       throw TypeError("pat#" + std::to_string(p.desc.index()));
     }
@@ -346,7 +352,7 @@ struct Typer {
       tt::Texp_let tl;
       tl.rf = le->rf;
       push();
-      for (auto& vb : le->bindings) tl.bindings.push_back(value_binding(vb));
+      tl.bindings = value_bindings(le->rf, le->bindings);
       tl.body = std::make_unique<tt::Expression>(expr(*le->body));
       pop();
       out.desc = std::move(tl);
@@ -407,6 +413,9 @@ struct Typer {
       out.desc = std::move(tf);
     } else if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
       out.desc = tt::Texp_lazy{std::make_unique<tt::Expression>(expr(*lz->e))};
+    } else if (auto* wh = std::get_if<Pexp_while>(&e.desc)) {
+      out.desc = tt::Texp_while{std::make_unique<tt::Expression>(expr(*wh->cond)),
+                                std::make_unique<tt::Expression>(expr(*wh->body))};
     } else {
       throw TypeError("expr#" + std::to_string(e.desc.index()));
     }
@@ -462,13 +471,34 @@ struct Typer {
     return out;
   }
 
+  // For `let rec`, bind all pattern names before typing any RHS so the names are
+  // in scope in their own and siblings' bodies.
+  std::vector<tt::ValueBinding> value_bindings(RecFlag rf,
+                                               const std::vector<ValueBinding>& vbs) {
+    std::vector<tt::ValueBinding> out;
+    if (rf == RecFlag::Recursive) {
+      std::vector<tt::Pattern> pats;
+      pats.reserve(vbs.size());
+      for (auto& vb : vbs) pats.push_back(pattern(vb.pat));
+      for (size_t i = 0; i < vbs.size(); ++i) {
+        tt::ValueBinding b;
+        b.pat = std::move(pats[i]);
+        b.expr = expr(*vbs[i].expr);
+        out.push_back(std::move(b));
+      }
+    } else {
+      for (auto& vb : vbs) out.push_back(value_binding(vb));
+    }
+    return out;
+  }
+
   tt::StructureItem structure_item(const StructureItem& it) {
     tt::StructureItem si;
     si.loc = it.loc;
     if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
       tt::Tstr_value out;
       out.rf = sv->rf;
-      for (auto& vb : sv->bindings) out.bindings.push_back(value_binding(vb));
+      out.bindings = value_bindings(sv->rf, sv->bindings);
       si.desc = std::move(out);
     } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc)) {
       si.desc = tt::Tstr_eval{std::make_unique<tt::Expression>(expr(*ev->e))};
