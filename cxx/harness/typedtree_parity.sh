@@ -25,18 +25,15 @@ oracle() {
     -dtypedtree "$1" 2>&1 1>/dev/null | sed -n '/^\[/,$p'
 }
 
-# Stamp normalization: ident stamps print as name/NNN inside double-quoted
-# strings ("x/274").  Map each DISTINCT numeric stamp to a per-file sequential
-# index, preserving the same-stamp<->same-id relation (so scope/shadowing bugs
-# still show up) while neutralizing the global Stdlib-load offset.  Only rewrite
-# inside quotes so location file paths are untouched.
+# Stamp normalization: ident stamps print as name/NNN, both inside quotes
+# ("x/274") and bare (type/module/constructor names: M/276, t/274).  Map each
+# DISTINCT numeric stamp to a per-file sequential index by first appearance,
+# preserving same-stamp<->same-id (so scope/shadowing bugs still show up) while
+# neutralizing the global Stdlib-load offset.  Applied globally: location
+# offsets have no "/NNN" form, and any "/NNN" in paths/string-constants is
+# identical on both sides, so the rewrite is symmetric and harmless.
 normalize() {
-  perl -pe 'BEGIN{%m=();$n=0}
-            s{"([^"]*)"}{
-              my $s=$1;
-              $s =~ s{/(\d+)}{ "/" . ($m{$1} //= ++$n) }ge;
-              "\"$s\""
-            }ge'
+  perl -pe 'BEGIN{%m=();$n=0} s{/(\d+)}{ "/" . ($m{$1} //= ++$n) }ge'
 }
 
 # Worker: process one file, print a single result token.  Invoked in parallel.

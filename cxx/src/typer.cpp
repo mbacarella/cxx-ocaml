@@ -54,8 +54,9 @@ struct Typer {
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
 
-  // Type constructors defined in this module (separate namespace from values).
+  // Type constructors and submodules defined here (own namespaces).
   std::unordered_map<std::string, tt::Ident> type_scope;
+  std::unordered_map<std::string, tt::Ident> module_scope;
 
   // Module-level `open M`: names exported by M resolve through M's path.
   struct OpenEntry {
@@ -86,6 +87,11 @@ struct Typer {
   tt::Ident fresh_type(const std::string& name) {
     tt::Ident id{name, next_stamp++, tt::Ident::Local};
     type_scope[name] = id;
+    return id;
+  }
+  tt::Ident fresh_module(const std::string& name) {
+    tt::Ident id{name, next_stamp++, tt::Ident::Local};
+    module_scope[name] = id;
     return id;
   }
   void push() { scopes.emplace_back(); }
@@ -259,9 +265,15 @@ struct Typer {
     throw TypeError("unsupported longident");
   }
 
-  // Resolve a module path head (e.g. List -> Stdlib!.List via implicit open).
+  // Resolve a module path head: local submodule, else Stdlib (implicit open).
   tt::Path resolve_module(const Longident& lid) {
     if (auto* l = std::get_if<Lident>(&lid.v)) {
+      auto m = module_scope.find(l->name);
+      if (m != module_scope.end()) {
+        tt::Path p;
+        p.v = tt::Pident{m->second};
+        return p;
+      }
       auto pre = std::make_shared<tt::Path>();
       pre->v = tt::Pident{tt::Ident{"Stdlib", 0, tt::Ident::Global}};
       tt::Path p;
@@ -492,6 +504,35 @@ struct Typer {
     return out;
   }
 
+  // A nested structure (module body) gets its own scopes; outer type/module/open
+  // bindings are visible inside but inner ones don't leak out.
+  std::vector<tt::StructureItem> nested_structure(const ast::Structure& s) {
+    auto st = type_scope;
+    auto md = module_scope;
+    auto op = opens;
+    push();
+    std::vector<tt::StructureItem> out;
+    for (auto& it : s) out.push_back(structure_item(it));
+    pop();
+    type_scope = std::move(st);
+    module_scope = std::move(md);
+    opens = std::move(op);
+    return out;
+  }
+
+  tt::ModuleExpr module_expr(const ModuleExpr& me) {
+    tt::ModuleExpr out;
+    out.loc = me.loc;
+    if (auto* mi = std::get_if<Pmod_ident>(&me.desc)) {
+      out.desc = tt::Tmod_ident{resolve_module(mi->id.txt)};
+    } else if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
+      out.desc = tt::Tmod_structure{nested_structure(ms->items)};
+    } else {
+      throw TypeError("module_expr#" + std::to_string(me.desc.index()));
+    }
+    return out;
+  }
+
   tt::StructureItem structure_item(const StructureItem& it) {
     tt::StructureItem si;
     si.loc = it.loc;
@@ -522,8 +563,9 @@ struct Typer {
       tt::Path mpath = resolve_module(mi->id.txt);
       tt::Tstr_open to;
       to.override_ = op->ovr == OverrideFlag::Override;
-      to.expr.loc = op->expr.loc;
-      to.expr.desc = tt::Tmod_ident{mpath};
+      to.expr = std::make_unique<tt::ModuleExpr>();
+      to.expr->loc = op->expr.loc;
+      to.expr->desc = tt::Tmod_ident{mpath};  // copy; mpath reused below
       si.desc = std::move(to);
       // Bring the opened module's names into scope (stdlib modules, best effort).
       if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
@@ -542,6 +584,13 @@ struct Typer {
       te.args = ctor_args(decl->args);
       if (decl->res) te.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
       si.desc = std::move(te);
+    } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+      auto& b = mb->binding;
+      tt::Tstr_module tm;
+      tm.id = fresh_module(b.name.txt ? *b.name.txt : "_");
+      tm.present = !std::holds_alternative<Pmod_ident>(b.expr.desc);  // alias=Absent
+      tm.expr = std::make_unique<tt::ModuleExpr>(module_expr(b.expr));
+      si.desc = std::move(tm);
     } else {
       throw TypeError("stritem#" + std::to_string(it.desc.index()));
     }

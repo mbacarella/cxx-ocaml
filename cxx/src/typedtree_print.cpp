@@ -395,6 +395,22 @@ struct Printer {
     expression(i + 1, vb.expr);
   }
 
+  void module_expr(int i, const ModuleExpr& me) {
+    line(i, "module_expr " + loc(me.loc));
+    if (auto* mi = std::get_if<Tmod_ident>(&me.desc)) {
+      line(i + 1, "Tmod_ident \"" + path_aux(mi->path) + "\"");
+    } else {
+      auto& ms = std::get<Tmod_structure>(me.desc);
+      line(i + 1, "Tmod_structure");
+      if (ms.items.empty()) line(i + 1, "[]");
+      else {
+        line(i + 1, "[");
+        for (auto& sit : ms.items) structure_item(i + 2, sit);
+        line(i + 1, "]");
+      }
+    }
+  }
+
   void structure_item(int i, const StructureItem& it) {
     line(i, "structure_item " + loc(it.loc));
     int j = i + 1;
@@ -422,9 +438,11 @@ struct Printer {
       list_strings(j + 2, pr->prims);
     } else if (auto* op = std::get_if<Tstr_open>(&it.desc)) {
       line(j, std::string("Tstr_open ") + (op->override_ ? "Override" : "Fresh"));
-      line(j, "module_expr " + loc(op->expr.loc));
-      auto& mi = std::get<Tmod_ident>(op->expr.desc);
-      line(j + 1, "Tmod_ident \"" + path_aux(mi.path) + "\"");
+      module_expr(j, *op->expr);
+    } else if (auto* md = std::get_if<Tstr_module>(&it.desc)) {
+      line(j, std::string("Tstr_module (") + (md->present ? "Present" : "Absent") + ")");
+      line(j, ident(md->id));
+      module_expr(j + 1, *md->expr);
     } else {
       auto& ex = std::get<Tstr_exception>(it.desc);
       line(j, "Tstr_exception");

@@ -168,12 +168,10 @@ struct TypeDeclaration {
   std::optional<CoreTypeBox> manifest;
 };
 
-// --- module expressions (fragment) ---
-struct Tmod_ident { Path path; };
-struct ModuleExpr {
-  std::variant<Tmod_ident> desc;
-  Location loc;
-};
+// Module expressions are mutually recursive with structures, so ModuleExpr is
+// defined after StructureItem and referenced here through a box.
+struct ModuleExpr;
+using ModuleExprBox = Box<ModuleExpr>;
 
 // --- structure ---
 struct Tstr_value {
@@ -181,7 +179,8 @@ struct Tstr_value {
   std::vector<ValueBinding> bindings;
 };
 struct Tstr_eval { ExprBox e; };
-struct Tstr_open { bool override_ = false; ModuleExpr expr; };
+struct Tstr_open { bool override_ = false; ModuleExprBox expr; };
+struct Tstr_module { bool present = true; Ident id; ModuleExprBox expr; };
 struct Tstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Tstr_primitive {
   Ident id;
@@ -197,11 +196,19 @@ struct Tstr_exception {
 };
 struct StructureItem {
   std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception,
-               Tstr_open>
+               Tstr_open, Tstr_module>
       desc;
   Location loc;
 };
 using Structure = std::vector<StructureItem>;
+
+// --- module expressions (now that Structure is complete) ---
+struct Tmod_ident { Path path; };
+struct Tmod_structure { Structure items; };
+struct ModuleExpr {
+  std::variant<Tmod_ident, Tmod_structure> desc;
+  Location loc;
+};
 
 // Render a structure in `ocamlc -dtypedtree` format.
 void print_dtypedtree(const Structure& s, std::string_view fname, std::ostream& os,
