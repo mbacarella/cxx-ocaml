@@ -130,12 +130,20 @@ enum class Direction { Up, Down };
 struct Texp_for { Ident var; Direction dir; ExprBox lo; ExprBox hi; ExprBox body; };
 struct Texp_lazy { ExprBox e; };
 struct Texp_while { ExprBox cond; ExprBox body; };
+// A record field in Texp_record: Overridden (name + value) or Kept (`with`).
+struct RecordField { bool kept = false; std::string name; ExprBox value; };
+struct Texp_record {
+  std::vector<RecordField> fields;          // in declaration order
+  std::string representation = "Record_regular";
+  std::optional<ExprBox> extended;          // `{ e with ... }`
+};
+struct Texp_field { ExprBox record; std::string name; };
 struct ExprExtra { CoreType ctype; Location loc; };  // Texp_constraint
 struct Expression {
   std::variant<Texp_constant, Texp_ident, Texp_tuple, Texp_apply, Texp_function,
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
                Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
-               Texp_while>
+               Texp_while, Texp_record, Texp_field>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;

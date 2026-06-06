@@ -58,6 +58,20 @@ struct Typer {
   std::unordered_map<std::string, tt::Ident> type_scope;
   std::unordered_map<std::string, tt::Ident> module_scope;
 
+  // Record fields: name -> the record type's full field list (decl order) +
+  // representation.  Drives Texp_record's decl-order emission and <kept> fields.
+  struct RecordInfo {
+    std::vector<std::string> decl_fields;
+    std::string repr = "Record_regular";
+  };
+  std::unordered_map<std::string, RecordInfo> field_registry;
+
+  static std::string lid_last(const Longident& x) {
+    if (auto* p = std::get_if<Lident>(&x.v)) return p->name;
+    if (auto* p = std::get_if<Ldot>(&x.v)) return p->name;
+    return "?";
+  }
+
   // Module-level `open M`: names exported by M resolve through M's path.
   struct OpenEntry {
     tt::Path path;
@@ -475,6 +489,43 @@ struct Typer {
     } else if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
       out = expr(*ct->e);  // become the inner expr; record the constraint as extra
       out.extras.push_back(tt::ExprExtra{core_type(*ct->t), e.loc});
+    } else if (auto* fd = std::get_if<Pexp_field>(&e.desc)) {
+      out.desc = tt::Texp_field{std::make_unique<tt::Expression>(expr(*fd->e)),
+                                lid_str(fd->field.txt)};
+    } else if (auto* rec = std::get_if<Pexp_record>(&e.desc)) {
+      tt::Texp_record tr;
+      if (rec->base)
+        tr.extended = std::make_unique<tt::Expression>(expr(**rec->base));
+      const RecordInfo* info = nullptr;
+      if (!rec->fields.empty()) {
+        auto it = field_registry.find(lid_last(rec->fields[0].first.txt));
+        if (it != field_registry.end()) info = &it->second;
+      }
+      if (info) {  // emit all fields in declaration order, <kept> for omitted
+        std::unordered_map<std::string, std::pair<std::string, const ExprBox*>> prov;
+        for (auto& [lid, ev] : rec->fields)
+          prov[lid_last(lid.txt)] = {lid_str(lid.txt), &ev};
+        tr.representation = info->repr;
+        for (auto& fname : info->decl_fields) {
+          tt::RecordField rf;
+          auto p = prov.find(fname);
+          if (p != prov.end()) {
+            rf.name = p->second.first;
+            rf.value = std::make_unique<tt::Expression>(expr(**p->second.second));
+          } else {
+            rf.kept = true;
+          }
+          tr.fields.push_back(std::move(rf));
+        }
+      } else {  // unknown record type: source order, all overridden
+        for (auto& [lid, ev] : rec->fields) {
+          tt::RecordField rf;
+          rf.name = lid_str(lid.txt);
+          rf.value = std::make_unique<tt::Expression>(expr(*ev));
+          tr.fields.push_back(std::move(rf));
+        }
+      }
+      out.desc = std::move(tr);
     } else {
       throw TypeError("expr#" + std::to_string(e.desc.index()));
     }
@@ -594,6 +645,19 @@ struct Typer {
       tt::Tstr_type out;
       out.rf = ty->rf;
       for (auto& d : ty->decls) fresh_type(d.name.txt);  // pre-bind (recursive)
+      for (auto& d : ty->decls) {
+        if (auto* r = std::get_if<Ptype_record>(&d.kind)) {  // register fields
+          RecordInfo info;
+          bool all_float = !r->fields.empty();
+          for (auto& f : r->fields) {
+            info.decl_fields.push_back(f.name.txt);
+            auto* fc = std::get_if<Ptyp_constr>(&f.type->desc);
+            if (!fc || lid_last(fc->id.txt) != "float") all_float = false;
+          }
+          if (all_float) info.repr = "Record_float";
+          for (auto& f : r->fields) field_registry[f.name.txt] = info;
+        }
+      }
       for (auto& d : ty->decls) out.decls.push_back(type_declaration(d));
       si.desc = std::move(out);
     } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {

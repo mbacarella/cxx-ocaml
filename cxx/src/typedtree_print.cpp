@@ -415,11 +415,36 @@ struct Printer {
     } else if (auto* lz = std::get_if<Texp_lazy>(&e.desc)) {
       os << std::string(2 * j, ' ') << "Texp_lazy";  // run-on (no newline)
       expression(j, *lz->e);
-    } else {
-      auto& wh = std::get<Texp_while>(e.desc);
+    } else if (auto* wh = std::get_if<Texp_while>(&e.desc)) {
       line(j, "Texp_while");
-      expression(j, *wh.cond);
-      expression(j, *wh.body);
+      expression(j, *wh->cond);
+      expression(j, *wh->body);
+    } else if (auto* r = std::get_if<Texp_record>(&e.desc)) {
+      line(j, "Texp_record");
+      line(j + 1, "fields =");
+      if (r->fields.empty()) line(j + 2, "[]");
+      else {
+        line(j + 2, "[");
+        for (auto& f : r->fields) {
+          if (f.kept) {
+            os << std::string(2 * (j + 3), ' ') << "<kept>";  // run-on (no \n)
+          } else {
+            line(j + 3, "\"" + f.name + "\"");
+            expression(j + 4, *f.value);
+          }
+        }
+        line(j + 2, "]");
+      }
+      line(j + 1, "representation =");
+      line(j + 2, r->representation);
+      line(j + 1, "extended_expression =");
+      if (r->extended) { line(j + 2, "Some"); expression(j + 3, **r->extended); }
+      else line(j + 2, "None");
+    } else {
+      auto& fd = std::get<Texp_field>(e.desc);
+      line(j, "Texp_field");
+      expression(j, *fd.record);
+      line(j, "\"" + fd.name + "\"");
     }
   }
 
