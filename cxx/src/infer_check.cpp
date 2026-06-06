@@ -323,6 +323,15 @@ struct Checker {
     }
   }
 
+  // Split a (instantiated) constructor scheme into its argument types and result.
+  static std::vector<TypePtr> ctor_params(const TypePtr& sch, TypePtr& result) {
+    std::vector<TypePtr> ps;
+    TypePtr c = I::Engine::repr(sch);
+    while (c->kind == I::Type::Kind::Arrow) { ps.push_back(c->dom); c = I::Engine::repr(c->cod); }
+    result = c;
+    return ps;
+  }
+
   TypePtr try_(std::function<TypePtr()> f) {
     try { return f(); } catch (const I::TypeError&) { return eng.fresh_var(); }
   }
@@ -399,22 +408,22 @@ struct Checker {
         if (k->arg) infer_pat(**k->arg);
         return eng.fresh_var();
       }
-      TypePtr sch = eng.instantiate(it->second);
+      TypePtr result;
+      auto ps = ctor_params(eng.instantiate(it->second), result);
       if (k->arg) {
-        // peel one or more arrow args against the (possibly tuple) sub-pattern
-        if (auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc)) {
-          for (auto& el : tup->elems) {
-            TypePtr s = I::Engine::repr(sch);
-            if (s->kind == I::Type::Kind::Arrow) { try_unify(s->dom, infer_pat(*el)); sch = s->cod; }
-            else infer_pat(*el);
-          }
+        auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
+        // A multi-argument constructor `B of t1*t2` (arity>1) destructures a
+        // tuple pattern element-wise; a single tuple-typed argument
+        // `A of (t1*t2)` (arity 1) unifies the whole tuple against the one arg.
+        if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
+          for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_pat(*tup->elems[i]));
+        } else if (!ps.empty()) {
+          try_unify(ps[0], infer_pat(**k->arg));
         } else {
-          TypePtr s = I::Engine::repr(sch);
-          if (s->kind == I::Type::Kind::Arrow) { try_unify(s->dom, infer_pat(**k->arg)); sch = s->cod; }
-          else infer_pat(**k->arg);
+          infer_pat(**k->arg);
         }
       }
-      return I::Engine::repr(sch);
+      return result;
     }
     if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
       TypePtr pt = infer_pat(*ct->p);
@@ -517,19 +526,19 @@ struct Checker {
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       auto it = ctors.find(lid_last(k->id.txt));
       if (it == ctors.end()) { if (k->arg) infer_expr(**k->arg); return eng.fresh_var(); }
-      TypePtr sch = eng.instantiate(it->second);
+      TypePtr result;
+      auto ps = ctor_params(eng.instantiate(it->second), result);
       if (k->arg) {
-        std::vector<const Expression*> args;
-        if (auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc))
-          for (auto& el : tup->elems) args.push_back(el.get());
-        else args.push_back(k->arg->get());
-        for (auto* ae : args) {
-          TypePtr s = I::Engine::repr(sch);
-          if (s->kind == I::Type::Kind::Arrow) { try_unify(s->dom, infer_expr(*ae)); sch = s->cod; }
-          else infer_expr(*ae);
+        auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+        if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
+          for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_expr(*tup->elems[i]));
+        } else if (!ps.empty()) {
+          try_unify(ps[0], infer_expr(**k->arg));
+        } else {
+          infer_expr(**k->arg);
         }
       }
-      return I::Engine::repr(sch);
+      return result;
     }
     if (auto* it = std::get_if<Pexp_ifthenelse>(&e.desc)) {
       try_unify(infer_expr(*it->cond), eng.constr("bool"));
