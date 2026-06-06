@@ -202,9 +202,10 @@ struct Typer {
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
 
-  // Type constructors and submodules defined here (own namespaces).
+  // Type constructors, submodules, and module types (own namespaces).
   std::unordered_map<std::string, tt::Ident> type_scope;
   std::unordered_map<std::string, tt::Ident> module_scope;
+  std::unordered_map<std::string, tt::Ident> modtype_scope;
 
   // Record fields: name -> the record type's full field list (decl order) +
   // representation.  Drives Texp_record's decl-order emission and <kept> fields.
@@ -272,6 +273,11 @@ struct Typer {
   tt::Ident fresh_module(const std::string& name) {
     tt::Ident id{name, next_stamp++, tt::Ident::Local};
     module_scope[name] = id;
+    return id;
+  }
+  tt::Ident fresh_modtype(const std::string& name) {
+    tt::Ident id{name, next_stamp++, tt::Ident::Local};
+    modtype_scope[name] = id;
     return id;
   }
   void push() { scopes.emplace_back(); }
@@ -425,6 +431,29 @@ struct Typer {
     return td;
   }
 
+  // Transcribe a (recursive) type-declaration group: pre-bind names, register
+  // record fields, then transcribe bodies.  Shared by Pstr_type and Psig_type.
+  std::vector<tt::TypeDeclaration> type_decls(
+      const std::vector<TypeDeclaration>& decls) {
+    for (auto& d : decls) fresh_type(d.name.txt);
+    for (auto& d : decls) {
+      if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+        RecordInfo info;
+        bool all_float = !r->fields.empty();
+        for (auto& f : r->fields) {
+          info.decl_fields.push_back(f.name.txt);
+          auto* fc = std::get_if<Ptyp_constr>(&f.type->desc);
+          if (!fc || lid_last(fc->id.txt) != "float") all_float = false;
+        }
+        if (all_float) info.repr = "Record_float";
+        for (auto& f : r->fields) field_registry[f.name.txt] = info;
+      }
+    }
+    std::vector<tt::TypeDeclaration> out;
+    for (auto& d : decls) out.push_back(type_declaration(d));
+    return out;
+  }
+
   // Resolve an unqualified value name: locals (innermost first), else Stdlib.
   tt::Path resolve_value(const Longident& lid, size_t err_pos) {
     if (auto* l = std::get_if<Lident>(&lid.v)) {
@@ -479,6 +508,26 @@ struct Typer {
       return p;
     }
     throw TypeError("unsupported module path");
+  }
+
+  // Resolve a module-type path: local module type, else qualified.
+  tt::Path resolve_modtype(const Longident& lid) {
+    if (auto* l = std::get_if<Lident>(&lid.v)) {
+      auto m = modtype_scope.find(l->name);
+      if (m != modtype_scope.end()) {
+        tt::Path p;
+        p.v = tt::Pident{m->second};
+        return p;
+      }
+      throw TypeError("Unbound module type " + l->name);
+    }
+    if (auto* d = std::get_if<Ldot>(&lid.v)) {
+      tt::Path prefix = resolve_module(*d->prefix);
+      tt::Path p;
+      p.v = tt::Pdot{std::make_shared<tt::Path>(std::move(prefix)), d->name};
+      return p;
+    }
+    throw TypeError("unsupported module-type path");
   }
 
   static std::string lid_str(const Longident& x) {
@@ -796,6 +845,52 @@ struct Typer {
     return out;
   }
 
+  // A signature gets its own scopes (its types/etc. don't leak out).
+  std::vector<tt::SignatureItem> signature(const Signature& items) {
+    auto st = type_scope; auto md = module_scope; auto mt = modtype_scope;
+    auto fr = field_registry; auto op = opens;
+    push();
+    std::vector<tt::SignatureItem> out;
+    for (auto& it : items) {
+      tt::SignatureItem si;
+      si.loc = it.loc;
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+        tt::ValueDesc vd;
+        vd.id = fresh_anon(v->vd.name.txt);
+        vd.type = core_type(*v->vd.type);
+        vd.loc = v->vd.loc;
+        vd.attrs = &v->vd.attrs;
+        si.desc = tt::Tsig_value{std::move(vd)};
+      } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        tt::Tsig_type ts;
+        ts.rf = t->rf;
+        ts.decls = type_decls(t->decls);
+        si.desc = std::move(ts);
+      } else {
+        throw TypeError("sigitem#" + std::to_string(it.desc.index()));
+      }
+      out.push_back(std::move(si));
+    }
+    pop();
+    type_scope = std::move(st); module_scope = std::move(md);
+    modtype_scope = std::move(mt); field_registry = std::move(fr);
+    opens = std::move(op);
+    return out;
+  }
+
+  tt::ModuleType module_type_t(const ModuleType& mt) {
+    tt::ModuleType out;
+    out.loc = mt.loc;
+    if (auto* id = std::get_if<Pmty_ident>(&mt.desc)) {
+      out.desc = tt::Tmty_ident{resolve_modtype(id->id.txt)};
+    } else if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) {
+      out.desc = tt::Tmty_signature{signature(sg->items)};
+    } else {
+      throw TypeError("module_type#" + std::to_string(mt.desc.index()));
+    }
+    return out;
+  }
+
   tt::ModuleExpr module_expr(const ModuleExpr& me) {
     tt::ModuleExpr out;
     out.loc = me.loc;
@@ -822,21 +917,7 @@ struct Typer {
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
       tt::Tstr_type out;
       out.rf = ty->rf;
-      for (auto& d : ty->decls) fresh_type(d.name.txt);  // pre-bind (recursive)
-      for (auto& d : ty->decls) {
-        if (auto* r = std::get_if<Ptype_record>(&d.kind)) {  // register fields
-          RecordInfo info;
-          bool all_float = !r->fields.empty();
-          for (auto& f : r->fields) {
-            info.decl_fields.push_back(f.name.txt);
-            auto* fc = std::get_if<Ptyp_constr>(&f.type->desc);
-            if (!fc || lid_last(fc->id.txt) != "float") all_float = false;
-          }
-          if (all_float) info.repr = "Record_float";
-          for (auto& f : r->fields) field_registry[f.name.txt] = info;
-        }
-      }
-      for (auto& d : ty->decls) out.decls.push_back(type_declaration(d));
+      out.decls = type_decls(ty->decls);
       si.desc = std::move(out);
     } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
       if (!pr->prim.type || pr->prim.alias) throw TypeError("primitive alias");
@@ -877,6 +958,12 @@ struct Typer {
       for (auto& c : e.ctors) out.ctors.push_back(ext_ctor(c));
       out.private_ = e.priv == PrivateFlag::Private;
       out.attrs = &e.attrs;
+      si.desc = std::move(out);
+    } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
+      tt::Tstr_modtype out;
+      out.id = fresh_modtype(mt->name.txt);
+      if (mt->type)
+        out.type = std::make_unique<tt::ModuleType>(module_type_t(*mt->type));
       si.desc = std::move(out);
     } else if (auto* at = std::get_if<Pstr_attribute>(&it.desc)) {
       si.desc = tt::Tstr_attribute{at->name, &at->payload};

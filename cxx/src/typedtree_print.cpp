@@ -484,6 +484,47 @@ struct Printer {
     }
   }
 
+  void value_desc(int i, const ValueDesc& vd) {
+    line(i, "value_description " + ident(vd.id) + " " + loc(vd.loc));
+    if (vd.attrs) attributes(i, *vd.attrs);
+    core_type(i + 1, vd.type);
+  }
+
+  void signature_item(int i, const SignatureItem& si) {
+    line(i, "signature_item " + loc(si.loc));
+    int j = i + 1;
+    if (auto* v = std::get_if<Tsig_value>(&si.desc)) {
+      line(j, "Tsig_value");
+      value_desc(j, v->vd);
+    } else {
+      auto& ty = std::get<Tsig_type>(si.desc);
+      line(j, std::string("Tsig_type ") +
+                  (ty.rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
+      if (ty.decls.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& d : ty.decls) type_declaration(j + 1, d);
+        line(j, "]");
+      }
+    }
+  }
+
+  void module_type(int i, const ModuleType& mt) {
+    line(i, "module_type " + loc(mt.loc));
+    if (auto* id = std::get_if<Tmty_ident>(&mt.desc)) {
+      line(i + 1, "Tmty_ident \"" + path_aux(id->path) + "\"");
+    } else {
+      auto& sg = std::get<Tmty_signature>(mt.desc);
+      line(i + 1, "Tmty_signature");
+      if (sg.items.empty()) line(i + 1, "[]");
+      else {
+        line(i + 1, "[");
+        for (auto& s : sg.items) signature_item(i + 2, s);
+        line(i + 1, "]");
+      }
+    }
+  }
+
   void structure_item(int i, const StructureItem& it) {
     line(i, "structure_item " + loc(it.loc));
     int j = i + 1;
@@ -522,6 +563,9 @@ struct Printer {
         ast::print_payload_structure(*at->payload, j, os, fname, dirfiles);
       else
         line(j, "[]");
+    } else if (auto* mt = std::get_if<Tstr_modtype>(&it.desc)) {
+      line(j, "Tstr_modtype \"" + ident(mt->id) + "\"");
+      if (mt->type) module_type(j + 1, *mt->type);
     } else if (auto* tx = std::get_if<Tstr_typext>(&it.desc)) {
       line(j, "Tstr_typext");
       line(j, "type_extension");

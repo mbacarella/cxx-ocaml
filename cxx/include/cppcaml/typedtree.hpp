@@ -192,6 +192,27 @@ struct TypeDeclaration {
   const ast::Attributes* attrs = nullptr;
 };
 
+// --- module types / signatures (fragment) ---
+struct ValueDesc {
+  Ident id;
+  CoreType type;
+  Location loc;
+  const ast::Attributes* attrs = nullptr;
+};
+struct Tsig_value { ValueDesc vd; };
+struct Tsig_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
+struct SignatureItem {
+  std::variant<Tsig_value, Tsig_type> desc;
+  Location loc;
+};
+struct Tmty_ident { Path path; };
+struct Tmty_signature { std::vector<SignatureItem> items; };
+struct ModuleType {
+  std::variant<Tmty_ident, Tmty_signature> desc;
+  Location loc;
+};
+using ModuleTypeBox2 = Box<ModuleType>;
+
 // Module expressions are mutually recursive with structures, so ModuleExpr is
 // defined after StructureItem and referenced here through a box.
 struct ModuleExpr;
@@ -231,9 +252,10 @@ struct Tstr_typext {
   const ast::Attributes* attrs = nullptr;
 };
 struct Tstr_attribute { std::string name; const ast::Structure* payload; };
+struct Tstr_modtype { Ident id; ModuleTypeBox2 type; };  // type null = abstract
 struct StructureItem {
   std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception,
-               Tstr_open, Tstr_module, Tstr_attribute, Tstr_typext>
+               Tstr_open, Tstr_module, Tstr_attribute, Tstr_typext, Tstr_modtype>
       desc;
   Location loc;
 };
