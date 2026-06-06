@@ -687,53 +687,68 @@ struct Checker {
   // labelled args in any order and optional args to be omitted).  When the
   // function's arrow spine is known, do label-aware matching; otherwise fall back
   // to plain positional peeling so unknown/var-typed callees never false-reject.
+  // Find the spine parameter index matching an argument label (lk/nm), among the
+  // not-yet-`used` params; returns -1 if none.  Labelled/optional args match by
+  // name, positional args match the next unlabelled param.
+  static int match_param(const std::vector<TypePtr>& spine, const std::vector<bool>& used,
+                         int lk, const std::string& nm) {
+    for (size_t i = 0; i < spine.size(); ++i) {
+      if (used[i]) continue;
+      if (lk == 0 ? spine[i]->arrow_label == 0
+                  : (spine[i]->arrow_label != 0 && spine[i]->arrow_lbl == nm))
+        return (int)i;
+    }
+    return -1;
+  }
+
   TypePtr infer_apply(const Pexp_apply& a) {
     TypePtr ft = infer_expr(*a.fn);
-    bool any_labelled = false;
-    for (auto& [lbl, arg] : a.args)
-      if (!std::holds_alternative<Nolabel>(lbl)) any_labelled = true;
+    // Collect the function's known arrow spine.
+    std::vector<TypePtr> spine;
+    TypePtr cur = I::Engine::repr(ft);
+    while (cur->kind == I::Type::Kind::Arrow) {
+      spine.push_back(cur);
+      cur = I::Engine::repr(cur->cod);
+    }
+    TypePtr tail = cur;
 
-    if (any_labelled) {
-      // Collect the known arrow spine of the function type.
-      std::vector<TypePtr> spine;
-      TypePtr cur = I::Engine::repr(ft);
-      while (cur->kind == I::Type::Kind::Arrow) {
-        spine.push_back(cur);
-        cur = I::Engine::repr(cur->cod);
-      }
-      TypePtr tail = cur;
+    // Dry run: can every argument be matched to a parameter by label?  (This is
+    // the OCaml commutation rule: labelled args in any order, positional args to
+    // the next unlabelled param, optionals skippable.)
+    std::vector<bool> dry(spine.size(), false);
+    bool can = !spine.empty();
+    for (auto& [lbl, arg] : a.args) {
+      auto [lk, nm] = arglabel(lbl);
+      int idx = match_param(spine, dry, lk, nm);
+      if (idx < 0) { can = false; break; }
+      dry[idx] = true;
+    }
+
+    if (can) {  // label-aware application
       std::vector<bool> used(spine.size(), false);
-      bool clean = true;
+      int maxc = -1;
       for (auto& [lbl, arg] : a.args) {
         auto [lk, nm] = arglabel(lbl);
-        int idx = -1;
-        for (size_t i = 0; i < spine.size(); ++i) {
-          if (used[i]) continue;
-          if (lk == 0 ? spine[i]->arrow_label == 0
-                      : (spine[i]->arrow_label != 0 && spine[i]->arrow_lbl == nm)) {
-            idx = (int)i;
-            break;
-          }
-        }
-        if (idx < 0) { clean = false; break; }
+        int idx = match_param(spine, used, lk, nm);
         used[idx] = true;
+        if (idx > maxc) maxc = idx;
         TypePtr at = infer_expr_expected(*arg, spine[idx]->dom);
         try_unify(spine[idx]->dom, at);
       }
-      if (clean) {
-        // result = the unconsumed params (in order) chained onto the tail
-        TypePtr res = tail;
-        for (int i = (int)spine.size() - 1; i >= 0; --i)
-          if (!used[i])
-            res = eng.arrow(spine[i]->dom, res, spine[i]->arrow_label, spine[i]->arrow_lbl);
-        return res;
+      // result = unconsumed params chained onto the tail, erasing any leading
+      // optional that precedes a consumed positional (it is defaulted).
+      TypePtr res = tail;
+      for (int i = (int)spine.size() - 1; i >= 0; --i) {
+        if (used[i]) continue;
+        if (spine[i]->arrow_label == 2 && i < maxc) continue;  // erased optional
+        res = eng.arrow(spine[i]->dom, res, spine[i]->arrow_label, spine[i]->arrow_lbl);
       }
-      // fall through to positional peeling on partial/unknown match
+      return res;
     }
 
+    // Fallback: spine unknown/insufficient -- peel positionally (bidirectional
+    // on each argument), so a var-typed callee never false-rejects.
     for (auto& [lbl, arg] : a.args) {
-      // Peel the function's expected domain first, so we can type-direct the
-      // argument (bidirectional checking) rather than inferring it blindly.
       TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
       try_unify(ft, eng.arrow(dom, r));
       TypePtr at = infer_expr_expected(*arg, dom);
