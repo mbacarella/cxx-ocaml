@@ -21,7 +21,8 @@ add_library(cppcaml_core
   src/marshal.cpp
   src/cmi.cpp
   src/typer.cpp
-  src/typedtree_print.cpp)
+  src/typedtree_print.cpp
+  src/infer.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 
 # Stage tools.
@@ -36,3 +37,6 @@ target_link_libraries(c++cmi PRIVATE cppcaml_core)
 
 add_executable(c++type src/tools/cpptype_main.cpp)
 target_link_libraries(c++type PRIVATE cppcaml_core)
+
+add_executable(c++infer-test src/tools/cppinfer_test.cpp)
+target_link_libraries(c++infer-test PRIVATE cppcaml_core)
