@@ -60,6 +60,12 @@ struct Checker {
   // `type ('a,..) t = <manifest>` can be expanded when t is used in annotations.
   struct Alias { std::vector<std::string> params; const CoreType* manifest; };
   std::unordered_map<std::string, Alias> type_aliases;
+  // GADT type names (a constructor has an explicit result type): matching one
+  // refines types per branch, so branch results must not be cross-unified.
+  std::set<std::string> gadt_types;
+  // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
+  // annotations mentioning `a` unify rather than clashing as an opaque constr.
+  std::unordered_map<std::string, TypePtr> newtype_vars;
   std::set<std::string> expanding_;  // guard against cyclic abbreviations
   // match-expression node -> is-partial (the result we route back to the dump)
   std::unordered_map<const Expression*, bool> match_partial;
@@ -143,6 +149,12 @@ struct Checker {
       return eng.tuple(std::move(es));
     }
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      // a bare locally-abstract type name resolves to its flexible var
+      if (c->args.empty())
+        if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
+          auto nt = newtype_vars.find(l->name);
+          if (nt != newtype_vars.end()) return nt->second;
+        }
       std::vector<TypePtr> as;
       for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
       // Expand a known type abbreviation (type (params) name = manifest), with a
@@ -307,7 +319,9 @@ struct Checker {
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;
     std::vector<std::string> names;
-    for (auto& c : v->ctors) names.push_back(c.name.txt);
+    bool is_gadt = false;
+    for (auto& c : v->ctors) { names.push_back(c.name.txt); if (c.res) is_gadt = true; }
+    if (is_gadt) gadt_types.insert(d.name.txt);
     type_ctors[d.name.txt] = std::move(names);
     for (auto& c : v->ctors) {
       std::unordered_map<std::string, TypePtr> vars;
@@ -511,6 +525,10 @@ struct Checker {
     if (auto* a = std::get_if<Pexp_apply>(&e.desc))
       return infer_apply(*a);
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return infer_function(*f);
+    if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) {  // fun (type a) -> e
+      newtype_vars[nt->name.txt] = eng.fresh_var();
+      return infer_expr(*nt->body);
+    }
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
       venv.emplace_back();
       infer_bindings(le->rf, le->bindings);
@@ -552,12 +570,18 @@ struct Checker {
     }
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       TypePtr se = infer_expr(*m->e);
+      TypePtr sr = I::Engine::repr(se);
+      // Matching a GADT refines types per branch (e.g. Int -> int, Ptr ->
+      // int list at result type 'a); cross-unifying the branch results would be
+      // an unsound clash, so leave the result type open for GADT scrutinees.
+      bool gadt = sr->kind == I::Type::Kind::Constr && gadt_types.count(sr->path);
       TypePtr rt = eng.fresh_var();
       for (auto& c : m->cases) {
         venv.emplace_back();
         try_unify(infer_pat(c.lhs), se);
         if (c.guard) infer_expr(**c.guard);
-        try_unify(infer_expr(*c.rhs), rt);
+        TypePtr br = infer_expr(*c.rhs);
+        if (!gadt) try_unify(br, rt);
         venv.pop_back();
       }
       match_partial[&e] = compute_partial(se, m->cases);  // for the dump (Slice 3)
@@ -650,6 +674,11 @@ struct Checker {
 
   TypePtr infer_function(const Pexp_function& f) {
     venv.emplace_back();
+    // Bind all (type a) params to flexible vars first, so value-param
+    // annotations mentioning them resolve regardless of order.
+    for (auto& fp : f.params)
+      if (auto* nt = std::get_if<Pparam_newtype>(&fp.desc))
+        newtype_vars[nt->name.txt] = eng.fresh_var();
     struct Param { TypePtr ty; int lk; std::string nm; };
     std::vector<Param> params;
     for (auto& fp : f.params) {
