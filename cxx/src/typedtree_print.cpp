@@ -222,6 +222,16 @@ struct Printer {
     else line(j + 1, "None");
   }
 
+  void extension_constructor(int i, const ExtCtor& c) {
+    line(i, "extension_constructor " + loc(c.loc));
+    line(i + 1, "pext_name = \"" + ident(c.id) + "\"");
+    line(i + 1, "pext_kind =");
+    line(i + 2, "Text_decl");
+    list_core_types(i + 3, c.args);
+    if (c.res) { line(i + 3, "Some"); core_type(i + 4, **c.res); }
+    else line(i + 3, "None");
+  }
+
   void list_strings(int i, const std::vector<std::string>& ss) {
     if (ss.empty()) { line(i, "[]"); return; }
     line(i, "[");
@@ -487,20 +497,29 @@ struct Printer {
         ast::print_payload_structure(*at->payload, j, os, fname, dirfiles);
       else
         line(j, "[]");
+    } else if (auto* tx = std::get_if<Tstr_typext>(&it.desc)) {
+      line(j, "Tstr_typext");
+      line(j, "type_extension");
+      if (tx->attrs) attributes(j, *tx->attrs);
+      line(j + 1, "ptyext_path = \"" + path_aux(tx->path) + "\"");
+      line(j + 1, "ptyext_params =");
+      list_core_types(j + 2, tx->params);
+      line(j + 1, "ptyext_constructors =");
+      if (tx->ctors.empty()) line(j + 2, "[]");
+      else {
+        line(j + 2, "[");
+        for (auto& c : tx->ctors) extension_constructor(j + 3, c);
+        line(j + 2, "]");
+      }
+      line(j + 1, std::string("ptyext_private = ") +
+                      (tx->private_ ? "Private" : "Public"));
     } else {
       auto& ex = std::get<Tstr_exception>(it.desc);
       line(j, "Tstr_exception");
       line(j, "type_exception");
       if (ex.attrs) attributes(j, *ex.attrs);
       line(j + 1, "ptyext_constructor =");
-      int k = j + 2;
-      line(k, "extension_constructor " + loc(ex.loc));
-      line(k + 1, "pext_name = \"" + ident(ex.id) + "\"");
-      line(k + 1, "pext_kind =");
-      line(k + 2, "Text_decl");
-      list_core_types(k + 3, ex.args);
-      if (ex.res) { line(k + 3, "Some"); core_type(k + 4, **ex.res); }
-      else line(k + 3, "None");
+      extension_constructor(j + 2, ex.ctor);
     }
   }
 

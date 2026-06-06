@@ -204,17 +204,28 @@ struct Tstr_primitive {
   CoreType type;
   std::vector<std::string> prims;  // the "external" strings
 };
-struct Tstr_exception {
+// An extension constructor (Text_decl form): shared by exceptions and typexts.
+struct ExtCtor {
   Location loc;
   Ident id;
   std::vector<CoreTypeBox> args;
   std::optional<CoreTypeBox> res;
+};
+struct Tstr_exception {
+  ExtCtor ctor;
   const ast::Attributes* attrs = nullptr;  // ptyexn_attributes
+};
+struct Tstr_typext {
+  Path path;
+  std::vector<CoreTypeBox> params;
+  std::vector<ExtCtor> ctors;
+  bool private_ = false;
+  const ast::Attributes* attrs = nullptr;
 };
 struct Tstr_attribute { std::string name; const ast::Structure* payload; };
 struct StructureItem {
   std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception,
-               Tstr_open, Tstr_module, Tstr_attribute>
+               Tstr_open, Tstr_module, Tstr_attribute, Tstr_typext>
       desc;
   Location loc;
 };

@@ -182,6 +182,17 @@ struct Typer {
     return out;
   }
 
+  tt::ExtCtor ext_ctor(const ExtensionConstructor& c) {
+    auto* decl = std::get_if<Pext_decl>(&c.kind);
+    if (!decl) throw TypeError("extension rebind");
+    tt::ExtCtor out;
+    out.loc = c.loc;
+    out.id = fresh_anon(c.name.txt);
+    out.args = ctor_args(decl->args);
+    if (decl->res) out.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
+    return out;
+  }
+
   tt::ConstructorDecl constructor_decl(const ConstructorDecl& c) {
     tt::ConstructorDecl out;
     out.loc = c.loc;
@@ -611,16 +622,20 @@ struct Typer {
         opens.push_back(std::move(oe));
       }
     } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
-      auto& ctor = ex->exn.ctor;
-      auto* decl = std::get_if<Pext_decl>(&ctor.kind);
-      if (!decl) throw TypeError("exception rebind");
       tt::Tstr_exception te;
-      te.loc = ctor.loc;
-      te.id = fresh_anon(ctor.name.txt);
-      te.args = ctor_args(decl->args);
-      if (decl->res) te.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
+      te.ctor = ext_ctor(ex->exn.ctor);
       te.attrs = &ex->exn.attrs;
       si.desc = std::move(te);
+    } else if (auto* tx = std::get_if<Pstr_typext>(&it.desc)) {
+      auto& e = tx->ext;
+      tt::Tstr_typext out;
+      out.path = resolve_type(e.path.txt);
+      for (auto& p : e.params)
+        out.params.push_back(std::make_unique<tt::CoreType>(core_type(*p)));
+      for (auto& c : e.ctors) out.ctors.push_back(ext_ctor(c));
+      out.private_ = e.priv == PrivateFlag::Private;
+      out.attrs = &e.attrs;
+      si.desc = std::move(out);
     } else if (auto* at = std::get_if<Pstr_attribute>(&it.desc)) {
       si.desc = tt::Tstr_attribute{at->name, &at->payload};
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
