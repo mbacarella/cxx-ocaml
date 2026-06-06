@@ -896,3 +896,19 @@ The remaining ~173 false-accepts are concentrated in: module signature *content*
 (value-type + type-decl comparison, ~19), and the deep features above -- each a substantial
 subsystem (the OO/row-types layer being the largest).  These, not more propagation, are the
 next soundness frontier.
+
+## Signature-content matching: value side (soundness 72.7% -> 71.0%)
+
+Extended Includemod from missing-names to value TYPES: a value a structure provides must
+match the type its ascribed signature declares, flagged via expected_clash (reliable
+builtins + identity, pure) so an incomplete inferred type can't false-report.  Inline
+signatures only.  Skip the value-type check when the structure has a top-level `open` (a
+generalized open shadows an export in our flat export map though OCaml doesn't export it --
+shadowing.ml); missing-name checking still runs.  Completeness held at 6.
+
+The type-DECLARATION side of signature content (`sig type t = int end` vs `struct type t =
+string end`) remains: it needs the structure's own type definitions plumbed through
+module_exports (module-scoped type tracking), which today's flat global type registry
+doesn't provide -- deferred.
+
+Session soundness arc: 81.1% -> 71.0% false-acceptance; completeness pinned at 99.2%.
