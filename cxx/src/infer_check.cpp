@@ -101,6 +101,11 @@ struct Checker {
   // so we keep them unknown rather than resolve to the wrong kind.
   std::set<std::string> predef_ctors_;
   std::set<std::string> exn_ctors_;
+  // record fields with a UNIQUE label across all record types: label -> generic
+  // scheme arrow(recordType, fieldType).  Ambiguous labels are omitted (type-
+  // directed disambiguation needed) and left to Any, so this can't pick wrong.
+  std::unordered_map<std::string, TypePtr> fields_;
+  std::unordered_map<std::string, std::vector<TypePtr>> field_candidates_;
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
@@ -633,6 +638,29 @@ struct Checker {
     }
   }
 
+  // Collect a record type's field schemes: label -> arrow((params) t, field),
+  // sharing the params and carrying the type's identity stamp.  Uniqueness across
+  // all record types is resolved later in finalize_fields.
+  void register_record_decl(const TypeDeclaration& d) {
+    auto* rec = std::get_if<Ptype_record>(&d.kind);
+    if (!rec) return;
+    std::unordered_map<std::string, TypePtr> vars;
+    std::vector<TypePtr> params;
+    for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
+    TypePtr recTy = eng.constr(d.name.txt, params, type_stamp_[&d]);
+    for (auto& f : rec->fields) {
+      // a universally-quantified field (`{ f : 'a. ... }`) is polymorphic per use;
+      // a single monomorphic scheme would clash, so leave it to Any.
+      if (std::holds_alternative<Ptyp_poly>(f.type->desc)) continue;
+      field_candidates_[f.name.txt].push_back(eng.arrow(recTy, from_coretype(*f.type, vars)));
+    }
+  }
+  // Keep only labels unique across all record types (others need type-direction).
+  void finalize_fields() {
+    for (auto& [k, v] : field_candidates_)
+      if (v.size() == 1) fields_[k] = v[0];
+  }
+
   // Register an exception/extension constructor: A of t1*..*tn => t1->..->tn->exn.
   // Participates in ambiguity detection so `exception E` + `type t = E` makes E
   // ambiguous (type-directed disambiguation, approximated as unknown).
@@ -870,11 +898,18 @@ struct Checker {
       return t;
     }
     if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
-      // record fields aren't typed (deferred); bind their vars to Any so a field
-      // with a polymorphic type (`{ pf : 'a. ... }`) used at several types in the
-      // body doesn't clash through a single monomorphic var.
-      for (auto& [lid, sub] : r->fields) bind_pat_any(*sub);
-      return eng.any();
+      // Type fields via the unique-label registry; an ambiguous/unknown label's
+      // sub-pattern vars bind to Any (a polymorphic field used at several types
+      // must not clash through one monomorphic var).
+      TypePtr recTy = nullptr;
+      for (auto& [lid, sub] : r->fields) {
+        auto it = fields_.find(lid_last(lid.txt));
+        if (it == fields_.end()) { bind_pat_any(*sub); continue; }
+        TypePtr s = I::Engine::repr(eng.instantiate(it->second));
+        try_unify(infer_pat(*sub), s->cod);
+        if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
+      }
+      return recTy ? recTy : eng.any();
     }
     if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
       for (auto& el : a->elems) infer_pat(*el);
@@ -1017,9 +1052,51 @@ struct Checker {
       TypePtr at = from_coretype(*ct->t, vars);
       return at;
     }
-    // record / field / variant / etc.: best-effort (record-field types need
-    // type-directed disambiguation of shared labels; without it, a flat label
-    // registry resolves to the wrong record type and clashes -- left opaque).
+    // Records, via the unique-label registry (ambiguous labels -> Any).
+    if (auto* fld = std::get_if<Pexp_field>(&e.desc)) {
+      auto it = fields_.find(lid_last(fld->field.txt));
+      if (it == fields_.end()) { infer_expr(*fld->e); return eng.any(); }
+      TypePtr s = I::Engine::repr(eng.instantiate(it->second));  // recTy -> fldTy
+      try_unify(infer_expr(*fld->e), s->dom);
+      return s->cod;
+    }
+    if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
+      // Record update `{ e with ... }` flows the base record through incomplete
+      // inference (e.g. recursive maps over a record tree) and clashes; its
+      // soundness value is low, so type only plain construction.
+      if (rc->base) {
+        bool sv = strict; strict = false;
+        infer_expr(**rc->base);
+        for (auto& [lbl, val] : rc->fields) infer_expr(*val);
+        strict = sv;
+        return eng.any();
+      }
+      TypePtr recTy = nullptr;
+      for (auto& [lbl, val] : rc->fields) {
+        // Infer the field value for its type, but suppress errors from inside its
+        // body: traversing field values exposes unrelated inference incompleteness
+        // (effect handlers, polymorphic recursion).  The record-shape check below
+        // still records (strict restored).
+        bool sv = strict; strict = false;
+        TypePtr vt = infer_expr(*val);
+        strict = sv;
+        auto it = fields_.find(lid_last(lbl.txt));
+        if (it == fields_.end()) continue;
+        TypePtr s = I::Engine::repr(eng.instantiate(it->second));
+        try_unify(vt, s->cod);
+        if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
+      }
+      return recTy ? recTy : eng.any();
+    }
+    if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
+      auto it = fields_.find(lid_last(sf->field.txt));
+      if (it != fields_.end()) {
+        TypePtr s = I::Engine::repr(eng.instantiate(it->second));
+        try_unify(infer_expr(*sf->obj), s->dom);
+        try_unify(infer_expr(*sf->value), s->cod);
+      } else { infer_expr(*sf->obj); infer_expr(*sf->value); }
+      return eng.constr("unit");
+    }
     if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
       TypePtr el = eng.fresh_var();
       for (auto& x : a->elems) try_unify(el, infer_expr(*x));
@@ -1389,9 +1466,12 @@ struct Checker {
 // structures (a flat ctor namespace — best-effort, so `open M; A` resolves).
 static void register_types_rec(Checker& ck, const ast::Structure& s) {
   for (auto& it : s) {
-    if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+    if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+      // two passes so a mutually-recursive group's aliases are all registered
+      // before any record fields/ctors that reference them are built.
       for (auto& d : ty->decls) ck.register_type_decl(d);
-    else if (auto* ex = std::get_if<Pstr_exception>(&it.desc))
+      for (auto& d : ty->decls) ck.register_record_decl(d);
+    } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc))
       ck.register_exception(ex->exn.ctor);
     else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       const ModuleExpr* me = &mb->binding.expr;
@@ -1407,6 +1487,7 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
 static void run_checker(Checker& ck, const ast::Structure& s) {
   ck.register_predef_ctors();
   register_types_rec(ck, s);
+  ck.finalize_fields();
   ck.check_cyclic_aliases();
   ck.process_items(s);
 }
