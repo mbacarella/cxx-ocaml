@@ -259,7 +259,12 @@ struct Checker {
   }
 
   TypePtr constant_type(const Constant& c) {
-    if (std::holds_alternative<Pconst_integer>(c.desc)) return eng.constr("int");
+    if (auto* i = std::get_if<Pconst_integer>(&c.desc)) {
+      if (i->suffix == 'l') return eng.constr("int32");
+      if (i->suffix == 'L') return eng.constr("int64");
+      if (i->suffix == 'n') return eng.constr("nativeint");
+      return eng.constr("int");  // unsuffixed (or user-defined suffix => int)
+    }
     if (std::holds_alternative<Pconst_char>(c.desc)) return eng.constr("char");
     if (std::holds_alternative<Pconst_string>(c.desc)) return eng.constr("string");
     return eng.constr("float");
@@ -325,6 +330,29 @@ struct Checker {
     return eng.fresh_var();
   }
 
+  // Is `t` (after repr) a printf-family format type — format / format4 /
+  // format6, possibly module-qualified?  A string literal in such a position is
+  // a valid format and must be accepted as that type, not as `string`.
+  static bool is_format_constr(const TypePtr& t0) {
+    TypePtr t = I::Engine::repr(t0);
+    if (t->kind != I::Type::Kind::Constr) return false;
+    auto dot = t->path.rfind('.');
+    std::string base = dot == std::string::npos ? t->path : t->path.substr(dot + 1);
+    return base == "format" || base == "format4" || base == "format6";
+  }
+
+  // Infer an expression with an expected type pushed down (bidirectional).  The
+  // only type-directed rule so far: a string literal expected at a format type
+  // is accepted as that format (OCaml's type_format).  Otherwise it's ordinary
+  // inference; the caller still unifies the result against the expected type.
+  TypePtr infer_expr_expected(const Expression& e, const TypePtr& expected) {
+    if (auto* c = std::get_if<Pexp_constant>(&e.desc))
+      if (std::holds_alternative<Pconst_string>(c->c.desc) &&
+          is_format_constr(expected))
+        return expected;
+    return infer_expr(e);
+  }
+
   TypePtr infer_expr(const Expression& e) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return constant_type(c->c);
     if (auto* id = std::get_if<Pexp_ident>(&e.desc))
@@ -332,16 +360,14 @@ struct Checker {
     if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       TypePtr ft = infer_expr(*a->fn);
       for (auto& [lbl, arg] : a->args) {
-        TypePtr at = infer_expr(*arg);
-        TypePtr r = eng.fresh_var();
-        try_unify(ft, eng.arrow(at, r));
+        // Peel the function's expected domain first, so we can type-direct the
+        // argument (bidirectional checking) rather than inferring it blindly.
+        TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
+        try_unify(ft, eng.arrow(dom, r));
+        TypePtr at = infer_expr_expected(*arg, dom);
+        try_unify(dom, at);
         ft = I::Engine::repr(r);
       }
-      // NOTE: string literals in a format-typed position currently infer as
-      // `string` and clash with `format6` -> a known false-rejection category.
-      // The correct fix is expected-type propagation (bidirectional checking),
-      // re-typing the literal as a format against its expected type -- NOT a
-      // callee-name heuristic.  Deferred to the bidirectional-inference work.
       return ft;
     }
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return infer_function(*f);
