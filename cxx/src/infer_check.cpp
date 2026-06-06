@@ -56,6 +56,11 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> ctors;
   // finite variant types: type name -> its full constructor-name set
   std::unordered_map<std::string, std::vector<std::string>> type_ctors;
+  // type abbreviations: name -> (param var names, manifest core_type) so that a
+  // `type ('a,..) t = <manifest>` can be expanded when t is used in annotations.
+  struct Alias { std::vector<std::string> params; const CoreType* manifest; };
+  std::unordered_map<std::string, Alias> type_aliases;
+  std::set<std::string> expanding_;  // guard against cyclic abbreviations
   // match-expression node -> is-partial (the result we route back to the dump)
   std::unordered_map<const Expression*, bool> match_partial;
   // local module name -> its exported value schemes (so open/include/M.x resolve)
@@ -138,6 +143,20 @@ struct Checker {
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
       std::vector<TypePtr> as;
       for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
+      // Expand a known type abbreviation (type (params) name = manifest), with a
+      // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
+      std::string nm = lid_last(c->id.txt);
+      auto ai = type_aliases.find(nm);
+      if (ai != type_aliases.end() && ai->second.params.size() == as.size() &&
+          !expanding_.count(nm)) {
+        std::unordered_map<std::string, TypePtr> sub;
+        for (size_t i = 0; i < as.size(); ++i)
+          if (!ai->second.params[i].empty()) sub[ai->second.params[i]] = as[i];
+        expanding_.insert(nm);
+        TypePtr r = from_coretype(*ai->second.manifest, sub);
+        expanding_.erase(nm);
+        return r;
+      }
       return eng.constr(lid_full(c->id.txt), std::move(as));
     }
     return eng.fresh_var();
@@ -238,6 +257,13 @@ struct Checker {
 
   // Register a user variant: A of t1*..*tn -> scheme t1->..->tn->(params) name.
   void register_type_decl(const TypeDeclaration& d) {
+    if (d.manifest) {  // `type (params) t = <manifest>`: a type abbreviation
+      std::vector<std::string> ps;
+      for (auto& p : d.params)
+        ps.push_back(std::holds_alternative<Ptyp_var>(p->desc)
+                         ? std::get<Ptyp_var>(p->desc).name : "");
+      type_aliases[d.name.txt] = {std::move(ps), d.manifest->get()};
+    }
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;
     std::vector<std::string> names;
