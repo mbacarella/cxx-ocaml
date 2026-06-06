@@ -54,7 +54,9 @@ if [ "${1:-}" == "--worker" ]; then
     [ -n "$o" ] && printf 'B 1\n' || printf 'B 0\n'
   else                                 # diff mode
     on=$(printf '%s' "$o" | normalize)
-    c=$("$CPP" "$f" 2>/dev/null)
+    # CPP_TIMEOUT guards against a c++type hang pinning a core during a sweep;
+    # to debug a hang, run `c++type <file>` directly (no timeout) under gdb.
+    c=$(timeout "${CPP_TIMEOUT:-10}" "$CPP" "$f" 2>/dev/null)
     cn=$(printf '%s' "$c" | normalize)
     if [ "$on" == "$cn" ]; then printf 'M\n'
     elif [ -z "$c" ] || [ "${c#TYPE_ERROR}" != "$c" ]; then
