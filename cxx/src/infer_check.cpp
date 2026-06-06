@@ -438,8 +438,66 @@ struct Checker {
     type_ctors["unit"] = {"()"};
   }
 
+  // Collect the type-variable names in a core type.  Sets `uncertain` when a
+  // construct that can introduce/bind implicit row or universal variables
+  // appears (poly-variant, object, alias, poly, package, class) -- we then skip
+  // the unbound-variable check to stay sound (never false-reject).
+  static void collect_tyvars(const CoreType& t, std::set<std::string>& vars, bool& uncertain) {
+    if (auto* v = std::get_if<Ptyp_var>(&t.desc)) { vars.insert(v->name); return; }
+    if (std::holds_alternative<Ptyp_any>(t.desc)) return;
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      collect_tyvars(*a->dom, vars, uncertain); collect_tyvars(*a->cod, vars, uncertain); return;
+    }
+    if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : tu->elems) collect_tyvars(*e, vars, uncertain); return;
+    }
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      for (auto& a : c->args) collect_tyvars(*a, vars, uncertain); return;
+    }
+    uncertain = true;  // variant/object/alias/poly/package/class/...: be safe
+  }
+  // The unbound-type-variable restriction on a type declaration: every variable
+  // used in the body must be a declared parameter (or bound by a constraint /
+  // constructor existential).  Conservative: skip GADTs and uncertain bodies.
+  void check_type_vars(const TypeDeclaration& d) {
+    if (!strict) return;
+    std::set<std::string> allowed;
+    bool uncertain = false;
+    for (auto& p : d.params)
+      if (auto* v = std::get_if<Ptyp_var>(&p->desc)) allowed.insert(v->name);
+    for (auto& con : d.constraints) {  // constraint t1 = t2 binds its variables
+      collect_tyvars(*con.t1, allowed, uncertain);
+      collect_tyvars(*con.t2, allowed, uncertain);
+    }
+    std::set<std::string> used;
+    if (d.manifest) collect_tyvars(*d.manifest->get(), used, uncertain);
+    if (auto* rec = std::get_if<Ptype_record>(&d.kind))
+      for (auto& f : rec->fields) collect_tyvars(*f.type, used, uncertain);
+    if (auto* var = std::get_if<Ptype_variant>(&d.kind))
+      for (auto& c : var->ctors) {
+        if (c.res) { uncertain = true; break; }  // GADT: existential vars -- skip
+        std::set<std::string> exi(allowed);
+        for (auto& vn : c.vars) exi.insert(vn);  // A : 'a. ... -> t  existentials
+        if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
+          for (auto& e : tup->elems) {
+            std::set<std::string> u; collect_tyvars(*e, u, uncertain);
+            for (auto& vn : u) if (!exi.count(vn)) used.insert(vn);
+          }
+        else if (auto* r = std::get_if<Pcstr_record>(&c.args))
+          for (auto& f : r->fields) {
+            std::set<std::string> u; collect_tyvars(*f.type, u, uncertain);
+            for (auto& vn : u) if (!exi.count(vn)) used.insert(vn);
+          }
+      }
+    if (uncertain) return;
+    for (auto& v : used)
+      if (!allowed.count(v))
+        note_error("The type variable \"'" + v + "\" is unbound in this type declaration.");
+  }
+
   // Register a user variant: A of t1*..*tn -> scheme t1->..->tn->(params) name.
   void register_type_decl(const TypeDeclaration& d) {
+    check_type_vars(d);
     type_arity[d.name.txt] = (int)d.params.size();
     if (d.manifest) {  // `type (params) t = <manifest>`: a type abbreviation
       std::vector<std::string> ps;
