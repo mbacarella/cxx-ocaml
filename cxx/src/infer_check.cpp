@@ -73,6 +73,7 @@ struct Checker {
   // refines types per branch, so branch results must not be cross-unified.
   std::set<std::string> gadt_types;
   std::set<std::string> gadt_ctors;  // constructor names belonging to a GADT
+  std::unordered_map<std::string, int> type_arity;  // type name -> param count
   // constructors defined in more than one type: ambiguous without type-directed
   // disambiguation, so treated as unknown (a flat last-wins map picks wrong).
   std::set<std::string> ambiguous_ctors_;
@@ -199,6 +200,12 @@ struct Checker {
       if (is_format_base(lid_full(c->id.txt))) return eng.constr("format6");
       std::vector<TypePtr> as;
       for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
+      // Pad an under-applied type (e.g. an existential GADT's `_ raw_arity`
+      // written with fewer wildcards than the type's arity) with Any, so it
+      // unifies with the fully-applied form instead of clashing on arity.
+      auto ar = type_arity.find(lid_last(c->id.txt));
+      if (ar != type_arity.end())
+        while ((int)as.size() < ar->second) as.push_back(eng.any());
       // Expand a known type abbreviation (type (params) name = manifest), with a
       // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
       std::string nm = lid_last(c->id.txt);
@@ -412,6 +419,7 @@ struct Checker {
 
   // Register a user variant: A of t1*..*tn -> scheme t1->..->tn->(params) name.
   void register_type_decl(const TypeDeclaration& d) {
+    type_arity[d.name.txt] = (int)d.params.size();
     if (d.manifest) {  // `type (params) t = <manifest>`: a type abbreviation
       std::vector<std::string> ps;
       for (auto& p : d.params)
