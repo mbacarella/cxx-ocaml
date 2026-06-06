@@ -626,3 +626,40 @@ oracle: `(+) : int -> int -> int`, `compare : 'a -> 'a -> int`, `@@ : ('a -> 'b)
 typer stage (deserializing OCaml's binary type repr) landed fast and clean — observe the
 bytes, mirror the layout, verify against the oracle; no fight with a type system. Next:
 the stamp-normalizing `-dtypedtree` harness, then `Env` + inference for trivial exprs.
+
+## Inferencer error-rejection climb: 82.8% -> 97.0% accept (15 commits)
+
+With the dump confirmed inference-blind (printtyped emits no inferred types), the
+inferencer is validated by **error-rejection parity** instead: of the 744 corpus files
+the oracle ACCEPTS (non-empty cached `-dtypedtree`), how many does `c++type --check`
+wrongly reject? Driving that false-rejection rate toward 0 == completing the engine. A
+correct checker never rejects valid code, and you can't fake-accept valid code, so the
+metric can't be gamed. This session took it from **128 false-rejects (17.2%) to 22
+(3.0%) — 97.0% accept**, each commit a real, oracle-validated inference capability (HM
+unit tests kept green throughout):
+
+- suffixed int literals (`0l/0L/0n` -> int32/64/nativeint); **bidirectional format
+  typing** (a string literal in a `format6` position is that format, not `string` — the
+  principled fix for the dominant clash, not the reverted callee-name heuristic).
+- bind vars in or / poly-variant / exception / local-open / effect patterns.
+- **module resolution**: qualified opens (`open Effect.Deep` walks stdlib__Effect.cmi's
+  nested sigs); functor-application results (`Map.Make(..)`, curried `F(A)(B)`, local
+  functors) bound by *name* to fresh vars; **module aliases followed** (`include
+  Stdlib.Array` -> stdlib__Array.cmi); first-class module unpacks (`(val x : S)` against a
+  local `module type S`); expression-level structure items (`let module`/`let open` in e).
+- `(type a)` newtype params add no value arrow and bind to a *flexible* var (so GADT
+  result annotations don't clash); **GADT matches** don't cross-unify branch results.
+- **label-aware application** (labelled args matched by name, optionals omittable; falls
+  back to positional for var-typed callees) — added a label to the Arrow type.
+- source-level type abbreviations expanded; format/format4/format6 normalized to one
+  canonical type; **constructor arity** distinguished from a single tuple argument
+  (`A of (a*b*c)` vs `B of a*b`).
+
+The recurring law, observed repeatedly: **completeness and soundness must advance
+together.** Every time partial inference handed concrete types to an incomplete consumer
+(opens, records, local-functor bodies), false-rejections went *up* until the consumer was
+completed or deliberately left opaque. Records are the standing example — deferred,
+because correct field typing needs type-directed disambiguation of shared labels; a flat
+last-wins label map clashes (37 -> 52). The remaining 22 are the genuinely hard tail:
+polymorphic record fields, optional-arg default/erasure, empty-type refutations, module
+patterns, extensible variants, objects, GADT existentials — several bundled per file.
