@@ -82,8 +82,11 @@ struct Printer {
   }
 
   std::string ident(const Ident& id) const {
-    if (id.global) return id.name + "!";
-    return id.name + "/" + std::to_string(id.stamp);
+    switch (id.kind) {
+      case Ident::Global: return id.name + "!";
+      case Ident::Predef: return id.name + "/" + std::to_string(id.stamp) + "!";
+      default: return id.name + "/" + std::to_string(id.stamp);
+    }
   }
   std::string path_aux(const Path& p) const {
     if (auto* pi = std::get_if<Pident>(&p.v)) return ident(pi->id);
@@ -119,6 +122,110 @@ struct Printer {
     if (std::holds_alternative<ast::Nolabel>(l)) line(i, "Nolabel");
     else if (auto* p = std::get_if<ast::Labelled>(&l)) line(i, "Labelled \"" + p->name + "\"");
     else line(i, "Optional \"" + std::get<ast::Optional>(l).name + "\"");
+  }
+
+  void core_type(int i, const CoreType& t) {
+    line(i, "core_type " + loc(t.loc));
+    int j = i + 1;
+    if (std::holds_alternative<Ttyp_any>(t.desc)) {
+      line(j, "Ttyp_any");
+    } else if (auto* v = std::get_if<Ttyp_var>(&t.desc)) {
+      line(j, "Ttyp_var " + v->name);
+    } else if (auto* a = std::get_if<Ttyp_arrow>(&t.desc)) {
+      line(j, "Ttyp_arrow");
+      arg_label(j, a->label);
+      core_type(j, *a->dom);
+      core_type(j, *a->cod);
+    } else if (auto* tu = std::get_if<Ttyp_tuple>(&t.desc)) {
+      line(j, "Ttyp_tuple");
+      if (tu->elems.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& [label, el] : tu->elems) {
+          line(j + 1, label ? "Label: Some \"" + *label + "\"" : "Label: None");
+          core_type(j + 2, *el);
+        }
+        line(j, "]");
+      }
+    } else if (auto* c = std::get_if<Ttyp_constr>(&t.desc)) {
+      line(j, "Ttyp_constr \"" + path_aux(c->path) + "\"");
+      list_core_types(j, c->args);
+    } else {
+      auto& p = std::get<Ttyp_poly>(t.desc);
+      std::string s = "Ttyp_poly";
+      for (auto& v : p.vars) s += " '" + v;
+      line(j, s);
+      core_type(j, *p.type);
+    }
+  }
+
+  void list_core_types(int i, const std::vector<CoreTypeBox>& ts) {
+    if (ts.empty()) { line(i, "[]"); return; }
+    line(i, "[");
+    for (auto& t : ts) core_type(i + 1, *t);
+    line(i, "]");
+  }
+
+  void constructor_decl(int i, const ConstructorDecl& cd) {
+    line(i, loc(cd.loc));
+    line(i + 1, ident(cd.id));
+    list_core_types(i + 1, cd.args);
+    if (cd.res) { line(i + 1, "Some"); core_type(i + 2, **cd.res); }
+    else line(i + 1, "None");
+  }
+
+  void label_decl(int i, const LabelDecl& ld) {
+    line(i, loc(ld.loc));
+    line(i + 1, ld.mutable_ ? "Mutable" : "Immutable");
+    line(i + 1, ld.atomic ? "Atomic" : "Nonatomic");
+    os << std::string(2 * (i + 1), ' ') << ident(ld.id);  // run-on (no newline)
+    core_type(i + 1, ld.type);
+  }
+
+  void type_kind(int i, const TypeKind& k) {
+    if (std::holds_alternative<Ttype_abstract>(k.v)) {
+      line(i, "Ttype_abstract");
+    } else if (auto* v = std::get_if<Ttype_variant>(&k.v)) {
+      line(i, "Ttype_variant");
+      if (v->ctors.empty()) line(i + 1, "[]");
+      else {
+        line(i + 1, "[");
+        for (auto& c : v->ctors) constructor_decl(i + 2, c);
+        line(i + 1, "]");
+      }
+    } else if (auto* r = std::get_if<Ttype_record>(&k.v)) {
+      line(i, "Ttype_record");
+      if (r->labels.empty()) line(i + 1, "[]");
+      else {
+        line(i + 1, "[");
+        for (auto& l : r->labels) label_decl(i + 2, l);
+        line(i + 1, "]");
+      }
+    } else {
+      line(i, "Ttype_open");
+    }
+  }
+
+  void type_declaration(int i, const TypeDeclaration& td) {
+    line(i, "type_declaration " + ident(td.id) + " " + loc(td.loc));
+    int j = i + 1;
+    line(j, "ptype_params =");
+    list_core_types(j + 1, td.params);
+    line(j, "ptype_constraints =");
+    line(j + 1, "[]");
+    line(j, "ptype_kind =");
+    type_kind(j + 1, td.kind);
+    line(j, std::string("ptype_private = ") + (td.private_ ? "Private" : "Public"));
+    line(j, "ptype_manifest =");
+    if (td.manifest) { line(j + 1, "Some"); core_type(j + 2, **td.manifest); }
+    else line(j + 1, "None");
+  }
+
+  void list_strings(int i, const std::vector<std::string>& ss) {
+    if (ss.empty()) { line(i, "[]"); return; }
+    line(i, "[");
+    for (auto& s : ss) line(i + 1, ocaml_escape(s));
+    line(i, "]");
   }
 
   void pattern(int i, const Pattern& p) {
@@ -238,10 +345,19 @@ struct Printer {
         for (auto& a : ar->elems) expression(j + 1, *a);
         line(j, "]");
       }
-    } else {
-      auto& as = std::get<Texp_assert>(e.desc);
+    } else if (auto* as = std::get_if<Texp_assert>(&e.desc)) {
       os << std::string(2 * j, ' ') << "Texp_assert";  // printtyped omits the \n
-      expression(j, *as.e);
+      expression(j, *as->e);
+    } else if (auto* fo = std::get_if<Texp_for>(&e.desc)) {
+      line(j, "Texp_for \"" + ident(fo->var) + "\" " +
+                  (fo->dir == Direction::Up ? "Up" : "Down"));
+      expression(j, *fo->lo);
+      expression(j, *fo->hi);
+      expression(j, *fo->body);
+    } else {
+      auto& lz = std::get<Texp_lazy>(e.desc);
+      os << std::string(2 * j, ' ') << "Texp_lazy";  // run-on (no newline)
+      expression(j, *lz.e);
     }
   }
 
@@ -271,10 +387,37 @@ struct Printer {
       line(j, std::string("Tstr_value ") +
                   (sv->rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
       list_bindings(j, sv->rf, sv->bindings);
-    } else {
-      auto& ev = std::get<Tstr_eval>(it.desc);
+    } else if (auto* ev = std::get_if<Tstr_eval>(&it.desc)) {
       line(j, "Tstr_eval");
-      expression(j, *ev.e);
+      expression(j, *ev->e);
+    } else if (auto* ty = std::get_if<Tstr_type>(&it.desc)) {
+      line(j, std::string("Tstr_type ") +
+                  (ty->rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
+      if (ty->decls.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& d : ty->decls) type_declaration(j + 1, d);
+        line(j, "]");
+      }
+    } else if (auto* pr = std::get_if<Tstr_primitive>(&it.desc)) {
+      line(j, "Tstr_primitive");
+      line(j, "primitive_description " + ident(pr->id) + " " + loc(pr->loc));
+      line(j + 1, "Tprim_decl");
+      core_type(j + 2, pr->type);
+      list_strings(j + 2, pr->prims);
+    } else {
+      auto& ex = std::get<Tstr_exception>(it.desc);
+      line(j, "Tstr_exception");
+      line(j, "type_exception");
+      line(j + 1, "ptyext_constructor =");
+      int k = j + 2;
+      line(k, "extension_constructor " + loc(ex.loc));
+      line(k + 1, "pext_name = \"" + ident(ex.id) + "\"");
+      line(k + 1, "pext_kind =");
+      line(k + 2, "Text_decl");
+      list_core_types(k + 3, ex.args);
+      if (ex.res) { line(k + 3, "Some"); core_type(k + 4, **ex.res); }
+      else line(k + 3, "None");
     }
   }
 

@@ -27,10 +27,23 @@ const std::unordered_set<std::string>& stdlib_values() {
   return s;
 }
 
+// Predefined type constructors (Predef idents, printed name/stamp!).  Stamp
+// values are arbitrary post-normalization; only distinctness matters.
+const std::unordered_map<std::string, long long>& predef_types() {
+  static const std::unordered_map<std::string, long long> m = {
+      {"int", 1},      {"char", 2},    {"bytes", 3},   {"float", 4},
+      {"bool", 5},     {"unit", 6},    {"exn", 7},     {"array", 8},
+      {"list", 9},     {"option", 10}, {"nativeint", 11}, {"int32", 12},
+      {"int64", 13},   {"lazy_t", 14}, {"string", 17}, {"floatarray", 16},
+      {"extension_constructor", 15},
+  };
+  return m;
+}
+
 // Build the Stdlib path Stdlib!.name (Pdot over a global Stdlib ident).
 tt::Path stdlib_path(const std::string& name) {
   auto pre = std::make_shared<tt::Path>();
-  pre->v = tt::Pident{tt::Ident{"Stdlib", 0, /*global=*/true}};
+  pre->v = tt::Pident{tt::Ident{"Stdlib", 0, tt::Ident::Global}};
   tt::Path p;
   p.v = tt::Pdot{pre, name};
   return p;
@@ -41,13 +54,153 @@ struct Typer {
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
 
+  // Type constructors defined in this module (separate namespace from values).
+  std::unordered_map<std::string, tt::Ident> type_scope;
+
   tt::Ident fresh_local(const std::string& name) {
-    tt::Ident id{name, next_stamp++, false};
+    tt::Ident id{name, next_stamp++, tt::Ident::Local};
     scopes.back()[name] = id;
+    return id;
+  }
+  tt::Ident fresh_anon(const std::string& name) {  // stamped, not scoped
+    return tt::Ident{name, next_stamp++, tt::Ident::Local};
+  }
+  tt::Ident fresh_type(const std::string& name) {
+    tt::Ident id{name, next_stamp++, tt::Ident::Local};
+    type_scope[name] = id;
     return id;
   }
   void push() { scopes.emplace_back(); }
   void pop() { scopes.pop_back(); }
+
+  // Resolve a type constructor: local type, else predef, else qualified path.
+  tt::Path resolve_type(const Longident& lid) {
+    if (auto* l = std::get_if<Lident>(&lid.v)) {
+      auto t = type_scope.find(l->name);
+      if (t != type_scope.end()) {
+        tt::Path p;
+        p.v = tt::Pident{t->second};
+        return p;
+      }
+      auto pd = predef_types().find(l->name);
+      if (pd != predef_types().end()) {
+        tt::Path p;
+        p.v = tt::Pident{tt::Ident{l->name, pd->second, tt::Ident::Predef}};
+        return p;
+      }
+      throw TypeError("Unbound type constructor " + l->name);
+    }
+    if (auto* d = std::get_if<Ldot>(&lid.v)) {
+      tt::Path prefix = resolve_module(*d->prefix);
+      tt::Path p;
+      p.v = tt::Pdot{std::make_shared<tt::Path>(std::move(prefix)), d->name};
+      return p;
+    }
+    throw TypeError("unsupported type path");
+  }
+
+  tt::CoreType core_type(const CoreType& t) {
+    tt::CoreType out;
+    out.loc = t.loc;
+    if (std::holds_alternative<Ptyp_any>(t.desc)) {
+      out.desc = tt::Ttyp_any{};
+    } else if (auto* v = std::get_if<Ptyp_var>(&t.desc)) {
+      out.desc = tt::Ttyp_var{v->name};
+    } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      out.desc = tt::Ttyp_arrow{a->label,
+                                std::make_unique<tt::CoreType>(core_type(*a->dom)),
+                                std::make_unique<tt::CoreType>(core_type(*a->cod))};
+    } else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+      tt::Ttyp_tuple tup;
+      for (size_t k = 0; k < tu->elems.size(); ++k) {
+        std::optional<std::string> label;
+        if (k < tu->labels.size()) label = tu->labels[k];
+        tup.elems.emplace_back(
+            label, std::make_unique<tt::CoreType>(core_type(*tu->elems[k])));
+      }
+      out.desc = std::move(tup);
+    } else if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      tt::Ttyp_constr tc;
+      tc.path = resolve_type(c->id.txt);
+      for (auto& arg : c->args)
+        tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*arg)));
+      out.desc = std::move(tc);
+    } else {
+      throw TypeError("coretype#" + std::to_string(t.desc.index()));
+    }
+    return out;
+  }
+
+  // Record fields wrap their type in Ttyp_poly([], inner).
+  tt::CoreType poly_wrap(const CoreType& t) {
+    tt::CoreType inner = core_type(t);
+    tt::CoreType poly;
+    poly.loc = inner.loc;
+    poly.desc = tt::Ttyp_poly{{}, std::make_unique<tt::CoreType>(std::move(inner))};
+    return poly;
+  }
+
+  std::vector<tt::CoreTypeBox> ctor_args(const ConstructorArguments& a) {
+    std::vector<tt::CoreTypeBox> out;
+    if (auto* t = std::get_if<Pcstr_tuple>(&a)) {
+      for (auto& el : t->elems)
+        out.push_back(std::make_unique<tt::CoreType>(core_type(*el)));
+    } else {
+      throw TypeError("inline record constructor");
+    }
+    return out;
+  }
+
+  tt::ConstructorDecl constructor_decl(const ConstructorDecl& c) {
+    tt::ConstructorDecl out;
+    out.loc = c.loc;
+    out.id = fresh_anon(c.name.txt);
+    out.args = ctor_args(c.args);
+    if (c.res) out.res = std::make_unique<tt::CoreType>(core_type(**c.res));
+    return out;
+  }
+
+  tt::LabelDecl label_decl(const LabelDecl& f) {
+    tt::LabelDecl out;
+    out.loc = f.loc;
+    out.mutable_ = f.mut == MutableFlag::Mutable;
+    out.id = fresh_anon(f.name.txt);
+    out.type = poly_wrap(*f.type);
+    return out;
+  }
+
+  tt::TypeKind type_kind(const TypeKind& k) {
+    tt::TypeKind out;
+    if (std::holds_alternative<Ptype_abstract>(k)) {
+      out.v = tt::Ttype_abstract{};
+    } else if (auto* v = std::get_if<Ptype_variant>(&k)) {
+      tt::Ttype_variant tv;
+      for (auto& c : v->ctors) tv.ctors.push_back(constructor_decl(c));
+      out.v = std::move(tv);
+    } else if (auto* r = std::get_if<Ptype_record>(&k)) {
+      tt::Ttype_record tr;
+      for (auto& f : r->fields) tr.labels.push_back(label_decl(f));
+      out.v = std::move(tr);
+    } else if (std::holds_alternative<Ptype_open>(k)) {
+      out.v = tt::Ttype_open{};
+    } else {
+      throw TypeError("type_external kind");
+    }
+    return out;
+  }
+
+  tt::TypeDeclaration type_declaration(const TypeDeclaration& d) {
+    tt::TypeDeclaration td;
+    td.id = type_scope.at(d.name.txt);
+    td.loc = d.loc;
+    for (auto& p : d.params)
+      td.params.push_back(std::make_unique<tt::CoreType>(core_type(*p)));
+    td.kind = type_kind(d.kind);
+    td.private_ = d.priv == PrivateFlag::Private;
+    if (d.manifest)
+      td.manifest = std::make_unique<tt::CoreType>(core_type(**d.manifest));
+    return td;
+  }
 
   // Resolve an unqualified value name: locals (innermost first), else Stdlib.
   tt::Path resolve_value(const Longident& lid, size_t err_pos) {
@@ -78,7 +231,7 @@ struct Typer {
   tt::Path resolve_module(const Longident& lid) {
     if (auto* l = std::get_if<Lident>(&lid.v)) {
       auto pre = std::make_shared<tt::Path>();
-      pre->v = tt::Pident{tt::Ident{"Stdlib", 0, true}};
+      pre->v = tt::Pident{tt::Ident{"Stdlib", 0, tt::Ident::Global}};
       tt::Path p;
       p.v = tt::Pdot{pre, l->name};
       return p;
@@ -207,6 +360,21 @@ struct Typer {
       out.desc = std::move(ta);
     } else if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
       out.desc = tt::Texp_assert{std::make_unique<tt::Expression>(expr(*as->e))};
+    } else if (auto* fo = std::get_if<Pexp_for>(&e.desc)) {
+      tt::Texp_for tf;
+      tf.lo = std::make_unique<tt::Expression>(expr(*fo->lo));
+      tf.hi = std::make_unique<tt::Expression>(expr(*fo->hi));
+      tf.dir = fo->dir == DirectionFlag::Upto ? tt::Direction::Up
+                                              : tt::Direction::Down;
+      push();
+      auto* pv = std::get_if<Ppat_var>(&fo->var.desc);
+      if (!pv) { pop(); throw TypeError("for-var not a variable"); }
+      tf.var = fresh_local(pv->name.txt);
+      tf.body = std::make_unique<tt::Expression>(expr(*fo->body));
+      pop();
+      out.desc = std::move(tf);
+    } else if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
+      out.desc = tt::Texp_lazy{std::make_unique<tt::Expression>(expr(*lz->e))};
     } else {
       throw TypeError("expr#" + std::to_string(e.desc.index()));
     }
@@ -272,6 +440,30 @@ struct Typer {
       si.desc = std::move(out);
     } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc)) {
       si.desc = tt::Tstr_eval{std::make_unique<tt::Expression>(expr(*ev->e))};
+    } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+      tt::Tstr_type out;
+      out.rf = ty->rf;
+      for (auto& d : ty->decls) fresh_type(d.name.txt);  // pre-bind (recursive)
+      for (auto& d : ty->decls) out.decls.push_back(type_declaration(d));
+      si.desc = std::move(out);
+    } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
+      if (!pr->prim.type || pr->prim.alias) throw TypeError("primitive alias");
+      tt::Tstr_primitive tp;
+      tp.id = fresh_anon(pr->prim.name.txt);
+      tp.loc = pr->prim.loc;
+      tp.type = core_type(*pr->prim.type);
+      tp.prims = pr->prim.prims;
+      si.desc = std::move(tp);
+    } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
+      auto& ctor = ex->exn.ctor;
+      auto* decl = std::get_if<Pext_decl>(&ctor.kind);
+      if (!decl) throw TypeError("exception rebind");
+      tt::Tstr_exception te;
+      te.loc = ctor.loc;
+      te.id = fresh_anon(ctor.name.txt);
+      te.args = ctor_args(decl->args);
+      if (decl->res) te.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
+      si.desc = std::move(te);
     } else {
       throw TypeError("stritem#" + std::to_string(it.desc.index()));
     }

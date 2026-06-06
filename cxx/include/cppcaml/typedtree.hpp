@@ -25,12 +25,13 @@ using ast::RecFlag;
 template <class T>
 using Box = std::unique_ptr<T>;
 
-// A resolved identifier (Ident.t).  `global` marks a persistent/global ident,
-// which Ident.print renders with a trailing '!' (e.g. "Stdlib!").
+// A resolved identifier (Ident.t).  Ident.print renders:
+//   Local  -> name/stamp        Global -> name!        Predef -> name/stamp!
 struct Ident {
+  enum Kind { Local, Global, Predef };
   std::string name;
   long long stamp = 0;
-  bool global = false;
+  Kind kind = Local;
 };
 
 // Resolved Path.t.
@@ -39,6 +40,23 @@ using PathBox = std::shared_ptr<Path>;
 struct Pident { Ident id; };
 struct Pdot { PathBox prefix; std::string name; };
 struct Path { std::variant<Pident, Pdot> v; };
+
+// --- core types (Ttyp_*) ---
+struct CoreType;
+using CoreTypeBox = Box<CoreType>;
+struct Ttyp_any {};
+struct Ttyp_var { std::string name; };
+struct Ttyp_arrow { ArgLabel label; CoreTypeBox dom; CoreTypeBox cod; };
+struct Ttyp_tuple {
+  std::vector<std::pair<std::optional<std::string>, CoreTypeBox>> elems;
+};
+struct Ttyp_constr { Path path; std::vector<CoreTypeBox> args; };
+struct Ttyp_poly { std::vector<std::string> vars; CoreTypeBox type; };
+struct CoreType {
+  std::variant<Ttyp_any, Ttyp_var, Ttyp_arrow, Ttyp_tuple, Ttyp_constr, Ttyp_poly>
+      desc;
+  Location loc;
+};
 
 struct Pattern;
 struct Expression;
@@ -92,10 +110,13 @@ struct Texp_try { ExprBox body; std::vector<Case> cases; };     // cases are val
 struct Texp_construct { std::string name; std::vector<ExprBox> args; };
 struct Texp_array { std::vector<ExprBox> elems; };
 struct Texp_assert { ExprBox e; };
+enum class Direction { Up, Down };
+struct Texp_for { Ident var; Direction dir; ExprBox lo; ExprBox hi; ExprBox body; };
+struct Texp_lazy { ExprBox e; };
 struct Expression {
   std::variant<Texp_constant, Texp_ident, Texp_tuple, Texp_apply, Texp_function,
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
-               Texp_construct, Texp_array, Texp_assert>
+               Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy>
       desc;
   Location loc;
 };
@@ -110,14 +131,58 @@ struct Case {
   ExprBox rhs;
 };
 
+// --- type declarations ---
+struct LabelDecl {
+  Location loc;
+  bool mutable_ = false;
+  bool atomic = false;
+  Ident id;
+  CoreType type;  // already Ttyp_poly-wrapped (record fields always are)
+};
+struct ConstructorDecl {
+  Location loc;
+  Ident id;
+  std::vector<CoreTypeBox> args;  // Cstr_tuple argument types
+  std::optional<CoreTypeBox> res; // GADT return type
+};
+struct Ttype_abstract {};
+struct Ttype_variant { std::vector<ConstructorDecl> ctors; };
+struct Ttype_record { std::vector<LabelDecl> labels; };
+struct Ttype_open {};
+struct TypeKind {
+  std::variant<Ttype_abstract, Ttype_variant, Ttype_record, Ttype_open> v;
+};
+struct TypeDeclaration {
+  Ident id;
+  Location loc;
+  std::vector<CoreTypeBox> params;
+  TypeKind kind;
+  bool private_ = false;
+  std::optional<CoreTypeBox> manifest;
+};
+
 // --- structure ---
 struct Tstr_value {
   RecFlag rf;
   std::vector<ValueBinding> bindings;
 };
 struct Tstr_eval { ExprBox e; };
+struct Tstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
+struct Tstr_primitive {
+  Ident id;
+  Location loc;
+  CoreType type;
+  std::vector<std::string> prims;  // the "external" strings
+};
+struct Tstr_exception {
+  Location loc;
+  Ident id;
+  std::vector<CoreTypeBox> args;
+  std::optional<CoreTypeBox> res;
+};
 struct StructureItem {
-  std::variant<Tstr_value, Tstr_eval> desc;
+  std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception>
+      desc;
   Location loc;
 };
 using Structure = std::vector<StructureItem>;
