@@ -824,3 +824,27 @@ matching** (Includemod, the 19-file bucket), is the remaining Env work.
 
 Session soundness arc: 81.1% -> 76.1% false-acceptance; completeness steady at 99.2%
 throughout (every change gated by both harnesses).
+
+## Scoped/ordered constructor resolution (improves both axes)
+
+Replaced the flat ambiguous-constructor hack with a scoped `cenv` (mirrors `tenv`): a
+constructor name resolves to the in-scope declaration, populated in declaration order and
+module-scoped.  A name reused across local variant types is now disambiguated by position
+-- fixing morematch-style completeness *without* the hack and letting a constructor's
+stamped result reach use sites (unblocking type identity, e.g. unique_names_in_unification).
+
+A name that also denotes a predef (`::`/`[]`/`Some`/...) or an exception constructor needs
+type-directed disambiguation we don't have, so it falls back to Any rather than resolving to
+the wrong kind (`hlist` redefining `::`/`[]` must not break a list literal `[1;2;3]`;
+`exception E; type t = E; raise E` must not clash).  That guard kept completeness at 6.
+
+Soundness 76.1% -> 74.8% false-acceptance; completeness held 99.2%.
+
+## Session soundness arc (cumulative)
+
+From the flat best-effort checker (81.1% false-acceptance) to **74.8%**, completeness steady
+at **99.2%** throughout, via: the two-harness framework; six structural checks (let-rec,
+qualified-unbound, unbound-tyvar, cyclic-abbrev, unboxed); and the Env-lite core (scoped
+type identity with stamps + tenv, identity-checked binding annotations, scoped/ordered
+constructor resolution + cenv).  The remaining large soundness bucket is module **signature
+matching** (Includemod) -- inclusion of a structure in its `: S` ascription.
