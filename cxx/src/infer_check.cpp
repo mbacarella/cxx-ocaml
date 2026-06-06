@@ -33,6 +33,15 @@ std::pair<int, std::string> arglabel(const ArgLabel& l) {
   return {0, ""};
 }
 
+// printf-family format types (format / format4 / format6, possibly qualified)
+// are mutually-aliased with different arities; normalize them all to a single
+// canonical nullary `format6` so they never clash on name or arity.
+bool is_format_base(const std::string& path) {
+  auto dot = path.rfind('.');
+  std::string b = dot == std::string::npos ? path : path.substr(dot + 1);
+  return b == "format" || b == "format4" || b == "format6";
+}
+
 std::string cmi_path_str(const cmi::Path& p) {
   switch (p.kind) {
     case cmi::Path::Pident: return p.id.name;
@@ -114,9 +123,11 @@ struct Checker {
       }
       case cmi::TypeExpr::Tconstr:
       case cmi::TypeExpr::Texpand: {
+        std::string p = n->path ? cmi_path_str(*n->path) : "?";
+        if (is_format_base(p)) return eng.constr("format6");
         std::vector<TypePtr> as;
         for (auto& a : n->args) as.push_back(from_cmi(a, memo));
-        return eng.constr(n->path ? cmi_path_str(*n->path) : "?", std::move(as));
+        return eng.constr(std::move(p), std::move(as));
       }
       case cmi::TypeExpr::Tpoly:
         return from_cmi(n->link, memo);
@@ -155,6 +166,7 @@ struct Checker {
           auto nt = newtype_vars.find(l->name);
           if (nt != newtype_vars.end()) return nt->second;
         }
+      if (is_format_base(lid_full(c->id.txt))) return eng.constr("format6");
       std::vector<TypePtr> as;
       for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
       // Expand a known type abbreviation (type (params) name = manifest), with a
@@ -500,10 +512,7 @@ struct Checker {
   // a valid format and must be accepted as that type, not as `string`.
   static bool is_format_constr(const TypePtr& t0) {
     TypePtr t = I::Engine::repr(t0);
-    if (t->kind != I::Type::Kind::Constr) return false;
-    auto dot = t->path.rfind('.');
-    std::string base = dot == std::string::npos ? t->path : t->path.substr(dot + 1);
-    return base == "format" || base == "format4" || base == "format6";
+    return t->kind == I::Type::Kind::Constr && is_format_base(t->path);
   }
 
   // Infer an expression with an expected type pushed down (bidirectional).  The
