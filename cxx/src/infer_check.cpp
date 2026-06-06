@@ -1047,9 +1047,11 @@ struct Checker {
       return rt;
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
-      infer_expr(*ct->e);
+      TypePtr et = infer_expr(*ct->e);
       std::unordered_map<std::string, TypePtr> vars;
       TypePtr at = from_coretype(*ct->t, vars);
+      if (strict && expected_clash(et, at))  // (e : T) with e of a clashing type
+        note_error("expression does not match the type constraint");
       return at;
     }
     // Records, via the unique-label registry (ambiguous labels -> Any).
@@ -1134,6 +1136,26 @@ struct Checker {
 
   TypePtr infer_apply(const Pexp_apply& a) {
     TypePtr ft = infer_expr(*a.fn);
+    // Pure soundness check: a qualified callee M.x is otherwise typed as Any, so
+    // its argument types go unchecked.  Resolve its real type and check each
+    // positional argument against the matching parameter via expected_clash
+    // (pure, reliable-only) -- catches e.g. `String.length 5`.
+    if (strict)
+      if (auto* id = std::get_if<Pexp_ident>(&a.fn->desc))
+        if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
+          auto& ex = module_values_cached(*d->prefix);
+          auto f = ex.find(d->name);
+          if (f != ex.end()) {
+            TypePtr rt = I::Engine::repr(eng.instantiate(f->second));
+            for (auto& [lbl, arg] : a.args) {
+              if (rt->kind != I::Type::Kind::Arrow) break;
+              if (std::holds_alternative<Nolabel>(lbl) && rt->arrow_label == 0 &&
+                  expected_clash(infer_expr(*arg), rt->dom))
+                note_error("argument type mismatch for " + lid_full(id->id.txt));
+              rt = I::Engine::repr(rt->cod);
+            }
+          }
+        }
     // Collect the function's known arrow spine.
     std::vector<TypePtr> spine;
     TypePtr cur = I::Engine::repr(ft);
@@ -1271,8 +1293,8 @@ struct Checker {
         if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_)) {
           for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
           std::unordered_map<std::string, TypePtr> vars;
-          if (strict && identity_clash(te, from_coretype(*pc->typ, vars)))
-            note_error("type constructor mismatch (distinct type identities)");
+          if (strict && expected_clash(te, from_coretype(*pc->typ, vars)))
+            note_error("type mismatch against declared type");
         }
       eng.leave_level();
       eng.generalize(te);
@@ -1330,6 +1352,45 @@ struct Checker {
       if (!provided.count(n))
         note_error("Signature mismatch: the value \"" + n +
                    "\" is required but not provided");
+  }
+
+  // Builtins whose inferred type we trust enough to flag against an expected
+  // type (constants, arithmetic, comparisons produce these reliably).  Excludes
+  // array/list/user types, where our inference is still incomplete.
+  static bool reliable_builtin(const std::string& path) {
+    auto d = path.rfind('.');
+    std::string b = d == std::string::npos ? path : path.substr(d + 1);
+    static const std::set<std::string> s = {
+        "int", "char", "string", "float", "bool", "unit",
+        "int32", "int64", "nativeint", "exn", "bytes"};
+    return s.count(b);
+  }
+  // Like identity_clash, but also flags a mismatch between two distinct reliable
+  // builtins (int vs string, float vs int).  Pure, no mutation.  Used to apply a
+  // declared/expected type without the full structural unify that incomplete
+  // inference trips on.
+  static bool expected_clash(const TypePtr& a0, const TypePtr& b0) {
+    TypePtr a = I::Engine::repr(a0), b = I::Engine::repr(b0);
+    if (a->kind == I::Type::Kind::Constr && b->kind == I::Type::Kind::Constr) {
+      if (a->stamp && b->stamp && a->stamp != b->stamp) return true;
+      auto last = [](const std::string& p) {
+        auto d = p.rfind('.'); return d == std::string::npos ? p : p.substr(d + 1);
+      };
+      if (reliable_builtin(a->path) && reliable_builtin(b->path) &&
+          last(a->path) != last(b->path))
+        return true;
+      size_t n = std::min(a->args.size(), b->args.size());
+      for (size_t i = 0; i < n; ++i) if (expected_clash(a->args[i], b->args[i])) return true;
+      return false;
+    }
+    if (a->kind == I::Type::Kind::Arrow && b->kind == I::Type::Kind::Arrow)
+      return expected_clash(a->dom, b->dom) || expected_clash(a->cod, b->cod);
+    if (a->kind == I::Type::Kind::Tuple && b->kind == I::Type::Kind::Tuple) {
+      size_t n = std::min(a->args.size(), b->args.size());
+      for (size_t i = 0; i < n; ++i) if (expected_clash(a->args[i], b->args[i])) return true;
+      return false;
+    }
+    return false;
   }
 
   // Bind a let pattern's variables to a (generalized) type.
