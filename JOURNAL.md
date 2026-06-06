@@ -929,3 +929,30 @@ row-types (the "The value", "pattern matches", "type variables unbound in class"
 the largest), the full Value_rec_check 3-mode analysis (let-rec, 11), match refutation /
 emptiness (6), extension-constructor signature matching (3), and scope-escape / abstract-type
 cases.  Each is a subsystem-scale effort rather than an incremental check.
+
+## Soundness frontier: safe incremental slice is exhausted at 69.7%
+
+Investigated the remaining "tractable" soundness targets and found each is gated by a deep
+subsystem -- there is no safe incremental check left (any partial version false-rejects):
+
+- **let-rec full** (11): arity-dependent.  The identical `let rec x = f ~x` is VALID in
+  letrec-compilation/labels.ml (partial application of `let f () ~x = ...`, x merely
+  captured) but INVALID in letrec-check/labels.ml -- which one depends on `f`'s arity (full
+  vs partial application = forces vs captures the rec var).  A sound check can't flag it
+  without arity/effect analysis; the minimal direct-deref check is the safe limit.
+- **refutation `-> .`** (6): all GADTs -- the case is refuted by type-index reasoning
+  (`BoolLit : bool t` is impossible at `int t`), not constructor coverage, so compute_partial
+  can't decide it.
+- **variant/record def mismatch** (3): cross-module kind matching (`type t0 = T0.t = {...}`
+  where T0.t is abstract) and GADTs.
+- **type-vars-unbound-in-class** (4), **The value / pattern / expression** buckets: objects/
+  row-types, GADTs, scope-escape.
+
+So every remaining false-accept needs a subsystem-scale feature (objects/row-types, GADT
+type-indices, arity-aware effect analysis, cross-module kind/identity).  The safe,
+completeness-preserving incremental soundness work is **complete at 69.7% false-acceptance
+/ 30.3% correct-rejection**, with completeness pinned at 99.2% (6/744).
+
+Final session axes: completeness 17.2% -> 0.8% false-rejection (99.2% accept); soundness
+81.1% -> 69.7% false-acceptance.  Further gains are a deliberate choice to build a full deep
+subsystem (with transient completeness risk), not an incremental check.
