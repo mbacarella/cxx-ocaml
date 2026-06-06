@@ -536,9 +536,35 @@ struct Checker {
     }
   }
 
+  // `[@@unboxed]` is valid only on a single-constructor variant whose
+  // constructor takes exactly one argument, or a single-field record.  Flag the
+  // clear count violations (sound: a valid 1-arg/1-field type is never flagged).
+  void check_unboxed(const TypeDeclaration& d) {
+    if (!strict) return;
+    bool unboxed = false;
+    for (auto& a : d.attrs) if (a.name == "unboxed" || a.name == "ocaml.unboxed") unboxed = true;
+    if (!unboxed) return;
+    bool bad = false;
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+      if (v->ctors.size() != 1) bad = true;
+      else if (!v->ctors[0].res) {  // skip GADT constructors (subtler rules)
+        if (auto* tup = std::get_if<Pcstr_tuple>(&v->ctors[0].args)) bad = tup->elems.size() != 1;
+        else if (auto* r = std::get_if<Pcstr_record>(&v->ctors[0].args)) bad = r->fields.size() != 1;
+      }
+    } else if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
+      bad = rec->fields.size() != 1;
+    } else {
+      return;  // abstract / open: not a count violation we can judge
+    }
+    if (bad)
+      note_error("This type cannot be unboxed because it must have exactly one "
+                 "constructor with a single argument, or one field");
+  }
+
   // Register a user variant: A of t1*..*tn -> scheme t1->..->tn->(params) name.
   void register_type_decl(const TypeDeclaration& d) {
     check_type_vars(d);
+    check_unboxed(d);
     type_arity[d.name.txt] = (int)d.params.size();
     if (d.manifest) {  // `type (params) t = <manifest>`: a type abbreviation
       std::vector<std::string> ps;
