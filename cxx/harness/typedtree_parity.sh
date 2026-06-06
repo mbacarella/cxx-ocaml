@@ -47,22 +47,32 @@ if [ "${1:-}" == "--cache-one" ]; then
 fi
 
 # Diff/baseline worker: read the cached oracle dump, compare with c++type.
+# File-based throughout — some corpus dumps are ~10 MB (e.g. fma.ml's giant list
+# literals nest into deep :: chains), and bash string capture/compare on those
+# pins a core.  cmp on normalized temp files is C-fast and memory-flat.
 if [ "${1:-}" == "--worker" ]; then
   f="$2"
-  o=$(cat "$CACHE/$(key "$f")" 2>/dev/null)
+  ocache="$CACHE/$(key "$f")"
   if [ ! -x "$CPP" ]; then            # baseline mode: just oracle-typeable?
-    [ -n "$o" ] && printf 'B 1\n' || printf 'B 0\n'
-  else                                 # diff mode
-    on=$(printf '%s' "$o" | normalize)
-    # CPP_TIMEOUT guards against a c++type hang pinning a core during a sweep;
-    # to debug a hang, run `c++type <file>` directly (no timeout) under gdb.
-    c=$(timeout "${CPP_TIMEOUT:-10}" "$CPP" "$f" 2>/dev/null)
-    cn=$(printf '%s' "$c" | normalize)
-    if [ "$on" == "$cn" ]; then printf 'M\n'
-    elif [ -z "$c" ] || [ "${c#TYPE_ERROR}" != "$c" ]; then
-      if [ -z "$o" ]; then printf 'BOTHERR\n'; else printf 'CPPERR\n'; fi
-    else printf 'DIFF\n'; fi
+    [ -s "$ocache" ] && printf 'B 1\n' || printf 'B 0\n'
+    exit 0
   fi
+  # diff mode.  CPP_TIMEOUT guards a c++type hang; debug a hang by running
+  # `c++type <file>` directly (no timeout) under gdb.
+  rawc=$(mktemp)
+  timeout "${CPP_TIMEOUT:-20}" "$CPP" "$f" >"$rawc" 2>/dev/null
+  oempty=1; [ -s "$ocache" ] && oempty=0
+  cerr=0
+  { [ ! -s "$rawc" ] || [ "$(head -c 10 "$rawc")" = "TYPE_ERROR" ]; } && cerr=1
+  if [ "$cerr" = 1 ]; then
+    [ "$oempty" = 1 ] && printf 'BOTHERR\n' || printf 'CPPERR\n'
+    rm -f "$rawc"; exit 0
+  fi
+  no=$(mktemp); nc=$(mktemp)
+  normalize < "$ocache" > "$no"
+  normalize < "$rawc" > "$nc"
+  cmp -s "$no" "$nc" && printf 'M\n' || printf 'DIFF\n'
+  rm -f "$rawc" "$no" "$nc"
   exit 0
 fi
 
