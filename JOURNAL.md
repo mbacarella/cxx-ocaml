@@ -912,3 +912,20 @@ module_exports (module-scoped type tracking), which today's flat global type reg
 doesn't provide -- deferred.
 
 Session soundness arc: 81.1% -> 71.0% false-acceptance; completeness pinned at 99.2%.
+
+## Includemod complete (value + type sides): soundness 71.0% -> 69.7%
+
+Type-declaration matching: compare a structure's own top-level type decls (extracted
+directly from its AST -- module-scoped by construction) against the ascribed signature's.
+Flags, conservatively: both-manifest mismatches (expected_clash) and differing
+constructor/field name sets; abstract spec accepts anything; GADT/cross-kind skipped.  Also
+fixed the ascription guard so a type-only structure (empty value exports) still gets checked.
+Signature-mismatch bucket 19 -> 15; completeness held at 6.
+
+**Session soundness arc: 81.1% -> 69.7% false-acceptance; completeness pinned at 99.2%.**
+The structural / identity / records / signature-matching soundness wins are now harvested.
+Remaining false-accepts (~166) are concentrated in deep type-system subsystems: objects /
+row-types (the "The value", "pattern matches", "type variables unbound in class" buckets --
+the largest), the full Value_rec_check 3-mode analysis (let-rec, 11), match refutation /
+emptiness (6), extension-constructor signature matching (3), and scope-escape / abstract-type
+cases.  Each is a subsystem-scale effort rather than an incremental check.
