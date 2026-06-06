@@ -208,6 +208,7 @@ struct Printer {
 
   void type_declaration(int i, const TypeDeclaration& td) {
     line(i, "type_declaration " + ident(td.id) + " " + loc(td.loc));
+    if (td.attrs) attributes(i, *td.attrs);
     int j = i + 1;
     line(j, "ptype_params =");
     list_core_types(j + 1, td.params);
@@ -241,6 +242,11 @@ struct Printer {
     line(i, "pattern " + loc(p.loc));
     if (p.attrs) attributes(i, *p.attrs);
     int j = i + 1;
+    for (auto& ex : p.extras) {
+      line(j, "extra " + loc(ex.loc));
+      line(j + 1, "Tpat_extra_constraint");
+      core_type(j + 1, ex.ctype);
+    }
     if (std::holds_alternative<Tpat_any>(p.desc)) {
       line(j, "Tpat_any");
     } else if (auto* v = std::get_if<Tpat_var>(&p.desc)) {
@@ -298,6 +304,11 @@ struct Printer {
     line(i, "expression " + loc(e.loc));
     if (e.attrs) attributes(i, *e.attrs);
     int j = i + 1;
+    for (auto& ex : e.extras) {
+      line(j, "extra " + loc(ex.loc));
+      line(j + 1, "Texp_constraint");
+      core_type(j + 1, ex.ctype);
+    }
     if (auto* c = std::get_if<Texp_constant>(&e.desc)) {
       constant(j, "Texp_constant ", c->c);
     } else if (auto* id = std::get_if<Texp_ident>(&e.desc)) {
@@ -470,10 +481,17 @@ struct Printer {
       line(j, std::string("Tstr_module (") + (md->present ? "Present" : "Absent") + ")");
       line(j, ident(md->id));
       module_expr(j + 1, *md->expr);
+    } else if (auto* at = std::get_if<Tstr_attribute>(&it.desc)) {
+      line(j, "Tstr_attribute \"" + at->name + "\"");
+      if (at->payload)
+        ast::print_payload_structure(*at->payload, j, os, fname, dirfiles);
+      else
+        line(j, "[]");
     } else {
       auto& ex = std::get<Tstr_exception>(it.desc);
       line(j, "Tstr_exception");
       line(j, "type_exception");
+      if (ex.attrs) attributes(j, *ex.attrs);
       line(j + 1, "ptyext_constructor =");
       int k = j + 2;
       line(k, "extension_constructor " + loc(ex.loc));

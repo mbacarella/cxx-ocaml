@@ -78,12 +78,14 @@ struct Tpat_tuple {
 };
 struct Tpat_or { PatBox left; PatBox right; };
 struct Tpat_alias { Ident id; PatBox inner; };  // (p as id)
+struct PatExtra { CoreType ctype; Location loc; };  // Tpat_extra_constraint
 struct Pattern {
   std::variant<Tpat_any, Tpat_var, Tpat_constant, Tpat_construct, Tpat_value,
                Tpat_tuple, Tpat_exception, Tpat_or, Tpat_alias>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
+  std::vector<PatExtra> extras;
 };
 
 // --- expressions ---
@@ -128,6 +130,7 @@ enum class Direction { Up, Down };
 struct Texp_for { Ident var; Direction dir; ExprBox lo; ExprBox hi; ExprBox body; };
 struct Texp_lazy { ExprBox e; };
 struct Texp_while { ExprBox cond; ExprBox body; };
+struct ExprExtra { CoreType ctype; Location loc; };  // Texp_constraint
 struct Expression {
   std::variant<Texp_constant, Texp_ident, Texp_tuple, Texp_apply, Texp_function,
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
@@ -136,6 +139,7 @@ struct Expression {
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
+  std::vector<ExprExtra> extras;
 };
 
 struct ValueBinding {
@@ -177,6 +181,7 @@ struct TypeDeclaration {
   TypeKind kind;
   bool private_ = false;
   std::optional<CoreTypeBox> manifest;
+  const ast::Attributes* attrs = nullptr;
 };
 
 // Module expressions are mutually recursive with structures, so ModuleExpr is
@@ -204,10 +209,12 @@ struct Tstr_exception {
   Ident id;
   std::vector<CoreTypeBox> args;
   std::optional<CoreTypeBox> res;
+  const ast::Attributes* attrs = nullptr;  // ptyexn_attributes
 };
+struct Tstr_attribute { std::string name; const ast::Structure* payload; };
 struct StructureItem {
   std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception,
-               Tstr_open, Tstr_module>
+               Tstr_open, Tstr_module, Tstr_attribute>
       desc;
   Location loc;
 };

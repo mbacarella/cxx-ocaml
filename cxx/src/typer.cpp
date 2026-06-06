@@ -224,6 +224,7 @@ struct Typer {
     tt::TypeDeclaration td;
     td.id = type_scope.at(d.name.txt);
     td.loc = d.loc;
+    td.attrs = &d.attrs;
     for (auto& p : d.params)
       td.params.push_back(std::make_unique<tt::CoreType>(core_type(*p)));
     td.kind = type_kind(d.kind);
@@ -339,6 +340,9 @@ struct Typer {
       ta.id = fresh_local(al->name.txt);
       ta.inner = std::move(inner);
       out.desc = std::move(ta);
+    } else if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
+      out = pattern(*ct->p);  // become inner pattern; record constraint as extra
+      out.extras.push_back(tt::PatExtra{core_type(*ct->t), p.loc});
     } else {
       throw TypeError("pat#" + std::to_string(p.desc.index()));
     }
@@ -457,6 +461,9 @@ struct Typer {
     } else if (auto* wh = std::get_if<Pexp_while>(&e.desc)) {
       out.desc = tt::Texp_while{std::make_unique<tt::Expression>(expr(*wh->cond)),
                                 std::make_unique<tt::Expression>(expr(*wh->body))};
+    } else if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
+      out = expr(*ct->e);  // become the inner expr; record the constraint as extra
+      out.extras.push_back(tt::ExprExtra{core_type(*ct->t), e.loc});
     } else {
       throw TypeError("expr#" + std::to_string(e.desc.index()));
     }
@@ -612,7 +619,10 @@ struct Typer {
       te.id = fresh_anon(ctor.name.txt);
       te.args = ctor_args(decl->args);
       if (decl->res) te.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
+      te.attrs = &ex->exn.attrs;
       si.desc = std::move(te);
+    } else if (auto* at = std::get_if<Pstr_attribute>(&it.desc)) {
+      si.desc = tt::Tstr_attribute{at->name, &at->payload};
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       auto& b = mb->binding;
       tt::Tstr_module tm;
