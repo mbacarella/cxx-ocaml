@@ -10,6 +10,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -21,6 +22,12 @@ namespace cppcaml {
 // Infer types for the top-level value bindings of a structure (best-effort).
 // Returns (name, rendered-type) pairs in source order.
 std::vector<std::pair<std::string, std::string>> infer_structure_types(
+    const ast::Structure& s);
+
+// Best-effort exhaustiveness: map each `match` expression node to whether it is
+// (certainly) non-exhaustive — i.e. should print `Texp_match (Partial)`.  Only
+// set true when certain, so consulting it cannot cause false-positive Partials.
+std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
     const ast::Structure& s);
 
 }  // namespace cppcaml

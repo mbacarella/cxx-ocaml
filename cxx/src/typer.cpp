@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 #include "cppcaml/cmi.hpp"
+#include "cppcaml/infer_check.hpp"
 
 namespace cppcaml {
 namespace {
@@ -198,6 +199,8 @@ tt::Path stdlib_path(const std::string& name) {
 }
 
 struct Typer {
+  // Side-table from the inference pass: match nodes that are non-exhaustive.
+  const std::unordered_map<const ast::Expression*, bool>* partiality = nullptr;
   long long next_stamp = 274;  // arbitrary base; the harness normalizes stamps
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
@@ -669,6 +672,10 @@ struct Typer {
       tt::Texp_match tm;
       tm.scrut = std::make_unique<tt::Expression>(expr(*m->e));
       for (auto& c : m->cases) tm.cases.push_back(case_(c, /*computation=*/true));
+      if (partiality) {
+        auto it = partiality->find(&e);
+        tm.partial = it != partiality->end() && it->second;
+      }
       out.desc = std::move(tm);
     } else if (auto* tr = std::get_if<Pexp_try>(&e.desc)) {
       tt::Texp_try tt2;
@@ -1015,6 +1022,8 @@ struct Typer {
 
 typedtree::Structure type_structure(const ast::Structure& s) {
   Typer t;
+  auto partiality = infer_match_partiality(s);  // inference side-table (Slice 3)
+  t.partiality = &partiality;
   typedtree::Structure out;
   for (auto& it : s) out.push_back(t.structure_item(it));
   return out;

@@ -122,7 +122,7 @@ struct Texp_let {
 };
 struct Texp_ifthenelse { ExprBox cond; ExprBox then_; std::optional<ExprBox> else_; };
 struct Texp_sequence { ExprBox e1; ExprBox e2; };
-struct Texp_match { ExprBox scrut; std::vector<Case> cases; };  // cases are computation
+struct Texp_match { ExprBox scrut; std::vector<Case> cases; bool partial = false; };
 struct Texp_try { ExprBox body; std::vector<Case> cases; };     // cases are value
 struct Texp_construct { std::string name; std::vector<ExprBox> args; };
 struct Texp_array { std::vector<ExprBox> elems; };

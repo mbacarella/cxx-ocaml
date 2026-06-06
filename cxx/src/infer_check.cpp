@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <optional>
+#include <set>
 #include <unordered_map>
 
 #include "cppcaml/cmi.hpp"
@@ -46,6 +47,10 @@ struct Checker {
   std::vector<std::unordered_map<std::string, TypePtr>> venv{{}};
   // constructor schemes: ctor name -> a chain arg1->..->argN->result (generic)
   std::unordered_map<std::string, TypePtr> ctors;
+  // finite variant types: type name -> its full constructor-name set
+  std::unordered_map<std::string, std::vector<std::string>> type_ctors;
+  // match-expression node -> is-partial (the result we route back to the dump)
+  std::unordered_map<const Expression*, bool> match_partial;
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
@@ -155,12 +160,19 @@ struct Checker {
     ctors["true"] = eng.constr("bool");
     ctors["false"] = eng.constr("bool");
     ctors["()"] = eng.constr("unit");
+    type_ctors["bool"] = {"false", "true"};
+    type_ctors["option"] = {"None", "Some"};
+    type_ctors["list"] = {"[]", "::"};
+    type_ctors["unit"] = {"()"};
   }
 
   // Register a user variant: A of t1*..*tn -> scheme t1->..->tn->(params) name.
   void register_type_decl(const TypeDeclaration& d) {
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;
+    std::vector<std::string> names;
+    for (auto& c : v->ctors) names.push_back(c.name.txt);
+    type_ctors[d.name.txt] = std::move(names);
     for (auto& c : v->ctors) {
       std::unordered_map<std::string, TypePtr> vars;
       std::vector<TypePtr> params;
@@ -180,6 +192,43 @@ struct Checker {
   }
   void try_unify(const TypePtr& a, const TypePtr& b) {
     try { eng.unify(a, b); } catch (const I::TypeError&) {}
+  }
+
+  // A top-level case pattern that matches anything (no guard handled by caller).
+  static bool is_catchall(const Pattern& p) {
+    if (std::holds_alternative<Ppat_any>(p.desc)) return true;
+    if (std::holds_alternative<Ppat_var>(p.desc)) return true;
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return is_catchall(*c->p);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return is_catchall(*a->p);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return is_catchall(*o->l) || is_catchall(*o->r);
+    return false;
+  }
+  static void collect_ctors(const Pattern& p, std::set<std::string>& out) {
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc)) out.insert(lid_last(k->id.txt));
+    else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      collect_ctors(*o->l, out); collect_ctors(*o->r, out);
+    } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) collect_ctors(*c->p, out);
+    else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) collect_ctors(*a->p, out);
+  }
+  // Conservatively decide non-exhaustiveness: only true when CERTAIN — an
+  // infinite builtin type or a finite variant missing a top-level constructor,
+  // with no unguarded catch-all.  Unknown / fully-covered => Total (never a
+  // false-positive Partial, so no regressions even if inference is imperfect).
+  bool compute_partial(const TypePtr& scrut, const std::vector<Case>& cases) {
+    for (auto& c : cases)
+      if (!c.guard && is_catchall(c.lhs)) return false;  // unguarded catch-all
+    TypePtr s = I::Engine::repr(scrut);
+    if (s->kind != I::Type::Kind::Constr) return false;  // unknown type
+    static const std::set<std::string> inf = {
+        "int", "char", "string", "float", "int32", "int64", "nativeint", "bytes"};
+    if (inf.count(s->path)) return true;  // infinite type, no catch-all
+    auto it = type_ctors.find(s->path);
+    if (it == type_ctors.end()) return false;  // unknown variant
+    std::set<std::string> covered;
+    for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
+    for (auto& ctor : it->second) if (!covered.count(ctor)) return true;  // missing
+    return false;  // covers all top-level ctors => Total (conservative)
   }
 
   TypePtr constant_type(const Constant& c) {
@@ -304,6 +353,7 @@ struct Checker {
         try_unify(infer_expr(*c.rhs), rt);
         venv.pop_back();
       }
+      match_partial[&e] = compute_partial(se, m->cases);  // for the dump (Slice 3)
       return rt;
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
@@ -381,6 +431,32 @@ struct Checker {
 };
 
 }  // namespace
+
+// Shared setup: register predef + all type-decl constructors, then run
+// best-effort inference over every top-level value binding / eval expression
+// (this is what populates ck.match_partial as it traverses).
+static void run_checker(Checker& ck, const ast::Structure& s) {
+  ck.register_predef_ctors();
+  for (auto& it : s)
+    if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+      for (auto& d : ty->decls) ck.register_type_decl(d);
+  for (auto& it : s) {
+    try {
+      if (auto* sv = std::get_if<Pstr_value>(&it.desc))
+        ck.infer_bindings(sv->rf, sv->bindings);
+      else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
+        ck.infer_expr(*ev->e);
+    } catch (const I::TypeError&) {
+    }
+  }
+}
+
+std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
+    const ast::Structure& s) {
+  Checker ck;
+  run_checker(ck, s);
+  return std::move(ck.match_partial);
+}
 
 std::vector<std::pair<std::string, std::string>> infer_structure_types(
     const ast::Structure& s) {

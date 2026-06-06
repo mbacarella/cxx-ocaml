@@ -378,7 +378,7 @@ struct Printer {
       expression(j, *s->e1);
       expression(j, *s->e2);
     } else if (auto* m = std::get_if<Texp_match>(&e.desc)) {
-      line(j, "Texp_match");
+      line(j, m->partial ? "Texp_match (Partial)" : "Texp_match");
       expression(j, *m->scrut);
       list_cases(j, m->cases);
       line(j, "[]");  // l2 (legacy second case list)
