@@ -72,6 +72,7 @@ struct Checker {
   // GADT type names (a constructor has an explicit result type): matching one
   // refines types per branch, so branch results must not be cross-unified.
   std::set<std::string> gadt_types;
+  std::set<std::string> gadt_ctors;  // constructor names belonging to a GADT
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
@@ -420,7 +421,10 @@ struct Checker {
     std::vector<std::string> names;
     bool is_gadt = false;
     for (auto& c : v->ctors) { names.push_back(c.name.txt); if (c.res) is_gadt = true; }
-    if (is_gadt) gadt_types.insert(d.name.txt);
+    if (is_gadt) {
+      gadt_types.insert(d.name.txt);
+      for (auto& c : v->ctors) gadt_ctors.insert(c.name.txt);
+    }
     type_ctors[d.name.txt] = std::move(names);
     for (auto& c : v->ctors) {
       std::unordered_map<std::string, TypePtr> vars;
@@ -470,6 +474,24 @@ struct Checker {
     } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) collect_ctors(*c->p, out);
     else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) collect_ctors(*a->p, out);
   }
+  // Does a pattern (recursively) use a GADT constructor?  Such a match refines
+  // types branch-locally, so we must not unify its patterns/results globally.
+  bool pat_has_gadt_ctor(const Pattern& p) {
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
+      if (gadt_ctors.count(lid_last(k->id.txt))) return true;
+      return k->arg && pat_has_gadt_ctor(**k->arg);
+    }
+    if (auto* tu = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : tu->elems) if (pat_has_gadt_ctor(*e)) return true;
+      return false;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return pat_has_gadt_ctor(*o->l) || pat_has_gadt_ctor(*o->r);
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pat_has_gadt_ctor(*c->p);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pat_has_gadt_ctor(*a->p);
+    return false;
+  }
+
   // Conservatively decide non-exhaustiveness: only true when CERTAIN — an
   // infinite builtin type or a finite variant missing a top-level constructor,
   // with no unguarded catch-all.  Unknown / fully-covered => Total (never a
@@ -668,14 +690,19 @@ struct Checker {
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       TypePtr se = infer_expr(*m->e);
       TypePtr sr = I::Engine::repr(se);
-      // Matching a GADT refines types per branch (e.g. Int -> int, Ptr ->
-      // int list at result type 'a); cross-unifying the branch results would be
-      // an unsound clash, so leave the result type open for GADT scrutinees.
+      // Matching a GADT refines types branch-locally (e.g. Int -> int, Ptr ->
+      // int list at result type 'a; or a scrutinee component refined to ab in
+      // one branch and xy in another).  Our global unification can't model that,
+      // so for a GADT match -- detected by the scrutinee's type OR by any case
+      // using a GADT constructor -- we skip both the pattern/scrutinee unify and
+      // the branch-result cross-unify, leaving types open.
       bool gadt = sr->kind == I::Type::Kind::Constr && gadt_types.count(sr->path);
+      for (auto& c : m->cases) if (pat_has_gadt_ctor(c.lhs)) gadt = true;
       TypePtr rt = eng.fresh_var();
       for (auto& c : m->cases) {
         venv.emplace_back();
-        try_unify(infer_pat(c.lhs), se);
+        TypePtr pt = infer_pat(c.lhs);
+        if (!gadt) try_unify(pt, se);
         if (c.guard) infer_expr(**c.guard);
         TypePtr br = infer_expr(*c.rhs);
         if (!gadt) try_unify(br, rt);
