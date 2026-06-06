@@ -22,7 +22,8 @@ add_library(cppcaml_core
   src/cmi.cpp
   src/typer.cpp
   src/typedtree_print.cpp
-  src/infer.cpp)
+  src/infer.cpp
+  src/infer_check.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 
 # Stage tools.
