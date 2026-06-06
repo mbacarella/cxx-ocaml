@@ -326,6 +326,11 @@ struct Checker {
         try_unify(ft, eng.arrow(at, r));
         ft = I::Engine::repr(r);
       }
+      // NOTE: string literals in a format-typed position currently infer as
+      // `string` and clash with `format6` -> a known false-rejection category.
+      // The correct fix is expected-type propagation (bidirectional checking),
+      // re-typing the literal as a format against its expected type -- NOT a
+      // callee-name heuristic.  Deferred to the bidirectional-inference work.
       return ft;
     }
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return infer_function(*f);
