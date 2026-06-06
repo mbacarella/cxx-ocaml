@@ -97,7 +97,17 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     return;
   }
   if (a->kind == Type::Kind::Constr && b->kind == Type::Kind::Constr) {
-    if (a->path != b->path || a->args.size() != b->args.size())
+    // Compare type-constructor paths by their last component: the same type can
+    // reach us with different qualifications (e.g. `t` via `open Lazy` vs the
+    // source's `Lazy.t`, or stdlib's `Stdlib__M.t` vs `M.t`) and we have no Env
+    // to canonicalize paths.  Matching on the final component avoids those
+    // spurious clashes; over-accepting two distinct same-named types is a far
+    // smaller cost here than false-rejecting valid code.
+    auto last = [](const std::string& p) {
+      auto d = p.rfind('.');
+      return d == std::string::npos ? p : p.substr(d + 1);
+    };
+    if (last(a->path) != last(b->path) || a->args.size() != b->args.size())
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     for (size_t i = 0; i < a->args.size(); ++i) unify(a->args[i], b->args[i]);
     return;
