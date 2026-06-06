@@ -710,3 +710,37 @@ device: a format-type subsystem and the principal-types/Env layer (records disam
 rides the latter).  Net result this session: **128 -> 6 false-rejects, 82.8% -> 99.2%
 accept**, every committed change sound (HM unit tests green; three net-negative attempts
 reverted).
+
+## Soundness axis: measurement framework + first sound check (the Any-weeding path)
+
+To weed out `Any` / "implement what OCaml does" we need the *other* metric:
+**false-acceptance** (does the checker reject invalid code?).  Two harnesses added:
+
+- `cxx/harness/accept_parity.sh` — over oracle-REJECTED files; but this is confounded by
+  the build environment (most plain rejects are missing external/sibling modules, which are
+  valid given `-I` — not intrinsic errors).  ~85% false-accept, noisy.
+- `cxx/harness/expect_soundness.sh` — the clean tool: expect-tests are self-contained and
+  carry their own verdict (an `[%%expect]` block containing `Error` = a known-invalid
+  file).  Strip the expect blocks, run `--check`, and a file we wrongly accept is a true
+  soundness gap.  **Baseline: 81.1% false-acceptance (193/238 invalid files), completeness
+  94.7% on the same corpus.**
+
+Bucketed the 193 false-accepts by the OCaml error they carry: signature mismatch (19),
+value errors (21), let-rec restriction (12), pattern/expr type mismatch (objects/modules/
+GADTs), refutation (6), unbound (7), ...  Each is a faithful re-implementation of an OCaml
+pass; the **strategy to remove `Any` = implement these subsystems bottom-up, each gated by
+BOTH harnesses** (completeness must not regress while soundness improves) — the same
+"advance together" law, now measurable on both axes.
+
+First sound check landed: the **let-rec value restriction** (a sound subset of OCaml's
+Value_rec_check) — flags only direct dereferences of a rec name at the RHS head, never
+argument positions (captured by partial application), so completeness held at 99.2% while
+soundness improved 81.1% -> 80.3%.  Confirmed once more that a *partial* port of the full
+3-mode access analysis false-rejects (`let rec f = let g = f in fun x -> g x`).
+
+**Net state:** completeness 99.2% accept (6 false-rejects/744); soundness 80.3%
+false-acceptance (self-contained corpus).  `Any` is now visible to a metric, so its removal
+is measurable.  Next soundness subsystems (each large): cross-module resolution + Env
+(retires the qualified-`M.x` Any and unbound errors), records/constructor disambiguation
+(retires the record/ctor Any), module signature matching, full inference for the
+object/module/GADT mismatch cases.
