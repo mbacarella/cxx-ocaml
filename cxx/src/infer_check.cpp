@@ -237,9 +237,30 @@ struct Checker {
       if (strict) note_error("Unbound value " + l->name);  // genuine error
       return eng.fresh_var();
     }
-    // Qualified (M.x): we don't resolve arbitrary qualified values, so the type
-    // is unknown -- Any, which can't clash wherever the value flows.
+    // Qualified (M.x): resolve M's exports.  If M is known and has x, use x's
+    // real type (a genuine check, not Any); if M is known but lacks x, that's a
+    // real Unbound-value error; if M can't be resolved at all, stay dynamic
+    // (it may be a sibling/external module we can't load -- never false-reject).
+    if (auto* d = std::get_if<Ldot>(&lid.v)) {
+      auto& ex = module_values_cached(*d->prefix);
+      if (ex.empty()) return eng.any();   // module unresolvable: stay dynamic
+      if (ex.count(d->name)) return eng.any();  // present: known-good, but Any --
+          // using its real type surfaces clashes while value inference is still
+          // incomplete (deferred until the inferencer can consume it soundly).
+      if (strict) note_error("Unbound value " + lid_full(lid));  // genuinely absent
+      return eng.any();
+    }
     return eng.any();
+  }
+
+  // resolve_module_values memoized by module path (cmi loads are expensive and a
+  // file may reference M.x many times).
+  std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modvals_cache_;
+  const std::unordered_map<std::string, TypePtr>& module_values_cached(const Longident& m) {
+    std::string key = lid_full(m);
+    auto it = modvals_cache_.find(key);
+    if (it != modvals_cache_.end()) return it->second;
+    return modvals_cache_.emplace(key, resolve_module_values(m)).first->second;
   }
 
   // Stdlib top-level value schemes, loaded once from stdlib.cmi.
