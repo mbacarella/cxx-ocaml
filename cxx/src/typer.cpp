@@ -57,6 +57,24 @@ struct Typer {
   // Type constructors defined in this module (separate namespace from values).
   std::unordered_map<std::string, tt::Ident> type_scope;
 
+  // Module-level `open M`: names exported by M resolve through M's path.
+  struct OpenEntry {
+    tt::Path path;
+    std::unordered_set<std::string> values;
+    std::unordered_set<std::string> types;
+  };
+  std::vector<OpenEntry> opens;
+
+  void load_open_names(const std::string& modname, OpenEntry& oe) {
+    try {
+      auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + modname + ".cmi");
+      for (auto& v : cmi.values()) oe.values.insert(v.name);
+      for (auto& t : cmi.types()) oe.types.insert(t.name);
+    } catch (...) {
+      // Unknown/local module: names from it won't resolve (best effort).
+    }
+  }
+
   tt::Ident fresh_local(const std::string& name) {
     tt::Ident id{name, next_stamp++, tt::Ident::Local};
     scopes.back()[name] = id;
@@ -87,6 +105,13 @@ struct Typer {
         tt::Path p;
         p.v = tt::Pident{tt::Ident{l->name, pd->second, tt::Ident::Predef}};
         return p;
+      }
+      for (auto it = opens.rbegin(); it != opens.rend(); ++it) {
+        if (it->types.count(l->name)) {
+          tt::Path p;
+          p.v = tt::Pdot{std::make_shared<tt::Path>(it->path), l->name};
+          return p;
+        }
       }
       throw TypeError("Unbound type constructor " + l->name);
     }
@@ -210,6 +235,13 @@ struct Typer {
         if (f != it->end()) {
           tt::Path p;
           p.v = tt::Pident{f->second};
+          return p;
+        }
+      }
+      for (auto it = opens.rbegin(); it != opens.rend(); ++it) {
+        if (it->values.count(l->name)) {
+          tt::Path p;
+          p.v = tt::Pdot{std::make_shared<tt::Path>(it->path), l->name};
           return p;
         }
       }
@@ -454,6 +486,22 @@ struct Typer {
       tp.type = core_type(*pr->prim.type);
       tp.prims = pr->prim.prims;
       si.desc = std::move(tp);
+    } else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
+      auto* mi = std::get_if<Pmod_ident>(&op->expr.desc);
+      if (!mi) throw TypeError("open of non-ident module");
+      tt::Path mpath = resolve_module(mi->id.txt);
+      tt::Tstr_open to;
+      to.override_ = op->ovr == OverrideFlag::Override;
+      to.expr.loc = op->expr.loc;
+      to.expr.desc = tt::Tmod_ident{mpath};
+      si.desc = std::move(to);
+      // Bring the opened module's names into scope (stdlib modules, best effort).
+      if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
+        OpenEntry oe;
+        oe.path = std::move(mpath);
+        load_open_names(l->name, oe);
+        opens.push_back(std::move(oe));
+      }
     } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
       auto& ctor = ex->exn.ctor;
       auto* decl = std::get_if<Pext_decl>(&ctor.kind);

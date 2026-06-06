@@ -405,6 +405,11 @@ struct Printer {
       line(j + 1, "Tprim_decl");
       core_type(j + 2, pr->type);
       list_strings(j + 2, pr->prims);
+    } else if (auto* op = std::get_if<Tstr_open>(&it.desc)) {
+      line(j, std::string("Tstr_open ") + (op->override_ ? "Override" : "Fresh"));
+      line(j, "module_expr " + loc(op->expr.loc));
+      auto& mi = std::get<Tmod_ident>(op->expr.desc);
+      line(j + 1, "Tmod_ident \"" + path_aux(mi.path) + "\"");
     } else {
       auto& ex = std::get<Tstr_exception>(it.desc);
       line(j, "Tstr_exception");

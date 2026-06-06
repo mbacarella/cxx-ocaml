@@ -161,12 +161,20 @@ struct TypeDeclaration {
   std::optional<CoreTypeBox> manifest;
 };
 
+// --- module expressions (fragment) ---
+struct Tmod_ident { Path path; };
+struct ModuleExpr {
+  std::variant<Tmod_ident> desc;
+  Location loc;
+};
+
 // --- structure ---
 struct Tstr_value {
   RecFlag rf;
   std::vector<ValueBinding> bindings;
 };
 struct Tstr_eval { ExprBox e; };
+struct Tstr_open { bool override_ = false; ModuleExpr expr; };
 struct Tstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Tstr_primitive {
   Ident id;
@@ -181,7 +189,8 @@ struct Tstr_exception {
   std::optional<CoreTypeBox> res;
 };
 struct StructureItem {
-  std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception>
+  std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception,
+               Tstr_open>
       desc;
   Location loc;
 };
