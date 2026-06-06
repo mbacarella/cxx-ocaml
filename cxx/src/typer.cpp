@@ -898,6 +898,24 @@ struct Typer {
       out.desc = tt::Tmod_ident{resolve_module(mi->id.txt)};
     } else if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
       out.desc = tt::Tmod_structure{nested_structure(ms->items)};
+    } else if (auto* fn = std::get_if<Pmod_functor>(&me.desc)) {
+      auto* named = std::get_if<Functor_named>(&fn->param);
+      if (!named) throw TypeError("generative functor (unit param)");
+      tt::Tmod_functor tf;
+      auto saved = module_scope;
+      tf.param = fresh_module(named->name.txt ? *named->name.txt : "_");
+      tf.param_type = std::make_unique<tt::ModuleType>(module_type_t(*named->type));
+      tf.body = std::make_unique<tt::ModuleExpr>(module_expr(*fn->body));
+      module_scope = std::move(saved);
+      out.desc = std::move(tf);
+    } else if (auto* ap = std::get_if<Pmod_apply>(&me.desc)) {
+      out.desc = tt::Tmod_apply{
+          std::make_unique<tt::ModuleExpr>(module_expr(*ap->f)),
+          std::make_unique<tt::ModuleExpr>(module_expr(*ap->arg))};
+    } else if (auto* cn = std::get_if<Pmod_constraint>(&me.desc)) {
+      out.desc = tt::Tmod_constraint{
+          std::make_unique<tt::ModuleExpr>(module_expr(*cn->me)),
+          std::make_unique<tt::ModuleType>(module_type_t(*cn->mt))};
     } else {
       throw TypeError("module_expr#" + std::to_string(me.desc.index()));
     }

@@ -264,8 +264,17 @@ using Structure = std::vector<StructureItem>;
 // --- module expressions (now that Structure is complete) ---
 struct Tmod_ident { Path path; };
 struct Tmod_structure { Structure items; };
+struct Tmod_functor {
+  std::optional<Ident> param;       // Named param (nullopt for `_`/unit handled later)
+  ModuleTypeBox2 param_type;
+  ModuleExprBox body;
+};
+struct Tmod_apply { ModuleExprBox fn; ModuleExprBox arg; };
+struct Tmod_constraint { ModuleExprBox expr; ModuleTypeBox2 type; };
 struct ModuleExpr {
-  std::variant<Tmod_ident, Tmod_structure> desc;
+  std::variant<Tmod_ident, Tmod_structure, Tmod_functor, Tmod_apply,
+               Tmod_constraint>
+      desc;
   Location loc;
 };
 

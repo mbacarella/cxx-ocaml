@@ -470,17 +470,30 @@ struct Printer {
 
   void module_expr(int i, const ModuleExpr& me) {
     line(i, "module_expr " + loc(me.loc));
+    int j = i + 1;
     if (auto* mi = std::get_if<Tmod_ident>(&me.desc)) {
-      line(i + 1, "Tmod_ident \"" + path_aux(mi->path) + "\"");
-    } else {
-      auto& ms = std::get<Tmod_structure>(me.desc);
-      line(i + 1, "Tmod_structure");
-      if (ms.items.empty()) line(i + 1, "[]");
+      line(j, "Tmod_ident \"" + path_aux(mi->path) + "\"");
+    } else if (auto* ms = std::get_if<Tmod_structure>(&me.desc)) {
+      line(j, "Tmod_structure");
+      if (ms->items.empty()) line(j, "[]");
       else {
-        line(i + 1, "[");
-        for (auto& sit : ms.items) structure_item(i + 2, sit);
-        line(i + 1, "]");
+        line(j, "[");
+        for (auto& sit : ms->items) structure_item(j + 1, sit);
+        line(j, "]");
       }
+    } else if (auto* fn = std::get_if<Tmod_functor>(&me.desc)) {
+      line(j, "Tmod_functor \"" + (fn->param ? ident(*fn->param) : "*") + "\"");
+      if (fn->param_type) module_type(j, *fn->param_type);
+      module_expr(j, *fn->body);
+    } else if (auto* ap = std::get_if<Tmod_apply>(&me.desc)) {
+      line(j, "Tmod_apply");
+      module_expr(j, *ap->fn);
+      module_expr(j, *ap->arg);
+    } else {
+      auto& cn = std::get<Tmod_constraint>(me.desc);
+      line(j, "Tmod_constraint");
+      module_expr(j, *cn.expr);
+      module_type(j, *cn.type);
     }
   }
 
