@@ -687,9 +687,26 @@ Two changes were tried and **reverted as net-negative** (the law again): pushing
 binding's type annotation into function params (surfaces clashes in incomplete bodies),
 and relaxing unify's arity check for existential GADTs (broke a soundness unit test).
 
-The remaining **8** (1.1%) are the genuinely hard tail, each needing a whole subsystem
-and several bundled per file: polymorphic record fields (`{ pf : 'a. ... }`), Format's
-higher-order `%a` API, first-class-module type flow and module patterns, modular
-explicits (`{M : S} -> ...`), existential GADTs. These need the principal-types/Env layer
-built as a unit (records disambiguation rides the same machinery) — a deliberate next
-phase, not another increment.
+## Continued: 98.9% -> 99.2% accept (3 more commits, 8 -> 6 false-rejects)
+
+A gradual-typing device closed most of what remained:
+
+- **a dynamic `Any` type** in the engine: it unifies with anything without clashing or
+  propagating (a touched var links to Any).  Routed every "we can't infer this" case to it
+  -- qualified `M.x`, unknown/ambiguous constructors, unresolved record fields/expressions,
+  unknown-pattern variables.  Unlike a fresh var (which can still clash if unified to two
+  concretes), Any *strictly cannot* add a false rejection.  This is the principled
+  best-effort stance, and it fixed the polymorphic-record-field case (`{ pf : 'a. ... }`
+  used at several types now flows through Any).
+- **arity padding**: track each type's declared arity and pad an under-applied constructor
+  (an existential GADT's `_ raw_arity` with fewer wildcards than params) with Any, so it
+  unifies with the fully-applied form instead of clashing on arity.
+
+The final **6** (0.8%) all live in deep subsystems, several bundled per file: Format's
+higher-order `%a` type-flow (needs decoding the format string's CamlinternalFormat
+type structure), first-class-module type flow + module patterns, modular explicits
+(`{M : S} -> ...`).  These are the genuine step-change beyond the incremental + gradual
+device: a format-type subsystem and the principal-types/Env layer (records disambiguation
+rides the latter).  Net result this session: **128 -> 6 false-rejects, 82.8% -> 99.2%
+accept**, every committed change sound (HM unit tests green; three net-negative attempts
+reverted).
