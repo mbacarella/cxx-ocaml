@@ -495,6 +495,47 @@ struct Checker {
         note_error("The type variable \"'" + v + "\" is unbound in this type declaration.");
   }
 
+  // Alias names referenced (transitively expandable) in a manifest core type.
+  void collect_alias_refs(const CoreType& t, std::set<std::string>& out) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      // Only a bare (unqualified) name can refer to a file-local alias; a
+      // qualified `M.t` is another module's type, not this alias (matching it by
+      // last component would invent false cycles, e.g. `type t = T1.t = A`).
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+        if (type_aliases.count(l->name)) out.insert(l->name);
+      for (auto& a : c->args) collect_alias_refs(*a, out);
+    } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      collect_alias_refs(*a->dom, out); collect_alias_refs(*a->cod, out);
+    } else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : tu->elems) collect_alias_refs(*e, out);
+    } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+      collect_alias_refs(*al->type, out);
+    }
+  }
+  // Cyclic type-abbreviation check: an abbreviation whose expansion refers back
+  // to itself (`type t = t * t`, `type a = b and b = a`) is rejected (no
+  // -rectypes).  Only file-local aliases participate, so this never
+  // false-rejects external/valid types.
+  void check_cyclic_aliases() {
+    if (!strict) return;
+    std::unordered_map<std::string, std::set<std::string>> refs;
+    for (auto& [name, al] : type_aliases) collect_alias_refs(*al.manifest, refs[name]);
+    for (auto& [name, al] : type_aliases) {
+      std::set<std::string> seen;
+      std::function<bool(const std::string&)> reaches = [&](const std::string& cur) -> bool {
+        auto it = refs.find(cur);
+        if (it == refs.end()) return false;
+        for (auto& nx : it->second) {
+          if (nx == name) return true;
+          if (seen.insert(nx).second && reaches(nx)) return true;
+        }
+        return false;
+      };
+      if (reaches(name))
+        note_error("The type abbreviation \"" + name + "\" is cyclic");
+    }
+  }
+
   // Register a user variant: A of t1*..*tn -> scheme t1->..->tn->(params) name.
   void register_type_decl(const TypeDeclaration& d) {
     check_type_vars(d);
@@ -1216,6 +1257,7 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
 static void run_checker(Checker& ck, const ast::Structure& s) {
   ck.register_predef_ctors();
   register_types_rec(ck, s);
+  ck.check_cyclic_aliases();
   ck.process_items(s);
 }
 
