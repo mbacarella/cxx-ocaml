@@ -872,3 +872,27 @@ The records win is the proof the foundation pays off: the long-blocked keystone 
 in only after type identity + scoped resolution + the Any escape hatch were all in place --
 exactly the "advance together" sequencing.  Session soundness arc: **81.1% -> 72.7%**
 false-acceptance; completeness pinned at 99.2% throughout.
+
+## Expected-type propagation (bidirectional checking) — mechanism in, corpus saturated
+
+Implemented the bidirectional checking the value/expression-mismatch buckets need:
+expected_clash (identity_clash + a mismatch between two distinct *reliable* builtins --
+int/char/string/float/bool/unit/int32/64/nativeint/exn/bytes, excluding array/list/user
+types where our inference is still incomplete; pure, no mutation), applied to:
+- binding annotations `let x : T = e`,
+- type-constraint expressions `(e : T)`,
+- application arguments of an otherwise-Any qualified callee (resolve M.x's real type and
+  check args, e.g. `String.length 5`).
+
+Verified correct on synthetic cases (`let x : string = 5`, `String.length 5`, `f "x"` with
+f:int->int all rejected).  **But both harnesses were unchanged (99.2% / 72.7%)**: this
+expect-test corpus's remaining false-accepts are *not* simple structural mismatches -- they
+are deep type-system features (objects, GADTs, recursive modules, abstract types, scope
+escape, polymorphic variants).  So the propagation engine is correct and is real soundness
+for ordinary code, but the corpus metric is saturated for it.
+
+**Finding:** the easy/structural soundness wins are harvested (81.1% -> 72.7% this session).
+The remaining ~173 false-accepts are concentrated in: module signature *content* matching
+(value-type + type-decl comparison, ~19), and the deep features above -- each a substantial
+subsystem (the OO/row-types layer being the largest).  These, not more propagation, are the
+next soundness frontier.
