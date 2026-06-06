@@ -11,15 +11,16 @@
 #include "cppcaml/typer.hpp"
 
 int main(int argc, char** argv) {
-  bool infer_mode = false;
+  bool infer_mode = false, check_mode = false;
   const char* path = nullptr;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--infer") infer_mode = true;
+    else if (a == "--check") check_mode = true;
     else path = argv[i];
   }
   if (!path) {
-    std::cerr << "usage: c++type [--infer] <file.ml>\n";
+    std::cerr << "usage: c++type [--infer|--check] <file.ml>\n";
     return 2;
   }
   std::ifstream in(path, std::ios::binary);
@@ -38,6 +39,12 @@ int main(int argc, char** argv) {
       for (auto& [name, ty] : cppcaml::infer_structure_types(structure))
         std::cout << "val " << name << " : " << ty << '\n';
       return 0;
+    }
+    if (check_mode) {  // strict type-check: print errors, exit 1 if rejected
+      auto errs = cppcaml::structure_typecheck(structure);
+      for (auto& e : errs) std::cout << "Error: " << e << '\n';
+      if (errs.empty()) std::cout << "OK\n";
+      return errs.empty() ? 0 : 1;
     }
     auto typed = cppcaml::type_structure(structure);
     cppcaml::typedtree::print_dtypedtree(typed, path, std::cout, dirfiles);

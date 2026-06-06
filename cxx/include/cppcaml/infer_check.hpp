@@ -30,4 +30,9 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
 std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
     const ast::Structure& s);
 
+// Strict type-check (toward error-rejection parity): the definite type errors in
+// a structure; empty => accepted.  Conservative (only certain errors), so the
+// false-rejection rate over oracle-accepted files measures engine completeness.
+std::vector<std::string> structure_typecheck(const ast::Structure& s);
+
 }  // namespace cppcaml

@@ -54,6 +54,10 @@ struct Checker {
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
+  // Strict mode: record definite type errors instead of swallowing them.
+  bool strict = false;
+  std::vector<std::string> errors;
+  void note_error(const std::string& m) { if (errors.size() < 100) errors.push_back(m); }
 
   TypePtr generic_var() {
     auto v = eng.fresh_var();
@@ -124,15 +128,21 @@ struct Checker {
     return eng.fresh_var();
   }
 
-  TypePtr lookup_value(const std::string& name) {
-    for (auto it = venv.rbegin(); it != venv.rend(); ++it) {
-      auto f = it->find(name);
-      if (f != it->end()) return eng.instantiate(f->second);
+  TypePtr lookup_value(const Longident& lid) {
+    if (auto* l = std::get_if<Lident>(&lid.v)) {
+      for (auto it = venv.rbegin(); it != venv.rend(); ++it) {
+        auto f = it->find(l->name);
+        if (f != it->end()) return eng.instantiate(f->second);
+      }
+      auto& s = stdlib_schemes();
+      auto f = s.find(l->name);
+      if (f != s.end()) return eng.instantiate(f->second);
+      if (strict) note_error("Unbound value " + l->name);  // genuine error
+      return eng.fresh_var();
     }
-    auto& s = stdlib_schemes();
-    auto f = s.find(name);
-    if (f != s.end()) return eng.instantiate(f->second);
-    return eng.fresh_var();  // unbound / qualified: best-effort
+    // Qualified (M.x): submodule cmis not loaded yet — can't resolve, so we must
+    // NOT reject (a known gap, not a type error).  Best-effort fresh var.
+    return eng.fresh_var();
   }
 
   // Stdlib top-level value schemes, loaded once from stdlib.cmi.
@@ -147,6 +157,20 @@ struct Checker {
       }
     } catch (...) {}
     return stdlib_;
+  }
+
+  // `open M`: load M's exported value schemes (+ variant ctors) into the current
+  // scope so unqualified names resolve.  Stdlib submodules only, best-effort.
+  void load_open(const Longident& m) {
+    auto* l = std::get_if<Lident>(&m.v);
+    if (!l) return;
+    try {
+      auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + l->name + ".cmi");
+      for (auto& v : cmi.values()) {
+        std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+        venv.back()[v.name] = from_cmi(v.type, memo);
+      }
+    } catch (...) {}
   }
 
   void register_predef_ctors() {
@@ -191,7 +215,8 @@ struct Checker {
     try { return f(); } catch (const I::TypeError&) { return eng.fresh_var(); }
   }
   void try_unify(const TypePtr& a, const TypePtr& b) {
-    try { eng.unify(a, b); } catch (const I::TypeError&) {}
+    try { eng.unify(a, b); }
+    catch (const I::TypeError& e) { if (strict) note_error(e.what()); }
   }
 
   // A top-level case pattern that matches anything (no guard handled by caller).
@@ -292,7 +317,7 @@ struct Checker {
   TypePtr infer_expr(const Expression& e) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return constant_type(c->c);
     if (auto* id = std::get_if<Pexp_ident>(&e.desc))
-      return lookup_value(lid_last(id->id.txt));
+      return lookup_value(id->id.txt);
     if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       TypePtr ft = infer_expr(*a->fn);
       for (auto& [lbl, arg] : a->args) {
@@ -367,6 +392,14 @@ struct Checker {
       TypePtr el = eng.fresh_var();
       for (auto& x : a->elems) try_unify(el, infer_expr(*x));
       return eng.constr("array", {el});
+    }
+    if (auto* sti = std::get_if<Pexp_struct_item>(&e.desc)) {
+      venv.emplace_back();
+      if (auto* op = std::get_if<Pstr_open>(&sti->item->desc))
+        if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) load_open(mi->id.txt);
+      TypePtr bt = infer_expr(*sti->body);
+      venv.pop_back();
+      return bt;
     }
     return eng.fresh_var();
   }
@@ -446,6 +479,10 @@ static void run_checker(Checker& ck, const ast::Structure& s) {
         ck.infer_bindings(sv->rf, sv->bindings);
       else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
         ck.infer_expr(*ev->e);
+      else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
+        if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc))
+          ck.load_open(mi->id.txt);  // bring opened names into top-level scope
+      }
     } catch (const I::TypeError&) {
     }
   }
@@ -456,6 +493,18 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
   Checker ck;
   run_checker(ck, s);
   return std::move(ck.match_partial);
+}
+
+// Strict type-check: returns the definite type errors found (empty => accepted).
+// Conservative — only DEFINITE errors (unqualified unbound value, type clash);
+// unknown/unsupported constructs and qualified names are assumed OK so that
+// engine incompleteness shows up as false-rejections to be driven out, not as
+// spurious accepts.
+std::vector<std::string> structure_typecheck(const ast::Structure& s) {
+  Checker ck;
+  ck.strict = true;
+  run_checker(ck, s);
+  return std::move(ck.errors);
 }
 
 std::vector<std::pair<std::string, std::string>> infer_structure_types(
