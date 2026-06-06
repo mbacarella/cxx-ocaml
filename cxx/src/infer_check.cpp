@@ -444,6 +444,21 @@ struct Checker {
     }
   }
 
+  // Register an exception/extension constructor: A of t1*..*tn => t1->..->tn->exn.
+  // Participates in ambiguity detection so `exception E` + `type t = E` makes E
+  // ambiguous (type-directed disambiguation, approximated as unknown).
+  void register_exception(const ExtensionConstructor& ec) {
+    TypePtr scheme = eng.constr("exn");
+    if (auto* d = std::get_if<Pext_decl>(&ec.kind))
+      if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
+        for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it) {
+          std::unordered_map<std::string, TypePtr> vars;
+          scheme = eng.arrow(from_coretype(**it, vars), scheme);
+        }
+    if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
+    ctors[ec.name.txt] = scheme;
+  }
+
   // Look up a constructor scheme, treating ambiguous (multiply-defined) names as
   // unknown so they don't resolve to the wrong type and clash.
   TypePtr* find_ctor(const std::string& name) {
@@ -1007,6 +1022,8 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
   for (auto& it : s) {
     if (auto* ty = std::get_if<Pstr_type>(&it.desc))
       for (auto& d : ty->decls) ck.register_type_decl(d);
+    else if (auto* ex = std::get_if<Pstr_exception>(&it.desc))
+      ck.register_exception(ex->exn.ctor);
     else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       const ModuleExpr* me = &mb->binding.expr;
       while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
