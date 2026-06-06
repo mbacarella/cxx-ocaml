@@ -85,13 +85,22 @@ struct Checker {
   // local module-type name -> its signature's value names (first-class modules):
   // (val e : S) unpacks bring S's values into scope.
   std::unordered_map<std::string, std::vector<std::string>> modtype_env;
+  // When loading a module's values from a cmi, its own type abbreviations so
+  // from_cmi can expand them (e.g. Float.t = float, so `min : t -> t -> t`
+  // becomes float -> float -> float instead of clashing t vs float).
+  const std::vector<cmi::TypeDecl>* cmi_types_ctx_ = nullptr;
+  std::set<std::string> cmi_expanding_;
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
   // Strict mode: record definite type errors instead of swallowing them.
   bool strict = false;
   std::vector<std::string> errors;
-  void note_error(const std::string& m) { if (errors.size() < 100) errors.push_back(m); }
+  int cur_line_ = 0;  // line of the expression currently being inferred (for diagnostics)
+  void note_error(const std::string& m) {
+    if (errors.size() < 100)
+      errors.push_back(cur_line_ ? ("L" + std::to_string(cur_line_) + ": " + m) : m);
+  }
 
   TypePtr generic_var() {
     auto v = eng.fresh_var();
@@ -128,6 +137,20 @@ struct Checker {
       case cmi::TypeExpr::Texpand: {
         std::string p = n->path ? cmi_path_str(*n->path) : "?";
         if (is_format_base(p)) return eng.constr("format6");
+        // expand a same-module type abbreviation (Float.t = float, Int.t = int)
+        if (cmi_types_ctx_ && n->path && n->path->kind == cmi::Path::Pident &&
+            !cmi_expanding_.count(n->path->id.name))
+          for (auto& td : *cmi_types_ctx_)
+            if (td.name == n->path->id.name && td.manifest &&
+                td.params.size() == n->args.size()) {
+              std::unordered_map<cmi::TypeExpr*, TypePtr> m2;
+              for (size_t i = 0; i < td.params.size(); ++i)
+                m2[td.params[i].get()] = from_cmi(n->args[i], memo);
+              cmi_expanding_.insert(td.name);
+              TypePtr r = from_cmi(td.manifest, m2);
+              cmi_expanding_.erase(td.name);
+              return r;
+            }
         std::vector<TypePtr> as;
         for (auto& a : n->args) as.push_back(from_cmi(a, memo));
         return eng.constr(std::move(p), std::move(as));
@@ -278,12 +301,15 @@ struct Checker {
           if (mm.name == comps[i]) { md = &mm; break; }
         sig = md ? module_sig(md->type, loaded) : nullptr;
       }
-      if (sig)
+      if (sig) {
+        cmi_types_ctx_ = &sig->types;  // enable same-module abbreviation expansion
         for (auto& v : sig->values) {
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
           out[v.name] = from_cmi(v.type, memo);
         }
-    } catch (...) {}
+        cmi_types_ctx_ = nullptr;
+      }
+    } catch (...) { cmi_types_ctx_ = nullptr; }
     return out;
   }
 
@@ -589,6 +615,7 @@ struct Checker {
   }
 
   TypePtr infer_expr(const Expression& e) {
+    if (e.loc.start.lnum) cur_line_ = e.loc.start.lnum;
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return constant_type(c->c);
     if (auto* id = std::get_if<Pexp_ident>(&e.desc))
       return lookup_value(id->id.txt);
