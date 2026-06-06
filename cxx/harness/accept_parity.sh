@@ -20,6 +20,9 @@ key() { printf '%s' "$1" | tr '/' '%'; }
 if [ "${1:-}" == "--worker" ]; then
   f="$2"
   [ -s "$CACHE/$(key "$f")" ] && { printf 'SKIP\n'; exit 0; }  # oracle accepted it
+  # expect-tests are toplevel phrase/[%%expect] tests: `ocamlc -dtypedtree` rejects
+  # them for the expect extension, not a single-file type error -- out of scope.
+  grep -q '%%expect' "$f" && { printf 'SKIP\n'; exit 0; }
   out=$(timeout "$TIMEOUT" "$CPP" --check "$f" 2>/dev/null)
   rc=$?
   if [ $rc -eq 124 ]; then printf 'TIMEOUT\n'
