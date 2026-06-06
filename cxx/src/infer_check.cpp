@@ -89,7 +89,18 @@ struct Checker {
   }
   // constructors defined in more than one type: ambiguous without type-directed
   // disambiguation, so treated as unknown (a flat last-wins map picks wrong).
+  // (Only consulted as a fallback for ctors not in the scoped cenv below.)
   std::set<std::string> ambiguous_ctors_;
+  // Scoped, ordered constructor resolution (mirrors tenv for types): a ctor name
+  // resolves to the in-scope declaration, so a name reused across several local
+  // types is disambiguated by position instead of collapsed to ambiguous.
+  std::unordered_map<const ConstructorDecl*, TypePtr> ctor_scheme_;
+  std::vector<std::unordered_map<std::string, TypePtr>> cenv{{}};
+  // names that are also predefined or exception constructors: when one of these
+  // is reused by a variant, OCaml disambiguates by expected type (which we lack),
+  // so we keep them unknown rather than resolve to the wrong kind.
+  std::set<std::string> predef_ctors_;
+  std::set<std::string> exn_ctors_;
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
@@ -448,6 +459,7 @@ struct Checker {
     ctors["true"] = eng.constr("bool");
     ctors["false"] = eng.constr("bool");
     ctors["()"] = eng.constr("unit");
+    predef_ctors_ = {"[]", "::", "None", "Some", "true", "false", "()"};
     type_ctors["bool"] = {"false", "true"};
     type_ctors["option"] = {"None", "Some"};
     type_ctors["list"] = {"[]", "::"};
@@ -617,6 +629,7 @@ struct Checker {
       }
       if (ctors.count(c.name.txt)) ambiguous_ctors_.insert(c.name.txt);
       ctors[c.name.txt] = scheme;
+      ctor_scheme_[&c] = scheme;  // for scoped (in-order) resolution via cenv
     }
   }
 
@@ -633,11 +646,21 @@ struct Checker {
         }
     if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
     ctors[ec.name.txt] = scheme;
+    exn_ctors_.insert(ec.name.txt);
   }
 
-  // Look up a constructor scheme, treating ambiguous (multiply-defined) names as
-  // unknown so they don't resolve to the wrong type and clash.
+  // Look up a constructor scheme.  The scoped cenv (in-order, module-scoped)
+  // takes priority -- it resolves a name reused across local types to the
+  // in-scope declaration.  Only when a name isn't in scope do we fall back to
+  // the flat map, treating cross-module duplicates as ambiguous (unknown).
   TypePtr* find_ctor(const std::string& name) {
+    // A variant constructor reusing a predef/exception name needs type-directed
+    // disambiguation we don't have -> leave unknown rather than pick wrong.
+    if (!predef_ctors_.count(name) && !exn_ctors_.count(name))
+      for (auto it = cenv.rbegin(); it != cenv.rend(); ++it) {
+        auto f = it->find(name);
+        if (f != it->end()) return &f->second;
+      }
     if (ambiguous_ctors_.count(name)) return nullptr;
     auto it = ctors.find(name);
     return it == ctors.end() ? nullptr : &it->second;
@@ -1222,7 +1245,9 @@ struct Checker {
     if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
       venv.emplace_back();
       tenv.emplace_back();  // the module's type declarations are scoped here
+      cenv.emplace_back();  // and its constructors
       process_items(ms->items);
+      cenv.pop_back();
       tenv.pop_back();
       auto exports = std::move(venv.back());
       venv.pop_back();
@@ -1270,9 +1295,13 @@ struct Checker {
     {
       try {
         if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
-          // bind these type names' identities in the current scope, in order
-          for (auto& d : ty->decls)
+          // bind these type names' identities and constructors in scope, in order
+          for (auto& d : ty->decls) {
             if (type_stamp_.count(&d)) tenv.back()[d.name.txt] = type_stamp_[&d];
+            if (auto* v = std::get_if<Ptype_variant>(&d.kind))
+              for (auto& c : v->ctors)
+                if (ctor_scheme_.count(&c)) cenv.back()[c.name.txt] = ctor_scheme_[&c];
+          }
         } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings);
         else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
