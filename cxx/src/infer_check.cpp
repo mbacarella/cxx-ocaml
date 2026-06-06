@@ -257,8 +257,10 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> resolve_module_values(const Longident& m) {
     auto comps = mod_components(m);
     if (comps.empty()) return {};
-    if (comps.size() == 1) {
-      auto it = modenv.find(comps[0]);
+    // local modules are recorded flat by simple name; a qualified local nested
+    // module (e.g. include T.Int) is found by its last component.
+    {
+      auto it = modenv.find(comps.back());
       if (it != modenv.end()) return it->second;
     }
     std::unordered_map<std::string, TypePtr> out;
@@ -755,7 +757,10 @@ struct Checker {
       // contributes no arrow to the function's type.
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
         auto [lk, nm] = arglabel(pv->label);
-        params.push_back({infer_pat(pv->pat), lk, nm});
+        TypePtr pt = infer_pat(pv->pat);
+        // an optional parameter's type is its default's type: `?(c = 100)` => int
+        if (pv->default_) try_unify(pt, infer_expr(**pv->default_));
+        params.push_back({pt, lk, nm});
       }
     }
     TypePtr body;
