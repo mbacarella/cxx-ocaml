@@ -65,6 +65,8 @@ struct Checker {
   std::unordered_map<const Expression*, bool> match_partial;
   // local module name -> its exported value schemes (so open/include/M.x resolve)
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modenv;
+  // local functor name -> its body's exported value schemes (F(X) result)
+  std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> functor_env;
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
@@ -246,6 +248,10 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> functor_result_values(const Longident& fpath) {
     auto comps = mod_components(fpath);
     if (comps.empty()) return {};
+    if (comps.size() == 1) {  // a local functor's recorded body exports
+      auto it = functor_env.find(comps[0]);
+      if (it != functor_env.end()) return it->second;
+    }
     std::unordered_map<std::string, TypePtr> out;
     try {
       const std::string& head = comps[0];
@@ -737,8 +743,28 @@ struct Checker {
         else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
         } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
-          if (mb->binding.name.txt)
-            modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
+          if (mb->binding.name.txt) {
+            // A functor: record its body's exports as the application result.
+            const ModuleExpr* me = &mb->binding.expr;
+            while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
+            if (std::holds_alternative<Pmod_functor>(me->desc)) {
+              while (auto* mf = std::get_if<Pmod_functor>(&me->desc)) me = mf->body.get();
+              // Keep only the result's value *names* (fresh polymorphic types):
+              // the body's concrete types depend on the (unsubstituted) argument,
+              // so using them would surface spurious clashes -- names suffice to
+              // clear unbound false-rejections without ever adding a clash.  The
+              // body also can't be soundly checked without applying the functor,
+              // so suppress error recording while harvesting its names.
+              bool saved = strict;
+              strict = false;
+              auto ex = module_exports(*me);
+              strict = saved;
+              for (auto& [k, v] : ex) v = generic_var();
+              functor_env[*mb->binding.name.txt] = std::move(ex);
+            } else {
+              modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
+            }
+          }
         } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
           for (auto& [k, v] : module_exports(in->expr)) venv.back()[k] = v;
         } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
