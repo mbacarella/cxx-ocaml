@@ -657,9 +657,39 @@ unit tests kept green throughout):
 
 The recurring law, observed repeatedly: **completeness and soundness must advance
 together.** Every time partial inference handed concrete types to an incomplete consumer
-(opens, records, local-functor bodies), false-rejections went *up* until the consumer was
-completed or deliberately left opaque. Records are the standing example — deferred,
-because correct field typing needs type-directed disambiguation of shared labels; a flat
-last-wins label map clashes (37 -> 52). The remaining 22 are the genuinely hard tail:
-polymorphic record fields, optional-arg default/erasure, empty-type refutations, module
-patterns, extensible variants, objects, GADT existentials — several bundled per file.
+(opens, records, local-functor bodies, binding-annotation push), false-rejections went
+*up* until the consumer was completed or deliberately left opaque. Records are the
+standing example — deferred, because correct field typing needs type-directed
+disambiguation of shared labels; a flat last-wins label map clashes (37 -> 52).
+
+## Continued: 97.0% -> 98.9% accept (8 more commits, 22 -> 8 false-rejects)
+
+Triaged the tail with per-error source-line tags. More wins, each oracle-validated, HM
+unit tests green:
+
+- **path canonicalization**: compare type-constructor paths by *last component* in unify
+  (same type reaches us as `t` via `open Lazy` vs source `Lazy.t`); **cmi-level
+  abbreviation expansion** when loading a module's values (`open Float; min 1. nan` —
+  Float.t = float — no longer clashes t-vs-float).
+- **optional-argument commutation**: always label-aware application via a dry run; a
+  positional arg skips a leading optional (`return_exn ()` no longer matches
+  ?raise:bool); erase a leading optional once a later positional is supplied.
+- **GADT matches detected by constructor** (not just scrutinee type), skipping *both*
+  pattern/scrutinee and result unifies (branch-local refinement we can't model);
+  **polymorphic-recursive** `let rec f : type a. T` bound to its generic annotation so
+  recursive calls instantiate (kills a spurious occurs-check).
+- **constructor/exception disambiguation**: a constructor defined in >1 type, or a name
+  that is both an exception and a variant constructor (`exception E` + `type t = E`), is
+  ambiguous without type-direction — registered, detected, and left opaque rather than
+  resolved last-wins to the wrong type.
+
+Two changes were tried and **reverted as net-negative** (the law again): pushing a
+binding's type annotation into function params (surfaces clashes in incomplete bodies),
+and relaxing unify's arity check for existential GADTs (broke a soundness unit test).
+
+The remaining **8** (1.1%) are the genuinely hard tail, each needing a whole subsystem
+and several bundled per file: polymorphic record fields (`{ pf : 'a. ... }`), Format's
+higher-order `%a` API, first-class-module type flow and module patterns, modular
+explicits (`{M : S} -> ...`), existential GADTs. These need the principal-types/Env layer
+built as a unit (records disambiguation rides the same machinery) — a deliberate next
+phase, not another increment.
