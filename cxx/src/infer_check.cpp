@@ -272,10 +272,11 @@ struct Checker {
   // signature into the body, which we don't do; binding the names (types left
   // fully generic) clears the unbound-value false-rejections without ever
   // introducing a clash.  F is given by its (possibly qualified) module path.
-  std::unordered_map<std::string, TypePtr> functor_result_values(const Longident& fpath) {
+  std::unordered_map<std::string, TypePtr> functor_result_values(const Longident& fpath,
+                                                                 int napp = 1) {
     auto comps = mod_components(fpath);
     if (comps.empty()) return {};
-    if (comps.size() == 1) {  // a local functor's recorded body exports
+    if (comps.size() == 1) {  // a local functor's recorded (fully-applied) body
       auto it = functor_env.find(comps[0]);
       if (it != functor_env.end()) return it->second;
     }
@@ -295,12 +296,13 @@ struct Checker {
         mt = md->type.get();
         sig = (mt->kind == cmi::ModuleType::Sig) ? mt->sig.get() : nullptr;
       }
-      // mt is the functor; take its body signature's value names.
-      if (mt && mt->kind == cmi::ModuleType::Functor && mt->functor_body) {
-        const cmi::ModuleType* body = mt->functor_body.get();
-        if (body->kind == cmi::ModuleType::Sig && body->sig)
-          for (auto& v : body->sig->values) out[v.name] = generic_var();
-      }
+      // Descend napp functor-body levels (curried application F(A)(B)...),
+      // then take the resulting signature's value names.
+      const cmi::ModuleType* cur = mt;
+      for (int i = 0; i < napp && cur; ++i)
+        cur = (cur->kind == cmi::ModuleType::Functor) ? cur->functor_body.get() : nullptr;
+      if (cur && cur->kind == cmi::ModuleType::Sig && cur->sig)
+        for (auto& v : cur->sig->values) out[v.name] = generic_var();
     } catch (...) {}
     return out;
   }
@@ -820,12 +822,20 @@ struct Checker {
           return modtype_values_of(pk->path.txt);
       return {};
     }
-    if (auto* ma = std::get_if<Pmod_apply>(&me.desc))  // F(X): functor application
-      if (auto* fi = std::get_if<Pmod_ident>(&ma->f->desc))
-        return functor_result_values(fi->id.txt);
-    if (auto* mau = std::get_if<Pmod_apply_unit>(&me.desc))  // F()
-      if (auto* fi = std::get_if<Pmod_ident>(&mau->f->desc))
-        return functor_result_values(fi->id.txt);
+    if (std::get_if<Pmod_apply>(&me.desc) || std::get_if<Pmod_apply_unit>(&me.desc)) {
+      // possibly-curried functor application F(A)(B)...: count the applications
+      // and find the head functor ident.
+      int napp = 0;
+      const ModuleExpr* h = &me;
+      while (true) {
+        if (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++napp; h = a->f.get(); }
+        else if (auto* au = std::get_if<Pmod_apply_unit>(&h->desc)) { ++napp; h = au->f.get(); }
+        else break;
+      }
+      if (auto* fi = std::get_if<Pmod_ident>(&h->desc))
+        return functor_result_values(fi->id.txt, napp);
+      return {};
+    }
     return {};  // functor definition itself: no values
   }
 
