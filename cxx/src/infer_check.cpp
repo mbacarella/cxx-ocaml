@@ -1224,6 +1224,37 @@ struct Checker {
     return false;
   }
 
+  // Signature inclusion (Includemod), sound slice: every value name required by
+  // an ascribed signature must be provided by the structure.  Only flag a
+  // genuinely-missing name; under-population of `provided` (e.g. via an include
+  // we don't expand) would false-report, so we only require values from inline
+  // signatures / known local module types, and skip if the sig has includes.
+  void check_sig_missing(const std::unordered_map<std::string, TypePtr>& provided,
+                         const ModuleType& mt) {
+    if (!strict) return;
+    std::vector<std::string> required;
+    if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) {
+      for (auto& it : sg->items)
+        if (std::holds_alternative<Psig_include>(it.desc)) return;  // can't be sure
+      collect_sig_values(sg->items, required);
+    } else if (auto* mi = std::get_if<Pmty_ident>(&mt.desc)) {
+      auto* l = std::get_if<Lident>(&mi->id.txt.v);
+      if (!l) return;
+      auto e = modtype_env.find(l->name);
+      if (e == modtype_env.end()) return;
+      required = e->second;
+    } else if (auto* mw = std::get_if<Pmty_with>(&mt.desc)) {
+      check_sig_missing(provided, *mw->mt);
+      return;
+    } else {
+      return;
+    }
+    for (auto& n : required)
+      if (!provided.count(n))
+        note_error("Signature mismatch: the value \"" + n +
+                   "\" is required but not provided");
+  }
+
   // Bind a let pattern's variables to a (generalized) type.
   void bind_pattern_scheme(const Pattern& p, const TypePtr& te) {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
@@ -1257,7 +1288,10 @@ struct Checker {
       return resolve_module_values(mi->id.txt);  // local alias or stdlib (sub)module
     if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
       auto inner = module_exports(*mc->me);
-      if (!inner.empty()) return inner;
+      if (!inner.empty()) {
+        check_sig_missing(inner, *mc->mt);  // signature ascription: required values
+        return inner;
+      }
       return modtype_values(*mc->mt);  // e.g. `(val e : S)` parsed as a constraint
     }
     if (auto* mu = std::get_if<Pmod_unpack>(&me.desc)) {
