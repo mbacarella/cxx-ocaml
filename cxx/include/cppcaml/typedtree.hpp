@@ -72,12 +72,15 @@ struct Tpat_construct {
   std::vector<PatBox> args;
 };
 struct Tpat_value { PatBox inner; };  // computation-pattern wrapper (match cases)
+struct Tpat_exception { PatBox inner; };  // computation: `exception P`
 struct Tpat_tuple {
   std::vector<std::pair<std::optional<std::string>, PatBox>> elems;
 };
+struct Tpat_or { PatBox left; PatBox right; };
+struct Tpat_alias { Ident id; PatBox inner; };  // (p as id)
 struct Pattern {
   std::variant<Tpat_any, Tpat_var, Tpat_constant, Tpat_construct, Tpat_value,
-               Tpat_tuple>
+               Tpat_tuple, Tpat_exception, Tpat_or, Tpat_alias>
       desc;
   Location loc;
 };
@@ -99,7 +102,12 @@ struct FunctionParam {
 };
 struct Texp_function {
   std::vector<FunctionParam> params;
-  ExprBox body;  // Tfunction_body
+  // Exactly one form is used: Tfunction_body (body set) when there are params,
+  // or Tfunction_cases (is_cases) for a bare `function ... | ...`.
+  bool is_cases = false;
+  ExprBox body;                 // Tfunction_body
+  Location cases_loc;           // Tfunction_cases
+  std::vector<struct Case> cases;
 };
 struct ValueBinding;  // (defined below; used by Texp_let)
 struct Case;

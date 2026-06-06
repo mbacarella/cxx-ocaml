@@ -329,8 +329,35 @@ struct Typer {
         tup.elems.emplace_back(std::nullopt,
                                std::make_unique<tt::Pattern>(pattern(*el)));
       out.desc = std::move(tup);
+    } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      out.desc = tt::Tpat_or{std::make_unique<tt::Pattern>(pattern(*o->l)),
+                             std::make_unique<tt::Pattern>(pattern(*o->r))};
+    } else if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
+      auto inner = std::make_unique<tt::Pattern>(pattern(*al->p));
+      tt::Tpat_alias ta;
+      ta.id = fresh_local(al->name.txt);
+      ta.inner = std::move(inner);
+      out.desc = std::move(ta);
     } else {
       throw TypeError("pat#" + std::to_string(p.desc.index()));
+    }
+    return out;
+  }
+
+  // Build a computation pattern (match case lhs): or distributes, `exception P`
+  // becomes Tpat_exception, and any other (value) pattern is wrapped Tpat_value.
+  tt::Pattern to_computation(const Pattern& p) {
+    tt::Pattern out;
+    out.loc = p.loc;
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      out.desc = tt::Tpat_or{std::make_unique<tt::Pattern>(to_computation(*o->l)),
+                             std::make_unique<tt::Pattern>(to_computation(*o->r))};
+    } else if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) {
+      out.desc = tt::Tpat_exception{std::make_unique<tt::Pattern>(pattern(*ex->p))};
+    } else {
+      tt::Pattern inner = pattern(p);
+      out.loc = inner.loc;
+      out.desc = tt::Tpat_value{std::make_unique<tt::Pattern>(std::move(inner))};
     }
     return out;
   }
@@ -440,16 +467,7 @@ struct Typer {
   tt::Case case_(const ast::Case& c, bool computation) {
     push();
     tt::Case out;
-    tt::Pattern p = pattern(c.lhs);
-    if (computation) {
-      Location l = p.loc;
-      tt::Pattern wrap;
-      wrap.loc = l;
-      wrap.desc = tt::Tpat_value{std::make_unique<tt::Pattern>(std::move(p))};
-      out.lhs = std::move(wrap);
-    } else {
-      out.lhs = std::move(p);
-    }
+    out.lhs = computation ? to_computation(c.lhs) : pattern(c.lhs);
     if (c.guard)
       out.guard = std::make_unique<tt::Expression>(expr(**c.guard));
     out.rhs = std::make_unique<tt::Expression>(expr(*c.rhs));
@@ -469,9 +487,16 @@ struct Typer {
       fp.pat = std::make_unique<tt::Pattern>(pattern(pv->pat));
       fn.params.push_back(std::move(fp));
     }
-    auto* body = std::get_if<Pfunction_body>(&f.body->v);
-    if (!body) { pop(); throw TypeError("function cases body"); }
-    fn.body = std::make_unique<tt::Expression>(expr(*body->e));
+    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
+      fn.is_cases = false;
+      fn.body = std::make_unique<tt::Expression>(expr(*fb->e));
+    } else {
+      auto& fc = std::get<Pfunction_cases>(f.body->v);
+      fn.is_cases = true;
+      fn.cases_loc = fc.loc;
+      for (auto& c : fc.cases)
+        fn.cases.push_back(case_(c, /*computation=*/false));  // value patterns
+    }
     pop();
     return fn;
   }

@@ -249,6 +249,16 @@ struct Printer {
     } else if (auto* w = std::get_if<Tpat_value>(&p.desc)) {
       line(j, "Tpat_value");
       pattern(j, *w->inner);  // inner at same depth (printtyped: `pattern i`)
+    } else if (auto* ex = std::get_if<Tpat_exception>(&p.desc)) {
+      line(j, "Tpat_exception");
+      pattern(j, *ex->inner);
+    } else if (auto* o = std::get_if<Tpat_or>(&p.desc)) {
+      line(j, "Tpat_or");
+      pattern(j, *o->left);
+      pattern(j, *o->right);
+    } else if (auto* al = std::get_if<Tpat_alias>(&p.desc)) {
+      line(j, "Tpat_alias \"" + ident(al->id) + "\"");
+      pattern(j, *al->inner);
     } else {
       auto& tu = std::get<Tpat_tuple>(p.desc);
       line(j, "Tpat_tuple");
@@ -313,8 +323,13 @@ struct Printer {
         }
         line(j, "]");
       }
-      line(j, "Tfunction_body");
-      expression(j + 1, *fn->body);
+      if (fn->is_cases) {
+        line(j, "Tfunction_cases " + loc(fn->cases_loc));
+        list_cases(j + 1, fn->cases);
+      } else {
+        line(j, "Tfunction_body");
+        expression(j + 1, *fn->body);
+      }
     } else if (auto* l = std::get_if<Texp_let>(&e.desc)) {
       line(j, std::string("Texp_let ") +
                   (l->rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
