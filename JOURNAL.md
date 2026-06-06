@@ -795,3 +795,32 @@ flat best-effort pre-pass; correct identity needs the scoped rewrite -- the one 
 large architectural step), and module signature matching (Includemod).  These can't be
 bolted on without risking the 99.2% completeness, so they want a dedicated, harness-guarded
 effort.
+
+## Env-lite: scoped type identity (stamps) — foundation laid
+
+Built the type-identity layer the soundness tail needs.  Each opaque (non-alias) type
+declaration gets a unique **stamp**; a scoped `tenv` (mirroring module scopes) resolves a
+bare type reference to the in-scope declaration's stamp, so a shadowed `type t` is a
+distinct type.  Constructor result types and type annotations carry the stamp.
+
+**unify is tightened purely additively**: two constructors with distinct non-zero stamps
+never unify (even with matching names); everything unstamped falls through to the existing
+name-based comparison.  So completeness was untouched (held at 6 / 99.2%) -- the design
+goal that makes this safe.
+
+A binding's declared type is applied as a pure **identity-only check** (`identity_clash`):
+flag a stamp mismatch at corresponding positions, but do NOT unify structurally (structural
+inference is still incomplete; unifying the annotation in false-rejects, e.g. array vs
+iarray).  This catches the canonical case `type t=A; let x=A; module M = struct type t=B;
+let f:t->t = fun B -> x end`.  Soundness 76.5% -> 76.1%.
+
+**Next, clearly scoped:** the fuller identity payoff (e.g. unique_names_in_unification in
+full) is gated by the flat *ambiguous-constructor* hack -- `A` defined in two types becomes
+`Any`, hiding the clash.  Replacing it with **scoped/ordered constructor resolution** (a
+ctor name resolves to the in-scope declaration, like `tenv` does for types) should improve
+*both* axes at once: it fixes morematch-style completeness (each use resolves to the right
+ctor) without the hack, and unblocks identity soundness.  That, plus module **signature
+matching** (Includemod, the 19-file bucket), is the remaining Env work.
+
+Session soundness arc: 81.1% -> 76.1% false-acceptance; completeness steady at 99.2%
+throughout (every change gated by both harnesses).
