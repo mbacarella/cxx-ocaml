@@ -233,6 +233,24 @@ struct Checker {
     return out;
   }
 
+  // The signature of a module-decl type, following an alias (e.g. stdlib's
+  // `module Array = Stdlib__Array`) by loading the aliased cmi into `loaded`.
+  const cmi::Signature* module_sig(const cmi::ModuleTypePtr& mt,
+                                   std::vector<cmi::CmiFile>& loaded) {
+    if (!mt) return nullptr;
+    if (mt->kind == cmi::ModuleType::Sig) return mt->sig.get();
+    if (mt->kind == cmi::ModuleType::Alias && mt->path && loaded.size() < 16) {
+      std::string p = cmi_path_str(*mt->path);  // e.g. "Stdlib__Array"
+      if (p.empty()) return nullptr;
+      if (p[0] >= 'A' && p[0] <= 'Z') p[0] += 32;  // file is first-char-lowercased
+      try {
+        loaded.push_back(cmi::CmiFile::load("stdlib/" + p + ".cmi"));
+        return &loaded.back().sig();
+      } catch (...) { return nullptr; }
+    }
+    return nullptr;
+  }
+
   // Resolve a (possibly qualified) module path to its exported value schemes:
   // a local top-level module from modenv, else a stdlib module/submodule walked
   // through nested signatures (open Effect.Deep -> stdlib__Effect.cmi -> Deep).
@@ -246,17 +264,17 @@ struct Checker {
     std::unordered_map<std::string, TypePtr> out;
     try {
       const std::string& head = comps[0];
-      auto cmi = (head == "Stdlib")
-                     ? cmi::CmiFile::load("stdlib/stdlib.cmi")
-                     : cmi::CmiFile::load("stdlib/stdlib__" + head + ".cmi");
-      const cmi::Signature* sig = &cmi.sig();
+      // cmis stay alive for the whole walk; sig points into the last one.
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(head == "Stdlib"
+                           ? cmi::CmiFile::load("stdlib/stdlib.cmi")
+                           : cmi::CmiFile::load("stdlib/stdlib__" + head + ".cmi"));
+      const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
           if (mm.name == comps[i]) { md = &mm; break; }
-        if (md && md->type && md->type->kind == cmi::ModuleType::Sig && md->type->sig)
-          sig = md->type->sig.get();
-        else { sig = nullptr; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
       }
       if (sig)
         for (auto& v : sig->values) {
