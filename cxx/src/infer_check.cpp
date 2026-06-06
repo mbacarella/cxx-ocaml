@@ -884,12 +884,28 @@ struct Checker {
   // Bind a let group (generalizing each RHS at the outer level).
   void infer_bindings(RecFlag rf, const std::vector<ValueBinding>& bs) {
     if (rf == RecFlag::Recursive) {
-      // pre-bind monomorphic vars, infer, then nothing fancy (no generalization
-      // of rec bindings in this best-effort pass)
-      std::vector<TypePtr> tv;
-      for (auto& b : bs) tv.push_back(infer_pat(b.pat));
-      for (size_t i = 0; i < bs.size(); ++i)
-        try_unify(tv[i], infer_expr(*bs[i].expr));
+      // Pre-bind each name; a `let rec f : type a. T = ...` annotation makes f
+      // polymorphic-recursive -- bind it to the (generic) annotation so recursive
+      // calls instantiate fresh, rather than forcing one monomorphic type (which
+      // for a GADT recursion yields a spurious occurs-check).  Plain bindings get
+      // a monomorphic var unified with the inferred body.
+      std::vector<TypePtr> tv(bs.size(), nullptr);
+      for (size_t i = 0; i < bs.size(); ++i) {
+        const ValueBinding& b = bs[i];
+        const Pvc_constraint* pc =
+            b.constraint_ ? std::get_if<Pvc_constraint>(&*b.constraint_) : nullptr;
+        if (pc && !pc->univars.empty()) {
+          for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
+          std::unordered_map<std::string, TypePtr> vars;
+          bind_pattern_scheme(b.pat, from_coretype(*pc->typ, vars));
+        } else {
+          tv[i] = infer_pat(b.pat);
+        }
+      }
+      for (size_t i = 0; i < bs.size(); ++i) {
+        TypePtr te = infer_expr(*bs[i].expr);  // check body (best-effort)
+        if (tv[i]) try_unify(tv[i], te);
+      }
       return;
     }
     for (auto& b : bs) {
