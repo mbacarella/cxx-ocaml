@@ -484,6 +484,56 @@ struct Checker {
     return ps;
   }
 
+  // --- let rec value restriction (a sound subset of OCaml's Value_rec_check) ---
+  // OCaml forbids dereferencing a recursively-bound name during its own
+  // definition.  The full analysis is an intricate 3-mode (Dereference / Guard /
+  // Return) traversal; modelling it partially false-rejects valid definitions
+  // (e.g. `let rec f = let g = f in fun x -> g x`).  So we flag only the
+  // unambiguous, top-level direct dereferences -- the RHS head is itself a rec
+  // name, or applies/field-accesses one directly -- which never false-rejects
+  // (it only under-catches the subtler illegal cases).
+  static void pat_names(const Pattern& p, std::set<std::string>& out) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) out.insert(v->name.txt);
+    else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) { out.insert(a->name.txt); pat_names(*a->p, out); }
+    else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) { for (auto& e : t->elems) pat_names(*e, out); }
+    else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) pat_names(*c->p, out);
+  }
+  static const Expression* peel_constraint(const Expression* e) {
+    while (auto* c = std::get_if<Pexp_constraint>(&e->desc)) e = c->e.get();
+    return e;
+  }
+  static bool is_rec_ident(const Expression* e, const std::set<std::string>& recs) {
+    e = peel_constraint(e);
+    auto* id = std::get_if<Pexp_ident>(&e->desc);
+    if (!id) return false;
+    auto* l = std::get_if<Lident>(&id->id.txt.v);
+    return l && recs.count(l->name);
+  }
+  // A direct, unguarded dereference of a rec name at the RHS head.  We flag the
+  // name only in *forcing* positions -- the whole RHS, the function being
+  // applied, or a field projection -- never in argument position (an argument
+  // may merely be captured by a partial application, e.g. `let rec x = f ~x`,
+  // which OCaml accepts), so this never false-rejects.
+  static bool letrec_bad_top(const Expression* e0, const std::set<std::string>& recs) {
+    const Expression* e = peel_constraint(e0);
+    if (is_rec_ident(e, recs)) return true;                          // let rec x = x
+    if (auto* ap = std::get_if<Pexp_apply>(&e->desc))               // let rec x = x e...
+      return is_rec_ident(ap->fn.get(), recs);
+    if (auto* fl = std::get_if<Pexp_field>(&e->desc))               // let rec x = x.field
+      return is_rec_ident(fl->e.get(), recs);
+    return false;
+  }
+  void check_letrec(const std::vector<ValueBinding>& bs) {
+    if (!strict) return;
+    std::set<std::string> recs;
+    for (auto& b : bs) pat_names(b.pat, recs);
+    if (recs.empty()) return;
+    for (auto& b : bs)
+      if (letrec_bad_top(b.expr.get(), recs))
+        note_error("This kind of expression is not allowed as "
+                   "right-hand side of \"let rec\"");
+  }
+
   TypePtr try_(std::function<TypePtr()> f) {
     try { return f(); } catch (const I::TypeError&) { return eng.fresh_var(); }
   }
@@ -921,6 +971,7 @@ struct Checker {
       // calls instantiate fresh, rather than forcing one monomorphic type (which
       // for a GADT recursion yields a spurious occurs-check).  Plain bindings get
       // a monomorphic var unified with the inferred body.
+      check_letrec(bs);  // the value-recursion restriction
       std::vector<TypePtr> tv(bs.size(), nullptr);
       for (size_t i = 0; i < bs.size(); ++i) {
         const ValueBinding& b = bs[i];
