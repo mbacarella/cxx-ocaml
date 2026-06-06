@@ -5,23 +5,27 @@
 #
 # Usage: typedtree_parity.sh [N]      # N>0 limits to the first N corpus files
 #        JOBS=8 typedtree_parity.sh   # override parallelism (default: nproc)
+#        REBUILD_CACHE=1 typedtree_parity.sh   # rebuild the oracle dump cache
 #
-# Files are processed in parallel (one ocamlc.opt per core).  While the typer
-# doesn't exist yet, $CPP is absent: the harness then reports the corpus baseline
-# (how many files the oracle can type — the eventual denominator) and self-checks
-# the stamp normalizer (idempotency).
+# The oracle dumps are cached once under $CACHE (keyed by file path).  This makes
+# the typeable denominator stable (no spurious 20s-timeout flakiness from
+# 32-way oracle contention re-running each time) and makes diff runs fast (only
+# c++type reruns).  Rebuild the cache after rebuilding ocamlc.opt.
 set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 
 CPP=./cxx/build/c++type
 JOBS="${JOBS:-$(nproc)}"
-TIMEOUT="${TIMEOUT:-20}"   # per-file cap; some typer inputs (conjunctive_types) hang
+CACHE="${CACHE:-/tmp/ttp_oracle_cache}"
+CACHE_TIMEOUT="${CACHE_TIMEOUT:-60}"  # generous; only paid once when caching
+
+key() { printf '%s' "$1" | tr '/' '%'; }
 
 # The -dtypedtree dump (like every -d* dump) goes to stderr and starts at a bare
 # "[".  Strip any leading warning preamble by anchoring on ^\[.
-oracle() {
-  timeout "$TIMEOUT" ./ocamlc.opt -nostdlib -I stdlib -stop-after typing \
+oracle_raw() {
+  timeout "$CACHE_TIMEOUT" ./ocamlc.opt -nostdlib -I stdlib -stop-after typing \
     -dtypedtree "$1" 2>&1 1>/dev/null | sed -n '/^\[/,$p'
 }
 
@@ -36,13 +40,18 @@ normalize() {
   perl -pe 'BEGIN{%m=();$n=0} s{/(\d+)}{ "/" . ($m{$1} //= ++$n) }ge'
 }
 
-# Worker: process one file, print a single result token.  Invoked in parallel.
+# Cache-build worker: write one file's raw oracle dump to the cache.
+if [ "${1:-}" == "--cache-one" ]; then
+  oracle_raw "$2" > "$CACHE/$(key "$2")"
+  exit 0
+fi
+
+# Diff/baseline worker: read the cached oracle dump, compare with c++type.
 if [ "${1:-}" == "--worker" ]; then
   f="$2"
-  o=$(oracle "$f")
+  o=$(cat "$CACHE/$(key "$f")" 2>/dev/null)
   if [ ! -x "$CPP" ]; then            # baseline mode: just oracle-typeable?
-    ty=0; [ -n "$o" ] && ty=1
-    printf 'B %d\n' "$ty"
+    [ -n "$o" ] && printf 'B 1\n' || printf 'B 0\n'
   else                                 # diff mode
     on=$(printf '%s' "$o" | normalize)
     c=$("$CPP" "$f" 2>/dev/null)
@@ -59,7 +68,13 @@ LIMIT="${1:-0}"
 mapfile -t files < <(find testsuite/tests -name '*.ml' | sort)
 [ "$LIMIT" -gt 0 ] 2>/dev/null && files=("${files[@]:0:$LIMIT}")
 
-# Progress is observable at $PROG (one line per finished file) during the run.
+# Build the oracle cache once (or when forced / missing).
+if [ -n "${REBUILD_CACHE:-}" ] || [ ! -d "$CACHE" ]; then
+  rm -rf "$CACHE"; mkdir -p "$CACHE"
+  echo "building oracle cache ($CACHE) ..." >&2
+  printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --cache-one {}
+fi
+
 PROG="${PROG:-/tmp/.ttp_progress}"
 : > "$PROG"
 printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} > "$PROG"
