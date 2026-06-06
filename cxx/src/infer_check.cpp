@@ -520,7 +520,9 @@ struct Checker {
       TypePtr at = from_coretype(*ct->t, vars);
       return at;
     }
-    // record / field / variant / etc.: best-effort
+    // record / field / variant / etc.: best-effort (record-field types need
+    // type-directed disambiguation of shared labels; without it, a flat label
+    // registry resolves to the wrong record type and clashes -- left opaque).
     if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
       TypePtr el = eng.fresh_var();
       for (auto& x : a->elems) try_unify(el, infer_expr(*x));
