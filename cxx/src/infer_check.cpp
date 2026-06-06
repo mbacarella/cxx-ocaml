@@ -1379,6 +1379,61 @@ struct Checker {
     }
   }
 
+  // Do a structure's type definition and a signature's differ incompatibly?
+  // Conservative: an abstract spec accepts anything; otherwise compare only
+  // like-with-like (both manifests -> reliable-builtin/identity clash; both
+  // variants/records -> constructor/field name sets), skipping GADTs and
+  // cross-kind/abstract-impl cases so we never false-reject.
+  bool type_decls_clash(const TypeDeclaration& impl, const TypeDeclaration& spec) {
+    if (std::holds_alternative<Ptype_abstract>(spec.kind) && !spec.manifest)
+      return false;  // spec abstract: any implementation is fine
+    if (impl.manifest && spec.manifest) {
+      std::unordered_map<std::string, TypePtr> v1, v2;
+      return expected_clash(from_coretype(*impl.manifest->get(), v1),
+                            from_coretype(*spec.manifest->get(), v2));
+    }
+    auto* iv = std::get_if<Ptype_variant>(&impl.kind);
+    auto* sv = std::get_if<Ptype_variant>(&spec.kind);
+    if (iv && sv) {
+      std::set<std::string> si, ss;
+      for (auto& c : iv->ctors) { if (c.res) return false; si.insert(c.name.txt); }
+      for (auto& c : sv->ctors) { if (c.res) return false; ss.insert(c.name.txt); }
+      return si != ss;
+    }
+    auto* ir = std::get_if<Ptype_record>(&impl.kind);
+    auto* sr = std::get_if<Ptype_record>(&spec.kind);
+    if (ir && sr) {
+      std::set<std::string> fi, fs;
+      for (auto& f : ir->fields) fi.insert(f.name.txt);
+      for (auto& f : sr->fields) fs.insert(f.name.txt);
+      return fi != fs;
+    }
+    return false;  // cross-kind / abstract impl: not sure -> don't flag
+  }
+  // Includemod, type side: compare the structure's own top-level type decls
+  // against those the ascribed signature declares.
+  void check_sig_types(const ModuleExpr& me, const ModuleType& mt) {
+    if (!strict) return;
+    auto* sg = std::get_if<Pmty_signature>(&mt.desc);
+    if (!sg) return;
+    const ModuleExpr* m = &me;
+    while (auto* mc = std::get_if<Pmod_constraint>(&m->desc)) m = mc->me.get();
+    auto* ms = std::get_if<Pmod_structure>(&m->desc);
+    if (!ms) return;
+    std::unordered_map<std::string, const TypeDeclaration*> impl;
+    for (auto& it : ms->items)
+      if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+        for (auto& d : ty->decls) impl[d.name.txt] = &d;
+    for (auto& it : sg->items)
+      if (auto* pst = std::get_if<Psig_type>(&it.desc))
+        for (auto& sd : pst->decls) {
+          auto f = impl.find(sd.name.txt);  // missing-type: provided elsewhere -> skip
+          if (f != impl.end() && type_decls_clash(*f->second, sd))
+            note_error("Signature mismatch: type \"" + sd.name.txt +
+                       "\" does not match its signature");
+        }
+  }
+
   // Builtins whose inferred type we trust enough to flag against an expected
   // type (constants, arithmetic, comparisons produce these reliably).  Excludes
   // array/list/user types, where our inference is still incomplete.
@@ -1450,9 +1505,15 @@ struct Checker {
     if (auto* mi = std::get_if<Pmod_ident>(&me.desc))
       return resolve_module_values(mi->id.txt);  // local alias or stdlib (sub)module
     if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
+      // Is the constrained module a structure (an ascription to check) or
+      // something else like `(val e : S)` (which yields S's values)?
+      const ModuleExpr* m = mc->me.get();
+      while (auto* c = std::get_if<Pmod_constraint>(&m->desc)) m = c->me.get();
+      bool is_struct = std::holds_alternative<Pmod_structure>(m->desc);
       auto inner = module_exports(*mc->me);
-      if (!inner.empty()) {
+      if (is_struct || !inner.empty()) {
         check_sig_missing(inner, *mc->mt, !body_has_toplevel_open(*mc->me));
+        check_sig_types(*mc->me, *mc->mt);
         return inner;
       }
       return modtype_values(*mc->mt);  // e.g. `(val e : S)` parsed as a constraint
