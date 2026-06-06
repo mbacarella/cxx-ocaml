@@ -771,3 +771,27 @@ files each and increasingly fiddly.
 Current two-axis state: completeness 99.2% accept (6/744); soundness 78.6% false-acceptance
 (self-contained corpus).  Harnesses: reject_parity.sh (completeness), expect_soundness.sh
 (soundness) — both gate every change.
+
+## More sound checks: 78.6% -> 76.5% false-acceptance (completeness held 99.2%)
+
+Two further structural checks, both gated by both harnesses:
+
+4. cyclic type-abbreviation -- reject `type t = t * t`, `type a = b and b = a` (no
+   -rectypes).  Reference graph over file-local aliases; only *bare* references count (a
+   qualified `M.t` is another module's type -- matching by last component invented false
+   cycles like `type t = T1.t = A`, so that distinction kept completeness at 6).
+5. [@@unboxed] validity -- flag unless a single-constructor/one-arg variant or single-field
+   record (count violations only).
+
+Soundness checks delivered this phase (1-5): let-rec restriction, qualified Unbound, unbound
+type variables, cyclic abbreviation, unboxed validity.  Net: soundness 81.1% -> 76.5%
+false-acceptance, completeness unchanged at 99.2%.
+
+Remaining structural checks are mostly exhausted (refutation needs emptiness analysis;
+unbound module/record-field need resolution that tensions with completeness).  The dominant
+false-accepts now require two big subsystems, both needing the type-identity/Env layer:
+per-declaration type stamps with *scoped, ordered* resolution (today's registration is a
+flat best-effort pre-pass; correct identity needs the scoped rewrite -- the one remaining
+large architectural step), and module signature matching (Includemod).  These can't be
+bolted on without risking the 99.2% completeness, so they want a dedicated, harness-guarded
+effort.
