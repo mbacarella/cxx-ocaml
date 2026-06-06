@@ -26,7 +26,10 @@ using TypePtr = std::shared_ptr<Type>;
 constexpr int GENERIC_LEVEL = 1'000'000'000;
 
 struct Type {
-  enum class Kind { Var, Arrow, Tuple, Constr, Link };
+  // Any is a dynamic/unknown type for values we cannot infer (qualified lookups,
+  // unresolved record fields, ambiguous constructors): it unifies with anything
+  // without clashing or propagating, so it never causes a false rejection.
+  enum class Kind { Var, Arrow, Tuple, Constr, Link, Any };
   Kind kind = Kind::Var;
   int level = 0;             // Var: binding level (GENERIC_LEVEL if generalized)
   int id = 0;                // unique id (occurs-check / debug printing)
@@ -53,6 +56,7 @@ public:
   void leave_level() { --level; }
 
   TypePtr fresh_var();
+  TypePtr any();  // the shared dynamic/unknown type
   TypePtr arrow(TypePtr dom, TypePtr cod, int label = 0, std::string lbl = "");
   TypePtr tuple(std::vector<TypePtr> elems);
   TypePtr constr(std::string path, std::vector<TypePtr> args = {});
@@ -73,6 +77,7 @@ public:
 
 private:
   int next_id_ = 0;
+  TypePtr any_;  // singleton Any node
   void occurs_and_lower(const TypePtr& var, const TypePtr& t);
 };
 

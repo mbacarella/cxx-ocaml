@@ -12,6 +12,13 @@ TypePtr Engine::fresh_var() {
   t->id = next_id_++;
   return t;
 }
+TypePtr Engine::any() {
+  if (!any_) {
+    any_ = std::make_shared<Type>();
+    any_->kind = Type::Kind::Any;
+  }
+  return any_;
+}
 TypePtr Engine::arrow(TypePtr dom, TypePtr cod, int label, std::string lbl) {
   auto t = std::make_shared<Type>();
   t->kind = Type::Kind::Arrow;
@@ -66,13 +73,21 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
       for (auto& a : t->args) occurs_and_lower(var, a);
       break;
     case Type::Kind::Link:
-      break;  // repr already resolved
+    case Type::Kind::Any:
+      break;  // repr already resolved / Any has no vars
   }
 }
 
 void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
   TypePtr a = repr(a0), b = repr(b0);
   if (a == b) return;
+  // Any absorbs: it unifies with anything.  If the other side is a variable,
+  // link it to Any so it too becomes dynamic and can't later clash.
+  if (a->kind == Type::Kind::Any || b->kind == Type::Kind::Any) {
+    TypePtr var = a->kind == Type::Kind::Var ? a : b->kind == Type::Kind::Var ? b : nullptr;
+    if (var) { var->kind = Type::Kind::Link; var->link = any(); }
+    return;
+  }
   if (a->kind == Type::Kind::Var) {
     occurs_and_lower(a, b);
     a->kind = Type::Kind::Link;
@@ -143,6 +158,8 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       }
       case Type::Kind::Link:
         return copy(t);  // repr resolved; unreachable
+      case Type::Kind::Any:
+        return t;  // dynamic: shared, not copied
     }
     return t;
   };
@@ -164,6 +181,7 @@ void Engine::generalize(const TypePtr& t0) {
       for (auto& a : t->args) generalize(a);
       break;
     case Type::Kind::Link:
+    case Type::Kind::Any:
       break;
   }
 }
@@ -212,6 +230,9 @@ void show_rec(const TypePtr& t0, std::string& out, bool paren,
       out += t->path;
       break;
     case Type::Kind::Link:
+      break;
+    case Type::Kind::Any:
+      out += "_";
       break;
   }
 }

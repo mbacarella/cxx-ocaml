@@ -230,9 +230,9 @@ struct Checker {
       if (strict) note_error("Unbound value " + l->name);  // genuine error
       return eng.fresh_var();
     }
-    // Qualified (M.x): submodule cmis not loaded yet — can't resolve, so we must
-    // NOT reject (a known gap, not a type error).  Best-effort fresh var.
-    return eng.fresh_var();
+    // Qualified (M.x): we don't resolve arbitrary qualified values, so the type
+    // is unknown -- Any, which can't clash wherever the value flows.
+    return eng.any();
   }
 
   // Stdlib top-level value schemes, loaded once from stdlib.cmi.
@@ -551,6 +551,27 @@ struct Checker {
     return eng.constr("float");
   }
 
+  // Bind all variables of a pattern to Any (used for patterns in an unknown
+  // context, e.g. record fields we don't type).
+  void bind_pat_any(const Pattern& p) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) { venv.back()[v->name.txt] = eng.any(); return; }
+    if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
+      venv.back()[al->name.txt] = eng.any(); bind_pat_any(*al->p); return;
+    }
+    if (auto* tu = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : tu->elems) bind_pat_any(*e); return;
+    }
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) { bind_pat_any(*c->p); return; }
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) { bind_pat_any(*o->l); bind_pat_any(*o->r); return; }
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc)) { if (k->arg) bind_pat_any(**k->arg); return; }
+    if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& [lid, sub] : r->fields) bind_pat_any(*sub); return;
+    }
+    if (auto* a = std::get_if<Ppat_array>(&p.desc)) { for (auto& e : a->elems) bind_pat_any(*e); return; }
+    if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) { bind_pat_any(*lz->p); return; }
+    // any/constant/etc: nothing to bind
+  }
+
   TypePtr infer_pat(const Pattern& p) {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
       auto t = eng.fresh_var();
@@ -568,7 +589,7 @@ struct Checker {
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
       if (!sch) {
         if (k->arg) infer_pat(**k->arg);
-        return eng.fresh_var();
+        return eng.any();  // unknown/ambiguous constructor: dynamic
       }
       TypePtr result;
       auto ps = ctor_params(eng.instantiate(*sch), result);
@@ -600,8 +621,11 @@ struct Checker {
       return t;
     }
     if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
-      for (auto& [lid, sub] : r->fields) infer_pat(*sub);  // bind field vars
-      return eng.fresh_var();
+      // record fields aren't typed (deferred); bind their vars to Any so a field
+      // with a polymorphic type (`{ pf : 'a. ... }`) used at several types in the
+      // body doesn't clash through a single monomorphic var.
+      for (auto& [lid, sub] : r->fields) bind_pat_any(*sub);
+      return eng.any();
     }
     if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
       for (auto& el : a->elems) infer_pat(*el);
@@ -689,7 +713,7 @@ struct Checker {
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
-      if (!sch) { if (k->arg) infer_expr(**k->arg); return eng.fresh_var(); }
+      if (!sch) { if (k->arg) infer_expr(**k->arg); return eng.any(); }
       TypePtr result;
       auto ps = ctor_params(eng.instantiate(*sch), result);
       if (k->arg) {
@@ -761,7 +785,7 @@ struct Checker {
       venv.pop_back();
       return bt;
     }
-    return eng.fresh_var();
+    return eng.any();  // records/fields/objects/etc. unhandled: dynamic, no clash
   }
 
   // Type an application, matching arguments to parameters by label (OCaml allows
