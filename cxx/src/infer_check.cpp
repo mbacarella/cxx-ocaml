@@ -1323,35 +1323,60 @@ struct Checker {
     return false;
   }
 
-  // Signature inclusion (Includemod), sound slice: every value name required by
-  // an ascribed signature must be provided by the structure.  Only flag a
-  // genuinely-missing name; under-population of `provided` (e.g. via an include
-  // we don't expand) would false-report, so we only require values from inline
-  // signatures / known local module types, and skip if the sig has includes.
+  // Signature inclusion (Includemod): every value required by an ascribed
+  // signature must be provided with a compatible type.  Missing names are a
+  // certain error; value-type mismatches are flagged only via expected_clash
+  // (reliable builtins + identity), so an incomplete inferred structure type
+  // can't false-report.  Inline signatures only (a named sig has no types here);
+  // skip sigs with `include` (we can't be sure what they require).
+  // Does a module expression's body bring names in via a top-level open?  If so,
+  // our flat export map conflates opened (non-exported, possibly shadowing) names
+  // with the module's real exports, so value-type checking is unreliable there.
+  static bool body_has_toplevel_open(const ModuleExpr& me) {
+    const ModuleExpr* m = &me;
+    while (auto* mc = std::get_if<Pmod_constraint>(&m->desc)) m = mc->me.get();
+    if (auto* ms = std::get_if<Pmod_structure>(&m->desc))
+      for (auto& it : ms->items)
+        if (std::holds_alternative<Pstr_open>(it.desc)) return true;
+    return false;
+  }
   void check_sig_missing(const std::unordered_map<std::string, TypePtr>& provided,
-                         const ModuleType& mt) {
+                         const ModuleType& mt, bool reliable_types = true) {
     if (!strict) return;
-    std::vector<std::string> required;
-    if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) {
-      for (auto& it : sg->items)
-        if (std::holds_alternative<Psig_include>(it.desc)) return;  // can't be sure
-      collect_sig_values(sg->items, required);
-    } else if (auto* mi = std::get_if<Pmty_ident>(&mt.desc)) {
+    if (auto* mw = std::get_if<Pmty_with>(&mt.desc)) { check_sig_missing(provided, *mw->mt, reliable_types); return; }
+    if (auto* mi = std::get_if<Pmty_ident>(&mt.desc)) {  // named sig: names only
       auto* l = std::get_if<Lident>(&mi->id.txt.v);
       if (!l) return;
       auto e = modtype_env.find(l->name);
       if (e == modtype_env.end()) return;
-      required = e->second;
-    } else if (auto* mw = std::get_if<Pmty_with>(&mt.desc)) {
-      check_sig_missing(provided, *mw->mt);
-      return;
-    } else {
+      for (auto& n : e->second)
+        if (!provided.count(n))
+          note_error("Signature mismatch: the value \"" + n + "\" is required but not provided");
       return;
     }
-    for (auto& n : required)
-      if (!provided.count(n))
-        note_error("Signature mismatch: the value \"" + n +
+    auto* sg = std::get_if<Pmty_signature>(&mt.desc);
+    if (!sg) return;
+    for (auto& it : sg->items)
+      if (std::holds_alternative<Psig_include>(it.desc)) return;  // can't be sure
+    for (auto& it : sg->items) {
+      const ValueDescription* vd = nullptr;
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) vd = &v->vd;
+      else if (auto* p = std::get_if<Psig_primitive>(&it.desc))
+        { /* external: name only */ if (!provided.count(p->pd.name.txt))
+            note_error("Signature mismatch: the value \"" + p->pd.name.txt +
+                       "\" is required but not provided"); continue; }
+      if (!vd) continue;
+      auto f = provided.find(vd->name.txt);
+      if (f == provided.end()) {
+        note_error("Signature mismatch: the value \"" + vd->name.txt +
                    "\" is required but not provided");
+      } else if (reliable_types) {
+        std::unordered_map<std::string, TypePtr> vars;
+        if (expected_clash(f->second, from_coretype(*vd->type, vars)))
+          note_error("Signature mismatch: the value \"" + vd->name.txt +
+                     "\" has an incompatible type");
+      }
+    }
   }
 
   // Builtins whose inferred type we trust enough to flag against an expected
@@ -1427,7 +1452,7 @@ struct Checker {
     if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
       auto inner = module_exports(*mc->me);
       if (!inner.empty()) {
-        check_sig_missing(inner, *mc->mt);  // signature ascription: required values
+        check_sig_missing(inner, *mc->mt, !body_has_toplevel_open(*mc->me));
         return inner;
       }
       return modtype_values(*mc->mt);  // e.g. `(val e : S)` parsed as a constraint
