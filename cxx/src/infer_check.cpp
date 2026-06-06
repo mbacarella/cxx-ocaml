@@ -238,6 +238,40 @@ struct Checker {
     return out;
   }
 
+  // Resolve a functor application F(...)'s result value *names*, bound to fresh
+  // polymorphic vars.  Applying a functor would require substituting the argument
+  // signature into the body, which we don't do; binding the names (types left
+  // fully generic) clears the unbound-value false-rejections without ever
+  // introducing a clash.  F is given by its (possibly qualified) module path.
+  std::unordered_map<std::string, TypePtr> functor_result_values(const Longident& fpath) {
+    auto comps = mod_components(fpath);
+    if (comps.empty()) return {};
+    std::unordered_map<std::string, TypePtr> out;
+    try {
+      const std::string& head = comps[0];
+      auto cmi = (head == "Stdlib")
+                     ? cmi::CmiFile::load("stdlib/stdlib.cmi")
+                     : cmi::CmiFile::load("stdlib/stdlib__" + head + ".cmi");
+      const cmi::Signature* sig = &cmi.sig();
+      const cmi::ModuleType* mt = nullptr;
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        if (!md || !md->type) { sig = nullptr; break; }
+        mt = md->type.get();
+        sig = (mt->kind == cmi::ModuleType::Sig) ? mt->sig.get() : nullptr;
+      }
+      // mt is the functor; take its body signature's value names.
+      if (mt && mt->kind == cmi::ModuleType::Functor && mt->functor_body) {
+        const cmi::ModuleType* body = mt->functor_body.get();
+        if (body->kind == cmi::ModuleType::Sig && body->sig)
+          for (auto& v : body->sig->values) out[v.name] = generic_var();
+      }
+    } catch (...) {}
+    return out;
+  }
+
   void register_predef_ctors() {
     auto a = generic_var();
     ctors["[]"] = eng.constr("list", {a});
@@ -531,7 +565,7 @@ struct Checker {
     if (auto* sti = std::get_if<Pexp_struct_item>(&e.desc)) {
       venv.emplace_back();
       if (auto* op = std::get_if<Pstr_open>(&sti->item->desc))
-        if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) open_into(mi->id.txt);
+        for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
       TypePtr bt = infer_expr(*sti->body);
       venv.pop_back();
       return bt;
@@ -682,7 +716,13 @@ struct Checker {
       return resolve_module_values(mi->id.txt);  // local alias or stdlib (sub)module
     if (auto* mc = std::get_if<Pmod_constraint>(&me.desc))
       return module_exports(*mc->me);  // ignore the constraint sig for now
-    return {};  // functor / apply: deferred
+    if (auto* ma = std::get_if<Pmod_apply>(&me.desc))  // F(X): functor application
+      if (auto* fi = std::get_if<Pmod_ident>(&ma->f->desc))
+        return functor_result_values(fi->id.txt);
+    if (auto* mau = std::get_if<Pmod_apply_unit>(&me.desc))  // F()
+      if (auto* fi = std::get_if<Pmod_ident>(&mau->f->desc))
+        return functor_result_values(fi->id.txt);
+    return {};  // functor definition itself: no values
   }
 
   // Process structure items into the current scope, populating modenv for
@@ -695,8 +735,7 @@ struct Checker {
         else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
           infer_expr(*ev->e);
         else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
-          if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc))
-            open_into(mi->id.txt);
+          for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
         } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
           if (mb->binding.name.txt)
             modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
