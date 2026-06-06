@@ -848,3 +848,27 @@ qualified-unbound, unbound-tyvar, cyclic-abbrev, unboxed); and the Env-lite core
 type identity with stamps + tenv, identity-checked binding annotations, scoped/ordered
 constructor resolution + cenv).  The remaining large soundness bucket is module **signature
 matching** (Includemod) -- inclusion of a structure in its `: S` ascription.
+
+## Includemod (sound slice) + #1 records — soundness 74.8% -> 72.7%
+
+**Includemod (signature inclusion), sound slice:** a structure ascribed `: S` must provide
+every value name S requires (else "Signature mismatch: required but not provided").  Inline
+sigs and known local module types only; sigs with `include` skipped (so under-populated
+exports can't false-report).  The value-type and type-decl mismatches (the bulk) need
+complete inference -> deferred with the rest of #1.  74.8% -> 74.4%.
+
+**#1, first slice: RECORDS** -- deferred all session (four reverted attempts), now landed
+with ZERO completeness regression.  What made it possible was the new foundation (identity
+stamps, scoped resolution, Any) plus four safety measures, each found by the harness:
+- unique-label field registry only (ambiguous labels need expected-type direction -> Any);
+- skip polymorphic fields `{ f : 'a. ... }` (one monomorphic scheme clashes; -> Any);
+- infer field *values* with error-recording suppressed (traversing them exposes unrelated
+  incompleteness: effect handlers, polymorphic recursion) while still checking record shape;
+- record update `{ e with ... }` -> Any (flows the base through incomplete inference);
+- register a mutually-recursive type group's aliases before its record fields.
+Result: 74.4% -> 72.7% false-acceptance, completeness held at 6 (99.2%).
+
+The records win is the proof the foundation pays off: the long-blocked keystone feature went
+in only after type identity + scoped resolution + the Any escape hatch were all in place --
+exactly the "advance together" sequencing.  Session soundness arc: **81.1% -> 72.7%**
+false-acceptance; completeness pinned at 99.2% throughout.
