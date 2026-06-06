@@ -744,3 +744,30 @@ is measurable.  Next soundness subsystems (each large): cross-module resolution 
 (retires the qualified-`M.x` Any and unbound errors), records/constructor disambiguation
 (retires the record/ctor Any), module signature matching, full inference for the
 object/module/GADT mismatch cases.
+
+## Soundness checks batch (this turn): 81.1% -> 78.6% false-acceptance, completeness held
+
+Three sound checks landed, each gated by BOTH harnesses (completeness stayed at 6
+false-rejects / 99.2% throughout):
+
+1. **let-rec value restriction** (sound subset of Value_rec_check) — flag a direct deref of
+   a rec name at the RHS head only (never argument position).
+2. **qualified Unbound value** — for `M.x`, resolve M's exports; if M is known but lacks x,
+   it's a genuine Unbound error.  Present qualified values still return Any (their real type
+   surfaced 29 clashes in incomplete inference; the *check* is decoupled and sound alone).
+3. **unbound type variables in a type declaration** — a body variable must be a param /
+   constraint var / constructor existential; skip GADTs and implicit-var-binding bodies
+   (poly-variants, objects, aliases) to stay sound.
+
+Key finding reaffirmed on the soundness axis: the dominant remaining false-accepts need the
+**type-identity (Env) layer** — e.g. "The value y has type t/2 but expected t": OCaml
+distinguishes two same-named types by stamp, while our last-component path comparison
+(needed for completeness: Lazy.t == t) conflates them.  Restoring that distinction without
+losing the completeness gain *is* the principal-types/Env subsystem.  Likewise "Signature
+mismatch" (19, the biggest bucket) needs module subtyping.  These are the next big builds;
+the cheap structural checks (unboxed validity, cyclic abbreviations, refutation) are ~2
+files each and increasingly fiddly.
+
+Current two-axis state: completeness 99.2% accept (6/744); soundness 78.6% false-acceptance
+(self-contained corpus).  Harnesses: reject_parity.sh (completeness), expect_soundness.sh
+(soundness) — both gate every change.
