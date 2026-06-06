@@ -12,11 +12,13 @@ TypePtr Engine::fresh_var() {
   t->id = next_id_++;
   return t;
 }
-TypePtr Engine::arrow(TypePtr dom, TypePtr cod) {
+TypePtr Engine::arrow(TypePtr dom, TypePtr cod, int label, std::string lbl) {
   auto t = std::make_shared<Type>();
   t->kind = Type::Kind::Arrow;
   t->dom = std::move(dom);
   t->cod = std::move(cod);
+  t->arrow_label = label;
+  t->arrow_lbl = std::move(lbl);
   t->id = next_id_++;
   return t;
 }
@@ -118,7 +120,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         }
         return t;  // free var: shared, not copied
       case Type::Kind::Arrow:
-        return arrow(copy(t->dom), copy(t->cod));
+        return arrow(copy(t->dom), copy(t->cod), t->arrow_label, t->arrow_lbl);
       case Type::Kind::Tuple: {
         std::vector<TypePtr> es;
         for (auto& a : t->args) es.push_back(copy(a));

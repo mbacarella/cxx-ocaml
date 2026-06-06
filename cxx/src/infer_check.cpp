@@ -26,6 +26,13 @@ std::string lid_full(const Longident& x) {
   return lid_full(*a.f) + "(" + lid_full(*a.x) + ")";
 }
 
+// (kind, name) for an AST argument label: 0 Nolabel, 1 Labelled, 2 Optional.
+std::pair<int, std::string> arglabel(const ArgLabel& l) {
+  if (auto* p = std::get_if<Labelled>(&l)) return {1, p->name};
+  if (auto* p = std::get_if<Optional>(&l)) return {2, p->name};
+  return {0, ""};
+}
+
 std::string cmi_path_str(const cmi::Path& p) {
   switch (p.kind) {
     case cmi::Path::Pident: return p.id.name;
@@ -85,7 +92,8 @@ struct Checker {
         return v;
       }
       case cmi::TypeExpr::Tarrow:
-        return eng.arrow(from_cmi(n->dom, memo), from_cmi(n->cod, memo));
+        return eng.arrow(from_cmi(n->dom, memo), from_cmi(n->cod, memo),
+                         n->label_kind, n->label);
       case cmi::TypeExpr::Ttuple: {
         std::vector<TypePtr> es;
         for (auto& e : n->elems) es.push_back(from_cmi(e.second, memo));
@@ -115,8 +123,13 @@ struct Checker {
       vars[v->name] = g;
       return g;
     }
-    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc))
-      return eng.arrow(from_coretype(*a->dom, vars), from_coretype(*a->cod, vars));
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      int lk = std::holds_alternative<Labelled>(a->label) ? 1
+               : std::holds_alternative<Optional>(a->label) ? 2 : 0;
+      std::string nm = lk == 1 ? std::get<Labelled>(a->label).name
+                       : lk == 2 ? std::get<Optional>(a->label).name : "";
+      return eng.arrow(from_coretype(*a->dom, vars), from_coretype(*a->cod, vars), lk, nm);
+    }
     if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
       std::vector<TypePtr> es;
       for (auto& e : tu->elems) es.push_back(from_coretype(*e, vars));
@@ -420,19 +433,8 @@ struct Checker {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return constant_type(c->c);
     if (auto* id = std::get_if<Pexp_ident>(&e.desc))
       return lookup_value(id->id.txt);
-    if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
-      TypePtr ft = infer_expr(*a->fn);
-      for (auto& [lbl, arg] : a->args) {
-        // Peel the function's expected domain first, so we can type-direct the
-        // argument (bidirectional checking) rather than inferring it blindly.
-        TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
-        try_unify(ft, eng.arrow(dom, r));
-        TypePtr at = infer_expr_expected(*arg, dom);
-        try_unify(dom, at);
-        ft = I::Engine::repr(r);
-      }
-      return ft;
-    }
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc))
+      return infer_apply(*a);
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return infer_function(*f);
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
       venv.emplace_back();
@@ -509,13 +511,77 @@ struct Checker {
     return eng.fresh_var();
   }
 
+  // Type an application, matching arguments to parameters by label (OCaml allows
+  // labelled args in any order and optional args to be omitted).  When the
+  // function's arrow spine is known, do label-aware matching; otherwise fall back
+  // to plain positional peeling so unknown/var-typed callees never false-reject.
+  TypePtr infer_apply(const Pexp_apply& a) {
+    TypePtr ft = infer_expr(*a.fn);
+    bool any_labelled = false;
+    for (auto& [lbl, arg] : a.args)
+      if (!std::holds_alternative<Nolabel>(lbl)) any_labelled = true;
+
+    if (any_labelled) {
+      // Collect the known arrow spine of the function type.
+      std::vector<TypePtr> spine;
+      TypePtr cur = I::Engine::repr(ft);
+      while (cur->kind == I::Type::Kind::Arrow) {
+        spine.push_back(cur);
+        cur = I::Engine::repr(cur->cod);
+      }
+      TypePtr tail = cur;
+      std::vector<bool> used(spine.size(), false);
+      bool clean = true;
+      for (auto& [lbl, arg] : a.args) {
+        auto [lk, nm] = arglabel(lbl);
+        int idx = -1;
+        for (size_t i = 0; i < spine.size(); ++i) {
+          if (used[i]) continue;
+          if (lk == 0 ? spine[i]->arrow_label == 0
+                      : (spine[i]->arrow_label != 0 && spine[i]->arrow_lbl == nm)) {
+            idx = (int)i;
+            break;
+          }
+        }
+        if (idx < 0) { clean = false; break; }
+        used[idx] = true;
+        TypePtr at = infer_expr_expected(*arg, spine[idx]->dom);
+        try_unify(spine[idx]->dom, at);
+      }
+      if (clean) {
+        // result = the unconsumed params (in order) chained onto the tail
+        TypePtr res = tail;
+        for (int i = (int)spine.size() - 1; i >= 0; --i)
+          if (!used[i])
+            res = eng.arrow(spine[i]->dom, res, spine[i]->arrow_label, spine[i]->arrow_lbl);
+        return res;
+      }
+      // fall through to positional peeling on partial/unknown match
+    }
+
+    for (auto& [lbl, arg] : a.args) {
+      // Peel the function's expected domain first, so we can type-direct the
+      // argument (bidirectional checking) rather than inferring it blindly.
+      TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
+      try_unify(ft, eng.arrow(dom, r));
+      TypePtr at = infer_expr_expected(*arg, dom);
+      try_unify(dom, at);
+      ft = I::Engine::repr(r);
+    }
+    return ft;
+  }
+
   TypePtr infer_function(const Pexp_function& f) {
     venv.emplace_back();
-    std::vector<TypePtr> params;
+    struct Param { TypePtr ty; int lk; std::string nm; };
+    std::vector<Param> params;
     for (auto& fp : f.params) {
       // (type a) introduces a locally-abstract type, not a value argument, so it
       // contributes no arrow to the function's type.
-      if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) params.push_back(infer_pat(pv->pat));
+      if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
+        auto [lk, nm] = arglabel(pv->label);
+        params.push_back({infer_pat(pv->pat), lk, nm});
+      }
     }
     TypePtr body;
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
@@ -529,11 +595,12 @@ struct Checker {
         try_unify(infer_expr(*c.rhs), rt);
         venv.pop_back();
       }
-      params.push_back(arg);
+      params.push_back({arg, 0, ""});
       body = rt;
     }
     TypePtr t = body;
-    for (auto it = params.rbegin(); it != params.rend(); ++it) t = eng.arrow(*it, t);
+    for (auto it = params.rbegin(); it != params.rend(); ++it)
+      t = eng.arrow(it->ty, t, it->lk, it->nm);
     venv.pop_back();
     return t;
   }

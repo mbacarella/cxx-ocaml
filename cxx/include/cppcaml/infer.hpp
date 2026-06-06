@@ -32,6 +32,8 @@ struct Type {
   int id = 0;                // unique id (occurs-check / debug printing)
 
   TypePtr dom, cod;          // Arrow
+  int arrow_label = 0;       // Arrow: 0 Nolabel, 1 Labelled, 2 Optional
+  std::string arrow_lbl;     // Arrow: label name (when Labelled/Optional)
   std::vector<TypePtr> args; // Tuple / Constr
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
 
@@ -51,7 +53,7 @@ public:
   void leave_level() { --level; }
 
   TypePtr fresh_var();
-  TypePtr arrow(TypePtr dom, TypePtr cod);
+  TypePtr arrow(TypePtr dom, TypePtr cod, int label = 0, std::string lbl = "");
   TypePtr tuple(std::vector<TypePtr> elems);
   TypePtr constr(std::string path, std::vector<TypePtr> args = {});
 
