@@ -124,8 +124,36 @@ struct Printer {
   void pattern(int i, const Pattern& p) {
     line(i, "pattern " + loc(p.loc));
     int j = i + 1;
-    if (std::holds_alternative<Tpat_any>(p.desc)) line(j, "Tpat_any");
-    else line(j, "Tpat_var \"" + ident(std::get<Tpat_var>(p.desc).id) + "\"");
+    if (std::holds_alternative<Tpat_any>(p.desc)) {
+      line(j, "Tpat_any");
+    } else if (auto* v = std::get_if<Tpat_var>(&p.desc)) {
+      line(j, "Tpat_var \"" + ident(v->id) + "\"");
+    } else if (auto* c = std::get_if<Tpat_constant>(&p.desc)) {
+      constant(j, "Tpat_constant ", c->c);
+    } else if (auto* k = std::get_if<Tpat_construct>(&p.desc)) {
+      line(j, "Tpat_construct \"" + k->name + "\"");
+      if (k->args.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& a : k->args) pattern(j + 1, *a);
+        line(j, "]");
+      }
+      line(j, "None");  // existential (vars, type) annotation: always None here
+    } else {
+      auto& w = std::get<Tpat_value>(p.desc);
+      line(j, "Tpat_value");
+      pattern(j, *w.inner);  // inner at same depth (printtyped: `pattern i`)
+    }
+  }
+
+  void case_(int i, const Case& c) {
+    line(i, "<case>");
+    pattern(i + 1, c.lhs);
+    if (c.guard) {
+      line(i + 1, "<when>");
+      expression(i + 2, **c.guard);
+    }
+    expression(i + 1, *c.rhs);
   }
 
   void expression(int i, const Expression& e) {
@@ -155,13 +183,12 @@ struct Printer {
         expression(j + 2, *ex);
       }
       line(j, "]");
-    } else {
-      auto& fn = std::get<Texp_function>(e.desc);
+    } else if (auto* fn = std::get_if<Texp_function>(&e.desc)) {
       line(j, "Texp_function");
-      if (fn.params.empty()) line(j, "[]");
+      if (fn->params.empty()) line(j, "[]");
       else {
         line(j, "[");
-        for (auto& p : fn.params) {
+        for (auto& p : fn->params) {
           arg_label(j + 1, p.label);
           line(j + 1, "Param_pat");
           pattern(j + 2, *p.pat);
@@ -169,8 +196,66 @@ struct Printer {
         line(j, "]");
       }
       line(j, "Tfunction_body");
-      expression(j + 1, *fn.body);
+      expression(j + 1, *fn->body);
+    } else if (auto* l = std::get_if<Texp_let>(&e.desc)) {
+      line(j, std::string("Texp_let ") +
+                  (l->rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
+      list_bindings(j, l->rf, l->bindings);
+      expression(j, *l->body);
+    } else if (auto* it = std::get_if<Texp_ifthenelse>(&e.desc)) {
+      line(j, "Texp_ifthenelse");
+      expression(j, *it->cond);
+      expression(j, *it->then_);
+      if (it->else_) { line(j, "Some"); expression(j + 1, **it->else_); }
+      else line(j, "None");
+    } else if (auto* s = std::get_if<Texp_sequence>(&e.desc)) {
+      line(j, "Texp_sequence");
+      expression(j, *s->e1);
+      expression(j, *s->e2);
+    } else if (auto* m = std::get_if<Texp_match>(&e.desc)) {
+      line(j, "Texp_match");
+      expression(j, *m->scrut);
+      list_cases(j, m->cases);
+      line(j, "[]");  // l2 (legacy second case list)
+    } else if (auto* tr = std::get_if<Texp_try>(&e.desc)) {
+      line(j, "Texp_try");
+      expression(j, *tr->body);
+      list_cases(j, tr->cases);
+      line(j, "[]");
+    } else if (auto* k = std::get_if<Texp_construct>(&e.desc)) {
+      line(j, "Texp_construct \"" + k->name + "\"");
+      if (k->args.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& a : k->args) expression(j + 1, *a);
+        line(j, "]");
+      }
+    } else if (auto* ar = std::get_if<Texp_array>(&e.desc)) {
+      line(j, "Texp_array Mutable");
+      if (ar->elems.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& a : ar->elems) expression(j + 1, *a);
+        line(j, "]");
+      }
+    } else {
+      auto& as = std::get<Texp_assert>(e.desc);
+      os << std::string(2 * j, ' ') << "Texp_assert";  // printtyped omits the \n
+      expression(j, *as.e);
     }
+  }
+
+  void list_cases(int i, const std::vector<Case>& cases) {
+    if (cases.empty()) { line(i, "[]"); return; }
+    line(i, "[");
+    for (auto& c : cases) case_(i + 1, c);
+    line(i, "]");
+  }
+  void list_bindings(int i, RecFlag rf, const std::vector<ValueBinding>& bs) {
+    if (bs.empty()) { line(i, "[]"); return; }
+    line(i, "[");
+    for (auto& b : bs) value_binding(i + 1, rf, b);
+    line(i, "]");
   }
 
   void value_binding(int i, RecFlag rf, const ValueBinding& vb) {
@@ -182,13 +267,15 @@ struct Printer {
   void structure_item(int i, const StructureItem& it) {
     line(i, "structure_item " + loc(it.loc));
     int j = i + 1;
-    auto& sv = std::get<Tstr_value>(it.desc);
-    line(j, std::string("Tstr_value ") +
-                (sv.rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
-    if (sv.bindings.empty()) { line(j, "[]"); return; }
-    line(j, "[");
-    for (auto& vb : sv.bindings) value_binding(j + 1, sv.rf, vb);
-    line(j, "]");
+    if (auto* sv = std::get_if<Tstr_value>(&it.desc)) {
+      line(j, std::string("Tstr_value ") +
+                  (sv->rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
+      list_bindings(j, sv->rf, sv->bindings);
+    } else {
+      auto& ev = std::get<Tstr_eval>(it.desc);
+      line(j, "Tstr_eval");
+      expression(j, *ev.e);
+    }
   }
 
   void structure(const Structure& s) {

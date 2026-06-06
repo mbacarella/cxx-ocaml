@@ -48,8 +48,14 @@ using ExprBox = Box<Expression>;
 // --- patterns ---
 struct Tpat_any {};
 struct Tpat_var { Ident id; };
+struct Tpat_constant { Constant c; };
+struct Tpat_construct {
+  std::string name;            // fmt_longident of the constructor
+  std::vector<PatBox> args;
+};
+struct Tpat_value { PatBox inner; };  // computation-pattern wrapper (match cases)
 struct Pattern {
-  std::variant<Tpat_any, Tpat_var> desc;
+  std::variant<Tpat_any, Tpat_var, Tpat_constant, Tpat_construct, Tpat_value> desc;
   Location loc;
 };
 
@@ -72,23 +78,46 @@ struct Texp_function {
   std::vector<FunctionParam> params;
   ExprBox body;  // Tfunction_body
 };
+struct ValueBinding;  // (defined below; used by Texp_let)
+struct Case;
+struct Texp_let {
+  RecFlag rf;
+  std::vector<ValueBinding> bindings;
+  ExprBox body;
+};
+struct Texp_ifthenelse { ExprBox cond; ExprBox then_; std::optional<ExprBox> else_; };
+struct Texp_sequence { ExprBox e1; ExprBox e2; };
+struct Texp_match { ExprBox scrut; std::vector<Case> cases; };  // cases are computation
+struct Texp_try { ExprBox body; std::vector<Case> cases; };     // cases are value
+struct Texp_construct { std::string name; std::vector<ExprBox> args; };
+struct Texp_array { std::vector<ExprBox> elems; };
+struct Texp_assert { ExprBox e; };
 struct Expression {
-  std::variant<Texp_constant, Texp_ident, Texp_tuple, Texp_apply, Texp_function>
+  std::variant<Texp_constant, Texp_ident, Texp_tuple, Texp_apply, Texp_function,
+               Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
+               Texp_construct, Texp_array, Texp_assert>
       desc;
   Location loc;
 };
 
-// --- structure ---
 struct ValueBinding {
   Pattern pat;
   Expression expr;
 };
+struct Case {
+  Pattern lhs;
+  std::optional<ExprBox> guard;
+  ExprBox rhs;
+};
+
+// --- structure ---
 struct Tstr_value {
   RecFlag rf;
   std::vector<ValueBinding> bindings;
 };
+struct Tstr_eval { ExprBox e; };
 struct StructureItem {
-  std::variant<Tstr_value> desc;
+  std::variant<Tstr_value, Tstr_eval> desc;
   Location loc;
 };
 using Structure = std::vector<StructureItem>;
