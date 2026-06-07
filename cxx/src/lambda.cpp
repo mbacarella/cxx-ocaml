@@ -170,6 +170,13 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
     case Lam::K::ConstInt: return text(std::to_string(l->int_val));
     case Lam::K::ConstFloat: return text(l->str_val);
     case Lam::K::ConstString: return text("\"" + l->str_val + "\"");
+    case Lam::K::ConstBlock: {  // struct_const: [tag] or [tag: f1 f2 ...]
+      std::string tag = std::to_string(l->prim_arg);
+      if (l->args.empty()) return text("[" + tag + "]");
+      std::vector<DocP> fs;
+      for (size_t i = 0; i < l->args.size(); ++i) { if (i) fs.push_back(brk()); fs.push_back(to_doc(l->args[i], pr)); }
+      return box(BoxT::Box, 1, {text("[" + tag + ":"), brk(), box(BoxT::Box, 0, std::move(fs)), text("]")});
+    }
     case Lam::K::Let: return let_doc(l, pr);
     case Lam::K::Prim: {
       std::string head;
@@ -296,8 +303,41 @@ struct Translator {
     return false;
   }
 
+  static bool is_const(const LamPtr& l) {
+    return l->k == Lam::K::ConstInt || l->k == Lam::K::ConstFloat ||
+           l->k == Lam::K::ConstString || l->k == Lam::K::ConstBlock;
+  }
+  // Build a block: a struct-const [tag: ...] if all fields are constant, else a
+  // dynamic (makeblock tag ...).
+  LamPtr block(int tag, std::vector<LamPtr> fields) {
+    bool allc = true;
+    for (auto& f : fields) if (!is_const(f)) allc = false;
+    auto b = mk(allc ? Lam::K::ConstBlock : Lam::K::Prim);
+    if (!allc) b->prim = Prim::Makeblock;
+    b->prim_arg = tag;
+    b->args = std::move(fields);
+    return b;
+  }
+
   LamPtr expr(const Expression& e) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return translate_const(c->c);
+    if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
+      std::vector<LamPtr> es;
+      for (auto& el : tu->elems) es.push_back(expr(*el));
+      return block(0, std::move(es));
+    }
+    if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
+      std::string n = lid_last(k->id.txt);
+      if (n == "[]" || n == "None" || n == "false" || n == "()") { auto z = mk(Lam::K::ConstInt); z->int_val = 0; return z; }
+      if (n == "true") { auto z = mk(Lam::K::ConstInt); z->int_val = 1; return z; }
+      if (n == "::" && k->arg) {  // a :: b : block tag 0 of (head, tail)
+        if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc); at && at->elems.size() == 2)
+          return block(0, {expr(*at->elems[0]), expr(*at->elems[1])});
+      }
+      if (n == "Some" && k->arg) return block(0, {expr(**k->arg)});
+      auto v = mk(Lam::K::Var); v->var = fresh("?" + n);  // user ctor: needs its tag (defer)
+      return v;
+    }
     if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
       if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
