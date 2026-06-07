@@ -61,6 +61,11 @@ static int typed_mode(const char* file, const char* sel) {
                     cmi::print_type(v.type).c_str());
       return 0;
     }
+    if (s == "--fields") {
+      int i = 0;
+      for (const auto& f : c.sig().fields) std::printf("  %d %s\n", i++, f.c_str());
+      return 0;
+    }
     if (s == "--types") {
       for (const auto& t : c.types())
         std::printf("  %s\n", cmi::print_type_decl(t).c_str());

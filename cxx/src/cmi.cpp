@@ -40,8 +40,14 @@ public:
             if (item.fields.size() == 3) {
               SigValue sv;
               sv.name = ident(item.fields[0]).name;
-              // value_description.val_type is field 0 of the record.
-              sv.type = type(arena_[item.fields[1]].fields.at(0));
+              // value_description: field 0 = val_type, field 1 = val_kind.
+              const m::Value& vd = arena_[item.fields[1]];
+              sv.type = type(vd.fields.at(0));
+              // val_kind: Val_reg is the immediate constant 0; Val_prim (an
+              // inlined %/C primitive) is a block and takes no runtime field.
+              if (vd.fields.size() > 1 &&
+                  arena_[vd.fields[1]].kind == m::Value::Kind::Int)
+                out.fields.push_back(sv.name);
               out.values.push_back(std::move(sv));
             }
             break;
@@ -56,6 +62,7 @@ public:
             if (item.fields.size() == 4) {
               ExtConstructor ec = ext_constructor(item.fields[1]);
               ec.name = ident(item.fields[0]).name;
+              out.fields.push_back(ec.name);  // an exception/extension takes a field
               out.typexts.push_back(std::move(ec));
             }
             break;
@@ -65,6 +72,7 @@ public:
               md.name = ident(item.fields[0]).name;
               // module_declaration.md_type is field 0 of the record.
               md.type = module_type(arena_[item.fields[2]].fields.at(0));
+              out.fields.push_back(md.name);  // a submodule takes a field
               out.modules.push_back(std::move(md));
             }
             break;

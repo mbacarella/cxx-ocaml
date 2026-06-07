@@ -144,6 +144,11 @@ struct Signature {
   std::vector<ModuleDecl> modules;
   std::vector<ModtypeDecl> modtypes;
   std::vector<ExtConstructor> typexts;
+  // Names of the module's runtime block fields, in order (the Lambda back end
+  // needs these to compile a qualified value to `field N (global M!)`): a
+  // regular value (Val_reg, not an inlined %/C primitive), an exception, or a
+  // submodule takes a field; types/modtypes do not.
+  std::vector<std::string> fields;
 };
 
 // A loaded .cmi: owns the decoded signature and exposes its bindings.

@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <variant>
 
+#include "cppcaml/cmi.hpp"
 #include "cppcaml/infer_check.hpp"
 
 namespace cppcaml::lambda {
@@ -24,13 +25,14 @@ std::string lid_last(const Longident& x) {
 // indents to the box's open-column + offset (column-relative, as Format does).
 struct Doc;
 using DocP = std::shared_ptr<Doc>;
-enum class BoxT { Hov, Hv, H, V };
+enum class BoxT { Box, Hov, Hv, H, V };  // Box = @[<n>] (the printlambda default)
 struct Doc {
   enum T { Text, Break, Box } t;
   std::string s;            // Text content / Break separator
   BoxT bt = BoxT::Hov;      // Box
   int off = 0;              // Box offset
   std::vector<DocP> ch;     // Box children
+  int bsize = 0;            // Break: Oppen size (text to next break, nesting-aware)
 };
 DocP text(std::string s) { auto d = std::make_shared<Doc>(); d->t = Doc::Text; d->s = std::move(s); return d; }
 DocP brk(std::string sep = " ") { auto d = std::make_shared<Doc>(); d->t = Doc::Break; d->s = std::move(sep); return d; }
@@ -45,45 +47,81 @@ int flatw(const DocP& d) {
   int w = 0; for (auto& c : d->ch) w += flatw(c); return w;
 }
 
+// Compute each break's Oppen "size" = the width of the material following it up
+// to the next break AT THE SAME BOX LEVEL (a nested box counts as its full flat
+// width; its own breaks are not boundaries for the outer break).  `tail` is the
+// size to attribute to content that runs off the end of this box (the parent's
+// continuation), so an outer break sees the whole nested content -- which is why
+// `setglobal`'s break sees the entire (let ...) and breaks first.
+void set_sizes(const DocP& b, int tail) {
+  int n = (int)b->ch.size();
+  auto run = [&](int from) {  // flat width from `from` to the next break (or end+tail)
+    int s = 0; bool found = false;
+    for (int j = from; j < n; ++j) {
+      if (b->ch[j]->t == Doc::Break) { found = true; break; }
+      s += flatw(b->ch[j]);
+    }
+    return s + (found ? 0 : tail);
+  };
+  for (int i = 0; i < n; ++i) {
+    if (b->ch[i]->t == Doc::Break) b->ch[i]->bsize = run(i + 1);
+    else if (b->ch[i]->t == Doc::Box) set_sizes(b->ch[i], run(i + 1));
+  }
+}
+
+// A faithful port of OCaml's Format break decisions (stdlib/format.ml).  On
+// entering a box, if its flat width fits the remaining space it becomes "fits"
+// (all breaks stay on the line); otherwise it keeps its declared type.  `@[<n>`
+// is Pp_box (not hov): it breaks a hint when the next chunk overflows OR when
+// the current line is already indented past the box's open column.
 struct Render {
   std::ostream& out;
   int col = 0;
+  int cur_indent = 0;   // indentation of the current line
+  bool is_new_line = true;
+  void emit(const std::string& s) { out << s; col += (int)s.size(); if (!s.empty()) is_new_line = false; }
+  void newline(int indent) {
+    out << '\n' << std::string(indent, ' ');
+    col = indent; cur_indent = indent; is_new_line = true;
+  }
   void go(const DocP& d) {
-    if (d->t == Doc::Text) { out << d->s; col += (int)d->s.size(); return; }
-    if (d->t == Doc::Break) { out << d->s; col += (int)d->s.size(); return; }  // bare break: flat
-    int bi = col + d->off;
-    bool hv_flat = (d->bt == BoxT::H) || (d->bt != BoxT::V && col + flatw(d) <= MARGIN);
-    for (size_t i = 0; i < d->ch.size(); ++i) {
-      auto& c = d->ch[i];
-      if (c->t == Doc::Text) { out << c->s; col += (int)c->s.size(); }
+    if (d->t == Doc::Text || d->t == Doc::Break) { emit(d->s); return; }
+    // Box: resolve to "fits" if the whole box fits the remaining width.
+    bool fits = flatw(d) <= MARGIN - col;
+    BoxT ty = d->bt;
+    int open_indent = col + d->off;  // break indent and Pp_box threshold
+    for (auto& c : d->ch) {
+      if (c->t == Doc::Text) { emit(c->s); }
       else if (c->t == Doc::Box) { go(c); }
-      else {  // Break: decide per box policy
-        bool b;
-        if (d->bt == BoxT::H) b = false;
-        else if (d->bt == BoxT::V) b = true;
-        else if (d->bt == BoxT::Hv) b = !hv_flat;
-        else {  // Hov: break if the next chunk (to the next break) doesn't fit
-          int frag = 0;
-          for (size_t j = i + 1; j < d->ch.size() && d->ch[j]->t != Doc::Break; ++j)
-            frag += flatw(d->ch[j]);
-          b = col + frag > MARGIN;
+      else {  // Break (separator c->s, offset 0 for our `@ ` breaks)
+        bool nl;
+        if (fits) nl = false;
+        else switch (ty) {
+          case BoxT::H: nl = false; break;
+          case BoxT::V: nl = true; break;
+          case BoxT::Hv: nl = true; break;
+          case BoxT::Hov: nl = c->bsize > MARGIN - col; break;
+          default:  // Pp_box (the @[<n>] default)
+            if (is_new_line) nl = false;
+            else if (c->bsize > MARGIN - col) nl = true;
+            else nl = cur_indent > open_indent;
+            break;
         }
-        if (b) { out << '\n' << std::string(bi, ' '); col = bi; }
-        else { out << c->s; col += (int)c->s.size(); }
+        if (nl) newline(open_indent);
+        else emit(c->s);
       }
     }
   }
 };
 
-// ---- stamp normalization (by first appearance, like the typedtree harness) ----
+// Print the raw stamp (NOT normalized): the layout/line-breaking depends on the
+// stamp's digit width, which must match OCaml's (its stamps are ~3 digits, like
+// ours start at 300).  The harness normalizes both sides by first appearance for
+// the byte comparison, so the actual values are irrelevant -- only widths matter.
 struct Pr {
-  std::unordered_map<int, int> stamps;
-  int next = 274;
-  int norm(int s) { auto it = stamps.find(s); if (it != stamps.end()) return it->second;
-                    return stamps[s] = next++; }
   std::string ident(const Ident& i) {
     std::string base = i.temp ? "*match*" : i.name;
-    return base + "/" + std::to_string(norm(i.stamp));
+    return base + "/" + std::to_string(i.stamp);
   }
 };
 
@@ -118,12 +156,12 @@ DocP let_doc(const LamPtr& l, Pr& pr) {
   for (size_t i = 0; i < l->bindings.size(); ++i) {
     auto& b = l->bindings[i];
     if (i) binds.push_back(brk());
-    binds.push_back(box(BoxT::Hov, 2,
+    binds.push_back(box(BoxT::Box, 2,
         {text(pr.ident(b.id) + " =" + kind_suffix(b.kind)), brk(), to_doc(b.val, pr)}));
   }
   binds.push_back(text(")"));
   DocP bindings = box(BoxT::Hv, 1, std::move(binds));
-  return box(BoxT::Hov, 2, {text("(let"), brk(), bindings, brk(), to_doc(l->body, pr), text(")")});
+  return box(BoxT::Box, 2, {text("(let"), brk(), bindings, brk(), to_doc(l->body, pr), text(")")});
 }
 
 DocP to_doc(const LamPtr& l, Pr& pr) {
@@ -150,13 +188,13 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
       std::vector<DocP> xs{text(head)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
       xs.push_back(text(")"));
-      return box(BoxT::Hov, 2, std::move(xs));
+      return box(BoxT::Box, 2, std::move(xs));
     }
     case Lam::K::Apply: {
       std::vector<DocP> xs{text("(apply"), brk(), to_doc(l->fn, pr)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
       xs.push_back(text(")"));
-      return box(BoxT::Hov, 2, std::move(xs));
+      return box(BoxT::Box, 2, std::move(xs));
     }
     case Lam::K::Function: {
       std::vector<DocP> xs{text("(function")};
@@ -165,13 +203,13 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
       if (l->ret_kind != ValueKind::Gen) { xs.push_back(text(ret_suffix(l->ret_kind))); xs.push_back(brk()); }
       xs.push_back(to_doc(l->body, pr));
       xs.push_back(text(")"));
-      return box(BoxT::Hov, 2, std::move(xs));
+      return box(BoxT::Box, 2, std::move(xs));
     }
     case Lam::K::IfThenElse:
-      return box(BoxT::Hov, 2, {text("(if"), brk(), to_doc(l->cond, pr), brk(),
+      return box(BoxT::Box, 2, {text("(if"), brk(), to_doc(l->cond, pr), brk(),
                                 to_doc(l->then_, pr), brk(), to_doc(l->else_, pr), text(")")});
     case Lam::K::Sequence:
-      return box(BoxT::Hov, 2, {text("(seq"), brk(), to_doc(l->cond, pr), brk(),
+      return box(BoxT::Box, 2, {text("(seq"), brk(), to_doc(l->cond, pr), brk(),
                                 to_doc(l->else_, pr), text(")")});
   }
   return text("?");
@@ -210,6 +248,14 @@ struct Translator {
   ValueKinds vk;
   int stamp = 300;  // arbitrary; normalized on print
   std::vector<std::unordered_map<std::string, Ident>> scope{{}};
+  std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
+
+  // (field_imm N (global Stdlib!)) for a Stdlib value.
+  LamPtr stdlib_field(int idx) {
+    auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = "Stdlib";
+    auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = idx; f->args = {g};
+    return f;
+  }
 
   Ident fresh(const std::string& name, bool temp = false) { return Ident{name, stamp++, temp}; }
   ValueKind pat_kind(const Pattern* p) {
@@ -235,8 +281,18 @@ struct Translator {
   LamPtr expr(const Expression& e) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return translate_const(c->c);
     if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
-      if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+      if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
+        auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
+        if (sf != stdlib_fields.end()) return stdlib_field(sf->second);
+      }
+      // Stdlib.x explicitly qualified
+      if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (pl->name == "Stdlib") {
+            auto sf = stdlib_fields.find(d->name);
+            if (sf != stdlib_fields.end()) return stdlib_field(sf->second);
+          }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + lid_last(id->id.txt));  // unresolved (will DIFF)
       return v;
     }
@@ -313,6 +369,11 @@ struct Translator {
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name) {
   Translator t;
   t.vk = infer_value_kinds(s);
+  try {  // Stdlib value -> module field index, for pervasive resolution
+    auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
+    int i = 0;
+    for (auto& f : cmi.sig().fields) t.stdlib_fields[f] = i++;
+  } catch (...) {}
   auto root = mk(Lam::K::Let);
   std::vector<LamPtr> exports;  // export expressions (a var, or an alias target)
   for (auto& it : s) {
@@ -353,8 +414,10 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
 void print_dlambda(const LamPtr& code, std::ostream& out) {
   Pr pr;
   std::ostringstream ss;
+  DocP d = to_doc(code, pr);
+  set_sizes(d, 0);
   Render r{ss};
-  r.go(to_doc(code, pr));
+  r.go(d);
   out << ss.str() << "\n";
 }
 
