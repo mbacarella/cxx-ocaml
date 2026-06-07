@@ -58,3 +58,6 @@ target_link_libraries(c++cmo PRIVATE cppcaml_core)
 
 add_executable(c++link src/tools/cpplink_main.cpp)
 target_link_libraries(c++link PRIVATE cppcaml_core)
+
+add_executable(c++ocamlc src/tools/cppocamlc_main.cpp)
+target_link_libraries(c++ocamlc PRIVATE cppcaml_core)
