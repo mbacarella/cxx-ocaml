@@ -594,12 +594,25 @@ struct Translator {
     if (prim == "%opaque" && as.size() == 1) return op("opaque");
     if (prim == "%ignore" && as.size() == 1) return op("ignore");
     if (prim == "%identity" && as.size() == 1) return expr(*as[0].second);  // no-op
-    // Polymorphic compare specialized to ints (the spelling we can be sure of).
-    if (prim == "%compare" && as.size() == 2 &&
-        (expr_kind(as[0].second.get()) == ValueKind::Int ||
-         expr_kind(as[1].second.get()) == ValueKind::Int))
-      return op("compare_ints");
-    (void)e;
+    // Polymorphic compare specialized by operand kind (the spellings we can be
+    // sure of; string/other gen needs the operand type, so left unresolved).
+    if (prim == "%compare" && as.size() == 2) {
+      ValueKind k0 = expr_kind(as[0].second.get()), k1 = expr_kind(as[1].second.get());
+      if (k0 == ValueKind::Int || k1 == ValueKind::Int) return op("compare_ints");
+      if (k0 == ValueKind::Float || k1 == ValueKind::Float) return op("compare_floats");
+    }
+    // fst / snd: read field 0 / 1 with the element's read kind (int vs pointer;
+    // a float element would be field_float, which we don't spell -> leave it).
+    if ((prim == "%field0" || prim == "%field1") && as.size() == 1) {
+      ValueKind k = expr_kind(&e);
+      if (k == ValueKind::Int || k == ValueKind::Gen) {
+        auto pr = mk(Lam::K::Prim);
+        pr->prim = k == ValueKind::Int ? Prim::FieldInt : Prim::FieldMut;
+        pr->prim_arg = prim == "%field0" ? 0 : 1;
+        pr->args = {expr(*as[0].second)};
+        return pr;
+      }
+    }
     return nullptr;
   }
 
