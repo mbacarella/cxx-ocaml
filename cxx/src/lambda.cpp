@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <set>
 #include <ostream>
 #include <sstream>
 #include <unordered_map>
@@ -143,17 +144,27 @@ std::string kind_suffix(ValueKind k) {
   }
   return "";
 }
-// block_shape for a single-field block (printlambda): omitted when generic.
-std::string shape_suffix(ValueKind k) {
+std::string field_kind(ValueKind k) {
   switch (k) {
-    case ValueKind::Int: return " (int)";
-    case ValueKind::Float: return " (float)";
-    case ValueKind::Boxedint32: return " (int32)";
-    case ValueKind::Boxedint64: return " (int64)";
-    case ValueKind::Nativeint: return " (nativeint)";
-    case ValueKind::Gen: return "";
+    case ValueKind::Int: return "int";
+    case ValueKind::Float: return "float";
+    case ValueKind::Boxedint32: return "int32";
+    case ValueKind::Boxedint64: return "int64";
+    case ValueKind::Nativeint: return "nativeint";
+    case ValueKind::Gen: return "*";
   }
-  return "";
+  return "*";
+}
+// block_shape (printlambda): omitted when empty or all-generic; otherwise
+// " (k0,k1,...)".
+std::string shape_suffix(const std::vector<ValueKind>& shape) {
+  if (shape.empty()) return "";
+  bool all_gen = true;
+  for (auto k : shape) if (k != ValueKind::Gen) all_gen = false;
+  if (all_gen) return "";
+  std::string s = " (" + field_kind(shape[0]);
+  for (size_t i = 1; i < shape.size(); ++i) s += "," + field_kind(shape[i]);
+  return s + ")";
 }
 std::string ret_suffix(ValueKind k) {
   switch (k) {
@@ -211,7 +222,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::NotEqInt: head = "(!="; break;
         case Prim::EqInt: head = "(=="; break;
         case Prim::Makemutable:
-          head = "(makemutable " + std::to_string(l->prim_arg) + shape_suffix(l->blk_kind); break;
+          head = "(makemutable " + std::to_string(l->prim_arg) + shape_suffix(l->blk_shape); break;
         case Prim::FieldInt: head = "(field_int " + std::to_string(l->prim_arg); break;
         case Prim::FieldMut: head = "(field_mut " + std::to_string(l->prim_arg); break;
         case Prim::SetfieldImm: head = "(setfield_imm " + std::to_string(l->prim_arg); break;
@@ -310,21 +321,76 @@ struct Translator {
   struct CtorInfo { std::string type; int tag; bool is_block; };
   std::unordered_map<std::string, CtorInfo> ctor_info_;
   std::unordered_map<std::string, std::pair<int, int>> type_ctors_;  // type -> (n_const, n_block)
+  std::set<std::string> immediate_local_;  // local all-constant variant type names
+
+  // Locally-declared record fields: label -> {owning type, index, mutable, kind}.
+  // Only UNAMBIGUOUS labels are usable (a label reused across records can't be
+  // resolved without type direction, so it falls back to a generic translation).
+  struct FieldInfo { std::string type; int index; bool mut; ValueKind kind; };
+  std::unordered_map<std::string, FieldInfo> field_info_;
+  std::set<std::string> ambiguous_fields_;
+  struct RecType { std::vector<std::string> labels; bool mut; std::vector<ValueKind> shape; };
+  std::unordered_map<std::string, RecType> rec_types_;  // type name -> record layout
+
+  // The value kind of a field/element from its syntactic core type (builtins and
+  // immediate local variants; everything else is generic/boxed).
+  ValueKind coretype_kind(const CoreType& t) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      std::string b = lid_last(c->id.txt);
+      if (b == "int" || b == "char" || b == "bool" || b == "unit") return ValueKind::Int;
+      if (b == "float") return ValueKind::Float;
+      if (b == "int32") return ValueKind::Boxedint32;
+      if (b == "int64") return ValueKind::Boxedint64;
+      if (b == "nativeint") return ValueKind::Nativeint;
+      if (immediate_local_.count(b)) return ValueKind::Int;
+    }
+    return ValueKind::Gen;
+  }
 
   void register_types(const Structure& s) {
-    for (auto& item : s)
-      if (auto* td = std::get_if<Pstr_type>(&item.desc))
-        for (auto& d : td->decls)
-          if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
-            int nc = 0, nb = 0;
-            for (auto& c : v->ctors) {
-              bool block = true;
-              if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) block = !t->elems.empty();
-              ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block};
-              if (block) ++nb; else ++nc;
-            }
-            type_ctors_[d.name.txt] = {nc, nb};
-          }
+    auto each_decl = [&](auto fn) {
+      for (auto& item : s)
+        if (auto* td = std::get_if<Pstr_type>(&item.desc))
+          for (auto& d : td->decls) fn(d);
+    };
+    each_decl([&](const TypeDeclaration& d) {  // variants first (records may cite them)
+      if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+        int nc = 0, nb = 0;
+        bool all_const = !v->ctors.empty(), gadt = false;
+        for (auto& c : v->ctors) {
+          bool block = true;
+          if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) block = !t->elems.empty();
+          if (c.res) gadt = true;
+          if (block) all_const = false;
+          ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block};
+          if (block) ++nb; else ++nc;
+        }
+        type_ctors_[d.name.txt] = {nc, nb};
+        if (all_const && !gadt) immediate_local_.insert(d.name.txt);
+      }
+    });
+    each_decl([&](const TypeDeclaration& d) {  // then records
+      if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
+        RecType rt;
+        rt.mut = false;
+        int idx = 0;
+        for (auto& f : rec->fields) {
+          ValueKind k = coretype_kind(*f.type);
+          bool m = f.mut == MutableFlag::Mutable;
+          rt.mut |= m;
+          rt.labels.push_back(f.name.txt);
+          rt.shape.push_back(k);
+          if (field_info_.count(f.name.txt)) ambiguous_fields_.insert(f.name.txt);
+          field_info_[f.name.txt] = {d.name.txt, idx++, m, k};
+        }
+        rec_types_[d.name.txt] = std::move(rt);
+      }
+    });
+  }
+  const FieldInfo* find_field(const std::string& label) {
+    if (ambiguous_fields_.count(label)) return nullptr;
+    auto it = field_info_.find(label);
+    return it == field_info_.end() ? nullptr : &it->second;
   }
 
   // (field_imm N (global G!)) for a value at field idx of global module G.
@@ -465,6 +531,46 @@ struct Translator {
       for (auto& el : tu->elems) es.push_back(expr(*el));
       return block(0, std::move(es));
     }
+    if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
+      if (!rc->base && !rc->fields.empty())  // not a functional update `{e with ..}`
+        if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt))) {
+          auto rt = rec_types_.find(f0->type);
+          if (rt != rec_types_.end()) {
+            std::vector<LamPtr> vals(rt->second.labels.size());
+            bool ok = vals.size() == rc->fields.size();
+            for (auto& [lid, ve] : rc->fields) {
+              auto* fi = find_field(lid_last(lid.txt));
+              if (!fi || fi->type != f0->type) { ok = false; break; }
+              vals[fi->index] = expr(*ve);
+            }
+            if (ok) {
+              if (!rt->second.mut) return block(0, std::move(vals));
+              auto m = mk(Lam::K::Prim);  // any mutable field -> makemutable
+              m->prim = Prim::Makemutable; m->prim_arg = 0;
+              m->blk_shape = rt->second.shape; m->args = std::move(vals);
+              return m;
+            }
+          }
+        }
+    }
+    if (auto* fe = std::get_if<Pexp_field>(&e.desc)) {
+      if (auto* fi = find_field(lid_last(fe->field.txt))) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = fi->kind == ValueKind::Int ? Prim::FieldInt
+                  : fi->mut                  ? Prim::FieldMut
+                                             : Prim::FieldImm;
+        l->prim_arg = fi->index; l->args = {expr(*fe->e)};
+        return l;
+      }
+    }
+    if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
+      if (auto* fi = find_field(lid_last(sf->field.txt))) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = fi->kind == ValueKind::Int ? Prim::SetfieldImm : Prim::SetfieldPtr;
+        l->prim_arg = fi->index; l->args = {expr(*sf->obj), expr(*sf->value)};
+        return l;
+      }
+    }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       std::string n = lid_last(k->id.txt);
       if (n == "[]" || n == "None" || n == "false" || n == "()") { auto z = mk(Lam::K::ConstInt); z->int_val = 0; return z; }
@@ -507,7 +613,7 @@ struct Translator {
             }
             if (n == "ref" && as.size() == 1) {  // (makemutable 0 (shape) e)
               auto pr = mk(Lam::K::Prim); pr->prim = Prim::Makemutable; pr->prim_arg = 0;
-              pr->blk_kind = expr_kind(as[0].second.get());
+              pr->blk_shape = {expr_kind(as[0].second.get())};
               pr->args = {expr(*as[0].second)};
               return pr;
             }

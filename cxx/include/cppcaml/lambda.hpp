@@ -76,7 +76,7 @@ struct Lam {
   Prim prim;
   int prim_arg = 0;                // field index / makeblock tag / offsetref delta
   std::string prim_id;             // global name (e.g. "Stdlib")
-  ValueKind blk_kind = ValueKind::Gen;  // makemutable single-field shape
+  std::vector<ValueKind> blk_shape;  // makemutable block_shape (per-field kinds)
 
   // IfThenElse
   LamPtr cond, then_, else_;
