@@ -655,10 +655,51 @@ struct Translator {
       else
         elems.push_back([this, run](LamPtr r) { return cblock(11, {cstr(run), r}); });
     };
+    auto flit = [&](int tag) {  // Formatting_lit(17) of a constant formatting_lit
+      elems.push_back([this, tag](LamPtr r) { return cblock(17, {cint(tag), r}); });
+    };
+    auto fbreak = [&](const std::string& src, int w, int o) {  // Formatting_lit(Break)
+      elems.push_back([this, src, w, o](LamPtr r) {
+        return cblock(17, {cblock(0, {cstr(src), cint(w), cint(o)}), r});
+      });
+    };
     std::string run;
     size_t i = 0, n = s.size();
     while (i < n) {
       char ch = s[i];
+      if (ch == '@') {  // a Format `@` directive (shared format parsing, even Printf)
+        if (i + 1 >= n) return nullptr;
+        if (!run.empty()) { lit(run); run.clear(); }
+        char d = s[i + 1];
+        if (d == ']') { flit(0); i += 2; continue; }                 // @] Close_box
+        if (d == '}') { flit(1); i += 2; continue; }                 // @} Close_tag
+        if (d == '?') { flit(2); i += 2; continue; }                 // @? FFlush
+        if (d == '\n') { flit(3); i += 2; continue; }                // @\n Force_newline
+        if (d == '.') { flit(4); i += 2; continue; }                 // @. Flush_newline
+        if (d == '@') { flit(5); i += 2; continue; }                 // @@ Escaped_at
+        if (d == ',') { fbreak("@,", 0, 0); i += 2; continue; }      // @, break
+        if (d == ' ') { fbreak("@ ", 1, 0); i += 2; continue; }      // @  break
+        if (d == ';') {  // @; or @;<w o>
+          size_t j = i + 2; int w = 1, o = 0;
+          if (j < n && s[j] == '<') {
+            size_t k = s.find('>', j);
+            if (k == std::string::npos) return nullptr;
+            int a = 0, b = 0; bool sa = false, sb = false; bool sp = false;
+            for (size_t p = j + 1; p < k; ++p) {
+              char cc = s[p];
+              if (cc == ' ') { sp = true; continue; }
+              if (cc < '0' || cc > '9') return nullptr;
+              if (!sp) { a = a * 10 + (cc - '0'); sa = true; }
+              else { b = b * 10 + (cc - '0'); sb = true; }
+            }
+            if (!sa) return nullptr;
+            w = a; o = sb ? b : 0;
+            fbreak(s.substr(i, k + 1 - i), w, o); i = k + 1; continue;
+          }
+          fbreak("@;", 1, 0); i += 2; continue;
+        }
+        return nullptr;  // @[ @{ @< (box/tag/magic, needs Formatting_gen): fall back
+      }
       if (ch != '%') { run += ch; ++i; continue; }
       // a '%' directive: flush any pending literal run first
       ++i;  // past '%'
