@@ -617,6 +617,19 @@ struct Translator {
   // Compile a match into an if-chain (int constants + catch-all) or a bool if;
   // other forms (variant tags, nested patterns, guards) fall back best-effort.
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases) {
+    // A non-variable scrutinee with a `| n -> ...` catch-all is bound to n first
+    // (`let n = scrut in ...`), so n refers to it inside the arms (matches ocamlc).
+    if (scrut->k != Lam::K::Var)
+      for (auto& c : cases)
+        if (!c.guard)
+          if (auto* pv = std::get_if<Ppat_var>(&c.lhs.desc)) {
+            Ident nid = fresh(pv->name.txt);
+            scope.back()[pv->name.txt] = nid;
+            auto v = mk(Lam::K::Var); v->var = nid;
+            auto body = compile_match(v, cases);
+            auto l = mk(Lam::K::Let); l->bindings = {{nid, ValueKind::Gen, scrut}}; l->body = body;
+            return l;
+          }
     if (cases.size() == 2 && !cases[0].guard && !cases[1].guard) {
       std::string a = ctor_of(cases[0].lhs), b = ctor_of(cases[1].lhs);
       if ((a == "true" && b == "false") || (a == "false" && b == "true")) {
@@ -656,10 +669,19 @@ struct Translator {
     sw->sw_consts = std::move(arms);
     return sw;
   }
+  // A catch-all `n -> ...` binds n to the scrutinee (which, for a var scrutinee,
+  // is just an alias to its binder).
+  void bind_catchall(const Pattern& p, const LamPtr& scrut) {
+    if (auto* pv = std::get_if<Ppat_var>(&p.desc))
+      if (scrut->k == Lam::K::Var) scope.back()[pv->name.txt] = scrut->var;
+  }
   LamPtr int_cases(const LamPtr& scrut, const std::vector<Case>& cases, size_t i) {
     if (i >= cases.size()) return cint(0);
     const Case& c = cases[i];
-    if (!c.guard && (is_catchall(c.lhs) || i + 1 == cases.size())) return expr(*c.rhs);
+    if (!c.guard && (is_catchall(c.lhs) || i + 1 == cases.size())) {
+      bind_catchall(c.lhs, scrut);
+      return expr(*c.rhs);
+    }
     if (!c.guard)
       if (auto* pc = std::get_if<Ppat_constant>(&c.lhs.desc))
         if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
@@ -978,8 +1000,17 @@ struct Translator {
       }
     auto rk = vk.fn_ret.find(&f);
     l->ret_kind = rk == vk.fn_ret.end() ? ValueKind::Gen : vkind(rk->second);
-    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) l->body = expr(*fb->e);
-    else l->body = mk(Lam::K::ConstInt);  // function-cases: defer
+    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
+      l->body = expr(*fb->e);
+    } else if (auto* fc = std::get_if<Pfunction_cases>(&f.body->v)) {
+      // `function P -> ...` adds an implicit final parameter matched on.
+      Ident pid = fresh("param");
+      l->params.push_back({pid, ValueKind::Gen});
+      auto scrut = mk(Lam::K::Var); scrut->var = pid;
+      l->body = compile_match(scrut, fc->cases);
+    } else {
+      l->body = mk(Lam::K::ConstInt);
+    }
     scope.pop_back();
     return l;
   }
