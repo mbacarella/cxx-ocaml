@@ -1671,7 +1671,8 @@ static std::string kind_str(const TypePtr& t0, const std::set<std::string>& imm)
   if (t->kind != I::Type::Kind::Constr) return "";
   auto d = t->path.rfind('.');
   std::string b = d == std::string::npos ? t->path : t->path.substr(d + 1);
-  if (b == "int" || b == "char" || b == "bool") return "int";  // immediates
+  if (b == "int" || b == "char" || b == "bool" || b == "unit")
+    return "int";  // immediates (unit is the immediate 0)
   if (imm.count(t->path)) return "int";  // all-constant local variant
   if (b == "float") return "float";
   if (b == "int32") return "int32";

@@ -486,6 +486,14 @@ struct Translator {
     }
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return function(*f);
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
+      // `let _ = e in body` discards e -> seq, not a binding.
+      if (le->bindings.size() == 1 &&
+          std::holds_alternative<Ppat_any>(le->bindings[0].pat.desc)) {
+        auto sq = mk(Lam::K::Sequence);
+        sq->cond = expr(*le->bindings[0].expr);
+        sq->else_ = expr(*le->body);
+        return sq;
+      }
       scope.emplace_back();
       auto l = mk(Lam::K::Let);
       for (auto& b : le->bindings) {
@@ -494,8 +502,8 @@ struct Translator {
           Lam::Binding bd{id, pat_kind(&b.pat), expr(*b.expr)};
           l->bindings.push_back(std::move(bd));
           scope.back()[pv->name.txt] = id;
-        } else {
-          expr(*b.expr);  // unsupported pattern: best-effort
+        } else {  // `let () = e in ...` and other refutable patterns: *match* temp
+          l->bindings.push_back({fresh("", true), ValueKind::Gen, expr(*b.expr)});
         }
       }
       l->body = expr(*le->body);
