@@ -71,6 +71,9 @@ struct TypeExpr {
 struct SigValue {
   std::string name;
   TypePtr type;
+  // For a Val_prim value (`external x = "%op"` / C primitive), its prim_name
+  // (e.g. "%compare", "caml_format_int"); empty for an ordinary Val_reg value.
+  std::string prim;
 };
 
 // label_declaration / constructor_declaration (typing/types.mli).

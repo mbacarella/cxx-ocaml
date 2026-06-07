@@ -48,6 +48,15 @@ public:
               if (vd.fields.size() > 1 &&
                   arena_[vd.fields[1]].kind == m::Value::Kind::Int)
                 out.fields.push_back(sv.name);
+              else if (vd.fields.size() > 1) {
+                // Val_prim of Primitive.description: tag-0 block whose field 0 is
+                // the description record; its field 0 is prim_name ("%op"/C name).
+                const m::Value& vk = arena_[vd.fields[1]];
+                if (!vk.fields.empty()) {
+                  const m::Value& desc = arena_[vk.fields[0]];
+                  if (!desc.fields.empty()) sv.prim = arena_[desc.fields[0]].str;
+                }
+              }
               out.values.push_back(std::move(sv));
             }
             break;
