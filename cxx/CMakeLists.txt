@@ -23,7 +23,8 @@ add_library(cppcaml_core
   src/typer.cpp
   src/typedtree_print.cpp
   src/infer.cpp
-  src/infer_check.cpp)
+  src/infer_check.cpp
+  src/lambda.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 
 # Stage tools.
@@ -41,3 +42,6 @@ target_link_libraries(c++type PRIVATE cppcaml_core)
 
 add_executable(c++infer-test src/tools/cppinfer_test.cpp)
 target_link_libraries(c++infer-test PRIVATE cppcaml_core)
+
+add_executable(c++lambda src/tools/cpplambda_main.cpp)
+target_link_libraries(c++lambda PRIVATE cppcaml_core)
