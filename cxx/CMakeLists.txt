@@ -26,7 +26,9 @@ add_library(cppcaml_core
   src/infer_check.cpp
   src/lambda.cpp
   src/bytecode.cpp
-  src/cmo.cpp)
+  src/omarshal.cpp
+  src/cmo.cpp
+  src/link.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 
 # Stage tools.
@@ -53,3 +55,6 @@ target_link_libraries(c++instr PRIVATE cppcaml_core)
 
 add_executable(c++cmo src/tools/cppcmo_main.cpp)
 target_link_libraries(c++cmo PRIVATE cppcaml_core)
+
+add_executable(c++link src/tools/cpplink_main.cpp)
+target_link_libraries(c++link PRIVATE cppcaml_core)

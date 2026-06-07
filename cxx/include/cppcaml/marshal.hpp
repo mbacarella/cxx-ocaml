@@ -29,12 +29,17 @@ struct Value {
   enum class Kind { Int, String, Double, Block, DoubleArray };
   Kind kind = Kind::Int;
 
-  long long i = 0;              // Int
+  long long i = 0;              // Int (scalar boxed ints decode to Int too)
   std::string str;             // String (raw bytes, may contain NULs)
   double d = 0.0;              // Double
   unsigned tag = 0;            // Block tag
   std::vector<std::size_t> fields;  // Block: arena ids of fields, in order
   std::vector<double> darr;    // DoubleArray
+  // A scalar boxed-int custom (int32/int64/nativeint) decodes to an Int for the
+  // type reader, but also keeps its verbatim on-disk bytes so the linker can
+  // round-trip the boxed value into the DATA section unchanged.
+  std::string custom_raw;
+  int custom_bsize = 0;        // in-memory data size in bytes
 };
 
 struct Error : std::runtime_error {

@@ -1,4 +1,6 @@
 #include "cppcaml/marshal.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 #include <cstring>
 
@@ -179,29 +181,46 @@ private:
     return objs_[objs_.size() - dist];
   }
 
-  std::size_t read_custom() {
-    // Custom blocks begin with a NUL-terminated identifier ("_i" int32,
-    // "_j" int64, "_n" nativeint, "_bigarray", ...).  Signatures don't contain
-    // these, so decode the common scalars and reject the rest loudly.
+  std::size_t read_custom(int code, std::size_t start) {
+    // Custom blocks begin with a NUL-terminated identifier ("_i" int32, "_j"
+    // int64, "_n" nativeint, BLAKE128 digests, ...).  CODE_CUSTOM_LEN carries
+    // the serialized data length (sz_32 + sz_64) before the payload.  We keep
+    // the verbatim on-disk bytes (from the code byte) so the value round-trips
+    // through the linker's DATA section unchanged.
     std::string id;
     for (;;) {
       char c = static_cast<char>(u8());
       if (c == '\0') break;
       id.push_back(c);
     }
-    if (id == "_i") {  // int32
-      std::int32_t v = static_cast<std::int32_t>(u32());
-      std::size_t r = mk_int(v);
-      objs_.push_back(r);
-      return r;
+    long long bsize = 0;       // in-memory data size in bytes
+    long long val = 0;         // decoded scalar value (int32/64/nativeint)
+    bool scalar = true;
+    if (code == CODE_CUSTOM_LEN) { u32(); bsize = (long long)u64(); }
+    if (id == "_i") { val = (std::int32_t)u32(); bsize = 4; }   // int32 (FIXED)
+    else if (id == "_j") { val = (std::int64_t)u64(); bsize = 8; }  // int64 (FIXED)
+    else if (id == "_n") {                           // nativeint (LEN): tag + value
+      int t = u8(); val = (t == 1) ? (long long)(std::int32_t)u32() : (long long)(std::int64_t)u64();
+      bsize = 8;
+    } else if (code == CODE_CUSTOM_LEN) {            // unknown (e.g. a digest)
+      scalar = false;
+      for (long long k = 0; k < bsize; ++k) u8();
+    } else {
+      throw Error("marshal: unsupported custom block '" + id + "'");
     }
-    if (id == "_j") {  // int64
-      std::int64_t v = static_cast<std::int64_t>(u64());
-      std::size_t r = mk_int(v);
-      objs_.push_back(r);
-      return r;
+    Value v;
+    if (scalar) {  // int32/int64/nativeint: an Int for the reader, raw for the linker
+      v.kind = Value::Kind::Int;
+      v.i = val;
+      v.custom_raw.assign(reinterpret_cast<const char*>(data_ + start), pos_ - start);
+      v.custom_bsize = (int)bsize;
+    } else {       // a digest etc.: opaque payload bytes
+      v.kind = Value::Kind::String;
+      v.str.assign(reinterpret_cast<const char*>(data_ + start), pos_ - start);
     }
-    throw Error("marshal: unsupported custom block '" + id + "'");
+    std::size_t r = arena_.push(std::move(v));
+    objs_.push_back(r);
+    return r;
   }
 
   std::size_t read_value() {
@@ -248,7 +267,7 @@ private:
       case CODE_CUSTOM_LEN:
       case CODE_CUSTOM_FIXED:
       case OLD_CODE_CUSTOM:
-        return read_custom();
+        return read_custom(code, pos_ - 1);
       case CODE_CODEPOINTER:
       case CODE_INFIXPOINTER:
         throw Error("marshal: code/infix pointer unsupported");

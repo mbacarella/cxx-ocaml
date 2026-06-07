@@ -3,6 +3,7 @@
 // peephole pass) plus a minimal OCaml Marshal *writer* for the
 // Cmo_format.compilation_unit descriptor.
 #include "cppcaml/cmo.hpp"
+#include "cppcaml/omarshal.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -47,27 +48,11 @@ enum OP {
   RESUMETERM, REPERFORMTERM
 };
 
-// ---- a minimal OCaml value model for marshaling ----
-struct Value;
-using ValPtr = std::shared_ptr<Value>;
-struct Value {
-  enum K { Int, Str, Dbl, Block } k;
-  long long i = 0;
-  std::string s;
-  double d = 0;
-  int tag = 0;
-  std::vector<ValPtr> fields;
-};
-ValPtr vint(long long n) { auto v = std::make_shared<Value>(); v->k = Value::Int; v->i = n; return v; }
-ValPtr vstr(std::string s) { auto v = std::make_shared<Value>(); v->k = Value::Str; v->s = std::move(s); return v; }
-ValPtr vblock(int tag, std::vector<ValPtr> f) {
-  auto v = std::make_shared<Value>(); v->k = Value::Block; v->tag = tag; v->fields = std::move(f); return v;
-}
-ValPtr vlist(const std::vector<ValPtr>& xs) {  // OCaml list: cons = block tag 0 [hd;tl], [] = int 0
-  ValPtr acc = vint(0);
-  for (auto it = xs.rbegin(); it != xs.rend(); ++it) acc = vblock(0, {*it, acc});
-  return acc;
-}
+using omarshal::ValPtr;
+using omarshal::vint;
+using omarshal::vstr;
+using omarshal::vblock;
+using omarshal::vlist;
 
 // The structured constant carried by a Reloc_literal.
 ValPtr const_value(const LamPtr& c) {
@@ -75,9 +60,7 @@ ValPtr const_value(const LamPtr& c) {
     case Lam::K::ConstInt: return vint(c->int_val);
     case Lam::K::ConstChar: return vint(c->int_val);
     case Lam::K::ConstString: return vstr(c->str_val);
-    case Lam::K::ConstFloat: {
-      auto v = std::make_shared<Value>(); v->k = Value::Dbl; v->d = std::stod(c->str_val); return v;
-    }
+    case Lam::K::ConstFloat: return omarshal::vdbl(std::stod(c->str_val));
     case Lam::K::ConstBlock: {
       std::vector<ValPtr> fs;
       for (auto& a : c->args) fs.push_back(const_value(a));
@@ -86,66 +69,6 @@ ValPtr const_value(const LamPtr& c) {
     default: return vint(0);
   }
 }
-
-// ---- Marshal writer (runtime/caml/intext.h) ----
-struct Marshaler {
-  std::vector<std::uint8_t> body;
-  long long nobjs = 0, w32 = 0, w64 = 0;
-  void byte(int b) { body.push_back((std::uint8_t)b); }
-  void be32(std::uint32_t n) { byte(n >> 24); byte(n >> 16); byte(n >> 8); byte(n); }
-  void emit_int(long long n) {
-    if (n >= 0 && n < 0x40) byte(0x40 | (int)n);
-    else if (n >= -128 && n < 128) { byte(0x0); byte((int)n & 0xFF); }
-    else if (n >= -32768 && n < 32768) { byte(0x1); byte(n >> 8); byte(n); }
-    else if (n >= -(1LL << 31) && n < (1LL << 31)) { byte(0x2); be32((std::uint32_t)n); }
-    else { byte(0x3); for (int s = 56; s >= 0; s -= 8) byte(n >> s); }
-  }
-  void emit_str(const std::string& s) {
-    size_t len = s.size();
-    if (len < 0x20) byte(0x20 | (int)len);
-    else if (len < 256) { byte(0x9); byte((int)len); }
-    else { byte(0xA); be32((std::uint32_t)len); }
-    for (char c : s) byte((std::uint8_t)c);
-    nobjs++;
-    w64 += 1 + (len / 8 + 1);
-    w32 += 1 + (len / 4 + 1);
-  }
-  void emit(const ValPtr& v) {
-    switch (v->k) {
-      case Value::Int: emit_int(v->i); return;
-      case Value::Str: emit_str(v->s); return;
-      case Value::Dbl: {
-        byte(0xC);  // CODE_DOUBLE_LITTLE (x86)
-        std::uint64_t bits; std::memcpy(&bits, &v->d, 8);
-        for (int s = 0; s < 64; s += 8) byte(bits >> s);
-        nobjs++; w64 += 2; w32 += 3;
-        return;
-      }
-      case Value::Block: {
-        int size = (int)v->fields.size();
-        if (size == 0) { byte(0x80 | v->tag); return; }  // atom (not counted)
-        if (v->tag < 16 && size < 8) byte(0x80 | v->tag | (size << 4));
-        else { byte(0x8); be32(((std::uint32_t)size << 10) | (std::uint32_t)v->tag); }
-        nobjs++; w64 += 1 + size; w32 += 1 + size;
-        for (auto& f : v->fields) emit(f);
-        return;
-      }
-    }
-  }
-  // Full marshaled blob: 20-byte small header + body.
-  std::vector<std::uint8_t> finish(const ValPtr& root) {
-    emit(root);
-    std::vector<std::uint8_t> out;
-    auto be = [&](std::uint32_t n) { out.push_back(n >> 24); out.push_back(n >> 16); out.push_back(n >> 8); out.push_back(n); };
-    be(0x8495A6BE);
-    be((std::uint32_t)body.size());
-    be((std::uint32_t)nobjs);
-    be((std::uint32_t)w32);
-    be((std::uint32_t)w64);
-    out.insert(out.end(), body.begin(), body.end());
-    return out;
-  }
-};
 
 // ---- relocations ----
 struct Reloc {
@@ -433,8 +356,7 @@ void write_cmo(const bytecode::Code& code, const std::string& module_name,
       vint(0),                    // cu_hint
       vint(0),                    // cu_hintsize
   });
-  Marshaler m;
-  std::vector<std::uint8_t> cu_bytes = m.finish(compunit);
+  std::vector<std::uint8_t> cu_bytes = omarshal::marshal(compunit);
 
   // --- assemble the .cmo ---
   std::vector<std::uint8_t> out;
