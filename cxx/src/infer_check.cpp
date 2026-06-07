@@ -474,11 +474,16 @@ struct Checker {
     ctors["true"] = eng.constr("bool");
     ctors["false"] = eng.constr("bool");
     ctors["()"] = eng.constr("unit");
-    predef_ctors_ = {"[]", "::", "None", "Some", "true", "false", "()"};
+    // result (predefined since 4.03): Ok of 'a / Error of 'b : ('a,'b) result.
+    auto rok = generic_var(), rerr = generic_var();
+    ctors["Ok"] = eng.arrow(rok, eng.constr("result", {rok, rerr}));
+    ctors["Error"] = eng.arrow(rerr, eng.constr("result", {rok, rerr}));
+    predef_ctors_ = {"[]", "::", "None", "Some", "true", "false", "()", "Ok", "Error"};
     type_ctors["bool"] = {"false", "true"};
     type_ctors["option"] = {"None", "Some"};
     type_ctors["list"] = {"[]", "::"};
     type_ctors["unit"] = {"()"};
+    type_ctors["result"] = {"Ok", "Error"};
   }
 
   // Collect the type-variable names in a core type.  Sets `uncertain` when a
