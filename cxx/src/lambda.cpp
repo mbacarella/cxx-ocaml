@@ -249,12 +249,30 @@ struct Translator {
   int stamp = 300;  // arbitrary; normalized on print
   std::vector<std::unordered_map<std::string, Ident>> scope{{}};
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
+  // module name ("List", "Printf", ...) -> its value -> field index, cached.
+  std::unordered_map<std::string, std::unordered_map<std::string, int>> mod_fields;
 
-  // (field_imm N (global Stdlib!)) for a Stdlib value.
-  LamPtr stdlib_field(int idx) {
-    auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = "Stdlib";
+  // (field_imm N (global G!)) for a value at field idx of global module G.
+  LamPtr field_of(const std::string& global, int idx) {
+    auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = global;
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = idx; f->args = {g};
     return f;
+  }
+  // Field map of a stdlib (sub)module; empty if not a loadable stdlib module.
+  const std::unordered_map<std::string, int>& fields_of(const std::string& mod) {
+    auto it = mod_fields.find(mod);
+    if (it != mod_fields.end()) return it->second;
+    std::unordered_map<std::string, int> m;
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? "stdlib/stdlib.cmi"
+                                                     : "stdlib/stdlib__" + mod + ".cmi");
+      int i = 0;
+      for (auto& f : cmi.sig().fields) m[f] = i++;
+    } catch (...) {}
+    return mod_fields[mod] = std::move(m);
+  }
+  static std::string global_of(const std::string& mod) {
+    return mod == "Stdlib" ? "Stdlib" : "Stdlib__" + mod;
   }
 
   Ident fresh(const std::string& name, bool temp = false) { return Ident{name, stamp++, temp}; }
@@ -284,15 +302,15 @@ struct Translator {
       if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
         auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
-        if (sf != stdlib_fields.end()) return stdlib_field(sf->second);
+        if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
       }
-      // Stdlib.x explicitly qualified
+      // Qualified M.x where M is a stdlib (sub)module: field of Stdlib[__M].
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
-        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
-          if (pl->name == "Stdlib") {
-            auto sf = stdlib_fields.find(d->name);
-            if (sf != stdlib_fields.end()) return stdlib_field(sf->second);
-          }
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+          auto& fm = fields_of(pl->name);
+          auto sf = fm.find(d->name);
+          if (sf != fm.end()) return field_of(global_of(pl->name), sf->second);
+        }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + lid_last(id->id.txt));  // unresolved (will DIFF)
       return v;
     }
