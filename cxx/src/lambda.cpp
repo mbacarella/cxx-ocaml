@@ -41,7 +41,9 @@ DocP box(BoxT bt, int off, std::vector<DocP> ch) {
   auto d = std::make_shared<Doc>(); d->t = Doc::Box; d->bt = bt; d->off = off; d->ch = std::move(ch); return d;
 }
 
-constexpr int MARGIN = 78;
+// OCaml's pretty-printer wraps a box whose flat width would reach 78 columns, so
+// the effective fit threshold (pp_space_left at column 0) is 77.
+constexpr int MARGIN = 77;
 
 int flatw(const DocP& d) {
   if (d->t == Doc::Text || d->t == Doc::Break) return (int)d->s.size();
@@ -90,7 +92,8 @@ struct Render {
     // Box: resolve to "fits" if the whole box fits the remaining width.
     bool fits = flatw(d) <= MARGIN - col;
     BoxT ty = d->bt;
-    int open_indent = col + d->off;  // break indent and Pp_box threshold
+    int box_col = col;               // column where this box opens (margin - width)
+    int brk_indent = box_col + d->off;  // where a forced newline lands
     for (auto& c : d->ch) {
       if (c->t == Doc::Text) { emit(c->s); }
       else if (c->t == Doc::Box) { go(c); }
@@ -103,13 +106,15 @@ struct Render {
           case BoxT::V: nl = true; break;
           case BoxT::Hv: nl = true; break;
           case BoxT::Hov: nl = c->bsize > MARGIN - col; break;
-          default:  // Pp_box (the @[<n>] default)
+          default:  // Pp_box (the @[<n>] default): format.ml's Pp_box rule.
+            // pp_current_indent here is the CURRENT LINE's indent (updated only
+            // on a newline), not the running column -- so we test cur_indent.
             if (is_new_line) nl = false;
             else if (c->bsize > MARGIN - col) nl = true;
-            else nl = cur_indent > open_indent;
+            else nl = cur_indent > brk_indent;  // > pp_margin - width + off
             break;
         }
-        if (nl) newline(open_indent);
+        if (nl) newline(brk_indent);
         else emit(c->s);
       }
     }
@@ -544,9 +549,20 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     int i = 0;
     for (auto& f : cmi.sig().fields) t.stdlib_fields[f] = i++;
   } catch (...) {}
-  auto root = mk(Lam::K::Let);
-  std::vector<LamPtr> exports;  // export expressions (a var, or an alias target)
+  // The module body is a sequence of segments: consecutive value bindings group
+  // into one `let`; a discarded computation (`let _ = e` or a bare `e;;`) becomes
+  // a `seq` that splits the surrounding groups and wraps the continuation.
+  struct Seg { bool seq; std::vector<Lam::Binding> binds; LamPtr e; };
+  std::vector<Seg> segs;
+  std::vector<Lam::Binding> cur;  // accumulating let group
+  std::vector<LamPtr> exports;    // exported values, in declaration order
+  auto flush = [&] { if (!cur.empty()) segs.push_back({false, std::move(cur), nullptr}), cur.clear(); };
   for (auto& it : s) {
+    if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
+      flush();
+      segs.push_back({true, {}, t.expr(*pe->e)});
+      continue;
+    }
     auto* sv = std::get_if<Pstr_value>(&it.desc);
     if (!sv) continue;
     for (auto& b : sv->bindings) {
@@ -560,24 +576,38 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
               continue;
             }
         Ident id = t.fresh(pv->name.txt);
-        root->bindings.push_back({id, t.pat_kind(&b.pat), t.expr(*b.expr)});
+        cur.push_back({id, t.pat_kind(&b.pat), t.expr(*b.expr)});
         t.scope.back()[pv->name.txt] = id;
         auto v = mk(Lam::K::Var); v->var = id; exports.push_back(v);
+      } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {
+        // `let _ = e`: the value is discarded -> seq, not a binding.
+        flush();
+        segs.push_back({true, {}, t.expr(*b.expr)});
       } else {
-        // `let () = e` / `let _ = e`: a *match* temp, not exported.
+        // `let () = e` (and other refutable patterns): a *match* temp binding.
         Ident tmp = t.fresh("", true);
-        root->bindings.push_back({tmp, ValueKind::Gen, t.expr(*b.expr)});
+        cur.push_back({tmp, ValueKind::Gen, t.expr(*b.expr)});
       }
     }
   }
+  flush();
+
   auto block = mk(Lam::K::Prim);
   block->prim = Prim::Makeblock; block->prim_arg = 0;
   block->args = std::move(exports);
-  root->body = block;
+
+  LamPtr acc = block;
+  for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+    if (it->seq) {
+      auto sq = mk(Lam::K::Sequence); sq->cond = it->e; sq->else_ = acc; acc = sq;
+    } else {
+      auto l = mk(Lam::K::Let); l->bindings = std::move(it->binds); l->body = acc; acc = l;
+    }
+  }
 
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
-  sg->args.push_back(root->bindings.empty() ? block : root);
+  sg->args.push_back(acc);
   return sg;
 }
 
