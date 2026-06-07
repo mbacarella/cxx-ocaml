@@ -107,6 +107,10 @@ struct Checker {
   bool record_kinds_ = false;
   std::unordered_map<const Pattern*, TypePtr> rec_pat_;
   std::unordered_map<const void*, TypePtr> rec_ret_;
+  // Local variant types whose constructors are all constant (nullary): these have
+  // an immediate (int) runtime representation, so a value of such a type gets the
+  // [int] value kind in the Lambda dump.
+  std::set<std::string> immediate_types_;
   // record fields with a UNIQUE label across all record types: label -> generic
   // scheme arrow(recordType, fieldType).  Ambiguous labels are omitted (type-
   // directed disambiguation needed) and left to Any, so this can't pick wrong.
@@ -621,8 +625,14 @@ struct Checker {
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;
     std::vector<std::string> names;
-    bool is_gadt = false;
-    for (auto& c : v->ctors) { names.push_back(c.name.txt); if (c.res) is_gadt = true; }
+    bool is_gadt = false, all_const = !v->ctors.empty();
+    for (auto& c : v->ctors) {
+      names.push_back(c.name.txt);
+      if (c.res) is_gadt = true;
+      auto* tup = std::get_if<Pcstr_tuple>(&c.args);
+      if (!tup || !tup->elems.empty()) all_const = false;  // a block constructor
+    }
+    if (all_const && !is_gadt) immediate_types_.insert(d.name.txt);
     if (is_gadt) {
       gadt_types.insert(d.name.txt);
       for (auto& c : v->ctors) gadt_ctors.insert(c.name.txt);
@@ -1656,12 +1666,13 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
 }
 
 // The Lambda value_kind of an inferred type, as -dlambda spells it.
-static std::string kind_str(const TypePtr& t0) {
+static std::string kind_str(const TypePtr& t0, const std::set<std::string>& imm) {
   TypePtr t = I::Engine::repr(t0);
   if (t->kind != I::Type::Kind::Constr) return "";
   auto d = t->path.rfind('.');
   std::string b = d == std::string::npos ? t->path : t->path.substr(d + 1);
   if (b == "int" || b == "char" || b == "bool") return "int";  // immediates
+  if (imm.count(t->path)) return "int";  // all-constant local variant
   if (b == "float") return "float";
   if (b == "int32") return "int32";
   if (b == "int64") return "int64";
@@ -1674,8 +1685,8 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   ck.record_kinds_ = true;
   run_checker(ck, s);
   ValueKinds vk;
-  for (auto& [p, t] : ck.rec_pat_) vk.pat[p] = kind_str(t);
-  for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t);
+  for (auto& [p, t] : ck.rec_pat_) vk.pat[p] = kind_str(t, ck.immediate_types_);
+  for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck.immediate_types_);
   return vk;
 }
 

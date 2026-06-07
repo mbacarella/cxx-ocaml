@@ -1,5 +1,6 @@
 #include "cppcaml/lambda.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <ostream>
 #include <sstream>
@@ -95,7 +96,8 @@ struct Render {
       else if (c->t == Doc::Box) { go(c); }
       else {  // Break (separator c->s, offset 0 for our `@ ` breaks)
         bool nl;
-        if (fits) nl = false;
+        if (ty == BoxT::V) nl = true;  // vbox is never collapsed to "fits"
+        else if (fits) nl = false;
         else switch (ty) {
           case BoxT::H: nl = false; break;
           case BoxT::V: nl = true; break;
@@ -218,6 +220,25 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
     case Lam::K::Sequence:
       return box(BoxT::Box, 2, {text("(seq"), brk(), to_doc(l->cond, pr), brk(),
                                 to_doc(l->else_, pr), text(")")});
+    case Lam::K::Switch: {
+      // @[<1>(switch* larg@ @[<v 0> @[<hv 1>case int N:@ body@] @ ... @])@]
+      std::vector<DocP> cases;
+      bool spc = false;
+      auto add = [&](const std::string& kind, int tag, const LamPtr& body) {
+        if (spc) cases.push_back(brk()); else spc = true;
+        cases.push_back(box(BoxT::Hv, 1,
+            {text("case " + kind + " " + std::to_string(tag) + ":"), brk(), to_doc(body, pr)}));
+      };
+      for (auto& c : l->sw_consts) add("int", c.tag, c.body);
+      for (auto& c : l->sw_blocks) add("tag", c.tag, c.body);
+      if (l->sw_default) {
+        if (spc) cases.push_back(brk()); else spc = true;
+        cases.push_back(box(BoxT::Hv, 1, {text("default:"), brk(), to_doc(l->sw_default, pr)}));
+      }
+      std::string head = l->sw_default ? "(switch " : "(switch* ";
+      return box(BoxT::Box, 1, {text(head), to_doc(l->cond, pr), brk(),
+                                box(BoxT::V, 0, std::move(cases)), text(")")});
+    }
   }
   return text("?");
 }
@@ -258,6 +279,29 @@ struct Translator {
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
   // module name ("List", "Printf", ...) -> its value -> field index, cached.
   std::unordered_map<std::string, std::unordered_map<std::string, int>> mod_fields;
+
+  // Locally-declared variant constructors: name -> {owning type, tag, is_block}.
+  // Constant (nullary) and block (with-args) constructors are numbered
+  // separately from 0 in declaration order, matching the runtime representation.
+  struct CtorInfo { std::string type; int tag; bool is_block; };
+  std::unordered_map<std::string, CtorInfo> ctor_info_;
+  std::unordered_map<std::string, std::pair<int, int>> type_ctors_;  // type -> (n_const, n_block)
+
+  void register_types(const Structure& s) {
+    for (auto& item : s)
+      if (auto* td = std::get_if<Pstr_type>(&item.desc))
+        for (auto& d : td->decls)
+          if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+            int nc = 0, nb = 0;
+            for (auto& c : v->ctors) {
+              bool block = true;
+              if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) block = !t->elems.empty();
+              ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block};
+              if (block) ++nb; else ++nc;
+            }
+            type_ctors_[d.name.txt] = {nc, nb};
+          }
+  }
 
   // (field_imm N (global G!)) for a value at field idx of global module G.
   LamPtr field_of(const std::string& global, int idx) {
@@ -319,8 +363,75 @@ struct Translator {
     return b;
   }
 
+  LamPtr cint(long long n) { auto z = mk(Lam::K::ConstInt); z->int_val = n; return z; }
+  static bool is_catchall(const Pattern& p) {
+    return std::holds_alternative<Ppat_any>(p.desc) || std::holds_alternative<Ppat_var>(p.desc);
+  }
+  static std::string ctor_of(const Pattern& p) {
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc)) return lid_last(k->id.txt);
+    return "";
+  }
+  // Compile a match into an if-chain (int constants + catch-all) or a bool if;
+  // other forms (variant tags, nested patterns, guards) fall back best-effort.
+  LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases) {
+    if (cases.size() == 2 && !cases[0].guard && !cases[1].guard) {
+      std::string a = ctor_of(cases[0].lhs), b = ctor_of(cases[1].lhs);
+      if ((a == "true" && b == "false") || (a == "false" && b == "true")) {
+        auto i = mk(Lam::K::IfThenElse);
+        i->cond = scrut;
+        i->then_ = expr(*(a == "true" ? cases[0] : cases[1]).rhs);
+        i->else_ = expr(*(a == "false" ? cases[0] : cases[1]).rhs);
+        return i;
+      }
+    }
+    if (auto sw = const_switch(scrut, cases)) return sw;
+    return int_cases(scrut, cases, 0);
+  }
+
+  // Exhaustive match over a purely-constant variant type -> (switch* ...).
+  LamPtr const_switch(const LamPtr& scrut, const std::vector<Case>& cases) {
+    std::string type;
+    std::vector<Lam::SwitchCase> arms;
+    for (auto& c : cases) {
+      if (c.guard) return nullptr;
+      auto it = ctor_info_.find(ctor_of(c.lhs));
+      if (it == ctor_info_.end() || it->second.is_block) return nullptr;
+      auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
+      if (k && k->arg) return nullptr;  // constant ctor must take no argument
+      if (type.empty()) type = it->second.type;
+      else if (type != it->second.type) return nullptr;
+      arms.push_back({it->second.tag, expr(*c.rhs)});
+    }
+    auto t = type_ctors_.find(type);
+    if (t == type_ctors_.end() || t->second.second != 0 ||
+        (int)arms.size() != t->second.first)
+      return nullptr;  // not exhaustive over a constant-only type
+    std::sort(arms.begin(), arms.end(),
+              [](auto& x, auto& y) { return x.tag < y.tag; });
+    auto sw = mk(Lam::K::Switch);
+    sw->cond = scrut;
+    sw->sw_consts = std::move(arms);
+    return sw;
+  }
+  LamPtr int_cases(const LamPtr& scrut, const std::vector<Case>& cases, size_t i) {
+    if (i >= cases.size()) return cint(0);
+    const Case& c = cases[i];
+    if (!c.guard && (is_catchall(c.lhs) || i + 1 == cases.size())) return expr(*c.rhs);
+    if (!c.guard)
+      if (auto* pc = std::get_if<Ppat_constant>(&c.lhs.desc))
+        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
+          auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
+          ne->args = {scrut, cint(std::stoll(pi->value))};
+          auto iff = mk(Lam::K::IfThenElse);
+          iff->cond = ne; iff->then_ = int_cases(scrut, cases, i + 1); iff->else_ = expr(*c.rhs);
+          return iff;
+        }
+    return expr(*c.rhs);  // unsupported pattern: best-effort
+  }
+
   LamPtr expr(const Expression& e) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return translate_const(c->c);
+    if (auto* m = std::get_if<Pexp_match>(&e.desc)) return compile_match(expr(*m->e), m->cases);
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
       for (auto& el : tu->elems) es.push_back(expr(*el));
@@ -427,6 +538,7 @@ struct Translator {
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name) {
   Translator t;
   t.vk = infer_value_kinds(s);
+  t.register_types(s);
   try {  // Stdlib value -> module field index, for pervasive resolution
     auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
     int i = 0;

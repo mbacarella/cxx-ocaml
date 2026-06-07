@@ -47,7 +47,7 @@ enum class Prim {
 
 struct Lam {
   enum class K { Var, ConstInt, ConstFloat, ConstString, ConstBlock, Apply,
-                 Function, Let, Prim, IfThenElse, Sequence };
+                 Function, Let, Prim, IfThenElse, Sequence, Switch };
   K k;
 
   Ident var;                       // Var
@@ -73,6 +73,12 @@ struct Lam {
 
   // IfThenElse
   LamPtr cond, then_, else_;
+
+  // Switch (Lswitch): scrutinee in `cond`; integer-constant and block-tag arms;
+  // sw_default null => exhaustive (printed "switch*"), else "switch".
+  struct SwitchCase { int tag; LamPtr body; };
+  std::vector<SwitchCase> sw_consts, sw_blocks;
+  LamPtr sw_default;
 };
 
 // Translate a structure into the module's Lambda term (the setglobal form).
