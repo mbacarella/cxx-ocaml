@@ -35,4 +35,13 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
 // false-rejection rate over oracle-accepted files measures engine completeness.
 std::vector<std::string> structure_typecheck(const ast::Structure& s);
 
+// For the Lambda back end: inferred value kinds (Lambda's value_kind, as a
+// short string "int"/"float"/"int32"/"int64"/"nativeint", or "" for generic),
+// keyed by the let/parameter pattern, and by function node for its return kind.
+struct ValueKinds {
+  std::unordered_map<const ast::Pattern*, std::string> pat;
+  std::unordered_map<const void*, std::string> fn_ret;  // keyed by Pexp_function*
+};
+ValueKinds infer_value_kinds(const ast::Structure& s);
+
 }  // namespace cppcaml

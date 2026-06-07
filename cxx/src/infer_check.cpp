@@ -101,6 +101,12 @@ struct Checker {
   // so we keep them unknown rather than resolve to the wrong kind.
   std::set<std::string> predef_ctors_;
   std::set<std::string> exn_ctors_;
+  // For the Lambda back end: record inferred types of let/param patterns and
+  // function bodies, so value kinds can be read off after inference (additive;
+  // off by default so the soundness/completeness passes are unaffected).
+  bool record_kinds_ = false;
+  std::unordered_map<const Pattern*, TypePtr> rec_pat_;
+  std::unordered_map<const void*, TypePtr> rec_ret_;
   // record fields with a UNIQUE label across all record types: label -> generic
   // scheme arrow(recordType, fieldType).  Ambiguous labels are omitted (type-
   // directed disambiguation needed) and left to Any, so this can't pick wrong.
@@ -853,6 +859,7 @@ struct Checker {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
       auto t = eng.fresh_var();
       venv.back()[v->name.txt] = t;  // monomorphic in its scope
+      if (record_kinds_) rec_pat_[&p] = t;
       return t;
     }
     if (std::holds_alternative<Ppat_any>(p.desc)) return eng.fresh_var();
@@ -1246,6 +1253,7 @@ struct Checker {
       params.push_back({arg, 0, ""});
       body = rt;
     }
+    if (record_kinds_) rec_ret_[&f] = body;
     TypePtr t = body;
     for (auto it = params.rbegin(); it != params.rend(); ++it)
       t = eng.arrow(it->ty, t, it->lk, it->nm);
@@ -1476,6 +1484,7 @@ struct Checker {
   // Bind a let pattern's variables to a (generalized) type.
   void bind_pattern_scheme(const Pattern& p, const TypePtr& te) {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
+      if (record_kinds_) rec_pat_[&p] = te;
       venv.back()[v->name.txt] = te;
       return;
     }
@@ -1644,6 +1653,30 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
   Checker ck;
   run_checker(ck, s);
   return std::move(ck.match_partial);
+}
+
+// The Lambda value_kind of an inferred type, as -dlambda spells it.
+static std::string kind_str(const TypePtr& t0) {
+  TypePtr t = I::Engine::repr(t0);
+  if (t->kind != I::Type::Kind::Constr) return "";
+  auto d = t->path.rfind('.');
+  std::string b = d == std::string::npos ? t->path : t->path.substr(d + 1);
+  if (b == "int" || b == "char" || b == "bool") return "int";  // immediates
+  if (b == "float") return "float";
+  if (b == "int32") return "int32";
+  if (b == "int64") return "int64";
+  if (b == "nativeint") return "nativeint";
+  return "";  // generic / blocks
+}
+
+ValueKinds infer_value_kinds(const ast::Structure& s) {
+  Checker ck;
+  ck.record_kinds_ = true;
+  run_checker(ck, s);
+  ValueKinds vk;
+  for (auto& [p, t] : ck.rec_pat_) vk.pat[p] = kind_str(t);
+  for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t);
+  return vk;
 }
 
 // Strict type-check: returns the definite type errors found (empty => accepted).
