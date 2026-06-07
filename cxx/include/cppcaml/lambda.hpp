@@ -96,7 +96,8 @@ struct Lam {
 
 // Translate a structure into the module's Lambda term (the setglobal form).
 // `module_name` is the capitalized file basename (e.g. "L0").
-LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name);
+LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
+                                const std::string& stdlib_dir = "stdlib");
 
 // Print in -dlambda format (stamps normalized by first appearance).
 void print_dlambda(const LamPtr& code, std::ostream& out);

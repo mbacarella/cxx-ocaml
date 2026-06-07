@@ -385,6 +385,7 @@ LamPtr translate_const(const Constant& c) {
 struct Translator {
   ValueKinds vk;
   int stamp = 300;  // arbitrary; normalized on print
+  std::string stdlib_dir = "stdlib";  // where to find stdlib*.cmi (CWD-relative by default)
   std::vector<std::unordered_map<std::string, Ident>> scope{{}};
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
   // module name ("List", "Printf", ...) -> its value -> field index, cached.
@@ -491,8 +492,8 @@ struct Translator {
     if (it != mod_fields.end()) return it->second;
     std::unordered_map<std::string, int> m;
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? "stdlib/stdlib.cmi"
-                                                     : "stdlib/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                     : stdlib_dir + "/stdlib__" + mod + ".cmi");
       int i = 0;
       for (auto& f : cmi.sig().fields) m[f] = i++;
     } catch (...) {}
@@ -1158,12 +1159,14 @@ struct Translator {
 
 }  // namespace
 
-LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name) {
+LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
+                                const std::string& stdlib_dir) {
   Translator t;
+  t.stdlib_dir = stdlib_dir;
   t.vk = infer_value_kinds(s);
   t.register_types(s);
   try {  // Stdlib value -> module field index, for pervasive resolution
-    auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
+    auto cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
     int i = 0;
     for (auto& f : cmi.sig().fields) t.stdlib_fields[f] = i++;
   } catch (...) {}

@@ -26,6 +26,23 @@
 
 namespace fs = std::filesystem;
 
+// Locate the stdlib directory (containing stdlib.cmi / stdlib.cma): an explicit
+// -I, else $OCAMLLIB/$CAMLLIB, else "stdlib" relative to the CWD, else relative
+// to this executable (<repo>/cxx/build/c++ocamlc -> <repo>/stdlib).
+static std::string discover_stdlib(const std::string& flag) {
+  if (!flag.empty()) return flag;
+  if (const char* e = std::getenv("OCAMLLIB"); e && *e) return e;
+  if (const char* e = std::getenv("CAMLLIB"); e && *e) return e;
+  if (fs::exists("stdlib/stdlib.cmi")) return "stdlib";
+  std::error_code ec;
+  fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+  if (!ec) {
+    fs::path cand = exe.parent_path().parent_path().parent_path() / "stdlib";
+    if (fs::exists(cand / "stdlib.cmi")) return cand.string();
+  }
+  return "stdlib";
+}
+
 static std::string module_name(const std::string& path) {
   std::string base = fs::path(path).filename().string();
   size_t dot = base.find('.');
@@ -35,7 +52,7 @@ static std::string module_name(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-  std::string in_path, out_path, stdlib_dir = "stdlib", runtime;
+  std::string in_path, out_path, stdlib_dir, runtime;  // stdlib_dir: -I, else discovered
   bool compile_only = false;  // -c : stop at the .cmo
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -51,6 +68,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   std::string mod = module_name(in_path);
+  stdlib_dir = discover_stdlib(stdlib_dir);
   if (out_path.empty()) {
     fs::path p(in_path);
     out_path = compile_only ? (p.parent_path() / (p.stem().string() + ".cmo")).string()
@@ -58,7 +76,7 @@ int main(int argc, char** argv) {
   }
   // Default the launcher path to an absolute ocamlrun next to the stdlib dir.
   if (runtime.empty()) {
-    fs::path r = fs::absolute(fs::path(stdlib_dir).parent_path() / "runtime" / "ocamlrun");
+    fs::path r = fs::absolute(fs::path(stdlib_dir)).parent_path() / "runtime" / "ocamlrun";
     if (fs::exists(r)) runtime = r.string();
   }
 
@@ -71,7 +89,7 @@ int main(int argc, char** argv) {
   try {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
-    auto code = cppcaml::lambda::translate_implementation(structure, mod);
+    auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     cppcaml::cmo::write_cmo(instrs, mod, cmo);
   } catch (const cppcaml::ParseError& e) {
