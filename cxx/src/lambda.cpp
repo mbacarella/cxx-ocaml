@@ -1104,4 +1104,14 @@ void print_dlambda(const LamPtr& code, std::ostream& out) {
   out << ss.str() << "\n";
 }
 
+std::string structured_constant(const LamPtr& c) {
+  Pr pr;
+  std::ostringstream ss;
+  DocP d = to_doc(c, pr);
+  set_sizes(d, 0);
+  Render r{ss};
+  r.go(d);
+  return ss.str();
+}
+
 }  // namespace cppcaml::lambda

@@ -101,4 +101,8 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
 // Print in -dlambda format (stamps normalized by first appearance).
 void print_dlambda(const LamPtr& code, std::ostream& out);
 
+// Render a constant node (ConstInt/Char/Float/String/Block) in printlambda's
+// structured_constant syntax -- used by the bytecode `const` instruction printer.
+std::string structured_constant(const LamPtr& c);
+
 }  // namespace cppcaml::lambda
