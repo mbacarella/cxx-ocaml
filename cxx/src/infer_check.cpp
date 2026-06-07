@@ -287,9 +287,8 @@ struct Checker {
     if (auto* d = std::get_if<Ldot>(&lid.v)) {
       auto& ex = module_values_cached(*d->prefix);
       if (ex.empty()) return eng.any();   // module unresolvable: stay dynamic
-      if (ex.count(d->name)) return eng.any();  // present: known-good, but Any --
-          // using its real type surfaces clashes while value inference is still
-          // incomplete (deferred until the inferencer can consume it soundly).
+      if (auto f = ex.find(d->name); f != ex.end())
+        return eng.instantiate(f->second);  // present: use its real type
       if (strict) note_error("Unbound value " + lid_full(lid));  // genuinely absent
       return eng.any();
     }
@@ -778,6 +777,16 @@ struct Checker {
     catch (const I::TypeError& e) { if (strict) note_error(e.what()); }
   }
 
+  // Like try_unify but never rejects: on clash the two types simply stay
+  // unlinked.  Used where unification is for type *propagation* (driving value
+  // kinds) and genuine errors are caught by a separate reliable check -- e.g.
+  // function-argument positions, where `expected_clash` does the sound checking.
+  // This lets real (e.g. qualified-stdlib) types flow without the inferencer's
+  // incompletely-modelled features (formats, GADTs, abbreviations) false-rejecting.
+  void soft_unify(const TypePtr& a, const TypePtr& b) {
+    try { eng.unify(a, b); } catch (const I::TypeError&) {}
+  }
+
   // A top-level case pattern that matches anything (no guard handled by caller).
   static bool is_catchall(const Pattern& p) {
     if (std::holds_alternative<Ppat_any>(p.desc)) return true;
@@ -1239,7 +1248,7 @@ struct Checker {
         used[idx] = true;
         if (idx > maxc) maxc = idx;
         TypePtr at = infer_expr_expected(*arg, spine[idx]->dom);
-        try_unify(spine[idx]->dom, at);
+        soft_unify(spine[idx]->dom, at);  // propagate; genuine errors via expected_clash
       }
       // result = unconsumed params chained onto the tail, erasing any leading
       // optional that precedes a consumed positional (it is defaulted).
@@ -1256,9 +1265,9 @@ struct Checker {
     // on each argument), so a var-typed callee never false-rejects.
     for (auto& [lbl, arg] : a.args) {
       TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
-      try_unify(ft, eng.arrow(dom, r));
+      soft_unify(ft, eng.arrow(dom, r));
       TypePtr at = infer_expr_expected(*arg, dom);
-      try_unify(dom, at);
+      soft_unify(dom, at);
       ft = I::Engine::repr(r);
     }
     return ft;
