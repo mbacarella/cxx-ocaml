@@ -107,6 +107,7 @@ struct Checker {
   bool record_kinds_ = false;
   std::unordered_map<const Pattern*, TypePtr> rec_pat_;
   std::unordered_map<const void*, TypePtr> rec_ret_;
+  std::unordered_map<const void*, TypePtr> rec_expr_;  // every expression's type
   // Local variant types whose constructors are all constant (nullary): these have
   // an immediate (int) runtime representation, so a value of such a type gets the
   // [int] value kind in the Lambda dump.
@@ -989,6 +990,12 @@ struct Checker {
   }
 
   TypePtr infer_expr(const Expression& e) {
+    TypePtr t = infer_expr_impl(e);
+    if (record_kinds_) rec_expr_[&e] = t;
+    return t;
+  }
+
+  TypePtr infer_expr_impl(const Expression& e) {
     if (e.loc.start.lnum) cur_line_ = e.loc.start.lnum;
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return constant_type(c->c);
     if (auto* id = std::get_if<Pexp_ident>(&e.desc))
@@ -1688,6 +1695,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   ValueKinds vk;
   for (auto& [p, t] : ck.rec_pat_) vk.pat[p] = kind_str(t, ck.immediate_types_);
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck.immediate_types_);
+  for (auto& [e, t] : ck.rec_expr_) vk.expr[e] = kind_str(t, ck.immediate_types_);
   return vk;
 }
 

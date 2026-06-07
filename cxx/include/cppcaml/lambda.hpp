@@ -43,6 +43,12 @@ enum class Prim {
   Global,    // global id  (as an arg of field)
   NotEqInt,  // !=
   EqInt,     // ==
+  Makemutable, // makemutable tag (shape)  (ref / mutable record)
+  FieldInt,    // field_int n   (deref of an immediate-contents ref)
+  FieldMut,    // field_mut n   (deref of a pointer-contents ref)
+  SetfieldImm, // setfield_imm n  (:= into an immediate-contents ref)
+  SetfieldPtr, // setfield_ptr n  (:= into a pointer-contents ref)
+  Offsetref,   // +:=n   (incr/decr)
 };
 
 struct Lam {
@@ -68,8 +74,9 @@ struct Lam {
 
   // Prim
   Prim prim;
-  int prim_arg = 0;                // field index / makeblock tag
+  int prim_arg = 0;                // field index / makeblock tag / offsetref delta
   std::string prim_id;             // global name (e.g. "Stdlib")
+  ValueKind blk_kind = ValueKind::Gen;  // makemutable single-field shape
 
   // IfThenElse
   LamPtr cond, then_, else_;

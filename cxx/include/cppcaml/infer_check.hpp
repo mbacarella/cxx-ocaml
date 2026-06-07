@@ -41,6 +41,7 @@ std::vector<std::string> structure_typecheck(const ast::Structure& s);
 struct ValueKinds {
   std::unordered_map<const ast::Pattern*, std::string> pat;
   std::unordered_map<const void*, std::string> fn_ret;  // keyed by Pexp_function*
+  std::unordered_map<const void*, std::string> expr;    // keyed by Expression*
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 

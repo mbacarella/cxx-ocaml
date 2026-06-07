@@ -143,6 +143,18 @@ std::string kind_suffix(ValueKind k) {
   }
   return "";
 }
+// block_shape for a single-field block (printlambda): omitted when generic.
+std::string shape_suffix(ValueKind k) {
+  switch (k) {
+    case ValueKind::Int: return " (int)";
+    case ValueKind::Float: return " (float)";
+    case ValueKind::Boxedint32: return " (int32)";
+    case ValueKind::Boxedint64: return " (int64)";
+    case ValueKind::Nativeint: return " (nativeint)";
+    case ValueKind::Gen: return "";
+  }
+  return "";
+}
 std::string ret_suffix(ValueKind k) {
   switch (k) {
     case ValueKind::Int: return ": int";
@@ -198,6 +210,13 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::Mulint: head = "(*"; break;
         case Prim::NotEqInt: head = "(!="; break;
         case Prim::EqInt: head = "(=="; break;
+        case Prim::Makemutable:
+          head = "(makemutable " + std::to_string(l->prim_arg) + shape_suffix(l->blk_kind); break;
+        case Prim::FieldInt: head = "(field_int " + std::to_string(l->prim_arg); break;
+        case Prim::FieldMut: head = "(field_mut " + std::to_string(l->prim_arg); break;
+        case Prim::SetfieldImm: head = "(setfield_imm " + std::to_string(l->prim_arg); break;
+        case Prim::SetfieldPtr: head = "(setfield_ptr " + std::to_string(l->prim_arg); break;
+        case Prim::Offsetref: head = "(+:=" + std::to_string(l->prim_arg); break;
       }
       std::vector<DocP> xs{text(head)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
@@ -335,6 +354,10 @@ struct Translator {
   ValueKind pat_kind(const Pattern* p) {
     auto it = vk.pat.find(p);
     return it == vk.pat.end() ? ValueKind::Gen : vkind(it->second);
+  }
+  ValueKind expr_kind(const Expression* e) {
+    auto it = vk.expr.find(e);
+    return it == vk.expr.end() ? ValueKind::Gen : vkind(it->second);
   }
   const Ident* lookup(const std::string& n) {
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
@@ -474,10 +497,40 @@ struct Translator {
       Prim p;
       if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
         if (auto* l = std::get_if<Lident>(&fid->id.txt.v))
-          if (!lookup(l->name) && int_op(l->name, p) && ap->args.size() == 2) {
-            auto pr = mk(Lam::K::Prim); pr->prim = p;
-            pr->args = {expr(*ap->args[0].second), expr(*ap->args[1].second)};
-            return pr;
+          if (!lookup(l->name)) {  // an unshadowed pervasive operator
+            const auto& n = l->name;
+            auto& as = ap->args;
+            if (int_op(n, p) && as.size() == 2) {
+              auto pr = mk(Lam::K::Prim); pr->prim = p;
+              pr->args = {expr(*as[0].second), expr(*as[1].second)};
+              return pr;
+            }
+            if (n == "ref" && as.size() == 1) {  // (makemutable 0 (shape) e)
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Makemutable; pr->prim_arg = 0;
+              pr->blk_kind = expr_kind(as[0].second.get());
+              pr->args = {expr(*as[0].second)};
+              return pr;
+            }
+            if (n == "!" && as.size() == 1) {  // deref: field_int / field_mut 0
+              auto pr = mk(Lam::K::Prim);
+              pr->prim = expr_kind(&e) == ValueKind::Int ? Prim::FieldInt : Prim::FieldMut;
+              pr->prim_arg = 0; pr->args = {expr(*as[0].second)};
+              return pr;
+            }
+            if (n == ":=" && as.size() == 2) {  // setfield_imm / setfield_ptr 0
+              auto pr = mk(Lam::K::Prim);
+              pr->prim = expr_kind(as[1].second.get()) == ValueKind::Int
+                             ? Prim::SetfieldImm : Prim::SetfieldPtr;
+              pr->prim_arg = 0;
+              pr->args = {expr(*as[0].second), expr(*as[1].second)};
+              return pr;
+            }
+            if ((n == "incr" || n == "decr") && as.size() == 1) {  // +:=1 / +:=-1
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Offsetref;
+              pr->prim_arg = n == "incr" ? 1 : -1;
+              pr->args = {expr(*as[0].second)};
+              return pr;
+            }
           }
       auto a = mk(Lam::K::Apply);
       a->fn = expr(*ap->fn);
