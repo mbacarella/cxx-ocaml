@@ -356,6 +356,10 @@ struct Translator {
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
   // module name ("List", "Printf", ...) -> its value -> field index, cached.
   std::unordered_map<std::string, std::unordered_map<std::string, int>> mod_fields;
+  // Locally-defined submodules: name -> its binder, and name -> field layout
+  // (export value/submodule name -> field index), for resolving `M.x`.
+  std::unordered_map<std::string, Ident> module_ident_;
+  std::unordered_map<std::string, std::unordered_map<std::string, int>> module_layout_;
 
   // Locally-declared variant constructors: name -> {owning type, tag, is_block}.
   // Constant (nullary) and block (with-args) constructors are numbered
@@ -645,9 +649,19 @@ struct Translator {
         auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
       }
-      // Qualified M.x where M is a stdlib (sub)module: field of Stdlib[__M].
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+          // Qualified M.x where M is a local submodule: field of its block.
+          if (auto mi = module_ident_.find(pl->name); mi != module_ident_.end()) {
+            auto& lay = module_layout_[pl->name];
+            if (auto f = lay.find(d->name); f != lay.end()) {
+              auto v = mk(Lam::K::Var); v->var = mi->second;
+              auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+              fi->prim_arg = f->second; fi->args = {v};
+              return fi;
+            }
+          }
+          // Qualified M.x where M is a stdlib (sub)module: field of Stdlib[__M].
           auto& fm = fields_of(pl->name);
           auto sf = fm.find(d->name);
           if (sf != fm.end()) return field_of(global_of(pl->name), sf->second);
@@ -759,6 +773,75 @@ struct Translator {
     scope.pop_back();
     return l;
   }
+
+  // Build a module body: the `(let <segments> (makeblock 0 exports))` term for a
+  // structure.  Consecutive value/module bindings group into one `let`; a
+  // discarded computation (`let _ = e` or bare `e;;`) becomes a `seq` that splits
+  // the groups.  `names` (if given) receives the exported field names in order.
+  LamPtr build_module(const Structure& s, std::vector<std::string>* names) {
+    scope.emplace_back();
+    struct Seg { bool seq; std::vector<Lam::Binding> binds; LamPtr e; };
+    std::vector<Seg> segs;
+    std::vector<Lam::Binding> cur;
+    std::vector<LamPtr> exports;
+    auto flush = [&] { if (!cur.empty()) segs.push_back({false, std::move(cur), nullptr}), cur.clear(); };
+    auto add_export = [&](const std::string& nm, const Ident& id) {
+      auto v = mk(Lam::K::Var); v->var = id; exports.push_back(v);
+      if (names) names->push_back(nm);
+    };
+    for (auto& it : s) {
+      if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
+        flush(); segs.push_back({true, {}, expr(*pe->e)}); continue;
+      }
+      if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {  // module M = struct ... end
+        auto& mb = pm->binding;
+        if (mb.name.txt)
+          if (auto* ps = std::get_if<Pmod_structure>(&mb.expr.desc)) {
+            std::vector<std::string> sub;
+            LamPtr body = build_module(ps->items, &sub);
+            Ident mid = fresh(*mb.name.txt);
+            cur.push_back({mid, ValueKind::Gen, body});
+            module_ident_[*mb.name.txt] = mid;
+            auto& lay = module_layout_[*mb.name.txt]; lay.clear();
+            for (int i = 0; i < (int)sub.size(); ++i) lay[sub[i]] = i;
+            add_export(*mb.name.txt, mid);
+          }
+        continue;
+      }
+      auto* sv = std::get_if<Pstr_value>(&it.desc);
+      if (!sv) continue;
+      for (auto& b : sv->bindings) {
+        if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
+          // alias elimination: `let x = <var v>` binds nothing; x exports as v.
+          if (auto* rid = std::get_if<Pexp_ident>(&b.expr->desc))
+            if (auto* rl = std::get_if<Lident>(&rid->id.txt.v))
+              if (auto* tgt = lookup(rl->name)) {
+                add_export(pv->name.txt, *tgt);
+                scope.back()[pv->name.txt] = *tgt;
+                continue;
+              }
+          Ident id = fresh(pv->name.txt);
+          cur.push_back({id, pat_kind(&b.pat), expr(*b.expr)});
+          scope.back()[pv->name.txt] = id;
+          add_export(pv->name.txt, id);
+        } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {
+          flush(); segs.push_back({true, {}, expr(*b.expr)});  // `let _ = e` -> seq
+        } else {  // `let () = e` and other refutable patterns: a *match* temp
+          cur.push_back({fresh("", true), ValueKind::Gen, expr(*b.expr)});
+        }
+      }
+    }
+    flush();
+    auto block = mk(Lam::K::Prim);
+    block->prim = Prim::Makeblock; block->prim_arg = 0; block->args = std::move(exports);
+    LamPtr acc = block;
+    for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+      if (it->seq) { auto sq = mk(Lam::K::Sequence); sq->cond = it->e; sq->else_ = acc; acc = sq; }
+      else { auto l = mk(Lam::K::Let); l->bindings = std::move(it->binds); l->body = acc; acc = l; }
+    }
+    scope.pop_back();
+    return acc;
+  }
 };
 
 }  // namespace
@@ -772,65 +855,9 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     int i = 0;
     for (auto& f : cmi.sig().fields) t.stdlib_fields[f] = i++;
   } catch (...) {}
-  // The module body is a sequence of segments: consecutive value bindings group
-  // into one `let`; a discarded computation (`let _ = e` or a bare `e;;`) becomes
-  // a `seq` that splits the surrounding groups and wraps the continuation.
-  struct Seg { bool seq; std::vector<Lam::Binding> binds; LamPtr e; };
-  std::vector<Seg> segs;
-  std::vector<Lam::Binding> cur;  // accumulating let group
-  std::vector<LamPtr> exports;    // exported values, in declaration order
-  auto flush = [&] { if (!cur.empty()) segs.push_back({false, std::move(cur), nullptr}), cur.clear(); };
-  for (auto& it : s) {
-    if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
-      flush();
-      segs.push_back({true, {}, t.expr(*pe->e)});
-      continue;
-    }
-    auto* sv = std::get_if<Pstr_value>(&it.desc);
-    if (!sv) continue;
-    for (auto& b : sv->bindings) {
-      if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
-        // alias elimination: `let x = <var v>` binds nothing; x exports as v.
-        if (auto* rid = std::get_if<Pexp_ident>(&b.expr->desc))
-          if (auto* rl = std::get_if<Lident>(&rid->id.txt.v))
-            if (auto* tgt = t.lookup(rl->name)) {
-              auto v = mk(Lam::K::Var); v->var = *tgt; exports.push_back(v);
-              t.scope.back()[pv->name.txt] = *tgt;
-              continue;
-            }
-        Ident id = t.fresh(pv->name.txt);
-        cur.push_back({id, t.pat_kind(&b.pat), t.expr(*b.expr)});
-        t.scope.back()[pv->name.txt] = id;
-        auto v = mk(Lam::K::Var); v->var = id; exports.push_back(v);
-      } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {
-        // `let _ = e`: the value is discarded -> seq, not a binding.
-        flush();
-        segs.push_back({true, {}, t.expr(*b.expr)});
-      } else {
-        // `let () = e` (and other refutable patterns): a *match* temp binding.
-        Ident tmp = t.fresh("", true);
-        cur.push_back({tmp, ValueKind::Gen, t.expr(*b.expr)});
-      }
-    }
-  }
-  flush();
-
-  auto block = mk(Lam::K::Prim);
-  block->prim = Prim::Makeblock; block->prim_arg = 0;
-  block->args = std::move(exports);
-
-  LamPtr acc = block;
-  for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
-    if (it->seq) {
-      auto sq = mk(Lam::K::Sequence); sq->cond = it->e; sq->else_ = acc; acc = sq;
-    } else {
-      auto l = mk(Lam::K::Let); l->bindings = std::move(it->binds); l->body = acc; acc = l;
-    }
-  }
-
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
-  sg->args.push_back(acc);
+  sg->args.push_back(t.build_module(s, nullptr));
   return sg;
 }
 
