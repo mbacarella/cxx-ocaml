@@ -1050,6 +1050,20 @@ struct Checker {
       infer_expr(*s->e1);
       return infer_expr(*s->e2);
     }
+    if (auto* fo = std::get_if<Pexp_for>(&e.desc)) {
+      try_unify(infer_expr(*fo->lo), eng.constr("int"));
+      try_unify(infer_expr(*fo->hi), eng.constr("int"));
+      venv.emplace_back();
+      try_unify(infer_pat(fo->var), eng.constr("int"));
+      infer_expr(*fo->body);
+      venv.pop_back();
+      return eng.constr("unit");
+    }
+    if (auto* wh = std::get_if<Pexp_while>(&e.desc)) {
+      try_unify(infer_expr(*wh->cond), eng.constr("bool"));
+      infer_expr(*wh->body);
+      return eng.constr("unit");
+    }
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       TypePtr se = infer_expr(*m->e);
       TypePtr sr = I::Engine::repr(se);

@@ -266,6 +266,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::SetfieldPtr: head = "(setfield_ptr " + std::to_string(l->prim_arg); break;
         case Prim::Offsetref: head = "(+:=" + std::to_string(l->prim_arg); break;
         case Prim::Ccall: head = "(" + l->prim_id; break;
+        case Prim::IntCmp: head = "(" + l->prim_id; break;
       }
       std::vector<DocP> xs{text(head)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
@@ -293,6 +294,14 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
     case Lam::K::Sequence:
       return box(BoxT::Box, 2, {text("(seq"), brk(), to_doc(l->cond, pr), brk(),
                                 to_doc(l->else_, pr), text(")")});
+    case Lam::K::While:
+      return box(BoxT::Box, 2, {text("(while"), brk(), to_doc(l->cond, pr), brk(),
+                                to_doc(l->body, pr), text(")")});
+    case Lam::K::For:
+      return box(BoxT::Box, 2, {text("(for " + pr.ident(l->var)), brk(),
+                                to_doc(l->then_, pr), brk(),
+                                text(l->downto_ ? "downto" : "to"), brk(),
+                                to_doc(l->else_, pr), brk(), to_doc(l->body, pr), text(")")});
     case Lam::K::Switch: {
       // @[<1>(switch* larg@ @[<v 0> @[<hv 1>case int N:@ body@] @ ... @])@]
       std::vector<DocP> cases;
@@ -490,6 +499,16 @@ struct Translator {
     if (n == "-") { p = Prim::Subint; return true; }
     if (n == "*") { p = Prim::Mulint; return true; }
     return false;
+  }
+  // A polymorphic comparison operator -> {int-comparison spelling, caml_* C name}.
+  static std::pair<std::string, std::string> poly_cmp(const std::string& n) {
+    if (n == "<") return {"<", "caml_lessthan"};
+    if (n == ">") return {">", "caml_greaterthan"};
+    if (n == "<=") return {"<=", "caml_lessequal"};
+    if (n == ">=") return {">=", "caml_greaterequal"};
+    if (n == "=") return {"==", "caml_equal"};
+    if (n == "<>") return {"!=", "caml_notequal"};
+    return {"", ""};
   }
 
   static bool is_const(const LamPtr& l) {
@@ -690,6 +709,23 @@ struct Translator {
               pr->args = {expr(*as[0].second), expr(*as[1].second)};
               return pr;
             }
+            // Polymorphic comparison ops: specialize to an integer comparison
+            // when an operand is an immediate, else a caml_* C compare.
+            if (auto c = poly_cmp(n); !c.first.empty() && as.size() == 2) {
+              bool isint = expr_kind(as[0].second.get()) == ValueKind::Int ||
+                           expr_kind(as[1].second.get()) == ValueKind::Int;
+              auto pr = mk(Lam::K::Prim);
+              if (isint) { pr->prim = Prim::IntCmp; pr->prim_id = c.first; }
+              else { pr->prim = Prim::Ccall; pr->prim_id = c.second; }
+              pr->args = {expr(*as[0].second), expr(*as[1].second)};
+              return pr;
+            }
+            // Physical equality and short-circuit boolean ops are always inlined.
+            if ((n == "==" || n == "!=" || n == "&&" || n == "||") && as.size() == 2) {
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = n;
+              pr->args = {expr(*as[0].second), expr(*as[1].second)};
+              return pr;
+            }
             if (n == "ref" && as.size() == 1) {  // (makemutable 0 (shape) e)
               auto pr = mk(Lam::K::Prim); pr->prim = Prim::Makemutable; pr->prim_arg = 0;
               pr->blk_shape = {expr_kind(as[0].second.get())};
@@ -761,6 +797,25 @@ struct Translator {
       l->else_ = expr(*sq->e2);
       return l;
     }
+    if (auto* wh = std::get_if<Pexp_while>(&e.desc)) {
+      auto l = mk(Lam::K::While);
+      l->cond = expr(*wh->cond); l->body = expr(*wh->body);
+      return l;
+    }
+    if (auto* fo = std::get_if<Pexp_for>(&e.desc)) {
+      auto l = mk(Lam::K::For);
+      l->then_ = expr(*fo->lo); l->else_ = expr(*fo->hi);
+      l->downto_ = fo->dir == DirectionFlag::Downto;
+      scope.emplace_back();
+      if (auto* pv = std::get_if<Ppat_var>(&fo->var.desc)) {
+        l->var = fresh(pv->name.txt); scope.back()[pv->name.txt] = l->var;
+      } else {
+        l->var = fresh("param");  // `for _ = ...` (rare)
+      }
+      l->body = expr(*fo->body);
+      scope.pop_back();
+      return l;
+    }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) return expr(*ct->e);
     return mk(Lam::K::ConstInt);  // unsupported: placeholder (will DIFF)
   }
@@ -772,12 +827,14 @@ struct Translator {
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
         // Every parameter gets a binder; a non-variable pattern (`()`, `_`, a
         // tuple) is named "param" like ocamlc and matched in the body (deferred).
-        if (auto* var = std::get_if<Ppat_var>(&pv->pat.desc)) {
+        const Pattern* pat = &pv->pat;
+        while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) pat = pc->p.get();
+        if (auto* var = std::get_if<Ppat_var>(&pat->desc)) {
           Ident id = fresh(var->name.txt);
-          l->params.push_back({id, pat_kind(&pv->pat)});
+          l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
         } else {
-          l->params.push_back({fresh("param"), pat_kind(&pv->pat)});
+          l->params.push_back({fresh("param"), pat_kind(pat)});
         }
       }
     auto rk = vk.fn_ret.find(&f);
