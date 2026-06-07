@@ -528,6 +528,13 @@ struct Translator {
     auto it = t.find(n);
     return it == t.end() ? std::pair<std::string, int>{"", 0} : it->second;
   }
+  // Array element-kind annotation (array_kind in printlambda); a known-boxed vs
+  // polymorphic element both read as gen here (we can't tell addr from gen).
+  static std::string array_kind(ValueKind k) {
+    if (k == ValueKind::Int) return "int";
+    if (k == ValueKind::Float) return "float";
+    return "gen";
+  }
   // A polymorphic comparison operator -> {int-comparison spelling, caml_* C name}.
   static std::pair<std::string, std::string> poly_cmp(const std::string& n) {
     if (n == "<") return {"<", "caml_lessthan"};
@@ -695,6 +702,13 @@ struct Translator {
           }
         }
     }
+    if (auto* ar = std::get_if<Pexp_array>(&e.desc)) {  // [| ... |] -> makearray[k]
+      ValueKind k = ar->elems.empty() ? ValueKind::Gen : expr_kind(ar->elems[0].get());
+      auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
+      m->prim_id = "makearray[" + array_kind(k) + "]";
+      for (auto& el : ar->elems) m->args.push_back(expr(*el));
+      return m;
+    }
     if (auto* fe = std::get_if<Pexp_field>(&e.desc)) {
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
@@ -771,6 +785,35 @@ struct Translator {
     }
     if (auto* ap = std::get_if<Pexp_apply>(&e.desc)) {
       Prim p;
+      // Qualified module primitives: Array.get/set (kind-annotated), String/Bytes
+      // length/get/set.  `x.(i)` / `s.[i]` desugar to these.
+      if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
+        if (auto* d = std::get_if<Ldot>(&fid->id.txt.v))
+          if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+            auto& as = ap->args;
+            const std::string& m = pl->name;
+            const std::string& f = d->name;
+            std::string op;
+            if (m == "Array" && f == "get" && as.size() == 2)
+              op = "array.get[" + array_kind(expr_kind(&e)) + "]";
+            else if (m == "Array" && f == "unsafe_get" && as.size() == 2)
+              op = "array.unsafe_get[" + array_kind(expr_kind(&e)) + "]";
+            else if (m == "Array" && f == "set" && as.size() == 3)
+              op = "array.set[" + array_kind(expr_kind(as[2].second.get())) + "]";
+            else if (m == "Array" && f == "unsafe_set" && as.size() == 3)
+              op = "array.unsafe_set[" + array_kind(expr_kind(as[2].second.get())) + "]";
+            else if (m == "String" && f == "length" && as.size() == 1) op = "string.length";
+            else if (m == "String" && f == "get" && as.size() == 2) op = "string.get";
+            else if (m == "String" && f == "unsafe_get" && as.size() == 2) op = "string.unsafe_get";
+            else if (m == "Bytes" && f == "length" && as.size() == 1) op = "bytes.length";
+            else if (m == "Bytes" && f == "get" && as.size() == 2) op = "bytes.get";
+            else if (m == "Bytes" && f == "set" && as.size() == 3) op = "bytes.set";
+            if (!op.empty()) {
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = op;
+              for (auto& a : as) pr->args.push_back(expr(*a.second));
+              return pr;
+            }
+          }
       if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
         if (auto* l = std::get_if<Lident>(&fid->id.txt.v))
           if (!lookup(l->name)) {  // an unshadowed pervasive operator
