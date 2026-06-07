@@ -108,6 +108,7 @@ struct Checker {
   std::unordered_map<const Pattern*, TypePtr> rec_pat_;
   std::unordered_map<const void*, TypePtr> rec_ret_;
   std::unordered_map<const void*, TypePtr> rec_expr_;  // every expression's type
+  std::set<const Expression*> fmt_lits_;  // string literals inferred at format type
   // Local variant types whose constructors are all constant (nullary): these have
   // an immediate (int) runtime representation, so a value of such a type gets the
   // [int] value kind in the Lambda dump.
@@ -1002,8 +1003,10 @@ struct Checker {
   TypePtr infer_expr_expected(const Expression& e, const TypePtr& expected) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc))
       if (std::holds_alternative<Pconst_string>(c->c.desc) &&
-          is_format_constr(expected))
+          is_format_constr(expected)) {
+        if (record_kinds_) fmt_lits_.insert(&e);  // Lambda lowers it as a format
         return expected;
+      }
     return infer_expr(e);
   }
 
@@ -1739,6 +1742,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   for (auto& [p, t] : ck.rec_pat_) vk.pat[p] = kind_str(t, ck.immediate_types_);
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck.immediate_types_);
   for (auto& [e, t] : ck.rec_expr_) vk.expr[e] = kind_str(t, ck.immediate_types_);
+  vk.format_lits = std::move(ck.fmt_lits_);
   return vk;
 }
 

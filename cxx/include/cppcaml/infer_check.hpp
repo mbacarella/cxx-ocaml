@@ -9,6 +9,7 @@
 // per-node types back into the dump (match exhaustiveness, disambiguation).
 #pragma once
 
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -42,6 +43,9 @@ struct ValueKinds {
   std::unordered_map<const ast::Pattern*, std::string> pat;
   std::unordered_map<const void*, std::string> fn_ret;  // keyed by Pexp_function*
   std::unordered_map<const void*, std::string> expr;    // keyed by Expression*
+  // String-literal expressions inferred at a format type (Printf/Format/Scanf):
+  // the Lambda back end lowers these to a CamlinternalFormatBasics format value.
+  std::set<const ast::Expression*> format_lits;
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 

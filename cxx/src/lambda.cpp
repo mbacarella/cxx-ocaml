@@ -634,6 +634,122 @@ struct Translator {
   }
 
   LamPtr cint(long long n) { auto z = mk(Lam::K::ConstInt); z->int_val = n; return z; }
+  LamPtr cchar(int c) { auto z = mk(Lam::K::ConstChar); z->int_val = c; return z; }
+  LamPtr cstr(const std::string& s) { auto z = mk(Lam::K::ConstString); z->str_val = s; return z; }
+  LamPtr cblock(int tag, std::vector<LamPtr> fs) {
+    auto b = mk(Lam::K::ConstBlock); b->prim_arg = tag; b->args = std::move(fs); return b;
+  }
+
+  // Lower a format string into its CamlinternalFormatBasics value, matching the
+  // -dlambda structured constant: `Format (fmt, original)` = [0: <fmt> <string>],
+  // where <fmt> is a cons-list of format elements ending in End_of_format (int 0).
+  // Returns null on any directive we don't yet encode, so the caller can fall back
+  // to a plain string (partial support only improves parity, never regresses).
+  // Tags follow camlinternalFormatBasics.ml's `fmt` GADT (block ctors 0..24).
+  LamPtr format_value(const std::string& s) {
+    // Each parsed element is a builder taking the already-built `rest`.
+    std::vector<std::function<LamPtr(LamPtr)>> elems;
+    auto lit = [&](const std::string& run) {  // 1 char -> Char_literal(12), else String_literal(11)
+      if (run.size() == 1)
+        elems.push_back([this, c = run[0]](LamPtr r) { return cblock(12, {cchar((unsigned char)c), r}); });
+      else
+        elems.push_back([this, run](LamPtr r) { return cblock(11, {cstr(run), r}); });
+    };
+    std::string run;
+    size_t i = 0, n = s.size();
+    while (i < n) {
+      char ch = s[i];
+      if (ch != '%') { run += ch; ++i; continue; }
+      // a '%' directive: flush any pending literal run first
+      ++i;  // past '%'
+      if (i >= n) return nullptr;
+      if (s[i] == '%') { run += '%'; ++i; continue; }  // %% -> literal '%'
+      if (s[i] == '@') { run += '@'; ++i; continue; }  // %@ -> literal '@'
+      if (!run.empty()) { lit(run); run.clear(); }
+      // flags
+      bool plus = false, space = false, hash = false, minus = false, zero = false;
+      for (; i < n; ++i) {
+        if (s[i] == '+') plus = true;
+        else if (s[i] == ' ') space = true;
+        else if (s[i] == '#') hash = true;
+        else if (s[i] == '-') minus = true;
+        else if (s[i] == '0') zero = true;
+        else break;
+      }
+      if (i >= n) return nullptr;
+      // width (literal padding) -- '*' (arg-padding) not yet supported
+      bool has_w = false; int width = 0;
+      while (i < n && s[i] >= '0' && s[i] <= '9') { has_w = true; width = width * 10 + (s[i] - '0'); ++i; }
+      // precision .N -- '.*' not yet supported
+      bool has_p = false; int prec = 0;
+      if (i < n && s[i] == '.') {
+        ++i; has_p = true;
+        if (i < n && s[i] == '*') return nullptr;
+        while (i < n && s[i] >= '0' && s[i] <= '9') { prec = prec * 10 + (s[i] - '0'); ++i; }
+      }
+      if (i >= n) return nullptr;
+      // length modifier for ints: l/n/L
+      char len = 0;
+      if (s[i] == 'l' || s[i] == 'n' || s[i] == 'L') { len = s[i]; ++i; }
+      if (i >= n) return nullptr;
+      char conv = s[i]; ++i;
+      // padding value: No_padding(int 0) | Lit_padding(block0: padty,width)
+      auto padding = [&]() -> LamPtr {
+        if (!has_w) return cint(0);
+        int padty = minus ? 0 : (zero ? 2 : 1);  // Left=0, Right=1, Zeros=2
+        return cblock(0, {cint(padty), cint(width)});
+      };
+      // precision value: No_precision(int 0) | Lit_precision(block0: n)
+      auto precision = [&]() -> LamPtr {
+        if (!has_p) return cint(0);
+        return cblock(0, {cint(prec)});
+      };
+      switch (conv) {
+        case 'c': elems.push_back([this](LamPtr r) { return cblock(0, {r}); }); break;       // Char
+        case 'C': elems.push_back([this](LamPtr r) { return cblock(1, {r}); }); break;       // Caml_char
+        case 's': { auto p = padding(); elems.push_back([this, p](LamPtr r) { return cblock(2, {p, r}); }); break; }
+        case 'S': { auto p = padding(); elems.push_back([this, p](LamPtr r) { return cblock(3, {p, r}); }); break; }
+        case 'b': case 'B': { auto p = padding(); elems.push_back([this, p](LamPtr r) { return cblock(9, {p, r}); }); break; }
+        case 'a': elems.push_back([this](LamPtr r) { return cblock(15, {r}); }); break;       // Alpha
+        case 't': elems.push_back([this](LamPtr r) { return cblock(16, {r}); }); break;       // Theta
+        case '!': elems.push_back([this](LamPtr r) { return cblock(10, {r}); }); break;       // Flush
+        case 'd': case 'i': case 'x': case 'X': case 'o': case 'u': {
+          int ic = int_conv(conv, plus, space, hash);
+          if (ic < 0) return nullptr;
+          int tag = len == 'l' ? 5 : len == 'n' ? 6 : len == 'L' ? 7 : 4;  // Int32/Nativeint/Int64/Int
+          auto p = padding(), q = precision();
+          elems.push_back([this, ic, tag, p, q](LamPtr r) { return cblock(tag, {cint(ic), p, q, r}); });
+          break;
+        }
+        case 'f': case 'e': case 'E': case 'g': case 'G': case 'F': case 'h': case 'H': {
+          int flag = plus ? 1 : space ? 2 : 0;
+          int kind = conv == 'f' ? 0 : conv == 'e' ? 1 : conv == 'E' ? 2 : conv == 'g' ? 3
+                   : conv == 'G' ? 4 : conv == 'F' ? 5 : conv == 'h' ? 6 : 7;
+          auto fconv = cblock(0, {cint(flag), cint(kind)});
+          auto p = padding(), q = precision();
+          elems.push_back([this, fconv, p, q](LamPtr r) { return cblock(8, {fconv, p, q, r}); });
+          break;
+        }
+        default: return nullptr;  // unhandled directive: fall back to plain string
+      }
+    }
+    if (!run.empty()) lit(run);
+    LamPtr fmt = cint(0);  // End_of_format
+    for (auto it = elems.rbegin(); it != elems.rend(); ++it) fmt = (*it)(fmt);
+    return cblock(0, {fmt, cstr(s)});  // Format (fmt, original)
+  }
+  // int_conv tag for a %[dixXou] with +/space/# flags, or -1 if unrepresentable.
+  static int int_conv(char conv, bool plus, bool space, bool hash) {
+    switch (conv) {
+      case 'd': return hash ? 13 : plus ? 1 : space ? 2 : 0;          // Int_d/pd/sd/Cd
+      case 'i': return hash ? 14 : plus ? 4 : space ? 5 : 3;          // Int_i/pi/si/Ci
+      case 'x': return hash ? 7 : 6;                                  // Int_x/Cx
+      case 'X': return hash ? 9 : 8;                                  // Int_X/CX
+      case 'o': return hash ? 11 : 10;                                // Int_o/Co
+      case 'u': return hash ? 15 : 12;                                // Int_u/Cu
+    }
+    return -1;
+  }
   // The identity value of an exception constructor: a local exception's binder, a
   // predefined exception's Stdlib field, else null (unresolved).
   LamPtr exn_value(const std::string& name) {
@@ -765,7 +881,13 @@ struct Translator {
   }
 
   LamPtr expr(const Expression& e) {
-    if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return translate_const(c->c);
+    if (auto* c = std::get_if<Pexp_constant>(&e.desc)) {
+      // A string literal the inferencer typed at a format type lowers to a
+      // CamlinternalFormatBasics format value, not a plain string.
+      if (auto* s = std::get_if<Pconst_string>(&c->c.desc); s && vk.format_lits.count(&e))
+        if (auto fv = format_value(s->s)) return fv;
+      return translate_const(c->c);
+    }
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) return compile_match(expr(*m->e), m->cases);
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
