@@ -5,3 +5,6 @@ build/
 oracle/dump_tokens
 oracle/*.cm[iox]
 oracle/*.o
+
+# clangd index cache
+.cache/
