@@ -233,6 +233,19 @@ DocP let_doc(const LamPtr& l, Pr& pr) {
   return box(BoxT::Box, 2, {text("(let"), brk(), bindings, brk(), to_doc(l->body, pr), text(")")});
 }
 
+// @[<2>(letrec@ (@[<hv 1>@[<2>id@ def@] @ ...@])@ body)@]  (no `=`, defs are functions)
+DocP letrec_doc(const LamPtr& l, Pr& pr) {
+  std::vector<DocP> binds;
+  for (size_t i = 0; i < l->bindings.size(); ++i) {
+    auto& b = l->bindings[i];
+    if (i) binds.push_back(brk());
+    binds.push_back(box(BoxT::Box, 2, {text(pr.ident(b.id)), brk(), to_doc(b.val, pr)}));
+  }
+  DocP bindings = box(BoxT::Hv, 1, std::move(binds));
+  return box(BoxT::Box, 2, {text("(letrec"), brk(), text("("), bindings, text(")"),
+                            brk(), to_doc(l->body, pr), text(")")});
+}
+
 DocP to_doc(const LamPtr& l, Pr& pr) {
   switch (l->k) {
     case Lam::K::Var: return text(pr.ident(l->var));
@@ -248,6 +261,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
       return box(BoxT::Box, 1, {text("[" + tag + ":"), brk(), box(BoxT::Box, 0, std::move(fs)), text("]")});
     }
     case Lam::K::Let: return let_doc(l, pr);
+    case Lam::K::Letrec: return letrec_doc(l, pr);
     case Lam::K::Prim: {
       std::string head;
       switch (l->prim) {
@@ -921,6 +935,21 @@ struct Translator {
         return sq;
       }
       scope.emplace_back();
+      if (le->rf == RecFlag::Recursive) {  // names in scope within their RHSs
+        auto l = mk(Lam::K::Letrec);
+        std::vector<std::pair<const ValueBinding*, Ident>> recs;
+        for (auto& b : le->bindings)
+          if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
+            Ident id = fresh(pv->name.txt);
+            scope.back()[pv->name.txt] = id;
+            recs.push_back({&b, id});
+          }
+        for (auto& [b, id] : recs)
+          l->bindings.push_back({id, pat_kind(&b->pat), expr(*b->expr)});
+        l->body = expr(*le->body);
+        scope.pop_back();
+        return l;
+      }
       auto l = mk(Lam::K::Let);
       for (auto& b : le->bindings) {
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
@@ -1021,18 +1050,18 @@ struct Translator {
   // the groups.  `names` (if given) receives the exported field names in order.
   LamPtr build_module(const Structure& s, std::vector<std::string>* names) {
     scope.emplace_back();
-    struct Seg { bool seq; std::vector<Lam::Binding> binds; LamPtr e; };
+    struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e; };
     std::vector<Seg> segs;
     std::vector<Lam::Binding> cur;
     std::vector<LamPtr> exports;
-    auto flush = [&] { if (!cur.empty()) segs.push_back({false, std::move(cur), nullptr}), cur.clear(); };
+    auto flush = [&] { if (!cur.empty()) segs.push_back({false, false, std::move(cur), nullptr}), cur.clear(); };
     auto add_export = [&](const std::string& nm, const Ident& id) {
       auto v = mk(Lam::K::Var); v->var = id; exports.push_back(v);
       if (names) names->push_back(nm);
     };
     for (auto& it : s) {
       if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
-        flush(); segs.push_back({true, {}, expr(*pe->e)}); continue;
+        flush(); segs.push_back({true, false, {}, expr(*pe->e)}); continue;
       }
       if (auto* pp = std::get_if<Pstr_primitive>(&it.desc)) {  // external f = "cname"
         auto& pd = pp->prim;
@@ -1073,6 +1102,23 @@ struct Translator {
       }
       auto* sv = std::get_if<Pstr_value>(&it.desc);
       if (!sv) continue;
+      if (sv->rf == RecFlag::Recursive) {  // let rec: names in scope within RHSs
+        flush();
+        std::vector<std::pair<const ValueBinding*, Ident>> recs;
+        for (auto& b : sv->bindings)
+          if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
+            Ident id = fresh(pv->name.txt);
+            scope.back()[pv->name.txt] = id;
+            recs.push_back({&b, id});
+          }
+        std::vector<Lam::Binding> binds;
+        for (auto& [b, id] : recs) {
+          binds.push_back({id, pat_kind(&b->pat), expr(*b->expr)});
+          add_export(std::get_if<Ppat_var>(&b->pat.desc)->name.txt, id);
+        }
+        segs.push_back({false, true, std::move(binds), nullptr});
+        continue;
+      }
       for (auto& b : sv->bindings) {
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
           // alias elimination: `let x = <var v>` binds nothing; x exports as v.
@@ -1088,7 +1134,7 @@ struct Translator {
           scope.back()[pv->name.txt] = id;
           add_export(pv->name.txt, id);
         } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {
-          flush(); segs.push_back({true, {}, expr(*b.expr)});  // `let _ = e` -> seq
+          flush(); segs.push_back({true, false, {}, expr(*b.expr)});  // `let _ = e` -> seq
         } else {  // `let () = e` and other refutable patterns: a *match* temp
           cur.push_back({fresh("", true), ValueKind::Gen, expr(*b.expr)});
         }
@@ -1100,7 +1146,10 @@ struct Translator {
     LamPtr acc = block;
     for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
       if (it->seq) { auto sq = mk(Lam::K::Sequence); sq->cond = it->e; sq->else_ = acc; acc = sq; }
-      else { auto l = mk(Lam::K::Let); l->bindings = std::move(it->binds); l->body = acc; acc = l; }
+      else {
+        auto l = mk(it->rec_ ? Lam::K::Letrec : Lam::K::Let);
+        l->bindings = std::move(it->binds); l->body = acc; acc = l;
+      }
     }
     scope.pop_back();
     return acc;

@@ -140,6 +140,12 @@ struct Emitter {
       case Op::Restart: out(RESTART); break;
       case Op::Grab: out(GRAB); out_int(in.a); break;
       case Op::Closure: out(CLOSURE); out_int(in.b); out_label(in.a); break;
+      case Op::Closurerec: {
+        out(CLOSUREREC); out_int(in.a); out_int(in.b);  // nfuncs, nfv
+        int org = pos();
+        for (int lbl : in.labels) out_label_orig(org, lbl);
+        break;
+      }
       case Op::Offsetclosure:
         if (in.a == -3 || in.a == 0 || in.a == 3) out(OFFSETCLOSURE0 + in.a / 3);
         else { out(OFFSETCLOSURE); out_int(in.a); } break;

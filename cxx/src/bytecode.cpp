@@ -309,6 +309,36 @@ struct Bytegen {
         Instr cl = I(Op::Closure); cl.a = lbl; cl.b = (int)fv.size();
         return comp_args(env, fvargs, sz, cons(cl, cont));
       }
+      case K::Letrec: {  // mutually-recursive functions -> one closurerec block
+        int ndecl = (int)exp->bindings.size();
+        std::set<int> bound;
+        for (auto& b : exp->bindings) bound.insert(b.id.stamp);
+        std::map<int, Ident> fvm;
+        for (auto& b : exp->bindings) fvs(b.val, bound, fvm);
+        std::vector<Ident> fv;
+        for (auto& [s, id] : fvm) fv.push_back(id);
+        // closure_entries Multiple_recursive: functions at 0,3,6..; free vars after
+        std::map<int, std::pair<bool, int>> entries;
+        for (int i = 0; i < ndecl; ++i) entries[exp->bindings[i].id.stamp] = {true, 3 * i};
+        int pos_end = 3 * ndecl;
+        for (size_t i = 0; i < fv.size(); ++i) entries[fv[i].stamp] = {false, pos_end - 1 + (int)i};
+        std::vector<int> labels;
+        for (int i = 0; i < ndecl; ++i) {
+          int lbl = new_label();
+          const LamPtr& fn = exp->bindings[i].val;  // a Function
+          std::vector<Ident> params;
+          for (auto& p : fn->params) params.push_back(p.first);
+          functions_to_compile.push_back({params, fn->body, lbl, entries, i});
+          labels.push_back(lbl);
+        }
+        Env benv = env;  // rec idents live on the stack at sz+1..sz+ndecl
+        for (int i = 0; i < ndecl; ++i) benv.stack[exp->bindings[i].id.stamp] = sz + 1 + i;
+        std::vector<LamPtr> fvargs;
+        for (auto& id : fv) { auto v = std::make_shared<Lam>(); v->k = K::Var; v->var = id; fvargs.push_back(v); }
+        Instr cr = I(Op::Closurerec); cr.a = ndecl; cr.b = (int)fv.size(); cr.labels = labels;
+        return comp_args(env, fvargs, sz,
+                 cons(cr, comp_expr(benv, exp->body, sz + ndecl, add_pop(ndecl, cont))));
+      }
       case K::Prim: {
         switch (exp->prim) {
           case Prim::Makeblock: case Prim::Makemutable: {
@@ -521,6 +551,11 @@ std::string instr_text(const Instr& i) {
     case Op::Restart: return "\trestart";
     case Op::Grab: return "\tgrab " + n(i.a);
     case Op::Closure: return "\tclosure L" + n(i.a) + ", " + n(i.b);
+    case Op::Closurerec: {  // printinstr: closurerec <lbl...>, <nfv>  (bare label nums)
+      std::string s = "\tclosurerec";
+      for (int lbl : i.labels) s += " " + n(lbl);
+      return s + ", " + n(i.b);
+    }
     case Op::Offsetclosure: return "\toffsetclosure " + n(i.a);
     case Op::Getglobal: return "\tgetglobal " + i.str + "!";
     case Op::Setglobal: return "\tsetglobal " + i.str + "!";
