@@ -237,6 +237,14 @@ struct Emitter {
       case Op::Branchifnot: out(BRANCHIFNOT); out_label(in.a); break;
       case Op::Strictbranchif: out(BRANCHIF); out_label(in.a); break;
       case Op::Strictbranchifnot: out(BRANCHIFNOT); out_label(in.a); break;
+      case Op::Switch: {
+        out(SWITCH);
+        int nc = in.nconsts, nb = (int)in.labels.size() - nc;
+        out_int(nc | (nb << 16));
+        int org = pos();
+        for (int k = 0; k < (int)in.labels.size(); ++k) out_label_orig(org, in.labels[k]);
+        break;
+      }
       case Op::Boolnot: out(BOOLNOT); break;
       case Op::Pushtrap: out(PUSHTRAP); out_label(in.a); break;
       case Op::Poptrap: out(POPTRAP); break;

@@ -327,6 +327,12 @@ struct Bytegen {
             if (exp->args.size() == 2 && exp->args[1]->k == K::ConstInt && is_immed(-exp->args[1]->int_val))
               return comp_expr(env, exp->args[0], sz, cons(Iop(Op::Offsetint, -(int)exp->args[1]->int_val), cont));
             break;
+          case Prim::IntCmp:
+            if (exp->prim_id == "&&" && exp->args.size() == 2)
+              return comp_seq_and(env, exp->args[0], exp->args[1], sz, cont);
+            if (exp->prim_id == "||" && exp->args.size() == 2)
+              return comp_seq_or(env, exp->args[0], exp->args[1], sz, cont);
+            break;
           default: break;
         }
         // generic: comp_args then the closing primitive instruction
@@ -334,11 +340,112 @@ struct Bytegen {
         (void)nargs;
         return comp_args(env, exp->args, sz, cons(comp_primitive(exp), cont));
       }
+      case K::While: {
+        int lbl_loop = new_label();
+        int lbl_test = new_label();
+        return cons(Iop(Op::Branch, lbl_test), cons(Iop(Op::Label, lbl_loop),
+          cons(I(Op::CheckSignals),
+            comp_expr(env, exp->body, sz,
+              cons(Iop(Op::Label, lbl_test),
+                comp_expr(env, exp->cond, sz,
+                  cons(Iop(Op::Branchif, lbl_loop), add_const_unit(cont))))))));
+      }
+      case K::For: {
+        int lbl_loop = new_label();
+        int lbl_exit = new_label();
+        int offset = exp->downto_ ? -1 : 1;
+        Op comp = exp->downto_ ? Op::Ltint : Op::Gtint;
+        Env body_env = add_var(exp->var, sz + 1, env);
+        // body continuation: bump the counter, test against the limit, re-loop.
+        Code after = add_const_unit(add_pop(2, cont));
+        after = cons(Iop(Op::Label, lbl_exit), after);
+        after = cons(Iop(Op::Branchif, lbl_loop), after);
+        after = cons(I(Op::Neqint), after);
+        after = cons(Iop(Op::Acc, 1), after);
+        after = cons(Iop(Op::Assign, 2), after);
+        after = cons(Iop(Op::Offsetint, offset), after);
+        after = cons(I(Op::Push), after);
+        after = cons(Iop(Op::Acc, 1), after);
+        Code mid = cons(I(Op::CheckSignals), comp_expr(body_env, exp->body, sz + 2, after));
+        mid = cons(Iop(Op::Label, lbl_loop), mid);
+        mid = cons(Iop(Op::Branchif, lbl_exit), mid);
+        mid = cons(I(comp), mid);
+        mid = cons(Iop(Op::Acc, 2), mid);
+        mid = cons(I(Op::Push), mid);
+        mid = cons(I(Op::Push), mid);
+        Code start_cont = cons(I(Op::Push), comp_expr(env, exp->else_, sz + 1, mid));
+        return comp_expr(env, exp->then_, sz, start_cont);
+      }
+      case K::Try: {
+        auto [branch1, cont1] = make_branch(cont);
+        int lbl_handler = new_label();
+        Env henv = add_var(exp->var, sz + 1, env);
+        Code body_cont = cons(I(Op::Poptrap), cons(branch1,
+          cons(Iop(Op::Label, lbl_handler), cons(I(Op::Push),
+            comp_expr(henv, exp->then_, sz + 1, add_pop(1, cont1))))));
+        return cons(Iop(Op::Pushtrap, lbl_handler), comp_expr(env, exp->body, sz + 4, body_cont));
+      }
+      case K::Switch: return comp_switch(env, exp, sz, cont);
       default:
-        // Switch / For / While / Try not yet lowered: placeholder (will DIFF).
         { auto z = std::make_shared<Lam>(); z->k = K::ConstInt; z->int_val = 0;
           Instr k = I(Op::Const); k.cst = z; return cons(k, cont); }
     }
+  }
+
+  // Lswitch: compile each action behind a label, then a Kswitch over the
+  // const/block tag vectors.  (No action sharing -- our switches have distinct
+  // arms -- and the only failaction case is sw_default.)
+  Code comp_switch(const Env& env, const LamPtr& exp, int sz, Code cont) {
+    auto [branch, cont1] = make_branch(cont);
+    Code c = discard_dead_code(cont1);
+    int nconsts = (int)exp->sw_consts.size();
+    int nblocks = (int)exp->sw_blocks.size();
+    std::vector<int> lbl_consts(nconsts, 0), lbl_blocks(nblocks, 0);
+    // actions in reverse: blocks (high tag first) then consts, so the lowest
+    // const tag's code ends up first -- matching the reverse loop in bytegen.
+    for (int i = nblocks - 1; i >= 0; --i) {
+      auto [lbl, c1] = label_code(comp_expr(env, exp->sw_blocks[i].body, sz, cons(branch, c)));
+      lbl_blocks[i] = lbl; c = discard_dead_code(c1);
+    }
+    for (int i = nconsts - 1; i >= 0; --i) {
+      auto [lbl, c1] = label_code(comp_expr(env, exp->sw_consts[i].body, sz, cons(branch, c)));
+      lbl_consts[i] = lbl; c = discard_dead_code(c1);
+    }
+    Instr sw = I(Op::Switch);
+    sw.nconsts = nconsts;
+    sw.labels = lbl_consts;
+    sw.labels.insert(sw.labels.end(), lbl_blocks.begin(), lbl_blocks.end());
+    return comp_expr(env, exp->cond, sz, cons(sw, c));
+  }
+
+  // Short-circuit && / || (Psequand / Psequor).
+  Code comp_seq_and(const Env& env, const LamPtr& e1, const LamPtr& e2, int sz, Code cont) {
+    if (auto* h = head(cont); h && h->op == Op::Branchifnot) {
+      int lbl = h->a;
+      return comp_expr(env, e1, sz, cons(Iop(Op::Branchifnot, lbl), comp_expr(env, e2, sz, cont)));
+    }
+    if (auto* h = head(cont); h && h->op == Op::Branchif) {
+      int lbl = h->a;
+      auto [lbl2, cont2] = label_code(cont->tail);
+      return comp_expr(env, e1, sz, cons(Iop(Op::Branchifnot, lbl2),
+                       comp_expr(env, e2, sz, cons(Iop(Op::Branchif, lbl), cont2))));
+    }
+    auto [lbl, cont1] = label_code(cont);
+    return comp_expr(env, e1, sz, cons(Iop(Op::Strictbranchifnot, lbl), comp_expr(env, e2, sz, cont1)));
+  }
+  Code comp_seq_or(const Env& env, const LamPtr& e1, const LamPtr& e2, int sz, Code cont) {
+    if (auto* h = head(cont); h && h->op == Op::Branchif) {
+      int lbl = h->a;
+      return comp_expr(env, e1, sz, cons(Iop(Op::Branchif, lbl), comp_expr(env, e2, sz, cont)));
+    }
+    if (auto* h = head(cont); h && h->op == Op::Branchifnot) {
+      int lbl = h->a;
+      auto [lbl2, cont2] = label_code(cont->tail);
+      return comp_expr(env, e1, sz, cons(Iop(Op::Branchif, lbl2),
+                       comp_expr(env, e2, sz, cons(Iop(Op::Branchifnot, lbl), cont2))));
+    }
+    auto [lbl, cont1] = label_code(cont);
+    return comp_expr(env, e1, sz, cons(Iop(Op::Strictbranchif, lbl), comp_expr(env, e2, sz, cont1)));
   }
 
   // if-then-else (code_as_jump is always None for us: no Lstaticraise).
@@ -430,6 +537,13 @@ std::string instr_text(const Instr& i) {
     case Op::Branchifnot: return "\tbranchifnot L" + n(i.a);
     case Op::Strictbranchif: return "\tstrictbranchif L" + n(i.a);
     case Op::Strictbranchifnot: return "\tstrictbranchifnot L" + n(i.a);
+    case Op::Switch: {  // printinstr: \tswitch <consts.../<blocks...  (bare nums)
+      std::string s = "\tswitch";
+      for (int k = 0; k < i.nconsts; ++k) s += " " + n(i.labels[k]);
+      s += "/";
+      for (size_t k = i.nconsts; k < i.labels.size(); ++k) s += " " + n(i.labels[k]);
+      return s;
+    }
     case Op::Boolnot: return "\tboolnot";
     case Op::Pushtrap: return "\tpushtrap L" + n(i.a);
     case Op::Poptrap: return "\tpoptrap";
