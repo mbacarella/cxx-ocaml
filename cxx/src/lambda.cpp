@@ -512,6 +512,22 @@ struct Translator {
     if (n == "*") { p = Prim::Mulint; return true; }
     return false;
   }
+  // A monomorphic pervasive %-primitive -> {printlambda spelling, arity}.  These
+  // always inline to the primitive regardless of operand type.
+  static std::pair<std::string, int> pervasive_prim(const std::string& n) {
+    static const std::unordered_map<std::string, std::pair<std::string, int>> t = {
+      {"+.", {"+.", 2}}, {"-.", {"-.", 2}}, {"*.", {"*.", 2}}, {"/.", {"/.", 2}},
+      {"/", {"/", 2}}, {"mod", {"mod", 2}},
+      {"land", {"and", 2}}, {"lor", {"or", 2}}, {"lxor", {"xor", 2}},
+      {"lsl", {"lsl", 2}}, {"lsr", {"lsr", 2}}, {"asr", {"asr", 2}},
+      {"not", {"not", 1}}, {"~-", {"~", 1}}, {"~-.", {"~.", 1}},
+      {"abs_float", {"abs.", 1}}, {"ignore", {"ignore", 1}},
+      {"float_of_int", {"float_of_int", 1}}, {"int_of_float", {"int_of_float", 1}},
+      {"float", {"float_of_int", 1}}, {"truncate", {"int_of_float", 1}},
+    };
+    auto it = t.find(n);
+    return it == t.end() ? std::pair<std::string, int>{"", 0} : it->second;
+  }
   // A polymorphic comparison operator -> {int-comparison spelling, caml_* C name}.
   static std::pair<std::string, std::string> poly_cmp(const std::string& n) {
     if (n == "<") return {"<", "caml_lessthan"};
@@ -775,6 +791,11 @@ struct Translator {
               pr->args = {expr(*as[0].second), expr(*as[1].second)};
               return pr;
             }
+            if (auto pp = pervasive_prim(n); !pp.first.empty() && (int)as.size() == pp.second) {
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = pp.first;
+              for (auto& a : as) pr->args.push_back(expr(*a.second));
+              return pr;
+            }
             // Polymorphic comparison ops: specialize to an integer comparison
             // when an operand is an immediate, else a caml_* C compare.
             if (auto c = poly_cmp(n); !c.first.empty() && as.size() == 2) {
@@ -963,7 +984,10 @@ struct Translator {
         if (mb.name.txt)
           if (auto* ps = std::get_if<Pmod_structure>(&mb.expr.desc)) {
             std::vector<std::string> sub;
+            std::string saved = mod_path_;
+            mod_path_ += "." + *mb.name.txt;  // nested exceptions are "Outer.M.E"
             LamPtr body = build_module(ps->items, &sub);
+            mod_path_ = saved;
             Ident mid = fresh(*mb.name.txt);
             cur.push_back({mid, ValueKind::Gen, body});
             module_ident_[*mb.name.txt] = mid;
