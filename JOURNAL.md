@@ -73,14 +73,14 @@ Scoreboard (filled in as stages land, to check the predictions):
 |---|---|---|---|
 | Foundations | 2–4 days | folded into lexer stage (day 0) | Token type + Location offsets done inline |
 | Lexer | 2–4 days | **day 0: 100% parity (1853/1853)** | beat the low end of the estimate |
-| Parser | 1.5–3 weeks | — | |
-| Typer | 1.5–4 months | — | |
-| Lambda | 3–6 weeks | — | |
-| Bytecode | 1–2 weeks | — | |
+| Parser | 1.5–3 weeks | **100% over oracle-parseable (day 3)** | 1801/1801 byte-identical + 52/52 co-rejections |
+| Typer | 1.5–4 months | **99.2% accept; dump-parity plateaued ~25%** | inference engine built; thesis confirmed (dump is inference-blind) |
+| Lambda | 3–6 weeks | **18.6% dump-parity (138/743)** | completeness held 99.2%; in progress |
+| Bytecode | 1–2 weeks | **20.8% instr-parity (162/777)** + runnable `.cmo` | emit `.cmo` read/linked/run by real toolchain |
 
 ---
 
-## Progress dashboard  (updated 2026-06-05 — parser complete)
+## Progress dashboard  (updated 2026-06-07 — bytecode + runnable `.cmo`)
 
 **Conceptual stages** (the pipeline; one binary grown stage by stage)
 - ● **Lexer** — **100% token-identical** vs trunk oracle (1853 / 1853 testsuite files, incl. matching error positions on the 6 error-path files)
@@ -91,7 +91,13 @@ Scoreboard (filled in as stages land, to check the predictions):
   **KEY THESIS RESULT (sharpened):** the climb to 299 needed *zero HM inference*. `printtyped` dumps no inferred types, so the whole `-dtypedtree` surface is reproducible by resolution + scope + faithful transcription + a couple of registries — even **records** (the supposed frontier) fell to a field registry, not unification. The 6.7K-line `ctype.ml` core is almost *invisible* in this projection.
   **OVERFITTING WATCH (concern raised 2026-06-06):** most of this is faithful modeling, NOT test-fitting — we implement *constructs*, never special-case individual files, and a construct either matches across all corpus files using it or doesn't. The one genuine hack is **format-string detection by a hardcoded Printf/Format/Scanf function-name + arg-position heuristic** (real rule is type-directed via expected type) — explicitly tagged in-code as **scaffolding to be replaced by inference**, not a permanent design. Conservative bail-outs (format flags, unique-field-only records) are honest *gaps* (safe DIFFs), not wrong answers. The structural anti-overfit safeguard: dump parity is a *proxy* with a known blind spot (no inferred types shown), so the real finish line — byte-identical `.cmi`/`.cmo` **and rejecting ill-typed programs** — will expose anything faked (a heuristic typer cannot reject bad code).
   **Remaining:** mechanical — `Pstr_modtype`/signatures (in progress), functor/apply/constraint module-exprs, `Pexp_struct_item`, format flags. Genuinely needs inference — ambiguous field/ctor disambiguation, `Texp_match (Partial)` exhaustiveness, true format detection. **Plan:** bank the mechanical points, then bite the inference bullet as a focused milestone (minimal HM core: `type_expr`+`Tlink` union-find, levels, unify/instantiate/generalize) — it's the load-bearing capability for the real-artifact goal and the actual experiment.
-  **LOAD POST-MORTEM (2026-06-06):** a long agent-driven session melted the machine. Cause: orphaned background `until…sleep` poll-loops accumulating (the result-channel kept dropping outputs, so I re-dispatched waiters that never exited) × overlapping 32-way `ocamlc` harness sweeps (couldn't tell a sweep had finished, relaunched it). Fixes: NO background poll-loops (run synchronously, check once); never re-dispatch on a transport error without checking; `JOBS=8` not 32; oracle cache removes per-run ocamlc fan-out. See [[parallel-corpus-harness]].  ☐ Lambda  ☐ Bytecode  ☐ Native
+  **LOAD POST-MORTEM (2026-06-06):** a long agent-driven session melted the machine. Cause: orphaned background `until…sleep` poll-loops accumulating (the result-channel kept dropping outputs, so I re-dispatched waiters that never exited) × overlapping 32-way `ocamlc` harness sweeps (couldn't tell a sweep had finished, relaunched it). Fixes: NO background poll-loops (run synchronously, check once); never re-dispatch on a transport error without checking; `JOBS=8` not 32; oracle cache removes per-run ocamlc fan-out. See [[parallel-corpus-harness]].
+- ◐ **Lambda** — vs `ocamlc -dlambda`: **18.6% dump-parity** (138/743 byte-identical, up from 9.8%/73), **completeness held at 99.2%** (false-rejection over oracle-accepted) the whole climb. Tool `c++lambda`; harness `cxx/harness/lambda_parity.sh`. Features landed this session: match→switch, seq for discarded bindings + the print-margin fix (effective margin 77), unit value-kind, ref/`!`/`:=`/incr/decr, records (literal/field/set, mutable→makemutable), user variant construction, submodules + `M.x`, for/while, exceptions/raise/try-with, arrays, string escaping + char + boxed-int literals, C externals, pervasive %-primitives, comparison operators, function params for all patterns, per-expression value-kind inference.
+- ◐ **Bytecode (instr)** — NEW phase: `cxx/{include,src}/bytecode.{hpp,cpp}` — Bytegen lowers the Lambda IR to the stack+accumulator VM instruction stream, validated against `ocamlc -dinstr`. Tool `c++instr`; harness `cxx/harness/instr_parity.sh`. **Baseline 20.8% instr-parity** (162/777 byte-identical). Of the diffs, only ~22 are bytegen's own gaps (stubbed for/while/switch/try); the rest are inherited from the lambda stage.
+- ● **emitcode / `.cmo`** — NEW phase: `cxx/{include,src}/cmo.{hpp,cpp}` + the `c++cmo` tool — encodes the instruction stream to relocatable bytecode (compact opcodes, label backpatching, emit peephole fusions, relocations) and writes a real `.cmo` (magic `Caml1999O038` + code + a marshaled `Cmo_format.compilation_unit`, via a minimal OCaml Marshal *writer*). **MILESTONE:** a c++caml-produced `.cmo` is read by `ocamlobjinfo`, linked by the real `ocamlc` against `stdlib.cma`, and run by `ocamlrun` — `hello.ml` prints "hello from c++caml"; arithmetic, `string_of_int`, `if`, and a user function also run correctly.
+- ☐ **Linker** (next)  ☐ **Native**
+
+Pipeline now: lex (done) → parse (done) → type/infer (done, 99.2% accept) → lambda (18.6%) → bytecode instr (20.8%) → emit `.cmo` (runnable) → [next: own linker]. New tools: `c++lambda`, `c++instr`, `c++cmo`; harnesses `cxx/harness/{lambda_parity,instr_parity}.sh`.
 
 **Files converted (OCaml → C++)**
 
@@ -981,3 +987,34 @@ match/switch compilation, tuples/records/constructors -> makeblock (the type-era
 blocks/tags), and qualified calls into other stdlib modules (List.map -> field of
 Stdlib__List).  Each is a population of files.  The dump-diff loop is solid; this is the
 typer climb again, earlier on the curve.
+
+### 2026-06-07 — lambda 9.8 → 18.6%, NEW bytecode + `.cmo`, first runnable artifact
+
+**Lambda climb (`ocamlc -dlambda`): 9.8 → 18.6% dump-parity** — 73 → **138** byte-identical
+files of 743, with **completeness held at 99.2%** (false-rejection over oracle-accepted) the
+whole way. Features added, each oracle-validated: match→switch; seq for discarded bindings +
+the print-margin fix (effective margin 77); unit value-kind; `ref`/`!`/`:=`/`incr`/`decr`;
+records (literal/field/set, mutable→makemutable); user variant construction; submodules +
+`M.x`; for/while; exceptions/raise/try-with; arrays; string escaping + char + boxed-int
+literals; C externals; pervasive %-primitives; comparison operators; function params for all
+patterns; per-expression value-kind inference.
+
+**NEW phase — bytecode instruction stream (`-dinstr`).** Added `cxx/{include,src}/bytecode.
+{hpp,cpp}`: Bytegen lowers the Lambda IR to the stack+accumulator VM instruction stream,
+validated against `ocamlc -dinstr` via `cxx/harness/instr_parity.sh` (tool `c++instr`).
+**Baseline 20.8%** (162/777 byte-identical instruction streams). Of the diffs, only ~22 are
+bytegen's own gaps (stubbed for/while/switch/try); the rest are *inherited* from the lambda
+stage — so closing lambda pulls this up with it.
+
+**NEW phase — emitcode / `.cmo`, and the first runnable artifact.** Added `cxx/{include,src}/
+cmo.{hpp,cpp}` + the `c++cmo` tool: encodes the instruction stream to relocatable bytecode
+(compact opcodes, label backpatching, the emit peephole fusions, relocations) and writes a
+real `.cmo` — magic `Caml1999O038` + code + a marshaled `Cmo_format.compilation_unit`, via a
+minimal OCaml Marshal *writer*. **MILESTONE:** a c++caml-produced `.cmo` is read by
+`ocamlobjinfo`, linked by the real `ocamlc` against `stdlib.cma`, and run by `ocamlrun` —
+`hello.ml` prints "hello from c++caml"; arithmetic, `string_of_int`, `if`, and a user
+function also run correctly. First end-to-end byte that c++caml emits and the real toolchain
+accepts and runs.
+
+Pipeline now: lex (done) → parse (done) → type/infer (done, 99.2% accept) → lambda (18.6%) →
+bytecode instr (20.8%) → emit `.cmo` (runnable) → **next: our own linker**.
