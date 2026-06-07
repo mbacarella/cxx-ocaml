@@ -1064,6 +1064,17 @@ struct Checker {
       infer_expr(*wh->body);
       return eng.constr("unit");
     }
+    if (auto* tr = std::get_if<Pexp_try>(&e.desc)) {
+      TypePtr t = infer_expr(*tr->e);  // body and every handler share the result type
+      for (auto& c : tr->cases) {
+        venv.emplace_back();
+        infer_pat(c.lhs);  // an exception pattern (binds exn-typed vars)
+        if (c.guard) try_unify(infer_expr(**c.guard), eng.constr("bool"));
+        try_unify(t, infer_expr(*c.rhs));
+        venv.pop_back();
+      }
+      return t;
+    }
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       TypePtr se = infer_expr(*m->e);
       TypePtr sr = I::Engine::repr(se);

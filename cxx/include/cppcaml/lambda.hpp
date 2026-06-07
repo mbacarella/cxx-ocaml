@@ -49,11 +49,16 @@ enum class Prim {
   SetfieldImm, // setfield_imm n  (:= into an immediate-contents ref)
   SetfieldPtr, // setfield_ptr n  (:= into a pointer-contents ref)
   Offsetref,   // +:=n   (incr/decr)
+  Ccall,       // a C external call, printed by its C name (prim_id)
+  IntCmp,      // integer comparison; spelling (< > <= >= == !=) in prim_id
+  Raise,       // (raise e)
+  Reraise,     // (reraise e)  (exception handler fall-through)
 };
 
 struct Lam {
   enum class K { Var, ConstInt, ConstChar, ConstFloat, ConstString, ConstBlock,
-                 Apply, Function, Let, Prim, IfThenElse, Sequence, Switch };
+                 Apply, Function, Let, Prim, IfThenElse, Sequence, Switch,
+                 For, While, Try };
   K k;
 
   Ident var;                       // Var
@@ -75,8 +80,9 @@ struct Lam {
   // Prim
   Prim prim;
   int prim_arg = 0;                // field index / makeblock tag / offsetref delta
-  std::string prim_id;             // global name (e.g. "Stdlib")
+  std::string prim_id;             // global name (e.g. "Stdlib") / Ccall name / cmp op
   std::vector<ValueKind> blk_shape;  // makemutable block_shape (per-field kinds)
+  bool downto_ = false;            // For: counts down
 
   // IfThenElse
   LamPtr cond, then_, else_;

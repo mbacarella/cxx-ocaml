@@ -39,6 +39,9 @@ struct Doc {
 };
 DocP text(std::string s) { auto d = std::make_shared<Doc>(); d->t = Doc::Text; d->s = std::move(s); return d; }
 DocP brk(std::string sep = " ") { auto d = std::make_shared<Doc>(); d->t = Doc::Break; d->s = std::move(sep); return d; }
+// A break carrying its own indent offset (Format's `@;<width off>`); a forced
+// newline lands at box-open + box-offset + this offset.
+DocP brk_off(std::string sep, int off) { auto d = brk(std::move(sep)); d->off = off; return d; }
 DocP box(BoxT bt, int off, std::vector<DocP> ch) {
   auto d = std::make_shared<Doc>(); d->t = Doc::Box; d->bt = bt; d->off = off; d->ch = std::move(ch); return d;
 }
@@ -116,7 +119,7 @@ struct Render {
             else nl = cur_indent > brk_indent;  // > pp_margin - width + off
             break;
         }
-        if (nl) newline(brk_indent);
+        if (nl) newline(brk_indent + c->off);  // c->off: this break's own offset
         else emit(c->s);
       }
     }
@@ -267,6 +270,8 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::Offsetref: head = "(+:=" + std::to_string(l->prim_arg); break;
         case Prim::Ccall: head = "(" + l->prim_id; break;
         case Prim::IntCmp: head = "(" + l->prim_id; break;
+        case Prim::Raise: head = "(raise"; break;
+        case Prim::Reraise: head = "(reraise"; break;
       }
       std::vector<DocP> xs{text(head)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
@@ -302,6 +307,10 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
                                 to_doc(l->then_, pr), brk(),
                                 text(l->downto_ ? "downto" : "to"), brk(),
                                 to_doc(l->else_, pr), brk(), to_doc(l->body, pr), text(")")});
+    case Lam::K::Try:  // @[<2>(try@ body@;<1 -1>with exn@ handler)@]
+      return box(BoxT::Box, 2, {text("(try"), brk(), to_doc(l->body, pr),
+                                brk_off(" ", -1), text("with " + pr.ident(l->var)),
+                                brk(), to_doc(l->then_, pr), text(")")});
     case Lam::K::Switch: {
       // @[<1>(switch* larg@ @[<v 0> @[<hv 1>case int N:@ body@] @ ... @])@]
       std::vector<DocP> cases;
@@ -373,6 +382,9 @@ struct Translator {
   // User C externals: value name -> C primitive name (the `external f = "cname"`
   // string).  Applying one emits (cname args); %-builtins are left for later.
   std::unordered_map<std::string, std::string> externals_;
+  // Locally-declared exceptions: name -> its binder (the makeblock-248 value).
+  std::unordered_map<std::string, Ident> exn_ident_;
+  std::string mod_path_;  // dotted module path prefix for exception names
 
   // Locally-declared variant constructors: name -> {owning type, tag, is_block}.
   // Constant (nullary) and block (with-args) constructors are numbered
@@ -529,6 +541,49 @@ struct Translator {
   }
 
   LamPtr cint(long long n) { auto z = mk(Lam::K::ConstInt); z->int_val = n; return z; }
+  // The identity value of an exception constructor: a local exception's binder, a
+  // predefined exception's Stdlib field, else null (unresolved).
+  LamPtr exn_value(const std::string& name) {
+    if (auto ei = exn_ident_.find(name); ei != exn_ident_.end()) {
+      auto v = mk(Lam::K::Var); v->var = ei->second; return v;
+    }
+    if (auto sf = stdlib_fields.find(name); sf != stdlib_fields.end())
+      return field_of("Stdlib", sf->second);
+    return nullptr;
+  }
+  // Compile a `try ... with` handler body: an if-chain testing the caught
+  // exception `exn` against each case, falling through to (reraise exn).
+  LamPtr exn_dispatch(const Ident& exn, const std::vector<Case>& cases, size_t i) {
+    if (i >= cases.size()) {
+      auto rr = mk(Lam::K::Prim); rr->prim = Prim::Reraise;
+      auto v = mk(Lam::K::Var); v->var = exn; rr->args = {v}; return rr;
+    }
+    const Case& c = cases[i];
+    if (!c.guard) {
+      if (is_catchall(c.lhs)) {  // `_`/var: handle unconditionally
+        if (auto* pv = std::get_if<Ppat_var>(&c.lhs.desc)) scope.back()[pv->name.txt] = exn;
+        return expr(*c.rhs);
+      }
+      if (auto* k = std::get_if<Ppat_construct>(&c.lhs.desc))
+        if (LamPtr id = exn_value(lid_last(k->id.txt))) {
+          auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
+          LamPtr lhs;
+          if (k->arg) {  // exn carries data: compare its identity field
+            lhs = mk(Lam::K::Prim); lhs->prim = Prim::FieldImm; lhs->prim_arg = 0;
+            lhs->args = {exv()};
+          } else {
+            lhs = exv();
+          }
+          auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
+          test->args = {lhs, id};
+          auto iff = mk(Lam::K::IfThenElse);
+          iff->cond = test; iff->then_ = expr(*c.rhs);
+          iff->else_ = exn_dispatch(exn, cases, i + 1);
+          return iff;
+        }
+    }
+    return exn_dispatch(exn, cases, i + 1);  // unsupported case: skip
+  }
   static bool is_catchall(const Pattern& p) {
     return std::holds_alternative<Ppat_any>(p.desc) || std::holds_alternative<Ppat_var>(p.desc);
   }
@@ -663,6 +718,12 @@ struct Translator {
         }
         return block(ci->second.tag, std::move(fs));
       }
+      if (auto ei = exn_ident_.find(n); ei != exn_ident_.end() && !k->arg) {
+        auto v = mk(Lam::K::Var); v->var = ei->second; return v;  // local exception value
+      }
+      if (!k->arg)  // a predefined exception (Not_found, ...) is a Stdlib field
+        if (auto sf = stdlib_fields.find(n); sf != stdlib_fields.end())
+          return field_of("Stdlib", sf->second);
       auto v = mk(Lam::K::Var); v->var = fresh("?" + n);  // user ctor: needs its tag (defer)
       return v;
     }
@@ -702,6 +763,11 @@ struct Translator {
             if (auto ex = externals_.find(n); ex != externals_.end()) {  // C external
               auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = ex->second;
               for (auto& a : as) pr->args.push_back(expr(*a.second));
+              return pr;
+            }
+            if (n == "raise" && as.size() == 1) {
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Raise;
+              pr->args = {expr(*as[0].second)};
               return pr;
             }
             if (int_op(n, p) && as.size() == 2) {
@@ -816,6 +882,15 @@ struct Translator {
       scope.pop_back();
       return l;
     }
+    if (auto* tr = std::get_if<Pexp_try>(&e.desc)) {
+      auto l = mk(Lam::K::Try);
+      l->body = expr(*tr->e);
+      scope.emplace_back();
+      l->var = fresh("exn");
+      l->then_ = exn_dispatch(l->var, tr->cases, 0);
+      scope.pop_back();
+      return l;
+    }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) return expr(*ct->e);
     return mk(Lam::K::ConstInt);  // unsupported: placeholder (will DIFF)
   }
@@ -868,6 +943,19 @@ struct Translator {
         auto& pd = pp->prim;
         if (!pd.prims.empty() && pd.prims[0][0] != '%')  // C call (not a %-builtin)
           externals_[pd.name.txt] = pd.prims[0];
+        continue;
+      }
+      if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {  // exception E [of ...]
+        const std::string& nm = pe->exn.ctor.name.txt;
+        auto str = mk(Lam::K::ConstString); str->str_val = mod_path_ + "." + nm;
+        auto oid = mk(Lam::K::Prim); oid->prim = Prim::Ccall;
+        oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
+        blk->args = {str, oid};
+        Ident id = fresh(nm);
+        cur.push_back({id, ValueKind::Gen, blk});
+        exn_ident_[nm] = id;
+        add_export(nm, id);
         continue;
       }
       if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {  // module M = struct ... end
@@ -932,6 +1020,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     int i = 0;
     for (auto& f : cmi.sig().fields) t.stdlib_fields[f] = i++;
   } catch (...) {}
+  t.mod_path_ = module_name;
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
   sg->args.push_back(t.build_module(s, nullptr));
