@@ -74,7 +74,9 @@ struct Lam {
   LamPtr body;
 
   // Let: a group of bindings (kind shown as =[kind]) then a body
-  struct Binding { Ident id; ValueKind kind; LamPtr val; };
+  // alias: the Llet Alias kind (printed `=a`), used for pattern-variable bindings
+  // to a sub-term of the scrutinee (e.g. `Some y` where y is used more than once).
+  struct Binding { Ident id; ValueKind kind; LamPtr val; bool alias = false; };
   std::vector<Binding> bindings;
 
   // Prim

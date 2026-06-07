@@ -226,7 +226,8 @@ DocP let_doc(const LamPtr& l, Pr& pr) {
     auto& b = l->bindings[i];
     if (i) binds.push_back(brk());
     binds.push_back(box(BoxT::Box, 2,
-        {text(pr.ident(b.id) + " =" + kind_suffix(b.kind)), brk(), to_doc(b.val, pr)}));
+        {text(pr.ident(b.id) + " =" + std::string(b.alias ? "a" : "") + kind_suffix(b.kind)),
+         brk(), to_doc(b.val, pr)}));
   }
   binds.push_back(text(")"));
   DocP bindings = box(BoxT::Hv, 1, std::move(binds));
@@ -434,6 +435,25 @@ struct Translator {
       if (immediate_local_.count(b)) return ValueKind::Int;
     }
     return ValueKind::Gen;
+  }
+
+  // Predefined variant constructors, so constructor matches over option/list/
+  // result (and bool/unit) get the same tag info as local variants.
+  void register_predef_ctor_info() {
+    ctor_info_["None"]  = {"option", 0, false, 0};
+    ctor_info_["Some"]  = {"option", 0, true, 1};
+    ctor_info_["[]"]    = {"list", 0, false, 0};
+    ctor_info_["::"]    = {"list", 0, true, 2};
+    ctor_info_["Ok"]    = {"result", 0, true, 1};
+    ctor_info_["Error"] = {"result", 1, true, 1};
+    ctor_info_["false"] = {"bool", 0, false, 0};
+    ctor_info_["true"]  = {"bool", 1, false, 0};
+    ctor_info_["()"]    = {"unit", 0, false, 0};
+    type_ctors_["option"] = {1, 1};
+    type_ctors_["list"]   = {1, 1};
+    type_ctors_["result"] = {0, 2};
+    type_ctors_["bool"]   = {2, 0};
+    type_ctors_["unit"]   = {1, 0};
   }
 
   void register_types(const Structure& s) {
@@ -843,6 +863,123 @@ struct Translator {
   }
   // Compile a match into an if-chain (int constants + catch-all) or a bool if;
   // other forms (variant tags, nested patterns, guards) fall back best-effort.
+  // Count / substitute occurrences of a binder in a (freshly-built) Lambda tree.
+  static int count_var(const LamPtr& l, const Ident& id) {
+    if (!l) return 0;
+    if (l->k == Lam::K::Var)
+      return (l->var.stamp == id.stamp && l->var.name == id.name) ? 1 : 0;
+    int c = count_var(l->fn, id) + count_var(l->body, id) + count_var(l->cond, id) +
+            count_var(l->then_, id) + count_var(l->else_, id) + count_var(l->sw_default, id);
+    for (auto& a : l->args) c += count_var(a, id);
+    for (auto& b : l->bindings) c += count_var(b.val, id);
+    for (auto& sc : l->sw_consts) c += count_var(sc.body, id);
+    for (auto& sc : l->sw_blocks) c += count_var(sc.body, id);
+    return c;
+  }
+  static void subst_var(LamPtr& l, const Ident& id, const LamPtr& repl) {
+    if (!l) return;
+    if (l->k == Lam::K::Var && l->var.stamp == id.stamp && l->var.name == id.name) { l = repl; return; }
+    subst_var(l->fn, id, repl); subst_var(l->body, id, repl); subst_var(l->cond, id, repl);
+    subst_var(l->then_, id, repl); subst_var(l->else_, id, repl); subst_var(l->sw_default, id, repl);
+    for (auto& a : l->args) subst_var(a, id, repl);
+    for (auto& b : l->bindings) subst_var(b.val, id, repl);
+    for (auto& sc : l->sw_consts) subst_var(sc.body, id, repl);
+    for (auto& sc : l->sw_blocks) subst_var(sc.body, id, repl);
+  }
+  LamPtr fieldimm(int i, const LamPtr& s) {
+    auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = i; f->args = {s}; return f;
+  }
+
+  // Compile one block-constructor arm: bind its argument fields (field_imm i scrut)
+  // in the body, inlining single-use bindings and `=a`-aliasing multi-use ones (as
+  // ocamlc's matcher + simplif do).  Returns null for sub-patterns we don't bind.
+  LamPtr build_block_arm(const LamPtr& scrut, const CtorInfo& ci,
+                         const Ppat_construct* k, const Expression& rhs) {
+    scope.emplace_back();
+    std::vector<std::pair<int, Ident>> binders;
+    bool ok = true;
+    auto bind_field = [&](int idx, const Pattern& p) {
+      if (std::holds_alternative<Ppat_any>(p.desc)) return;             // wildcard: no binder
+      if (auto* pv = std::get_if<Ppat_var>(&p.desc)) {
+        Ident id = fresh(pv->name.txt);
+        scope.back()[pv->name.txt] = id;
+        binders.push_back({idx, id});
+        return;
+      }
+      ok = false;  // a deeper sub-pattern -- not handled here
+    };
+    if (k->arg) {
+      const Pattern& arg = **k->arg;
+      if (ci.arity > 1) {
+        auto* tup = std::get_if<Ppat_tuple>(&arg.desc);
+        if (!tup || (int)tup->elems.size() != ci.arity) ok = false;
+        else for (int idx = 0; idx < ci.arity && ok; ++idx) bind_field(idx, *tup->elems[idx]);
+      } else {
+        bind_field(0, arg);
+      }
+    }
+    if (!ok) { scope.pop_back(); return nullptr; }
+    LamPtr body = expr(rhs);
+    scope.pop_back();
+    std::vector<Lam::Binding> aliases;
+    for (auto& [idx, id] : binders) {
+      LamPtr fa = fieldimm(idx, scrut);
+      if (count_var(body, id) <= 1) subst_var(body, id, fa);
+      else aliases.push_back({id, ValueKind::Gen, fa, true});
+    }
+    if (aliases.empty()) return body;
+    auto l = mk(Lam::K::Let); l->bindings = std::move(aliases); l->body = body; return l;
+  }
+
+  // Match over constructor patterns of one variant type.  Two exact shapes:
+  //   1 constant + 1 block  -> (if scrut <block-arm> <const-arm>)   (option/list)
+  //   blocks only (>=2)     -> (switch* scrut case tag T: ...)      (result)
+  // Returns null otherwise (mixed isint forms / non-exhaustive / complex
+  // sub-patterns), so the caller falls back without harm.  Eligibility is decided
+  // before any arm is compiled, so a null return allocates no stamps.
+  LamPtr ctor_match(const LamPtr& scrut, const std::vector<Case>& cases) {
+    if (cases.empty()) return nullptr;
+    std::string type;
+    int nconst = 0, nblock = 0;
+    for (auto& c : cases) {
+      if (c.guard) return nullptr;
+      auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
+      if (!k) return nullptr;
+      auto it = ctor_info_.find(ctor_of(c.lhs));
+      if (it == ctor_info_.end()) return nullptr;
+      if (type.empty()) type = it->second.type;
+      else if (type != it->second.type) return nullptr;
+      if (it->second.is_block) ++nblock; else { if (k->arg) return nullptr; ++nconst; }
+    }
+    auto tc = type_ctors_.find(type);
+    if (tc == type_ctors_.end()) return nullptr;
+    if (nconst != tc->second.first || nblock != tc->second.second) return nullptr;  // not exhaustive
+    bool shape_if = nconst == 1 && nblock == 1;
+    bool shape_sw = nconst == 0 && nblock >= 2;
+    if (!shape_if && !shape_sw) return nullptr;
+    // Eligible: now compile arms.
+    LamPtr const_arm; std::vector<Lam::SwitchCase> blocks;
+    for (auto& c : cases) {
+      auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
+      auto& ci = ctor_info_.at(ctor_of(c.lhs));
+      if (ci.is_block) {
+        LamPtr body = build_block_arm(scrut, ci, k, *c.rhs);
+        if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
+        blocks.push_back({ci.tag, body});
+      } else {
+        const_arm = expr(*c.rhs);
+      }
+    }
+    if (shape_if) {
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = scrut; i->then_ = blocks[0].body; i->else_ = const_arm;
+      return i;
+    }
+    std::sort(blocks.begin(), blocks.end(), [](auto& x, auto& y) { return x.tag < y.tag; });
+    auto sw = mk(Lam::K::Switch); sw->cond = scrut; sw->sw_blocks = std::move(blocks);
+    return sw;
+  }
+
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases) {
     // A non-variable scrutinee with a `| n -> ...` catch-all is bound to n first
     // (`let n = scrut in ...`), so n refers to it inside the arms (matches ocamlc).
@@ -868,6 +1005,7 @@ struct Translator {
       }
     }
     if (auto sw = const_switch(scrut, cases)) return sw;
+    if (auto cm = ctor_match(scrut, cases)) return cm;
     return int_cases(scrut, cases, 0);
   }
 
@@ -1389,6 +1527,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   Translator t;
   t.stdlib_dir = stdlib_dir;
   t.vk = infer_value_kinds(s);
+  t.register_predef_ctor_info();
   t.register_types(s);
   try {  // Stdlib value -> module field index, for pervasive resolution
     auto cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
