@@ -956,3 +956,28 @@ completeness-preserving incremental soundness work is **complete at 69.7% false-
 Final session axes: completeness 17.2% -> 0.8% false-rejection (99.2% accept); soundness
 81.1% -> 69.7% false-acceptance.  Further gains are a deliberate choice to build a full deep
 subsystem (with transient completeness risk), not an incremental check.
+
+## Lambda climb: stdlib field resolution + faithful Format port
+
+Two foundational pieces landed (parity flat at 11.3%, but for the right reason -- see below):
+
+- **Stdlib field resolution.** Extended the cmi reader to emit the module's runtime field
+  components in order (Signature.fields): a regular value (Val_reg, detected via val_kind --
+  an inlined %/C primitive takes no field), an exception, or a submodule.  Verified against
+  the oracle: print_string=41, print_int=43 exactly.  Lambda now compiles a pervasive /
+  Stdlib.x to `(field_imm N (global Stdlib!))`.
+- **Faithful Format pretty-printer.** Discovered `@[<n>]` is **Pp_box**, not hov (read
+  camlinternalFormat.open_box_of_string + format.ml's break logic).  Ported format.ml's
+  decisions exactly: a box becomes "fits" when its flat width fits (all breaks flat) else
+  keeps its type; Pp_box breaks a hint when the next chunk overflows OR the current line is
+  already indented past the box's open column (the rule that puts the module's makeblock on
+  its own line).  Nesting-aware Oppen break-sizes; raw stamps for layout (digit widths must
+  match OCaml; harness normalizes for the byte compare).
+
+Now byte-exact: pervasive calls, let-in, sequences, packed function params, the
+module let/makeblock structure.  **The printer was the gate for multi-line files; it is now
+faithful (proven on the test cases).  The remaining gate is translation breadth** --
+match/switch compilation, tuples/records/constructors -> makeblock (the type-erasure into
+blocks/tags), and qualified calls into other stdlib modules (List.map -> field of
+Stdlib__List).  Each is a population of files.  The dump-diff loop is solid; this is the
+typer climb again, earlier on the curve.
