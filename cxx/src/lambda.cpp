@@ -1,4 +1,5 @@
 #include "cppcaml/lambda.hpp"
+#include <cstdio>
 
 #include <algorithm>
 #include <functional>
@@ -178,6 +179,41 @@ std::string ret_suffix(ValueKind k) {
   return "";
 }
 
+// Replicate OCaml's Char.escaped (printlambda prints a char constant as 'x').
+std::string ocaml_char(int code) {
+  unsigned char c = (unsigned char)code;
+  switch (c) {
+    case '\'': return "\\'";
+    case '\\': return "\\\\";
+    case '\n': return "\\n";
+    case '\t': return "\\t";
+    case '\r': return "\\r";
+    case '\b': return "\\b";
+    default:
+      if (c >= ' ' && c <= '~') return std::string(1, (char)c);
+      char b[5]; std::snprintf(b, sizeof b, "\\%03d", c); return b;
+  }
+}
+
+// Replicate OCaml's String.escaped (used by printlambda for string constants).
+std::string ocaml_escape(const std::string& s) {
+  std::string o;
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\t': o += "\\t"; break;
+      case '\r': o += "\\r"; break;
+      case '\b': o += "\\b"; break;
+      default:
+        if (c >= ' ' && c <= '~') o += (char)c;
+        else { char b[5]; std::snprintf(b, sizeof b, "\\%03d", c); o += b; }
+    }
+  }
+  return o;
+}
+
 DocP to_doc(const LamPtr& l, Pr& pr);
 
 // @[<2>(let@ @[<hv 1>(@[<2>id =vk@ val@] @ ...)@]@ body)@]
@@ -197,9 +233,10 @@ DocP let_doc(const LamPtr& l, Pr& pr) {
 DocP to_doc(const LamPtr& l, Pr& pr) {
   switch (l->k) {
     case Lam::K::Var: return text(pr.ident(l->var));
-    case Lam::K::ConstInt: return text(std::to_string(l->int_val));
+    case Lam::K::ConstInt: return text(std::to_string(l->int_val) + l->str_val);
+    case Lam::K::ConstChar: return text("'" + ocaml_char((int)l->int_val) + "'");
     case Lam::K::ConstFloat: return text(l->str_val);
-    case Lam::K::ConstString: return text("\"" + l->str_val + "\"");
+    case Lam::K::ConstString: return text("\"" + ocaml_escape(l->str_val) + "\"");
     case Lam::K::ConstBlock: {  // struct_const: [tag] or [tag: f1 f2 ...]
       std::string tag = std::to_string(l->prim_arg);
       if (l->args.empty()) return text("[" + tag + "]");
@@ -294,7 +331,12 @@ ValueKind vkind(const std::string& s) {
 
 LamPtr translate_const(const Constant& c) {
   if (auto* i = std::get_if<Pconst_integer>(&c.desc)) {
-    auto l = mk(Lam::K::ConstInt); l->int_val = std::stoll(i->value); return l;
+    auto l = mk(Lam::K::ConstInt); l->int_val = std::stoll(i->value);
+    if (i->suffix) l->str_val = std::string(1, *i->suffix);  // 42L / 42l / 42n
+    return l;
+  }
+  if (auto* ch = std::get_if<Pconst_char>(&c.desc)) {  // prints as 'x', value is its byte
+    auto l = mk(Lam::K::ConstChar); l->int_val = ch->code; return l;
   }
   if (auto* f = std::get_if<Pconst_float>(&c.desc)) {
     auto l = mk(Lam::K::ConstFloat); l->str_val = f->value; return l;
@@ -443,8 +485,9 @@ struct Translator {
   }
 
   static bool is_const(const LamPtr& l) {
-    return l->k == Lam::K::ConstInt || l->k == Lam::K::ConstFloat ||
-           l->k == Lam::K::ConstString || l->k == Lam::K::ConstBlock;
+    return l->k == Lam::K::ConstInt || l->k == Lam::K::ConstChar ||
+           l->k == Lam::K::ConstFloat || l->k == Lam::K::ConstString ||
+           l->k == Lam::K::ConstBlock;
   }
   // Build a block: a struct-const [tag: ...] if all fields are constant, else a
   // dynamic (makeblock tag ...).

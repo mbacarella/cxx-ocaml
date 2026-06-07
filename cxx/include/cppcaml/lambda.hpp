@@ -52,8 +52,8 @@ enum class Prim {
 };
 
 struct Lam {
-  enum class K { Var, ConstInt, ConstFloat, ConstString, ConstBlock, Apply,
-                 Function, Let, Prim, IfThenElse, Sequence, Switch };
+  enum class K { Var, ConstInt, ConstChar, ConstFloat, ConstString, ConstBlock,
+                 Apply, Function, Let, Prim, IfThenElse, Sequence, Switch };
   K k;
 
   Ident var;                       // Var
