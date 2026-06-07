@@ -318,7 +318,7 @@ struct Translator {
   // Locally-declared variant constructors: name -> {owning type, tag, is_block}.
   // Constant (nullary) and block (with-args) constructors are numbered
   // separately from 0 in declaration order, matching the runtime representation.
-  struct CtorInfo { std::string type; int tag; bool is_block; };
+  struct CtorInfo { std::string type; int tag; bool is_block; int arity; };
   std::unordered_map<std::string, CtorInfo> ctor_info_;
   std::unordered_map<std::string, std::pair<int, int>> type_ctors_;  // type -> (n_const, n_block)
   std::set<std::string> immediate_local_;  // local all-constant variant type names
@@ -359,10 +359,11 @@ struct Translator {
         bool all_const = !v->ctors.empty(), gadt = false;
         for (auto& c : v->ctors) {
           bool block = true;
-          if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) block = !t->elems.empty();
+          int arity = 0;
+          if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) { arity = (int)t->elems.size(); block = arity > 0; }
           if (c.res) gadt = true;
           if (block) all_const = false;
-          ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block};
+          ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block, arity};
           if (block) ++nb; else ++nc;
         }
         type_ctors_[d.name.txt] = {nc, nb};
@@ -580,6 +581,18 @@ struct Translator {
           return block(0, {expr(*at->elems[0]), expr(*at->elems[1])});
       }
       if (n == "Some" && k->arg) return block(0, {expr(**k->arg)});
+      if (auto ci = ctor_info_.find(n); ci != ctor_info_.end()) {  // local variant ctor
+        if (!ci->second.is_block) return cint(ci->second.tag);  // constant -> its tag
+        std::vector<LamPtr> fs;
+        if (k->arg) {  // `B of t1 * t2` flattens the tuple argument into fields
+          if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+              at && ci->second.arity > 1 && (int)at->elems.size() == ci->second.arity)
+            for (auto& el : at->elems) fs.push_back(expr(*el));
+          else
+            fs.push_back(expr(**k->arg));
+        }
+        return block(ci->second.tag, std::move(fs));
+      }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + n);  // user ctor: needs its tag (defer)
       return v;
     }
