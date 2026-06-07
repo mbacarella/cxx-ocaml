@@ -867,10 +867,14 @@ struct Checker {
   }
 
   TypePtr infer_pat(const Pattern& p) {
+    TypePtr t = infer_pat_impl(p);
+    if (record_kinds_) rec_pat_[&p] = t;  // record every pattern's kind (params incl.)
+    return t;
+  }
+  TypePtr infer_pat_impl(const Pattern& p) {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
       auto t = eng.fresh_var();
       venv.back()[v->name.txt] = t;  // monomorphic in its scope
-      if (record_kinds_) rec_pat_[&p] = t;
       return t;
     }
     if (std::holds_alternative<Ppat_any>(p.desc)) return eng.fresh_var();

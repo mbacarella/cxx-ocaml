@@ -265,6 +265,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::SetfieldImm: head = "(setfield_imm " + std::to_string(l->prim_arg); break;
         case Prim::SetfieldPtr: head = "(setfield_ptr " + std::to_string(l->prim_arg); break;
         case Prim::Offsetref: head = "(+:=" + std::to_string(l->prim_arg); break;
+        case Prim::Ccall: head = "(" + l->prim_id; break;
       }
       std::vector<DocP> xs{text(head)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
@@ -360,6 +361,9 @@ struct Translator {
   // (export value/submodule name -> field index), for resolving `M.x`.
   std::unordered_map<std::string, Ident> module_ident_;
   std::unordered_map<std::string, std::unordered_map<std::string, int>> module_layout_;
+  // User C externals: value name -> C primitive name (the `external f = "cname"`
+  // string).  Applying one emits (cname args); %-builtins are left for later.
+  std::unordered_map<std::string, std::string> externals_;
 
   // Locally-declared variant constructors: name -> {owning type, tag, is_block}.
   // Constant (nullary) and block (with-args) constructors are numbered
@@ -676,6 +680,11 @@ struct Translator {
           if (!lookup(l->name)) {  // an unshadowed pervasive operator
             const auto& n = l->name;
             auto& as = ap->args;
+            if (auto ex = externals_.find(n); ex != externals_.end()) {  // C external
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = ex->second;
+              for (auto& a : as) pr->args.push_back(expr(*a.second));
+              return pr;
+            }
             if (int_op(n, p) && as.size() == 2) {
               auto pr = mk(Lam::K::Prim); pr->prim = p;
               pr->args = {expr(*as[0].second), expr(*as[1].second)};
@@ -760,12 +769,17 @@ struct Translator {
     scope.emplace_back();
     auto l = mk(Lam::K::Function);
     for (auto& fp : f.params)
-      if (auto* pv = std::get_if<Pparam_val>(&fp.desc))
+      if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
+        // Every parameter gets a binder; a non-variable pattern (`()`, `_`, a
+        // tuple) is named "param" like ocamlc and matched in the body (deferred).
         if (auto* var = std::get_if<Ppat_var>(&pv->pat.desc)) {
           Ident id = fresh(var->name.txt);
           l->params.push_back({id, pat_kind(&pv->pat)});
           scope.back()[var->name.txt] = id;
+        } else {
+          l->params.push_back({fresh("param"), pat_kind(&pv->pat)});
         }
+      }
     auto rk = vk.fn_ret.find(&f);
     l->ret_kind = rk == vk.fn_ret.end() ? ValueKind::Gen : vkind(rk->second);
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) l->body = expr(*fb->e);
@@ -792,6 +806,12 @@ struct Translator {
     for (auto& it : s) {
       if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
         flush(); segs.push_back({true, {}, expr(*pe->e)}); continue;
+      }
+      if (auto* pp = std::get_if<Pstr_primitive>(&it.desc)) {  // external f = "cname"
+        auto& pd = pp->prim;
+        if (!pd.prims.empty() && pd.prims[0][0] != '%')  // C call (not a %-builtin)
+          externals_[pd.name.txt] = pd.prims[0];
+        continue;
       }
       if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {  // module M = struct ... end
         auto& mb = pm->binding;
