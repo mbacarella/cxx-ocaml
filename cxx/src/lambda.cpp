@@ -305,6 +305,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
     case Lam::K::Function: {
       std::vector<DocP> xs{text("(function")};
       for (auto& [id, k] : l->params) { xs.push_back(brk()); xs.push_back(text(pr.ident(id) + kind_suffix(k))); }
+      if (!l->inline_attr.empty()) { xs.push_back(brk()); xs.push_back(text(l->inline_attr)); }
       xs.push_back(brk());
       if (l->ret_kind != ValueKind::Gen) { xs.push_back(text(ret_suffix(l->ret_kind))); xs.push_back(brk()); }
       xs.push_back(to_doc(l->body, pr));
@@ -1645,6 +1646,29 @@ struct Translator {
   // structure.  Consecutive value/module bindings group into one `let`; a
   // discarded computation (`let _ = e` or bare `e;;`) becomes a `seq` that splits
   // the groups.  `names` (if given) receives the exported field names in order.
+  // The leading identifier of an attribute payload (`[@inline never]` -> "never").
+  static std::string attr_ident(const Structure& s) {
+    if (s.empty()) return "";
+    if (auto* ev = std::get_if<Pstr_eval>(&s[0].desc))
+      if (auto* id = std::get_if<Pexp_ident>(&ev->e->desc))
+        if (auto* l = std::get_if<Lident>(&id->id.txt.v)) return l->name;
+    return "";
+  }
+  // The -dlambda inline annotation from a binding's `[@inline ...]` attribute.
+  static std::string inline_of(const Attributes& attrs) {
+    for (auto& a : attrs) {
+      if (a.name != "inline" && a.name != "ocaml.inline") continue;
+      return attr_ident(a.payload) == "never" ? "never_inline" : "always_inline";
+    }
+    return "";
+  }
+  // Stamp a function value with its binding's inline annotation, if any.
+  LamPtr with_inline(LamPtr v, const Attributes& attrs) {
+    if (v && v->k == Lam::K::Function)
+      if (auto ia = inline_of(attrs); !ia.empty()) v->inline_attr = ia;
+    return v;
+  }
+
   LamPtr build_module(const Structure& s, std::vector<std::string>* names) {
     scope.emplace_back();
     struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e; };
@@ -1710,7 +1734,7 @@ struct Translator {
           }
         std::vector<Lam::Binding> binds;
         for (auto& [b, id] : recs) {
-          binds.push_back({id, pat_kind(&b->pat), expr(*b->expr)});
+          binds.push_back({id, pat_kind(&b->pat), with_inline(expr(*b->expr), b->attrs)});
           add_export(std::get_if<Ppat_var>(&b->pat.desc)->name.txt, id);
         }
         segs.push_back({false, true, std::move(binds), nullptr});
@@ -1727,7 +1751,7 @@ struct Translator {
                 continue;
               }
           Ident id = fresh(pv->name.txt);
-          cur.push_back({id, pat_kind(&b.pat), expr(*b.expr)});
+          cur.push_back({id, pat_kind(&b.pat), with_inline(expr(*b.expr), b.attrs)});
           scope.back()[pv->name.txt] = id;
           add_export(pv->name.txt, id);
         } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {

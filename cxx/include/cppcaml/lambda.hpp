@@ -72,6 +72,7 @@ struct Lam {
   std::vector<std::pair<Ident, ValueKind>> params;
   ValueKind ret_kind = ValueKind::Gen;
   LamPtr body;
+  std::string inline_attr;  // "never_inline"/"always_inline" from [@inline ...], or ""
 
   // Let: a group of bindings (kind shown as =[kind]) then a body
   // alias: the Llet Alias kind (printed `=a`), used for pattern-variable bindings
