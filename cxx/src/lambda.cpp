@@ -268,7 +268,8 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
       std::string head;
       switch (l->prim) {
         case Prim::Setglobal: head = "(setglobal " + l->prim_id + "!"; break;
-        case Prim::Makeblock: head = "(makeblock " + std::to_string(l->prim_arg); break;
+        case Prim::Makeblock:
+          head = "(makeblock " + std::to_string(l->prim_arg) + shape_suffix(l->blk_shape); break;
         case Prim::Field: head = "(field " + std::to_string(l->prim_arg); break;
         case Prim::FieldImm: head = "(field_imm " + std::to_string(l->prim_arg); break;
         case Prim::Global:
@@ -773,6 +774,15 @@ struct Translator {
     if (!allc) b->prim = Prim::Makeblock;
     b->prim_arg = tag;
     b->args = std::move(fields);
+    return b;
+  }
+  // block() from field expressions, attaching the per-field value-kind shape (a
+  // dynamic makeblock prints `(makeblock T (k1,k2,...) ...)`; all-gen -> no shape).
+  LamPtr block_of(int tag, const std::vector<const Expression*>& exprs) {
+    std::vector<LamPtr> fields; std::vector<ValueKind> shape;
+    for (auto* ex : exprs) { fields.push_back(expr(*ex)); shape.push_back(expr_kind(ex)); }
+    auto b = block(tag, std::move(fields));
+    if (b->k == Lam::K::Prim) b->blk_shape = std::move(shape);
     return b;
   }
 
@@ -1346,8 +1356,11 @@ struct Translator {
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) return compile_match(expr(*m->e), m->cases, e.loc);
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
-      for (auto& el : tu->elems) es.push_back(expr(*el));
-      return block(0, std::move(es));
+      std::vector<ValueKind> shape;
+      for (auto& el : tu->elems) { es.push_back(expr(*el)); shape.push_back(expr_kind(el.get())); }
+      auto b = block(0, std::move(es));
+      if (b->k == Lam::K::Prim) b->blk_shape = std::move(shape);  // dynamic block -> field shape
+      return b;
     }
     if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
       if (!rc->base && !rc->fields.empty())  // not a functional update `{e with ..}`
@@ -1362,7 +1375,11 @@ struct Translator {
               vals[fi->index] = expr(*ve);
             }
             if (ok) {
-              if (!rt->second.mut) return block(0, std::move(vals));
+              if (!rt->second.mut) {
+                auto b = block(0, std::move(vals));
+                if (b->k == Lam::K::Prim) b->blk_shape = rt->second.shape;  // field kinds
+                return b;
+              }
               auto m = mk(Lam::K::Prim);  // any mutable field -> makemutable
               m->prim = Prim::Makemutable; m->prim_arg = 0;
               m->blk_shape = rt->second.shape; m->args = std::move(vals);
@@ -1402,20 +1419,20 @@ struct Translator {
       if (n == "true") { auto z = mk(Lam::K::ConstInt); z->int_val = 1; return z; }
       if (n == "::" && k->arg) {  // a :: b : block tag 0 of (head, tail)
         if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc); at && at->elems.size() == 2)
-          return block(0, {expr(*at->elems[0]), expr(*at->elems[1])});
+          return block_of(0, {at->elems[0].get(), at->elems[1].get()});
       }
-      if (n == "Some" && k->arg) return block(0, {expr(**k->arg)});
+      if (n == "Some" && k->arg) return block_of(0, {k->arg->get()});
       if (auto ci = ctor_info_.find(n); ci != ctor_info_.end()) {  // local variant ctor
         if (!ci->second.is_block) return cint(ci->second.tag);  // constant -> its tag
-        std::vector<LamPtr> fs;
+        std::vector<const Expression*> fs;
         if (k->arg) {  // `B of t1 * t2` flattens the tuple argument into fields
           if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
               at && ci->second.arity > 1 && (int)at->elems.size() == ci->second.arity)
-            for (auto& el : at->elems) fs.push_back(expr(*el));
+            for (auto& el : at->elems) fs.push_back(el.get());
           else
-            fs.push_back(expr(**k->arg));
+            fs.push_back(k->arg->get());
         }
-        return block(ci->second.tag, std::move(fs));
+        return block_of(ci->second.tag, fs);
       }
       if (auto ei = exn_ident_.find(n); ei != exn_ident_.end() && !k->arg) {
         auto v = mk(Lam::K::Var); v->var = ei->second; return v;  // local exception value
