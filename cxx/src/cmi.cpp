@@ -54,7 +54,11 @@ public:
                 const m::Value& vk = arena_[vd.fields[1]];
                 if (!vk.fields.empty()) {
                   const m::Value& desc = arena_[vk.fields[0]];
+                  // description record: field 0 = prim_name, field 1 = prim_arity.
                   if (!desc.fields.empty()) sv.prim = arena_[desc.fields[0]].str;
+                  if (desc.fields.size() > 1 &&
+                      arena_[desc.fields[1]].kind == m::Value::Kind::Int)
+                    sv.prim_arity = (int)arena_[desc.fields[1]].i;
                 }
               }
               out.values.push_back(std::move(sv));

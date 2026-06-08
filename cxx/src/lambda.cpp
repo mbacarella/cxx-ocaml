@@ -406,11 +406,12 @@ struct Translator {
   std::string stdlib_dir = "stdlib";  // where to find stdlib*.cmi (CWD-relative by default)
   std::vector<std::unordered_map<std::string, Ident>> scope{{}};
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
-  std::unordered_map<std::string, std::string> stdlib_prims;  // Stdlib value -> "%prim"
+  struct StdPrim { std::string name; int arity; };  // an external's prim_name + arity
+  std::unordered_map<std::string, StdPrim> stdlib_prims;  // Stdlib value -> prim
   // module name ("List", "Printf", ...) -> its value -> field index, cached.
   std::unordered_map<std::string, std::unordered_map<std::string, int>> mod_fields;
-  // module name -> its value -> "%prim"/C-primitive name (external values), cached.
-  std::unordered_map<std::string, std::unordered_map<std::string, std::string>> mod_prims;
+  // module name -> its value -> external prim (%builtin or C name) + arity, cached.
+  std::unordered_map<std::string, std::unordered_map<std::string, StdPrim>> mod_prims;
   // Locally-defined submodules: name -> its binder, and name -> field layout
   // (export value/submodule name -> field index), for resolving `M.x`.
   std::unordered_map<std::string, Ident> module_ident_;
@@ -586,23 +587,24 @@ struct Translator {
     auto it = mod_fields.find(mod);
     if (it != mod_fields.end()) return it->second;
     std::unordered_map<std::string, int> m;
-    std::unordered_map<std::string, std::string> pr;
+    std::unordered_map<std::string, StdPrim> pr;
     try {
       auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
                                                      : stdlib_dir + "/stdlib__" + mod + ".cmi");
       int i = 0;
       for (auto& f : cmi.sig().fields) m[f] = i++;
-      for (auto& v : cmi.values()) if (!v.prim.empty()) pr[v.name] = v.prim;
+      for (auto& v : cmi.values()) if (!v.prim.empty()) pr[v.name] = {v.prim, v.prim_arity};
     } catch (...) {}
     mod_prims[mod] = std::move(pr);
     return mod_fields[mod] = std::move(m);
   }
-  // The "%prim"/C-primitive name of a (possibly stdlib) module's value, or "".
-  std::string value_prim(const std::string& mod, const std::string& name) {
+  // The external prim (name + arity) of a (possibly stdlib) module's value; .name
+  // empty if the value is not an external.
+  StdPrim value_prim(const std::string& mod, const std::string& name) {
     fields_of(mod);  // ensures mod_prims[mod] is populated
     auto& pr = mod_prims[mod];
     auto it = pr.find(name);
-    return it == pr.end() ? std::string() : it->second;
+    return it == pr.end() ? StdPrim{"", 0} : it->second;
   }
   static std::string global_of(const std::string& mod) {
     return mod == "Stdlib" ? "Stdlib" : "Stdlib__" + mod;
@@ -671,7 +673,7 @@ struct Translator {
   // spell (the caller leaves them unresolved) -- never wrong, only incomplete.
   // Conservative on type-directed prims: only the cases whose spelling we can
   // determine from value kinds are emitted.
-  LamPtr prim_to_lam(const std::string& prim, const Pexp_apply& ap, const Expression& e) {
+  LamPtr prim_to_lam(const std::string& prim, int arity, const Pexp_apply& ap, const Expression& e) {
     auto& as = ap.args;
     auto args = [&] {
       std::vector<LamPtr> v;
@@ -704,6 +706,12 @@ struct Translator {
         pr->args = {expr(*as[0].second)};
         return pr;
       }
+    }
+    // A C-external (non-`%`) primitive applied at its full arity -> a C call.
+    if (!prim.empty() && prim[0] != '%' && (int)as.size() == arity) {
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = prim;
+      pr->args = args();
+      return pr;
     }
     return nullptr;
   }
@@ -1423,8 +1431,8 @@ struct Translator {
               return pr;
             }
             // General: an `external` value resolved via its cmi prim_name.
-            if (auto prim = value_prim(m, f); !prim.empty())
-              if (auto r = prim_to_lam(prim, *ap, e)) return r;
+            if (auto prim = value_prim(m, f); !prim.name.empty())
+              if (auto r = prim_to_lam(prim.name, prim.arity, *ap, e)) return r;
           }
       if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
         if (auto* l = std::get_if<Lident>(&fid->id.txt.v))
@@ -1497,7 +1505,7 @@ struct Translator {
             // General: an unqualified pervasive `external` (e.g. compare, ignore)
             // resolved via its cmi prim_name.
             if (auto pi = stdlib_prims.find(n); pi != stdlib_prims.end())
-              if (auto r = prim_to_lam(pi->second, *ap, e)) return r;
+              if (auto r = prim_to_lam(pi->second.name, pi->second.arity, *ap, e)) return r;
           }
       auto a = mk(Lam::K::Apply);
       a->fn = expr(*ap->fn);
@@ -1751,7 +1759,8 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     auto cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
     int i = 0;
     for (auto& f : cmi.sig().fields) t.stdlib_fields[f] = i++;
-    for (auto& v : cmi.values()) if (!v.prim.empty()) t.stdlib_prims[v.name] = v.prim;
+    for (auto& v : cmi.values())
+      if (!v.prim.empty()) t.stdlib_prims[v.name] = {v.prim, v.prim_arity};
   } catch (...) {}
   t.mod_path_ = module_name;
   auto sg = mk(Lam::K::Prim);
