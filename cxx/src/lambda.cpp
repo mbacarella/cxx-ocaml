@@ -1649,6 +1649,10 @@ struct Translator {
       a->fn = expr(*ap->fn);
       for (auto& [lbl, arg] : ap->args) a->args.push_back(expr(*arg));
       a->inline_attr = inline_of_named(ap->fn->attrs, "inlined");  // (f [@inlined never]) x
+      if (has_attr(ap->fn->attrs, "tailcall")) {  // (f [@tailcall]) x -> ... tailcall
+        if (!a->inline_attr.empty()) a->inline_attr += " ";
+        a->inline_attr += "tailcall";
+      }
       return a;
     }
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return function(*f, e.loc);
