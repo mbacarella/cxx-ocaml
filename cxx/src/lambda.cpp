@@ -1111,6 +1111,72 @@ struct Translator {
   LamPtr fieldimm(int i, const LamPtr& s) {
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = i; f->args = {s}; return f;
   }
+  // Read record field `fi` of `s` with the spelling its kind implies (an int field
+  // is field_int, a mutable boxed field field_mut, otherwise field_imm).
+  LamPtr field_read(const FieldInfo* fi, const LamPtr& s) {
+    auto l = mk(Lam::K::Prim);
+    l->prim = fi->kind == ValueKind::Int ? Prim::FieldInt
+              : fi->mut                  ? Prim::FieldMut
+                                         : Prim::FieldImm;
+    l->prim_arg = fi->index; l->args = {s}; return l;
+  }
+  // Bind the variables of an irrefutable pattern (var / alias / tuple / record /
+  // single-constructor) to field reads of `scrut`, recording (ident, access) in
+  // `out` and binding the names in the current scope.  Returns false on any shape
+  // that isn't irrefutably destructurable (the caller falls back to a plain temp).
+  bool collect_binders(const Pattern& p0, const LamPtr& scrut,
+                       std::vector<std::pair<Ident, LamPtr>>& out) {
+    const Pattern* p = &p0;
+    while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+    if (std::holds_alternative<Ppat_any>(p->desc)) return true;
+    if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
+      Ident id = fresh(pv->name.txt);
+      scope.back()[pv->name.txt] = id; out.push_back({id, scrut}); return true;
+    }
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {  // `pat as x`: bind x and recurse
+      Ident id = fresh(pa->name.txt);
+      scope.back()[pa->name.txt] = id; out.push_back({id, scrut});
+      return collect_binders(*pa->p, scrut, out);
+    }
+    if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (size_t i = 0; i < pt->elems.size(); ++i)
+        if (!collect_binders(*pt->elems[i], fieldimm((int)i, scrut), out)) return false;
+      return true;
+    }
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [lbl, sub] : pr->fields) {
+        const FieldInfo* fi = find_field(lid_last(lbl.txt));
+        if (!fi) return false;
+        if (!collect_binders(*sub, field_read(fi, scrut), out)) return false;
+      }
+      return true;
+    }
+    if (auto* pk = std::get_if<Ppat_construct>(&p->desc)) {
+      auto ci = ctor_info_.find(ctor_of(*p));
+      if (ci == ctor_info_.end()) return false;
+      auto tc = type_ctors_.find(ci->second.type);
+      if (tc == type_ctors_.end() ||
+          tc->second.first + tc->second.second != 1) return false;  // not single-ctor
+      auto fps = ctor_field_pats(pk, ci->second.arity);
+      if ((int)fps.size() != ci->second.arity) return false;
+      for (size_t i = 0; i < fps.size(); ++i)
+        if (!collect_binders(*fps[i], fieldimm((int)i, scrut), out)) return false;
+      return true;
+    }
+    return false;
+  }
+  // Wrap `body` (already compiled with `binders` in scope) so each binder's
+  // variable reads its field access -- inlined when used at most once, `=a`-aliased
+  // (a field read is an alias) otherwise; exactly ocamlc's matcher + simplif.
+  LamPtr wrap_binders(LamPtr body, std::vector<std::pair<Ident, LamPtr>>& binders) {
+    std::vector<Lam::Binding> aliases;
+    for (auto& [id, acc] : binders) {
+      if (count_var(body, id) <= 1) subst_var(body, id, acc);
+      else aliases.push_back({id, ValueKind::Gen, acc, is_field_access(acc)});
+    }
+    if (aliases.empty()) return body;
+    auto l = mk(Lam::K::Let); l->bindings = std::move(aliases); l->body = body; return l;
+  }
   static bool is_field_access(const LamPtr& l) {
     return l->k == Lam::K::Prim &&
            (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt || l->prim == Prim::FieldMut);
@@ -1934,18 +2000,29 @@ struct Translator {
         return l;
       }
       auto l = mk(Lam::K::Let);
+      std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured pats
       for (auto& b : le->bindings) {
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
           Ident id = fresh(pv->name.txt);
           Lam::Binding bd{id, pat_kind(&b.pat), expr(*b.expr)};
           l->bindings.push_back(std::move(bd));
           scope.back()[pv->name.txt] = id;
-        } else {  // `let () = e in ...` and other refutable patterns: *match* temp
-          l->bindings.push_back({fresh("", true), ValueKind::Gen, expr(*b.expr)});
+        } else {  // `let (a,b) = e` / `let {a;b} = e`: the irrefutable sub-vars read
+          LamPtr val = expr(*b.expr);  // fields of e -- directly when e is a var, else
+          if (val->k == Lam::K::Var) {  // via a *match* temp bound to e
+            collect_binders(b.pat, val, binders);
+          } else {
+            Ident tmp = fresh("", true);
+            l->bindings.push_back({tmp, ValueKind::Gen, val});
+            auto tv = mk(Lam::K::Var); tv->var = tmp;
+            collect_binders(b.pat, tv, binders);
+          }
         }
       }
-      l->body = expr(*le->body);
+      LamPtr body = wrap_binders(expr(*le->body), binders);
       scope.pop_back();
+      if (l->bindings.empty()) return body;  // all bindings were field reads of a var
+      l->body = body;
       return l;
     }
     if (auto* it = std::get_if<Pexp_ifthenelse>(&e.desc)) {
@@ -2011,10 +2088,12 @@ struct Translator {
   LamPtr function(const Pexp_function& f, const Location& floc) {
     scope.emplace_back();
     auto l = mk(Lam::K::Function);
+    std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured params
     for (auto& fp : f.params)
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
-        // Every parameter gets a binder; a non-variable pattern (`()`, `_`, a
-        // tuple) is named "param" like ocamlc and matched in the body (deferred).
+        // Every parameter gets a binder; a non-variable pattern (a constructor,
+        // record or tuple) is named "param" like ocamlc and its variables bound to
+        // field reads in the body (an unsupported shape stays a bare temp).
         const Pattern* pat = &pv->pat;
         while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) pat = pc->p.get();
         if (auto* var = std::get_if<Ppat_var>(&pat->desc)) {
@@ -2022,19 +2101,22 @@ struct Translator {
           l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
         } else {
-          l->params.push_back({fresh("param"), pat_kind(pat)});
+          Ident pid = fresh("param");
+          l->params.push_back({pid, pat_kind(pat)});
+          auto pvar = mk(Lam::K::Var); pvar->var = pid;
+          collect_binders(*pat, pvar, binders);
         }
       }
     auto rk = vk.fn_ret.find(&f);
     l->ret_kind = rk == vk.fn_ret.end() ? ValueKind::Gen : vkind(rk->second);
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
-      l->body = expr(*fb->e);
+      l->body = wrap_binders(expr(*fb->e), binders);
     } else if (auto* fc = std::get_if<Pfunction_cases>(&f.body->v)) {
       // `function P -> ...` adds an implicit final parameter matched on.
       Ident pid = fresh("param");
       l->params.push_back({pid, ValueKind::Gen});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
-      l->body = compile_match(scrut, fc->cases, floc);
+      l->body = wrap_binders(compile_match(scrut, fc->cases, floc), binders);
     } else {
       l->body = mk(Lam::K::ConstInt);
     }
