@@ -451,6 +451,8 @@ struct Translator {
   std::unordered_map<std::string, std::unordered_map<std::string, int>> module_layout_;
   // A local functor's result field layout, so `Make(Arg).foo` resolves.
   std::unordered_map<std::string, std::vector<std::string>> functor_result_;
+  // A named module type's value layout, so `module F (X : S)` knows X's fields.
+  std::unordered_map<std::string, std::vector<std::string>> modtype_layout_;
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
   // unqualified name resolves as `M.x` (a stdlib field or an external prim).
   std::vector<std::string> opened_;
@@ -1877,6 +1879,10 @@ struct Translator {
   // slot; only regular values, submodules, and exceptions do.)
   std::vector<std::string> sig_layout(const ModuleType& mt) {
     std::vector<std::string> out;
+    if (auto* pi = std::get_if<Pmty_ident>(&mt.desc)) {  // a named module type S
+      auto it = modtype_layout_.find(lid_last(pi->id.txt));
+      if (it != modtype_layout_.end()) return it->second;
+    }
     if (auto* ps = std::get_if<Pmty_signature>(&mt.desc))
       for (auto& it : ps->items) {
         if (auto* v = std::get_if<Psig_value>(&it.desc)) out.push_back(v->vd.name.txt);
@@ -2013,6 +2019,10 @@ struct Translator {
     for (auto& it : s) {
       if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
         flush(); segs.push_back({true, false, {}, expr(*pe->e)}); continue;
+      }
+      if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {  // module type S = mty (no slot)
+        if (pmt->type) modtype_layout_[pmt->name.txt] = sig_layout(*pmt->type);
+        continue;
       }
       if (auto* pp = std::get_if<Pstr_primitive>(&it.desc)) {  // external f = "cname"
         auto& pd = pp->prim;
