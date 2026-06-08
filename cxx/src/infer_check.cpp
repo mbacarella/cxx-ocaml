@@ -182,7 +182,7 @@ struct Checker {
       case cmi::TypeExpr::Tconstr:
       case cmi::TypeExpr::Texpand: {
         std::string p = n->path ? cmi_path_str(*n->path) : "?";
-        if (is_format_base(p)) return eng.constr("format6");
+        if (is_format_base(p)) { std::vector<TypePtr> fa; for (auto& a : n->args) fa.push_back(from_cmi(a, memo)); return eng.constr("format6", std::move(fa)); }
         // expand a same-module type abbreviation (Float.t = float, Int.t = int)
         if (cmi_types_ctx_ && n->path && n->path->kind == cmi::Path::Pident &&
             !cmi_expanding_.count(n->path->id.name))
@@ -996,15 +996,62 @@ struct Checker {
     return t->kind == I::Type::Kind::Constr && is_format_base(t->path);
   }
 
-  // Infer an expression with an expected type pushed down (bidirectional).  The
-  // only type-directed rule so far: a string literal expected at a format type
-  // is accepted as that format (OCaml's type_format).  Otherwise it's ordinary
-  // inference; the caller still unifies the result against the expected type.
+  // The argument arrow of a format string (printf "%d %s" -> int -> string -> 'r),
+  // so a format-consuming application flows argument value-kinds (x:int in
+  // `printf "%d" x`).  %a consumes two args, %t one; unknown directives -> Any.
+  TypePtr format_arrow(const std::string& s, const TypePtr& result) {
+    auto isdig = [](char c) { return c >= '0' && c <= '9'; };
+    std::vector<TypePtr> args;
+    size_t i = 0, n = s.size();
+    while (i < n) {
+      if (s[i] != '%') { ++i; continue; }
+      ++i;
+      if (i >= n) break;
+      if (s[i] == '%' || s[i] == '@' || s[i] == '!' || s[i] == ',') { ++i; continue; }
+      bool ignored = false;  // `%_d` etc. read-and-discard: consume no argument
+      if (s[i] == '_') { ignored = true; ++i; }
+      auto add = [&](TypePtr t) { if (!ignored) args.push_back(std::move(t)); };
+      for (; i < n; ++i) {  // flags / width / precision (`*` is an int arg)
+        char c = s[i];
+        if (c == '*') add(eng.constr("int"));
+        else if (c != '+' && c != '-' && c != '#' && c != ' ' && c != '.' && !isdig(c)) break;
+      }
+      if (i >= n) break;
+      char len = 0;
+      if (s[i] == 'l' || s[i] == 'n' || s[i] == 'L') { len = s[i]; if (++i >= n) break; }
+      char c = s[i]; ++i;
+      switch (c) {
+        case 'd': case 'i': case 'x': case 'X': case 'o': case 'u':
+          add(eng.constr(len == 'l' ? "int32" : len == 'n' ? "nativeint"
+                         : len == 'L' ? "int64" : "int")); break;
+        case 's': case 'S': add(eng.constr("string")); break;
+        case 'c': case 'C': add(eng.constr("char")); break;
+        case 'f': case 'e': case 'E': case 'g': case 'G': case 'F': case 'h': case 'H':
+          add(eng.constr("float")); break;
+        case 'b': case 'B': add(eng.constr("bool")); break;
+        case 'a': add(eng.any()); add(eng.any()); break;  // fn + value
+        case 't': add(eng.any()); break;
+        default: add(eng.any()); break;
+      }
+    }
+    TypePtr r = result;  // the printf function's result is the format's result param
+    for (auto it = args.rbegin(); it != args.rend(); ++it) r = eng.arrow(*it, r);
+    return r;
+  }
+
+  // Infer an expression with an expected type pushed down (bidirectional).  A
+  // string literal expected at a format type is accepted as that format (OCaml's
+  // type_format), with its argument arrow filled in so the consuming application
+  // (printf/sprintf/...) flows argument value-kinds.
   TypePtr infer_expr_expected(const Expression& e, const TypePtr& expected) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc))
-      if (std::holds_alternative<Pconst_string>(c->c.desc) &&
-          is_format_constr(expected)) {
+      if (auto* s = std::get_if<Pconst_string>(&c->c.desc); s && is_format_constr(expected)) {
         if (record_kinds_) fmt_lits_.insert(&e);  // Lambda lowers it as a format
+        auto er = I::Engine::repr(expected);  // format6's arg0 ('a) is the args function
+        if (er->kind == I::Type::Kind::Constr && !er->args.empty()) {
+          std::vector<TypePtr> a = er->args; a[0] = format_arrow(s->s, a.back());
+          return eng.constr(er->path, std::move(a));
+        }
         return expected;
       }
     return infer_expr(e);
