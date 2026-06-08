@@ -1779,6 +1779,7 @@ struct Translator {
       return l;
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) return expr(*ct->e);
+    if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) return expr(*co->e);  // (e :> t) erased
     return mk(Lam::K::ConstInt);  // unsupported: placeholder (will DIFF)
   }
 
