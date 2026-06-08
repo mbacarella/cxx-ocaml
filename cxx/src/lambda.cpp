@@ -1909,6 +1909,17 @@ struct Translator {
         if (auto it = module_ident_.find(l->name); it != module_ident_.end()) {
           auto v = mk(Lam::K::Var); v->var = it->second; return v;
         }
+      if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))  // M.Sub -> field of M's block
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (auto mi = module_ident_.find(pl->name); mi != module_ident_.end()) {
+            auto& lay = module_layout_[pl->name];
+            if (auto f = lay.find(d->name); f != lay.end()) {
+              auto v = mk(Lam::K::Var); v->var = mi->second;
+              auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+              fi->prim_arg = f->second; fi->args = {v};
+              return fi;
+            }
+          }
     }
     if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) {  // F(X) -> (apply F X)
       auto a = mk(Lam::K::Apply);
