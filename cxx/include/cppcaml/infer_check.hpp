@@ -46,6 +46,10 @@ struct ValueKinds {
   // String-literal expressions inferred at a format type (Printf/Format/Scanf):
   // the Lambda back end lowers these to a CamlinternalFormatBasics format value.
   std::set<const ast::Expression*> format_lits;
+  // For an array-typed expression, the kind_str of its ELEMENT type ("int"/
+  // "float"/"addr"/"string"/""), so the back end can annotate Array.length /
+  // empty `[||]` with the element kind (which the array's own kind can't give).
+  std::unordered_map<const void*, std::string> array_elem;
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 

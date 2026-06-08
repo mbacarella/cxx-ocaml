@@ -706,6 +706,16 @@ struct Translator {
     if (s == "addr" || s == "string") return "addr";
     return "gen";
   }
+  // Element kind of an *array-typed* expression (e.g. the arg of Array.length, or
+  // an empty `[||]`), from the inferencer's recorded element kind.
+  std::string array_arg_kind(const Expression* a) {
+    auto it = vk.array_elem.find(a);
+    if (it == vk.array_elem.end()) return "gen";
+    if (it->second == "int") return "int";
+    if (it->second == "float") return "float";
+    if (it->second == "addr" || it->second == "string") return "addr";
+    return "gen";
+  }
   // A polymorphic comparison operator -> {int-comparison spelling, caml_* C name}.
   static std::pair<std::string, std::string> poly_cmp(const std::string& n) {
     if (n == "<") return {"<", "caml_lessthan"};
@@ -1415,7 +1425,7 @@ struct Translator {
         }
     }
     if (auto* ar = std::get_if<Pexp_array>(&e.desc)) {  // [| ... |] -> makearray[k]
-      std::string k = ar->elems.empty() ? "gen" : array_elem_kind(ar->elems[0].get());
+      std::string k = ar->elems.empty() ? array_arg_kind(&e) : array_elem_kind(ar->elems[0].get());
       auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
       m->prim_id = "makearray[" + k + "]";
       for (auto& el : ar->elems) m->args.push_back(expr(*el));
@@ -1514,7 +1524,9 @@ struct Translator {
             const std::string& m = pl->name;
             const std::string& f = d->name;
             std::string op;
-            if (m == "Array" && f == "get" && as.size() == 2)
+            if (m == "Array" && f == "length" && as.size() == 1)
+              op = "array.length[" + array_arg_kind(as[0].second.get()) + "]";
+            else if (m == "Array" && f == "get" && as.size() == 2)
               op = "array.get[" + array_elem_kind(&e) + "]";
             else if (m == "Array" && f == "unsafe_get" && as.size() == 2)
               op = "array.unsafe_get[" + array_elem_kind(&e) + "]";

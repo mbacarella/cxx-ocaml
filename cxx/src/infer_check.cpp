@@ -1825,6 +1825,18 @@ static std::string kind_str(const TypePtr& t0, const std::set<std::string>& imm)
   return "addr";
 }
 
+// If `t0` is an array type, sets `out` to its element kind_str ("" for a generic
+// element) and returns true; otherwise returns false.
+static bool array_elem_str(const TypePtr& t0, const std::set<std::string>& imm, std::string& out) {
+  TypePtr t = I::Engine::repr(t0);
+  if (t->kind != I::Type::Kind::Constr || t->args.empty()) return false;
+  auto d = t->path.rfind('.');
+  std::string b = d == std::string::npos ? t->path : t->path.substr(d + 1);
+  if (b != "array" && b != "iarray") return false;
+  out = kind_str(t->args[0], imm);
+  return true;
+}
+
 ValueKinds infer_value_kinds(const ast::Structure& s) {
   Checker ck;
   ck.record_kinds_ = true;
@@ -1832,7 +1844,11 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   ValueKinds vk;
   for (auto& [p, t] : ck.rec_pat_) vk.pat[p] = kind_str(t, ck.immediate_types_);
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck.immediate_types_);
-  for (auto& [e, t] : ck.rec_expr_) vk.expr[e] = kind_str(t, ck.immediate_types_);
+  for (auto& [e, t] : ck.rec_expr_) {
+    vk.expr[e] = kind_str(t, ck.immediate_types_);
+    std::string ek;
+    if (array_elem_str(t, ck.immediate_types_, ek)) vk.array_elem[e] = ek;  // "" = gen element
+  }
   vk.format_lits = std::move(ck.fmt_lits_);
   return vk;
 }
