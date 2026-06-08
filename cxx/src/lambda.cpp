@@ -1855,6 +1855,26 @@ struct Translator {
     return v;
   }
 
+  // Compile a module expression to its Lambda value: a structure is a record of
+  // its exports; a functor is `(function X is_a_functor <body>)`.
+  LamPtr compile_module_expr(const ModuleExpr& me) {
+    if (auto* ps = std::get_if<Pmod_structure>(&me.desc)) {
+      std::vector<std::string> sub;
+      return build_module(ps->items, &sub);
+    }
+    if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) {
+      auto fn = mk(Lam::K::Function);
+      std::string nm = "*";
+      if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->name.txt) nm = *fp->name.txt;
+      fn->params.push_back({fresh(nm), ValueKind::Gen});
+      fn->inline_attr = "is_a_functor";  // printed in the function header after params
+      fn->body = compile_module_expr(*pf->body);
+      return fn;
+    }
+    if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) return compile_module_expr(*pc->me);
+    return mk(Lam::K::ConstInt);  // other module exprs (apply/ident/...): best-effort
+  }
+
   LamPtr build_module(const Structure& s, std::vector<std::string>* names) {
     scope.emplace_back();
     struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e; };
@@ -1911,6 +1931,11 @@ struct Translator {
             module_ident_[*mb.name.txt] = mid;
             auto& lay = module_layout_[*mb.name.txt]; lay.clear();
             for (int i = 0; i < (int)sub.size(); ++i) lay[sub[i]] = i;
+            add_export(*mb.name.txt, mid);
+          } else if (std::holds_alternative<Pmod_functor>(mb.expr.desc)) {
+            Ident mid = fresh(*mb.name.txt);            // a functor binds as a function
+            cur.push_back({mid, ValueKind::Gen, compile_module_expr(mb.expr)});
+            module_ident_[*mb.name.txt] = mid;
             add_export(*mb.name.txt, mid);
           }
         continue;
