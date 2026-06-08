@@ -1778,12 +1778,20 @@ struct Translator {
   // order: inline, local, tail_mod_cons, poll (specialise is flambda-only, not
   // printed by ocamlc -dlambda).
   static std::string fn_attrs(const Attributes& attrs) {
+    bool poll_err = has_attr(attrs, "poll") && attr_of(attrs, "poll") == "error";
     std::vector<std::string> a;
-    if (auto s = inline_of_named(attrs, "inline"); !s.empty()) a.push_back(s);
+    // A [@poll error] function cannot be inlined or stack-allocated, so the
+    // compiler forces never_inline + never_local on it.
+    std::string inl = inline_of_named(attrs, "inline");
+    if (poll_err) inl = "never_inline";
+    if (!inl.empty()) a.push_back(inl);
+    std::string loc;
     if (has_attr(attrs, "local"))
-      a.push_back(attr_of(attrs, "local") == "never" ? "never_local" : "always_local");
+      loc = attr_of(attrs, "local") == "never" ? "never_local" : "always_local";
+    if (poll_err) loc = "never_local";
+    if (!loc.empty()) a.push_back(loc);
     if (has_attr(attrs, "tail_mod_cons")) a.push_back("tail_mod_cons");
-    if (has_attr(attrs, "poll") && attr_of(attrs, "poll") == "error") a.push_back("error_poll");
+    if (poll_err) a.push_back("error_poll");
     std::string r;
     for (size_t i = 0; i < a.size(); ++i) { if (i) r += " "; r += a[i]; }
     return r;
@@ -1801,10 +1809,18 @@ struct Translator {
     std::vector<Seg> segs;
     std::vector<Lam::Binding> cur;
     std::vector<LamPtr> exports;
+    std::vector<std::string> export_names;
     auto flush = [&] { if (!cur.empty()) segs.push_back({false, false, std::move(cur), nullptr}), cur.clear(); };
     auto add_export = [&](const std::string& nm, const Ident& id) {
+      // a redefinition (shadow) moves the name to its last definition's position
+      for (size_t i = 0; i < export_names.size(); ++i)
+        if (export_names[i] == nm) {
+          export_names.erase(export_names.begin() + i);
+          exports.erase(exports.begin() + i);
+          break;
+        }
       auto v = mk(Lam::K::Var); v->var = id; exports.push_back(v);
-      if (names) names->push_back(nm);
+      export_names.push_back(nm);
     };
     for (auto& it : s) {
       if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
@@ -1888,6 +1904,7 @@ struct Translator {
       }
     }
     flush();
+    if (names) *names = export_names;  // the (deduplicated) export layout, in order
     auto block = mk(Lam::K::Prim);
     block->prim = Prim::Makeblock; block->prim_arg = 0; block->args = std::move(exports);
     LamPtr acc = block;
