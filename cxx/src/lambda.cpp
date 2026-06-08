@@ -1855,6 +1855,21 @@ struct Translator {
     return v;
   }
 
+  // The runtime field layout (value/module names, in order) of a module-type
+  // signature -- a functor parameter's value layout.  (externals/types take no
+  // slot; only regular values, submodules, and exceptions do.)
+  std::vector<std::string> sig_layout(const ModuleType& mt) {
+    std::vector<std::string> out;
+    if (auto* ps = std::get_if<Pmty_signature>(&mt.desc))
+      for (auto& it : ps->items) {
+        if (auto* v = std::get_if<Psig_value>(&it.desc)) out.push_back(v->vd.name.txt);
+        else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+          if (m->md.name.txt) out.push_back(*m->md.name.txt);
+        }
+      }
+    return out;
+  }
+
   // Compile a module expression to its Lambda value: a structure is a record of
   // its exports; a functor is `(function X is_a_functor <body>)`.
   LamPtr compile_module_expr(const ModuleExpr& me) {
@@ -1865,10 +1880,25 @@ struct Translator {
     if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) {
       auto fn = mk(Lam::K::Function);
       std::string nm = "*";
-      if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->name.txt) nm = *fp->name.txt;
-      fn->params.push_back({fresh(nm), ValueKind::Gen});
+      const Functor_named* fp = std::get_if<Functor_named>(&pf->param);
+      if (fp && fp->name.txt) nm = *fp->name.txt;
+      Ident pid = fresh(nm);
+      // Bind the parameter X (with its signature's value layout) so `X.foo`
+      // inside the body resolves to `(field_imm i X)`.  Save/restore for nesting.
+      bool had = module_ident_.count(nm);
+      Ident saved_id = had ? module_ident_[nm] : Ident{};
+      auto saved_lay = module_layout_[nm];
+      if (fp && fp->type) {
+        module_ident_[nm] = pid;
+        auto& lay = module_layout_[nm]; lay.clear();
+        auto fields = sig_layout(*fp->type);
+        for (int i = 0; i < (int)fields.size(); ++i) lay[fields[i]] = i;
+      }
+      fn->params.push_back({pid, ValueKind::Gen});
       fn->inline_attr = "is_a_functor";  // printed in the function header after params
       fn->body = compile_module_expr(*pf->body);
+      if (had) module_ident_[nm] = saved_id; else module_ident_.erase(nm);
+      module_layout_[nm] = saved_lay;
       return fn;
     }
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) return compile_module_expr(*pc->me);
