@@ -452,6 +452,9 @@ struct Translator {
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
   // unqualified name resolves as `M.x` (a stdlib field or an external prim).
   std::vector<std::string> opened_;
+  // The exception binders of the enclosing try/with handlers; `raise` of the
+  // innermost caught exception is a `reraise`.
+  std::vector<Ident> caught_exn_;
   // User C externals: value name -> C primitive name (the `external f = "cname"`
   // string).  Applying one emits (cname args); %-builtins are left for later.
   std::unordered_map<std::string, std::string> externals_;
@@ -1560,8 +1563,13 @@ struct Translator {
               return pr;
             }
             if (n == "raise" && as.size() == 1) {
-              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Raise;
-              pr->args = {expr(*as[0].second)};
+              LamPtr arg = expr(*as[0].second);
+              // raising the innermost caught exception re-raises (keeps backtrace).
+              bool reraise = !caught_exn_.empty() && arg->k == Lam::K::Var &&
+                             arg->var.stamp == caught_exn_.back().stamp;
+              auto pr = mk(Lam::K::Prim);
+              pr->prim = reraise ? Prim::Reraise : Prim::Raise;
+              pr->args = {arg};
               return pr;
             }
             if (int_op(n, p) && as.size() == 2) {
@@ -1732,8 +1740,22 @@ struct Translator {
       auto l = mk(Lam::K::Try);
       l->body = expr(*tr->e);
       scope.emplace_back();
-      l->var = fresh("exn");
-      l->then_ = exn_dispatch(l->var, tr->cases, 0);
+      // `with e -> body` (a single catch-all var) binds `e` directly; otherwise a
+      // synthetic `exn` is matched against the cases.
+      const Ppat_var* pv = nullptr;
+      if (tr->cases.size() == 1 && !tr->cases[0].guard)
+        pv = std::get_if<Ppat_var>(&tr->cases[0].lhs.desc);
+      if (pv) {
+        l->var = fresh(pv->name.txt);
+        scope.back()[pv->name.txt] = l->var;
+        caught_exn_.push_back(l->var);
+        l->then_ = expr(*tr->cases[0].rhs);
+      } else {
+        l->var = fresh("exn");
+        caught_exn_.push_back(l->var);
+        l->then_ = exn_dispatch(l->var, tr->cases, 0);
+      }
+      caught_exn_.pop_back();
       scope.pop_back();
       return l;
     }
