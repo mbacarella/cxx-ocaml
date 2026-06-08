@@ -1159,6 +1159,17 @@ struct Translator {
   LamPtr int_cases(const LamPtr& scrut, const std::vector<Row>& rows, size_t i) {
     if (i >= rows.size()) return cint(0);
     const Row& r = rows[i];
+    // A guard on a catch-all (var/`_`) pattern inlines: the pattern always matches,
+    // so guard-failure just falls through to the rest -> `(if guard body <rest>)`.
+    // (A guard on a constant/ctor pattern would share <rest> across pattern- and
+    // guard-failure, needing the matcher's catch/exit; left to the best-effort tail.)
+    if (r.guard && is_catchall(*r.lhs)) {
+      bind_catchall(*r.lhs, scrut);
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = expr(*r.guard); iff->then_ = expr(*r.rhs);
+      iff->else_ = int_cases(scrut, rows, i + 1);
+      return iff;
+    }
     if (!r.guard && (is_catchall(*r.lhs) || i + 1 == rows.size())) {
       bind_catchall(*r.lhs, scrut);
       return expr(*r.rhs);
