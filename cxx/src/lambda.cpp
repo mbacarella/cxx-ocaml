@@ -315,9 +315,17 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
     case Lam::K::IfThenElse:
       return box(BoxT::Box, 2, {text("(if"), brk(), to_doc(l->cond, pr), brk(),
                                 to_doc(l->then_, pr), brk(), to_doc(l->else_, pr), text(")")});
-    case Lam::K::Sequence:
-      return box(BoxT::Box, 2, {text("(seq"), brk(), to_doc(l->cond, pr), brk(),
-                                to_doc(l->else_, pr), text(")")});
+    case Lam::K::Sequence: {  // flatten right-nested seqs: (seq e1 e2 ... en)
+      std::vector<DocP> xs{text("(seq")};
+      LamPtr cur = l;
+      while (true) {
+        xs.push_back(brk()); xs.push_back(to_doc(cur->cond, pr));
+        if (cur->else_ && cur->else_->k == Lam::K::Sequence) cur = cur->else_;
+        else { xs.push_back(brk()); xs.push_back(to_doc(cur->else_, pr)); break; }
+      }
+      xs.push_back(text(")"));
+      return box(BoxT::Box, 2, std::move(xs));
+    }
     case Lam::K::While:
       return box(BoxT::Box, 2, {text("(while"), brk(), to_doc(l->cond, pr), brk(),
                                 to_doc(l->body, pr), text(")")});
