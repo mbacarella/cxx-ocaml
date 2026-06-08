@@ -500,6 +500,7 @@ struct Translator {
   std::unordered_map<std::string, CtorInfo> ctor_info_;
   std::unordered_map<std::string, std::pair<int, int>> type_ctors_;  // type -> (n_const, n_block)
   std::set<std::string> immediate_local_;  // local all-constant variant type names
+  std::set<std::string> gadt_types_;        // variant types with a GADT constructor
 
   // Locally-declared record fields: label -> {owning type, index, mutable, kind}.
   // Only UNAMBIGUOUS labels are usable (a label reused across records can't be
@@ -593,6 +594,7 @@ struct Translator {
         }
         type_ctors_[d.name.txt] = {nc, nb};
         if (all_const && !gadt) immediate_local_.insert(d.name.txt);
+        if (gadt) gadt_types_.insert(d.name.txt);
       }
     });
     each_decl([&](const TypeDeclaration& d) {  // then records
@@ -1155,8 +1157,13 @@ struct Translator {
       auto ci = ctor_info_.find(ctor_of(*p));
       if (ci == ctor_info_.end()) return false;
       auto tc = type_ctors_.find(ci->second.type);
-      if (tc == type_ctors_.end() ||
-          tc->second.first + tc->second.second != 1) return false;  // not single-ctor
+      // Irrefutable only for a single-constructor type, OR a GADT one: there, type
+      // refinement can make a one-constructor parameter pattern (`let f (Float x)`)
+      // exhaustive even though the type has several constructors, and ocamlc emits a
+      // bare field read with no tag test.
+      if (tc == type_ctors_.end()) return false;
+      if (tc->second.first + tc->second.second != 1 && !gadt_types_.count(ci->second.type))
+        return false;
       auto fps = ctor_field_pats(pk, ci->second.arity);
       if ((int)fps.size() != ci->second.arity) return false;
       for (size_t i = 0; i < fps.size(); ++i)
