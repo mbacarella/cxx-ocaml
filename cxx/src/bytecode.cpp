@@ -218,6 +218,7 @@ struct Bytegen {
     if (s == ">") return I(Op::Gtint);
     if (s == "<=") return I(Op::Leint);
     if (s == ">=") return I(Op::Geint);
+    if (s == "isint") return I(Op::Isint);
     static const std::unordered_map<std::string, std::string> ccall = {
       {"+.", "caml_add_float"}, {"-.", "caml_sub_float"}, {"*.", "caml_mul_float"},
       {"/.", "caml_div_float"}, {"~.", "caml_neg_float"}, {"abs.", "caml_abs_float"},

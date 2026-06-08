@@ -954,11 +954,9 @@ struct Translator {
     auto tc = type_ctors_.find(type);
     if (tc == type_ctors_.end()) return nullptr;
     if (nconst != tc->second.first || nblock != tc->second.second) return nullptr;  // not exhaustive
-    bool shape_if = nconst == 1 && nblock == 1;
-    bool shape_sw = nconst == 0 && nblock >= 2;
-    if (!shape_if && !shape_sw) return nullptr;
-    // Eligible: now compile arms.
-    LamPtr const_arm; std::vector<Lam::SwitchCase> blocks;
+    if (nblock < 1) return nullptr;  // const-only -> const_switch handles it
+    // Eligible: now compile arms (consts keyed by int value, blocks by tag).
+    std::vector<Lam::SwitchCase> consts, blocks;
     for (auto& c : cases) {
       auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
       auto& ci = ctor_info_.at(ctor_of(c.lhs));
@@ -967,16 +965,42 @@ struct Translator {
         if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
         blocks.push_back({ci.tag, body});
       } else {
-        const_arm = expr(*c.rhs);
+        consts.push_back({ci.tag, expr(*c.rhs)});  // ci.tag is the constant's int value
       }
     }
-    if (shape_if) {
+    std::sort(consts.begin(), consts.end(), [](auto& x, auto& y) { return x.tag < y.tag; });
+    std::sort(blocks.begin(), blocks.end(), [](auto& x, auto& y) { return x.tag < y.tag; });
+    // nb==1, nc==1 -> truthy `(if scrut <block> <const>)` (option/list).
+    if (consts.size() == 1 && blocks.size() == 1) {
       auto i = mk(Lam::K::IfThenElse);
-      i->cond = scrut; i->then_ = blocks[0].body; i->else_ = const_arm;
+      i->cond = scrut; i->then_ = blocks[0].body; i->else_ = consts[0].body;
       return i;
     }
-    std::sort(blocks.begin(), blocks.end(), [](auto& x, auto& y) { return x.tag < y.tag; });
-    auto sw = mk(Lam::K::Switch); sw->cond = scrut; sw->sw_blocks = std::move(blocks);
+    // nb>=2 -> one (switch* scrut case int V: .. case tag T: ..) over both.
+    if (blocks.size() >= 2) {
+      auto sw = mk(Lam::K::Switch); sw->cond = scrut;
+      sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks);
+      return sw;
+    }
+    // nb==1, nc==0 -> the single block arm directly (e.g. `type t = T of int`).
+    if (consts.empty()) return blocks[0].body;
+    // nb==1, nc>=2 -> `(if (isint scrut) <const-dispatch> <block-arm>)`.
+    auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
+    isint->prim_id = "isint"; isint->args = {scrut};
+    auto i = mk(Lam::K::IfThenElse);
+    i->cond = isint; i->then_ = const_dispatch(scrut, consts); i->else_ = blocks[0].body;
+    return i;
+  }
+  // Dispatch over a variant's constant constructors (values 0..nc-1, sorted):
+  // 1 -> the arm; 2 -> `(if scrut <v1> <v0>)`; >=3 -> `(switch* scrut case int V:)`.
+  LamPtr const_dispatch(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts) {
+    if (consts.size() == 1) return consts[0].body;
+    if (consts.size() == 2) {
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = scrut; i->then_ = consts[1].body; i->else_ = consts[0].body;
+      return i;
+    }
+    auto sw = mk(Lam::K::Switch); sw->cond = scrut; sw->sw_consts = consts;
     return sw;
   }
 
