@@ -1820,7 +1820,9 @@ static std::string kind_str(const TypePtr& t0, const std::set<std::string>& imm)
   if (b == "int64") return "int64";
   if (b == "nativeint") return "nativeint";
   if (b == "string") return "string";  // not a value kind, but drives string compares
-  return "";  // generic / blocks
+  // A known boxed type (record/block-variant/string/...): not a value kind, but
+  // an `addr` array element (vs a type variable, which is `gen`).
+  return "addr";
 }
 
 ValueKinds infer_value_kinds(const ast::Structure& s) {

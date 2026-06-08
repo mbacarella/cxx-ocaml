@@ -684,11 +684,20 @@ struct Translator {
     auto it = t.find(n);
     return it == t.end() ? std::pair<std::string, int>{"", 0} : it->second;
   }
-  // Array element-kind annotation (array_kind in printlambda); a known-boxed vs
-  // polymorphic element both read as gen here (we can't tell addr from gen).
+  // Array element-kind annotation (array_kind in printlambda).
   static std::string array_kind(ValueKind k) {
     if (k == ValueKind::Int) return "int";
     if (k == ValueKind::Float) return "float";
+    return "gen";
+  }
+  // Array element kind from an element expression's inferred type: int / float /
+  // addr (a known boxed type, e.g. string/record) / gen (a type variable).
+  std::string array_elem_kind(const Expression* e) {
+    auto it = vk.expr.find(e);
+    std::string s = it == vk.expr.end() ? "" : it->second;
+    if (s == "int") return "int";
+    if (s == "float") return "float";
+    if (s == "addr" || s == "string") return "addr";
     return "gen";
   }
   // A polymorphic comparison operator -> {int-comparison spelling, caml_* C name}.
@@ -1363,9 +1372,9 @@ struct Translator {
         }
     }
     if (auto* ar = std::get_if<Pexp_array>(&e.desc)) {  // [| ... |] -> makearray[k]
-      ValueKind k = ar->elems.empty() ? ValueKind::Gen : expr_kind(ar->elems[0].get());
+      std::string k = ar->elems.empty() ? "gen" : array_elem_kind(ar->elems[0].get());
       auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
-      m->prim_id = "makearray[" + array_kind(k) + "]";
+      m->prim_id = "makearray[" + k + "]";
       for (auto& el : ar->elems) m->args.push_back(expr(*el));
       return m;
     }
@@ -1455,13 +1464,13 @@ struct Translator {
             const std::string& f = d->name;
             std::string op;
             if (m == "Array" && f == "get" && as.size() == 2)
-              op = "array.get[" + array_kind(expr_kind(&e)) + "]";
+              op = "array.get[" + array_elem_kind(&e) + "]";
             else if (m == "Array" && f == "unsafe_get" && as.size() == 2)
-              op = "array.unsafe_get[" + array_kind(expr_kind(&e)) + "]";
+              op = "array.unsafe_get[" + array_elem_kind(&e) + "]";
             else if (m == "Array" && f == "set" && as.size() == 3)
-              op = "array.set[" + array_kind(expr_kind(as[2].second.get())) + "]";
+              op = "array.set[" + array_elem_kind(as[2].second.get()) + "]";
             else if (m == "Array" && f == "unsafe_set" && as.size() == 3)
-              op = "array.unsafe_set[" + array_kind(expr_kind(as[2].second.get())) + "]";
+              op = "array.unsafe_set[" + array_elem_kind(as[2].second.get()) + "]";
             else if (m == "String" && f == "length" && as.size() == 1) op = "string.length";
             else if (m == "String" && f == "get" && as.size() == 2) op = "string.get";
             else if (m == "String" && f == "unsafe_get" && as.size() == 2) op = "string.unsafe_get";
