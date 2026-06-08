@@ -299,6 +299,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
     case Lam::K::Apply: {
       std::vector<DocP> xs{text("(apply"), brk(), to_doc(l->fn, pr)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
+      if (!l->inline_attr.empty()) { xs.push_back(brk()); xs.push_back(text(l->inline_attr)); }
       xs.push_back(text(")"));
       return box(BoxT::Box, 2, std::move(xs));
     }
@@ -1571,6 +1572,7 @@ struct Translator {
       auto a = mk(Lam::K::Apply);
       a->fn = expr(*ap->fn);
       for (auto& [lbl, arg] : ap->args) a->args.push_back(expr(*arg));
+      a->inline_attr = inline_of_named(ap->fn->attrs, "inlined");  // (f [@inlined never]) x
       return a;
     }
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return function(*f, e.loc);
@@ -1705,14 +1707,16 @@ struct Translator {
         if (auto* l = std::get_if<Lident>(&id->id.txt.v)) return l->name;
     return "";
   }
-  // The -dlambda inline annotation from a binding's `[@inline ...]` attribute.
-  static std::string inline_of(const Attributes& attrs) {
+  // The -dlambda inline annotation from an `[@<which> ...]` attribute (which is
+  // "inline" on a function binding, "inlined" on a call site).
+  static std::string inline_of_named(const Attributes& attrs, const std::string& which) {
     for (auto& a : attrs) {
-      if (a.name != "inline" && a.name != "ocaml.inline") continue;
+      if (a.name != which && a.name != "ocaml." + which) continue;
       return attr_ident(a.payload) == "never" ? "never_inline" : "always_inline";
     }
     return "";
   }
+  static std::string inline_of(const Attributes& attrs) { return inline_of_named(attrs, "inline"); }
   // Stamp a function value with its binding's inline annotation, if any.
   LamPtr with_inline(LamPtr v, const Attributes& attrs) {
     if (v && v->k == Lam::K::Function)
