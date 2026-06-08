@@ -111,12 +111,14 @@ struct Render {
           case BoxT::H: nl = false; break;
           case BoxT::V: nl = true; break;
           case BoxT::Hv: nl = true; break;
-          case BoxT::Hov: nl = c->bsize > MARGIN - col; break;
+          // A break's Oppen size includes its own blanks (c->s), not just the
+          // following content -- so the threshold test counts them too.
+          case BoxT::Hov: nl = c->bsize + (int)c->s.size() > MARGIN - col; break;
           default:  // Pp_box (the @[<n>] default): format.ml's Pp_box rule.
             // pp_current_indent here is the CURRENT LINE's indent (updated only
             // on a newline), not the running column -- so we test cur_indent.
             if (is_new_line) nl = false;
-            else if (c->bsize > MARGIN - col) nl = true;
+            else if (c->bsize + (int)c->s.size() > MARGIN - col) nl = true;
             else nl = cur_indent > brk_indent;  // > pp_margin - width + off
             break;
         }
