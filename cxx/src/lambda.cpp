@@ -1673,18 +1673,22 @@ struct Translator {
     // An integer literal, or a constant constructor (matched by its integer tag),
     // tested against the scrutinee with the rest of the rows as the fall-through.
     if (!r.guard) {
-      bool isint = false; long long val = 0;
+      bool isint = false, ctor = false; long long val = 0;
       if (auto* pc = std::get_if<Ppat_constant>(&r.lhs->desc)) {
         if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) { isint = true; val = parse_ocaml_int(pi->value); }
       } else if (auto* k = std::get_if<Ppat_construct>(&r.lhs->desc); k && !k->arg) {
         auto it = ctor_info_.find(ctor_of(*r.lhs));
-        if (it != ctor_info_.end() && !it->second.is_block) { isint = true; val = it->second.tag; }
+        if (it != ctor_info_.end() && !it->second.is_block) { isint = true; val = it->second.tag; ctor = true; }
       }
       if (isint) {
-        auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
-        ne->args = {scrut, cint(val)};
         auto iff = mk(Lam::K::IfThenElse);
-        iff->cond = ne; iff->then_ = int_cases(scrut, rows, i + 1); iff->else_ = expr(*r.rhs);
+        if (ctor && val == 0) {
+          iff->cond = scrut;  // constant ctor of tag 0: a truthy test (`!= 0` is identity)
+        } else {
+          auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt; ne->args = {scrut, cint(val)};
+          iff->cond = ne;
+        }
+        iff->then_ = int_cases(scrut, rows, i + 1); iff->else_ = expr(*r.rhs);
         return iff;
       }
     }

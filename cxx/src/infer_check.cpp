@@ -672,6 +672,19 @@ struct Checker {
       if (!tup || !tup->elems.empty()) all_const = false;  // a block constructor
     }
     if (all_const && !is_gadt) immediate_types_.insert(d.name.txt);
+    // `[@@unboxed]` of a single immediate field shares its int representation, so
+    // a value of the type gets the [int] value kind too.
+    bool unboxed = false;
+    for (auto& a : d.attrs) if (a.name == "unboxed" || a.name == "ocaml.unboxed") unboxed = true;
+    if (unboxed && v->ctors.size() == 1)
+      if (auto* tup = std::get_if<Pcstr_tuple>(&v->ctors[0].args))
+        if (tup->elems.size() == 1)
+          if (auto* c = std::get_if<Ptyp_constr>(&tup->elems[0]->desc)) {
+            std::string n = lid_last(c->id.txt);
+            if (n == "int" || n == "char" || n == "bool" || n == "unit" ||
+                immediate_types_.count(n))
+              immediate_types_.insert(d.name.txt);
+          }
     if (is_gadt) {
       gadt_types.insert(d.name.txt);
       for (auto& c : v->ctors) gadt_ctors.insert(c.name.txt);
