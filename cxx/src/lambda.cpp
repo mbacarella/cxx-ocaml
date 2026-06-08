@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <map>
 #include <set>
 #include <ostream>
 #include <sstream>
@@ -965,39 +966,50 @@ struct Translator {
   // Returns null otherwise (mixed isint forms / non-exhaustive / complex
   // sub-patterns), so the caller falls back without harm.  Eligibility is decided
   // before any arm is compiled, so a null return allocates no stamps.
-  LamPtr ctor_match(const LamPtr& scrut, const std::vector<Case>& cases) {
+  LamPtr ctor_match(const LamPtr& scrut, const std::vector<Case>& cases, const Location& mloc) {
     if (cases.empty()) return nullptr;
     std::string type;
-    int nconst = 0, nblock = 0;
+    std::set<int> cseen, bseen;  // covered values/tags; a duplicate => multi-row, bail
     for (auto& c : cases) {
       if (c.guard) return nullptr;
       auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
       if (!k) return nullptr;
       auto it = ctor_info_.find(ctor_of(c.lhs));
       if (it == ctor_info_.end()) return nullptr;
-      if (type.empty()) type = it->second.type;
-      else if (type != it->second.type) return nullptr;
-      if (it->second.is_block) ++nblock; else { if (k->arg) return nullptr; ++nconst; }
+      auto& ci = it->second;
+      if (type.empty()) type = ci.type;
+      else if (type != ci.type) return nullptr;
+      if (ci.is_block) { if (!bseen.insert(ci.tag).second) return nullptr; }
+      else { if (k->arg || !cseen.insert(ci.tag).second) return nullptr; }
     }
     auto tc = type_ctors_.find(type);
     if (tc == type_ctors_.end()) return nullptr;
-    if (nconst != tc->second.first || nblock != tc->second.second) return nullptr;  // not exhaustive
-    if (nblock < 1) return nullptr;  // const-only -> const_switch handles it
-    // Eligible: now compile arms (consts keyed by int value, blocks by tag).
-    std::vector<Lam::SwitchCase> consts, blocks;
+    int NC = tc->second.first, NB = tc->second.second;
+    if (NB < 1) return nullptr;  // const-only -> const_switch handles it
+    bool exhaustive = (int)cseen.size() == NC && (int)bseen.size() == NB;
+    // A partial multi-block match over a type that ALSO has constant ctors needs
+    // the matcher's isint-split heuristic we don't replicate; bail.  (Pure-block
+    // types -- NC==0, e.g. result -- just fill missing tags with Match_failure.)
+    if (!exhaustive && NB >= 2 && NC >= 1) return nullptr;
+    // Eligible: compile covered arms, then fill missing ctors with Match_failure
+    // (a missing constructor's slot raises, exactly as ocamlc fills partial matches).
+    std::map<int, LamPtr> cmap, bmap;
     for (auto& c : cases) {
       auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
       auto& ci = ctor_info_.at(ctor_of(c.lhs));
       if (ci.is_block) {
         LamPtr body = build_block_arm(scrut, ci, k, *c.rhs);
         if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
-        blocks.push_back({ci.tag, body});
+        bmap[ci.tag] = body;
       } else {
-        consts.push_back({ci.tag, expr(*c.rhs)});  // ci.tag is the constant's int value
+        cmap[ci.tag] = expr(*c.rhs);
       }
     }
-    std::sort(consts.begin(), consts.end(), [](auto& x, auto& y) { return x.tag < y.tag; });
-    std::sort(blocks.begin(), blocks.end(), [](auto& x, auto& y) { return x.tag < y.tag; });
+    std::vector<Lam::SwitchCase> consts, blocks;
+    for (int v = 0; v < NC; ++v)
+      consts.push_back({v, cmap.count(v) ? cmap[v] : raise_predef("Match_failure", mloc)});
+    for (int t = 0; t < NB; ++t)
+      blocks.push_back({t, bmap.count(t) ? bmap[t] : raise_predef("Match_failure", mloc)});
     // nb==1, nc==1 -> truthy `(if scrut <block> <const>)` (option/list).
     if (consts.size() == 1 && blocks.size() == 1) {
       auto i = mk(Lam::K::IfThenElse);
@@ -1032,7 +1044,8 @@ struct Translator {
     return sw;
   }
 
-  LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases) {
+  LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases,
+                       const Location& mloc) {
     // A non-variable scrutinee with a `| n -> ...` catch-all is bound to n first
     // (`let n = scrut in ...`), so n refers to it inside the arms (matches ocamlc).
     if (scrut->k != Lam::K::Var)
@@ -1042,7 +1055,7 @@ struct Translator {
             Ident nid = fresh(pv->name.txt);
             scope.back()[pv->name.txt] = nid;
             auto v = mk(Lam::K::Var); v->var = nid;
-            auto body = compile_match(v, cases);
+            auto body = compile_match(v, cases, mloc);
             auto l = mk(Lam::K::Let); l->bindings = {{nid, ValueKind::Gen, scrut}}; l->body = body;
             return l;
           }
@@ -1057,7 +1070,7 @@ struct Translator {
       }
     }
     if (auto sw = const_switch(scrut, cases)) return sw;
-    if (auto cm = ctor_match(scrut, cases)) return cm;
+    if (auto cm = ctor_match(scrut, cases, mloc)) return cm;
     return int_cases(scrut, cases, 0);
   }
 
@@ -1128,7 +1141,7 @@ struct Translator {
       i->else_ = raise_predef("Assert_failure", e.loc);
       return i;
     }
-    if (auto* m = std::get_if<Pexp_match>(&e.desc)) return compile_match(expr(*m->e), m->cases);
+    if (auto* m = std::get_if<Pexp_match>(&e.desc)) return compile_match(expr(*m->e), m->cases, e.loc);
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
       for (auto& el : tu->elems) es.push_back(expr(*el));
@@ -1349,7 +1362,7 @@ struct Translator {
       for (auto& [lbl, arg] : ap->args) a->args.push_back(expr(*arg));
       return a;
     }
-    if (auto* f = std::get_if<Pexp_function>(&e.desc)) return function(*f);
+    if (auto* f = std::get_if<Pexp_function>(&e.desc)) return function(*f, e.loc);
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
       // `let _ = e in body` discards e -> seq, not a binding.
       if (le->bindings.size() == 1 &&
@@ -1435,7 +1448,7 @@ struct Translator {
     return mk(Lam::K::ConstInt);  // unsupported: placeholder (will DIFF)
   }
 
-  LamPtr function(const Pexp_function& f) {
+  LamPtr function(const Pexp_function& f, const Location& floc) {
     scope.emplace_back();
     auto l = mk(Lam::K::Function);
     for (auto& fp : f.params)
@@ -1461,7 +1474,7 @@ struct Translator {
       Ident pid = fresh("param");
       l->params.push_back({pid, ValueKind::Gen});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
-      l->body = compile_match(scrut, fc->cases);
+      l->body = compile_match(scrut, fc->cases, floc);
     } else {
       l->body = mk(Lam::K::ConstInt);
     }
