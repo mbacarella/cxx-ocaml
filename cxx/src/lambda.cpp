@@ -449,6 +449,8 @@ struct Translator {
   // (export value/submodule name -> field index), for resolving `M.x`.
   std::unordered_map<std::string, Ident> module_ident_;
   std::unordered_map<std::string, std::unordered_map<std::string, int>> module_layout_;
+  // A local functor's result field layout, so `Make(Arg).foo` resolves.
+  std::unordered_map<std::string, std::vector<std::string>> functor_result_;
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
   // unqualified name resolves as `M.x` (a stdlib field or an external prim).
   std::vector<std::string> opened_;
@@ -1902,7 +1904,57 @@ struct Translator {
       return fn;
     }
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) return compile_module_expr(*pc->me);
-    return mk(Lam::K::ConstInt);  // other module exprs (apply/ident/...): best-effort
+    if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {  // a module in value position
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
+        if (auto it = module_ident_.find(l->name); it != module_ident_.end()) {
+          auto v = mk(Lam::K::Var); v->var = it->second; return v;
+        }
+    }
+    if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) {  // F(X) -> (apply F X)
+      auto a = mk(Lam::K::Apply);
+      a->fn = compile_module_expr(*pa->f);
+      a->args = {compile_module_expr(*pa->arg)};
+      return a;
+    }
+    return mk(Lam::K::ConstInt);  // other module exprs: best-effort
+  }
+  // The runtime field layout a module expression *produces*: a structure's
+  // exports, a functor application's result = the functor's result layout, a
+  // constraint's = the ascribed signature.
+  // The exported names of a structure (value/module/exception, in declaration
+  // order; a redefined name moves to its last position) -- the runtime layout,
+  // computed statically (no compilation/side effects).
+  static std::vector<std::string> struct_export_names(const Structure& s) {
+    std::vector<std::string> out;
+    auto add = [&](const std::string& n) {
+      for (size_t i = 0; i < out.size(); ++i) if (out[i] == n) { out.erase(out.begin() + i); break; }
+      out.push_back(n);
+    };
+    for (auto& it : s) {
+      if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
+        for (auto& b : sv->bindings)
+          if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) add(pv->name.txt);
+      } else if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {
+        if (pm->binding.name.txt) add(*pm->binding.name.txt);
+      }
+    }
+    return out;
+  }
+  std::vector<std::string> module_result_layout(const ModuleExpr& me) {
+    if (auto* ps = std::get_if<Pmod_structure>(&me.desc)) return struct_export_names(ps->items);
+    if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
+      auto s = sig_layout(*pc->mt);
+      return s.empty() ? module_result_layout(*pc->me) : s;
+    }
+    if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) return module_result_layout(*pf->body);
+    if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) {
+      if (auto* fi = std::get_if<Pmod_ident>(&pa->f->desc))
+        if (auto* l = std::get_if<Lident>(&fi->id.txt.v)) {
+          auto it = functor_result_.find(l->name);
+          if (it != functor_result_.end()) return it->second;
+        }
+    }
+    return {};
   }
 
   LamPtr build_module(const Structure& s, std::vector<std::string>* names) {
@@ -1966,6 +2018,15 @@ struct Translator {
             Ident mid = fresh(*mb.name.txt);            // a functor binds as a function
             cur.push_back({mid, ValueKind::Gen, compile_module_expr(mb.expr)});
             module_ident_[*mb.name.txt] = mid;
+            functor_result_[*mb.name.txt] = module_result_layout(mb.expr);  // for Make(..)
+            add_export(*mb.name.txt, mid);
+          } else {  // module M = F(X) / M2 / (M : S): bind + layout from the result
+            Ident mid = fresh(*mb.name.txt);
+            cur.push_back({mid, ValueKind::Gen, compile_module_expr(mb.expr)});
+            module_ident_[*mb.name.txt] = mid;
+            auto& lay = module_layout_[*mb.name.txt]; lay.clear();
+            auto rl = module_result_layout(mb.expr);
+            for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
             add_export(*mb.name.txt, mid);
           }
         continue;
