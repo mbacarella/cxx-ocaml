@@ -1262,15 +1262,24 @@ struct Translator {
       bind_catchall(*r.lhs, scrut);
       return expr(*r.rhs);
     }
-    if (!r.guard)
-      if (auto* pc = std::get_if<Ppat_constant>(&r.lhs->desc))
-        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
-          auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
-          ne->args = {scrut, cint(std::stoll(pi->value))};
-          auto iff = mk(Lam::K::IfThenElse);
-          iff->cond = ne; iff->then_ = int_cases(scrut, rows, i + 1); iff->else_ = expr(*r.rhs);
-          return iff;
-        }
+    // An integer literal, or a constant constructor (matched by its integer tag),
+    // tested against the scrutinee with the rest of the rows as the fall-through.
+    if (!r.guard) {
+      bool isint = false; long long val = 0;
+      if (auto* pc = std::get_if<Ppat_constant>(&r.lhs->desc)) {
+        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) { isint = true; val = std::stoll(pi->value); }
+      } else if (auto* k = std::get_if<Ppat_construct>(&r.lhs->desc); k && !k->arg) {
+        auto it = ctor_info_.find(ctor_of(*r.lhs));
+        if (it != ctor_info_.end() && !it->second.is_block) { isint = true; val = it->second.tag; }
+      }
+      if (isint) {
+        auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
+        ne->args = {scrut, cint(val)};
+        auto iff = mk(Lam::K::IfThenElse);
+        iff->cond = ne; iff->then_ = int_cases(scrut, rows, i + 1); iff->else_ = expr(*r.rhs);
+        return iff;
+      }
+    }
     return expr(*r.rhs);  // unsupported pattern: best-effort
   }
 
