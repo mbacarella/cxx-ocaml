@@ -819,6 +819,20 @@ struct Translator {
   }
 
   LamPtr cint(long long n) { auto z = mk(Lam::K::ConstInt); z->int_val = n; return z; }
+  // A recursive binding whose value is a heap block (tuple/ctor/record) -- compiled
+  // with caml_alloc_dummy + caml_update_dummy, unlike a recursive function.
+  static bool is_rec_data(const LamPtr& v) {
+    return v->k == Lam::K::Prim && (v->prim == Prim::Makeblock || v->prim == Prim::Makemutable);
+  }
+  LamPtr alloc_dummy(int size) {
+    auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_alloc_dummy";
+    pr->args = {cint(size)}; return pr;
+  }
+  LamPtr update_dummy(const Ident& id, const LamPtr& val) {
+    auto v = mk(Lam::K::Var); v->var = id;
+    auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_update_dummy";
+    pr->args = {v, val}; return pr;
+  }
   LamPtr cchar(int c) { auto z = mk(Lam::K::ConstChar); z->int_val = c; return z; }
   LamPtr cstr(const std::string& s) { auto z = mk(Lam::K::ConstString); z->str_val = s; return z; }
   LamPtr cblock(int tag, std::vector<LamPtr> fs) {
@@ -1703,7 +1717,6 @@ struct Translator {
       }
       scope.emplace_back();
       if (le->rf == RecFlag::Recursive) {  // names in scope within their RHSs
-        auto l = mk(Lam::K::Letrec);
         std::vector<std::pair<const ValueBinding*, Ident>> recs;
         for (auto& b : le->bindings)
           if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
@@ -1711,8 +1724,24 @@ struct Translator {
             scope.back()[pv->name.txt] = id;
             recs.push_back({&b, id});
           }
-        for (auto& [b, id] : recs)
-          l->bindings.push_back({id, pat_kind(&b->pat), expr(*b->expr)});
+        std::vector<LamPtr> vals; bool all_data = !recs.empty();
+        for (auto& [b, id] : recs) { LamPtr v = expr(*b->expr); vals.push_back(v); if (!is_rec_data(v)) all_data = false; }
+        if (all_data) {  // recursive data: `(let <dummies> (seq <updates> body))`
+          auto l = mk(Lam::K::Let);
+          std::vector<LamPtr> updates;
+          for (size_t i = 0; i < recs.size(); ++i) {
+            l->bindings.push_back({recs[i].second, ValueKind::Gen, alloc_dummy((int)vals[i]->args.size())});
+            updates.push_back(update_dummy(recs[i].second, vals[i]));
+          }
+          LamPtr body = expr(*le->body);
+          for (auto u = updates.rbegin(); u != updates.rend(); ++u) {
+            auto sq = mk(Lam::K::Sequence); sq->cond = *u; sq->else_ = body; body = sq;
+          }
+          l->body = body; scope.pop_back(); return l;
+        }
+        auto l = mk(Lam::K::Letrec);
+        for (size_t i = 0; i < recs.size(); ++i)
+          l->bindings.push_back({recs[i].second, pat_kind(&recs[i].first->pat), vals[i]});
         l->body = expr(*le->body);
         scope.pop_back();
         return l;
@@ -2009,7 +2038,10 @@ struct Translator {
 
   LamPtr build_module(const Structure& s, std::vector<std::string>* names) {
     scope.emplace_back();
-    struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e; };
+    // updates non-empty => a recursive-data group: `(let <binds=dummies>
+    // (seq <updates> body))` (caml_alloc_dummy + caml_update_dummy).
+    struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e;
+                 std::vector<LamPtr> updates; };
     std::vector<Seg> segs;
     std::vector<Lam::Binding> cur;
     std::vector<LamPtr> exports;
@@ -2096,12 +2128,28 @@ struct Translator {
             scope.back()[pv->name.txt] = id;
             recs.push_back({&b, id});
           }
-        std::vector<Lam::Binding> binds;
+        std::vector<LamPtr> vals;
+        bool all_data = !recs.empty();
         for (auto& [b, id] : recs) {
-          binds.push_back({id, pat_kind(&b->pat), with_inline(expr(*b->expr), b->attrs)});
+          LamPtr v = with_inline(expr(*b->expr), b->attrs);
+          vals.push_back(v);
+          if (!is_rec_data(v)) all_data = false;
           add_export(std::get_if<Ppat_var>(&b->pat.desc)->name.txt, id);
         }
-        segs.push_back({false, true, std::move(binds), nullptr});
+        if (all_data) {  // recursive data: alloc dummies, then update in place
+          std::vector<Lam::Binding> dummies; std::vector<LamPtr> updates;
+          for (size_t i = 0; i < recs.size(); ++i) {
+            dummies.push_back({recs[i].second, ValueKind::Gen, alloc_dummy((int)vals[i]->args.size())});
+            updates.push_back(update_dummy(recs[i].second, vals[i]));
+          }
+          Seg s; s.seq = false; s.rec_ = false; s.binds = std::move(dummies); s.updates = std::move(updates);
+          segs.push_back(std::move(s));
+        } else {
+          std::vector<Lam::Binding> binds;
+          for (size_t i = 0; i < recs.size(); ++i)
+            binds.push_back({recs[i].second, pat_kind(&recs[i].first->pat), vals[i]});
+          segs.push_back({false, true, std::move(binds), nullptr, {}});
+        }
         continue;
       }
       for (auto& b : sv->bindings) {
@@ -2132,7 +2180,13 @@ struct Translator {
     LamPtr acc = block;
     for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
       if (it->seq) { auto sq = mk(Lam::K::Sequence); sq->cond = it->e; sq->else_ = acc; acc = sq; }
-      else {
+      else if (!it->updates.empty()) {  // recursive data: let dummies in (seq updates body)
+        LamPtr body = acc;
+        for (auto u = it->updates.rbegin(); u != it->updates.rend(); ++u) {
+          auto sq = mk(Lam::K::Sequence); sq->cond = *u; sq->else_ = body; body = sq;
+        }
+        auto l = mk(Lam::K::Let); l->bindings = std::move(it->binds); l->body = body; acc = l;
+      } else {
         auto l = mk(it->rec_ ? Lam::K::Letrec : Lam::K::Let);
         l->bindings = std::move(it->binds); l->body = acc; acc = l;
       }
