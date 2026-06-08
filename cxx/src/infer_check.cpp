@@ -1206,8 +1206,13 @@ struct Checker {
     }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
       infer_expr(*as->e);  // infer the condition (flows operand kinds, e.g. x:int)
-      // `assert e` is unit (-> the [int] value kind); but `assert false` is 'a and a
-      // concrete unit clashes in strict checking, so only commit to unit for kinds.
+      // `assert false` is bottom ('a, never returns): the type-checker leaves the
+      // surrounding result type open, so don't constrain it (would wrongly pin a
+      // polymorphic result -- e.g. a fold's accumulator -- to unit's [int] kind).
+      if (auto* ctr = std::get_if<Pexp_construct>(&as->e->desc))
+        if (lid_last(ctr->id.txt) == "false") return eng.any();
+      // `assert e` (e != false) is unit (-> the [int] value kind), but a concrete
+      // unit clashes in strict checking, so only commit to unit for kinds.
       return record_kinds_ ? eng.constr("unit") : eng.any();
     }
     // Records, via the unique-label registry (ambiguous labels -> Any).
