@@ -918,6 +918,20 @@ struct Translator {
   LamPtr fieldimm(int i, const LamPtr& s) {
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = i; f->args = {s}; return f;
   }
+  static bool is_field_access(const LamPtr& l) {
+    return l->k == Lam::K::Prim &&
+           (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt || l->prim == Prim::FieldMut);
+  }
+
+  // A match row as a *borrowed* view into the AST (the Structure outlives the
+  // translation), so sub-matches can be built from inner sub-patterns without
+  // copying the move-only Case.  guard==nullptr means no `when`.
+  struct Row { const Pattern* lhs; const Expression* rhs; const Expression* guard; };
+  static std::vector<Row> rows_of(const std::vector<Case>& cs) {
+    std::vector<Row> rs;
+    for (auto& c : cs) rs.push_back({&c.lhs, c.rhs.get(), c.guard ? c.guard->get() : nullptr});
+    return rs;
+  }
 
   // Compile one block-constructor arm: bind its argument fields (field_imm i scrut)
   // in the body, inlining single-use bindings and `=a`-aliasing multi-use ones (as
@@ -966,27 +980,61 @@ struct Translator {
   // Returns null otherwise (mixed isint forms / non-exhaustive / complex
   // sub-patterns), so the caller falls back without harm.  Eligibility is decided
   // before any arm is compiled, so a null return allocates no stamps.
-  LamPtr ctor_match(const LamPtr& scrut, const std::vector<Case>& cases, const Location& mloc) {
-    if (cases.empty()) return nullptr;
+  // One block constructor's arm, given all rows that select it (in source order).
+  // A single simple-argument row uses the inlining fast path; multiple rows (or a
+  // complex argument) sub-match the constructor's single field (arity 1 only).
+  LamPtr build_ctor_group_arm(const LamPtr& scrut, const CtorInfo& ci,
+                              const std::vector<const Row*>& rs, const Location& mloc) {
+    if (rs.size() == 1) {
+      auto* k = std::get_if<Ppat_construct>(&rs[0]->lhs->desc);
+      if (LamPtr a = build_block_arm(scrut, ci, k, *rs[0]->rhs)) return a;
+    }
+    if (ci.arity != 1) return nullptr;  // multi-field multi-row: multi-column, bail
+    LamPtr field0 = fieldimm(0, scrut);
+    std::vector<Row> sub;
+    bool has_var = false;  // a row whose inner pattern is a plain variable
+    for (auto* r : rs) {
+      auto* k = std::get_if<Ppat_construct>(&r->lhs->desc);
+      if (!k || !k->arg) return nullptr;
+      const Pattern* ip = k->arg->get();
+      if (!r->guard && std::holds_alternative<Ppat_var>(ip->desc)) has_var = true;
+      sub.push_back({ip, r->rhs, r->guard});
+    }
+    // With a variable sub-pattern, compile_match binds the field to that user name.
+    if (has_var) return compile_match(field0, sub, mloc);
+    // Otherwise bind the (possibly reused) field to a *match* temp -- aliased if
+    // used more than once, inlined if not (as ocamlc's matcher does).
+    Ident tv = fresh("", true);
+    auto tvar = mk(Lam::K::Var); tvar->var = tv;
+    LamPtr body = compile_match(tvar, sub, mloc);
+    if (count_var(body, tv) <= 1) { subst_var(body, tv, field0); return body; }
+    auto l = mk(Lam::K::Let); l->bindings = {{tv, ValueKind::Gen, field0, true}}; l->body = body;
+    return l;
+  }
+
+  LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc) {
+    if (rows.empty()) return nullptr;
     std::string type;
-    std::set<int> cseen, bseen;  // covered values/tags; a duplicate => multi-row, bail
-    for (auto& c : cases) {
-      if (c.guard) return nullptr;
-      auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
+    std::set<int> cseen;                            // covered constant values
+    std::map<int, const Row*> crow;                 // const value -> its (sole) row
+    std::map<int, std::vector<const Row*>> brows;   // block tag -> its rows, in order
+    for (auto& r : rows) {
+      if (r.guard) return nullptr;
+      auto* k = std::get_if<Ppat_construct>(&r.lhs->desc);
       if (!k) return nullptr;
-      auto it = ctor_info_.find(ctor_of(c.lhs));
+      auto it = ctor_info_.find(ctor_of(*r.lhs));
       if (it == ctor_info_.end()) return nullptr;
       auto& ci = it->second;
       if (type.empty()) type = ci.type;
       else if (type != ci.type) return nullptr;
-      if (ci.is_block) { if (!bseen.insert(ci.tag).second) return nullptr; }
-      else { if (k->arg || !cseen.insert(ci.tag).second) return nullptr; }
+      if (ci.is_block) brows[ci.tag].push_back(&r);
+      else { if (k->arg || !cseen.insert(ci.tag).second) return nullptr; crow[ci.tag] = &r; }
     }
     auto tc = type_ctors_.find(type);
     if (tc == type_ctors_.end()) return nullptr;
     int NC = tc->second.first, NB = tc->second.second;
     if (NB < 1) return nullptr;  // const-only -> const_switch handles it
-    bool exhaustive = (int)cseen.size() == NC && (int)bseen.size() == NB;
+    bool exhaustive = (int)cseen.size() == NC && (int)brows.size() == NB;
     // A partial multi-block match over a type that ALSO has constant ctors needs
     // the matcher's isint-split heuristic we don't replicate; bail.  (Pure-block
     // types -- NC==0, e.g. result -- just fill missing tags with Match_failure.)
@@ -994,16 +1042,12 @@ struct Translator {
     // Eligible: compile covered arms, then fill missing ctors with Match_failure
     // (a missing constructor's slot raises, exactly as ocamlc fills partial matches).
     std::map<int, LamPtr> cmap, bmap;
-    for (auto& c : cases) {
-      auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
-      auto& ci = ctor_info_.at(ctor_of(c.lhs));
-      if (ci.is_block) {
-        LamPtr body = build_block_arm(scrut, ci, k, *c.rhs);
-        if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
-        bmap[ci.tag] = body;
-      } else {
-        cmap[ci.tag] = expr(*c.rhs);
-      }
+    for (auto& [v, r] : crow) cmap[v] = expr(*r->rhs);
+    for (auto& [tag, rs] : brows) {
+      auto& ci = ctor_info_.at(ctor_of(*rs[0]->lhs));
+      LamPtr body = build_ctor_group_arm(scrut, ci, rs, mloc);
+      if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
+      bmap[tag] = body;
     }
     std::vector<Lam::SwitchCase> consts, blocks;
     for (int v = 0; v < NC; ++v)
@@ -1046,47 +1090,54 @@ struct Translator {
 
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases,
                        const Location& mloc) {
+    return compile_match(scrut, rows_of(cases), mloc);
+  }
+  LamPtr compile_match(const LamPtr& scrut, const std::vector<Row>& rows,
+                       const Location& mloc) {
     // A non-variable scrutinee with a `| n -> ...` catch-all is bound to n first
     // (`let n = scrut in ...`), so n refers to it inside the arms (matches ocamlc).
+    // A binding to a sub-term of the scrutinee (a field read) is an Alias (`=a`).
     if (scrut->k != Lam::K::Var)
-      for (auto& c : cases)
-        if (!c.guard)
-          if (auto* pv = std::get_if<Ppat_var>(&c.lhs.desc)) {
+      for (auto& r : rows)
+        if (!r.guard)
+          if (auto* pv = std::get_if<Ppat_var>(&r.lhs->desc)) {
             Ident nid = fresh(pv->name.txt);
             scope.back()[pv->name.txt] = nid;
             auto v = mk(Lam::K::Var); v->var = nid;
-            auto body = compile_match(v, cases, mloc);
-            auto l = mk(Lam::K::Let); l->bindings = {{nid, ValueKind::Gen, scrut}}; l->body = body;
+            auto body = compile_match(v, rows, mloc);
+            auto l = mk(Lam::K::Let);
+            l->bindings = {{nid, ValueKind::Gen, scrut, is_field_access(scrut)}};
+            l->body = body;
             return l;
           }
-    if (cases.size() == 2 && !cases[0].guard && !cases[1].guard) {
-      std::string a = ctor_of(cases[0].lhs), b = ctor_of(cases[1].lhs);
+    if (rows.size() == 2 && !rows[0].guard && !rows[1].guard) {
+      std::string a = ctor_of(*rows[0].lhs), b = ctor_of(*rows[1].lhs);
       if ((a == "true" && b == "false") || (a == "false" && b == "true")) {
         auto i = mk(Lam::K::IfThenElse);
         i->cond = scrut;
-        i->then_ = expr(*(a == "true" ? cases[0] : cases[1]).rhs);
-        i->else_ = expr(*(a == "false" ? cases[0] : cases[1]).rhs);
+        i->then_ = expr(*(a == "true" ? rows[0] : rows[1]).rhs);
+        i->else_ = expr(*(a == "false" ? rows[0] : rows[1]).rhs);
         return i;
       }
     }
-    if (auto sw = const_switch(scrut, cases)) return sw;
-    if (auto cm = ctor_match(scrut, cases, mloc)) return cm;
-    return int_cases(scrut, cases, 0);
+    if (auto sw = const_switch(scrut, rows)) return sw;
+    if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
+    return int_cases(scrut, rows, 0);
   }
 
   // Exhaustive match over a purely-constant variant type -> (switch* ...).
-  LamPtr const_switch(const LamPtr& scrut, const std::vector<Case>& cases) {
+  LamPtr const_switch(const LamPtr& scrut, const std::vector<Row>& rows) {
     std::string type;
     std::vector<Lam::SwitchCase> arms;
-    for (auto& c : cases) {
-      if (c.guard) return nullptr;
-      auto it = ctor_info_.find(ctor_of(c.lhs));
+    for (auto& r : rows) {
+      if (r.guard) return nullptr;
+      auto it = ctor_info_.find(ctor_of(*r.lhs));
       if (it == ctor_info_.end() || it->second.is_block) return nullptr;
-      auto* k = std::get_if<Ppat_construct>(&c.lhs.desc);
+      auto* k = std::get_if<Ppat_construct>(&r.lhs->desc);
       if (k && k->arg) return nullptr;  // constant ctor must take no argument
       if (type.empty()) type = it->second.type;
       else if (type != it->second.type) return nullptr;
-      arms.push_back({it->second.tag, expr(*c.rhs)});
+      arms.push_back({it->second.tag, expr(*r.rhs)});
     }
     auto t = type_ctors_.find(type);
     if (t == type_ctors_.end() || t->second.second != 0 ||
@@ -1105,23 +1156,23 @@ struct Translator {
     if (auto* pv = std::get_if<Ppat_var>(&p.desc))
       if (scrut->k == Lam::K::Var) scope.back()[pv->name.txt] = scrut->var;
   }
-  LamPtr int_cases(const LamPtr& scrut, const std::vector<Case>& cases, size_t i) {
-    if (i >= cases.size()) return cint(0);
-    const Case& c = cases[i];
-    if (!c.guard && (is_catchall(c.lhs) || i + 1 == cases.size())) {
-      bind_catchall(c.lhs, scrut);
-      return expr(*c.rhs);
+  LamPtr int_cases(const LamPtr& scrut, const std::vector<Row>& rows, size_t i) {
+    if (i >= rows.size()) return cint(0);
+    const Row& r = rows[i];
+    if (!r.guard && (is_catchall(*r.lhs) || i + 1 == rows.size())) {
+      bind_catchall(*r.lhs, scrut);
+      return expr(*r.rhs);
     }
-    if (!c.guard)
-      if (auto* pc = std::get_if<Ppat_constant>(&c.lhs.desc))
+    if (!r.guard)
+      if (auto* pc = std::get_if<Ppat_constant>(&r.lhs->desc))
         if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
           auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
           ne->args = {scrut, cint(std::stoll(pi->value))};
           auto iff = mk(Lam::K::IfThenElse);
-          iff->cond = ne; iff->then_ = int_cases(scrut, cases, i + 1); iff->else_ = expr(*c.rhs);
+          iff->cond = ne; iff->then_ = int_cases(scrut, rows, i + 1); iff->else_ = expr(*r.rhs);
           return iff;
         }
-    return expr(*c.rhs);  // unsupported pattern: best-effort
+    return expr(*r.rhs);  // unsupported pattern: best-effort
   }
 
   LamPtr expr(const Expression& e) {
