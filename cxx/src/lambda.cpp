@@ -2449,8 +2449,39 @@ struct Translator {
           add_export(pv->name.txt, id);
         } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {
           flush(); segs.push_back({true, false, {}, expr(*b.expr)});  // `let _ = e` -> seq
-        } else {  // `let () = e` and other refutable patterns: a *match* temp
-          cur.push_back({fresh("", true), ValueKind::Gen, expr(*b.expr)});
+        } else {
+          // `let (a,b) = e` / `let {x;y} = e`: each component becomes its own export,
+          // bound (`=a`) to a field read of e -- directly when e is a variable or a
+          // constant block (whose element reads fold to the elements), else via a
+          // *match* temp.  ocamlc emits the component bindings in reverse field order
+          // but exports them in source order; a refutable pattern stays a bare temp.
+          LamPtr val = expr(*b.expr);
+          bool direct = val->k == Lam::K::Var || val->k == Lam::K::ConstBlock;
+          LamPtr scrut; Ident tmp;
+          if (direct) scrut = val;
+          else { tmp = fresh("", true); auto tv = mk(Lam::K::Var); tv->var = tmp; scrut = tv; }
+          std::vector<std::pair<Ident, LamPtr>> binders;
+          if (collect_binders(b.pat, scrut, binders) && !binders.empty()) {
+            if (!direct) cur.push_back({tmp, ValueKind::Gen, val});
+            auto fold = [&](const LamPtr& acc) -> std::pair<LamPtr, bool> {
+              if (acc->k == Lam::K::Prim && !acc->args.empty() &&
+                  acc->args[0]->k == Lam::K::ConstBlock &&
+                  (acc->prim == Prim::FieldImm || acc->prim == Prim::FieldInt ||
+                   acc->prim == Prim::FieldMut)) {
+                auto& cb = acc->args[0];
+                if (acc->prim_arg >= 0 && acc->prim_arg < (int)cb->args.size())
+                  return {cb->args[acc->prim_arg], false};  // const element -> strict
+              }
+              return {acc, is_field_access(acc)};  // a field read -> `=a` alias
+            };
+            for (auto it2 = binders.rbegin(); it2 != binders.rend(); ++it2) {
+              auto [v, alias] = fold(it2->second);
+              cur.push_back({it2->first, ValueKind::Gen, v, alias});
+            }
+            for (auto& [id, acc] : binders) add_export(id.name, id);
+          } else {  // `let () = e` and other refutable patterns: a bare *match* temp
+            cur.push_back({fresh("", true), ValueKind::Gen, val});
+          }
         }
       }
     }
