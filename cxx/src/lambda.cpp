@@ -1376,7 +1376,22 @@ struct Translator {
           opened_.pop_back();
           return b;
         }
-      return expr(*si->body);  // other struct-item bodies (let module, ...): best-effort
+      // `let module M = me in body`: bind M (value + layout), then the body.
+      if (auto* pm = std::get_if<Pstr_module>(&si->item->desc))
+        if (pm->binding.name.txt) {
+          auto& mb = pm->binding;
+          Ident mid = fresh(*mb.name.txt);
+          LamPtr modval = compile_module_expr(mb.expr);
+          module_ident_[*mb.name.txt] = mid;
+          auto& lay = module_layout_[*mb.name.txt]; lay.clear();
+          auto rl = module_result_layout(mb.expr);
+          for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+          auto l = mk(Lam::K::Let);
+          l->bindings = {{mid, ValueKind::Gen, modval}};
+          l->body = expr(*si->body);
+          return l;
+        }
+      return expr(*si->body);  // other struct-item bodies: best-effort
     }
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) {
       // A string literal the inferencer typed at a format type lowers to a
@@ -1927,6 +1942,12 @@ struct Translator {
       a->args = {compile_module_expr(*pa->arg)};
       return a;
     }
+    if (auto* pu = std::get_if<Pmod_apply_unit>(&me.desc)) {  // F() -> (apply F 0)
+      auto a = mk(Lam::K::Apply);
+      a->fn = compile_module_expr(*pu->f);
+      a->args = {cint(0)};
+      return a;
+    }
     return mk(Lam::K::ConstInt);  // other module exprs: best-effort
   }
   // The runtime field layout a module expression *produces*: a structure's
@@ -1958,13 +1979,15 @@ struct Translator {
       return s.empty() ? module_result_layout(*pc->me) : s;
     }
     if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) return module_result_layout(*pf->body);
-    if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) {
-      if (auto* fi = std::get_if<Pmod_ident>(&pa->f->desc))
+    const ModuleExpr* head = nullptr;
+    if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) head = pa->f.get();
+    else if (auto* pu = std::get_if<Pmod_apply_unit>(&me.desc)) head = pu->f.get();
+    if (head)
+      if (auto* fi = std::get_if<Pmod_ident>(&head->desc))
         if (auto* l = std::get_if<Lident>(&fi->id.txt.v)) {
           auto it = functor_result_.find(l->name);
           if (it != functor_result_.end()) return it->second;
         }
-    }
     return {};
   }
 
