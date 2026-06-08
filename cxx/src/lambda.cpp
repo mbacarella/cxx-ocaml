@@ -1172,6 +1172,39 @@ struct Translator {
     }
     return false;
   }
+  // Whether a pattern is irrefutable (always matches): exactly the shapes
+  // collect_binders destructures.  Used to decide between field extraction and a
+  // partial match (which raises Match_failure on the missing cases).
+  bool is_irrefutable(const Pattern& p0) {
+    const Pattern* p = &p0;
+    while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+    if (std::holds_alternative<Ppat_any>(p->desc) ||
+        std::holds_alternative<Ppat_var>(p->desc)) return true;
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) return is_irrefutable(*pa->p);
+    if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (auto& e : pt->elems) if (!is_irrefutable(*e)) return false;
+      return true;
+    }
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [lbl, sub] : pr->fields) {
+        if (!find_field(lid_last(lbl.txt))) return false;
+        if (!is_irrefutable(*sub)) return false;
+      }
+      return true;
+    }
+    if (auto* pk = std::get_if<Ppat_construct>(&p->desc)) {
+      auto ci = ctor_info_.find(ctor_of(*p));
+      if (ci == ctor_info_.end()) return false;
+      auto tc = type_ctors_.find(ci->second.type);
+      if (tc == type_ctors_.end()) return false;
+      if (tc->second.first + tc->second.second != 1 && !gadt_types_.count(ci->second.type))
+        return false;
+      for (auto* fp : ctor_field_pats(pk, ci->second.arity))
+        if (!is_irrefutable(*fp)) return false;
+      return true;
+    }
+    return false;
+  }
   // Wrap `body` (already compiled with `binders` in scope) so each binder's
   // variable reads its field access -- inlined when used at most once, `=a`-aliased
   // (a field read is an alias) otherwise; exactly ocamlc's matcher + simplif.
@@ -2006,6 +2039,27 @@ struct Translator {
         scope.pop_back();
         return l;
       }
+      // `let <refutable> = e in body`: a partial pattern match over e raising
+      // Match_failure on the missing cases (located at the let expression).  e is
+      // bound to a *match* temp unless it is already a variable.
+      if (le->bindings.size() == 1) {
+        auto& b = le->bindings[0];
+        if (!std::holds_alternative<Ppat_var>(b.pat.desc) &&
+            !std::holds_alternative<Ppat_any>(b.pat.desc) && !is_irrefutable(b.pat)) {
+          LamPtr val = expr(*b.expr);
+          auto wrap = mk(Lam::K::Let); LamPtr scrut = val;
+          if (val->k != Lam::K::Var) {
+            Ident tmp = fresh("", true);
+            wrap->bindings.push_back({tmp, ValueKind::Gen, val});
+            auto tv = mk(Lam::K::Var); tv->var = tmp; scrut = tv;
+          }
+          std::vector<Row> rows = {{&b.pat, le->body.get(), nullptr}};
+          LamPtr m = compile_match(scrut, rows, e.loc);
+          scope.pop_back();
+          if (wrap->bindings.empty()) return m;
+          wrap->body = m; return wrap;
+        }
+      }
       auto l = mk(Lam::K::Let);
       std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured pats
       for (auto& b : le->bindings) {
@@ -2096,28 +2150,43 @@ struct Translator {
     scope.emplace_back();
     auto l = mk(Lam::K::Function);
     std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured params
+    const Pattern* refut = nullptr; Ident refut_pid; Location refut_loc; int nrefut = 0;
     for (auto& fp : f.params)
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
         // Every parameter gets a binder; a non-variable pattern (a constructor,
-        // record or tuple) is named "param" like ocamlc and its variables bound to
-        // field reads in the body (an unsupported shape stays a bare temp).
+        // record or tuple) is named "param" like ocamlc.  An irrefutable one has its
+        // variables bound to field reads in the body; a refutable one (a partial
+        // pattern, e.g. `(Some x)`) is matched in the body, raising Match_failure on
+        // the missing cases -- supported for at most one such parameter.
         const Pattern* pat = &pv->pat;
         while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) pat = pc->p.get();
         if (auto* var = std::get_if<Ppat_var>(&pat->desc)) {
           Ident id = fresh(var->name.txt);
           l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
-        } else {
+        } else if (is_irrefutable(*pat)) {
           Ident pid = fresh("param");
           l->params.push_back({pid, pat_kind(pat)});
           auto pvar = mk(Lam::K::Var); pvar->var = pid;
           collect_binders(*pat, pvar, binders);
+        } else {
+          Ident pid = fresh("param");
+          l->params.push_back({pid, pat_kind(pat)});
+          refut = pat; refut_pid = pid; refut_loc = pv->pat.loc; ++nrefut;
         }
       }
     auto rk = vk.fn_ret.find(&f);
     l->ret_kind = rk == vk.fn_ret.end() ? ValueKind::Gen : vkind(rk->second);
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
-      l->body = wrap_binders(expr(*fb->e), binders);
+      LamPtr body;
+      if (refut && nrefut == 1) {  // a partial parameter pattern -> match in the body
+        auto sv = mk(Lam::K::Var); sv->var = refut_pid;
+        std::vector<Row> rows = {{refut, fb->e.get(), nullptr}};
+        body = compile_match(sv, rows, refut_loc);
+      } else {
+        body = expr(*fb->e);
+      }
+      l->body = wrap_binders(body, binders);
     } else if (auto* fc = std::get_if<Pfunction_cases>(&f.body->v)) {
       // `function P -> ...` adds an implicit final parameter matched on.
       Ident pid = fresh("param");
