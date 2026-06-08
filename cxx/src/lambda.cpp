@@ -648,6 +648,10 @@ struct Translator {
     auto it = vk.expr.find(e);
     return it == vk.expr.end() ? ValueKind::Gen : vkind(it->second);
   }
+  bool expr_is_string(const Expression* e) {  // string isn't a value kind; drives string compares
+    auto it = vk.expr.find(e);
+    return it != vk.expr.end() && it->second == "string";
+  }
   const Ident* lookup(const std::string& n) {
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
       auto f = it->find(n);
@@ -1500,6 +1504,14 @@ struct Translator {
             // Polymorphic comparison ops: specialize to an integer comparison
             // when an operand is an immediate, else a caml_* C compare.
             if (auto c = poly_cmp(n); !c.first.empty() && as.size() == 2) {
+              // A string operand selects the string compare (caml_string_lessthan,
+              // ...): the polymorphic caml_* name with the `string` infix.
+              if (expr_is_string(as[0].second.get()) || expr_is_string(as[1].second.get())) {
+                auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall;
+                pr->prim_id = "caml_string_" + c.second.substr(5);  // drop "caml_"
+                pr->args = {expr(*as[0].second), expr(*as[1].second)};
+                return pr;
+              }
               // The operand kind drives the spelling: int -> `==`, float -> `==.`,
               // int64/int32/nativeint -> `Int64.==` etc.; two generics fall back to
               // the polymorphic caml_* compare.
