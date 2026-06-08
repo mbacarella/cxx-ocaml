@@ -389,9 +389,29 @@ ValueKind vkind(const std::string& s) {
   return ValueKind::Gen;
 }
 
+// Parse an OCaml integer literal: decimal/0x/0o/0b, `_` separators, full
+// unsigned range with two's-complement wraparound (as the compiler does).
+long long parse_ocaml_int(const std::string& s) {
+  std::string t;
+  for (char c : s) if (c != '_') t += c;
+  size_t i = 0; bool neg = false;
+  if (i < t.size() && (t[i] == '-' || t[i] == '+')) { neg = t[i] == '-'; ++i; }
+  int base = 10;
+  if (i + 1 < t.size() && t[i] == '0') {
+    char b = t[i + 1];
+    if (b == 'x' || b == 'X') { base = 16; i += 2; }
+    else if (b == 'o' || b == 'O') { base = 8; i += 2; }
+    else if (b == 'b' || b == 'B') { base = 2; i += 2; }
+  }
+  unsigned long long v = 0;
+  try { v = std::stoull(t.substr(i), nullptr, base); } catch (...) {}
+  long long r = static_cast<long long>(v);
+  return neg ? -r : r;
+}
+
 LamPtr translate_const(const Constant& c) {
   if (auto* i = std::get_if<Pconst_integer>(&c.desc)) {
-    auto l = mk(Lam::K::ConstInt); l->int_val = std::stoll(i->value);
+    auto l = mk(Lam::K::ConstInt); l->int_val = parse_ocaml_int(i->value);
     if (i->suffix) l->str_val = std::string(1, *i->suffix);  // 42L / 42l / 42n
     return l;
   }
@@ -1276,7 +1296,7 @@ struct Translator {
     if (!r.guard) {
       bool isint = false; long long val = 0;
       if (auto* pc = std::get_if<Ppat_constant>(&r.lhs->desc)) {
-        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) { isint = true; val = std::stoll(pi->value); }
+        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) { isint = true; val = parse_ocaml_int(pi->value); }
       } else if (auto* k = std::get_if<Ppat_construct>(&r.lhs->desc); k && !k->arg) {
         auto it = ctor_info_.find(ctor_of(*r.lhs));
         if (it != ctor_info_.end() && !it->second.is_block) { isint = true; val = it->second.tag; }
