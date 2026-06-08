@@ -58,7 +58,7 @@ enum class Prim {
 struct Lam {
   enum class K { Var, ConstInt, ConstChar, ConstFloat, ConstString, ConstBlock,
                  Apply, Function, Let, Letrec, Prim, IfThenElse, Sequence,
-                 Switch, For, While, Try };
+                 Switch, For, While, Try, Catch, Staticraise };
   K k;
 
   Ident var;                       // Var
@@ -94,6 +94,11 @@ struct Lam {
   struct SwitchCase { int tag; LamPtr body; };
   std::vector<SwitchCase> sw_consts, sw_blocks;
   LamPtr sw_default;
+
+  // Catch (Lstaticcatch): protected body in `cond`, handler in `then_`, static
+  // exception id in `prim_arg`, handler-bound vars in `catch_vars`.
+  // Staticraise (Lstaticraise): exit id in `prim_arg`, args in `args`.
+  std::vector<Ident> catch_vars;
 };
 
 // Translate a structure into the module's Lambda term (the setglobal form).

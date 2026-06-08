@@ -329,6 +329,20 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
       return box(BoxT::Box, 2, {text("(try"), brk(), to_doc(l->body, pr),
                                 brk_off(" ", -1), text("with " + pr.ident(l->var)),
                                 brk(), to_doc(l->then_, pr), text(")")});
+    case Lam::K::Catch: {  // @[<2>(catch@ body@;<1 -1>with (N vars)@ handler)@]
+      std::string w = "with (" + std::to_string(l->prim_arg);
+      for (auto& v : l->catch_vars) w += " " + pr.ident(v);
+      w += ")";
+      return box(BoxT::Box, 2, {text("(catch"), brk(), to_doc(l->cond, pr),
+                                brk_off(" ", -1), text(w),
+                                brk(), to_doc(l->then_, pr), text(")")});
+    }
+    case Lam::K::Staticraise: {  // @[<2>(exit@ N args)@]
+      std::vector<DocP> ds{text("(exit"), brk(), text(std::to_string(l->prim_arg))};
+      for (auto& a : l->args) { ds.push_back(brk()); ds.push_back(to_doc(a, pr)); }
+      ds.push_back(text(")"));
+      return box(BoxT::Box, 2, std::move(ds));
+    }
     case Lam::K::Switch: {
       // @[<1>(switch* larg@ @[<v 0> @[<hv 1>case int N:@ body@] @ ... @])@]
       std::vector<DocP> cases;
@@ -411,6 +425,7 @@ struct Translator {
   // Predefined exception globals (Match_failure/Assert_failure): a stable stamp per
   // name so the dump's first-appearance normalization is consistent within a file.
   std::unordered_map<std::string, int> predef_global_stamp_;
+  int next_exit_ = 0;  // static-exception ids (normalized in the dump, so value is free)
 
   // `(global Name/stamp!)` for a predefined exception used by the compiler.
   LamPtr predef_global(const std::string& name) {
@@ -937,7 +952,8 @@ struct Translator {
   // in the body, inlining single-use bindings and `=a`-aliasing multi-use ones (as
   // ocamlc's matcher + simplif do).  Returns null for sub-patterns we don't bind.
   LamPtr build_block_arm(const LamPtr& scrut, const CtorInfo& ci,
-                         const Ppat_construct* k, const Expression& rhs) {
+                         const Ppat_construct* k, const Expression& rhs,
+                         const Expression* guard = nullptr, const LamPtr& dflt = nullptr) {
     scope.emplace_back();
     std::vector<std::pair<int, Ident>> binders;
     bool ok = true;
@@ -963,6 +979,11 @@ struct Translator {
     }
     if (!ok) { scope.pop_back(); return nullptr; }
     LamPtr body = expr(rhs);
+    if (guard) {  // a `when` guard: failure falls to the shared default (exit)
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = expr(*guard); i->then_ = body; i->else_ = dflt;
+      body = i;
+    }
     scope.pop_back();
     std::vector<Lam::Binding> aliases;
     for (auto& [idx, id] : binders) {
@@ -984,11 +1005,14 @@ struct Translator {
   // A single simple-argument row uses the inlining fast path; multiple rows (or a
   // complex argument) sub-match the constructor's single field (arity 1 only).
   LamPtr build_ctor_group_arm(const LamPtr& scrut, const CtorInfo& ci,
-                              const std::vector<const Row*>& rs, const Location& mloc) {
+                              const std::vector<const Row*>& rs, const Location& mloc,
+                              const LamPtr& dflt) {
     if (rs.size() == 1) {
       auto* k = std::get_if<Ppat_construct>(&rs[0]->lhs->desc);
-      if (LamPtr a = build_block_arm(scrut, ci, k, *rs[0]->rhs)) return a;
+      const Expression* g = rs[0]->guard;  // a `when` on this single row -> if/dflt
+      if (LamPtr a = build_block_arm(scrut, ci, k, *rs[0]->rhs, g, dflt)) return a;
     }
+    for (auto* r : rs) if (r->guard) return nullptr;  // multi-row guards: bail
     if (ci.arity != 1) return nullptr;  // multi-field multi-row: multi-column, bail
     LamPtr field0 = fieldimm(0, scrut);
     std::vector<Row> sub;
@@ -1012,14 +1036,16 @@ struct Translator {
     return l;
   }
 
-  LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc) {
+  LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc,
+                    const LamPtr& dflt = nullptr) {
     if (rows.empty()) return nullptr;
     std::string type;
     std::set<int> cseen;                            // covered constant values
     std::map<int, const Row*> crow;                 // const value -> its (sole) row
     std::map<int, std::vector<const Row*>> brows;   // block tag -> its rows, in order
     for (auto& r : rows) {
-      if (r.guard) return nullptr;
+      if (r.guard && !dflt) return nullptr;  // guards only with a shared default (catch)
+      if (r.guard && !std::holds_alternative<Ppat_construct>(r.lhs->desc)) return nullptr;
       auto* k = std::get_if<Ppat_construct>(&r.lhs->desc);
       if (!k) return nullptr;
       auto it = ctor_info_.find(ctor_of(*r.lhs));
@@ -1027,6 +1053,7 @@ struct Translator {
       auto& ci = it->second;
       if (type.empty()) type = ci.type;
       else if (type != ci.type) return nullptr;
+      if (r.guard && !ci.is_block) return nullptr;  // guarded constant: bail (rare)
       if (ci.is_block) brows[ci.tag].push_back(&r);
       else { if (k->arg || !cseen.insert(ci.tag).second) return nullptr; crow[ci.tag] = &r; }
     }
@@ -1045,15 +1072,18 @@ struct Translator {
     for (auto& [v, r] : crow) cmap[v] = expr(*r->rhs);
     for (auto& [tag, rs] : brows) {
       auto& ci = ctor_info_.at(ctor_of(*rs[0]->lhs));
-      LamPtr body = build_ctor_group_arm(scrut, ci, rs, mloc);
+      LamPtr body = build_ctor_group_arm(scrut, ci, rs, mloc, dflt);
       if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
       bmap[tag] = body;
     }
+    // A missing constructor's slot raises Match_failure, or jumps to the shared
+    // default (exit) when one was supplied (a catch context).
+    auto miss = [&] { return dflt ? dflt : raise_predef("Match_failure", mloc); };
     std::vector<Lam::SwitchCase> consts, blocks;
     for (int v = 0; v < NC; ++v)
-      consts.push_back({v, cmap.count(v) ? cmap[v] : raise_predef("Match_failure", mloc)});
+      consts.push_back({v, cmap.count(v) ? cmap[v] : miss()});
     for (int t = 0; t < NB; ++t)
-      blocks.push_back({t, bmap.count(t) ? bmap[t] : raise_predef("Match_failure", mloc)});
+      blocks.push_back({t, bmap.count(t) ? bmap[t] : miss()});
     // nb==1, nc==1 -> truthy `(if scrut <block> <const>)` (option/list).
     if (consts.size() == 1 && blocks.size() == 1) {
       auto i = mk(Lam::K::IfThenElse);
@@ -1110,6 +1140,28 @@ struct Translator {
             l->body = body;
             return l;
           }
+    // Shared catch-all fallback via catch/exit: a guard on a non-variable pattern
+    // makes guard-failure AND pattern-mismatch both reach the trailing catch-all,
+    // so ocamlc emits it once behind `(catch <body> with (N) fallback)` with
+    // `(exit N)` at each failure path.
+    {
+      bool guarded_nonvar = false;
+      for (auto& r : rows)
+        if (r.guard && !is_catchall(*r.lhs)) guarded_nonvar = true;
+      if (guarded_nonvar && rows.size() >= 2 && !rows.back().guard &&
+          is_catchall(*rows.back().lhs)) {
+        int eid = ++next_exit_;
+        auto exitL = mk(Lam::K::Staticraise); exitL->prim_arg = eid;
+        std::vector<Row> inner(rows.begin(), rows.end() - 1);
+        if (LamPtr body = ctor_match(scrut, inner, mloc, exitL)) {
+          bind_catchall(*rows.back().lhs, scrut);
+          LamPtr fb = expr(*rows.back().rhs);
+          auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = eid; c->then_ = fb;
+          return c;
+        }
+        --next_exit_;  // inner not buildable: undo id, fall through to best-effort
+      }
+    }
     if (rows.size() == 2 && !rows[0].guard && !rows[1].guard) {
       std::string a = ctor_of(*rows[0].lhs), b = ctor_of(*rows[1].lhs);
       if ((a == "true" && b == "false") || (a == "false" && b == "true")) {

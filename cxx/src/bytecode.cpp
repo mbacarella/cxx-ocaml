@@ -42,6 +42,8 @@ Code add_pop(int n, Code cont) {
 struct Bytegen {
   int label_counter = 0;
   std::string compunit;
+  struct sz_lbl { int lbl; int sz; };  // a static-catch handler: label + stack level
+  std::unordered_map<int, sz_lbl> static_lbl_;  // exit id -> handler (ids are unique)
   int new_label() { return ++label_counter; }
 
   struct ToCompile {
@@ -164,6 +166,16 @@ struct Bytegen {
         fvs(e->body, bound, out);
         std::set<int> b = bound; b.insert(e->var.stamp);
         fvs(e->then_, b, out);
+        return;
+      }
+      case K::Catch: {
+        fvs(e->cond, bound, out);
+        std::set<int> b = bound; for (auto& v : e->catch_vars) b.insert(v.stamp);
+        fvs(e->then_, b, out);
+        return;
+      }
+      case K::Staticraise: {
+        for (auto& a : e->args) fvs(a, bound, out);
         return;
       }
       case K::Switch: {
@@ -421,6 +433,25 @@ struct Bytegen {
           cons(Iop(Op::Label, lbl_handler), cons(I(Op::Push),
             comp_expr(henv, exp->then_, sz + 1, add_pop(1, cont1))))));
         return cons(Iop(Op::Pushtrap, lbl_handler), comp_expr(env, exp->body, sz + 4, body_cont));
+      }
+      case K::Catch: {
+        // Static catch (no handler vars): a label the body's (exit N) branches to;
+        // not a trap (no pushtrap).  body falls through past the handler via branch1.
+        auto [branch1, cont1] = make_branch(cont);
+        int lbl = new_label();
+        static_lbl_[exp->prim_arg] = sz_lbl{lbl, sz};
+        Code hcode = cons(Iop(Op::Label, lbl), comp_expr(env, exp->then_, sz, cont1));
+        return comp_expr(env, exp->cond, sz, cons(branch1, hcode));
+      }
+      case K::Staticraise: {
+        // (exit N): pop back to the catch's stack level, then branch to its label.
+        auto it = static_lbl_.find(exp->prim_arg);
+        if (it == static_lbl_.end()) {  // shouldn't happen; degrade to unit
+          auto z = std::make_shared<Lam>(); z->k = K::ConstInt;
+          Instr c = I(Op::Const); c.cst = z; return cons(c, cont);
+        }
+        Code tail = branch_to(it->second.lbl, discard_dead_code(cont));
+        return add_pop(sz - it->second.sz, tail);
       }
       case K::Switch: return comp_switch(env, exp, sz, cont);
       default:

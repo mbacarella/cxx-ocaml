@@ -14,8 +14,14 @@ TIMEOUT="${CPP_TIMEOUT:-10}"
 CACHE="${CACHE:-/tmp/lambda_oracle_cache}"
 mkdir -p "$CACHE"
 key() { printf '%s' "$1" | tr '/' '%'; }
-# normalize: map each distinct /NNN to a sequential id by first appearance; trim.
-norm() { perl -0777 -pe 'BEGIN{%m=();$n=0} s{/(\d+)}{ "/" . ($m{$1} //= ++$n) }ge; s/\s+\z//'; }
+# normalize: /NNN stamps AND static-exception numbers (exit N / with (N) by first
+# appearance -- both are arbitrary module-global ids (next_raise_count), so like
+# stamps they are normalized rather than matched raw.  Trim trailing whitespace.
+norm() { perl -0777 -pe 'BEGIN{%m=();$n=0;%e=();$en=0}
+  s{/(\d+)}{ "/" . ($m{$1} //= ++$n) }ge;
+  s{\bexit (\d+)}{ "exit " . ($e{$1} //= ++$en) }ge;
+  s{\bwith \((\d+)}{ "with (" . ($e{$1} //= ++$en) }ge;
+  s/\s+\z//'; }
 
 if [ "${1:-}" == "--worker" ]; then
   f="$2"
