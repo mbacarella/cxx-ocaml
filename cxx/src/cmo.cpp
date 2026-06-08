@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -53,6 +54,16 @@ using omarshal::vint;
 using omarshal::vstr;
 using omarshal::vblock;
 using omarshal::vlist;
+
+// Predefined exceptions (runtimedef.ml builtin_exceptions): a GETGLOBAL of one of
+// these resolves to a fixed predef slot (Reloc_getpredef), not a compilation unit.
+bool is_predef_exn(const std::string& n) {
+  static const std::set<std::string> s = {
+      "Out_of_memory", "Sys_error", "Failure", "Invalid_argument", "End_of_file",
+      "Division_by_zero", "Not_found", "Match_failure", "Stack_overflow",
+      "Sys_blocked_io", "Assert_failure", "Undefined_recursive_module"};
+  return s.count(n) != 0;
+}
 
 // The structured constant carried by a Reloc_literal.
 ValPtr const_value(const LamPtr& c) {
@@ -149,7 +160,7 @@ struct Emitter {
       case Op::Offsetclosure:
         if (in.a == -3 || in.a == 0 || in.a == 3) out(OFFSETCLOSURE0 + in.a / 3);
         else { out(OFFSETCLOSURE); out_int(in.a); } break;
-      case Op::Getglobal: out(GETGLOBAL); slot_getglobal(in.str, false); break;
+      case Op::Getglobal: out(GETGLOBAL); slot_getglobal(in.str, is_predef_exn(in.str)); break;
       case Op::Setglobal: out(SETGLOBAL); slot_setglobal(in.str); break;
       case Op::Const: emit_const(in.cst); break;
       case Op::Makeblock:
@@ -295,11 +306,11 @@ struct Emitter {
       }
       // push; getglobal[; getfield]
       if (h.op == Op::Push && h1 && h1->op == Op::Getglobal && h2 && h2->op == Op::Getfield) {
-        out(PUSHGETGLOBALFIELD); slot_getglobal(h1->str, false); out_int(h2->a);
+        out(PUSHGETGLOBALFIELD); slot_getglobal(h1->str, is_predef_exn(h1->str)); out_int(h2->a);
         c = drop(c, 3); continue;
       }
       if (h.op == Op::Push && h1 && h1->op == Op::Getglobal) {
-        out(PUSHGETGLOBAL); slot_getglobal(h1->str, false);
+        out(PUSHGETGLOBAL); slot_getglobal(h1->str, is_predef_exn(h1->str));
         c = drop(c, 2); continue;
       }
       if (h.op == Op::Push && h1 && h1->op == Op::Const) {
@@ -307,7 +318,7 @@ struct Emitter {
         c = drop(c, 2); continue;
       }
       if (h.op == Op::Getglobal && h1 && h1->op == Op::Getfield) {
-        out(GETGLOBALFIELD); slot_getglobal(h.str, false); out_int(h1->a);
+        out(GETGLOBALFIELD); slot_getglobal(h.str, is_predef_exn(h.str)); out_int(h1->a);
         c = drop(c, 2); continue;
       }
       emit_instr(h);

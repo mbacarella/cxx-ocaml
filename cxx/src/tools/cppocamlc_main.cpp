@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
   try {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
-    auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir);
+    auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, in_path);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     cppcaml::cmo::write_cmo(instrs, mod, cmo);
   } catch (const cppcaml::ParseError& e) {

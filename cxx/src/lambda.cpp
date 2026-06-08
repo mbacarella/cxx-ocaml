@@ -270,7 +270,9 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::Makeblock: head = "(makeblock " + std::to_string(l->prim_arg); break;
         case Prim::Field: head = "(field " + std::to_string(l->prim_arg); break;
         case Prim::FieldImm: head = "(field_imm " + std::to_string(l->prim_arg); break;
-        case Prim::Global: return text("(global " + l->prim_id + "!)");
+        case Prim::Global:
+          return text("(global " + l->prim_id +
+                      (l->var.stamp ? "/" + std::to_string(l->var.stamp) : "") + "!)");
         case Prim::Addint: head = "(+"; break;
         case Prim::Subint: head = "(-"; break;
         case Prim::Mulint: head = "(*"; break;
@@ -404,6 +406,32 @@ struct Translator {
   // Locally-declared exceptions: name -> its binder (the makeblock-248 value).
   std::unordered_map<std::string, Ident> exn_ident_;
   std::string mod_path_;  // dotted module path prefix for exception names
+  std::string file_name_;  // source path, for Match_failure/Assert_failure locations
+  // Predefined exception globals (Match_failure/Assert_failure): a stable stamp per
+  // name so the dump's first-appearance normalization is consistent within a file.
+  std::unordered_map<std::string, int> predef_global_stamp_;
+
+  // `(global Name/stamp!)` for a predefined exception used by the compiler.
+  LamPtr predef_global(const std::string& name) {
+    auto it = predef_global_stamp_.find(name);
+    int st = it != predef_global_stamp_.end() ? it->second
+                                              : (predef_global_stamp_[name] = stamp++);
+    auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = name; g->var.stamp = st;
+    return g;
+  }
+  // The `[0: "file" line char]` location block of a Match_failure/Assert_failure.
+  LamPtr loc_block(const Location& loc) {
+    return cblock(0, {cstr(file_name_), cint(loc.start.lnum),
+                      cint(loc.start.cnum - loc.start.bol)});
+  }
+  // `(raise (makeblock 0 (global Exn/s!) [0: file line char]))` for a compiler-
+  // raised predefined exception (Match_failure / Assert_failure).
+  LamPtr raise_predef(const std::string& exn, const Location& loc) {
+    auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+    blk->args = {predef_global(exn), loc_block(loc)};
+    auto r = mk(Lam::K::Prim); r->prim = Prim::Raise; r->args = {blk};
+    return r;
+  }
 
   // Locally-declared variant constructors: name -> {owning type, tag, is_block}.
   // Constant (nullary) and block (with-args) constructors are numbered
@@ -1091,6 +1119,15 @@ struct Translator {
         if (auto fv = format_value(s->s)) return fv;
       return translate_const(c->c);
     }
+    if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
+      // `assert false` -> raise directly; `assert e` -> (if e 0 (raise Assert_failure)).
+      auto* ic = std::get_if<Pexp_construct>(&as->e->desc);
+      if (ic && lid_last(ic->id.txt) == "false") return raise_predef("Assert_failure", e.loc);
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = expr(*as->e); i->then_ = cint(0);
+      i->else_ = raise_predef("Assert_failure", e.loc);
+      return i;
+    }
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) return compile_match(expr(*m->e), m->cases);
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
@@ -1547,9 +1584,10 @@ struct Translator {
 }  // namespace
 
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
-                                const std::string& stdlib_dir) {
+                                const std::string& stdlib_dir, const std::string& file_name) {
   Translator t;
   t.stdlib_dir = stdlib_dir;
+  t.file_name_ = file_name;
   t.vk = infer_value_kinds(s);
   t.register_predef_ctor_info();
   t.register_types(s);
