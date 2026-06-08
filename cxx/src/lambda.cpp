@@ -720,6 +720,16 @@ struct Translator {
   // spell (the caller leaves them unresolved) -- never wrong, only incomplete.
   // Conservative on type-directed prims: only the cases whose spelling we can
   // determine from value kinds are emitted.
+  // A primitive used as a *value* (not applied): e.g. Sys.argv = %sys_argv lowers
+  // to `(caml_sys_argv 0)`.  Null for prims we don't spell in value position.
+  LamPtr prim_value(const std::string& prim) {
+    if (prim == "%sys_argv") {
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_sys_argv";
+      pr->args = {cint(0)}; return pr;
+    }
+    return nullptr;
+  }
+
   LamPtr prim_to_lam(const std::string& prim, int arity, const Pexp_apply& ap, const Expression& e) {
     auto& as = ap.args;
     auto args = [&] {
@@ -1485,6 +1495,8 @@ struct Translator {
           auto& fm = fields_of(pl->name);
           auto sf = fm.find(d->name);
           if (sf != fm.end()) return field_of(global_of(pl->name), sf->second);
+          // A prim used as a value (e.g. Sys.argv = %sys_argv -> (caml_sys_argv 0)).
+          if (auto pv = prim_value(value_prim(pl->name, d->name).name)) return pv;
         }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + lid_last(id->id.txt));  // unresolved (will DIFF)
       return v;
