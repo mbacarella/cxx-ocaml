@@ -496,7 +496,7 @@ struct Translator {
   // Locally-declared variant constructors: name -> {owning type, tag, is_block}.
   // Constant (nullary) and block (with-args) constructors are numbered
   // separately from 0 in declaration order, matching the runtime representation.
-  struct CtorInfo { std::string type; int tag; bool is_block; int arity; };
+  struct CtorInfo { std::string type; int tag; bool is_block; int arity; bool unboxed = false; };
   std::unordered_map<std::string, CtorInfo> ctor_info_;
   std::unordered_map<std::string, std::pair<int, int>> type_ctors_;  // type -> (n_const, n_block)
   std::set<std::string> immediate_local_;  // local all-constant variant type names
@@ -583,13 +583,16 @@ struct Translator {
       if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
         int nc = 0, nb = 0;
         bool all_const = !v->ctors.empty(), gadt = false;
+        // `[@@unboxed]` (one one-argument constructor): the constructor is a no-op
+        // wrapper -- its value IS the argument, with no allocation or field read.
+        bool unboxed = has_attr(d.attrs, "unboxed") && v->ctors.size() == 1;
         for (auto& c : v->ctors) {
           bool block = true;
           int arity = 0;
           if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) { arity = (int)t->elems.size(); block = arity > 0; }
           if (c.res) gadt = true;
           if (block) all_const = false;
-          ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block, arity};
+          ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block, arity, unboxed && arity == 1};
           if (block) ++nb; else ++nc;
         }
         type_ctors_[d.name.txt] = {nc, nb};
@@ -1128,8 +1131,7 @@ struct Translator {
   // that isn't irrefutably destructurable (the caller falls back to a plain temp).
   bool collect_binders(const Pattern& p0, const LamPtr& scrut,
                        std::vector<std::pair<Ident, LamPtr>>& out) {
-    const Pattern* p = &p0;
-    while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+    const Pattern* p = effective_pat(&p0);
     if (std::holds_alternative<Ppat_any>(p->desc)) return true;
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
       Ident id = fresh(pv->name.txt);
@@ -1172,12 +1174,26 @@ struct Translator {
     }
     return false;
   }
+  // Strip type constraints and peel `[@@unboxed]` constructor wrappers (whose
+  // value is transparently their argument), giving the pattern that actually
+  // tests/binds the scrutinee.
+  const Pattern* effective_pat(const Pattern* p) {
+    while (true) {
+      while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+      auto* k = std::get_if<Ppat_construct>(&p->desc);
+      if (!k) return p;
+      auto ci = ctor_info_.find(ctor_of(*p));
+      if (ci == ctor_info_.end() || !ci->second.unboxed) return p;
+      auto fps = ctor_field_pats(k, ci->second.arity);
+      if (fps.size() != 1) return p;
+      p = fps[0];
+    }
+  }
   // Whether a pattern is irrefutable (always matches): exactly the shapes
   // collect_binders destructures.  Used to decide between field extraction and a
   // partial match (which raises Match_failure on the missing cases).
   bool is_irrefutable(const Pattern& p0) {
-    const Pattern* p = &p0;
-    while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+    const Pattern* p = effective_pat(&p0);
     if (std::holds_alternative<Ppat_any>(p->desc) ||
         std::holds_alternative<Ppat_var>(p->desc)) return true;
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) return is_irrefutable(*pa->p);
@@ -1423,8 +1439,7 @@ struct Translator {
   // summed over fields.  Returns 999 for any shape this matcher can't compile, so
   // a value in [1,998] guarantees match_pat() below will not return null.
   int count_tests(const Pattern& p0) {
-    const Pattern* p = &p0;
-    while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+    const Pattern* p = effective_pat(&p0);
     if (std::holds_alternative<Ppat_any>(p->desc) ||
         std::holds_alternative<Ppat_var>(p->desc)) return 0;
     if (auto* pc = std::get_if<Ppat_constant>(&p->desc))
@@ -1457,8 +1472,7 @@ struct Translator {
   // inlined.  Pre-validated by count_tests(), so it does not return null in use.
   LamPtr match_pat(const LamPtr& scrut, const Pattern& pat0,
                    const std::function<LamPtr()>& k, const LamPtr& dflt) {
-    const Pattern* p = &pat0;
-    while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+    const Pattern* p = effective_pat(&pat0);
     if (std::holds_alternative<Ppat_any>(p->desc)) return k();
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
       Ident id = fresh(pv->name.txt);
@@ -1544,6 +1558,15 @@ struct Translator {
   }
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Row>& rows,
                        const Location& mloc) {
+    // Peel `[@@unboxed]` constructor wrappers off the patterns (transparent) and
+    // re-dispatch, so the matcher below never sees an unboxed constructor.
+    bool unbox = false;
+    for (auto& r : rows) if (effective_pat(r.lhs) != r.lhs) { unbox = true; break; }
+    if (unbox) {
+      std::vector<Row> ur;
+      for (auto& r : rows) ur.push_back({effective_pat(r.lhs), r.rhs, r.guard});
+      return compile_match(scrut, ur, mloc);
+    }
     // A non-variable scrutinee with a `| n -> ...` catch-all is bound to n first
     // (`let n = scrut in ...`), so n refers to it inside the arms (matches ocamlc).
     // A binding to a sub-term of the scrutinee (a field read) is an Alias (`=a`).
@@ -1780,6 +1803,9 @@ struct Translator {
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       std::string n = lid_last(k->id.txt);
+      // an `[@@unboxed]` constructor is a no-op wrapper: its value is its argument
+      if (auto ci = ctor_info_.find(n); ci != ctor_info_.end() && ci->second.unboxed && k->arg)
+        return expr(**k->arg);
       if (n == "[]" || n == "None" || n == "false" || n == "()") { auto z = mk(Lam::K::ConstInt); z->int_val = 0; return z; }
       if (n == "true") { auto z = mk(Lam::K::ConstInt); z->int_val = 1; return z; }
       if (n == "::" && k->arg) {  // a :: b : block tag 0 of (head, tail)
