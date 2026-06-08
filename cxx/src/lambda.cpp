@@ -1508,7 +1508,16 @@ struct Translator {
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
         // an `open M` brings M's exported values into scope (innermost first)
         for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
-          auto& fm = fields_of(*it);
+          if (auto mi = module_ident_.find(*it); mi != module_ident_.end()) {  // local module
+            auto& lay = module_layout_[*it];
+            if (auto f = lay.find(l->name); f != lay.end()) {
+              auto v = mk(Lam::K::Var); v->var = mi->second;
+              auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+              fi->prim_arg = f->second; fi->args = {v};
+              return fi;
+            }
+          }
+          auto& fm = fields_of(*it);  // stdlib module
           if (auto f = fm.find(l->name); f != fm.end())
             return field_of(global_of(*it), f->second);
         }
