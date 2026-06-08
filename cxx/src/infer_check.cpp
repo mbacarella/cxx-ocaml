@@ -487,6 +487,39 @@ struct Checker {
     type_ctors["result"] = {"Ok", "Error"};
   }
 
+  // Register top-level Stdlib variant CONSTANT constructors (e.g. fpclass's
+  // FP_normal) so an unqualified use gets its real type (and an all-constant type
+  // is marked immediate -> the [int] value kind).  Skips names already known
+  // (predef wins) or ambiguous across stdlib types; constant ctors only (block
+  // ctors need parameter handling and are left to Any).
+  void register_stdlib_ctors() {
+    try {
+      auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
+      std::set<std::string> ambiguous, seen;
+      std::unordered_map<std::string, TypePtr> found;
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Variant || td.ctors.empty()) continue;
+        bool gadt = false, all_const = true;
+        for (auto& c : td.ctors) {
+          if (c.res) gadt = true;
+          if (!c.args.empty() || c.is_inline_record) all_const = false;
+        }
+        if (gadt) continue;
+        std::vector<TypePtr> params;
+        for (int i = 0; i < td.arity; ++i) params.push_back(generic_var());
+        for (auto& c : td.ctors) {
+          if (!c.args.empty() || c.is_inline_record) continue;  // constant ctors only
+          if (seen.count(c.name) || ctors.count(c.name)) { ambiguous.insert(c.name); continue; }
+          seen.insert(c.name);
+          found[c.name] = eng.constr(td.name, params);
+        }
+        if (all_const) immediate_types_.insert(td.name);
+      }
+      for (auto& [name, ty] : found)
+        if (!ambiguous.count(name)) ctors[name] = ty;
+    } catch (...) {}
+  }
+
   // Collect the type-variable names in a core type.  Sets `uncertain` when a
   // construct that can introduce/bind implicit row or universal variables
   // appears (poly-variant, object, alias, poly, package, class) -- we then skip
@@ -1759,6 +1792,7 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
 // structure (populating ck.match_partial and ck.errors as it traverses).
 static void run_checker(Checker& ck, const ast::Structure& s) {
   ck.register_predef_ctors();
+  ck.register_stdlib_ctors();
   register_types_rec(ck, s);
   ck.finalize_fields();
   ck.check_cyclic_aliases();

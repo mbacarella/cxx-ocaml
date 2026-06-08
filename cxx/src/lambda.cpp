@@ -500,6 +500,34 @@ struct Translator {
     type_ctors_["unit"]   = {1, 0};
   }
 
+  // Register top-level Stdlib variant constructors (e.g. fpclass's FP_normal..)
+  // from stdlib.cmi, so an unqualified use resolves to its tag instead of `?name`.
+  // Skips names already known (predef wins) and names ambiguous across stdlib types.
+  void register_stdlib_ctors() {
+    try {
+      auto cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
+      std::set<std::string> ambiguous;
+      std::unordered_map<std::string, CtorInfo> found;
+      for (auto& td : cmi.sig().types) {
+        if (td.kind != cmi::TypeDecl::Variant) continue;
+        bool gadt = false;
+        for (auto& c : td.ctors) if (c.res) gadt = true;
+        if (gadt) continue;  // GADT tag rules are subtler -- skip
+        int nc = 0, nb = 0;
+        for (auto& c : td.ctors) {
+          bool block = !c.args.empty() || c.is_inline_record;
+          int arity = c.is_inline_record ? 1 : (int)c.args.size();
+          if (found.count(c.name) || ctor_info_.count(c.name)) ambiguous.insert(c.name);
+          found[c.name] = {td.name, block ? nb : nc, block, arity};
+          if (block) ++nb; else ++nc;
+        }
+        if (!gadt) type_ctors_.emplace(td.name, std::make_pair(nc, nb));
+      }
+      for (auto& [name, ci] : found)
+        if (!ambiguous.count(name) && !ctor_info_.count(name)) ctor_info_[name] = ci;
+    } catch (...) {}
+  }
+
   void register_types(const Structure& s) {
     auto each_decl = [&](auto fn) {
       for (auto& item : s)
@@ -1717,6 +1745,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.file_name_ = file_name;
   t.vk = infer_value_kinds(s);
   t.register_predef_ctor_info();
+  t.register_stdlib_ctors();
   t.register_types(s);
   try {  // Stdlib value -> module field index, for pervasive resolution
     auto cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
