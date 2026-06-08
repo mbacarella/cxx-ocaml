@@ -612,6 +612,39 @@ struct Translator {
         rec_types_[d.name.txt] = std::move(rt);
       }
     });
+    // Constructors declared inside nested module structures are referenced by a
+    // bare name within that module's body (e.g. `module B = struct type t = B ..`
+    // then `B`).  Register them too, but only filling names not already taken so a
+    // nested type never shadows a top-level one (and clashes stay unresolved).
+    std::function<void(const Structure&)> nested = [&](const Structure& items) {
+      for (auto& item : items) {
+        if (auto* td = std::get_if<Pstr_type>(&item.desc))
+          for (auto& d : td->decls)
+            if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+              int nc = 0, nb = 0; bool all_const = !v->ctors.empty(), gadt = false;
+              for (auto& c : v->ctors) {
+                int arity = 0; bool block = true;
+                if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) {
+                  arity = (int)t->elems.size(); block = arity > 0;
+                }
+                if (c.res) gadt = true;
+                if (block) all_const = false;
+                if (!ctor_info_.count(c.name.txt))
+                  ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block, arity};
+                if (block) ++nb; else ++nc;
+              }
+              type_ctors_.emplace(d.name.txt, std::make_pair(nc, nb));
+              if (all_const && !gadt) immediate_local_.insert(d.name.txt);
+            }
+        if (auto* pm = std::get_if<Pstr_module>(&item.desc))
+          if (auto* ps = std::get_if<Pmod_structure>(&pm->binding.expr.desc))
+            nested(ps->items);
+      }
+    };
+    for (auto& item : s)
+      if (auto* pm = std::get_if<Pstr_module>(&item.desc))
+        if (auto* ps = std::get_if<Pmod_structure>(&pm->binding.expr.desc))
+          nested(ps->items);
   }
   const FieldInfo* find_field(const std::string& label) {
     if (ambiguous_fields_.count(label)) return nullptr;
