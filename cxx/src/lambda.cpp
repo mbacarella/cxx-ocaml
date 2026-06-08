@@ -1742,11 +1742,32 @@ struct Translator {
     }
     return "";
   }
-  static std::string inline_of(const Attributes& attrs) { return inline_of_named(attrs, "inline"); }
-  // Stamp a function value with its binding's inline annotation, if any.
+  static bool has_attr(const Attributes& attrs, const std::string& n) {
+    for (auto& a : attrs) if (a.name == n || a.name == "ocaml." + n) return true;
+    return false;
+  }
+  static std::string attr_of(const Attributes& attrs, const std::string& n) {
+    for (auto& a : attrs) if (a.name == n || a.name == "ocaml." + n) return attr_ident(a.payload);
+    return "<none>";
+  }
+  // The -dlambda function annotations from a binding's attributes, in printlambda
+  // order: inline, local, tail_mod_cons, poll (specialise is flambda-only, not
+  // printed by ocamlc -dlambda).
+  static std::string fn_attrs(const Attributes& attrs) {
+    std::vector<std::string> a;
+    if (auto s = inline_of_named(attrs, "inline"); !s.empty()) a.push_back(s);
+    if (has_attr(attrs, "local"))
+      a.push_back(attr_of(attrs, "local") == "never" ? "never_local" : "always_local");
+    if (has_attr(attrs, "tail_mod_cons")) a.push_back("tail_mod_cons");
+    if (has_attr(attrs, "poll") && attr_of(attrs, "poll") == "error") a.push_back("error_poll");
+    std::string r;
+    for (size_t i = 0; i < a.size(); ++i) { if (i) r += " "; r += a[i]; }
+    return r;
+  }
+  // Stamp a function value with its binding's annotations, if any.
   LamPtr with_inline(LamPtr v, const Attributes& attrs) {
     if (v && v->k == Lam::K::Function)
-      if (auto ia = inline_of(attrs); !ia.empty()) v->inline_attr = ia;
+      if (auto ia = fn_attrs(attrs); !ia.empty()) v->inline_attr = ia;
     return v;
   }
 
