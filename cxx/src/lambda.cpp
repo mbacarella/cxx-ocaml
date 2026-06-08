@@ -2076,28 +2076,40 @@ struct Translator {
       std::vector<std::string> sub;
       return build_module(ps->items, &sub);
     }
-    if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) {
+    if (std::holds_alternative<Pmod_functor>(me.desc)) {
+      // A multi-parameter functor `F (A) (B) = ...` parses as nested Pmod_functor
+      // but lowers to ONE multi-argument function `(function A B is_a_functor body)`
+      // (ocamlc flattens consecutive functor params), not a curried chain.
       auto fn = mk(Lam::K::Function);
-      std::string nm = "*";
-      const Functor_named* fp = std::get_if<Functor_named>(&pf->param);
-      if (fp && fp->name.txt) nm = *fp->name.txt;
-      Ident pid = fresh(nm);
-      // Bind the parameter X (with its signature's value layout) so `X.foo`
-      // inside the body resolves to `(field_imm i X)`.  Save/restore for nesting.
-      bool had = module_ident_.count(nm);
-      Ident saved_id = had ? module_ident_[nm] : Ident{};
-      auto saved_lay = module_layout_[nm];
-      if (fp && fp->type) {
-        module_ident_[nm] = pid;
-        auto& lay = module_layout_[nm]; lay.clear();
-        auto fields = sig_layout(*fp->type);
-        for (int i = 0; i < (int)fields.size(); ++i) lay[fields[i]] = i;
+      fn->inline_attr = "is_a_functor";  // printed in the header after the params
+      struct Saved { std::string nm; bool had; Ident id;
+                     decltype(module_layout_[std::string{}]) lay; };
+      std::vector<Saved> saves;
+      const ModuleExpr* cur = &me;
+      while (auto* pf = std::get_if<Pmod_functor>(&cur->desc)) {
+        std::string nm = "*";
+        const Functor_named* fp = std::get_if<Functor_named>(&pf->param);
+        if (fp && fp->name.txt) nm = *fp->name.txt;
+        Ident pid = fresh(nm);
+        // Bind the parameter X (with its signature's value layout) so `X.foo`
+        // inside the body resolves to `(field_imm i X)`.  Save/restore for nesting.
+        saves.push_back({nm, module_ident_.count(nm) != 0,
+                         module_ident_.count(nm) ? module_ident_[nm] : Ident{},
+                         module_layout_[nm]});
+        if (fp && fp->type) {
+          module_ident_[nm] = pid;
+          auto& lay = module_layout_[nm]; lay.clear();
+          auto fields = sig_layout(*fp->type);
+          for (int i = 0; i < (int)fields.size(); ++i) lay[fields[i]] = i;
+        }
+        fn->params.push_back({pid, ValueKind::Gen});
+        cur = pf->body.get();
       }
-      fn->params.push_back({pid, ValueKind::Gen});
-      fn->inline_attr = "is_a_functor";  // printed in the function header after params
-      fn->body = compile_module_expr(*pf->body);
-      if (had) module_ident_[nm] = saved_id; else module_ident_.erase(nm);
-      module_layout_[nm] = saved_lay;
+      fn->body = compile_module_expr(*cur);
+      for (auto it = saves.rbegin(); it != saves.rend(); ++it) {
+        if (it->had) module_ident_[it->nm] = it->id; else module_ident_.erase(it->nm);
+        module_layout_[it->nm] = it->lay;
+      }
       return fn;
     }
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) return compile_module_expr(*pc->me);
