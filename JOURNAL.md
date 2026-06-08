@@ -1018,3 +1018,67 @@ accepts and runs.
 
 Pipeline now: lex (done) → parse (done) → type/infer (done, 99.2% accept) → lambda (18.6%) →
 bytecode instr (20.8%) → emit `.cmo` (runnable) → **next: our own linker**.
+
+### 2026-06-08 — lambda 18.8 → 24.5%, completeness 8 → 3; Printf/assert/matches run end-to-end
+
+**Headline metrics.** Lambda dump-parity (`ocamlc -dlambda`) **18.8 → 24.5%**;
+instruction-stream parity (`-dinstr`) **21.1 → 23.0%**; and — the best completeness yet —
+false-rejection over the 744 oracle-accepted files **8 → 3** (and *held at 3 throughout the
+whole climb*, both harnesses gating every commit). A long list of constructs that previously
+crashed or miscompiled the self-hosted `c++ocamlc` now run end-to-end: Printf/Format/sprintf,
+`assert`, guards, option/list/result/nested matches, and `classify_float`/`fpclass`.
+
+**Rooting out the `Any` dynamic type (this drove most of the lambda gain).** Qualified stdlib
+values `M.x` now flow their **real cmi types** instead of Any, so value-kind inference works
+through them (`String.length s` comes back `int`, not dynamic). The risk is the usual one —
+handing concrete types to the still-incomplete inferencer surfaces clashes (formats, GADTs,
+cross-module abbreviations) — so a new **`soft_unify`** is used at function-argument positions:
+propagation-only, a clash leaves the types unlinked rather than rejecting, because genuine
+qualified-argument errors are already caught by the separate, *reliable* `expected_clash`
+check. The advance-together law again: types flow for kinds, soundness stays with the reliable
+check. Net **completeness 8 → 3** — the best so far. Also registered the predefined `Ok`/`Error`
+(result) constructors.
+
+**Stdlib values lower to their real implementation.** The cmi reader now decodes each value's
+`Val_prim` `prim_name` + `prim_arity`, and the Lambda translator resolves them instead of
+emitting an unresolved `?name`: `%`-builtins (`%opaque`→opaque, `%compare`→
+`compare_ints`/`compare_floats`, `%ignore`, `%identity`, `%field0`/`%field1`→`fst`/`snd`) and
+C-external primitives (`classify_float`→`caml_classify_float`, `sqrt`, `int_of_string`, …).
+Top-level Stdlib variant constructors (`fpclass`'s `FP_normal` etc.) resolve to their tag, and
+an all-constant type is marked immediate so the value gets the `[int]` kind.
+
+**Format strings — the biggest single feature.** Printf/Format string literals now lower to the
+real `CamlinternalFormatBasics` `Format(fmt, string)` structured constant — parsing the
+`%`-directives and `@`-formatting into the cons-list the back end expects (previously emitted as
+a plain string, which segfaulted at runtime). And the *inferencer* now infers a format's
+argument types from the same parse: `printf "%d %d" x y` flows `x:int`, `y:int` and the unit
+result, with detection principled (the format literal is recorded by the existing
+expected-format-type rule, not the reverted callee-name heuristic). Printf/Format/sprintf run
+end-to-end.
+
+**Match compiler — built out almost fully.** Constructor-pattern matching (option/list/result
+and all exhaustive single-type variant shapes, including the isint-split mixed
+constant+block forms); nested / multi-row sub-patterns (`Some 0 | Some n`) via a borrowed
+Row-view refactor; guards on variable/wildcard patterns AND on constructor patterns — the
+latter via a new **catch/exit static-exception IR**, the first matrix-optimizer piece;
+non-exhaustive matches filling the missing slots with `Match_failure`; and constant-constructor
+patterns matched by their integer tag. The harness now normalizes exit-numbers the way it
+already normalizes stamps.
+
+**`assert` + predefined-exception globals.** `assert false` lowers to `raise Assert_failure`
+with the location; `assert e` to the `if`/`raise` form. Both ride the new
+predefined-exception-global infrastructure (`Match_failure`/`Assert_failure` globals via
+`Reloc_getpredef`).
+
+**Runtime fixes (all were crashing).** `isint` → the `ISINT` instruction; `ignore` →
+eval-arg-then-unit in Bytegen; predef-exception `GETGLOBAL` relocations.
+
+**Value-kind + printer wins (the recent parity surge).** Inferring types inside `assert` and
+function-cases guards (closing a value-kind gap); printing function `[@inline never]`/`[@inline]`
+annotations (`never_inline`/`always_inline`); **flattening nested sequences in the `-dlambda`
+printer** (`(seq e1 e2 e3)`, not nested — a big one); and specializing comparison operators by
+operand value-kind (`==.` for float, `Int64.==`, etc.).
+
+Pipeline unchanged in shape — lex → parse → type/infer (3/744 false-rejects) → lambda (24.5%) →
+bytecode instr (23.0%) → emit `.cmo` (runnable) → **next: our own linker** — but a much wider
+slice of real programs now compiles and runs through `c++ocamlc`.
