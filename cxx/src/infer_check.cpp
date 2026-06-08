@@ -1124,6 +1124,12 @@ struct Checker {
         note_error("expression does not match the type constraint");
       return at;
     }
+    if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
+      infer_expr(*as->e);  // infer the condition (flows operand kinds, e.g. x:int)
+      // `assert e` is unit (-> the [int] value kind); but `assert false` is 'a and a
+      // concrete unit clashes in strict checking, so only commit to unit for kinds.
+      return record_kinds_ ? eng.constr("unit") : eng.any();
+    }
     // Records, via the unique-label registry (ambiguous labels -> Any).
     if (auto* fld = std::get_if<Pexp_field>(&e.desc)) {
       auto it = fields_.find(lid_last(fld->field.txt));
@@ -1310,6 +1316,7 @@ struct Checker {
       for (auto& c : fc.cases) {
         venv.emplace_back();
         try_unify(infer_pat(c.lhs), arg);
+        if (c.guard) infer_expr(**c.guard);  // infer (flows operand kinds); not bool-constrained
         try_unify(infer_expr(*c.rhs), rt);
         venv.pop_back();
       }
