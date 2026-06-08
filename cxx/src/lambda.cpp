@@ -1480,11 +1480,22 @@ struct Translator {
             // Polymorphic comparison ops: specialize to an integer comparison
             // when an operand is an immediate, else a caml_* C compare.
             if (auto c = poly_cmp(n); !c.first.empty() && as.size() == 2) {
-              bool isint = expr_kind(as[0].second.get()) == ValueKind::Int ||
-                           expr_kind(as[1].second.get()) == ValueKind::Int;
+              // The operand kind drives the spelling: int -> `==`, float -> `==.`,
+              // int64/int32/nativeint -> `Int64.==` etc.; two generics fall back to
+              // the polymorphic caml_* compare.
+              ValueKind k = ValueKind::Gen;
+              for (ValueKind kk : {expr_kind(as[0].second.get()), expr_kind(as[1].second.get())})
+                if (kk != ValueKind::Gen) k = kk;
               auto pr = mk(Lam::K::Prim);
-              if (isint) { pr->prim = Prim::IntCmp; pr->prim_id = c.first; }
-              else { pr->prim = Prim::Ccall; pr->prim_id = c.second; }
+              if (k == ValueKind::Gen) { pr->prim = Prim::Ccall; pr->prim_id = c.second; }
+              else {
+                pr->prim = Prim::IntCmp;
+                pr->prim_id = k == ValueKind::Int ? c.first
+                            : k == ValueKind::Float ? c.first + "."
+                            : k == ValueKind::Boxedint64 ? "Int64." + c.first
+                            : k == ValueKind::Boxedint32 ? "Int32." + c.first
+                            : "Nativeint." + c.first;
+              }
               pr->args = {expr(*as[0].second), expr(*as[1].second)};
               return pr;
             }
