@@ -447,6 +447,9 @@ struct Translator {
   // (export value/submodule name -> field index), for resolving `M.x`.
   std::unordered_map<std::string, Ident> module_ident_;
   std::unordered_map<std::string, std::unordered_map<std::string, int>> module_layout_;
+  // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
+  // unqualified name resolves as `M.x` (a stdlib field or an external prim).
+  std::vector<std::string> opened_;
   // User C externals: value name -> C primitive name (the `external f = "cname"`
   // string).  Applying one emits (cname args); %-builtins are left for later.
   std::unordered_map<std::string, std::string> externals_;
@@ -1337,6 +1340,17 @@ struct Translator {
   }
 
   LamPtr expr(const Expression& e) {
+    // `M.(body)` / `let open M in body`: resolve `body`'s unqualified names in M.
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
+      if (auto* op = std::get_if<Pstr_open>(&si->item->desc))
+        if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
+          opened_.push_back(lid_last(mi->id.txt));
+          LamPtr b = expr(*si->body);
+          opened_.pop_back();
+          return b;
+        }
+      return expr(*si->body);  // other struct-item bodies (let module, ...): best-effort
+    }
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) {
       // A string literal the inferencer typed at a format type lowers to a
       // CamlinternalFormatBasics format value, not a plain string.
@@ -1448,6 +1462,12 @@ struct Translator {
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
         auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
+        // an `open M` brings M's exported values into scope (innermost first)
+        for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+          auto& fm = fields_of(*it);
+          if (auto f = fm.find(l->name); f != fm.end())
+            return field_of(global_of(*it), f->second);
+        }
       }
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
@@ -1594,6 +1614,10 @@ struct Translator {
             // resolved via its cmi prim_name.
             if (auto pi = stdlib_prims.find(n); pi != stdlib_prims.end())
               if (auto r = prim_to_lam(pi->second.name, pi->second.arity, *ap, e)) return r;
+            // an `open M`'d external (e.g. Marshal.(to_string ...)): M's prim.
+            for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
+              if (auto p = value_prim(*it, n); !p.name.empty())
+                if (auto r = prim_to_lam(p.name, p.arity, *ap, e)) return r;
           }
       auto a = mk(Lam::K::Apply);
       a->fn = expr(*ap->fn);
