@@ -819,6 +819,16 @@ struct Translator {
   }
 
   LamPtr cint(long long n) { auto z = mk(Lam::K::ConstInt); z->int_val = n; return z; }
+  // A polymorphic-variant tag `` `Foo `` is represented at runtime by the hash of
+  // its name (caml_hash_variant / typing/btype.ml hash_variant): an accumulator
+  // mod 2^31, normalized to the signed range of an OCaml int.
+  static long long hash_variant(const std::string& s) {
+    unsigned long long accu = 0;
+    for (unsigned char c : s) accu = 223 * accu + c;
+    long long r = (long long)(accu & ((1ULL << 31) - 1));
+    if (r > 0x3FFFFFFF) r -= (1LL << 31);
+    return r;
+  }
   // A recursive binding whose value is a heap block (tuple/ctor/record) -- compiled
   // with caml_alloc_dummy + caml_update_dummy, unlike a recursive function.
   static bool is_rec_data(const LamPtr& v) {
@@ -1621,6 +1631,13 @@ struct Translator {
         l->prim_arg = fi->index; l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }
+    }
+    // Polymorphic variant: `` `Foo `` is its name's hash; `` `Foo e `` is a block
+    // tag 0 of (hash, arg) -- block() folds it to a constant when the arg is one.
+    if (auto* pv = std::get_if<Pexp_variant>(&e.desc)) {
+      LamPtr h = cint(hash_variant(pv->label));
+      if (!pv->arg) return h;
+      return block(0, {h, expr(**pv->arg)});
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       std::string n = lid_last(k->id.txt);
