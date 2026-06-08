@@ -1253,6 +1253,142 @@ struct Translator {
     return sw;
   }
 
+  // ----- nested-pattern matcher (one ctor row + a trailing catch-all) ----------
+  // The sub-patterns of a block constructor `K(p0,..,pn)` (its argument fields):
+  // for arity>1 the argument is a tuple, for arity 1 it is the single pattern.
+  std::vector<const Pattern*> ctor_field_pats(const Ppat_construct* k, int arity) {
+    std::vector<const Pattern*> v;
+    if (!k->arg) return v;
+    const Pattern& arg = **k->arg;
+    if (arity > 1) {
+      if (auto* tup = std::get_if<Ppat_tuple>(&arg.desc))
+        for (auto& e : tup->elems) v.push_back(e.get());
+    } else {
+      v.push_back(&arg);
+    }
+    return v;
+  }
+  // The number of constructor/constant tests a pattern performs against the
+  // scrutinee (its "failure points" toward the fallback): 0 for a var/wildcard,
+  // 1 per integer-constant or 1-const-1-block constructor (option/list/`A|B of t`),
+  // summed over fields.  Returns 999 for any shape this matcher can't compile, so
+  // a value in [1,998] guarantees match_pat() below will not return null.
+  int count_tests(const Pattern& p0) {
+    const Pattern* p = &p0;
+    while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+    if (std::holds_alternative<Ppat_any>(p->desc) ||
+        std::holds_alternative<Ppat_var>(p->desc)) return 0;
+    if (auto* pc = std::get_if<Ppat_constant>(&p->desc))
+      return std::holds_alternative<Pconst_integer>(pc->c.desc) ? 1 : 999;
+    auto* k = std::get_if<Ppat_construct>(&p->desc);
+    if (!k) return 999;
+    auto cit = ctor_info_.find(ctor_of(*p));
+    if (cit == ctor_info_.end()) return 999;
+    auto& ci = cit->second;
+    auto tc = type_ctors_.find(ci.type);
+    if (tc == type_ctors_.end() || tc->second.first != 1 || tc->second.second != 1)
+      return 999;  // only 1-const-1-block types (truthy test)
+    auto fps = ctor_field_pats(k, ci.arity);
+    if ((int)fps.size() != ci.arity) return 999;
+    int n = 1;
+    for (auto* fp : fps) { int t = count_tests(*fp); if (t >= 999) return 999; n += t; }
+    return n;
+  }
+  // Match the fields of a (1-const-1-block) block constructor, left to right,
+  // then run the continuation k; any field mismatch jumps to dflt.
+  LamPtr match_fields(const LamPtr& s, const std::vector<const Pattern*>& fps,
+                      size_t idx, const std::function<LamPtr()>& k, const LamPtr& dflt) {
+    if (idx >= fps.size()) return k();
+    return match_pat(fieldimm((int)idx, s), *fps[idx],
+                     [&, idx] { return match_fields(s, fps, idx + 1, k, dflt); }, dflt);
+  }
+  // Match `pat` against `scrut`, binding its variables in the current scope; on a
+  // full match run k(), on any mismatch evaluate dflt.  Mirrors ocamlc's decision
+  // tree: a reused field is aliased to a `*match*` temp (`=a`), a single-use one is
+  // inlined.  Pre-validated by count_tests(), so it does not return null in use.
+  LamPtr match_pat(const LamPtr& scrut, const Pattern& pat0,
+                   const std::function<LamPtr()>& k, const LamPtr& dflt) {
+    const Pattern* p = &pat0;
+    while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+    if (std::holds_alternative<Ppat_any>(p->desc)) return k();
+    if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
+      Ident id = fresh(pv->name.txt);
+      scope.back()[pv->name.txt] = id;
+      LamPtr body = k();
+      if (count_var(body, id) <= 1) { subst_var(body, id, scrut); return body; }
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{id, ValueKind::Gen, scrut, true}}; l->body = body; return l;
+    }
+    if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
+      auto* pi = std::get_if<Pconst_integer>(&pc->c.desc);
+      if (!pi) return nullptr;
+      auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
+      ne->args = {scrut, cint(parse_ocaml_int(pi->value))};
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = ne; iff->then_ = dflt; iff->else_ = k();
+      return iff;
+    }
+    auto* k_ = std::get_if<Ppat_construct>(&p->desc);
+    if (!k_) return nullptr;
+    auto cit = ctor_info_.find(ctor_of(*p));
+    if (cit == ctor_info_.end()) return nullptr;
+    auto& ci = cit->second;
+    // Reused scrutinee (a field read, not a bare Var) -> bind it to a temp, aliased
+    // if the resulting tree reads it more than once, inlined otherwise.
+    LamPtr s = scrut;
+    bool need_temp = scrut->k != Lam::K::Var;
+    Ident tv;
+    if (need_temp) { tv = fresh("", true); auto v = mk(Lam::K::Var); v->var = tv; s = v; }
+    LamPtr inner;
+    if (ci.is_block) {  // block ctor matched -> test truthy, then match fields
+      auto fps = ctor_field_pats(k_, ci.arity);
+      LamPtr fields = match_fields(s, fps, 0, k, dflt);
+      if (!fields) return nullptr;
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = s; iff->then_ = fields; iff->else_ = dflt; inner = iff;
+    } else {            // constant ctor matched (None/[]): test truthy inverted
+      LamPtr kk = k(); if (!kk) return nullptr;
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = s; iff->then_ = dflt; iff->else_ = kk; inner = iff;
+    }
+    if (!need_temp) return inner;
+    if (count_var(inner, tv) <= 1) { subst_var(inner, tv, scrut); return inner; }
+    auto l = mk(Lam::K::Let);
+    l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = inner; return l;
+  }
+  // Drive a `<ctor pattern> -> body | _ -> fallback` match.  One failure point (a
+  // single top constructor with simple fields) inlines the fallback as the else
+  // branch; two or more share it once behind `(catch .. with (N) fallback)`, with
+  // `(exit N)` at each mismatch -- exactly ocamlc's action-sharing for this shape.
+  LamPtr nested_match(const LamPtr& scrut, const std::vector<Row>& rows,
+                      const Location& mloc) {
+    (void)mloc;
+    if (rows.size() != 2 || rows[0].guard || rows[1].guard) return nullptr;
+    if (!is_catchall(*rows[1].lhs)) return nullptr;
+    const Pattern& pat = *rows[0].lhs;
+    if (!std::holds_alternative<Ppat_construct>(pat.desc)) return nullptr;
+    int nt = count_tests(pat);
+    if (nt <= 0 || nt >= 999) return nullptr;  // pure var / unsupported -> existing path
+    if (nt == 1) {  // single test: inline the fallback as the else branch
+      bind_catchall(*rows[1].lhs, scrut);
+      LamPtr fb = expr(*rows[1].rhs);
+      scope.emplace_back();
+      LamPtr m = match_pat(scrut, pat, [&] { return expr(*rows[0].rhs); }, fb);
+      scope.pop_back();
+      return m;
+    }
+    int eid = ++next_exit_;  // multiple tests: share the fallback behind catch/exit
+    auto exitL = mk(Lam::K::Staticraise); exitL->prim_arg = eid;
+    scope.emplace_back();
+    LamPtr m = match_pat(scrut, pat, [&] { return expr(*rows[0].rhs); }, exitL);
+    scope.pop_back();
+    if (!m) { --next_exit_; return nullptr; }
+    bind_catchall(*rows[1].lhs, scrut);
+    LamPtr fb = expr(*rows[1].rhs);
+    auto c = mk(Lam::K::Catch); c->cond = m; c->prim_arg = eid; c->then_ = fb;
+    return c;
+  }
+
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases,
                        const Location& mloc) {
     return compile_match(scrut, rows_of(cases), mloc);
@@ -1309,6 +1445,7 @@ struct Translator {
     }
     if (auto sw = const_switch(scrut, rows)) return sw;
     if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
+    if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     return int_cases(scrut, rows, 0);
   }
 
