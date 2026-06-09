@@ -671,7 +671,10 @@ struct Checker {
       auto* tup = std::get_if<Pcstr_tuple>(&c.args);
       if (!tup || !tup->elems.empty()) all_const = false;  // a block constructor
     }
-    if (all_const && !is_gadt) immediate_types_.insert(d.name.txt);
+    // An all-constant variant is immediate (its constructors are ints) -- this
+    // holds for an all-constant GADT too (`Int : _ typ | Ptr : _ typ`), so the
+    // immediacy does not depend on is_gadt.
+    if (all_const) immediate_types_.insert(d.name.txt);
     // `[@@unboxed]` of a single immediate field shares its int representation, so
     // a value of the type gets the [int] value kind too.
     bool unboxed = false;
