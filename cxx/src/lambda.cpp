@@ -721,6 +721,33 @@ struct Translator {
   static std::string global_of(const std::string& mod) {
     return mod == "Stdlib" ? "Stdlib" : "Stdlib__" + mod;
   }
+  // The value kind of a cmi field type (int/char/bool/unit -> int, float ->
+  // float, everything else -> generic/boxed), for spelling its field read.
+  static ValueKind cmi_field_kind(const cmi::TypePtr& t0) {
+    cmi::TypePtr t = t0;
+    while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst)) t = t->link;
+    if (!t || t->kind != cmi::TypeExpr::Tconstr || !t->path) return ValueKind::Gen;
+    const std::string& n = t->path->kind == cmi::Path::Pident ? t->path->id.name : t->path->s;
+    if (n == "int" || n == "char" || n == "bool" || n == "unit") return ValueKind::Int;
+    if (n == "float") return ValueKind::Float;
+    return ValueKind::Gen;
+  }
+  // A record field of a stdlib (sub)module's record type, e.g. `Gc.minor_heap_size`
+  // -> {field index, kind, mutable}; nullopt if not found.
+  struct StdField { int index; ValueKind kind; bool mut; };
+  std::optional<StdField> stdlib_record_field(const std::string& mod, const std::string& label) {
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Record) continue;
+        for (int i = 0; i < (int)td.labels.size(); ++i)
+          if (td.labels[i].name == label)
+            return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_};
+      }
+    } catch (...) {}
+    return std::nullopt;
+  }
 
   Ident fresh(const std::string& name, bool temp = false) { return Ident{name, stamp++, temp}; }
   ValueKind pat_kind(const Pattern* p) {
@@ -1926,6 +1953,17 @@ struct Translator {
         l->prim_arg = fi->index; l->args = {expr(*fe->e)};
         return l;
       }
+      // A module-qualified field `e.M.label` of a stdlib record (e.g. Gc.control).
+      if (auto* d = std::get_if<Ldot>(&fe->field.txt.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (auto rf = stdlib_record_field(pl->name, d->name)) {
+            auto l = mk(Lam::K::Prim);
+            l->prim = rf->kind == ValueKind::Int ? Prim::FieldInt
+                      : rf->mut                  ? Prim::FieldMut
+                                                 : Prim::FieldImm;
+            l->prim_arg = rf->index; l->args = {expr(*fe->e)};
+            return l;
+          }
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
       if (auto* fi = find_field(lid_last(sf->field.txt))) {

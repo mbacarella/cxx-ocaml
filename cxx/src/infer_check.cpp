@@ -492,6 +492,23 @@ struct Checker {
   // is marked immediate -> the [int] value kind).  Skips names already known
   // (predef wins) or ambiguous across stdlib types; constant ctors only (block
   // ctors need parameter handling and are left to Any).
+  // The declared type of a stdlib (sub)module's record field (e.g. Gc.control's
+  // `minor_heap_size`), instantiated into our type universe; null if not found.
+  TypePtr stdlib_field_type(const std::string& mod, const std::string& label) {
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? "stdlib/stdlib.cmi"
+                                                    : "stdlib/stdlib__" + mod + ".cmi");
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Record) continue;
+        for (auto& l : td.labels)
+          if (l.name == label) {
+            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            return from_cmi(l.type, memo);
+          }
+      }
+    } catch (...) {}
+    return nullptr;
+  }
   void register_stdlib_ctors() {
     try {
       auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
@@ -1234,10 +1251,17 @@ struct Checker {
     // Records, via the unique-label registry (ambiguous labels -> Any).
     if (auto* fld = std::get_if<Pexp_field>(&e.desc)) {
       auto it = fields_.find(lid_last(fld->field.txt));
-      if (it == fields_.end()) { infer_expr(*fld->e); return eng.any(); }
-      TypePtr s = I::Engine::repr(eng.instantiate(it->second));  // recTy -> fldTy
-      try_unify(infer_expr(*fld->e), s->dom);
-      return s->cod;
+      if (it != fields_.end()) {
+        TypePtr s = I::Engine::repr(eng.instantiate(it->second));  // recTy -> fldTy
+        try_unify(infer_expr(*fld->e), s->dom);
+        return s->cod;
+      }
+      infer_expr(*fld->e);
+      // A module-qualified field `e.M.label` of a stdlib record: its declared type.
+      if (auto* d = std::get_if<Ldot>(&fld->field.txt.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (TypePtr ft = stdlib_field_type(pl->name, d->name)) return ft;
+      return eng.any();
     }
     if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
       // Record update `{ e with ... }` flows the base record through incomplete
