@@ -5,6 +5,8 @@
 // byte-identical, so they are reproduced exactly.
 #include "cppcaml/bytecode.hpp"
 
+#include <cctype>
+#include <cstring>
 #include <map>
 #include <ostream>
 #include <set>
@@ -227,27 +229,68 @@ struct Bytegen {
   }
   // IntCmp carries a spelling: integer comparison, or a float/string/array op
   // that lowers to a C call.
+  Instr cc(const std::string& name, int n) {
+    Instr i = I(Op::Ccall); i.str = name; i.a = n; return i;
+  }
   Instr intcmp_or_ccall(const LamPtr& e) {
     const std::string& s = e->prim_id;
-    if (s == "==") return I(Op::Eqint);
-    if (s == "!=") return I(Op::Neqint);
-    if (s == "<") return I(Op::Ltint);
-    if (s == ">") return I(Op::Gtint);
-    if (s == "<=") return I(Op::Leint);
-    if (s == ">=") return I(Op::Geint);
-    if (s == "isint") return I(Op::Isint);
+    int n = (int)e->args.size();
+    // Integer comparisons and arithmetic/bitwise that compile to a dedicated op.
+    static const std::unordered_map<std::string, Op> op = {
+      {"==", Op::Eqint}, {"!=", Op::Neqint}, {"<", Op::Ltint}, {">", Op::Gtint},
+      {"<=", Op::Leint}, {">=", Op::Geint}, {"isint", Op::Isint},
+      {"mod", Op::Modint}, {"/", Op::Divint}, {"not", Op::Boolnot}, {"~", Op::Negint},
+      {"and", Op::Andint}, {"or", Op::Orint}, {"xor", Op::Xorint},
+      {"lsl", Op::Lslint}, {"lsr", Op::Lsrint}, {"asr", Op::Asrint},
+    };
+    if (auto it = op.find(s); it != op.end()) return I(it->second);
+    // Array operations: `array.<op>[<kind>]`.  The kind (int/addr/float/gen)
+    // selects the spelling: unsafe int/addr access is an op, float and generic a
+    // C call; the safe versions are C calls (they bounds-check / dispatch).
+    if (s.rfind("array.", 0) == 0) {
+      auto br = s.find('[');
+      std::string o = s.substr(6, br == std::string::npos ? std::string::npos : br - 6);
+      std::string k = br == std::string::npos ? "" : s.substr(br + 1, s.find(']', br) - br - 1);
+      bool flt = k.rfind("float", 0) == 0, gen = k.rfind("gen", 0) == 0;
+      if (o == "length") return I(Op::Vectlength);
+      if (o == "unsafe_get")
+        return flt ? cc("caml_floatarray_unsafe_get", n)
+             : gen ? cc("caml_array_unsafe_get", n) : I(Op::Getvectitem);
+      if (o == "unsafe_set")
+        return flt ? cc("caml_floatarray_unsafe_set", n)
+             : gen ? cc("caml_array_unsafe_set", n) : I(Op::Setvectitem);
+      if (o == "get") return cc(flt ? "caml_floatarray_get" : "caml_array_get", n);
+      if (o == "set") return cc(flt ? "caml_floatarray_set" : "caml_array_set_addr", n);
+    }
+    // Boxed integers (`Int32.add` -> caml_int32_add, with a few non-uniform names).
+    static const std::unordered_map<std::string, std::string> bint_op = {
+      {"add", "add"}, {"sub", "sub"}, {"mul", "mul"}, {"div", "div"}, {"mod", "mod"},
+      {"and", "and"}, {"or", "or"}, {"xor", "xor"}, {"neg", "neg"},
+      {"lsl", "shift_left"}, {"lsr", "shift_right_unsigned"}, {"asr", "shift_right"},
+      {"of_int", "of_int"}, {"to_int", "to_int"},
+    };
+    for (const char* m : {"Int32.", "Int64.", "Nativeint."})
+      if (s.rfind(m, 0) == 0) {
+        std::string mod = std::string(m, strlen(m) - 1);  // "Int32"
+        for (auto& c : mod) c = (char)std::tolower((unsigned char)c);
+        auto bo = bint_op.find(s.substr(strlen(m)));
+        if (bo != bint_op.end()) return cc("caml_" + mod + "_" + bo->second, n);
+        if (s.substr(strlen(m)) == "==") return cc("caml_equal", n);
+      }
     static const std::unordered_map<std::string, std::string> ccall = {
       {"+.", "caml_add_float"}, {"-.", "caml_sub_float"}, {"*.", "caml_mul_float"},
       {"/.", "caml_div_float"}, {"~.", "caml_neg_float"}, {"abs.", "caml_abs_float"},
+      {"<.", "caml_lt_float"}, {">.", "caml_gt_float"}, {"<=.", "caml_le_float"},
+      {">=.", "caml_ge_float"}, {"==.", "caml_eq_float"}, {"!=.", "caml_neq_float"},
+      {"compare_ints", "caml_int_compare"}, {"compare_floats", "caml_float_compare"},
       {"float_of_int", "caml_float_of_int"}, {"int_of_float", "caml_int_of_float"},
       {"string.length", "caml_ml_string_length"}, {"string.get", "caml_string_get"},
+      {"string.unsafe_get", "caml_string_unsafe_get"},
       {"bytes.length", "caml_ml_bytes_length"}, {"bytes.get", "caml_bytes_get"},
       {"bytes.set", "caml_bytes_set"},
     };
-    if (auto it = ccall.find(s); it != ccall.end()) {
-      Instr i = I(Op::Ccall); i.str = it->second; i.a = (int)e->args.size(); return i;
-    }
-    Instr i = I(Op::Ccall); i.str = "?" + s; i.a = (int)e->args.size(); return i;
+    if (auto it = ccall.find(s); it != ccall.end()) return cc(it->second, n);
+    return cc("?" + s, n);
   }
 
   // ---- comp_expr ----
@@ -395,6 +438,18 @@ struct Bytegen {
               auto unit = std::make_shared<Lam>(); unit->k = K::ConstInt; unit->int_val = 0;
               Instr k = I(Op::Const); k.cst = unit;
               return comp_expr(env, exp->args[0], sz, cons(k, cont));
+            }
+            if (exp->prim_id == "opaque" && exp->args.size() == 1)
+              return comp_expr(env, exp->args[0], sz, cont);  // identity: no instruction
+            if (exp->prim_id.rfind("makearray", 0) == 0) {  // [| .. |] -> a block
+              if (exp->args.empty()) {  // [||]: the empty-array atom (const 0)
+                auto z = std::make_shared<Lam>(); z->k = K::ConstInt; z->int_val = 0;
+                Instr k = I(Op::Const); k.cst = z; return cons(k, cont);
+              }
+              bool flt = exp->prim_id.find("[float") != std::string::npos;
+              Instr mb = I(flt ? Op::Makefloatblock : Op::Makeblock);
+              mb.a = (int)exp->args.size(); mb.b = 0;
+              return comp_args(env, exp->args, sz, cons(mb, cont));
             }
             break;
           default: break;
@@ -617,9 +672,14 @@ std::string instr_text(const Instr& i) {
     case Op::Makefloatblock: return "\tmakefloatblock " + n(i.a);
     case Op::Getfield: return "\tgetfield " + n(i.a);
     case Op::Setfield: return "\tsetfield " + n(i.a);
+    case Op::Vectlength: return "\tvectlength";
     case Op::Getvectitem: return "\tgetvectitem";
     case Op::Setvectitem: return "\tsetvectitem";
+    case Op::Getfloatfield: return "\tgetfloatfield " + n(i.a);
+    case Op::Setfloatfield: return "\tsetfloatfield " + n(i.a);
     case Op::Getstringchar: return "\tgetstringchar";
+    case Op::Getbyteschar: return "\tgetbyteschar";
+    case Op::Setbyteschar: return "\tsetbyteschar";
     case Op::Branch: return "\tbranch L" + n(i.a);
     case Op::Branchif: return "\tbranchif L" + n(i.a);
     case Op::Branchifnot: return "\tbranchifnot L" + n(i.a);
