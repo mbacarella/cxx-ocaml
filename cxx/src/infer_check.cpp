@@ -1417,6 +1417,13 @@ struct Checker {
 
   TypePtr infer_apply(const Pexp_apply& a) {
     TypePtr ft = infer_expr(*a.fn);
+    // Applying a value of a reliable non-function type (`1 2`, `"x" y`) is a
+    // definite error -- a builtin like int/string is never an arrow.
+    if (strict && !a.args.empty()) {
+      TypePtr fr = I::Engine::repr(ft);
+      if (fr->kind == I::Type::Kind::Constr && reliable_builtin(fr->path))
+        note_error("This expression is not a function; it cannot be applied");
+    }
     // Pure soundness check: a qualified callee M.x is otherwise typed as Any, so
     // its argument types go unchecked.  Resolve its real type and check each
     // positional argument against the matching parameter via expected_clash
