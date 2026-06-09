@@ -2668,9 +2668,16 @@ struct Translator {
     auto add_export = [&](const std::string& nm, const Ident& id) {
       auto v = mk(Lam::K::Var); v->var = id; add_export_val(nm, v);
     };
+    int n_opens = 0;  // top-level `open M` opened for the rest of the structure
     for (auto& it : s) {
       if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
         flush(); segs.push_back({true, false, {}, expr(*pe->e)}); continue;
+      }
+      if (auto* op = std::get_if<Pstr_open>(&it.desc)) {  // open M (brings members in)
+        if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
+          opened_.push_back(lid_last(mi->id.txt)); ++n_opens;
+        }
+        continue;
       }
       if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {  // module type S = mty (no slot)
         if (pmt->type) modtype_layout_[pmt->name.txt] = sig_layout(*pmt->type);
@@ -2902,6 +2909,7 @@ struct Translator {
         l->bindings = std::move(it->binds); l->body = acc; acc = l;
       }
     }
+    for (int i = 0; i < n_opens; ++i) opened_.pop_back();
     scope.pop_back();
     return acc;
   }
