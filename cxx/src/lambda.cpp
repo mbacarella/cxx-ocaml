@@ -2459,7 +2459,7 @@ struct Translator {
       while (auto* pf = std::get_if<Pmod_functor>(&cur->desc)) {
         std::string nm = "*";
         const Functor_named* fp = std::get_if<Functor_named>(&pf->param);
-        if (fp && fp->name.txt) nm = *fp->name.txt;
+        if (fp) nm = fp->name.txt ? *fp->name.txt : "_";  // anonymous param prints `_`
         Ident pid = fresh(nm);
         // Bind the parameter X (with its signature's value layout) so `X.foo`
         // inside the body resolves to `(field_imm i X)`.  Save/restore for nesting.
@@ -2633,7 +2633,11 @@ struct Translator {
             if (is_pure_path(mv)) {  // a module alias `M = N.Sub`: inline the path
               module_alias_[*mb.name.txt] = mv;
               module_ident_.erase(*mb.name.txt);
-              add_export_val(*mb.name.txt, mv);
+              // A plain `module M = path` is a type-level alias with no runtime
+              // slot (elided from the export); a constrained `module M : S = path`
+              // materializes a coerced field.
+              if (std::holds_alternative<Pmod_constraint>(mb.expr.desc))
+                add_export_val(*mb.name.txt, mv);
             } else {
               Ident mid = fresh(*mb.name.txt);
               cur.push_back({mid, ValueKind::Gen, mv});
