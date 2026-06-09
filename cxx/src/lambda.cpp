@@ -2305,6 +2305,8 @@ struct Translator {
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) return expr(*ct->e);
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) return expr(*co->e);  // (e :> t) erased
+    if (auto* pp = std::get_if<Pexp_pack>(&e.desc))   // (module ME): the module value
+      return compile_module_expr(*pp->me);
     return mk(Lam::K::ConstInt);  // unsupported: placeholder (will DIFF)
   }
 
@@ -2509,6 +2511,8 @@ struct Translator {
       a->args = {cint(0)};
       return a;
     }
+    if (auto* un = std::get_if<Pmod_unpack>(&me.desc))  // (val e): unpack is transparent
+      return expr(*un->e);
     return mk(Lam::K::ConstInt);  // other module exprs: best-effort
   }
   // The runtime field layout a module expression *produces*: a structure's
