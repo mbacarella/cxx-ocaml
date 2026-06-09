@@ -2643,6 +2643,20 @@ struct Translator {
           }
         continue;
       }
+      if (auto* pin = std::get_if<Pstr_include>(&it.desc)) {  // include ME
+        // Evaluate ME (bound to `include/N` for its effects), then splice its
+        // exported value fields into this structure (as field reads of include/N).
+        LamPtr mv = compile_module_expr(pin->expr);
+        Ident iid = fresh("include");
+        cur.push_back({iid, ValueKind::Gen, mv});
+        auto rl = module_result_layout(pin->expr);
+        for (int i = 0; i < (int)rl.size(); ++i) {
+          auto v = mk(Lam::K::Var); v->var = iid;
+          auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm; fi->prim_arg = i; fi->args = {v};
+          add_export_val(rl[i], fi);
+        }
+        continue;
+      }
       auto* sv = std::get_if<Pstr_value>(&it.desc);
       if (!sv) continue;
       if (sv->rf == RecFlag::Recursive) {  // let rec: names in scope within RHSs
