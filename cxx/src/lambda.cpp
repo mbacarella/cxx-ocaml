@@ -2496,8 +2496,13 @@ struct Translator {
     }
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) return compile_module_expr(*pc->me);
     if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {  // a module in value position
-      if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
         if (LamPtr base = module_base(l->name)) return base;
+        if (!fields_of(l->name).empty()) {  // a stdlib module: its global
+          auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = global_of(l->name);
+          return g;
+        }
+      }
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))  // M.Sub -> field of M's block
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
           if (LamPtr base = module_base(pl->name)) {
@@ -2566,7 +2571,8 @@ struct Translator {
     return {};
   }
 
-  LamPtr build_module(const Structure& s, std::vector<std::string>* names) {
+  LamPtr build_module(const Structure& s, std::vector<std::string>* names,
+                      const std::vector<std::string>* coerce = nullptr) {
     scope.emplace_back();
     // updates non-empty => a recursive-data group: `(let <binds=dummies>
     // (seq <updates> body))` (caml_alloc_dummy + caml_update_dummy).
@@ -2642,12 +2648,19 @@ struct Translator {
       }
       if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {  // module M = struct ... end
         auto& mb = pm->binding;
+        // `module M : S = struct .. end` coerces the structure's exports to S.
+        const ModuleExpr* me = &mb.expr;
+        const std::vector<std::string>* coerce = nullptr;
+        std::vector<std::string> coerce_store;
+        if (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) {
+          coerce_store = sig_layout(*pc->mt); coerce = &coerce_store; me = pc->me.get();
+        }
         if (mb.name.txt)
-          if (auto* ps = std::get_if<Pmod_structure>(&mb.expr.desc)) {
+          if (auto* ps = std::get_if<Pmod_structure>(&me->desc)) {
             std::vector<std::string> sub;
             std::string saved = mod_path_;
             mod_path_ += "." + *mb.name.txt;  // nested exceptions are "Outer.M.E"
-            LamPtr body = build_module(ps->items, &sub);
+            LamPtr body = build_module(ps->items, &sub, coerce);
             mod_path_ = saved;
             Ident mid = fresh(*mb.name.txt);
             cur.push_back({mid, ValueKind::Gen, body});
@@ -2789,6 +2802,18 @@ struct Translator {
       }
     }
     flush();
+    // A signature ascription `(struct .. : S)` coerces the export block to S's
+    // fields (selected and reordered by name); the structure's bindings stay.
+    if (coerce) {
+      std::vector<LamPtr> ce; std::vector<std::string> cn;
+      for (auto& nm : *coerce) {
+        auto it = std::find(export_names.begin(), export_names.end(), nm);
+        if (it != export_names.end()) {
+          ce.push_back(exports[it - export_names.begin()]); cn.push_back(nm);
+        }
+      }
+      exports = std::move(ce); export_names = std::move(cn);
+    }
     if (names) *names = export_names;  // the (deduplicated) export layout, in order
     auto block = mk(Lam::K::Prim);
     block->prim = Prim::Makeblock; block->prim_arg = 0; block->args = std::move(exports);
