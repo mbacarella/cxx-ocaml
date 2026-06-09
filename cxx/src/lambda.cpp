@@ -460,6 +460,8 @@ struct Translator {
   std::unordered_map<std::string, std::unordered_map<std::string, int>> module_layout_;
   // A local functor's result field layout, so `Make(Arg).foo` resolves.
   std::unordered_map<std::string, std::vector<std::string>> functor_result_;
+  // A local functor's parameter signature layout, to coerce its argument.
+  std::unordered_map<std::string, std::vector<std::string>> functor_param_;
   // A named module type's value layout, so `module F (X : S)` knows X's fields.
   std::unordered_map<std::string, std::vector<std::string>> modtype_layout_;
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
@@ -720,6 +722,51 @@ struct Translator {
   }
   static std::string global_of(const std::string& mod) {
     return mod == "Stdlib" ? "Stdlib" : "Stdlib__" + mod;
+  }
+  // A stdlib functor (e.g. Set.Make): its field index in its module, and the
+  // runtime field layouts of its parameter signature and its result signature.
+  // The runtime field names of a cmi module type, resolving a named module type
+  // (`Ident`, e.g. Set's OrderedType) through the same signature's modtype decls.
+  static std::vector<std::string> mt_fields(const cmi::CmiFile& cmi,
+                                            const cmi::ModuleTypePtr& mt, int depth = 0) {
+    if (!mt || depth > 8) return {};
+    if (mt->kind == cmi::ModuleType::Sig && mt->sig) return mt->sig->fields;
+    if (mt->kind == cmi::ModuleType::Ident && mt->path) {
+      const std::string& nm = mt->path->kind == cmi::Path::Pident ? mt->path->id.name : mt->path->s;
+      for (auto& md : cmi.sig().modtypes)
+        if (md.name == nm) return mt_fields(cmi, md.type, depth + 1);
+    }
+    return {};
+  }
+  struct FunctorSig { int idx = -1; std::vector<std::string> param, result; bool ok = false; };
+  FunctorSig stdlib_functor(const std::string& mod, const std::string& name) {
+    FunctorSig fs;
+    auto& fm = fields_of(mod);
+    auto fi = fm.find(name);
+    if (fi == fm.end()) return fs;
+    fs.idx = fi->second;
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& md : cmi.sig().modules) {
+        if (md.name != name || !md.type || md.type->kind != cmi::ModuleType::Functor) continue;
+        fs.param = mt_fields(cmi, md.type->functor_param_type);
+        fs.result = mt_fields(cmi, md.type->functor_body);
+        fs.ok = true;
+        break;
+      }
+    } catch (...) {}
+    return fs;
+  }
+  // Whether a pure path bottoms out in a global (a stdlib module) rather than a
+  // local Var -- a global functor/argument is wrapped in `(let (let/N = p) ..)`.
+  static bool is_global_path(const LamPtr& l) {
+    if (!l) return false;
+    if (l->k == Lam::K::Prim && l->prim == Prim::Global) return true;
+    if (l->k == Lam::K::Prim && !l->args.empty() &&
+        (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt || l->prim == Prim::FieldMut))
+      return is_global_path(l->args[0]);
+    return false;
   }
   // The value kind of a cmi field type (int/char/bool/unit -> int, float ->
   // float, everything else -> generic/boxed), for spelling its field read.
@@ -2551,6 +2598,76 @@ struct Translator {
 
   // Compile a module expression to its Lambda value: a structure is a record of
   // its exports; a functor is `(function X is_a_functor <body>)`.
+  // The runtime field names a module argument exposes (for projecting it to a
+  // functor's parameter signature): a local module's layout or a stdlib module's.
+  std::vector<std::string> arg_layout(const ModuleExpr& me0) {
+    const ModuleExpr* me = &me0;
+    while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+    if (auto* pi = std::get_if<Pmod_ident>(&me->desc))
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
+        if (auto it = module_layout_.find(l->name); it != module_layout_.end()) {
+          std::vector<std::string> v(it->second.size());
+          for (auto& [n, i] : it->second) if (i >= 0 && i < (int)v.size()) v[i] = n;
+          return v;
+        }
+        auto& fm = fields_of(l->name);
+        std::vector<std::string> v(fm.size());
+        for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
+        return v;
+      }
+    return {};
+  }
+  // The first parameter signature of a (local) functor definition.
+  std::vector<std::string> functor_param_layout(const ModuleExpr& me0) {
+    const ModuleExpr* me = &me0;
+    while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+    if (auto* pf = std::get_if<Pmod_functor>(&me->desc))
+      if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->type)
+        return sig_layout(*fp->type);
+    return {};
+  }
+  // Compile a functor application `F(Arg)` with ocamlc's coercion: the argument is
+  // projected (by field name, via field_mut) to F's parameter signature when it
+  // has extra/reordered fields, and a global-path operand is bound to an (unused)
+  // `let/N` then re-read.
+  LamPtr compile_functor_apply(const Pmod_apply& pa) {
+    LamPtr fval; std::vector<std::string> param;
+    if (auto* pi = std::get_if<Pmod_ident>(&pa.f->desc)) {
+      if (auto* d = std::get_if<Ldot>(&pi->id.txt.v)) {
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (!module_base(pl->name) && !fields_of(pl->name).empty()) {  // stdlib functor
+            auto fs = stdlib_functor(pl->name, d->name);
+            if (fs.ok) { fval = field_of(global_of(pl->name), fs.idx); param = fs.param; }
+          }
+      } else if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {  // local functor
+        if (auto it = functor_param_.find(l->name); it != functor_param_.end()) param = it->second;
+      }
+    }
+    if (!fval) fval = compile_module_expr(*pa.f);
+    LamPtr aval = compile_module_expr(*pa.arg);
+    LamPtr acoerced = aval;
+    if (!param.empty() && param != arg_layout(*pa.arg)) {  // project to the param sig
+      auto alay = arg_layout(*pa.arg);
+      std::vector<LamPtr> fs;
+      for (auto& nm : param) {
+        int idx = 0;
+        for (int i = 0; i < (int)alay.size(); ++i) if (alay[i] == nm) { idx = i; break; }
+        auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut; fr->prim_arg = idx; fr->args = {aval};
+        fs.push_back(fr);
+      }
+      auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+      blk->args = std::move(fs); acoerced = blk;
+    }
+    auto wrap = [&](const LamPtr& src, const LamPtr& body) -> LamPtr {
+      if (!is_global_path(src)) return body;
+      Ident id = fresh("let");
+      auto l = mk(Lam::K::Let); l->bindings = {{id, ValueKind::Gen, src}}; l->body = body; return l;
+    };
+    auto a = mk(Lam::K::Apply);
+    a->fn = wrap(fval, fval);
+    a->args = {wrap(aval, acoerced)};
+    return a;
+  }
   LamPtr compile_module_expr(const ModuleExpr& me) {
     if (auto* ps = std::get_if<Pmod_structure>(&me.desc)) {
       std::vector<std::string> sub;
@@ -2602,7 +2719,7 @@ struct Translator {
         }
       }
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))  // M.Sub -> field of M's block
-        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
           if (LamPtr base = module_base(pl->name)) {
             auto& lay = module_layout_[pl->name];
             if (auto f = lay.find(d->name); f != lay.end()) {
@@ -2611,13 +2728,12 @@ struct Translator {
               return fi;
             }
           }
+          if (auto& fm = fields_of(pl->name); !fm.empty())  // stdlib M.Sub (e.g. Set.Make)
+            if (auto f = fm.find(d->name); f != fm.end())
+              return field_of(global_of(pl->name), f->second);
+        }
     }
-    if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) {  // F(X) -> (apply F X)
-      auto a = mk(Lam::K::Apply);
-      a->fn = compile_module_expr(*pa->f);
-      a->args = {compile_module_expr(*pa->arg)};
-      return a;
-    }
+    if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) return compile_functor_apply(*pa);
     if (auto* pu = std::get_if<Pmod_apply_unit>(&me.desc)) {  // F() -> (apply F 0)
       auto a = mk(Lam::K::Apply);
       a->fn = compile_module_expr(*pu->f);
@@ -2661,11 +2777,18 @@ struct Translator {
     if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) head = pa->f.get();
     else if (auto* pu = std::get_if<Pmod_apply_unit>(&me.desc)) head = pu->f.get();
     if (head)
-      if (auto* fi = std::get_if<Pmod_ident>(&head->desc))
+      if (auto* fi = std::get_if<Pmod_ident>(&head->desc)) {
         if (auto* l = std::get_if<Lident>(&fi->id.txt.v)) {
           auto it = functor_result_.find(l->name);
           if (it != functor_result_.end()) return it->second;
         }
+        if (auto* d = std::get_if<Ldot>(&fi->id.txt.v))  // a stdlib functor M.Make
+          if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+            if (!module_base(pl->name) && !fields_of(pl->name).empty()) {
+              auto fs = stdlib_functor(pl->name, d->name);
+              if (fs.ok) return fs.result;
+            }
+      }
     return {};
   }
 
@@ -2778,6 +2901,7 @@ struct Translator {
             cur.push_back({mid, ValueKind::Gen, compile_module_expr(mb.expr)});
             module_ident_[*mb.name.txt] = mid;
             functor_result_[*mb.name.txt] = module_result_layout(mb.expr);  // for Make(..)
+            functor_param_[*mb.name.txt] = functor_param_layout(mb.expr);   // for arg coercion
             add_export(*mb.name.txt, mid);
           } else {  // module M = F(X) / M2 / (M : S): bind + layout from the result
             LamPtr mv = compile_module_expr(mb.expr);
