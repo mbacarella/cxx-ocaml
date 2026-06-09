@@ -229,7 +229,8 @@ DocP let_doc(const LamPtr& l, Pr& pr) {
     auto& b = l->bindings[i];
     if (i) binds.push_back(brk());
     binds.push_back(box(BoxT::Box, 2,
-        {text(pr.ident(b.id) + " =" + std::string(b.alias ? "a" : "") + kind_suffix(b.kind)),
+        {text(pr.ident(b.id) + " =" +
+              std::string(b.mut ? "mut" : b.alias ? "a" : "") + kind_suffix(b.kind)),
          brk(), to_doc(b.val, pr)}));
   }
   binds.push_back(text(")"));
@@ -253,6 +254,10 @@ DocP letrec_doc(const LamPtr& l, Pr& pr) {
 DocP to_doc(const LamPtr& l, Pr& pr) {
   switch (l->k) {
     case Lam::K::Var: return text(pr.ident(l->var));
+    case Lam::K::Mutvar: return text("*" + pr.ident(l->var));  // read a mutable local
+    case Lam::K::Assign:  // (assign x e)
+      return box(BoxT::Box, 2, {text("(assign " + pr.ident(l->var)), brk(),
+                                to_doc(l->cond, pr), text(")")});
     case Lam::K::ConstInt: return text(std::to_string(l->int_val) + l->str_val);
     case Lam::K::ConstChar: return text("'" + ocaml_char((int)l->int_val) + "'");
     case Lam::K::ConstFloat: return text(l->str_val);
@@ -289,6 +294,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::SetfieldImm: head = "(setfield_imm " + std::to_string(l->prim_arg); break;
         case Prim::SetfieldPtr: head = "(setfield_ptr " + std::to_string(l->prim_arg); break;
         case Prim::Offsetref: head = "(+:=" + std::to_string(l->prim_arg); break;
+        case Prim::Offsetint: head = "(" + std::to_string(l->prim_arg) + "+"; break;
         case Prim::Ccall: head = "(" + l->prim_id; break;
         case Prim::IntCmp: head = "(" + l->prim_id; break;
         case Prim::Raise: head = "(raise"; break;
@@ -1115,6 +1121,72 @@ struct Translator {
   }
   LamPtr fieldimm(int i, const LamPtr& s) {
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = i; f->args = {s}; return f;
+  }
+  // ----- mutable-local `ref` optimization ------------------------------------
+  // Whether `rid` (a `ref`'s binder) is used anywhere but as `!r` / `r := e` /
+  // `incr r` / `decr r` in an already-translated body -- i.e. it ESCAPES (is taken
+  // as a first-class value), so it must stay a heap ref.  A bare Var(rid) reached
+  // without a consuming ref-operation parent counts as an escape.
+  static bool ref_op0(const LamPtr& l, const Ident& rid) {
+    return !l->args.empty() && l->args[0]->k == Lam::K::Var &&
+           l->args[0]->var.stamp == rid.stamp;
+  }
+  static bool ref_escapes(const LamPtr& l, const Ident& rid) {
+    if (!l) return false;
+    if (l->k == Lam::K::Var) return l->var.stamp == rid.stamp;
+    // Any use inside a nested closure forces a heap ref (the closure may outlive
+    // the binding's stack frame), even a mere `!r`.
+    if (l->k == Lam::K::Function) return count_var(l->body, rid) > 0;
+    if (l->k == Lam::K::Prim && ref_op0(l, rid)) {
+      if (l->prim_arg == 0 && (l->prim == Prim::FieldInt || l->prim == Prim::FieldMut))
+        return false;                                              // !r
+      if (l->prim_arg == 0 && (l->prim == Prim::SetfieldImm || l->prim == Prim::SetfieldPtr))
+        return ref_escapes(l->args[1], rid);                       // r := e -> check e
+      if (l->prim == Prim::Offsetref) return false;                // incr/decr
+    }
+    if (ref_escapes(l->fn, rid) || ref_escapes(l->body, rid) ||
+        ref_escapes(l->cond, rid) || ref_escapes(l->then_, rid) ||
+        ref_escapes(l->else_, rid) || ref_escapes(l->sw_default, rid)) return true;
+    for (auto& a : l->args) if (ref_escapes(a, rid)) return true;
+    for (auto& b : l->bindings) if (ref_escapes(b.val, rid)) return true;
+    for (auto& sc : l->sw_consts) if (ref_escapes(sc.body, rid)) return true;
+    for (auto& sc : l->sw_blocks) if (ref_escapes(sc.body, rid)) return true;
+    return false;
+  }
+  // Rewrite the (non-escaping) ref operations on `rid` in place to mutable-local
+  // form: `!r` -> `*r` (Mutvar), `r := e` -> `(assign r e)`, `incr/decr r` ->
+  // `(assign r (n+ *r))`.
+  void ref_rewrite(LamPtr& l, const Ident& rid) {
+    if (!l) return;
+    if (l->k == Lam::K::Prim && ref_op0(l, rid)) {
+      if (l->prim_arg == 0 && (l->prim == Prim::FieldInt || l->prim == Prim::FieldMut)) {
+        l->k = Lam::K::Mutvar; l->var = rid; l->args.clear(); return;
+      }
+      if (l->prim_arg == 0 && (l->prim == Prim::SetfieldImm || l->prim == Prim::SetfieldPtr)) {
+        ref_rewrite(l->args[1], rid);
+        l->k = Lam::K::Assign; l->var = rid; l->cond = l->args[1]; l->args.clear(); return;
+      }
+      if (l->prim == Prim::Offsetref) {
+        auto mv = mk(Lam::K::Mutvar); mv->var = rid;
+        auto oi = mk(Lam::K::Prim); oi->prim = Prim::Offsetint;
+        oi->prim_arg = l->prim_arg; oi->args = {mv};
+        l->k = Lam::K::Assign; l->var = rid; l->cond = oi; l->args.clear(); return;
+      }
+    }
+    ref_rewrite(l->fn, rid); ref_rewrite(l->body, rid); ref_rewrite(l->cond, rid);
+    ref_rewrite(l->then_, rid); ref_rewrite(l->else_, rid); ref_rewrite(l->sw_default, rid);
+    for (auto& a : l->args) ref_rewrite(a, rid);
+    for (auto& b : l->bindings) ref_rewrite(b.val, rid);
+    for (auto& sc : l->sw_consts) ref_rewrite(sc.body, rid);
+    for (auto& sc : l->sw_blocks) ref_rewrite(sc.body, rid);
+  }
+  // `ref E` as a call -> the content expression E (else null).
+  static const Expression* ref_call(const Expression& e) {
+    auto* ap = std::get_if<Pexp_apply>(&e.desc);
+    if (!ap || ap->args.size() != 1) return nullptr;
+    auto* id = std::get_if<Pexp_ident>(&ap->fn->desc);
+    if (id && lid_last(id->id.txt) == "ref") return ap->args[0].second.get();
+    return nullptr;
   }
   // Read record field `fi` of `s` with the spelling its kind implies (an int field
   // is field_int, a mutable boxed field field_mut, otherwise field_imm).
@@ -2038,6 +2110,12 @@ struct Translator {
         sq->else_ = expr(*le->body);
         return sq;
       }
+      // `let x = E in x` -> E: a linear alias binding ocamlc's simplif drops.
+      if (le->rf != RecFlag::Recursive && le->bindings.size() == 1)
+        if (auto* pv = std::get_if<Ppat_var>(&le->bindings[0].pat.desc))
+          if (auto* bid = std::get_if<Pexp_ident>(&le->body->desc))
+            if (auto* bl = std::get_if<Lident>(&bid->id.txt.v); bl && bl->name == pv->name.txt)
+              return expr(*le->bindings[0].expr);
       scope.emplace_back();
       if (le->rf == RecFlag::Recursive) {  // names in scope within their RHSs
         std::vector<std::pair<const ValueBinding*, Ident>> recs;
@@ -2069,6 +2147,30 @@ struct Translator {
         scope.pop_back();
         return l;
       }
+      // `let r = ref E in body`: if r never escapes (used only as `!r` / `r := e`
+      // / `incr`/`decr`), it becomes a mutable local variable -- `=mut[k]` with
+      // `*r` reads and `(assign r e)` writes -- instead of a heap ref.
+      if (le->bindings.size() == 1)
+        if (auto* pv = std::get_if<Ppat_var>(&le->bindings[0].pat.desc))
+          if (const Expression* init = ref_call(*le->bindings[0].expr)) {
+            Ident rid = fresh(pv->name.txt);
+            scope.back()[pv->name.txt] = rid;
+            ValueKind k = expr_kind(init);
+            LamPtr iv = expr(*init);
+            LamPtr body = expr(*le->body);
+            auto l = mk(Lam::K::Let);
+            if (ref_escapes(body, rid)) {  // escapes -> stays a heap ref
+              auto mm = mk(Lam::K::Prim); mm->prim = Prim::Makemutable;
+              mm->prim_arg = 0; mm->blk_shape = {k}; mm->args = {iv};
+              l->bindings = {{rid, ValueKind::Gen, mm}};
+            } else {  // mutable local
+              ref_rewrite(body, rid);
+              l->bindings = {{rid, k, iv, false, true}};
+            }
+            l->body = body;
+            scope.pop_back();
+            return l;
+          }
       // `let <refutable> = e in body`: a partial pattern match over e raising
       // Match_failure on the missing cases (located at the let expression).  e is
       // bound to a *match* temp unless it is already a variable.

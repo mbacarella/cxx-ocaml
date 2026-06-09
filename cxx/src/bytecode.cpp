@@ -134,8 +134,12 @@ struct Bytegen {
     using K = Lam::K;
     switch (e->k) {
       case K::Var:
+      case K::Mutvar:
         if (!bound.count(e->var.stamp) && !out.count(e->var.stamp)) out[e->var.stamp] = e->var;
         return;
+      case K::Assign:  // reads the assigned variable and the value expression
+        if (!bound.count(e->var.stamp) && !out.count(e->var.stamp)) out[e->var.stamp] = e->var;
+        fvs(e->cond, bound, out); return;
       case K::ConstInt: case K::ConstChar: case K::ConstFloat:
       case K::ConstString: return;
       case K::ConstBlock: for (auto& a : e->args) fvs(a, bound, out); return;
@@ -213,6 +217,7 @@ struct Bytegen {
       case Prim::NotEqInt: return I(Op::Neqint);
       case Prim::EqInt: return I(Op::Eqint);
       case Prim::Offsetref: return Iop(Op::Offsetref, e->prim_arg);
+      case Prim::Offsetint: return Iop(Op::Offsetint, e->prim_arg);
       case Prim::Ccall: { Instr i = I(Op::Ccall); i.str = e->prim_id; i.a = (int)e->args.size(); return i; }
       case Prim::IntCmp: return intcmp_or_ccall(e);
       default: break;
@@ -279,6 +284,16 @@ struct Bytegen {
           }
         }
         return cons(Iop(Op::Acc, 0), cont);  // unresolved (will DIFF)
+      }
+      case K::Mutvar: {  // read a mutable local: same as a stack variable
+        auto it = env.stack.find(exp->var.stamp);
+        if (it != env.stack.end()) return cons(Iop(Op::Acc, sz - it->second), cont);
+        return cons(Iop(Op::Acc, 0), cont);
+      }
+      case K::Assign: {  // (assign x e): eval e then ASSIGN its stack slot (-> unit)
+        auto it = env.stack.find(exp->var.stamp);
+        int ofs = it != env.stack.end() ? sz - it->second : 0;
+        return comp_expr(env, exp->cond, sz, cons(Iop(Op::Assign, ofs), cont));
       }
       case K::ConstInt: case K::ConstChar: case K::ConstFloat:
       case K::ConstString: case K::ConstBlock: {

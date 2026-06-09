@@ -49,6 +49,7 @@ enum class Prim {
   SetfieldImm, // setfield_imm n  (:= into an immediate-contents ref)
   SetfieldPtr, // setfield_ptr n  (:= into a pointer-contents ref)
   Offsetref,   // +:=n   (incr/decr)
+  Offsetint,   // n+      (incr/decr on a mutable-local ref: assign r (1+ *r))
   Ccall,       // a C external call, printed by its C name (prim_id)
   IntCmp,      // integer comparison; spelling (< > <= >= == !=) in prim_id
   Raise,       // (raise e)
@@ -56,8 +57,8 @@ enum class Prim {
 };
 
 struct Lam {
-  enum class K { Var, ConstInt, ConstChar, ConstFloat, ConstString, ConstBlock,
-                 Apply, Function, Let, Letrec, Prim, IfThenElse, Sequence,
+  enum class K { Var, Mutvar, ConstInt, ConstChar, ConstFloat, ConstString, ConstBlock,
+                 Apply, Function, Let, Letrec, Prim, Assign, IfThenElse, Sequence,
                  Switch, For, While, Try, Catch, Staticraise };
   K k;
 
@@ -77,7 +78,9 @@ struct Lam {
   // Let: a group of bindings (kind shown as =[kind]) then a body
   // alias: the Llet Alias kind (printed `=a`), used for pattern-variable bindings
   // to a sub-term of the scrutinee (e.g. `Some y` where y is used more than once).
-  struct Binding { Ident id; ValueKind kind; LamPtr val; bool alias = false; };
+  // mut: the Llet Mutable kind (printed `=mut`), a mutable local variable (an
+  // un-escaping `ref`); read via Mutvar (`*x`) and written via Assign.
+  struct Binding { Ident id; ValueKind kind; LamPtr val; bool alias = false; bool mut = false; };
   std::vector<Binding> bindings;
 
   // Prim
