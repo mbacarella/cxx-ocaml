@@ -452,6 +452,21 @@ struct Bytegen {
             }
             if (exp->prim_id == "opaque" && exp->args.size() == 1)
               return comp_expr(env, exp->args[0], sz, cont);  // identity: no instruction
+            // (Pintcomp c [arg; const]) -> reorder to [const; arg] and swap the
+            // comparison, so the constant lands in the accumulator (matches bytegen,
+            // which does this to enable the emitcode branch/compare fusion).
+            {
+              static const std::unordered_map<std::string, std::string> swap_cmp = {
+                {"==", "=="}, {"!=", "!="}, {"<", ">"}, {">", "<"}, {"<=", ">="}, {">=", "<="}};
+              auto sw = swap_cmp.find(exp->prim_id);
+              if (sw != swap_cmp.end() && exp->args.size() == 2 &&
+                  (exp->args[1]->k == K::ConstInt || exp->args[1]->k == K::ConstChar)) {
+                auto e2 = std::make_shared<Lam>(*exp);
+                e2->prim_id = sw->second;
+                e2->args = {exp->args[1], exp->args[0]};
+                return comp_args(env, e2->args, sz, cons(comp_primitive(e2), cont));
+              }
+            }
             if (exp->prim_id.rfind("makearray", 0) == 0) {  // [| .. |] -> a block
               if (exp->args.empty()) {  // [||]: the empty-array atom (const 0)
                 auto z = std::make_shared<Lam>(); z->k = K::ConstInt; z->int_val = 0;
