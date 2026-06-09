@@ -1235,6 +1235,10 @@ struct Checker {
       TypePtr at = from_coretype(*ct->t, vars);
       if (strict && expected_clash(et, at))  // (e : T) with e of a clashing type
         note_error("expression does not match the type constraint");
+      // Pin the inner expression's type for the value-kind pass (`(x:int)` ->
+      // x:int); not in the strict reject pass, where an incomplete unify can
+      // propagate a spurious clash and cost a false-rejection.
+      if (record_kinds_) try_unify(et, at);
       return at;
     }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
