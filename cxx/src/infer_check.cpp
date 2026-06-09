@@ -423,7 +423,17 @@ struct Checker {
       for (int i = 0; i < napp && cur; ++i)
         cur = (cur->kind == cmi::ModuleType::Functor) ? cur->functor_body.get() : nullptr;
       if (cur && cur->kind == cmi::ModuleType::Sig && cur->sig)
-        for (auto& v : cur->sig->values) out[v.name] = generic_var();
+        for (auto& v : cur->sig->values) {
+          // The value-kind pass wants each member's real type (so a concrete
+          // return like `mem : .. -> bool` yields the [int] kind); the strict
+          // reject pass keeps fully-generic schemes, which never clash.
+          if (record_kinds_ && v.type) {
+            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            out[v.name] = from_cmi(v.type, memo);
+          } else {
+            out[v.name] = generic_var();
+          }
+        }
     } catch (...) {}
     return out;
   }
