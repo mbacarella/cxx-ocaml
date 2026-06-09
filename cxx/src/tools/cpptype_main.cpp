@@ -41,6 +41,19 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (check_mode) {  // strict type-check: print errors, exit 1 if rejected
+      // A companion `.mli` with no compiled `.cmi` makes ocamlc reject before
+      // typing ("Could not find the .cmi file for interface ..."); match that
+      // deterministic build error (a valid file's .cmi would be present).
+      {
+        std::string p = path;
+        if (p.size() > 3 && p.compare(p.size() - 3, 3, ".ml") == 0) {
+          std::ifstream mli(p + "i"), cmi(p.substr(0, p.size() - 3) + ".cmi");
+          if (mli.good() && !cmi.good()) {
+            std::cout << "Error: Could not find the .cmi file for interface\n";
+            return 1;
+          }
+        }
+      }
       auto errs = cppcaml::structure_typecheck(structure);
       for (auto& e : errs) std::cout << "Error: " << e << '\n';
       if (errs.empty()) std::cout << "OK\n";
