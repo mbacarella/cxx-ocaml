@@ -57,7 +57,8 @@ using omarshal::vlist;
 
 // Predefined exceptions (runtimedef.ml builtin_exceptions): a GETGLOBAL of one of
 // these resolves to a fixed predef slot (Reloc_getpredef), not a compilation unit.
-bool is_predef_exn(const std::string& n) {
+bool is_predef_exn(const std::string& n0) {
+  std::string n = n0.substr(0, n0.find('/'));  // strip a "/stamp" suffix
   static const std::set<std::string> s = {
       "Out_of_memory", "Sys_error", "Failure", "Invalid_argument", "End_of_file",
       "Division_by_zero", "Not_found", "Match_failure", "Stack_overflow",

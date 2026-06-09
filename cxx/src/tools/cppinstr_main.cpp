@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
     std::string mod = module_name(argv[1]);
-    auto code = cppcaml::lambda::translate_implementation(structure, mod);
+    auto code = cppcaml::lambda::translate_implementation(structure, mod, "stdlib", argv[1]);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     cppcaml::bytecode::print_dinstr(instrs, std::cout);
   } catch (const cppcaml::ParseError& e) {

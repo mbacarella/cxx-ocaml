@@ -482,11 +482,18 @@ struct Translator {
   std::unordered_map<std::string, int> predef_global_stamp_;
   int next_exit_ = 0;  // static-exception ids (normalized in the dump, so value is free)
 
-  // `(global Name/stamp!)` for a predefined exception used by the compiler.
+  // `(global Name/stamp!)` for a predefined exception used by the compiler.  The
+  // stamps are OCaml's fixed Predef ident stamps (the lambda dump normalizes them,
+  // but -dinstr does not, so the bytecode getglobal needs the exact value).
   LamPtr predef_global(const std::string& name) {
-    auto it = predef_global_stamp_.find(name);
-    int st = it != predef_global_stamp_.end() ? it->second
-                                              : (predef_global_stamp_[name] = stamp++);
+    static const std::unordered_map<std::string, int> predef = {
+      {"Match_failure", 23}, {"Assert_failure", 33}, {"Invalid_argument", 6},
+      {"Failure", 4}, {"Not_found", 12}, {"Out_of_memory", 1}, {"Stack_overflow", 15},
+      {"Sys_error", 3}, {"End_of_file", 9}, {"Division_by_zero", 10},
+      {"Sys_blocked_io", 17}, {"Undefined_recursive_module", 35},
+    };
+    auto p = predef.find(name);
+    int st = p != predef.end() ? p->second : (stamp++);
     auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = name; g->var.stamp = st;
     return g;
   }

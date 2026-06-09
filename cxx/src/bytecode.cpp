@@ -208,7 +208,11 @@ struct Bytegen {
   Instr comp_primitive(const LamPtr& e) {
     switch (e->prim) {
       case Prim::Setglobal: { Instr i = I(Op::Setglobal); i.str = e->prim_id; return i; }
-      case Prim::Global:    { Instr i = I(Op::Getglobal); i.str = e->prim_id; return i; }
+      case Prim::Global: {  // a predef exception carries its (non-zero) Predef stamp
+        Instr i = I(Op::Getglobal);
+        i.str = e->var.stamp ? e->prim_id + "/" + std::to_string(e->var.stamp) : e->prim_id;
+        return i;
+      }
       case Prim::Field: case Prim::FieldImm: case Prim::FieldMut: case Prim::FieldInt:
         return Iop(Op::Getfield, e->prim_arg);
       case Prim::SetfieldImm: case Prim::SetfieldPtr:

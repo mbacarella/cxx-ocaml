@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
     std::string mod = module_name(in_path);
-    auto code = cppcaml::lambda::translate_implementation(structure, mod);
+    auto code = cppcaml::lambda::translate_implementation(structure, mod, "stdlib", in_path);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     cppcaml::cmo::write_cmo(instrs, mod, out_path);
   } catch (const cppcaml::ParseError& e) {
