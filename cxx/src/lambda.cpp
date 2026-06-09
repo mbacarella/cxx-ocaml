@@ -454,6 +454,9 @@ struct Translator {
   // Locally-defined submodules: name -> its binder, and name -> field layout
   // (export value/submodule name -> field index), for resolving `M.x`.
   std::unordered_map<std::string, Ident> module_ident_;
+  // A module alias `module F = M.Sub` resolves F to a pure path expression
+  // (`(field_imm i M)`) inlined at use sites, instead of a fresh binding.
+  std::unordered_map<std::string, LamPtr> module_alias_;
   std::unordered_map<std::string, std::unordered_map<std::string, int>> module_layout_;
   // A local functor's result field layout, so `Make(Arg).foo` resolves.
   std::unordered_map<std::string, std::vector<std::string>> functor_result_;
@@ -668,6 +671,28 @@ struct Translator {
     auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = global;
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = idx; f->args = {g};
     return f;
+  }
+  // The base expression for a local module `m`: its alias path if `m` is a module
+  // alias, else a Var of its binding; null if `m` is not a known local module.
+  LamPtr module_base(const std::string& m) {
+    if (auto a = module_alias_.find(m); a != module_alias_.end()) return a->second;
+    if (auto i = module_ident_.find(m); i != module_ident_.end()) {
+      auto v = mk(Lam::K::Var); v->var = i->second; return v;
+    }
+    return nullptr;
+  }
+  // A pure module path (a Var, a Global, or a chain of immutable field reads of
+  // one) -- safe to inline at every use of a module alias.
+  static bool is_pure_path(const LamPtr& l) {
+    if (!l) return false;
+    if (l->k == Lam::K::Var) return true;
+    if (l->k == Lam::K::Prim) {
+      if (l->prim == Prim::Global) return true;
+      if ((l->prim == Prim::FieldImm || l->prim == Prim::FieldInt ||
+           l->prim == Prim::FieldMut) && l->args.size() == 1)
+        return is_pure_path(l->args[0]);
+    }
+    return false;
   }
   // Field map of a stdlib (sub)module; empty if not a loadable stdlib module.
   const std::unordered_map<std::string, int>& fields_of(const std::string& mod) {
@@ -1924,12 +1949,11 @@ struct Translator {
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
         // an `open M` brings M's exported values into scope (innermost first)
         for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
-          if (auto mi = module_ident_.find(*it); mi != module_ident_.end()) {  // local module
+          if (LamPtr base = module_base(*it)) {  // local module (binding or alias)
             auto& lay = module_layout_[*it];
             if (auto f = lay.find(l->name); f != lay.end()) {
-              auto v = mk(Lam::K::Var); v->var = mi->second;
               auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
-              fi->prim_arg = f->second; fi->args = {v};
+              fi->prim_arg = f->second; fi->args = {base};
               return fi;
             }
           }
@@ -1941,12 +1965,11 @@ struct Translator {
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
           // Qualified M.x where M is a local submodule: field of its block.
-          if (auto mi = module_ident_.find(pl->name); mi != module_ident_.end()) {
+          if (LamPtr base = module_base(pl->name)) {
             auto& lay = module_layout_[pl->name];
             if (auto f = lay.find(d->name); f != lay.end()) {
-              auto v = mk(Lam::K::Var); v->var = mi->second;
               auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
-              fi->prim_arg = f->second; fi->args = {v};
+              fi->prim_arg = f->second; fi->args = {base};
               return fi;
             }
           }
@@ -2462,17 +2485,14 @@ struct Translator {
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) return compile_module_expr(*pc->me);
     if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {  // a module in value position
       if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
-        if (auto it = module_ident_.find(l->name); it != module_ident_.end()) {
-          auto v = mk(Lam::K::Var); v->var = it->second; return v;
-        }
+        if (LamPtr base = module_base(l->name)) return base;
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))  // M.Sub -> field of M's block
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
-          if (auto mi = module_ident_.find(pl->name); mi != module_ident_.end()) {
+          if (LamPtr base = module_base(pl->name)) {
             auto& lay = module_layout_[pl->name];
             if (auto f = lay.find(d->name); f != lay.end()) {
-              auto v = mk(Lam::K::Var); v->var = mi->second;
               auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
-              fi->prim_arg = f->second; fi->args = {v};
+              fi->prim_arg = f->second; fi->args = {base};
               return fi;
             }
           }
@@ -2543,7 +2563,7 @@ struct Translator {
     std::vector<LamPtr> exports;
     std::vector<std::string> export_names;
     auto flush = [&] { if (!cur.empty()) segs.push_back({false, false, std::move(cur), nullptr}), cur.clear(); };
-    auto add_export = [&](const std::string& nm, const Ident& id) {
+    auto add_export_val = [&](const std::string& nm, LamPtr v) {
       // a redefinition (shadow) moves the name to its last definition's position
       for (size_t i = 0; i < export_names.size(); ++i)
         if (export_names[i] == nm) {
@@ -2551,8 +2571,11 @@ struct Translator {
           exports.erase(exports.begin() + i);
           break;
         }
-      auto v = mk(Lam::K::Var); v->var = id; exports.push_back(v);
+      exports.push_back(std::move(v));
       export_names.push_back(nm);
+    };
+    auto add_export = [&](const std::string& nm, const Ident& id) {
+      auto v = mk(Lam::K::Var); v->var = id; add_export_val(nm, v);
     };
     for (auto& it : s) {
       if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
@@ -2603,13 +2626,20 @@ struct Translator {
             functor_result_[*mb.name.txt] = module_result_layout(mb.expr);  // for Make(..)
             add_export(*mb.name.txt, mid);
           } else {  // module M = F(X) / M2 / (M : S): bind + layout from the result
-            Ident mid = fresh(*mb.name.txt);
-            cur.push_back({mid, ValueKind::Gen, compile_module_expr(mb.expr)});
-            module_ident_[*mb.name.txt] = mid;
+            LamPtr mv = compile_module_expr(mb.expr);
             auto& lay = module_layout_[*mb.name.txt]; lay.clear();
             auto rl = module_result_layout(mb.expr);
             for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
-            add_export(*mb.name.txt, mid);
+            if (is_pure_path(mv)) {  // a module alias `M = N.Sub`: inline the path
+              module_alias_[*mb.name.txt] = mv;
+              module_ident_.erase(*mb.name.txt);
+              add_export_val(*mb.name.txt, mv);
+            } else {
+              Ident mid = fresh(*mb.name.txt);
+              cur.push_back({mid, ValueKind::Gen, mv});
+              module_ident_[*mb.name.txt] = mid;
+              add_export(*mb.name.txt, mid);
+            }
           }
         continue;
       }
