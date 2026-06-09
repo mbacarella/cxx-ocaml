@@ -1945,16 +1945,32 @@ struct Translator {
       if (auto* pm = std::get_if<Pstr_module>(&si->item->desc))
         if (pm->binding.name.txt) {
           auto& mb = pm->binding;
-          Ident mid = fresh(*mb.name.txt);
+          const std::string& nm = *mb.name.txt;
           LamPtr modval = compile_module_expr(mb.expr);
-          module_ident_[*mb.name.txt] = mid;
-          auto& lay = module_layout_[*mb.name.txt]; lay.clear();
           auto rl = module_result_layout(mb.expr);
+          if (rl.empty()) rl = arg_layout(mb.expr);  // a module path -> its own fields
+          // save the names this binding shadows (M is local to the body)
+          bool had_i = module_ident_.count(nm), had_a = module_alias_.count(nm);
+          Ident sav_i = had_i ? module_ident_[nm] : Ident{};
+          LamPtr sav_a = had_a ? module_alias_[nm] : nullptr;
+          auto sav_l = module_layout_[nm];
+          auto& lay = module_layout_[nm]; lay.clear();
           for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
-          auto l = mk(Lam::K::Let);
-          l->bindings = {{mid, ValueKind::Gen, modval}};
-          l->body = expr(*si->body);
-          return l;
+          LamPtr result;
+          if (is_pure_path(modval)) {  // `let module M = <path>`: an alias, elided
+            module_alias_[nm] = modval; module_ident_.erase(nm);
+            result = expr(*si->body);
+          } else {
+            Ident mid = fresh(nm);
+            module_ident_[nm] = mid; module_alias_.erase(nm);
+            auto l = mk(Lam::K::Let);
+            l->bindings = {{mid, ValueKind::Gen, modval}}; l->body = expr(*si->body);
+            result = l;
+          }
+          if (had_i) module_ident_[nm] = sav_i; else module_ident_.erase(nm);
+          if (had_a) module_alias_[nm] = sav_a; else module_alias_.erase(nm);
+          module_layout_[nm] = sav_l;
+          return result;
         }
       return expr(*si->body);  // other struct-item bodies: best-effort
     }
