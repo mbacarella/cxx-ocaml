@@ -1205,7 +1205,11 @@ struct Checker {
       return eng.constr("unit");
     }
     if (auto* tr = std::get_if<Pexp_try>(&e.desc)) {
-      TypePtr t = infer_expr(*tr->e);  // body and every handler share the result type
+      // Body and every handler share the result type; unify them into a fresh var
+      // (not the body's type) so a handler pins it even when the body is bottom --
+      // `try (..; assert false) with _ -> 0` is int, from the handler.
+      TypePtr t = eng.fresh_var();
+      try_unify(t, infer_expr(*tr->e));
       for (auto& c : tr->cases) {
         venv.emplace_back();
         infer_pat(c.lhs);  // an exception pattern (binds exn-typed vars)
@@ -1253,11 +1257,12 @@ struct Checker {
     }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
       infer_expr(*as->e);  // infer the condition (flows operand kinds, e.g. x:int)
-      // `assert false` is bottom ('a, never returns): the type-checker leaves the
-      // surrounding result type open, so don't constrain it (would wrongly pin a
-      // polymorphic result -- e.g. a fold's accumulator -- to unit's [int] kind).
+      // `assert false` is bottom ('a, never returns): a fresh var, so the
+      // surrounding result type is decided by the other branches -- it neither
+      // pins a polymorphic result (a fold accumulator) nor absorbs a concrete one
+      // (`try (..; assert false) with _ -> 0` is int, from the handler).
       if (auto* ctr = std::get_if<Pexp_construct>(&as->e->desc))
-        if (lid_last(ctr->id.txt) == "false") return eng.any();
+        if (lid_last(ctr->id.txt) == "false") return generic_var();
       // `assert e` (e != false) is unit (-> the [int] value kind), but a concrete
       // unit clashes in strict checking, so only commit to unit for kinds.
       return record_kinds_ ? eng.constr("unit") : eng.any();
