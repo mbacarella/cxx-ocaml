@@ -1713,6 +1713,13 @@ struct Translator {
       return nullptr;  // not exhaustive over a constant-only type
     std::sort(arms.begin(), arms.end(),
               [](auto& x, auto& y) { return x.tag < y.tag; });
+    // Exactly two constant constructors (tags 0 and 1) -> a truthy `if`, like bool;
+    // three or more -> a switch.
+    if (arms.size() == 2 && arms[0].tag == 0 && arms[1].tag == 1) {
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = scrut; i->then_ = arms[1].body; i->else_ = arms[0].body;
+      return i;
+    }
     auto sw = mk(Lam::K::Switch);
     sw->cond = scrut;
     sw->sw_consts = std::move(arms);
