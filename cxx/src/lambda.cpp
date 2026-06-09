@@ -2111,6 +2111,11 @@ struct Translator {
               pr->args = {expr(*as[0].second)};
               return pr;
             }
+            if (n == "perform" && as.size() == 1) {  // Effect.perform e -> (perform e)
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "perform";
+              pr->args = {expr(*as[0].second)};
+              return pr;
+            }
             // General: an unqualified pervasive `external` (e.g. compare, ignore)
             // resolved via its cmi prim_name.
             if (auto pi = stdlib_prims.find(n); pi != stdlib_prims.end())
@@ -2611,6 +2616,28 @@ struct Translator {
         cur.push_back({id, ValueKind::Gen, blk});
         exn_ident_[nm] = id;
         add_export(nm, id);
+        continue;
+      }
+      if (auto* px = std::get_if<Pstr_typext>(&it.desc)) {  // type t += E ... (incl. effects)
+        for (auto& c : px->ext.ctors) {
+          const std::string& nm = c.name.txt;
+          if (auto* rb = std::get_if<Pext_rebind>(&c.kind)) {  // `E = D`: alias to D
+            if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
+              if (auto e = exn_ident_.find(l->name); e != exn_ident_.end()) {
+                exn_ident_[nm] = e->second; add_export(nm, e->second);
+              }
+            continue;
+          }
+          auto str = mk(Lam::K::ConstString); str->str_val = mod_path_ + "." + nm;
+          auto oid = mk(Lam::K::Prim); oid->prim = Prim::Ccall;
+          oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
+          auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
+          blk->args = {str, oid};
+          Ident id = fresh(nm);
+          cur.push_back({id, ValueKind::Gen, blk});
+          exn_ident_[nm] = id;
+          add_export(nm, id);
+        }
         continue;
       }
       if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {  // module M = struct ... end
