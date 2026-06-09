@@ -232,6 +232,11 @@ struct Checker {
       return eng.tuple(std::move(es));
     }
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      // a qualified type `M.t` whose head module is unbound is a soundness error
+      if (strict)
+        if (auto* d = std::get_if<Ldot>(&c->id.txt.v))
+          if (module_head_unbound(*d->prefix))
+            note_error("Unbound module " + mod_components(*d->prefix).front());
       // a bare locally-abstract type name resolves to its flexible var
       if (c->args.empty())
         if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
@@ -1781,8 +1786,11 @@ struct Checker {
       venv.pop_back();
       return exports;
     }
-    if (auto* mi = std::get_if<Pmod_ident>(&me.desc))
+    if (auto* mi = std::get_if<Pmod_ident>(&me.desc)) {
+      if (strict && module_head_unbound(mi->id.txt))  // module F = <unbound>
+        note_error("Unbound module " + mod_components(mi->id.txt).front());
       return resolve_module_values(mi->id.txt);  // local alias or stdlib (sub)module
+    }
     if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
       // Is the constrained module a structure (an ascription to check) or
       // something else like `(val e : S)` (which yields S's values)?
@@ -1815,8 +1823,11 @@ struct Checker {
         else if (auto* au = std::get_if<Pmod_apply_unit>(&h->desc)) { ++napp; h = au->f.get(); }
         else break;
       }
-      if (auto* fi = std::get_if<Pmod_ident>(&h->desc))
+      if (auto* fi = std::get_if<Pmod_ident>(&h->desc)) {
+        if (strict && module_head_unbound(fi->id.txt))  // module O = <unbound>.Make(..)
+          note_error("Unbound module " + mod_components(fi->id.txt).front());
         return functor_result_values(fi->id.txt, napp);
+      }
       return {};
     }
     return {};  // functor definition itself: no values
@@ -1843,6 +1854,13 @@ struct Checker {
         }
       } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
         collect_bound_modules_me(in->expr);
+        if (auto* pi = std::get_if<Pmod_ident>(&in->expr.desc))
+          for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
+      } else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
+        // `open M` brings M's submodules into bare scope -- collect now (before
+        // type declarations referencing them are checked).
+        if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc))
+          for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
       } else if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
         for (auto& b : sv->bindings) collect_bound_modules_expr(*b.expr);
       } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc)) {
@@ -1972,10 +1990,10 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
 static void run_checker(Checker& ck, const ast::Structure& s) {
   ck.register_predef_ctors();
   ck.register_stdlib_ctors();
+  ck.collect_bound_modules(s);  // pre-collect bound module names (before type checks)
   register_types_rec(ck, s);
   ck.finalize_fields();
   ck.check_cyclic_aliases();
-  ck.collect_bound_modules(s);  // pre-collect locally-bound module names
   ck.process_items(s);
 }
 
