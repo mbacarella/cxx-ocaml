@@ -2328,6 +2328,11 @@ struct Translator {
           Ident id = fresh(var->name.txt);
           l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
+        } else if (auto* up = std::get_if<Ppat_unpack>(&pat->desc); up && up->name.txt) {
+          Ident id = fresh(*up->name.txt);  // `(module X)`: a first-class-module param
+          l->params.push_back({id, ValueKind::Gen});
+          scope.back()[*up->name.txt] = id;
+          module_ident_[*up->name.txt] = id;
         } else if (is_irrefutable(*pat)) {
           Ident pid = fresh("param");
           l->params.push_back({pid, pat_kind(pat)});
@@ -2652,15 +2657,19 @@ struct Translator {
         continue;
       }
       if (auto* pin = std::get_if<Pstr_include>(&it.desc)) {  // include ME
-        // Evaluate ME (bound to `include/N` for its effects), then splice its
-        // exported value fields into this structure (as field reads of include/N).
+        // Splice ME's exported value fields into this structure.  A pure path
+        // (an already-evaluated module) needs no binding; a computation (e.g. a
+        // functor application) is bound to `include/N` first for its effect.
         LamPtr mv = compile_module_expr(pin->expr);
-        Ident iid = fresh("include");
-        cur.push_back({iid, ValueKind::Gen, mv});
+        LamPtr base = mv;
+        if (!is_pure_path(mv)) {
+          Ident iid = fresh("include");
+          cur.push_back({iid, ValueKind::Gen, mv});
+          auto v = mk(Lam::K::Var); v->var = iid; base = v;
+        }
         auto rl = module_result_layout(pin->expr);
         for (int i = 0; i < (int)rl.size(); ++i) {
-          auto v = mk(Lam::K::Var); v->var = iid;
-          auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm; fi->prim_arg = i; fi->args = {v};
+          auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm; fi->prim_arg = i; fi->args = {base};
           add_export_val(rl[i], fi);
         }
         continue;
