@@ -845,6 +845,31 @@ struct Translator {
     return nullptr;
   }
 
+  // A primitive used as a first-class value is eta-expanded to a `stub` function
+  // applying the underlying C call: `compare` -> `(function prim prim stub
+  // (caml_compare prim prim))`.  Returns null for prims we don't C-call this way.
+  LamPtr prim_stub(const StdPrim& p) {
+    static const std::unordered_map<std::string, std::string> poly = {
+      {"%compare", "caml_compare"}, {"%equal", "caml_equal"},
+      {"%notequal", "caml_notequal"}, {"%lessthan", "caml_lessthan"},
+      {"%lessequal", "caml_lessequal"}, {"%greaterthan", "caml_greaterthan"},
+      {"%greaterequal", "caml_greaterequal"},
+    };
+    std::string cname;
+    if (auto it = poly.find(p.name); it != poly.end()) cname = it->second;
+    else if (!p.name.empty() && p.name[0] != '%') cname = p.name;  // a C external
+    else return nullptr;
+    int arity = p.arity > 0 ? p.arity : 2;
+    auto fn = mk(Lam::K::Function); fn->inline_attr = "stub";
+    auto call = mk(Lam::K::Prim); call->prim = Prim::Ccall; call->prim_id = cname;
+    for (int i = 0; i < arity; ++i) {
+      Ident pp = fresh("prim");
+      fn->params.push_back({pp, ValueKind::Gen});
+      auto v = mk(Lam::K::Var); v->var = pp; call->args.push_back(v);
+    }
+    fn->body = call;
+    return fn;
+  }
   LamPtr prim_to_lam(const std::string& prim, int arity, const Pexp_apply& ap, const Expression& e) {
     auto& as = ap.args;
     auto args = [&] {
@@ -2018,6 +2043,8 @@ struct Translator {
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
         auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
+        if (auto pi = stdlib_prims.find(l->name); pi != stdlib_prims.end())  // prim as value
+          if (LamPtr s = prim_stub(pi->second)) return s;
         // an `open M` brings M's exported values into scope (innermost first)
         for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
           if (LamPtr base = module_base(*it)) {  // local module (binding or alias)
