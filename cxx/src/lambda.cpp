@@ -852,6 +852,39 @@ struct Translator {
         return pr;
       }
     }
+    // Pervasive arithmetic primitives reached module-qualified (Int.add = %addint,
+    // Float.add = %addfloat, Float.of_int = %floatofint, ...): emit their operator
+    // forms, the same way the unqualified pervasives do.
+    {
+      static const std::unordered_map<std::string, std::string> parith = {
+        {"%addint", "+"}, {"%subint", "-"}, {"%mulint", "*"}, {"%divint", "/"},
+        {"%modint", "mod"}, {"%negint", "~-"}, {"%andint", "land"}, {"%orint", "lor"},
+        {"%xorint", "lxor"}, {"%lslint", "lsl"}, {"%lsrint", "lsr"}, {"%asrint", "asr"},
+        {"%addfloat", "+."}, {"%subfloat", "-."}, {"%mulfloat", "*."}, {"%divfloat", "/."},
+        {"%negfloat", "~-."}, {"%floatofint", "float_of_int"}, {"%intoffloat", "int_of_float"},
+      };
+      if (auto pi = parith.find(prim); pi != parith.end() && (int)as.size() == arity) {
+        Prim p;
+        if (int_op(pi->second, p)) {
+          auto pr = mk(Lam::K::Prim); pr->prim = p; pr->args = args(); return pr;
+        }
+        if (auto pp = pervasive_prim(pi->second); !pp.first.empty()) return op(pp.first);
+      }
+    }
+    // Boxed-integer primitives (`%int32_add`, `%int64_mul`, `%nativeint_sub`, ...)
+    // print `Int32.add` etc. -- the module-qualified operation name (the suffix
+    // after the prefix, e.g. add / sub / mul / div / mod / of_int / to_int / lsl).
+    {
+      static const std::pair<std::string, std::string> bint[] = {
+        {"%int32_", "Int32."}, {"%int64_", "Int64."}, {"%nativeint_", "Nativeint."}};
+      for (auto& [pfx, mod] : bint)
+        if (prim.rfind(pfx, 0) == 0 && (int)as.size() == arity) {
+          auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall;
+          pr->prim_id = mod + prim.substr(pfx.size());
+          pr->args = args();
+          return pr;
+        }
+    }
     // A C-external (non-`%`) primitive applied at its full arity -> a C call.
     if (!prim.empty() && prim[0] != '%' && (int)as.size() == arity) {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = prim;
