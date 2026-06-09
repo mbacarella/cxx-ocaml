@@ -1437,6 +1437,17 @@ struct Checker {
             }
           }
         }
+    // Only argument-check a callee whose type we trust: a pervasive/stdlib value
+    // (a bare operator like `+` resolved from stdlib, not shadowed locally).  A
+    // local function's inferred type may be wrong (GADTs, abstract types), so
+    // flagging its arguments would false-reject.
+    bool reliable_callee = false;
+    if (auto* id = std::get_if<Pexp_ident>(&a.fn->desc))
+      if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
+        bool local = false;
+        for (auto& sc : venv) if (sc.count(l->name)) { local = true; break; }
+        reliable_callee = !local && stdlib_schemes().count(l->name);
+      }
     // Collect the function's known arrow spine.
     std::vector<TypePtr> spine;
     TypePtr cur = I::Engine::repr(ft);
@@ -1467,6 +1478,11 @@ struct Checker {
         used[idx] = true;
         if (idx > maxc) maxc = idx;
         TypePtr at = infer_expr_expected(*arg, spine[idx]->dom);
+        // Restrict to a literal-constant argument: its type is certain, whereas a
+        // GADT/abstract-typed expression argument may be mis-inferred.
+        if (strict && reliable_callee && std::holds_alternative<Pexp_constant>(arg->desc) &&
+            builtin_clash(at, spine[idx]->dom))
+          note_error("This expression has a type that clashes with the expected type");
         soft_unify(spine[idx]->dom, at);  // propagate; genuine errors via expected_clash
       }
       // result = unconsumed params chained onto the tail, erasing any leading
@@ -1732,6 +1748,34 @@ struct Checker {
   // builtins (int vs string, float vs int).  Pure, no mutation.  Used to apply a
   // declared/expected type without the full structural unify that incomplete
   // inference trips on.
+  // A stricter clash than expected_clash for argument positions: fire ONLY on a
+  // reliable-builtin mismatch (int vs string, float vs int, ...), recursing into
+  // same-head constructors/arrows/tuples.  Never on differing stamps -- those
+  // include GADT-refined and locally-abstract types that instantiate at the call,
+  // so flagging them would false-reject valid code.
+  static bool builtin_clash(const TypePtr& a0, const TypePtr& b0) {
+    TypePtr a = I::Engine::repr(a0), b = I::Engine::repr(b0);
+    auto last = [](const std::string& p) {
+      auto d = p.rfind('.'); return d == std::string::npos ? p : p.substr(d + 1);
+    };
+    if (a->kind == I::Type::Kind::Constr && b->kind == I::Type::Kind::Constr) {
+      if (reliable_builtin(a->path) && reliable_builtin(b->path) &&
+          last(a->path) != last(b->path))
+        return true;
+      if (last(a->path) == last(b->path)) {  // same head: compare arguments
+        size_t n = std::min(a->args.size(), b->args.size());
+        for (size_t i = 0; i < n; ++i) if (builtin_clash(a->args[i], b->args[i])) return true;
+      }
+      return false;
+    }
+    if (a->kind == I::Type::Kind::Arrow && b->kind == I::Type::Kind::Arrow)
+      return builtin_clash(a->dom, b->dom) || builtin_clash(a->cod, b->cod);
+    if (a->kind == I::Type::Kind::Tuple && b->kind == I::Type::Kind::Tuple) {
+      size_t n = std::min(a->args.size(), b->args.size());
+      for (size_t i = 0; i < n; ++i) if (builtin_clash(a->args[i], b->args[i])) return true;
+    }
+    return false;
+  }
   static bool expected_clash(const TypePtr& a0, const TypePtr& b0) {
     TypePtr a = I::Engine::repr(a0), b = I::Engine::repr(b0);
     if (a->kind == I::Type::Kind::Constr && b->kind == I::Type::Kind::Constr) {
