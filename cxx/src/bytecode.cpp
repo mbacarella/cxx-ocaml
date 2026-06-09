@@ -220,7 +220,7 @@ struct Bytegen {
       case Prim::EqInt: return I(Op::Eqint);
       case Prim::Offsetref: return Iop(Op::Offsetref, e->prim_arg);
       case Prim::Offsetint: return Iop(Op::Offsetint, e->prim_arg);
-      case Prim::Ccall: { Instr i = I(Op::Ccall); i.str = e->prim_id; i.a = (int)e->args.size(); return i; }
+      case Prim::Ccall: return cc(bint_cname(e->prim_id), (int)e->args.size());
       case Prim::IntCmp: return intcmp_or_ccall(e);
       default: break;
     }
@@ -231,6 +231,26 @@ struct Bytegen {
   // that lowers to a C call.
   Instr cc(const std::string& name, int n) {
     Instr i = I(Op::Ccall); i.str = name; i.a = n; return i;
+  }
+  // A Ccall prim_id printed by printlambda as a module-qualified name maps to its
+  // runtime C primitive: `Int32.add` -> caml_int32_add (shifts are renamed).
+  static std::string bint_cname(const std::string& s) {
+    static const std::unordered_map<std::string, std::string> op = {
+      {"add", "add"}, {"sub", "sub"}, {"mul", "mul"}, {"div", "div"}, {"mod", "mod"},
+      {"and", "and"}, {"or", "or"}, {"xor", "xor"}, {"neg", "neg"},
+      {"lsl", "shift_left"}, {"lsr", "shift_right_unsigned"}, {"asr", "shift_right"},
+      {"of_int", "of_int"}, {"to_int", "to_int"},
+    };
+    for (const char* m : {"Int32.", "Int64.", "Nativeint."})
+      if (s.rfind(m, 0) == 0) {
+        std::string mod(m, strlen(m) - 1);
+        for (auto& c : mod) c = (char)std::tolower((unsigned char)c);
+        std::string suf = s.substr(strlen(m));
+        if (auto it = op.find(suf); it != op.end()) return "caml_" + mod + "_" + it->second;
+        if (suf == "==") return "caml_equal";
+        return s;
+      }
+    return s;
   }
   Instr intcmp_or_ccall(const LamPtr& e) {
     const std::string& s = e->prim_id;
@@ -259,24 +279,11 @@ struct Bytegen {
       if (o == "unsafe_set")
         return flt ? cc("caml_floatarray_unsafe_set", n)
              : gen ? cc("caml_array_unsafe_set", n) : I(Op::Setvectitem);
-      if (o == "get") return cc(flt ? "caml_floatarray_get" : "caml_array_get", n);
-      if (o == "set") return cc(flt ? "caml_floatarray_set" : "caml_array_set_addr", n);
+      if (o == "get")
+        return cc(flt ? "caml_floatarray_get" : gen ? "caml_array_get" : "caml_array_get_addr", n);
+      if (o == "set")
+        return cc(flt ? "caml_floatarray_set" : gen ? "caml_array_set" : "caml_array_set_addr", n);
     }
-    // Boxed integers (`Int32.add` -> caml_int32_add, with a few non-uniform names).
-    static const std::unordered_map<std::string, std::string> bint_op = {
-      {"add", "add"}, {"sub", "sub"}, {"mul", "mul"}, {"div", "div"}, {"mod", "mod"},
-      {"and", "and"}, {"or", "or"}, {"xor", "xor"}, {"neg", "neg"},
-      {"lsl", "shift_left"}, {"lsr", "shift_right_unsigned"}, {"asr", "shift_right"},
-      {"of_int", "of_int"}, {"to_int", "to_int"},
-    };
-    for (const char* m : {"Int32.", "Int64.", "Nativeint."})
-      if (s.rfind(m, 0) == 0) {
-        std::string mod = std::string(m, strlen(m) - 1);  // "Int32"
-        for (auto& c : mod) c = (char)std::tolower((unsigned char)c);
-        auto bo = bint_op.find(s.substr(strlen(m)));
-        if (bo != bint_op.end()) return cc("caml_" + mod + "_" + bo->second, n);
-        if (s.substr(strlen(m)) == "==") return cc("caml_equal", n);
-      }
     static const std::unordered_map<std::string, std::string> ccall = {
       {"+.", "caml_add_float"}, {"-.", "caml_sub_float"}, {"*.", "caml_mul_float"},
       {"/.", "caml_div_float"}, {"~.", "caml_neg_float"}, {"abs.", "caml_abs_float"},
