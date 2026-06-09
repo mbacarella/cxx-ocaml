@@ -758,6 +758,44 @@ struct Translator {
     } catch (...) {}
     return fs;
   }
+  // The argument labels of a stdlib value's type, in order (0 Nolabel /
+  // 1 Labelled / 2 Optional), so a call can insert defaults for omitted optionals.
+  std::vector<int> stdlib_value_labels(const std::string& mod, const std::string& name) {
+    std::vector<int> labels;
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& v : cmi.values())
+        if (v.name == name) {
+          cmi::TypePtr t = v.type;
+          while (t) {
+            while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst))
+              t = t->link;
+            if (!t || t->kind != cmi::TypeExpr::Tarrow) break;
+            labels.push_back(t->label_kind);
+            t = t->cod;
+          }
+          break;
+        }
+    } catch (...) {}
+    return labels;
+  }
+  // Build `(apply fn args..)` inserting `0` (None) for each omitted optional
+  // parameter the application passes; null if not applicable (no optionals, or a
+  // labeled argument, which we don't match precisely).
+  LamPtr apply_optionals(const Pexp_apply& ap, const std::vector<int>& labels) {
+    if (std::find(labels.begin(), labels.end(), 2) == labels.end()) return nullptr;
+    for (auto& a : ap.args) if (!std::holds_alternative<Nolabel>(a.first)) return nullptr;
+    std::vector<LamPtr> args;
+    size_t ai = 0, remaining = ap.args.size();
+    for (size_t pi = 0; pi < labels.size() && remaining > 0; ++pi) {
+      if (labels[pi] == 2) args.push_back(cint(0));  // omitted optional -> None
+      else { args.push_back(expr(*ap.args[ai].second)); ++ai; --remaining; }
+    }
+    for (; ai < ap.args.size(); ++ai) args.push_back(expr(*ap.args[ai].second));  // over-app
+    auto a = mk(Lam::K::Apply); a->fn = expr(*ap.fn); a->args = std::move(args);
+    return a;
+  }
   // Whether a pure path bottoms out in a global (a stdlib module) rather than a
   // local Var -- a global functor/argument is wrapped in `(let (let/N = p) ..)`.
   static bool is_global_path(const LamPtr& l) {
@@ -2299,6 +2337,15 @@ struct Translator {
               if (auto p = value_prim(*it, n); !p.name.empty())
                 if (auto r = prim_to_lam(p.name, p.arity, *ap, e)) return r;
           }
+      // A call to a stdlib function with optional parameters inserts `0` (None)
+      // for each omitted optional the application passes (`Hashtbl.create 16` ->
+      // `(apply create 0 16)`).
+      if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
+        if (auto* d = std::get_if<Ldot>(&fid->id.txt.v))
+          if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+            if (!module_base(pl->name) && !fields_of(pl->name).empty())
+              if (auto r = apply_optionals(*ap, stdlib_value_labels(pl->name, d->name)))
+                return r;
       auto a = mk(Lam::K::Apply);
       a->fn = expr(*ap->fn);
       for (auto& [lbl, arg] : ap->args) a->args.push_back(expr(*arg));
