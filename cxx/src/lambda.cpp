@@ -2646,8 +2646,10 @@ struct Translator {
     if (!fval) fval = compile_module_expr(*pa.f);
     LamPtr aval = compile_module_expr(*pa.arg);
     LamPtr acoerced = aval;
-    if (!param.empty() && param != arg_layout(*pa.arg)) {  // project to the param sig
-      auto alay = arg_layout(*pa.arg);
+    auto alay = arg_layout(*pa.arg);
+    // Project only when the argument's layout is known and differs from the
+    // parameter signature; an unknown layout (e.g. a struct literal) is passed as is.
+    if (!param.empty() && !alay.empty() && param != alay) {
       std::vector<LamPtr> fs;
       for (auto& nm : param) {
         int idx = 0;
