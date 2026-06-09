@@ -287,7 +287,11 @@ struct Checker {
     // (it may be a sibling/external module we can't load -- never false-reject).
     if (auto* d = std::get_if<Ldot>(&lid.v)) {
       auto& ex = module_values_cached(*d->prefix);
-      if (ex.empty()) return eng.any();   // module unresolvable: stay dynamic
+      if (ex.empty()) {  // module unresolvable
+        if (strict && module_head_unbound(*d->prefix))  // genuinely unbound -> error
+          note_error("Unbound module " + mod_components(*d->prefix).front());
+        return eng.any();   // else stay dynamic (a module we just can't load)
+      }
       if (auto f = ex.find(d->name); f != ex.end())
         return eng.instantiate(f->second);  // present: use its real type
       if (strict) note_error("Unbound value " + lid_full(lid));  // genuinely absent
@@ -296,6 +300,58 @@ struct Checker {
     return eng.any();
   }
 
+  // Whether a stdlib (sub)module's cmi is loadable (cached): the head module of a
+  // path is bound if its cmi exists, or it is a local module / functor.
+  std::unordered_map<std::string, bool> cmi_exists_cache_;
+  bool cmi_module_loads(const std::string& head) {
+    auto it = cmi_exists_cache_.find(head);
+    if (it != cmi_exists_cache_.end()) return it->second;
+    bool ok = false;
+    try {
+      cmi::CmiFile::load(head == "Stdlib" ? "stdlib/stdlib.cmi"
+                                          : "stdlib/stdlib__" + head + ".cmi");
+      ok = true;
+    } catch (...) {}
+    return cmi_exists_cache_[head] = ok;
+  }
+  // Names brought into bare module scope by `open M` / `include M` (M's submodules)
+  // -- so a reference to one of them is not flagged unbound.
+  std::set<std::string> opened_submodules_;
+  // The head module of a path is unbound: not a local module/functor, not opened,
+  // and no loadable cmi.  Conservative -- used only to record a soundness error.
+  // Module names bound somewhere in this file that the value resolution doesn't
+  // track (recursive modules, first-class-module params/unpacks): collected so a
+  // reference to one is never flagged unbound (over-inclusion only loses recall).
+  std::set<std::string> bound_module_names_;
+  bool module_head_unbound(const Longident& m) {
+    auto comps = mod_components(m);
+    if (comps.empty()) return false;
+    const std::string& head = comps[0];
+    if (modenv.count(head) || functor_env.count(head)) return false;
+    if (opened_submodules_.count(head) || bound_module_names_.count(head)) return false;
+    return !cmi_module_loads(head);
+  }
+  // The submodule names of a (cmi-resolvable) module path, so `open M` / `include
+  // M` can bring them into bare scope (e.g. `open Bigarray` -> Array1, Array2..).
+  std::set<std::string> module_submodule_names(const Longident& m) {
+    std::set<std::string> out;
+    auto comps = mod_components(m);
+    if (comps.empty()) return out;
+    try {
+      const std::string& head = comps[0];
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(head == "Stdlib" ? cmi::CmiFile::load("stdlib/stdlib.cmi")
+                                        : cmi::CmiFile::load("stdlib/stdlib__" + head + ".cmi"));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (sig) for (auto& mm : sig->modules) out.insert(mm.name);
+    } catch (...) {}
+    return out;
+  }
   // resolve_module_values memoized by module path (cmi loads are expensive and a
   // file may reference M.x many times).
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modvals_cache_;
@@ -1772,6 +1828,61 @@ struct Checker {
     for (auto& it : items) process_item(it);
   }
 
+  // Pre-pass: collect every module name bound in the file (modules, recursive
+  // modules, functor parameters, first-class-module parameters/unpacks) so the
+  // unbound-module check never flags one.  Over-inclusion only loses recall.
+  void collect_bound_modules(const ast::Structure& items) {
+    for (auto& it : items) {
+      if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+        if (mb->binding.name.txt) bound_module_names_.insert(*mb->binding.name.txt);
+        collect_bound_modules_me(mb->binding.expr);
+      } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
+        for (auto& b : rm->bindings) {
+          if (b.name.txt) bound_module_names_.insert(*b.name.txt);
+          collect_bound_modules_me(b.expr);
+        }
+      } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
+        collect_bound_modules_me(in->expr);
+      } else if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
+        for (auto& b : sv->bindings) collect_bound_modules_expr(*b.expr);
+      } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc)) {
+        collect_bound_modules_expr(*ev->e);
+      }
+    }
+  }
+  void collect_bound_modules_me(const ModuleExpr& me) {
+    if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) {
+      if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->name.txt)
+        bound_module_names_.insert(*fp->name.txt);
+      collect_bound_modules_me(*pf->body);
+    } else if (auto* ps = std::get_if<Pmod_structure>(&me.desc)) {
+      collect_bound_modules(ps->items);
+    } else if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
+      collect_bound_modules_me(*pc->me);
+    }
+  }
+  // Walk an expression for module-binding sites: `let module M = ..`, first-class
+  // module function parameters `(module P : S)`, and nested functions/lets.
+  void collect_bound_modules_expr(const Expression& e) {
+    if (auto* fn = std::get_if<Pexp_function>(&e.desc)) {
+      for (auto& p : fn->params)
+        if (auto* pv = std::get_if<Pparam_val>(&p.desc)) {
+          const Pattern* pat = &pv->pat;
+          while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) pat = pc->p.get();
+          if (auto* up = std::get_if<Ppat_unpack>(&pat->desc); up && up->name.txt)
+            bound_module_names_.insert(*up->name.txt);
+        }
+      if (auto* b = std::get_if<Pfunction_body>(&fn->body->v)) collect_bound_modules_expr(*b->e);
+    } else if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
+      if (auto* mb = std::get_if<Pstr_module>(&si->item->desc))
+        if (mb->binding.name.txt) bound_module_names_.insert(*mb->binding.name.txt);
+      collect_bound_modules_expr(*si->body);
+    } else if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
+      for (auto& b : le->bindings) collect_bound_modules_expr(*b.expr);
+      collect_bound_modules_expr(*le->body);
+    }
+  }
+
   void process_item(const StructureItem& it) {
     {
       try {
@@ -1789,6 +1900,8 @@ struct Checker {
           infer_expr(*ev->e);
         else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
+          if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc))  // open M -> M's submodules
+            for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
         } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
           if (mb->binding.name.txt) {
             // A functor: record its body's exports as the application result.
@@ -1814,6 +1927,8 @@ struct Checker {
           }
         } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
           for (auto& [k, v] : module_exports(in->expr)) venv.back()[k] = v;
+          if (auto* pi = std::get_if<Pmod_ident>(&in->expr.desc))  // include M -> M's submodules
+            for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
         } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
           if (pr->prim.type) {  // external f : t = "..." binds f : t
             std::unordered_map<std::string, TypePtr> vars;
@@ -1860,6 +1975,7 @@ static void run_checker(Checker& ck, const ast::Structure& s) {
   register_types_rec(ck, s);
   ck.finalize_fields();
   ck.check_cyclic_aliases();
+  ck.collect_bound_modules(s);  // pre-collect locally-bound module names
   ck.process_items(s);
 }
 
