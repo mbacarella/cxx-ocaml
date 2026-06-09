@@ -2221,12 +2221,25 @@ struct Translator {
                 pr->args = {expr(*as[0].second), expr(*as[1].second)};
                 return pr;
               }
+              LamPtr e0 = expr(*as[0].second), e1 = expr(*as[1].second);
               // The operand kind drives the spelling: int -> `==`, float -> `==.`,
               // int64/int32/nativeint -> `Int64.==` etc.; two generics fall back to
               // the polymorphic caml_* compare.
               ValueKind k = ValueKind::Gen;
               for (ValueKind kk : {expr_kind(as[0].second.get()), expr_kind(as[1].second.get())})
                 if (kk != ValueKind::Gen) k = kk;
+              // Equality with an immediate constant of a generic type (`x = None`,
+              // `x = []`) is physical -- comparing any value with an immediate is the
+              // `==`/`!=` int test.  Only when the kind is generic: a boxed-int
+              // literal (`0n`/`0l`/`0L`) is ConstInt too but keeps its `Int64.==`
+              // spelling, which the kind path below provides.
+              auto is_imm = [](const LamPtr& l) {
+                return l->k == Lam::K::ConstInt || l->k == Lam::K::ConstChar;
+              };
+              if (k == ValueKind::Gen && (n == "=" || n == "<>") && (is_imm(e0) || is_imm(e1))) {
+                auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = c.first;
+                pr->args = {e0, e1}; return pr;
+              }
               auto pr = mk(Lam::K::Prim);
               if (k == ValueKind::Gen) { pr->prim = Prim::Ccall; pr->prim_id = c.second; }
               else {
@@ -2237,7 +2250,7 @@ struct Translator {
                             : k == ValueKind::Boxedint32 ? "Int32." + c.first
                             : "Nativeint." + c.first;
               }
-              pr->args = {expr(*as[0].second), expr(*as[1].second)};
+              pr->args = {e0, e1};
               return pr;
             }
             // Physical equality and short-circuit boolean ops are always inlined.
