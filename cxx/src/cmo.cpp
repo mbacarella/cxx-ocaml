@@ -188,6 +188,14 @@ struct Emitter {
       case Op::Getvectitem: out(GETVECTITEM); break;
       case Op::Setvectitem: out(SETVECTITEM); break;
       case Op::Getstringchar: out(GETSTRINGCHAR); break;
+      case Op::Vectlength: out(VECTLENGTH); break;
+      case Op::Makefloatblock: out(MAKEFLOATBLOCK); out_int(in.a); break;
+      case Op::Getfloatfield: out(GETFLOATFIELD); out_int(in.a); break;
+      case Op::Setfloatfield: out(SETFLOATFIELD); out_int(in.a); break;
+      case Op::Getbyteschar: out(GETBYTESCHAR); break;
+      case Op::Setbyteschar: out(SETBYTESCHAR); break;
+      case Op::Physeq: out(EQ); break;     // physical == uses the EQ opcode
+      case Op::Physneq: out(NEQ); break;   // physical != uses the NEQ opcode
       case Op::Branch: out(BRANCH); out_label(in.a); break;
       case Op::Branchif: out(BRANCHIF); out_label(in.a); break;
       case Op::Branchifnot: out(BRANCHIFNOT); out_label(in.a); break;
