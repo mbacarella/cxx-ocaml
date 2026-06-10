@@ -220,6 +220,7 @@ struct Emitter {
       case Op::Offsetint: out(OFFSETINT); out_int(in.a); break;
       case Op::Offsetref: out(OFFSETREF); out_int(in.a); break;
       case Op::Isint: out(ISINT); break;
+      case Op::Perform: out(PERFORM); break;
       case Op::Isout: out(ULTINT); break;
       case Op::Stop: out(STOP); break;
       default: break;

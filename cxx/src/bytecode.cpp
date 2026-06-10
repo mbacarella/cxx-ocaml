@@ -246,6 +246,15 @@ struct Bytegen {
       {"and", "and"}, {"or", "or"}, {"xor", "xor"}, {"neg", "neg"},
       {"lsl", "shift_left"}, {"lsr", "shift_right_unsigned"}, {"asr", "shift_right"},
       {"of_int", "of_int"}, {"to_int", "to_int"},
+      {"to_int32", "to_int32"}, {"of_int32", "of_int32"},
+      {"of_nativeint", "of_nativeint"}, {"to_nativeint", "to_nativeint"},
+      {"bswap", "bswap"},
+    };
+    // Pbintcomp compiles to the *generic* compare primitives (bytegen).
+    static const std::unordered_map<std::string, std::string> cmp = {
+      {"==", "caml_equal"}, {"!=", "caml_notequal"},
+      {"<", "caml_lessthan"}, {">", "caml_greaterthan"},
+      {"<=", "caml_lessequal"}, {">=", "caml_greaterequal"},
     };
     for (const char* m : {"Int32.", "Int64.", "Nativeint."})
       if (s.rfind(m, 0) == 0) {
@@ -253,7 +262,7 @@ struct Bytegen {
         for (auto& c : mod) c = (char)std::tolower((unsigned char)c);
         std::string suf = s.substr(strlen(m));
         if (auto it = op.find(suf); it != op.end()) return "caml_" + mod + "_" + it->second;
-        if (suf == "==") return "caml_equal";
+        if (auto it = cmp.find(suf); it != cmp.end()) return it->second;
         return s;
       }
     return s;
@@ -303,6 +312,8 @@ struct Bytegen {
       {"bytes.set", "caml_bytes_set"},
     };
     if (auto it = ccall.find(s); it != ccall.end()) return cc(it->second, n);
+    // boxed-int comparisons arrive as IntCmp with a module-qualified prim_id
+    if (std::string b = bint_cname(s); b != s) return cc(b, n);
     return cc("?" + s, n);
   }
 
@@ -430,6 +441,13 @@ struct Bytegen {
             Instr mb = I(Op::Makeblock); mb.a = (int)exp->args.size(); mb.b = exp->prim_arg;
             return comp_args(env, exp->args, sz, cons(mb, cont));
           }
+          case Prim::Ccall:
+            if (exp->prim_id == "perform" && exp->args.size() == 1) {
+              // Kperform pushes 4 words (bytegen's check_stack (sz + 4))
+              if (sz + 4 > max_stack_) max_stack_ = sz + 4;
+              return comp_expr(env, exp->args[0], sz, cons(I(Op::Perform), cont));
+            }
+            break;
           case Prim::Raise:
             return comp_expr(env, exp->args[0], sz, cons(I(Op::Raise), discard_dead_code(cont)));
           case Prim::Reraise:
@@ -760,6 +778,7 @@ std::string instr_text(const Instr& i) {
     case Op::Offsetint: return "\toffsetint " + n(i.a);
     case Op::Offsetref: return "\toffsetref " + n(i.a);
     case Op::Isint: return "\tisint";
+    case Op::Perform: return "\tperform";
     case Op::Isout: return "\tisout";
     case Op::Stop: return "\tstop";
     default: return "\t?";
