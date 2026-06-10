@@ -158,6 +158,13 @@ struct Bytegen {
         fvs(e->body, b, out);
         return;
       }
+      case K::Letrec: {  // all the rec idents are in scope in every RHS
+        std::set<int> b = bound;
+        for (auto& bd : e->bindings) b.insert(bd.id.stamp);
+        for (auto& bd : e->bindings) fvs(bd.val, b, out);
+        fvs(e->body, b, out);
+        return;
+      }
       case K::Function: {
         std::set<int> b = bound;
         for (auto& p : e->params) b.insert(p.first.stamp);

@@ -1514,16 +1514,20 @@ struct Translator {
   // Compile a match into an if-chain (int constants + catch-all) or a bool if;
   // other forms (variant tags, nested patterns, guards) fall back best-effort.
   // Count / substitute occurrences of a binder in a (freshly-built) Lambda tree.
-  static int count_var(const LamPtr& l, const Ident& id) {
+  // A use under a lambda weighs 2 (simplif's use_var on a var not locally bound:
+  // enough that single-use inlining does not apply -- the closure may run often).
+  static int count_var(const LamPtr& l, const Ident& id, int w = 1) {
     if (!l) return 0;
     if (l->k == Lam::K::Var)
-      return (l->var.stamp == id.stamp && l->var.name == id.name) ? 1 : 0;
-    int c = count_var(l->fn, id) + count_var(l->body, id) + count_var(l->cond, id) +
-            count_var(l->then_, id) + count_var(l->else_, id) + count_var(l->sw_default, id);
-    for (auto& a : l->args) c += count_var(a, id);
-    for (auto& b : l->bindings) c += count_var(b.val, id);
-    for (auto& sc : l->sw_consts) c += count_var(sc.body, id);
-    for (auto& sc : l->sw_blocks) c += count_var(sc.body, id);
+      return (l->var.stamp == id.stamp && l->var.name == id.name) ? w : 0;
+    int wb = l->k == Lam::K::Function ? 2 : w;
+    int c = count_var(l->fn, id, w) + count_var(l->body, id, wb) +
+            count_var(l->cond, id, w) + count_var(l->then_, id, w) +
+            count_var(l->else_, id, w) + count_var(l->sw_default, id, w);
+    for (auto& a : l->args) c += count_var(a, id, w);
+    for (auto& b : l->bindings) c += count_var(b.val, id, w);
+    for (auto& sc : l->sw_consts) c += count_var(sc.body, id, w);
+    for (auto& sc : l->sw_blocks) c += count_var(sc.body, id, w);
     return c;
   }
   static void subst_var(LamPtr& l, const Ident& id, const LamPtr& repl) {
