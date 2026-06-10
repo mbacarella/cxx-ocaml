@@ -444,12 +444,10 @@ struct Bytegen {
               return comp_seq_and(env, exp->args[0], exp->args[1], sz, cont);
             if (exp->prim_id == "||" && exp->args.size() == 2)
               return comp_seq_or(env, exp->args[0], exp->args[1], sz, cont);
-            if (exp->prim_id == "ignore" && exp->args.size() == 1) {
-              // (ignore x): evaluate x for effect, then the result is unit.
-              auto unit = std::make_shared<Lam>(); unit->k = K::ConstInt; unit->int_val = 0;
-              Instr k = I(Op::Const); k.cst = unit;
-              return comp_expr(env, exp->args[0], sz, cons(k, cont));
-            }
+            if (exp->prim_id == "ignore" && exp->args.size() == 1)
+              // (ignore x): evaluate x for effect; the unit result is elided when
+              // the continuation immediately reloads the accumulator (add_const_unit).
+              return comp_expr(env, exp->args[0], sz, add_const_unit(cont));
             if (exp->prim_id == "opaque" && exp->args.size() == 1)
               return comp_expr(env, exp->args[0], sz, cont);  // identity: no instruction
             // (Pintcomp c [arg; const]) -> reorder to [const; arg] and swap the
