@@ -2146,6 +2146,98 @@ struct Translator {
       p = fps[0];
     }
   }
+  // Flatten a (possibly nested) or-pattern into its leaf alternatives.
+  void flatten_or(const Pattern* p, std::vector<const Pattern*>& alts) {
+    p = effective_pat(p);
+    if (auto* po = std::get_if<Ppat_or>(&p->desc)) {
+      flatten_or(po->l.get(), alts); flatten_or(po->r.get(), alts);
+    } else alts.push_back(p);
+  }
+  // Variable-name -> field-access for one already-selected constructor arm (no
+  // tag test, no scope binding).  False on a refutable sub-pattern (a constant,
+  // a nested or, ...) so the caller falls back.
+  bool or_accesses(const Pattern& p0, const LamPtr& scrut,
+                   std::vector<std::pair<std::string, LamPtr>>& out) {
+    const Pattern* p = effective_pat(&p0);
+    if (std::holds_alternative<Ppat_any>(p->desc)) return true;
+    if (auto* pv = std::get_if<Ppat_var>(&p->desc)) { out.push_back({pv->name.txt, scrut}); return true; }
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+      out.push_back({pa->name.txt, scrut}); return or_accesses(*pa->p, scrut, out);
+    }
+    if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (size_t i = 0; i < pt->elems.size(); ++i)
+        if (!or_accesses(*pt->elems[i], fieldimm((int)i, scrut), out)) return false;
+      return true;
+    }
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [lbl, sub] : pr->fields) {
+        const FieldInfo* fi = find_field(lid_last(lbl.txt));
+        if (!fi || !or_accesses(*sub, field_read(fi, scrut), out)) return false;
+      }
+      return true;
+    }
+    if (auto* pk = std::get_if<Ppat_construct>(&p->desc)) {
+      auto ci = ctor_info_.find(ctor_of(*p));
+      if (ci == ctor_info_.end()) return false;
+      auto fps = ctor_field_pats(pk, ci->second.arity);
+      if ((int)fps.size() != ci->second.arity) return false;
+      for (size_t i = 0; i < fps.size(); ++i)
+        if (!or_accesses(*fps[i], fieldimm((int)i, scrut), out)) return false;
+      return true;
+    }
+    return false;  // a refutable / unsupported sub-pattern
+  }
+  // `let (orpat) = e`: an or-pattern of same-type constructor alternatives, each
+  // binding the same variables (possibly at different field positions).  Build a
+  // switch over the scrutinee tag whose arms produce the bound values -- for >1
+  // variable, each arm makes a tuple in the canonical (first-alternative) order,
+  // which the caller projects.  ocamlc instead passes the values out of the
+  // switch as static-exception arguments; the tuple form runs identically.
+  // Returns the switch and var order, or false (the caller keeps its path).
+  // `scrut` must be a variable/temp.
+  bool or_pattern_values(const Pattern& orpat, const LamPtr& scrut, const Location& loc,
+                         std::vector<std::string>& order, LamPtr& result) {
+    std::vector<const Pattern*> alts; flatten_or(&orpat, alts);
+    if (alts.size() < 2) return false;
+    struct Arm { int tag; bool is_block; std::map<std::string, LamPtr> acc; };
+    std::vector<Arm> arms; std::string type;
+    for (auto* a : alts) {
+      const Pattern* ep = effective_pat(a);
+      auto* pk = std::get_if<Ppat_construct>(&ep->desc);
+      if (!pk) return false;
+      auto ci = ctor_info_.find(ctor_of(*ep));
+      if (ci == ctor_info_.end()) return false;
+      if (type.empty()) type = ci->second.type;
+      else if (type != ci->second.type) return false;
+      std::vector<std::pair<std::string, LamPtr>> a2;
+      auto fps = ctor_field_pats(pk, ci->second.arity);
+      if ((int)fps.size() != ci->second.arity) return false;
+      for (size_t i = 0; i < fps.size(); ++i)
+        if (!or_accesses(*fps[i], fieldimm((int)i, scrut), a2)) return false;
+      Arm arm; arm.tag = ci->second.tag; arm.is_block = ci->second.is_block;
+      if (order.empty()) for (auto& [nm, _] : a2) order.push_back(nm);
+      for (auto& [nm, ac] : a2) arm.acc[nm] = ac;
+      if (arm.acc.size() != order.size()) return false;  // alternatives bind different sets
+      arms.push_back(std::move(arm));
+    }
+    if (order.empty()) return false;
+    auto arm_body = [&](Arm& arm) -> LamPtr {
+      if (order.size() == 1) return arm.acc[order[0]];
+      auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+      for (auto& nm : order) blk->args.push_back(arm.acc[nm]);
+      return blk;
+    };
+    auto sw = mk(Lam::K::Switch); sw->cond = scrut;
+    for (auto& arm : arms) {
+      Lam::SwitchCase c{arm.tag, arm_body(arm)};
+      (arm.is_block ? sw->sw_blocks : sw->sw_consts).push_back(c);
+    }
+    auto tc = type_ctors_.find(type);  // non-exhaustive -> Match_failure default
+    if (tc == type_ctors_.end() || (int)arms.size() != tc->second.first + tc->second.second)
+      sw->sw_default = raise_predef("Match_failure", loc);
+    result = sw;
+    return true;
+  }
   // Whether a pattern is irrefutable (always matches): exactly the shapes
   // collect_binders destructures.  Used to decide between field extraction and a
   // partial match (which raises Match_failure on the missing cases).
@@ -3348,6 +3440,33 @@ struct Translator {
         auto& b = le->bindings[0];
         if (!std::holds_alternative<Ppat_var>(b.pat.desc) &&
             !std::holds_alternative<Ppat_any>(b.pat.desc) && !is_irrefutable(b.pat)) {
+          // `let (P1 | P2) = e in body`: an or-pattern binding -- switch into a
+          // tuple of the bound values, project each, then the body.
+          if (const Pattern* ep = effective_pat(&b.pat);
+              std::holds_alternative<Ppat_or>(ep->desc)) {
+            LamPtr v0 = expr(*b.expr); LamPtr scrut = v0; Ident mtmp;
+            if (v0->k != Lam::K::Var) { mtmp = fresh("", true); auto tv = mk(Lam::K::Var); tv->var = mtmp; scrut = tv; }
+            std::vector<std::string> order; LamPtr orval;
+            if (or_pattern_values(*ep, scrut, b.pat.loc, order, orval)) {
+              auto outer = mk(Lam::K::Let);
+              if (v0->k != Lam::K::Var) outer->bindings.push_back({mtmp, ValueKind::Gen, v0});
+              if (order.size() == 1) {
+                Ident vid = fresh(order[0]); scope.back()[order[0]] = vid;
+                outer->bindings.push_back({vid, ValueKind::Gen, orval});
+              } else {
+                Ident tupid = fresh("", true);
+                outer->bindings.push_back({tupid, ValueKind::Gen, orval});
+                auto tv = mk(Lam::K::Var); tv->var = tupid;
+                for (size_t i = 0; i < order.size(); ++i) {
+                  Ident vid = fresh(order[i]); scope.back()[order[i]] = vid;
+                  outer->bindings.push_back({vid, ValueKind::Gen, fieldimm((int)i, tv), true});
+                }
+              }
+              outer->body = expr(*le->body);
+              scope.pop_back();
+              return outer;
+            }
+          }
           LamPtr val = expr(*b.expr);
           auto wrap = mk(Lam::K::Let); LamPtr scrut = val;
           if (val->k != Lam::K::Var) {
@@ -4031,6 +4150,32 @@ struct Translator {
         } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {
           flush(); segs.push_back({true, false, {}, expr(*b.expr)});  // `let _ = e` -> seq
         } else {
+          // `let (P1 | P2) = e`: an or-pattern of constructor alternatives binding
+          // the same variables.  Switch over e's tag into a tuple of the bound
+          // values, then export each component off the tuple.
+          if (const Pattern* ep = effective_pat(&b.pat);
+              std::holds_alternative<Ppat_or>(ep->desc)) {
+            std::vector<std::string> order; LamPtr orval;
+            Ident mtmp = fresh("", true); auto mv = mk(Lam::K::Var); mv->var = mtmp;
+            if (or_pattern_values(*ep, mv, b.pat.loc, order, orval)) {
+              cur.push_back({mtmp, ValueKind::Gen, expr(*b.expr)});
+              if (order.size() == 1) {
+                Ident vid = fresh(order[0]);
+                cur.push_back({vid, ValueKind::Gen, orval});
+                scope.back()[order[0]] = vid; add_export(order[0], vid);
+              } else {
+                Ident tupid = fresh("", true);
+                cur.push_back({tupid, ValueKind::Gen, orval});
+                auto tv = mk(Lam::K::Var); tv->var = tupid;
+                for (size_t i = 0; i < order.size(); ++i) {
+                  Ident vid = fresh(order[i]);
+                  cur.push_back({vid, ValueKind::Gen, fieldimm((int)i, tv), true});
+                  scope.back()[order[i]] = vid; add_export(order[i], vid);
+                }
+              }
+              continue;
+            }
+          }
           // `let (a,b) = e` / `let {x;y} = e`: each component becomes its own export,
           // bound (`=a`) to a field read of e -- directly when e is a variable or a
           // constant block (whose element reads fold to the elements), else via a
