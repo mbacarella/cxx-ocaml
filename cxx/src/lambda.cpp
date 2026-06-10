@@ -2758,6 +2758,33 @@ struct Translator {
           module_layout_[nm] = sav_l;
           return result;
         }
+      // `let exception E [of t] in body`: a fresh exception identity per
+      // evaluation (caml_fresh_oo_id runs each time this expression does), in
+      // scope only over body.  Local exceptions use the bare name string.
+      if (auto* pe = std::get_if<Pstr_exception>(&si->item->desc)) {
+        const std::string& nm = pe->exn.ctor.name.txt;
+        auto str = mk(Lam::K::ConstString); str->str_val = nm;
+        auto oid = mk(Lam::K::Prim); oid->prim = Prim::Ccall;
+        oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
+        blk->args = {str, oid};
+        Ident id = fresh(nm);
+        // save what this local exception shadows, restore after the body
+        bool had_i = exn_ident_.count(nm), had_a = exn_arity_.count(nm);
+        Ident sav_i = had_i ? exn_ident_[nm] : Ident{};
+        int sav_a = had_a ? exn_arity_[nm] : 0;
+        exn_ident_[nm] = id;
+        if (auto* d = std::get_if<Pext_decl>(&pe->exn.ctor.kind))
+          if (auto* t = std::get_if<Pcstr_tuple>(&d->args))
+            exn_arity_[nm] = (int)t->elems.size();
+        rec_spine_ = rec_spine;
+        LamPtr body = expr(*si->body);
+        if (had_i) exn_ident_[nm] = sav_i; else exn_ident_.erase(nm);
+        if (had_a) exn_arity_[nm] = sav_a; else exn_arity_.erase(nm);
+        auto l = mk(Lam::K::Let);
+        l->bindings = {{id, ValueKind::Gen, blk}}; l->body = body;
+        return l;
+      }
       return expr(*si->body);  // other struct-item bodies: best-effort
     }
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) {
