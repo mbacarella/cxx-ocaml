@@ -2931,7 +2931,30 @@ struct Translator {
       }
       l->body = wrap_binders(body, binders);
     } else if (auto* fc = std::get_if<Pfunction_cases>(&f.body->v)) {
-      // `function P -> ...` adds an implicit final parameter matched on.
+      // `function P -> ...` adds an implicit final parameter matched on.  A
+      // single unguarded irrefutable case binds directly like an ordinary
+      // parameter -- no match: `function () -> e` is just the body, and
+      // `function x -> e` names the parameter x.
+      if (fc->cases.size() == 1 && !fc->cases[0].guard) {
+        const Pattern* pat = effective_pat(&fc->cases[0].lhs);
+        if (auto* var = std::get_if<Ppat_var>(&pat->desc)) {
+          Ident id = fresh(var->name.txt);
+          l->params.push_back({id, pat_kind(pat)});
+          scope.back()[var->name.txt] = id;
+          l->body = wrap_binders(expr(*fc->cases[0].rhs), binders);
+          scope.pop_back();
+          return l;
+        }
+        if (is_irrefutable(*pat)) {
+          Ident pid = fresh("param");
+          l->params.push_back({pid, pat_kind(pat)});
+          auto pvar = mk(Lam::K::Var); pvar->var = pid;
+          collect_binders(*pat, pvar, binders);
+          l->body = wrap_binders(expr(*fc->cases[0].rhs), binders);
+          scope.pop_back();
+          return l;
+        }
+      }
       Ident pid = fresh("param");
       l->params.push_back({pid, ValueKind::Gen});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
