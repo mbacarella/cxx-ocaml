@@ -120,7 +120,10 @@ struct Emitter {
   void out_label(int lbl) { out_label_orig(pos(), lbl); }
 
   void slot_literal(const LamPtr& c) { relocs.push_back({Reloc::Literal, "", const_value(c), pos()}); out_int(0); }
-  void slot_getglobal(const std::string& name, bool predef) {
+  void slot_getglobal(const std::string& name0, bool predef) {
+    // The -dinstr name carries a predef's "/stamp" suffix; the reloc wants the
+    // bare identifier (compunit names never contain '/').
+    std::string name = name0.substr(0, name0.find('/'));
     relocs.push_back({predef ? Reloc::GetPredef : Reloc::GetCompunit, name, nullptr, pos()});
     out_int(0);
   }
