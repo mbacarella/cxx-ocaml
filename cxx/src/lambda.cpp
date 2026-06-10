@@ -486,6 +486,13 @@ struct Translator {
   std::unordered_map<std::string, int> predef_global_stamp_;
   int next_exit_ = 0;  // static-exception ids (normalized in the dump, so value is free)
 
+  static bool is_predef_exn_name(const std::string& n) {
+    static const std::set<std::string> s = {
+        "Out_of_memory", "Sys_error", "Failure", "Invalid_argument", "End_of_file",
+        "Division_by_zero", "Not_found", "Match_failure", "Stack_overflow",
+        "Sys_blocked_io", "Assert_failure", "Undefined_recursive_module"};
+    return s.count(n) != 0;
+  }
   // `(global Name/stamp!)` for a predefined exception used by the compiler.  The
   // stamps are OCaml's fixed Predef ident stamps (the lambda dump normalizes them,
   // but -dinstr does not, so the bytecode getglobal needs the exact value).
@@ -2451,9 +2458,17 @@ struct Translator {
         b->args = std::move(fields); b->blk_shape = std::move(shape);
         return b;
       }
-      if (!k->arg)  // a predefined exception (Not_found, ...) is a Stdlib field
-        if (auto sf = stdlib_fields.find(n); sf != stdlib_fields.end())
-          return field_of("Stdlib", sf->second);
+      // a predefined exception (Not_found, ...) is a Stdlib field; applied
+      // (Invalid_argument "X") it builds the block with the identity at field 0
+      if (auto sf = stdlib_fields.find(n); sf != stdlib_fields.end()) {
+        if (!k->arg) return field_of("Stdlib", sf->second);
+        if (is_predef_exn_name(n)) {
+          auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
+          b->args = {field_of("Stdlib", sf->second), expr(**k->arg)};
+          b->blk_shape = {ValueKind::Gen, expr_kind(k->arg->get())};
+          return b;
+        }
+      }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + n);  // user ctor: needs its tag (defer)
       return v;
     }
