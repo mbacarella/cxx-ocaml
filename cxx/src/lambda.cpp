@@ -2317,30 +2317,51 @@ struct Translator {
       return b;
     }
     if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
-      if (!rc->base && !rc->fields.empty())  // not a functional update `{e with ..}`
-        if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt))) {
-          auto rt = rec_types_.find(f0->type);
-          if (rt != rec_types_.end()) {
-            std::vector<LamPtr> vals(rt->second.labels.size());
-            bool ok = vals.size() == rc->fields.size();
-            for (auto& [lid, ve] : rc->fields) {
-              auto* fi = find_field(lid_last(lid.txt));
-              if (!fi || fi->type != f0->type) { ok = false; break; }
-              vals[fi->index] = expr(*ve);
+      if (!rc->base && !rc->fields.empty()) {  // not a functional update `{e with ..}`
+        // Pick the record type: the first label's registered type when the
+        // literal's label set fills it exactly; otherwise any known record type
+        // the label set fills exactly (shared label names -- Effect.Deep's
+        // handler.effc vs effect_handler.effc -- disambiguate by shape).
+        std::set<std::string> labs;
+        for (auto& [lid, ve] : rc->fields) labs.insert(lid_last(lid.txt));
+        const RecType* rt = nullptr;
+        if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
+          if (auto it = rec_types_.find(f0->type);
+              it != rec_types_.end() && it->second.labels.size() == labs.size())
+            rt = &it->second;
+        if (!rt)
+          for (auto& [name, cand] : rec_types_) {
+            if (cand.labels.size() != labs.size()) continue;
+            bool all = true;
+            for (auto& l : cand.labels) if (!labs.count(l)) { all = false; break; }
+            if (all) { rt = &cand; break; }
+          }
+        if (rt) {
+          auto index_of = [&](const std::string& l) {
+            for (size_t i = 0; i < rt->labels.size(); ++i)
+              if (rt->labels[i] == l) return (int)i;
+            return -1;
+          };
+          std::vector<LamPtr> vals(rt->labels.size());
+          bool ok = vals.size() == rc->fields.size();
+          for (auto& [lid, ve] : rc->fields) {
+            int ix = index_of(lid_last(lid.txt));
+            if (ix < 0 || vals[ix]) { ok = false; break; }
+            vals[ix] = expr(*ve);
+          }
+          if (ok) {
+            if (!rt->mut) {
+              auto b = block(0, std::move(vals));
+              if (b->k == Lam::K::Prim) b->blk_shape = rt->shape;  // field kinds
+              return b;
             }
-            if (ok) {
-              if (!rt->second.mut) {
-                auto b = block(0, std::move(vals));
-                if (b->k == Lam::K::Prim) b->blk_shape = rt->second.shape;  // field kinds
-                return b;
-              }
-              auto m = mk(Lam::K::Prim);  // any mutable field -> makemutable
-              m->prim = Prim::Makemutable; m->prim_arg = 0;
-              m->blk_shape = rt->second.shape; m->args = std::move(vals);
-              return m;
-            }
+            auto m = mk(Lam::K::Prim);  // any mutable field -> makemutable
+            m->prim = Prim::Makemutable; m->prim_arg = 0;
+            m->blk_shape = rt->shape; m->args = std::move(vals);
+            return m;
           }
         }
+      }
     }
     if (auto* ar = std::get_if<Pexp_array>(&e.desc)) {  // [| ... |] -> makearray[k]
       std::string k = ar->elems.empty() ? array_arg_kind(&e) : array_elem_kind(ar->elems[0].get());
