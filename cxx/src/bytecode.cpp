@@ -494,9 +494,9 @@ struct Bytegen {
               }
             }
             if (exp->prim_id.rfind("makearray", 0) == 0) {  // [| .. |] -> a block
-              if (exp->args.empty()) {  // [||]: the empty-array atom (const 0)
-                auto z = std::make_shared<Lam>(); z->k = K::ConstInt; z->int_val = 0;
-                Instr k = I(Op::Const); k.cst = z; return cons(k, cont);
+              if (exp->args.empty()) {  // [||]: an empty block (ATOM0), not const 0
+                Instr mb = I(Op::Makeblock); mb.a = 0; mb.b = 0;
+                return cons(mb, cont);
               }
               bool flt = exp->prim_id.find("[float") != std::string::npos;
               Instr mb = I(flt ? Op::Makefloatblock : Op::Makeblock);
