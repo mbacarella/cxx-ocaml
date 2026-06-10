@@ -1194,13 +1194,6 @@ struct Translator {
     std::vector<Lam::Binding> dummies, funcs;
     std::vector<LamPtr> updates;
   };
-  static bool is_rec_const(const LamPtr& v) {  // a constant cannot reference a rec id
-    switch (v->k) {
-      case Lam::K::ConstInt: case Lam::K::ConstChar: case Lam::K::ConstFloat:
-      case Lam::K::ConstString: case Lam::K::ConstBlock: return true;
-      default: return false;
-    }
-  }
   // The size of a rec RHS, mirroring value_rec_compiler's compute_static_size:
   // the tail spine (lets, sequences, single-reachable branches) determines
   // whether the value is a sized heap block, a function, or a constant; `env`
@@ -1447,24 +1440,31 @@ struct Translator {
   }
   // Partition a `let rec` group for value recursion, mirroring ocamlc's
   // value_rec_compiler: sized heap blocks become caml_alloc_dummy pre-bindings
-  // backpatched in place; constants stay ordinary bindings (placed after the
-  // allocs, like upstream's dynamic class); syntactic functions stay a letrec;
-  // a non-syntactic function splits into a lifted function plus a backpatched
-  // context block (split_fn).  The result shape is `(let <allocs;consts>
-  // (letrec <funcs> (seq <updates> body)))`.  False when every binding is
-  // already a syntactic function (plain letrec) or a binding fits no class
-  // (unsupported; caller keeps its existing path).
+  // backpatched in place; a binding that references no rec id at all is
+  // upstream's Dynamic class -- an ordinary binding (constants, but also e.g.
+  // `let rec foof = f` aliasing an outer name), placed after the allocs;
+  // syntactic functions stay a letrec; a non-syntactic function splits into a
+  // lifted function plus a backpatched context block (split_fn).  The result
+  // shape is `(let <allocs;dynamics> (letrec <funcs> (seq <updates> body)))`.
+  // False when every binding is already a syntactic function (plain letrec)
+  // or a binding fits no class (unsupported; caller keeps its existing path).
   bool partition_rec(const std::vector<Ident>& ids, const std::vector<ValueKind>& kinds,
                      const std::vector<LamPtr>& vals, RecParts& out) {
-    enum Cls { Func, Lift, Block, Cst };
+    enum Cls { Func, Lift, Block, Dyn };
     std::vector<Cls> cls(vals.size());
     std::vector<int> bsize(vals.size(), 0);
+    std::set<int> rec_ids;
+    for (auto& id : ids) rec_ids.insert(id.stamp);
     bool transform = false;  // any non-(syntactic-function) binding?
     for (size_t i = 0; i < vals.size(); ++i) {
       auto& v = vals[i];
       if (v->k == Lam::K::Function) { cls[i] = Func; continue; }
       transform = true;
-      if (is_rec_const(v)) { cls[i] = Cst; continue; }
+      std::set<int> bound; std::map<int, Ident> fv;
+      free_vars(v, bound, fv);
+      bool refs_rec = false;
+      for (int s : rec_ids) if (fv.count(s)) { refs_rec = true; break; }
+      if (!refs_rec) { cls[i] = Dyn; continue; }
       std::map<int, RSize> env;
       RSize sz = static_size(v, env);
       if (sz.k == RSize::Block) { cls[i] = Block; bsize[i] = sz.n; continue; }
@@ -1479,12 +1479,12 @@ struct Translator {
       return false;
     }
     if (!transform) return false;
-    std::vector<Lam::Binding> consts;
+    std::vector<Lam::Binding> dyns;
     for (size_t i = 0; i < vals.size(); ++i) {
       LamPtr v = vals[i];
       switch (cls[i]) {
         case Func: out.funcs.push_back({ids[i], kinds[i], v}); break;
-        case Cst: consts.push_back({ids[i], kinds[i], v}); break;
+        case Dyn: dyns.push_back({ids[i], kinds[i], collapse_let_id(v)}); break;
         case Block:
           out.dummies.push_back({ids[i], ValueKind::Gen, alloc_dummy(bsize[i])});
           out.updates.push_back(update_dummy(ids[i], collapse_let_id(v)));
@@ -1500,7 +1500,7 @@ struct Translator {
         }
       }
     }
-    out.dummies.insert(out.dummies.end(), consts.begin(), consts.end());
+    out.dummies.insert(out.dummies.end(), dyns.begin(), dyns.end());
     return true;
   }
   LamPtr cchar(int c) { auto z = mk(Lam::K::ConstChar); z->int_val = c; return z; }
