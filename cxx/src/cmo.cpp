@@ -67,12 +67,24 @@ bool is_predef_exn(const std::string& n0) {
 }
 
 // The structured constant carried by a Reloc_literal.
+// OCaml float-literal semantics: '_' separators are allowed, degenerate hex
+// forms ("0x.", "0xp0") mean zero, overflow is infinity -- strtod handles
+// hexfloat and never throws (std::stod threw out_of_range on 0x-extremes).
+double float_of_lit(const std::string& s0) {
+  std::string s;
+  for (char ch : s0) if (ch != '_') s += ch;
+  const char* p = s.c_str();
+  char* end = nullptr;
+  double v = std::strtod(p, &end);
+  return end == p ? 0.0 : v;
+}
+
 ValPtr const_value(const LamPtr& c) {
   switch (c->k) {
     case Lam::K::ConstInt: return vint(c->int_val);
     case Lam::K::ConstChar: return vint(c->int_val);
     case Lam::K::ConstString: return vstr(c->str_val);
-    case Lam::K::ConstFloat: return omarshal::vdbl(std::stod(c->str_val));
+    case Lam::K::ConstFloat: return omarshal::vdbl(float_of_lit(c->str_val));
     case Lam::K::ConstBlock: {
       std::vector<ValPtr> fs;
       for (auto& a : c->args) fs.push_back(const_value(a));
