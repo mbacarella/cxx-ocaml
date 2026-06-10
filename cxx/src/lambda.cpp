@@ -1093,6 +1093,43 @@ struct Translator {
     auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_update_dummy";
     pr->args = {v, val}; return pr;
   }
+  // Partition a `let rec` group for value recursion: sized heap blocks become
+  // caml_alloc_dummy pre-bindings updated in place, functions stay a letrec --
+  // `(let <dummies> (letrec <funcs> (seq <updates> body)))`, the shape ocamlc's
+  // value_rec_compiler emits.  False when there is no data binding (plain
+  // letrec) or a binding is neither data nor a function (unsupported; caller
+  // keeps its existing path).
+  struct RecParts {
+    std::vector<Lam::Binding> dummies, funcs;
+    std::vector<LamPtr> updates;
+  };
+  static bool is_rec_const(const LamPtr& v) {  // a constant cannot reference a rec id
+    switch (v->k) {
+      case Lam::K::ConstInt: case Lam::K::ConstChar: case Lam::K::ConstFloat:
+      case Lam::K::ConstString: case Lam::K::ConstBlock: return true;
+      default: return false;
+    }
+  }
+  bool partition_rec(const std::vector<Ident>& ids, const std::vector<ValueKind>& kinds,
+                     const std::vector<LamPtr>& vals, RecParts& out) {
+    bool any_value = false;  // a non-function binding: only then transform
+    for (auto& v : vals) {
+      if (is_rec_data(v) || is_rec_const(v)) any_value = true;
+      else if (v->k != Lam::K::Function) return false;
+    }
+    if (!any_value) return false;
+    for (size_t i = 0; i < vals.size(); ++i) {
+      if (is_rec_data(vals[i])) {
+        out.dummies.push_back({ids[i], ValueKind::Gen, alloc_dummy((int)vals[i]->args.size())});
+        out.updates.push_back(update_dummy(ids[i], vals[i]));
+      } else if (is_rec_const(vals[i])) {  // `let rec s = "bar"`: an ordinary binding
+        out.dummies.push_back({ids[i], kinds[i], vals[i]});
+      } else {
+        out.funcs.push_back({ids[i], kinds[i], vals[i]});
+      }
+    }
+    return true;
+  }
   LamPtr cchar(int c) { auto z = mk(Lam::K::ConstChar); z->int_val = c; return z; }
   LamPtr cstr(const std::string& s) { auto z = mk(Lam::K::ConstString); z->str_val = s; return z; }
   LamPtr cblock(int tag, std::vector<LamPtr> fs) {
@@ -2484,24 +2521,29 @@ struct Translator {
             scope.back()[pv->name.txt] = id;
             recs.push_back({&b, id});
           }
-        std::vector<LamPtr> vals; bool all_data = !recs.empty();
-        for (auto& [b, id] : recs) { LamPtr v = expr(*b->expr); vals.push_back(v); if (!is_rec_data(v)) all_data = false; }
-        if (all_data) {  // recursive data: `(let <dummies> (seq <updates> body))`
-          auto l = mk(Lam::K::Let);
-          std::vector<LamPtr> updates;
-          for (size_t i = 0; i < recs.size(); ++i) {
-            l->bindings.push_back({recs[i].second, ValueKind::Gen, alloc_dummy((int)vals[i]->args.size())});
-            updates.push_back(update_dummy(recs[i].second, vals[i]));
-          }
+        std::vector<Ident> ids; std::vector<ValueKind> kinds; std::vector<LamPtr> vals;
+        for (auto& [b, id] : recs) {
+          ids.push_back(id);
+          kinds.push_back(pat_kind(&b->pat));
+          vals.push_back(expr(*b->expr));
+        }
+        RecParts rp;
+        if (!recs.empty() && partition_rec(ids, kinds, vals, rp)) {
           LamPtr body = expr(*le->body);
-          for (auto u = updates.rbegin(); u != updates.rend(); ++u) {
+          for (auto u = rp.updates.rbegin(); u != rp.updates.rend(); ++u) {
             auto sq = mk(Lam::K::Sequence); sq->cond = *u; sq->else_ = body; body = sq;
           }
-          l->body = body; scope.pop_back(); return l;
+          if (!rp.funcs.empty()) {
+            auto lr = mk(Lam::K::Letrec);
+            lr->bindings = std::move(rp.funcs); lr->body = body; body = lr;
+          }
+          auto l = mk(Lam::K::Let);
+          l->bindings = std::move(rp.dummies); l->body = body;
+          scope.pop_back(); return l;
         }
         auto l = mk(Lam::K::Letrec);
         for (size_t i = 0; i < recs.size(); ++i)
-          l->bindings.push_back({recs[i].second, pat_kind(&recs[i].first->pat), vals[i]});
+          l->bindings.push_back({ids[i], kinds[i], vals[i]});
         l->body = expr(*le->body);
         scope.pop_back();
         return l;
@@ -3143,26 +3185,32 @@ struct Translator {
             scope.back()[pv->name.txt] = id;
             recs.push_back({&b, id});
           }
-        std::vector<LamPtr> vals;
-        bool all_data = !recs.empty();
+        std::vector<Ident> ids; std::vector<ValueKind> kinds; std::vector<LamPtr> vals;
         for (auto& [b, id] : recs) {
-          LamPtr v = with_inline(expr(*b->expr), b->attrs);
-          vals.push_back(v);
-          if (!is_rec_data(v)) all_data = false;
+          ids.push_back(id);
+          kinds.push_back(pat_kind(&b->pat));
+          vals.push_back(with_inline(expr(*b->expr), b->attrs));
           add_export(std::get_if<Ppat_var>(&b->pat.desc)->name.txt, id);
         }
-        if (all_data) {  // recursive data: alloc dummies, then update in place
-          std::vector<Lam::Binding> dummies; std::vector<LamPtr> updates;
-          for (size_t i = 0; i < recs.size(); ++i) {
-            dummies.push_back({recs[i].second, ValueKind::Gen, alloc_dummy((int)vals[i]->args.size())});
-            updates.push_back(update_dummy(recs[i].second, vals[i]));
+        RecParts rp;
+        if (!recs.empty() && partition_rec(ids, kinds, vals, rp)) {
+          // value recursion: dummies first, functions next, updates innermost
+          // (attached to the innermost of the two segments).
+          if (rp.funcs.empty()) {
+            Seg s; s.seq = false; s.rec_ = false;
+            s.binds = std::move(rp.dummies); s.updates = std::move(rp.updates);
+            segs.push_back(std::move(s));
+          } else {
+            Seg d; d.seq = false; d.rec_ = false; d.binds = std::move(rp.dummies);
+            segs.push_back(std::move(d));
+            Seg f; f.seq = false; f.rec_ = true;
+            f.binds = std::move(rp.funcs); f.updates = std::move(rp.updates);
+            segs.push_back(std::move(f));
           }
-          Seg s; s.seq = false; s.rec_ = false; s.binds = std::move(dummies); s.updates = std::move(updates);
-          segs.push_back(std::move(s));
         } else {
           std::vector<Lam::Binding> binds;
           for (size_t i = 0; i < recs.size(); ++i)
-            binds.push_back({recs[i].second, pat_kind(&recs[i].first->pat), vals[i]});
+            binds.push_back({ids[i], kinds[i], vals[i]});
           segs.push_back({false, true, std::move(binds), nullptr, {}});
         }
         continue;
@@ -3238,15 +3286,13 @@ struct Translator {
     LamPtr acc = block;
     for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
       if (it->seq) { auto sq = mk(Lam::K::Sequence); sq->cond = it->e; sq->else_ = acc; acc = sq; }
-      else if (!it->updates.empty()) {  // recursive data: let dummies in (seq updates body)
+      else {  // updates (caml_update_dummy of value recursion) run before the rest
         LamPtr body = acc;
         for (auto u = it->updates.rbegin(); u != it->updates.rend(); ++u) {
           auto sq = mk(Lam::K::Sequence); sq->cond = *u; sq->else_ = body; body = sq;
         }
-        auto l = mk(Lam::K::Let); l->bindings = std::move(it->binds); l->body = body; acc = l;
-      } else {
         auto l = mk(it->rec_ ? Lam::K::Letrec : Lam::K::Let);
-        l->bindings = std::move(it->binds); l->body = acc; acc = l;
+        l->bindings = std::move(it->binds); l->body = body; acc = l;
       }
     }
     for (int i = 0; i < n_opens; ++i) opened_.pop_back();
