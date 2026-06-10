@@ -53,4 +53,9 @@ struct ValueKinds {
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 
+// Directory holding the compiled stdlib .cmi files the inferencer consults
+// (default "stdlib", relative to the CWD -- callers that run from elsewhere,
+// like c++ocamlc, must set the discovered absolute path first).
+void set_infer_stdlib_dir(const std::string& dir);
+
 }  // namespace cppcaml

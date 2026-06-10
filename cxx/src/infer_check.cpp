@@ -8,10 +8,22 @@
 #include "cppcaml/cmi.hpp"
 
 namespace cppcaml {
+
+// Where the stdlib .cmi files live; see set_infer_stdlib_dir below.
+static std::string g_stdlib_dir = "stdlib";
+void set_infer_stdlib_dir(const std::string& dir) { g_stdlib_dir = dir; }
+
 namespace {
 
 namespace I = infer;
 using namespace ast;
+
+// Path of a .cmi in the configured stdlib directory.
+std::string stdpath(const std::string& file) { return g_stdlib_dir + "/" + file; }
+// The .cmi of a stdlib head module ("Stdlib" itself or a Stdlib__X submodule).
+std::string head_cmi(const std::string& head) {
+  return stdpath(head == "Stdlib" ? "stdlib.cmi" : "stdlib__" + head + ".cmi");
+}
 using I::TypePtr;
 
 std::string lid_last(const Longident& x) {
@@ -313,8 +325,7 @@ struct Checker {
     if (it != cmi_exists_cache_.end()) return it->second;
     bool ok = false;
     try {
-      cmi::CmiFile::load(head == "Stdlib" ? "stdlib/stdlib.cmi"
-                                          : "stdlib/stdlib__" + head + ".cmi");
+      cmi::CmiFile::load(head_cmi(head));
       ok = true;
     } catch (...) {}
     return cmi_exists_cache_[head] = ok;
@@ -345,8 +356,7 @@ struct Checker {
     try {
       const std::string& head = comps[0];
       std::vector<cmi::CmiFile> loaded;
-      loaded.push_back(head == "Stdlib" ? cmi::CmiFile::load("stdlib/stdlib.cmi")
-                                        : cmi::CmiFile::load("stdlib/stdlib__" + head + ".cmi"));
+      loaded.push_back(cmi::CmiFile::load(head_cmi(head)));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
@@ -372,7 +382,7 @@ struct Checker {
     if (stdlib_ready_) return stdlib_;
     stdlib_ready_ = true;
     try {
-      auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
+      auto cmi = cmi::CmiFile::load(stdpath("stdlib.cmi"));
       for (auto& v : cmi.values()) {
         std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
         stdlib_[v.name] = from_cmi(v.type, memo);
@@ -403,7 +413,7 @@ struct Checker {
       if (p.empty()) return nullptr;
       if (p[0] >= 'A' && p[0] <= 'Z') p[0] += 32;  // file is first-char-lowercased
       try {
-        loaded.push_back(cmi::CmiFile::load("stdlib/" + p + ".cmi"));
+        loaded.push_back(cmi::CmiFile::load(stdpath(p + ".cmi")));
         return &loaded.back().sig();
       } catch (...) { return nullptr; }
     }
@@ -427,9 +437,7 @@ struct Checker {
       const std::string& head = comps[0];
       // cmis stay alive for the whole walk; sig points into the last one.
       std::vector<cmi::CmiFile> loaded;
-      loaded.push_back(head == "Stdlib"
-                           ? cmi::CmiFile::load("stdlib/stdlib.cmi")
-                           : cmi::CmiFile::load("stdlib/stdlib__" + head + ".cmi"));
+      loaded.push_back(cmi::CmiFile::load(head_cmi(head)));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
@@ -465,9 +473,7 @@ struct Checker {
     std::unordered_map<std::string, TypePtr> out;
     try {
       const std::string& head = comps[0];
-      auto cmi = (head == "Stdlib")
-                     ? cmi::CmiFile::load("stdlib/stdlib.cmi")
-                     : cmi::CmiFile::load("stdlib/stdlib__" + head + ".cmi");
+      auto cmi = cmi::CmiFile::load(head_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       const cmi::ModuleType* mt = nullptr;
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -567,8 +573,7 @@ struct Checker {
   // `minor_heap_size`), instantiated into our type universe; null if not found.
   TypePtr stdlib_field_type(const std::string& mod, const std::string& label) {
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? "stdlib/stdlib.cmi"
-                                                    : "stdlib/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(head_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record) continue;
         for (auto& l : td.labels)
@@ -582,7 +587,7 @@ struct Checker {
   }
   void register_stdlib_ctors() {
     try {
-      auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
+      auto cmi = cmi::CmiFile::load(stdpath("stdlib.cmi"));
       std::set<std::string> ambiguous, seen;
       std::unordered_map<std::string, TypePtr> found;
       for (auto& td : cmi.types()) {

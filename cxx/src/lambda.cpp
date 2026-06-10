@@ -475,6 +475,10 @@ struct Translator {
   std::unordered_map<std::string, std::string> externals_;
   // Locally-declared exceptions: name -> its binder (the makeblock-248 value).
   std::unordered_map<std::string, Ident> exn_ident_;
+  // Declared argument count of an exception constructor (`exception E of int *
+  // string` has two).  Data-carrying predef exceptions all take one argument
+  // (Failure of string; Assert_failure of a string*int*int tuple), the default.
+  std::unordered_map<std::string, int> exn_arity_;
   std::string mod_path_;  // dotted module path prefix for exception names
   std::string file_name_;  // source path, for Match_failure/Assert_failure locations
   // Predefined exception globals (Match_failure/Assert_failure): a stable stamp per
@@ -1102,137 +1106,184 @@ struct Translator {
   // to a plain string (partial support only improves parity, never regresses).
   // Tags follow camlinternalFormatBasics.ml's `fmt` GADT (block ctors 0..24).
   LamPtr format_value(const std::string& s) {
-    // Each parsed element is a builder taking the already-built `rest`.
-    std::vector<std::function<LamPtr(LamPtr)>> elems;
-    auto lit = [&](const std::string& run) {  // 1 char -> Char_literal(12), else String_literal(11)
-      if (run.size() == 1)
-        elems.push_back([this, c = run[0]](LamPtr r) { return cblock(12, {cchar((unsigned char)c), r}); });
-      else
-        elems.push_back([this, run](LamPtr r) { return cblock(11, {cstr(run), r}); });
-    };
-    auto flit = [&](int tag) {  // Formatting_lit(17) of a constant formatting_lit
-      elems.push_back([this, tag](LamPtr r) { return cblock(17, {cint(tag), r}); });
-    };
-    auto fbreak = [&](const std::string& src, int w, int o) {  // Formatting_lit(Break)
-      elems.push_back([this, src, w, o](LamPtr r) {
-        return cblock(17, {cblock(0, {cstr(src), cint(w), cint(o)}), r});
-      });
-    };
-    std::string run;
-    size_t i = 0, n = s.size();
-    while (i < n) {
-      char ch = s[i];
-      if (ch == '@') {  // a Format `@` directive (shared format parsing, even Printf)
-        if (i + 1 >= n) return nullptr;
-        if (!run.empty()) { lit(run); run.clear(); }
-        char d = s[i + 1];
-        if (d == ']') { flit(0); i += 2; continue; }                 // @] Close_box
-        if (d == '}') { flit(1); i += 2; continue; }                 // @} Close_tag
-        if (d == '?') { flit(2); i += 2; continue; }                 // @? FFlush
-        if (d == '\n') { flit(3); i += 2; continue; }                // @\n Force_newline
-        if (d == '.') { flit(4); i += 2; continue; }                 // @. Flush_newline
-        if (d == '@') { flit(5); i += 2; continue; }                 // @@ Escaped_at
-        if (d == ',') { fbreak("@,", 0, 0); i += 2; continue; }      // @, break
-        if (d == ' ') { fbreak("@ ", 1, 0); i += 2; continue; }      // @  break
-        if (d == ';') {  // @; or @;<w o>
-          size_t j = i + 2; int w = 1, o = 0;
-          if (j < n && s[j] == '<') {
-            size_t k = s.find('>', j);
-            if (k == std::string::npos) return nullptr;
-            int a = 0, b = 0; bool sa = false, sb = false; bool sp = false;
-            for (size_t p = j + 1; p < k; ++p) {
-              char cc = s[p];
-              if (cc == ' ') { sp = true; continue; }
-              if (cc < '0' || cc > '9') return nullptr;
-              if (!sp) { a = a * 10 + (cc - '0'); sa = true; }
-              else { b = b * 10 + (cc - '0'); sb = true; }
-            }
-            if (!sa) return nullptr;
-            w = a; o = sb ? b : 0;
-            fbreak(s.substr(i, k + 1 - i), w, o); i = k + 1; continue;
+    LamPtr fmt = fmt_parse(s, 0, s.size());
+    if (!fmt) return nullptr;
+    return cblock(0, {fmt, cstr(s)});  // Format (fmt, original)
+  }
+  // Recursive mirror of CamlinternalFormat.fmt_ebb_of_string over s[i,end):
+  // literal runs up to the next '%'/'@' become Char_literal(12)/String_literal(11),
+  // then the directive parsers below.  Null on a directive outside the supported
+  // subset, so the caller can fall back to a plain string.
+  LamPtr fmt_parse(const std::string& s, size_t i, size_t end) {
+    size_t j = i;
+    while (j < end && s[j] != '%' && s[j] != '@') ++j;
+    if (j > i) {
+      LamPtr rest = fmt_parse(s, j, end);
+      if (!rest) return nullptr;
+      if (j - i == 1) return cblock(12, {cchar((unsigned char)s[i]), rest});
+      return cblock(11, {cstr(s.substr(i, j - i)), rest});
+    }
+    if (i >= end) return cint(0);  // End_of_format
+    if (s[i] == '@') return fmt_parse_at(s, i + 1, end);
+    return fmt_parse_pct(s, i + 1, end);
+  }
+  // Formatting_lit(17) of a constant formatting_lit, then the rest.
+  LamPtr fmt_flit(int tag, const std::string& s, size_t k, size_t end) {
+    LamPtr r = fmt_parse(s, k, end);
+    return r ? cblock(17, {cint(tag), r}) : nullptr;
+  }
+  // Formatting_lit(Break(src, width, offset)), then the rest.
+  LamPtr fmt_break(const std::string& src, int w, int o,
+                   const std::string& s, size_t k, size_t end) {
+    LamPtr r = fmt_parse(s, k, end);
+    return r ? cblock(17, {cblock(0, {cstr(src), cint(w), cint(o)}), r}) : nullptr;
+  }
+  // `@<spaces><integer><spaces>` helper for @;<w o> and @<n>: parses an optional
+  // '-' sign and digits with surrounding blanks; false if no integer is present.
+  static bool fmt_int(const std::string& s, size_t& i, size_t end, int& out) {
+    while (i < end && s[i] == ' ') ++i;
+    size_t d = i; bool neg = false;
+    if (d < end && s[d] == '-') { neg = true; ++d; }
+    if (d >= end || s[d] < '0' || s[d] > '9') return false;
+    long v = 0;
+    while (d < end && s[d] >= '0' && s[d] <= '9') v = v * 10 + (s[d] - '0'), ++d;
+    while (d < end && s[d] == ' ') ++d;
+    i = d; out = (int)(neg ? -v : v);
+    return true;
+  }
+  // After '@' (parse_after_at): i points at the directive character.
+  LamPtr fmt_parse_at(const std::string& s, size_t i, size_t end) {
+    if (i >= end) return cblock(12, {cchar('@'), cint(0)});
+    char d = s[i];
+    switch (d) {
+      case '[': case '{': {  // Formatting_gen(18): Open_box(1) / Open_tag(0)
+        size_t k = i + 1;
+        LamPtr sub = cint(0);  // Format(End_of_format, "") when no <...> follows
+        std::string substr;
+        if (k < end && s[k] == '<') {
+          size_t gt = s.find('>', k + 1);
+          if (gt != std::string::npos && gt < end) {
+            substr = s.substr(k, gt - k + 1);
+            sub = fmt_parse(s, k, gt + 1);  // the bracket text, parsed as a format
+            if (!sub) return nullptr;
+            k = gt + 1;
           }
-          fbreak("@;", 1, 0); i += 2; continue;
         }
-        return nullptr;  // @[ @{ @< (box/tag/magic, needs Formatting_gen): fall back
+        LamPtr r = fmt_parse(s, k, end);
+        if (!r) return nullptr;
+        return cblock(18, {cblock(d == '{' ? 0 : 1, {cblock(0, {sub, cstr(substr)})}), r});
       }
-      if (ch != '%') { run += ch; ++i; continue; }
-      // a '%' directive: flush any pending literal run first
-      ++i;  // past '%'
-      if (i >= n) return nullptr;
-      if (s[i] == '%') { run += '%'; ++i; continue; }  // %% -> literal '%'
-      if (s[i] == '@') { run += '@'; ++i; continue; }  // %@ -> literal '@'
-      if (!run.empty()) { lit(run); run.clear(); }
-      // flags
-      bool plus = false, space = false, hash = false, minus = false, zero = false;
-      for (; i < n; ++i) {
-        if (s[i] == '+') plus = true;
-        else if (s[i] == ' ') space = true;
-        else if (s[i] == '#') hash = true;
-        else if (s[i] == '-') minus = true;
-        else if (s[i] == '0') zero = true;
-        else break;
-      }
-      if (i >= n) return nullptr;
-      // width (literal padding) -- '*' (arg-padding) not yet supported
-      bool has_w = false; int width = 0;
-      while (i < n && s[i] >= '0' && s[i] <= '9') { has_w = true; width = width * 10 + (s[i] - '0'); ++i; }
-      // precision .N -- '.*' not yet supported
-      bool has_p = false; int prec = 0;
-      if (i < n && s[i] == '.') {
-        ++i; has_p = true;
-        if (i < n && s[i] == '*') return nullptr;
-        while (i < n && s[i] >= '0' && s[i] <= '9') { prec = prec * 10 + (s[i] - '0'); ++i; }
-      }
-      if (i >= n) return nullptr;
-      // length modifier for ints: l/n/L
-      char len = 0;
-      if (s[i] == 'l' || s[i] == 'n' || s[i] == 'L') { len = s[i]; ++i; }
-      if (i >= n) return nullptr;
-      char conv = s[i]; ++i;
-      // padding value: No_padding(int 0) | Lit_padding(block0: padty,width)
-      auto padding = [&]() -> LamPtr {
-        if (!has_w) return cint(0);
-        int padty = minus ? 0 : (zero ? 2 : 1);  // Left=0, Right=1, Zeros=2
-        return cblock(0, {cint(padty), cint(width)});
-      };
-      // precision value: No_precision(int 0) | Lit_precision(block0: n)
-      auto precision = [&]() -> LamPtr {
-        if (!has_p) return cint(0);
-        return cblock(0, {cint(prec)});
-      };
-      switch (conv) {
-        case 'c': elems.push_back([this](LamPtr r) { return cblock(0, {r}); }); break;       // Char
-        case 'C': elems.push_back([this](LamPtr r) { return cblock(1, {r}); }); break;       // Caml_char
-        case 's': { auto p = padding(); elems.push_back([this, p](LamPtr r) { return cblock(2, {p, r}); }); break; }
-        case 'S': { auto p = padding(); elems.push_back([this, p](LamPtr r) { return cblock(3, {p, r}); }); break; }
-        case 'b': case 'B': { auto p = padding(); elems.push_back([this, p](LamPtr r) { return cblock(9, {p, r}); }); break; }
-        case 'a': elems.push_back([this](LamPtr r) { return cblock(15, {r}); }); break;       // Alpha
-        case 't': elems.push_back([this](LamPtr r) { return cblock(16, {r}); }); break;       // Theta
-        case '!': elems.push_back([this](LamPtr r) { return cblock(10, {r}); }); break;       // Flush
-        case 'd': case 'i': case 'x': case 'X': case 'o': case 'u': {
-          int ic = int_conv(conv, plus, space, hash);
-          if (ic < 0) return nullptr;
-          int tag = len == 'l' ? 5 : len == 'n' ? 6 : len == 'L' ? 7 : 4;  // Int32/Nativeint/Int64/Int
-          auto p = padding(), q = precision();
-          elems.push_back([this, ic, tag, p, q](LamPtr r) { return cblock(tag, {cint(ic), p, q, r}); });
-          break;
+      case ']': return fmt_flit(0, s, i + 1, end);    // Close_box
+      case '}': return fmt_flit(1, s, i + 1, end);    // Close_tag
+      case '?': return fmt_flit(2, s, i + 1, end);    // FFlush
+      case '\n': return fmt_flit(3, s, i + 1, end);   // Force_newline
+      case '.': return fmt_flit(4, s, i + 1, end);    // Flush_newline
+      case '@': return fmt_flit(5, s, i + 1, end);    // Escaped_at
+      case ',': return fmt_break("@,", 0, 0, s, i + 1, end);
+      case ' ': return fmt_break("@ ", 1, 0, s, i + 1, end);
+      case ';': {  // @; or @;<w> or @;<w o>; on malformed <...>, plain "@;"
+        size_t k = i + 1;
+        if (k < end && s[k] == '<') {
+          size_t p = k + 1; int w = 0, o = 0;
+          if (fmt_int(s, p, end, w)) {
+            if (p < end && s[p] == '>')
+              return fmt_break(s.substr(i - 1, p - i + 2), w, 0, s, p + 1, end);
+            if (fmt_int(s, p, end, o) && p < end && s[p] == '>')
+              return fmt_break(s.substr(i - 1, p - i + 2), w, o, s, p + 1, end);
+          }
         }
-        case 'f': case 'e': case 'E': case 'g': case 'G': case 'F': case 'h': case 'H': {
-          int flag = plus ? 1 : space ? 2 : 0;
-          int kind = conv == 'f' ? 0 : conv == 'e' ? 1 : conv == 'E' ? 2 : conv == 'g' ? 3
-                   : conv == 'G' ? 4 : conv == 'F' ? 5 : conv == 'h' ? 6 : 7;
-          auto fconv = cblock(0, {cint(flag), cint(kind)});
-          auto p = padding(), q = precision();
-          elems.push_back([this, fconv, p, q](LamPtr r) { return cblock(8, {fconv, p, q, r}); });
-          break;
+        return fmt_break("@;", 1, 0, s, k, end);
+      }
+      case '<': {  // @<n> Magic_size(block 1) or, malformed, Scan_indic '<'
+        size_t p = i + 1; int sz = 0;
+        if (fmt_int(s, p, end, sz) && p < end && s[p] == '>') {
+          LamPtr r = fmt_parse(s, p + 1, end);
+          if (!r) return nullptr;
+          return cblock(17, {cblock(1, {cstr(s.substr(i - 1, p - i + 2)), cint(sz)}), r});
         }
-        default: return nullptr;  // unhandled directive: fall back to plain string
+        LamPtr r = fmt_parse(s, i + 1, end);
+        return r ? cblock(17, {cblock(2, {cchar('<')}), r}) : nullptr;
+      }
+      case '%':
+        if (i + 1 < end && s[i + 1] == '%') return fmt_flit(6, s, i + 2, end);  // @%% Escaped_percent
+        {  // lone @%: a literal '@', then re-parse at the '%'
+          LamPtr r = fmt_parse(s, i, end);
+          return r ? cblock(12, {cchar('@'), r}) : nullptr;
+        }
+      default: {  // any other char: Formatting_lit(Scan_indic(block 2))
+        LamPtr r = fmt_parse(s, i + 1, end);
+        return r ? cblock(17, {cblock(2, {cchar((unsigned char)d)}), r}) : nullptr;
       }
     }
-    if (!run.empty()) lit(run);
-    LamPtr fmt = cint(0);  // End_of_format
-    for (auto it = elems.rbegin(); it != elems.rend(); ++it) fmt = (*it)(fmt);
-    return cblock(0, {fmt, cstr(s)});  // Format (fmt, original)
+  }
+  // After '%': flags, padding, precision, length modifier, conversion.
+  LamPtr fmt_parse_pct(const std::string& s, size_t i, size_t end) {
+    if (i >= end) return nullptr;
+    if (s[i] == '%' || s[i] == '@') {  // literal '%'/'@': its own Char_literal node
+      LamPtr r = fmt_parse(s, i + 1, end);
+      return r ? cblock(12, {cchar((unsigned char)s[i]), r}) : nullptr;
+    }
+    bool plus = false, space = false, hash = false, minus = false, zero = false;
+    for (; i < end; ++i) {
+      if (s[i] == '+') plus = true;
+      else if (s[i] == ' ') space = true;
+      else if (s[i] == '#') hash = true;
+      else if (s[i] == '-') minus = true;
+      else if (s[i] == '0') zero = true;
+      else break;
+    }
+    if (i >= end) return nullptr;
+    int padty = minus ? 0 : (zero ? 2 : 1);  // Left=0, Right=1, Zeros=2
+    // padding: No_padding(0) | Lit_padding[0: padty w] | Arg_padding[1: padty] (%*)
+    LamPtr pad = cint(0);
+    if (s[i] == '*') { pad = cblock(1, {cint(padty)}); ++i; }
+    else if (s[i] >= '0' && s[i] <= '9') {
+      int width = 0;
+      while (i < end && s[i] >= '0' && s[i] <= '9') width = width * 10 + (s[i] - '0'), ++i;
+      pad = cblock(0, {cint(padty), cint(width)});
+    }
+    if (i >= end) return nullptr;
+    // precision: No_precision(0) | Lit_precision[0: n] | Arg_precision(1) (.*)
+    LamPtr prec = cint(0);
+    if (s[i] == '.') {
+      ++i;
+      if (i < end && s[i] == '*') { prec = cint(1); ++i; }
+      else {
+        int p = 0;
+        while (i < end && s[i] >= '0' && s[i] <= '9') p = p * 10 + (s[i] - '0'), ++i;
+        prec = cblock(0, {cint(p)});
+      }
+    }
+    if (i >= end) return nullptr;
+    char len = 0;  // boxed-int length modifier, only before an int conversion
+    if ((s[i] == 'l' || s[i] == 'n' || s[i] == 'L') && i + 1 < end &&
+        std::string_view("dixXou").find(s[i + 1]) != std::string_view::npos) { len = s[i]; ++i; }
+    char conv = s[i]; ++i;
+    LamPtr r = fmt_parse(s, i, end);
+    if (!r) return nullptr;
+    switch (conv) {
+      case 'c': return cblock(0, {r});                 // Char
+      case 'C': return cblock(1, {r});                 // Caml_char
+      case 's': return cblock(2, {pad, r});            // String
+      case 'S': return cblock(3, {pad, r});            // Caml_string
+      case 'b': case 'B': return cblock(9, {pad, r});  // Bool
+      case 'a': return cblock(15, {r});                // Alpha
+      case 't': return cblock(16, {r});                // Theta
+      case '!': return cblock(10, {r});                // Flush
+      case 'd': case 'i': case 'x': case 'X': case 'o': case 'u': {
+        int ic = int_conv(conv, plus, space, hash);
+        if (ic < 0) return nullptr;
+        int tag = len == 'l' ? 5 : len == 'n' ? 6 : len == 'L' ? 7 : 4;  // Int32/Nativeint/Int64/Int
+        return cblock(tag, {cint(ic), pad, prec, r});
+      }
+      case 'f': case 'e': case 'E': case 'g': case 'G': case 'F': case 'h': case 'H': {
+        int flag = plus ? 1 : space ? 2 : 0;
+        int kind = conv == 'f' ? 0 : conv == 'e' ? 1 : conv == 'E' ? 2 : conv == 'g' ? 3
+                 : conv == 'G' ? 4 : conv == 'F' ? 5 : conv == 'h' ? 6 : 7;
+        return cblock(8, {cblock(0, {cint(flag), cint(kind)}), pad, prec, r});
+      }
+      default: return nullptr;  // %r %{ %( %[ etc: fall back to plain string
+    }
   }
   // int_conv tag for a %[dixXou] with +/space/# flags, or -1 if unrepresentable.
   static int int_conv(char conv, bool plus, bool space, bool hash) {
@@ -1279,15 +1330,60 @@ struct Translator {
           } else {
             lhs = exv();
           }
+          LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs);
+          if (!then) return exn_dispatch(exn, cases, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
           test->args = {lhs, id};
           auto iff = mk(Lam::K::IfThenElse);
-          iff->cond = test; iff->then_ = expr(*c.rhs);
+          iff->cond = test; iff->then_ = then;
           iff->else_ = exn_dispatch(exn, cases, i + 1);
           return iff;
         }
     }
     return exn_dispatch(exn, cases, i + 1);  // unsupported case: skip
+  }
+  // The body of a matched exception case: the constructor's data lives at fields
+  // 1..arity of the exception block (field 0 is its identity).  A structured
+  // sub-pattern (the string*int*int tuple of Assert_failure etc.) reads through a
+  // `*match*` temp like ocamlc's matcher; simple binders inline as field reads.
+  // Null when a sub-pattern is refutable (a constant pattern etc.) -- the case is
+  // then skipped, preserving the previous behavior.
+  LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
+                       const Expression& rhs) {
+    if (!k->arg) return expr(rhs);
+    int arity = 1;
+    if (auto a = exn_arity_.find(name); a != exn_arity_.end()) arity = a->second;
+    auto fps = ctor_field_pats(k, arity);
+    if ((int)fps.size() != arity) return nullptr;
+    auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
+    scope.emplace_back();
+    std::vector<std::pair<Ident, LamPtr>> binders;  // simple field binders
+    std::vector<std::pair<Ident, LamPtr>> temps;    // *match* temps for structured sub-pats
+    std::vector<std::vector<std::pair<Ident, LamPtr>>> sub_binders;
+    bool ok = true;
+    for (int j = 0; ok && j < arity; ++j) {
+      const Pattern* fp = effective_pat(fps[j]);
+      LamPtr acc = fieldimm(j + 1, exv());
+      if (std::holds_alternative<Ppat_any>(fp->desc)) continue;
+      if (std::holds_alternative<Ppat_var>(fp->desc) ||
+          std::holds_alternative<Ppat_alias>(fp->desc)) {
+        ok = collect_binders(*fp, acc, binders);
+      } else if (is_irrefutable(*fp)) {
+        Ident tv = fresh("", true);
+        auto tvv = mk(Lam::K::Var); tvv->var = tv;
+        std::vector<std::pair<Ident, LamPtr>> sub;
+        ok = collect_binders(*fp, tvv, sub);
+        temps.push_back({tv, acc});
+        sub_binders.push_back(std::move(sub));
+      } else ok = false;
+    }
+    if (!ok) { scope.pop_back(); return nullptr; }
+    LamPtr body = expr(rhs);
+    scope.pop_back();
+    for (auto& sb : sub_binders) body = wrap_binders(body, sb);
+    body = wrap_binders(body, binders);
+    body = wrap_binders(body, temps);
+    return body;
   }
   static bool is_catchall(const Pattern& p) {
     return std::holds_alternative<Ppat_any>(p.desc) || std::holds_alternative<Ppat_var>(p.desc);
@@ -2934,6 +3030,9 @@ struct Translator {
         Ident id = fresh(nm);
         cur.push_back({id, ValueKind::Gen, blk});
         exn_ident_[nm] = id;
+        if (auto* d = std::get_if<Pext_decl>(&pe->exn.ctor.kind))
+          if (auto* t = std::get_if<Pcstr_tuple>(&d->args))
+            exn_arity_[nm] = (int)t->elems.size();
         add_export(nm, id);
         continue;
       }
@@ -2944,6 +3043,8 @@ struct Translator {
             if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
               if (auto e = exn_ident_.find(l->name); e != exn_ident_.end()) {
                 exn_ident_[nm] = e->second; add_export(nm, e->second);
+                if (auto a = exn_arity_.find(l->name); a != exn_arity_.end())
+                  exn_arity_[nm] = a->second;
               }
             continue;
           }
@@ -2955,6 +3056,9 @@ struct Translator {
           Ident id = fresh(nm);
           cur.push_back({id, ValueKind::Gen, blk});
           exn_ident_[nm] = id;
+          if (auto* d = std::get_if<Pext_decl>(&c.kind))
+            if (auto* t = std::get_if<Pcstr_tuple>(&d->args))
+              exn_arity_[nm] = (int)t->elems.size();
           add_export(nm, id);
         }
         continue;
@@ -3158,6 +3262,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   Translator t;
   t.stdlib_dir = stdlib_dir;
   t.file_name_ = file_name;
+  set_infer_stdlib_dir(stdlib_dir);  // the inferencer reads .cmi files too
   t.vk = infer_value_kinds(s);
   t.register_predef_ctor_info();
   t.register_stdlib_ctors();
