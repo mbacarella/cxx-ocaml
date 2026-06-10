@@ -734,6 +734,88 @@ struct Translator {
   static std::string global_of(const std::string& mod) {
     return mod == "Stdlib" ? "Stdlib" : "Stdlib__" + mod;
   }
+  // A dotted module path from a Longident ("Effect.Deep"); false on Lapply.
+  static bool lid_to_dotted(const Longident& l, std::string& out) {
+    if (auto* p = std::get_if<Lident>(&l.v)) { out += p->name; return true; }
+    if (auto* d = std::get_if<Ldot>(&l.v)) {
+      if (!lid_to_dotted(*d->prefix, out)) return false;
+      out += '.'; out += d->name;
+      return true;
+    }
+    return false;
+  }
+  // A stdlib *submodule* path ("Effect.Deep"): the field-index chain from the
+  // head module's global down to the submodule block, plus its own field map --
+  // so `Effect.Deep.continue` compiles to nested field reads.
+  struct SubMod { std::vector<int> path; std::unordered_map<std::string, int> fields;
+                  bool ok = false; };
+  std::unordered_map<std::string, SubMod> submod_cache_;
+  const SubMod& submodule_of(const std::string& dotted) {
+    auto it = submod_cache_.find(dotted);
+    if (it != submod_cache_.end()) return it->second;
+    SubMod sm;
+    size_t dot = dotted.find('.');
+    if (dot != std::string::npos) try {
+      std::string head = dotted.substr(0, dot);
+      auto cmi = cmi::CmiFile::load(head == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                     : stdlib_dir + "/stdlib__" + head + ".cmi");
+      const cmi::Signature* sig = &cmi.sig();
+      size_t pos = dot + 1;
+      bool fail = false;
+      while (!fail) {
+        size_t nd = dotted.find('.', pos);
+        std::string comp = dotted.substr(pos, nd == std::string::npos ? std::string::npos
+                                                                      : nd - pos);
+        int ix = -1;
+        for (size_t i = 0; i < sig->fields.size(); ++i)
+          if (sig->fields[i] == comp) { ix = (int)i; break; }
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comp) { md = &mm; break; }
+        if (ix < 0 || !md || !md->type || md->type->kind != cmi::ModuleType::Sig ||
+            !md->type->sig) { fail = true; break; }
+        sm.path.push_back(ix);
+        sig = md->type->sig.get();
+        if (nd == std::string::npos) break;
+        pos = nd + 1;
+      }
+      if (!fail) {
+        int i = 0;
+        for (auto& f : sig->fields) sm.fields[f] = i++;
+        // Register the submodule's record types (Effect.Deep's handler etc.) so
+        // record literals/projections with these labels resolve.  Only labels no
+        // local type claims -- a fallback, never an ambiguity.
+        for (auto& td : sig->types) {
+          if (td.kind != cmi::TypeDecl::Record) continue;
+          RecType rt; rt.mut = false;
+          bool fresh_type = !rec_types_.count(td.name);
+          for (int j = 0; j < (int)td.labels.size(); ++j) {
+            ValueKind k = cmi_field_kind(td.labels[j].type);
+            bool m = td.labels[j].mutable_;
+            rt.mut |= m;
+            rt.labels.push_back(td.labels[j].name);
+            rt.shape.push_back(k);
+            if (fresh_type && !field_info_.count(td.labels[j].name) &&
+                !ambiguous_fields_.count(td.labels[j].name))
+              field_info_[td.labels[j].name] = {td.name, j, m, k};
+          }
+          if (fresh_type) rec_types_[td.name] = std::move(rt);
+        }
+        sm.ok = true;
+      }
+    } catch (...) {}
+    return submod_cache_[dotted] = std::move(sm);
+  }
+  LamPtr submodule_value(const std::string& dotted, const std::string& name) {
+    auto& sm = submodule_of(dotted);
+    if (!sm.ok) return nullptr;
+    auto f = sm.fields.find(name);
+    if (f == sm.fields.end()) return nullptr;
+    auto g = mk(Lam::K::Prim); g->prim = Prim::Global;
+    g->prim_id = global_of(dotted.substr(0, dotted.find('.')));
+    LamPtr cur = g;
+    for (int ix : sm.path) cur = fieldimm(ix, cur);
+    return fieldimm(f->second, cur);
+  }
   // A stdlib functor (e.g. Set.Make): its field index in its module, and the
   // runtime field layouts of its parameter signature and its result signature.
   // The runtime field names of a cmi module type, resolving a named module type
@@ -2025,7 +2107,56 @@ struct Translator {
     if (auto sw = const_switch(scrut, rows)) return sw;
     if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
+    if (auto em = ext_match(scrut, rows)) return em;
     return int_cases(scrut, rows, 0);
+  }
+
+  // Match over extension constructors (`type t += A ...`, exceptions, effects):
+  // an if-chain comparing constructor identities (field 0 of an applied
+  // constructor's block, the value itself for a constant one), each arm binding
+  // its fields like a try-handler case.  Requires a variable scrutinee and a
+  // trailing catch-all; anything else keeps the existing paths.
+  LamPtr ext_match(const LamPtr& scrut, const std::vector<Row>& rows) {
+    if (scrut->k != Lam::K::Var || rows.size() < 2) return nullptr;
+    if (rows.back().guard || !is_catchall(*rows.back().lhs)) return nullptr;
+    for (size_t i = 0; i + 1 < rows.size(); ++i) {
+      if (rows[i].guard) return nullptr;
+      auto* k = std::get_if<Ppat_construct>(&rows[i].lhs->desc);
+      if (!k) return nullptr;
+      std::string n = lid_last(k->id.txt);
+      if (!exn_ident_.count(n) || ctor_info_.count(n)) return nullptr;
+      if (k->arg) {  // binder shapes exn_case_body supports only
+        int arity = exn_arity_.count(n) ? exn_arity_[n] : 1;
+        for (auto* fp : ctor_field_pats(k, arity)) {
+          const Pattern* e = effective_pat(fp);
+          if (!std::holds_alternative<Ppat_any>(e->desc) &&
+              !std::holds_alternative<Ppat_var>(e->desc) &&
+              !std::holds_alternative<Ppat_alias>(e->desc) && !is_irrefutable(*e))
+            return nullptr;
+        }
+      }
+    }
+    return ext_match_arm(scrut->var, rows, 0);
+  }
+  LamPtr ext_match_arm(const Ident& sid, const std::vector<Row>& rows, size_t i) {
+    auto sv = [&] { auto v = mk(Lam::K::Var); v->var = sid; return v; };
+    if (i + 1 == rows.size()) {
+      bind_catchall(*rows[i].lhs, sv());
+      return expr(*rows[i].rhs);
+    }
+    auto* k = std::get_if<Ppat_construct>(&rows[i].lhs->desc);
+    std::string n = lid_last(k->id.txt);
+    auto idv = mk(Lam::K::Var); idv->var = exn_ident_[n];
+    LamPtr lhs = k->arg ? fieldimm(0, sv()) : sv();
+    LamPtr body = exn_case_body(sid, k, n, *rows[i].rhs);
+    if (!body) return nullptr;
+    LamPtr rest = ext_match_arm(sid, rows, i + 1);
+    if (!rest) return nullptr;
+    auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
+    test->args = {lhs, idv};
+    auto iff = mk(Lam::K::IfThenElse);
+    iff->cond = test; iff->then_ = body; iff->else_ = rest;
+    return iff;
   }
 
   // Exhaustive match over a purely-constant variant type -> (switch* ...).
@@ -2114,7 +2245,11 @@ struct Translator {
     if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
       if (auto* op = std::get_if<Pstr_open>(&si->item->desc))
         if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
-          opened_.push_back(lid_last(mi->id.txt));
+          std::string dotted;  // a dotted submodule path opens under its full path
+          if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+          if (dotted.find('.') != std::string::npos)
+            submodule_of(dotted);  // eager: registers its record-type labels
+          opened_.push_back(dotted);
           LamPtr b = expr(*si->body);
           opened_.pop_back();
           return b;
@@ -2314,6 +2449,10 @@ struct Translator {
               return fi;
             }
           }
+          if (it->find('.') != std::string::npos) {  // opened stdlib submodule
+            if (LamPtr v = submodule_value(*it, l->name)) return v;
+            continue;
+          }
           auto& fm = fields_of(*it);  // stdlib module
           if (auto f = fm.find(l->name); f != fm.end())
             return field_of(global_of(*it), f->second);
@@ -2337,6 +2476,12 @@ struct Translator {
           // A prim used as a value (e.g. Sys.argv = %sys_argv -> (caml_sys_argv 0)).
           if (auto pv = prim_value(value_prim(pl->name, d->name).name)) return pv;
         }
+      // Qualified M.S.x through a stdlib submodule path (Effect.Deep.continue).
+      if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
+        std::string dotted;
+        if (lid_to_dotted(*d->prefix, dotted) && dotted.find('.') != std::string::npos)
+          if (LamPtr v = submodule_value(dotted, d->name)) return v;
+      }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + lid_last(id->id.txt));  // unresolved (will DIFF)
       return v;
     }
@@ -3066,7 +3211,11 @@ struct Translator {
       }
       if (auto* op = std::get_if<Pstr_open>(&it.desc)) {  // open M (brings members in)
         if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
-          opened_.push_back(lid_last(mi->id.txt)); ++n_opens;
+          std::string dotted;  // a dotted submodule path opens under its full path
+          if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+          if (dotted.find('.') != std::string::npos)
+            submodule_of(dotted);  // eager: registers its record-type labels
+          opened_.push_back(dotted); ++n_opens;
         }
         continue;
       }
