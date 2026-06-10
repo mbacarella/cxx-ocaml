@@ -1043,29 +1043,83 @@ struct Translator {
     return nullptr;
   }
 
-  // A primitive used as a first-class value is eta-expanded to a `stub` function
-  // applying the underlying C call: `compare` -> `(function prim prim stub
-  // (caml_compare prim prim))`.  Returns null for prims we don't C-call this way.
-  LamPtr prim_stub(const StdPrim& p) {
+  // The GENERIC (type-agnostic) lambda body for `prim` applied to `argv`, used to
+  // eta-expand a primitive that appears in value position.  Mirrors translprim's
+  // fallback lowering: the stub carries no operand types, so polymorphic compare
+  // takes its `caml_*` form and field reads take the pointer (`field_mut`) form.
+  // Null for prims we don't lower this way.
+  LamPtr prim_stub_body(const std::string& prim, const std::vector<LamPtr>& argv) {
+    int n = (int)argv.size();
+    auto ic = [&](const std::string& sp) {
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = sp;
+      pr->args = argv; return pr; };
+    auto cc = [&](const std::string& nm) {
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = nm;
+      pr->args = argv; return pr; };
     static const std::unordered_map<std::string, std::string> poly = {
       {"%compare", "caml_compare"}, {"%equal", "caml_equal"},
       {"%notequal", "caml_notequal"}, {"%lessthan", "caml_lessthan"},
       {"%lessequal", "caml_lessequal"}, {"%greaterthan", "caml_greaterthan"},
       {"%greaterequal", "caml_greaterequal"},
     };
-    std::string cname;
-    if (auto it = poly.find(p.name); it != poly.end()) cname = it->second;
-    else if (!p.name.empty() && p.name[0] != '%') cname = p.name;  // a C external
-    else return nullptr;
-    int arity = p.arity > 0 ? p.arity : 2;
-    auto fn = mk(Lam::K::Function); fn->inline_attr = "stub";
-    auto call = mk(Lam::K::Prim); call->prim = Prim::Ccall; call->prim_id = cname;
-    for (int i = 0; i < arity; ++i) {
-      Ident pp = fresh("prim");
-      fn->params.push_back({pp, ValueKind::Gen});
-      auto v = mk(Lam::K::Var); v->var = pp; call->args.push_back(v);
+    if (auto it = poly.find(prim); it != poly.end() && n == 2) return cc(it->second);
+    if (prim == "%opaque" && n == 1) return ic("opaque");
+    if (prim == "%ignore" && n == 1) return ic("ignore");
+    if (prim == "%identity" && n == 1) return argv[0];
+    if ((prim == "%succint" || prim == "%predint") && n == 1) {
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::Offsetint;
+      pr->prim_arg = prim == "%succint" ? 1 : -1; pr->args = argv; return pr;
     }
-    fn->body = call;
+    if ((prim == "%field0" || prim == "%field1") && n == 1) {  // generic -> field_mut
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::FieldMut;
+      pr->prim_arg = prim == "%field1" ? 1 : 0; pr->args = argv; return pr;
+    }
+    {  // pervasive arithmetic / bitwise / unary, via the operator-form maps
+      static const std::unordered_map<std::string, std::string> parith = {
+        {"%addint", "+"}, {"%subint", "-"}, {"%mulint", "*"}, {"%divint", "/"},
+        {"%modint", "mod"}, {"%negint", "~-"}, {"%andint", "land"}, {"%orint", "lor"},
+        {"%xorint", "lxor"}, {"%lslint", "lsl"}, {"%lsrint", "lsr"}, {"%asrint", "asr"},
+        {"%addfloat", "+."}, {"%subfloat", "-."}, {"%mulfloat", "*."}, {"%divfloat", "/."},
+        {"%negfloat", "~-."}, {"%floatofint", "float_of_int"}, {"%intoffloat", "int_of_float"},
+        {"%boolnot", "not"},
+      };
+      if (auto pi = parith.find(prim); pi != parith.end()) {
+        Prim p;
+        if (int_op(pi->second, p) && n == 2) {
+          auto pr = mk(Lam::K::Prim); pr->prim = p; pr->args = argv; return pr;
+        }
+        if (auto pp = pervasive_prim(pi->second); !pp.first.empty() && n == pp.second)
+          return ic(pp.first);
+      }
+    }
+    {  // boxed integers print `Int32.`/`Int64.`/`Nativeint.<op>`
+      static const std::pair<std::string, std::string> bint[] = {
+        {"%int32_", "Int32."}, {"%int64_", "Int64."}, {"%nativeint_", "Nativeint."}};
+      for (auto& [pfx, mod] : bint)
+        if (prim.rfind(pfx, 0) == 0) return cc(mod + prim.substr(pfx.size()));
+    }
+    if (!prim.empty() && prim[0] != '%') return cc(prim);  // a C external
+    return nullptr;
+  }
+  // A primitive used as a first-class value is eta-expanded to a `stub` function
+  // applying the primitive to its parameters: `compare` -> `(function prim prim
+  // stub (caml_compare prim prim))`, `succ` -> `(function prim stub (1+ prim))`.
+  // Returns null for prims we don't lower this way.
+  LamPtr prim_stub(const StdPrim& p) {
+    bool poly = p.name == "%compare" || p.name == "%equal" || p.name == "%notequal" ||
+                p.name == "%lessthan" || p.name == "%lessequal" ||
+                p.name == "%greaterthan" || p.name == "%greaterequal";
+    int arity = p.arity > 0 ? p.arity : (poly ? 2 : 1);
+    auto fn = mk(Lam::K::Function); fn->inline_attr = "stub";
+    std::vector<LamPtr> argv;  // params in body-application order
+    for (int i = 0; i < arity; ++i) {
+      Ident pp = fresh("prim");  // unprinted stamps are invisible to normalization
+      fn->params.push_back({pp, ValueKind::Gen});
+      auto v = mk(Lam::K::Var); v->var = pp; argv.push_back(v);
+    }
+    LamPtr body = prim_stub_body(p.name, argv);
+    if (!body) return nullptr;
+    fn->body = body;
     return fn;
   }
   LamPtr prim_to_lam(const std::string& prim, int arity, const Pexp_apply& ap, const Expression& e) {
@@ -1083,6 +1137,13 @@ struct Translator {
     if (prim == "%opaque" && as.size() == 1) return op("opaque");
     if (prim == "%ignore" && as.size() == 1) return op("ignore");
     if (prim == "%identity" && as.size() == 1) return expr(*as[0].second);  // no-op
+    // `f @@ x` / `x |> f` apply f to x (the function is the 1st / 2nd argument).
+    if ((prim == "%apply" || prim == "%revapply") && as.size() == 2) {
+      auto a = mk(Lam::K::Apply);
+      int fi = prim == "%apply" ? 0 : 1, xi = prim == "%apply" ? 1 : 0;
+      a->fn = expr(*as[fi].second); a->args = {expr(*as[xi].second)};
+      return a;
+    }
     // Polymorphic compare specialized by operand kind (the spellings we can be
     // sure of; string/other gen needs the operand type, so left unresolved).
     if (prim == "%compare" && as.size() == 2) {
@@ -2859,7 +2920,11 @@ struct Translator {
           auto sf = fm.find(d->name);
           if (sf != fm.end()) return field_of(global_of(pl->name), sf->second);
           // A prim used as a value (e.g. Sys.argv = %sys_argv -> (caml_sys_argv 0)).
-          if (auto pv = prim_value(value_prim(pl->name, d->name).name)) return pv;
+          StdPrim sp = value_prim(pl->name, d->name);
+          if (auto pv = prim_value(sp.name)) return pv;
+          // Otherwise a primitive in value position eta-expands to a stub
+          // (`Int64.add` -> `(function p p stub (Int64.add p p))`).
+          if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) return s;
         }
       // Qualified M.S.x through a stdlib submodule path (Effect.Deep.continue).
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
