@@ -2668,29 +2668,41 @@ struct Translator {
   LamPtr int_cases(const LamPtr& scrut, const std::vector<Row>& rows, size_t i) {
     if (i >= rows.size()) return cint(0);
     const Row& r = rows[i];
+    // Peel `<inner> as x` aliases: x binds to the scrutinee value over this row's
+    // guard and body.  Bound by scope to the scrutinee variable (as simplif also
+    // does); a non-variable scrutinee skips the alias (best-effort, the test still
+    // emits).  A row-local scope frame keeps x out of the later rows.
+    const Pattern* lhs = r.lhs;
+    std::vector<std::string> aliases;
+    while (auto* pa = std::get_if<Ppat_alias>(&lhs->desc)) { aliases.push_back(pa->name.txt); lhs = pa->p.get(); }
+    bool framed = !aliases.empty() && scrut->k == Lam::K::Var;
+    auto enter = [&] { if (framed) { scope.emplace_back(); for (auto& nm : aliases) scope.back()[nm] = scrut->var; } };
+    auto leave = [&] { if (framed) scope.pop_back(); };
     // A guard on a catch-all (var/`_`) pattern inlines: the pattern always matches,
     // so guard-failure just falls through to the rest -> `(if guard body <rest>)`.
     // (A guard on a constant/ctor pattern would share <rest> across pattern- and
     // guard-failure, needing the matcher's catch/exit; left to the best-effort tail.)
-    if (r.guard && is_catchall(*r.lhs)) {
-      bind_catchall(*r.lhs, scrut);
+    if (r.guard && is_catchall(*lhs)) {
+      enter(); bind_catchall(*lhs, scrut);
       auto iff = mk(Lam::K::IfThenElse);
       iff->cond = expr(*r.guard); iff->then_ = expr(*r.rhs);
+      leave();
       iff->else_ = int_cases(scrut, rows, i + 1);
       return iff;
     }
-    if (!r.guard && (is_catchall(*r.lhs) || i + 1 == rows.size())) {
-      bind_catchall(*r.lhs, scrut);
-      return expr(*r.rhs);
+    if (!r.guard && (is_catchall(*lhs) || i + 1 == rows.size())) {
+      enter(); bind_catchall(*lhs, scrut);
+      LamPtr b = expr(*r.rhs); leave();
+      return b;
     }
     // An integer literal, or a constant constructor (matched by its integer tag),
     // tested against the scrutinee with the rest of the rows as the fall-through.
     if (!r.guard) {
       bool isint = false, ctor = false; long long val = 0;
-      if (auto* pc = std::get_if<Ppat_constant>(&r.lhs->desc)) {
+      if (auto* pc = std::get_if<Ppat_constant>(&lhs->desc)) {
         if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) { isint = true; val = parse_ocaml_int(pi->value); }
-      } else if (auto* k = std::get_if<Ppat_construct>(&r.lhs->desc); k && !k->arg) {
-        auto it = ctor_info_.find(ctor_of(*r.lhs));
+      } else if (auto* k = std::get_if<Ppat_construct>(&lhs->desc); k && !k->arg) {
+        auto it = ctor_info_.find(ctor_of(*lhs));
         if (it != ctor_info_.end() && !it->second.is_block) { isint = true; val = it->second.tag; ctor = true; }
       }
       if (isint) {
@@ -2701,7 +2713,8 @@ struct Translator {
           auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt; ne->args = {scrut, cint(val)};
           iff->cond = ne;
         }
-        iff->then_ = int_cases(scrut, rows, i + 1); iff->else_ = expr(*r.rhs);
+        iff->then_ = int_cases(scrut, rows, i + 1);
+        enter(); iff->else_ = expr(*r.rhs); leave();
         return iff;
       }
     }
