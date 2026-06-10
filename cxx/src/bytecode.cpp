@@ -448,6 +448,10 @@ struct Bytegen {
             Instr mb = I(Op::Makeblock); mb.a = (int)exp->args.size(); mb.b = exp->prim_arg;
             return comp_args(env, exp->args, sz, cons(mb, cont));
           }
+          case Prim::Makelazyblock: {  // a 1-field block tagged Lazy(246)/Forward(250)
+            Instr mb = I(Op::Makeblock); mb.a = 1; mb.b = exp->prim_arg;
+            return comp_args(env, exp->args, sz, cons(mb, cont));
+          }
           case Prim::Ccall:
             if (exp->prim_id == "perform" && exp->args.size() == 1) {
               // Kperform pushes 4 words (bytegen's check_stack (sz + 4))

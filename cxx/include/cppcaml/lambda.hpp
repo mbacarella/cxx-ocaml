@@ -54,6 +54,7 @@ enum class Prim {
   IntCmp,      // integer comparison; spelling (< > <= >= == !=) in prim_id
   Raise,       // (raise e)
   Reraise,     // (reraise e)  (exception handler fall-through)
+  Makelazyblock, // makelazyblock (Lazy_tag 246) / makeforwardblock (Forward_tag 250)
 };
 
 struct Lam {

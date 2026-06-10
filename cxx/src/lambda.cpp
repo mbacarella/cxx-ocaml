@@ -307,6 +307,8 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::IntCmp: head = "(" + l->prim_id; break;
         case Prim::Raise: head = "(raise"; break;
         case Prim::Reraise: head = "(reraise"; break;
+        case Prim::Makelazyblock:
+          head = l->prim_arg == 250 ? "(makeforwardblock" : "(makelazyblock"; break;
       }
       std::vector<DocP> xs{text(head)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
@@ -752,7 +754,10 @@ struct Translator {
     return it == pr.end() ? StdPrim{"", 0} : it->second;
   }
   static std::string global_of(const std::string& mod) {
-    return mod == "Stdlib" ? "Stdlib" : "Stdlib__" + mod;
+    // Stdlib and the CamlinternalXxx units are top-level compilation units; every
+    // other stdlib module is a `Stdlib__`-prefixed submodule.
+    if (mod == "Stdlib" || mod.rfind("Camlinternal", 0) == 0) return mod;
+    return "Stdlib__" + mod;
   }
   // A dotted module path from a Longident ("Effect.Deep"); false on Lapply.
   static bool lid_to_dotted(const Longident& l, std::string& out) {
@@ -1144,6 +1149,7 @@ struct Translator {
       a->fn = expr(*as[fi].second); a->args = {expr(*as[xi].second)};
       return a;
     }
+    if (prim == "%lazy_force" && as.size() == 1) return force_lazy(expr(*as[0].second));
     // Polymorphic compare specialized by operand kind (the spellings we can be
     // sure of; string/other gen needs the operand type, so left unresolved).
     if (prim == "%compare" && as.size() == 2) {
@@ -1203,6 +1209,112 @@ struct Translator {
       return pr;
     }
     return nullptr;
+  }
+
+  // --- lazy values (Texp_lazy / %lazy_force), mirroring translcore + matching ---
+  // The raw inferred runtime-class string for an expression: "int"/"float"/
+  // "addr" (known boxed)/"" (unrecorded, treated as the polymorphic Any).
+  std::string vk_str(const Expression* e) {
+    auto it = vk.expr.find(e);
+    return it == vk.expr.end() ? "" : it->second;
+  }
+  // Typeopt.classify_lazy_argument's "small and commutative" test: an expression
+  // with no coeffects and only generative effects, under a size cutoff of 42.
+  bool lazy_commutative(const Expression* e, int& size) {
+    if (++size > 42) return false;
+    if (std::get_if<Pexp_ident>(&e->desc) || std::get_if<Pexp_constant>(&e->desc) ||
+        std::get_if<Pexp_function>(&e->desc) || std::get_if<Pexp_lazy>(&e->desc) ||
+        std::get_if<Pexp_extension>(&e->desc))  // extension_constructor approx
+      return true;
+    if (auto* v = std::get_if<Pexp_variant>(&e->desc))
+      return !v->arg || lazy_commutative(v->arg->get(), size);
+    if (auto* c = std::get_if<Pexp_construct>(&e->desc))
+      return !c->arg || lazy_commutative(c->arg->get(), size);
+    if (auto* a = std::get_if<Pexp_array>(&e->desc)) {
+      for (auto& el : a->elems) if (!lazy_commutative(el.get(), size)) return false;
+      return true;
+    }
+    if (auto* t = std::get_if<Pexp_tuple>(&e->desc)) {
+      for (auto& el : t->elems) if (!lazy_commutative(el.get(), size)) return false;
+      return true;
+    }
+    if (auto* r = std::get_if<Pexp_record>(&e->desc)) {
+      for (auto& f : r->fields) if (!lazy_commutative(f.second.get(), size)) return false;
+      return !r->base || lazy_commutative(r->base->get(), size);
+    }
+    return false;
+  }
+  // `lazy e`.  A non-commutative body becomes a thunk in a Lazy_tag block; a
+  // small commutative body is evaluated eagerly and either shortcut to the value
+  // itself (immediate/known-boxed: forcing returns it) or wrapped in a Forward_tag
+  // block (float, or a body of polymorphic/lazy type, where the shortcut is unsafe).
+  LamPtr lazy_expr(const Expression& e) {
+    int size = 0;
+    if (!lazy_commutative(&e, size)) {  // Lazy_thunk: (makelazyblock (function param e))
+      auto fn = mk(Lam::K::Function); fn->params = {{fresh("param"), ValueKind::Gen}};
+      fn->body = expr(e);
+      auto b = mk(Lam::K::Prim); b->prim = Prim::Makelazyblock; b->prim_arg = 246;
+      b->args = {fn};
+      return b;
+    }
+    bool forward;  // Eager: float and the polymorphic/lazy `Any` class -> Forward
+    if (std::get_if<Pexp_constant>(&e.desc))
+      forward = std::holds_alternative<Pconst_float>(
+                    std::get_if<Pexp_constant>(&e.desc)->c.desc);
+    else if (std::get_if<Pexp_construct>(&e.desc) || std::get_if<Pexp_variant>(&e.desc) ||
+             std::get_if<Pexp_array>(&e.desc) || std::get_if<Pexp_tuple>(&e.desc) ||
+             std::get_if<Pexp_record>(&e.desc) || std::get_if<Pexp_function>(&e.desc))
+      forward = false;  // always a (boxed or immediate) non-lazy value -> Shortcut
+    else {  // ident / field: by runtime class (addr & int shortcut, float/'a forward)
+      std::string k = vk_str(&e);
+      forward = (k == "float" || (k != "int" && k != "addr" && k != "string"));
+    }
+    if (!forward) return expr(e);  // Shortcut
+    auto b = mk(Lam::K::Prim); b->prim = Prim::Makelazyblock; b->prim_arg = 250;  // Forward
+    b->args = {expr(e)};
+    return b;
+  }
+  // Matching.inline_lazy_force: the inlined head of Lazy.force.
+  //   (let (lzarg = arg)              -- elided when arg is already a variable
+  //     (let (tag =a (caml_obj_tag lzarg))
+  //       (if (== tag 250) (field_mut 0 lzarg)         -- Forward_tag: already a value
+  //         (if (|| (== tag 246) (== tag 244))         -- Lazy_tag / Forcing_tag
+  //           (apply (field_imm <force_lazy_block> CamlinternalLazy) (opaque lzarg))
+  //           lzarg))))                                -- otherwise the value itself
+  LamPtr force_lazy(LamPtr arg) {
+    LamPtr lzarg; Ident la; bool bind = arg->k != Lam::K::Var;
+    if (bind) { la = fresh("lzarg"); auto v = mk(Lam::K::Var); v->var = la; lzarg = v; }
+    else lzarg = arg;
+    auto use = [&] { auto v = mk(Lam::K::Var); v->var = lzarg->var; return v; };
+    Ident tagid = fresh("tag");
+    auto tagvar = [&] { auto v = mk(Lam::K::Var); v->var = tagid; return v; };
+    auto tag_call = mk(Lam::K::Prim); tag_call->prim = Prim::Ccall;
+    tag_call->prim_id = "caml_obj_tag"; tag_call->args = {use()};
+    auto eqtag = [&](int t) {
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::EqInt; pr->args = {tagvar(), cint(t)};
+      return pr;
+    };
+    // force_lazy_block: CamlinternalLazy.force_lazy_block (resolve its field index).
+    auto& fm = fields_of("CamlinternalLazy");
+    int fidx = 1; if (auto f = fm.find("force_lazy_block"); f != fm.end()) fidx = f->second;
+    auto opq = mk(Lam::K::Prim); opq->prim = Prim::IntCmp; opq->prim_id = "opaque"; opq->args = {use()};
+    auto call = mk(Lam::K::Apply); call->fn = field_of(global_of("CamlinternalLazy"), fidx);
+    call->args = {opq};
+    auto orcond = mk(Lam::K::Prim); orcond->prim = Prim::IntCmp; orcond->prim_id = "||";
+    orcond->args = {eqtag(246), eqtag(244)};
+    auto inner = mk(Lam::K::IfThenElse);
+    inner->cond = orcond; inner->then_ = call; inner->else_ = use();
+    auto fwd = mk(Lam::K::Prim); fwd->prim = Prim::FieldMut; fwd->prim_arg = 0; fwd->args = {use()};
+    auto outer = mk(Lam::K::IfThenElse);
+    outer->cond = eqtag(250); outer->then_ = fwd; outer->else_ = inner;
+    auto tlet = mk(Lam::K::Let);  // (let (tag =a (caml_obj_tag ..)) ...)
+    tlet->bindings = {{tagid, ValueKind::Gen, tag_call, /*alias=*/true}};
+    tlet->body = outer;
+    if (!bind) return tlet;
+    auto alet = mk(Lam::K::Let);  // (let (lzarg = arg) ...)
+    alet->bindings = {{la, ValueKind::Gen, arg}};
+    alet->body = tlet;
+    return alet;
   }
 
   static bool is_const(const LamPtr& l) {
@@ -2664,6 +2776,7 @@ struct Translator {
       i->else_ = raise_predef("Assert_failure", e.loc);
       return i;
     }
+    if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) return lazy_expr(*lz->e);
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) return compile_match(expr(*m->e), m->cases, e.loc);
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
