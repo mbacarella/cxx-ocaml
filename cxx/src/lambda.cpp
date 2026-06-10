@@ -2270,8 +2270,26 @@ struct Translator {
         }
         return block_of(ci->second.tag, fs);
       }
-      if (auto ei = exn_ident_.find(n); ei != exn_ident_.end() && !k->arg) {
-        auto v = mk(Lam::K::Var); v->var = ei->second; return v;  // local exception value
+      if (auto ei = exn_ident_.find(n); ei != exn_ident_.end()) {
+        auto v = mk(Lam::K::Var); v->var = ei->second;
+        if (!k->arg) return v;  // local exception/extension-ctor value
+        // applied: a block whose field 0 is the constructor's identity --
+        // `(makeblock 0 (*,k1..) E/1 a1..)` -- with a tuple argument flattened
+        // when the constructor was declared with several fields.
+        int arity = 1;
+        if (auto a = exn_arity_.find(n); a != exn_arity_.end()) arity = a->second;
+        std::vector<const Expression*> fs;
+        if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+            at && arity > 1 && (int)at->elems.size() == arity)
+          for (auto& el : at->elems) fs.push_back(el.get());
+        else
+          fs.push_back(k->arg->get());
+        std::vector<LamPtr> fields = {v};
+        std::vector<ValueKind> shape = {ValueKind::Gen};
+        for (auto* ex : fs) { fields.push_back(expr(*ex)); shape.push_back(expr_kind(ex)); }
+        auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
+        b->args = std::move(fields); b->blk_shape = std::move(shape);
+        return b;
       }
       if (!k->arg)  // a predefined exception (Not_found, ...) is a Stdlib field
         if (auto sf = stdlib_fields.find(n); sf != stdlib_fields.end())
