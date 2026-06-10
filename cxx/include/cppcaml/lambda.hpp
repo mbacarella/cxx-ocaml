@@ -118,4 +118,9 @@ void print_dlambda(const LamPtr& code, std::ostream& out);
 // structured_constant syntax -- used by the bytecode `const` instruction printer.
 std::string structured_constant(const LamPtr& c);
 
+// Render a full bytecode `const` instruction line, matching printinstr.ml's
+// `@[<10>\tconst@ %a@]` box: a wide constant breaks after `const` and indents
+// to column 10, with internal wrapping that depends on that start column.
+std::string const_instruction(const LamPtr& c);
+
 }  // namespace cppcaml::lambda

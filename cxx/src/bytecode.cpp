@@ -691,7 +691,7 @@ std::string instr_text(const Instr& i) {
     case Op::Offsetclosure: return "\toffsetclosure " + n(i.a);
     case Op::Getglobal: return "\tgetglobal " + i.str + "!";
     case Op::Setglobal: return "\tsetglobal " + i.str + "!";
-    case Op::Const: return "\tconst " + lambda::structured_constant(i.cst);
+    case Op::Const: return lambda::const_instruction(i.cst);
     case Op::Makeblock: return "\tmakeblock " + n(i.a) + ", " + n(i.b);
     case Op::Makefloatblock: return "\tmakefloatblock " + n(i.a);
     case Op::Getfield: return "\tgetfield " + n(i.a);

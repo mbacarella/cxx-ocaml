@@ -3196,4 +3196,15 @@ std::string structured_constant(const LamPtr& c) {
   return ss.str();
 }
 
+std::string const_instruction(const LamPtr& c) {
+  Pr pr;
+  std::ostringstream ss;
+  // printinstr.ml: @[<10>\tconst@ %a@]
+  DocP d = box(BoxT::Box, 10, {text("\tconst"), brk(" "), to_doc(c, pr)});
+  set_sizes(d, 0);
+  Render r{ss};
+  r.go(d);
+  return ss.str();
+}
+
 }  // namespace cppcaml::lambda

@@ -26,8 +26,12 @@ if [ "${1:-}" == "--worker" ]; then
     timeout "$TIMEOUT" ./ocamlc.opt -nostdlib -I stdlib -dinstr -c "$td/$(basename "$f")" \
       2>"$ck" 1>/dev/null || true
     rm -rf "$td"
-    # keep only the instruction lines (start with a tab or a label)
-    grep -E '^(	|L[0-9])' "$ck" > "$ck.f" 2>/dev/null; mv -f "$ck.f" "$ck" 2>/dev/null || true
+    # keep the instruction lines: those starting with a tab or a label, plus the
+    # space-indented continuation lines of a wrapped operand (e.g. a wide `const`
+    # block).  Skip any leading warning/banner block by only emitting once the
+    # first real instruction line has been seen.
+    awk '/^(	|L[0-9])/{seen=1} seen && /^(	|L[0-9]| )/{print}' "$ck" \
+      > "$ck.f" 2>/dev/null; mv -f "$ck.f" "$ck" 2>/dev/null || true
   fi
   [ -s "$ck" ] || { printf 'SKIP\n'; exit 0; }   # oracle produced no instructions
   o=$(norm < "$ck")
