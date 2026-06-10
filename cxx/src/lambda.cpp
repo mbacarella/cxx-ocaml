@@ -223,19 +223,27 @@ std::string ocaml_escape(const std::string& s) {
 DocP to_doc(const LamPtr& l, Pr& pr);
 
 // @[<2>(let@ @[<hv 1>(@[<2>id =vk@ val@] @ ...)@]@ body)@]
+// Like printlambda's letbody loop, consecutive lets merge into one group:
+// nested Let bodies are flattened into the binding list.
 DocP let_doc(const LamPtr& l, Pr& pr) {
   std::vector<DocP> binds{text("(")};
-  for (size_t i = 0; i < l->bindings.size(); ++i) {
-    auto& b = l->bindings[i];
-    if (i) binds.push_back(brk());
-    binds.push_back(box(BoxT::Box, 2,
-        {text(pr.ident(b.id) + " =" +
-              std::string(b.mut ? "mut" : b.alias ? "a" : "") + kind_suffix(b.kind)),
-         brk(), to_doc(b.val, pr)}));
+  LamPtr cur = l;
+  bool first = true;
+  while (true) {
+    for (auto& b : cur->bindings) {
+      if (!first) binds.push_back(brk());
+      first = false;
+      binds.push_back(box(BoxT::Box, 2,
+          {text(pr.ident(b.id) + " =" +
+                std::string(b.mut ? "mut" : b.alias ? "a" : "") + kind_suffix(b.kind)),
+           brk(), to_doc(b.val, pr)}));
+    }
+    if (cur->body && cur->body->k == Lam::K::Let) cur = cur->body;
+    else break;
   }
   binds.push_back(text(")"));
   DocP bindings = box(BoxT::Hv, 1, std::move(binds));
-  return box(BoxT::Box, 2, {text("(let"), brk(), bindings, brk(), to_doc(l->body, pr), text(")")});
+  return box(BoxT::Box, 2, {text("(let"), brk(), bindings, brk(), to_doc(cur->body, pr), text(")")});
 }
 
 // @[<2>(letrec@ (@[<hv 1>@[<2>id@ def@] @ ...@])@ body)@]  (no `=`, defs are functions)
@@ -442,6 +450,11 @@ LamPtr translate_const(const Constant& c) {
 struct Translator {
   ValueKinds vk;
   int stamp = 300;  // arbitrary; normalized on print
+  // True while translating the tail spine of a `let rec` RHS: suppresses the
+  // `let x = E in x -> E` collapse there, because ocamlc only runs that
+  // simplification (Simplif) *after* value_rec compilation -- partition_rec
+  // must see the un-collapsed spine (and collapses it again afterwards).
+  bool rec_spine_ = false;
   std::string stdlib_dir = "stdlib";  // where to find stdlib*.cmi (CWD-relative by default)
   std::vector<std::unordered_map<std::string, Ident>> scope{{}};
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
@@ -1168,11 +1181,6 @@ struct Translator {
     if (r > 0x3FFFFFFF) r -= (1LL << 31);
     return r;
   }
-  // A recursive binding whose value is a heap block (tuple/ctor/record) -- compiled
-  // with caml_alloc_dummy + caml_update_dummy, unlike a recursive function.
-  static bool is_rec_data(const LamPtr& v) {
-    return v->k == Lam::K::Prim && (v->prim == Prim::Makeblock || v->prim == Prim::Makemutable);
-  }
   LamPtr alloc_dummy(int size) {
     auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_alloc_dummy";
     pr->args = {cint(size)}; return pr;
@@ -1182,12 +1190,6 @@ struct Translator {
     auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_update_dummy";
     pr->args = {v, val}; return pr;
   }
-  // Partition a `let rec` group for value recursion: sized heap blocks become
-  // caml_alloc_dummy pre-bindings updated in place, functions stay a letrec --
-  // `(let <dummies> (letrec <funcs> (seq <updates> body)))`, the shape ocamlc's
-  // value_rec_compiler emits.  False when there is no data binding (plain
-  // letrec) or a binding is neither data nor a function (unsupported; caller
-  // keeps its existing path).
   struct RecParts {
     std::vector<Lam::Binding> dummies, funcs;
     std::vector<LamPtr> updates;
@@ -1199,24 +1201,306 @@ struct Translator {
       default: return false;
     }
   }
-  bool partition_rec(const std::vector<Ident>& ids, const std::vector<ValueKind>& kinds,
-                     const std::vector<LamPtr>& vals, RecParts& out) {
-    bool any_value = false;  // a non-function binding: only then transform
-    for (auto& v : vals) {
-      if (is_rec_data(v) || is_rec_const(v)) any_value = true;
-      else if (v->k != Lam::K::Function) return false;
+  // The size of a rec RHS, mirroring value_rec_compiler's compute_static_size:
+  // the tail spine (lets, sequences, single-reachable branches) determines
+  // whether the value is a sized heap block, a function, or a constant; `env`
+  // carries the sizes of spine-bound locals so `let x = 1 :: t in x` sizes as
+  // the block.  Dyn means no class fits (caller falls back).
+  struct RSize { enum K { Dyn, Unreach, Const, Func, Block } k = Dyn; int n = 0; };
+  static RSize rjoin(const RSize& a, const RSize& b) {
+    if (a.k == RSize::Unreach) return b;
+    if (b.k == RSize::Unreach) return a;
+    return {};  // two reachable branches: upstream join_sizes fails
+  }
+  static RSize static_size(const LamPtr& l, std::map<int, RSize>& env) {
+    if (!l) return {};
+    switch (l->k) {
+      case Lam::K::ConstInt: case Lam::K::ConstChar: case Lam::K::ConstFloat:
+      case Lam::K::ConstString: case Lam::K::ConstBlock: return {RSize::Const, 0};
+      case Lam::K::Function: return {RSize::Func, 0};
+      case Lam::K::Var: {
+        auto it = env.find(l->var.stamp);
+        return it != env.end() ? it->second : RSize{};
+      }
+      case Lam::K::Let:
+        for (auto& b : l->bindings) {
+          RSize s = static_size(b.val, env);
+          env[b.id.stamp] = s;
+        }
+        return static_size(l->body, env);
+      case Lam::K::Letrec:
+        for (auto& b : l->bindings) env[b.id.stamp] = {RSize::Func, 0};
+        return static_size(l->body, env);
+      case Lam::K::Sequence: return static_size(l->else_, env);
+      case Lam::K::IfThenElse:
+        return rjoin(static_size(l->then_, env), static_size(l->else_, env));
+      case Lam::K::Try: return rjoin(static_size(l->body, env), static_size(l->then_, env));
+      case Lam::K::Catch: return rjoin(static_size(l->cond, env), static_size(l->then_, env));
+      case Lam::K::Switch: {
+        RSize r{RSize::Unreach, 0};
+        for (auto& sc : l->sw_consts) r = rjoin(r, static_size(sc.body, env));
+        for (auto& sc : l->sw_blocks) r = rjoin(r, static_size(sc.body, env));
+        if (l->sw_default) r = rjoin(r, static_size(l->sw_default, env));
+        return r;
+      }
+      case Lam::K::Staticraise: return {RSize::Unreach, 0};
+      case Lam::K::Prim:
+        if (l->prim == Prim::Raise || l->prim == Prim::Reraise) return {RSize::Unreach, 0};
+        if (l->prim == Prim::Makeblock || l->prim == Prim::Makemutable)
+          return {RSize::Block, (int)l->args.size()};
+        return {};
+      default: return {};
     }
-    if (!any_value) return false;
-    for (size_t i = 0; i < vals.size(); ++i) {
-      if (is_rec_data(vals[i])) {
-        out.dummies.push_back({ids[i], ValueKind::Gen, alloc_dummy((int)vals[i]->args.size())});
-        out.updates.push_back(update_dummy(ids[i], vals[i]));
-      } else if (is_rec_const(vals[i])) {  // `let rec s = "bar"`: an ordinary binding
-        out.dummies.push_back({ids[i], kinds[i], vals[i]});
-      } else {
-        out.funcs.push_back({ids[i], kinds[i], vals[i]});
+  }
+  // Free variables of l (stamp -> ident), respecting binders -- which context
+  // locals does a lifted letrec function capture?
+  static void free_vars(const LamPtr& l, std::set<int>& bound, std::map<int, Ident>& out) {
+    if (!l) return;
+    switch (l->k) {
+      case Lam::K::Var: case Lam::K::Mutvar:
+        if (!bound.count(l->var.stamp)) out.emplace(l->var.stamp, l->var);
+        return;
+      case Lam::K::Assign:
+        if (!bound.count(l->var.stamp)) out.emplace(l->var.stamp, l->var);
+        free_vars(l->cond, bound, out);
+        return;
+      case Lam::K::Function: {
+        std::set<int> b2 = bound;
+        for (auto& [id, k] : l->params) b2.insert(id.stamp);
+        free_vars(l->body, b2, out);
+        return;
+      }
+      case Lam::K::Let: {
+        std::set<int> b2 = bound;
+        for (auto& b : l->bindings) { free_vars(b.val, b2, out); b2.insert(b.id.stamp); }
+        free_vars(l->body, b2, out);
+        return;
+      }
+      case Lam::K::Letrec: {
+        std::set<int> b2 = bound;
+        for (auto& b : l->bindings) b2.insert(b.id.stamp);
+        for (auto& b : l->bindings) free_vars(b.val, b2, out);
+        free_vars(l->body, b2, out);
+        return;
+      }
+      case Lam::K::Try: {
+        free_vars(l->body, bound, out);
+        std::set<int> b2 = bound; b2.insert(l->var.stamp);
+        free_vars(l->then_, b2, out);
+        return;
+      }
+      case Lam::K::Catch: {
+        free_vars(l->cond, bound, out);
+        std::set<int> b2 = bound;
+        for (auto& v : l->catch_vars) b2.insert(v.stamp);
+        free_vars(l->then_, b2, out);
+        return;
+      }
+      case Lam::K::For: {
+        free_vars(l->then_, bound, out); free_vars(l->else_, bound, out);
+        std::set<int> b2 = bound; b2.insert(l->var.stamp);
+        free_vars(l->body, b2, out);
+        return;
+      }
+      default:
+        free_vars(l->fn, bound, out); free_vars(l->body, bound, out);
+        free_vars(l->cond, bound, out); free_vars(l->then_, bound, out);
+        free_vars(l->else_, bound, out); free_vars(l->sw_default, bound, out);
+        for (auto& a : l->args) free_vars(a, bound, out);
+        for (auto& b : l->bindings) free_vars(b.val, bound, out);
+        for (auto& sc : l->sw_consts) free_vars(sc.body, bound, out);
+        for (auto& sc : l->sw_blocks) free_vars(sc.body, bound, out);
+        return;
+    }
+  }
+  // Replace each captured local (slots: stamp -> field index) with
+  // `(field_imm i ctx)`: a lifted function reads its context block.  Stamps
+  // are unique, so no binder handling is needed.
+  static void subst_ctx(LamPtr& l, const std::map<int, int>& slots, const Ident& ctx) {
+    if (!l) return;
+    if (l->k == Lam::K::Var) {
+      auto it = slots.find(l->var.stamp);
+      if (it == slots.end()) return;
+      auto cv = mk(Lam::K::Var); cv->var = ctx;
+      auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = it->second;
+      f->args = {cv};
+      l = f;
+      return;
+    }
+    subst_ctx(l->fn, slots, ctx); subst_ctx(l->body, slots, ctx);
+    subst_ctx(l->cond, slots, ctx); subst_ctx(l->then_, slots, ctx);
+    subst_ctx(l->else_, slots, ctx); subst_ctx(l->sw_default, slots, ctx);
+    for (auto& a : l->args) subst_ctx(a, slots, ctx);
+    for (auto& b : l->bindings) subst_ctx(b.val, slots, ctx);
+    for (auto& sc : l->sw_consts) subst_ctx(sc.body, slots, ctx);
+    for (auto& sc : l->sw_blocks) subst_ctx(sc.body, slots, ctx);
+  }
+  // value_rec_compiler's split_static_function: descend the tail spine of a
+  // non-syntactic function RHS.  On commit, the tail function is lifted into
+  // `lifted` (its captured context locals rebound through ctx, see subst_ctx)
+  // and the tail slot becomes the context block (makeblock of the captured
+  // locals, in ascending-stamp order like upstream's Ident.Set); a variable
+  // tail eta-expands to a `stub` wrapper applying the single block field.
+  // Branch points admit at most one reachable arm.  The check pass
+  // (commit=false) never mutates, so a Fail leaves the term intact.
+  enum class SplitR { Fail, Unreach, Ok };
+  SplitR split_fn(LamPtr& slot, const Ident& ctx, std::map<int, Ident>& locals,
+                  bool commit, LamPtr& lifted, int& blk_size) {
+    LamPtr l = slot;
+    if (!l) return SplitR::Fail;
+    switch (l->k) {
+      case Lam::K::Var: {  // eta-expansion
+        if (!commit) return SplitR::Ok;
+        Ident p = fresh("let_rec_param");
+        auto cv = mk(Lam::K::Var); cv->var = ctx;
+        auto fld = mk(Lam::K::Prim); fld->prim = Prim::FieldImm; fld->prim_arg = 0;
+        fld->args = {cv};
+        auto pv = mk(Lam::K::Var); pv->var = p;
+        auto ap = mk(Lam::K::Apply); ap->fn = fld; ap->args = {pv};
+        auto fn = mk(Lam::K::Function); fn->params = {{p, ValueKind::Gen}};
+        fn->inline_attr = "stub"; fn->body = ap;
+        lifted = fn; blk_size = 1;
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+        blk->args = {l};
+        slot = blk;
+        return SplitR::Ok;
+      }
+      case Lam::K::Function: {
+        if (!commit) return SplitR::Ok;
+        std::set<int> bound; std::map<int, Ident> fv;
+        free_vars(l, bound, fv);
+        std::map<int, int> slots; std::vector<LamPtr> fields;
+        for (auto& [s, id] : fv)
+          if (locals.count(s)) {
+            slots[s] = (int)fields.size();
+            auto v = mk(Lam::K::Var); v->var = id; fields.push_back(v);
+          }
+        subst_ctx(l->body, slots, ctx);
+        lifted = l; blk_size = (int)fields.size();
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+        blk->args = std::move(fields);
+        slot = blk;
+        return SplitR::Ok;
+      }
+      case Lam::K::Let: case Lam::K::Letrec:
+        for (auto& b : l->bindings) locals.emplace(b.id.stamp, b.id);
+        return split_fn(l->body, ctx, locals, commit, lifted, blk_size);
+      case Lam::K::Sequence:
+        return split_fn(l->else_, ctx, locals, commit, lifted, blk_size);
+      case Lam::K::IfThenElse:
+        return split_arms({&l->then_, &l->else_}, ctx, locals, commit, lifted, blk_size);
+      case Lam::K::Try:
+        locals.emplace(l->var.stamp, l->var);
+        return split_arms({&l->body, &l->then_}, ctx, locals, commit, lifted, blk_size);
+      case Lam::K::Catch:
+        for (auto& v : l->catch_vars) locals.emplace(v.stamp, v);
+        return split_arms({&l->cond, &l->then_}, ctx, locals, commit, lifted, blk_size);
+      case Lam::K::Switch: {
+        std::vector<LamPtr*> arms;
+        for (auto& sc : l->sw_consts) arms.push_back(&sc.body);
+        for (auto& sc : l->sw_blocks) arms.push_back(&sc.body);
+        if (l->sw_default) arms.push_back(&l->sw_default);
+        return split_arms(arms, ctx, locals, commit, lifted, blk_size);
+      }
+      case Lam::K::Staticraise: return SplitR::Unreach;
+      case Lam::K::Prim:
+        return (l->prim == Prim::Raise || l->prim == Prim::Reraise)
+                   ? SplitR::Unreach : SplitR::Fail;
+      default: return SplitR::Fail;
+    }
+  }
+  SplitR split_arms(const std::vector<LamPtr*>& arms, const Ident& ctx,
+                    std::map<int, Ident>& locals, bool commit,
+                    LamPtr& lifted, int& blk_size) {
+    LamPtr* ok = nullptr;
+    for (auto* a : arms) {
+      SplitR r = split_fn(*a, ctx, locals, false, lifted, blk_size);
+      if (r == SplitR::Fail) return SplitR::Fail;
+      if (r == SplitR::Ok) {
+        if (ok) return SplitR::Fail;  // multiple reachable functions
+        ok = a;
       }
     }
+    if (!ok) return SplitR::Unreach;
+    return commit ? split_fn(*ok, ctx, locals, true, lifted, blk_size) : SplitR::Ok;
+  }
+  // Simplif's `(let (x = e) x)` -> e on the binding spine.  ocamlc runs this
+  // simplification *after* value_rec compilation, so rec RHSs reach
+  // partition_rec un-collapsed (rec_spine_ suppresses the translate-time
+  // rule) and are collapsed here afterwards.
+  static LamPtr collapse_let_id(LamPtr l) {
+    if (!l) return l;
+    if (l->k == Lam::K::Let && l->body) {
+      l->body = collapse_let_id(l->body);
+      while (!l->bindings.empty() && !l->bindings.back().mut &&
+             l->body->k == Lam::K::Var &&
+             l->body->var.stamp == l->bindings.back().id.stamp) {
+        LamPtr v = l->bindings.back().val;
+        l->bindings.pop_back();
+        l->body = collapse_let_id(v);
+      }
+      if (l->bindings.empty()) return l->body;
+    } else if (l->k == Lam::K::Sequence && l->else_) {
+      l->else_ = collapse_let_id(l->else_);
+    }
+    return l;
+  }
+  // Partition a `let rec` group for value recursion, mirroring ocamlc's
+  // value_rec_compiler: sized heap blocks become caml_alloc_dummy pre-bindings
+  // backpatched in place; constants stay ordinary bindings (placed after the
+  // allocs, like upstream's dynamic class); syntactic functions stay a letrec;
+  // a non-syntactic function splits into a lifted function plus a backpatched
+  // context block (split_fn).  The result shape is `(let <allocs;consts>
+  // (letrec <funcs> (seq <updates> body)))`.  False when every binding is
+  // already a syntactic function (plain letrec) or a binding fits no class
+  // (unsupported; caller keeps its existing path).
+  bool partition_rec(const std::vector<Ident>& ids, const std::vector<ValueKind>& kinds,
+                     const std::vector<LamPtr>& vals, RecParts& out) {
+    enum Cls { Func, Lift, Block, Cst };
+    std::vector<Cls> cls(vals.size());
+    std::vector<int> bsize(vals.size(), 0);
+    bool transform = false;  // any non-(syntactic-function) binding?
+    for (size_t i = 0; i < vals.size(); ++i) {
+      auto& v = vals[i];
+      if (v->k == Lam::K::Function) { cls[i] = Func; continue; }
+      transform = true;
+      if (is_rec_const(v)) { cls[i] = Cst; continue; }
+      std::map<int, RSize> env;
+      RSize sz = static_size(v, env);
+      if (sz.k == RSize::Block) { cls[i] = Block; bsize[i] = sz.n; continue; }
+      if (sz.k == RSize::Func) {
+        std::map<int, Ident> locals; LamPtr lf; int bs = 0;
+        LamPtr probe = v;
+        if (split_fn(probe, Ident{}, locals, false, lf, bs) == SplitR::Ok) {
+          cls[i] = Lift;
+          continue;
+        }
+      }
+      return false;
+    }
+    if (!transform) return false;
+    std::vector<Lam::Binding> consts;
+    for (size_t i = 0; i < vals.size(); ++i) {
+      LamPtr v = vals[i];
+      switch (cls[i]) {
+        case Func: out.funcs.push_back({ids[i], kinds[i], v}); break;
+        case Cst: consts.push_back({ids[i], kinds[i], v}); break;
+        case Block:
+          out.dummies.push_back({ids[i], ValueKind::Gen, alloc_dummy(bsize[i])});
+          out.updates.push_back(update_dummy(ids[i], collapse_let_id(v)));
+          break;
+        case Lift: {
+          Ident ctx = fresh("letrec_function_context");
+          std::map<int, Ident> locals; LamPtr lf; int bs = 0;
+          split_fn(v, ctx, locals, true, lf, bs);
+          out.dummies.push_back({ctx, ValueKind::Gen, alloc_dummy(bs)});
+          out.funcs.push_back({ids[i], kinds[i], lf});
+          out.updates.push_back(update_dummy(ctx, v));
+          break;
+        }
+      }
+    }
+    out.dummies.insert(out.dummies.end(), consts.begin(), consts.end());
     return true;
   }
   LamPtr cchar(int c) { auto z = mk(Lam::K::ConstChar); z->int_val = c; return z; }
@@ -2252,6 +2536,10 @@ struct Translator {
   }
 
   LamPtr expr(const Expression& e) {
+    // The rec-RHS spine flag holds only along tail spines: take it, clear it,
+    // and re-set it just before each spine-continuing body recursion below.
+    bool rec_spine = rec_spine_;
+    rec_spine_ = false;
     // `M.(body)` / `let open M in body`: resolve `body`'s unqualified names in M.
     if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
       if (auto* op = std::get_if<Pstr_open>(&si->item->desc))
@@ -2261,6 +2549,7 @@ struct Translator {
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
           opened_.push_back(dotted);
+          rec_spine_ = rec_spine;
           LamPtr b = expr(*si->body);
           opened_.pop_back();
           return b;
@@ -2762,11 +3051,12 @@ struct Translator {
           std::holds_alternative<Ppat_any>(le->bindings[0].pat.desc)) {
         auto sq = mk(Lam::K::Sequence);
         sq->cond = expr(*le->bindings[0].expr);
+        rec_spine_ = rec_spine;
         sq->else_ = expr(*le->body);
         return sq;
       }
       // `let x = E in x` -> E: a linear alias binding ocamlc's simplif drops.
-      if (le->rf != RecFlag::Recursive && le->bindings.size() == 1)
+      if (!rec_spine && le->rf != RecFlag::Recursive && le->bindings.size() == 1)
         if (auto* pv = std::get_if<Ppat_var>(&le->bindings[0].pat.desc))
           if (auto* bid = std::get_if<Pexp_ident>(&le->body->desc))
             if (auto* bl = std::get_if<Lident>(&bid->id.txt.v); bl && bl->name == pv->name.txt)
@@ -2784,6 +3074,7 @@ struct Translator {
         for (auto& [b, id] : recs) {
           ids.push_back(id);
           kinds.push_back(pat_kind(&b->pat));
+          rec_spine_ = true;
           vals.push_back(expr(*b->expr));
         }
         RecParts rp;
@@ -2802,7 +3093,7 @@ struct Translator {
         }
         auto l = mk(Lam::K::Letrec);
         for (size_t i = 0; i < recs.size(); ++i)
-          l->bindings.push_back({ids[i], kinds[i], vals[i]});
+          l->bindings.push_back({ids[i], kinds[i], collapse_let_id(vals[i])});
         l->body = expr(*le->body);
         scope.pop_back();
         return l;
@@ -2817,6 +3108,7 @@ struct Translator {
             scope.back()[pv->name.txt] = rid;
             ValueKind k = expr_kind(init);
             LamPtr iv = expr(*init);
+            rec_spine_ = rec_spine;
             LamPtr body = expr(*le->body);
             auto l = mk(Lam::K::Let);
             if (ref_escapes(body, rid)) {  // escapes -> stays a heap ref
@@ -2872,6 +3164,7 @@ struct Translator {
           }
         }
       }
+      rec_spine_ = rec_spine;
       LamPtr body = wrap_binders(expr(*le->body), binders);
       scope.pop_back();
       if (l->bindings.empty()) return body;  // all bindings were field reads of a var
@@ -2888,6 +3181,7 @@ struct Translator {
     if (auto* sq = std::get_if<Pexp_sequence>(&e.desc)) {
       auto l = mk(Lam::K::Sequence);
       l->cond = expr(*sq->e1);
+      rec_spine_ = rec_spine;
       l->else_ = expr(*sq->e2);
       return l;
     }
@@ -3475,6 +3769,7 @@ struct Translator {
         for (auto& [b, id] : recs) {
           ids.push_back(id);
           kinds.push_back(pat_kind(&b->pat));
+          rec_spine_ = true;
           vals.push_back(with_inline(expr(*b->expr), b->attrs));
           add_export(std::get_if<Ppat_var>(&b->pat.desc)->name.txt, id);
         }
@@ -3496,7 +3791,7 @@ struct Translator {
         } else {
           std::vector<Lam::Binding> binds;
           for (size_t i = 0; i < recs.size(); ++i)
-            binds.push_back({ids[i], kinds[i], vals[i]});
+            binds.push_back({ids[i], kinds[i], collapse_let_id(vals[i])});
           segs.push_back({false, true, std::move(binds), nullptr, {}});
         }
         continue;
