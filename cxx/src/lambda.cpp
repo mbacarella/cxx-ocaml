@@ -2324,6 +2324,62 @@ struct Translator {
       return b;
     }
     if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
+      // Functional update `{e with l=v}`: unchanged fields read off the base --
+      // bound to an `init` temp unless it is already a variable (simplif's
+      // alias elimination), each read by its field kind/mutability.
+      if (rc->base && !rc->fields.empty()) {
+        const RecType* rt = nullptr;
+        std::string tname;
+        if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
+          if (auto it = rec_types_.find(f0->type); it != rec_types_.end()) {
+            rt = &it->second; tname = f0->type;
+          }
+        if (rt) {
+          auto index_of = [&](const std::string& l) {
+            for (size_t i = 0; i < rt->labels.size(); ++i)
+              if (rt->labels[i] == l) return (int)i;
+            return -1;
+          };
+          LamPtr basev = expr(**rc->base);
+          std::vector<LamPtr> vals(rt->labels.size());
+          bool ok = true;
+          for (auto& [lid, ve] : rc->fields) {
+            int ix = index_of(lid_last(lid.txt));
+            if (ix < 0 || vals[ix]) { ok = false; break; }
+            vals[ix] = expr(*ve);
+          }
+          if (ok) {
+            Ident tv; bool temp = basev->k != Lam::K::Var;
+            LamPtr bv = basev;
+            if (temp) { tv = fresh("init"); auto v = mk(Lam::K::Var); v->var = tv; bv = v; }
+            for (size_t i = 0; i < vals.size(); ++i) {
+              if (vals[i]) continue;
+              auto* fi = find_field(rt->labels[i]);
+              auto fr = mk(Lam::K::Prim);
+              fr->prim = rt->shape[i] == ValueKind::Int ? Prim::FieldInt
+                         : (fi && fi->type == tname && fi->mut) ? Prim::FieldMut
+                                                                : Prim::FieldImm;
+              fr->prim_arg = (int)i; fr->args = {bv};
+              vals[i] = fr;
+            }
+            LamPtr blk;
+            if (!rt->mut) {
+              blk = block(0, std::move(vals));
+              if (blk->k == Lam::K::Prim) blk->blk_shape = rt->shape;
+            } else {
+              auto m = mk(Lam::K::Prim);
+              m->prim = Prim::Makemutable; m->prim_arg = 0;
+              m->blk_shape = rt->shape; m->args = std::move(vals);
+              blk = m;
+            }
+            if (!temp) return blk;
+            auto l = mk(Lam::K::Let);
+            l->bindings = {{tv, ValueKind::Gen, basev}};
+            l->body = blk;
+            return l;
+          }
+        }
+      }
       if (!rc->base && !rc->fields.empty()) {  // not a functional update `{e with ..}`
         // Pick the record type: the first label's registered type when the
         // literal's label set fills it exactly; otherwise any known record type
