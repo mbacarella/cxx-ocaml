@@ -15,12 +15,19 @@ CACHE="${CACHE:-/tmp/instr_oracle_cache}"
 mkdir -p "$CACHE"
 key() { printf '%s' "$1" | tr '/' '%'; }
 # normalize: map each distinct L<n> to a sequential id by first appearance; trim.
-norm() { perl -0777 -pe 'BEGIN{%m=();$n=0} s{L(\d+)}{ "L" . ($m{$1} //= ++$n) }ge; s/\s+\z//'; }
+norm() { perl -0777 -pe 'BEGIN{%m=();$n=0}
+  s{L(\d+)}{ "L" . ($m{$1} //= ++$n) }ge;
+  s{"[^"]*/([^"/]+\.ml)"}{"$1"}g;   # location-block path -> basename (temp-dir vs real path)
+  s/\s+\z//'; }
 
 if [ "${1:-}" == "--worker" ]; then
   f="$2"
   ck="$CACHE/$(key "$f")"
   if [ ! -f "$ck" ]; then
+    # Compile in an isolated temp dir (so sibling .cmi files don't perturb the
+    # corpus) — the .cmo side effect stays out of the testsuite.  The location
+    # filename in Match_failure/Assert_failure blocks then differs from the path
+    # c++instr sees, so `norm` strips quoted .ml paths to their basename.
     td=$(mktemp -d)
     cp "$f" "$td/$(basename "$f")"
     timeout "$TIMEOUT" ./ocamlc.opt -nostdlib -I stdlib -dinstr -c "$td/$(basename "$f")" \
