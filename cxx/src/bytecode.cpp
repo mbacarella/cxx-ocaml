@@ -57,6 +57,8 @@ struct Bytegen {
     int rec_pos;
   };
   std::vector<ToCompile> functions_to_compile;  // a stack (LIFO)
+  int max_stack_ = 0;  // deepest stack slot used in the current code block (bytegen's
+                       // max_stack_used), for the caml_ensure_stack_capacity prologue.
 
   std::pair<int, Code> label_code(Code cont) {
     if (auto* h = head(cont)) {
@@ -326,6 +328,7 @@ struct Bytegen {
 
   Code comp_expr(const Env& env, const LamPtr& exp, int sz, Code cont) {
     using K = Lam::K;
+    if (sz > max_stack_) max_stack_ = sz;  // check_stack
     switch (exp->k) {
       case K::Var: {
         auto it = env.stack.find(exp->var.stamp);
@@ -629,7 +632,17 @@ struct Bytegen {
 
   // ---- functions & module ----
   Code comp_block(const Env& env, const LamPtr& exp, int sz, Code cont) {
-    return comp_expr(env, exp, sz, cont);
+    int saved = max_stack_;
+    max_stack_ = 0;
+    Code code = comp_expr(env, exp, sz, cont);
+    int used_safe = max_stack_ + 6;  // Config.stack_safety_margin
+    max_stack_ = saved;
+    if (used_safe > 32) {  // Config.stack_threshold: deep blocks check capacity first
+      auto n = std::make_shared<Lam>(); n->k = Lam::K::ConstInt; n->int_val = used_safe;
+      Instr kconst = I(Op::Const); kconst.cst = n;
+      return cons(kconst, cons(cc("caml_ensure_stack_capacity", 1), code));
+    }
+    return code;
   }
   Code comp_function(const ToCompile& tc, Code cont) {
     int arity = (int)tc.params.size();
