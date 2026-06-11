@@ -1403,8 +1403,10 @@ struct Checker {
       infer_expr(*sd->obj);
       return eng.any();
     }
-    if (auto* si = std::get_if<Pexp_setinstvar>(&e.desc)) {  // n <- e
-      infer_expr(*si->value);
+    if (auto* si = std::get_if<Pexp_setinstvar>(&e.desc)) {  // n <- e: e has n's type
+      TypePtr vt = infer_expr(*si->value);
+      for (auto it = venv.rbegin(); it != venv.rend(); ++it)
+        if (auto f = it->find(si->name.txt); f != it->end()) { try_unify(f->second, vt); break; }
       return eng.any();
     }
     if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
@@ -1412,27 +1414,7 @@ struct Checker {
       // params/results value kinds and records format literals (lowered by Lambda).
       // In --check mode the object's self/instance-var model is incomplete, so stay
       // dynamic to avoid false-rejects (the advance-together law).
-      if (!record_kinds_) return eng.any();
-      auto& cs = *ob->cs;
-      venv.emplace_back();
-      if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = eng.any();
-      // Instance variables are visible to all methods, typed from their initialiser.
-      for (auto& f : cs.fields)
-        if (auto* v = std::get_if<Pcf_val>(&f.desc))
-          if (auto* cc = std::get_if<Cfk_concrete>(&v->kind))
-            venv.back()[v->name.txt] = infer_expr(*cc->e);
-      for (auto& f : cs.fields) {
-        if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
-          if (auto* cc = std::get_if<Cfk_concrete>(&m->kind)) {
-            const Expression* body = cc->e.get();
-            if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) body = poly->e.get();
-            infer_expr(*body);
-          }
-        } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
-          infer_expr(*ini->e);
-        }
-      }
-      venv.pop_back();
+      if (record_kinds_) infer_object_body(*ob->cs);
       return eng.any();
     }
     return eng.any();  // records/fields/objects/etc. unhandled: dynamic, no clash
@@ -1554,6 +1536,30 @@ struct Checker {
       ft = I::Engine::repr(r);
     }
     return ft;
+  }
+
+  // Type an object/class body for value kinds: instance vars from their initialiser,
+  // method/initializer bodies (so params/results get kinds and format literals are
+  // recorded).  Value-kind pass only.
+  void infer_object_body(const ast::ClassStructure& cs) {
+    venv.emplace_back();
+    if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = eng.any();
+    for (auto& f : cs.fields)
+      if (auto* v = std::get_if<Pcf_val>(&f.desc))
+        if (auto* cc = std::get_if<Cfk_concrete>(&v->kind))
+          venv.back()[v->name.txt] = infer_expr(*cc->e);
+    for (auto& f : cs.fields) {
+      if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+        if (auto* cc = std::get_if<Cfk_concrete>(&m->kind)) {
+          const Expression* body = cc->e.get();
+          if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) body = poly->e.get();
+          infer_expr(*body);
+        }
+      } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
+        infer_expr(*ini->e);
+      }
+    }
+    venv.pop_back();
   }
 
   TypePtr infer_function(const Pexp_function& f) {
@@ -2006,7 +2012,11 @@ struct Checker {
           }
         } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings);
-        else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
+        else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
+          if (record_kinds_)  // value kinds for class method bodies (see Pexp_object)
+            for (auto& d : pc->decls)
+              if (auto* ps = std::get_if<Pcl_structure>(&d.expr.desc)) infer_object_body(ps->cs);
+        } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
           infer_expr(*ev->e);
         else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;

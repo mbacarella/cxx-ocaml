@@ -504,6 +504,9 @@ struct Translator {
   // Each object/class definition gets a 1-based index; its methods' self parameter
   // is named `self-<index>` (Translclass's enter_class_definition depth).
   int obj_counter_ = 0;
+  // Stamps of class-value bindings (`class c = ...`): `new c` reads obj_init at
+  // field 0 of the class 3-tuple.
+  std::set<int> class_ids_;
   // Shared method/variable-name constant blocks hoisted to module top (Translobj's
   // `share`): a const-block key -> its `shared` binder, in creation order.  Wrapped
   // around the module body as `=a` bindings; single-use ones inline away (Simplif).
@@ -3934,6 +3937,27 @@ struct Translator {
     }
     if (auto* ob = std::get_if<Pexp_object>(&e.desc))
       if (LamPtr o = object_expr(*ob->cs)) return o;
+    if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {  // new c -> (apply (field_mut 0 c) 0)
+      LamPtr clsval;
+      if (auto* l = std::get_if<Lident>(&nw->id.txt.v)) {
+        if (auto* b = lookup(l->name)) clsval = varof(*b);
+      } else if (auto* d = std::get_if<Ldot>(&nw->id.txt.v)) {
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (LamPtr base = module_base(pl->name)) {
+            auto& lay = module_layout_[pl->name];
+            if (auto f = lay.find(d->name); f != lay.end()) {
+              auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+              fi->prim_arg = f->second; fi->args = {base}; clsval = fi;
+            }
+          }
+      }
+      if (clsval) {
+        auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut; fm->prim_arg = 0;
+        fm->args = {clsval};
+        auto ap = mk(Lam::K::Apply); ap->fn = fm; ap->args = {cint(0)};
+        return ap;
+      }
+    }
     return mk(Lam::K::ConstInt);  // unsupported: placeholder (will DIFF)
   }
 
@@ -3985,11 +4009,15 @@ struct Translator {
     return s;
   }
 
-  // An immediate object `object (self) val.. method.. end` (Translclass.transl_object
-  // for the common toplevel case: Tcl_structure, concrete fields, no class
-  // parameters).  Returns null (-> placeholder) for shapes not yet handled
-  // (inherit / virtual / initializers).
-  LamPtr object_expr(const ast::ClassStructure& cs) {
+  LamPtr object_expr(const ast::ClassStructure& cs) { return build_object(cs, false); }
+
+  // An object structure `object (self) val.. method.. end` (Tcl_structure, concrete
+  // fields, no class parameters).  `as_class` selects the class-declaration form
+  // (a class_init function + make_class, obj_init taking a self argument) vs the
+  // immediate-object form (create_table + a direct obj_init applied to 0).  Returns
+  // null (-> placeholder) for shapes not yet handled (inherit/virtual/initializers).
+  LamPtr build_object(const ast::ClassStructure& cs, bool as_class,
+                      const std::string& class_name = "") {
     struct Meth { std::string name; const ast::Expression* body; };
     struct Val  { std::string name; const ast::Expression* init; };
     std::vector<Meth> meths;
@@ -4078,12 +4106,16 @@ struct Translator {
       }
     }
 
-    // The env_init function: `(function env (let (self = create_object_opt 0 class)
-    // (seq <val-inits> self)))`, or just the create_object_opt call when no vals.
+    // The env_init function: `(function env [self] (let (self2 = create_object_opt
+    // <obj> class) (seq <val-inits> self2)))`.  For a class the object argument is
+    // the env_init's own self parameter (so `new`/inheritance can pass an allocated
+    // object); for an immediate object it is 0.  No vals -> just the call.
+    Ident self_param = fresh("self");  // the obj_init parameter (class mode only)
+    LamPtr obj_arg = as_class ? varof(self_param) : cint(0);
     Ident selfo = fresh("self");
     LamPtr env_body;
     if (vals.empty()) {
-      env_body = oo_call("create_object_opt", {cint(0), varof(cla)});
+      env_body = oo_call("create_object_opt", {obj_arg, varof(cla)});
     } else {
       // val inits, right-associated in declaration order, then `(seq <inits> self)`
       // (create_object wraps the init sequence with `self` as its value).
@@ -4102,12 +4134,13 @@ struct Translator {
       auto outer = mk(Lam::K::Sequence); outer->cond = inits; outer->else_ = varof(selfo);
       auto let = mk(Lam::K::Let);
       let->bindings = {{selfo, ValueKind::Gen,
-                        oo_call("create_object_opt", {cint(0), varof(cla)}), false, false, false}};
+                        oo_call("create_object_opt", {obj_arg, varof(cla)}), false, false, false}};
       let->body = outer;
       env_body = let;
     }
     auto env_fn = mk(Lam::K::Function);
     env_fn->params = {{envp, ValueKind::Gen}};
+    if (as_class) env_fn->params.push_back({self_param, ValueKind::Gen});
     env_fn->body = env_body;
 
     inst_vars_ = save_iv; cur_meth_id_ = save_mid;
@@ -4148,9 +4181,12 @@ struct Translator {
       }
     } else {
       // new_methods_variables: one `ids` array, fields bound StrictOpt (`=o`).
+      // ocaml binds the var-name array (`names`) before the method-name array, so
+      // create the shared const for vals first to match the stamp/print order.
       Ident ids = fresh("ids");
+      LamPtr val_arr = nvals ? transl_meth_list(val_names) : nullptr;
       std::vector<LamPtr> nmv_args = {varof(cla), transl_meth_list(methl_names)};
-      if (nvals) nmv_args.push_back(transl_meth_list(val_names));
+      if (val_arr) nmv_args.push_back(val_arr);
       std::string getter = nvals ? "new_methods_variables" : "get_method_labels";
       // layout order: methl method labels, then val indices.
       std::vector<std::string> layout = methl_names;
@@ -4167,6 +4203,20 @@ struct Translator {
       outer->bindings = {{ids, ValueKind::Gen, oo_call(getter, nmv_args), false, false, false}};
       outer->body = let;
       cl_init = outer;
+    }
+
+    if (as_class) {
+      // A class declaration: wrap cl_init in the class_init function over the table,
+      // then `(apply make_class shared class_init)` returns the class 3-tuple.
+      Ident class_init = fresh(class_name + "_init");
+      auto ci_fn = mk(Lam::K::Function);
+      ci_fn->params = {{cla, ValueKind::Gen}};
+      ci_fn->body = cl_init;
+      auto mc = oo_call("make_class", {transl_meth_list(pub_meths), varof(class_init)});
+      auto let = mk(Lam::K::Let);
+      let->bindings = {{class_init, ValueKind::Gen, ci_fn, false, false, false}};
+      let->body = mc;
+      return let;
     }
 
     // ltable cla (ldirect obj_init):
@@ -4670,6 +4720,21 @@ struct Translator {
             if (auto* t = std::get_if<Pcstr_tuple>(&d->args))
               exn_arity_[nm] = (int)t->elems.size();
           add_export(nm, id);
+        }
+        continue;
+      }
+      if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {  // class c = object ... end
+        flush();
+        for (auto& d : pc->decls) {
+          Ident id = fresh(d.name.txt);
+          LamPtr v;
+          if (auto* ps = std::get_if<Pcl_structure>(&d.expr.desc))
+            v = build_object(ps->cs, /*as_class=*/true, d.name.txt);
+          if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
+          cur.push_back({id, ValueKind::Gen, v});
+          scope.back()[d.name.txt] = id;
+          class_ids_.insert(id.stamp);
+          add_export(d.name.txt, id);
         }
         continue;
       }
