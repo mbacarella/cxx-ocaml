@@ -2519,18 +2519,39 @@ struct Translator {
                          const Ppat_construct* k, const Expression& rhs,
                          const Expression* guard = nullptr, const LamPtr& dflt = nullptr) {
     scope.emplace_back();
-    std::vector<std::pair<int, Ident>> binders;
+    std::vector<std::pair<Ident, LamPtr>> binders;  // bound var -> field-access path
     bool ok = true;
-    auto bind_field = [&](int idx, const Pattern& p) {
-      if (std::holds_alternative<Ppat_any>(p.desc)) return;             // wildcard: no binder
-      if (auto* pv = std::get_if<Ppat_var>(&p.desc)) {
-        Ident id = fresh(pv->name.txt);
-        scope.back()[pv->name.txt] = id;
-        binders.push_back({idx, id});
+    // Destructure a constructor field, binding its variables to the field-read
+    // chain.  Handles a nested *tuple/record* sub-pattern (`Some (x, y)`,
+    // `Ok {a; b}`) but bails on a nested constructor (it would add a tag test we
+    // don't model here) or any refutable pattern -- the caller then falls back.
+    std::function<void(const Pattern&, const LamPtr&)> destruct =
+        [&](const Pattern& p0, const LamPtr& acc) {
+      const Pattern* p = effective_pat(&p0);
+      if (std::holds_alternative<Ppat_any>(p->desc)) return;
+      if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
+        Ident id = fresh(pv->name.txt); scope.back()[pv->name.txt] = id;
+        binders.push_back({id, acc}); return;
+      }
+      if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+        Ident id = fresh(pa->name.txt); scope.back()[pa->name.txt] = id;
+        binders.push_back({id, acc}); destruct(*pa->p, acc); return;
+      }
+      if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
+        for (size_t i = 0; i < pt->elems.size(); ++i) destruct(*pt->elems[i], fieldimm((int)i, acc));
         return;
       }
-      ok = false;  // a deeper sub-pattern -- not handled here
+      if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+        for (auto& [lbl, sub] : pr->fields) {
+          const FieldInfo* fi = find_field(lid_last(lbl.txt));
+          if (!fi) { ok = false; return; }
+          destruct(*sub, field_read(fi, acc));
+        }
+        return;
+      }
+      ok = false;  // a nested constructor / constant / refutable sub-pattern
     };
+    auto bind_field = [&](int idx, const Pattern& p) { destruct(p, fieldimm(idx, scrut)); };
     if (k->arg) {
       const Pattern& arg = **k->arg;
       if (ci.arity > 1) {
@@ -2550,8 +2571,7 @@ struct Translator {
     }
     scope.pop_back();
     std::vector<Lam::Binding> aliases;
-    for (auto& [idx, id] : binders) {
-      LamPtr fa = fieldimm(idx, scrut);
+    for (auto& [id, fa] : binders) {
       if (count_var(body, id) <= 1) subst_var(body, id, fa);
       else aliases.push_back({id, ValueKind::Gen, fa, true});
     }
