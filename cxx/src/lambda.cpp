@@ -941,7 +941,10 @@ struct Translator {
     auto a = mk(Lam::K::Apply); a->fn = expr(*ap.fn); a->args = std::move(args);
     return a;
   }
-  // (label kind, name) per parameter of a syntactic function -- its call signature.
+  // (label kind, name) per parameter of a syntactic function -- its call
+  // signature.  Follows the curried tail through sequences/lets/constraints so a
+  // function whose later parameters are nested (`fun ?a -> e; fun ~b -> ...`)
+  // still reports all of them.
   static FnSig fn_param_labels(const Pexp_function& f) {
     FnSig v;
     for (auto& fp : f.params) {
@@ -950,6 +953,22 @@ struct Translator {
       if (auto* lb = std::get_if<Labelled>(&pv->label)) v.push_back({1, lb->name});
       else if (auto* op = std::get_if<Optional>(&pv->label)) v.push_back({2, op->name});
       else v.push_back({0, ""});
+    }
+    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
+      const Expression* e = fb->e.get();
+      while (e) {  // peel an effect/binding spine down to a tail function
+        if (auto* sq = std::get_if<Pexp_sequence>(&e->desc)) { e = sq->e2.get(); continue; }
+        if (auto* le = std::get_if<Pexp_let>(&e->desc)) { e = le->body.get(); continue; }
+        if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) { e = ct->e.get(); continue; }
+        break;
+      }
+      if (e)
+        if (auto* nf = std::get_if<Pexp_function>(&e->desc)) {
+          FnSig more = fn_param_labels(*nf);
+          v.insert(v.end(), more.begin(), more.end());
+        }
+    } else if (std::holds_alternative<Pfunction_cases>(f.body->v)) {
+      v.push_back({0, ""});  // `function ...` adds one implicit positional parameter
     }
     return v;
   }
@@ -981,11 +1000,83 @@ struct Translator {
     }
     return {};
   }
-  // Match a call's arguments to the callee's parameter labels: reorder labelled
-  // args into parameter order, wrap a `~l:e` optional as `Some e` and pass a
-  // `?l:e` one as `e`, fill an omitted optional with `0` (None) when a later
-  // argument is still supplied, and append over-application args.  Null if the
-  // shape is one we can't place safely (caller then applies the args verbatim).
+  // Append args to an application (merging into an existing apply, like
+  // translcore's lapply).
+  LamPtr lapply_(LamPtr fn, std::vector<LamPtr> args) {
+    if (args.empty()) return fn;
+    if (fn->k == Lam::K::Apply) { for (auto& a : args) fn->args.push_back(a); return fn; }
+    auto a = mk(Lam::K::Apply); a->fn = fn; a->args = std::move(args); return a;
+  }
+  // One element of the parameter-ordered argument list: an Arg (its translated
+  // value) or an Omitted slot, with the parameter's optional flag.
+  struct AppArg { LamPtr val; bool omitted; bool optional; };
+  // Port of translcore's build_apply: build the application, evaluating arguments
+  // right-to-left in parameter order, and -- for an out-of-order partial
+  // application (an Omitted slot before a later Arg) -- protecting the already
+  // computed pieces in `let`s and wrapping the rest in a `stub` closure of the
+  // omitted parameters.  `acc` accumulates the consumed Args (reversed).
+  LamPtr build_apply(LamPtr lam, std::vector<std::pair<LamPtr, bool>> acc,
+                     const std::vector<AppArg>& list, size_t i) {
+    if (i >= list.size()) {  // [] -> apply lam to the accumulated args (un-reversed)
+      std::vector<LamPtr> a;
+      for (auto it = acc.rbegin(); it != acc.rend(); ++it) a.push_back(it->first);
+      return lapply_(lam, std::move(a));
+    }
+    if (!list[i].omitted) {  // Arg -> accumulate (prepend) and continue
+      acc.insert(acc.begin(), {list[i].val, list[i].optional});
+      return build_apply(lam, std::move(acc), list, i + 1);
+    }
+    // Omitted: out-of-order partial application -> a closure over this parameter.
+    std::vector<std::pair<Ident, LamPtr>> defs;
+    auto protect = [&](const std::string& nm, LamPtr l) -> LamPtr {
+      if (l->k == Lam::K::Var || is_const(l)) return l;
+      Ident id = fresh(nm);
+      defs.push_back({id, l});
+      auto v = mk(Lam::K::Var); v->var = id; return v;
+    };
+    bool all_opt = true;
+    for (auto& [a, o] : acc) if (!o) all_opt = false;
+    std::vector<std::pair<LamPtr, bool>> kept, delayed;
+    if (all_opt) delayed = acc; else kept = acc;  // delay all-optional args past here
+    LamPtr lam2 = lam;
+    if (!kept.empty()) {
+      std::vector<LamPtr> a;
+      for (auto it = kept.rbegin(); it != kept.rend(); ++it) a.push_back(it->first);
+      lam2 = lapply_(lam, std::move(a));
+    }
+    LamPtr handle = protect("func", lam2);
+    std::vector<std::pair<LamPtr, bool>> acc2;
+    for (auto& [a, o] : delayed) acc2.push_back({protect("arg", a), o});
+    std::vector<AppArg> rest;
+    for (size_t j = i + 1; j < list.size(); ++j) {
+      AppArg aa = list[j];
+      if (!aa.omitted) aa.val = protect("arg", aa.val);
+      rest.push_back(aa);
+    }
+    Ident id_arg = fresh("param");
+    auto idv = mk(Lam::K::Var); idv->var = id_arg;
+    std::vector<std::pair<LamPtr, bool>> recacc;
+    recacc.push_back({idv, list[i].optional});
+    for (auto& a : acc2) recacc.push_back(a);
+    LamPtr body = build_apply(handle, std::move(recacc), rest, 0);
+    LamPtr fn;  // merge into a curried function when the recursion already is one
+    if (body->k == Lam::K::Function && (int)body->params.size() < 120) {
+      body->params.insert(body->params.begin(), {id_arg, ValueKind::Gen});
+      fn = body;
+    } else {
+      fn = mk(Lam::K::Function); fn->params = {{id_arg, ValueKind::Gen}};
+      fn->inline_attr = "stub"; fn->body = body;
+    }
+    for (auto& [id, l] : defs) {  // wrap the protected defs (last-pushed outermost)
+      auto let = mk(Lam::K::Let); let->bindings = {{id, ValueKind::Gen, l}};
+      let->body = fn; fn = let;
+    }
+    return fn;
+  }
+  // Match a call's arguments to the callee's parameter labels (reorder labelled
+  // args, wrap a `~l:e` optional as `Some e`, pass a `?l:e` one directly, mark a
+  // missing parameter Omitted), then build the application via build_apply.  Null
+  // on a shape we can't place safely (caller then applies the args verbatim).
   LamPtr apply_labeled(const Expression* fnexpr, const FnSig& params, const Pexp_apply& ap) {
     const auto& as = ap.args;
     auto alabel = [&](size_t i, std::string& nm) -> int {
@@ -993,9 +1084,10 @@ struct Translator {
       if (auto* op = std::get_if<Optional>(&as[i].first)) { nm = op->name; return 2; }
       return 0;
     };
+    LamPtr fn = expr(*fnexpr);  // the function is translated before its arguments
     std::vector<bool> used(as.size(), false);
-    auto any_unused = [&] { for (size_t i = 0; i < as.size(); ++i) if (!used[i]) return true; return false; };
-    std::vector<LamPtr> out;
+    std::vector<AppArg> list;
+    int last_arg = -1;
     for (auto& [pk, pn] : params) {
       int found = -1, fk = 0;
       for (size_t i = 0; i < as.size(); ++i) {
@@ -1006,23 +1098,36 @@ struct Translator {
         if (pk == 2 && (k == 1 || k == 2) && nm == pn) { found = (int)i; fk = k; break; }
       }
       if (found < 0) {
-        if (pk == 2 && any_unused()) { out.push_back(cint(0)); continue; }  // None
-        break;  // a missing positional/labelled or a trailing optional -> partial app
+        // An omitted optional is filled with None (0); an omitted non-optional
+        // parameter (a skipped label) becomes an Omitted slot -> a stub closure.
+        if (pk == 2) list.push_back({cint(0), false, true});
+        else list.push_back({nullptr, true, false});
+        continue;
       }
       used[found] = true;
       LamPtr v = expr(*as[found].second);
-      if (pk == 2 && fk == 1) v = block(0, {v});  // ~l:e on an optional param -> Some e
-      out.push_back(v);
+      if (pk == 2 && fk == 1) {  // ~l:e on an optional param -> Some e
+        ValueKind vk = expr_kind(as[found].second.get());
+        v = block(0, {v});
+        if (v->k == Lam::K::Prim) v->blk_shape = {vk};  // a dynamic Some -> field shape
+      }
+      list.push_back({v, false, pk == 2});
+      last_arg = (int)list.size() - 1;
     }
-    for (size_t i = 0; i < as.size(); ++i)  // over-application: leftover args
+    if (last_arg < 0) return nullptr;  // nothing matched -> verbatim apply
+    list.resize(last_arg + 1);  // drop trailing Omitted (params beyond the call)
+    bool has_omitted = false;
+    for (auto& a : list) if (a.omitted) has_omitted = true;
+    std::vector<LamPtr> leftover;
+    for (size_t i = 0; i < as.size(); ++i)
       if (!used[i]) {
         std::string nm;
-        if (alabel(i, nm) != 0) return nullptr;  // a stray labelled arg -> can't place
-        out.push_back(expr(*as[i].second));
+        if (alabel(i, nm) != 0) return nullptr;  // a stray labelled over-app arg
+        leftover.push_back(expr(*as[i].second));
       }
-    if (out.empty()) return nullptr;
-    auto a = mk(Lam::K::Apply); a->fn = expr(*fnexpr); a->args = std::move(out);
-    return a;
+    if (!leftover.empty() && has_omitted) return nullptr;  // over-app + gap: too complex
+    LamPtr r = build_apply(fn, {}, list, 0);
+    return lapply_(r, std::move(leftover));
   }
   // Whether a pure path bottoms out in a global (a stdlib module) rather than a
   // local Var -- a global functor/argument is wrapped in `(let (let/N = p) ..)`.
