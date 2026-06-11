@@ -135,7 +135,8 @@ struct Render {
 // the byte comparison, so the actual values are irrelevant -- only widths matter.
 struct Pr {
   std::string ident(const Ident& i) {
-    std::string base = i.temp ? "*match*" : i.name;
+    // A compiler temp prints `*name*` (default `*match*` when unnamed, e.g. `*opt*`).
+    std::string base = i.temp ? "*" + (i.name.empty() ? "match" : i.name) + "*" : i.name;
     return base + "/" + std::to_string(i.stamp);
   }
 };
@@ -462,6 +463,10 @@ struct Translator {
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
   struct StdPrim { std::string name; int arity; };  // an external's prim_name + arity
   std::unordered_map<std::string, StdPrim> stdlib_prims;  // Stdlib value -> prim
+  // A labeled/optional function's parameter signature: (label kind 0/1/2, name)
+  // per parameter, keyed by the binder stamp -- used to match a call's arguments.
+  using FnSig = std::vector<std::pair<int, std::string>>;
+  std::map<int, FnSig> fn_sig_;
   // module name ("List", "Printf", ...) -> its value -> field index, cached.
   std::unordered_map<std::string, std::unordered_map<std::string, int>> mod_fields;
   // module name -> its value -> external prim (%builtin or C name) + arity, cached.
@@ -898,6 +903,28 @@ struct Translator {
     } catch (...) {}
     return labels;
   }
+  // The (label kind, name) signature of a qualified stdlib value from its cmi
+  // arrow type, for matching labelled/optional call arguments.
+  FnSig stdlib_value_sig(const std::string& mod, const std::string& name) {
+    FnSig s;
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& v : cmi.values())
+        if (v.name == name) {
+          cmi::TypePtr t = v.type;
+          while (t) {
+            while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst))
+              t = t->link;
+            if (!t || t->kind != cmi::TypeExpr::Tarrow) break;
+            s.push_back({t->label_kind, t->label});
+            t = t->cod;
+          }
+          break;
+        }
+    } catch (...) {}
+    return s;
+  }
   // Build `(apply fn args..)` inserting `0` (None) for each omitted optional
   // parameter the application passes; null if not applicable (no optionals, or a
   // labeled argument, which we don't match precisely).
@@ -912,6 +939,89 @@ struct Translator {
     }
     for (; ai < ap.args.size(); ++ai) args.push_back(expr(*ap.args[ai].second));  // over-app
     auto a = mk(Lam::K::Apply); a->fn = expr(*ap.fn); a->args = std::move(args);
+    return a;
+  }
+  // (label kind, name) per parameter of a syntactic function -- its call signature.
+  static FnSig fn_param_labels(const Pexp_function& f) {
+    FnSig v;
+    for (auto& fp : f.params) {
+      auto* pv = std::get_if<Pparam_val>(&fp.desc);
+      if (!pv) return {};  // a `(type a)` param mixed in -> don't model
+      if (auto* lb = std::get_if<Labelled>(&pv->label)) v.push_back({1, lb->name});
+      else if (auto* op = std::get_if<Optional>(&pv->label)) v.push_back({2, op->name});
+      else v.push_back({0, ""});
+    }
+    return v;
+  }
+  // Record a binding's parameter labels (only if it is a function with at least
+  // one labelled/optional parameter), so its call sites can reorder/wrap args.
+  void record_fn_sig(const Ident& id, const Expression* e) {
+    if (!e) return;
+    if (auto* f = std::get_if<Pexp_function>(&e->desc)) {
+      FnSig s = fn_param_labels(*f);
+      for (auto& [k, n] : s) if (k != 0) { fn_sig_[id.stamp] = s; return; }
+    }
+  }
+  // The callee's parameter signature for an application: a local function (by its
+  // recorded sig) or a qualified stdlib value (from its cmi arrow type).  Empty if
+  // unknown or unlabelled.
+  FnSig callee_sig(const Expression* fn) {
+    auto* id = std::get_if<Pexp_ident>(&fn->desc);
+    if (!id) return {};
+    if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
+      if (auto* b = lookup(l->name)) {
+        auto it = fn_sig_.find(b->stamp);
+        if (it != fn_sig_.end()) return it->second;
+      }
+    } else if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
+      if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+        FnSig s = stdlib_value_sig(pl->name, d->name);
+        for (auto& [k, n] : s) if (k != 0) return s;
+      }
+    }
+    return {};
+  }
+  // Match a call's arguments to the callee's parameter labels: reorder labelled
+  // args into parameter order, wrap a `~l:e` optional as `Some e` and pass a
+  // `?l:e` one as `e`, fill an omitted optional with `0` (None) when a later
+  // argument is still supplied, and append over-application args.  Null if the
+  // shape is one we can't place safely (caller then applies the args verbatim).
+  LamPtr apply_labeled(const Expression* fnexpr, const FnSig& params, const Pexp_apply& ap) {
+    const auto& as = ap.args;
+    auto alabel = [&](size_t i, std::string& nm) -> int {
+      if (auto* lb = std::get_if<Labelled>(&as[i].first)) { nm = lb->name; return 1; }
+      if (auto* op = std::get_if<Optional>(&as[i].first)) { nm = op->name; return 2; }
+      return 0;
+    };
+    std::vector<bool> used(as.size(), false);
+    auto any_unused = [&] { for (size_t i = 0; i < as.size(); ++i) if (!used[i]) return true; return false; };
+    std::vector<LamPtr> out;
+    for (auto& [pk, pn] : params) {
+      int found = -1, fk = 0;
+      for (size_t i = 0; i < as.size(); ++i) {
+        if (used[i]) continue;
+        std::string nm; int k = alabel(i, nm);
+        if (pk == 0 && k == 0) { found = (int)i; break; }
+        if (pk == 1 && k == 1 && nm == pn) { found = (int)i; break; }
+        if (pk == 2 && (k == 1 || k == 2) && nm == pn) { found = (int)i; fk = k; break; }
+      }
+      if (found < 0) {
+        if (pk == 2 && any_unused()) { out.push_back(cint(0)); continue; }  // None
+        break;  // a missing positional/labelled or a trailing optional -> partial app
+      }
+      used[found] = true;
+      LamPtr v = expr(*as[found].second);
+      if (pk == 2 && fk == 1) v = block(0, {v});  // ~l:e on an optional param -> Some e
+      out.push_back(v);
+    }
+    for (size_t i = 0; i < as.size(); ++i)  // over-application: leftover args
+      if (!used[i]) {
+        std::string nm;
+        if (alabel(i, nm) != 0) return nullptr;  // a stray labelled arg -> can't place
+        out.push_back(expr(*as[i].second));
+      }
+    if (out.empty()) return nullptr;
+    auto a = mk(Lam::K::Apply); a->fn = expr(*fnexpr); a->args = std::move(out);
     return a;
   }
   // Whether a pure path bottoms out in a global (a stdlib module) rather than a
@@ -3337,15 +3447,10 @@ struct Translator {
               if (auto p = value_prim(*it, n); !p.name.empty())
                 if (auto r = prim_to_lam(p.name, p.arity, *ap, e)) return r;
           }
-      // A call to a stdlib function with optional parameters inserts `0` (None)
-      // for each omitted optional the application passes (`Hashtbl.create 16` ->
-      // `(apply create 0 16)`).
-      if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
-        if (auto* d = std::get_if<Ldot>(&fid->id.txt.v))
-          if (auto* pl = std::get_if<Lident>(&d->prefix->v))
-            if (!module_base(pl->name) && !fields_of(pl->name).empty())
-              if (auto r = apply_optionals(*ap, stdlib_value_labels(pl->name, d->name)))
-                return r;
+      // A call to a labelled/optional function (local or a qualified stdlib value):
+      // reorder the arguments to parameter order, wrap/insert optionals.
+      if (FnSig sig = callee_sig(ap->fn.get()); !sig.empty())
+        if (auto r = apply_labeled(ap->fn.get(), sig, *ap)) return r;
       auto a = mk(Lam::K::Apply);
       a->fn = expr(*ap->fn);
       for (auto& [lbl, arg] : ap->args) a->args.push_back(expr(*arg));
@@ -3380,6 +3485,7 @@ struct Translator {
           if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
             Ident id = fresh(pv->name.txt);
             scope.back()[pv->name.txt] = id;
+            record_fn_sig(id, b.expr.get());
             recs.push_back({&b, id});
           }
         std::vector<Ident> ids; std::vector<ValueKind> kinds; std::vector<LamPtr> vals;
@@ -3491,6 +3597,7 @@ struct Translator {
           Lam::Binding bd{id, pat_kind(&b.pat), expr(*b.expr)};
           l->bindings.push_back(std::move(bd));
           scope.back()[pv->name.txt] = id;
+          record_fn_sig(id, b.expr.get());
         } else {  // `let (a,b) = e` / `let {a;b} = e`: the irrefutable sub-vars read
           LamPtr val = expr(*b.expr);  // fields of e -- directly when e is a var, else
           if (val->k == Lam::K::Var) {  // via a *match* temp bound to e
@@ -3577,16 +3684,30 @@ struct Translator {
     scope.emplace_back();
     auto l = mk(Lam::K::Function);
     std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured params
+    // An `?(x=default)` parameter becomes a `*opt*` param plus a body let binding
+    // `x = (if *opt* (field_imm 0 *opt*) default)` -- unwrap the option or use the
+    // default.  (A `?x` without a default keeps the option itself as the param.)
+    struct OptDef { Ident xid, optid; const Expression* def; ValueKind k; };
+    std::vector<OptDef> optdefs;
     const Pattern* refut = nullptr; Ident refut_pid; Location refut_loc; int nrefut = 0;
     for (auto& fp : f.params)
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
+        const Pattern* pat = &pv->pat;
+        while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) pat = pc->p.get();
+        if (std::holds_alternative<Optional>(pv->label) && pv->default_)
+          if (auto* var = std::get_if<Ppat_var>(&pat->desc)) {
+            Ident optid = fresh("opt", true);  // the `*opt*` parameter
+            l->params.push_back({optid, ValueKind::Gen});
+            Ident xid = fresh(var->name.txt);
+            scope.back()[var->name.txt] = xid;
+            optdefs.push_back({xid, optid, pv->default_->get(), pat_kind(pat)});
+            continue;
+          }
         // Every parameter gets a binder; a non-variable pattern (a constructor,
         // record or tuple) is named "param" like ocamlc.  An irrefutable one has its
         // variables bound to field reads in the body; a refutable one (a partial
         // pattern, e.g. `(Some x)`) is matched in the body, raising Match_failure on
         // the missing cases -- supported for at most one such parameter.
-        const Pattern* pat = &pv->pat;
-        while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) pat = pc->p.get();
         if (auto* var = std::get_if<Ppat_var>(&pat->desc)) {
           Ident id = fresh(var->name.txt);
           l->params.push_back({id, pat_kind(pat)});
@@ -3609,6 +3730,19 @@ struct Translator {
       }
     auto rk = vk.fn_ret.find(&f);
     l->ret_kind = rk == vk.fn_ret.end() ? ValueKind::Gen : vkind(rk->second);
+    // Wrap the body with each `?(x=default)` binding (outermost first).
+    auto wrap_optdefs = [&](LamPtr body) -> LamPtr {
+      for (auto it = optdefs.rbegin(); it != optdefs.rend(); ++it) {
+        auto cond = mk(Lam::K::Var); cond->var = it->optid;
+        auto optv = mk(Lam::K::Var); optv->var = it->optid;
+        auto iff = mk(Lam::K::IfThenElse);
+        iff->cond = cond; iff->then_ = fieldimm(0, optv); iff->else_ = expr(*it->def);
+        auto let = mk(Lam::K::Let);
+        let->bindings = {{it->xid, it->k, iff}};
+        let->body = body; body = let;
+      }
+      return body;
+    };
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
       LamPtr body;
       if (refut && nrefut == 1) {  // a partial parameter pattern -> match in the body
@@ -3618,7 +3752,7 @@ struct Translator {
       } else {
         body = expr(*fb->e);
       }
-      l->body = wrap_binders(body, binders);
+      l->body = wrap_optdefs(wrap_binders(body, binders));
     } else if (auto* fc = std::get_if<Pfunction_cases>(&f.body->v)) {
       // `function P -> ...` adds an implicit final parameter matched on.  A
       // single unguarded irrefutable case binds directly like an ordinary
@@ -3630,7 +3764,7 @@ struct Translator {
           Ident id = fresh(var->name.txt);
           l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
-          l->body = wrap_binders(expr(*fc->cases[0].rhs), binders);
+          l->body = wrap_optdefs(wrap_binders(expr(*fc->cases[0].rhs), binders));
           scope.pop_back();
           return l;
         }
@@ -3639,7 +3773,7 @@ struct Translator {
           l->params.push_back({pid, pat_kind(pat)});
           auto pvar = mk(Lam::K::Var); pvar->var = pid;
           collect_binders(*pat, pvar, binders);
-          l->body = wrap_binders(expr(*fc->cases[0].rhs), binders);
+          l->body = wrap_optdefs(wrap_binders(expr(*fc->cases[0].rhs), binders));
           scope.pop_back();
           return l;
         }
@@ -3647,7 +3781,7 @@ struct Translator {
       Ident pid = fresh("param");
       l->params.push_back({pid, ValueKind::Gen});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
-      l->body = wrap_binders(compile_match(scrut, fc->cases, floc), binders);
+      l->body = wrap_optdefs(wrap_binders(compile_match(scrut, fc->cases, floc), binders));
     } else {
       l->body = mk(Lam::K::ConstInt);
     }
@@ -4102,6 +4236,7 @@ struct Translator {
           if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
             Ident id = fresh(pv->name.txt);
             scope.back()[pv->name.txt] = id;
+            record_fn_sig(id, b.expr.get());
             recs.push_back({&b, id});
           }
         std::vector<Ident> ids; std::vector<ValueKind> kinds; std::vector<LamPtr> vals;
@@ -4148,6 +4283,7 @@ struct Translator {
           Ident id = fresh(pv->name.txt);
           cur.push_back({id, pat_kind(&b.pat), with_inline(expr(*b.expr), b.attrs)});
           scope.back()[pv->name.txt] = id;
+          record_fn_sig(id, b.expr.get());
           add_export(pv->name.txt, id);
         } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {
           flush(); segs.push_back({true, false, {}, expr(*b.expr)});  // `let _ = e` -> seq
