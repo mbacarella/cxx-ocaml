@@ -7,8 +7,11 @@
 #include "cppcaml/link.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -51,7 +54,24 @@ struct Unit {
   std::string name;
   std::vector<std::uint8_t> code;
   std::vector<Reloc> relocs;
+  bool force_link = false;             // cu_force_link: link even if unreferenced
+  std::vector<std::string> required;   // cu_required_compunits (pack submodules)
+  bool selected = false;               // chosen by the reachability pass
+  // Units this unit references / provides (from GetCompunit / SetCompunit relocs).
+  std::vector<std::string> req_units() const {
+    std::vector<std::string> r = required;
+    for (const Reloc& x : relocs) if (x.k == Reloc::GetCompunit) r.push_back(x.name);
+    return r;
+  }
+  std::vector<std::string> provides() const {
+    std::vector<std::string> p;
+    for (const Reloc& x : relocs) if (x.k == Reloc::SetCompunit) p.push_back(x.name);
+    return p;
+  }
 };
+// A linker input: a .cmo (one unit, always linked) or a .cma (link only the
+// units transitively required).
+struct InputFile { bool archive; std::vector<Unit> units; };
 
 // Convert a decoded Marshal value (the literal Obj.t) to an omarshal value.
 ValPtr conv(const m::Arena& a, std::size_t id) {
@@ -92,6 +112,10 @@ Unit parse_unit(const m::Arena& a, std::size_t cu, const std::vector<std::uint8_
   int cu_pos = (int)a[r.fields[1]].i;
   int cu_codesize = (int)a[r.fields[2]].i;
   u.code.assign(file.begin() + cu_pos, file.begin() + cu_pos + cu_codesize);
+  // cu_required_compunits (field 5, a string list) and cu_force_link (field 7).
+  if (r.fields.size() > 5)
+    for (std::size_t e : list_elems(a, r.fields[5])) u.required.push_back(a[e].str);
+  if (r.fields.size() > 7) u.force_link = a[r.fields[7]].i != 0;
   for (std::size_t e : list_elems(a, r.fields[3])) {  // cu_reloc: (reloc_info * int) list
     const m::Value& pair = a[e];
     const m::Value& info = a[pair.fields[0]];
@@ -110,23 +134,25 @@ Unit parse_unit(const m::Arena& a, std::size_t cu, const std::vector<std::uint8_
   return u;
 }
 
-std::vector<Unit> read_objects(const std::string& path) {
+InputFile read_objects(const std::string& path) {
   std::vector<std::uint8_t> file = read_file(path);
   if (file.size() < 16) throw std::runtime_error("not an object file: " + path);
   std::string magic((const char*)file.data(), 12);
   std::size_t off = be32(file, 12);
   m::Arena arena;
   std::size_t root = m::read_value(file.data(), file.size(), off, arena);
-  std::vector<Unit> units;
+  InputFile in;
   if (magic == "Caml1999O038") {            // .cmo: one compilation_unit
-    units.push_back(parse_unit(arena, root, file));
+    in.archive = false;
+    in.units.push_back(parse_unit(arena, root, file));
   } else if (magic == "Caml1999A038") {     // .cma: library, field 0 = unit list
+    in.archive = true;
     for (std::size_t cu : list_elems(arena, arena[root].fields[0]))
-      units.push_back(parse_unit(arena, cu, file));
+      in.units.push_back(parse_unit(arena, cu, file));
   } else {
     throw std::runtime_error("unknown object magic in " + path);
   }
-  return units;
+  return in;
 }
 
 // ---- Symtable ----
@@ -181,10 +207,31 @@ void link_executable(const std::vector<std::string>& inputs,
   Symtable st;
   st.init_predef();
 
-  // Gather units in link order, then resolve relocations and concatenate code.
+  // Read every input file (each is a .cmo or a .cma).
+  std::vector<InputFile> files;
+  for (const std::string& in : inputs) files.push_back(read_objects(in));
+
+  // Pass 1 -- reachability (bytelink's scan_file/Linkdeps).  Fold right-to-left:
+  // a .cmo is always linked; a .cma unit is linked only if force_link or its
+  // name is currently required.  Each linked unit's requires become required and
+  // its provides satisfied.  Because the link list (and a .cma's units) are in
+  // dependency order, the reverse fold propagates needs from users to providers.
+  std::set<std::string> missing;
+  auto take = [&](Unit& u) {
+    u.selected = true;
+    for (auto& r : u.req_units()) missing.insert(r);
+    for (auto& p : u.provides()) missing.erase(p);
+  };
+  for (auto fi = files.rbegin(); fi != files.rend(); ++fi)
+    for (auto ui = fi->units.rbegin(); ui != fi->units.rend(); ++ui)
+      if (!fi->archive || ui->force_link || missing.count(ui->name)) take(*ui);
+
+  // Pass 2 -- resolve relocations of the selected units, in original link order,
+  // and concatenate their code.
   std::vector<std::uint8_t> code;
-  for (const std::string& in : inputs) {
-    for (Unit u : read_objects(in)) {
+  for (InputFile& f : files) {
+    for (Unit& u : f.units) {
+      if (!u.selected) continue;
       for (const Reloc& r : u.relocs) {
         int n = 0;
         switch (r.k) {
