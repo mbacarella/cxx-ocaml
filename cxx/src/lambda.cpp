@@ -1198,6 +1198,50 @@ struct Translator {
     } catch (...) {}
     return std::nullopt;
   }
+  // The full layout of the stdlib record type (in module `mod`'s cmi) declaring
+  // `label`, for unqualified-label updates of non-opened stdlib records
+  // (`{ (Gc.get ()) with allocation_policy = 2 }`). All-float (flat) records
+  // have a different representation and are not handled.
+  struct StdRec { std::vector<std::string> labels; std::vector<ValueKind> shape; std::vector<bool> mut; };
+  std::optional<StdRec> stdlib_record_layout(const std::string& mod, const std::string& label) {
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Record) continue;
+        bool has = false;
+        for (auto& l : td.labels) if (l.name == label) { has = true; break; }
+        if (!has) continue;
+        StdRec r;
+        bool all_float = true;
+        for (auto& l : td.labels) {
+          r.labels.push_back(l.name);
+          r.shape.push_back(cmi_field_kind(l.type));
+          r.mut.push_back(l.mutable_);
+          if (r.shape.back() != ValueKind::Float) all_float = false;
+        }
+        if (all_float) return std::nullopt;
+        return r;
+      }
+    } catch (...) {}
+    return std::nullopt;
+  }
+  // The stdlib-module prefix governing a record label: an explicit `M.label`
+  // qualification, else the base expression's qualified head.
+  static std::string record_module_of(const Longident& lid, const Expression* base) {
+    if (auto* d = std::get_if<Ldot>(&lid.v))
+      if (auto* pl = std::get_if<Lident>(&d->prefix->v)) return pl->name;
+    while (base) {
+      if (auto* ap = std::get_if<Pexp_apply>(&base->desc)) { base = ap->fn.get(); continue; }
+      if (auto* ct = std::get_if<Pexp_constraint>(&base->desc)) { base = ct->e.get(); continue; }
+      break;
+    }
+    if (base)
+      if (auto* id = std::get_if<Pexp_ident>(&base->desc))
+        if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
+          if (auto* pl = std::get_if<Lident>(&d->prefix->v)) return pl->name;
+    return {};
+  }
 
   Ident fresh(const std::string& name, bool temp = false) { return Ident{name, stamp++, temp}; }
   ValueKind pat_kind(const Pattern* p) {
@@ -3265,11 +3309,28 @@ struct Translator {
       // alias elimination), each read by its field kind/mutability.
       if (rc->base && !rc->fields.empty()) {
         const RecType* rt = nullptr;
-        std::string tname;
+        RecType std_rt;            // backing store for a stdlib-cmi layout
+        std::vector<bool> fmut;    // per-field mutability, parallel to labels
         if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
           if (auto it = rec_types_.find(f0->type); it != rec_types_.end()) {
-            rt = &it->second; tname = f0->type;
+            rt = &it->second;
+            for (auto& l : it->second.labels) {
+              auto* fi = find_field(l);
+              fmut.push_back(fi && fi->type == f0->type && fi->mut);
+            }
           }
+        if (!rt) {  // a stdlib record of a non-opened module (e.g. Gc.control)
+          std::string mod = record_module_of(rc->fields[0].first.txt, rc->base->get());
+          if (!mod.empty())
+            if (auto sr = stdlib_record_layout(mod, lid_last(rc->fields[0].first.txt))) {
+              std_rt.labels = std::move(sr->labels);
+              std_rt.shape = std::move(sr->shape);
+              std_rt.mut = false;
+              for (bool m : sr->mut) if (m) std_rt.mut = true;
+              fmut = std::move(sr->mut);
+              rt = &std_rt;
+            }
+        }
         if (rt) {
           auto index_of = [&](const std::string& l) {
             for (size_t i = 0; i < rt->labels.size(); ++i)
@@ -3290,11 +3351,10 @@ struct Translator {
             if (temp) { tv = fresh("init"); auto v = mk(Lam::K::Var); v->var = tv; bv = v; }
             for (size_t i = 0; i < vals.size(); ++i) {
               if (vals[i]) continue;
-              auto* fi = find_field(rt->labels[i]);
               auto fr = mk(Lam::K::Prim);
               fr->prim = rt->shape[i] == ValueKind::Int ? Prim::FieldInt
-                         : (fi && fi->type == tname && fi->mut) ? Prim::FieldMut
-                                                                : Prim::FieldImm;
+                         : fmut[i]                      ? Prim::FieldMut
+                                                        : Prim::FieldImm;
               fr->prim_arg = (int)i; fr->args = {bv};
               vals[i] = fr;
             }
