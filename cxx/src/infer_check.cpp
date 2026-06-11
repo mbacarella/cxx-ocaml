@@ -1541,8 +1541,12 @@ struct Checker {
   // Type an object/class body for value kinds: instance vars from their initialiser,
   // method/initializer bodies (so params/results get kinds and format literals are
   // recorded).  Value-kind pass only.
-  void infer_object_body(const ast::ClassStructure& cs) {
+  void infer_object_body(const ast::ClassStructure& cs,
+                         const std::vector<const ast::Pattern*>* cl_params = nullptr) {
     venv.emplace_back();
+    // Class parameters: bind each so a val initialiser referencing one shares its
+    // type var with the instance variable (method-body unification then flows back).
+    if (cl_params) for (auto* p : *cl_params) infer_pat(*p);
     if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = eng.any();
     for (auto& f : cs.fields)
       if (auto* v = std::get_if<Pcf_val>(&f.desc))
@@ -2014,8 +2018,16 @@ struct Checker {
           infer_bindings(sv->rf, sv->bindings);
         else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
           if (record_kinds_)  // value kinds for class method bodies (see Pexp_object)
-            for (auto& d : pc->decls)
-              if (auto* ps = std::get_if<Pcl_structure>(&d.expr.desc)) infer_object_body(ps->cs);
+            for (auto& d : pc->decls) {
+              const ClassExpr* ce = &d.expr;
+              std::vector<const Pattern*> params;  // `class c x = ...` parameters
+              while (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
+                params.push_back(&pf->pat);
+                ce = pf->body.get();
+              }
+              if (auto* ps = std::get_if<Pcl_structure>(&ce->desc))
+                infer_object_body(ps->cs, params.empty() ? nullptr : &params);
+            }
         } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
           infer_expr(*ev->e);
         else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {

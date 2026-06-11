@@ -3600,6 +3600,18 @@ struct Translator {
           return send_expr(*sd, std::move(args));
         }
       }
+      // `new c arg..` is one application: (apply (field_mut 0 c) 0 arg..).
+      if (std::get_if<Pexp_new>(&ap->fn->desc)) {
+        bool simple = true;
+        for (auto& a : ap->args) if (!std::holds_alternative<Nolabel>(a.first)) simple = false;
+        if (simple) {
+          LamPtr nw = expr(*ap->fn);
+          if (nw->k == Lam::K::Apply) {
+            for (auto& a : ap->args) nw->args.push_back(expr(*a.second));
+            return nw;
+          }
+        }
+      }
       // Qualified module primitives: Array.get/set (kind-annotated), String/Bytes
       // length/get/set.  `x.(i)` / `s.[i]` desugar to these.
       if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
@@ -4072,12 +4084,17 @@ struct Translator {
   LamPtr object_expr(const ast::ClassStructure& cs) { return build_object(cs, false); }
 
   // An object structure `object (self) val.. method.. end` (Tcl_structure, concrete
-  // fields, no class parameters).  `as_class` selects the class-declaration form
-  // (a class_init function + make_class, obj_init taking a self argument) vs the
-  // immediate-object form (create_table + a direct obj_init applied to 0).  Returns
-  // null (-> placeholder) for shapes not yet handled (inherit/virtual/initializers).
+  // fields).  `as_class` selects the class-declaration form (a class_init function +
+  // make_class, obj_init taking a self argument) vs the immediate-object form
+  // (create_table + a direct obj_init applied to 0).  `cl_params` are class
+  // parameters (`class c x = ...`): extra obj_init parameters after self, in scope
+  // for the val initialisers.  A method referencing a class parameter needs the
+  // env-capture machinery (not yet built) -- detected post-translation and bailed.
+  // Returns null (-> placeholder) for shapes not yet handled (inherit/virtual/
+  // initializers/env capture).
   LamPtr build_object(const ast::ClassStructure& cs, bool as_class,
-                      const std::string& class_name = "") {
+                      const std::string& class_name = "",
+                      const std::vector<const ast::Pattern*>* cl_params = nullptr) {
     struct Meth { std::string name; const ast::Expression* body; };
     struct Val  { std::string name; const ast::Expression* init; };
     std::vector<Meth> meths;
@@ -4100,6 +4117,23 @@ struct Translator {
         return nullptr;  // inherit / initializer -- not yet supported
       }
     }
+
+    // Class parameters: var patterns only (a constraint wrapper is peeled).
+    // A parameter referenced by a method body is COPIED into an anonymous
+    // instance variable (`=o (new_variable class "")`), stored in env_init
+    // before the val inits; the method reads it via field_computed.  Val
+    // initialisers use the raw parameter directly.
+    struct CParam { std::string name; Ident pid, var_id; const ast::Pattern* pat;
+                    bool captured = false; };
+    std::vector<CParam> cparams;
+    if (cl_params)
+      for (auto* p : *cl_params) {
+        while (auto* pc = std::get_if<ast::Ppat_constraint>(&p->desc)) p = pc->p.get();
+        if (auto* pv = std::get_if<ast::Ppat_var>(&p->desc))
+          cparams.push_back({pv->name.txt, fresh(pv->name.txt), fresh(pv->name.txt), p});
+        else
+          return nullptr;  // destructuring/wildcard class params: unsupported
+      }
 
     // pub_meths: method names sorted by hash_variant ascending (create_table arg).
     std::vector<std::string> pub_meths;
@@ -4133,6 +4167,9 @@ struct Translator {
     for (auto& v : vals) inst_vars_[v.name] = val_id[v.name];
     cur_meth_id_ = meth_id;
     std::string self_name = "self-" + std::to_string(++obj_counter_);
+    scope.emplace_back();  // class parameters, visible to val inits and methods
+    for (auto& cp : cparams) scope.back()[cp.name] = cp.pid;
+    auto restore = [&] { scope.pop_back(); inst_vars_ = save_iv; cur_meth_id_ = save_mid; };
 
     // The set_methods block: in declaration order, each method's id var then its
     // method code -- a closure `(function self params.. <body>)`, or the builtin
@@ -4158,6 +4195,14 @@ struct Translator {
       }
       cur_self_ = save_self;
       scope.pop_back();
+      // A referenced class parameter is rewritten to its instance-var copy.
+      for (auto& cp : cparams)
+        if (count_var(fn->body, cp.pid)) {
+          auto fc = mk(Lam::K::Prim); fc->prim = Prim::FieldComputed;
+          fc->args = {varof(self), varof(cp.var_id)};
+          subst_var(fn->body, cp.pid, fc);
+          cp.captured = true;
+        }
       if (fn->params.size() == 1 && is_const_path(fn->body, self)) {
         methods_block.push_back(cint(0));      // GetConst
         methods_block.push_back(fn->body);
@@ -4173,23 +4218,37 @@ struct Translator {
     Ident self_param = fresh("self");  // the obj_init parameter (class mode only)
     LamPtr obj_arg = as_class ? varof(self_param) : cint(0);
     Ident selfo = fresh("self");
+    // The object-field stores: captured-parameter copies (parameter order), then
+    // the val inits (declaration order).
+    std::vector<LamPtr> stores;
+    for (auto& cp : cparams) {
+      if (!cp.captured) continue;
+      auto sf = mk(Lam::K::Prim); sf->prim = Prim::SetfieldComputed;
+      sf->prim_id = pat_kind(cp.pat) == ValueKind::Int
+                      ? "setfield_imm_computed" : "setfield_ptr_computed";
+      sf->args = {varof(selfo), varof(cp.var_id), varof(cp.pid)};
+      stores.push_back(sf);
+    }
+    for (auto& vl : vals) {
+      auto save_self = cur_self_; cur_self_ = selfo;
+      LamPtr v = expr(*vl.init);
+      cur_self_ = save_self;
+      auto sf = mk(Lam::K::Prim); sf->prim = Prim::SetfieldComputed;
+      sf->prim_id = value_is_immediate(vl.init)
+                      ? "setfield_imm_computed" : "setfield_ptr_computed";
+      sf->args = {varof(selfo), varof(val_id[vl.name]), v};
+      stores.push_back(sf);
+    }
     LamPtr env_body;
-    if (vals.empty()) {
+    if (stores.empty()) {
       env_body = oo_call("create_object_opt", {obj_arg, varof(cla)});
     } else {
-      // val inits, right-associated in declaration order, then `(seq <inits> self)`
-      // (create_object wraps the init sequence with `self` as its value).
+      // stores right-associated, then `(seq <stores> self)` (create_object wraps
+      // the init sequence with `self` as its value).
       LamPtr inits;
-      for (auto it = vals.rbegin(); it != vals.rend(); ++it) {
-        auto save_self = cur_self_; cur_self_ = selfo;
-        LamPtr v = expr(*it->init);
-        cur_self_ = save_self;
-        auto sf = mk(Lam::K::Prim); sf->prim = Prim::SetfieldComputed;
-        sf->prim_id = value_is_immediate(it->init)
-                        ? "setfield_imm_computed" : "setfield_ptr_computed";
-        sf->args = {varof(selfo), varof(val_id[it->name]), v};
-        if (!inits) inits = sf;
-        else { auto s = mk(Lam::K::Sequence); s->cond = sf; s->else_ = inits; inits = s; }
+      for (auto it = stores.rbegin(); it != stores.rend(); ++it) {
+        if (!inits) inits = *it;
+        else { auto s = mk(Lam::K::Sequence); s->cond = *it; s->else_ = inits; inits = s; }
       }
       auto outer = mk(Lam::K::Sequence); outer->cond = inits; outer->else_ = varof(selfo);
       auto let = mk(Lam::K::Let);
@@ -4201,9 +4260,10 @@ struct Translator {
     auto env_fn = mk(Lam::K::Function);
     env_fn->params = {{envp, ValueKind::Gen}};
     if (as_class) env_fn->params.push_back({self_param, ValueKind::Gen});
+    for (auto& cp : cparams) env_fn->params.push_back({cp.pid, ValueKind::Gen});
     env_fn->body = env_body;
 
-    inst_vars_ = save_iv; cur_meth_id_ = save_mid;
+    restore();
 
     // output_methods: exactly one (label, code) pair -> set_method, else a
     // set_methods over a makeblock of all the entries.
@@ -4263,6 +4323,17 @@ struct Translator {
       outer->bindings = {{ids, ValueKind::Gen, oo_call(getter, nmv_args), false, false, false}};
       outer->body = let;
       cl_init = outer;
+    }
+
+    // Captured-parameter instance variables: anonymous (`new_variable class ""`),
+    // bound `=o` outermost (printed before the method-label binders).
+    for (auto it = cparams.rbegin(); it != cparams.rend(); ++it) {
+      if (!it->captured) continue;
+      auto let = mk(Lam::K::Let);
+      let->bindings = {{it->var_id, ValueKind::Gen,
+                        oo_call("new_variable", {varof(cla), cstr("")}),
+                        false, false, /*strict_opt=*/true}};
+      let->body = cl_init; cl_init = let;
     }
 
     if (as_class) {
@@ -4788,8 +4859,19 @@ struct Translator {
         for (auto& d : pc->decls) {
           Ident id = fresh(d.name.txt);
           LamPtr v;
-          if (auto* ps = std::get_if<Pcl_structure>(&d.expr.desc))
-            v = build_object(ps->cs, /*as_class=*/true, d.name.txt);
+          // Peel `class c x y = ...` parameter wrappers (positional only).
+          const ClassExpr* ce = &d.expr;
+          std::vector<const Pattern*> params;
+          bool ok = true;
+          while (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
+            if (!std::holds_alternative<Nolabel>(pf->label) || pf->default_) { ok = false; break; }
+            params.push_back(&pf->pat);
+            ce = pf->body.get();
+          }
+          if (ok)
+            if (auto* ps = std::get_if<Pcl_structure>(&ce->desc))
+              v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
+                               params.empty() ? nullptr : &params);
           if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
           cur.push_back({id, ValueKind::Gen, v});
           scope.back()[d.name.txt] = id;
