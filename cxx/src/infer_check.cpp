@@ -1542,11 +1542,14 @@ struct Checker {
   // method/initializer bodies (so params/results get kinds and format literals are
   // recorded).  Value-kind pass only.
   void infer_object_body(const ast::ClassStructure& cs,
-                         const std::vector<const ast::Pattern*>* cl_params = nullptr) {
+                         const std::vector<const ast::Pattern*>* cl_params = nullptr,
+                         const std::vector<const ast::Pcl_let*>* cl_lets = nullptr) {
     venv.emplace_back();
     // Class parameters: bind each so a val initialiser referencing one shares its
     // type var with the instance variable (method-body unification then flows back).
     if (cl_params) for (auto* p : *cl_params) infer_pat(*p);
+    // `class c = let .. in object`: the local bindings, before the fields.
+    if (cl_lets) for (auto* lg : *cl_lets) infer_bindings(lg->rf, lg->bindings);
     if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = eng.any();
     for (auto& f : cs.fields)
       if (auto* v = std::get_if<Pcf_val>(&f.desc))
@@ -2021,12 +2024,19 @@ struct Checker {
             for (auto& d : pc->decls) {
               const ClassExpr* ce = &d.expr;
               std::vector<const Pattern*> params;  // `class c x = ...` parameters
-              while (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
-                params.push_back(&pf->pat);
-                ce = pf->body.get();
+              std::vector<const Pcl_let*> lets;    // `class c = let .. in object`
+              for (;;) {
+                if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
+                  params.push_back(&pf->pat);
+                  ce = pf->body.get();
+                } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
+                  lets.push_back(pl);
+                  ce = pl->body.get();
+                } else break;
               }
               if (auto* ps = std::get_if<Pcl_structure>(&ce->desc))
-                infer_object_body(ps->cs, params.empty() ? nullptr : &params);
+                infer_object_body(ps->cs, params.empty() ? nullptr : &params,
+                                  lets.empty() ? nullptr : &lets);
             }
         } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
           infer_expr(*ev->e);

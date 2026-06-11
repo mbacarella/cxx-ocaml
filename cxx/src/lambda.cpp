@@ -4094,7 +4094,8 @@ struct Translator {
   // initializers/env capture).
   LamPtr build_object(const ast::ClassStructure& cs, bool as_class,
                       const std::string& class_name = "",
-                      const std::vector<const ast::Pattern*>* cl_params = nullptr) {
+                      const std::vector<const ast::Pattern*>* cl_params = nullptr,
+                      const std::vector<const ast::Pcl_let*>* cl_lets = nullptr) {
     struct Meth { std::string name; const ast::Expression* body; };
     struct Val  { std::string name; const ast::Expression* init; };
     std::vector<Meth> meths;
@@ -4124,13 +4125,13 @@ struct Translator {
     // before the val inits; the method reads it via field_computed.  Val
     // initialisers use the raw parameter directly.
     struct CParam { std::string name; Ident pid, var_id; const ast::Pattern* pat;
-                    bool captured = false; };
+                    bool is_param; bool captured = false; };
     std::vector<CParam> cparams;
     if (cl_params)
       for (auto* p : *cl_params) {
         while (auto* pc = std::get_if<ast::Ppat_constraint>(&p->desc)) p = pc->p.get();
         if (auto* pv = std::get_if<ast::Ppat_var>(&p->desc))
-          cparams.push_back({pv->name.txt, fresh(pv->name.txt), fresh(pv->name.txt), p});
+          cparams.push_back({pv->name.txt, fresh(pv->name.txt), fresh(pv->name.txt), p, true});
         else
           return nullptr;  // destructuring/wildcard class params: unsupported
       }
@@ -4170,6 +4171,63 @@ struct Translator {
     scope.emplace_back();  // class parameters, visible to val inits and methods
     for (auto& cp : cparams) scope.back()[cp.name] = cp.pid;
     auto restore = [&] { scope.pop_back(); inst_vars_ = save_iv; cur_meth_id_ = save_mid; };
+
+    // `class c = let .. in object`: the bindings wrap the class_init function
+    // (bodies attached at the end).  Simple var lets and letrecs of functions
+    // only.  Their vars behave like class parameters: val inits use them
+    // directly, a method reference is copied into an anonymous instance var.
+    // A let RHS cannot reference a class parameter (bound only inside obj_init).
+    std::vector<LamPtr> let_layers;
+    size_t nparams = cparams.size();
+    auto rhs_leaks_param = [&](const LamPtr& v) {
+      for (size_t i = 0; i < nparams; ++i)
+        if (cparams[i].is_param && count_var(v, cparams[i].pid)) return true;
+      return false;
+    };
+    if (cl_lets)
+      for (auto* lg : *cl_lets) {
+        if (lg->rf == RecFlag::Recursive) {
+          auto lr = mk(Lam::K::Letrec);
+          std::vector<std::pair<const ast::ValueBinding*, Ident>> recs;
+          for (auto& b : lg->bindings) {
+            auto* pv = std::get_if<ast::Ppat_var>(&b.pat.desc);
+            if (!pv) { restore(); return nullptr; }
+            Ident id = fresh(pv->name.txt);
+            scope.back()[pv->name.txt] = id;
+            record_fn_sig(id, b.expr.get());
+            recs.push_back({&b, id});
+          }
+          for (auto& [b, id] : recs) {
+            rec_spine_ = true;
+            LamPtr v = expr(*b->expr);
+            // keep to the syntactic-function letrec class (no value recursion)
+            if (v->k != Lam::K::Function || rhs_leaks_param(v)) { restore(); return nullptr; }
+            lr->bindings.push_back({id, pat_kind(&b->pat), v});
+            auto& nm = std::get<ast::Ppat_var>(b->pat.desc).name.txt;
+            cparams.push_back({nm, id, fresh(nm), &b->pat, false});
+          }
+          let_layers.push_back(lr);
+        } else {
+          auto l = mk(Lam::K::Let);
+          std::vector<std::pair<const ast::ValueBinding*, Ident>> binds;
+          for (auto& b : lg->bindings) {  // RHSs see the outer scope only
+            auto* pv = std::get_if<ast::Ppat_var>(&b.pat.desc);
+            if (!pv) { restore(); return nullptr; }
+            LamPtr v = expr(*b.expr);
+            if (rhs_leaks_param(v)) { restore(); return nullptr; }
+            Ident id = fresh(pv->name.txt);
+            record_fn_sig(id, b.expr.get());
+            l->bindings.push_back({id, pat_kind(&b.pat), v});
+            binds.push_back({&b, id});
+          }
+          for (auto& [b, id] : binds) {
+            auto& nm = std::get<ast::Ppat_var>(b->pat.desc).name.txt;
+            scope.back()[nm] = id;
+            cparams.push_back({nm, id, fresh(nm), &b->pat, false});
+          }
+          let_layers.push_back(l);
+        }
+      }
 
     // The set_methods block: in declaration order, each method's id var then its
     // method code -- a closure `(function self params.. <body>)`, or the builtin
@@ -4260,7 +4318,8 @@ struct Translator {
     auto env_fn = mk(Lam::K::Function);
     env_fn->params = {{envp, ValueKind::Gen}};
     if (as_class) env_fn->params.push_back({self_param, ValueKind::Gen});
-    for (auto& cp : cparams) env_fn->params.push_back({cp.pid, ValueKind::Gen});
+    for (auto& cp : cparams)
+      if (cp.is_param) env_fn->params.push_back({cp.pid, ValueKind::Gen});
     env_fn->body = env_body;
 
     restore();
@@ -4343,9 +4402,14 @@ struct Translator {
       auto ci_fn = mk(Lam::K::Function);
       ci_fn->params = {{cla, ValueKind::Gen}};
       ci_fn->body = cl_init;
+      // `class c = let .. in object`: the let layers wrap the class_init fn.
+      LamPtr ci_val = ci_fn;
+      for (auto it = let_layers.rbegin(); it != let_layers.rend(); ++it) {
+        (*it)->body = ci_val; ci_val = *it;
+      }
       auto mc = oo_call("make_class", {transl_meth_list(pub_meths), varof(class_init)});
       auto let = mk(Lam::K::Let);
-      let->bindings = {{class_init, ValueKind::Gen, ci_fn, false, false, false}};
+      let->bindings = {{class_init, ValueKind::Gen, ci_val, false, false, false}};
       let->body = mc;
       return let;
     }
@@ -4859,19 +4923,27 @@ struct Translator {
         for (auto& d : pc->decls) {
           Ident id = fresh(d.name.txt);
           LamPtr v;
-          // Peel `class c x y = ...` parameter wrappers (positional only).
+          // Peel `class c x y = ...` parameter wrappers (positional only) and
+          // `class c = let .. in object` local-binding wrappers.
           const ClassExpr* ce = &d.expr;
           std::vector<const Pattern*> params;
+          std::vector<const Pcl_let*> lets;
           bool ok = true;
-          while (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
-            if (!std::holds_alternative<Nolabel>(pf->label) || pf->default_) { ok = false; break; }
-            params.push_back(&pf->pat);
-            ce = pf->body.get();
+          for (;;) {
+            if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
+              if (!std::holds_alternative<Nolabel>(pf->label) || pf->default_) { ok = false; break; }
+              params.push_back(&pf->pat);
+              ce = pf->body.get();
+            } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
+              lets.push_back(pl);
+              ce = pl->body.get();
+            } else break;
           }
           if (ok)
             if (auto* ps = std::get_if<Pcl_structure>(&ce->desc))
               v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
-                               params.empty() ? nullptr : &params);
+                               params.empty() ? nullptr : &params,
+                               lets.empty() ? nullptr : &lets);
           if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
           cur.push_back({id, ValueKind::Gen, v});
           scope.back()[d.name.txt] = id;
