@@ -4172,15 +4172,25 @@ struct Translator {
     // ltable cla (ldirect obj_init):
     //   (let (class = create_table(pub_meths)  obj_init = cl_init)
     //     (seq (init_class class) (apply obj_init 0)))
-    auto apply_init = mk(Lam::K::Apply); apply_init->fn = varof(obj_init);
-    apply_init->args = {cint(0)};
+    // When cl_init is directly a function (a method-less, val-less object), simplif
+    // inlines the single-use obj_init and beta-reduces the application, leaving
+    // `(seq (init_class class) (let (env = 0) <body>))`.
+    LamPtr top = mk(Lam::K::Let);
+    top->bindings = {{cla, ValueKind::Gen,
+                      oo_call("create_table", {transl_meth_list(pub_meths)}), false, false, false}};
     auto seq = mk(Lam::K::Sequence);
     seq->cond = oo_call("init_class", {varof(cla)});
-    seq->else_ = apply_init;
-    auto top = mk(Lam::K::Let);
-    top->bindings = {
-      {cla, ValueKind::Gen, oo_call("create_table", {transl_meth_list(pub_meths)}), false, false, false},
-      {obj_init, ValueKind::Gen, cl_init, false, false, false}};
+    if (cl_init->k == Lam::K::Function && cl_init->params.size() == 1) {
+      auto let = mk(Lam::K::Let);
+      let->bindings = {{cl_init->params[0].first, ValueKind::Gen, cint(0), false, false, false}};
+      let->body = cl_init->body;
+      seq->else_ = let;
+    } else {
+      top->bindings.push_back({obj_init, ValueKind::Gen, cl_init, false, false, false});
+      auto apply_init = mk(Lam::K::Apply); apply_init->fn = varof(obj_init);
+      apply_init->args = {cint(0)};
+      seq->else_ = apply_init;
+    }
     top->body = seq;
     return top;
   }
