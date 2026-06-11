@@ -241,6 +241,9 @@ struct Emitter {
       case Op::Offsetref: out(OFFSETREF); out_int(in.a); break;
       case Op::Isint: out(ISINT); break;
       case Op::Perform: out(PERFORM); break;
+      case Op::Getmethod: out(GETMETHOD); break;
+      case Op::Getpubmet: out(GETPUBMET); out_int(in.a); out_int(0); break;  // tag + cache
+      case Op::Getdynmet: out(GETDYNMET); break;
       case Op::Isout: out(ULTINT); break;
       case Op::Stop: out(STOP); break;
       default: break;

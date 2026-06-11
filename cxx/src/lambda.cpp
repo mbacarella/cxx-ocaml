@@ -2957,6 +2957,17 @@ struct Translator {
             l->body = body;
             return l;
           }
+    // A non-variable scrutinee with no `| n ->` catch-all is evaluated once into a
+    // `*match*` temp, so constructor arms reading its fields don't re-evaluate it
+    // (critical when the scrutinee reads mutable state an arm then mutates, e.g. an
+    // instance variable).  Kept only if used more than once (else simplif inlines).
+    if (scrut->k != Lam::K::Var) {
+      Ident mv = fresh("", true);
+      LamPtr body = compile_match(varof(mv), rows, mloc);
+      if (count_var(body, mv) <= 1) { subst_var(body, mv, scrut); return body; }
+      auto l = mk(Lam::K::Let); l->bindings = {{mv, ValueKind::Gen, scrut, false}};
+      l->body = body; return l;
+    }
     // Shared catch-all fallback via catch/exit: a guard on a non-variable pattern
     // makes guard-failure AND pattern-mismatch both reach the trailing catch-all,
     // so ocamlc emits it once behind `(catch <body> with (N) fallback)` with

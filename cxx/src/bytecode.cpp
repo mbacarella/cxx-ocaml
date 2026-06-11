@@ -233,6 +233,8 @@ struct Bytegen {
       case Prim::EqInt: return I(Op::Eqint);
       case Prim::Offsetref: return Iop(Op::Offsetref, e->prim_arg);
       case Prim::Offsetint: return Iop(Op::Offsetint, e->prim_arg);
+      case Prim::FieldComputed: return I(Op::Getvectitem);     // obj.(id)
+      case Prim::SetfieldComputed: return I(Op::Setvectitem);  // obj.(id) <- v
       case Prim::Ccall: return cc(bint_cname(e->prim_id), (int)e->args.size());
       case Prim::IntCmp: return intcmp_or_ccall(e);
       default: break;
@@ -459,6 +461,36 @@ struct Bytegen {
               return comp_expr(env, exp->args[0], sz, cons(I(Op::Perform), cont));
             }
             break;
+          case Prim::Send: {
+            // Method dispatch (bytegen's Lsend).  Public `(send obj tag args..)`:
+            // Kgetpubmet tag over (obj :: args).  Self `(sendself self m args..)`:
+            // Kgetmethod over (m :: self :: args).  Then apply to nargs (incl. obj).
+            bool self_send = exp->prim_id == "sendself";
+            const LamPtr& obj = exp->args[0];
+            const LamPtr& met = exp->args[1];
+            std::vector<LamPtr> realargs(exp->args.begin() + 2, exp->args.end());
+            int nargs = (int)realargs.size() + 1;
+            std::vector<LamPtr> args2;
+            Instr getm;
+            if (self_send) {
+              getm = I(Op::Getmethod);
+              args2.push_back(met); args2.push_back(obj);
+            } else {
+              getm = Iop(Op::Getpubmet, (int)met->int_val);
+              args2.push_back(obj);
+            }
+            for (auto& a : realargs) args2.push_back(a);
+            if (is_tailcall(cont)) {
+              Instr at = I(Op::Appterm); at.a = nargs; at.b = sz + nargs;
+              return comp_args(env, args2, sz, cons(getm, cons(at, discard_dead_code(cont))));
+            }
+            if (nargs < 4)
+              return comp_args(env, args2, sz, cons(getm, cons(Iop(Op::Apply, nargs), cont)));
+            auto [lbl, cont1] = label_code(cont);
+            return cons(Iop(Op::PushRetaddr, lbl),
+                     comp_args(env, args2, sz + 3,
+                       cons(getm, cons(Iop(Op::Apply, nargs), cont1))));
+          }
           case Prim::Raise:
             return comp_expr(env, exp->args[0], sz, cons(I(Op::Raise), discard_dead_code(cont)));
           case Prim::Reraise:
@@ -741,6 +773,9 @@ std::string instr_text(const Instr& i) {
     case Op::Vectlength: return "\tvectlength";
     case Op::Getvectitem: return "\tgetvectitem";
     case Op::Setvectitem: return "\tsetvectitem";
+    case Op::Getmethod: return "\tgetmethod";
+    case Op::Getpubmet: return "\tgetpubmet " + n(i.a);
+    case Op::Getdynmet: return "\tgetdynmet";
     case Op::Getfloatfield: return "\tgetfloatfield " + n(i.a);
     case Op::Setfloatfield: return "\tsetfloatfield " + n(i.a);
     case Op::Getstringchar: return "\tgetstringchar";
