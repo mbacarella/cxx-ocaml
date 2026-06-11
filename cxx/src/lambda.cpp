@@ -4100,6 +4100,7 @@ struct Translator {
     struct Val  { std::string name; const ast::Expression* init; };
     std::vector<Meth> meths;
     std::vector<Val> vals;
+    std::vector<const ast::Expression*> initializers;
     for (auto& f : cs.fields) {
       if (auto* m = std::get_if<ast::Pcf_method>(&f.desc)) {
         auto* cc = std::get_if<ast::Cfk_concrete>(&m->kind);
@@ -4111,11 +4112,13 @@ struct Translator {
         auto* cc = std::get_if<ast::Cfk_concrete>(&v->kind);
         if (!cc) return nullptr;  // virtual val
         vals.push_back({v->name.txt, cc->e.get()});
+      } else if (auto* ini = std::get_if<ast::Pcf_initializer>(&f.desc)) {
+        initializers.push_back(ini->e.get());
       } else if (std::get_if<ast::Pcf_constraint>(&f.desc) ||
                  std::get_if<ast::Pcf_attribute>(&f.desc)) {
         // no runtime effect
       } else {
-        return nullptr;  // inherit / initializer -- not yet supported
+        return nullptr;  // inherit -- not yet supported
       }
     }
 
@@ -4269,6 +4272,30 @@ struct Translator {
       }
     }
 
+    // Initializer bodies: closures over self, same instance-var/capture rules
+    // as methods; each becomes `(apply add_initializer class fn)` after
+    // set_methods.
+    std::vector<LamPtr> init_fns;
+    for (auto* ie : initializers) {
+      Ident self = fresh(self_name);
+      scope.emplace_back();
+      if (auto* pv = std::get_if<ast::Ppat_var>(&cs.self.desc)) scope.back()[pv->name.txt] = self;
+      auto save_self = cur_self_; cur_self_ = self;
+      auto fn = mk(Lam::K::Function);
+      fn->params = {{self, ValueKind::Gen}};
+      fn->body = expr(*ie);
+      cur_self_ = save_self;
+      scope.pop_back();
+      for (auto& cp : cparams)
+        if (count_var(fn->body, cp.pid)) {
+          auto fc = mk(Lam::K::Prim); fc->prim = Prim::FieldComputed;
+          fc->args = {varof(self), varof(cp.var_id)};
+          subst_var(fn->body, cp.pid, fc);
+          cp.captured = true;
+        }
+      init_fns.push_back(fn);
+    }
+
     // The env_init function: `(function env [self] (let (self2 = create_object_opt
     // <obj> class) (seq <val-inits> self2)))`.  For a class the object argument is
     // the env_init's own self parameter (so `new`/inheritance can pass an allocated
@@ -4299,16 +4326,22 @@ struct Translator {
     }
     LamPtr env_body;
     if (stores.empty()) {
-      env_body = oo_call("create_object_opt", {obj_arg, varof(cla)});
+      env_body = init_fns.empty()
+          ? oo_call("create_object_opt", {obj_arg, varof(cla)})
+          : oo_call("create_object_and_run_initializers", {obj_arg, varof(cla)});
     } else {
-      // stores right-associated, then `(seq <stores> self)` (create_object wraps
-      // the init sequence with `self` as its value).
+      // stores right-associated, then `(seq <stores> <tail>)` where the tail is
+      // self (create_object wraps the init sequence with it as its value), or
+      // the run-initializers call when the class has initializers.
+      LamPtr tail = init_fns.empty()
+          ? varof(selfo)
+          : oo_call("run_initializers_opt", {obj_arg, varof(selfo), varof(cla)});
       LamPtr inits;
       for (auto it = stores.rbegin(); it != stores.rend(); ++it) {
         if (!inits) inits = *it;
         else { auto s = mk(Lam::K::Sequence); s->cond = *it; s->else_ = inits; inits = s; }
       }
-      auto outer = mk(Lam::K::Sequence); outer->cond = inits; outer->else_ = varof(selfo);
+      auto outer = mk(Lam::K::Sequence); outer->cond = inits; outer->else_ = tail;
       auto let = mk(Lam::K::Let);
       let->bindings = {{selfo, ValueKind::Gen,
                         oo_call("create_object_opt", {obj_arg, varof(cla)}), false, false, false}};
@@ -4325,8 +4358,14 @@ struct Translator {
     restore();
 
     // output_methods: exactly one (label, code) pair -> set_method, else a
-    // set_methods over a makeblock of all the entries.
+    // set_methods over a makeblock of all the entries.  Initializer
+    // registrations follow set_methods, in declaration order.
     LamPtr cl_init = env_fn;
+    for (auto it = init_fns.rbegin(); it != init_fns.rend(); ++it) {
+      auto s = mk(Lam::K::Sequence);
+      s->cond = oo_call("add_initializer", {varof(cla), *it});
+      s->else_ = cl_init; cl_init = s;
+    }
     if (!methods_block.empty()) {
       LamPtr setm;
       if (methods_block.size() == 2) {
