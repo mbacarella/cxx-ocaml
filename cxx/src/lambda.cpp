@@ -2901,11 +2901,13 @@ struct Translator {
     }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
       // `assert false` -> raise directly; `assert e` -> (if e 0 (raise Assert_failure)).
+      // The Assert_failure location is the `assert …` span (kw_loc), which -- unlike
+      // e.loc -- is not widened to enclosing parens (ocaml's innermost loc_stack).
       auto* ic = std::get_if<Pexp_construct>(&as->e->desc);
-      if (ic && lid_last(ic->id.txt) == "false") return raise_predef("Assert_failure", e.loc);
+      if (ic && lid_last(ic->id.txt) == "false") return raise_predef("Assert_failure", as->kw_loc);
       auto i = mk(Lam::K::IfThenElse);
       i->cond = expr(*as->e); i->then_ = cint(0);
-      i->else_ = raise_predef("Assert_failure", e.loc);
+      i->else_ = raise_predef("Assert_failure", as->kw_loc);
       return i;
     }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) return lazy_expr(*lz->e);

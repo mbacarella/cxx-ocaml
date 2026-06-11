@@ -211,7 +211,9 @@ struct Pexp_record {
   std::optional<ExprBox> base;  // `{ e with ... }`
 };
 enum class DirectionFlag { Upto, Downto };
-struct Pexp_assert { ExprBox e; };
+struct Pexp_assert { ExprBox e; Location kw_loc; };  // kw_loc: the `assert …` span,
+// preserved before any paren relocation (ocaml's innermost pexp_loc_stack), used
+// for the Assert_failure location.
 struct Pexp_lazy { ExprBox e; };
 struct Pexp_variant { std::string label; std::optional<ExprBox> arg; };
 struct Pexp_newtype { StringLoc name; ExprBox body; };  // fun (type a) -> e

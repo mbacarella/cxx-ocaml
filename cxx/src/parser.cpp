@@ -837,7 +837,8 @@ class Parser {
       std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // assert%ext[@attr]
       ExprBox arg = parse_atom_postfix();
       Position ae = arg->loc.end;
-      return wrap_ext(E({Pexp_assert{std::move(arg)}, span(position(t.start), ae)}), std::move(ext), std::move(attrs));
+      Location kw = span(position(t.start), ae);  // the `assert …` span (survives paren reloc)
+      return wrap_ext(E({Pexp_assert{std::move(arg), kw}, kw}), std::move(ext), std::move(attrs));
     }
     if (cur().kind == Kind::LAZY) {
       Token t = cur(); advance();
