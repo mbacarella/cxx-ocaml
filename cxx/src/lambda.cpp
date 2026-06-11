@@ -2,7 +2,9 @@
 #include <cstdio>
 
 #include <algorithm>
+#include <cctype>
 #include <functional>
+#include <optional>
 #include <map>
 #include <set>
 #include <ostream>
@@ -236,7 +238,7 @@ DocP let_doc(const LamPtr& l, Pr& pr) {
       first = false;
       binds.push_back(box(BoxT::Box, 2,
           {text(pr.ident(b.id) + " =" +
-                std::string(b.mut ? "mut" : b.alias ? "a" : "") + kind_suffix(b.kind)),
+                std::string(b.mut ? "mut" : b.alias ? "a" : b.strict_opt ? "o" : "") + kind_suffix(b.kind)),
            brk(), to_doc(b.val, pr)}));
     }
     if (cur->body && cur->body->k == Lam::K::Let) cur = cur->body;
@@ -310,6 +312,9 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::Reraise: head = "(reraise"; break;
         case Prim::Makelazyblock:
           head = l->prim_arg == 250 ? "(makeforwardblock" : "(makelazyblock"; break;
+        case Prim::Send: head = "(" + (l->prim_id.empty() ? "send" : l->prim_id); break;
+        case Prim::FieldComputed: head = "(field_computed"; break;
+        case Prim::SetfieldComputed: head = "(" + l->prim_id; break;
       }
       std::vector<DocP> xs{text(head)};
       for (auto& a : l->args) { xs.push_back(brk()); xs.push_back(to_doc(a, pr)); }
@@ -487,6 +492,23 @@ struct Translator {
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
   // unqualified name resolves as `M.x` (a stdlib field or an external prim).
   std::vector<std::string> opened_;
+  // Object-method translation state.  Inside a method body `cur_self_` is the
+  // method's self parameter and `inst_vars_` maps each instance-variable name to
+  // its var-id binder (so `n` -> (field_computed self n) and `n<-e` ->
+  // (setfield_*_computed self n e)).  Empty outside an object.
+  std::optional<Ident> cur_self_;
+  std::unordered_map<std::string, Ident> inst_vars_;
+  // Method-label binders of the current object, so a self-send `self#m` lowers to
+  // (sendself self m) with the bound label rather than a public (send self tag).
+  std::unordered_map<std::string, Ident> cur_meth_id_;
+  // Each object/class definition gets a 1-based index; its methods' self parameter
+  // is named `self-<index>` (Translclass's enter_class_definition depth).
+  int obj_counter_ = 0;
+  // Shared method/variable-name constant blocks hoisted to module top (Translobj's
+  // `share`): a const-block key -> its `shared` binder, in creation order.  Wrapped
+  // around the module body as `=a` bindings; single-use ones inline away (Simplif).
+  std::vector<std::pair<std::string, Lam::Binding>> shared_consts_;
+  std::unordered_map<std::string, Ident> shared_index_;
   // The exception binders of the enclosing try/with handlers; `raise` of the
   // innermost caught exception is a `reraise`.
   std::vector<Ident> caught_exn_;
@@ -741,8 +763,15 @@ struct Translator {
     std::unordered_map<std::string, int> m;
     std::unordered_map<std::string, StdPrim> pr;
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                     : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      // Stdlib and the CamlinternalXxx units are top-level compilation units whose
+      // cmi is `<lowercase-first-char><rest>.cmi`; other stdlib modules are
+      // `stdlib__<Mod>.cmi` submodules.
+      std::string path;
+      if (mod == "Stdlib") path = stdlib_dir + "/stdlib.cmi";
+      else if (mod.rfind("Camlinternal", 0) == 0)
+        path = stdlib_dir + "/" + (char)std::tolower((unsigned char)mod[0]) + mod.substr(1) + ".cmi";
+      else path = stdlib_dir + "/stdlib__" + mod + ".cmi";
+      auto cmi = cmi::CmiFile::load(path);
       int i = 0;
       for (auto& f : cmi.sig().fields) m[f] = i++;
       for (auto& v : cmi.values()) if (!v.prim.empty()) pr[v.name] = {v.prim, v.prim_arity};
@@ -1176,6 +1205,48 @@ struct Translator {
     auto it = vk.expr.find(e);
     return it == vk.expr.end() ? ValueKind::Gen : vkind(it->second);
   }
+  // Approximate Typeopt.maybe_pointer for object val-inits / `n<-e`: is the value
+  // an immediate (Immediate -> setfield_imm_computed) rather than a heap pointer?
+  // The inferencer doesn't visit object bodies, so fall back to a syntactic check
+  // (constants, bool/unit, int arithmetic & comparisons) and default to pointer.
+  bool value_is_immediate(const Expression* e) {
+    if (expr_kind(e) == ValueKind::Int) return true;
+    if (auto* c = std::get_if<Pexp_constant>(&e->desc)) {
+      if (auto* i = std::get_if<Pconst_integer>(&c->c.desc)) return !i->suffix;  // l/L/n boxed
+      if (std::get_if<Pconst_char>(&c->c.desc)) return true;
+      return false;  // string/float
+    }
+    if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) return value_is_immediate(ct->e.get());
+    if (auto* k = std::get_if<Pexp_construct>(&e->desc)) {
+      std::string n = lid_last(k->id.txt);
+      return n == "true" || n == "false" || n == "()";
+    }
+    if (auto* ap = std::get_if<Pexp_apply>(&e->desc))
+      if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
+        if (auto* l = std::get_if<Lident>(&fid->id.txt.v)) {
+          const std::string& n = l->name;
+          static const std::set<std::string> imm = {
+            "+","-","*","/","mod","land","lor","lxor","lsl","lsr","asr","~-","abs",
+            "=","<>","<",">","<=",">=","==","!=","not","&&","||"};
+          if (imm.count(n)) return true;
+        }
+    if (auto* it = std::get_if<Pexp_ifthenelse>(&e->desc))
+      return it->else_ && value_is_immediate(it->then_.get()) && value_is_immediate((*it->else_).get());
+    return false;
+  }
+
+  // Translclass.const_path: a method body that is a self-contained value (a
+  // constant, an outer variable, or a closure not capturing self) becomes a
+  // GetConst builtin method instead of a closure.
+  bool is_const_path(const LamPtr& l, const Ident& self) {
+    switch (l->k) {
+      case Lam::K::ConstInt: case Lam::K::ConstChar: case Lam::K::ConstFloat:
+      case Lam::K::ConstString: case Lam::K::ConstBlock: return true;
+      case Lam::K::Var: return l->var.stamp != self.stamp;
+      case Lam::K::Function: return count_var(l->body, self) == 0;
+      default: return false;
+    }
+  }
   bool expr_is_string(const Expression* e) {  // string isn't a value kind; drives string compares
     auto it = vk.expr.find(e);
     return it != vk.expr.end() && it->second == "string";
@@ -1559,6 +1630,25 @@ struct Translator {
   }
 
   LamPtr cint(long long n) { auto z = mk(Lam::K::ConstInt); z->int_val = n; return z; }
+  LamPtr varof(const Ident& id) { auto v = mk(Lam::K::Var); v->var = id; return v; }
+
+  // Wrap the module body in the `=a` bindings for the shared method/variable-name
+  // const blocks (Translobj.transl_label_init_general); single-use ones inline
+  // into their use site (Simplif).  Multiply-used blocks print in reverse creation
+  // order (Ident.Map.fold places the largest stamp outermost).
+  LamPtr wrap_shared(LamPtr body) {
+    if (shared_consts_.empty()) return body;
+    std::vector<Lam::Binding> keep;
+    for (auto it = shared_consts_.rbegin(); it != shared_consts_.rend(); ++it) {
+      auto& b = it->second;
+      if (count_var(body, b.id) <= 1) subst_var(body, b.id, b.val);
+      else keep.push_back(b);
+    }
+    if (keep.empty()) return body;
+    auto let = mk(Lam::K::Let); let->bindings = std::move(keep); let->body = body;
+    return let;
+  }
+
   // A polymorphic-variant tag `` `Foo `` is represented at runtime by the hash of
   // its name (caml_hash_variant / typing/btype.ml hash_variant): an accumulator
   // mod 2^31, normalized to the signed range of an OCaml int.
@@ -3363,6 +3453,13 @@ struct Translator {
     if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
       if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
+        // An instance variable referenced in a method body: (field_computed self n).
+        if (cur_self_) if (auto iv = inst_vars_.find(l->name); iv != inst_vars_.end()) {
+          auto self = mk(Lam::K::Var); self->var = *cur_self_;
+          auto idv = mk(Lam::K::Var); idv->var = iv->second;
+          auto fc = mk(Lam::K::Prim); fc->prim = Prim::FieldComputed; fc->args = {self, idv};
+          return fc;
+        }
         auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
         if (auto pi = stdlib_prims.find(l->name); pi != stdlib_prims.end())  // prim as value
@@ -3419,6 +3516,16 @@ struct Translator {
     }
     if (auto* ap = std::get_if<Pexp_apply>(&e.desc)) {
       Prim p;
+      // A method call `o#m a b` is a single send carrying its arguments.
+      if (auto* sd = std::get_if<Pexp_send>(&ap->fn->desc)) {
+        bool simple = true;
+        for (auto& a : ap->args) if (!std::holds_alternative<Nolabel>(a.first)) simple = false;
+        if (simple) {
+          std::vector<LamPtr> args;
+          for (auto& a : ap->args) args.push_back(expr(*a.second));
+          return send_expr(*sd, std::move(args));
+        }
+      }
       // Qualified module primitives: Array.get/set (kind-annotated), String/Bytes
       // length/get/set.  `x.(i)` / `s.[i]` desugar to these.
       if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
@@ -3769,7 +3876,7 @@ struct Translator {
       if (auto* pv = std::get_if<Ppat_var>(&fo->var.desc)) {
         l->var = fresh(pv->name.txt); scope.back()[pv->name.txt] = l->var;
       } else {
-        l->var = fresh("param");  // `for _ = ...` (rare)
+        l->var = fresh("_for");  // `for _ = ...`: ocaml names the index `_for`
       }
       l->body = expr(*fo->body);
       scope.pop_back();
@@ -3802,7 +3909,269 @@ struct Translator {
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) return expr(*co->e);  // (e :> t) erased
     if (auto* pp = std::get_if<Pexp_pack>(&e.desc))   // (module ME): the module value
       return compile_module_expr(*pp->me);
+    if (auto* sd = std::get_if<Pexp_send>(&e.desc)) return send_expr(*sd, {});
+    if (auto* si = std::get_if<Pexp_setinstvar>(&e.desc)) {  // n <- e (in a method)
+      if (cur_self_) if (auto iv = inst_vars_.find(si->name.txt); iv != inst_vars_.end()) {
+        auto self = mk(Lam::K::Var); self->var = *cur_self_;
+        auto idv = mk(Lam::K::Var); idv->var = iv->second;
+        auto sf = mk(Lam::K::Prim); sf->prim = Prim::SetfieldComputed;
+        sf->prim_id = value_is_immediate(si->value.get())
+                        ? "setfield_imm_computed" : "setfield_ptr_computed";
+        sf->args = {self, idv, expr(*si->value)};
+        return sf;
+      }
+    }
+    if (auto* ob = std::get_if<Pexp_object>(&e.desc))
+      if (LamPtr o = object_expr(*ob->cs)) return o;
     return mk(Lam::K::ConstInt);  // unsupported: placeholder (will DIFF)
+  }
+
+  // Translobj.share: a hoisted module-global `shared` const-block of label
+  // strings, reused across the module; single-use ones inline away later.  An
+  // empty list is the integer 0.
+  LamPtr transl_meth_list(const std::vector<std::string>& labels) {
+    if (labels.empty()) return cint(0);
+    std::string key;
+    for (auto& s : labels) { key += std::to_string(s.size()); key += ':'; key += s; }
+    Ident id;
+    if (auto it = shared_index_.find(key); it != shared_index_.end()) id = it->second;
+    else {
+      id = fresh("shared");
+      auto blk = mk(Lam::K::ConstBlock); blk->prim_arg = 0;
+      for (auto& s : labels) { auto c = mk(Lam::K::ConstString); c->str_val = s; blk->args.push_back(c); }
+      Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = blk; b.alias = true;
+      shared_consts_.push_back({key, b});
+      shared_index_[key] = id;
+    }
+    auto v = mk(Lam::K::Var); v->var = id; return v;
+  }
+
+  // A CamlinternalOO value as `(field_imm idx (global CamlinternalOO!))`.
+  LamPtr oo_prim(const std::string& name) {
+    auto& fm = fields_of("CamlinternalOO");
+    auto it = fm.find(name);
+    return field_of("CamlinternalOO", it == fm.end() ? 0 : it->second);
+  }
+  LamPtr oo_call(const std::string& name, std::vector<LamPtr> args) {
+    auto a = mk(Lam::K::Apply); a->fn = oo_prim(name); a->args = std::move(args); return a;
+  }
+
+  // e#m, possibly applied to `args`: a public `(send obj tag args..)`, or
+  // `(sendself self m args..)` when the receiver is the enclosing method's self
+  // and `m` is one of the current object's methods.
+  LamPtr send_expr(const ast::Pexp_send& sd, std::vector<LamPtr> args) {
+    LamPtr obj = expr(*sd.obj);
+    auto s = mk(Lam::K::Prim); s->prim = Prim::Send;
+    if (cur_self_ && obj->k == Lam::K::Var && obj->var.stamp == cur_self_->stamp &&
+        cur_meth_id_.count(sd.meth.txt)) {
+      s->prim_id = "sendself";
+      s->args = {obj, varof(cur_meth_id_[sd.meth.txt])};
+    } else {
+      s->prim_id = "send";
+      s->args = {obj, cint(hash_variant(sd.meth.txt))};
+    }
+    for (auto& a : args) s->args.push_back(a);
+    return s;
+  }
+
+  // An immediate object `object (self) val.. method.. end` (Translclass.transl_object
+  // for the common toplevel case: Tcl_structure, concrete fields, no class
+  // parameters).  Returns null (-> placeholder) for shapes not yet handled
+  // (inherit / virtual / initializers).
+  LamPtr object_expr(const ast::ClassStructure& cs) {
+    struct Meth { std::string name; const ast::Expression* body; };
+    struct Val  { std::string name; const ast::Expression* init; };
+    std::vector<Meth> meths;
+    std::vector<Val> vals;
+    for (auto& f : cs.fields) {
+      if (auto* m = std::get_if<ast::Pcf_method>(&f.desc)) {
+        auto* cc = std::get_if<ast::Cfk_concrete>(&m->kind);
+        if (!cc) return nullptr;  // virtual method
+        const ast::Expression* body = cc->e.get();
+        if (auto* poly = std::get_if<ast::Pexp_poly>(&body->desc)) body = poly->e.get();
+        meths.push_back({m->name.txt, body});
+      } else if (auto* v = std::get_if<ast::Pcf_val>(&f.desc)) {
+        auto* cc = std::get_if<ast::Cfk_concrete>(&v->kind);
+        if (!cc) return nullptr;  // virtual val
+        vals.push_back({v->name.txt, cc->e.get()});
+      } else if (std::get_if<ast::Pcf_constraint>(&f.desc) ||
+                 std::get_if<ast::Pcf_attribute>(&f.desc)) {
+        // no runtime effect
+      } else {
+        return nullptr;  // inherit / initializer -- not yet supported
+      }
+    }
+
+    // pub_meths: method names sorted by hash_variant ascending (create_table arg).
+    std::vector<std::string> pub_meths;
+    for (auto& m : meths) pub_meths.push_back(m.name);
+    std::sort(pub_meths.begin(), pub_meths.end(),
+              [&](const std::string& a, const std::string& b) {
+                return hash_variant(a) < hash_variant(b); });
+    // methl: method names in descending name order (Meths.fold prepend order).
+    std::vector<std::string> methl_names;
+    for (auto& m : meths) methl_names.push_back(m.name);
+    std::sort(methl_names.begin(), methl_names.end(), std::greater<>());
+    std::vector<std::string> val_names;
+    for (auto& v : vals) val_names.push_back(v.name);
+    int len = (int)methl_names.size(), nvals = (int)val_names.size();
+
+    Ident cla = fresh("class");
+    Ident obj_init = fresh("obj_init");
+    Ident envp = fresh("env");
+
+    // Method-id and val-id binders (used both in the index bindings and as the
+    // method-label entries of the set_methods block).
+    std::unordered_map<std::string, Ident> meth_id, val_id;
+    for (auto& n : methl_names) meth_id[n] = fresh(n);
+    for (auto& n : val_names)   val_id[n]  = fresh(n);
+
+    // Translate method bodies and val initialisers with the instance variables in
+    // scope (a method's `n` -> (field_computed self n)) and the method labels
+    // known (so a self-send resolves to (sendself self m)).
+    auto save_iv = inst_vars_; auto save_mid = cur_meth_id_;
+    inst_vars_.clear();
+    for (auto& v : vals) inst_vars_[v.name] = val_id[v.name];
+    cur_meth_id_ = meth_id;
+    std::string self_name = "self-" + std::to_string(++obj_counter_);
+
+    // The set_methods block: in declaration order, each method's id var then its
+    // method code -- a closure `(function self params.. <body>)`, or the builtin
+    // `GetConst <value>` (tag 0) when the body is a self-contained value.
+    std::vector<LamPtr> methods_block;
+    for (auto& m : meths) {
+      methods_block.push_back(varof(meth_id[m.name]));
+      Ident self = fresh(self_name);
+      scope.emplace_back();
+      if (auto* pv = std::get_if<ast::Ppat_var>(&cs.self.desc)) scope.back()[pv->name.txt] = self;
+      auto save_self = cur_self_; cur_self_ = self;
+      // A method `method f a b = e` is one curried function over self plus its own
+      // params: prepend self to the (flattened) function translated from the body.
+      LamPtr fn;
+      if (auto* pf = std::get_if<ast::Pexp_function>(&m.body->desc)) {
+        fn = function(*pf, m.body->loc);
+        fn->params.insert(fn->params.begin(), {self, ValueKind::Gen});
+        fn->ret_kind = ValueKind::Gen;  // method closures use lfunction ~return:Pgenval
+      } else {
+        fn = mk(Lam::K::Function);
+        fn->params = {{self, ValueKind::Gen}};
+        fn->body = expr(*m.body);
+      }
+      cur_self_ = save_self;
+      scope.pop_back();
+      if (fn->params.size() == 1 && is_const_path(fn->body, self)) {
+        methods_block.push_back(cint(0));      // GetConst
+        methods_block.push_back(fn->body);
+      } else {
+        methods_block.push_back(fn);
+      }
+    }
+
+    // The env_init function: `(function env (let (self = create_object_opt 0 class)
+    // (seq <val-inits> self)))`, or just the create_object_opt call when no vals.
+    Ident selfo = fresh("self");
+    LamPtr env_body;
+    if (vals.empty()) {
+      env_body = oo_call("create_object_opt", {cint(0), varof(cla)});
+    } else {
+      // val inits, right-associated in declaration order, then `(seq <inits> self)`
+      // (create_object wraps the init sequence with `self` as its value).
+      LamPtr inits;
+      for (auto it = vals.rbegin(); it != vals.rend(); ++it) {
+        auto save_self = cur_self_; cur_self_ = selfo;
+        LamPtr v = expr(*it->init);
+        cur_self_ = save_self;
+        auto sf = mk(Lam::K::Prim); sf->prim = Prim::SetfieldComputed;
+        sf->prim_id = value_is_immediate(it->init)
+                        ? "setfield_imm_computed" : "setfield_ptr_computed";
+        sf->args = {varof(selfo), varof(val_id[it->name]), v};
+        if (!inits) inits = sf;
+        else { auto s = mk(Lam::K::Sequence); s->cond = sf; s->else_ = inits; inits = s; }
+      }
+      auto outer = mk(Lam::K::Sequence); outer->cond = inits; outer->else_ = varof(selfo);
+      auto let = mk(Lam::K::Let);
+      let->bindings = {{selfo, ValueKind::Gen,
+                        oo_call("create_object_opt", {cint(0), varof(cla)}), false, false, false}};
+      let->body = outer;
+      env_body = let;
+    }
+    auto env_fn = mk(Lam::K::Function);
+    env_fn->params = {{envp, ValueKind::Gen}};
+    env_fn->body = env_body;
+
+    inst_vars_ = save_iv; cur_meth_id_ = save_mid;
+
+    // output_methods: exactly one (label, code) pair -> set_method, else a
+    // set_methods over a makeblock of all the entries.
+    LamPtr cl_init = env_fn;
+    if (!methods_block.empty()) {
+      LamPtr setm;
+      if (methods_block.size() == 2) {
+        setm = oo_call("set_method", {varof(cla), methods_block[0], methods_block[1]});
+      } else {
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+        blk->args = methods_block;
+        setm = oo_call("set_methods", {varof(cla), blk});
+      }
+      auto s = mk(Lam::K::Sequence); s->cond = setm; s->else_ = cl_init; cl_init = s;
+    }
+
+    // bind_methods: bind the method-label / variable-index ids from the table.
+    if (len < 2 && nvals == 0) {
+      // bind_method: a single method via get_method_label (Strict, `=`).
+      for (auto it = methl_names.rbegin(); it != methl_names.rend(); ++it) {
+        auto let = mk(Lam::K::Let);
+        let->bindings = {{meth_id[*it], ValueKind::Gen,
+                          oo_call("get_method_label", {varof(cla), cstr(*it)}),
+                          false, false, false}};
+        let->body = cl_init; cl_init = let;
+      }
+    } else if (len == 0 && nvals < 2) {
+      // transl_vals: a lone variable via new_variable (Strict, `=`).
+      for (auto it = val_names.rbegin(); it != val_names.rend(); ++it) {
+        auto let = mk(Lam::K::Let);
+        let->bindings = {{val_id[*it], ValueKind::Gen,
+                          oo_call("new_variable", {varof(cla), cstr(*it)}),
+                          false, false, false}};
+        let->body = cl_init; cl_init = let;
+      }
+    } else {
+      // new_methods_variables: one `ids` array, fields bound StrictOpt (`=o`).
+      Ident ids = fresh("ids");
+      std::vector<LamPtr> nmv_args = {varof(cla), transl_meth_list(methl_names)};
+      if (nvals) nmv_args.push_back(transl_meth_list(val_names));
+      std::string getter = nvals ? "new_methods_variables" : "get_method_labels";
+      // layout order: methl method labels, then val indices.
+      std::vector<std::string> layout = methl_names;
+      for (auto& n : val_names) layout.push_back(n);
+      auto let = mk(Lam::K::Let);
+      for (size_t i = 0; i < layout.size(); ++i) {
+        Ident& bid = i < methl_names.size() ? meth_id[layout[i]] : val_id[layout[i]];
+        auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut; fm->prim_arg = (int)i;
+        fm->args = {varof(ids)};
+        let->bindings.push_back({bid, ValueKind::Gen, fm, false, false, /*strict_opt=*/true});
+      }
+      let->body = cl_init;
+      auto outer = mk(Lam::K::Let);
+      outer->bindings = {{ids, ValueKind::Gen, oo_call(getter, nmv_args), false, false, false}};
+      outer->body = let;
+      cl_init = outer;
+    }
+
+    // ltable cla (ldirect obj_init):
+    //   (let (class = create_table(pub_meths)  obj_init = cl_init)
+    //     (seq (init_class class) (apply obj_init 0)))
+    auto apply_init = mk(Lam::K::Apply); apply_init->fn = varof(obj_init);
+    apply_init->args = {cint(0)};
+    auto seq = mk(Lam::K::Sequence);
+    seq->cond = oo_call("init_class", {varof(cla)});
+    seq->else_ = apply_init;
+    auto top = mk(Lam::K::Let);
+    top->bindings = {
+      {cla, ValueKind::Gen, oo_call("create_table", {transl_meth_list(pub_meths)}), false, false, false},
+      {obj_init, ValueKind::Gen, cl_init, false, false, false}};
+    top->body = seq;
+    return top;
   }
 
   LamPtr function(const Pexp_function& f, const Location& floc) {
@@ -4530,7 +4899,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.mod_path_ = module_name;
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
-  sg->args.push_back(t.build_module(s, nullptr));
+  sg->args.push_back(t.wrap_shared(t.build_module(s, nullptr)));
   return sg;
 }
 

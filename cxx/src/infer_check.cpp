@@ -1399,6 +1399,42 @@ struct Checker {
       venv.pop_back();
       return bt;
     }
+    if (auto* sd = std::get_if<Pexp_send>(&e.desc)) {  // o#m: infer the receiver only
+      infer_expr(*sd->obj);
+      return eng.any();
+    }
+    if (auto* si = std::get_if<Pexp_setinstvar>(&e.desc)) {  // n <- e
+      infer_expr(*si->value);
+      return eng.any();
+    }
+    if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
+      // Only descend for the value-kind pass: typing method bodies gives their
+      // params/results value kinds and records format literals (lowered by Lambda).
+      // In --check mode the object's self/instance-var model is incomplete, so stay
+      // dynamic to avoid false-rejects (the advance-together law).
+      if (!record_kinds_) return eng.any();
+      auto& cs = *ob->cs;
+      venv.emplace_back();
+      if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = eng.any();
+      // Instance variables are visible to all methods, typed from their initialiser.
+      for (auto& f : cs.fields)
+        if (auto* v = std::get_if<Pcf_val>(&f.desc))
+          if (auto* cc = std::get_if<Cfk_concrete>(&v->kind))
+            venv.back()[v->name.txt] = infer_expr(*cc->e);
+      for (auto& f : cs.fields) {
+        if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+          if (auto* cc = std::get_if<Cfk_concrete>(&m->kind)) {
+            const Expression* body = cc->e.get();
+            if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) body = poly->e.get();
+            infer_expr(*body);
+          }
+        } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
+          infer_expr(*ini->e);
+        }
+      }
+      venv.pop_back();
+      return eng.any();
+    }
     return eng.any();  // records/fields/objects/etc. unhandled: dynamic, no clash
   }
 

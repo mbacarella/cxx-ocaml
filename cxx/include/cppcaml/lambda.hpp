@@ -55,6 +55,9 @@ enum class Prim {
   Raise,       // (raise e)
   Reraise,     // (reraise e)  (exception handler fall-through)
   Makelazyblock, // makelazyblock (Lazy_tag 246) / makeforwardblock (Forward_tag 250)
+  Send,            // (send obj tag)        -- method dispatch (args: [obj, tag])
+  FieldComputed,   // (field_computed o id) -- read an instance var by id (args: [obj, id])
+  SetfieldComputed,// (setfield_imm_computed o id v) / setfield_ptr_computed (spelling in prim_id)
 };
 
 struct Lam {
@@ -81,7 +84,8 @@ struct Lam {
   // to a sub-term of the scrutinee (e.g. `Some y` where y is used more than once).
   // mut: the Llet Mutable kind (printed `=mut`), a mutable local variable (an
   // un-escaping `ref`); read via Mutvar (`*x`) and written via Assign.
-  struct Binding { Ident id; ValueKind kind; LamPtr val; bool alias = false; bool mut = false; };
+  struct Binding { Ident id; ValueKind kind; LamPtr val; bool alias = false; bool mut = false;
+                   bool strict_opt = false; };  // strict_opt: the StrictOpt kind, printed `=o`
   std::vector<Binding> bindings;
 
   // Prim
