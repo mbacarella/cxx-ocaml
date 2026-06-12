@@ -859,6 +859,9 @@ struct Translator {
   std::unordered_map<std::string, SubMod> submod_cache_;
   // local alias name -> stdlib submodule dotted path (`module MP = Gc.Memprof`)
   std::unordered_map<std::string, std::string> submod_alias_;
+  // translating raise's argument: the position is exn-typed, so a registered
+  // exception outranks a same-named variant constructor
+  bool raise_arg_ = false;
   const SubMod& submodule_of(const std::string& dotted) {
     auto it = submod_cache_.find(dotted);
     if (it != submod_cache_.end()) return it->second;
@@ -2347,6 +2350,17 @@ struct Translator {
     if (s[i] == '%' || s[i] == '@') {  // literal '%'/'@': its own Char_literal node
       LamPtr r = fmt_parse(s, i + 1, end);
       return r ? cblock(12, {cchar((unsigned char)s[i]), r}) : nullptr;
+    }
+    // `%_[nlNL]` (read-and-discard counter): Ignored_param(Ignored_scan_get_counter)
+    // -- the only `%_` forms lowered; others keep the plain-string fallback.
+    if (s[i] == '_' && i + 1 < end &&
+        (s[i + 1] == 'n' || s[i + 1] == 'l' || s[i + 1] == 'L' || s[i + 1] == 'N') &&
+        (s[i + 1] == 'N' || i + 2 >= end ||
+         std::string_view("dixXou").find(s[i + 2]) == std::string_view::npos)) {
+      char cc = s[i + 1];
+      LamPtr r = fmt_parse(s, i + 2, end);
+      if (!r) return nullptr;
+      return cblock(23, {cblock(11, {cint(cc == 'l' ? 0 : cc == 'n' ? 1 : 2)}), r});
     }
     bool plus = false, space = false, hash = false, minus = false, zero = false;
     for (; i < end; ++i) {
@@ -4079,9 +4093,12 @@ struct Translator {
       }
       if (n == "Some" && k->arg) return block_of(0, {k->arg->get()});
       // a LOCAL exception/extension ctor shadows a same-named builtin ctor
-      // (`exception Ok` vs result's Ok)
+      // (`exception Ok` vs result's Ok); in raise position the argument is
+      // exn-typed, so a registered exception wins over a same-named variant
+      bool raise_pos = raise_arg_;
+      raise_arg_ = false;  // consumed by the head constructor only
       bool exn_shadows = (exn_ident_.count(n) || exn_field_.count(n)) &&
-                         (!ctor_info_.count(n) || builtin_ctors_.count(n));
+                         (raise_pos || !ctor_info_.count(n) || builtin_ctors_.count(n));
       if (auto ci = ctor_info_.find(n); ci != ctor_info_.end() && !exn_shadows) {
         if (!ci->second.is_block) return cint(ci->second.tag);  // constant -> its tag
         std::vector<const Expression*> fs;
@@ -4325,7 +4342,11 @@ struct Translator {
                 break;  // a field here shadows outer opens
             }
             if (n == "raise" && as.size() == 1) {
+              // raise's argument is exn-typed: a registered exception wins over
+              // a same-named variant ctor (`type t = E` after `exception E`).
+              raise_arg_ = true;
               LamPtr arg = expr(*as[0].second);
+              raise_arg_ = false;
               // raising the innermost caught exception re-raises (keeps backtrace).
               bool reraise = !caught_exn_.empty() && arg->k == Lam::K::Var &&
                              arg->var.stamp == caught_exn_.back().stamp;
@@ -5861,6 +5882,25 @@ struct Translator {
       }
       if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {  // exception E [of ...]
         const std::string& nm = pe->exn.ctor.name.txt;
+        // `exception F = E` rebinds: F's identity IS E's value (no fresh block)
+        if (auto* rb = std::get_if<Pext_rebind>(&pe->exn.ctor.kind)) {
+          if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
+            if (auto e2 = exn_ident_.find(l->name); e2 != exn_ident_.end()) {
+              exn_ident_[nm] = e2->second;
+              add_export(nm, e2->second);
+              if (auto a = exn_arity_.find(l->name); a != exn_arity_.end())
+                exn_arity_[nm] = a->second;
+              continue;
+            }
+          // non-local target (stdlib/qualified): bind a let to its value
+          if (LamPtr v = exn_value(lid_last(rb->id.txt))) {
+            Ident id = fresh(nm);
+            cur.push_back({id, ValueKind::Gen, v});
+            exn_ident_[nm] = id;
+            add_export(nm, id);
+          }
+          continue;
+        }
         auto str = mk(Lam::K::ConstString); str->str_val = mod_path_ + "." + nm;
         auto oid = mk(Lam::K::Prim); oid->prim = Prim::Ccall;
         oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
