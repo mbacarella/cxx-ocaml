@@ -1046,7 +1046,52 @@ struct Checker {
   TypePtr infer_pat(const Pattern& p) {
     TypePtr t = infer_pat_impl(p);
     if (record_kinds_) rec_pat_[&p] = t;  // record every pattern's kind (params incl.)
+    if (as_map_) (*as_map_)[&p] = t;      // side record for build_as_type under an alias
     return t;
+  }
+
+  // typecore.ml build_as_type: the variable bound by `pat as x` does not get the
+  // scrutinee's type but one REBUILT from the pattern -- a constructor pattern
+  // yields a fresh instance of the constructor's result type (argument slots
+  // unified from the sub-patterns), so constructors that don't constrain a type
+  // parameter leave it free.  `B _ | C _ as x -> x` can then return x at a
+  // different parameter instantiation than the scrutinee's.  Patterns we don't
+  // rebuild (records, constants, ...) keep their inferred type from `tys`.
+  std::unordered_map<const Pattern*, TypePtr>* as_map_ = nullptr;
+  TypePtr build_as_type(const Pattern& p,
+                        const std::unordered_map<const Pattern*, TypePtr>& tys) {
+    auto fallback = [&]() -> TypePtr {
+      auto it = tys.find(&p);
+      return it != tys.end() ? it->second : eng.fresh_var();
+    };
+    if (auto* al = std::get_if<Ppat_alias>(&p.desc)) return build_as_type(*al->p, tys);
+    if (auto* tu = std::get_if<Ppat_tuple>(&p.desc)) {
+      std::vector<TypePtr> es;
+      for (auto& e : tu->elems) es.push_back(build_as_type(*e, tys));
+      return eng.tuple(std::move(es));
+    }
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
+      TypePtr* sch = find_ctor(lid_last(k->id.txt));
+      if (!sch) return fallback();
+      TypePtr result;
+      auto ps = ctor_params(eng.instantiate(*sch), result);
+      if (k->arg) {
+        auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
+        if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
+          for (size_t i = 0; i < ps.size(); ++i)
+            soft_unify(ps[i], build_as_type(*tup->elems[i], tys));
+        } else if (!ps.empty()) {
+          soft_unify(ps[0], build_as_type(**k->arg, tys));
+        }
+      }
+      return result;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      TypePtr lt = build_as_type(*o->l, tys), rt = build_as_type(*o->r, tys);
+      soft_unify(lt, rt);
+      return lt;
+    }
+    return fallback();
   }
   TypePtr infer_pat_impl(const Pattern& p) {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
@@ -1092,8 +1137,18 @@ struct Checker {
       return at;
     }
     if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
+      if (record_kinds_) {  // kind pass: the scrutinee type gives the better kind
+        TypePtr t = infer_pat(*al->p);
+        venv.back()[al->name.txt] = t;
+        return t;
+      }
+      std::unordered_map<const Pattern*, TypePtr> tys;
+      auto* saved = as_map_;
+      as_map_ = &tys;
       TypePtr t = infer_pat(*al->p);
-      venv.back()[al->name.txt] = t;
+      as_map_ = saved;
+      venv.back()[al->name.txt] =
+          pat_has_gadt_ctor(*al->p) ? t : build_as_type(*al->p, tys);
       return t;
     }
     if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
