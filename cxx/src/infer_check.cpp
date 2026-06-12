@@ -243,6 +243,26 @@ struct Checker {
       for (auto& e : tu->elems) es.push_back(from_coretype(*e, vars));
       return eng.tuple(std::move(es));
     }
+    // `'a 'b. t` (method poly types): the quantified body, vars as fresh.
+    if (auto* pl = std::get_if<Ptyp_poly>(&t.desc))
+      return from_coretype(*pl->type, vars);
+    // `(t as 'a)`: the inner type, with 'a bound to it for later references.
+    if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+      TypePtr inner = from_coretype(*al->type, vars);
+      vars[al->name] = inner;
+      return inner;
+    }
+    // A closed all-constant polymorphic variant is an immediate (its values are
+    // tag hashes) -- type it int so the [int] value kind flows.  Payload-carrying
+    // or open/inherited rows stay opaque.
+    if (auto* pvr = std::get_if<Ptyp_variant>(&t.desc)) {
+      bool all_const = pvr->closed == ClosedFlag::Closed && !pvr->rows.empty();
+      for (auto& r : pvr->rows) {
+        auto* rt = std::get_if<Rtag>(&r);
+        if (!rt || !rt->constant) { all_const = false; break; }
+      }
+      if (all_const) return eng.constr("int");
+    }
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
       // a qualified type `M.t` whose head module is unbound is a soundness error
       if (strict)
@@ -1564,8 +1584,16 @@ struct Checker {
       if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
         if (auto* cc = std::get_if<Cfk_concrete>(&m->kind)) {
           const Expression* body = cc->e.get();
-          if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) body = poly->e.get();
-          infer_expr(*body);
+          const CoreType* pty = nullptr;  // `method m : T = ...` poly annotation
+          if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) {
+            if (poly->t) pty = poly->t->get();
+            body = poly->e.get();
+          }
+          TypePtr bt = infer_expr(*body);
+          if (pty) {  // value-kind flow only: clashes are swallowed
+            std::unordered_map<std::string, TypePtr> vars;
+            soft_unify(bt, from_coretype(*pty, vars));
+          }
         }
       } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
         infer_expr(*ini->e);
@@ -1663,6 +1691,9 @@ struct Checker {
           std::unordered_map<std::string, TypePtr> vars;
           if (strict && expected_clash(te, from_coretype(*pc->typ, vars)))
             note_error("type mismatch against declared type");
+          // value-kind pass: flow the declared type into the inferred one (so
+          // e.g. an annotated param gets its [int] kind); clashes swallowed.
+          if (record_kinds_) soft_unify(te, from_coretype(*pc->typ, vars));
         }
       eng.leave_level();
       eng.generalize(te);

@@ -3029,8 +3029,13 @@ struct Translator {
     if (scrut->k != Lam::K::Var) {
       Ident mv = fresh("", true);
       LamPtr body = compile_match(varof(mv), rows, mloc);
-      if (count_var(body, mv) <= 1) { subst_var(body, mv, scrut); return body; }
-      auto l = mk(Lam::K::Let); l->bindings = {{mv, ValueKind::Gen, scrut, false}};
+      // single-use inlining is simplif's ALIAS rule: only a field access (or
+      // var) inlines; a strict computation (apply/send/...) stays bound.
+      if (count_var(body, mv) <= 1 && is_field_access(scrut)) {
+        subst_var(body, mv, scrut);
+        return body;
+      }
+      auto l = mk(Lam::K::Let); l->bindings = {{mv, ValueKind::Gen, scrut, is_field_access(scrut)}};
       l->body = body; return l;
     }
     // Shared catch-all fallback via catch/exit: a guard on a non-variable pattern
@@ -3065,6 +3070,7 @@ struct Translator {
         return i;
       }
     }
+    if (auto pm = pv_const_match(scrut, rows)) return pm;
     // A single irrefutable non-catchall row (e.g. a polyvariant payload
     // `` `A g -> .. ``): destructure directly, no test.
     if (rows.size() == 1 && !rows[0].guard && !is_catchall(*rows[0].lhs) &&
@@ -3081,6 +3087,90 @@ struct Translator {
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
     return int_cases(scrut, rows, 0);
+  }
+
+  // Constant polymorphic-variant match: dispatch on the tag hashes with the
+  // Switcher's test shapes (n<=4 exact; larger fall back to a correct equality
+  // chain).  An optional trailing catch-all gives the isint-split catch form
+  // (n<=2 exact, matching ocamlc) or an equality chain ending in the fallback.
+  LamPtr pv_const_match(const LamPtr& scrut, const std::vector<Row>& rows) {
+    struct KV { long long h; const Expression* rhs; };
+    std::vector<KV> kvs;
+    const Row* dflt = nullptr;
+    for (auto& r : rows) {
+      if (r.guard) return nullptr;
+      const Pattern* p = effective_pat(r.lhs);
+      if (auto* pv = std::get_if<Ppat_variant>(&p->desc)) {
+        if (pv->arg || dflt) return nullptr;
+        kvs.push_back({hash_variant(pv->label), r.rhs});
+      } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
+        dflt = &r;
+      } else {
+        return nullptr;
+      }
+    }
+    if (kvs.size() < (dflt ? 1u : 2u)) return nullptr;
+    if (scrut->k != Lam::K::Var) return nullptr;  // bound by compile_match first
+    std::sort(kvs.begin(), kvs.end(), [](const KV& a, const KV& b) { return a.h < b.h; });
+    for (size_t i = 1; i < kvs.size(); ++i)
+      if (kvs[i].h == kvs[i - 1].h) return nullptr;  // duplicate tags
+    auto cmp = [&](const char* op, long long h) {
+      auto t = mk(Lam::K::Prim); t->prim = Prim::IntCmp; t->prim_id = op;
+      t->args = {scrut, cint(h)};
+      return t;
+    };
+    auto iff = [&](LamPtr c, LamPtr a, LamPtr b) {
+      auto i = mk(Lam::K::IfThenElse); i->cond = c; i->then_ = a; i->else_ = b;
+      return i;
+    };
+    if (!dflt) {
+      std::function<LamPtr(int, int)> tree = [&](int lo, int hi) -> LamPtr {
+        int n = hi - lo + 1;
+        if (n == 1) return expr(*kvs[lo].rhs);
+        if (n == 2)
+          return iff(cmp(">=", kvs[hi].h), expr(*kvs[hi].rhs), expr(*kvs[lo].rhs));
+        if (n == 3)
+          return iff(cmp("!=", kvs[lo + 1].h),
+                     iff(cmp(">=", kvs[lo + 2].h), expr(*kvs[lo + 2].rhs),
+                         expr(*kvs[lo].rhs)),
+                     expr(*kvs[lo + 1].rhs));
+        if (n == 4) return iff(cmp(">=", kvs[lo + 2].h), tree(lo + 2, hi), tree(lo, lo + 1));
+        // larger: a correct (not byte-exact) equality chain
+        LamPtr c = expr(*kvs[hi].rhs);
+        for (int i = hi - 1; i >= lo; --i)
+          c = iff(cmp("==", kvs[i].h), expr(*kvs[i].rhs), c);
+        return c;
+      };
+      return tree(0, (int)kvs.size() - 1);
+    }
+    // trailing catch-all: bind its var to the scrutinee for the fallback body
+    auto bind_dflt = [&]() -> LamPtr {
+      scope.emplace_back();
+      if (auto* pv2 = std::get_if<Ppat_var>(&effective_pat(dflt->lhs)->desc))
+        scope.back()[pv2->name.txt] = scrut->var;
+      LamPtr b = expr(*dflt->rhs);
+      scope.pop_back();
+      return b;
+    };
+    if (kvs.size() <= 2) {
+      // (catch (if (isint s) <!=-chain, miss -> exit> (exit N)) with (N) fb)
+      int eid = ++next_exit_;
+      auto exitL = [&] { auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x; };
+      LamPtr chain = exitL();
+      for (int i = (int)kvs.size() - 1; i >= 0; --i)
+        chain = iff(cmp("!=", kvs[i].h), chain, expr(*kvs[i].rhs));
+      auto isi = mk(Lam::K::Prim); isi->prim = Prim::IntCmp;
+      isi->prim_id = "isint"; isi->args = {scrut};
+      auto c = mk(Lam::K::Catch);
+      c->cond = iff(isi, chain, exitL());
+      c->prim_arg = eid; c->then_ = bind_dflt();
+      return c;
+    }
+    // larger with default: equality chain ending in the fallback (correct)
+    LamPtr c = bind_dflt();
+    for (int i = (int)kvs.size() - 1; i >= 0; --i)
+      c = iff(cmp("==", kvs[i].h), expr(*kvs[i].rhs), c);
+    return c;
   }
 
   // Match over extension constructors (`type t += A ...`, exceptions, effects):
