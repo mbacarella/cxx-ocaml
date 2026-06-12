@@ -1714,6 +1714,7 @@ struct Translator {
     if (prim == "%ignore" && n == 1) return ic("ignore");
     if (prim == "%identity" && n == 1) return argv[0];
     if (prim == "%perform" && n == 1) return cc("perform");
+    if (prim == "%lazy_force" && n == 1) return force_lazy(argv[0]);
     if ((prim == "%raise" || prim == "%reraise") && n == 1) {  // raise as a value
       auto pr = mk(Lam::K::Prim);
       pr->prim = prim == "%reraise" ? Prim::Reraise : Prim::Raise;
