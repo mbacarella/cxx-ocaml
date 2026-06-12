@@ -675,6 +675,51 @@ struct Translator {
     } catch (...) {}
   }
 
+  // A stdlib module's variant constructors, loaded on demand from its cmi
+  // (Arg.spec's Unit/Set/String/...): name -> CtorInfo per module.
+  std::unordered_map<std::string, std::unordered_map<std::string, CtorInfo>> mod_ctor_cache_;
+  const std::unordered_map<std::string, CtorInfo>& module_ctors(const std::string& mod) {
+    if (auto it = mod_ctor_cache_.find(mod); it != mod_ctor_cache_.end()) return it->second;
+    auto& out = mod_ctor_cache_[mod];
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& td : cmi.sig().types) {
+        if (td.kind != cmi::TypeDecl::Variant) continue;
+        bool gadt = false;
+        for (auto& c : td.ctors) if (c.res) gadt = true;
+        if (gadt) continue;  // GADT tag rules are subtler -- skip
+        int nc = 0, nb = 0;
+        for (auto& c : td.ctors) {
+          bool block = !c.args.empty() || c.is_inline_record;
+          int arity = c.is_inline_record ? 1 : (int)c.args.size();
+          if (!out.count(c.name)) out[c.name] = {td.name, block ? nb : nc, block, arity};
+          if (block) ++nb; else ++nc;
+        }
+      }
+    } catch (...) {}
+    return out;
+  }
+  // Resolve a constructor through its explicit stdlib-module qualification, or
+  // through the opened modules when bare.  Local modules take no part (their
+  // ctors register through the normal paths).
+  const CtorInfo* stdlib_module_ctor(const Longident& lid, const std::string& n) {
+    std::vector<std::string> mods;
+    if (auto* d = std::get_if<Ldot>(&lid.v)) {
+      if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+        if (!module_base(pl->name)) mods.push_back(pl->name);
+    } else {
+      for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
+        if (it->find('.') == std::string::npos && !module_base(*it))
+          mods.push_back(*it);
+    }
+    for (auto& m : mods) {
+      auto& mc = module_ctors(m);
+      if (auto f = mc.find(n); f != mc.end()) return &f->second;
+    }
+    return nullptr;
+  }
+
   void register_types(const Structure& s) {
     auto each_decl = [&](auto fn) {
       for (auto& item : s)
@@ -1544,6 +1589,12 @@ struct Translator {
     if (prim == "%ignore" && n == 1) return ic("ignore");
     if (prim == "%identity" && n == 1) return argv[0];
     if (prim == "%perform" && n == 1) return cc("perform");
+    if ((prim == "%raise" || prim == "%reraise") && n == 1) {  // raise as a value
+      auto pr = mk(Lam::K::Prim);
+      pr->prim = prim == "%reraise" ? Prim::Reraise : Prim::Raise;
+      pr->args = argv;
+      return pr;
+    }
     if ((prim == "%succint" || prim == "%predint") && n == 1) {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::Offsetint;
       pr->prim_arg = prim == "%succint" ? 1 : -1; pr->args = argv; return pr;
@@ -4143,6 +4194,37 @@ struct Translator {
           return b;
         }
       }
+      // a stdlib module's variant constructor (`Arg.Unit f`, or bare under
+      // `open Arg`): tag/arity from the module cmi's variant decls
+      if (const CtorInfo* sci = stdlib_module_ctor(k->id.txt, n)) {
+        if (!sci->is_block) return cint(sci->tag);
+        std::vector<const Expression*> fs;
+        if (k->arg) {
+          if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+              at && sci->arity > 1 && (int)at->elems.size() == sci->arity)
+            for (auto& el : at->elems) fs.push_back(el.get());
+          else
+            fs.push_back(k->arg->get());
+        }
+        return block_of(sci->tag, fs);
+      }
+      // a stdlib module's exception, constructed (`Arg.Bad msg`): identity is the
+      // module's export field (uppercase non-ctor exports are exceptions)
+      if (auto* dq = std::get_if<Ldot>(&k->id.txt.v))
+        if (auto* pl = std::get_if<Lident>(&dq->prefix->v))
+          if (!module_base(pl->name)) {
+            auto& fm = fields_of(pl->name);
+            if (auto f = fm.find(n); f != fm.end()) {
+              LamPtr idv = field_of(global_of(pl->name), f->second);
+              if (!k->arg) return idv;
+              if (!std::holds_alternative<Pexp_tuple>((*k->arg)->desc)) {
+                auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
+                b->args = {idv, expr(**k->arg)};
+                b->blk_shape = {ValueKind::Gen, expr_kind(k->arg->get())};
+                return b;
+              }
+            }
+          }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + n);  // user ctor: needs its tag (defer)
       return v;
     }
@@ -4530,9 +4612,11 @@ struct Translator {
         if (auto* pv = std::get_if<Ppat_var>(&le->bindings[0].pat.desc))
           if (const Expression* init = ref_call(*le->bindings[0].expr)) {
             Ident rid = fresh(pv->name.txt);
-            scope.back()[pv->name.txt] = rid;
             ValueKind k = expr_kind(init);
+            // the init sees the OUTER scope: `let b = ref b` reads the shadowed
+            // binding, not itself (this once self-referenced -> garbage init)
             LamPtr iv = expr(*init);
+            scope.back()[pv->name.txt] = rid;
             rec_spine_ = rec_spine;
             LamPtr body = expr(*le->body);
             auto l = mk(Lam::K::Let);
