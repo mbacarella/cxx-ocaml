@@ -4116,6 +4116,10 @@ struct Translator {
     if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
+    if (LamPtr r = int_cases(scrut, rows, 0, /*strict=*/true)) return r;
+    // shapes the structured paths can't express compile through the correct
+    // per-row chain instead of silently collapsing
+    if (LamPtr r = naive_match(scrut, rows, mloc)) return r;
     return int_cases(scrut, rows, 0);
   }
 
@@ -4291,7 +4295,8 @@ struct Translator {
     if (auto* pv = std::get_if<Ppat_var>(&p.desc))
       if (scrut->k == Lam::K::Var) scope.back()[pv->name.txt] = scrut->var;
   }
-  LamPtr int_cases(const LamPtr& scrut, const std::vector<Row>& rows, size_t i) {
+  LamPtr int_cases(const LamPtr& scrut, const std::vector<Row>& rows, size_t i,
+                   bool strict = false) {
     if (i >= rows.size()) return cint(0);
     const Row& r = rows[i];
     // Peel `<inner> as x` aliases: x binds to the scrutinee value over this row's
@@ -4309,14 +4314,18 @@ struct Translator {
     // (A guard on a constant/ctor pattern would share <rest> across pattern- and
     // guard-failure, needing the matcher's catch/exit; left to the best-effort tail.)
     if (r.guard && is_catchall(*lhs)) {
+      LamPtr rest = int_cases(scrut, rows, i + 1, strict);
+      if (!rest) return nullptr;
       enter(); bind_catchall(*lhs, scrut);
       auto iff = mk(Lam::K::IfThenElse);
       iff->cond = expr(*r.guard); iff->then_ = expr(*r.rhs);
       leave();
-      iff->else_ = int_cases(scrut, rows, i + 1);
+      iff->else_ = rest;
       return iff;
     }
-    if (!r.guard && (is_catchall(*lhs) || i + 1 == rows.size())) {
+    if (!r.guard && (is_catchall(*lhs) || (!strict && i + 1 == rows.size()))) {
+      // strict mode: a non-catchall final row binds nothing here -- null, so
+      // the caller's correct fallback (naive_match) takes over
       enter(); bind_catchall(*lhs, scrut);
       LamPtr b = expr(*r.rhs); leave();
       return b;
@@ -4332,6 +4341,8 @@ struct Translator {
         if (it != ctor_info_.end() && !it->second.is_block) { isint = true; val = it->second.tag; ctor = true; }
       }
       if (isint) {
+        LamPtr rest = int_cases(scrut, rows, i + 1, strict);
+        if (!rest) return nullptr;
         auto iff = mk(Lam::K::IfThenElse);
         if (ctor && val == 0) {
           iff->cond = scrut;  // constant ctor of tag 0: a truthy test (`!= 0` is identity)
@@ -4339,12 +4350,227 @@ struct Translator {
           auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt; ne->args = {scrut, cint(val)};
           iff->cond = ne;
         }
-        iff->then_ = int_cases(scrut, rows, i + 1);
+        iff->then_ = rest;
         enter(); iff->else_ = expr(*r.rhs); leave();
         return iff;
       }
     }
+    if (strict) return nullptr;  // unsupported: let naive_match handle it correctly
     return expr(*r.rhs);  // unsupported pattern: best-effort
+  }
+
+  // ---- last-resort, always-correct match: per-row test chains -------------
+  // Each row compiles to its own test + binders + (guarded) body; failures fall
+  // to the next row (guard/test failures share the rest behind a catch/exit).
+  // Tests duplicate work the matrix compiler would share -- correctness first,
+  // so unsupported shapes never silently collapse to a wrong arm again.
+  LamPtr if_and(const LamPtr& a, const LamPtr& b) {
+    if (!a) return b;
+    if (!b) return a;
+    auto i = mk(Lam::K::IfThenElse);
+    i->cond = a; i->then_ = b; i->else_ = cint(0);
+    return i;
+  }
+  bool pat_test(const Pattern* p0, const LamPtr& acc, LamPtr& test,
+                std::vector<std::pair<Ident, LamPtr>>& binds) {
+    const Pattern* p = effective_pat(p0);
+    if (std::holds_alternative<Ppat_any>(p->desc)) return true;
+    if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
+      binds.push_back({fresh(pv->name.txt), acc});
+      return true;
+    }
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+      binds.push_back({fresh(pa->name.txt), acc});
+      return pat_test(pa->p.get(), acc, test, binds);
+    }
+    if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
+      if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
+        if (pi->suffix) return false;  // boxed-int literals: skip
+        auto t = mk(Lam::K::Prim); t->prim = Prim::EqInt;
+        t->args = {acc, cint(parse_ocaml_int(pi->value))};
+        test = if_and(test, t);
+        return true;
+      }
+      if (auto* pch = std::get_if<Pconst_char>(&pc->c.desc)) {
+        auto t = mk(Lam::K::Prim); t->prim = Prim::EqInt;
+        t->args = {acc, cchar((unsigned char)pch->code)};
+        test = if_and(test, t);
+        return true;
+      }
+      if (auto* ps = std::get_if<Pconst_string>(&pc->c.desc)) {
+        auto sv = mk(Lam::K::ConstString); sv->str_val = ps->s;
+        auto t = mk(Lam::K::Prim); t->prim = Prim::Ccall;
+        t->prim_id = "caml_string_equal"; t->args = {acc, sv};
+        test = if_and(test, t);
+        return true;
+      }
+      return false;  // float literals: NaN semantics, skip
+    }
+    if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (size_t i = 0; i < tu->elems.size(); ++i)
+        if (!pat_test(tu->elems[i].get(), fieldimm((int)i, acc), test, binds))
+          return false;
+      return true;
+    }
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
+      auto ci = ctor_info_.find(ctor_of(*p));
+      if (ci == ctor_info_.end()) return false;
+      auto tc = type_ctors_.find(ci->second.type);
+      int nc = tc != type_ctors_.end() ? tc->second.first : -1;
+      int nb = tc != type_ctors_.end() ? tc->second.second : -1;
+      if (!ci->second.is_block) {
+        LamPtr t;
+        if (nb == 0) {  // constants only: a plain integer compare
+          auto e2 = mk(Lam::K::Prim); e2->prim = Prim::EqInt;
+          e2->args = {acc, cint(ci->second.tag)};
+          t = e2;
+        } else {
+          auto ii = mk(Lam::K::Prim); ii->prim = Prim::IntCmp;
+          ii->prim_id = "isint"; ii->args = {acc};
+          auto e2 = mk(Lam::K::Prim); e2->prim = Prim::EqInt;
+          e2->args = {acc, cint(ci->second.tag)};
+          auto g = mk(Lam::K::IfThenElse);
+          g->cond = ii; g->then_ = e2; g->else_ = cint(0);
+          t = g;
+        }
+        test = if_and(test, t);
+        return true;
+      }
+      // block ctor: tag test (caml_obj_tag of an immediate is out of range)
+      if (!(nb == 1 && nc >= 0 && ci->second.tag == 0)) {
+        auto tg = mk(Lam::K::Prim); tg->prim = Prim::Ccall;
+        tg->prim_id = "caml_obj_tag"; tg->args = {acc};
+        auto e2 = mk(Lam::K::Prim); e2->prim = Prim::EqInt;
+        e2->args = {tg, cint(ci->second.tag)};
+        test = if_and(test, e2);
+      } else if (nc > 0) {  // sole block ctor of a mixed type: non-immediate test
+        auto ii = mk(Lam::K::Prim); ii->prim = Prim::IntCmp;
+        ii->prim_id = "isint"; ii->args = {acc};
+        auto g = mk(Lam::K::IfThenElse);
+        g->cond = ii; g->then_ = cint(0); g->else_ = cint(1);
+        test = if_and(test, g);
+      }
+      if (k->arg) {
+        if (ci->second.unboxed) return pat_test(k->arg->get(), acc, test, binds);
+        auto* at = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
+        if (ci->second.arity > 1 && at && (int)at->elems.size() == ci->second.arity) {
+          for (int i = 0; i < ci->second.arity; ++i)
+            if (!pat_test(at->elems[i].get(), fieldimm(i, acc), test, binds))
+              return false;
+        } else if (!pat_test(k->arg->get(), fieldimm(0, acc), test, binds)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+      // alternatives must bind nothing (per-alternative binds would need
+      // per-branch bodies); tests OR together
+      std::vector<std::pair<Ident, LamPtr>> b1, b2;
+      LamPtr t1, t2;
+      if (!pat_test(o->l.get(), acc, t1, b1) || !b1.empty()) return false;
+      if (!pat_test(o->r.get(), acc, t2, b2) || !b2.empty()) return false;
+      if (!t1 || !t2) return true;  // one side always matches
+      auto g = mk(Lam::K::IfThenElse);
+      g->cond = t1; g->then_ = cint(1); g->else_ = t2;
+      test = if_and(test, g);
+      return true;
+    }
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [lbl, sub] : pr->fields) {
+        const FieldInfo* fi = find_field(lid_last(lbl.txt));
+        if (!fi) return false;
+        if (!pat_test(sub.get(), field_read(fi, acc), test, binds)) return false;
+      }
+      return true;
+    }
+    if (auto* pv2 = std::get_if<Ppat_variant>(&p->desc)) {
+      if (!pv2->arg) {
+        auto t = mk(Lam::K::Prim); t->prim = Prim::EqInt;
+        t->args = {acc, cint(hash_variant(pv2->label))};
+        test = if_and(test, t);
+        return true;
+      }
+      auto ii = mk(Lam::K::Prim); ii->prim = Prim::IntCmp;
+      ii->prim_id = "isint"; ii->args = {acc};
+      auto e2 = mk(Lam::K::Prim); e2->prim = Prim::EqInt;
+      e2->args = {fieldimm(0, acc), cint(hash_variant(pv2->label))};
+      auto g = mk(Lam::K::IfThenElse);
+      g->cond = ii; g->then_ = cint(0); g->else_ = e2;
+      test = if_and(test, g);
+      return pat_test(pv2->arg->get(), fieldimm(1, acc), test, binds);
+    }
+    return false;  // lazy / array / interval / unpack: unmodeled
+  }
+  LamPtr naive_match(const LamPtr& scrut0, const std::vector<Row>& rows0,
+                     const Location& mloc) {
+    LamPtr scrut = scrut0;
+    Ident stmp;
+    bool tempd = false;
+    if (scrut->k != Lam::K::Var) {
+      stmp = fresh("", true);
+      tempd = true;
+      scrut = varof(stmp);
+    }
+    struct NRow { const Pattern* lhs; const Expression* rhs; const Expression* guard;
+                  std::vector<std::string> aliases; };
+    std::vector<NRow> rows;
+    for (auto& r : rows0) {
+      const Pattern* l = effective_pat(r.lhs);
+      std::vector<std::string> als;
+      while (auto* pa = std::get_if<Ppat_alias>(&l->desc)) {
+        als.push_back(pa->name.txt);
+        l = effective_pat(pa->p.get());
+      }
+      std::vector<const Pattern*> alts;
+      flatten_or(l, alts);
+      for (auto* a : alts) rows.push_back({a, r.rhs, r.guard, als});
+    }
+    LamPtr chain = raise_predef("Match_failure", mloc);
+    for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
+      LamPtr test;
+      std::vector<std::pair<Ident, LamPtr>> binds;
+      if (!pat_test(it->lhs, scrut, test, binds)) return nullptr;
+      scope.emplace_back();
+      for (auto& nm : it->aliases) scope.back()[nm] = scrut->var;
+      for (auto& [id, acc] : binds) scope.back()[id.name] = id;
+      if (it->guard) {
+        int n = ++next_exit_;
+        auto exitL = [&] {
+          auto x = mk(Lam::K::Staticraise); x->prim_arg = n; return x;
+        };
+        auto gi = mk(Lam::K::IfThenElse);
+        gi->cond = expr(*it->guard);
+        gi->then_ = expr(*it->rhs);
+        gi->else_ = exitL();
+        LamPtr body = wrap_binders(gi, binds);
+        if (test) {
+          auto o = mk(Lam::K::IfThenElse);
+          o->cond = test; o->then_ = body; o->else_ = exitL();
+          body = o;
+        }
+        auto cat = mk(Lam::K::Catch);
+        cat->cond = body; cat->prim_arg = n; cat->then_ = chain;
+        chain = cat;
+      } else {
+        LamPtr body = wrap_binders(expr(*it->rhs), binds);
+        if (!test) {
+          chain = body;  // irrefutable row: the rest is unreachable
+        } else {
+          auto o = mk(Lam::K::IfThenElse);
+          o->cond = test; o->then_ = body; o->else_ = chain;
+          chain = o;
+        }
+      }
+      scope.pop_back();
+    }
+    if (tempd) {
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{stmp, ValueKind::Gen, scrut0}};
+      l->body = chain;
+      chain = l;
+    }
+    return chain;
   }
 
   LamPtr expr(const Expression& e) {
