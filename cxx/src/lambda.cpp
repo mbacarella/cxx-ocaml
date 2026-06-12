@@ -2490,6 +2490,12 @@ struct Translator {
         if (!collect_binders(*fps[i], fieldimm((int)i, scrut), out)) return false;
       return true;
     }
+    // A polymorphic-variant pattern: the block is [hash; arg], the payload at
+    // field 1 (exhaustive by typing when ocamlc emits no tag test either).
+    if (auto* pvr = std::get_if<Ppat_variant>(&p->desc)) {
+      if (!pvr->arg) return true;
+      return collect_binders(**pvr->arg, fieldimm(1, scrut), out);
+    }
     return false;
   }
   // Strip type constraints and peel `[@@unboxed]` constructor wrappers (whose
@@ -2629,6 +2635,8 @@ struct Translator {
         if (!is_irrefutable(*fp)) return false;
       return true;
     }
+    if (auto* pvr = std::get_if<Ppat_variant>(&p->desc))
+      return !pvr->arg || is_irrefutable(**pvr->arg);
     return false;
   }
   // Wrap `body` (already compiled with `binders` in scope) so each binder's
@@ -3055,6 +3063,17 @@ struct Translator {
         i->else_ = expr(*(a == "false" ? rows[0] : rows[1]).rhs);
         return i;
       }
+    }
+    // A single irrefutable non-catchall row (e.g. a polyvariant payload
+    // `` `A g -> .. ``): destructure directly, no test.
+    if (rows.size() == 1 && !rows[0].guard && !is_catchall(*rows[0].lhs) &&
+        is_irrefutable(*rows[0].lhs)) {
+      std::vector<std::pair<Ident, LamPtr>> binders;
+      scope.emplace_back();
+      bool ok = collect_binders(*rows[0].lhs, scrut, binders);
+      LamPtr body = ok ? expr(*rows[0].rhs) : nullptr;
+      scope.pop_back();
+      if (body) return wrap_binders(body, binders);
     }
     if (auto sw = const_switch(scrut, rows)) return sw;
     if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
@@ -4846,8 +4865,16 @@ struct Translator {
           return l;
         }
       }
-      Ident pid = fresh("param");
-      l->params.push_back({pid, ValueKind::Gen});
+      // Matching.name_pattern: the parameter takes the first var/alias row's name.
+      std::string pname = "param";
+      for (auto& c : fc->cases) {
+        const Pattern* ep = effective_pat(&c.lhs);
+        if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) { pname = pv->name.txt; break; }
+        if (auto* pa = std::get_if<Ppat_alias>(&ep->desc)) { pname = pa->name.txt; break; }
+      }
+      Ident pid = fresh(pname);
+      // the param's kind is the scrutinee type = any case pattern's (unified)
+      l->params.push_back({pid, pat_kind(&fc->cases[0].lhs)});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
       l->body = wrap_optdefs(wrap_binders(compile_match(scrut, fc->cases, floc), binders));
     } else {
