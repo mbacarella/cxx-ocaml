@@ -501,6 +501,10 @@ struct Translator {
   // Method-label binders of the current object, so a self-send `self#m` lowers to
   // (sendself self m) with the bound label rather than a public (send self tag).
   std::unordered_map<std::string, Ident> cur_meth_id_;
+  // `inherit parent as super`: super#m applies the parent's method closure
+  // (bound from the inherits result) to self directly.
+  std::string cur_super_name_;
+  std::unordered_map<std::string, Ident> cur_super_mid_;
   // Each object/class definition gets a 1-based index; its methods' self parameter
   // is named `self-<index>` (Translclass's enter_class_definition depth).
   int obj_counter_ = 0;
@@ -4072,6 +4076,17 @@ struct Translator {
   // `(sendself self m args..)` when the receiver is the enclosing method's self
   // and `m` is one of the current object's methods.
   LamPtr send_expr(const ast::Pexp_send& sd, std::vector<LamPtr> args) {
+    // `super#m`: apply the parent's method closure to self -- not a send.
+    if (cur_self_ && !cur_super_name_.empty())
+      if (auto* id = std::get_if<Pexp_ident>(&sd.obj->desc))
+        if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+          if (l->name == cur_super_name_ && cur_super_mid_.count(sd.meth.txt)) {
+            auto ap = mk(Lam::K::Apply);
+            ap->fn = varof(cur_super_mid_[sd.meth.txt]);
+            ap->args = {varof(*cur_self_)};
+            for (auto& a : args) ap->args.push_back(a);
+            return ap;
+          }
     LamPtr obj = expr(*sd.obj);
     auto s = mk(Lam::K::Prim); s->prim = Prim::Send;
     if (cur_self_ && obj->k == Lam::K::Var && obj->var.stamp == cur_self_->stamp &&
@@ -4155,6 +4170,7 @@ struct Translator {
     const ClassMeta* parent_meta = nullptr;
     Ident parent_var;
     std::vector<const ast::Expression*> inh_args;
+    std::string super_name;  // `inherit parent as super`
     std::vector<std::string> virt_own;  // own virtual methods (virtual class only)
     for (auto& f : cs.fields) {
       if (auto* m = std::get_if<ast::Pcf_method>(&f.desc)) {
@@ -4176,8 +4192,9 @@ struct Translator {
       } else if (auto* ini = std::get_if<ast::Pcf_initializer>(&f.desc)) {
         initializers.push_back(ini->e.get());
       } else if (auto* inh = std::get_if<ast::Pcf_inherit>(&f.desc)) {
-        if (parent_meta || inh->as_ || !vals.empty() || !initializers.empty())
-          return nullptr;  // multiple/super-named/late inherit: unsupported
+        if (parent_meta || !vals.empty() || !initializers.empty())
+          return nullptr;  // multiple/late inherit: unsupported
+        if (inh->as_) super_name = inh->as_->txt;
         const ast::ClassExpr* pe = inh->ce.get();
         if (auto* ap = std::get_if<ast::Pcl_apply>(&pe->desc)) {
           for (auto& [l, e] : ap->args) {
@@ -4252,20 +4269,28 @@ struct Translator {
     if (parent_meta)
       for (auto& n : parent_meta->vals)
         if (!val_id.count(n)) val_id[n] = fresh(n);
+    // `as super`: ids for the parent's concrete-method closures (the trailing
+    // fields of the inherits result), bound sparsely by super#m usage.
+    std::unordered_map<std::string, Ident> super_mid;
+    if (parent_meta && !super_name.empty())
+      for (auto& n : parent_meta->concr) super_mid[n] = fresh(n);
 
     // Translate method bodies and val initialisers with the instance variables in
     // scope (a method's `n` -> (field_computed self n)) and the method labels
     // known (so a self-send resolves to (sendself self m)).
     auto save_iv = inst_vars_; auto save_mid = cur_meth_id_;
+    auto save_sn = cur_super_name_; auto save_smid = cur_super_mid_;
     inst_vars_.clear();
     if (parent_meta)
       for (auto& n : parent_meta->vals) inst_vars_[n] = val_id[n];
     for (auto& v : vals) inst_vars_[v.name] = val_id[v.name];
     cur_meth_id_ = meth_id;
+    cur_super_name_ = super_name; cur_super_mid_ = super_mid;
     std::string self_name = "self-" + std::to_string(++obj_counter_);
     scope.emplace_back();  // class parameters, visible to val inits and methods
     for (auto& cp : cparams) scope.back()[cp.name] = cp.pid;
-    auto restore = [&] { scope.pop_back(); inst_vars_ = save_iv; cur_meth_id_ = save_mid; };
+    auto restore = [&] { scope.pop_back(); inst_vars_ = save_iv; cur_meth_id_ = save_mid;
+                         cur_super_name_ = save_sn; cur_super_mid_ = save_smid; };
 
     // `class c = let .. in object`: the bindings wrap the class_init function
     // (bodies attached at the end).  Simple var lets and letrecs of functions
@@ -4539,6 +4564,16 @@ struct Translator {
         fm->prim_arg = (int)(1 + i); fm->args = {varof(inh)};
         bindlet->bindings.push_back({vid, ValueKind::Gen, fm, false, false, true});
       }
+      // super-called parent method closures follow the vals in the result array
+      if (!super_mid.empty())
+        for (size_t j = 0; j < parent_meta->concr.size(); ++j) {
+          Ident& mid = super_mid[parent_meta->concr[j]];
+          if (!used_id(mid)) continue;
+          auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut;
+          fm->prim_arg = (int)(1 + parent_meta->vals.size() + j);
+          fm->args = {varof(inh)};
+          bindlet->bindings.push_back({mid, ValueKind::Gen, fm, false, false, true});
+        }
       bindlet->body = cl_init;
       auto inhlet = mk(Lam::K::Let);
       inhlet->bindings = {{inh, ValueKind::Gen, oo_call("inherits", ia), false, false, false}};
