@@ -4143,7 +4143,8 @@ struct Translator {
   LamPtr build_object(const ast::ClassStructure& cs, bool as_class,
                       const std::string& class_name = "",
                       const std::vector<const ast::Pattern*>* cl_params = nullptr,
-                      const std::vector<const ast::Pcl_let*>* cl_lets = nullptr) {
+                      const std::vector<const ast::Pcl_let*>* cl_lets = nullptr,
+                      bool virt_class = false) {
     struct Meth { std::string name; const ast::Expression* body; };
     struct Val  { std::string name; const ast::Expression* init; };
     std::vector<Meth> meths;
@@ -4154,10 +4155,17 @@ struct Translator {
     const ClassMeta* parent_meta = nullptr;
     Ident parent_var;
     std::vector<const ast::Expression*> inh_args;
+    std::vector<std::string> virt_own;  // own virtual methods (virtual class only)
     for (auto& f : cs.fields) {
       if (auto* m = std::get_if<ast::Pcf_method>(&f.desc)) {
         auto* cc = std::get_if<ast::Cfk_concrete>(&m->kind);
-        if (!cc) return nullptr;  // virtual method
+        if (!cc) {
+          // a virtual method contributes its label to the method universe but
+          // has no code; only legal inside a `class virtual`.
+          if (!virt_class) return nullptr;
+          virt_own.push_back(m->name.txt);
+          continue;
+        }
         const ast::Expression* body = cc->e.get();
         if (auto* poly = std::get_if<ast::Pexp_poly>(&body->desc)) body = poly->e.get();
         meths.push_back({m->name.txt, body});
@@ -4212,10 +4220,12 @@ struct Translator {
           return nullptr;  // destructuring/wildcard class params: unsupported
       }
 
-    // The method universe is the union of inherited and own method names.
+    // The method universe is the union of inherited and own method names
+    // (including own virtual ones -- they have labels but no code).
     std::set<std::string> own_defined;
     std::set<std::string> all_meths;
     for (auto& m : meths) { own_defined.insert(m.name); all_meths.insert(m.name); }
+    for (auto& n : virt_own) all_meths.insert(n);
     if (parent_meta) for (auto& n : parent_meta->meths) all_meths.insert(n);
     // pub_meths: sorted by hash_variant ascending (create_table/make_class arg).
     std::vector<std::string> pub_meths(all_meths.begin(), all_meths.end());
@@ -4484,13 +4494,16 @@ struct Translator {
     // vars (fields 1..) -- the innermost binder group, after the ids binds.
     if (parent_meta) {
       Ident inh = fresh("inh");
-      // argument arrays are created before the method/val-name arrays
-      std::vector<LamPtr> ia = {
-          varof(cla),
-          parent_meta->vals.empty() ? cint(0) : transl_meth_list(parent_meta->vals),
-          parent_meta->virt.empty() ? cint(0) : transl_meth_list(parent_meta->virt),
-          parent_meta->concr.empty() ? cint(0) : transl_meth_list(parent_meta->concr),
-          varof(parent_var), cint(1)};
+      // argument arrays are created before the method/val-name arrays, the
+      // concrete-methods array before the virtual one (oracle creation order)
+      LamPtr vals_arr =
+          parent_meta->vals.empty() ? cint(0) : transl_meth_list(parent_meta->vals);
+      LamPtr concr_arr =
+          parent_meta->concr.empty() ? cint(0) : transl_meth_list(parent_meta->concr);
+      LamPtr virt_arr =
+          parent_meta->virt.empty() ? cint(0) : transl_meth_list(parent_meta->virt);
+      std::vector<LamPtr> ia = {varof(cla), vals_arr, virt_arr, concr_arr,
+                                varof(parent_var), cint(1)};
       auto bindlet = mk(Lam::K::Let);
       auto f0 = mk(Lam::K::Prim); f0->prim = Prim::FieldMut; f0->prim_arg = 0;
       f0->args = {varof(inh)};
@@ -4581,6 +4594,14 @@ struct Translator {
       LamPtr ci_val = ci_fn;
       for (auto it = let_layers.rbegin(); it != let_layers.rend(); ++it) {
         (*it)->body = ci_val; ci_val = *it;
+      }
+      // A virtual class cannot be instantiated: no make_class -- its value is
+      // the plain 3-tuple [0; class_init; 0], dummy-allocated and updated at
+      // the binding site (value-rec compilation of class declarations).
+      if (virt_class) {
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+        blk->args = {cint(0), ci_val, cint(0)};
+        return blk;
       }
       auto mc = oo_call("make_class", {transl_meth_list(pub_meths), varof(class_init)});
       auto let = mk(Lam::K::Let);
@@ -5114,18 +5135,28 @@ struct Translator {
               ce = pl->body.get();
             } else break;
           }
+          bool is_virt = d.virt == VirtualFlag::Virtual;
           if (ok)
             if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
               v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
                                params.empty() ? nullptr : &params,
-                               lets.empty() ? nullptr : &lets);
+                               lets.empty() ? nullptr : &lets, is_virt);
               register_class_meta(d.name.txt, ps->cs);
             }
-          if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
-          cur.push_back({id, ValueKind::Gen, v});
           scope.back()[d.name.txt] = id;
           class_ids_.insert(id.stamp);
           add_export(d.name.txt, id);
+          if (v && is_virt) {
+            // virtual class: `c = (caml_alloc_dummy 3)` updated with the 3-tuple
+            flush();
+            Seg s; s.seq = false; s.rec_ = false;
+            s.binds = {{id, ValueKind::Gen, alloc_dummy(3)}};
+            s.updates = {update_dummy(id, v)};
+            segs.push_back(std::move(s));
+            continue;
+          }
+          if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
+          cur.push_back({id, ValueKind::Gen, v});
         }
         continue;
       }
