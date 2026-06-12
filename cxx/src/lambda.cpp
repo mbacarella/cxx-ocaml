@@ -854,8 +854,11 @@ struct Translator {
   // so `Effect.Deep.continue` compiles to nested field reads.
   struct SubMod { std::vector<int> path; std::unordered_map<std::string, int> fields;
                   std::unordered_map<std::string, StdPrim> prims;
+                  std::unordered_map<std::string, FnSig> sigs;  // labelled values only
                   bool ok = false; };
   std::unordered_map<std::string, SubMod> submod_cache_;
+  // local alias name -> stdlib submodule dotted path (`module MP = Gc.Memprof`)
+  std::unordered_map<std::string, std::string> submod_alias_;
   const SubMod& submodule_of(const std::string& dotted) {
     auto it = submod_cache_.find(dotted);
     if (it != submod_cache_.end()) return it->second;
@@ -888,8 +891,23 @@ struct Translator {
         int i = 0;
         for (auto& f : sig->fields) sm.fields[f] = i++;
         // the submodule's externals (Bigarray.Array1.get = %caml_ba_ref_1 etc.)
-        for (auto& v : sig->values)
+        for (auto& v : sig->values) {
           if (!v.prim.empty()) sm.prims[v.name] = {v.prim, v.prim_arity};
+          // a labelled/optional arrow's signature, for call-site arg matching
+          // (Domain.DLS.new_key ?split_from_parent needs its None filled)
+          FnSig fs;
+          cmi::TypePtr t = v.type;
+          while (t) {
+            while (t && (t->kind == cmi::TypeExpr::Tlink ||
+                         t->kind == cmi::TypeExpr::Tsubst))
+              t = t->link;
+            if (!t || t->kind != cmi::TypeExpr::Tarrow) break;
+            fs.push_back({t->label_kind, t->label});
+            t = t->cod;
+          }
+          for (auto& [k, nm] : fs)
+            if (k != 0) { sm.sigs[v.name] = fs; break; }
+        }
         // Register the submodule's record types (Effect.Deep's handler etc.) so
         // record literals/projections with these labels resolve.  Only labels no
         // local type claims -- a fallback, never an ambiguity.
@@ -1081,6 +1099,25 @@ struct Translator {
       if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
         FnSig s = stdlib_value_sig(pl->name, d->name);
         for (auto& [k, n] : s) if (k != 0) return s;
+      }
+      // a stdlib submodule's value (Domain.DLS.new_key), incl. an opened head
+      // and a local alias (`module MP = Gc.Memprof` -> MP.start)
+      std::string dotted;
+      if (lid_to_dotted(*d->prefix, dotted)) {
+        if (auto sa = submod_alias_.find(dotted); sa != submod_alias_.end())
+          dotted = sa->second;
+        std::vector<std::string> cands;
+        if (dotted.find('.') != std::string::npos) cands.push_back(dotted);
+        for (auto it2 = opened_.rbegin(); it2 != opened_.rend(); ++it2)
+          if (it2->find('.') == std::string::npos)
+            cands.push_back(*it2 + "." + dotted);
+        for (auto& cand : cands) {
+          auto& sm = submodule_of(cand);
+          if (!sm.ok) continue;
+          if (auto it3 = sm.sigs.find(d->name); it3 != sm.sigs.end())
+            return it3->second;
+          if (sm.fields.count(d->name)) break;  // known value, no labels
+        }
       }
     }
     return {};
@@ -6027,6 +6064,21 @@ struct Translator {
             auto& lay = module_layout_[*mb.name.txt]; lay.clear();
             auto rl = module_result_layout(mb.expr);
             for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+            // an alias to a stdlib submodule (`module MP = Gc.Memprof`): register
+            // the dotted path so MP.x gets the submodule's fields, externals,
+            // labelled signatures, and record types
+            if (auto* pi2 = std::get_if<Pmod_ident>(&mb.expr.desc)) {
+              std::string dotted;
+              if (lid_to_dotted(pi2->id.txt, dotted) &&
+                  dotted.find('.') != std::string::npos &&
+                  !module_base(dotted.substr(0, dotted.find('.')))) {
+                auto& sm = submodule_of(dotted);
+                if (sm.ok) {
+                  submod_alias_[*mb.name.txt] = dotted;
+                  for (auto& [n2, i2] : sm.fields) lay[n2] = i2;
+                }
+              }
+            }
             if (is_pure_path(mv)) {  // a module alias `M = N.Sub`: inline the path
               module_alias_[*mb.name.txt] = mv;
               module_ident_.erase(*mb.name.txt);
