@@ -544,7 +544,7 @@ struct Translator {
     static const std::set<std::string> s = {
         "Out_of_memory", "Sys_error", "Failure", "Invalid_argument", "End_of_file",
         "Division_by_zero", "Not_found", "Match_failure", "Stack_overflow",
-        "Sys_blocked_io", "Assert_failure", "Undefined_recursive_module"};
+        "Sys_blocked_io", "Assert_failure", "Undefined_recursive_module", "Todo"};
     return s.count(n) != 0;
   }
   // `(global Name/stamp!)` for a predefined exception used by the compiler.  The
@@ -555,7 +555,7 @@ struct Translator {
       {"Match_failure", 23}, {"Assert_failure", 33}, {"Invalid_argument", 6},
       {"Failure", 4}, {"Not_found", 12}, {"Out_of_memory", 1}, {"Stack_overflow", 15},
       {"Sys_error", 3}, {"End_of_file", 9}, {"Division_by_zero", 10},
-      {"Sys_blocked_io", 17}, {"Undefined_recursive_module", 35},
+      {"Sys_blocked_io", 17}, {"Undefined_recursive_module", 35}, {"Todo", 36},
     };
     auto p = predef.find(name);
     int st = p != predef.end() ? p->second : (stamp++);
@@ -1483,6 +1483,16 @@ struct Translator {
     // Structural (kind-independent) prims.
     if (prim == "%opaque" && as.size() == 1) return op("opaque");
     if (prim == "%ignore" && as.size() == 1) return op("ignore");
+    // `Fun.todo ()`: evaluate the argument, then raise Todo with the call-site
+    // [0: file line] (translprim's location builtin).
+    if (prim == "%todo" && as.size() == 1) {
+      auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+      blk->args = {predef_global("Todo"),
+                   cblock(0, {cstr(file_name_), cint(e.loc.start.lnum)})};
+      auto r = mk(Lam::K::Prim); r->prim = Prim::Raise; r->args = {blk};
+      auto s = mk(Lam::K::Sequence); s->cond = expr(*as[0].second); s->else_ = r;
+      return s;
+    }
     if (prim == "%identity" && as.size() == 1) return expr(*as[0].second);  // no-op
     // `f @@ x` / `x |> f` apply f to x (the function is the 1st / 2nd argument).
     if ((prim == "%apply" || prim == "%revapply") && as.size() == 2) {
@@ -2269,8 +2279,23 @@ struct Translator {
         if (auto* pv = std::get_if<Ppat_var>(&lhsp->desc)) scope.back()[pv->name.txt] = exn;
         return expr(*c.rhs);
       }
-      if (auto* k = std::get_if<Ppat_construct>(&lhsp->desc))
-        if (LamPtr id = exn_value(lid_last(k->id.txt))) {
+      if (auto* k = std::get_if<Ppat_construct>(&lhsp->desc)) {
+        LamPtr id0 = exn_value(lid_last(k->id.txt));
+        // A stdlib module's exception (`Lazy.Undefined`): its identity is the
+        // module's runtime export field.
+        if (!id0)
+          if (auto* d = std::get_if<Ldot>(&k->id.txt.v))
+            if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+              auto& fm = fields_of(pl->name);
+              if (auto f = fm.find(d->name); f != fm.end()) {
+                std::string g = pl->name == "Stdlib" ? "Stdlib"
+                                : pl->name.rfind("Camlinternal", 0) == 0
+                                    ? pl->name
+                                    : "Stdlib__" + pl->name;
+                id0 = field_of(g, f->second);
+              }
+            }
+        if (LamPtr id = id0) {
           auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
           LamPtr lhs;
           if (k->arg) {  // exn carries data: compare its identity field
@@ -2288,6 +2313,7 @@ struct Translator {
           iff->else_ = exn_dispatch(exn, rows, i + 1);
           return iff;
         }
+      }
     }
     return exn_dispatch(exn, rows, i + 1);  // unsupported case: skip
   }
@@ -2656,9 +2682,11 @@ struct Translator {
     if (aliases.empty()) return body;
     auto l = mk(Lam::K::Let); l->bindings = std::move(aliases); l->body = body; return l;
   }
+  // An IMMUTABLE field read -- the alias (`=a`) class.  A mutable read
+  // (field_mut) is a strict computation: re-evaluation could differ.
   static bool is_field_access(const LamPtr& l) {
     return l->k == Lam::K::Prim &&
-           (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt || l->prim == Prim::FieldMut);
+           (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt);
   }
 
   static std::vector<Row> rows_of(const std::vector<Case>& cs) {
