@@ -2377,6 +2377,15 @@ struct Translator {
     // outside the module, so read the module's export field
     if (auto ef = exn_field_.find(name); ef != exn_field_.end())
       return fieldimm(ef->second.second, varof(ef->second.first));
+    // an opened stdlib module's exception (`open Effect; ... with Unhandled e`):
+    // its identity is the module's export field, shadowing the pervasives
+    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+      if (it->find('.') != std::string::npos) continue;  // dotted: submodule opens
+      if (module_base(*it)) continue;  // local module exns register in exn_field_
+      auto& fm = fields_of(*it);
+      if (auto f = fm.find(name); f != fm.end())
+        return field_of(global_of(*it), f->second);
+    }
     if (auto sf = stdlib_fields.find(name); sf != stdlib_fields.end())
       return field_of("Stdlib", sf->second);
     return nullptr;
@@ -2424,10 +2433,32 @@ struct Translator {
           } else {
             lhs = exv();
           }
-          LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs);
+          std::vector<std::pair<int, LamPtr>> ptests;
+          LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs, &ptests);
           if (!then) return exn_dispatch(exn, rows, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
           test->args = {lhs, id};
+          if (!ptests.empty()) {
+            // payload identity tests: the rest of the dispatch is needed at
+            // each failure point, so share it behind a catch/exit
+            int eid = ++next_exit_;
+            auto exitL = [&] {
+              auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x;
+            };
+            for (auto it = ptests.rbegin(); it != ptests.rend(); ++it) {
+              auto t = mk(Lam::K::Prim); t->prim = Prim::IntCmp; t->prim_id = "==";
+              t->args = {fieldimm(it->first, exv()), it->second};
+              auto pf = mk(Lam::K::IfThenElse);
+              pf->cond = t; pf->then_ = then; pf->else_ = exitL();
+              then = pf;
+            }
+            auto iff = mk(Lam::K::IfThenElse);
+            iff->cond = test; iff->then_ = then; iff->else_ = exitL();
+            auto cat = mk(Lam::K::Catch);
+            cat->cond = iff; cat->prim_arg = eid;
+            cat->then_ = exn_dispatch(exn, rows, i + 1);
+            return cat;
+          }
           auto iff = mk(Lam::K::IfThenElse);
           iff->cond = test; iff->then_ = then;
           iff->else_ = exn_dispatch(exn, rows, i + 1);
@@ -2441,10 +2472,13 @@ struct Translator {
   // 1..arity of the exception block (field 0 is its identity).  A structured
   // sub-pattern (the string*int*int tuple of Assert_failure etc.) reads through a
   // `*match*` temp like ocamlc's matcher; simple binders inline as field reads.
-  // Null when a sub-pattern is refutable (a constant pattern etc.) -- the case is
-  // then skipped, preserving the previous behavior.
+  // A constant extension-ctor sub-pattern (`with Unhandled E ->`) adds a
+  // field-identity test to `tests` (field index, identity value) when the caller
+  // provides it.  Null when a sub-pattern is otherwise refutable (a constant
+  // pattern etc.) -- the case is then skipped, preserving the previous behavior.
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
-                       const Expression& rhs) {
+                       const Expression& rhs,
+                       std::vector<std::pair<int, LamPtr>>* tests = nullptr) {
     if (!k->arg) return expr(rhs);
     int arity = 1;
     if (auto a = exn_arity_.find(name); a != exn_arity_.end()) arity = a->second;
@@ -2460,7 +2494,17 @@ struct Translator {
       const Pattern* fp = effective_pat(fps[j]);
       LamPtr acc = fieldimm(j + 1, exv());
       if (std::holds_alternative<Ppat_any>(fp->desc)) continue;
-      if (std::holds_alternative<Ppat_var>(fp->desc) ||
+      if (auto* kc = std::get_if<Ppat_construct>(&fp->desc);
+          kc && !kc->arg && tests &&
+          (exn_ident_.count(lid_last(kc->id.txt)) ||
+           exn_field_.count(lid_last(kc->id.txt)))) {
+        // constant extension/exception ctor payload: physical-identity test
+        if (LamPtr idv = exn_value(lid_last(kc->id.txt))) {
+          tests->push_back({j + 1, idv});
+          continue;
+        }
+        ok = false;
+      } else if (std::holds_alternative<Ppat_var>(fp->desc) ||
           std::holds_alternative<Ppat_alias>(fp->desc)) {
         ok = collect_binders(*fp, acc, binders);
       } else if (is_irrefutable(*fp)) {
