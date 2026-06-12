@@ -2626,6 +2626,17 @@ struct Translator {
     }
     const Row& c = rows[i];
     const Pattern* lhsp = effective_pat(c.lhs);
+    // `with A | B -> body`: expand the or-pattern into consecutive rows sharing
+    // the body (each alternative binds its own vars) -- previously the row was
+    // silently dropped to a reraise.
+    if (!c.guard && std::holds_alternative<Ppat_or>(lhsp->desc)) {
+      std::vector<const Pattern*> alts;
+      flatten_or(lhsp, alts);
+      std::vector<Row> expanded;
+      for (auto* a : alts) expanded.push_back({a, c.rhs, nullptr});
+      for (size_t j = i + 1; j < rows.size(); ++j) expanded.push_back(rows[j]);
+      return exn_dispatch(exn, expanded, 0);
+    }
     if (!c.guard) {
       if (is_catchall(*lhsp)) {  // `_`/var: handle unconditionally
         if (auto* pv = std::get_if<Ppat_var>(&lhsp->desc)) scope.back()[pv->name.txt] = exn;
@@ -2656,7 +2667,7 @@ struct Translator {
           } else {
             lhs = exv();
           }
-          std::vector<std::pair<int, LamPtr>> ptests;
+          std::vector<PayloadTest> ptests;
           LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs, &ptests);
           if (!then) return exn_dispatch(exn, rows, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
@@ -2669,8 +2680,10 @@ struct Translator {
               auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x;
             };
             for (auto it = ptests.rbegin(); it != ptests.rend(); ++it) {
-              auto t = mk(Lam::K::Prim); t->prim = Prim::IntCmp; t->prim_id = "==";
-              t->args = {fieldimm(it->first, exv()), it->second};
+              auto t = mk(Lam::K::Prim);
+              if (it->string_eq) { t->prim = Prim::Ccall; t->prim_id = "caml_string_equal"; }
+              else { t->prim = Prim::IntCmp; t->prim_id = "=="; }
+              t->args = {fieldimm(it->idx, exv()), it->rhs};
               auto pf = mk(Lam::K::IfThenElse);
               pf->cond = t; pf->then_ = then; pf->else_ = exitL();
               then = pf;
@@ -2699,9 +2712,10 @@ struct Translator {
   // field-identity test to `tests` (field index, identity value) when the caller
   // provides it.  Null when a sub-pattern is otherwise refutable (a constant
   // pattern etc.) -- the case is then skipped, preserving the previous behavior.
+  struct PayloadTest { int idx; LamPtr rhs; bool string_eq; };
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
                        const Expression& rhs,
-                       std::vector<std::pair<int, LamPtr>>* tests = nullptr) {
+                       std::vector<PayloadTest>* tests = nullptr) {
     if (!k->arg) return expr(rhs);
     int arity = 1;
     if (auto a = exn_arity_.find(name); a != exn_arity_.end()) arity = a->second;
@@ -2723,7 +2737,23 @@ struct Translator {
            exn_field_.count(lid_last(kc->id.txt)))) {
         // constant extension/exception ctor payload: physical-identity test
         if (LamPtr idv = exn_value(lid_last(kc->id.txt))) {
-          tests->push_back({j + 1, idv});
+          tests->push_back({j + 1, idv, false});
+          continue;
+        }
+        ok = false;
+      } else if (auto* pc = std::get_if<Ppat_constant>(&fp->desc); pc && tests) {
+        // constant payload (`Ex "!!!!!"`, `Code 42`): value test on the field
+        if (auto* ps = std::get_if<Pconst_string>(&pc->c.desc)) {
+          auto sv = mk(Lam::K::ConstString); sv->str_val = ps->s;
+          tests->push_back({j + 1, sv, true});
+          continue;
+        }
+        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc); pi && !pi->suffix) {
+          tests->push_back({j + 1, cint(parse_ocaml_int(pi->value)), false});
+          continue;
+        }
+        if (auto* pch = std::get_if<Pconst_char>(&pc->c.desc)) {
+          tests->push_back({j + 1, cchar((unsigned char)pch->code), false});
           continue;
         }
         ok = false;
