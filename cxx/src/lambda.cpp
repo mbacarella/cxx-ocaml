@@ -1302,6 +1302,29 @@ struct Translator {
     } catch (...) {}
     return std::nullopt;
   }
+  // Same, but keyed by the record TYPE name ("Gc.control" -> mod Gc, ty control)
+  // for resolution through an inferred type path.
+  std::optional<StdRec> stdlib_record_layout_named(const std::string& mod,
+                                                   const std::string& ty) {
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Record || td.name != ty) continue;
+        StdRec r;
+        bool all_float = true;
+        for (auto& l : td.labels) {
+          r.labels.push_back(l.name);
+          r.shape.push_back(cmi_field_kind(l.type));
+          r.mut.push_back(l.mutable_);
+          if (r.shape.back() != ValueKind::Float) all_float = false;
+        }
+        if (all_float) return std::nullopt;
+        return r;
+      }
+    } catch (...) {}
+    return std::nullopt;
+  }
   // The stdlib-module prefix governing a record label: an explicit `M.label`
   // qualification, else the base expression's qualified head.
   static std::string record_module_of(const Longident& lid, const Expression* base) {
@@ -3848,6 +3871,34 @@ struct Translator {
             for (auto& l : cand.labels) if (!labs.count(l)) { all = false; break; }
             if (all) { rt = &cand; break; }
           }
+        RecType std_rt;  // a stdlib record: by the literal's inferred type path,
+                         // else an opened module's label set (`open Gc; {..}`)
+        if (!rt) {
+          auto try_std = [&](std::optional<StdRec> sr) {
+            if (!sr || sr->labels.size() != labs.size()) return false;
+            for (auto& l : sr->labels) if (!labs.count(l)) return false;
+            std_rt.labels = std::move(sr->labels);
+            std_rt.shape = std::move(sr->shape);
+            std_rt.mut = false;
+            for (bool m : sr->mut) if (m) std_rt.mut = true;
+            rt = &std_rt;
+            return true;
+          };
+          if (auto itc = vk.expr_constr.find(&e); itc != vk.expr_constr.end()) {
+            const std::string& p = itc->second;
+            auto dpos = p.rfind('.');
+            std::string mod = p.substr(0, dpos);
+            if (mod.find('.') == std::string::npos)
+              try_std(stdlib_record_layout_named(mod, p.substr(dpos + 1)));
+          }
+          if (!rt)
+            for (auto it2 = opened_.rbegin(); it2 != opened_.rend(); ++it2) {
+              if (it2->find('.') != std::string::npos || module_base(*it2)) continue;
+              if (try_std(stdlib_record_layout(*it2,
+                                               lid_last(rc->fields[0].first.txt))))
+                break;
+            }
+        }
         if (rt) {
           auto index_of = [&](const std::string& l) {
             for (size_t i = 0; i < rt->labels.size(); ++i)
@@ -4148,6 +4199,8 @@ struct Translator {
             else if (m == "Bytes" && f == "length" && as.size() == 1) op = "bytes.length";
             else if (m == "Bytes" && f == "get" && as.size() == 2) op = "bytes.get";
             else if (m == "Bytes" && f == "set" && as.size() == 3) op = "bytes.set";
+            else if (m == "Bytes" && f == "unsafe_get" && as.size() == 2) op = "bytes.unsafe_get";
+            else if (m == "Bytes" && f == "unsafe_set" && as.size() == 3) op = "bytes.unsafe_set";
             if (!op.empty()) {
               auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = op;
               for (auto& a : as) pr->args.push_back(expr(*a.second));

@@ -312,6 +312,11 @@ struct Bytegen {
       if (o == "set")
         return cc(flt ? "caml_floatarray_set" : gen ? "caml_array_set" : "caml_array_set_addr", n);
     }
+    // unsafe string/bytes accesses are dedicated instructions (bytegen.ml
+    // Pstringrefu/Pbytesrefu/Pbytessetu), not C calls
+    if (s == "string.unsafe_get") return I(Op::Getstringchar);
+    if (s == "bytes.unsafe_get") return I(Op::Getbyteschar);
+    if (s == "bytes.unsafe_set") return I(Op::Setbyteschar);
     static const std::unordered_map<std::string, std::string> ccall = {
       {"+.", "caml_add_float"}, {"-.", "caml_sub_float"}, {"*.", "caml_mul_float"},
       {"/.", "caml_div_float"}, {"~.", "caml_neg_float"}, {"abs.", "caml_abs_float"},
@@ -320,7 +325,6 @@ struct Bytegen {
       {"compare_ints", "caml_int_compare"}, {"compare_floats", "caml_float_compare"},
       {"float_of_int", "caml_float_of_int"}, {"int_of_float", "caml_int_of_float"},
       {"string.length", "caml_ml_string_length"}, {"string.get", "caml_string_get"},
-      {"string.unsafe_get", "caml_string_unsafe_get"},
       {"bytes.length", "caml_ml_bytes_length"}, {"bytes.get", "caml_bytes_get"},
       {"bytes.set", "caml_bytes_set"}, {"bswap16", "caml_bswap16"},
     };

@@ -1494,11 +1494,24 @@ struct Checker {
         try_unify(infer_expr(*fld->e), s->dom);
         return s->cod;
       }
-      infer_expr(*fld->e);
+      TypePtr bt = infer_expr(*fld->e);
       // A module-qualified field `e.M.label` of a stdlib record: its declared type.
       if (auto* d = std::get_if<Ldot>(&fld->field.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
           if (TypePtr ft = stdlib_field_type(pl->name, d->name)) return ft;
+      // kinds pass: an unqualified label through the base's inferred type
+      // (g1.verbose with g1 : Gc.control), so comparisons/kinds specialize.
+      if (record_kinds_) {
+        TypePtr rb = I::Engine::repr(bt);
+        if (rb->kind == I::Type::Kind::Constr) {
+          auto dpos = rb->path.rfind('.');
+          if (dpos != std::string::npos &&
+              rb->path.find('.') == dpos)  // single-module prefix
+            if (TypePtr ft = stdlib_field_type(rb->path.substr(0, dpos),
+                                               lid_last(fld->field.txt)))
+              return ft;
+        }
+      }
       return eng.any();
     }
     if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
