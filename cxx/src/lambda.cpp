@@ -3627,6 +3627,13 @@ struct Translator {
         l->prim_arg = fi->index; l->args = {expr(*fe->e)};
         return l;
       }
+      // `r.contents` is the ref's mutable cell (the `!r` spelling's field).
+      if (lid_last(fe->field.txt) == "contents") {
+        auto l = mk(Lam::K::Prim);
+        l->prim = expr_kind(&e) == ValueKind::Int ? Prim::FieldInt : Prim::FieldMut;
+        l->prim_arg = 0; l->args = {expr(*fe->e)};
+        return l;
+      }
       // A module-qualified field `e.M.label` of a stdlib record (e.g. Gc.control).
       if (auto* d = std::get_if<Ldot>(&fe->field.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
@@ -3644,6 +3651,13 @@ struct Translator {
         auto l = mk(Lam::K::Prim);
         l->prim = fi->kind == ValueKind::Int ? Prim::SetfieldImm : Prim::SetfieldPtr;
         l->prim_arg = fi->index; l->args = {expr(*sf->obj), expr(*sf->value)};
+        return l;
+      }
+      if (lid_last(sf->field.txt) == "contents") {  // r.contents <- v == r := v
+        auto l = mk(Lam::K::Prim);
+        l->prim = expr_kind(sf->value.get()) == ValueKind::Int ? Prim::SetfieldImm
+                                                               : Prim::SetfieldPtr;
+        l->prim_arg = 0; l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }
     }
