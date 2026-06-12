@@ -50,6 +50,10 @@ struct ValueKinds {
   // "float"/"addr"/"string"/""), so the back end can annotate Array.length /
   // empty `[||]` with the element kind (which the array's own kind can't give).
   std::unordered_map<const void*, std::string> array_elem;
+  // For an expression whose type is a module-qualified constr ("Gc.stat"), the
+  // full path -- the back end resolves unqualified record labels through the
+  // base expression's inferred type (heap_stats.major_collections).
+  std::unordered_map<const void*, std::string> expr_constr;
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 

@@ -148,6 +148,11 @@ struct Checker {
   // becomes float -> float -> float instead of clashing t vs float).
   const std::vector<cmi::TypeDecl>* cmi_types_ctx_ = nullptr;
   std::set<std::string> cmi_expanding_;
+  // The module path owning cmi_types_ctx_: a Pident type constr in a cmi names a
+  // same-unit type, so qualify it ("stat" in gc.cmi -> "Gc.stat") -- unification
+  // compares last components, and consumers (record-label resolution) need the
+  // module.  Predefs aren't in the signature's type list and stay bare.
+  std::string cmi_mod_prefix_;
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
@@ -209,6 +214,11 @@ struct Checker {
               cmi_expanding_.erase(td.name);
               return r;
             }
+        // qualify a same-unit (Pident) type with its owning module
+        if (cmi_types_ctx_ && !cmi_mod_prefix_.empty() && n->path &&
+            n->path->kind == cmi::Path::Pident)
+          for (auto& td : *cmi_types_ctx_)
+            if (td.name == n->path->id.name) { p = cmi_mod_prefix_ + "." + p; break; }
         std::vector<TypePtr> as;
         for (auto& a : n->args) as.push_back(from_cmi(a, memo));
         return eng.constr(std::move(p), std::move(as));
@@ -338,10 +348,15 @@ struct Checker {
             std::unordered_map<cmi::TypeExpr*, TypePtr> m2;
             for (size_t i = 0; i < as.size(); ++i) m2[td.params[i].get()] = as[i];
             cmi_types_ctx_ = &sig->types;
+            std::string saved_pfx = cmi_mod_prefix_;
+            std::string pfx;
+            for (auto& cmp : comps) { if (!pfx.empty()) pfx += '.'; pfx += cmp; }
+            cmi_mod_prefix_ = pfx;
             cmi_expanding_.insert(td.name);
             TypePtr r = from_cmi(td.manifest, m2);
             cmi_expanding_.erase(td.name);
             cmi_types_ctx_ = saved;
+            cmi_mod_prefix_ = saved_pfx;
             return r;
           }
     } catch (...) {}
@@ -510,13 +525,17 @@ struct Checker {
       }
       if (sig) {
         cmi_types_ctx_ = &sig->types;  // enable same-module abbreviation expansion
+        std::string pfx;
+        for (auto& cmp : comps) { if (!pfx.empty()) pfx += '.'; pfx += cmp; }
+        cmi_mod_prefix_ = pfx;
         for (auto& v : sig->values) {
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
           out[v.name] = from_cmi(v.type, memo);
         }
         cmi_types_ctx_ = nullptr;
+        cmi_mod_prefix_.clear();
       }
-    } catch (...) { cmi_types_ctx_ = nullptr; }
+    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
     return out;
   }
 
@@ -2341,6 +2360,9 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
     vk.expr[e] = kind_str(t, ck.immediate_types_);
     std::string ek;
     if (array_elem_str(t, ck.immediate_types_, ek)) vk.array_elem[e] = ek;  // "" = gen element
+    TypePtr r = I::Engine::repr(t);
+    if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
+      vk.expr_constr[e] = r->path;  // module-qualified type, e.g. "Gc.stat"
   }
   vk.format_lits = std::move(ck.fmt_lits_);
   return vk;

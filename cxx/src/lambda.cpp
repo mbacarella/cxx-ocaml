@@ -1251,6 +1251,29 @@ struct Translator {
     } catch (...) {}
     return std::nullopt;
   }
+  // An unqualified label resolved through the base expression's INFERRED type:
+  // `heap_stats.major_collections` with heap_stats : Gc.stat reads the labeled
+  // field of the record decl `stat` in gc.cmi.
+  std::optional<StdField> inferred_record_field(const Expression* base,
+                                                const std::string& label) {
+    auto it = vk.expr_constr.find(base);
+    if (it == vk.expr_constr.end()) return std::nullopt;
+    const std::string& p = it->second;
+    auto d = p.rfind('.');
+    std::string mod = p.substr(0, d), ty = p.substr(d + 1);
+    if (mod.find('.') != std::string::npos) return std::nullopt;  // nested module
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Record || td.name != ty) continue;
+        for (int i = 0; i < (int)td.labels.size(); ++i)
+          if (td.labels[i].name == label)
+            return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_};
+      }
+    } catch (...) {}
+    return std::nullopt;
+  }
   // The full layout of the stdlib record type (in module `mod`'s cmi) declaring
   // `label`, for unqualified-label updates of non-opened stdlib records
   // (`{ (Gc.get ()) with allocation_policy = 2 }`). All-float (flat) records
@@ -3842,6 +3865,15 @@ struct Translator {
             l->prim_arg = rf->index; l->args = {expr(*fe->e)};
             return l;
           }
+      // An unqualified stdlib-record label via the base's inferred type.
+      if (auto rf = inferred_record_field(fe->e.get(), lid_last(fe->field.txt))) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = rf->kind == ValueKind::Int ? Prim::FieldInt
+                  : rf->mut                  ? Prim::FieldMut
+                                             : Prim::FieldImm;
+        l->prim_arg = rf->index; l->args = {expr(*fe->e)};
+        return l;
+      }
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
       if (auto* fi = find_field(lid_last(sf->field.txt))) {
@@ -3855,6 +3887,13 @@ struct Translator {
         l->prim = expr_kind(sf->value.get()) == ValueKind::Int ? Prim::SetfieldImm
                                                                : Prim::SetfieldPtr;
         l->prim_arg = 0; l->args = {expr(*sf->obj), expr(*sf->value)};
+        return l;
+      }
+      // An unqualified stdlib-record label via the base's inferred type.
+      if (auto rf = inferred_record_field(sf->obj.get(), lid_last(sf->field.txt))) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = rf->kind == ValueKind::Int ? Prim::SetfieldImm : Prim::SetfieldPtr;
+        l->prim_arg = rf->index; l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }
     }
