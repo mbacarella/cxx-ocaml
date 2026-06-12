@@ -104,10 +104,9 @@ ValPtr const_value(const LamPtr& c) {
           raw.push_back((char)0x19);
           raw += "_j"; raw.push_back('\0');
           be64((std::uint64_t)c->int_val);
-        } else {  // 'n'
-          raw.push_back((char)0x18);  // CODE_CUSTOM_LEN
+        } else {  // 'n': nativeint is fixed-length too -- a width tag + value
+          raw.push_back((char)0x19);
           raw += "_n"; raw.push_back('\0');
-          be32(4); be64(8);  // sz_32 / sz_64 headers
           long long v = c->int_val;
           if (v >= INT32_MIN && v <= INT32_MAX) { raw.push_back(1); be32((std::uint32_t)v); }
           else { raw.push_back(2); be64((std::uint64_t)v); }
@@ -177,8 +176,11 @@ struct Emitter {
   void slot_cprim(const std::string& name) { relocs.push_back({Reloc::Primitive, name, nullptr, pos()}); out_int(0); }
 
   static bool is_immed(long long n) { return n >= -(1LL << 30) && n < (1LL << 30); }
+  // A suffixed literal (42l/42L/42n) is BOXED whatever its value: never an
+  // immediate (it must go through the marshalled custom-block literal).
   static bool is_immed_const(const LamPtr& c) {
-    return (c->k == Lam::K::ConstInt && is_immed(c->int_val)) || c->k == Lam::K::ConstChar;
+    return (c->k == Lam::K::ConstInt && c->str_val.empty() && is_immed(c->int_val)) ||
+           c->k == Lam::K::ConstChar;
   }
   static long long const_as_int(const LamPtr& c) { return c->int_val; }
 
@@ -287,7 +289,7 @@ struct Emitter {
     }
   }
   void emit_const(const LamPtr& c) {
-    if (c->k == Lam::K::ConstInt && is_immed(c->int_val)) {
+    if (c->k == Lam::K::ConstInt && c->str_val.empty() && is_immed(c->int_val)) {
       long long i = c->int_val;
       if (i >= 0 && i <= 3) out(CONST0 + (int)i); else { out(CONSTINT); out_int(i); }
     } else if (c->k == Lam::K::ConstChar) {
@@ -299,7 +301,7 @@ struct Emitter {
     }
   }
   void emit_pushconst(const LamPtr& c) {
-    if (c->k == Lam::K::ConstInt && is_immed(c->int_val)) {
+    if (c->k == Lam::K::ConstInt && c->str_val.empty() && is_immed(c->int_val)) {
       long long i = c->int_val;
       if (i >= 0 && i <= 3) out(PUSHCONST0 + (int)i); else { out(PUSHCONSTINT); out_int(i); }
     } else if (c->k == Lam::K::ConstChar) {

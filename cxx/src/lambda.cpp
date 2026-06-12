@@ -839,6 +839,7 @@ struct Translator {
   // head module's global down to the submodule block, plus its own field map --
   // so `Effect.Deep.continue` compiles to nested field reads.
   struct SubMod { std::vector<int> path; std::unordered_map<std::string, int> fields;
+                  std::unordered_map<std::string, StdPrim> prims;
                   bool ok = false; };
   std::unordered_map<std::string, SubMod> submod_cache_;
   const SubMod& submodule_of(const std::string& dotted) {
@@ -872,6 +873,9 @@ struct Translator {
       if (!fail) {
         int i = 0;
         for (auto& f : sig->fields) sm.fields[f] = i++;
+        // the submodule's externals (Bigarray.Array1.get = %caml_ba_ref_1 etc.)
+        for (auto& v : sig->values)
+          if (!v.prim.empty()) sm.prims[v.name] = {v.prim, v.prim_arity};
         // Register the submodule's record types (Effect.Deep's handler etc.) so
         // record literals/projections with these labels resolve.  Only labels no
         // local type claims -- a fallback, never an ambiguity.
@@ -895,6 +899,12 @@ struct Translator {
       }
     } catch (...) {}
     return submod_cache_[dotted] = std::move(sm);
+  }
+  StdPrim submodule_prim(const std::string& dotted, const std::string& name) {
+    auto& sm = submodule_of(dotted);
+    if (!sm.ok) return {"", 0};
+    auto it = sm.prims.find(name);
+    return it == sm.prims.end() ? StdPrim{"", 0} : it->second;
   }
   LamPtr submodule_value(const std::string& dotted, const std::string& name) {
     auto& sm = submodule_of(dotted);
@@ -1574,6 +1584,19 @@ struct Translator {
           pr->args = args();
           return pr;
         }
+    }
+    // Bigarray accessors: the kind/layout-less spelling (what ocamlc prints
+    // when inference supplies no type info); the bytecode back end uses the
+    // generic C entry points regardless of kind, exactly like upstream bytegen.
+    if (prim.rfind("%caml_ba_", 0) == 0 && (int)as.size() == arity) {
+      static const std::pair<const char*, const char*> ba[] = {
+          {"%caml_ba_ref_", "get"}, {"%caml_ba_unsafe_ref_", "unsafe_get"},
+          {"%caml_ba_set_", "set"}, {"%caml_ba_unsafe_set_", "unsafe_set"}};
+      for (auto& [pfx, nm] : ba)
+        if (prim.rfind(pfx, 0) == 0)
+          return op(std::string("Bigarray.") + nm + "[generic,unknown]");
+      if (prim.rfind("%caml_ba_dim_", 0) == 0)
+        return op("Bigarray.dim_" + prim.substr(sizeof("%caml_ba_dim_") - 1));
     }
     // Byte-swap builtins: %bswap16 prints bare, the boxed ones module-qualified.
     if ((int)as.size() == arity && arity == 1) {
@@ -3875,6 +3898,8 @@ struct Translator {
           }
           if (it->find('.') != std::string::npos) {  // opened stdlib submodule
             if (LamPtr v = submodule_value(*it, l->name)) return v;
+            if (StdPrim sp = submodule_prim(*it, l->name); !sp.name.empty())
+              if (LamPtr s = prim_stub(sp)) return s;
             continue;
           }
           auto& fm = fields_of(*it);  // stdlib module
@@ -3912,11 +3937,22 @@ struct Translator {
           // (`Int64.add` -> `(function p p stub (Int64.add p p))`).
           if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) return s;
         }
-      // Qualified M.S.x through a stdlib submodule path (Effect.Deep.continue).
+      // Qualified M.S.x through a stdlib submodule path (Effect.Deep.continue),
+      // including an opened head (`Array1.x` under `open Bigarray`) and the
+      // submodule's externals (value position -> eta-stub).
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
         std::string dotted;
-        if (lid_to_dotted(*d->prefix, dotted) && dotted.find('.') != std::string::npos)
-          if (LamPtr v = submodule_value(dotted, d->name)) return v;
+        if (lid_to_dotted(*d->prefix, dotted)) {
+          std::vector<std::string> cands;
+          if (dotted.find('.') != std::string::npos) cands.push_back(dotted);
+          for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
+            if (it->find('.') == std::string::npos) cands.push_back(*it + "." + dotted);
+          for (auto& cand : cands) {
+            if (LamPtr v = submodule_value(cand, d->name)) return v;
+            if (StdPrim sp = submodule_prim(cand, d->name); !sp.name.empty())
+              if (LamPtr s = prim_stub(sp)) return s;
+          }
+        }
       }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + lid_last(id->id.txt));  // unresolved (will DIFF)
       return v;
@@ -3985,6 +4021,27 @@ struct Translator {
             if (auto prim = value_prim(m, f); !prim.name.empty())
               if (auto r = prim_to_lam(prim.name, prim.arity, *ap, e)) return r;
           }
+      // Nested-prefix qualified externals (`Bigarray.Array1.get a i`, or
+      // `Array1.get` under `open Bigarray`): the submodule's prim via the cmi
+      // signature chain.
+      if (auto* fid2 = std::get_if<Pexp_ident>(&ap->fn->desc))
+        if (std::get_if<Ldot>(&fid2->id.txt.v)) {
+          std::string full;
+          if (lid_to_dotted(fid2->id.txt, full)) {
+            size_t lastd = full.rfind('.');
+            std::string pre = full.substr(0, lastd), nm = full.substr(lastd + 1);
+            std::string head = pre.substr(0, pre.find('.'));
+            if (!lookup(head) && !module_base(head)) {
+              std::vector<std::string> cands;
+              if (pre.find('.') != std::string::npos) cands.push_back(pre);
+              for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
+                if (it->find('.') == std::string::npos) cands.push_back(*it + "." + pre);
+              for (auto& cand : cands)
+                if (StdPrim sp = submodule_prim(cand, nm); !sp.name.empty())
+                  if (auto r = prim_to_lam(sp.name, sp.arity, *ap, e)) return r;
+            }
+          }
+        }
       if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
         if (auto* l = std::get_if<Lident>(&fid->id.txt.v))
           if (!lookup(l->name) && !opened_has(l->name)) {  // an unshadowed pervasive
@@ -3998,6 +4055,19 @@ struct Translator {
             if (auto lp = local_prims_.find(n); lp != local_prims_.end())
               if (auto r = prim_to_lam(lp->second.first, lp->second.second, *ap, e))
                 return r;
+            // an opened module's external member applied directly (its fields
+            // are handled by the generic path; opened_has excludes prims)
+            for (auto it2 = opened_.rbegin(); it2 != opened_.rend(); ++it2) {
+              bool dotted = it2->find('.') != std::string::npos;
+              StdPrim sp = dotted ? submodule_prim(*it2, n) : value_prim(*it2, n);
+              if (!sp.name.empty()) {
+                if (auto r = prim_to_lam(sp.name, sp.arity, *ap, e)) return r;
+                break;
+              }
+              if (dotted ? submodule_of(*it2).fields.count(n) > 0
+                         : fields_of(*it2).count(n) > 0)
+                break;  // a field here shadows outer opens
+            }
             if (n == "raise" && as.size() == 1) {
               LamPtr arg = expr(*as[0].second);
               // raising the innermost caught exception re-raises (keeps backtrace).

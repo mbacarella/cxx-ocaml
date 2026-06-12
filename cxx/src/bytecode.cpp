@@ -325,6 +325,16 @@ struct Bytegen {
       {"bytes.set", "caml_bytes_set"}, {"bswap16", "caml_bswap16"},
     };
     if (auto it = ccall.find(s); it != ccall.end()) return cc(it->second, n);
+    // Bigarray accessors compile to the generic C entry points whatever the
+    // kind/layout annotation (bytegen's Pbigarrayref/set/dim).
+    if (s.rfind("Bigarray.", 0) == 0) {
+      auto br = s.find('[');
+      std::string o = s.substr(9, br == std::string::npos ? std::string::npos : br - 9);
+      if (o.rfind("dim_", 0) == 0) return cc("caml_ba_dim_" + o.substr(4), n);
+      bool set = o == "set" || o == "unsafe_set";
+      int N = set ? n - 2 : n - 1;
+      return cc((set ? "caml_ba_set_" : "caml_ba_get_") + std::to_string(N), n);
+    }
     // boxed-int comparisons arrive as IntCmp with a module-qualified prim_id
     if (std::string b = bint_cname(s); b != s) return cc(b, n);
     return cc("?" + s, n);
