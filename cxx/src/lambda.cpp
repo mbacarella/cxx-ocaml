@@ -1696,6 +1696,13 @@ struct Translator {
       pr->args = argv;
       return pr;
     }
+    if ((prim == "%sequand" || prim == "%sequor") && n == 2) {  // && / || as values
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = argv[0];
+      if (prim == "%sequand") { i->then_ = argv[1]; i->else_ = cint(0); }
+      else { i->then_ = cint(1); i->else_ = argv[1]; }
+      return i;
+    }
     if ((prim == "%succint" || prim == "%predint") && n == 1) {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::Offsetint;
       pr->prim_arg = prim == "%succint" ? 1 : -1; pr->args = argv; return pr;
@@ -1795,6 +1802,14 @@ struct Translator {
       return s;
     }
     if (prim == "%identity" && as.size() == 1) return expr(*as[0].second);  // no-op
+    // qualified short-circuits (`Bool.( && ) a b`): still lazy in the 2nd arg
+    if ((prim == "%sequand" || prim == "%sequor") && as.size() == 2) {
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = expr(*as[0].second);
+      if (prim == "%sequand") { i->then_ = expr(*as[1].second); i->else_ = cint(0); }
+      else { i->then_ = cint(1); i->else_ = expr(*as[1].second); }
+      return i;
+    }
     // `f @@ x` / `x |> f` apply f to x (the function is the 1st / 2nd argument).
     if ((prim == "%apply" || prim == "%revapply") && as.size() == 2) {
       auto a = mk(Lam::K::Apply);
@@ -2648,17 +2663,25 @@ struct Translator {
       if (auto* k = std::get_if<Ppat_construct>(&lhsp->desc)) {
         LamPtr id0 = exn_value(lid_last(k->id.txt));
         // A stdlib module's exception (`Lazy.Undefined`): its identity is the
-        // module's runtime export field.
+        // module's runtime export field.  A LOCAL module's (incl. one spliced
+        // in by `include Stack` -- `with S.Empty ->`): its layout field.
         if (!id0)
           if (auto* d = std::get_if<Ldot>(&k->id.txt.v))
             if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
-              auto& fm = fields_of(pl->name);
-              if (auto f = fm.find(d->name); f != fm.end()) {
-                std::string g = pl->name == "Stdlib" ? "Stdlib"
-                                : pl->name.rfind("Camlinternal", 0) == 0
-                                    ? pl->name
-                                    : "Stdlib__" + pl->name;
-                id0 = field_of(g, f->second);
+              if (LamPtr base = module_base(pl->name)) {
+                auto& lay = module_layout_[pl->name];
+                if (auto f = lay.find(d->name); f != lay.end())
+                  id0 = fieldimm(f->second, base);
+              }
+              if (!id0) {
+                auto& fm = fields_of(pl->name);
+                if (auto f = fm.find(d->name); f != fm.end()) {
+                  std::string g = pl->name == "Stdlib" ? "Stdlib"
+                                  : pl->name.rfind("Camlinternal", 0) == 0
+                                      ? pl->name
+                                      : "Stdlib__" + pl->name;
+                  id0 = field_of(g, f->second);
+                }
               }
             }
         if (LamPtr id = id0) {
@@ -7257,9 +7280,18 @@ struct Translator {
           auto v = mk(Lam::K::Var); v->var = iid; base = v;
         }
         auto rl = module_result_layout(pin->expr);
+        if (rl.empty()) rl = arg_layout(pin->expr);  // a module path: its own fields
         for (int i = 0; i < (int)rl.size(); ++i) {
           auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm; fi->prim_arg = i; fi->args = {base};
           add_export_val(rl[i], fi);
+        }
+        // an included module path also brings its names into BARE scope for the
+        // rest of the structure (like open): `include Stack ... iter f s`
+        if (auto* mi = std::get_if<Pmod_ident>(&pin->expr.desc)) {
+          std::string dotted;
+          if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+          opened_.push_back(dotted);
+          ++n_opens;
         }
         continue;
       }
