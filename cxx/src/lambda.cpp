@@ -596,7 +596,14 @@ struct Translator {
   // Locally-declared variant constructors: name -> {owning type, tag, is_block}.
   // Constant (nullary) and block (with-args) constructors are numbered
   // separately from 0 in declaration order, matching the runtime representation.
-  struct CtorInfo { std::string type; int tag; bool is_block; int arity; bool unboxed = false; };
+  struct CtorInfo {
+    std::string type; int tag; bool is_block; int arity; bool unboxed = false;
+    // inline record (`T of { pos : int }`): fields live directly in the
+    // constructor block, in label order
+    std::vector<std::string> rlabels;
+    std::vector<ValueKind> rshape;
+    std::vector<bool> rfmut;
+  };
   std::unordered_map<std::string, CtorInfo> ctor_info_;
   std::unordered_map<std::string, std::pair<int, int>> type_ctors_;  // type -> (n_const, n_block)
   std::set<std::string> immediate_local_;  // local all-constant variant type names
@@ -758,11 +765,28 @@ struct Translator {
         for (auto& c : v->ctors) {
           bool block = true;
           int arity = 0;
+          auto* r = std::get_if<Pcstr_record>(&c.args);
           if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) { arity = (int)t->elems.size(); block = arity > 0; }
+          else if (r) arity = (int)r->fields.size();  // inline record: fields in the block
           if (c.res) gadt = true;
           if (block) all_const = false;
           builtin_ctors_.erase(c.name.txt);  // a local decl un-marks a builtin
-          ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block, arity, unboxed && arity == 1};
+          CtorInfo ci{d.name.txt, block ? nb : nc, block, arity, unboxed && arity == 1};
+          if (r) {
+            int ridx = 0;
+            for (auto& f : r->fields) {
+              ValueKind fk = coretype_kind(*f.type);
+              bool fm = f.mut == MutableFlag::Mutable;
+              ci.rlabels.push_back(f.name.txt);
+              ci.rshape.push_back(fk);
+              ci.rfmut.push_back(fm);
+              // the labels resolve like record labels (`r.cnt` on a bound
+              // inline-record value reads the block field)
+              if (field_info_.count(f.name.txt)) ambiguous_fields_.insert(f.name.txt);
+              field_info_[f.name.txt] = {d.name.txt, ridx++, fm, fk};
+            }
+          }
+          ctor_info_[c.name.txt] = std::move(ci);
           if (block) ++nb; else ++nc;
         }
         type_ctors_[d.name.txt] = {nc, nb};
@@ -3569,6 +3593,22 @@ struct Translator {
       if (tc == type_ctors_.end()) return false;
       if (tc->second.first + tc->second.second != 1 && !gadt_types_.count(ci->second.type))
         return false;
+      // inline record (`T {pos}`): each named label reads its block field
+      if (!ci->second.rlabels.empty()) {
+        auto* pr = pk->arg ? std::get_if<Ppat_record>(&effective_pat(pk->arg->get())->desc)
+                           : nullptr;
+        if (!pr) return false;
+        auto& L = ci->second.rlabels;
+        for (auto& [lbl, sub] : pr->fields) {
+          int ix = -1;
+          for (size_t i2 = 0; i2 < L.size(); ++i2)
+            if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
+          if (ix < 0) return false;
+          FieldInfo fi{ci->second.type, ix, ci->second.rfmut[ix], ci->second.rshape[ix]};
+          if (!collect_binders(*sub, field_read(&fi, scrut), out)) return false;
+        }
+        return true;
+      }
       auto fps = ctor_field_pats(pk, ci->second.arity);
       if ((int)fps.size() != ci->second.arity) return false;
       for (size_t i = 0; i < fps.size(); ++i)
@@ -3735,6 +3775,13 @@ struct Translator {
       if (tc == type_ctors_.end()) return false;
       if (tc->second.first + tc->second.second != 1 && !gadt_types_.count(ci->second.type))
         return false;
+      if (!ci->second.rlabels.empty()) {  // inline record: check the label pats
+        auto* pr = pk->arg ? std::get_if<Ppat_record>(&effective_pat(pk->arg->get())->desc)
+                           : nullptr;
+        if (!pr) return false;
+        for (auto& [lbl, sub] : pr->fields) if (!is_irrefutable(*sub)) return false;
+        return true;
+      }
       for (auto* fp : ctor_field_pats(pk, ci->second.arity))
         if (!is_irrefutable(*fp)) return false;
       return true;
@@ -3817,7 +3864,11 @@ struct Translator {
     auto bind_field = [&](int idx, const Pattern& p) { destruct(p, fieldimm(idx, scrut)); };
     if (k->arg) {
       const Pattern& arg = **k->arg;
-      if (ci.arity > 1) {
+      if (!ci.rlabels.empty()) {
+        // inline record: the argument pattern matches the block itself
+        // (`T r` binds r to the scrutinee; `T {cnt}` reads the labels' fields)
+        destruct(arg, scrut);
+      } else if (ci.arity > 1) {
         auto* tup = std::get_if<Ppat_tuple>(&arg.desc);
         if (!tup || (int)tup->elems.size() != ci.arity) ok = false;
         else for (int idx = 0; idx < ci.arity && ok; ++idx) bind_field(idx, *tup->elems[idx]);
@@ -5193,6 +5244,38 @@ struct Translator {
                          (raise_pos || !ctor_info_.count(n) || builtin_ctors_.count(n));
       if (auto ci = ctor_info_.find(n); ci != ctor_info_.end() && !exn_shadows) {
         if (!ci->second.is_block) return cint(ci->second.tag);  // constant -> its tag
+        // inline record (`T {pos}`): the labels are the block's fields, in
+        // declaration order, with the declared kinds as the shape
+        if (!ci->second.rlabels.empty() && k->arg) {
+          auto* rc = std::get_if<Pexp_record>(&(*k->arg)->desc);
+          if (rc && !rc->base) {
+            auto& L = ci->second.rlabels;
+            std::vector<const Expression*> vexps(L.size(), nullptr);
+            bool ok = vexps.size() == rc->fields.size();
+            for (auto& [lid, ve] : rc->fields) {
+              int ix = -1;
+              for (size_t i2 = 0; i2 < L.size(); ++i2)
+                if (L[i2] == lid_last(lid.txt)) { ix = (int)i2; break; }
+              if (ix < 0 || vexps[ix]) { ok = false; break; }
+              vexps[ix] = ve.get();
+            }
+            if (ok) {
+              bool anymut = false;
+              for (bool m : ci->second.rfmut) anymut = anymut || m;
+              std::vector<LamPtr> vals;
+              for (auto* vexp : vexps) vals.push_back(expr(*vexp));
+              if (anymut) {
+                auto m = mk(Lam::K::Prim);
+                m->prim = Prim::Makemutable; m->prim_arg = ci->second.tag;
+                m->blk_shape = ci->second.rshape; m->args = std::move(vals);
+                return m;
+              }
+              auto b = block(ci->second.tag, std::move(vals));
+              if (b->k == Lam::K::Prim) b->blk_shape = ci->second.rshape;
+              return b;
+            }
+          }
+        }
         std::vector<const Expression*> fs;
         if (k->arg) {  // `B of t1 * t2` flattens the tuple argument into fields
           if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
