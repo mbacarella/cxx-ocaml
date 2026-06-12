@@ -1148,3 +1148,42 @@ Dashboard: **exec 82%+ (was 55.3% at the metric's birth), lambda 45.0% (334),
 instr 48.5% (377), completeness 100% (0/744 false-rejects), soundness 86.3%**.
 Pipeline: lex (100%) → parse (100%) → type/infer (100% accept / 86.3% reject) →
 lambda → bytecode → .cmo → link → run.
+
+## Crossing 91% exec: the crash classes fall (2026-06-12, cont.)
+
+Four sessions' worth of "known-hard" entries fell in one sweep, mostly to
+letrec and silent-drop classes:
+
+- **The letrec compile-crash class is dead** (4 files: recvalues, lazy_,
+  pr12153, hamming). partition_rec only knew Regular_block sizing, so a
+  recursive lazy thunk or array literal fell through to a raw letrec whose
+  non-function bindings crashed bytegen on a null body. Ported the rest of
+  value_rec_compiler's sizing: `Pmakelazyblock` → `caml_alloc_dummy_lazy` +
+  `caml_update_dummy_lazy` (non-syntactic thunks wrapped in
+  `CamlinternalLazy.indirect` so backpatch can't race a force), makearray →
+  regular/float dummies. Plus `{contents = e}` is the predef ref record — it
+  compiled to the placeholder 0.
+- **Recursive class declarations**: `class foo = … and bar = …` bodies can
+  `new` any group member (even a lone class can `new` itself), but we bound
+  each name only after its body — forward refs compiled to `(apply 0 args)`.
+  Pre-bind the group, then backpatch referencing bindings through the
+  alloc_dummy(3) scheme. Cleared backtrace/methods.ml.
+- **The backtrace cluster (~9 files) needed NO debug-info support** — the
+  oracle compiles without -g in our harness, so backtraces print "unknown
+  location" on both sides. The real bugs were: lazy patterns never forcing
+  (`let (lazy ()) = l2` was a no-op; now bound strict via inline_lazy_force),
+  `E p as x` in try handlers silently dropped, value-position exception
+  matches (`match exn with Error "f" ->`) falling into the variant paths
+  (result's builtin Error blocked ext_match; constant payloads unsupported),
+  value-or-exception or-patterns miscompiling, and %raise_with_backtrace
+  leaking as `?`. All but pr2195 (a cosmetic extra backtrace frame) now match.
+- **Inline-record constructors** (`T of { pos : int }`) registered as
+  zero-arity blocks: construction built `[0: 0]`, destructuring leaked
+  `?pos`, `r.cnt` read garbage. Full support: construction in label order,
+  patterns by label index (`T r` binds the block itself), labels in
+  field_info_ for `.cnt` access.
+
+Dashboard: **exec 91.1% (658/722, 0 compile-fails, was 89.1%), lambda 47.2%
+(351), instr 51.5% (400), completeness 100% (0/744), soundness 86.3%** — the
+back-end gates pinned exactly through all 4 commits (one stash-bisect
+churn-check on the riskiest field_info_ change: identical DIFF lists).
