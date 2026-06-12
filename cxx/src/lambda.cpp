@@ -749,6 +749,18 @@ struct Translator {
   }
 
   // (field_imm N (global G!)) for a value at field idx of global module G.
+  // Whether any opened module exports `n` (so it shadows a pervasive).
+  bool opened_has(const std::string& n) {
+    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+      if (module_base(*it) && module_layout_[*it].count(n)) return true;
+      if (it->find('.') != std::string::npos) {
+        if (submodule_value(*it, n)) return true;
+        continue;
+      }
+      if (fields_of(*it).count(n)) return true;
+    }
+    return false;
+  }
   LamPtr field_of(const std::string& global, int idx) {
     auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = global;
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = idx; f->args = {g};
@@ -3757,11 +3769,8 @@ struct Translator {
           auto fc = mk(Lam::K::Prim); fc->prim = Prim::FieldComputed; fc->args = {self, idv};
           return fc;
         }
-        auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
-        if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
-        if (auto pi = stdlib_prims.find(l->name); pi != stdlib_prims.end())  // prim as value
-          if (LamPtr s = prim_stub(pi->second)) return s;
-        // an `open M` brings M's exported values into scope (innermost first)
+        // an `open M` brings M's exported values into scope (innermost first);
+        // they SHADOW the pervasives (open Random; float = Random.float).
         for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
           if (LamPtr base = module_base(*it)) {  // local module (binding or alias)
             auto& lay = module_layout_[*it];
@@ -3779,6 +3788,10 @@ struct Translator {
           if (auto f = fm.find(l->name); f != fm.end())
             return field_of(global_of(*it), f->second);
         }
+        auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
+        if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
+        if (auto pi = stdlib_prims.find(l->name); pi != stdlib_prims.end())  // prim as value
+          if (LamPtr s = prim_stub(pi->second)) return s;
       }
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
@@ -3877,7 +3890,7 @@ struct Translator {
           }
       if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
         if (auto* l = std::get_if<Lident>(&fid->id.txt.v))
-          if (!lookup(l->name)) {  // an unshadowed pervasive operator
+          if (!lookup(l->name) && !opened_has(l->name)) {  // an unshadowed pervasive
             const auto& n = l->name;
             auto& as = ap->args;
             if (auto ex = externals_.find(n); ex != externals_.end()) {  // C external
