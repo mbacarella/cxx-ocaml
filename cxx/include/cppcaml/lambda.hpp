@@ -107,9 +107,11 @@ struct Lam {
   LamPtr sw_default;
 
   // Catch (Lstaticcatch): protected body in `cond`, handler in `then_`, static
-  // exception id in `prim_arg`, handler-bound vars in `catch_vars`.
+  // exception id in `prim_arg`, handler-bound vars in `catch_vars` (with their
+  // value kinds in catch_var_kinds when known, for the printer).
   // Staticraise (Lstaticraise): exit id in `prim_arg`, args in `args`.
   std::vector<Ident> catch_vars;
+  std::vector<ValueKind> catch_var_kinds;
 };
 
 // Translate a structure into the module's Lambda term (the setglobal form).

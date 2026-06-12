@@ -370,7 +370,10 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
                                 brk(), to_doc(l->then_, pr), text(")")});
     case Lam::K::Catch: {  // @[<2>(catch@ body@;<1 -1>with (N vars)@ handler)@]
       std::string w = "with (" + std::to_string(l->prim_arg);
-      for (auto& v : l->catch_vars) w += " " + pr.ident(v);
+      for (size_t vi = 0; vi < l->catch_vars.size(); ++vi)
+        w += " " + pr.ident(l->catch_vars[vi]) +
+             (vi < l->catch_var_kinds.size() ? kind_suffix(l->catch_var_kinds[vi])
+                                             : "");
       w += ")";
       return box(BoxT::Box, 2, {text("(catch"), brk(), to_doc(l->cond, pr),
                                 brk_off(" ", -1), text(w),
@@ -2965,6 +2968,246 @@ struct Translator {
   }
   // Read record field `fi` of `s` with the spelling its kind implies (an int field
   // is field_int, a mutable boxed field field_mut, otherwise field_imm).
+  // ===== Simplif.simplify_local_functions (lambda/simplif.ml) port =====
+  // A let-bound function whose every use is a FULL application in one shared
+  // "tail scope" (and the same function) becomes a static-catch handler on
+  // that scope, its calls becoming exits -- zero allocation.  ocamlc applies
+  // this automatically; [@local] forces it, [@inline]/[@local never] disable.
+  // func held by LamPtr: the rewrite erases the binding that owns the function
+  // node before re-attaching its body as a handler.
+  struct LFSlot { LamPtr func; Lam* fn_scope; Lam* scope = nullptr; };
+  std::unordered_map<int, LFSlot> lf_slots_;        // binder stamp -> slot
+  std::unordered_map<int, int> lf_static_id_;       // binder stamp -> exit id
+  std::unordered_map<Lam*, std::vector<std::pair<int, LamPtr>>> lf_static_;
+  Lam* lf_scope_ = nullptr;
+  Lam* lf_fnscope_ = nullptr;
+  static bool lf_enabled(const Lam* f) {
+    const std::string& a = f->inline_attr;
+    if (a.find("never_local") != std::string::npos) return false;
+    if (a.find("always_local") != std::string::npos) return true;
+    return a.find("always_inline") == std::string::npos;
+  }
+  void lf_nontail(Lam* l) {
+    if (!l) return;
+    Lam* sv = lf_scope_;
+    lf_scope_ = l;
+    lf_tail(l);
+    lf_scope_ = sv;
+  }
+  void lf_fndef(Lam* f) {  // PR11383: never move code across function boundaries
+    Lam* sv = lf_fnscope_;
+    lf_fnscope_ = f->body.get();
+    lf_nontail(f->body.get());
+    lf_fnscope_ = sv;
+  }
+  void lf_tail(Lam* l) {
+    if (!l) return;
+    switch (l->k) {
+      case Lam::K::Let: {
+        std::vector<size_t> fnb;  // indices of candidate function bindings
+        for (size_t i = 0; i < l->bindings.size(); ++i) {
+          auto& b = l->bindings[i];
+          if (b.val && b.val->k == Lam::K::Function && lf_enabled(b.val.get()) &&
+              !b.alias && !b.mut) {
+            lf_slots_[b.id.stamp] = {b.val, lf_fnscope_, nullptr};
+            fnb.push_back(i);
+          } else if (b.val) {
+            lf_nontail(b.val.get());
+          }
+        }
+        lf_tail(l->body.get());
+        // later (inner) bindings finalize first, like ocamlc's nested Llets
+        for (auto it = fnb.rbegin(); it != fnb.rend(); ++it) {
+          auto& b = l->bindings[*it];
+          auto si = lf_slots_.find(b.id.stamp);
+          if (si != lf_slots_.end() && si->second.scope) {
+            int st = ++next_exit_;
+            Lam* sc = si->second.scope == lf_scope_ ? l->body.get()
+                                                    : si->second.scope;
+            lf_static_id_[b.id.stamp] = st;
+            lf_static_[sc].push_back({st, si->second.func});
+            // the body becomes a handler in that scope
+            Lam* sv = lf_scope_;
+            lf_scope_ = si->second.scope;
+            lf_tail(si->second.func->body.get());
+            lf_scope_ = sv;
+            lf_slots_.erase(b.id.stamp);
+          } else {  // unused, or disqualified mid-analysis: an ordinary function
+            lf_slots_.erase(b.id.stamp);
+            lf_fndef(b.val.get());
+          }
+        }
+        return;
+      }
+      case Lam::K::Apply: {
+        if (l->fn && l->fn->k == Lam::K::Var) {
+          auto it = lf_slots_.find(l->fn->var.stamp);
+          if (it != lf_slots_.end()) {
+            auto& s = it->second;
+            if (l->args.size() != s.func->params.size())
+              lf_slots_.erase(it);  // partial / over-application
+            else if (s.scope && s.scope != lf_scope_)
+              lf_slots_.erase(it);  // a second, different tail scope
+            else if (s.fn_scope != lf_fnscope_)
+              lf_slots_.erase(it);  // crosses a function boundary
+            else if (!s.scope)
+              s.scope = lf_scope_;  // first use pins the tail scope
+          }
+        } else {
+          lf_nontail(l->fn.get());
+        }
+        for (auto& a : l->args) lf_nontail(a.get());
+        return;
+      }
+      case Lam::K::Var:
+        lf_slots_.erase(l->var.stamp);  // used as a value: disqualify
+        return;
+      case Lam::K::Function: lf_fndef(l); return;
+      case Lam::K::Sequence: lf_nontail(l->cond.get()); lf_tail(l->else_.get()); return;
+      case Lam::K::IfThenElse:
+        lf_nontail(l->cond.get());
+        lf_tail(l->then_.get());
+        lf_tail(l->else_.get());
+        return;
+      case Lam::K::Switch:
+        lf_nontail(l->cond.get());
+        for (auto& c : l->sw_consts) lf_tail(c.body.get());
+        for (auto& c : l->sw_blocks) lf_tail(c.body.get());
+        if (l->sw_default) lf_tail(l->sw_default.get());
+        return;
+      case Lam::K::Catch: lf_tail(l->cond.get()); lf_tail(l->then_.get()); return;
+      case Lam::K::Staticraise:
+        for (auto& a : l->args) lf_nontail(a.get());
+        return;
+      case Lam::K::Try: lf_nontail(l->body.get()); lf_tail(l->then_.get()); return;
+      case Lam::K::While: lf_nontail(l->cond.get()); lf_nontail(l->body.get()); return;
+      case Lam::K::For:
+        lf_nontail(l->then_.get());
+        lf_nontail(l->else_.get());
+        lf_nontail(l->body.get());
+        return;
+      case Lam::K::Letrec:
+        for (auto& b : l->bindings) if (b.val) lf_nontail(b.val.get());
+        lf_tail(l->body.get());
+        return;
+      case Lam::K::Assign: lf_nontail(l->cond.get()); return;
+      case Lam::K::Prim:
+        for (auto& a : l->args) lf_nontail(a.get());
+        return;
+      default: return;  // constants / Mutvar
+    }
+  }
+  void lf_rewrite(LamPtr& l) {
+    if (!l) return;
+    Lam* orig = l.get();
+    switch (l->k) {
+      case Lam::K::Let: {
+        for (auto it = l->bindings.begin(); it != l->bindings.end();) {
+          if (lf_static_id_.count(it->id.stamp)) it = l->bindings.erase(it);
+          else { lf_rewrite(it->val); ++it; }
+        }
+        lf_rewrite(l->body);
+        if (l->bindings.empty()) { LamPtr b = l->body; *l = *b; }
+        break;
+      }
+      case Lam::K::Apply: {
+        if (l->fn && l->fn->k == Lam::K::Var) {
+          auto it = lf_static_id_.find(l->fn->var.stamp);
+          if (it != lf_static_id_.end()) {
+            for (auto& a : l->args) lf_rewrite(a);
+            l->k = Lam::K::Staticraise;
+            l->prim_arg = it->second;
+            l->fn = nullptr;
+            break;
+          }
+        }
+        lf_rewrite(l->fn);
+        for (auto& a : l->args) lf_rewrite(a);
+        break;
+      }
+      default: {
+        lf_rewrite(l->fn);
+        lf_rewrite(l->body);
+        lf_rewrite(l->cond);
+        lf_rewrite(l->then_);
+        lf_rewrite(l->else_);
+        lf_rewrite(l->sw_default);
+        for (auto& a : l->args) lf_rewrite(a);
+        for (auto& b : l->bindings) lf_rewrite(b.val);
+        for (auto& c : l->sw_consts) lf_rewrite(c.body);
+        for (auto& c : l->sw_blocks) lf_rewrite(c.body);
+        break;
+      }
+    }
+    // wrap the catches attached to this (original) node: oldest innermost
+    if (auto it = lf_static_.find(orig); it != lf_static_.end()) {
+      auto handlers = std::move(it->second);
+      lf_static_.erase(it);
+      for (auto& [st, fnp] : handlers) {
+        auto inner = std::make_shared<Lam>(*l);
+        LamPtr hb = fnp->body;
+        lf_rewrite(hb);
+        auto cat = mk(Lam::K::Catch);
+        cat->cond = inner;
+        cat->prim_arg = st;
+        cat->then_ = hb;
+        for (auto& p : fnp->params) {
+          cat->catch_vars.push_back(p.first);
+          cat->catch_var_kinds.push_back(p.second);
+        }
+        *l = *cat;
+      }
+    }
+  }
+  // After local functions became static catches, a heap ref whose only closure
+  // uses were the converted functions no longer escapes: demote it to a mutable
+  // local (`=mut` + assign/*r) -- ocamlc's ref elimination also runs after
+  // simplify_local_functions, which is exactly why its tail-scope refs are flat.
+  void demote_refs(LamPtr& l) {
+    if (!l) return;
+    if (l->k == Lam::K::Let) {
+      for (size_t i = 0; i < l->bindings.size(); ++i) {
+        auto& b = l->bindings[i];
+        if (b.val && b.val->k == Lam::K::Prim && b.val->prim == Prim::Makemutable &&
+            b.val->prim_arg == 0 && b.val->args.size() == 1 && !b.mut && !b.alias) {
+          bool esc = ref_escapes(l->body, b.id);
+          for (size_t j = i + 1; j < l->bindings.size() && !esc; ++j)
+            esc = ref_escapes(l->bindings[j].val, b.id);
+          if (!esc) {
+            ValueKind k = b.val->blk_shape.empty() ? ValueKind::Gen : b.val->blk_shape[0];
+            b.kind = k;
+            b.mut = true;
+            b.val = b.val->args[0];
+            for (size_t j = i + 1; j < l->bindings.size(); ++j)
+              ref_rewrite(l->bindings[j].val, b.id);
+            ref_rewrite(l->body, b.id);
+          }
+        }
+      }
+    }
+    demote_refs(l->fn);
+    demote_refs(l->body);
+    demote_refs(l->cond);
+    demote_refs(l->then_);
+    demote_refs(l->else_);
+    demote_refs(l->sw_default);
+    for (auto& a : l->args) demote_refs(a);
+    for (auto& b : l->bindings) demote_refs(b.val);
+    for (auto& c : l->sw_consts) demote_refs(c.body);
+    for (auto& c : l->sw_blocks) demote_refs(c.body);
+  }
+  void simplify_local_functions(LamPtr& root) {
+    lf_slots_.clear();
+    lf_static_id_.clear();
+    lf_static_.clear();
+    lf_scope_ = lf_fnscope_ = root.get();
+    lf_tail(root.get());
+    lf_slots_.clear();
+    if (lf_static_.empty()) return;
+    lf_rewrite(root);
+    demote_refs(root);
+  }
+
   LamPtr field_read(const FieldInfo* fi, const LamPtr& s) {
     auto l = mk(Lam::K::Prim);
     auto rt = rec_types_.find(fi->type);
@@ -6612,7 +6855,9 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
   sg->args.push_back(t.wrap_shared(t.build_module(s, nullptr)));
-  return sg;
+  LamPtr root = sg;
+  t.simplify_local_functions(root);
+  return root;
 }
 
 void print_dlambda(const LamPtr& code, std::ostream& out) {
