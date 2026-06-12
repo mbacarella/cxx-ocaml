@@ -1082,3 +1082,69 @@ operand value-kind (`==.` for float, `Int64.==`, etc.).
 Pipeline unchanged in shape — lex → parse → type/infer (3/744 false-rejects) → lambda (24.5%) →
 bytecode instr (23.0%) → emit `.cmo` (runnable) → **next: our own linker** — but a much wider
 slice of real programs now compiles and runs through `c++ocamlc`.
+
+## Catch-up: the exec-parity era (linker, driver, objects, effects — 2026-06-07..11)
+
+The journal fell behind the work; the compressed history. After the `.cmo` emitter
+came our own **linker** (`c++link`, a bytelink/symtable port: predef exception
+slots, relocation patching, CODE/PRIM/DATA + trailer — later upgraded to
+**reachability linking**, selecting only required `.cma` units like the real
+bytelink), and the **drop-in driver `c++ocamlc`** (source → `.cmo` → link against
+`stdlib.cma` → `#!ocamlrun` launcher; `c++ocamlc f.ml -o f && ./f`). That made a
+new primary metric possible: **exec parity** — compile every corpus file with both
+compilers, run both, compare stdout/stderr/exit. It started at 55.3% and exposed
+whole bug classes the dump diffs are structurally blind to (dropped opcodes,
+boxed-literal wire encodings, out-of-scope binders, silent first-arm-collapse
+miscompiles).
+
+Since then the back end grew: let-rec (incl. the full value_rec stub/size
+classes), labeled/optional arguments with eval-order-preserving partial-app stubs,
+lazy values, format-string lowering (full `fmt_ebb_of_string` mirror), effects
+(runstack/resume/reperform + the `effect (E x), k` match syntax), exit-with-args
+static catches, Bigarray's generic ccalls, and the **object/class subsystem**
+(CamlinternalOO: immediate objects, classes, params, initializers, single
+inheritance + `as super` calls, virtual classes, class aliases). The typer-side
+axes ran in parallel: soundness 19.5% → 86.3% correct-rejection (unbound-module
+detection + reliable-builtin clashes), completeness driven from 8 false-rejects
+down to 3, with both harnesses gating every back-end change.
+
+## MILESTONE: 0 false-rejects — and the exec triage loop keeps paying (2026-06-12)
+
+**The inferencer now accepts 744/744 oracle-accepted corpus files (100%).** The
+last three false-rejects fell to three principled fixes, not hacks:
+
+- **GADT branch-local refinement** via a full undo trail in the unification
+  engine (mark/rollback windows over var bindings, level changes, and repr's
+  path compression) — arms refine in a window, then roll back.
+- **`build_as_type` for as-patterns** (typecore's rule): the variable bound by
+  `pat as x` gets a type *rebuilt* from the pattern — a constructor that doesn't
+  constrain a type parameter leaves it free, so `B _ | C _ as x -> x` returns x
+  at a different instantiation than the scrutinee (test_generator's
+  `unit … atom` in, `int list … atom` out).
+- **Qualified abbreviation expansion from the cmi**: a source annotation
+  `int Seq.t` now expands to the manifest *arrow* `unit -> int Seq.node` the way
+  cmi-side types already did, instead of clashing Constr-vs-Arrow.
+
+Strict-pass-only where it matters: the kind pass keeps its scrutinee-typed
+bindings, so the lambda/instr dumps were byte-identical throughout (the
+completeness/back-end axes stay independently gated).
+
+Same session, the smallest-first exec triage found three more systemic bugs:
+
+- **`%n %l %N %L` are conversions** (deprecated unsigned printers →
+  `Scan_get_counter`), not length modifiers; we fell back to a plain string =
+  segfault. Now byte-exact.
+- **Unqualified stdlib record labels through inference**: `stats.major_collections`
+  with `stats : Gc.stat` silently compiled to literal `0` (!). Fixed by
+  qualifying same-unit cmi type paths ("stat" in gc.cmi → "Gc.stat") and
+  exporting per-expression type paths from the kind pass so the field translator
+  can read the record layout from the module's cmi.
+- **`try perform e with Unhandled E ->`**: bare exception names didn't resolve
+  through `open`ed modules, and a constant extension-ctor *payload* pattern
+  wasn't a supported test — the arm silently dropped to a reraise. Now the
+  byte-exact catch/exit-shared identity-test form.
+
+Dashboard: **exec 82%+ (was 55.3% at the metric's birth), lambda 45.0% (334),
+instr 48.5% (377), completeness 100% (0/744 false-rejects), soundness 86.3%**.
+Pipeline: lex (100%) → parse (100%) → type/infer (100% accept / 86.3% reject) →
+lambda → bytecode → .cmo → link → run.
