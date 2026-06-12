@@ -3111,11 +3111,34 @@ struct Translator {
   LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc,
                     const LamPtr& dflt = nullptr) {
     if (rows.empty()) return nullptr;
+    // Peel top-level `pat as x` aliases: x binds to the scrutinee value over its
+    // own row (the scrutinee must be a named var; simplif inlines the alias).
+    std::vector<Row> prows;
+    prows.reserve(rows.size());
+    std::vector<std::vector<std::string>> ralias(rows.size());
+    for (size_t ri = 0; ri < rows.size(); ++ri) {
+      const Pattern* l = rows[ri].lhs;
+      while (auto* pa = std::get_if<Ppat_alias>(&l->desc)) {
+        if (scrut->k != Lam::K::Var) return nullptr;
+        ralias[ri].push_back(pa->name.txt);
+        l = pa->p.get();
+      }
+      prows.push_back({l, rows[ri].rhs, rows[ri].guard});
+    }
+    auto with_alias = [&](const Row* r, auto&& fn) -> LamPtr {
+      size_t idx = (size_t)(r - prows.data());
+      if (ralias[idx].empty()) return fn();
+      scope.emplace_back();
+      for (auto& nm : ralias[idx]) scope.back()[nm] = scrut->var;
+      LamPtr b = fn();
+      scope.pop_back();
+      return b;
+    };
     std::string type;
     std::set<int> cseen;                            // covered constant values
     std::map<int, const Row*> crow;                 // const value -> its (sole) row
     std::map<int, std::vector<const Row*>> brows;   // block tag -> its rows, in order
-    for (auto& r : rows) {
+    for (auto& r : prows) {
       if (r.guard && !dflt) return nullptr;  // guards only with a shared default (catch)
       if (r.guard && !std::holds_alternative<Ppat_construct>(r.lhs->desc)) return nullptr;
       auto* k = std::get_if<Ppat_construct>(&r.lhs->desc);
@@ -3141,10 +3164,17 @@ struct Translator {
     // Eligible: compile covered arms, then fill missing ctors with Match_failure
     // (a missing constructor's slot raises, exactly as ocamlc fills partial matches).
     std::map<int, LamPtr> cmap, bmap;
-    for (auto& [v, r] : crow) cmap[v] = expr(*r->rhs);
+    for (auto& [v, r] : crow)
+      cmap[v] = with_alias(r, [&] { return expr(*r->rhs); });
     for (auto& [tag, rs] : brows) {
       auto& ci = ctor_info_.at(ctor_of(*rs[0]->lhs));
-      LamPtr body = build_ctor_group_arm(scrut, ci, rs, mloc, dflt);
+      // an aliased row in a multi-row group would need per-sub-row scoping: bail
+      if (rs.size() > 1)
+        for (auto* r : rs)
+          if (!ralias[(size_t)(r - prows.data())].empty()) return nullptr;
+      LamPtr body = with_alias(rs[0], [&] {
+        return build_ctor_group_arm(scrut, ci, rs, mloc, dflt);
+      });
       if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
       bmap[tag] = body;
     }
