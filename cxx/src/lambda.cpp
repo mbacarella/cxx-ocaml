@@ -1132,6 +1132,44 @@ struct Translator {
       for (auto& [k, n] : s) if (k != 0) { fn_sig_[id.stamp] = s; return; }
     }
   }
+  // `let f, g = M.(a, b)`: each tuple component that aliases a labelled function
+  // (qualified, or a bare name under the wrapping local open) gets its source's
+  // parameter signature, so call sites still reorder/fill labelled args
+  // (Format.(pp_print_custom_break) was applied with verbatim arg order).
+  void record_tuple_sigs(const Pattern& pat0, const Expression& ex) {
+    const Expression* e = &ex;
+    std::string open_mod;
+    while (auto* sti = std::get_if<Pexp_struct_item>(&e->desc)) {
+      if (auto* po = std::get_if<Pstr_open>(&sti->item->desc))
+        if (auto* mi = std::get_if<Pmod_ident>(&po->expr.desc))
+          lid_to_dotted(mi->id.txt, open_mod);
+      e = sti->body.get();
+    }
+    const Pattern* pat = effective_pat(&pat0);
+    auto* tp = std::get_if<Ppat_tuple>(&pat->desc);
+    auto* te = std::get_if<Pexp_tuple>(&e->desc);
+    if (!tp || !te || tp->elems.size() != te->elems.size()) return;
+    for (size_t i = 0; i < tp->elems.size(); ++i) {
+      auto* pv = std::get_if<Ppat_var>(&effective_pat(tp->elems[i].get())->desc);
+      if (!pv) continue;
+      const Ident* bid = lookup(pv->name.txt);
+      if (!bid) continue;
+      FnSig s = callee_sig(te->elems[i].get());
+      if (s.empty() && !open_mod.empty())
+        if (auto* idc = std::get_if<Pexp_ident>(&te->elems[i]->desc))
+          if (auto* lc = std::get_if<Lident>(&idc->id.txt.v)) {
+            if (open_mod.find('.') == std::string::npos)
+              s = stdlib_value_sig(open_mod, lc->name);
+            else {
+              auto& sm = submodule_of(open_mod);
+              if (auto f = sm.sigs.find(lc->name); sm.ok && f != sm.sigs.end())
+                s = f->second;
+            }
+          }
+      for (auto& [k, n2] : s)
+        if (k != 0) { fn_sig_[bid->stamp] = s; break; }
+    }
+  }
   // The callee's parameter signature for an application: a local function (by its
   // recorded sig) or a qualified stdlib value (from its cmi arrow type).  Empty if
   // unknown or unlabelled.
@@ -4699,6 +4737,7 @@ struct Translator {
             auto tv = mk(Lam::K::Var); tv->var = tmp;
             collect_binders(b.pat, tv, binders);
           }
+          record_tuple_sigs(b.pat, *b.expr);
         }
       }
       rec_spine_ = rec_spine;
@@ -6367,6 +6406,7 @@ struct Translator {
           else { tmp = fresh("", true); auto tv = mk(Lam::K::Var); tv->var = tmp; scrut = tv; }
           std::vector<std::pair<Ident, LamPtr>> binders;
           if (collect_binders(b.pat, scrut, binders) && !binders.empty()) {
+            record_tuple_sigs(b.pat, *b.expr);
             if (!direct) cur.push_back({tmp, ValueKind::Gen, val});
             auto fold = [&](const LamPtr& acc) -> std::pair<LamPtr, bool> {
               if (acc->k == Lam::K::Prim && !acc->args.empty() &&
