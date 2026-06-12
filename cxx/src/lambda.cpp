@@ -2968,6 +2968,227 @@ struct Translator {
   }
   // Read record field `fi` of `s` with the spelling its kind implies (an int field
   // is field_int, a mutable boxed field field_mut, otherwise field_imm).
+  // Rewrite every TAIL value of `l` that is a k-tuple construction into
+  // (exit N <components>); bottoms (raise / existing exits) stay.  Returns
+  // false when any tail produces the tuple un-decomposed (a variable, a call)
+  // -- the caller then keeps the allocating form.  This is how
+  // `let (a, b) = match .. with .. -> e1, e2` avoids building the pair
+  // (Matching's exit-with-args form).
+  bool tail_tuple_exit(LamPtr& l, int n, size_t k) {
+    if (!l) return false;
+    switch (l->k) {
+      case Lam::K::Prim:
+        if (l->prim == Prim::Makeblock && l->prim_arg == 0 && l->args.size() == k) {
+          l->k = Lam::K::Staticraise;
+          l->prim_arg = n;
+          l->blk_shape.clear();
+          return true;
+        }
+        if (l->prim == Prim::Raise || l->prim == Prim::Reraise) return true;
+        return false;
+      case Lam::K::ConstBlock:
+        if (l->prim_arg == 0 && l->args.size() == k) {
+          l->k = Lam::K::Staticraise;
+          l->prim_arg = n;
+          return true;
+        }
+        return false;
+      case Lam::K::Staticraise: return true;  // bottom w.r.t. the value
+      case Lam::K::Let:
+      case Lam::K::Letrec: return tail_tuple_exit(l->body, n, k);
+      case Lam::K::Sequence: return tail_tuple_exit(l->else_, n, k);
+      case Lam::K::IfThenElse:
+        return tail_tuple_exit(l->then_, n, k) && tail_tuple_exit(l->else_, n, k);
+      case Lam::K::Switch: {
+        for (auto& c : l->sw_consts) if (!tail_tuple_exit(c.body, n, k)) return false;
+        for (auto& c : l->sw_blocks) if (!tail_tuple_exit(c.body, n, k)) return false;
+        if (l->sw_default) return tail_tuple_exit(l->sw_default, n, k);
+        return true;
+      }
+      case Lam::K::Catch:
+        return tail_tuple_exit(l->cond, n, k) && tail_tuple_exit(l->then_, n, k);
+      case Lam::K::Try:
+        return tail_tuple_exit(l->body, n, k) && tail_tuple_exit(l->then_, n, k);
+      default: return false;
+    }
+  }
+
+  // ===== multi-value match: `match e1, e2 with p1, p2 -> ..` ==============
+  // The components match column-by-column without ever building the tuple
+  // (Matching.for_multiple_match; match-exception/allocation's no-alloc
+  // requirement).  Restricted: no guards, every (or-expanded) row a k-tuple
+  // of var/_/single-field ctors of a 1-const/1-block type, and no column
+  // mixing vars with ctors (default rows need the real matrix).  Or-rows
+  // duplicate bodies where ocamlc shares via exits (exec-equivalent).
+  struct MRow {
+    std::vector<const Pattern*> cols;
+    const Expression* rhs;
+    std::vector<std::pair<std::string, Ident>> binds;
+  };
+  LamPtr multi_match(const Pexp_tuple* tu, const std::vector<Row>& vrows,
+                     const std::vector<Row>& erows, const Location& mloc) {
+    size_t k = tu->elems.size();
+    std::vector<MRow> rows;
+    for (auto& r : vrows) {
+      if (r.guard) return nullptr;
+      std::vector<const Pattern*> alts;
+      flatten_or(r.lhs, alts);
+      for (auto* a : alts) {
+        auto* tp = std::get_if<Ppat_tuple>(&a->desc);
+        if (!tp || tp->elems.size() != k) return nullptr;
+        MRow mr;
+        mr.rhs = r.rhs;
+        for (auto& el : tp->elems) mr.cols.push_back(effective_pat(el.get()));
+        rows.push_back(std::move(mr));
+      }
+    }
+    if (rows.empty()) return nullptr;
+    for (size_t c = 0; c < k; ++c) {
+      bool anyvar = false, anyctor = false;
+      std::string type;
+      for (auto& r : rows) {
+        const Pattern* p = r.cols[c];
+        if (std::get_if<Ppat_var>(&p->desc) ||
+            std::holds_alternative<Ppat_any>(p->desc)) {
+          anyvar = true;
+          continue;
+        }
+        auto* kc = std::get_if<Ppat_construct>(&p->desc);
+        if (!kc) return nullptr;
+        auto ci = ctor_info_.find(ctor_of(*p));
+        if (ci == ctor_info_.end()) return nullptr;
+        auto tc = type_ctors_.find(ci->second.type);
+        if (tc == type_ctors_.end() || tc->second.first != 1 ||
+            tc->second.second != 1)
+          return nullptr;
+        if (type.empty()) type = ci->second.type;
+        else if (type != ci->second.type) return nullptr;
+        if (kc->arg) {
+          if (ci->second.arity != 1) return nullptr;
+          const Pattern* ap = effective_pat(kc->arg->get());
+          if (!std::get_if<Ppat_var>(&ap->desc) &&
+              !std::holds_alternative<Ppat_any>(ap->desc))
+            return nullptr;
+        }
+        anyctor = true;
+      }
+      if (anyvar && anyctor) return nullptr;
+    }
+    // translate components; non-var ones bind to *match* temps
+    std::vector<LamPtr> comps;
+    std::vector<Lam::Binding> temps;
+    for (auto& el : tu->elems) {
+      LamPtr v = expr(*el);
+      if (v->k != Lam::K::Var) {
+        Ident t = fresh("", true);
+        temps.push_back({t, expr_kind(el.get()), v});
+        v = varof(t);
+      }
+      comps.push_back(v);
+    }
+    LamPtr body;
+    if (!erows.empty()) {
+      // (catch (try (exit N c1..ck) with exn <dispatch>) with (N v1..vk) <mm>)
+      int eid = ++next_exit_;
+      auto ex = mk(Lam::K::Staticraise);
+      ex->prim_arg = eid;
+      ex->args = comps;
+      auto tr = mk(Lam::K::Try);
+      tr->body = ex;
+      tr->var = fresh("exn");
+      scope.emplace_back();
+      caught_exn_.push_back(tr->var);
+      tr->then_ = exn_dispatch(tr->var, erows, 0);
+      caught_exn_.pop_back();
+      scope.pop_back();
+      auto cat = mk(Lam::K::Catch);
+      cat->cond = tr;
+      cat->prim_arg = eid;
+      std::vector<LamPtr> hv;
+      for (size_t c = 0; c < k; ++c) {
+        Ident v = fresh("val");
+        cat->catch_vars.push_back(v);
+        hv.push_back(varof(v));
+      }
+      LamPtr mbody = mm_cols(hv, rows, 0, mloc);
+      if (!mbody) return nullptr;
+      cat->then_ = mbody;
+      body = cat;
+    } else {
+      body = mm_cols(comps, rows, 0, mloc);
+      if (!body) return nullptr;
+    }
+    if (!temps.empty()) {
+      auto l = mk(Lam::K::Let);
+      l->bindings = std::move(temps);
+      l->body = body;
+      body = l;
+    }
+    return body;
+  }
+  LamPtr mm_cols(const std::vector<LamPtr>& comps, std::vector<MRow> rows,
+                 size_t i, const Location& mloc) {
+    if (rows.empty()) return raise_predef("Match_failure", mloc);
+    if (i == comps.size()) {
+      auto& r = rows[0];
+      scope.emplace_back();
+      for (auto& [nm, id] : r.binds) scope.back()[nm] = id;
+      LamPtr b = expr(*r.rhs);
+      scope.pop_back();
+      return b;
+    }
+    bool varcol = true;
+    for (auto& r : rows)
+      if (std::get_if<Ppat_construct>(&r.cols[i]->desc)) { varcol = false; break; }
+    if (varcol) {
+      for (auto& r : rows)
+        if (auto* pv = std::get_if<Ppat_var>(&r.cols[i]->desc))
+          r.binds.push_back({pv->name.txt, comps[i]->var});
+      return mm_cols(comps, std::move(rows), i + 1, mloc);
+    }
+    // ctor column over a 1-const/1-block type: (if comp <block> <const>)
+    std::vector<MRow> crows, brows;
+    bool field_used = false;
+    std::string fname;
+    for (auto& r : rows) {
+      auto* kc = std::get_if<Ppat_construct>(&r.cols[i]->desc);
+      auto& ci = ctor_info_.at(ctor_of(*r.cols[i]));
+      if (ci.is_block) {
+        if (kc->arg)
+          if (auto* pv = std::get_if<Ppat_var>(&effective_pat(kc->arg->get())->desc)) {
+            field_used = true;
+            if (fname.empty()) fname = pv->name.txt;
+          }
+        brows.push_back(r);
+      } else {
+        crows.push_back(r);
+      }
+    }
+    LamPtr cbranch = mm_cols(comps, std::move(crows), i + 1, mloc);
+    LamPtr bbranch;
+    if (field_used) {
+      Ident fid = fname.empty() ? fresh("", true) : fresh(fname);
+      for (auto& r : brows) {
+        auto* kc = std::get_if<Ppat_construct>(&r.cols[i]->desc);
+        if (kc->arg)
+          if (auto* pv = std::get_if<Ppat_var>(&effective_pat(kc->arg->get())->desc))
+            r.binds.push_back({pv->name.txt, fid});
+      }
+      LamPtr inner = mm_cols(comps, std::move(brows), i + 1, mloc);
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{fid, ValueKind::Gen, fieldimm(0, comps[i]), true}};
+      l->body = inner;
+      bbranch = l;
+    } else {
+      bbranch = mm_cols(comps, std::move(brows), i + 1, mloc);
+    }
+    auto iff = mk(Lam::K::IfThenElse);
+    iff->cond = comps[i];
+    iff->then_ = bbranch;
+    iff->else_ = cbranch;
+    return iff;
+  }
+
   // ===== Simplif.simplify_local_functions (lambda/simplif.ml) port =====
   // A let-bound function whose every use is a FULL application in one shared
   // "tail scope" (and the same function) becomes a static-catch handler on
@@ -4249,6 +4470,12 @@ struct Translator {
       if (!frows.empty() && !eff_guard && !vrows.empty())
         if (LamPtr r = effect_match(*m->e, vrows, erows, frows, e.loc))
           return r;
+      // Multiple values (`match e1, e2 with ..`): match the components
+      // column-by-column without building the tuple.
+      if (frows.empty() && !vrows.empty())
+        if (auto* tu = std::get_if<Pexp_tuple>(&m->e->desc))
+          if (LamPtr r = multi_match(tu, vrows, erows, e.loc))
+            return r;
       if (!erows.empty() && !vrows.empty() && frows.empty()) {
         int eid = ++next_exit_;
         auto ex = mk(Lam::K::Staticraise);
@@ -5028,6 +5255,53 @@ struct Translator {
             scope.pop_back();
             return l;
           }
+      // `let (a, b) = match .. in body`: when every match arm RESULT is a
+      // syntactic tuple, pass the components through a static catch instead of
+      // building the pair (Matching's exit-with-args form; basic/tuple_match).
+      if (le->bindings.size() == 1)
+        if (auto* tp = std::get_if<Ppat_tuple>(
+                &effective_pat(&le->bindings[0].pat)->desc)) {
+          bool allvars = !tp->elems.empty();
+          for (auto& el : tp->elems) {
+            const Pattern* ep = effective_pat(el.get());
+            if (!std::get_if<Ppat_var>(&ep->desc) &&
+                !std::holds_alternative<Ppat_any>(ep->desc)) {
+              allvars = false;
+              break;
+            }
+          }
+          const Expression* rhs = le->bindings[0].expr.get();
+          while (auto* ct = std::get_if<Pexp_constraint>(&rhs->desc)) rhs = ct->e.get();
+          if (allvars && (std::get_if<Pexp_match>(&rhs->desc) ||
+                          std::get_if<Pexp_try>(&rhs->desc) ||
+                          std::get_if<Pexp_ifthenelse>(&rhs->desc))) {
+            LamPtr mm = expr(*rhs);
+            int n = ++next_exit_;
+            if (tail_tuple_exit(mm, n, tp->elems.size())) {
+              auto cat = mk(Lam::K::Catch);
+              cat->cond = mm;
+              cat->prim_arg = n;
+              for (auto& el : tp->elems) {
+                const Pattern* ep = effective_pat(el.get());
+                Ident id;
+                if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) {
+                  id = fresh(pv->name.txt);
+                  scope.back()[pv->name.txt] = id;
+                } else {
+                  id = fresh("", true);
+                }
+                cat->catch_vars.push_back(id);
+                cat->catch_var_kinds.push_back(pat_kind(ep));
+              }
+              rec_spine_ = rec_spine;
+              cat->then_ = expr(*le->body);
+              scope.pop_back();
+              return cat;
+            }
+            // partially-rewritten translation discarded; fall through to the
+            // allocating path, which re-translates from the AST
+          }
+        }
       // `let <refutable> = e in body`: a partial pattern match over e raising
       // Match_failure on the missing cases (located at the let expression).  e is
       // bound to a *match* temp unless it is already a variable.
