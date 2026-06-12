@@ -6363,6 +6363,33 @@ struct Translator {
   // The runtime field layout (value/module names, in order) of a module-type
   // signature -- a functor parameter's value layout.  (externals/types take no
   // slot; only regular values, submodules, and exceptions do.)
+  // The CamlinternalMod SHAPE of a recursive module's signature: `Module
+  // [| Function; .. |]` as a structured constant ([0: [0: 0 ..]]).  Only
+  // function-typed values are safe to pre-allocate as dummies; any other
+  // member returns null (the binding then keeps the old behavior).
+  LamPtr recmod_shape(const ModuleType& mt) {
+    auto* ps = std::get_if<Pmty_signature>(&mt.desc);
+    if (!ps) return nullptr;
+    std::vector<LamPtr> elems;
+    for (auto& it : ps->items) {
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+        if (!std::get_if<Ptyp_arrow>(&v->vd.type->desc)) return nullptr;
+        elems.push_back(cint(0));  // Function
+      } else if (std::holds_alternative<Psig_type>(it.desc)) {
+        continue;  // no runtime slot
+      } else {
+        return nullptr;  // submodules/classes/...: shapes we don't model
+      }
+    }
+    auto arr = mk(Lam::K::ConstBlock);
+    arr->prim_arg = 0;
+    arr->args = std::move(elems);
+    auto outer = mk(Lam::K::ConstBlock);
+    outer->prim_arg = 0;
+    outer->args = {arr};
+    return outer;
+  }
+
   std::vector<std::string> sig_layout(const ModuleType& mt) {
     std::vector<std::string> out;
     if (auto* pi = std::get_if<Pmty_ident>(&mt.desc)) {  // a named module type S
@@ -6929,6 +6956,67 @@ struct Translator {
               add_export(*mb.name.txt, mid);
             }
           }
+        continue;
+      }
+      if (auto* prm = std::get_if<Pstr_recmodule>(&it.desc)) {
+        // module rec M : S = struct .. end -- CamlinternalMod's init/update
+        // scheme: each module binds a dummy built from its signature SHAPE,
+        // the structs evaluate with the dummies in scope (recursive refs read
+        // the dummies' pre-allocated closures, patched in place), then
+        // update_mod copies each real structure over its dummy.
+        struct RM { const ModuleBinding* mb; const ModuleType* sig;
+                    const Pmod_structure* body; const ModuleExpr* bodyme;
+                    Ident id; LamPtr shape; };
+        std::vector<RM> rms;
+        bool ok = !prm->bindings.empty();
+        for (auto& mb : prm->bindings) {
+          if (!mb.name.txt) { ok = false; break; }
+          const ModuleExpr* me = &mb.expr;
+          const ModuleType* sig = nullptr;
+          while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) {
+            sig = pc->mt.get();
+            me = pc->me.get();
+          }
+          auto* ps = sig ? std::get_if<Pmod_structure>(&me->desc) : nullptr;
+          LamPtr shape = sig ? recmod_shape(*sig) : nullptr;
+          if (!shape) { ok = false; break; }
+          rms.push_back({&mb, sig, ps, me, {}, shape});  // ps null: any module expr
+        }
+        auto& cim = fields_of("CamlinternalMod");
+        auto initI = cim.find("init_mod");
+        auto updI = cim.find("update_mod");
+        if (ok && initI != cim.end() && updI != cim.end()) {
+          for (auto& rm : rms) {  // dummies first: all names in scope for all bodies
+            rm.id = fresh(*rm.mb->name.txt);
+            auto ap = mk(Lam::K::Apply);
+            ap->fn = field_of("CamlinternalMod", initI->second);
+            ap->args = {loc_block(rm.bodyme->loc), rm.shape};
+            cur.push_back({rm.id, ValueKind::Gen, ap});
+            module_ident_[*rm.mb->name.txt] = rm.id;
+            auto lay = sig_layout(*rm.sig);
+            auto& ml = module_layout_[*rm.mb->name.txt];
+            ml.clear();
+            for (int i = 0; i < (int)lay.size(); ++i) ml[lay[i]] = i;
+          }
+          for (auto& rm : rms) {
+            LamPtr body;
+            if (rm.body) {
+              std::vector<std::string> co = sig_layout(*rm.sig);
+              std::vector<std::string> sub;
+              std::string saved = mod_path_;
+              mod_path_ += "." + *rm.mb->name.txt;
+              body = build_module(rm.body->items, &sub, &co);
+              mod_path_ = saved;
+            } else {  // `module rec Id : S = Id` and other non-struct bodies
+              body = compile_module_expr(*rm.bodyme);
+            }
+            auto up = mk(Lam::K::Apply);
+            up->fn = field_of("CamlinternalMod", updI->second);
+            up->args = {rm.shape, varof(rm.id), body};
+            cur.push_back({fresh("", true), ValueKind::Gen, up});
+            add_export(*rm.mb->name.txt, rm.id);
+          }
+        }
         continue;
       }
       if (auto* pin = std::get_if<Pstr_include>(&it.desc)) {  // include ME
