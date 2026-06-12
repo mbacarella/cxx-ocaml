@@ -537,6 +537,9 @@ struct Translator {
   std::unordered_map<std::string, std::pair<std::string, int>> local_prims_;
   // Locally-declared exceptions: name -> its binder (the makeblock-248 value).
   std::unordered_map<std::string, Ident> exn_ident_;
+  // A submodule's exported exception/extension ctor: (module binder, field
+  // index) -- the inner binder is out of scope outside the module.
+  std::unordered_map<std::string, std::pair<Ident, int>> exn_field_;
   // Declared argument count of an exception constructor (`exception E of int *
   // string` has two).  Data-carrying predef exceptions all take one argument
   // (Failure of string; Assert_failure of a string*int*int tuple), the default.
@@ -2313,6 +2316,10 @@ struct Translator {
     if (auto ei = exn_ident_.find(name); ei != exn_ident_.end()) {
       auto v = mk(Lam::K::Var); v->var = ei->second; return v;
     }
+    // a submodule's exception/extension ctor: its binder is out of scope
+    // outside the module, so read the module's export field
+    if (auto ef = exn_field_.find(name); ef != exn_field_.end())
+      return fieldimm(ef->second.second, varof(ef->second.first));
     if (auto sf = stdlib_fields.find(name); sf != stdlib_fields.end())
       return field_of("Stdlib", sf->second);
     return nullptr;
@@ -3351,7 +3358,8 @@ struct Translator {
       auto* k = std::get_if<Ppat_construct>(&rows[i].lhs->desc);
       if (!k) return nullptr;
       std::string n = lid_last(k->id.txt);
-      if (!exn_ident_.count(n) || ctor_info_.count(n)) return nullptr;
+      if ((!exn_ident_.count(n) && !exn_field_.count(n)) || ctor_info_.count(n))
+        return nullptr;
       if (k->arg) {  // binder shapes exn_case_body supports only
         int arity = exn_arity_.count(n) ? exn_arity_[n] : 1;
         for (auto* fp : ctor_field_pats(k, arity)) {
@@ -3373,7 +3381,8 @@ struct Translator {
     }
     auto* k = std::get_if<Ppat_construct>(&rows[i].lhs->desc);
     std::string n = lid_last(k->id.txt);
-    auto idv = mk(Lam::K::Var); idv->var = exn_ident_[n];
+    LamPtr idv = exn_value(n);
+    if (!idv) return nullptr;
     LamPtr lhs = k->arg ? fieldimm(0, sv()) : sv();
     LamPtr body = exn_case_body(sid, k, n, *rows[i].rhs);
     if (!body) return nullptr;
@@ -3840,8 +3849,8 @@ struct Translator {
         }
         return block_of(ci->second.tag, fs);
       }
-      if (auto ei = exn_ident_.find(n); ei != exn_ident_.end()) {
-        auto v = mk(Lam::K::Var); v->var = ei->second;
+      if (exn_ident_.count(n) || exn_field_.count(n)) {
+        LamPtr v = exn_value(n);
         if (!k->arg) return v;  // local exception/extension-ctor value
         // applied: a block whose field 0 is the constructor's identity --
         // `(makeblock 0 (*,k1..) E/1 a1..)` -- with a tuple argument flattened
@@ -4421,6 +4430,14 @@ struct Translator {
     }
     if (auto* ob = std::get_if<Pexp_object>(&e.desc))
       if (LamPtr o = object_expr(*ob->cs)) return o;
+    // [%extension_constructor M.A]: the constructor's runtime identity -- the
+    // payload constructor expression's own (unapplied) value.
+    if (auto* xe = std::get_if<Pexp_extension>(&e.desc))
+      if ((xe->name == "extension_constructor" ||
+           xe->name == "ocaml.extension_constructor") &&
+          xe->payload.str.size() == 1)
+        if (auto* ev = std::get_if<Pstr_eval>(&xe->payload.str[0].desc))
+          return expr(*ev->e);
     if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {  // new c -> (apply (field_mut 0 c) 0)
       LamPtr clsval;
       if (auto* l = std::get_if<Lident>(&nw->id.txt.v)) {
@@ -5767,6 +5784,7 @@ struct Translator {
             std::vector<std::string> sub;
             std::string saved = mod_path_;
             mod_path_ += "." + *mb.name.txt;  // nested exceptions are "Outer.M.E"
+            auto exn_before = exn_ident_;
             LamPtr body = build_module(ps->items, &sub, coerce);
             mod_path_ = saved;
             Ident mid = fresh(*mb.name.txt);
@@ -5774,6 +5792,21 @@ struct Translator {
             module_ident_[*mb.name.txt] = mid;
             auto& lay = module_layout_[*mb.name.txt]; lay.clear();
             for (int i = 0; i < (int)sub.size(); ++i) lay[sub[i]] = i;
+            // exceptions/extension ctors declared inside: their binders are out
+            // of scope out here -- later references read the module's field.
+            for (auto& [nm, eid] : exn_ident_) {
+              auto bi = exn_before.find(nm);
+              if (bi != exn_before.end() && bi->second.stamp == eid.stamp) continue;
+              if (auto f = lay.find(nm); f != lay.end())
+                exn_field_[nm] = {mid, f->second};
+            }
+            for (auto it2 = exn_ident_.begin(); it2 != exn_ident_.end();) {
+              auto bi = exn_before.find(it2->first);
+              bool inner = bi == exn_before.end() || bi->second.stamp != it2->second.stamp;
+              if (!inner) { ++it2; continue; }
+              if (bi != exn_before.end()) { it2->second = bi->second; ++it2; }
+              else it2 = exn_ident_.erase(it2);
+            }
             add_export(*mb.name.txt, mid);
           } else if (std::holds_alternative<Pmod_functor>(mb.expr.desc)) {
             Ident mid = fresh(*mb.name.txt);            // a functor binds as a function
