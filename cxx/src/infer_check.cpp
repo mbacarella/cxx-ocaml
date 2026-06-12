@@ -896,10 +896,31 @@ struct Checker {
     TypePtr recTy = eng.constr(d.name.txt, params, type_stamp_[&d]);
     for (auto& f : rec->fields) {
       // a universally-quantified field (`{ f : 'a. ... }`) is polymorphic per use;
-      // a single monomorphic scheme would clash, so leave it to Any.
-      if (std::holds_alternative<Ptyp_poly>(f.type->desc)) continue;
+      // a single monomorphic scheme would clash, so leave it to Any -- EXCEPT, in
+      // the KIND pass only, a format-typed field (`{ pf : 'a. ('a,..) format ->
+      // 'a }`): its uses must type string literals at format type or they stay
+      // unlowered (= segfault); cross-use clashes are soft there.  The strict
+      // pass keeps the skip (a monomorphic scheme false-rejects valid reuses).
+      if (std::holds_alternative<Ptyp_poly>(f.type->desc) &&
+          !(record_kinds_ && mentions_format(*f.type)))
+        continue;
       field_candidates_[f.name.txt].push_back(eng.arrow(recTy, from_coretype(*f.type, vars)));
     }
+  }
+  static bool mentions_format(const CoreType& t) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      if (is_format_base(lid_full(c->id.txt))) return true;
+      for (auto& a : c->args) if (mentions_format(*a)) return true;
+      return false;
+    }
+    if (auto* pl = std::get_if<Ptyp_poly>(&t.desc)) return mentions_format(*pl->type);
+    if (auto* ar = std::get_if<Ptyp_arrow>(&t.desc))
+      return mentions_format(*ar->dom) || mentions_format(*ar->cod);
+    if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& el : tu->elems) if (mentions_format(*el)) return true;
+      return false;
+    }
+    return false;
   }
   // Keep only labels unique across all record types (others need type-direction).
   void finalize_fields() {
