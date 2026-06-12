@@ -5851,6 +5851,16 @@ struct Translator {
     if (auto* pi = std::get_if<Pmty_ident>(&mt.desc)) {  // a named module type S
       auto it = modtype_layout_.find(lid_last(pi->id.txt));
       if (it != modtype_layout_.end()) return it->second;
+      // a stdlib module's named module type (`Digest.S`): its cmi modtype decl
+      if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (!module_base(pl->name)) try {
+            auto cmi = cmi::CmiFile::load(
+                pl->name == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                     : stdlib_dir + "/stdlib__" + pl->name + ".cmi");
+            for (auto& md : cmi.sig().modtypes)
+              if (md.name == d->name) return mt_fields(cmi, md.type);
+          } catch (...) {}
     }
     if (auto* ps = std::get_if<Pmty_signature>(&mt.desc))
       for (auto& it : ps->items) {
