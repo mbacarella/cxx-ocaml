@@ -1542,12 +1542,17 @@ struct Checker {
   // method/initializer bodies (so params/results get kinds and format literals are
   // recorded).  Value-kind pass only.
   void infer_object_body(const ast::ClassStructure& cs,
-                         const std::vector<const ast::Pattern*>* cl_params = nullptr,
+                         const std::vector<const ast::Pcl_fun*>* cl_params = nullptr,
                          const std::vector<const ast::Pcl_let*>* cl_lets = nullptr) {
     venv.emplace_back();
     // Class parameters: bind each so a val initialiser referencing one shares its
     // type var with the instance variable (method-body unification then flows back).
-    if (cl_params) for (auto* p : *cl_params) infer_pat(*p);
+    // An optional parameter's type is its default's type.
+    if (cl_params)
+      for (auto* pf : *cl_params) {
+        TypePtr pt = infer_pat(pf->pat);
+        if (pf->default_) try_unify(pt, infer_expr(**pf->default_));
+      }
     // `class c = let .. in object`: the local bindings, before the fields.
     if (cl_lets) for (auto* lg : *cl_lets) infer_bindings(lg->rf, lg->bindings);
     if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = eng.any();
@@ -2026,11 +2031,11 @@ struct Checker {
           if (record_kinds_)  // value kinds for class method bodies (see Pexp_object)
             for (auto& d : pc->decls) {
               const ClassExpr* ce = &d.expr;
-              std::vector<const Pattern*> params;  // `class c x = ...` parameters
+              std::vector<const Pcl_fun*> params;  // `class c x = ...` parameters
               std::vector<const Pcl_let*> lets;    // `class c = let .. in object`
               for (;;) {
                 if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
-                  params.push_back(&pf->pat);
+                  params.push_back(pf);
                   ce = pf->body.get();
                 } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
                   lets.push_back(pl);

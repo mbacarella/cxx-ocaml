@@ -3610,14 +3610,20 @@ struct Translator {
         }
       }
       // `new c arg..` is one application: (apply (field_mut 0 c) 0 arg..).
-      if (std::get_if<Pexp_new>(&ap->fn->desc)) {
+      // A class with labelled/optional params goes through apply_labeled
+      // (reorder, Some-wrap, None-fill) against its recorded signature.
+      if (auto* nw = std::get_if<Pexp_new>(&ap->fn->desc)) {
+        if (auto* l = std::get_if<Lident>(&nw->id.txt.v))
+          if (auto* b = lookup(l->name))
+            if (auto it = fn_sig_.find(b->stamp); it != fn_sig_.end())
+              if (auto r = apply_labeled(ap->fn.get(), it->second, *ap)) return r;
         bool simple = true;
         for (auto& a : ap->args) if (!std::holds_alternative<Nolabel>(a.first)) simple = false;
         if (simple) {
-          LamPtr nw = expr(*ap->fn);
-          if (nw->k == Lam::K::Apply) {
-            for (auto& a : ap->args) nw->args.push_back(expr(*a.second));
-            return nw;
+          LamPtr nw2 = expr(*ap->fn);
+          if (nw2->k == Lam::K::Apply) {
+            for (auto& a : ap->args) nw2->args.push_back(expr(*a.second));
+            return nw2;
           }
         }
       }
@@ -4157,7 +4163,7 @@ struct Translator {
   // initializers/env capture).
   LamPtr build_object(const ast::ClassStructure& cs, bool as_class,
                       const std::string& class_name = "",
-                      const std::vector<const ast::Pattern*>* cl_params = nullptr,
+                      const std::vector<const ast::Pcl_fun*>* cl_params = nullptr,
                       const std::vector<const ast::Pcl_let*>* cl_lets = nullptr,
                       bool virt_class = false) {
     struct Meth { std::string name; const ast::Expression* body; };
@@ -4226,15 +4232,30 @@ struct Translator {
     // before the val inits; the method reads it via field_computed.  Val
     // initialisers use the raw parameter directly.
     struct CParam { std::string name; Ident pid, var_id; const ast::Pattern* pat;
-                    bool is_param; bool captured = false; };
+                    bool is_param; bool captured = false;
+                    Ident opt_id; const ast::Expression* dflt = nullptr; };
     std::vector<CParam> cparams;
     if (cl_params)
-      for (auto* p : *cl_params) {
+      for (auto* pf : *cl_params) {
+        const ast::Pattern* p = &pf->pat;
         while (auto* pc = std::get_if<ast::Ppat_constraint>(&p->desc)) p = pc->p.get();
-        if (auto* pv = std::get_if<ast::Ppat_var>(&p->desc))
-          cparams.push_back({pv->name.txt, fresh(pv->name.txt), fresh(pv->name.txt), p, true});
-        else
-          return nullptr;  // destructuring/wildcard class params: unsupported
+        bool optdef = std::holds_alternative<Optional>(pf->label) && pf->default_;
+        if (auto* pv = std::get_if<ast::Ppat_var>(&p->desc)) {
+          CParam cp{pv->name.txt, fresh(pv->name.txt), fresh(pv->name.txt), p, true};
+          if (optdef) {  // `?(h=d)`: a *opt* param + an unwrap let in the body
+            cp.opt_id = fresh("opt", true);
+            cp.dflt = pf->default_->get();
+          }
+          cparams.push_back(std::move(cp));
+        } else if (!optdef &&
+                   (std::holds_alternative<ast::Ppat_any>(p->desc) ||
+                    (std::get_if<ast::Ppat_construct>(&p->desc) &&
+                     lid_last(std::get_if<ast::Ppat_construct>(&p->desc)->id.txt) == "()"))) {
+          // a binderless `()`/`_` parameter, named "param", never referenced
+          cparams.push_back({"", fresh("param"), fresh("param"), p, true});
+        } else {
+          return nullptr;  // destructuring class params: unsupported
+        }
       }
 
     // The method universe is the union of inherited and own method names
@@ -4288,7 +4309,8 @@ struct Translator {
     cur_super_name_ = super_name; cur_super_mid_ = super_mid;
     std::string self_name = "self-" + std::to_string(++obj_counter_);
     scope.emplace_back();  // class parameters, visible to val inits and methods
-    for (auto& cp : cparams) scope.back()[cp.name] = cp.pid;
+    for (auto& cp : cparams)
+      if (!cp.name.empty()) scope.back()[cp.name] = cp.pid;
     auto restore = [&] { scope.pop_back(); inst_vars_ = save_iv; cur_meth_id_ = save_mid;
                          cur_super_name_ = save_sn; cur_super_mid_ = save_smid; };
 
@@ -4499,12 +4521,41 @@ struct Translator {
       let->body = outer;
       env_body = let;
     }
-    auto env_fn = mk(Lam::K::Function);
-    env_fn->params = {{envp, ValueKind::Gen}};
-    if (as_class) env_fn->params.push_back({self_param, ValueKind::Gen});
-    for (auto& cp : cparams)
-      if (cp.is_param) env_fn->params.push_back({cp.pid, ValueKind::Gen});
-    env_fn->body = env_body;
+    // obj_init parameters, split into curried functions at each
+    // optional-default unwrap (`?(h=d)` ends its group with the *opt* param;
+    // the body lets `h = (if *opt* (field_imm 0 *opt*) d)` and the remaining
+    // parameters form a nested function).
+    struct PGroup { std::vector<std::pair<Ident, ValueKind>> ps; const CParam* unwrap = nullptr; };
+    std::vector<PGroup> groups(1);
+    groups[0].ps.push_back({envp, ValueKind::Gen});
+    if (as_class) groups[0].ps.push_back({self_param, ValueKind::Gen});
+    for (auto& cp : cparams) {
+      if (!cp.is_param) continue;
+      if (cp.dflt) {
+        groups.back().ps.push_back({cp.opt_id, ValueKind::Gen});
+        groups.back().unwrap = &cp;
+        groups.emplace_back();
+      } else {
+        groups.back().ps.push_back({cp.pid, ValueKind::Gen});
+      }
+    }
+    LamPtr env_fn = env_body;
+    for (int gi = (int)groups.size() - 1; gi >= 0; --gi) {
+      if (groups[gi].unwrap) {
+        const CParam* cp = groups[gi].unwrap;
+        auto iff = mk(Lam::K::IfThenElse);
+        iff->cond = varof(cp->opt_id);
+        iff->then_ = fieldimm(0, varof(cp->opt_id));
+        iff->else_ = expr(*cp->dflt);
+        auto let = mk(Lam::K::Let);
+        let->bindings = {{cp->pid, pat_kind(cp->pat), iff}};
+        let->body = env_fn; env_fn = let;
+      }
+      if (!groups[gi].ps.empty()) {
+        auto f = mk(Lam::K::Function);
+        f->params = groups[gi].ps; f->body = env_fn; env_fn = f;
+      }
+    }
 
     restore();
 
@@ -5180,30 +5231,38 @@ struct Translator {
         for (auto& d : pc->decls) {
           Ident id = fresh(d.name.txt);
           LamPtr v;
-          // Peel `class c x y = ...` parameter wrappers (positional only) and
-          // `class c = let .. in object` local-binding wrappers.
+          // Peel `class c x y = ...` parameter wrappers (incl. labelled and
+          // optional) and `class c = let .. in object` local-binding wrappers.
           const ClassExpr* ce = &d.expr;
-          std::vector<const Pattern*> params;
+          std::vector<const Pcl_fun*> params;
           std::vector<const Pcl_let*> lets;
-          bool ok = true;
           for (;;) {
             if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
-              if (!std::holds_alternative<Nolabel>(pf->label) || pf->default_) { ok = false; break; }
-              params.push_back(&pf->pat);
+              params.push_back(pf);
               ce = pf->body.get();
             } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
               lets.push_back(pl);
               ce = pl->body.get();
             } else break;
           }
+          // labelled/optional class params: record the signature for `new` sites
+          FnSig csig;
+          bool any_lab = false;
+          for (auto* pf : params) {
+            int k = 0; std::string nm;
+            if (auto* lb = std::get_if<Labelled>(&pf->label)) { k = 1; nm = lb->name; }
+            else if (auto* op = std::get_if<Optional>(&pf->label)) { k = 2; nm = op->name; }
+            if (k) any_lab = true;
+            csig.push_back({k, nm});
+          }
+          if (any_lab) fn_sig_[id.stamp] = csig;
           bool is_virt = d.virt == VirtualFlag::Virtual;
-          if (ok)
-            if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
-              v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
-                               params.empty() ? nullptr : &params,
-                               lets.empty() ? nullptr : &lets, is_virt);
-              register_class_meta(d.name.txt, ps->cs);
-            }
+          if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
+            v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
+                             params.empty() ? nullptr : &params,
+                             lets.empty() ? nullptr : &lets, is_virt);
+            register_class_meta(d.name.txt, ps->cs);
+          }
           scope.back()[d.name.txt] = id;
           class_ids_.insert(id.stamp);
           add_export(d.name.txt, id);
