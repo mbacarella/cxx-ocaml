@@ -507,6 +507,11 @@ struct Translator {
   // Stamps of class-value bindings (`class c = ...`): `new c` reads obj_init at
   // field 0 of the class 3-tuple.
   std::set<int> class_ids_;
+  // Per-class shape metadata for inheritance: instance-variable names (parent's
+  // first, declaration order), all method names, and the virtual/concrete method
+  // split (name-ascending) -- the arrays a child passes to CamlinternalOO.inherits.
+  struct ClassMeta { std::vector<std::string> vals, meths, virt, concr; };
+  std::unordered_map<std::string, ClassMeta> class_meta_;
   // Shared method/variable-name constant blocks hoisted to module top (Translobj's
   // `share`): a const-block key -> its `shared` binder, in creation order.  Wrapped
   // around the module body as `=a` bindings; single-use ones inline away (Simplif).
@@ -4083,6 +4088,49 @@ struct Translator {
 
   LamPtr object_expr(const ast::ClassStructure& cs) { return build_object(cs, false); }
 
+  // Record a class's shape (vals / methods / virtual-vs-concrete split) so a
+  // later `inherit` can build its CamlinternalOO.inherits arguments.  Skipped
+  // (children then bail) when the shape isn't analyzable: unknown parent,
+  // multiple inherits, duplicate vals.
+  void register_class_meta(const std::string& name, const ast::ClassStructure& cs) {
+    ClassMeta m;
+    std::set<std::string> vset, virt, concr;
+    bool inherited = false;
+    for (auto& f : cs.fields) {
+      if (auto* inh = std::get_if<ast::Pcf_inherit>(&f.desc)) {
+        const ast::ClassExpr* pe = inh->ce.get();
+        if (auto* ap = std::get_if<ast::Pcl_apply>(&pe->desc)) pe = ap->ce.get();
+        auto* pc = std::get_if<ast::Pcl_constr>(&pe->desc);
+        if (!pc) return;
+        auto* pl = std::get_if<Lident>(&pc->id.txt.v);
+        if (!pl) return;
+        auto it = class_meta_.find(pl->name);
+        if (it == class_meta_.end() || inherited || !vset.empty()) return;
+        inherited = true;
+        m = it->second;  // start from the parent's shape
+        for (auto& v : m.vals) vset.insert(v);
+        virt.insert(it->second.virt.begin(), it->second.virt.end());
+        concr.insert(it->second.concr.begin(), it->second.concr.end());
+      } else if (auto* v = std::get_if<ast::Pcf_val>(&f.desc)) {
+        if (!std::get_if<ast::Cfk_concrete>(&v->kind)) return;  // virtual val
+        if (!vset.insert(v->name.txt).second) return;  // duplicate val
+        m.vals.push_back(v->name.txt);
+      } else if (auto* me = std::get_if<ast::Pcf_method>(&f.desc)) {
+        if (std::get_if<ast::Cfk_concrete>(&me->kind)) {
+          concr.insert(me->name.txt); virt.erase(me->name.txt);
+        } else if (!concr.count(me->name.txt)) {
+          virt.insert(me->name.txt);
+        }
+      }
+    }
+    m.meths.assign(concr.begin(), concr.end());
+    m.meths.insert(m.meths.end(), virt.begin(), virt.end());
+    std::sort(m.meths.begin(), m.meths.end());
+    m.virt.assign(virt.begin(), virt.end());
+    m.concr.assign(concr.begin(), concr.end());
+    class_meta_[name] = m;
+  }
+
   // An object structure `object (self) val.. method.. end` (Tcl_structure, concrete
   // fields).  `as_class` selects the class-declaration form (a class_init function +
   // make_class, obj_init taking a self argument) vs the immediate-object form
@@ -4101,6 +4149,11 @@ struct Translator {
     std::vector<Meth> meths;
     std::vector<Val> vals;
     std::vector<const ast::Expression*> initializers;
+    // Single `inherit parent args..` (no `as super`), before any val or
+    // initializer (its parent-init call precedes their stores in env_init).
+    const ClassMeta* parent_meta = nullptr;
+    Ident parent_var;
+    std::vector<const ast::Expression*> inh_args;
     for (auto& f : cs.fields) {
       if (auto* m = std::get_if<ast::Pcf_method>(&f.desc)) {
         auto* cc = std::get_if<ast::Cfk_concrete>(&m->kind);
@@ -4114,11 +4167,31 @@ struct Translator {
         vals.push_back({v->name.txt, cc->e.get()});
       } else if (auto* ini = std::get_if<ast::Pcf_initializer>(&f.desc)) {
         initializers.push_back(ini->e.get());
+      } else if (auto* inh = std::get_if<ast::Pcf_inherit>(&f.desc)) {
+        if (parent_meta || inh->as_ || !vals.empty() || !initializers.empty())
+          return nullptr;  // multiple/super-named/late inherit: unsupported
+        const ast::ClassExpr* pe = inh->ce.get();
+        if (auto* ap = std::get_if<ast::Pcl_apply>(&pe->desc)) {
+          for (auto& [l, e] : ap->args) {
+            if (!std::holds_alternative<ast::Nolabel>(l)) return nullptr;
+            inh_args.push_back(e.get());
+          }
+          pe = ap->ce.get();
+        }
+        auto* pc = std::get_if<ast::Pcl_constr>(&pe->desc);
+        if (!pc) return nullptr;
+        auto* pl = std::get_if<Lident>(&pc->id.txt.v);
+        if (!pl) return nullptr;
+        auto mit = class_meta_.find(pl->name);
+        const Ident* pid = lookup(pl->name);
+        if (mit == class_meta_.end() || !pid) return nullptr;
+        parent_meta = &mit->second;
+        parent_var = *pid;
       } else if (std::get_if<ast::Pcf_constraint>(&f.desc) ||
                  std::get_if<ast::Pcf_attribute>(&f.desc)) {
         // no runtime effect
       } else {
-        return nullptr;  // inherit -- not yet supported
+        return nullptr;  // unsupported field
       }
     }
 
@@ -4139,17 +4212,20 @@ struct Translator {
           return nullptr;  // destructuring/wildcard class params: unsupported
       }
 
-    // pub_meths: method names sorted by hash_variant ascending (create_table arg).
-    std::vector<std::string> pub_meths;
-    for (auto& m : meths) pub_meths.push_back(m.name);
+    // The method universe is the union of inherited and own method names.
+    std::set<std::string> own_defined;
+    std::set<std::string> all_meths;
+    for (auto& m : meths) { own_defined.insert(m.name); all_meths.insert(m.name); }
+    if (parent_meta) for (auto& n : parent_meta->meths) all_meths.insert(n);
+    // pub_meths: sorted by hash_variant ascending (create_table/make_class arg).
+    std::vector<std::string> pub_meths(all_meths.begin(), all_meths.end());
     std::sort(pub_meths.begin(), pub_meths.end(),
               [&](const std::string& a, const std::string& b) {
                 return hash_variant(a) < hash_variant(b); });
-    // methl: method names in descending name order (Meths.fold prepend order).
-    std::vector<std::string> methl_names;
-    for (auto& m : meths) methl_names.push_back(m.name);
+    // methl: descending name order (Meths.fold prepend order).
+    std::vector<std::string> methl_names(all_meths.begin(), all_meths.end());
     std::sort(methl_names.begin(), methl_names.end(), std::greater<>());
-    std::vector<std::string> val_names;
+    std::vector<std::string> val_names;   // own (new) vals only
     for (auto& v : vals) val_names.push_back(v.name);
     int len = (int)methl_names.size(), nvals = (int)val_names.size();
 
@@ -4158,16 +4234,22 @@ struct Translator {
     Ident envp = fresh("env");
 
     // Method-id and val-id binders (used both in the index bindings and as the
-    // method-label entries of the set_methods block).
+    // method-label entries of the set_methods block).  Parent instance vars get
+    // ids too -- bound from the inherits result rather than the ids array.
     std::unordered_map<std::string, Ident> meth_id, val_id;
     for (auto& n : methl_names) meth_id[n] = fresh(n);
     for (auto& n : val_names)   val_id[n]  = fresh(n);
+    if (parent_meta)
+      for (auto& n : parent_meta->vals)
+        if (!val_id.count(n)) val_id[n] = fresh(n);
 
     // Translate method bodies and val initialisers with the instance variables in
     // scope (a method's `n` -> (field_computed self n)) and the method labels
     // known (so a self-send resolves to (sendself self m)).
     auto save_iv = inst_vars_; auto save_mid = cur_meth_id_;
     inst_vars_.clear();
+    if (parent_meta)
+      for (auto& n : parent_meta->vals) inst_vars_[n] = val_id[n];
     for (auto& v : vals) inst_vars_[v.name] = val_id[v.name];
     cur_meth_id_ = meth_id;
     std::string self_name = "self-" + std::to_string(++obj_counter_);
@@ -4303,8 +4385,10 @@ struct Translator {
     Ident self_param = fresh("self");  // the obj_init parameter (class mode only)
     LamPtr obj_arg = as_class ? varof(self_param) : cint(0);
     Ident selfo = fresh("self");
-    // The object-field stores: captured-parameter copies (parameter order), then
-    // the val inits (declaration order).
+    // The object-field stores: captured-parameter copies (parameter order), the
+    // parent's obj_init call (when inheriting), then the val inits (declaration
+    // order).
+    Ident pobj_init = fresh("obj_init");  // parent obj_init (inherit only)
     std::vector<LamPtr> stores;
     for (auto& cp : cparams) {
       if (!cp.captured) continue;
@@ -4313,6 +4397,13 @@ struct Translator {
                       ? "setfield_imm_computed" : "setfield_ptr_computed";
       sf->args = {varof(selfo), varof(cp.var_id), varof(cp.pid)};
       stores.push_back(sf);
+    }
+    if (parent_meta) {
+      auto call = mk(Lam::K::Apply);
+      call->fn = varof(pobj_init);
+      call->args = {varof(selfo)};
+      for (auto* a : inh_args) call->args.push_back(expr(*a));
+      stores.push_back(call);
     }
     for (auto& vl : vals) {
       auto save_self = cur_self_; cur_self_ = selfo;
@@ -4332,8 +4423,9 @@ struct Translator {
     } else {
       // stores right-associated, then `(seq <stores> <tail>)` where the tail is
       // self (create_object wraps the init sequence with it as its value), or
-      // the run-initializers call when the class has initializers.
-      LamPtr tail = init_fns.empty()
+      // the run-initializers call when the class has (possibly inherited)
+      // initializers.
+      LamPtr tail = init_fns.empty() && !parent_meta
           ? varof(selfo)
           : oo_call("run_initializers_opt", {obj_arg, varof(selfo), varof(cla)});
       LamPtr inits;
@@ -4378,10 +4470,50 @@ struct Translator {
       auto s = mk(Lam::K::Sequence); s->cond = setm; s->else_ = cl_init; cl_init = s;
     }
 
+    // Whether a binder is referenced by any translated method/initializer body
+    // or by env_init -- unreferenced inherited labels/vars are not bound.
+    auto used_id = [&](const Ident& id) {
+      if (count_var(env_fn, id)) return true;
+      for (auto& mb : methods_block) if (count_var(mb, id)) return true;
+      for (auto& fi : init_fns) if (count_var(fi, id)) return true;
+      return false;
+    };
+
+    // inherits: `(inherits class parent_vals virt_meths concr_meths parent 1)`,
+    // binding the parent's obj_init (field 0) and the used inherited instance
+    // vars (fields 1..) -- the innermost binder group, after the ids binds.
+    if (parent_meta) {
+      Ident inh = fresh("inh");
+      // argument arrays are created before the method/val-name arrays
+      std::vector<LamPtr> ia = {
+          varof(cla),
+          parent_meta->vals.empty() ? cint(0) : transl_meth_list(parent_meta->vals),
+          parent_meta->virt.empty() ? cint(0) : transl_meth_list(parent_meta->virt),
+          parent_meta->concr.empty() ? cint(0) : transl_meth_list(parent_meta->concr),
+          varof(parent_var), cint(1)};
+      auto bindlet = mk(Lam::K::Let);
+      auto f0 = mk(Lam::K::Prim); f0->prim = Prim::FieldMut; f0->prim_arg = 0;
+      f0->args = {varof(inh)};
+      bindlet->bindings.push_back({pobj_init, ValueKind::Gen, f0, false, false, true});
+      for (size_t i = 0; i < parent_meta->vals.size(); ++i) {
+        Ident& vid = val_id[parent_meta->vals[i]];
+        if (!used_id(vid)) continue;
+        auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut;
+        fm->prim_arg = (int)(1 + i); fm->args = {varof(inh)};
+        bindlet->bindings.push_back({vid, ValueKind::Gen, fm, false, false, true});
+      }
+      bindlet->body = cl_init;
+      auto inhlet = mk(Lam::K::Let);
+      inhlet->bindings = {{inh, ValueKind::Gen, oo_call("inherits", ia), false, false, false}};
+      inhlet->body = bindlet;
+      cl_init = inhlet;
+    }
+
     // bind_methods: bind the method-label / variable-index ids from the table.
     if (len < 2 && nvals == 0) {
       // bind_method: a single method via get_method_label (Strict, `=`).
       for (auto it = methl_names.rbegin(); it != methl_names.rend(); ++it) {
+        if (!own_defined.count(*it) && !used_id(meth_id[*it])) continue;
         auto let = mk(Lam::K::Let);
         let->bindings = {{meth_id[*it], ValueKind::Gen,
                           oo_call("get_method_label", {varof(cla), cstr(*it)}),
@@ -4411,7 +4543,11 @@ struct Translator {
       for (auto& n : val_names) layout.push_back(n);
       auto let = mk(Lam::K::Let);
       for (size_t i = 0; i < layout.size(); ++i) {
-        Ident& bid = i < methl_names.size() ? meth_id[layout[i]] : val_id[layout[i]];
+        bool is_meth = i < methl_names.size();
+        // inherited methods are bound only when referenced (self-sends)
+        if (is_meth && !own_defined.count(layout[i]) && !used_id(meth_id[layout[i]]))
+          continue;
+        Ident& bid = is_meth ? meth_id[layout[i]] : val_id[layout[i]];
         auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut; fm->prim_arg = (int)i;
         fm->args = {varof(ids)};
         let->bindings.push_back({bid, ValueKind::Gen, fm, false, false, /*strict_opt=*/true});
@@ -4979,10 +5115,12 @@ struct Translator {
             } else break;
           }
           if (ok)
-            if (auto* ps = std::get_if<Pcl_structure>(&ce->desc))
+            if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
               v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
                                params.empty() ? nullptr : &params,
                                lets.empty() ? nullptr : &lets);
+              register_class_meta(d.name.txt, ps->cs);
+            }
           if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
           cur.push_back({id, ValueKind::Gen, v});
           scope.back()[d.name.txt] = id;

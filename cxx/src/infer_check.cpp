@@ -1564,6 +1564,9 @@ struct Checker {
         }
       } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
         infer_expr(*ini->e);
+      } else if (auto* inh = std::get_if<Pcf_inherit>(&f.desc)) {
+        if (auto* ap = std::get_if<Pcl_apply>(&inh->ce->desc))
+          for (auto& [l, e] : ap->args) infer_expr(*e);
       }
     }
     venv.pop_back();
