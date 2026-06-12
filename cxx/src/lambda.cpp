@@ -5785,15 +5785,18 @@ struct Translator {
             std::string saved = mod_path_;
             mod_path_ += "." + *mb.name.txt;  // nested exceptions are "Outer.M.E"
             auto exn_before = exn_ident_;
+            auto mod_before = module_ident_;
+            auto alias_before = module_alias_;
             LamPtr body = build_module(ps->items, &sub, coerce);
             mod_path_ = saved;
             Ident mid = fresh(*mb.name.txt);
             cur.push_back({mid, ValueKind::Gen, body});
-            module_ident_[*mb.name.txt] = mid;
             auto& lay = module_layout_[*mb.name.txt]; lay.clear();
             for (int i = 0; i < (int)sub.size(); ++i) lay[sub[i]] = i;
-            // exceptions/extension ctors declared inside: their binders are out
-            // of scope out here -- later references read the module's field.
+            // Binders declared INSIDE the submodule are out of scope out here:
+            // exported exception/extension ctors re-register as field reads,
+            // exported inner modules as field-path aliases; the rest restore
+            // their shadowed outer entries (or vanish).
             for (auto& [nm, eid] : exn_ident_) {
               auto bi = exn_before.find(nm);
               if (bi != exn_before.end() && bi->second.stamp == eid.stamp) continue;
@@ -5807,6 +5810,30 @@ struct Translator {
               if (bi != exn_before.end()) { it2->second = bi->second; ++it2; }
               else it2 = exn_ident_.erase(it2);
             }
+            for (auto& [nm, iid] : module_ident_) {
+              auto bi = mod_before.find(nm);
+              if (bi != mod_before.end() && bi->second.stamp == iid.stamp) continue;
+              if (auto f = lay.find(nm); f != lay.end())
+                module_alias_[nm] = fieldimm(f->second, varof(mid));
+            }
+            for (auto it2 = module_ident_.begin(); it2 != module_ident_.end();) {
+              auto bi = mod_before.find(it2->first);
+              bool inner = bi == mod_before.end() || bi->second.stamp != it2->second.stamp;
+              if (!inner) { ++it2; continue; }
+              if (bi != mod_before.end()) { it2->second = bi->second; ++it2; }
+              else it2 = module_ident_.erase(it2);
+            }
+            for (auto it2 = module_alias_.begin(); it2 != module_alias_.end();) {
+              auto bi = alias_before.find(it2->first);
+              bool inner = bi == alias_before.end() || bi->second != it2->second;
+              if (!inner) { ++it2; continue; }
+              if (module_alias_[it2->first] &&
+                  lay.count(it2->first) &&
+                  bi == alias_before.end()) { ++it2; continue; }  // just re-pointed above
+              if (bi != alias_before.end()) { it2->second = bi->second; ++it2; }
+              else it2 = module_alias_.erase(it2);
+            }
+            module_ident_[*mb.name.txt] = mid;
             add_export(*mb.name.txt, mid);
           } else if (std::holds_alternative<Pmod_functor>(mb.expr.desc)) {
             Ident mid = fresh(*mb.name.txt);            // a functor binds as a function
