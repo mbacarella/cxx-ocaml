@@ -298,12 +298,55 @@ struct Checker {
         expanding_.erase(nm);
         return r;
       }
+      // A qualified abbreviation (`int Seq.t`) expands from the module's cmi
+      // manifest, like the cmi-side Texpand path -- otherwise an annotation
+      // stays an opaque constr and clashes with the cmi-expanded form (Seq.t's
+      // manifest is the *arrow* unit -> 'a node).
+      if (std::holds_alternative<Ldot>(c->id.txt.v))
+        if (TypePtr r = expand_qualified_abbrev(c->id.txt, as)) return r;
       // A bare reference to a local opaque type carries its identity stamp.
       int stamp = 0;
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
       return eng.constr(lid_full(c->id.txt), std::move(as), stamp);
     }
     return eng.fresh_var();
+  }
+
+  // Expand a qualified type abbreviation `M.t` from the module's cmi: find M's
+  // signature, then t's manifest, and convert it with t's params bound to the
+  // already-converted args.  Null when M.t isn't a loadable abbreviation (opaque
+  // or datatype decls stay constrs).
+  TypePtr expand_qualified_abbrev(const Longident& id, const std::vector<TypePtr>& as) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d || cmi_expanding_.count(d->name)) return nullptr;
+    auto comps = mod_components(*d->prefix);
+    if (comps.empty()) return nullptr;
+    auto* saved = cmi_types_ctx_;
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == d->name && td.manifest && td.params.size() == as.size()) {
+            std::unordered_map<cmi::TypeExpr*, TypePtr> m2;
+            for (size_t i = 0; i < as.size(); ++i) m2[td.params[i].get()] = as[i];
+            cmi_types_ctx_ = &sig->types;
+            cmi_expanding_.insert(td.name);
+            TypePtr r = from_cmi(td.manifest, m2);
+            cmi_expanding_.erase(td.name);
+            cmi_types_ctx_ = saved;
+            return r;
+          }
+    } catch (...) {}
+    cmi_types_ctx_ = saved;
+    return nullptr;
   }
 
   TypePtr lookup_value(const Longident& lid) {
