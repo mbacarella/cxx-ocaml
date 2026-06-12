@@ -291,6 +291,9 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
           head = "(makeblock " + std::to_string(l->prim_arg) + shape_suffix(l->blk_shape); break;
         case Prim::Field: head = "(field " + std::to_string(l->prim_arg); break;
         case Prim::FieldImm: head = "(field_imm " + std::to_string(l->prim_arg); break;
+        case Prim::Floatfield: head = "(floatfield " + std::to_string(l->prim_arg); break;
+        case Prim::SetFloatfield:
+          head = "(setfloatfield " + std::to_string(l->prim_arg); break;
         case Prim::Global:
           return text("(global " + l->prim_id +
                       (l->var.stamp ? "/" + std::to_string(l->var.stamp) : "") + "!)");
@@ -602,7 +605,8 @@ struct Translator {
   struct FieldInfo { std::string type; int index; bool mut; ValueKind kind; };
   std::unordered_map<std::string, FieldInfo> field_info_;
   std::set<std::string> ambiguous_fields_;
-  struct RecType { std::vector<std::string> labels; bool mut; std::vector<ValueKind> shape; };
+  struct RecType { std::vector<std::string> labels; bool mut; std::vector<ValueKind> shape;
+                   bool flat = false; };  // all-float: a flat float block, not a record
   std::unordered_map<std::string, RecType> rec_types_;  // type name -> record layout
 
   // The value kind of a field/element from its syntactic core type (builtins and
@@ -618,6 +622,21 @@ struct Translator {
       if (immediate_local_.count(b)) return ValueKind::Int;
     }
     return ValueKind::Gen;
+  }
+  // Is this core type float, following local abbreviations (`type t = float;
+  // type s = {f : t}` makes s a FLAT float record)?  Used only for the flat
+  // decision, so coretype_kind's existing classifications stay untouched.
+  std::unordered_map<std::string, const CoreType*> local_alias_;
+  bool is_float_core(const CoreType& t, int depth = 0) {
+    if (depth > 8) return false;
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      if (!c->args.empty()) return false;
+      std::string b = lid_last(c->id.txt);
+      if (b == "float") return true;
+      if (auto a = local_alias_.find(b); a != local_alias_.end())
+        return is_float_core(*a->second, depth + 1);
+    }
+    return false;
   }
 
   // Predefined variant constructors, so constructor matches over option/list/
@@ -748,15 +767,22 @@ struct Translator {
         if (gadt) gadt_types_.insert(d.name.txt);
       }
     });
+    each_decl([&](const TypeDeclaration& d) {  // aliases (records resolve through them)
+      if (d.manifest && !std::get_if<Ptype_variant>(&d.kind) &&
+          !std::get_if<Ptype_record>(&d.kind))
+        local_alias_.emplace(d.name.txt, d.manifest->get());
+    });
     each_decl([&](const TypeDeclaration& d) {  // then records
       if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
         RecType rt;
         rt.mut = false;
+        rt.flat = !rec->fields.empty();
         int idx = 0;
         for (auto& f : rec->fields) {
           ValueKind k = coretype_kind(*f.type);
           bool m = f.mut == MutableFlag::Mutable;
           rt.mut |= m;
+          rt.flat = rt.flat && is_float_core(*f.type);
           rt.labels.push_back(f.name.txt);
           rt.shape.push_back(k);
           if (field_info_.count(f.name.txt)) ambiguous_fields_.insert(f.name.txt);
@@ -772,7 +798,36 @@ struct Translator {
     std::function<void(const Structure&)> nested = [&](const Structure& items) {
       for (auto& item : items) {
         if (auto* td = std::get_if<Pstr_type>(&item.desc))
-          for (auto& d : td->decls)
+          for (auto& d : td->decls) {
+            // fill-absent registration of a submodule's aliases and records, so
+            // qualified labels resolve ({ Float_record.f = .. } incl. flat
+            // float records); a nested decl never shadows a top-level one
+            if (d.manifest && !std::get_if<Ptype_variant>(&d.kind) &&
+                !std::get_if<Ptype_record>(&d.kind))
+              local_alias_.emplace(d.name.txt, d.manifest->get());
+            if (auto* rec = std::get_if<Ptype_record>(&d.kind);
+                rec && !rec_types_.count(d.name.txt)) {
+              RecType rt;
+              rt.mut = false;
+              rt.flat = !rec->fields.empty();
+              int idx = 0;
+              bool clash = false;
+              for (auto& f : rec->fields)
+                if (field_info_.count(f.name.txt) &&
+                    field_info_[f.name.txt].type != d.name.txt)
+                  clash = true;
+              for (auto& f : rec->fields) {
+                ValueKind k = coretype_kind(*f.type);
+                bool m = f.mut == MutableFlag::Mutable;
+                rt.mut |= m;
+                rt.flat = rt.flat && is_float_core(*f.type);
+                rt.labels.push_back(f.name.txt);
+                rt.shape.push_back(k);
+                if (!clash) field_info_[f.name.txt] = {d.name.txt, idx, m, k};
+                ++idx;
+              }
+              if (!clash) rec_types_[d.name.txt] = std::move(rt);
+            }
             if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
               int nc = 0, nb = 0; bool all_const = !v->ctors.empty(), gadt = false;
               for (auto& c : v->ctors) {
@@ -791,15 +846,20 @@ struct Translator {
               type_ctors_.emplace(d.name.txt, std::make_pair(nc, nb));
               if (all_const && !gadt) immediate_local_.insert(d.name.txt);
             }
-        if (auto* pm = std::get_if<Pstr_module>(&item.desc))
-          if (auto* ps = std::get_if<Pmod_structure>(&pm->binding.expr.desc))
-            nested(ps->items);
+          }
+        if (auto* pm = std::get_if<Pstr_module>(&item.desc)) {
+          const ModuleExpr* me = &pm->binding.expr;  // peel `M : S = struct..end`
+          while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+          if (auto* ps = std::get_if<Pmod_structure>(&me->desc)) nested(ps->items);
+        }
       }
     };
     for (auto& item : s)
-      if (auto* pm = std::get_if<Pstr_module>(&item.desc))
-        if (auto* ps = std::get_if<Pmod_structure>(&pm->binding.expr.desc))
-          nested(ps->items);
+      if (auto* pm = std::get_if<Pstr_module>(&item.desc)) {
+        const ModuleExpr* me = &pm->binding.expr;
+        while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+        if (auto* ps = std::get_if<Pmod_structure>(&me->desc)) nested(ps->items);
+      }
   }
   const FieldInfo* find_field(const std::string& label) {
     if (ambiguous_fields_.count(label)) return nullptr;
@@ -2877,9 +2937,13 @@ struct Translator {
   // is field_int, a mutable boxed field field_mut, otherwise field_imm).
   LamPtr field_read(const FieldInfo* fi, const LamPtr& s) {
     auto l = mk(Lam::K::Prim);
-    l->prim = fi->kind == ValueKind::Int ? Prim::FieldInt
-              : fi->mut                  ? Prim::FieldMut
-                                         : Prim::FieldImm;
+    auto rt = rec_types_.find(fi->type);
+    if (rt != rec_types_.end() && rt->second.flat)
+      l->prim = Prim::Floatfield;  // flat float record: unboxed field read
+    else
+      l->prim = fi->kind == ValueKind::Int ? Prim::FieldInt
+                : fi->mut                  ? Prim::FieldMut
+                                           : Prim::FieldImm;
     l->prim_arg = fi->index; l->args = {s}; return l;
   }
   // Bind the variables of an irrefutable pattern (var / alias / tuple / record /
@@ -3998,14 +4062,21 @@ struct Translator {
             for (size_t i = 0; i < vals.size(); ++i) {
               if (vals[i]) continue;
               auto fr = mk(Lam::K::Prim);
-              fr->prim = rt->shape[i] == ValueKind::Int ? Prim::FieldInt
-                         : fmut[i]                      ? Prim::FieldMut
-                                                        : Prim::FieldImm;
+              if (rt->flat) fr->prim = Prim::Floatfield;
+              else
+                fr->prim = rt->shape[i] == ValueKind::Int ? Prim::FieldInt
+                           : fmut[i]                      ? Prim::FieldMut
+                                                          : Prim::FieldImm;
               fr->prim_arg = (int)i; fr->args = {bv};
               vals[i] = fr;
             }
             LamPtr blk;
-            if (!rt->mut) {
+            if (rt->flat) {  // flat float record: a float block, not a record
+              auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
+              m->prim_id = rt->mut ? "makearray[float]" : "makearray_imm[float]";
+              m->args = std::move(vals);
+              blk = m;
+            } else if (!rt->mut) {
               blk = block(0, std::move(vals));
               if (blk->k == Lam::K::Prim) blk->blk_shape = rt->shape;
             } else {
@@ -4083,6 +4154,12 @@ struct Translator {
             vals[ix] = expr(*ve);
           }
           if (ok) {
+            if (rt->flat) {  // flat float record: a float block, not a record
+              auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
+              m->prim_id = rt->mut ? "makearray[float]" : "makearray_imm[float]";
+              m->args = std::move(vals);
+              return m;
+            }
             if (!rt->mut) {
               auto b = block(0, std::move(vals));
               if (b->k == Lam::K::Prim) b->blk_shape = rt->shape;  // field kinds
@@ -4106,9 +4183,13 @@ struct Translator {
     if (auto* fe = std::get_if<Pexp_field>(&e.desc)) {
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
-        l->prim = fi->kind == ValueKind::Int ? Prim::FieldInt
-                  : fi->mut                  ? Prim::FieldMut
-                                             : Prim::FieldImm;
+        auto rt = rec_types_.find(fi->type);
+        if (rt != rec_types_.end() && rt->second.flat)
+          l->prim = Prim::Floatfield;  // flat float record: unboxed field read
+        else
+          l->prim = fi->kind == ValueKind::Int ? Prim::FieldInt
+                    : fi->mut                  ? Prim::FieldMut
+                                               : Prim::FieldImm;
         l->prim_arg = fi->index; l->args = {expr(*fe->e)};
         return l;
       }
@@ -4143,7 +4224,11 @@ struct Translator {
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
       if (auto* fi = find_field(lid_last(sf->field.txt))) {
         auto l = mk(Lam::K::Prim);
-        l->prim = fi->kind == ValueKind::Int ? Prim::SetfieldImm : Prim::SetfieldPtr;
+        auto rt = rec_types_.find(fi->type);
+        if (rt != rec_types_.end() && rt->second.flat)
+          l->prim = Prim::SetFloatfield;  // flat float record: unboxed field write
+        else
+          l->prim = fi->kind == ValueKind::Int ? Prim::SetfieldImm : Prim::SetfieldPtr;
         l->prim_arg = fi->index; l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }

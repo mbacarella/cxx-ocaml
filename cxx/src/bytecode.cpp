@@ -230,6 +230,8 @@ struct Bytegen {
         return Iop(Op::Getfield, e->prim_arg);
       case Prim::SetfieldImm: case Prim::SetfieldPtr:
         return Iop(Op::Setfield, e->prim_arg);
+      case Prim::Floatfield: return Iop(Op::Getfloatfield, e->prim_arg);
+      case Prim::SetFloatfield: return Iop(Op::Setfloatfield, e->prim_arg);
       case Prim::Addint: return I(Op::Addint);
       case Prim::Subint: return I(Op::Subint);
       case Prim::Mulint: return I(Op::Mulint);

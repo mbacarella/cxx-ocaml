@@ -58,6 +58,8 @@ enum class Prim {
   Send,            // (send obj tag)        -- method dispatch (args: [obj, tag])
   FieldComputed,   // (field_computed o id) -- read an instance var by id (args: [obj, id])
   SetfieldComputed,// (setfield_imm_computed o id v) / setfield_ptr_computed (spelling in prim_id)
+  Floatfield,      // (floatfield n r)      -- flat float-record field read
+  SetFloatfield,   // (setfloatfield n r v) -- flat float-record field write
 };
 
 struct Lam {
