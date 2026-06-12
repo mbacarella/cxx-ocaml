@@ -622,7 +622,12 @@ struct Translator {
 
   // Predefined variant constructors, so constructor matches over option/list/
   // result (and bool/unit) get the same tag info as local variants.
+  // Constructor names that came from the predefs/stdlib (not local decls): a
+  // LOCAL exception/extension ctor of the same name shadows them.
+  std::set<std::string> builtin_ctors_;
   void register_predef_ctor_info() {
+    for (const char* c : {"None", "Some", "[]", "::", "Ok", "Error", "false", "true", "()"})
+      builtin_ctors_.insert(c);
     ctor_info_["None"]  = {"option", 0, false, 0};
     ctor_info_["Some"]  = {"option", 0, true, 1};
     ctor_info_["[]"]    = {"list", 0, false, 0};
@@ -663,7 +668,10 @@ struct Translator {
         if (!gadt) type_ctors_.emplace(td.name, std::make_pair(nc, nb));
       }
       for (auto& [name, ci] : found)
-        if (!ambiguous.count(name) && !ctor_info_.count(name)) ctor_info_[name] = ci;
+        if (!ambiguous.count(name) && !ctor_info_.count(name)) {
+          ctor_info_[name] = ci;
+          builtin_ctors_.insert(name);
+        }
     } catch (...) {}
   }
 
@@ -686,6 +694,7 @@ struct Translator {
           if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) { arity = (int)t->elems.size(); block = arity > 0; }
           if (c.res) gadt = true;
           if (block) all_const = false;
+          builtin_ctors_.erase(c.name.txt);  // a local decl un-marks a builtin
           ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block, arity, unboxed && arity == 1};
           if (block) ++nb; else ++nc;
         }
@@ -728,8 +737,10 @@ struct Translator {
                 }
                 if (c.res) gadt = true;
                 if (block) all_const = false;
-                if (!ctor_info_.count(c.name.txt))
+                if (!ctor_info_.count(c.name.txt)) {
+                  builtin_ctors_.erase(c.name.txt);
                   ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block, arity};
+                }
                 if (block) ++nb; else ++nc;
               }
               type_ctors_.emplace(d.name.txt, std::make_pair(nc, nb));
@@ -3855,7 +3866,11 @@ struct Translator {
           return block_of(0, {at->elems[0].get(), at->elems[1].get()});
       }
       if (n == "Some" && k->arg) return block_of(0, {k->arg->get()});
-      if (auto ci = ctor_info_.find(n); ci != ctor_info_.end()) {  // local variant ctor
+      // a LOCAL exception/extension ctor shadows a same-named builtin ctor
+      // (`exception Ok` vs result's Ok)
+      bool exn_shadows = (exn_ident_.count(n) || exn_field_.count(n)) &&
+                         (!ctor_info_.count(n) || builtin_ctors_.count(n));
+      if (auto ci = ctor_info_.find(n); ci != ctor_info_.end() && !exn_shadows) {
         if (!ci->second.is_block) return cint(ci->second.tag);  // constant -> its tag
         std::vector<const Expression*> fs;
         if (k->arg) {  // `B of t1 * t2` flattens the tuple argument into fields
