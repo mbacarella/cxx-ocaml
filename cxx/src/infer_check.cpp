@@ -2170,6 +2170,8 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
 // The Lambda value_kind of an inferred type, as -dlambda spells it.
 static std::string kind_str(const TypePtr& t0, const std::set<std::string>& imm) {
   TypePtr t = I::Engine::repr(t0);
+  // functions and tuples are always boxed (Typeopt: Paddrarray, lazy Shortcut)
+  if (t->kind == I::Type::Kind::Arrow || t->kind == I::Type::Kind::Tuple) return "addr";
   if (t->kind != I::Type::Kind::Constr) return "";
   auto d = t->path.rfind('.');
   std::string b = d == std::string::npos ? t->path : t->path.substr(d + 1);

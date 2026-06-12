@@ -1503,6 +1503,24 @@ struct Translator {
     fn->body = body;
     return fn;
   }
+  // Over-application of a primitive (`Lazy.force e ()`, `snd p 42`): saturate
+  // it on the first `arity` arguments, then apply the result to the rest.  The
+  // argument vector is trimmed in place for the nested call and restored.
+  LamPtr prim_apply(const std::string& prim, int arity, const Pexp_apply& ap0,
+                    const Expression& e) {
+    if (arity <= 0 || (int)ap0.args.size() <= arity)
+      return prim_to_lam(prim, arity, ap0, e);
+    auto& ap = const_cast<Pexp_apply&>(ap0);
+    std::vector<std::pair<ArgLabel, ExprBox>> tail;
+    for (size_t i = arity; i < ap.args.size(); ++i) tail.push_back(std::move(ap.args[i]));
+    ap.args.resize(arity);
+    LamPtr r = prim_to_lam(prim, arity, ap, e);
+    std::vector<LamPtr> rest;
+    if (r) for (auto& t : tail) rest.push_back(expr(*t.second));
+    for (auto& t : tail) ap.args.push_back(std::move(t));
+    if (!r) return nullptr;
+    return lapply_(r, std::move(rest));
+  }
   LamPtr prim_to_lam(const std::string& prim, int arity, const Pexp_apply& ap, const Expression& e) {
     auto& as = ap.args;
     auto args = [&] {
@@ -4028,7 +4046,7 @@ struct Translator {
             }
             // General: an `external` value resolved via its cmi prim_name.
             if (auto prim = value_prim(m, f); !prim.name.empty())
-              if (auto r = prim_to_lam(prim.name, prim.arity, *ap, e)) return r;
+              if (auto r = prim_apply(prim.name, prim.arity, *ap, e)) return r;
           }
       // Nested-prefix qualified externals (`Bigarray.Array1.get a i`, or
       // `Array1.get` under `open Bigarray`): the submodule's prim via the cmi
@@ -4047,7 +4065,7 @@ struct Translator {
                 if (it->find('.') == std::string::npos) cands.push_back(*it + "." + pre);
               for (auto& cand : cands)
                 if (StdPrim sp = submodule_prim(cand, nm); !sp.name.empty())
-                  if (auto r = prim_to_lam(sp.name, sp.arity, *ap, e)) return r;
+                  if (auto r = prim_apply(sp.name, sp.arity, *ap, e)) return r;
             }
           }
         }
@@ -4062,7 +4080,7 @@ struct Translator {
               return pr;
             }
             if (auto lp = local_prims_.find(n); lp != local_prims_.end())
-              if (auto r = prim_to_lam(lp->second.first, lp->second.second, *ap, e))
+              if (auto r = prim_apply(lp->second.first, lp->second.second, *ap, e))
                 return r;
             // an opened module's external member applied directly (its fields
             // are handled by the generic path; opened_has excludes prims)
@@ -4070,7 +4088,7 @@ struct Translator {
               bool dotted = it2->find('.') != std::string::npos;
               StdPrim sp = dotted ? submodule_prim(*it2, n) : value_prim(*it2, n);
               if (!sp.name.empty()) {
-                if (auto r = prim_to_lam(sp.name, sp.arity, *ap, e)) return r;
+                if (auto r = prim_apply(sp.name, sp.arity, *ap, e)) return r;
                 break;
               }
               if (dotted ? submodule_of(*it2).fields.count(n) > 0
@@ -4180,11 +4198,11 @@ struct Translator {
             // General: an unqualified pervasive `external` (e.g. compare, ignore)
             // resolved via its cmi prim_name.
             if (auto pi = stdlib_prims.find(n); pi != stdlib_prims.end())
-              if (auto r = prim_to_lam(pi->second.name, pi->second.arity, *ap, e)) return r;
+              if (auto r = prim_apply(pi->second.name, pi->second.arity, *ap, e)) return r;
             // an `open M`'d external (e.g. Marshal.(to_string ...)): M's prim.
             for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
               if (auto p = value_prim(*it, n); !p.name.empty())
-                if (auto r = prim_to_lam(p.name, p.arity, *ap, e)) return r;
+                if (auto r = prim_apply(p.name, p.arity, *ap, e)) return r;
           }
       // A call to a labelled/optional function (local or a qualified stdlib value):
       // reorder the arguments to parameter order, wrap/insert optionals.
