@@ -2251,20 +2251,25 @@ struct Translator {
       return field_of("Stdlib", sf->second);
     return nullptr;
   }
+  // A match row as a *borrowed* view into the AST (the Structure outlives the
+  // translation), so sub-matches can be built from inner sub-patterns without
+  // copying the move-only Case.  guard==nullptr means no `when`.
+  struct Row { const Pattern* lhs; const Expression* rhs; const Expression* guard; };
   // Compile a `try ... with` handler body: an if-chain testing the caught
   // exception `exn` against each case, falling through to (reraise exn).
-  LamPtr exn_dispatch(const Ident& exn, const std::vector<Case>& cases, size_t i) {
-    if (i >= cases.size()) {
+  LamPtr exn_dispatch(const Ident& exn, const std::vector<Row>& rows, size_t i) {
+    if (i >= rows.size()) {
       auto rr = mk(Lam::K::Prim); rr->prim = Prim::Reraise;
       auto v = mk(Lam::K::Var); v->var = exn; rr->args = {v}; return rr;
     }
-    const Case& c = cases[i];
+    const Row& c = rows[i];
+    const Pattern* lhsp = effective_pat(c.lhs);
     if (!c.guard) {
-      if (is_catchall(c.lhs)) {  // `_`/var: handle unconditionally
-        if (auto* pv = std::get_if<Ppat_var>(&c.lhs.desc)) scope.back()[pv->name.txt] = exn;
+      if (is_catchall(*lhsp)) {  // `_`/var: handle unconditionally
+        if (auto* pv = std::get_if<Ppat_var>(&lhsp->desc)) scope.back()[pv->name.txt] = exn;
         return expr(*c.rhs);
       }
-      if (auto* k = std::get_if<Ppat_construct>(&c.lhs.desc))
+      if (auto* k = std::get_if<Ppat_construct>(&lhsp->desc))
         if (LamPtr id = exn_value(lid_last(k->id.txt))) {
           auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
           LamPtr lhs;
@@ -2275,16 +2280,16 @@ struct Translator {
             lhs = exv();
           }
           LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs);
-          if (!then) return exn_dispatch(exn, cases, i + 1);  // unsupported binder shape
+          if (!then) return exn_dispatch(exn, rows, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
           test->args = {lhs, id};
           auto iff = mk(Lam::K::IfThenElse);
           iff->cond = test; iff->then_ = then;
-          iff->else_ = exn_dispatch(exn, cases, i + 1);
+          iff->else_ = exn_dispatch(exn, rows, i + 1);
           return iff;
         }
     }
-    return exn_dispatch(exn, cases, i + 1);  // unsupported case: skip
+    return exn_dispatch(exn, rows, i + 1);  // unsupported case: skip
   }
   // The body of a matched exception case: the constructor's data lives at fields
   // 1..arity of the exception block (field 0 is its identity).  A structured
@@ -2656,10 +2661,6 @@ struct Translator {
            (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt || l->prim == Prim::FieldMut);
   }
 
-  // A match row as a *borrowed* view into the AST (the Structure outlives the
-  // translation), so sub-matches can be built from inner sub-patterns without
-  // copying the move-only Case.  guard==nullptr means no `when`.
-  struct Row { const Pattern* lhs; const Expression* rhs; const Expression* guard; };
   static std::vector<Row> rows_of(const std::vector<Case>& cs) {
     std::vector<Row> rs;
     for (auto& c : cs) rs.push_back({&c.lhs, c.rhs.get(), c.guard ? c.guard->get() : nullptr});
@@ -3322,7 +3323,49 @@ struct Translator {
       return i;
     }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) return lazy_expr(*lz->e);
-    if (auto* m = std::get_if<Pexp_match>(&e.desc)) return compile_match(expr(*m->e), m->cases, e.loc);
+    if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      // Mixed value/exception arms: the scrutinee is evaluated under a try whose
+      // body exits with the value -- value arms run OUTSIDE the try, exception
+      // arms dispatch in its handler:
+      //   (catch (try (exit N scrut) with exn <dispatch|reraise>)
+      //    with (N v) <value-arm match over v>)
+      std::vector<Row> vrows, erows;
+      for (auto& c : m->cases) {
+        const Expression* g = c.guard ? c.guard->get() : nullptr;
+        if (auto* pe = std::get_if<Ppat_exception>(&c.lhs.desc))
+          erows.push_back({pe->p.get(), c.rhs.get(), g});
+        else
+          vrows.push_back({&c.lhs, c.rhs.get(), g});
+      }
+      if (!erows.empty() && !vrows.empty()) {
+        int eid = ++next_exit_;
+        auto ex = mk(Lam::K::Staticraise);
+        ex->prim_arg = eid; ex->args = {expr(*m->e)};
+        auto tr = mk(Lam::K::Try);
+        tr->body = ex;
+        tr->var = fresh("exn");
+        scope.emplace_back();
+        caught_exn_.push_back(tr->var);
+        tr->then_ = exn_dispatch(tr->var, erows, 0);
+        caught_exn_.pop_back();
+        scope.pop_back();
+        // the catch var takes the first var/alias value row's name
+        std::string vn;
+        for (auto& r : vrows) {
+          const Pattern* ep = effective_pat(r.lhs);
+          if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) { vn = pv->name.txt; break; }
+          if (auto* pa = std::get_if<Ppat_alias>(&ep->desc)) { vn = pa->name.txt; break; }
+        }
+        Ident v = vn.empty() ? fresh("", true) : fresh(vn);
+        auto cat = mk(Lam::K::Catch);
+        cat->cond = tr; cat->prim_arg = eid; cat->catch_vars = {v};
+        scope.emplace_back();
+        cat->then_ = compile_match(varof(v), vrows, e.loc);
+        scope.pop_back();
+        return cat;
+      }
+      return compile_match(expr(*m->e), m->cases, e.loc);
+    }
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
       std::vector<ValueKind> shape;
@@ -4019,7 +4062,7 @@ struct Translator {
       } else {
         l->var = fresh("exn");
         caught_exn_.push_back(l->var);
-        l->then_ = exn_dispatch(l->var, tr->cases, 0);
+        l->then_ = exn_dispatch(l->var, rows_of(tr->cases), 0);
       }
       caught_exn_.pop_back();
       scope.pop_back();

@@ -7,6 +7,7 @@
 
 #include <cctype>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <ostream>
 #include <set>
@@ -44,8 +45,11 @@ Code add_pop(int n, Code cont) {
 struct Bytegen {
   int label_counter = 0;
   std::string compunit;
-  struct sz_lbl { int lbl; int sz; };  // a static-catch handler: label + stack level
+  // a static-catch handler: label + stack level + enclosing-try depth at the
+  // catch (a raise inside deeper try blocks must Poptrap through each)
+  struct sz_lbl { int lbl; int sz; size_t tb_depth; };
   std::unordered_map<int, sz_lbl> static_lbl_;  // exit id -> handler (ids are unique)
+  std::vector<int> try_blocks_;  // stack size at each nested try block entry
   int new_label() { return ++label_counter; }
 
   struct ToCompile {
@@ -590,26 +594,74 @@ struct Bytegen {
         Code body_cont = cons(I(Op::Poptrap), cons(branch1,
           cons(Iop(Op::Label, lbl_handler), cons(I(Op::Push),
             comp_expr(henv, exp->then_, sz + 1, add_pop(1, cont1))))));
-        return cons(Iop(Op::Pushtrap, lbl_handler), comp_expr(env, exp->body, sz + 4, body_cont));
+        try_blocks_.push_back(sz);  // a static raise from the body must Poptrap
+        Code body = comp_expr(env, exp->body, sz + 4, body_cont);
+        try_blocks_.pop_back();
+        return cons(Iop(Op::Pushtrap, lbl_handler), body);
       }
       case K::Catch: {
-        // Static catch (no handler vars): a label the body's (exit N) branches to;
-        // not a trap (no pushtrap).  body falls through past the handler via branch1.
+        // Static catch: a label the body's (exit N ..) branches to; not a trap.
+        // Handler vars live in stack slots: nvars dummies pushed under the body,
+        // assigned by the raise site (nvars==1 passes the value in the accu).
         auto [branch1, cont1] = make_branch(cont);
+        int nvars = (int)exp->catch_vars.size();
         int lbl = new_label();
-        static_lbl_[exp->prim_arg] = sz_lbl{lbl, sz};
-        Code hcode = cons(Iop(Op::Label, lbl), comp_expr(env, exp->then_, sz, cont1));
-        return comp_expr(env, exp->cond, sz, cons(branch1, hcode));
+        if (nvars == 0) {
+          static_lbl_[exp->prim_arg] = sz_lbl{lbl, sz, try_blocks_.size()};
+          Code hcode = cons(Iop(Op::Label, lbl), comp_expr(env, exp->then_, sz, cont1));
+          return comp_expr(env, exp->cond, sz, cons(branch1, hcode));
+        }
+        if (nvars == 1) {
+          static_lbl_[exp->prim_arg] = sz_lbl{lbl, sz, try_blocks_.size()};
+          Env henv = add_var(exp->catch_vars[0], sz + 1, env);
+          Code hcode = cons(Iop(Op::Label, lbl), cons(I(Op::Push),
+              comp_expr(henv, exp->then_, sz + 1, add_pop(1, cont1))));
+          return comp_expr(env, exp->cond, sz, cons(branch1, hcode));
+        }
+        static_lbl_[exp->prim_arg] = sz_lbl{lbl, sz + nvars, try_blocks_.size()};
+        Env henv = env;
+        for (int i = 0; i < nvars; ++i) henv = add_var(exp->catch_vars[i], sz + 1 + i, henv);
+        Code hcode = cons(Iop(Op::Label, lbl),
+            comp_expr(henv, exp->then_, sz + nvars, add_pop(nvars, cont1)));
+        Code body = comp_expr(env, exp->cond, sz + nvars,
+                              add_pop(nvars, cons(branch1, hcode)));
+        for (int i = 0; i < nvars; ++i) {  // push_dummies
+          auto z = std::make_shared<Lam>(); z->k = K::ConstInt; z->int_val = 0;
+          Instr c = I(Op::Const); c.cst = z;
+          body = cons(c, cons(I(Op::Push), body));
+        }
+        return body;
       }
       case K::Staticraise: {
-        // (exit N): pop back to the catch's stack level, then branch to its label.
+        // (exit N args..): unwind any try blocks entered since the catch
+        // (pop to each trap's level + Poptrap), pop to the catch's stack level,
+        // then branch.  One arg travels in the accumulator; several assign into
+        // the catch's reserved slots.
         auto it = static_lbl_.find(exp->prim_arg);
         if (it == static_lbl_.end()) {  // shouldn't happen; degrade to unit
           auto z = std::make_shared<Lam>(); z->k = K::ConstInt;
           Instr c = I(Op::Const); c.cst = z; return cons(c, cont);
         }
-        Code tail = branch_to(it->second.lbl, discard_dead_code(cont));
-        return add_pop(sz - it->second.sz, tail);
+        Code c0 = branch_to(it->second.lbl, discard_dead_code(cont));
+        std::vector<int> tbs(try_blocks_.begin() + it->second.tb_depth, try_blocks_.end());
+        std::function<Code(int, int)> unwind = [&](int s, int i) -> Code {
+          if (i == 0) return add_pop(s - it->second.sz, c0);
+          int tsz = tbs[i - 1];
+          return add_pop(s - tsz - 4, cons(I(Op::Poptrap), unwind(tsz, i - 1)));
+        };
+        Code tail = unwind(sz, (int)tbs.size());
+        if (exp->args.size() == 1)  // optim: the argument travels in the accu
+          return comp_expr(env, exp->args[0], sz, tail);
+        if (!exp->args.empty()) {
+          // comp_exit_args: args reversed, each assigned to its reserved slot
+          std::function<Code(size_t, int)> assign = [&](size_t idx, int pos) -> Code {
+            if (idx == exp->args.size()) return tail;
+            return comp_expr(env, exp->args[exp->args.size() - 1 - idx], sz,
+                             cons(Iop(Op::Assign, sz - pos), assign(idx + 1, pos - 1)));
+          };
+          return assign(0, it->second.sz);
+        }
+        return tail;
       }
       case K::Switch: return comp_switch(env, exp, sz, cont);
       default:
