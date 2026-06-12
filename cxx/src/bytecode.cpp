@@ -464,6 +464,22 @@ struct Bytegen {
               if (sz + 4 > max_stack_) max_stack_ = sz + 4;
               return comp_expr(env, exp->args[0], sz, cons(I(Op::Perform), cont));
             }
+            // runstack/resume (stack, fn, arg): Kresume, or Kresumeterm in tail
+            // position (bytegen's Prunstack/Presume).
+            if (exp->prim_id == "runstack" && exp->args.size() == 3) {
+              if (is_tailcall(cont)) {
+                Instr rt = I(Op::Resumeterm); rt.a = sz + 2;
+                return comp_args(env, exp->args, sz, cons(rt, discard_dead_code(cont)));
+              }
+              if (sz + 3 > max_stack_) max_stack_ = sz + 3;
+              return comp_args(env, exp->args, sz, cons(I(Op::Resume), cont));
+            }
+            // reperform (eff, cont): tail-only Kreperformterm (resets the stack).
+            if (exp->prim_id == "reperform" && exp->args.size() == 2) {
+              if (3 > max_stack_) max_stack_ = 3;
+              Instr rp = I(Op::Reperformterm); rp.a = sz + 1;
+              return comp_args(env, exp->args, sz, cons(rp, discard_dead_code(cont)));
+            }
             break;
           case Prim::Send: {
             // Method dispatch (bytegen's Lsend).  Public `(send obj tag args..)`:
@@ -877,6 +893,9 @@ std::string instr_text(const Instr& i) {
     case Op::Offsetref: return "\toffsetref " + n(i.a);
     case Op::Isint: return "\tisint";
     case Op::Perform: return "\tperform";
+    case Op::Resume: return "\tresume";
+    case Op::Resumeterm: return "\tresumeterm " + n(i.a);
+    case Op::Reperformterm: return "\treperformterm " + n(i.a);
     case Op::Isout: return "\tisout";
     case Op::Stop: return "\tstop";
     default: return "\t?";

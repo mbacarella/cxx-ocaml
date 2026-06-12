@@ -1433,6 +1433,7 @@ struct Translator {
     if (prim == "%opaque" && n == 1) return ic("opaque");
     if (prim == "%ignore" && n == 1) return ic("ignore");
     if (prim == "%identity" && n == 1) return argv[0];
+    if (prim == "%perform" && n == 1) return cc("perform");
     if ((prim == "%succint" || prim == "%predint") && n == 1) {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::Offsetint;
       pr->prim_arg = prim == "%succint" ? 1 : -1; pr->args = argv; return pr;
@@ -2391,6 +2392,87 @@ struct Translator {
     body = wrap_binders(body, binders);
     body = wrap_binders(body, temps);
     return body;
+  }
+  // The effect-handler match syntax: lower the whole match to
+  //   (runstack (caml_alloc_stack <value fn> <exn fn> <effect fn>)
+  //             (function param <scrut>) 0)
+  // The effect fn `(function eff k ...)` dispatches on the extension-ctor
+  // identity (field 0 of an applied effect, the value for a constant one),
+  // binding the data fields like an exn handler and the continuation pattern
+  // to k; the fall-through is `(reperform eff k)` (always tail position).
+  LamPtr effect_match(const Expression& scrut, const std::vector<Row>& vrows,
+                      const std::vector<Row>& erows,
+                      const std::vector<std::pair<const Ppat_effect*, const Expression*>>& frows,
+                      const Location& mloc) {
+    Ident eff = fresh("eff"), kid = fresh("k");
+    auto effv = [&] { return varof(eff); };
+    std::function<LamPtr(size_t)> dispatch = [&](size_t i) -> LamPtr {
+      if (i == frows.size()) {
+        auto rp = mk(Lam::K::Prim); rp->prim = Prim::Ccall; rp->prim_id = "reperform";
+        rp->args = {effv(), varof(kid)};
+        return rp;
+      }
+      auto [pf, rhs] = frows[i];
+      const Pattern* p = effective_pat(pf->eff.get());
+      auto* k = std::get_if<Ppat_construct>(&p->desc);
+      if (!k) return nullptr;
+      LamPtr id = exn_value(lid_last(k->id.txt));
+      if (!id) return nullptr;
+      scope.emplace_back();
+      if (auto* kv = std::get_if<Ppat_var>(&pf->cont->desc))
+        scope.back()[kv->name.txt] = kid;
+      LamPtr then = exn_case_body(eff, k, lid_last(k->id.txt), *rhs);
+      scope.pop_back();
+      if (!then) return nullptr;
+      LamPtr rest = dispatch(i + 1);
+      if (!rest) return nullptr;
+      auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
+      test->args = {k->arg ? fieldimm(0, effv()) : effv(), id};
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = test; iff->then_ = then; iff->else_ = rest;
+      return iff;
+    };
+    LamPtr dis = dispatch(0);
+    if (!dis) return nullptr;
+    auto ffn = mk(Lam::K::Function);
+    ffn->params = {{eff, ValueKind::Gen}, {kid, ValueKind::Gen}};
+    ffn->body = dis;
+    // value continuation: named after the first var/alias value row
+    std::string vn = "param";
+    for (auto& r : vrows) {
+      const Pattern* ep = effective_pat(r.lhs);
+      if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) { vn = pv->name.txt; break; }
+      if (auto* pa = std::get_if<Ppat_alias>(&ep->desc)) { vn = pa->name.txt; break; }
+    }
+    Ident v = fresh(vn);
+    auto vfn = mk(Lam::K::Function);
+    vfn->params = {{v, ValueKind::Gen}};
+    scope.emplace_back();
+    vfn->body = compile_match(varof(v), vrows, mloc);
+    scope.pop_back();
+    // exception continuation: reraise, or the exception arms' dispatch
+    Ident exn = fresh("exn");
+    auto efn = mk(Lam::K::Function);
+    efn->params = {{exn, ValueKind::Gen}};
+    scope.emplace_back();
+    caught_exn_.push_back(exn);
+    if (erows.empty()) {
+      auto rr = mk(Lam::K::Prim); rr->prim = Prim::Reraise; rr->args = {varof(exn)};
+      efn->body = rr;
+    } else {
+      efn->body = exn_dispatch(exn, erows, 0);
+    }
+    caught_exn_.pop_back();
+    scope.pop_back();
+    auto al = mk(Lam::K::Prim); al->prim = Prim::Ccall; al->prim_id = "caml_alloc_stack";
+    al->args = {vfn, efn, ffn};
+    Ident pp = fresh("param");
+    auto th = mk(Lam::K::Function);
+    th->params = {{pp, ValueKind::Gen}};
+    th->body = expr(scrut);
+    auto rs = mk(Lam::K::Prim); rs->prim = Prim::Ccall; rs->prim_id = "runstack";
+    rs->args = {al, th, cint(0)};
+    return rs;
   }
   static bool is_catchall(const Pattern& p) {
     return std::holds_alternative<Ppat_any>(p.desc) || std::holds_alternative<Ppat_var>(p.desc);
@@ -3480,14 +3562,25 @@ struct Translator {
       //   (catch (try (exit N scrut) with exn <dispatch|reraise>)
       //    with (N v) <value-arm match over v>)
       std::vector<Row> vrows, erows;
+      std::vector<std::pair<const Ppat_effect*, const Expression*>> frows;
+      bool eff_guard = false;
       for (auto& c : m->cases) {
         const Expression* g = c.guard ? c.guard->get() : nullptr;
         if (auto* pe = std::get_if<Ppat_exception>(&c.lhs.desc))
           erows.push_back({pe->p.get(), c.rhs.get(), g});
-        else
+        else if (auto* pf = std::get_if<Ppat_effect>(&c.lhs.desc)) {
+          if (g) eff_guard = true;
+          frows.push_back({pf, c.rhs.get()});
+        } else
           vrows.push_back({&c.lhs, c.rhs.get(), g});
       }
-      if (!erows.empty() && !vrows.empty()) {
+      // Effect handlers (`| effect (Foo i), k -> ..`): the whole match becomes
+      //   (runstack (caml_alloc_stack <value fn> <exn fn> <effect fn>)
+      //             (function param <scrut>) 0)
+      if (!frows.empty() && !eff_guard && !vrows.empty())
+        if (LamPtr r = effect_match(*m->e, vrows, erows, frows, e.loc))
+          return r;
+      if (!erows.empty() && !vrows.empty() && frows.empty()) {
         int eid = ++next_exit_;
         auto ex = mk(Lam::K::Staticraise);
         ex->prim_arg = eid; ex->args = {expr(*m->e)};
@@ -3787,6 +3880,10 @@ struct Translator {
           auto& fm = fields_of(*it);  // stdlib module
           if (auto f = fm.find(l->name); f != fm.end())
             return field_of(global_of(*it), f->second);
+          // an opened module's EXTERNAL member in value position -> eta-stub
+          // (externals have no runtime field; e.g. `open Effect; ... perform`)
+          if (StdPrim sp = value_prim(*it, l->name); !sp.name.empty())
+            if (LamPtr s = prim_stub(sp)) return s;
         }
         auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);

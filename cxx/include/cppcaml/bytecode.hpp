@@ -23,7 +23,7 @@ enum class Op {
   RaiseNotrace, CheckSignals, Ccall, Negint, Addint, Subint, Mulint, Divint,
   Modint, Andint, Orint, Xorint, Lslint, Lsrint, Asrint, Eqint, Neqint, Ltint,
   Gtint, Leint, Geint, Physeq, Physneq, Offsetint, Offsetref, Isint, Isout,
-  Perform, Getmethod, Getpubmet, Getdynmet, Stop
+  Perform, Resume, Resumeterm, Reperformterm, Getmethod, Getpubmet, Getdynmet, Stop
 };
 
 struct Instr {
