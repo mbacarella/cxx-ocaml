@@ -2066,13 +2066,14 @@ struct Translator {
     if (r > 0x3FFFFFFF) r -= (1LL << 31);
     return r;
   }
-  LamPtr alloc_dummy(int size) {
-    auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_alloc_dummy";
+  LamPtr alloc_dummy(int size, const char* prim = "caml_alloc_dummy") {
+    auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = prim;
     pr->args = {cint(size)}; return pr;
   }
-  LamPtr update_dummy(const Ident& id, const LamPtr& val) {
+  LamPtr update_dummy(const Ident& id, const LamPtr& val,
+                      const char* prim = "caml_update_dummy") {
     auto v = mk(Lam::K::Var); v->var = id;
-    auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_update_dummy";
+    auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = prim;
     pr->args = {v, val}; return pr;
   }
   struct RecParts {
@@ -2084,7 +2085,11 @@ struct Translator {
   // whether the value is a sized heap block, a function, or a constant; `env`
   // carries the sizes of spine-bound locals so `let x = 1 :: t in x` sizes as
   // the block.  Dyn means no class fits (caller falls back).
-  struct RSize { enum K { Dyn, Unreach, Const, Func, Block } k = Dyn; int n = 0; };
+  struct RSize {
+    enum K { Dyn, Unreach, Const, Func, Block } k = Dyn;
+    int n = 0;
+    enum B { Reg, Flt, Lzy } b = Reg;  // block kind: regular / float record / lazy
+  };
   static RSize rjoin(const RSize& a, const RSize& b) {
     if (a.k == RSize::Unreach) return b;
     if (b.k == RSize::Unreach) return a;
@@ -2126,6 +2131,11 @@ struct Translator {
         if (l->prim == Prim::Raise || l->prim == Prim::Reraise) return {RSize::Unreach, 0};
         if (l->prim == Prim::Makeblock || l->prim == Prim::Makemutable)
           return {RSize::Block, (int)l->args.size()};
+        if (l->prim == Prim::Makelazyblock)  // lazy/forward blocks share the lazy dummy
+          return {RSize::Block, 0, RSize::Lzy};
+        if (l->prim == Prim::IntCmp && l->prim_id.rfind("makearray", 0) == 0)
+          return {RSize::Block, (int)l->args.size(),
+                  l->prim_id.find("[float]") != std::string::npos ? RSize::Flt : RSize::Reg};
         return {};
       default: return {};
     }
@@ -2337,7 +2347,7 @@ struct Translator {
                      const std::vector<LamPtr>& vals, RecParts& out) {
     enum Cls { Func, Lift, Block, Dyn };
     std::vector<Cls> cls(vals.size());
-    std::vector<int> bsize(vals.size(), 0);
+    std::vector<RSize> bsize(vals.size());
     std::set<int> rec_ids;
     for (auto& id : ids) rec_ids.insert(id.stamp);
     bool transform = false;  // any non-(syntactic-function) binding?
@@ -2352,7 +2362,7 @@ struct Translator {
       if (!refs_rec) { cls[i] = Dyn; continue; }
       std::map<int, RSize> env;
       RSize sz = static_size(v, env);
-      if (sz.k == RSize::Block) { cls[i] = Block; bsize[i] = sz.n; continue; }
+      if (sz.k == RSize::Block) { cls[i] = Block; bsize[i] = sz; continue; }
       if (sz.k == RSize::Func) {
         std::map<int, Ident> locals; LamPtr lf; int bs = 0;
         LamPtr probe = v;
@@ -2369,10 +2379,36 @@ struct Translator {
       LamPtr v = vals[i];
       switch (cls[i]) {
         case Func: out.funcs.push_back({ids[i], kinds[i], v}); break;
-        case Dyn: dyns.push_back({ids[i], kinds[i], collapse_let_id(v)}); break;
+        case Dyn:  // upstream binds dynamics with Pgenval, not the inferred kind
+          dyns.push_back({ids[i], ValueKind::Gen, collapse_let_id(v)});
+          break;
         case Block:
-          out.dummies.push_back({ids[i], ValueKind::Gen, alloc_dummy(bsize[i])});
-          out.updates.push_back(update_dummy(ids[i], collapse_let_id(v)));
+          if (bsize[i].b == RSize::Lzy) {
+            // value_rec_compiler's Lazy_block: alloc takes unit, and a value
+            // that isn't syntactically a lazy block is wrapped in
+            // CamlinternalLazy.indirect so backpatching can't race a force.
+            bool direct = v->k == Lam::K::Prim && v->prim == Prim::Makelazyblock;
+            LamPtr nv = collapse_let_id(v);
+            if (!direct) {
+              auto& cil = fields_of("CamlinternalLazy");
+              auto ind = cil.find("indirect");
+              if (ind == cil.end()) return false;
+              auto ap = mk(Lam::K::Apply);
+              ap->fn = field_of("CamlinternalLazy", ind->second);
+              ap->args = {nv};
+              nv = ap;
+            }
+            out.dummies.push_back({ids[i], ValueKind::Gen,
+                                   alloc_dummy(0, "caml_alloc_dummy_lazy")});
+            out.updates.push_back(update_dummy(ids[i], nv, "caml_update_dummy_lazy"));
+          } else if (bsize[i].b == RSize::Flt) {
+            out.dummies.push_back({ids[i], ValueKind::Gen,
+                                   alloc_dummy(bsize[i].n, "caml_alloc_dummy_float")});
+            out.updates.push_back(update_dummy(ids[i], collapse_let_id(v)));
+          } else {
+            out.dummies.push_back({ids[i], ValueKind::Gen, alloc_dummy(bsize[i].n)});
+            out.updates.push_back(update_dummy(ids[i], collapse_let_id(v)));
+          }
           break;
         case Lift: {
           Ident ctx = fresh("letrec_function_context");
@@ -4919,6 +4955,17 @@ struct Translator {
             m->blk_shape = rt->shape; m->args = std::move(vals);
             return m;
           }
+        }
+        // The predefined `'a ref` record: `{contents = e}` == `ref e`
+        // (no user/stdlib type matched the label set above).
+        if (!rt && rc->fields.size() == 1 &&
+            lid_last(rc->fields[0].first.txt) == "contents") {
+          auto* ve = rc->fields[0].second.get();
+          auto m = mk(Lam::K::Prim);
+          m->prim = Prim::Makemutable; m->prim_arg = 0;
+          m->blk_shape = {expr_kind(ve)};
+          m->args = {expr(*ve)};
+          return m;
         }
       }
     }
