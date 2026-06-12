@@ -887,19 +887,23 @@ struct Translator {
               if (all_const && !gadt) immediate_local_.insert(d.name.txt);
             }
           }
-        if (auto* pm = std::get_if<Pstr_module>(&item.desc)) {
-          const ModuleExpr* me = &pm->binding.expr;  // peel `M : S = struct..end`
-          while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
-          if (auto* ps = std::get_if<Pmod_structure>(&me->desc)) nested(ps->items);
-        }
+        if (auto* pm = std::get_if<Pstr_module>(&item.desc))
+          if (auto* ps = peel_to_structure(pm->binding.expr)) nested(ps->items);
       }
     };
     for (auto& item : s)
-      if (auto* pm = std::get_if<Pstr_module>(&item.desc)) {
-        const ModuleExpr* me = &pm->binding.expr;
-        while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
-        if (auto* ps = std::get_if<Pmod_structure>(&me->desc)) nested(ps->items);
-      }
+      if (auto* pm = std::get_if<Pstr_module>(&item.desc))
+        if (auto* ps = peel_to_structure(pm->binding.expr)) nested(ps->items);
+  }
+  // The structure under `M : S = struct..end` / a functor `F (X) = struct..end`
+  // (a functor body's type decls register fill-absent like a submodule's).
+  static const Pmod_structure* peel_to_structure(const ModuleExpr& me0) {
+    const ModuleExpr* me = &me0;
+    for (;;) {
+      if (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) { me = pc->me.get(); continue; }
+      if (auto* pf = std::get_if<Pmod_functor>(&me->desc)) { me = pf->body.get(); continue; }
+      return std::get_if<Pmod_structure>(&me->desc);
+    }
   }
   const FieldInfo* find_field(const std::string& label) {
     if (ambiguous_fields_.count(label)) return nullptr;
@@ -1002,24 +1006,90 @@ struct Translator {
     std::vector<std::string> target;
     if (auto it = modtype_layout_.find(last); it != modtype_layout_.end())
       target = it->second;
-    auto src = module_result_layout(me);
-    bool subset = !target.empty() && !src.empty() && target != src;
-    for (auto& nm : target)  // only project when every target field is known
-      if (subset && std::find(src.begin(), src.end(), nm) == src.end()) subset = false;
-    if (!subset) return mv;
+    if (LamPtr c = coerce_block(mv, module_result_layout(me), target)) return c;
+    return mv;
+  }
+  // The Pmty_signature under a module type, resolving named module types
+  // through modtype_ast_; null when unknown.
+  const Pmty_signature* sig_items_of(const ModuleType& mt0) {
+    const ModuleType* m = &mt0;
+    for (int g = 0; g < 8; ++g) {
+      if (auto* ps = std::get_if<Pmty_signature>(&m->desc)) return ps;
+      auto* pi = std::get_if<Pmty_ident>(&m->desc);
+      if (!pi) return nullptr;
+      const ModuleType* res = nullptr;
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
+        if (auto a = modtype_ast_.find(l->name); a != modtype_ast_.end()) res = a->second;
+      if (!res) return nullptr;
+      m = res;
+    }
+    return nullptr;
+  }
+  // A signature's named module member's type; null if not a module member.
+  static const ModuleType* sig_member_modtype(const Pmty_signature& sig,
+                                              const std::string& nm) {
+    for (auto& it : sig.items)
+      if (auto* m = std::get_if<Psig_module>(&it.desc))
+        if (m->md.name.txt && *m->md.name.txt == nm) return &*m->md.type;
+    return nullptr;
+  }
+  // A source module expression's named module member: its expression when the
+  // source is a structure (for nested coercion), else null.
+  static const ModuleExpr* src_member_expr(const ModuleExpr& me0, const std::string& nm) {
+    const ModuleExpr* m = &me0;
+    while (auto* pc = std::get_if<Pmod_constraint>(&m->desc)) m = pc->me.get();
+    if (auto* ps = std::get_if<Pmod_structure>(&m->desc))
+      for (auto& it : ps->items)
+        if (auto* pm = std::get_if<Pstr_module>(&it.desc))
+          if (pm->binding.name.txt && *pm->binding.name.txt == nm)
+            return &pm->binding.expr;
+    return nullptr;
+  }
+  // The field layout of a source module expression's named module member.
+  std::vector<std::string> src_member_layout(const ModuleExpr& me0, const std::string& nm) {
+    if (const ModuleExpr* sub = src_member_expr(me0, nm))
+      return module_result_layout(*sub);
+    const ModuleExpr* m = &me0;
+    while (auto* pc = std::get_if<Pmod_constraint>(&m->desc)) m = pc->me.get();
+    if (auto* pi = std::get_if<Pmod_ident>(&m->desc)) {
+      std::string dotted;
+      if (lid_to_dotted(pi->id.txt, dotted)) return layout_vec(dotted + "." + nm);
+    }
+    return {};
+  }
+  // Project a module value from a `src` field layout to a narrower/reordered
+  // `target` one: `(let (let/N = mv) (makeblock 0 (field_mut i let/N) ..))`.
+  // Null when no projection is needed (or possible): equal layouts, either
+  // side unknown, or a target field missing from the source.  With `src_me`
+  // and `tsig` supplied, module members narrowed by the signature project
+  // recursively.
+  LamPtr coerce_block(const LamPtr& mv, const std::vector<std::string>& src,
+                      const std::vector<std::string>& target,
+                      const ModuleExpr* src_me = nullptr,
+                      const Pmty_signature* tsig = nullptr) {
+    if (target.empty() || src.empty() || target == src) return nullptr;
+    for (auto& nm : target)
+      if (std::find(src.begin(), src.end(), nm) == src.end()) return nullptr;
     Ident id = fresh("let");
     auto v = mk(Lam::K::Var); v->var = id;
     std::vector<LamPtr> fs;
     for (auto& nm : target) {
       int idx = 0;
       for (int i = 0; i < (int)src.size(); ++i) if (src[i] == nm) { idx = i; break; }
-      auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
+      LamPtr fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
       fr->prim_arg = idx; fr->args = {v};
+      if (src_me && tsig)
+        if (const ModuleType* smt = sig_member_modtype(*tsig, nm)) {
+          const ModuleExpr* sme = src_member_expr(*src_me, nm);
+          if (LamPtr c2 = coerce_block(fr, src_member_layout(*src_me, nm),
+                                       sig_layout(*smt), sme, sig_items_of(*smt)))
+            fr = c2;
+        }
       fs.push_back(fr);
     }
     auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
     blk->args = std::move(fs);
-    auto lt = mk(Lam::K::Let); lt->bindings = {{id, ValueKind::Gen, std::move(mv)}};
+    auto lt = mk(Lam::K::Let); lt->bindings = {{id, ValueKind::Gen, mv}};
     lt->body = blk;
     return lt;
   }
@@ -6173,15 +6243,17 @@ struct Translator {
       LamPtr clsval;
       if (auto* l = std::get_if<Lident>(&nw->id.txt.v)) {
         if (auto* b = lookup(l->name)) clsval = varof(*b);
-      } else if (auto* d = std::get_if<Ldot>(&nw->id.txt.v)) {
-        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
-          if (LamPtr base = module_base(pl->name)) {
-            auto& lay = module_layout_[pl->name];
-            if (auto f = lay.find(d->name); f != lay.end()) {
-              auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
-              fi->prim_arg = f->second; fi->args = {base}; clsval = fi;
+        if (!clsval)  // an include/open'd module's class (include E; new c)
+          for (auto it = opened_.rbegin(); !clsval && it != opened_.rend(); ++it)
+            if (LamPtr base = module_base(*it)) {
+              auto& lay = module_layout_[*it];
+              if (auto f = lay.find(l->name); f != lay.end())
+                clsval = fieldimm(f->second, base);
             }
-          }
+      } else if (std::get_if<Ldot>(&nw->id.txt.v)) {
+        std::string dotted;  // a class at a (possibly deep) local module path
+        if (lid_to_dotted(nw->id.txt, dotted))
+          if (auto mp = resolve_module_path(dotted); mp.base) clsval = mp.base;
       }
       if (clsval) {
         auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut; fm->prim_arg = 0;
@@ -7123,7 +7195,12 @@ struct Translator {
         if (auto* v = std::get_if<Psig_value>(&it.desc)) out.push_back(v->vd.name.txt);
         else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
           if (m->md.name.txt) out.push_back(*m->md.name.txt);
-        }
+        } else if (auto* ex = std::get_if<Psig_exception>(&it.desc))
+          out.push_back(ex->exn.ctor.name.txt);  // exceptions occupy slots
+        else if (auto* tx = std::get_if<Psig_typext>(&it.desc))
+          for (auto& c : tx->ext.ctors) out.push_back(c.name.txt);
+        else if (auto* cl = std::get_if<Psig_class>(&it.desc))
+          for (auto& d : cl->decls) out.push_back(d.name.txt);
       }
     return out;
   }
@@ -7249,7 +7326,15 @@ struct Translator {
       }
       return fn;
     }
-    if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) return compile_module_expr(*pc->me);
+    if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
+      // (M : S) over a narrower/reordered signature projects to S's layout
+      // (include (A : sig val f .. val x .. end) must not read raw slots)
+      LamPtr inner = compile_module_expr(*pc->me);
+      if (LamPtr c = coerce_block(inner, module_result_layout(*pc->me), sig_layout(*pc->mt),
+                                  pc->me.get(), sig_items_of(*pc->mt)))
+        return c;
+      return inner;
+    }
     if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {  // a module in value position
       {  // a (possibly deep) path through local modules: chain of field reads
         std::string dotted;
@@ -7306,6 +7391,12 @@ struct Translator {
           if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) add(pv->name.txt);
       } else if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {
         if (pm->binding.name.txt) add(*pm->binding.name.txt);
+      } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
+        add(ex->exn.ctor.name.txt);  // exceptions occupy slots
+      } else if (auto* tx = std::get_if<Pstr_typext>(&it.desc)) {
+        for (auto& c : tx->ext.ctors) add(c.name.txt);
+      } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
+        for (auto& d : cl->decls) add(d.name.txt);
       }
     }
     return out;
@@ -7462,7 +7553,7 @@ struct Translator {
           }
           continue;
         }
-        auto str = mk(Lam::K::ConstString); str->str_val = mod_path_ + "." + nm;
+        auto str = mk(Lam::K::ConstString); str->str_val = mod_path_.empty() ? nm : mod_path_ + "." + nm;
         auto oid = mk(Lam::K::Prim); oid->prim = Prim::Ccall;
         oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
         auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
@@ -7488,7 +7579,7 @@ struct Translator {
               }
             continue;
           }
-          auto str = mk(Lam::K::ConstString); str->str_val = mod_path_ + "." + nm;
+          auto str = mk(Lam::K::ConstString); str->str_val = mod_path_.empty() ? nm : mod_path_ + "." + nm;
           auto oid = mk(Lam::K::Prim); oid->prim = Prim::Ccall;
           oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
           auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
@@ -7843,9 +7934,18 @@ struct Translator {
         // Splice ME's exported value fields into this structure.  A pure path
         // (an already-evaluated module) needs no binding; a computation (e.g. a
         // functor application) is bound to `include/N` first for its effect.
+        // an anonymous included struct's exceptions have a bare path
+        // (Printexc prints "XXX", not "Unit.XXX")
+        std::string sv_path = mod_path_;
+        if (std::get_if<Pmod_ident>(&pin->expr.desc) == nullptr) mod_path_.clear();
         LamPtr mv = compile_module_expr(pin->expr);
+        mod_path_ = sv_path;
+        const Pmty_signature* tsig = nullptr;  // a constrained include's sig items
+        if (auto* pcst = std::get_if<Pmod_constraint>(&pin->expr.desc))
+          tsig = sig_items_of(*pcst->mt);
         LamPtr base = mv;
-        if (!is_pure_path(mv)) {
+        bool bound = !is_pure_path(mv);
+        if (bound) {
           Ident iid = fresh("include");
           cur.push_back({iid, ValueKind::Gen, mv});
           auto v = mk(Lam::K::Var); v->var = iid; base = v;
@@ -7853,8 +7953,32 @@ struct Translator {
         auto rl = module_result_layout(pin->expr);
         if (rl.empty()) rl = arg_layout(pin->expr);  // a module path: its own fields
         for (int i = 0; i < (int)rl.size(); ++i) {
-          auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm; fi->prim_arg = i; fi->args = {base};
-          add_export_val(rl[i], fi);
+          if (bound) {
+            // a computed include (e.g. a coerced one) has no module name for
+            // bare resolution: rebind each field like ocamlc (`f =a field_mut`)
+            Ident id = fresh(rl[i]);
+            auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
+            fr->prim_arg = i; fr->args = {base};
+            cur.push_back({id, ValueKind::Gen, fr, true});
+            scope.back()[rl[i]] = id;
+            add_export(rl[i], id);
+            if (tsig) {  // module / exception members register as such
+              if (const ModuleType* smt = sig_member_modtype(*tsig, rl[i])) {
+                module_ident_[rl[i]] = id;
+                module_alias_.erase(rl[i]);
+                register_sig_layouts(rl[i], *smt);
+              } else {
+                for (auto& sit : tsig->items)
+                  if (auto* ex = std::get_if<Psig_exception>(&sit.desc);
+                      ex && ex->exn.ctor.name.txt == rl[i])
+                    exn_ident_[rl[i]] = id;
+              }
+            }
+          } else {
+            auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+            fi->prim_arg = i; fi->args = {base};
+            add_export_val(rl[i], fi);
+          }
         }
         // an included module path also brings its names into BARE scope for the
         // rest of the structure (like open): `include Stack ... iter f s`
