@@ -1277,11 +1277,16 @@ struct Checker {
         else if (c != '+' && c != '-' && c != '#' && c != ' ' && c != '.' && !isdig(c)) break;
       }
       if (i >= n) break;
-      char len = 0;
-      if (s[i] == 'l' || s[i] == 'n' || s[i] == 'L') { len = s[i]; if (++i >= n) break; }
+      char len = 0;  // l/n/L is a length modifier only before an int conversion;
+                     // bare (or N) it is the deprecated counter directive %u
+      if ((s[i] == 'l' || s[i] == 'n' || s[i] == 'L') && i + 1 < n &&
+          std::string_view("dixXou").find(s[i + 1]) != std::string_view::npos) {
+        len = s[i]; ++i;
+      }
       char c = s[i]; ++i;
       switch (c) {
         case 'd': case 'i': case 'x': case 'X': case 'o': case 'u':
+        case 'l': case 'n': case 'L': case 'N':  // Scan_get_counter: one int arg
           add(eng.constr(len == 'l' ? "int32" : len == 'n' ? "nativeint"
                          : len == 'L' ? "int64" : "int")); break;
         case 's': case 'S': add(eng.constr("string")); break;

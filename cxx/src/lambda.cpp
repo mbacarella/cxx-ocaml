@@ -2324,6 +2324,11 @@ struct Translator {
                  : conv == 'G' ? 4 : conv == 'F' ? 5 : conv == 'h' ? 6 : 7;
         return cblock(8, {cblock(0, {cint(flag), cint(kind)}), pad, prec, r});
       }
+      // a bare l/n/L (no int conversion follows -- the modifier branch above
+      // didn't consume it) or N is the deprecated %u-style counter directive:
+      // Scan_get_counter(Line=0 / Char=1 / Token=2)
+      case 'l': case 'n': case 'L': case 'N':
+        return cblock(21, {cint(conv == 'l' ? 0 : conv == 'n' ? 1 : 2), r});
       default: return nullptr;  // %r %{ %( %[ etc: fall back to plain string
     }
   }
