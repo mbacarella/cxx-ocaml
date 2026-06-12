@@ -549,8 +549,8 @@ struct Translator {
   // innermost caught exception is a `reraise`.
   std::vector<Ident> caught_exn_;
   // User C externals: value name -> C primitive name (the `external f = "cname"`
-  // string).  Applying one emits (cname args); %-builtins are left for later.
-  std::unordered_map<std::string, std::string> externals_;
+  // string) + declared arity.  Applying one emits (cname args).
+  std::unordered_map<std::string, StdPrim> externals_;
   // Locally-declared %-builtins (`external f : t -> u = "%bswap16"`): name ->
   // (primitive, arity), routed through prim_to_lam at application sites.
   std::unordered_map<std::string, std::pair<std::string, int>> local_prims_;
@@ -1939,8 +1939,42 @@ struct Translator {
   // fallback lowering: the stub carries no operand types, so polymorphic compare
   // takes its `caml_*` form and field reads take the pointer (`field_mut`) form.
   // Null for prims we don't lower this way.
+  // The printlambda spelling of a string/bytes/bigstring 16/32/64-bit
+  // accessor %-builtin; null for other primitives.  Safe and unsafe variants
+  // lower to the same checked C entry points in bytecode.
+  static const std::string* mem_access_spelling(const std::string& prim) {
+    static const std::unordered_map<std::string, std::string> mem = {
+      {"%caml_string_get16", "string.get16"}, {"%caml_string_get16u", "string.unsafe_get16"},
+      {"%caml_string_get32", "string.get32"}, {"%caml_string_get32u", "string.unsafe_get32"},
+      {"%caml_string_get64", "string.get64"}, {"%caml_string_get64u", "string.unsafe_get64"},
+      {"%caml_bytes_get16", "bytes.get16"}, {"%caml_bytes_get16u", "bytes.unsafe_get16"},
+      {"%caml_bytes_get32", "bytes.get32"}, {"%caml_bytes_get32u", "bytes.unsafe_get32"},
+      {"%caml_bytes_get64", "bytes.get64"}, {"%caml_bytes_get64u", "bytes.unsafe_get64"},
+      {"%caml_bytes_set16", "bytes.set16"}, {"%caml_bytes_set16u", "bytes.unsafe_set16"},
+      {"%caml_bytes_set32", "bytes.set32"}, {"%caml_bytes_set32u", "bytes.unsafe_set32"},
+      {"%caml_bytes_set64", "bytes.set64"}, {"%caml_bytes_set64u", "bytes.unsafe_set64"},
+      {"%caml_bigstring_get16", "bigarray.array1.get16"},
+      {"%caml_bigstring_get16u", "bigarray.array1.unsafe_get16"},
+      {"%caml_bigstring_get32", "bigarray.array1.get32"},
+      {"%caml_bigstring_get32u", "bigarray.array1.unsafe_get32"},
+      {"%caml_bigstring_get64", "bigarray.array1.get64"},
+      {"%caml_bigstring_get64u", "bigarray.array1.unsafe_get64"},
+      {"%caml_bigstring_set16", "bigarray.array1.set16"},
+      {"%caml_bigstring_set16u", "bigarray.array1.unsafe_set16"},
+      {"%caml_bigstring_set32", "bigarray.array1.set32"},
+      {"%caml_bigstring_set32u", "bigarray.array1.unsafe_set32"},
+      {"%caml_bigstring_set64", "bigarray.array1.set64"},
+      {"%caml_bigstring_set64u", "bigarray.array1.unsafe_set64"},
+    };
+    auto m = mem.find(prim);
+    return m == mem.end() ? nullptr : &m->second;
+  }
   LamPtr prim_stub_body(const std::string& prim, const std::vector<LamPtr>& argv) {
     int n = (int)argv.size();
+    if (const std::string* sp = mem_access_spelling(prim)) {
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp;
+      pr->prim_id = *sp; pr->args = argv; return pr;
+    }
     auto ic = [&](const std::string& sp) {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = sp;
       pr->args = argv; return pr; };
@@ -2163,6 +2197,22 @@ struct Translator {
       if (prim.rfind("%caml_ba_dim_", 0) == 0)
         return op("Bigarray.dim_" + prim.substr(sizeof("%caml_ba_dim_") - 1));
     }
+    // String/bytes/bigstring 16/32/64-bit accessors (printlambda's spelling);
+    // bytecode calls the same checked C entry points for safe and unsafe.
+    if ((int)as.size() == arity)
+      if (const std::string* sp = mem_access_spelling(prim)) return op(*sp);
+    // Array access builtins as locally-declared externals: the same spelling
+    // and lowering as Array.get/set (element kind from the application).
+    if (prim == "%array_safe_get" && as.size() == 2)
+      return op("array.get[" + array_elem_kind(&e) + "]");
+    if (prim == "%array_unsafe_get" && as.size() == 2)
+      return op("array.unsafe_get[" + array_elem_kind(&e) + "]");
+    if (prim == "%array_safe_set" && as.size() == 3)
+      return op("array.set[" + array_elem_kind(as[2].second.get()) + "]");
+    if (prim == "%array_unsafe_set" && as.size() == 3)
+      return op("array.unsafe_set[" + array_elem_kind(as[2].second.get()) + "]");
+    if (prim == "%array_length" && as.size() == 1)
+      return op("array.length[" + array_arg_kind(as[0].second.get()) + "]");
     // Byte-swap builtins: %bswap16 prints bare, the boxed ones module-qualified.
     if ((int)as.size() == arity && arity == 1) {
       static const std::unordered_map<std::string, std::string> bsw = {
@@ -5607,6 +5657,12 @@ struct Translator {
           auto fc = mk(Lam::K::Prim); fc->prim = Prim::FieldComputed; fc->args = {self, idv};
           return fc;
         }
+        // a locally-declared external / %-builtin in value position eta-stubs
+        // (`assert_bound_check2 caml_bytes_get_16 s ..` passes the prim itself)
+        if (auto ex = externals_.find(l->name); ex != externals_.end())
+          if (LamPtr s = prim_stub(ex->second)) return s;
+        if (auto lp = local_prims_.find(l->name); lp != local_prims_.end())
+          if (LamPtr s = prim_stub({lp->second.first, lp->second.second})) return s;
         // an `open M` brings M's exported values into scope (innermost first);
         // they SHADOW the pervasives (open Random; float = Random.float).
         for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
@@ -5782,7 +5838,8 @@ struct Translator {
             const auto& n = l->name;
             auto& as = ap->args;
             if (auto ex = externals_.find(n); ex != externals_.end()) {  // C external
-              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = ex->second;
+              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall;
+              pr->prim_id = ex->second.name;
               for (auto& a : as) pr->args.push_back(expr(*a.second));
               return pr;
             }
@@ -7521,14 +7578,15 @@ struct Translator {
       }
       if (auto* pp = std::get_if<Pstr_primitive>(&it.desc)) {  // external f = "cname"
         auto& pd = pp->prim;
-        if (!pd.prims.empty() && pd.prims[0][0] != '%') {  // C call
-          externals_[pd.name.txt] = pd.prims[0];
-        } else if (!pd.prims.empty() && pd.type) {
-          // a locally-declared %-builtin: arity from the declared arrow type
-          int ar = 0;
+        int ar = 0;  // arity from the declared arrow type
+        if (pd.type) {
           const CoreType* t = pd.type.get();
           while (auto* a = std::get_if<Ptyp_arrow>(&t->desc)) { ++ar; t = a->cod.get(); }
-          local_prims_[pd.name.txt] = {pd.prims[0], ar};
+        }
+        if (!pd.prims.empty() && pd.prims[0][0] != '%') {  // C call
+          externals_[pd.name.txt] = {pd.prims[0], ar};
+        } else if (!pd.prims.empty() && pd.type) {
+          local_prims_[pd.name.txt] = {pd.prims[0], ar};  // a %-builtin
         }
         continue;
       }

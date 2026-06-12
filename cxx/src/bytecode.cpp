@@ -329,6 +329,29 @@ struct Bytegen {
       {"string.length", "caml_ml_string_length"}, {"string.get", "caml_string_get"},
       {"bytes.length", "caml_ml_bytes_length"}, {"bytes.get", "caml_bytes_get"},
       {"bytes.set", "caml_bytes_set"}, {"bswap16", "caml_bswap16"},
+      // 16/32/64-bit accessors: safe and unsafe call the same C entry
+      // (bytegen.ml's Pstring_load/Pbytes_load/Pbytes_set/Pbigstring_*)
+      {"string.get16", "caml_string_get16"}, {"string.unsafe_get16", "caml_string_get16"},
+      {"string.get32", "caml_string_get32"}, {"string.unsafe_get32", "caml_string_get32"},
+      {"string.get64", "caml_string_get64"}, {"string.unsafe_get64", "caml_string_get64"},
+      {"bytes.get16", "caml_bytes_get16"}, {"bytes.unsafe_get16", "caml_bytes_get16"},
+      {"bytes.get32", "caml_bytes_get32"}, {"bytes.unsafe_get32", "caml_bytes_get32"},
+      {"bytes.get64", "caml_bytes_get64"}, {"bytes.unsafe_get64", "caml_bytes_get64"},
+      {"bytes.set16", "caml_bytes_set16"}, {"bytes.unsafe_set16", "caml_bytes_set16"},
+      {"bytes.set32", "caml_bytes_set32"}, {"bytes.unsafe_set32", "caml_bytes_set32"},
+      {"bytes.set64", "caml_bytes_set64"}, {"bytes.unsafe_set64", "caml_bytes_set64"},
+      {"bigarray.array1.get16", "caml_ba_uint8_get16"},
+      {"bigarray.array1.unsafe_get16", "caml_ba_uint8_get16"},
+      {"bigarray.array1.get32", "caml_ba_uint8_get32"},
+      {"bigarray.array1.unsafe_get32", "caml_ba_uint8_get32"},
+      {"bigarray.array1.get64", "caml_ba_uint8_get64"},
+      {"bigarray.array1.unsafe_get64", "caml_ba_uint8_get64"},
+      {"bigarray.array1.set16", "caml_ba_uint8_set16"},
+      {"bigarray.array1.unsafe_set16", "caml_ba_uint8_set16"},
+      {"bigarray.array1.set32", "caml_ba_uint8_set32"},
+      {"bigarray.array1.unsafe_set32", "caml_ba_uint8_set32"},
+      {"bigarray.array1.set64", "caml_ba_uint8_set64"},
+      {"bigarray.array1.unsafe_set64", "caml_ba_uint8_set64"},
     };
     if (auto it = ccall.find(s); it != ccall.end()) return cc(it->second, n);
     // Bigarray accessors compile to the generic C entry points whatever the
