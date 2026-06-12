@@ -3259,6 +3259,12 @@ struct Translator {
           return c;
         }
         --next_exit_;  // inner not buildable: undo id, fall through to best-effort
+      } else if (guarded_nonvar) {
+        // no explicit catch-all: a guard failure falls to Match_failure (inlined
+        // when single-use; ocamlc shares multi-use defaults behind a catch)
+        if (LamPtr body = ctor_match(scrut, rows, mloc,
+                                     raise_predef("Match_failure", mloc)))
+          return body;
       }
     }
     if (rows.size() == 2 && !rows[0].guard && !rows[1].guard) {
