@@ -322,7 +322,7 @@ struct Bytegen {
       {"string.length", "caml_ml_string_length"}, {"string.get", "caml_string_get"},
       {"string.unsafe_get", "caml_string_unsafe_get"},
       {"bytes.length", "caml_ml_bytes_length"}, {"bytes.get", "caml_bytes_get"},
-      {"bytes.set", "caml_bytes_set"},
+      {"bytes.set", "caml_bytes_set"}, {"bswap16", "caml_bswap16"},
     };
     if (auto it = ccall.find(s); it != ccall.end()) return cc(it->second, n);
     // boxed-int comparisons arrive as IntCmp with a module-qualified prim_id

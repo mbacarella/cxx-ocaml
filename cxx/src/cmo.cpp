@@ -81,7 +81,41 @@ double float_of_lit(const std::string& s0) {
 
 ValPtr const_value(const LamPtr& c) {
   switch (c->k) {
-    case Lam::K::ConstInt: return vint(c->int_val);
+    case Lam::K::ConstInt: {
+      // A suffixed literal (42l / 42L / 42n) is a BOXED int: a Marshal custom
+      // block ("_i" int32 / "_j" int64 fixed; "_n" nativeint length-prefixed
+      // with a 1/2 width tag), exactly extern.c's encoding.  A plain immediate
+      // here would make the runtime deref a non-block (segfault).
+      if (!c->str_val.empty()) {
+        std::string raw;
+        auto be32 = [&](std::uint32_t n) {
+          for (int i = 3; i >= 0; --i) raw.push_back((char)((n >> (8 * i)) & 0xff));
+        };
+        auto be64 = [&](std::uint64_t n) {
+          for (int i = 7; i >= 0; --i) raw.push_back((char)((n >> (8 * i)) & 0xff));
+        };
+        int bsize = 8;
+        char sfx = c->str_val[0];
+        if (sfx == 'l') {
+          raw.push_back((char)0x19);  // CODE_CUSTOM_FIXED
+          raw += "_i"; raw.push_back('\0');
+          be32((std::uint32_t)c->int_val); bsize = 4;
+        } else if (sfx == 'L') {
+          raw.push_back((char)0x19);
+          raw += "_j"; raw.push_back('\0');
+          be64((std::uint64_t)c->int_val);
+        } else {  // 'n'
+          raw.push_back((char)0x18);  // CODE_CUSTOM_LEN
+          raw += "_n"; raw.push_back('\0');
+          be32(4); be64(8);  // sz_32 / sz_64 headers
+          long long v = c->int_val;
+          if (v >= INT32_MIN && v <= INT32_MAX) { raw.push_back(1); be32((std::uint32_t)v); }
+          else { raw.push_back(2); be64((std::uint64_t)v); }
+        }
+        return omarshal::vcustom(raw, 1 + (bsize + 7) / 8);
+      }
+      return vint(c->int_val);
+    }
     case Lam::K::ConstChar: return vint(c->int_val);
     case Lam::K::ConstString: return vstr(c->str_val);
     case Lam::K::ConstFloat: return omarshal::vdbl(float_of_lit(c->str_val));

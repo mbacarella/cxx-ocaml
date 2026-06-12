@@ -1,4 +1,5 @@
 #include "cppcaml/lambda.hpp"
+#include <cstdint>
 #include <cstdio>
 
 #include <algorithm>
@@ -438,7 +439,11 @@ long long parse_ocaml_int(const std::string& s) {
 LamPtr translate_const(const Constant& c) {
   if (auto* i = std::get_if<Pconst_integer>(&c.desc)) {
     auto l = mk(Lam::K::ConstInt); l->int_val = parse_ocaml_int(i->value);
-    if (i->suffix) l->str_val = std::string(1, *i->suffix);  // 42L / 42l / 42n
+    if (i->suffix) {
+      l->str_val = std::string(1, *i->suffix);  // 42L / 42l / 42n
+      // an int32 literal wraps to 32-bit two's complement (0xf0f0f0f0l < 0)
+      if (*i->suffix == 'l') l->int_val = (long long)(std::int32_t)l->int_val;
+    }
     return l;
   }
   if (auto* ch = std::get_if<Pconst_char>(&c.desc)) {  // prints as 'x', value is its byte
@@ -527,6 +532,9 @@ struct Translator {
   // User C externals: value name -> C primitive name (the `external f = "cname"`
   // string).  Applying one emits (cname args); %-builtins are left for later.
   std::unordered_map<std::string, std::string> externals_;
+  // Locally-declared %-builtins (`external f : t -> u = "%bswap16"`): name ->
+  // (primitive, arity), routed through prim_to_lam at application sites.
+  std::unordered_map<std::string, std::pair<std::string, int>> local_prims_;
   // Locally-declared exceptions: name -> its binder (the makeblock-248 value).
   std::unordered_map<std::string, Ident> exn_ident_;
   // Declared argument count of an exception constructor (`exception E of int *
@@ -1553,6 +1561,18 @@ struct Translator {
           pr->args = args();
           return pr;
         }
+    }
+    // Byte-swap builtins: %bswap16 prints bare, the boxed ones module-qualified.
+    if ((int)as.size() == arity && arity == 1) {
+      static const std::unordered_map<std::string, std::string> bsw = {
+          {"%bswap16", "bswap16"}, {"%bswap_int32", "Int32.bswap"},
+          {"%bswap_int64", "Int64.bswap"}, {"%bswap_native", "Nativeint.bswap"}};
+      if (auto b = bsw.find(prim); b != bsw.end()) {
+        auto pr = mk(Lam::K::Prim);
+        pr->prim = prim == "%bswap16" ? Prim::IntCmp : Prim::Ccall;
+        pr->prim_id = b->second; pr->args = args();
+        return pr;
+      }
     }
     // A C-external (non-`%`) primitive applied at its full arity -> a C call.
     if (!prim.empty() && prim[0] != '%' && (int)as.size() == arity) {
@@ -3865,6 +3885,9 @@ struct Translator {
               for (auto& a : as) pr->args.push_back(expr(*a.second));
               return pr;
             }
+            if (auto lp = local_prims_.find(n); lp != local_prims_.end())
+              if (auto r = prim_to_lam(lp->second.first, lp->second.second, *ap, e))
+                return r;
             if (n == "raise" && as.size() == 1) {
               LamPtr arg = expr(*as[0].second);
               // raising the innermost caught exception re-raises (keeps backtrace).
@@ -5381,8 +5404,15 @@ struct Translator {
       }
       if (auto* pp = std::get_if<Pstr_primitive>(&it.desc)) {  // external f = "cname"
         auto& pd = pp->prim;
-        if (!pd.prims.empty() && pd.prims[0][0] != '%')  // C call (not a %-builtin)
+        if (!pd.prims.empty() && pd.prims[0][0] != '%') {  // C call
           externals_[pd.name.txt] = pd.prims[0];
+        } else if (!pd.prims.empty() && pd.type) {
+          // a locally-declared %-builtin: arity from the declared arrow type
+          int ar = 0;
+          const CoreType* t = pd.type.get();
+          while (auto* a = std::get_if<Ptyp_arrow>(&t->desc)) { ++ar; t = a->cod.get(); }
+          local_prims_[pd.name.txt] = {pd.prims[0], ar};
+        }
         continue;
       }
       if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {  // exception E [of ...]
