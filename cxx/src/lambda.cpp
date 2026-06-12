@@ -5257,6 +5257,67 @@ struct Translator {
           }
           if (any_lab) fn_sig_[id.stamp] = csig;
           bool is_virt = d.virt == VirtualFlag::Virtual;
+          if (params.empty() && lets.empty()) {
+            // `class a = b`: a pure alias -- no binding, the export IS b.
+            if (auto* pcn = std::get_if<Pcl_constr>(&ce->desc)) {
+              if (auto* pl = std::get_if<Lident>(&pcn->id.txt.v))
+                if (const Ident* pid = lookup(pl->name); pid && class_ids_.count(pid->stamp)) {
+                  scope.back()[d.name.txt] = *pid;
+                  if (auto mit = class_meta_.find(pl->name); mit != class_meta_.end())
+                    class_meta_[d.name.txt] = mit->second;
+                  if (auto sit = fn_sig_.find(pid->stamp); sit != fn_sig_.end())
+                    fn_sig_[id.stamp] = sit->second;
+                  add_export(d.name.txt, *pid);
+                  continue;
+                }
+            }
+            // `class c = parent args`: rebind the parent's obj_init/env_init
+            // through `new_init = (function obj_init self (apply obj_init self
+            // args))` in a fresh 3-tuple (translclass's class application).
+            if (auto* apc = std::get_if<Pcl_apply>(&ce->desc))
+              if (auto* pcn = std::get_if<Pcl_constr>(&apc->ce->desc))
+                if (auto* pl = std::get_if<Lident>(&pcn->id.txt.v))
+                  if (const Ident* pid = lookup(pl->name); pid && class_ids_.count(pid->stamp)) {
+                    bool simple = true;
+                    for (auto& [l, e] : apc->args)
+                      if (!std::holds_alternative<Nolabel>(l)) simple = false;
+                    if (simple) {
+                      Ident ninit = fresh("new_init");
+                      Ident oi = fresh("obj_init"), slf = fresh("self");
+                      auto wrap = mk(Lam::K::Function);
+                      wrap->params = {{oi, ValueKind::Gen}, {slf, ValueKind::Gen}};
+                      auto apl = mk(Lam::K::Apply);
+                      apl->fn = varof(oi); apl->args = {varof(slf)};
+                      for (auto& [l, e] : apc->args) apl->args.push_back(expr(*e));
+                      wrap->body = apl;
+                      auto fm0 = mk(Lam::K::Prim); fm0->prim = Prim::FieldMut;
+                      fm0->prim_arg = 0; fm0->args = {varof(*pid)};
+                      auto f0 = mk(Lam::K::Apply); f0->fn = varof(ninit); f0->args = {fm0};
+                      Ident tbl = fresh("table"), einit = fresh("env_init"), envs = fresh("envs");
+                      auto fm1 = mk(Lam::K::Prim); fm1->prim = Prim::FieldMut;
+                      fm1->prim_arg = 1; fm1->args = {varof(*pid)};
+                      auto e_ap = mk(Lam::K::Apply); e_ap->fn = fm1; e_ap->args = {varof(tbl)};
+                      auto inner_ap = mk(Lam::K::Apply);
+                      inner_ap->fn = varof(einit); inner_ap->args = {varof(envs)};
+                      auto nf = mk(Lam::K::Apply); nf->fn = varof(ninit); nf->args = {inner_ap};
+                      auto envs_fn = mk(Lam::K::Function);
+                      envs_fn->params = {{envs, ValueKind::Gen}}; envs_fn->body = nf;
+                      auto elet = mk(Lam::K::Let);
+                      elet->bindings = {{einit, ValueKind::Gen, e_ap}}; elet->body = envs_fn;
+                      auto tbl_fn = mk(Lam::K::Function);
+                      tbl_fn->params = {{tbl, ValueKind::Gen}}; tbl_fn->body = elet;
+                      auto fm2 = mk(Lam::K::Prim); fm2->prim = Prim::FieldMut;
+                      fm2->prim_arg = 2; fm2->args = {varof(*pid)};
+                      auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+                      blk->args = {f0, tbl_fn, fm2};
+                      auto outer = mk(Lam::K::Let);
+                      outer->bindings = {{ninit, ValueKind::Gen, wrap}}; outer->body = blk;
+                      v = outer;
+                      if (auto mit = class_meta_.find(pl->name); mit != class_meta_.end())
+                        class_meta_[d.name.txt] = mit->second;
+                    }
+                  }
+          }
           if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
             v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
                              params.empty() ? nullptr : &params,
