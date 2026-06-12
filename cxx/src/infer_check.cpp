@@ -1316,14 +1316,25 @@ struct Checker {
       // the branch-result cross-unify, leaving types open.
       bool gadt = sr->kind == I::Type::Kind::Constr && gadt_types.count(sr->path);
       for (auto& c : m->cases) if (pat_has_gadt_ctor(c.lhs)) gadt = true;
+      // Branch-local refinement (strict pass): each arm types inside an engine
+      // window -- the pattern/scrutinee and result unifications happen (soft:
+      // refinement bindings, clashes swallowed) and roll back after the arm, so
+      // one arm's `a := float` cannot leak into the next arm's `a := int32`.
+      // The kind pass keeps the historical skip (rolled-back bindings would
+      // erase value kinds it records).
+      bool window = gadt && !record_kinds_;
       TypePtr rt = eng.fresh_var();
       for (auto& c : m->cases) {
         venv.emplace_back();
+        size_t wm = window ? eng.mark() : 0;
         TypePtr pt = infer_pat(c.lhs);
-        if (!gadt) try_unify(pt, se);
+        if (window) soft_unify(pt, se);
+        else if (!gadt) try_unify(pt, se);
         if (c.guard) infer_expr(**c.guard);
         TypePtr br = infer_expr(*c.rhs);
-        if (!gadt) try_unify(br, rt);
+        if (window) soft_unify(br, rt);
+        else if (!gadt) try_unify(br, rt);
+        if (window) eng.undo_to(wm);
         venv.pop_back();
       }
       match_partial[&e] = compute_partial(se, m->cases);  // for the dump (Slice 3)
@@ -1631,11 +1642,27 @@ struct Checker {
     } else {
       auto& fc = std::get<Pfunction_cases>(f.body->v);
       TypePtr arg = eng.fresh_var(), rt = eng.fresh_var();
+      // A GADT `function` refines branch-locally exactly like a GADT match
+      // (`let default : type a. a t -> a = function Float -> exp 0. | Int32 ->
+      // ... constant` returns float in one arm, int32 in the other): window +
+      // soft unify + rollback in the strict pass, the historical full unify in
+      // the kind pass (value kinds need the bindings kept).
+      bool gadt = false;
+      for (auto& c : fc.cases) if (pat_has_gadt_ctor(c.lhs)) gadt = true;
+      bool window = gadt && !record_kinds_;
       for (auto& c : fc.cases) {
         venv.emplace_back();
-        try_unify(infer_pat(c.lhs), arg);
-        if (c.guard) infer_expr(**c.guard);  // infer (flows operand kinds); not bool-constrained
-        try_unify(infer_expr(*c.rhs), rt);
+        size_t wm = window ? eng.mark() : 0;
+        if (window) {
+          soft_unify(infer_pat(c.lhs), arg);
+          if (c.guard) infer_expr(**c.guard);
+          soft_unify(infer_expr(*c.rhs), rt);
+          eng.undo_to(wm);
+        } else {
+          try_unify(infer_pat(c.lhs), arg);
+          if (c.guard) infer_expr(**c.guard);  // flows operand kinds; not bool-constrained
+          try_unify(infer_expr(*c.rhs), rt);
+        }
         venv.pop_back();
       }
       params.push_back({arg, 0, ""});

@@ -46,10 +46,39 @@ TypePtr Engine::constr(std::string path, std::vector<TypePtr> args, int stamp) {
   return t;
 }
 
+Engine* Engine::trail_owner_ = nullptr;
+
+void Engine::note(const TypePtr& n) {
+  if (window_depth_) trail_.push_back({n, n->kind, n->link, n->level});
+}
+size_t Engine::mark() {
+  ++window_depth_;
+  trail_owner_ = this;
+  return trail_.size();
+}
+void Engine::undo_to(size_t m) {
+  while (trail_.size() > m) {
+    Trail& e = trail_.back();
+    e.node->kind = e.kind;
+    e.node->link = e.link;
+    e.node->level = e.level;
+    trail_.pop_back();
+  }
+  if (--window_depth_ == 0) {
+    trail_owner_ = nullptr;
+    trail_.clear();
+  }
+}
+
 TypePtr Engine::repr(TypePtr t) {
   while (t && t->kind == Type::Kind::Link) {
-    // path compression: collapse chains as we walk.
-    if (t->link && t->link->kind == Type::Kind::Link) t->link = repr(t->link);
+    // path compression: collapse chains as we walk -- trailed while a window is
+    // open (a compressed link skipping over an in-window binding would survive
+    // the rollback and resurrect it).
+    if (t->link && t->link->kind == Type::Kind::Link) {
+      if (trail_owner_) trail_owner_->note(t);
+      t->link = repr(t->link);
+    }
     t = t->link;
   }
   return t;
@@ -63,7 +92,7 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
   switch (t->kind) {
     case Type::Kind::Var:
       if (t == var) throw TypeError("occurs check: recursive type");
-      if (t->level > var->level) t->level = var->level;
+      if (t->level > var->level) { note(t); t->level = var->level; }
       break;
     case Type::Kind::Arrow:
       occurs_and_lower(var, t->dom);
@@ -86,17 +115,19 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
   // link it to Any so it too becomes dynamic and can't later clash.
   if (a->kind == Type::Kind::Any || b->kind == Type::Kind::Any) {
     TypePtr var = a->kind == Type::Kind::Var ? a : b->kind == Type::Kind::Var ? b : nullptr;
-    if (var) { var->kind = Type::Kind::Link; var->link = any(); }
+    if (var) { note(var); var->kind = Type::Kind::Link; var->link = any(); }
     return;
   }
   if (a->kind == Type::Kind::Var) {
     occurs_and_lower(a, b);
+    note(a);
     a->kind = Type::Kind::Link;
     a->link = b;
     return;
   }
   if (b->kind == Type::Kind::Var) {
     occurs_and_lower(b, a);
+    note(b);
     b->kind = Type::Kind::Link;
     b->link = a;
     return;

@@ -78,10 +78,25 @@ public:
   // Generalize: any variable with level > the current level becomes generic.
   void generalize(const TypePtr& t);
 
+  // Undo trail, for branch-local typing (GADT refinement): every binding made
+  // while a window is open is recorded and can be rolled back, so one match
+  // arm's refinement (`a := float`) cannot leak into the next (`a := int32`).
+  // Windows nest; undo_to must be called with the matching mark in LIFO order.
+  size_t mark();
+  void undo_to(size_t m);
+
 private:
   int next_id_ = 0;
   TypePtr any_;  // singleton Any node
   void occurs_and_lower(const TypePtr& var, const TypePtr& t);
+
+  struct Trail { TypePtr node; Type::Kind kind; TypePtr link; int level; };
+  std::vector<Trail> trail_;
+  int window_depth_ = 0;
+  void note(const TypePtr& n);
+  // repr is static (compression must be trailed too): the engine with an open
+  // window, if any.  Single-threaded by construction.
+  static Engine* trail_owner_;
 };
 
 // Render a type in OCaml-ish syntax (for tests/debugging only).
