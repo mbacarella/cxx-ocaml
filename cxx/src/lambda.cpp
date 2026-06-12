@@ -4282,7 +4282,6 @@ struct Translator {
     if (cl_lets)
       for (auto* lg : *cl_lets) {
         if (lg->rf == RecFlag::Recursive) {
-          auto lr = mk(Lam::K::Letrec);
           std::vector<std::pair<const ast::ValueBinding*, Ident>> recs;
           for (auto& b : lg->bindings) {
             auto* pv = std::get_if<ast::Ppat_var>(&b.pat.desc);
@@ -4292,16 +4291,41 @@ struct Translator {
             record_fn_sig(id, b.expr.get());
             recs.push_back({&b, id});
           }
+          std::vector<Ident> ids; std::vector<ValueKind> kinds; std::vector<LamPtr> rvals;
           for (auto& [b, id] : recs) {
+            ids.push_back(id);
+            kinds.push_back(pat_kind(&b->pat));
             rec_spine_ = true;
             LamPtr v = expr(*b->expr);
-            // keep to the syntactic-function letrec class (no value recursion)
-            if (v->k != Lam::K::Function || rhs_leaks_param(v)) { restore(); return nullptr; }
-            lr->bindings.push_back({id, pat_kind(&b->pat), v});
+            if (rhs_leaks_param(v)) { restore(); return nullptr; }
+            rvals.push_back(v);
+          }
+          RecParts rp;
+          if (!recs.empty() && partition_rec(ids, kinds, rvals, rp)) {
+            // value recursion: dummies-let outermost, lifted funcs, then the
+            // backpatch updates as seq layers before the class_init fn.
+            if (!rp.dummies.empty()) {
+              auto l = mk(Lam::K::Let); l->bindings = std::move(rp.dummies);
+              let_layers.push_back(l);
+            }
+            if (!rp.funcs.empty()) {
+              auto lr = mk(Lam::K::Letrec); lr->bindings = std::move(rp.funcs);
+              let_layers.push_back(lr);
+            }
+            for (auto& u : rp.updates) {
+              auto s = mk(Lam::K::Sequence); s->cond = u;
+              let_layers.push_back(s);
+            }
+          } else {
+            auto lr = mk(Lam::K::Letrec);
+            for (size_t i = 0; i < recs.size(); ++i)
+              lr->bindings.push_back({ids[i], kinds[i], collapse_let_id(rvals[i])});
+            let_layers.push_back(lr);
+          }
+          for (auto& [b, id] : recs) {
             auto& nm = std::get<ast::Ppat_var>(b->pat.desc).name.txt;
             cparams.push_back({nm, id, fresh(nm), &b->pat, false});
           }
-          let_layers.push_back(lr);
         } else {
           auto l = mk(Lam::K::Let);
           std::vector<std::pair<const ast::ValueBinding*, Ident>> binds;
@@ -4593,7 +4617,9 @@ struct Translator {
       // `class c = let .. in object`: the let layers wrap the class_init fn.
       LamPtr ci_val = ci_fn;
       for (auto it = let_layers.rbegin(); it != let_layers.rend(); ++it) {
-        (*it)->body = ci_val; ci_val = *it;
+        if ((*it)->k == Lam::K::Sequence) (*it)->else_ = ci_val;
+        else (*it)->body = ci_val;
+        ci_val = *it;
       }
       // A virtual class cannot be instantiated: no make_class -- its value is
       // the plain 3-tuple [0; class_init; 0], dummy-allocated and updated at
