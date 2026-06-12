@@ -1187,3 +1187,46 @@ Dashboard: **exec 91.1% (658/722, 0 compile-fails, was 89.1%), lambda 47.2%
 (351), instr 51.5% (400), completeness 100% (0/744), soundness 86.3%** — the
 back-end gates pinned exactly through all 4 commits (one stash-bisect
 churn-check on the riskiest field_info_ change: identical DIFF lists).
+
+## The module-system layout debt comes due (2026-06-12, cont.)
+
+Three commits (c4d5e40a6e, 9c18e41408, a0c110fdfa), each smallest-first-triaged
+from the 63-DIFF frontier and gated as usual. The arc of the day: almost every
+remaining segfault traced back to *module layout information we never had*.
+
+- **First-class modules + dotted module paths** (the diagnosed multi-file
+  target from last session). `module X = (val x)` had an empty layout — `X.M`,
+  `Z.s` through alias chains, and even plain `module D = B; B.M.s` silently
+  leaked `?s`. The fix is one idea: `module_layout_` is now ALSO keyed by
+  dotted paths ("X.M"), with `resolve_module_path` walking deep prefixes,
+  `copy_layout_subtree` re-registering an alias source's whole subtree, and
+  `register_sig_layouts` walking a `module type S = sig..end` AST (kept in
+  modtype_ast_) for nested member/functor layouts. `let x = (module .. : S)`
+  records x's package type; `(val x)` reads it back; `(module P : S)` params
+  register P's layout; `(module M)` arguments coerce to the callee's recorded
+  package type via the let/N + makeblock field_mut projection ocamlc inserts.
+  Cleared shape-index/index_aliases and typing-modular-explicits/compiling.
+- **Signature-ascription coercion** — the includestruct segfault. `include
+  (A : sig val f .. val x .. end)` spliced fields POSITIONALLY from the raw
+  block (f ← x, then applied an int). `(M : S)` now projects to S's layout,
+  recursing into module members the sig narrows; a computed include rebinds
+  each field (`f =a field_mut i include/N`) and re-registers sig module
+  members as modules, exception members as exceptions. Two adjacent latent
+  bugs fell out: a FUNCTOR body's type decls never registered (its own
+  matches collapsed to the first arm — the old silent-miscompile class,
+  inside any `module F(X) = struct type t = .. end`), and layouts didn't
+  count exception/class/typext slots at all.
+- **The 16/32/64-bit accessor family + locals-as-values**.
+  %caml_bytes_get16 & co. as local externals were unmapped (segfault);
+  they now print like printlambda (bytes.get16 …) and the bytecode calls
+  the same checked C entries for safe and unsafe, exactly like bytegen.ml.
+  Local externals referenced as VALUES eta-stub like stdlib prims. Cleared
+  evaluation_order, array_spec, string_access, bigstring_access.
+
+Dashboard: **exec 92.4% (667/722, DIFF 55, 0 compile-fails/timeouts, was
+91.3%), lambda 47.8% (355), instr 52.1% (405), completeness 100% (0/744)**.
+Remaining frontier is the known-hard tail: cast.ml (objects+GADT+extensible),
+immediate64 (curried stdlib functor + ctors from functor-result sigs), sets
+(higher-order functors), tmc, pr7657 eta-coercion, struct_include_optimisation
+(needs the FUSED coercion — ours allocates an intermediate), statmemprof,
+parallel cluster, bigarrays.ml channel I/O.
