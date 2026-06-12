@@ -7032,8 +7032,22 @@ struct Translator {
       }
       if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {  // class c = object ... end
         flush();
+        // Class declarations are recursive (even a lone one may `new` itself,
+        // and `class a = .. and b = ..` bodies see every group name), so
+        // pre-bind all names before translating any body; a binding whose
+        // value then references a group id is backpatched through the
+        // caml_alloc_dummy(3) scheme like translclass.
+        std::vector<Ident> gids;
         for (auto& d : pc->decls) {
-          Ident id = fresh(d.name.txt);
+          gids.push_back(fresh(d.name.txt));
+          scope.back()[d.name.txt] = gids.back();
+          class_ids_.insert(gids.back().stamp);
+        }
+        struct ClsOut { Ident id; LamPtr v; bool dummy; };
+        std::vector<ClsOut> outs;
+        for (size_t di = 0; di < pc->decls.size(); ++di) {
+          auto& d = pc->decls[di];
+          Ident id = gids[di];
           LamPtr v;
           // Peel `class c x y = ...` parameter wrappers (incl. labelled and
           // optional) and `class c = let .. in object` local-binding wrappers.
@@ -7128,20 +7142,33 @@ struct Translator {
                              lets.empty() ? nullptr : &lets, is_virt);
             register_class_meta(d.name.txt, ps->cs);
           }
-          scope.back()[d.name.txt] = id;
-          class_ids_.insert(id.stamp);
           add_export(d.name.txt, id);
-          if (v && is_virt) {
-            // virtual class: `c = (caml_alloc_dummy 3)` updated with the 3-tuple
-            flush();
-            Seg s; s.seq = false; s.rec_ = false;
-            s.binds = {{id, ValueKind::Gen, alloc_dummy(3)}};
-            s.updates = {update_dummy(id, v)};
-            segs.push_back(std::move(s));
-            continue;
-          }
           if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
-          cur.push_back({id, ValueKind::Gen, v});
+          outs.push_back({id, v, is_virt});  // virtual classes are always dummies
+        }
+        std::set<int> gset;
+        for (auto& g : gids) gset.insert(g.stamp);
+        bool any_dummy = false;
+        for (auto& o : outs) {
+          if (!o.dummy) {
+            std::set<int> bound; std::map<int, Ident> fv;
+            free_vars(o.v, bound, fv);
+            for (int s : gset) if (fv.count(s)) { o.dummy = true; break; }
+          }
+          any_dummy = any_dummy || o.dummy;
+        }
+        if (!any_dummy) {
+          for (auto& o : outs) cur.push_back({o.id, ValueKind::Gen, o.v});
+        } else {  // `(let (<dummies> <non-recursive binds>) (seq <updates> ..))`
+          flush();
+          Seg s; s.seq = false; s.rec_ = false;
+          for (auto& o : outs)
+            if (o.dummy) s.binds.push_back({o.id, ValueKind::Gen, alloc_dummy(3)});
+          for (auto& o : outs)
+            if (!o.dummy) s.binds.push_back({o.id, ValueKind::Gen, o.v});
+          for (auto& o : outs)
+            if (o.dummy) s.updates.push_back(update_dummy(o.id, o.v));
+          segs.push_back(std::move(s));
         }
         continue;
       }
