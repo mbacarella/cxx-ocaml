@@ -38,9 +38,19 @@ struct Instr {
 
 // A persistent cons-list of instructions, mirroring Bytegen's continuations
 // (cheap head-inspection + prepend, which the peephole helpers rely on).
+// The destructor unlinks iteratively: a long program's instruction list must
+// not tear down by dtor recursion (stack overflow past ~100k instructions).
 struct ICell;
 using Code = std::shared_ptr<const ICell>;
-struct ICell { Instr head; Code tail; };
+struct ICell {
+  Instr head;
+  Code tail;
+  ~ICell() {
+    Code n = std::move(tail);
+    while (n && n.use_count() == 1)
+      n = std::move(const_cast<ICell&>(*n).tail);
+  }
+};
 
 // Compile a module's Lambda term to its instruction stream (compile_implementation).
 Code compile_implementation(const lambda::LamPtr& code, const std::string& module_name);
