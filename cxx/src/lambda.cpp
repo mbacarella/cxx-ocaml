@@ -1696,6 +1696,17 @@ struct Translator {
       pr->args = argv;
       return pr;
     }
+    if (prim == "%raise_with_backtrace" && n == 2) {  // translprim's expansion
+      Ident ex = fresh("exn");
+      auto rst = mk(Lam::K::Prim); rst->prim = Prim::Ccall;
+      rst->prim_id = "caml_restore_raw_backtrace"; rst->args = {varof(ex), argv[1]};
+      auto rr = mk(Lam::K::Prim); rr->prim = Prim::Reraise; rr->args = {varof(ex)};
+      auto sq = mk(Lam::K::Sequence); sq->cond = rst; sq->else_ = rr;
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{ex, ValueKind::Gen, argv[0]}};
+      l->body = sq;
+      return l;
+    }
     if ((prim == "%sequand" || prim == "%sequor") && n == 2) {  // && / || as values
       auto i = mk(Lam::K::IfThenElse);
       i->cond = argv[0];
@@ -2692,8 +2703,16 @@ struct Translator {
       return exn_dispatch(exn, expanded, 0);
     }
     if (!c.guard) {
+      // `E p as x`: x is the exception value itself; peel the alias and bind
+      // it over the row's body (was silently dropped to a reraise).
+      std::vector<std::string> row_aliases;
+      while (auto* pa = std::get_if<Ppat_alias>(&lhsp->desc)) {
+        row_aliases.push_back(pa->name.txt);
+        lhsp = effective_pat(pa->p.get());
+      }
       if (is_catchall(*lhsp)) {  // `_`/var: handle unconditionally
         if (auto* pv = std::get_if<Ppat_var>(&lhsp->desc)) scope.back()[pv->name.txt] = exn;
+        for (auto& nm : row_aliases) scope.back()[nm] = exn;
         return expr(*c.rhs);
       }
       if (auto* k = std::get_if<Ppat_construct>(&lhsp->desc)) {
@@ -2730,7 +2749,8 @@ struct Translator {
             lhs = exv();
           }
           std::vector<PayloadTest> ptests;
-          LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs, &ptests);
+          LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs, &ptests,
+                                      &row_aliases);
           if (!then) return exn_dispatch(exn, rows, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
           test->args = {lhs, id};
@@ -2777,14 +2797,23 @@ struct Translator {
   struct PayloadTest { int idx; LamPtr rhs; bool string_eq; };
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
                        const Expression& rhs,
-                       std::vector<PayloadTest>* tests = nullptr) {
-    if (!k->arg) return expr(rhs);
+                       std::vector<PayloadTest>* tests = nullptr,
+                       const std::vector<std::string>* aliases = nullptr) {
+    if (!k->arg) {
+      if (!aliases || aliases->empty()) return expr(rhs);
+      scope.emplace_back();
+      for (auto& nm : *aliases) scope.back()[nm] = exn;
+      LamPtr b = expr(rhs);
+      scope.pop_back();
+      return b;
+    }
     int arity = 1;
     if (auto a = exn_arity_.find(name); a != exn_arity_.end()) arity = a->second;
     auto fps = ctor_field_pats(k, arity);
     if ((int)fps.size() != arity) return nullptr;
     auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
     scope.emplace_back();
+    if (aliases) for (auto& nm : *aliases) scope.back()[nm] = exn;
     std::vector<std::pair<Ident, LamPtr>> binders;  // simple field binders
     std::vector<std::pair<Ident, LamPtr>> temps;    // *match* temps for structured sub-pats
     std::vector<std::vector<std::pair<Ident, LamPtr>>> sub_binders;
@@ -3552,6 +3581,25 @@ struct Translator {
       if (!pvr->arg) return true;
       return collect_binders(**pvr->arg, fieldimm(1, scrut), out);
     }
+    // `lazy p`: force the scrutinee (an effect that must happen even when p
+    // binds nothing -- ocamlc binds a strict *match*), then destructure p
+    // against the forced value.
+    if (auto* pz = std::get_if<Ppat_lazy>(&p->desc)) {
+      const Pattern* sub = effective_pat(pz->p.get());
+      Ident id;
+      if (auto* pv = std::get_if<Ppat_var>(&sub->desc)) {
+        id = fresh(pv->name.txt);
+        scope.back()[pv->name.txt] = id;
+      } else {
+        id = fresh("", true);
+      }
+      lazy_force_binders_.insert(id.stamp);
+      out.push_back({id, force_lazy(scrut)});
+      if (std::holds_alternative<Ppat_var>(sub->desc) ||
+          std::holds_alternative<Ppat_any>(sub->desc))
+        return true;
+      return collect_binders(*sub, varof(id), out);
+    }
     return false;
   }
   // Strip type constraints and peel `[@@unboxed]` constructor wrappers (whose
@@ -3693,6 +3741,8 @@ struct Translator {
     }
     if (auto* pvr = std::get_if<Ppat_variant>(&p->desc))
       return !pvr->arg || is_irrefutable(**pvr->arg);
+    if (auto* pz = std::get_if<Ppat_lazy>(&p->desc))  // always matches; forces
+      return is_irrefutable(*pz->p);
     return false;
   }
   // Wrap `body` (already compiled with `binders` in scope) so each binder's
@@ -3701,12 +3751,17 @@ struct Translator {
   LamPtr wrap_binders(LamPtr body, std::vector<std::pair<Ident, LamPtr>>& binders) {
     std::vector<Lam::Binding> aliases;
     for (auto& [id, acc] : binders) {
-      if (count_var(body, id) <= 1) subst_var(body, id, acc);
+      // A lazy-force binder is an effectful computation: always kept, strict,
+      // never inlined into its use (Simplif only inlines alias lets).
+      if (lazy_force_binders_.count(id.stamp))
+        aliases.push_back({id, ValueKind::Gen, acc, false});
+      else if (count_var(body, id) <= 1) subst_var(body, id, acc);
       else aliases.push_back({id, ValueKind::Gen, acc, is_field_access(acc)});
     }
     if (aliases.empty()) return body;
     auto l = mk(Lam::K::Let); l->bindings = std::move(aliases); l->body = body; return l;
   }
+  std::set<int> lazy_force_binders_;  // binder stamps holding a lazy force
   // An IMMUTABLE field read -- the alias (`=a`) class.  A mutable read
   // (field_mut) is a strict computation: re-evaluation could differ.
   static bool is_field_access(const LamPtr& l) {
@@ -4276,15 +4331,28 @@ struct Translator {
     if (rows.back().guard || !is_catchall(*rows.back().lhs)) return nullptr;
     for (size_t i = 0; i + 1 < rows.size(); ++i) {
       if (rows[i].guard) return nullptr;
-      auto* k = std::get_if<Ppat_construct>(&rows[i].lhs->desc);
+      const Pattern* lp = effective_pat(rows[i].lhs);  // `E .. as x`: x = scrutinee
+      while (auto* pa = std::get_if<Ppat_alias>(&lp->desc)) lp = effective_pat(pa->p.get());
+      auto* k = std::get_if<Ppat_construct>(&lp->desc);
       if (!k) return nullptr;
       std::string n = lid_last(k->id.txt);
-      if ((!exn_ident_.count(n) && !exn_field_.count(n)) || ctor_info_.count(n))
+      // a variant-ctor entry blocks the exception reading -- unless it is a
+      // shadowed builtin (`exception Error` vs result's Error)
+      if ((!exn_ident_.count(n) && !exn_field_.count(n)) ||
+          (ctor_info_.count(n) && !builtin_ctors_.count(n)))
         return nullptr;
       if (k->arg) {  // binder shapes exn_case_body supports only
         int arity = exn_arity_.count(n) ? exn_arity_[n] : 1;
         for (auto* fp : ctor_field_pats(k, arity)) {
           const Pattern* e = effective_pat(fp);
+          if (auto* pc = std::get_if<Ppat_constant>(&e->desc)) {
+            // constant payloads exn_case_body can test (string/int/char)
+            if (std::holds_alternative<Pconst_string>(pc->c.desc)) continue;
+            if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc); pi && !pi->suffix)
+              continue;
+            if (std::holds_alternative<Pconst_char>(pc->c.desc)) continue;
+            return nullptr;
+          }
           if (!std::holds_alternative<Ppat_any>(e->desc) &&
               !std::holds_alternative<Ppat_var>(e->desc) &&
               !std::holds_alternative<Ppat_alias>(e->desc) && !is_irrefutable(*e))
@@ -4300,17 +4368,46 @@ struct Translator {
       bind_catchall(*rows[i].lhs, sv());
       return expr(*rows[i].rhs);
     }
-    auto* k = std::get_if<Ppat_construct>(&rows[i].lhs->desc);
+    const Pattern* lp = effective_pat(rows[i].lhs);
+    std::vector<std::string> aliases;
+    while (auto* pa = std::get_if<Ppat_alias>(&lp->desc)) {
+      aliases.push_back(pa->name.txt);
+      lp = effective_pat(pa->p.get());
+    }
+    auto* k = std::get_if<Ppat_construct>(&lp->desc);
     std::string n = lid_last(k->id.txt);
     LamPtr idv = exn_value(n);
     if (!idv) return nullptr;
     LamPtr lhs = k->arg ? fieldimm(0, sv()) : sv();
-    LamPtr body = exn_case_body(sid, k, n, *rows[i].rhs);
+    std::vector<PayloadTest> ptests;
+    LamPtr body = exn_case_body(sid, k, n, *rows[i].rhs, &ptests, &aliases);
     if (!body) return nullptr;
     LamPtr rest = ext_match_arm(sid, rows, i + 1);
     if (!rest) return nullptr;
     auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
     test->args = {lhs, idv};
+    if (!ptests.empty()) {
+      // constant payloads: identity-fail and each payload-fail share the
+      // rest of the chain behind a catch/exit (like exn_dispatch)
+      int eid = ++next_exit_;
+      auto exitL = [&] {
+        auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x;
+      };
+      for (auto it = ptests.rbegin(); it != ptests.rend(); ++it) {
+        auto t = mk(Lam::K::Prim);
+        if (it->string_eq) { t->prim = Prim::Ccall; t->prim_id = "caml_string_equal"; }
+        else { t->prim = Prim::IntCmp; t->prim_id = "=="; }
+        t->args = {fieldimm(it->idx, sv()), it->rhs};
+        auto pf = mk(Lam::K::IfThenElse);
+        pf->cond = t; pf->then_ = body; pf->else_ = exitL();
+        body = pf;
+      }
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = test; iff->then_ = body; iff->else_ = exitL();
+      auto cat = mk(Lam::K::Catch); cat->cond = iff; cat->prim_arg = eid;
+      cat->then_ = rest;
+      return cat;
+    }
     auto iff = mk(Lam::K::IfThenElse);
     iff->cond = test; iff->then_ = body; iff->else_ = rest;
     return iff;
@@ -4741,6 +4838,31 @@ struct Translator {
       bool eff_guard = false;
       for (auto& c : m->cases) {
         const Expression* g = c.guard ? c.guard->get() : nullptr;
+        // A value-or-exception or-pattern (`| P as x | exception (Q as x) ->`)
+        // splits into one row per side sharing the body (duplicated; ocamlc
+        // shares via exits -- exec-equivalent).  Guarded rows keep the old path
+        // (exn_dispatch would silently skip a guarded exception row).
+        if (!g) {
+          std::vector<const Pattern*> leaves;
+          bool mixed = false;
+          std::function<void(const Pattern*)> walk = [&](const Pattern* p) {
+            if (auto* o2 = std::get_if<Ppat_or>(&p->desc)) {
+              walk(o2->l.get()); walk(o2->r.get()); return;
+            }
+            if (std::holds_alternative<Ppat_exception>(p->desc)) mixed = true;
+            leaves.push_back(p);
+          };
+          walk(&c.lhs);
+          if (mixed && leaves.size() > 1) {
+            for (auto* l : leaves) {
+              if (auto* pe2 = std::get_if<Ppat_exception>(&l->desc))
+                erows.push_back({pe2->p.get(), c.rhs.get(), nullptr});
+              else
+                vrows.push_back({l, c.rhs.get(), nullptr});
+            }
+            continue;
+          }
+        }
         if (auto* pe = std::get_if<Ppat_exception>(&c.lhs.desc))
           erows.push_back({pe->p.get(), c.rhs.get(), g});
         else if (auto* pf = std::get_if<Ppat_effect>(&c.lhs.desc)) {
