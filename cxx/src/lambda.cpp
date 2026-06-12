@@ -483,6 +483,10 @@ struct Translator {
   // per parameter, keyed by the binder stamp -- used to match a call's arguments.
   using FnSig = std::vector<std::pair<int, std::string>>;
   std::map<int, FnSig> fn_sig_;
+  // A function's first-class-module parameters (`(module P : S)`): per
+  // positional param the package module type name ("" if not one), so call
+  // sites coerce un-annotated `(module M)` arguments to S's layout.
+  std::unordered_map<int, std::vector<std::string>> fn_pack_params_;
   // module name ("List", "Printf", ...) -> its value -> field index, cached.
   std::unordered_map<std::string, std::unordered_map<std::string, int>> mod_fields;
   // module name -> its value -> external prim (%builtin or C name) + arity, cached.
@@ -494,10 +498,19 @@ struct Translator {
   // (`(field_imm i M)`) inlined at use sites, instead of a fresh binding.
   std::unordered_map<std::string, LamPtr> module_alias_;
   std::unordered_map<std::string, std::unordered_map<std::string, int>> module_layout_;
+  // module_layout_ is also keyed by DOTTED paths ("X.M") for submodules
+  // reachable from a binding, so alias chains and deep member access resolve.
   // A local functor's result field layout, so `Make(Arg).foo` resolves.
+  // (Also keyed by dotted paths for functor members of first-class modules.)
   std::unordered_map<std::string, std::vector<std::string>> functor_result_;
   // A local functor's parameter signature layout, to coerce its argument.
   std::unordered_map<std::string, std::vector<std::string>> functor_param_;
+  // module type S = <mt>: the signature AST (the Structure outlives
+  // translation), for layouts of nested members of first-class modules.
+  std::unordered_map<std::string, const ModuleType*> modtype_ast_;
+  // let x = (module .. : S): x's package module type name, so
+  // `module X = (val x)` knows X's signature.
+  std::unordered_map<std::string, std::string> pack_modtype_;
   // A named module type's value layout, so `module F (X : S)` knows X's fields.
   std::unordered_map<std::string, std::vector<std::string>> modtype_layout_;
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
@@ -921,6 +934,154 @@ struct Translator {
     }
     return nullptr;
   }
+  // Resolve a (possibly dotted) local module path to its base expression plus
+  // the module_layout_ key holding its field layout; base is null when the
+  // head isn't a local module or a step's layout is unknown.
+  struct ModPath { LamPtr base; std::string key; };
+  ModPath resolve_module_path(const std::string& dotted) {
+    size_t p = dotted.find('.');
+    std::string head = p == std::string::npos ? dotted : dotted.substr(0, p);
+    LamPtr base = module_base(head);
+    if (!base) return {};
+    std::string key = head;
+    while (p != std::string::npos) {
+      size_t q = dotted.find('.', p + 1);
+      std::string comp =
+          dotted.substr(p + 1, (q == std::string::npos ? dotted.size() : q) - p - 1);
+      auto li = module_layout_.find(key);
+      if (li == module_layout_.end()) return {};
+      auto fi = li->second.find(comp);
+      if (fi == li->second.end()) return {};
+      base = fieldimm(fi->second, base);
+      key += '.'; key += comp;
+      p = q;
+    }
+    return {base, key};
+  }
+  // The package module-type name of `(module .. : S)` / `(e : (module S))` /
+  // an ident bound to one; empty if `e` isn't a first-class-module package.
+  std::string expr_pack_modtype(const Expression& e0) {
+    const Expression* e = &e0;
+    while (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) {
+      if (ct->t)
+        if (auto* pk = std::get_if<Ptyp_package>(&ct->t->desc)) {
+          std::string out;
+          if (lid_to_dotted(pk->path.txt, out)) return out;
+        }
+      e = ct->e.get();
+    }
+    if (auto* pp = std::get_if<Pexp_pack>(&e->desc); pp && pp->pkg) {
+      std::string out;
+      if (lid_to_dotted(pp->pkg->path.txt, out)) return out;
+    }
+    if (auto* id = std::get_if<Pexp_ident>(&e->desc))
+      if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+        if (auto it = pack_modtype_.find(l->name); it != pack_modtype_.end())
+          return it->second;
+    return {};
+  }
+  // Register the layouts of a module bound to a first-class-module package of
+  // module type `mtname` (dotted): nested via the local sig AST when known,
+  // else flat via the named module type's layout.
+  void register_pack_layouts(const std::string& prefix, const std::string& mtname) {
+    if (mtname.empty()) return;
+    std::string last = mtname.substr(mtname.rfind('.') + 1);
+    if (auto a = modtype_ast_.find(last); a != modtype_ast_.end())
+      return register_sig_layouts(prefix, *a->second);
+    if (auto it = modtype_layout_.find(last); it != modtype_layout_.end()) {
+      auto& ml = module_layout_[prefix]; ml.clear();
+      for (int i = 0; i < (int)it->second.size(); ++i) ml[it->second[i]] = i;
+    }
+  }
+  // Coerce a packed module value to the package module type's layout when it
+  // differs (the typed coercion ocamlc inserts when creating a first-class
+  // module): `(let (let/N = mv) (makeblock 0 (field_mut i let/N) ..))`.
+  LamPtr pack_coerce(LamPtr mv, const ModuleExpr& me, const std::string& mtname) {
+    if (mtname.empty()) return mv;
+    std::string last = mtname.substr(mtname.rfind('.') + 1);
+    std::vector<std::string> target;
+    if (auto it = modtype_layout_.find(last); it != modtype_layout_.end())
+      target = it->second;
+    auto src = module_result_layout(me);
+    bool subset = !target.empty() && !src.empty() && target != src;
+    for (auto& nm : target)  // only project when every target field is known
+      if (subset && std::find(src.begin(), src.end(), nm) == src.end()) subset = false;
+    if (!subset) return mv;
+    Ident id = fresh("let");
+    auto v = mk(Lam::K::Var); v->var = id;
+    std::vector<LamPtr> fs;
+    for (auto& nm : target) {
+      int idx = 0;
+      for (int i = 0; i < (int)src.size(); ++i) if (src[i] == nm) { idx = i; break; }
+      auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
+      fr->prim_arg = idx; fr->args = {v};
+      fs.push_back(fr);
+    }
+    auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+    blk->args = std::move(fs);
+    auto lt = mk(Lam::K::Let); lt->bindings = {{id, ValueKind::Gen, std::move(mv)}};
+    lt->body = blk;
+    return lt;
+  }
+  // An alias `module Y = X.M` adopts the source's layouts: every layout (and
+  // functor) key at or under `src` re-registers at or under `dst`.
+  void copy_layout_subtree(const std::string& src, const std::string& dst) {
+    if (src == dst) return;
+    auto under = [&](const std::string& k) {
+      return k == src || (k.size() > src.size() && k[src.size()] == '.' &&
+                          k.compare(0, src.size(), src) == 0);
+    };
+    auto copy = [&](auto& map) {
+      std::vector<std::pair<std::string, typename std::decay_t<decltype(map)>::mapped_type>> ks;
+      for (auto& [k, v] : map) if (under(k)) ks.emplace_back(dst + k.substr(src.size()), v);
+      for (auto& [k, v] : ks) map[k] = std::move(v);
+    };
+    copy(module_layout_);
+    copy(functor_result_);
+    copy(functor_param_);
+  }
+  // Register the field layouts a module of signature `mt` exposes -- the module
+  // itself under `prefix`, submodules under dotted keys, functor members in
+  // functor_result_/functor_param_ -- so member paths through a first-class
+  // module resolve.  A named module type resolves locally via modtype_ast_,
+  // else flat via sig_layout (named/stdlib module types).
+  void register_sig_layouts(const std::string& prefix, const ModuleType& mt) {
+    const ModuleType* m = &mt;
+    for (int guard = 0; ; ++guard) {
+      auto* pi = std::get_if<Pmty_ident>(&m->desc);
+      if (!pi) break;
+      const ModuleType* res = nullptr;
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
+        if (auto a = modtype_ast_.find(l->name); a != modtype_ast_.end()) res = a->second;
+      if (!res || guard > 8) {  // no local sig AST: flat layout only
+        auto lay = sig_layout(*m);
+        auto& ml = module_layout_[prefix]; ml.clear();
+        for (int i = 0; i < (int)lay.size(); ++i) ml[lay[i]] = i;
+        return;
+      }
+      m = res;
+    }
+    auto* ps = std::get_if<Pmty_signature>(&m->desc);
+    if (!ps) return;
+    auto& ml = module_layout_[prefix]; ml.clear();
+    int i = 0;
+    for (auto& it : ps->items) {
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) ml[v->vd.name.txt] = i++;
+      else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
+        if (!md->md.name.txt) continue;
+        const std::string& nm = *md->md.name.txt;
+        ml[nm] = i++;
+        const ModuleType& t = *md->md.type;
+        if (auto* pf = std::get_if<Pmty_functor>(&t.desc)) {
+          functor_result_[prefix + "." + nm] = sig_layout(*pf->body);
+          if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->type)
+            functor_param_[prefix + "." + nm] = sig_layout(*fp->type);
+        } else {
+          register_sig_layouts(prefix + "." + nm, t);
+        }
+      }
+    }
+  }
   // A pure module path (a Var, a Global, or a chain of immutable field reads of
   // one) -- safe to inline at every use of a module alias.
   static bool is_pure_path(const LamPtr& l) {
@@ -1215,6 +1376,19 @@ struct Translator {
   void record_fn_sig(const Ident& id, const Expression* e) {
     if (!e) return;
     if (auto* f = std::get_if<Pexp_function>(&e->desc)) {
+      // first-class-module parameters `(module P : S)`: record each positional
+      // param's package type so un-annotated `(module M)` arguments coerce
+      std::vector<std::string> packs; bool any_pack = false;
+      for (auto& fp : f->params)
+        if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
+          const Pattern* p = &pv->pat;
+          while (auto* pc = std::get_if<Ppat_constraint>(&p->desc)) p = pc->p.get();
+          std::string mt;
+          if (auto* up = std::get_if<Ppat_unpack>(&p->desc); up && up->pkg)
+            if (lid_to_dotted(up->pkg->path.txt, mt) && !mt.empty()) any_pack = true;
+          packs.push_back(mt);
+        }
+      if (any_pack) fn_pack_params_[id.stamp] = std::move(packs);
       FnSig s = fn_param_labels(*f);
       for (auto& [k, n] : s) if (k != 0) { fn_sig_[id.stamp] = s; return; }
     }
@@ -5415,6 +5589,16 @@ struct Translator {
           // (`Int64.add` -> `(function p p stub (Int64.add p p))`).
           if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) return s;
         }
+      // Qualified M.S.x through a *local* deep module path (alias chains,
+      // first-class-module members): resolve the prefix, field-read the member.
+      if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
+        std::string pdotted;
+        if (lid_to_dotted(*d->prefix, pdotted) && pdotted.find('.') != std::string::npos)
+          if (auto mp = resolve_module_path(pdotted); mp.base)
+            if (auto li = module_layout_.find(mp.key); li != module_layout_.end())
+              if (auto f = li->second.find(d->name); f != li->second.end())
+                return fieldimm(f->second, mp.base);
+      }
       // Qualified M.S.x through a stdlib submodule path (Effect.Deep.continue),
       // including an opened head (`Array1.x` under `open Bigarray`) and the
       // submodule's externals (value position -> eta-stub).
@@ -5667,7 +5851,23 @@ struct Translator {
         if (auto r = apply_labeled(ap->fn.get(), sig, *ap)) return r;
       auto a = mk(Lam::K::Apply);
       a->fn = expr(*ap->fn);
-      for (auto& [lbl, arg] : ap->args) a->args.push_back(expr(*arg));
+      const std::vector<std::string>* packs = nullptr;
+      if (auto* fid3 = std::get_if<Pexp_ident>(&ap->fn->desc))
+        if (auto* l3 = std::get_if<Lident>(&fid3->id.txt.v))
+          if (auto* b3 = lookup(l3->name))
+            if (auto it3 = fn_pack_params_.find(b3->stamp); it3 != fn_pack_params_.end())
+              packs = &it3->second;
+      size_t ai = 0;
+      for (auto& [lbl, arg] : ap->args) {
+        LamPtr av = expr(*arg);
+        // an un-annotated `(module M)` argument coerces to the callee
+        // parameter's package type (recorded off `(module P : S)` params)
+        if (packs && ai < packs->size() && !(*packs)[ai].empty())
+          if (auto* pk = std::get_if<Pexp_pack>(&arg->desc); pk && !pk->pkg)
+            av = pack_coerce(std::move(av), *pk->me, (*packs)[ai]);
+        a->args.push_back(std::move(av));
+        ++ai;
+      }
       a->inline_attr = inline_of_named(ap->fn->attrs, "inlined");  // (f [@inlined never]) x
       if (has_attr(ap->fn->attrs, "tailcall")) {  // (f [@tailcall]) x -> ... tailcall
         if (!a->inline_attr.empty()) a->inline_attr += " ";
@@ -5939,8 +6139,14 @@ struct Translator {
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) return expr(*ct->e);
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) return expr(*co->e);  // (e :> t) erased
-    if (auto* pp = std::get_if<Pexp_pack>(&e.desc))   // (module ME): the module value
-      return compile_module_expr(*pp->me);
+    if (auto* pp = std::get_if<Pexp_pack>(&e.desc)) {  // (module ME): the module value
+      LamPtr mv = compile_module_expr(*pp->me);
+      if (pp->pkg) {  // coerce to the package type's layout when it differs
+        std::string mt;
+        if (lid_to_dotted(pp->pkg->path.txt, mt)) return pack_coerce(mv, *pp->me, mt);
+      }
+      return mv;
+    }
     if (auto* sd = std::get_if<Pexp_send>(&e.desc)) return send_expr(*sd, {});
     if (auto* si = std::get_if<Pexp_setinstvar>(&e.desc)) {  // n <- e (in a method)
       if (cur_self_) if (auto iv = inst_vars_.find(si->name.txt); iv != inst_vars_.end()) {
@@ -6724,6 +6930,10 @@ struct Translator {
           l->params.push_back({id, ValueKind::Gen});
           scope.back()[*up->name.txt] = id;
           module_ident_[*up->name.txt] = id;
+          if (up->pkg) {  // `(module X : S)`: members resolve via S's layout
+            std::string mt;
+            if (lid_to_dotted(up->pkg->path.txt, mt)) register_pack_layouts(*up->name.txt, mt);
+          }
         } else if (is_irrefutable(*pat)) {
           Ident pid = fresh("param");
           l->params.push_back({pid, pat_kind(pat)});
@@ -6964,6 +7174,12 @@ struct Translator {
       } else if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {  // local functor
         if (auto it = functor_param_.find(l->name); it != functor_param_.end()) param = it->second;
       }
+      if (param.empty()) {  // a functor member of a local module (X.F): sig info
+        std::string dotted;
+        if (lid_to_dotted(pi->id.txt, dotted))
+          if (auto it = functor_param_.find(dotted); it != functor_param_.end())
+            param = it->second;
+      }
     }
     if (!fval) fval = compile_module_expr(*pa.f);
     LamPtr aval = compile_module_expr(*pa.arg);
@@ -7035,8 +7251,12 @@ struct Translator {
     }
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) return compile_module_expr(*pc->me);
     if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {  // a module in value position
+      {  // a (possibly deep) path through local modules: chain of field reads
+        std::string dotted;
+        if (lid_to_dotted(pi->id.txt, dotted))
+          if (auto mp = resolve_module_path(dotted); mp.base) return mp.base;
+      }
       if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
-        if (LamPtr base = module_base(l->name)) return base;
         if (!fields_of(l->name).empty()) {  // a stdlib module: its global
           auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = global_of(l->name);
           return g;
@@ -7090,6 +7310,14 @@ struct Translator {
     }
     return out;
   }
+  // The field-name vector of a registered (possibly dotted) layout key.
+  std::vector<std::string> layout_vec(const std::string& key) {
+    auto it = module_layout_.find(key);
+    if (it == module_layout_.end()) return {};
+    std::vector<std::string> v(it->second.size());
+    for (auto& [n, i] : it->second) if (i >= 0 && i < (int)v.size()) v[i] = n;
+    return v;
+  }
   std::vector<std::string> module_result_layout(const ModuleExpr& me) {
     if (auto* ps = std::get_if<Pmod_structure>(&me.desc)) return struct_export_names(ps->items);
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
@@ -7097,6 +7325,36 @@ struct Translator {
       return s.empty() ? module_result_layout(*pc->me) : s;
     }
     if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) return module_result_layout(*pf->body);
+    if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {  // a module path
+      std::string dotted;
+      if (lid_to_dotted(pi->id.txt, dotted)) {
+        auto v = layout_vec(dotted);          // a local module / alias chain
+        if (!v.empty()) return v;
+        if (dotted.find('.') == std::string::npos) {
+          auto& fm = fields_of(dotted);       // a stdlib module's cmi fields
+          v.resize(fm.size());
+          for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
+          return v;
+        }
+        if (!module_base(dotted.substr(0, dotted.find('.')))) {
+          auto& sm = submodule_of(dotted);    // a stdlib submodule's fields
+          if (sm.ok) {
+            v.resize(sm.fields.size());
+            for (auto& [n, i] : sm.fields) if (i >= 0 && i < (int)v.size()) v[i] = n;
+            return v;
+          }
+        }
+      }
+      return {};
+    }
+    if (auto* un = std::get_if<Pmod_unpack>(&me.desc)) {  // (val x): the package sig
+      auto mt = expr_pack_modtype(*un->e);
+      if (!mt.empty()) {
+        std::string last = mt.substr(mt.rfind('.') + 1);
+        if (auto it = modtype_layout_.find(last); it != modtype_layout_.end())
+          return it->second;
+      }
+    }
     const ModuleExpr* head = nullptr;
     if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) head = pa->f.get();
     else if (auto* pu = std::get_if<Pmod_apply_unit>(&me.desc)) head = pu->f.get();
@@ -7105,6 +7363,12 @@ struct Translator {
         if (auto* l = std::get_if<Lident>(&fi->id.txt.v)) {
           auto it = functor_result_.find(l->name);
           if (it != functor_result_.end()) return it->second;
+        }
+        {  // a functor member of a local module (X.F): its sig's result layout
+          std::string dotted;
+          if (lid_to_dotted(fi->id.txt, dotted))
+            if (auto it = functor_result_.find(dotted); it != functor_result_.end())
+              return it->second;
         }
         if (auto* d = std::get_if<Ldot>(&fi->id.txt.v))  // a stdlib functor M.Make
           if (auto* pl = std::get_if<Lident>(&d->prefix->v))
@@ -7158,7 +7422,10 @@ struct Translator {
         continue;
       }
       if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {  // module type S = mty (no slot)
-        if (pmt->type) modtype_layout_[pmt->name.txt] = sig_layout(*pmt->type);
+        if (pmt->type) {
+          modtype_layout_[pmt->name.txt] = sig_layout(*pmt->type);
+          modtype_ast_[pmt->name.txt] = &*pmt->type;
+        }
         continue;
       }
       if (auto* pp = std::get_if<Pstr_primitive>(&it.desc)) {  // external f = "cname"
@@ -7418,11 +7685,14 @@ struct Translator {
               if (bi != exn_before.end()) { it2->second = bi->second; ++it2; }
               else it2 = exn_ident_.erase(it2);
             }
+            std::vector<std::string> inner_mods;
             for (auto& [nm, iid] : module_ident_) {
               auto bi = mod_before.find(nm);
               if (bi != mod_before.end() && bi->second.stamp == iid.stamp) continue;
-              if (auto f = lay.find(nm); f != lay.end())
+              if (auto f = lay.find(nm); f != lay.end()) {
                 module_alias_[nm] = fieldimm(f->second, varof(mid));
+                inner_mods.push_back(nm);
+              }
             }
             for (auto it2 = module_ident_.begin(); it2 != module_ident_.end();) {
               auto bi = mod_before.find(it2->first);
@@ -7441,6 +7711,11 @@ struct Translator {
               if (bi != alias_before.end()) { it2->second = bi->second; ++it2; }
               else it2 = module_alias_.erase(it2);
             }
+            // exported inner modules' layouts also register under the dotted
+            // path ("X.M"), so deep member access / alias chains through X
+            // resolve (NOTE: after the loops above -- inserting invalidates lay)
+            for (auto& nm : inner_mods)
+              copy_layout_subtree(nm, *mb.name.txt + "." + nm);
             module_ident_[*mb.name.txt] = mid;
             add_export(*mb.name.txt, mid);
           } else if (std::holds_alternative<Pmod_functor>(mb.expr.desc)) {
@@ -7450,39 +7725,55 @@ struct Translator {
             functor_result_[*mb.name.txt] = module_result_layout(mb.expr);  // for Make(..)
             functor_param_[*mb.name.txt] = functor_param_layout(mb.expr);   // for arg coercion
             add_export(*mb.name.txt, mid);
-          } else {  // module M = F(X) / M2 / (M : S): bind + layout from the result
+          } else {  // module M = F(X) / M2 / (M : S) / (val x): bind + layout
             LamPtr mv = compile_module_expr(mb.expr);
-            auto& lay = module_layout_[*mb.name.txt]; lay.clear();
-            auto rl = module_result_layout(mb.expr);
-            for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+            const std::string& nm = *mb.name.txt;
+            {
+              auto& lay = module_layout_[nm]; lay.clear();
+              auto rl = module_result_layout(mb.expr);
+              for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+            }
             // an alias to a stdlib submodule (`module MP = Gc.Memprof`): register
             // the dotted path so MP.x gets the submodule's fields, externals,
             // labelled signatures, and record types
             if (auto* pi2 = std::get_if<Pmod_ident>(&mb.expr.desc)) {
               std::string dotted;
-              if (lid_to_dotted(pi2->id.txt, dotted) &&
-                  dotted.find('.') != std::string::npos &&
-                  !module_base(dotted.substr(0, dotted.find('.')))) {
-                auto& sm = submodule_of(dotted);
-                if (sm.ok) {
-                  submod_alias_[*mb.name.txt] = dotted;
-                  for (auto& [n2, i2] : sm.fields) lay[n2] = i2;
+              if (lid_to_dotted(pi2->id.txt, dotted)) {
+                if (dotted.find('.') != std::string::npos &&
+                    !module_base(dotted.substr(0, dotted.find('.')))) {
+                  auto& sm = submodule_of(dotted);
+                  if (sm.ok) {
+                    submod_alias_[nm] = dotted;
+                    auto& lay = module_layout_[nm];
+                    for (auto& [n2, i2] : sm.fields) lay[n2] = i2;
+                  }
+                } else {
+                  // a local-path alias adopts the source's layout subtree
+                  // (module D = B / module Y = X.M), nested keys included
+                  copy_layout_subtree(dotted, nm);
                 }
               }
             }
+            const ModuleExpr* mex = &mb.expr;  // (val x): layouts from x's package type
+            while (auto* pc2 = std::get_if<Pmod_constraint>(&mex->desc)) mex = pc2->me.get();
+            bool unpack = false;
+            if (auto* un = std::get_if<Pmod_unpack>(&mex->desc)) {
+              unpack = true;
+              register_pack_layouts(nm, expr_pack_modtype(*un->e));
+            }
             if (is_pure_path(mv)) {  // a module alias `M = N.Sub`: inline the path
-              module_alias_[*mb.name.txt] = mv;
-              module_ident_.erase(*mb.name.txt);
+              module_alias_[nm] = mv;
+              module_ident_.erase(nm);
               // A plain `module M = path` is a type-level alias with no runtime
               // slot (elided from the export); a constrained `module M : S = path`
-              // materializes a coerced field.
-              if (std::holds_alternative<Pmod_constraint>(mb.expr.desc))
-                add_export_val(*mb.name.txt, mv);
+              // and an unpack `module M = (val x)` materialize a field.
+              if (std::holds_alternative<Pmod_constraint>(mb.expr.desc) || unpack)
+                add_export_val(nm, mv);
             } else {
-              Ident mid = fresh(*mb.name.txt);
+              Ident mid = fresh(nm);
               cur.push_back({mid, ValueKind::Gen, mv});
-              module_ident_[*mb.name.txt] = mid;
-              add_export(*mb.name.txt, mid);
+              module_ident_[nm] = mid;
+              add_export(nm, mid);
             }
           }
         continue;
@@ -7619,6 +7910,22 @@ struct Translator {
         continue;
       }
       for (auto& b : sv->bindings) {
+        {  // `let x = (module .. : S)` / `let x : (module S) = ..`: record x's
+           // package type so a later `(val x)` knows its layout
+          const Pattern* p0 = &b.pat;
+          const CoreType* ct0 = nullptr;
+          while (auto* pc0 = std::get_if<Ppat_constraint>(&p0->desc)) {
+            ct0 = pc0->t.get(); p0 = pc0->p.get();
+          }
+          if (auto* pv0 = std::get_if<Ppat_var>(&p0->desc)) {
+            std::string mt;
+            if (ct0)
+              if (auto* pk0 = std::get_if<Ptyp_package>(&ct0->desc))
+                lid_to_dotted(pk0->path.txt, mt);
+            if (mt.empty()) mt = expr_pack_modtype(*b.expr);
+            if (!mt.empty()) pack_modtype_[pv0->name.txt] = mt;
+          }
+        }
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
           // alias elimination: `let x = <var v>` binds nothing; x exports as v.
           if (auto* rid = std::get_if<Pexp_ident>(&b.expr->desc))
