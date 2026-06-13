@@ -72,9 +72,14 @@ RUN nix profile install github:NixOS/nixpkgs/nixos-25.05#nodejs_20 && \
 # Land in the mounted repo, inside the dev shell. The dev shell is built from the
 # warm flake (identical to the repo's, but avoids copying the mounted tree into
 # the Nix store on every invocation).
+# Entrypoint: runs the command inside the dev shell, optionally dropping to a
+# user matching the host UID/GID (set by docker-dev.sh) so files written to the
+# bind-mounted tree are host-owned, not root-owned. The CMD is a *non-login*
+# bash: a login shell re-sources /etc/profile, which resets PATH and would drop
+# the toolchain that `nix develop` put on PATH.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 WORKDIR ${REPO}
-# `--command` runs the given argv inside the dev shell. Use a *non-login* bash:
-# a login shell re-sources /etc/profile, which resets PATH and would drop the
-# toolchain that `nix develop` put on PATH.
-ENTRYPOINT ["nix", "develop", "path:/opt/flake-warm", "--command"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["bash"]

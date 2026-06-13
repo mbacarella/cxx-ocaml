@@ -33,9 +33,13 @@ if [ -d "$HOME/.claude" ]; then
   mounts+=( -v "$HOME/.claude:/home/mbac/.claude" )
 fi
 
+# Pass the host UID/GID so the entrypoint drops to a matching user -- files
+# written to the mounts come out owned by you, not root.
+ids=( -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" )
+
 # Allocate a TTY only when stdin/stdout actually are one.
 tty_flags=( -i )
 if [ -t 0 ] && [ -t 1 ]; then tty_flags=( -i -t ); fi
 
 # No args -> the image's default CMD (an interactive bash inside the dev shell).
-exec docker run --rm "${tty_flags[@]}" "${mounts[@]}" "$IMAGE" "$@"
+exec docker run --rm "${tty_flags[@]}" "${mounts[@]}" "${ids[@]}" "$IMAGE" "$@"
