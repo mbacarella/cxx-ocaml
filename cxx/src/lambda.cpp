@@ -1350,6 +1350,67 @@ struct Translator {
     } catch (...) {}
     return fs;
   }
+  // Register a cmi signature's variant constructors (fill-absent, like nested
+  // local decls) so matches over a stdlib functor result's constructors
+  // compile (Sys.Immediate64.Make's Immediate/Non_immediate).
+  void register_cmi_sig_ctors(const cmi::Signature& sig) {
+    for (auto& td : sig.types) {
+      if (td.ctors.empty()) continue;
+      int nc = 0, nb = 0;
+      for (auto& c : td.ctors) {
+        int arity = (int)(c.args.empty() ? c.inline_record.size() : c.args.size());
+        bool block = arity > 0;
+        if (!ctor_info_.count(c.name)) {
+          builtin_ctors_.erase(c.name);
+          ctor_info_[c.name] = {td.name, block ? nb : nc, block, arity};
+        }
+        if (block) ++nb; else ++nc;
+      }
+      type_ctors_.emplace(td.name, std::make_pair(nc, nb));
+    }
+  }
+  // The runtime fields of a (possibly nested) stdlib functor's result after
+  // `napps` applications -- "Sys.Immediate64.Make" applied twice yields its
+  // innermost result signature ([repr]).  Registers that signature's variant
+  // constructors as a side effect.  Empty when the path isn't such a functor.
+  std::vector<std::string> stdlib_functor_result(const std::string& dotted, int napps) {
+    size_t d0 = dotted.find('.');
+    if (d0 == std::string::npos) return {};
+    std::string unit = dotted.substr(0, d0);
+    if (module_base(unit)) return {};
+    try {
+      auto cmi = cmi::CmiFile::load(unit == "Stdlib"
+                                        ? stdlib_dir + "/stdlib.cmi"
+                                        : stdlib_dir + "/stdlib__" + unit + ".cmi");
+      const cmi::Signature* sig = &cmi.sig();
+      cmi::ModuleTypePtr mt;
+      for (size_t p = d0; p != std::string::npos;) {
+        size_t q = dotted.find('.', p + 1);
+        std::string comp =
+            dotted.substr(p + 1, (q == std::string::npos ? dotted.size() : q) - p - 1);
+        mt = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { mt = md.type; break; }
+        if (!mt) return {};
+        if (q != std::string::npos) {  // an intermediate step must be a signature
+          if (mt->kind != cmi::ModuleType::Sig || !mt->sig) return {};
+          sig = mt->sig.get();
+        }
+        p = q;
+      }
+      for (int i = 0; i < napps && mt; ++i) {
+        if (mt->kind != cmi::ModuleType::Functor) return {};
+        mt = mt->functor_body;
+      }
+      if (!mt) return {};
+      if (mt->kind == cmi::ModuleType::Sig && mt->sig) {
+        register_cmi_sig_ctors(*mt->sig);
+        return mt->sig->fields;
+      }
+      return mt_fields(cmi, mt);
+    } catch (...) {}
+    return {};
+  }
   // The argument labels of a stdlib value's type, in order (0 Nolabel /
   // 1 Labelled / 2 Optional), so a call can insert defaults for omitted optionals.
   std::vector<int> stdlib_value_labels(const std::string& mod, const std::string& name) {
@@ -1993,6 +2054,7 @@ struct Translator {
     if (prim == "%identity" && n == 1) return argv[0];
     if (prim == "%perform" && n == 1) return cc("perform");
     if (prim == "%lazy_force" && n == 1) return force_lazy(argv[0]);
+    if (prim == "%obj_is_int" && n == 1) return ic("isint");
     if ((prim == "%raise" || prim == "%reraise") && n == 1) {  // raise as a value
       auto pr = mk(Lam::K::Prim);
       pr->prim = prim == "%reraise" ? Prim::Reraise : Prim::Raise;
@@ -2132,6 +2194,7 @@ struct Translator {
       return a;
     }
     if (prim == "%lazy_force" && as.size() == 1) return force_lazy(expr(*as[0].second));
+    if (prim == "%obj_is_int" && as.size() == 1) return op("isint");
     // Polymorphic compare specialized by operand kind (the spellings we can be
     // sure of; string/other gen needs the operand type, so left unresolved).
     if (prim == "%compare" && as.size() == 2) {
@@ -7418,6 +7481,16 @@ struct Translator {
             if (auto f = fm.find(d->name); f != fm.end())
               return field_of(global_of(pl->name), f->second);
         }
+      {  // a deep stdlib submodule member (Sys.Immediate64.Make)
+        std::string dotted;
+        if (lid_to_dotted(pi->id.txt, dotted)) {
+          size_t lastd = dotted.rfind('.');
+          if (lastd != std::string::npos && lastd != dotted.find('.') &&
+              !module_base(dotted.substr(0, dotted.find('.'))))
+            if (LamPtr v = submodule_value(dotted.substr(0, lastd), dotted.substr(lastd + 1)))
+              return v;
+        }
+      }
     }
     if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) return compile_functor_apply(*pa);
     if (auto* pu = std::get_if<Pmod_apply_unit>(&me.desc)) {  // F() -> (apply F 0)
@@ -7525,6 +7598,24 @@ struct Translator {
               if (fs.ok) return fs.result;
             }
       }
+    {  // curried / deep-path stdlib functors (Sys.Immediate64.Make(Int)(Int64)):
+       // descend one functor result per application
+      const ModuleExpr* base = &me;
+      int napps = 0;
+      for (;;) {
+        if (auto* pa2 = std::get_if<Pmod_apply>(&base->desc)) { base = pa2->f.get(); ++napps; continue; }
+        if (auto* pu2 = std::get_if<Pmod_apply_unit>(&base->desc)) { base = pu2->f.get(); ++napps; continue; }
+        break;
+      }
+      if (napps > 0)
+        if (auto* fi = std::get_if<Pmod_ident>(&base->desc)) {
+          std::string dotted;
+          if (lid_to_dotted(fi->id.txt, dotted) && dotted.find('.') != std::string::npos) {
+            auto v = stdlib_functor_result(dotted, napps);
+            if (!v.empty()) return v;
+          }
+        }
+    }
     return {};
   }
 
