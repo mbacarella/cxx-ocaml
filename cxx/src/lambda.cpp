@@ -5973,7 +5973,15 @@ struct Translator {
         ex->prim_arg = eid; ex->args = {expr(*m->e)};
         auto tr = mk(Lam::K::Try);
         tr->body = ex;
-        tr->var = fresh("exn");
+        // the exn binder takes the first var/alias exception row's name (`|
+        // exception e ->` -> `with e`), else ocamlc's default `exn`.
+        std::string en;
+        for (auto& r : erows) {
+          const Pattern* ep = effective_pat(r.lhs);
+          if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) { en = pv->name.txt; break; }
+          if (auto* pa = std::get_if<Ppat_alias>(&ep->desc)) { en = pa->name.txt; break; }
+        }
+        tr->var = fresh(en.empty() ? "exn" : en);
         scope.emplace_back();
         caught_exn_.push_back(tr->var);
         tr->then_ = exn_dispatch(tr->var, erows, 0);
