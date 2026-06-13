@@ -1537,6 +1537,12 @@ struct Checker {
       if (record_kinds_) try_unify(et, at);
       return at;
     }
+    if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
+      // `lazy e` : e Lazy.t -- only in the value-kinds pass (a concrete type here
+      // can clash downstream in an incomplete strict pass and false-reject).
+      TypePtr inner = infer_expr(*lz->e);
+      return record_kinds_ ? eng.constr("Lazy.t", {inner}) : eng.any();
+    }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
       infer_expr(*as->e);  // infer the condition (flows operand kinds, e.g. x:int)
       // `assert false` is bottom ('a, never returns): a fresh var, so the
