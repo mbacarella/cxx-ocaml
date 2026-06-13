@@ -1349,3 +1349,29 @@ need the effects subsystem (`perform E` with GADT effect constructors typed
 Any); the `=o`/`=a` let-kind and module-field `field_mut`/`field_imm` cases are
 risky reclassifications that many currently-matching files depend on (Simplif
 let-kind / module-projection mutability rules).
+
+## Effect-body return-kinds: infra + blocker (2026-06-13, cont.)
+
+Attempted the effect-handler return-kind near-misses (callback/test7,
+effects/evenodd, effects/used_cont -- functions whose bodies are `perform E` /
+continuation calls, returning an immediate but typed Any).
+
+Landed the necessary infrastructure: **typed extension-constructor declarations**
+(`type t += C`, Pstr_typext was never registered -> every extensible-variant and
+effect constructor was Any). Each ctor now registers with its result type (the
+explicit GADT result `E : unit t`, or the extended type applied to its params;
+`type exn +=` are exceptions). Completeness held at 0; lambda 374 -> 375.
+
+But the original goal (`perform E : unit` so `fun () -> perform E` gets `: int`)
+is still blocked, precisely diagnosed: `perform : 'a t -> 'a` but the cmi expands
+Effect.t's manifest (`type 'a t = 'a eff = ..`) so perform's arg reads as
+`'a eff`; `E`'s result is written `t` (unqualified, after `open Effect`) and we
+keep it as `unit t`. `t` vs `eff` don't unify (last-component differs). Resolving
+`t` -> `Effect.t` -> `eff` needs the type pre-pass to be open-aware (it currently
+runs before opens are tracked) -- a structural change deferred to a focused pass.
+evenodd/used_cont need more besides (the handler/continuation result type flows
+from match_with's signature). So no file flipped from the effect work; the
+ext-ctor typing is kept as correct general infrastructure.
+
+Dashboard: **lambda 50.5% (375/743), exec 94.3% (681/722), completeness 100%
+(0/744)**.
