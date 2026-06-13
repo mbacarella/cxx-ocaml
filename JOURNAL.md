@@ -1277,3 +1277,25 @@ ocamlc does: `(let (arg = v) (function eta (apply arg 0 eta)))`). The
 optional-arg erasure is the best next target — one feature unblocks 3 files —
 but it is type-directed (the inferencer must mark the coercion point), not a
 quick win.
+
+## Type-directed optional-argument erasure (2026-06-13)
+
+A value of type `?l:t -> rest` used where a non-optional arrow is expected
+must be eta-expanded with None for the omitted optional, as ocamlc's
+`type_argument` does: `(let (arg = v) (function eta.. (apply arg 0 eta..)))`.
+We passed the optional-arity function straight through, so it partially applied
+and the body never ran (pr7657 dropped its two `f1` prints).
+
+Detection lives in `infer_expr_expected` (the bidirectional argument position):
+walk the inferred type against the expected, emitting a slot per parameter — a
+None for each optional the expected type lacks, an eta param for each kept one
+— into a new `ValueKinds.optional_erasures` table. Gated to the value-kinds
+pass (the returned un-erased type can't false-reject; the strict pass uses soft
+propagation). The Lambda back end re-enters `expr` once (guarded) to translate
+the inner value, then wraps it. Also typed the `'a ref` cell `r.contents` as
+its element (was Any) so a ref of an optional-arity function is erased too.
+
+Dashboard: **exec 94.2% (680/722), lambda 47.9% (356), instr 52.1%,
+completeness 100% (0/744)** — gates held; HM unit tests green. pr7657 flipped
+to MATCH. (syntactic_arity/max_arity still DIFF — they need definition-site
+optional *defaults* with patterns + `__FUNCTION__`, distinct features.)
