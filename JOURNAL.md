@@ -1249,3 +1249,31 @@ but execution-correct — the drop-in goal.
 
 Dashboard: **exec 94.0% (679/722, was 678), lambda 47.9% (356), instr 52.1%
 (405), completeness 100% (0/744)** — back-end gates held exactly.
+
+## ref `{contents}` patterns + exec-DIFF triage (2026-06-13)
+
+Fixed a real correctness bug: a record pattern on the predefined `'a ref`
+(`g {contents=x1} {contents=x2} () = x1+x2`) silently dropped its bindings
+because `is_irrefutable`/`collect_binders` had no entry for the `contents`
+field, so the param took the refutable path and (with two of them) bound
+nothing — the body read `?x1`/`?x2`. Both now recognize the single-field
+`{contents=p}` cell and read the mutable field 0 in the function body, which
+defers the read to full saturation (ocamlc's syntactic-arity semantics).
+
+Dashboard: **exec 94.2% (680/722), lambda 47.9% (356), instr 52.1%,
+completeness 100% (0/744)** — gates held.
+
+Triage of the remaining 42 exec DIFFs (all hard-tail subsystems): objects+GADT
+(cast, mixin1-3), higher-order functors (sets, testmap, testset), effects
+(shallow2deep), tail-mod-cons (tmc/semantic), module-coercion fusion
+(struct_include_optimisation), memprof (statmemprof x3), backtraces
+(names, pr2195), multi-domain (parallel/churn), exact GC-allocation accounting
+(pr7798 — we over-count by 15M words), and the **location/optional-arg cluster**:
+`__FUNCTION__`/`__LOC__` family (translprim/locs — needs lexical function-name
+path tracking incl. `.(fun)`/nested/functor/class) and **type-directed
+optional-argument erasure** (pr7657, syntactic_arity, max_arity — eta-expand a
+`?x:t -> rest`-typed value to the non-optional type by inserting `None`, as
+ocamlc does: `(let (arg = v) (function eta (apply arg 0 eta)))`). The
+optional-arg erasure is the best next target — one feature unblocks 3 files —
+but it is type-directed (the inferencer must mark the coercion point), not a
+quick win.
