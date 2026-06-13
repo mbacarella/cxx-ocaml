@@ -1330,3 +1330,22 @@ effect/continuation/qualified-call bodies (lazy2 `Lazy.force` -> Any not unit,
 rules per case, ~3, regression-risky), curried-vs-flattened stdlib applies
 (sort_sub, input_lines). No single cheap shared fix remains; each needs
 per-case work.
+
+## Lazy typing (2026-06-13, cont.)
+
+- **`lazy e` typed as `e Lazy.t`** (infer). Pexp_lazy was unhandled (-> Any), so
+  a function forcing a lazy value (`fun () -> Lazy.force l`, common in
+  Domain.spawn / effect tests) couldn't determine its unit return type and lost
+  the `: int` return-kind annotation. Typed it so the element flows through
+  `Lazy.force : 'a Lazy.t -> 'a`. Gated to the value-kinds pass (a concrete type
+  here false-rejected in the strict pass, 0.0% -> 0.1%; the strict pass keeps
+  Any). +3.
+
+Dashboard: **lambda 50.3% (374/743), exec 94.3% (681/722), completeness 100%
+(0/744)** — crossed 50% lambda parity.
+
+The cheap shared near-miss wins are now exhausted. Remaining return-kind cases
+need the effects subsystem (`perform E` with GADT effect constructors typed
+Any); the `=o`/`=a` let-kind and module-field `field_mut`/`field_imm` cases are
+risky reclassifications that many currently-matching files depend on (Simplif
+let-kind / module-projection mutability rules).
