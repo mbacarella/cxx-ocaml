@@ -4001,7 +4001,18 @@ struct Translator {
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
       for (auto& [lbl, sub] : pr->fields) {
         const FieldInfo* fi = find_field(lid_last(lbl.txt));
-        if (!fi) return false;
+        if (!fi) {
+          // The predefined `'a ref = { mutable contents }` cell: a `{contents=p}`
+          // pattern reads the mutable field 0 (deferred to here, the function
+          // body, so it isn't read until full saturation -- syntactic_arity).
+          if (lid_last(lbl.txt) == "contents" && pr->fields.size() == 1) {
+            auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut;
+            fm->prim_arg = 0; fm->args = {scrut};
+            if (!collect_binders(*sub, fm, out)) return false;
+            continue;
+          }
+          return false;
+        }
         if (!collect_binders(*sub, field_read(fi, scrut), out)) return false;
       }
       return true;
@@ -4187,7 +4198,11 @@ struct Translator {
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
       for (auto& [lbl, sub] : pr->fields) {
-        if (!find_field(lid_last(lbl.txt))) return false;
+        // The predefined `'a ref` cell `{contents=p}` is always destructurable
+        // even though `contents` isn't in the user field registry.
+        if (!find_field(lid_last(lbl.txt)) &&
+            !(lid_last(lbl.txt) == "contents" && pr->fields.size() == 1))
+          return false;
         if (!is_irrefutable(*sub)) return false;
       }
       return true;
