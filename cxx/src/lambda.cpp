@@ -6336,6 +6336,44 @@ struct Translator {
       auto v = mk(Lam::K::Var); v->var = fresh("?" + n);  // user ctor: needs its tag (defer)
       return v;
     }
+    // Binding operators: `let* p0 = e0 and* p1 = e1 ... and* pk = ek in body`
+    // desugars to `(let*) ((and*) (... ((and*) e0 e1) ...) ek) (fun pat -> body)`
+    // where the and-combined operand is left-nested and `pat` is the matching
+    // left-nested tuple `((p0,p1),...,pk)`.  The let*/and* operators resolve as
+    // ordinary values in scope (e.g. brought in by `let open Result.Syntax`).
+    if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) {
+      auto resolve_op = [&](const StringLoc& op) -> LamPtr {
+        Expression ide; ide.loc = op.loc;
+        ide.desc = Pexp_ident{LongidentLoc{Longident{Lident{op.txt}}, op.loc}};
+        return expr(ide);
+      };
+      // and-combined operand value (all operands evaluated in the outer scope).
+      LamPtr acc = expr(*lo->let_.exp);
+      for (auto& an : lo->ands) {
+        auto ap = mk(Lam::K::Apply);
+        ap->fn = resolve_op(an.op);
+        ap->args = {acc, expr(*an.exp)};
+        acc = ap;
+      }
+      // fun <left-nested tuple pattern> -> body
+      auto fn = mk(Lam::K::Function);
+      Ident pid = fresh("param");
+      fn->params.push_back({pid, ValueKind::Gen});
+      scope.emplace_back();
+      std::vector<std::pair<Ident, LamPtr>> binders;
+      LamPtr cur = mk(Lam::K::Var); cur->var = pid;
+      for (int i = (int)lo->ands.size() - 1; i >= 0; --i) {
+        collect_binders(lo->ands[i].pat, fieldimm(1, cur), binders);
+        cur = fieldimm(0, cur);
+      }
+      collect_binders(lo->let_.pat, cur, binders);
+      fn->body = wrap_binders(expr(*lo->body), binders);
+      scope.pop_back();
+      auto call = mk(Lam::K::Apply);
+      call->fn = resolve_op(lo->let_.op);
+      call->args = {acc, fn};
+      return call;
+    }
     if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
       if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
