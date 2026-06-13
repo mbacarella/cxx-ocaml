@@ -3391,11 +3391,21 @@ struct Translator {
     scope.pop_back();
     auto al = mk(Lam::K::Prim); al->prim = Prim::Ccall; al->prim_id = "caml_alloc_stack";
     al->args = {vfn, efn, ffn};
+    auto rs = mk(Lam::K::Prim); rs->prim = Prim::Ccall; rs->prim_id = "runstack";
+    // runstack runs `f x` on the new stack.  When the matched computation is a
+    // single-argument application of a plain function (`match f x with effect..`),
+    // ocamlc passes f and x to runstack directly rather than the thunk
+    // `(fun () -> f x) 0`.
+    if (auto* ap = std::get_if<Pexp_apply>(&scrut.desc))
+      if (ap->args.size() == 1 && std::holds_alternative<Nolabel>(ap->args[0].first) &&
+          std::holds_alternative<Pexp_ident>(ap->fn->desc)) {
+        rs->args = {al, expr(*ap->fn), expr(*ap->args[0].second)};
+        return rs;
+      }
     Ident pp = fresh("param");
     auto th = mk(Lam::K::Function);
     th->params = {{pp, ValueKind::Gen}};
     th->body = expr(scrut);
-    auto rs = mk(Lam::K::Prim); rs->prim = Prim::Ccall; rs->prim_id = "runstack";
     rs->args = {al, th, cint(0)};
     return rs;
   }
