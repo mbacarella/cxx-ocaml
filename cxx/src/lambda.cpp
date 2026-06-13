@@ -511,6 +511,8 @@ struct Translator {
   // let x = (module .. : S): x's package module type name, so
   // `module X = (val x)` knows X's signature.
   std::unordered_map<std::string, std::string> pack_modtype_;
+  // Synthetic names for generalized opens (`open F(X)`), un-spellable in source.
+  int open_gen_count_ = 0;
   // A named module type's value layout, so `module F (X : S)` knows X's fields.
   std::unordered_map<std::string, std::vector<std::string>> modtype_layout_;
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
@@ -5145,7 +5147,7 @@ struct Translator {
     rec_spine_ = false;
     // `M.(body)` / `let open M in body`: resolve `body`'s unqualified names in M.
     if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
-      if (auto* op = std::get_if<Pstr_open>(&si->item->desc))
+      if (auto* op = std::get_if<Pstr_open>(&si->item->desc)) {
         if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
           std::string dotted;  // a dotted submodule path opens under its full path
           if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
@@ -5157,6 +5159,26 @@ struct Translator {
           opened_.pop_back();
           return b;
         }
+        // `let open F(X) / struct..end / (M:S) in body`: bind open/N over body
+        LamPtr mv = compile_module_expr(op->expr);
+        auto rl = module_result_layout(op->expr);
+        if (rl.empty()) rl = arg_layout(op->expr);
+        std::string nm = "open#" + std::to_string(++open_gen_count_);
+        Ident oid = fresh("open");
+        module_ident_[nm] = oid;
+        auto& lay = module_layout_[nm]; lay.clear();
+        for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+        opened_.push_back(nm);
+        rec_spine_ = rec_spine;
+        LamPtr b = expr(*si->body);
+        opened_.pop_back();
+        module_ident_.erase(nm);
+        module_layout_.erase(nm);
+        auto l = mk(Lam::K::Let);
+        l->bindings = {{oid, ValueKind::Gen, mv}};
+        l->body = b;
+        return l;
+      }
       // `let module M = me in body`: bind M (value + layout), then the body.
       if (auto* pm = std::get_if<Pstr_module>(&si->item->desc))
         if (pm->binding.name.txt) {
@@ -7657,6 +7679,20 @@ struct Translator {
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
           opened_.push_back(dotted); ++n_opens;
+        } else {
+          // a generalized open (`open F(X)` / `open struct..end` / `open (M:S)`)
+          // binds the module value like ocamlc's open/N and opens it under a
+          // synthetic (un-spellable) module name
+          LamPtr mv = compile_module_expr(op->expr);
+          auto rl = module_result_layout(op->expr);
+          if (rl.empty()) rl = arg_layout(op->expr);
+          std::string nm = "open#" + std::to_string(++open_gen_count_);
+          Ident oid = fresh("open");
+          cur.push_back({oid, ValueKind::Gen, mv});
+          module_ident_[nm] = oid;
+          auto& lay = module_layout_[nm]; lay.clear();
+          for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+          opened_.push_back(nm); ++n_opens;
         }
         continue;
       }
