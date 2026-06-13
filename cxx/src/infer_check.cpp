@@ -950,6 +950,34 @@ struct Checker {
     exn_ctors_.insert(ec.name.txt);
   }
 
+  // A type extension `type ('a..) path += C [of args] [: res]` (extensible
+  // variants and effects, e.g. `type _ t += E : unit t`).  Each constructor's
+  // result is its explicit GADT result (`: unit t`) or the extended type applied
+  // to the extension's parameters; `type exn += ..` are exceptions.  Typing these
+  // lets `perform E`/`E` flow a real type instead of Any (effect return kinds).
+  void register_typext(const TypeExtension& te) {
+    bool is_exn = lid_last(te.path.txt) == "exn";
+    for (auto& ec : te.ctors) {
+      auto* d = std::get_if<Pext_decl>(&ec.kind);
+      if (!d) continue;  // Pext_rebind (`+= C = M.C`): leave unknown
+      std::unordered_map<std::string, TypePtr> vars;
+      TypePtr result;
+      if (d->res) result = from_coretype(**d->res, vars);
+      else {
+        std::vector<TypePtr> params;
+        for (auto& p : te.params) params.push_back(from_coretype(*p, vars));
+        result = is_exn ? eng.constr("exn") : eng.constr(lid_last(te.path.txt), params);
+      }
+      TypePtr scheme = result;
+      if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
+        for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
+          scheme = eng.arrow(from_coretype(**it, vars), scheme);
+      if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
+      ctors[ec.name.txt] = scheme;
+      if (is_exn) exn_ctors_.insert(ec.name.txt);
+    }
+  }
+
   // Look up a constructor scheme.  The scoped cenv (in-order, module-scoped)
   // takes priority -- it resolves a name reused across local types to the
   // in-scope declaration.  Only when a name isn't in scope do we fall back to
@@ -2376,6 +2404,8 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
       for (auto& d : ty->decls) ck.register_record_decl(d);
     } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc))
       ck.register_exception(ex->exn.ctor);
+    else if (auto* tx = std::get_if<Pstr_typext>(&it.desc))
+      ck.register_typext(tx->ext);
     else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       const ModuleExpr* me = &mb->binding.expr;
       while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
