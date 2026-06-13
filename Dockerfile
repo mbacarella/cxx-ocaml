@@ -54,7 +54,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/
     mkdir -p /etc/nix && \
     printf 'experimental-features = nix-command flakes\nmax-jobs = auto\n' \
       >> /etc/nix/nix.conf
-ENV PATH=/home/mbac/.npm-global/bin:/home/mbac/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/home/mbac/.local/bin:/home/mbac/.npm-global/bin:/home/mbac/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Pre-realise the dev-shell toolchain into the image's Nix store, keyed on the
 # flake alone (copied to a throwaway path so the mount point stays empty and the
@@ -65,9 +65,13 @@ COPY flake.nix flake.lock /opt/flake-warm/
 RUN nix develop "path:/opt/flake-warm" --command true
 
 # Node.js (from the same nixpkgs channel as the flake) + the Claude Code CLI
-# (a prebuilt native binary -- runs because the base is glibc Debian).
+# (a prebuilt native binary -- runs because the base is glibc Debian). After the
+# npm bootstrap, `claude install` lays down the native binary at
+# ~/.local/bin/claude -- the path a host-shared ~/.claude.json records, so
+# `/doctor` is happy instead of reporting a missing install.
 RUN nix profile install github:NixOS/nixpkgs/nixos-25.05#nodejs_20 && \
-    npm install -g @anthropic-ai/claude-code
+    npm install -g @anthropic-ai/claude-code && \
+    claude install
 
 # Land in the mounted repo, inside the dev shell. The dev shell is built from the
 # warm flake (identical to the repo's, but avoids copying the mounted tree into

@@ -34,10 +34,14 @@ groupadd -o -g "$gid" dev 2>/dev/null || true
 id -u dev >/dev/null 2>&1 || \
   useradd -o -u "$uid" -g "$gid" -d /home/mbac -M -s /bin/bash dev 2>/dev/null || true
 
-# Let that user own its home and create fresh nix/XDG state (the build populated
-# these as root; clear them so the dev user isn't blocked on their lock files).
+# Let that user own its home and the state the build populated as root (nix
+# caches, the npm/native claude install) so it's writable. These are real dirs
+# created during the build -- never bind mounts -- so chown -R is safe; the
+# mounts (~/.claude, ~/.claude.json, the repo) are deliberately not listed.
 chown "$uid:$gid" /home/mbac 2>/dev/null || true
-rm -rf /home/mbac/.cache /home/mbac/.local 2>/dev/null || true
+for d in .cache .local .npm-global .config; do
+  [ -e "/home/mbac/$d" ] && chown -R "$uid:$gid" "/home/mbac/$d" 2>/dev/null || true
+done
 
 exec setpriv --reuid "$uid" --regid "$gid" --init-groups \
   nix develop "path:/opt/flake-warm" --command "$@"
