@@ -5134,7 +5134,23 @@ struct Translator {
       test = if_and(test, rng);
       return true;
     }
-    return false;  // lazy / array / unpack: unmodeled
+    if (auto* arr = std::get_if<Ppat_array>(&p->desc)) {
+      // `[|p0;..;pn-1|]`: a length test (== n) gates per-element matches.
+      // Generic array access (correct for every element kind, incl. flat
+      // float arrays); feeds the naive matcher, so correctness not byte-parity.
+      int n = (int)arr->elems.size();
+      auto len = mk(Lam::K::Prim); len->prim = Prim::IntCmp;
+      len->prim_id = "array.length[gen]"; len->args = {acc};
+      auto lt = mk(Lam::K::Prim); lt->prim = Prim::EqInt; lt->args = {len, cint(n)};
+      test = if_and(test, lt);  // length first: short-circuits the element gets
+      for (int i = 0; i < n; ++i) {
+        auto get = mk(Lam::K::Prim); get->prim = Prim::IntCmp;
+        get->prim_id = "array.get[gen]"; get->args = {acc, cint(i)};
+        if (!pat_test(arr->elems[i].get(), get, test, binds)) return false;
+      }
+      return true;
+    }
+    return false;  // lazy / unpack: unmodeled
   }
   LamPtr naive_match(const LamPtr& scrut0, const std::vector<Row>& rows0,
                      const Location& mloc) {
