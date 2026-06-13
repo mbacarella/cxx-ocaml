@@ -1375,3 +1375,22 @@ ext-ctor typing is kept as correct general infrastructure.
 
 Dashboard: **lambda 50.5% (375/743), exec 94.3% (681/722), completeness 100%
 (0/744)**.
+
+## Lambda near-miss climb, batch 2 (2026-06-13, cont.)
+
+Three more, +14 files, all gated (completeness 0, exec held):
+
+- **try/with exn binder named after the pattern var** (lambda). `| exception e ->`
+  names the handler `e` (Matching.name_pattern), default `exn` only for a
+  constructor pattern. We always used `exn`. +2.
+- **flatten `@@`/`|>` into the applied function** (lambda). `%apply`/`%revapply`
+  built a fresh `(apply f x)`, so `Array.init n @@ g` nested as
+  `(apply (apply Array.init n) g)`; route through `lapply_` so it merges into
+  `f`'s arg list like ocamlc's lapply. +8 (pervasive operators).
+- **effect-match `match f x with` -> `runstack al f x`** (lambda). The matched
+  computation, when a single-arg application of a plain function, is passed to
+  runstack directly instead of the thunk `(fun () -> f x) 0`. +4 effect-syntax.
+
+Dashboard: **lambda 52.4% (389/743, was 377), exec 94.2% (681/722),
+completeness 100% (0/744)**. Session: lambda 356 -> 389 (+33), exec +3, 11 code
+commits, 0 regressions, completeness pinned at 0.
