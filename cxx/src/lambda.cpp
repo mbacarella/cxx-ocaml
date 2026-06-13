@@ -986,18 +986,37 @@ struct Translator {
           return it->second;
     return {};
   }
+  // The runtime field layout of a (possibly qualified) package module type
+  // name: a local `module type S` via modtype_layout_, or a qualified stdlib
+  // one (`Set.S`) from its module's cmi modtype decl.  Empty if unresolved.
+  std::vector<std::string> pack_modtype_layout(const std::string& mtname) {
+    if (mtname.empty()) return {};
+    size_t dot = mtname.rfind('.');
+    std::string last = mtname.substr(dot + 1);
+    if (auto it = modtype_layout_.find(last); it != modtype_layout_.end())
+      return it->second;
+    if (dot != std::string::npos) {  // Head.S -> the head module's cmi modtype
+      std::string head = mtname.substr(0, dot);
+      if (head.find('.') == std::string::npos && !module_base(head)) try {
+        auto cmi = cmi::CmiFile::load(head == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                       : stdlib_dir + "/stdlib__" + head + ".cmi");
+        for (auto& md : cmi.sig().modtypes)
+          if (md.name == last) return mt_fields(cmi, md.type);
+      } catch (...) {}
+    }
+    return {};
+  }
   // Register the layouts of a module bound to a first-class-module package of
   // module type `mtname` (dotted): nested via the local sig AST when known,
-  // else flat via the named module type's layout.
+  // else flat via the named module type's layout (local or qualified stdlib).
   void register_pack_layouts(const std::string& prefix, const std::string& mtname) {
     if (mtname.empty()) return;
     std::string last = mtname.substr(mtname.rfind('.') + 1);
     if (auto a = modtype_ast_.find(last); a != modtype_ast_.end())
       return register_sig_layouts(prefix, *a->second);
-    if (auto it = modtype_layout_.find(last); it != modtype_layout_.end()) {
-      auto& ml = module_layout_[prefix]; ml.clear();
-      for (int i = 0; i < (int)it->second.size(); ++i) ml[it->second[i]] = i;
-    }
+    auto lay = pack_modtype_layout(mtname);
+    auto& ml = module_layout_[prefix]; ml.clear();
+    for (int i = 0; i < (int)lay.size(); ++i) ml[lay[i]] = i;
   }
   // Coerce a packed module value to the package module type's layout when it
   // differs (the typed coercion ocamlc inserts when creating a first-class
@@ -7696,12 +7715,8 @@ struct Translator {
       return {};
     }
     if (auto* un = std::get_if<Pmod_unpack>(&me.desc)) {  // (val x): the package sig
-      auto mt = expr_pack_modtype(*un->e);
-      if (!mt.empty()) {
-        std::string last = mt.substr(mt.rfind('.') + 1);
-        if (auto it = modtype_layout_.find(last); it != modtype_layout_.end())
-          return it->second;
-      }
+      auto lay = pack_modtype_layout(expr_pack_modtype(*un->e));
+      if (!lay.empty()) return lay;
     }
     const ModuleExpr* head = nullptr;
     if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) head = pa->f.get();
