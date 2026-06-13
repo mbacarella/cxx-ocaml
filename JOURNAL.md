@@ -1230,3 +1230,22 @@ immediate64 (curried stdlib functor + ctors from functor-result sigs), sets
 (higher-order functors), tmc, pr7657 eta-coercion, struct_include_optimisation
 (needs the FUSED coercion — ours allocates an intermediate), statmemprof,
 parallel cluster, bigarrays.ml channel I/O.
+
+## Binding operators (2026-06-13)
+
+`Pexp_letop` — the `let*`/`and*`/`let+`/`and+` binding operators — was never
+handled in the lambda translator, so lib-result/test.ml compiled to wrong code
+and failed an assertion at runtime inside the `Result.Syntax` block.
+
+Fixed by desugaring exactly as ocamlc does: the and-combined operand is the
+left-nested `(and*) (... ((and*) e0 e1) ...) ek`, applied through `(let*)` to a
+`fun pat -> body` whose single parameter is destructured by the matching
+left-nested tuple pattern `((p0,p1),...,pk)`. The `let*`/`and*` operators
+resolve as ordinary values in scope (e.g. brought in by `let open
+Result.Syntax`). Operands evaluate in the outer scope; only the body sees the
+bound variables. Not `-dlambda` byte-exact for multi-`and*` (ocamlc introduces
+an intermediate `left` let and shares the projection via a `*match*` alias),
+but execution-correct — the drop-in goal.
+
+Dashboard: **exec 94.0% (679/722, was 678), lambda 47.9% (356), instr 52.1%
+(405), completeness 100% (0/744)** — back-end gates held exactly.
