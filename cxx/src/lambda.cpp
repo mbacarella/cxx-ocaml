@@ -2235,10 +2235,12 @@ struct Translator {
     }
     // `f @@ x` / `x |> f` apply f to x (the function is the 1st / 2nd argument).
     if ((prim == "%apply" || prim == "%revapply") && as.size() == 2) {
-      auto a = mk(Lam::K::Apply);
       int fi = prim == "%apply" ? 0 : 1, xi = prim == "%apply" ? 1 : 0;
-      a->fn = expr(*as[fi].second); a->args = {expr(*as[xi].second)};
-      return a;
+      // `f @@ x` / `x |> f` is an application; when `f` is itself a saturated
+      // application (`Array.init n @@ g`) ocamlc's lapply merges the arg into it
+      // (`(apply Array.init n g)`, not a nested `(apply (apply ..) g)`).
+      LamPtr fn = expr(*as[fi].second);
+      return lapply_(fn, {expr(*as[xi].second)});
     }
     if (prim == "%lazy_force" && as.size() == 1) return force_lazy(expr(*as[0].second));
     if (prim == "%obj_is_int" && as.size() == 1) return op("isint");
