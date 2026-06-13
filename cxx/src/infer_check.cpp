@@ -1448,8 +1448,14 @@ struct Checker {
     if (auto* it = std::get_if<Pexp_ifthenelse>(&e.desc)) {
       try_unify(infer_expr(*it->cond), eng.constr("bool"));
       TypePtr tt = infer_expr(*it->then_);
-      if (it->else_) try_unify(tt, infer_expr(**it->else_));
-      return tt;
+      if (it->else_) { try_unify(tt, infer_expr(**it->else_)); return tt; }
+      // No else: the then-branch must be unit and the whole expression is unit
+      // (so a unit-returning `if c then e` body annotates `: int`).  Constrain
+      // the branch softly in the strict pass to avoid false-rejecting a branch
+      // we mis-typed; force it in the value-kinds pass so the unit kind flows.
+      if (strict) soft_unify(tt, eng.constr("unit"));
+      else try_unify(tt, eng.constr("unit"));
+      return eng.constr("unit");
     }
     if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
       infer_expr(*s->e1);
