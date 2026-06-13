@@ -2313,6 +2313,19 @@ struct Translator {
     // bytecode calls the same checked C entry points for safe and unsafe.
     if ((int)as.size() == arity)
       if (const std::string* sp = mem_access_spelling(prim)) return op(*sp);
+    // String/bytes element access + length as locally-declared externals (the
+    // printlambda spelling; bytecode calls the checked C entry for safe/unsafe).
+    if (prim == "%string_unsafe_get" && as.size() == 2) return op("string.unsafe_get");
+    if (prim == "%string_safe_get" && as.size() == 2) return op("string.get");
+    if (prim == "%bytes_unsafe_get" && as.size() == 2) return op("bytes.unsafe_get");
+    if (prim == "%bytes_safe_get" && as.size() == 2) return op("bytes.get");
+    if (prim == "%bytes_unsafe_set" && as.size() == 3) return op("bytes.unsafe_set");
+    if (prim == "%bytes_safe_set" && as.size() == 3) return op("bytes.set");
+    if (prim == "%string_length" && as.size() == 1) return op("string.length");
+    if (prim == "%bytes_length" && as.size() == 1) return op("bytes.length");
+    // `%bytes_to_string` / `%string_to_bytes` are representation no-ops (identity).
+    if ((prim == "%bytes_to_string" || prim == "%string_to_bytes") && as.size() == 1)
+      return expr(*as[0].second);
     // Array access builtins as locally-declared externals: the same spelling
     // and lowering as Array.get/set (element kind from the application).
     if (prim == "%array_safe_get" && as.size() == 2)
