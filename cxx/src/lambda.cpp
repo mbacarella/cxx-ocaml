@@ -2300,9 +2300,28 @@ struct Translator {
     if (!prim.empty() && prim[0] != '%' && (int)as.size() == arity) {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = prim;
       pr->args = args();
+      if (prim == "caml_obj_with_tag")
+        if (auto r = fold_with_tag(pr->args)) return r;
       return pr;
     }
     return nullptr;
+  }
+
+  // Simplif's Obj.with_tag folding (lambda/simplif.ml): `caml_obj_with_tag` of a
+  // compile-time tag and a directly-allocated block is the same allocation with
+  // the new tag; of a structured constant, the retagged constant.  Null when the
+  // shape doesn't match (the generic C call stands).
+  LamPtr fold_with_tag(const std::vector<LamPtr>& args) {
+    if (args.size() != 2) return nullptr;
+    const LamPtr& t = args[0];
+    if (t->k != Lam::K::ConstInt || !t->str_val.empty()) return nullptr;
+    const LamPtr& b = args[1];
+    bool makeblk = b->k == Lam::K::Prim &&
+                   (b->prim == Prim::Makeblock || b->prim == Prim::Makemutable);
+    if (!makeblk && b->k != Lam::K::ConstBlock) return nullptr;
+    auto r = std::make_shared<Lam>(*b);
+    r->prim_arg = (int)t->int_val;
+    return r;
   }
 
   // --- lazy values (Texp_lazy / %lazy_force), mirroring translcore + matching ---
@@ -5959,6 +5978,8 @@ struct Translator {
               auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall;
               pr->prim_id = ex->second.name;
               for (auto& a : as) pr->args.push_back(expr(*a.second));
+              if (pr->prim_id == "caml_obj_with_tag")
+                if (auto r = fold_with_tag(pr->args)) return r;
               return pr;
             }
             if (auto lp = local_prims_.find(n); lp != local_prims_.end())
