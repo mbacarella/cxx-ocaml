@@ -1,6 +1,8 @@
 #include "cppcaml/lambda.hpp"
 #include <cstdint>
 #include <cstdio>
+#include <climits>
+#include <cstdlib>
 
 #include <algorithm>
 #include <cctype>
@@ -571,6 +573,24 @@ struct Translator {
   // name so the dump's first-appearance normalization is consistent within a file.
   std::unordered_map<std::string, int> predef_global_stamp_;
   int next_exit_ = 0;  // static-exception ids (normalized in the dump, so value is free)
+
+  // ===== The Switcher: a faithful port of lambda/switch.ml + matching.ml's
+  // as_interval/call_switcher glue (see switcher_match below).  State that the
+  // recursive cost optimizer threads: ok_inter (interval tests allowed only when
+  // the matched values fit in [-2^16,2^16]) and a memo over case-array shapes.
+  bool sw_ok_inter_ = false;
+  struct Ctests { long long n = 0, ni = 0; };
+  // A representation of a switch over intervals: each entry (lo,hi,act) covers a
+  // contiguous run of inputs mapping to action index `act` (0 = the default).
+  struct SwCase { long long lo, hi; int act; };
+  struct SwCtx { long long off; LamPtr arg; };
+  using ActFn = std::function<LamPtr(const SwCtx&)>;
+  // t_ret: Inter(i,j) interval test, Sep(i) `x < bound`, No no test needed.
+  enum class TR { No, Sep, Inter };
+  struct TRet { TR k; long long i = 0, j = 0; };
+  using OptRes = std::pair<TRet, std::pair<Ctests, Ctests>>;  // (tactic,(cm,ci))
+  std::unordered_map<std::string, OptRes> sw_memo_;
+  static constexpr int kDefaultLeaf = INT_MIN;  // sentinel exit-id for the default action
 
   static bool is_predef_exn_name(const std::string& n) {
     static const std::set<std::string> s = {
@@ -4682,7 +4702,7 @@ struct Translator {
       if (body) return wrap_binders(body, binders);
     }
     if (auto sw = const_switch(scrut, rows)) return sw;
-    if (auto ds = dense_switch(scrut, rows)) return ds;
+    if (auto ds = switcher_match(scrut, rows)) return ds;
     if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
@@ -4901,16 +4921,393 @@ struct Translator {
     sw->sw_consts = std::move(arms);
     return sw;
   }
-  // The Switcher (lambda/switch.ml) for a DENSE run of >=3 integer or char
-  // constant cases with a trailing catch-all: an offset + unsigned bounds
-  // check + jump table -- `(let (switcher =a (-base+ s)) (if (isout span
-  // switcher) default (switch* switcher case int 0: .. case int span: ..)))`,
-  // or directly on `s` when base==0.  Only the fully-dense case (values cover
-  // [min,max] with no gaps); gapped/sparse runs need the catch/exit default
-  // machinery, left to int_cases/naive_match.  ocamlc keeps <3 cases as an
-  // if-chain, so do we.
-  LamPtr dense_switch(const LamPtr& scrut, const std::vector<Row>& rows) {
-    if (scrut->k != Lam::K::Var) return nullptr;  // bound by compile_match first
+  // ===== The Switcher (a faithful port of lambda/switch.ml) ==================
+  // switcher_match (below) is the entry point: for an integer- or char-constant
+  // match with a trailing catch-all, it reproduces ocamlc's switch compilation
+  // -- clustering dense runs into jump tables (`switch*`) joined by an optimal
+  // tree of comparison / interval (`isout`) tests, with the default action
+  // shared behind a `(catch .. with (N) default)` when it is reached from more
+  // than one leaf.  It only takes over when ocamlc would emit at least one jump
+  // table; pure if-chains are left to int_cases (which already matches them).
+
+  // -- cost algebra (switch.ml:261-306) --
+  static constexpr long long kTooMuch = (long long)1 << 60;  // sentinel; never add_test'd
+  static bool less_tests(const Ctests& a, const Ctests& b) {
+    return a.n < b.n || (a.n == b.n && a.ni < b.ni);
+  }
+  static bool eq_tests(const Ctests& a, const Ctests& b) { return a.n == b.n && a.ni == b.ni; }
+  static bool less2tests(const std::pair<Ctests, Ctests>& a, const std::pair<Ctests, Ctests>& b) {
+    return eq_tests(a.first, b.first) ? less_tests(a.second, b.second) : less_tests(a.first, b.first);
+  }
+  static void add_test(Ctests& t, const Ctests& o) { t.n += o.n; t.ni += o.ni; }
+
+  // coupe i: split at i -> (lo of cases[i], cases[0..i), cases[i..end))
+  static void coupe(const std::vector<SwCase>& c, int i, long long& lim,
+                    std::vector<SwCase>& left, std::vector<SwCase>& right) {
+    lim = c[i].lo;
+    left.assign(c.begin(), c.begin() + i);
+    right.assign(c.begin() + i, c.end());
+  }
+  // case_append (switch.ml:328): concatenate two interval arrays, merging the
+  // junction (shared action, or absorbing a degenerate boundary interval).
+  static std::vector<SwCase> case_append(const std::vector<SwCase>& c1, const std::vector<SwCase>& c2) {
+    size_t l1 = c1.size(), l2 = c2.size();
+    if (l1 == 0) return c2;
+    if (l2 == 0) return c1;
+    SwCase a = c1.back(), b = c2.front();
+    std::vector<SwCase> r;
+    if (a.act == b.act) {
+      r = c1; r.pop_back();
+      long long lo = (l1 < 2) ? a.lo : std::min(r[l1 - 2].hi + 1, a.lo);
+      long long hi = (l2 < 2) ? b.hi : std::max(b.hi, c2[1].lo - 1);
+      r.push_back({lo, hi, a.act});
+      for (size_t i = 1; i < l2; ++i) r.push_back(c2[i]);
+      return r;
+    } else if (a.hi > a.lo) {
+      r = c1; r.back() = {a.lo, b.lo - 1, a.act};
+      for (auto& x : c2) r.push_back(x);
+      return r;
+    } else if (b.hi > b.lo) {
+      r = c1; r.push_back({a.hi + 1, b.hi, b.act});
+      for (size_t i = 1; i < l2; ++i) r.push_back(c2[i]);
+      return r;
+    } else {
+      r = c1; for (auto& x : c2) r.push_back(x); return r;
+    }
+  }
+  // coupe_inter i j: carve out the closed interval [i,j] as `inside`, the rest as `outside`.
+  static void coupe_inter(int i, int j, const std::vector<SwCase>& c, long long& low, long long& high,
+                          std::vector<SwCase>& inside, std::vector<SwCase>& outside) {
+    low = c[i].lo; high = c[j].hi;
+    inside.assign(c.begin() + i, c.begin() + j + 1);
+    std::vector<SwCase> a(c.begin(), c.begin() + i), b(c.begin() + j + 1, c.end());
+    outside = case_append(a, b);
+  }
+  static bool same_act(const std::vector<SwCase>& c) {
+    for (size_t i = 0; i + 1 < c.size(); ++i) if (c[i].act != c.back().act) return false;
+    return true;
+  }
+  // make_key (switch.ml:409): a canonical string keyed only by the case-array
+  // *shape* (value vs interval, action-equalities normalized by first-appearance,
+  // gaps marked) -- structurally-identical sub-problems share a memo entry.
+  static std::string make_key_str(const std::vector<SwCase>& c) {
+    std::vector<int> seen; int count = 0;
+    auto got_it = [&](int act) {
+      for (size_t i = 0; i < seen.size(); ++i) if (seen[i] == act) return (int)i;  // (act,index)
+      seen.push_back(act); return count++;
+    };
+    auto make_one = [&](const SwCase& s) {
+      return std::string(s.lo == s.hi ? "V" : "I") + std::to_string(got_it(s.act));
+    };
+    std::string r;
+    int n = (int)c.size();
+    r = make_one(c[n - 1]);
+    long long pl = c[n - 1].lo;
+    for (int i = n - 2; i >= 0; --i) {
+      if (pl == c[i].hi + 1) r += "|" + make_one(c[i]);
+      else r += "|E|" + make_one(c[i]);
+      pl = c[i].lo;
+    }
+    return r;
+  }
+
+  // opt_count (switch.ml:474): the memoized recursive cost optimizer; returns the
+  // chosen test tactic and its (worst-case, total) cost.
+  OptRes opt_count(const std::vector<SwCase>& c) {
+    std::string key = make_key_str(c);
+    auto it = sw_memo_.find(key);
+    if (it != sw_memo_.end()) return it->second;
+    OptRes r;
+    int lc = (int)c.size();
+    if (same_act(c)) r = {{TR::No}, {{0, 0}, {0, 0}}};
+    else if (lc < 8) r = sw_enum(c);
+    else if (lc < 16) r = sw_heuristic(c);
+    else r = sw_divide(c);
+    sw_memo_[key] = r;
+    return r;
+  }
+  OptRes sw_divide(const std::vector<SwCase>& c) {
+    int lc = (int)c.size(), m = lc / 2;
+    long long lim; std::vector<SwCase> left, right; coupe(c, m, lim, left, right);
+    Ctests ci{1, 0}, cm{1, 0};
+    auto pl = opt_count(left).second, pr = opt_count(right).second;
+    add_test(ci, pl.second); add_test(ci, pr.second);
+    add_test(cm, less_tests(pl.first, pr.first) ? pr.first : pl.first);
+    return {{TR::Sep, m}, {cm, ci}};
+  }
+  OptRes sw_heuristic(const std::vector<SwCase>& c) {
+    int lc = (int)c.size();
+    auto sep = sw_divide(c);  // (Sep m, csep)
+    TRet inter{TR::Inter, -1, -1}; std::pair<Ctests, Ctests> cinter{{kTooMuch, kTooMuch}, {kTooMuch, kTooMuch}};
+    if (sw_ok_inter_ && c[0].act == c[lc - 1].act) {
+      long long low, high; std::vector<SwCase> inside, outside;
+      coupe_inter(1, lc - 2, c, low, high, inside, outside);
+      auto pi = opt_count(inside).second, po = opt_count(outside).second;
+      Ctests cmij{1, low == high ? 0 : 1}, cij{1, low == high ? 0 : 1};
+      add_test(cij, pi.second); add_test(cij, po.second);
+      add_test(cmij, less_tests(pi.first, po.first) ? po.first : pi.first);
+      inter = {TR::Inter, 1, lc - 2}; cinter = {cmij, cij};
+    }
+    if (less2tests(sep.second, cinter)) return sep;
+    return {inter, cinter};
+  }
+  OptRes sw_enum(const std::vector<SwCase>& c) {
+    int lc = (int)c.size();
+    int lim = -1; std::pair<Ctests, Ctests> best{{kTooMuch, kTooMuch}, {kTooMuch, kTooMuch}};
+    for (int i = 1; i <= lc - 1; ++i) {
+      long long l; std::vector<SwCase> left, right; coupe(c, i, l, left, right);
+      Ctests ci{1, 0}, cm{1, 0};
+      auto pl = opt_count(left).second, pr = opt_count(right).second;
+      add_test(ci, pl.second); add_test(ci, pr.second);
+      add_test(cm, less_tests(pl.first, pr.first) ? pr.first : pl.first);
+      if (less2tests({cm, ci}, best)) { lim = i; best = {cm, ci}; }
+    }
+    auto with_sep = best;
+    int ilow = -1, ihigh = -1; std::pair<Ctests, Ctests> winter{{kTooMuch, kTooMuch}, {kTooMuch, kTooMuch}};
+    auto try_inter = [&](int i, int j) {
+      long long low, high; std::vector<SwCase> inside, outside;
+      coupe_inter(i, j, c, low, high, inside, outside);
+      auto pi = opt_count(inside).second, po = opt_count(outside).second;
+      Ctests cmij{1, low == high ? 0 : 1}, cij{1, low == high ? 0 : 1};
+      add_test(cij, pi.second); add_test(cij, po.second);
+      add_test(cmij, less_tests(pi.first, po.first) ? po.first : pi.first);
+      if (less2tests({cmij, cij}, winter)) { ilow = i; ihigh = j; winter = {cmij, cij}; }
+    };
+    if (!sw_ok_inter_) {
+      for (int i = 1; i <= lc - 2; ++i) if (c[i].lo == c[i].hi) try_inter(i, i);
+    } else {
+      for (int i = 1; i <= lc - 2; ++i) for (int j = i; j <= lc - 2; ++j) try_inter(i, j);
+    }
+    TRet r{TR::Inter, ilow, ihigh}; auto rc = winter;
+    if (less2tests(with_sep, rc)) { r = {TR::Sep, lim}; rc = with_sep; }
+    return {r, rc};
+  }
+
+  // -- dense / clustering (switch.ml:811-874) --
+  static bool particular_case(const std::vector<SwCase>& c, int i, int j) {
+    return j - i == 2 && c[i].lo + 1 == c[i + 1].lo && c[i + 1].lo + 1 == c[i + 2].lo &&
+           c[i + 2].lo == c[i + 2].hi && c[i].act != c[i + 2].act;
+  }
+  long long approx_count(const std::vector<SwCase>& c, int i, int j) {
+    int l = j - i + 1;
+    if (l < 8) {
+      std::vector<SwCase> sub(c.begin() + i, c.begin() + j + 1);
+      return opt_count(sub).second.second.n;  // ci.n
+    }
+    return l - 1;
+  }
+  bool dense(const std::vector<SwCase>& c, int i, int j) {
+    if (i == j) return true;
+    long long l = c[i].lo, h = c[j].hi;
+    long long ntests = approx_count(c, i, j);
+    return particular_case(c, i, j) ||
+           (ntests >= 3 && (double)ntests + 1.0 >= 0.33333 * ((double)h - (double)l + 1.0));
+  }
+  // comp_clusters (switch.ml:856): DP for the minimum number of dense clusters.
+  void comp_clusters(const std::vector<SwCase>& c, std::vector<int>& k) {
+    int len = (int)c.size();
+    std::vector<long long> mc(len, kTooMuch);
+    k.assign(len, 0);
+    auto get_min = [&](int i) -> long long { return i < 0 ? 0 : mc[i]; };
+    for (int i = 0; i < len; ++i)
+      for (int j = 0; j <= i; ++j)
+        if (dense(c, j, i) && get_min(j - 1) + 1 < mc[i]) { k[i] = j; mc[i] = get_min(j - 1) + 1; }
+  }
+
+  // make_switch (switch.ml:879): a jump table over [ll,hh].  Gap/default slots
+  // (act 0) emit a fresh default sentinel; value slots emit the action term.
+  ActFn make_switch_act(const std::vector<SwCase>& c, int i, int j,
+                        const std::vector<LamPtr>& actions) {
+    long long ll = c[i].lo, hh = c[j].hi;
+    int len = (int)(hh - ll + 1);
+    std::vector<int> tbl(len, 0);
+    for (int kk = i; kk <= j; ++kk)
+      for (long long v = c[kk].lo; v <= c[kk].hi; ++v) tbl[v - ll] = c[kk].act;
+    return [this, ll, len, tbl, &actions](const SwCtx& ctx) -> LamPtr {
+      long long off2 = -ll - ctx.off;
+      LamPtr arg; Ident sv;
+      if (off2 == 0) arg = ctx.arg;
+      else { sv = fresh("switcher"); arg = varof(sv); }
+      auto sw = mk(Lam::K::Switch); sw->cond = arg;
+      for (int kk = 0; kk < len; ++kk)
+        sw->sw_consts.push_back({kk, clone_or_leaf(tbl[kk], actions)});
+      if (off2 == 0) return sw;
+      auto offn = mk(Lam::K::Prim); offn->prim = Prim::Offsetint;
+      offn->prim_arg = (int)off2; offn->args = {ctx.arg};
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{sv, ValueKind::Gen, offn, /*alias=*/true}};
+      l->body = sw; return l;
+    };
+  }
+  LamPtr clone_or_leaf(int act, const std::vector<LamPtr>& actions) {
+    if (act == 0) { auto e = mk(Lam::K::Staticraise); e->prim_arg = kDefaultLeaf; return e; }
+    return actions[act];
+  }
+  // make_clusters (switch.ml:916): turn the cluster choice `k` into a new case
+  // array whose actions are either a singleton's term or a make_switch closure.
+  void make_clusters(const std::vector<SwCase>& c, const std::vector<int>& k,
+                     const std::vector<LamPtr>& actions, std::vector<SwCase>& out_cases,
+                     std::vector<ActFn>& out_acts, bool& made_switch) {
+    std::unordered_map<int, int> single_idx;  // dedup singleton actions by orig act
+    auto get_index = [&](int act) {
+      auto it = single_idx.find(act);
+      if (it != single_idx.end()) return it->second;
+      int idx = (int)out_acts.size();
+      out_acts.push_back([this, act, &actions](const SwCtx&) { return clone_or_leaf(act, actions); });
+      single_idx[act] = idx; return idx;
+    };
+    std::vector<SwCase> rev;
+    int j = (int)c.size() - 1;
+    while (true) {
+      int i = k[j];
+      if (i == j) rev.push_back({c[i].lo, c[i].hi, get_index(c[i].act)});
+      else {
+        made_switch = true;
+        int idx = (int)out_acts.size();
+        out_acts.push_back(make_switch_act(c, i, j, actions));
+        rev.push_back({c[i].lo, c[j].hi, idx});
+      }
+      if (i <= 0) break;
+      j = i - 1;
+    }
+    out_cases.assign(rev.rbegin(), rev.rend());
+  }
+
+  // -- code generation: the test tree (switch.ml:672-808) --
+  LamPtr sw_if(const LamPtr& cond, const LamPtr& ifso, const LamPtr& ifnot) {
+    auto i = mk(Lam::K::IfThenElse); i->cond = cond; i->then_ = ifso; i->else_ = ifnot; return i;
+  }
+  LamPtr sw_cmp(const std::string& op, const LamPtr& arg, long long i) {
+    auto p = mk(Lam::K::Prim); p->prim = Prim::IntCmp; p->prim_id = op;
+    p->args = {arg, cint(i)}; return p;
+  }
+  LamPtr make_if_lt(const LamPtr& a, long long i, const LamPtr& s, const LamPtr& n) {
+    return i == 1 ? sw_if(sw_cmp("<=", a, 0), s, n) : sw_if(sw_cmp("<", a, i), s, n);
+  }
+  LamPtr make_if_ge(const LamPtr& a, long long i, const LamPtr& s, const LamPtr& n) {
+    return i == 1 ? sw_if(sw_cmp(">", a, 0), s, n) : sw_if(sw_cmp(">=", a, i), s, n);
+  }
+  LamPtr make_if_eq(const LamPtr& a, long long i, const LamPtr& s, const LamPtr& n) { return sw_if(sw_cmp("==", a, i), s, n); }
+  LamPtr make_if_ne(const LamPtr& a, long long i, const LamPtr& s, const LamPtr& n) { return sw_if(sw_cmp("!=", a, i), s, n); }
+  // `(if arg ifso ifnot)` -- bytecode's make_is_nonzero / arg_as_test are the identity.
+  LamPtr make_if_bool(const LamPtr& a, const LamPtr& s, const LamPtr& n) { return sw_if(a, s, n); }
+  LamPtr isout_node(long long d, const LamPtr& arg) {
+    auto p = mk(Lam::K::Prim); p->prim = Prim::IntCmp; p->prim_id = "isout";
+    p->args = {cint(d), arg}; return p;  // prints `(isout d arg)`
+  }
+  // make_if_out / make_if_in (switch.ml:701-729): interval test, binding a shifted
+  // `switcher` alias when the lower bound l != 0 so nested tests reuse it.
+  LamPtr make_if_io(bool is_in, const SwCtx& ctx, long long l, long long d,
+                    const std::function<LamPtr(const SwCtx&)>& mk_so,
+                    const std::function<LamPtr(const SwCtx&)>& mk_no) {
+    auto mk_test = [&](long long dd, const LamPtr& arg, const LamPtr& so, const LamPtr& no) {
+      LamPtr t = isout_node(dd, arg);
+      if (is_in) { auto nt = mk(Lam::K::Prim); nt->prim = Prim::IntCmp; nt->prim_id = "not"; nt->args = {t}; t = nt; }
+      return sw_if(t, so, no);
+    };
+    if (l == 0) return mk_test(d, ctx.arg, mk_so(ctx), mk_no(ctx));
+    Ident sv = fresh("switcher");
+    SwCtx c2{-l + ctx.off, varof(sv)};
+    auto offn = mk(Lam::K::Prim); offn->prim = Prim::Offsetint; offn->prim_arg = (int)(-l); offn->args = {ctx.arg};
+    auto inner = mk_test(d, c2.arg, mk_so(c2), mk_no(c2));
+    auto let = mk(Lam::K::Let);
+    let->bindings = {{sv, ValueKind::Gen, offn, /*alias=*/true}};
+    let->body = inner; return let;
+  }
+  LamPtr c_test(const SwCtx& ctx, const std::vector<SwCase>& cases, const std::vector<ActFn>& actions) {
+    int lc = (int)cases.size();
+    if (lc == 1) return actions[cases[0].act](ctx);
+    auto w = opt_count(cases).first;
+    if (w.k == TR::No) return actions[cases[0].act](ctx);
+    if (w.k == TR::Inter) {
+      long long low, high; std::vector<SwCase> inside, outside;
+      coupe_inter((int)w.i, (int)w.j, cases, low, high, inside, outside);
+      Ctests cinside = opt_count(inside).second.first, coutside = opt_count(outside).second.first;
+      if (low == high) {
+        if (less_tests(coutside, cinside))
+          return make_if_eq(ctx.arg, low + ctx.off, c_test(ctx, inside, actions), c_test(ctx, outside, actions));
+        return make_if_ne(ctx.arg, low + ctx.off, c_test(ctx, outside, actions), c_test(ctx, inside, actions));
+      }
+      auto in_fn = [&](const SwCtx& c) { return c_test(c, inside, actions); };
+      auto out_fn = [&](const SwCtx& c) { return c_test(c, outside, actions); };
+      if (less_tests(coutside, cinside)) return make_if_io(true, ctx, low + ctx.off, high - low, in_fn, out_fn);
+      return make_if_io(false, ctx, low + ctx.off, high - low, out_fn, in_fn);
+    }
+    // Sep i
+    long long lim; std::vector<SwCase> left, right; coupe(cases, (int)w.i, lim, left, right);
+    Ctests cleft = opt_count(left).second.first, cright = opt_count(right).second.first;
+    if (w.i == 1 && (lim + ctx.off) == 1 && cases[0].lo + ctx.off == 0) {
+      // both make_if_bool and make_if_nonzero are `(if arg ..)` in bytecode
+      return make_if_bool(ctx.arg, c_test(ctx, right, actions), c_test(ctx, left, actions));
+    } else if (less_tests(cright, cleft))
+      return make_if_lt(ctx.arg, lim + ctx.off, c_test(ctx, left, actions), c_test(ctx, right, actions));
+    return make_if_ge(ctx.arg, lim + ctx.off, c_test(ctx, right, actions), c_test(ctx, left, actions));
+  }
+
+  // -- default sharing (abstract_shared / PR#11893): if the default is reached
+  // from >=2 leaves, share it behind one `(catch .. with (N) default)`. --
+  static int count_default_leaves(const LamPtr& l) {
+    if (!l) return 0;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == kDefaultLeaf && l->args.empty()) return 1;
+    int c = count_default_leaves(l->fn) + count_default_leaves(l->body) +
+            count_default_leaves(l->cond) + count_default_leaves(l->then_) +
+            count_default_leaves(l->else_) + count_default_leaves(l->sw_default);
+    for (auto& a : l->args) c += count_default_leaves(a);
+    for (auto& b : l->bindings) c += count_default_leaves(b.val);
+    for (auto& sc : l->sw_consts) c += count_default_leaves(sc.body);
+    for (auto& sc : l->sw_blocks) c += count_default_leaves(sc.body);
+    return c;
+  }
+  // Inline the single default leaf (replace it in place), or set every default
+  // leaf to `(exit eid)`.  Returns whether any leaf was a default sentinel.
+  static void rewrite_default_leaves(const LamPtr& l, int eid, const LamPtr& inline_with) {
+    if (!l) return;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == kDefaultLeaf && l->args.empty()) {
+      if (inline_with) *l = *inline_with; else l->prim_arg = eid;
+      return;
+    }
+    rewrite_default_leaves(l->fn, eid, inline_with); rewrite_default_leaves(l->body, eid, inline_with);
+    rewrite_default_leaves(l->cond, eid, inline_with); rewrite_default_leaves(l->then_, eid, inline_with);
+    rewrite_default_leaves(l->else_, eid, inline_with); rewrite_default_leaves(l->sw_default, eid, inline_with);
+    for (auto& a : l->args) rewrite_default_leaves(a, eid, inline_with);
+    for (auto& b : l->bindings) rewrite_default_leaves(b.val, eid, inline_with);
+    for (auto& sc : l->sw_consts) rewrite_default_leaves(sc.body, eid, inline_with);
+    for (auto& sc : l->sw_blocks) rewrite_default_leaves(sc.body, eid, inline_with);
+  }
+
+  // A conservative structural key for an action body, used only to detect when
+  // ocamlc would *share* two equal bodies in a switch (which we don't model) so
+  // we can bail to int_cases.  Returns "" for terms ocamlc's make_key rejects
+  // (functions/letrec/loops) -- those are never shared, so never trigger a bail.
+  static std::string make_lam_key(const LamPtr& l) {
+    if (!l) return "_";
+    using K = Lam::K;
+    switch (l->k) {
+      case K::Function: case K::Letrec: case K::For: case K::While: return "";
+      case K::Var: return "v" + l->var.name + "#" + std::to_string(l->var.stamp);
+      case K::Mutvar: return "m" + l->var.name + "#" + std::to_string(l->var.stamp);
+      case K::ConstInt: return "i" + std::to_string(l->int_val);
+      case K::ConstChar: return "c" + std::to_string(l->int_val);
+      case K::ConstFloat: return "f" + l->str_val;
+      case K::ConstString: return "s" + l->str_val;
+      default: break;
+    }
+    std::string r = "(" + std::to_string((int)l->k);
+    if (l->k == K::Prim) r += ":" + std::to_string((int)l->prim) + ":" + l->prim_id + ":" + std::to_string(l->prim_arg);
+    auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key(c); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+    add(l->fn); add(l->cond); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
+    for (auto& a : l->args) add(a);
+    for (auto& b : l->bindings) { if (!r.empty()) r += " b" + std::to_string(b.id.stamp); add(b.val); }
+    for (auto& sc : l->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
+    for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
+    if (r.empty()) return "";
+    return r + ")";
+  }
+  // Entry point: an int/char-constant match with a trailing catch-all.  Returns
+  // null (deferring to int_cases) unless at least one jump table is generated --
+  // i.e. unless ocamlc would emit a switch rather than a plain if-chain.
+  LamPtr switcher_match(const LamPtr& scrut, const std::vector<Row>& rows) {
+    if (scrut->k != Lam::K::Var) return nullptr;
     struct KV { long long v; const Expression* rhs; };
     std::vector<KV> kvs;
     const Row* dflt = nullptr;
@@ -4919,7 +5316,7 @@ struct Translator {
       if (r.guard) return nullptr;
       const Pattern* p = effective_pat(r.lhs);
       if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
-        if (dflt) return nullptr;  // a case after the catch-all: bail
+        if (dflt) return nullptr;  // a case after the catch-all
         if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
           if (pi->suffix) return nullptr;  // boxed-int literal
           is_int = true; kvs.push_back({parse_ocaml_int(pi->value), r.rhs});
@@ -4930,34 +5327,72 @@ struct Translator {
         dflt = &r;
       } else return nullptr;
     }
-    if ((is_int && is_char) || !dflt || kvs.size() < 3) return nullptr;
+    if ((is_int && is_char) || !dflt || kvs.size() < 2) return nullptr;
     std::sort(kvs.begin(), kvs.end(), [](auto& a, auto& b) { return a.v < b.v; });
     for (size_t i = 1; i < kvs.size(); ++i)
-      if (kvs[i].v != kvs[i - 1].v + 1) return nullptr;  // gap or duplicate: not dense
-    long long base = kvs.front().v, span = kvs.back().v - base;
-    bool offset = base != 0;
-    Ident swid;
-    LamPtr sw_arg = scrut;
-    if (offset) { swid = fresh("switcher"); sw_arg = varof(swid); }
-    // case bodies in source (value) order, then the default body (catch-all
-    // var binds to the original scrutinee)
-    auto switchn = mk(Lam::K::Switch); switchn->cond = sw_arg;
-    for (auto& kv : kvs)
-      switchn->sw_consts.push_back({(int)(kv.v - base), expr(*kv.rhs)});
+      if (kvs[i].v == kvs[i - 1].v) return nullptr;  // duplicate value: bail
+
+    // Translate the case bodies (source order) and the default body once.  If
+    // any two bodies are structurally identical, ocamlc would *share* them in
+    // the switch (which we don't model); bail so int_cases stays exact.
+    std::vector<LamPtr> actions(1);  // index 0 = default (emitted via sentinel)
+    std::vector<std::string> body_keys;
+    actions.resize(kvs.size() + 1);
+    std::vector<int> act_of(kvs.size());
+    // bodies must be translated in source order for stable stamp normalization
+    std::vector<const Expression*> by_src;
+    for (auto& r : rows) if (!r.guard) { const Pattern* p = effective_pat(r.lhs);
+      if (std::get_if<Ppat_constant>(&p->desc)) by_src.push_back(r.rhs); }
+    std::unordered_map<const Expression*, int> src_idx;
+    for (size_t i = 0; i < kvs.size(); ++i) {
+      // find this kv's source position -> action index (1-based, source order)
+      int pos = 0; for (size_t s = 0; s < by_src.size(); ++s) if (by_src[s] == kvs[i].rhs) { pos = (int)s; break; }
+      act_of[i] = pos + 1;
+    }
+    for (size_t s = 0; s < by_src.size(); ++s) {
+      LamPtr b = expr(*by_src[s]);
+      std::string key = make_lam_key(b);
+      for (auto& bk : body_keys) if (bk == key && !key.empty()) return nullptr;  // shared body
+      body_keys.push_back(key);
+      actions[s + 1] = b;
+    }
     scope.emplace_back();
     bind_catchall(*dflt->lhs, scrut);
-    LamPtr def = expr(*dflt->rhs);
+    LamPtr default_body = expr(*dflt->rhs);
     scope.pop_back();
-    auto io = mk(Lam::K::Prim); io->prim = Prim::IntCmp; io->prim_id = "isout";
-    io->args = {cint(span), sw_arg};  // prints `(isout span switcher)`
-    auto iff = mk(Lam::K::IfThenElse); iff->cond = io; iff->then_ = def; iff->else_ = switchn;
-    if (!offset) return iff;
-    auto off = mk(Lam::K::Prim); off->prim = Prim::Offsetint;
-    off->prim_arg = -(int)base; off->args = {scrut};
-    auto l = mk(Lam::K::Let);
-    l->bindings = {{swid, ValueKind::Gen, off, /*alias=*/true}};
-    l->body = iff;
-    return l;
+    {  // a case body equal to the default is folded into the default by ocamlc
+      std::string dk = make_lam_key(default_body);
+      if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) return nullptr;
+    }
+
+    // Build the interval cover (matching.ml as_interval_canfail, distinct values).
+    const long long LOW = is_char ? 0 : (LLONG_MIN / 4);
+    const long long HIGH = is_char ? 255 : (LLONG_MAX / 4);
+    std::vector<SwCase> cases;
+    long long firstv = kvs.front().v, lastv = kvs.back().v;
+    if (LOW < firstv) cases.push_back({LOW, firstv - 1, 0});
+    for (size_t i = 0; i < kvs.size(); ++i) {
+      cases.push_back({kvs[i].v, kvs[i].v, act_of[i]});
+      if (i + 1 < kvs.size() && kvs[i + 1].v > kvs[i].v + 1)
+        cases.push_back({kvs[i].v + 1, kvs[i + 1].v - 1, 0});
+    }
+    if (lastv < HIGH) cases.push_back({lastv + 1, HIGH, 0});
+
+    sw_ok_inter_ = std::llabs(firstv) <= (1 << 16) && std::llabs(lastv) <= (1 << 16);
+    sw_memo_.clear();
+    std::vector<int> k; comp_clusters(cases, k);
+    std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
+    make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
+    if (!made_switch) return nullptr;  // ocamlc emits an if-chain -> let int_cases match
+
+    LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
+    int nd = count_default_leaves(tree);
+    if (nd == 0) return tree;
+    if (nd == 1) { rewrite_default_leaves(tree, 0, default_body); return tree; }
+    int eid = ++next_exit_;
+    rewrite_default_leaves(tree, eid, nullptr);
+    auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid; cat->then_ = default_body;
+    return cat;
   }
   // A catch-all `n -> ...` binds n to the scrutinee (which, for a var scrutinee,
   // is just an alias to its binder).
