@@ -27,10 +27,16 @@ if [ "$build" -eq 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker build -t "$IMAGE" "$REPO_DIR"
 fi
 
-# Bind-mount the repo; add ~/.claude if it exists so auth/memory persist.
+# Bind-mount the repo. Also persist Claude Code state from the host: the
+# ~/.claude DIRECTORY (credentials, projects, sessions, memory) *and* the
+# ~/.claude.json FILE (onboarding, project list, history) -- both are needed or
+# Claude Code starts as a brand-new install.
 mounts=( -v "$REPO_DIR:$CONTAINER_REPO" )
 if [ -d "$HOME/.claude" ]; then
   mounts+=( -v "$HOME/.claude:/home/mbac/.claude" )
+fi
+if [ -f "$HOME/.claude.json" ]; then
+  mounts+=( -v "$HOME/.claude.json:/home/mbac/.claude.json" )
 fi
 
 # Pass the host UID/GID so the entrypoint drops to a matching user -- files
