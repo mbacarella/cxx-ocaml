@@ -1299,3 +1299,34 @@ Dashboard: **exec 94.2% (680/722), lambda 47.9% (356), instr 52.1%,
 completeness 100% (0/744)** — gates held; HM unit tests green. pr7657 flipped
 to MATCH. (syntactic_arity/max_arity still DIFF — they need definition-site
 optional *defaults* with patterns + `__FUNCTION__`, distinct features.)
+
+## Lambda near-miss climb (2026-06-13, cont.)
+
+Switched from exec to lambda-parity near-misses (ranked by normalized diff size,
+/tmp/{lnorm.pl,lrank.sh,ldiff.sh}). Two fixes, +15 files:
+
+- **`if c then e` (no else) is unit-typed** (infer). The else-less conditional
+  was typed as the then-branch's type, so a unit-returning `if c then <stmts>`
+  body (in-place loops like quicksort's `qsort`, no else) had an unresolved
+  return type and dropped ocamlc's `: int` return annotation. Constrain the
+  branch to unit (softly in the strict pass to avoid false-rejecting a branch we
+  mis-typed; firmly in the value-kinds pass) and return unit. +3.
+
+- **value-or-exception catch var named `val` + scrutinee kind** (lambda).
+  `match e with exception P -> .. | <non-var> -> ..` lowers to
+  `(catch (try (exit N e) with exn ..) with (N v) <value match>)`; ocamlc names
+  the handler param after the first value-row variable, else its default `val`
+  (Matching.name_pattern), with the scrutinee's value kind (`with (1 val/4[int])`).
+  We used a `*match*` temp with no kind, so every such match (pervasive across the
+  effects/exception-handling tests) diffed by that one line. +12.
+
+Dashboard: **lambda 49.9% (371/743, was 356 at session start), exec 94.3%
+(681/722), instr 52.1%, completeness 100% (0/744)** — gates held throughout.
+
+Remaining near-misses are now heterogeneous: function return-kind in
+effect/continuation/qualified-call bodies (lazy2 `Lazy.force` -> Any not unit,
+~8 files), `=o`/`=a` let-binding kind (~3), module-field `field_mut` vs
+`field_imm` (include re-export / recursive modules / opaque defs — distinct
+rules per case, ~3, regression-risky), curried-vs-flattened stdlib applies
+(sort_sub, input_lines). No single cheap shared fix remains; each needs
+per-case work.
