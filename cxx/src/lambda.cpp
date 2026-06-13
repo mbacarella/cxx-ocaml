@@ -2099,6 +2099,24 @@ struct Translator {
     if (prim == "%opaque" && n == 1) return ic("opaque");
     if (prim == "%ignore" && n == 1) return ic("ignore");
     if (prim == "%identity" && n == 1) return argv[0];
+    // Array/string/bytes element access as a value (eta-stub): the operand type
+    // is unknown here, so the generic spelling (a runtime-tag-checked access).
+    if ((prim == "%array_unsafe_get" || prim == "%array_safe_get" ||
+         prim == "%array_get") && n == 2)
+      return ic(prim == "%array_unsafe_get" ? "array.unsafe_get[gen]" : "array.get[gen]");
+    if ((prim == "%array_unsafe_set" || prim == "%array_safe_set" ||
+         prim == "%array_set") && n == 3)
+      return ic(prim == "%array_unsafe_set" ? "array.unsafe_set[gen]" : "array.set[gen]");
+    if (prim == "%array_length" && n == 1) return ic("array.length[gen]");
+    if (prim == "%string_unsafe_get" && n == 2) return ic("string.unsafe_get");
+    if ((prim == "%string_safe_get" || prim == "%string_get") && n == 2) return ic("string.get");
+    if (prim == "%bytes_unsafe_get" && n == 2) return ic("bytes.unsafe_get");
+    if ((prim == "%bytes_safe_get" || prim == "%bytes_get") && n == 2) return ic("bytes.get");
+    if (prim == "%bytes_unsafe_set" && n == 3) return ic("bytes.unsafe_set");
+    if ((prim == "%bytes_safe_set" || prim == "%bytes_set") && n == 3) return ic("bytes.set");
+    if (prim == "%string_length" && n == 1) return ic("string.length");
+    if (prim == "%bytes_length" && n == 1) return ic("bytes.length");
+    if ((prim == "%bytes_to_string" || prim == "%string_to_bytes") && n == 1) return argv[0];
     if (prim == "%perform" && n == 1) return cc("perform");
     if (prim == "%lazy_force" && n == 1) return force_lazy(argv[0]);
     if (prim == "%obj_is_int" && n == 1) return ic("isint");
