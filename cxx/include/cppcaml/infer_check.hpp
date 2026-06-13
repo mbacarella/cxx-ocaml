@@ -54,6 +54,11 @@ struct ValueKinds {
   // full path -- the back end resolves unqualified record labels through the
   // base expression's inferred type (heap_stats.major_collections).
   std::unordered_map<const void*, std::string> expr_constr;
+  // Expressions of type `?l:.. -> ..` used where a non-optional arrow is expected:
+  // the back end eta-expands them, inserting None for each erased optional.  The
+  // bool vector is the resulting application's argument slots (true = None for an
+  // erased optional, false = an eta parameter).
+  std::unordered_map<const ast::Expression*, std::vector<bool>> optional_erasures;
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 

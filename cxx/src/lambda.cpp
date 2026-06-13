@@ -5732,7 +5732,41 @@ struct Translator {
     return chain;
   }
 
+  // Eta-expand an optional-argument-erased value: `(let (arg = inner) (function
+  // eta.. (apply arg <slots>)))`, where each `true` slot is a None (0) for an
+  // erased optional and each `false` slot is one of the eta parameters.
+  std::set<const Expression*> erasure_active_;
+  LamPtr wrap_optional_erasure(LamPtr inner, const std::vector<bool>& slots) {
+    Ident argid = fresh("arg");
+    auto fn = mk(Lam::K::Function);
+    std::vector<Ident> etas;
+    for (bool none_slot : slots)
+      if (!none_slot) { Ident e = fresh("eta"); etas.push_back(e); fn->params.push_back({e, ValueKind::Gen}); }
+    auto ap = mk(Lam::K::Apply);
+    auto argv = mk(Lam::K::Var); argv->var = argid; ap->fn = argv;
+    size_t ei = 0;
+    for (bool none_slot : slots) {
+      if (none_slot) ap->args.push_back(mk(Lam::K::ConstInt));  // None == 0
+      else { auto ev = mk(Lam::K::Var); ev->var = etas[ei++]; ap->args.push_back(ev); }
+    }
+    fn->body = ap;
+    auto let = mk(Lam::K::Let);
+    let->bindings = {{argid, ValueKind::Gen, inner}};
+    let->body = fn;
+    return let;
+  }
+
   LamPtr expr(const Expression& e) {
+    // Optional-argument erasure: a `?l:.. -> ..`-typed value used where a
+    // non-optional arrow is expected is eta-expanded (None for the omitted
+    // optional).  Re-enter once (guarded) to translate the inner value, wrap it.
+    if (auto it = vk.optional_erasures.find(&e);
+        it != vk.optional_erasures.end() && !erasure_active_.count(&e)) {
+      erasure_active_.insert(&e);
+      LamPtr inner = expr(e);
+      erasure_active_.erase(&e);
+      return wrap_optional_erasure(inner, it->second);
+    }
     // The rec-RHS spine flag holds only along tail spines: take it, clear it,
     // and re-set it just before each spine-continuing body recursion below.
     bool rec_spine = rec_spine_;

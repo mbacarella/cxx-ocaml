@@ -121,6 +121,12 @@ struct Checker {
   std::unordered_map<const void*, TypePtr> rec_ret_;
   std::unordered_map<const void*, TypePtr> rec_expr_;  // every expression's type
   std::set<const Expression*> fmt_lits_;  // string literals inferred at format type
+  // Optional-argument erasure: an expression of type `?l:.. -> ..` used where a
+  // non-optional arrow is expected is eta-expanded with None for each erased
+  // optional.  The bool vector is the application's argument slots in order
+  // (true = a None for an erased optional, false = an eta-expansion parameter);
+  // the Lambda back end builds `(let (arg = e) (function eta.. (apply arg ..)))`.
+  std::unordered_map<const Expression*, std::vector<bool>> erasures_;
   // Local variant types whose constructors are all constant (nullary): these have
   // an immediate (int) runtime representation, so a value of such a type gets the
   // [int] value kind in the Lambda dump.
@@ -1359,7 +1365,37 @@ struct Checker {
         }
         return expected;
       }
-    return infer_expr(e);
+    TypePtr t = infer_expr(e);
+    // Optional-argument erasure (ocaml's type_argument): a value of type
+    // `?l:.. -> ..` used where a non-optional arrow is expected is eta-expanded
+    // with None for the omitted optional(s).  Recorded for the Lambda back end;
+    // only in the value-kinds pass (the strict pass uses soft propagation, so the
+    // un-erased type returned here never causes a false-rejection).
+    if (record_kinds_) {
+      std::vector<bool> slots;
+      bool erased = false;
+      TypePtr a = I::Engine::repr(t), ex = I::Engine::repr(expected);
+      while (a->kind == I::Type::Kind::Arrow) {
+        bool ex_arrow = ex->kind == I::Type::Kind::Arrow;
+        if (a->arrow_label == 2 &&
+            !(ex_arrow && ex->arrow_label == 2 && ex->arrow_lbl == a->arrow_lbl)) {
+          slots.push_back(true);  // erase this optional -> None
+          erased = true;
+          a = I::Engine::repr(a->cod);
+          continue;
+        }
+        if (!ex_arrow) break;
+        slots.push_back(false);  // a kept parameter -> eta param
+        a = I::Engine::repr(a->cod);
+        ex = I::Engine::repr(ex->cod);
+      }
+      // Need at least one erased optional and at least one kept (eta) parameter:
+      // a trailing-only optional with nothing after it isn't eta-expandable here.
+      if (erased)
+        for (bool none_slot : slots)
+          if (!none_slot) { erasures_[&e] = slots; break; }
+    }
+    return t;
   }
 
   TypePtr infer_expr(const Expression& e) {
@@ -1516,6 +1552,12 @@ struct Checker {
         return s->cod;
       }
       TypePtr bt = infer_expr(*fld->e);
+      // The predefined `'a ref = { mutable contents : 'a }` cell.
+      if (lid_last(fld->field.txt) == "contents") {
+        TypePtr rb = I::Engine::repr(bt);
+        if (rb->kind == I::Type::Kind::Constr && rb->path == "ref" && rb->args.size() == 1)
+          return rb->args[0];
+      }
       // A module-qualified field `e.M.label` of a stdlib record: its declared type.
       if (auto* d = std::get_if<Ldot>(&fld->field.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
@@ -2399,6 +2441,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
       vk.expr_constr[e] = r->path;  // module-qualified type, e.g. "Gc.stat"
   }
   vk.format_lits = std::move(ck.fmt_lits_);
+  vk.optional_erasures = std::move(ck.erasures_);
   return vk;
 }
 
