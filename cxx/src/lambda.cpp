@@ -1139,6 +1139,12 @@ struct Translator {
     int i = 0;
     for (auto& it : ps->items) {
       if (auto* v = std::get_if<Psig_value>(&it.desc)) ml[v->vd.name.txt] = i++;
+      else if (auto* ex = std::get_if<Psig_exception>(&it.desc))
+        ml[ex->exn.ctor.name.txt] = i++;  // exceptions occupy slots
+      else if (auto* tx = std::get_if<Psig_typext>(&it.desc))
+        for (auto& c : tx->ext.ctors) ml[c.name.txt] = i++;
+      else if (auto* cl = std::get_if<Psig_class>(&it.desc))
+        for (auto& d : cl->decls) ml[d.name.txt] = i++;  // so do classes
       else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
         if (!md->md.name.txt) continue;
         const std::string& nm = *md->md.name.txt;
@@ -7289,22 +7295,49 @@ struct Translator {
   // The runtime field layout (value/module names, in order) of a module-type
   // signature -- a functor parameter's value layout.  (externals/types take no
   // slot; only regular values, submodules, and exceptions do.)
-  // The CamlinternalMod SHAPE of a recursive module's signature: `Module
-  // [| Function; .. |]` as a structured constant ([0: [0: 0 ..]]).  Only
-  // function-typed values are safe to pre-allocate as dummies; any other
-  // member returns null (the binding then keeps the old behavior).
+  // Does this type constructor name Lazy.t (the predef lazy_t)?
+  static bool is_lazy_lid(const Longident& lid) {
+    if (auto* l = std::get_if<Lident>(&lid.v)) return l->name == "lazy_t";
+    if (auto* d = std::get_if<Ldot>(&lid.v))
+      if (auto* p = std::get_if<Lident>(&d->prefix->v))
+        return d->name == "t" && (p->name == "Lazy" || p->name == "Stdlib__Lazy");
+    return false;
+  }
+  // The CamlinternalMod SHAPE of a recursive module's signature, mirroring
+  // translmod's init_shape: values map to Function (0) or Lazy (1), classes
+  // to Class (2), submodules to `Module [|..|]` ([0: [0: ..]]); types and
+  // module types take no slot.  Non-function/lazy values are rejected
+  // upstream ("cannot be safely evaluated"); we return null and the binding
+  // keeps the old behavior.
   LamPtr recmod_shape(const ModuleType& mt) {
     auto* ps = std::get_if<Pmty_signature>(&mt.desc);
     if (!ps) return nullptr;
     std::vector<LamPtr> elems;
     for (auto& it : ps->items) {
       if (auto* v = std::get_if<Psig_value>(&it.desc)) {
-        if (!std::get_if<Ptyp_arrow>(&v->vd.type->desc)) return nullptr;
-        elems.push_back(cint(0));  // Function
-      } else if (std::holds_alternative<Psig_type>(it.desc)) {
+        if (std::get_if<Ptyp_arrow>(&v->vd.type->desc)) {
+          elems.push_back(cint(0));  // Function
+        } else if (auto* tc = std::get_if<Ptyp_constr>(&v->vd.type->desc);
+                   tc && is_lazy_lid(tc->id.txt)) {
+          elems.push_back(cint(1));  // Lazy
+        } else {
+          return nullptr;  // non-function value: unsafe upstream
+        }
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (!m->md.name.txt) continue;
+        LamPtr sub = recmod_shape(*m->md.type);  // Module of recursive shapes
+        if (!sub) return nullptr;
+        elems.push_back(sub);
+      } else if (auto* cl = std::get_if<Psig_class>(&it.desc)) {
+        for (size_t i = 0; i < cl->decls.size(); ++i)
+          elems.push_back(cint(2));  // Class
+      } else if (std::holds_alternative<Psig_type>(it.desc) ||
+                 std::holds_alternative<Psig_modtype>(it.desc) ||
+                 std::holds_alternative<Psig_class_type>(it.desc) ||
+                 std::holds_alternative<Psig_primitive>(it.desc)) {
         continue;  // no runtime slot
       } else {
-        return nullptr;  // submodules/classes/...: shapes we don't model
+        return nullptr;  // typext/exception/...: unsafe upstream
       }
     }
     auto arr = mk(Lam::K::ConstBlock);
@@ -8089,10 +8122,8 @@ struct Translator {
             ap->args = {loc_block(rm.bodyme->loc), rm.shape};
             cur.push_back({rm.id, ValueKind::Gen, ap});
             module_ident_[*rm.mb->name.txt] = rm.id;
-            auto lay = sig_layout(*rm.sig);
-            auto& ml = module_layout_[*rm.mb->name.txt];
-            ml.clear();
-            for (int i = 0; i < (int)lay.size(); ++i) ml[lay[i]] = i;
+            // nested layouts too, so M.Sub.f paths through the dummy resolve
+            register_sig_layouts(*rm.mb->name.txt, *rm.sig);
           }
           for (auto& rm : rms) {
             LamPtr body;
