@@ -5191,9 +5191,34 @@ struct Translator {
           bool had_i = module_ident_.count(nm), had_a = module_alias_.count(nm);
           Ident sav_i = had_i ? module_ident_[nm] : Ident{};
           LamPtr sav_a = had_a ? module_alias_[nm] : nullptr;
-          auto sav_l = module_layout_[nm];
+          // every layout/functor key at/under M is scoped to the body too
+          // (copy_layout_subtree below adds dotted keys like "M.Make")
+          auto under = [&](const std::string& k) {
+            return k == nm || (k.size() > nm.size() && k[nm.size()] == '.' &&
+                               k.compare(0, nm.size(), nm) == 0);
+          };
+          auto snap = [&](auto& map) {
+            std::vector<std::pair<std::string,
+                typename std::decay_t<decltype(map)>::mapped_type>> s;
+            for (auto& [k, v] : map) if (under(k)) s.emplace_back(k, v);
+            return s;
+          };
+          auto unsnap = [&](auto& map, auto& s) {
+            for (auto it2 = map.begin(); it2 != map.end();)
+              if (under(it2->first)) it2 = map.erase(it2); else ++it2;
+            for (auto& [k, v] : s) map[k] = std::move(v);
+          };
+          auto sav_l = snap(module_layout_);
+          auto sav_fr = snap(functor_result_);
+          auto sav_fp = snap(functor_param_);
           auto& lay = module_layout_[nm]; lay.clear();
           for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+          // a module-path RHS adopts the source's layout subtree (functor
+          // members included): `let module S2 = S in .. S2.Make(..)`
+          if (auto* pi2 = std::get_if<Pmod_ident>(&mb.expr.desc)) {
+            std::string dotted;
+            if (lid_to_dotted(pi2->id.txt, dotted)) copy_layout_subtree(dotted, nm);
+          }
           LamPtr result;
           if (is_pure_path(modval)) {  // `let module M = <path>`: an alias, elided
             module_alias_[nm] = modval; module_ident_.erase(nm);
@@ -5207,7 +5232,9 @@ struct Translator {
           }
           if (had_i) module_ident_[nm] = sav_i; else module_ident_.erase(nm);
           if (had_a) module_alias_[nm] = sav_a; else module_alias_.erase(nm);
-          module_layout_[nm] = sav_l;
+          unsnap(module_layout_, sav_l);
+          unsnap(functor_result_, sav_fr);
+          unsnap(functor_param_, sav_fp);
           return result;
         }
       // `let exception E [of t] in body`: a fresh exception identity per
@@ -7332,18 +7359,35 @@ struct Translator {
               if (md.name == d->name) return mt_fields(cmi, md.type);
           } catch (...) {}
     }
-    if (auto* ps = std::get_if<Pmty_signature>(&mt.desc))
-      for (auto& it : ps->items) {
-        if (auto* v = std::get_if<Psig_value>(&it.desc)) out.push_back(v->vd.name.txt);
-        else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
-          if (m->md.name.txt) out.push_back(*m->md.name.txt);
-        } else if (auto* ex = std::get_if<Psig_exception>(&it.desc))
-          out.push_back(ex->exn.ctor.name.txt);  // exceptions occupy slots
-        else if (auto* tx = std::get_if<Psig_typext>(&it.desc))
-          for (auto& c : tx->ext.ctors) out.push_back(c.name.txt);
-        else if (auto* cl = std::get_if<Psig_class>(&it.desc))
-          for (auto& d : cl->decls) out.push_back(d.name.txt);
-      }
+    if (auto* ps = std::get_if<Pmty_signature>(&mt.desc)) {
+      // `module type S = ..` siblings have no slot but a later `include S`
+      // (which splices S's fields here) resolves through them
+      std::unordered_map<std::string, const ModuleType*> local_mts;
+      std::function<void(const Pmty_signature&)> walk = [&](const Pmty_signature& sg) {
+        for (auto& it : sg.items) {
+          if (auto* v = std::get_if<Psig_value>(&it.desc)) out.push_back(v->vd.name.txt);
+          else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+            if (m->md.name.txt) out.push_back(*m->md.name.txt);
+          } else if (auto* ex = std::get_if<Psig_exception>(&it.desc))
+            out.push_back(ex->exn.ctor.name.txt);  // exceptions occupy slots
+          else if (auto* tx = std::get_if<Psig_typext>(&it.desc))
+            for (auto& c : tx->ext.ctors) out.push_back(c.name.txt);
+          else if (auto* cl = std::get_if<Psig_class>(&it.desc))
+            for (auto& d : cl->decls) out.push_back(d.name.txt);
+          else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
+            if (pmt->type) local_mts[pmt->name.txt] = &*pmt->type;
+          } else if (auto* pin = std::get_if<Psig_include>(&it.desc)) {
+            const ModuleType* im = &pin->mt;
+            if (auto* ii = std::get_if<Pmty_ident>(&im->desc))
+              if (auto lm = local_mts.find(lid_last(ii->id.txt)); lm != local_mts.end())
+                im = lm->second;
+            if (auto* isig = std::get_if<Pmty_signature>(&im->desc)) walk(*isig);
+            else for (auto& n : sig_layout(*im)) out.push_back(n);
+          }
+        }
+      };
+      walk(*ps);
+    }
     return out;
   }
 
@@ -7531,7 +7575,7 @@ struct Translator {
   // The exported names of a structure (value/module/exception, in declaration
   // order; a redefined name moves to its last position) -- the runtime layout,
   // computed statically (no compilation/side effects).
-  static std::vector<std::string> struct_export_names(const Structure& s) {
+  std::vector<std::string> struct_export_names(const Structure& s) {
     std::vector<std::string> out;
     auto add = [&](const std::string& n) {
       for (size_t i = 0; i < out.size(); ++i) if (out[i] == n) { out.erase(out.begin() + i); break; }
@@ -7549,6 +7593,11 @@ struct Translator {
         for (auto& c : tx->ext.ctors) add(c.name.txt);
       } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
         for (auto& d : cl->decls) add(d.name.txt);
+      } else if (auto* pin = std::get_if<Pstr_include>(&it.desc)) {
+        // `include ME` splices ME's exported fields here
+        auto rl = module_result_layout(pin->expr);
+        if (rl.empty()) rl = arg_layout(pin->expr);  // a module path: its own fields
+        for (auto& n : rl) add(n);
       }
     }
     return out;
@@ -7574,6 +7623,8 @@ struct Translator {
         auto v = layout_vec(dotted);          // a local module / alias chain
         if (!v.empty()) return v;
         if (dotted.find('.') == std::string::npos) {
+          // a local module with no value exports shadows any stdlib namesake
+          if (module_base(dotted)) return v;
           auto& fm = fields_of(dotted);       // a stdlib module's cmi fields
           v.resize(fm.size());
           for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
