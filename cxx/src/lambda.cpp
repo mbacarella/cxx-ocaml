@@ -5092,7 +5092,30 @@ struct Translator {
       test = if_and(test, g);
       return pat_test(pv2->arg->get(), fieldimm(1, acc), test, binds);
     }
-    return false;  // lazy / array / interval / unpack: unmodeled
+    if (auto* pi = std::get_if<Ppat_interval>(&p->desc)) {
+      // `lo..hi` (char or int range): acc >= lo && acc <= hi.  A single-point
+      // range collapses to one equality.  This is correct (not byte-exact with
+      // the Switcher's `isout`); the naive matcher's safety net handles it.
+      auto bound = [](const Constant& c, long long& out) -> bool {
+        if (auto* ch = std::get_if<Pconst_char>(&c.desc)) { out = (unsigned char)ch->code; return true; }
+        if (auto* in = std::get_if<Pconst_integer>(&c.desc)) {
+          if (in->suffix) return false; out = parse_ocaml_int(in->value); return true;
+        }
+        return false;
+      };
+      long long lo, hi;
+      if (!bound(pi->c1, lo) || !bound(pi->c2, hi)) return false;
+      if (lo > hi) std::swap(lo, hi);
+      auto rel = [&](const char* op, long long v) {
+        auto t = mk(Lam::K::Prim); t->prim = Prim::IntCmp; t->prim_id = op;
+        t->args = {acc, cint(v)}; return t;
+      };
+      if (lo == hi) { test = if_and(test, rel("==", lo)); return true; }
+      LamPtr rng = if_and(rel(">=", lo), rel("<=", hi));
+      test = if_and(test, rng);
+      return true;
+    }
+    return false;  // lazy / array / unpack: unmodeled
   }
   LamPtr naive_match(const LamPtr& scrut0, const std::vector<Row>& rows0,
                      const Location& mloc) {
