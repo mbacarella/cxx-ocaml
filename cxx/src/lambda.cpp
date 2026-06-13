@@ -5979,16 +5979,18 @@ struct Translator {
         tr->then_ = exn_dispatch(tr->var, erows, 0);
         caught_exn_.pop_back();
         scope.pop_back();
-        // the catch var takes the first var/alias value row's name
+        // the catch var takes the first var/alias value row's name, else ocamlc's
+        // default "val" (Matching.name_pattern); it carries the scrutinee's kind.
         std::string vn;
         for (auto& r : vrows) {
           const Pattern* ep = effective_pat(r.lhs);
           if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) { vn = pv->name.txt; break; }
           if (auto* pa = std::get_if<Ppat_alias>(&ep->desc)) { vn = pa->name.txt; break; }
         }
-        Ident v = vn.empty() ? fresh("", true) : fresh(vn);
+        Ident v = fresh(vn.empty() ? "val" : vn);
         auto cat = mk(Lam::K::Catch);
         cat->cond = tr; cat->prim_arg = eid; cat->catch_vars = {v};
+        cat->catch_var_kinds = {expr_kind(m->e.get())};
         scope.emplace_back();
         cat->then_ = compile_match(varof(v), vrows, e.loc);
         scope.pop_back();
