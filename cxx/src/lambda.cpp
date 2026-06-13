@@ -4682,6 +4682,7 @@ struct Translator {
       if (body) return wrap_binders(body, binders);
     }
     if (auto sw = const_switch(scrut, rows)) return sw;
+    if (auto ds = dense_switch(scrut, rows)) return ds;
     if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
@@ -4899,6 +4900,64 @@ struct Translator {
     sw->cond = scrut;
     sw->sw_consts = std::move(arms);
     return sw;
+  }
+  // The Switcher (lambda/switch.ml) for a DENSE run of >=3 integer or char
+  // constant cases with a trailing catch-all: an offset + unsigned bounds
+  // check + jump table -- `(let (switcher =a (-base+ s)) (if (isout span
+  // switcher) default (switch* switcher case int 0: .. case int span: ..)))`,
+  // or directly on `s` when base==0.  Only the fully-dense case (values cover
+  // [min,max] with no gaps); gapped/sparse runs need the catch/exit default
+  // machinery, left to int_cases/naive_match.  ocamlc keeps <3 cases as an
+  // if-chain, so do we.
+  LamPtr dense_switch(const LamPtr& scrut, const std::vector<Row>& rows) {
+    if (scrut->k != Lam::K::Var) return nullptr;  // bound by compile_match first
+    struct KV { long long v; const Expression* rhs; };
+    std::vector<KV> kvs;
+    const Row* dflt = nullptr;
+    bool is_int = false, is_char = false;
+    for (auto& r : rows) {
+      if (r.guard) return nullptr;
+      const Pattern* p = effective_pat(r.lhs);
+      if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
+        if (dflt) return nullptr;  // a case after the catch-all: bail
+        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
+          if (pi->suffix) return nullptr;  // boxed-int literal
+          is_int = true; kvs.push_back({parse_ocaml_int(pi->value), r.rhs});
+        } else if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc)) {
+          is_char = true; kvs.push_back({(unsigned char)ch->code, r.rhs});
+        } else return nullptr;  // string/float
+      } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
+        dflt = &r;
+      } else return nullptr;
+    }
+    if ((is_int && is_char) || !dflt || kvs.size() < 3) return nullptr;
+    std::sort(kvs.begin(), kvs.end(), [](auto& a, auto& b) { return a.v < b.v; });
+    for (size_t i = 1; i < kvs.size(); ++i)
+      if (kvs[i].v != kvs[i - 1].v + 1) return nullptr;  // gap or duplicate: not dense
+    long long base = kvs.front().v, span = kvs.back().v - base;
+    bool offset = base != 0;
+    Ident swid;
+    LamPtr sw_arg = scrut;
+    if (offset) { swid = fresh("switcher"); sw_arg = varof(swid); }
+    // case bodies in source (value) order, then the default body (catch-all
+    // var binds to the original scrutinee)
+    auto switchn = mk(Lam::K::Switch); switchn->cond = sw_arg;
+    for (auto& kv : kvs)
+      switchn->sw_consts.push_back({(int)(kv.v - base), expr(*kv.rhs)});
+    scope.emplace_back();
+    bind_catchall(*dflt->lhs, scrut);
+    LamPtr def = expr(*dflt->rhs);
+    scope.pop_back();
+    auto io = mk(Lam::K::Prim); io->prim = Prim::IntCmp; io->prim_id = "isout";
+    io->args = {cint(span), sw_arg};  // prints `(isout span switcher)`
+    auto iff = mk(Lam::K::IfThenElse); iff->cond = io; iff->then_ = def; iff->else_ = switchn;
+    if (!offset) return iff;
+    auto off = mk(Lam::K::Prim); off->prim = Prim::Offsetint;
+    off->prim_arg = -(int)base; off->args = {scrut};
+    auto l = mk(Lam::K::Let);
+    l->bindings = {{swid, ValueKind::Gen, off, /*alias=*/true}};
+    l->body = iff;
+    return l;
   }
   // A catch-all `n -> ...` binds n to the scrutinee (which, for a var scrutinee,
   // is just an alias to its binder).

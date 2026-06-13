@@ -573,6 +573,13 @@ struct Bytegen {
               return comp_expr(env, exp->args[0], sz, add_const_unit(cont));
             if (exp->prim_id == "opaque" && exp->args.size() == 1)
               return comp_expr(env, exp->args[0], sz, cont);  // identity: no instruction
+            if (exp->prim_id == "isout" && exp->args.size() == 2)
+              // (isout span arg): push arg, span in accu, then ULTINT -- the
+              // operand order the BOUNDSWITCH/branch-fusion peephole expects
+              return comp_expr(env, exp->args[1], sz,
+                       cons(I(Op::Push),
+                         comp_expr(env, exp->args[0], sz + 1,
+                           cons(I(Op::Isout), cont))));
             // (Pintcomp c [arg; const]) -> reorder to [const; arg] and swap the
             // comparison, so the constant lands in the accumulator (matches bytegen,
             // which does this to enable the emitcode branch/compare fusion).
