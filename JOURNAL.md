@@ -1606,3 +1606,31 @@ curried-functor result layout (sets `?` removed). 2 deterministic exec flips +
 crash-class fixes. Remaining 34 dominated by OBJECTS (~10 files, translclass.ml
 -- highest ROI next) and deeper functor runtime coercion (sets/htbl/boxedints),
 plus effects/memprof/bigarray/domains/TMC/exact-GC. 100% is multi-session.
+
+## Object system: class-expression wrappers (2026-06-14)
+
+The object runtime (object literals, methods, inheritance, virtual, initializers,
+class params, coercion `:>`, polymorphic methods, self-send) already worked; the
+failing object files hit unhandled class-EXPRESSION forms that fell through to a
+`0` placeholder -> `new` read field 0 off an immediate -> segfault. Fixed four
+class-definition wrappers (each a general improvement, gated, 0 regression):
+  - `let () = e` / `let _ = e` in a class (unit/wildcard pattern, not Ppat_var)
+    -> bind a throwaway *match* temp, keep the class-creation side effect;
+  - `let open M in <class-expr>` (Pcl_open) -> push/pop the open around build;
+  - `class c : t = ..` (Pcl_constraint) -> unwrap the runtime-irrelevant ascription;
+  - `class c = let () = e in parent args` -> emit the class-creation lets and wrap
+    the class-application value with them.
+
+runtime-objects/toplevel_lets.ml now runs M1/M2/M3 correctly (was crashing at M1).
+STILL needs M4's `(let () = e in parent) ()` shape (a let INSIDE the application,
+object-creation semantics -- intricate new_init placement) to flip, then M5.
+mixin2/3 need parameterized classes with self-type constraints (`object (self :
+('a,var) #ops)`) + lazy_fix; cast needs object+extensible-type interplay.
+
+Dashboard: **exec 95.3% (688/722, flaky 687-688; was 685 at session start), lambda
+52.4% (389, held), completeness 100% (0/744, held)**. SESSION TOTAL: 9 code commits
+(polyvariant #type, functor externals, stdlib alias, curried-functor, + 4 object
+class-expr wrappers), 2 deterministic exec flips (mixin, gen_test) + crash-class
+fixes + broad object-system advance, 0 regressions on any dimension. Objects remain
+the highest-count remaining cluster; the per-file deep features (M4 nested-let-app,
+parameterized-class self-types, lazy_fix) are the next steps.
