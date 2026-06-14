@@ -1070,11 +1070,18 @@ struct Translator {
           }
         if (auto* pm = std::get_if<Pstr_module>(&item.desc))
           if (auto* ps = peel_to_structure(pm->binding.expr)) nested(ps->items);
+        if (auto* prm = std::get_if<Pstr_recmodule>(&item.desc))
+          for (auto& b : prm->bindings)
+            if (auto* ps = peel_to_structure(b.expr)) nested(ps->items);
       }
     };
-    for (auto& item : s)
+    for (auto& item : s) {
       if (auto* pm = std::get_if<Pstr_module>(&item.desc))
         if (auto* ps = peel_to_structure(pm->binding.expr)) nested(ps->items);
+      if (auto* prm = std::get_if<Pstr_recmodule>(&item.desc))
+        for (auto& b : prm->bindings)
+          if (auto* ps = peel_to_structure(b.expr)) nested(ps->items);
+    }
   }
   // The structure under `M : S = struct..end` / a functor `F (X) = struct..end`
   // (a functor body's type decls register fill-absent like a submodule's).

@@ -1884,3 +1884,23 @@ THIS GRIND TURN (no new flip, but correct general progress, 0 regressions): patm
 extension-ctor matching (line 79->143) + the location primitives. Both stash-
 verified parity-neutral. Dashboard: **exec 95.6-95.7% (691 deterministic; morematch
 flipped), lambda 52.5% (390), completeness 100% (0/744)**.
+
+## Recursive-/nested-module constructor registration (2026-06-14)
+
+register_types' `nested` fill-absent pass already recursed into `Pstr_module`
+bodies (so a submodule's bare-named ctors/records/aliases resolve) but stopped
+there. Extended it to also recurse into `Pstr_recmodule` bindings, in both the
+nested lambda and the top-level driver loop. Effect on t22ok (tree-of-sets
+recursive module): `A.Leaf`/`A.Node` -- declared inside `module rec A = struct
+type t = Leaf .. | Node .. end` -- now resolve instead of dumping `?A ?Leaf
+?Node`, so the file COMPILES (was a hard compile failure). Stash-verified parity-
+neutral: lambda DIFF list byte-identical (0 regressed / 0 improved, still 390),
+completeness 100% (744/744, 0 false-rejects).
+
+Does NOT flip t22ok: the produced binary segfaults at runtime. The blocker is the
+recmod *runtime* stack -- CamlinternalMod init_mod/update_mod safe-initialization
+combined with `ASet : Set.S with type elt = A.t = Set.Make(A)` (a functor
+application coerced through a `Pmty_with` signature) -- not constructor naming.
+That's a deep multi-feature knot (recmod runtime + functor coercion + with-
+constraint), left for a dedicated push. The ctor-registration fix is correct,
+reusable groundwork that any nested-recmodule file needs regardless.
