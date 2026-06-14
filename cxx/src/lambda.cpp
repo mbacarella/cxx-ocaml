@@ -7870,10 +7870,18 @@ struct Translator {
           auto l = mk(Lam::K::Let);
           std::vector<std::pair<const ast::ValueBinding*, Ident>> binds;
           for (auto& b : lg->bindings) {  // RHSs see the outer scope only
-            auto* pv = std::get_if<ast::Ppat_var>(&b.pat.desc);
-            if (!pv) { restore(); return nullptr; }
+            const ast::Pattern* bp = effective_pat(&b.pat);
+            auto* pv = std::get_if<ast::Ppat_var>(&bp->desc);
+            // `let () = e` / `let _ = e` (run for effect, bind nothing): the
+            // oracle binds a throwaway `*match*` and keeps the side effect.
+            bool nobind = !pv &&
+                (std::holds_alternative<ast::Ppat_any>(bp->desc) ||
+                 (std::get_if<ast::Ppat_construct>(&bp->desc) &&
+                  lid_last(std::get<ast::Ppat_construct>(bp->desc).id.txt) == "()"));
+            if (!pv && !nobind) { restore(); return nullptr; }
             LamPtr v = expr(*b.expr);
             if (rhs_leaks_param(v)) { restore(); return nullptr; }
+            if (nobind) { l->bindings.push_back({fresh("", true), ValueKind::Gen, v}); continue; }
             Ident id = fresh(pv->name.txt);
             record_fn_sig(id, b.expr.get());
             l->bindings.push_back({id, pat_kind(&b.pat), v});
@@ -9018,6 +9026,7 @@ struct Translator {
           const ClassExpr* ce = &d.expr;
           std::vector<const Pcl_fun*> params;
           std::vector<const Pcl_let*> lets;
+          int opens_pushed = 0;  // `let open M in <class-expr>` wrappers
           for (;;) {
             if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
               params.push_back(pf);
@@ -9025,6 +9034,10 @@ struct Translator {
             } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
               lets.push_back(pl);
               ce = pl->body.get();
+            } else if (auto* po = std::get_if<Pcl_open>(&ce->desc)) {
+              std::string dotted;
+              if (lid_to_dotted(po->id.txt, dotted)) { opened_.push_back(dotted); ++opens_pushed; }
+              ce = po->body.get();
             } else break;
           }
           // labelled/optional class params: record the signature for `new` sites
@@ -9106,6 +9119,7 @@ struct Translator {
                              lets.empty() ? nullptr : &lets, is_virt);
             register_class_meta(d.name.txt, ps->cs);
           }
+          for (; opens_pushed > 0; --opens_pushed) opened_.pop_back();
           add_export(d.name.txt, id);
           if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
           outs.push_back({id, v, is_virt});  // virtual classes are always dummies
