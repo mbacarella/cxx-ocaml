@@ -1859,3 +1859,28 @@ run, was 685 at start), lambda 52.5% (390), completeness 100% (0/744)**. SESSION
 morematch FLIPPED (matrix matcher: or-expansion + field scoping) + patmatch
 advanced (extension-ctor pat_test) + earlier ctor scoping, all stash-verified
 parity-neutral.
+
+## Location primitives + __FUNCTION__ (2026-06-14)
+
+Implemented the location ext-primitives (general, removes a crash class): __FILE__/
+__LINE__/__LOC__/__MODULE__/__POS__ idents + __LOC_OF__/__LINE_OF__/__POS_OF__
+applications (pair of the WHOLE application's loc info and the arg), and
+__FUNCTION__ = module path + a func_path_ stack pushed by fn_binding_rhs at each
+function-valued let. __FUNCTION__ naming handles: top-level / nested / module /
+anonymous (`.(fun)`, deduped for nesting) / sequence-yielded (`f.(fun)`, only a
+DIRECT `let f = fun..` names the function). All stash-verified parity-neutral
+(lambda 390, completeness 0).
+
+translprim/locs.ml (a comprehensive __FUNCTION__ torture test) advances from an
+immediate crash to line 35. Remaining: __FUNCTION__ in local-module (`.N`) /
+functor (`Locs.Functor.fn`) / recmod / operator (`Locs.(+@+)`) / object-method
+(`klass#meth`) contexts -- mod_path_/func_path_ don't track those -- PLUS a crash
+at the functor instantiation and its object cases at the end. So it won't flip
+without that whole tail; the loc-primitive feature itself is correct and reusable
+(also a partial prerequisite for syntactic-arity, which additionally needs
+optional-defaults-with-non-var-patterns + first-class-module patterns).
+
+THIS GRIND TURN (no new flip, but correct general progress, 0 regressions): patmatch
+extension-ctor matching (line 79->143) + the location primitives. Both stash-
+verified parity-neutral. Dashboard: **exec 95.6-95.7% (691 deterministic; morematch
+flipped), lambda 52.5% (390), completeness 100% (0/744)**.
