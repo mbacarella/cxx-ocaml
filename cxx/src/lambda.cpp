@@ -5950,6 +5950,82 @@ struct Translator {
     i->cond = a; i->then_ = b; i->else_ = cint(0);
     return i;
   }
+  // Does the pattern bind any variable (a Ppat_var / Ppat_alias anywhere)?
+  bool pattern_binds(const Pattern* p0) {
+    const Pattern* p = effective_pat(p0);
+    if (std::holds_alternative<Ppat_var>(p->desc)) return true;
+    if (std::holds_alternative<Ppat_alias>(p->desc)) return true;
+    if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (auto& e : tu->elems) if (pattern_binds(e.get())) return true; return false;
+    }
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc)) return k->arg && pattern_binds(k->arg->get());
+    if (auto* o = std::get_if<Ppat_or>(&p->desc)) return pattern_binds(o->l.get()) || pattern_binds(o->r.get());
+    if (auto* pv = std::get_if<Ppat_variant>(&p->desc)) return pv->arg && pattern_binds(pv->arg->get());
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [l, s] : pr->fields) if (pattern_binds(s.get())) return true; return false;
+    }
+    if (auto* arr = std::get_if<Ppat_array>(&p->desc)) {
+      for (auto& e : arr->elems) if (pattern_binds(e.get())) return true; return false;
+    }
+    if (auto* pz = std::get_if<Ppat_lazy>(&p->desc)) return pattern_binds(pz->p.get());
+    return false;
+  }
+  // A choice of one child at each BINDING or-node, so a row with binding
+  // or-alternatives (`(C|D) as x | E x | F(_,x)`) can be matched as several
+  // or-free rows (each consults its choice in pat_test).  Non-binding or-nodes
+  // are left to pat_test's OR, preserving their existing codegen.
+  using Choices = std::unordered_map<const Pattern*, const Pattern*>;
+  const Choices* cur_choices_ = nullptr;
+  static constexpr size_t kOrExpandCap = 64;
+  // Enumerate the or-free instantiations of a pattern's BINDING or-nodes.
+  bool expand_pattern(const Pattern* p0, std::vector<Choices>& out) {
+    const Pattern* p = effective_pat(p0);
+    auto cartesian = [&](auto&& subs) -> bool {
+      out = {Choices{}};
+      for (auto* e : subs) {
+        std::vector<Choices> ee;
+        if (!expand_pattern(e, ee)) return false;
+        std::vector<Choices> next;
+        for (auto& a : out) for (auto& b : ee) {
+          Choices m = a; for (auto& kv : b) m.insert(kv); next.push_back(std::move(m));
+          if (next.size() > kOrExpandCap) return false;
+        }
+        out = std::move(next);
+      }
+      return true;
+    };
+    if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+      if (!pattern_binds(p)) { out = {Choices{}}; return true; }  // non-binding: leaf
+      out.clear();
+      for (const Pattern* child : {o->l.get(), o->r.get()}) {
+        std::vector<Choices> sub;
+        if (!expand_pattern(child, sub)) return false;
+        for (auto& s : sub) { s[p] = child; out.push_back(std::move(s)); }
+        if (out.size() > kOrExpandCap) return false;
+      }
+      return true;
+    }
+    if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
+      std::vector<const Pattern*> es; for (auto& e : tu->elems) es.push_back(e.get());
+      return cartesian(es);
+    }
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      std::vector<const Pattern*> es; for (auto& [l, s] : pr->fields) es.push_back(s.get());
+      return cartesian(es);
+    }
+    if (auto* arr = std::get_if<Ppat_array>(&p->desc)) {
+      std::vector<const Pattern*> es; for (auto& e : arr->elems) es.push_back(e.get());
+      return cartesian(es);
+    }
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc))
+      return k->arg ? expand_pattern(k->arg->get(), out) : (out = {Choices{}}, true);
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) return expand_pattern(pa->p.get(), out);
+    if (auto* pv = std::get_if<Ppat_variant>(&p->desc))
+      return pv->arg ? expand_pattern(pv->arg->get(), out) : (out = {Choices{}}, true);
+    if (auto* pz = std::get_if<Ppat_lazy>(&p->desc)) return expand_pattern(pz->p.get(), out);
+    out = {Choices{}};
+    return true;
+  }
   bool pat_test(const Pattern* p0, const LamPtr& acc, LamPtr& test,
                 std::vector<std::pair<Ident, LamPtr>>& binds) {
     const Pattern* p = effective_pat(p0);
@@ -6043,6 +6119,11 @@ struct Translator {
       return true;
     }
     if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+      // a binding or-node was expanded into separate rows: follow this row's
+      // chosen alternative.
+      if (cur_choices_)
+        if (auto it = cur_choices_->find(p); it != cur_choices_->end())
+          return pat_test(it->second, acc, test, binds);
       // alternatives must bind nothing (per-alternative binds would need
       // per-branch bodies); tests OR together
       std::vector<std::pair<Ident, LamPtr>> b1, b2;
@@ -6159,7 +6240,7 @@ struct Translator {
       scrut = varof(stmp);
     }
     struct NRow { const Pattern* lhs; const Expression* rhs; const Expression* guard;
-                  std::vector<std::string> aliases; };
+                  std::vector<std::string> aliases; Choices choices; };
     std::vector<NRow> rows;
     for (auto& r : rows0) {
       const Pattern* l = effective_pat(r.lhs);
@@ -6169,14 +6250,23 @@ struct Translator {
         l = effective_pat(pa->p.get());
       }
       std::vector<const Pattern*> alts;
-      flatten_or(l, alts);
-      for (auto* a : alts) rows.push_back({a, r.rhs, r.guard, als});
+      flatten_or(l, alts);  // top-level or split (preserves non-binding-or codegen)
+      for (auto* a : alts) {
+        // expand any NESTED binding or-patterns (`(C|D) as x | E x`) into one row
+        // per alternative, each carrying its choice for pat_test to follow.
+        std::vector<Choices> choices;
+        if (!expand_pattern(a, choices)) return nullptr;  // blowup -> bail
+        for (auto& ch : choices) rows.push_back({a, r.rhs, r.guard, als, std::move(ch)});
+      }
     }
     LamPtr chain = raise_predef("Match_failure", mloc);
     for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
       LamPtr test;
       std::vector<std::pair<Ident, LamPtr>> binds;
-      if (!pat_test(it->lhs, scrut, test, binds)) return nullptr;
+      cur_choices_ = it->choices.empty() ? nullptr : &it->choices;
+      bool ok = pat_test(it->lhs, scrut, test, binds);
+      cur_choices_ = nullptr;
+      if (!ok) return nullptr;
       scope.emplace_back();
       for (auto& nm : it->aliases) scope.back()[nm] = scrut->var;
       for (auto& [id, acc] : binds) scope.back()[id.name] = id;
