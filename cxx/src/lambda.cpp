@@ -9227,6 +9227,14 @@ struct Translator {
       return fn;
     }
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
+      // (struct .. end : S): build the structure already coerced to S's layout,
+      // so a module field S exposes that the struct elides as an alias (`module
+      // Elem = E`) is still MATERIALISED at the right slot (functor result sigs).
+      if (auto* ps = std::get_if<Pmod_structure>(&pc->me->desc)) {
+        std::vector<std::string> co = sig_layout(*pc->mt);
+        std::vector<std::string> sub;
+        return build_module(ps->items, &sub, co.empty() ? nullptr : &co);
+      }
       // (M : S) over a narrower/reordered signature projects to S's layout
       // (include (A : sig val f .. val x .. end) must not read raw slots)
       LamPtr inner = compile_module_expr(*pc->me);
@@ -10331,6 +10339,12 @@ struct Translator {
         auto it = std::find(export_names.begin(), export_names.end(), nm);
         if (it != export_names.end()) {
           ce.push_back(exports[it - export_names.begin()]); cn.push_back(nm);
+        } else if (auto a = module_alias_.find(nm); a != module_alias_.end()) {
+          // a module the struct ELIDED as an alias (`module Elem = E`) but the
+          // ascribed sig exposes -> materialise the alias value at this slot.
+          ce.push_back(a->second); cn.push_back(nm);
+        } else if (auto mi = module_ident_.find(nm); mi != module_ident_.end()) {
+          ce.push_back(varof(mi->second)); cn.push_back(nm);
         }
       }
       exports = std::move(ce); export_names = std::move(cn);
