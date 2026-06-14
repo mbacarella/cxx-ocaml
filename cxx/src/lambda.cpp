@@ -4456,8 +4456,15 @@ struct Translator {
       l->prim = fi->kind == ValueKind::Int ? Prim::FieldInt
                 : fi->mut                  ? Prim::FieldMut
                                            : Prim::FieldImm;
-    l->prim_arg = fi->index; l->args = {s}; return l;
+    l->prim_arg = fi->index; l->args = {s};
+    // A read of a MUTABLE field is bound StrictOpt, not Alias (matching.ml maps
+    // Immutable->Alias, Mutable->StrictOpt).  An immediate mutable field reads as
+    // `field_int` (spelling ignores mutability), so the spelling alone can't tell
+    // -- record the node so wrap_binders picks the right let-kind.
+    if (fi->mut) mutfield_reads_.insert(l.get());
+    return l;
   }
+  std::set<const void*> mutfield_reads_;  // mutable-field read nodes (StrictOpt)
   // Bind the variables of an irrefutable pattern (var / alias / tuple / record /
   // single-constructor) to field reads of `scrut`, recording (ident, access) in
   // `out` and binding the names in the current scope.  Returns false on any shape
@@ -4490,6 +4497,7 @@ struct Translator {
           if (lid_last(lbl.txt) == "contents" && pr->fields.size() == 1) {
             auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut;
             fm->prim_arg = 0; fm->args = {scrut};
+            mutfield_reads_.insert(fm.get());
             if (!collect_binders(*sub, fm, out)) return false;
             continue;
           }
@@ -4724,7 +4732,10 @@ struct Translator {
       if (lazy_force_binders_.count(id.stamp))
         aliases.push_back({id, ValueKind::Gen, acc, false});
       else if (count_var(body, id) <= 1) subst_var(body, id, acc);
-      else aliases.push_back({id, ValueKind::Gen, acc, is_field_access(acc)});
+      else if (is_mut_field_access(acc)) {  // mutable field -> StrictOpt (`=o`)
+        Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = acc;
+        b.strict_opt = true; aliases.push_back(b);
+      } else aliases.push_back({id, ValueKind::Gen, acc, is_field_access(acc)});
     }
     if (aliases.empty()) return body;
     auto l = mk(Lam::K::Let); l->bindings = std::move(aliases); l->body = body; return l;
@@ -4735,6 +4746,12 @@ struct Translator {
   static bool is_field_access(const LamPtr& l) {
     return l->k == Lam::K::Prim &&
            (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt);
+  }
+  // A read of a mutable field (field_mut, or a field_int off a mutable immediate
+  // field): bound StrictOpt rather than Alias.
+  bool is_mut_field_access(const LamPtr& l) const {
+    return l->k == Lam::K::Prim &&
+           (l->prim == Prim::FieldMut || mutfield_reads_.count(l.get()));
   }
 
   static std::vector<Row> rows_of(const std::vector<Case>& cs) {
