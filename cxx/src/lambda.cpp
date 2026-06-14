@@ -9038,6 +9038,8 @@ struct Translator {
               std::string dotted;
               if (lid_to_dotted(po->id.txt, dotted)) { opened_.push_back(dotted); ++opens_pushed; }
               ce = po->body.get();
+            } else if (auto* pcc = std::get_if<Pcl_constraint>(&ce->desc)) {
+              ce = pcc->ce.get();  // `class c : t = ..`: the type ascription is runtime-irrelevant
             } else break;
           }
           // labelled/optional class params: record the signature for `new` sites
