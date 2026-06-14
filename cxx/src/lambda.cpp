@@ -9406,15 +9406,38 @@ struct Translator {
       if (auto it = field_info_.find(n); it != field_info_.end())
         saved_fields.emplace_back(n, it->second);
     std::set<std::string> saved_scoped = scoped_unambig_fields_;
+    // The variant CONSTRUCTOR-COUNT (type_ctors_) is scoped too: two sibling types
+    // sharing a name (A's `t = Leaf|Node`, Expr's `t = Var|Const|Add|Binding`) must
+    // each see THEIR own count at a match site, else the matcher truncates the
+    // switch to the wrong arity and drops arms.  Snapshot the counts of types this
+    // structure (re)declares, re-register in source order below, restore on exit.
+    std::vector<std::pair<std::string, std::optional<std::pair<int,int>>>> saved_tctors;
+    {
+      std::set<std::string> seen;
+      std::function<void(const Structure&)> snap = [&](const Structure& items) {
+        for (auto& item : items)
+          if (auto* td = std::get_if<Pstr_type>(&item.desc))
+            for (auto& d : td->decls)
+              if (std::get_if<Ptype_variant>(&d.kind) && seen.insert(d.name.txt).second) {
+                auto it = type_ctors_.find(d.name.txt);
+                saved_tctors.emplace_back(d.name.txt,
+                  it == type_ctors_.end() ? std::nullopt
+                                          : std::optional<std::pair<int,int>>(it->second));
+              }
+      };
+      snap(s);
+    }
     struct AmbigRestore {
       Translator* t; std::vector<std::pair<std::string, CtorInfo>>* s;
       std::vector<std::pair<std::string, FieldInfo>>* sf; std::set<std::string>* ss;
+      std::vector<std::pair<std::string, std::optional<std::pair<int,int>>>>* st;
       ~AmbigRestore() {
         for (auto& [n, ci] : *s) t->ctor_info_[n] = ci;
         for (auto& [n, fi] : *sf) t->field_info_[n] = fi;
         t->scoped_unambig_fields_ = std::move(*ss);
+        for (auto& [n, v] : *st) { if (v) t->type_ctors_[n] = *v; else t->type_ctors_.erase(n); }
       }
-    } ambig_restore{this, &saved_ambig, &saved_fields, &saved_scoped};
+    } ambig_restore{this, &saved_ambig, &saved_fields, &saved_scoped, &saved_tctors};
     // updates non-empty => a recursive-data group: `(let <binds=dummies>
     // (seq <updates> body))` (caml_alloc_dummy + caml_update_dummy).
     struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e;
@@ -9451,6 +9474,19 @@ struct Translator {
           if (auto tfi = type_field_info_.find(d.name.txt); tfi != type_field_info_.end())
             for (auto& [fn, fi] : tfi->second)
               if (ambiguous_fields_.count(fn)) { field_info_[fn] = fi; scoped_unambig_fields_.insert(fn); }
+          // re-register THIS variant's ctor count, so a same-named sibling type's
+          // count (registered first by the flat fill-absent pass) doesn't make the
+          // matcher truncate this type's switch (restored on module exit).
+          if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+            int nc = 0, nb = 0; bool gadt = false;
+            for (auto& c : v->ctors) {
+              bool block = true;
+              if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) block = !t->elems.empty();
+              if (c.res) gadt = true;
+              if (block) ++nb; else ++nc;
+            }
+            if (!gadt) type_ctors_[d.name.txt] = {nc, nb};
+          }
         }
         continue;
       }
