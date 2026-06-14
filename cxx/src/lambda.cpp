@@ -7963,6 +7963,7 @@ struct Translator {
       return l;
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) return expr(*ct->e);
+    if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) return expr(*nt->body);  // (type a) -> e erased
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) return expr(*co->e);  // (e :> t) erased
     if (auto* pp = std::get_if<Pexp_pack>(&e.desc)) {  // (module ME): the module value
       LamPtr mv = compile_module_expr(*pp->me);
@@ -8420,8 +8421,17 @@ struct Translator {
       // A method `method f a b = e` is one curried function over self plus its own
       // params: prepend self to the (flattened) function translated from the body.
       LamPtr fn;
-      if (auto* pf = std::get_if<ast::Pexp_function>(&m.body->desc)) {
-        fn = function(*pf, m.body->loc);
+      // A polymorphic method `method m : type a. T = fun ..` desugars to a
+      // Pexp_newtype (and maybe a constraint) wrapping the function; peel those
+      // (no runtime effect) so the function flattens like a plain method body.
+      const ast::Expression* mb = m.body;
+      while (true) {
+        if (auto* nt = std::get_if<ast::Pexp_newtype>(&mb->desc)) { mb = nt->body.get(); continue; }
+        if (auto* ct = std::get_if<ast::Pexp_constraint>(&mb->desc)) { mb = ct->e.get(); continue; }
+        break;
+      }
+      if (auto* pf = std::get_if<ast::Pexp_function>(&mb->desc)) {
+        fn = function(*pf, mb->loc);
         fn->params.insert(fn->params.begin(), {self, ValueKind::Gen});
         fn->ret_kind = ValueKind::Gen;  // method closures use lfunction ~return:Pgenval
       } else {
