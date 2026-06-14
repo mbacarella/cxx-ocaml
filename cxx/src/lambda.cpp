@@ -9098,13 +9098,41 @@ struct Translator {
             // `class c = parent args`: rebind the parent's obj_init/env_init
             // through `new_init = (function obj_init self (apply obj_init self
             // args))` in a fresh 3-tuple (translclass's class application).
-            if (auto* apc = std::get_if<Pcl_apply>(&ce->desc))
-              if (auto* pcn = std::get_if<Pcl_constr>(&apc->ce->desc))
+            if (auto* apc = std::get_if<Pcl_apply>(&ce->desc)) {
+              // `(let () = e in parent) args`: a let INSIDE the application is
+              // object-creation-time (the test "Nested bindings are not toplevel")
+              // -- emit it in the per-object new_init wrap body, not at class build.
+              const ClassExpr* ace = apc->ce.get();
+              std::vector<const Pcl_let*> inner_lets;
+              while (auto* il = std::get_if<Pcl_let>(&ace->desc)) {
+                inner_lets.push_back(il); ace = il->body.get();
+              }
+              if (auto* pcn = std::get_if<Pcl_constr>(&ace->desc))
                 if (auto* pl = std::get_if<Lident>(&pcn->id.txt.v))
                   if (const Ident* pid = lookup(pl->name); pid && class_ids_.count(pid->stamp)) {
                     bool simple = true;
                     for (auto& [l, e] : apc->args)
                       if (!std::holds_alternative<Nolabel>(l)) simple = false;
+                    // build the inner lets' bindings (binding vars in scope so the
+                    // args can see them), to wrap the obj_init application below
+                    std::vector<LamPtr> inner_wraps;
+                    for (auto* lg : inner_lets) {
+                      auto l = mk(Lam::K::Let);
+                      for (auto& b : lg->bindings) {
+                        const Pattern* bp = effective_pat(&b.pat);
+                        auto* pv = std::get_if<Ppat_var>(&bp->desc);
+                        bool nobind = !pv &&
+                            (std::holds_alternative<Ppat_any>(bp->desc) ||
+                             (std::get_if<Ppat_construct>(&bp->desc) &&
+                              lid_last(std::get<Ppat_construct>(bp->desc).id.txt) == "()"));
+                        if (!pv && !nobind) { simple = false; break; }
+                        LamPtr rv = expr(*b.expr);
+                        Ident bid = pv ? fresh(pv->name.txt) : fresh("", true);
+                        if (pv) scope.back()[pv->name.txt] = bid;
+                        l->bindings.push_back({bid, pv ? pat_kind(&b.pat) : ValueKind::Gen, rv});
+                      }
+                      inner_wraps.push_back(l);
+                    }
                     if (simple) {
                       Ident ninit = fresh("new_init");
                       Ident oi = fresh("obj_init"), slf = fresh("self");
@@ -9113,7 +9141,11 @@ struct Translator {
                       auto apl = mk(Lam::K::Apply);
                       apl->fn = varof(oi); apl->args = {varof(slf)};
                       for (auto& [l, e] : apc->args) apl->args.push_back(expr(*e));
-                      wrap->body = apl;
+                      LamPtr wbody = apl;
+                      for (auto wit = inner_wraps.rbegin(); wit != inner_wraps.rend(); ++wit) {
+                        (*wit)->body = wbody; wbody = *wit;
+                      }
+                      wrap->body = wbody;
                       auto fm0 = mk(Lam::K::Prim); fm0->prim = Prim::FieldMut;
                       fm0->prim_arg = 0; fm0->args = {varof(*pid)};
                       auto f0 = mk(Lam::K::Apply); f0->fn = varof(ninit); f0->args = {fm0};
@@ -9141,6 +9173,7 @@ struct Translator {
                         class_meta_[d.name.txt] = mit->second;
                     }
                   }
+            }  // end `if (auto* apc = ...)`
             // wrap the class value with the class-creation lets (run once, when
             // the class is built), innermost let last
             if (v && !let_wraps.empty())
