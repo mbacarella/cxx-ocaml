@@ -1773,3 +1773,32 @@ must preserve same-group forward refs for records-citing-variants, and submodule
 fill-absent vs top-level overwrite semantics). Deferred to a focused session.
 
 Dashboard unchanged: **exec 95.6% (690 ceiling), lambda 390, completeness 0**.
+
+## Ambiguous-constructor scoping IMPLEMENTED (2026-06-14)
+
+Implemented the source-order constructor scoping diagnosed earlier. Track per-type
+ctor info + the set of names defined by >1 type; build_module re-registers a
+type's ambiguous constructors when it reaches that `type` decl (in source order),
+saved on module entry / restored on exit so a submodule's re-registration doesn't
+leak. Single-definition ctors untouched (no-op for the common case).
+
+Verified PARITY-NEUTRAL via stash baseline (0 lambda regressed, 0 improved),
+lambda 390 + completeness 0 held, exec floor held, all 4 prior flips intact.
+
+IMPACT (both still DIFF but much further -- the fix is correct, the remaining
+blockers are separate deep features):
+- **morematch**: test #2 -> #81. #81 "autre" is a 3-column matrix match with
+  nested or-patterns + aliases-in-or (`(J,J,((C|D) as x|E x|F(_,x)))|..`), needing
+  the matching.ml decision-tree matrix matcher (the long-deferred big matcher
+  feature). Everything up to #81 now passes.
+- **patmatch**: SEGFAULT -> runs to module A's `f A B` (test ~#81). That fails in
+  the FULL file (a 2-column match over EXTENSION constructors `type t += A|B`
+  redefined across nested modules MPR7761.A / .B) although every isolated repro
+  (single module, two modules, the exact match) works -- an elusive full-context
+  bug in the extension-ctor path (exn_ident_, which the ctor_info_ scoping fix does
+  not touch). Pre-existing, exposed by clearing the earlier segfault.
+
+Dashboard: **exec 95.6% (690 ceiling, deterministic 689; flaky), lambda 52.5%
+(390), completeness 100% (0/744)**. Next matcher steps: the matching.ml matrix
+decision tree (unlocks morematch's #81+ and other or-pattern/multi-column tests)
+and module-scoped EXTENSION-ctor identities (patmatch).
