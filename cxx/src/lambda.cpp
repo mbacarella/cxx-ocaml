@@ -3675,35 +3675,41 @@ struct Translator {
     }
     if (rows.empty()) return nullptr;
     for (size_t c = 0; c < k; ++c) {
-      bool anyvar = false, anyctor = false;
+      bool anyvar = false, anyctor = false, all_const_type = false;
       std::string type;
       for (auto& r : rows) {
-        const Pattern* p = r.cols[c];
-        if (std::get_if<Ppat_var>(&p->desc) ||
-            std::holds_alternative<Ppat_any>(p->desc)) {
-          anyvar = true;
-          continue;
+        std::vector<const Pattern*> alts;  // examine each or-pattern alternative
+        flatten_or(r.cols[c], alts);
+        for (const Pattern* p : alts) {
+          if (std::get_if<Ppat_var>(&p->desc) ||
+              std::holds_alternative<Ppat_any>(p->desc)) {
+            anyvar = true;
+            continue;
+          }
+          auto* kc = std::get_if<Ppat_construct>(&p->desc);
+          if (!kc) return nullptr;
+          auto ci = ctor_info_.find(ctor_of(*p));
+          if (ci == ctor_info_.end()) return nullptr;
+          auto tc = type_ctors_.find(ci->second.type);
+          if (tc == type_ctors_.end()) return nullptr;
+          bool one_one = tc->second.first == 1 && tc->second.second == 1;
+          bool allc = tc->second.second == 0;
+          if (!one_one && !allc) return nullptr;
+          if (type.empty()) { type = ci->second.type; all_const_type = allc; }
+          else if (type != ci->second.type) return nullptr;
+          if (kc->arg) {
+            if (ci->second.arity != 1) return nullptr;
+            const Pattern* ap = effective_pat(kc->arg->get());
+            if (!std::get_if<Ppat_var>(&ap->desc) &&
+                !std::holds_alternative<Ppat_any>(ap->desc))
+              return nullptr;
+          }
+          anyctor = true;
         }
-        auto* kc = std::get_if<Ppat_construct>(&p->desc);
-        if (!kc) return nullptr;
-        auto ci = ctor_info_.find(ctor_of(*p));
-        if (ci == ctor_info_.end()) return nullptr;
-        auto tc = type_ctors_.find(ci->second.type);
-        if (tc == type_ctors_.end() || tc->second.first != 1 ||
-            tc->second.second != 1)
-          return nullptr;
-        if (type.empty()) type = ci->second.type;
-        else if (type != ci->second.type) return nullptr;
-        if (kc->arg) {
-          if (ci->second.arity != 1) return nullptr;
-          const Pattern* ap = effective_pat(kc->arg->get());
-          if (!std::get_if<Ppat_var>(&ap->desc) &&
-              !std::holds_alternative<Ppat_any>(ap->desc))
-            return nullptr;
-        }
-        anyctor = true;
       }
-      if (anyvar && anyctor) return nullptr;
+      // A mixed var/constructor column is only handled for an all-constant type
+      // (mm_cols routes var rows to every switch case plus the default).
+      if (anyvar && anyctor && !all_const_type) return nullptr;
     }
     // translate components; non-var ones bind to *match* temps
     std::vector<LamPtr> comps;
@@ -3768,6 +3774,18 @@ struct Translator {
       scope.pop_back();
       return b;
     }
+    // Expand or-patterns in this column into separate rows (preserving order),
+    // so `(A | B), C` matches like two rows `A, C` and `B, C`.
+    for (auto& r : rows)
+      if (std::get_if<Ppat_or>(&r.cols[i]->desc)) {
+        std::vector<MRow> ex;
+        for (auto& rr : rows) {
+          std::vector<const Pattern*> alts;
+          flatten_or(rr.cols[i], alts);
+          for (auto* a : alts) { MRow nr = rr; nr.cols[i] = a; ex.push_back(std::move(nr)); }
+        }
+        return mm_cols(comps, std::move(ex), i, mloc);
+      }
     bool varcol = true;
     for (auto& r : rows)
       if (std::get_if<Ppat_construct>(&r.cols[i]->desc)) { varcol = false; break; }
@@ -3777,6 +3795,54 @@ struct Translator {
           r.binds.push_back({pv->name.txt, comps[i]->var});
       return mm_cols(comps, std::move(rows), i + 1, mloc);
     }
+    // Determine this column's type shape (n_const, n_block).
+    std::string coltype;
+    for (auto& r : rows)
+      if (std::get_if<Ppat_construct>(&r.cols[i]->desc)) {
+        auto ci = ctor_info_.find(ctor_of(*r.cols[i]));
+        if (ci == ctor_info_.end()) return nullptr;
+        coltype = ci->second.type; break;
+      }
+    auto tcit = type_ctors_.find(coltype);
+    if (tcit == type_ctors_.end()) return nullptr;
+    int n_const = tcit->second.first, n_block = tcit->second.second;
+    // An all-constant enum column (`type t = A | B | C | ..`): switch on the tag,
+    // recursing on the remaining columns per case.  A var/any row matches every
+    // tag (and the default); a constructor row only its tag.
+    if (n_block == 0 && n_const >= 1) {
+      auto is_ctor = [](const MRow& r, size_t c) {
+        return std::get_if<Ppat_construct>(&r.cols[c]->desc) != nullptr; };
+      auto bind = [&](MRow r) -> MRow {
+        if (auto* pv = std::get_if<Ppat_var>(&r.cols[i]->desc))
+          r.binds.push_back({pv->name.txt, comps[i]->var});
+        return r; };
+      std::vector<int> tags;
+      for (auto& r : rows)
+        if (is_ctor(r, i)) {
+          int t = ctor_info_.at(ctor_of(*r.cols[i])).tag;
+          if (std::find(tags.begin(), tags.end(), t) == tags.end()) tags.push_back(t);
+        }
+      auto sw = mk(Lam::K::Switch); sw->cond = comps[i];
+      for (int t : tags) {
+        std::vector<MRow> sub;
+        for (auto& r : rows) {
+          if (is_ctor(r, i)) { if (ctor_info_.at(ctor_of(*r.cols[i])).tag == t) sub.push_back(r); }
+          else sub.push_back(bind(r));
+        }
+        LamPtr cb = mm_cols(comps, std::move(sub), i + 1, mloc);
+        if (!cb) return nullptr;
+        sw->sw_consts.push_back({t, cb});
+      }
+      std::vector<MRow> dft;
+      for (auto& r : rows) if (!is_ctor(r, i)) dft.push_back(bind(r));
+      if ((int)tags.size() < n_const) {  // unlisted tags need a default
+        if (dft.empty()) sw->sw_default = raise_predef("Match_failure", mloc);
+        else { LamPtr d = mm_cols(comps, std::move(dft), i + 1, mloc);
+               if (!d) return nullptr; sw->sw_default = d; }
+      }
+      return sw;
+    }
+    if (n_const != 1 || n_block != 1) return nullptr;  // only 1-const/1-block below
     // ctor column over a 1-const/1-block type: (if comp <block> <const>)
     std::vector<MRow> crows, brows;
     bool field_used = false;
