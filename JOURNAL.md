@@ -1935,3 +1935,25 @@ DOES NOT flip the exec test, for two reasons unrelated to the optimisation:
      what c++ emits. So c++ is CORRECT here; the recorded "DIFF" is a stale-cache
      artifact. The clobbered oracle needs rebuilding (`make ocamlc.opt`) before
      exec parity can be trusted/measured again.
+
+## Oracle restored + dashboard (2026-06-14)
+
+Relinked the clobbered `ocamlc.opt` (all native inputs survived; `make ocamlc.opt`
+re-ran only the final LINKOPT, seconds) and confirmed it reproduces the cached
+oracle output. With the trusted oracle back: full exec sweep **690/722 = 95.6%**
+(flaky band ~690-691; floor held, same 32-file frontier incl. struct_include +
+t22ok, no new regressions), lambda **52.5% (390/743)**, completeness **100%
+(744/744)**. This session's two commits (recmod/nested-module ctor registration;
+include-coercion fusion) are both parity-neutral correctness wins.
+
+struct_include is now ONE linker feature from flipping: stdout (7,7,6,6) and exit
+(2) match the oracle exactly; only the uncaught-assert message differs (oracle:
+Printexc "File .., characters 2-8: Assertion failed"; c++: generic
+`Assert_failure(..)`). Root cause: the repo oracle links Printexc (its init
+registers `Printexc.handle_uncaught_exception`) via an INTERFACE-import link
+dependency that c++'s GETGLOBAL-reloc-only linker doesn't track; trivial `assert
+false` gets the generic form from BOTH (Printexc not in that closure), so it's
+specifically the Printf/Sys/etc. closure pulling Printexc by cmi-import. Matching
+that (link a unit when its interface is imported, not just value-referenced) is a
+focused linker change for a dedicated push -- broad blast radius, needs full
+exec-parity validation.
