@@ -9117,12 +9117,94 @@ struct Translator {
         return sig_layout(*fp->type);
     return {};
   }
+  // The parameter's declared module TYPE (for nested argument coercion), null if
+  // none.  Keyed alongside functor_param_ by the functor's binding name.
+  std::unordered_map<std::string, const ModuleType*> functor_param_sig_;
+  const ModuleType* functor_param_type(const ModuleExpr& me0) {
+    const ModuleExpr* me = &me0;
+    while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+    if (auto* pf = std::get_if<Pmod_functor>(&me->desc))
+      if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->type)
+        return fp->type.get();
+    return nullptr;
+  }
+  // Coerce a stdlib/local module VALUE to a target signature layout, eta-stubbing
+  // members that are EXTERNALS of the source module (`Int32.neg` = %int32_neg,
+  // not a field) and field-reading the rest.  This is how a functor argument's
+  // `module Ops = Int32` is narrowed to a sub-signature `sig val neg .. end`.
+  LamPtr coerce_module_value(const LamPtr& src, const std::string& src_mod,
+                             const std::vector<std::string>& target) {
+    if (target.empty()) return src;
+    auto& flayout = fields_of(src_mod);  // name -> field index (ensures prims too)
+    Ident id = fresh("let");
+    bool bind = !is_global_path(src) && !is_pure_path(src);
+    LamPtr base = bind ? varof(id) : src;
+    std::vector<LamPtr> fs;
+    for (auto& nm : target) {
+      StdPrim sp = value_prim(src_mod, nm);
+      if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) { fs.push_back(s); continue; }
+      auto fit = flayout.find(nm);
+      auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldImm;
+      fr->prim_arg = fit != flayout.end() ? fit->second : 0; fr->args = {base};
+      fs.push_back(fr);
+    }
+    auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+    blk->args = std::move(fs);
+    if (!bind) return blk;
+    auto lt = mk(Lam::K::Let); lt->bindings = {{id, ValueKind::Gen, src}}; lt->body = blk;
+    return lt;
+  }
+  // The source stdlib/local module name of a struct's `module nm = <Ident>` member.
+  static std::string struct_member_module_src(const Pmod_structure& ps, const std::string& nm) {
+    for (auto& it : ps.items)
+      if (auto* pm = std::get_if<Pstr_module>(&it.desc))
+        if (pm->binding.name.txt && *pm->binding.name.txt == nm) {
+          const ModuleExpr* me = &pm->binding.expr;
+          while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+          if (auto* pi = std::get_if<Pmod_ident>(&me->desc))
+            if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) return l->name;
+        }
+    return "";
+  }
+  // Coerce a struct-LITERAL functor argument to the parameter signature `pmt`,
+  // reordering to the sig's field order and recursively coercing a module member
+  // (`module Ops = Int32` -> the sig's `Ops` sub-signature, eta-stubbing externals).
+  // Null when the shape isn't handled (the caller falls back to the flat path).
+  LamPtr coerce_struct_arg(const Pmod_structure& ps, const ModuleType& pmt) {
+    const Pmty_signature* psig = sig_items_of(pmt);
+    if (!psig) return nullptr;
+    std::vector<std::string> force = sig_layout(pmt);
+    if (force.empty()) return nullptr;
+    std::vector<std::string> sub;
+    LamPtr block = build_module(ps.items, &sub, nullptr, &force);
+    LamPtr body = block;
+    while (body && (body->k == Lam::K::Let || body->k == Lam::K::Letrec)) body = body->body;
+    if (!body || body->k != Lam::K::Prim || body->prim != Prim::Makeblock ||
+        body->args.size() != sub.size())
+      return nullptr;
+    std::unordered_map<std::string, LamPtr> val;
+    for (size_t i = 0; i < sub.size(); ++i) val[sub[i]] = body->args[i];
+    std::vector<LamPtr> fs;
+    for (auto& nm : force) {
+      auto it = val.find(nm);
+      if (it == val.end()) return nullptr;  // a sig field absent from the struct
+      LamPtr v = it->second;
+      if (const ModuleType* smt = sig_member_modtype(*psig, nm)) {
+        std::string srcmod = struct_member_module_src(ps, nm);
+        if (!srcmod.empty()) v = coerce_module_value(v, srcmod, sig_layout(*smt));
+      }
+      fs.push_back(v);
+    }
+    body->args = std::move(fs);  // reuse the block (its bindings), param-ordered
+    return block;
+  }
   // Compile a functor application `F(Arg)` with ocamlc's coercion: the argument is
   // projected (by field name, via field_mut) to F's parameter signature when it
   // has extra/reordered fields, and a global-path operand is bound to an (unused)
   // `let/N` then re-read.
   LamPtr compile_functor_apply(const Pmod_apply& pa) {
     LamPtr fval; std::vector<std::string> param;
+    const ModuleType* param_mt = nullptr;
     if (auto* pi = std::get_if<Pmod_ident>(&pa.f->desc)) {
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v)) {
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
@@ -9132,6 +9214,7 @@ struct Translator {
           }
       } else if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {  // local functor
         if (auto it = functor_param_.find(l->name); it != functor_param_.end()) param = it->second;
+        if (auto it = functor_param_sig_.find(l->name); it != functor_param_sig_.end()) param_mt = it->second;
       }
       if (param.empty()) {  // a functor member of a local module (X.F): sig info
         std::string dotted;
@@ -9141,6 +9224,14 @@ struct Translator {
       }
     }
     if (!fval) fval = compile_module_expr(*pa.f);
+    // A struct-LITERAL argument with a known parameter signature is coerced with
+    // nested module-member coercion (`module Ops = Int32` -> the param's Ops sub-
+    // sig), which the flat projection below can't do.
+    if (param_mt)
+      if (auto* aps = std::get_if<Pmod_structure>(&pa.arg->desc))
+        if (LamPtr c = coerce_struct_arg(*aps, *param_mt)) {
+          auto a = mk(Lam::K::Apply); a->fn = fval; a->args = {c}; return a;
+        }
     LamPtr aval = compile_module_expr(*pa.arg);
     LamPtr acoerced = aval;
     auto alay = arg_layout(*pa.arg);
@@ -9941,6 +10032,7 @@ struct Translator {
             module_ident_[*mb.name.txt] = mid;
             functor_result_[*mb.name.txt] = module_result_layout(mb.expr);  // for Make(..)
             functor_param_[*mb.name.txt] = functor_param_layout(mb.expr);   // for arg coercion
+            if (auto* pt = functor_param_type(mb.expr)) functor_param_sig_[*mb.name.txt] = pt;
             add_export(*mb.name.txt, mid);
           } else {  // module M = F(X) / M2 / (M : S) / (val x): bind + layout
             LamPtr mv = compile_module_expr(mb.expr);
