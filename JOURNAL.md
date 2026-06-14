@@ -1999,3 +1999,38 @@ value-kind gaps (assert-arg-not-constrained-to-bool so a `bool ref` reads
 `field_mut` not `field_int`; opaque-record-typed tuple elements; polymorphic
 array element kind) -- the hard tail the journal has flagged, with real
 regression risk (the makeblock-shape attempt confirmed it).
+
+## Pretty-printer break sizes cap at the box close (2026-06-14)
+
+The single biggest near-miss cluster turned out to be a printer bug, not
+inference.  `set_sizes` computed each break's Oppen size as the flat
+width to the next break, and for a box's LAST break (no following break)
+added `tail` = the parent box's continuation.  That over-counted the
+trailing close-parens of ENCLOSING boxes, so a line like
+
+    safe_remove_dir/13 testrename/16 testfailure/21 testrenamedir/25))))
+
+(whose last leaf ends at col 76, then `))))` runs to col 80) had its
+final break sized as leaf+`))))`, tripping the col-77 threshold and
+wrapping `testrenamedir` one element early.
+
+Format finalises a break's size at its enclosing box's boundary (the box
+close caps the size; trailing material in PARENT boxes does not count).
+Fix: pass `tail = 0` when recursing into a child box, so its internal
+breaks cap at its own close.  The box's OWN closing `)` (a text child) is
+still counted via `run()`; only the parents' closes are dropped.
+
+Flipped **11 files** (lib-char / int32 / int64 / nativeint / pair /
+random / sys-rename, c-api/alloc_async, callback_effects_gc,
+effect-syntax/test6, lf_skiplist/test_parallel), 0 regressions,
+completeness 100% held.  The earlier journal had flagged this as
+HIGH-RISK and left it alone -- the caution was unwarranted; tail=0 is the
+correct Format semantics and the stash-diff proved 0 regressions.
+
+Session total: lambda **390 -> 406 (52.5% -> 54.6%)**, completeness 100%
+(744/744) throughout, 6 commits, 0 regressions.  Remaining printer
+near-misses are now the OPPOSITE direction (oracle breaks, I fit) -- fine
+col-precision / "fits"-collapse issues (let-RHS break in opt_variants,
+indent off-by-one in lists.ml, UTF-8 width in Latin9, deep-nesting col in
+the exception_callback pair) -- 1-column precision, real regression risk,
+deprioritised.
