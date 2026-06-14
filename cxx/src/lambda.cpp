@@ -6077,8 +6077,29 @@ struct Translator {
       return true;
     }
     if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
-      auto ci = ctor_info_.find(ctor_of(*p));
-      if (ci == ctor_info_.end()) return false;
+      std::string cn = ctor_of(*p);
+      auto ci = ctor_info_.find(cn);
+      if (ci == ctor_info_.end()) {
+        // an EXTENSION constructor (exn_ident_/exn_field_): test the identity
+        // (the value itself when nullary, else field 0), like ext_match -- so a
+        // pattern containing one (`Some B`, `(Some A|Some B), A`) matches in the
+        // multi-column naive matcher instead of bailing.
+        if (exn_ident_.count(cn) || exn_field_.count(cn)) {
+          int arity = exn_arity_.count(cn) ? exn_arity_[cn] : (k->arg ? 1 : 0);
+          auto t = mk(Lam::K::Prim); t->prim = Prim::IntCmp; t->prim_id = "==";
+          t->args = {k->arg ? fieldimm(0, acc) : acc, exn_value(cn)};
+          test = if_and(test, t);
+          if (k->arg) {  // args at field 1.. (field 0 is the identity)
+            auto* at = std::get_if<Ppat_tuple>(&effective_pat(k->arg->get())->desc);
+            if (arity > 1 && at && (int)at->elems.size() == arity) {
+              for (int i = 0; i < arity; ++i)
+                if (!pat_test(at->elems[i].get(), fieldimm(i + 1, acc), test, binds)) return false;
+            } else if (!pat_test(k->arg->get(), fieldimm(1, acc), test, binds)) return false;
+          }
+          return true;
+        }
+        return false;
+      }
       auto tc = type_ctors_.find(ci->second.type);
       int nc = tc != type_ctors_.end() ? tc->second.first : -1;
       int nb = tc != type_ctors_.end() ? tc->second.second : -1;
