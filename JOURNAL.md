@@ -2071,3 +2071,45 @@ impractical), matcher torture (patmatch), optional-default-at-saturation
 (syntactic_arity, max_arity), TMC (semantic), domains (test_generator),
 plus the sorts/floatarray segfaults (non-object codegen bugs, large files,
 hard to localise).
+
+## Simplif post-passes: static-catch + var-alias + inline attrs (2026-06-14)
+
+After the printer cap, the next lambda cluster was simplif optimisations
+I wasn't replicating.  Ported three, each gated by lambda_parity +
+reject_parity, 0 regressions, completeness 100% held.  lambda 406 -> 417
+(54.6% -> 56.1%).
+
+ 1. **Simplif.simplify_exits** (static-catch collapse).  A static-catch
+    whose exit is raised 0 times drops its handler; raised exactly once
+    (not under an inner try..with) the handler inlines at the raise site
+    as `let vars = args in handler` (Strict).  Collapses the degenerate
+    `(catch (exit N v) with (N x) body)` the matcher emits into
+    `(let (x = v) body)`.  Static exits never cross a function boundary,
+    so count/inline skip Lfunction bodies.  Added as a post-pass
+    (simplify_static_catches) alongside simplify_local_functions.
+    Flipped eval_order_pr10283, lib-sys/opaque.
+
+ 2. **Tree-wide var-alias inlining** (`let v = (Lvar w)` -> subst, any
+    let-kind).  The construction-time pass only caught source lets;
+    compiler-generated temps (an apply's function bound to a temp, a
+    renamed parameter, the letrec dummy body) needed a tree-wide post-
+    pass.  It runs AFTER rec compilation, so unlike the construction-time
+    version it cannot perturb letrec strategy -- and so it also fixes
+    pr4989 (whose `let g = f` on a recursive spine the construction-time
+    `!rec_spine` guard deliberately skipped).  Skips `=mut` (Lmutlet,
+    never inlined).  Flipped eval_order_2/3, pr4989, lib-fun,
+    compaction_corner_case, typing-multifile/f, ephetest2 (+7).
+
+ 3. **Inline attributes on local let functions.**  A local
+    `let[@inline never] f = ..` dropped never_inline: the general local-
+    let path passed empty attrs to fn_binding_rhs, and the `let x = E in
+    x` -> E collapse re-translated E without the binding's attrs/name.
+    Pass b.attrs (and the name, for __FUNCTION__) in both.  Flipped
+    staticalloc, eval_order_8.
+
+Remaining lambda near-misses are now overwhelmingly INFERENCE-bound value
+kinds (effect-handler return types `: int` ~7 files; bigarray element/
+layout kinds; record/tuple element kinds the inferencer can't resolve
+through qualified functor members; ref-content int via assert; operand
+kinds for `==` vs caml_equal; polyvariant immediacy), plus a few specific
+items (recmod field_mut reads pr8681/pr7601; module-coercion artifacts).
