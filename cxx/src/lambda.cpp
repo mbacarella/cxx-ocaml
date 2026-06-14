@@ -7658,7 +7658,8 @@ struct Translator {
                       const std::string& class_name = "",
                       const std::vector<const ast::Pcl_fun*>* cl_params = nullptr,
                       const std::vector<const ast::Pcl_let*>* cl_lets = nullptr,
-                      bool virt_class = false) {
+                      bool virt_class = false,
+                      const std::vector<const ast::Pcl_let*>* cl_per_obj_lets = nullptr) {
     struct Meth { std::string name; const ast::Expression* body; };
     struct Val  { std::string name; const ast::Expression* init; };
     std::vector<Meth> meths;
@@ -8022,6 +8023,21 @@ struct Translator {
       let->body = outer;
       env_body = let;
     }
+    // Per-object lets (a `let` under a constraint, `(let () = e in object : ct)`):
+    // ocamlc keeps them inside the env_init body so they run on each `new`, not
+    // lifted to class creation.  Only the var / `()` / `_` binding shapes.
+    if (cl_per_obj_lets)
+      for (auto it = cl_per_obj_lets->rbegin(); it != cl_per_obj_lets->rend(); ++it) {
+        auto l = mk(Lam::K::Let);
+        for (auto& b : (*it)->bindings) {
+          const ast::Pattern* bp = effective_pat(&b.pat);
+          auto* pv = std::get_if<ast::Ppat_var>(&bp->desc);
+          Ident bid = pv ? fresh(pv->name.txt) : fresh("", true);
+          if (pv) scope.back()[pv->name.txt] = bid;
+          l->bindings.push_back({bid, ValueKind::Gen, expr(*b.expr)});
+        }
+        l->body = env_body; env_body = l;
+      }
     // obj_init parameters, split into curried functions at each
     // optional-default unwrap (`?(h=d)` ends its group with the *opt* param;
     // the body lets `h = (if *opt* (field_imm 0 *opt*) d)` and the remaining
@@ -9025,21 +9041,26 @@ struct Translator {
           // optional) and `class c = let .. in object` local-binding wrappers.
           const ClassExpr* ce = &d.expr;
           std::vector<const Pcl_fun*> params;
-          std::vector<const Pcl_let*> lets;
+          std::vector<const Pcl_let*> lets;       // class-creation lets (lifted)
+          std::vector<const Pcl_let*> per_obj_lets;  // lets under a constraint (per object)
+          bool saw_constraint = false;
           int opens_pushed = 0;  // `let open M in <class-expr>` wrappers
           for (;;) {
             if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
               params.push_back(pf);
               ce = pf->body.get();
             } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
-              lets.push_back(pl);
+              // a let UNDER a constraint is not lifted to class-creation (the
+              // "Constraints prevent lifting" rule) -- it runs per object.
+              (saw_constraint ? per_obj_lets : lets).push_back(pl);
               ce = pl->body.get();
             } else if (auto* po = std::get_if<Pcl_open>(&ce->desc)) {
               std::string dotted;
               if (lid_to_dotted(po->id.txt, dotted)) { opened_.push_back(dotted); ++opens_pushed; }
               ce = po->body.get();
             } else if (auto* pcc = std::get_if<Pcl_constraint>(&ce->desc)) {
-              ce = pcc->ce.get();  // `class c : t = ..`: the type ascription is runtime-irrelevant
+              saw_constraint = true;  // type ascription is runtime-irrelevant but blocks let-lifting
+              ce = pcc->ce.get();
             } else break;
           }
           // labelled/optional class params: record the signature for `new` sites
@@ -9184,7 +9205,8 @@ struct Translator {
           if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
             v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
                              params.empty() ? nullptr : &params,
-                             lets.empty() ? nullptr : &lets, is_virt);
+                             lets.empty() ? nullptr : &lets, is_virt,
+                             per_obj_lets.empty() ? nullptr : &per_obj_lets);
             register_class_meta(d.name.txt, ps->cs);
           }
           for (; opens_pushed > 0; --opens_pushed) opened_.pop_back();
