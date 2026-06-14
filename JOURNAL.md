@@ -1831,3 +1831,31 @@ Dashboard: **exec 95.7% (691/722; was 690 ceiling / 685 at the multi-session
 start), lambda 52.5% (390), completeness 100% (0/744)**. Matrix-matcher via
 or-expansion is a general win (any multi-column/binding-or match); next matcher
 step is module-scoped extension-ctor identities (patmatch).
+
+## patmatch advanced: extension-ctor matching (2026-06-14)
+
+pat_test bailed on any pattern containing an EXTENSION constructor (they live in
+exn_ident_, not ctor_info_), so option-of-extension / multi-column extension
+matches (patmatch's `g x y = match x,y with Some B,C | (Some A|Some B),A | ..`)
+collapsed to the first arm. Added an extension-ctor case to pat_test (identity
+`==` test like ext_match; args at field 1..). Verified parity-neutral (stash
+baseline), advances patmatch line 79 -> 143.
+
+patmatch (a comprehensive matcher torture test) still DIFFs -- remaining are deep,
+and several are ELUSIVE (pass standalone, fail only in the full file = global
+matcher-state accumulation across its 14 `type t +=` modules):
+- **functor-parameter extension ctors**: `module Z(T:S) = struct open T; let f x
+  y z = match x,y,z with A,X,_ ->.. | (B|C),_,X ->.. ` -- A/B/C/X/Y/Z are the
+  param T's extension ctors (reproducible standalone, gives wrong result);
+- **module D `g false A`**: a `type t += C=A` rebind match -- works standalone
+  (the rebind C=A resolves to A's identity correctly), fails only in full patmatch;
+- **module A `f A B`**: works standalone, fails in full file.
+The elusive ones point at exn_ident_ (extension-ctor identities) lacking the
+module-boundary save/restore that ctor_info_/field_info_ now have -- the likely
+next lever, but risky (M.Ctor cross-module access uses exn_field_, must stay).
+
+Dashboard: **exec 95.6-95.7% (691 deterministic; morematch flipped this multi-day
+run, was 685 at start), lambda 52.5% (390), completeness 100% (0/744)**. SESSION:
+morematch FLIPPED (matrix matcher: or-expansion + field scoping) + patmatch
+advanced (extension-ctor pat_test) + earlier ctor scoping, all stash-verified
+parity-neutral.
