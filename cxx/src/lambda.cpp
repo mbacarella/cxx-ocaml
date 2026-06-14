@@ -575,6 +575,7 @@ struct Translator {
   std::string file_name_;  // source path, for Match_failure/Assert_failure locations
   std::string unit_name_;  // the compilation unit (top module) name, for __MODULE__
   std::vector<std::string> func_path_;  // enclosing function-binding names, for __FUNCTION__
+  std::set<const ast::Pexp_function*> named_funcs_;  // functions already named by a let binding
   // Predefined exception globals (Match_failure/Assert_failure): a stable stamp per
   // name so the dump's first-appearance normalization is consistent within a file.
   std::unordered_map<std::string, int> predef_global_stamp_;
@@ -654,20 +655,27 @@ struct Translator {
   // Compile a `let name = rhs` RHS, pushing `name` onto func_path_ while a
   // function RHS is compiled so `__FUNCTION__` inside it includes this binding.
   LamPtr fn_binding_rhs(const std::string& name, const Expression& rhs, const Attributes& attrs) {
-    // a binding whose VALUE is a function (directly, or after side-effecting
-    // sequences / lets / a constraint) names its `__FUNCTION__` (ocamlc gives the
-    // let-name to a function-typed binding, e.g. `let f = e1; fun .. -> ..`).
-    const Expression* r = &rhs;
+    // A binding whose VALUE is a function (directly, or after side-effecting
+    // sequences / lets) takes the let-name for its `__FUNCTION__` scope.  BUT
+    // only a DIRECT `let f = fun ..` names the function itself; when the function
+    // is reached through a sequence/let (`let f = e1; fun ..`), the name covers
+    // the side effects yet the function is anonymous (`f.(fun)`, like ocamlc).
+    const Expression* rd = &rhs;
+    while (auto* c = std::get_if<Pexp_constraint>(&rd->desc)) rd = c->e.get();
+    auto* direct = std::get_if<Pexp_function>(&rd->desc);
+    const Expression* ry = rd;
     for (;;) {
-      if (auto* c = std::get_if<Pexp_constraint>(&r->desc)) { r = c->e.get(); continue; }
-      if (auto* sq = std::get_if<Pexp_sequence>(&r->desc)) { r = sq->e2.get(); continue; }
-      if (auto* le = std::get_if<Pexp_let>(&r->desc)) { r = le->body.get(); continue; }
+      if (auto* sq = std::get_if<Pexp_sequence>(&ry->desc)) { ry = sq->e2.get(); continue; }
+      if (auto* le = std::get_if<Pexp_let>(&ry->desc)) { ry = le->body.get(); continue; }
+      if (auto* c = std::get_if<Pexp_constraint>(&ry->desc)) { ry = c->e.get(); continue; }
       break;
     }
-    bool is_fun = std::holds_alternative<Pexp_function>(r->desc);
-    if (is_fun) func_path_.push_back(name);
+    bool yields = std::holds_alternative<Pexp_function>(ry->desc);
+    if (yields) func_path_.push_back(name);
+    if (direct) named_funcs_.insert(direct);
     LamPtr v = with_inline(expr(rhs), attrs);
-    if (is_fun) func_path_.pop_back();
+    if (yields) func_path_.pop_back();
+    if (direct) named_funcs_.erase(direct);
     return v;
   }
   // `(raise (makeblock 0 (global Exn/s!) [0: file line char]))` for a compiler-
@@ -7484,7 +7492,17 @@ struct Translator {
       }
       return a;
     }
-    if (auto* f = std::get_if<Pexp_function>(&e.desc)) return function(*f, e.loc);
+    if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      // an ANONYMOUS function (not named by a let binding) is `<enclosing>.(fun)`
+      // for __FUNCTION__; a named one already has its name on func_path_.  Nested
+      // anonymous functions don't stack `.(fun).(fun)` (ocamlc appends one).
+      bool anon = !named_funcs_.count(f) &&
+                  (func_path_.empty() || func_path_.back() != "(fun)");
+      if (anon) func_path_.push_back("(fun)");
+      LamPtr v = function(*f, e.loc);
+      if (anon) func_path_.pop_back();
+      return v;
+    }
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
       // `let _ = e in body` discards e -> seq, not a binding.
       if (le->bindings.size() == 1 &&
