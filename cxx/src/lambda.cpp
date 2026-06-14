@@ -9227,13 +9227,17 @@ struct Translator {
       return fn;
     }
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
-      // (struct .. end : S): build the structure already coerced to S's layout,
-      // so a module field S exposes that the struct elides as an alias (`module
-      // Elem = E`) is still MATERIALISED at the right slot (functor result sigs).
+      // (struct .. : S): build the struct forcing S's fields to be exported even
+      // if elided as aliases (`module Elem = E`), then coerce_block reorders +
+      // applies any nested module coercion.  `sub` is the actual export layout.
       if (auto* ps = std::get_if<Pmod_structure>(&pc->me->desc)) {
-        std::vector<std::string> co = sig_layout(*pc->mt);
+        std::vector<std::string> force = sig_layout(*pc->mt);
         std::vector<std::string> sub;
-        return build_module(ps->items, &sub, co.empty() ? nullptr : &co);
+        LamPtr inner = build_module(ps->items, &sub, nullptr, force.empty() ? nullptr : &force);
+        if (LamPtr c = coerce_block(inner, sub, sig_layout(*pc->mt),
+                                    pc->me.get(), sig_items_of(*pc->mt)))
+          return c;
+        return inner;
       }
       // (M : S) over a narrower/reordered signature projects to S's layout
       // (include (A : sig val f .. val x .. end) must not read raw slots)
@@ -9418,7 +9422,8 @@ struct Translator {
   }
 
   LamPtr build_module(const Structure& s, std::vector<std::string>* names,
-                      const std::vector<std::string>* coerce = nullptr) {
+                      const std::vector<std::string>* coerce = nullptr,
+                      const std::vector<std::string>* force_export = nullptr) {
     scope.emplace_back();
     // Re-register ambiguous constructors in source order within this module:
     // save their current entries and restore on exit, so a submodule's in-order
@@ -9995,8 +10000,12 @@ struct Translator {
               module_ident_.erase(nm);
               // A plain `module M = path` is a type-level alias with no runtime
               // slot (elided from the export); a constrained `module M : S = path`
-              // and an unpack `module M = (val x)` materialize a field.
-              if (std::holds_alternative<Pmod_constraint>(mb.expr.desc) || unpack)
+              // and an unpack `module M = (val x)` materialize a field.  An enclosing
+              // result-sig coercion that EXPOSES this alias (force_export) also
+              // materialises it (functor result `: H` with `module Elem = E`).
+              bool forced = force_export &&
+                  std::find(force_export->begin(), force_export->end(), nm) != force_export->end();
+              if (std::holds_alternative<Pmod_constraint>(mb.expr.desc) || unpack || forced)
                 add_export_val(nm, mv);
             } else {
               Ident mid = fresh(nm);
@@ -10343,8 +10352,6 @@ struct Translator {
           // a module the struct ELIDED as an alias (`module Elem = E`) but the
           // ascribed sig exposes -> materialise the alias value at this slot.
           ce.push_back(a->second); cn.push_back(nm);
-        } else if (auto mi = module_ident_.find(nm); mi != module_ident_.end()) {
-          ce.push_back(varof(mi->second)); cn.push_back(nm);
         }
       }
       exports = std::move(ce); export_names = std::move(cn);
