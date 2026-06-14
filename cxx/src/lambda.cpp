@@ -3839,6 +3839,39 @@ struct Translator {
     for (auto& sc : l->sw_consts) inline_exit(sc.body, id, vars, kinds, handler);
     for (auto& sc : l->sw_blocks) inline_exit(sc.body, id, vars, kinds, handler);
   }
+  // Simplif drops `let v = (Lvar w)` for ANY let-kind, substituting v by w.  The
+  // construction-time pass only catches source lets; compiler-generated temps
+  // (an apply's function bound to a temp, a renamed parameter) need a tree-wide
+  // pass.  Runs after rec compilation, so it can't perturb letrec strategy.
+  // Mutable-local bindings (`=mut`) are Lmutlet, never inlined -- skip them.
+  void inline_var_aliases(LamPtr& l) {
+    if (!l) return;
+    inline_var_aliases(l->fn);
+    inline_var_aliases(l->body);
+    inline_var_aliases(l->cond);
+    inline_var_aliases(l->then_);
+    inline_var_aliases(l->else_);
+    inline_var_aliases(l->sw_default);
+    for (auto& a : l->args) inline_var_aliases(a);
+    for (auto& b : l->bindings) inline_var_aliases(b.val);
+    for (auto& sc : l->sw_consts) inline_var_aliases(sc.body);
+    for (auto& sc : l->sw_blocks) inline_var_aliases(sc.body);
+    if (l->k != Lam::K::Let) return;
+    std::vector<Lam::Binding> keep;
+    for (size_t i = 0; i < l->bindings.size(); ++i) {
+      auto& b = l->bindings[i];
+      if (b.val && b.val->k == Lam::K::Var && !b.mut) {
+        // substitute v -> w in the later (sequential) bindings and the body
+        for (size_t j = i + 1; j < l->bindings.size(); ++j)
+          subst_var(l->bindings[j].val, b.id, b.val);
+        subst_var(l->body, b.id, b.val);
+      } else {
+        keep.push_back(std::move(b));
+      }
+    }
+    if (keep.empty()) { l = l->body; return; }
+    l->bindings = std::move(keep);
+  }
   // Collapse a static-catch whose exit is raised 0 times (drop the handler) or
   // exactly once and not under an inner try (inline the handler at that site).
   void simplify_static_catches(LamPtr& l) {
@@ -10226,6 +10259,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   LamPtr root = sg;
   t.simplify_local_functions(root);
   t.simplify_static_catches(root);
+  t.inline_var_aliases(root);
   return root;
 }
 
