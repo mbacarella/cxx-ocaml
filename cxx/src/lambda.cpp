@@ -3784,6 +3784,85 @@ struct Translator {
   LamPtr fieldimm(int i, const LamPtr& s) {
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = i; f->args = {s}; return f;
   }
+
+  // ===== Simplif.simplify_exits (lambda/simplif.ml) port =====
+  // Count Lstaticraise of exit `id`; `bad` accumulates those nested under an
+  // inner try..with (which can't be safely inlined).  Static exits never cross a
+  // function boundary, so a nested Lfunction contributes nothing.
+  static int count_exit(const LamPtr& l, int id, bool under_try, int& bad) {
+    if (!l) return 0;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == id) {
+      if (under_try) ++bad;
+      return 1;
+    }
+    if (l->k == Lam::K::Function) return 0;
+    if (l->k == Lam::K::Try)  // protected body is under_try; handler is not
+      return count_exit(l->body, id, true, bad) +
+             count_exit(l->then_, id, under_try, bad);
+    int c = count_exit(l->fn, id, under_try, bad) +
+            count_exit(l->body, id, under_try, bad) +
+            count_exit(l->cond, id, under_try, bad) +
+            count_exit(l->then_, id, under_try, bad) +
+            count_exit(l->else_, id, under_try, bad) +
+            count_exit(l->sw_default, id, under_try, bad);
+    for (auto& a : l->args) c += count_exit(a, id, under_try, bad);
+    for (auto& b : l->bindings) c += count_exit(b.val, id, under_try, bad);
+    for (auto& sc : l->sw_consts) c += count_exit(sc.body, id, under_try, bad);
+    for (auto& sc : l->sw_blocks) c += count_exit(sc.body, id, under_try, bad);
+    return c;
+  }
+  // Replace the single `(exit id args)` with `let vars = args in handler` (Strict
+  // lets, last var outermost -- matching simplif's fold_left2).
+  void inline_exit(LamPtr& l, int id, const std::vector<Ident>& vars,
+                   const std::vector<ValueKind>& kinds, const LamPtr& handler) {
+    if (!l) return;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == id) {
+      LamPtr res = handler;
+      if (l->args.size() == vars.size())
+        for (size_t i = 0; i < vars.size(); ++i) {
+          auto let = mk(Lam::K::Let);
+          ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
+          let->bindings = {{vars[i], k, l->args[i]}};  // Strict
+          let->body = res; res = let;
+        }
+      l = res; return;
+    }
+    if (l->k == Lam::K::Function) return;  // exits don't cross functions
+    inline_exit(l->fn, id, vars, kinds, handler);
+    inline_exit(l->body, id, vars, kinds, handler);
+    inline_exit(l->cond, id, vars, kinds, handler);
+    inline_exit(l->then_, id, vars, kinds, handler);
+    inline_exit(l->else_, id, vars, kinds, handler);
+    inline_exit(l->sw_default, id, vars, kinds, handler);
+    for (auto& a : l->args) inline_exit(a, id, vars, kinds, handler);
+    for (auto& b : l->bindings) inline_exit(b.val, id, vars, kinds, handler);
+    for (auto& sc : l->sw_consts) inline_exit(sc.body, id, vars, kinds, handler);
+    for (auto& sc : l->sw_blocks) inline_exit(sc.body, id, vars, kinds, handler);
+  }
+  // Collapse a static-catch whose exit is raised 0 times (drop the handler) or
+  // exactly once and not under an inner try (inline the handler at that site).
+  void simplify_static_catches(LamPtr& l) {
+    if (!l) return;
+    simplify_static_catches(l->fn);
+    simplify_static_catches(l->body);
+    simplify_static_catches(l->cond);
+    simplify_static_catches(l->then_);
+    simplify_static_catches(l->else_);
+    simplify_static_catches(l->sw_default);
+    for (auto& a : l->args) simplify_static_catches(a);
+    for (auto& b : l->bindings) simplify_static_catches(b.val);
+    for (auto& sc : l->sw_consts) simplify_static_catches(sc.body);
+    for (auto& sc : l->sw_blocks) simplify_static_catches(sc.body);
+    if (l->k != Lam::K::Catch) return;
+    int bad = 0;
+    int n = count_exit(l->cond, l->prim_arg, false, bad);
+    if (n == 0) { l = l->cond; return; }  // exit never raised -> drop handler
+    if (n == 1 && bad == 0) {
+      LamPtr body = l->cond;
+      inline_exit(body, l->prim_arg, l->catch_vars, l->catch_var_kinds, l->then_);
+      l = body;
+    }
+  }
   // ----- mutable-local `ref` optimization ------------------------------------
   // Whether `rid` (a `ref`'s binder) is used anywhere but as `!r` / `r := e` /
   // `incr r` / `decr r` in an already-translated body -- i.e. it ESCAPES (is taken
@@ -10141,6 +10220,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   sg->args.push_back(t.wrap_shared(t.build_module(s, nullptr)));
   LamPtr root = sg;
   t.simplify_local_functions(root);
+  t.simplify_static_catches(root);
   return root;
 }
 
