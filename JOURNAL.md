@@ -1441,3 +1441,20 @@ qualified-stdlib-ctor match resolution). Remaining 36: extensible-variant
 matching (patmatch, morematch), functors (sets/htbl/t22ok/boxedints/floatarray),
 bigarray, memprof, parallel, objects (mixin), __FUNCTION__ (locs), exact-GC
 (pr7798, testset), first-class-module members, recursive modules.
+
+## Extensible-variant multi-column matching (2026-06-14)
+
+Extended mm_cols to columns of extensible/exception constructors (`type t += A`):
+an identity `(if (== col <ctor-id>) ..)` chain via exn_value, recursing on the
+remaining columns. Grouped by IDENTITY (binder stamp), not name, so an alias
+(`exception Bar = Foo`) shares a branch -- patmatch's PR#5788 now gives 2 not 3.
+Gate relaxed for nullary extensible/exception ctors (mixed var/ctor allowed).
+
+patmatch still differs: it declares `type t += A|B` in SEVERAL modules, and our
+flat exn_ident_ map keeps only the last, so module A's `f` compares against the
+wrong identity -- needs module-scoped exception resolution (separate).
+
+Dashboard: **exec 95.0% (686/722), lambda 52.4% (389), completeness 100%
+(0/744)**. This exec-push session: 681->686 (+5 files / fixes), 10 commits, all
+gated, 0 regressions. Remaining 36 all deep subsystems; 100% is a multi-session
+goal (and exact-GC-accounting files may be impractical to match byte-for-byte).
