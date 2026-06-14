@@ -3810,37 +3810,37 @@ struct Translator {
     // recursing on the remaining columns per case.  A var/any row matches every
     // tag (and the default); a constructor row only its tag.
     if (n_block == 0 && n_const >= 1) {
+      // Emit a DENSE exhaustive switch (a case for every tag 0..n_const-1): our
+      // bytecode Kswitch indexes labels by tag and has no failaction slot, so a
+      // sparse switch + sw_default would read out of bounds.  Gaps reuse the
+      // shared default body.  Cap the width so a huge enum falls back instead.
+      if (n_const > 64) return nullptr;
       auto is_ctor = [](const MRow& r, size_t c) {
         return std::get_if<Ppat_construct>(&r.cols[c]->desc) != nullptr; };
       auto bind = [&](MRow r) -> MRow {
         if (auto* pv = std::get_if<Ppat_var>(&r.cols[i]->desc))
           r.binds.push_back({pv->name.txt, comps[i]->var});
         return r; };
-      std::vector<int> tags;
-      for (auto& r : rows)
-        if (is_ctor(r, i)) {
-          int t = ctor_info_.at(ctor_of(*r.cols[i])).tag;
-          if (std::find(tags.begin(), tags.end(), t) == tags.end()) tags.push_back(t);
-        }
+      std::vector<MRow> dft_rows;
+      for (auto& r : rows) if (!is_ctor(r, i)) dft_rows.push_back(bind(r));
+      LamPtr dft_body = dft_rows.empty() ? raise_predef("Match_failure", mloc)
+                                         : mm_cols(comps, dft_rows, i + 1, mloc);
+      if (!dft_body) return nullptr;
       auto sw = mk(Lam::K::Switch); sw->cond = comps[i];
-      for (int t : tags) {
+      for (int t = 0; t < n_const; ++t) {
         std::vector<MRow> sub;
+        bool explicit_t = false;
         for (auto& r : rows) {
-          if (is_ctor(r, i)) { if (ctor_info_.at(ctor_of(*r.cols[i])).tag == t) sub.push_back(r); }
-          else sub.push_back(bind(r));
+          if (is_ctor(r, i)) {
+            if (ctor_info_.at(ctor_of(*r.cols[i])).tag == t) { sub.push_back(r); explicit_t = true; }
+          } else sub.push_back(bind(r));
         }
+        if (!explicit_t) { sw->sw_consts.push_back({t, dft_body}); continue; }
         LamPtr cb = mm_cols(comps, std::move(sub), i + 1, mloc);
         if (!cb) return nullptr;
         sw->sw_consts.push_back({t, cb});
       }
-      std::vector<MRow> dft;
-      for (auto& r : rows) if (!is_ctor(r, i)) dft.push_back(bind(r));
-      if ((int)tags.size() < n_const) {  // unlisted tags need a default
-        if (dft.empty()) sw->sw_default = raise_predef("Match_failure", mloc);
-        else { LamPtr d = mm_cols(comps, std::move(dft), i + 1, mloc);
-               if (!d) return nullptr; sw->sw_default = d; }
-      }
-      return sw;
+      return sw;  // exhaustive: switch*, no failaction
     }
     if (n_const != 1 || n_block != 1) return nullptr;  // only 1-const/1-block below
     // ctor column over a 1-const/1-block type: (if comp <block> <const>)
