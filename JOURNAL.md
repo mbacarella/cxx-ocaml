@@ -2192,3 +2192,30 @@ recmod CLASSES at Test 70 and functor-recmod at Test 60; fstclassmod needs
 the GADT/first-class-module-in-recmod interaction).  3 commits, lambda 418
 held, completeness 100%, deterministic exec 693 held, 0 regressions.
 The recmod core model is now correct, reusable groundwork.
+
+## Recmod cont.: variant ctor-count scoping (2026-06-14)
+
+Chased the elusive t22ok crash (Tests 10-40 passed, then crashed before
+Test 50 even though the Expr/Binding recmod passes IN ISOLATION).  Bisected
+to: A/ASet + Expr/Binding together crash, each alone is fine.  Root cause
+was NOT a recmod-runtime bug -- it was a TYPE-NAME collision in the flat
+ctor-count map: A's `type t = Leaf|Node` (2 ctors) and Expr's
+`type t = Var|Const|Add|Binding` (4) both key `t` in type_ctors_, which the
+fill-absent pass fills first-wins.  So Expr.fv's match used A's 2-ctor count
+and the matcher TRUNCATED the switch to 2 arms, dropping Add/Binding ->
+Match_failure/SIGSEGV.  (Found by diffing the Expr.fv lambda with vs without
+A/ASet preceding it: the `case tag 2/3` arms were simply missing.)
+
+Fix: build_module re-registers each variant decl's OWN ctor count in source
+order (snapshot + restore on module exit), mirroring the ambiguous-ctor
+scoping already there.  General correctness fix for any two same-named
+variant types in different modules.  t22ok: **Test 40 -> Test 51** (next
+blocker: a Match_failure in the Bootstrap-heap functor's recmod at Test 60
+-- a qualified-ctor 2-column match, a distinct issue).  lambda 418 held,
+completeness 100%, deterministic exec ~693, 0 regressions.
+
+Recmod session arc: t22ok went from an IMMEDIATE crash (Test 10) to Test 51
+across 4 commits (eval_rec_bindings classify, reorder, sig-layout, ctor-
+count scoping).  Still needs, to fully flip: the Test-60 qualified-ctor
+match, recmod CLASSES (Test 70), and module coercions (Test 80) -- each a
+separate feature.  The recmod core is correct, general groundwork.
