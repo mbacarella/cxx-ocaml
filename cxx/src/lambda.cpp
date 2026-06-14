@@ -5165,7 +5165,10 @@ struct Translator {
         subst_var(body, mv, scrut);
         return body;
       }
-      auto l = mk(Lam::K::Let); l->bindings = {{mv, ValueKind::Gen, scrut, is_field_access(scrut)}};
+      // The matcher's top argument is bound Strict (`=`), never Alias: the scrutinee
+      // is evaluated once into the temp (matching.ml `root_arg arg Strict`), and
+      // simplif keeps a multi-use Strict let verbatim.
+      auto l = mk(Lam::K::Let); l->bindings = {{mv, ValueKind::Gen, scrut, false}};
       l->body = body; return l;
     }
     // Shared catch-all fallback via catch/exit: a guard on a non-variable pattern
