@@ -1365,6 +1365,9 @@ struct Translator {
   void register_sig_layouts(const std::string& prefix, const ModuleType& mt) {
     const ModuleType* m = &mt;
     for (int guard = 0; ; ++guard) {
+      // `S with type t = ..` has the runtime layout of S (a with-constraint only
+      // refines types) -- peel it to the underlying module type.
+      if (auto* pw = std::get_if<Pmty_with>(&m->desc)) { m = pw->mt.get(); continue; }
       auto* pi = std::get_if<Pmty_ident>(&m->desc);
       if (!pi) break;
       const ModuleType* res = nullptr;
@@ -10049,9 +10052,15 @@ struct Translator {
             if (rm.dummyable) continue;
             const std::string& nm = *rm.mb->name.txt;
             LamPtr mv = compile_module_expr(*rm.bodyme);
-            auto& lay = module_layout_[nm]; lay.clear();
+            // Use the functor-RESULT layout only when it's known (Set.Make(..)).
+            // For an unknown functor (a functor PARAMETER applied, `MakeH(BE)`)
+            // it's empty -- keep the SIGNATURE layout registered in phase 0
+            // (the member has a `: S` ascription), so M.member still resolves.
             auto rl = module_result_layout(*rm.bodyme);
-            for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+            if (!rl.empty()) {
+              auto& lay = module_layout_[nm]; lay.clear();
+              for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+            }
             uval[rm.id.stamp] = mv; unsafe.push_back(&rm);
           }
           std::vector<RM*> order;        // topological (deps first)
