@@ -8536,13 +8536,31 @@ struct Translator {
     LamPtr aval = compile_module_expr(*pa.arg);
     LamPtr acoerced = aval;
     auto alay = arg_layout(*pa.arg);
+    // The stdlib module name of a bare `Pmod_ident` argument (`F(Int32)`), so a
+    // param value that is one of its EXTERNALS (absent from the field layout) can
+    // be eta-stubbed from the primitive rather than mis-read as field 0.
+    std::string arg_mod;
+    {
+      const ModuleExpr* am = pa.arg.get();
+      while (auto* pc = std::get_if<Pmod_constraint>(&am->desc)) am = pc->me.get();
+      if (auto* pi = std::get_if<Pmod_ident>(&am->desc))
+        if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
+          if (!module_base(l->name) && !fields_of(l->name).empty()) arg_mod = l->name;
+    }
     // Project only when the argument's layout is known and differs from the
     // parameter signature; an unknown layout (e.g. a struct literal) is passed as is.
     if (!param.empty() && !alay.empty() && param != alay) {
       std::vector<LamPtr> fs;
       for (auto& nm : param) {
-        int idx = 0;
+        int idx = -1;
         for (int i = 0; i < (int)alay.size(); ++i) if (alay[i] == nm) { idx = i; break; }
+        if (idx < 0 && !arg_mod.empty()) {
+          // not a runtime field: an external -> eta-stub the primitive (ocamlc's
+          // `(function prim stub (Mod.prim prim))`)
+          StdPrim sp = value_prim(arg_mod, nm);
+          if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) { fs.push_back(s); continue; }
+        }
+        if (idx < 0) idx = 0;  // last-resort (unknown value): field 0 as before
         auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut; fr->prim_arg = idx; fr->args = {aval};
         fs.push_back(fr);
       }
