@@ -1693,3 +1693,30 @@ initializers/params/coercion/poly-methods/self-send, parameterized classes,
 self-type annotations, class constraints, class let-groups, lazy_fix recursive
 objects, simple Set.Make/Map.Make. Dashboard unchanged: **exec 95.3% (689 ceiling),
 lambda 389, completeness 0**.
+
+## Parameterized-class lets -> instance variables (2026-06-14)
+
+Implemented the documented next object feature: in a parameterized class the
+class-creation lets are PER-OBJECT instance variables (ocamlc runs their inits in
+obj_init where the params are bound and stores them in variable slots), unlike a
+parameterless class where a let is computed ONCE and the shared value is stored
+into every object. Verified against the oracle that even a param-INDEPENDENT let
+(`let a = 99`) in a parameterized class is per-object, while a parameterless
+`let a = ref 0` is shared across instances -- so the rule keys on "class has
+params", not per-binding param-dependence. Route simple var-binding cl_lets into
+the `vals` instance-var machinery when cl_params is non-empty.
+
+`class c (n) = let m = n+1 in object method get = m end` runs correctly (was a
+segfault). Correctness fix; doesn't flip a corpus file (mixin2/3 still need
+`open MoreLabels` -- a SUBMODULE-labeled resolution, not StdLabels' top-level
+alias -- plus labeled functor-result args on Subst.add ~key ~data / Subst.fold
+~init ~f, plus lazy_fix interplay). lambda 389 + completeness 0 held, no
+regression (parameterless path unchanged).
+
+Dashboard: **exec 95.4% (689/722 ceiling; deterministic 688 = mixin/gen_test/
+toplevel_lets flipped, +debuggee flaky; was 685 at session start), lambda 52.4%
+(389, held), completeness 100% (0/744, held)**. SESSION TOTAL: 16 code commits,
+3 deterministic exec flips + many crash-class/object correctness fixes, 0
+regressions on any dimension. Next object step: MoreLabels submodule resolution +
+labeled functor-result args (would unblock mixin2/3 alongside lazy_fix); then
+cast (GADTs+poly-methods+coercion), pr6922 (virtual class-type hierarchies).
