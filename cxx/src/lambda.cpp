@@ -654,8 +654,16 @@ struct Translator {
   // Compile a `let name = rhs` RHS, pushing `name` onto func_path_ while a
   // function RHS is compiled so `__FUNCTION__` inside it includes this binding.
   LamPtr fn_binding_rhs(const std::string& name, const Expression& rhs, const Attributes& attrs) {
+    // a binding whose VALUE is a function (directly, or after side-effecting
+    // sequences / lets / a constraint) names its `__FUNCTION__` (ocamlc gives the
+    // let-name to a function-typed binding, e.g. `let f = e1; fun .. -> ..`).
     const Expression* r = &rhs;
-    while (auto* c = std::get_if<Pexp_constraint>(&r->desc)) r = c->e.get();
+    for (;;) {
+      if (auto* c = std::get_if<Pexp_constraint>(&r->desc)) { r = c->e.get(); continue; }
+      if (auto* sq = std::get_if<Pexp_sequence>(&r->desc)) { r = sq->e2.get(); continue; }
+      if (auto* le = std::get_if<Pexp_let>(&r->desc)) { r = le->body.get(); continue; }
+      break;
+    }
     bool is_fun = std::holds_alternative<Pexp_function>(r->desc);
     if (is_fun) func_path_.push_back(name);
     LamPtr v = with_inline(expr(rhs), attrs);
@@ -7209,7 +7217,7 @@ struct Translator {
         if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
           if (auto* fl = std::get_if<Lident>(&fid->id.txt.v)) {
             const Expression& a = *ap->args[0].second;
-            const Location& al = a.loc;
+            const Location& al = e.loc;  // the WHOLE `__X_OF__ e` application's loc
             if (fl->name == "__LOC_OF__")
               return cblock(0, {cstr(loc_string(al)), expr(a)});
             if (fl->name == "__LINE_OF__")
