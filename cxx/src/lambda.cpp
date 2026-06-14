@@ -6695,8 +6695,17 @@ struct Translator {
               return fi;
             }
           }
-          if (it->find('.') != std::string::npos) {  // opened stdlib submodule
-            if (LamPtr v = submodule_value(*it, l->name)) return v;
+          if (it->find('.') != std::string::npos) {  // opened submodule
+            // a LOCAL nested submodule path (`open M.Ops`, M a functor param):
+            // resolve the path and read the member from its registered layout
+            if (auto mp = resolve_module_path(*it); mp.base)
+              if (auto li = module_layout_.find(mp.key); li != module_layout_.end())
+                if (auto f = li->second.find(l->name); f != li->second.end()) {
+                  auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+                  fi->prim_arg = f->second; fi->args = {mp.base};
+                  return fi;
+                }
+            if (LamPtr v = submodule_value(*it, l->name)) return v;  // stdlib submodule
             if (StdPrim sp = submodule_prim(*it, l->name); !sp.name.empty())
               if (LamPtr s = prim_stub(sp)) return s;
             continue;
@@ -8436,9 +8445,9 @@ struct Translator {
                          module_layout_[nm]});
         if (fp && fp->type) {
           module_ident_[nm] = pid;
-          auto& lay = module_layout_[nm]; lay.clear();
-          auto fields = sig_layout(*fp->type);
-          for (int i = 0; i < (int)fields.size(); ++i) lay[fields[i]] = i;
+          // Register the param's flat layout AND its nested submodule layouts
+          // (so `X.Sub.foo` / `open X; open Sub; foo` resolve -- boxedints).
+          register_sig_layouts(nm, *fp->type);
         }
         fn->params.push_back({pid, ValueKind::Gen});
         cur = pf->body.get();
@@ -8661,6 +8670,15 @@ struct Translator {
         if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
           std::string dotted;  // a dotted submodule path opens under its full path
           if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+          // a bare `open Ops` where Ops is a submodule of an already-opened module
+          // (e.g. `open M; open Ops`, M a functor param): open it as `M.Ops`.
+          if (dotted.find('.') == std::string::npos && !module_base(dotted) &&
+              fields_of(dotted).empty())
+            for (auto o = opened_.rbegin(); o != opened_.rend(); ++o) {
+              auto li = module_layout_.find(*o);
+              if (li != module_layout_.end() && li->second.count(dotted) &&
+                  module_layout_.count(*o + "." + dotted)) { dotted = *o + "." + dotted; break; }
+            }
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
           opened_.push_back(dotted); ++n_opens;
