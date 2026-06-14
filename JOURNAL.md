@@ -1662,3 +1662,34 @@ features: mixin2/3 = parameterized classes with self-type constraints (`object
 pr6922 = virtual class type hierarchies; backtrace/names + locs also need
 __FUNCTION__/backtraces; t22ok = recursive modules. Plus the non-object deep tail
 (functor runtime coercion, effects, memprof, bigarray, domains, TMC, exact-GC).
+
+## Object frontier mapped (2026-06-14)
+
+Probed the remaining object files; the object RUNTIME + the class-expr forms now
+handled cover the "simple" object tests (toplevel_lets flipped). The rest each
+need a STACK of deep features, precisely:
+
+- **Parameterized class with a param-dependent let** (`class c (n) = let m = n+1
+  in object method get = m end`) -> SEGFAULT. ocamlc compiles such a let as an
+  INSTANCE VARIABLE: allocate a slot at class-creation (`m =o new_variable class
+  ""`), methods read it `(field_computed self m)`, and obj_init (which receives
+  the param) computes `m = n+1` per-object and `setfield_computed`s it. Our code
+  bails (rhs_leaks_param -> nullptr -> `0` placeholder) because it only lifts
+  param-INDEPENDENT lets. Fix = route param-dependent cl_lets into the `vals`
+  (instance-var) machinery before val_id setup. Contained but real; doesn't flip
+  a file alone.
+- **mixin2/mixin3** additionally need `open MoreLabels` (labeled Map/Set/Hashtbl
+  -- MoreLabels.Map is a SUBMODULE, not a top-level alias like StdLabels.List, so
+  the stdlib_alias_target mechanism doesn't cover it) + lazy_fix recursive objects
+  (works in isolation) + the param-dependent-let instance vars above.
+- **cast** = GADTs (`type 'a class_name = .. constraint`) + polymorphic methods
+  with local types (`method cast : type a. a name -> a`) + object coercion
+  `(self :> foo_t)` + extensible types.
+- **pr6922** = virtual class-type hierarchies; **exotic/locs/backtrace-names** =
+  objects + (__FUNCTION__ / backtraces); **t22ok** = recursive modules.
+
+Confirmed working in isolation: object literals/methods/inheritance/virtual/
+initializers/params/coercion/poly-methods/self-send, parameterized classes,
+self-type annotations, class constraints, class let-groups, lazy_fix recursive
+objects, simple Set.Make/Map.Make. Dashboard unchanged: **exec 95.3% (689 ceiling),
+lambda 389, completeness 0**.
