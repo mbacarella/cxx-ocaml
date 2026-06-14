@@ -1957,3 +1957,45 @@ specifically the Printf/Sys/etc. closure pulling Printexc by cmi-import. Matchin
 that (link a unit when its interface is imported, not just value-referenced) is a
 focused linker change for a dedicated push -- broad blast radius, needs full
 exec-parity validation.
+
+## Lambda near-miss sweep: let-kinds + field semantics (2026-06-14)
+
+A pass over the smallest (<=2 line) lambda DIFFs, each gated by
+lambda_parity + reject_parity, all stash-verified 0-regression. Lambda
+**390 -> 395 (52.5% -> 53.2%)**, completeness **100% (744/744)** held
+throughout, 5 commits, 0 regressions.
+
+ 1. **include-projection field semantics** -- a pure-path `include M`
+    re-exported M's fields via `field_imm`, but translmod's coercion
+    `get_field` always reads `Pfield(pos, Pointer, Mutable)` = `field_mut`.
+    Flips offset.ml, index_local_opaque_defs.ml.
+ 2. **mutable-field destructure binders -> StrictOpt** -- a pattern
+    variable bound to a record-field read was always `=a` (Alias), but
+    matching.ml maps Immutable->Alias, Mutable->StrictOpt (`=o`). An
+    immediate mutable field reads as `field_int` (spelling ignores
+    mutability), so track mutable-field read nodes and pick the let-kind
+    from that. Flips eval_order_6.ml.
+ 3. **match-scrutinee temp -> Strict** -- a multi-use non-var scrutinee
+    bound to a `*match*` temp used `=a` when a field access, but
+    matching.ml binds the matcher's top argument Strict (`root_arg arg
+    Strict`) and simplif keeps a multi-use Strict let verbatim (only
+    Alias inlines). Flips bigints.ml.
+ 4. **var-alias inlining** -- `let x = (var w)` is dropped by simplif
+    unconditionally (any let-kind), substituting x by w. Mirror it by
+    aliasing the name in scope, EXCEPT on a recursive binding's spine
+    (the rec-value compiler chooses dummy-context vs direct-letrec from
+    the RHS's syntactic shape BEFORE simplif runs -- inlining there flips
+    the strategy, observed on pr4989). Flips pr10611.
+
+ABANDONED (reverted, recorded so it isn't re-attempted): a makeblock-shape
+fallback deriving an element's value-kind from the built `field_int` node
+when the inferencer returns Gen. WRONG -- the block shape uses
+`Typeopt.value_kind` of the TUPLE-ELEMENT type (can be Pgenval/polymorphic)
+which legitimately differs from the field-read spelling (which uses the
+RECORD field's declared type). Regressed 9 files, fixed 0.
+
+The remaining <=2-line near-misses are now genuinely INFERENCE-bound
+value-kind gaps (assert-arg-not-constrained-to-bool so a `bool ref` reads
+`field_mut` not `field_int`; opaque-record-typed tuple elements; polymorphic
+array element kind) -- the hard tail the journal has flagged, with real
+regression risk (the makeblock-shape attempt confirmed it).
