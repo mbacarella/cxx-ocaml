@@ -644,6 +644,14 @@ struct Translator {
     std::vector<bool> rfmut;
   };
   std::unordered_map<std::string, CtorInfo> ctor_info_;
+  // Per-type constructor info, plus names defined by more than one type.  A
+  // constructor name shared across types (morematch redefines `A|B|C..`) is
+  // resolved in SOURCE ORDER: build_module re-registers each type's ambiguous
+  // constructors when it reaches that `type` decl, so an earlier expression /
+  // match sees the constructor of the type in scope at that point (OCaml
+  // scoping), not the flat last-registered one.
+  std::unordered_map<std::string, std::unordered_map<std::string, CtorInfo>> type_ctor_info_;
+  std::set<std::string> ambiguous_ctors_;
   std::unordered_map<std::string, std::pair<int, int>> type_ctors_;  // type -> (n_const, n_block)
   std::set<std::string> immediate_local_;  // local all-constant variant type names
   std::set<std::string> gadt_types_;        // variant types with a GADT constructor
@@ -890,6 +898,10 @@ struct Translator {
               field_info_[f.name.txt] = {d.name.txt, ridx++, fm, fk};
             }
           }
+          if (ctor_info_.count(c.name.txt) &&
+              ctor_info_[c.name.txt].type != d.name.txt)
+            ambiguous_ctors_.insert(c.name.txt);  // same name, a different type
+          type_ctor_info_[d.name.txt][c.name.txt] = ci;
           ctor_info_[c.name.txt] = std::move(ci);
           if (block) ++nb; else ++nc;
         }
@@ -8963,6 +8975,17 @@ struct Translator {
   LamPtr build_module(const Structure& s, std::vector<std::string>* names,
                       const std::vector<std::string>* coerce = nullptr) {
     scope.emplace_back();
+    // Re-register ambiguous constructors in source order within this module:
+    // save their current entries and restore on exit, so a submodule's in-order
+    // re-registration does not leak to the enclosing structure.
+    std::vector<std::pair<std::string, CtorInfo>> saved_ambig;
+    for (auto& n : ambiguous_ctors_)
+      if (auto it = ctor_info_.find(n); it != ctor_info_.end())
+        saved_ambig.emplace_back(n, it->second);
+    struct AmbigRestore {
+      Translator* t; std::vector<std::pair<std::string, CtorInfo>>* s;
+      ~AmbigRestore() { for (auto& [n, ci] : *s) t->ctor_info_[n] = ci; }
+    } ambig_restore{this, &saved_ambig};
     // updates non-empty => a recursive-data group: `(let <binds=dummies>
     // (seq <updates> body))` (caml_alloc_dummy + caml_update_dummy).
     struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e;
@@ -8988,6 +9011,15 @@ struct Translator {
     };
     int n_opens = 0;  // top-level `open M` opened for the rest of the structure
     for (auto& it : s) {
+      if (auto* td = std::get_if<Pstr_type>(&it.desc)) {
+        // bring this type's ambiguous constructors into scope (overwriting an
+        // earlier same-named one), so subsequent code resolves them to THIS type
+        for (auto& d : td->decls)
+          if (auto tci = type_ctor_info_.find(d.name.txt); tci != type_ctor_info_.end())
+            for (auto& [cn, ci] : tci->second)
+              if (ambiguous_ctors_.count(cn)) ctor_info_[cn] = ci;
+        continue;
+      }
       if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
         flush(); segs.push_back({true, false, {}, expr(*pe->e)}); continue;
       }
