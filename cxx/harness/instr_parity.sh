@@ -37,7 +37,9 @@ if [ "${1:-}" == "--worker" ]; then
     # space-indented continuation lines of a wrapped operand (e.g. a wide `const`
     # block).  Skip any leading warning/banner block by only emitting once the
     # first real instruction line has been seen.
-    awk '/^(	|L[0-9])/{seen=1} seen && /^(	|L[0-9]| )/{print}' "$ck" \
+    # (drop caret-only lines: deprecation/alert warnings on stderr underline the
+    #  source with `^^^` -- space-led like a wrapped operand, but pure noise.)
+    awk '/^(	|L[0-9])/{seen=1} seen && /^(	|L[0-9]| )/ && !/^ *\^+ *$/{print}' "$ck" \
       > "$ck.f" 2>/dev/null; mv -f "$ck.f" "$ck" 2>/dev/null || true
   fi
   [ -s "$ck" ] || { printf 'SKIP\n'; exit 0; }   # oracle produced no instructions
