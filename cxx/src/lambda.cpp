@@ -679,6 +679,12 @@ struct Translator {
   struct FieldInfo { std::string type; int index; bool mut; ValueKind kind; };
   std::unordered_map<std::string, FieldInfo> field_info_;
   std::set<std::string> ambiguous_fields_;
+  // Per-type record fields + the labels source-order scoping has resolved at the
+  // current point (so find_field uses the in-scope type's field despite the
+  // label being ambiguous overall) -- the record analogue of the constructor
+  // scoping (morematch: `x` in `type eber={x;y;z}` vs a later `type tg={v;x}`).
+  std::unordered_map<std::string, std::unordered_map<std::string, FieldInfo>> type_field_info_;
+  std::set<std::string> scoped_unambig_fields_;
   struct RecType { std::vector<std::string> labels; bool mut; std::vector<ValueKind> shape;
                    bool flat = false; };  // all-float: a flat float block, not a record
   std::unordered_map<std::string, RecType> rec_types_;  // type name -> record layout
@@ -942,8 +948,11 @@ struct Translator {
           rt.flat = rt.flat && is_float_core(*f.type);
           rt.labels.push_back(f.name.txt);
           rt.shape.push_back(k);
-          if (field_info_.count(f.name.txt)) ambiguous_fields_.insert(f.name.txt);
-          field_info_[f.name.txt] = {d.name.txt, idx++, m, k};
+          if (field_info_.count(f.name.txt) && field_info_[f.name.txt].type != d.name.txt)
+            ambiguous_fields_.insert(f.name.txt);
+          FieldInfo finfo{d.name.txt, idx++, m, k};
+          type_field_info_[d.name.txt][f.name.txt] = finfo;
+          field_info_[f.name.txt] = finfo;
         }
         rec_types_[d.name.txt] = std::move(rt);
       }
@@ -1023,7 +1032,7 @@ struct Translator {
     }
   }
   const FieldInfo* find_field(const std::string& label) {
-    if (ambiguous_fields_.count(label)) return nullptr;
+    if (ambiguous_fields_.count(label) && !scoped_unambig_fields_.count(label)) return nullptr;
     auto it = field_info_.find(label);
     return it == field_info_.end() ? nullptr : &it->second;
   }
@@ -9072,10 +9081,20 @@ struct Translator {
     for (auto& n : ambiguous_ctors_)
       if (auto it = ctor_info_.find(n); it != ctor_info_.end())
         saved_ambig.emplace_back(n, it->second);
+    std::vector<std::pair<std::string, FieldInfo>> saved_fields;
+    for (auto& n : ambiguous_fields_)
+      if (auto it = field_info_.find(n); it != field_info_.end())
+        saved_fields.emplace_back(n, it->second);
+    std::set<std::string> saved_scoped = scoped_unambig_fields_;
     struct AmbigRestore {
       Translator* t; std::vector<std::pair<std::string, CtorInfo>>* s;
-      ~AmbigRestore() { for (auto& [n, ci] : *s) t->ctor_info_[n] = ci; }
-    } ambig_restore{this, &saved_ambig};
+      std::vector<std::pair<std::string, FieldInfo>>* sf; std::set<std::string>* ss;
+      ~AmbigRestore() {
+        for (auto& [n, ci] : *s) t->ctor_info_[n] = ci;
+        for (auto& [n, fi] : *sf) t->field_info_[n] = fi;
+        t->scoped_unambig_fields_ = std::move(*ss);
+      }
+    } ambig_restore{this, &saved_ambig, &saved_fields, &saved_scoped};
     // updates non-empty => a recursive-data group: `(let <binds=dummies>
     // (seq <updates> body))` (caml_alloc_dummy + caml_update_dummy).
     struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e;
@@ -9102,12 +9121,17 @@ struct Translator {
     int n_opens = 0;  // top-level `open M` opened for the rest of the structure
     for (auto& it : s) {
       if (auto* td = std::get_if<Pstr_type>(&it.desc)) {
-        // bring this type's ambiguous constructors into scope (overwriting an
-        // earlier same-named one), so subsequent code resolves them to THIS type
-        for (auto& d : td->decls)
+        // bring this type's ambiguous constructors / record fields into scope
+        // (overwriting an earlier same-named one), so subsequent code resolves
+        // them to THIS type
+        for (auto& d : td->decls) {
           if (auto tci = type_ctor_info_.find(d.name.txt); tci != type_ctor_info_.end())
             for (auto& [cn, ci] : tci->second)
               if (ambiguous_ctors_.count(cn)) ctor_info_[cn] = ci;
+          if (auto tfi = type_field_info_.find(d.name.txt); tfi != type_field_info_.end())
+            for (auto& [fn, fi] : tfi->second)
+              if (ambiguous_fields_.count(fn)) { field_info_[fn] = fi; scoped_unambig_fields_.insert(fn); }
+        }
         continue;
       }
       if (auto* pe = std::get_if<Pstr_eval>(&it.desc)) {  // bare `e;;` -> seq
