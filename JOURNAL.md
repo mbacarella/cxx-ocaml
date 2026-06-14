@@ -1548,3 +1548,32 @@ out, floor held at 685 = no regression, ceiling rose from 686), lambda 52.4%
 (polyvariant #type matching + functor externals coercion), 0 regressions on any
 dimension. 100% remains multi-session (objects, nested-module coercion, exact-GC,
 memprof, domains, bigarray, effects, backtraces, TMC each still open).
+
+## Stdlib module-alias following: open StdLabels (2026-06-14)
+
+`open StdLabels; List.map [..] ~f:..` segfaulted. `StdLabels.List` is an
+`Mty_alias` to the top-level `ListLabels`, but submodule resolution only handled
+submodules with a concrete signature, so `List.map` fell through to the PLAIN
+`Stdlib__List` (whose `map` has no `~f:` label and the opposite arg order) ->
+labels mis-applied -> crash.
+
+Added stdlib_alias_target(mod, sub): reads mod's cmi, and if `mod.sub` is an
+`Mty_alias`, returns the aliased top-level module's bare name. Used in two places,
+gated to stdlib opens and checked BEFORE the plain module (so the alias shadows,
+matching ocamlc): value resolution (`List.map` -> Stdlib__ListLabels field) and
+callee_sig label lookup (so `~f:` reorders against ListLabels.map's labels --
+reordering itself already worked for direct `ListLabels.map`).
+
+Flips unboxed-primitive-args/gen_test.ml. Verified open StdLabels with
+List/Array/String map/iter/iteri ~f. lambda 389 + completeness 0 held.
+
+Dashboard: **exec 95.3% (688/722, was 685 at session start), lambda 52.4% (389,
+held), completeness 100% (0/744, held)**. SESSION TOTAL: 3 committed code fixes
+(polyvariant #type matching, functor externals coercion, stdlib alias following)
+-> 3 deterministic exec flips (mixin, gen_test) + functor crash-class fix, 0
+regressions on any dimension. Remaining 34 dominated by OBJECTS (~10 files:
+backtrace/names, exotic, toplevel_lets, locs, fstclassmod, cast, mixin2/3,
+pr6922, t22ok -- the translclass.ml subsystem, the single highest-ROI next
+target), plus functor-member resolution (sets/htbl/boxedints), exact-GC
+(testset/testmap/pr7798), effects, memprof, bigarray, domains, TMC, optional-
+defaults+__FUNCTION__ (syntactic-arity).
