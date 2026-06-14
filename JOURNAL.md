@@ -2113,3 +2113,25 @@ layout kinds; record/tuple element kinds the inferencer can't resolve
 through qualified functor members; ref-content int via assert; operand
 kinds for `==` vs caml_equal; polyvariant immediacy), plus a few specific
 items (recmod field_mut reads pr8681/pr7601; module-coercion artifacts).
+
+## Over-applied %field0/%field1 reads field_mut (2026-06-14)
+
+translprim makes `%field0`/`%field1` (fst/snd) `Pfield(_, Pointer,
+Mutable)` = field_mut, specialised to field_int only when the field is
+provably immediate.  For an OVER-applied projection (`snd p 42`, the
+field content being a function) expr_kind was taken off the whole CALL
+(kind int) and wrongly emitted field_int.  The over-application path
+already trims the apply's args in place before prim_to_lam runs (so
+inspecting e.desc sees the trimmed list), so thread an explicit `over`
+flag and treat the field kind as Gen (-> field_mut) when set.  Flips
+pr8681.  lambda 417->418 (56.3%).
+
+Session arc (one day): lambda **390 -> 418 (52.5% -> 56.3%, +28)**, exec
+**688 -> 690**, completeness **100% (744/744)** held throughout, ~14
+commits, 0 regressions.  Highest-leverage were two printer/simplif
+post-passes (break-size cap +11, tree-wide var-alias inlining +7) plus the
+static-catch collapse.  Remaining lambda near-misses are now
+inference-bound value kinds and a handful of "oracle breaks, I fit"
+col-precision printer cases (divint/localfunction/opt_variants/lists/
+exception_callback/Latin9 -- high regression risk to the 238+ matching
+files, deprioritised).
