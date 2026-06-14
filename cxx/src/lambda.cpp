@@ -9153,6 +9153,11 @@ struct Translator {
         if (auto* mi = std::get_if<Pmod_ident>(&pin->expr.desc)) {
           std::string dotted;
           if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+          // `Stdlib.Array` is the bare stdlib submodule `Array` (Stdlib__Array);
+          // open it under its bare name so its members resolve unqualified.
+          if (dotted.rfind("Stdlib.", 0) == 0 &&
+              dotted.find('.', 7) == std::string::npos)
+            dotted = dotted.substr(7);
           opened_.push_back(dotted);
           ++n_opens;
         }
