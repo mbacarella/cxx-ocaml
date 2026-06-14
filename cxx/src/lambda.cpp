@@ -7994,7 +7994,7 @@ struct Translator {
       methods_block.push_back(varof(meth_id[m.name]));
       Ident self = fresh(self_name);
       scope.emplace_back();
-      if (auto* pv = std::get_if<ast::Ppat_var>(&cs.self.desc)) scope.back()[pv->name.txt] = self;
+      if (auto* pv = std::get_if<ast::Ppat_var>(&effective_pat(&cs.self)->desc)) scope.back()[pv->name.txt] = self;
       auto save_self = cur_self_; cur_self_ = self;
       // A method `method f a b = e` is one curried function over self plus its own
       // params: prepend self to the (flattened) function translated from the body.
@@ -8033,7 +8033,7 @@ struct Translator {
     for (auto* ie : initializers) {
       Ident self = fresh(self_name);
       scope.emplace_back();
-      if (auto* pv = std::get_if<ast::Ppat_var>(&cs.self.desc)) scope.back()[pv->name.txt] = self;
+      if (auto* pv = std::get_if<ast::Ppat_var>(&effective_pat(&cs.self)->desc)) scope.back()[pv->name.txt] = self;
       auto save_self = cur_self_; cur_self_ = self;
       auto fn = mk(Lam::K::Function);
       fn->params = {{self, ValueKind::Gen}};
