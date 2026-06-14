@@ -1458,3 +1458,21 @@ Dashboard: **exec 95.0% (686/722), lambda 52.4% (389), completeness 100%
 (0/744)**. This exec-push session: 681->686 (+5 files / fixes), 10 commits, all
 gated, 0 regressions. Remaining 36 all deep subsystems; 100% is a multi-session
 goal (and exact-GC-accounting files may be impractical to match byte-for-byte).
+
+## include Stdlib.X + remaining-frontier confirmation (2026-06-14)
+
+- **`include Stdlib.X` opens X bare** so its members resolve unqualified
+  (`include Stdlib.Array; create_float` was `?`). floatarray's names resolve now
+  but it still crashes on a deeper I/O path.
+
+Confirmed each remaining frontier blocker by direct probe:
+- functor-param NESTED-submodule member access (`M.Ops.add` / `open M; open Ops`)
+  is unresolved -> blocks boxedints (single-level M.x works; nested doesn't).
+- patmatch was ALREADY segfaulting pre-session (option-of-extensible + deeper
+  modules); my matcher correctly bails, no regression.
+- exact-GC-allocation asserts (pr7798, testset) likely unreachable byte-for-byte.
+
+Dashboard unchanged: **exec 95.0% (686/722), lambda 52.4% (389), completeness
+100% (0/744)**. The 35 remaining are each a deep subsystem (nested-module/functor
+resolution, bigarray, memprof, parallel, objects, effect-depth, exn module
+scoping, __FUNCTION__, first-class-mod, exact-GC). 100% is multi-session.
