@@ -644,6 +644,23 @@ struct Translator {
   std::set<std::string> immediate_local_;  // local all-constant variant type names
   std::set<std::string> gadt_types_;        // variant types with a GADT constructor
 
+  // Polymorphic-variant type abbreviations (`type lambda = [ `Var | `App .. ]`):
+  // map the type name to its directly-named tags and to the polyvariant types it
+  // inherits (`[ a | b ]`), so a `#lambda` pattern can be expanded to the full
+  // tag-hash set (with inheritance, resolved lazily by collect_pv_tags).
+  std::unordered_map<std::string, std::vector<std::string>> pv_raw_tags_;
+  std::unordered_map<std::string, std::vector<std::string>> pv_inherits_;
+  void collect_pv_tags(const std::string& ty, std::set<long long>& out,
+                       std::set<std::string>& seen) {
+    if (!seen.insert(ty).second) return;
+    auto it = pv_raw_tags_.find(ty);
+    if (it != pv_raw_tags_.end())
+      for (auto& t : it->second) out.insert(hash_variant(t));
+    auto ii = pv_inherits_.find(ty);
+    if (ii != pv_inherits_.end())
+      for (auto& sub : ii->second) collect_pv_tags(sub, out, seen);
+  }
+
   // Locally-declared record fields: label -> {owning type, index, mutable, kind}.
   // Only UNAMBIGUOUS labels are usable (a label reused across records can't be
   // resolved without type direction, so it falls back to a generic translation).
@@ -881,6 +898,20 @@ struct Translator {
       if (d.manifest && !std::get_if<Ptype_variant>(&d.kind) &&
           !std::get_if<Ptype_record>(&d.kind))
         local_alias_.emplace(d.name.txt, d.manifest->get());
+    });
+    each_decl([&](const TypeDeclaration& d) {  // polymorphic-variant abbreviations
+      if (!d.manifest) return;
+      auto* pv = std::get_if<Ptyp_variant>(&d.manifest->get()->desc);
+      if (!pv) return;
+      std::vector<std::string> tags, inh;
+      for (auto& rf : pv->rows) {
+        if (auto* rt = std::get_if<Rtag>(&rf)) tags.push_back(rt->name);
+        else if (auto* ri = std::get_if<Rinherit>(&rf))
+          if (auto* c = std::get_if<Ptyp_constr>(&ri->ct->desc))
+            inh.push_back(lid_last(c->id.txt));
+      }
+      pv_raw_tags_[d.name.txt] = std::move(tags);
+      pv_inherits_[d.name.txt] = std::move(inh);
     });
     each_decl([&](const TypeDeclaration& d) {  // then records
       if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
@@ -4940,6 +4971,24 @@ struct Translator {
       }
     }
     if (auto pm = pv_const_match(scrut, rows)) return pm;
+    if (auto pt = pvtype_match(scrut, rows)) return pt;
+    // A single `#poly`-type row is exhaustive by typing, hence irrefutable: just
+    // bind the `as` alias and run the body, no tag test (matches ocamlc, which
+    // emits only the scrutinee evaluation).
+    if (rows.size() == 1 && !rows[0].guard) {
+      const Pattern* p = effective_pat(rows[0].lhs);
+      const std::string* bind = nullptr;
+      if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+        bind = &pa->name.txt; p = effective_pat(pa->p.get());
+      }
+      if (std::holds_alternative<Ppat_type>(p->desc)) {
+        scope.emplace_back();
+        if (bind) scope.back()[*bind] = scrut->var;
+        LamPtr b = expr(*rows[0].rhs);
+        scope.pop_back();
+        return b;
+      }
+    }
     // A single irrefutable non-catchall row (e.g. a polyvariant payload
     // `` `A g -> .. ``): destructure directly, no test.
     if (rows.size() == 1 && !rows[0].guard && !is_catchall(*rows[0].lhs) &&
@@ -5045,6 +5094,70 @@ struct Translator {
     for (int i = (int)kvs.size() - 1; i >= 0; --i)
       c = iff(cmp("==", kvs[i].h), expr(*kvs[i].rhs), c);
     return c;
+  }
+
+  // Match over polymorphic-variant *type* patterns (`#lambda as x -> ..`): each
+  // arm matches the set of tags belonging to a named polyvariant type.  The
+  // scrutinee's tag is the value itself for a constant tag, else field 0 of its
+  // block; `as x` binds x to the whole scrutinee.  Not byte-exact with ocamlc's
+  // interval Switcher, but correct -- enough for execution parity.
+  LamPtr pvtype_match(const LamPtr& scrut, const std::vector<Row>& rows) {
+    if (scrut->k != Lam::K::Var) return nullptr;
+    struct Arm { std::set<long long> tags; const std::string* bind; const Expression* rhs; };
+    std::vector<Arm> arms;
+    for (auto& r : rows) {
+      if (r.guard) return nullptr;
+      const Pattern* p = effective_pat(r.lhs);
+      const std::string* bind = nullptr;
+      if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+        bind = &pa->name.txt;
+        p = effective_pat(pa->p.get());
+      }
+      auto* pt = std::get_if<Ppat_type>(&p->desc);
+      if (!pt) return nullptr;
+      std::set<long long> tags;
+      std::set<std::string> seen;
+      collect_pv_tags(lid_last(pt->id.txt), tags, seen);
+      if (tags.empty()) return nullptr;  // unknown polyvariant type
+      arms.push_back({std::move(tags), bind, r.rhs});
+    }
+    if (arms.size() < 2) return nullptr;
+    Ident tagid = fresh("", true);
+    auto isi = mk(Lam::K::Prim); isi->prim = Prim::IntCmp; isi->prim_id = "isint";
+    isi->args = {scrut};
+    auto tagexpr = mk(Lam::K::IfThenElse);
+    tagexpr->cond = isi; tagexpr->then_ = scrut; tagexpr->else_ = fieldimm(0, scrut);
+    auto tagvar = [&] { auto v = mk(Lam::K::Var); v->var = tagid; return v; };
+    auto cmpeq = [&](long long h) {
+      auto t = mk(Lam::K::Prim); t->prim = Prim::IntCmp; t->prim_id = "==";
+      t->args = {tagvar(), cint(h)};
+      return t;
+    };
+    auto iff = [&](LamPtr c, LamPtr a, LamPtr b) {
+      auto i = mk(Lam::K::IfThenElse); i->cond = c; i->then_ = a; i->else_ = b;
+      return i;
+    };
+    auto arm_body = [&](const Arm& a) -> LamPtr {
+      scope.emplace_back();
+      if (a.bind) scope.back()[*a.bind] = scrut->var;
+      LamPtr b = expr(*a.rhs);
+      scope.pop_back();
+      return b;
+    };
+    auto member = [&](const std::set<long long>& tags) -> LamPtr {
+      std::vector<long long> hs(tags.begin(), tags.end());
+      LamPtr c = cmpeq(hs.back());
+      for (int i = (int)hs.size() - 2; i >= 0; --i)
+        c = iff(cmpeq(hs[i]), cint(1), c);  // (|| (== tag h) rest)
+      return c;
+    };
+    LamPtr body = arm_body(arms.back());  // last arm = else (match is exhaustive)
+    for (int i = (int)arms.size() - 2; i >= 0; --i)
+      body = iff(member(arms[i].tags), arm_body(arms[i]), body);
+    auto l = mk(Lam::K::Let);
+    l->bindings = {{tagid, ValueKind::Int, tagexpr, false}};
+    l->body = body;
+    return l;
   }
 
   // Match over extension constructors (`type t += A ...`, exceptions, effects):
@@ -5854,6 +5967,34 @@ struct Translator {
       g->cond = ii; g->then_ = cint(0); g->else_ = e2;
       test = if_and(test, g);
       return pat_test(pv2->arg->get(), fieldimm(1, acc), test, binds);
+    }
+    // A polymorphic-variant *type* pattern (`#lambda`): the scrutinee's tag (the
+    // value itself when immediate, else field 0 of the block) must belong to the
+    // named type's tag set.  Lets naive_match handle matches mixing `#type` rows
+    // with explicit-tag rows (`#var as x | `Abs .. | `App ..`).
+    if (auto* pt = std::get_if<Ppat_type>(&p->desc)) {
+      std::set<long long> tags; std::set<std::string> seen;
+      collect_pv_tags(lid_last(pt->id.txt), tags, seen);
+      if (tags.empty()) return false;  // unknown polyvariant type
+      auto tagof = [&]() -> LamPtr {
+        auto ii = mk(Lam::K::Prim); ii->prim = Prim::IntCmp;
+        ii->prim_id = "isint"; ii->args = {acc};
+        auto tx = mk(Lam::K::IfThenElse);
+        tx->cond = ii; tx->then_ = acc; tx->else_ = fieldimm(0, acc);
+        return tx;
+      };
+      auto eq = [&](long long h) -> LamPtr {
+        auto e = mk(Lam::K::Prim); e->prim = Prim::EqInt; e->args = {tagof(), cint(h)};
+        return e;
+      };
+      std::vector<long long> hs(tags.begin(), tags.end());
+      LamPtr mem = eq(hs.back());
+      for (int i = (int)hs.size() - 2; i >= 0; --i) {  // (|| (== tag h) rest)
+        auto o = mk(Lam::K::IfThenElse); o->cond = eq(hs[i]);
+        o->then_ = cint(1); o->else_ = mem; mem = o;
+      }
+      test = if_and(test, mem);
+      return true;
     }
     if (auto* pi = std::get_if<Ppat_interval>(&p->desc)) {
       // `lo..hi` (char or int range): acc >= lo && acc <= hi.  A single-point
