@@ -7747,8 +7747,19 @@ struct Translator {
       std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured pats
       for (auto& b : le->bindings) {
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
+          LamPtr rhs = fn_binding_rhs(pv->name.txt, *b.expr, {});
+          // simplif drops `let x = (var w)` unconditionally (any let-kind),
+          // substituting x by w -- so alias the name to w rather than binding it.
+          // Not on a recursive binding's spine, though: the rec-value compiler
+          // chooses its strategy (dummy-context vs direct letrec) from the RHS's
+          // SYNTACTIC shape, before simplif inlines -- inlining here would flip it.
+          if (rhs->k == Lam::K::Var && !rec_spine) {
+            scope.back()[pv->name.txt] = rhs->var;
+            record_fn_sig(rhs->var, b.expr.get());
+            continue;
+          }
           Ident id = fresh(pv->name.txt);
-          Lam::Binding bd{id, pat_kind(&b.pat), fn_binding_rhs(pv->name.txt, *b.expr, {})};
+          Lam::Binding bd{id, pat_kind(&b.pat), std::move(rhs)};
           l->bindings.push_back(std::move(bd));
           scope.back()[pv->name.txt] = id;
           record_fn_sig(id, b.expr.get());
