@@ -784,6 +784,54 @@ struct Translator {
     return nullptr;
   }
 
+  // Register a qualified stdlib constructor's whole type into ctor_info_/type_ctors_
+  // (e.g. a `Seq.Cons(x,_)` pattern needs Seq.node's Nil/Cons tags so the matcher
+  // can bind x and decide exhaustiveness).  Idempotent; local modules are skipped.
+  void register_qualified_ctor(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return;
+    auto* pl = std::get_if<Lident>(&d->prefix->v);
+    if (!pl || module_base(pl->name)) return;
+    if (ctor_info_.count(d->name)) return;
+    auto& mc = module_ctors(pl->name);
+    auto f = mc.find(d->name);
+    if (f == mc.end()) return;
+    const std::string ty = f->second.type;
+    int nc = 0, nb = 0;
+    for (auto& [nm, info] : mc) if (info.type == ty) (info.is_block ? nb : nc)++;
+    for (auto& [nm, info] : mc)
+      if (info.type == ty && !ctor_info_.count(nm)) {
+        ctor_info_[nm] = info; builtin_ctors_.insert(nm);
+      }
+    type_ctors_.emplace(ty, std::make_pair(nc, nb));
+  }
+  // Recursively register the qualified stdlib constructors named in a pattern,
+  // so the match compiler resolves them like local/predef ones.
+  void scan_pat_ctors(const Pattern& p) {
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
+      register_qualified_ctor(k->id.txt);
+      if (k->arg) scan_pat_ctors(**k->arg);
+    } else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems) scan_pat_ctors(*e);
+    } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      scan_pat_ctors(*o->l); scan_pat_ctors(*o->r);
+    } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
+      scan_pat_ctors(*a->p);
+    } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
+      scan_pat_ctors(*c->p);
+    } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& [lbl, sub] : r->fields) scan_pat_ctors(*sub);
+    } else if (auto* ar = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : ar->elems) scan_pat_ctors(*e);
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      if (v->arg) scan_pat_ctors(**v->arg);
+    } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
+      scan_pat_ctors(*lz->p);
+    } else if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) {
+      scan_pat_ctors(*ex->p);
+    }
+  }
+
   void register_types(const Structure& s) {
     auto each_decl = [&](auto fn) {
       for (auto& item : s)
@@ -4668,6 +4716,9 @@ struct Translator {
   }
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Row>& rows,
                        const Location& mloc) {
+    // Resolve any qualified stdlib constructors in the rows (Seq.Cons, ...) so
+    // the matcher below has their tag/arity like local/predef constructors.
+    for (auto& r : rows) scan_pat_ctors(*r.lhs);
     // Peel `[@@unboxed]` constructor wrappers off the patterns (transparent) and
     // re-dispatch, so the matcher below never sees an unboxed constructor.
     bool unbox = false;
