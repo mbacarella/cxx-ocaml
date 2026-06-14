@@ -1577,3 +1577,32 @@ pr6922, t22ok -- the translclass.ml subsystem, the single highest-ROI next
 target), plus functor-member resolution (sets/htbl/boxedints), exact-GC
 (testset/testmap/pr7798), effects, memprof, bigarray, domains, TMC, optional-
 defaults+__FUNCTION__ (syntactic-arity).
+
+## Curried-functor result layout + functor-resolution frontier (2026-06-14)
+
+`module_result_layout` only handled an application whose head is a module ident,
+so a curried/nested application `PowerSet(IntSet)(functor (S) -> S)` (head =
+`PowerSet(IntSet)`, itself a Pmod_apply) returned empty -> the result module's
+members were unresolved `?empty`/`?add`/`?mem`. Fix: unwrap nested Pmod_apply to
+the base functor (committed).  basic/sets.ml members now resolve.
+
+FRONTIER finding (functor runtime codegen): resolving the members is necessary
+but NOT sufficient -- sets.ml (higher-order curried functor: a functor arg that
+is itself a functor) and htbl.ml (2-param `Test(H: Hashtbl.SeededS)(M: Map.S with
+type key = H.key)`) both still SEGFAULT after the `?` are gone, because the
+runtime functor application / argument coercion is still wrong for these. A
+`Pmty_with` layout fix (S with type t=u -> base layout) in sig_layout +
+register_sig_layouts cleared htbl's `?` too, but REGRESSED pr7519_ok.ml (lambda
+389->388) and flipped nothing, so it was REVERTED (net-negative -- the
+advance-together law: resolving without correct coercion isn't enough).
+
+Dashboard: **exec ~95.3% (688/722 ceiling, flaky 687-688; was 685 at session
+start), lambda 52.4% (389, held), completeness 100% (0/744, held)**.
+
+SESSION GRAND TOTAL (5 code commits, 0 regressions on any dimension):
+polyvariant `#type` matching (flips mixin.ml), functor externals coercion (fixes
+the F(Int32) segfault class), stdlib module-alias following (flips gen_test.ml),
+curried-functor result layout (sets `?` removed). 2 deterministic exec flips +
+crash-class fixes. Remaining 34 dominated by OBJECTS (~10 files, translclass.ml
+-- highest ROI next) and deeper functor runtime coercion (sets/htbl/boxedints),
+plus effects/memprof/bigarray/domains/TMC/exact-GC. 100% is multi-session.
