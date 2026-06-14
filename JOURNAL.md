@@ -1522,3 +1522,29 @@ Dashboard: **exec 95.0% (686/722, was 685), lambda 52.4% (389, held),
 completeness 100% (0/744, held)**. 1 file flipped, 0 regressions across all three
 dimensions (lambda-only change; index_types near-miss caught and fixed before
 commit via a stash-diff baseline).
+
+## Functor argument coercion: eta-stub externals (2026-06-14)
+
+`F(Int32)` -- a functor applied to a bare stdlib module whose signature contains
+`external`s -- segfaulted. The arg-coercion loop in compile_functor_apply looked
+each parameter-signature value up in the argument's runtime FIELD layout, but
+externals (of_int, to_int, neg, ...) occupy no module field, so every miss
+defaulted to field 0 (`field_imm 0 M` off the wrong slot -> crash).
+
+Fix: a param value absent from the arg's field layout is an external -> eta-stub
+its primitive (`(function prim stub (Int32.of_int prim))`) via value_prim +
+prim_stub, exactly like ocamlc, instead of reading a field. Regular (Val_reg)
+values keep their correct index (externals are correctly skipped in the layout;
+verified vs oracle that `unsigned_div` reads field 3, not 8).
+
+Verified F(Int32)/F(Int64)/F(Nativeint) run correctly. lambda 389 + completeness
+0 held. boxedints still needs the deeper NESTED case (`module Ops = Int32` inside
+a struct-literal functor arg, coerced to a sub-signature -- signature-directed
+module coercion threaded into struct bindings, not attempted).
+
+Dashboard: **exec ~95.2% (687/722; FLAKY 685-687 at JOBS=3 -- heavy tests time
+out, floor held at 685 = no regression, ceiling rose from 686), lambda 52.4%
+(389, held), completeness 100% (0/744, held)**. Session total: 2 committed fixes
+(polyvariant #type matching + functor externals coercion), 0 regressions on any
+dimension. 100% remains multi-session (objects, nested-module coercion, exact-GC,
+memprof, domains, bigarray, effects, backtraces, TMC each still open).
