@@ -1802,3 +1802,32 @@ Dashboard: **exec 95.6% (690 ceiling, deterministic 689; flaky), lambda 52.5%
 (390), completeness 100% (0/744)**. Next matcher steps: the matching.ml matrix
 decision tree (unlocks morematch's #81+ and other or-pattern/multi-column tests)
 and module-scoped EXTENSION-ctor identities (patmatch).
+
+## morematch FLIPPED: matrix matcher (or-expansion) + field scoping (2026-06-14)
+
+Flipped basic-more/morematch.ml (the whole pattern-matching-compiler test suite)
+with two matcher fixes:
+1. **Binding or-pattern expansion**: the naive matcher bailed on a row with a
+   binding or-alternative (`(C|D) as x|E x|F(_,x)` -- x bound differently per
+   alternative). Added a per-row choice-map (or-node -> chosen child, no AST
+   construction, cap 64) enumerating the or-free instantiations of BINDING
+   or-nodes; pat_test follows the choice. Non-binding ors keep their OR codegen.
+   Advanced morematch #2 -> #81 ("autre") -> #140.
+2. **Record-field source-order scoping**: the field analogue of the ctor scoping.
+   `x` in `type eber={x;y;z}` vs a later `type tg={v;x}` resolved to the flat
+   last type (tg's boxed x) -> eber's `{x=a}` read garbage. Per-type field info +
+   build_module re-registers a type's ambiguous fields in source order, marked
+   resolvable via scoped_unambig_fields_. Cleared #140 -> morematch PASSES.
+
+Both verified PARITY-NEUTRAL via stash baselines (0 lambda regressed/improved),
+completeness 0 held, exec floor held, all prior flips intact.
+
+patmatch did NOT advance (still fails module A's `f A B`, a 2-column match over
+EXTENSION ctors `type t += A|B` redefined across nested modules) -- its blocker is
+the extension-ctor (exn_ident_) path, which these fixes don't touch; remains
+ELUSIVE (every isolated/2-module/nested repro works, only the full file fails).
+
+Dashboard: **exec 95.7% (691/722; was 690 ceiling / 685 at the multi-session
+start), lambda 52.5% (390), completeness 100% (0/744)**. Matrix-matcher via
+or-expansion is a general win (any multi-column/binding-or match); next matcher
+step is module-scoped extension-ctor identities (patmatch).
