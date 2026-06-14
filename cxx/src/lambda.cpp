@@ -9877,7 +9877,9 @@ struct Translator {
               }
             }
           } else {
-            auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+            // a coercion/include projection reads module fields with Mutable
+            // semantics (translmod's get_field: `Pfield(pos, Pointer, Mutable)`)
+            auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldMut;
             fi->prim_arg = i; fi->args = {base};
             add_export_val(rl[i], fi);
           }
