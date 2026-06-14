@@ -3675,7 +3675,7 @@ struct Translator {
     }
     if (rows.empty()) return nullptr;
     for (size_t c = 0; c < k; ++c) {
-      bool anyvar = false, anyctor = false, all_const_type = false;
+      bool anyvar = false, anyctor = false, all_const_type = false, ext_col = false;
       std::string type;
       for (auto& r : rows) {
         std::vector<const Pattern*> alts;  // examine each or-pattern alternative
@@ -3689,7 +3689,15 @@ struct Translator {
           auto* kc = std::get_if<Ppat_construct>(&p->desc);
           if (!kc) return nullptr;
           auto ci = ctor_info_.find(ctor_of(*p));
-          if (ci == ctor_info_.end()) return nullptr;
+          if (ci == ctor_info_.end()) {
+            // An extensible/exception constructor (`type t += A`): identity-matched,
+            // nullary only -- mm_cols builds an `(if (== col id) ..)` chain.
+            std::string cn = ctor_of(*p);
+            if ((exn_ident_.count(cn) || exn_field_.count(cn)) && !kc->arg) {
+              ext_col = true; anyctor = true; continue;
+            }
+            return nullptr;
+          }
           auto tc = type_ctors_.find(ci->second.type);
           if (tc == type_ctors_.end()) return nullptr;
           bool one_one = tc->second.first == 1 && tc->second.second == 1;
@@ -3708,8 +3716,8 @@ struct Translator {
         }
       }
       // A mixed var/constructor column is only handled for an all-constant type
-      // (mm_cols routes var rows to every switch case plus the default).
-      if (anyvar && anyctor && !all_const_type) return nullptr;
+      // or an extensible type (mm_cols routes var rows to every case + default).
+      if (anyvar && anyctor && !all_const_type && !ext_col) return nullptr;
     }
     // translate components; non-var ones bind to *match* temps
     std::vector<LamPtr> comps;
@@ -3794,6 +3802,56 @@ struct Translator {
         if (auto* pv = std::get_if<Ppat_var>(&r.cols[i]->desc))
           r.binds.push_back({pv->name.txt, comps[i]->var});
       return mm_cols(comps, std::move(rows), i + 1, mloc);
+    }
+    auto is_ctor = [](const MRow& r, size_t c) {
+      return std::get_if<Ppat_construct>(&r.cols[c]->desc) != nullptr; };
+    auto bindv = [&](MRow r) -> MRow {
+      if (auto* pv = std::get_if<Ppat_var>(&r.cols[i]->desc))
+        r.binds.push_back({pv->name.txt, comps[i]->var});
+      return r; };
+    // An extensible/exception-constructor column (`type t += A | B`): the values
+    // are identity-matched, so build an `(if (== col <id>) <rows for A> <rest>)`
+    // chain, recursing on the remaining columns; var rows match every arm + rest.
+    {
+      bool extensible = false;
+      for (auto& r : rows)
+        if (is_ctor(r, i)) {
+          std::string n = ctor_of(*r.cols[i]);
+          if (ctor_info_.count(n)) { extensible = false; break; }
+          if ((exn_ident_.count(n) || exn_field_.count(n)) &&
+              !std::get_if<Ppat_construct>(&r.cols[i]->desc)->arg) extensible = true;
+          else { extensible = false; break; }
+        }
+      if (extensible) {
+        std::vector<std::string> names;
+        for (auto& r : rows)
+          if (is_ctor(r, i)) {
+            std::string n = ctor_of(*r.cols[i]);
+            if (std::find(names.begin(), names.end(), n) == names.end()) names.push_back(n);
+          }
+        std::vector<MRow> dft;
+        for (auto& r : rows) if (!is_ctor(r, i)) dft.push_back(bindv(r));
+        LamPtr acc = dft.empty() ? raise_predef("Match_failure", mloc)
+                                 : mm_cols(comps, dft, i + 1, mloc);
+        if (!acc) return nullptr;
+        for (auto it = names.rbegin(); it != names.rend(); ++it) {
+          LamPtr idv = exn_value(*it);
+          if (!idv) return nullptr;
+          std::vector<MRow> sub;
+          for (auto& r : rows) {
+            if (is_ctor(r, i)) { if (ctor_of(*r.cols[i]) == *it) sub.push_back(r); }
+            else sub.push_back(bindv(r));
+          }
+          LamPtr body = mm_cols(comps, std::move(sub), i + 1, mloc);
+          if (!body) return nullptr;
+          auto eq = mk(Lam::K::Prim); eq->prim = Prim::IntCmp; eq->prim_id = "==";
+          eq->args = {comps[i], idv};
+          auto iff = mk(Lam::K::IfThenElse);
+          iff->cond = eq; iff->then_ = body; iff->else_ = acc;
+          acc = iff;
+        }
+        return acc;
+      }
     }
     // Determine this column's type shape (n_const, n_block).
     std::string coltype;
