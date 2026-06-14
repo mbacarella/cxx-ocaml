@@ -1277,6 +1277,43 @@ struct Translator {
     if (target.empty() || src.empty() || target == src) return nullptr;
     for (auto& nm : target)
       if (std::find(src.begin(), src.end(), nm) == src.end()) return nullptr;
+    // Structure-include optimisation: when the source value is a freshly-built
+    // structure block `(let <bindings> (makeblock 0 v0 v1 ..))`, the coercion is
+    // fused into that makeblock -- keep the bindings (their effects) but rebuild
+    // the body block from the selected/reordered field values directly, instead
+    // of materialising the full block and reprojecting it (which allocates a
+    // second module block).  ocamlc does this so a coerced `include (struct ..
+    // end : sig .. end)` allocates only the narrowed block.  Only when the body
+    // block's fields are all pure (Var/const) so dropping/reordering is safe.
+    if (mv->k == Lam::K::Let && mv->body && mv->body->k == Lam::K::Prim &&
+        mv->body->prim == Prim::Makeblock && mv->body->prim_arg == 0 &&
+        mv->body->args.size() == src.size()) {
+      bool simple = true;
+      for (auto& a : mv->body->args)
+        if (!(a->k == Lam::K::Var || a->k == Lam::K::ConstInt ||
+              a->k == Lam::K::ConstChar || a->k == Lam::K::ConstString ||
+              a->k == Lam::K::ConstFloat)) { simple = false; break; }
+      if (simple) {
+        std::vector<LamPtr> fs;
+        for (auto& nm : target) {
+          int idx = 0;
+          for (int i = 0; i < (int)src.size(); ++i) if (src[i] == nm) { idx = i; break; }
+          LamPtr fr = mv->body->args[idx];
+          if (src_me && tsig)  // a narrowed module member projects recursively
+            if (const ModuleType* smt = sig_member_modtype(*tsig, nm)) {
+              const ModuleExpr* sme = src_member_expr(*src_me, nm);
+              if (LamPtr c2 = coerce_block(fr, src_member_layout(*src_me, nm),
+                                           sig_layout(*smt), sme, sig_items_of(*smt)))
+                fr = c2;
+            }
+          fs.push_back(fr);
+        }
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+        blk->args = std::move(fs);
+        auto lt = mk(Lam::K::Let); lt->bindings = mv->bindings; lt->body = blk;
+        return lt;
+      }
+    }
     Ident id = fresh("let");
     auto v = mk(Lam::K::Var); v->var = id;
     std::vector<LamPtr> fs;

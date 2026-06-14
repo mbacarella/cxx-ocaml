@@ -1904,3 +1904,34 @@ application coerced through a `Pmty_with` signature) -- not constructor naming.
 That's a deep multi-feature knot (recmod runtime + functor coercion + with-
 constraint), left for a dedicated push. The ctor-registration fix is correct,
 reusable groundwork that any nested-recmodule file needs regardless.
+
+## Structure-include optimisation: coercion fusion (2026-06-14)
+
+`coerce_block` projected a module value to a narrower/reordered signature by
+materialising the source as `(let (let/N = mv) (makeblock 0 (field i let/N) ..))`
+-- a SECOND module-block allocation on top of the source's own. ocamlc instead
+fuses the coercion into the source structure: when `mv` is a freshly-built block
+`(let <bindings> (makeblock 0 v0 v1 ..))`, keep the bindings (their effects) but
+rebuild the body block directly from the selected field VALUES, never allocating
+the intermediate. Implemented as a peephole at the top of `coerce_block`, gated
+on the body fields being pure (Var/const, so drop/reorder is safe) and applying
+any per-member nested coercion to the picked value. struct_include_optimisation's
+"no signature"/"trivial"/"prefix"/"reordering" coercion cases now match the
+oracle's lambda exactly (was: full block + reproject each). Stash-verified
+parity-neutral: lambda 0 regressed / 0 improved (390), completeness 100%.
+
+DOES NOT flip the exec test, for two reasons unrelated to the optimisation:
+ (1) the remaining nested-module include (`module Inner = struct include (struct
+     let e .. end) end`) differs only COSMETICALLY -- c++ alias-binds the field
+     (`e =a field_mut 0 include/N`) where ocamlc inlines `field_mut` into the
+     export makeblock; identical allocation, just a different (equivalent) dump.
+ (2) ORACLE BINARY CLOBBERED: `ocamlc.opt` at the repo root is no longer a
+     compiler -- it is a 783-byte ASCII file (27x "Called from unknown
+     location"), mtime 2026-06-14 00:50. The exec/lambda/reject harnesses still
+     run only because they read CACHED oracle output under /tmp; some cache
+     entries are stale. struct_include's cached oracle stderr shows the Printexc
+     "File ..., characters 2-8: Assertion failed" form, but genuine OCaml 5.3.0
+     (nix) prints the generic `Assert_failure("..",62,2)` -- which is exactly
+     what c++ emits. So c++ is CORRECT here; the recorded "DIFF" is a stale-cache
+     artifact. The clobbered oracle needs rebuilding (`make ocamlc.opt`) before
+     exec parity can be trusted/measured again.
