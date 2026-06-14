@@ -2280,3 +2280,30 @@ CamlinternalMod update_mod Class-shape assertion fails.  Deep object work
 (needs class metadata from the parent's signature + the module-field value).
 lambda 418 held, completeness 100%, 0 regressions.  sets/htbl/boxedints
 remain a separate functor-coercion family.
+
+## Functor-argument coercion -> boxedints flips (2026-06-14)
+
+Implemented the functor-argument coercion the journal long-deferred, and
+boxedints.ml now passes (exec 690 -> 693, 96.0%).  `Test32(struct type
+t=int32; module Ops=Int32; let testcomp=.. end)` where `Test32(M:TESTSIG)`
+narrows `module Ops` to a sub-signature: the arg was compiled to its raw
+export block (Ops alias-elided, wrong order) so M.Ops.of_int read garbage.
+
+Fix (reuses the force_export + coerce machinery): store the functor
+parameter's module TYPE (functor_param_sig_, set beside functor_param_).
+When the argument is a struct literal, coerce_struct_arg builds it with
+force_export = the param sig's fields (materialising `module Ops = Int32`),
+reorders to the sig order, and recursively coerces each module member with
+coerce_module_value -- which ETA-STUBS members that are EXTERNALS of the
+source stdlib module (Int32.neg = %int32_neg, not a field) and field-reads
+the rest.  That nested stdlib-module-to-subsig coercion (externals stubbed)
+is exactly the piece long flagged as missing for boxedints.
+
+lambda 418 held, completeness 100%, 0 regressions.
+
+sets/htbl remain a SEPARATE, harder functor family: sets needs HIGHER-ORDER
+functors (`PowerSet(BaseSet)(SetOrd: functor(S)->Set.OrderedType)`); htbl is
+a two-param functor over stdlib modtypes (`Test(H:Hashtbl.SeededS)(M:Map.S
+with type key=H.key)`) -- it now runs deep ("Random integers, large range")
+then crashes on a specific op.  These need functor PARAMETER coercion (the
+arg is a module ident / functor, not a struct literal) -- a future push.
