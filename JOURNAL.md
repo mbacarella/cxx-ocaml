@@ -1394,3 +1394,27 @@ Three more, +14 files, all gated (completeness 0, exec held):
 Dashboard: **lambda 52.4% (389/743, was 377), exec 94.2% (681/722),
 completeness 100% (0/744)**. Session: lambda 356 -> 389 (+33), exec +3, 11 code
 commits, 0 regressions, completeness pinned at 0.
+
+## Exec-parity push (2026-06-14): toward 100%
+
+Goal set to drive exec parity to 100%. Triaged the 42 DIFFs: ~22 segfaults
+(unresolved `?` prims/members), ~10 wrong-output (matcher / exact-GC), rest
+flaky. Landed (all completeness-0, gated):
+
+- **basic %bytes_/%string_ prims** mapped (were `?`-unresolved -> segfault):
+  %bytes_unsafe_set/%string_unsafe_get/%bytes_to_string/... in prim_to_lam.
+  Fixed patmatch's startup segfault (still differs on multi-column matching).
+- **array/string/bytes %-prims in value position** eta-stubbed
+  (`let uget = unsafe_get` -> `array.unsafe_get[gen]`). Flipped bug13448.
+- **qualified stdlib constructors in match patterns** (`Seq.Cons(x,_)` left x
+  unbound): register_qualified_ctor + scan_pat_ctors load the type's tags from
+  the module cmi at compile_match entry. Flipped lib-seq.
+- **`%makemutable` (ref) in value position** eta-stubbed.
+
+Dashboard: **exec 94.6% (684/722, was 681), lambda 52.4% (389), completeness
+100% (0/744)**. Remaining 39 are deep: multi-column matching (patmatch,
+morematch), higher-order/nested functors (sets, htbl, t22ok, boxedints,
+floatarray), bigarray plugin (bigarrays x3, testvectors), memprof (statmemprof
+x3), parallel domains (churn), objects (mixin x3, toplevel_lets), __FUNCTION__
+(locs), exact GC-allocation accounting (pr7798, testset), first-class-module
+members (fstclassmod), recursive modules (t22ok).
