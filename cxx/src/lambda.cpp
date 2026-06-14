@@ -7664,7 +7664,10 @@ struct Translator {
         if (auto* pv = std::get_if<Ppat_var>(&le->bindings[0].pat.desc))
           if (auto* bid = std::get_if<Pexp_ident>(&le->body->desc))
             if (auto* bl = std::get_if<Lident>(&bid->id.txt.v); bl && bl->name == pv->name.txt)
-              return expr(*le->bindings[0].expr);
+              // keep the binding's name (for __FUNCTION__) and attributes (a
+              // `let[@inline never] f = fun.. in f` must keep never_inline).
+              return fn_binding_rhs(pv->name.txt, *le->bindings[0].expr,
+                                    le->bindings[0].attrs);
       scope.emplace_back();
       if (le->rf == RecFlag::Recursive) {  // names in scope within their RHSs
         std::vector<std::pair<const ValueBinding*, Ident>> recs;
@@ -7829,7 +7832,9 @@ struct Translator {
       std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured pats
       for (auto& b : le->bindings) {
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
-          LamPtr rhs = fn_binding_rhs(pv->name.txt, *b.expr, {});
+          // pass b.attrs so a local `let[@inline never] f = ..` carries its
+          // never_inline attribute onto the function (as the top-level path does).
+          LamPtr rhs = fn_binding_rhs(pv->name.txt, *b.expr, b.attrs);
           // simplif drops `let x = (var w)` unconditionally (any let-kind),
           // substituting x by w -- so alias the name to w rather than binding it.
           // Not on a recursive binding's spine, though: the rec-value compiler
