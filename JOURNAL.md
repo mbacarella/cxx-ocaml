@@ -2135,3 +2135,28 @@ inference-bound value kinds and a handful of "oracle breaks, I fit"
 col-precision printer cases (divint/localfunction/opt_variants/lists/
 exception_callback/Latin9 -- high regression risk to the 238+ matching
 files, deprioritised).
+
+## Polymorphic methods -> exec 693 (2026-06-14)
+
+Resumed exec-parity work by triaging the 17 crashing DIFFs.  Probed object
+features from a minimal base: simple classes / inheritance / super /
+virtual methods / vals / initializers / first-class modules ALL run; a
+POLYMORPHIC METHOD (`method m : type a. T = ..`) SIGSEGVs.
+
+Root cause: such a method desugars to a Pexp_newtype wrapping the
+function, and expr() had NO Pexp_newtype case -> it fell through to 0, so
+the method body became a `0` placeholder and set_methods registered the
+method with null code -> calling it jumped to null.  Fix: expr(Pexp_newtype)
+-> expr(body) (the `(type a)` binder is runtime-erased), and peel
+newtype/constraint in the method-body handler so the inner function
+flattens (self prepended) into a byte-exact `set_method`.  Flips cast.ml
+(SIGSEGV -> correct Bad_cast exit 2).  exec **690 -> 693 (96.0%)**, lambda
+418 held, completeness 100%, 0 regressions.
+
+Remaining crashers localised for next time: fstclassmod + t22ok = RECURSIVE
+MODULES (`module rec` runtime: CamlinternalMod init_mod/update_mod), pr6922
+= virtual class-type hierarchies, sets/htbl/boxedints = functor runtime
+coercion, bigarrays/floatarray/testvectors = Bigarray, locs = elusive
+full-file object-state bug (isolated repros run; also a real but separate
+__FUNCTION__-in-anonymous-object naming diff: mine `M.f` vs oracle
+`M.f.object#meth`), sorts = Arg.parse, intern/ephetest3 = memprof/weak.
