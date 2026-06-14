@@ -7752,6 +7752,29 @@ struct Translator {
         }
       }
 
+    // In a PARAMETERIZED class the class-creation lets become PER-OBJECT instance
+    // variables: ocamlc runs their inits in obj_init (where the params are
+    // bound), unlike a parameterless class where a let is computed once and the
+    // shared value is stored into every object.  Route simple var-binding lets
+    // into `vals` (the instance-var machinery); their inits then run per object
+    // with the params in scope.  Side-effect / destructuring / rec lets keep the
+    // class-creation path (which bails on a param ref, as before).
+    bool lets_as_vals = false;
+    if (cl_params && !cl_params->empty() && cl_lets && !cl_lets->empty()) {
+      std::vector<Val> let_vals;
+      lets_as_vals = true;
+      for (auto* lg : *cl_lets) {
+        if (lg->rf == RecFlag::Recursive) { lets_as_vals = false; break; }
+        for (auto& b : lg->bindings) {
+          auto* pv = std::get_if<ast::Ppat_var>(&effective_pat(&b.pat)->desc);
+          if (!pv) { lets_as_vals = false; break; }
+          let_vals.push_back({pv->name.txt, b.expr.get()});
+        }
+        if (!lets_as_vals) break;
+      }
+      if (lets_as_vals) for (auto& v : let_vals) vals.push_back(v);
+    }
+
     // The method universe is the union of inherited and own method names
     // (including own virtual ones -- they have labels but no code).
     std::set<std::string> own_defined;
@@ -7820,7 +7843,7 @@ struct Translator {
         if (cparams[i].is_param && count_var(v, cparams[i].pid)) return true;
       return false;
     };
-    if (cl_lets)
+    if (cl_lets && !lets_as_vals)
       for (auto* lg : *cl_lets) {
         if (lg->rf == RecFlag::Recursive) {
           std::vector<std::pair<const ast::ValueBinding*, Ident>> recs;
