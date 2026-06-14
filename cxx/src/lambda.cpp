@@ -1322,6 +1322,31 @@ struct Translator {
     auto it = pr.find(name);
     return it == pr.end() ? StdPrim{"", 0} : it->second;
   }
+  // If `mod.sub` is a module alias (`module List = ListLabels` in StdLabels),
+  // the bare name of the aliased top-level stdlib module ("ListLabels"); else "".
+  // Lets `open StdLabels; List.map` reach Stdlib__ListLabels.map like ocamlc.
+  std::string stdlib_alias_target(const std::string& mod, const std::string& sub) {
+    auto ck = mod + "." + sub;
+    if (auto it = alias_target_cache_.find(ck); it != alias_target_cache_.end()) return it->second;
+    std::string tgt;
+    try {
+      std::string path = mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                       : mod.rfind("Camlinternal", 0) == 0
+                           ? stdlib_dir + "/" + (char)std::tolower((unsigned char)mod[0]) + mod.substr(1) + ".cmi"
+                           : stdlib_dir + "/stdlib__" + mod + ".cmi";
+      auto cmi = cmi::CmiFile::load(path);
+      for (auto& md : cmi.sig().modules)
+        if (md.name == sub && md.type && md.type->kind == cmi::ModuleType::Alias && md.type->path) {
+          std::string nm = md.type->path->kind == cmi::Path::Pident ? md.type->path->id.name
+                                                                    : md.type->path->s;
+          if (nm.rfind("Stdlib__", 0) == 0) nm = nm.substr(8);  // bare module name
+          tgt = nm;
+          break;
+        }
+    } catch (...) {}
+    return alias_target_cache_[ck] = tgt;
+  }
+  std::unordered_map<std::string, std::string> alias_target_cache_;
   static std::string global_of(const std::string& mod) {
     // Stdlib and the CamlinternalXxx units are top-level compilation units; every
     // other stdlib module is a `Stdlib__`-prefixed submodule.
@@ -1703,6 +1728,14 @@ struct Translator {
       if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
         FnSig s = stdlib_value_sig(pl->name, d->name);
         for (auto& [k, n] : s) if (k != 0) return s;
+        // `open StdLabels; List.map` -> the label sig of ListLabels.map.
+        for (auto oit = opened_.rbegin(); oit != opened_.rend(); ++oit) {
+          if (module_base(*oit)) continue;
+          std::string tgt = stdlib_alias_target(*oit, pl->name);
+          if (tgt.empty()) continue;
+          FnSig s2 = stdlib_value_sig(tgt, d->name);
+          for (auto& [k, n] : s2) if (k != 0) return s2;
+        }
       }
       // a stdlib submodule's value (Domain.DLS.new_key), incl. an opened head
       // and a local alias (`module MP = Gc.Memprof` -> MP.start)
@@ -6874,6 +6907,19 @@ struct Translator {
               fi->prim_arg = f->second; fi->args = {base};
               return fi;
             }
+          }
+          // `open StdLabels` brings `List` into scope as an alias to ListLabels;
+          // a `List.x` then resolves through the alias target (shadows the plain
+          // List), matching ocamlc.  Checked before the plain stdlib module.
+          for (auto oit = opened_.rbegin(); oit != opened_.rend(); ++oit) {
+            if (module_base(*oit)) continue;  // only stdlib opens carry aliases
+            std::string tgt = stdlib_alias_target(*oit, pl->name);
+            if (tgt.empty()) continue;
+            auto& afm = fields_of(tgt);
+            if (auto f = afm.find(d->name); f != afm.end())
+              return field_of(global_of(tgt), f->second);
+            StdPrim asp = value_prim(tgt, d->name);
+            if (!asp.name.empty()) if (LamPtr s = prim_stub(asp)) return s;
           }
           // Qualified M.x where M is a stdlib (sub)module: field of Stdlib[__M].
           auto& fm = fields_of(pl->name);
