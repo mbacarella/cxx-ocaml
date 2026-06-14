@@ -9985,7 +9985,12 @@ struct Translator {
           for (auto& rm : rms) {
             rm.id = fresh(*rm.mb->name.txt);
             module_ident_[*rm.mb->name.txt] = rm.id;
-            if (rm.dummyable && rm.sig) register_sig_layouts(*rm.mb->name.txt, *rm.sig);
+            // register the signature layout (for ALL members, not just dummy-able)
+            // so a sibling body's `M.member` resolves from M's sig -- e.g. an
+            // unsafe value module `Before` whose `Before.x` another body reads.  A
+            // functor-application member's real result layout overwrites this in
+            // phase 2.
+            if (rm.sig) register_sig_layouts(*rm.mb->name.txt, *rm.sig);
           }
           // (phase 1) init_mod dummies for the dummy-able members
           for (auto& rm : rms) {
@@ -9998,7 +10003,12 @@ struct Translator {
           // (phase 2) bind the unsafe members directly to their RHS (a functor
           // application etc.), reading the dummies that are already in scope.
           // Register the result layout (like `module M = F(X)`) so a sibling
-          // body's `M.member` resolves instead of dumping `?member`.
+          // body's `M.member` resolves instead of dumping `?member`.  Compile all
+          // first, then emit in DEPENDENCY order (reorder_rec_bindings): an unsafe
+          // member that reads another unsafe member's REAL value must follow it
+          // (a non-function value module like `After = struct let x = Before.x+1`).
+          std::vector<RM*> unsafe;
+          std::unordered_map<int, LamPtr> uval;  // rm.id.stamp -> compiled body
           for (auto& rm : rms) {
             if (rm.dummyable) continue;
             const std::string& nm = *rm.mb->name.txt;
@@ -10006,8 +10016,21 @@ struct Translator {
             auto& lay = module_layout_[nm]; lay.clear();
             auto rl = module_result_layout(*rm.bodyme);
             for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
-            cur.push_back({rm.id, ValueKind::Gen, mv});
-            add_export(nm, rm.id);
+            uval[rm.id.stamp] = mv; unsafe.push_back(&rm);
+          }
+          std::vector<RM*> order;        // topological (deps first)
+          std::set<int> emitted;
+          std::function<void(RM*)> emit = [&](RM* rm) {
+            if (emitted.count(rm->id.stamp)) return;
+            emitted.insert(rm->id.stamp);  // mark before recursing (cycles -> dummy reads)
+            for (RM* o : unsafe)
+              if (o != rm && count_var(uval[rm->id.stamp], o->id) > 0) emit(o);
+            order.push_back(rm);
+          };
+          for (RM* rm : unsafe) emit(rm);
+          for (RM* rm : order) {
+            cur.push_back({rm->id, ValueKind::Gen, uval[rm->id.stamp]});
+            add_export(*rm->mb->name.txt, rm->id);
           }
           // (phase 3) update_mod each dummy with the real structure
           for (auto& rm : rms) {
