@@ -2160,3 +2160,35 @@ coercion, bigarrays/floatarray/testvectors = Bigarray, locs = elusive
 full-file object-state bug (isolated repros run; also a real but separate
 __FUNCTION__-in-anonymous-object naming diff: mine `M.f` vs oracle
 `M.f.object#meth`), sorts = Arg.parse, intern/ephetest3 = memprof/weak.
+
+## Recursive-module cluster: the eval_rec_bindings model (2026-06-14)
+
+Attacked the recmod exec crashers (t22ok, fstclassmod).  Root cause of the
+immediate SIGSEGV: my recmod compiler demanded a CamlinternalMod shape for
+EVERY member and bailed the whole `module rec` block when one lacked it --
+so a tree-of-sets `module rec A .. and ASet = Set.Make(A)` produced no
+bindings at all (members -> ?unresolved -> crash).
+
+Ported Translmod.eval_rec_bindings' real 3-phase scheme + classification:
+ - init_shape classifies each member.  Shape-able (all functions/lazy/
+   modules) -> a dummy.  init_shape FAILS for a functor application, a
+   non-function value, or an abstract sig -> "unsafe", bound directly.
+ - phase 0: register every name + its SIGNATURE layout (so a sibling body's
+   M.x resolves from M's sig, not ?x).
+ - phase 1: init_mod dummies for shape-able members.
+ - phase 2: bind unsafe members directly to their compiled RHS, registering
+   the functor-RESULT layout (so a sibling's M.member resolves); emit them
+   in DEPENDENCY order (reorder_rec_bindings, via a count_var topo-sort) so
+   `After = struct let x = Before.x+1` follows `Before`.
+ - phase 3: update_mod each dummy with the real structure.
+
+Result: synthetic tree-of-sets + After/Before recmods now run correctly.
+**t22ok: immediate crash -> Tests 10..40 all pass** (then an elusive full-
+file crash before Test 50 -- the Expr/Binding recmod passes IN ISOLATION,
+so it's global-state accumulation, like the patmatch torture tests).
+fstclassmod: immediate crash -> runs partway (first-class-module printing
+works) then GADT-recmod garbage.  Neither fully flips (t22ok also needs
+recmod CLASSES at Test 70 and functor-recmod at Test 60; fstclassmod needs
+the GADT/first-class-module-in-recmod interaction).  3 commits, lambda 418
+held, completeness 100%, deterministic exec 693 held, 0 regressions.
+The recmod core model is now correct, reusable groundwork.
