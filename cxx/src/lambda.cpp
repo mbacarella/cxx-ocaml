@@ -1365,9 +1365,10 @@ struct Translator {
   void register_sig_layouts(const std::string& prefix, const ModuleType& mt) {
     const ModuleType* m = &mt;
     for (int guard = 0; ; ++guard) {
-      // `S with type t = ..` has the runtime layout of S (a with-constraint only
-      // refines types) -- peel it to the underlying module type.
-      if (auto* pw = std::get_if<Pmty_with>(&m->desc)) { m = pw->mt.get(); continue; }
+      // `S with ..` has S's runtime layout unless a modsubst removes a field.
+      if (auto* pw = std::get_if<Pmty_with>(&m->desc); pw && with_keeps_layout(*pw)) {
+        m = pw->mt.get(); continue;
+      }
       auto* pi = std::get_if<Pmty_ident>(&m->desc);
       if (!pi) break;
       const ModuleType* res = nullptr;
@@ -9024,8 +9025,22 @@ struct Translator {
     return outer;
   }
 
-  std::vector<std::string> sig_layout(const ModuleType& mt) {
+  // `S with ..` keeps S's value/module layout UNLESS a constraint destructively
+  // removes a module field (`with module M := N`, Pwith_modsubst); type/modtype
+  // (sub)stitutions and `with module M = N` leave the runtime field layout intact.
+  static bool with_keeps_layout(const Pmty_with& pw) {
+    for (auto& c : pw.constraints)
+      if (std::holds_alternative<Pwith_modsubst>(c)) return false;
+    return true;
+  }
+  std::vector<std::string> sig_layout(const ModuleType& mt0) {
     std::vector<std::string> out;
+    const ModuleType* mtp = &mt0;
+    while (auto* pw = std::get_if<Pmty_with>(&mtp->desc)) {
+      if (!with_keeps_layout(*pw)) break;  // a modsubst removes a field -> don't peel
+      mtp = pw->mt.get();
+    }
+    const ModuleType& mt = *mtp;
     if (auto* pi = std::get_if<Pmty_ident>(&mt.desc)) {  // a named module type S
       auto it = modtype_layout_.find(lid_last(pi->id.txt));
       if (it != modtype_layout_.end()) return it->second;
