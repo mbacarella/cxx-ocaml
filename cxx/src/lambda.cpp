@@ -79,7 +79,10 @@ void set_sizes(const DocP& b, int tail) {
   };
   for (int i = 0; i < n; ++i) {
     if (b->ch[i]->t == Doc::Break) b->ch[i]->bsize = run(i + 1);
-    else if (b->ch[i]->t == Doc::Box) set_sizes(b->ch[i], run(i + 1));
+    // A nested box's internal break sizes cap at that box's own close (Format
+    // finalises a break's size at its box boundary), so its last break must NOT
+    // inherit the parent's trailing close-parens -- pass tail 0, not run(i+1).
+    else if (b->ch[i]->t == Doc::Box) set_sizes(b->ch[i], 0);
   }
 }
 
