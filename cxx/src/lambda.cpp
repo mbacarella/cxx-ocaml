@@ -573,6 +573,8 @@ struct Translator {
   std::unordered_map<std::string, int> exn_arity_;
   std::string mod_path_;  // dotted module path prefix for exception names
   std::string file_name_;  // source path, for Match_failure/Assert_failure locations
+  std::string unit_name_;  // the compilation unit (top module) name, for __MODULE__
+  std::vector<std::string> func_path_;  // enclosing function-binding names, for __FUNCTION__
   // Predefined exception globals (Match_failure/Assert_failure): a stable stamp per
   // name so the dump's first-appearance normalization is consistent within a file.
   std::unordered_map<std::string, int> predef_global_stamp_;
@@ -622,6 +624,43 @@ struct Translator {
   LamPtr loc_block(const Location& loc) {
     return cblock(0, {cstr(file_name_), cint(loc.start.lnum),
                       cint(loc.start.cnum - loc.start.bol)});
+  }
+  std::string loc_string(const Location& l) {
+    char buf[600];
+    snprintf(buf, sizeof buf, "File \"%s\", line %d, characters %d-%d",
+             file_name_.c_str(), l.start.lnum, l.start.cnum - l.start.bol,
+             l.end.cnum - l.end.bol);
+    return buf;
+  }
+  // The location ext-primitives (`__LOC__`/`__FILE__`/...): compile-time
+  // constants.  `__FUNCTION__` is the module path plus the enclosing function
+  // bindings.  Returns null if `name` is not one of them.
+  LamPtr loc_primitive(const std::string& name, const Location& loc) {
+    if (name == "__FILE__") return cstr(file_name_);
+    if (name == "__LINE__") return cint(loc.start.lnum);
+    if (name == "__LOC__") return cstr(loc_string(loc));
+    if (name == "__MODULE__") return cstr(unit_name_);
+    if (name == "__POS__")
+      return cblock(0, {cstr(file_name_), cint(loc.start.lnum),
+                        cint(loc.start.cnum - loc.start.bol),
+                        cint(loc.end.cnum - loc.end.bol)});
+    if (name == "__FUNCTION__") {
+      std::string p = mod_path_;
+      for (auto& f : func_path_) { if (!p.empty()) p += "."; p += f; }
+      return cstr(p);
+    }
+    return nullptr;
+  }
+  // Compile a `let name = rhs` RHS, pushing `name` onto func_path_ while a
+  // function RHS is compiled so `__FUNCTION__` inside it includes this binding.
+  LamPtr fn_binding_rhs(const std::string& name, const Expression& rhs, const Attributes& attrs) {
+    const Expression* r = &rhs;
+    while (auto* c = std::get_if<Pexp_constraint>(&r->desc)) r = c->e.get();
+    bool is_fun = std::holds_alternative<Pexp_function>(r->desc);
+    if (is_fun) func_path_.push_back(name);
+    LamPtr v = with_inline(expr(rhs), attrs);
+    if (is_fun) func_path_.pop_back();
+    return v;
   }
   // `(raise (makeblock 0 (global Exn/s!) [0: file line char]))` for a compiler-
   // raised predefined exception (Match_failure / Assert_failure).
@@ -7043,6 +7082,8 @@ struct Translator {
     if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
       if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
+        if (l->name.size() > 4 && l->name[0] == '_' && l->name[1] == '_')
+          if (LamPtr lp = loc_primitive(l->name, e.loc)) return lp;
         // An instance variable referenced in a method body: (field_computed self n).
         if (cur_self_) if (auto iv = inst_vars_.find(l->name); iv != inst_vars_.end()) {
           auto self = mk(Lam::K::Var); self->var = *cur_self_;
@@ -7162,6 +7203,22 @@ struct Translator {
     }
     if (auto* ap = std::get_if<Pexp_apply>(&e.desc)) {
       Prim p;
+      // `__LOC_OF__ e` / `__LINE_OF__ e` / `__POS_OF__ e`: a pair of the argument's
+      // location info and the argument itself.
+      if (ap->args.size() == 1)
+        if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
+          if (auto* fl = std::get_if<Lident>(&fid->id.txt.v)) {
+            const Expression& a = *ap->args[0].second;
+            const Location& al = a.loc;
+            if (fl->name == "__LOC_OF__")
+              return cblock(0, {cstr(loc_string(al)), expr(a)});
+            if (fl->name == "__LINE_OF__")
+              return cblock(0, {cint(al.start.lnum), expr(a)});
+            if (fl->name == "__POS_OF__")
+              return cblock(0, {cblock(0, {cstr(file_name_), cint(al.start.lnum),
+                                          cint(al.start.cnum - al.start.bol),
+                                          cint(al.end.cnum - al.end.bol)}), expr(a)});
+          }
       // A method call `o#m a b` is a single send carrying its arguments.
       if (auto* sd = std::get_if<Pexp_send>(&ap->fn->desc)) {
         bool simple = true;
@@ -7601,7 +7658,7 @@ struct Translator {
       for (auto& b : le->bindings) {
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
           Ident id = fresh(pv->name.txt);
-          Lam::Binding bd{id, pat_kind(&b.pat), expr(*b.expr)};
+          Lam::Binding bd{id, pat_kind(&b.pat), fn_binding_rhs(pv->name.txt, *b.expr, {})};
           l->bindings.push_back(std::move(bd));
           scope.back()[pv->name.txt] = id;
           record_fn_sig(id, b.expr.get());
@@ -9787,7 +9844,8 @@ struct Translator {
           ids.push_back(id);
           kinds.push_back(pat_kind(&b->pat));
           rec_spine_ = true;
-          vals.push_back(with_inline(expr(*b->expr), b->attrs));
+          vals.push_back(fn_binding_rhs(std::get_if<Ppat_var>(&b->pat.desc)->name.txt,
+                                        *b->expr, b->attrs));
           add_export(std::get_if<Ppat_var>(&b->pat.desc)->name.txt, id);
         }
         RecParts rp;
@@ -9840,7 +9898,7 @@ struct Translator {
                 continue;
               }
           Ident id = fresh(pv->name.txt);
-          cur.push_back({id, pat_kind(&b.pat), with_inline(expr(*b.expr), b.attrs)});
+          cur.push_back({id, pat_kind(&b.pat), fn_binding_rhs(pv->name.txt, *b.expr, b.attrs)});
           scope.back()[pv->name.txt] = id;
           record_fn_sig(id, b.expr.get());
           add_export(pv->name.txt, id);
@@ -9963,6 +10021,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
       if (!v.prim.empty()) t.stdlib_prims[v.name] = {v.prim, v.prim_arity};
   } catch (...) {}
   t.mod_path_ = module_name;
+  t.unit_name_ = module_name;
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
   sg->args.push_back(t.wrap_shared(t.build_module(s, nullptr)));
