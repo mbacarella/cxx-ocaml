@@ -2516,14 +2516,15 @@ struct Translator {
     std::vector<std::pair<ArgLabel, ExprBox>> tail;
     for (size_t i = arity; i < ap.args.size(); ++i) tail.push_back(std::move(ap.args[i]));
     ap.args.resize(arity);
-    LamPtr r = prim_to_lam(prim, arity, ap, e);
+    LamPtr r = prim_to_lam(prim, arity, ap, e, /*over=*/true);
     std::vector<LamPtr> rest;
     if (r) for (auto& t : tail) rest.push_back(expr(*t.second));
     for (auto& t : tail) ap.args.push_back(std::move(t));
     if (!r) return nullptr;
     return lapply_(r, std::move(rest));
   }
-  LamPtr prim_to_lam(const std::string& prim, int arity, const Pexp_apply& ap, const Expression& e) {
+  LamPtr prim_to_lam(const std::string& prim, int arity, const Pexp_apply& ap, const Expression& e,
+                     bool over = false) {
     auto& as = ap.args;
     auto args = [&] {
       std::vector<LamPtr> v;
@@ -2577,14 +2578,16 @@ struct Translator {
     // fst / snd: read field 0 / 1 with the element's read kind (int vs pointer;
     // a float element would be field_float, which we don't spell -> leave it).
     if ((prim == "%field0" || prim == "%field1") && as.size() == 1) {
-      ValueKind k = expr_kind(&e);
-      if (k == ValueKind::Int || k == ValueKind::Gen) {
-        auto pr = mk(Lam::K::Prim);
-        pr->prim = k == ValueKind::Int ? Prim::FieldInt : Prim::FieldMut;
-        pr->prim_arg = prim == "%field0" ? 0 : 1;
-        pr->args = {expr(*as[0].second)};
-        return pr;
-      }
+      // translprim: %field0/%field1 are Pfield(_, Pointer, Mutable) by default
+      // (field_mut), specialised to field_int only when the field is provably an
+      // immediate.  When over-applied (`snd p x` -- e is the CALL, not the field),
+      // e's kind is the call result, not the field, so don't trust it as Int.
+      ValueKind k = over ? ValueKind::Gen : expr_kind(&e);
+      auto pr = mk(Lam::K::Prim);
+      pr->prim = k == ValueKind::Int ? Prim::FieldInt : Prim::FieldMut;
+      pr->prim_arg = prim == "%field0" ? 0 : 1;
+      pr->args = {expr(*as[0].second)};
+      return pr;
     }
     // Pervasive arithmetic primitives reached module-qualified (Int.add = %addint,
     // Float.add = %addfloat, Float.of_int = %floatofint, ...): emit their operator
