@@ -2034,3 +2034,40 @@ col-precision / "fits"-collapse issues (let-RHS break in opt_variants,
 indent off-by-one in lists.ml, UTF-8 width in Latin9, deep-nesting col in
 the exception_callback pair) -- 1-column precision, real regression risk,
 deprioritised.
+
+## Exec-parity chase: virtual instance variables (2026-06-14)
+
+Turned to exec parity (the runtime-correctness metric).  Triage of the 34
+DIFFs: 3-4 are FLAKY timeouts that actually pass on a clean re-run
+(lib-int32/test, debuggee, weaklifetime_par, lib-float/test -- long-
+running tests hitting CPP_TIMEOUT), so real parity is ~691-693/722, not
+688.  Only 2 are pure stderr-format diffs (struct_include, pr2195): the
+uncaught-exception message.  ROOT CAUSE confirmed: when `Printexc` is
+LINKED, its module init registers the nice `File "..", line N,
+characters a-b: Assertion failed` printer; otherwise the C runtime prints
+the generic `Assert_failure("..",N,c)`.  `Gc` imports Printexc's
+interface (a record field typed `Printexc.raw_backtrace`), so ocamlc's
+bytecode linker pulls Printexc as a unit; c++'s value-reloc-only linker
+does not (Gc has NO Printexc value reloc).  Fixing it = link
+interface-imported units -- broad blast radius, deferred (flips ~2, one
+is `native;`-only anyway).
+
+FIXED -- virtual instance variables (object codegen crash, flips
+exotic.ml).  `val virtual x` in a `class virtual` made class compilation
+bail to a `0` placeholder, so `caml_update_dummy c 0` corrupted the
+3-word class block -> SIGSEGV at startup (bisected exotic.ml to the
+virtual classes c3/c4).  Treat a virtual val like a virtual method:
+reserve a `new_variable` slot (add to val_names) with no initialiser.
+BYTE-EXACT vs the oracle lambda (the class block now matches:
+`(makeblock 0 0 (function class (let (x = (new_variable class "x")) ..)) 0)`).
+exec 688->690 (exotic SIGSEGV->exit 0), lambda 406 held, completeness
+100%, 0 regressions.
+
+Remaining 31 exec DIFFs are all deep, multi-session: objects/translclass
+(names, pr2195, cast, fstclassmod, mixin2, pr6922, locs ~7), functor
+runtime coercion (sets, htbl, boxedints), effects (shallow2deep), memprof
+x3, bigarray x2, exact-GC alloc asserts (testset, testmap, pr7798 --
+impractical), matcher torture (patmatch), optional-default-at-saturation
+(syntactic_arity, max_arity), TMC (semantic), domains (test_generator),
+plus the sorts/floatarray segfaults (non-object codegen bugs, large files,
+hard to localise).
