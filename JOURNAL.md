@@ -1748,3 +1748,28 @@ Dashboard: **exec 95.6% (690/722; deterministic 689 -- mixin/gen_test/toplevel_l
 completeness 100% (0/744)**. SESSION TOTAL: ~20 commits, **4 DETERMINISTIC exec
 flips**, broad object + functor + label subsystems advanced, 0 regressions on any
 dimension throughout.
+
+## morematch diagnosis: ambiguous-constructor scoping (2026-06-14)
+
+basic-more/morematch.ml fails its 2nd test (`f D` where `f x = match x with A|B|C
+-> 1 | D|E -> 2 | F -> 3`, x:t). Root cause: morematch REDEFINES A..F across many
+types (`type t = A|B|C|D|E|F`, `type cd = C|D`, `type zob = ..D of..`, ...), and
+register_types registers them all UPFRONT so the flat ctor_info_["D"] = the LAST
+type's D (cd's, tag 1), violating OCaml SCOPING (at line 27 only `type t` is in
+scope, so D should be t's D, tag 3).
+
+This breaks BOTH sides: the construction `f D` builds tag 1, and a match on t
+expects tag 3. A localized match-only disambiguation (pick the single type whose
+ctors contain ALL the match's ctors, override ctor_info_ under an RAII guard) was
+implemented and VERIFIED to pick type t correctly -- but it's INSUFFICIENT because
+the *construction* site `f D` (not a match) still uses the flat wrong tag, giving
+`f D = 1`. Reverted.
+
+The correct fix is INCREMENTAL type registration (register each `type` group as
+build_module reaches it, in source order) so an early expression sees only earlier
+types -- fixes construction and matching uniformly. It's a broad, regression-risky
+refactor (type registration feeds all 390 lambda-matching files + completeness;
+must preserve same-group forward refs for records-citing-variants, and submodule
+fill-absent vs top-level overwrite semantics). Deferred to a focused session.
+
+Dashboard unchanged: **exec 95.6% (690 ceiling), lambda 390, completeness 0**.
