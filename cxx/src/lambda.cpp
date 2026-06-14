@@ -3823,23 +3823,36 @@ struct Translator {
           else { extensible = false; break; }
         }
       if (extensible) {
-        std::vector<std::string> names;
+        // Group by IDENTITY, not name: `exception Bar = Foo` makes Bar and Foo the
+        // same value, so a row matching one matches the other (PR#5788).  Key each
+        // name by its binder stamp / module-field slot; same key => same branch.
+        auto ident_key = [&](const std::string& n) -> std::string {
+          if (auto ei = exn_ident_.find(n); ei != exn_ident_.end())
+            return "v" + std::to_string(ei->second.stamp);
+          if (auto ef = exn_field_.find(n); ef != exn_field_.end())
+            return "f" + std::to_string(ef->second.first.stamp) + ":" +
+                   std::to_string(ef->second.second);
+          return "";
+        };
+        std::vector<std::string> keys;
+        std::unordered_map<std::string, std::string> rep;  // identity key -> a name
         for (auto& r : rows)
           if (is_ctor(r, i)) {
-            std::string n = ctor_of(*r.cols[i]);
-            if (std::find(names.begin(), names.end(), n) == names.end()) names.push_back(n);
+            std::string n = ctor_of(*r.cols[i]), key = ident_key(n);
+            if (key.empty()) return nullptr;
+            if (!rep.count(key)) { rep[key] = n; keys.push_back(key); }
           }
         std::vector<MRow> dft;
         for (auto& r : rows) if (!is_ctor(r, i)) dft.push_back(bindv(r));
         LamPtr acc = dft.empty() ? raise_predef("Match_failure", mloc)
                                  : mm_cols(comps, dft, i + 1, mloc);
         if (!acc) return nullptr;
-        for (auto it = names.rbegin(); it != names.rend(); ++it) {
-          LamPtr idv = exn_value(*it);
+        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+          LamPtr idv = exn_value(rep[*it]);
           if (!idv) return nullptr;
           std::vector<MRow> sub;
           for (auto& r : rows) {
-            if (is_ctor(r, i)) { if (ctor_of(*r.cols[i]) == *it) sub.push_back(r); }
+            if (is_ctor(r, i)) { if (ident_key(ctor_of(*r.cols[i])) == *it) sub.push_back(r); }
             else sub.push_back(bindv(r));
           }
           LamPtr body = mm_cols(comps, std::move(sub), i + 1, mloc);
