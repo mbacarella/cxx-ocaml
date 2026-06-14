@@ -8031,6 +8031,7 @@ struct Translator {
     std::vector<const ast::Expression*> inh_args;
     std::string super_name;  // `inherit parent as super`
     std::vector<std::string> virt_own;  // own virtual methods (virtual class only)
+    std::vector<std::string> virt_vals; // own virtual vals (reserve a slot, no init)
     for (auto& f : cs.fields) {
       if (auto* m = std::get_if<ast::Pcf_method>(&f.desc)) {
         auto* cc = std::get_if<ast::Cfk_concrete>(&m->kind);
@@ -8046,7 +8047,13 @@ struct Translator {
         meths.push_back({m->name.txt, body});
       } else if (auto* v = std::get_if<ast::Pcf_val>(&f.desc)) {
         auto* cc = std::get_if<ast::Cfk_concrete>(&v->kind);
-        if (!cc) return nullptr;  // virtual val
+        if (!cc) {
+          // a virtual val reserves a variable slot (new_variable) but has no
+          // initialiser; only legal in a `class virtual`.
+          if (!virt_class) return nullptr;
+          virt_vals.push_back(v->name.txt);
+          continue;
+        }
         vals.push_back({v->name.txt, cc->e.get()});
       } else if (auto* ini = std::get_if<ast::Pcf_initializer>(&f.desc)) {
         initializers.push_back(ini->e.get());
@@ -8151,6 +8158,7 @@ struct Translator {
     std::sort(methl_names.begin(), methl_names.end(), std::greater<>());
     std::vector<std::string> val_names;   // own (new) vals only
     for (auto& v : vals) val_names.push_back(v.name);
+    for (auto& n : virt_vals) val_names.push_back(n);  // virtual vals: slot only
     int len = (int)methl_names.size(), nvals = (int)val_names.size();
 
     Ident cla = fresh("class");
