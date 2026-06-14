@@ -9054,9 +9054,36 @@ struct Translator {
           }
           if (any_lab) fn_sig_[id.stamp] = csig;
           bool is_virt = d.virt == VirtualFlag::Virtual;
-          if (params.empty() && lets.empty()) {
+          // Class-creation-time lets in front of a class application/alias
+          // (`class c = let () = e in parent args`): emit the bindings (run when
+          // the class value is built) and wrap the class value below.  Only the
+          // var / `()` / `_` binding shapes (build_object's set) are handled.
+          std::vector<LamPtr> let_wraps;
+          bool let_wrap_ok = true;
+          if (params.empty() && !lets.empty() &&
+              !std::holds_alternative<Pcl_structure>(ce->desc)) {
+            for (auto* lg : lets) {
+              auto l = mk(Lam::K::Let);
+              for (auto& b : lg->bindings) {
+                const Pattern* bp = effective_pat(&b.pat);
+                auto* pv = std::get_if<Ppat_var>(&bp->desc);
+                bool nobind = !pv &&
+                    (std::holds_alternative<Ppat_any>(bp->desc) ||
+                     (std::get_if<Ppat_construct>(&bp->desc) &&
+                      lid_last(std::get<Ppat_construct>(bp->desc).id.txt) == "()"));
+                if (!pv && !nobind) { let_wrap_ok = false; break; }
+                LamPtr rv = expr(*b.expr);
+                Ident bid = pv ? fresh(pv->name.txt) : fresh("", true);
+                if (pv) scope.back()[pv->name.txt] = bid;
+                l->bindings.push_back({bid, pv ? pat_kind(&b.pat) : ValueKind::Gen, rv});
+              }
+              if (!let_wrap_ok) break;
+              let_wraps.push_back(l);
+            }
+          }
+          if (params.empty() && (lets.empty() || (!let_wraps.empty() && let_wrap_ok))) {
             // `class a = b`: a pure alias -- no binding, the export IS b.
-            if (auto* pcn = std::get_if<Pcl_constr>(&ce->desc)) {
+            if (lets.empty()) if (auto* pcn = std::get_if<Pcl_constr>(&ce->desc)) {
               if (auto* pl = std::get_if<Lident>(&pcn->id.txt.v))
                 if (const Ident* pid = lookup(pl->name); pid && class_ids_.count(pid->stamp)) {
                   scope.back()[d.name.txt] = *pid;
@@ -9114,6 +9141,12 @@ struct Translator {
                         class_meta_[d.name.txt] = mit->second;
                     }
                   }
+            // wrap the class value with the class-creation lets (run once, when
+            // the class is built), innermost let last
+            if (v && !let_wraps.empty())
+              for (auto wit = let_wraps.rbegin(); wit != let_wraps.rend(); ++wit) {
+                (*wit)->body = v; v = *wit;
+              }
           }
           if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
             v = build_object(ps->cs, /*as_class=*/true, d.name.txt,
