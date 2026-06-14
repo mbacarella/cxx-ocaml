@@ -507,6 +507,10 @@ struct Translator {
   std::unordered_map<std::string, std::vector<std::string>> functor_result_;
   // A local functor's parameter signature layout, to coerce its argument.
   std::unordered_map<std::string, std::vector<std::string>> functor_param_;
+  // A local module bound to a stdlib functor application (`module Subst =
+  // Map.Make(..)` -> {"Map","Make"}), so `Subst.fold ~init ~f` can recover the
+  // labelled signature of the functor RESULT's value for call-site reordering.
+  std::unordered_map<std::string, std::pair<std::string, std::string>> module_functor_src_;
   // module type S = <mt>: the signature AST (the Structure outlives
   // translation), for layouts of nested members of first-class modules.
   std::unordered_map<std::string, const ModuleType*> modtype_ast_;
@@ -1482,6 +1486,63 @@ struct Translator {
     return {};
   }
   struct FunctorSig { int idx = -1; std::vector<std::string> param, result; bool ok = false; };
+  // Resolve a cmi module type to its concrete Signature (following a named
+  // module-type Ident through the same cmi's modtype decls), or null.
+  static const cmi::Signature* mt_sig(const cmi::CmiFile& cmi,
+                                      const cmi::ModuleTypePtr& mt, int depth = 0) {
+    if (!mt || depth > 8) return nullptr;
+    if (mt->kind == cmi::ModuleType::Sig) return mt->sig.get();
+    if (mt->kind == cmi::ModuleType::Ident && mt->path) {
+      const std::string& nm = mt->path->kind == cmi::Path::Pident ? mt->path->id.name
+                                                                  : mt->path->s;
+      for (auto& md : cmi.sig().modtypes)
+        if (md.name == nm) return mt_sig(cmi, md.type, depth + 1);
+    }
+    return nullptr;
+  }
+  // The labelled signature of a value in a stdlib functor's RESULT signature
+  // (`Map.Make`'s `fold : f:.. -> .. -> init:.. -> ..`), for call-site reordering.
+  FnSig functor_result_value_sig(const std::string& moddotted, const std::string& fname,
+                                 const std::string& value) {
+    FnSig s;
+    try {
+      size_t dot = moddotted.find('.');
+      std::string head = dot == std::string::npos ? moddotted : moddotted.substr(0, dot);
+      auto cmi = cmi::CmiFile::load(head == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                     : stdlib_dir + "/stdlib__" + head + ".cmi");
+      const cmi::Signature* sig = &cmi.sig();
+      // navigate submodules for `MoreLabels.Map` (the functor's containing module)
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = moddotted.find('.', pos + 1);
+        std::string comp = moddotted.substr(pos + 1,
+                                            nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return s;
+        sig = next; pos = nd;
+      }
+      for (auto& md : sig->modules) {
+        if (md.name != fname || !md.type || md.type->kind != cmi::ModuleType::Functor) continue;
+        const cmi::Signature* rsig = mt_sig(cmi, md.type->functor_body);
+        if (!rsig) break;
+        for (auto& v : rsig->values)
+          if (v.name == value) {
+            cmi::TypePtr t = v.type;
+            while (t) {
+              while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst))
+                t = t->link;
+              if (!t || t->kind != cmi::TypeExpr::Tarrow) break;
+              s.push_back({t->label_kind, t->label});
+              t = t->cod;
+            }
+            break;
+          }
+        break;
+      }
+    } catch (...) {}
+    return s;
+  }
   FunctorSig stdlib_functor(const std::string& mod, const std::string& name) {
     FunctorSig fs;
     auto& fm = fields_of(mod);
@@ -1726,6 +1787,11 @@ struct Translator {
       }
     } else if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
       if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+        // `Subst.fold` where Subst = Map.Make(..): the labelled result signature.
+        if (auto fs = module_functor_src_.find(pl->name); fs != module_functor_src_.end()) {
+          FnSig s = functor_result_value_sig(fs->second.first, fs->second.second, d->name);
+          for (auto& [k, n] : s) if (k != 0) return s;
+        }
         FnSig s = stdlib_value_sig(pl->name, d->name);
         for (auto& [k, n] : s) if (k != 0) return s;
         // `open StdLabels; List.map` -> the label sig of ListLabels.map.
@@ -9351,6 +9417,23 @@ struct Translator {
               auto rl = module_result_layout(mb.expr);
               for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
             }
+            // `module Subst = Map.Make(..)`: record the stdlib functor source so
+            // Subst.fold's labelled result signature is recoverable for reordering.
+            // `Map` under `open MoreLabels` is the submodule MoreLabels.Map (its
+            // result is the LABELLED Map), so resolve the prefix through opens.
+            if (auto* pa = std::get_if<Pmod_apply>(&mb.expr.desc))
+              if (auto* fi = std::get_if<Pmod_ident>(&pa->f->desc))
+                if (auto* d = std::get_if<Ldot>(&fi->id.txt.v))
+                  if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+                    std::string src = pl->name;
+                    for (auto oit = opened_.rbegin(); oit != opened_.rend(); ++oit)
+                      if (!module_base(*oit) && submodule_of(*oit + "." + pl->name).ok) {
+                        src = *oit + "." + pl->name; break;
+                      }
+                    if (src.find('.') != std::string::npos ||
+                        (!module_base(pl->name) && !fields_of(pl->name).empty()))
+                      module_functor_src_[nm] = {src, d->name};
+                  }
             // an alias to a stdlib submodule (`module MP = Gc.Memprof`): register
             // the dotted path so MP.x gets the submodule's fields, externals,
             // labelled signatures, and record types
