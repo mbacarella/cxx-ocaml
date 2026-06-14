@@ -1476,3 +1476,15 @@ Dashboard unchanged: **exec 95.0% (686/722), lambda 52.4% (389), completeness
 100% (0/744)**. The 35 remaining are each a deep subsystem (nested-module/functor
 resolution, bigarray, memprof, parallel, objects, effect-depth, exn module
 scoping, __FUNCTION__, first-class-mod, exact-GC). 100% is multi-session.
+
+## Functor-param nested submodule resolution (2026-06-14)
+
+`X.Sub.foo` / `open X.Sub` / `open X; open Sub` where X is a functor parameter
+with a nested submodule were `?`-unresolved (the param layout was registered
+flat). Fixed: register nested submodule layouts (register_sig_layouts on the
+param), resolve local dotted opened paths via resolve_module_path, and rewrite a
+bare `open Sub` to `M.Sub`. boxedints now resolves all names and runs partway
+(was fully unresolved) -- it still crashes deeper in the Int32 test logic.
+
+Dashboard: **exec 95.0% (686/722), lambda 52.4% (389), completeness 100%
+(0/744)**, no regressions.
