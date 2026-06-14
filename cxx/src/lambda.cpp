@@ -2165,6 +2165,10 @@ struct Translator {
     if (prim == "%string_length" && n == 1) return ic("string.length");
     if (prim == "%bytes_length" && n == 1) return ic("bytes.length");
     if ((prim == "%bytes_to_string" || prim == "%string_to_bytes") && n == 1) return argv[0];
+    if (prim == "%makemutable" && n == 1) {  // `ref` as a value: (makemutable 0 prim)
+      auto m = mk(Lam::K::Prim); m->prim = Prim::Makemutable; m->prim_arg = 0;
+      m->blk_shape = {ValueKind::Gen}; m->args = argv; return m;
+    }
     if (prim == "%perform" && n == 1) return cc("perform");
     if (prim == "%lazy_force" && n == 1) return force_lazy(argv[0]);
     if (prim == "%obj_is_int" && n == 1) return ic("isint");
