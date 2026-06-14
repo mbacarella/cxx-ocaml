@@ -1634,3 +1634,31 @@ class-expr wrappers), 2 deterministic exec flips (mixin, gen_test) + crash-class
 fixes + broad object-system advance, 0 regressions on any dimension. Objects remain
 the highest-count remaining cluster; the per-file deep features (M4 nested-let-app,
 parameterized-class self-types, lazy_fix) are the next steps.
+
+## Object system: toplevel_lets FLIPPED (2026-06-14)
+
+Completed the class-expression let handling and flipped
+runtime-objects/toplevel_lets.ml (all five modules M1-M5):
+  - M3: class-creation lets before a class application (wrap the class value);
+  - M4: a let INSIDE a class application (`(let () = e in parent) args`) is
+    per-object -> emit it in the new_init wrap body;
+  - M5: a let UNDER a constraint (`(let .. in object : ct)`) is per-object too
+    ("Constraints prevent lifting") -> route constraint-shadowed lets to a
+    separate per_obj_lets list that build_object wraps around the env_init body
+    (not class_init).
+
+Dashboard: **exec 95.3% (689/722 ceiling, flaky -- debuggee toggles; was 685 at
+session start), lambda 52.4% (389, held), completeness 100% (0/744, held)**.
+
+SESSION GRAND TOTAL: 12 code commits, **3 deterministic exec flips (mixin.ml,
+gen_test.ml, toplevel_lets.ml)** + functor/curried crash-class fixes + broad
+object-system advance, 0 regressions on any dimension across the whole session.
+Object class-expr forms now handled: object literals/methods/inheritance/virtual/
+initializers/params/coercion/poly-methods/self-send (pre-existing) + let-in-class
+/ let-open / class-type-ascription / class-app-with-lets / let-in-class-app /
+constraint-prevents-lifting (this session). REMAINING objects need deeper per-file
+features: mixin2/3 = parameterized classes with self-type constraints (`object
+(self : ('a,var) #ops)`) + lazy_fix recursion; cast = object+extensible interplay;
+pr6922 = virtual class type hierarchies; backtrace/names + locs also need
+__FUNCTION__/backtraces; t22ok = recursive modules. Plus the non-object deep tail
+(functor runtime coercion, effects, memprof, bigarray, domains, TMC, exact-GC).
