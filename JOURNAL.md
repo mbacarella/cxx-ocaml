@@ -1488,3 +1488,37 @@ bare `open Sub` to `M.Sub`. boxedints now resolves all names and runs partway
 
 Dashboard: **exec 95.0% (686/722), lambda 52.4% (389), completeness 100%
 (0/744)**, no regressions.
+
+## Polymorphic-variant `#type` pattern matching (2026-06-14)
+
+`#poly`-type patterns (`Ppat_type`, e.g. `#lambda as x`) were unhandled by the
+match compiler, so any match using them fell through to a path that raised
+Match_failure at runtime (typing-labels/mixin.ml).
+
+Recorded polymorphic-variant type abbreviations (`type lambda = [ `Var | .. ]`,
+with `[ a | b ]` inheritance) as a tag-hash set (pv_raw_tags_ / pv_inherits_ /
+collect_pv_tags), then:
+- `pat_test` gained a `Ppat_type` case (tag = the value when immediate, else
+  field 0; membership = OR of equalities), so `naive_match` handles matches
+  *mixing* `#type` rows with explicit-tag rows (`#var as x | `Abs .. | `App ..`)
+  -- which is what mixin actually needs;
+- `compile_match` treats a single `#poly` row as irrefutable (exhaustive by
+  typing) -- no tag test, matching ocamlc (was the index_types.ml near-miss);
+- a pure `#type | #type` match also has a direct `pvtype_match` path.
+
+Not byte-exact with ocamlc's interval Switcher (uses an OR-of-equalities chain),
+but execution-correct -- enough for exec parity.
+
+mixin.ml flips. mixin2/mixin3 still need OBJECTS/classes (lazy_fix + `class type
+ops` + methods), a separate subsystem. Confirmed during triage that the other
+remaining DIFFs are each deep: translprim/locs.ml needs object support too (the
+`class klass`/`inline_object` __FUNCTION__ cases); lib-set/testset+testmap and
+pr7798 are EXACT-GC-allocation asserts (`a2 -. a1 = a1 -. a0`, impractical
+byte-for-byte); sets/htbl segfault on unresolved functor-result members
+(`?empty`/`?add`/`?mem`); sorts/exotic/floatarray/boxedints segfault on genuine
+codegen bugs (no `?` placeholders).
+
+Dashboard: **exec 95.0% (686/722, was 685), lambda 52.4% (389, held),
+completeness 100% (0/744, held)**. 1 file flipped, 0 regressions across all three
+dimensions (lambda-only change; index_types near-miss caught and fixed before
+commit via a stash-diff baseline).
