@@ -1720,3 +1720,31 @@ toplevel_lets flipped, +debuggee flaky; was 685 at session start), lambda 52.4%
 regressions on any dimension. Next object step: MoreLabels submodule resolution +
 labeled functor-result args (would unblock mixin2/3 alongside lazy_fix); then
 cast (GADTs+poly-methods+coercion), pr6922 (virtual class-type hierarchies).
+
+## mixin3 FLIPPED: MoreLabels + object fixes chain (2026-06-14)
+
+A chain of three fixes flipped typing-labels/mixin3.ml:
+1. **parameterized-class lets -> instance variables** (committed earlier);
+2. **labelled functor-result signatures** (`open MoreLabels; Subst.fold s ~init
+   ~f` -- Map.Make's result has labelled fold; resolve `Map` through the open to
+   the SUBMODULE MoreLabels.Map, read its Make result sig's value arrow labels via
+   functor_result_value_sig/mt_sig, and reorder the call) -- fixes the garbage
+   from Subst.fold's out-of-order labelled args;
+3. **object self-pattern type annotation** `object (self : 'a)` -- the self was a
+   Ppat_constraint so it never got bound, and a `self#m` send read an unbound var
+   -> segfault; peel via effective_pat.
+
+Found by deep differential bisection of mixin2's `lambda#eval` crash (lazy_fix
+recursive objects + parameterized ops classes): isolated it to `self#map ~f:..`
+under `(self : 'a)`, which is fix #3.
+
+mixin2 still DIFFs -- it now runs much further (past object construction and eval)
+but hits a Match_failure in expr_ops's `map` at line 120 (a malformed value from
+deeper in the eval/subst/lazy recursion; the map pattern works standalone). Deep,
+layered -- left for later.
+
+Dashboard: **exec 95.6% (690/722; deterministic 689 -- mixin/gen_test/toplevel_lets
+/mixin3 flipped; +debuggee flaky; was 685 at session start), lambda 52.5% (390),
+completeness 100% (0/744)**. SESSION TOTAL: ~20 commits, **4 DETERMINISTIC exec
+flips**, broad object + functor + label subsystems advanced, 0 regressions on any
+dimension throughout.
