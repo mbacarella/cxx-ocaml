@@ -8800,6 +8800,13 @@ struct Translator {
     const ModuleExpr* head = nullptr;
     if (auto* pa = std::get_if<Pmod_apply>(&me.desc)) head = pa->f.get();
     else if (auto* pu = std::get_if<Pmod_apply_unit>(&me.desc)) head = pu->f.get();
+    // Unwrap a curried application `F(A)(B)` down to the base functor `F`, whose
+    // recorded result layout is the layout after all parameters are applied.
+    while (head) {
+      if (auto* pa2 = std::get_if<Pmod_apply>(&head->desc)) { head = pa2->f.get(); continue; }
+      if (auto* pu2 = std::get_if<Pmod_apply_unit>(&head->desc)) { head = pu2->f.get(); continue; }
+      break;
+    }
     if (head)
       if (auto* fi = std::get_if<Pmod_ident>(&head->desc)) {
         if (auto* l = std::get_if<Lident>(&fi->id.txt.v)) {
