@@ -2219,3 +2219,29 @@ across 4 commits (eval_rec_bindings classify, reorder, sig-layout, ctor-
 count scoping).  Still needs, to fully flip: the Test-60 qualified-ctor
 match, recmod CLASSES (Test 70), and module coercions (Test 80) -- each a
 separate feature.  The recmod core is correct, general groundwork.
+
+## Recmod grind cont.: functor-param member resolution (2026-06-14)
+
+Pushed t22ok toward Test 60 (the Bootstrap-heap functor).  Two general
+resolution fixes (committed, 0 regressions): (1) a recmod member
+`PrimH : HEAP with .. = MakeH(BE)` with MakeH a functor PARAMETER got an
+EMPTY result layout from module_result_layout that CLOBBERED its phase-0
+signature layout -> only overwrite when the functor result is actually
+known, else keep the sig layout; (2) register_sig_layouts now peels
+Pmty_with (`S with type t=..` has S's runtime layout).  PrimH.insert/merge/
+empty now resolve from the HEAP sig (no more ?unresolved).
+
+t22ok Test 60 STILL Match_failures, but now on a genuinely deep issue, not
+resolution: BE.t (`E|H`) is matched by `BE.E`/`BE.H` in Bootstrap's BODY
+(after BE's struct), but the variant ctor-count scoping restores BE.t's
+count when BE's struct exits -- and bare type name `t` can't carry the
+qualified BE.t identity.  Plus the test nests TWO heap types (BE.t = E|H
+and LeftistHeap.heap = E|T) through MakeH, an intricate functor-of-functor
+interaction.  Deep; needs per-module-qualified type-count tracking.
+
+REMAINING recmod-cluster blockers are all deep/distinct: t22ok Test 60
+(qualified-type count + nested functor heaps), Test 70 (recmod CLASSES),
+Test 80 (module coercions); fstclassmod (runs to the GADT/first-class-
+module-recmod part, then prints a pointer where an int is expected);
+sets/htbl/boxedints are a SEPARATE functor-coercion crash family.  The
+recmod core + functor-param resolution are correct, general groundwork.
