@@ -1418,3 +1418,26 @@ floatarray), bigarray plugin (bigarrays x3, testvectors), memprof (statmemprof
 x3), parallel domains (churn), objects (mixin x3, toplevel_lets), __FUNCTION__
 (locs), exact GC-allocation accounting (pr7798, testset), first-class-module
 members (fstclassmod), recursive modules (t22ok).
+
+## Multi-column matching + exec push cont. (2026-06-14)
+
+- **Multi-column matrix matcher** for all-constant enum columns. `multi_match`
+  (`match e1,e2 with`) only handled 1-const/1-block columns and bailed on
+  or-patterns / multi-constant enums, so `(A|B),A->'a'|(A|B),B->'b'|(C|D),_->'c'`
+  matched only the first column. Generalized mm_cols: or-pattern column
+  expansion + a switch path over an all-constant column (recurse on remaining
+  columns per tag; var rows hit every case + default). Emit a DENSE exhaustive
+  switch (case per tag 0..n_const-1, gaps reuse the default body) -- the
+  bytecode Kswitch indexes labels by tag with no failaction, so a sparse
+  switch+default segfaults. Relaxed the gate (or-patterns, all-constant, mixed
+  var/ctor only for all-constant). patmatch still differs: it matches over an
+  EXTENSIBLE variant (`type t += A|B`) by identity, not tags -- a different
+  mechanism the tag matcher correctly bails on.
+
+Dashboard: **exec 95.0% (686/722, was 681 at goal start), lambda 52.4% (389),
+completeness 100% (0/744)**. Session flips toward 100%: bug13448, lib-seq, +2-3
+multi-column files; plus correct infra (byte/array/ref %-prims in value pos,
+qualified-stdlib-ctor match resolution). Remaining 36: extensible-variant
+matching (patmatch, morematch), functors (sets/htbl/t22ok/boxedints/floatarray),
+bigarray, memprof, parallel, objects (mixin), __FUNCTION__ (locs), exact-GC
+(pr7798, testset), first-class-module members, recursive modules.
