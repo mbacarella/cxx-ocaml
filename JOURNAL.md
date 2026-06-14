@@ -2245,3 +2245,38 @@ Test 80 (module coercions); fstclassmod (runs to the GADT/first-class-
 module-recmod part, then prints a pointer where an int is expected);
 sets/htbl/boxedints are a SEPARATE functor-coercion crash family.  The
 recmod core + functor-param resolution are correct, general groundwork.
+
+## Recmod grind: functor-result coercion + alias materialisation (2026-06-14)
+
+Cracked t22ok's Test 60-62 (the Okasaki Bootstrap-heap functor), which
+needed THREE module-coercion fixes (all general, 0 regressions):
+
+1. **sig_layout peels non-destructive `S with ..`** (guarded against
+   `with module M := N` modsubst, which removes a field -- the earlier
+   unguarded attempt regressed pr7519 and was reverted).  So a functor
+   result sig `HEAP with module Elem = Element` yields HEAP's layout, and
+   C.insert resolved to the right field (3, not the struct order 4).
+
+2. **register_sig_layouts peels `Pmty_with`** likewise, so a recmod member
+   `PrimH : HEAP with type Elem.t = BE.t = MakeH(BE)` (MakeH a functor
+   PARAMETER) resolves PrimH.insert/merge from the HEAP sig.
+
+3. **functor-result coercion materialises alias-elided modules**.  A
+   `functor (E) : H = struct module Elem = E ; .. end` elides the
+   unconstrained `module Elem = E`, but H exposes `module Elem`, so the
+   result block was missing a field -> off-by-one -> SIGSEGV.  Fix: build
+   the constrained struct with a `force_export` set (= the result sig's
+   field names) so the alias IS exported, THEN coerce_block reorders AND
+   recursively coerces nested module members (a first attempt that used
+   build_module's flat coerce-loop lost the nested coercion and regressed
+   includestruct.ml -- force_export + coerce_block keeps both).
+
+t22ok now passes Tests 10-62 (was an IMMEDIATE crash at the session start);
+next blocker is Test 70: `module rec Class1 .. and Class2 = struct class d =
+object inherit Class1.c .. end end` -- inheriting a QUALIFIED class path
+(`C1.c`, an Ldot) from a recmod dummy, which the class compiler bails on
+(only Lident parents) -> the class becomes a `0` placeholder -> the
+CamlinternalMod update_mod Class-shape assertion fails.  Deep object work
+(needs class metadata from the parent's signature + the module-field value).
+lambda 418 held, completeness 100%, 0 regressions.  sets/htbl/boxedints
+remain a separate functor-coercion family.
