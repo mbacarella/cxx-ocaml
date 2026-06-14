@@ -9951,9 +9951,15 @@ struct Translator {
         // the structs evaluate with the dummies in scope (recursive refs read
         // the dummies' pre-allocated closures, patched in place), then
         // update_mod copies each real structure over its dummy.
+        // Per Translmod.eval_rec_bindings: init_shape classifies each binding.
+        // A binding whose signature yields a shape (all functions/lazy/modules)
+        // is "dummy-able" -> init_mod a dummy, then update_mod the real struct.
+        // A binding whose init_shape FAILS (a functor application, a non-function
+        // value, an abstract sig) is "unsafe" -> bound directly to its compiled
+        // RHS, with no dummy/update (it reads the others' dummies in place).
         struct RM { const ModuleBinding* mb; const ModuleType* sig;
                     const Pmod_structure* body; const ModuleExpr* bodyme;
-                    Ident id; LamPtr shape; };
+                    Ident id; LamPtr shape; bool dummyable; };
         std::vector<RM> rms;
         bool ok = !prm->bindings.empty();
         for (auto& mb : prm->bindings) {
@@ -9966,24 +9972,46 @@ struct Translator {
           }
           auto* ps = sig ? std::get_if<Pmod_structure>(&me->desc) : nullptr;
           LamPtr shape = sig ? recmod_shape(*sig) : nullptr;
-          if (!shape) { ok = false; break; }
-          rms.push_back({&mb, sig, ps, me, {}, shape});  // ps null: any module expr
+          rms.push_back({&mb, sig, ps, me, {}, shape, shape != nullptr});
         }
         auto& cim = fields_of("CamlinternalMod");
         auto initI = cim.find("init_mod");
         auto updI = cim.find("update_mod");
-        if (ok && initI != cim.end() && updI != cim.end()) {
-          for (auto& rm : rms) {  // dummies first: all names in scope for all bodies
+        bool need_mod = false;
+        for (auto& rm : rms) if (rm.dummyable) need_mod = true;
+        if (ok && (!need_mod || (initI != cim.end() && updI != cim.end()))) {
+          // (phase 0) register every name first, so mutual refs resolve in every
+          // body; a dummy-able member also registers its signature layout.
+          for (auto& rm : rms) {
             rm.id = fresh(*rm.mb->name.txt);
+            module_ident_[*rm.mb->name.txt] = rm.id;
+            if (rm.dummyable && rm.sig) register_sig_layouts(*rm.mb->name.txt, *rm.sig);
+          }
+          // (phase 1) init_mod dummies for the dummy-able members
+          for (auto& rm : rms) {
+            if (!rm.dummyable) continue;
             auto ap = mk(Lam::K::Apply);
             ap->fn = field_of("CamlinternalMod", initI->second);
             ap->args = {loc_block(rm.bodyme->loc), rm.shape};
             cur.push_back({rm.id, ValueKind::Gen, ap});
-            module_ident_[*rm.mb->name.txt] = rm.id;
-            // nested layouts too, so M.Sub.f paths through the dummy resolve
-            register_sig_layouts(*rm.mb->name.txt, *rm.sig);
           }
+          // (phase 2) bind the unsafe members directly to their RHS (a functor
+          // application etc.), reading the dummies that are already in scope.
+          // Register the result layout (like `module M = F(X)`) so a sibling
+          // body's `M.member` resolves instead of dumping `?member`.
           for (auto& rm : rms) {
+            if (rm.dummyable) continue;
+            const std::string& nm = *rm.mb->name.txt;
+            LamPtr mv = compile_module_expr(*rm.bodyme);
+            auto& lay = module_layout_[nm]; lay.clear();
+            auto rl = module_result_layout(*rm.bodyme);
+            for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+            cur.push_back({rm.id, ValueKind::Gen, mv});
+            add_export(nm, rm.id);
+          }
+          // (phase 3) update_mod each dummy with the real structure
+          for (auto& rm : rms) {
+            if (!rm.dummyable) continue;
             LamPtr body;
             if (rm.body) {
               std::vector<std::string> co = sig_layout(*rm.sig);
