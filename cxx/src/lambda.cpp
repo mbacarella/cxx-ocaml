@@ -1625,6 +1625,38 @@ struct Translator {
     for (int ix : sm.path) cur = fieldimm(ix, cur);
     return fieldimm(f->second, cur);
   }
+  // Drop a redundant leading `Stdlib.` from a module path: `Stdlib.Array` and
+  // `Stdlib.Float.Array` denote the same units as `Array` / `Float.Array`,
+  // because Stdlib re-exports each stdlib unit `Foo` as an alias of the separate
+  // top-level unit `Stdlib__Foo` (not as a field of Stdlib's own block).  Strip
+  // only when `Foo` is genuinely a stdlib unit and not shadowed by a local one.
+  std::string canon_stdlib_path(const std::string& dotted) {
+    if (dotted.rfind("Stdlib.", 0) != 0) return dotted;
+    std::string rest = dotted.substr(7);
+    std::string head = rest.substr(0, rest.find('.'));
+    if (head.empty() || module_base(head) || fields_of(head).empty()) return dotted;
+    return rest;
+  }
+  // Resolve a stdlib module path `A[.B[.C..]]` (A a stdlib unit) to its runtime
+  // value: bare `A` is the whole unit global; `A.B` is field B of A's block;
+  // deeper levels walk submodule_of.
+  LamPtr stdlib_module_path(const std::string& dotted) {
+    size_t first = dotted.find('.');
+    std::string head = first == std::string::npos ? dotted : dotted.substr(0, first);
+    if (module_base(head) || fields_of(head).empty()) return nullptr;
+    if (first == std::string::npos) {  // a bare stdlib unit: its global block
+      auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = global_of(head);
+      return g;
+    }
+    if (dotted.find('.', first + 1) == std::string::npos) {  // A.B
+      auto& fm = fields_of(head);
+      auto f = fm.find(dotted.substr(first + 1));
+      if (f == fm.end()) return nullptr;
+      return field_of(global_of(head), f->second);
+    }
+    size_t ld = dotted.rfind('.');  // A.B...X.Y
+    return submodule_value(dotted.substr(0, ld), dotted.substr(ld + 1));
+  }
   // A stdlib functor (e.g. Set.Make): its field index in its module, and the
   // runtime field layouts of its parameter signature and its result signature.
   // The runtime field names of a cmi module type, resolving a named module type
@@ -2441,6 +2473,12 @@ struct Translator {
          prim == "%array_set") && n == 3)
       return ic(prim == "%array_unsafe_set" ? "array.unsafe_set[gen]" : "array.set[gen]");
     if (prim == "%array_length" && n == 1) return ic("array.length[gen]");
+    // floatarray element access (Float.Array.unsafe_get etc.): the [float] form.
+    if ((prim == "%floatarray_unsafe_get" || prim == "%floatarray_safe_get") && n == 2)
+      return ic(prim == "%floatarray_unsafe_get" ? "array.unsafe_get[float]" : "array.get[float]");
+    if ((prim == "%floatarray_unsafe_set" || prim == "%floatarray_safe_set") && n == 3)
+      return ic(prim == "%floatarray_unsafe_set" ? "array.unsafe_set[float]" : "array.set[float]");
+    if (prim == "%floatarray_length" && n == 1) return ic("array.length[float]");
     if (prim == "%string_unsafe_get" && n == 2) return ic("string.unsafe_get");
     if ((prim == "%string_safe_get" || prim == "%string_get") && n == 2) return ic("string.get");
     if (prim == "%bytes_unsafe_get" && n == 2) return ic("bytes.unsafe_get");
@@ -9146,7 +9184,7 @@ struct Translator {
   std::vector<std::string> arg_layout(const ModuleExpr& me0) {
     const ModuleExpr* me = &me0;
     while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
-    if (auto* pi = std::get_if<Pmod_ident>(&me->desc))
+    if (auto* pi = std::get_if<Pmod_ident>(&me->desc)) {
       if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
         if (auto it = module_layout_.find(l->name); it != module_layout_.end()) {
           std::vector<std::string> v(it->second.size());
@@ -9158,6 +9196,18 @@ struct Translator {
         for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
         return v;
       }
+      // `Stdlib.Array` etc.: its own fields are the canonical unit's fields.
+      std::string dotted;
+      if (lid_to_dotted(pi->id.txt, dotted)) {
+        std::string c = canon_stdlib_path(dotted);
+        if (c.find('.') == std::string::npos && !module_base(c)) {
+          auto& fm = fields_of(c);
+          std::vector<std::string> v(fm.size());
+          for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
+          return v;
+        }
+      }
+    }
     return {};
   }
   // The first parameter signature of a (local) functor definition.
@@ -9393,8 +9443,14 @@ struct Translator {
     if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {  // a module in value position
       {  // a (possibly deep) path through local modules: chain of field reads
         std::string dotted;
-        if (lid_to_dotted(pi->id.txt, dotted))
+        if (lid_to_dotted(pi->id.txt, dotted)) {
           if (auto mp = resolve_module_path(dotted); mp.base) return mp.base;
+          // `Stdlib.Array` / `Stdlib.Float.Array` are the units `Array` /
+          // `Float.Array` (Stdlib re-exports them as aliases); strip the explicit
+          // prefix so the path resolves against the real unit, not Stdlib's block.
+          if (std::string c = canon_stdlib_path(dotted); c != dotted)
+            if (LamPtr v = stdlib_module_path(c)) return v;
+        }
       }
       if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
         if (!fields_of(l->name).empty()) {  // a stdlib module: its global
@@ -9491,6 +9547,7 @@ struct Translator {
       if (lid_to_dotted(pi->id.txt, dotted)) {
         auto v = layout_vec(dotted);          // a local module / alias chain
         if (!v.empty()) return v;
+        dotted = canon_stdlib_path(dotted);   // `Stdlib.Float.Array` -> `Float.Array`
         if (dotted.find('.') == std::string::npos) {
           // a local module with no value exports shadows any stdlib namesake
           if (module_base(dotted)) return v;
@@ -9620,6 +9677,9 @@ struct Translator {
     std::vector<Lam::Binding> cur;
     std::vector<LamPtr> exports;
     std::vector<std::string> export_names;
+    // stdlib (sub)modules `include`d here (canonical dotted/bare names): a `: S`
+    // coercion eta-stubs S members that are PRIMITIVES of these (no runtime field).
+    std::vector<std::string> inc_stdlib_mods;
     auto flush = [&] { if (!cur.empty()) segs.push_back({false, false, std::move(cur), nullptr}), cur.clear(); };
     auto add_export_val = [&](const std::string& nm, LamPtr v) {
       // a redefinition (shadow) moves the name to its last definition's position
@@ -10311,6 +10371,18 @@ struct Translator {
           cur.push_back({iid, ValueKind::Gen, mv});
           auto v = mk(Lam::K::Var); v->var = iid; base = v;
         }
+        // remember an `include <stdlib (sub)module>` so a `: S` coercion can
+        // eta-stub S members that are PRIMITIVES of it (they have no field here).
+        if (auto* mip = std::get_if<Pmod_ident>(&pin->expr.desc)) {
+          std::string idot;
+          if (lid_to_dotted(mip->id.txt, idot)) {
+            std::string c = canon_stdlib_path(idot);
+            std::string h = c.substr(0, c.find('.'));
+            if (!module_base(h) && !fields_of(h).empty() &&
+                (c.find('.') == std::string::npos || submodule_of(c).ok))
+              inc_stdlib_mods.push_back(c);
+          }
+        }
         auto rl = module_result_layout(pin->expr);
         if (rl.empty()) rl = arg_layout(pin->expr);  // a module path: its own fields
         for (int i = 0; i < (int)rl.size(); ++i) {
@@ -10512,6 +10584,16 @@ struct Translator {
           // a module the struct ELIDED as an alias (`module Elem = E`) but the
           // ascribed sig exposes -> materialise the alias value at this slot.
           ce.push_back(a->second); cn.push_back(nm);
+        } else {
+          // an S member that is a PRIMITIVE of an `include`d stdlib module
+          // (`include Float.Array` then `: S` with `val unsafe_get`): it has no
+          // runtime field there, so the coercion eta-stubs it.
+          for (auto& im : inc_stdlib_mods) {
+            StdPrim sp = im.find('.') != std::string::npos ? submodule_prim(im, nm)
+                                                           : value_prim(im, nm);
+            if (sp.name.empty()) continue;
+            if (LamPtr s = prim_stub(sp)) { ce.push_back(s); cn.push_back(nm); break; }
+          }
         }
       }
       exports = std::move(ce); export_names = std::move(cn);
