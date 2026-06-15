@@ -2482,3 +2482,37 @@ Remaining exec DIFFs: just **1 real** -- typing-poly-bugs/pr6922_ok
 (parameterized virtual class-types, SIGSEGV; deepest translclass).  The other
 nominal DIFF (tool-debugger/basic/debuggee) is flaky-under-load: it matches the
 oracle when run alone, only DIFFs under heavy parallel ocamlrun contention.
+
+## pr6922_ok FIXED -> exec parity 721/722 (99.9%), every stand-alone file matches (2026-06-15)
+
+The last real exec DIFF.  `class virtual ['archiver] basic_agent` does `inherit
+['archiver] Basic.agent` where `module Basic = include Create(P)` (a functor),
+and `Create` itself contains `class virtual ['archiver] agent`.  build_object
+bailed on BOTH -> the recursive class dummy filled with `0`
+(`caml_update_dummy _ 0`) -> SIGSEGV at module init (compile-only test; the
+classes are never instantiated, the crash is just building them).  Two causes:
+
+1. **Pure wildcard class-lets referencing a class parameter.**  `agent` opens
+   `let _ = (prioritizer :> 'level prioritizer)` / `let _ = (archivers :>
+   'archiver list)`.  These reference class params, so the class-creation-let
+   path (params not in scope there) tripped rhs_leaks_param and bailed.  A
+   `let _ = <pure expr>` is a no-op -> elide it (oracle runs it per-object as
+   `(seq param ..)`, semantically identical).  New is_pure_expr.
+
+2. **Class meta for an inherited functor-included class.**  `inherit
+   Basic.agent` needs class_meta_["Basic.agent"], but a class brought in via a
+   functor application + `include` registers no module-qualified meta (only the
+   bare "agent", from when Create's body compiled -- there is no general
+   "module M exports class c -> class_meta_[M.c]" path).  Fall back to the bare
+   class name in the `inherit M.c` branch.
+
+exec **720 -> 721/722 (99.9%)**, lambda 431, completeness 100%, 0 regressions.
+
+**MILESTONE: every testsuite file the oracle can compile stand-alone now
+executes byte-identically (stdout/stderr/exit).**  The single nominal DIFF
+(tool-debugger/find-artifacts/debuggee) is flaky-under-load only: it matches the
+oracle when run alone (M/M/M), and only diverges (a transient ocamlrun SIGSEGV)
+under heavy parallel JOBS contention in the harness -- a harness/runtime
+resource artifact, not a codegen bug.  The remaining non-judged files are SKIPs
+(multi-module / otherlibs-dep / intended-type-error tests the oracle itself
+can't compile stand-alone).
