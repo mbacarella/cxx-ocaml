@@ -2696,3 +2696,21 @@ when compiling a dependent; all type-check.  Self-host with a type decl runs.
 NEXT climb: Type_variant / Type_record (constructor_declaration / label_declaration
 records + variant_representation) and cross-module constructor/field use (a
 dependent matching on `A.Red`), then qualified Pdot types, then stdlib bootstrap.
+
+## .cmi writer: Type_variant declarations (2026-06-15)
+
+Writer emits variant type decls: Type_variant(ctors, Variant_regular=0); each
+constructor_declaration = {Ident.Local, Cstr_tuple(args bridged), cd_res None,
+loc, [], Uid}.  Also fixed type_variance/type_separability to carry exactly
+type_arity entries (OCaml iter2's them vs params -> "List.iter2" crash on
+empty); emit one 0 per param.  variant_representation Variant_regular/Unboxed
+are plain constants (0/1).  type params marshal as Tvar(Some "a").
+
+Verified: c++ocamlc compiles `type color=Red|Green|Blue  type 'a opt=Nada|Just
+of 'a`; an oracle dependent CONSTRUCTS+MATCHES the ctors cross-.cmi (A.Green,
+match A.Red, A.Just 42, A.Nada).  exec 99.9% (flaky), completeness 100%.
+
+Next: Type_record (label_declaration {ld_id; ld_mutable; ld_atomic; ld_type;
+ld_loc; ld_attributes; ld_uid} + record_representation), our OWN infer/lambda
+using cross-module ctors (full self-host with variants), qualified Pdot types,
+stdlib bootstrap.
