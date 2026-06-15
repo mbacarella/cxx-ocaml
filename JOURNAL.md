@@ -2651,3 +2651,30 @@ stdlib+a+b+std_exit -- but the linked prog SIGSEGVs at startup, before any A
 access (even a leading print_string doesn't run).  So the crash is module-init /
 global-table / link level, not the .cmi.  That cross-module-resolution work is
 phase #5.
+
+## SELF-HOSTED SEPARATE COMPILATION WORKS (2026-06-15)
+
+A multi-module OCaml program compiled, linked, and run ENTIRELY by our
+toolchain: c++ocamlc a.ml -> a.cmi (our writer) + a.cmo; c++ocamlc b.ml against
+a.cmi; c++link a+b+stdlib+std_exit; ocamlrun.
+`Printf.printf "%d %b %d %s" A.answer (snd A.pair) (A.id 99) (A.greet "bob")`
+-> `42 true 99 hi bob`.
+
+The earlier "self-host segfault" was a RED HERRING: the driver took the LAST -I
+as stdlib_dir, so `-I . -I stdlib` set stdlib to "." and made a malformed .cmo.
+Fixes: (1) driver collects all -I, picks the one holding stdlib.cmi as
+stdlib_dir; (2) lambda resolve_cmi() falls back from the stdlib naming pattern
+to `<mod>.cmi` in the -I dirs (replaced ~24 hardcoded stdlib-path sites);
+(3) global_of() prefixes `Stdlib__` only when stdlib__<mod>.cmi exists -- a
+local top-level unit (A) uses its bare global name (was linking against the
+nonexistent Stdlib__A).  exec 722/722, completeness 100%, no regression.
+
+NOTE: the inferencer still only reads stdlib cmis (set_infer_stdlib_dir), so
+when typing b it gives A.* the Any type -- fine here (b type-checks, and the
+LAMBDA side reads a.cmi for the real field indices).  For richer cross-module
+typing the infer side should search the -I dirs too.
+
+REMAINING toward bootstrap (task #5 cont. + #3): the .cmi writer still only
+emits value signatures over predef/arrow/tuple/var; real multi-module programs
+need Sig_type (type decls), Sig_module, Sig_typext, and qualified Pdot types in
+the .cmi.  Then the big one: compile the stdlib's own .ml with c++ocamlc.
