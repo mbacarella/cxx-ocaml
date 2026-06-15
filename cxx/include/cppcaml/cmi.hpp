@@ -189,12 +189,13 @@ namespace cmiw {
 struct Ty;
 using TyPtr = std::shared_ptr<Ty>;
 struct Ty {
-  enum K { Predef, Arrow, Tuple, Var } k = Predef;
-  std::string name;            // Predef: "int" / "bool" / "string" / ...
-  std::vector<TyPtr> args;     // Arrow: {dom, cod}; Tuple: elems
+  enum K { Constr, Arrow, Tuple, Var } k = Constr;
+  std::string name;            // Constr: type-ctor name ("int","list","M.t",...)
+  std::vector<TyPtr> args;     // Constr: type args; Arrow: {dom, cod}; Tuple: elems
   int var = 0;                 // Var: identity within one signature item
 };
-TyPtr ty_predef(const std::string& name);
+TyPtr ty_predef(const std::string& name);             // nullary predef constr
+TyPtr ty_constr(const std::string& name, std::vector<TyPtr> args);
 TyPtr ty_arrow(const TyPtr& dom, const TyPtr& cod);
 TyPtr ty_tuple(std::vector<TyPtr> elems);
 TyPtr ty_var(int id);

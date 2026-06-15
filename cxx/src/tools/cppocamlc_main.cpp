@@ -20,7 +20,9 @@
 #include <vector>
 
 #include "cppcaml/bytecode.hpp"
+#include "cppcaml/cmi.hpp"
 #include "cppcaml/cmo.hpp"
+#include "cppcaml/infer_check.hpp"
 #include "cppcaml/lambda.hpp"
 #include "cppcaml/link.hpp"
 #include "cppcaml/parser.hpp"
@@ -110,6 +112,16 @@ int main(int argc, char** argv) {
     lap("bytegen", tp);
     cppcaml::cmo::write_cmo(instrs, mod, cmo, required_globals);
     lap("write_cmo", tp);
+    // Emit the interface (.cmi) next to the .cmo, from the inferred top-level
+    // value signature, so dependents can be compiled separately against it.
+    // Best-effort while the writer is young: never let it break the .cmo / link.
+    try {
+      fs::path cmi_path = fs::path(cmo).replace_extension(".cmi");
+      cppcaml::cmi::cmiw::write_cmi(cmi_path.string(), mod, cppcaml::infer_signature(structure));
+    } catch (const std::exception& e) {
+      if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
+    }
+    lap("write_cmi", tp);
     if (prof)
       std::cerr << "  TOTAL compile: "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";

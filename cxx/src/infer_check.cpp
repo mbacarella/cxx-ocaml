@@ -2566,4 +2566,55 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
   return out;
 }
 
+// Bridge an inferencer type to a cmiw type descriptor.  `vars` shares type-var
+// nodes of equal identity within one value's scheme (so `'a -> 'a` is one var);
+// Any becomes a fresh var (opaque).  Constr paths are passed through -- the cmi
+// writer keeps predefined ones and renders the rest as opaque vars.
+static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
+                                  std::unordered_map<const I::Type*, int>& vars, int& nextvar) {
+  TypePtr t = I::Engine::repr(t0);
+  using K = I::Type::Kind;
+  switch (t->kind) {
+    case K::Var: {
+      auto it = vars.find(t.get());
+      if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
+      int id = nextvar++; vars[t.get()] = id; return cmi::cmiw::ty_var(id);
+    }
+    case K::Any: return cmi::cmiw::ty_var(nextvar++);
+    case K::Arrow:
+      return cmi::cmiw::ty_arrow(bridge_ty(t->dom, vars, nextvar), bridge_ty(t->cod, vars, nextvar));
+    case K::Tuple: {
+      std::vector<cmi::cmiw::TyPtr> as;
+      for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));
+      return cmi::cmiw::ty_tuple(std::move(as));
+    }
+    case K::Constr: {
+      std::vector<cmi::cmiw::TyPtr> as;
+      for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));
+      return cmi::cmiw::ty_constr(t->path, std::move(as));
+    }
+    case K::Link: return bridge_ty(t->link, vars, nextvar);
+  }
+  return cmi::cmiw::ty_var(nextvar++);
+}
+
+std::vector<std::pair<std::string, cmi::cmiw::TyPtr>> infer_signature(const ast::Structure& s) {
+  Checker ck;
+  ck.record_kinds_ = true;
+  run_checker(ck, s);  // leaves top-level bindings in venv.back()
+  std::vector<std::pair<std::string, cmi::cmiw::TyPtr>> out;
+  for (auto& it : s) {
+    auto* sv = std::get_if<Pstr_value>(&it.desc);
+    if (!sv) continue;
+    for (auto& b : sv->bindings)
+      if (auto* v = std::get_if<Ppat_var>(&b.pat.desc)) {  // single-var top-level lets
+        auto f = ck.venv.back().find(v->name.txt);
+        if (f == ck.venv.back().end()) continue;
+        std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
+        out.emplace_back(v->name.txt, bridge_ty(f->second, vars, nextvar));
+      }
+  }
+  return out;
+}
+
 }  // namespace cppcaml

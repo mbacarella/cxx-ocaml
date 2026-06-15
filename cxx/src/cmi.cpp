@@ -655,7 +655,8 @@ std::string print_type_decl(const TypeDecl& d) {
 namespace cmiw {
 
 namespace o = omarshal;
-TyPtr ty_predef(const std::string& n) { auto t = std::make_shared<Ty>(); t->k = Ty::Predef; t->name = n; return t; }
+TyPtr ty_predef(const std::string& n) { auto t = std::make_shared<Ty>(); t->k = Ty::Constr; t->name = n; return t; }
+TyPtr ty_constr(const std::string& n, std::vector<TyPtr> as) { auto t = std::make_shared<Ty>(); t->k = Ty::Constr; t->name = n; t->args = std::move(as); return t; }
 TyPtr ty_arrow(const TyPtr& d, const TyPtr& c) { auto t = std::make_shared<Ty>(); t->k = Ty::Arrow; t->args = {d, c}; return t; }
 TyPtr ty_tuple(std::vector<TyPtr> es) { auto t = std::make_shared<Ty>(); t->k = Ty::Tuple; t->args = std::move(es); return t; }
 TyPtr ty_var(int id) { auto t = std::make_shared<Ty>(); t->k = Ty::Var; t->var = id; return t; }
@@ -693,11 +694,18 @@ struct TyEmit {
         vars[t->var] = te;
         return te;
       }
-      case Ty::Predef: {
-        auto ident = o::vblock(3, {o::vstr(t->name), o::vint(predef_stamp(t->name))});  // Ident.Predef
-        auto path = o::vblock(0, {ident});                                              // Path.Pident
-        auto abbrev = o::vblock(0, {o::vint(0)});                                        // ref Mnil
-        return texpr(o::vblock(3, {path, o::vint(0) /*[]*/, abbrev}));                   // Tconstr
+      case Ty::Constr: {
+        // Only PREDEFINED constructors are emitted as a real Tconstr (with the
+        // predef.ml stamp, possibly with type args: `int list`, `'a option`).
+        // A qualified or user-defined name we can't yet place becomes an opaque
+        // Tvar -- valid, just over-general.  (Pdot / local type decls: the climb.)
+        int st = predef_stamp(t->name);
+        if (!st) return texpr(o::vblock(0, {o::vint(0)}));  // unknown -> Tvar None
+        auto path = o::vblock(0, {o::vblock(3, {o::vstr(t->name), o::vint(st)})});  // Pident(Predef)
+        std::vector<o::ValPtr> as;
+        for (auto& a : t->args) as.push_back(emit(a));
+        auto abbrev = o::vblock(0, {o::vint(0)});  // ref Mnil
+        return texpr(o::vblock(3, {path, as.empty() ? o::vint(0) : o::vlist(as), abbrev}));  // Tconstr
       }
       case Ty::Arrow: {
         // In this trunk a Tarrow's DOMAIN is wrapped in Tpoly(ty, []) (to allow

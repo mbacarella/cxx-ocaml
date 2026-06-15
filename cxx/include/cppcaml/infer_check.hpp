@@ -17,6 +17,7 @@
 
 #include "cppcaml/ast.hpp"
 #include "cppcaml/infer.hpp"
+#include "cppcaml/cmi.hpp"
 
 namespace cppcaml {
 
@@ -66,5 +67,14 @@ ValueKinds infer_value_kinds(const ast::Structure& s);
 // (default "stdlib", relative to the CWD -- callers that run from elsewhere,
 // like c++ocamlc, must set the discovered absolute path first).
 void set_infer_stdlib_dir(const std::string& dir);
+
+// A compilation unit's top-level value signature (in source order) as cmiw type
+// descriptors, bridged from the inferencer's types -- the input to
+// cmi::cmiw::write_cmi.  Only single-variable top-level `let` bindings are
+// included (matching the .cmo's exported field order for the common case);
+// types using an unsupported construct become a fresh type variable (opaque but
+// valid).
+std::vector<std::pair<std::string, cmi::cmiw::TyPtr>> infer_signature(
+    const ast::Structure& s);
 
 }  // namespace cppcaml
