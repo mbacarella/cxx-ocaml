@@ -3845,8 +3845,10 @@ class Parser {
         advance();
         LongidentLoc id = parse_longident_path();
         ModuleType mt{Pmty_alias{id}, id.loc, {}};
+        Attributes mdattrs = std::move(prefixattrs);  // trailing `[@@attr]` (e.g. [@@alert])
+        while (cur().kind == Kind::LBRACKETATAT) { advance(); mdattrs.push_back(parse_attribute_body()); }
         return wrap_sig_ext(SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt)),
-                            std::move(prefixattrs)}}, here()}, std::move(mod_ext));
+                            std::move(mdattrs)}}, here()}, std::move(mod_ext));
       }
       // module M (X:S) … : mty   (functor module declaration)
       std::vector<std::pair<Position, FunctorParam>> fparams;
