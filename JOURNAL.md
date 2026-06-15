@@ -2367,3 +2367,48 @@ functor_param_ instead.
 Remaining object DIFFs (each a distinct deep feature): pr6922 (parameterized
 virtual class-types), pr2195 (backtrace+objects, flaky), mixin2 (deep
 eval/subst Match_failure), fstclassmod (GADT-recmod).
+
+## Exec parity 712->718: eta-stub allocation + first-class-module ctors (2026-06-15)
+
+Four general fixes from triaging the remaining exec DIFFs (the flaky-OK ones
+-- debuggee, bigarrays, lib-float, pr2195 -- match in isolation; they only
+DIFF under heavy parallel ocamlrun load):
+
+1. **Saturated %-primitive applied directly, not eta-stubbed.**  A `%`-prim
+   reached in application position but not specialised by prim_to_lam (e.g.
+   polymorphic `%compare` over operands of an abstract type) fell through to
+   the generic apply, which translated the callee as a *value* -- eta-expanding
+   it into a `stub` closure -- and applied that.  One closure allocated per
+   call.  translprim applies a saturated primitive directly; mirror it via
+   prim_stub_body with the real args.  Fixes lib-set/{testset,testmap}: their
+   functor argument `compare (x:t) y = compare x y` over abstract `t` allocated
+   a stub per call, breaking the #6645 no-allocation assertions.
+
+2. **Pipe / `@@` to a primitive applies it directly.**  `x |> ignore` /
+   `f @@ x` translated f then applied; when f is a bare primitive ident its
+   arity-1 eta-stub was saturated by the single pipe arg -- a stub allocated
+   per call.  When the translated function is such a stub over a primitive
+   ident, lower the application `f x` directly (bare-ident guard preserves the
+   `Array.init n @@ g` arg-merge path).  Fixes regression/pr7798 (15M words of
+   per-iteration `|> ignore` stubs broke its exact-allocation assertion).
+
+3. **Module-qualified constructors resolve to their own module's field.**
+   `M.E` was resolved by bare name `E` through the flat exn registry, so with
+   several `type t += E` only the last survived -- `M1.E` and `M2.E` both
+   lowered to M2's identity.  New module_ctor_identity reads E from the bound
+   module's own block when its layout exports E (exception / extension ctor,
+   not a type-level variant); routed through the construct expr, pat_test,
+   ext_match_arm and exn_dispatch.
+
+4. **`(module M : S)` function parameter registers S's constructors.**  So
+   `?(opt = M.E)` defaults and bodies resolve `M.E` to the parameter's field
+   (register_sig_ctors/exts, restored when the scope closes).  Fixes
+   syntactic-arity/syntactic_arity.
+
+Each gated by lambda_parity + reject_parity: exec **712 -> 718/722 (99.4%)**,
+lambda 419 -> 431, completeness 100% (0 false-rejects), 0 regressions.
+
+Remaining exec DIFFs are 3 deep subsystems: lib-dynlink-domains/test_generator
+(domains+dynlink codegen, SIGSEGV), typing-labels/mixin2 (polymorphic-variant
+`#var as x` abbreviation patterns in an object method -> Match_failure),
+typing-poly-bugs/pr6922_ok (parameterized virtual class-types, SIGSEGV).
