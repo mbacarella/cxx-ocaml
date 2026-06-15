@@ -8827,12 +8827,16 @@ struct Translator {
         if (std::holds_alternative<Optional>(pv->label) && pv->default_) {
           const Ppat_var* var = std::get_if<Ppat_var>(&pat->desc);
           bool any = std::holds_alternative<Ppat_any>(pat->desc);
-          if (var || any) {  // `?x:(_ = d)` discards the value but still runs `d`
+          if (var || any || is_irrefutable(*pat)) {
             Ident optid = fresh("opt", true);  // the `*opt*` parameter
             l->params.push_back({optid, ValueKind::Gen});
-            Ident xid = fresh(var ? var->name.txt : "");
+            // var -> bind the name; `_` -> discard via seq (runs the default for
+            // effect); `()`/tuple/record -> bind a *match* temp then destructure.
+            Ident xid = var ? fresh(var->name.txt) : fresh("", !any);
             if (var) scope.back()[var->name.txt] = xid;
-            optdefs.push_back({xid, optid, pv->default_->get(), pat_kind(pat), /*discard=*/!var});
+            else if (!any) collect_binders(*pat, varof(xid), binders);
+            ValueKind ok = var ? pat_kind(pat) : ValueKind::Gen;  // a *match* temp is unannotated
+            optdefs.push_back({xid, optid, pv->default_->get(), ok, /*discard=*/any});
             continue;
           }
         }
