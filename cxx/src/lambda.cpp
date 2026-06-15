@@ -693,7 +693,10 @@ struct Translator {
     // A module-level binding always names __FUNCTION__ in its RHS (even a plain
     // value `let r = .. __FUNCTION__ ..`); a local let only does so for a function.
     bool push = yields || module_level;
-    if (push) func_path_.push_back(name);
+    // An operator binding `let (+@+) ..` prints as `(+@+)` in __FUNCTION__.
+    std::string fname = (!name.empty() && !std::isalpha((unsigned char)name[0]) &&
+                         name[0] != '_') ? "(" + name + ")" : name;
+    if (push) func_path_.push_back(fname);
     if (direct) named_funcs_.insert(direct);
     LamPtr v = with_inline(expr(rhs), attrs);
     if (push) func_path_.pop_back();
@@ -10224,7 +10227,10 @@ struct Translator {
           for (auto& rm : rms) {
             if (rm.dummyable) continue;
             const std::string& nm = *rm.mb->name.txt;
+            std::string saved_mp = mod_path_;  // __FUNCTION__ inside is `..Rec2.fn`
+            mod_path_ += (mod_path_.empty() ? "" : ".") + nm;
             LamPtr mv = compile_module_expr(*rm.bodyme);
+            mod_path_ = saved_mp;
             if (std::holds_alternative<Pmod_functor>(rm.bodyme->desc)) {
               // a FUNCTOR member (`Rec2 : functor(X)->.. = functor(X)->..`): a
               // sibling's `Rec2(arg).m` resolves via functor_result_, not a layout.
