@@ -2995,6 +2995,16 @@ struct Translator {
         if (auto r = fold_with_tag(pr->args)) return r;
       return pr;
     }
+    // A `%`-primitive we did not specialise above, applied at its full arity:
+    // emit the primitive directly (the same lowering prim_stub_body uses for the
+    // value-position eta-stub, but with the real arguments).  translprim applies
+    // a saturated primitive directly -- letting the caller fall through to the
+    // generic apply would instead eta-expand it into a `stub` closure and apply
+    // that, allocating one closure per call (breaks Set/Map's #6645
+    // no-allocation assertions: `compare (x:t) y = compare x y` over an abstract
+    // `t` lowers `compare x y` to a polymorphic caml_compare here).
+    if (!prim.empty() && prim[0] == '%' && (int)as.size() == arity)
+      if (LamPtr b = prim_stub_body(prim, args())) return b;
     return nullptr;
   }
 
