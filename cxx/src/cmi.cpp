@@ -745,6 +745,7 @@ struct TyEmit {
   long long id = -2;
   std::unordered_map<int, o::ValPtr> vars;
   std::set<std::string>* referenced = nullptr;  // global module names cited by Pdot
+  const std::unordered_map<std::string, int>* local_types = nullptr;  // same-sig type -> stamp
   o::ValPtr texpr(o::ValPtr desc) {  // type_expr = {desc; level; scope; id}
     return o::vblock(0, {desc, o::vint(GENERIC_LEVEL), o::vint(0), o::vint(id--)});
   }
@@ -779,6 +780,13 @@ struct TyEmit {
             path = o::vblock(1, {path, o::vstr(comps[i])});   // Pdot(path, comp)
         } else if (int st = predef_stamp(t->name)) {
           path = o::vblock(0, {o::vblock(3, {o::vstr(t->name), o::vint(st)})});  // Pident(Predef)
+        } else if (local_types && local_types->count(t->name)) {
+          // A same-module type (`type t` referenced bare in this module's own
+          // value/type signatures): Pident(Local{name; stamp}) with the stamp of
+          // its declaration in this signature, so the reader resolves it to that
+          // type instead of an opaque variable.
+          int st = local_types->at(t->name);
+          path = o::vblock(0, {o::vblock(0, {o::vstr(t->name), o::vint(st)})});  // Pident(Local)
         } else {
           return texpr(o::vblock(0, {o::vint(0)}));  // unknown -> Tvar None
         }
@@ -815,17 +823,28 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
 }  // namespace
 
 // Marshal a list of signature items (recursive: a submodule's items nest under
-// Mty_signature).  Stamps are arbitrary local-ident ids (a fresh counter per
-// signature is fine -- consumers refer to names, not stamps).
+// Mty_signature).  `stamp` is a counter shared across the whole cmi so every
+// local ident is unique (a value's type referencing a same-module `type t`
+// must cite that decl's exact stamp).
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
-                                             std::set<std::string>& referenced);
+                                             std::set<std::string>& referenced,
+                                             int& stamp);
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
-                                             std::set<std::string>& referenced) {
-  int stamp = 300;
+                                             std::set<std::string>& referenced,
+                                             int& stamp) {
+  // Pre-pass: give every item its stamp up front and record the local type
+  // names, so a value emitted before/after a type can still cite it by stamp.
+  std::vector<int> item_stamp(items.size());
+  std::unordered_map<std::string, int> local_types;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    item_stamp[i] = stamp++;
+    if (items[i].k == SigItem::Type) local_types[items[i].name] = item_stamp[i];
+  }
   std::vector<o::ValPtr> sig;
-  for (auto& it : items) {
-    TyEmit te; te.referenced = &referenced;
-    auto ident = o::vblock(0, {o::vstr(it.name), o::vint(stamp++)});  // Ident.Local{name;stamp}
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    const SigItem& it = items[i];
+    TyEmit te; te.referenced = &referenced; te.local_types = &local_types;
+    auto ident = o::vblock(0, {o::vstr(it.name), o::vint(item_stamp[i])});  // Ident.Local{name;stamp}
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
       if (it.prim.empty()) {
@@ -848,7 +867,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // Sig_module(id, Mp_present, module_declaration, rec_status, visibility).
       // A submodule takes a runtime field, so it must appear in the signature
       // to keep the surrounding value field layout aligned.
-      auto mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced))});  // Mty_signature
+      auto mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                               o::vint(0) /*md_uid*/});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(0) /*Mp_present*/, md,
@@ -909,7 +928,8 @@ std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
                       const std::vector<Import>& imports) {
   std::set<std::string> referenced;  // global units cited by qualified Tconstrs
-  auto header = o::vblock(0, {o::vstr(modname), o::vlist(emit_sig_items(items, referenced))});
+  int stamp = 300;
+  auto header = o::vblock(0, {o::vstr(modname), o::vlist(emit_sig_items(items, referenced, stamp))});
   std::vector<std::uint8_t> hbytes = o::marshal(header);
 
   const std::string MAGIC = "Caml1999I038";
