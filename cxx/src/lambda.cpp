@@ -1849,6 +1849,55 @@ struct Translator {
     } catch (...) {}
     return s;
   }
+  // The fields of a (possibly cross-module) named module type referenced from a
+  // cmi -- e.g. Weak.Make's parameter `Hashtbl.HashedType`, whose modtype lives
+  // in a DIFFERENT cmi than the functor's.  Empty if not an Ident or unresolved.
+  std::vector<std::string> qualified_modtype_fields(const cmi::ModuleTypePtr& mt) {
+    if (!mt || mt->kind != cmi::ModuleType::Ident || !mt->path) return {};
+    if (mt->path->kind != cmi::Path::Pdot || !mt->path->a) return {};
+    std::string mod = mt->path->a->kind == cmi::Path::Pident ? mt->path->a->id.name
+                                                             : mt->path->a->s;
+    std::string ty = mt->path->s;  // `Stdlib__Hashtbl.HashedType` -> Hashtbl / HashedType
+    if (mod.rfind("Stdlib__", 0) == 0) mod = mod.substr(8);
+    if (module_base(mod)) return {};
+    try {
+      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      for (auto& md : cmi.sig().modtypes)
+        if (md.name == ty) return mt_fields(cmi, md.type);
+    } catch (...) {}
+    return {};
+  }
+  // The parameter-signature field layout of a stdlib functor named by a (possibly
+  // deep) dotted path -- `Weak.Make`, `Ephemeron.K1.Make` -- navigating submodules
+  // and resolving a cross-module parameter modtype.  Empty if not found.
+  std::vector<std::string> stdlib_functor_param(const std::string& dotted) {
+    size_t lastd = dotted.rfind('.');
+    if (lastd == std::string::npos) return {};
+    std::string container = dotted.substr(0, lastd), name = dotted.substr(lastd + 1);
+    size_t headd = container.find('.');
+    std::string head = headd == std::string::npos ? container : container.substr(0, headd);
+    if (module_base(head) || fields_of(head).empty()) return {};
+    try {
+      auto cmi = cmi::CmiFile::load(head == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                     : stdlib_dir + "/stdlib__" + head + ".cmi");
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = headd; pos != std::string::npos;) {  // navigate Ephemeron.K1
+        size_t nd = container.find('.', pos + 1);
+        std::string comp = container.substr(pos + 1, nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules) if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return {};
+        sig = next; pos = nd;
+      }
+      for (auto& md : sig->modules) {
+        if (md.name != name || !md.type || md.type->kind != cmi::ModuleType::Functor) continue;
+        auto p = mt_fields(cmi, md.type->functor_param_type);
+        return p.empty() ? qualified_modtype_fields(md.type->functor_param_type) : p;
+      }
+    } catch (...) {}
+    return {};
+  }
   FunctorSig stdlib_functor(const std::string& mod, const std::string& name) {
     FunctorSig fs;
     auto& fm = fields_of(mod);
@@ -9615,6 +9664,10 @@ struct Translator {
         if (lid_to_dotted(pi->id.txt, dotted))
           if (auto it = functor_param_.find(dotted); it != functor_param_.end())
             param = it->second;
+      }
+      if (param.empty()) {  // a deep/cross-module stdlib functor (Weak.Make,
+        std::string dotted;  // Ephemeron.K1.Make) whose param sig is in another cmi
+        if (lid_to_dotted(pi->id.txt, dotted)) param = stdlib_functor_param(dotted);
       }
     }
     if (!fval) fval = compile_module_expr(*pa.f);
