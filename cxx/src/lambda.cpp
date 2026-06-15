@@ -1,5 +1,6 @@
 #include "cppcaml/lambda.hpp"
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <cstdint>
 #include <cstdio>
@@ -482,6 +483,24 @@ struct Translator {
   // must see the un-collapsed spine (and collapses it again afterwards).
   bool rec_spine_ = false;
   std::string stdlib_dir = "stdlib";  // where to find stdlib*.cmi (CWD-relative by default)
+  std::vector<std::string> module_dirs_;  // extra -I dirs to find local module .cmi
+  // Path to a module's .cmi: the stdlib naming pattern under stdlib_dir, else (for
+  // a separately-compiled local module like `A`) the first `<a>.cmi`/`A.cmi`
+  // found in the -I search dirs.  Enables cross-module separate compilation.
+  std::string resolve_cmi(const std::string& mod) const {
+    std::string sp;
+    if (mod == "Stdlib") sp = stdlib_dir + "/stdlib.cmi";
+    else if (mod.rfind("Camlinternal", 0) == 0)
+      sp = stdlib_dir + "/" + (char)std::tolower((unsigned char)mod[0]) + mod.substr(1) + ".cmi";
+    else sp = stdlib_dir + "/stdlib__" + mod + ".cmi";
+    if (std::filesystem::exists(sp)) return sp;
+    std::string low = (char)std::tolower((unsigned char)mod[0]) + mod.substr(1);
+    for (const std::string& d : module_dirs_) {
+      if (std::filesystem::exists(d + "/" + low + ".cmi")) return d + "/" + low + ".cmi";
+      if (std::filesystem::exists(d + "/" + mod + ".cmi")) return d + "/" + mod + ".cmi";
+    }
+    return sp;  // not found: keep the stdlib path (load throws -> caller handles)
+  }
   std::vector<std::unordered_map<std::string, Ident>> scope{{}};
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
   struct StdPrim { std::string name; int arity; };  // an external's prim_name + arity
@@ -874,8 +893,7 @@ struct Translator {
     if (auto it = mod_ctor_cache_.find(mod); it != mod_ctor_cache_.end()) return it->second;
     auto& out = mod_ctor_cache_[mod];
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.sig().types) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         // GADT constructors follow the same constant/block tag rules (Bigarray's
@@ -1240,8 +1258,7 @@ struct Translator {
     if (dot != std::string::npos) {  // Head.S -> the head module's cmi modtype
       std::string head = mtname.substr(0, dot);
       if (head.find('.') == std::string::npos && !module_base(head)) try {
-        auto cmi = cmi::CmiFile::load(head == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                       : stdlib_dir + "/stdlib__" + head + ".cmi");
+        auto cmi = cmi::CmiFile::load(resolve_cmi(head));
         for (auto& md : cmi.sig().modtypes)
           if (md.name == last) return mt_fields(cmi, md.type);
       } catch (...) {}
@@ -1587,15 +1604,7 @@ struct Translator {
     std::unordered_map<std::string, int> m;
     std::unordered_map<std::string, StdPrim> pr;
     try {
-      // Stdlib and the CamlinternalXxx units are top-level compilation units whose
-      // cmi is `<lowercase-first-char><rest>.cmi`; other stdlib modules are
-      // `stdlib__<Mod>.cmi` submodules.
-      std::string path;
-      if (mod == "Stdlib") path = stdlib_dir + "/stdlib.cmi";
-      else if (mod.rfind("Camlinternal", 0) == 0)
-        path = stdlib_dir + "/" + (char)std::tolower((unsigned char)mod[0]) + mod.substr(1) + ".cmi";
-      else path = stdlib_dir + "/stdlib__" + mod + ".cmi";
-      auto cmi = cmi::CmiFile::load(path);
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       int i = 0;
       for (auto& f : cmi.sig().fields) m[f] = i++;
       for (auto& v : cmi.values()) if (!v.prim.empty()) {
@@ -1625,11 +1634,7 @@ struct Translator {
     if (auto it = alias_target_cache_.find(ck); it != alias_target_cache_.end()) return it->second;
     std::string tgt;
     try {
-      std::string path = mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                       : mod.rfind("Camlinternal", 0) == 0
-                           ? stdlib_dir + "/" + (char)std::tolower((unsigned char)mod[0]) + mod.substr(1) + ".cmi"
-                           : stdlib_dir + "/stdlib__" + mod + ".cmi";
-      auto cmi = cmi::CmiFile::load(path);
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& md : cmi.sig().modules)
         if (md.name == sub && md.type && md.type->kind == cmi::ModuleType::Alias && md.type->path) {
           std::string nm = md.type->path->kind == cmi::Path::Pident ? md.type->path->id.name
@@ -1642,11 +1647,14 @@ struct Translator {
     return alias_target_cache_[ck] = tgt;
   }
   std::unordered_map<std::string, std::string> alias_target_cache_;
-  static std::string global_of(const std::string& mod) {
-    // Stdlib and the CamlinternalXxx units are top-level compilation units; every
-    // other stdlib module is a `Stdlib__`-prefixed submodule.
+  std::string global_of(const std::string& mod) const {
+    // Stdlib and the CamlinternalXxx units are top-level compilation units; a
+    // stdlib *submodule* is the `Stdlib__`-prefixed global -- recognised by its
+    // stdlib__<mod>.cmi existing.  Any other module (a separately-compiled local
+    // unit like `A`) is itself a top-level unit, so its global is the bare name.
     if (mod == "Stdlib" || mod.rfind("Camlinternal", 0) == 0) return mod;
-    return "Stdlib__" + mod;
+    if (std::filesystem::exists(stdlib_dir + "/stdlib__" + mod + ".cmi")) return "Stdlib__" + mod;
+    return mod;
   }
   // A dotted module path from a Longident ("Effect.Deep"); false on Lapply.
   static bool lid_to_dotted(const Longident& l, std::string& out) {
@@ -1678,8 +1686,7 @@ struct Translator {
     size_t dot = dotted.find('.');
     if (dot != std::string::npos) try {
       std::string head = dotted.substr(0, dot);
-      auto cmi = cmi::CmiFile::load(head == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                     : stdlib_dir + "/stdlib__" + head + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       size_t pos = dot + 1;
       bool fail = false;
@@ -1849,8 +1856,7 @@ struct Translator {
     try {
       size_t dot = moddotted.find('.');
       std::string head = dot == std::string::npos ? moddotted : moddotted.substr(0, dot);
-      auto cmi = cmi::CmiFile::load(head == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                     : stdlib_dir + "/stdlib__" + head + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       // navigate submodules for `MoreLabels.Map` (the functor's containing module)
       for (size_t pos = dot; pos != std::string::npos;) {
@@ -1896,8 +1902,7 @@ struct Translator {
     if (mod.rfind("Stdlib__", 0) == 0) mod = mod.substr(8);
     if (module_base(mod)) return {};
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& md : cmi.sig().modtypes)
         if (md.name == ty) return mt_fields(cmi, md.type);
     } catch (...) {}
@@ -1914,8 +1919,7 @@ struct Translator {
     std::string head = headd == std::string::npos ? container : container.substr(0, headd);
     if (module_base(head) || fields_of(head).empty()) return {};
     try {
-      auto cmi = cmi::CmiFile::load(head == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                     : stdlib_dir + "/stdlib__" + head + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t pos = headd; pos != std::string::npos;) {  // navigate Ephemeron.K1
         size_t nd = container.find('.', pos + 1);
@@ -1940,8 +1944,7 @@ struct Translator {
     if (fi == fm.end()) return fs;
     fs.idx = fi->second;
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& md : cmi.sig().modules) {
         if (md.name != name || !md.type || md.type->kind != cmi::ModuleType::Functor) continue;
         fs.param = mt_fields(cmi, md.type->functor_param_type);
@@ -1981,9 +1984,7 @@ struct Translator {
     std::string unit = dotted.substr(0, d0);
     if (module_base(unit)) return {};
     try {
-      auto cmi = cmi::CmiFile::load(unit == "Stdlib"
-                                        ? stdlib_dir + "/stdlib.cmi"
-                                        : stdlib_dir + "/stdlib__" + unit + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(unit));
       const cmi::Signature* sig = &cmi.sig();
       cmi::ModuleTypePtr mt;
       for (size_t p = d0; p != std::string::npos;) {
@@ -2018,8 +2019,7 @@ struct Translator {
   std::vector<int> stdlib_value_labels(const std::string& mod, const std::string& name) {
     std::vector<int> labels;
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& v : cmi.values())
         if (v.name == name) {
           cmi::TypePtr t = v.type;
@@ -2040,8 +2040,7 @@ struct Translator {
   FnSig stdlib_value_sig(const std::string& mod, const std::string& name) {
     FnSig s;
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& v : cmi.values())
         if (v.name == name) {
           cmi::TypePtr t = v.type;
@@ -2081,8 +2080,7 @@ struct Translator {
           if (mod.rfind("Stdlib__", 0) == 0) mod = mod.substr(8);
           if (module_base(mod) || fields_of(mod).empty()) return;
           try {
-            auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                          : stdlib_dir + "/stdlib__" + mod + ".cmi");
+            auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
             for (auto& mtd : cmi.sig().modtypes)
               if (mtd.name == d->name)
                 if (const cmi::Signature* sig = mt_sig(cmi, mtd.type))
@@ -2417,8 +2415,7 @@ struct Translator {
   }
   std::optional<StdField> stdlib_record_field(const std::string& mod, const std::string& label) {
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record) continue;
         for (int i = 0; i < (int)td.labels.size(); ++i)
@@ -2441,8 +2438,7 @@ struct Translator {
     std::string mod = p.substr(0, d), ty = p.substr(d + 1);
     if (mod.find('.') != std::string::npos) return std::nullopt;  // nested module
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record || td.name != ty) continue;
         for (int i = 0; i < (int)td.labels.size(); ++i)
@@ -2461,8 +2457,7 @@ struct Translator {
                   bool flat = false; };  // all-float -> a flat float block (Complex.t)
   std::optional<StdRec> stdlib_record_layout(const std::string& mod, const std::string& label) {
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record) continue;
         bool has = false;
@@ -2487,8 +2482,7 @@ struct Translator {
   std::optional<StdRec> stdlib_record_layout_named(const std::string& mod,
                                                    const std::string& ty) {
     try {
-      auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                                    : stdlib_dir + "/stdlib__" + mod + ".cmi");
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record || td.name != ty) continue;
         StdRec r;
@@ -9690,8 +9684,7 @@ struct Translator {
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
           if (!module_base(pl->name)) try {
             auto cmi = cmi::CmiFile::load(
-                pl->name == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
-                                     : stdlib_dir + "/stdlib__" + pl->name + ".cmi");
+                resolve_cmi(pl->name));
             for (auto& md : cmi.sig().modtypes)
               if (md.name == d->name) return mt_fields(cmi, md.type);
           } catch (...) {}
@@ -11308,6 +11301,9 @@ struct Translator {
 
 }  // namespace
 
+static std::vector<std::string> g_module_dirs;
+void set_module_dirs(std::vector<std::string> dirs) { g_module_dirs = std::move(dirs); }
+
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
                                 const std::string& stdlib_dir, const std::string& file_name,
                                 std::vector<std::string>* required_globals) {
@@ -11323,6 +11319,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   };
   Translator t;
   t.stdlib_dir = stdlib_dir;
+  t.module_dirs_ = g_module_dirs;
   t.file_name_ = file_name;
   set_infer_stdlib_dir(stdlib_dir);  // the inferencer reads .cmi files too
   t.vk = infer_value_kinds(s);

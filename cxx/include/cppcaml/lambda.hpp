@@ -133,4 +133,8 @@ std::string structured_constant(const LamPtr& c);
 // to column 10, with internal wrapping that depends on that start column.
 std::string const_instruction(const LamPtr& c);
 
+// Extra -I directories searched (after the stdlib pattern) for a separately
+// compiled local module's .cmi -- enables cross-module separate compilation.
+void set_module_dirs(std::vector<std::string> dirs);
+
 }  // namespace cppcaml::lambda

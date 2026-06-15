@@ -55,23 +55,30 @@ static std::string module_name(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-  std::string in_path, out_path, stdlib_dir, runtime;  // stdlib_dir: -I, else discovered
+  std::string in_path, out_path, stdlib_dir, runtime;
+  std::vector<std::string> incdirs;  // all -I dirs, in order
   bool compile_only = false;  // -c : stop at the .cmo
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "-o" && i + 1 < argc) out_path = argv[++i];
-    else if (a == "-I" && i + 1 < argc) stdlib_dir = argv[++i];
+    else if (a == "-I" && i + 1 < argc) incdirs.push_back(argv[++i]);
     else if (a == "-runtime" && i + 1 < argc) runtime = argv[++i];
     else if (a == "-c") compile_only = true;
     else in_path = a;
   }
   if (in_path.empty()) {
-    std::cerr << "usage: c++ocamlc [-c] [-I <stdlibdir>] [-runtime <ocamlrun>] "
+    std::cerr << "usage: c++ocamlc [-c] [-I <dir>]... [-runtime <ocamlrun>] "
                  "<file.ml> [-o <out>]\n";
     return 2;
   }
   std::string mod = module_name(in_path);
+  // stdlib_dir = the -I dir that actually holds stdlib.cmi (so `-I . -I <stdlib>`
+  // and `-I <stdlib> -I .` both work); else the usual discovery.  All -I dirs are
+  // searched for separately-compiled local module interfaces.
+  for (const std::string& d : incdirs)
+    if (fs::exists(fs::path(d) / "stdlib.cmi")) { stdlib_dir = d; break; }
   stdlib_dir = discover_stdlib(stdlib_dir);
+  cppcaml::lambda::set_module_dirs(incdirs);
   if (out_path.empty()) {
     fs::path p(in_path);
     out_path = compile_only ? (p.parent_path() / (p.stem().string() + ".cmo")).string()
