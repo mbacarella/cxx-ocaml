@@ -4406,6 +4406,13 @@ struct Translator {
             if (key.empty()) return nullptr;
             if (!rep.count(key)) { rep[key] = n; keys.push_back(key); }
           }
+        // Extension constructors can ALIAS at runtime (`type t += C=A` rebinds C to
+        // A's identity), so the grouped identity-key dispatch below is UNSOUND when
+        // a later column's sub-match can fail and a different key would then match
+        // (x=A failing A's rest must still reach C's row).  ocamlc handles this with
+        // catch/exit fallthrough; we fall back to the row-by-row matcher (always
+        // correct for aliasing) when 2+ keys coincide with remaining columns.
+        if (keys.size() >= 2 && i + 1 < comps.size()) return nullptr;
         std::vector<MRow> dft;
         for (auto& r : rows) if (!is_ctor(r, i)) dft.push_back(bindv(r));
         LamPtr acc = dft.empty() ? raise_predef("Match_failure", mloc)
@@ -10056,6 +10063,10 @@ struct Translator {
       if (auto* px = std::get_if<Pstr_typext>(&it.desc)) {  // type t += E ... (incl. effects)
         for (auto& c : px->ext.ctors) {
           const std::string& nm = c.name.txt;
+          // an extension constructor is identity-matched; it shadows a same-named
+          // VARIANT constructor (`type other = ..C..` then `type t += C=A`) so a
+          // match in its scope compares identity, not the variant's tag.
+          ctor_info_.erase(nm); builtin_ctors_.erase(nm);
           if (auto* rb = std::get_if<Pext_rebind>(&c.kind)) {  // `E = D`: alias to D
             if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
               if (auto e = exn_ident_.find(l->name); e != exn_ident_.end()) {
