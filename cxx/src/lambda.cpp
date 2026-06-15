@@ -1418,7 +1418,10 @@ struct Translator {
       else if (auto* tx = std::get_if<Psig_typext>(&it.desc))
         for (auto& c : tx->ext.ctors) ml[c.name.txt] = i++;
       else if (auto* cl = std::get_if<Psig_class>(&it.desc))
-        for (auto& d : cl->decls) ml[d.name.txt] = i++;  // so do classes
+        for (auto& d : cl->decls) {
+          ml[d.name.txt] = i++;  // so do classes
+          register_class_meta_from_sig(prefix + "." + d.name.txt, d.expr);  // for `inherit M.c`
+        }
       else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
         if (!md->md.name.txt) continue;
         const std::string& nm = *md->md.name.txt;
@@ -8461,6 +8464,30 @@ struct Translator {
     m.concr.assign(concr.begin(), concr.end());
     class_meta_[name] = m;
   }
+  // The inheritance metadata of a class from its SIGNATURE class type (`class c :
+  // object val v.. method m.. end`), keyed by a (possibly module-qualified) name
+  // -- so `inherit M.c` over a recursive-module class can build its inherits args.
+  void register_class_meta_from_sig(const std::string& name, const ast::ClassType& ct) {
+    auto* ps = std::get_if<ast::Pcty_signature>(&ct.desc);
+    if (!ps) return;
+    ClassMeta m;
+    std::set<std::string> virt, concr, vset;
+    for (auto& f : ps->cs.fields) {
+      if (auto* mm = std::get_if<ast::Pctf_method>(&f.desc)) {
+        if (mm->virt == ast::VirtualFlag::Virtual) virt.insert(mm->name.txt);
+        else concr.insert(mm->name.txt);
+      } else if (auto* v = std::get_if<ast::Pctf_val>(&f.desc)) {
+        if (v->virt != ast::VirtualFlag::Virtual && vset.insert(v->name.txt).second)
+          m.vals.push_back(v->name.txt);
+      }
+    }
+    m.meths.assign(concr.begin(), concr.end());
+    m.meths.insert(m.meths.end(), virt.begin(), virt.end());
+    std::sort(m.meths.begin(), m.meths.end());
+    m.virt.assign(virt.begin(), virt.end());
+    m.concr.assign(concr.begin(), concr.end());
+    class_meta_[name] = m;
+  }
 
   // An object structure `object (self) val.. method.. end` (Tcl_structure, concrete
   // fields).  `as_class` selects the class-declaration form (a class_init function +
@@ -8485,7 +8512,7 @@ struct Translator {
     // Single `inherit parent args..` (no `as super`), before any val or
     // initializer (its parent-init call precedes their stores in env_init).
     const ClassMeta* parent_meta = nullptr;
-    Ident parent_var;
+    LamPtr parent_val;  // the parent class value (a local Var, or `field_imm i M`)
     std::vector<const ast::Expression*> inh_args;
     std::string super_name;  // `inherit parent as super`
     std::vector<std::string> virt_own;  // own virtual methods (virtual class only)
@@ -8529,13 +8556,26 @@ struct Translator {
         }
         auto* pc = std::get_if<ast::Pcl_constr>(&pe->desc);
         if (!pc) return nullptr;
-        auto* pl = std::get_if<Lident>(&pc->id.txt.v);
-        if (!pl) return nullptr;
-        auto mit = class_meta_.find(pl->name);
-        const Ident* pid = lookup(pl->name);
-        if (mit == class_meta_.end() || !pid) return nullptr;
-        parent_meta = &mit->second;
-        parent_var = *pid;
+        if (auto* pl = std::get_if<Lident>(&pc->id.txt.v)) {  // inherit LocalClass
+          auto mit = class_meta_.find(pl->name);
+          const Ident* pid = lookup(pl->name);
+          if (mit == class_meta_.end() || !pid) return nullptr;
+          parent_meta = &mit->second;
+          parent_val = varof(*pid);
+        } else if (auto* d = std::get_if<Ldot>(&pc->id.txt.v)) {  // inherit M.c
+          auto* ml2 = std::get_if<Lident>(&d->prefix->v);
+          if (!ml2) return nullptr;
+          std::string key = ml2->name + "." + d->name;
+          auto mit = class_meta_.find(key);
+          LamPtr base = module_base(ml2->name);
+          auto& lay = module_layout_[ml2->name];
+          auto fi = lay.find(d->name);
+          if (mit == class_meta_.end() || !base || fi == lay.end()) return nullptr;
+          parent_meta = &mit->second;
+          auto f0 = mk(Lam::K::Prim); f0->prim = Prim::FieldImm;
+          f0->prim_arg = fi->second; f0->args = {base};
+          parent_val = f0;
+        } else return nullptr;
       } else if (std::get_if<ast::Pcf_constraint>(&f.desc) ||
                  std::get_if<ast::Pcf_attribute>(&f.desc)) {
         // no runtime effect
@@ -8981,7 +9021,7 @@ struct Translator {
       LamPtr virt_arr =
           parent_meta->virt.empty() ? cint(0) : transl_meth_list(parent_meta->virt);
       std::vector<LamPtr> ia = {varof(cla), vals_arr, virt_arr, concr_arr,
-                                varof(parent_var), cint(1)};
+                                parent_val, cint(1)};
       auto bindlet = mk(Lam::K::Let);
       auto f0 = mk(Lam::K::Prim); f0->prim = Prim::FieldMut; f0->prim_arg = 0;
       f0->args = {varof(inh)};
@@ -10765,8 +10805,14 @@ struct Translator {
               mod_path_ += "." + *rm.mb->name.txt;
               body = build_module(rm.body->items, &sub, &co);
               mod_path_ = saved;
-            } else {  // `module rec Id : S = Id` and other non-struct bodies
+            } else {  // `module rec Id : S = Id` / `= F(X)` and other non-struct bodies
               body = compile_module_expr(*rm.bodyme);
+              // coerce a functor-application body's result to the binding's sig
+              // (`Coerce6 : sig val at end = Coerce4(Coerce5)` drops Coerce4's `x`)
+              if (LamPtr c = coerce_block(body, module_result_layout(*rm.bodyme),
+                                          sig_layout(*rm.sig), rm.bodyme,
+                                          sig_items_of(*rm.sig)))
+                body = c;
             }
             auto up = mk(Lam::K::Apply);
             up->fn = field_of("CamlinternalMod", updI->second);
