@@ -2487,6 +2487,18 @@ struct Translator {
     if ((prim == "%floatarray_unsafe_set" || prim == "%floatarray_safe_set") && n == 3)
       return ic(prim == "%floatarray_unsafe_set" ? "array.unsafe_set[float]" : "array.set[float]");
     if (prim == "%floatarray_length" && n == 1) return ic("array.length[float]");
+    // Bigarray accessors as values (`String.init n (Array1.get buf)`): the
+    // kind/layout-less spelling, like the direct-application path.
+    if (prim.rfind("%caml_ba_", 0) == 0) {
+      static const std::pair<const char*, const char*> ba[] = {
+          {"%caml_ba_ref_", "get"}, {"%caml_ba_unsafe_ref_", "unsafe_get"},
+          {"%caml_ba_set_", "set"}, {"%caml_ba_unsafe_set_", "unsafe_set"}};
+      for (auto& [pfx, nm] : ba)
+        if (prim.rfind(pfx, 0) == 0)
+          return ic(std::string("Bigarray.") + nm + "[generic,unknown]");
+      if (prim.rfind("%caml_ba_dim_", 0) == 0)
+        return ic("Bigarray.dim_" + prim.substr(sizeof("%caml_ba_dim_") - 1));
+    }
     if (prim == "%string_unsafe_get" && n == 2) return ic("string.unsafe_get");
     if ((prim == "%string_safe_get" || prim == "%string_get") && n == 2) return ic("string.get");
     if (prim == "%bytes_unsafe_get" && n == 2) return ic("bytes.unsafe_get");
