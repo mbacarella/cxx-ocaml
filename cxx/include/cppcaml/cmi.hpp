@@ -222,9 +222,16 @@ struct SigItem {
   // value field layout).
   std::string prim, prim_native;
   std::vector<SigItem> sub;   // Module: the submodule's signature items
+  // Module: if non-empty, this is a module ALIAS `module name = <alias>` (the
+  // alias is a compilation-unit global like "Stdlib__List"); emitted as
+  // Mty_alias instead of Mty_signature.  `sub` is then ignored.
+  std::string alias;
 };
 inline SigItem sig_module(std::string n, std::vector<SigItem> items) {
   SigItem s; s.k = SigItem::Module; s.name = std::move(n); s.sub = std::move(items); return s;
+}
+inline SigItem sig_module_alias(std::string n, std::string target) {
+  SigItem s; s.k = SigItem::Module; s.name = std::move(n); s.alias = std::move(target); return s;
 }
 inline SigItem sig_value(std::string n, TyPtr t) { return {SigItem::Value, std::move(n), std::move(t), {}, nullptr, {}, {}, "", ""}; }
 inline SigItem sig_external(std::string n, TyPtr t, std::string prim, std::string native) {

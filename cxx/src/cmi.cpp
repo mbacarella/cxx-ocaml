@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <set>
 #include <unordered_map>
 
@@ -744,7 +745,11 @@ std::string read_cmi_self_crc(const std::string& path) {
 struct TyEmit {
   long long id = -2;
   std::unordered_map<int, o::ValPtr> vars;
-  std::set<std::string>* referenced = nullptr;  // global module names cited by Pdot
+  // global module names cited by the signature -> whether they need a real
+  // interface CRC (true for a qualified type like Buffer.t; false for a module
+  // alias `module M = Unit`, which OCaml imports with CRC=None to avoid a
+  // circular dependency, e.g. stdlib.cmi <-> stdlib__List.cmi).
+  std::map<std::string, bool>* referenced = nullptr;
   const std::unordered_map<std::string, int>* local_types = nullptr;  // same-sig type -> stamp
   o::ValPtr texpr(o::ValPtr desc) {  // type_expr = {desc; level; scope; id}
     return o::vblock(0, {desc, o::vint(GENERIC_LEVEL), o::vint(0), o::vint(id--)});
@@ -774,7 +779,7 @@ struct TyEmit {
             comps.push_back(t->name.substr(i, j - i));
           }
           std::string g = global_of(comps[0]);
-          if (referenced) referenced->insert(g);
+          if (referenced) (*referenced)[g] = true;  // a real type ref needs the CRC
           path = o::vblock(0, {o::vblock(2, {o::vstr(g)})});  // Pident(Global head)
           for (std::size_t i = 1; i < comps.size(); ++i)
             path = o::vblock(1, {path, o::vstr(comps[i])});   // Pdot(path, comp)
@@ -827,10 +832,10 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
 // local ident is unique (a value's type referencing a same-module `type t`
 // must cite that decl's exact stamp).
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
-                                             std::set<std::string>& referenced,
+                                             std::map<std::string, bool>& referenced,
                                              int& stamp);
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
-                                             std::set<std::string>& referenced,
+                                             std::map<std::string, bool>& referenced,
                                              int& stamp) {
   // Pre-pass: give every item its stamp up front and record the local type
   // names, so a value emitted before/after a type can still cite it by stamp.
@@ -867,7 +872,16 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // Sig_module(id, Mp_present, module_declaration, rec_status, visibility).
       // A submodule takes a runtime field, so it must appear in the signature
       // to keep the surrounding value field layout aligned.
-      auto mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature
+      o::ValPtr mty;
+      if (!it.alias.empty()) {
+        // `module name = <unit>`: Mty_alias(Pident(Global unit)).  Record the
+        // unit so it's imported with its CRC.
+        referenced.emplace(it.alias, false);  // alias import: CRC=None (no cycle)
+        auto path = o::vblock(0, {o::vblock(2, {o::vstr(it.alias)})});  // Pident(Global)
+        mty = o::vblock(3, {path});  // Mty_alias
+      } else {
+        mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature
+      }
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                               o::vint(0) /*md_uid*/});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(0) /*Mp_present*/, md,
@@ -927,7 +941,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
                       const std::vector<Import>& imports) {
-  std::set<std::string> referenced;  // global units cited by qualified Tconstrs
+  std::map<std::string, bool> referenced;  // cited global unit -> needs real CRC
   int stamp = 300;
   auto header = o::vblock(0, {o::vstr(modname), o::vlist(emit_sig_items(items, referenced, stamp))});
   std::vector<std::uint8_t> hbytes = o::marshal(header);
@@ -945,13 +959,21 @@ std::string write_cmi(const std::string& path, const std::string& modname,
     if (!seen.insert(im.name).second) continue;
     crcs.push_back(o::vblock(0, {o::vstr(im.name), crc_opt(im.crc)}));
   }
-  // Units cited by qualified types (`Buffer.t`): import each with its real CRC,
-  // read from its .cmi, so the interface stays self-consistent.
-  for (const std::string& g : referenced) {
+  // Units cited by the signature.  A qualified type (`Buffer.t`) is imported
+  // with the unit's real CRC (read from its .cmi) so the interface stays
+  // self-consistent; a module alias (`module M = Unit`) is imported with
+  // CRC=None -- like ocamlc's -no-alias-deps -- so stdlib.cmi can reference
+  // Stdlib__List without Stdlib__List (built against stdlib.cmi) creating a
+  // circular CRC dependency.
+  for (const auto& [g, wants_crc] : referenced) {
     if (!seen.insert(g).second) continue;
-    std::string crc = read_cmi_self_crc(resolve_cmi_global(g));
-    if (crc.empty()) continue;  // can't locate it -> omit (still valid)
-    crcs.push_back(o::vblock(0, {o::vstr(g), crc_opt(crc)}));
+    if (wants_crc) {
+      std::string crc = read_cmi_self_crc(resolve_cmi_global(g));
+      if (crc.empty()) continue;  // can't locate it -> omit (still valid)
+      crcs.push_back(o::vblock(0, {o::vstr(g), crc_opt(crc)}));
+    } else {
+      crcs.push_back(o::vblock(0, {o::vstr(g), o::vint(0) /*CRC None*/}));
+    }
   }
   std::vector<std::uint8_t> cbytes = o::marshal(o::vlist(crcs));
 

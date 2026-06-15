@@ -2678,9 +2678,15 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
     } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
       emit_type_decls(ck, pt->decls, out);
     } else if (auto* pm = std::get_if<Psig_module>(&it.desc)) {
-      if (pm->md.name.txt && pm->md.type)
+      if (pm->md.name.txt && pm->md.type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(ps->items)));
+        else if (auto* al = std::get_if<Pmty_alias>(&pm->md.type->desc))
+          // `module M = Target` (e.g. stdlib.mli's `module List = Stdlib__List`):
+          // a single-component target is the unit's global name.
+          if (auto* l = std::get_if<Lident>(&al->id.txt.v))
+            out.push_back(cmi::cmiw::sig_module_alias(*pm->md.name.txt, l->name));
+      }
     }
   }
   return out;
