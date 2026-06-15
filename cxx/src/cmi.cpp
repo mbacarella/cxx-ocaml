@@ -742,7 +742,21 @@ std::string write_cmi(const std::string& path, const std::string& modname,
     TyEmit te;
     auto ident = o::vblock(0, {o::vstr(it.name), o::vint(stamp++)});  // Ident.Local{name;stamp}
     if (it.k == SigItem::Value) {
-      auto vdesc = o::vblock(0, {te.emit(it.ty), o::vint(0) /*Val_reg*/, loc_none(),
+      o::ValPtr valkind;
+      if (it.prim.empty()) {
+        valkind = o::vint(0);  // Val_reg
+      } else {
+        // Val_prim(Primitive.description): an external; inlined by consumers and
+        // taking no module field.  prim_native_repr_args length must = arity.
+        int arity = 0;
+        for (TyPtr a = it.ty; a && a->k == Ty::Arrow; a = a->args[1]) ++arity;
+        std::vector<o::ValPtr> reprs(arity, o::vint(0));  // Same_as_ocaml_repr per arg
+        auto desc = o::vblock(0, {o::vstr(it.prim), o::vint(arity), o::vint(1) /*alloc*/,
+                                  o::vstr(it.prim_native),
+                                  reprs.empty() ? o::vint(0) : o::vlist(reprs), o::vint(0) /*res repr*/});
+        valkind = o::vblock(0, {desc});  // Val_prim
+      }
+      auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, loc_none(),
                                  o::vint(0) /*[] attrs*/, o::vint(0) /*Uid.Internal*/});
       sig.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
     } else {

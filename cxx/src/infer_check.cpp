@@ -2623,6 +2623,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
           std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
           out.push_back(cmi::cmiw::sig_value(v->name.txt, bridge_ty(f->second, vars, nextvar)));
         }
+    } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
+      // `external f : t = "prim"`: a Val_prim value (typed from the annotation).
+      if (pr->prim.type && !pr->prim.prims.empty()) {
+        std::unordered_map<std::string, TypePtr> tvars;
+        std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
+        auto ty = bridge_ty(ck.from_coretype(*pr->prim.type, tvars), bvars, nextvar);
+        std::string native = pr->prim.prims.size() > 1 ? pr->prim.prims[1] : "";
+        out.push_back(cmi::cmiw::sig_external(pr->prim.name.txt, ty, pr->prim.prims[0], native));
+      }
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
       for (auto& d : ty->decls) {
         std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
