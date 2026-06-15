@@ -19,6 +19,7 @@ add_library(cppcaml_core
   src/parser.cpp
   src/ast_print.cpp
   src/marshal.cpp
+  src/blake2.cpp
   src/cmi.cpp
   src/typer.cpp
   src/typedtree_print.cpp
