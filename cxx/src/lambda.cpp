@@ -488,6 +488,10 @@ struct Translator {
   // per parameter, keyed by the binder stamp -- used to match a call's arguments.
   using FnSig = std::vector<std::pair<int, std::string>>;
   std::map<int, FnSig> fn_sig_;
+  // labelled value signatures of a functor parameter's signature (`H : SeededS`
+  // -> create's `?random`), so `H.create 51` fills the omitted optional: param
+  // name -> value name -> FnSig.
+  std::unordered_map<std::string, std::unordered_map<std::string, FnSig>> param_value_sigs_;
   // A function's first-class-module parameters (`(module P : S)`): per
   // positional param the package module type name ("" if not one), so call
   // sites coerce un-annotated `(module M)` arguments to S's layout.
@@ -2022,6 +2026,43 @@ struct Translator {
     } catch (...) {}
     return s;
   }
+  // The labelled arrow signature of a cmi value's type (label kind per param).
+  static FnSig cmi_arrow_sig(const cmi::TypePtr& type) {
+    FnSig s;
+    cmi::TypePtr t = type;
+    while (t) {
+      while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst))
+        t = t->link;
+      if (!t || t->kind != cmi::TypeExpr::Tarrow) break;
+      s.push_back({t->label_kind, t->label});
+      t = t->cod;
+    }
+    return s;
+  }
+  // Register the labelled value signatures of a functor parameter `prefix`'s
+  // module type (`H : Hashtbl.SeededS`), so a call `H.create 51` can fill the
+  // omitted optional `?random`.  Resolves a cross-module named modtype via its cmi.
+  void register_param_value_sigs(const std::string& prefix, const ModuleType& mt) {
+    if (auto* pi = std::get_if<Pmty_ident>(&mt.desc))
+      if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {  // Hashtbl.SeededS
+          std::string mod = pl->name;
+          if (mod.rfind("Stdlib__", 0) == 0) mod = mod.substr(8);
+          if (module_base(mod) || fields_of(mod).empty()) return;
+          try {
+            auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
+                                                          : stdlib_dir + "/stdlib__" + mod + ".cmi");
+            for (auto& mtd : cmi.sig().modtypes)
+              if (mtd.name == d->name)
+                if (const cmi::Signature* sig = mt_sig(cmi, mtd.type))
+                  for (auto& v : sig->values) {
+                    FnSig fs = cmi_arrow_sig(v.type);
+                    for (auto& [k, n] : fs)
+                      if (k != 0) { param_value_sigs_[prefix][v.name] = fs; break; }
+                  }
+          } catch (...) {}
+        }
+  }
   // Build `(apply fn args..)` inserting `0` (None) for each omitted optional
   // parameter the application passes; null if not applicable (no optionals, or a
   // labeled argument, which we don't match precisely).
@@ -2142,6 +2183,10 @@ struct Translator {
       }
     } else if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
       if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+        // `H.create` where H is a functor parameter: its sig's labelled value sig.
+        if (auto it = param_value_sigs_.find(pl->name); it != param_value_sigs_.end())
+          if (auto vit = it->second.find(d->name); vit != it->second.end())
+            return vit->second;
         // `Subst.fold` where Subst = Map.Make(..): the labelled result signature.
         if (auto fs = module_functor_src_.find(pl->name); fs != module_functor_src_.end()) {
           FnSig s = functor_result_value_sig(fs->second.first, fs->second.second, d->name);
@@ -9751,6 +9796,7 @@ struct Translator {
       std::vector<Saved> saves;
       std::vector<SigCtorSave> ctor_saves;  // param-sig variant ctors (`type u=X|Y|Z`)
       std::vector<SigExtSave> ext_saves;    // param-sig extension ctors (`type t+=A|B`)
+      std::vector<std::pair<std::string, std::unordered_map<std::string, FnSig>>> pvs_saves;
       const ModuleExpr* cur = &me;
       while (auto* pf = std::get_if<Pmod_functor>(&cur->desc)) {
         std::string nm = "*";
@@ -9772,6 +9818,11 @@ struct Translator {
           ctor_saves.insert(ctor_saves.end(), cs.begin(), cs.end());
           auto es = register_sig_exts(nm, pid, *fp->type);
           ext_saves.insert(ext_saves.end(), es.begin(), es.end());
+          // and its labelled value sigs (`H.create 51` fills the optional ?random).
+          pvs_saves.push_back({nm, param_value_sigs_.count(nm) ? param_value_sigs_[nm]
+                                                              : std::unordered_map<std::string, FnSig>{}});
+          param_value_sigs_.erase(nm);
+          register_param_value_sigs(nm, *fp->type);
         }
         fn->params.push_back({pid, ValueKind::Gen});
         cur = pf->body.get();
@@ -9779,6 +9830,10 @@ struct Translator {
       fn->body = compile_module_expr(*cur);
       restore_sig_exts(ext_saves);
       restore_sig_ctors(ctor_saves);
+      for (auto it = pvs_saves.rbegin(); it != pvs_saves.rend(); ++it) {
+        if (it->second.empty()) param_value_sigs_.erase(it->first);
+        else param_value_sigs_[it->first] = it->second;
+      }
       for (auto it = saves.rbegin(); it != saves.rend(); ++it) {
         if (it->had) module_ident_[it->nm] = it->id; else module_ident_.erase(it->nm);
         module_layout_[it->nm] = it->lay;
