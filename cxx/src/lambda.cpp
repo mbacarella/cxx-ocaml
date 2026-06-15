@@ -8796,22 +8796,25 @@ struct Translator {
     // An `?(x=default)` parameter becomes a `*opt*` param plus a body let binding
     // `x = (if *opt* (field_imm 0 *opt*) default)` -- unwrap the option or use the
     // default.  (A `?x` without a default keeps the option itself as the param.)
-    struct OptDef { Ident xid, optid; const Expression* def; ValueKind k; };
+    struct OptDef { Ident xid, optid; const Expression* def; ValueKind k; bool discard = false; };
     std::vector<OptDef> optdefs;
     const Pattern* refut = nullptr; Ident refut_pid; Location refut_loc; int nrefut = 0;
     for (auto& fp : f.params)
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
         const Pattern* pat = &pv->pat;
         while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) pat = pc->p.get();
-        if (std::holds_alternative<Optional>(pv->label) && pv->default_)
-          if (auto* var = std::get_if<Ppat_var>(&pat->desc)) {
+        if (std::holds_alternative<Optional>(pv->label) && pv->default_) {
+          const Ppat_var* var = std::get_if<Ppat_var>(&pat->desc);
+          bool any = std::holds_alternative<Ppat_any>(pat->desc);
+          if (var || any) {  // `?x:(_ = d)` discards the value but still runs `d`
             Ident optid = fresh("opt", true);  // the `*opt*` parameter
             l->params.push_back({optid, ValueKind::Gen});
-            Ident xid = fresh(var->name.txt);
-            scope.back()[var->name.txt] = xid;
-            optdefs.push_back({xid, optid, pv->default_->get(), pat_kind(pat)});
+            Ident xid = fresh(var ? var->name.txt : "");
+            if (var) scope.back()[var->name.txt] = xid;
+            optdefs.push_back({xid, optid, pv->default_->get(), pat_kind(pat), /*discard=*/!var});
             continue;
           }
+        }
         // Every parameter gets a binder; a non-variable pattern (a constructor,
         // record or tuple) is named "param" like ocamlc.  An irrefutable one has its
         // variables bound to field reads in the body; a refutable one (a partial
@@ -8850,9 +8853,13 @@ struct Translator {
         auto optv = mk(Lam::K::Var); optv->var = it->optid;
         auto iff = mk(Lam::K::IfThenElse);
         iff->cond = cond; iff->then_ = fieldimm(0, optv); iff->else_ = expr(*it->def);
-        auto let = mk(Lam::K::Let);
-        let->bindings = {{it->xid, it->k, iff}};
-        let->body = body; body = let;
+        if (it->discard) {  // `_` pattern: evaluate for effect, discard the value
+          auto sq = mk(Lam::K::Sequence); sq->cond = iff; sq->else_ = body; body = sq;
+        } else {
+          auto let = mk(Lam::K::Let);
+          let->bindings = {{it->xid, it->k, iff}};
+          let->body = body; body = let;
+        }
       }
       return body;
     };
