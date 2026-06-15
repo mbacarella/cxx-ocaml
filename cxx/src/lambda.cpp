@@ -10225,14 +10225,22 @@ struct Translator {
             if (rm.dummyable) continue;
             const std::string& nm = *rm.mb->name.txt;
             LamPtr mv = compile_module_expr(*rm.bodyme);
-            // Use the functor-RESULT layout only when it's known (Set.Make(..)).
-            // For an unknown functor (a functor PARAMETER applied, `MakeH(BE)`)
-            // it's empty -- keep the SIGNATURE layout registered in phase 0
-            // (the member has a `: S` ascription), so M.member still resolves.
-            auto rl = module_result_layout(*rm.bodyme);
-            if (!rl.empty()) {
-              auto& lay = module_layout_[nm]; lay.clear();
-              for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+            if (std::holds_alternative<Pmod_functor>(rm.bodyme->desc)) {
+              // a FUNCTOR member (`Rec2 : functor(X)->.. = functor(X)->..`): a
+              // sibling's `Rec2(arg).m` resolves via functor_result_, not a layout.
+              functor_result_[nm] = module_result_layout(*rm.bodyme);
+              functor_param_[nm] = functor_param_layout(*rm.bodyme);
+              if (auto* pt = functor_param_type(*rm.bodyme)) functor_param_sig_[nm] = pt;
+            } else {
+              // Use the functor-RESULT layout only when it's known (Set.Make(..)).
+              // For an unknown functor (a functor PARAMETER applied, `MakeH(BE)`)
+              // it's empty -- keep the SIGNATURE layout registered in phase 0
+              // (the member has a `: S` ascription), so M.member still resolves.
+              auto rl = module_result_layout(*rm.bodyme);
+              if (!rl.empty()) {
+                auto& lay = module_layout_[nm]; lay.clear();
+                for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
+              }
             }
             uval[rm.id.stamp] = mv; unsafe.push_back(&rm);
           }
