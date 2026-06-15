@@ -672,7 +672,8 @@ struct Translator {
   }
   // Compile a `let name = rhs` RHS, pushing `name` onto func_path_ while a
   // function RHS is compiled so `__FUNCTION__` inside it includes this binding.
-  LamPtr fn_binding_rhs(const std::string& name, const Expression& rhs, const Attributes& attrs) {
+  LamPtr fn_binding_rhs(const std::string& name, const Expression& rhs, const Attributes& attrs,
+                        bool module_level = false) {
     // A binding whose VALUE is a function (directly, or after side-effecting
     // sequences / lets) takes the let-name for its `__FUNCTION__` scope.  BUT
     // only a DIRECT `let f = fun ..` names the function itself; when the function
@@ -689,10 +690,13 @@ struct Translator {
       break;
     }
     bool yields = std::holds_alternative<Pexp_function>(ry->desc);
-    if (yields) func_path_.push_back(name);
+    // A module-level binding always names __FUNCTION__ in its RHS (even a plain
+    // value `let r = .. __FUNCTION__ ..`); a local let only does so for a function.
+    bool push = yields || module_level;
+    if (push) func_path_.push_back(name);
     if (direct) named_funcs_.insert(direct);
     LamPtr v = with_inline(expr(rhs), attrs);
-    if (yields) func_path_.pop_back();
+    if (push) func_path_.pop_back();
     if (direct) named_funcs_.erase(direct);
     return v;
   }
@@ -6679,7 +6683,16 @@ struct Translator {
         if (pm->binding.name.txt) {
           auto& mb = pm->binding;
           const std::string& nm = *mb.name.txt;
+          // Entering module N: __FUNCTION__ inside is `<enclosing path>.N.fn`, and
+          // the enclosing-function scope resets (N is a new module scope).
+          std::string saved_mp = mod_path_;
+          std::vector<std::string> saved_fp = func_path_;
+          std::string cur_path = mod_path_;
+          for (auto& fn : func_path_) { if (!cur_path.empty()) cur_path += "."; cur_path += fn; }
+          mod_path_ = cur_path + (cur_path.empty() ? "" : ".") + nm;
+          func_path_.clear();
           LamPtr modval = compile_module_expr(mb.expr);
+          mod_path_ = saved_mp; func_path_ = saved_fp;
           auto rl = module_result_layout(mb.expr);
           if (rl.empty()) rl = arg_layout(mb.expr);  // a module path -> its own fields
           // save the names this binding shadows (M is local to the body)
@@ -10060,7 +10073,11 @@ struct Translator {
             add_export(*mb.name.txt, mid);
           } else if (std::holds_alternative<Pmod_functor>(mb.expr.desc)) {
             Ident mid = fresh(*mb.name.txt);            // a functor binds as a function
-            cur.push_back({mid, ValueKind::Gen, compile_module_expr(mb.expr)});
+            std::string saved_mp = mod_path_;  // __FUNCTION__ inside is `..Functor.fn`
+            mod_path_ += (mod_path_.empty() ? "" : ".") + *mb.name.txt;
+            LamPtr fv = compile_module_expr(mb.expr);
+            mod_path_ = saved_mp;
+            cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
             functor_result_[*mb.name.txt] = module_result_layout(mb.expr);  // for Make(..)
             functor_param_[*mb.name.txt] = functor_param_layout(mb.expr);   // for arg coercion
@@ -10394,7 +10411,8 @@ struct Translator {
                 continue;
               }
           Ident id = fresh(pv->name.txt);
-          cur.push_back({id, pat_kind(&b.pat), fn_binding_rhs(pv->name.txt, *b.expr, b.attrs)});
+          cur.push_back({id, pat_kind(&b.pat),
+                         fn_binding_rhs(pv->name.txt, *b.expr, b.attrs, /*module_level=*/true)});
           scope.back()[pv->name.txt] = id;
           record_fn_sig(id, b.expr.get());
           add_export(pv->name.txt, id);
