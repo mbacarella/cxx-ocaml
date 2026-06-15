@@ -3786,6 +3786,21 @@ struct Translator {
     if ((s[i] == 'l' || s[i] == 'n' || s[i] == 'L') && i + 1 < end &&
         std::string_view("dixXou").find(s[i + 1]) != std::string_view::npos) { len = s[i]; ++i; }
     char conv = s[i]; ++i;
+    // `%(...%)` format substitution -> Format_subst(14) of (pad_option, fmtty,
+    // continuation).  Only the empty inner form `%(%)` is lowered: its fmtty is
+    // End_of_fmtty (the sole constant fmtty_rel ctor = int 0), and a width-less
+    // `%(` has pad_option None (= int 0).  A non-empty inner / width falls back
+    // to a plain string (which is unsafe in format position, but no worse than
+    // before).  This is the common `%(%)` splice-a-format-argument idiom.
+    if (conv == '(') {
+      bool no_pad = pad->k == Lam::K::ConstInt && pad->int_val == 0;
+      if (no_pad && i + 1 < end && s[i] == '%' && s[i + 1] == ')') {
+        LamPtr rest = fmt_parse(s, i + 2, end);
+        if (!rest) return nullptr;
+        return cblock(14, {cint(0), cint(0), rest});  // None, End_of_fmtty, rest
+      }
+      return nullptr;
+    }
     LamPtr r = fmt_parse(s, i, end);
     if (!r) return nullptr;
     switch (conv) {

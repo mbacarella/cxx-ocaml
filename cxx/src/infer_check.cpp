@@ -1370,6 +1370,30 @@ struct Checker {
         case 'b': case 'B': add(eng.constr("bool")); break;
         case 'a': add(eng.any()); add(eng.any()); break;  // fn + value
         case 't': add(eng.any()); break;
+        case '(': {  // %(...%): the argument is itself a format6 (substitution).
+          add(eng.constr("format6"));  // so a string-literal arg is typed as a format
+          int depth = 1;               // skip the inner format up to the matching %)
+          while (i < n && depth > 0) {
+            if (s[i] == '%' && i + 1 < n) {
+              if (s[i + 1] == '(') { depth++; i += 2; }
+              else if (s[i + 1] == ')') { depth--; i += 2; }
+              else i += 2;
+            } else ++i;
+          }
+          break;
+        }
+        case '{': {  // %{...%}: a format6 argument (its type-digest is printed)
+          add(eng.constr("format6"));
+          int depth = 1;
+          while (i < n && depth > 0) {
+            if (s[i] == '%' && i + 1 < n) {
+              if (s[i + 1] == '{') { depth++; i += 2; }
+              else if (s[i + 1] == '}') { depth--; i += 2; }
+              else i += 2;
+            } else ++i;
+          }
+          break;
+        }
         default: add(eng.any()); break;
       }
     }
