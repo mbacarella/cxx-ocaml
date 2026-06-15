@@ -180,4 +180,35 @@ std::string print_type(const TypePtr& t);
 std::string print_type_decl(const TypeDecl& d);
 std::string print_module_type(const ModuleType& mt);
 
+// --- .cmi WRITER (inverse of CmiFile::load) -------------------------------
+// A minimal type descriptor for the values a module exports, enough to build a
+// valid Types.signature the oracle reads back.  Grown construct by construct
+// (predefined constructors first, then arrows / tuples / variables).
+namespace cmiw {
+
+struct Ty;
+using TyPtr = std::shared_ptr<Ty>;
+struct Ty {
+  enum K { Predef, Arrow, Tuple, Var } k = Predef;
+  std::string name;            // Predef: "int" / "bool" / "string" / ...
+  std::vector<TyPtr> args;     // Arrow: {dom, cod}; Tuple: elems
+  int var = 0;                 // Var: identity within one signature item
+};
+TyPtr ty_predef(const std::string& name);
+TyPtr ty_arrow(const TyPtr& dom, const TyPtr& cod);
+TyPtr ty_tuple(std::vector<TyPtr> elems);
+TyPtr ty_var(int id);
+
+// An interface import (module name + its .cmi's BLAKE128 CRC).
+struct Import { std::string name; std::string crc; };
+
+// Write magic + marshal(name,sign) + BLAKE128 self-CRC + marshal(crcs) +
+// marshal(flags) to `path`.  `imports` are the non-self interfaces (self is
+// prepended automatically with the computed CRC).  Returns the self-CRC.
+std::string write_cmi(const std::string& path, const std::string& modname,
+                      const std::vector<std::pair<std::string, TyPtr>>& values,
+                      const std::vector<Import>& imports = {});
+
+}  // namespace cmiw
+
 }  // namespace cppcaml::cmi

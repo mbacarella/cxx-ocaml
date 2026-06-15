@@ -1,4 +1,6 @@
 #include "cppcaml/cmi.hpp"
+#include "cppcaml/omarshal.hpp"
+#include "cppcaml/blake2.hpp"
 
 #include <fstream>
 #include <iterator>
@@ -648,5 +650,118 @@ std::string print_type_decl(const TypeDecl& d) {
   }
   return out;
 }
+
+// ---- .cmi WRITER ---------------------------------------------------------
+namespace cmiw {
+
+namespace o = omarshal;
+TyPtr ty_predef(const std::string& n) { auto t = std::make_shared<Ty>(); t->k = Ty::Predef; t->name = n; return t; }
+TyPtr ty_arrow(const TyPtr& d, const TyPtr& c) { auto t = std::make_shared<Ty>(); t->k = Ty::Arrow; t->args = {d, c}; return t; }
+TyPtr ty_tuple(std::vector<TyPtr> es) { auto t = std::make_shared<Ty>(); t->k = Ty::Tuple; t->args = std::move(es); return t; }
+TyPtr ty_var(int id) { auto t = std::make_shared<Ty>(); t->k = Ty::Var; t->var = id; return t; }
+
+namespace {
+constexpr long long GENERIC_LEVEL = 100000000;
+// Predefined type identifier stamps (typing/predef.ml create order, predefstamp
+// counter): a predef Tconstr must carry the right stamp so a reader's Path.same
+// resolves it to the real predefined type (e.g. `int` must unify with `+`).
+int predef_stamp(const std::string& n) {
+  static const std::unordered_map<std::string, int> s = {
+      {"int", 1}, {"char", 2}, {"bytes", 3}, {"float", 4}, {"bool", 5},
+      {"unit", 6}, {"exn", 7}, {"eff", 8}, {"continuation", 9}, {"array", 10},
+      {"list", 11}, {"option", 12}, {"nativeint", 13}, {"int32", 14},
+      {"int64", 15}, {"lazy_t", 16}, {"string", 17}, {"extension_constructor", 18},
+      {"floatarray", 19}};
+  auto it = s.find(n);
+  return it == s.end() ? 0 : it->second;
+}
+
+// Build the omarshal value graph for one exported value's type.  `id` is a
+// per-item counter for the cosmetic type_expr id field; `vars` shares Tvar
+// nodes of equal identity (so `'a -> 'a` is one node, used twice).
+struct TyEmit {
+  long long id = -2;
+  std::unordered_map<int, o::ValPtr> vars;
+  o::ValPtr texpr(o::ValPtr desc) {  // type_expr = {desc; level; scope; id}
+    return o::vblock(0, {desc, o::vint(GENERIC_LEVEL), o::vint(0), o::vint(id--)});
+  }
+  o::ValPtr emit(const TyPtr& t) {
+    switch (t->k) {
+      case Ty::Var: {
+        if (auto it = vars.find(t->var); it != vars.end()) return it->second;
+        o::ValPtr te = texpr(o::vblock(0, {o::vint(0)}));  // Tvar None
+        vars[t->var] = te;
+        return te;
+      }
+      case Ty::Predef: {
+        auto ident = o::vblock(3, {o::vstr(t->name), o::vint(predef_stamp(t->name))});  // Ident.Predef
+        auto path = o::vblock(0, {ident});                                              // Path.Pident
+        auto abbrev = o::vblock(0, {o::vint(0)});                                        // ref Mnil
+        return texpr(o::vblock(3, {path, o::vint(0) /*[]*/, abbrev}));                   // Tconstr
+      }
+      case Ty::Arrow: {
+        // In this trunk a Tarrow's DOMAIN is wrapped in Tpoly(ty, []) (to allow
+        // first-class-poly arguments); the codomain stays bare.  OCaml asserts
+        // (btype.tpoly_get_mono) if the argument isn't a Tpoly.
+        o::ValPtr dom = texpr(o::vblock(8, {emit(t->args[0]), o::vint(0) /*[]*/}));  // Tpoly
+        o::ValPtr c = emit(t->args[1]);
+        return texpr(o::vblock(1, {o::vint(0) /*Nolabel*/, dom, c, o::vint(0) /*Cok*/}));  // Tarrow
+      }
+      case Ty::Tuple: {
+        std::vector<o::ValPtr> elems;
+        for (auto& e : t->args) elems.push_back(o::vblock(0, {o::vint(0) /*None*/, emit(e)}));  // (label,ty)
+        return texpr(o::vblock(2, {o::vlist(elems)}));  // Ttuple of (so * te) list
+      }
+    }
+    return o::vint(0);
+  }
+};
+
+o::ValPtr dummy_pos() {  // Lexing.dummy_pos = {pos_fname=""; pos_lnum=0; pos_bol=0; pos_cnum=-1}
+  return o::vblock(0, {o::vstr(""), o::vint(0), o::vint(0), o::vint(-1)});
+}
+o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
+  auto p = dummy_pos();
+  return o::vblock(0, {p, p, o::vint(1)});
+}
+}  // namespace
+
+std::string write_cmi(const std::string& path, const std::string& modname,
+                      const std::vector<std::pair<std::string, TyPtr>>& values,
+                      const std::vector<Import>& imports) {
+  int stamp = 300;
+  std::vector<o::ValPtr> items;
+  for (auto& [name, ty] : values) {
+    TyEmit te;
+    auto ident = o::vblock(0, {o::vstr(name), o::vint(stamp++)});  // Ident.Local{name;stamp}
+    auto vdesc = o::vblock(0, {te.emit(ty), o::vint(0) /*Val_reg*/, loc_none(),
+                               o::vint(0) /*[] attrs*/, o::vint(0) /*Uid.Internal*/});
+    items.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
+  }
+  auto header = o::vblock(0, {o::vstr(modname), o::vlist(items)});
+  std::vector<std::uint8_t> hbytes = o::marshal(header);
+
+  const std::string MAGIC = "Caml1999I038";
+  std::string prefix(MAGIC);
+  prefix.append(reinterpret_cast<const char*>(hbytes.data()), hbytes.size());
+  std::string self_crc = blake2::blake128(reinterpret_cast<const unsigned char*>(prefix.data()),
+                                          prefix.size());
+
+  auto crc_opt = [](const std::string& c) { return o::vblock(0, {o::vstr(c)}); };  // Some
+  std::vector<o::ValPtr> crcs = {o::vblock(0, {o::vstr(modname), crc_opt(self_crc)})};
+  for (auto& im : imports) crcs.push_back(o::vblock(0, {o::vstr(im.name), crc_opt(im.crc)}));
+  std::vector<std::uint8_t> cbytes = o::marshal(o::vlist(crcs));
+
+  // flags = [Alerts <empty map>]  (Alerts is the lone single-arg pers_flags ctor)
+  std::vector<std::uint8_t> fbytes = o::marshal(o::vlist({o::vblock(0, {o::vint(0)})}));
+
+  std::ofstream out(path, std::ios::binary);
+  out.write(prefix.data(), prefix.size());
+  out.write(reinterpret_cast<const char*>(cbytes.data()), cbytes.size());
+  out.write(reinterpret_cast<const char*>(fbytes.data()), fbytes.size());
+  return self_crc;
+}
+
+}  // namespace cmiw
 
 }  // namespace cppcaml::cmi
