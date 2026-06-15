@@ -2678,3 +2678,21 @@ REMAINING toward bootstrap (task #5 cont. + #3): the .cmi writer still only
 emits value signatures over predef/arrow/tuple/var; real multi-module programs
 need Sig_type (type decls), Sig_module, Sig_typext, and qualified Pdot types in
 the .cmi.  Then the big one: compile the stdlib's own .ml with c++ocamlc.
+
+## .cmi writer climbs to type declarations (Sig_type) (2026-06-15)
+
+Writer now emits Sig_type for type declarations (abstract / manifest / parametric
+aliases) interleaved with Sig_value in source order.  type_declaration = 14
+fields: params, arity, Type_abstract(Definition) kind, Public, manifest
+(None | Some te), variance [], separability [], is_newtype false, scope 0, loc,
+attrs [], immediate Unknown, unboxed false, Uid.Internal.  rec_status Trec_first.
+Type decls take no runtime field -> value field layout unchanged.  infer_signature
+returns a SigItem list; type-decl params/manifest bridged via from_coretype.
+
+Verified: a.cmi for `type t=int  type abs  type 'a box='a list  let zero:t
+let succ:t->t` -> ORACLE resolves A.t (=int), A.abs (opaque), int A.box (='a list)
+when compiling a dependent; all type-check.  Self-host with a type decl runs.
+
+NEXT climb: Type_variant / Type_record (constructor_declaration / label_declaration
+records + variant_representation) and cross-module constructor/field use (a
+dependent matching on `A.Red`), then qualified Pdot types, then stdlib bootstrap.
