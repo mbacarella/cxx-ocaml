@@ -2667,6 +2667,14 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
         if (d.manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
         out.push_back(cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest));
       }
+    } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+      // A submodule `module Inner = struct ... end`: emit Sig_module so the
+      // oracle can resolve `Outer.Inner.x` and so the submodule's runtime field
+      // keeps the surrounding value layout aligned.  Inner structures are
+      // inferred recursively (self-contained submodules; outer refs not yet).
+      if (!mb->binding.name.txt) continue;  // `module _ = ...`
+      if (auto* ms = std::get_if<Pmod_structure>(&mb->binding.expr.desc))
+        out.push_back(cmi::cmiw::sig_module(*mb->binding.name.txt, infer_signature(ms->items)));
     }
   }
   return out;

@@ -208,8 +208,9 @@ struct Import { std::string name; std::string crc; };
 // a Value item emits Sig_value.
 struct Ctor { std::string name; std::vector<TyPtr> args; };  // Cstr_tuple args
 struct Label { std::string name; bool mut = false; TyPtr ty; };  // record field
+struct SigItem;
 struct SigItem {
-  enum K { Value, Type } k = Value;
+  enum K { Value, Type, Module } k = Value;
   std::string name;
   TyPtr ty;                   // Value: the value's type
   std::vector<TyPtr> params;  // Type: type parameters (Var descriptors)
@@ -220,7 +221,11 @@ struct SigItem {
   // primitive by consumers and taking NO module field (so it doesn't shift the
   // value field layout).
   std::string prim, prim_native;
+  std::vector<SigItem> sub;   // Module: the submodule's signature items
 };
+inline SigItem sig_module(std::string n, std::vector<SigItem> items) {
+  SigItem s; s.k = SigItem::Module; s.name = std::move(n); s.sub = std::move(items); return s;
+}
 inline SigItem sig_value(std::string n, TyPtr t) { return {SigItem::Value, std::move(n), std::move(t), {}, nullptr, {}, {}, "", ""}; }
 inline SigItem sig_external(std::string n, TyPtr t, std::string prim, std::string native) {
   SigItem s; s.k = SigItem::Value; s.name = std::move(n); s.ty = std::move(t);

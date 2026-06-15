@@ -734,8 +734,11 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
 }
 }  // namespace
 
-std::string write_cmi(const std::string& path, const std::string& modname,
-                      const std::vector<SigItem>& items, const std::vector<Import>& imports) {
+// Marshal a list of signature items (recursive: a submodule's items nest under
+// Mty_signature).  Stamps are arbitrary local-ident ids (a fresh counter per
+// signature is fine -- consumers refer to names, not stamps).
+static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items);
+static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items) {
   int stamp = 300;
   std::vector<o::ValPtr> sig;
   for (auto& it : items) {
@@ -759,6 +762,15 @@ std::string write_cmi(const std::string& path, const std::string& modname,
       auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, loc_none(),
                                  o::vint(0) /*[] attrs*/, o::vint(0) /*Uid.Internal*/});
       sig.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
+    } else if (it.k == SigItem::Module) {
+      // Sig_module(id, Mp_present, module_declaration, rec_status, visibility).
+      // A submodule takes a runtime field, so it must appear in the signature
+      // to keep the surrounding value field layout aligned.
+      auto mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub))});  // Mty_signature
+      auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
+                              o::vint(0) /*md_uid*/});  // module_declaration
+      sig.push_back(o::vblock(3, {ident, o::vint(0) /*Mp_present*/, md,
+                                  o::vint(0) /*Trec_not*/, o::vint(0) /*Exported*/}));  // Sig_module
     } else {
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
       // alias (`type t = manifest`).  Variant/record kinds: the climb.
@@ -808,7 +820,13 @@ std::string write_cmi(const std::string& path, const std::string& modname,
       sig.push_back(o::vblock(1, {ident, tdecl, o::vint(1) /*Trec_first*/, o::vint(0) /*Exported*/}));
     }
   }
-  auto header = o::vblock(0, {o::vstr(modname), o::vlist(sig)});
+  return sig;
+}
+
+std::string write_cmi(const std::string& path, const std::string& modname,
+                      const std::vector<SigItem>& items,
+                      const std::vector<Import>& imports) {
+  auto header = o::vblock(0, {o::vstr(modname), o::vlist(emit_sig_items(items))});
   std::vector<std::uint8_t> hbytes = o::marshal(header);
 
   const std::string MAGIC = "Caml1999I038";
