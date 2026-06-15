@@ -2341,3 +2341,29 @@ intern, lists_in_minor), effects (shallow2deep), TMC (semantic), recmod
 (t22ok needs recmod-class inherit), exact-GC asserts (pr7798 - impractical),
 domains (test_generator), first-class-module patterns (syntactic_arity), weak
 (ephetest3), Arg.parse (sorts).
+
+## Object system push: __FUNCTION__ + recmod-functor -> locs+names flip (2026-06-15)
+
+Picked the object/translclass cluster (biggest, most foundational).  Chipped
+it via __FUNCTION__ naming + a recmod-functor fix; flipped locs.ml AND
+names.ml (exec 694 -> 697, 96.5%), 0 regressions throughout.
+
+__FUNCTION__ is module-path + nearest enclosing FUNCTION/MODULE-LEVEL binding:
+ - thread mod_path_ through a functor body (`Functor.fn`), a `let module N`
+   (`local_module.N.foo`, resetting the function scope), and a recmod member
+   (`Rec2.fn`);
+ - a MODULE-LEVEL value binding names its RHS even when plain (`let r = .. ` ->
+   `..N.r`), a LOCAL `let x` does not (fn_binding_rhs module_level flag);
+ - operator bindings parenthesise (`(+@+)`);
+ - a method body pushes `<class>#<method>` (anon object = `object`):
+   `Locs.klass#meth`, `Locs.inline_object.object#meth`.
+
+Separately, the locs CRASH was a recmod member that is a FUNCTOR
+(`Rec2 : functor(X)->S = functor(X)->..`): phase 2 registered a plain
+module_layout_ for it, so a sibling's `M = Rec2(arg)` left `?fn` unresolved
+-> SIGSEGV.  Detect a Pmod_functor member and register functor_result_/
+functor_param_ instead.
+
+Remaining object DIFFs (each a distinct deep feature): pr6922 (parameterized
+virtual class-types), pr2195 (backtrace+objects, flaky), mixin2 (deep
+eval/subst Match_failure), fstclassmod (GADT-recmod).
