@@ -1,4 +1,6 @@
 #include "cppcaml/lambda.hpp"
+#include <chrono>
+#include <iostream>
 #include <cstdint>
 #include <cstdio>
 #include <climits>
@@ -11309,11 +11311,22 @@ struct Translator {
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
                                 const std::string& stdlib_dir, const std::string& file_name,
                                 std::vector<std::string>* required_globals) {
+  bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
+  using clk = std::chrono::steady_clock;
+  auto tp = clk::now();
+  auto lap = [&](const char* what) {
+    auto now = clk::now();
+    if (prof)
+      std::cerr << "    [" << what << "] "
+                << std::chrono::duration<double, std::milli>(now - tp).count() << " ms\n";
+    tp = now;
+  };
   Translator t;
   t.stdlib_dir = stdlib_dir;
   t.file_name_ = file_name;
   set_infer_stdlib_dir(stdlib_dir);  // the inferencer reads .cmi files too
   t.vk = infer_value_kinds(s);
+  lap("infer_value_kinds");
   t.register_predef_ctor_info();
   t.register_stdlib_ctors();
   t.register_types(s);
@@ -11324,15 +11337,18 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     for (auto& v : cmi.values())
       if (!v.prim.empty()) t.stdlib_prims[v.name] = {v.prim, v.prim_arity};
   } catch (...) {}
+  lap("register types/ctors + stdlib.cmi");
   t.mod_path_ = module_name;
   t.unit_name_ = module_name;
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
   sg->args.push_back(t.wrap_shared(t.build_module(s, nullptr)));
+  lap("build_module");
   LamPtr root = sg;
   t.simplify_local_functions(root);
   t.simplify_static_catches(root);
   t.inline_var_aliases(root);
+  lap("simplify");
   if (required_globals) {
     std::set<std::string> rg;
     t.collect_required_globals(root, rg);

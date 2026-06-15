@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <iterator>
+#include <unordered_map>
 
 namespace cppcaml::cmi {
 
@@ -399,6 +400,12 @@ private:
 }  // namespace
 
 CmiFile CmiFile::load(const std::string& filepath) {
+  // A .cmi is immutable for the lifetime of a compile, but several passes (the
+  // inferencer, register_stdlib_ctors, pervasive resolution) each re-decode the
+  // same file -- stdlib.cmi alone is decoded 3x.  Memoise by path: the Marshal
+  // decode (the costly part, ~2 ms for stdlib.cmi) then happens once.
+  static std::unordered_map<std::string, CmiFile> cache;
+  if (auto it = cache.find(filepath); it != cache.end()) return it->second;
   std::ifstream in(filepath, std::ios::binary);
   if (!in) throw m::Error("cannot open " + filepath);
   std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
@@ -420,6 +427,7 @@ CmiFile CmiFile::load(const std::string& filepath) {
   CmiFile cmi;
   cmi.module_name_ = arena[tuple.fields.at(0)].str;
   cmi.sig_ = dec.signature(tuple.fields.at(1));
+  cache.emplace(filepath, cmi);
   return cmi;
 }
 

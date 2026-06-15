@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -85,15 +86,33 @@ int main(int argc, char** argv) {
   std::ostringstream ss; ss << in.rdbuf();
 
   // 1. compile source -> .cmo
+  bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
+  using clk = std::chrono::steady_clock;
+  auto t0 = clk::now();
+  auto lap = [&](const char* what, clk::time_point& prev) {
+    auto now = clk::now();
+    if (prof)
+      std::cerr << "  " << what << ": "
+                << std::chrono::duration<double, std::milli>(now - prev).count() << " ms\n";
+    prev = now;
+  };
   std::string cmo = compile_only ? out_path : (fs::temp_directory_path() / (mod + ".cmo")).string();
   try {
+    auto tp = t0;
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
+    lap("parse", tp);
     std::vector<std::string> required_globals;
     auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, in_path,
                                                           &required_globals);
+    lap("translate (infer+lambda)", tp);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
+    lap("bytegen", tp);
     cppcaml::cmo::write_cmo(instrs, mod, cmo, required_globals);
+    lap("write_cmo", tp);
+    if (prof)
+      std::cerr << "  TOTAL compile: "
+                << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
   } catch (const cppcaml::ParseError& e) {
     std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
     return 1;
