@@ -2629,6 +2629,19 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
         std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
         std::vector<cmi::cmiw::TyPtr> params;
         for (auto& p : d.params) params.push_back(bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar));
+        // A variant type: emit its constructors (Cstr_tuple args; record-args and
+        // GADT results are dropped to a no-arg ctor for now -- still valid).
+        if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
+          std::vector<cmi::cmiw::Ctor> ctors;
+          for (auto& c : var->ctors) {
+            cmi::cmiw::Ctor cc; cc.name = c.name.txt;
+            if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
+              for (auto& a : tup->elems) cc.args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
+            ctors.push_back(std::move(cc));
+          }
+          out.push_back(cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors)));
+          continue;
+        }
         cmi::cmiw::TyPtr manifest = nullptr;
         if (d.manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
         out.push_back(cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest));

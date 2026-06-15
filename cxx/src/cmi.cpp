@@ -751,13 +751,32 @@ std::string write_cmi(const std::string& path, const std::string& modname,
       std::vector<o::ValPtr> ps;
       for (auto& p : it.params) ps.push_back(te.emit(p));
       auto man = it.manifest ? o::vblock(0, {te.emit(it.manifest)}) : o::vint(0);  // Some/None
+      o::ValPtr kind;
+      if (!it.ctors.empty()) {
+        int cstamp = 270;
+        std::vector<o::ValPtr> cds;
+        for (auto& c : it.ctors) {
+          auto cid = o::vblock(0, {o::vstr(c.name), o::vint(cstamp++)});  // cd_id = Ident.Local
+          std::vector<o::ValPtr> args;
+          for (auto& a : c.args) args.push_back(te.emit(a));
+          auto cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
+          cds.push_back(o::vblock(0, {cid, cargs, o::vint(0) /*cd_res None*/, loc_none(),
+                                      o::vint(0) /*attrs*/, o::vint(0) /*Uid.Internal*/}));
+        }
+        kind = o::vblock(2, {o::vlist(cds), o::vint(0) /*Variant_regular*/});  // Type_variant
+      } else {
+        kind = o::vblock(0, {o::vint(0)});  // Type_abstract(Definition)
+      }
       auto tdecl = o::vblock(0, {
           ps.empty() ? o::vint(0) : o::vlist(ps),     // type_params
           o::vint((long long)it.params.size()),       // type_arity
-          o::vblock(0, {o::vint(0)}),                  // type_kind = Type_abstract(Definition)
+          kind,                                        // type_kind
           o::vint(1),                                  // type_private = Public
           man,                                         // type_manifest
-          o::vint(0), o::vint(0),                      // variance [], separability []
+          // type_variance / type_separability: ONE entry per parameter (OCaml
+          // iter2's them against the params -- a length mismatch aborts).
+          [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
+          [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
           o::vint(0), o::vint(0),                      // is_newtype false, expansion_scope 0
           loc_none(),                                  // type_loc
           o::vint(0), o::vint(0), o::vint(0),          // attrs [], immediate Unknown, unboxed false

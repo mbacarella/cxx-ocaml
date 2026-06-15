@@ -206,16 +206,21 @@ struct Import { std::string name; std::string crc; };
 // One signature item, in source order.  A Type item emits Sig_type (it takes no
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
+struct Ctor { std::string name; std::vector<TyPtr> args; };  // Cstr_tuple args
 struct SigItem {
   enum K { Value, Type } k = Value;
   std::string name;
   TyPtr ty;                   // Value: the value's type
   std::vector<TyPtr> params;  // Type: type parameters (Var descriptors)
   TyPtr manifest;             // Type: null = abstract; else `type name = manifest`
+  std::vector<Ctor> ctors;    // Type: non-empty => Type_variant
 };
-inline SigItem sig_value(std::string n, TyPtr t) { return {SigItem::Value, std::move(n), std::move(t), {}, nullptr}; }
+inline SigItem sig_value(std::string n, TyPtr t) { return {SigItem::Value, std::move(n), std::move(t), {}, nullptr, {}}; }
 inline SigItem sig_type(std::string n, std::vector<TyPtr> ps, TyPtr man) {
-  return {SigItem::Type, std::move(n), nullptr, std::move(ps), std::move(man)};
+  return {SigItem::Type, std::move(n), nullptr, std::move(ps), std::move(man), {}};
+}
+inline SigItem sig_variant(std::string n, std::vector<TyPtr> ps, std::vector<Ctor> cs) {
+  return {SigItem::Type, std::move(n), nullptr, std::move(ps), nullptr, std::move(cs)};
 }
 
 // Write magic + marshal(name,sign) + BLAKE128 self-CRC + marshal(crcs) +
