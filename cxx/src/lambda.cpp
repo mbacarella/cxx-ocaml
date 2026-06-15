@@ -8459,6 +8459,9 @@ struct Translator {
       scope.emplace_back();
       if (auto* pv = std::get_if<ast::Ppat_var>(&effective_pat(&cs.self)->desc)) scope.back()[pv->name.txt] = self;
       auto save_self = cur_self_; cur_self_ = self;
+      // __FUNCTION__ inside a method is `<path>.<class>#<method>` (an anonymous
+      // object is named `object`).
+      func_path_.push_back((class_name.empty() ? "object" : class_name) + "#" + m.name);
       // A method `method f a b = e` is one curried function over self plus its own
       // params: prepend self to the (flattened) function translated from the body.
       LamPtr fn;
@@ -8480,6 +8483,7 @@ struct Translator {
         fn->params = {{self, ValueKind::Gen}};
         fn->body = expr(*m.body);
       }
+      func_path_.pop_back();
       cur_self_ = save_self;
       scope.pop_back();
       // A referenced class parameter is rewritten to its instance-var copy.
