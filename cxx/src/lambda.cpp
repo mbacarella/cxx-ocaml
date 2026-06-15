@@ -1704,6 +1704,24 @@ struct Translator {
           }
           if (fresh_type) rec_types_[td.name] = std::move(rt);
         }
+        // Register the submodule's VARIANT constructors (Gc.Memprof's
+        // `allocation_source = Normal | Marshalled | Custom`) so unqualified
+        // type-directed uses resolve to their tags.  Fallback only -- never
+        // override or make ambiguous a name a local/earlier type already claims.
+        for (auto& td : sig->types) {
+          if (td.kind != cmi::TypeDecl::Variant) continue;
+          int nc = 0, nb = 0;
+          for (auto& c : td.ctors) {
+            bool block = !c.args.empty() || c.is_inline_record;
+            int arity = c.is_inline_record ? 1 : (int)c.args.size();
+            if (!ctor_info_.count(c.name) && !ambiguous_ctors_.count(c.name)) {
+              ctor_info_[c.name] = {td.name, block ? nb : nc, block, arity};
+              type_ctor_info_[td.name][c.name] = ctor_info_[c.name];
+            }
+            if (block) ++nb; else ++nc;
+          }
+          if (!type_ctors_.count(td.name)) type_ctors_[td.name] = {nc, nb};
+        }
         sm.ok = true;
       }
     } catch (...) {}
