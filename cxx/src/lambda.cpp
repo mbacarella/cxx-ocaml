@@ -552,6 +552,13 @@ struct Translator {
   // (setfield_*_computed self n e)).  Empty outside an object.
   std::optional<Ident> cur_self_;
   std::unordered_map<std::string, Ident> inst_vars_;
+  // Scope-frame index of a method body's own bindings: frames at or above this
+  // are method-local (params / lets) and shadow instance variables; everything
+  // below is the class-creation / module scope, which instance variables shadow.
+  // (An instance var that merely shares a name with a module-level value -- e.g.
+  // a class-let `let lambda = new lambda_ops ops` shadowing a global `lambda` --
+  // must resolve to the per-object field, not the global.)
+  size_t method_scope_floor_ = 0;
   // Method-label binders of the current object, so a self-send `self#m` lowers to
   // (sendself self m) with the bound label rather than a public (send self tag).
   std::unordered_map<std::string, Ident> cur_meth_id_;
@@ -2575,6 +2582,14 @@ struct Translator {
     }
     return nullptr;
   }
+  // Like lookup, but only scope frames at index >= floor (the topmost frames).
+  const Ident* lookup_from(const std::string& n, size_t floor) {
+    for (size_t i = scope.size(); i-- > floor;) {
+      auto f = scope[i].find(n);
+      if (f != scope[i].end()) return &f->second;
+    }
+    return nullptr;
+  }
 
   // Integer arithmetic operators that compile to a primitive.
   static bool int_op(const std::string& n, Prim& p) {
@@ -2717,6 +2732,10 @@ struct Translator {
          prim == "%array_set") && n == 3)
       return ic(prim == "%array_unsafe_set" ? "array.unsafe_set[gen]" : "array.set[gen]");
     if (prim == "%array_length" && n == 1) return ic("array.length[gen]");
+    // Obj.size/field/set_field as values: generic-array ops (Obj.t is opaque).
+    if (prim == "%obj_size" && n == 1) return ic("array.length[gen]");
+    if (prim == "%obj_field" && n == 2) return ic("array.unsafe_get[gen]");
+    if (prim == "%obj_set_field" && n == 3) return ic("array.unsafe_set[gen]");
     // floatarray element access (Float.Array.unsafe_get etc.): the [float] form.
     if ((prim == "%floatarray_unsafe_get" || prim == "%floatarray_safe_get") && n == 2)
       return ic(prim == "%floatarray_unsafe_get" ? "array.unsafe_get[float]" : "array.get[float]");
@@ -3015,6 +3034,11 @@ struct Translator {
       return op("array.unsafe_set[" + array_elem_kind(as[2].second.get()) + "]");
     if (prim == "%array_length" && as.size() == 1)
       return op("array.length[" + array_arg_kind(as[0].second.get()) + "]");
+    // Obj.size/field/set_field: translprim lowers these to generic-array
+    // operations (Obj.t is opaque, so the kind is always `gen`).
+    if (prim == "%obj_size" && as.size() == 1) return op("array.length[gen]");
+    if (prim == "%obj_field" && as.size() == 2) return op("array.unsafe_get[gen]");
+    if (prim == "%obj_set_field" && as.size() == 3) return op("array.unsafe_set[gen]");
     // Byte-swap builtins: %bswap16 prints bare, the boxed ones module-qualified.
     if ((int)as.size() == arity && arity == 1) {
       static const std::unordered_map<std::string, std::string> bsw = {
@@ -7721,16 +7745,24 @@ struct Translator {
     }
     if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
       if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
+        // Inside a method body, a method-local binding (param / let, in a frame at
+        // or above the method floor) shadows an instance variable, which in turn
+        // shadows the class-creation / module scope.  Outside a method, plain
+        // lexical lookup applies.
+        if (cur_self_) {
+          if (auto* b = lookup_from(l->name, method_scope_floor_)) {
+            auto v = mk(Lam::K::Var); v->var = *b; return v;
+          }
+          if (auto iv = inst_vars_.find(l->name); iv != inst_vars_.end()) {
+            auto self = mk(Lam::K::Var); self->var = *cur_self_;
+            auto idv = mk(Lam::K::Var); idv->var = iv->second;
+            auto fc = mk(Lam::K::Prim); fc->prim = Prim::FieldComputed; fc->args = {self, idv};
+            return fc;
+          }
+        }
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
         if (l->name.size() > 4 && l->name[0] == '_' && l->name[1] == '_')
           if (LamPtr lp = loc_primitive(l->name, e.loc)) return lp;
-        // An instance variable referenced in a method body: (field_computed self n).
-        if (cur_self_) if (auto iv = inst_vars_.find(l->name); iv != inst_vars_.end()) {
-          auto self = mk(Lam::K::Var); self->var = *cur_self_;
-          auto idv = mk(Lam::K::Var); idv->var = iv->second;
-          auto fc = mk(Lam::K::Prim); fc->prim = Prim::FieldComputed; fc->args = {self, idv};
-          return fc;
-        }
         // a locally-declared external / %-builtin in value position eta-stubs
         // (`assert_bound_check2 caml_bytes_get_16 s ..` passes the prim itself)
         if (auto ex = externals_.find(l->name); ex != externals_.end())
@@ -8895,6 +8927,7 @@ struct Translator {
       methods_block.push_back(varof(meth_id[m.name]));
       Ident self = fresh(self_name);
       scope.emplace_back();
+      auto save_floor = method_scope_floor_; method_scope_floor_ = scope.size() - 1;
       if (auto* pv = std::get_if<ast::Ppat_var>(&effective_pat(&cs.self)->desc)) scope.back()[pv->name.txt] = self;
       auto save_self = cur_self_; cur_self_ = self;
       // __FUNCTION__ inside a method is `<path>.<class>#<method>` (an anonymous
@@ -8923,6 +8956,7 @@ struct Translator {
       }
       func_path_.pop_back();
       cur_self_ = save_self;
+      method_scope_floor_ = save_floor;
       scope.pop_back();
       // A referenced class parameter is rewritten to its instance-var copy.
       for (auto& cp : cparams)
@@ -8947,12 +8981,14 @@ struct Translator {
     for (auto* ie : initializers) {
       Ident self = fresh(self_name);
       scope.emplace_back();
+      auto save_floor = method_scope_floor_; method_scope_floor_ = scope.size() - 1;
       if (auto* pv = std::get_if<ast::Ppat_var>(&effective_pat(&cs.self)->desc)) scope.back()[pv->name.txt] = self;
       auto save_self = cur_self_; cur_self_ = self;
       auto fn = mk(Lam::K::Function);
       fn->params = {{self, ValueKind::Gen}};
       fn->body = expr(*ie);
       cur_self_ = save_self;
+      method_scope_floor_ = save_floor;
       scope.pop_back();
       for (auto& cp : cparams)
         if (count_var(fn->body, cp.pid)) {
@@ -8993,8 +9029,13 @@ struct Translator {
     }
     for (auto& vl : vals) {
       auto save_self = cur_self_; cur_self_ = selfo;
+      // A val initialiser is not a method body: resolve names lexically (floor 0
+      // makes lookup_from behave like plain lookup), so a class parameter or
+      // outer value isn't mistaken for an instance-var field read.
+      auto save_floor = method_scope_floor_; method_scope_floor_ = 0;
       LamPtr v = expr(*vl.init);
       cur_self_ = save_self;
+      method_scope_floor_ = save_floor;
       auto sf = mk(Lam::K::Prim); sf->prim = Prim::SetfieldComputed;
       sf->prim_id = value_is_immediate(vl.init)
                       ? "setfield_imm_computed" : "setfield_ptr_computed";
