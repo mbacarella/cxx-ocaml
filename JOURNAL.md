@@ -2714,3 +2714,25 @@ Next: Type_record (label_declaration {ld_id; ld_mutable; ld_atomic; ld_type;
 ld_loc; ld_attributes; ld_uid} + record_representation), our OWN infer/lambda
 using cross-module ctors (full self-host with variants), qualified Pdot types,
 stdlib bootstrap.
+
+## .cmi writer: Type_record + variant self-host confirmed (2026-06-15)
+
+(1) Confirmed self-host with VARIANTS already works end to end: c++ocamlc
+compiles b.ml using A's constructors (`A.Red`, `match .. A.Green ..`), links,
+runs -> "green\nred".  Our infer+lambda already read variant ctors from a local
+.cmi (via resolve_cmi/head_cmi finding it).
+
+(2) Writer emits Type_record(labels, Record_regular=0); label_declaration =
+{Ident.Local, ld_mutable, ld_atomic Nonatomic, ld_type, loc, [], Uid} (7 fields).
+Oracle-validated: `type point = {x:int; mutable y:int}` -> an oracle dependent
+constructs/reads/MUTATES the fields across the .cmi.
+
+KNOWN self-host bug (follow-on): c++ocamlc compiling a dependent reads
+cross-module record fields correctly (3 4) but a cross-module field SET
+(`p.A.y <- 9`) doesn't take effect on re-read.  Both read and set go through
+find_field(bare-name); needs the real lambda dump to localize (c++lambda can't
+load a local .cmi -- it has no module-dirs).  exec 99.9% (flaky), completeness
+100%, no regression.
+
+NEXT: cross-module record-SET fix; qualified Pdot types in signatures; stdlib
+bootstrap (point c++ocamlc at the stdlib .ml sources).
