@@ -2736,3 +2736,18 @@ load a local .cmi -- it has no module-dirs).  exec 99.9% (flaky), completeness
 
 NEXT: cross-module record-SET fix; qualified Pdot types in signatures; stdlib
 bootstrap (point c++ocamlc at the stdlib .ml sources).
+
+## Fix: cross-module record field SET; c++lambda gains -I (2026-06-15)
+
+The Pexp_setfield handler lacked the module-qualified-field path the read
+handler has (stdlib_record_field), so `p.M.l <- v` for a cross-module record
+silently lowered to `0` (no-op).  Added the mirror branch.  Self-host record
+mutation now works (`p.A.y <- 9` -> reads 9).  Also taught c++lambda to take
+-I dirs (set_module_dirs/set_infer_module_dirs) so it can dump a unit that
+references a separately-compiled local module -- the tool that localized this.
+exec 99.7% (flaky), completeness 100%.
+
+Self-host now covers: values, type names (abstract/manifest/parametric),
+variant constructors (construct+match), and record fields (read+write), all
+cross-module.  NEXT: qualified Pdot types in emitted signatures (a value of
+type `OtherMod.t`), then the stdlib bootstrap probe.
