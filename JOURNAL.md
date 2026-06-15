@@ -2516,3 +2516,28 @@ under heavy parallel JOBS contention in the harness -- a harness/runtime
 resource artifact, not a codegen bug.  The remaining non-judged files are SKIPs
 (multi-module / otherlibs-dep / intended-type-error tests the oracle itself
 can't compile stand-alone).
+
+## Perf: memoize CmiFile::load -> c++ocamlc now FASTER than ocamlc (2026-06-15)
+
+Benchmarked compiling the whole testsuite (-c, 776 stand-alone files, single
+thread, best of 3) and profiled the fixed cost.
+
+Initial: native oracle ocamlc.opt 6.13s (7.9 ms/file) vs c++ocamlc release 9.73s
+(12.5 ms/file) -- ~1.6x slower.  CPPCAML_PROFILE timers on a trivial
+`let () = ()` showed ~100% of in-process time in fixed stdlib-cmi setup:
+stdlib.cmi Marshal-decoded 3x per compile (inferencer / register_stdlib_ctors /
+pervasive resolution), and every referenced module's .cmi re-decoded by each of
+fields_of / value_prim / submodule_prim within a single compile.
+
+Fix: memoize CmiFile::load by path (a .cmi is immutable per process) -- decode
+each once.  One-line cache, no behaviour change (returns a copy; callers only
+read).  Result: c++ocamlc 9.73s -> 4.59s (5.9 ms/file) == ~1.3x FASTER than
+optimized ocamlc.opt.  exec parity 721/722 + completeness 100% unchanged.
+
+Added env-gated CPPCAML_PROFILE std::chrono phase timers (driver +
+translate_implementation) for future perf work.  Next cheap targets: the
+remaining ~2ms is the single stdlib.cmi decode in infer_value_kinds (eagerly
+loaded even when unused) + the inferencer/translator still being two
+independent tree-walks (see the "what ocamlc does differently" note: ocamlc
+infers once into an annotated typedtree; c++ runs HM inference then re-resolves
+in lambda).
