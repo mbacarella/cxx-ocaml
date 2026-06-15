@@ -9267,6 +9267,22 @@ struct Translator {
         return fp->type.get();
     return nullptr;
   }
+  // All declared parameter types of a (possibly multi-parameter) functor
+  // definition, in order; an entry is null for an unannotated / `()` param.
+  std::vector<const ModuleType*> functor_param_types(const ModuleExpr& me0) {
+    std::vector<const ModuleType*> out;
+    const ModuleExpr* me = &me0;
+    while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+    while (auto* pf = std::get_if<Pmod_functor>(&me->desc)) {
+      const Functor_named* fp = std::get_if<Functor_named>(&pf->param);
+      out.push_back(fp && fp->type ? fp->type.get() : nullptr);
+      me = pf->body.get();
+    }
+    return out;
+  }
+  // A local functor's per-parameter declared types (for coercing a functor-
+  // typed argument's result; functor_param_sig_ holds only the FIRST).
+  std::unordered_map<std::string, std::vector<const ModuleType*>> functor_param_types_;
   // Coerce a stdlib/local module VALUE to a target signature layout, eta-stubbing
   // members that are EXTERNALS of the source module (`Int32.neg` = %int32_neg,
   // not a field) and field-reading the rest.  This is how a functor argument's
@@ -9337,6 +9353,67 @@ struct Translator {
     body->args = std::move(fs);  // reuse the block (its bindings), param-ordered
     return block;
   }
+  // A functor used as an ARGUMENT whose declared parameter type is a functor type
+  // `functor(P) -> R` (a higher-order functor parameter, e.g. Set's PowerSet
+  // SetOrd): compile `functor(P) -> body` but coerce its RESULT to R's layout, so
+  // the body's module value is narrowed (`functor(S) -> S` over result
+  // Set.OrderedType -> `(makeblock 0 (field_mut 34 S))`).  Null when the shape
+  // isn't the simple single-parameter / pure-path-body case (flat path applies).
+  LamPtr compile_coerced_functor_arg(const ModuleExpr& arg, const ModuleType& expected) {
+    const ModuleExpr* a = &arg;
+    while (auto* pc = std::get_if<Pmod_constraint>(&a->desc)) a = pc->me.get();
+    auto* pf_a = std::get_if<Pmod_functor>(&a->desc);
+    auto* pf_e = std::get_if<Pmty_functor>(&expected.desc);
+    if (!pf_a || !pf_e) return nullptr;
+    if (std::get_if<Pmod_functor>(&pf_a->body->desc)) return nullptr;  // multi-param: bail
+    std::vector<std::string> target = sig_layout(*pf_e->body);
+    if (target.empty()) return nullptr;
+    auto fn = mk(Lam::K::Function); fn->inline_attr = "is_a_functor";
+    const Functor_named* fp = std::get_if<Functor_named>(&pf_a->param);
+    std::string nm = fp ? (fp->name.txt ? *fp->name.txt : "_") : "*";
+    Ident pid = fresh(nm);
+    bool had = module_ident_.count(nm); Ident oldid = had ? module_ident_[nm] : Ident{};
+    auto oldlay = module_layout_[nm];
+    if (fp && fp->type) { module_ident_[nm] = pid; register_sig_layouts(nm, *fp->type); }
+    fn->params.push_back({pid, ValueKind::Gen});
+    LamPtr body = compile_module_expr(*pf_a->body);
+    std::vector<std::string> src = module_result_layout(*pf_a->body);
+    fn->body = body;
+    if (is_pure_path(body) && !src.empty() && src != target) {  // direct projection
+      bool ok = true;
+      for (auto& t : target) if (std::find(src.begin(), src.end(), t) == src.end()) ok = false;
+      if (ok) {
+        std::vector<LamPtr> fs;
+        for (auto& t : target) {
+          int idx = 0;
+          for (int i = 0; i < (int)src.size(); ++i) if (src[i] == t) { idx = i; break; }
+          auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut; fr->prim_arg = idx;
+          fr->args = {body};
+          fs.push_back(fr);
+        }
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+        blk->args = std::move(fs); fn->body = blk;
+      }
+    }
+    if (had) module_ident_[nm] = oldid; else module_ident_.erase(nm);
+    module_layout_[nm] = oldlay;
+    return fn;
+  }
+  // The head functor's binding name and the 0-based index of THIS application's
+  // argument (counting nested applies in `f`), for looking up the formal param.
+  std::pair<std::string, int> functor_head_arg_index(const ModuleExpr& f) {
+    int depth = 0;
+    const ModuleExpr* m = &f;
+    for (;;) {
+      if (auto* pa = std::get_if<Pmod_apply>(&m->desc)) { ++depth; m = pa->f.get(); continue; }
+      if (auto* pu = std::get_if<Pmod_apply_unit>(&m->desc)) { ++depth; m = pu->f.get(); continue; }
+      break;
+    }
+    std::string nm;
+    if (auto* pi = std::get_if<Pmod_ident>(&m->desc))
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) nm = l->name;
+    return {nm, depth};
+  }
   // Compile a functor application `F(Arg)` with ocamlc's coercion: the argument is
   // projected (by field name, via field_mut) to F's parameter signature when it
   // has extra/reordered fields, and a global-path operand is bound to an (unused)
@@ -9363,6 +9440,18 @@ struct Translator {
       }
     }
     if (!fval) fval = compile_module_expr(*pa.f);
+    // A FUNCTOR-typed formal parameter (a higher-order functor like Set's PowerSet
+    // SetOrd): coerce the functor argument's RESULT to the declared result sig.
+    {
+      auto [hnm, aidx] = functor_head_arg_index(*pa.f);
+      if (!hnm.empty())
+        if (auto it = functor_param_types_.find(hnm); it != functor_param_types_.end())
+          if (aidx < (int)it->second.size() && it->second[aidx])
+            if (std::get_if<Pmty_functor>(&it->second[aidx]->desc))
+              if (LamPtr c = compile_coerced_functor_arg(*pa.arg, *it->second[aidx])) {
+                auto ap = mk(Lam::K::Apply); ap->fn = fval; ap->args = {c}; return ap;
+              }
+    }
     // A struct-LITERAL argument with a known parameter signature is coerced with
     // nested module-member coercion (`module Ops = Int32` -> the param's Ops sub-
     // sig), which the flat projection below can't do.
@@ -10186,6 +10275,7 @@ struct Translator {
             functor_result_[*mb.name.txt] = module_result_layout(mb.expr);  // for Make(..)
             functor_param_[*mb.name.txt] = functor_param_layout(mb.expr);   // for arg coercion
             if (auto* pt = functor_param_type(mb.expr)) functor_param_sig_[*mb.name.txt] = pt;
+            functor_param_types_[*mb.name.txt] = functor_param_types(mb.expr);  // all params
             add_export(*mb.name.txt, mid);
           } else {  // module M = F(X) / M2 / (M : S) / (val x): bind + layout
             LamPtr mv = compile_module_expr(mb.expr);
