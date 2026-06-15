@@ -7550,6 +7550,18 @@ struct Translator {
         l->prim_arg = 0; l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }
+      // A module-qualified field `e.M.label <- v` of a cross-module record
+      // (mirrors the read path -- without this the set silently became a no-op).
+      if (auto* d = std::get_if<Ldot>(&sf->field.txt.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (auto rf = stdlib_record_field(pl->name, d->name)) {
+            auto l = mk(Lam::K::Prim);
+            l->prim = rf->flat                 ? Prim::SetFloatfield
+                      : rf->kind == ValueKind::Int ? Prim::SetfieldImm
+                                                   : Prim::SetfieldPtr;
+            l->prim_arg = rf->index; l->args = {expr(*sf->obj), expr(*sf->value)};
+            return l;
+          }
       // An unqualified stdlib-record label via the base's inferred type.
       if (auto rf = inferred_record_field(sf->obj.get(), lid_last(sf->field.txt))) {
         auto l = mk(Lam::K::Prim);
