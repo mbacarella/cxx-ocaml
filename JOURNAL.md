@@ -2751,3 +2751,20 @@ Self-host now covers: values, type names (abstract/manifest/parametric),
 variant constructors (construct+match), and record fields (read+write), all
 cross-module.  NEXT: qualified Pdot types in emitted signatures (a value of
 type `OtherMod.t`), then the stdlib bootstrap probe.
+
+## Bootstrap step: externals (Val_prim) in the .cmi (2026-06-15)
+
+Probed the stdlib bootstrap: simple stdlib modules (bool/char/option/result/
+unit/float/int) all compile to .cmo+.cmi with c++ocamlc.  Found the next gap by
+USING one: `bool.ml` renamed Mybool -> a dependent calling Mybool.not segfaulted,
+because the writer recorded every value as Val_reg -- so an `external f="%prim"`
+looked like a regular module field (it has none; externals inline as the prim).
+
+Fix: Pstr_primitive -> Sig_value with val_kind = Val_prim(Primitive.description
+{prim_name; arity; alloc; native_name; native_repr_args[len=arity]; res}).
+Val_prim takes no field, so the .cmo's value layout is preserved.  Now Mybool's
+externals are usable: to_string/not(%boolnot)/compare -> true/false/1.
+
+exec 99.7% (flaky), completeness 100%, no regression.  NEXT: qualified Pdot
+types in signatures (value of type OtherMod.t), then push more stdlib modules
+through (records/variants/externals all supported now) toward a real bootstrap.
