@@ -2875,6 +2875,27 @@ struct Translator {
       // application (`Array.init n @@ g`) ocamlc's lapply merges the arg into it
       // (`(apply Array.init n g)`, not a nested `(apply (apply ..) g)`).
       LamPtr fn = expr(*as[fi].second);
+      // When `f` is a bare primitive identifier (`ignore`, `Sys.opaque_identity`,
+      // ...) it translates to an eta `stub` closure; the pipe then saturates that
+      // arity-1 stub.  Applying the stub allocates one closure per call (15M
+      // words in pr7798's `x |> ignore` loops).  Instead lower the application
+      // `f x` directly, so the primitive is applied without the stub -- which is
+      // also what translprim emits.
+      if (fn->k == Lam::K::Function && fn->inline_attr == "stub" &&
+          fn->params.size() == 1 &&
+          std::holds_alternative<Pexp_ident>(as[fi].second->desc)) {
+        auto& asm_ = const_cast<std::vector<std::pair<ArgLabel, ExprBox>>&>(as);
+        Expression synth; synth.loc = e.loc;
+        Pexp_apply sa;
+        sa.fn = std::move(asm_[fi].second);
+        sa.args.emplace_back(Nolabel{}, std::move(asm_[xi].second));
+        synth.desc = std::move(sa);
+        LamPtr r = expr(synth);
+        auto& sap = std::get<Pexp_apply>(synth.desc);  // restore the moved boxes
+        asm_[fi].second = std::move(sap.fn);
+        asm_[xi].second = std::move(sap.args[0].second);
+        return r;
+      }
       return lapply_(fn, {expr(*as[xi].second)});
     }
     if (prim == "%lazy_force" && as.size() == 1) return force_lazy(expr(*as[0].second));
