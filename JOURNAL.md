@@ -2307,3 +2307,37 @@ a two-param functor over stdlib modtypes (`Test(H:Hashtbl.SeededS)(M:Map.S
 with type key=H.key)`) -- it now runs deep ("Random integers, large range")
 then crashes on a specific op.  These need functor PARAMETER coercion (the
 arg is a module ident / functor, not a struct literal) -- a future push.
+
+## Exec parity 690->694: optional-arg defaults + cu_required_compunits (2026-06-15)
+
+Two general fixes from triaging the exec DIFFs (4 flaky-OK -> real ~698):
+
+1. **Optional-arg defaults with non-var patterns.**  The optional-default
+   machinery only fired for `Ppat_var`, so `?x:(_ = failwith "1")` (max_arity)
+   and `?opt:(() = def ..)` (syntactic_arity) never RAN their defaults.
+   ocamlc: `_` -> `(seq (if *opt* (field0) d) ..)` (effect, discard); `()`/
+   irrefutable -> `(let (*match* = if *opt* (field0) d) ..)` (unannotated temp
+   + destructure).  Flips max_arity.ml; fixes syntactic_arity's stdout (it
+   still crashes later on a first-class-module PATTERN, a separate feature).
+
+2. **cu_required_compunits for C-external modules.**  A unit calling
+   `Gc.minor_words` (= caml_gc_minor_words, a Ccall with no getglobal) recorded
+   NO dependency on Stdlib__Gc, so the linker never pulled Gc -> not its chain
+   (Fun -> Printexc).  Without Printexc linked its uncaught handler isn't
+   registered, so an escaping Assert_failure printed the generic
+   `Assert_failure(..)` instead of `File "..", characters C-C': Assertion
+   failed`.  Like ocamlc's Translprim.get_used_primitives, record each used C
+   external's declaring module (prim_to_mod_ in fields_of) and emit them as
+   cu_required_compunits.  Matches ocamlc's link set EXACTLY -> Printexc is
+   linked precisely when the oracle links it (0 format regressions).  Flips
+   struct_include_optimisation.ml.
+
+exec **690 -> 694/722 (96.1%)**, lambda 419, completeness 100%, 0 regressions.
+
+Remaining exec DIFFs are deep subsystems: objects/translclass (names, pr2195,
+mixin2, pr6922, locs, patmatch, fstclassmod), higher-order functors (sets,
+htbl), bigarray (bigarrays x2, floatarray, testvectors), memprof (custom,
+intern, lists_in_minor), effects (shallow2deep), TMC (semantic), recmod
+(t22ok needs recmod-class inherit), exact-GC asserts (pr7798 - impractical),
+domains (test_generator), first-class-module patterns (syntactic_arity), weak
+(ephetest3), Arg.parse (sorts).
