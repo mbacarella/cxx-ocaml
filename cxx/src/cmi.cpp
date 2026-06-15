@@ -2,8 +2,10 @@
 #include "cppcaml/omarshal.hpp"
 #include "cppcaml/blake2.hpp"
 
+#include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <unordered_map>
 
 namespace cppcaml::cmi {
@@ -677,12 +679,72 @@ int predef_stamp(const std::string& n) {
   return it == s.end() ? 0 : it->second;
 }
 
+// --- module resolution (for qualified `M.t` Tconstr paths + import CRCs) -----
+std::string g_stdlib_dir = "stdlib";
+std::vector<std::string> g_module_dirs;
+
+// A source module head ("Buffer", "List", a local "A") -> its compilation-unit
+// global ("Stdlib__Buffer", "A").  Mirrors lambda's global_of.
+std::string global_of(const std::string& mod) {
+  if (mod == "Stdlib" || mod.rfind("Stdlib__", 0) == 0) return mod;
+  if (mod.rfind("Camlinternal", 0) == 0) return mod;
+  if (std::filesystem::exists(g_stdlib_dir + "/stdlib__" + mod + ".cmi"))
+    return "Stdlib__" + mod;
+  return mod;  // a separately-compiled local module
+}
+
+// A compilation-unit global -> its .cmi path.  Mirrors lambda's resolve_cmi but
+// keyed by the already-resolved global name.
+std::string resolve_cmi_global(const std::string& g) {
+  if (g == "Stdlib") return g_stdlib_dir + "/stdlib.cmi";
+  if (g.rfind("Stdlib__", 0) == 0)
+    return g_stdlib_dir + "/stdlib__" + g.substr(8) + ".cmi";
+  if (g.rfind("Camlinternal", 0) == 0)
+    return g_stdlib_dir + "/" + (char)std::tolower((unsigned char)g[0]) + g.substr(1) + ".cmi";
+  std::string low = (char)std::tolower((unsigned char)g[0]) + g.substr(1);
+  for (const std::string& d : g_module_dirs) {
+    if (std::filesystem::exists(d + "/" + low + ".cmi")) return d + "/" + low + ".cmi";
+    if (std::filesystem::exists(d + "/" + g + ".cmi")) return d + "/" + g + ".cmi";
+  }
+  return g_stdlib_dir + "/stdlib__" + g + ".cmi";
+}
+
+// Read a .cmi's own interface CRC (the first crcs entry, whose name is the
+// module itself).  Empty on any failure -- the caller then omits the import.
+std::string read_cmi_self_crc(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return "";
+  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+  std::size_t off = 0;
+  for (; off + 4 <= bytes.size(); ++off)
+    if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
+        (bytes[off + 3] == 0xBE || bytes[off + 3] == 0xBF || bytes[off + 3] == 0xBD))
+      break;
+  if (off + 4 > bytes.size()) return "";
+  try {
+    m::Arena arena;
+    m::read_value(bytes.data(), bytes.size(), off, arena);          // header
+    std::size_t crcs = m::read_value(bytes.data(), bytes.size(), off, arena);  // crc list
+    const m::Value& cell = arena[crcs];                             // first cons cell
+    if (cell.kind != m::Value::Kind::Block || cell.fields.size() < 1) return "";
+    const m::Value& entry = arena[cell.fields[0]];                  // (name, crc option)
+    if (entry.kind != m::Value::Kind::Block || entry.fields.size() < 2) return "";
+    const m::Value& crcopt = arena[entry.fields[1]];               // None=Int 0 / Some=Block{str}
+    if (crcopt.kind != m::Value::Kind::Block || crcopt.fields.empty()) return "";
+    return arena[crcopt.fields[0]].str;
+  } catch (const std::exception&) {
+    return "";
+  }
+}
+
 // Build the omarshal value graph for one exported value's type.  `id` is a
 // per-item counter for the cosmetic type_expr id field; `vars` shares Tvar
 // nodes of equal identity (so `'a -> 'a` is one node, used twice).
 struct TyEmit {
   long long id = -2;
   std::unordered_map<int, o::ValPtr> vars;
+  std::set<std::string>* referenced = nullptr;  // global module names cited by Pdot
   o::ValPtr texpr(o::ValPtr desc) {  // type_expr = {desc; level; scope; id}
     return o::vblock(0, {desc, o::vint(GENERIC_LEVEL), o::vint(0), o::vint(id--)});
   }
@@ -695,13 +757,31 @@ struct TyEmit {
         return te;
       }
       case Ty::Constr: {
-        // Only PREDEFINED constructors are emitted as a real Tconstr (with the
-        // predef.ml stamp, possibly with type args: `int list`, `'a option`).
-        // A qualified or user-defined name we can't yet place becomes an opaque
-        // Tvar -- valid, just over-general.  (Pdot / local type decls: the climb.)
-        int st = predef_stamp(t->name);
-        if (!st) return texpr(o::vblock(0, {o::vint(0)}));  // unknown -> Tvar None
-        auto path = o::vblock(0, {o::vblock(3, {o::vstr(t->name), o::vint(st)})});  // Pident(Predef)
+        // A qualified name (`Buffer.t`, `A.Inner.t`) emits a Tconstr whose path
+        // is Pdot(...Pdot(Pident(Global head), mid)..., typename), with `head`
+        // resolved to its compilation-unit global; the cited unit is recorded so
+        // write_cmi can list it (with its CRC) among the imports.  A predefined
+        // name emits Pident(Predef) with the predef.ml stamp.  Anything else (a
+        // bare user/local type we can't yet place) degrades to an opaque Tvar --
+        // valid, just over-general.
+        o::ValPtr path;
+        if (auto dot = t->name.find('.'); dot != std::string::npos) {
+          std::vector<std::string> comps;
+          for (std::size_t i = 0, j; i <= t->name.size(); i = j + 1) {
+            j = t->name.find('.', i);
+            if (j == std::string::npos) j = t->name.size();
+            comps.push_back(t->name.substr(i, j - i));
+          }
+          std::string g = global_of(comps[0]);
+          if (referenced) referenced->insert(g);
+          path = o::vblock(0, {o::vblock(2, {o::vstr(g)})});  // Pident(Global head)
+          for (std::size_t i = 1; i < comps.size(); ++i)
+            path = o::vblock(1, {path, o::vstr(comps[i])});   // Pdot(path, comp)
+        } else if (int st = predef_stamp(t->name)) {
+          path = o::vblock(0, {o::vblock(3, {o::vstr(t->name), o::vint(st)})});  // Pident(Predef)
+        } else {
+          return texpr(o::vblock(0, {o::vint(0)}));  // unknown -> Tvar None
+        }
         std::vector<o::ValPtr> as;
         for (auto& a : t->args) as.push_back(emit(a));
         auto abbrev = o::vblock(0, {o::vint(0)});  // ref Mnil
@@ -737,12 +817,14 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
 // Marshal a list of signature items (recursive: a submodule's items nest under
 // Mty_signature).  Stamps are arbitrary local-ident ids (a fresh counter per
 // signature is fine -- consumers refer to names, not stamps).
-static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items);
-static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items) {
+static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
+                                             std::set<std::string>& referenced);
+static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
+                                             std::set<std::string>& referenced) {
   int stamp = 300;
   std::vector<o::ValPtr> sig;
   for (auto& it : items) {
-    TyEmit te;
+    TyEmit te; te.referenced = &referenced;
     auto ident = o::vblock(0, {o::vstr(it.name), o::vint(stamp++)});  // Ident.Local{name;stamp}
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
@@ -766,7 +848,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items) 
       // Sig_module(id, Mp_present, module_declaration, rec_status, visibility).
       // A submodule takes a runtime field, so it must appear in the signature
       // to keep the surrounding value field layout aligned.
-      auto mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub))});  // Mty_signature
+      auto mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced))});  // Mty_signature
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                               o::vint(0) /*md_uid*/});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(0) /*Mp_present*/, md,
@@ -826,7 +908,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items) 
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
                       const std::vector<Import>& imports) {
-  auto header = o::vblock(0, {o::vstr(modname), o::vlist(emit_sig_items(items))});
+  std::set<std::string> referenced;  // global units cited by qualified Tconstrs
+  auto header = o::vblock(0, {o::vstr(modname), o::vlist(emit_sig_items(items, referenced))});
   std::vector<std::uint8_t> hbytes = o::marshal(header);
 
   const std::string MAGIC = "Caml1999I038";
@@ -837,7 +920,19 @@ std::string write_cmi(const std::string& path, const std::string& modname,
 
   auto crc_opt = [](const std::string& c) { return o::vblock(0, {o::vstr(c)}); };  // Some
   std::vector<o::ValPtr> crcs = {o::vblock(0, {o::vstr(modname), crc_opt(self_crc)})};
-  for (auto& im : imports) crcs.push_back(o::vblock(0, {o::vstr(im.name), crc_opt(im.crc)}));
+  std::set<std::string> seen = {modname};
+  for (auto& im : imports) {
+    if (!seen.insert(im.name).second) continue;
+    crcs.push_back(o::vblock(0, {o::vstr(im.name), crc_opt(im.crc)}));
+  }
+  // Units cited by qualified types (`Buffer.t`): import each with its real CRC,
+  // read from its .cmi, so the interface stays self-consistent.
+  for (const std::string& g : referenced) {
+    if (!seen.insert(g).second) continue;
+    std::string crc = read_cmi_self_crc(resolve_cmi_global(g));
+    if (crc.empty()) continue;  // can't locate it -> omit (still valid)
+    crcs.push_back(o::vblock(0, {o::vstr(g), crc_opt(crc)}));
+  }
   std::vector<std::uint8_t> cbytes = o::marshal(o::vlist(crcs));
 
   // flags = [Alerts <empty map>]  (Alerts is the lone single-arg pers_flags ctor)
@@ -848,6 +943,12 @@ std::string write_cmi(const std::string& path, const std::string& modname,
   out.write(reinterpret_cast<const char*>(cbytes.data()), cbytes.size());
   out.write(reinterpret_cast<const char*>(fbytes.data()), fbytes.size());
   return self_crc;
+}
+
+void set_module_dirs(const std::string& stdlib_dir,
+                     const std::vector<std::string>& dirs) {
+  g_stdlib_dir = stdlib_dir;
+  g_module_dirs = dirs;
 }
 
 std::string write_cmi(const std::string& path, const std::string& modname,

@@ -241,6 +241,12 @@ inline SigItem sig_record(std::string n, std::vector<TyPtr> ps, std::vector<Labe
   return {SigItem::Type, std::move(n), nullptr, std::move(ps), nullptr, {}, std::move(ls)};
 }
 
+// Configure how the writer resolves a referenced module name (`Buffer` in a
+// `Buffer.t` type) to its compilation-unit global (`Stdlib__Buffer`) and to its
+// .cmi file (for the import CRC).  Mirrors lambda's resolve_cmi/global_of.
+void set_module_dirs(const std::string& stdlib_dir,
+                     const std::vector<std::string>& dirs);
+
 // Write magic + marshal(name,sign) + BLAKE128 self-CRC + marshal(crcs) +
 // marshal(flags) to `path`.  `imports` are the non-self interfaces (self is
 // prepended automatically with the computed CRC).  Returns the self-CRC.
