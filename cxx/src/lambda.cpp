@@ -1178,6 +1178,25 @@ struct Translator {
     }
     return {base, key};
   }
+  // `M.E` / `A.B.E`: a constructor qualified by a bound local module whose
+  // layout EXPORTS it (an exception or extension constructor -- regular variant
+  // constructors are type-level, not module fields).  Returns the constructor's
+  // identity value `(field_imm i M)`, which distinguishes same-named extension
+  // constructors that live in different modules (`M1.E` vs `M2.E`).  Null when
+  // the prefix isn't a bound module path or doesn't export the name.
+  LamPtr module_ctor_identity(const Longident& id) {
+    auto* dq = std::get_if<Ldot>(&id.v);
+    if (!dq) return nullptr;
+    std::string prefix;
+    if (!lid_to_dotted(*dq->prefix, prefix)) return nullptr;
+    ModPath mp = resolve_module_path(prefix);
+    if (!mp.base) return nullptr;
+    auto li = module_layout_.find(mp.key);
+    if (li == module_layout_.end()) return nullptr;
+    auto fi = li->second.find(dq->name);
+    if (fi == li->second.end()) return nullptr;
+    return fieldimm(fi->second, mp.base);
+  }
   // The package module-type name of `(module .. : S)` / `(e : (module S))` /
   // an ident bound to one; empty if `e` isn't a first-class-module package.
   std::string expr_pack_modtype(const Expression& e0) {
@@ -3847,7 +3866,10 @@ struct Translator {
         return expr(*c.rhs);
       }
       if (auto* k = std::get_if<Ppat_construct>(&lhsp->desc)) {
-        LamPtr id0 = exn_value(lid_last(k->id.txt));
+        // a module-qualified exception/extension ctor resolves to that module's
+        // own field first (distinguishes `M1.E` from `M2.E`); else the binder.
+        LamPtr id0 = module_ctor_identity(k->id.txt);
+        if (!id0) id0 = exn_value(lid_last(k->id.txt));
         // A stdlib module's exception (`Lazy.Undefined`): its identity is the
         // module's runtime export field.  A LOCAL module's (incl. one spliced
         // in by `include Stack` -- `with S.Empty ->`): its layout field.
@@ -5933,7 +5955,10 @@ struct Translator {
     }
     auto* k = std::get_if<Ppat_construct>(&lp->desc);
     std::string n = lid_last(k->id.txt);
-    LamPtr idv = exn_value(n);
+    // a module-qualified extension ctor (`M1.E`) tests that module's own field,
+    // so distinct same-named ctors in sibling modules stay distinct.
+    LamPtr idv = module_ctor_identity(k->id.txt);
+    if (!idv) idv = exn_value(n);
     if (!idv) return nullptr;
     LamPtr lhs = k->arg ? fieldimm(0, sv()) : sv();
     std::vector<PayloadTest> ptests;
@@ -6693,10 +6718,15 @@ struct Translator {
         // (the value itself when nullary, else field 0), like ext_match -- so a
         // pattern containing one (`Some B`, `(Some A|Some B), A`) matches in the
         // multi-column naive matcher instead of bailing.
-        if (exn_ident_.count(cn) || exn_field_.count(cn)) {
+        if (exn_ident_.count(cn) || exn_field_.count(cn) ||
+            module_ctor_identity(k->id.txt)) {
           int arity = exn_arity_.count(cn) ? exn_arity_[cn] : (k->arg ? 1 : 0);
+          // a module-qualified extension constructor (`M1.E`) compares against
+          // that module's own field, not the last same-named binder
+          LamPtr ident = module_ctor_identity(k->id.txt);
+          if (!ident) ident = exn_value(cn);
           auto t = mk(Lam::K::Prim); t->prim = Prim::IntCmp; t->prim_id = "==";
-          t->args = {k->arg ? fieldimm(0, acc) : acc, exn_value(cn)};
+          t->args = {k->arg ? fieldimm(0, acc) : acc, ident};
           test = if_and(test, t);
           if (k->arg) {  // args at field 1.. (field 0 is the identity)
             auto* at = std::get_if<Ppat_tuple>(&effective_pat(k->arg->get())->desc);
@@ -7504,6 +7534,24 @@ struct Translator {
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       std::string n = lid_last(k->id.txt);
+      // a constructor qualified by a bound module that exports it (an exception /
+      // extension constructor): read its identity from that module's block, so
+      // `M1.E` and `M2.E` (distinct `type t += E`) stay distinct.
+      if (LamPtr cid = module_ctor_identity(k->id.txt)) {
+        if (!k->arg) return cid;  // nullary: the identity value itself
+        int arity = exn_arity_.count(n) ? exn_arity_[n] : 1;  // applied: block tag 0
+        std::vector<const Expression*> fs;
+        if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+            at && arity > 1 && (int)at->elems.size() == arity)
+          for (auto& el : at->elems) fs.push_back(el.get());
+        else fs.push_back(k->arg->get());
+        std::vector<LamPtr> fields = {cid};
+        std::vector<ValueKind> shape = {ValueKind::Gen};
+        for (auto* ex : fs) { fields.push_back(expr(*ex)); shape.push_back(expr_kind(ex)); }
+        auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
+        b->args = std::move(fields); b->blk_shape = std::move(shape);
+        return b;
+      }
       // an `[@@unboxed]` constructor is a no-op wrapper: its value is its argument
       if (auto ci = ctor_info_.find(n); ci != ctor_info_.end() && ci->second.unboxed && k->arg)
         return expr(**k->arg);
@@ -9230,6 +9278,12 @@ struct Translator {
     struct OptDef { Ident xid, optid; const Expression* def; ValueKind k; bool discard = false; };
     std::vector<OptDef> optdefs;
     const Pattern* refut = nullptr; Ident refut_pid; Location refut_loc; int nrefut = 0;
+    // A `(module M : S)` parameter shadows S's variant / extension constructors to
+    // the parameter's own fields (so `M.E` reads `(field_imm i M)`, not a sibling
+    // module's same-named ctor); restored when the function scope closes.
+    std::vector<SigExtSave> fcm_ext_saves;
+    std::vector<SigCtorSave> fcm_ctor_saves;
+    auto restore_fcm = [&] { restore_sig_exts(fcm_ext_saves); restore_sig_ctors(fcm_ctor_saves); };
     for (auto& fp : f.params)
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
         const Pattern* pat = &pv->pat;
@@ -9266,7 +9320,18 @@ struct Translator {
           module_ident_[*up->name.txt] = id;
           if (up->pkg) {  // `(module X : S)`: members resolve via S's layout
             std::string mt;
-            if (lid_to_dotted(up->pkg->path.txt, mt)) register_pack_layouts(*up->name.txt, mt);
+            if (lid_to_dotted(up->pkg->path.txt, mt)) {
+              register_pack_layouts(*up->name.txt, mt);
+              // S's own variant / extension constructors resolve to this param's
+              // fields (`M.E` -> `(field_imm i M)`), shadowing siblings'.
+              std::string last = mt.substr(mt.rfind('.') + 1);
+              if (auto a = modtype_ast_.find(last); a != modtype_ast_.end()) {
+                auto cs = register_sig_ctors(*a->second);
+                fcm_ctor_saves.insert(fcm_ctor_saves.end(), cs.begin(), cs.end());
+                auto es = register_sig_exts(*up->name.txt, id, *a->second);
+                fcm_ext_saves.insert(fcm_ext_saves.end(), es.begin(), es.end());
+              }
+            }
           }
         } else if (is_irrefutable(*pat)) {
           Ident pid = fresh("param");
@@ -9320,6 +9385,7 @@ struct Translator {
           l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
           l->body = wrap_optdefs(wrap_binders(expr(*fc->cases[0].rhs), binders));
+          restore_fcm();
           scope.pop_back();
           return l;
         }
@@ -9329,6 +9395,7 @@ struct Translator {
           auto pvar = mk(Lam::K::Var); pvar->var = pid;
           collect_binders(*pat, pvar, binders);
           l->body = wrap_optdefs(wrap_binders(expr(*fc->cases[0].rhs), binders));
+          restore_fcm();
           scope.pop_back();
           return l;
         }
@@ -9348,6 +9415,7 @@ struct Translator {
     } else {
       l->body = mk(Lam::K::ConstInt);
     }
+    restore_fcm();
     scope.pop_back();
     return l;
   }
