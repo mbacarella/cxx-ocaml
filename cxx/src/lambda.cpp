@@ -9215,10 +9215,61 @@ struct Translator {
     for (size_t i = 0; i < a.size(); ++i) { if (i) r += " "; r += a[i]; }
     return r;
   }
+  // Does `l` reach a function application through tail positions?  A cons whose
+  // TAIL argument does is the recursive call that `[@tail_mod_cons]` delays.
+  static bool tail_reaches_apply(const LamPtr& l) {
+    if (!l) return false;
+    switch (l->k) {
+      case Lam::K::Apply: return true;
+      case Lam::K::Sequence: return tail_reaches_apply(l->else_);
+      case Lam::K::Let: case Lam::K::Letrec: return tail_reaches_apply(l->body);
+      case Lam::K::IfThenElse:
+        return tail_reaches_apply(l->then_) || tail_reaches_apply(l->else_);
+      default: return false;
+    }
+  }
+  // Partial `[@tail_mod_cons]`: a cons in TAIL position whose tail argument leads
+  // to a (recursive) call is what TMC transforms; ocamlc's transform evaluates
+  // the constructor's OTHER arguments before the tail recursion (head-first),
+  // whereas a plain cons evaluates right-to-left.  We don't do the full
+  // destination-passing transform (no extra stack safety), but we DO reproduce
+  // the observable evaluation order by binding the head to a temp first.
+  LamPtr tmc_head_first(LamPtr l) {
+    if (!l) return l;
+    switch (l->k) {
+      case Lam::K::IfThenElse:
+        l->then_ = tmc_head_first(l->then_); l->else_ = tmc_head_first(l->else_); return l;
+      case Lam::K::Sequence: l->else_ = tmc_head_first(l->else_); return l;
+      case Lam::K::Let: case Lam::K::Letrec: l->body = tmc_head_first(l->body); return l;
+      case Lam::K::Catch:
+        l->cond = tmc_head_first(l->cond); l->then_ = tmc_head_first(l->then_); return l;
+      case Lam::K::Switch:
+        for (auto& c : l->sw_consts) c.body = tmc_head_first(c.body);
+        for (auto& c : l->sw_blocks) c.body = tmc_head_first(c.body);
+        if (l->sw_default) l->sw_default = tmc_head_first(l->sw_default);
+        return l;
+      case Lam::K::Prim:
+        if (l->prim == Prim::Makeblock && l->prim_arg == 0 && l->args.size() == 2 &&
+            tail_reaches_apply(l->args[1]) && !is_const(l->args[0]) &&
+            l->args[0]->k != Lam::K::Var) {
+          Ident h = fresh("");  // an unnamed temp forcing head-before-tail eval
+          auto let = mk(Lam::K::Let);
+          let->bindings = {{h, ValueKind::Gen, l->args[0]}};
+          l->args[0] = varof(h);
+          let->body = l;
+          return let;
+        }
+        return l;
+      default: return l;
+    }
+  }
   // Stamp a function value with its binding's annotations, if any.
   LamPtr with_inline(LamPtr v, const Attributes& attrs) {
     if (v && v->k == Lam::K::Function)
-      if (auto ia = fn_attrs(attrs); !ia.empty()) v->inline_attr = ia;
+      if (auto ia = fn_attrs(attrs); !ia.empty()) {
+        v->inline_attr = ia;
+        if (has_attr(attrs, "tail_mod_cons")) v->body = tmc_head_first(v->body);
+      }
     return v;
   }
 
