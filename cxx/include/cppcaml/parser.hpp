@@ -20,6 +20,8 @@ ast::Structure parse_structure(std::string_view src);
 // Variant that also reports the filenames named by `# N "file"` directives
 // (in file_id order: directive_files[k] is file_id k+1).
 ast::Structure parse_structure(std::string_view src, std::vector<std::string>& directive_files);
+// Parse an interface (.mli signature). `src` must outlive the call.
+ast::Signature parse_signature(std::string_view src);
 
 namespace ast {
 // Render a structure in `ocamlc -dparsetree` format (see ast_print.cpp).

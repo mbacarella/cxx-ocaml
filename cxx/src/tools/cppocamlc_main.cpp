@@ -96,6 +96,27 @@ int main(int argc, char** argv) {
   if (!in) { std::cerr << "c++ocamlc: cannot open " << in_path << '\n'; return 2; }
   std::ostringstream ss; ss << in.rdbuf();
 
+  // 0. an interface (.mli): build the .cmi from the hand-written signature
+  //    (verbatim types, no inference) and stop -- no .cmo, no link.
+  if (in_path.size() >= 4 && in_path.compare(in_path.size() - 4, 4, ".mli") == 0) {
+    fs::path p(in_path);
+    std::string cmi_out =
+        (!out_path.empty() && fs::path(out_path).extension() == ".cmi")
+            ? out_path
+            : (p.parent_path() / (p.stem().string() + ".cmi")).string();
+    try {
+      auto sig = cppcaml::parse_signature(ss.str());
+      cppcaml::cmi::cmiw::write_cmi(cmi_out, mod, cppcaml::signature_to_cmi(sig));
+    } catch (const cppcaml::ParseError& e) {
+      std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
+      return 1;
+    } catch (const std::exception& e) {
+      std::cerr << "c++ocamlc: " << in_path << ": .cmi write failed: " << e.what() << '\n';
+      return 1;
+    }
+    return 0;
+  }
+
   // 1. compile source -> .cmo
   bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
   using clk = std::chrono::steady_clock;
@@ -123,10 +144,15 @@ int main(int argc, char** argv) {
     lap("write_cmo", tp);
     // Emit the interface (.cmi) next to the .cmo, from the inferred top-level
     // value signature, so dependents can be compiled separately against it.
+    // BUT if a hand-written .mli exists for this unit, its .cmi is authoritative
+    // (it may hide values or abstract types) -- like ocamlc, don't clobber it
+    // from inference; it is compiled separately from the .mli.
     // Best-effort while the writer is young: never let it break the .cmo / link.
     try {
       fs::path cmi_path = fs::path(cmo).replace_extension(".cmi");
-      cppcaml::cmi::cmiw::write_cmi(cmi_path.string(), mod, cppcaml::infer_signature(structure));
+      bool has_mli = fs::exists(fs::path(in_path).replace_extension(".mli"));
+      if (!has_mli)
+        cppcaml::cmi::cmiw::write_cmi(cmi_path.string(), mod, cppcaml::infer_signature(structure));
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
     }

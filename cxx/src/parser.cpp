@@ -158,6 +158,7 @@ class Parser {
   }
 
   Structure parse_structure() { return parse_structure_until(Kind::TEOF); }
+  Signature parse_signature() { return parse_signature_until(Kind::TEOF); }
   Structure parse_structure_until(Kind stop) {
     // Boundary positions for extra_str: first/last item, or (empty structure) the
     // previous token's end ($startpos of an empty production).
@@ -4711,6 +4712,7 @@ class Parser {
 }  // namespace
 
 Structure parse_structure(std::string_view src) { return Parser(src).parse_structure(); }
+Signature parse_signature(std::string_view src) { return Parser(src).parse_signature(); }
 Structure parse_structure(std::string_view src, std::vector<std::string>& directive_files) {
   Parser p(src);
   Structure s = p.parse_structure();

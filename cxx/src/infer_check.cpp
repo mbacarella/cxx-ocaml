@@ -2609,6 +2609,83 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
   return cmi::cmiw::ty_var(nextvar++);
 }
 
+// Convert a run of `type ... and ...` declarations (shared by structure and
+// signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
+static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
+                            std::vector<cmi::cmiw::SigItem>& out) {
+  for (auto& d : decls) {
+    std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
+    std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
+    std::vector<cmi::cmiw::TyPtr> params;
+    for (auto& p : d.params) params.push_back(bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar));
+    // A variant type: emit its constructors (Cstr_tuple args; record-args and
+    // GADT results are dropped to a no-arg ctor for now -- still valid).
+    if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
+      std::vector<cmi::cmiw::Ctor> ctors;
+      for (auto& c : var->ctors) {
+        cmi::cmiw::Ctor cc; cc.name = c.name.txt;
+        if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
+          for (auto& a : tup->elems) cc.args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
+        ctors.push_back(std::move(cc));
+      }
+      out.push_back(cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors)));
+      continue;
+    }
+    if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
+      std::vector<cmi::cmiw::Label> labels;
+      for (auto& f : rec->fields) {
+        cmi::cmiw::Label lab;
+        lab.name = f.name.txt;
+        lab.mut = (f.mut == MutableFlag::Mutable);
+        lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
+        labels.push_back(std::move(lab));
+      }
+      out.push_back(cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels)));
+      continue;
+    }
+    cmi::cmiw::TyPtr manifest = nullptr;
+    if (d.manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
+    out.push_back(cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest));
+  }
+}
+
+// Build a .cmi signature from a hand-written interface (.mli) -- the explicit
+// path, used when an interface file exists.  Types are taken verbatim from the
+// declarations (no inference); local type names are pre-registered so qualified
+// and same-module references resolve.
+std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
+  Checker ck;
+  ck.record_kinds_ = true;
+  for (auto& it : s)  // pre-register type names (for arity / local references)
+    if (auto* pt = std::get_if<Psig_type>(&it.desc))
+      for (auto& d : pt->decls) ck.register_type_decl(d);
+  std::vector<cmi::cmiw::SigItem> out;
+  for (auto& it : s) {
+    if (auto* pv = std::get_if<Psig_value>(&it.desc)) {
+      if (!pv->vd.type) continue;
+      std::unordered_map<std::string, TypePtr> tvars;
+      std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
+      out.push_back(cmi::cmiw::sig_value(pv->vd.name.txt,
+                      bridge_ty(ck.from_coretype(*pv->vd.type, tvars), bvars, nextvar)));
+    } else if (auto* pr = std::get_if<Psig_primitive>(&it.desc)) {
+      if (pr->pd.type && !pr->pd.prims.empty()) {
+        std::unordered_map<std::string, TypePtr> tvars;
+        std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
+        auto ty = bridge_ty(ck.from_coretype(*pr->pd.type, tvars), bvars, nextvar);
+        std::string native = pr->pd.prims.size() > 1 ? pr->pd.prims[1] : "";
+        out.push_back(cmi::cmiw::sig_external(pr->pd.name.txt, ty, pr->pd.prims[0], native));
+      }
+    } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
+      emit_type_decls(ck, pt->decls, out);
+    } else if (auto* pm = std::get_if<Psig_module>(&it.desc)) {
+      if (pm->md.name.txt && pm->md.type)
+        if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
+          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(ps->items)));
+    }
+  }
+  return out;
+}
+
 std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
   Checker ck;
   ck.record_kinds_ = true;
@@ -2633,40 +2710,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
         out.push_back(cmi::cmiw::sig_external(pr->prim.name.txt, ty, pr->prim.prims[0], native));
       }
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
-      for (auto& d : ty->decls) {
-        std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
-        std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
-        std::vector<cmi::cmiw::TyPtr> params;
-        for (auto& p : d.params) params.push_back(bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar));
-        // A variant type: emit its constructors (Cstr_tuple args; record-args and
-        // GADT results are dropped to a no-arg ctor for now -- still valid).
-        if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
-          std::vector<cmi::cmiw::Ctor> ctors;
-          for (auto& c : var->ctors) {
-            cmi::cmiw::Ctor cc; cc.name = c.name.txt;
-            if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
-              for (auto& a : tup->elems) cc.args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
-            ctors.push_back(std::move(cc));
-          }
-          out.push_back(cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors)));
-          continue;
-        }
-        if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
-          std::vector<cmi::cmiw::Label> labels;
-          for (auto& f : rec->fields) {
-            cmi::cmiw::Label lab;
-            lab.name = f.name.txt;
-            lab.mut = (f.mut == MutableFlag::Mutable);
-            lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
-            labels.push_back(std::move(lab));
-          }
-          out.push_back(cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels)));
-          continue;
-        }
-        cmi::cmiw::TyPtr manifest = nullptr;
-        if (d.manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
-        out.push_back(cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest));
-      }
+      emit_type_decls(ck, ty->decls, out);
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       // A submodule `module Inner = struct ... end`: emit Sig_module so the
       // oracle can resolve `Outer.Inner.x` and so the submodule's runtime field

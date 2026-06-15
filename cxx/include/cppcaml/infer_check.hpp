@@ -79,4 +79,9 @@ void set_infer_module_dirs(std::vector<std::string> dirs);
 // unsupported construct becomes a fresh type variable (opaque but valid).
 std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s);
 
+// Build the .cmi signature from a hand-written interface (.mli).  Unlike
+// infer_signature this reads types verbatim from the declarations (no
+// inference); it is the path used when an interface file exists.
+std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s);
+
 }  // namespace cppcaml
