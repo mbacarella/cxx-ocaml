@@ -8647,6 +8647,16 @@ struct Translator {
   // env-capture machinery (not yet built) -- detected post-translation and bailed.
   // Returns null (-> placeholder) for shapes not yet handled (inherit/virtual/
   // initializers/env capture).
+  // A side-effect-free expression: an identifier / constant, or a coercion /
+  // type-constraint wrapping a pure expression (`(x :> t)`, `(x : t)`).  Used to
+  // tell whether a `let _ = e` binding can simply be dropped.
+  static bool is_pure_expr(const ast::Expression& e) {
+    if (std::holds_alternative<ast::Pexp_ident>(e.desc) ||
+        std::holds_alternative<ast::Pexp_constant>(e.desc)) return true;
+    if (auto* c = std::get_if<ast::Pexp_coerce>(&e.desc)) return is_pure_expr(*c->e);
+    if (auto* c = std::get_if<ast::Pexp_constraint>(&e.desc)) return is_pure_expr(*c->e);
+    return false;
+  }
   LamPtr build_object(const ast::ClassStructure& cs, bool as_class,
                       const std::string& class_name = "",
                       const std::vector<const ast::Pcl_fun*>* cl_params = nullptr,
@@ -8716,6 +8726,11 @@ struct Translator {
           if (!ml2) return nullptr;
           std::string key = ml2->name + "." + d->name;
           auto mit = class_meta_.find(key);
+          // A class brought in through a functor application + `include` (e.g.
+          // `module Basic = include Create(P)` -> `Basic.agent`) has no
+          // module-qualified meta registered; fall back to the bare class name,
+          // under which it was registered when the (functor) body was compiled.
+          if (mit == class_meta_.end()) mit = class_meta_.find(d->name);
           LamPtr base = module_base(ml2->name);
           auto& lay = module_layout_[ml2->name];
           auto fi = lay.find(d->name);
@@ -8918,7 +8933,14 @@ struct Translator {
                   lid_last(std::get<ast::Ppat_construct>(bp->desc).id.txt) == "()"));
             if (!pv && !nobind) { restore(); return nullptr; }
             LamPtr v = expr(*b.expr);
-            if (rhs_leaks_param(v)) { restore(); return nullptr; }
+            if (rhs_leaks_param(v)) {
+              // `let _ = (param :> t)` -- a pure wildcard coercion of a class
+              // parameter has no effect, so eliding it is sound.  (Class-creation
+              // lets can't see params; the oracle runs this pure no-op per object
+              // as `(seq param ..)`.)  Only a pure RHS is safe to drop.
+              if (nobind && is_pure_expr(*b.expr)) continue;
+              restore(); return nullptr;
+            }
             if (nobind) { l->bindings.push_back({fresh("", true), ValueKind::Gen, v}); continue; }
             Ident id = fresh(pv->name.txt);
             record_fn_sig(id, b.expr.get());
