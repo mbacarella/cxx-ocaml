@@ -1,6 +1,7 @@
 #include "cppcaml/omarshal.hpp"
 
 #include <cstring>
+#include <unordered_map>
 
 namespace cppcaml::omarshal {
 
@@ -26,8 +27,20 @@ namespace {
 struct Marshaler {
   std::vector<std::uint8_t> body;
   long long nobjs = 0, w32 = 0, w64 = 0;
+  // Each sharable object (block size>0 / string / double / dblarr / custom) is
+  // assigned its emit-order index in `seen` so a repeat emits a CODE_SHARED
+  // back-reference instead of re-serializing -- required for the shared / cyclic
+  // type_expr graphs in a signature (otherwise type vars duplicate or recursive
+  // types loop forever).  Registration happens BEFORE a block's fields so a
+  // field may point back at the block itself (cycles).
+  std::unordered_map<const Value*, long long> seen;
   void byte(int b) { body.push_back((std::uint8_t)b); }
   void be32(std::uint32_t n) { byte(n >> 24); byte(n >> 16); byte(n >> 8); byte(n); }
+  void emit_shared(long long dist) {  // back-distance to the target object
+    if (dist < 0x100) { byte(0x4); byte((int)dist); }                  // CODE_SHARED8
+    else if (dist < 0x10000) { byte(0x5); byte(dist >> 8); byte(dist); }  // SHARED16
+    else { byte(0x6); be32((std::uint32_t)dist); }                     // SHARED32
+  }
   void emit_int(long long n) {
     if (n >= 0 && n < 0x40) byte(0x40 | (int)n);
     else if (n >= -128 && n < 128) { byte(0x0); byte((int)n & 0xFF); }
@@ -44,6 +57,12 @@ struct Marshaler {
     nobjs++; w64 += 1 + (len / 8 + 1); w32 += 1 + (len / 4 + 1);
   }
   void emit(const ValPtr& v) {
+    // immediates are never registered for sharing
+    if (v->k == Value::Int) { emit_int(v->i); return; }
+    if (v->k == Value::Block && v->fields.empty()) { byte(0x80 | v->tag); return; }
+    // a sharable object already serialized -> a back-reference (objs[nobjs-dist])
+    if (auto it = seen.find(v.get()); it != seen.end()) { emit_shared(nobjs - it->second); return; }
+    seen[v.get()] = nobjs;  // index assigned before this object's own nobjs++
     switch (v->k) {
       case Value::Int: emit_int(v->i); return;
       case Value::Str: emit_str(v->s); return;
