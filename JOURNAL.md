@@ -2454,3 +2454,31 @@ with a top-level signature ascription `class c (o) : S = let .. in object`
 routes its lets to `per_obj_lets` (the "constraints prevent lifting" path),
 where they end up UNRESOLVED (`?ev`) in method bodies -- distinct from mixin2's
 lifted-lets path.  Minimal repro: /tmp/sub2.ml.
+
+## test_generator FIXED: %(%) format-substitution lowering (2026-06-15)
+
+Same bisection method as mixin2: reduce the driver to find the crash point
+(checkpoints showed it dies in `reference_file`, not `plugins` as the journal
+guessed), then minimise.  Minimal crasher: `Printf.printf "%s%(%)" "x" "Y"`.
+
+The `%(...%)` format-substitution directive was unhandled.  `-dlambda` showed
+the format STRING `"%s%(%)"` actually lowered correctly already
+(`[2: 0 [14: 0 0 0]]` -- String then Format_subst), but its format6 ARGUMENT
+`"Y"` stayed a plain string `"Y"` where ocamlc emits the Format value
+`[0: [12: 'Y' 0] "Y"]`.  Printf/Format consume that argument as a parsed format
+value -> deref a plain string -> SIGSEGV.
+
+Two coordinated fixes (empty-inner `%(%)` idiom only):
+- lambda fmt_parse_pct: lower `%(%)` to Format_subst(14) =
+  (pad_option None=0, fmtty End_of_fmtty=0, continuation).  Byte-identical to
+  ocamlc.  Non-empty inner / widthed `%N(` still fall back.
+- infer_check format_arrow: type the `%(...%)` (and `%{...%}`) argument as
+  `format6` (skipping the inner to the matching `%)`/`%}`), so a string-literal
+  argument is recorded as a format literal and lowered as a Format value.
+
+exec **719 -> 720/722 (99.7%)**, lambda 431, completeness 100%, 0 regressions.
+
+Remaining exec DIFFs: just **1 real** -- typing-poly-bugs/pr6922_ok
+(parameterized virtual class-types, SIGSEGV; deepest translclass).  The other
+nominal DIFF (tool-debugger/basic/debuggee) is flaky-under-load: it matches the
+oracle when run alone, only DIFFs under heavy parallel ocamlrun contention.
