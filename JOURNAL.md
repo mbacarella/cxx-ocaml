@@ -2541,3 +2541,53 @@ loaded even when unused) + the inferencer/translator still being two
 independent tree-walks (see the "what ocamlc does differently" note: ocamlc
 infers once into an annotated typedtree; c++ runs HM inference then re-resolves
 in lambda).
+
+## NEW GOAL: .cmi emission for separate compilation / bootstrap (2026-06-15)
+
+Decision (user): target VALID + self-consistent .cmi (ocamlc can read it,
+dependents type-check against it, BLAKE128 CRCs computed like the oracle) ->
+self-hosted separate compilation -> bootstrap stdlib.  NOT byte-identical to the
+oracle (that needs replicating OCaml's exact type_expr ids/normalization; only
+needed for artifact-level drop-in, and CRC *consistency* — what the linker
+checks — comes from everyone reading the same .cmi, not from byte-identity).
+
+**.cmi format (file_formats/cmi_format.ml `output_cmi`, trunk):**
+  magic "Caml1999I038"
+  Compression.output_value (cmi_name, cmi_sign)   <- UNCOMPRESSED here (marshal
+                                                     magic 0x8495A6BE), no zstd
+  crc = Digest.BLAKE128.file <partial file>       <- self-CRC = BLAKE128(magic ++
+                                                     marshaled header bytes)
+  output_value ((cmi_name, Some crc) :: cmi_crcs) <- imports; self prepended
+  output_value cmi_flags                          <- pers_flags list
+So self-CRC falls out of reproducing the header bytes + a BLAKE128 impl (~task2).
+Imports = interfaces Env consulted during typing (e.g. `let x=1` pulls
+M, Stdlib, CamlinternalFormatBasics) — their CRCs read from the prebuilt stdlib.
+
+**ADT to marshal (typing/types.mli):** signature_item = Sig_value(Ident.t *
+value_description * visibility) | Sig_type | Sig_typext | Sig_module | Sig_modtype.
+value_description = {val_type:type_expr; val_kind; val_loc:Location.t;
+val_attributes; val_uid:Uid.t}.  type_expr = transient record {desc; level;
+scope; id} (field0=desc).  Ident.t = Local{name;stamp}(0)|Scoped(1)|Global str(2)
+|Predef{name;stamp}(3).  Uid.t = Compilation_unit str(0)|Item{..}(1)|...|Predef
+str(4).  visibility Exported=0/Hidden=1.  Predef types (int) must marshal as
+Tconstr(Path.Pident(Ident.Predef{name="int";stamp=<predef>}),..) so a reader
+resolves them to the real predef.
+
+**CRITICAL marshal-writer gap:** omarshal.cpp (our generic Marshal writer) has NO
+SHARING — fine for the .cmo trees it was built for, but type_expr graphs are
+shared (a type var used twice MUST be one node) and often cyclic (recursive
+types) -> the current writer would duplicate vars (semantically wrong) or
+infinite-loop.  Must add CODE_SHARED: register each sharable object (block
+size>0 / string / double / dblarr / custom; NOT int, NOT size-0 atom) in
+emit-order, BEFORE its fields (for cycles); a repeat emits SHARED8/16/32 with
+dist = objc - seen[v] (reader: objs[objc - dist]).  ALSO must then make
+nobjs/size_32/size_64 header counts EXACT (shared refs add nothing; strings add
+1 + (len+8)/8 words on 64-bit) — the no-sharing path under-counted strings,
+which was harmless only because nothing was SHARED.  This is task #3's prereq
+and the main risk; build it as a standalone round-trip test (read a real .cmi
+arena -> omarshal graph preserving sharing by arena-id -> marshal -> ocamlc/our
+reader accepts it) before constructing signatures from inference.
+
+Tasks #1-#5 created.  Order: omarshal-sharing+sizing -> BLAKE128 -> trivial
+Sig_value(int) .cmi that ocamlc reads + a dependent type-checks -> climb -> wire
+into -c -> self-host.
