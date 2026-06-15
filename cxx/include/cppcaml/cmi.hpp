@@ -203,9 +203,28 @@ TyPtr ty_var(int id);
 // An interface import (module name + its .cmi's BLAKE128 CRC).
 struct Import { std::string name; std::string crc; };
 
+// One signature item, in source order.  A Type item emits Sig_type (it takes no
+// runtime field, so it doesn't shift the value field layout the .cmo expects);
+// a Value item emits Sig_value.
+struct SigItem {
+  enum K { Value, Type } k = Value;
+  std::string name;
+  TyPtr ty;                   // Value: the value's type
+  std::vector<TyPtr> params;  // Type: type parameters (Var descriptors)
+  TyPtr manifest;             // Type: null = abstract; else `type name = manifest`
+};
+inline SigItem sig_value(std::string n, TyPtr t) { return {SigItem::Value, std::move(n), std::move(t), {}, nullptr}; }
+inline SigItem sig_type(std::string n, std::vector<TyPtr> ps, TyPtr man) {
+  return {SigItem::Type, std::move(n), nullptr, std::move(ps), std::move(man)};
+}
+
 // Write magic + marshal(name,sign) + BLAKE128 self-CRC + marshal(crcs) +
 // marshal(flags) to `path`.  `imports` are the non-self interfaces (self is
 // prepended automatically with the computed CRC).  Returns the self-CRC.
+std::string write_cmi(const std::string& path, const std::string& modname,
+                      const std::vector<SigItem>& items,
+                      const std::vector<Import>& imports = {});
+// Convenience: a values-only signature.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<std::pair<std::string, TyPtr>>& values,
                       const std::vector<Import>& imports = {});

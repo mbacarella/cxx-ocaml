@@ -72,13 +72,11 @@ void set_infer_stdlib_dir(const std::string& dir);
 // .cmi (so a dependent gets real types for `A.x`, not Any).
 void set_infer_module_dirs(std::vector<std::string> dirs);
 
-// A compilation unit's top-level value signature (in source order) as cmiw type
-// descriptors, bridged from the inferencer's types -- the input to
-// cmi::cmiw::write_cmi.  Only single-variable top-level `let` bindings are
-// included (matching the .cmo's exported field order for the common case);
-// types using an unsupported construct become a fresh type variable (opaque but
-// valid).
-std::vector<std::pair<std::string, cmi::cmiw::TyPtr>> infer_signature(
-    const ast::Structure& s);
+// A compilation unit's top-level signature (in source order) as cmiw items --
+// the input to cmi::cmiw::write_cmi.  Single-var `let` bindings -> Sig_value
+// (matching the .cmo's exported field order); `type` declarations -> Sig_type
+// (abstract / manifest; they take no runtime field).  A type using an
+// unsupported construct becomes a fresh type variable (opaque but valid).
+std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s);
 
 }  // namespace cppcaml

@@ -2609,21 +2609,31 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
   return cmi::cmiw::ty_var(nextvar++);
 }
 
-std::vector<std::pair<std::string, cmi::cmiw::TyPtr>> infer_signature(const ast::Structure& s) {
+std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
   Checker ck;
   ck.record_kinds_ = true;
   run_checker(ck, s);  // leaves top-level bindings in venv.back()
-  std::vector<std::pair<std::string, cmi::cmiw::TyPtr>> out;
+  std::vector<cmi::cmiw::SigItem> out;
   for (auto& it : s) {
-    auto* sv = std::get_if<Pstr_value>(&it.desc);
-    if (!sv) continue;
-    for (auto& b : sv->bindings)
-      if (auto* v = std::get_if<Ppat_var>(&b.pat.desc)) {  // single-var top-level lets
-        auto f = ck.venv.back().find(v->name.txt);
-        if (f == ck.venv.back().end()) continue;
-        std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
-        out.emplace_back(v->name.txt, bridge_ty(f->second, vars, nextvar));
+    if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
+      for (auto& b : sv->bindings)
+        if (auto* v = std::get_if<Ppat_var>(&b.pat.desc)) {  // single-var top-level lets
+          auto f = ck.venv.back().find(v->name.txt);
+          if (f == ck.venv.back().end()) continue;
+          std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
+          out.push_back(cmi::cmiw::sig_value(v->name.txt, bridge_ty(f->second, vars, nextvar)));
+        }
+    } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+      for (auto& d : ty->decls) {
+        std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
+        std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
+        std::vector<cmi::cmiw::TyPtr> params;
+        for (auto& p : d.params) params.push_back(bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar));
+        cmi::cmiw::TyPtr manifest = nullptr;
+        if (d.manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
+        out.push_back(cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest));
       }
+    }
   }
   return out;
 }

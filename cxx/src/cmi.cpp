@@ -735,18 +735,37 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
 }  // namespace
 
 std::string write_cmi(const std::string& path, const std::string& modname,
-                      const std::vector<std::pair<std::string, TyPtr>>& values,
-                      const std::vector<Import>& imports) {
+                      const std::vector<SigItem>& items, const std::vector<Import>& imports) {
   int stamp = 300;
-  std::vector<o::ValPtr> items;
-  for (auto& [name, ty] : values) {
+  std::vector<o::ValPtr> sig;
+  for (auto& it : items) {
     TyEmit te;
-    auto ident = o::vblock(0, {o::vstr(name), o::vint(stamp++)});  // Ident.Local{name;stamp}
-    auto vdesc = o::vblock(0, {te.emit(ty), o::vint(0) /*Val_reg*/, loc_none(),
-                               o::vint(0) /*[] attrs*/, o::vint(0) /*Uid.Internal*/});
-    items.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
+    auto ident = o::vblock(0, {o::vstr(it.name), o::vint(stamp++)});  // Ident.Local{name;stamp}
+    if (it.k == SigItem::Value) {
+      auto vdesc = o::vblock(0, {te.emit(it.ty), o::vint(0) /*Val_reg*/, loc_none(),
+                                 o::vint(0) /*[] attrs*/, o::vint(0) /*Uid.Internal*/});
+      sig.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
+    } else {
+      // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
+      // alias (`type t = manifest`).  Variant/record kinds: the climb.
+      std::vector<o::ValPtr> ps;
+      for (auto& p : it.params) ps.push_back(te.emit(p));
+      auto man = it.manifest ? o::vblock(0, {te.emit(it.manifest)}) : o::vint(0);  // Some/None
+      auto tdecl = o::vblock(0, {
+          ps.empty() ? o::vint(0) : o::vlist(ps),     // type_params
+          o::vint((long long)it.params.size()),       // type_arity
+          o::vblock(0, {o::vint(0)}),                  // type_kind = Type_abstract(Definition)
+          o::vint(1),                                  // type_private = Public
+          man,                                         // type_manifest
+          o::vint(0), o::vint(0),                      // variance [], separability []
+          o::vint(0), o::vint(0),                      // is_newtype false, expansion_scope 0
+          loc_none(),                                  // type_loc
+          o::vint(0), o::vint(0), o::vint(0),          // attrs [], immediate Unknown, unboxed false
+          o::vint(0)});                                // type_uid = Uid.Internal
+      sig.push_back(o::vblock(1, {ident, tdecl, o::vint(1) /*Trec_first*/, o::vint(0) /*Exported*/}));
+    }
   }
-  auto header = o::vblock(0, {o::vstr(modname), o::vlist(items)});
+  auto header = o::vblock(0, {o::vstr(modname), o::vlist(sig)});
   std::vector<std::uint8_t> hbytes = o::marshal(header);
 
   const std::string MAGIC = "Caml1999I038";
@@ -768,6 +787,14 @@ std::string write_cmi(const std::string& path, const std::string& modname,
   out.write(reinterpret_cast<const char*>(cbytes.data()), cbytes.size());
   out.write(reinterpret_cast<const char*>(fbytes.data()), fbytes.size());
   return self_crc;
+}
+
+std::string write_cmi(const std::string& path, const std::string& modname,
+                      const std::vector<std::pair<std::string, TyPtr>>& values,
+                      const std::vector<Import>& imports) {
+  std::vector<SigItem> items;
+  for (auto& [n, t] : values) items.push_back(sig_value(n, t));
+  return write_cmi(path, modname, items, imports);
 }
 
 }  // namespace cmiw
