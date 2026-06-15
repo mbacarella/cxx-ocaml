@@ -2591,3 +2591,40 @@ reader accepts it) before constructing signatures from inference.
 Tasks #1-#5 created.  Order: omarshal-sharing+sizing -> BLAKE128 -> trivial
 Sig_value(int) .cmi that ocamlc reads + a dependent type-checks -> climb -> wire
 into -c -> self-host.
+
+## .cmi writer Phase 1-3 done: valid signatures OCaml reads + type-checks (2026-06-15)
+
+Parts 1-3 of the .cmi-emission arc landed and validated against the oracle:
+1. omarshal CODE_SHARED (shared/cyclic graphs).
+2. BLAKE2b/BLAKE128 self-CRC (byte-exact vs oracle).
+3. cmiw writer (cmi.cpp): builds a real Types.signature + full .cmi
+   (magic + marshal(name,sign) + BLAKE128 + crcs + flags).
+
+Covers value signatures over predef ctors (int/bool/string/unit/...), arrows
+(curried + higher-order), tuples, type variables -- mono and polymorphic.
+ocamlobjinfo reads them; oracle-compiled dependents type-check (`One.x+1`,
+`g 1 2`, `h (fun x->x+1)`, `id`/`k` at multiple instantiations).
+
+Representation facts (decoded from real oracle .cmi -- the spec for the writer):
+ - type_expr = {desc; level=generic 100000000; scope; id}.  We emit CLEAN graphs
+   (no Tlink/Tsubst artifacts): valid + type-checks, not byte-identical (the bar).
+ - type_desc block tags (Tnil is constant, skipped): Tvar0 Tarrow1 Ttuple2
+   Tconstr3 Tobject4 Tfield5 Tvariant6 Tunivar7 Tpoly8 Tpackage9 Tfunctor10
+   Texpand11 Tlink12 Tsubst13.
+ - predef Tconstr = Tconstr(Path.Pident(Ident.Predef{name; stamp}), [], ref Mnil)
+   with the predef.ml stamp (int=1 char=2 bytes=3 float=4 bool=5 unit=6 exn=7
+   ... string=17) -- needed so a reader's Path.same resolves it to the real type
+   (else `One.x + 1` won't unify with int).
+ - TRUNK QUIRK: Tarrow's DOMAIN is Tpoly(ty,[])-wrapped (first-class-poly args),
+   codomain bare; a bare domain -> assert in btype.tpoly_get_mono.
+ - value_description = {val_type; Val_reg=0; Location.none; [] attrs;
+   Uid.Internal=0}; visibility Exported=0; ref Mnil = block0{0}; flags=[Alerts ∅].
+ - cmi magic "Caml1999I038"; header marshal is UNcompressed (0x8495A6BE).
+ - Local idents use arbitrary stamps (a dependent refers by name, not stamp).
+
+STILL TO CLIMB on the writer (task #3 cont.): Sig_type (type declarations:
+abstract/variant/record), Sig_module, Sig_typext (exceptions/extensions),
+qualified Pdot types (`int list`, `string option`, stdlib types), abbreviations.
+Then wire into c++ocamlc -c (emit .cmi from the inferred signature; task #4) and
+self-host (task #5).  Build gotcha: see [[cppcaml-build-ar-gotcha]] before
+editing CMakeLists.
