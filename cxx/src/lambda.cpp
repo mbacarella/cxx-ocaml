@@ -4913,6 +4913,17 @@ struct Translator {
       Ident id = fresh(pv->name.txt);
       scope.back()[pv->name.txt] = id; out.push_back({id, scrut}); return true;
     }
+    if (auto* up = std::get_if<Ppat_unpack>(&p->desc)) {  // `(module M [: S])`: bind M
+      if (up->name.txt) {
+        Ident id = fresh(*up->name.txt);
+        scope.back()[*up->name.txt] = id; out.push_back({id, scrut});
+        module_ident_[*up->name.txt] = id;
+        std::string mt;
+        if (up->pkg && lid_to_dotted(up->pkg->path.txt, mt))
+          register_pack_layouts(*up->name.txt, mt);  // so `M.x` in a guard/body resolves
+      }
+      return true;
+    }
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {  // `pat as x`: bind x and recurse
       Ident id = fresh(pa->name.txt);
       scope.back()[pa->name.txt] = id; out.push_back({id, scrut});
@@ -5116,7 +5127,8 @@ struct Translator {
   bool is_irrefutable(const Pattern& p0) {
     const Pattern* p = effective_pat(&p0);
     if (std::holds_alternative<Ppat_any>(p->desc) ||
-        std::holds_alternative<Ppat_var>(p->desc)) return true;
+        std::holds_alternative<Ppat_var>(p->desc) ||
+        std::holds_alternative<Ppat_unpack>(p->desc)) return true;  // `(module M)` always matches
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) return is_irrefutable(*pa->p);
     if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
       for (auto& e : pt->elems) if (!is_irrefutable(*e)) return false;
@@ -6601,6 +6613,17 @@ struct Translator {
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
       binds.push_back({fresh(pa->name.txt), acc});
       return pat_test(pa->p.get(), acc, test, binds);
+    }
+    if (auto* up = std::get_if<Ppat_unpack>(&p->desc)) {  // `(module M [: S])`: bind M
+      if (up->name.txt) {
+        Ident id = fresh(*up->name.txt);
+        binds.push_back({id, acc});
+        module_ident_[*up->name.txt] = id;  // so `M.x` in a `when` guard / body resolves
+        std::string mt;
+        if (up->pkg && lid_to_dotted(up->pkg->path.txt, mt))
+          register_pack_layouts(*up->name.txt, mt);
+      }
+      return true;  // always matches
     }
     if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
       if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
@@ -10843,6 +10866,12 @@ struct Translator {
           cur.push_back({iid, ValueKind::Gen, mv});
           auto v = mk(Lam::K::Var); v->var = iid; base = v;
         }
+        // `include M` where M is a LOCAL module: its fields shadow enclosing
+        // bindings (e.g. a function parameter), so they must enter scope as
+        // binders -- an open alone resolves them only AFTER local scope.
+        bool local_include = false;
+        if (auto* mip = std::get_if<Pmod_ident>(&pin->expr.desc))
+          if (auto* l = std::get_if<Lident>(&mip->id.txt.v)) local_include = module_base(l->name) != nullptr;
         // remember an `include <stdlib (sub)module>` so a `: S` coercion can
         // eta-stub S members that are PRIMITIVES of it (they have no field here).
         if (auto* mip = std::get_if<Pmod_ident>(&pin->expr.desc)) {
@@ -10884,7 +10913,14 @@ struct Translator {
             // semantics (translmod's get_field: `Pfield(pos, Pointer, Mutable)`)
             auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldMut;
             fi->prim_arg = i; fi->args = {base};
-            add_export_val(rl[i], fi);
+            if (local_include && lookup(rl[i])) {  // shadow an enclosing binding only
+              Ident id = fresh(rl[i]);
+              cur.push_back({id, ValueKind::Gen, fi, true});  // =a alias
+              scope.back()[rl[i]] = id;
+              add_export(rl[i], id);
+            } else {
+              add_export_val(rl[i], fi);
+            }
           }
         }
         // an included module path also brings its names into BARE scope for the

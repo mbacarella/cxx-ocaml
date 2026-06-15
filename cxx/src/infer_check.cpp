@@ -2371,6 +2371,21 @@ struct Checker {
               modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
             }
           }
+        } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
+          // Visit each recursive-module body so its expressions are inferred and
+          // its format-string literals collected (a `module rec` body's Printf
+          // would otherwise be left as a raw string -> runtime crash).  Names are
+          // pre-registered for sibling references; errors are suppressed (the
+          // dummies make a sound check impossible without applying the recursion).
+          for (auto& b : rm->bindings)
+            if (b.name.txt)
+              modenv.emplace(*b.name.txt, std::unordered_map<std::string, TypePtr>{});
+          for (auto& b : rm->bindings) {
+            bool saved = strict; strict = false;
+            auto ex = module_exports(b.expr);
+            strict = saved;
+            if (b.name.txt) modenv[*b.name.txt] = std::move(ex);
+          }
         } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
           for (auto& [k, v] : module_exports(in->expr)) venv.back()[k] = v;
           if (auto* pi = std::get_if<Pmod_ident>(&in->expr.desc))  // include M -> M's submodules
