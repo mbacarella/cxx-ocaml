@@ -2628,3 +2628,26 @@ qualified Pdot types (`int list`, `string option`, stdlib types), abbreviations.
 Then wire into c++ocamlc -c (emit .cmi from the inferred signature; task #4) and
 self-host (task #5).  Build gotcha: see [[cppcaml-build-ar-gotcha]] before
 editing CMakeLists.
+
+## .cmi emission wired into c++ocamlc (task #4 done) (2026-06-15)
+
+c++ocamlc -c now emits M.cmi from the inferred signature: infer_signature
+(infer_check.cpp) runs the checker, reads each single-var top-level binding's
+generalized type from venv.back(), and bridges the engine type -> cmiw
+descriptor (Var/Any->tyvar, Arrow, Tuple, Constr->predef-or-opaque).  cmiw::Ty
+gained ty_constr (args), so `int list`/`'a option` work; non-predef paths
+render as opaque vars (the climb).  write_cmi is best-effort (never breaks the
+.cmo/link).  exec parity 722/722, completeness 100%, no regression.
+
+Verified: `c++ocamlc -c a.ml` emits a.cmi (answer:int, pair:int*bool, id:'a->'a,
+twice:('a->'a)->'a->'a, ...); ocamlobjinfo reads it; an ORACLE-compiled
+dependent (`A.answer+1`, `snd A.pair`, `A.id "x"`, ...) type-checks.  Inference
+gap surfaced (not a writer bug): `add x y = x+y` is inferred 'a->'b->'c (the +
+int-constraint isn't propagated to params) -- valid but over-general.
+
+SELF-HOST probe (task #5, NOT yet working): c++ocamlc CAN compile a dependent
+b.ml against our a.cmi (reads the local .cmi, produces b.cmo) and c++link links
+stdlib+a+b+std_exit -- but the linked prog SIGSEGVs at startup, before any A
+access (even a leading print_string doesn't run).  So the crash is module-init /
+global-table / link level, not the .cmi.  That cross-module-resolution work is
+phase #5.
