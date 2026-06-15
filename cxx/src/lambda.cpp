@@ -2164,7 +2164,13 @@ struct Translator {
   }
   // A record field of a stdlib (sub)module's record type, e.g. `Gc.minor_heap_size`
   // -> {field index, kind, mutable}; nullopt if not found.
-  struct StdField { int index; ValueKind kind; bool mut; };
+  struct StdField { int index; ValueKind kind; bool mut; bool flat = false; };
+  // True when every label of `td` is float-kind (a flat float record, read/written
+  // with floatfield rather than the boxed field ops).
+  static bool record_all_float(const cmi::TypeDecl& td) {
+    for (auto& l : td.labels) if (cmi_field_kind(l.type) != ValueKind::Float) return false;
+    return !td.labels.empty();
+  }
   std::optional<StdField> stdlib_record_field(const std::string& mod, const std::string& label) {
     try {
       auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
@@ -2173,7 +2179,8 @@ struct Translator {
         if (td.kind != cmi::TypeDecl::Record) continue;
         for (int i = 0; i < (int)td.labels.size(); ++i)
           if (td.labels[i].name == label)
-            return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_};
+            return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_,
+                            record_all_float(td)};
       }
     } catch (...) {}
     return std::nullopt;
@@ -2196,7 +2203,8 @@ struct Translator {
         if (td.kind != cmi::TypeDecl::Record || td.name != ty) continue;
         for (int i = 0; i < (int)td.labels.size(); ++i)
           if (td.labels[i].name == label)
-            return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_};
+            return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_,
+                            record_all_float(td)};
       }
     } catch (...) {}
     return std::nullopt;
@@ -2205,7 +2213,8 @@ struct Translator {
   // `label`, for unqualified-label updates of non-opened stdlib records
   // (`{ (Gc.get ()) with allocation_policy = 2 }`). All-float (flat) records
   // have a different representation and are not handled.
-  struct StdRec { std::vector<std::string> labels; std::vector<ValueKind> shape; std::vector<bool> mut; };
+  struct StdRec { std::vector<std::string> labels; std::vector<ValueKind> shape; std::vector<bool> mut;
+                  bool flat = false; };  // all-float -> a flat float block (Complex.t)
   std::optional<StdRec> stdlib_record_layout(const std::string& mod, const std::string& label) {
     try {
       auto cmi = cmi::CmiFile::load(mod == "Stdlib" ? stdlib_dir + "/stdlib.cmi"
@@ -2223,7 +2232,7 @@ struct Translator {
           r.mut.push_back(l.mutable_);
           if (r.shape.back() != ValueKind::Float) all_float = false;
         }
-        if (all_float) return std::nullopt;
+        r.flat = all_float;  // Complex.t etc.: a flat float block
         return r;
       }
     } catch (...) {}
@@ -2246,7 +2255,7 @@ struct Translator {
           r.mut.push_back(l.mutable_);
           if (r.shape.back() != ValueKind::Float) all_float = false;
         }
-        if (all_float) return std::nullopt;
+        r.flat = all_float;  // Complex.t etc.: a flat float block
         return r;
       }
     } catch (...) {}
@@ -6961,6 +6970,7 @@ struct Translator {
               std_rt.shape = std::move(sr->shape);
               std_rt.mut = false;
               for (bool m : sr->mut) if (m) std_rt.mut = true;
+              std_rt.flat = sr->flat;  // Complex.t etc.: a flat float block
               fmut = std::move(sr->mut);
               rt = &std_rt;
             }
@@ -7046,16 +7056,22 @@ struct Translator {
             std_rt.shape = std::move(sr->shape);
             std_rt.mut = false;
             for (bool m : sr->mut) if (m) std_rt.mut = true;
+            std_rt.flat = sr->flat;  // Complex.t etc.: build a flat float block
             rt = &std_rt;
             return true;
           };
-          if (auto itc = vk.expr_constr.find(&e); itc != vk.expr_constr.end()) {
-            const std::string& p = itc->second;
-            auto dpos = p.rfind('.');
-            std::string mod = p.substr(0, dpos);
-            if (mod.find('.') == std::string::npos)
-              try_std(stdlib_record_layout_named(mod, p.substr(dpos + 1)));
-          }
+          // an explicit module qualification on the first label (`{Complex.im=..}`)
+          if (auto* d0 = std::get_if<Ldot>(&rc->fields[0].first.txt.v))
+            if (auto* pl0 = std::get_if<Lident>(&d0->prefix->v))
+              try_std(stdlib_record_layout(pl0->name, d0->name));
+          if (!rt)
+            if (auto itc = vk.expr_constr.find(&e); itc != vk.expr_constr.end()) {
+              const std::string& p = itc->second;
+              auto dpos = p.rfind('.');
+              std::string mod = p.substr(0, dpos);
+              if (mod.find('.') == std::string::npos)
+                try_std(stdlib_record_layout_named(mod, p.substr(dpos + 1)));
+            }
           if (!rt)
             for (auto it2 = opened_.rbegin(); it2 != opened_.rend(); ++it2) {
               if (it2->find('.') != std::string::npos || module_base(*it2)) continue;
@@ -7140,7 +7156,8 @@ struct Translator {
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
           if (auto rf = stdlib_record_field(pl->name, d->name)) {
             auto l = mk(Lam::K::Prim);
-            l->prim = rf->kind == ValueKind::Int ? Prim::FieldInt
+            l->prim = rf->flat                 ? Prim::Floatfield  // Complex.t etc.
+                      : rf->kind == ValueKind::Int ? Prim::FieldInt
                       : rf->mut                  ? Prim::FieldMut
                                                  : Prim::FieldImm;
             l->prim_arg = rf->index; l->args = {expr(*fe->e)};
@@ -7149,7 +7166,8 @@ struct Translator {
       // An unqualified stdlib-record label via the base's inferred type.
       if (auto rf = inferred_record_field(fe->e.get(), lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
-        l->prim = rf->kind == ValueKind::Int ? Prim::FieldInt
+        l->prim = rf->flat                 ? Prim::Floatfield  // Complex.t etc.
+                  : rf->kind == ValueKind::Int ? Prim::FieldInt
                   : rf->mut                  ? Prim::FieldMut
                                              : Prim::FieldImm;
         l->prim_arg = rf->index; l->args = {expr(*fe->e)};
@@ -7177,7 +7195,9 @@ struct Translator {
       // An unqualified stdlib-record label via the base's inferred type.
       if (auto rf = inferred_record_field(sf->obj.get(), lid_last(sf->field.txt))) {
         auto l = mk(Lam::K::Prim);
-        l->prim = rf->kind == ValueKind::Int ? Prim::SetfieldImm : Prim::SetfieldPtr;
+        l->prim = rf->flat                 ? Prim::SetFloatfield  // Complex.t etc.
+                  : rf->kind == ValueKind::Int ? Prim::SetfieldImm
+                                               : Prim::SetfieldPtr;
         l->prim_arg = rf->index; l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }
