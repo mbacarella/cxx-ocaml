@@ -2547,6 +2547,10 @@ struct Translator {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::FieldMut;
       pr->prim_arg = prim == "%field1" ? 1 : 0; pr->args = argv; return pr;
     }
+    if ((prim == "%setfield0" || prim == "%setfield1") && n == 2) {  // (:=) as a value
+      auto pr = mk(Lam::K::Prim); pr->prim = Prim::SetfieldImm;
+      pr->prim_arg = prim == "%setfield1" ? 1 : 0; pr->args = argv; return pr;
+    }
     {  // pervasive arithmetic / bitwise / unary, via the operator-form maps
       static const std::unordered_map<std::string, std::string> parith = {
         {"%addint", "+"}, {"%subint", "-"}, {"%mulint", "*"}, {"%divint", "/"},
