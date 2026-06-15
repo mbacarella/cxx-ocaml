@@ -865,9 +865,8 @@ struct Translator {
                                                     : stdlib_dir + "/stdlib__" + mod + ".cmi");
       for (auto& td : cmi.sig().types) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
-        bool gadt = false;
-        for (auto& c : td.ctors) if (c.res) gadt = true;
-        if (gadt) continue;  // GADT tag rules are subtler -- skip
+        // GADT constructors follow the same constant/block tag rules (Bigarray's
+        // `kind`: Float32=0, Float64=1, ...), so they resolve like plain variants.
         int nc = 0, nb = 0;
         for (auto& c : td.ctors) {
           bool block = !c.args.empty() || c.is_inline_record;
@@ -7293,19 +7292,10 @@ struct Translator {
         b->args = std::move(fields); b->blk_shape = std::move(shape);
         return b;
       }
-      // a predefined exception (Not_found, ...) is a Stdlib field; applied
-      // (Invalid_argument "X") it builds the block with the identity at field 0
-      if (auto sf = stdlib_fields.find(n); sf != stdlib_fields.end()) {
-        if (!k->arg) return field_of("Stdlib", sf->second);
-        if (is_predef_exn_name(n)) {
-          auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
-          b->args = {field_of("Stdlib", sf->second), expr(**k->arg)};
-          b->blk_shape = {ValueKind::Gen, expr_kind(k->arg->get())};
-          return b;
-        }
-      }
       // a stdlib module's variant constructor (`Arg.Unit f`, or bare under
-      // `open Arg`): tag/arity from the module cmi's variant decls
+      // `open Arg`): tag/arity from the module cmi's variant decls.  Checked
+      // before the Stdlib-field fallback so an opened constructor (`Bigarray`'s
+      // `Int` kind) shadows a same-named Stdlib module/exception field.
       if (const CtorInfo* sci = stdlib_module_ctor(k->id.txt, n)) {
         if (!sci->is_block) return cint(sci->tag);
         std::vector<const Expression*> fs;
@@ -7317,6 +7307,17 @@ struct Translator {
             fs.push_back(k->arg->get());
         }
         return block_of(sci->tag, fs);
+      }
+      // a predefined exception (Not_found, ...) is a Stdlib field; applied
+      // (Invalid_argument "X") it builds the block with the identity at field 0
+      if (auto sf = stdlib_fields.find(n); sf != stdlib_fields.end()) {
+        if (!k->arg) return field_of("Stdlib", sf->second);
+        if (is_predef_exn_name(n)) {
+          auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
+          b->args = {field_of("Stdlib", sf->second), expr(**k->arg)};
+          b->blk_shape = {ValueKind::Gen, expr_kind(k->arg->get())};
+          return b;
+        }
       }
       // a stdlib module's exception, constructed (`Arg.Bad msg`): identity is the
       // module's export field (uppercase non-ctor exports are exceptions)
