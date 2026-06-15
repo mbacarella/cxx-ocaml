@@ -1430,6 +1430,108 @@ struct Translator {
       }
     }
   }
+  // Register the variant constructors declared in a functor parameter's signature
+  // (`module Z(T:S)` with `type u = X|Y|Z`), so they resolve to their tags inside
+  // the body after `open T`.  Returns a save list for restore_sig_ctors().
+  struct SigCtorSave { std::string cname; bool had_c; CtorInfo c_info;
+                       std::string tname; bool had_t; std::pair<int,int> t_info; };
+  std::vector<SigCtorSave> register_sig_ctors(const ModuleType& mt) {
+    std::vector<SigCtorSave> saved;
+    const ModuleType* m = &mt;
+    for (int g = 0; g < 8; ++g) {  // resolve a named module type to its signature
+      auto* pi = std::get_if<Pmty_ident>(&m->desc);
+      if (!pi) break;
+      auto* l = std::get_if<Lident>(&pi->id.txt.v);
+      if (!l) break;
+      auto a = modtype_ast_.find(l->name);
+      if (a == modtype_ast_.end()) break;
+      m = a->second;
+    }
+    auto* ps = std::get_if<Pmty_signature>(&m->desc);
+    if (!ps) return saved;
+    for (auto& it : ps->items) {
+      auto* pt = std::get_if<Psig_type>(&it.desc);
+      if (!pt) continue;
+      for (auto& d : pt->decls) {
+        auto* v = std::get_if<Ptype_variant>(&d.kind);
+        if (!v) continue;
+        int nc = 0, nb = 0;
+        for (auto& c : v->ctors) {
+          int arity = 0; bool block = true;
+          if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) { arity = (int)t->elems.size(); block = arity > 0; }
+          else if (auto* r = std::get_if<Pcstr_record>(&c.args)) arity = (int)r->fields.size();
+          SigCtorSave s;
+          s.cname = c.name.txt;
+          s.had_c = ctor_info_.count(c.name.txt) > 0;
+          if (s.had_c) s.c_info = ctor_info_[c.name.txt];
+          s.tname = d.name.txt;
+          s.had_t = type_ctors_.count(d.name.txt) > 0;
+          if (s.had_t) s.t_info = type_ctors_[d.name.txt];
+          saved.push_back(std::move(s));
+          ctor_info_[c.name.txt] = CtorInfo{d.name.txt, block ? nb : nc, block, arity, false};
+          type_ctor_info_[d.name.txt][c.name.txt] = ctor_info_[c.name.txt];
+          if (block) ++nb; else ++nc;
+        }
+        type_ctors_[d.name.txt] = {nc, nb};
+      }
+    }
+    return saved;
+  }
+  void restore_sig_ctors(const std::vector<SigCtorSave>& saved) {
+    for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+      if (it->had_c) ctor_info_[it->cname] = it->c_info; else ctor_info_.erase(it->cname);
+      if (it->had_t) type_ctors_[it->tname] = it->t_info; else type_ctors_.erase(it->tname);
+    }
+  }
+  // Register the EXTENSION constructors of a functor parameter's signature
+  // (`type t += A|B|C`) as fields of the parameter `pid`, shadowing a same-named
+  // sibling's binding -- so `open T; match x with C -> ..` compares against the
+  // param's C identity (not a sibling module's).  Needs module_layout_[prefix]
+  // (register_sig_layouts) already populated for the field indices.
+  struct SigExtSave { std::string name; bool had_i; Ident i; bool had_f; std::pair<Ident, int> f;
+                      bool had_ci; CtorInfo ci; };
+  std::vector<SigExtSave> register_sig_exts(const std::string& prefix, const Ident& pid,
+                                            const ModuleType& mt) {
+    std::vector<SigExtSave> saved;
+    const ModuleType* m = &mt;
+    for (int g = 0; g < 8; ++g) {
+      auto* pi = std::get_if<Pmty_ident>(&m->desc);
+      if (!pi) break;
+      auto* l = std::get_if<Lident>(&pi->id.txt.v);
+      if (!l) break;
+      auto a = modtype_ast_.find(l->name);
+      if (a == modtype_ast_.end()) break;
+      m = a->second;
+    }
+    auto* ps = std::get_if<Pmty_signature>(&m->desc);
+    if (!ps) return saved;
+    auto& lay = module_layout_[prefix];
+    for (auto& it : ps->items) {
+      auto* tx = std::get_if<Psig_typext>(&it.desc);
+      if (!tx) continue;
+      for (auto& c : tx->ext.ctors) {
+        auto li = lay.find(c.name.txt);
+        if (li == lay.end()) continue;
+        SigExtSave s;
+        s.name = c.name.txt;
+        s.had_i = exn_ident_.count(c.name.txt) > 0; if (s.had_i) s.i = exn_ident_[c.name.txt];
+        s.had_f = exn_field_.count(c.name.txt) > 0; if (s.had_f) s.f = exn_field_[c.name.txt];
+        s.had_ci = ctor_info_.count(c.name.txt) > 0; if (s.had_ci) s.ci = ctor_info_[c.name.txt];
+        saved.push_back(std::move(s));
+        exn_ident_.erase(c.name.txt);             // shadow a sibling's binder
+        ctor_info_.erase(c.name.txt);             // ... and a same-named VARIANT ctor
+        exn_field_[c.name.txt] = {pid, li->second};
+      }
+    }
+    return saved;
+  }
+  void restore_sig_exts(const std::vector<SigExtSave>& saved) {
+    for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+      if (it->had_i) exn_ident_[it->name] = it->i; else exn_ident_.erase(it->name);
+      if (it->had_f) exn_field_[it->name] = it->f; else exn_field_.erase(it->name);
+      if (it->had_ci) ctor_info_[it->name] = it->ci; else ctor_info_.erase(it->name);
+    }
+  }
   // A pure module path (a Var, a Global, or a chain of immutable field reads of
   // one) -- safe to inline at every use of a module alias.
   static bool is_pure_path(const LamPtr& l) {
@@ -9518,6 +9620,8 @@ struct Translator {
       struct Saved { std::string nm; bool had; Ident id;
                      decltype(module_layout_[std::string{}]) lay; };
       std::vector<Saved> saves;
+      std::vector<SigCtorSave> ctor_saves;  // param-sig variant ctors (`type u=X|Y|Z`)
+      std::vector<SigExtSave> ext_saves;    // param-sig extension ctors (`type t+=A|B`)
       const ModuleExpr* cur = &me;
       while (auto* pf = std::get_if<Pmod_functor>(&cur->desc)) {
         std::string nm = "*";
@@ -9534,11 +9638,18 @@ struct Translator {
           // Register the param's flat layout AND its nested submodule layouts
           // (so `X.Sub.foo` / `open X; open Sub; foo` resolve -- boxedints).
           register_sig_layouts(nm, *fp->type);
+          // and its variant- / extension-type constructors (resolved after `open X`).
+          auto cs = register_sig_ctors(*fp->type);
+          ctor_saves.insert(ctor_saves.end(), cs.begin(), cs.end());
+          auto es = register_sig_exts(nm, pid, *fp->type);
+          ext_saves.insert(ext_saves.end(), es.begin(), es.end());
         }
         fn->params.push_back({pid, ValueKind::Gen});
         cur = pf->body.get();
       }
       fn->body = compile_module_expr(*cur);
+      restore_sig_exts(ext_saves);
+      restore_sig_ctors(ctor_saves);
       for (auto it = saves.rbegin(); it != saves.rend(); ++it) {
         if (it->had) module_ident_[it->nm] = it->id; else module_ident_.erase(it->nm);
         module_layout_[it->nm] = it->lay;
