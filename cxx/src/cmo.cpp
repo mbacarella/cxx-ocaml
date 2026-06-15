@@ -401,7 +401,8 @@ void append_be32(std::vector<std::uint8_t>& v, std::uint32_t n) {
 }  // namespace
 
 void write_cmo(const bytecode::Code& code, const std::string& module_name,
-               const std::string& path) {
+               const std::string& path,
+               const std::vector<std::string>& required_compunits) {
   Emitter em;
   em.emit(code);
 
@@ -432,7 +433,9 @@ void write_cmo(const bytecode::Code& code, const std::string& module_name,
       vint(codesize),             // cu_codesize
       vlist(relocs),              // cu_reloc
       vint(0),                    // cu_imports = []
-      vint(0),                    // cu_required_compunits = []
+      [&]{ std::vector<ValPtr> rc; for (auto& n : required_compunits) rc.push_back(vstr(n));
+           return vlist(rc); }(),  // cu_required_compunits
+
       vlist(prims),               // cu_primitives
       vint(0),                    // cu_force_link
       vint(0),                    // cu_debug

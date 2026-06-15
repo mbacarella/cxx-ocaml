@@ -496,6 +496,21 @@ struct Translator {
   std::unordered_map<std::string, std::unordered_map<std::string, int>> mod_fields;
   // module name -> its value -> external prim (%builtin or C name) + arity, cached.
   std::unordered_map<std::string, std::unordered_map<std::string, StdPrim>> mod_prims;
+  std::unordered_map<std::string, std::string> prim_to_mod_;  // C prim -> declaring module
+  // Modules required (linked) because a C external of theirs is used in `l`.
+  void collect_required_globals(const LamPtr& l, std::set<std::string>& out) {
+    if (!l) return;
+    if (l->k == Lam::K::Prim && l->prim == Prim::Ccall)
+      if (auto it = prim_to_mod_.find(l->prim_id); it != prim_to_mod_.end())
+        out.insert(global_of(it->second));
+    collect_required_globals(l->fn, out); collect_required_globals(l->body, out);
+    collect_required_globals(l->cond, out); collect_required_globals(l->then_, out);
+    collect_required_globals(l->else_, out); collect_required_globals(l->sw_default, out);
+    for (auto& a : l->args) collect_required_globals(a, out);
+    for (auto& b : l->bindings) collect_required_globals(b.val, out);
+    for (auto& sc : l->sw_consts) collect_required_globals(sc.body, out);
+    for (auto& sc : l->sw_blocks) collect_required_globals(sc.body, out);
+  }
   // Locally-defined submodules: name -> its binder, and name -> field layout
   // (export value/submodule name -> field index), for resolving `M.x`.
   std::unordered_map<std::string, Ident> module_ident_;
@@ -1440,7 +1455,13 @@ struct Translator {
       auto cmi = cmi::CmiFile::load(path);
       int i = 0;
       for (auto& f : cmi.sig().fields) m[f] = i++;
-      for (auto& v : cmi.values()) if (!v.prim.empty()) pr[v.name] = {v.prim, v.prim_arity};
+      for (auto& v : cmi.values()) if (!v.prim.empty()) {
+        pr[v.name] = {v.prim, v.prim_arity};
+        // A real C primitive (`external f = "caml_.."`) used in the code makes
+        // this module a REQUIRED global (linked even though the call is a Ccall,
+        // not a getglobal): map the prim name -> its declaring stdlib module.
+        if (v.prim[0] != '%') prim_to_mod_.emplace(v.prim, mod);
+      }
     } catch (...) {}
     mod_prims[mod] = std::move(pr);
     return mod_fields[mod] = std::move(m);
@@ -10479,7 +10500,8 @@ struct Translator {
 }  // namespace
 
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
-                                const std::string& stdlib_dir, const std::string& file_name) {
+                                const std::string& stdlib_dir, const std::string& file_name,
+                                std::vector<std::string>* required_globals) {
   Translator t;
   t.stdlib_dir = stdlib_dir;
   t.file_name_ = file_name;
@@ -10504,6 +10526,11 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.simplify_local_functions(root);
   t.simplify_static_catches(root);
   t.inline_var_aliases(root);
+  if (required_globals) {
+    std::set<std::string> rg;
+    t.collect_required_globals(root, rg);
+    required_globals->assign(rg.begin(), rg.end());
+  }
   return root;
 }
 

@@ -89,9 +89,11 @@ int main(int argc, char** argv) {
   try {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
-    auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, in_path);
+    std::vector<std::string> required_globals;
+    auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, in_path,
+                                                          &required_globals);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
-    cppcaml::cmo::write_cmo(instrs, mod, cmo);
+    cppcaml::cmo::write_cmo(instrs, mod, cmo, required_globals);
   } catch (const cppcaml::ParseError& e) {
     std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
     return 1;
