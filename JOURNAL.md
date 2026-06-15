@@ -2412,3 +2412,45 @@ Remaining exec DIFFs are 3 deep subsystems: lib-dynlink-domains/test_generator
 (domains+dynlink codegen, SIGSEGV), typing-labels/mixin2 (polymorphic-variant
 `#var as x` abbreviation patterns in an object method -> Match_failure),
 typing-poly-bugs/pr6922_ok (parameterized virtual class-types, SIGSEGV).
+
+## mixin2 FIXED: object-method instance-var scoping + Obj.field/size (2026-06-15)
+
+Chased typing-labels/mixin2 to root cause via bisection.  The "lenient
+polymorphic-variant range-switch" theory from the prior note was a RED HERRING.
+Two real codegen bugs:
+
+1. **Instance vars must shadow the outer/module scope inside a method body.**
+   In `lexpr_ops`, the class-let `let lambda = new lambda_ops ops` (a per-object
+   instance variable) shares its name with the module-level `lambda = lazy_fix
+   (new lambda_ops)`.  Pexp_ident did a full lexical `lookup` BEFORE consulting
+   `inst_vars_`, so the method `#lambda as x -> lambda#eval x` dispatched to the
+   *global* lambda object (ops = itself, pure-lambda semantics) instead of the
+   per-object sub-object (ops = the lexpr fixpoint).  A mixed `App` carrying an
+   `expr` (`Num`) payload then reached lambda_ops#map -> no arm -> Match_failure.
+   Fix: a new `method_scope_floor_` records the method body's own scope frames;
+   Pexp_ident resolves method-local (param/let) first, then instance variables,
+   then the outer scope (the OCaml shadowing order).  Set at the 3 method /
+   initializer sites; val initialisers keep plain lexical lookup (floor 0).
+
+2. **%obj_size / %obj_field / %obj_set_field were unresolved** (`?size`/`?field`
+   placeholders -> SIGSEGV).  Map them to array.length[gen] /
+   array.unsafe_get[gen] / array.unsafe_set[gen] (translprim's lowering; Obj.t is
+   opaque so kind = gen), in both the application and eta-stub paths.  This was
+   actually masking the bisection -- every Obj.field probe I added crashed on
+   its own until this was fixed.
+
+exec **718 -> 719/722 (99.6%)**, lambda 431, completeness 100%, 0 regressions.
+
+Bisection method that worked: reduce the driver to one expression
+(`lexpr#eval (`App(`Abs("x",`Num 7),`Var"y"))` is the minimal crasher), then
+entry-print each method to find which gets the wrong value; the `-dlambda` of
+lexpr_ops's method bodies showed `(send lambda/406 ..)` (the global) where it
+should read `(field_computed self lambda/472)`.
+
+Remaining exec DIFFs (2 real): lib-dynlink-domains/test_generator (domains+
+dynlink codegen SIGSEGV), typing-poly-bugs/pr6922_ok (parameterized virtual
+class-types SIGSEGV).  Plus a NEWLY-FOUND separate bug (not yet fixed): a class
+with a top-level signature ascription `class c (o) : S = let .. in object`
+routes its lets to `per_obj_lets` (the "constraints prevent lifting" path),
+where they end up UNRESOLVED (`?ev`) in method bodies -- distinct from mixin2's
+lifted-lets path.  Minimal repro: /tmp/sub2.ml.
