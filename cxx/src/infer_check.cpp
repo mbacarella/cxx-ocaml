@@ -1,5 +1,6 @@
 #include "cppcaml/infer_check.hpp"
 
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <set>
@@ -11,7 +12,9 @@ namespace cppcaml {
 
 // Where the stdlib .cmi files live; see set_infer_stdlib_dir below.
 static std::string g_stdlib_dir = "stdlib";
+static std::vector<std::string> g_infer_module_dirs;  // extra -I dirs for local .cmi
 void set_infer_stdlib_dir(const std::string& dir) { g_stdlib_dir = dir; }
+void set_infer_module_dirs(std::vector<std::string> dirs) { g_infer_module_dirs = std::move(dirs); }
 
 namespace {
 
@@ -20,9 +23,17 @@ using namespace ast;
 
 // Path of a .cmi in the configured stdlib directory.
 std::string stdpath(const std::string& file) { return g_stdlib_dir + "/" + file; }
-// The .cmi of a stdlib head module ("Stdlib" itself or a Stdlib__X submodule).
+// The .cmi of a head module: the stdlib naming pattern, else (for a separately
+// compiled local module like `A`) the first <head>.cmi found in the -I dirs.
 std::string head_cmi(const std::string& head) {
-  return stdpath(head == "Stdlib" ? "stdlib.cmi" : "stdlib__" + head + ".cmi");
+  std::string sp = stdpath(head == "Stdlib" ? "stdlib.cmi" : "stdlib__" + head + ".cmi");
+  if (std::filesystem::exists(sp)) return sp;
+  std::string low = (char)std::tolower((unsigned char)head[0]) + head.substr(1);
+  for (const std::string& d : g_infer_module_dirs) {
+    if (std::filesystem::exists(d + "/" + low + ".cmi")) return d + "/" + low + ".cmi";
+    if (std::filesystem::exists(d + "/" + head + ".cmi")) return d + "/" + head + ".cmi";
+  }
+  return sp;
 }
 using I::TypePtr;
 

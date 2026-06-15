@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
     if (fs::exists(fs::path(d) / "stdlib.cmi")) { stdlib_dir = d; break; }
   stdlib_dir = discover_stdlib(stdlib_dir);
   cppcaml::lambda::set_module_dirs(incdirs);
+  cppcaml::set_infer_module_dirs(incdirs);
   if (out_path.empty()) {
     fs::path p(in_path);
     out_path = compile_only ? (p.parent_path() / (p.stem().string() + ".cmo")).string()

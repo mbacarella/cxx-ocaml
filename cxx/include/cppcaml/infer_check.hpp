@@ -68,6 +68,10 @@ ValueKinds infer_value_kinds(const ast::Structure& s);
 // like c++ocamlc, must set the discovered absolute path first).
 void set_infer_stdlib_dir(const std::string& dir);
 
+// Extra -I dirs the inferencer searches for a separately-compiled local module's
+// .cmi (so a dependent gets real types for `A.x`, not Any).
+void set_infer_module_dirs(std::vector<std::string> dirs);
+
 // A compilation unit's top-level value signature (in source order) as cmiw type
 // descriptors, bridged from the inferencer's types -- the input to
 // cmi::cmiw::write_cmi.  Only single-variable top-level `let` bindings are
