@@ -2642,6 +2642,18 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
           out.push_back(cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors)));
           continue;
         }
+        if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
+          std::vector<cmi::cmiw::Label> labels;
+          for (auto& f : rec->fields) {
+            cmi::cmiw::Label lab;
+            lab.name = f.name.txt;
+            lab.mut = (f.mut == MutableFlag::Mutable);
+            lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
+            labels.push_back(std::move(lab));
+          }
+          out.push_back(cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels)));
+          continue;
+        }
         cmi::cmiw::TyPtr manifest = nullptr;
         if (d.manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
         out.push_back(cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest));

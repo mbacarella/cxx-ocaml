@@ -764,6 +764,16 @@ std::string write_cmi(const std::string& path, const std::string& modname,
                                       o::vint(0) /*attrs*/, o::vint(0) /*Uid.Internal*/}));
         }
         kind = o::vblock(2, {o::vlist(cds), o::vint(0) /*Variant_regular*/});  // Type_variant
+      } else if (!it.labels.empty()) {
+        int lstamp = 280;
+        std::vector<o::ValPtr> lds;
+        for (auto& l : it.labels) {
+          auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
+          lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
+                                      o::vint(0) /*ld_atomic Nonatomic*/, te.emit(l.ty),
+                                      loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
+        }
+        kind = o::vblock(1, {o::vlist(lds), o::vint(0) /*Record_regular*/});  // Type_record
       } else {
         kind = o::vblock(0, {o::vint(0)});  // Type_abstract(Definition)
       }
