@@ -7929,6 +7929,17 @@ struct Translator {
           return b;
         }
       }
+      // A predefined exception NOT exported as a Stdlib field (our self-built
+      // stdlib drops the `exception Not_found = Not_found` re-exports): use the
+      // predef global as its identity -- the SAME one exn_value/raise_predef use,
+      // so `raise Not_found` and `with Not_found ->` stay consistent all-ours.
+      if (is_predef_exn_name(n)) {
+        if (!k->arg) return predef_global(n);
+        auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
+        b->args = {predef_global(n), expr(**k->arg)};
+        b->blk_shape = {ValueKind::Gen, expr_kind(k->arg->get())};
+        return b;
+      }
       // a stdlib module's exception, constructed (`Arg.Bad msg`): identity is the
       // module's export field (uppercase non-ctor exports are exceptions)
       if (auto* dq = std::get_if<Ldot>(&k->id.txt.v))
