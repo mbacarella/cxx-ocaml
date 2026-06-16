@@ -2771,7 +2771,8 @@ struct Translator {
     if ((prim == "%bytes_safe_set" || prim == "%bytes_set") && n == 3) return ic("bytes.set");
     if (prim == "%string_length" && n == 1) return ic("string.length");
     if (prim == "%bytes_length" && n == 1) return ic("bytes.length");
-    if ((prim == "%bytes_to_string" || prim == "%string_to_bytes") && n == 1) return argv[0];
+    if ((prim == "%bytes_to_string" || prim == "%bytes_of_string" ||
+         prim == "%string_to_bytes" || prim == "%string_of_bytes") && n == 1) return argv[0];
     if (prim == "%makemutable" && n == 1) {  // `ref` as a value: (makemutable 0 prim)
       auto m = mk(Lam::K::Prim); m->prim = Prim::Makemutable; m->prim_arg = 0;
       m->blk_shape = {ValueKind::Gen}; m->args = argv; return m;
@@ -3069,8 +3070,11 @@ struct Translator {
     if (prim == "%bytes_safe_set" && as.size() == 3) return op("bytes.set");
     if (prim == "%string_length" && as.size() == 1) return op("string.length");
     if (prim == "%bytes_length" && as.size() == 1) return op("bytes.length");
-    // `%bytes_to_string` / `%string_to_bytes` are representation no-ops (identity).
-    if ((prim == "%bytes_to_string" || prim == "%string_to_bytes") && as.size() == 1)
+    // bytes<->string conversions are representation no-ops (identity).  The real
+    // prim names are %bytes_to_string / %bytes_of_string (bytes.ml's
+    // unsafe_to_string / unsafe_of_string); also accept the %string_* spellings.
+    if ((prim == "%bytes_to_string" || prim == "%bytes_of_string" ||
+         prim == "%string_to_bytes" || prim == "%string_of_bytes") && as.size() == 1)
       return expr(*as[0].second);
     // Array access builtins as locally-declared externals: the same spelling
     // and lowering as Array.get/set (element kind from the application).

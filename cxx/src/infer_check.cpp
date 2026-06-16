@@ -2602,7 +2602,16 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
     case K::Constr: {
       std::vector<cmi::cmiw::TyPtr> as;
       for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));
-      return cmi::cmiw::ty_constr(t->path, std::move(as));
+      std::string path = t->path;
+      // The printf-family format type (format/format4/format6, all canonicalised
+      // to "format6" by from_coretype) lives in CamlinternalFormatBasics.  Qualify
+      // it so the cmi writer emits a real Tconstr (Pdot) instead of degrading the
+      // bare name to a Tvar -- otherwise a `val printf : (...) format -> 'a`
+      // records as `'_ -> '_`, the reader can't see the format type, and format
+      // string literals aren't lowered to fmt values (Printf then gets a raw
+      // string and dies in make_printf).
+      if (path == "format6") path = "CamlinternalFormatBasics.format6";
+      return cmi::cmiw::ty_constr(path, std::move(as));
     }
     case K::Link: return bridge_ty(t->link, vars, nextvar);
   }
