@@ -7958,6 +7958,13 @@ struct Translator {
               fi->prim_arg = f->second; fi->args = {base};
               return fi;
             }
+            // A submodule's EXTERNAL member (no runtime field) used as a value:
+            // eta-stub the primitive (domain.ml's `Raw.get_domain_count`).  The
+            // submodule's externals were registered by bare name when it was built.
+            if (auto ex = externals_.find(d->name); ex != externals_.end())
+              if (LamPtr s = prim_stub(ex->second)) return s;
+            if (auto lp = local_prims_.find(d->name); lp != local_prims_.end())
+              if (LamPtr s = prim_stub({lp->second.first, lp->second.second})) return s;
           }
           // `open StdLabels` brings `List` into scope as an alias to ListLabels;
           // a `List.x` then resolves through the alias target (shadows the plain
