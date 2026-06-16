@@ -91,7 +91,11 @@ public:
               md.name = ident(item.fields[0]).name;
               // module_declaration.md_type is field 0 of the record.
               md.type = module_type(arena_[item.fields[2]].fields.at(0));
-              out.fields.push_back(md.name);  // a submodule takes a field
+              // Only a present submodule (Mp_present = int 0) takes a runtime
+              // field; an Mp_absent module alias is transparent (no field).
+              const m::Value& pres = arena_[item.fields[1]];
+              bool absent = (pres.kind == m::Value::Kind::Int && pres.i != 0);
+              if (!absent) out.fields.push_back(md.name);
               out.modules.push_back(std::move(md));
             }
             break;
@@ -873,18 +877,21 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // A submodule takes a runtime field, so it must appear in the signature
       // to keep the surrounding value field layout aligned.
       o::ValPtr mty;
+      int presence = 0;  // Mp_present: takes a runtime field
       if (!it.alias.empty()) {
-        // `module name = <unit>`: Mty_alias(Pident(Global unit)).  Record the
-        // unit so it's imported with its CRC.
-        referenced.emplace(it.alias, false);  // alias import: CRC=None (no cycle)
+        // `module name = <unit>`: Mty_alias(Pident(Global unit)), Mp_absent --
+        // an alias is transparent and takes NO runtime field.  Record the unit so
+        // it's imported (CRC=None, like -no-alias-deps).
+        referenced.emplace(it.alias, false);
         auto path = o::vblock(0, {o::vblock(2, {o::vstr(it.alias)})});  // Pident(Global)
         mty = o::vblock(3, {path});  // Mty_alias
+        presence = 1;  // Mp_absent
       } else {
         mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature
       }
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                               o::vint(0) /*md_uid*/});  // module_declaration
-      sig.push_back(o::vblock(3, {ident, o::vint(0) /*Mp_present*/, md,
+      sig.push_back(o::vblock(3, {ident, o::vint(presence), md,
                                   o::vint(0) /*Trec_not*/, o::vint(0) /*Exported*/}));  // Sig_module
     } else {
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an

@@ -11276,6 +11276,17 @@ struct Translator {
           // a module the struct ELIDED as an alias (`module Elem = E`) but the
           // ascribed sig exposes -> materialise the alias value at this slot.
           ce.push_back(a->second); cn.push_back(nm);
+        } else if (auto ex = externals_.find(nm);
+                   ex != externals_.end() && prim_stub(ex->second)) {
+          // The impl declares this as an `external` (inlined, no field) but the
+          // interface exposes it as a `val` (takes a field): materialise the
+          // primitive as an eta-stub closure, like ocamlc's coercion does --
+          // e.g. stdlib.ml's `external flush = "caml_ml_flush"` vs stdlib.mli's
+          // `val flush`.
+          ce.push_back(prim_stub(ex->second)); cn.push_back(nm);
+        } else if (auto lp = local_prims_.find(nm);
+                   lp != local_prims_.end() && prim_stub({lp->second.first, lp->second.second})) {
+          ce.push_back(prim_stub({lp->second.first, lp->second.second})); cn.push_back(nm);
         } else {
           // an S member that is a PRIMITIVE of an `include`d stdlib module
           // (`include Float.Array` then `: S` with `val unsafe_get`): it has no
@@ -11349,9 +11360,28 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   lap("register types/ctors + stdlib.cmi");
   t.mod_path_ = module_name;
   t.unit_name_ = module_name;
+  // If this unit has a hand-written interface (.mli, already compiled to .cmi),
+  // coerce the implementation's module block to the interface's field order --
+  // exactly the impl->intf coercion ocamlc performs.  Without it, the .cmo block
+  // is laid out in .ml definition order while consumers read fields at the .cmi's
+  // (.mli) order, so a separate compilation against the .cmi reads wrong fields
+  // (e.g. std_exit's `do_at_exit` vs stdlib.ml's layout -> segfault).
+  std::vector<std::string> mli_fields;
+  {
+    namespace fs = std::filesystem;
+    fs::path mli = fs::path(file_name); mli.replace_extension(".mli");
+    fs::path cmi = fs::path(file_name); cmi.replace_extension(".cmi");
+    if (fs::exists(mli) && fs::exists(cmi)) {
+      try {
+        auto c = cmi::CmiFile::load(cmi.string());
+        if (c.module_name() == module_name) mli_fields = c.sig().fields;
+      } catch (...) {}
+    }
+  }
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
-  sg->args.push_back(t.wrap_shared(t.build_module(s, nullptr)));
+  sg->args.push_back(t.wrap_shared(
+      t.build_module(s, nullptr, mli_fields.empty() ? nullptr : &mli_fields)));
   lap("build_module");
   LamPtr root = sg;
   t.simplify_local_functions(root);
