@@ -9899,6 +9899,14 @@ struct Translator {
   // A local functor's per-parameter declared types (for coercing a functor-
   // typed argument's result; functor_param_sig_ holds only the FIRST).
   std::unordered_map<std::string, std::vector<const ModuleType*>> functor_param_types_;
+  // From this unit's own .mli (.cmi): a top-level functor's name -> its RESULT
+  // signature field order (Map.Make -> S's fields).  Used to coerce the functor
+  // BODY struct in map.ml (which has no `: S` on the .ml side) to S's layout, so
+  // Map.Make(..).cardinal etc. land at the right field index.
+  std::unordered_map<std::string, std::vector<std::string>> mli_functor_results_;
+  // Set just before compiling a functor whose body must be coerced to its .mli
+  // result signature; consumed (and cleared) by compile_module_expr's body build.
+  std::vector<std::string> pending_functor_coerce_;
   // Coerce a stdlib/local module VALUE to a target signature layout, eta-stubbing
   // members that are EXTERNALS of the source module (`Int32.neg` = %int32_neg,
   // not a field) and field-reading the rest.  This is how a functor argument's
@@ -10171,7 +10179,15 @@ struct Translator {
         fn->params.push_back({pid, ValueKind::Gen});
         cur = pf->body.get();
       }
-      fn->body = compile_module_expr(*cur);
+      // If the enclosing binding requested a result coercion (.mli `module Make
+      // (..) : S`), lay the body struct out per S's field order.
+      auto pending = std::move(pending_functor_coerce_); pending_functor_coerce_.clear();
+      if (auto* ps = std::get_if<Pmod_structure>(&cur->desc); ps && !pending.empty()) {
+        std::vector<std::string> sub;
+        fn->body = build_module(ps->items, &sub, &pending, &pending);
+      } else {
+        fn->body = compile_module_expr(*cur);
+      }
       restore_sig_exts(ext_saves);
       restore_sig_ctors(ctor_saves);
       for (auto it = pvs_saves.rbegin(); it != pvs_saves.rend(); ++it) {
@@ -10911,7 +10927,13 @@ struct Translator {
             Ident mid = fresh(*mb.name.txt);            // a functor binds as a function
             std::string saved_mp = mod_path_;  // __FUNCTION__ inside is `..Functor.fn`
             mod_path_ += (mod_path_.empty() ? "" : ".") + *mb.name.txt;
+            // .mli-driven functor-result coercion: lay this functor's body struct
+            // out per its declared result signature (the .ml has no `: S`).
+            if (auto fr = mli_functor_results_.find(*mb.name.txt);
+                fr != mli_functor_results_.end())
+              pending_functor_coerce_ = fr->second;
             LamPtr fv = compile_module_expr(mb.expr);
+            pending_functor_coerce_.clear();
             mod_path_ = saved_mp;
             cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
@@ -11479,7 +11501,15 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     if (fs::exists(mli) && fs::exists(cmi)) {
       try {
         auto c = cmi::CmiFile::load(cmi.string());
-        if (c.module_name() == module_name) mli_fields = c.sig().fields;
+        if (c.module_name() == module_name) {
+          mli_fields = c.sig().fields;
+          // record each top-level functor's RESULT field order, to coerce its
+          // body struct (Map.Make : S -> S's fields).
+          for (auto& md : c.modules())
+            if (md.type && md.type->kind == cmi::ModuleType::Functor &&
+                md.type->functor_body && md.type->functor_body->sig)
+              t.mli_functor_results_[md.name] = md.type->functor_body->sig->fields;
+        }
       } catch (...) {}
     }
   }
