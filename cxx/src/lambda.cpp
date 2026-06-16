@@ -933,13 +933,26 @@ struct Translator {
   // (e.g. a `Seq.Cons(x,_)` pattern needs Seq.node's Nil/Cons tags so the matcher
   // can bind x and decide exhaustiveness).  Idempotent; local modules are skipped.
   void register_qualified_ctor(const Longident& id) {
-    auto* d = std::get_if<Ldot>(&id.v);
-    if (!d) return;
-    auto* pl = std::get_if<Lident>(&d->prefix->v);
-    if (!pl || module_base(pl->name)) return;
-    if (ctor_info_.count(d->name)) return;
-    auto& mc = module_ctors(pl->name);
-    auto f = mc.find(d->name);
+    std::string ctor_name, mod;
+    if (auto* d = std::get_if<Ldot>(&id.v)) {  // `M.C`
+      auto* pl = std::get_if<Lident>(&d->prefix->v);
+      if (!pl || module_base(pl->name)) return;
+      ctor_name = d->name; mod = pl->name;
+    } else if (auto* l = std::get_if<Lident>(&id.v)) {  // bare `C` via an `open M`
+      // A constructor brought into scope by `open CamlinternalFormatBasics` etc.
+      // must register its whole type too, else the match compiler can't find the
+      // type's constructor count (type_ctors_) and falls back to a degenerate
+      // single-arm match (this is what broke fmtty_rel's GADT match in Printf).
+      if (ctor_info_.count(l->name)) return;  // predef/local/already-known wins
+      for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+        if (it->find('.') != std::string::npos || module_base(*it)) continue;
+        if (module_ctors(*it).count(l->name)) { ctor_name = l->name; mod = *it; break; }
+      }
+      if (mod.empty()) return;
+    } else return;
+    if (ctor_info_.count(ctor_name)) return;
+    auto& mc = module_ctors(mod);
+    auto f = mc.find(ctor_name);
     if (f == mc.end()) return;
     const std::string ty = f->second.type;
     int nc = 0, nb = 0;
