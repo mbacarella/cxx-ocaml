@@ -665,6 +665,9 @@ namespace o = omarshal;
 TyPtr ty_predef(const std::string& n) { auto t = std::make_shared<Ty>(); t->k = Ty::Constr; t->name = n; return t; }
 TyPtr ty_constr(const std::string& n, std::vector<TyPtr> as) { auto t = std::make_shared<Ty>(); t->k = Ty::Constr; t->name = n; t->args = std::move(as); return t; }
 TyPtr ty_arrow(const TyPtr& d, const TyPtr& c) { auto t = std::make_shared<Ty>(); t->k = Ty::Arrow; t->args = {d, c}; return t; }
+TyPtr ty_arrow_lbl(const TyPtr& d, const TyPtr& c, int lk, const std::string& lbl) {
+  auto t = std::make_shared<Ty>(); t->k = Ty::Arrow; t->args = {d, c};
+  t->label_kind = lk; t->label = lbl; return t; }
 TyPtr ty_tuple(std::vector<TyPtr> es) { auto t = std::make_shared<Ty>(); t->k = Ty::Tuple; t->args = std::move(es); return t; }
 TyPtr ty_var(int id) { auto t = std::make_shared<Ty>(); t->k = Ty::Var; t->var = id; return t; }
 
@@ -810,7 +813,12 @@ struct TyEmit {
         // (btype.tpoly_get_mono) if the argument isn't a Tpoly.
         o::ValPtr dom = texpr(o::vblock(8, {emit(t->args[0]), o::vint(0) /*[]*/}));  // Tpoly
         o::ValPtr c = emit(t->args[1]);
-        return texpr(o::vblock(1, {o::vint(0) /*Nolabel*/, dom, c, o::vint(0) /*Cok*/}));  // Tarrow
+        // arg_label = Nolabel (int 0) | Labelled of string (block tag 0)
+        //           | Optional of string (block tag 1)
+        o::ValPtr lbl = t->label_kind == 1 ? o::vblock(0, {o::vstr(t->label)})
+                      : t->label_kind == 2 ? o::vblock(1, {o::vstr(t->label)})
+                      : o::vint(0) /*Nolabel*/;
+        return texpr(o::vblock(1, {lbl, dom, c, o::vint(0) /*Cok*/}));  // Tarrow
       }
       case Ty::Tuple: {
         std::vector<o::ValPtr> elems;

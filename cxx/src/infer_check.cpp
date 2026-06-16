@@ -2593,7 +2593,9 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
     }
     case K::Any: return cmi::cmiw::ty_var(nextvar++);
     case K::Arrow:
-      return cmi::cmiw::ty_arrow(bridge_ty(t->dom, vars, nextvar), bridge_ty(t->cod, vars, nextvar));
+      return cmi::cmiw::ty_arrow_lbl(bridge_ty(t->dom, vars, nextvar),
+                                     bridge_ty(t->cod, vars, nextvar),
+                                     t->arrow_label, t->arrow_lbl);
     case K::Tuple: {
       std::vector<cmi::cmiw::TyPtr> as;
       for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));

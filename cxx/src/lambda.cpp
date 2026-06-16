@@ -2240,6 +2240,11 @@ struct Translator {
       }
     } else if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
       if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+        // `DLS.new_key` where DLS is a local submodule of THIS unit: its value
+        // label sig from this unit's own .cmi (fills the omitted optional).
+        if (auto it = local_member_sig_.find(pl->name); it != local_member_sig_.end())
+          if (auto vit = it->second.find(d->name); vit != it->second.end())
+            return vit->second;
         // `H.create` where H is a functor parameter: its sig's labelled value sig.
         if (auto it = param_value_sigs_.find(pl->name); it != param_value_sigs_.end())
           if (auto vit = it->second.find(d->name); vit != it->second.end())
@@ -2794,9 +2799,26 @@ struct Translator {
         pr->args = std::move(v); return pr; };
       if (prim == "%atomic_load" && n == 1) return acc("caml_atomic_load_field", {argv[0], cint(0)});
       if (prim == "%atomic_exchange" && n == 2) return acc("caml_atomic_exchange_field", {argv[0], cint(0), argv[1]});
-      if (prim == "%atomic_compare_and_set" && n == 3) return acc("caml_atomic_cas_field", {argv[0], cint(0), argv[1], argv[2]});
+      if ((prim == "%atomic_compare_and_set" || prim == "%atomic_cas") && n == 3) return acc("caml_atomic_cas_field", {argv[0], cint(0), argv[1], argv[2]});
       if (prim == "%atomic_fetch_add" && n == 2) return acc("caml_atomic_fetch_add_field", {argv[0], cint(0), argv[1]});
       if (prim == "%dls_get" && n == 1) return acc("caml_domain_dls_get", {argv[0]});
+      // %atomic_*_loc (OCaml 5.2+ atomic-location API): arg0 is a 2-field block
+      // (obj, field-index) from `[%atomic.loc e.field]`; bind it to a temp and
+      // forward (obj, field) to the runtime caml_atomic_*_field primitive.
+      auto loc_call = [&](const char* fn, std::vector<LamPtr> extra) {
+        Ident t = fresh("loc", true);
+        std::vector<LamPtr> v = {fieldimm(0, varof(t)), fieldimm(1, varof(t))};
+        for (auto& e : extra) v.push_back(std::move(e));
+        auto pr = acc(fn, std::move(v));
+        auto l = mk(Lam::K::Let);
+        l->bindings = {{t, ValueKind::Gen, argv[0]}};
+        l->body = pr;
+        return l;
+      };
+      if (prim == "%atomic_load_loc" && n == 1) return loc_call("caml_atomic_load_field", {});
+      if (prim == "%atomic_exchange_loc" && n == 2) return loc_call("caml_atomic_exchange_field", {argv[1]});
+      if (prim == "%atomic_cas_loc" && n == 3) return loc_call("caml_atomic_cas_field", {argv[1], argv[2]});
+      if (prim == "%atomic_fetch_add_loc" && n == 2) return loc_call("caml_atomic_fetch_add_field", {argv[1]});
     }
     if (prim == "%makemutable" && n == 1) {  // `ref` as a value: (makemutable 0 prim)
       auto m = mk(Lam::K::Prim); m->prim = Prim::Makemutable; m->prim_arg = 0;
@@ -3015,7 +3037,7 @@ struct Translator {
       if (prim == "%atomic_exchange" && as.size() == 2)
         return cc("caml_atomic_exchange_field",
                   {expr(*as[0].second), cint(0), expr(*as[1].second)});
-      if (prim == "%atomic_compare_and_set" && as.size() == 3)
+      if ((prim == "%atomic_compare_and_set" || prim == "%atomic_cas") && as.size() == 3)
         return cc("caml_atomic_cas_field", {expr(*as[0].second), cint(0),
                   expr(*as[1].second), expr(*as[2].second)});
       if (prim == "%atomic_fetch_add" && as.size() == 2)
@@ -3025,6 +3047,31 @@ struct Translator {
       // Domain.DLS.new_key runs this at module init (needed by Hashtbl).
       if (prim == "%dls_get" && as.size() == 1)
         return cc("caml_domain_dls_get", {expr(*as[0].second)});
+      // The OCaml 5.2+ atomic-LOCATION API (Atomic.fetch_and_add etc. call
+      // `Loc.* [%atomic.loc t.contents]`).  `[%atomic.loc e.field]` lowers to a
+      // 2-field block (obj, field-index) (see the Pexp_extension handler), so a
+      // `%atomic_*_loc` op binds that pair to a temp and forwards (obj, field).
+      {
+        auto loc_call = [&](const char* fn, std::vector<LamPtr> extra) {
+          Ident t = fresh("loc", true);
+          std::vector<LamPtr> v = {fieldimm(0, varof(t)), fieldimm(1, varof(t))};
+          for (auto& e : extra) v.push_back(std::move(e));
+          auto pr = cc(fn, std::move(v));
+          auto l = mk(Lam::K::Let);
+          l->bindings = {{t, ValueKind::Gen, expr(*as[0].second)}};
+          l->body = pr;
+          return l;
+        };
+        if (prim == "%atomic_load_loc" && as.size() == 1)
+          return loc_call("caml_atomic_load_field", {});
+        if (prim == "%atomic_exchange_loc" && as.size() == 2)
+          return loc_call("caml_atomic_exchange_field", {expr(*as[1].second)});
+        if (prim == "%atomic_cas_loc" && as.size() == 3)
+          return loc_call("caml_atomic_cas_field",
+                          {expr(*as[1].second), expr(*as[2].second)});
+        if (prim == "%atomic_fetch_add_loc" && as.size() == 2)
+          return loc_call("caml_atomic_fetch_add_field", {expr(*as[1].second)});
+      }
     }
     // Sys compile-time constants (%word_size, %big_endian, %ostype_unix, ...):
     // the oracle lowers each to `(sys.constant_X 0)`; in bytecode that is a ccall
@@ -8625,12 +8672,27 @@ struct Translator {
       if (LamPtr o = object_expr(*ob->cs)) return o;
     // [%extension_constructor M.A]: the constructor's runtime identity -- the
     // payload constructor expression's own (unapplied) value.
-    if (auto* xe = std::get_if<Pexp_extension>(&e.desc))
+    if (auto* xe = std::get_if<Pexp_extension>(&e.desc)) {
       if ((xe->name == "extension_constructor" ||
            xe->name == "ocaml.extension_constructor") &&
           xe->payload.str.size() == 1)
         if (auto* ev = std::get_if<Pstr_eval>(&xe->payload.str[0].desc))
           return expr(*ev->e);
+      // `[%atomic.loc e.field]`: an atomic LOCATION (OCaml 5.2+ atomic API), which
+      // we represent as the pair (obj, field-index); the %atomic_*_loc primitives
+      // consume that pair (-> caml_atomic_*_field obj field ..).  Used by atomic.ml
+      // (Atomic.fetch_and_add etc. via Loc.* [%atomic.loc t.contents]).
+      if ((xe->name == "atomic.loc" || xe->name == "ocaml.atomic.loc") &&
+          xe->payload.str.size() == 1)
+        if (auto* ev = std::get_if<Pstr_eval>(&xe->payload.str[0].desc))
+          if (auto* fa = std::get_if<Pexp_field>(&ev->e->desc)) {
+            int idx = 0;
+            if (auto* fi = find_field(lid_last(fa->field.txt))) idx = fi->index;
+            auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+            blk->args = {expr(*fa->e), cint(idx)};
+            return blk;
+          }
+    }
     if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {  // new c -> (apply (field_mut 0 c) 0)
       LamPtr clsval;
       if (auto* l = std::get_if<Lident>(&nw->id.txt.v)) {
@@ -9946,6 +10008,17 @@ struct Translator {
   // BODY struct in map.ml (which has no `: S` on the .ml side) to S's layout, so
   // Map.Make(..).cardinal etc. land at the right field index.
   std::unordered_map<std::string, std::vector<std::string>> mli_functor_results_;
+  // From this unit's own .mli (.cmi): a SUBMODULE's value label signatures
+  // (`Domain.DLS.new_key`'s `?split_from_parent`), keyed by the immediate
+  // submodule name -> value name -> FnSig.  Lets a same-unit call to a local
+  // submodule member (`DLS.new_key (fun..)`) fill the omitted optional, just as
+  // submodule_of does for a cross-module call.
+  std::unordered_map<std::string, std::unordered_map<std::string, FnSig>> local_member_sig_;
+  // From this unit's own .mli (.cmi): a SUBMODULE's exported field order, keyed by
+  // the immediate submodule name.  The top-level impl->intf coercion uses it to
+  // reorder a submodule's OWN block to its .mli layout (domain.ml's DLS struct has
+  // new_key at internal field 5, but Domain.DLS's signature exposes it at field 0).
+  std::unordered_map<std::string, std::vector<std::string>> mli_submodule_fields_;
   // Set just before compiling a functor whose body must be coerced to its .mli
   // result signature; consumed (and cleared) by compile_module_expr's body build.
   std::vector<std::string> pending_functor_coerce_;
@@ -11440,7 +11513,18 @@ struct Translator {
       for (auto& nm : *coerce) {
         auto it = std::find(export_names.begin(), export_names.end(), nm);
         if (it != export_names.end()) {
-          ce.push_back(exports[it - export_names.begin()]); cn.push_back(nm);
+          LamPtr val = exports[it - export_names.begin()];
+          // a submodule whose own block layout differs from its .mli signature
+          // (Domain.DLS: internal field order != exposed [new_key; get; set])
+          // is reprojected to the .mli order so external field reads land right.
+          if (auto sf = mli_submodule_fields_.find(nm); sf != mli_submodule_fields_.end())
+            if (auto li = module_layout_.find(nm); li != module_layout_.end()) {
+              std::vector<std::string> srclay(li->second.size());
+              for (auto& [fn2, ix] : li->second)
+                if (ix >= 0 && ix < (int)srclay.size()) srclay[ix] = fn2;
+              if (LamPtr c = coerce_block(val, srclay, sf->second)) val = c;
+            }
+          ce.push_back(val); cn.push_back(nm);
         } else if (auto a = module_alias_.find(nm); a != module_alias_.end()) {
           // a module the struct ELIDED as an alias (`module Elem = E`) but the
           // ascribed sig exposes -> materialise the alias value at this slot.
@@ -11547,10 +11631,22 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
           mli_fields = c.sig().fields;
           // record each top-level functor's RESULT field order, to coerce its
           // body struct (Map.Make : S -> S's fields).
-          for (auto& md : c.modules())
+          for (auto& md : c.modules()) {
             if (md.type && md.type->kind == cmi::ModuleType::Functor &&
                 md.type->functor_body && md.type->functor_body->sig)
               t.mli_functor_results_[md.name] = md.type->functor_body->sig->fields;
+            // a plain submodule (Domain.DLS): record its values' label sigs so a
+            // same-unit `DLS.new_key (fun..)` fills the omitted optional, and its
+            // exported field order so the impl->intf coercion reorders its block.
+            if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig) {
+              t.mli_submodule_fields_[md.name] = md.type->sig->fields;
+              for (auto& v : md.type->sig->values) {
+                Translator::FnSig fs = Translator::cmi_arrow_sig(v.type);
+                for (auto& [k, n] : fs)
+                  if (k != 0) { t.local_member_sig_[md.name][v.name] = fs; break; }
+              }
+            }
+          }
         }
       } catch (...) {}
     }

@@ -193,10 +193,14 @@ struct Ty {
   std::string name;            // Constr: type-ctor name ("int","list","M.t",...)
   std::vector<TyPtr> args;     // Constr: type args; Arrow: {dom, cod}; Tuple: elems
   int var = 0;                 // Var: identity within one signature item
+  int label_kind = 0;          // Arrow: 0 Nolabel, 1 Labelled, 2 Optional
+  std::string label;           // Arrow: label name (Labelled/Optional)
 };
 TyPtr ty_predef(const std::string& name);             // nullary predef constr
 TyPtr ty_constr(const std::string& name, std::vector<TyPtr> args);
 TyPtr ty_arrow(const TyPtr& dom, const TyPtr& cod);
+TyPtr ty_arrow_lbl(const TyPtr& dom, const TyPtr& cod, int label_kind,
+                   const std::string& label);
 TyPtr ty_tuple(std::vector<TyPtr> elems);
 TyPtr ty_var(int id);
 
