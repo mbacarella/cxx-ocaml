@@ -214,7 +214,7 @@ struct Ctor { std::string name; std::vector<TyPtr> args; };  // Cstr_tuple args
 struct Label { std::string name; bool mut = false; TyPtr ty; };  // record field
 struct SigItem;
 struct SigItem {
-  enum K { Value, Type, Module } k = Value;
+  enum K { Value, Type, Module, Modtype } k = Value;
   std::string name;
   TyPtr ty;                   // Value: the value's type
   std::vector<TyPtr> params;  // Type: type parameters (Var descriptors)
@@ -249,6 +249,11 @@ inline SigItem sig_module_functor(std::string n, std::string param,
 }
 inline SigItem sig_module(std::string n, std::vector<SigItem> items) {
   SigItem s; s.k = SigItem::Module; s.name = std::move(n); s.sub = std::move(items); return s;
+}
+// A `module type S = sig .. end` declaration (takes NO runtime field).  Lets a
+// functor parameter `(H : Hashtbl.HashedType)` resolve H.equal/H.hash to fields.
+inline SigItem sig_modtype(std::string n, std::vector<SigItem> items) {
+  SigItem s; s.k = SigItem::Modtype; s.name = std::move(n); s.sub = std::move(items); return s;
 }
 inline SigItem sig_module_alias(std::string n, std::string target) {
   SigItem s; s.k = SigItem::Module; s.name = std::move(n); s.alias = std::move(target); return s;

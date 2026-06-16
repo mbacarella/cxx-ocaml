@@ -2744,6 +2744,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(*bs)));
         }
       }
+    } else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
+      // `module type S = sig .. end`: emit it so a functor parameter typed by S
+      // (`Make (H : Hashtbl.HashedType)`) can resolve H's members to fields.
+      if (pmt->type)
+        if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
+          out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
     }
   }
   return out;

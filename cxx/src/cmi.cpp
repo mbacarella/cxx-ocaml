@@ -910,6 +910,13 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                               o::vint(0) /*md_uid*/});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(presence), md,
                                   o::vint(0) /*Trec_not*/, o::vint(0) /*Exported*/}));  // Sig_module
+    } else if (it.k == SigItem::Modtype) {
+      // Sig_modtype(id, modtype_declaration, vis).  mtd_type = Some(Mty_signature
+      // sig).  Takes NO runtime field, so it never shifts the value layout.
+      auto msig = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature
+      auto mtd = o::vblock(0, {o::vblock(0, {msig}) /*Some*/, o::vint(0) /*attrs*/,
+                               loc_none(), o::vint(0) /*mtd_uid*/});  // modtype_declaration
+      sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
     } else {
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
       // alias (`type t = manifest`).  Variant/record kinds: the climb.
