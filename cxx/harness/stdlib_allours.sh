@@ -53,14 +53,28 @@ cp "$STD/std_exit.ml" "$BD/std_exit.ml"
 
 cat > "$BD/app.ml" <<'EOF'
 module M = Map.Make (Int)
+module SS = Set.Make (String)
 let () =
   Printf.printf "hello %d %s %b\n" 42 "world" true;
   Printf.printf "sum=%d\n" (List.fold_left (+) 0 (List.map (fun x -> x*x) [1;2;3;4]));
   Printf.printf "cat=%s sub=%s\n" (String.concat "-" ["a";"b";"c"]) (String.sub "abcdef" 1 3);
   Printf.printf "sorted=%s\n" (String.concat "," (List.map string_of_int (List.sort compare [3;1;2])));
+  Printf.printf "filt=%d seq=%d\n" (List.length (List.filter (fun x -> x > 1) [1;2;3]))
+    (List.length (List.of_seq (List.to_seq [1;2;3;4])));
+  Printf.printf "opt=%d res=%s either=%b\n"
+    (Option.value (Option.bind (Some 4) (fun x -> Some (x*2))) ~default:0)
+    (Result.fold ~ok:string_of_int ~error:(fun e -> e) (Ok 9))
+    (Either.is_right (Either.Right 1 : (int, int) Either.t));
   let m = M.add 3 "c" (M.add 1 "a" (M.add 2 "b" M.empty)) in
-  Printf.printf "map=%s card=%d find2=%s\n"
+  let s = SS.add "b" (SS.add "a" SS.empty) in
+  Printf.printf "map=%s card=%d find2=%s set=%s\n"
     (String.concat "" (List.map snd (M.bindings m))) (M.cardinal m) (M.find 2 m)
+    (String.concat "" (SS.elements s));
+  let q = Queue.create () in Queue.add 1 q; Queue.add 2 q;
+  let b = Buffer.create 4 in List.iter (Buffer.add_string b) ["x";"y";"z"];
+  Printf.printf "qpop=%d buf=%s float=%.2f i32=%ld lazy=%d\n"
+    (Queue.pop q) (Buffer.contents b) (Float.sqrt 2.0) 7l
+    (Lazy.force (lazy (let _ = () in 99)))
 EOF
 ( cd "$BD" && "$CPP" -c -I "$BD" app.ml ) 2>/dev/null || { echo "FAIL: app.ml"; exit 1; }
 
@@ -74,10 +88,13 @@ want='hello 42 world true
 sum=30
 cat=a-b-c sub=bcd
 sorted=1,2,3
-map=abc card=3 find2=b'
+filt=2 seq=4
+opt=8 res=9 either=true
+map=abc card=3 find2=b set=ab
+qpop=1 buf=xyz float=1.41 i32=7 lazy=99'
 echo "--- output (rc=$rc) ---"; printf '%s\n' "$out"
 if [ "$out" = "$want" ] && [ "$rc" = 0 ]; then
-  echo "MATCH: Printf/String/List/Map run correctly on the fully self-built stdlib"
+  echo "MATCH: stdlib core+data-structures (Printf/String/List/Seq/Option/Result/Either/Map/Set/Queue/Buffer/Float/Int32/Lazy) run on the fully self-built stdlib"
   exit 0
 else
   echo "DIFF: expected"; printf '%s\n' "$want"; exit 1
