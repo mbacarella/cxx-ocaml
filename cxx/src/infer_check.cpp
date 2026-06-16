@@ -2737,6 +2737,11 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
           if (const ast::Signature* rs = body_sig(*body)) result = signature_to_cmi(*rs);
           out.push_back(cmi::cmiw::sig_module_functor(*pm->md.name.txt, param,
                           std::move(param_sig), std::move(result)));
+        } else if (const ast::Signature* bs = body_sig(*pm->md.type)) {
+          // `module MD5 : S` (a NAMED module type) or `S with ...`: emit the
+          // submodule with S's resolved signature inline, so a consumer can
+          // resolve `Digest.MD5.bytes` to its field (else the module is dropped).
+          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(*bs)));
         }
       }
     }

@@ -1727,10 +1727,12 @@ struct Translator {
           if (sig->fields[i] == comp) { ix = (int)i; break; }
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comp) { md = &mm; break; }
-        if (ix < 0 || !md || !md->type || md->type->kind != cmi::ModuleType::Sig ||
-            !md->type->sig) { fail = true; break; }
+        // a submodule whose type is a NAMED module type (`Digest.MD5 : S`)
+        // resolves through this cmi's modtypes via mt_sig.
+        const cmi::Signature* nsig = md ? mt_sig(cmi, md->type) : nullptr;
+        if (ix < 0 || !nsig) { fail = true; break; }
         sm.path.push_back(ix);
-        sig = md->type->sig.get();
+        sig = nsig;
         if (nd == std::string::npos) break;
         pos = nd + 1;
       }
