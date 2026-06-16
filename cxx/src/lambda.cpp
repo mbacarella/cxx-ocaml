@@ -3190,6 +3190,17 @@ struct Translator {
       cb->args = {len, expr(*as[1].second)};
       return cb;
     }
+    // Effect primitives applied directly (effect.ml's `resume (..) f v` etc.):
+    // lower to the special bytecode ops the backend emits (Kperform / Kresume /
+    // Kresumeterm / Kreperformterm).  %resume and %runstack are the same op.
+    {
+      auto eff = [&](const char* fn) {
+        auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = fn;
+        pr->args = args(); return pr; };
+      if (prim == "%perform" && as.size() == 1) return eff("perform");
+      if ((prim == "%resume" || prim == "%runstack") && as.size() == 3) return eff("runstack");
+      if (prim == "%reperform" && as.size() == 2) return eff("reperform");
+    }
     // Obj.size/field/set_field: translprim lowers these to generic-array
     // operations (Obj.t is opaque, so the kind is always `gen`).
     if (prim == "%obj_size" && as.size() == 1) return op("array.length[gen]");
