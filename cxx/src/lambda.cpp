@@ -3173,6 +3173,23 @@ struct Translator {
       return op("array.unsafe_set[" + array_elem_kind(as[2].second.get()) + "]");
     if (prim == "%array_length" && as.size() == 1)
       return op("array.length[" + array_arg_kind(as[0].second.get()) + "]");
+    // Atomic.Array: `unsafe_index t i` is the atomic LOCATION of element i, i.e.
+    // the 2-field (obj, field-index) block -- element i IS field i of the array
+    // block (translprim's make_atomic_loc).  `check_array_bound t i` is
+    // caml_check_bound(length t, i) (translprim's Pcheckbound).
+    if (prim == "%atomic_unsafe_index" && as.size() == 2) {
+      auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+      blk->args = {expr(*as[0].second), expr(*as[1].second)};
+      return blk;
+    }
+    if (prim == "%check_array_bound" && as.size() == 2) {
+      auto len = mk(Lam::K::Prim); len->prim = Prim::IntCmp;
+      len->prim_id = "array.length[" + array_arg_kind(as[0].second.get()) + "]";
+      len->args = {expr(*as[0].second)};
+      auto cb = mk(Lam::K::Prim); cb->prim = Prim::Ccall; cb->prim_id = "caml_check_bound";
+      cb->args = {len, expr(*as[1].second)};
+      return cb;
+    }
     // Obj.size/field/set_field: translprim lowers these to generic-array
     // operations (Obj.t is opaque, so the kind is always `gen`).
     if (prim == "%obj_size" && as.size() == 1) return op("array.length[gen]");
@@ -4004,6 +4021,10 @@ struct Translator {
     }
     if (auto sf = stdlib_fields.find(name); sf != stdlib_fields.end())
       return field_of("Stdlib", sf->second);
+    // a compiler-internal predefined exception (Match_failure/Assert_failure) is
+    // NOT re-exported as a Stdlib field; its identity is the predef global (the
+    // same one raise_predef raises), so a pattern can match it.
+    if (is_predef_exn_name(name)) return predef_global(name);
     return nullptr;
   }
   // A match row as a *borrowed* view into the AST (the Structure outlives the
