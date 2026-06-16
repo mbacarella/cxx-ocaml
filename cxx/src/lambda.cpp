@@ -6111,8 +6111,10 @@ struct Translator {
       if (!k) return nullptr;
       std::string n = lid_last(k->id.txt);
       // a variant-ctor entry blocks the exception reading -- unless it is a
-      // shadowed builtin (`exception Error` vs result's Error)
-      if ((!exn_ident_.count(n) && !exn_field_.count(n)) ||
+      // shadowed builtin (`exception Error` vs result's Error).  A predefined
+      // exception (Failure/Invalid_argument/..) counts as an exception ctor too:
+      // without this, `function Failure s -> ..` collapses and drops `s`.
+      if ((!exn_ident_.count(n) && !exn_field_.count(n) && !is_predef_exn_name(n)) ||
           (ctor_info_.count(n) && !builtin_ctors_.count(n)))
         return nullptr;
       if (k->arg) {  // binder shapes exn_case_body supports only
@@ -6914,7 +6916,7 @@ struct Translator {
         // pattern containing one (`Some B`, `(Some A|Some B), A`) matches in the
         // multi-column naive matcher instead of bailing.
         if (exn_ident_.count(cn) || exn_field_.count(cn) ||
-            module_ctor_identity(k->id.txt)) {
+            is_predef_exn_name(cn) || module_ctor_identity(k->id.txt)) {
           int arity = exn_arity_.count(cn) ? exn_arity_[cn] : (k->arg ? 1 : 0);
           // a module-qualified extension constructor (`M1.E`) compares against
           // that module's own field, not the last same-named binder
