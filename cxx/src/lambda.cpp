@@ -5695,7 +5695,24 @@ struct Translator {
     if (need_temp) { tv = fresh("", true); auto v = mk(Lam::K::Var); v->var = tv; s = v; }
     LamPtr inner;
     if (ci.is_block) {  // block ctor matched -> test truthy, then match fields
-      auto fps = ctor_field_pats(k_, ci.arity);
+      std::vector<const Pattern*> fps;
+      if (!ci.rlabels.empty()) {
+        // Inline record (`Cons of {content; next}`): labels are the block's FLAT
+        // fields, so match them at their own indices (label order) -- NOT via a
+        // field-0 wrapper, which would read `field i (field 0 s)` (Queue.take's
+        // `Cons {next = Nil}` -> a wrong double field read).
+        auto* pr = k_->arg ? std::get_if<Ppat_record>(&effective_pat(k_->arg->get())->desc)
+                           : nullptr;
+        if (!pr) return nullptr;
+        static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
+        for (auto& lbl : ci.rlabels) {
+          const Pattern* fp = &any_pat;
+          for (auto& [l, sub] : pr->fields) if (lid_last(l.txt) == lbl) { fp = sub.get(); break; }
+          fps.push_back(fp);
+        }
+      } else {
+        fps = ctor_field_pats(k_, ci.arity);
+      }
       LamPtr fields = match_fields(s, fps, 0, k, dflt);
       if (!fields) return nullptr;
       auto iff = mk(Lam::K::IfThenElse);
@@ -6905,6 +6922,12 @@ struct Translator {
           for (int i = 0; i < ci->second.arity; ++i)
             if (!pat_test(at->elems[i].get(), fieldimm(i, acc), test, binds))
               return false;
+        } else if (!ci->second.rlabels.empty()) {
+          // inline record (`Cons {next = Nil}`): the record's labels are the
+          // constructor block's FLAT fields, so match the record pattern against
+          // the block itself (acc), not `field 0 acc` -- else next reads
+          // `field 1 (field 0 acc)` (Queue.take's wrong double field read).
+          if (!pat_test(k->arg->get(), acc, test, binds)) return false;
         } else if (!pat_test(k->arg->get(), fieldimm(0, acc), test, binds)) {
           return false;
         }
