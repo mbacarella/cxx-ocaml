@@ -2955,6 +2955,27 @@ struct Translator {
       pr->args = {expr(*as[0].second)};
       return pr;
     }
+    // Atomic primitives (OCaml 5).  An Atomic.t is a flat 1-field mutable block
+    // (`atomic_make` = makemutable), so each op is the field-0 form of the
+    // runtime caml_atomic_*_field primitive.  do_at_exit's `atomic_get
+    // exit_function` is %atomic_load; at_exit uses %atomic_compare_and_set.
+    {
+      auto cc = [&](const char* fn, std::vector<LamPtr> v) {
+        auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = fn;
+        pr->args = std::move(v); return pr;
+      };
+      if (prim == "%atomic_load" && as.size() == 1)
+        return cc("caml_atomic_load_field", {expr(*as[0].second), cint(0)});
+      if (prim == "%atomic_exchange" && as.size() == 2)
+        return cc("caml_atomic_exchange_field",
+                  {expr(*as[0].second), cint(0), expr(*as[1].second)});
+      if (prim == "%atomic_compare_and_set" && as.size() == 3)
+        return cc("caml_atomic_cas_field", {expr(*as[0].second), cint(0),
+                  expr(*as[1].second), expr(*as[2].second)});
+      if (prim == "%atomic_fetch_add" && as.size() == 2)
+        return cc("caml_atomic_fetch_add_field",
+                  {expr(*as[0].second), cint(0), expr(*as[1].second)});
+    }
     // Pervasive arithmetic primitives reached module-qualified (Int.add = %addint,
     // Float.add = %addfloat, Float.of_int = %floatofint, ...): emit their operator
     // forms, the same way the unqualified pervasives do.
