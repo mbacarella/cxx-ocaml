@@ -883,8 +883,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // The parameter's own signature is left empty (consumers resolve members
         // via the RESULT signature only); the functor still takes a field.
         auto pident = o::vblock(0, {o::vstr(it.functor_param), o::vint(stamp++)});  // Ident.Local
-        auto param = o::vblock(0, {o::vblock(0, {pident}) /*Some*/,
-                                   o::vblock(1, {o::vint(0) /*[] sig*/})});  // Named(Some,Mty_signature[])
+        auto psig = o::vblock(1, {o::vlist(emit_sig_items(it.param_sig, referenced, stamp))});  // Mty_signature
+        auto param = o::vblock(0, {o::vblock(0, {pident}) /*Some*/, psig});  // Named(Some, <param sig>)
         auto body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature(result)
         mty = o::vblock(2, {param, body});  // Mty_functor
       } else if (!it.alias.empty()) {

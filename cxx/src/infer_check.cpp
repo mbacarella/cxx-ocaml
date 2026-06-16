@@ -2719,13 +2719,22 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
           // module so Make takes a field and Make(Arg).x resolves via S's layout.
           // Peel curried params; the result body is the innermost non-functor mt.
           std::string param;
-          if (auto* fn = std::get_if<Functor_named>(&pf->param))
+          std::vector<cmi::cmiw::SigItem> param_sig;
+          if (auto* fn = std::get_if<Functor_named>(&pf->param)) {
             if (fn->name.txt) param = *fn->name.txt;
+            // the parameter's signature (OrderedType): consumers coerce the
+            // functor ARGUMENT (Int) to this layout so `Ord.compare` resolves to
+            // the right field -- without it, the whole argument is passed and
+            // `Ord.compare` reads a wrong slot (Map.Make(Int).find segfaults).
+            if (fn->type)
+              if (const ast::Signature* psg = body_sig(*fn->type)) param_sig = signature_to_cmi(*psg);
+          }
           const ast::ModuleType* body = pf->body.get();
           while (auto* pf2 = std::get_if<Pmty_functor>(&body->desc)) body = pf2->body.get();
           std::vector<cmi::cmiw::SigItem> result;
           if (const ast::Signature* rs = body_sig(*body)) result = signature_to_cmi(*rs);
-          out.push_back(cmi::cmiw::sig_module_functor(*pm->md.name.txt, param, std::move(result)));
+          out.push_back(cmi::cmiw::sig_module_functor(*pm->md.name.txt, param,
+                          std::move(param_sig), std::move(result)));
         }
       }
     }

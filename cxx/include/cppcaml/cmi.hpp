@@ -233,11 +233,14 @@ struct SigItem {
   // signature is left opaque (consumers only need the result layout).
   bool is_functor = false;
   std::string functor_param;  // the parameter's name (e.g. "Ord")
+  std::vector<SigItem> param_sig;  // the parameter's signature items (OrderedType)
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
+                                  std::vector<SigItem> param_sig,
                                   std::vector<SigItem> result) {
   SigItem s; s.k = SigItem::Module; s.name = std::move(n);
-  s.is_functor = true; s.functor_param = std::move(param); s.sub = std::move(result);
+  s.is_functor = true; s.functor_param = std::move(param);
+  s.param_sig = std::move(param_sig); s.sub = std::move(result);
   return s;
 }
 inline SigItem sig_module(std::string n, std::vector<SigItem> items) {

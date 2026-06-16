@@ -52,11 +52,15 @@ cp "$STD/std_exit.ml" "$BD/std_exit.ml"
 ( cd "$BD" && "$CPP" -c -I "$BD" std_exit.ml ) 2>/dev/null
 
 cat > "$BD/app.ml" <<'EOF'
+module M = Map.Make (Int)
 let () =
   Printf.printf "hello %d %s %b\n" 42 "world" true;
   Printf.printf "sum=%d\n" (List.fold_left (+) 0 (List.map (fun x -> x*x) [1;2;3;4]));
   Printf.printf "cat=%s sub=%s\n" (String.concat "-" ["a";"b";"c"]) (String.sub "abcdef" 1 3);
-  Printf.printf "sorted=%s\n" (String.concat "," (List.map string_of_int (List.sort compare [3;1;2])))
+  Printf.printf "sorted=%s\n" (String.concat "," (List.map string_of_int (List.sort compare [3;1;2])));
+  let m = M.add 3 "c" (M.add 1 "a" (M.add 2 "b" M.empty)) in
+  Printf.printf "map=%s card=%d find2=%s\n"
+    (String.concat "" (List.map snd (M.bindings m))) (M.cardinal m) (M.find 2 m)
 EOF
 ( cd "$BD" && "$CPP" -c -I "$BD" app.ml ) 2>/dev/null || { echo "FAIL: app.ml"; exit 1; }
 
@@ -69,10 +73,11 @@ out=$("$RUN" "$BD/prog" 2>&1); rc=$?
 want='hello 42 world true
 sum=30
 cat=a-b-c sub=bcd
-sorted=1,2,3'
+sorted=1,2,3
+map=abc card=3 find2=b'
 echo "--- output (rc=$rc) ---"; printf '%s\n' "$out"
 if [ "$out" = "$want" ] && [ "$rc" = 0 ]; then
-  echo "MATCH: Printf/String/List run correctly on the fully self-built stdlib"
+  echo "MATCH: Printf/String/List/Map run correctly on the fully self-built stdlib"
   exit 0
 else
   echo "DIFF: expected"; printf '%s\n' "$want"; exit 1
