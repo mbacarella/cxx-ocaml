@@ -7913,12 +7913,20 @@ struct Translator {
             StdPrim asp = value_prim(tgt, d->name);
             if (!asp.name.empty()) if (LamPtr s = prim_stub(asp)) return s;
           }
+          // A local alias to a top-level stdlib module (`module B = Bytes`):
+          // resolve B.x as Bytes.x.  (Dotted submodule aliases go through the
+          // submodule_prim path elsewhere; here we only remap single-component
+          // stdlib targets so fields_of/value_prim below take the real module.)
+          std::string head = pl->name;
+          if (auto sa = submod_alias_.find(head);
+              sa != submod_alias_.end() && sa->second.find('.') == std::string::npos)
+            head = sa->second;
           // Qualified M.x where M is a stdlib (sub)module: field of Stdlib[__M].
-          auto& fm = fields_of(pl->name);
+          auto& fm = fields_of(head);
           auto sf = fm.find(d->name);
-          if (sf != fm.end()) return field_of(global_of(pl->name), sf->second);
+          if (sf != fm.end()) return field_of(global_of(head), sf->second);
           // A prim used as a value (e.g. Sys.argv = %sys_argv -> (caml_sys_argv 0)).
-          StdPrim sp = value_prim(pl->name, d->name);
+          StdPrim sp = value_prim(head, d->name);
           if (auto pv = prim_value(sp.name)) return pv;
           // Otherwise a primitive in value position eta-expands to a stub
           // (`Int64.add` -> `(function p p stub (Int64.add p p))`).
@@ -10920,6 +10928,14 @@ struct Translator {
                     auto& lay = module_layout_[nm];
                     for (auto& [n2, i2] : sm.fields) lay[n2] = i2;
                   }
+                } else if (dotted.find('.') == std::string::npos &&
+                           !module_base(dotted) && !fields_of(dotted).empty()) {
+                  // `module B = Bytes`: an alias to a top-level stdlib module.
+                  // Record it so B.x resolves like Bytes.x -- including externals
+                  // (B.create = "caml_create_bytes") that take no runtime field and
+                  // so aren't covered by the layout copy below (string.ml/bytes.ml).
+                  submod_alias_[nm] = dotted;
+                  copy_layout_subtree(dotted, nm);
                 } else {
                   // a local-path alias adopts the source's layout subtree
                   // (module D = B / module Y = X.M), nested keys included
