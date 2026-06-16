@@ -1272,6 +1272,15 @@ struct Translator {
       if (auto* l = std::get_if<Lident>(&id->id.txt.v))
         if (auto it = pack_modtype_.find(l->name); it != pack_modtype_.end())
           return it->second;
+    // `(val (match .. with .. -> (module M : S) | ..))` (filename.ml's Sysdeps):
+    // every arm packs the same module type, so any arm's gives the layout.
+    if (auto* m = std::get_if<Pexp_match>(&e->desc))
+      for (auto& c : m->cases)
+        if (std::string r = expr_pack_modtype(*c.rhs); !r.empty()) return r;
+    if (auto* it = std::get_if<Pexp_ifthenelse>(&e->desc)) {
+      if (std::string r = expr_pack_modtype(*it->then_); !r.empty()) return r;
+      if (it->else_) return expr_pack_modtype(**it->else_);
+    }
     return {};
   }
   // The runtime field layout of a (possibly qualified) package module type
