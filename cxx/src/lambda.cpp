@@ -2796,6 +2796,7 @@ struct Translator {
       if (prim == "%atomic_exchange" && n == 2) return acc("caml_atomic_exchange_field", {argv[0], cint(0), argv[1]});
       if (prim == "%atomic_compare_and_set" && n == 3) return acc("caml_atomic_cas_field", {argv[0], cint(0), argv[1], argv[2]});
       if (prim == "%atomic_fetch_add" && n == 2) return acc("caml_atomic_fetch_add_field", {argv[0], cint(0), argv[1]});
+      if (prim == "%dls_get" && n == 1) return acc("caml_domain_dls_get", {argv[0]});
     }
     if (prim == "%makemutable" && n == 1) {  // `ref` as a value: (makemutable 0 prim)
       auto m = mk(Lam::K::Prim); m->prim = Prim::Makemutable; m->prim_arg = 0;
@@ -3020,6 +3021,10 @@ struct Translator {
       if (prim == "%atomic_fetch_add" && as.size() == 2)
         return cc("caml_atomic_fetch_add_field",
                   {expr(*as[0].second), cint(0), expr(*as[1].second)});
+      // %dls_get (domain-local state root): ccall caml_domain_dls_get (unit).
+      // Domain.DLS.new_key runs this at module init (needed by Hashtbl).
+      if (prim == "%dls_get" && as.size() == 1)
+        return cc("caml_domain_dls_get", {expr(*as[0].second)});
     }
     // Sys compile-time constants (%word_size, %big_endian, %ostype_unix, ...):
     // the oracle lowers each to `(sys.constant_X 0)`; in bytecode that is a ccall
