@@ -2976,6 +2976,26 @@ struct Translator {
         return cc("caml_atomic_fetch_add_field",
                   {expr(*as[0].second), cint(0), expr(*as[1].second)});
     }
+    // Sys compile-time constants (%word_size, %big_endian, %ostype_unix, ...):
+    // the oracle lowers each to `(sys.constant_X 0)`; in bytecode that is a ccall
+    // to the runtime caml_sys_const_X applied to the unit argument.  sys.ml runs
+    // these at module init (`let word_size = word_size ()`), so they must lower.
+    {
+      static const std::unordered_map<std::string, const char*> sysconst = {
+        {"%big_endian", "caml_sys_const_big_endian"},
+        {"%word_size", "caml_sys_const_word_size"},
+        {"%int_size", "caml_sys_const_int_size"},
+        {"%max_wosize", "caml_sys_const_max_wosize"},
+        {"%ostype_unix", "caml_sys_const_ostype_unix"},
+        {"%ostype_win32", "caml_sys_const_ostype_win32"},
+        {"%ostype_cygwin", "caml_sys_const_ostype_cygwin"},
+        {"%backend_type", "caml_sys_const_backend_type"},
+      };
+      if (auto it = sysconst.find(prim); it != sysconst.end() && as.size() == 1) {
+        auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = it->second;
+        pr->args = {expr(*as[0].second)}; return pr;
+      }
+    }
     // Pervasive arithmetic primitives reached module-qualified (Int.add = %addint,
     // Float.add = %addfloat, Float.of_int = %floatofint, ...): emit their operator
     // forms, the same way the unqualified pervasives do.
