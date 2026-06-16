@@ -2665,9 +2665,28 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
 std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
   Checker ck;
   ck.record_kinds_ = true;
-  for (auto& it : s)  // pre-register type names (for arity / local references)
+  // Collect `module type S = sig .. end` so a functor result `: S` (Map.Make)
+  // can be resolved to S's signature items.
+  std::unordered_map<std::string, const ast::Signature*> modtypes;
+  for (auto& it : s) {
     if (auto* pt = std::get_if<Psig_type>(&it.desc))
       for (auto& d : pt->decls) ck.register_type_decl(d);
+    if (auto* pmt = std::get_if<Psig_modtype>(&it.desc))
+      if (pmt->type)
+        if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
+          modtypes[pmt->name.txt] = &ps->items;
+  }
+  // Resolve a module type to its signature items (Pmty_signature directly, a
+  // named modtype `S`, or `S with ...` -- the with-constraints are ignored).
+  std::function<const ast::Signature*(const ast::ModuleType&)> body_sig =
+      [&](const ast::ModuleType& mt) -> const ast::Signature* {
+    if (auto* ps = std::get_if<Pmty_signature>(&mt.desc)) return &ps->items;
+    if (auto* pi = std::get_if<Pmty_ident>(&mt.desc))
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
+        if (auto f = modtypes.find(l->name); f != modtypes.end()) return f->second;
+    if (auto* pw = std::get_if<Pmty_with>(&mt.desc)) return body_sig(*pw->mt);
+    return nullptr;
+  };
   std::vector<cmi::cmiw::SigItem> out;
   for (auto& it : s) {
     if (auto* pv = std::get_if<Psig_value>(&it.desc)) {
@@ -2690,11 +2709,24 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
       if (pm->md.name.txt && pm->md.type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(ps->items)));
-        else if (auto* al = std::get_if<Pmty_alias>(&pm->md.type->desc))
+        else if (auto* al = std::get_if<Pmty_alias>(&pm->md.type->desc)) {
           // `module M = Target` (e.g. stdlib.mli's `module List = Stdlib__List`):
           // a single-component target is the unit's global name.
           if (auto* l = std::get_if<Lident>(&al->id.txt.v))
             out.push_back(cmi::cmiw::sig_module_alias(*pm->md.name.txt, l->name));
+        } else if (auto* pf = std::get_if<Pmty_functor>(&pm->md.type->desc)) {
+          // `module Make (Ord : _) : S with ...` (Map/Set/Hashtbl): emit a functor
+          // module so Make takes a field and Make(Arg).x resolves via S's layout.
+          // Peel curried params; the result body is the innermost non-functor mt.
+          std::string param;
+          if (auto* fn = std::get_if<Functor_named>(&pf->param))
+            if (fn->name.txt) param = *fn->name.txt;
+          const ast::ModuleType* body = pf->body.get();
+          while (auto* pf2 = std::get_if<Pmty_functor>(&body->desc)) body = pf2->body.get();
+          std::vector<cmi::cmiw::SigItem> result;
+          if (const ast::Signature* rs = body_sig(*body)) result = signature_to_cmi(*rs);
+          out.push_back(cmi::cmiw::sig_module_functor(*pm->md.name.txt, param, std::move(result)));
+        }
       }
     }
   }

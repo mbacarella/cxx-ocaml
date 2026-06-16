@@ -221,12 +221,25 @@ struct SigItem {
   // primitive by consumers and taking NO module field (so it doesn't shift the
   // value field layout).
   std::string prim, prim_native;
-  std::vector<SigItem> sub;   // Module: the submodule's signature items
+  std::vector<SigItem> sub;   // Module: the submodule's signature items; for a
+                              // functor (functor_param set) these are the RESULT
+                              // signature items (Map.Make's S).
   // Module: if non-empty, this is a module ALIAS `module name = <alias>` (the
   // alias is a compilation-unit global like "Stdlib__List"); emitted as
   // Mty_alias instead of Mty_signature.  `sub` is then ignored.
   std::string alias;
+  // Module: if set, this is a FUNCTOR `module name (P : _) : <sub>`; emitted as
+  // Mty_functor(Named(P, <opaque>), Mty_signature(sub)).  The param's own
+  // signature is left opaque (consumers only need the result layout).
+  bool is_functor = false;
+  std::string functor_param;  // the parameter's name (e.g. "Ord")
 };
+inline SigItem sig_module_functor(std::string n, std::string param,
+                                  std::vector<SigItem> result) {
+  SigItem s; s.k = SigItem::Module; s.name = std::move(n);
+  s.is_functor = true; s.functor_param = std::move(param); s.sub = std::move(result);
+  return s;
+}
 inline SigItem sig_module(std::string n, std::vector<SigItem> items) {
   SigItem s; s.k = SigItem::Module; s.name = std::move(n); s.sub = std::move(items); return s;
 }

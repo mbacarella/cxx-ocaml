@@ -878,7 +878,16 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // to keep the surrounding value field layout aligned.
       o::ValPtr mty;
       int presence = 0;  // Mp_present: takes a runtime field
-      if (!it.alias.empty()) {
+      if (it.is_functor) {
+        // Mty_functor(Named(Some param, Mty_signature[]), Mty_signature(result)).
+        // The parameter's own signature is left empty (consumers resolve members
+        // via the RESULT signature only); the functor still takes a field.
+        auto pident = o::vblock(0, {o::vstr(it.functor_param), o::vint(stamp++)});  // Ident.Local
+        auto param = o::vblock(0, {o::vblock(0, {pident}) /*Some*/,
+                                   o::vblock(1, {o::vint(0) /*[] sig*/})});  // Named(Some,Mty_signature[])
+        auto body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature(result)
+        mty = o::vblock(2, {param, body});  // Mty_functor
+      } else if (!it.alias.empty()) {
         // `module name = <unit>`: Mty_alias(Pident(Global unit)), Mp_absent --
         // an alias is transparent and takes NO runtime field.  Record the unit so
         // it's imported (CRC=None, like -no-alias-deps).
