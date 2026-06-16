@@ -3201,6 +3201,18 @@ struct Translator {
       if ((prim == "%resume" || prim == "%runstack") && as.size() == 3) return eff("runstack");
       if (prim == "%reperform" && as.size() == 2) return eff("reperform");
     }
+    // Method-dispatch primitives applied directly (camlinternalOO's `sendself obj
+    // n` / `sendcache ..`): a Send prim the backend lowers to Kgetmethod (self) /
+    // Kgetpubmet|Kgetdynmet (public).  In bytecode %sendcache is a public send
+    // (cache/pos ignored -- the cached path is native-only).
+    {
+      auto snd = [&](const char* kind) {
+        auto s = mk(Lam::K::Prim); s->prim = Prim::Send; s->prim_id = kind;
+        s->args = {expr(*as[0].second), expr(*as[1].second)}; return s; };
+      if (prim == "%send" && as.size() == 2) return snd("send");
+      if (prim == "%sendself" && as.size() == 2) return snd("sendself");
+      if (prim == "%sendcache" && as.size() == 4) return snd("send");
+    }
     // Obj.size/field/set_field: translprim lowers these to generic-array
     // operations (Obj.t is opaque, so the kind is always `gen`).
     if (prim == "%obj_size" && as.size() == 1) return op("array.length[gen]");
