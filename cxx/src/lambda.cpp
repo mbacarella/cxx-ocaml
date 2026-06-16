@@ -8124,13 +8124,20 @@ struct Translator {
           if (!lookup(l->name) && !opened_has(l->name)) {  // an unshadowed pervasive
             const auto& n = l->name;
             auto& as = ap->args;
-            if (auto ex = externals_.find(n); ex != externals_.end()) {  // C external
-              auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall;
-              pr->prim_id = ex->second.name;
-              for (auto& a : as) pr->args.push_back(expr(*a.second));
-              if (pr->prim_id == "caml_obj_with_tag")
-                if (auto r = fold_with_tag(pr->args)) return r;
-              return pr;
+            if (auto ex = externals_.find(n); ex != externals_.end()) {
+              // A %-builtin external (e.g. `external f = "%atomic_compare_and_set"`)
+              // is NOT a C function -- route it through prim_to_lam (a Ccall to
+              // "%foo" would be a bogus undefined primitive).
+              if (!ex->second.name.empty() && ex->second.name[0] == '%') {
+                if (auto r = prim_apply(ex->second.name, ex->second.arity, *ap, e)) return r;
+              } else {  // a real C external
+                auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall;
+                pr->prim_id = ex->second.name;
+                for (auto& a : as) pr->args.push_back(expr(*a.second));
+                if (pr->prim_id == "caml_obj_with_tag")
+                  if (auto r = fold_with_tag(pr->args)) return r;
+                return pr;
+              }
             }
             if (auto lp = local_prims_.find(n); lp != local_prims_.end())
               if (auto r = prim_apply(lp->second.first, lp->second.second, *ap, e))
