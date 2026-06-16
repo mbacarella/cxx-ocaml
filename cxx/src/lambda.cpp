@@ -1121,14 +1121,29 @@ struct Translator {
               int nc = 0, nb = 0; bool all_const = !v->ctors.empty(), gadt = false;
               for (auto& c : v->ctors) {
                 int arity = 0; bool block = true;
+                auto* r = std::get_if<Pcstr_record>(&c.args);
                 if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) {
                   arity = (int)t->elems.size(); block = arity > 0;
-                }
+                } else if (r) arity = (int)r->fields.size();  // inline record (Map's Node)
                 if (c.res) gadt = true;
                 if (block) all_const = false;
                 if (!ctor_info_.count(c.name.txt)) {
                   builtin_ctors_.erase(c.name.txt);
-                  ctor_info_[c.name.txt] = {d.name.txt, block ? nb : nc, block, arity};
+                  CtorInfo ci{d.name.txt, block ? nb : nc, block, arity};
+                  if (r) {  // inline-record labels, so `Node {h}` binds h to its field
+                    int ridx = 0;
+                    for (auto& f : r->fields) {
+                      ValueKind fk = coretype_kind(*f.type);
+                      bool fm = f.mut == MutableFlag::Mutable;
+                      ci.rlabels.push_back(f.name.txt);
+                      ci.rshape.push_back(fk);
+                      ci.rfmut.push_back(fm);
+                      if (!field_info_.count(f.name.txt))
+                        field_info_[f.name.txt] = {d.name.txt, ridx, fm, fk};
+                      ++ridx;
+                    }
+                  }
+                  ctor_info_[c.name.txt] = std::move(ci);
                 }
                 if (block) ++nb; else ++nc;
               }
@@ -2773,6 +2788,15 @@ struct Translator {
     if (prim == "%bytes_length" && n == 1) return ic("bytes.length");
     if ((prim == "%bytes_to_string" || prim == "%bytes_of_string" ||
          prim == "%string_to_bytes" || prim == "%string_of_bytes") && n == 1) return argv[0];
+    {  // atomic ops as first-class values (Atomic.get etc.): the field-0 ccall form
+      auto acc = [&](const char* fn, std::vector<LamPtr> v) {
+        auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = fn;
+        pr->args = std::move(v); return pr; };
+      if (prim == "%atomic_load" && n == 1) return acc("caml_atomic_load_field", {argv[0], cint(0)});
+      if (prim == "%atomic_exchange" && n == 2) return acc("caml_atomic_exchange_field", {argv[0], cint(0), argv[1]});
+      if (prim == "%atomic_compare_and_set" && n == 3) return acc("caml_atomic_cas_field", {argv[0], cint(0), argv[1], argv[2]});
+      if (prim == "%atomic_fetch_add" && n == 2) return acc("caml_atomic_fetch_add_field", {argv[0], cint(0), argv[1]});
+    }
     if (prim == "%makemutable" && n == 1) {  // `ref` as a value: (makemutable 0 prim)
       auto m = mk(Lam::K::Prim); m->prim = Prim::Makemutable; m->prim_arg = 0;
       m->blk_shape = {ValueKind::Gen}; m->args = argv; return m;
@@ -2780,8 +2804,8 @@ struct Translator {
     if (prim == "%perform" && n == 1) return cc("perform");
     if (prim == "%lazy_force" && n == 1) return force_lazy(argv[0]);
     if (prim == "%obj_is_int" && n == 1) return ic("isint");
-    if ((prim == "%raise" || prim == "%reraise") && n == 1) {  // raise as a value
-      auto pr = mk(Lam::K::Prim);
+    if ((prim == "%raise" || prim == "%reraise" || prim == "%raise_notrace") && n == 1) {
+      auto pr = mk(Lam::K::Prim);  // raise / raise_notrace as a value
       pr->prim = prim == "%reraise" ? Prim::Reraise : Prim::Raise;
       pr->args = argv;
       return pr;
@@ -2895,6 +2919,13 @@ struct Translator {
       pr->prim_id = spelling; pr->args = args(); return pr;
     };
     // Structural (kind-independent) prims.
+    if ((prim == "%raise" || prim == "%raise_notrace") && as.size() == 1) {
+      raise_arg_ = true; LamPtr arg = expr(*as[0].second); raise_arg_ = false;
+      bool reraise = !caught_exn_.empty() && arg->k == Lam::K::Var &&
+                     arg->var.stamp == caught_exn_.back().stamp;
+      auto pr = mk(Lam::K::Prim); pr->prim = reraise ? Prim::Reraise : Prim::Raise;
+      pr->args = {arg}; return pr;
+    }
     if (prim == "%opaque" && as.size() == 1) return op("opaque");
     if (prim == "%ignore" && as.size() == 1) return op("ignore");
     // `Fun.todo ()`: evaluate the argument, then raise Todo with the call-site
