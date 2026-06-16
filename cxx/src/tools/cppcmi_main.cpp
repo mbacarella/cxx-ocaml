@@ -77,6 +77,18 @@ static int typed_mode(const char* file, const char* sel) {
                     md.type ? cmi::print_module_type(*md.type).c_str() : "?");
       return 0;
     }
+    if (s.rfind("--functor=", 0) == 0) {  // dump a functor member's RESULT fields
+      std::string nm = s.substr(10);
+      if (const cmi::ModuleDecl* md = c.find_module(nm))
+        if (md->type && md->type->kind == cmi::ModuleType::Functor &&
+            md->type->functor_body && md->type->functor_body->sig) {
+          int i = 0;
+          for (auto& f : md->type->functor_body->sig->fields) std::printf("  %d %s\n", i++, f.c_str());
+          return 0;
+        }
+      std::printf("  (no functor %s)\n", nm.c_str());
+      return 0;
+    }
     if (const cmi::ModuleDecl* md = c.find_module(s)) {
       std::printf("  module %s : %s\n", md->name.c_str(),
                   md->type ? cmi::print_module_type(*md->type).c_str() : "?");
