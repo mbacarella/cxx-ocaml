@@ -9630,7 +9630,7 @@ struct Translator {
     // An `?(x=default)` parameter becomes a `*opt*` param plus a body let binding
     // `x = (if *opt* (field_imm 0 *opt*) default)` -- unwrap the option or use the
     // default.  (A `?x` without a default keeps the option itself as the param.)
-    struct OptDef { Ident xid, optid; const Expression* def; ValueKind k; bool discard = false; };
+    struct OptDef { Ident xid, optid; LamPtr def; ValueKind k; bool discard = false; };
     std::vector<OptDef> optdefs;
     const Pattern* refut = nullptr; Ident refut_pid; Location refut_loc; int nrefut = 0;
     // A `(module M : S)` parameter shadows S's variant / extension constructors to
@@ -9652,10 +9652,16 @@ struct Translator {
             // var -> bind the name; `_` -> discard via seq (runs the default for
             // effect); `()`/tuple/record -> bind a *match* temp then destructure.
             Ident xid = var ? fresh(var->name.txt) : fresh("", !any);
+            // Compile the default expression BEFORE binding this parameter's name,
+            // so `?(current=current)` resolves the default's `current` to the OUTER
+            // binding (the global ref) -- not to this very parameter (a self-ref
+            // that read garbage and broke Arg.parse's loop counter).  Earlier
+            // params are already in scope, which is correct.
+            LamPtr dlam = expr(*pv->default_->get());
             if (var) scope.back()[var->name.txt] = xid;
             else if (!any) collect_binders(*pat, varof(xid), binders);
             ValueKind ok = var ? pat_kind(pat) : ValueKind::Gen;  // a *match* temp is unannotated
-            optdefs.push_back({xid, optid, pv->default_->get(), ok, /*discard=*/any});
+            optdefs.push_back({xid, optid, std::move(dlam), ok, /*discard=*/any});
             continue;
           }
         }
@@ -9707,7 +9713,7 @@ struct Translator {
         auto cond = mk(Lam::K::Var); cond->var = it->optid;
         auto optv = mk(Lam::K::Var); optv->var = it->optid;
         auto iff = mk(Lam::K::IfThenElse);
-        iff->cond = cond; iff->then_ = fieldimm(0, optv); iff->else_ = expr(*it->def);
+        iff->cond = cond; iff->then_ = fieldimm(0, optv); iff->else_ = it->def;
         if (it->discard) {  // `_` pattern: evaluate for effect, discard the value
           auto sq = mk(Lam::K::Sequence); sq->cond = iff; sq->else_ = body; body = sq;
         } else {
