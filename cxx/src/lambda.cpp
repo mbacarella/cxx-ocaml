@@ -1814,6 +1814,47 @@ struct Translator {
     auto it = sm.prims.find(name);
     return it == sm.prims.end() ? StdPrim{"", 0} : it->second;
   }
+  // `open M` where M is a separately-compiled module (Syntax): register M's
+  // top-level record types' field labels into field_info_, so a record pattern
+  // / literal using those bare labels (`fun {name; args; ..} -> ..`) resolves to
+  // the right offsets.  Without this the labels stay unbound -> garbage reads.
+  // (Dotted opens already do this via submodule_of; bare opens did not.)
+  std::set<std::string> module_records_done_;
+  void register_module_records(const std::string& mod) {
+    if (mod.empty() || mod.find('.') != std::string::npos) return;
+    if (module_base(mod) || fields_of(mod).empty()) return;  // local / unknown
+    if (!module_records_done_.insert(mod).second) return;    // once
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      for (auto& td : cmi.sig().types) {
+        if (td.kind == cmi::TypeDecl::Record) {
+          // An ALL-FLOAT record (Complex.t = {re;im}) has the flat Double_array_tag
+          // representation; registering its plain field offsets here would build/
+          // read it with the wrong (boxed) layout.  Skip such records -- this
+          // helper only needs ordinary (mixed) records like ocamllex's `entry`.
+          bool all_float = !td.labels.empty();
+          for (auto& l : td.labels)
+            if (cmi_field_kind(l.type) != ValueKind::Float) { all_float = false; break; }
+          if (all_float) continue;
+          RecType rt; rt.mut = false;
+          bool fresh_type = !rec_types_.count(td.name);
+          for (int j = 0; j < (int)td.labels.size(); ++j) {
+            ValueKind k = cmi_field_kind(td.labels[j].type);
+            bool m = td.labels[j].mutable_;
+            rt.mut |= m; rt.labels.push_back(td.labels[j].name); rt.shape.push_back(k);
+            if (fresh_type && !field_info_.count(td.labels[j].name) &&
+                !ambiguous_fields_.count(td.labels[j].name))
+              field_info_[td.labels[j].name] = {td.name, j, m, k};
+          }
+          if (fresh_type) rec_types_[td.name] = std::move(rt);
+        }
+        // NOTE: variant constructors are deliberately NOT registered here -- a
+        // bare `open M` of a large stdlib module (Bigarray/Complex) would inject
+        // its ctors globally and shadow/skew unrelated resolution.  This helper
+        // exists only to resolve record PATTERN/literal labels (ocamllex's entry).
+      }
+    } catch (...) {}
+  }
   LamPtr submodule_value(const std::string& dotted, const std::string& name) {
     auto& sm = submodule_of(dotted);
     if (!sm.ok) return nullptr;
@@ -10712,6 +10753,8 @@ struct Translator {
             }
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
+          else
+            register_module_records(dotted);  // bare `open M`: M's record labels
           opened_.push_back(dotted); ++n_opens;
         } else {
           // a generalized open (`open F(X)` / `open struct..end` / `open (M:S)`)
