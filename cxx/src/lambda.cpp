@@ -2803,6 +2803,20 @@ struct Translator {
     if (auto it = poly.find(prim); it != poly.end() && n == 2) return cc(it->second);
     if (prim == "%opaque" && n == 1) return ic("opaque");
     if (prim == "%ignore" && n == 1) return ic("ignore");
+    {  // Sys compile-time constants, used as a value (eta-stub) -> ccall.
+      static const std::unordered_map<std::string, std::string> sysconst = {
+        {"%big_endian", "caml_sys_const_big_endian"},
+        {"%word_size", "caml_sys_const_word_size"},
+        {"%int_size", "caml_sys_const_int_size"},
+        {"%max_wosize", "caml_sys_const_max_wosize"},
+        {"%ostype_unix", "caml_sys_const_ostype_unix"},
+        {"%ostype_win32", "caml_sys_const_ostype_win32"},
+        {"%ostype_cygwin", "caml_sys_const_ostype_cygwin"},
+        {"%backend_type", "caml_sys_const_backend_type"},
+        {"%standard_library_default", "caml_sys_const_standard_library_default"},
+      };
+      if (auto it = sysconst.find(prim); it != sysconst.end() && n == 1) return cc(it->second);
+    }
     if (prim == "%identity" && n == 1) return argv[0];
     // Array/string/bytes element access as a value (eta-stub): the operand type
     // is unknown here, so the generic spelling (a runtime-tag-checked access).
@@ -3139,6 +3153,7 @@ struct Translator {
         {"%ostype_win32", "caml_sys_const_ostype_win32"},
         {"%ostype_cygwin", "caml_sys_const_ostype_cygwin"},
         {"%backend_type", "caml_sys_const_backend_type"},
+        {"%standard_library_default", "caml_sys_const_standard_library_default"},
       };
       if (auto it = sysconst.find(prim); it != sysconst.end() && as.size() == 1) {
         auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = it->second;
@@ -4157,11 +4172,10 @@ struct Translator {
               if (!id0) {
                 auto& fm = fields_of(pl->name);
                 if (auto f = fm.find(d->name); f != fm.end()) {
-                  std::string g = pl->name == "Stdlib" ? "Stdlib"
-                                  : pl->name.rfind("Camlinternal", 0) == 0
-                                      ? pl->name
-                                      : "Stdlib__" + pl->name;
-                  id0 = field_of(g, f->second);
+                  // The module's runtime global: a stdlib submodule is
+                  // `Stdlib__M`, but a separately-compiled unit (e.g. the
+                  // compiler's own `Syntaxerr`) is just `M`.
+                  id0 = field_of(global_of(pl->name), f->second);
                 }
               }
             }
@@ -10014,6 +10028,10 @@ struct Translator {
               if (md.name == d->name) return mt_fields(cmi, md.type);
           } catch (...) {}
     }
+    // `module type of M` (used by `include module type of String`): the runtime
+    // field layout is M's own -- its non-prim values / submodules, in order.
+    if (auto* pto = std::get_if<Pmty_typeof>(&mt.desc))
+      return arg_layout(*pto->me);
     if (auto* ps = std::get_if<Pmty_signature>(&mt.desc)) {
       // `module type S = ..` siblings have no slot but a later `include S`
       // (which splices S's fields here) resolves through them

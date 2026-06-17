@@ -59,7 +59,14 @@ struct Marshaler {
   void emit(const ValPtr& v) {
     // immediates are never registered for sharing
     if (v->k == Value::Int) { emit_int(v->i); return; }
-    if (v->k == Value::Block && v->fields.empty()) { byte(0x80 | v->tag); return; }
+    // A zero-size block is an atom: never registered for sharing.  Tags < 16 use
+    // the packed small-block byte; tag >= 16 must use CODE_BLOCK32, else the tag
+    // bits spill into the size nibble and the reader sees a non-empty block.
+    if (v->k == Value::Block && v->fields.empty()) {
+      if (v->tag < 16) byte(0x80 | v->tag);
+      else { byte(0x8); be32((std::uint32_t)v->tag); }  // CODE_BLOCK32, size 0
+      return;
+    }
     // a sharable object already serialized -> a back-reference (objs[nobjs-dist])
     if (auto it = seen.find(v.get()); it != seen.end()) { emit_shared(nobjs - it->second); return; }
     seen[v.get()] = nobjs;  // index assigned before this object's own nobjs++
@@ -75,7 +82,6 @@ struct Marshaler {
       }
       case Value::Block: {
         int size = (int)v->fields.size();
-        if (size == 0) { byte(0x80 | v->tag); return; }
         if (v->tag < 16 && size < 8) byte(0x80 | v->tag | (size << 4));
         else { byte(0x8); be32(((std::uint32_t)size << 10) | (std::uint32_t)v->tag); }
         nobjs++; w64 += 1 + size; w32 += 1 + size;

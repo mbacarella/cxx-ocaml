@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
   stdlib_dir = discover_stdlib(stdlib_dir);
   cppcaml::lambda::set_module_dirs(incdirs);
   cppcaml::set_infer_module_dirs(incdirs);
+  cppcaml::set_infer_stdlib_dir(stdlib_dir);  // .mli cmi-writing reads .cmi too
   cppcaml::cmi::cmiw::set_module_dirs(stdlib_dir, incdirs);
   if (out_path.empty()) {
     fs::path p(in_path);

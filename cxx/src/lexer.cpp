@@ -814,6 +814,37 @@ void Lexer::scan_comment() {
     if (eof()) throw LexError("Unterminated comment", 0);
     if (looking_at("(*")) { depth++; pos_ += 2; continue; }
     if (looking_at("*)")) { depth--; pos_ += 2; continue; }
+    if (cur() == '\'') {
+      // Skip a char literal so that a quoted double-quote (e.g. '"') inside the
+      // comment doesn't spuriously start a string.  Mirrors OCaml's comment
+      // rule: only the genuine char-literal shapes are consumed; a bare quote
+      // (a type variable like 'a) just advances one char.
+      size_t p = pos_ + 1;  // after opening '
+      auto closes = [&](size_t q) { return at(q) == '\''; };
+      size_t end = 0;  // one past the closing quote, or 0 if not a char literal
+      // ' \r* \n '
+      { size_t q = p; while (at(q) == '\r') q++;
+        if (at(q) == '\n' && closes(q + 1)) end = q + 2; }
+      if (!end) {
+        char c0 = at(p);
+        if (c0 == '\\') {
+          char e = at(p + 1);
+          if ((e == '\\' || e == '\'' || e == '"' || e == 'n' || e == 't' ||
+               e == 'b' || e == 'r' || e == ' ') && closes(p + 2)) end = p + 3;
+          else if (is_digit(e) && is_digit(at(p + 2)) && is_digit(at(p + 3)) &&
+                   closes(p + 4)) end = p + 5;
+          else if (e == 'o' && at(p + 2) >= '0' && at(p + 2) <= '7' &&
+                   at(p + 3) >= '0' && at(p + 3) <= '7' && at(p + 4) >= '0' &&
+                   at(p + 4) <= '7' && closes(p + 5)) end = p + 6;
+          else if (e == 'x' && is_hex(at(p + 2)) && is_hex(at(p + 3)) &&
+                   closes(p + 4)) end = p + 5;
+        } else if (c0 != '\'' && c0 != '\n' && c0 != '\r' && closes(p + 1)) {
+          end = p + 2;
+        }
+      }
+      if (end) pos_ = end; else pos_++;  // char literal, or bare quote
+      continue;
+    }
     if (cur() == '"') {
       // skip a string literal so that "*)" inside it doesn't end the comment
       pos_++;

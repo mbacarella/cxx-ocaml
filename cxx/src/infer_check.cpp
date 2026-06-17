@@ -2669,6 +2669,115 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
   }
 }
 
+// ---- include module type of M: splice M's (already-compiled) cmi signature ----
+// Render a cmi type path as the writer's bare name convention (no Stdlib__).
+static std::string bare_cmi_path(const cmi::Path& p) {
+  std::string s = cmi_path_str(p);
+  if (s.rfind("Stdlib__", 0) == 0) s = s.substr(8);
+  else if (s.rfind("Stdlib.", 0) == 0) s = s.substr(7);
+  return s;
+}
+// cmi reader type -> cmi writer type.  Best-effort: shapes the back end / arg
+// matching cares about (arrows + labels, tuples, constructors, vars) are
+// preserved; anything else degrades to a fresh type variable (always valid).
+static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
+    std::unordered_map<const cmi::TypeExpr*, int>& vars, int& nextvar) {
+  cmi::TypePtr t = t0;
+  while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst))
+    t = t->link;
+  if (!t) return cmi::cmiw::ty_var(nextvar++);
+  switch (t->kind) {
+    case cmi::TypeExpr::Tvar:
+    case cmi::TypeExpr::Tunivar: {
+      auto it = vars.find(t.get());
+      if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
+      int id = nextvar++; vars[t.get()] = id; return cmi::cmiw::ty_var(id);
+    }
+    case cmi::TypeExpr::Tarrow:
+      return cmi::cmiw::ty_arrow_lbl(conv_cmi_ty(t->dom, vars, nextvar),
+                                     conv_cmi_ty(t->cod, vars, nextvar),
+                                     t->label_kind, t->label);
+    case cmi::TypeExpr::Ttuple: {
+      std::vector<cmi::cmiw::TyPtr> es;
+      for (auto& e : t->elems) es.push_back(conv_cmi_ty(e.second, vars, nextvar));
+      return cmi::cmiw::ty_tuple(std::move(es));
+    }
+    case cmi::TypeExpr::Tconstr:
+    case cmi::TypeExpr::Texpand: {
+      std::vector<cmi::cmiw::TyPtr> as;
+      for (auto& a : t->args) as.push_back(conv_cmi_ty(a, vars, nextvar));
+      std::string nm = t->path ? bare_cmi_path(*t->path) : "";
+      if (nm.empty()) return cmi::cmiw::ty_var(nextvar++);
+      return cmi::cmiw::ty_constr(nm, std::move(as));
+    }
+    default:
+      return cmi::cmiw::ty_var(nextvar++);
+  }
+}
+static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& sig) {
+  std::vector<cmi::cmiw::SigItem> out;
+  // Types and module-types take no runtime field; emit them first.
+  for (auto& td : sig.types) {
+    std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
+    std::vector<cmi::cmiw::TyPtr> params;
+    for (auto& p : td.params) params.push_back(conv_cmi_ty(p, vars, nv));
+    if (td.kind == cmi::TypeDecl::Record) {
+      std::vector<cmi::cmiw::Label> ls;
+      for (auto& l : td.labels)
+        ls.push_back({l.name, l.mutable_, conv_cmi_ty(l.type, vars, nv)});
+      out.push_back(cmi::cmiw::sig_record(td.name, std::move(params), std::move(ls)));
+    } else if (td.kind == cmi::TypeDecl::Variant) {
+      std::vector<cmi::cmiw::Ctor> cs;
+      for (auto& c : td.ctors) {
+        std::vector<cmi::cmiw::TyPtr> as;
+        for (auto& a : c.args) as.push_back(conv_cmi_ty(a, vars, nv));
+        cs.push_back({c.name, std::move(as)});
+      }
+      out.push_back(cmi::cmiw::sig_variant(td.name, std::move(params), std::move(cs)));
+    } else {
+      cmi::cmiw::TyPtr man = td.manifest ? conv_cmi_ty(td.manifest, vars, nv) : nullptr;
+      out.push_back(cmi::cmiw::sig_type(td.name, std::move(params), man));
+    }
+  }
+  for (auto& mt : sig.modtypes)
+    if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig)
+      out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig)));
+  // Primitive values take no field either; emit before the field-takers.
+  for (auto& v : sig.values) {
+    if (v.prim.empty()) continue;
+    std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
+    out.push_back(cmi::cmiw::sig_external(v.name, conv_cmi_ty(v.type, vars, nv), v.prim, ""));
+  }
+  // Field-taking items in the recorded runtime field order, so the spliced
+  // layout matches the .cmo block (`include M` copies M's non-prim fields).
+  std::unordered_map<std::string, const cmi::SigValue*> vmap;
+  for (auto& v : sig.values) if (v.prim.empty()) vmap[v.name] = &v;
+  std::unordered_map<std::string, const cmi::ModuleDecl*> mmap;
+  for (auto& m : sig.modules) mmap[m.name] = &m;
+  std::unordered_map<std::string, const cmi::ExtConstructor*> xmap;
+  for (auto& x : sig.typexts) xmap[x.name] = &x;
+  for (auto& fn : sig.fields) {
+    if (auto it = vmap.find(fn); it != vmap.end()) {
+      std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
+      out.push_back(cmi::cmiw::sig_value(fn, conv_cmi_ty(it->second->type, vars, nv)));
+    } else if (auto it = mmap.find(fn); it != mmap.end()) {
+      const cmi::ModuleDecl* md = it->second;
+      if (md->type && md->type->kind == cmi::ModuleType::Sig && md->type->sig)
+        out.push_back(cmi::cmiw::sig_module(fn, cmi_sig_to_items(*md->type->sig)));
+      else if (md->type && md->type->kind == cmi::ModuleType::Alias && md->type->path)
+        out.push_back(cmi::cmiw::sig_module_alias(fn, bare_cmi_path(*md->type->path)));
+      else
+        out.push_back(cmi::cmiw::sig_module(fn, {}));  // opaque, but keeps the field
+    } else if (auto it = xmap.find(fn); it != xmap.end()) {
+      std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
+      std::vector<cmi::cmiw::TyPtr> args;
+      for (auto& a : it->second->args) args.push_back(conv_cmi_ty(a, vars, nv));
+      out.push_back(cmi::cmiw::sig_exception(fn, std::move(args)));
+    }
+  }
+  return out;
+}
+
 // Build a .cmi signature from a hand-written interface (.mli) -- the explicit
 // path, used when an interface file exists.  Types are taken verbatim from the
 // declarations (no inference); local type names are pre-registered so qualified
@@ -2697,6 +2806,26 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
         if (auto f = modtypes.find(l->name); f != modtypes.end()) return f->second;
     if (auto* pw = std::get_if<Pmty_with>(&mt.desc)) return body_sig(*pw->mt);
     return nullptr;
+  };
+  // A QUALIFIED named module type (`Set.S`, `Hashtbl.S with type key = string`):
+  // resolve through the head module's cmi modtype decl and convert to SigItems.
+  // (the with-constraints only refine types, which take no runtime field).  This
+  // lets `module Set : Set.S with ..` (a functor result) emit its members so
+  // `M.Set.empty` resolves -- otherwise the whole submodule is dropped.
+  auto qual_modtype_items =
+      [&](const ast::ModuleType& mt0) -> std::vector<cmi::cmiw::SigItem> {
+    const ast::ModuleType* mt = &mt0;
+    while (auto* pw = std::get_if<Pmty_with>(&mt->desc)) mt = pw->mt.get();
+    if (auto* pi = std::get_if<Pmty_ident>(&mt->desc))
+      if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
+        if (auto* l = std::get_if<Lident>(&d->prefix->v)) try {
+          auto cmi = cmi::CmiFile::load(head_cmi(l->name));
+          for (auto& md : cmi.sig().modtypes)
+            if (md.name == d->name && md.type &&
+                md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+              return cmi_sig_to_items(*md.type->sig);
+        } catch (...) {}
+    return {};
   };
   std::vector<cmi::cmiw::SigItem> out;
   for (auto& it : s) {
@@ -2751,6 +2880,9 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
           // submodule with S's resolved signature inline, so a consumer can
           // resolve `Digest.MD5.bytes` to its field (else the module is dropped).
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(*bs)));
+        } else if (auto items = qual_modtype_items(*pm->md.type); !items.empty()) {
+          // `module Set : Set.S with ..` (a qualified functor-result module type).
+          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items)));
         }
       }
     } else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
@@ -2775,6 +2907,20 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
           }
           out.push_back(cmi::cmiw::sig_exception(ec.name.txt, std::move(args)));
         }
+    } else if (auto* pinc = std::get_if<Psig_include>(&it.desc)) {
+      // `include module type of M`: splice M's compiled cmi signature here so the
+      // .cmi records M's values (with prim flags) and types -- otherwise the
+      // included members are absent and the field layout is short of the .cmo.
+      if (auto* pto = std::get_if<Pmty_typeof>(&pinc->mt.desc)) {
+        if (auto* pi = std::get_if<Pmod_ident>(&pto->me->desc))
+          if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) try {
+            auto cmi = cmi::CmiFile::load(head_cmi(l->name));
+            for (auto& si : cmi_sig_to_items(cmi.sig())) out.push_back(std::move(si));
+          } catch (...) {}
+      } else if (const ast::Signature* bs = body_sig(pinc->mt)) {
+        // `include S` (named local modtype) / `include sig .. end`
+        for (auto& si : signature_to_cmi(*bs)) out.push_back(std::move(si));
+      }
     }
   }
   return out;
