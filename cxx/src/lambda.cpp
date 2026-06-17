@@ -11088,6 +11088,16 @@ struct Translator {
         if (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) {
           coerce_store = sig_layout(*pc->mt); coerce = &coerce_store; me = pc->me.get();
         }
+        // No explicit `: S`, but THIS unit's own .mli declares the submodule's
+        // field order: coerce the submodule body to it so members the impl gives
+        // as EXTERNALS (Stdlib.LargeFile's seek_in etc. -- all externals, hence a
+        // 0-field raw block) are materialised as eta-stubs.  Without this the
+        // submodule block is empty and `M.Sub.f` reads out of bounds -> a garbage
+        // pointer that crashes the GC under load.
+        if (!coerce && mb.name.txt)
+          if (auto sf = mli_submodule_fields_.find(*mb.name.txt);
+              sf != mli_submodule_fields_.end())
+            coerce = &sf->second;
         if (mb.name.txt)
           if (auto* ps = std::get_if<Pmod_structure>(&me->desc)) {
             std::vector<std::string> sub;
