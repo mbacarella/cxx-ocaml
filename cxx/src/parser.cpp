@@ -2047,6 +2047,17 @@ class Parser {
         for (auto& a : opattrs) p.attrs.push_back(std::move(a));
       else idx_ = save;
     }
+    // `(p) as x :: rest`: OCaml's `::` has higher precedence than `as`, so the LR
+    // parser shifts the `::` -- the alias binds to this cons OPERAND. We mirror
+    // that only when a `::` follows the alias; a trailing `as x` (no `::`) belongs
+    // to the whole pattern (parse_pat_alias), keeping `a::b as x` == `(a::b) as x`.
+    if (cur().kind == Kind::AS && peek(1).kind == Kind::LIDENT &&
+        peek(2).kind == Kind::COLONCOLON) {
+      advance();
+      StringLoc nm = parse_alias_name();
+      Location al = span(p.loc.start, nm.loc.end);
+      p = Pattern{Ppat_alias{box(std::move(p)), nm}, al};
+    }
     if (cur().kind != Kind::COLONCOLON) return p;
     Token optok = cur();
     advance();

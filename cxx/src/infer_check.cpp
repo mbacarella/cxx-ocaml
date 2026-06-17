@@ -2428,7 +2428,16 @@ struct Checker {
         } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
           if (pr->prim.type) {  // external f : t = "..." binds f : t
             std::unordered_map<std::string, TypePtr> vars;
-            venv.back()[pr->prim.name.txt] = from_coretype(*pr->prim.type, vars);
+            // An external's type annotation is fully universally quantified
+            // (`'a array -> int -> 'a`), so GENERALIZE it -- else every use of
+            // the primitive shares one type variable and a single monomorphic use
+            // poisons the rest (array.ml's `unsafe_get` collapsed to a float array
+            // -> Array.iter/map garbage on string arrays).
+            eng.enter_level();
+            TypePtr ty = from_coretype(*pr->prim.type, vars);
+            eng.leave_level();
+            eng.generalize(ty);
+            venv.back()[pr->prim.name.txt] = ty;
           }
         } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
           if (mt->type)  // record a signature module type's value names for unpacks

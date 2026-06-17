@@ -11050,7 +11050,19 @@ struct Translator {
             auto exn_before = exn_ident_;
             auto mod_before = module_ident_;
             auto alias_before = module_alias_;
+            // A submodule's external must not SHADOW a same-named parent one
+            // unqualified: array.ml's `module Floatarray = struct external
+            // unsafe_get : floatarray.. = "%floatarray_unsafe_get" end` would
+            // overwrite the top-level `unsafe_get = "%array_unsafe_get"`, so later
+            // top-level `unsafe_get` lowered to a FLOAT array get (Array.iter/map
+            // garbage).  Restore only the SHADOWED parent entries; KEEP the
+            // submodule's NEW ones -- `M.member` resolution falls back to them by
+            // name (domain.ml's `Raw.get_domain_count`).
+            auto lprims_before = local_prims_;
+            auto exts_before = externals_;
             LamPtr body = build_module(ps->items, &sub, coerce);
+            for (auto& [k, v] : lprims_before) local_prims_[k] = v;
+            for (auto& [k, v] : exts_before) externals_[k] = v;
             mod_path_ = saved;
             Ident mid = fresh(*mb.name.txt);
             cur.push_back({mid, ValueKind::Gen, body});
