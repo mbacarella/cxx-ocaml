@@ -2759,6 +2759,22 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
       if (pmt->type)
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
           out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
+    } else if (auto* pe = std::get_if<Psig_exception>(&it.desc)) {
+      // `exception E [of t..]`: emit Sig_typext (takes a runtime field).  Without
+      // it the .cmi value layout is short of the .cmo (Parsing.Parse_error/YYexit
+      // shifted peek_val -> the C parse engine read the wrong table fields).
+      const ExtensionConstructor& ec = pe->exn.ctor;
+      if (!ec.name.txt.empty())
+        if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
+          std::vector<cmi::cmiw::TyPtr> args;
+          if (auto* tup = std::get_if<Pcstr_tuple>(&pd->args)) {
+            std::unordered_map<std::string, TypePtr> tvars;
+            std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
+            for (auto& a : tup->elems)
+              args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
+          }
+          out.push_back(cmi::cmiw::sig_exception(ec.name.txt, std::move(args)));
+        }
     }
   }
   return out;

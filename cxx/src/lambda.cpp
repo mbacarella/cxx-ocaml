@@ -4092,12 +4092,13 @@ struct Translator {
       if (auto f = fm.find(name); f != fm.end())
         return field_of(global_of(*it), f->second);
     }
+    // A predefined exception's identity is the predef global -- checked BEFORE the
+    // stdlib_fields path so `exception Match_failure = Match_failure` while
+    // compiling stdlib.ml ITSELF doesn't resolve to `(field i Stdlib)` (a
+    // self-reference); the predef global is the same value Stdlib re-exports.
+    if (is_predef_exn_name(name)) return predef_global(name);
     if (auto sf = stdlib_fields.find(name); sf != stdlib_fields.end())
       return field_of("Stdlib", sf->second);
-    // a compiler-internal predefined exception (Match_failure/Assert_failure) is
-    // NOT re-exported as a Stdlib field; its identity is the predef global (the
-    // same one raise_predef raises), so a pattern can match it.
-    if (is_predef_exn_name(name)) return predef_global(name);
     return nullptr;
   }
   // A match row as a *borrowed* view into the AST (the Structure outlives the
@@ -7959,21 +7960,14 @@ struct Translator {
         }
         return block_of(sci->tag, fs);
       }
-      // a predefined exception (Not_found, ...) is a Stdlib field; applied
-      // (Invalid_argument "X") it builds the block with the identity at field 0
-      if (auto sf = stdlib_fields.find(n); sf != stdlib_fields.end()) {
-        if (!k->arg) return field_of("Stdlib", sf->second);
-        if (is_predef_exn_name(n)) {
-          auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
-          b->args = {field_of("Stdlib", sf->second), expr(**k->arg)};
-          b->blk_shape = {ValueKind::Gen, expr_kind(k->arg->get())};
-          return b;
-        }
-      }
-      // A predefined exception NOT exported as a Stdlib field (our self-built
-      // stdlib drops the `exception Not_found = Not_found` re-exports): use the
-      // predef global as its identity -- the SAME one exn_value/raise_predef use,
-      // so `raise Not_found` and `with Not_found ->` stay consistent all-ours.
+      // A predefined exception (Not_found, Match_failure, ...): ALWAYS use the
+      // predef global as its identity -- the same value Stdlib re-exports (so
+      // it's correct from any module) AND the same one exn_value/raise_predef use
+      // (so `raise`/`with` agree).  Crucially this is checked BEFORE the
+      // stdlib_fields path: now that stdlib.cmi carries these as fields, resolving
+      // them to `(field i Stdlib)` while COMPILING stdlib.ml itself
+      // (`exception Match_failure = Match_failure`) would be a self-reference ->
+      // "undefined global Stdlib referenced by Stdlib" at link.
       if (is_predef_exn_name(n)) {
         if (!k->arg) return predef_global(n);
         auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
@@ -7981,6 +7975,9 @@ struct Translator {
         b->blk_shape = {ValueKind::Gen, expr_kind(k->arg->get())};
         return b;
       }
+      // any other Stdlib-field value (a pervasive exception/value re-export)
+      if (auto sf = stdlib_fields.find(n); sf != stdlib_fields.end())
+        if (!k->arg) return field_of("Stdlib", sf->second);
       // a stdlib module's exception, constructed (`Arg.Bad msg`): identity is the
       // module's export field (uppercase non-ctor exports are exceptions)
       if (auto* dq = std::get_if<Ldot>(&k->id.txt.v))

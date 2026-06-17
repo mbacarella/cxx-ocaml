@@ -214,7 +214,7 @@ struct Ctor { std::string name; std::vector<TyPtr> args; };  // Cstr_tuple args
 struct Label { std::string name; bool mut = false; TyPtr ty; };  // record field
 struct SigItem;
 struct SigItem {
-  enum K { Value, Type, Module, Modtype } k = Value;
+  enum K { Value, Type, Module, Modtype, Exception } k = Value;
   std::string name;
   TyPtr ty;                   // Value: the value's type
   std::vector<TyPtr> params;  // Type: type parameters (Var descriptors)
@@ -254,6 +254,16 @@ inline SigItem sig_module(std::string n, std::vector<SigItem> items) {
 // functor parameter `(H : Hashtbl.HashedType)` resolve H.equal/H.hash to fields.
 inline SigItem sig_modtype(std::string n, std::vector<SigItem> items) {
   SigItem s; s.k = SigItem::Modtype; s.name = std::move(n); s.sub = std::move(items); return s;
+}
+// An `exception E [of t1 * ..]` declaration.  Emitted as Sig_typext over the
+// predefined `exn` type; TAKES A RUNTIME FIELD, so it must appear in the .cmi to
+// keep the surrounding value field layout aligned with the .cmo (Parsing's
+// Parse_error/YYexit shifted peek_val by 2 -> mis-driven parse engine).  `args`
+// holds the constructor argument types (empty for a nullary exception).
+inline SigItem sig_exception(std::string n, std::vector<TyPtr> args) {
+  SigItem s; s.k = SigItem::Exception; s.name = std::move(n);
+  Ctor c; c.name = s.name; c.args = std::move(args); s.ctors.push_back(std::move(c));
+  return s;
 }
 inline SigItem sig_module_alias(std::string n, std::string target) {
   SigItem s; s.k = SigItem::Module; s.name = std::move(n); s.alias = std::move(target); return s;

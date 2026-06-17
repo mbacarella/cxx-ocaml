@@ -917,6 +917,18 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       auto mtd = o::vblock(0, {o::vblock(0, {msig}) /*Some*/, o::vint(0) /*attrs*/,
                                loc_none(), o::vint(0) /*mtd_uid*/});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
+    } else if (it.k == SigItem::Exception) {
+      // Sig_typext(id, extension_constructor, Text_exception, vis).  An exception
+      // is an extension of the predefined `exn` type and TAKES a runtime field.
+      auto path = o::vblock(0, {o::vblock(3, {o::vstr("exn"), o::vint(7)})});  // Pident(Predef exn)
+      std::vector<o::ValPtr> args;
+      if (!it.ctors.empty()) for (auto& a : it.ctors[0].args) args.push_back(te.emit(a));
+      auto cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
+      auto extcon = o::vblock(0, {path, o::vint(0) /*ext_type_params []*/, cargs,
+                                  o::vint(0) /*ext_ret_type None*/, o::vint(0) /*ext_private Public*/,
+                                  loc_none(), o::vint(0) /*ext_attributes*/, o::vint(0) /*ext_uid*/});
+      sig.push_back(o::vblock(2, {ident, extcon, o::vint(2) /*Text_exception*/,
+                                  o::vint(0) /*Exported*/}));  // Sig_typext
     } else {
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
       // alias (`type t = manifest`).  Variant/record kinds: the climb.
