@@ -10357,6 +10357,56 @@ struct Translator {
     body->args = std::move(fs);  // reuse the block (its bindings), param-ordered
     return block;
   }
+  // The parameter signature of a cross-module functor (`Arg_helper.Make`), copied
+  // from the head module's cmi so it outlives the loaded CmiFile.  False when the
+  // path isn't such a functor.
+  bool load_functor_param_sig(const std::string& mod, const std::string& name,
+                              cmi::Signature& out) {
+    if (module_base(mod) || fields_of(mod).empty()) return false;
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      for (auto& md : cmi.sig().modules)
+        if (md.name == name && md.type &&
+            md.type->kind == cmi::ModuleType::Functor && md.type->functor_param_type)
+          if (const cmi::Signature* ps = mt_sig(cmi, md.type->functor_param_type)) {
+            out = *ps; return true;  // copy (shares shared_ptr nodes, kept alive)
+          }
+    } catch (...) {}
+    return false;
+  }
+  // Coerce a struct-literal argument of a CROSS-MODULE functor to its cmi
+  // parameter signature, reordering the top level AND recursing into nested
+  // submodules (Arg_helper.Make's argument `module Key = struct include
+  // Numbers.Int; let of_string end` must be laid out as the param's Key
+  // [of_string; Map], else the functor body reads `field 1 Key` as a non-module
+  // and stores garbage in the parsed record -> GC segfault).  The AST-based
+  // coerce_struct_arg only fires for local functors (it needs an AST param sig);
+  // this is its cmi twin for separately-compiled functors.
+  LamPtr coerce_struct_arg_cmi(const Pmod_structure& ps, const cmi::Signature& psig) {
+    if (psig.fields.empty()) return nullptr;
+    std::vector<std::string> sub;
+    LamPtr block = build_module(ps.items, &sub, nullptr, &psig.fields);
+    LamPtr body = block;
+    while (body && (body->k == Lam::K::Let || body->k == Lam::K::Letrec)) body = body->body;
+    if (!body || body->k != Lam::K::Prim || body->prim != Prim::Makeblock ||
+        body->args.size() != sub.size())
+      return nullptr;
+    std::unordered_map<std::string, LamPtr> val;
+    for (size_t i = 0; i < sub.size(); ++i) val[sub[i]] = body->args[i];
+    std::vector<LamPtr> fs;
+    for (auto& nm : psig.fields) {
+      auto it = val.find(nm);
+      if (it == val.end()) return nullptr;
+      LamPtr v = it->second;
+      if (const cmi::Signature* nsig = nested_cmi_sig(psig, nm))
+        if (LamPtr c = coerce_block(v, layout_vec(nm), nsig->fields, nullptr, nullptr,
+                                    nsig, nm))
+          v = c;
+      fs.push_back(v);
+    }
+    body->args = std::move(fs);
+    return block;
+  }
   // A functor used as an ARGUMENT whose declared parameter type is a functor type
   // `functor(P) -> R` (a higher-order functor parameter, e.g. Set's PowerSet
   // SetOrd): compile `functor(P) -> body` but coerce its RESULT to R's layout, so
@@ -10468,6 +10518,19 @@ struct Translator {
         if (LamPtr c = coerce_struct_arg(*aps, *param_mt)) {
           auto a = mk(Lam::K::Apply); a->fn = fval; a->args = {c}; return a;
         }
+    // The same nested coercion for a CROSS-MODULE functor (Arg_helper.Make),
+    // whose parameter signature lives in another cmi (no AST param_mt).
+    if (!param_mt)
+      if (auto* aps = std::get_if<Pmod_structure>(&pa.arg->desc))
+        if (auto* pi = std::get_if<Pmod_ident>(&pa.f->desc))
+          if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
+            if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+              cmi::Signature psig;
+              if (load_functor_param_sig(pl->name, d->name, psig))
+                if (LamPtr c = coerce_struct_arg_cmi(*aps, psig)) {
+                  auto a = mk(Lam::K::Apply); a->fn = fval; a->args = {c}; return a;
+                }
+            }
     LamPtr aval = compile_module_expr(*pa.arg);
     LamPtr acoerced = aval;
     auto alay = arg_layout(*pa.arg);
