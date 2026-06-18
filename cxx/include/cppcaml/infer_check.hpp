@@ -82,6 +82,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s);
 // Build the .cmi signature from a hand-written interface (.mli).  Unlike
 // infer_signature this reads types verbatim from the declarations (no
 // inference); it is the path used when an interface file exists.
-std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s);
+std::vector<cmi::cmiw::SigItem> signature_to_cmi(
+    const ast::Signature& s,
+    const std::unordered_map<std::string, const ast::Signature*>* outer = nullptr);
 
 }  // namespace cppcaml

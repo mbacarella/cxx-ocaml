@@ -10334,6 +10334,23 @@ struct Translator {
       if (const ModuleType* smt = sig_member_modtype(*psig, nm)) {
         std::string srcmod = struct_member_module_src(ps, nm);
         if (!srcmod.empty()) v = coerce_module_value(v, srcmod, sig_layout(*smt));
+        else {
+          // A struct-LITERAL member (`module Key = struct include Numbers.Int;
+          // let of_string end`): reorder its block to the parameter's member
+          // signature, recursing into ITS submodules (Key.Map), so a functor-body
+          // field read (`S.Key.Map.empty`) lands on the right field.  Without this
+          // Arg_helper.Make's argument Key keeps its include-order layout (Map at a
+          // high offset) and the parsed record gets a garbage Map -> GC segfault.
+          const ModuleExpr* sme = nullptr;
+          for (auto& mi : ps.items)
+            if (auto* pm = std::get_if<Pstr_module>(&mi.desc))
+              if (pm->binding.name.txt && *pm->binding.name.txt == nm) {
+                sme = &pm->binding.expr; break;
+              }
+          if (LamPtr c = coerce_block(v, layout_vec(nm), sig_layout(*smt), sme,
+                                      sig_items_of(*smt)))
+            v = c;
+        }
       }
       fs.push_back(v);
     }

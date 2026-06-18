@@ -2782,12 +2782,17 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
 // path, used when an interface file exists.  Types are taken verbatim from the
 // declarations (no inference); local type names are pre-registered so qualified
 // and same-module references resolve.
-std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
+std::vector<cmi::cmiw::SigItem> signature_to_cmi(
+    const ast::Signature& s,
+    const std::unordered_map<std::string, const ast::Signature*>* outer) {
   Checker ck;
   ck.record_kinds_ = true;
   // Collect `module type S = sig .. end` so a functor result `: S` (Map.Make)
-  // can be resolved to S's signature items.
+  // can be resolved to S's signature items.  Inherit ENCLOSING modtypes too: a
+  // nested signature (`module type S = sig include Thing; module Map : Map end`
+  // in identifiable.mli) references modtypes declared in its outer scope.
   std::unordered_map<std::string, const ast::Signature*> modtypes;
+  if (outer) modtypes = *outer;
   for (auto& it : s) {
     if (auto* pt = std::get_if<Psig_type>(&it.desc))
       for (auto& d : pt->decls) ck.register_type_decl(d);
@@ -2848,7 +2853,8 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
     } else if (auto* pm = std::get_if<Psig_module>(&it.desc)) {
       if (pm->md.name.txt && pm->md.type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
-          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(ps->items)));
+          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt,
+                                              signature_to_cmi(ps->items, &modtypes)));
         else if (auto* al = std::get_if<Pmty_alias>(&pm->md.type->desc)) {
           // `module M = Target` (stdlib.mli's `module List = Stdlib__List`, or a
           // DOTTED target like types.mli's `module Uid = Shape.Uid`).  Emit the
@@ -2870,19 +2876,19 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
             // the right field -- without it, the whole argument is passed and
             // `Ord.compare` reads a wrong slot (Map.Make(Int).find segfaults).
             if (fn->type)
-              if (const ast::Signature* psg = body_sig(*fn->type)) param_sig = signature_to_cmi(*psg);
+              if (const ast::Signature* psg = body_sig(*fn->type)) param_sig = signature_to_cmi(*psg, &modtypes);
           }
           const ast::ModuleType* body = pf->body.get();
           while (auto* pf2 = std::get_if<Pmty_functor>(&body->desc)) body = pf2->body.get();
           std::vector<cmi::cmiw::SigItem> result;
-          if (const ast::Signature* rs = body_sig(*body)) result = signature_to_cmi(*rs);
+          if (const ast::Signature* rs = body_sig(*body)) result = signature_to_cmi(*rs, &modtypes);
           out.push_back(cmi::cmiw::sig_module_functor(*pm->md.name.txt, param,
                           std::move(param_sig), std::move(result)));
         } else if (const ast::Signature* bs = body_sig(*pm->md.type)) {
           // `module MD5 : S` (a NAMED module type) or `S with ...`: emit the
           // submodule with S's resolved signature inline, so a consumer can
           // resolve `Digest.MD5.bytes` to its field (else the module is dropped).
-          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(*bs)));
+          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(*bs, &modtypes)));
         } else if (auto items = qual_modtype_items(*pm->md.type); !items.empty()) {
           // `module Set : Set.S with ..` (a qualified functor-result module type).
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items)));
@@ -2893,7 +2899,8 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
       // (`Make (H : Hashtbl.HashedType)`) can resolve H's members to fields.
       if (pmt->type)
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
-          out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
+          out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt,
+                                               signature_to_cmi(ps->items, &modtypes)));
     } else if (auto* pe = std::get_if<Psig_exception>(&it.desc)) {
       // `exception E [of t..]`: emit Sig_typext (takes a runtime field).  Without
       // it the .cmi value layout is short of the .cmo (Parsing.Parse_error/YYexit
@@ -2922,7 +2929,14 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
           } catch (...) {}
       } else if (const ast::Signature* bs = body_sig(pinc->mt)) {
         // `include S` (named local modtype) / `include sig .. end`
-        for (auto& si : signature_to_cmi(*bs)) out.push_back(std::move(si));
+        for (auto& si : signature_to_cmi(*bs, &modtypes)) out.push_back(std::move(si));
+      } else if (auto items = qual_modtype_items(pinc->mt); !items.empty()) {
+        // `include Identifiable.S with type t = int` (a QUALIFIED cross-module
+        // module type): splice its members from the head module's cmi, so the
+        // .cmi records the included values/submodules (Numbers.Int gets Map/Set/
+        // compare).  Without it a downstream `include Numbers.Int` builds a short
+        // block missing Key.Map -> Arg_helper.Make's parsed record is garbage.
+        for (auto& si : items) out.push_back(std::move(si));
       }
     }
   }
