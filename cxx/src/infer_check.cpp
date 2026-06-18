@@ -1,5 +1,6 @@
 #include "cppcaml/infer_check.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -47,6 +48,38 @@ std::string lid_full(const Longident& x) {
   if (auto* p = std::get_if<Ldot>(&x.v)) return lid_full(*p->prefix) + "." + p->name;
   auto& a = std::get<Lapply>(x.v);
   return lid_full(*a.f) + "(" + lid_full(*a.x) + ")";
+}
+
+// Module names removed by a DESTRUCTIVE module substitution in a `<modtype> with
+// module X := P` (and `with module type X := ..`): the substituted module loses
+// its runtime field.  identifiable.mli's `module Map : Map with module T := T`
+// drops the leading `module T`, so the runtime block (Make_map, which has no T)
+// and the .cmi agree -- without this they differ by one field and every
+// `Numbers.Int.Map.x` reads one slot off.
+static std::set<std::string> with_modsubst_names(const ast::ModuleType& mt) {
+  std::set<std::string> r;
+  const ast::ModuleType* m = &mt;
+  while (auto* pw = std::get_if<Pmty_with>(&m->desc)) {
+    for (auto& c : pw->constraints)
+      if (auto* ms = std::get_if<Pwith_modsubst>(&c)) {
+        if (auto* l = std::get_if<Lident>(&ms->lid1.txt.v)) r.insert(l->name);
+      } else if (auto* mts = std::get_if<Pwith_modtypesubst>(&c)) {
+        if (auto* l = std::get_if<Lident>(&mts->lid.txt.v)) r.insert(l->name);
+      }
+    m = pw->mt.get();
+  }
+  return r;
+}
+
+// Drop the module/modtype SigItems named by a destructive substitution, so the
+// emitted .cmi field layout matches the runtime block.
+static void drop_modsubst(std::vector<cmi::cmiw::SigItem>& items,
+                          const std::set<std::string>& removed) {
+  if (removed.empty()) return;
+  items.erase(std::remove_if(items.begin(), items.end(), [&](const cmi::cmiw::SigItem& si) {
+    return (si.k == cmi::cmiw::SigItem::Module || si.k == cmi::cmiw::SigItem::Modtype) &&
+           removed.count(si.name) > 0;
+  }), items.end());
 }
 
 // (kind, name) for an AST argument label: 0 Nolabel, 1 Labelled, 2 Optional.
@@ -2888,9 +2921,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           // `module MD5 : S` (a NAMED module type) or `S with ...`: emit the
           // submodule with S's resolved signature inline, so a consumer can
           // resolve `Digest.MD5.bytes` to its field (else the module is dropped).
-          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(*bs, &modtypes)));
+          auto items = signature_to_cmi(*bs, &modtypes);
+          drop_modsubst(items, with_modsubst_names(*pm->md.type));
+          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items)));
         } else if (auto items = qual_modtype_items(*pm->md.type); !items.empty()) {
           // `module Set : Set.S with ..` (a qualified functor-result module type).
+          drop_modsubst(items, with_modsubst_names(*pm->md.type));
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items)));
         }
       }
