@@ -1380,13 +1380,49 @@ struct Translator {
   // side unknown, or a target field missing from the source.  With `src_me`
   // and `tsig` supplied, module members narrowed by the signature project
   // recursively.
+  // The nested signature of submodule `nm` within a decoded .cmi signature, when
+  // it is a structural (Mty_signature) submodule -- used to recurse impl->intf
+  // field coercion into nested submodules (Misc.Stdlib.String).
+  static const cmi::Signature* nested_cmi_sig(const cmi::Signature& s,
+                                              const std::string& nm) {
+    for (auto& md : s.modules)
+      if (md.name == nm && md.type && md.type->kind == cmi::ModuleType::Sig &&
+          md.type->sig)
+        return md.type->sig.get();
+    return nullptr;
+  }
+  // Does coercing a module block (field names `src`, with nested submodule
+  // layouts registered under dotted `src_path` keys in module_layout_) to the
+  // cmi target signature `tsig` change anything -- at this level OR in any nested
+  // submodule?  A nested submodule can be out of order even when this level's
+  // field order already matches, so the top-level reorder must still recurse.
+  bool needs_coerce_cmi(const std::vector<std::string>& src,
+                        const cmi::Signature& tsig, const std::string& src_path) {
+    if (tsig.fields.empty()) return false;
+    for (auto& nm : tsig.fields)
+      if (std::find(src.begin(), src.end(), nm) == src.end()) return false;
+    if (tsig.fields != src) return true;
+    for (auto& nm : tsig.fields)
+      if (const cmi::Signature* nsig = nested_cmi_sig(tsig, nm)) {
+        std::string sp = src_path.empty() ? nm : src_path + "." + nm;
+        std::vector<std::string> sl = layout_vec(sp);
+        if (!sl.empty() && needs_coerce_cmi(sl, *nsig, sp)) return true;
+      }
+    return false;
+  }
   LamPtr coerce_block(const LamPtr& mv, const std::vector<std::string>& src,
                       const std::vector<std::string>& target,
                       const ModuleExpr* src_me = nullptr,
-                      const Pmty_signature* tsig = nullptr) {
-    if (target.empty() || src.empty() || target == src) return nullptr;
+                      const Pmty_signature* tsig = nullptr,
+                      const cmi::Signature* tcmi = nullptr,
+                      const std::string& src_path = "") {
+    if (target.empty() || src.empty()) return nullptr;
     for (auto& nm : target)
       if (std::find(src.begin(), src.end(), nm) == src.end()) return nullptr;
+    // When this level's field order already matches, a coercion is still needed
+    // if a NESTED submodule (per the .cmi signature) is itself out of order.
+    if (target == src && !(tcmi && needs_coerce_cmi(src, *tcmi, src_path)))
+      return nullptr;
     // Structure-include optimisation: when the source value is a freshly-built
     // structure block `(let <bindings> (makeblock 0 v0 v1 ..))`, the coercion is
     // fused into that makeblock -- keep the bindings (their effects) but rebuild
@@ -1416,6 +1452,15 @@ struct Translator {
                                            sig_layout(*smt), sme, sig_items_of(*smt)))
                 fr = c2;
             }
+          if (tcmi)  // .cmi-driven nested submodule reorder (Misc.Stdlib.String)
+            if (const cmi::Signature* nsig = nested_cmi_sig(*tcmi, nm)) {
+              std::string sp = src_path.empty() ? nm : src_path + "." + nm;
+              std::vector<std::string> sl = layout_vec(sp);
+              if (!sl.empty())
+                if (LamPtr c2 = coerce_block(fr, sl, nsig->fields, nullptr, nullptr,
+                                             nsig, sp))
+                  fr = c2;
+            }
           fs.push_back(fr);
         }
         auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
@@ -1438,6 +1483,15 @@ struct Translator {
           if (LamPtr c2 = coerce_block(fr, src_member_layout(*src_me, nm),
                                        sig_layout(*smt), sme, sig_items_of(*smt)))
             fr = c2;
+        }
+      if (tcmi)  // .cmi-driven nested submodule reorder (Misc.Stdlib.String)
+        if (const cmi::Signature* nsig = nested_cmi_sig(*tcmi, nm)) {
+          std::string sp = src_path.empty() ? nm : src_path + "." + nm;
+          std::vector<std::string> sl = layout_vec(sp);
+          if (!sl.empty())
+            if (LamPtr c2 = coerce_block(fr, sl, nsig->fields, nullptr, nullptr,
+                                         nsig, sp))
+              fr = c2;
         }
       fs.push_back(fr);
     }
@@ -10149,6 +10203,11 @@ struct Translator {
   // reorder a submodule's OWN block to its .mli layout (domain.ml's DLS struct has
   // new_key at internal field 5, but Domain.DLS's signature exposes it at field 0).
   std::unordered_map<std::string, std::vector<std::string>> mli_submodule_fields_;
+  // This unit's own decoded .mli (.cmi) signature, kept whole so the top-level
+  // impl->intf coercion can RECURSE into nested submodules (Misc.Stdlib.String)
+  // -- mli_submodule_fields_ flattens only one level.  Empty when no .mli.
+  cmi::Signature mli_cmi_sig_;
+  bool has_mli_cmi_ = false;
   // Set just before compiling a functor whose body must be coerced to its .mli
   // result signature; consumed (and cleared) by compile_module_expr's body build.
   std::vector<std::string> pending_functor_coerce_;
@@ -10649,7 +10708,8 @@ struct Translator {
 
   LamPtr build_module(const Structure& s, std::vector<std::string>* names,
                       const std::vector<std::string>* coerce = nullptr,
-                      const std::vector<std::string>* force_export = nullptr) {
+                      const std::vector<std::string>* force_export = nullptr,
+                      const cmi::Signature* coerce_sig = nullptr) {
     scope.emplace_back();
     // Re-register ambiguous constructors in source order within this module:
     // save their current entries and restore on exit, so a submodule's in-order
@@ -11671,13 +11731,23 @@ struct Translator {
           // a submodule whose own block layout differs from its .mli signature
           // (Domain.DLS: internal field order != exposed [new_key; get; set])
           // is reprojected to the .mli order so external field reads land right.
-          if (auto sf = mli_submodule_fields_.find(nm); sf != mli_submodule_fields_.end())
-            if (auto li = module_layout_.find(nm); li != module_layout_.end()) {
-              std::vector<std::string> srclay(li->second.size());
-              for (auto& [fn2, ix] : li->second)
-                if (ix >= 0 && ix < (int)srclay.size()) srclay[ix] = fn2;
+          // When this unit's full .cmi signature is available (coerce_sig), drive
+          // the reorder from it so the coercion recurses into NESTED submodules
+          // (Misc.Stdlib.String: misc.ml and misc.mli order String's members
+          // differently -- the top-level Misc coercion must reach inside).
+          if (const cmi::Signature* nsig =
+                  coerce_sig ? nested_cmi_sig(*coerce_sig, nm) : nullptr) {
+            std::vector<std::string> srclay = layout_vec(nm);
+            if (!srclay.empty())
+              if (LamPtr c = coerce_block(val, srclay, nsig->fields, nullptr,
+                                          nullptr, nsig, nm))
+                val = c;
+          } else if (auto sf = mli_submodule_fields_.find(nm);
+                     sf != mli_submodule_fields_.end()) {
+            std::vector<std::string> srclay = layout_vec(nm);
+            if (!srclay.empty())
               if (LamPtr c = coerce_block(val, srclay, sf->second)) val = c;
-            }
+          }
           ce.push_back(val); cn.push_back(nm);
         } else if (auto a = module_alias_.find(nm); a != module_alias_.end()) {
           // a module the struct ELIDED as an alias (`module Elem = E`) but the
@@ -11783,6 +11853,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
         auto c = cmi::CmiFile::load(cmi.string());
         if (c.module_name() == module_name) {
           mli_fields = c.sig().fields;
+          t.mli_cmi_sig_ = c.sig(); t.has_mli_cmi_ = true;  // for nested coercion
           // record each top-level functor's RESULT field order, to coerce its
           // body struct (Map.Make : S -> S's fields).
           for (auto& md : c.modules()) {
@@ -11808,7 +11879,8 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   auto sg = mk(Lam::K::Prim);
   sg->prim = Prim::Setglobal; sg->prim_id = module_name;
   sg->args.push_back(t.wrap_shared(
-      t.build_module(s, nullptr, mli_fields.empty() ? nullptr : &mli_fields)));
+      t.build_module(s, nullptr, mli_fields.empty() ? nullptr : &mli_fields,
+                     nullptr, t.has_mli_cmi_ ? &t.mli_cmi_sig_ : nullptr)));
   lap("build_module");
   LamPtr root = sg;
   t.simplify_local_functions(root);
