@@ -2850,10 +2850,13 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(const ast::Signature& s) {
         if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, signature_to_cmi(ps->items)));
         else if (auto* al = std::get_if<Pmty_alias>(&pm->md.type->desc)) {
-          // `module M = Target` (e.g. stdlib.mli's `module List = Stdlib__List`):
-          // a single-component target is the unit's global name.
-          if (auto* l = std::get_if<Lident>(&al->id.txt.v))
-            out.push_back(cmi::cmiw::sig_module_alias(*pm->md.name.txt, l->name));
+          // `module M = Target` (stdlib.mli's `module List = Stdlib__List`, or a
+          // DOTTED target like types.mli's `module Uid = Shape.Uid`).  Emit the
+          // full path so `M.x` resolves through the alias (a dotted target was
+          // previously dropped, losing the whole submodule).
+          if (!std::holds_alternative<Lapply>(al->id.txt.v))
+            out.push_back(cmi::cmiw::sig_module_alias(*pm->md.name.txt,
+                                                      lid_full(al->id.txt)));
         } else if (auto* pf = std::get_if<Pmty_functor>(&pm->md.type->desc)) {
           // `module Make (Ord : _) : S with ...` (Map/Set/Hashtbl): emit a functor
           // module so Make takes a field and Make(Arg).x resolves via S's layout.

@@ -896,11 +896,21 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         auto body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature(result)
         mty = o::vblock(2, {param, body});  // Mty_functor
       } else if (!it.alias.empty()) {
-        // `module name = <unit>`: Mty_alias(Pident(Global unit)), Mp_absent --
-        // an alias is transparent and takes NO runtime field.  Record the unit so
-        // it's imported (CRC=None, like -no-alias-deps).
-        referenced.emplace(it.alias, false);
-        auto path = o::vblock(0, {o::vblock(2, {o::vstr(it.alias)})});  // Pident(Global)
+        // `module name = <target>`: Mty_alias(path), Mp_absent -- an alias is
+        // transparent and takes NO runtime field.  A single-component target is
+        // Pident(Global unit); a dotted target (`Uid = Shape.Uid`) is
+        // Pdot(Pident(Global head), comp..).  Record the HEAD unit as imported.
+        size_t dot = it.alias.find('.');
+        std::string head = dot == std::string::npos ? it.alias : it.alias.substr(0, dot);
+        referenced.emplace(head, false);
+        o::ValPtr path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global head)
+        for (size_t pos = dot; pos != std::string::npos;) {
+          size_t nd = it.alias.find('.', pos + 1);
+          std::string comp = it.alias.substr(pos + 1,
+              nd == std::string::npos ? std::string::npos : nd - pos - 1);
+          path = o::vblock(1, {path, o::vstr(comp)});  // Pdot(path, comp)
+          pos = nd;
+        }
         mty = o::vblock(3, {path});  // Mty_alias
         presence = 1;  // Mp_absent
       } else {

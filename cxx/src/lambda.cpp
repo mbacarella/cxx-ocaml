@@ -1763,7 +1763,16 @@ struct Translator {
   struct SubMod { std::vector<int> path; std::unordered_map<std::string, int> fields;
                   std::unordered_map<std::string, StdPrim> prims;
                   std::unordered_map<std::string, FnSig> sigs;  // labelled values only
+                  std::string base;  // global to start `path` from (empty = the head unit)
                   bool ok = false; };
+  // A cmi Path (Pident/Pdot) as a dotted string ("Shape.Uid"), for following a
+  // submodule alias (`module Uid = Shape.Uid`) to its target unit + path.
+  static std::string cmi_path_dotted(const cmi::Path& p) {
+    if (p.kind == cmi::Path::Pident) return p.id.name;
+    if (p.kind == cmi::Path::Pdot && p.a)
+      return cmi_path_dotted(*p.a) + "." + p.s;
+    return "";
+  }
   std::unordered_map<std::string, SubMod> submod_cache_;
   // local alias name -> stdlib submodule dotted path (`module MP = Gc.Memprof`)
   std::unordered_map<std::string, std::string> submod_alias_;
@@ -1790,6 +1799,20 @@ struct Translator {
           if (sig->fields[i] == comp) { ix = (int)i; break; }
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comp) { md = &mm; break; }
+        // A submodule ALIAS (`module Uid = Shape.Uid`) takes no field (Mp_absent,
+        // ix < 0) and resolves to ITS target unit.  Expand the path to the alias
+        // target plus the remaining components and resolve THAT, recording the
+        // target's head as the base global so member reads start from it.
+        if (md && md->type && md->type->kind == cmi::ModuleType::Alias &&
+            md->type->path) {
+          std::string tgt = cmi_path_dotted(*md->type->path);
+          if (!tgt.empty() && tgt.find('.') != std::string::npos) {
+            std::string rest = (nd == std::string::npos) ? "" : dotted.substr(nd);
+            SubMod r = submodule_of(tgt + rest);  // resolve the real path
+            if (r.ok && r.base.empty()) r.base = tgt.substr(0, tgt.find('.'));
+            return submod_cache_[dotted] = std::move(r);
+          }
+        }
         // a submodule whose type is a NAMED module type (`Digest.MD5 : S`)
         // resolves through this cmi's modtypes via mt_sig.
         const cmi::Signature* nsig = md ? mt_sig(cmi, md->type) : nullptr;
@@ -1862,6 +1885,28 @@ struct Translator {
     } catch (...) {}
     return submod_cache_[dotted] = std::move(sm);
   }
+  // Resolve a bare module name used as a prefix (`Variance`, `Separability`) to
+  // its dotted path when it is a submodule of an opened module (`open Types`):
+  // returns "Types.Variance".  Empty when it is not an opened submodule.
+  std::string opened_submodule_path(const std::string& name) {
+    if (name.find('.') != std::string::npos || module_base(name)) return "";
+    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
+      if (it->find('.') == std::string::npos && !module_base(*it))
+        if (submodule_of(*it + "." + name).ok) return *it + "." + name;
+    return "";
+  }
+  // `Sub.Ctor` where Sub is a submodule of an opened module (predef.ml's
+  // `Separability.Ind` under `open Types`): eagerly resolve the submodule, which
+  // registers its variant constructors into ctor_info_ so the qualified ctor
+  // resolves to its tag instead of staying an unbound `?Ctor`.
+  void register_opened_submodule_ctors(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return;
+    std::string prefix;
+    if (!lid_to_dotted(*d->prefix, prefix)) return;
+    if (prefix.find('.') != std::string::npos) { submodule_of(prefix); return; }
+    if (std::string p = opened_submodule_path(prefix); !p.empty()) submodule_of(p);
+  }
   StdPrim submodule_prim(const std::string& dotted, const std::string& name) {
     auto& sm = submodule_of(dotted);
     if (!sm.ok) return {"", 0};
@@ -1915,7 +1960,8 @@ struct Translator {
     auto f = sm.fields.find(name);
     if (f == sm.fields.end()) return nullptr;
     auto g = mk(Lam::K::Prim); g->prim = Prim::Global;
-    g->prim_id = global_of(dotted.substr(0, dotted.find('.')));
+    g->prim_id = global_of(sm.base.empty() ? dotted.substr(0, dotted.find('.'))
+                                           : sm.base);
     LamPtr cur = g;
     for (int ix : sm.path) cur = fieldimm(ix, cur);
     return fieldimm(f->second, cur);
@@ -7389,6 +7435,10 @@ struct Translator {
         if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
           std::string dotted;  // a dotted submodule path opens under its full path
           if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+          // a bare local open of a submodule of an already-opened module
+          // (`open Types` then `Variance.(contravariant, covariant)`): resolve it
+          // to the full path so its members resolve.
+          if (std::string p = opened_submodule_path(dotted); !p.empty()) dotted = p;
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
           opened_.push_back(dotted);
@@ -7912,6 +7962,15 @@ struct Translator {
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       std::string n = lid_last(k->id.txt);
+      // A qualified ctor of a separately-compiled module in EXPRESSION position
+      // registers its whole type's ctors (like the pattern path does), so a later
+      // UNQUALIFIED sibling resolves: predef.ml writes `Type_immediacy.Unknown`
+      // (the decl0 default) then `~immediate:Always` -- type-directed, where the
+      // expected type is fixed by that same qualified default.
+      if (std::holds_alternative<Ldot>(k->id.txt.v) && !ctor_info_.count(n)) {
+        register_qualified_ctor(k->id.txt);            // top-level `M.Ctor`
+        register_opened_submodule_ctors(k->id.txt);    // opened-submodule `Sub.Ctor`
+      }
       // a constructor qualified by a bound module that exports it (an exception /
       // extension constructor): read its identity from that module's block, so
       // `M1.E` and `M2.E` (distinct `type t += E`) stay distinct.
