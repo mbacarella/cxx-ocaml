@@ -1578,7 +1578,9 @@ struct Translator {
   // functor_result_/functor_param_ -- so member paths through a first-class
   // module resolve.  A named module type resolves locally via modtype_ast_,
   // else flat via sig_layout (named/stdlib module types).
-  void register_sig_layouts(const std::string& prefix, const ModuleType& mt) {
+  void register_sig_layouts(const std::string& prefix, const ModuleType& mt, int depth = 0) {
+    if (depth > 24) return;  // a recursive module type (strongly_connected_components'
+                             // `module Id : .. module Id : ..`) would recurse forever
     const ModuleType* m = &mt;
     for (int guard = 0; ; ++guard) {
       // `S with ..` has S's runtime layout unless a modsubst removes a field.
@@ -1588,8 +1590,20 @@ struct Translator {
       auto* pi = std::get_if<Pmty_ident>(&m->desc);
       if (!pi) break;
       const ModuleType* res = nullptr;
-      if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
         if (auto a = modtype_ast_.find(l->name); a != modtype_ast_.end()) res = a->second;
+      } else if (auto* d = std::get_if<Ldot>(&pi->id.txt.v)) {
+        // A QUALIFIED modtype (`TableFormat.TABLES` -- a functor parameter sig in a
+        // sibling submodule): resolve by its dotted path (registered alongside the
+        // bare name), falling back to the last component.  The dotted key
+        // disambiguates a name shared by two submodules (TableFormat.TABLES vs
+        // InspectionTableFormat.TABLES).
+        std::string dotted;
+        if (lid_to_dotted(pi->id.txt, dotted))
+          if (auto a = modtype_ast_.find(dotted); a != modtype_ast_.end()) res = a->second;
+        if (!res)
+          if (auto a = modtype_ast_.find(d->name); a != modtype_ast_.end()) res = a->second;
+      }
       if (!res || guard > 8) {  // no local sig AST: flat layout only
         auto lay = sig_layout(*m);
         auto& ml = module_layout_[prefix]; ml.clear();
@@ -1623,7 +1637,7 @@ struct Translator {
           if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->type)
             functor_param_[prefix + "." + nm] = sig_layout(*fp->type);
         } else {
-          register_sig_layouts(prefix + "." + nm, t);
+          register_sig_layouts(prefix + "." + nm, t, depth + 1);
         }
       } else if (auto* pin = std::get_if<Psig_include>(&it.desc)) {
         // `include HashedType` inside a functor parameter's signature (`T : Thing`
@@ -11250,6 +11264,12 @@ struct Translator {
         if (pmt->type) {
           modtype_layout_[pmt->name.txt] = sig_layout(*pmt->type);
           modtype_ast_[pmt->name.txt] = &*pmt->type;
+          // Also register under the unit-relative dotted path so a cross-submodule
+          // qualified reference (`TableFormat.TABLES`) disambiguates a shared name.
+          std::string rel = mod_path_;
+          size_t fd = rel.find('.');
+          rel = (fd == std::string::npos) ? "" : rel.substr(fd + 1);
+          if (!rel.empty()) modtype_ast_[rel + "." + pmt->name.txt] = &*pmt->type;
         }
         continue;
       }
