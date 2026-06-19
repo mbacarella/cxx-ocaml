@@ -2876,6 +2876,20 @@ struct Translator {
     } catch (...) {}
     return std::nullopt;
   }
+  // Resolve a record-pattern/expression label to its field info: the in-scope
+  // find_field, else a deep-qualified (`A.B.field`) one via the navigated cmi.
+  const FieldInfo* resolve_record_label(const Longident& lid, FieldInfo& store) {
+    if (const FieldInfo* fi = find_field(lid_last(lid))) return fi;
+    if (auto* d = std::get_if<Ldot>(&lid.v))
+      if (!std::get_if<Lident>(&d->prefix->v)) {
+        std::string dotted;
+        if (lid_to_dotted(*d->prefix, dotted))
+          if (auto rf = nested_record_field(dotted, d->name)) {
+            store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
+          }
+      }
+    return nullptr;
+  }
   // A single field of a record in a NESTED module path (`e.CamlinternalMenhirLib.
   // EngineTypes.current`): its index/kind/mut from the navigated cmi record.
   std::optional<StdField> nested_record_field(const std::string& dotted, const std::string& label) {
@@ -5577,7 +5591,8 @@ struct Translator {
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
       for (auto& [lbl, sub] : pr->fields) {
-        const FieldInfo* fi = find_field(lid_last(lbl.txt));
+        FieldInfo nfi;
+        const FieldInfo* fi = resolve_record_label(lbl.txt, nfi);
         if (!fi) {
           // The predefined `'a ref = { mutable contents }` cell: a `{contents=p}`
           // pattern reads the mutable field 0 (deferred to here, the function
@@ -7466,7 +7481,8 @@ struct Translator {
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
       for (auto& [lbl, sub] : pr->fields) {
-        const FieldInfo* fi = find_field(lid_last(lbl.txt));
+        FieldInfo nfi;
+        const FieldInfo* fi = resolve_record_label(lbl.txt, nfi);
         if (!fi) return false;
         if (!pat_test(sub.get(), field_read(fi, acc), test, binds)) return false;
       }
