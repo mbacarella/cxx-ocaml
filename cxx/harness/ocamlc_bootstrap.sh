@@ -31,7 +31,8 @@ semaphore camlinternalLazy lazy seq option pair result bool char uchar list int 
 iarray bytes string unit marshal float int32 int64 nativeint lexing parsing repr set \
 map stack queue buffer camlinternalFormat printf arg printexc domain fun gc in_channel \
 out_channel digest bigarray random hashtbl weak scanf callback camlinternalOO oo \
-dynarray format camlinternalMod pqueue ephemeron filename complex effect"
+dynarray format camlinternalMod pqueue ephemeron filename complex effect \
+arrayLabels bytesLabels listLabels stringLabels moreLabels stdLabels"
 
 # ---- 1. all-ours stdlib (.cmi then .cmo) -----------------------------------
 for phase in cmi cmo; do
