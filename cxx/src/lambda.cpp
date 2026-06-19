@@ -1573,6 +1573,38 @@ struct Translator {
       }
     }
   }
+  // Register the field layouts of a decoded cmi signature under dotted keys,
+  // recursing into structural submodules: module_layout_[prefix.Sub] etc.  Used
+  // for a cross-module functor RESULT (`module M = Identifiable.Make(..)`) so a
+  // later `include M; Set.empty` (Set a functor-result submodule) resolves.
+  void register_cmi_nested_layouts(const cmi::CmiFile& cmi, const std::string& prefix,
+                                   const cmi::Signature& sig) {
+    auto& ml = module_layout_[prefix]; ml.clear();
+    for (int i = 0; i < (int)sig.fields.size(); ++i) ml[sig.fields[i]] = i;
+    for (auto& md : sig.modules)
+      if (const cmi::Signature* sub = mt_sig(cmi, md.type))
+        register_cmi_nested_layouts(cmi, prefix + "." + md.name, *sub);
+  }
+  // For `module M = F(Arg)` with F a separately-compiled functor (Identifiable.
+  // Make): register F's RESULT nested submodule layouts under M so `M.Set.x` (and
+  // `Set.x` after `include M`) field-resolve.
+  void register_functor_result_layouts(const std::string& prefix, const ModuleExpr& me) {
+    auto* pa = std::get_if<Pmod_apply>(&me.desc);
+    if (!pa) return;
+    auto* fi = std::get_if<Pmod_ident>(&pa->f->desc);
+    if (!fi) return;
+    auto* d = std::get_if<Ldot>(&fi->id.txt.v);
+    if (!d) return;
+    auto* pl = std::get_if<Lident>(&d->prefix->v);
+    if (!pl || module_base(pl->name) || fields_of(pl->name).empty()) return;
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(pl->name));
+      for (auto& md : cmi.sig().modules)
+        if (md.name == d->name && md.type && md.type->kind == cmi::ModuleType::Functor)
+          if (const cmi::Signature* rs = mt_sig(cmi, md.type->functor_body))
+            register_cmi_nested_layouts(cmi, prefix, *rs);
+    } catch (...) {}
+  }
   // Register the variant constructors declared in a functor parameter's signature
   // (`module Z(T:S)` with `type u = X|Y|Z`), so they resolve to their tags inside
   // the body after `open T`.  Returns a save list for restore_sig_ctors().
@@ -8299,6 +8331,13 @@ struct Translator {
           for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
             if (it->find('.') == std::string::npos) cands.push_back(*it + "." + dotted);
           for (auto& cand : cands) {
+            // a LOCAL module's submodule (`include Int_base; Set.empty`, with
+            // Int_base a functor-result module whose nested layouts we
+            // registered): field-read through the registered module_layout_.
+            if (auto mp = resolve_module_path(cand); mp.base)
+              if (auto li = module_layout_.find(mp.key); li != module_layout_.end())
+                if (auto f = li->second.find(d->name); f != li->second.end())
+                  return fieldimm(f->second, mp.base);
             if (LamPtr v = submodule_value(cand, d->name)) return v;
             if (StdPrim sp = submodule_prim(cand, d->name); !sp.name.empty())
               if (LamPtr s = prim_stub(sp)) return s;
@@ -11418,6 +11457,10 @@ struct Translator {
               auto rl = module_result_layout(mb.expr);
               for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
             }
+            // A cross-module functor result's NESTED submodule layouts (M.Set/
+            // M.Map for `module M = Identifiable.Make(..)`), so `include M;
+            // Set.empty` resolves Set as the functor-result submodule.
+            register_functor_result_layouts(nm, mb.expr);
             // `module Subst = Map.Make(..)`: record the stdlib functor source so
             // Subst.fold's labelled result signature is recoverable for reordering.
             // `Map` under `open MoreLabels` is the submodule MoreLabels.Map (its
