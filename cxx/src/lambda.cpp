@@ -550,6 +550,10 @@ struct Translator {
   std::unordered_map<std::string, std::vector<std::string>> functor_result_;
   // A local functor's parameter signature layout, to coerce its argument.
   std::unordered_map<std::string, std::vector<std::string>> functor_param_;
+  // The package type of an enclosing `(val e : (module S))` unpack: a `(module
+  // M)` inside e with no explicit `: S` is coerced to S's layout (the match arms
+  // in targetint's `(val (match.. (module Int32)|(module Int64)) : S)`).
+  std::string unpack_pkg_;
   // A local module bound to a stdlib functor application (`module Subst =
   // Map.Make(..)` -> {"Map","Make"}), so `Subst.fold ~init ~f` can recover the
   // labelled signature of the functor RESULT's value for call-site reordering.
@@ -1323,8 +1327,36 @@ struct Translator {
     std::vector<std::string> target;
     if (auto it = modtype_layout_.find(last); it != modtype_layout_.end())
       target = it->second;
-    if (LamPtr c = coerce_block(mv, module_result_layout(me), target)) return c;
-    return mv;
+    if (target.empty()) return mv;
+    auto src = module_result_layout(me);
+    if (LamPtr c = coerce_block(mv, src, target)) return c;
+    // coerce_block bails when a target member is absent from src -- targetint's
+    // `(module Int32 : S)` where Int32 = `struct include Int32; .. end` and S
+    // lists Int32's EXTERNALS (add/sub/..) as vals: our `include Int32` inlines
+    // them (no field).  Build the block field-reading the present members and
+    // eta-stubbing the missing ones from the same-named stdlib module's prims.
+    std::string stdmod;
+    if (auto* pi = std::get_if<Pmod_ident>(&me.desc))
+      if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) stdmod = l->name;
+    if (stdmod.empty()) return mv;
+    for (auto& nm : target)
+      if (std::find(src.begin(), src.end(), nm) == src.end() &&
+          value_prim(stdmod, nm).name.empty())
+        return mv;  // a missing member isn't a stdlib prim -> can't materialise
+    Ident id = fresh("let");
+    auto v = mk(Lam::K::Var); v->var = id;
+    std::vector<LamPtr> fs;
+    for (auto& nm : target) {
+      int idx = -1;
+      for (int i = 0; i < (int)src.size(); ++i) if (src[i] == nm) { idx = i; break; }
+      if (idx >= 0) { fs.push_back(fieldimm(idx, v)); continue; }
+      LamPtr s = prim_stub(value_prim(stdmod, nm));
+      fs.push_back(s ? s : cint(0));
+    }
+    auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+    blk->args = std::move(fs);
+    auto lt = mk(Lam::K::Let); lt->bindings = {{id, ValueKind::Gen, mv}}; lt->body = blk;
+    return lt;
   }
   // The Pmty_signature under a module type, resolving named module types
   // through modtype_ast_; null when unknown.
@@ -8941,6 +8973,12 @@ struct Translator {
       if (pp->pkg) {  // coerce to the package type's layout when it differs
         std::string mt;
         if (lid_to_dotted(pp->pkg->path.txt, mt)) return pack_coerce(mv, *pp->me, mt);
+      } else if (!unpack_pkg_.empty()) {  // package type from an enclosing (val..:S)
+        std::string mt = unpack_pkg_, saved = unpack_pkg_;
+        unpack_pkg_.clear();  // don't leak into ME's own contents
+        LamPtr c = pack_coerce(mv, *pp->me, mt);
+        unpack_pkg_ = saved;
+        return c;
       }
       return mv;
     }
@@ -10711,6 +10749,18 @@ struct Translator {
           return c;
         return inner;
       }
+      // `(val e : S)`: a first-class-module unpack constrained to a module type.
+      // module_result_layout of the unpack already reports S's layout, so the
+      // coerce_block below is a no-op -- but the runtime value (a match of raw
+      // `(module Int32)`/`(module Int64)` packs) is NOT in S's layout.  Push S to
+      // the leaf packs so each is coerced (targetint's `include (val (match.. )
+      // : S)` -- else it reads S's field order off Int32's layout -> garbage).
+      if (auto* un = std::get_if<Pmod_unpack>(&pc->me->desc))
+        if (auto* mi = std::get_if<Pmty_ident>(&pc->mt->desc)) {
+          std::string saved = unpack_pkg_; unpack_pkg_ = lid_last(mi->id.txt);
+          LamPtr v = expr(*un->e); unpack_pkg_ = saved;
+          return v;
+        }
       // (M : S) over a narrower/reordered signature projects to S's layout
       // (include (A : sig val f .. val x .. end) must not read raw slots)
       LamPtr inner = compile_module_expr(*pc->me);
@@ -10769,8 +10819,25 @@ struct Translator {
       a->args = {cint(0)};
       return a;
     }
-    if (auto* un = std::get_if<Pmod_unpack>(&me.desc))  // (val e): unpack is transparent
-      return expr(*un->e);
+    if (auto* un = std::get_if<Pmod_unpack>(&me.desc)) {  // (val e): unpack is transparent
+      // `(val e : (module S))`: the package type rides on e as a Pexp_constraint
+      // (Ptyp_package).  A first-class module built by a match/if packs each arm
+      // RAW, so push S down to the leaf `(module M)` packs and coerce them to S's
+      // layout -- else `include (val.. : S)` reads S's field order off the arm's
+      // own layout (targetint's Int32/Int64) -> a malformed re-export block.
+      const Expression* e = un->e.get();
+      std::string pkg;
+      if (auto* pc = std::get_if<Pexp_constraint>(&e->desc))
+        if (pc->t)
+          if (auto* tp = std::get_if<Ptyp_package>(&pc->t->desc)) {
+            lid_to_dotted(tp->path.txt, pkg);
+            e = pc->e.get();
+          }
+      if (pkg.empty()) return expr(*un->e);
+      std::string saved = unpack_pkg_; unpack_pkg_ = pkg;
+      LamPtr v = expr(*e); unpack_pkg_ = saved;
+      return v;
+    }
     return mk(Lam::K::ConstInt);  // other module exprs: best-effort
   }
   // The runtime field layout a module expression *produces*: a structure's
