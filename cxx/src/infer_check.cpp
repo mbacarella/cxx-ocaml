@@ -2946,8 +2946,13 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
             // functor ARGUMENT (Int) to this layout so `Ord.compare` resolves to
             // the right field -- without it, the whole argument is passed and
             // `Ord.compare` reads a wrong slot (Map.Make(Int).find segfaults).
-            if (fn->type)
-              if (const ast::Signature* psg = body_sig(*fn->type)) param_sig = signature_to_cmi(*psg, &modtypes, &module_sigs);
+            if (fn->type) {
+              if (const ast::Signature* psg = body_sig(*fn->type))
+                param_sig = signature_to_cmi(*psg, &modtypes, &module_sigs);
+              else  // a QUALIFIED parameter modtype (`MakeEngineTable (T :
+                    // TableFormat.TABLES)`): resolve it so the ARGUMENT is projected.
+                param_sig = qual_modtype_items(*fn->type);
+            }
           }
           const ast::ModuleType* body = pf->body.get();
           while (auto* pf2 = std::get_if<Pmty_functor>(&body->desc)) body = pf2->body.get();
