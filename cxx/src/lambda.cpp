@@ -8516,6 +8516,20 @@ struct Translator {
     }
     if (auto* ap = std::get_if<Pexp_apply>(&e.desc)) {
       Prim p;
+      // A record literal passed to `Mod.f` is disambiguated by f's parameter type
+      // (the record's labels need not be in scope -- no `open Mod`).  Eagerly load
+      // Mod's record-type labels so the argument literal resolves to its layout
+      // instead of collapsing to 0 (maindriver's `process_deferred_actions {..}`).
+      {
+        bool has_record_arg = false;
+        for (auto& a : ap->args)
+          if (std::get_if<Pexp_record>(&a.second->desc)) { has_record_arg = true; break; }
+        if (has_record_arg)
+          if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
+            if (auto* d = std::get_if<Ldot>(&fid->id.txt.v))
+              if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+                register_module_records(pl->name);
+      }
       // `__LOC_OF__ e` / `__LINE_OF__ e` / `__POS_OF__ e`: a pair of the argument's
       // location info and the argument itself.
       if (ap->args.size() == 1)
