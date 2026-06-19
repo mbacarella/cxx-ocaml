@@ -11574,6 +11574,27 @@ struct Translator {
           if (auto sf = mli_submodule_fields_.find(*mb.name.txt);
               sf != mli_submodule_fields_.end())
             coerce = &sf->second;
+        // The implicit .mli-driven coercion above narrows the submodule's INTERNAL
+        // block to its exposed signature.  When the .mli HIDES a member that is used
+        // intra-unit (parser.mli exposes MenhirInterpreter as the incremental API
+        // only, but parser.ml calls MenhirInterpreter.entry internally), narrowing
+        // here makes that internal `M.entry` an unresolved stub.  Build the submodule
+        // FULL instead and let the unit-level export coercion re-narrow it to the
+        // .mli for the .cmo's exported block.  EXCEPTION: a struct whose exposed
+        // members are `external` decls (Stdlib.LargeFile) must keep the binding
+        // coercion -- it materialises those externals as eta-stubs, which the export
+        // coercion's coerce_block cannot do (it bails on a member absent from src).
+        // An EXPLICIT `(struct : S)` ascription is left untouched (it narrows for real).
+        if (coerce && !std::get_if<Pmod_constraint>(&mb.expr.desc))
+          if (auto* ps0 = std::get_if<Pmod_structure>(&me->desc)) {
+            bool has_external = false;
+            for (auto& sit : ps0->items)
+              if (auto* pp = std::get_if<Pstr_primitive>(&sit.desc))
+                if (std::find(coerce->begin(), coerce->end(), pp->prim.name.txt) != coerce->end()) {
+                  has_external = true; break;
+                }
+            if (!has_external) coerce = nullptr;
+          }
         if (mb.name.txt)
           if (auto* ps = std::get_if<Pmod_structure>(&me->desc)) {
             std::vector<std::string> sub;
