@@ -199,7 +199,8 @@ bytecomp/bytelibrarian.mli bytecomp/bytelibrarian.ml
 bytecomp/bytepackager.mli bytecomp/bytepackager.ml
 driver/errors.mli driver/errors.ml
 driver/compile.mli driver/compile.ml
-driver/maindriver.mli driver/maindriver.ml"
+driver/maindriver.mli driver/maindriver.ml
+driver/main.mli driver/main.ml"
 
 # include dirs for the in-tree .cmi deps of multi-dir modules
 INCS="-I $WD -I $ROOT/utils -I $ROOT/parsing -I $ROOT/typing -I $ROOT/lambda \

@@ -2233,6 +2233,32 @@ struct Translator {
     } catch (...) {}
     return {};
   }
+  // The runtime field layout of a (possibly deeply nested) cross-module path
+  // like `Misc.Stdlib.String`, read by navigating the head module's cmi through
+  // its submodules.  Empty if the head isn't a loadable module or a step is
+  // missing.  Used to coerce a functor ARGUMENT that is such a nested path to
+  // the functor's parameter signature (Consistbl.Make(Misc.Stdlib.String)).
+  std::vector<std::string> dotted_module_fields(const std::string& dotted) {
+    size_t dot = dotted.find('.');
+    if (dot == std::string::npos) return {};
+    std::string head = dotted.substr(0, dot);
+    if (module_base(head) || fields_of(head).empty()) return {};
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = dotted.find('.', pos + 1);
+        std::string comp = dotted.substr(pos + 1,
+                                         nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules) if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return {};
+        sig = next; pos = nd;
+      }
+      return sig->fields;
+    } catch (...) {}
+    return {};
+  }
   FunctorSig stdlib_functor(const std::string& mod, const std::string& name) {
     FunctorSig fs;
     auto& fm = fields_of(mod);
@@ -10392,6 +10418,10 @@ struct Translator {
           for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
           return v;
         }
+        // A nested cross-module path (`Misc.Stdlib.String`): navigate its cmi so
+        // a functor argument that is such a path can be projected to the param.
+        if (auto nf = dotted_module_fields(c); !nf.empty()) return nf;
+        if (auto nf = dotted_module_fields(dotted); !nf.empty()) return nf;
       }
     }
     return {};
