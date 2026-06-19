@@ -2928,6 +2928,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           // `module Set : Set.S with ..` (a qualified functor-result module type).
           drop_modsubst(items, with_modsubst_names(*pm->md.type));
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items)));
+        } else {
+          // Any other module type (`module Consistbl : module type of struct ..
+          // end`): emit an opaque submodule so it still TAKES A FIELD -- else the
+          // surrounding value layout is short of the .cmo and every following
+          // member (Persistent_env.empty) resolves to the wrong slot.
+          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, {}));
         }
       }
     } else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
@@ -2953,6 +2959,26 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           }
           out.push_back(cmi::cmiw::sig_exception(ec.name.txt, std::move(args)));
         }
+    } else if (auto* px = std::get_if<Psig_typext>(&it.desc)) {
+      // `type exn += Error of t`: each extension constructor TAKES A FIELD (like
+      // an exception).  persistent_env.mli's `type exn += private Error` was
+      // dropped, shifting `empty` to the wrong slot -> `Persistent_env.empty ()`
+      // applied a non-closure -> SIGSEGV in env's init.
+      for (auto& ec : px->ext.ctors) {
+        if (ec.name.txt.empty()) continue;
+        if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
+          std::vector<cmi::cmiw::TyPtr> args;
+          if (auto* tup = std::get_if<Pcstr_tuple>(&pd->args)) {
+            std::unordered_map<std::string, TypePtr> tvars;
+            std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
+            for (auto& a : tup->elems)
+              args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
+          }
+          out.push_back(cmi::cmiw::sig_exception(ec.name.txt, std::move(args)));
+        } else {
+          out.push_back(cmi::cmiw::sig_exception(ec.name.txt, {}));  // rebind `+= C = D`
+        }
+      }
     } else if (auto* pinc = std::get_if<Psig_include>(&it.desc)) {
       // `include module type of M`: splice M's compiled cmi signature here so the
       // .cmi records M's values (with prim flags) and types -- otherwise the
