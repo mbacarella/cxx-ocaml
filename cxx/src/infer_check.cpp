@@ -2883,13 +2883,24 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     while (auto* pw = std::get_if<Pmty_with>(&mt->desc)) mt = pw->mt.get();
     if (auto* pi = std::get_if<Pmty_ident>(&mt->desc))
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
-        if (auto* l = std::get_if<Lident>(&d->prefix->v)) try {
-          auto cmi = cmi::CmiFile::load(head_cmi(l->name));
-          for (auto& md : cmi.sig().modtypes)
-            if (md.name == d->name && md.type &&
-                md.type->kind == cmi::ModuleType::Sig && md.type->sig)
-              return cmi_sig_to_items(*md.type->sig);
-        } catch (...) {}
+        if (auto* l = std::get_if<Lident>(&d->prefix->v)) {
+          // The head may be a LOCAL submodule (`IncrementalEngine.INCREMENTAL_ENGINE`
+          // where IncrementalEngine is a sibling, not a separate cmi): find its
+          // module-type decl in the threaded module signatures and emit its items.
+          if (auto f = module_sigs.find(l->name); f != module_sigs.end())
+            for (auto& mit : *f->second)
+              if (auto* pmt = std::get_if<Psig_modtype>(&mit.desc))
+                if (pmt->name.txt == d->name && pmt->type)
+                  if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
+                    return signature_to_cmi(ps->items, &modtypes, &module_sigs);
+          try {
+            auto cmi = cmi::CmiFile::load(head_cmi(l->name));
+            for (auto& md : cmi.sig().modtypes)
+              if (md.name == d->name && md.type &&
+                  md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+                return cmi_sig_to_items(*md.type->sig);
+          } catch (...) {}
+        }
     return {};
   };
   std::vector<cmi::cmiw::SigItem> out;
