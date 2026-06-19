@@ -1879,6 +1879,19 @@ struct Translator {
   std::unordered_map<std::string, SubMod> submod_cache_;
   // local alias name -> stdlib submodule dotted path (`module MP = Gc.Memprof`)
   std::unordered_map<std::string, std::string> submod_alias_;
+  // Expand a leading submodule-alias component to its target path: with
+  // `module S = Misc.Stdlib.String`, `S.Map` -> `Misc.Stdlib.String.Map` (so the
+  // env.ml chain `module NameMap = S.Map` and `S.Map.empty` resolve).
+  std::string expand_alias_head(std::string dotted) {
+    for (int g = 0; g < 8; ++g) {
+      size_t d = dotted.find('.');
+      std::string head = d == std::string::npos ? dotted : dotted.substr(0, d);
+      auto it = submod_alias_.find(head);
+      if (it == submod_alias_.end()) break;
+      dotted = it->second + (d == std::string::npos ? "" : dotted.substr(d));
+    }
+    return dotted;
+  }
   // translating raise's argument: the position is exn-typed, so a registered
   // exception outranks a same-named variant constructor
   bool raise_arg_ = false;
@@ -8453,6 +8466,7 @@ struct Translator {
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
         std::string dotted;
         if (lid_to_dotted(*d->prefix, dotted)) {
+          dotted = expand_alias_head(dotted);  // `S.Map`/`NameMap` -> the full path
           std::vector<std::string> cands;
           if (dotted.find('.') != std::string::npos) cands.push_back(dotted);
           for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
@@ -11650,6 +11664,7 @@ struct Translator {
             if (auto* pi2 = std::get_if<Pmod_ident>(&mb.expr.desc)) {
               std::string dotted;
               if (lid_to_dotted(pi2->id.txt, dotted)) {
+                dotted = expand_alias_head(dotted);  // `module NameMap = S.Map`
                 if (dotted.find('.') != std::string::npos &&
                     !module_base(dotted.substr(0, dotted.find('.')))) {
                   auto& sm = submodule_of(dotted);
