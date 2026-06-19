@@ -1570,6 +1570,17 @@ struct Translator {
         } else {
           register_sig_layouts(prefix + "." + nm, t);
         }
+      } else if (auto* pin = std::get_if<Psig_include>(&it.desc)) {
+        // `include HashedType` inside a functor parameter's signature (`T : Thing`
+        // = `sig include Hashtbl.HashedType; include Map.OrderedType; .. end`):
+        // each included member occupies a slot, so `include T` in the functor body
+        // splices them (equal/hash/compare) -- otherwise the result block is short
+        // and a consumer's `include M` reads out of bounds -> GC segfault.
+        const ModuleType* im = &pin->mt;
+        if (auto* ii = std::get_if<Pmty_ident>(&im->desc))
+          if (auto a = modtype_ast_.find(lid_last(ii->id.txt)); a != modtype_ast_.end())
+            im = a->second;
+        for (auto& n : sig_layout(*im)) ml[n] = i++;
       }
     }
   }
@@ -1602,7 +1613,12 @@ struct Translator {
       for (auto& md : cmi.sig().modules)
         if (md.name == d->name && md.type && md.type->kind == cmi::ModuleType::Functor)
           if (const cmi::Signature* rs = mt_sig(cmi, md.type->functor_body))
-            register_cmi_nested_layouts(cmi, prefix, *rs);
+            // only the NESTED submodules -- the top-level prefix layout is already
+            // set from module_result_layout and must not be clobbered (it drives
+            // the field count of a downstream `include M`).
+            for (auto& sm : rs->modules)
+              if (const cmi::Signature* sub = mt_sig(cmi, sm.type))
+                register_cmi_nested_layouts(cmi, prefix + "." + sm.name, *sub);
     } catch (...) {}
   }
   // Register the variant constructors declared in a functor parameter's signature
@@ -11453,8 +11469,12 @@ struct Translator {
             LamPtr mv = compile_module_expr(mb.expr);
             const std::string& nm = *mb.name.txt;
             {
-              auto& lay = module_layout_[nm]; lay.clear();
+              // Compute the layout BEFORE clearing -- a self-alias `module T = T`
+              // (Identifiable.Make rebinds its parameter) would otherwise wipe the
+              // param's layout and re-read it empty, so a following `include T`
+              // splices nothing and the functor result is short.
               auto rl = module_result_layout(mb.expr);
+              auto& lay = module_layout_[nm]; lay.clear();
               for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
             }
             // A cross-module functor result's NESTED submodule layouts (M.Set/
