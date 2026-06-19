@@ -760,6 +760,11 @@ struct Translator {
     std::vector<bool> rfmut;
   };
   std::unordered_map<std::string, CtorInfo> ctor_info_;
+  // A variable bound to a WHOLE inline record by `Ctor x` (ident.ml's `Local x`):
+  // its var stamp -> that ctor's CtorInfo, so a later `x.field` reads the inline
+  // record's field even when the label is AMBIGUOUS across constructors (Local/
+  // Predef/Scoped all have `stamp`), where find_field bails.
+  std::unordered_map<int, const CtorInfo*> inline_rec_var_;
   // Per-type constructor info, plus names defined by more than one type.  A
   // constructor name shared across types (morematch redefines `A|B|C..`) is
   // resolved in SOURCE ORDER: build_module re-registers each type's ambiguous
@@ -1184,6 +1189,24 @@ struct Translator {
     if (ambiguous_fields_.count(label) && !scoped_unambig_fields_.count(label)) return nullptr;
     auto it = field_info_.find(label);
     return it == field_info_.end() ? nullptr : &it->second;
+  }
+  // `x.label` where x was bound to a whole inline record by `Ctor x` -- resolve
+  // the field via that ctor's rlabels, so an AMBIGUOUS label (ident.ml's `stamp`,
+  // shared by Local/Predef/Scoped) reads the right offset (find_field bails on it).
+  std::optional<FieldInfo> inline_rec_field(const Expression* base, const std::string& label) {
+    auto* id = std::get_if<Pexp_ident>(&base->desc);
+    if (!id) return std::nullopt;
+    auto* l = std::get_if<Lident>(&id->id.txt.v);
+    if (!l) return std::nullopt;
+    const Ident* b = lookup(l->name);
+    if (!b) return std::nullopt;
+    auto it = inline_rec_var_.find(b->stamp);
+    if (it == inline_rec_var_.end()) return std::nullopt;
+    const CtorInfo& ci = *it->second;
+    for (int i = 0; i < (int)ci.rlabels.size(); ++i)
+      if (ci.rlabels[i] == label)
+        return FieldInfo{ci.type, i, ci.rfmut[i], ci.rshape[i]};
+    return std::nullopt;
   }
 
   // (field_imm N (global G!)) for a value at field idx of global module G.
@@ -5774,6 +5797,11 @@ struct Translator {
         // inline record: the argument pattern matches the block itself
         // (`T r` binds r to the scrutinee; `T {cnt}` reads the labels' fields)
         destruct(arg, scrut);
+        // `Local x` binds x to the WHOLE record -- remember its ctor so an
+        // ambiguous `x.stamp` resolves via ci.rlabels (find_field would bail).
+        if (auto* pv = std::get_if<Ppat_var>(&effective_pat(&arg)->desc))
+          if (auto sit = scope.back().find(pv->name.txt); sit != scope.back().end())
+            inline_rec_var_[sit->second.stamp] = &ci;
       } else if (ci.arity > 1) {
         auto* tup = std::get_if<Ppat_tuple>(&arg.desc);
         if (!tup || (int)tup->elems.size() != ci.arity) ok = false;
@@ -6039,6 +6067,27 @@ struct Translator {
     LamPtr inner;
     if (ci.is_block) {  // block ctor matched -> test truthy, then match fields
       std::vector<const Pattern*> fps;
+      // `Local x` binds x to the WHOLE inline record (the block itself), not a
+      // field-0 read.  Bind it to `s`, remember its ctor so `x.stamp` resolves
+      // via ci.rlabels (an ambiguous label find_field would bail on), then test.
+      if (!ci.rlabels.empty())
+        if (const Pattern* ap = k_->arg ? effective_pat(k_->arg->get()) : nullptr)
+          if (auto* pv = std::get_if<Ppat_var>(&ap->desc)) {
+            Ident id = fresh(pv->name.txt); scope.back()[pv->name.txt] = id;
+            inline_rec_var_[id.stamp] = &ci;
+            LamPtr body = k();
+            if (!body) return nullptr;
+            LamPtr fields;
+            if (count_var(body, id) <= 1) { subst_var(body, id, s); fields = body; }
+            else { auto l = mk(Lam::K::Let);
+                   l->bindings = {{id, ValueKind::Gen, s, true}}; l->body = body; fields = l; }
+            auto iff = mk(Lam::K::IfThenElse);
+            iff->cond = s; iff->then_ = fields; iff->else_ = dflt; inner = iff;
+            if (!need_temp) return inner;
+            if (count_var(inner, tv) <= 1) { subst_var(inner, tv, scrut); return inner; }
+            auto l = mk(Lam::K::Let);
+            l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = inner; return l;
+          }
       if (!ci.rlabels.empty()) {
         // Inline record (`Cons of {content; next}`): labels are the block's FLAT
         // fields, so match them at their own indices (label order) -- NOT via a
@@ -7272,7 +7321,27 @@ struct Translator {
           // constructor block's FLAT fields, so match the record pattern against
           // the block itself (acc), not `field 0 acc` -- else next reads
           // `field 1 (field 0 acc)` (Queue.take's wrong double field read).
-          if (!pat_test(k->arg->get(), acc, test, binds)) return false;
+          // A bare var arg (`Local x`) binds x to the WHOLE record; remember its
+          // ctor so `x.stamp` resolves via rlabels (ambiguous labels).
+          const Pattern* ap = effective_pat(k->arg->get());
+          if (auto* pv = std::get_if<Ppat_var>(&ap->desc)) {
+            Ident id = fresh(pv->name.txt);
+            inline_rec_var_[id.stamp] = &ci->second;
+            binds.push_back({id, acc});
+          } else if (auto* pr = std::get_if<Ppat_record>(&ap->desc)) {
+            // `Predef { stamp = s1; _ }`: match each label at its rlabels index of
+            // the block directly -- find_field would bail on an AMBIGUOUS label
+            // (Ident's `stamp`, shared by Local/Predef/Scoped).
+            auto& L = ci->second.rlabels;
+            for (auto& [lbl, sub] : pr->fields) {
+              int ix = -1;
+              for (size_t i2 = 0; i2 < L.size(); ++i2)
+                if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
+              if (ix < 0) return false;
+              FieldInfo fi{ci->second.type, ix, ci->second.rfmut[ix], ci->second.rshape[ix]};
+              if (!pat_test(sub.get(), field_read(&fi, acc), test, binds)) return false;
+            }
+          } else if (!pat_test(k->arg->get(), acc, test, binds)) return false;
         } else if (!pat_test(k->arg->get(), fieldimm(0, acc), test, binds)) {
           return false;
         }
@@ -7951,6 +8020,16 @@ struct Translator {
       return m;
     }
     if (auto* fe = std::get_if<Pexp_field>(&e.desc)) {
+      // `x.label` on a whole-inline-record-bound var (ident.ml's `Local x` then
+      // `x.stamp`): resolve via the ctor's rlabels (ambiguous labels first).
+      if (auto irf = inline_rec_field(fe->e.get(), lid_last(fe->field.txt))) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = irf->kind == ValueKind::Int ? Prim::FieldInt
+                  : irf->mut                  ? Prim::FieldMut
+                                              : Prim::FieldImm;
+        l->prim_arg = irf->index; l->args = {expr(*fe->e)};
+        return l;
+      }
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);
