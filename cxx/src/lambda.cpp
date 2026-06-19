@@ -11299,6 +11299,31 @@ struct Translator {
                 exn_arity_[nm] = a->second;
               continue;
             }
+          // A QUALIFIED target (`exception Error = Parsing.Parse_error`): its value
+          // is a field of the named module's global.  Resolving it is essential --
+          // the .mli still exposes `exception Error` (it TAKES a field), so dropping
+          // the binding shifts every following export by one (parser.mli: Error is
+          // field 0 before use_file.., so the whole Parser block was misread).
+          if (auto* d = std::get_if<Ldot>(&rb->id.txt.v)) {
+            std::string dotted;
+            if (lid_to_dotted(rb->id.txt, dotted)) {
+              size_t ld = dotted.rfind('.');
+              std::string modp = dotted.substr(0, ld), en = dotted.substr(ld + 1);
+              LamPtr v;
+              if (modp.find('.') != std::string::npos) v = submodule_value(modp, en);
+              else if (!module_base(modp) && !fields_of(modp).empty()) {
+                auto& fm = fields_of(modp);
+                if (auto f = fm.find(en); f != fm.end()) v = field_of(global_of(modp), f->second);
+              }
+              if (v) {
+                Ident id = fresh(nm);
+                cur.push_back({id, ValueKind::Gen, v});
+                exn_ident_[nm] = id; add_export(nm, id);
+                continue;
+              }
+            }
+            (void)d;
+          }
           // non-local target (stdlib/qualified): bind a let to its value
           if (LamPtr v = exn_value(lid_last(rb->id.txt))) {
             Ident id = fresh(nm);
@@ -12225,6 +12250,13 @@ struct Translator {
         } else if (auto lp = local_prims_.find(nm);
                    lp != local_prims_.end() && prim_stub({lp->second.first, lp->second.second})) {
           ce.push_back(prim_stub({lp->second.first, lp->second.second})); cn.push_back(nm);
+        } else if (LamPtr v = exn_value(nm)) {
+          // An exception the .mli re-exposes but the impl only brings into scope via
+          // `open M` (parser.ml: `module MenhirBasics = struct exception Error = ..
+          // end; open MenhirBasics`, and parser.mli exposes `exception Error`):
+          // materialise its value (a submodule field) at this slot.  Without it the
+          // whole exported block is short by one and consumers read shifted fields.
+          ce.push_back(v); cn.push_back(nm);
         } else {
           // an S member that is a PRIMITIVE of an `include`d stdlib module
           // (`include Float.Array` then `: S` with `val unsafe_get`): it has no
