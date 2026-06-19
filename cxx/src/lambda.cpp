@@ -11676,10 +11676,23 @@ struct Translator {
             std::string saved_mp = mod_path_;  // __FUNCTION__ inside is `..Functor.fn`
             mod_path_ += (mod_path_.empty() ? "" : ".") + *mb.name.txt;
             // .mli-driven functor-result coercion: lay this functor's body struct
-            // out per its declared result signature (the .ml has no `: S`).
-            if (auto fr = mli_functor_results_.find(*mb.name.txt);
-                fr != mli_functor_results_.end())
-              pending_functor_coerce_ = fr->second;
+            // out per its declared result signature (the .ml has no `: S`).  Keys in
+            // mli_functor_results_ are unit-relative ("Engine.Make"); saved_mp here is
+            // the unit-qualified enclosing path ("CamlinternalMenhirLib.Engine"), so
+            // try its progressively-stripped suffixes (dropping the unit name) down to
+            // the bare functor name.
+            {
+              std::string full = saved_mp.empty() ? *mb.name.txt
+                                                  : saved_mp + "." + *mb.name.txt;
+              for (std::string cand = full; ; ) {
+                if (auto fr = mli_functor_results_.find(cand); fr != mli_functor_results_.end()) {
+                  pending_functor_coerce_ = fr->second; break;
+                }
+                size_t d = cand.find('.');
+                if (d == std::string::npos) break;
+                cand = cand.substr(d + 1);
+              }
+            }
             LamPtr fv = compile_module_expr(mb.expr);
             pending_functor_coerce_.clear();
             mod_path_ = saved_mp;
@@ -12283,7 +12296,25 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
           mli_fields = c.sig().fields;
           t.mli_cmi_sig_ = c.sig(); t.has_mli_cmi_ = true;  // for nested coercion
           // record each top-level functor's RESULT field order, to coerce its
-          // body struct (Map.Make : S -> S's fields).
+          // body struct (Map.Make : S -> S's fields).  Also recurse into Sig
+          // submodules so a NESTED functor (CamlinternalMenhirLib's Engine.Make :
+          // ENGINE) gets its result recorded under the dotted key "Engine.Make" --
+          // without it the .ml body (`include T; .. let entry ..`) stays in raw
+          // order and `MenhirInterpreter.entry` reads the wrong field at runtime.
+          std::function<void(const cmi::Signature&, const std::string&)> rec_funct =
+              [&](const cmi::Signature& sig, const std::string& prefix) {
+            for (auto& sm : sig.modules) {
+              std::string key = prefix.empty() ? sm.name : prefix + "." + sm.name;
+              if (sm.type && sm.type->kind == cmi::ModuleType::Functor &&
+                  sm.type->functor_body && sm.type->functor_body->sig)
+                t.mli_functor_results_[key] = sm.type->functor_body->sig->fields;
+              if (sm.type && sm.type->kind == cmi::ModuleType::Sig && sm.type->sig)
+                rec_funct(*sm.type->sig, key);
+            }
+          };
+          for (auto& md : c.modules())
+            if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+              rec_funct(*md.type->sig, md.name);
           for (auto& md : c.modules()) {
             if (md.type && md.type->kind == cmi::ModuleType::Functor &&
                 md.type->functor_body && md.type->functor_body->sig)

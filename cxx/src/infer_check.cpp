@@ -2952,7 +2952,11 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           const ast::ModuleType* body = pf->body.get();
           while (auto* pf2 = std::get_if<Pmty_functor>(&body->desc)) body = pf2->body.get();
           std::vector<cmi::cmiw::SigItem> result;
-          if (const ast::Signature* rs = body_sig(*body)) result = signature_to_cmi(*rs, &modtypes, &module_sigs);
+          if (const ast::Signature* rs = body_sig(*body))
+            result = signature_to_cmi(*rs, &modtypes, &module_sigs);
+          else  // a QUALIFIED result modtype (`MakeEngineTable (..) : EngineTypes.TABLE
+                // with ..`): resolve it through the local/cross-module signature.
+            result = qual_modtype_items(*body);
           out.push_back(cmi::cmiw::sig_module_functor(*pm->md.name.txt, param,
                           std::move(param_sig), std::move(result)));
         } else if (const ast::Signature* bs = body_sig(*pm->md.type)) {
