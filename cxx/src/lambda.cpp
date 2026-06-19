@@ -2840,6 +2840,51 @@ struct Translator {
     } catch (...) {}
     return std::nullopt;
   }
+  // A record layout from a NESTED module path (`CamlinternalMenhirLib.EngineTypes`):
+  // navigate the head module's cmi through its submodules, then find the record
+  // type that has `label`.  Used for an explicitly deep-qualified record literal
+  // (`{ CamlinternalMenhirLib.EngineTypes.state = .. }` in menhir's actions).
+  std::optional<StdRec> nested_record_layout(const std::string& dotted, const std::string& label) {
+    size_t dot = dotted.find('.');
+    if (dot == std::string::npos) return stdlib_record_layout(dotted, label);
+    std::string head = dotted.substr(0, dot);
+    if (module_base(head) || fields_of(head).empty()) return std::nullopt;
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = dotted.find('.', pos + 1);
+        std::string comp = dotted.substr(pos + 1, nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules) if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return std::nullopt;
+        sig = next; pos = nd;
+      }
+      for (auto& td : sig->types) {
+        if (td.kind != cmi::TypeDecl::Record) continue;
+        bool has = false;
+        for (auto& l : td.labels) if (l.name == label) { has = true; break; }
+        if (!has) continue;
+        StdRec r; bool all_float = true;
+        for (auto& l : td.labels) {
+          r.labels.push_back(l.name); r.shape.push_back(cmi_field_kind(l.type));
+          r.mut.push_back(l.mutable_);
+          if (r.shape.back() != ValueKind::Float) all_float = false;
+        }
+        r.flat = all_float; return r;
+      }
+    } catch (...) {}
+    return std::nullopt;
+  }
+  // A single field of a record in a NESTED module path (`e.CamlinternalMenhirLib.
+  // EngineTypes.current`): its index/kind/mut from the navigated cmi record.
+  std::optional<StdField> nested_record_field(const std::string& dotted, const std::string& label) {
+    if (auto sr = nested_record_layout(dotted, label))
+      for (int i = 0; i < (int)sr->labels.size(); ++i)
+        if (sr->labels[i] == label)
+          return StdField{i, sr->shape[i], sr->mut[i], sr->flat};
+    return std::nullopt;
+  }
   // The stdlib-module prefix governing a record label: an explicit `M.label`
   // qualification, else the base expression's qualified head.
   static std::string record_module_of(const Longident& lid, const Expression* base) {
@@ -7916,6 +7961,21 @@ struct Translator {
               rt = &std_rt;
             }
         }
+        if (!rt)  // `{ e with A.B.label = v }` -- a DEEP-qualified record label
+          if (auto* d0 = std::get_if<Ldot>(&rc->fields[0].first.txt.v))
+            if (!std::get_if<Lident>(&d0->prefix->v)) {
+              std::string dotted;
+              if (lid_to_dotted(*d0->prefix, dotted))
+                if (auto sr = nested_record_layout(dotted, d0->name)) {
+                  std_rt.labels = std::move(sr->labels);
+                  std_rt.shape = std::move(sr->shape);
+                  std_rt.mut = false;
+                  for (bool m : sr->mut) if (m) std_rt.mut = true;
+                  std_rt.flat = sr->flat;
+                  fmut = std::move(sr->mut);
+                  rt = &std_rt;
+                }
+            }
         if (rt) {
           auto index_of = [&](const std::string& l) {
             for (size_t i = 0; i < rt->labels.size(); ++i)
@@ -8002,9 +8062,15 @@ struct Translator {
             return true;
           };
           // an explicit module qualification on the first label (`{Complex.im=..}`)
-          if (auto* d0 = std::get_if<Ldot>(&rc->fields[0].first.txt.v))
+          if (auto* d0 = std::get_if<Ldot>(&rc->fields[0].first.txt.v)) {
             if (auto* pl0 = std::get_if<Lident>(&d0->prefix->v))
               try_std(stdlib_record_layout(pl0->name, d0->name));
+            else {  // a NESTED module prefix (`CamlinternalMenhirLib.EngineTypes.state`)
+              std::string dotted;
+              if (lid_to_dotted(*d0->prefix, dotted))
+                try_std(nested_record_layout(dotted, d0->name));
+            }
+          }
           if (!rt)
             if (auto itc = vk.expr_constr.find(&e); itc != vk.expr_constr.end()) {
               const std::string& p = itc->second;
@@ -8102,18 +8168,26 @@ struct Translator {
         l->prim_arg = 0; l->args = {expr(*fe->e)};
         return l;
       }
-      // A module-qualified field `e.M.label` of a stdlib record (e.g. Gc.control).
-      if (auto* d = std::get_if<Ldot>(&fe->field.txt.v))
-        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
-          if (auto rf = stdlib_record_field(pl->name, d->name)) {
-            auto l = mk(Lam::K::Prim);
-            l->prim = rf->flat                 ? Prim::Floatfield  // Complex.t etc.
-                      : rf->kind == ValueKind::Int ? Prim::FieldInt
-                      : rf->mut                  ? Prim::FieldMut
-                                                 : Prim::FieldImm;
-            l->prim_arg = rf->index; l->args = {expr(*fe->e)};
-            return l;
-          }
+      // A module-qualified field `e.M.label` of a stdlib record (e.g. Gc.control),
+      // or a DEEP-qualified one `e.A.B.label` (menhir's `env.CamlinternalMenhirLib.
+      // EngineTypes.current`) navigated through nested submodules.
+      if (auto* d = std::get_if<Ldot>(&fe->field.txt.v)) {
+        std::optional<StdField> rf;
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v)) rf = stdlib_record_field(pl->name, d->name);
+        else {
+          std::string dotted;
+          if (lid_to_dotted(*d->prefix, dotted)) rf = nested_record_field(dotted, d->name);
+        }
+        if (rf) {
+          auto l = mk(Lam::K::Prim);
+          l->prim = rf->flat                 ? Prim::Floatfield  // Complex.t etc.
+                    : rf->kind == ValueKind::Int ? Prim::FieldInt
+                    : rf->mut                  ? Prim::FieldMut
+                                               : Prim::FieldImm;
+          l->prim_arg = rf->index; l->args = {expr(*fe->e)};
+          return l;
+        }
+      }
       // An unqualified stdlib-record label via the base's inferred type.
       if (auto rf = inferred_record_field(fe->e.get(), lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
@@ -8145,9 +8219,14 @@ struct Translator {
       }
       // A module-qualified field `e.M.label <- v` of a cross-module record
       // (mirrors the read path -- without this the set silently became a no-op).
-      if (auto* d = std::get_if<Ldot>(&sf->field.txt.v))
-        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
-          if (auto rf = stdlib_record_field(pl->name, d->name)) {
+      if (auto* d = std::get_if<Ldot>(&sf->field.txt.v)) {
+        std::optional<StdField> rf;
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v)) rf = stdlib_record_field(pl->name, d->name);
+        else {
+          std::string dotted;
+          if (lid_to_dotted(*d->prefix, dotted)) rf = nested_record_field(dotted, d->name);
+        }
+          if (rf) {
             auto l = mk(Lam::K::Prim);
             l->prim = rf->flat                 ? Prim::SetFloatfield
                       : rf->kind == ValueKind::Int ? Prim::SetfieldImm
@@ -8155,6 +8234,7 @@ struct Translator {
             l->prim_arg = rf->index; l->args = {expr(*sf->obj), expr(*sf->value)};
             return l;
           }
+      }
       // An unqualified stdlib-record label via the base's inferred type.
       if (auto rf = inferred_record_field(sf->obj.get(), lid_last(sf->field.txt))) {
         auto l = mk(Lam::K::Prim);
