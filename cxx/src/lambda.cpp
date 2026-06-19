@@ -11310,8 +11310,15 @@ struct Translator {
               size_t ld = dotted.rfind('.');
               std::string modp = dotted.substr(0, ld), en = dotted.substr(ld + 1);
               LamPtr v;
-              if (modp.find('.') != std::string::npos) v = submodule_value(modp, en);
-              else if (!module_base(modp) && !fields_of(modp).empty()) {
+              // A LOCAL module / functor parameter (`exception Error = T.Error`
+              // where T : TableFormat.TABLES exposes `exception Error`): read its
+              // field from the in-scope module value.
+              if (auto mi = module_ident_.find(modp); mi != module_ident_.end())
+                if (auto ml = module_layout_.find(modp); ml != module_layout_.end())
+                  if (auto f = ml->second.find(en); f != ml->second.end())
+                    v = fieldimm(f->second, varof(mi->second));
+              if (!v && modp.find('.') != std::string::npos) v = submodule_value(modp, en);
+              else if (!v && !module_base(modp) && !fields_of(modp).empty()) {
                 auto& fm = fields_of(modp);
                 if (auto f = fm.find(en); f != fm.end()) v = field_of(global_of(modp), f->second);
               }
