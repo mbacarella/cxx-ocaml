@@ -2482,6 +2482,49 @@ struct Translator {
     }
     return v;
   }
+  // The tail expression a syntactic function reduces to once its parameters,
+  // any nested `fun` layers, and the binding/sequence spine are peeled off.
+  static const Expression* fn_tail_expr(const Pexp_function& f) {
+    auto* fb = std::get_if<Pfunction_body>(&f.body->v);
+    if (!fb) return nullptr;  // `function ...` cases: no simple tail
+    const Expression* e = fb->e.get();
+    while (e) {
+      if (auto* sq = std::get_if<Pexp_sequence>(&e->desc)) { e = sq->e2.get(); continue; }
+      if (auto* le = std::get_if<Pexp_let>(&e->desc)) { e = le->body.get(); continue; }
+      if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) { e = ct->e.get(); continue; }
+      if (auto* nf = std::get_if<Pexp_function>(&e->desc)) return fn_tail_expr(*nf);
+      break;
+    }
+    return e;
+  }
+  // The parameters of `params` left unsupplied by an application's argument list
+  // `as` (matching positional args to unlabelled params and labelled/optional
+  // args to their named params, in parameter order) -- the residual signature of
+  // a partial application.
+  static FnSig residual_after_apply(
+      const FnSig& params,
+      const std::vector<std::pair<ArgLabel, ExprBox>>& as) {
+    auto alab = [](const ArgLabel& a, std::string& nm) -> int {
+      if (auto* lb = std::get_if<Labelled>(&a)) { nm = lb->name; return 1; }
+      if (auto* op = std::get_if<Optional>(&a)) { nm = op->name; return 2; }
+      return 0;
+    };
+    std::vector<bool> used(as.size(), false);
+    FnSig resid;
+    for (auto& [pk, pn] : params) {
+      int found = -1;
+      for (size_t i = 0; i < as.size(); ++i) {
+        if (used[i]) continue;
+        std::string nm; int k = alab(as[i].first, nm);
+        if (pk == 0 && k == 0) { found = (int)i; break; }
+        if (pk == 1 && k == 1 && nm == pn) { found = (int)i; break; }
+        if (pk == 2 && (k == 1 || k == 2) && nm == pn) { found = (int)i; break; }
+      }
+      if (found < 0) resid.push_back({pk, pn});
+      else used[found] = true;
+    }
+    return resid;
+  }
   // Record a binding's parameter labels (only if it is a function with at least
   // one labelled/optional parameter), so its call sites can reorder/wrap args.
   void record_fn_sig(const Ident& id, const Expression* e) {
@@ -2501,6 +2544,18 @@ struct Translator {
         }
       if (any_pack) fn_pack_params_[id.stamp] = std::move(packs);
       FnSig s = fn_param_labels(*f);
+      // If the function's body is a partial application of a labelled/optional
+      // function (`let fpm name = base penv f name` where `base ~allow_hidden ..`
+      // leaves `~allow_hidden` unsupplied), append the residual parameters so
+      // THIS function's call sites reorder/fill them too.
+      if (const Expression* body = fn_tail_expr(*f))
+        if (auto* ap = std::get_if<Pexp_apply>(&body->desc)) {
+          FnSig callee = callee_sig(ap->fn.get());
+          if (!callee.empty()) {
+            FnSig resid = residual_after_apply(callee, ap->args);
+            s.insert(s.end(), resid.begin(), resid.end());
+          }
+        }
       for (auto& [k, n] : s) if (k != 0) { fn_sig_[id.stamp] = s; return; }
     }
   }
