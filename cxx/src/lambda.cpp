@@ -2950,6 +2950,38 @@ struct Translator {
     } catch (...) {}
     return std::nullopt;
   }
+  // A qualified label `M.label` where M is a LOCAL (same-unit) submodule: the
+  // field of M's record type (via mod_record_types_).  The qualifier is
+  // authoritative -- it must win over a bare find_field that could pick a
+  // different record sharing the ambiguous label (load_path's `dir.Dir.hidden`
+  // [field 2] vs the top-level paths record's `hidden` [field 1]).
+  std::optional<StdField> local_module_field(const std::string& mod, const std::string& label) {
+    auto it = mod_record_types_.find(mod);
+    if (it == mod_record_types_.end()) return std::nullopt;
+    for (auto& key : it->second) {
+      auto tfi = type_field_info_.find(key);
+      if (tfi == type_field_info_.end()) continue;
+      auto f = tfi->second.find(label);
+      if (f != tfi->second.end()) {
+        auto rt = rec_types_.find(key);
+        bool flat = rt != rec_types_.end() && rt->second.flat;
+        return StdField{f->second.index, f->second.kind, f->second.mut, flat};
+      }
+    }
+    return std::nullopt;
+  }
+  // Resolve a qualified record label (`M.l` local or stdlib, or deep `A.B.l`).
+  std::optional<StdField> qualified_field(const Longident& lid) {
+    auto* d = std::get_if<Ldot>(&lid.v);
+    if (!d) return std::nullopt;
+    if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+      if (auto rf = local_module_field(pl->name, d->name)) return rf;
+      return stdlib_record_field(pl->name, d->name);
+    }
+    std::string dotted;
+    if (lid_to_dotted(*d->prefix, dotted)) return nested_record_field(dotted, d->name);
+    return std::nullopt;
+  }
   // An unqualified label resolved through the base expression's INFERRED type:
   // `heap_stats.major_collections` with heap_stats : Gc.stat reads the labeled
   // field of the record decl `stat` in gc.cmi.
@@ -3062,22 +3094,13 @@ struct Translator {
   // Resolve a record-pattern/expression label to its field info: the in-scope
   // find_field, else a deep-qualified (`A.B.field`) one via the navigated cmi.
   const FieldInfo* resolve_record_label(const Longident& lid, FieldInfo& store) {
-    if (const FieldInfo* fi = find_field(lid_last(lid))) return fi;
-    if (auto* d = std::get_if<Ldot>(&lid.v)) {
-      if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
-        // a TOP-LEVEL qualified label (`Typedtree.{structure; coercion}` in
-        // compile.ml's `to_bytecode Typedtree.{structure; coercion; _}`).
-        if (auto rf = stdlib_record_field(pl->name, d->name)) {
-          store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
-        }
-      } else {  // a NESTED qualified label (`A.B.field`)
-        std::string dotted;
-        if (lid_to_dotted(*d->prefix, dotted))
-          if (auto rf = nested_record_field(dotted, d->name)) {
-            store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
-          }
-      }
+    // A qualified label (`M.l` local or stdlib, `A.B.l` deep) resolves through its
+    // authoritative qualifier FIRST -- a bare find_field could pick a different
+    // record sharing the ambiguous label (load_path's `Dir.hidden` vs paths.hidden).
+    if (auto rf = qualified_field(lid)) {
+      store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
     }
+    if (const FieldInfo* fi = find_field(lid_last(lid))) return fi;
     return nullptr;
   }
   // A single field of a record in a NESTED module path (`e.CamlinternalMenhirLib.
@@ -8383,6 +8406,18 @@ struct Translator {
         l->prim_arg = irf->index; l->args = {expr(*fe->e)};
         return l;
       }
+      // A qualified field `e.M.label` (M local or stdlib) / deep `e.A.B.label`:
+      // the qualifier is authoritative, so resolve it BEFORE the bare find_field
+      // (which could pick a different record sharing an ambiguous label).
+      if (auto rf = qualified_field(fe->field.txt)) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = rf->flat                     ? Prim::Floatfield
+                  : rf->kind == ValueKind::Int ? Prim::FieldInt
+                  : rf->mut                    ? Prim::FieldMut
+                                               : Prim::FieldImm;
+        l->prim_arg = rf->index; l->args = {expr(*fe->e)};
+        return l;
+      }
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);
@@ -8434,6 +8469,16 @@ struct Translator {
       }
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
+      // A qualified field `e.M.label <- v` (M local or stdlib) / deep one:
+      // resolve via the authoritative qualifier BEFORE the bare find_field.
+      if (auto rf = qualified_field(sf->field.txt)) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = rf->flat                     ? Prim::SetFloatfield
+                  : rf->kind == ValueKind::Int ? Prim::SetfieldImm
+                                               : Prim::SetfieldPtr;
+        l->prim_arg = rf->index; l->args = {expr(*sf->obj), expr(*sf->value)};
+        return l;
+      }
       if (auto* fi = find_field(lid_last(sf->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);
