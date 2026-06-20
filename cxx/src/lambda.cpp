@@ -2880,14 +2880,21 @@ struct Translator {
   // find_field, else a deep-qualified (`A.B.field`) one via the navigated cmi.
   const FieldInfo* resolve_record_label(const Longident& lid, FieldInfo& store) {
     if (const FieldInfo* fi = find_field(lid_last(lid))) return fi;
-    if (auto* d = std::get_if<Ldot>(&lid.v))
-      if (!std::get_if<Lident>(&d->prefix->v)) {
+    if (auto* d = std::get_if<Ldot>(&lid.v)) {
+      if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+        // a TOP-LEVEL qualified label (`Typedtree.{structure; coercion}` in
+        // compile.ml's `to_bytecode Typedtree.{structure; coercion; _}`).
+        if (auto rf = stdlib_record_field(pl->name, d->name)) {
+          store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
+        }
+      } else {  // a NESTED qualified label (`A.B.field`)
         std::string dotted;
         if (lid_to_dotted(*d->prefix, dotted))
           if (auto rf = nested_record_field(dotted, d->name)) {
             store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
           }
       }
+    }
     return nullptr;
   }
   // A single field of a record in a NESTED module path (`e.CamlinternalMenhirLib.
@@ -5676,6 +5683,13 @@ struct Translator {
   const Pattern* effective_pat(const Pattern* p) {
     while (true) {
       while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+      // `M.(P)` / `M.{ field = .. }` (compile.ml's `to_bytecode Typedtree.{structure;
+      // coercion; _}`): register M's record labels so P's unqualified labels resolve,
+      // then descend into P.
+      while (auto* po = std::get_if<Ppat_open>(&p->desc)) {
+        if (auto* l = std::get_if<Lident>(&po->mod_.txt.v)) register_module_records(l->name);
+        p = po->p.get();
+      }
       auto* k = std::get_if<Ppat_construct>(&p->desc);
       if (!k) return p;
       auto ci = ctor_info_.find(ctor_of(*p));
