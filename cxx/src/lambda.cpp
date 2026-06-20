@@ -1105,15 +1105,17 @@ struct Translator {
               local_alias_.emplace(d.name.txt, d.manifest->get());
             if (auto* rec = std::get_if<Ptype_record>(&d.kind);
                 rec && !rec_types_.count(d.name.txt)) {
+              // Register the record type's layout so its literals/projections
+              // resolve (keyed by the in-scope type name).  A label already
+              // claimed by another type is left pointing at that type and marked
+              // ambiguous -- exactly as the top-level records pass does -- rather
+              // than discarding the whole nested type (which would leave its
+              // construction unresolvable, e.g. load_path's `Dir.t` whose
+              // `hidden` label clashes with the top-level `paths` record).
               RecType rt;
               rt.mut = false;
               rt.flat = !rec->fields.empty();
               int idx = 0;
-              bool clash = false;
-              for (auto& f : rec->fields)
-                if (field_info_.count(f.name.txt) &&
-                    field_info_[f.name.txt].type != d.name.txt)
-                  clash = true;
               for (auto& f : rec->fields) {
                 ValueKind k = coretype_kind(*f.type);
                 bool m = f.mut == MutableFlag::Mutable;
@@ -1121,10 +1123,15 @@ struct Translator {
                 rt.flat = rt.flat && is_float_core(*f.type);
                 rt.labels.push_back(f.name.txt);
                 rt.shape.push_back(k);
-                if (!clash) field_info_[f.name.txt] = {d.name.txt, idx, m, k};
+                type_field_info_[d.name.txt][f.name.txt] = {d.name.txt, idx, m, k};
+                if (field_info_.count(f.name.txt) &&
+                    field_info_[f.name.txt].type != d.name.txt)
+                  ambiguous_fields_.insert(f.name.txt);  // shared label: unusable bare
+                else
+                  field_info_[f.name.txt] = {d.name.txt, idx, m, k};
                 ++idx;
               }
-              if (!clash) rec_types_[d.name.txt] = std::move(rt);
+              rec_types_[d.name.txt] = std::move(rt);
             }
             if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
               int nc = 0, nb = 0; bool all_const = !v->ctors.empty(), gadt = false;
@@ -2545,6 +2552,24 @@ struct Translator {
       if (auto* b = lookup(l->name)) {
         auto it = fn_sig_.find(b->stamp);
         if (it != fn_sig_.end()) return it->second;
+        return {};  // a local binding shadows any opened-module value
+      }
+      // An unqualified name brought into scope by `open M` / `M.(..)`: the value's
+      // label sig from M's cmi (so a local-open partial application like
+      // `Profile.(record transl)` fills record's omitted optional `?accumulate`).
+      if (!opened_has(l->name)) return {};
+      for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+        if (module_base(*it)) continue;
+        if (it->find('.') != std::string::npos) {  // an opened submodule path
+          auto& sm = submodule_of(*it);
+          if (!sm.ok) continue;
+          if (auto sit = sm.sigs.find(l->name); sit != sm.sigs.end()) return sit->second;
+          if (sm.fields.count(l->name)) return {};  // a known plain value here
+          continue;
+        }
+        FnSig s = stdlib_value_sig(*it, l->name);
+        for (auto& [k, n] : s) if (k != 0) return s;
+        if (fields_of(*it).count(l->name)) return {};  // shadows outer opens
       }
     } else if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
       if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
@@ -4454,15 +4479,15 @@ struct Translator {
     // `with A | B -> body`: expand the or-pattern into consecutive rows sharing
     // the body (each alternative binds its own vars) -- previously the row was
     // silently dropped to a reraise.
-    if (!c.guard && std::holds_alternative<Ppat_or>(lhsp->desc)) {
+    if (std::holds_alternative<Ppat_or>(lhsp->desc)) {
       std::vector<const Pattern*> alts;
       flatten_or(lhsp, alts);
       std::vector<Row> expanded;
-      for (auto* a : alts) expanded.push_back({a, c.rhs, nullptr});
+      for (auto* a : alts) expanded.push_back({a, c.rhs, c.guard});
       for (size_t j = i + 1; j < rows.size(); ++j) expanded.push_back(rows[j]);
       return exn_dispatch(exn, expanded, 0);
     }
-    if (!c.guard) {
+    {
       // `E p as x`: x is the exception value itself; peel the alias and bind
       // it over the row's body (was silently dropped to a reraise).
       std::vector<std::string> row_aliases;
@@ -4470,10 +4495,15 @@ struct Translator {
         row_aliases.push_back(pa->name.txt);
         lhsp = effective_pat(pa->p.get());
       }
-      if (is_catchall(*lhsp)) {  // `_`/var: handle unconditionally
+      if (is_catchall(*lhsp)) {  // `_`/var: handle (guard permitting)
         if (auto* pv = std::get_if<Ppat_var>(&lhsp->desc)) scope.back()[pv->name.txt] = exn;
         for (auto& nm : row_aliases) scope.back()[nm] = exn;
-        return expr(*c.rhs);
+        if (!c.guard) return expr(*c.rhs);
+        // `with x when g -> body`: test the guard, else fall to the rest.
+        auto iff = mk(Lam::K::IfThenElse);
+        iff->cond = expr(*c.guard); iff->then_ = expr(*c.rhs);
+        iff->else_ = exn_dispatch(exn, rows, i + 1);
+        return iff;
       }
       if (auto* k = std::get_if<Ppat_construct>(&lhsp->desc)) {
         // a module-qualified exception/extension ctor resolves to that module's
@@ -4511,18 +4541,23 @@ struct Translator {
             lhs = exv();
           }
           std::vector<PayloadTest> ptests;
+          // A `when` guard (and any payload identity test) needs the dispatch's
+          // remainder at several failure points, so share it behind a catch/exit
+          // and pass the exit as the guard's `else`.
+          int eid = c.guard ? ++next_exit_ : 0;
+          auto exitL = [&] {
+            auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x;
+          };
           LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs, &ptests,
-                                      &row_aliases);
+                                      &row_aliases, c.guard,
+                                      c.guard ? exitL() : nullptr);
           if (!then) return exn_dispatch(exn, rows, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
           test->args = {lhs, id};
-          if (!ptests.empty()) {
-            // payload identity tests: the rest of the dispatch is needed at
-            // each failure point, so share it behind a catch/exit
-            int eid = ++next_exit_;
-            auto exitL = [&] {
-              auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x;
-            };
+          if (!ptests.empty() || c.guard) {
+            // payload identity tests / a guard: the rest of the dispatch is
+            // needed at each failure point, so share it behind a catch/exit
+            if (!eid) eid = ++next_exit_;
             for (auto it = ptests.rbegin(); it != ptests.rend(); ++it) {
               auto t = mk(Lam::K::Prim);
               if (it->string_eq) { t->prim = Prim::Ccall; t->prim_id = "caml_string_equal"; }
@@ -4560,12 +4595,23 @@ struct Translator {
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
                        const Expression& rhs,
                        std::vector<PayloadTest>* tests = nullptr,
-                       const std::vector<std::string>* aliases = nullptr) {
+                       const std::vector<std::string>* aliases = nullptr,
+                       const Expression* guard = nullptr, LamPtr guard_else = nullptr) {
+    // Compile `rhs`, or -- when the case carries a `when` guard -- the
+    // `if guard then rhs else guard_else` test, with both evaluated in the
+    // scope that holds the payload binders.
+    auto with_guard = [&]() -> LamPtr {
+      if (!guard) return expr(rhs);
+      LamPtr g = expr(*guard);
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = g; iff->then_ = expr(rhs); iff->else_ = guard_else;
+      return iff;
+    };
     if (!k->arg) {
-      if (!aliases || aliases->empty()) return expr(rhs);
+      if ((!aliases || aliases->empty()) && !guard) return expr(rhs);
       scope.emplace_back();
-      for (auto& nm : *aliases) scope.back()[nm] = exn;
-      LamPtr b = expr(rhs);
+      if (aliases) for (auto& nm : *aliases) scope.back()[nm] = exn;
+      LamPtr b = with_guard();
       scope.pop_back();
       return b;
     }
@@ -4623,7 +4669,7 @@ struct Translator {
       } else ok = false;
     }
     if (!ok) { scope.pop_back(); return nullptr; }
-    LamPtr body = expr(rhs);
+    LamPtr body = with_guard();
     scope.pop_back();
     for (auto& sb : sub_binders) body = wrap_binders(body, sb);
     body = wrap_binders(body, binders);
