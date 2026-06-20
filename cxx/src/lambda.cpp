@@ -1103,15 +1103,24 @@ struct Translator {
             if (d.manifest && !std::get_if<Ptype_variant>(&d.kind) &&
                 !std::get_if<Ptype_record>(&d.kind))
               local_alias_.emplace(d.name.txt, d.manifest->get());
-            if (auto* rec = std::get_if<Ptype_record>(&d.kind);
-                rec && !rec_types_.count(d.name.txt)) {
+            if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
               // Register the record type's layout so its literals/projections
-              // resolve (keyed by the in-scope type name).  A label already
-              // claimed by another type is left pointing at that type and marked
-              // ambiguous -- exactly as the top-level records pass does -- rather
-              // than discarding the whole nested type (which would leave its
-              // construction unresolvable, e.g. load_path's `Dir.t` whose
-              // `hidden` label clashes with the top-level `paths` record).
+              // resolve.  A label already claimed by another type is left
+              // pointing at that type and marked ambiguous -- as the top-level
+              // records pass does -- rather than discarding the whole nested type
+              // (which would leave its construction unresolvable, e.g. load_path's
+              // `Dir.t` whose `hidden` label clashes with the top-level `paths`).
+              // A *different* record that already claims this short type name
+              // (`Persistent_signature.t` vs the top-level `'a t`) is registered
+              // under a disambiguated key so the by-label-set lookup still finds it.
+              std::vector<std::string> labels;
+              for (auto& f : rec->fields) labels.push_back(f.name.txt);
+              auto exist = rec_types_.find(d.name.txt);
+              if (exist != rec_types_.end() && exist->second.labels == labels)
+                continue;  // already registered (same type), nothing to do
+              std::string key = d.name.txt;
+              if (exist != rec_types_.end())
+                key = d.name.txt + "#" + std::to_string(rec_types_.size());
               RecType rt;
               rt.mut = false;
               rt.flat = !rec->fields.empty();
@@ -1123,15 +1132,15 @@ struct Translator {
                 rt.flat = rt.flat && is_float_core(*f.type);
                 rt.labels.push_back(f.name.txt);
                 rt.shape.push_back(k);
-                type_field_info_[d.name.txt][f.name.txt] = {d.name.txt, idx, m, k};
+                type_field_info_[key][f.name.txt] = {key, idx, m, k};
                 if (field_info_.count(f.name.txt) &&
-                    field_info_[f.name.txt].type != d.name.txt)
+                    field_info_[f.name.txt].type != key)
                   ambiguous_fields_.insert(f.name.txt);  // shared label: unusable bare
                 else
-                  field_info_[f.name.txt] = {d.name.txt, idx, m, k};
+                  field_info_[f.name.txt] = {key, idx, m, k};
                 ++idx;
               }
-              rec_types_[d.name.txt] = std::move(rt);
+              rec_types_[key] = std::move(rt);
             }
             if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
               int nc = 0, nb = 0; bool all_const = !v->ctors.empty(), gadt = false;
