@@ -1122,7 +1122,8 @@ struct Translator {
     // bare name within that module's body (e.g. `module B = struct type t = B ..`
     // then `B`).  Register them too, but only filling names not already taken so a
     // nested type never shadows a top-level one (and clashes stay unresolved).
-    std::function<void(const Structure&)> nested = [&](const Structure& items) {
+    std::function<void(const Structure&, const std::string&)> nested =
+        [&](const Structure& items, const std::string& modpath) {
       for (auto& item : items) {
         if (auto* td = std::get_if<Pstr_type>(&item.desc))
           for (auto& d : td->decls) {
@@ -1170,6 +1171,7 @@ struct Translator {
                 ++idx;
               }
               rec_types_[key] = std::move(rt);
+              if (!modpath.empty()) mod_record_types_[modpath].push_back(key);
             }
             if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
               int nc = 0, nb = 0; bool all_const = !v->ctors.empty(), gadt = false;
@@ -1206,19 +1208,30 @@ struct Translator {
             }
           }
         if (auto* pm = std::get_if<Pstr_module>(&item.desc))
-          if (auto* ps = peel_to_structure(pm->binding.expr)) nested(ps->items);
+          if (auto* ps = peel_to_structure(pm->binding.expr))
+            nested(ps->items, sub_modpath(modpath, pm->binding.name.txt));
         if (auto* prm = std::get_if<Pstr_recmodule>(&item.desc))
           for (auto& b : prm->bindings)
-            if (auto* ps = peel_to_structure(b.expr)) nested(ps->items);
+            if (auto* ps = peel_to_structure(b.expr))
+              nested(ps->items, sub_modpath(modpath, b.name.txt));
       }
     };
     for (auto& item : s) {
       if (auto* pm = std::get_if<Pstr_module>(&item.desc))
-        if (auto* ps = peel_to_structure(pm->binding.expr)) nested(ps->items);
+        if (auto* ps = peel_to_structure(pm->binding.expr))
+          nested(ps->items, sub_modpath("", pm->binding.name.txt));
       if (auto* prm = std::get_if<Pstr_recmodule>(&item.desc))
         for (auto& b : prm->bindings)
-          if (auto* ps = peel_to_structure(b.expr)) nested(ps->items);
+          if (auto* ps = peel_to_structure(b.expr))
+            nested(ps->items, sub_modpath("", b.name.txt));
     }
+  }
+  // Build a dotted submodule path, or "" for an anonymous module (whose records
+  // can't be named-qualified anyway).
+  static std::string sub_modpath(const std::string& parent,
+                                 const std::optional<std::string>& name) {
+    if (!name) return "";
+    return parent.empty() ? *name : parent + "." + *name;
   }
   // The structure under `M : S = struct..end` / a functor `F (X) = struct..end`
   // (a functor body's type decls register fill-absent like a submodule's).
@@ -2094,9 +2107,36 @@ struct Translator {
   // the right offsets.  Without this the labels stay unbound -> garbage reads.
   // (Dotted opens already do this via submodule_of; bare opens did not.)
   std::set<std::string> module_records_done_;
+  // A LOCAL (same-unit) submodule's record type KEYS (rec_types_/type_field_info_
+  // keys), e.g. "Unscoped" -> ["desc"], populated by register_types' submodule
+  // walk.  Lets a qualified record pattern/literal `Unscoped.{name; stamp}`
+  // (Ppat_open / Pexp_open of a local module) bring that record's labels into
+  // scope even when they are ambiguous overall (Ident.t's inline records also
+  // have name/stamp).
+  std::unordered_map<std::string, std::vector<std::string>> mod_record_types_;
+  // Bring a LOCAL module's record-type labels into the scoped resolution, so the
+  // inner bare labels of `M.{ .. }` resolve to that record's offsets.  A later
+  // top-level `type` decl re-scopes any shared label (build_module's per-decl
+  // scoping), so this only governs until the next such decl -- enough for the
+  // `M.{ .. }` pattern itself.
+  void register_local_module_records(const std::string& mod) {
+    auto it = mod_record_types_.find(mod);
+    if (it == mod_record_types_.end()) return;
+    for (auto& key : it->second) {
+      auto tfi = type_field_info_.find(key);
+      if (tfi == type_field_info_.end()) continue;
+      for (auto& [fn, fi] : tfi->second) {
+        field_info_[fn] = fi;
+        scoped_unambig_fields_.insert(fn);
+      }
+    }
+  }
   void register_module_records(const std::string& mod) {
     if (mod.empty() || mod.find('.') != std::string::npos) return;
-    if (module_base(mod) || fields_of(mod).empty()) return;  // local / unknown
+    if (module_base(mod) || fields_of(mod).empty()) {  // local / unknown
+      register_local_module_records(mod);
+      return;
+    }
     if (!module_records_done_.insert(mod).second) return;    // once
     try {
       auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
