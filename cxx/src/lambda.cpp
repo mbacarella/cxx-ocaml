@@ -1243,6 +1243,31 @@ struct Translator {
       return std::get_if<Pmod_structure>(&me->desc);
     }
   }
+  // Scope a record type declaration's labels (so an ambiguous label resolves to
+  // THIS record while it is in scope), resolving the rec_types_ key by the
+  // decl's label set -- the registered key may be disambiguated ("t#N") when the
+  // short type name is taken by another module's type.
+  void scope_record_decl(const TypeDeclaration& d) {
+    auto* rec = std::get_if<Ptype_record>(&d.kind);
+    if (!rec) return;
+    std::vector<std::string> labels;
+    for (auto& f : rec->fields) labels.push_back(f.name.txt);
+    std::string key = d.name.txt;
+    if (auto it = rec_types_.find(key); it == rec_types_.end() || it->second.labels != labels) {
+      key.clear();
+      for (auto& [k, r] : rec_types_) if (r.labels == labels) { key = k; break; }
+    }
+    if (key.empty()) return;
+    int idx = 0;
+    for (auto& f : rec->fields) {
+      if (ambiguous_fields_.count(f.name.txt)) {
+        field_info_[f.name.txt] =
+            {key, idx, f.mut == MutableFlag::Mutable, coretype_kind(*f.type)};
+        scoped_unambig_fields_.insert(f.name.txt);
+      }
+      ++idx;
+    }
+  }
   const FieldInfo* find_field(const std::string& label) {
     if (ambiguous_fields_.count(label) && !scoped_unambig_fields_.count(label)) return nullptr;
     auto it = field_info_.find(label);
@@ -11495,6 +11520,13 @@ struct Translator {
           if (auto tfi = type_field_info_.find(d.name.txt); tfi != type_field_info_.end())
             for (auto& [fn, fi] : tfi->second)
               if (ambiguous_fields_.count(fn)) { field_info_[fn] = fi; scoped_unambig_fields_.insert(fn); }
+          // The lookup above is keyed by the BARE type name; when the short name
+          // is taken by another module's type the record was registered under a
+          // disambiguated key ("t#N"), so scope this decl's record directly from
+          // its own fields (env.ml's IdTbl.t / TycompTbl.t both named `t`, sharing
+          // the ambiguous `current`/`layer` labels -- without this their `{tbl
+          // with current = ..}` updates can't resolve the record and emit `0`).
+          scope_record_decl(d);
           // re-register THIS variant's ctor count, so a same-named sibling type's
           // count (registered first by the flat fill-absent pass) doesn't make the
           // matcher truncate this type's switch (restored on module exit).
