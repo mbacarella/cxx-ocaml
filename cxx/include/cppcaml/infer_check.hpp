@@ -55,6 +55,12 @@ struct ValueKinds {
   // full path -- the back end resolves unqualified record labels through the
   // base expression's inferred type (heap_stats.major_collections).
   std::unordered_map<const void*, std::string> expr_constr;
+  // For a constructor PATTERN whose constructor name is unqualified/unknown but
+  // whose inferred (scrutinee-column) type is a module-qualified variant
+  // ("Load_path.visibility"): the full path.  The back end registers that type's
+  // constructors so an unqualified pattern (`Visible`/`Hidden` matched without an
+  // `open Load_path`) resolves -- type-directed constructor disambiguation.
+  std::unordered_map<const void*, std::string> pat_constr;
   // Expressions of type `?l:.. -> ..` used where a non-optional arrow is expected:
   // the back end eta-expands them, inserting None for each erased optional.  The
   // bool vector is the resulting application's argument slots (true = None for an

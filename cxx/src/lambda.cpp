@@ -972,11 +972,40 @@ struct Translator {
       }
     type_ctors_.emplace(ty, std::make_pair(nc, nb));
   }
+  // Register ALL constructors of a module-qualified variant type ("Vmod.vis")
+  // into ctor_info_/type_ctors_, given the type's full path from the inferencer.
+  // Used for type-directed disambiguation of an unqualified constructor pattern
+  // whose type lives in a module that is NOT opened (persistent_env matches
+  // `Visible`/`Hidden` of `Load_path.visibility` with no `open Load_path`).
+  void register_ctors_of_type(const std::string& path) {
+    auto d = path.rfind('.');
+    if (d == std::string::npos) return;
+    std::string mod = path.substr(0, d), ty = path.substr(d + 1);
+    if (mod.find('.') != std::string::npos) return;  // nested module: unhandled
+    if (module_base(mod)) return;                     // a local module: skip
+    auto& mc = module_ctors(mod);
+    int nc = 0, nb = 0;
+    bool found = false;
+    for (auto& [nm, info] : mc) if (info.type == ty) { (info.is_block ? nb : nc)++; found = true; }
+    if (!found) return;
+    for (auto& [nm, info] : mc)
+      if (info.type == ty && !ctor_info_.count(nm)) {
+        ctor_info_[nm] = info; builtin_ctors_.insert(nm);
+      }
+    type_ctors_.emplace(ty, std::make_pair(nc, nb));
+  }
   // Recursively register the qualified stdlib constructors named in a pattern,
   // so the match compiler resolves them like local/predef ones.
   void scan_pat_ctors(const Pattern& p) {
     if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
       register_qualified_ctor(k->id.txt);
+      // Type-directed: an unqualified constructor still unresolved (its module is
+      // not opened) -- register it through the pattern's inferred variant type.
+      if (std::holds_alternative<Lident>(k->id.txt.v) &&
+          !ctor_info_.count(lid_last(k->id.txt))) {
+        auto it = vk.pat_constr.find(&p);
+        if (it != vk.pat_constr.end()) register_ctors_of_type(it->second);
+      }
       if (k->arg) scan_pat_ctors(**k->arg);
     } else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
       for (auto& e : t->elems) scan_pat_ctors(*e);

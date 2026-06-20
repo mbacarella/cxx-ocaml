@@ -1271,6 +1271,12 @@ struct Checker {
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
       if (!sch) {
         if (k->arg) infer_pat(**k->arg);
+        // In the kind pass, return a fresh var (not Any) so unification against
+        // the scrutinee binds it to the constructor's real type -- the back end
+        // then resolves the unqualified constructor through that type
+        // (type-directed disambiguation: Visible/Hidden : Load_path.visibility
+        // matched without `open Load_path`).  The strict pass keeps Any.
+        if (record_kinds_) return eng.fresh_var();
         return eng.any();  // unknown/ambiguous constructor: dynamic
       }
       TypePtr result;
@@ -2564,7 +2570,16 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   ck.record_kinds_ = true;
   run_checker(ck, s);
   ValueKinds vk;
-  for (auto& [p, t] : ck.rec_pat_) vk.pat[p] = kind_str(t, ck.immediate_types_);
+  for (auto& [p, t] : ck.rec_pat_) {
+    vk.pat[p] = kind_str(t, ck.immediate_types_);
+    // A constructor pattern whose type resolved to a module-qualified variant:
+    // record the path so the back end can register that type's constructors.
+    if (std::holds_alternative<ast::Ppat_construct>(p->desc)) {
+      TypePtr r = I::Engine::repr(t);
+      if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
+        vk.pat_constr[p] = r->path;
+    }
+  }
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck.immediate_types_);
   for (auto& [e, t] : ck.rec_expr_) {
     vk.expr[e] = kind_str(t, ck.immediate_types_);
