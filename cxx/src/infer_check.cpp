@@ -3064,6 +3064,15 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       }
     }
   }
+  // Canonical shadowing dedup: a FIELD-TAKING member redeclared later (same
+  // namespace) keeps only its LAST occurrence, at that position (OCaml semantics).
+  // `include module type of String; .. val for_all`; `include A; include B` both
+  // carrying a member (main_args' Bytecomp_options).  Writing both would add a slot
+  // before every later field; the AST layouts (sig_layout / register_sig_layouts in
+  // lambda.cpp) dedup IDENTICALLY, so .cmi index == .cmo block index ==
+  // functor-param index everywhere.  Values / modules / exception ctors are
+  // separate namespaces (a value `x` and a module `x` both take a field).
+  out = cmi::cmiw::dedup_shadowed_fields(std::move(out));
   return out;
 }
 

@@ -283,6 +283,36 @@ inline SigItem sig_record(std::string n, std::vector<TyPtr> ps, std::vector<Labe
   return {SigItem::Type, std::move(n), nullptr, std::move(ps), nullptr, {}, std::move(ls)};
 }
 
+// The runtime-field NAMESPACE+name of a field-taking SigItem, or "" if it takes no
+// field (type / modtype / `external` value).  Values, modules and exception ctors
+// are SEPARATE namespaces: a value `x` and a module `x` each take a field.
+inline std::string field_key(const SigItem& s) {
+  if (s.k == SigItem::Value && s.prim.empty()) return "v:" + s.name;
+  if (s.k == SigItem::Module) return "m:" + s.name;
+  if (s.k == SigItem::Exception) return "e:" + s.name;
+  return "";
+}
+// Canonical OCaml shadowing dedup: when a field-taking member is declared more than
+// once in the same namespace (an `include` then a later decl, or two includes both
+// carrying it), keep ONLY the LAST occurrence, at its position.  Used by the .cmi
+// writer; the AST-side field layouts in lambda.cpp dedup by the same rule, so every
+// computation of a module's field order agrees.
+inline std::vector<SigItem> dedup_shadowed_fields(std::vector<SigItem> in) {
+  std::unordered_map<std::string, int> last;
+  for (int i = 0; i < (int)in.size(); ++i)
+    if (std::string k = field_key(in[i]); !k.empty()) last[k] = i;
+  bool dup = false;
+  for (int i = 0; i < (int)in.size(); ++i)
+    if (std::string k = field_key(in[i]); !k.empty() && last[k] != i) { dup = true; break; }
+  if (!dup) return in;
+  std::vector<SigItem> out; out.reserve(in.size());
+  for (int i = 0; i < (int)in.size(); ++i) {
+    if (std::string k = field_key(in[i]); !k.empty() && last[k] != i) continue;  // shadowed
+    out.push_back(std::move(in[i]));
+  }
+  return out;
+}
+
 // Configure how the writer resolves a referenced module name (`Buffer` in a
 // `Buffer.t` type) to its compilation-unit global (`Stdlib__Buffer`) and to its
 // .cmi file (for the import CRC).  Mirrors lambda's resolve_cmi/global_of.

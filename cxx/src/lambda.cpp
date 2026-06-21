@@ -1698,22 +1698,27 @@ struct Translator {
     auto* ps = std::get_if<Pmty_signature>(&m->desc);
     if (!ps) return;
     auto& ml = module_layout_[prefix]; ml.clear();
-    int i = 0;
+    // Collect field names IN ORDER (expanding includes), then dedup-keep-last and
+    // assign CONTIGUOUS indices -- the same canonical shadowing rule as the .cmi
+    // writer.  `ml[name]=i++` would orphan a slot (a GAP) when a name is shadowed
+    // across `include A; include B` (main_args' Bytecomp_options) -> the functor
+    // body would index its members one slot off the coerced argument.
+    std::vector<std::string> names;
     for (auto& it : ps->items) {
-      if (auto* v = std::get_if<Psig_value>(&it.desc)) ml[v->vd.name.txt] = i++;
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) names.push_back(v->vd.name.txt);
       else if (auto* ex = std::get_if<Psig_exception>(&it.desc))
-        ml[ex->exn.ctor.name.txt] = i++;  // exceptions occupy slots
+        names.push_back(ex->exn.ctor.name.txt);  // exceptions occupy slots
       else if (auto* tx = std::get_if<Psig_typext>(&it.desc))
-        for (auto& c : tx->ext.ctors) ml[c.name.txt] = i++;
+        for (auto& c : tx->ext.ctors) names.push_back(c.name.txt);
       else if (auto* cl = std::get_if<Psig_class>(&it.desc))
         for (auto& d : cl->decls) {
-          ml[d.name.txt] = i++;  // so do classes
+          names.push_back(d.name.txt);  // so do classes
           register_class_meta_from_sig(prefix + "." + d.name.txt, d.expr);  // for `inherit M.c`
         }
       else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
         if (!md->md.name.txt) continue;
         const std::string& nm = *md->md.name.txt;
-        ml[nm] = i++;
+        names.push_back(nm);
         const ModuleType& t = *md->md.type;
         if (auto* pf = std::get_if<Pmty_functor>(&t.desc)) {
           functor_result_[prefix + "." + nm] = sig_layout(*pf->body);
@@ -1732,9 +1737,11 @@ struct Translator {
         if (auto* ii = std::get_if<Pmty_ident>(&im->desc))
           if (auto a = modtype_ast_.find(lid_last(ii->id.txt)); a != modtype_ast_.end())
             im = a->second;
-        for (auto& n : sig_layout(*im)) ml[n] = i++;
+        for (auto& n : sig_layout(*im)) names.push_back(n);
       }
     }
+    names = dedup_keep_last(std::move(names));
+    for (int i = 0; i < (int)names.size(); ++i) ml[names[i]] = i;
   }
   // Register the field layouts of a decoded cmi signature under dotted keys,
   // recursing into structural submodules: module_layout_[prefix.Sub] etc.  Used
@@ -10773,6 +10780,22 @@ struct Translator {
       };
       walk(*ps);
     }
+    return dedup_keep_last(std::move(out));
+  }
+  // Canonical OCaml shadowing dedup for an AST-derived field-name layout: a name
+  // redeclared later (include + a later decl, or two includes) keeps only its LAST
+  // occurrence, at its position.  Mirrors cmi::cmiw::dedup_shadowed_fields (the .cmi
+  // writer) so the .cmi field index, the .cmo block index and the functor-param
+  // index all agree.  Name-keyed (a value and a module sharing a name -- vanishingly
+  // rare -- would merge; the shadowed cases here are same-namespace).
+  static std::vector<std::string> dedup_keep_last(std::vector<std::string> in) {
+    std::unordered_map<std::string, int> last;
+    for (int i = 0; i < (int)in.size(); ++i) last[in[i]] = i;
+    bool dup = false;
+    for (int i = 0; i < (int)in.size(); ++i) if (last[in[i]] != i) { dup = true; break; }
+    if (!dup) return in;
+    std::vector<std::string> out; out.reserve(in.size());
+    for (int i = 0; i < (int)in.size(); ++i) if (last[in[i]] == i) out.push_back(in[i]);
     return out;
   }
 
