@@ -11361,6 +11361,23 @@ struct Translator {
           auto g = mk(Lam::K::Prim); g->prim = Prim::Global; g->prim_id = global_of(l->name);
           return g;
         }
+        // A bare module name that is a SUBMODULE of an opened module, used in
+        // module position (`open Types; Set.Make(TransientTypeOps)` where
+        // TransientTypeOps = Types.TransientTypeOps): resolve it to the field path
+        // into the opened module's block.  Without this it fell through to null ->
+        // the functor argument compiled to the constant 0 -> a broken Set/Map.
+        std::string osp = opened_submodule_path(l->name);
+        if (!osp.empty()) {
+          auto& sm = submodule_of(osp);
+          if (sm.ok) {
+            auto g = mk(Lam::K::Prim); g->prim = Prim::Global;
+            g->prim_id = global_of(sm.base.empty() ? osp.substr(0, osp.find('.'))
+                                                   : sm.base);
+            LamPtr cur = g;
+            for (int ix : sm.path) cur = fieldimm(ix, cur);
+            return cur;
+          }
+        }
       }
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))  // M.Sub -> field of M's block
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
