@@ -11249,11 +11249,21 @@ struct Translator {
         cur = pf->body.get();
       }
       // If the enclosing binding requested a result coercion (.mli `module Make
-      // (..) : S`), lay the body struct out per S's field order.
+      // (..) : S`, the .ml has no `: S`), lay the body struct out per S's field
+      // order AND RESTRICT it to S's members.  `build_module(coerce)` reorders but
+      // keeps the struct's extra members (private helpers like Map.Make's
+      // `bal`/`create`/`*_aux`/`rev_seq_of_enum_`), so the result block stays in
+      // raw order with helpers and `find` is NOT at S's index -- a CROSS-MODULE /
+      // nested consumer reading the .cmi's S layout (env.ml's
+      // Misc.Stdlib.String.Map.find @ field 16) then hits the wrong member.  Run
+      // coerce_block (target = S) to drop the helpers and reorder, exactly like the
+      // `(struct : S)` ascription path below.
       auto pending = std::move(pending_functor_coerce_); pending_functor_coerce_.clear();
       if (auto* ps = std::get_if<Pmod_structure>(&cur->desc); ps && !pending.empty()) {
         std::vector<std::string> sub;
-        fn->body = build_module(ps->items, &sub, &pending, &pending);
+        LamPtr inner = build_module(ps->items, &sub, nullptr, &pending);
+        if (LamPtr c = coerce_block(inner, sub, pending)) fn->body = c;
+        else fn->body = inner;
       } else {
         fn->body = compile_module_expr(*cur);
       }
