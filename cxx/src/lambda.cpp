@@ -10845,10 +10845,25 @@ struct Translator {
           for (auto& [n, i] : it->second) if (i >= 0 && i < (int)v.size()) v[i] = n;
           return v;
         }
-        auto& fm = fields_of(l->name);
-        std::vector<std::string> v(fm.size());
-        for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
-        return v;
+        if (!fields_of(l->name).empty()) {
+          auto& fm = fields_of(l->name);
+          std::vector<std::string> v(fm.size());
+          for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
+          return v;
+        }
+        // A submodule of an opened module (`open Types; Set.Make(TransientTypeOps)`):
+        // its field layout drives the argument->parameter coercion (project the
+        // arg's `compare` to OrderedType field 0).  Without this the WHOLE arg is
+        // passed uncoerced and Set/Hashtbl read the wrong member as Ord.compare.
+        if (std::string osp = opened_submodule_path(l->name); !osp.empty()) {
+          auto& sm = submodule_of(osp);
+          if (sm.ok && !sm.fields.empty()) {
+            int mx = 0; for (auto& [n, i] : sm.fields) mx = std::max(mx, i + 1);
+            std::vector<std::string> v(mx);
+            for (auto& [n, i] : sm.fields) if (i >= 0 && i < mx) v[i] = n;
+            return v;
+          }
+        }
       }
       // `Stdlib.Array` etc.: its own fields are the canonical unit's fields.
       std::string dotted;
