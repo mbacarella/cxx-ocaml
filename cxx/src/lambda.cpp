@@ -12132,12 +12132,13 @@ struct Translator {
             // the unit-qualified enclosing path ("CamlinternalMenhirLib.Engine"), so
             // try its progressively-stripped suffixes (dropping the unit name) down to
             // the bare functor name.
+            std::vector<std::string> mli_result_layout;
             {
               std::string full = saved_mp.empty() ? *mb.name.txt
                                                   : saved_mp + "." + *mb.name.txt;
               for (std::string cand = full; ; ) {
                 if (auto fr = mli_functor_results_.find(cand); fr != mli_functor_results_.end()) {
-                  pending_functor_coerce_ = fr->second; break;
+                  pending_functor_coerce_ = fr->second; mli_result_layout = fr->second; break;
                 }
                 size_t d = cand.find('.');
                 if (d == std::string::npos) break;
@@ -12149,7 +12150,15 @@ struct Translator {
             mod_path_ = saved_mp;
             cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
-            functor_result_[*mb.name.txt] = module_result_layout(mb.expr);  // for Make(..)
+            // When the .mli RESTRICTS this functor's result (the body has more
+            // members than the declared result sig, e.g. parmatch.ml's `Compat`
+            // exposes only [compat;compats] of its 4-member body), the result
+            // block is coerced to the .mli layout -- so an APPLICATION's member
+            // (`SyntacticCompat.compats`) must index into THAT layout, not the
+            // raw body's.  Use the .mli result layout for functor_result_.
+            functor_result_[*mb.name.txt] =
+                mli_result_layout.empty() ? module_result_layout(mb.expr)  // for Make(..)
+                                          : mli_result_layout;
             functor_param_[*mb.name.txt] = functor_param_layout(mb.expr);   // for arg coercion
             if (auto* pt = functor_param_type(mb.expr)) functor_param_sig_[*mb.name.txt] = pt;
             functor_param_types_[*mb.name.txt] = functor_param_types(mb.expr);  // all params
