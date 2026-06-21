@@ -994,6 +994,29 @@ struct Translator {
       }
     type_ctors_.emplace(ty, std::make_pair(nc, nb));
   }
+  // Register the type owning constructor `ctorname` from module `mod` (an imported
+  // module, by name), so a BARE ctor whose module is neither opened nor qualified
+  // resolves -- type-directed disambiguation by the applied function's module
+  // (btype.ml's `Misc.protect_refs [R(..)] f`: `R` is Misc.ref_and_value's ctor,
+  // never `open`ed).  No-op if mod is local / has no such ctor / it's already known.
+  void register_module_ctor(const std::string& mod, const std::string& ctorname) {
+    if (ctor_info_.count(ctorname) || mod.empty() || module_base(mod)) return;
+    auto& mc = module_ctors(mod);
+    auto f = mc.find(ctorname);
+    if (f == mc.end()) return;
+    register_ctors_of_type(mod + "." + f->second.type);
+  }
+  // Walk an expression for BARE unresolved constructors and register each from
+  // `mod` (used at a `Mod.f arg` call site so ctors inside the args resolve).
+  void scan_expr_ctors_from(const Expression& e0, const std::string& mod, int depth = 0) {
+    if (depth > 6) return;
+    if (auto* k = std::get_if<Pexp_construct>(&e0.desc)) {
+      if (auto* l = std::get_if<Lident>(&k->id.txt.v)) register_module_ctor(mod, l->name);
+      if (k->arg) scan_expr_ctors_from(**k->arg, mod, depth + 1);
+    } else if (auto* t = std::get_if<Pexp_tuple>(&e0.desc)) {
+      for (auto& el : t->elems) scan_expr_ctors_from(*el, mod, depth + 1);
+    }
+  }
   // Recursively register the qualified stdlib constructors named in a pattern,
   // so the match compiler resolves them like local/predef ones.
   void scan_pat_ctors(const Pattern& p) {
@@ -8581,6 +8604,16 @@ struct Translator {
         register_qualified_ctor(k->id.txt);            // top-level `M.Ctor`
         register_opened_submodule_ctors(k->id.txt);    // opened-submodule `Sub.Ctor`
       }
+      // A BARE ctor unresolved here but whose inferred type is a module-qualified
+      // variant (type-directed disambiguation, NO `open`): register that type's
+      // ctors.  btype.ml's `Misc.protect_refs [R(pool_stack, pool)] f` -- `R` is
+      // Misc.ref_and_value's constructor, resolved only by protect_refs's expected
+      // arg type; without this it compiled to a bare `?R` with its args DROPPED.
+      // Mirrors scan_pat_ctors' pattern-side type-directed registration.
+      if (std::holds_alternative<Lident>(k->id.txt.v) && !ctor_info_.count(n)) {
+        auto itc = vk.expr_constr.find(&e);
+        if (itc != vk.expr_constr.end()) register_ctors_of_type(itc->second);
+      }
       // a constructor qualified by a bound module that exports it (an exception /
       // extension constructor): read its identity from that module's block, so
       // `M1.E` and `M2.E` (distinct `type t += E`) stay distinct.
@@ -8942,6 +8975,13 @@ struct Translator {
               if (auto* pl = std::get_if<Lident>(&d->prefix->v))
                 register_module_records(pl->name);
       }
+      // Likewise, a BARE constructor inside an argument to `Mod.f` is disambiguated
+      // by f's parameter type (no `open Mod`): register Mod's ctor for it
+      // (btype.ml's `Misc.protect_refs [R(pool_stack, pool)] f`).
+      if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
+        if (auto* d = std::get_if<Ldot>(&fid->id.txt.v))
+          if (auto* pl = std::get_if<Lident>(&d->prefix->v); pl && !module_base(pl->name))
+            for (auto& a : ap->args) scan_expr_ctors_from(*a.second, pl->name);
       // `__LOC_OF__ e` / `__LINE_OF__ e` / `__POS_OF__ e`: a pair of the argument's
       // location info and the argument itself.
       if (ap->args.size() == 1)
