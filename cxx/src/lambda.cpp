@@ -2175,10 +2175,15 @@ struct Translator {
   }
   void register_module_records(const std::string& mod) {
     if (mod.empty() || mod.find('.') != std::string::npos) return;
-    if (module_base(mod) || fields_of(mod).empty()) {  // local / unknown
+    if (module_base(mod)) {  // a locally-defined module: AST-derived records
       register_local_module_records(mod);
       return;
     }
+    // An imported module: load its .cmi record types.  Do NOT gate on
+    // fields_of(mod) being non-empty -- a TYPES-ONLY module (Parsetree: all type
+    // declarations, no values) has empty fields_of but its cmi still carries the
+    // record decls (signature_item={psig_desc;psig_loc}) that `open Parsetree`
+    // must register so `item.psig_desc` resolves to a field read (not 0).
     if (!module_records_done_.insert(mod).second) return;    // once
     try {
       auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
