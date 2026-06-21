@@ -1183,7 +1183,17 @@ struct Translator {
                 } else if (r) arity = (int)r->fields.size();  // inline record (Map's Node)
                 if (c.res) gadt = true;
                 if (block) all_const = false;
-                if (!ctor_info_.count(c.name.txt)) {
+                // An inline-record ctor (`Open of {..}`) carries rlabels the
+                // matcher needs to bind `Open {l=..}` at the right block field.
+                // A same-named ctor of ANOTHER type may already be registered
+                // (env.ml's TycompTbl.layer `Open` collides with Asttypes'
+                // constant `closed_flag.Open`); since that one has no rlabels,
+                // let the inline-record version overwrite it so `Open {..}`
+                // resolves to this type's field order (the constant ctor is only
+                // ever used bare, which doesn't consult rlabels).
+                bool inline_over = r && ctor_info_.count(c.name.txt) &&
+                                   ctor_info_[c.name.txt].rlabels.empty();
+                if (!ctor_info_.count(c.name.txt) || inline_over) {
                   builtin_ctors_.erase(c.name.txt);
                   CtorInfo ci{d.name.txt, block ? nb : nc, block, arity};
                   if (r) {  // inline-record labels, so `Node {h}` binds h to its field
@@ -6156,13 +6166,30 @@ struct Translator {
       const Pattern& arg = **k->arg;
       if (!ci.rlabels.empty()) {
         // inline record: the argument pattern matches the block itself
-        // (`T r` binds r to the scrutinee; `T {cnt}` reads the labels' fields)
-        destruct(arg, scrut);
-        // `Local x` binds x to the WHOLE record -- remember its ctor so an
-        // ambiguous `x.stamp` resolves via ci.rlabels (find_field would bail).
-        if (auto* pv = std::get_if<Ppat_var>(&effective_pat(&arg)->desc))
-          if (auto sit = scope.back().find(pv->name.txt); sit != scope.back().end())
-            inline_rec_var_[sit->second.stamp] = &ci;
+        // (`T r` binds r to the scrutinee; `T {cnt}` reads the labels' fields).
+        // A `T {l=..}` field pattern MUST resolve `l` via the ctor's rlabels, not
+        // generic destruct/find_field -- when the label name is shared by another
+        // record (env.ml's TycompTbl.Open.components vs IdTbl.opened.components),
+        // find_field picks an arbitrary index and reads the wrong block field.
+        const Pattern* ap = effective_pat(&arg);
+        if (auto* pr = std::get_if<Ppat_record>(&ap->desc)) {
+          auto& L = ci.rlabels;
+          for (auto& [lbl, sub] : pr->fields) {
+            int ix = -1;
+            for (size_t i2 = 0; i2 < L.size(); ++i2)
+              if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
+            if (ix < 0) { ok = false; break; }
+            FieldInfo fi{ci.type, ix, ci.rfmut[ix], ci.rshape[ix]};
+            destruct(*sub, field_read(&fi, scrut));
+          }
+        } else {
+          destruct(arg, scrut);
+          // `Local x` binds x to the WHOLE record -- remember its ctor so an
+          // ambiguous `x.stamp` resolves via ci.rlabels (find_field would bail).
+          if (auto* pv = std::get_if<Ppat_var>(&ap->desc))
+            if (auto sit = scope.back().find(pv->name.txt); sit != scope.back().end())
+              inline_rec_var_[sit->second.stamp] = &ci;
+        }
       } else if (ci.arity > 1) {
         auto* tup = std::get_if<Ppat_tuple>(&arg.desc);
         if (!tup || (int)tup->elems.size() != ci.arity) ok = false;
