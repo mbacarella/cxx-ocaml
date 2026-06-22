@@ -990,6 +990,20 @@ struct Translator {
       }
     type_ctors_.emplace(ty, std::make_pair(nc, nb));
   }
+  // The CtorInfo of a QUALIFIED variant constructor `M.C` from M's own type --
+  // authoritative over a same-named LOCAL/bare ctor (typecore's `Env.Pattern`
+  // -- constructor_usage.Pattern, tag 1 -- vs its local `wrong_kind_context.
+  // Pattern`, tag 0).  Null for a local-module qualifier (handled elsewhere) or
+  // an unknown ctor.  The returned pointer is stable (module_ctors is cached).
+  const CtorInfo* qualified_ctor_info(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return nullptr;
+    auto* pl = std::get_if<Lident>(&d->prefix->v);
+    if (!pl || module_base(pl->name)) return nullptr;
+    auto& mc = module_ctors(pl->name);
+    auto f = mc.find(d->name);
+    return f == mc.end() ? nullptr : &f->second;
+  }
   // Register ALL constructors of a module-qualified variant type ("Vmod.vis")
   // into ctor_info_/type_ctors_, given the type's full path from the inferencer.
   // Used for type-directed disambiguation of an unqualified constructor pattern
@@ -8856,14 +8870,20 @@ struct Translator {
       raise_arg_ = false;  // consumed by the head constructor only
       bool exn_shadows = (exn_ident_.count(n) || exn_field_.count(n)) &&
                          (raise_pos || !ctor_info_.count(n) || builtin_ctors_.count(n));
-      if (auto ci = ctor_info_.find(n); ci != ctor_info_.end() && !exn_shadows) {
-        if (!ci->second.is_block) return cint(ci->second.tag);  // constant -> its tag
+      // A QUALIFIED `M.C` resolves via M's own type, OUTRANKING a same-named
+      // local/bare ctor (typecore's `Env.Pattern` vs its local `Pattern`).
+      const CtorInfo* qci = std::holds_alternative<Ldot>(k->id.txt.v)
+                            ? qualified_ctor_info(k->id.txt) : nullptr;
+      const CtorInfo* cip = qci;
+      if (!cip) { auto ci = ctor_info_.find(n); if (ci != ctor_info_.end()) cip = &ci->second; }
+      if (cip && !exn_shadows) {
+        if (!cip->is_block) return cint(cip->tag);  // constant -> its tag
         // inline record (`T {pos}`): the labels are the block's fields, in
         // declaration order, with the declared kinds as the shape
-        if (!ci->second.rlabels.empty() && k->arg) {
+        if (!cip->rlabels.empty() && k->arg) {
           auto* rc = std::get_if<Pexp_record>(&(*k->arg)->desc);
           if (rc && !rc->base) {
-            auto& L = ci->second.rlabels;
+            auto& L = cip->rlabels;
             std::vector<const Expression*> vexps(L.size(), nullptr);
             bool ok = vexps.size() == rc->fields.size();
             for (auto& [lid, ve] : rc->fields) {
@@ -8875,17 +8895,17 @@ struct Translator {
             }
             if (ok) {
               bool anymut = false;
-              for (bool m : ci->second.rfmut) anymut = anymut || m;
+              for (bool m : cip->rfmut) anymut = anymut || m;
               std::vector<LamPtr> vals;
               for (auto* vexp : vexps) vals.push_back(expr(*vexp));
               if (anymut) {
                 auto m = mk(Lam::K::Prim);
-                m->prim = Prim::Makemutable; m->prim_arg = ci->second.tag;
-                m->blk_shape = ci->second.rshape; m->args = std::move(vals);
+                m->prim = Prim::Makemutable; m->prim_arg = cip->tag;
+                m->blk_shape = cip->rshape; m->args = std::move(vals);
                 return m;
               }
-              auto b = block(ci->second.tag, std::move(vals));
-              if (b->k == Lam::K::Prim) b->blk_shape = ci->second.rshape;
+              auto b = block(cip->tag, std::move(vals));
+              if (b->k == Lam::K::Prim) b->blk_shape = cip->rshape;
               return b;
             }
           }
@@ -8893,12 +8913,12 @@ struct Translator {
         std::vector<const Expression*> fs;
         if (k->arg) {  // `B of t1 * t2` flattens the tuple argument into fields
           if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
-              at && ci->second.arity > 1 && (int)at->elems.size() == ci->second.arity)
+              at && cip->arity > 1 && (int)at->elems.size() == cip->arity)
             for (auto& el : at->elems) fs.push_back(el.get());
           else
             fs.push_back(k->arg->get());
         }
-        return block_of(ci->second.tag, fs);
+        return block_of(cip->tag, fs);
       }
       if (exn_ident_.count(n) || exn_field_.count(n)) {
         LamPtr v = exn_value(n);
