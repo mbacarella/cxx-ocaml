@@ -2686,14 +2686,25 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
     std::vector<cmi::cmiw::TyPtr> params;
     for (auto& p : d.params) params.push_back(bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar));
-    // A variant type: emit its constructors (Cstr_tuple args; record-args and
-    // GADT results are dropped to a no-arg ctor for now -- still valid).
+    // A variant type: emit its constructors (Cstr_tuple args OR an inline record
+    // `Ctor of {l;..}`; GADT results are dropped to a no-arg ctor for now).
     if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
       std::vector<cmi::cmiw::Ctor> ctors;
       for (auto& c : var->ctors) {
         cmi::cmiw::Ctor cc; cc.name = c.name.txt;
         if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
           for (auto& a : tup->elems) cc.args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
+        else if (auto* r = std::get_if<Pcstr_record>(&c.args))
+          // Inline record (Typedtree's `Texp_record of {fields; representation;
+          // extended_expression}`): emit the labels so a consumer matching
+          // `Ctor {l = ..}` resolves the labels via the ctor's rlabels.
+          for (auto& f : r->fields) {
+            cmi::cmiw::Label lab;
+            lab.name = f.name.txt;
+            lab.mut = (f.mut == MutableFlag::Mutable);
+            lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
+            cc.inline_record.push_back(std::move(lab));
+          }
         ctors.push_back(std::move(cc));
       }
       out.push_back(cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors)));

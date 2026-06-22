@@ -911,7 +911,21 @@ struct Translator {
         for (auto& c : td.ctors) {
           bool block = !c.args.empty() || c.is_inline_record;
           int arity = c.is_inline_record ? 1 : (int)c.args.size();
-          if (!out.count(c.name)) out[c.name] = {td.name, block ? nb : nc, block, arity};
+          if (!out.count(c.name)) {
+            CtorInfo ci{td.name, block ? nb : nc, block, arity};
+            // An INLINE-RECORD ctor of an imported module (Typedtree's
+            // `Texp_record of {fields; representation; extended_expression}`):
+            // carry its label order so `open Typedtree; match e with Texp_record
+            // {fields; extended_expression; _}` resolves the labels via rlabels
+            // (else they fall to find_field -> unresolved `?fields` -> garbage).
+            if (c.is_inline_record)
+              for (auto& l : c.inline_record) {
+                ci.rlabels.push_back(l.name);
+                ci.rshape.push_back(cmi_field_kind(l.type));
+                ci.rfmut.push_back(l.mutable_);
+              }
+            out[c.name] = std::move(ci);
+          }
           if (block) ++nb; else ++nc;
         }
       }

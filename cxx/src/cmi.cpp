@@ -951,9 +951,22 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         std::vector<o::ValPtr> cds;
         for (auto& c : it.ctors) {
           auto cid = o::vblock(0, {o::vstr(c.name), o::vint(cstamp++)});  // cd_id = Ident.Local
-          std::vector<o::ValPtr> args;
-          for (auto& a : c.args) args.push_back(te.emit(a));
-          auto cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
+          o::ValPtr cargs;
+          if (!c.inline_record.empty()) {  // Cstr_record of label_declaration list
+            int lstamp = 290;
+            std::vector<o::ValPtr> lds;
+            for (auto& l : c.inline_record) {
+              auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
+              lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
+                                          o::vint(0) /*ld_atomic Nonatomic*/, te.emit(l.ty),
+                                          loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
+            }
+            cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
+          } else {
+            std::vector<o::ValPtr> args;
+            for (auto& a : c.args) args.push_back(te.emit(a));
+            cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
+          }
           cds.push_back(o::vblock(0, {cid, cargs, o::vint(0) /*cd_res None*/, loc_none(),
                                       o::vint(0) /*attrs*/, o::vint(0) /*Uid.Internal*/}));
         }

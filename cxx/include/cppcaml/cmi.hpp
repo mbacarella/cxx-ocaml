@@ -210,8 +210,13 @@ struct Import { std::string name; std::string crc; };
 // One signature item, in source order.  A Type item emits Sig_type (it takes no
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
-struct Ctor { std::string name; std::vector<TyPtr> args; };  // Cstr_tuple args
 struct Label { std::string name; bool mut = false; TyPtr ty; };  // record field
+struct Ctor {
+  std::string name;
+  std::vector<TyPtr> args;           // Cstr_tuple args
+  std::vector<Label> inline_record;  // Cstr_record (inline-record ctor); when
+                                     // non-empty, takes precedence over args
+};
 struct SigItem;
 struct SigItem {
   enum K { Value, Type, Module, Modtype, Exception } k = Value;
