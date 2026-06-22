@@ -2297,7 +2297,16 @@ struct Translator {
             if (!ambiguous_fields_.count(td.labels[j].name))
               field_info_[td.labels[j].name] = {td.name, j, m, k};
           }
+          // Register the layout for by-field-set CONSTRUCTION lookups.  On a
+          // short type-name collision (Parsetree.expression vs
+          // Typedtree.expression) keep the first under the bare name but ALSO
+          // register the colliding one under a disambiguated key, so a `{e
+          // with l=v}` whose label set only fits the second record still
+          // resolves (as the local nested-records pass already does).
           if (fresh_type) rec_types_[td.name] = std::move(rt);
+          else if (rec_types_[td.name].labels != rt.labels)
+            rec_types_[td.name + "#" + std::to_string(rec_types_.size())] =
+                std::move(rt);
         }
         // NOTE: variant constructors are deliberately NOT registered here -- a
         // bare `open M` of a large stdlib module (Bigarray/Complex) would inject
@@ -3170,6 +3179,15 @@ struct Translator {
     } catch (...) {}
     return std::nullopt;
   }
+  // The inferred module-qualified type path of a record expression: the
+  // expression node itself if the checker typed it, else its `with`-base
+  // (a `{base with ..}` node often goes untyped while `base` does not).
+  decltype(ValueKinds{}.expr_constr)::const_iterator
+  expr_constr_of(const Expression* e, const Expression* base) {
+    auto it = vk.expr_constr.find(e);
+    if (it != vk.expr_constr.end()) return it;
+    return vk.expr_constr.find(base);
+  }
   std::optional<StdField> inferred_record_field(const Expression* base,
                                                 const std::string& label) {
     auto it = vk.expr_constr.find(base);
@@ -3294,6 +3312,46 @@ struct Translator {
       store = FieldInfo{"", 0, true, ValueKind::Gen}; return &store;
     }
     return nullptr;
+  }
+  // The record type a record pattern's/expr's field SET identifies: the unique
+  // rec_types_ entry whose labels contain ALL the given labels.  Null if none or
+  // 2+ match.  Lets an AMBIGUOUS label (`ty`, shared by many records) resolve to
+  // the index in the record the OTHER fields pin down (typecore's
+  // `{ty; explanation}` = type_expected.ty@0, not another record's `ty`).
+  const std::pair<const std::string, RecType>* record_for_fields(
+      const std::vector<std::string>& want) {
+    const std::pair<const std::string, RecType>* best = nullptr;
+    for (auto& kv : rec_types_) {
+      bool all = true;
+      for (auto& w : want) {
+        bool has = false;
+        for (auto& l : kv.second.labels) if (l == w) { has = true; break; }
+        if (!has) { all = false; break; }
+      }
+      if (!all) continue;
+      if (best) return nullptr;  // ambiguous field set
+      best = &kv;
+    }
+    return best;
+  }
+  // Resolve a record-PATTERN label, using the pattern's full field set to pin the
+  // record for an AMBIGUOUS label (so it takes the right index, not last-wins).
+  const FieldInfo* resolve_record_pat_field(const std::vector<std::string>& fields,
+                                            const Longident& lid, FieldInfo& store) {
+    if (auto rf = qualified_field(lid)) { store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store; }
+    std::string n = lid_last(lid);
+    // The record the WHOLE field set pins down is authoritative for a multi-field
+    // pattern -- an ambiguous label (`ty`) takes ITS index there, not the
+    // last-declared / scoped one (`{ty; explanation}` is type_expected.ty@0).
+    if (fields.size() > 1)
+      if (auto* kv = record_for_fields(fields))
+        for (int i = 0; i < (int)kv->second.labels.size(); ++i)
+          if (kv->second.labels[i] == n) {
+            store = FieldInfo{kv->first, i, kv->second.mut, kv->second.shape[i]};
+            return &store;
+          }
+    if (const FieldInfo* fi = find_field(n)) return fi;
+    return resolve_record_label(lid, store);
   }
   // A single field of a record in a NESTED module path (`e.CamlinternalMenhirLib.
   // EngineTypes.current`): its index/kind/mut from the navigated cmi record.
@@ -6091,9 +6149,11 @@ struct Translator {
       return true;
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      std::vector<std::string> flds;
+      for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_label(lbl.txt, nfi);
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi);
         if (!fi) {
           // The predefined `'a ref = { mutable contents }` cell: a `{contents=p}`
           // pattern reads the mutable field 0 (deferred to here, the function
@@ -6217,8 +6277,11 @@ struct Translator {
       return true;
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      std::vector<std::string> flds;
+      for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
-        const FieldInfo* fi = find_field(lid_last(lbl.txt));
+        FieldInfo nfi;
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi);
         if (!fi || !or_accesses(*sub, field_read(fi, scrut), out)) return false;
       }
       return true;
@@ -6402,8 +6465,11 @@ struct Translator {
         return;
       }
       if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+        std::vector<std::string> flds;
+        for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
         for (auto& [lbl, sub] : pr->fields) {
-          const FieldInfo* fi = find_field(lid_last(lbl.txt));
+          FieldInfo nfi;
+          const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi);
           if (!fi) { ok = false; return; }
           destruct(*sub, field_read(fi, acc));
         }
@@ -8028,9 +8094,11 @@ struct Translator {
       return true;
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      std::vector<std::string> flds;
+      for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_label(lbl.txt, nfi);
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi);
         if (!fi) return false;
         if (!pat_test(sub.get(), field_read(fi, acc), test, binds)) return false;
       }
@@ -8514,8 +8582,22 @@ struct Translator {
         const RecType* rt = nullptr;
         RecType std_rt;            // backing store for a stdlib-cmi layout
         std::vector<bool> fmut;    // per-field mutability, parallel to labels
+        // The update is valid only against a record whose layout HAS every
+        // updated label; a `find_field`-by-name hit can land on the WRONG record
+        // when the short type name collides (Parsetree.expression vs
+        // Typedtree.expression -- `{texp with exp_type=..}` must not resolve to
+        // Parsetree's `expression`, which has no `exp_type`).
+        auto has_all_labels = [&](const RecType* r) {
+          for (auto& [lid, ve] : rc->fields) {
+            bool found = false;
+            for (auto& l : r->labels) if (l == lid_last(lid.txt)) { found = true; break; }
+            if (!found) return false;
+          }
+          return true;
+        };
         if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
-          if (auto it = rec_types_.find(f0->type); it != rec_types_.end()) {
+          if (auto it = rec_types_.find(f0->type);
+              it != rec_types_.end() && has_all_labels(&it->second)) {
             rt = &it->second;
             for (auto& l : it->second.labels) {
               auto* fi = find_field(l);
@@ -8550,6 +8632,40 @@ struct Translator {
                   rt = &std_rt;
                 }
             }
+        if (!rt)  // the base's INFERRED type path (`Typedtree.expression`): load
+                  // its layout from the cmi by name -- the only reliable source
+                  // when a short type-name collision kept it out of rec_types_.
+          if (auto itc = expr_constr_of(&e, rc->base->get());
+              itc != vk.expr_constr.end()) {
+            const std::string& p = itc->second;
+            auto dpos = p.rfind('.');
+            if (dpos != std::string::npos && p.find('.') == dpos)
+              if (auto sr = stdlib_record_layout_named(p.substr(0, dpos),
+                                                       p.substr(dpos + 1))) {
+                std_rt.labels = std::move(sr->labels);
+                std_rt.shape = std::move(sr->shape);
+                std_rt.mut = false;
+                for (bool m : sr->mut) if (m) std_rt.mut = true;
+                std_rt.flat = sr->flat;
+                fmut = std::move(sr->mut);
+                rt = &std_rt;
+              }
+          }
+        if (!rt) {  // the UNIQUE registered record whose layout has every updated
+                    // label -- finds a collision-disambiguated key
+                    // (`expression#N` = Typedtree.expression) that the bare-name
+                    // `find_field` lookup above could not.
+          const RecType* uniq = nullptr; bool many = false;
+          for (auto& [name, cand] : rec_types_)
+            if (has_all_labels(&cand)) { if (uniq) many = true; uniq = &cand; }
+          if (uniq && !many) {
+            rt = uniq;
+            for (auto& l : rt->labels) {
+              auto* fi = find_field(l);
+              fmut.push_back(fi && fi->mut);
+            }
+          }
+        }
         if (rt) {
           auto index_of = [&](const std::string& l) {
             for (size_t i = 0; i < rt->labels.size(); ++i)
