@@ -625,6 +625,10 @@ struct Translator {
   // string` has two).  Data-carrying predef exceptions all take one argument
   // (Failure of string; Assert_failure of a string*int*int tuple), the default.
   std::unordered_map<std::string, int> exn_arity_;
+  // Inline-record exception labels in declaration order (`exception Apply_error
+  // of {loc; env; ..}`): the fields are FLAT in the exn block at offsets 1.. ,
+  // so a `{loc; env}` pattern binds each label to field (1 + its decl index).
+  std::unordered_map<std::string, std::vector<std::string>> exn_rlabels_;
   std::string mod_path_;  // dotted module path prefix for exception names
   std::string file_name_;  // source path, for Match_failure/Assert_failure locations
   std::string unit_name_;  // the compilation unit (top module) name, for __MODULE__
@@ -1408,6 +1412,25 @@ struct Translator {
     auto fi = li->second.find(dq->name);
     if (fi == li->second.end()) return nullptr;
     return fieldimm(fi->second, mp.base);
+  }
+  // The identity value of a QUALIFIED exn/extension ctor `M.E` (M local OR
+  // imported, possibly nested): a runtime field of M's block.  Null when `M.E`
+  // is not a module field -- a bare variant ctor never is -- so a non-null
+  // result means `M.E` really is an exception (and outranks a same-named bare
+  // variant the unqualified resolution would otherwise pick).
+  LamPtr qualified_exn_identity(const Longident& id) {
+    if (LamPtr v = module_ctor_identity(id)) return v;  // local module
+    auto* dq = std::get_if<Ldot>(&id.v);
+    if (!dq) return nullptr;
+    std::string prefix;
+    if (!lid_to_dotted(*dq->prefix, prefix)) return nullptr;
+    if (prefix.find('.') != std::string::npos)   // nested submodule path
+      return submodule_value(prefix, dq->name);
+    if (module_base(prefix)) return nullptr;     // local module: handled above
+    auto& fm = fields_of(prefix);
+    if (auto f = fm.find(dq->name); f != fm.end())
+      return field_of(global_of(prefix), f->second);
+    return nullptr;
   }
   // The package module-type name of `(module .. : S)` / `(e : (module S))` /
   // an ident bound to one; empty if `e` isn't a first-class-module package.
@@ -4893,6 +4916,40 @@ struct Translator {
   // field-identity test to `tests` (field index, identity value) when the caller
   // provides it.  Null when a sub-pattern is otherwise refutable (a constant
   // pattern etc.) -- the case is then skipped, preserving the previous behavior.
+  // Inline-record labels of an exception/extension ctor (decl order), for a
+  // `{l1; l2}` pattern: from the local map, else navigated from the qualifier's
+  // cmi typexts (`Includemod.Apply_error`).  Empty when not an inline-record exn.
+  std::vector<std::string> exn_inline_labels(const std::string& name, const Longident* lid) {
+    if (auto it = exn_rlabels_.find(name); it != exn_rlabels_.end()) return it->second;
+    if (lid) if (auto* d = std::get_if<Ldot>(&lid->v)) {
+      std::string dotted;
+      if (lid_to_dotted(*d->prefix, dotted)) {
+        try {
+          size_t dot = dotted.find('.');
+          auto cmi = cmi::CmiFile::load(resolve_cmi(dot == std::string::npos
+                                                    ? dotted : dotted.substr(0, dot)));
+          const cmi::Signature* sig = &cmi.sig();
+          for (size_t pos = dot; pos != std::string::npos;) {
+            size_t nd = dotted.find('.', pos + 1);
+            std::string comp = dotted.substr(pos + 1, nd == std::string::npos
+                                                      ? std::string::npos : nd - pos - 1);
+            const cmi::Signature* next = nullptr;
+            for (auto& md : sig->modules)
+              if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+            if (!next) return {};
+            sig = next; pos = nd;
+          }
+          for (auto& tx : sig->typexts)
+            if (tx.name == name && tx.is_inline_record) {
+              std::vector<std::string> r;
+              for (auto& l : tx.inline_record) r.push_back(l.name);
+              return r;
+            }
+        } catch (...) {}
+      }
+    }
+    return {};
+  }
   struct PayloadTest { int idx; LamPtr rhs; bool string_eq; };
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
                        const Expression& rhs,
@@ -4916,6 +4973,47 @@ struct Translator {
       LamPtr b = with_guard();
       scope.pop_back();
       return b;
+    }
+    // Inline-record exn payload `Apply_error {loc; env; ..}`: the fields are FLAT
+    // in the exn block at offsets 1.. , bound per the LABEL's decl index (the
+    // pattern may omit/reorder labels), not positionally.
+    if (auto* pr = std::get_if<Ppat_record>(&effective_pat(k->arg->get())->desc)) {
+      auto labels = exn_inline_labels(name, &k->id.txt);
+      if (!labels.empty()) {
+        auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
+        scope.emplace_back();
+        if (aliases) for (auto& nm : *aliases) scope.back()[nm] = exn;
+        std::vector<std::pair<Ident, LamPtr>> binders;
+        std::vector<std::pair<Ident, LamPtr>> temps;
+        std::vector<std::vector<std::pair<Ident, LamPtr>>> sub_binders;
+        bool ok = true;
+        for (auto& [lbl, sub] : pr->fields) {
+          int idx = -1;
+          for (int i = 0; i < (int)labels.size(); ++i)
+            if (labels[i] == lid_last(lbl.txt)) { idx = i; break; }
+          if (idx < 0) { ok = false; break; }
+          const Pattern* fp = effective_pat(sub.get());
+          LamPtr acc = fieldimm(idx + 1, exv());
+          if (std::holds_alternative<Ppat_any>(fp->desc)) continue;
+          if (std::holds_alternative<Ppat_var>(fp->desc) ||
+              std::holds_alternative<Ppat_alias>(fp->desc))
+            ok = collect_binders(*fp, acc, binders);
+          else if (is_irrefutable(*fp)) {
+            Ident tv = fresh("", true); auto tvv = mk(Lam::K::Var); tvv->var = tv;
+            std::vector<std::pair<Ident, LamPtr>> sb;
+            ok = collect_binders(*fp, tvv, sb);
+            temps.push_back({tv, acc}); sub_binders.push_back(std::move(sb));
+          } else ok = false;
+          if (!ok) break;
+        }
+        if (!ok) { scope.pop_back(); return nullptr; }
+        LamPtr body = with_guard();
+        scope.pop_back();
+        for (auto& sb : sub_binders) body = wrap_binders(body, sb);
+        body = wrap_binders(body, binders);
+        body = wrap_binders(body, temps);
+        return body;
+      }
     }
     int arity = 1;
     if (auto a = exn_arity_.find(name); a != exn_arity_.end()) arity = a->second;
@@ -6940,14 +7038,36 @@ struct Translator {
       auto* k = std::get_if<Ppat_construct>(&lp->desc);
       if (!k) return nullptr;
       std::string n = lid_last(k->id.txt);
+      // A QUALIFIED exn/extension ctor (`Includemod.Error`, `Includemod.
+      // Apply_error`) is identity-matched via module_ctor_identity; it resolves
+      // ONLY for a module runtime field (exns take one, variant ctors do not),
+      // so a non-null result means it really is an imported exception -- and it
+      // outranks a same-named bare VARIANT (`result.Error`) the unqualified
+      // resolution would otherwise pick (mis-reading the exn as a tagged variant).
+      bool qualified_exn = std::holds_alternative<Ldot>(k->id.txt.v) &&
+                           qualified_exn_identity(k->id.txt) != nullptr;
       // a variant-ctor entry blocks the exception reading -- unless it is a
       // shadowed builtin (`exception Error` vs result's Error).  A predefined
       // exception (Failure/Invalid_argument/..) counts as an exception ctor too:
       // without this, `function Failure s -> ..` collapses and drops `s`.
-      if ((!exn_ident_.count(n) && !exn_field_.count(n) && !is_predef_exn_name(n)) ||
-          (ctor_info_.count(n) && !builtin_ctors_.count(n)))
+      if (!qualified_exn &&
+          ((!exn_ident_.count(n) && !exn_field_.count(n) && !is_predef_exn_name(n)) ||
+           (ctor_info_.count(n) && !builtin_ctors_.count(n))))
         return nullptr;
       if (k->arg) {  // binder shapes exn_case_body supports only
+        // Inline-record exn payload `{l; ..}`: exn_case_body binds via label
+        // index when the labels are known; require simple field sub-patterns.
+        if (auto* pr = std::get_if<Ppat_record>(&effective_pat(k->arg->get())->desc)) {
+          if (exn_inline_labels(n, &k->id.txt).empty()) return nullptr;
+          for (auto& [lbl, sub] : pr->fields) {
+            const Pattern* e = effective_pat(sub.get());
+            if (!std::holds_alternative<Ppat_any>(e->desc) &&
+                !std::holds_alternative<Ppat_var>(e->desc) &&
+                !std::holds_alternative<Ppat_alias>(e->desc) && !is_irrefutable(*e))
+              return nullptr;
+          }
+          continue;
+        }
         int arity = exn_arity_.count(n) ? exn_arity_[n] : 1;
         for (auto* fp : ctor_field_pats(k, arity)) {
           const Pattern* e = effective_pat(fp);
@@ -6983,8 +7103,9 @@ struct Translator {
     auto* k = std::get_if<Ppat_construct>(&lp->desc);
     std::string n = lid_last(k->id.txt);
     // a module-qualified extension ctor (`M1.E`) tests that module's own field,
-    // so distinct same-named ctors in sibling modules stay distinct.
-    LamPtr idv = module_ctor_identity(k->id.txt);
+    // so distinct same-named ctors in sibling modules stay distinct (local AND
+    // imported, e.g. `Includemod.Error` vs the bare `result.Error` variant).
+    LamPtr idv = qualified_exn_identity(k->id.txt);
     if (!idv) idv = exn_value(n);
     if (!idv) return nullptr;
     LamPtr lhs = k->arg ? fieldimm(0, sv()) : sv();
@@ -8191,14 +8312,24 @@ struct Translator {
         bool had_i = exn_ident_.count(nm), had_a = exn_arity_.count(nm);
         Ident sav_i = had_i ? exn_ident_[nm] : Ident{};
         int sav_a = had_a ? exn_arity_[nm] : 0;
+        bool had_r = exn_rlabels_.count(nm);
+        std::vector<std::string> sav_r = had_r ? exn_rlabels_[nm] : std::vector<std::string>{};
         exn_ident_[nm] = id;
-        if (auto* d = std::get_if<Pext_decl>(&pe->exn.ctor.kind))
+        if (auto* d = std::get_if<Pext_decl>(&pe->exn.ctor.kind)) {
           if (auto* t = std::get_if<Pcstr_tuple>(&d->args))
             exn_arity_[nm] = (int)t->elems.size();
+          else if (auto* r = std::get_if<Pcstr_record>(&d->args)) {
+            exn_arity_[nm] = (int)r->fields.size();
+            std::vector<std::string> ls;
+            for (auto& f : r->fields) ls.push_back(f.name.txt);
+            exn_rlabels_[nm] = std::move(ls);
+          }
+        }
         rec_spine_ = rec_spine;
         LamPtr body = expr(*si->body);
         if (had_i) exn_ident_[nm] = sav_i; else exn_ident_.erase(nm);
         if (had_a) exn_arity_[nm] = sav_a; else exn_arity_.erase(nm);
+        if (had_r) exn_rlabels_[nm] = std::move(sav_r); else exn_rlabels_.erase(nm);
         auto l = mk(Lam::K::Let);
         l->bindings = {{id, ValueKind::Gen, blk}}; l->body = body;
         return l;
@@ -11927,9 +12058,16 @@ struct Translator {
         Ident id = fresh(nm);
         cur.push_back({id, ValueKind::Gen, blk});
         exn_ident_[nm] = id;
-        if (auto* d = std::get_if<Pext_decl>(&pe->exn.ctor.kind))
+        if (auto* d = std::get_if<Pext_decl>(&pe->exn.ctor.kind)) {
           if (auto* t = std::get_if<Pcstr_tuple>(&d->args))
             exn_arity_[nm] = (int)t->elems.size();
+          else if (auto* r = std::get_if<Pcstr_record>(&d->args)) {
+            exn_arity_[nm] = (int)r->fields.size();
+            std::vector<std::string> ls;
+            for (auto& f : r->fields) ls.push_back(f.name.txt);
+            exn_rlabels_[nm] = std::move(ls);
+          }
+        }
         add_export(nm, id);
         continue;
       }
@@ -11957,9 +12095,16 @@ struct Translator {
           Ident id = fresh(nm);
           cur.push_back({id, ValueKind::Gen, blk});
           exn_ident_[nm] = id;
-          if (auto* d = std::get_if<Pext_decl>(&c.kind))
+          if (auto* d = std::get_if<Pext_decl>(&c.kind)) {
             if (auto* t = std::get_if<Pcstr_tuple>(&d->args))
               exn_arity_[nm] = (int)t->elems.size();
+            else if (auto* r = std::get_if<Pcstr_record>(&d->args)) {
+              exn_arity_[nm] = (int)r->fields.size();
+              std::vector<std::string> ls;
+              for (auto& f : r->fields) ls.push_back(f.name.txt);
+              exn_rlabels_[nm] = std::move(ls);
+            }
+          }
           add_export(nm, id);
         }
         continue;
