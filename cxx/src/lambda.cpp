@@ -3286,6 +3286,13 @@ struct Translator {
       store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
     }
     if (const FieldInfo* fi = find_field(lid_last(lid))) return fi;
+    // `{contents = ..}` is the ref cell (`'a ref = {mutable contents}`): field 0,
+    // mutable.  Without this a `{contents = p}` PATTERN (Tobject's abbrev ref in
+    // ctype's `copy`) leaves the label unresolved, so pat_test bails and the
+    // whole match collapses to the int_cases best-effort (unbound `?` bindings).
+    if (lid_last(lid) == "contents") {
+      store = FieldInfo{"", 0, true, ValueKind::Gen}; return &store;
+    }
     return nullptr;
   }
   // A single field of a record in a NESTED module path (`e.CamlinternalMenhirLib.
