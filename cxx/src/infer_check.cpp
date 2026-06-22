@@ -1872,6 +1872,20 @@ struct Checker {
     // Fallback: spine unknown/insufficient -- peel positionally (bidirectional
     // on each argument), so a var-typed callee never false-rejects.
     for (auto& [lbl, arg] : a.args) {
+      auto [lk, nm] = arglabel(lbl);
+      (void)nm;
+      // A POSITIONAL arg skips past leading OPTIONAL params (they are defaulted),
+      // aligning with the next non-optional param.  Without this,
+      // `Location.errorf "%d" 3` aligns "%d" with `?loc` instead of the `format6`
+      // param (the `3` overflows the known spine, so the label-aware path bails
+      // to here), so the string literal isn't recognised as a format and is
+      // lowered as a plain string -> make_printf crash at runtime.
+      if (lk == 0) {
+        TypePtr c = I::Engine::repr(ft);
+        while (c->kind == I::Type::Kind::Arrow && c->arrow_label == 2) {
+          ft = I::Engine::repr(c->cod); c = ft;
+        }
+      }
       TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
       soft_unify(ft, eng.arrow(dom, r));
       TypePtr at = infer_expr_expected(*arg, dom);
