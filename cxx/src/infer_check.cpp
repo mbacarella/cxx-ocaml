@@ -164,6 +164,11 @@ struct Checker {
   std::unordered_map<const Pattern*, TypePtr> rec_pat_;
   std::unordered_map<const void*, TypePtr> rec_ret_;
   std::unordered_map<const void*, TypePtr> rec_expr_;  // every expression's type
+  // Record decl by identity stamp, for resolving an AMBIGUOUS field projection
+  // through the base's inferred type identity (Sign_diff.t.untypables@4).
+  std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
+  // Field projections so resolved: node -> (index, mut, kind_str).
+  std::unordered_map<const Expression*, std::tuple<int, bool, std::string>> field_resolved_;
   std::set<const Expression*> fmt_lits_;  // string literals inferred at format type
   // Optional-argument erasure: an expression of type `?l:.. -> ..` used where a
   // non-optional arrow is expected is eta-expanded with None for each erased
@@ -281,6 +286,18 @@ struct Checker {
   }
 
   // ast core_type -> infer type, mapping type variables by name (generic).
+  // A coretype's value kind for a record-field read op: "int" (immediate),
+  // "float", or "" (boxed/generic).  Enough to pick FieldInt/FieldImm/FieldMut.
+  std::string ct_kind(const CoreType& t) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      std::string b = lid_last(c->id.txt);
+      if (b == "int" || b == "char" || b == "bool" || b == "unit") return "int";
+      if (immediate_types_.count(b) || immediate_types_.count(lid_full(c->id.txt)))
+        return "int";
+      if (b == "float") return "float";
+    }
+    return "";
+  }
   TypePtr from_coretype(const CoreType& t,
                         std::unordered_map<std::string, TypePtr>& vars) {
     if (std::holds_alternative<Ptyp_any>(t.desc)) return eng.fresh_var();
@@ -944,6 +961,7 @@ struct Checker {
     std::vector<TypePtr> params;
     for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
     TypePtr recTy = eng.constr(d.name.txt, params, type_stamp_[&d]);
+    if (int s = type_stamp_[&d]) stamp_record_decl_[s] = &d;  // for ambiguous-field resolution
     for (auto& f : rec->fields) {
       // a universally-quantified field (`{ f : 'a. ... }`) is polymorphic per use;
       // a single monomorphic scheme would clash, so leave it to Any -- EXCEPT, in
@@ -1666,6 +1684,29 @@ struct Checker {
         return s->cod;
       }
       TypePtr bt = infer_expr(*fld->e);
+      // An AMBIGUOUS label (omitted from fields_) resolved through the base's
+      // type IDENTITY: find the stamped record decl and read the field's index/
+      // mutability/kind, so the back end need not guess between same-named records.
+      {
+        TypePtr rb = I::Engine::repr(bt);
+        std::string lbl = lid_last(fld->field.txt);
+        if (rb->kind == I::Type::Kind::Constr && rb->stamp && !fields_.count(lbl)) {
+          auto dit = stamp_record_decl_.find(rb->stamp);
+          if (dit != stamp_record_decl_.end())
+            if (auto* rec = std::get_if<Ptype_record>(&dit->second->kind)) {
+              bool all_float = !rec->fields.empty();
+              for (auto& f : rec->fields)
+                if (ct_kind(*f.type) != "float") { all_float = false; break; }
+              if (!all_float)
+                for (int i = 0; i < (int)rec->fields.size(); ++i)
+                  if (rec->fields[i].name.txt == lbl) {
+                    field_resolved_[&e] = {i, rec->fields[i].mut == MutableFlag::Mutable,
+                                           ct_kind(*rec->fields[i].type)};
+                    break;
+                  }
+            }
+        }
+      }
       // The predefined `'a ref = { mutable contents : 'a }` cell.
       if (lid_last(fld->field.txt) == "contents") {
         TypePtr rb = I::Engine::repr(bt);
@@ -2603,6 +2644,8 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
     if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
       vk.expr_constr[e] = r->path;  // module-qualified type, e.g. "Gc.stat"
   }
+  for (auto& [e, fr] : ck.field_resolved_)
+    vk.field_resolved[e] = {std::get<0>(fr), std::get<1>(fr), std::get<2>(fr)};
   vk.format_lits = std::move(ck.fmt_lits_);
   vk.optional_erasures = std::move(ck.erasures_);
   return vk;

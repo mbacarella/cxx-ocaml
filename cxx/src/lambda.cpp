@@ -8851,6 +8851,17 @@ struct Translator {
         l->prim_arg = rf->index; l->args = {expr(*fe->e)};
         return l;
       }
+      // An AMBIGUOUS label resolved by the checker through the base's type
+      // identity (the bare find_field below cannot disambiguate same-named
+      // records -- Sign_diff.t.untypables@4 vs signature_symptom.untypables@8).
+      if (auto it = vk.field_resolved.find(&e); it != vk.field_resolved.end()) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = it->second.kind == "int" ? Prim::FieldInt
+                  : it->second.mut         ? Prim::FieldMut
+                                           : Prim::FieldImm;
+        l->prim_arg = it->second.index; l->args = {expr(*fe->e)};
+        return l;
+      }
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);

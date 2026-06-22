@@ -66,6 +66,12 @@ struct ValueKinds {
   // bool vector is the resulting application's argument slots (true = None for an
   // erased optional, false = an eta parameter).
   std::unordered_map<const ast::Expression*, std::vector<bool>> optional_erasures;
+  // For a record-field PROJECTION (`d.untypables`) whose label is AMBIGUOUS
+  // across record types, the field resolved through the base's inferred type
+  // IDENTITY (its decl stamp) -- which the back end's by-name `find_field`
+  // cannot disambiguate (Sign_diff.t.untypables@4 vs signature_symptom.untypables@8).
+  struct FieldResolved { int index; bool mut; std::string kind; };
+  std::unordered_map<const ast::Expression*, FieldResolved> field_resolved;
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 
