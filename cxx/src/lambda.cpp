@@ -2670,6 +2670,33 @@ struct Translator {
   // signature.  Follows the curried tail through sequences/lets/constraints so a
   // function whose later parameters are nested (`fun ?a -> e; fun ~b -> ...`)
   // still reports all of them.
+  // Record a LOCAL functor's result-struct value label-sigs: navigate the
+  // functor body to its result structure and remember each `let f = fun ..`
+  // whose params carry labels/optionals, so a `module M = F(arg)` application
+  // can give `M.f` the sig needed to fill omitted optionals.
+  void record_local_functor_result_sigs(const std::string& fname, const ModuleExpr* body) {
+    while (body) {
+      if (auto* pf = std::get_if<Pmod_functor>(&body->desc)) { body = pf->body.get(); continue; }
+      if (auto* pc = std::get_if<Pmod_constraint>(&body->desc)) { body = pc->me.get(); continue; }
+      break;
+    }
+    if (!body) return;
+    auto* ps = std::get_if<Pmod_structure>(&body->desc);
+    if (!ps) return;
+    for (auto& it : ps->items) {
+      auto* pv = std::get_if<Pstr_value>(&it.desc);
+      if (!pv) continue;
+      for (auto& b : pv->bindings) {
+        auto* nm = std::get_if<Ppat_var>(&b.pat.desc);
+        if (!nm || !b.expr) continue;
+        auto* fn = std::get_if<Pexp_function>(&b.expr->desc);
+        if (!fn) continue;
+        FnSig fs = fn_param_labels(*fn);
+        for (auto& [k, n] : fs)
+          if (k != 0) { local_functor_member_sig_[fname][nm->name.txt] = fs; break; }
+      }
+    }
+  }
   static FnSig fn_param_labels(const Pexp_function& f) {
     FnSig v;
     for (auto& fp : f.params) {
@@ -11197,6 +11224,12 @@ struct Translator {
   // submodule member (`DLS.new_key (fun..)`) fill the omitted optional, just as
   // submodule_of does for a cross-module call.
   std::unordered_map<std::string, std::unordered_map<std::string, FnSig>> local_member_sig_;
+  // A LOCAL functor's result-struct value label-sigs (functor name -> value ->
+  // FnSig), recorded at the functor's definition.  On `module M = F(arg)` for a
+  // local F, copied to local_member_sig_[M] so `M.f` fills f's omitted optionals
+  // (typecore's `Constructor = NameChoice(..)` -> `Constructor.disambiguate`'s
+  // leading ?warn/?filter).
+  std::unordered_map<std::string, std::unordered_map<std::string, FnSig>> local_functor_member_sig_;
   // From this unit's own .mli (.cmi): a SUBMODULE's exported field order, keyed by
   // the immediate submodule name.  The top-level impl->intf coercion uses it to
   // reorder a submodule's OWN block to its .mli layout (domain.ml's DLS struct has
@@ -12507,6 +12540,7 @@ struct Translator {
             functor_param_[*mb.name.txt] = functor_param_layout(mb.expr);   // for arg coercion
             if (auto* pt = functor_param_type(mb.expr)) functor_param_sig_[*mb.name.txt] = pt;
             functor_param_types_[*mb.name.txt] = functor_param_types(mb.expr);  // all params
+            record_local_functor_result_sigs(*mb.name.txt, &mb.expr);  // result value optionals
             add_export(*mb.name.txt, mid);
           } else {  // module M = F(X) / M2 / (M : S) / (val x): bind + layout
             LamPtr mv = compile_module_expr(mb.expr);
@@ -12528,6 +12562,15 @@ struct Translator {
             // Subst.fold's labelled result signature is recoverable for reordering.
             // `Map` under `open MoreLabels` is the submodule MoreLabels.Map (its
             // result is the LABELLED Map), so resolve the prefix through opens.
+            // `module Constructor = NameChoice(..)` for a LOCAL functor: copy the
+            // functor's recorded result value label-sigs so Constructor.f fills
+            // f's omitted optionals.
+            if (auto* pa = std::get_if<Pmod_apply>(&mb.expr.desc))
+              if (auto* fi = std::get_if<Pmod_ident>(&pa->f->desc))
+                if (auto* l = std::get_if<Lident>(&fi->id.txt.v))
+                  if (auto it = local_functor_member_sig_.find(l->name);
+                      it != local_functor_member_sig_.end())
+                    local_member_sig_[nm] = it->second;
             if (auto* pa = std::get_if<Pmod_apply>(&mb.expr.desc))
               if (auto* fi = std::get_if<Pmod_ident>(&pa->f->desc))
                 if (auto* d = std::get_if<Ldot>(&fi->id.txt.v))
