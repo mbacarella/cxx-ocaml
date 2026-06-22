@@ -2240,8 +2240,24 @@ struct Translator {
             ValueKind k = cmi_field_kind(td.labels[j].type);
             bool m = td.labels[j].mutable_;
             rt.mut |= m; rt.labels.push_back(td.labels[j].name); rt.shape.push_back(k);
-            if (fresh_type && !field_info_.count(td.labels[j].name) &&
-                !ambiguous_fields_.count(td.labels[j].name))
+            // A later `open M` SHADOWS an earlier record's label, matching
+            // OCaml's resolution of a bare label to the most-recently-opened
+            // record.  Two cases, BOTH last-open-wins:
+            //  - shared label across distinct types: cmt2annot's `open Typedtree`
+            //    then `open Tast_iterator` -- `structure` is in BOTH
+            //    Typedtree.implementation@0 and Tast_iterator.iterator@32, and
+            //    `iter.structure` must take the last-opened iterator@32.
+            //  - a SHORT TYPE-NAME collision: typetexp's `open Parsetree` then
+            //    `open Typedtree` both define a record named `core_type`, with
+            //    DISJOINT fields (ptyp_* vs ctyp_*).  Parsetree registers
+            //    rec_types_["core_type"] first, so `fresh_type` is false for
+            //    Typedtree's -- but its fields (ctyp_type@1 ...) must still be
+            //    registered or `typ.ctyp_type` drops to 0.  So register the
+            //    field regardless of `fresh_type`; only `rec_types_` (used for
+            //    record CONSTRUCTION, matched by field set) stays name-keyed.
+            // do NOT flag ambiguous (find_field returns null for ambiguous
+            // labels, which would drop the field read to 0).
+            if (!ambiguous_fields_.count(td.labels[j].name))
               field_info_[td.labels[j].name] = {td.name, j, m, k};
           }
           if (fresh_type) rec_types_[td.name] = std::move(rt);
@@ -3044,14 +3060,10 @@ struct Translator {
   // An unqualified label resolved through the base expression's INFERRED type:
   // `heap_stats.major_collections` with heap_stats : Gc.stat reads the labeled
   // field of the record decl `stat` in gc.cmi.
-  std::optional<StdField> inferred_record_field(const Expression* base,
-                                                const std::string& label) {
-    auto it = vk.expr_constr.find(base);
-    if (it == vk.expr_constr.end()) return std::nullopt;
-    const std::string& p = it->second;
-    auto d = p.rfind('.');
-    std::string mod = p.substr(0, d), ty = p.substr(d + 1);
-    if (mod.find('.') != std::string::npos) return std::nullopt;  // nested module
+  // Find record type `ty`'s field `label` in a top-level module's cmi.
+  std::optional<StdField> toplevel_typed_record_field(const std::string& mod,
+                                                      const std::string& ty,
+                                                      const std::string& label) {
     try {
       auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
@@ -3062,6 +3074,56 @@ struct Translator {
                             record_all_float(td)};
       }
     } catch (...) {}
+    return std::nullopt;
+  }
+  // Same, but for a NESTED module path ("Ctype.Pattern_env"): navigate the head
+  // unit's cmi through the named submodules, then find record `ty`'s `label`.
+  std::optional<StdField> nested_typed_record_field(const std::string& dotted,
+                                                    const std::string& ty,
+                                                    const std::string& label) {
+    size_t dot = dotted.find('.');
+    if (dot == std::string::npos) return toplevel_typed_record_field(dotted, ty, label);
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(dotted.substr(0, dot)));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = dotted.find('.', pos + 1);
+        std::string comp = dotted.substr(pos + 1, nd == std::string::npos
+                                                      ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return std::nullopt;
+        sig = next; pos = nd;
+      }
+      for (auto& td : sig->types) {
+        if (td.kind != cmi::TypeDecl::Record || td.name != ty) continue;
+        for (int i = 0; i < (int)td.labels.size(); ++i)
+          if (td.labels[i].name == label)
+            return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_,
+                            record_all_float(td)};
+      }
+    } catch (...) {}
+    return std::nullopt;
+  }
+  std::optional<StdField> inferred_record_field(const Expression* base,
+                                                const std::string& label) {
+    auto it = vk.expr_constr.find(base);
+    if (it == vk.expr_constr.end()) return std::nullopt;
+    const std::string& p = it->second;
+    auto d = p.rfind('.');
+    std::string mod = p.substr(0, d), ty = p.substr(d + 1);
+    // `mod` may itself be dotted (an already-qualified nested type path).
+    if (mod.find('.') != std::string::npos)
+      return nested_typed_record_field(mod, ty, label);
+    // A top-level module: resolve from its own cmi.
+    if (auto rf = toplevel_typed_record_field(mod, ty, label)) return rf;
+    // Else `mod` is a SUBMODULE reached via `open M` (Ctype's `Pattern_env`,
+    // written `Pattern_env.t` after `open Ctype`): resolve to its full dotted
+    // path and navigate.  Without this, `penv.env` (penv : Pattern_env.t) drops
+    // to a 0 field read.
+    if (std::string full = opened_submodule_path(mod); !full.empty())
+      return nested_typed_record_field(full, ty, label);
     return std::nullopt;
   }
   // The full layout of the stdlib record type (in module `mod`'s cmi) declaring
