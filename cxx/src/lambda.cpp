@@ -2164,7 +2164,15 @@ struct Translator {
                 !ambiguous_fields_.count(td.labels[j].name))
               field_info_[td.labels[j].name] = {td.name, j, m, k};
           }
+          // On a short type-NAME collision (the bare `t` of countless submodules,
+          // e.g. Persistent_env.Persistent_signature.t {filename;cmi;visibility})
+          // keep the first under the bare name but ALSO register the colliding one
+          // under a disambiguated key, so a `M.N.{ .. }` record LITERAL whose label
+          // set only fits this record still resolves by-field-set (else -> 0).
           if (fresh_type) rec_types_[td.name] = std::move(rt);
+          else if (rec_types_[td.name].labels != rt.labels)
+            rec_types_[td.name + "#" + std::to_string(rec_types_.size())] =
+                std::move(rt);
         }
         // Register the submodule's VARIANT constructors (Gc.Memprof's
         // `allocation_source = Normal | Marshalled | Custom`) so unqualified
