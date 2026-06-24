@@ -3346,6 +3346,13 @@ struct Translator {
   // record for an AMBIGUOUS label (so it takes the right index, not last-wins).
   const FieldInfo* resolve_record_pat_field(const std::vector<std::string>& fields,
                                             const Longident& lid, FieldInfo& store) {
+    // A qualified field (`{ Lambda.code = ..; required_globals }`) names the
+    // record's module: register its record types so the SIBLING bare labels
+    // (required_globals) resolve by-field-set too -- else the whole pattern fails
+    // and every bound var is left unresolved (?lambda/?required_globals).
+    if (auto* d = std::get_if<Ldot>(&lid.v))
+      if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+        register_module_records(pl->name);
     if (auto rf = qualified_field(lid)) { store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store; }
     std::string n = lid_last(lid);
     // The record the WHOLE field set pins down is authoritative for a multi-field
