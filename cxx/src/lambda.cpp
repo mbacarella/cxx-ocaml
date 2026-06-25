@@ -8215,14 +8215,27 @@ struct Translator {
       scrut = varof(stmp);
     }
     struct NRow { const Pattern* lhs; const Expression* rhs; const Expression* guard;
-                  std::vector<std::string> aliases; Choices choices; };
+                  std::vector<std::string> aliases; Choices choices; bool tcatch = false; };
     std::vector<NRow> rows;
-    for (auto& r : rows0) {
+    for (size_t ri = 0; ri < rows0.size(); ++ri) {
+      auto& r = rows0[ri];
       const Pattern* l = effective_pat(r.lhs);
       std::vector<std::string> als;
       while (auto* pa = std::get_if<Ppat_alias>(&l->desc)) {
         als.push_back(pa->name.txt);
         l = effective_pat(pa->p.get());
+      }
+      // A `#type [as id]` pattern matches a (possibly qualified / cmi-resolved)
+      // subset of polyvariant tags whose exact set we may not know.  As the LAST
+      // arm of an exhaustive match it is the residual catch-all (same reasoning
+      // as the single-`#poly`-row irrefutable path above): earlier explicit arms
+      // are tested first, this binds its alias to the scrutinee and runs.  A
+      // `#type` arm that is NOT last could shadow later arms whose tags we cannot
+      // exclude, so bail and let another path handle it.
+      if (std::holds_alternative<Ppat_type>(l->desc)) {
+        if (ri + 1 != rows0.size()) return nullptr;
+        rows.push_back({l, r.rhs, r.guard, als, {}, true});
+        continue;
       }
       std::vector<const Pattern*> alts;
       flatten_or(l, alts);  // top-level or split (preserves non-binding-or codegen)
@@ -8238,10 +8251,12 @@ struct Translator {
     for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
       LamPtr test;
       std::vector<std::pair<Ident, LamPtr>> binds;
-      cur_choices_ = it->choices.empty() ? nullptr : &it->choices;
-      bool ok = pat_test(it->lhs, scrut, test, binds);
-      cur_choices_ = nullptr;
-      if (!ok) return nullptr;
+      if (!it->tcatch) {
+        cur_choices_ = it->choices.empty() ? nullptr : &it->choices;
+        bool ok = pat_test(it->lhs, scrut, test, binds);
+        cur_choices_ = nullptr;
+        if (!ok) return nullptr;
+      }  // tcatch: test stays null (irrefutable residual), only aliases bind
       scope.emplace_back();
       for (auto& nm : it->aliases) scope.back()[nm] = scrut->var;
       for (auto& [id, acc] : binds) scope.back()[id.name] = id;
