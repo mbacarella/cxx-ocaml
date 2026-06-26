@@ -3921,6 +3921,15 @@ struct Translator {
     // Polymorphic compare specialized by operand kind (the spellings we can be
     // sure of; string/other gen needs the operand type, so left unresolved).
     if (prim == "%compare" && as.size() == 2) {
+      // A string operand -> caml_string_compare (the typed compare), matching the
+      // operator path (caml_string_lessthan, ~line 9646).  Without this `compare`
+      // on known strings fell back to polymorphic caml_compare, which walks the
+      // value (Obj.tag storm) and crashes on a corrupt/abstract block.
+      if (expr_is_string(as[0].second.get()) || expr_is_string(as[1].second.get())) {
+        auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall; pr->prim_id = "caml_string_compare";
+        pr->args = {expr(*as[0].second), expr(*as[1].second)};
+        return pr;
+      }
       ValueKind k0 = expr_kind(as[0].second.get()), k1 = expr_kind(as[1].second.get());
       if (k0 == ValueKind::Int || k1 == ValueKind::Int) return op("compare_ints");
       if (k0 == ValueKind::Float || k1 == ValueKind::Float) return op("compare_floats");
