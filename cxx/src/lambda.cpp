@@ -3089,10 +3089,23 @@ struct Translator {
         if (pk == 2 && (k == 1 || k == 2) && nm == pn) { found = (int)i; fk = k; break; }
       }
       if (found < 0) {
-        // An omitted optional is filled with None (0); an omitted non-optional
-        // parameter (a skipped label) becomes an Omitted slot -> a stub closure.
-        if (pk == 2) list.push_back({cint(0), false, true});
-        else list.push_back({nullptr, true, false});
+        // An omitted optional is filled with None (0) ONLY when a later POSITIONAL
+        // (Nolabel) argument forces the default (`Hashtbl.create 51` defaults
+        // ?random because 51 is supplied past it).  When no un-used positional
+        // remains -- a PARTIAL application supplying only a LATER labelled arg
+        // (`add_value ?shape:None`, where ?check precedes ?shape) -- the earlier
+        // optional must stay a parameter of the result (eta), NOT be defaulted;
+        // ocamlc emits `fun check -> impl check None`, not `impl None None`.
+        // An omitted non-optional (a skipped label) is always an eta (Omitted) slot.
+        if (pk == 2) {
+          bool later_positional = false;
+          for (size_t i = 0; i < as.size(); ++i)
+            if (!used[i]) { std::string nm; if (alabel(i, nm) == 0) { later_positional = true; break; } }
+          if (later_positional) list.push_back({cint(0), false, true});  // -> None
+          else list.push_back({nullptr, true, true});                    // -> eta param
+        } else {
+          list.push_back({nullptr, true, false});
+        }
         continue;
       }
       used[found] = true;
