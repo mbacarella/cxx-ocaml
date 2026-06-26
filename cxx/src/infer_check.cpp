@@ -2953,11 +2953,15 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
   // Import the module-type decls of an opened module (`open EngineTypes`) so a
   // following unqualified `: ENGINE` / `(T : TABLE)` resolves to its members.
   auto import_modtypes_of = [&](const ast::Signature& msig) {
-    for (auto& mit : msig)
+    for (auto& mit : msig) {
       if (auto* pmt = std::get_if<Psig_modtype>(&mit.desc))
         if (pmt->type)
           if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
             modtypes[pmt->name.txt] = &ps->items;
+      if (auto* pms = std::get_if<Psig_modtypesubst>(&mit.desc))
+        if (auto* ps = std::get_if<Pmty_signature>(&pms->type.desc))
+          modtypes[pms->name.txt] = &ps->items;
+    }
   };
   for (auto& it : s) {
     if (auto* pt = std::get_if<Psig_type>(&it.desc))
@@ -2966,6 +2970,15 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       if (pmt->type)
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
           modtypes[pmt->name.txt] = &ps->items;
+    // `module type S := sig .. end` (a destructive modtype SUBSTITUTION): S takes
+    // no field and is erased from the output, but a later `include S with ..` must
+    // still expand to its members.  printtyp.mli declares `module type Printers :=`
+    // then `include Printers with type 'a printer := ..`; without registering the
+    // subst, body_sig couldn't resolve the include and 22 items (ident/path/
+    // type_expr/..) were dropped -> Printtyp.* read wrong fields.
+    if (auto* pms = std::get_if<Psig_modtypesubst>(&it.desc))
+      if (auto* ps = std::get_if<Pmty_signature>(&pms->type.desc))
+        modtypes[pms->name.txt] = &ps->items;
     if (auto* po = std::get_if<Psig_open>(&it.desc))
       if (auto* l = std::get_if<Lident>(&po->id.txt.v))
         if (auto f = module_sigs.find(l->name); f != module_sigs.end())
