@@ -270,6 +270,15 @@ inline SigItem sig_exception(std::string n, std::vector<TyPtr> args) {
   Ctor c; c.name = s.name; c.args = std::move(args); s.ctors.push_back(std::move(c));
   return s;
 }
+// `exception E of { l1 : t1; .. }`: an inline-record payload.  Emitted as a
+// Cstr_record extension_constructor so a consumer matching `M.E {l = ..}` can
+// resolve the labels via the typext's inline_record (without it, ext_match bails
+// on the inline-record arm and the WHOLE match collapses to its first arm).
+inline SigItem sig_exception_record(std::string n, std::vector<Label> labels) {
+  SigItem s; s.k = SigItem::Exception; s.name = std::move(n);
+  Ctor c; c.name = s.name; c.inline_record = std::move(labels); s.ctors.push_back(std::move(c));
+  return s;
+}
 inline SigItem sig_module_alias(std::string n, std::string target) {
   SigItem s; s.k = SigItem::Module; s.name = std::move(n); s.alias = std::move(target); return s;
 }

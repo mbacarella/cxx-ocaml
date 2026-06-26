@@ -2894,6 +2894,33 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
   return out;
 }
 
+// Emit a Sig_typext for an `exception E [of t.. | of {l;..}]` declaration,
+// preserving an inline-record payload (Cstr_record) so a consumer matching
+// `M.E {l = ..}` resolves the labels -- otherwise ext_match bails on that arm
+// and the whole match collapses to its first arm (the cause of the bootstrapped
+// includemod_errorprinter's `Includemod.Apply_error {..}` collapse + crash).
+static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
+                                      const ast::Pext_decl& pd) {
+  std::unordered_map<std::string, TypePtr> tvars;
+  std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
+  if (auto* rec = std::get_if<Pcstr_record>(&pd.args)) {
+    std::vector<cmi::cmiw::Label> labels;
+    for (auto& f : rec->fields) {
+      cmi::cmiw::Label lab;
+      lab.name = f.name.txt;
+      lab.mut = (f.mut == MutableFlag::Mutable);
+      lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
+      labels.push_back(std::move(lab));
+    }
+    return cmi::cmiw::sig_exception_record(name, std::move(labels));
+  }
+  std::vector<cmi::cmiw::TyPtr> args;
+  if (auto* tup = std::get_if<Pcstr_tuple>(&pd.args))
+    for (auto& a : tup->elems)
+      args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
+  return cmi::cmiw::sig_exception(name, std::move(args));
+}
+
 // Build a .cmi signature from a hand-written interface (.mli) -- the explicit
 // path, used when an interface file exists.  Types are taken verbatim from the
 // declarations (no inference); local type names are pre-registered so qualified
@@ -3079,16 +3106,8 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       // shifted peek_val -> the C parse engine read the wrong table fields).
       const ExtensionConstructor& ec = pe->exn.ctor;
       if (!ec.name.txt.empty())
-        if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
-          std::vector<cmi::cmiw::TyPtr> args;
-          if (auto* tup = std::get_if<Pcstr_tuple>(&pd->args)) {
-            std::unordered_map<std::string, TypePtr> tvars;
-            std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
-            for (auto& a : tup->elems)
-              args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
-          }
-          out.push_back(cmi::cmiw::sig_exception(ec.name.txt, std::move(args)));
-        }
+        if (auto* pd = std::get_if<Pext_decl>(&ec.kind))
+          out.push_back(exn_sigitem(ck, ec.name.txt, *pd));
     } else if (auto* px = std::get_if<Psig_typext>(&it.desc)) {
       // `type exn += Error of t`: each extension constructor TAKES A FIELD (like
       // an exception).  persistent_env.mli's `type exn += private Error` was
@@ -3096,18 +3115,10 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       // applied a non-closure -> SIGSEGV in env's init.
       for (auto& ec : px->ext.ctors) {
         if (ec.name.txt.empty()) continue;
-        if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
-          std::vector<cmi::cmiw::TyPtr> args;
-          if (auto* tup = std::get_if<Pcstr_tuple>(&pd->args)) {
-            std::unordered_map<std::string, TypePtr> tvars;
-            std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
-            for (auto& a : tup->elems)
-              args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
-          }
-          out.push_back(cmi::cmiw::sig_exception(ec.name.txt, std::move(args)));
-        } else {
+        if (auto* pd = std::get_if<Pext_decl>(&ec.kind))
+          out.push_back(exn_sigitem(ck, ec.name.txt, *pd));
+        else
           out.push_back(cmi::cmiw::sig_exception(ec.name.txt, {}));  // rebind `+= C = D`
-        }
       }
     } else if (auto* pinc = std::get_if<Psig_include>(&it.desc)) {
       // `include module type of M`: splice M's compiled cmi signature here so the
@@ -3169,6 +3180,19 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       }
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
       emit_type_decls(ck, ty->decls, out);
+    } else if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {
+      // `exception E [of ..]` in a .ml without a .mli: emit the Sig_typext so
+      // the inferred .cmi carries the exception (it takes a runtime field, and a
+      // qualified `M.E` use must resolve it -- otherwise the match collapses).
+      const ExtensionConstructor& ec = pe->exn.ctor;
+      if (!ec.name.txt.empty())
+        if (auto* pd = std::get_if<Pext_decl>(&ec.kind))
+          out.push_back(exn_sigitem(ck, ec.name.txt, *pd));
+    } else if (auto* px = std::get_if<Pstr_typext>(&it.desc)) {
+      for (auto& ec : px->ext.ctors)
+        if (!ec.name.txt.empty())
+          if (auto* pd = std::get_if<Pext_decl>(&ec.kind))
+            out.push_back(exn_sigitem(ck, ec.name.txt, *pd));
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       // A submodule `module Inner = struct ... end`: emit Sig_module so the
       // oracle can resolve `Outer.Inner.x` and so the submodule's runtime field

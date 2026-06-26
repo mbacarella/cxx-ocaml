@@ -931,9 +931,25 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // Sig_typext(id, extension_constructor, Text_exception, vis).  An exception
       // is an extension of the predefined `exn` type and TAKES a runtime field.
       auto path = o::vblock(0, {o::vblock(3, {o::vstr("exn"), o::vint(7)})});  // Pident(Predef exn)
-      std::vector<o::ValPtr> args;
-      if (!it.ctors.empty()) for (auto& a : it.ctors[0].args) args.push_back(te.emit(a));
-      auto cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
+      o::ValPtr cargs;
+      if (!it.ctors.empty() && !it.ctors[0].inline_record.empty()) {
+        // Cstr_record inline-record payload (`exception E of {l;..}`): emit the
+        // label_declarations so a consumer matching `M.E {l = ..}` resolves the
+        // labels (without this, ext_match bails and the whole match collapses).
+        int lstamp = 290;
+        std::vector<o::ValPtr> lds;
+        for (auto& l : it.ctors[0].inline_record) {
+          auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
+          lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
+                                      o::vint(0) /*ld_atomic Nonatomic*/, te.emit(l.ty),
+                                      loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
+        }
+        cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
+      } else {
+        std::vector<o::ValPtr> args;
+        if (!it.ctors.empty()) for (auto& a : it.ctors[0].args) args.push_back(te.emit(a));
+        cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
+      }
       auto extcon = o::vblock(0, {path, o::vint(0) /*ext_type_params []*/, cargs,
                                   o::vint(0) /*ext_ret_type None*/, o::vint(0) /*ext_private Public*/,
                                   loc_none(), o::vint(0) /*ext_attributes*/, o::vint(0) /*ext_uid*/});
