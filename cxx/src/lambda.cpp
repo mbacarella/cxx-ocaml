@@ -31,6 +31,14 @@ std::string lid_last(const Longident& x) {
   return "?";
 }
 
+// The outermost component of a path (`A.B.x` -> "A"); "" for an Lapply head.
+std::string lid_head(const Longident& x) {
+  const Longident* p = &x;
+  while (auto* d = std::get_if<Ldot>(&p->v)) p = d->prefix.get();
+  if (auto* l = std::get_if<Lident>(&p->v)) return l->name;
+  return "";
+}
+
 // ---- Oppen-style pretty-printer matching OCaml's Format (hov/hv boxes) ----
 // Doc = Text | Break(sep) | Box(type, offset, children).  An hov box packs
 // (fill-and-wrap, like @[<2>); an hv box is all-or-none (like @[<hv 1>); a break
@@ -1383,6 +1391,45 @@ struct Translator {
       auto v = mk(Lam::K::Var); v->var = i->second; return v;
     }
     return nullptr;
+  }
+  // Is the HEAD module of a path bound at all -- a local module/alias/functor
+  // param, an already-loaded cmi, or a `.cmi` findable on the include path?  When
+  // it is NOT, a qualified reference through it (`Lib.x`, `Lib.Make`) cannot be
+  // compiled and must be a hard error, not a silent `?`/`0` placeholder (the most
+  // common cause is a missing `-I` so the unit's `.cmi` isn't on the load path).
+  // Deliberately GENEROUS: any doubt resolves to "resolvable" so a valid compile
+  // is never turned into a spurious error -- only a genuinely-absent module fails.
+  bool module_head_resolvable(const std::string& head) {
+    if (head.empty()) return true;
+    // NB: NOT mod_fields.count -- fields_of() inserts the key even when the cmi
+    // failed to load (an empty layout), so it is true for an absent module too.
+    if (module_base(head) || module_layout_.count(head) ||
+        module_ident_.count(head) || module_alias_.count(head) ||
+        submod_alias_.count(head) || module_functor_src_.count(head))
+      return true;
+    for (const std::string& o : opened_)
+      if (o == head || o.rfind(head + ".", 0) == 0) return true;
+    if (!opened_submodule_path(head).empty()) return true;
+    // A SUBMODULE of the default-opened Stdlib (`LargeFile.seek_in` =
+    // Stdlib.LargeFile.seek_in) or of any explicitly-opened module is a real
+    // reference we may not fully lower yet -- a feature gap, NOT an unbound module.
+    if (fields_of("Stdlib").count(head)) return true;
+    for (const std::string& o : opened_)
+      if (o.find('.') == std::string::npos &&
+          (fields_of(o).count(head) || module_layout_[o].count(head)))
+        return true;
+    return std::filesystem::exists(resolve_cmi(head));
+  }
+  // A path resolution dead end: the head module is not bound anywhere.  Matches
+  // OCaml's `Unbound module` (which its type checker raises in Env BEFORE codegen)
+  // plus a hint, since the usual cause is the include path.
+  [[noreturn]] void unbound_module(const std::string& head, const std::string& full) {
+    std::string low = head.empty() ? head
+                    : std::string(1, (char)std::tolower((unsigned char)head[0])) + head.substr(1);
+    throw std::runtime_error(
+        "Unbound module " + head +
+        (full != head && !full.empty() ? " (referenced as " + full + ")" : "") +
+        ": cannot find " + low + ".cmi on the include path (is the -I path correct?)");
   }
   // Resolve a (possibly dotted) local module path to its base expression plus
   // the module_layout_ key holding its field layout; base is null when the
@@ -9385,6 +9432,15 @@ struct Translator {
           }
         }
       }
+      // A QUALIFIED value whose head module isn't bound anywhere is unbound, not a
+      // best-effort `?` (which would silently miscompile to a wrong slot at link).
+      if (std::holds_alternative<Ldot>(id->id.txt.v)) {
+        std::string head = lid_head(id->id.txt);
+        if (!module_head_resolvable(head)) {
+          std::string full; lid_to_dotted(id->id.txt, full);
+          unbound_module(head, full);
+        }
+      }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + lid_last(id->id.txt));  // unresolved (will DIFF)
       return v;
     }
@@ -11920,6 +11976,20 @@ struct Translator {
       LamPtr v = expr(*e); unpack_pkg_ = saved;
       return v;
     }
+    // A QUALIFIED module path (`Lib.Make`) that reached here projects into its head
+    // (`.Make`), so the head must resolve NOW; if it is bound nowhere this is
+    // unbound, not a `0` placeholder (which compiles `Lib.Make(arg)` to `(apply 0
+    // arg)` -> a wild call).  A BARE module ident (`module M = Stdlib__ArrayLabels`)
+    // is NOT flagged: it may be a forward-declared alias whose unit is linked later
+    // (the stdlib's `*Labels` aliases) -- it lowers to a global the linker resolves.
+    if (auto* pi = std::get_if<Pmod_ident>(&me.desc))
+      if (std::holds_alternative<Ldot>(pi->id.txt.v)) {
+        std::string head = lid_head(pi->id.txt);
+        if (!module_head_resolvable(head)) {
+          std::string full; lid_to_dotted(pi->id.txt, full);
+          unbound_module(head, full);
+        }
+      }
     return mk(Lam::K::ConstInt);  // other module exprs: best-effort
   }
   // The runtime field layout a module expression *produces*: a structure's

@@ -164,6 +164,11 @@ int main(int argc, char** argv) {
   } catch (const cppcaml::ParseError& e) {
     std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
     return 1;
+  } catch (const std::exception& e) {
+    // A compile-phase failure (e.g. Unbound module from path resolution): report
+    // it cleanly and exit non-zero instead of an uncaught-exception terminate.
+    std::cerr << "c++ocamlc: " << in_path << ": " << e.what() << '\n';
+    return 1;
   }
   if (compile_only) return 0;
 
