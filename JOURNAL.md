@@ -2798,3 +2798,56 @@ crash: GETFIELD1 on NULL in the Parser region -- next target. Gated green: lambd
 391, stdlib_full_allours, ocamllex_selfhost. Still open: qualified exn CONSTRUCT
 `M.E args` -> `?E` (construct path uses the bare name), and `#type`-FIRST mixed
 matches.
+
+================================================================================
+PLAN: REAL MODULE SYSTEM (Env + Includemod-style coercion) — 2026-06-26
+================================================================================
+THESIS RE-GROUNDED: the project proves an LLM can implement the OCaml COMPILER in
+C++ (the implementation LANGUAGE needn't have OCaml's features). The compiler we
+build must implement OCaml's REAL type/module system. The inferencer's best-effort
+`Any` was a productive shortcut (got us full stdlib self-host + ocamllex), but it
+is now the STRUCTURAL bottleneck: we don't COMPUTE module coercions, we RECONSTRUCT
+field layouts heuristically (lambda.cpp coerce_block over `vector<string>` name-
+lists from layout_vec/src_member_layout), so every non-trivial functor/include/
+ascription gets a fresh layout bug (the menhir MAKEBLOCK 15-vs-23, the deep-path
+modtype drop, the MAKEBLOCK-13 wrong-projection). Upstream never guesses: Include-
+mod.modtypes computes a VERIFIED module_coercion as a byproduct of subtyping, and
+translmod REPLAYS it (Tcoerce_structure = "result field N <- struct field M"); it
+cannot project a wrong slot. Decision (user, 2026-06-26): MODULE SYSTEM FIRST —
+build a real Env + Includemod-style coercion the back end replays; KEEP `Any` for
+value-type inference for now (retire later).
+
+KEY SEAM: lambda.cpp coerce_block(src_names, target_names, ...) (~line 1682) IS the
+Includemod machinery already, but (a) matches by NAME in a flat list (no value/
+module/type/exn NAMESPACE), (b) gets src/target as heuristic name-lists, and (c)
+BAILS to the raw (wrong) block when a target member isn't in the reconstructed src
+layout (line ~1689). Replace the heuristic layouts with REAL ordered+namespaced
+signatures so it never bails/guesses.
+
+PHASES (each gated: bootstrap ok=284, lambda 391 cpp-err 0, reject unchanged,
+stdlib_full_allours + ocamllex_selfhost green; new behavior validated vs the oracle
+via dumpobj/-dlambda):
+  P1. SUBSTRATE — a real ordered, namespaced Signature for an in-construction
+      struct/module-expr (values/modules/types/modtypes/exns, with each runtime-
+      field item carrying its source field index and, for a submodule, its nested
+      Signature). Derive it where build_module already computes layouts. Reuse
+      cmi::Signature for the cmi side. Add a real Env (scoped frames: name ->
+      module/value/type/modtype entry; module entry carries its resolved Signature)
+      built during translation. NO behavior change yet — just compute + assert it
+      matches today's layouts on the green corpus.
+  P2. COERCION — compute_coercion(src_sig, tgt_sig) -> Coercion {per target field:
+      src field index + optional sub-Coercion}, recursive + namespace-aware, an
+      ERROR (not a silent raw block) when a required member is absent (matches
+      Includemod). Route build_module's ascription/include/functor-result layout
+      through it, replacing coerce_block's name-list path. GATE on the menhir
+      submodule MAKEBLOCKs matching the oracle and the bootstrap `-c` crash going
+      away.
+  P3. PATH RESOLUTION via Env — make Env lookup the single source of module/value
+      path resolution; `Unbound` falls out of lookup failure (retires UPDATE-70's
+      module_head_resolvable + the fail-fast hack, and the lambda `?`/ConstInt
+      fallbacks). 
+  P4. (LATER) real principal-types HM to retire value-level `Any`.
+
+VALIDATION ADDITIONS: a coercion unit test (c++ harness) checking compute_coercion
+against the oracle's Tcoerce on small hand-built cases; keep the differential
+dumpobj diff (our parser.cmo vs in-tree parsing/parser.cmo) as the menhir gate.

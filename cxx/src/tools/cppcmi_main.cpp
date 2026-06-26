@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <vector>
 
@@ -119,6 +120,27 @@ int main(int argc, char** argv) {
                  "       %s file.cmi NAME         (one value's type)\n",
                  argv[0], argv[0], argv[0]);
     return 2;
+  }
+  // `c++cmi src.cmi --coerce tgt.cmi`: print the Includemod-style coercion that
+  // builds tgt's signature from src's runtime block (validates compute_coercion).
+  if (argc >= 4 && std::string(argv[2]) == "--coerce") {
+    try {
+      cmi::CmiFile s = cmi::CmiFile::load(argv[1]);
+      cmi::CmiFile t = cmi::CmiFile::load(argv[3]);
+      std::function<void(const cmi::ModCoercion&, int)> dump =
+          [&](const cmi::ModCoercion& c, int ind) {
+            std::string pad(ind * 2, ' ');
+            if (!c.ok) { std::printf("%sMISMATCH at %s\n", pad.c_str(), c.error.c_str()); return; }
+            if (c.identity) { std::printf("%s<identity>\n", pad.c_str()); return; }
+            for (size_t i = 0; i < c.fields.size(); ++i) {
+              std::printf("%starget[%zu] <- src field %d%s\n", pad.c_str(), i,
+                          c.fields[i].src_field, c.fields[i].sub ? " {" : "");
+              if (c.fields[i].sub) { dump(*c.fields[i].sub, ind + 1); std::printf("%s}\n", pad.c_str()); }
+            }
+          };
+      dump(cmi::compute_coercion(s.sig(), t.sig()), 0);
+    } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
+    return 0;
   }
   if (argc >= 3) {
     return typed_mode(argv[1], argv[2]);

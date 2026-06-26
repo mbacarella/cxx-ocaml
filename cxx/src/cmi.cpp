@@ -459,6 +459,58 @@ const ModuleDecl* CmiFile::find_module(const std::string& name) const {
 }
 
 namespace {
+// The namespace a runtime field belongs to, recovered from the grouped signature:
+// 1 = submodule, 2 = exception (a typext of the predef `exn`), 0 = value.  -1 if
+// the name is AMBIGUOUS across namespaces (a `val x` and a `module x` both take a
+// field) -- the bare `fields` list can't disambiguate two same-named fields, so
+// the caller bails to keep today's behavior (a rare case; the substrate gains a
+// per-field namespace later).  3 = none (shouldn't appear in `fields`).
+int field_ns(const Signature& s, const std::string& name) {
+  int hits = 0, ns = 3;
+  for (auto& m : s.modules) if (m.name == name) { ns = 1; ++hits; break; }
+  for (auto& x : s.typexts) if (x.name == name) { if (ns != 1) ns = 2; ++hits; break; }
+  for (auto& v : s.values) if (v.name == name && v.prim.empty()) { if (ns == 3) ns = 0; ++hits; break; }
+  return hits > 1 ? -1 : ns;
+}
+// The inline signature of a submodule field, if its module type is a plain Sig.
+const Signature* submodule_signature(const Signature& s, const std::string& name) {
+  for (auto& m : s.modules)
+    if (m.name == name && m.type && m.type->kind == ModuleType::Sig && m.type->sig)
+      return m.type->sig.get();
+  return nullptr;
+}
+}  // namespace
+
+ModCoercion compute_coercion(const Signature& src, const Signature& tgt) {
+  ModCoercion c;
+  c.fields.reserve(tgt.fields.size());
+  for (const std::string& tn : tgt.fields) {
+    int tns = field_ns(tgt, tn);
+    if (tns < 0 || tns == 3) { c.ok = false; c.error = tn; return c; }  // ambiguous/none
+    int sidx = -1;
+    for (int si = 0; si < (int)src.fields.size(); ++si)
+      if (src.fields[si] == tn && field_ns(src, src.fields[si]) == tns) { sidx = si; break; }
+    if (sidx < 0) { c.ok = false; c.error = tn; return c; }  // member absent in source
+    ModCoercion::Field f;
+    f.src_field = sidx;
+    if (tns == 1) {  // a submodule: coerce it recursively when both sides have a Sig
+      const Signature* ssub = submodule_signature(src, tn);
+      const Signature* tsub = submodule_signature(tgt, tn);
+      if (ssub && tsub) {
+        ModCoercion sub = compute_coercion(*ssub, *tsub);
+        if (!sub.ok) { c.ok = false; c.error = tn + "." + sub.error; return c; }
+        if (!sub.identity) f.sub = std::make_shared<ModCoercion>(std::move(sub));
+      }
+    }
+    c.fields.push_back(std::move(f));
+  }
+  c.identity = c.fields.size() == src.fields.size();
+  for (size_t i = 0; i < c.fields.size() && c.identity; ++i)
+    if (c.fields[i].src_field != (int)i || c.fields[i].sub) c.identity = false;
+  return c;
+}
+
+namespace {
 
 const TypeExpr* follow(const TypeExpr* t) {
   while (t && (t->kind == TypeExpr::Tlink || t->kind == TypeExpr::Tsubst) && t->link)

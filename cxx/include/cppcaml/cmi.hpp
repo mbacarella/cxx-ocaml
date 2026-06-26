@@ -155,6 +155,27 @@ struct Signature {
   std::vector<std::string> fields;
 };
 
+// A computed module coercion, Includemod-style: how to build a value of the
+// TARGET signature from the SOURCE module's runtime block.  The back end REPLAYS
+// this (target field i <- source field `fields[i].src_field`, recursively coercing
+// a submodule through `sub`) instead of reconstructing field layouts heuristically
+// -- so it can never project a wrong/absent slot.  `ok` is false (with `error`
+// naming the offending member) when the source does not match the signature, i.e.
+// an OCaml signature mismatch.
+struct ModCoercion {
+  struct Field {
+    int src_field = -1;                // index in the SOURCE runtime block
+    std::shared_ptr<ModCoercion> sub;  // null = identity; else coerce this submodule
+  };
+  std::vector<Field> fields;  // one per TARGET runtime field, in target order
+  bool identity = false;      // source already matches target field-for-field
+  bool ok = true;             // false => a required member was absent / ambiguous
+  std::string error;          // the offending member path (when !ok)
+};
+// Match `src` against `tgt` by (namespace, name), recursively for submodules,
+// yielding the position mapping.  Pure: depends only on the two signatures.
+ModCoercion compute_coercion(const Signature& src, const Signature& tgt);
+
 // A loaded .cmi: owns the decoded signature and exposes its bindings.
 // Type graphs are decoded on demand.
 class CmiFile {
