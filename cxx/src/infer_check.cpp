@@ -3233,6 +3233,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
         out.push_back(cmi::cmiw::sig_module(*mb->binding.name.txt, infer_signature(ms->items)));
     }
   }
+  // Canonical shadowing dedup: a name bound twice at top level (e.g. ocamllex's
+  // rule `token` then a hand-written wrapper `token` in lexer.ml's trailer) keeps
+  // only its LAST occurrence, at that position -- exactly as the .cmo block layout
+  // (sig_layout / register_sig_layouts) dedups.  Without this the inferred .cmi
+  // carries BOTH, so its field index for the survivor is one slot too high and an
+  // external `Lexer.token` reads the wrong block field (a closure where a token is
+  // expected -> a SWITCH past its table -> heap corruption).  The explicit-.mli
+  // path (signature_to_cmi) already dedups identically.
+  out = cmi::cmiw::dedup_shadowed_fields(std::move(out));
   return out;
 }
 
