@@ -2768,3 +2768,33 @@ externals are usable: to_string/not(%boolnot)/compare -> true/false/1.
 exec 99.7% (flaky), completeness 100%, no regression.  NEXT: qualified Pdot
 types in signatures (value of type OtherMod.t), then push more stdlib modules
 through (records/variants/externals all supported now) toward a real bootstrap.
+
+## Bootstrap `-c` crash: includemod error-printer collapse FIXED (2026-06-25/26)
+
+The bootstrapped `ocamlc -c` SIGSEGV'd on every non-empty structure item (`let
+x=1`, `type t=A|B`, even a `.mli` with content) -- only truly-empty compiled. The
+crash is TYPING-phase: Maindriver catches an exception, Location.report_exception
+-> the includemod error printer's 6-arg recursive `module_type ~..~ diff` reads
+field 2 of garbage (the recurring accu=0x200000890).
+
+Root cause: `Includemod_errorprinter.register` does `register_error_of_exn
+(function Includemod.Error err -> .. | Includemod.Apply_error {loc;env;..} -> ..
+| _ -> None)`. `Apply_error {..}` is a qualified imported exception with an
+INLINE-RECORD payload, and our cmi writer always wrote an exception's args as
+Cstr_tuple -- dropping the labels. Read back as a tuple, `exn_inline_labels` was
+empty, `ext_match` bailed on that arm, and the WHOLE match collapsed to its first
+arm with `err` unbound -> every reported exception fed garbage to the printer.
+
+Fix (commit 7894330160): emit Cstr_record for inline-record exceptions in both
+the `.mli` path (Psig_exception/Psig_typext) and the `.ml`-inferred path
+(`infer_signature` had no Pstr_exception/Pstr_typext case at all), via a shared
+`exn_sigitem` + `cmiw::sig_exception_record`. Also commit 6bc0831a67: a trailing
+`#type [as id]` polymorphic-variant pattern is now bound as the match residual
+(cut matching.ml `?`-markers 7->3, parmatch 15->6).
+
+The 0x200000890 crash is gone (verified: the register fn now compiles to a correct
+`(== (field 0 exn) Includemod.Error_id)` dispatch). Cascade advanced to a separate
+crash: GETFIELD1 on NULL in the Parser region -- next target. Gated green: lambda
+391, stdlib_full_allours, ocamllex_selfhost. Still open: qualified exn CONSTRUCT
+`M.E args` -> `?E` (construct path uses the bare name), and `#type`-FIRST mixed
+matches.
