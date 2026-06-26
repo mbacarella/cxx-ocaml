@@ -2991,26 +2991,56 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       [&](const ast::ModuleType& mt0) -> std::vector<cmi::cmiw::SigItem> {
     const ast::ModuleType* mt = &mt0;
     while (auto* pw = std::get_if<Pmty_with>(&mt->desc)) mt = pw->mt.get();
-    if (auto* pi = std::get_if<Pmty_ident>(&mt->desc))
-      if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
-        if (auto* l = std::get_if<Lident>(&d->prefix->v)) {
-          // The head may be a LOCAL submodule (`IncrementalEngine.INCREMENTAL_ENGINE`
-          // where IncrementalEngine is a sibling, not a separate cmi): find its
-          // module-type decl in the threaded module signatures and emit its items.
-          if (auto f = module_sigs.find(l->name); f != module_sigs.end())
-            for (auto& mit : *f->second)
-              if (auto* pmt = std::get_if<Psig_modtype>(&mit.desc))
-                if (pmt->name.txt == d->name && pmt->type)
-                  if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
-                    return signature_to_cmi(ps->items, &modtypes, &module_sigs);
-          try {
-            auto cmi = cmi::CmiFile::load(head_cmi(l->name));
-            for (auto& md : cmi.sig().modtypes)
-              if (md.name == d->name && md.type &&
-                  md.type->kind == cmi::ModuleType::Sig && md.type->sig)
-                return cmi_sig_to_items(*md.type->sig);
-          } catch (...) {}
-        }
+    auto* pi = std::get_if<Pmty_ident>(&mt->desc);
+    if (!pi) return {};
+    // Flatten the modtype path `A.B...MT` into components (outermost first); the
+    // last is the module-type name, the rest is the module path to navigate.
+    std::vector<std::string> comps;
+    std::function<bool(const ast::Longident*)> flat =
+        [&](const ast::Longident* lid) -> bool {
+      if (auto* l = std::get_if<Lident>(&lid->v)) { comps.push_back(l->name); return true; }
+      if (auto* dd = std::get_if<Ldot>(&lid->v)) {
+        if (!flat(dd->prefix.get())) return false;
+        comps.push_back(dd->name); return true;
+      }
+      return false;  // Lapply: unsupported
+    };
+    if (!flat(&pi->id.txt) || comps.size() < 2) return {};
+    const std::string& mtname = comps.back();
+    // The head may be a LOCAL submodule (`IncrementalEngine.INCREMENTAL_ENGINE`
+    // where IncrementalEngine is a sibling, not a separate cmi): find its
+    // module-type decl in the threaded module signatures and emit its items.
+    if (comps.size() == 2)
+      if (auto f = module_sigs.find(comps[0]); f != module_sigs.end())
+        for (auto& mit : *f->second)
+          if (auto* pmt = std::get_if<Psig_modtype>(&mit.desc))
+            if (pmt->name.txt == mtname && pmt->type)
+              if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
+                return signature_to_cmi(ps->items, &modtypes, &module_sigs);
+    // Cross-module, possibly DEEP (`CamlinternalMenhirLib.IncrementalEngine.
+    // INCREMENTAL_ENGINE`): load the head cmi, navigate intermediate submodules,
+    // then read the module-type's signature.  Previously only a single-component
+    // prefix (`A.MT`) resolved -- a deeper prefix was a `Ldot`, not a `Lident`,
+    // so the whole `include` was dropped (the parser's MenhirInterpreter lost the
+    // 23 INCREMENTAL_ENGINE values -> a short module block -> a wild call at parse).
+    try {
+      auto cmi = cmi::CmiFile::load(head_cmi(comps[0]));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t i = 1; i + 1 < comps.size(); ++i) {  // walk submodules
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comps[i] && md.type &&
+              md.type->kind == cmi::ModuleType::Sig && md.type->sig) {
+            next = md.type->sig.get(); break;
+          }
+        if (!next) return {};
+        sig = next;
+      }
+      for (auto& md : sig->modtypes)
+        if (md.name == mtname && md.type &&
+            md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+          return cmi_sig_to_items(*md.type->sig);
+    } catch (...) {}
     return {};
   };
   std::vector<cmi::cmiw::SigItem> out;
