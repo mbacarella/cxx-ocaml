@@ -1865,9 +1865,19 @@ struct Translator {
         // splices them (equal/hash/compare) -- otherwise the result block is short
         // and a consumer's `include M` reads out of bounds -> GC segfault.
         const ModuleType* im = &pin->mt;
-        if (auto* ii = std::get_if<Pmty_ident>(&im->desc))
-          if (auto a = modtype_ast_.find(lid_last(ii->id.txt)); a != modtype_ast_.end())
-            im = a->second;
+        if (auto* ii = std::get_if<Pmty_ident>(&im->desc)) {
+          // Resolve a QUALIFIED modtype include (`IncrementalEngine.INCREMENTAL_
+          // ENGINE`) by its DOTTED path first.  The bare last-name picks a SIBLING
+          // submodule's same-named modtype (the top-level INCREMENTAL_ENGINE) whose
+          // field ORDER differs -> the .cmo layout drifts from the .cmi (ENGINE
+          // off-by-one -> the menhir wild-jump crash).
+          std::string dotted;
+          if (lid_to_dotted(ii->id.txt, dotted))
+            if (auto a = modtype_ast_.find(dotted); a != modtype_ast_.end()) im = a->second;
+          if (im == &pin->mt)
+            if (auto a = modtype_ast_.find(lid_last(ii->id.txt)); a != modtype_ast_.end())
+              im = a->second;
+        }
         for (auto& n : sig_layout(*im)) names.push_back(n);
       }
     }
@@ -11292,6 +11302,13 @@ struct Translator {
     }
     const ModuleType& mt = *mtp;
     if (auto* pi = std::get_if<Pmty_ident>(&mt.desc)) {  // a named module type S
+      // The FULL dotted path first: `IncrementalEngine.INCREMENTAL_ENGINE` and a
+      // sibling/top-level `INCREMENTAL_ENGINE` share a last name but differ in field
+      // ORDER -- the bare last-name lookup picked the wrong one, so ENGINE's layout
+      // came out one slot off and the .cmo drifted from the .cmi (menhir wild jump).
+      std::string dotted;
+      if (lid_to_dotted(pi->id.txt, dotted) && dotted.find('.') != std::string::npos)
+        if (auto it = modtype_layout_.find(dotted); it != modtype_layout_.end()) return it->second;
       auto it = modtype_layout_.find(lid_last(pi->id.txt));
       if (it != modtype_layout_.end()) return it->second;
       // a stdlib module's named module type (`Digest.S`): its cmi modtype decl
@@ -12270,14 +12287,20 @@ struct Translator {
       }
       if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {  // module type S = mty (no slot)
         if (pmt->type) {
-          modtype_layout_[pmt->name.txt] = sig_layout(*pmt->type);
+          auto lay = sig_layout(*pmt->type);
+          modtype_layout_[pmt->name.txt] = lay;
           modtype_ast_[pmt->name.txt] = &*pmt->type;
           // Also register under the unit-relative dotted path so a cross-submodule
-          // qualified reference (`TableFormat.TABLES`) disambiguates a shared name.
+          // qualified reference (`TableFormat.TABLES`, `IncrementalEngine.
+          // INCREMENTAL_ENGINE`) disambiguates a name SHARED with a sibling/top-level
+          // modtype -- the bare last-name picks the wrong one (different field order).
           std::string rel = mod_path_;
           size_t fd = rel.find('.');
           rel = (fd == std::string::npos) ? "" : rel.substr(fd + 1);
-          if (!rel.empty()) modtype_ast_[rel + "." + pmt->name.txt] = &*pmt->type;
+          if (!rel.empty()) {
+            modtype_ast_[rel + "." + pmt->name.txt] = &*pmt->type;
+            modtype_layout_[rel + "." + pmt->name.txt] = std::move(lay);
+          }
         }
         continue;
       }
