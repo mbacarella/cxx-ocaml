@@ -5161,6 +5161,17 @@ struct Translator {
           continue;
         }
         ok = false;
+      } else if (auto* kc = std::get_if<Ppat_construct>(&fp->desc);
+                 kc && !kc->arg && tests) {
+        // a nullary VARIANT constructor payload (`Error (Unterminated_string, x)`,
+        // lexer.ml): an integer test on the field against its constant-ctor index.
+        // Without this the whole `with`-arm was dropped to a bare reraise.
+        auto ci = ctor_info_.find(ctor_of(*fp));
+        if (ci != ctor_info_.end() && !ci->second.is_block) {
+          tests->push_back({j + 1, cint(ci->second.tag), false});
+          continue;
+        }
+        ok = false;
       } else if (auto* pc = std::get_if<Ppat_constant>(&fp->desc); pc && tests) {
         // constant payload (`Ex "!!!!!"`, `Code 42`): value test on the field
         if (auto* ps = std::get_if<Pconst_string>(&pc->c.desc)) {
