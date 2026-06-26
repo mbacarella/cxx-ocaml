@@ -38,6 +38,7 @@
 #include "caml/globroots.h"
 #include "caml/startup.h"
 #include "caml/startup_aux.h"
+#include "caml/cppcaml_debug.h"
 
 /* Registers for the abstract machine:
         pc         the code pointer
@@ -296,6 +297,8 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
   if (prog == NULL) {           /* Interpreter is initializing */
     static opcode_t raise_unhandled_effect_code[] = { ACC, 0, RAISE };
     value raise_unhandled_effect_closure;
+
+    caml_cppcaml_debug_init();   /* c++caml: arm the field-read crash dump */
 
     caml_register_code_fragment(
       (char *) raise_unhandled_effect_code,
@@ -825,14 +828,19 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
 /* Access to components of blocks */
 
     Instruct(GETFIELD0):
+      Cppcaml_field_read(pc - 1, accu, sp, 0);
       accu = Field(accu, 0); Next;
     Instruct(GETFIELD1):
+      Cppcaml_field_read(pc - 1, accu, sp, 1);
       accu = Field(accu, 1); Next;
     Instruct(GETFIELD2):
+      Cppcaml_field_read(pc - 1, accu, sp, 2);
       accu = Field(accu, 2); Next;
     Instruct(GETFIELD3):
+      Cppcaml_field_read(pc - 1, accu, sp, 3);
       accu = Field(accu, 3); Next;
     Instruct(GETFIELD):
+      Cppcaml_field_read(pc - 1, accu, sp, (int)*pc);
       accu = Field(accu, *pc); pc++; Next;
     Instruct(GETFLOATFIELD): {
       double d = Double_flat_field(accu, *pc++);

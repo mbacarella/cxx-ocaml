@@ -10111,7 +10111,7 @@ ocamltest/actions_helpers.cmx : \
     ocamltest/test_result.cmx \
     ocamltest/strace.cmx \
     ocamltest/run_command.cmx \
-    ocamltest/ocamltest_unix.cmx \
+    ocamltest/ocamltest_unix.cmi \
     ocamltest/ocamltest_stdlib.cmx \
     ocamltest/modifier_parser.cmx \
     ocamltest/filecompare.cmx \
@@ -10136,7 +10136,7 @@ ocamltest/builtin_actions.cmo : \
     ocamltest/builtin_actions.cmi
 ocamltest/builtin_actions.cmx : \
     ocamltest/test_result.cmx \
-    ocamltest/ocamltest_unix.cmx \
+    ocamltest/ocamltest_unix.cmi \
     ocamltest/ocamltest_stdlib.cmx \
     ocamltest/ocamltest_config.cmx \
     ocamltest/environments.cmx \
@@ -10251,7 +10251,7 @@ ocamltest/main.cmx : \
     ocamltest/tsl_ast.cmx \
     ocamltest/tests.cmx \
     ocamltest/options.cmx \
-    ocamltest/ocamltest_unix.cmx \
+    ocamltest/ocamltest_unix.cmi \
     ocamltest/ocamltest_stdlib.cmx \
     ocamltest/ocaml_actions.cmx \
     parsing/location.cmx \
@@ -10505,7 +10505,7 @@ ocamltest/ocamltest_stdlib.cmo : \
     utils/misc.cmi \
     ocamltest/ocamltest_stdlib.cmi
 ocamltest/ocamltest_stdlib.cmx : \
-    ocamltest/ocamltest_unix.cmx \
+    ocamltest/ocamltest_unix.cmi \
     ocamltest/ocamltest_config.cmx \
     utils/misc.cmx \
     ocamltest/ocamltest_stdlib.cmi

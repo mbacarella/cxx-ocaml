@@ -227,11 +227,16 @@ void link_executable(const std::vector<std::string>& inputs,
       if (!fi->archive || ui->force_link || missing.count(ui->name)) take(*ui);
 
   // Pass 2 -- resolve relocations of the selected units, in original link order,
-  // and concatenate their code.
+  // and concatenate their code.  Alongside, record each unit's start (in code
+  // WORDS) and name into a `<output>.linkmap` sidecar, so a runtime crash dump
+  // (CPPCAML_FIELDTRACE) can map a bytecode offset back to a module + offset; see
+  // tools/cppcaml-resolve.sh.
   std::vector<std::uint8_t> code;
+  std::string linkmap;
   for (InputFile& f : files) {
     for (Unit& u : f.units) {
       if (!u.selected) continue;
+      linkmap += std::to_string(code.size() / 4) + " " + u.name + "\n";
       for (const Reloc& r : u.relocs) {
         int n = 0;
         switch (r.k) {
@@ -282,6 +287,10 @@ void link_executable(const std::vector<std::string>& inputs,
   std::ofstream f(out_path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot write " + out_path);
   f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)out.size());
+
+  // The module map sidecar (best-effort; a failure to write it is non-fatal).
+  std::ofstream lm(out_path + ".linkmap");
+  if (lm) lm << linkmap;
 }
 
 }  // namespace cppcaml::link
