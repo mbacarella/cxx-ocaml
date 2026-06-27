@@ -9082,10 +9082,31 @@ struct Translator {
       if (auto it = vk.expr_constr.find(fe->e.get()); it != vk.expr_constr.end()) {
         const std::string& p = it->second;
         auto dpos = p.rfind('.');
-        if (dpos != std::string::npos && p.find('.') == dpos)
-          if (auto sr = stdlib_record_layout_named(p.substr(0, dpos), p.substr(dpos + 1)))
+        std::string lbl = lid_last(fe->field.txt);
+        if (dpos != std::string::npos && p.find('.') == dpos) {
+          std::string mod = p.substr(0, dpos), ty = p.substr(dpos + 1);
+          // A LOCAL nested-module record (`module Measure = struct type t = {..}`;
+          // `(m : Measure.t).allocated_words`): the same collision but the type has
+          // no cmi, so resolve via the nested record registered under this module.
+          if (auto mr = mod_record_types_.find(mod); mr != mod_record_types_.end())
+            for (auto& key : mr->second)
+              if (key == ty ||
+                  (key.size() > ty.size() + 1 && key.compare(0, ty.size(), ty) == 0 &&
+                   key[ty.size()] == '#'))
+                if (auto tf = type_field_info_.find(key); tf != type_field_info_.end())
+                  if (auto fi = tf->second.find(lbl); fi != tf->second.end()) {
+                    auto l = mk(Lam::K::Prim);
+                    auto rt = rec_types_.find(key);
+                    l->prim = (rt != rec_types_.end() && rt->second.flat) ? Prim::Floatfield
+                              : fi->second.kind == ValueKind::Int ? Prim::FieldInt
+                              : fi->second.mut                    ? Prim::FieldMut
+                                                                  : Prim::FieldImm;
+                    l->prim_arg = fi->second.index; l->args = {expr(*fe->e)};
+                    return l;
+                  }
+          if (auto sr = stdlib_record_layout_named(mod, ty))
             for (size_t i = 0; i < sr->labels.size(); ++i)
-              if (sr->labels[i] == lid_last(fe->field.txt)) {
+              if (sr->labels[i] == lbl) {
                 auto l = mk(Lam::K::Prim);
                 l->prim = sr->flat                         ? Prim::Floatfield
                           : sr->shape[i] == ValueKind::Int ? Prim::FieldInt
@@ -9094,6 +9115,7 @@ struct Translator {
                 l->prim_arg = (int)i; l->args = {expr(*fe->e)};
                 return l;
               }
+        }
       }
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
