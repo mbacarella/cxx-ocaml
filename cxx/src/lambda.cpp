@@ -812,6 +812,11 @@ struct Translator {
   struct FieldInfo { std::string type; int index; bool mut; ValueKind kind; };
   std::unordered_map<std::string, FieldInfo> field_info_;
   std::set<std::string> ambiguous_fields_;
+  // A record label -> the module-qualified ("Module.type") variant type of its VALUE,
+  // for a field whose type is a constructor of a (single-component-qualified) module.
+  // Lets a bare unresolved ctor field value (`{ vb_rec_kind = Dynamic }`, Dynamic's
+  // module Value_rec_types un-opened) be resolved by type direction at construction.
+  std::unordered_map<std::string, std::string> field_value_ctor_type_;
   // Per-type record fields + the labels source-order scoping has resolved at the
   // current point (so find_field uses the in-scope type's field despite the
   // label being ambiguous overall) -- the record analogue of the constructor
@@ -2361,6 +2366,11 @@ struct Translator {
             // labels, which would drop the field read to 0).
             if (!ambiguous_fields_.count(td.labels[j].name))
               field_info_[td.labels[j].name] = {td.name, j, m, k};
+            // Capture the field's value type when it is a constructor of a single-
+            // component-qualified module (`vb_rec_kind : Value_rec_types.recursive_
+            // binding_kind`), so a bare ctor written for it resolves by type direction.
+            if (auto p = field_ctor_type_path(td.labels[j].type); !p.empty())
+              field_value_ctor_type_[td.labels[j].name] = std::move(p);
           }
           // Register the layout for by-field-set CONSTRUCTION lookups.  On a
           // short type-name collision (Parsetree.expression vs
@@ -3142,6 +3152,18 @@ struct Translator {
         (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt || l->prim == Prim::FieldMut))
       return is_global_path(l->args[0]);
     return false;
+  }
+  // The module-qualified type path ("Module.type") of a cmi field type that is a
+  // constructor application headed by a `Module.type` Pdot path whose prefix is a
+  // single module component; "" otherwise (a builtin, a bare-local type, or a
+  // nested-module path register_ctors_of_type cannot use anyway).
+  static std::string field_ctor_type_path(const cmi::TypePtr& t0) {
+    cmi::TypePtr t = t0;
+    while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst)) t = t->link;
+    if (!t || t->kind != cmi::TypeExpr::Tconstr || !t->path) return {};
+    const cmi::Path& p = *t->path;
+    if (p.kind != cmi::Path::Pdot || !p.a || p.a->kind != cmi::Path::Pident) return {};
+    return p.a->id.name + "." + p.s;
   }
   // The value kind of a cmi field type (int/char/bool/unit -> int, float ->
   // float, everything else -> generic/boxed), for spelling its field read.
@@ -8920,6 +8942,15 @@ struct Translator {
           for (auto& [lid, ve] : rc->fields) {
             int ix = index_of(lid_last(lid.txt));
             if (ix < 0 || vals[ix]) { ok = false; break; }
+            // A bare unresolved ctor field value whose field type is a qualified
+            // variant (`{ vb_rec_kind = Dynamic }`, Value_rec_types un-opened):
+            // register that type's ctors first so it lowers to a tag, not `?Dynamic`.
+            if (auto* kc = std::get_if<Pexp_construct>(&ve->desc))
+              if (std::holds_alternative<Lident>(kc->id.txt.v) &&
+                  !ctor_info_.count(lid_last(kc->id.txt)))
+                if (auto fc = field_value_ctor_type_.find(lid_last(lid.txt));
+                    fc != field_value_ctor_type_.end())
+                  register_ctors_of_type(fc->second);
             vals[ix] = expr(*ve);
           }
           if (ok) {
