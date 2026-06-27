@@ -9073,6 +9073,28 @@ struct Translator {
         l->prim_arg = it->second.index; l->args = {expr(*fe->e)};
         return l;
       }
+      // The base's INFERRED module-qualified record type disambiguates a label
+      // shared across opened records: `vd1 : Types.value_description` then
+      // `vd1.val_loc`, where `open Types; open Typedtree` both define a
+      // value_description with `val_loc`/`val_attributes` at DIFFERENT offsets --
+      // the bare find_field below takes the last-opened (Typedtree) offset and
+      // reads the wrong (here out-of-bounds) field of a Types.value_description.
+      if (auto it = vk.expr_constr.find(fe->e.get()); it != vk.expr_constr.end()) {
+        const std::string& p = it->second;
+        auto dpos = p.rfind('.');
+        if (dpos != std::string::npos && p.find('.') == dpos)
+          if (auto sr = stdlib_record_layout_named(p.substr(0, dpos), p.substr(dpos + 1)))
+            for (size_t i = 0; i < sr->labels.size(); ++i)
+              if (sr->labels[i] == lid_last(fe->field.txt)) {
+                auto l = mk(Lam::K::Prim);
+                l->prim = sr->flat                         ? Prim::Floatfield
+                          : sr->shape[i] == ValueKind::Int ? Prim::FieldInt
+                          : sr->mut[i]                     ? Prim::FieldMut
+                                                           : Prim::FieldImm;
+                l->prim_arg = (int)i; l->args = {expr(*fe->e)};
+                return l;
+              }
+      }
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);
