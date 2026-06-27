@@ -26,6 +26,30 @@ static struct cppcaml_entry cppcaml_ring[CPPCAML_RING];
 static unsigned cppcaml_pos = 0;
 static int cppcaml_installed = 0;
 
+struct cppcaml_apply_entry { long call_off; value accu; long code_off; int nargs; };
+static struct cppcaml_apply_entry cppcaml_aring[CPPCAML_RING];
+static unsigned cppcaml_apos = 0;
+
+void caml_cppcaml_apply(code_t call_pc, value accu, int nargs)
+{
+  unsigned i = cppcaml_apos & (CPPCAML_RING - 1);
+  cppcaml_aring[i].call_off = (long)(call_pc - caml_start_code);
+  cppcaml_aring[i].accu = accu;
+  cppcaml_aring[i].nargs = nargs;
+  cppcaml_aring[i].code_off = -2;   /* "not computed" until the deref below */
+  cppcaml_apos++;
+  /* Deref Code_val LAST: a wild accu faults here exactly as the APPLY would,
+     but the entry (accu, call site) is already recorded for the dump. */
+  if (accu != 0 && (accu & 1) == 0) {
+    code_t cp = (code_t)Field(accu, 0);
+    if (cp >= caml_start_code &&
+        (value)cp < (value)caml_start_code + caml_code_size)
+      cppcaml_aring[i].code_off = (long)(cp - caml_start_code);
+    else
+      cppcaml_aring[i].code_off = -1;   /* not a code pointer: a non-closure call */
+  }
+}
+
 void caml_cppcaml_field_read(code_t opcode_pc, value accu, value *sp, value env,
                              int field)
 {
@@ -104,6 +128,20 @@ static void cppcaml_segv(int sig)
     put(" field="); put_long(e->field);
     put(" accu="); dump_accu(e->accu); put("\n");
   }
+  /* The recently-entered functions: the most recent apply is the call that
+     entered the crashing function; fn@ is its callee entry (Code_val).  fn@-1 =
+     a NON-closure was called; a clean chain ending at the crash function's entry
+     means the function was entered correctly (so the corruption is in its data,
+     not the call). */
+  put("--- recent applies (most recent first): call_site -> fn@entry (closure) ---\n");
+  for (unsigned k = 0; k < 16 && k < cppcaml_apos; k++) {
+    struct cppcaml_apply_entry *e =
+      &cppcaml_aring[(cppcaml_apos - 1 - k) & (CPPCAML_RING - 1)];
+    put("  apply call="); put_long(e->call_off);
+    put(" -> fn@"); put_long(e->code_off);
+    put(" nargs="); put_long(e->nargs);
+    put(" closure="); dump_accu(e->accu); put("\n");
+  }
   /* A bytecode backtrace from the most recent read's stack pointer: stack slots
      that point into the code segment are saved return addresses. */
   if (cppcaml_pos > 0) {
@@ -138,6 +176,7 @@ void caml_cppcaml_debug_init(void)
   caml_cppcaml_fieldtrace = getenv("CPPCAML_FIELDTRACE") != NULL;
   if (caml_cppcaml_fieldtrace) {
     memset(cppcaml_ring, 0, sizeof cppcaml_ring);
+    memset(cppcaml_aring, 0, sizeof cppcaml_aring);
     signal(SIGSEGV, cppcaml_segv);
   }
 }

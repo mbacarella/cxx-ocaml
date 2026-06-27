@@ -476,12 +476,14 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       Next;
     }
     Instruct(APPLY): {
+      Cppcaml_apply(pc - 1, accu, *pc);
       extra_args = *pc - 1;
       pc = Code_val(accu);
       env = accu;
       goto check_stacks;
     }
     Instruct(APPLY1): {
+      Cppcaml_apply(pc - 1, accu, 1);
       value arg1 = sp[0];
       sp -= 3;
       sp[0] = arg1;
@@ -494,6 +496,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPLY2): {
+      Cppcaml_apply(pc - 1, accu, 2);
       value arg1 = sp[0];
       value arg2 = sp[1];
       sp -= 3;
@@ -508,6 +511,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPLY3): {
+      Cppcaml_apply(pc - 1, accu, 3);
       value arg1 = sp[0];
       value arg2 = sp[1];
       value arg3 = sp[2];
@@ -526,6 +530,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
 
     Instruct(APPTERM): {
       int nargs = *pc++;
+      Cppcaml_apply(pc - 2, accu, nargs);
       int slotsize = *pc;
       value * newsp;
       /* Slide the nargs bottom words of the current frame to the top
@@ -539,6 +544,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPTERM1): {
+      Cppcaml_apply(pc - 1, accu, 1);
       value arg1 = sp[0];
       sp = sp + *pc - 1;
       sp[0] = arg1;
@@ -547,6 +553,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPTERM2): {
+      Cppcaml_apply(pc - 1, accu, 2);
       value arg1 = sp[0];
       value arg2 = sp[1];
       sp = sp + *pc - 2;
@@ -558,6 +565,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPTERM3): {
+      Cppcaml_apply(pc - 1, accu, 3);
       value arg1 = sp[0];
       value arg2 = sp[1];
       value arg3 = sp[2];

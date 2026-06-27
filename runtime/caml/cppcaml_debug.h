@@ -50,5 +50,17 @@ void caml_cppcaml_field_read(code_t opcode_pc, value accu, value *sp, value env,
          caml_cppcaml_field_read((opcode_pc), (accu), (sp), (env), (field)); } \
   while (0)
 
+/* Record one APPLY/APPTERM: the call-site opcode address, the closure being
+   called (`accu`), and the argument count.  The dump derives the callee's entry
+   pc (Code_val) so the chain of recently-entered FUNCTIONS is visible -- which
+   pins a corrupted closure call (a wild value, or a closure whose env disagrees
+   with its code) at the CALL, not at the downstream wild field read. */
+void caml_cppcaml_apply(code_t call_pc, value accu, int nargs);
+
+#define Cppcaml_apply(call_pc, accu, nargs)                                 \
+  do { if (caml_cppcaml_fieldtrace)                                         \
+         caml_cppcaml_apply((call_pc), (accu), (nargs)); }                  \
+  while (0)
+
 #endif /* CAML_INTERNALS */
 #endif /* CAML_CPPCAML_DEBUG_H */
