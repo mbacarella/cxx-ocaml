@@ -1255,6 +1255,23 @@ struct Translator {
             }
             if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
               int nc = 0, nb = 0; bool all_const = !v->ctors.empty(), gadt = false;
+              // A nested variant whose SHORT type name collides with an already-
+              // registered, DIFFERENTLY-shaped variant (includemod's top-level
+              // `pos = Module|Modtype|Arg|Body`, 4 block ctors, vs Directionality's
+              // `pos = Strictly_positive|Positive|Negative`, 3 const) must register
+              // its ctor count under a disambiguated key, else a `match` over the
+              // nested one builds a switch for the WRONG ctor set -> all arms collapse
+              // to Match_failure.  Pre-count to pick the key before tagging ctors.
+              int pc = 0, pb = 0;
+              for (auto& c : v->ctors) {
+                auto* rr = std::get_if<Pcstr_record>(&c.args);
+                auto* tt = std::get_if<Pcstr_tuple>(&c.args);
+                if (rr || (tt && !tt->elems.empty())) ++pb; else ++pc;
+              }
+              std::string tkey = d.name.txt;
+              if (auto ex = type_ctors_.find(d.name.txt);
+                  ex != type_ctors_.end() && ex->second != std::make_pair(pc, pb))
+                tkey = d.name.txt + "#" + std::to_string(type_ctors_.size());
               for (auto& c : v->ctors) {
                 int arity = 0; bool block = true;
                 auto* r = std::get_if<Pcstr_record>(&c.args);
@@ -1275,7 +1292,7 @@ struct Translator {
                                    ctor_info_[c.name.txt].rlabels.empty();
                 if (!ctor_info_.count(c.name.txt) || inline_over) {
                   builtin_ctors_.erase(c.name.txt);
-                  CtorInfo ci{d.name.txt, block ? nb : nc, block, arity};
+                  CtorInfo ci{tkey, block ? nb : nc, block, arity};
                   if (r) {  // inline-record labels, so `Node {h}` binds h to its field
                     int ridx = 0;
                     for (auto& f : r->fields) {
@@ -1293,8 +1310,8 @@ struct Translator {
                 }
                 if (block) ++nb; else ++nc;
               }
-              type_ctors_.emplace(d.name.txt, std::make_pair(nc, nb));
-              if (all_const && !gadt) immediate_local_.insert(d.name.txt);
+              type_ctors_[tkey] = std::make_pair(nc, nb);
+              if (all_const && !gadt) immediate_local_.insert(tkey);
             }
           }
         if (auto* pm = std::get_if<Pstr_module>(&item.desc))
