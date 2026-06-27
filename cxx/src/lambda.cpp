@@ -981,9 +981,20 @@ struct Translator {
   // can bind x and decide exhaustiveness).  Idempotent; local modules are skipped.
   void register_qualified_ctor(const Longident& id) {
     std::string ctor_name, mod;
-    if (auto* d = std::get_if<Ldot>(&id.v)) {  // `M.C`
+    if (auto* d = std::get_if<Ldot>(&id.v)) {  // `M.C` or `A.B.C`
       auto* pl = std::get_if<Lident>(&d->prefix->v);
-      if (!pl || module_base(pl->name)) return;
+      if (!pl) {
+        // A NESTED-module qualifier (`Patterns.Head.Variant`): resolve the
+        // submodule, which registers its variant constructors -- including
+        // inline-record labels -- into ctor_info_ so the matcher binds the
+        // fields instead of collapsing to `?tag`/`?cstr_row`.
+        std::string prefix;
+        if (lid_to_dotted(*d->prefix, prefix) &&
+            prefix.find('.') != std::string::npos)
+          submodule_of(prefix);
+        return;
+      }
+      if (module_base(pl->name)) return;
       ctor_name = d->name; mod = pl->name;
     } else if (auto* l = std::get_if<Lident>(&id.v)) {  // bare `C` via an `open M`
       // A constructor brought into scope by `open CamlinternalFormatBasics` etc.
@@ -2276,8 +2287,18 @@ struct Translator {
             bool block = !c.args.empty() || c.is_inline_record;
             int arity = c.is_inline_record ? 1 : (int)c.args.size();
             if (!ctor_info_.count(c.name) && !ambiguous_ctors_.count(c.name)) {
-              ctor_info_[c.name] = {td.name, block ? nb : nc, block, arity};
-              type_ctor_info_[td.name][c.name] = ctor_info_[c.name];
+              CtorInfo ci{td.name, block ? nb : nc, block, arity};
+              // An inline-record ctor (Patterns.Head's `Variant of {tag; cstr_row;
+              // ..}`): carry its label order so a `M.Sub.Variant {tag; cstr_row}`
+              // pattern binds the fields (else they fall to `?tag`/`?cstr_row`).
+              if (c.is_inline_record)
+                for (auto& l : c.inline_record) {
+                  ci.rlabels.push_back(l.name);
+                  ci.rshape.push_back(cmi_field_kind(l.type));
+                  ci.rfmut.push_back(l.mutable_);
+                }
+              ctor_info_[c.name] = ci;
+              type_ctor_info_[td.name][c.name] = std::move(ci);
             }
             if (block) ++nb; else ++nc;
           }
