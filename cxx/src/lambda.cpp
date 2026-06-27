@@ -1021,6 +1021,28 @@ struct Translator {
       }
     type_ctors_.emplace(ty, std::make_pair(nc, nb));
   }
+  // Register ONLY the explicitly-named constructor of a qualified `M.C`, NOT its
+  // siblings.  A qualified CONSTRUCTION expression (`Longident.Lident "x"`) is
+  // lowered directly via qualified_ctor_info and needs no sibling tags; eagerly
+  // registering the whole type would let a sibling whose SHORT NAME collides with
+  // another module's constructor (`Longident.Lapply` tag 2 vs `Lambda.Lapply`
+  // tag 3) squat the flat ctor_info_ slot first, so a later `open Lambda` match
+  // on `Lapply` reads the wrong tag and the arm is dropped -> Match_failure.
+  void register_single_qualified_ctor(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return;
+    auto* pl = std::get_if<Lident>(&d->prefix->v);
+    if (!pl || module_base(pl->name)) return;
+    if (ctor_info_.count(d->name)) return;
+    auto& mc = module_ctors(pl->name);
+    auto f = mc.find(d->name);
+    if (f == mc.end()) return;
+    ctor_info_[d->name] = f->second; builtin_ctors_.insert(d->name);
+    // record the owning type's constant/block counts for tag/exhaustiveness tests
+    int nc = 0, nb = 0;
+    for (auto& [nm, info] : mc) if (info.type == f->second.type) (info.is_block ? nb : nc)++;
+    type_ctors_.emplace(f->second.type, std::make_pair(nc, nb));
+  }
   // The CtorInfo of a QUALIFIED variant constructor `M.C` from M's own type --
   // authoritative over a same-named LOCAL/bare ctor (typecore's `Env.Pattern`
   // -- constructor_usage.Pattern, tag 1 -- vs its local `wrong_kind_context.
@@ -9276,7 +9298,13 @@ struct Translator {
       // (the decl0 default) then `~immediate:Always` -- type-directed, where the
       // expected type is fixed by that same qualified default.
       if (std::holds_alternative<Ldot>(k->id.txt.v) && !ctor_info_.count(n)) {
-        register_qualified_ctor(k->id.txt);            // top-level `M.Ctor`
+        register_single_qualified_ctor(k->id.txt);     // top-level `M.Ctor` (this
+                                                        // ctor only -- a sibling's
+                                                        // short name may belong to
+                                                        // another type; a later
+                                                        // BARE sibling resolves via
+                                                        // the inferred-type path
+                                                        // below)
         register_opened_submodule_ctors(k->id.txt);    // opened-submodule `Sub.Ctor`
       }
       // A BARE ctor unresolved here but whose inferred type is a module-qualified
