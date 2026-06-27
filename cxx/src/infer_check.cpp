@@ -169,6 +169,33 @@ struct Checker {
   std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
   // Field projections so resolved: node -> (index, mut, kind_str).
   std::unordered_map<const Expression*, std::tuple<int, bool, std::string>> field_resolved_;
+  // Ambiguous field accesses (base expr type + label), resolved AFTER inference
+  // reaches a fixpoint: an unannotated record param's type is often pinned only by a
+  // LATER field read (`pool.level` typed before `pool.next` proves `pool` is the pool
+  // record), so resolving at the read site sees a free var.  The base TypePtr is
+  // mutable (union-find), so its repr at the end reflects all constraints.
+  std::vector<std::tuple<const Expression*, TypePtr, std::string>> pending_field_;
+  void resolve_pending_fields() {
+    for (auto& [e, bt, lbl] : pending_field_) {
+      if (field_resolved_.count(e)) continue;
+      TypePtr rb = I::Engine::repr(bt);
+      if (rb->kind != I::Type::Kind::Constr || !rb->stamp) continue;
+      auto dit = stamp_record_decl_.find(rb->stamp);
+      if (dit == stamp_record_decl_.end()) continue;
+      auto* rec = std::get_if<Ptype_record>(&dit->second->kind);
+      if (!rec) continue;
+      bool all_float = !rec->fields.empty();
+      for (auto& f : rec->fields)
+        if (ct_kind(*f.type) != "float") { all_float = false; break; }
+      if (all_float) continue;
+      for (int i = 0; i < (int)rec->fields.size(); ++i)
+        if (rec->fields[i].name.txt == lbl) {
+          field_resolved_[e] = {i, rec->fields[i].mut == MutableFlag::Mutable,
+                                ct_kind(*rec->fields[i].type)};
+          break;
+        }
+    }
+  }
   std::set<const Expression*> fmt_lits_;  // string literals inferred at format type
   // Optional-argument erasure: an expression of type `?l:.. -> ..` used where a
   // non-optional arrow is expected is eta-expanded with None for each erased
@@ -1680,7 +1707,13 @@ struct Checker {
       auto it = fields_.find(lid_last(fld->field.txt));
       if (it != fields_.end()) {
         TypePtr s = I::Engine::repr(eng.instantiate(it->second));  // recTy -> fldTy
-        try_unify(infer_expr(*fld->e), s->dom);
+        TypePtr bt = infer_expr(*fld->e);
+        try_unify(bt, s->dom);
+        // A label the inferencer sees as UNIQUE (it models only local records) can
+        // still be ambiguous to the back end (the opened `type_expr.level` vs the
+        // local `pool.level`); record the base+label so the post-inference pass
+        // emits the resolved index and the back end doesn't pick the wrong offset.
+        if (record_kinds_) pending_field_.push_back({&e, bt, lid_last(fld->field.txt)});
         return s->cod;
       }
       TypePtr bt = infer_expr(*fld->e);
@@ -1690,7 +1723,15 @@ struct Checker {
       {
         TypePtr rb = I::Engine::repr(bt);
         std::string lbl = lid_last(fld->field.txt);
-        if (rb->kind == I::Type::Kind::Constr && rb->stamp && !fields_.count(lbl)) {
+        // Queue for the post-inference pass: `bt`'s repr may only become a stamped
+        // record after a later field read unifies the base's type.  Record for ANY
+        // field on a record base, not just labels the inferencer deems ambiguous --
+        // the inferencer models only LOCAL records, so a label it sees as unique
+        // (`pool.level`) is AMBIGUOUS to the back end (which also sees the opened
+        // `type_expr.level`); without the resolved index the back end picks the
+        // last-opened (wrong) offset -> e.g. pool_of_level loops forever.
+        if (record_kinds_) pending_field_.push_back({&e, bt, lbl});
+        if (rb->kind == I::Type::Kind::Constr && rb->stamp) {
           auto dit = stamp_record_decl_.find(rb->stamp);
           if (dit != stamp_record_decl_.end())
             if (auto* rec = std::get_if<Ptype_record>(&dit->second->kind)) {
@@ -2628,6 +2669,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   Checker ck;
   ck.record_kinds_ = true;
   run_checker(ck, s);
+  ck.resolve_pending_fields();  // re-resolve ambiguous field reads with final types
   ValueKinds vk;
   for (auto& [p, t] : ck.rec_pat_) {
     vk.pat[p] = kind_str(t, ck.immediate_types_);
