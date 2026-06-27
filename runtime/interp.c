@@ -828,19 +828,19 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
 /* Access to components of blocks */
 
     Instruct(GETFIELD0):
-      Cppcaml_field_read(pc - 1, accu, sp, 0);
+      Cppcaml_field_read(pc - 1, accu, sp, env, 0);
       accu = Field(accu, 0); Next;
     Instruct(GETFIELD1):
-      Cppcaml_field_read(pc - 1, accu, sp, 1);
+      Cppcaml_field_read(pc - 1, accu, sp, env, 1);
       accu = Field(accu, 1); Next;
     Instruct(GETFIELD2):
-      Cppcaml_field_read(pc - 1, accu, sp, 2);
+      Cppcaml_field_read(pc - 1, accu, sp, env, 2);
       accu = Field(accu, 2); Next;
     Instruct(GETFIELD3):
-      Cppcaml_field_read(pc - 1, accu, sp, 3);
+      Cppcaml_field_read(pc - 1, accu, sp, env, 3);
       accu = Field(accu, 3); Next;
     Instruct(GETFIELD):
-      Cppcaml_field_read(pc - 1, accu, sp, (int)*pc);
+      Cppcaml_field_read(pc - 1, accu, sp, env, (int)*pc);
       accu = Field(accu, *pc); pc++; Next;
     Instruct(GETFLOATFIELD): {
       double d = Double_flat_field(accu, *pc++);

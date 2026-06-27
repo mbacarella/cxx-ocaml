@@ -21,19 +21,33 @@
 int caml_cppcaml_fieldtrace = 0;
 
 #define CPPCAML_RING 64  /* power of two */
-struct cppcaml_entry { long pc_off; value accu; value *sp; int field; };
+struct cppcaml_entry { long pc_off; value accu; value *sp; value env; int field; };
 static struct cppcaml_entry cppcaml_ring[CPPCAML_RING];
 static unsigned cppcaml_pos = 0;
 static int cppcaml_installed = 0;
 
-void caml_cppcaml_field_read(code_t opcode_pc, value accu, value *sp, int field)
+void caml_cppcaml_field_read(code_t opcode_pc, value accu, value *sp, value env,
+                             int field)
 {
   struct cppcaml_entry *e = &cppcaml_ring[cppcaml_pos & (CPPCAML_RING - 1)];
   e->pc_off = (long)(opcode_pc - caml_start_code);
   e->accu = accu;
   e->sp = sp;
+  e->env = env;
   e->field = field;
   cppcaml_pos++;
+}
+
+/* The code-segment entry offset of a closure (its function's first opcode), or
+   -1 when env is not a heap closure. */
+static long cppcaml_fn_entry(value env)
+{
+  if (env == 0 || (env & 1)) return -1;
+  code_t cp = (code_t)Field(env, 0);   /* Code_val */
+  if (cp >= caml_start_code &&
+      (value)cp < (value)caml_start_code + caml_code_size)
+    return (long)(cp - caml_start_code);
+  return -1;
 }
 
 /* Async-signal-safe output: only write(), no malloc / stdio. */
@@ -86,6 +100,7 @@ static void cppcaml_segv(int sig)
     struct cppcaml_entry *e =
       &cppcaml_ring[(cppcaml_pos - 1 - k) & (CPPCAML_RING - 1)];
     put("  getfield pc="); put_long(e->pc_off);
+    put(" fn@"); put_long(cppcaml_fn_entry(e->env));
     put(" field="); put_long(e->field);
     put(" accu="); dump_accu(e->accu); put("\n");
   }

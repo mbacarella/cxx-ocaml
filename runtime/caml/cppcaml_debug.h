@@ -39,12 +39,15 @@ extern int caml_cppcaml_fieldtrace;
 void caml_cppcaml_debug_init(void);
 
 /* Record one block-field read (opcode address, the value being indexed, the
-   interpreter stack pointer, and the field index). */
-void caml_cppcaml_field_read(code_t opcode_pc, value accu, value *sp, int field);
+   interpreter stack pointer, the currently-executing closure, and the field
+   index).  `env` lets the dump print the offending FUNCTION's entry pc (the
+   closure's code pointer), which a bytecode offset alone does not give. */
+void caml_cppcaml_field_read(code_t opcode_pc, value accu, value *sp, value env,
+                             int field);
 
-#define Cppcaml_field_read(opcode_pc, accu, sp, field)                      \
+#define Cppcaml_field_read(opcode_pc, accu, sp, env, field)                 \
   do { if (caml_cppcaml_fieldtrace)                                         \
-         caml_cppcaml_field_read((opcode_pc), (accu), (sp), (field)); }     \
+         caml_cppcaml_field_read((opcode_pc), (accu), (sp), (env), (field)); } \
   while (0)
 
 #endif /* CAML_INTERNALS */
