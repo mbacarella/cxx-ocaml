@@ -1885,12 +1885,16 @@ struct Checker {
 
     if (can) {  // label-aware application
       std::vector<bool> used(spine.size(), false);
-      int maxc = -1;
+      int maxc = -1;          // max consumed POSITIONAL index: only a positional
+                              // argument past an optional forces it defaulted.  A
+                              // later LABELLED arg commutes past an optional WITHOUT
+                              // erasing it (`f ~check:false ~rebind:false` keeps the
+                              // intervening `?shape` in the result type).
       for (auto& [lbl, arg] : a.args) {
         auto [lk, nm] = arglabel(lbl);
         int idx = match_param(spine, used, lk, nm);
         used[idx] = true;
-        if (idx > maxc) maxc = idx;
+        if (lk == 0 && idx > maxc) maxc = idx;
         TypePtr at = infer_expr_expected(*arg, spine[idx]->dom);
         // Restrict to a literal-constant argument: its type is certain, whereas a
         // GADT/abstract-typed expression argument may be mis-inferred.
