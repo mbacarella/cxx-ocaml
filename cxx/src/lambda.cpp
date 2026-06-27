@@ -8846,10 +8846,22 @@ struct Translator {
         std::set<std::string> labs;
         for (auto& [lid, ve] : rc->fields) labs.insert(lid_last(lid.txt));
         const RecType* rt = nullptr;
+        // The first label's registered type -- but only when it actually HAS the
+        // whole literal label set.  A same-SHORT-NAMED record from another opened
+        // module (`open Parsetree; open Typedtree` -> two `value_binding`s, both 5
+        // fields: pvb_* vs vb_*) can match by COUNT yet have the wrong labels; if
+        // we locked onto it here, index_of below would fail (-1) and the literal
+        // collapse to 0.  Requiring the labels to match lets the exact-set loop
+        // below find the right (collision-disambiguated) record instead.
         if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
           if (auto it = rec_types_.find(f0->type);
-              it != rec_types_.end() && it->second.labels.size() == labs.size())
-            rt = &it->second;
+              it != rec_types_.end() && it->second.labels.size() == labs.size()) {
+            bool all = true;
+            for (auto& l : labs)
+              if (std::find(it->second.labels.begin(), it->second.labels.end(), l)
+                  == it->second.labels.end()) { all = false; break; }
+            if (all) rt = &it->second;
+          }
         if (!rt)
           for (auto& [name, cand] : rec_types_) {
             if (cand.labels.size() != labs.size()) continue;
