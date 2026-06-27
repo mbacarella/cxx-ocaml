@@ -817,6 +817,13 @@ struct Translator {
   // Lets a bare unresolved ctor field value (`{ vb_rec_kind = Dynamic }`, Dynamic's
   // module Value_rec_types un-opened) be resolved by type direction at construction.
   std::unordered_map<std::string, std::string> field_value_ctor_type_;
+  // A record label -> the label signature of its FUNCTION-typed value, so a call
+  // through a field projection (`core.value_descriptions ~loc ~direction env ..`)
+  // reorders its labelled args to the parameter order, exactly as a directly-named
+  // function does.  Without this the args pass verbatim and a `~direction` after a
+  // positional `env` swaps the two (includemod's core_relation: every field is a
+  // labelled `core_incl` arrow).
+  std::unordered_map<std::string, FnSig> field_fn_sig_;
   // Per-type record fields + the labels source-order scoping has resolved at the
   // current point (so find_field uses the in-scope type's field despite the
   // label being ambiguous overall) -- the record analogue of the constructor
@@ -1182,6 +1189,11 @@ struct Translator {
           FieldInfo finfo{d.name.txt, idx++, m, k};
           type_field_info_[d.name.txt][f.name.txt] = finfo;
           field_info_[f.name.txt] = finfo;
+          // A field whose value is a labelled function: record its label sig so a
+          // call through the projection reorders args (the local_alias_ pass above
+          // already ran, so a `core_incl`-aliased arrow expands here).
+          if (FnSig fs = coretype_label_sig(f.type.get()); !fs.empty())
+            field_fn_sig_[f.name.txt] = std::move(fs);
         }
         rec_types_[d.name.txt] = std::move(rt);
       }
@@ -2926,7 +2938,43 @@ struct Translator {
   // The callee's parameter signature for an application: a local function (by its
   // recorded sig) or a qualified stdlib value (from its cmi arrow type).  Empty if
   // unknown or unlabelled.
+  // The label signature of a function type, expanding a leading local type alias
+  // (`value_description core_incl` -> core_incl's `loc:.. -> Env.t -> direction:..`
+  // arrow), then reading each arrow arg's label kind/name.  Empty if not an arrow
+  // or has no labelled/optional argument (a positional-only callee needs no sig).
+  FnSig coretype_label_sig(const CoreType* t, int depth = 0) {
+    if (!t || depth > 8) return {};
+    if (auto* c = std::get_if<Ptyp_constr>(&t->desc)) {
+      auto it = local_alias_.find(lid_last(c->id.txt));
+      if (it == local_alias_.end()) return {};
+      return coretype_label_sig(it->second, depth + 1);
+    }
+    FnSig s;
+    const CoreType* cur = t;
+    while (cur) {
+      if (auto* c = std::get_if<Ptyp_constr>(&cur->desc)) {  // a mid/tail alias arrow
+        auto it = local_alias_.find(lid_last(c->id.txt));
+        if (it == local_alias_.end() || ++depth > 8) break;
+        cur = it->second; continue;
+      }
+      auto* ar = std::get_if<Ptyp_arrow>(&cur->desc);
+      if (!ar) break;
+      int k = 0; std::string nm;
+      if (auto* lb = std::get_if<Labelled>(&ar->label)) { k = 1; nm = lb->name; }
+      else if (auto* op = std::get_if<Optional>(&ar->label)) { k = 2; nm = op->name; }
+      s.push_back({k, nm});
+      cur = ar->cod.get();
+    }
+    for (auto& [k, n] : s) if (k != 0) return s;  // only worth it with a label
+    return {};
+  }
   FnSig callee_sig(const Expression* fn) {
+    // A call through a record-field projection of a labelled function.
+    if (auto* fe = std::get_if<Pexp_field>(&fn->desc)) {
+      auto it = field_fn_sig_.find(lid_last(fe->field.txt));
+      if (it != field_fn_sig_.end()) return it->second;
+      return {};
+    }
     auto* id = std::get_if<Pexp_ident>(&fn->desc);
     if (!id) return {};
     if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
