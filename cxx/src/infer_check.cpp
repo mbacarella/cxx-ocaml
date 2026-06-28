@@ -1099,6 +1099,31 @@ struct Checker {
     return it == ctors.end() ? nullptr : &it->second;
   }
 
+  // Resolve a QUALIFIED constructor `M.C` (M a single, non-opened module) to its
+  // owning variant type `M.tname`, read from M's cmi.  `M.C` otherwise types as
+  // Any (find_ctor only knows bare names), which loses the type that an optional-
+  // argument default pins: predef's `decl0 ?(immediate = Type_immediacy.Unknown)`
+  // gives `immediate : Type_immediacy.t`, type-directing a later `~immediate:Always`.
+  TypePtr qualified_ctor_type(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return nullptr;
+    auto* pl = std::get_if<Lident>(&d->prefix->v);
+    if (!pl) return nullptr;  // nested-module qualifier: best-effort skip
+    try {
+      auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Variant) continue;
+        for (auto& c : td.ctors)
+          if (c.name == d->name) {
+            std::vector<TypePtr> params;
+            for (int i = 0; i < td.arity; ++i) params.push_back(eng.fresh_var());
+            return eng.constr(pl->name + "." + td.name, std::move(params));
+          }
+      }
+    } catch (...) {}
+    return nullptr;
+  }
+
   // Split a (instantiated) constructor scheme into its argument types and result.
   static std::vector<TypePtr> ctor_params(const TypePtr& sch, TypePtr& result) {
     std::vector<TypePtr> ps;
@@ -1528,6 +1553,18 @@ struct Checker {
         return expected;
       }
     TypePtr t = infer_expr(e);
+    // Type-directed bare-constructor resolution: an unqualified constructor we
+    // couldn't resolve (typed Any) whose EXPECTED type is a module-qualified
+    // variant -- record that type at the node so infer_value_kinds exposes it via
+    // expr_constr and the back end registers the type's ctors, resolving the bare
+    // ctor (predef's `decl0 ~immediate:Always`, with immediate : Type_immediacy.t).
+    if (record_kinds_)
+      if (auto* k = std::get_if<Pexp_construct>(&e.desc))
+        if (!find_ctor(lid_last(k->id.txt))) {
+          TypePtr er = I::Engine::repr(expected);
+          if (er->kind == I::Type::Kind::Constr && er->path.find('.') != std::string::npos)
+            rec_expr_[&e] = expected;
+        }
     // Optional-argument erasure (ocaml's type_argument): a value of type
     // `?l:.. -> ..` used where a non-optional arrow is expected is eta-expanded
     // with None for the omitted optional(s).  Recorded for the Lambda back end;
@@ -1592,7 +1629,16 @@ struct Checker {
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
-      if (!sch) { if (k->arg) infer_expr(**k->arg); return eng.any(); }
+      if (!sch) {
+        // A qualified `M.C` whose bare name isn't in scope: recover its variant
+        // type from M's cmi (so an optional-arg default fixes the param type).
+        if (TypePtr qt = qualified_ctor_type(k->id.txt)) {
+          if (k->arg) infer_expr(**k->arg);
+          return qt;
+        }
+        if (k->arg) infer_expr(**k->arg);
+        return eng.any();
+      }
       TypePtr result;
       auto ps = ctor_params(eng.instantiate(*sch), result);
       if (k->arg) {
