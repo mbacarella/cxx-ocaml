@@ -3605,7 +3605,8 @@ struct Translator {
   // Resolve a record-PATTERN label, using the pattern's full field set to pin the
   // record for an AMBIGUOUS label (so it takes the right index, not last-wins).
   const FieldInfo* resolve_record_pat_field(const std::vector<std::string>& fields,
-                                            const Longident& lid, FieldInfo& store) {
+                                            const Longident& lid, FieldInfo& store,
+                                            const void* pat_key = nullptr) {
     // A qualified field (`{ Lambda.code = ..; required_globals }`) names the
     // record's module: register its record types so the SIBLING bare labels
     // (required_globals) resolve by-field-set too -- else the whole pattern fails
@@ -3625,9 +3626,42 @@ struct Translator {
             store = FieldInfo{kv->first, i, kv->second.mut, kv->second.shape[i]};
             return &store;
           }
+    // An AMBIGUOUS field (`args` in both `pattern_matching`@1 and `division`@0)
+    // resolved by TYPE: (a) the matched value's record type the inferencer pinned
+    // for this pattern, or (b) the record uniquely determined by the UNION of the
+    // sibling match arms' record-pattern fields (`{cases;args}` pins
+    // pattern_matching, so the size-1 `{args}` arm takes args@1 there too).  This
+    // runs BEFORE find_field, whose scoped-unambiguous map may hold the wrong one.
+    if (ambiguous_fields_.count(n)) {
+      auto from = [&](const std::string& ty) -> const FieldInfo* {
+        auto rt = rec_types_.find(ty);
+        if (rt == rec_types_.end()) return nullptr;
+        for (int i = 0; i < (int)rt->second.labels.size(); ++i)
+          if (rt->second.labels[i] == n) {
+            store = FieldInfo{ty, i, rt->second.mut, rt->second.shape[i]};
+            return &store;
+          }
+        return nullptr;
+      };
+      if (pat_key)
+        if (auto pt = vk.pat_record_type.find(pat_key); pt != vk.pat_record_type.end())
+          if (const FieldInfo* fi = from(pt->second.substr(pt->second.rfind('.') + 1)))
+            return fi;
+      if (!match_rec_fields_.empty()) {
+        std::set<std::string> u(match_rec_fields_.begin(), match_rec_fields_.end());
+        u.insert(fields.begin(), fields.end());
+        std::vector<std::string> uv(u.begin(), u.end());
+        if (auto* kv = record_for_fields(uv))
+          if (const FieldInfo* fi = from(kv->first)) return fi;
+      }
+    }
     if (const FieldInfo* fi = find_field(n)) return fi;
     return resolve_record_label(lid, store);
   }
+  // The UNION of the record-pattern field labels across the arms of the match
+  // currently being compiled -- to disambiguate a size-1 ambiguous-field arm by a
+  // multi-field sibling (set/restored around compile_match's row loop).
+  std::vector<std::string> match_rec_fields_;
   // A single field of a record in a NESTED module path (`e.CamlinternalMenhirLib.
   // EngineTypes.current`): its index/kind/mut from the navigated cmi record.
   std::optional<StdField> nested_record_field(const std::string& dotted, const std::string& label) {
@@ -6448,7 +6482,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi);
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p);
         if (!fi) {
           // The predefined `'a ref = { mutable contents }` cell: a `{contents=p}`
           // pattern reads the mutable field 0 (deferred to here, the function
@@ -6576,7 +6610,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi);
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p);
         if (!fi || !or_accesses(*sub, field_read(fi, scrut), out)) return false;
       }
       return true;
@@ -6764,7 +6798,7 @@ struct Translator {
         for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
         for (auto& [lbl, sub] : pr->fields) {
           FieldInfo nfi;
-          const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi);
+          const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p);
           if (!fi) { ok = false; return; }
           destruct(*sub, field_read(fi, acc));
         }
@@ -7160,6 +7194,19 @@ struct Translator {
     // Resolve any qualified stdlib constructors in the rows (Seq.Cons, ...) so
     // the matcher below has their tag/arity like local/predef constructors.
     for (auto& r : rows) scan_pat_ctors(*r.lhs);
+    // The union of the arms' top-level record-pattern fields, so a size-1
+    // ambiguous-field arm (`{ args = .. }`) is disambiguated by a multi-field
+    // sibling (`{ cases = []; args = [] }` pins pattern_matching).  Save/restore.
+    std::vector<std::string> saved_mrf = match_rec_fields_;
+    {
+      std::set<std::string> u;  // this match's arms only (not the enclosing match's)
+      for (auto& r : rows)
+        if (auto* pr = std::get_if<Ppat_record>(&effective_pat(r.lhs)->desc))
+          for (auto& [lbl, sub] : pr->fields) u.insert(lid_last(lbl.txt));
+      match_rec_fields_.assign(u.begin(), u.end());
+    }
+    struct MrfGuard { std::vector<std::string>& cur; std::vector<std::string> sv;
+                      ~MrfGuard() { cur = std::move(sv); } } mrf_guard{match_rec_fields_, std::move(saved_mrf)};
     // Peel `[@@unboxed]` constructor wrappers off the patterns (transparent) and
     // re-dispatch, so the matcher below never sees an unboxed constructor.
     bool unbox = false;
@@ -8393,7 +8440,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi);
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p);
         if (!fi) return false;
         if (!pat_test(sub.get(), field_read(fi, acc), test, binds)) return false;
       }

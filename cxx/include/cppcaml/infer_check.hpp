@@ -61,6 +61,11 @@ struct ValueKinds {
   // constructors so an unqualified pattern (`Visible`/`Hidden` matched without an
   // `open Load_path`) resolves -- type-directed constructor disambiguation.
   std::unordered_map<const void*, std::string> pat_constr;
+  // A record pattern whose matched value's type resolved to a (possibly
+  // qualified) record type, so the back end disambiguates an AMBIGUOUS field
+  // (`{ args = .. }` on a `pattern_matching` -- args@1 -- vs `division` -- args@0)
+  // by the matched value's type instead of a single-label guess.
+  std::unordered_map<const void*, std::string> pat_record_type;
   // Expressions of type `?l:.. -> ..` used where a non-optional arrow is expected:
   // the back end eta-expands them, inserting None for each erased optional.  The
   // bool vector is the resulting application's argument slots (true = None for an

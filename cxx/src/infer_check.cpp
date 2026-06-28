@@ -2680,6 +2680,13 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
       if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
         vk.pat_constr[p] = r->path;
     }
+    // A record pattern's matched-value type (resolved by unify with the
+    // scrutinee): lets the back end disambiguate an ambiguous field by type.
+    if (std::holds_alternative<ast::Ppat_record>(p->desc)) {
+      TypePtr r = I::Engine::repr(t);
+      if (r->kind == I::Type::Kind::Constr && !r->path.empty())
+        vk.pat_record_type[p] = r->path;
+    }
   }
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck.immediate_types_);
   for (auto& [e, t] : ck.rec_expr_) {
