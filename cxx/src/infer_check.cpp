@@ -167,6 +167,8 @@ struct Checker {
   // Record decl by identity stamp, for resolving an AMBIGUOUS field projection
   // through the base's inferred type identity (Sign_diff.t.untypables@4).
   std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
+  std::unordered_map<std::string, const TypeDeclaration*> name_record_decl_;
+  std::set<std::string> ambiguous_record_names_;  // a record name declared by >1 decl
   // Field projections so resolved: node -> (index, mut, kind_str).
   std::unordered_map<const Expression*, std::tuple<int, bool, std::string>> field_resolved_;
   // Ambiguous field accesses (base expr type + label), resolved AFTER inference
@@ -179,10 +181,19 @@ struct Checker {
     for (auto& [e, bt, lbl] : pending_field_) {
       if (field_resolved_.count(e)) continue;
       TypePtr rb = I::Engine::repr(bt);
-      if (rb->kind != I::Type::Kind::Constr || !rb->stamp) continue;
-      auto dit = stamp_record_decl_.find(rb->stamp);
-      if (dit == stamp_record_decl_.end()) continue;
-      auto* rec = std::get_if<Ptype_record>(&dit->second->kind);
+      if (rb->kind != I::Type::Kind::Constr) continue;
+      // A stamped record disambiguates exactly; a stamp-LESS record Constr (a
+      // parametrized local record like `('a,'b) pattern_matching` whose head
+      // resolved but never got a stamp) falls back to the unique by-name decl.
+      const TypeDeclaration* decl = nullptr;
+      if (rb->stamp) { auto it = stamp_record_decl_.find(rb->stamp);
+                       if (it != stamp_record_decl_.end()) decl = it->second; }
+      if (!decl && !ambiguous_record_names_.count(rb->path)) {
+        auto it = name_record_decl_.find(rb->path);
+        if (it != name_record_decl_.end()) decl = it->second;
+      }
+      if (!decl) continue;
+      auto* rec = std::get_if<Ptype_record>(&decl->kind);
       if (!rec) continue;
       bool all_float = !rec->fields.empty();
       for (auto& f : rec->fields)
@@ -989,6 +1000,10 @@ struct Checker {
     for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
     TypePtr recTy = eng.constr(d.name.txt, params, type_stamp_[&d]);
     if (int s = type_stamp_[&d]) stamp_record_decl_[s] = &d;  // for ambiguous-field resolution
+    if (auto it = name_record_decl_.find(d.name.txt);  // by-name fallback (only when UNIQUE)
+        it != name_record_decl_.end() && it->second != &d)
+      ambiguous_record_names_.insert(d.name.txt);
+    name_record_decl_[d.name.txt] = &d;
     for (auto& f : rec->fields) {
       // a universally-quantified field (`{ f : 'a. ... }`) is polymorphic per use;
       // a single monomorphic scheme would clash, so leave it to Any -- EXCEPT, in
