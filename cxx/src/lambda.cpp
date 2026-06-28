@@ -3609,9 +3609,30 @@ struct Translator {
   // Consulted ONLY as a last resort -- a literal that would otherwise collapse to
   // 0 -- and only when the label set maps to exactly ONE record across the path,
   // so it can never change a record that already resolves.
+  // A cmi Path -> its dotted name ("lfunction", "M.t").
+  static std::string cmi_path_dotted(const cmi::PathPtr& p) {
+    if (!p) return "";
+    if (p->kind == cmi::Path::Pident) return p->id.name;
+    if (p->kind == cmi::Path::Pdot) {
+      std::string pre = cmi_path_dotted(p->a);
+      return pre.empty() ? p->s : pre + "." + p->s;
+    }
+    return "";
+  }
+  // The dotted type-constructor path of a cmi field's type ("lfunction"), else "".
+  static std::string cmi_type_ctor_path(const cmi::TypePtr& t) {
+    if (!t || t->kind != cmi::TypeExpr::Tconstr) return "";
+    return cmi_path_dotted(t->path);
+  }
   bool labelset_index_built_ = false;
   std::map<std::vector<std::string>, StdRec> labelset_index_;
   std::set<std::vector<std::string>> labelset_ambiguous_;
+  // Per record-type-NAME: its layout, and each field's declared type path -- so a
+  // nested record pattern (`{ def = {params;body} }`) resolves through the enclosing
+  // field's value type (def : lfunction), disambiguating an ambiguous label set.
+  std::map<std::string, StdRec> record_by_name_;
+  std::map<std::string, std::map<std::string, std::string>> record_field_types_;
+  std::set<std::string> record_by_name_ambig_;
   void build_labelset_index() {
     if (labelset_index_built_) return;
     labelset_index_built_ = true;
@@ -3628,13 +3649,27 @@ struct Translator {
             if (td.kind != cmi::TypeDecl::Record || td.labels.empty()) continue;
             StdRec r; bool all_float = true;
             std::vector<std::string> key;
+            std::map<std::string, std::string> ftypes;
             for (auto& l : td.labels) {
               r.labels.push_back(l.name); key.push_back(l.name);
               r.shape.push_back(cmi_field_kind(l.type));
               r.mut.push_back(l.mutable_);
               if (r.shape.back() != ValueKind::Float) all_float = false;
+              if (std::string fp = cmi_type_ctor_path(l.type); !fp.empty())
+                ftypes[l.name] = fp;
             }
             r.flat = all_float;
+            // Index by NAME (for resolving through a field's value type).
+            if (!record_by_name_ambig_.count(td.name)) {
+              auto ni = record_by_name_.find(td.name);
+              if (ni == record_by_name_.end()) {
+                record_by_name_[td.name] = r;
+                record_field_types_[td.name] = std::move(ftypes);
+              } else if (ni->second.labels != r.labels) {
+                record_by_name_.erase(ni); record_field_types_.erase(td.name);
+                record_by_name_ambig_.insert(td.name);
+              }
+            }
             std::sort(key.begin(), key.end());
             if (labelset_ambiguous_.count(key)) continue;
             auto it = labelset_index_.find(key);
@@ -3646,6 +3681,50 @@ struct Translator {
         } catch (...) {}
       }
     }
+  }
+  // The declared type path of `record_type`'s field `label`, from its cmi decl.
+  std::string record_field_type_path(const std::string& record_type,
+                                     const std::string& label) {
+    build_labelset_index();
+    auto it = record_field_types_.find(record_type);
+    if (it == record_field_types_.end()) return "";
+    auto f = it->second.find(label);
+    return f == it->second.end() ? "" : f->second;
+  }
+  // Resolve `label` of the record named (dotted) `path` through record_by_name_,
+  // registering its layout into rec_types_ on demand so find paths see it.
+  const FieldInfo* named_record_field(const std::string& path, const std::string& label,
+                                      FieldInfo& store) {
+    build_labelset_index();
+    std::string ty = path.substr(path.rfind('.') + 1);
+    auto it = record_by_name_.find(ty);
+    if (it == record_by_name_.end() || it->second.flat) return nullptr;
+    if (!rec_types_.count(ty)) {  // make it visible to from()/find paths
+      RecType rt; rt.labels = it->second.labels; rt.shape = it->second.shape;
+      rt.flat = it->second.flat; rt.mut = false;
+      for (bool m : it->second.mut) rt.mut = rt.mut || m;
+      rec_types_[ty] = std::move(rt);
+    }
+    for (int i = 0; i < (int)it->second.labels.size(); ++i)
+      if (it->second.labels[i] == label) {
+        store = FieldInfo{ty, i, it->second.mut[i], it->second.shape[i]};
+        return &store;
+      }
+    return nullptr;
+  }
+  // A nested record pattern -> its record type, set from the enclosing field's
+  // declared value type while compiling the outer record pattern.
+  std::unordered_map<const void*, std::string> pat_type_hint_;
+  // While compiling a record pattern's field `label` (resolved to `fi`) whose
+  // sub-pattern is itself a record pattern, tag that sub-pattern with the field's
+  // declared value type, so its (ambiguous) labels resolve through it.
+  void tag_nested_record_subpat(const FieldInfo* fi, const std::string& label,
+                                const Pattern* sub) {
+    if (!fi || fi->type.empty() || !sub) return;
+    const Pattern* e = effective_pat(sub);
+    if (!std::get_if<Ppat_record>(&e->desc)) return;
+    if (std::string vt = record_field_type_path(fi->type, label); !vt.empty())
+      pat_type_hint_[(const void*)e] = vt;
   }
   // type that has `label`.  Used for an explicitly deep-qualified record literal
   // (`{ CamlinternalMenhirLib.EngineTypes.state = .. }` in menhir's actions).
@@ -3747,6 +3826,13 @@ struct Translator {
         register_module_records(pl->name);
     if (auto rf = qualified_field(lid)) { store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store; }
     std::string n = lid_last(lid);
+    // A NESTED record pattern tagged with its record type by the enclosing field's
+    // value type (`{ def = {params;body} }` -> {params;body} : lfunction): resolve
+    // its (ambiguous) labels through that type, not a same-labelled local record
+    // (bytegen's function_to_compile vs Lambda's lfunction).
+    if (pat_key)
+      if (auto h = pat_type_hint_.find(pat_key); h != pat_type_hint_.end())
+        if (const FieldInfo* fi = named_record_field(h->second, n, store)) return fi;
     // A bare label whose record is pinned by a QUALIFIED SIBLING field
     // (`{Types.cd_id; cd_args; cd_res}`): OCaml requires all fields of one record,
     // so the sibling's module is authoritative -- resolve `cd_args` as
@@ -6627,6 +6713,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
         const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
+        tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
         if (!fi) {
           // The predefined `'a ref = { mutable contents }` cell: a `{contents=p}`
           // pattern reads the mutable field 0 (deferred to here, the function
@@ -6756,6 +6843,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
         const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
+        tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
         if (!fi || !or_accesses(*sub, field_read(fi, scrut), out)) return false;
       }
       return true;
@@ -6944,6 +7032,7 @@ struct Translator {
         for (auto& [lbl, sub] : pr->fields) {
           FieldInfo nfi;
           const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
+          tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
           if (!fi) { ok = false; return; }
           destruct(*sub, field_read(fi, acc));
         }
@@ -8632,6 +8721,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
         const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
+        tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
         if (!fi) return false;
         if (!pat_test(sub.get(), field_read(fi, acc), test, binds)) return false;
       }
