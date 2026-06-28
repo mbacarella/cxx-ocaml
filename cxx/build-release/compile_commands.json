@@ -1,0 +1,158 @@
+[
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/token.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/token.cpp.o -c /home/mbac/code/c++caml/cxx/src/token.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/token.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/token.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/lexer.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/lexer.cpp.o -c /home/mbac/code/c++caml/cxx/src/lexer.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/lexer.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/lexer.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/parser.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/parser.cpp.o -c /home/mbac/code/c++caml/cxx/src/parser.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/parser.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/parser.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/ast_print.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/ast_print.cpp.o -c /home/mbac/code/c++caml/cxx/src/ast_print.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/ast_print.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/ast_print.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/marshal.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/marshal.cpp.o -c /home/mbac/code/c++caml/cxx/src/marshal.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/marshal.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/marshal.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/blake2.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/blake2.cpp.o -c /home/mbac/code/c++caml/cxx/src/blake2.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/blake2.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/blake2.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/cmi.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/cmi.cpp.o -c /home/mbac/code/c++caml/cxx/src/cmi.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/cmi.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/cmi.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/typer.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/typer.cpp.o -c /home/mbac/code/c++caml/cxx/src/typer.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/typer.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/typer.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/typedtree_print.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/typedtree_print.cpp.o -c /home/mbac/code/c++caml/cxx/src/typedtree_print.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/typedtree_print.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/typedtree_print.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/infer.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/infer.cpp.o -c /home/mbac/code/c++caml/cxx/src/infer.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/infer.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/infer.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/infer_check.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/infer_check.cpp.o -c /home/mbac/code/c++caml/cxx/src/infer_check.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/infer_check.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/infer_check.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/lambda.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/lambda.cpp.o -c /home/mbac/code/c++caml/cxx/src/lambda.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/lambda.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/lambda.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/bytecode.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/bytecode.cpp.o -c /home/mbac/code/c++caml/cxx/src/bytecode.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/bytecode.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/bytecode.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/omarshal.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/omarshal.cpp.o -c /home/mbac/code/c++caml/cxx/src/omarshal.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/omarshal.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/omarshal.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/cmo.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/cmo.cpp.o -c /home/mbac/code/c++caml/cxx/src/cmo.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/cmo.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/cmo.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/cppcaml_core.dir/src/link.cpp.o.modmap -o CMakeFiles/cppcaml_core.dir/src/link.cpp.o -c /home/mbac/code/c++caml/cxx/src/link.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/link.cpp",
+  "output": "CMakeFiles/cppcaml_core.dir/src/link.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++lex.dir/src/tools/cpplex_main.cpp.o.modmap -o CMakeFiles/c++lex.dir/src/tools/cpplex_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cpplex_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cpplex_main.cpp",
+  "output": "CMakeFiles/c++lex.dir/src/tools/cpplex_main.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++parse.dir/src/tools/cppparse_main.cpp.o.modmap -o CMakeFiles/c++parse.dir/src/tools/cppparse_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cppparse_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cppparse_main.cpp",
+  "output": "CMakeFiles/c++parse.dir/src/tools/cppparse_main.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++cmi.dir/src/tools/cppcmi_main.cpp.o.modmap -o CMakeFiles/c++cmi.dir/src/tools/cppcmi_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cppcmi_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cppcmi_main.cpp",
+  "output": "CMakeFiles/c++cmi.dir/src/tools/cppcmi_main.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++type.dir/src/tools/cpptype_main.cpp.o.modmap -o CMakeFiles/c++type.dir/src/tools/cpptype_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cpptype_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cpptype_main.cpp",
+  "output": "CMakeFiles/c++type.dir/src/tools/cpptype_main.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++infer-test.dir/src/tools/cppinfer_test.cpp.o.modmap -o CMakeFiles/c++infer-test.dir/src/tools/cppinfer_test.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cppinfer_test.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cppinfer_test.cpp",
+  "output": "CMakeFiles/c++infer-test.dir/src/tools/cppinfer_test.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++lambda.dir/src/tools/cpplambda_main.cpp.o.modmap -o CMakeFiles/c++lambda.dir/src/tools/cpplambda_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cpplambda_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cpplambda_main.cpp",
+  "output": "CMakeFiles/c++lambda.dir/src/tools/cpplambda_main.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++instr.dir/src/tools/cppinstr_main.cpp.o.modmap -o CMakeFiles/c++instr.dir/src/tools/cppinstr_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cppinstr_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cppinstr_main.cpp",
+  "output": "CMakeFiles/c++instr.dir/src/tools/cppinstr_main.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++cmo.dir/src/tools/cppcmo_main.cpp.o.modmap -o CMakeFiles/c++cmo.dir/src/tools/cppcmo_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cppcmo_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cppcmo_main.cpp",
+  "output": "CMakeFiles/c++cmo.dir/src/tools/cppcmo_main.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++link.dir/src/tools/cpplink_main.cpp.o.modmap -o CMakeFiles/c++link.dir/src/tools/cpplink_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cpplink_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cpplink_main.cpp",
+  "output": "CMakeFiles/c++link.dir/src/tools/cpplink_main.cpp.o"
+},
+{
+  "directory": "/home/mbac/code/c++caml/cxx/build-release",
+  "command": "/nix/store/90lsdrdffwgf3kjd4sdxjchchg44cr02-clang-wrapper-20.1.8/bin/clang++ -I/home/mbac/code/c++caml/cxx/include -O3 -DNDEBUG -std=c++23 -Wall -Wextra -Wpedantic -Wno-unused-parameter @CMakeFiles/c++ocamlc.dir/src/tools/cppocamlc_main.cpp.o.modmap -o CMakeFiles/c++ocamlc.dir/src/tools/cppocamlc_main.cpp.o -c /home/mbac/code/c++caml/cxx/src/tools/cppocamlc_main.cpp",
+  "file": "/home/mbac/code/c++caml/cxx/src/tools/cppocamlc_main.cpp",
+  "output": "CMakeFiles/c++ocamlc.dir/src/tools/cppocamlc_main.cpp.o"
+}
+]

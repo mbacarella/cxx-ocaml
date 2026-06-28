@@ -737,6 +737,7 @@ TyPtr ty_arrow_lbl(const TyPtr& d, const TyPtr& c, int lk, const std::string& lb
   auto t = std::make_shared<Ty>(); t->k = Ty::Arrow; t->args = {d, c};
   t->label_kind = lk; t->label = lbl; return t; }
 TyPtr ty_tuple(std::vector<TyPtr> es) { auto t = std::make_shared<Ty>(); t->k = Ty::Tuple; t->args = std::move(es); return t; }
+TyPtr ty_variant(std::vector<std::string> tags) { auto t = std::make_shared<Ty>(); t->k = Ty::Variant; t->pv_tags = std::move(tags); return t; }
 TyPtr ty_var(int id) { auto t = std::make_shared<Ty>(); t->k = Ty::Var; t->var = id; return t; }
 
 namespace {
@@ -892,6 +893,20 @@ struct TyEmit {
         std::vector<o::ValPtr> elems;
         for (auto& e : t->args) elems.push_back(o::vblock(0, {o::vint(0) /*None*/, emit(e)}));  // (label,ty)
         return texpr(o::vblock(2, {o::vlist(elems)}));  // Ttuple of (so * te) list
+      }
+      case Ty::Variant: {
+        // A closed polymorphic-variant abbreviation (`type view = [ `A | `B .. ]`):
+        // emit just enough row_desc for a consumer's `#view` pattern to read the
+        // tag set.  row_field is a dummy RFabsent (the reader only reads labels).
+        // row_desc = { row_fields; row_more; row_closed; row_fixed; row_name }.
+        std::vector<o::ValPtr> fields;
+        for (auto& tag : t->pv_tags)
+          fields.push_back(o::vblock(0, {o::vstr(tag), o::vint(0) /*RFabsent*/}));  // (label, row_field)
+        o::ValPtr more = texpr(o::vblock(0, {o::vint(0)}));  // row_more = Tvar None
+        o::ValPtr rd = o::vblock(0, {fields.empty() ? o::vint(0) : o::vlist(fields),
+                                     more, o::vint(1) /*row_closed=true*/,
+                                     o::vint(0) /*row_fixed=None*/, o::vint(0) /*row_name=None*/});
+        return texpr(o::vblock(6, {rd}));  // Tvariant of row_desc
       }
     }
     return o::vint(0);

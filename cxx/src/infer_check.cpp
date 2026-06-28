@@ -2826,7 +2826,22 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       continue;
     }
     cmi::cmiw::TyPtr manifest = nullptr;
-    if (d.manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
+    if (d.manifest) {
+      // A FLAT closed polymorphic-variant abbreviation (`type view = [ `A | `B ]`,
+      // all direct tags, no inheritance): emit its tag set so a consumer's
+      // `#view` pattern resolves the tags cross-module.  An abbreviation that
+      // INHERITS another polyvariant (`[ Simple.view | `Or ]`) is left abstract --
+      // emitting only its direct tags would be an INCOMPLETE set (wrongly matching).
+      if (auto* pv = std::get_if<Ptyp_variant>(&d.manifest->get()->desc)) {
+        std::vector<std::string> tags; bool all_tag = true;
+        for (auto& rf : pv->rows) {
+          if (auto* rt = std::get_if<Rtag>(&rf)) tags.push_back(rt->name);
+          else { all_tag = false; break; }
+        }
+        if (all_tag && !tags.empty()) manifest = cmi::cmiw::ty_variant(std::move(tags));
+      }
+      if (!manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
+    }
     out.push_back(cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest));
   }
 }

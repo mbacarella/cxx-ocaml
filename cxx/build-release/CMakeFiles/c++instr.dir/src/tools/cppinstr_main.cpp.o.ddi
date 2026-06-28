@@ -1,0 +1,9 @@
+{
+  "revision": 0,
+  "rules": [
+    {
+      "primary-output": "CMakeFiles/c++instr.dir/src/tools/cppinstr_main.cpp.o"
+    }
+  ],
+  "version": 1
+}

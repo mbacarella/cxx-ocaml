@@ -1,0 +1,105 @@
+{
+	"bmi-installation" : null,
+	"compiler-frontend-variant" : "GNU",
+	"compiler-id" : "Clang",
+	"compiler-simulate-id" : "",
+	"config" : "Release",
+	"cxx-modules" : {},
+	"database-info" : null,
+	"dir-cur-bld" : "/home/mbac/code/c++caml/cxx/build-release",
+	"dir-cur-src" : "/home/mbac/code/c++caml/cxx",
+	"dir-top-bld" : "/home/mbac/code/c++caml/cxx/build-release",
+	"dir-top-src" : "/home/mbac/code/c++caml/cxx",
+	"exports" : [],
+	"forward-modules-from-target-dirs" : [],
+	"include-dirs" : 
+	[
+		"/home/mbac/code/c++caml/cxx/include"
+	],
+	"language" : "CXX",
+	"linked-target-dirs" : [],
+	"module-dir" : "/home/mbac/code/c++caml/cxx/build-release/CMakeFiles/cppcaml_core.dir",
+	"sources" : 
+	{
+		"CMakeFiles/cppcaml_core.dir/src/ast_print.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/ast_print.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/blake2.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/blake2.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/bytecode.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/bytecode.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/cmi.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/cmi.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/cmo.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/cmo.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/infer.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/infer.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/infer_check.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/infer_check.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/lambda.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/lambda.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/lexer.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/lexer.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/link.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/link.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/marshal.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/marshal.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/omarshal.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/omarshal.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/parser.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/parser.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/token.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/token.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/typedtree_print.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/typedtree_print.cpp"
+		},
+		"CMakeFiles/cppcaml_core.dir/src/typer.cpp.o" : 
+		{
+			"language" : "CXX",
+			"source" : "/home/mbac/code/c++caml/cxx/src/typer.cpp"
+		}
+	}
+}

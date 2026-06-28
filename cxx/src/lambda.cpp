@@ -8505,17 +8505,22 @@ struct Translator {
         als.push_back(pa->name.txt);
         l = effective_pat(pa->p.get());
       }
-      // A `#type [as id]` pattern matches a (possibly qualified / cmi-resolved)
-      // subset of polyvariant tags whose exact set we may not know.  As the LAST
-      // arm of an exhaustive match it is the residual catch-all (same reasoning
-      // as the single-`#poly`-row irrefutable path above): earlier explicit arms
-      // are tested first, this binds its alias to the scrutinee and runs.  A
-      // `#type` arm that is NOT last could shadow later arms whose tags we cannot
-      // exclude, so bail and let another path handle it.
-      if (std::holds_alternative<Ppat_type>(l->desc)) {
-        if (ri + 1 != rows0.size()) return nullptr;
-        rows.push_back({l, r.rhs, r.guard, als, {}, true});
-        continue;
+      // A `#type [as id]` pattern matches a subset of polyvariant tags.  When the
+      // tag set is RESOLVABLE (a local abbreviation or, cross-module, via the
+      // qualified `#Mod.type` cmi lookup) it compiles like any other testable row
+      // -- pat_test dispatches on the tags and binds the alias -- so a non-last /
+      // GUARDED `#type` arm works (matching.ml's `#Simple.view as view when ..`).
+      // When the set is UNKNOWN it is only sound as the LAST (residual) arm, where
+      // it binds its alias and runs without a test (earlier arms filtered first).
+      if (auto* pt0 = std::get_if<Ppat_type>(&l->desc)) {
+        std::set<long long> tags; std::set<std::string> seen;
+        collect_pv_tags_lid(pt0->id.txt, tags, seen);
+        if (tags.empty()) {
+          if (ri + 1 != rows0.size()) return nullptr;
+          rows.push_back({l, r.rhs, r.guard, als, {}, true});
+          continue;
+        }
+        // known tags: fall through to the normal testable-row path below.
       }
       std::vector<const Pattern*> alts;
       flatten_or(l, alts);  // top-level or split (preserves non-binding-or codegen)
