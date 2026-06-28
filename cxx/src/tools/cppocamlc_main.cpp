@@ -63,10 +63,16 @@ static std::string module_name(const std::string& path) {
   return base;
 }
 
-// ocamlc spells a stdlib-relative include dir as `+unix` (= <stdlib>/unix).
+// ocamlc spells a stdlib-relative include dir as `+unix` (= <stdlib>/unix in an
+// install).  In this repo's dev layout the otherlibs live at <stdlib>/../otherlibs
+// instead, so fall back there when <stdlib>/<x> is absent.
 static std::string resolve_incdir(const std::string& d, const std::string& stdlib_dir) {
-  if (!d.empty() && d[0] == '+') return (fs::path(stdlib_dir) / d.substr(1)).string();
-  return d;
+  if (d.empty() || d[0] != '+') return d;
+  fs::path inst = fs::path(stdlib_dir) / d.substr(1);
+  if (fs::exists(inst)) return inst.string();
+  fs::path dev = fs::path(stdlib_dir).parent_path() / "otherlibs" / d.substr(1);
+  if (fs::exists(dev)) return dev.string();
+  return inst.string();
 }
 
 static bool ends_with(const std::string& s, const char* suf) {
