@@ -3749,6 +3749,23 @@ struct Translator {
       }
     }
   }
+  // A var bound to a record LITERAL whose label set uniquely identifies one record
+  // type: remember that type's layout so a later `v.label` reads the right offset
+  // even when the label is AMBIGUOUS across records (`md.md_type` --
+  // Types.module_declaration@0 vs Typedtree.module_declaration@4 -- find_field
+  // would pick the wrong one).
+  std::map<int, StdRec> var_record_lit_;
+  void record_record_lit(const Ident& id, const Expression* e) {
+    if (!e) return;
+    auto* rc = std::get_if<Pexp_record>(&e->desc);
+    if (!rc || rc->base || rc->fields.empty()) return;
+    build_labelset_index();
+    std::vector<std::string> key;
+    for (auto& [lid, v] : rc->fields) key.push_back(lid_last(lid.txt));
+    std::sort(key.begin(), key.end());
+    if (auto it = labelset_index_.find(key); it != labelset_index_.end())
+      var_record_lit_[id.stamp] = it->second;
+  }
   // The declared type path of `record_type`'s field `label`, from its cmi decl.
   std::string record_field_type_path(const std::string& record_type,
                                      const std::string& label) {
@@ -9648,6 +9665,26 @@ struct Translator {
               }
         }
       }
+      // A var bound to a record LITERAL of a label-set-determined type: resolve the
+      // (possibly ambiguous) label through that exact layout (`md.md_type` ->
+      // Types.module_declaration@0, not Typedtree.module_declaration@4).
+      if (auto* id = std::get_if<Pexp_ident>(&fe->e->desc))
+        if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+          if (auto* b = lookup(l->name))
+            if (auto vit = var_record_lit_.find(b->stamp); vit != var_record_lit_.end()) {
+              const StdRec& sr = vit->second;
+              std::string lbl = lid_last(fe->field.txt);
+              for (int i = 0; i < (int)sr.labels.size(); ++i)
+                if (sr.labels[i] == lbl) {
+                  auto lp = mk(Lam::K::Prim);
+                  lp->prim = sr.flat ? Prim::Floatfield
+                             : sr.shape[i] == ValueKind::Int ? Prim::FieldInt
+                             : sr.mut[i]                     ? Prim::FieldMut
+                                                             : Prim::FieldImm;
+                  lp->prim_arg = i; lp->args = {expr(*fe->e)};
+                  return lp;
+                }
+            }
       // A var bound to an inline-record field of NAMED RECORD type (`Pattern
       // {penv}`, penv : Pattern_env.t): resolve its AMBIGUOUS label through that
       // record type, which find_field below cannot disambiguate (Ctype.get_env's
@@ -10731,6 +10768,7 @@ struct Translator {
           // own references resolve to the OUTER binding (`let f .. = f ..` wrapping
           // an outer f), which is what the residual-signature analysis must see.
           record_fn_sig(id, b.expr.get());
+          record_record_lit(id, b.expr.get());
           scope.back()[pv->name.txt] = id;
         } else {  // `let (a,b) = e` / `let {a;b} = e`: the irrefutable sub-vars read
           LamPtr val = expr(*b.expr);  // fields of e -- directly when e is a var, else
