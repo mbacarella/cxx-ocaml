@@ -7014,6 +7014,33 @@ struct Translator {
       if (LamPtr a = build_block_arm(scrut, ci, k, *rs[0]->rhs, g, dflt)) return a;
     }
     for (auto* r : rs) if (r->guard) return nullptr;  // multi-row guards: bail
+    // An INLINE-RECORD ctor with multiple rows (`Tfunction_cases {cases=..}` in two
+    // arms): the block IS the inline record.  Map each row's record pattern to its
+    // positional field sub-patterns; if they all constrain a SINGLE common field,
+    // sub-match on that field (read at its inline index).  Multi-field divergence is
+    // a multi-column match we don't replicate -> bail.
+    if (!ci.rlabels.empty()) {
+      int col = -1;
+      std::vector<std::vector<const Pattern*>> rowfps;
+      for (auto* r : rs) {
+        auto* k = std::get_if<Ppat_construct>(&r->lhs->desc);
+        if (!k) return nullptr;
+        auto fps = ctor_field_pats(k, ci.arity);
+        if (fps.size() != ci.rlabels.size()) return nullptr;
+        for (int i = 0; i < (int)fps.size(); ++i)
+          if (!std::holds_alternative<Ppat_any>(effective_pat(fps[i])->desc)) {
+            if (col < 0) col = i;
+            else if (col != i) return nullptr;  // multi-column: bail
+          }
+        rowfps.push_back(std::move(fps));
+      }
+      if (col < 0) return nullptr;
+      std::vector<Row> sub;
+      for (size_t ri = 0; ri < rs.size(); ++ri)
+        sub.push_back({rowfps[ri][col], rs[ri]->rhs, rs[ri]->guard});
+      FieldInfo fi{ci.type, col, ci.rfmut[col], ci.rshape[col]};
+      return compile_match(field_read(&fi, scrut), sub, mloc);
+    }
     if (ci.arity != 1) return nullptr;  // multi-field multi-row: multi-column, bail
     LamPtr field0 = fieldimm(0, scrut);
     std::vector<Row> sub;
@@ -7156,6 +7183,24 @@ struct Translator {
     std::vector<const Pattern*> v;
     if (!k->arg) return v;
     const Pattern& arg = **k->arg;
+    // An INLINE-RECORD ctor (`Tfunction_cases { cases = .. }`): the arg is a record
+    // pattern; map its field patterns to positional sub-patterns in the ctor's
+    // label order (absent labels -> wildcard), so the match compiler reads/binds
+    // each inline field by index.  Without this the record arg matched no shape and
+    // ctor_field_pats returned empty -> a bound var (`c_rhs`) was left unresolved.
+    if (auto* pr = std::get_if<Ppat_record>(&effective_pat(&arg)->desc)) {
+      auto ci = ctor_info_.find(lid_last(k->id.txt));
+      if (ci != ctor_info_.end() && !ci->second.rlabels.empty()) {
+        static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
+        for (auto& lbl : ci->second.rlabels) {
+          const Pattern* fp = &any_pat;
+          for (auto& [l, sub] : pr->fields)
+            if (lid_last(l.txt) == lbl) { fp = sub.get(); break; }
+          v.push_back(fp);
+        }
+        return v;
+      }
+    }
     if (arity > 1) {
       if (auto* tup = std::get_if<Ppat_tuple>(&arg.desc))
         for (auto& e : tup->elems) v.push_back(e.get());
