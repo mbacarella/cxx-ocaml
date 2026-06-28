@@ -9667,6 +9667,53 @@ struct Translator {
               return b;
             }
           }
+          // A functional update of an inline record, re-wrapped in its ctor
+          // (`Pattern { r with assume_injective = false }`): copy the base's fields,
+          // override the updated labels, rebuild the ctor block.  Without this the
+          // update collapses to a 1-field block and later field reads go OOB.
+          if (rc && rc->base) {
+            auto& L = cip->rlabels;
+            std::unordered_map<std::string, const Expression*> upd;
+            bool ok = true;
+            for (auto& [lid, ve] : rc->fields) {
+              std::string ln = lid_last(lid.txt);
+              if (std::find(L.begin(), L.end(), ln) == L.end()) { ok = false; break; }
+              upd[ln] = ve.get();
+            }
+            if (ok) {
+              LamPtr basev = expr(**rc->base);
+              bool temp = basev->k != Lam::K::Var;
+              Ident tv;
+              LamPtr bref = basev;
+              if (temp) { tv = fresh("with"); bref = mk(Lam::K::Var); bref->var = tv; }
+              std::vector<LamPtr> vals;
+              for (int i = 0; i < (int)L.size(); ++i) {
+                auto u = upd.find(L[i]);
+                if (u != upd.end()) vals.push_back(expr(*u->second));
+                else {
+                  FieldInfo fi{cip->type, i, cip->rfmut[i], cip->rshape[i]};
+                  vals.push_back(field_read(&fi, bref));
+                }
+              }
+              bool anymut = false;
+              for (bool m : cip->rfmut) anymut = anymut || m;
+              LamPtr blk;
+              if (anymut) {
+                auto m = mk(Lam::K::Prim);
+                m->prim = Prim::Makemutable; m->prim_arg = cip->tag;
+                m->blk_shape = cip->rshape; m->args = std::move(vals);
+                blk = m;
+              } else {
+                blk = block(cip->tag, std::move(vals));
+                if (blk->k == Lam::K::Prim) blk->blk_shape = cip->rshape;
+              }
+              if (!temp) return blk;
+              auto lt = mk(Lam::K::Let);
+              lt->bindings = {{tv, ValueKind::Gen, basev}};
+              lt->body = blk;
+              return lt;
+            }
+          }
         }
         std::vector<const Expression*> fs;
         if (k->arg) {  // `B of t1 * t2` flattens the tuple argument into fields
