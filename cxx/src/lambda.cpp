@@ -12617,12 +12617,20 @@ struct Translator {
           // a bare `open Ops` where Ops is a submodule of an already-opened module
           // (e.g. `open M; open Ops`, M a functor param): open it as `M.Ops`.
           if (dotted.find('.') == std::string::npos && !module_base(dotted) &&
-              fields_of(dotted).empty())
+              fields_of(dotted).empty()) {
             for (auto o = opened_.rbegin(); o != opened_.rend(); ++o) {
               auto li = module_layout_.find(*o);
               if (li != module_layout_.end() && li->second.count(dotted) &&
                   module_layout_.count(*o + "." + dotted)) { dotted = *o + "." + dotted; break; }
             }
+            // An IMPORTED opened module's submodule (`open Transient_expr` under
+            // `open Types`, Types from its cmi -- module_layout_ has no entry for
+            // it): expand via the cmi so its bare values/labels resolve through the
+            // dotted-submodule path (else `repr` -> unbound `?repr` -> garbage).
+            if (dotted.find('.') == std::string::npos)
+              if (std::string full = opened_submodule_path(dotted); !full.empty())
+                dotted = full;
+          }
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
           else
