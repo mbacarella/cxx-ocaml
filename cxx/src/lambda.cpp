@@ -1183,7 +1183,7 @@ struct Translator {
         auto it = vk.pat_constr.find(&p);
         if (it != vk.pat_constr.end()) register_ctors_of_type(it->second);
       }
-      if (k->arg) scan_pat_ctors(**k->arg);
+      if (k->arg) { tag_ctor_record_args(lid_last(k->id.txt), k->arg->get()); scan_pat_ctors(**k->arg); }
     } else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
       for (auto& e : t->elems) scan_pat_ctors(*e);
     } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
@@ -1545,6 +1545,14 @@ struct Translator {
     auto* pv = std::get_if<Ppat_var>(&effective_pat(sub)->desc);
     if (!pv) return;
     if (auto* b = lookup(pv->name.txt)) var_record_path_[b->stamp] = ci.rftypes[ix];
+  }
+  // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
+  // enclosing constructor argument declares -- applied to var_record_path_ when the
+  // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
+  std::unordered_map<const void*, std::string> var_node_path_;
+  void apply_var_node_path(const Pattern* p, const Ident& id) {
+    if (auto it = var_node_path_.find((const void*)p); it != var_node_path_.end())
+      var_record_path_[id.stamp] = it->second;
   }
   // `x.label` where x was bound to a whole inline record by `Ctor x` -- resolve
   // the field via that ctor's rlabels, so an AMBIGUOUS label (ident.ml's `stamp`,
@@ -3700,6 +3708,11 @@ struct Translator {
   std::map<std::string, StdRec> record_by_name_;
   std::map<std::string, std::map<std::string, std::string>> record_field_types_;
   std::set<std::string> record_by_name_ambig_;
+  // A variant constructor's argument type paths (qualified with the defining
+  // module), so a record arg pattern (`Sig_module(_,_,{md_type=..},_,_)`) resolves
+  // its AMBIGUOUS label through Types.module_declaration, not the last-registered.
+  std::map<std::string, std::vector<std::string>> ctor_arg_paths_;
+  std::set<std::string> ctor_arg_paths_ambig_;
   void build_labelset_index() {
     if (labelset_index_built_) return;
     labelset_index_built_ = true;
@@ -3712,7 +3725,25 @@ struct Translator {
         if (ent.path().extension() != ".cmi") continue;
         try {
           auto cmi = cmi::CmiFile::load(ent.path().string());
+          std::string modname = ent.path().stem().string();
+          if (!modname.empty()) modname[0] = (char)std::toupper((unsigned char)modname[0]);
           for (auto& td : cmi.sig().types) {
+            if (td.kind == cmi::TypeDecl::Variant && !td.ctors.empty())
+              for (auto& c : td.ctors) {
+                if (ctor_arg_paths_ambig_.count(c.name)) continue;
+                std::vector<std::string> argpaths;
+                for (auto& a : c.args) {
+                  std::string p = cmi_type_ctor_path(a);
+                  // a local (bare) type of this cmi -> qualify with its module
+                  if (!p.empty() && p.find('.') == std::string::npos) p = modname + "." + p;
+                  argpaths.push_back(p);
+                }
+                auto ci = ctor_arg_paths_.find(c.name);
+                if (ci == ctor_arg_paths_.end()) ctor_arg_paths_[c.name] = std::move(argpaths);
+                else if (ci->second != argpaths) {  // same ctor name, different module
+                  ctor_arg_paths_.erase(ci); ctor_arg_paths_ambig_.insert(c.name);
+                }
+              }
             if (td.kind != cmi::TypeDecl::Record || td.labels.empty()) continue;
             StdRec r; bool all_float = true;
             std::vector<std::string> key;
@@ -3809,6 +3840,30 @@ struct Translator {
     if (!std::get_if<Ppat_record>(&e->desc)) return;
     if (std::string vt = record_field_type_path(fi->type, label); !vt.empty())
       pat_type_hint_[(const void*)e] = vt;
+  }
+  // While scanning a constructor pattern `C(a0, a1, ..)`, tag any record-pattern
+  // argument with C's declared arg type (qualified), so its labels resolve through
+  // that record even when ambiguous (`Sig_module(_,_,{md_type=..},_,_)`).
+  void tag_ctor_record_args(const std::string& ctor, const Pattern* arg) {
+    if (!arg) return;
+    build_labelset_index();
+    auto it = ctor_arg_paths_.find(ctor);
+    if (it == ctor_arg_paths_.end()) return;
+    const std::vector<std::string>& paths = it->second;
+    std::vector<const Pattern*> args;
+    const Pattern* a0 = effective_pat(arg);
+    if (auto* tup = std::get_if<Ppat_tuple>(&a0->desc); tup && tup->elems.size() == paths.size())
+      for (auto& e : tup->elems) args.push_back(e.get());
+    else if (paths.size() == 1) args.push_back(arg);
+    else return;
+    for (size_t i = 0; i < args.size() && i < paths.size(); ++i) {
+      if (paths[i].empty() || paths[i].find('.') == std::string::npos) continue;
+      const Pattern* s = effective_pat(args[i]);
+      if (std::get_if<Ppat_record>(&s->desc))
+        pat_type_hint_[(const void*)s] = paths[i];
+      else if (std::get_if<Ppat_var>(&s->desc))  // a var arg: tag for var_record_path_
+        var_node_path_[(const void*)s] = paths[i];
+    }
   }
   // type that has `label`.  Used for an explicitly deep-qualified record literal
   // (`{ CamlinternalMenhirLib.EngineTypes.state = .. }` in menhir's actions).
@@ -3915,8 +3970,13 @@ struct Translator {
     // its (ambiguous) labels through that type, not a same-labelled local record
     // (bytegen's function_to_compile vs Lambda's lfunction).
     if (pat_key)
-      if (auto h = pat_type_hint_.find(pat_key); h != pat_type_hint_.end())
+      if (auto h = pat_type_hint_.find(pat_key); h != pat_type_hint_.end()) {
+        // a QUALIFIED hint (`Types.module_declaration`) names the exact record's
+        // module -- resolve through it so an ambiguous label (md_type, shared with
+        // Typedtree.module_declaration) is not stripped to the bare ambiguous name.
+        if (auto rf = resolve_field_in_record_path(h->second, n)) { store = *rf; return &store; }
         if (const FieldInfo* fi = named_record_field(h->second, n, store)) return fi;
+      }
     // A bare label whose record is pinned by a QUALIFIED SIBLING field
     // (`{Types.cd_id; cd_args; cd_res}`): OCaml requires all fields of one record,
     // so the sibling's module is authoritative -- resolve `cd_args` as
@@ -6768,7 +6828,8 @@ struct Translator {
     if (std::holds_alternative<Ppat_any>(p->desc)) return true;
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
       Ident id = fresh(pv->name.txt);
-      scope.back()[pv->name.txt] = id; out.push_back({id, scrut}); return true;
+      scope.back()[pv->name.txt] = id; apply_var_node_path(p, id);
+      out.push_back({id, scrut}); return true;
     }
     if (auto* up = std::get_if<Ppat_unpack>(&p->desc)) {  // `(module M [: S])`: bind M
       if (up->name.txt) {
@@ -6845,8 +6906,11 @@ struct Translator {
       }
       auto fps = ctor_field_pats(pk, ci->second.arity);
       if ((int)fps.size() != ci->second.arity) return false;
-      for (size_t i = 0; i < fps.size(); ++i)
+      for (size_t i = 0; i < fps.size(); ++i) {
         if (!collect_binders(*fps[i], fieldimm((int)i, scrut), out)) return false;
+        if (auto* pv = std::get_if<Ppat_var>(&effective_pat(fps[i])->desc))
+          if (auto* b = lookup(pv->name.txt)) apply_var_node_path(effective_pat(fps[i]), *b);
+      }
       return true;
     }
     // A polymorphic-variant pattern: the block is [hash; arg], the payload at
@@ -7100,6 +7164,7 @@ struct Translator {
       if (std::holds_alternative<Ppat_any>(p->desc)) return;
       if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
         Ident id = fresh(pv->name.txt); scope.back()[pv->name.txt] = id;
+        apply_var_node_path(p, id);  // a ctor-arg var: tag its record type
         binders.push_back({id, acc}); return;
       }
       if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
@@ -7436,6 +7501,7 @@ struct Translator {
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
       Ident id = fresh(pv->name.txt);
       scope.back()[pv->name.txt] = id;
+      apply_var_node_path(p, id);  // a ctor-arg var: tag its record type before k()
       LamPtr body = k();
       if (count_var(body, id) <= 1) { subst_var(body, id, scrut); return body; }
       auto l = mk(Lam::K::Let);
@@ -8631,7 +8697,9 @@ struct Translator {
     const Pattern* p = effective_pat(p0);
     if (std::holds_alternative<Ppat_any>(p->desc)) return true;
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
-      binds.push_back({fresh(pv->name.txt), acc});
+      Ident id = fresh(pv->name.txt);
+      apply_var_node_path(p, id);  // a ctor-arg var: tag its record type
+      binds.push_back({id, acc});
       return true;
     }
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
@@ -9610,6 +9678,26 @@ struct Translator {
         l->prim_arg = rf->index; l->args = {expr(*fe->e)};
         return l;
       }
+      // A var bound to a constructor argument or inline-record field of a KNOWN
+      // record type: that declared type is AUTHORITATIVE, beating the checker's
+      // ambiguous guess below for a var whose type it could not pin down
+      // (`Sig_module(_,_,md,_,_)` then `md.md_type` -> Types.module_declaration@0,
+      // not the last-registered Typedtree.module_declaration@4).
+      if (auto* id = std::get_if<Pexp_ident>(&fe->e->desc))
+        if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+          if (auto* b = lookup(l->name))
+            if (auto vp = var_record_path_.find(b->stamp); vp != var_record_path_.end()) {
+              if (auto rf = resolve_field_in_record_path(vp->second, lid_last(fe->field.txt))) {
+                auto lp = mk(Lam::K::Prim);
+                auto rt = rec_types_.find(rf->type);
+                lp->prim = (rt != rec_types_.end() && rt->second.flat) ? Prim::Floatfield
+                           : rf->kind == ValueKind::Int ? Prim::FieldInt
+                           : rf->mut                    ? Prim::FieldMut
+                                                        : Prim::FieldImm;
+                lp->prim_arg = rf->index; lp->args = {expr(*fe->e)};
+                return lp;
+              }
+            }
       // An AMBIGUOUS label resolved by the checker through the base's type
       // identity (the bare find_field below cannot disambiguate same-named
       // records -- Sign_diff.t.untypables@4 vs signature_symptom.untypables@8).
