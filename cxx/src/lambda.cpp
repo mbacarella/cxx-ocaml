@@ -770,8 +770,16 @@ struct Translator {
     std::vector<std::string> rlabels;
     std::vector<ValueKind> rshape;
     std::vector<bool> rfmut;
+    // The (dotted) type path of each inline-record field whose type is a named
+    // record (`Pattern {penv : Pattern_env.t}` -> "Pattern_env.t"), else "".  Lets a
+    // var bound to such a field resolve its own AMBIGUOUS labels by that type.
+    std::vector<std::string> rftypes;
   };
   std::unordered_map<std::string, CtorInfo> ctor_info_;
+  // A var bound to an inline-record field of NAMED RECORD type (`Pattern {penv}`,
+  // penv : Pattern_env.t): its stamp -> that record's dotted type path, so a later
+  // `penv.env` (env AMBIGUOUS) resolves through Pattern_env.t instead of find_field.
+  std::unordered_map<int, std::string> var_record_path_;
   // A variable bound to a WHOLE inline record by `Ctor x` (ident.ml's `Local x`):
   // its var stamp -> that ctor's CtorInfo, so a later `x.field` reads the inline
   // record's field even when the label is AMBIGUOUS across constructors (Local/
@@ -879,6 +887,21 @@ struct Translator {
                    bool flat = false; };  // all-float: a flat float block, not a record
   std::unordered_map<std::string, RecType> rec_types_;  // type name -> record layout
 
+  // The dotted type path of a core type that is a named-record constructor
+  // (`Pattern_env.t`, `foo`), for type-directed field resolution of a var bound to
+  // it.  Empty for builtins, type variables, arrows, tuples, etc.
+  std::string coretype_record_path(const CoreType& t) {
+    auto* c = std::get_if<Ptyp_constr>(&t.desc);
+    if (!c) return "";
+    std::string b = lid_last(c->id.txt);
+    static const std::set<std::string> builtins = {
+        "int","char","bool","unit","float","string","bytes","int32","int64",
+        "nativeint","list","array","option","ref","exn","lazy_t"};
+    if (builtins.count(b)) return "";
+    std::string dotted;
+    if (!lid_to_dotted(c->id.txt, dotted)) return "";
+    return dotted;
+  }
   // The value kind of a field/element from its syntactic core type (builtins and
   // immediate local variants; everything else is generic/boxed).
   ValueKind coretype_kind(const CoreType& t) {
@@ -992,6 +1015,7 @@ struct Translator {
                 ci.rlabels.push_back(l.name);
                 ci.rshape.push_back(cmi_field_kind(l.type));
                 ci.rfmut.push_back(l.mutable_);
+                ci.rftypes.push_back("");
               }
             out[c.name] = std::move(ci);
           }
@@ -1212,6 +1236,7 @@ struct Translator {
               ci.rlabels.push_back(f.name.txt);
               ci.rshape.push_back(fk);
               ci.rfmut.push_back(fm);
+              ci.rftypes.push_back(coretype_record_path(*f.type));
               // the labels resolve like record labels (`r.cnt` on a bound
               // inline-record value reads the block field)
               if (field_info_.count(f.name.txt)) ambiguous_fields_.insert(f.name.txt);
@@ -1394,6 +1419,7 @@ struct Translator {
                       ci.rlabels.push_back(f.name.txt);
                       ci.rshape.push_back(fk);
                       ci.rfmut.push_back(fm);
+                      ci.rftypes.push_back(coretype_record_path(*f.type));
                       if (!field_info_.count(f.name.txt))
                         field_info_[f.name.txt] = {d.name.txt, ridx, fm, fk};
                       ++ridx;
@@ -1472,6 +1498,43 @@ struct Translator {
     if (ambiguous_fields_.count(label) && !scoped_unambig_fields_.count(label)) return nullptr;
     auto it = field_info_.find(label);
     return it == field_info_.end() ? nullptr : &it->second;
+  }
+  // Resolve `label` of a record named by dotted `path` -- a bare local record
+  // ("foo"), a LOCAL submodule record ("Pattern_env.t" via mod_record_types_), or
+  // an IMPORTED module record ("Mod.t" via its cmi).  Used for a var tagged
+  // (var_record_path_) with its record type when its label is AMBIGUOUS.
+  std::optional<FieldInfo> resolve_field_in_record_path(const std::string& path,
+                                                        const std::string& label) {
+    auto in_key = [&](const std::string& key) -> std::optional<FieldInfo> {
+      auto tf = type_field_info_.find(key);
+      if (tf == type_field_info_.end()) return std::nullopt;
+      auto f = tf->second.find(label);
+      if (f == tf->second.end()) return std::nullopt;
+      return f->second;
+    };
+    auto dpos = path.rfind('.');
+    if (dpos == std::string::npos) return in_key(path);  // bare local record
+    std::string mod = path.substr(0, dpos), ty = path.substr(dpos + 1);
+    if (auto mr = mod_record_types_.find(mod); mr != mod_record_types_.end())
+      for (auto& key : mr->second)
+        if (key == ty || (key.size() > ty.size() + 1 &&
+                          key.compare(0, ty.size(), ty) == 0 && key[ty.size()] == '#'))
+          if (auto fi = in_key(key)) return fi;
+    if (mod.find('.') == std::string::npos)  // an imported top-level module's record
+      if (auto sr = stdlib_record_layout_named(mod, ty)) {
+        for (int i = 0; i < (int)sr->labels.size(); ++i)
+          if (sr->labels[i] == label)
+            return FieldInfo{ty, i, sr->mut[i], sr->shape[i]};
+      }
+    return std::nullopt;
+  }
+  // Tag a var bound by an inline-record-ctor field pattern (`Pattern {penv}`) with
+  // its field's record type, so a later `penv.env` resolves the ambiguous label.
+  void tag_inline_field_var(const Pattern* sub, const CtorInfo& ci, int ix) {
+    if (ix < 0 || ix >= (int)ci.rftypes.size() || ci.rftypes[ix].empty()) return;
+    auto* pv = std::get_if<Ppat_var>(&effective_pat(sub)->desc);
+    if (!pv) return;
+    if (auto* b = lookup(pv->name.txt)) var_record_path_[b->stamp] = ci.rftypes[ix];
   }
   // `x.label` where x was bound to a whole inline record by `Ctor x` -- resolve
   // the field via that ctor's rlabels, so an AMBIGUOUS label (ident.ml's `stamp`,
@@ -2378,6 +2441,7 @@ struct Translator {
                   ci.rlabels.push_back(l.name);
                   ci.rshape.push_back(cmi_field_kind(l.type));
                   ci.rfmut.push_back(l.mutable_);
+                  ci.rftypes.push_back("");
                 }
               ctor_info_[c.name] = ci;
               type_ctor_info_[td.name][c.name] = std::move(ci);
@@ -6594,6 +6658,7 @@ struct Translator {
           if (ix < 0) return false;
           FieldInfo fi{ci->second.type, ix, ci->second.rfmut[ix], ci->second.rshape[ix]};
           if (!collect_binders(*sub, field_read(&fi, scrut), out)) return false;
+          tag_inline_field_var(sub.get(), ci->second, ix);
         }
         return true;
       }
@@ -6896,6 +6961,7 @@ struct Translator {
             if (ix < 0) { ok = false; break; }
             FieldInfo fi{ci.type, ix, ci.rfmut[ix], ci.rshape[ix]};
             destruct(*sub, field_read(&fi, scrut));
+            tag_inline_field_var(sub.get(), ci, ix);
           }
         } else {
           destruct(arg, scrut);
@@ -9368,6 +9434,25 @@ struct Translator {
               }
         }
       }
+      // A var bound to an inline-record field of NAMED RECORD type (`Pattern
+      // {penv}`, penv : Pattern_env.t): resolve its AMBIGUOUS label through that
+      // record type, which find_field below cannot disambiguate (Ctype.get_env's
+      // `penv.env` -- env shared with the Expression inline record -> else 0).
+      if (auto* id = std::get_if<Pexp_ident>(&fe->e->desc))
+        if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+          if (auto* b = lookup(l->name))
+            if (auto vp = var_record_path_.find(b->stamp); vp != var_record_path_.end())
+              if (auto rf = resolve_field_in_record_path(vp->second,
+                                                         lid_last(fe->field.txt))) {
+                auto lp = mk(Lam::K::Prim);
+                auto rt = rec_types_.find(rf->type);
+                lp->prim = (rt != rec_types_.end() && rt->second.flat) ? Prim::Floatfield
+                           : rf->kind == ValueKind::Int ? Prim::FieldInt
+                           : rf->mut                    ? Prim::FieldMut
+                                                        : Prim::FieldImm;
+                lp->prim_arg = rf->index; lp->args = {expr(*fe->e)};
+                return lp;
+              }
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);
