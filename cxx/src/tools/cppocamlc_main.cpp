@@ -1,12 +1,18 @@
-// c++ocamlc — the drop-in driver: compile an OCaml source file and link it into
-// a runnable bytecode executable in one step.
+// c++ocamlc — the drop-in driver: a command-line-compatible bytecode `ocamlc`.
 //
-//   c++ocamlc hello.ml -o hello && ./hello
+//   c++ocamlc -c foo.ml                    # foo.ml -> foo.cmo (+ foo.cmi)
+//   c++ocamlc a.cmo b.cmo -o prog          # link into a runnable bytecode exe
+//   c++ocamlc -I src -w +a-4 -c src/x.ml   # accepts ocamlc's flag vocabulary
 //
 // Runs the whole c++caml pipeline (parse -> infer -> Lambda -> Bytegen ->
 // emitcode) then links against the stdlib and writes a `#!ocamlrun` launcher so
 // the result is directly executable.  No ocamlc involved; only ocamlrun (the C
 // VM) and the prebuilt stdlib objects are reused.
+//
+// CLI policy: flags whose ARGUMENT we must consume (else they would be mistaken
+// for a source file) and meaning-preserving toggles are accepted and ignored;
+// flags that would silently change the meaning of the output if ignored (-pp,
+// -ppx, -pack, -a, -open, ...) are reported as unsupported rather than dropped.
 #include <sys/stat.h>
 
 #include <cctype>
@@ -15,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -28,6 +35,8 @@
 #include "cppcaml/parser.hpp"
 
 namespace fs = std::filesystem;
+
+static const char* kVersion = "5.6.0+dev0-2026-01-26";
 
 // Locate the stdlib directory (containing stdlib.cmi / stdlib.cma): an explicit
 // -I, else $OCAMLLIB/$CAMLLIB, else "stdlib" relative to the CWD, else relative
@@ -54,72 +63,51 @@ static std::string module_name(const std::string& path) {
   return base;
 }
 
-int main(int argc, char** argv) {
-  std::string in_path, out_path, stdlib_dir, runtime;
-  std::vector<std::string> incdirs;  // all -I dirs, in order
-  bool compile_only = false;  // -c : stop at the .cmo
-  for (int i = 1; i < argc; ++i) {
-    std::string a = argv[i];
-    if (a == "-o" && i + 1 < argc) out_path = argv[++i];
-    else if (a == "-I" && i + 1 < argc) incdirs.push_back(argv[++i]);
-    else if (a == "-runtime" && i + 1 < argc) runtime = argv[++i];
-    else if (a == "-c") compile_only = true;
-    else in_path = a;
-  }
-  if (in_path.empty()) {
-    std::cerr << "usage: c++ocamlc [-c] [-I <dir>]... [-runtime <ocamlrun>] "
-                 "<file.ml> [-o <out>]\n";
-    return 2;
-  }
-  std::string mod = module_name(in_path);
-  // stdlib_dir = the -I dir that actually holds stdlib.cmi (so `-I . -I <stdlib>`
-  // and `-I <stdlib> -I .` both work); else the usual discovery.  All -I dirs are
-  // searched for separately-compiled local module interfaces.
-  for (const std::string& d : incdirs)
-    if (fs::exists(fs::path(d) / "stdlib.cmi")) { stdlib_dir = d; break; }
-  stdlib_dir = discover_stdlib(stdlib_dir);
-  cppcaml::lambda::set_module_dirs(incdirs);
-  cppcaml::set_infer_module_dirs(incdirs);
-  cppcaml::set_infer_stdlib_dir(stdlib_dir);  // .mli cmi-writing reads .cmi too
-  cppcaml::cmi::cmiw::set_module_dirs(stdlib_dir, incdirs);
-  if (out_path.empty()) {
-    fs::path p(in_path);
-    out_path = compile_only ? (p.parent_path() / (p.stem().string() + ".cmo")).string()
-                            : p.stem().string();
-  }
-  // Default the launcher path to an absolute ocamlrun next to the stdlib dir.
-  if (runtime.empty()) {
-    fs::path r = fs::absolute(fs::path(stdlib_dir)).parent_path() / "runtime" / "ocamlrun";
-    if (fs::exists(r)) runtime = r.string();
-  }
+// ocamlc spells a stdlib-relative include dir as `+unix` (= <stdlib>/unix).
+static std::string resolve_incdir(const std::string& d, const std::string& stdlib_dir) {
+  if (!d.empty() && d[0] == '+') return (fs::path(stdlib_dir) / d.substr(1)).string();
+  return d;
+}
 
+static bool ends_with(const std::string& s, const char* suf) {
+  size_t n = std::string(suf).size();
+  return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+}
+
+// Flags taking ONE argument that we accept and ignore (must consume the arg so
+// it is not mistaken for a source file).
+static const std::set<std::string> kArgIgnore = {
+    "-w", "-warn-error", "-alert", "-color", "-error-style", "-cclib", "-ccopt",
+    "-dllib", "-dllpath", "-stop-after", "-intf-suffix", "-intf_suffix",
+    "-cmi-file", "-dump-dir", "-inline", "-afl-inst-ratio", "-function-sections",
+    "-match-context-rows", "-runtime-variant", "-with-runtime"};
+// Boolean flags we accept and ignore (meaning-preserving for our bytecode output).
+static const std::set<std::string> kBoolIgnore = {
+    "-safe-string", "-unsafe-string", "-strict-sequence", "-no-strict-sequence",
+    "-strict-formats", "-no-strict-formats", "-bin-annot", "-bin-annot-occurrences",
+    "-annot", "-g", "-no-g", "-opaque", "-principal", "-no-principal", "-rectypes",
+    "-no-rectypes", "-short-paths", "-keep-locs", "-no-keep-locs", "-keep-docs",
+    "-no-keep-docs", "-absname", "-no-absname", "-noassert", "-unsafe",
+    "-no-alias-deps", "-alias-deps", "-app-funct", "-no-app-funct", "-compat-32",
+    "-noautolink", "-linkall", "-custom", "-no-check-prims", "-bytecode",
+    "-make-runtime", "-make_runtime", "-use-runtime", "-use_runtime",
+    "-warn-help", "-warn-error-help"};
+// Flags that would silently change the output if dropped -> reported unsupported.
+static const std::set<std::string> kUnsupportedArg = {"-pp", "-ppx", "-open",
+                                                      "-for-pack"};
+static const std::set<std::string> kUnsupportedBool = {"-pack", "-a", "-i",
+                                                       "-output-obj"};
+// -labels/-nolabels affect typing but not our (untyped-after-infer) output.
+static const std::set<std::string> kBoolIgnore2 = {"-labels", "-nolabels"};
+
+// Compile a single .ml -> .cmo (+ .cmi unless a hand-written .mli exists).
+// Returns 0 on success.  `cmo_out` is where the .cmo is written.
+static int compile_ml(const std::string& in_path, const std::string& cmo_out,
+                      const std::string& stdlib_dir, bool prof) {
   std::ifstream in(in_path, std::ios::binary);
   if (!in) { std::cerr << "c++ocamlc: cannot open " << in_path << '\n'; return 2; }
   std::ostringstream ss; ss << in.rdbuf();
-
-  // 0. an interface (.mli): build the .cmi from the hand-written signature
-  //    (verbatim types, no inference) and stop -- no .cmo, no link.
-  if (in_path.size() >= 4 && in_path.compare(in_path.size() - 4, 4, ".mli") == 0) {
-    fs::path p(in_path);
-    std::string cmi_out =
-        (!out_path.empty() && fs::path(out_path).extension() == ".cmi")
-            ? out_path
-            : (p.parent_path() / (p.stem().string() + ".cmi")).string();
-    try {
-      auto sig = cppcaml::parse_signature(ss.str());
-      cppcaml::cmi::cmiw::write_cmi(cmi_out, mod, cppcaml::signature_to_cmi(sig));
-    } catch (const cppcaml::ParseError& e) {
-      std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
-      return 1;
-    } catch (const std::exception& e) {
-      std::cerr << "c++ocamlc: " << in_path << ": .cmi write failed: " << e.what() << '\n';
-      return 1;
-    }
-    return 0;
-  }
-
-  // 1. compile source -> .cmo
-  bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
+  std::string mod = module_name(in_path);
   using clk = std::chrono::steady_clock;
   auto t0 = clk::now();
   auto lap = [&](const char* what, clk::time_point& prev) {
@@ -129,7 +117,6 @@ int main(int argc, char** argv) {
                 << std::chrono::duration<double, std::milli>(now - prev).count() << " ms\n";
     prev = now;
   };
-  std::string cmo = compile_only ? out_path : (fs::temp_directory_path() / (mod + ".cmo")).string();
   try {
     auto tp = t0;
     std::vector<std::string> dirfiles;
@@ -141,46 +128,160 @@ int main(int argc, char** argv) {
     lap("translate (infer+lambda)", tp);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     lap("bytegen", tp);
-    cppcaml::cmo::write_cmo(instrs, mod, cmo, required_globals);
+    cppcaml::cmo::write_cmo(instrs, mod, cmo_out, required_globals);
     lap("write_cmo", tp);
-    // Emit the interface (.cmi) next to the .cmo, from the inferred top-level
-    // value signature, so dependents can be compiled separately against it.
-    // BUT if a hand-written .mli exists for this unit, its .cmi is authoritative
-    // (it may hide values or abstract types) -- like ocamlc, don't clobber it
-    // from inference; it is compiled separately from the .mli.
-    // Best-effort while the writer is young: never let it break the .cmo / link.
-    try {
-      fs::path cmi_path = fs::path(cmo).replace_extension(".cmi");
+    try {  // best-effort .cmi from inference (unless a hand-written .mli owns it)
+      fs::path cmi_path = fs::path(cmo_out).replace_extension(".cmi");
       bool has_mli = fs::exists(fs::path(in_path).replace_extension(".mli"));
       if (!has_mli)
         cppcaml::cmi::cmiw::write_cmi(cmi_path.string(), mod, cppcaml::infer_signature(structure));
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
     }
-    lap("write_cmi", tp);
     if (prof)
-      std::cerr << "  TOTAL compile: "
+      std::cerr << "  TOTAL compile " << in_path << ": "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
   } catch (const cppcaml::ParseError& e) {
     std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
     return 1;
   } catch (const std::exception& e) {
-    // A compile-phase failure (e.g. Unbound module from path resolution): report
-    // it cleanly and exit non-zero instead of an uncaught-exception terminate.
     std::cerr << "c++ocamlc: " << in_path << ": " << e.what() << '\n';
     return 1;
   }
-  if (compile_only) return 0;
+  return 0;
+}
 
-  // 2. link: stdlib + this unit + std_exit (flushes stdout at exit)
-  std::vector<std::string> inputs = {stdlib_dir + "/stdlib.cma", cmo, stdlib_dir + "/std_exit.cmo"};
+// Compile a .mli -> .cmi.
+static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
+  std::ifstream in(in_path, std::ios::binary);
+  if (!in) { std::cerr << "c++ocamlc: cannot open " << in_path << '\n'; return 2; }
+  std::ostringstream ss; ss << in.rdbuf();
   try {
-    cppcaml::link::link_executable(inputs, out_path, runtime);
+    auto sig = cppcaml::parse_signature(ss.str());
+    cppcaml::cmi::cmiw::write_cmi(cmi_out, module_name(in_path), cppcaml::signature_to_cmi(sig));
+  } catch (const cppcaml::ParseError& e) {
+    std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
+    return 1;
+  } catch (const std::exception& e) {
+    std::cerr << "c++ocamlc: " << in_path << ": .cmi write failed: " << e.what() << '\n';
+    return 1;
+  }
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  std::string out_path, stdlib_flag, runtime;
+  std::vector<std::string> incdirs_raw;  // -I dirs (may be `+unix`), in order
+  std::vector<std::string> inputs;       // positional files (.ml/.mli/.cmo/.cma)
+  bool compile_only = false;             // -c : stop at the .cmo / .cmi
+  bool nostdlib = false;                 // -nostdlib : do not auto-link stdlib
+  bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
+
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    auto need_arg = [&](const char* what) -> const char* {
+      if (i + 1 >= argc) {
+        std::cerr << "c++ocamlc: option " << what << " needs an argument\n";
+        std::exit(2);
+      }
+      return argv[++i];
+    };
+    if (a == "-o") out_path = need_arg("-o");
+    else if (a == "-I") incdirs_raw.push_back(need_arg("-I"));
+    else if (a == "-runtime") runtime = need_arg("-runtime");
+    else if (a == "-c") compile_only = true;
+    else if (a == "-nostdlib") nostdlib = true;
+    else if (a == "-version") { std::cout << kVersion << '\n'; return 0; }
+    else if (a == "-vnum") { std::cout << kVersion << '\n'; return 0; }
+    else if (a == "-where") { std::cout << discover_stdlib(stdlib_flag) << '\n'; return 0; }
+    else if (a == "-config") {
+      std::cout << "version: " << kVersion << "\nstandard_library: "
+                << fs::absolute(discover_stdlib(stdlib_flag)).string()
+                << "\next_obj: .o\next_lib: .a\next_dll: .so\nos_type: Unix\n";
+      return 0;
+    } else if (a == "-impl") inputs.push_back(need_arg("-impl"));   // force .ml kind
+    else if (a == "-intf") inputs.push_back(need_arg("-intf"));     // force .mli kind
+    else if (kArgIgnore.count(a)) { (void)need_arg(a.c_str()); }
+    else if (kBoolIgnore.count(a) || kBoolIgnore2.count(a)) { /* accept, ignore */ }
+    else if (kUnsupportedArg.count(a)) {
+      std::cerr << "c++ocamlc: " << a << " is not supported yet\n";
+      (void)need_arg(a.c_str());
+      return 2;
+    } else if (kUnsupportedBool.count(a)) {
+      std::cerr << "c++ocamlc: " << a << " is not supported yet\n";
+      return 2;
+    } else if (!a.empty() && a[0] == '-') {
+      // An unrecognised flag: warn but keep going (be lenient for drop-in use).
+      std::cerr << "c++ocamlc: warning: ignoring unknown option " << a << '\n';
+    } else {
+      inputs.push_back(a);  // a source/object file
+    }
+  }
+
+  if (inputs.empty()) {
+    std::cerr << "usage: c++ocamlc [-c] [-I <dir>]... <files...> [-o <out>]\n";
+    return 2;
+  }
+
+  // stdlib_dir = the -I dir that actually holds stdlib.cmi, else discovery.
+  std::string stdlib_dir;
+  for (const std::string& d : incdirs_raw)
+    if (d.empty() || d[0] != '+')
+      if (fs::exists(fs::path(d) / "stdlib.cmi")) { stdlib_dir = d; break; }
+  stdlib_dir = discover_stdlib(stdlib_dir.empty() ? stdlib_flag : stdlib_dir);
+
+  std::vector<std::string> incdirs;  // resolved (+unix -> <stdlib>/unix)
+  for (const std::string& d : incdirs_raw) incdirs.push_back(resolve_incdir(d, stdlib_dir));
+  cppcaml::lambda::set_module_dirs(incdirs);
+  cppcaml::set_infer_module_dirs(incdirs);
+  cppcaml::set_infer_stdlib_dir(stdlib_dir);
+  cppcaml::cmi::cmiw::set_module_dirs(stdlib_dir, incdirs);
+
+  if (runtime.empty()) {
+    fs::path r = fs::absolute(fs::path(stdlib_dir)).parent_path() / "runtime" / "ocamlrun";
+    if (fs::exists(r)) runtime = r.string();
+  }
+
+  // Compile every source input; collect the resulting (and pre-built) objects
+  // for a possible link step.
+  std::vector<std::string> link_objs;
+  for (const std::string& f : inputs) {
+    if (ends_with(f, ".mli")) {
+      std::string cmi_out =
+          (compile_only && !out_path.empty() && ends_with(out_path, ".cmi"))
+              ? out_path
+              : (fs::path(f).parent_path() / (fs::path(f).stem().string() + ".cmi")).string();
+      if (int rc = compile_mli(f, cmi_out)) return rc;
+    } else if (ends_with(f, ".ml")) {
+      std::string cmo_out =
+          (compile_only && !out_path.empty() && ends_with(out_path, ".cmo"))
+              ? out_path
+              : (fs::path(f).parent_path() / (fs::path(f).stem().string() + ".cmo")).string();
+      if (int rc = compile_ml(f, cmo_out, stdlib_dir, prof)) return rc;
+      link_objs.push_back(cmo_out);
+    } else if (ends_with(f, ".cmo") || ends_with(f, ".cma")) {
+      link_objs.push_back(f);  // a pre-compiled object/library to link
+    } else {
+      std::cerr << "c++ocamlc: don't know what to do with " << f << '\n';
+      return 2;
+    }
+  }
+
+  if (compile_only) return 0;       // -c : no link
+  if (link_objs.empty()) return 0;  // only .mli inputs
+
+  // Link: [stdlib.cma] + objects + [std_exit.cmo] -> runnable bytecode launcher.
+  if (out_path.empty()) out_path = "a.out";
+  std::vector<std::string> linkin;
+  if (!nostdlib) linkin.push_back(stdlib_dir + "/stdlib.cma");
+  for (const std::string& o : link_objs) linkin.push_back(o);
+  if (!nostdlib) linkin.push_back(stdlib_dir + "/std_exit.cmo");
+  try {
+    cppcaml::link::link_executable(linkin, out_path, runtime);
   } catch (const std::exception& e) {
     std::cerr << "c++ocamlc: link error: " << e.what() << '\n';
     return 1;
   }
-  // 3. make the launcher executable
   chmod(out_path.c_str(), 0755);
   return 0;
 }
