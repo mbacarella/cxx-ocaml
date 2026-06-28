@@ -3046,7 +3046,10 @@ struct Translator {
     FnSig v;
     for (auto& fp : f.params) {
       auto* pv = std::get_if<Pparam_val>(&fp.desc);
-      if (!pv) return {};  // a `(type a)` param mixed in -> don't model
+      // a `(type a)` newtype param is erased at runtime: skip it (don't bail), so a
+      // GADT function `let f : type k. .. = fun ..` still reports its value params'
+      // labels -- a local wrapper of it needs them to fill omitted optionals.
+      if (!pv) continue;
       if (auto* lb = std::get_if<Labelled>(&pv->label)) v.push_back({1, lb->name});
       else if (auto* op = std::get_if<Optional>(&pv->label)) v.push_back({2, op->name});
       else v.push_back({0, ""});
@@ -3115,6 +3118,15 @@ struct Translator {
   // Record a binding's parameter labels (only if it is a function with at least
   // one labelled/optional parameter), so its call sites can reorder/wrap args.
   void record_fn_sig(const Ident& id, const Expression* e) {
+    if (!e) return;
+    // `let f : type k. t = fun ..` wraps the function in newtype/constraint nodes
+    // (one Pexp_newtype per locally-abstract type); peel them so the inner
+    // function's labelled signature is still recorded.
+    while (e) {
+      if (auto* nt = std::get_if<Pexp_newtype>(&e->desc)) { e = nt->body.get(); continue; }
+      if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) { e = ct->e.get(); continue; }
+      break;
+    }
     if (!e) return;
     if (auto* f = std::get_if<Pexp_function>(&e->desc)) {
       // first-class-module parameters `(module P : S)`: record each positional
@@ -10715,8 +10727,11 @@ struct Translator {
           Ident id = fresh(pv->name.txt);
           Lam::Binding bd{id, pat_kind(&b.pat), std::move(rhs)};
           l->bindings.push_back(std::move(bd));
-          scope.back()[pv->name.txt] = id;
+          // record BEFORE binding the name: in this non-recursive let, the RHS's
+          // own references resolve to the OUTER binding (`let f .. = f ..` wrapping
+          // an outer f), which is what the residual-signature analysis must see.
           record_fn_sig(id, b.expr.get());
+          scope.back()[pv->name.txt] = id;
         } else {  // `let (a,b) = e` / `let {a;b} = e`: the irrefutable sub-vars read
           LamPtr val = expr(*b.expr);  // fields of e -- directly when e is a var, else
           if (val->k == Lam::K::Var) {  // via a *match* temp bound to e
