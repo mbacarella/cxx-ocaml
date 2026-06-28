@@ -3602,11 +3602,23 @@ struct Translator {
     }
     return best;
   }
+  // The module qualifying a record pattern: the prefix of its first `M.field`
+  // field.  OCaml's type-directed disambiguation pins the whole record to that
+  // module, so an ambiguous bare sibling label resolves there.
+  const std::string& pat_record_qual_mod(const Ppat_record& pr) {
+    static const std::string empty;
+    for (auto& f : pr.fields)
+      if (auto* d = std::get_if<Ldot>(&f.first.txt.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          return pl->name;
+    return empty;
+  }
   // Resolve a record-PATTERN label, using the pattern's full field set to pin the
   // record for an AMBIGUOUS label (so it takes the right index, not last-wins).
   const FieldInfo* resolve_record_pat_field(const std::vector<std::string>& fields,
                                             const Longident& lid, FieldInfo& store,
-                                            const void* pat_key = nullptr) {
+                                            const void* pat_key = nullptr,
+                                            const std::string& qual_mod = "") {
     // A qualified field (`{ Lambda.code = ..; required_globals }`) names the
     // record's module: register its record types so the SIBLING bare labels
     // (required_globals) resolve by-field-set too -- else the whole pattern fails
@@ -3616,6 +3628,19 @@ struct Translator {
         register_module_records(pl->name);
     if (auto rf = qualified_field(lid)) { store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store; }
     std::string n = lid_last(lid);
+    // A bare label whose record is pinned by a QUALIFIED SIBLING field
+    // (`{Types.cd_id; cd_args; cd_res}`): OCaml requires all fields of one record,
+    // so the sibling's module is authoritative -- resolve `cd_args` as
+    // `Types.cd_args` (@1), not the last-registered Typedtree.cd_args (@4).
+    if (!qual_mod.empty()) {
+      register_module_records(qual_mod);
+      if (auto rf = local_module_field(qual_mod, n)) {
+        store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
+      }
+      if (auto rf = stdlib_record_field(qual_mod, n)) {
+        store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
+      }
+    }
     // The record the WHOLE field set pins down is authoritative for a multi-field
     // pattern -- an ambiguous label (`ty`) takes ITS index there, not the
     // last-declared / scoped one (`{ty; explanation}` is type_expected.ty@0).
@@ -6482,7 +6507,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p);
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
         if (!fi) {
           // The predefined `'a ref = { mutable contents }` cell: a `{contents=p}`
           // pattern reads the mutable field 0 (deferred to here, the function
@@ -6610,7 +6635,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p);
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
         if (!fi || !or_accesses(*sub, field_read(fi, scrut), out)) return false;
       }
       return true;
@@ -6798,7 +6823,7 @@ struct Translator {
         for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
         for (auto& [lbl, sub] : pr->fields) {
           FieldInfo nfi;
-          const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p);
+          const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
           if (!fi) { ok = false; return; }
           destruct(*sub, field_read(fi, acc));
         }
@@ -8440,7 +8465,7 @@ struct Translator {
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p);
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
         if (!fi) return false;
         if (!pat_test(sub.get(), field_read(fi, acc), test, binds)) return false;
       }
