@@ -1148,6 +1148,35 @@ struct Translator {
       }
     type_ctors_.emplace(ty, std::make_pair(nc, nb));
   }
+  using CtorSave = std::vector<std::pair<std::string, std::optional<CtorInfo>>>;
+  // FORCE-register an imported type's constructors with their cmi tag/arity,
+  // OVERRIDING a wrong global resolution, scoped to one match.  `Named` is shared
+  // by 6 types at arities 1/2/3; a `match (arg_opt : Parsetree.functor_parameter)
+  // with Named (param, smty)` must use arity 2, not the last-registered arity 1.
+  CtorSave force_register_type_ctors(const std::string& path) {
+    CtorSave saved;
+    auto d = path.rfind('.');
+    if (d == std::string::npos) return saved;
+    std::string mod = path.substr(0, d), ty = path.substr(d + 1);
+    if (mod.find('.') != std::string::npos || module_base(mod)) return saved;
+    auto& mc = module_ctors(mod);
+    int nc = 0, nb = 0;
+    bool any = false;
+    for (auto& [nm, info] : mc) if (info.type == ty) { (info.is_block ? nb : nc)++; any = true; }
+    if (!any) return saved;
+    for (auto& [nm, info] : mc)
+      if (info.type == ty) {
+        auto it = ctor_info_.find(nm);
+        if (it == ctor_info_.end() || it->second.type != ty ||
+            it->second.arity != info.arity || it->second.tag != info.tag) {
+          saved.emplace_back(nm, it == ctor_info_.end() ? std::optional<CtorInfo>()
+                                                        : std::optional<CtorInfo>(it->second));
+          ctor_info_[nm] = info;
+        }
+      }
+    type_ctors_[ty] = std::make_pair(nc, nb);
+    return saved;
+  }
   // Register the type owning constructor `ctorname` from module `mod` (an imported
   // module, by name), so a BARE ctor whose module is neither opened nor qualified
   // resolves -- type-directed disambiguation by the applied function's module
@@ -2837,7 +2866,6 @@ struct Translator {
   // in match ph.pat_desc with Tuple -> ..` the open's Tuple (tag 2) must win, else
   // an int-constant head dispatches to divide_tuple (matching.ml's assert).  We
   // override the opened module's ctors scoped to the open's body, restoring on exit.
-  using CtorSave = std::vector<std::pair<std::string, std::optional<CtorInfo>>>;
   CtorSave open_shadow_ctors(const std::string& dotted) {
     CtorSave saved;
     size_t d0 = dotted.find('.');
@@ -7621,6 +7649,16 @@ struct Translator {
   }
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Row>& rows,
                        const Location& mloc) {
+    // If the scrutinee is a var of a known imported type, force-register that type's
+    // constructors (correct arity/tag) for THIS match, so an ambiguous ctor name
+    // (`Named`, shared by 6 types at arities 1/2/3) resolves through the scrutinee's
+    // type, not the globally last-registered one.  Restored on return.
+    CtorSave ctor_save;
+    if (scrut->k == Lam::K::Var)
+      if (auto vp = var_record_path_.find(scrut->var.stamp); vp != var_record_path_.end())
+        ctor_save = force_register_type_ctors(vp->second);
+    struct CtorGuard { Translator* self; CtorSave sv;
+                       ~CtorGuard() { self->restore_ctors(sv); } } ctor_guard{this, std::move(ctor_save)};
     // Resolve any qualified stdlib constructors in the rows (Seq.Cons, ...) so
     // the matcher below has their tag/arity like local/predef constructors.
     for (auto& r : rows) scan_pat_ctors(*r.lhs);
@@ -8811,6 +8849,19 @@ struct Translator {
         test = if_and(test, g);
       }
       if (k->arg) {
+        // While matching this ctor's arguments, force-register each arg type's
+        // constructors so a nested ambiguous ctor (`Mty_functor(Named(id,arg),res)`:
+        // Named is functor_parameter@arity-2 here) resolves through the enclosing
+        // ctor's declared arg type rather than the global last-registered one.
+        CtorSave argsv;
+        if (auto cap = ctor_arg_paths_.find(lid_last(k->id.txt)); cap != ctor_arg_paths_.end())
+          for (auto& ap : cap->second) {
+            auto s = force_register_type_ctors(ap);
+            argsv.insert(argsv.end(), std::make_move_iterator(s.begin()),
+                         std::make_move_iterator(s.end()));
+          }
+        struct G { Translator* self; CtorSave sv; ~G() { self->restore_ctors(sv); } }
+          arg_guard{this, std::move(argsv)};
         if (ci->second.unboxed) return pat_test(k->arg->get(), acc, test, binds);
         auto* at = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
         if (ci->second.arity > 1 && at && (int)at->elems.size() == ci->second.arity) {
