@@ -1840,10 +1840,13 @@ struct Checker {
       // soundness value is low, so type only plain construction.
       if (rc->base) {
         bool sv = strict; strict = false;
-        infer_expr(**rc->base);
+        TypePtr bt = infer_expr(**rc->base);
         for (auto& [lbl, val] : rc->fields) infer_expr(*val);
         strict = sv;
-        return eng.any();
+        // The update's type IS the base record's type; returning it (instead of
+        // `any`) lets a field read on the result (`let it = {super with ..} in
+        // it.it_module_type`) resolve its label through that record type.
+        return bt;
       }
       TypePtr recTy = nullptr;
       for (auto& [lbl, val] : rc->fields) {
