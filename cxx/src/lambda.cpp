@@ -3528,6 +3528,51 @@ struct Translator {
   }
   // A record layout from a NESTED module path (`CamlinternalMenhirLib.EngineTypes`):
   // navigate the head module's cmi through its submodules, then find the record
+  // A lazily-built index of every include-path record type's SORTED label set ->
+  // its layout.  Resolves an UNQUALIFIED record literal of an IMPORTED record that
+  // is in scope only by type-directed disambiguation (typecore's `{pattern;
+  // has_guard; needs_refute}` = Parmatch.parmatch_case, with no `open Parmatch`).
+  // Consulted ONLY as a last resort -- a literal that would otherwise collapse to
+  // 0 -- and only when the label set maps to exactly ONE record across the path,
+  // so it can never change a record that already resolves.
+  bool labelset_index_built_ = false;
+  std::map<std::vector<std::string>, StdRec> labelset_index_;
+  std::set<std::vector<std::string>> labelset_ambiguous_;
+  void build_labelset_index() {
+    if (labelset_index_built_) return;
+    labelset_index_built_ = true;
+    std::vector<std::string> dirs = module_dirs_;
+    dirs.push_back(stdlib_dir);
+    for (auto& d : dirs) {
+      std::error_code ec;
+      if (d.empty() || !std::filesystem::is_directory(d, ec)) continue;
+      for (auto& ent : std::filesystem::directory_iterator(d, ec)) {
+        if (ent.path().extension() != ".cmi") continue;
+        try {
+          auto cmi = cmi::CmiFile::load(ent.path().string());
+          for (auto& td : cmi.sig().types) {
+            if (td.kind != cmi::TypeDecl::Record || td.labels.empty()) continue;
+            StdRec r; bool all_float = true;
+            std::vector<std::string> key;
+            for (auto& l : td.labels) {
+              r.labels.push_back(l.name); key.push_back(l.name);
+              r.shape.push_back(cmi_field_kind(l.type));
+              r.mut.push_back(l.mutable_);
+              if (r.shape.back() != ValueKind::Float) all_float = false;
+            }
+            r.flat = all_float;
+            std::sort(key.begin(), key.end());
+            if (labelset_ambiguous_.count(key)) continue;
+            auto it = labelset_index_.find(key);
+            if (it == labelset_index_.end()) labelset_index_[key] = std::move(r);
+            else if (it->second.labels != r.labels) {  // a genuinely different layout
+              labelset_index_.erase(it); labelset_ambiguous_.insert(key);
+            }
+          }
+        } catch (...) {}
+      }
+    }
+  }
   // type that has `label`.  Used for an explicitly deep-qualified record literal
   // (`{ CamlinternalMenhirLib.EngineTypes.state = .. }` in menhir's actions).
   std::optional<StdRec> nested_record_layout(const std::string& dotted, const std::string& label) {
@@ -9175,6 +9220,15 @@ struct Translator {
                                                lid_last(rc->fields[0].first.txt))))
                 break;
             }
+          // LAST RESORT: an unqualified literal of an imported record in scope only
+          // by type-directed disambiguation (Parmatch.parmatch_case).  The label
+          // set must map to exactly one include-path record, else leave it (= 0).
+          if (!rt) {
+            build_labelset_index();
+            std::vector<std::string> key(labs.begin(), labs.end());  // labs: sorted set
+            auto li = labelset_index_.find(key);
+            if (li != labelset_index_.end() && !li->second.flat) try_std(li->second);
+          }
         }
         if (rt) {
           auto index_of = [&](const std::string& l) {
