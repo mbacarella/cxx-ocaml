@@ -2822,6 +2822,61 @@ struct Translator {
       type_ctors_.emplace(td.name, std::make_pair(nc, nb));
     }
   }
+  // `open Patterns.Head` brings Head's VARIANT CONSTRUCTORS into scope and they
+  // SHADOW any same-named ctor of another type (OCaml's open semantics).  This
+  // matters for matching.ml: `Tuple` is ambiguous between the local `pure_arg.Tuple`
+  // (tag 1) and `Patterns.Head.desc.Tuple` (tag 2); within `let open Patterns.Head
+  // in match ph.pat_desc with Tuple -> ..` the open's Tuple (tag 2) must win, else
+  // an int-constant head dispatches to divide_tuple (matching.ml's assert).  We
+  // override the opened module's ctors scoped to the open's body, restoring on exit.
+  using CtorSave = std::vector<std::pair<std::string, std::optional<CtorInfo>>>;
+  CtorSave open_shadow_ctors(const std::string& dotted) {
+    CtorSave saved;
+    size_t d0 = dotted.find('.');
+    std::string unit = (d0 == std::string::npos) ? dotted : dotted.substr(0, d0);
+    if (module_base(unit)) return saved;  // a local module: ctors register via AST
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(unit));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t p = d0; p != std::string::npos;) {
+        size_t q = dotted.find('.', p + 1);
+        std::string comp =
+            dotted.substr(p + 1, (q == std::string::npos ? dotted.size() : q) - p - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return saved;
+        sig = next; p = q;
+      }
+      for (auto& td : sig->types) {
+        if (td.ctors.empty()) continue;
+        int nc = 0, nb = 0;
+        for (auto& c : td.ctors) {
+          int arity = (int)(c.args.empty() ? c.inline_record.size() : c.args.size());
+          bool block = arity > 0;
+          int tag = block ? nb : nc;
+          auto it = ctor_info_.find(c.name);
+          // override an ambiguous name bound to a DIFFERENT type, or add a fresh
+          // one -- both scoped: the open's ctors are only visible in its body.
+          if (it == ctor_info_.end() || it->second.type != td.name) {
+            saved.emplace_back(c.name, it == ctor_info_.end()
+                                           ? std::optional<CtorInfo>()
+                                           : std::optional<CtorInfo>(it->second));
+            builtin_ctors_.erase(c.name);
+            ctor_info_[c.name] = {td.name, tag, block, arity};
+          }
+          if (block) ++nb; else ++nc;
+        }
+      }
+    } catch (...) {}
+    return saved;
+  }
+  void restore_ctors(const CtorSave& saved) {
+    for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+      if (it->second) ctor_info_[it->first] = *it->second;
+      else ctor_info_.erase(it->first);
+    }
+  }
   // The runtime fields of a (possibly nested) stdlib functor's result after
   // `napps` applications -- "Sys.Immediate64.Make" applied twice yields its
   // innermost result signature ([repr]).  Registers that signature's variant
@@ -8963,10 +9018,12 @@ struct Translator {
           if (std::string p = opened_submodule_path(dotted); !p.empty()) dotted = p;
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
+          CtorSave ctor_save = open_shadow_ctors(dotted);  // ctors shadow in body
           opened_.push_back(dotted);
           rec_spine_ = rec_spine;
           LamPtr b = expr(*si->body);
           opened_.pop_back();
+          restore_ctors(ctor_save);
           return b;
         }
         // `let open F(X) / struct..end / (M:S) in body`: bind open/N over body
