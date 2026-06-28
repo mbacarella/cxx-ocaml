@@ -12758,8 +12758,23 @@ struct Translator {
           // a local module with no value exports shadows any stdlib namesake
           if (module_base(dotted)) return v;
           auto& fm = fields_of(dotted);       // a stdlib module's cmi fields
-          v.resize(fm.size());
-          for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
+          if (!fm.empty()) {
+            v.resize(fm.size());
+            for (auto& [n, i] : fm) if (i >= 0 && i < (int)v.size()) v[i] = n;
+            return v;
+          }
+          // A bare IMPORTED submodule of an opened module (`include TransientTypeHash`
+          // with `open Types`, Types.TransientTypeHash = Hashtbl.Make(..)): expand to
+          // the full path and read its fields, so the include brings its members
+          // (mem/add/..) into scope instead of leaving them unbound `?mem`.
+          if (std::string full = opened_submodule_path(dotted); !full.empty()) {
+            auto& sm = submodule_of(full);
+            if (sm.ok) {
+              v.resize(sm.fields.size());
+              for (auto& [n, i] : sm.fields) if (i >= 0 && i < (int)v.size()) v[i] = n;
+              return v;
+            }
+          }
           return v;
         }
         if (!module_base(dotted.substr(0, dotted.find('.')))) {
@@ -13829,6 +13844,13 @@ struct Translator {
           if (dotted.rfind("Stdlib.", 0) == 0 &&
               dotted.find('.', 7) == std::string::npos)
             dotted = dotted.substr(7);
+          // A bare IMPORTED submodule (`include TransientTypeHash` under `open
+          // Types`): expand to its full path so its members (mem/add/..) resolve
+          // unqualified through the dotted-submodule path, not as unbound `?mem`.
+          if (dotted.find('.') == std::string::npos && !module_base(dotted) &&
+              fields_of(dotted).empty())
+            if (std::string full = opened_submodule_path(dotted); !full.empty())
+              dotted = full;
           opened_.push_back(dotted);
           ++n_opens;
         }
