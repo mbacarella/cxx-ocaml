@@ -383,7 +383,23 @@ private:
         switch (d.tag) {
           case 4: t.kind = TypeExpr::Tobject; break;
           case 5: t.kind = TypeExpr::Tfield; break;
-          case 6: t.kind = TypeExpr::Tvariant; break;
+          case 6: {  // Tvariant of row_desc; row_desc.field0 = row_fields list.
+            t.kind = TypeExpr::Tvariant;
+            // row_desc = { row_fields:(label*row_field) list; row_more; .. }.
+            if (d.fields.empty()) break;
+            const m::Value& rd = arena_[d.fields[0]];
+            if (!rd.fields.empty())
+              for (std::size_t cur = rd.fields[0];
+                   arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();
+                   cur = arena_[cur].fields[1]) {       // cons cell: (head, tail)
+                const m::Value& pair = arena_[arena_[cur].fields[0]];  // (label, row_field)
+                if (!pair.fields.empty()) {
+                  const m::Value& lbl = arena_[pair.fields[0]];
+                  if (lbl.kind == m::Value::Kind::String) t.pv_tags.push_back(lbl.str);
+                }
+              }
+            break;
+          }
           case 9: t.kind = TypeExpr::Tpackage; break;
           case 10: t.kind = TypeExpr::Tfunctor; break;
           default: t.kind = TypeExpr::Other; break;

@@ -805,6 +805,51 @@ struct Translator {
     if (ii != pv_inherits_.end())
       for (auto& sub : ii->second) collect_pv_tags(sub, out, seen);
   }
+  // Resolve a `#Mod.type` (or bare `#type`) pattern's tag set: try the QUALIFIED
+  // key first ("Simple.view", registered for cross-module includes), else the bare
+  // last component (a local abbreviation).
+  void collect_pv_tags_lid(const Longident& id, std::set<long long>& out,
+                           std::set<std::string>& seen) {
+    std::string dotted;
+    if (lid_to_dotted(id, dotted) && dotted.find('.') != std::string::npos &&
+        pv_raw_tags_.count(dotted)) {
+      collect_pv_tags(dotted, out, seen); return;
+    }
+    collect_pv_tags(lid_last(id), out, seen);
+  }
+  // Register the polymorphic-variant type abbreviations of an IMPORTED module path
+  // (`Patterns.Simple`) under "<key_prefix>.<type>", so a `#key_prefix.type` pattern
+  // resolves its tag set in a SEPARATE compilation where the type lives behind an
+  // `include` (matching's `module Simple = struct include Patterns.Simple end` ->
+  // `#Simple.view`; pv_raw_tags_ is otherwise only filled from local AST decls).
+  void register_pv_types_from(const std::string& key_prefix, const std::string& dotted) {
+    size_t dot = dotted.find('.');
+    std::string head = dot == std::string::npos ? dotted : dotted.substr(0, dot);
+    if (module_base(head)) return;  // a local module: its types are AST-visible
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = dotted.find('.', pos + 1);
+        std::string comp = dotted.substr(pos + 1,
+            nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return;
+        sig = next; pos = nd;
+      }
+      for (auto& td : sig->types) {
+        cmi::TypePtr m = td.manifest;
+        while (m && (m->kind == cmi::TypeExpr::Tlink || m->kind == cmi::TypeExpr::Tsubst))
+          m = m->link;
+        if (m && m->kind == cmi::TypeExpr::Tvariant && !m->pv_tags.empty()) {
+          std::string key = key_prefix.empty() ? td.name : key_prefix + "." + td.name;
+          if (!pv_raw_tags_.count(key)) pv_raw_tags_[key] = m->pv_tags;
+        }
+      }
+    } catch (...) {}
+  }
 
   // Locally-declared record fields: label -> {owning type, index, mutable, kind}.
   // Only UNAMBIGUOUS labels are usable (a label reused across records can't be
@@ -1204,6 +1249,21 @@ struct Translator {
       pv_raw_tags_[d.name.txt] = std::move(tags);
       pv_inherits_[d.name.txt] = std::move(inh);
     });
+    // A top-level submodule that `include`s an imported module (matching's
+    // `module Simple = struct include Patterns.Simple end`): register the
+    // included module's polyvariant abbreviations under "Submod.type", so a
+    // qualified `#Submod.type` pattern resolves its tag set.
+    for (auto& item : s)
+      if (auto* pm = std::get_if<Pstr_module>(&item.desc))
+        if (pm->binding.name.txt)
+          if (auto* ps = peel_to_structure(pm->binding.expr))
+            for (auto& sit : ps->items)
+              if (auto* inc = std::get_if<Pstr_include>(&sit.desc))
+                if (auto* mi = std::get_if<Pmod_ident>(&inc->expr.desc)) {
+                  std::string dotted;
+                  if (lid_to_dotted(mi->id.txt, dotted))
+                    register_pv_types_from(*pm->binding.name.txt, dotted);
+                }
     each_decl([&](const TypeDeclaration& d) {  // then records
       if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
         RecType rt;
@@ -7329,7 +7389,7 @@ struct Translator {
       if (!pt) return nullptr;
       std::set<long long> tags;
       std::set<std::string> seen;
-      collect_pv_tags(lid_last(pt->id.txt), tags, seen);
+      collect_pv_tags_lid(pt->id.txt, tags, seen);
       if (tags.empty()) return nullptr;  // unknown polyvariant type
       arms.push_back({std::move(tags), bind, r.rhs});
     }
@@ -8361,7 +8421,7 @@ struct Translator {
     // with explicit-tag rows (`#var as x | `Abs .. | `App ..`).
     if (auto* pt = std::get_if<Ppat_type>(&p->desc)) {
       std::set<long long> tags; std::set<std::string> seen;
-      collect_pv_tags(lid_last(pt->id.txt), tags, seen);
+      collect_pv_tags_lid(pt->id.txt, tags, seen);
       if (tags.empty()) return false;  // unknown polyvariant type
       auto tagof = [&]() -> LamPtr {
         auto ii = mk(Lam::K::Prim); ii->prim = Prim::IntCmp;

@@ -66,6 +66,10 @@ struct TypeExpr {
   std::vector<TypePtr> args;    // Tconstr / Texpand
 
   TypePtr link;                 // Tlink / Tsubst indirection
+
+  // Tvariant: the directly-named polymorphic-variant tags (row_fields labels),
+  // so a `#poly` type pattern over an imported abbreviation resolves its tag set.
+  std::vector<std::string> pv_tags;
 };
 
 struct SigValue {
