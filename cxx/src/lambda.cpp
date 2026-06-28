@@ -1257,8 +1257,18 @@ struct Translator {
     });
     each_decl([&](const TypeDeclaration& d) {  // aliases (records resolve through them)
       if (d.manifest && !std::get_if<Ptype_variant>(&d.kind) &&
-          !std::get_if<Ptype_record>(&d.kind))
+          !std::get_if<Ptype_record>(&d.kind)) {
         local_alias_.emplace(d.name.txt, d.manifest->get());
+        // A local alias to an IMPORTED module's variant (`type sd =
+        // Value_rec_types.recursive_binding_kind`): register that variant's ctors so
+        // a bare `Static`/`Dynamic` -- used by type-directed disambiguation with no
+        // `open Value_rec_types` -- resolves instead of becoming an unbound `?Static`.
+        if (auto* c = std::get_if<Ptyp_constr>(&d.manifest->get()->desc))
+          if (std::holds_alternative<Ldot>(c->id.txt.v)) {
+            std::string dotted;
+            if (lid_to_dotted(c->id.txt, dotted)) register_ctors_of_type(dotted);
+          }
+      }
     });
     each_decl([&](const TypeDeclaration& d) {  // polymorphic-variant abbreviations
       if (!d.manifest) return;
