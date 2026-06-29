@@ -462,6 +462,11 @@ struct Printer {
       line(j, "Texp_field");
       expression(j, *fd->record);
       line(j, "\"" + fd->name + "\"");
+    } else if (auto* sf = std::get_if<Texp_setfield>(&e.desc)) {
+      line(j, "Texp_setfield");
+      expression(j, *sf->record);
+      line(j, "\"" + sf->name + "\"");
+      expression(j, *sf->value);
     } else {
       auto& si = std::get<Texp_struct_item>(e.desc);
       line(j, "Texp_struct_item");

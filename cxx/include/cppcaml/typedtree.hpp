@@ -147,6 +147,7 @@ struct Texp_record {
   std::optional<ExprBox> extended;          // `{ e with ... }`
 };
 struct Texp_field { ExprBox record; std::string name; };
+struct Texp_setfield { ExprBox record; std::string name; ExprBox value; };  // r.l <- v
 // `let module/open/exception … in e` (fork): an embedded structure item + body.
 struct Texp_struct_item { Box<StructureItem> item; ExprBox body; };
 struct ExprExtra { CoreType ctype; Location loc; };  // Texp_constraint
@@ -154,7 +155,7 @@ struct Expression {
   std::variant<Texp_constant, Texp_ident, Texp_tuple, Texp_apply, Texp_function,
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
                Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
-               Texp_while, Texp_record, Texp_field, Texp_struct_item>
+               Texp_while, Texp_record, Texp_field, Texp_setfield, Texp_struct_item>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
