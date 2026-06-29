@@ -7,6 +7,7 @@
 #include "cppcaml/link.hpp"
 #include "cppcaml/cmi.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -72,7 +73,14 @@ struct Unit {
 };
 // A linker input: a .cmo (one unit, always linked) or a .cma (link only the
 // units transitively required).
-struct InputFile { bool archive; std::vector<Unit> units; };
+struct InputFile {
+  bool archive;
+  std::vector<Unit> units;
+  // lib_dllibs from a .cma: (suffixed, name) pairs naming the C-stub shared
+  // libraries the library needs (e.g. (true, "-lunixbyt")).  Drives the DLLS
+  // section so the runtime dlopen()s them and resolves their C primitives.
+  std::vector<std::pair<bool, std::string>> dllibs;
+};
 
 // Convert a decoded Marshal value (the literal Obj.t) to an omarshal value.
 ValPtr conv(const m::Arena& a, std::size_t id) {
@@ -150,6 +158,14 @@ InputFile read_objects(const std::string& path) {
     in.archive = true;
     for (std::size_t cu : list_elems(arena, arena[root].fields[0]))
       in.units.push_back(parse_unit(arena, cu, file));
+    // lib_dllibs = field 4: list of (suffixed:bool * string).
+    if (arena[root].fields.size() > 4) {
+      for (std::size_t e : list_elems(arena, arena[root].fields[4])) {
+        const m::Value& d = arena[e];
+        if (d.kind == m::Value::Kind::Block && d.fields.size() >= 2)
+          in.dllibs.emplace_back(arena[d.fields[0]].i != 0, arena[d.fields[1]].str);
+      }
+    }
   } else {
     throw std::runtime_error("unknown object magic in " + path);
   }
@@ -266,6 +282,27 @@ void link_executable(const std::vector<std::string>& inputs,
   std::vector<std::uint8_t> prim;
   for (auto& name : st.prim_order) { prim.insert(prim.end(), name.begin(), name.end()); prim.push_back(0); }
 
+  // DLLS: the C-stub shared libraries to dlopen at startup (from .cma dllibs).
+  // Each entry is `('-' if suffixed else ':') name '\0'`; a suffixed `-l<x>`
+  // dllib becomes `-dll<x>` (bytelink's process_dllib).  The unmodified runtime
+  // reads DLLS, loads each library, then resolves the PRIM names against them.
+  std::vector<std::uint8_t> dlls;
+  {
+    std::vector<std::pair<bool, std::string>> seen;
+    for (const InputFile& fi : files)
+      for (const auto& [suffixed, name] : fi.dllibs) {
+        bool out_suffixed = suffixed;
+        std::string out_name = name;
+        if (suffixed && name.rfind("-l", 0) == 0) out_name = "dll" + name.substr(2);
+        auto key = std::make_pair(out_suffixed, out_name);
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+        seen.push_back(key);
+        dlls.push_back(out_suffixed ? '-' : ':');
+        dlls.insert(dlls.end(), out_name.begin(), out_name.end());
+        dlls.push_back(0);
+      }
+  }
+
   // ---- assemble the executable: [shebang] CODE PRIM DATA + TOC + trailer ----
   std::vector<std::uint8_t> out;
   if (!runtime_path.empty()) {
@@ -273,15 +310,19 @@ void link_executable(const std::vector<std::string>& inputs,
     out.insert(out.end(), sh.begin(), sh.end());
   }
   out.insert(out.end(), code.begin(), code.end());
+  if (!dlls.empty()) out.insert(out.end(), dlls.begin(), dlls.end());
   out.insert(out.end(), prim.begin(), prim.end());
   out.insert(out.end(), data.begin(), data.end());
   auto section = [&](const char* nm, std::size_t len) {
     out.insert(out.end(), nm, nm + 4); put_be32(out, (std::uint32_t)len);
   };
+  // TOC order must match the body layout above.
+  int nsec = 3;
   section("CODE", code.size());
+  if (!dlls.empty()) { section("DLLS", dlls.size()); ++nsec; }
   section("PRIM", prim.size());
   section("DATA", data.size());
-  put_be32(out, 3);  // number of sections
+  put_be32(out, nsec);  // number of sections
   const char* magic = "Caml1999X038";
   out.insert(out.end(), magic, magic + 12);
 
