@@ -815,6 +815,11 @@ void Lexer::scan_comment() {
     if (looking_at("(*")) { depth++; pos_ += 2; continue; }
     if (looking_at("*)")) { depth--; pos_ += 2; continue; }
     if (cur() == '\'') {
+      // A quote immediately after an identifier character is an identifier prime
+      // (`f'`), not a char-literal opener -- so `(* f' '"' *)` is not mis-lexed
+      // (treating the `'` as a char start would swallow the following `"..."` as
+      // a string and run off the end).  OCaml's lexer makes the same distinction.
+      if (pos_ > 0 && is_identchar(src_[pos_ - 1])) { pos_++; continue; }
       // Skip a char literal so that a quoted double-quote (e.g. '"') inside the
       // comment doesn't spuriously start a string.  Mirrors OCaml's comment
       // rule: only the genuine char-literal shapes are consumed; a bare quote
