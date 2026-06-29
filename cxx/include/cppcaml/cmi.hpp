@@ -371,6 +371,14 @@ std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<std::pair<std::string, TyPtr>>& values,
                       const std::vector<Import>& imports = {});
 
+// `ocamlc -pack`: write the packed module's .cmi.  Each member's own .cmi
+// signature is reused verbatim as a `module <Member> : sig ... end` entry, so
+// the pack's interface is exactly the members wrapped one level deeper.
+// `member_cmis` are the members' .cmi paths, in pack order.  Returns the
+// self-CRC.
+std::string write_packed_cmi(const std::string& path, const std::string& pack_name,
+                             const std::vector<std::string>& member_cmis);
+
 }  // namespace cmiw
 
 }  // namespace cppcaml::cmi

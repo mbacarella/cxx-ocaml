@@ -5,6 +5,7 @@
 // and concatenate its code, append STOP, and write the CODE/PRIM/DATA sections
 // plus the TOC trailer the runtime reads.
 #include "cppcaml/link.hpp"
+#include "cppcaml/cmi.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -418,6 +419,20 @@ void pack(const std::vector<std::string>& cmos, const std::string& pack_name,
   std::ofstream f(out_path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot write " + out_path);
   f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)out.size());
+
+  // Emit the packed .cmi: each member's own .cmi signature wrapped one level
+  // deeper as `module <Member> : sig ... end`, so dependents can compile
+  // against `Pack.Member.x`.  A member compiled without a .cmi is skipped.
+  std::vector<std::string> member_cmis;
+  for (const auto& c : cmos) {
+    std::string mc = c.substr(0, c.find_last_of('.')) + ".cmi";
+    std::ifstream probe(mc, std::ios::binary);
+    if (probe) member_cmis.push_back(mc);
+  }
+  if (member_cmis.size() == cmos.size()) {
+    std::string cmi_out = out_path.substr(0, out_path.find_last_of('.')) + ".cmi";
+    cppcaml::cmi::cmiw::write_packed_cmi(cmi_out, pack_name, member_cmis);
+  }
 }
 
 }  // namespace cppcaml::link

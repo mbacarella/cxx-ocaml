@@ -1166,6 +1166,90 @@ std::string write_cmi(const std::string& path, const std::string& modname,
   return write_cmi(path, modname, items, imports);
 }
 
+namespace {
+// Rebuild a decoded Marshal value as an omarshal graph (for reusing a member
+// .cmi's signature blob verbatim).  Mirrors link.cpp's conv.
+o::ValPtr conv_value(const m::Arena& a, std::size_t id) {
+  const m::Value& v = a[id];
+  switch (v.kind) {
+    case m::Value::Kind::Int:
+      if (!v.custom_raw.empty())
+        return o::vcustom(v.custom_raw, 1 + (v.custom_bsize + 7) / 8);
+      return o::vint(v.i);
+    case m::Value::Kind::String: return o::vstr(v.str);
+    case m::Value::Kind::Double: return o::vdbl(v.d);
+    case m::Value::Kind::Block: {
+      std::vector<o::ValPtr> fs;
+      for (auto f : v.fields) fs.push_back(conv_value(a, f));
+      return o::vblock((int)v.tag, std::move(fs));
+    }
+    case m::Value::Kind::DoubleArray: return o::vdblarr(v.darr);
+  }
+  return o::vint(0);
+}
+
+// Read a .cmi file's marshaled header `(name, signature)` and return the
+// signature as an omarshal graph; `*out_name` receives the stored module name.
+o::ValPtr read_cmi_sign(const std::string& path, std::string* out_name) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open " + path);
+  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+  std::size_t off = 0;
+  for (; off + 4 <= bytes.size(); ++off)
+    if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
+        (bytes[off + 3] == 0xBE || bytes[off + 3] == 0xBF || bytes[off + 3] == 0xBD))
+      break;
+  if (off + 4 > bytes.size()) throw std::runtime_error("no marshal header in " + path);
+  m::Arena arena;
+  std::size_t hid = m::read_value(bytes.data(), bytes.size(), off, arena);  // (name, sign)
+  const m::Value& hv = arena[hid];
+  if (hv.kind != m::Value::Kind::Block || hv.fields.size() < 2)
+    throw std::runtime_error("malformed cmi header in " + path);
+  if (out_name) *out_name = arena[hv.fields[0]].str;
+  return conv_value(arena, hv.fields[1]);
+}
+}  // namespace
+
+std::string write_packed_cmi(const std::string& path, const std::string& pack_name,
+                             const std::vector<std::string>& member_cmis) {
+  int stamp = 200;
+  std::vector<o::ValPtr> sig_items;
+  for (const auto& mc : member_cmis) {
+    std::string mname;
+    o::ValPtr member_sign = read_cmi_sign(mc, &mname);
+    // module <Member> : sig <member_sign> end
+    auto ident = o::vblock(0, {o::vstr(mname), o::vint(stamp++)});       // Ident.Local
+    auto mty = o::vblock(1, {member_sign});                             // Mty_signature
+    auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
+                            o::vint(0) /*md_uid*/});                    // module_declaration
+    sig_items.push_back(o::vblock(3, {ident, o::vint(0) /*Mp_present*/, md,
+                                      o::vint(0) /*Trec_not*/, o::vint(0) /*Exported*/}));
+  }
+
+  auto header = o::vblock(0, {o::vstr(pack_name), o::vlist(sig_items)});
+  std::vector<std::uint8_t> hbytes = o::marshal(header);
+
+  const std::string MAGIC = "Caml1999I038";
+  std::string prefix(MAGIC);
+  prefix.append(reinterpret_cast<const char*>(hbytes.data()), hbytes.size());
+  std::string self_crc = blake2::blake128(reinterpret_cast<const unsigned char*>(prefix.data()),
+                                          prefix.size());
+
+  auto crc_opt = [](const std::string& c) { return o::vblock(0, {o::vstr(c)}); };  // Some
+  std::vector<o::ValPtr> crcs = {o::vblock(0, {o::vstr(pack_name), crc_opt(self_crc)})};
+  std::vector<std::uint8_t> cbytes = o::marshal(o::vlist(crcs));
+
+  // flags = [Alerts <empty map>]
+  std::vector<std::uint8_t> fbytes = o::marshal(o::vlist({o::vblock(0, {o::vint(0)})}));
+
+  std::ofstream out(path, std::ios::binary);
+  out.write(prefix.data(), prefix.size());
+  out.write(reinterpret_cast<const char*>(cbytes.data()), cbytes.size());
+  out.write(reinterpret_cast<const char*>(fbytes.data()), fbytes.size());
+  return self_crc;
+}
+
 }  // namespace cmiw
 
 }  // namespace cppcaml::cmi
