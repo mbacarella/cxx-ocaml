@@ -898,6 +898,52 @@ struct Checker {
     }
   }
 
+  // OCaml requires module-type names to be unique within a single structure or
+  // signature scope (`module type X = ...` twice is an error, never valid code).
+  // Walk every scope and flag a duplicate.  Sound: same-named module types in
+  // different scopes (nested modules) are fine and not flagged.
+  void check_dup_modtypes_mt(const ModuleType& mt) {
+    if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) check_dup_modtypes_sig(sg->items);
+    else if (auto* fn = std::get_if<Pmty_functor>(&mt.desc)) check_dup_modtypes_mt(*fn->body);
+  }
+  void check_dup_modtypes_me(const ModuleExpr& me) {
+    if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) check_dup_modtypes_struct(ms->items);
+    else if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
+      check_dup_modtypes_me(*mc->me); check_dup_modtypes_mt(*mc->mt);
+    } else if (auto* mf = std::get_if<Pmod_functor>(&me.desc)) check_dup_modtypes_me(*mf->body);
+  }
+  void check_dup_modtypes_sig(const ast::Signature& items) {
+    std::set<std::string> seen;
+    for (auto& it : items) {
+      if (auto* mt = std::get_if<Psig_modtype>(&it.desc)) {
+        if (!seen.insert(mt->name.txt).second)
+          note_error("Multiple definition of the module type name " + mt->name.txt);
+        if (mt->type) check_dup_modtypes_mt(*mt->type);
+      } else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
+        check_dup_modtypes_mt(*md->md.type);
+      } else if (auto* rm = std::get_if<Psig_recmodule>(&it.desc)) {
+        for (auto& d : rm->decls) check_dup_modtypes_mt(*d.type);
+      }
+    }
+  }
+  void check_dup_modtypes_struct(const ast::Structure& items) {
+    if (!strict) return;
+    std::set<std::string> seen;
+    for (auto& it : items) {
+      if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
+        if (!seen.insert(mt->name.txt).second)
+          note_error("Multiple definition of the module type name " + mt->name.txt);
+        if (mt->type) check_dup_modtypes_mt(*mt->type);
+      } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+        check_dup_modtypes_me(mb->binding.expr);
+      } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
+        for (auto& b : rm->bindings) check_dup_modtypes_me(b.expr);
+      } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
+        check_dup_modtypes_me(in->expr);
+      }
+    }
+  }
+
   // A `module rec` group can hide a cyclic type abbreviation that the file-local
   // check misses, because the self-reference is *qualified* through the module
   // being defined (`module rec A : sig type t = A.t end`).  Build the abbreviation
@@ -2819,6 +2865,7 @@ static void run_checker(Checker& ck, const ast::Structure& s) {
   register_types_rec(ck, s);
   ck.finalize_fields();
   ck.check_cyclic_aliases();
+  ck.check_dup_modtypes_struct(s);
   ck.process_items(s);
 }
 
