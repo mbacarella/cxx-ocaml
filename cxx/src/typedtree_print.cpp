@@ -467,6 +467,10 @@ struct Printer {
       expression(j, *sf->record);
       line(j, "\"" + sf->name + "\"");
       expression(j, *sf->value);
+    } else if (auto* vr = std::get_if<Texp_variant>(&e.desc)) {
+      line(j, "Texp_variant \"" + vr->label + "\"");
+      if (vr->arg) { line(j, "Some"); expression(j + 1, **vr->arg); }
+      else line(j, "None");
     } else {
       auto& si = std::get<Texp_struct_item>(e.desc);
       line(j, "Texp_struct_item");

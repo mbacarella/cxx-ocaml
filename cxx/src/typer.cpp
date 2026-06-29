@@ -763,6 +763,11 @@ struct Typer {
       out.desc = tt::Texp_setfield{std::make_unique<tt::Expression>(expr(*sf->obj)),
                                    lid_str(sf->field.txt),
                                    std::make_unique<tt::Expression>(expr(*sf->value))};
+    } else if (auto* vr = std::get_if<Pexp_variant>(&e.desc)) {
+      tt::Texp_variant tv;
+      tv.label = vr->label;
+      if (vr->arg) tv.arg = std::make_unique<tt::Expression>(expr(**vr->arg));
+      out.desc = std::move(tv);
     } else if (auto* rec = std::get_if<Pexp_record>(&e.desc)) {
       tt::Texp_record tr;
       if (rec->base)
