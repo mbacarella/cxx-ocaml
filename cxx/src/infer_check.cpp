@@ -2131,6 +2131,36 @@ struct Checker {
         try_unify(vt, s->cod);
         if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
       }
+      // Completeness: a plain record construction must define every field of its
+      // type.  Resolve the record decl unambiguously (stamp, else unique name)
+      // and flag a missing field -- but only when every provided label belongs to
+      // that record, so a mis-resolved type can't cause a false report.
+      if (strict && recTy) {
+        TypePtr rb = I::Engine::repr(recTy);
+        const TypeDeclaration* decl = nullptr;
+        if (rb->kind == I::Type::Kind::Constr) {
+          if (rb->stamp) { auto it = stamp_record_decl_.find(rb->stamp);
+                           if (it != stamp_record_decl_.end()) decl = it->second; }
+          if (!decl && !ambiguous_record_names_.count(rb->path)) {
+            auto it = name_record_decl_.find(rb->path);
+            if (it != name_record_decl_.end()) decl = it->second;
+          }
+        }
+        if (decl)
+          if (auto* rec = std::get_if<Ptype_record>(&decl->kind)) {
+            std::set<std::string> provided, declset;
+            for (auto& [lbl, val] : rc->fields) provided.insert(lid_last(lbl.txt));
+            for (auto& f : rec->fields) declset.insert(f.name.txt);
+            bool all_known = true;
+            for (auto& p : provided) if (!declset.count(p)) { all_known = false; break; }
+            if (all_known)
+              for (auto& f : rec->fields)
+                if (!provided.count(f.name.txt)) {
+                  note_error("Some record fields are undefined: " + f.name.txt);
+                  break;
+                }
+          }
+      }
       return recTy ? recTy : eng.any();
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
