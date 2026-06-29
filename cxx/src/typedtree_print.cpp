@@ -334,8 +334,15 @@ struct Printer {
     int j = i + 1;
     for (auto& ex : e.extras) {
       line(j, "extra " + loc(ex.loc));
-      line(j + 1, "Texp_constraint");
-      core_type(j + 1, ex.ctype);
+      if (ex.kind == ExprExtra::Kind::Coerce) {
+        line(j + 1, "Texp_coerce");
+        if (ex.from) { line(j + 1, "Some"); core_type(j + 2, *ex.from); }
+        else line(j + 1, "None");
+        core_type(j + 1, ex.ctype);
+      } else {
+        line(j + 1, "Texp_constraint");
+        core_type(j + 1, ex.ctype);
+      }
     }
     if (auto* c = std::get_if<Texp_constant>(&e.desc)) {
       constant(j, "Texp_constant ", c->c);

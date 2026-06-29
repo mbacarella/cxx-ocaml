@@ -151,7 +151,12 @@ struct Texp_setfield { ExprBox record; std::string name; ExprBox value; };  // r
 struct Texp_variant { std::string label; std::optional<ExprBox> arg; };  // `A [e]
 // `let module/open/exception … in e` (fork): an embedded structure item + body.
 struct Texp_struct_item { Box<StructureItem> item; ExprBox body; };
-struct ExprExtra { CoreType ctype; Location loc; };  // Texp_constraint
+struct ExprExtra {  // Texp_constraint `(e : t)` or Texp_coerce `(e [: t1] :> t2)`
+  enum class Kind { Constraint, Coerce } kind = Kind::Constraint;
+  CoreType ctype;                 // constraint type, or coerce TARGET type
+  std::optional<CoreType> from;   // coerce SOURCE type (`(e : t1 :> t2)`), else none
+  Location loc;
+};
 struct Expression {
   std::variant<Texp_constant, Texp_ident, Texp_tuple, Texp_apply, Texp_function,
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,

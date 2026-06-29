@@ -755,7 +755,19 @@ struct Typer {
                                 std::make_unique<tt::Expression>(expr(*wh->body))};
     } else if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
       out = expr(*ct->e);  // become the inner expr; record the constraint as extra
-      out.extras.push_back(tt::ExprExtra{core_type(*ct->t), e.loc});
+      tt::ExprExtra ex;
+      ex.kind = tt::ExprExtra::Kind::Constraint;
+      ex.ctype = core_type(*ct->t);
+      ex.loc = e.loc;
+      out.extras.push_back(std::move(ex));
+    } else if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) {
+      out = expr(*co->e);  // become the inner expr; record the coercion as extra
+      tt::ExprExtra ex;
+      ex.kind = tt::ExprExtra::Kind::Coerce;
+      ex.ctype = core_type(*co->to_);
+      if (co->from) ex.from = core_type(**co->from);
+      ex.loc = e.loc;
+      out.extras.push_back(std::move(ex));
     } else if (auto* fd = std::get_if<Pexp_field>(&e.desc)) {
       out.desc = tt::Texp_field{std::make_unique<tt::Expression>(expr(*fd->e)),
                                 lid_str(fd->field.txt)};
