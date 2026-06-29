@@ -953,10 +953,13 @@ struct Checker {
   void check_recmodule_cyclic_types(const Pstr_recmodule& rm) {
     if (!strict) return;
     struct QAlias { std::string mod; const CoreType* manifest; };
-    std::unordered_map<std::string, QAlias> aliases;  // "Mod.t" -> defn
+    std::unordered_map<std::string, QAlias> aliases;  // "Mod.t" -> defn (manifest only)
+    std::set<std::string> group_types;                // every "Mod.t" in the group
     auto add_decls = [&](const std::string& mod, const std::vector<TypeDeclaration>& ds) {
-      for (auto& d : ds)
+      for (auto& d : ds) {
+        group_types.insert(mod + "." + d.name.txt);
         if (d.manifest) aliases[mod + "." + d.name.txt] = {mod, d.manifest->get()};
+      }
     };
     for (auto& b : rm.bindings) {
       if (!b.name.txt) continue;
@@ -1011,6 +1014,73 @@ struct Checker {
       };
       if (reaches(start)) { note_error("The type abbreviation \"" + start + "\" is cyclic"); break; }
     }
+
+    // Regularity (subtle): a recursive group type may only be applied to its own
+    // parameter variables.  Applying a group type N to a *non-variable* argument
+    // is non-regular ONLY when N is mutually recursive with the type whose
+    // manifest contains the application (same strongly-connected component of the
+    // group-reference graph) -- otherwise it is an ordinary application of a
+    // settled type (t10ok: `A.t = 'a list B.t` is fine because B never refers
+    // back to A, so the parameter cannot grow without bound).
+    auto qname = [](const Ptyp_constr& c, const std::string& cur) -> std::string {
+      if (auto* l = std::get_if<Lident>(&c.id.txt.v)) return cur + "." + l->name;
+      if (auto* d = std::get_if<Ldot>(&c.id.txt.v))
+        if (auto* p = std::get_if<Lident>(&d->prefix->v)) return p->name + "." + d->name;
+      return "";
+    };
+    using Visit = std::function<void(const Ptyp_constr&)>;
+    std::function<void(const CoreType&, const Visit&)> descend =
+        [&](const CoreType& t, const Visit& visit) {
+          if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+            visit(*c);
+            for (auto& a : c->args) descend(*a, visit);
+          } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+            descend(*a->dom, visit); descend(*a->cod, visit);
+          } else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+            for (auto& e : tu->elems) descend(*e, visit);
+          } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+            descend(*al->type, visit);
+          } else if (auto* po = std::get_if<Ptyp_poly>(&t.desc)) {
+            descend(*po->type, visit);
+          } else if (auto* ob = std::get_if<Ptyp_object>(&t.desc)) {
+            for (auto& f : ob->fields) {
+              if (auto* ot = std::get_if<Otag>(&f)) descend(*ot->type, visit);
+              else if (auto* oi = std::get_if<Oinherit>(&f)) descend(*oi->type, visit);
+            }
+          }
+        };
+    // Group-reference graph (any reference, regardless of arguments).
+    std::unordered_map<std::string, std::set<std::string>> gref;
+    for (auto& [q, a] : aliases)
+      descend(*a.manifest, [&, mod = a.mod, key = q](const Ptyp_constr& c) {
+        std::string n = qname(c, mod);
+        if (!n.empty() && group_types.count(n)) gref[key].insert(n);
+      });
+    auto reaches = [&](const std::string& s, const std::string& tgt) {
+      std::set<std::string> seen; std::vector<std::string> st{s};
+      while (!st.empty()) {
+        std::string x = st.back(); st.pop_back();
+        auto it = gref.find(x); if (it == gref.end()) continue;
+        for (auto& nx : it->second) {
+          if (nx == tgt) return true;
+          if (seen.insert(nx).second) st.push_back(nx);
+        }
+      }
+      return false;
+    };
+    bool non_regular = false;
+    for (auto& [q, a] : aliases) {
+      descend(*a.manifest, [&, mod = a.mod, key = q](const Ptyp_constr& c) {
+        std::string n = qname(c, mod);
+        if (n.empty() || !group_types.count(n)) return;
+        bool concrete = false;
+        for (auto& arg : c.args)
+          if (!std::get_if<Ptyp_var>(&arg->desc) && !std::get_if<Ptyp_any>(&arg->desc)) concrete = true;
+        if (concrete && (n == key || (reaches(key, n) && reaches(n, key)))) non_regular = true;
+      });
+      if (non_regular) break;
+    }
+    if (non_regular) note_error("This recursive type is not regular");
   }
 
   // `[@@unboxed]` is valid only on a single-constructor variant whose
