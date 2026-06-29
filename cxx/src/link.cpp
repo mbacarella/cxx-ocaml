@@ -384,20 +384,22 @@ void pack(const std::vector<std::string>& cmos, const std::string& pack_name,
   std::vector<ValPtr> reloc_entries;  // (reloc_info * int) list elements
   std::vector<ValPtr> primitives;
   std::set<std::string> members, processed;
-  std::vector<std::string> member_names;
-  // An interface-only member (a `.cmi` in the pack list, like ocamlbuild's
-  // signatures.cmi) is PM_intf: it contributes its signature to the packed
-  // .cmi but no code and no slot in the structure block.
+  // Every member in pack order, paired with whether it carries code.  An
+  // interface-only (.cmi) member (PM_intf, like ocamlbuild's signatures.cmi)
+  // contributes no code, but STILL occupies a slot in the pack record: the
+  // packed .cmi lists it as a module, so a consumer counts it when computing a
+  // sibling's field offset.  Its slot holds an empty block.
+  std::vector<std::pair<bool, std::string>> all_members;  // (has_code, name)
   auto is_intf = [](const std::string& p) {
     return p.size() >= 4 && p.compare(p.size() - 4, 4, ".cmi") == 0;
   };
   for (const std::string& path : cmos) {
-    if (is_intf(path)) continue;
+    if (is_intf(path)) { all_members.push_back({false, std::string()}); continue; }
     InputFile in = read_objects(path);
     if (in.archive || in.units.size() != 1)
       throw std::runtime_error(path + ": -pack expects a single .cmo");
     members.insert(in.units[0].name);
-    member_names.push_back(in.units[0].name);
+    all_members.push_back({true, in.units[0].name});
   }
   auto reloc_info = [&](const Reloc& r) -> ValPtr {
     switch (r.k) {
@@ -435,11 +437,16 @@ void pack(const std::vector<std::string>& cmos, const std::string& pack_name,
     code.push_back((std::uint8_t)op); code.push_back(0); code.push_back(0); code.push_back(0);
   };
   auto operand0 = [&] { for (int k = 0; k < 4; ++k) code.push_back(0); };  // reloc placeholder
-  int N = (int)member_names.size();
+  int N = (int)all_members.size();
   for (int i = N - 1; i >= 0; --i) {                 // push args N-1..1, acc = arg 0
-    word(GETGLOBAL);
-    add_reloc(Reloc{Reloc::GetCompunit, pack_name + "." + member_names[i], nullptr, (int)code.size()}, (int)code.size());
-    operand0();
+    if (all_members[i].first) {                      // impl member: getglobal Pack.M
+      word(GETGLOBAL);
+      add_reloc(Reloc{Reloc::GetCompunit, pack_name + "." + all_members[i].second,
+                      nullptr, (int)code.size()}, (int)code.size());
+      operand0();
+    } else {                                         // interface-only: empty block
+      word(ATOM0);
+    }
     if (i != 0) word(PUSH);
   }
   if (N == 0) word(ATOM0);

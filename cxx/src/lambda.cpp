@@ -3309,10 +3309,13 @@ struct Translator {
           if (auto vit = it->second.find(d->name); vit != it->second.end())
             return vit->second;
         // `Subst.fold` where Subst = Map.Make(..): the labelled result signature.
-        if (auto fs = module_functor_src_.find(pl->name); fs != module_functor_src_.end()) {
-          FnSig s = functor_result_value_sig(fs->second.first, fs->second.second, d->name);
-          for (auto& [k, n] : s) if (k != 0) return s;
-        }
+        // A local `module Hashtbl = Hashtbl.Make(..)` SHADOWS any stdlib module of
+        // the same name, so the functor result's signature is authoritative -- we
+        // must NOT fall through to the stdlib value below (whose `create` carries a
+        // `?random` the result's `create` lacks, which would insert a bogus None
+        // and over-apply).  Return the result sig even when it has no labels.
+        if (auto fs = module_functor_src_.find(pl->name); fs != module_functor_src_.end())
+          return functor_result_value_sig(fs->second.first, fs->second.second, d->name);
         FnSig s = stdlib_value_sig(pl->name, d->name);
         for (auto& [k, n] : s) if (k != 0) return s;
         // `open StdLabels; List.map` -> the label sig of ListLabels.map.
