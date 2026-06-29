@@ -1078,19 +1078,13 @@ struct Typer {
     out.desc = std::move(fn);
     return out;
   }
-  tt::ClassDeclaration class_declaration(const ast::ClassDeclaration& d) {
-    tt::ClassDeclaration out;
-    out.loc = d.loc;
-    out.virt = d.virt == VirtualFlag::Virtual;
-    out.name = d.name.txt;
-    auto* ps = std::get_if<Pcl_structure>(&d.expr.desc);  // `object .. end` only for now
-    if (!ps) throw TypeError("class_expr#" + std::to_string(d.expr.desc.index()));
-    tt::ClassExpr tce;
-    tce.loc = d.expr.loc;
+  tt::ClassExpr class_structure_expr(const ast::ClassStructure& cs, Location celoc) {
+    tt::ClassExpr out;
+    out.loc = celoc;
     tt::Tcl_structure ts;
     // self pattern: Tpat_alias "selfpat-*" (Tpat_any).  The inner sits on the
     // self location (a zero-width point), the alias on the _none_ location.
-    Location selfloc = ps->cs.self.loc;
+    Location selfloc = cs.self.loc;
     selfloc.ghost = true;
     tt::Pattern inner;
     inner.loc = selfloc;
@@ -1100,14 +1094,13 @@ struct Typer {
     selfp.desc = tt::Tpat_alias{fresh_anon("selfpat-*"),
                                 std::make_unique<tt::Pattern>(std::move(inner))};
     ts.cs.self = std::make_unique<tt::Pattern>(std::move(selfp));
-    // Pre-register all instance variables (in scope in every method, any order),
-    // then transcribe fields.  Save/restore for nesting.
+    // Pre-register all instance variables (in scope in every method, any order).
     auto saved_iv = instvars_;
-    for (auto& f : ps->cs.fields)
+    for (auto& f : cs.fields)
       if (auto* v = std::get_if<Pcf_val>(&f.desc))
         instvars_[v->name.txt] = fresh_anon(v->name.txt);
     int method_no = 0;
-    for (auto& f : ps->cs.fields) {
+    for (auto& f : cs.fields) {
       tt::ClassField cf;
       cf.loc = f.loc;
       if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
@@ -1117,7 +1110,7 @@ struct Typer {
         tm.name = m->name.txt;
         tm.private_ = m->priv == PrivateFlag::Private;
         tm.override_ = cc->ovr == OverrideFlag::Override;
-        tm.expr = std::make_unique<tt::Expression>(elaborate_method(*cc->e, ++method_no, ps->cs.self.loc));
+        tm.expr = std::make_unique<tt::Expression>(elaborate_method(*cc->e, ++method_no, cs.self.loc));
         cf.desc = std::move(tm);
       } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
         auto* cc = std::get_if<Cfk_concrete>(&v->kind);
@@ -1134,8 +1127,49 @@ struct Typer {
       ts.cs.fields.push_back(std::move(cf));
     }
     instvars_ = std::move(saved_iv);
-    tce.desc = std::move(ts);
-    out.expr = std::move(tce);
+    out.desc = std::move(ts);
+    return out;
+  }
+  void collect_pat_vars(const Pattern& p, std::vector<std::string>& out) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) out.push_back(v->name.txt);
+    else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) collect_pat_vars(*c->p, out);
+    else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) { for (auto& e : t->elems) collect_pat_vars(*e, out); }
+    else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) { out.push_back(a->name.txt); collect_pat_vars(*a->p, out); }
+  }
+  tt::ClassExpr class_expr_t(const ClassExpr& ce) {
+    if (auto* fn = std::get_if<Pcl_fun>(&ce.desc)) {  // class c <pat> = ..
+      if (fn->default_) throw TypeError("class optional param");
+      tt::ClassExpr out;
+      out.loc = ce.loc;
+      tt::Tcl_fun tf;
+      tf.label = fn->label;
+      tf.pat = std::make_unique<tt::Pattern>(pattern(fn->pat));  // the param ident
+      // A class parameter is captured as an instance variable (a fresh ident):
+      // method bodies see it via the self object (Texp_instvar), not as a local.
+      std::vector<std::string> pvars;
+      collect_pat_vars(fn->pat, pvars);
+      for (auto& nm : pvars) {
+        scopes.back().erase(nm);
+        instvars_[nm] = fresh_anon(nm);
+      }
+      tf.body = std::make_unique<tt::ClassExpr>(class_expr_t(*fn->body));
+      out.desc = std::move(tf);
+      return out;
+    }
+    if (auto* ps = std::get_if<Pcl_structure>(&ce.desc))
+      return class_structure_expr(ps->cs, ce.loc);
+    throw TypeError("class_expr#" + std::to_string(ce.desc.index()));
+  }
+  tt::ClassDeclaration class_declaration(const ast::ClassDeclaration& d) {
+    tt::ClassDeclaration out;
+    out.loc = d.loc;
+    out.virt = d.virt == VirtualFlag::Virtual;
+    out.name = d.name.txt;
+    auto saved_iv = instvars_;
+    push();  // a scope for class parameters
+    out.expr = class_expr_t(d.expr);
+    pop();
+    instvars_ = std::move(saved_iv);
     return out;
   }
 

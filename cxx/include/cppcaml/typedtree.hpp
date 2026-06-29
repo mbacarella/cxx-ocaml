@@ -300,8 +300,14 @@ struct ClassStructure {
   std::vector<ClassField> fields;
 };
 struct Tcl_structure { ClassStructure cs; };
+struct ClassExpr;
+struct Tcl_fun {  // class c <pat> = ..  (a class parameter)
+  ArgLabel label;
+  PatBox pat;
+  Box<ClassExpr> body;
+};
 struct ClassExpr {
-  std::variant<Tcl_structure> desc;
+  std::variant<Tcl_structure, Tcl_fun> desc;
   Location loc;
 };
 struct ClassDeclaration {

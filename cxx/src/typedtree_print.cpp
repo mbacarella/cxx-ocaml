@@ -613,6 +613,13 @@ struct Printer {
   }
   void class_expr(int i, const ClassExpr& ce) {
     line(i, "class_expr " + loc(ce.loc));
+    if (auto* fn = std::get_if<Tcl_fun>(&ce.desc)) {
+      line(i + 1, "Tcl_fun");
+      arg_label(i + 1, fn->label);
+      pattern(i + 1, *fn->pat);
+      class_expr(i + 1, *fn->body);
+      return;
+    }
     auto& st = std::get<Tcl_structure>(ce.desc);
     line(i + 1, "Tcl_structure");
     line(i + 1, "class_structure");
