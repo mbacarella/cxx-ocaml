@@ -1080,6 +1080,20 @@ struct Typer {
       si.desc = std::move(tm);
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
       si.desc = tt::Tstr_include{std::make_unique<tt::ModuleExpr>(module_expr(in->expr))};
+    } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
+      tt::Tstr_recmodule tr;
+      std::vector<tt::Ident> ids;  // pre-bind all names (stamp order + mutual refs)
+      for (auto& b : rm->bindings)
+        ids.push_back(fresh_module(b.name.txt ? *b.name.txt : "_"));
+      for (size_t k = 0; k < rm->bindings.size(); ++k) {
+        const ModuleExpr& be = rm->bindings[k].expr;
+        auto me = module_expr(be);
+        // The constrained module's typedtree location is the inner module's
+        // (the `= struct ..`), not the binding's `: S = struct ..` span.
+        if (auto* mc = std::get_if<Pmod_constraint>(&be.desc)) me.loc = mc->me->loc;
+        tr.bindings.emplace_back(ids[k], std::make_unique<tt::ModuleExpr>(std::move(me)));
+      }
+      si.desc = std::move(tr);
     } else {
       throw TypeError("stritem#" + std::to_string(it.desc.index()));
     }

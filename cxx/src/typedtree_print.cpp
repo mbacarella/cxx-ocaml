@@ -630,6 +630,14 @@ struct Printer {
     } else if (auto* inc = std::get_if<Tstr_include>(&it.desc)) {
       os << std::string(2 * j, ' ') << "Tstr_include";  // run-on: module_expr on the same line
       module_expr(j, *inc->expr);
+    } else if (auto* rm = std::get_if<Tstr_recmodule>(&it.desc)) {
+      line(j, "Tstr_recmodule");
+      line(j, "[");
+      for (auto& [id, me] : rm->bindings) {
+        line(j + 1, ident(id));
+        module_expr(j + 2, *me);
+      }
+      line(j, "]");
     } else if (auto* tx = std::get_if<Tstr_typext>(&it.desc)) {
       line(j, "Tstr_typext");
       line(j, "type_extension");

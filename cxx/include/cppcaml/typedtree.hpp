@@ -279,10 +279,13 @@ struct Tstr_typext {
 struct Tstr_attribute { std::string name; const ast::Structure* payload; };
 struct Tstr_modtype { Ident id; ModuleTypeBox2 type; };  // type null = abstract
 struct Tstr_include { ModuleExprBox expr; };  // include M
+struct Tstr_recmodule {  // module rec A = .. and B = ..
+  std::vector<std::pair<Ident, ModuleExprBox>> bindings;
+};
 struct StructureItem {
   std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception,
                Tstr_open, Tstr_module, Tstr_attribute, Tstr_typext, Tstr_modtype,
-               Tstr_include>
+               Tstr_include, Tstr_recmodule>
       desc;
   Location loc;
 };
