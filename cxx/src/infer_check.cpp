@@ -960,6 +960,55 @@ struct Checker {
     }
   }
 
+  // An object override `{< l = e; .. >}` may only set instance variables of the
+  // enclosing object.  Checked syntactically and conservatively: only when the
+  // object has NO `inherit` (so its val set is complete -- inheritance could
+  // bring in more vars we don't see) and only for an override that is directly a
+  // method/initializer body (no general expression walk needed for the corpus).
+  void check_object_overrides_cs(const ast::ClassStructure& cs) {
+    for (auto& f : cs.fields)
+      if (std::holds_alternative<Pcf_inherit>(f.desc)) return;  // unknown inherited vals
+    std::set<std::string> vals;
+    for (auto& f : cs.fields)
+      if (auto* v = std::get_if<Pcf_val>(&f.desc)) vals.insert(v->name.txt);
+    for (auto& f : cs.fields) {
+      const Expression* body = nullptr;
+      if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+        if (auto* cc = std::get_if<Cfk_concrete>(&m->kind)) body = cc->e.get();
+      } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) body = ini->e.get();
+      if (!body) continue;
+      if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) body = poly->e.get();
+      if (auto* ov = std::get_if<Pexp_override>(&body->desc))
+        for (auto& [lbl, e] : ov->fields)
+          if (!vals.count(lbl.txt)) {
+            note_error("Unbound instance variable " + lbl.txt);
+            return;
+          }
+    }
+  }
+  void check_object_overrides_ce(const ast::ClassExpr& ce) {
+    const ast::ClassExpr* c = &ce;
+    while (true) {  // unwrap class fun/let/constraint wrappers to the structure
+      if (auto* fn = std::get_if<Pcl_fun>(&c->desc)) c = fn->body.get();
+      else if (auto* lt = std::get_if<Pcl_let>(&c->desc)) c = lt->body.get();
+      else if (auto* cn = std::get_if<Pcl_constraint>(&c->desc)) c = cn->ce.get();
+      else break;
+    }
+    if (auto* st = std::get_if<Pcl_structure>(&c->desc)) check_object_overrides_cs(st->cs);
+  }
+  void check_object_overrides(const ast::Structure& items) {
+    if (!strict) return;
+    for (auto& it : items) {
+      if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
+        for (auto& d : cl->decls) check_object_overrides_ce(d.expr);
+      } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+        const ModuleExpr* me = &mb->binding.expr;
+        while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
+        if (auto* ms = std::get_if<Pmod_structure>(&me->desc)) check_object_overrides(ms->items);
+      }
+    }
+  }
+
   // A `module rec` group can hide a cyclic type abbreviation that the file-local
   // check misses, because the self-reference is *qualified* through the module
   // being defined (`module rec A : sig type t = A.t end`).  Build the abbreviation
@@ -3060,6 +3109,7 @@ static void run_checker(Checker& ck, const ast::Structure& s) {
   ck.finalize_fields();
   ck.check_cyclic_aliases();
   ck.check_dup_modtypes_struct(s);
+  ck.check_object_overrides(s);
   ck.process_items(s);
 }
 
