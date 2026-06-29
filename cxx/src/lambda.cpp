@@ -3190,6 +3190,13 @@ struct Translator {
     while (e) {
       if (auto* nt = std::get_if<Pexp_newtype>(&e->desc)) { e = nt->body.get(); continue; }
       if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) { e = ct->e.get(); continue; }
+      // `let do_read = let u = Bytes.create 4096 in fun ?(loop=false) ..`: the
+      // binding's VALUE is the inner function (the let/seq just sets up captured
+      // state), so its labelled signature is that function's.  Without peeling
+      // these, the call site `do_read ~loop:false` didn't wrap the optional in a
+      // `Some` and passed it raw -> the callee's `if loop then loop.(0)` faulted.
+      if (auto* le = std::get_if<Pexp_let>(&e->desc)) { e = le->body.get(); continue; }
+      if (auto* sq = std::get_if<Pexp_sequence>(&e->desc)) { e = sq->e2.get(); continue; }
       break;
     }
     if (!e) return;
