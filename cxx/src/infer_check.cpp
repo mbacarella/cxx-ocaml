@@ -1368,6 +1368,45 @@ struct Checker {
                    "right-hand side of \"let rec\"");
   }
 
+  // Two purely-syntactic restrictions on a match/try case (always errors, so
+  // checking them never false-rejects valid code):
+  //   - an effect pattern must be at the top level of a case, not nested inside
+  //     a constructor/tuple/record (`Some (effect A, _)` is illegal);
+  //   - a guarded case may not mix value and exception patterns
+  //     (`Some x | exception E x when g -> ...`).
+  void check_case_structure(const Case& c) {
+    if (!strict) return;
+    std::function<void(const Pattern&, bool)> eff = [&](const Pattern& p, bool top) {
+      if (auto* e = std::get_if<Ppat_effect>(&p.desc)) {
+        if (!top) { note_error("Effect patterns must be at the top level of a match case."); return; }
+        eff(*e->eff, false); eff(*e->cont, false);
+      } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) { eff(*o->l, top); eff(*o->r, top); }
+      else if (auto* cn = std::get_if<Ppat_constraint>(&p.desc)) eff(*cn->p, top);
+      else if (auto* al = std::get_if<Ppat_alias>(&p.desc)) eff(*al->p, top);
+      else if (auto* tu = std::get_if<Ppat_tuple>(&p.desc)) { for (auto& s : tu->elems) eff(*s, false); }
+      else if (auto* k = std::get_if<Ppat_construct>(&p.desc)) { if (k->arg) eff(**k->arg, false); }
+      else if (auto* r = std::get_if<Ppat_record>(&p.desc)) { for (auto& [l, s] : r->fields) eff(*s, false); }
+      else if (auto* a = std::get_if<Ppat_array>(&p.desc)) { for (auto& s : a->elems) eff(*s, false); }
+      else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) eff(*lz->p, false);
+      else if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) eff(*ex->p, false);
+    };
+    eff(c.lhs, true);
+    if (c.guard) {  // a guard over an or-pattern mixing value and exception arms
+      bool has_value = false, has_exn = false;
+      std::function<void(const Pattern&)> vx = [&](const Pattern& p) {
+        if (std::get_if<Ppat_exception>(&p.desc)) has_exn = true;
+        else if (std::get_if<Ppat_effect>(&p.desc)) { /* neither */ }
+        else if (auto* o = std::get_if<Ppat_or>(&p.desc)) { vx(*o->l); vx(*o->r); }
+        else if (auto* cn = std::get_if<Ppat_constraint>(&p.desc)) vx(*cn->p);
+        else if (auto* al = std::get_if<Ppat_alias>(&p.desc)) vx(*al->p);
+        else has_value = true;
+      };
+      vx(c.lhs);
+      if (has_value && has_exn)
+        note_error("Mixing value and exception patterns under when-guards is not supported.");
+    }
+  }
+
   TypePtr try_(std::function<TypePtr()> f) {
     try { return f(); } catch (const I::TypeError&) { return eng.fresh_var(); }
   }
@@ -1917,6 +1956,7 @@ struct Checker {
       TypePtr t = eng.fresh_var();
       try_unify(t, infer_expr(*tr->e));
       for (auto& c : tr->cases) {
+        check_case_structure(c);
         venv.emplace_back();
         infer_pat(c.lhs);  // an exception pattern (binds exn-typed vars)
         if (c.guard) try_unify(infer_expr(**c.guard), eng.constr("bool"));
@@ -1945,6 +1985,7 @@ struct Checker {
       bool window = gadt && !record_kinds_;
       TypePtr rt = eng.fresh_var();
       for (auto& c : m->cases) {
+        check_case_structure(c);
         venv.emplace_back();
         size_t wm = window ? eng.mark() : 0;
         TypePtr pt = infer_pat(c.lhs);
