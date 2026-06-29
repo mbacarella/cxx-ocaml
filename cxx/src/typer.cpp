@@ -255,6 +255,7 @@ struct Typer {
     tt::Path path;
     std::unordered_set<std::string> values;
     std::unordered_set<std::string> types;
+    std::unordered_set<std::string> submodules;  // for `open M; Sub.x` -> M.Sub.x
   };
   std::vector<OpenEntry> opens;
 
@@ -263,6 +264,7 @@ struct Typer {
       auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + modname + ".cmi");
       for (auto& v : cmi.values()) oe.values.insert(v.name);
       for (auto& t : cmi.types()) oe.types.insert(t.name);
+      for (auto& m : cmi.modules()) oe.submodules.insert(m.name);
     } catch (...) {
       // Unknown/local module: names from it won't resolve (best effort).
     }
@@ -568,6 +570,13 @@ struct Typer {
         p.v = tt::Pident{m->second};
         return p;
       }
+      // A submodule brought into scope by `open M` resolves through M's path.
+      for (auto it = opens.rbegin(); it != opens.rend(); ++it)
+        if (it->submodules.count(l->name)) {
+          tt::Path p;
+          p.v = tt::Pdot{std::make_shared<tt::Path>(it->path), l->name};
+          return p;
+        }
       auto pre = std::make_shared<tt::Path>();
       pre->v = tt::Pident{tt::Ident{"Stdlib", 0, tt::Ident::Global}};
       tt::Path p;
