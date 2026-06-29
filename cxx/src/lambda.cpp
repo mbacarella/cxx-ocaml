@@ -5661,6 +5661,34 @@ struct Translator {
     }
     return nullptr;
   }
+  // The arity of an exception/extension ctor exported by an opened, separately-
+  // compiled module (Unix's `Unix_error of error * string * string` -> 3), read
+  // from that module's cmi typexts.  Without it exn_case_body defaults to arity 1
+  // and treats the whole payload tuple as one refutable field, dropping the arm.
+  // Returns -1 when no opened module exports `name` as a tuple exception.
+  int opened_exn_arity(const std::string& name) {
+    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+      if (it->find('.') != std::string::npos) continue;
+      try {
+        auto cmi = cmi::CmiFile::load(resolve_cmi(*it));
+        for (auto& tx : cmi.sig().typexts)
+          if (tx.name == name && !tx.is_inline_record) return (int)tx.args.size();
+      } catch (...) {}
+    }
+    return -1;
+  }
+  // Register a bare constructor (`EINTR`) brought into scope by `open M` of a
+  // separately-compiled module, by finding which opened module's cmi declares it
+  // and registering its whole variant type's ctors.  Lets an exn payload pattern
+  // `Unix_error (EINTR, _, _)` test EINTR's tag instead of bailing.
+  void register_opened_ctor(const std::string& name) {
+    if (ctor_info_.count(name)) return;
+    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+      if (it->find('.') != std::string::npos) continue;
+      register_module_ctor(*it, name);
+      if (ctor_info_.count(name)) return;
+    }
+  }
   // A match row as a *borrowed* view into the AST (the Structure outlives the
   // translation), so sub-matches can be built from inner sub-patterns without
   // copying the move-only Case.  guard==nullptr means no `when`.
@@ -5704,6 +5732,14 @@ struct Translator {
         return iff;
       }
       if (auto* k = std::get_if<Ppat_construct>(&lhsp->desc)) {
+        // An exn ctor from `open Unix` (`Unix_error of error*string*string`):
+        // register its true arity so exn_case_body destructures the payload
+        // rather than treating it as one tuple field and dropping the arm.
+        if (k->arg) {
+          std::string cn = lid_last(k->id.txt);
+          if (!exn_arity_.count(cn))
+            if (int a = opened_exn_arity(cn); a > 0) exn_arity_[cn] = a;
+        }
         // a module-qualified exception/extension ctor resolves to that module's
         // own field first (distinguishes `M1.E` from `M2.E`); else the binder.
         LamPtr id0 = module_ctor_identity(k->id.txt);
@@ -5918,6 +5954,10 @@ struct Translator {
         // a nullary VARIANT constructor payload (`Error (Unterminated_string, x)`,
         // lexer.ml): an integer test on the field against its constant-ctor index.
         // Without this the whole `with`-arm was dropped to a bare reraise.
+        // A ctor from `open Unix` (EINTR in `Unix_error (EINTR,_,_)`) is not yet
+        // in ctor_info_ -- register its type from the opened module first.
+        if (std::holds_alternative<Lident>(kc->id.txt.v))
+          register_opened_ctor(ctor_of(*fp));
         auto ci = ctor_info_.find(ctor_of(*fp));
         if (ci != ctor_info_.end() && !ci->second.is_block) {
           tests->push_back({j + 1, cint(ci->second.tag), false});
@@ -11033,6 +11073,12 @@ struct Translator {
       auto l = mk(Lam::K::Try);
       l->body = expr(*tr->e);
       scope.emplace_back();
+      // Register constructors named in the handler patterns (the match path does
+      // this at scan_pat_ctors; try/with skipped it).  A payload ctor like EINTR
+      // in `with Unix_error (EINTR, _, _) ->` (from `open Unix`) is otherwise
+      // unresolved, so exn_case_body bails and the WHOLE arm is silently dropped
+      // to a bare reraise -- e.g. ocamlbuild's select() EINTR-retry never retried.
+      for (auto& c : tr->cases) scan_pat_ctors(c.lhs);
       // `with e -> body` (a single catch-all var) binds `e` directly; otherwise a
       // synthetic `exn` is matched against the cases.
       const Ppat_var* pv = nullptr;
