@@ -52,8 +52,10 @@ struct Ttyp_tuple {
 };
 struct Ttyp_constr { Path path; std::vector<CoreTypeBox> args; };
 struct Ttyp_poly { std::vector<std::string> vars; CoreTypeBox type; };
+struct Ttyp_alias { std::string name; CoreTypeBox type; };  // (t as 'name)
 struct CoreType {
-  std::variant<Ttyp_any, Ttyp_var, Ttyp_arrow, Ttyp_tuple, Ttyp_constr, Ttyp_poly>
+  std::variant<Ttyp_any, Ttyp_var, Ttyp_arrow, Ttyp_tuple, Ttyp_constr, Ttyp_poly,
+               Ttyp_alias>
       desc;
   Location loc;
 };

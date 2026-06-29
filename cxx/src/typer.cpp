@@ -349,6 +349,12 @@ struct Typer {
       for (auto& arg : c->args)
         tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*arg)));
       out.desc = std::move(tc);
+    } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+      out.desc = tt::Ttyp_alias{al->name,
+                                std::make_unique<tt::CoreType>(core_type(*al->type))};
+    } else if (auto* po = std::get_if<Ptyp_poly>(&t.desc)) {
+      out.desc = tt::Ttyp_poly{po->vars,
+                               std::make_unique<tt::CoreType>(core_type(*po->type))};
     } else {
       throw TypeError("coretype#" + std::to_string(t.desc.index()));
     }

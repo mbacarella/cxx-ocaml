@@ -150,6 +150,9 @@ struct Printer {
     } else if (auto* c = std::get_if<Ttyp_constr>(&t.desc)) {
       line(j, "Ttyp_constr \"" + path_aux(c->path) + "\"");
       list_core_types(j, c->args);
+    } else if (auto* al = std::get_if<Ttyp_alias>(&t.desc)) {
+      line(j, "Ttyp_alias \"" + al->name + "\"");
+      core_type(j, *al->type);
     } else {
       auto& p = std::get<Ttyp_poly>(t.desc);
       std::string s = "Ttyp_poly";
