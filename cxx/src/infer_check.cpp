@@ -913,7 +913,7 @@ struct Checker {
     } else if (auto* mf = std::get_if<Pmod_functor>(&me.desc)) check_dup_modtypes_me(*mf->body);
   }
   void check_dup_modtypes_sig(const ast::Signature& items) {
-    std::set<std::string> seen;
+    std::set<std::string> seen, seen_class, seen_classty;
     for (auto& it : items) {
       if (auto* mt = std::get_if<Psig_modtype>(&it.desc)) {
         if (!seen.insert(mt->name.txt).second)
@@ -923,12 +923,20 @@ struct Checker {
         check_dup_modtypes_mt(*md->md.type);
       } else if (auto* rm = std::get_if<Psig_recmodule>(&it.desc)) {
         for (auto& d : rm->decls) check_dup_modtypes_mt(*d.type);
+      } else if (auto* cl = std::get_if<Psig_class>(&it.desc)) {
+        for (auto& d : cl->decls)
+          if (!seen_class.insert(d.name.txt).second)
+            note_error("Multiple definition of the class name " + d.name.txt);
+      } else if (auto* ct = std::get_if<Psig_class_type>(&it.desc)) {
+        for (auto& d : ct->decls)
+          if (!seen_classty.insert(d.name.txt).second)
+            note_error("Multiple definition of the class type name " + d.name.txt);
       }
     }
   }
   void check_dup_modtypes_struct(const ast::Structure& items) {
     if (!strict) return;
-    std::set<std::string> seen;
+    std::set<std::string> seen, seen_class, seen_classty;
     for (auto& it : items) {
       if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
         if (!seen.insert(mt->name.txt).second)
@@ -940,6 +948,14 @@ struct Checker {
         for (auto& b : rm->bindings) check_dup_modtypes_me(b.expr);
       } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
         check_dup_modtypes_me(in->expr);
+      } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
+        for (auto& d : cl->decls)
+          if (!seen_class.insert(d.name.txt).second)
+            note_error("Multiple definition of the class name " + d.name.txt);
+      } else if (auto* ct = std::get_if<Pstr_class_type>(&it.desc)) {
+        for (auto& d : ct->decls)
+          if (!seen_classty.insert(d.name.txt).second)
+            note_error("Multiple definition of the class type name " + d.name.txt);
       }
     }
   }
