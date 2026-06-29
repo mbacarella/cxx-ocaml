@@ -607,6 +607,12 @@ struct Typer {
         tr.fields.emplace_back(lid_last(lid.txt),
                                std::make_unique<tt::Pattern>(pattern(*sub)));
       out.desc = std::move(tr);
+    } else if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      tt::Tpat_array ta;
+      for (auto& el : a->elems) ta.elems.push_back(std::make_unique<tt::Pattern>(pattern(*el)));
+      out.desc = std::move(ta);
+    } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
+      out.desc = tt::Tpat_lazy{std::make_unique<tt::Pattern>(pattern(*lz->p))};
     } else {
       throw TypeError("pat#" + std::to_string(p.desc.index()));
     }

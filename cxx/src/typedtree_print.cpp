@@ -293,6 +293,13 @@ struct Printer {
         pattern(j + 2, *sub);
       }
       line(j, "]");
+    } else if (auto* ar = std::get_if<Tpat_array>(&p.desc)) {
+      line(j, "Tpat_array Mutable");
+      if (ar->elems.empty()) line(j, "[]");
+      else { line(j, "["); for (auto& el : ar->elems) pattern(j + 1, *el); line(j, "]"); }
+    } else if (auto* lz = std::get_if<Tpat_lazy>(&p.desc)) {
+      line(j, "Tpat_lazy");
+      pattern(j, *lz->inner);
     } else {
       auto& tu = std::get<Tpat_tuple>(p.desc);
       line(j, "Tpat_tuple");

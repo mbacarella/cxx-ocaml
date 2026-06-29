@@ -82,10 +82,13 @@ struct Tpat_alias { Ident id; PatBox inner; };  // (p as id)
 struct Tpat_record {  // { l1 = p1; ... } -- only the written fields, in order
   std::vector<std::pair<std::string, PatBox>> fields;  // label (last component), sub-pattern
 };
+struct Tpat_array { std::vector<PatBox> elems; };  // [| ... |] (always Mutable)
+struct Tpat_lazy { PatBox inner; };                // lazy p
 struct PatExtra { CoreType ctype; Location loc; };  // Tpat_extra_constraint
 struct Pattern {
   std::variant<Tpat_any, Tpat_var, Tpat_constant, Tpat_construct, Tpat_value,
-               Tpat_tuple, Tpat_exception, Tpat_or, Tpat_alias, Tpat_record>
+               Tpat_tuple, Tpat_exception, Tpat_or, Tpat_alias, Tpat_record,
+               Tpat_array, Tpat_lazy>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
