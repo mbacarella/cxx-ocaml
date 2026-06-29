@@ -1333,9 +1333,12 @@ struct Typer {
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       auto& b = mb->binding;
       tt::Tstr_module tm;
-      tm.id = fresh_module(b.name.txt ? *b.name.txt : "_");
       tm.present = !std::holds_alternative<Pmod_ident>(b.expr.desc);  // alias=Absent
+      // A plain `module M = E` is non-recursive: E is elaborated with M NOT yet
+      // bound (so `module M = struct .. M.x .. end` sees an OUTER M), then M is
+      // bound for the following items.
       tm.expr = std::make_unique<tt::ModuleExpr>(module_expr(b.expr));
+      tm.id = fresh_module(b.name.txt ? *b.name.txt : "_");
       si.desc = std::move(tm);
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
       si.desc = tt::Tstr_include{std::make_unique<tt::ModuleExpr>(module_expr(in->expr))};
