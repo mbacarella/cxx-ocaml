@@ -254,6 +254,16 @@ int main(int argc, char** argv) {
   // Compile every source input; collect the resulting (and pre-built) objects
   // for a possible link step.
   std::vector<std::string> link_objs;
+  // A bare object name (`unix.cma`) on the link line is resolved against the
+  // -I include path, like ocamlc -- otherwise only a cwd-relative path works.
+  auto resolve_obj = [&](const std::string& f) -> std::string {
+    if (fs::exists(f)) return f;
+    for (const std::string& d : incdirs) {
+      fs::path cand = fs::path(d) / f;
+      if (fs::exists(cand)) return cand.string();
+    }
+    return f;  // leave as-is; the linker reports the open failure
+  };
   for (const std::string& f : inputs) {
     if (ends_with(f, ".mli")) {
       std::string cmi_out =
@@ -269,7 +279,9 @@ int main(int argc, char** argv) {
       if (int rc = compile_ml(f, cmo_out, stdlib_dir, prof)) return rc;
       link_objs.push_back(cmo_out);
     } else if (ends_with(f, ".cmo") || ends_with(f, ".cma")) {
-      link_objs.push_back(f);  // a pre-compiled object/library to link
+      link_objs.push_back(resolve_obj(f));  // a pre-compiled object/library to link
+    } else if (ends_with(f, ".cmi")) {
+      link_objs.push_back(resolve_obj(f));  // interface-only member (meaningful under -pack)
     } else {
       std::cerr << "c++ocamlc: don't know what to do with " << f << '\n';
       return 2;

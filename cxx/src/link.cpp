@@ -344,7 +344,14 @@ void pack(const std::vector<std::string>& cmos, const std::string& pack_name,
   std::vector<ValPtr> primitives;
   std::set<std::string> members, processed;
   std::vector<std::string> member_names;
+  // An interface-only member (a `.cmi` in the pack list, like ocamlbuild's
+  // signatures.cmi) is PM_intf: it contributes its signature to the packed
+  // .cmi but no code and no slot in the structure block.
+  auto is_intf = [](const std::string& p) {
+    return p.size() >= 4 && p.compare(p.size() - 4, 4, ".cmi") == 0;
+  };
   for (const std::string& path : cmos) {
+    if (is_intf(path)) continue;
     InputFile in = read_objects(path);
     if (in.archive || in.units.size() != 1)
       throw std::runtime_error(path + ": -pack expects a single .cmo");
@@ -366,6 +373,7 @@ void pack(const std::vector<std::string>& cmos, const std::string& pack_name,
   };
   // Members: copy code, rebase + rename relocations.
   for (const std::string& path : cmos) {
+    if (is_intf(path)) continue;  // PM_intf: no code
     Unit u = read_objects(path).units[0];
     int base = (int)code.size();
     code.insert(code.end(), u.code.begin(), u.code.end());
