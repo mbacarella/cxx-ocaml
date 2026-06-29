@@ -2563,29 +2563,66 @@ struct Checker {
   // like-with-like (both manifests -> reliable-builtin/identity clash; both
   // variants/records -> constructor/field name sets), skipping GADTs and
   // cross-kind/abstract-impl cases so we never false-reject.
-  bool type_decls_clash(const TypeDeclaration& impl, const TypeDeclaration& spec) {
-    if (std::holds_alternative<Ptype_abstract>(spec.kind) && !spec.manifest)
-      return false;  // spec abstract: any implementation is fine
-    if (impl.manifest && spec.manifest) {
-      std::unordered_map<std::string, TypePtr> v1, v2;
-      return expected_clash(from_coretype(*impl.manifest->get(), v1),
-                            from_coretype(*spec.manifest->get(), v2));
+  // Reliable clash between two written core types (used for inclusion checks):
+  // a clash on builtins/arrows/tuples, never on user types (incomplete inference).
+  bool ct_clash(const CoreType& a, const CoreType& b) {
+    std::unordered_map<std::string, TypePtr> va, vb;
+    return expected_clash(from_coretype(a, va), from_coretype(b, vb));
+  }
+  // Reliable clash between two constructor argument lists.
+  bool ctor_args_clash(const ConstructorArguments& a, const ConstructorArguments& b) {
+    auto* at = std::get_if<Pcstr_tuple>(&a);
+    auto* bt = std::get_if<Pcstr_tuple>(&b);
+    if (at && bt) {
+      if (at->elems.size() != bt->elems.size()) return true;  // different arity
+      for (size_t i = 0; i < at->elems.size(); ++i)
+        if (ct_clash(*at->elems[i], *bt->elems[i])) return true;
+      return false;
     }
+    auto* ar = std::get_if<Pcstr_record>(&a);
+    auto* br = std::get_if<Pcstr_record>(&b);
+    if (ar && br) {
+      if (ar->fields.size() != br->fields.size()) return true;
+      for (size_t i = 0; i < ar->fields.size(); ++i)
+        if (ar->fields[i].name.txt != br->fields[i].name.txt ||
+            ct_clash(*ar->fields[i].type, *br->fields[i].type)) return true;
+      return false;
+    }
+    return (at != nullptr) != (bt != nullptr);  // tuple vs inline-record: a clash
+  }
+  bool type_decls_clash(const TypeDeclaration& impl, const TypeDeclaration& spec) {
+    if (impl.params.size() != spec.params.size())
+      return true;  // arity mismatch (`type 'a t` vs `type t`): always an error
+    if (std::holds_alternative<Ptype_abstract>(spec.kind) && !spec.manifest)
+      return false;  // spec abstract (matching arity): any implementation is fine
+    if (impl.manifest && spec.manifest)
+      return ct_clash(*impl.manifest->get(), *spec.manifest->get());
     auto* iv = std::get_if<Ptype_variant>(&impl.kind);
     auto* sv = std::get_if<Ptype_variant>(&spec.kind);
     if (iv && sv) {
-      std::set<std::string> si, ss;
-      for (auto& c : iv->ctors) { if (c.res) return false; si.insert(c.name.txt); }
-      for (auto& c : sv->ctors) { if (c.res) return false; ss.insert(c.name.txt); }
-      return si != ss;
+      std::unordered_map<std::string, const ConstructorDecl*> mi, ms;
+      for (auto& c : iv->ctors) { if (c.res) return false; mi[c.name.txt] = &c; }
+      for (auto& c : sv->ctors) { if (c.res) return false; ms[c.name.txt] = &c; }
+      if (mi.size() != ms.size()) return true;
+      for (auto& [n, sc] : ms) {
+        auto f = mi.find(n);
+        if (f == mi.end()) return true;                       // name-set mismatch
+        if (ctor_args_clash(f->second->args, sc->args)) return true;  // arg-type mismatch
+      }
+      return false;
     }
     auto* ir = std::get_if<Ptype_record>(&impl.kind);
     auto* sr = std::get_if<Ptype_record>(&spec.kind);
     if (ir && sr) {
-      std::set<std::string> fi, fs;
-      for (auto& f : ir->fields) fi.insert(f.name.txt);
-      for (auto& f : sr->fields) fs.insert(f.name.txt);
-      return fi != fs;
+      if (ir->fields.size() != sr->fields.size()) return true;
+      std::unordered_map<std::string, const LabelDecl*> mi;
+      for (auto& f : ir->fields) mi[f.name.txt] = &f;
+      for (auto& f : sr->fields) {
+        auto g = mi.find(f.name.txt);
+        if (g == mi.end()) return true;                       // field-set mismatch
+        if (ct_clash(*g->second->type, *f.type)) return true;  // field-type mismatch
+      }
+      return false;
     }
     return false;  // cross-kind / abstract impl: not sure -> don't flag
   }
