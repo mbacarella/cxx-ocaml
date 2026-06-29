@@ -18,6 +18,7 @@
 #include "cppcaml/ast.hpp"
 #include "cppcaml/infer.hpp"
 #include "cppcaml/cmi.hpp"
+#include "cppcaml/apply_match.hpp"
 
 namespace cppcaml {
 
@@ -31,6 +32,18 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
 // set true when certain, so consulting it cannot cause false-positive Partials.
 std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
     const ast::Structure& s);
+
+// Slice 3 dump side-tables computed in ONE inference pass (so the transcriber
+// doesn't pay for inference twice): per `match` node, whether it is certainly
+// non-exhaustive; and per `Pexp_apply` node, the reconstructed argument slots
+// (callee-parameter order, omitted optionals filled with None, labelled args
+// reordered) -- present only when the call's args don't already match a plain
+// positional pass-through.
+struct DumpAux {
+  std::unordered_map<const ast::Expression*, bool> match_partial;
+  std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>> apply_plans;
+};
+DumpAux infer_dump_aux(const ast::Structure& s);
 
 // Strict type-check (toward error-rejection parity): the definite type errors in
 // a structure; empty => accepted.  Conservative (only certain errors), so the

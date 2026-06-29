@@ -201,6 +201,10 @@ tt::Path stdlib_path(const std::string& name) {
 struct Typer {
   // Side-table from the inference pass: match nodes that are non-exhaustive.
   const std::unordered_map<const ast::Expression*, bool>* partiality = nullptr;
+  // Slice 3: per Pexp_apply, the reconstructed argument slots (consumed at
+  // Pexp_apply in step 3).
+  const std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>>*
+      apply_plans = nullptr;
   long long next_stamp = 274;  // arbitrary base; the harness normalizes stamps
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
@@ -1317,8 +1321,9 @@ struct Typer {
 
 typedtree::Structure type_structure(const ast::Structure& s) {
   Typer t;
-  auto partiality = infer_match_partiality(s);  // inference side-table (Slice 3)
-  t.partiality = &partiality;
+  auto aux = infer_dump_aux(s);  // inference side-tables (Slice 3)
+  t.partiality = &aux.match_partial;
+  t.apply_plans = &aux.apply_plans;
   typedtree::Structure out;
   for (auto& it : s) out.push_back(t.structure_item(it));
   return out;

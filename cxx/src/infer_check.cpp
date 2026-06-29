@@ -229,6 +229,9 @@ struct Checker {
   std::set<std::string> expanding_;  // guard against cyclic abbreviations
   // match-expression node -> is-partial (the result we route back to the dump)
   std::unordered_map<const Expression*, bool> match_partial;
+  // Pexp_apply node -> reconstructed argument slots (callee-param order, omitted
+  // optionals filled), for the dump.  Only stored when non-trivial (see infer_apply).
+  std::unordered_map<const Expression*, std::vector<applymatch::Slot>> apply_plans;
   // local module name -> its exported value schemes (so open/include/M.x resolve)
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modenv;
   // local functor name -> its body's exported value schemes (F(X) result)
@@ -1914,7 +1917,7 @@ struct Checker {
     if (auto* id = std::get_if<Pexp_ident>(&e.desc))
       return lookup_value(id->id.txt);
     if (auto* a = std::get_if<Pexp_apply>(&e.desc))
-      return infer_apply(*a);
+      return infer_apply(*a, e);
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return infer_function(*f);
     if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) {  // fun (type a) -> e
       newtype_vars[nt->name.txt] = eng.fresh_var();
@@ -2290,8 +2293,37 @@ struct Checker {
     return -1;
   }
 
-  TypePtr infer_apply(const Pexp_apply& a) {
+  // Slice 3: reconstruct the application's argument list against the callee's
+  // inferred parameter labels, for the typed-tree dump.  Stored only when the
+  // plan is NON-TRIVIAL (some omitted optional, a Some-wrap, or a reordering) --
+  // a plain positional call already dumps correctly from source order.
+  void record_apply_plan(const Pexp_apply& a, const Expression& enode, const TypePtr& ft) {
+    std::vector<applymatch::Param> params;
+    TypePtr cur = I::Engine::repr(ft);
+    while (cur->kind == I::Type::Kind::Arrow) {
+      params.push_back({cur->arrow_label, cur->arrow_lbl});
+      cur = I::Engine::repr(cur->cod);
+    }
+    if (params.empty()) return;  // not a function type we can place args against
+    std::vector<applymatch::Arg> args;
+    for (auto& [lbl, arg] : a.args) {
+      auto [k, nm] = arglabel(lbl);
+      args.push_back({k, nm});
+    }
+    applymatch::Result m = applymatch::match(params, args);
+    if (!m.ok) return;
+    bool trivial = m.slots.size() == args.size();
+    if (trivial)
+      for (size_t i = 0; i < m.slots.size(); ++i)
+        if (m.slots[i].omitted || m.slots[i].some_wrap || m.slots[i].arg_index != (int)i) {
+          trivial = false;
+          break;
+        }
+    if (!trivial) apply_plans[&enode] = std::move(m.slots);
+  }
+  TypePtr infer_apply(const Pexp_apply& a, const Expression& enode) {
     TypePtr ft = infer_expr(*a.fn);
+    record_apply_plan(a, enode, ft);
     // Applying a value of a reliable non-function type (`1 2`, `"x" y`) is a
     // definite error -- a builtin like int/string is never an arrow.
     if (strict && !a.args.empty()) {
@@ -3118,6 +3150,15 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
   Checker ck;
   run_checker(ck, s);
   return std::move(ck.match_partial);
+}
+
+DumpAux infer_dump_aux(const ast::Structure& s) {
+  Checker ck;
+  run_checker(ck, s);
+  DumpAux out;
+  out.match_partial = std::move(ck.match_partial);
+  out.apply_plans = std::move(ck.apply_plans);
+  return out;
 }
 
 // The Lambda value_kind of an inferred type, as -dlambda spells it.
