@@ -1638,6 +1638,32 @@ struct Checker {
       venv.pop_back();
       return bt;
     }
+    if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) {
+      // `let+ p1 = e1 and+ p2 = e2 in body` desugars to
+      //   (let+) ((and+) e1 e2) (fun (p1, p2) -> body)
+      // with the and-ops folded left-associatively into nested pairs.  Typing
+      // the desugaring lets a misused operator clash (e.g. `(let+) = 7` applied
+      // as a function) instead of the whole letop collapsing to Any.
+      auto op_type = [&](const std::string& nm) {
+        return lookup_value(Longident{Lident{nm}});
+      };
+      // Fold the source value (and its operators) left-to-right.
+      TypePtr src = infer_expr(*lo->let_.exp);
+      for (auto& a : lo->ands) {
+        TypePtr res = eng.fresh_var();
+        try_unify(op_type(a.op.txt), eng.arrow(src, eng.arrow(infer_expr(*a.exp), res)));
+        src = res;
+      }
+      // The binding function: parameter pattern nested to match the fold.
+      venv.emplace_back();
+      TypePtr patTy = infer_pat(lo->let_.pat);
+      for (auto& a : lo->ands) patTy = eng.tuple({patTy, infer_pat(a.pat)});
+      TypePtr funTy = eng.arrow(patTy, infer_expr(*lo->body));
+      venv.pop_back();
+      TypePtr result = eng.fresh_var();
+      try_unify(op_type(lo->let_.op.txt), eng.arrow(src, eng.arrow(funTy, result)));
+      return result;
+    }
     if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<TypePtr> es;
       for (auto& el : t->elems) es.push_back(infer_expr(*el));
