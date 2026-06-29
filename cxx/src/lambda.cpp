@@ -2386,6 +2386,7 @@ struct Translator {
       std::string head = dotted.substr(0, dot);
       auto cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
+      std::vector<std::shared_ptr<cmi::CmiFile>> keep;  // park cross-unit cmis
       size_t pos = dot + 1;
       bool fail = false;
       while (!fail) {
@@ -2413,7 +2414,7 @@ struct Translator {
         }
         // a submodule whose type is a NAMED module type (`Digest.MD5 : S`)
         // resolves through this cmi's modtypes via mt_sig.
-        const cmi::Signature* nsig = md ? mt_sig(cmi, md->type) : nullptr;
+        const cmi::Signature* nsig = md ? mt_sig_x(cmi, md->type, keep) : nullptr;
         if (ix < 0 || !nsig) { fail = true; break; }
         sm.path.push_back(ix);
         sig = nsig;
@@ -2704,6 +2705,34 @@ struct Translator {
                                                                   : mt->path->s;
       for (auto& md : cmi.sig().modtypes)
         if (md.name == nm) return mt_sig(cmi, md.type, depth + 1);
+    }
+    return nullptr;
+  }
+  // As mt_sig, but resolves a modtype named in ANOTHER unit (`Signatures.LIST`)
+  // by loading that unit's cmi.  The loaded cmi is parked in `keep` so the
+  // returned Signature* stays valid for the caller's scope.  My_std re-exports
+  // `module List : Signatures.LIST`, so reading List's field layout needs it.
+  const cmi::Signature* mt_sig_x(const cmi::CmiFile& cmi, const cmi::ModuleTypePtr& mt,
+                                 std::vector<std::shared_ptr<cmi::CmiFile>>& keep,
+                                 int depth = 0) {
+    if (!mt || depth > 8) return nullptr;
+    if (mt->kind == cmi::ModuleType::Sig) return mt->sig.get();
+    if (mt->kind == cmi::ModuleType::Ident && mt->path) {
+      if (mt->path->kind == cmi::Path::Pident) {
+        for (auto& md : cmi.sig().modtypes)
+          if (md.name == mt->path->id.name) return mt_sig_x(cmi, md.type, keep, depth + 1);
+        return nullptr;
+      }
+      if (mt->path->kind == cmi::Path::Pdot && mt->path->a &&
+          mt->path->a->kind == cmi::Path::Pident) {
+        try {
+          auto sub = std::make_shared<cmi::CmiFile>(
+              cmi::CmiFile::load(resolve_cmi(mt->path->a->id.name)));
+          keep.push_back(sub);
+          for (auto& md : sub->sig().modtypes)
+            if (md.name == mt->path->s) return mt_sig_x(*sub, md.type, keep, depth + 1);
+        } catch (...) {}
+      }
     }
     return nullptr;
   }
@@ -10350,6 +10379,17 @@ struct Translator {
               return field_of(global_of(tgt), f->second);
             StdPrim asp = value_prim(tgt, d->name);
             if (!asp.name.empty()) if (LamPtr s = prim_stub(asp)) return s;
+          }
+          // `open My_std` (a separately-compiled unit) brings its SUBMODULES
+          // into scope, so a re-exported `module List`/`String` shadows the
+          // stdlib module.  A bare `List.x` must then resolve through My_std's
+          // List submodule (a DIFFERENT runtime field layout from Stdlib__List
+          // -- `getglobal My_std; getfield <List>; getfield <x>`), matching
+          // ocamlc.  Checked before the plain stdlib module below; harmless
+          // when the open carries no such submodule (submodule_value -> null).
+          for (auto oit = opened_.rbegin(); oit != opened_.rend(); ++oit) {
+            if (oit->find('.') != std::string::npos) continue;
+            if (LamPtr v = submodule_value(*oit + "." + pl->name, d->name)) return v;
           }
           // A local alias to a top-level stdlib module (`module B = Bytes`):
           // resolve B.x as Bytes.x.  (Dotted submodule aliases go through the
