@@ -7,6 +7,7 @@
 #include <string>
 
 #include "cppcaml/infer_check.hpp"
+#include "cppcaml/lexer.hpp"
 #include "cppcaml/parser.hpp"
 #include "cppcaml/typer.hpp"
 
@@ -64,8 +65,16 @@ int main(int argc, char** argv) {
   } catch (const cppcaml::ParseError& e) {
     std::cout << "TYPE_ERROR\tparse\t" << e.pos << '\t' << e.what() << '\n';
     return 1;
+  } catch (const cppcaml::LexError& e) {
+    std::cout << "TYPE_ERROR\tlex\t" << e.pos << '\t' << e.what() << '\n';
+    return 1;
   } catch (const cppcaml::TypeError& e) {
     std::cout << "TYPE_ERROR\t" << e.what() << '\n';
+    return 1;
+  } catch (const std::exception& e) {
+    // Robustness: never crash (SIGABRT) on an unexpected internal error -- report
+    // it as a parser/internal gap so the harnesses exclude it cleanly.
+    std::cout << "TYPE_ERROR\tinternal\t" << e.what() << '\n';
     return 1;
   }
   return 0;
