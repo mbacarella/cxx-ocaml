@@ -289,10 +289,16 @@ struct Tstr_recmodule {  // module rec A = .. and B = ..
   std::vector<std::pair<Ident, ModuleExprBox>> bindings;
 };
 // --- classes (Tstr_class) ---
+struct ClassExpr;
 struct Tcf_val { std::string name; bool mutable_; bool override_; ExprBox expr; };
 struct Tcf_method { std::string name; bool private_; bool override_; ExprBox expr; };
+struct Tcf_inherit {  // inherit [!] ce [as super]
+  bool override_;
+  Box<ClassExpr> ce;
+  std::optional<std::string> super;
+};
 struct ClassField {
-  std::variant<Tcf_val, Tcf_method> desc;
+  std::variant<Tcf_val, Tcf_method, Tcf_inherit> desc;
   Location loc;
 };
 struct ClassStructure {
@@ -300,14 +306,15 @@ struct ClassStructure {
   std::vector<ClassField> fields;
 };
 struct Tcl_structure { ClassStructure cs; };
-struct ClassExpr;
 struct Tcl_fun {  // class c <pat> = ..  (a class parameter)
   ArgLabel label;
   PatBox pat;
   Box<ClassExpr> body;
 };
+struct Tcl_ident { Path path; std::vector<CoreTypeBox> args; };  // a class path (e.g. inherit b)
+struct Tcl_constraint { Box<ClassExpr> ce; };  // None-constraint: prints nothing, just recurses
 struct ClassExpr {
-  std::variant<Tcl_structure, Tcl_fun> desc;
+  std::variant<Tcl_structure, Tcl_fun, Tcl_ident, Tcl_constraint> desc;
   Location loc;
 };
 struct ClassDeclaration {

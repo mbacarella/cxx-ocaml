@@ -276,6 +276,19 @@ struct Typer {
   // a method body that is one of these (and not shadowed by a local) is an
   // instance-variable reference (Texp_instvar), not an ordinary identifier.
   std::unordered_map<std::string, tt::Ident> instvars_;
+  std::unordered_map<std::string, tt::Ident> class_scope_;  // class names -> Ident
+  tt::Path resolve_class(const Longident& lid) {
+    if (auto* l = std::get_if<Lident>(&lid.v)) {
+      auto it = class_scope_.find(l->name);
+      if (it != class_scope_.end()) {
+        tt::Path p;
+        p.v = tt::Pident{it->second};
+        return p;
+      }
+      throw TypeError("Unbound class " + l->name);
+    }
+    throw TypeError("qualified class path");
+  }
   bool is_local(const std::string& name) {
     for (auto it = scopes.rbegin(); it != scopes.rend(); ++it)
       if (it->count(name)) return true;
@@ -1121,6 +1134,17 @@ struct Typer {
         tv.override_ = cc->ovr == OverrideFlag::Override;
         tv.expr = std::make_unique<tt::Expression>(expr(*cc->e));
         cf.desc = std::move(tv);
+      } else if (auto* in = std::get_if<Pcf_inherit>(&f.desc)) {
+        tt::Tcf_inherit ti;
+        ti.override_ = in->ovr == OverrideFlag::Override;
+        if (in->as_) ti.super = in->as_->txt;
+        // the typer coerces the parent class: Tcl_constraint(parent, None)
+        tt::ClassExpr wrap;
+        wrap.loc = in->ce->loc;
+        wrap.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(class_expr_t(*in->ce))};
+        ti.ce = std::make_unique<tt::ClassExpr>(std::move(wrap));
+        cf.desc = std::move(ti);
+        ++method_no;  // an inherit consumes a self-N binding (hidden)
       } else {
         throw TypeError("class_field#" + std::to_string(f.desc.index()));
       }
@@ -1158,6 +1182,15 @@ struct Typer {
     }
     if (auto* ps = std::get_if<Pcl_structure>(&ce.desc))
       return class_structure_expr(ps->cs, ce.loc);
+    if (auto* cc = std::get_if<Pcl_constr>(&ce.desc)) {  // a class path, e.g. `inherit b`
+      tt::ClassExpr out;
+      out.loc = ce.loc;
+      tt::Tcl_ident ti;
+      ti.path = resolve_class(cc->id.txt);
+      for (auto& a : cc->args) ti.args.push_back(std::make_unique<tt::CoreType>(core_type(*a)));
+      out.desc = std::move(ti);
+      return out;
+    }
     throw TypeError("class_expr#" + std::to_string(ce.desc.index()));
   }
   tt::ClassDeclaration class_declaration(const ast::ClassDeclaration& d) {
@@ -1247,6 +1280,8 @@ struct Typer {
       si.desc = tt::Tstr_include{std::make_unique<tt::ModuleExpr>(module_expr(in->expr))};
     } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
       tt::Tstr_class tc;
+      for (auto& d : cl->decls)  // pre-register names (stamp first, mutual refs)
+        class_scope_[d.name.txt] = fresh_anon(d.name.txt);
       for (auto& d : cl->decls) tc.decls.push_back(class_declaration(d));
       si.desc = std::move(tc);
     } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {

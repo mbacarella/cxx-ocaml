@@ -600,6 +600,13 @@ struct Printer {
 
   void class_field(int i, const ClassField& f) {
     line(i, "class_field " + loc(f.loc));
+    if (auto* in = std::get_if<Tcf_inherit>(&f.desc)) {
+      line(i + 1, std::string("Tcf_inherit ") + (in->override_ ? "Override" : "Fresh"));
+      class_expr(i + 2, *in->ce);
+      if (in->super) line(i + 2, "Some \"" + *in->super + "\"");
+      else line(i + 2, "None");
+      return;
+    }
     if (auto* m = std::get_if<Tcf_method>(&f.desc)) {
       line(i + 1, "Tcf_method \"" + m->name + "\" " + (m->private_ ? "Private" : "Public"));
       line(i + 2, std::string("Concrete ") + (m->override_ ? "Override" : "Fresh"));
@@ -618,6 +625,15 @@ struct Printer {
       arg_label(i + 1, fn->label);
       pattern(i + 1, *fn->pat);
       class_expr(i + 1, *fn->body);
+      return;
+    }
+    if (auto* id = std::get_if<Tcl_ident>(&ce.desc)) {
+      line(i + 1, "Tcl_ident \"" + path_aux(id->path) + "\"");
+      list_core_types(i + 1, id->args);
+      return;
+    }
+    if (auto* cn = std::get_if<Tcl_constraint>(&ce.desc)) {
+      class_expr(i + 1, *cn->ce);  // None constraint: nothing for itself, just recurse
       return;
     }
     auto& st = std::get<Tcl_structure>(ce.desc);
