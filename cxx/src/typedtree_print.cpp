@@ -500,6 +500,13 @@ struct Printer {
       else line(j, "None");
     } else if (auto* iv = std::get_if<Texp_instvar>(&e.desc)) {
       line(j, "Texp_instvar \"" + ident(iv->id) + "\"");
+    } else if (auto* sd = std::get_if<Texp_send>(&e.desc)) {
+      line(j, "Texp_send \"" + sd->meth + "\"");
+      expression(j, *sd->obj);
+    } else if (auto* ob = std::get_if<Texp_object>(&e.desc)) {
+      os << std::string(2 * j, ' ') << "Texp_object";  // run-on: class_structure same line
+      line(j, "class_structure");
+      class_structure_p(j, *ob->cs);
     } else {
       auto& si = std::get<Texp_struct_item>(e.desc);
       line(j, "Texp_struct_item");
@@ -639,10 +646,13 @@ struct Printer {
     auto& st = std::get<Tcl_structure>(ce.desc);
     line(i + 1, "Tcl_structure");
     line(i + 1, "class_structure");
-    pattern(i + 2, *st.cs.self);
-    line(i + 2, "[");
-    for (auto& f : st.cs.fields) class_field(i + 3, f);
-    line(i + 2, "]");
+    class_structure_p(i + 1, st.cs);
+  }
+  void class_structure_p(int i, const ClassStructure& cs) {
+    pattern(i + 1, *cs.self);
+    line(i + 1, "[");
+    for (auto& f : cs.fields) class_field(i + 2, f);
+    line(i + 1, "]");
   }
   void class_declaration(int i, const ClassDeclaration& d) {
     line(i, "class_declaration " + loc(d.loc));

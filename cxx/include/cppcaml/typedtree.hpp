@@ -160,6 +160,9 @@ struct Texp_field { ExprBox record; std::string name; };
 struct Texp_setfield { ExprBox record; std::string name; ExprBox value; };  // r.l <- v
 struct Texp_variant { std::string label; std::optional<ExprBox> arg; };  // `A [e]
 struct Texp_instvar { Ident id; };  // an instance-variable reference inside a method
+struct Texp_send { ExprBox obj; std::string meth; };  // e # m
+struct ClassStructure;
+struct Texp_object { Box<ClassStructure> cs; };  // object … end (an expression)
 // `let module/open/exception … in e` (fork): an embedded structure item + body.
 struct Texp_struct_item { Box<StructureItem> item; ExprBox body; };
 struct ExprExtra {  // Texp_constraint / Texp_coerce / Texp_poly (method bodies)
@@ -174,7 +177,7 @@ struct Expression {
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
                Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
                Texp_while, Texp_record, Texp_field, Texp_setfield, Texp_variant,
-               Texp_instvar, Texp_struct_item>
+               Texp_instvar, Texp_send, Texp_object, Texp_struct_item>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;

@@ -829,6 +829,10 @@ struct Typer {
       tv.label = vr->label;
       if (vr->arg) tv.arg = std::make_unique<tt::Expression>(expr(**vr->arg));
       out.desc = std::move(tv);
+    } else if (auto* sd = std::get_if<Pexp_send>(&e.desc)) {
+      out.desc = tt::Texp_send{std::make_unique<tt::Expression>(expr(*sd->obj)), sd->meth.txt};
+    } else if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
+      out.desc = tt::Texp_object{std::make_unique<tt::ClassStructure>(build_class_structure(*ob->cs))};
     } else if (auto* rec = std::get_if<Pexp_record>(&e.desc)) {
       tt::Texp_record tr;
       if (rec->base)
@@ -1094,7 +1098,12 @@ struct Typer {
   tt::ClassExpr class_structure_expr(const ast::ClassStructure& cs, Location celoc) {
     tt::ClassExpr out;
     out.loc = celoc;
-    tt::Tcl_structure ts;
+    out.desc = tt::Tcl_structure{build_class_structure(cs)};
+    return out;
+  }
+  // Build a class_structure (shared by classes and inline `object .. end`).
+  tt::ClassStructure build_class_structure(const ast::ClassStructure& cs) {
+    tt::ClassStructure ts;
     // self pattern: Tpat_alias "selfpat-*" (Tpat_any).  The inner sits on the
     // self location (a zero-width point), the alias on the _none_ location.
     Location selfloc = cs.self.loc;
@@ -1106,7 +1115,7 @@ struct Typer {
     selfp.loc = none_loc();
     selfp.desc = tt::Tpat_alias{fresh_anon("selfpat-*"),
                                 std::make_unique<tt::Pattern>(std::move(inner))};
-    ts.cs.self = std::make_unique<tt::Pattern>(std::move(selfp));
+    ts.self = std::make_unique<tt::Pattern>(std::move(selfp));
     // Pre-register all instance variables (in scope in every method, any order).
     auto saved_iv = instvars_;
     for (auto& f : cs.fields)
@@ -1148,11 +1157,10 @@ struct Typer {
       } else {
         throw TypeError("class_field#" + std::to_string(f.desc.index()));
       }
-      ts.cs.fields.push_back(std::move(cf));
+      ts.fields.push_back(std::move(cf));
     }
     instvars_ = std::move(saved_iv);
-    out.desc = std::move(ts);
-    return out;
+    return ts;
   }
   void collect_pat_vars(const Pattern& p, std::vector<std::string>& out) {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) out.push_back(v->name.txt);
