@@ -385,7 +385,7 @@ struct Printer {
       for (auto& [label, ex] : a->args) {
         line(j + 1, "<arg>");
         arg_label(j + 2, label);
-        expression(j + 2, *ex);
+        if (ex) expression(j + 2, *ex);  // an Omitted (eta) arg is the label alone
       }
       line(j, "]");
     } else if (auto* fn = std::get_if<Texp_function>(&e.desc)) {

@@ -751,10 +751,13 @@ struct Typer {
           if (s.param_label == 1) label = Labelled{s.param_name};
           else if (s.param_label == 2) label = Optional{s.param_name};
           tt::ExprBox av;
-          if (s.omitted) {  // omitted optional -> ghost None
-            av = std::make_unique<tt::Expression>();
-            av->loc = none_loc();
-            av->desc = tt::Texp_construct{"None", {}};
+          if (s.omitted) {
+            if (s.none_fill) {  // omitted optional defaulted -> ghost None
+              av = std::make_unique<tt::Expression>();
+              av->loc = none_loc();
+              av->desc = tt::Texp_construct{"None", {}};
+            }
+            // else an eta/Omitted argument: the label with no expression (av null)
           } else {
             av = written_arg(s.arg_index);
             used[s.arg_index] = true;
