@@ -1065,6 +1065,8 @@ struct Typer {
       tm.present = !std::holds_alternative<Pmod_ident>(b.expr.desc);  // alias=Absent
       tm.expr = std::make_unique<tt::ModuleExpr>(module_expr(b.expr));
       si.desc = std::move(tm);
+    } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
+      si.desc = tt::Tstr_include{std::make_unique<tt::ModuleExpr>(module_expr(in->expr))};
     } else {
       throw TypeError("stritem#" + std::to_string(it.desc.index()));
     }

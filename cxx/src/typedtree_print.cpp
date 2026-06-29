@@ -617,6 +617,9 @@ struct Printer {
     } else if (auto* mt = std::get_if<Tstr_modtype>(&it.desc)) {
       line(j, "Tstr_modtype \"" + ident(mt->id) + "\"");
       if (mt->type) module_type(j + 1, *mt->type);
+    } else if (auto* inc = std::get_if<Tstr_include>(&it.desc)) {
+      os << std::string(2 * j, ' ') << "Tstr_include";  // run-on: module_expr on the same line
+      module_expr(j, *inc->expr);
     } else if (auto* tx = std::get_if<Tstr_typext>(&it.desc)) {
       line(j, "Tstr_typext");
       line(j, "type_extension");
