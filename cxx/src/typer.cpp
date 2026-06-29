@@ -586,6 +586,12 @@ struct Typer {
     } else if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
       out = pattern(*ct->p);  // become inner pattern; record constraint as extra
       out.extras.push_back(tt::PatExtra{core_type(*ct->t), p.loc});
+    } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      tt::Tpat_record tr;  // only the written fields, in order (label = last comp)
+      for (auto& [lid, sub] : r->fields)
+        tr.fields.emplace_back(lid_last(lid.txt),
+                               std::make_unique<tt::Pattern>(pattern(*sub)));
+      out.desc = std::move(tr);
     } else {
       throw TypeError("pat#" + std::to_string(p.desc.index()));
     }

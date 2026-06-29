@@ -285,6 +285,14 @@ struct Printer {
     } else if (auto* al = std::get_if<Tpat_alias>(&p.desc)) {
       line(j, "Tpat_alias \"" + ident(al->id) + "\"");
       pattern(j, *al->inner);
+    } else if (auto* rc = std::get_if<Tpat_record>(&p.desc)) {
+      line(j, "Tpat_record");
+      line(j, "[");
+      for (auto& [label, sub] : rc->fields) {
+        line(j + 1, "\"" + label + "\"");
+        pattern(j + 2, *sub);
+      }
+      line(j, "]");
     } else {
       auto& tu = std::get<Tpat_tuple>(p.desc);
       line(j, "Tpat_tuple");
