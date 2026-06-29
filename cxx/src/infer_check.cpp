@@ -3376,6 +3376,27 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       if (!mb->binding.name.txt) continue;  // `module _ = ...`
       if (auto* ms = std::get_if<Pmod_structure>(&mb->binding.expr.desc))
         out.push_back(cmi::cmiw::sig_module(*mb->binding.name.txt, infer_signature(ms->items)));
+    } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
+      // `include M` / `include (struct .. end)`: build_module FLATTENS the
+      // included module's members into THIS module's record (each takes its own
+      // field), so the inferred .cmi must list them too -- otherwise every field
+      // after the include sits one slot too low and a cross-module read lands on
+      // the wrong field (ocamlbuild's Log: `module Debug = ..; include Debug`).
+      const ast::Structure* inc = nullptr;
+      if (auto* ms = std::get_if<Pmod_structure>(&in->expr.desc))
+        inc = &ms->items;                              // include (struct .. end)
+      else if (auto* mi = std::get_if<Pmod_ident>(&in->expr.desc)) {
+        std::string nm = lid_last(mi->id.txt);         // include LocalModule
+        for (auto& it2 : s)
+          if (auto* mb2 = std::get_if<Pstr_module>(&it2.desc))
+            if (mb2->binding.name.txt && *mb2->binding.name.txt == nm) {
+              if (auto* ms2 = std::get_if<Pmod_structure>(&mb2->binding.expr.desc))
+                inc = &ms2->items;
+              break;
+            }
+      }
+      if (inc)
+        for (auto& si : infer_signature(*inc)) out.push_back(si);
     }
   }
   // Canonical shadowing dedup: a name bound twice at top level (e.g. ocamllex's
