@@ -721,15 +721,55 @@ struct Typer {
       int fmtidx = -1;
       if (auto* fid = std::get_if<Pexp_ident>(&a->fn->desc))
         fmtidx = format_arg_index(fid->id.txt);
-      for (size_t k = 0; k < a->args.size(); ++k) {
-        auto& [label, arg] = a->args[k];
-        tt::ExprBox av;
+      auto written_arg = [&](size_t k) -> tt::ExprBox {  // the k-th source arg
+        auto& arg = a->args[k].second;
         if (static_cast<int>(k) == fmtidx)
           if (auto* cst = std::get_if<Pexp_constant>(&arg->desc))
             if (auto* ps = std::get_if<ast::Pconst_string>(&cst->c.desc))
-              av = fmtlib::make(ps->s, arg->loc);
-        if (!av) av = std::make_unique<tt::Expression>(expr(*arg));
-        ap.args.emplace_back(label, std::move(av));
+              if (tt::ExprBox fmt = fmtlib::make(ps->s, arg->loc))  // null if unparseable
+                return fmt;
+        return std::make_unique<tt::Expression>(expr(*arg));
+      };
+      // Slice 3: when inference reconstructed the call's arguments (omitted
+      // optionals filled with None, labelled args reordered to parameter order,
+      // `~l:e` on an optional Some-wrapped), emit that; else source order.
+      const std::vector<applymatch::Slot>* plan = nullptr;
+      if (apply_plans) { auto it = apply_plans->find(&e); if (it != apply_plans->end()) plan = &it->second; }
+      if (plan) {
+        std::vector<bool> used(a->args.size(), false);
+        for (auto& s : *plan) {
+          ArgLabel label = Nolabel{};
+          if (s.param_label == 1) label = Labelled{s.param_name};
+          else if (s.param_label == 2) label = Optional{s.param_name};
+          tt::ExprBox av;
+          if (s.omitted) {  // omitted optional -> ghost None
+            av = std::make_unique<tt::Expression>();
+            av->loc = none_loc();
+            av->desc = tt::Texp_construct{"None", {}};
+          } else {
+            av = written_arg(s.arg_index);
+            used[s.arg_index] = true;
+            if (s.some_wrap) {  // ~l:e on an optional param -> Some e
+              auto some = std::make_unique<tt::Expression>();
+              some->loc = av->loc;
+              std::vector<tt::ExprBox> sa;
+              sa.push_back(std::move(av));
+              some->desc = tt::Texp_construct{"Some", std::move(sa)};
+              av = std::move(some);
+            }
+          }
+          ap.args.emplace_back(std::move(label), std::move(av));
+        }
+        for (size_t k = 0; k < a->args.size(); ++k)  // over-application leftover
+          if (!used[k]) {
+            tt::ExprBox av = written_arg(k);
+            ap.args.emplace_back(a->args[k].first, std::move(av));
+          }
+      } else {
+        for (size_t k = 0; k < a->args.size(); ++k) {
+          tt::ExprBox av = written_arg(k);  // evaluate the arg before emplace_back
+          ap.args.emplace_back(a->args[k].first, std::move(av));
+        }
       }
       out.desc = std::move(ap);
     } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
