@@ -355,6 +355,10 @@ struct Printer {
         if (ex.from) { line(j + 1, "Some"); core_type(j + 2, *ex.from); }
         else line(j + 1, "None");
         core_type(j + 1, ex.ctype);
+      } else if (ex.kind == ExprExtra::Kind::Poly) {
+        line(j + 1, "Texp_poly");
+        if (ex.poly_has_type) { line(j + 1, "Some"); core_type(j + 2, ex.ctype); }
+        else line(j + 1, "None");
       } else {
         line(j + 1, "Texp_constraint");
         core_type(j + 1, ex.ctype);
@@ -494,6 +498,8 @@ struct Printer {
       line(j, "Texp_variant \"" + vr->label + "\"");
       if (vr->arg) { line(j, "Some"); expression(j + 1, **vr->arg); }
       else line(j, "None");
+    } else if (auto* iv = std::get_if<Texp_instvar>(&e.desc)) {
+      line(j, "Texp_instvar \"" + ident(iv->id) + "\"");
     } else {
       auto& si = std::get<Texp_struct_item>(e.desc);
       line(j, "Texp_struct_item");
@@ -592,6 +598,39 @@ struct Printer {
     }
   }
 
+  void class_field(int i, const ClassField& f) {
+    line(i, "class_field " + loc(f.loc));
+    if (auto* m = std::get_if<Tcf_method>(&f.desc)) {
+      line(i + 1, "Tcf_method \"" + m->name + "\" " + (m->private_ ? "Private" : "Public"));
+      line(i + 2, std::string("Concrete ") + (m->override_ ? "Override" : "Fresh"));
+      expression(i + 2, *m->expr);
+    } else {
+      auto& v = std::get<Tcf_val>(f.desc);
+      line(i + 1, "Tcf_val \"" + v.name + "\" " + (v.mutable_ ? "Mutable" : "Immutable"));
+      line(i + 2, std::string("Concrete ") + (v.override_ ? "Override" : "Fresh"));
+      expression(i + 2, *v.expr);
+    }
+  }
+  void class_expr(int i, const ClassExpr& ce) {
+    line(i, "class_expr " + loc(ce.loc));
+    auto& st = std::get<Tcl_structure>(ce.desc);
+    line(i + 1, "Tcl_structure");
+    line(i + 1, "class_structure");
+    pattern(i + 2, *st.cs.self);
+    line(i + 2, "[");
+    for (auto& f : st.cs.fields) class_field(i + 3, f);
+    line(i + 2, "]");
+  }
+  void class_declaration(int i, const ClassDeclaration& d) {
+    line(i, "class_declaration " + loc(d.loc));
+    line(i + 1, std::string("pci_virt = ") + (d.virt ? "Virtual" : "Concrete"));
+    line(i + 1, "pci_params =");
+    line(i + 2, "[]");
+    line(i + 1, "pci_name = \"" + d.name + "\"");
+    line(i + 1, "pci_expr =");
+    class_expr(i + 2, d.expr);
+  }
+
   void structure_item(int i, const StructureItem& it) {
     line(i, "structure_item " + loc(it.loc));
     int j = i + 1;
@@ -643,6 +682,11 @@ struct Printer {
         line(j + 1, ident(id));
         module_expr(j + 2, *me);
       }
+      line(j, "]");
+    } else if (auto* cl = std::get_if<Tstr_class>(&it.desc)) {
+      line(j, "Tstr_class");
+      line(j, "[");
+      for (auto& d : cl->decls) class_declaration(j + 1, d);
       line(j, "]");
     } else if (auto* tx = std::get_if<Tstr_typext>(&it.desc)) {
       line(j, "Tstr_typext");

@@ -159,12 +159,14 @@ struct Texp_record {
 struct Texp_field { ExprBox record; std::string name; };
 struct Texp_setfield { ExprBox record; std::string name; ExprBox value; };  // r.l <- v
 struct Texp_variant { std::string label; std::optional<ExprBox> arg; };  // `A [e]
+struct Texp_instvar { Ident id; };  // an instance-variable reference inside a method
 // `let module/open/exception … in e` (fork): an embedded structure item + body.
 struct Texp_struct_item { Box<StructureItem> item; ExprBox body; };
-struct ExprExtra {  // Texp_constraint `(e : t)` or Texp_coerce `(e [: t1] :> t2)`
-  enum class Kind { Constraint, Coerce } kind = Kind::Constraint;
+struct ExprExtra {  // Texp_constraint / Texp_coerce / Texp_poly (method bodies)
+  enum class Kind { Constraint, Coerce, Poly } kind = Kind::Constraint;
   CoreType ctype;                 // constraint type, or coerce TARGET type
   std::optional<CoreType> from;   // coerce SOURCE type (`(e : t1 :> t2)`), else none
+  bool poly_has_type = false;     // Poly: whether a method type annotation is present
   Location loc;
 };
 struct Expression {
@@ -172,7 +174,7 @@ struct Expression {
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
                Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
                Texp_while, Texp_record, Texp_field, Texp_setfield, Texp_variant,
-               Texp_struct_item>
+               Texp_instvar, Texp_struct_item>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
@@ -286,10 +288,33 @@ struct Tstr_include { ModuleExprBox expr; };  // include M
 struct Tstr_recmodule {  // module rec A = .. and B = ..
   std::vector<std::pair<Ident, ModuleExprBox>> bindings;
 };
+// --- classes (Tstr_class) ---
+struct Tcf_val { std::string name; bool mutable_; bool override_; ExprBox expr; };
+struct Tcf_method { std::string name; bool private_; bool override_; ExprBox expr; };
+struct ClassField {
+  std::variant<Tcf_val, Tcf_method> desc;
+  Location loc;
+};
+struct ClassStructure {
+  Box<Pattern> self;                 // synthesized self (Tpat_alias selfpat-* / Tpat_any)
+  std::vector<ClassField> fields;
+};
+struct Tcl_structure { ClassStructure cs; };
+struct ClassExpr {
+  std::variant<Tcl_structure> desc;
+  Location loc;
+};
+struct ClassDeclaration {
+  bool virt = false;
+  std::string name;
+  ClassExpr expr;
+  Location loc;
+};
+struct Tstr_class { std::vector<ClassDeclaration> decls; };
 struct StructureItem {
   std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception,
                Tstr_open, Tstr_module, Tstr_attribute, Tstr_typext, Tstr_modtype,
-               Tstr_include, Tstr_recmodule>
+               Tstr_include, Tstr_recmodule, Tstr_class>
       desc;
   Location loc;
 };

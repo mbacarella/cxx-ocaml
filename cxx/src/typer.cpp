@@ -272,6 +272,15 @@ struct Typer {
   tt::Ident fresh_anon(const std::string& name) {  // stamped, not scoped
     return tt::Ident{name, next_stamp++, tt::Ident::Local};
   }
+  // Instance variables of the class currently being transcribed: a bare name in
+  // a method body that is one of these (and not shadowed by a local) is an
+  // instance-variable reference (Texp_instvar), not an ordinary identifier.
+  std::unordered_map<std::string, tt::Ident> instvars_;
+  bool is_local(const std::string& name) {
+    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it)
+      if (it->count(name)) return true;
+    return false;
+  }
   tt::Ident fresh_type(const std::string& name) {
     tt::Ident id{name, next_stamp++, tt::Ident::Local};
     type_scope[name] = id;
@@ -673,7 +682,11 @@ struct Typer {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) {
       out.desc = tt::Texp_constant{c->c};
     } else if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
-      out.desc = tt::Texp_ident{resolve_value(id->id.txt, e.loc.start.cnum)};
+      const std::string* ivn = nullptr;
+      if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+        if (instvars_.count(l->name) && !is_local(l->name)) ivn = &l->name;
+      if (ivn) out.desc = tt::Texp_instvar{instvars_.at(*ivn)};
+      else out.desc = tt::Texp_ident{resolve_value(id->id.txt, e.loc.start.cnum)};
     } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
       tt::Texp_tuple tup;
       for (size_t k = 0; k < t->elems.size(); ++k) {
@@ -1018,6 +1031,114 @@ struct Typer {
     return out;
   }
 
+  // --- classes -------------------------------------------------------------
+  Location none_loc() {
+    Location l;
+    l.start.cnum = -1;
+    l.end.cnum = -1;
+    l.ghost = true;
+    return l;
+  }
+  // Elaborate a method body the way the typer does: `fun self-N -> body`, with a
+  // Texp_poly extra on the body.  (Instance-variable references in the body would
+  // become Texp_instvar -- handled once vals are tracked.)
+  tt::Expression elaborate_method(const Expression& body0, int method_no, Location selfloc) {
+    const Expression* body = &body0;
+    const CoreType* mty = nullptr;  // (method m : T = e): keep the type for the extra
+    if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) {
+      if (poly->t) mty = poly->t->get();
+      body = poly->e.get();
+    }
+    Location floc = body0.loc;  // the synthetic function & its poly extra sit on the body
+    floc.ghost = true;
+    selfloc.ghost = true;       // the self parameter sits on the self location
+    tt::Expression be = expr(*body);
+    tt::ExprExtra ex;
+    ex.kind = tt::ExprExtra::Kind::Poly;
+    ex.poly_has_type = mty != nullptr;
+    if (mty) ex.ctype = core_type(*mty);
+    ex.loc = floc;
+    be.extras.insert(be.extras.begin(), std::move(ex));  // Texp_poly first
+    // synthetic self parameter: Tpat_alias self-N (Tpat_var self-*), at the self loc
+    tt::Pattern selfvar;
+    selfvar.loc = selfloc;
+    selfvar.desc = tt::Tpat_var{fresh_anon("self-*")};
+    tt::Pattern selfpat;
+    selfpat.loc = selfloc;
+    selfpat.desc = tt::Tpat_alias{fresh_anon("self-" + std::to_string(method_no)),
+                                  std::make_unique<tt::Pattern>(std::move(selfvar))};
+    tt::FunctionParam fp;
+    fp.label = ArgLabel{};
+    fp.pat = std::make_unique<tt::Pattern>(std::move(selfpat));
+    tt::Texp_function fn;
+    fn.params.push_back(std::move(fp));
+    fn.body = std::make_unique<tt::Expression>(std::move(be));
+    tt::Expression out;
+    out.loc = floc;
+    out.desc = std::move(fn);
+    return out;
+  }
+  tt::ClassDeclaration class_declaration(const ast::ClassDeclaration& d) {
+    tt::ClassDeclaration out;
+    out.loc = d.loc;
+    out.virt = d.virt == VirtualFlag::Virtual;
+    out.name = d.name.txt;
+    auto* ps = std::get_if<Pcl_structure>(&d.expr.desc);  // `object .. end` only for now
+    if (!ps) throw TypeError("class_expr#" + std::to_string(d.expr.desc.index()));
+    tt::ClassExpr tce;
+    tce.loc = d.expr.loc;
+    tt::Tcl_structure ts;
+    // self pattern: Tpat_alias "selfpat-*" (Tpat_any).  The inner sits on the
+    // self location (a zero-width point), the alias on the _none_ location.
+    Location selfloc = ps->cs.self.loc;
+    selfloc.ghost = true;
+    tt::Pattern inner;
+    inner.loc = selfloc;
+    inner.desc = tt::Tpat_any{};
+    tt::Pattern selfp;
+    selfp.loc = none_loc();
+    selfp.desc = tt::Tpat_alias{fresh_anon("selfpat-*"),
+                                std::make_unique<tt::Pattern>(std::move(inner))};
+    ts.cs.self = std::make_unique<tt::Pattern>(std::move(selfp));
+    // Pre-register all instance variables (in scope in every method, any order),
+    // then transcribe fields.  Save/restore for nesting.
+    auto saved_iv = instvars_;
+    for (auto& f : ps->cs.fields)
+      if (auto* v = std::get_if<Pcf_val>(&f.desc))
+        instvars_[v->name.txt] = fresh_anon(v->name.txt);
+    int method_no = 0;
+    for (auto& f : ps->cs.fields) {
+      tt::ClassField cf;
+      cf.loc = f.loc;
+      if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+        auto* cc = std::get_if<Cfk_concrete>(&m->kind);
+        if (!cc) throw TypeError("virtual method");
+        tt::Tcf_method tm;
+        tm.name = m->name.txt;
+        tm.private_ = m->priv == PrivateFlag::Private;
+        tm.override_ = cc->ovr == OverrideFlag::Override;
+        tm.expr = std::make_unique<tt::Expression>(elaborate_method(*cc->e, ++method_no, ps->cs.self.loc));
+        cf.desc = std::move(tm);
+      } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
+        auto* cc = std::get_if<Cfk_concrete>(&v->kind);
+        if (!cc) throw TypeError("virtual val");
+        tt::Tcf_val tv;
+        tv.name = v->name.txt;
+        tv.mutable_ = v->mut == MutableFlag::Mutable;
+        tv.override_ = cc->ovr == OverrideFlag::Override;
+        tv.expr = std::make_unique<tt::Expression>(expr(*cc->e));
+        cf.desc = std::move(tv);
+      } else {
+        throw TypeError("class_field#" + std::to_string(f.desc.index()));
+      }
+      ts.cs.fields.push_back(std::move(cf));
+    }
+    instvars_ = std::move(saved_iv);
+    tce.desc = std::move(ts);
+    out.expr = std::move(tce);
+    return out;
+  }
+
   tt::StructureItem structure_item(const StructureItem& it) {
     tt::StructureItem si;
     si.loc = it.loc;
@@ -1090,6 +1211,10 @@ struct Typer {
       si.desc = std::move(tm);
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
       si.desc = tt::Tstr_include{std::make_unique<tt::ModuleExpr>(module_expr(in->expr))};
+    } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
+      tt::Tstr_class tc;
+      for (auto& d : cl->decls) tc.decls.push_back(class_declaration(d));
+      si.desc = std::move(tc);
     } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
       tt::Tstr_recmodule tr;
       std::vector<tt::Ident> ids;  // pre-bind all names (stamp order + mutual refs)
