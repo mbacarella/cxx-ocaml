@@ -2931,7 +2931,15 @@ static std::string bare_cmi_path(const cmi::Path& p) {
 static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
     std::unordered_map<const cmi::TypeExpr*, int>& vars, int& nextvar) {
   cmi::TypePtr t = t0;
-  while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst))
+  // Unwrap Tlink/Tsubst indirections AND Tpoly: a module type's polymorphic
+  // value (`val eprintf : ('a,..) format -> 'a` in Signatures.LOG) reaches us as
+  // Tpoly(body,[vars]) with the real type in `link`.  Without unwrapping it,
+  // conv_cmi_ty hit the default branch and degraded the whole type (incl. the
+  // `format6` constructor) to a fresh var -- so a spliced `include Sig` dropped
+  // the format type, and `Log.eprintf "%s"` was typed as a plain string, passing
+  // a raw string where a format value was needed -> the format reader segfaulted.
+  while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst ||
+               t->kind == cmi::TypeExpr::Tpoly))
     t = t->link;
   if (!t) return cmi::cmiw::ty_var(nextvar++);
   switch (t->kind) {
