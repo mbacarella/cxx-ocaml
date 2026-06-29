@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <variant>
 
+#include "cppcaml/apply_match.hpp"
 #include "cppcaml/cmi.hpp"
 #include "cppcaml/infer_check.hpp"
 
@@ -3494,66 +3495,36 @@ struct Translator {
   // on a shape we can't place safely (caller then applies the args verbatim).
   LamPtr apply_labeled(const Expression* fnexpr, const FnSig& params, const Pexp_apply& ap) {
     const auto& as = ap.args;
-    auto alabel = [&](size_t i, std::string& nm) -> int {
-      if (auto* lb = std::get_if<Labelled>(&as[i].first)) { nm = lb->name; return 1; }
-      if (auto* op = std::get_if<Optional>(&as[i].first)) { nm = op->name; return 2; }
-      return 0;
-    };
-    LamPtr fn = expr(*fnexpr);  // the function is translated before its arguments
-    std::vector<bool> used(as.size(), false);
-    std::vector<AppArg> list;
-    int last_arg = -1;
-    for (auto& [pk, pn] : params) {
-      int found = -1, fk = 0;
-      for (size_t i = 0; i < as.size(); ++i) {
-        if (used[i]) continue;
-        std::string nm; int k = alabel(i, nm);
-        if (pk == 0 && k == 0) { found = (int)i; break; }
-        if (pk == 1 && k == 1 && nm == pn) { found = (int)i; break; }
-        if (pk == 2 && (k == 1 || k == 2) && nm == pn) { found = (int)i; fk = k; break; }
-      }
-      if (found < 0) {
-        // An omitted optional is filled with None (0) ONLY when a later POSITIONAL
-        // (Nolabel) argument forces the default (`Hashtbl.create 51` defaults
-        // ?random because 51 is supplied past it).  When no un-used positional
-        // remains -- a PARTIAL application supplying only a LATER labelled arg
-        // (`add_value ?shape:None`, where ?check precedes ?shape) -- the earlier
-        // optional must stay a parameter of the result (eta), NOT be defaulted;
-        // ocamlc emits `fun check -> impl check None`, not `impl None None`.
-        // An omitted non-optional (a skipped label) is always an eta (Omitted) slot.
-        if (pk == 2) {
-          bool later_positional = false;
-          for (size_t i = 0; i < as.size(); ++i)
-            if (!used[i]) { std::string nm; if (alabel(i, nm) == 0) { later_positional = true; break; } }
-          if (later_positional) list.push_back({cint(0), false, true});  // -> None
-          else list.push_back({nullptr, true, true});                    // -> eta param
-        } else {
-          list.push_back({nullptr, true, false});
-        }
-        continue;
-      }
-      used[found] = true;
-      LamPtr v = expr(*as[found].second);
-      if (pk == 2 && fk == 1) {  // ~l:e on an optional param -> Some e
-        ValueKind vk = expr_kind(as[found].second.get());
-        v = block(0, {v});
-        if (v->k == Lam::K::Prim) v->blk_shape = {vk};  // a dynamic Some -> field shape
-      }
-      list.push_back({v, false, pk == 2});
-      last_arg = (int)list.size() - 1;
+    // Match the call against the callee's labels (pure; see apply_match.hpp).
+    std::vector<applymatch::Param> ps;
+    for (auto& [pk, pn] : params) ps.push_back({pk, pn});
+    std::vector<applymatch::Arg> args;
+    for (auto& a : as) {
+      if (auto* lb = std::get_if<Labelled>(&a.first)) args.push_back({1, lb->name});
+      else if (auto* op = std::get_if<Optional>(&a.first)) args.push_back({2, op->name});
+      else args.push_back({0, ""});
     }
-    if (last_arg < 0) return nullptr;  // nothing matched -> verbatim apply
-    list.resize(last_arg + 1);  // drop trailing Omitted (params beyond the call)
-    bool has_omitted = false;
-    for (auto& a : list) if (a.omitted) has_omitted = true;
-    std::vector<LamPtr> leftover;
-    for (size_t i = 0; i < as.size(); ++i)
-      if (!used[i]) {
-        std::string nm;
-        if (alabel(i, nm) != 0) return nullptr;  // a stray labelled over-app arg
-        leftover.push_back(expr(*as[i].second));
+    applymatch::Result m = applymatch::match(ps, args);
+    if (!m.ok) return nullptr;  // verbatim apply (nothing matched / over-app+gap / stray label)
+    LamPtr fn = expr(*fnexpr);  // the function is translated before its arguments
+    std::vector<AppArg> list;
+    for (auto& s : m.slots) {
+      if (!s.omitted) {  // a provided argument (evaluated in parameter order)
+        LamPtr v = expr(*as[s.arg_index].second);
+        if (s.some_wrap) {  // ~l:e on an optional param -> Some e
+          ValueKind vk = expr_kind(as[s.arg_index].second.get());
+          v = block(0, {v});
+          if (v->k == Lam::K::Prim) v->blk_shape = {vk};  // a dynamic Some -> field shape
+        }
+        list.push_back({v, false, s.optional});
+      } else if (s.none_fill) {
+        list.push_back({cint(0), false, true});  // omitted optional -> None
+      } else {
+        list.push_back({nullptr, true, s.optional});  // eta parameter of a partial application
       }
-    if (!leftover.empty() && has_omitted) return nullptr;  // over-app + gap: too complex
+    }
+    std::vector<LamPtr> leftover;
+    for (int i : m.leftover) leftover.push_back(expr(*as[i].second));
     LamPtr r = build_apply(fn, {}, list, 0);
     return lapply_(r, std::move(leftover));
   }
