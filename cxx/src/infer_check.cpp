@@ -1423,8 +1423,24 @@ struct Checker {
     }
     if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return infer_pat(*lz->p);
     if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
-      // Both branches bind the same variables; type them and unify.
-      TypePtr lt = infer_pat(*o->l), rt = infer_pat(*o->r);
+      // Both arms bind the same variables, and each shared variable must have
+      // a unifiable type across the two arms (typecore: or-pattern arms share
+      // their idents).  Unify the arm *types*, AND unify each same-named bound
+      // variable across the arms -- otherwise a clash like `(x,_) | (_,x)`
+      // matched at (int, string) goes undetected (left x : int, right x : string
+      // are never tied, so neither clashes with the scrutinee).
+      std::unordered_map<std::string, TypePtr> before = venv.back();
+      TypePtr lt = infer_pat(*o->l);
+      std::unordered_map<std::string, TypePtr> left;  // vars introduced by the left arm
+      for (auto& [k, v] : venv.back()) {
+        auto it = before.find(k);
+        if (it == before.end() || it->second != v) left[k] = v;
+      }
+      TypePtr rt = infer_pat(*o->r);
+      for (auto& [k, lv] : left) {
+        auto it = venv.back().find(k);  // the same name as rebound by the right arm
+        if (it != venv.back().end()) try_unify(lv, it->second);
+      }
       try_unify(lt, rt);
       return lt;
     }
@@ -2177,6 +2193,15 @@ struct Checker {
       for (size_t i = 0; i < bs.size(); ++i) {
         TypePtr te = infer_expr(*bs[i].expr);  // check body (best-effort)
         if (tv[i]) try_unify(tv[i], te);
+        // A plain declared type `let rec f : T = e` must not clash with the
+        // body (reliable check only; mirrors the non-recursive path below).
+        if (strict && bs[i].constraint_)
+          if (auto* pc = std::get_if<Pvc_constraint>(&*bs[i].constraint_))
+            if (pc->univars.empty()) {
+              std::unordered_map<std::string, TypePtr> vars;
+              if (expected_clash(te, from_coretype(*pc->typ, vars)))
+                note_error("type mismatch against declared type");
+            }
       }
       return;
     }
@@ -2381,6 +2406,18 @@ struct Checker {
   }
   static bool expected_clash(const TypePtr& a0, const TypePtr& b0) {
     TypePtr a = I::Engine::repr(a0), b = I::Engine::repr(b0);
+    // A nullary reliable builtin (int, string, ...) can never be a function or
+    // tuple, so a shape mismatch against one is a definite clash (`let f : int =
+    // fun x -> x`).  Restricted to reliable builtins so a user abbreviation that
+    // expands to an arrow/tuple (`type fn = int -> int`) is never mis-flagged.
+    auto rigid_base = [](const TypePtr& t) {
+      return t->kind == I::Type::Kind::Constr && reliable_builtin(t->path);
+    };
+    auto arrow_or_tuple = [](const TypePtr& t) {
+      return t->kind == I::Type::Kind::Arrow || t->kind == I::Type::Kind::Tuple;
+    };
+    if ((rigid_base(a) && arrow_or_tuple(b)) || (rigid_base(b) && arrow_or_tuple(a)))
+      return true;
     if (a->kind == I::Type::Kind::Constr && b->kind == I::Type::Kind::Constr) {
       if (a->stamp && b->stamp && a->stamp != b->stamp) return true;
       auto last = [](const std::string& p) {
