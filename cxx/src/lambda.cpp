@@ -495,12 +495,30 @@ struct Translator {
   // Path to a module's .cmi: the stdlib naming pattern under stdlib_dir, else (for
   // a separately-compiled local module like `A`) the first `<a>.cmi`/`A.cmi`
   // found in the -I search dirs.  Enables cross-module separate compilation.
+  // The path of a LOCAL top-level unit `<mod>` (`bool.cmi` on an -I dir, NOT the
+  // stdlib copy): such a unit shadows a same-named stdlib module (ocamlbuild's
+  // own `Bool` vs `Stdlib.Bool`), matching ocamlc's include-path-before-stdlib
+  // search.  Empty when no -I dir (other than stdlib) provides the unit.
+  std::string local_unit_cmi(const std::string& mod) const {
+    if (mod == "Stdlib" || mod.rfind("Camlinternal", 0) == 0) return "";
+    std::string low = (char)std::tolower((unsigned char)mod[0]) + mod.substr(1);
+    for (const std::string& d : module_dirs_) {
+      if (d == stdlib_dir) continue;
+      if (std::filesystem::exists(d + "/" + low + ".cmi")) return d + "/" + low + ".cmi";
+      if (std::filesystem::exists(d + "/" + mod + ".cmi")) return d + "/" + mod + ".cmi";
+    }
+    return "";
+  }
   std::string resolve_cmi(const std::string& mod) const {
     std::string sp;
     if (mod == "Stdlib") sp = stdlib_dir + "/stdlib.cmi";
     else if (mod.rfind("Camlinternal", 0) == 0)
       sp = stdlib_dir + "/" + (char)std::tolower((unsigned char)mod[0]) + mod.substr(1) + ".cmi";
-    else sp = stdlib_dir + "/stdlib__" + mod + ".cmi";
+    else {
+      // A local unit shadows the stdlib submodule: prefer it over stdlib__<mod>.
+      if (std::string lu = local_unit_cmi(mod); !lu.empty()) return lu;
+      sp = stdlib_dir + "/stdlib__" + mod + ".cmi";
+    }
     if (std::filesystem::exists(sp)) return sp;
     std::string low = (char)std::tolower((unsigned char)mod[0]) + mod.substr(1);
     for (const std::string& d : module_dirs_) {
@@ -2329,6 +2347,10 @@ struct Translator {
     // stdlib__<mod>.cmi existing.  Any other module (a separately-compiled local
     // unit like `A`) is itself a top-level unit, so its global is the bare name.
     if (mod == "Stdlib" || mod.rfind("Camlinternal", 0) == 0) return mod;
+    // A local top-level unit (`bool.cmi` on an -I dir) is its OWN global, even
+    // when a same-named stdlib submodule (`Stdlib__Bool`) also exists -- it
+    // shadows it (ocamlbuild's `Bool` vs `Stdlib.Bool`).
+    if (!local_unit_cmi(mod).empty()) return mod;
     if (std::filesystem::exists(stdlib_dir + "/stdlib__" + mod + ".cmi")) return "Stdlib__" + mod;
     return mod;
   }
