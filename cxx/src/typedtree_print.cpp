@@ -153,6 +153,16 @@ struct Printer {
     } else if (auto* al = std::get_if<Ttyp_alias>(&t.desc)) {
       line(j, "Ttyp_alias \"" + al->name + "\"");
       core_type(j, *al->type);
+    } else if (auto* vr = std::get_if<Ttyp_variant>(&t.desc)) {
+      line(j, std::string("Ttyp_variant closed=") + (vr->closed ? "Closed" : "Open"));
+      line(j, "[");
+      for (auto& tg : vr->tags) {
+        line(j + 1, "Ttag \"" + tg.name + "\" " + (tg.constant ? "true" : "false"));
+        list_core_types(j + 2, tg.types);
+      }
+      line(j, "]");
+      if (vr->labels) list_strings(j, *vr->labels);
+      else line(j, "None");
     } else {
       auto& p = std::get<Ttyp_poly>(t.desc);
       std::string s = "Ttyp_poly";

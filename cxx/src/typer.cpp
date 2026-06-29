@@ -355,6 +355,19 @@ struct Typer {
     } else if (auto* po = std::get_if<Ptyp_poly>(&t.desc)) {
       out.desc = tt::Ttyp_poly{po->vars,
                                std::make_unique<tt::CoreType>(core_type(*po->type))};
+    } else if (auto* pv = std::get_if<Ptyp_variant>(&t.desc)) {
+      tt::Ttyp_variant tv;
+      tv.closed = pv->closed == ClosedFlag::Closed;
+      for (auto& row : pv->rows) {
+        auto* rt = std::get_if<Rtag>(&row);
+        if (!rt) throw TypeError("coretype#5-inherit");  // Rinherit row: defer
+        tt::Ttag tag{rt->name, rt->constant, {}};
+        for (auto& ty : rt->types)
+          tag.types.push_back(std::make_unique<tt::CoreType>(core_type(*ty)));
+        tv.tags.push_back(std::move(tag));
+      }
+      if (pv->labels) tv.labels = *pv->labels;
+      out.desc = std::move(tv);
     } else {
       throw TypeError("coretype#" + std::to_string(t.desc.index()));
     }
