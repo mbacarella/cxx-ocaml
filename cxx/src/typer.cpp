@@ -217,6 +217,10 @@ struct Typer {
     std::string repr = "Record_regular";
   };
   std::unordered_map<std::string, RecordInfo> field_registry;
+  // Local type names whose manifest resolves to `float` (`type t = [private]
+  // float`, transitively): a record all of whose fields have such a type gets
+  // the Record_float representation, like a bare-`float` record.
+  std::set<std::string> float_abbrevs_;
 
   static std::string lid_last(const Longident& x) {
     if (auto* p = std::get_if<Lident>(&x.v)) return p->name;
@@ -439,16 +443,27 @@ struct Typer {
   std::vector<tt::TypeDeclaration> type_decls(
       const std::vector<TypeDeclaration>& decls) {
     for (auto& d : decls) fresh_type(d.name.txt);
+    // Register float abbreviations first (`type t = [private] float`, or an alias
+    // of an already-known float type), so a same-group float record sees them.
+    auto is_float_ty = [&](const CoreType& t) {
+      auto* c = std::get_if<Ptyp_constr>(&t.desc);
+      return c && (lid_last(c->id.txt) == "float" || float_abbrevs_.count(lid_last(c->id.txt)));
+    };
+    for (auto& d : decls)
+      if (d.manifest && is_float_ty(*d.manifest->get())) float_abbrevs_.insert(d.name.txt);
     for (auto& d : decls) {
       if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
         RecordInfo info;
         bool all_float = !r->fields.empty();
         for (auto& f : r->fields) {
           info.decl_fields.push_back(f.name.txt);
-          auto* fc = std::get_if<Ptyp_constr>(&f.type->desc);
-          if (!fc || lid_last(fc->id.txt) != "float") all_float = false;
+          if (!is_float_ty(*f.type)) all_float = false;
         }
+        bool unboxed = false;
+        for (auto& a : d.attrs)
+          if (a.name == "unboxed" || a.name == "ocaml.unboxed") unboxed = true;
         if (all_float) info.repr = "Record_float";
+        else if (unboxed) info.repr = "Record_unboxed false";
         for (auto& f : r->fields) field_registry[f.name.txt] = info;
       }
     }
