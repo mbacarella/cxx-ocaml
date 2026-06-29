@@ -898,6 +898,75 @@ struct Checker {
     }
   }
 
+  // A `module rec` group can hide a cyclic type abbreviation that the file-local
+  // check misses, because the self-reference is *qualified* through the module
+  // being defined (`module rec A : sig type t = A.t end`).  Build the abbreviation
+  // graph over qualified names (Mod.t) within the group -- following manifest
+  // edges only, like check_cyclic_aliases -- and reject a cycle.  Purely
+  // syntactic, so it stays sound under the otherwise-error-suppressed recursion.
+  void check_recmodule_cyclic_types(const Pstr_recmodule& rm) {
+    if (!strict) return;
+    struct QAlias { std::string mod; const CoreType* manifest; };
+    std::unordered_map<std::string, QAlias> aliases;  // "Mod.t" -> defn
+    auto add_decls = [&](const std::string& mod, const std::vector<TypeDeclaration>& ds) {
+      for (auto& d : ds)
+        if (d.manifest) aliases[mod + "." + d.name.txt] = {mod, d.manifest->get()};
+    };
+    for (auto& b : rm.bindings) {
+      if (!b.name.txt) continue;
+      const std::string& mod = *b.name.txt;
+      // Prefer the ascribed signature's type decls; else the struct body's.
+      const ast::Signature* sg = nullptr;
+      const ModuleExpr* m = &b.expr;
+      while (auto* mc = std::get_if<Pmod_constraint>(&m->desc)) {
+        if (auto* s = std::get_if<Pmty_signature>(&mc->mt->desc)) { sg = &s->items; break; }
+        m = mc->me.get();
+      }
+      if (sg) {
+        for (auto& si : *sg)
+          if (auto* st = std::get_if<Psig_type>(&si.desc)) add_decls(mod, st->decls);
+      } else if (auto* ms = std::get_if<Pmod_structure>(&m->desc)) {
+        for (auto& it : ms->items)
+          if (auto* pt = std::get_if<Pstr_type>(&it.desc)) add_decls(mod, pt->decls);
+      }
+    }
+    if (aliases.empty()) return;
+    // Qualified refs of a manifest (a bare name resolves within its own module).
+    std::function<void(const CoreType&, const std::string&, std::set<std::string>&)> refs =
+        [&](const CoreType& t, const std::string& cur, std::set<std::string>& out) {
+          if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+            std::string q;
+            if (auto* l = std::get_if<Lident>(&c->id.txt.v)) q = cur + "." + l->name;
+            else if (auto* d = std::get_if<Ldot>(&c->id.txt.v)) {
+              if (auto* p = std::get_if<Lident>(&d->prefix->v)) q = p->name + "." + d->name;
+            }
+            if (!q.empty() && aliases.count(q)) out.insert(q);
+            for (auto& a : c->args) refs(*a, cur, out);
+          } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+            refs(*a->dom, cur, out); refs(*a->cod, cur, out);
+          } else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+            for (auto& e : tu->elems) refs(*e, cur, out);
+          } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+            refs(*al->type, cur, out);
+          }
+        };
+    std::unordered_map<std::string, std::set<std::string>> graph;
+    for (auto& [q, a] : aliases) refs(*a.manifest, a.mod, graph[q]);
+    for (auto& [start, a] : aliases) {
+      std::set<std::string> seen;
+      std::function<bool(const std::string&)> reaches = [&](const std::string& cur) -> bool {
+        auto it = graph.find(cur);
+        if (it == graph.end()) return false;
+        for (auto& nx : it->second) {
+          if (nx == start) return true;
+          if (seen.insert(nx).second && reaches(nx)) return true;
+        }
+        return false;
+      };
+      if (reaches(start)) { note_error("The type abbreviation \"" + start + "\" is cyclic"); break; }
+    }
+  }
+
   // `[@@unboxed]` is valid only on a single-constructor variant whose
   // constructor takes exactly one argument, or a single-field record.  Flag the
   // clear count violations (sound: a valid 1-arg/1-field type is never flagged).
@@ -2673,6 +2742,7 @@ struct Checker {
             }
           }
         } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
+          check_recmodule_cyclic_types(*rm);  // syntactic; safe under the recursion
           // Visit each recursive-module body so its expressions are inferred and
           // its format-string literals collected (a `module rec` body's Printf
           // would otherwise be left as a raw string -> runtime crash).  Names are
