@@ -5617,6 +5617,21 @@ struct Translator {
       return field_of("Stdlib", sf->second);
     return nullptr;
   }
+  // A bare exception/extension ctor brought into scope by `open M` (M a global
+  // module whose export field carries the identity): `open A; raise E0` ->
+  // `field_of(global A, off)`.  Mirrors exn_value's opened-module branch but
+  // WITHOUT the predef/stdlib-field fallbacks, which have dedicated branches at
+  // the construct site.  Null if no opened module exports `name`.
+  LamPtr opened_module_exn_value(const std::string& name) {
+    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+      if (it->find('.') != std::string::npos) continue;  // dotted submodule opens
+      if (module_base(*it)) continue;                    // local module -> exn_field_
+      auto& fm = fields_of(*it);
+      if (auto f = fm.find(name); f != fm.end())
+        return field_of(global_of(*it), f->second);
+    }
+    return nullptr;
+  }
   // A match row as a *borrowed* view into the AST (the Structure outlives the
   // translation), so sub-matches can be built from inner sub-patterns without
   // copying the move-only Case.  guard==nullptr means no `when`.
@@ -10118,8 +10133,17 @@ struct Translator {
         }
         return block_of(cip->tag, fs);
       }
-      if (exn_ident_.count(n) || exn_field_.count(n)) {
-        LamPtr v = exn_value(n);
+      // A bare exception ctor that is local (exn_ident_/exn_field_) OR brought in
+      // by `open M` (a global module).  The opened-module case must be resolved
+      // here -- otherwise `open My_std; raise Exit_OK` left Exit_OK an unbound
+      // var, raising garbage that no `with Exit_OK` arm could match.
+      LamPtr exnv = (exn_ident_.count(n) || exn_field_.count(n))
+                        ? exn_value(n)
+                        : (std::holds_alternative<Lident>(k->id.txt.v) && !ctor_info_.count(n)
+                               ? opened_module_exn_value(n)
+                               : nullptr);
+      if (exnv) {
+        LamPtr v = exnv;
         if (!k->arg) return v;  // local exception/extension-ctor value
         // applied: a block whose field 0 is the constructor's identity --
         // `(makeblock 0 (*,k1..) E/1 a1..)` -- with a tuple argument flattened
