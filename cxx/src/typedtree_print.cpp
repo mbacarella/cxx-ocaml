@@ -161,7 +161,7 @@ struct Printer {
         list_core_types(j + 2, tg.types);
       }
       line(j, "]");
-      if (vr->labels) list_strings(j, *vr->labels);
+      if (vr->labels) { line(j, "Some"); list_strings(j + 1, *vr->labels); }
       else line(j, "None");
     } else if (auto* ob = std::get_if<Ttyp_object>(&t.desc)) {
       line(j, std::string("Ttyp_object ") + (ob->closed ? "Closed" : "Open"));
@@ -650,6 +650,7 @@ struct Printer {
   }
   void class_structure_p(int i, const ClassStructure& cs) {
     pattern(i + 1, *cs.self);
+    if (cs.fields.empty()) { line(i + 1, "[]"); return; }
     line(i + 1, "[");
     for (auto& f : cs.fields) class_field(i + 2, f);
     line(i + 1, "]");
