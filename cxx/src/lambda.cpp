@@ -3250,6 +3250,14 @@ struct Translator {
           }
         }
       for (auto& [k, n] : s) if (k != 0) { fn_sig_[id.stamp] = s; return; }
+    } else if (std::holds_alternative<Pexp_ident>(e->desc)) {
+      // `let g = M.f` / `let g = f`: an ALIAS of a labelled/optional function.
+      // Copy the aliased value's signature so g's call sites reorder/wrap args
+      // too -- ocamlbuild's `let caml_transitive_closure =
+      // Ocaml_dependencies.caml_transitive_closure` (a functor-result value with
+      // five optionals) was otherwise called raw, dropping an argument.
+      FnSig s = callee_sig(e);
+      for (auto& [k, n] : s) if (k != 0) { fn_sig_[id.stamp] = s; break; }
     }
   }
   // `let f, g = M.(a, b)`: each tuple component that aliases a labelled function
