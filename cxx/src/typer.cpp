@@ -368,6 +368,16 @@ struct Typer {
       }
       if (pv->labels) tv.labels = *pv->labels;
       out.desc = std::move(tv);
+    } else if (auto* ob = std::get_if<Ptyp_object>(&t.desc)) {
+      tt::Ttyp_object to;
+      to.closed = ob->closed == ClosedFlag::Closed;
+      for (auto& f : ob->fields) {
+        auto* ot = std::get_if<Otag>(&f);
+        if (!ot) throw TypeError("coretype#6-inherit");  // Oinherit row: defer
+        to.methods.emplace_back(ot->name.txt,
+                                std::make_unique<tt::CoreType>(poly_wrap(*ot->type)));
+      }
+      out.desc = std::move(to);
     } else {
       throw TypeError("coretype#" + std::to_string(t.desc.index()));
     }

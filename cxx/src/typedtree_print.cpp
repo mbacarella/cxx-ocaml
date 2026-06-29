@@ -163,6 +163,12 @@ struct Printer {
       line(j, "]");
       if (vr->labels) list_strings(j, *vr->labels);
       else line(j, "None");
+    } else if (auto* ob = std::get_if<Ttyp_object>(&t.desc)) {
+      line(j, std::string("Ttyp_object ") + (ob->closed ? "Closed" : "Open"));
+      for (auto& [name, ty] : ob->methods) {
+        line(j + 1, "method " + name);
+        core_type(j + 2, *ty);
+      }
     } else {
       auto& p = std::get<Ttyp_poly>(t.desc);
       std::string s = "Ttyp_poly";

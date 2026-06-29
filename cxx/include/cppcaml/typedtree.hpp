@@ -53,6 +53,10 @@ struct Ttyp_tuple {
 struct Ttyp_constr { Path path; std::vector<CoreTypeBox> args; };
 struct Ttyp_poly { std::vector<std::string> vars; CoreTypeBox type; };
 struct Ttyp_alias { std::string name; CoreTypeBox type; };  // (t as 'name)
+struct Ttyp_object {  // < m : t ; ... >  (Otag methods only)
+  std::vector<std::pair<std::string, CoreTypeBox>> methods;  // name -> poly-wrapped type
+  bool closed = true;  // < .. > vs < .. ; .. >
+};
 struct Ttag { std::string name; bool constant; std::vector<CoreTypeBox> types; };
 struct Ttyp_variant {  // [ `A | `B of t | ... ]  (Rtag rows only)
   std::vector<Ttag> tags;
@@ -61,7 +65,7 @@ struct Ttyp_variant {  // [ `A | `B of t | ... ]  (Rtag rows only)
 };
 struct CoreType {
   std::variant<Ttyp_any, Ttyp_var, Ttyp_arrow, Ttyp_tuple, Ttyp_constr, Ttyp_poly,
-               Ttyp_alias, Ttyp_variant>
+               Ttyp_alias, Ttyp_variant, Ttyp_object>
       desc;
   Location loc;
 };
