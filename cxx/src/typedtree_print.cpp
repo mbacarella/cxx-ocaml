@@ -71,7 +71,7 @@ struct Printer {
   }
   // printtyped fmt_position: filename on every position.
   std::string pos(const ast::Position& p) const {
-    if (p.cnum == -1) return "_none_[0]";
+    if (p.cnum == -1) return "_none_[0,0+-1]";  // the compiler's "none" position
     return file_of(p) + '[' + std::to_string(p.lnum) + ',' +
            std::to_string(p.bol) + '+' + std::to_string(p.cnum - p.bol) + ']';
   }
