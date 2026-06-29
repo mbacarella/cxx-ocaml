@@ -16,4 +16,14 @@ void link_executable(const std::vector<std::string>& inputs,
                      const std::string& out_path,
                      const std::string& runtime_path);
 
+// `ocamlc -a`: bundle `cmos` (.cmo paths, in order) into a .cma library at
+// `out_path` -- concatenate their code and emit the `library` table of contents.
+void archive(const std::vector<std::string>& cmos, const std::string& out_path);
+
+// `ocamlc -pack -o <Pack>.cmo`: consolidate `cmos` into one packed unit named
+// `pack_name`, renaming each member M to `Pack.M` and appending the structure
+// block that builds the `Pack` record from the members.
+void pack(const std::vector<std::string>& cmos, const std::string& pack_name,
+          const std::string& out_path);
+
 }  // namespace cppcaml::link

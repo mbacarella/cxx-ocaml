@@ -101,8 +101,7 @@ static const std::set<std::string> kBoolIgnore = {
 // Flags that would silently change the output if dropped -> reported unsupported.
 static const std::set<std::string> kUnsupportedArg = {"-pp", "-ppx", "-open",
                                                       "-for-pack"};
-static const std::set<std::string> kUnsupportedBool = {"-pack", "-a", "-i",
-                                                       "-output-obj"};
+static const std::set<std::string> kUnsupportedBool = {"-i", "-output-obj"};
 // -labels/-nolabels affect typing but not our (untyped-after-infer) output.
 static const std::set<std::string> kBoolIgnore2 = {"-labels", "-nolabels"};
 
@@ -180,6 +179,8 @@ int main(int argc, char** argv) {
   std::vector<std::string> incdirs_raw;  // -I dirs (may be `+unix`), in order
   std::vector<std::string> inputs;       // positional files (.ml/.mli/.cmo/.cma)
   bool compile_only = false;             // -c : stop at the .cmo / .cmi
+  bool make_lib = false;                 // -a : build a .cma archive
+  std::string pack_name;                 // -pack : build a packed unit (name from -o)
   bool nostdlib = false;                 // -nostdlib : do not auto-link stdlib
   bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
 
@@ -196,6 +197,8 @@ int main(int argc, char** argv) {
     else if (a == "-I") incdirs_raw.push_back(need_arg("-I"));
     else if (a == "-runtime") runtime = need_arg("-runtime");
     else if (a == "-c") compile_only = true;
+    else if (a == "-a") make_lib = true;
+    else if (a == "-pack") pack_name = "?";  // resolved from -o once known
     else if (a == "-nostdlib") nostdlib = true;
     else if (a == "-version") { std::cout << kVersion << '\n'; return 0; }
     else if (a == "-vnum") { std::cout << kVersion << '\n'; return 0; }
@@ -274,6 +277,28 @@ int main(int argc, char** argv) {
   }
 
   if (compile_only) return 0;       // -c : no link
+
+  if (make_lib) {  // -a : bundle the .cmo objects into a .cma
+    if (out_path.empty()) out_path = "a.cma";
+    try {
+      cppcaml::link::archive(link_objs, out_path);
+    } catch (const std::exception& e) {
+      std::cerr << "c++ocamlc: -a: " << e.what() << '\n';
+      return 1;
+    }
+    return 0;
+  }
+  if (!pack_name.empty()) {  // -pack -o Pack.cmo : consolidate into one unit
+    if (out_path.empty()) { std::cerr << "c++ocamlc: -pack needs -o <Pack>.cmo\n"; return 2; }
+    try {
+      cppcaml::link::pack(link_objs, module_name(out_path), out_path);
+    } catch (const std::exception& e) {
+      std::cerr << "c++ocamlc: -pack: " << e.what() << '\n';
+      return 1;
+    }
+    return 0;
+  }
+
   if (link_objs.empty()) return 0;  // only .mli inputs
 
   // Link: [stdlib.cma] + objects + [std_exit.cmo] -> runnable bytecode launcher.

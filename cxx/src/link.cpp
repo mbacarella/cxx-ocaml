@@ -293,4 +293,131 @@ void link_executable(const std::vector<std::string>& inputs,
   if (lm) lm << linkmap;
 }
 
+// ---- `ocamlc -a`: build a .cma library ------------------------------------
+// A .cma is `magic(12) + be32(toc_offset) + <concatenated unit code> + marshaled
+// library`; each unit's cu_pos is rewritten to its code offset within the file.
+void archive(const std::vector<std::string>& cmos, const std::string& out_path) {
+  std::vector<std::uint8_t> out;
+  const char* magic = "Caml1999A038";
+  out.insert(out.end(), magic, magic + 12);
+  std::size_t depl = out.size();
+  put_be32(out, 0);  // placeholder for the library-descriptor offset
+  std::vector<ValPtr> units;
+  for (const std::string& path : cmos) {
+    std::vector<std::uint8_t> file = read_file(path);
+    if (file.size() < 16 || std::string((const char*)file.data(), 12) != "Caml1999O038")
+      throw std::runtime_error(path + ": not a .cmo (cannot -a a .cma input)");
+    std::size_t off = be32(file, 12);
+    m::Arena arena;
+    std::size_t root = m::read_value(file.data(), file.size(), off, arena);
+    int cu_pos = (int)arena[arena[root].fields[1]].i;
+    int codesize = (int)arena[arena[root].fields[2]].i;
+    ValPtr cu = conv(arena, root);
+    cu->fields[1] = omarshal::vint((long long)out.size());  // rewrite cu_pos
+    out.insert(out.end(), file.begin() + cu_pos, file.begin() + cu_pos + codesize);
+    units.push_back(cu);
+  }
+  // library = { lib_units; lib_custom=false; lib_ccobjs=[]; lib_ccopts=[]; lib_dllibs=[] }
+  ValPtr lib = omarshal::vblock(0, {omarshal::vlist(units), omarshal::vint(0),
+                                    omarshal::vint(0), omarshal::vint(0), omarshal::vint(0)});
+  std::vector<std::uint8_t> lib_bytes = omarshal::marshal(lib);
+  std::uint32_t toc = (std::uint32_t)out.size();
+  out.insert(out.end(), lib_bytes.begin(), lib_bytes.end());
+  out[depl] = toc >> 24; out[depl + 1] = toc >> 16; out[depl + 2] = toc >> 8; out[depl + 3] = toc;
+  std::ofstream f(out_path, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot write " + out_path);
+  f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)out.size());
+}
+
+// ---- `ocamlc -pack`: consolidate .cmo members into one packed unit ---------
+// Concatenate each member's code, renaming its global M -> Pack.M (and sibling
+// references likewise), then append the structure block that builds the Pack
+// record `{M0; ..; Mn-1}` from those globals and SETGLOBALs Pack.  Members must
+// appear in dependency order (a sibling reference may only be backward).
+void pack(const std::vector<std::string>& cmos, const std::string& pack_name,
+          const std::string& out_path) {
+  // opcodes (runtime/caml/opcodes.h order): see cmo.cpp's enum.
+  enum { PUSH = 9, GETGLOBAL = 53, SETGLOBAL = 57, ATOM0 = 58, MAKEBLOCK = 62 };
+  std::vector<std::uint8_t> code;
+  std::vector<ValPtr> reloc_entries;  // (reloc_info * int) list elements
+  std::vector<ValPtr> primitives;
+  std::set<std::string> members, processed;
+  std::vector<std::string> member_names;
+  for (const std::string& path : cmos) {
+    InputFile in = read_objects(path);
+    if (in.archive || in.units.size() != 1)
+      throw std::runtime_error(path + ": -pack expects a single .cmo");
+    members.insert(in.units[0].name);
+    member_names.push_back(in.units[0].name);
+  }
+  auto reloc_info = [&](const Reloc& r) -> ValPtr {
+    switch (r.k) {
+      case Reloc::Literal:     return omarshal::vblock(0, {r.lit});
+      case Reloc::GetCompunit: return omarshal::vblock(1, {omarshal::vstr(r.name)});
+      case Reloc::GetPredef:   return omarshal::vblock(2, {omarshal::vstr(r.name)});
+      case Reloc::SetCompunit: return omarshal::vblock(3, {omarshal::vstr(r.name)});
+      case Reloc::Primitive:   return omarshal::vblock(4, {omarshal::vstr(r.name)});
+    }
+    return omarshal::vint(0);
+  };
+  auto add_reloc = [&](Reloc r, int pos) {
+    reloc_entries.push_back(omarshal::vblock(0, {reloc_info(r), omarshal::vint(pos)}));
+  };
+  // Members: copy code, rebase + rename relocations.
+  for (const std::string& path : cmos) {
+    Unit u = read_objects(path).units[0];
+    int base = (int)code.size();
+    code.insert(code.end(), u.code.begin(), u.code.end());
+    for (Reloc r : u.relocs) {
+      if (r.k == Reloc::SetCompunit && members.count(r.name)) r.name = pack_name + "." + r.name;
+      else if (r.k == Reloc::GetCompunit && members.count(r.name)) {
+        if (!processed.count(r.name))
+          throw std::runtime_error(path + ": forward reference to pack member " + r.name);
+        r.name = pack_name + "." + r.name;
+      } else if (r.k == Reloc::Primitive)
+        primitives.push_back(omarshal::vstr(r.name));
+      add_reloc(r, base + r.pos);
+    }
+    processed.insert(u.name);
+  }
+  // Structure block: `setglobal Pack (makeblock N [getglobal Pack.M0; ..])`.
+  auto word = [&](int op) {
+    code.push_back((std::uint8_t)op); code.push_back(0); code.push_back(0); code.push_back(0);
+  };
+  auto operand0 = [&] { for (int k = 0; k < 4; ++k) code.push_back(0); };  // reloc placeholder
+  int N = (int)member_names.size();
+  for (int i = N - 1; i >= 0; --i) {                 // push args N-1..1, acc = arg 0
+    word(GETGLOBAL);
+    add_reloc(Reloc{Reloc::GetCompunit, pack_name + "." + member_names[i], nullptr, (int)code.size()}, (int)code.size());
+    operand0();
+    if (i != 0) word(PUSH);
+  }
+  if (N == 0) word(ATOM0);
+  else { word(MAKEBLOCK);
+         auto put_int = [&](int n) { code.push_back(n & 0xFF); code.push_back((n >> 8) & 0xFF);
+                                     code.push_back((n >> 16) & 0xFF); code.push_back((n >> 24) & 0xFF); };
+         put_int(N); put_int(0); }
+  word(SETGLOBAL);
+  add_reloc(Reloc{Reloc::SetCompunit, pack_name, nullptr, (int)code.size()}, (int)code.size());
+  operand0();
+
+  // Write the packed .cmo (mirror cmo.cpp's compilation_unit layout).
+  const int pos_code = 16;  // magic(12) + 4-byte descriptor offset
+  ValPtr compunit = omarshal::vblock(0, {
+      omarshal::vstr(pack_name), omarshal::vint(pos_code), omarshal::vint((long long)code.size()),
+      omarshal::vlist(reloc_entries), omarshal::vint(0), omarshal::vint(0),
+      omarshal::vlist(primitives), omarshal::vint(0), omarshal::vint(0), omarshal::vint(0),
+      omarshal::vint(0), omarshal::vint(0)});
+  std::vector<std::uint8_t> cu_bytes = omarshal::marshal(compunit);
+  std::vector<std::uint8_t> out;
+  const char* magic = "Caml1999O038";
+  out.insert(out.end(), magic, magic + 12);
+  put_be32(out, (std::uint32_t)(pos_code + code.size()));
+  out.insert(out.end(), code.begin(), code.end());
+  out.insert(out.end(), cu_bytes.begin(), cu_bytes.end());
+  std::ofstream f(out_path, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot write " + out_path);
+  f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)out.size());
+}
+
 }  // namespace cppcaml::link
