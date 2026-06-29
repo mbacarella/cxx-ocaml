@@ -55,6 +55,47 @@ static std::string discover_stdlib(const std::string& flag) {
   return "stdlib";
 }
 
+// Print the full command-line help.  Mirrors `ocamlc -help` in spirit but only
+// documents what c++ocamlc actually implements; the large remainder of ocamlc's
+// vocabulary is accepted-and-ignored (or rejected, see -strict-flags) for
+// drop-in compatibility rather than honoured.
+static void print_help(std::ostream& os) {
+  os <<
+      "Usage: c++ocamlc [options] <files>\n"
+      "\n"
+      "A drop-in bytecode compiler: parses, type-infers, and compiles OCaml\n"
+      "source to .cmo/.cmi, and links .cmo/.cma objects into a runnable\n"
+      "#!ocamlrun bytecode executable.  Accepts ocamlc's flag vocabulary.\n"
+      "\n"
+      "  c++ocamlc -c foo.ml              # foo.ml -> foo.cmo (+ foo.cmi)\n"
+      "  c++ocamlc a.cmo b.cmo -o prog    # link objects into an executable\n"
+      "\n"
+      "Options:\n"
+      "  -a              Build a .cma library from the given .cmo files\n"
+      "  -c              Compile only (do not link); stop at .cmo/.cmi\n"
+      "  -I <dir>        Add <dir> to the list of include directories\n"
+      "                  (a `+dir' is taken relative to the stdlib directory)\n"
+      "  -impl <file>    Compile <file> as a .ml regardless of its extension\n"
+      "  -intf <file>    Compile <file> as a .mli regardless of its extension\n"
+      "  -nostdlib       Do not add the stdlib directory to the include path,\n"
+      "                  and do not auto-link the standard library\n"
+      "  -o <file>       Set the output file name\n"
+      "  -pack           Package the given .cmo files into one unit (needs -o)\n"
+      "  -runtime <file> Use <file> as the ocamlrun launched by the output exe\n"
+      "  -strict-flags   Turn accepted-but-ignored and unknown options into\n"
+      "                  errors instead of silently dropping them\n"
+      "  -config         Print the compiler configuration and exit\n"
+      "  -version        Print the compiler version and exit\n"
+      "  -vnum           Print the compiler version number and exit\n"
+      "  -where          Print the standard library directory and exit\n"
+      "  -help, --help   Print this help and exit\n"
+      "\n"
+      "Many other ocamlc options (-w, -g, -bin-annot, ...) are accepted for\n"
+      "compatibility and ignored; a few that would silently change the output\n"
+      "(-pp, -ppx, -open, -for-pack, -i, -output-obj) are rejected.  Use\n"
+      "-strict-flags to also reject the ignored ones.\n";
+}
+
 static std::string module_name(const std::string& path) {
   std::string base = fs::path(path).filename().string();
   size_t dot = base.find('.');
@@ -184,6 +225,17 @@ int main(int argc, char** argv) {
   bool nostdlib = false;                 // -nostdlib : do not auto-link stdlib
   bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
 
+  // -strict-flags makes accepted-but-ignored / unknown options hard errors.
+  // Detect it up front so it governs options appearing before it on the line.
+  bool strict_flags = false;
+  for (int i = 1; i < argc; ++i)
+    if (std::string(argv[i]) == "-strict-flags") strict_flags = true;
+  auto reject_ignored = [&](const std::string& a) {
+    std::cerr << "c++ocamlc: option " << a
+              << " is accepted-but-ignored and -strict-flags is set\n";
+    std::exit(2);
+  };
+
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto need_arg = [&](const char* what) -> const char* {
@@ -193,7 +245,9 @@ int main(int argc, char** argv) {
       }
       return argv[++i];
     };
-    if (a == "-o") out_path = need_arg("-o");
+    if (a == "-help" || a == "--help" || a == "-h") { print_help(std::cout); return 0; }
+    else if (a == "-strict-flags") { /* handled in the pre-scan above */ }
+    else if (a == "-o") out_path = need_arg("-o");
     else if (a == "-I") incdirs_raw.push_back(need_arg("-I"));
     else if (a == "-runtime") runtime = need_arg("-runtime");
     else if (a == "-c") compile_only = true;
@@ -210,8 +264,14 @@ int main(int argc, char** argv) {
       return 0;
     } else if (a == "-impl") inputs.push_back(need_arg("-impl"));   // force .ml kind
     else if (a == "-intf") inputs.push_back(need_arg("-intf"));     // force .mli kind
-    else if (kArgIgnore.count(a)) { (void)need_arg(a.c_str()); }
-    else if (kBoolIgnore.count(a) || kBoolIgnore2.count(a)) { /* accept, ignore */ }
+    else if (kArgIgnore.count(a)) {
+      if (strict_flags) reject_ignored(a);
+      (void)need_arg(a.c_str());
+    }
+    else if (kBoolIgnore.count(a) || kBoolIgnore2.count(a)) {
+      if (strict_flags) reject_ignored(a);
+      /* else accept, ignore */
+    }
     else if (kUnsupportedArg.count(a)) {
       std::cerr << "c++ocamlc: " << a << " is not supported yet\n";
       (void)need_arg(a.c_str());
@@ -220,7 +280,12 @@ int main(int argc, char** argv) {
       std::cerr << "c++ocamlc: " << a << " is not supported yet\n";
       return 2;
     } else if (!a.empty() && a[0] == '-') {
-      // An unrecognised flag: warn but keep going (be lenient for drop-in use).
+      // An unrecognised flag: error under -strict-flags, else warn and keep
+      // going (be lenient for drop-in use).
+      if (strict_flags) {
+        std::cerr << "c++ocamlc: unknown option " << a << " (-strict-flags)\n";
+        return 2;
+      }
       std::cerr << "c++ocamlc: warning: ignoring unknown option " << a << '\n';
     } else {
       inputs.push_back(a);  // a source/object file
@@ -228,7 +293,8 @@ int main(int argc, char** argv) {
   }
 
   if (inputs.empty()) {
-    std::cerr << "usage: c++ocamlc [-c] [-I <dir>]... <files...> [-o <out>]\n";
+    std::cerr << "usage: c++ocamlc [-c] [-I <dir>]... <files...> [-o <out>]\n"
+                 "       c++ocamlc -help   for the full list of options\n";
     return 2;
   }
 
