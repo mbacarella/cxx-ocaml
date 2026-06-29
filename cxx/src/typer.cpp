@@ -1112,7 +1112,8 @@ struct Typer {
   // Elaborate a method body the way the typer does: `fun self-N -> body`, with a
   // Texp_poly extra on the body.  (Instance-variable references in the body would
   // become Texp_instvar -- handled once vals are tracked.)
-  tt::Expression elaborate_method(const Expression& body0, int method_no, Location selfloc) {
+  int object_no_ = 0;  // global per-object counter for the self-N display name
+  tt::Expression elaborate_method(const Expression& body0, int self_n, Location selfloc) {
     const Expression* body = &body0;
     const CoreType* mty = nullptr;  // (method m : T = e): keep the type for the extra
     if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) {
@@ -1135,7 +1136,7 @@ struct Typer {
     selfvar.desc = tt::Tpat_var{fresh_anon("self-*")};
     tt::Pattern selfpat;
     selfpat.loc = selfloc;
-    selfpat.desc = tt::Tpat_alias{fresh_anon("self-" + std::to_string(method_no)),
+    selfpat.desc = tt::Tpat_alias{fresh_anon("self-" + std::to_string(self_n)),
                                   std::make_unique<tt::Pattern>(std::move(selfvar))};
     tt::FunctionParam fp;
     fp.label = ArgLabel{};
@@ -1174,7 +1175,7 @@ struct Typer {
     for (auto& f : cs.fields)
       if (auto* v = std::get_if<Pcf_val>(&f.desc))
         instvars_[v->name.txt] = fresh_anon(v->name.txt);
-    int method_no = 0;
+    int self_n = ++object_no_;  // this object's self-N (shared by all its methods)
     for (auto& f : cs.fields) {
       tt::ClassField cf;
       cf.loc = f.loc;
@@ -1185,7 +1186,7 @@ struct Typer {
         tm.name = m->name.txt;
         tm.private_ = m->priv == PrivateFlag::Private;
         tm.override_ = cc->ovr == OverrideFlag::Override;
-        tm.expr = std::make_unique<tt::Expression>(elaborate_method(*cc->e, ++method_no, cs.self.loc));
+        tm.expr = std::make_unique<tt::Expression>(elaborate_method(*cc->e, self_n, cs.self.loc));
         cf.desc = std::move(tm);
       } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
         auto* cc = std::get_if<Cfk_concrete>(&v->kind);
@@ -1206,7 +1207,6 @@ struct Typer {
         wrap.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(class_expr_t(*in->ce))};
         ti.ce = std::make_unique<tt::ClassExpr>(std::move(wrap));
         cf.desc = std::move(ti);
-        ++method_no;  // an inherit consumes a self-N binding (hidden)
       } else {
         throw TypeError("class_field#" + std::to_string(f.desc.index()));
       }
