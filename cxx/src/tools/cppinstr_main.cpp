@@ -2,12 +2,16 @@
 // them in -dinstr format, byte-comparable (after label normalization) with
 // `ocamlc -dinstr -c`.
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "cppcaml/bytecode.hpp"
+#include "cppcaml/cmi.hpp"
+#include "cppcaml/infer_check.hpp"
 #include "cppcaml/lambda.hpp"
 #include "cppcaml/parser.hpp"
 
@@ -21,16 +25,41 @@ static std::string module_name(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 2) { std::cerr << "usage: c++instr <file.ml>\n"; return 2; }
-  std::ifstream in(argv[1], std::ios::binary);
-  if (!in) { std::cerr << "c++instr: cannot open " << argv[1] << '\n'; return 2; }
+  namespace fs = std::filesystem;
+  std::string file, stdlib_dir = "stdlib";
+  std::vector<std::string> incdirs;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "-I" && i + 1 < argc) {
+      std::string d = argv[++i];
+      if (d.rfind("+", 0) == 0) {  // `+unix` -> <stdlib>/../otherlibs/unix dev fallback
+        std::string x = d.substr(1);
+        fs::path cand = fs::path(stdlib_dir) / x;
+        if (!fs::exists(cand)) cand = fs::path(stdlib_dir) / ".." / "otherlibs" / x;
+        d = cand.string();
+      }
+      incdirs.push_back(d);
+      if (fs::exists(fs::path(d) / "stdlib.cmi")) stdlib_dir = d;
+    } else if (a == "-stdlib" && i + 1 < argc) {
+      stdlib_dir = argv[++i];
+    } else if (a[0] != '-') {
+      file = a;
+    }
+  }
+  if (file.empty()) { std::cerr << "usage: c++instr [-I dir]... <file.ml>\n"; return 2; }
+  std::ifstream in(file, std::ios::binary);
+  if (!in) { std::cerr << "c++instr: cannot open " << file << '\n'; return 2; }
   std::ostringstream ss;
   ss << in.rdbuf();
+  cppcaml::lambda::set_module_dirs(incdirs);
+  cppcaml::set_infer_module_dirs(incdirs);
+  cppcaml::set_infer_stdlib_dir(stdlib_dir);
+  cppcaml::cmi::cmiw::set_module_dirs(stdlib_dir, incdirs);
   try {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
-    std::string mod = module_name(argv[1]);
-    auto code = cppcaml::lambda::translate_implementation(structure, mod, "stdlib", argv[1]);
+    std::string mod = module_name(file);
+    auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, file);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     cppcaml::bytecode::print_dinstr(instrs, std::cout);
   } catch (const cppcaml::ParseError& e) {
