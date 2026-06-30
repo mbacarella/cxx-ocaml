@@ -2435,8 +2435,11 @@ struct Checker {
       venv.pop_back();
       return bt;
     }
-    if (auto* sd = std::get_if<Pexp_send>(&e.desc)) {  // o#m: infer the receiver only
-      infer_expr(*sd->obj);
+    if (auto* sd = std::get_if<Pexp_send>(&e.desc)) {  // o#m: the method's type
+      TypePtr ot = I::Engine::repr(infer_expr(*sd->obj));
+      if (!strict && ot->kind == I::Type::Kind::Object)
+        for (size_t i = 0; i < ot->labels.size(); ++i)
+          if (ot->labels[i] == sd->meth.txt) return ot->args[i];
       return eng.any();
     }
     if (auto* si = std::get_if<Pexp_setinstvar>(&e.desc)) {  // n <- e: e has n's type
