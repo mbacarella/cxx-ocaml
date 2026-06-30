@@ -2267,6 +2267,12 @@ struct Checker {
       if (record_kinds_) try_unify(et, at);
       return at;
     }
+    if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) {
+      // A coercion `(e :> T)` or `(e : T1 :> T2)` has the TARGET type T/T2.
+      infer_expr(*co->e);  // infer the source for its kinds/effects
+      std::unordered_map<std::string, TypePtr> vars;
+      return from_coretype(*co->to_, vars);
+    }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
       // `lazy e` : e Lazy.t -- only in the value-kinds pass (a concrete type here
       // can clash downstream in an incomplete strict pass and false-reject).
@@ -2400,7 +2406,14 @@ struct Checker {
         TypePtr vt = infer_expr(*val);
         strict = sv;
         TypePtr fsch = field_scheme(lid_last(lbl.txt));
-        if (!fsch) continue;
+        if (!fsch) {
+          // `{contents = e}` builds the predefined `'a ref` (non-strict only).
+          if (!strict && lid_last(lbl.txt) == "contents") {
+            TypePtr rt = eng.constr("ref", {vt});
+            if (recTy) try_unify(recTy, rt); else recTy = rt;
+          }
+          continue;
+        }
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));
         try_unify(vt, s->cod);
         if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
