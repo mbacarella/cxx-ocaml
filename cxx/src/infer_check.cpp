@@ -2164,8 +2164,10 @@ struct Checker {
       return recTy ? recTy : eng.any();
     }
     if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
-      for (auto& el : a->elems) infer_pat(*el);
-      return eng.fresh_var();
+      // `[| x; y |]` matches `'a array`, all elements sharing the element type.
+      TypePtr el = eng.fresh_var();
+      for (auto& e : a->elems) try_unify(el, infer_pat(*e));
+      return eng.constr("array", {el});
     }
     if (auto* lz = std::get_if<Ppat_lazy>(&p.desc))  // `lazy p` matches `'a lazy_t`, p:'a
       return eng.constr("lazy_t", {infer_pat(*lz->p)});
