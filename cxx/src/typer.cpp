@@ -86,54 +86,150 @@ inline tt::ExprBox gstr(const std::string& s, const Location& g) {
   e->desc = tt::Texp_constant{std::move(k)};
   return e;
 }
+inline tt::ExprBox gint(long n, const Location& g) {
+  auto e = std::make_unique<tt::Expression>();
+  e->loc = g;
+  ast::Constant k;
+  k.loc = g;
+  ast::Pconst_integer pi;
+  pi.value = std::to_string(n);
+  k.desc = pi;
+  e->desc = tt::Texp_constant{std::move(k)};
+  return e;
+}
 
-// One plain directive `%<d>`; ok=false (and returns rest unchanged) for anything
-// not handled, so the caller bails out of converting this format.
-inline tt::ExprBox directive(char d, tt::ExprBox rest, const Location& g, bool& ok) {
-  ok = true;
-  auto intc = [&](const char* conv) {
-    std::vector<tt::ExprBox> a;
-    a.push_back(gctor(conv, {}, g));
-    a.push_back(gctor("No_padding", {}, g));
-    a.push_back(gctor("No_precision", {}, g));
-    a.push_back(std::move(rest));
-    return gctor("Int", std::move(a), g);
-  };
+// Build the `padding` sub-tree (No_padding / Lit_padding(padty,w) /
+// Arg_padding(padty)).  padty: 0=Right, 1=Left, 2=Zeros.
+inline tt::ExprBox padding_node(int padty, bool has_w, bool arg_w, long w,
+                                const Location& g) {
+  if (!has_w && !arg_w) return gctor("No_padding", {}, g);
+  const char* pty = padty == 1 ? "Left" : padty == 2 ? "Zeros" : "Right";
+  std::vector<tt::ExprBox> a;
+  a.push_back(gctor(pty, {}, g));
+  if (arg_w) return gctor("Arg_padding", std::move(a), g);
+  a.push_back(gint(w, g));
+  return gctor("Lit_padding", std::move(a), g);
+}
+// Build the `precision` sub-tree.
+inline tt::ExprBox precision_node(bool has_p, bool arg_p, long p,
+                                  const Location& g) {
+  if (!has_p) return gctor("No_precision", {}, g);
+  if (arg_p) return gctor("Arg_precision", {}, g);
+  std::vector<tt::ExprBox> a;
+  a.push_back(gint(p, g));
+  return gctor("Lit_precision", std::move(a), g);
+}
+
+// Parse a full `%`-spec at s[i] (s[i]=='%'): %[flags][width][.prec][length]conv.
+// On success returns the fmt node (tail = rest) and sets consumed = #chars used;
+// ok=false for any spec we don't desugar (caller bails, leaving a plain string).
+inline tt::ExprBox pct_directive(const std::string& s, size_t i, tt::ExprBox rest,
+                                 const Location& g, bool& ok, size_t& consumed) {
+  ok = false;
+  size_t j = i + 1;
+  bool f_minus = false, f_zero = false, f_plus = false, f_space = false,
+       f_hash = false;
+  for (; j < s.size(); ++j) {
+    char c = s[j];
+    if (c == '-') f_minus = true;
+    else if (c == '0') f_zero = true;
+    else if (c == '+') f_plus = true;
+    else if (c == ' ') f_space = true;
+    else if (c == '#') f_hash = true;
+    else break;
+  }
+  bool w_has = false, w_arg = false; long w_val = 0;
+  if (j < s.size() && s[j] == '*') { w_arg = true; ++j; }
+  else { size_t st = j;
+    while (j < s.size() && std::isdigit((unsigned char)s[j])) ++j;
+    if (j > st) { w_has = true; w_val = std::stol(s.substr(st, j - st)); } }
+  bool p_has = false, p_arg = false; long p_val = 0;
+  if (j < s.size() && s[j] == '.') {
+    ++j; p_has = true;
+    if (j < s.size() && s[j] == '*') { p_arg = true; ++j; }
+    else { size_t st = j;
+      while (j < s.size() && std::isdigit((unsigned char)s[j])) ++j;
+      p_val = (j > st) ? std::stol(s.substr(st, j - st)) : 0; }
+  }
+  char len = 0;
+  if (j < s.size() && (s[j] == 'l' || s[j] == 'L' || s[j] == 'n')) {
+    len = s[j]; ++j;
+  }
+  if (j >= s.size()) return rest;
+  char d = s[j];
+  consumed = (j - i) + 1;
+  // Zeros padding needs a width; bail on a bare `0` flag.
+  if (f_zero && !w_has && !w_arg) return rest;
+  int padty = f_minus ? 1 : f_zero ? 2 : 0;
+  auto pad = [&] { return padding_node(padty, w_has, w_arg, w_val, g); };
+  auto prec = [&] { return precision_node(p_has, p_arg, p_val, g); };
+
   switch (d) {
-    case 'd': return intc("Int_d");
-    case 'i': return intc("Int_i");
-    case 'u': return intc("Int_u");
-    case 'x': return intc("Int_x");
-    case 'X': return intc("Int_X");
-    case 'o': return intc("Int_o");
-    case 's': {
+    case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': {
+      const char* conv = nullptr;
+      if (d == 'd') conv = f_plus ? "Int_pd" : f_space ? "Int_sd" : "Int_d";
+      else if (d == 'i') conv = f_plus ? "Int_pi" : f_space ? "Int_si" : "Int_i";
+      else if (d == 'u') { if (f_plus || f_space || f_hash) return rest; conv = "Int_u"; }
+      else if (d == 'x') { if (f_plus || f_space) return rest; conv = f_hash ? "Int_Cx" : "Int_x"; }
+      else if (d == 'X') { if (f_plus || f_space) return rest; conv = f_hash ? "Int_CX" : "Int_X"; }
+      else { if (f_plus || f_space) return rest; conv = f_hash ? "Int_Co" : "Int_o"; }
+      if ((d == 'd' || d == 'i') && f_hash) return rest;
+      const char* fam = len == 'l' ? "Int32" : len == 'L' ? "Int64"
+                      : len == 'n' ? "Nativeint" : "Int";
       std::vector<tt::ExprBox> a;
-      a.push_back(gctor("No_padding", {}, g));
+      a.push_back(gctor(conv, {}, g));
+      a.push_back(pad());
+      a.push_back(prec());
       a.push_back(std::move(rest));
-      return gctor("String", std::move(a), g);
+      ok = true;
+      return gctor(fam, std::move(a), g);
     }
-    case 'c': {
-      std::vector<tt::ExprBox> a;
-      a.push_back(std::move(rest));
-      return gctor("Char", std::move(a), g);
-    }
-    case 'b': {
-      std::vector<tt::ExprBox> a;
-      a.push_back(gctor("No_padding", {}, g));
-      a.push_back(std::move(rest));
-      return gctor("Bool", std::move(a), g);
-    }
-    case 'f': case 'e': case 'g': case 'E': case 'F': {
+    case 'f': case 'e': case 'g': case 'E': case 'F': case 'h': case 'H': {
+      if (len || f_hash) return rest;
       const char* fc = d == 'f' ? "Float_f" : d == 'e' ? "Float_e"
-                     : d == 'g' ? "Float_g" : d == 'E' ? "Float_E" : "Float_F";
+                     : d == 'g' ? "Float_g" : d == 'E' ? "Float_E"
+                     : d == 'F' ? "Float_F" : d == 'h' ? "Float_h" : "Float_H";
+      const char* fl = f_plus ? "Float_flag_p" : f_space ? "Float_flag_s"
+                                                         : "Float_flag_";
+      auto fconv = std::make_unique<tt::Expression>();
+      fconv->loc = g;
+      tt::Texp_tuple ft;
+      ft.elems.emplace_back(std::nullopt, gctor(fl, {}, g));
+      ft.elems.emplace_back(std::nullopt, gctor(fc, {}, g));
+      fconv->desc = std::move(ft);
       std::vector<tt::ExprBox> a;
-      a.push_back(gctor(fc, {}, g));
-      a.push_back(gctor("No_padding", {}, g));
-      a.push_back(gctor("No_precision", {}, g));
+      a.push_back(std::move(fconv));
+      a.push_back(pad());
+      a.push_back(prec());
       a.push_back(std::move(rest));
+      ok = true;
       return gctor("Float", std::move(a), g);
     }
-    default: ok = false; return rest;
+    case 's': case 'S': {
+      if (len || p_has || f_plus || f_space || f_hash || f_zero) return rest;
+      std::vector<tt::ExprBox> a;
+      a.push_back(pad());
+      a.push_back(std::move(rest));
+      ok = true;
+      return gctor(d == 's' ? "String" : "Caml_string", std::move(a), g);
+    }
+    case 'c': case 'C': {
+      if (len || p_has || w_has || w_arg || f_minus || f_zero || f_plus ||
+          f_space || f_hash) return rest;
+      std::vector<tt::ExprBox> a;
+      a.push_back(std::move(rest));
+      ok = true;
+      return gctor(d == 'c' ? "Char" : "Caml_char", std::move(a), g);
+    }
+    case 'b': case 'B': {
+      if (len || p_has || f_plus || f_space || f_hash || f_zero) return rest;
+      std::vector<tt::ExprBox> a;
+      a.push_back(pad());
+      a.push_back(std::move(rest));
+      ok = true;
+      return gctor("Bool", std::move(a), g);
+    }
+    default: return rest;
   }
 }
 
@@ -154,14 +250,52 @@ inline tt::ExprBox parse(const std::string& s, size_t i, const Location& g) {
       std::vector<tt::ExprBox> a; a.push_back(std::move(r));
       return gctor("Flush", std::move(a), g);
     }
-    auto r = parse(s, i + 2, g);
+    bool ok; size_t consumed = 0;
+    // peek: build with a placeholder rest only after we know the spec parses.
+    // We parse the spec first to learn its length, then recurse for the tail.
+    {
+      // Trial parse with an empty tail just to measure `consumed` and validity.
+      bool tok; size_t tlen = 0;
+      auto probe = pct_directive(s, i, gctor("End_of_format", {}, g), g, tok, tlen);
+      (void)probe;
+      if (!tok) return nullptr;
+      consumed = tlen;
+    }
+    auto r = parse(s, i + consumed, g);
     if (!r) return nullptr;
-    bool ok;
-    auto e = directive(d, std::move(r), g, ok);
+    auto e = pct_directive(s, i, std::move(r), g, ok, consumed);
     return ok ? std::move(e) : nullptr;
   }
+  if (s[i] == '@') {
+    // A Format formatting directive (@., @], @?, @ , @,, @;, @\n).  Box opens
+    // (@[ @{) and parametrised breaks (@;<>) desugar to Formatting_gen / Break
+    // with sub-formats -- not handled yet, so bail (plain-string fallback).
+    if (i + 1 >= s.size()) return nullptr;
+    char c = s[i + 1];
+    size_t consumed = 2;
+    tt::ExprBox lit;
+    if (c == '.') lit = gctor("Flush_newline", {}, g);
+    else if (c == ']') lit = gctor("Close_box", {}, g);
+    else if (c == '?') lit = gctor("FFlush", {}, g);
+    else if (c == '\n') lit = gctor("Force_newline", {}, g);
+    else if (c == ' ' || c == ',' || (c == ';' && !(i + 2 < s.size() && s[i + 2] == '<'))) {
+      std::vector<tt::ExprBox> b;
+      b.push_back(gstr(s.substr(i, 2), g));
+      b.push_back(gint(c == ',' ? 0 : 1, g));
+      b.push_back(gint(0, g));
+      lit = gctor("Break", std::move(b), g);
+    } else {
+      return nullptr;  // @@, @%, @[, @{, @}, @;<>, ... not handled
+    }
+    auto r = parse(s, i + consumed, g);
+    if (!r) return nullptr;
+    std::vector<tt::ExprBox> args;
+    args.push_back(std::move(lit));
+    args.push_back(std::move(r));
+    return gctor("Formatting_lit", std::move(args), g);
+  }
   size_t k = i;
-  while (k < s.size() && s[k] != '%') ++k;
+  while (k < s.size() && s[k] != '%' && s[k] != '@') ++k;
   auto r = parse(s, k, g);
   if (!r) return nullptr;
   std::vector<tt::ExprBox> a;
@@ -299,6 +433,22 @@ struct Typer {
     for (auto it = scopes.rbegin(); it != scopes.rend(); ++it)
       if (it->count(name)) return true;
     return false;
+  }
+  // `a |> b` (%revapply) and `b @@ a` (%apply) are rewritten by the typer to the
+  // application `b a`.  Returns 1 for an unshadowed Stdlib `|>`, 2 for `@@`, else
+  // 0 -- gated on the operator resolving to Stdlib (not a local/opened rebinding).
+  int revapply_kind(const ast::Expression& fn) {
+    auto* id = std::get_if<Pexp_ident>(&fn.desc);
+    if (!id) return 0;
+    auto* l = std::get_if<Lident>(&id->id.txt.v);
+    if (!l) return 0;
+    int kind = l->name == "|>" ? 1 : l->name == "@@" ? 2 : 0;
+    if (!kind || is_local(l->name)) return 0;
+    tt::Path p = resolve_value(id->id.txt, fn.loc.start.cnum);
+    auto* d = std::get_if<tt::Pdot>(&p.v);
+    if (!d || d->name != l->name) return 0;
+    auto* pi = std::get_if<tt::Pident>(&d->prefix->v);
+    return (pi && pi->id.name == "Stdlib") ? kind : 0;
   }
   tt::Ident fresh_type(const std::string& name) {
     tt::Ident id{name, next_stamp++, tt::Ident::Local};
@@ -723,6 +873,23 @@ struct Typer {
       }
       out.desc = std::move(tup);
     } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      // `a |> b` / `b @@ a` rewrite to the application `b a` (matching the typer's
+      // %revapply/%apply handling), but only for a 2-arg unlabelled application.
+      int rev = 0;
+      if (a->args.size() == 2 &&
+          std::holds_alternative<Nolabel>(a->args[0].first) &&
+          std::holds_alternative<Nolabel>(a->args[1].first))
+        rev = revapply_kind(*a->fn);
+      if (rev) {
+        auto& fexpr = rev == 1 ? a->args[1].second : a->args[0].second;
+        auto& aexpr = rev == 1 ? a->args[0].second : a->args[1].second;
+        tt::Texp_apply ap;
+        ap.fn = std::make_unique<tt::Expression>(expr(*fexpr));
+        ap.args.emplace_back(ArgLabel{Nolabel{}},
+                             std::make_unique<tt::Expression>(expr(*aexpr)));
+        out.desc = std::move(ap);
+        return out;
+      }
       tt::Texp_apply ap;
       ap.fn = std::make_unique<tt::Expression>(expr(*a->fn));
       // Detect a format-string argument to a qualified printf/scanf-family call
@@ -969,7 +1136,24 @@ struct Typer {
     }
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
       fn.is_cases = false;
-      fn.body = std::make_unique<tt::Expression>(expr(*fb->e));
+      auto body = std::make_unique<tt::Expression>(expr(*fb->e));
+      // A return-type annotation (`let f .. : t = e` / `fun .. : t -> e`) wraps
+      // the body in a Texp_constraint / Texp_coerce extra.
+      if (f.constraint_) {
+        tt::ExprExtra ex;
+        ex.loc = fb->e->loc;
+        if (auto* pc = std::get_if<Pconstraint>(&*f.constraint_)) {
+          ex.kind = tt::ExprExtra::Kind::Constraint;
+          ex.ctype = core_type(*pc->type);
+        } else {
+          auto& cc = std::get<Pcoerce>(*f.constraint_);
+          ex.kind = tt::ExprExtra::Kind::Coerce;
+          ex.ctype = core_type(*cc.to_);
+          if (cc.from) ex.from = core_type(**cc.from);
+        }
+        body->extras.push_back(std::move(ex));
+      }
+      fn.body = std::move(body);
     } else {
       auto& fc = std::get<Pfunction_cases>(f.body->v);
       fn.is_cases = true;
@@ -981,11 +1165,39 @@ struct Typer {
     return fn;
   }
 
+  // `let p : t = e` (a Pvc_constraint binding) wraps the pattern in a
+  // Tpat_extra_constraint and the RHS in a Texp_constraint, both at the type t.
+  // (The `: type a. t` polymorphic form involves newtypes -- left unhandled.)
+  void apply_value_constraint(tt::ValueBinding& out, const ValueBinding& vb) {
+    if (!vb.constraint_) return;
+    auto* vc = std::get_if<Pvc_constraint>(&*vb.constraint_);
+    if (!vc || !vc->univars.empty()) return;
+    // core_type may throw on a construct we don't transcribe; if so leave the
+    // binding unconstrained (a DIFF) rather than failing the whole file.
+    tt::CoreType ct1, ct2;
+    try {
+      ct1 = core_type(*vc->typ);
+      ct2 = core_type(*vc->typ);
+    } catch (const TypeError&) { return; }
+    tt::PatExtra pe;
+    pe.ctype = std::move(ct1);
+    pe.loc = out.pat.loc;
+    pe.loc.ghost = true;
+    out.pat.extras.push_back(std::move(pe));
+    tt::ExprExtra ee;
+    ee.kind = tt::ExprExtra::Kind::Constraint;
+    ee.ctype = std::move(ct2);
+    ee.loc = out.expr.loc;
+    ee.loc.ghost = true;
+    out.expr.extras.push_back(std::move(ee));
+  }
+
   tt::ValueBinding value_binding(const ValueBinding& vb) {
     tt::ValueBinding out;
     out.expr = expr(*vb.expr);  // RHS typed before the pattern is bound (non-rec)
     out.pat = pattern(vb.pat);
     out.attrs = &vb.attrs;
+    apply_value_constraint(out, vb);
     return out;
   }
 
@@ -1003,6 +1215,7 @@ struct Typer {
         b.pat = std::move(pats[i]);
         b.expr = expr(*vbs[i].expr);
         b.attrs = &vbs[i].attrs;
+        apply_value_constraint(b, vbs[i]);
         out.push_back(std::move(b));
       }
     } else {
