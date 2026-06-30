@@ -2752,9 +2752,12 @@ struct Checker {
           std::unordered_map<std::string, TypePtr> vars;
           if (strict && expected_clash(te, from_coretype(*pc->typ, vars)))
             note_error("type mismatch against declared type");
-          // value-kind pass: flow the declared type into the inferred one (so
-          // e.g. an annotated param gets its [int] kind); clashes swallowed.
-          if (record_kinds_) soft_unify(te, from_coretype(*pc->typ, vars));
+          // Flow the declared type `let x : T = e` into the inferred one (pins
+          // an under-determined result, e.g. `let why : unit -> unit = fun () ->
+          // raise Exit`).  Non-strict only (the strict pass keeps the inferred
+          // type so an incomplete-inference clash can't false-reject); soft so a
+          // stray clash can't abort the pass.
+          if (!strict) soft_unify(te, from_coretype(*pc->typ, vars));
         }
       eng.leave_level();
       // Value restriction: generalise only a non-expansive (syntactic-value) RHS,
