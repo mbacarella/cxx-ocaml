@@ -2135,6 +2135,20 @@ struct Checker {
           int ar = qualified_ctor_arity(k->id.txt);
           if (ar > 1 && (size_t)ar == tup->elems.size()) flatten_construct.insert(&p);
         }
+        // The qualified ctor's scheme pins the pattern: `Either.Left s` binds
+        // s:'a and types the scrutinee `('a, 'b) Either.t`.  Non-strict only.
+        if (TypePtr scheme = !strict ? qualified_ctor_scheme(k->id.txt) : nullptr) {
+          TypePtr result;
+          auto ps = ctor_params(scheme, result);
+          if (k->arg) {
+            auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
+            if (ps.size() > 1 && tup && tup->elems.size() == ps.size())
+              for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_pat(*tup->elems[i]));
+            else if (!ps.empty()) try_unify(ps[0], infer_pat(**k->arg));
+            else infer_pat(**k->arg);
+          }
+          return result;
+        }
         if (k->arg) infer_pat(**k->arg);
         // In the kind pass, return a fresh var (not Any) so unification against
         // the scrutinee binds it to the constructor's real type -- the back end
