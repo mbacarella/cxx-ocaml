@@ -3318,6 +3318,415 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   return vk;
 }
 
+// ---------------------------------------------------------------------------
+// Recursive-value check ("let rec" RHS validity) -- a faithful parsetree port
+// of typing/value_rec_check.ml.  A `let rec x = e` is rejected when e would need
+// x's value before it is built (e.g. `let rec x = x + 1`, `match`ing the rec var).
+//
+// SOUNDNESS DISCIPLINE (to never raise reject_parity above 0): every rule assigns
+// each variable a usage mode <= OCaml's, and classifies an expression Dynamic
+// only where OCaml certainly does.  Unhandled forms contribute the empty
+// environment (mode Ignore) and classify Static -- both under-approximations.
+// So we reject a strict SUBSET of what OCaml rejects: no false rejections.
+namespace valrec {
+
+// Ignore < Delay < Guard < Return < Dereference  (rank = the enum value).
+enum Mode { Ignore = 0, Delay = 1, Guard = 2, Return = 3, Dereference = 4 };
+
+inline Mode mode_join(Mode a, Mode b) { return a >= b ? a : b; }
+// compose m' m  (typing/value_rec_check.ml Mode.compose).
+inline Mode mode_compose(Mode mp, Mode m) {
+  if (mp == Ignore || m == Ignore) return Ignore;
+  if (mp == Dereference) return Dereference;
+  if (mp == Delay) return Delay;
+  if (mp == Guard) return m == Return ? Guard : m;   // m in {Deref,Guard,Delay}
+  return m;                                           // mp == Return
+}
+
+using Env = std::unordered_map<std::string, Mode>;
+inline void env_join_into(Env& dst, const Env& src) {
+  for (auto& [k, v] : src) { auto& d = dst[k]; d = mode_join(d, v); }
+}
+inline Env env_compose(Mode m, const Env& e) {
+  Env out;
+  for (auto& [k, v] : e) out[k] = mode_compose(m, v);
+  return out;
+}
+
+// Names a pattern binds (for shadowing/removal); the rec group's idlist too.
+void pat_names(const Pattern& p, std::vector<std::string>& out) {
+  if (auto* v = std::get_if<Ppat_var>(&p.desc)) out.push_back(v->name.txt);
+  else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) { pat_names(*a->p, out); out.push_back(a->name.txt); }
+  else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) { for (auto& e : t->elems) pat_names(*e, out); }
+  else if (auto* a = std::get_if<Ppat_array>(&p.desc)) { for (auto& e : a->elems) pat_names(*e, out); }
+  else if (auto* c = std::get_if<Ppat_construct>(&p.desc)) { if (c->arg) pat_names(**c->arg, out); }
+  else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) { if (v->arg) pat_names(**v->arg, out); }
+  else if (auto* r = std::get_if<Ppat_record>(&p.desc)) { for (auto& f : r->fields) pat_names(*f.second, out); }
+  else if (auto* o = std::get_if<Ppat_or>(&p.desc)) { pat_names(*o->l, out); }  // both arms bind the same
+  else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) pat_names(*c->p, out);
+  else if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) pat_names(*l->p, out);
+  else if (auto* op = std::get_if<Ppat_open>(&p.desc)) pat_names(*op->p, out);
+  else if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) pat_names(*ex->p, out);
+  else if (auto* ef = std::get_if<Ppat_effect>(&p.desc)) { pat_names(*ef->eff, out); pat_names(*ef->cont, out); }
+}
+// A destructuring pattern places its scrutinee in Dereference (else Guard).
+// Unknown patterns default to NON-destructuring (Guard) -- the safe under-mode.
+bool is_destructuring(const Pattern& p) {
+  if (std::holds_alternative<Ppat_constant>(p.desc) ||
+      std::holds_alternative<Ppat_interval>(p.desc) ||
+      std::holds_alternative<Ppat_tuple>(p.desc) ||
+      std::holds_alternative<Ppat_construct>(p.desc) ||
+      std::holds_alternative<Ppat_variant>(p.desc) ||
+      std::holds_alternative<Ppat_record>(p.desc) ||
+      std::holds_alternative<Ppat_array>(p.desc) ||
+      std::holds_alternative<Ppat_lazy>(p.desc)) return true;
+  if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return is_destructuring(*a->p);
+  if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return is_destructuring(*c->p);
+  if (auto* o = std::get_if<Ppat_open>(&p.desc)) return is_destructuring(*o->p);
+  if (auto* o = std::get_if<Ppat_or>(&p.desc)) return is_destructuring(*o->l) || is_destructuring(*o->r);
+  return false;  // any / var / exception / unpack / unknown
+}
+
+enum SD { Static, Dynamic };
+
+// `ref e` (the Stdlib primitive): the argument is only Guarded, and the result
+// has a statically-known size (Static).  Matching by name is a safe
+// under-approximation -- a shadowing `ref` only makes us reject LESS.
+inline bool is_ref_apply(const Pexp_apply& a) {
+  if (a.args.size() != 1) return false;
+  auto* id = std::get_if<Pexp_ident>(&a.fn->desc);
+  if (!id) return false;
+  auto* li = std::get_if<Lident>(&id->id.txt.v);
+  return li && li->name == "ref";
+}
+
+struct RecCheck {
+  // classify-env: simple let-bound var -> its size (Static/Dynamic).  A var not
+  // here classifies Dynamic (OCaml) -- but to stay sound against our own gaps we
+  // only trust a recorded Static; an absent var is treated Static (under).
+  // (See classify_ident.)
+  std::unordered_map<std::string, SD> csize;
+
+  // pattern mode: how the bound value of `pat` is used, given env of its body.
+  Mode pattern_mode(const Pattern& pat, const Env& env) {
+    Mode m = is_destructuring(pat) ? Dereference : Guard;
+    std::vector<std::string> ns; pat_names(pat, ns);
+    for (auto& n : ns) { auto it = env.find(n); if (it != env.end()) m = mode_join(m, it->second); }
+    return m;
+  }
+
+  // --- classify (static or dynamic size) ---
+  SD classify(const Expression& e) {
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      auto saved = csize;
+      for (auto& b : l->bindings)
+        if (auto* v = std::get_if<Ppat_var>(&b.pat.desc)) csize[v->name.txt] = classify(*b.expr);
+      SD r = classify(*l->body);
+      csize = std::move(saved);
+      return r;
+    }
+    if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
+      if (auto* li = std::get_if<Lident>(&id->id.txt.v)) {
+        auto it = csize.find(li->name);
+        if (it != csize.end()) return it->second;
+      }
+      return Static;  // not-found: OCaml says Dynamic, but Static is the safe under-classify
+    }
+    if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) return classify(*s->e2);
+    if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) return classify(*c->e);
+    if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) return classify(*c->e);
+    if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) return classify(*nt->body);
+    if (auto* p = std::get_if<Pexp_poly>(&e.desc)) return classify(*p->e);
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) return classify(*si->body);
+    // An application is Dynamic only when fully positional: a `ref e` is Static,
+    // and a partial/labelled application may be a closure (Static) -- so any
+    // labelled-argument application is classified Static (the safe under-mode).
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      if (is_ref_apply(*a)) return Static;
+      for (auto& [lbl, _] : a->args)
+        if (!std::holds_alternative<Nolabel>(lbl)) return Static;
+      return Dynamic;
+    }
+    // Certainly-Dynamic forms (must be a SUBSET of OCaml's, else we over-reject).
+    if (std::holds_alternative<Pexp_ifthenelse>(e.desc) ||
+        std::holds_alternative<Pexp_match>(e.desc) ||
+        std::holds_alternative<Pexp_try>(e.desc) ||
+        std::holds_alternative<Pexp_field>(e.desc) ||
+        std::holds_alternative<Pexp_send>(e.desc) ||
+        std::holds_alternative<Pexp_assert>(e.desc) ||
+        std::holds_alternative<Pexp_new>(e.desc) ||
+        std::holds_alternative<Pexp_letop>(e.desc) ||
+        std::holds_alternative<Pexp_object>(e.desc) ||
+        std::holds_alternative<Pexp_override>(e.desc))
+      return Dynamic;
+    return Static;  // construct/record/tuple/function/array/lazy/.../unknown
+  }
+
+  // --- usage-mode judgment: expression -> (mode -> Env) ---
+  Env J(const Expression& e, Mode m) {
+    if (m == Ignore) return {};
+    if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
+      if (auto* li = std::get_if<Lident>(&id->id.txt.v)) return {{li->name, m}};
+      return {};  // qualified path: head is a module, never a rec value var
+    }
+    if (std::holds_alternative<Pexp_constant>(e.desc)) return {};
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) return let_judg(*l, m);
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      if (is_ref_apply(*a)) return J(*a->args[0].second, mode_compose(m, Guard));
+      bool positional = true;
+      for (auto& [lbl, _] : a->args) if (!std::holds_alternative<Nolabel>(lbl)) positional = false;
+      Mode fmode = a->args.empty() ? Guard : (positional ? Dereference : Guard);
+      Mode amode = positional ? Dereference : Guard;  // omitted/labelled -> safe under (Guard)
+      Env env = J(*a->fn, mode_compose(m, fmode));
+      for (auto& [_, arg] : a->args) env_join_into(env, J(*arg, mode_compose(m, amode)));
+      return env;
+    }
+    if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
+      Env env; for (auto& el : t->elems) env_join_into(env, J(*el, mode_compose(m, Guard)));
+      return env;
+    }
+    if (auto* c = std::get_if<Pexp_construct>(&e.desc))
+      return c->arg ? J(**c->arg, mode_compose(m, Guard)) : Env{};
+    if (auto* v = std::get_if<Pexp_variant>(&e.desc))
+      return v->arg ? J(**v->arg, mode_compose(m, Guard)) : Env{};
+    if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
+      Env env;
+      for (auto& [_, ev] : r->fields) env_join_into(env, J(*ev, mode_compose(m, Guard)));
+      if (r->base) env_join_into(env, J(**r->base, mode_compose(m, Dereference)));
+      return env;
+    }
+    if (auto* f = std::get_if<Pexp_field>(&e.desc)) return J(*f->e, mode_compose(m, Dereference));
+    if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
+      Env env = J(*s->obj, mode_compose(m, Dereference));
+      env_join_into(env, J(*s->value, mode_compose(m, Dereference)));
+      return env;
+    }
+    if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      Env env = J(*i->cond, mode_compose(m, Dereference));
+      env_join_into(env, J(*i->then_, m));
+      if (i->else_) env_join_into(env, J(**i->else_, m));
+      return env;
+    }
+    if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
+      Env env = J(*s->e1, mode_compose(m, Guard));
+      env_join_into(env, J(*s->e2, m));
+      return env;
+    }
+    if (auto* w = std::get_if<Pexp_while>(&e.desc)) {
+      Env env = J(*w->cond, mode_compose(m, Dereference));
+      env_join_into(env, J(*w->body, mode_compose(m, Guard)));
+      return env;
+    }
+    if (auto* fo = std::get_if<Pexp_for>(&e.desc)) {
+      Env env = J(*fo->lo, mode_compose(m, Dereference));
+      env_join_into(env, J(*fo->hi, mode_compose(m, Dereference)));
+      Env body = J(*fo->body, mode_compose(m, Guard));
+      std::vector<std::string> ns; pat_names(fo->var, ns);
+      for (auto& n : ns) body.erase(n);
+      env_join_into(env, body);
+      return env;
+    }
+    if (auto* mt = std::get_if<Pexp_match>(&e.desc)) return match_judg(*mt->e, mt->cases, m);
+    if (auto* tr = std::get_if<Pexp_try>(&e.desc)) {
+      Env env = J(*tr->e, m);
+      for (auto& c : tr->cases) { Mode sm; env_join_into(env, case_env(c, m, sm)); }
+      return env;
+    }
+    if (auto* f = std::get_if<Pexp_function>(&e.desc)) return function_judg(*f, m);
+    if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) return J(*lz->e, mode_compose(m, Delay));
+    if (auto* as = std::get_if<Pexp_assert>(&e.desc)) return J(*as->e, mode_compose(m, Dereference));
+    if (auto* sd = std::get_if<Pexp_send>(&e.desc)) return J(*sd->obj, mode_compose(m, Dereference));
+    if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) return J(*c->e, m);
+    if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) return J(*c->e, m);
+    if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) return J(*nt->body, m);
+    if (auto* p = std::get_if<Pexp_poly>(&e.desc)) return J(*p->e, m);
+    if (auto* ar = std::get_if<Pexp_array>(&e.desc)) {
+      Env env; for (auto& el : ar->elems) env_join_into(env, J(*el, mode_compose(m, Guard)));
+      return env;
+    }
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) return J(*si->body, m);
+    return {};  // letop / object / new / override / pack / extension / ... -> Ignore (safe under)
+  }
+
+  // case body+guard env at mode m, with the pattern's bound names removed; sets
+  // scrut_mode = the mode the matched value (scrutinee) is placed in.
+  Env case_env(const Case& c, Mode m, Mode& scrut_mode) {
+    Env env = J(*c.rhs, m);
+    if (c.guard) env_join_into(env, J(**c.guard, mode_compose(m, Dereference)));
+    scrut_mode = mode_compose(m, pattern_mode(c.lhs, env));
+    std::vector<std::string> ns; pat_names(c.lhs, ns);
+    for (auto& n : ns) env.erase(n);
+    return env;
+  }
+
+  Env match_judg(const Expression& scrut, const std::vector<Case>& cases, Mode m) {
+    Env env; Mode sjoin = Ignore;
+    for (auto& c : cases) { Mode sm; env_join_into(env, case_env(c, m, sm)); sjoin = mode_join(sjoin, sm); }
+    env_join_into(env, J(scrut, sjoin));
+    return env;
+  }
+
+  Env function_judg(const Pexp_function& f, Mode m) {
+    Mode inner = mode_compose(m, Delay);
+    Env env;
+    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) env = J(*fb->e, inner);
+    else {
+      auto& fc = std::get<Pfunction_cases>(f.body->v);
+      for (auto& c : fc.cases) { Mode sm; env_join_into(env, case_env(c, inner, sm)); }
+    }
+    std::vector<std::string> ns;
+    for (auto& param : f.params)
+      if (auto* pv = std::get_if<Pparam_val>(&param.desc)) {
+        if (pv->default_) env_join_into(env, J(**pv->default_, inner));
+        pat_names(pv->pat, ns);
+      }
+    for (auto& n : ns) env.erase(n);
+    return env;
+  }
+
+  Env let_judg(const Pexp_let& l, Mode m) {
+    std::vector<std::string> bound;
+    for (auto& b : l.bindings) pat_names(b.pat, bound);
+    Env body_env = J(*l.body, m);
+    Env out = body_env;
+    for (auto& n : bound) out.erase(n);
+    if (l.rf == RecFlag::Nonrecursive) {
+      for (auto& b : l.bindings) {
+        Mode mb = pattern_mode(b.pat, body_env);
+        Env rhs = J(*b.expr, mode_compose(m, mb));
+        std::vector<std::string> ns; pat_names(b.pat, ns);
+        for (auto& n : ns) rhs.erase(n);
+        env_join_into(out, rhs);
+      }
+      return out;
+    }
+    // Recursive: least-fixpoint transitive closure (value_rec_check value_bindings).
+    size_t n = l.bindings.size();
+    std::vector<Env> g(n);                       // immediate deps (binders removed)
+    std::vector<std::vector<Mode>> mdef(n, std::vector<Mode>(n, Ignore));
+    for (size_t i = 0; i < n; ++i) {
+      Mode mb = pattern_mode(l.bindings[i].pat, body_env);
+      Env rhs = J(*l.bindings[i].expr, mode_compose(m, mb));   // siblings in scope
+      for (size_t j = 0; j < n; ++j) mdef[i][j] = pattern_mode(l.bindings[j].pat, rhs);
+      for (auto& bn : bound) rhs.erase(bn);
+      g[i] = std::move(rhs);
+    }
+    std::vector<Env> gp = g;
+    for (size_t iter = 0; iter < n * 5 + 8; ++iter) {
+      std::vector<Env> nxt(n);
+      bool changed = false;
+      for (size_t i = 0; i < n; ++i) {
+        Env e = g[i];
+        for (size_t j = 0; j < n; ++j) env_join_into(e, env_compose(mdef[i][j], gp[j]));
+        if (e != gp[i]) changed = true;
+        nxt[i] = std::move(e);
+      }
+      gp = std::move(nxt);
+      if (!changed) break;
+    }
+    for (auto& e : gp) env_join_into(out, e);
+    return out;
+  }
+
+  // is_valid_recursive_expression: false => the binding RHS is an illegal let-rec.
+  bool valid(const std::vector<std::string>& idlist, const Expression& rhs) {
+    if (std::holds_alternative<Pexp_function>(rhs.desc)) return true;  // fast path
+    csize.clear();
+    SD sd = classify(rhs);
+    Env env = J(rhs, Return);
+    Mode threshold = sd == Static ? Guard : Ignore;  // reject if any id mode > threshold
+    for (auto& id : idlist) {
+      auto it = env.find(id);
+      if (it != env.end() && it->second > threshold) return false;
+    }
+    return true;
+  }
+};
+
+// Walk the structure; check every `let rec` group (top-level and nested).
+struct Walk {
+  std::vector<std::string>* errs;
+  RecCheck rc;
+  void check_group(const std::vector<ValueBinding>& bindings) {
+    std::vector<std::string> idlist;
+    for (auto& b : bindings) pat_names(b.pat, idlist);
+    for (auto& b : bindings)
+      if (!rc.valid(idlist, *b.expr)) {
+        errs->push_back("This kind of expression is not allowed as "
+                        "right-hand side of `let rec'");
+        break;  // one error per group is enough for the accept/reject gate
+      }
+  }
+  void w_expr(const Expression& e) {
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      if (l->rf == RecFlag::Recursive) check_group(l->bindings);
+      for (auto& b : l->bindings) w_expr(*b.expr);
+      w_expr(*l->body);
+      return;
+    }
+    // Recurse into all sub-expressions to find nested `let rec`s.
+    visit_subexprs(e, [&](const Expression& s) { w_expr(s); });
+  }
+  template <class F> void visit_subexprs(const Expression& e, F f);
+  void w_item(const StructureItem& it);
+};
+
+template <class F> void Walk::visit_subexprs(const Expression& e, F f) {
+  auto go = [&](const ExprBox& b) { f(*b); };
+  auto opt = [&](const std::optional<ExprBox>& b) { if (b) f(**b); };
+  if (auto* a = std::get_if<Pexp_apply>(&e.desc)) { go(a->fn); for (auto& [_, x] : a->args) go(x); }
+  else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) { for (auto& x : t->elems) go(x); }
+  else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) { go(i->cond); go(i->then_); opt(i->else_); }
+  else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) { if (c->arg) f(**c->arg); }
+  else if (auto* m = std::get_if<Pexp_match>(&e.desc)) { go(m->e); for (auto& c : m->cases) { f(*c.rhs); if (c.guard) f(**c.guard); } }
+  else if (auto* tr = std::get_if<Pexp_try>(&e.desc)) { go(tr->e); for (auto& c : tr->cases) { f(*c.rhs); if (c.guard) f(**c.guard); } }
+  else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) { go(s->e1); go(s->e2); }
+  else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) go(c->e);
+  else if (auto* fld = std::get_if<Pexp_field>(&e.desc)) go(fld->e);
+  else if (auto* r = std::get_if<Pexp_record>(&e.desc)) { for (auto& [_, x] : r->fields) go(x); if (r->base) f(**r->base); }
+  else if (auto* as = std::get_if<Pexp_assert>(&e.desc)) go(as->e);
+  else if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) go(lz->e);
+  else if (auto* w = std::get_if<Pexp_while>(&e.desc)) { go(w->cond); go(w->body); }
+  else if (auto* fo = std::get_if<Pexp_for>(&e.desc)) { go(fo->lo); go(fo->hi); go(fo->body); }
+  else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) { if (v->arg) f(**v->arg); }
+  else if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) go(nt->body);
+  else if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) { w_item(*si->item); go(si->body); }
+  else if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) { go(sf->obj); go(sf->value); }
+  else if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) go(co->e);
+  else if (auto* sd = std::get_if<Pexp_send>(&e.desc)) go(sd->obj);
+  else if (auto* fn = std::get_if<Pexp_function>(&e.desc)) {
+    for (auto& p : fn->params) if (auto* pv = std::get_if<Pparam_val>(&p.desc)) if (pv->default_) f(**pv->default_);
+    if (auto* fb = std::get_if<Pfunction_body>(&fn->body->v)) go(fb->e);
+    else { auto& fc = std::get<Pfunction_cases>(fn->body->v); for (auto& c : fc.cases) { f(*c.rhs); if (c.guard) f(**c.guard); } }
+  }
+  else if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) { go(lo->let_.exp); for (auto& a : lo->ands) go(a.exp); go(lo->body); }
+  else if (auto* p = std::get_if<Pexp_poly>(&e.desc)) go(p->e);
+  else if (auto* ov = std::get_if<Pexp_override>(&e.desc)) { for (auto& [_, x] : ov->fields) go(x); }
+  // Pexp_let handled by the caller; ident/constant/pack/object/new/extension/unreachable: no sub-exprs to walk
+}
+
+void Walk::w_item(const StructureItem& it) {
+  if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+    if (v->rf == RecFlag::Recursive) check_group(v->bindings);
+    for (auto& b : v->bindings) w_expr(*b.expr);
+  } else if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
+    w_expr(*e->e);
+  } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+    // descend into a submodule's structure body if present
+    if (auto* st = std::get_if<Pmod_structure>(&m->binding.expr.desc))
+      for (auto& sit : st->items) w_item(sit);
+  }
+}
+
+std::vector<std::string> value_rec_errors(const ast::Structure& s) {
+  std::vector<std::string> errs;
+  Walk w; w.errs = &errs;
+  for (auto& it : s) w.w_item(it);
+  return errs;
+}
+
+}  // namespace valrec
+
 // Strict type-check: returns the definite type errors found (empty => accepted).
 // Conservative — only DEFINITE errors (unqualified unbound value, type clash);
 // unknown/unsupported constructs and qualified names are assumed OK so that
@@ -3327,6 +3736,8 @@ std::vector<std::string> structure_typecheck(const ast::Structure& s) {
   Checker ck;
   ck.strict = true;
   run_checker(ck, s);
+  auto vr = valrec::value_rec_errors(s);
+  for (auto& e : vr) ck.errors.push_back(std::move(e));
   return std::move(ck.errors);
 }
 
