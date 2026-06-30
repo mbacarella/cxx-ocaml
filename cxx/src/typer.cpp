@@ -370,6 +370,12 @@ struct Typer {
   // the Record_float representation, like a bare-`float` record.
   std::set<std::string> float_abbrevs_;
 
+  // Locally-declared constructors of arity > 1 (`C of t1 * t2`): name -> arity.
+  // A constructor of arity n applied to an n-tuple flattens its argument in the
+  // typedtree (`C (a, b)` -> args [a; b]).  Keyed by simple name; external
+  // (cmi) constructors aren't here, so they keep the single (tuple) argument.
+  std::unordered_map<std::string, int> ctor_arity_;
+
   static std::string lid_last(const Longident& x) {
     if (auto* p = std::get_if<Lident>(&x.v)) return p->name;
     if (auto* p = std::get_if<Ldot>(&x.v)) return p->name;
@@ -665,6 +671,8 @@ struct Typer {
     out.id = fresh_anon(c.name.txt);
     out.args = ctor_args(c.args);
     if (c.res) out.res = std::make_unique<tt::CoreType>(core_type(**c.res));
+    if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
+      if (t->elems.size() > 1) ctor_arity_[c.name.txt] = (int)t->elems.size();
     return out;
   }
 
@@ -843,10 +851,18 @@ struct Typer {
     return lid_str(*a.f) + '(' + lid_str(*a.x) + ')';
   }
 
-  // A constructor of arity>1 applied to a literal tuple flattens its arguments
-  // in the typedtree.  Only `::` is arity-2 among the constructors we resolve
-  // without Env; everything else keeps a single (possibly tuple) argument.
-  static bool flattens(const std::string& name) { return name == "::"; }
+  // A constructor of arity>1 applied to an n-tuple flattens its arguments in the
+  // typedtree.  `::` is always arity-2; other multi-arg constructors are looked
+  // up in ctor_arity_ (local declarations) by simple name, requiring the tuple
+  // size to match the arity.  Unknown (external) constructors keep one argument.
+  bool flattens(const std::string& name, size_t tuple_n) {
+    if (name == "::") return true;
+    size_t dot = name.rfind('.');
+    auto it = ctor_arity_.find(dot == std::string::npos ? name
+                                                        : name.substr(dot + 1));
+    return it != ctor_arity_.end() && it->second > 1 &&
+           (size_t)it->second == tuple_n;
+  }
 
   tt::Pattern pattern(const Pattern& p) {
     tt::Pattern out;
@@ -863,7 +879,10 @@ struct Typer {
       tc.name = lid_str(k->id.txt);
       if (k->arg) {
         auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
-        if (tup && flattens(tc.name)) {
+        bool plain = tup && tup->closed == ClosedFlag::Closed &&
+                     std::none_of(tup->labels.begin(), tup->labels.end(),
+                                  [](auto& l) { return l.has_value(); });
+        if (plain && flattens(tc.name, tup->elems.size())) {
           for (auto& el : tup->elems)
             tc.args.push_back(std::make_unique<tt::Pattern>(pattern(*el)));
         } else {
@@ -1085,7 +1104,10 @@ struct Typer {
       tc.name = lid_str(k->id.txt);
       if (k->arg) {
         auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
-        if (tup && flattens(tc.name)) {
+        bool plain = tup &&
+                     std::none_of(tup->labels.begin(), tup->labels.end(),
+                                  [](auto& l) { return l.has_value(); });
+        if (plain && flattens(tc.name, tup->elems.size())) {
           for (auto& el : tup->elems)
             tc.args.push_back(std::make_unique<tt::Expression>(expr(*el)));
         } else {
