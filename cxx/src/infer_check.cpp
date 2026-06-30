@@ -147,6 +147,10 @@ struct Checker {
   // The binding name of a `module M = F(Arg)` currently being elaborated, used to
   // name F's abstract result types `M.t` (so `M.empty : M.t`).
   std::string func_bind_name_;
+  // True while translating a functor RESULT signature: from_cmi then keeps the
+  // result's abbreviation types abstract+qualified (`elt` -> `IntSet.elt`) rather
+  // than expanding their `= Ord.t` manifest.
+  bool func_result_mode_ = false;
   int tenv_lookup(const std::string& name) {
     for (auto it = tenv.rbegin(); it != tenv.rend(); ++it) {
       auto f = it->find(name);
@@ -330,8 +334,10 @@ struct Checker {
       case cmi::TypeExpr::Texpand: {
         std::string p = n->path ? cmi_path_str(*n->path) : "?";
         if (is_format_base(p)) { std::vector<TypePtr> fa; for (auto& a : n->args) fa.push_back(from_cmi(a, memo)); return eng.constr("format6", std::move(fa)); }
-        // expand a same-module type abbreviation (Float.t = float, Int.t = int)
-        if (cmi_types_ctx_ && n->path && n->path->kind == cmi::Path::Pident &&
+        // expand a same-module type abbreviation (Float.t = float, Int.t = int) --
+        // but NOT in a functor result, where `elt = Ord.t` stays the abstract,
+        // binding-qualified name (`IntSet.elt`), not its expansion.
+        if (!func_result_mode_ && cmi_types_ctx_ && n->path && n->path->kind == cmi::Path::Pident &&
             !cmi_expanding_.count(n->path->id.name))
           for (auto& td : *cmi_types_ctx_)
             if (td.name == n->path->id.name && td.manifest &&
@@ -771,7 +777,8 @@ struct Checker {
         // keeps fully-generic schemes (which never clash); the value-kinds and
         // signature passes get the real, M-qualified types.
         bool real = !strict && !func_bind_name_.empty();
-        if (real) { cmi_types_ctx_ = &cur->sig->types; cmi_mod_prefix_ = func_bind_name_; }
+        if (real) { cmi_types_ctx_ = &cur->sig->types; cmi_mod_prefix_ = func_bind_name_;
+                    func_result_mode_ = true; }
         for (auto& v : cur->sig->values) {
           if (real && v.type) {
             std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
@@ -780,9 +787,9 @@ struct Checker {
             out[v.name] = generic_var();
           }
         }
-        cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
+        cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); func_result_mode_ = false;
       }
-    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
+    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); func_result_mode_ = false; }
     return out;
   }
 
