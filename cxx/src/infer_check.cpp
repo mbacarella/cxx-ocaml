@@ -144,6 +144,9 @@ struct Checker {
   // "Float_record."), so a record type defined there is named `Float_record.s`
   // -- its rendered path, NOT its identity (the stamp is unchanged).
   std::string mod_prefix_;
+  // The binding name of a `module M = F(Arg)` currently being elaborated, used to
+  // name F's abstract result types `M.t` (so `M.empty : M.t`).
+  std::string func_bind_name_;
   int tenv_lookup(const std::string& name) {
     for (auto it = tenv.rbegin(); it != tenv.rend(); ++it) {
       auto f = it->find(name);
@@ -756,19 +759,25 @@ struct Checker {
       const cmi::ModuleType* cur = mt;
       for (int i = 0; i < napp && cur; ++i)
         cur = (cur->kind == cmi::ModuleType::Functor) ? cur->functor_body.get() : nullptr;
-      if (cur && cur->kind == cmi::ModuleType::Sig && cur->sig)
+      if (cur && cur->kind == cmi::ModuleType::Sig && cur->sig) {
+        // Name the result's abstract types after the binding (`M.t`), by
+        // translating the value schemes with the result sig as the same-module
+        // context and the binding name as the prefix.  The strict reject pass
+        // keeps fully-generic schemes (which never clash); the value-kinds and
+        // signature passes get the real, M-qualified types.
+        bool real = !strict && !func_bind_name_.empty();
+        if (real) { cmi_types_ctx_ = &cur->sig->types; cmi_mod_prefix_ = func_bind_name_; }
         for (auto& v : cur->sig->values) {
-          // The value-kind pass wants each member's real type (so a concrete
-          // return like `mem : .. -> bool` yields the [int] kind); the strict
-          // reject pass keeps fully-generic schemes, which never clash.
-          if (record_kinds_ && v.type) {
+          if (real && v.type) {
             std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
             out[v.name] = from_cmi(v.type, memo);
           } else {
             out[v.name] = generic_var();
           }
         }
-    } catch (...) {}
+        cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
+      }
+    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
     return out;
   }
 
@@ -3256,7 +3265,9 @@ struct Checker {
               for (auto& [k, v] : ex) v = generic_var();
               functor_env[*mb->binding.name.txt] = std::move(ex);
             } else {
+              func_bind_name_ = *mb->binding.name.txt;
               modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
+              func_bind_name_.clear();
             }
           }
         } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
