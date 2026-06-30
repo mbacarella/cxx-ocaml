@@ -274,6 +274,17 @@ struct Checker {
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modenv;
   // local functor name -> its body's exported value schemes (F(X) result)
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> functor_env;
+  // A LOCAL functor `module F (P : PS) : RS = ..` with an explicit result
+  // signature RS: enough to INSTANTIATE the result on application `F(Arg)` by
+  // substituting the parameter's types (`P.t`) with the argument's, instead of
+  // collapsing the result to generic vars.  param = P, param_sig = PS, result =
+  // RS.  (Non-strict passes only.)
+  struct FunctorDef { std::string param; const ast::ModuleType* param_sig = nullptr;
+                      const ast::ModuleType* result_sig = nullptr; };
+  std::unordered_map<std::string, FunctorDef> functor_defs_;
+  std::unordered_map<std::string, TypePtr> functor_param_subst_;     // "Elem.t" -> arg type
+  std::unordered_map<std::string, TypePtr> functor_result_abstract_; // RS's bare "t" -> fresh var
+  std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
   // local module-type name -> its signature's value names (first-class modules):
@@ -335,6 +346,11 @@ struct Checker {
       case cmi::TypeExpr::Tconstr:
       case cmi::TypeExpr::Texpand: {
         std::string p = n->path ? cmi_path_str(*n->path) : "?";
+        // Substituting a cmi modtype's abstract type (OrderedType's `t`) with the
+        // functor argument's type during param-signature value loading.
+        if (!cmi_abstract_subst_.empty() && n->path && n->path->kind == cmi::Path::Pident)
+          if (auto s = cmi_abstract_subst_.find(n->path->id.name); s != cmi_abstract_subst_.end())
+            return s->second;
         if (is_format_base(p)) { std::vector<TypePtr> fa; for (auto& a : n->args) fa.push_back(from_cmi(a, memo)); return eng.constr("format6", std::move(fa)); }
         // expand a same-module type abbreviation (Float.t = float, Int.t = int) --
         // but NOT in a functor result, where `elt = Ord.t` stays the abstract,
@@ -473,8 +489,21 @@ struct Checker {
       // manifest, like the cmi-side Texpand path -- otherwise an annotation
       // stays an opaque constr and clashes with the cmi-expanded form (Seq.t's
       // manifest is the *arrow* unit -> 'a node).
+      // Inside a functor instantiation: a qualified `Elem.t` (the parameter's
+      // type) substitutes to the argument's corresponding type.
+      if (!functor_param_subst_.empty())
+        if (auto s = functor_param_subst_.find(lid_full(c->id.txt));
+            s != functor_param_subst_.end())
+          return s->second;
       if (std::holds_alternative<Ldot>(c->id.txt.v))
         if (TypePtr r = expand_qualified_abbrev(c->id.txt, as)) return r;
+      // Inside a functor-result-signature instantiation: a bare name that is one
+      // of RS's own abstract types resolves to the per-instantiation fresh var.
+      if (!functor_result_abstract_.empty())
+        if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+          if (auto s = functor_result_abstract_.find(l->name);
+              s != functor_result_abstract_.end())
+            return s->second;
       // A bare reference to a local opaque type carries its identity stamp.
       int stamp = 0;
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
@@ -748,6 +777,115 @@ struct Checker {
       } catch (...) { return nullptr; }
     }
     return nullptr;
+  }
+
+  // Instantiate a local functor `F(Arg)` from its stored result signature RS,
+  // substituting the parameter's types with the argument's: `module Heap (Elem :
+  // OrderedType) : sig type t val add : t -> Elem.t -> unit .. end` applied to
+  // `struct type t = a .. end` yields `add : t0 -> a -> unit` (Elem.t -> a, RS's
+  // own `t` -> a shared fresh var t0).  Non-strict only.  Returns {} to fall
+  // back to the generic-var behaviour when it can't instantiate.
+  std::unordered_map<std::string, TypePtr> instantiate_local_functor(
+      const FunctorDef& fd, const ModuleExpr& argExpr) {
+    if (strict || !fd.result_sig) return {};
+    // The argument's type definitions: `type X = T` -> from_coretype(T); an
+    // abstract `type X` -> a fresh var.
+    const ModuleExpr* arg = &argExpr;
+    while (auto* mc = std::get_if<Pmod_constraint>(&arg->desc)) arg = mc->me.get();
+    auto* as = std::get_if<Pmod_structure>(&arg->desc);
+    if (!as) return {};
+    std::unordered_map<std::string, TypePtr> argtypes;
+    for (auto& it : as->items)
+      if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+        for (auto& d : ty->decls) {
+          std::unordered_map<std::string, TypePtr> v;
+          argtypes[d.name.txt] = d.manifest ? from_coretype(**d.manifest, v)
+                                            : eng.fresh_var();
+        }
+    // Set up the substitutions: `Param.X` -> argtypes[X]; RS's own abstract types
+    // -> shared fresh vars.
+    auto saved_subst = functor_param_subst_;
+    auto saved_abstract = functor_result_abstract_;
+    for (auto& [k, v] : argtypes) functor_param_subst_[fd.param + "." + k] = v;
+    auto* rs = std::get_if<Pmty_signature>(&fd.result_sig->desc);
+    for (auto& it : rs->items)
+      if (auto* t = std::get_if<Psig_type>(&it.desc))
+        for (auto& d : t->decls) functor_result_abstract_[d.name.txt] = eng.fresh_var();
+    std::unordered_map<std::string, TypePtr> out;
+    for (auto& it : rs->items)
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+        std::unordered_map<std::string, TypePtr> vars;
+        out[v->vd.name.txt] = from_coretype(*v->vd.type, vars);
+      }
+    functor_param_subst_ = std::move(saved_subst);
+    functor_result_abstract_ = std::move(saved_abstract);
+    // Tie the argument's values to the parameter signature's expected types
+    // (struct `compare = cmp` vs OrderedType's `compare : t -> t -> int`, t = the
+    // arg's t) so `cmp` gets `a -> a -> int`, not a free var.
+    if (fd.param_sig) {
+      auto argvals = module_exports(*arg);
+      auto psvals = param_sig_value_schemes(*fd.param_sig, argtypes);
+      for (auto& [nm, expected] : psvals)
+        if (auto f = argvals.find(nm); f != argvals.end()) try_unify(f->second, expected);
+    }
+    return out;
+  }
+
+  // A parameter signature PS's value name -> expected type, with PS's abstract
+  // types substituted by the functor argument's (`t` -> the arg's t).  PS may be
+  // an inline `sig .. end`, a cmi module-type ident (Map.OrderedType), or `S with`.
+  std::unordered_map<std::string, TypePtr> param_sig_value_schemes(
+      const ModuleType& ps, const std::unordered_map<std::string, TypePtr>& argtypes) {
+    std::unordered_map<std::string, TypePtr> out;
+    if (auto* sg = std::get_if<Pmty_signature>(&ps.desc)) {
+      auto saved = functor_result_abstract_;
+      for (auto& it : sg->items)
+        if (auto* t = std::get_if<Psig_type>(&it.desc))
+          for (auto& d : t->decls)
+            if (auto a = argtypes.find(d.name.txt); a != argtypes.end())
+              functor_result_abstract_[d.name.txt] = a->second;
+      for (auto& it : sg->items)
+        if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+          std::unordered_map<std::string, TypePtr> vars;
+          out[v->vd.name.txt] = from_coretype(*v->vd.type, vars);
+        }
+      functor_result_abstract_ = std::move(saved);
+    } else if (auto* mi = std::get_if<Pmty_ident>(&ps.desc)) {
+      out = cmi_modtype_value_schemes(mi->id.txt, argtypes);
+    } else if (auto* mw = std::get_if<Pmty_with>(&ps.desc)) {
+      return param_sig_value_schemes(*mw->mt, argtypes);
+    }
+    return out;
+  }
+
+  // Value schemes of a cmi module type `M.S` (e.g. Map.OrderedType), with its
+  // abstract types substituted by the functor argument's types.
+  std::unordered_map<std::string, TypePtr> cmi_modtype_value_schemes(
+      const Longident& path, const std::unordered_map<std::string, TypePtr>& argtypes) {
+    std::unordered_map<std::string, TypePtr> out;
+    auto comps = mod_components(path);
+    if (comps.empty()) return out;
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {  // navigate submodules
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (!sig) return out;
+      const cmi::ModuleType* mt = nullptr;  // the named module type
+      for (auto& mtd : sig->modtypes) if (mtd.name == comps.back()) { mt = mtd.type.get(); break; }
+      if (!mt || mt->kind != cmi::ModuleType::Sig || !mt->sig) return out;
+      cmi_abstract_subst_ = argtypes;
+      for (auto& v : mt->sig->values) {
+        std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+        out[v.name] = from_cmi(v.type, memo);
+      }
+      cmi_abstract_subst_.clear();
+    } catch (...) { cmi_abstract_subst_.clear(); }
+    return out;
   }
 
   // Resolve a (possibly qualified) module path to its exported value schemes:
@@ -3413,6 +3551,17 @@ struct Checker {
       if (auto* fi = std::get_if<Pmod_ident>(&h->desc)) {
         if (strict && module_head_unbound(fi->id.txt))  // module O = <unbound>.Make(..)
           note_error("Unbound module " + mod_components(fi->id.txt).front());
+        // A single-application LOCAL functor with a known result signature:
+        // instantiate it with the argument's types (Elem.t -> the arg's t).
+        if (napp == 1)
+          if (auto* ap = std::get_if<Pmod_apply>(&me.desc)) {
+            auto comps = mod_components(fi->id.txt);
+            if (comps.size() == 1)
+              if (auto fd = functor_defs_.find(comps[0]); fd != functor_defs_.end()) {
+                auto r = instantiate_local_functor(fd->second, *ap->arg);
+                if (!r.empty()) return r;
+              }
+          }
         return functor_result_values(fi->id.txt, napp);
       }
       return {};
@@ -3538,6 +3687,25 @@ struct Checker {
             const ModuleExpr* me = &mb->binding.expr;
             while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
             if (std::holds_alternative<Pmod_functor>(me->desc)) {
+              // Record a single-parameter functor with an explicit result
+              // signature so `F(Arg)` can be instantiated (param types substituted)
+              // rather than collapsed to generic vars.
+              if (auto* mf0 = std::get_if<Pmod_functor>(&me->desc)) {
+                const ModuleExpr* body = mf0->body.get();
+                while (auto* mc = std::get_if<Pmod_constraint>(&body->desc)) {
+                  FunctorDef fd;
+                  if (auto* fn = std::get_if<Functor_named>(&mf0->param))
+                    if (fn->name.txt) fd.param = *fn->name.txt;
+                  if (auto* fn = std::get_if<Functor_named>(&mf0->param))
+                    fd.param_sig = fn->type.get();
+                  if (std::holds_alternative<Pmty_signature>(mc->mt->desc))
+                    fd.result_sig = mc->mt.get();
+                  if (!fd.param.empty() && fd.result_sig &&
+                      !std::holds_alternative<Pmod_functor>(mc->me->desc))
+                    functor_defs_[*mb->binding.name.txt] = fd;
+                  break;
+                }
+              }
               while (auto* mf = std::get_if<Pmod_functor>(&me->desc)) me = mf->body.get();
               // Keep only the result's value *names* (fresh polymorphic types):
               // the body's concrete types depend on the (unsubstituted) argument,
