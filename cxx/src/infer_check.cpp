@@ -343,6 +343,11 @@ struct Checker {
             !cmi_expanding_.count(n->path->id.name))
           for (auto& td : *cmi_types_ctx_)
             if (td.name == n->path->id.name && td.manifest &&
+                // Keep an EXTENSIBLE abbreviation as its own name, not its
+                // manifest: `Effect.t = 'a eff = ..` prints `Effect.t`, not the
+                // builtin `eff` (and `eff` would not unify with a typext's bare
+                // `t`, leaving `perform (Set x)` polymorphic instead of unit).
+                td.kind != cmi::TypeDecl::Open &&
                 td.params.size() == n->args.size()) {
               std::unordered_map<cmi::TypeExpr*, TypePtr> m2;
               for (size_t i = 0; i < td.params.size(); ++i)
@@ -473,6 +478,13 @@ struct Checker {
       // A bare reference to a local opaque type carries its identity stamp.
       int stamp = 0;
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
+      // The predefined effect type is the builtin `eff`; ocamlc shows it as its
+      // public alias `Effect.t`.  Canonicalise so a typext written `_ eff += ..`
+      // (or annotated `unit eff`) and `Effect.perform`'s param (also Effect.t)
+      // unify and print alike.
+      if (!stamp)
+        if (auto* l = std::get_if<Lident>(&c->id.txt.v); l && l->name == "eff")
+          return eng.constr("Effect.t", std::move(as));
       // A bare type name brought into scope by `open M` (M not Stdlib, not a
       // local type) renders with M's qualification, matching ocamlc (`c_layout`
       // after `open Bigarray` -> `Bigarray.c_layout`).
@@ -517,7 +529,9 @@ struct Checker {
       }
       if (sig)
         for (auto& td : sig->types)
-          if (td.name == d->name && td.manifest && td.params.size() == as.size()) {
+          if (td.name == d->name && td.manifest &&
+              td.kind != cmi::TypeDecl::Open &&  // keep `Effect.t = 'a eff = ..` as Effect.t
+              td.params.size() == as.size()) {
             std::unordered_map<cmi::TypeExpr*, TypePtr> m2;
             for (size_t i = 0; i < as.size(); ++i) m2[td.params[i].get()] = as[i];
             cmi_types_ctx_ = &sig->types;
