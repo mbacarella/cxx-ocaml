@@ -140,6 +140,10 @@ struct Checker {
   int next_type_stamp_ = 1;
   std::unordered_map<const TypeDeclaration*, int> type_stamp_;
   std::vector<std::unordered_map<std::string, int>> tenv{{}};
+  // The path prefix of the submodule currently being type-registered (e.g.
+  // "Float_record."), so a record type defined there is named `Float_record.s`
+  // -- its rendered path, NOT its identity (the stamp is unchanged).
+  std::string mod_prefix_;
   int tenv_lookup(const std::string& name) {
     for (auto it = tenv.rbegin(); it != tenv.rend(); ++it) {
       auto f = it->find(name);
@@ -1324,7 +1328,7 @@ struct Checker {
     std::unordered_map<std::string, TypePtr> vars;
     std::vector<TypePtr> params;
     for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
-    TypePtr recTy = eng.constr(d.name.txt, params, type_stamp_[&d]);
+    TypePtr recTy = eng.constr(mod_prefix_ + d.name.txt, params, type_stamp_[&d]);
     if (int s = type_stamp_[&d]) stamp_record_decl_[s] = &d;  // for ambiguous-field resolution
     if (auto it = name_record_decl_.find(d.name.txt);  // by-name fallback (only when UNIQUE)
         it != name_record_decl_.end() && it->second != &d)
@@ -3318,8 +3322,12 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
     else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       const ModuleExpr* me = &mb->binding.expr;
       while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
-      if (auto* ms = std::get_if<Pmod_structure>(&me->desc))
+      if (auto* ms = std::get_if<Pmod_structure>(&me->desc)) {
+        std::string saved = ck.mod_prefix_;
+        if (mb->binding.name.txt) ck.mod_prefix_ += *mb->binding.name.txt + ".";
         register_types_rec(ck, ms->items);
+        ck.mod_prefix_ = saved;
+      }
     }
   }
 }
