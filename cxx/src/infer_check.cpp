@@ -1341,6 +1341,7 @@ struct Checker {
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
       }
+      register_inline_record(c.args, result, vars);  // `C of { f : t }`
       if (ctors.count(c.name.txt)) ambiguous_ctors_.insert(c.name.txt);
       ctors[c.name.txt] = scheme;
       ctor_scheme_[&c] = scheme;  // for scoped (in-order) resolution via cenv
@@ -1396,17 +1397,37 @@ struct Checker {
       if (v.size() == 1) fields_[k] = v[0];
   }
 
+  // An inline-record constructor argument (`C of { f : t; .. }`): register each
+  // field so a pattern `C { f }` / expression `C { f = e }` resolves f to its
+  // declared type instead of Any.  Mirrors register_record_decl's field handling
+  // (a universally-quantified field stays Any, save a format one in the kind
+  // pass); `result` is the constructor's result type, used as the field's
+  // record-type domain.
+  void register_inline_record(const ConstructorArguments& args, const TypePtr& result,
+                              std::unordered_map<std::string, TypePtr>& vars) {
+    auto* r = std::get_if<Pcstr_record>(&args);
+    if (!r) return;
+    for (auto& f : r->fields) {
+      if (std::holds_alternative<Ptyp_poly>(f.type->desc) &&
+          !(record_kinds_ && mentions_format(*f.type)))
+        continue;
+      field_candidates_[f.name.txt].push_back(
+          eng.arrow(result, from_coretype(*f.type, vars)));
+    }
+  }
+
   // Register an exception/extension constructor: A of t1*..*tn => t1->..->tn->exn.
   // Participates in ambiguity detection so `exception E` + `type t = E` makes E
   // ambiguous (type-directed disambiguation, approximated as unknown).
   void register_exception(const ExtensionConstructor& ec) {
     TypePtr scheme = eng.constr("exn");
-    if (auto* d = std::get_if<Pext_decl>(&ec.kind))
+    if (auto* d = std::get_if<Pext_decl>(&ec.kind)) {
+      std::unordered_map<std::string, TypePtr> vars;
       if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
-        for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it) {
-          std::unordered_map<std::string, TypePtr> vars;
+        for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
-        }
+      register_inline_record(d->args, eng.constr("exn"), vars);  // `exception E of { f }`
+    }
     if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
     ctors[ec.name.txt] = scheme;
     exn_ctors_.insert(ec.name.txt);
@@ -1434,6 +1455,7 @@ struct Checker {
       if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
+      register_inline_record(d->args, result, vars);  // `type t += C of { f }`
       if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
       ctors[ec.name.txt] = scheme;
       if (is_exn) exn_ctors_.insert(ec.name.txt);
