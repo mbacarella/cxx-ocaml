@@ -2312,6 +2312,10 @@ struct Checker {
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
       // `lazy e` : e Lazy.t -- only in the value-kinds pass (a concrete type here
       // can clash downstream in an incomplete strict pass and false-reject).
+      // NB: rendering this as the predefined `lazy_t` (which is what ocamlc -i
+      // shows for a constructed lazy value) was tried and REVERTED: lazy_t vs the
+      // cmi-loaded Lazy.t don't unify by name, regressing reject 0.0%->0.1% and
+      // sig (a lazy value flowing into a Lazy.t context clashed).
       TypePtr inner = infer_expr(*lz->e);
       return strict ? eng.any() : eng.constr("Lazy.t", {inner});
     }
@@ -4300,21 +4304,42 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
   ck.eng.lenient = true;  // signature pass: best-effort unify (see Engine::lenient)
   run_checker(ck, s);
   std::vector<std::pair<std::string, std::string>> all;
-  for (auto& it : s) {
-    auto* sv = std::get_if<Pstr_value>(&it.desc);
-    if (!sv) continue;
-    // Emit EVERY variable a binding's pattern binds, in pattern order -- a
-    // destructuring `let (a, b) = e` exports both a and b, not just simple vars.
-    for (auto& b : sv->bindings) {
-      std::vector<std::string> names;
-      valrec::pat_names(b.pat, names);
-      for (auto& nm : names) {
-        auto f = ck.venv.back().find(nm);
-        if (f != ck.venv.back().end())
-          all.emplace_back(nm, I::show(f->second));
+  auto emit = [&](const std::string& nm) {
+    auto f = ck.venv.back().find(nm);
+    if (f != ck.venv.back().end()) all.emplace_back(nm, I::show(f->second));
+  };
+  // Resolve `include M` to the included structure (a local struct, directly or
+  // via a local module binding), so we can emit its flattened value names too --
+  // `ocamlc -i` lists an included module's values in this module's signature.
+  std::function<const ast::Structure*(const ModuleExpr&)> incstruct =
+      [&](const ModuleExpr& me) -> const ast::Structure* {
+    if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) return &ms->items;
+    if (auto* mi = std::get_if<Pmod_ident>(&me.desc)) {
+      std::string nm = lid_last(mi->id.txt);
+      for (auto& it2 : s)
+        if (auto* mb = std::get_if<Pstr_module>(&it2.desc))
+          if (mb->binding.name.txt && *mb->binding.name.txt == nm)
+            if (auto* ms2 = std::get_if<Pmod_structure>(&mb->binding.expr.desc))
+              return &ms2->items;
+    }
+    return nullptr;
+  };
+  std::function<void(const ast::Structure&)> walk = [&](const ast::Structure& items) {
+    for (auto& it : items) {
+      if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
+        // Emit EVERY variable a binding's pattern binds, in pattern order -- a
+        // destructuring `let (a, b) = e` exports both a and b, not just simple vars.
+        for (auto& b : sv->bindings) {
+          std::vector<std::string> names;
+          valrec::pat_names(b.pat, names);
+          for (auto& nm : names) emit(nm);
+        }
+      } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
+        if (const ast::Structure* inc = incstruct(in->expr)) walk(*inc);
       }
     }
-  }
+  };
+  walk(s);
   // A shadowed name appears once in the signature, at (and with the type of) its
   // LAST binding -- keep only the final occurrence of each name.
   std::unordered_map<std::string, size_t> last;
