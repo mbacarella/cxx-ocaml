@@ -143,7 +143,7 @@ struct Printer {
         line(j, "[");
         for (auto& [label, el] : tu->elems) {
           line(j + 1, label ? "Label: Some \"" + *label + "\"" : "Label: None");
-          core_type(j + 2, *el);
+          core_type(j + 1, *el);  // labeled_core_type: type at the Label's depth
         }
         line(j, "]");
       }
