@@ -260,7 +260,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       }
       if (cp > 1) out += ")";
       break;
-    case Type::Kind::Constr:
+    case Type::Kind::Constr: {
       if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names); out += " "; }
       else if (t->args.size() > 1) {
         out += "(";
@@ -270,8 +270,16 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         }
         out += ") ";
       }
-      out += t->path;
+      std::string path = t->path;
+      // Stdlib is opened by default, so its types print unqualified
+      // (Stdlib.out_channel -> out_channel, Stdlib.Gc.stat -> Gc.stat).
+      if (path.rfind("Stdlib.", 0) == 0) path = path.substr(7);
+      // The printf format type is normalised to format6; a 3-parameter one prints
+      // as its `format` abbreviation, matching ocamlc.
+      if (path == "format6" && t->args.size() == 3) path = "format";
+      out += path;
       break;
+    }
     case Type::Kind::Link:
       break;
     case Type::Kind::Any:
