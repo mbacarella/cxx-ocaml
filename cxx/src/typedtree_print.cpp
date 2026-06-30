@@ -97,10 +97,11 @@ struct Printer {
   void constant(int i, const std::string& prefix, const Constant& c) {
     if (auto* p = std::get_if<ast::Pconst_integer>(&c.desc)) {
       const char* tag = "Const_int";
-      if (p->suffix == 'l') tag = "Const_int32";
+      long long v = parse_int(p->value);
+      if (p->suffix == 'l') { tag = "Const_int32"; v = (int32_t)v; }  // signed 32-bit
       else if (p->suffix == 'L') tag = "Const_int64";
       else if (p->suffix == 'n') tag = "Const_nativeint";
-      line(i, prefix + tag + " " + std::to_string(parse_int(p->value)));
+      line(i, prefix + tag + " " + std::to_string(v));
     } else if (auto* p = std::get_if<ast::Pconst_char>(&c.desc)) {
       char buf[8];
       std::snprintf(buf, sizeof buf, "%02x", p->code & 0xff);
