@@ -305,6 +305,13 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> stdlib_;
   // Strict mode: record definite type errors instead of swallowing them.
   bool strict = false;
+  // --infer signature DISPLAY pass: keep type abbreviations FOLDED (don't expand
+  // `Float.t`/`String.t`/`int Seq.t` to their manifest), matching ocamlc's
+  // printed signatures.  Safe only because this pass runs with lenient unify (a
+  // `Float.t` vs `float` clash from `+.` is swallowed, the annotation keeps its
+  // name).  NOT set in value-kinds (which needs the expanded arrow to apply a
+  // `Seq.t` as a function, the float kind, etc.) or strict.
+  bool fold_abbrevs_ = false;
   std::vector<std::string> errors;
   int cur_line_ = 0;  // line of the expression currently being inferred (for diagnostics)
   void note_error(const std::string& m) {
@@ -355,7 +362,8 @@ struct Checker {
         // expand a same-module type abbreviation (Float.t = float, Int.t = int) --
         // but NOT in a functor result, where `elt = Ord.t` stays the abstract,
         // binding-qualified name (`IntSet.elt`), not its expansion.
-        if (!func_result_mode_ && cmi_types_ctx_ && n->path && n->path->kind == cmi::Path::Pident &&
+        if (!fold_abbrevs_ &&
+            !func_result_mode_ && cmi_types_ctx_ && n->path && n->path->kind == cmi::Path::Pident &&
             !cmi_expanding_.count(n->path->id.name))
           for (auto& td : *cmi_types_ctx_)
             if (td.name == n->path->id.name && td.manifest &&
@@ -475,7 +483,7 @@ struct Checker {
       // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
       std::string nm = lid_last(c->id.txt);
       auto ai = type_aliases.find(nm);
-      if (ai != type_aliases.end() && ai->second.params.size() == as.size() &&
+      if (!fold_abbrevs_ && ai != type_aliases.end() && ai->second.params.size() == as.size() &&
           !expanding_.count(nm)) {
         std::unordered_map<std::string, TypePtr> sub;
         for (size_t i = 0; i < as.size(); ++i)
@@ -495,7 +503,7 @@ struct Checker {
         if (auto s = functor_param_subst_.find(lid_full(c->id.txt));
             s != functor_param_subst_.end())
           return s->second;
-      if (std::holds_alternative<Ldot>(c->id.txt.v))
+      if (!fold_abbrevs_ && std::holds_alternative<Ldot>(c->id.txt.v))
         if (TypePtr r = expand_qualified_abbrev(c->id.txt, as)) return r;
       // Inside a functor-result-signature instantiation: a bare name that is one
       // of RS's own abstract types resolves to the per-instantiation fresh var.
@@ -4594,6 +4602,7 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
   // registration, so every local record construction/projection leaked Any.
   Checker ck;
   ck.eng.lenient = true;  // signature pass: best-effort unify (see Engine::lenient)
+  ck.fold_abbrevs_ = true;  // keep abbreviations folded for display (see fold_abbrevs_)
   run_checker(ck, s);
   std::vector<std::pair<std::string, std::string>> all;
   auto emit = [&](const std::string& nm) {
