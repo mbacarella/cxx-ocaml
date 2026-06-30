@@ -4122,12 +4122,17 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
   for (auto& it : s) {
     auto* sv = std::get_if<Pstr_value>(&it.desc);
     if (!sv) continue;
-    for (auto& b : sv->bindings)
-      if (auto* v = std::get_if<Ppat_var>(&b.pat.desc)) {
-        auto f = ck.venv.back().find(v->name.txt);
+    // Emit EVERY variable a binding's pattern binds, in pattern order -- a
+    // destructuring `let (a, b) = e` exports both a and b, not just simple vars.
+    for (auto& b : sv->bindings) {
+      std::vector<std::string> names;
+      valrec::pat_names(b.pat, names);
+      for (auto& nm : names) {
+        auto f = ck.venv.back().find(nm);
         if (f != ck.venv.back().end())
-          out.emplace_back(v->name.txt, I::show(f->second));
+          out.emplace_back(nm, I::show(f->second));
       }
+    }
   }
   return out;
 }
