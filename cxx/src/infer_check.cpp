@@ -1889,7 +1889,8 @@ struct Checker {
       for (auto& el : a->elems) infer_pat(*el);
       return eng.fresh_var();
     }
-    if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return infer_pat(*lz->p);
+    if (auto* lz = std::get_if<Ppat_lazy>(&p.desc))  // `lazy p` matches `'a lazy_t`, p:'a
+      return eng.constr("lazy_t", {infer_pat(*lz->p)});
     if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
       // Both arms bind the same variables, and each shared variable must have
       // a unifiable type across the two arms (typecore: or-pattern arms share
