@@ -555,7 +555,18 @@ struct Checker {
     // (it may be a sibling/external module we can't load -- never false-reject).
     if (auto* d = std::get_if<Ldot>(&lid.v)) {
       auto& ex = module_values_cached(*d->prefix);
-      if (ex.empty()) {  // module unresolvable
+      if (ex.empty()) {  // module unresolvable as-is
+        // `Array1.create` after `open Bigarray`: the prefix head is an opened
+        // submodule, so resolve through its parent path (`Bigarray.Array1`).
+        auto pc = mod_components(*d->prefix);
+        if (!pc.empty())
+          if (auto q = opened_submod_quals_.find(pc[0]); q != opened_submod_quals_.end()) {
+            std::vector<std::string> qc = mod_components_str(q->second);
+            for (size_t i = 1; i < pc.size(); ++i) qc.push_back(pc[i]);
+            auto& ex2 = module_values_cached_comps(qc);
+            if (auto f = ex2.find(d->name); f != ex2.end())
+              return eng.instantiate(f->second);
+          }
         if (strict && module_head_unbound(*d->prefix))  // genuinely unbound -> error
           note_error("Unbound module " + mod_components(*d->prefix).front());
         return eng.any();   // else stay dynamic (a module we just can't load)
@@ -660,6 +671,27 @@ struct Checker {
     if (loaded_field_mods_.insert(key).second) load_module_record_fields(m);
     return modvals_cache_.emplace(key, resolve_module_values(m)).first->second;
   }
+  // As above, keyed by an explicit component path (for a qualified opened
+  // submodule like `Bigarray.Array1`, built at the use site).
+  const std::unordered_map<std::string, TypePtr>& module_values_cached_comps(
+      const std::vector<std::string>& comps) {
+    std::string key;
+    for (auto& c : comps) { if (!key.empty()) key += '.'; key += c; }
+    auto it = modvals_cache_.find(key);
+    if (it != modvals_cache_.end()) return it->second;
+    return modvals_cache_.emplace(key, resolve_module_values_comps(comps)).first->second;
+  }
+  static std::vector<std::string> mod_components_str(const std::string& path) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < path.size()) {
+      size_t d = path.find('.', i);
+      if (d == std::string::npos) { out.push_back(path.substr(i)); break; }
+      out.push_back(path.substr(i, d - i));
+      i = d + 1;
+    }
+    return out;
+  }
 
   // Stdlib top-level value schemes, loaded once from stdlib.cmi.
   const std::unordered_map<std::string, TypePtr>& stdlib_schemes() {
@@ -708,7 +740,10 @@ struct Checker {
   // a local top-level module from modenv, else a stdlib module/submodule walked
   // through nested signatures (open Effect.Deep -> stdlib__Effect.cmi -> Deep).
   std::unordered_map<std::string, TypePtr> resolve_module_values(const Longident& m) {
-    auto comps = mod_components(m);
+    return resolve_module_values_comps(mod_components(m));
+  }
+  std::unordered_map<std::string, TypePtr> resolve_module_values_comps(
+      std::vector<std::string> comps) {
     if (comps.empty()) return {};
     // local modules are recorded flat by simple name; a qualified local nested
     // module (e.g. include T.Int) is found by its last component.
