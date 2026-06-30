@@ -274,6 +274,8 @@ struct Checker {
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modenv;
   // local functor name -> its body's exported value schemes (F(X) result)
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> functor_env;
+  // A parameterless class's object type, so `new c` yields it (non-strict only).
+  std::unordered_map<std::string, TypePtr> class_types_;
   // local module-type name -> its signature's value names (first-class modules):
   // (val e : S) unpacks bring S's values into scope.
   std::unordered_map<std::string, std::vector<std::string>> modtype_env;
@@ -2300,6 +2302,13 @@ struct Checker {
       if (pk->pkg) return package_type(*pk->pkg);
       return eng.any();  // unconstrained pack: type unknown without the sig
     }
+    if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {
+      // `new c` for a parameterless local class is its object type.
+      if (!strict)
+        if (auto it = class_types_.find(lid_last(nw->id.txt)); it != class_types_.end())
+          return eng.instantiate(it->second);
+      return eng.any();
+    }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
       // `lazy e` : e Lazy.t -- only in the value-kinds pass (a concrete type here
       // can clash downstream in an incomplete strict pass and false-reject).
@@ -3369,7 +3378,7 @@ struct Checker {
         } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings);
         else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
-          if (record_kinds_)  // value kinds for class method bodies (see Pexp_object)
+          if (!strict)  // value kinds + signature: class method bodies (Pexp_object)
             for (auto& d : pc->decls) {
               const ClassExpr* ce = &d.expr;
               std::vector<const Pcl_fun*> params;  // `class c x = ...` parameters
@@ -3383,9 +3392,13 @@ struct Checker {
                   ce = pl->body.get();
                 } else break;
               }
-              if (auto* ps = std::get_if<Pcl_structure>(&ce->desc))
-                infer_object_body(ps->cs, params.empty() ? nullptr : &params,
-                                  lets.empty() ? nullptr : &lets);
+              if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
+                TypePtr ot = infer_object_body(ps->cs, params.empty() ? nullptr : &params,
+                                               lets.empty() ? nullptr : &lets);
+                // A parameterless class: `new c` is its object type.  Generalise
+                // so each `new c` instantiates fresh.
+                if (params.empty()) { eng.generalize(ot); class_types_[d.name.txt] = ot; }
+              }
             }
         } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
           infer_expr(*ev->e);
