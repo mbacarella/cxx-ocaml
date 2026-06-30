@@ -3183,6 +3183,7 @@ struct Checker {
     for (auto& b : bs) {
       eng.enter_level();
       TypePtr te = infer_expr(*b.expr);
+      TypePtr annot = nullptr;
       // A declared type `let f : T = e`: check the inferred type's identities
       // against T (a distinct local type used where another is declared is an
       // error).  We only flag identity (stamp) clashes, not structural ones --
@@ -3192,22 +3193,28 @@ struct Checker {
         if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_)) {
           for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
           std::unordered_map<std::string, TypePtr> vars;
-          if (strict && expected_clash(te, from_coretype(*pc->typ, vars)))
+          annot = from_coretype(*pc->typ, vars);
+          if (strict && expected_clash(te, annot))
             note_error("type mismatch against declared type");
           // Flow the declared type `let x : T = e` into the inferred one (pins
           // an under-determined result, e.g. `let why : unit -> unit = fun () ->
           // raise Exit`).  Non-strict only (the strict pass keeps the inferred
           // type so an incomplete-inference clash can't false-reject); soft so a
           // stray clash can't abort the pass.
-          if (!strict) soft_unify(te, from_coretype(*pc->typ, vars));
+          if (!strict) soft_unify(te, annot);
         }
       eng.leave_level();
+      // In the --infer DISPLAY pass the binding's type IS its annotation:
+      // `let x : int Seq.t = fun () -> ..` prints `int Seq.t`, not the body's
+      // expanded arrow.  (soft_unify above already flowed the body's constraints
+      // into the annotation's flexible vars.)
+      TypePtr bound = (fold_abbrevs_ && annot) ? annot : te;
       // Value restriction: generalise only a non-expansive (syntactic-value) RHS,
       // so `ref []` stays weak and is pinned by later use (`int list ref`, not
       // `'a list ref`).  Strict pass keeps generalising everything (an
       // over-eager weak var could false-reject a valid polymorphic use).
-      if (strict || non_expansive(*b.expr)) eng.generalize(te);
-      bind_pattern_scheme(b.pat, te);
+      if (strict || non_expansive(*b.expr)) eng.generalize(bound);
+      bind_pattern_scheme(b.pat, bound);
     }
   }
 
