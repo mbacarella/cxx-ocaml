@@ -1827,6 +1827,39 @@ struct Checker {
     return nullptr;
   }
 
+  // Full scheme of a qualified constructor `M.C` (arg1->..->result), so an
+  // application `Either.Left "s"` pins the parameter (`(string, 'b) Either.t`),
+  // not just the bare variant type.  Null when M.C isn't a loadable variant ctor.
+  TypePtr qualified_ctor_scheme(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return nullptr;
+    auto* pl = std::get_if<Lident>(&d->prefix->v);
+    if (!pl) return nullptr;
+    try {
+      auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Variant) continue;
+        for (auto& c : td.ctors) {
+          if (c.name != d->name || c.is_inline_record) continue;
+          std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+          std::vector<TypePtr> params;
+          for (auto& p : td.params) {
+            TypePtr v = eng.fresh_var();
+            if (p) memo[p.get()] = v;
+            params.push_back(v);
+          }
+          TypePtr result = c.res ? from_cmi(c.res, memo)
+                                 : eng.constr(pl->name + "." + td.name, params);
+          TypePtr scheme = result;
+          for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
+            scheme = eng.arrow(from_cmi(*it, memo), scheme);
+          return scheme;
+        }
+      }
+    } catch (...) {}
+    return nullptr;
+  }
+
   // Split a (instantiated) constructor scheme into its argument types and result.
   static std::vector<TypePtr> ctor_params(const TypePtr& sch, TypePtr& result) {
     std::vector<TypePtr> ps;
@@ -2443,6 +2476,22 @@ struct Checker {
         if (auto* tup = k->arg ? std::get_if<Pexp_tuple>(&(*k->arg)->desc) : nullptr) {
           int ar = qualified_ctor_arity(k->id.txt);
           if (ar > 1 && (size_t)ar == tup->elems.size()) flatten_construct.insert(&e);
+        }
+        // The qualified ctor's full scheme pins its argument: `Either.Left "s"`
+        // gives `(string, 'b) Either.t`, not `('a, 'b) Either.t`.  Non-strict
+        // only -- pinning the arg in the strict pass can false-reject when our
+        // incomplete inference mis-types the argument.
+        if (TypePtr scheme = !strict ? qualified_ctor_scheme(k->id.txt) : nullptr) {
+          TypePtr result;
+          auto ps = ctor_params(scheme, result);
+          if (k->arg) {
+            auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+            if (ps.size() > 1 && tup && tup->elems.size() == ps.size())
+              for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_expr(*tup->elems[i]));
+            else if (!ps.empty()) try_unify(ps[0], infer_expr(**k->arg));
+            else infer_expr(**k->arg);
+          }
+          return result;
         }
         if (TypePtr qt = qualified_ctor_type(k->id.txt)) {
           if (k->arg) infer_expr(**k->arg);
