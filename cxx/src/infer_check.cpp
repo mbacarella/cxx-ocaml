@@ -2757,9 +2757,45 @@ struct Checker {
           if (record_kinds_) soft_unify(te, from_coretype(*pc->typ, vars));
         }
       eng.leave_level();
-      eng.generalize(te);
+      // Value restriction: generalise only a non-expansive (syntactic-value) RHS,
+      // so `ref []` stays weak and is pinned by later use (`int list ref`, not
+      // `'a list ref`).  Strict pass keeps generalising everything (an
+      // over-eager weak var could false-reject a valid polymorphic use).
+      if (strict || non_expansive(*b.expr)) eng.generalize(te);
       bind_pattern_scheme(b.pat, te);
     }
+  }
+
+  // Value-restriction non-expansiveness (a conservative subset of OCaml's
+  // is_nonexpansive): syntactic values whose type may be generalised.  Anything
+  // not certainly a value (application, if/match/try, ...) is expansive -> weak.
+  bool non_expansive(const Expression& e) {
+    if (std::holds_alternative<Pexp_ident>(e.desc) ||
+        std::holds_alternative<Pexp_constant>(e.desc) ||
+        std::holds_alternative<Pexp_function>(e.desc)) return true;
+    if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
+      for (auto& x : t->elems) if (!non_expansive(*x)) return false;
+      return true;
+    }
+    if (auto* k = std::get_if<Pexp_construct>(&e.desc))
+      return !k->arg || non_expansive(**k->arg);
+    if (auto* v = std::get_if<Pexp_variant>(&e.desc))
+      return !v->arg || non_expansive(**v->arg);
+    if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
+      if (r->base && !non_expansive(**r->base)) return false;
+      for (auto& [_, x] : r->fields) if (!non_expansive(*x)) return false;
+      return true;
+    }
+    if (auto* f = std::get_if<Pexp_field>(&e.desc)) return non_expansive(*f->e);
+    if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) return non_expansive(*c->e);
+    if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) return non_expansive(*c->e);
+    if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) return non_expansive(*nt->body);
+    if (std::holds_alternative<Pexp_lazy>(e.desc)) return true;  // lazy is a value
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      for (auto& b : l->bindings) if (!non_expansive(*b.expr)) return false;
+      return non_expansive(*l->body);
+    }
+    return false;  // apply / if / match / try / sequence / while / for / send / ...
   }
 
   // Pure (no-mutation) check: do two types carry distinct local type identities
