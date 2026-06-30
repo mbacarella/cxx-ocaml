@@ -245,6 +245,8 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
     }
     case Type::Kind::Arrow:
       if (cp > 0) out += "(";
+      if (t->arrow_label == 1) out += t->arrow_lbl + ":";        // ~lbl:
+      else if (t->arrow_label == 2) out += "?" + t->arrow_lbl + ":";  // ?lbl:
       show_rec(t->dom, out, 1, names);   // domain: a tuple is fine unparen'd
       out += " -> ";
       show_rec(t->cod, out, 0, names);   // -> is right-assoc: codomain stays top
