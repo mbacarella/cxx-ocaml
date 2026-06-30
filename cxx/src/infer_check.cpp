@@ -1592,7 +1592,12 @@ struct Checker {
       std::unordered_map<std::string, TypePtr> vars;
       std::vector<TypePtr> params;
       for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
-      TypePtr result = eng.constr(d.name.txt, params, type_stamp_[&d]);
+      // A GADT constructor's explicit result (`Float : float -> float dyn`)
+      // refines the type's parameters, so a pattern `Float x` types its scrutinee
+      // as `float dyn`, not the generic `'a dyn`.  Non-strict only: in the strict
+      // pass the per-branch refinement needs windowing we keep conservative.
+      TypePtr result = (!strict && c.res) ? from_coretype(**c.res, vars)
+                                          : eng.constr(d.name.txt, params, type_stamp_[&d]);
       TypePtr scheme = result;
       if (auto* tup = std::get_if<Pcstr_tuple>(&c.args)) {
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
