@@ -379,6 +379,12 @@ struct Checker {
     }
     return "";
   }
+  // A first-class-module type `(module S)`: a constr whose path renders verbatim
+  // (constraints `with type ..` are dropped -- best effort).
+  TypePtr package_type(const Ptyp_package& pk) {
+    return eng.constr("(module " + lid_full(pk.path.txt) + ")");
+  }
+
   TypePtr from_coretype(const CoreType& t,
                         std::unordered_map<std::string, TypePtr>& vars) {
     if (std::holds_alternative<Ptyp_any>(t.desc)) return eng.fresh_var();
@@ -467,6 +473,7 @@ struct Checker {
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
       return eng.constr(lid_full(c->id.txt), std::move(as), stamp);
     }
+    if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) return package_type(*pk);
     return eng.fresh_var();
   }
 
@@ -1920,6 +1927,10 @@ struct Checker {
       infer_pat(*ef->cont);  // continuation k
       return eng.fresh_var();
     }
+    // `(module M : S)`: a first-class-module parameter has the package type
+    // `(module S)` (the module name M is bound to a module, not a value).
+    if (auto* up = std::get_if<Ppat_unpack>(&p.desc))
+      return up->pkg ? package_type(*up->pkg) : eng.fresh_var();
     return eng.fresh_var();
   }
 
