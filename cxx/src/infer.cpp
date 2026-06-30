@@ -55,6 +55,17 @@ TypePtr Engine::object_type(std::vector<std::string> names, std::vector<TypePtr>
   return t;
 }
 
+TypePtr Engine::variant_type(std::vector<std::string> tags, std::vector<TypePtr> argtys,
+                             std::vector<char> has_arg) {
+  auto t = std::make_shared<Type>();
+  t->kind = Type::Kind::Variant;
+  t->labels = std::move(tags);
+  t->args = std::move(argtys);
+  t->tag_has_arg = std::move(has_arg);
+  t->id = next_id_++;
+  return t;
+}
+
 Engine* Engine::trail_owner_ = nullptr;
 
 void Engine::note(const TypePtr& n) {
@@ -110,6 +121,7 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
     case Type::Kind::Tuple:
     case Type::Kind::Constr:
     case Type::Kind::Object:
+    case Type::Kind::Variant:
       for (auto& a : t->args) occurs_and_lower(var, a);
       break;
     case Type::Kind::Link:
@@ -184,6 +196,23 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
         if (a->labels[i] == b->labels[j]) unify(a->args[i], b->args[j]);
     return;
   }
+  if (a->kind == Type::Kind::Variant && b->kind == Type::Kind::Variant) {
+    // Merge the two open rows into their tag-union (`[> `A]` + `[> `B]` = `[> `A
+    // | `B]`), unifying a shared tag's argument; link both sides to the merge.
+    std::vector<std::string> tags = a->labels;
+    std::vector<TypePtr> ats = a->args;
+    std::vector<char> has = a->tag_has_arg;
+    for (size_t j = 0; j < b->labels.size(); ++j) {
+      size_t k = 0;
+      for (; k < tags.size(); ++k) if (tags[k] == b->labels[j]) break;
+      if (k < tags.size()) unify(ats[k], b->args[j]);
+      else { tags.push_back(b->labels[j]); ats.push_back(b->args[j]); has.push_back(b->tag_has_arg[j]); }
+    }
+    TypePtr m = variant_type(std::move(tags), std::move(ats), std::move(has));
+    note(a); a->kind = Type::Kind::Link; a->link = m;
+    note(b); b->kind = Type::Kind::Link; b->link = m;
+    return;
+  }
   throw TypeError("cannot unify incompatible types");
 }
 
@@ -218,6 +247,11 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         for (auto& a : t->args) as.push_back(copy(a));
         return object_type(t->labels, std::move(as));
       }
+      case Type::Kind::Variant: {
+        std::vector<TypePtr> as;
+        for (auto& a : t->args) as.push_back(copy(a));
+        return variant_type(t->labels, std::move(as), t->tag_has_arg);
+      }
       case Type::Kind::Link:
         return copy(t);  // repr resolved; unreachable
       case Type::Kind::Any:
@@ -241,6 +275,7 @@ void Engine::generalize(const TypePtr& t0) {
     case Type::Kind::Tuple:
     case Type::Kind::Constr:
     case Type::Kind::Object:
+    case Type::Kind::Variant:
       for (auto& a : t->args) generalize(a);
       break;
     case Type::Kind::Link:
@@ -315,6 +350,19 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         show_rec(t->args[i], out, 0, names);
       }
       out += " >";
+      break;
+    }
+    case Type::Kind::Variant: {
+      out += "[> ";
+      for (size_t i = 0; i < t->labels.size(); ++i) {
+        if (i) out += " | ";
+        out += "`" + t->labels[i];
+        if (i < t->tag_has_arg.size() && t->tag_has_arg[i]) {
+          out += " of ";
+          show_rec(t->args[i], out, 0, names);
+        }
+      }
+      out += " ]";
       break;
     }
     case Type::Kind::Link:

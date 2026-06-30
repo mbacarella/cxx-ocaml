@@ -32,7 +32,10 @@ struct Type {
   // Object is a structural object type `< m1 : t1; m2 : t2 >` (method names in
   // `labels`, types in `args`).  It is produced ONLY in the non-strict passes
   // (signature/value-kinds), so the strict pass never has to reason about it.
-  enum class Kind { Var, Arrow, Tuple, Constr, Link, Any, Object };
+  // Variant is an open polymorphic-variant row `[> `A | `B of t]` (tag names in
+  // `labels`, per-tag arg types in `args`, presence in `tag_has_arg`).  Like
+  // Object, only produced in the non-strict passes.
+  enum class Kind { Var, Arrow, Tuple, Constr, Link, Any, Object, Variant };
   Kind kind = Kind::Var;
   int level = 0;             // Var: binding level (GENERIC_LEVEL if generalized)
   int id = 0;                // unique id (occurs-check / debug printing)
@@ -40,8 +43,9 @@ struct Type {
   TypePtr dom, cod;          // Arrow
   int arrow_label = 0;       // Arrow: 0 Nolabel, 1 Labelled, 2 Optional
   std::string arrow_lbl;     // Arrow: label name (when Labelled/Optional)
-  std::vector<TypePtr> args; // Tuple / Constr / Object (method types)
-  std::vector<std::string> labels;  // Object: method names (parallel to args)
+  std::vector<TypePtr> args; // Tuple / Constr / Object / Variant
+  std::vector<std::string> labels;  // Object: method names; Variant: tag names
+  std::vector<char> tag_has_arg;    // Variant: 1 if the tag carries an argument
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are
@@ -68,6 +72,8 @@ public:
   TypePtr tuple(std::vector<TypePtr> elems);
   TypePtr constr(std::string path, std::vector<TypePtr> args = {}, int stamp = 0);
   TypePtr object_type(std::vector<std::string> names, std::vector<TypePtr> types);
+  TypePtr variant_type(std::vector<std::string> tags, std::vector<TypePtr> argtys,
+                       std::vector<char> has_arg);
 
   // Follow Link chains to the representative (path-compressing).
   static TypePtr repr(TypePtr t);

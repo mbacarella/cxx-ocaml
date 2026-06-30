@@ -2445,6 +2445,15 @@ struct Checker {
         if (auto f = it->find(si->name.txt); f != it->end()) { try_unify(f->second, vt); break; }
       return eng.any();
     }
+    if (auto* pv = std::get_if<Pexp_variant>(&e.desc)) {
+      // A constructed polymorphic variant `` `A [e] `` has the open row type
+      // `[> `A [of t]]`; rows merge through unification (if/match branches).  The
+      // strict pass stays dynamic (matched-only variants are conjunctive -- a
+      // naive row there is unsound; see the reverted attempt).
+      if (strict) { if (pv->arg) infer_expr(**pv->arg); return eng.any(); }
+      TypePtr at = pv->arg ? infer_expr(**pv->arg) : eng.fresh_var();
+      return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)});
+    }
     if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
       // Non-strict passes type the method bodies and build the object type
       // `< m : t; .. >` (the signature pass renders it; the value-kind pass needs
@@ -4210,6 +4219,7 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
     }
     case K::Any: return cmi::cmiw::ty_var(nextvar++);
     case K::Object: return cmi::cmiw::ty_var(nextvar++);  // opaque in the .cmi for now
+    case K::Variant: return cmi::cmiw::ty_var(nextvar++);  // opaque in the .cmi for now
     case K::Arrow:
       return cmi::cmiw::ty_arrow_lbl(bridge_ty(t->dom, vars, nextvar),
                                      bridge_ty(t->cod, vars, nextvar),
