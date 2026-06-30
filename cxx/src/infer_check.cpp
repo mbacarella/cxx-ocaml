@@ -31,6 +31,9 @@ std::string head_cmi(const std::string& head) {
   std::string sp = stdpath(head == "Stdlib" ? "stdlib.cmi" : "stdlib__" + head + ".cmi");
   if (std::filesystem::exists(sp)) return sp;
   std::string low = (char)std::tolower((unsigned char)head[0]) + head.substr(1);
+  // Some stdlib units (CamlinternalLazy, ...) ship as an unprefixed lower-case cmi.
+  std::string lowsp = stdpath(low + ".cmi");
+  if (std::filesystem::exists(lowsp)) return lowsp;
   for (const std::string& d : g_infer_module_dirs) {
     if (std::filesystem::exists(d + "/" + low + ".cmi")) return d + "/" + low + ".cmi";
     if (std::filesystem::exists(d + "/" + head + ".cmi")) return d + "/" + head + ".cmi";
@@ -3838,6 +3841,148 @@ std::vector<std::string> errors(const ast::Structure& s) {
 
 }  // namespace extcheck
 
+// ---------------------------------------------------------------------------
+// Unbound-module check (post-pass): flag a reference to a module whose head is
+// bound nowhere -- not a local module/functor/opened submodule (Checker tracks
+// these via the over-inclusive bound_module_names_), and no loadable cmi.  Run
+// against the FINAL scope sets, so it flags a SUBSET of what the per-reference
+// value check (already sound, reject 0.0%) would -- hence no new false rejects --
+// while covering the type / module-type / module-expr / constructor positions the
+// per-reference checks don't reach.  Only DOTTED paths (or bare module idents in
+// a module position) are module references; a bare lower-case value/type name is
+// not.  Deep-unbound submodules (`M.Gone.x`) are not detected (safe under-mode).
+struct UnboundWalk {
+  Checker* ck;
+  std::string bad;
+  bool done() const { return !bad.empty(); }
+  // A functor-application path (`X.F(Y).t`) has an Lapply node; head extraction
+  // is unreliable there and the applied functor may be local -- skip it.
+  static bool has_lapply(const Longident& id) {
+    if (std::holds_alternative<Lapply>(id.v)) return true;
+    if (auto* d = std::get_if<Ldot>(&id.v)) return has_lapply(*d->prefix);
+    return false;
+  }
+  void flag(const Longident& id) {
+    if (done() || has_lapply(id)) return;
+    if (ck->module_head_unbound(id)) {
+      auto c = Checker::mod_components(id);
+      if (!c.empty()) bad = c[0];
+    }
+  }
+  void path(const Longident& id) { if (std::holds_alternative<Ldot>(id.v)) flag(id); }
+
+  void ty(const CoreType& t) {
+    if (done()) return;
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) { path(c->id.txt); for (auto& a : c->args) ty(*a); }
+    else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) { ty(*a->dom); ty(*a->cod); }
+    else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) { for (auto& x : tu->elems) ty(*x); }
+    else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) ty(*p->type);
+    else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) ty(*al->type);
+  }
+  void pat(const Pattern& p) {
+    if (done()) return;
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) { path(c->id.txt); if (c->arg) pat(**c->arg); }
+    else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) { for (auto& x : t->elems) pat(*x); }
+    else if (auto* a = std::get_if<Ppat_array>(&p.desc)) { for (auto& x : a->elems) pat(*x); }
+    else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) { if (v->arg) pat(**v->arg); }
+    else if (auto* r = std::get_if<Ppat_record>(&p.desc)) { for (auto& f : r->fields) pat(*f.second); }
+    else if (auto* o = std::get_if<Ppat_or>(&p.desc)) { pat(*o->l); pat(*o->r); }
+    else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) pat(*a->p);
+    else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) { pat(*c->p); ty(*c->t); }
+    else if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) pat(*l->p);
+    else if (auto* op = std::get_if<Ppat_open>(&p.desc)) pat(*op->p);
+  }
+  void cse(const Case& c) { if (done()) return; pat(c.lhs); if (c.guard) ex(**c.guard); ex(*c.rhs); }
+  void ex(const Expression& e) {
+    if (done()) return;
+    if (auto* id = std::get_if<Pexp_ident>(&e.desc)) path(id->id.txt);
+    else if (auto* k = std::get_if<Pexp_construct>(&e.desc)) { path(k->id.txt); if (k->arg) ex(**k->arg); }
+    else if (auto* nw = std::get_if<Pexp_new>(&e.desc)) path(nw->id.txt);
+    else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) { ex(*a->fn); for (auto& [_, x] : a->args) ex(*x); }
+    else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) { for (auto& x : t->elems) ex(*x); }
+    else if (auto* l = std::get_if<Pexp_let>(&e.desc)) { for (auto& b : l->bindings) { pat(b.pat); ex(*b.expr); } ex(*l->body); }
+    else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      for (auto& pm : f->params) if (auto* pv = std::get_if<Pparam_val>(&pm.desc)) { pat(pv->pat); if (pv->default_) ex(**pv->default_); }
+      if (auto* fb = std::get_if<Pfunction_body>(&f->body->v)) ex(*fb->e);
+      else for (auto& c : std::get<Pfunction_cases>(f->body->v).cases) cse(c);
+    }
+    else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) { ex(*i->cond); ex(*i->then_); if (i->else_) ex(**i->else_); }
+    else if (auto* m = std::get_if<Pexp_match>(&e.desc)) { ex(*m->e); for (auto& c : m->cases) cse(c); }
+    else if (auto* tr = std::get_if<Pexp_try>(&e.desc)) { ex(*tr->e); for (auto& c : tr->cases) cse(c); }
+    else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) { ex(*s->e1); ex(*s->e2); }
+    else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) { ex(*c->e); ty(*c->t); }
+    else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) { ex(*c->e); if (c->from) ty(**c->from); ty(*c->to_); }
+    else if (auto* f = std::get_if<Pexp_field>(&e.desc)) ex(*f->e);
+    else if (auto* r = std::get_if<Pexp_record>(&e.desc)) { for (auto& [_, x] : r->fields) ex(*x); if (r->base) ex(**r->base); }
+    else if (auto* as = std::get_if<Pexp_assert>(&e.desc)) ex(*as->e);
+    else if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) ex(*lz->e);
+    else if (auto* w = std::get_if<Pexp_while>(&e.desc)) { ex(*w->cond); ex(*w->body); }
+    else if (auto* fo = std::get_if<Pexp_for>(&e.desc)) { pat(fo->var); ex(*fo->lo); ex(*fo->hi); ex(*fo->body); }
+    else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) { if (v->arg) ex(**v->arg); }
+    else if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) ex(*nt->body);
+    else if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) { item(*si->item); ex(*si->body); }
+    else if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) { ex(*sf->obj); ex(*sf->value); }
+    else if (auto* sd = std::get_if<Pexp_send>(&e.desc)) ex(*sd->obj);
+    else if (auto* p = std::get_if<Pexp_poly>(&e.desc)) { ex(*p->e); if (p->t) ty(**p->t); }
+    else if (auto* ar = std::get_if<Pexp_array>(&e.desc)) { for (auto& x : ar->elems) ex(*x); }
+    else if (auto* pk = std::get_if<Pexp_pack>(&e.desc)) mexp(*pk->me);
+    else if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) { ex(*lo->let_.exp); for (auto& a : lo->ands) ex(*a.exp); ex(*lo->body); }
+  }
+  void mty(const ModuleType& m) {
+    if (done()) return;
+    // A bare module-type name (`S`) lives in the module-TYPE namespace, not the
+    // module namespace -- only a DOTTED `M.S` references a module (head M).
+    if (auto* id = std::get_if<Pmty_ident>(&m.desc)) path(id->id.txt);
+    else if (auto* al = std::get_if<Pmty_alias>(&m.desc)) flag(al->id.txt);
+    // A `sig ... end` body introduces LOCAL module scopes our flat bound-set
+    // doesn't model (e.g. `module Spec : ..` then `val f : t Spec.extra`), so we
+    // don't descend into it -- a safe recall trade-off.
+    else if (std::holds_alternative<Pmty_signature>(m.desc)) { /* skip sig body */ }
+    else if (auto* fn = std::get_if<Pmty_functor>(&m.desc)) {
+      if (auto* fp = std::get_if<Functor_named>(&fn->param); fp && fp->type) mty(*fp->type);
+      mty(*fn->body);
+    }
+    else if (auto* w = std::get_if<Pmty_with>(&m.desc)) mty(*w->mt);
+    else if (auto* to = std::get_if<Pmty_typeof>(&m.desc)) mexp(*to->me);
+  }
+  void mexp(const ModuleExpr& m) {
+    if (done()) return;
+    // Only a DOTTED module path (head = a real module) is checkable; a bare
+    // module ident is often a local param/alias our bound-set may not capture.
+    if (auto* id = std::get_if<Pmod_ident>(&m.desc)) path(id->id.txt);
+    else if (auto* st = std::get_if<Pmod_structure>(&m.desc)) for (auto& it : st->items) item(it);
+    else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) { mexp(*c->me); mty(*c->mt); }
+    else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) { mexp(*a->f); mexp(*a->arg); }
+    else if (auto* fn = std::get_if<Pmod_functor>(&m.desc)) {
+      if (auto* fp = std::get_if<Functor_named>(&fn->param); fp && fp->type) mty(*fp->type);
+      mexp(*fn->body);
+    }
+    else if (auto* up = std::get_if<Pmod_unpack>(&m.desc)) ex(*up->e);
+  }
+  void type_decl(const TypeDeclaration& d) {
+    if (d.manifest) ty(**d.manifest);
+    for (auto& p : d.params) ty(*p);
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind))
+      for (auto& c : v->ctors) { if (auto* tu = std::get_if<Pcstr_tuple>(&c.args)) for (auto& a : tu->elems) ty(*a); if (c.res) ty(**c.res); }
+    else if (auto* r = std::get_if<Ptype_record>(&d.kind))
+      for (auto& fld : r->fields) ty(*fld.type);
+    for (auto& tc : d.constraints) { ty(*tc.t1); ty(*tc.t2); }
+  }
+  void item(const StructureItem& it) {
+    if (done()) return;
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) { for (auto& b : v->bindings) { pat(b.pat); ex(*b.expr); } }
+    else if (auto* e = std::get_if<Pstr_eval>(&it.desc)) ex(*e->e);
+    else if (auto* t = std::get_if<Pstr_type>(&it.desc)) for (auto& d : t->decls) type_decl(d);
+    else if (auto* m = std::get_if<Pstr_module>(&it.desc)) mexp(m->binding.expr);
+    else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) for (auto& b : rm->bindings) mexp(b.expr);
+    else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) { if (mt->type) mty(*mt->type); }
+    else if (auto* in = std::get_if<Pstr_include>(&it.desc)) mexp(in->expr);
+    else if (auto* op = std::get_if<Pstr_open>(&it.desc)) mexp(op->expr);
+    else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) { if (p->prim.type) ty(*p->prim.type); }
+    else if (auto* p = std::get_if<Pstr_val>(&it.desc)) ty(*p->vd.type);
+  }
+};
+
 // Strict type-check: returns the definite type errors found (empty => accepted).
 // Conservative — only DEFINITE errors (unqualified unbound value, type clash);
 // unknown/unsupported constructs and qualified names are assumed OK so that
@@ -3851,6 +3996,9 @@ std::vector<std::string> structure_typecheck(const ast::Structure& s) {
   for (auto& e : vr) ck.errors.push_back(std::move(e));
   auto ex = extcheck::errors(s);
   for (auto& e : ex) ck.errors.push_back(std::move(e));
+  { UnboundWalk uw; uw.ck = &ck;
+    for (auto& it : s) { uw.item(it); if (uw.done()) break; }
+    if (uw.done()) ck.errors.push_back("Unbound module " + uw.bad); }
   return std::move(ck.errors);
 }
 
