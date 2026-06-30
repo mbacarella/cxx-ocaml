@@ -444,6 +444,61 @@ struct Typer {
       if (it->count(name)) return true;
     return false;
   }
+  // Mirrors typecore's `turn_let_into_match`: a `let pat = e in body` is typed as
+  // `match e with pat -> body` (and dumped as Texp_match) when the pattern
+  // contains a constructor, an open tuple, or a labelled tuple.
+  bool turn_let_into_match(const ast::Pattern& p) {
+    if (std::holds_alternative<Ppat_construct>(p.desc)) return true;
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      if (t->closed == ClosedFlag::Open) return true;
+      for (auto& l : t->labels) if (l.has_value()) return true;
+      for (auto& e : t->elems) if (turn_let_into_match(*e)) return true;
+    } else if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : a->elems) if (turn_let_into_match(*e)) return true;
+    } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      return turn_let_into_match(*o->l) || turn_let_into_match(*o->r);
+    } else if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
+      return turn_let_into_match(*al->p);
+    } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
+      return turn_let_into_match(*c->p);
+    } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) if (turn_let_into_match(*f.second)) return true;
+    } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
+      return turn_let_into_match(*lz->p);
+    } else if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
+      return turn_let_into_match(*op->p);
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      if (v->arg) return turn_let_into_match(**v->arg);
+    }
+    return false;
+  }
+  // Conservative syntactic irrefutability (drives the synthetic match's Total/
+  // Partial flag): only true when CERTAIN -- so an uncertain single-constructor
+  // type yields Partial (a safe over-approximation that can't falsely accept).
+  bool pat_irrefutable(const ast::Pattern& p) {
+    if (std::holds_alternative<Ppat_any>(p.desc) ||
+        std::holds_alternative<Ppat_var>(p.desc)) return true;
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+        if (l->name == "()" && !c->arg) return true;  // unit is irrefutable
+      return false;
+    }
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      if (t->closed == ClosedFlag::Open) return false;
+      for (auto& e : t->elems) if (!pat_irrefutable(*e)) return false;
+      return true;
+    }
+    if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) if (!pat_irrefutable(*f.second)) return false;
+      return true;
+    }
+    if (auto* al = std::get_if<Ppat_alias>(&p.desc)) return pat_irrefutable(*al->p);
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pat_irrefutable(*c->p);
+    if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return pat_irrefutable(*lz->p);
+    if (auto* op = std::get_if<Ppat_open>(&p.desc)) return pat_irrefutable(*op->p);
+    return false;
+  }
+
   // `a |> b` (%revapply) and `b @@ a` (%apply) are rewritten by the typer to the
   // application `b a`.  Returns 1 for an unshadowed Stdlib `|>`, 2 for `@@`, else
   // 0 -- gated on the operator resolving to Stdlib (not a local/opened rebinding).
@@ -966,6 +1021,25 @@ struct Typer {
     } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
       out.desc = function(*f);
     } else if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
+      // `let pat = e in body` with a constructor/open-tuple/labelled-tuple
+      // pattern is typed as `match e with pat -> body` (single non-rec binding,
+      // no attributes/constraint).
+      if (le->rf == RecFlag::Nonrecursive && le->bindings.size() == 1 &&
+          le->bindings[0].attrs.empty() && !le->bindings[0].constraint_ &&
+          turn_let_into_match(le->bindings[0].pat)) {
+        auto& vb = le->bindings[0];
+        tt::Texp_match tm;
+        tm.scrut = std::make_unique<tt::Expression>(expr(*vb.expr));
+        push();
+        tt::Case cs;
+        cs.lhs = to_computation(vb.pat);
+        cs.rhs = std::make_unique<tt::Expression>(expr(*le->body));
+        tm.cases.push_back(std::move(cs));
+        pop();
+        tm.partial = !pat_irrefutable(vb.pat);
+        out.desc = std::move(tm);
+        return out;
+      }
       tt::Texp_let tl;
       tl.rf = le->rf;
       push();
