@@ -2295,6 +2295,11 @@ struct Checker {
       std::unordered_map<std::string, TypePtr> vars;
       return from_coretype(*co->to_, vars);
     }
+    if (auto* pk = std::get_if<Pexp_pack>(&e.desc)) {
+      // `(module ME : S)` is a first-class module of package type `(module S)`.
+      if (pk->pkg) return package_type(*pk->pkg);
+      return eng.any();  // unconstrained pack: type unknown without the sig
+    }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
       // `lazy e` : e Lazy.t -- only in the value-kinds pass (a concrete type here
       // can clash downstream in an incomplete strict pass and false-reject).
