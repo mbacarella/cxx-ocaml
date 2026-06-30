@@ -4636,7 +4636,16 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
           for (auto& nm : names) emit(nm);
         }
       } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
-        if (const ast::Structure* inc = incstruct(in->expr)) walk(*inc);
+        // `include (struct.. : SIG)`: the exported values are SIG's, in order.
+        if (auto* mc = std::get_if<Pmod_constraint>(&in->expr.desc)) {
+          if (auto* sg = std::get_if<Pmty_signature>(&mc->mt->desc)) {
+            std::vector<std::string> ns;
+            Checker::collect_sig_values(sg->items, ns);
+            for (auto& nm : ns) emit(nm);
+          }
+        } else if (const ast::Structure* inc = incstruct(in->expr)) {
+          walk(*inc);
+        }
       }
     }
   };
