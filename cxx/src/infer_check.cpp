@@ -1867,7 +1867,18 @@ struct Checker {
       TypePtr recTy = nullptr;
       for (auto& [lid, sub] : r->fields) {
         auto it = fields_.find(lid_last(lid.txt));
-        if (it == fields_.end()) { bind_pat_any(*sub); continue; }
+        if (it == fields_.end()) {
+          // The predefined `'a ref = { mutable contents : 'a }`: a `{contents=x}`
+          // pattern types as `'a ref`, binding x:'a (non-strict only -- strict
+          // stays Any since a user record could also declare `contents`).
+          if (!strict && lid_last(lid.txt) == "contents") {
+            TypePtr el = infer_pat(*sub);
+            TypePtr rt = eng.constr("ref", {el});
+            if (recTy) try_unify(recTy, rt); else recTy = rt;
+            continue;
+          }
+          bind_pat_any(*sub); continue;
+        }
         TypePtr s = I::Engine::repr(eng.instantiate(it->second));
         try_unify(infer_pat(*sub), s->cod);
         if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
@@ -2324,6 +2335,15 @@ struct Checker {
         TypePtr rb = I::Engine::repr(bt);
         if (rb->kind == I::Type::Kind::Constr && rb->path == "ref" && rb->args.size() == 1)
           return rb->args[0];
+        // Base not yet known to be a ref: in the non-strict passes commit it to
+        // `'a ref` (the only predefined record with a `contents` field), so
+        // `fun r -> r.contents + 1` infers `int ref -> int`, not `'a -> int`.
+        // Strict stays Any: a user record could also declare `contents`.
+        if (!strict && rb->kind == I::Type::Kind::Var) {
+          TypePtr el = eng.fresh_var();
+          try_unify(bt, eng.constr("ref", {el}));
+          return el;
+        }
       }
       // A module-qualified field `e.M.label` of a stdlib record: its declared type.
       if (auto* d = std::get_if<Ldot>(&fld->field.txt.v))
