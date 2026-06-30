@@ -4149,7 +4149,7 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
   // registration, so every local record construction/projection leaked Any.
   Checker ck;
   run_checker(ck, s);
-  std::vector<std::pair<std::string, std::string>> out;
+  std::vector<std::pair<std::string, std::string>> all;
   for (auto& it : s) {
     auto* sv = std::get_if<Pstr_value>(&it.desc);
     if (!sv) continue;
@@ -4161,10 +4161,17 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
       for (auto& nm : names) {
         auto f = ck.venv.back().find(nm);
         if (f != ck.venv.back().end())
-          out.emplace_back(nm, I::show(f->second));
+          all.emplace_back(nm, I::show(f->second));
       }
     }
   }
+  // A shadowed name appears once in the signature, at (and with the type of) its
+  // LAST binding -- keep only the final occurrence of each name.
+  std::unordered_map<std::string, size_t> last;
+  for (size_t i = 0; i < all.size(); ++i) last[all[i].first] = i;
+  std::vector<std::pair<std::string, std::string>> out;
+  for (size_t i = 0; i < all.size(); ++i)
+    if (last[all[i].first] == i) out.push_back(std::move(all[i]));
   return out;
 }
 
