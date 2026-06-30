@@ -5,6 +5,7 @@
 #include <functional>
 #include <optional>
 #include <set>
+#include <unordered_set>
 #include <unordered_map>
 
 #include "cppcaml/cmi.hpp"
@@ -232,6 +233,10 @@ struct Checker {
   // Pexp_apply node -> reconstructed argument slots (callee-param order, omitted
   // optionals filled), for the dump.  Only stored when non-trivial (see infer_apply).
   std::unordered_map<const Expression*, std::vector<applymatch::Slot>> apply_plans;
+  // Pexp_construct / Ppat_construct nodes whose resolved constructor has arity>1
+  // and is applied to a matching tuple -> the dump flattens the tuple into the
+  // constructor's arguments.  Covers cmi constructors the transcriber can't see.
+  std::unordered_set<const void*> flatten_construct;
   // local module name -> its exported value schemes (so open/include/M.x resolve)
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modenv;
   // local functor name -> its body's exported value schemes (F(X) result)
@@ -1357,6 +1362,25 @@ struct Checker {
   // Any (find_ctor only knows bare names), which loses the type that an optional-
   // argument default pins: predef's `decl0 ?(immediate = Type_immediacy.Unknown)`
   // gives `immediate : Type_immediacy.t`, type-directing a later `~immediate:Always`.
+  // The tuple-arg arity of a qualified constructor `M.C` read straight from M's
+  // cmi (0 when not found / not a Lident-qualified variant) -- so the dump can
+  // flatten `M.C (a, b)` even when C isn't in the inferencer's ctor scope.
+  int qualified_ctor_arity(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return 0;
+    auto* pl = std::get_if<Lident>(&d->prefix->v);
+    if (!pl) return 0;
+    try {
+      auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Variant) continue;
+        for (auto& c : td.ctors)
+          if (c.name == d->name) return (int)c.args.size();
+      }
+    } catch (...) {}
+    return 0;
+  }
+
   TypePtr qualified_ctor_type(const Longident& id) {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return nullptr;
@@ -1647,6 +1671,11 @@ struct Checker {
     if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
       if (!sch) {
+        // A qualified `M.C` not in scope: flatten its tuple by the cmi arity.
+        if (auto* tup = k->arg ? std::get_if<Ppat_tuple>(&(*k->arg)->desc) : nullptr) {
+          int ar = qualified_ctor_arity(k->id.txt);
+          if (ar > 1 && (size_t)ar == tup->elems.size()) flatten_construct.insert(&p);
+        }
         if (k->arg) infer_pat(**k->arg);
         // In the kind pass, return a fresh var (not Any) so unification against
         // the scrutinee binds it to the constructor's real type -- the back end
@@ -1664,6 +1693,7 @@ struct Checker {
         // tuple pattern element-wise; a single tuple-typed argument
         // `A of (t1*t2)` (arity 1) unifies the whole tuple against the one arg.
         if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
+          flatten_construct.insert(&p);
           for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_pat(*tup->elems[i]));
         } else if (!ps.empty()) {
           try_unify(ps[0], infer_pat(**k->arg));
@@ -1966,6 +1996,10 @@ struct Checker {
       if (!sch) {
         // A qualified `M.C` whose bare name isn't in scope: recover its variant
         // type from M's cmi (so an optional-arg default fixes the param type).
+        if (auto* tup = k->arg ? std::get_if<Pexp_tuple>(&(*k->arg)->desc) : nullptr) {
+          int ar = qualified_ctor_arity(k->id.txt);
+          if (ar > 1 && (size_t)ar == tup->elems.size()) flatten_construct.insert(&e);
+        }
         if (TypePtr qt = qualified_ctor_type(k->id.txt)) {
           if (k->arg) infer_expr(**k->arg);
           return qt;
@@ -1978,6 +2012,7 @@ struct Checker {
       if (k->arg) {
         auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
         if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
+          flatten_construct.insert(&e);
           for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_expr(*tup->elems[i]));
         } else if (!ps.empty()) {
           try_unify(ps[0], infer_expr(**k->arg));
@@ -3158,6 +3193,7 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
   DumpAux out;
   out.match_partial = std::move(ck.match_partial);
   out.apply_plans = std::move(ck.apply_plans);
+  out.flatten_construct = std::move(ck.flatten_construct);
   return out;
 }
 

@@ -349,6 +349,9 @@ struct Typer {
   // Pexp_apply in step 3).
   const std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>>*
       apply_plans = nullptr;
+  // Construct nodes whose argument tuple flattens (resolved arity>1, incl. cmi
+  // constructors that the local ctor_arity_ registry can't see).
+  const std::unordered_set<const void*>* flatten_construct = nullptr;
   long long next_stamp = 274;  // arbitrary base; the harness normalizes stamps
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
@@ -855,8 +858,10 @@ struct Typer {
   // typedtree.  `::` is always arity-2; other multi-arg constructors are looked
   // up in ctor_arity_ (local declarations) by simple name, requiring the tuple
   // size to match the arity.  Unknown (external) constructors keep one argument.
-  bool flattens(const std::string& name, size_t tuple_n) {
+  bool flattens(const std::string& name, size_t tuple_n, const void* node) {
     if (name == "::") return true;
+    // The inference side-table flattens by resolved arity (covers cmi ctors).
+    if (flatten_construct && flatten_construct->count(node)) return true;
     size_t dot = name.rfind('.');
     auto it = ctor_arity_.find(dot == std::string::npos ? name
                                                         : name.substr(dot + 1));
@@ -882,7 +887,7 @@ struct Typer {
         bool plain = tup && tup->closed == ClosedFlag::Closed &&
                      std::none_of(tup->labels.begin(), tup->labels.end(),
                                   [](auto& l) { return l.has_value(); });
-        if (plain && flattens(tc.name, tup->elems.size())) {
+        if (plain && flattens(tc.name, tup->elems.size(), &p)) {
           for (auto& el : tup->elems)
             tc.args.push_back(std::make_unique<tt::Pattern>(pattern(*el)));
         } else {
@@ -1107,7 +1112,7 @@ struct Typer {
         bool plain = tup &&
                      std::none_of(tup->labels.begin(), tup->labels.end(),
                                   [](auto& l) { return l.has_value(); });
-        if (plain && flattens(tc.name, tup->elems.size())) {
+        if (plain && flattens(tc.name, tup->elems.size(), &e)) {
           for (auto& el : tup->elems)
             tc.args.push_back(std::make_unique<tt::Expression>(expr(*el)));
         } else {
@@ -1717,6 +1722,7 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   auto aux = infer_dump_aux(s);  // inference side-tables (Slice 3)
   t.partiality = &aux.match_partial;
   t.apply_plans = &aux.apply_plans;
+  t.flatten_construct = &aux.flatten_construct;
   typedtree::Structure out;
   for (auto& it : s) out.push_back(t.structure_item(it));
   return out;

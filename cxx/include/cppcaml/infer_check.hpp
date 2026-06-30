@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,9 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
 struct DumpAux {
   std::unordered_map<const ast::Expression*, bool> match_partial;
   std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>> apply_plans;
+  // Construct nodes (Pexp_construct / Ppat_construct) whose argument tuple the
+  // dump flattens because the resolved constructor has arity>1 (incl. cmi ctors).
+  std::unordered_set<const void*> flatten_construct;
 };
 DumpAux infer_dump_aux(const ast::Structure& s);
 
