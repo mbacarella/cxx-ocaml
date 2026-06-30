@@ -46,6 +46,9 @@ struct DumpAux {
   // Construct nodes (Pexp_construct / Ppat_construct) whose argument tuple the
   // dump flattens because the resolved constructor has arity>1 (incl. cmi ctors).
   std::unordered_set<const void*> flatten_construct;
+  // Functional record-update nodes whose base is an EXTERNAL record type -> its
+  // full ordered field list (for the dump's <kept> fields).
+  std::unordered_map<const ast::Expression*, std::vector<std::string>> record_fields;
 };
 DumpAux infer_dump_aux(const ast::Structure& s);
 

@@ -237,6 +237,11 @@ struct Checker {
   // and is applied to a matching tuple -> the dump flattens the tuple into the
   // constructor's arguments.  Covers cmi constructors the transcriber can't see.
   std::unordered_set<const void*> flatten_construct;
+  // Functional record-update nodes (`{ ext_record with .. }`) whose base resolves
+  // to an EXTERNAL record type -> its full ordered field list, so the dump can
+  // emit the omitted fields as <kept> (the transcriber's registry has only local
+  // records).  Keyed by the Pexp_record node.
+  std::unordered_map<const Expression*, std::vector<std::string>> record_fields;
   // local module name -> its exported value schemes (so open/include/M.x resolve)
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modenv;
   // local functor name -> its body's exported value schemes (F(X) result)
@@ -1381,6 +1386,41 @@ struct Checker {
     return 0;
   }
 
+  // The ordered field names of an external record type named by a dotted path
+  // ("Gc.Memprof.tracker"), found by navigating the cmis (head cmi then nested
+  // submodule signatures).  Empty when not a cmi-resolvable record.
+  std::vector<std::string> cmi_record_fields(const std::string& path) {
+    size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return {};
+    std::string tyname = path.substr(dot + 1), modpath = path.substr(0, dot);
+    std::vector<std::string> comps;
+    for (size_t i = 0;;) {
+      size_t d = modpath.find('.', i);
+      if (d == std::string::npos) { comps.push_back(modpath.substr(i)); break; }
+      comps.push_back(modpath.substr(i, d - i)); i = d + 1;
+    }
+    try {
+      auto cmi = cmi::CmiFile::load(head_cmi(comps[0]));
+      const std::vector<cmi::TypeDecl>* types = &cmi.types();
+      const std::vector<cmi::ModuleDecl>* modules = &cmi.modules();
+      for (size_t k = 1; k < comps.size(); ++k) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& m : *modules) if (m.name == comps[k]) { md = &m; break; }
+        if (!md || !md->type || md->type->kind != cmi::ModuleType::Sig ||
+            !md->type->sig) return {};
+        types = &md->type->sig->types;
+        modules = &md->type->sig->modules;
+      }
+      for (auto& td : *types)
+        if (td.name == tyname && td.kind == cmi::TypeDecl::Record) {
+          std::vector<std::string> fs;
+          for (auto& l : td.labels) fs.push_back(l.name);
+          return fs;
+        }
+    } catch (...) {}
+    return {};
+  }
+
   TypePtr qualified_ctor_type(const Longident& id) {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return nullptr;
@@ -2214,6 +2254,14 @@ struct Checker {
         TypePtr bt = infer_expr(**rc->base);
         for (auto& [lbl, val] : rc->fields) infer_expr(*val);
         strict = sv;
+        // For the dump's `<kept>` fields, resolve an EXTERNAL record type's full
+        // ordered field list from the cmis (local records use the transcriber's
+        // own field registry).
+        { TypePtr rb = I::Engine::repr(bt);
+          if (rb->kind == I::Type::Kind::Constr) {
+            auto fs = cmi_record_fields(rb->path);
+            if (!fs.empty()) record_fields[&e] = std::move(fs);
+          } }
         // The update's type IS the base record's type; returning it (instead of
         // `any`) lets a field read on the result (`let it = {super with ..} in
         // it.it_module_type`) resolve its label through that record type.
@@ -3194,6 +3242,7 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
   out.match_partial = std::move(ck.match_partial);
   out.apply_plans = std::move(ck.apply_plans);
   out.flatten_construct = std::move(ck.flatten_construct);
+  out.record_fields = std::move(ck.record_fields);
   return out;
 }
 

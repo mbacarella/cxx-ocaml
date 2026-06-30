@@ -352,6 +352,10 @@ struct Typer {
   // Construct nodes whose argument tuple flattens (resolved arity>1, incl. cmi
   // constructors that the local ctor_arity_ registry can't see).
   const std::unordered_set<const void*>* flatten_construct = nullptr;
+  // Functional record-update nodes -> the EXTERNAL record type's ordered field
+  // list (for <kept> fields; local records use field_registry).
+  const std::unordered_map<const ast::Expression*, std::vector<std::string>>*
+      record_fields = nullptr;
   long long next_stamp = 274;  // arbitrary base; the harness normalizes stamps
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
@@ -1185,12 +1189,21 @@ struct Typer {
         auto it = field_registry.find(lid_last(rec->fields[0].first.txt));
         if (it != field_registry.end()) info = &it->second;
       }
-      if (info) {  // emit all fields in declaration order, <kept> for omitted
+      // Pick the decl-order field list + representation: the local field registry,
+      // else (an external record update) the inference side-table.
+      const std::vector<std::string>* decl_fields = nullptr;
+      std::string repr = "Record_regular";
+      if (info) { decl_fields = &info->decl_fields; repr = info->repr; }
+      else if (record_fields) {
+        auto it = record_fields->find(&e);
+        if (it != record_fields->end()) decl_fields = &it->second;
+      }
+      if (decl_fields) {  // emit all fields in declaration order, <kept> for omitted
         std::unordered_map<std::string, std::pair<std::string, const ExprBox*>> prov;
         for (auto& [lid, ev] : rec->fields)
           prov[lid_last(lid.txt)] = {lid_str(lid.txt), &ev};
-        tr.representation = info->repr;
-        for (auto& fname : info->decl_fields) {
+        tr.representation = repr;
+        for (auto& fname : *decl_fields) {
           tt::RecordField rf;
           auto p = prov.find(fname);
           if (p != prov.end()) {
@@ -1723,6 +1736,7 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   t.partiality = &aux.match_partial;
   t.apply_plans = &aux.apply_plans;
   t.flatten_construct = &aux.flatten_construct;
+  t.record_fields = &aux.record_fields;
   typedtree::Structure out;
   for (auto& it : s) out.push_back(t.structure_item(it));
   return out;
