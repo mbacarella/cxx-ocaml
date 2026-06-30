@@ -794,6 +794,13 @@ struct Typer {
           p.v = tt::Pdot{std::make_shared<tt::Path>(it->path), l->name};
           return p;
         }
+      // `Stdlib` itself is the global root, not a submodule of Stdlib.
+      if (l->name == "Stdlib") {
+        tt::Path p;
+        p.v = tt::Pident{tt::Ident{"Stdlib", 0, tt::Ident::Global}};
+        return p;
+      }
+      // Other bare names are auto-opened Stdlib submodules (`List` -> Stdlib.List).
       auto pre = std::make_shared<tt::Path>();
       pre->v = tt::Pident{tt::Ident{"Stdlib", 0, tt::Ident::Global}};
       tt::Path p;
