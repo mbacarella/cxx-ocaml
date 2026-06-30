@@ -1555,7 +1555,14 @@ struct Checker {
         auto f = it->find(name);
         if (f != it->end()) return &f->second;
       }
-    if (ambiguous_ctors_.count(name)) return nullptr;
+    // An exception constructor that collides with a stdlib variant ctor (a user
+    // `exception Error of string` vs `Result.Error`) is marked ambiguous, but the
+    // top-level exception definition SHADOWS the stdlib ctor for an unqualified
+    // `Error` -- so in the non-strict passes resolve it to the (last-registered)
+    // exn scheme rather than bailing to Any.  The strict reject pass keeps bailing
+    // (an incorrect pick could false-reject).
+    if (ambiguous_ctors_.count(name) && (strict || !exn_ctors_.count(name)))
+      return nullptr;
     auto it = ctors.find(name);
     return it == ctors.end() ? nullptr : &it->second;
   }
