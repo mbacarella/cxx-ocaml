@@ -2350,9 +2350,12 @@ struct Checker {
       if (auto* d = std::get_if<Ldot>(&fld->field.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
           if (TypePtr ft = stdlib_field_type(pl->name, d->name)) return ft;
-      // kinds pass: an unqualified label through the base's inferred type
-      // (g1.verbose with g1 : Gc.control), so comparisons/kinds specialize.
-      if (record_kinds_) {
+      // Resolve an unqualified label through the base's inferred type
+      // (`(Gc.quick_stat ()).major_collections` with the base : Gc.stat), so the
+      // value-kinds pass specializes comparisons/kinds AND the signature pass
+      // gets the field's real type instead of leaking Any.  Strict stays Any (a
+      // local record could share the label).
+      if (!strict) {
         TypePtr rb = I::Engine::repr(bt);
         if (rb->kind == I::Type::Kind::Constr) {
           auto dpos = rb->path.rfind('.');
