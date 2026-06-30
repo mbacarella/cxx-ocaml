@@ -952,6 +952,22 @@ struct Checker {
     type_ctors["list"] = {"[]", "::"};
     type_ctors["unit"] = {"()"};
     type_ctors["result"] = {"Ok", "Error"};
+    // The predefined exceptions (Stdlib's `Predef`), so an unqualified use pins
+    // its argument's type: `Assert_failure (f, line, 0)` gives line : int.
+    TypePtr exn = eng.constr("exn");
+    TypePtr sii = eng.tuple({eng.constr("string"), eng.constr("int"), eng.constr("int")});
+    for (auto& n : {"Not_found", "Out_of_memory", "Stack_overflow", "End_of_file",
+                    "Division_by_zero", "Sys_blocked_io"})
+      ctors[n] = exn;
+    for (auto& n : {"Failure", "Invalid_argument", "Sys_error"})
+      ctors[n] = eng.arrow(eng.constr("string"), exn);
+    for (auto& n : {"Match_failure", "Assert_failure", "Undefined_recursive_module"})
+      ctors[n] = eng.arrow(sii, exn);
+    for (auto& n : {"Not_found", "Out_of_memory", "Stack_overflow", "End_of_file",
+                    "Division_by_zero", "Sys_blocked_io", "Failure", "Invalid_argument",
+                    "Sys_error", "Match_failure", "Assert_failure",
+                    "Undefined_recursive_module"})
+      exn_ctors_.insert(n);
   }
 
   // Register top-level Stdlib variant CONSTANT constructors (e.g. fpclass's
