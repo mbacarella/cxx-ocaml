@@ -4005,28 +4005,22 @@ std::vector<std::string> structure_typecheck(const ast::Structure& s) {
 
 std::vector<std::pair<std::string, std::string>> infer_structure_types(
     const ast::Structure& s) {
+  // Use the FULL plain-pass pipeline (run_checker registers record fields,
+  // ctors, modules and finalises field uniqueness, and leaves the generalised
+  // top-level schemes in venv.back()).  The earlier reduced loop skipped record
+  // registration, so every local record construction/projection leaked Any.
   Checker ck;
-  ck.register_predef_ctors();
-  // Pre-register variant constructors from all type decls.
-  for (auto& it : s)
-    if (auto* ty = std::get_if<Pstr_type>(&it.desc))
-      for (auto& d : ty->decls) ck.register_type_decl(d);
-
+  run_checker(ck, s);
   std::vector<std::pair<std::string, std::string>> out;
   for (auto& it : s) {
     auto* sv = std::get_if<Pstr_value>(&it.desc);
     if (!sv) continue;
-    try {
-      ck.infer_bindings(sv->rf, sv->bindings);
-      // report the type bound to each simple var name
-      for (auto& b : sv->bindings)
-        if (auto* v = std::get_if<Ppat_var>(&b.pat.desc)) {
-          auto f = ck.venv.back().find(v->name.txt);
-          if (f != ck.venv.back().end())
-            out.emplace_back(v->name.txt, I::show(f->second));
-        }
-    } catch (const I::TypeError&) {
-    }
+    for (auto& b : sv->bindings)
+      if (auto* v = std::get_if<Ppat_var>(&b.pat.desc)) {
+        auto f = ck.venv.back().find(v->name.txt);
+        if (f != ck.venv.back().end())
+          out.emplace_back(v->name.txt, I::show(f->second));
+      }
   }
   return out;
 }
