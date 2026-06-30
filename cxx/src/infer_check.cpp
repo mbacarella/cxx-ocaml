@@ -3727,6 +3727,117 @@ std::vector<std::string> value_rec_errors(const ast::Structure& s) {
 
 }  // namespace valrec
 
+// ---------------------------------------------------------------------------
+// Uninterpreted-extension check: an extension node `[%foo]` / `[%%foo]` that
+// survives to type-checking (no ppx expanded it) is an error, UNLESS it is one
+// of the compiler's built-in extensions.  We flag the first non-built-in
+// extension found anywhere in the structure.  SOUND: the allowlist covers every
+// extension the oracle accepts in the corpus (verified against reject_parity);
+// positions we don't traverse simply go undetected (a safe under-approximation).
+namespace extcheck {
+
+inline bool ext_allowed(const std::string& n) {
+  // Built-in / typer-interpreted extensions (never an "uninterpreted" error).
+  static const std::set<std::string> ok = {
+    "extension_constructor", "ocaml.extension_constructor", "atomic.loc",
+    "src_pos", "call_pos", "probe", "probe_is_enabled", "ocaml.probe",
+  };
+  if (ok.count(n)) return true;
+  return n.rfind("ocaml.", 0) == 0;  // the compiler's builtin attribute namespace
+}
+
+struct Find {
+  std::string bad;  // first offending extension name ("" => none); short-circuits
+  bool done() const { return !bad.empty(); }
+  void hit(const std::string& n) { if (bad.empty() && !ext_allowed(n)) bad = n; }
+
+  void ty(const CoreType& t) {
+    if (done()) return;
+    if (auto* e = std::get_if<Ptyp_extension>(&t.desc)) { hit(e->name); return; }
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) { ty(*a->dom); ty(*a->cod); }
+    else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) { for (auto& x : tu->elems) ty(*x); }
+    else if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) { for (auto& x : c->args) ty(*x); }
+    else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) ty(*p->type);
+    else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) ty(*al->type);
+  }
+  void pat(const Pattern& p) {
+    if (done()) return;
+    if (auto* e = std::get_if<Ppat_extension>(&p.desc)) { hit(e->name); return; }
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) { for (auto& x : t->elems) pat(*x); }
+    else if (auto* a = std::get_if<Ppat_array>(&p.desc)) { for (auto& x : a->elems) pat(*x); }
+    else if (auto* c = std::get_if<Ppat_construct>(&p.desc)) { if (c->arg) pat(**c->arg); }
+    else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) { if (v->arg) pat(**v->arg); }
+    else if (auto* r = std::get_if<Ppat_record>(&p.desc)) { for (auto& f : r->fields) pat(*f.second); }
+    else if (auto* o = std::get_if<Ppat_or>(&p.desc)) { pat(*o->l); pat(*o->r); }
+    else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) pat(*a->p);
+    else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) { pat(*c->p); ty(*c->t); }
+    else if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) pat(*l->p);
+    else if (auto* op = std::get_if<Ppat_open>(&p.desc)) pat(*op->p);
+    else if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) pat(*ex->p);
+  }
+  void cse(const Case& c) { if (done()) return; pat(c.lhs); if (c.guard) ex(**c.guard); ex(*c.rhs); }
+  void ex(const Expression& e) {
+    if (done()) return;
+    if (auto* x = std::get_if<Pexp_extension>(&e.desc)) { hit(x->name); return; }
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc)) { ex(*a->fn); for (auto& [_, x] : a->args) ex(*x); }
+    else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) { for (auto& x : t->elems) ex(*x); }
+    else if (auto* l = std::get_if<Pexp_let>(&e.desc)) { for (auto& b : l->bindings) { pat(b.pat); ex(*b.expr); } ex(*l->body); }
+    else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      for (auto& pm : f->params) if (auto* pv = std::get_if<Pparam_val>(&pm.desc)) { pat(pv->pat); if (pv->default_) ex(**pv->default_); }
+      if (auto* fb = std::get_if<Pfunction_body>(&f->body->v)) ex(*fb->e);
+      else for (auto& c : std::get<Pfunction_cases>(f->body->v).cases) cse(c);
+    }
+    else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) { ex(*i->cond); ex(*i->then_); if (i->else_) ex(**i->else_); }
+    else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) { if (c->arg) ex(**c->arg); }
+    else if (auto* m = std::get_if<Pexp_match>(&e.desc)) { ex(*m->e); for (auto& c : m->cases) cse(c); }
+    else if (auto* tr = std::get_if<Pexp_try>(&e.desc)) { ex(*tr->e); for (auto& c : tr->cases) cse(c); }
+    else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) { ex(*s->e1); ex(*s->e2); }
+    else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) { ex(*c->e); ty(*c->t); }
+    else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) { ex(*c->e); if (c->from) ty(**c->from); ty(*c->to_); }
+    else if (auto* f = std::get_if<Pexp_field>(&e.desc)) ex(*f->e);
+    else if (auto* r = std::get_if<Pexp_record>(&e.desc)) { for (auto& [_, x] : r->fields) ex(*x); if (r->base) ex(**r->base); }
+    else if (auto* as = std::get_if<Pexp_assert>(&e.desc)) ex(*as->e);
+    else if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) ex(*lz->e);
+    else if (auto* w = std::get_if<Pexp_while>(&e.desc)) { ex(*w->cond); ex(*w->body); }
+    else if (auto* fo = std::get_if<Pexp_for>(&e.desc)) { pat(fo->var); ex(*fo->lo); ex(*fo->hi); ex(*fo->body); }
+    else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) { if (v->arg) ex(**v->arg); }
+    else if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) ex(*nt->body);
+    else if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) { item(*si->item); ex(*si->body); }
+    else if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) { ex(*sf->obj); ex(*sf->value); }
+    else if (auto* sd = std::get_if<Pexp_send>(&e.desc)) ex(*sd->obj);
+    else if (auto* p = std::get_if<Pexp_poly>(&e.desc)) { ex(*p->e); if (p->t) ty(**p->t); }
+    else if (auto* ar = std::get_if<Pexp_array>(&e.desc)) { for (auto& x : ar->elems) ex(*x); }
+    else if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) { ex(*lo->let_.exp); for (auto& a : lo->ands) ex(*a.exp); ex(*lo->body); }
+    else if (auto* ov = std::get_if<Pexp_override>(&e.desc)) { for (auto& [_, x] : ov->fields) ex(*x); }
+  }
+  void mexp(const ModuleExpr& m) {
+    if (done()) return;
+    if (auto* e = std::get_if<Pmod_extension>(&m.desc)) { hit(e->name); return; }
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) for (auto& it : st->items) item(it);
+    else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) mexp(*c->me);
+    else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) mexp(*f->body);
+  }
+  void item(const StructureItem& it) {
+    if (done()) return;
+    if (auto* e = std::get_if<Pstr_extension>(&it.desc)) { hit(e->name); return; }
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) { for (auto& b : v->bindings) { pat(b.pat); ex(*b.expr); } }
+    else if (auto* e = std::get_if<Pstr_eval>(&it.desc)) ex(*e->e);
+    else if (auto* m = std::get_if<Pstr_module>(&it.desc)) mexp(m->binding.expr);
+    else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) { if (p->prim.type) ty(*p->prim.type); }
+    else if (auto* p = std::get_if<Pstr_val>(&it.desc)) ty(*p->vd.type);
+  }
+};
+
+std::vector<std::string> errors(const ast::Structure& s) {
+  Find f;
+  for (auto& it : s) { f.item(it); if (f.done()) break; }
+  std::vector<std::string> out;
+  if (f.done()) out.push_back("Uninterpreted extension '" + f.bad + "'.");
+  return out;
+}
+
+}  // namespace extcheck
+
 // Strict type-check: returns the definite type errors found (empty => accepted).
 // Conservative — only DEFINITE errors (unqualified unbound value, type clash);
 // unknown/unsupported constructs and qualified names are assumed OK so that
@@ -3738,6 +3849,8 @@ std::vector<std::string> structure_typecheck(const ast::Structure& s) {
   run_checker(ck, s);
   auto vr = valrec::value_rec_errors(s);
   for (auto& e : vr) ck.errors.push_back(std::move(e));
+  auto ex = extcheck::errors(s);
+  for (auto& e : ex) ck.errors.push_back(std::move(e));
   return std::move(ck.errors);
 }
 
