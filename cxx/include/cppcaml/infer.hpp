@@ -97,6 +97,10 @@ public:
   // Generalize: any variable with level > the current level becomes generic.
   void generalize(const TypePtr& t);
 
+  // Lower (not generalize) a value-restricted binding's vars to the current
+  // level, so a later sibling's generalize() can't wrongly make them generic.
+  void demote(const TypePtr& t);
+
   // Undo trail, for branch-local typing (GADT refinement): every binding made
   // while a window is open is recorded and can be rolled back, so one match
   // arm's refinement (`a := float`) cannot leak into the next (`a := int32`).

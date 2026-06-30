@@ -291,6 +291,34 @@ void Engine::generalize(const TypePtr& t0) {
   }
 }
 
+// Lower a NON-generalized binding's vars (value restriction) to the current
+// level instead of leaving them at the higher binding level.  Otherwise a var
+// created at the inner level but tied to an outer mutable cell (`let r = ref []`)
+// stays trapped above the current level, and a LATER sibling let's generalize()
+// wrongly makes it generic -- breaking `let h e = r := e :: !r in (h, !r)` whose
+// element type must stay shared (`('a -> unit) * 'a list`, not `* 'b list`).
+void Engine::demote(const TypePtr& t0) {
+  TypePtr t = repr(t0);
+  switch (t->kind) {
+    case Type::Kind::Var:
+      if (t->level != GENERIC_LEVEL && t->level > level) { note(t); t->level = level; }
+      break;
+    case Type::Kind::Arrow:
+      demote(t->dom);
+      demote(t->cod);
+      break;
+    case Type::Kind::Tuple:
+    case Type::Kind::Constr:
+    case Type::Kind::Object:
+    case Type::Kind::Variant:
+      for (auto& a : t->args) demote(a);
+      break;
+    case Type::Kind::Link:
+    case Type::Kind::Any:
+      break;
+  }
+}
+
 namespace {
 // `cp` = context precedence required by the parent position: 0 top (arrow ok),
 // 1 arrow-domain (tuple ok, arrow needs parens), 2 atom (both need parens).

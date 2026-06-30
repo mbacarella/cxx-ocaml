@@ -3214,6 +3214,7 @@ struct Checker {
       // `'a list ref`).  Strict pass keeps generalising everything (an
       // over-eager weak var could false-reject a valid polymorphic use).
       if (strict || non_expansive(*b.expr)) eng.generalize(bound);
+      else eng.demote(bound);  // value restriction: lower, don't trap at inner level
       bind_pattern_scheme(b.pat, bound);
     }
   }
