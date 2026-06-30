@@ -2626,6 +2626,15 @@ struct Checker {
       params.push_back({arg, 0, ""});
       body = rt;
     }
+    // A return-type annotation (`fun .. : t -> e`) pins the body's type to t --
+    // resolving fresh/Any results in the signature.  Skipped in the strict pass
+    // (our incomplete inference could make a valid body clash with t and
+    // false-reject); soft elsewhere so a stray clash can't abort the pass.
+    if (f.constraint_ && !strict)
+      if (auto* pc = std::get_if<Pconstraint>(&*f.constraint_)) {
+        std::unordered_map<std::string, TypePtr> vars;
+        soft_unify(body, from_coretype(*pc->type, vars));
+      }
     if (record_kinds_) rec_ret_[&f] = body;
     TypePtr t = body;
     for (auto it = params.rbegin(); it != params.rend(); ++it)
