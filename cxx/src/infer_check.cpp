@@ -473,7 +473,23 @@ struct Checker {
       // A bare reference to a local opaque type carries its identity stamp.
       int stamp = 0;
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
-      return eng.constr(lid_full(c->id.txt), std::move(as), stamp);
+      // A bare type name brought into scope by `open M` (M not Stdlib, not a
+      // local type) renders with M's qualification, matching ocamlc (`c_layout`
+      // after `open Bigarray` -> `Bigarray.c_layout`).
+      if (!stamp)
+        if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+          if (auto q = opened_type_quals_.find(l->name); q != opened_type_quals_.end())
+            return eng.constr(q->second, std::move(as));
+      // `Array1.t` after `open Bigarray` -> `Bigarray.Array1.t` (opened submodule).
+      std::string path = lid_full(c->id.txt);
+      if (std::holds_alternative<Ldot>(c->id.txt.v)) {
+        auto dot = path.find('.');
+        if (dot != std::string::npos)
+          if (auto q = opened_submod_quals_.find(path.substr(0, dot));
+              q != opened_submod_quals_.end())
+            path = q->second + path.substr(dot);
+      }
+      return eng.constr(std::move(path), std::move(as), stamp);
     }
     if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) return package_type(*pk);
     return eng.fresh_var();
@@ -601,6 +617,34 @@ struct Checker {
       if (sig) for (auto& mm : sig->modules) out.insert(mm.name);
     } catch (...) {}
     return out;
+  }
+  // `open M` (M a real, non-Stdlib cmi module): record each of M's type names ->
+  // `M.t`, so a bare annotation `c_layout` after `open Bigarray` renders as the
+  // canonical `Bigarray.c_layout` (ocamlc keeps non-Stdlib opened types
+  // qualified; Stdlib is the default-open we instead SHORTEN, so skip it).
+  std::unordered_map<std::string, std::string> opened_type_quals_;
+  std::unordered_map<std::string, std::string> opened_submod_quals_;  // Array1 -> Bigarray.Array1
+  void load_open_type_quals(const Longident& m) {
+    auto comps = mod_components(m);
+    if (comps.empty() || comps[0] == "Stdlib") return;
+    std::string full = lid_full(m);
+    if (full.rfind("Stdlib.", 0) == 0) return;
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (sig) {
+        for (auto& td : sig->types) opened_type_quals_[td.name] = full + "." + td.name;
+        // A submodule `Array1` of an opened `Bigarray`: a `Array1.t` annotation
+        // qualifies to `Bigarray.Array1.t`.
+        for (auto& mm : sig->modules) opened_submod_quals_[mm.name] = full + "." + mm.name;
+      }
+    } catch (...) {}
   }
   // resolve_module_values memoized by module path (cmi loads are expensive and a
   // file may reference M.x many times).
@@ -3408,8 +3452,10 @@ struct Checker {
           infer_expr(*ev->e);
         else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
-          if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc))  // open M -> M's submodules
+          if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc)) {  // open M -> M's submodules
             for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
+            if (!strict) load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
+          }
         } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
           if (mb->binding.name.txt) {
             // A functor: record its body's exports as the application result.
