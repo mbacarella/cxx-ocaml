@@ -2867,6 +2867,14 @@ struct Checker {
           for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
           std::unordered_map<std::string, TypePtr> vars;
           bind_pattern_scheme(b.pat, from_coretype(*pc->typ, vars));
+        } else if (pc && !strict) {
+          // A plain declared type `let rec x : T = e` pins x to T -- bind the
+          // name to the annotation rather than the (possibly Any) body, so a
+          // body that infers Any (`(module struct end)`) or an under-determined
+          // value (`[||]`) doesn't erase the declared type.  tv stays null: the
+          // body is still inferred below (effects/kinds) but not unified back.
+          std::unordered_map<std::string, TypePtr> vars;
+          bind_pattern_scheme(b.pat, from_coretype(*pc->typ, vars));
         } else {
           tv[i] = infer_pat(b.pat);
         }
