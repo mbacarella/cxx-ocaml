@@ -37,8 +37,14 @@ int main(int argc, char** argv) {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(src, dirfiles);
     if (infer_mode) {  // Slice 2: show inferred top-level value types
-      for (auto& [name, ty] : cppcaml::infer_structure_types(structure))
-        std::cout << "val " << name << " : " << ty << '\n';
+      for (auto& [name, ty] : cppcaml::infer_structure_types(structure)) {
+        // Operators print parenthesised, like `ocamlc -i`: `( *. )` (the spaces
+        // also keep `( * )` from opening a comment).
+        bool op = !name.empty() &&
+                  !(std::isalpha((unsigned char)name[0]) || name[0] == '_');
+        std::string disp = op ? "( " + name + " )" : name;
+        std::cout << "val " << disp << " : " << ty << '\n';
+      }
       return 0;
     }
     if (check_mode) {  // strict type-check: print errors, exit 1 if rejected

@@ -2173,9 +2173,10 @@ struct Checker {
       // (`try (..; assert false) with _ -> 0` is int, from the handler).
       if (auto* ctr = std::get_if<Pexp_construct>(&as->e->desc))
         if (lid_last(ctr->id.txt) == "false") return generic_var();
-      // `assert e` (e != false) is unit (-> the [int] value kind), but a concrete
-      // unit clashes in strict checking, so only commit to unit for kinds.
-      return record_kinds_ ? eng.constr("unit") : eng.any();
+      // `assert e` (e != false) is unit.  A concrete unit can cause our
+      // incomplete strict pass to false-reject, so there alone we keep Any; the
+      // value-kinds and signature passes commit to unit.
+      return strict ? eng.any() : eng.constr("unit");
     }
     // Records, via the unique-label registry (ambiguous labels -> Any).
     if (auto* fld = std::get_if<Pexp_field>(&e.desc)) {
