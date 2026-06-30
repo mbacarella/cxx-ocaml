@@ -63,6 +63,14 @@ struct TypeError : std::runtime_error {
 class Engine {
 public:
   int level = 0;
+  // Best-effort structural unification (signature pass only): a leaf clash
+  // (constr name/arity, tuple arity, incompatible kinds) returns instead of
+  // throwing, so it can't abort a SIBLING unification.  Used to recover
+  // constraint flow through unexpandable functor-result abbreviations -- e.g.
+  // unifying `int -> int -> unit` against `key -> 'a -> unit` where `key` is an
+  // abstract functor-result type: the `int`/`key` clash must not stop `'a` from
+  // being linked to int.  Never set in the strict (reject) or value-kinds pass.
+  bool lenient = false;
   void enter_level() { ++level; }
   void leave_level() { --level; }
 

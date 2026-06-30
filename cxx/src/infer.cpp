@@ -160,8 +160,10 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     return;
   }
   if (a->kind == Type::Kind::Tuple && b->kind == Type::Kind::Tuple) {
-    if (a->args.size() != b->args.size())
+    if (a->args.size() != b->args.size()) {
+      if (lenient) return;
       throw TypeError("tuple arity mismatch");
+    }
     for (size_t i = 0; i < a->args.size(); ++i) unify(a->args[i], b->args[i]);
     return;
   }
@@ -180,10 +182,14 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     // a shadowed `type t`).  This is the only place stamps tighten unification;
     // unstamped constructors fall through to the name-based comparison, so it is
     // purely additive and can't introduce a false rejection.
-    if (a->stamp && b->stamp && a->stamp != b->stamp)
+    if (a->stamp && b->stamp && a->stamp != b->stamp) {
+      if (lenient) return;
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
-    if (last(a->path) != last(b->path) || a->args.size() != b->args.size())
+    }
+    if (last(a->path) != last(b->path) || a->args.size() != b->args.size()) {
+      if (lenient) return;
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
+    }
     for (size_t i = 0; i < a->args.size(); ++i) unify(a->args[i], b->args[i]);
     return;
   }
@@ -213,6 +219,7 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     note(b); b->kind = Type::Kind::Link; b->link = m;
     return;
   }
+  if (lenient) return;
   throw TypeError("cannot unify incompatible types");
 }
 

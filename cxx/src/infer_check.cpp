@@ -4179,6 +4179,7 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
   // top-level schemes in venv.back()).  The earlier reduced loop skipped record
   // registration, so every local record construction/projection leaked Any.
   Checker ck;
+  ck.eng.lenient = true;  // signature pass: best-effort unify (see Engine::lenient)
   run_checker(ck, s);
   std::vector<std::pair<std::string, std::string>> all;
   for (auto& it : s) {
