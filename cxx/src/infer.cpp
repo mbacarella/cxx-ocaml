@@ -312,9 +312,19 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
     }
     case Type::Kind::Arrow:
       if (cp > 0) out += "(";
-      if (t->arrow_label == 1) out += t->arrow_lbl + ":";        // ~lbl:
-      else if (t->arrow_label == 2) out += "?" + t->arrow_lbl + ":";  // ?lbl:
-      show_rec(t->dom, out, 1, names);   // domain: a tuple is fine unparen'd
+      if (t->arrow_label == 1) { out += t->arrow_lbl + ":";        // ~lbl:
+        show_rec(t->dom, out, 1, names);
+      } else if (t->arrow_label == 2) {  // ?lbl: -- internal type is `T option`,
+        out += "?" + t->arrow_lbl + ":";  // but ocamlc displays the bare T
+        TypePtr d = Engine::repr(t->dom);
+        if (d->kind == Type::Kind::Constr && d->args.size() == 1 &&
+            (d->path == "option" || d->path == "Stdlib.option"))
+          show_rec(d->args[0], out, 1, names);
+        else
+          show_rec(t->dom, out, 1, names);
+      } else {
+        show_rec(t->dom, out, 1, names);   // domain: a tuple is fine unparen'd
+      }
       out += " -> ";
       show_rec(t->cod, out, 0, names);   // -> is right-assoc: codomain stays top
       if (cp > 0) out += ")";
