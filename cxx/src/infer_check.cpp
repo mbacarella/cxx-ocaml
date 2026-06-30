@@ -2336,7 +2336,9 @@ struct Checker {
       for (auto& c : tr->cases) {
         check_case_structure(c);
         venv.emplace_back();
-        infer_pat(c.lhs);  // an exception pattern (binds exn-typed vars)
+        // A handler pattern always matches an `exn` value, so pin it -- a bare
+        // `with e -> ..` then gives e : exn (not a free var).
+        try_unify(infer_pat(c.lhs), eng.constr("exn"));
         if (c.guard) try_unify(infer_expr(**c.guard), eng.constr("bool"));
         try_unify(t, infer_expr(*c.rhs));
         venv.pop_back();
