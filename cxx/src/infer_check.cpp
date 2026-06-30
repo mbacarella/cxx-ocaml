@@ -2721,7 +2721,26 @@ struct Checker {
       }
     // `class c = let .. in object`: the local bindings, before the fields.
     if (cl_lets) for (auto* lg : *cl_lets) infer_bindings(lg->rf, lg->bindings);
-    if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = eng.any();
+    // Pre-create a type variable per concrete method and bind `self` to the
+    // object type built from them, so a method body's `self#other` resolves to
+    // the (possibly forward-declared) sibling method's var, which a later
+    // unification ties to that method's body type.  Without this, `self` was
+    // Any and every self-method-call returned Any.
+    std::unordered_map<std::string, TypePtr> mvar;
+    {
+      std::vector<std::string> sn;
+      std::vector<TypePtr> st;
+      for (auto& f : cs.fields)
+        if (auto* m = std::get_if<Pcf_method>(&f.desc))
+          if (std::get_if<Cfk_concrete>(&m->kind)) {
+            TypePtr v = eng.fresh_var();
+            mvar[m->name.txt] = v;
+            sn.push_back(m->name.txt);
+            st.push_back(v);
+          }
+      TypePtr selfTy = eng.object_type(std::move(sn), std::move(st));
+      if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = selfTy;
+    }
     for (auto& f : cs.fields)
       if (auto* v = std::get_if<Pcf_val>(&f.desc))
         if (auto* cc = std::get_if<Cfk_concrete>(&v->kind))
@@ -2740,6 +2759,12 @@ struct Checker {
             std::unordered_map<std::string, TypePtr> vars;
             TypePtr at = from_coretype(*pty, vars);
             if (strict) soft_unify(bt, at); else { try { try_unify(bt, at); } catch (...) {} bt = at; }
+          }
+          // Tie the pre-declared method var to the inferred body type, so any
+          // `self#m` use elsewhere sees the real type.
+          if (auto it = mvar.find(m->name.txt); it != mvar.end()) {
+            try_unify(it->second, bt);
+            bt = it->second;
           }
           mnames.push_back(m->name.txt);
           mtypes.push_back(bt);
