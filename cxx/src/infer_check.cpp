@@ -2446,11 +2446,11 @@ struct Checker {
       return eng.any();
     }
     if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
-      // Only descend for the value-kind pass: typing method bodies gives their
-      // params/results value kinds and records format literals (lowered by Lambda).
-      // In --check mode the object's self/instance-var model is incomplete, so stay
-      // dynamic to avoid false-rejects (the advance-together law).
-      if (record_kinds_) infer_object_body(*ob->cs);
+      // Non-strict passes type the method bodies and build the object type
+      // `< m : t; .. >` (the signature pass renders it; the value-kind pass needs
+      // the bodies for kinds/format literals).  The strict pass stays dynamic --
+      // its self/instance-var model is incomplete (avoid false-rejects).
+      if (!strict) return infer_object_body(*ob->cs);
       return eng.any();
     }
     return eng.any();  // records/fields/objects/etc. unhandled: dynamic, no clash
@@ -2624,9 +2624,13 @@ struct Checker {
   // Type an object/class body for value kinds: instance vars from their initialiser,
   // method/initializer bodies (so params/results get kinds and format literals are
   // recorded).  Value-kind pass only.
-  void infer_object_body(const ast::ClassStructure& cs,
+  // Infer an object/class body; returns the object type `< m : t; .. >` (concrete
+  // methods only -- inherited/virtual methods would need the full class model).
+  TypePtr infer_object_body(const ast::ClassStructure& cs,
                          const std::vector<const ast::Pcl_fun*>* cl_params = nullptr,
                          const std::vector<const ast::Pcl_let*>* cl_lets = nullptr) {
+    std::vector<std::string> mnames;
+    std::vector<TypePtr> mtypes;
     venv.emplace_back();
     // Class parameters: bind each so a val initialiser referencing one shares its
     // type var with the instance variable (method-body unification then flows back).
@@ -2653,10 +2657,13 @@ struct Checker {
             body = poly->e.get();
           }
           TypePtr bt = infer_expr(*body);
-          if (pty) {  // value-kind flow only: clashes are swallowed
+          if (pty) {  // an annotated method type pins the signature
             std::unordered_map<std::string, TypePtr> vars;
-            soft_unify(bt, from_coretype(*pty, vars));
+            TypePtr at = from_coretype(*pty, vars);
+            if (strict) soft_unify(bt, at); else { try { try_unify(bt, at); } catch (...) {} bt = at; }
           }
+          mnames.push_back(m->name.txt);
+          mtypes.push_back(bt);
         }
       } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
         infer_expr(*ini->e);
@@ -2666,6 +2673,7 @@ struct Checker {
       }
     }
     venv.pop_back();
+    return eng.object_type(std::move(mnames), std::move(mtypes));
   }
 
   TypePtr infer_function(const Pexp_function& f) {
@@ -4201,6 +4209,7 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
       int id = nextvar++; vars[t.get()] = id; return cmi::cmiw::ty_var(id);
     }
     case K::Any: return cmi::cmiw::ty_var(nextvar++);
+    case K::Object: return cmi::cmiw::ty_var(nextvar++);  // opaque in the .cmi for now
     case K::Arrow:
       return cmi::cmiw::ty_arrow_lbl(bridge_ty(t->dom, vars, nextvar),
                                      bridge_ty(t->cod, vars, nextvar),

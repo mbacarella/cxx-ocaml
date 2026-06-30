@@ -46,6 +46,15 @@ TypePtr Engine::constr(std::string path, std::vector<TypePtr> args, int stamp) {
   return t;
 }
 
+TypePtr Engine::object_type(std::vector<std::string> names, std::vector<TypePtr> types) {
+  auto t = std::make_shared<Type>();
+  t->kind = Type::Kind::Object;
+  t->labels = std::move(names);
+  t->args = std::move(types);
+  t->id = next_id_++;
+  return t;
+}
+
 Engine* Engine::trail_owner_ = nullptr;
 
 void Engine::note(const TypePtr& n) {
@@ -100,6 +109,7 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
       break;
     case Type::Kind::Tuple:
     case Type::Kind::Constr:
+    case Type::Kind::Object:
       for (auto& a : t->args) occurs_and_lower(var, a);
       break;
     case Type::Kind::Link:
@@ -165,6 +175,15 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     for (size_t i = 0; i < a->args.size(); ++i) unify(a->args[i], b->args[i]);
     return;
   }
+  if (a->kind == Type::Kind::Object && b->kind == Type::Kind::Object) {
+    // Unify the types of methods present in both; don't require equal method
+    // sets (an open object row would need row variables, which we don't model --
+    // best-effort, and only ever in the non-strict passes).
+    for (size_t i = 0; i < a->labels.size(); ++i)
+      for (size_t j = 0; j < b->labels.size(); ++j)
+        if (a->labels[i] == b->labels[j]) unify(a->args[i], b->args[j]);
+    return;
+  }
   throw TypeError("cannot unify incompatible types");
 }
 
@@ -194,6 +213,11 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         for (auto& a : t->args) as.push_back(copy(a));
         return constr(t->path, std::move(as), t->stamp);
       }
+      case Type::Kind::Object: {
+        std::vector<TypePtr> as;
+        for (auto& a : t->args) as.push_back(copy(a));
+        return object_type(t->labels, std::move(as));
+      }
       case Type::Kind::Link:
         return copy(t);  // repr resolved; unreachable
       case Type::Kind::Any:
@@ -216,6 +240,7 @@ void Engine::generalize(const TypePtr& t0) {
       break;
     case Type::Kind::Tuple:
     case Type::Kind::Constr:
+    case Type::Kind::Object:
       for (auto& a : t->args) generalize(a);
       break;
     case Type::Kind::Link:
@@ -280,6 +305,16 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       // Lazy.t is the public abbreviation of CamlinternalLazy.t; print the former.
       if (path == "CamlinternalLazy.t") path = "Lazy.t";
       out += path;
+      break;
+    }
+    case Type::Kind::Object: {
+      out += "< ";
+      for (size_t i = 0; i < t->labels.size(); ++i) {
+        if (i) out += "; ";
+        out += t->labels[i] + " : ";
+        show_rec(t->args[i], out, 0, names);
+      }
+      out += " >";
       break;
     }
     case Type::Kind::Link:

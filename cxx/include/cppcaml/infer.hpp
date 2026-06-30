@@ -29,7 +29,10 @@ struct Type {
   // Any is a dynamic/unknown type for values we cannot infer (qualified lookups,
   // unresolved record fields, ambiguous constructors): it unifies with anything
   // without clashing or propagating, so it never causes a false rejection.
-  enum class Kind { Var, Arrow, Tuple, Constr, Link, Any };
+  // Object is a structural object type `< m1 : t1; m2 : t2 >` (method names in
+  // `labels`, types in `args`).  It is produced ONLY in the non-strict passes
+  // (signature/value-kinds), so the strict pass never has to reason about it.
+  enum class Kind { Var, Arrow, Tuple, Constr, Link, Any, Object };
   Kind kind = Kind::Var;
   int level = 0;             // Var: binding level (GENERIC_LEVEL if generalized)
   int id = 0;                // unique id (occurs-check / debug printing)
@@ -37,7 +40,8 @@ struct Type {
   TypePtr dom, cod;          // Arrow
   int arrow_label = 0;       // Arrow: 0 Nolabel, 1 Labelled, 2 Optional
   std::string arrow_lbl;     // Arrow: label name (when Labelled/Optional)
-  std::vector<TypePtr> args; // Tuple / Constr
+  std::vector<TypePtr> args; // Tuple / Constr / Object (method types)
+  std::vector<std::string> labels;  // Object: method names (parallel to args)
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are
@@ -63,6 +67,7 @@ public:
   TypePtr arrow(TypePtr dom, TypePtr cod, int label = 0, std::string lbl = "");
   TypePtr tuple(std::vector<TypePtr> elems);
   TypePtr constr(std::string path, std::vector<TypePtr> args = {}, int stamp = 0);
+  TypePtr object_type(std::vector<std::string> names, std::vector<TypePtr> types);
 
   // Follow Link chains to the representative (path-compressing).
   static TypePtr repr(TypePtr t);
