@@ -225,7 +225,10 @@ void Engine::generalize(const TypePtr& t0) {
 }
 
 namespace {
-void show_rec(const TypePtr& t0, std::string& out, bool paren,
+// `cp` = context precedence required by the parent position: 0 top (arrow ok),
+// 1 arrow-domain (tuple ok, arrow needs parens), 2 atom (both need parens).
+// `*` binds tighter than `->`, so a tuple in arrow-domain position is unparen'd.
+void show_rec(const TypePtr& t0, std::string& out, int cp,
               std::unordered_map<Type*, std::string>& names) {
   TypePtr t = Engine::repr(t0);
   switch (t->kind) {
@@ -241,27 +244,27 @@ void show_rec(const TypePtr& t0, std::string& out, bool paren,
       break;
     }
     case Type::Kind::Arrow:
-      if (paren) out += "(";
-      show_rec(t->dom, out, true, names);
+      if (cp > 0) out += "(";
+      show_rec(t->dom, out, 1, names);   // domain: a tuple is fine unparen'd
       out += " -> ";
-      show_rec(t->cod, out, false, names);
-      if (paren) out += ")";
+      show_rec(t->cod, out, 0, names);   // -> is right-assoc: codomain stays top
+      if (cp > 0) out += ")";
       break;
     case Type::Kind::Tuple:
-      if (paren) out += "(";
+      if (cp > 1) out += "(";
       for (size_t i = 0; i < t->args.size(); ++i) {
         if (i) out += " * ";
-        show_rec(t->args[i], out, true, names);
+        show_rec(t->args[i], out, 2, names);  // components bind tighter than *
       }
-      if (paren) out += ")";
+      if (cp > 1) out += ")";
       break;
     case Type::Kind::Constr:
-      if (t->args.size() == 1) { show_rec(t->args[0], out, true, names); out += " "; }
+      if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names); out += " "; }
       else if (t->args.size() > 1) {
         out += "(";
         for (size_t i = 0; i < t->args.size(); ++i) {
           if (i) out += ", ";
-          show_rec(t->args[i], out, false, names);
+          show_rec(t->args[i], out, 0, names);
         }
         out += ") ";
       }
@@ -279,7 +282,7 @@ void show_rec(const TypePtr& t0, std::string& out, bool paren,
 std::string show(const TypePtr& t) {
   std::string out;
   std::unordered_map<Type*, std::string> names;
-  show_rec(t, out, false, names);
+  show_rec(t, out, 0, names);
   return out;
 }
 

@@ -2163,7 +2163,7 @@ struct Checker {
       // `lazy e` : e Lazy.t -- only in the value-kinds pass (a concrete type here
       // can clash downstream in an incomplete strict pass and false-reject).
       TypePtr inner = infer_expr(*lz->e);
-      return record_kinds_ ? eng.constr("Lazy.t", {inner}) : eng.any();
+      return strict ? eng.any() : eng.constr("Lazy.t", {inner});
     }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
       infer_expr(*as->e);  // infer the condition (flows operand kinds, e.g. x:int)
