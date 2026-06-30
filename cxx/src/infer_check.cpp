@@ -2430,6 +2430,14 @@ struct Checker {
       // `let open M in e`, `let module M = ... in e`, `let exception ... in e`:
       // process the item into a fresh scope, then type the body.
       venv.emplace_back();
+      // A LOCAL exception / type extension is only seen here (the top-level
+      // register_types_rec pass that registers exception/typext ctors never
+      // descends into expressions), so register its ctors now -- otherwise
+      // `let exception E of t in E x` leaves `E x` as Any instead of exn.
+      if (auto* ex = std::get_if<Pstr_exception>(&sti->item->desc))
+        register_exception(ex->exn.ctor);
+      else if (auto* tx = std::get_if<Pstr_typext>(&sti->item->desc))
+        register_typext(tx->ext);
       process_item(*sti->item);
       TypePtr bt = infer_expr(*sti->body);
       venv.pop_back();
