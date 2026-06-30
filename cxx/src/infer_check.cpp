@@ -226,6 +226,20 @@ struct Checker {
   // scheme arrow(recordType, fieldType).  Ambiguous labels are omitted (type-
   // directed disambiguation needed) and left to Any, so this can't pick wrong.
   std::unordered_map<std::string, TypePtr> fields_;
+  // Record-field schemes loaded from OPENED external modules (e.g. `open
+  // Effect.Deep` brings the `handler` record's retc/exnc/effc fields).  A pure
+  // FALLBACK consulted only when fields_ misses, so it can't disturb local
+  // record uniqueness; used (uniquely) per label.  label -> candidate schemes.
+  std::unordered_map<std::string, std::vector<TypePtr>> ext_fields_;
+  // The scheme for a record field: a local unique field, else a unique external
+  // (opened-module) field; null if unknown/ambiguous.
+  TypePtr field_scheme(const std::string& label) {
+    auto it = fields_.find(label);
+    if (it != fields_.end()) return it->second;
+    auto e = ext_fields_.find(label);
+    if (e != ext_fields_.end() && e->second.size() == 1) return e->second[0];
+    return nullptr;
+  }
   std::unordered_map<std::string, std::vector<TypePtr>> field_candidates_;
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
@@ -658,6 +672,52 @@ struct Checker {
       }
     } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
     return out;
+  }
+
+  // Load the record-field schemes of every record type in module `m` (navigated
+  // through the cmis) into ext_fields_, qualified (`Effect.Deep.handler`).  So a
+  // construction `{ retc; exnc; effc }` after `open Effect.Deep` resolves to the
+  // handler record and its result type flows (match_with's `'c` -> unit).
+  void load_module_record_fields(const Longident& m) {
+    auto comps = mod_components(m);
+    if (comps.empty()) return;
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (!sig) return;
+      std::string pfx;
+      for (auto& cmp : comps) { if (!pfx.empty()) pfx += '.'; pfx += cmp; }
+      cmi_types_ctx_ = &sig->types;
+      cmi_mod_prefix_ = pfx;
+      for (auto& td : sig->types) {
+        if (td.kind != cmi::TypeDecl::Record || td.labels.empty()) continue;
+        std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+        std::vector<TypePtr> params;
+        for (auto& p : td.params) params.push_back(from_cmi(p, memo));
+        TypePtr recTy = eng.constr(pfx + "." + td.name, params);
+        for (auto& l : td.labels)
+          ext_fields_[l.name].push_back(eng.arrow(recTy, from_cmi(l.type, memo)));
+      }
+      cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
+    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
+  }
+  // Scan top-level `open M` / `include M` (M a plain module path) and load their
+  // record fields, so external record constructions resolve.
+  void load_open_record_fields(const ast::Structure& items) {
+    for (auto& it : items) {
+      const ModuleExpr* me = nullptr;
+      if (auto* op = std::get_if<Pstr_open>(&it.desc)) me = &op->expr;
+      else if (auto* in = std::get_if<Pstr_include>(&it.desc)) me = &in->expr;
+      if (me)
+        if (auto* pi = std::get_if<Pmod_ident>(&me->desc))
+          load_module_record_fields(pi->id.txt);
+    }
   }
 
   // Resolve a functor application F(...)'s result value *names*, bound to fresh
@@ -2180,9 +2240,8 @@ struct Checker {
     }
     // Records, via the unique-label registry (ambiguous labels -> Any).
     if (auto* fld = std::get_if<Pexp_field>(&e.desc)) {
-      auto it = fields_.find(lid_last(fld->field.txt));
-      if (it != fields_.end()) {
-        TypePtr s = I::Engine::repr(eng.instantiate(it->second));  // recTy -> fldTy
+      if (TypePtr fsch = field_scheme(lid_last(fld->field.txt))) {
+        TypePtr s = I::Engine::repr(eng.instantiate(fsch));  // recTy -> fldTy
         TypePtr bt = infer_expr(*fld->e);
         try_unify(bt, s->dom);
         // A label the inferencer sees as UNIQUE (it models only local records) can
@@ -2280,9 +2339,9 @@ struct Checker {
         bool sv = strict; strict = false;
         TypePtr vt = infer_expr(*val);
         strict = sv;
-        auto it = fields_.find(lid_last(lbl.txt));
-        if (it == fields_.end()) continue;
-        TypePtr s = I::Engine::repr(eng.instantiate(it->second));
+        TypePtr fsch = field_scheme(lid_last(lbl.txt));
+        if (!fsch) continue;
+        TypePtr s = I::Engine::repr(eng.instantiate(fsch));
         try_unify(vt, s->cod);
         if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
       }
@@ -2319,9 +2378,8 @@ struct Checker {
       return recTy ? recTy : eng.any();
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
-      auto it = fields_.find(lid_last(sf->field.txt));
-      if (it != fields_.end()) {
-        TypePtr s = I::Engine::repr(eng.instantiate(it->second));
+      if (TypePtr fsch = field_scheme(lid_last(sf->field.txt))) {
+        TypePtr s = I::Engine::repr(eng.instantiate(fsch));
         try_unify(infer_expr(*sf->obj), s->dom);
         try_unify(infer_expr(*sf->value), s->cod);
       } else { infer_expr(*sf->obj); infer_expr(*sf->value); }
@@ -3234,6 +3292,7 @@ static void run_checker(Checker& ck, const ast::Structure& s) {
   ck.register_stdlib_ctors();
   ck.collect_bound_modules(s);  // pre-collect bound module names (before type checks)
   register_types_rec(ck, s);
+  ck.load_open_record_fields(s);
   ck.finalize_fields();
   ck.check_cyclic_aliases();
   ck.check_dup_modtypes_struct(s);
