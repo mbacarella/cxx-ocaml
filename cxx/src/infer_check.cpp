@@ -590,10 +590,15 @@ struct Checker {
   // resolve_module_values memoized by module path (cmi loads are expensive and a
   // file may reference M.x many times).
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modvals_cache_;
+  std::set<std::string> loaded_field_mods_;  // modules whose record fields we loaded
   const std::unordered_map<std::string, TypePtr>& module_values_cached(const Longident& m) {
     std::string key = lid_full(m);
     auto it = modvals_cache_.find(key);
     if (it != modvals_cache_.end()) return it->second;
+    // First reference to module m: also load its record fields, so a
+    // type-directed construction `Effect.Deep.match_with f x { retc = .. }`
+    // resolves the handler record without an explicit `open Effect.Deep`.
+    if (loaded_field_mods_.insert(key).second) load_module_record_fields(m);
     return modvals_cache_.emplace(key, resolve_module_values(m)).first->second;
   }
 
