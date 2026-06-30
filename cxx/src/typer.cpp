@@ -323,6 +323,16 @@ inline tt::ExprBox make(const std::string& s, const Location& sloc) {
 }
 }  // namespace fmtlib
 
+// True when a path's root identifier is a global (cmi-loaded) module, e.g.
+// `Stdlib!.Set.Make` -- but not a locally-bound `Mods/279.F`.
+bool path_root_global(const tt::Path& p) {
+  if (auto* pi = std::get_if<tt::Pident>(&p.v))
+    return pi->id.kind == tt::Ident::Global;
+  if (auto* pd = std::get_if<tt::Pdot>(&p.v))
+    return path_root_global(*pd->prefix);
+  return false;
+}
+
 // Build the Stdlib path Stdlib!.name (Pdot over a global Stdlib ident).
 tt::Path stdlib_path(const std::string& name) {
   auto pre = std::make_shared<tt::Path>();
@@ -590,6 +600,7 @@ struct Typer {
     out.id = fresh_anon(c.name.txt);
     out.args = ctor_args(decl->args);
     if (decl->res) out.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
+    if (!c.attrs.empty()) out.attrs = &c.attrs;
     return out;
   }
 
@@ -608,6 +619,7 @@ struct Typer {
     out.mutable_ = f.mut == MutableFlag::Mutable;
     out.id = fresh_anon(f.name.txt);
     out.type = poly_wrap(*f.type);
+    if (!f.attrs.empty()) out.attrs = &f.attrs;
     return out;
   }
 
@@ -1304,8 +1316,18 @@ struct Typer {
       module_scope = std::move(saved);
       out.desc = std::move(tf);
     } else if (auto* ap = std::get_if<Pmod_apply>(&me.desc)) {
+      auto fnme = std::make_unique<tt::ModuleExpr>(module_expr(*ap->f));
+      // A cmi-loaded (global-rooted) functor path carries an implicit
+      // strengthening coercion -- a transparent extra module_expr in the dump.
+      if (auto* mi = std::get_if<tt::Tmod_ident>(&fnme->desc))
+        if (path_root_global(mi->path)) {
+          auto wrap = std::make_unique<tt::ModuleExpr>();
+          wrap->loc = fnme->loc;
+          wrap->desc = tt::Tmod_constraint{std::move(fnme), nullptr, true};
+          fnme = std::move(wrap);
+        }
       out.desc = tt::Tmod_apply{
-          std::make_unique<tt::ModuleExpr>(module_expr(*ap->f)),
+          std::move(fnme),
           std::make_unique<tt::ModuleExpr>(module_expr(*ap->arg))};
     } else if (auto* cn = std::get_if<Pmod_constraint>(&me.desc)) {
       out.desc = tt::Tmod_constraint{

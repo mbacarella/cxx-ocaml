@@ -202,6 +202,7 @@ struct LabelDecl {
   bool atomic = false;
   Ident id;
   CoreType type;  // already Ttyp_poly-wrapped (record fields always are)
+  const ast::Attributes* attrs = nullptr;
 };
 struct ConstructorDecl {
   Location loc;
@@ -273,6 +274,7 @@ struct ExtCtor {
   Ident id;
   std::vector<CoreTypeBox> args;
   std::optional<CoreTypeBox> res;
+  const ast::Attributes* attrs = nullptr;
 };
 struct Tstr_exception {
   ExtCtor ctor;
@@ -345,7 +347,10 @@ struct Tmod_functor {
   ModuleExprBox body;
 };
 struct Tmod_apply { ModuleExprBox fn; ModuleExprBox arg; };
-struct Tmod_constraint { ModuleExprBox expr; ModuleTypeBox2 type; };
+// `implicit` = OCaml's Tmodtype_implicit (e.g. the strengthening coercion on a
+// cmi-loaded functor in `Set.Make(..)`): printed as a transparent extra
+// module_expr layer, with no "Tmod_constraint" label and no module_type.
+struct Tmod_constraint { ModuleExprBox expr; ModuleTypeBox2 type; bool implicit = false; };
 struct ModuleExpr {
   std::variant<Tmod_ident, Tmod_structure, Tmod_functor, Tmod_apply,
                Tmod_constraint>

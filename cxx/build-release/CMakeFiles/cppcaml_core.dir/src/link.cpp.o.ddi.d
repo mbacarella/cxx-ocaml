@@ -164,18 +164,25 @@ CMakeFiles/cppcaml_core.dir/src/link.cpp.o.ddi: \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_vector.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_bvector.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/vector.tcc \
+  /home/mbac/code/c++caml/cxx/include/cppcaml/cmi.hpp \
+  /home/mbac/code/c++caml/cxx/include/cppcaml/marshal.hpp \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/cstdint \
   /nix/store/1v9ggwkpb0xy708s11s1g9fhinn3b06r-glibc-2.40-66-dev/include/stdint.h \
   /nix/store/1v9ggwkpb0xy708s11s1g9fhinn3b06r-glibc-2.40-66-dev/include/bits/stdint-uintn.h \
   /nix/store/1v9ggwkpb0xy708s11s1g9fhinn3b06r-glibc-2.40-66-dev/include/bits/stdint-least.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/fstream \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/istream \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/ios \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/stdexcept \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/exception \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/exception_ptr.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/cxxabi_init_exception.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/typeinfo \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/nested_exception.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/memory \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_tempbuf.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_raw_storage_iter.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/align.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/unique_ptr.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/ostream \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/ios \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/ios_base.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/ext/atomicity.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/x86_64-unknown-linux-gnu/bits/gthr.h \
@@ -199,7 +206,6 @@ CMakeFiles/cppcaml_core.dir/src/link.cpp.o.ddi: \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/locale_classes.tcc \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/system_error \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/x86_64-unknown-linux-gnu/bits/error_constants.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/stdexcept \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/streambuf \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/streambuf.tcc \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/basic_ios.h \
@@ -212,7 +218,6 @@ CMakeFiles/cppcaml_core.dir/src/link.cpp.o.ddi: \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/x86_64-unknown-linux-gnu/bits/ctype_inline.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/locale_facets.tcc \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/basic_ios.tcc \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/ostream \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/format \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/array \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/charconv \
@@ -237,32 +242,12 @@ CMakeFiles/cppcaml_core.dir/src/link.cpp.o.ddi: \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/algorithmfwd.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_heap.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/uniform_int_dist.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_tempbuf.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/unicode-data.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/ostream.tcc \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/istream.tcc \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/x86_64-unknown-linux-gnu/bits/basic_file.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/x86_64-unknown-linux-gnu/bits/c++io.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/fstream.tcc \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/map \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_tree.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/ext/aligned_buffer.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/node_handle.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_map.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_multimap.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/erase_if.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/set \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_set.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_multiset.h \
-  /home/mbac/code/c++caml/cxx/include/cppcaml/marshal.hpp \
-  /home/mbac/code/c++caml/cxx/include/cppcaml/omarshal.hpp \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/memory \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_raw_storage_iter.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/align.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/unique_ptr.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/shared_ptr.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/shared_ptr_base.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/allocated_ptr.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/ext/aligned_buffer.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/ext/concurrence.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/shared_ptr_atomic.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/atomic_base.h \
@@ -296,4 +281,29 @@ CMakeFiles/cppcaml_core.dir/src/link.cpp.o.ddi: \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/ranges_uninitialized.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/out_ptr.h \
   /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/pstl/glue_memory_defs.h \
-  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/pstl/execution_defs.h
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/pstl/execution_defs.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/unordered_map \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/unordered_map.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/hashtable.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/hashtable_policy.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/node_handle.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/erase_if.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/utility \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_relops.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/algorithm \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/ranges_algo.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/pstl/glue_algorithm_defs.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/fstream \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/istream \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/istream.tcc \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/x86_64-unknown-linux-gnu/bits/basic_file.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/x86_64-unknown-linux-gnu/bits/c++io.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/fstream.tcc \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/map \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_tree.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_map.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_multimap.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/set \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_set.h \
+  /nix/store/y28c83zz73yr4vwz1fsl4nsrn6yz5fj0-gcc-14.3.0/include/c++/14.3.0/bits/stl_multiset.h \
+  /home/mbac/code/c++caml/cxx/include/cppcaml/omarshal.hpp

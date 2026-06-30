@@ -195,6 +195,7 @@ struct Printer {
 
   void label_decl(int i, const LabelDecl& ld) {
     line(i, loc(ld.loc));
+    if (ld.attrs) attributes(i, *ld.attrs);
     line(i + 1, ld.mutable_ ? "Mutable" : "Immutable");
     line(i + 1, ld.atomic ? "Atomic" : "Nonatomic");
     os << std::string(2 * (i + 1), ' ') << ident(ld.id);  // run-on (no newline)
@@ -243,6 +244,7 @@ struct Printer {
 
   void extension_constructor(int i, const ExtCtor& c) {
     line(i, "extension_constructor " + loc(c.loc));
+    if (c.attrs) attributes(i, *c.attrs);
     line(i + 1, "pext_name = \"" + ident(c.id) + "\"");
     line(i + 1, "pext_kind =");
     line(i + 2, "Text_decl");
@@ -558,9 +560,13 @@ struct Printer {
       module_expr(j, *ap->arg);
     } else {
       auto& cn = std::get<Tmod_constraint>(me.desc);
-      line(j, "Tmod_constraint");
-      module_expr(j, *cn.expr);
-      module_type(j, *cn.type);
+      if (cn.implicit) {  // transparent: just the inner module_expr (printtyped.ml)
+        module_expr(j, *cn.expr);
+      } else {
+        line(j, "Tmod_constraint");
+        module_expr(j, *cn.expr);
+        module_type(j, *cn.type);
+      }
     }
   }
 
