@@ -1911,6 +1911,38 @@ struct Checker {
     return nullptr;
   }
 
+  // `open M` (or a local `M.(..)` open) brings M's variant constructors into bare
+  // scope, so `open Arg in [ Unit f; Set r ]` resolves `Unit`/`Set` to `Arg.spec`.
+  // We register each into the scoped `cenv` (generalised, so each use instantiates
+  // fresh).  Non-strict only -- a wrong pick can't reach the strict reject pass.
+  void open_module_ctors(const Longident& modid) {
+    auto* pl = std::get_if<Lident>(&modid.v);
+    if (!pl) return;  // single-name modules only (matches qualified_ctor_scheme)
+    try {
+      auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Variant) continue;
+        for (auto& c : td.ctors) {
+          if (c.is_inline_record) continue;
+          std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+          std::vector<TypePtr> params;
+          for (auto& p : td.params) {
+            TypePtr v = eng.fresh_var();
+            if (p) memo[p.get()] = v;
+            params.push_back(v);
+          }
+          TypePtr result = c.res ? from_cmi(c.res, memo)
+                                 : eng.constr(pl->name + "." + td.name, params);
+          TypePtr scheme = result;
+          for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
+            scheme = eng.arrow(from_cmi(*it, memo), scheme);
+          eng.generalize(scheme);
+          cenv.back()[c.name] = scheme;
+        }
+      }
+    } catch (...) {}
+  }
+
   // Split a (instantiated) constructor scheme into its argument types and result.
   static std::vector<TypePtr> ctor_params(const TypePtr& sch, TypePtr& result) {
     std::vector<TypePtr> ps;
@@ -2946,6 +2978,7 @@ struct Checker {
       // `let open M in e`, `let module M = ... in e`, `let exception ... in e`:
       // process the item into a fresh scope, then type the body.
       venv.emplace_back();
+      cenv.emplace_back();  // a local `M.(..)` open may bring M's ctors into scope
       // A LOCAL exception / type extension is only seen here (the top-level
       // register_types_rec pass that registers exception/typext ctors never
       // descends into expressions), so register its ctors now -- otherwise
@@ -2956,6 +2989,7 @@ struct Checker {
         register_typext(tx->ext);
       process_item(*sti->item);
       TypePtr bt = infer_expr(*sti->body);
+      cenv.pop_back();
       venv.pop_back();
       return bt;
     }
@@ -3900,7 +3934,10 @@ struct Checker {
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
           if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc)) {  // open M -> M's submodules
             for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
-            if (!strict) load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
+            if (!strict) {
+              load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
+              open_module_ctors(pi->id.txt);     // bare ctor -> M's variant ctor
+            }
           }
         } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
           if (mb->binding.name.txt) {
