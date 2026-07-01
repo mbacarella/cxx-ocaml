@@ -49,6 +49,8 @@ struct Type {
   int variant_kind = 0;             // Variant: 0 = `[> ..]` (open, from construction),
                                     // 1 = `[< ..]` (upper bound, from a match/pattern)
   std::vector<std::string> present; // Variant: `[< L > P]` present tags (after `>`)
+  std::vector<TypePtr> inherited;   // Variant: inherited row types `[< int u | .. ]`
+                                    // (kept unexpanded for display; allowed-set bound)
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are

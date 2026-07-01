@@ -452,18 +452,26 @@ struct Checker {
       // Open -> `[>` (0); Closed with present-tags (`[< .. > l]` / `[< ..]`) -> `[<`
       // (1); Closed exact `[ .. ]` -> exact (2).  Non-strict only (rows are a
       // non-strict feature; the strict pass keeps the immediate-int shortcut).
+      // Accept rows built from explicit tags (`Rtag`) and/or inherited row types
+      // (`Rinherit`, e.g. `[< int u]` -- the inherited type's tags form the allowed
+      // bound, kept unexpanded for display).  Non-strict only.
       bool simple = !pvr->rows.empty();
-      for (auto& r : pvr->rows) if (!std::get_if<Rtag>(&r)) { simple = false; break; }  // Rinherit: defer
       if (!strict && simple) {
         std::vector<std::string> tags; std::vector<TypePtr> ats; std::vector<char> has;
+        std::vector<TypePtr> inh;
         for (auto& r : pvr->rows) {
-          auto* rt = std::get_if<Rtag>(&r);
-          tags.push_back(rt->name);
-          if (rt->types.empty()) { ats.push_back(eng.fresh_var()); has.push_back(0); }
-          else { ats.push_back(from_coretype(*rt->types[0], vars)); has.push_back(1); }
+          if (auto* rt = std::get_if<Rtag>(&r)) {
+            tags.push_back(rt->name);
+            if (rt->types.empty()) { ats.push_back(eng.fresh_var()); has.push_back(0); }
+            else { ats.push_back(from_coretype(*rt->types[0], vars)); has.push_back(1); }
+          } else {
+            auto* ri = std::get_if<Rinherit>(&r);
+            inh.push_back(from_coretype(*ri->ct, vars));
+          }
         }
         int vk = pvr->closed == ClosedFlag::Open ? 0 : (pvr->labels ? 1 : 2);
         TypePtr row = eng.variant_type(std::move(tags), std::move(ats), std::move(has), vk);
+        row->inherited = std::move(inh);
         if (pvr->labels && !pvr->labels->empty())  // `[< L > P]` present tags
           row->present = *pvr->labels;
         return row;

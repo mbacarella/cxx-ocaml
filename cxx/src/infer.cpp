@@ -241,7 +241,24 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     // an annotation `[ `A | `B ]` / `[< `A ]` unified with the body's matched/
     // constructed rows keeps the declared bound for display.
     int vk = std::max(a->variant_kind, b->variant_kind);
+    // Inherited row types (`[< int u]`) define the allowed-set bound, so any tags
+    // in this merge are just marking PRESENCE, not widening the row: keep labels
+    // empty and route every tag to `present`.  (No inherited: normal tag union.)
+    std::vector<TypePtr> inh = a->inherited;
+    for (auto& it : b->inherited) inh.push_back(it);
+    std::vector<std::string> present = a->present;
+    auto add_present = [&](const std::string& p) {
+      for (auto& x : present) if (x == p) return;
+      present.push_back(p);
+    };
+    for (auto& p : b->present) add_present(p);
+    if (!inh.empty()) {
+      for (auto& t : tags) add_present(t);
+      tags.clear(); ats.clear(); has.clear();
+    }
     TypePtr m = variant_type(tags, ats, has, vk);
+    m->inherited = std::move(inh);
+    m->present = std::move(present);
     // A composite's level is the min of its parts: merging a generic row with a
     // weak one yields a weak row (value restriction wins); two generics stay
     // generic.  (variant_type stamped the engine level; override with the merge.)
@@ -341,6 +358,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         else {
           r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
           r->present = t->present;
+          r->inherited = t->inherited;  // ground types (int/t): share unexpanded
           r->level = weak_copy ? level : t->level;  // fresh weak, else preserve
         }
         memo[t.get()] = r;
@@ -570,14 +588,21 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         std::sort(ord.begin(), ord.end(),
                   [&](size_t x, size_t y) { return t->labels[x] < t->labels[y]; });
         body = t->variant_kind == 1 ? "[< " : t->variant_kind == 2 ? "[ " : "[> ";
+        bool wrote = false;
+        for (auto& ih : t->inherited) {  // inherited row types: `[< int u | .. ]`
+          if (wrote) body += " | ";
+          show_rec(ih, body, 0, names, printed, rc);
+          wrote = true;
+        }
         for (size_t n = 0; n < ord.size(); ++n) {
           size_t i = ord[n];
-          if (n) body += " | ";
+          if (wrote) body += " | ";
           body += "`" + t->labels[i];
           if (i < t->tag_has_arg.size() && t->tag_has_arg[i]) {
             body += " of ";
             show_rec(t->args[i], body, 0, names, printed, rc);
           }
+          wrote = true;
         }
         if (!t->present.empty()) {  // `[< L > `P1 `P2 ]` present tags
           std::vector<std::string> pr = t->present;
