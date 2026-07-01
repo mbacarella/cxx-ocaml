@@ -111,26 +111,36 @@ TypePtr Engine::repr(TypePtr t) {
 // level-lowering that keeps generalization sound: every var reachable from t has
 // its level capped at the bound var's level.
 void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
-  TypePtr t = repr(t0);
-  switch (t->kind) {
-    case Type::Kind::Var:
-      if (t == var) throw TypeError("occurs check: recursive type");
-      if (t->level > var->level) { note(t); t->level = var->level; }
-      break;
-    case Type::Kind::Arrow:
-      occurs_and_lower(var, t->dom);
-      occurs_and_lower(var, t->cod);
-      break;
-    case Type::Kind::Tuple:
-    case Type::Kind::Constr:
-    case Type::Kind::Object:
-    case Type::Kind::Variant:
-      for (auto& a : t->args) occurs_and_lower(var, a);
-      break;
-    case Type::Kind::Link:
-    case Type::Kind::Any:
-      break;  // repr already resolved / Any has no vars
-  }
+  // Composite nodes are visited-guarded so a cyclic/heavily-shared row (a
+  // recursive `[> `A of 'a] as 'a` or a DAG reached via thousands of paths)
+  // is walked once, not looped/re-exploded.  Level-lowering is monotonic, so a
+  // skipped re-visit is a no-op, not a lost cap.
+  std::unordered_set<Type*> seen;
+  std::function<void(const TypePtr&)> go = [&](const TypePtr& x0) {
+    TypePtr t = repr(x0);
+    switch (t->kind) {
+      case Type::Kind::Var:
+        if (t == var) throw TypeError("occurs check: recursive type");
+        if (t->level > var->level) { note(t); t->level = var->level; }
+        break;
+      case Type::Kind::Arrow:
+        if (!seen.insert(t.get()).second) break;
+        go(t->dom);
+        go(t->cod);
+        break;
+      case Type::Kind::Tuple:
+      case Type::Kind::Constr:
+      case Type::Kind::Object:
+      case Type::Kind::Variant:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        break;
+      case Type::Kind::Link:
+      case Type::Kind::Any:
+        break;  // repr already resolved / Any has no vars
+    }
+  };
+  go(t0);
 }
 
 void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
@@ -243,40 +253,62 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
   // contains none (return the original node when no child changed).  This keeps a
   // monomorphic function-param row shared, so its tags accumulate across
   // `f `A; f `B` -- copying it would give each use a fresh row and lose the union.
+  // `memo` dedups shared-DAG subtrees to ONE copy (a heavily-shared arrow-DAG
+  // reached via thousands of paths must not be re-copied per path -- that is the
+  // exponential blow-up that crashed the earlier level-aware attempts).
+  // `on_stack` makes a cyclic row (recursive `[> `A of 'a] as 'a`) terminate:
+  // a back-edge shares the original node instead of looping.  Share-unchanged
+  // (return the original when no child changed) is preserved -- it is what keeps
+  // a monomorphic function-param row a single node so its tags accumulate.
+  std::unordered_map<Type*, TypePtr> memo;
+  std::unordered_set<Type*> on_stack;
   std::function<TypePtr(const TypePtr&)> copy = [&](const TypePtr& t0) -> TypePtr {
     TypePtr t = repr(t0);
+    auto mit = memo.find(t.get());
+    if (mit != memo.end()) return mit->second;
     switch (t->kind) {
       case Type::Kind::Var:
         if (t->level == GENERIC_LEVEL) {
           auto it = mapping.find(t.get());
-          if (it != mapping.end()) return it->second;
-          auto fv = fresh_var();
-          mapping[t.get()] = fv;
+          TypePtr fv = it != mapping.end() ? it->second : (mapping[t.get()] = fresh_var());
+          memo[t.get()] = fv;
           return fv;
         }
+        memo[t.get()] = t;
         return t;  // free (non-generic) var: shared, not copied
       case Type::Kind::Arrow: {
+        if (!on_stack.insert(t.get()).second) return t;  // cyclic back-edge: share
         TypePtr d = copy(t->dom), c = copy(t->cod);
-        if (d == t->dom && c == t->cod) return t;  // no generic inside: share
-        return arrow(std::move(d), std::move(c), t->arrow_label, t->arrow_lbl);
+        on_stack.erase(t.get());
+        TypePtr r = (d == t->dom && c == t->cod)
+                      ? t  // no generic inside: share
+                      : arrow(std::move(d), std::move(c), t->arrow_label, t->arrow_lbl);
+        memo[t.get()] = r;
+        return r;
       }
       case Type::Kind::Tuple:
       case Type::Kind::Constr:
       case Type::Kind::Object:
       case Type::Kind::Variant: {
+        if (!on_stack.insert(t.get()).second) return t;  // cyclic back-edge: share
         std::vector<TypePtr> as;
         bool changed = false;
         as.reserve(t->args.size());
         for (auto& a : t->args) { as.push_back(copy(a)); if (as.back() != a) changed = true; }
-        if (!changed) return t;  // monomorphic composite: share the node
-        if (t->kind == Type::Kind::Tuple) return tuple(std::move(as));
-        if (t->kind == Type::Kind::Constr) return constr(t->path, std::move(as), t->stamp);
-        if (t->kind == Type::Kind::Object) return object_type(t->labels, std::move(as));
-        return variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
+        on_stack.erase(t.get());
+        TypePtr r;
+        if (!changed) r = t;  // monomorphic composite: share the node
+        else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
+        else if (t->kind == Type::Kind::Constr) r = constr(t->path, std::move(as), t->stamp);
+        else if (t->kind == Type::Kind::Object) r = object_type(t->labels, std::move(as));
+        else r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
+        memo[t.get()] = r;
+        return r;
       }
       case Type::Kind::Link:
         return copy(t);  // repr already resolved; unreachable
       case Type::Kind::Any:
+        memo[t.get()] = t;
         return t;  // dynamic: shared, not copied
     }
     return t;
@@ -285,25 +317,34 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
 }
 
 void Engine::generalize(const TypePtr& t0) {
-  TypePtr t = repr(t0);
-  switch (t->kind) {
-    case Type::Kind::Var:
-      if (t->level > level) t->level = GENERIC_LEVEL;
-      break;
-    case Type::Kind::Arrow:
-      generalize(t->dom);
-      generalize(t->cod);
-      break;
-    case Type::Kind::Tuple:
-    case Type::Kind::Constr:
-    case Type::Kind::Object:
-    case Type::Kind::Variant:
-      for (auto& a : t->args) generalize(a);
-      break;
-    case Type::Kind::Link:
-    case Type::Kind::Any:
-      break;
-  }
+  // Visited-guarded (see occurs_and_lower): promoting a var to GENERIC is
+  // idempotent, so guarding composite re-visits is pure cycle/DAG safety with
+  // no behaviour change.
+  std::unordered_set<Type*> seen;
+  std::function<void(const TypePtr&)> go = [&](const TypePtr& x0) {
+    TypePtr t = repr(x0);
+    switch (t->kind) {
+      case Type::Kind::Var:
+        if (t->level > level) t->level = GENERIC_LEVEL;
+        break;
+      case Type::Kind::Arrow:
+        if (!seen.insert(t.get()).second) break;
+        go(t->dom);
+        go(t->cod);
+        break;
+      case Type::Kind::Tuple:
+      case Type::Kind::Constr:
+      case Type::Kind::Object:
+      case Type::Kind::Variant:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        break;
+      case Type::Kind::Link:
+      case Type::Kind::Any:
+        break;
+    }
+  };
+  go(t0);
 }
 
 // Lower a NON-generalized binding's vars (value restriction) to the current
@@ -313,25 +354,33 @@ void Engine::generalize(const TypePtr& t0) {
 // wrongly makes it generic -- breaking `let h e = r := e :: !r in (h, !r)` whose
 // element type must stay shared (`('a -> unit) * 'a list`, not `* 'b list`).
 void Engine::demote(const TypePtr& t0) {
-  TypePtr t = repr(t0);
-  switch (t->kind) {
-    case Type::Kind::Var:
-      if (t->level != GENERIC_LEVEL && t->level > level) { note(t); t->level = level; }
-      break;
-    case Type::Kind::Arrow:
-      demote(t->dom);
-      demote(t->cod);
-      break;
-    case Type::Kind::Tuple:
-    case Type::Kind::Constr:
-    case Type::Kind::Object:
-    case Type::Kind::Variant:
-      for (auto& a : t->args) demote(a);
-      break;
-    case Type::Kind::Link:
-    case Type::Kind::Any:
-      break;
-  }
+  // Visited-guarded (see occurs_and_lower): level-lowering is monotonic, so a
+  // skipped re-visit is a no-op -- pure cycle/DAG safety.
+  std::unordered_set<Type*> seen;
+  std::function<void(const TypePtr&)> go = [&](const TypePtr& x0) {
+    TypePtr t = repr(x0);
+    switch (t->kind) {
+      case Type::Kind::Var:
+        if (t->level != GENERIC_LEVEL && t->level > level) { note(t); t->level = level; }
+        break;
+      case Type::Kind::Arrow:
+        if (!seen.insert(t.get()).second) break;
+        go(t->dom);
+        go(t->cod);
+        break;
+      case Type::Kind::Tuple:
+      case Type::Kind::Constr:
+      case Type::Kind::Object:
+      case Type::Kind::Variant:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        break;
+      case Type::Kind::Link:
+      case Type::Kind::Any:
+        break;
+    }
+  };
+  go(t0);
 }
 
 namespace {
