@@ -2232,6 +2232,13 @@ struct Checker {
     }
     if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
+      // A QUALIFIED pattern ctor (`Float.FP_normal`) keeps M's own type path
+      // (`Float.fpclass`), not the base its bare name resolves to -- ocamlc
+      // follows the access path.  Prefer the qualified scheme when M's cmi
+      // yields the ctor (falls through to the qualified branch).  Non-strict.
+      if (sch && !strict && std::holds_alternative<Ldot>(k->id.txt.v) &&
+          qualified_ctor_scheme(k->id.txt))
+        sch = nullptr;
       if (!sch) {
         // A qualified `M.C` not in scope: flatten its tuple by the cmi arity.
         if (auto* tup = k->arg ? std::get_if<Ppat_tuple>(&(*k->arg)->desc) : nullptr) {
