@@ -65,6 +65,11 @@ TypePtr Engine::variant_type(std::vector<std::string> tags, std::vector<TypePtr>
   t->args = std::move(argtys);
   t->tag_has_arg = std::move(has_arg);
   t->variant_kind = variant_kind;
+  // Stamp the row's implicit tail variable with the current binding level, so a
+  // value-restricted (expansive) row stays weak while a generalised one is
+  // promoted to GENERIC -- this is what lets `show` name a weak row `as '_weak`
+  // (`bar = wrap ()` -> `([< `Test ] as '_weak1)`) but leave a generic one plain.
+  t->level = level;
   t->id = next_id_++;
   return t;
 }
@@ -128,10 +133,13 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
         go(t->dom);
         go(t->cod);
         break;
+      case Type::Kind::Variant:
+        // Cap the row's tail level too (keeps a row unified into a var weak).
+        if (t->level != GENERIC_LEVEL && t->level > var->level) { note(t); t->level = var->level; }
+        [[fallthrough]];
       case Type::Kind::Tuple:
       case Type::Kind::Constr:
       case Type::Kind::Object:
-      case Type::Kind::Variant:
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -234,6 +242,10 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     // constructed rows keeps the declared bound for display.
     int vk = std::max(a->variant_kind, b->variant_kind);
     TypePtr m = variant_type(tags, ats, has, vk);
+    // A composite's level is the min of its parts: merging a generic row with a
+    // weak one yields a weak row (value restriction wins); two generics stay
+    // generic.  (variant_type stamped the engine level; override with the merge.)
+    m->level = std::min(a->level, b->level);
     note(a); a->kind = Type::Kind::Link; a->link = m;
     note(b); b->kind = Type::Kind::Link; b->link = m;
     // Now unify shared-tag arguments (a/b already point at m, so a recursive arg
@@ -262,6 +274,26 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
   // a monomorphic function-param row a single node so its tags accumulate.
   std::unordered_map<Type*, TypePtr> memo;
   std::unordered_set<Type*> on_stack;
+  // A GENERIC variant row is fresh-copied at each use so value-restriction at one
+  // use can't weaken the shared scheme -- but ONLY when the row is small and
+  // acyclic (bounded DFS).  A giant shared/cyclic row (mixin's object+variant DAG)
+  // fails the bound and is shared unchanged: no fresh copy, no display change, no
+  // blow-up.  This confines weak-`as` to simple rows like `bar`'s `[< `Test ]`.
+  std::function<bool(const TypePtr&, std::unordered_set<Type*>&, int&)> fits =
+      [&](const TypePtr& x0, std::unordered_set<Type*>& stk, int& budget) -> bool {
+    TypePtr t = repr(x0);
+    if (--budget < 0) return false;
+    if (t->kind == Type::Kind::Var || t->kind == Type::Kind::Any) return true;
+    if (!stk.insert(t.get()).second) return false;  // back-edge: cyclic
+    bool ok = true;
+    if (t->kind == Type::Kind::Arrow) ok = fits(t->dom, stk, budget) && fits(t->cod, stk, budget);
+    else for (auto& a : t->args) { if (!fits(a, stk, budget)) { ok = false; break; } }
+    stk.erase(t.get());
+    return ok;
+  };
+  auto small_acyclic = [&](const TypePtr& t) {
+    std::unordered_set<Type*> stk; int budget = 64; return fits(t, stk, budget);
+  };
   std::function<TypePtr(const TypePtr&)> copy = [&](const TypePtr& t0) -> TypePtr {
     TypePtr t = repr(t0);
     auto mit = memo.find(t.get());
@@ -296,12 +328,21 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         as.reserve(t->args.size());
         for (auto& a : t->args) { as.push_back(copy(a)); if (as.back() != a) changed = true; }
         on_stack.erase(t.get());
+        // A generic variant row gets a FRESH weak node per use (see `fits`), so a
+        // value-restricted use (`bar = wrap ()`) can weaken its own copy without
+        // touching the scheme.  Others share-unchanged when nothing changed.
+        bool weak_copy = t->kind == Type::Kind::Variant &&
+                         t->level == GENERIC_LEVEL && small_acyclic(t);
         TypePtr r;
-        if (!changed) r = t;  // monomorphic composite: share the node
+        if (!changed && !weak_copy) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
         else if (t->kind == Type::Kind::Constr) r = constr(t->path, std::move(as), t->stamp);
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, std::move(as));
-        else r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
+        else {
+          r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
+          r->present = t->present;
+          r->level = weak_copy ? level : t->level;  // fresh weak, else preserve
+        }
         memo[t.get()] = r;
         return r;
       }
@@ -332,10 +373,13 @@ void Engine::generalize(const TypePtr& t0) {
         go(t->dom);
         go(t->cod);
         break;
+      case Type::Kind::Variant:
+        // Promote the row's tail level too, so a generalised row prints plain.
+        if (t->level > level) t->level = GENERIC_LEVEL;
+        [[fallthrough]];
       case Type::Kind::Tuple:
       case Type::Kind::Constr:
       case Type::Kind::Object:
-      case Type::Kind::Variant:
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -368,10 +412,13 @@ void Engine::demote(const TypePtr& t0) {
         go(t->dom);
         go(t->cod);
         break;
+      case Type::Kind::Variant:
+        // Lower the row's tail level too (value restriction keeps it weak).
+        if (t->level != GENERIC_LEVEL && t->level > level) { note(t); t->level = level; }
+        [[fallthrough]];
       case Type::Kind::Tuple:
       case Type::Kind::Constr:
       case Type::Kind::Object:
-      case Type::Kind::Variant:
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -494,9 +541,15 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       // has no row variable so is never named) is named `as 'aN`: assign the name
       // and mark `printed` BEFORE building the body, so a re-entry emits the
       // back-reference `'aN`.
+      // An exact `[ .. ]` variant has no row variable, so it is never named.
+      // A weak (non-generic) variant row carries a weak tail variable that ocamlc
+      // names even at a single occurrence (`bar`'s `([< `Test ] as '_weak1)`);
+      // Objects are not level-stamped, so only Variant weak-naming applies here.
+      bool exact = t->kind == Type::Kind::Variant && t->variant_kind == 2;
       auto it = rc.find(t.get());
-      bool multi = it != rc.end() && it->second >= 2 &&
-                   !(t->kind == Type::Kind::Variant && t->variant_kind == 2);
+      bool shared = it != rc.end() && it->second >= 2 && !exact;
+      bool weak = t->kind == Type::Kind::Variant && t->level != GENERIC_LEVEL && !exact;
+      bool multi = shared || weak;
       if (multi) {
         if (!names.count(t.get()))
           names[t.get()] = "'" + std::string(1, 'a' + (char)(names.size() % 26));
