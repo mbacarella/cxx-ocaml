@@ -472,6 +472,55 @@ remaining reachable clusters are all the two blocked ones (type-path naming incl
 lazy_t; GADT/object over-spec) plus the Way-4 row-variable poly-variant rework —
 each a dedicated project, none a session-sized freebie.
 
+## SESSION 2026-07-01 (h): three engine-free/contained flips (+3, sig 89.3%)
+
+Re-scanned the live 59 DIFF files myself (not trusting (g)'s categorisation) and
+found three genuine bugs OUTSIDE the blocked clusters, each a clean +1:
+
+- **Binding-operator val names printed bare — display, +1.** `cpptype_main.cpp`
+  decided operator-parenthesisation from the FIRST char only, so symbolic ops
+  (`*.`) got `( *. )` but binding operators (`let+`, `and+`) — first char a letter
+  — printed `val let+ :`. ocamlc prints `( let+ )`. Fix: any name with a
+  non-identifier char (not alnum/`_`/`'`) is an operator. **+1 (shape-index/
+  index_bindingops).** Committed `infer: parenthesise binding-operator val names`.
+
+- **Type-var display names collided past `'z` — display, +1.** `show_rec` minted a
+  var name as a single letter (`'a'+i%26`), so the 27th var reprinted `'a`; under
+  the harness's first-appearance normalisation a collision merges two distinct
+  vars, so any >26-variable signature could never match. Added `tvar_letter(i)`
+  (letter i%26 + numeric suffix i/26, empty when 0 => `'a..'z,'a1..'z1,'a2..`,
+  exactly ocamlc). **+1 (syntactic-arity/max_arity).** Committed `infer: type-var
+  display names past 'z go 'a1,'b1,..`.
+
+- **Format-type expectation not pushed through `if` — contained inference, +1.** A
+  format string wrapped in an `if` (`Printf.printf (if b then "a\n" else "b\n")`)
+  typed each branch as plain `string`, so printf's result param never resolved
+  (`passed : bool -> 'a` vs oracle `bool -> unit`). A direct literal already worked
+  via the bidirectional format-literal path; the `if` bypassed it. Fix:
+  `infer_expr_expected`, when expected is a format and the expr is `if`-then-else,
+  recurses into both branches with the format expectation. Scoped to formats (no
+  change to ordinary `if`). **+1 (c-api/test_c_thread_has_lock).** Committed
+  `infer: push format-type expectation through if branches`.
+
+All three: reject 0.0%, lambda 54.2% flat, 0 crashes / 1853, match-set delta
+exactly +1 each, 0 regressions.
+
+**Baseline now: sig 469/525 (89.3%), reject 0.0%, lambda 54.2%, 0 crashes.**
+
+### Assessed, NOT taken (fails the 0-regression session bar)
+- **`prim-revapply/apply.ml` `_f : int->int->int` vs `int->int`** — optional-arg
+  erasure via `%apply` (`bump @@ x`, `bump : ?cap:int -> int -> int` used where
+  `'a -> 'b` expected). The erasure machinery exists (`infer_expr_expected`,
+  ~line 2441) but only RECORDS slots for the Lambda back end; it returns the
+  UN-erased type, so the inferred type keeps the extra arrow. Making erasure change
+  the returned type is an engine-level change affecting every optional-arg
+  application — risky for a single intentionally-unused (`_f`) binding. Deferred.
+- The rest of the 59 DIFFs are the known blocked clusters: type-path naming
+  (`Module.t`↔`t`, `lazy_t`↔`Lazy.t`, functor-result paths, Bigarray submodule
+  qualifiers), format4↔format6 folding, GADT/object over-spec (`int Effect.t`,
+  `< .. >`, `#castable`), first-class-module/`(module S with ..)` type recovery,
+  generalized-open scope, and the Way-4 poly-variant row-variable rework.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
