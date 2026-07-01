@@ -314,6 +314,12 @@ struct Checker {
   // compares last components, and consumers (record-label resolution) need the
   // module.  Predefs aren't in the signature's type list and stay bare.
   std::string cmi_mod_prefix_;
+  // Enclosing cmi module scopes (outermost..innermost) for qualifying a Pident
+  // type that lives in a PARENT module: `Array1.create`'s `kind` is
+  // `Bigarray.kind`, not `Bigarray.Array1.kind`.  Each entry is (types, prefix).
+  // When set, the qualification step searches innermost->outermost; empty falls
+  // back to the single (cmi_types_ctx_, cmi_mod_prefix_) above.
+  std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> cmi_scopes_;
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
@@ -395,11 +401,22 @@ struct Checker {
               cmi_expanding_.erase(td.name);
               return r;
             }
-        // qualify a same-unit (Pident) type with its owning module
-        if (cmi_types_ctx_ && !cmi_mod_prefix_.empty() && n->path &&
-            n->path->kind == cmi::Path::Pident)
-          for (auto& td : *cmi_types_ctx_)
-            if (td.name == n->path->id.name) { p = cmi_mod_prefix_ + "." + p; break; }
+        // qualify a same-unit (Pident) type with its owning module.  Search the
+        // enclosing scopes innermost->outermost so a parent-module type resolves
+        // to its OWN module (`kind` in `Array1.create` -> `Bigarray.kind`).
+        if (n->path && n->path->kind == cmi::Path::Pident) {
+          if (!cmi_scopes_.empty()) {
+            for (auto it = cmi_scopes_.rbegin(); it != cmi_scopes_.rend(); ++it) {
+              bool found = false;
+              for (auto& td : *it->first)
+                if (td.name == n->path->id.name) { p = it->second + "." + p; found = true; break; }
+              if (found) break;
+            }
+          } else if (cmi_types_ctx_ && !cmi_mod_prefix_.empty()) {
+            for (auto& td : *cmi_types_ctx_)
+              if (td.name == n->path->id.name) { p = cmi_mod_prefix_ + "." + p; break; }
+          }
+        }
         std::vector<TypePtr> as;
         for (auto& a : n->args) as.push_back(from_cmi(a, memo));
         return eng.constr(std::move(p), std::move(as));
@@ -968,25 +985,31 @@ struct Checker {
       std::vector<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(head)));
       const cmi::Signature* sig = &loaded.back().sig();
+      // Record each module level's (types, cumulative-prefix) as an enclosing
+      // scope, so a Pident type owned by a PARENT module qualifies to its own
+      // module (`Array1.create`'s `kind` -> `Bigarray.kind`, not the submodule).
+      std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> scopes;
+      scopes.push_back({&sig->types, comps[0]});
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
           if (mm.name == comps[i]) { md = &mm; break; }
         sig = md ? module_sig(md->type, loaded) : nullptr;
+        if (sig) scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
       }
       if (sig) {
         cmi_types_ctx_ = &sig->types;  // enable same-module abbreviation expansion
-        std::string pfx;
-        for (auto& cmp : comps) { if (!pfx.empty()) pfx += '.'; pfx += cmp; }
-        cmi_mod_prefix_ = pfx;
+        cmi_mod_prefix_ = scopes.back().second;
+        cmi_scopes_ = scopes;
         for (auto& v : sig->values) {
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
           out[v.name] = from_cmi(v.type, memo);
         }
         cmi_types_ctx_ = nullptr;
         cmi_mod_prefix_.clear();
+        cmi_scopes_.clear();
       }
-    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
+    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); cmi_scopes_.clear(); }
     return out;
   }
 
