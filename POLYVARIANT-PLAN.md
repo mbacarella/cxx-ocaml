@@ -107,6 +107,33 @@ Revert any phase that can't hit those (as the two prior attempts were reverted).
 bounded residue — exactly the "convert open-ended risk into a bounded residue"
 goal, minus the last tiers.
 
+- **Instantiate row-sharing — ATTEMPTED, REVERTED (3rd sub-finding).** Root-caused
+  recursive_module_init: `instantiate` COPIES a Variant/Object node, but a row
+  accumulates tags by LINKING its node during unify, so copying a monomorphic
+  function-param row (`([> `A] -> int) -> ..`) breaks accumulation across
+  `f `A; f `B; f `C` -- we got only the first tag.  Fix (share a row with no
+  generic var; preserve variant_kind) made the ISOLATED cases correct
+  (`direct`/`viaid`/check's tags all merge to `[> `Mod|`Nonrec|`Self]`).  BUT:
+  (a) `contains_generic` recurses unboundedly -> STACK-OVERFLOW segfault on huge/
+  deep types (parsetree/source.ml, mixin.ml); (b) 0 corpus flips -- even with
+  tags merged, recursive_module_init still needs the CROSS-OCCURRENCE `as 'a`
+  SHARING display (the same row appears in both `stub:` and the `f` param;
+  ocamlc names it `([> ..] as 'a) -> .. -> ('a -> int)`, we print it twice).
+  Reverted.  So this file needs THREE stacked features: (1) crash-safe
+  monomorphic-row sharing in instantiate, (2) cross-occurrence `as 'a` naming in
+  show (a real rework: assign a shared name to any row/type node printed 2+
+  times, not just cyclic ones), (3) alpha ordering already done.
+
+**DECISION (2026-07-01): STOP the poly-variant grind after phases 0-1.** Three
+sub-attempts (recursive occurs, instantiate sharing, and the earlier pattern-row)
+each confirm: every remaining corpus file stacks 2-3 features AND the engine
+changes are crash-prone on deep/recursive/object types.  The floor is landed
+(pr10664, crashes gone).  The residue is now precisely understood (above) and is
+a dedicated multi-feature project, not a session's incremental wins.  Best next
+poly-variant investment if resumed: the CROSS-OCCURRENCE `as 'a` show rework
+(no engine/crash risk, unlocks the shared-row display that several files need)
+paired with a crash-safe (iterative/memoised) monomorphic-row-share in instantiate.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
