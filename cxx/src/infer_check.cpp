@@ -811,7 +811,7 @@ struct Checker {
     // First reference to module m: also load its record fields, so a
     // type-directed construction `Effect.Deep.match_with f x { retc = .. }`
     // resolves the handler record without an explicit `open Effect.Deep`.
-    if (loaded_field_mods_.insert(key).second) load_module_record_fields(m);
+    load_module_record_fields(m);  // (internally guarded against re-loading)
     return modvals_cache_.emplace(key, resolve_module_values(m)).first->second;
   }
   // As above, keyed by an explicit component path (for a qualified opened
@@ -1052,6 +1052,9 @@ struct Checker {
   void load_module_record_fields(const Longident& m) {
     auto comps = mod_components(m);
     if (comps.empty()) return;
+    // Guard against double-loading (a module both opened/referenced and aliased):
+    // re-loading would push each label twice and make it spuriously ambiguous.
+    if (!loaded_field_mods_.insert(lid_full(m)).second) return;
     try {
       std::vector<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
@@ -3009,7 +3012,18 @@ struct Checker {
       if (rc->base) {
         bool sv = strict; strict = false;
         TypePtr bt = infer_expr(**rc->base);
-        for (auto& [lbl, val] : rc->fields) infer_expr(*val);
+        for (auto& [lbl, val] : rc->fields) {
+          TypePtr vt = infer_expr(*val);
+          // Constrain each overridden field to its declared type, tying the field
+          // scheme's record-type (dom) to the base record so its type parameters are
+          // shared: `{ M.null_tracker with alloc_minor }` recovers alloc_minor's
+          // type (`M.allocation -> 'a option`) instead of leaking a free var.
+          if (TypePtr fsch = field_scheme(lid_last(lbl.txt))) {
+            TypePtr s = I::Engine::repr(eng.instantiate(fsch));
+            try_unify(bt, s->dom);
+            try_unify(vt, s->cod);
+          }
+        }
         strict = sv;
         // For the dump's `<kept>` fields, resolve an EXTERNAL record type's full
         // ordered field list from the cmis (local records use the transcriber's
@@ -4135,8 +4149,14 @@ struct Checker {
                 // path -- a uniform rewrite would corrupt the direct occurrences.
                 std::string head = tgt.substr(0, tgt.find('.'));
                 if (tgt.find('.') != std::string::npos && tgt != *mb->binding.name.txt &&
-                    !bound_module_names_.count(head))
+                    !bound_module_names_.count(head)) {
                   module_aliases_.emplace_back(tgt, *mb->binding.name.txt);
+                  // Load the aliased module's record fields (like `open`/`include`),
+                  // so a functional update `{ M.rec with field }` can recover the
+                  // overridden field's type.  The alias display rewrite (above) maps
+                  // the loaded `Long.Path.` prefix back to the alias.
+                  load_module_record_fields(pi->id.txt);
+                }
               }
               func_bind_name_ = *mb->binding.name.txt;
               modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
