@@ -48,6 +48,7 @@ struct Type {
   std::vector<char> tag_has_arg;    // Variant: 1 if the tag carries an argument
   int variant_kind = 0;             // Variant: 0 = `[> ..]` (open, from construction),
                                     // 1 = `[< ..]` (upper bound, from a match/pattern)
+  std::vector<std::string> present; // Variant: `[< L > P]` present tags (after `>`)
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are

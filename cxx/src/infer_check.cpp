@@ -463,7 +463,10 @@ struct Checker {
           else { ats.push_back(from_coretype(*rt->types[0], vars)); has.push_back(1); }
         }
         int vk = pvr->closed == ClosedFlag::Open ? 0 : (pvr->labels ? 1 : 2);
-        return eng.variant_type(std::move(tags), std::move(ats), std::move(has), vk);
+        TypePtr row = eng.variant_type(std::move(tags), std::move(ats), std::move(has), vk);
+        if (pvr->labels && !pvr->labels->empty())  // `[< L > P]` present tags
+          row->present = *pvr->labels;
+        return row;
       }
       // A closed all-constant variant is an immediate (tag hashes) -- type it int
       // so the [int] value kind flows (strict pass, and payload/inherited rows).

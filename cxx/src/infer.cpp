@@ -477,6 +477,12 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
             show_rec(t->args[i], body, 0, names, printed, rc);
           }
         }
+        if (!t->present.empty()) {  // `[< L > `P1 `P2 ]` present tags
+          std::vector<std::string> pr = t->present;
+          std::sort(pr.begin(), pr.end());
+          body += " >";
+          for (auto& p : pr) body += " `" + p;
+        }
         body += " ]";
       }
       if (multi)
