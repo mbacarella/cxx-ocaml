@@ -2656,13 +2656,16 @@ struct Checker {
       return strict ? eng.any() : eng.constr("Lazy.t", {inner});
     }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
-      infer_expr(*as->e);  // infer the condition (flows operand kinds, e.g. x:int)
+      TypePtr ct = infer_expr(*as->e);  // infer the condition (flows operand kinds)
       // `assert false` is bottom ('a, never returns): a fresh var, so the
       // surrounding result type is decided by the other branches -- it neither
       // pins a polymorphic result (a fold accumulator) nor absorbs a concrete one
       // (`try (..; assert false) with _ -> 0` is int, from the handler).
       if (auto* ctr = std::get_if<Pexp_construct>(&as->e->desc))
         if (lid_last(ctr->id.txt) == "false") return generic_var();
+      // `assert e` forces e : bool, so `assert (f x)` pins `f x : bool` (and thus
+      // f's result).  Non-strict only (an incomplete strict inference could clash).
+      if (!strict) try_unify(ct, eng.constr("bool"));
       // `assert e` (e != false) is unit.  A concrete unit can cause our
       // incomplete strict pass to false-reject, so there alone we keep Any; the
       // value-kinds and signature passes commit to unit.
