@@ -560,6 +560,84 @@ type) is now available for the other poly-field files (e.g. msg.ml's `wkind =
 constructor typing (a separate blocked cluster). No other engine-free flips
 surfaced in the scan; residue is the documented blocked clusters.
 
+## SESSION 2026-07-01 (j): the "blocked" path-naming cluster CRACKED via per-access-path (+10)
+
+Re-scanned the live 55 DIFF files. The residue is dominated by the type-path
+naming cluster that (f)/(g)/(h) all filed as "architecturally blocked, regression-
+prone" (our unifier compares constr paths by LAST component, so `Result.t` can't
+unify with `result`). **That framing was too pessimistic.** ocamlc's rule is
+*per-occurrence*: a type keeps the PATH THROUGH WHICH IT WAS ACCESSED. Reproducing
+that access-path faithfully SIDESTEPS the unification problem entirely — you never
+have to unify `Result.t` with `result`, because within a file the same value is
+always reached the same way. Ten flips landed this session, each a clean +N, 0
+regressions, reject 0.0% / lambda 54.2% / 0 crashes throughout, sig **470 -> 480
+(89.5% -> 91.4%)**:
+
+1. **Module-nested variant type paths (+2: w33, topeval).** Variant ctor result
+   types used the bare type name (`t`) while records already baked `mod_prefix_`
+   (`N.t`). A ctor defined in `module N` used from outside (`g N.(A|B)`) printed
+   `t` where ocamlc prints `N.t`. One-char fix (add `mod_prefix_`); unify still
+   compares last component so `N.t`≡`t`.
+2. **4-arg format6 -> `format4` abbreviation (+1: locale).** show already folded
+   3-arg -> `format`; added the analogous 4-arg -> `format4`. Arg count comes from
+   the source annotation (inference inherits it; fresh nodes are nullary), so it
+   unambiguously selects the abbreviation.
+3. **`open M` registers M's cmi variant ctors (+1: testarg).** `Arg.[ Unit f; Set
+   r ]` left the bare `Unit`/`Set` as Any -> element typed `_`. Added
+   open_module_ctors (load M's cmi, register each variant ctor as a generalised
+   scheme into a scoped cenv; the local-`M.(..)` Pexp_struct_item path now pushes/
+   pops a cenv scope too).
+4. **Module-alias display `MP.t` (+2: minor_no_postpone, start_stop).** `module MP
+   = Gc.Memprof` then `MP.t`: ocamlc keeps the alias, we expanded to
+   `Gc.Memprof.t`. Record each `module M = Long.Path` alias, rewrite the target
+   prefix back to the alias in the emitted signature. Restricted to EXTERNAL
+   targets (head not locally bound): a LOCAL target (`Std2.M`) can be reached both
+   directly and via the alias in one file and ocamlc keeps each occurrence's own
+   path — a uniform rewrite corrupted gatien_baron's `Std2.M.t` result (caught by
+   the diff-set check, fixed by the external-only guard).
+5. **Qualified CONSTRUCTOR keeps its module's type path (+3: contexts_1/2/3;  +1
+   pattern side: fma).** `Result.Ok`/`Result.Error` resolved via the bare name
+   `Ok`/`Error` -> the re-exported base `result`; ocamlc follows the access path
+   and prints `Result.t`. When a construct/pattern id is `Ldot` and M's cmi yields
+   the ctor, prefer the qualified scheme (already built with result path `M.t`) by
+   nulling the bare `sch` so the existing qualified branch runs (it also pins the
+   args, so `Result.Error "x"` -> `(_, string) Result.t`). Non-strict only; bare
+   uses still print `result`, exactly matching ocamlc's per-occurrence rule.
+   Applied to both the expression and pattern Ppat/Pexp_construct handlers.
+
+**Baseline now: sig 480/525 (91.4%), reject 0.0%, lambda 54.2%, 0 crashes.**
+
+### What's STILL genuinely blocked in path-naming (distinct mechanisms, do NOT retry as freebies)
+- **Alias UNIFIES with a differently-pathed base (qsort `string` vs `String.t`).**
+  `%s` forces `string`; `String.compare`'s arg is `String.t`; these are the same
+  type but differ in last component, so our unify-by-last-component treats them as
+  distinct (lenient no-op) and the `%s`-side `string` wins the display. The
+  ISOLATED `String.compare a b` already prints `String.t` correctly — the failure
+  is ONLY when a foreign path unifies in. This is the real "record the access path
+  on the constr node, survive unify" machinery; still deferred.
+- **from_cmi doesn't qualify a TOP-LEVEL cmi type (specialized `kind` vs
+  `Bigarray.kind`).** A submodule type already qualifies (`Bigarray.Array1.t` is
+  right) but a type at the loaded module's TOP level comes back bare. A from_cmi
+  path-construction slice (cmi_mod_prefix_ not firing for opened-submodule value
+  resolution), not the ctor axis — dedicated, broader risk surface.
+- **lazy_t<->Lazy.t** (reverse direction, keyword primitive not a qualified
+  access; the session-g hamming regression stands), **functor-result paths**
+  (ephetest3 `HW.key`/`SW.data`, pr6944 `Map.Make(String).t`), **qualified
+  functional record update field typing** (intern/exception_callback lose
+  `MP.allocation` from `{ MP.null_tracker with .. }`).
+- Non-path residue unchanged: GADT/object over-spec (`int Effect.t`, `#castable`),
+  first-class-module type recovery (pr6982/pr6954/compiling/syntactic_arity),
+  sscanf-return typing (lib-seq/test, gen_test), weak-var propagation (testerror),
+  generalized-open scope, and the Way-4 poly-variant row-variable rework.
+
+**Verdict:** the access-path INSIGHT (reproduce ocamlc's per-occurrence path;
+don't fight the unifier) converted the biggest "blocked" cluster into ten clean
+flips. The remaining path-naming files each need a genuinely distinct mechanism
+(constr-node access-path tracking through unify; from_cmi top-level
+qualification), each a dedicated slice — not session freebies. Best next path-
+naming investment: the from_cmi top-level-type qualification (specialized), the
+most self-contained of the three.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
