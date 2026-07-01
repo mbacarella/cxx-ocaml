@@ -2621,6 +2621,14 @@ struct Checker {
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
+      // A QUALIFIED `M.C` (`Result.Ok`) keeps M's own type path (`Result.t`),
+      // not the re-exported base (`result`) its bare name resolves to -- ocamlc
+      // follows the access path.  When M's cmi yields the ctor, prefer that
+      // scheme by falling through to the qualified branch below.  Non-strict
+      // only (that branch's pinning can't reach the reject pass).
+      if (sch && !strict && std::holds_alternative<Ldot>(k->id.txt.v) &&
+          qualified_ctor_scheme(k->id.txt))
+        sch = nullptr;
       if (!sch) {
         // A qualified `M.C` whose bare name isn't in scope: recover its variant
         // type from M's cmi (so an optional-arg default fixes the param type).
