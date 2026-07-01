@@ -775,6 +775,40 @@ other engine-free flips surfaced; residue is the documented blocked clusters
 weak-var, lazy_t↔Lazy.t constr-node access-path, module-shadow `Stdlib/2` display,
 Way-4 rows).
 
+## SESSION 2026-07-01 (o): functional record update field typing (+3)
+
+Re-scanned the live 41 DIFF files; all mapped to documented blocked clusters, but
+the statmemprof trio (restart, intern, exception_callback) shared ONE root and was
+reachable — the "qualified functional record update field typing" residue named in
+(j).
+
+- **Functional record update dropped the overridden field's type — genuine bug, +3.**
+  `{ M.null_tracker with alloc_minor }` (`M = Gc.Memprof`) inferred each overridden
+  field value in isolation and discarded it, so the punned `alloc_minor` leaked a
+  free var (`('a -> 'b) -> (..) M.tracker` vs oracle `(M.allocation -> 'a option) ->
+  ..`). We ALREADY resolved the base `M.null_tracker : ('a,'b) M.tracker` correctly —
+  the only miss was constraining the field. Two linked fixes:
+  1. **update branch ties fields.** The plain-construction path already unifies each
+     field value to its `field_scheme` (arrow(recTy, fieldType)); do the same in the
+     `{ base with .. }` branch — unify the scheme's record-type (dom) with the base
+     (sharing type params) and the value against the field type (cod).
+  2. **load record fields for `module M = ExternalPath` aliases** (only `open`/`include`
+     did before), so the field label resolves; the existing alias display rewrite maps
+     the loaded `Gc.Memprof.` prefix back to `M.`. Guarded load_module_record_fields
+     against double-loading (a module both referenced and aliased would push each label
+     twice -> spuriously ambiguous; unified the two prior guard sites into one internal
+     guard).
+  **restart/intern/exception_callback flip.** sig 484->487 (92.8%), reject 0.0%,
+  lambda 54.2% flat, 0 crashes / 1853, match-set delta exactly +3, 0 regressions.
+  Committed `infer: constrain overridden fields in functional record update`.
+
+**Baseline now: sig 487/525 (92.8%), reject 0.0%, lambda 54.2%, 0 crashes.** All 38
+remaining DIFFs are the documented blocked clusters (functor-result/first-class-module
+recovery incl. modular-explicits `(module P : Print)`, GADT/object over-spec incl.
+`int Effect.t`/`#castable`/`< .. >`, extensible-GADT ctor typing (msg), lazy_t<->Lazy.t
++ `String.t`<->`string` constr-node access-path, scanf-return, weak-var, Stdlib/2
+shadow-disambiguation, Way-4 rows). No other engine-free flip surfaced in this scan.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
