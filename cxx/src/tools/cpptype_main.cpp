@@ -39,9 +39,13 @@ int main(int argc, char** argv) {
     if (infer_mode) {  // Slice 2: show inferred top-level value types
       for (auto& [name, ty] : cppcaml::infer_structure_types(structure)) {
         // Operators print parenthesised, like `ocamlc -i`: `( *. )` (the spaces
-        // also keep `( * )` from opening a comment).
-        bool op = !name.empty() &&
-                  !(std::isalpha((unsigned char)name[0]) || name[0] == '_');
+        // also keep `( * )` from opening a comment). Any name containing a
+        // non-identifier char is an operator -- this catches symbolic operators
+        // (`*.`, `+`) AND binding operators (`let+`, `and+`), which begin with a
+        // letter but still print parenthesised.
+        bool op = false;
+        for (unsigned char c : name)
+          if (!(std::isalnum(c) || c == '_' || c == '\'')) { op = true; break; }
         std::string disp = op ? "( " + name + " )" : name;
         std::cout << "val " << disp << " : " << ty << '\n';
       }
