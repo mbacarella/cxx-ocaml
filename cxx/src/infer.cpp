@@ -335,25 +335,47 @@ void Engine::demote(const TypePtr& t0) {
 }
 
 namespace {
+// Count how many times each polymorphic-variant/object row node is referenced,
+// so the printer can name a SHARED one (appears 2+ times) or a CYCLIC one
+// (reached 2+ via the cycle) with `as 'a`.  Variant/Object are visited-guarded
+// (cycle-safe); the ref count is taken before the guard so a node reached via two
+// paths still counts twice.
+void count_refs(const TypePtr& t0, std::unordered_map<Type*, int>& rc,
+                std::unordered_set<Type*>& seen) {
+  TypePtr t = Engine::repr(t0);
+  switch (t->kind) {
+    case Type::Kind::Variant:
+    case Type::Kind::Object:
+      rc[t.get()]++;
+      if (!seen.insert(t.get()).second) return;
+      for (auto& a : t->args) count_refs(a, rc, seen);
+      break;
+    case Type::Kind::Arrow:
+      count_refs(t->dom, rc, seen); count_refs(t->cod, rc, seen);
+      break;
+    case Type::Kind::Tuple:
+    case Type::Kind::Constr:
+      for (auto& a : t->args) count_refs(a, rc, seen);
+      break;
+    default: break;
+  }
+}
+
 // `cp` = context precedence required by the parent position: 0 top (arrow ok),
 // 1 arrow-domain (tuple ok, arrow needs parens), 2 atom (both need parens).
-// `*` binds tighter than `->`, so a tuple in arrow-domain position is unparen'd.
-// `on_stack` holds the row nodes (Variant/Object) currently being printed: a
-// re-entry is a cyclic (recursive) row, printed as a back-reference `'aN` and, at
-// the node's first occurrence, wrapped `(.. as 'aN)` -- exactly ocamlc's `as`
-// display, and the guard that keeps a recursive row from looping forever.
+// A row node referenced 2+ times (`rc`) -- shared across the type OR recursive --
+// is named `as 'aN` at its first full print and back-referenced `'aN` afterwards,
+// matching ocamlc.  `printed` marks nodes whose print has begun (so a re-entry,
+// cyclic or a later occurrence, emits the back-reference and can't loop).
 void show_rec(const TypePtr& t0, std::string& out, int cp,
               std::unordered_map<Type*, std::string>& names,
-              std::unordered_set<Type*>& on_stack) {
+              std::unordered_set<Type*>& printed,
+              const std::unordered_map<Type*, int>& rc) {
   TypePtr t = Engine::repr(t0);
-  // Cyclic row back-reference: this node is already on the print stack.
+  // A named row already being/having-been printed: emit the back-reference.
   if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object) &&
-      on_stack.count(t.get())) {
-    auto it = names.find(t.get());
-    if (it == names.end())  // allocate a type-var name from the shared pool
-      it = names.emplace(t.get(),
-                         "'" + std::string(1, 'a' + (char)(names.size() % 26))).first;
-    out += it->second;
+      printed.count(t.get())) {
+    out += names[t.get()];
     return;
   }
   switch (t->kind) {
@@ -371,37 +393,37 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
     case Type::Kind::Arrow:
       if (cp > 0) out += "(";
       if (t->arrow_label == 1) { out += t->arrow_lbl + ":";        // ~lbl:
-        show_rec(t->dom, out, 1, names, on_stack);
+        show_rec(t->dom, out, 1, names, printed, rc);
       } else if (t->arrow_label == 2) {  // ?lbl: -- internal type is `T option`,
         out += "?" + t->arrow_lbl + ":";  // but ocamlc displays the bare T
         TypePtr d = Engine::repr(t->dom);
         if (d->kind == Type::Kind::Constr && d->args.size() == 1 &&
             (d->path == "option" || d->path == "Stdlib.option"))
-          show_rec(d->args[0], out, 1, names, on_stack);
+          show_rec(d->args[0], out, 1, names, printed, rc);
         else
-          show_rec(t->dom, out, 1, names, on_stack);
+          show_rec(t->dom, out, 1, names, printed, rc);
       } else {
-        show_rec(t->dom, out, 1, names, on_stack);   // domain: a tuple is fine unparen'd
+        show_rec(t->dom, out, 1, names, printed, rc);   // domain: a tuple is fine unparen'd
       }
       out += " -> ";
-      show_rec(t->cod, out, 0, names, on_stack);   // -> is right-assoc: codomain stays top
+      show_rec(t->cod, out, 0, names, printed, rc);   // -> is right-assoc: codomain stays top
       if (cp > 0) out += ")";
       break;
     case Type::Kind::Tuple:
       if (cp > 1) out += "(";
       for (size_t i = 0; i < t->args.size(); ++i) {
         if (i) out += " * ";
-        show_rec(t->args[i], out, 2, names, on_stack);  // components bind tighter than *
+        show_rec(t->args[i], out, 2, names, printed, rc);  // components bind tighter than *
       }
       if (cp > 1) out += ")";
       break;
     case Type::Kind::Constr: {
-      if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names, on_stack); out += " "; }
+      if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names, printed, rc); out += " "; }
       else if (t->args.size() > 1) {
         out += "(";
         for (size_t i = 0; i < t->args.size(); ++i) {
           if (i) out += ", ";
-          show_rec(t->args[i], out, 0, names, on_stack);
+          show_rec(t->args[i], out, 0, names, printed, rc);
         }
         out += ") ";
       }
@@ -417,42 +439,48 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       out += path;
       break;
     }
-    case Type::Kind::Object: {
-      on_stack.insert(t.get());
-      std::string body = "< ";
-      for (size_t i = 0; i < t->labels.size(); ++i) {
-        if (i) body += "; ";
-        body += t->labels[i] + " : ";
-        show_rec(t->args[i], body, 0, names, on_stack);
-      }
-      body += " >";
-      on_stack.erase(t.get());
-      if (auto rn = names.find(t.get()); rn != names.end())  // a descendant looped back
-        out += (cp > 0 ? "(" : "") + body + " as " + rn->second + (cp > 0 ? ")" : "");
-      else out += body;
-      break;
-    }
+    case Type::Kind::Object:
     case Type::Kind::Variant: {
-      on_stack.insert(t.get());
-      // ocamlc prints poly-variant tags in alphabetical order.
-      std::vector<size_t> ord(t->labels.size());
-      for (size_t i = 0; i < ord.size(); ++i) ord[i] = i;
-      std::sort(ord.begin(), ord.end(),
-                [&](size_t x, size_t y) { return t->labels[x] < t->labels[y]; });
-      std::string body = t->variant_kind == 1 ? "[< " : t->variant_kind == 2 ? "[ " : "[> ";
-      for (size_t n = 0; n < ord.size(); ++n) {
-        size_t i = ord[n];
-        if (n) body += " | ";
-        body += "`" + t->labels[i];
-        if (i < t->tag_has_arg.size() && t->tag_has_arg[i]) {
-          body += " of ";
-          show_rec(t->args[i], body, 0, names, on_stack);
-        }
+      // A row referenced 2+ times (shared or recursive; an exact `[ .. ]` variant
+      // has no row variable so is never named) is named `as 'aN`: assign the name
+      // and mark `printed` BEFORE building the body, so a re-entry emits the
+      // back-reference `'aN`.
+      auto it = rc.find(t.get());
+      bool multi = it != rc.end() && it->second >= 2 &&
+                   !(t->kind == Type::Kind::Variant && t->variant_kind == 2);
+      if (multi) {
+        if (!names.count(t.get()))
+          names[t.get()] = "'" + std::string(1, 'a' + (char)(names.size() % 26));
+        printed.insert(t.get());
       }
-      body += " ]";
-      on_stack.erase(t.get());
-      if (auto rn = names.find(t.get()); rn != names.end())
-        out += (cp > 0 ? "(" : "") + body + " as " + rn->second + (cp > 0 ? ")" : "");
+      std::string body;
+      if (t->kind == Type::Kind::Object) {
+        body = "< ";
+        for (size_t i = 0; i < t->labels.size(); ++i) {
+          if (i) body += "; ";
+          body += t->labels[i] + " : ";
+          show_rec(t->args[i], body, 0, names, printed, rc);
+        }
+        body += " >";
+      } else {
+        std::vector<size_t> ord(t->labels.size());  // ocamlc: tags alphabetical
+        for (size_t i = 0; i < ord.size(); ++i) ord[i] = i;
+        std::sort(ord.begin(), ord.end(),
+                  [&](size_t x, size_t y) { return t->labels[x] < t->labels[y]; });
+        body = t->variant_kind == 1 ? "[< " : t->variant_kind == 2 ? "[ " : "[> ";
+        for (size_t n = 0; n < ord.size(); ++n) {
+          size_t i = ord[n];
+          if (n) body += " | ";
+          body += "`" + t->labels[i];
+          if (i < t->tag_has_arg.size() && t->tag_has_arg[i]) {
+            body += " of ";
+            show_rec(t->args[i], body, 0, names, printed, rc);
+          }
+        }
+        body += " ]";
+      }
+      if (multi)
+        out += (cp > 0 ? "(" : "") + body + " as " + names[t.get()] + (cp > 0 ? ")" : "");
       else out += body;
       break;
     }
@@ -466,10 +494,12 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
 }  // namespace
 
 std::string show(const TypePtr& t) {
+  std::unordered_map<Type*, int> rc;      // row-node reference counts (for `as 'a`)
+  { std::unordered_set<Type*> seen; count_refs(t, rc, seen); }
   std::string out;
   std::unordered_map<Type*, std::string> names;
-  std::unordered_set<Type*> on_stack;
-  show_rec(t, out, 0, names, on_stack);
+  std::unordered_set<Type*> printed;
+  show_rec(t, out, 0, names, printed, rc);
   return out;
 }
 
