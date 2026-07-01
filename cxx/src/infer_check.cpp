@@ -1923,6 +1923,18 @@ struct Checker {
     if (!pl) return nullptr;
     try {
       auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      // A ctor ARGUMENT that names a same-module type (`Cons of 'a * 'a t` in Seq)
+      // must qualify to that module (`'a Seq.t`), matching ocamlc's per-occurrence
+      // path -- but WITHOUT expanding the abbreviation (`t` stays `Seq.t`, not
+      // `unit -> 'a node`).  fold_abbrevs_ suppresses the expansion; cmi_types_ctx_
+      // /cmi_mod_prefix_ drive the qualification.
+      auto* saved_ctx = cmi_types_ctx_;
+      std::string saved_pfx = cmi_mod_prefix_;
+      bool saved_fold = fold_abbrevs_;
+      cmi_types_ctx_ = &cmi.types();
+      cmi_mod_prefix_ = pl->name;
+      fold_abbrevs_ = true;
+      TypePtr scheme = nullptr;
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors) {
@@ -1936,12 +1948,17 @@ struct Checker {
           }
           TypePtr result = c.res ? from_cmi(c.res, memo)
                                  : eng.constr(pl->name + "." + td.name, params);
-          TypePtr scheme = result;
+          scheme = result;
           for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
             scheme = eng.arrow(from_cmi(*it, memo), scheme);
-          return scheme;
+          break;
         }
+        if (scheme) break;
       }
+      cmi_types_ctx_ = saved_ctx;
+      cmi_mod_prefix_ = saved_pfx;
+      fold_abbrevs_ = saved_fold;
+      return scheme;
     } catch (...) {}
     return nullptr;
   }
@@ -1955,6 +1972,15 @@ struct Checker {
     if (!pl) return;  // single-name modules only (matches qualified_ctor_scheme)
     try {
       auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      // Qualify (not expand) same-module ctor-arg types, as in qualified_ctor_scheme
+      // -- so `Seq.(Cons (.., tail))` gives the tail `Seq.t`, matching the explicit
+      // `Seq.Cons` path (ocamlc's per-occurrence path).
+      auto* saved_ctx = cmi_types_ctx_;
+      std::string saved_pfx = cmi_mod_prefix_;
+      bool saved_fold = fold_abbrevs_;
+      cmi_types_ctx_ = &cmi.types();
+      cmi_mod_prefix_ = pl->name;
+      fold_abbrevs_ = true;
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors) {
@@ -1975,6 +2001,9 @@ struct Checker {
           cenv.back()[c.name] = scheme;
         }
       }
+      cmi_types_ctx_ = saved_ctx;
+      cmi_mod_prefix_ = saved_pfx;
+      fold_abbrevs_ = saved_fold;
     } catch (...) {}
   }
 
