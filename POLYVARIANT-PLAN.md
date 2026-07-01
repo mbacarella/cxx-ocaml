@@ -669,6 +669,39 @@ lazy_t↔Lazy.t with the hamming witness) and functor-result paths (ephetest3, p
 Both need node-identity-stable access-path tracking through generalize/instantiate —
 a dedicated slice, not a session freebie.
 
+## SESSION 2026-07-01 (l): cmi ctor-arg qualification (+1) + local-module exceptions
+
+Re-scanned the live 44 DIFF files. Two genuine bugs outside the blocked clusters,
+both in cmi constructor handling:
+
+- **cmi ctor-ARG types weren't qualified (`Seq.t`) — +1, committed.** A constructor
+  read from a cmi (`Cons of 'a * 'a t` in Seq) had its ARGUMENT come back bare
+  `'a t` instead of `'a Seq.t`: `qualified_ctor_scheme` / `open_module_ctors` called
+  `from_cmi` with NO module context, so the same-unit qualification step (the one
+  session (k) built for RESULT types) never fired for args. Fix: set
+  `cmi_types_ctx_`/`cmi_mod_prefix_` with `fold_abbrevs_=true` (qualify but don't
+  EXPAND — `t` stays `Seq.t`, not `unit -> 'a node`) around the from_cmi calls, in
+  BOTH the explicit `M.C` path and the `open M`/`M.(..)` local-open path (lib-seq's
+  `infinite` is built via `Seq.(Cons (.., infinite ..))`, so the open path mattered).
+  **lib-seq/test flips.** sig 481->482 (91.8%), reject 0.0%, lambda 54.2% flat, 0
+  crashes / 1853, match-set delta exactly +1, 0 regressions (serial stash-and-rebuild
+  per-file diff).
+
+- **local-module exception/typext ctors were never registered — correctness, 0 flip.**
+  `process_item` had no `Pstr_exception`/`Pstr_typext` branch, so a ctor inside
+  `let module M = struct exception E of int .. end` left `E x`/`M.E x` unconstrained
+  (afl `fresh_exception : 'a -> unit` vs oracle `int -> unit`). register_types_rec
+  only descends TOP-LEVEL modules, never an expression's `let module`. Added the
+  branch, guarded by a per-node `ext_ctor_registered_` set so the two registration
+  paths don't double-register (which would spuriously mark the ctor ambiguous).
+  afl's fresh_exception now matches; the file still DIFFs on the unrelated blocked
+  lazy_t axis, so no sig flip -- but a clean latent-bug fix, 0 regressions.
+
+**Baseline now: sig 482/525 (91.8%), reject 0.0%, lambda 54.2%, 0 crashes.** The
+cmi-arg qualification generalises session (k)'s per-occurrence-path insight from
+RESULT types to ARGUMENT types; residue is still the two blocked path-naming
+mechanisms + Way-4 rows + GADT/object over-spec + first-class-module recovery.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
