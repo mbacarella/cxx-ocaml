@@ -521,6 +521,45 @@ exactly +1 each, 0 regressions.
   `< .. >`, `#castable`), first-class-module/`(module S with ..)` type recovery,
   generalized-open scope, and the Way-4 poly-variant row-variable rework.
 
+## SESSION 2026-07-01 (i): polymorphic record fields + format-arg preservation (+1)
+
+Re-scanned the live 56 DIFF files; the residue is overwhelmingly the known
+blocked clusters (path-naming `Module.t`↔`t`, lazy_t↔Lazy.t, format4↔format6,
+GADT/object over-spec, first-class-module type recovery, Way-4 rows). Found ONE
+genuine reachable bug outside them: **polymorphic record fields**.
+
+- **`{pf}` patterns over a poly field failed entirely — genuine bug, +1.** A
+  universally-quantified field (`type pf = { pf : 'a. ('a,_,_) format -> 'a }`)
+  is SKIPPED by register_record_decl (a single mono value scheme would clash
+  across the field's uses), so a `{pf}` pattern couldn't even resolve its record
+  TYPE (`test : int -> _ -> 'a`, oracle `int -> pf -> unit`). Two linked fixes:
+  1. **poly-field record-type registry.** Record the owning record type per
+     unique poly-field label (`poly_field_rec_`, ambiguity-filtered like
+     `finalize_fields`). The `{pf}` pattern resolves to `pf` and binds the field
+     variable to the field's GENERALIZED type (`from_coretype` mints generic
+     vars) via a new `bind_poly_field` — so each body use instantiates fresh
+     (the poly-record-field feature) instead of collapsing to Any. Isolated
+     proof: `type poly = {p:'x.'x->'x}; let k {p} = p 3` now gives `poly -> int`.
+  2. **format-arg preservation in from_coretype.** With (1) binding `pf`
+     correctly, `pf "@]"` still gave `'a`: `from_coretype` collapsed a format
+     annotation to a NULLARY `format6`, dropping the args, so the format
+     literal's result param never unified. `from_cmi` already PRESERVES format
+     args — made from_coretype consistent (keep args under the canonical
+     `format6` name; `show` already renders a 3-arg format6 as `format`). This
+     is the general fix for a format-typed function parameter (`g : (..) format
+     -> 'a`) resolving its result from a literal — NOT the (still-blocked)
+     format4↔format6 DISPLAY-name folding, which is orthogonal.
+  **lib-format/domains.ml flips.** sig 469->470 (89.5%), reject 0.0%, lambda
+  54.2% flat, 0 crashes / 1853, match-set delta exactly +1, 0 regressions.
+  Committed `infer: polymorphic record fields + format-arg preservation`.
+
+**Baseline now: sig 470/525 (89.5%), reject 0.0%, lambda 54.2%, 0 crashes.**
+The poly-record-field substrate (registry + `bind_poly_field` + generic field
+type) is now available for the other poly-field files (e.g. msg.ml's `wkind =
+{ f : 'a. 'a tag -> 'a kind }`), though those additionally need extensible-GADT
+constructor typing (a separate blocked cluster). No other engine-free flips
+surfaced in the scan; residue is the documented blocked clusters.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
