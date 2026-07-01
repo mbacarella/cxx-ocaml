@@ -239,6 +239,10 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
 
 TypePtr Engine::instantiate(const TypePtr& scheme) {
   std::unordered_map<Type*, TypePtr> mapping;  // generic var -> fresh var
+  // Copy replacing generic vars with fresh ones, but SHARING any subtree that
+  // contains none (return the original node when no child changed).  This keeps a
+  // monomorphic function-param row shared, so its tags accumulate across
+  // `f `A; f `B` -- copying it would give each use a fresh row and lose the union.
   std::function<TypePtr(const TypePtr&)> copy = [&](const TypePtr& t0) -> TypePtr {
     TypePtr t = repr(t0);
     switch (t->kind) {
@@ -250,31 +254,28 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
           mapping[t.get()] = fv;
           return fv;
         }
-        return t;  // free var: shared, not copied
-      case Type::Kind::Arrow:
-        return arrow(copy(t->dom), copy(t->cod), t->arrow_label, t->arrow_lbl);
-      case Type::Kind::Tuple: {
-        std::vector<TypePtr> es;
-        for (auto& a : t->args) es.push_back(copy(a));
-        return tuple(std::move(es));
+        return t;  // free (non-generic) var: shared, not copied
+      case Type::Kind::Arrow: {
+        TypePtr d = copy(t->dom), c = copy(t->cod);
+        if (d == t->dom && c == t->cod) return t;  // no generic inside: share
+        return arrow(std::move(d), std::move(c), t->arrow_label, t->arrow_lbl);
       }
-      case Type::Kind::Constr: {
-        std::vector<TypePtr> as;
-        for (auto& a : t->args) as.push_back(copy(a));
-        return constr(t->path, std::move(as), t->stamp);
-      }
-      case Type::Kind::Object: {
-        std::vector<TypePtr> as;
-        for (auto& a : t->args) as.push_back(copy(a));
-        return object_type(t->labels, std::move(as));
-      }
+      case Type::Kind::Tuple:
+      case Type::Kind::Constr:
+      case Type::Kind::Object:
       case Type::Kind::Variant: {
         std::vector<TypePtr> as;
-        for (auto& a : t->args) as.push_back(copy(a));
-        return variant_type(t->labels, std::move(as), t->tag_has_arg);
+        bool changed = false;
+        as.reserve(t->args.size());
+        for (auto& a : t->args) { as.push_back(copy(a)); if (as.back() != a) changed = true; }
+        if (!changed) return t;  // monomorphic composite: share the node
+        if (t->kind == Type::Kind::Tuple) return tuple(std::move(as));
+        if (t->kind == Type::Kind::Constr) return constr(t->path, std::move(as), t->stamp);
+        if (t->kind == Type::Kind::Object) return object_type(t->labels, std::move(as));
+        return variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
       }
       case Type::Kind::Link:
-        return copy(t);  // repr resolved; unreachable
+        return copy(t);  // repr already resolved; unreachable
       case Type::Kind::Any:
         return t;  // dynamic: shared, not copied
     }
