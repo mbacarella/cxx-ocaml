@@ -384,6 +384,47 @@ project the plan explicitly says NOT to start as a session task. Next session sh
 NOT re-scan for freebies (this section is the proof there are none); it should
 either (a) fund Way-4 as its own project, or (b) pivot to the non-row axes above.
 
+## SESSION 2026-07-01 (f): PIVOT off poly-variants -> `let rec` generalization (+10)
+
+Per the (e) closure verdict, pivoted to the non-row axes the corpus scan surfaced.
+The first one was a genuine single-root BUG, not a display-naming quirk:
+
+- **`let rec` bindings were never generalized.** `infer_bindings`'s recursive
+  branch inferred bodies + unified the pre-bound recursion vars but (unlike the
+  non-recursive branch) never raised the level or generalized the bound names. So
+  every `let rec f` stayed monomorphic at the outer level and any LATER use in the
+  same module pinned it: `let rec map f = ..;; map succ [1]` inferred
+  `(int -> int) -> int list -> int list`. Fix mirrors the non-rec path:
+  enter_level before pre-bind, leave_level after bodies, generalize each bound
+  scheme under the value restriction (non-expansive -> generalize, else demote).
+  Recursion stays monomorphic during body inference (shared non-generic pre-bound
+  var); generalize once, after. **sig 454->464 (86.5%->88.4%), reject 0.0%, lambda
+  54.2% flat, 0 crashes / 1853, match-set delta = exactly +10, 0 regressions**
+  (streams, terms, hamming, sieve, sorts, join, pingpong, semantic,
+  tupled_function, pr6323 -- all `let rec` fns used at a concrete type later).
+  Committed `infer: generalize \`let rec\` bindings`.
+
+**Baseline now: sig 464/525 (88.4%), reject 0.0%, lambda 54.2%, 0 crashes.**
+
+### Next non-row clusters identified (for a future session, NOT started)
+- **Type-path naming preference (~9 files, ARCHITECTURALLY BLOCKED).** Oracle keeps
+  the path a type was ACCESSED through: `Result.Ok`->`Result.t` (contexts_1/2/3),
+  `Float.classify_float`->`Float.fpclass` (fma), `String.compare`->`String.t`
+  (qsort), `Bigarray.kind` (specialized), `Scanf.Scanning` (tscanf2_io) -- and the
+  reverse for the `lazy` primitive: `lazy_t` not `Lazy.t` (lazy7, test_module). We
+  canonicalize to the base name. BLOCKER: our unifier matches on the FINAL path
+  component, so producing `Result.t` would not unify with `result` (this is exactly
+  why rendering `lazy_t` was tried and REVERTED, infer.cpp:2683 -- reject 0.0->0.1).
+  Matching needs recording the access-path on the constr node AND a display-time
+  normalization that survives unify. A coherent project, regression-prone, deferred.
+- **GADT/object over-specialization (niche, hard).** `int Effect.t` vs `'a Effect.t`
+  (effects, test2 -- locally-abstract `type a` should stay polymorphic); `< .. >`
+  vs `'a` (Tests, runtime-objects); `#castable` vs `'a` (cast). Need real
+  locally-abstract-type + object-row handling.
+- **format4<->format6 abbreviation folding** (lib-scanf test.ml `pr`); functor-result
+  and first-class-module type-path one-offs (pr6944_ok `Map.Make(String).t`,
+  pr6982_ok `(module S with type t = ..)`). Assorted one-offs, low leverage.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
