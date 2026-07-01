@@ -3247,7 +3247,15 @@ struct Checker {
       // for a GADT recursion yields a spurious occurs-check).  Plain bindings get
       // a monomorphic var unified with the inferred body.
       check_letrec(bs);  // the value-recursion restriction
-      std::vector<TypePtr> tv(bs.size(), nullptr);
+      // Generalize the rec group like the non-recursive path: infer the bodies at
+      // a RAISED level, then generalize each bound name so a LATER use in the same
+      // module instantiates a fresh copy (`let rec map f = .. ;; map succ [1]` must
+      // keep `map : ('a -> 'b) -> 'a list -> 'b list`, not monomorphize to int).
+      // Recursion itself stays monomorphic (the pre-bound var is shared,
+      // non-generic, during body inference) -- standard ML let-rec.
+      eng.enter_level();
+      std::vector<TypePtr> tv(bs.size(), nullptr);      // plain: the recursion var
+      std::vector<TypePtr> bound(bs.size(), nullptr);   // scheme to generalize
       for (size_t i = 0; i < bs.size(); ++i) {
         const ValueBinding& b = bs[i];
         const Pvc_constraint* pc =
@@ -3255,7 +3263,8 @@ struct Checker {
         if (pc && !pc->univars.empty()) {
           for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
           std::unordered_map<std::string, TypePtr> vars;
-          bind_pattern_scheme(b.pat, from_coretype(*pc->typ, vars));
+          bound[i] = from_coretype(*pc->typ, vars);
+          bind_pattern_scheme(b.pat, bound[i]);
         } else if (pc && !strict) {
           // A plain declared type `let rec x : T = e` pins x to T -- bind the
           // name to the annotation rather than the (possibly Any) body, so a
@@ -3263,9 +3272,11 @@ struct Checker {
           // value (`[||]`) doesn't erase the declared type.  tv stays null: the
           // body is still inferred below (effects/kinds) but not unified back.
           std::unordered_map<std::string, TypePtr> vars;
-          bind_pattern_scheme(b.pat, from_coretype(*pc->typ, vars));
+          bound[i] = from_coretype(*pc->typ, vars);
+          bind_pattern_scheme(b.pat, bound[i]);
         } else {
           tv[i] = infer_pat(b.pat);
+          bound[i] = tv[i];
         }
       }
       for (size_t i = 0; i < bs.size(); ++i) {
@@ -3281,6 +3292,14 @@ struct Checker {
                 note_error("type mismatch against declared type");
             }
       }
+      eng.leave_level();
+      // Value restriction (mirrors the non-recursive path): generalize a
+      // non-expansive RHS, otherwise demote its vars to the outer level.
+      for (size_t i = 0; i < bs.size(); ++i)
+        if (bound[i]) {
+          if (strict || non_expansive(*bs[i].expr)) eng.generalize(bound[i]);
+          else eng.demote(bound[i]);
+        }
       return;
     }
     for (auto& b : bs) {
