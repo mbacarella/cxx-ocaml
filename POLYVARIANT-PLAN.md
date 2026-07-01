@@ -124,6 +124,36 @@ goal, minus the last tiers.
   show (a real rework: assign a shared name to any row/type node printed 2+
   times, not just cyclic ones), (3) alpha ordering already done.
 
+## DEDICATED PROJECT DELIVERED (2026-07-01, committed)
+
+Did the "well-scoped, bounded" project (crash-safe instantiate + `as`-sharing show
++ present-tags).  Three clean flips, 0 crashes, 0 regressions, reject 0.0% / lambda
+54.2% throughout.  sig 447 (pre-poly) -> **451 (85.9%)**:
+
+1. **instantiate SHARE-UNCHANGED** — copy returns the ORIGINAL node when no child
+   changed (correct HM), so a monomorphic function-param row stays ONE node and
+   its tags accumulate across `f `A; f `B; f `C` (was copied -> only 1st tag).
+   Replaced the crash-prone contains_generic pass.  (foundation; 0 flips alone)
+2. **cross-occurrence `as 'a` show** — a count_refs pre-pass; a row reached 2+
+   times (shared OR cyclic) is named `as 'aN` at first print, back-ref'd after
+   (a `printed` set replaces on_stack).  => **recursive_module_init flips**.
+3. **present-tags `[< L > `P ]`** — stored (Variant.present) from the annotation,
+   rendered after the tags.  => **ref_spec flips** (its last missing piece).
+Plus **pr10664** from phases 0-1.  TOTAL poly-variant flips: 3 (pr10664,
+recursive_module_init, ref_spec).
+
+REVERTED within this project (1-file, delicate plumbing): `named_alias` (preserve
+a source single-occurrence `(row as 'a)` for pr6899 `bar`) — the flag is dropped
+by instantiate-copy / merge (neither carries present/named_alias), fiddly for 1
+file.
+
+REMAINING poly-variant residue, each its own hard feature: bar (source
+single-occurrence alias + instantiate/merge carrying present+named_alias), exotic
+(binding-level coercion `let x:T1:>T2`), pr6836 (conjunctive `[< int u > `A]`),
+nested (nested-recursion arg precision), morematch (input `[<]` -> DIFFERENT
+output `[>]` rows, needs row VARIABLES not pass-through sharing), mixin×3
+(objects+`#ops`+deep recursion), test2/frame-pointers (effect GADT univar).
+
 **DECISION (2026-07-01): STOP the poly-variant grind after phases 0-1.** Three
 sub-attempts (recursive occurs, instantiate sharing, and the earlier pattern-row)
 each confirm: every remaining corpus file stacks 2-3 features AND the engine
