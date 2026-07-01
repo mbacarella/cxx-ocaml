@@ -348,6 +348,42 @@ recursion), nested (nested-recursion arg precision). These genuinely need the
 `{fields; tail_var}` row rework — a dedicated project, not a session slice. No
 engine-free flips remain in the cluster.
 
+## SESSION 2026-07-01 (e): closure re-verified against live corpus
+
+Re-scanned the full corpus after a /clear (sig 454/525 = 86.5% confirmed). Pulled
+the 71 DIFF files and isolated the ones whose ORACLE sig contains backtick tags —
+the exhaustive set of remaining poly-variant DIFFs is exactly **5**: morematch,
+nested, mixin, mixin2, mixin3. Read each precise diff to check for a mislabelled
+engine-free freebie (as `exotic` turned out to be). **There is none left** — each
+genuinely needs the row-VARIABLE model:
+
+- **morematch** — we emit `([<..] as 'c) -> [> `A of 'c | `B of 'c]` (one shared
+  `'c`); oracle splits the input into DISTINCT output rows `[> `A of [> `Cons of 'a
+  | `Nil ] | `B of [> `Snoc of 'b ]]`. Pass-through node-sharing cannot express a
+  split — needs real row tail variables.
+- **nested** — recursive `as 'a` binds at the ARROW level (`'a = unit -> [> `A of
+  'a]`) over a `[>` constructed row; we emit `[< `A of unit -> '_60] as 'a` (wrong
+  kind, untied recursion arg). Deep-recursion arg precision + alias placement.
+- **mixin/mixin2/mixin3** — we emit huge fully-EXPANDED object/row types where the
+  oracle folds to named abbreviations (`'a lambda`, `([> var], var) ops`, `#ops`).
+  Needs object-row abbreviation folding + `#ops` ON TOP of the row model. mixin2 is
+  lost entirely (`val lambda : 'a`).
+
+Also noted (NON-poly-variant, out of this plan's scope but surfaced by the same
+scan — candidate future slices): abbreviation-fold prefs `Lazy.t`↔`lazy_t`,
+`format6`↔`format4`, abstract-alias display `HW.key`↔`SW.data` / `Pos.t`↔`int`
+(ephetest3, patmatch, test_generator), and GADT univar over-specialization
+(`int Effect.t` vs `'a Effect.t` in effects.ml; `int -> int` vs `'a -> 'b` variant
+match scrutinees in patmatch). These are separate axes, not row work.
+
+**Verdict: the poly-variant cluster is CLOSED to session-sized work.** Five engine-
+free/plumbing flips landed this project (pr10664, recursive_module_init, ref_spec,
+pr6836, bar, exotic → sig 447→454, +7, 0 crashes throughout). The residue is the
+Way-4 row-variable rework — a dedicated, token-heavy, crash-prone multi-feature
+project the plan explicitly says NOT to start as a session task. Next session should
+NOT re-scan for freebies (this section is the proof there are none); it should
+either (a) fund Way-4 as its own project, or (b) pivot to the non-row axes above.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
