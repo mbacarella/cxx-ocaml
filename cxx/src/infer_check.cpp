@@ -2170,6 +2170,55 @@ struct Checker {
     } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) collect_ctors(*c->p, out);
     else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) collect_ctors(*a->p, out);
   }
+  // Is `t` fully GROUND -- no type variable (and no Any) anywhere in its tree?
+  // Used after a GADT branch window is rolled back: a branch result that is
+  // still ground did NOT depend on the (now-undone) refinement, so it is the
+  // genuine match result and may be unified outward.  Any is treated as
+  // non-ground (conservative: we don't want to pin the result to `_`).
+  static bool type_is_ground(const TypePtr& t0) {
+    TypePtr t = I::Engine::repr(t0);
+    switch (t->kind) {
+      case I::Type::Kind::Var: return false;
+      case I::Type::Kind::Any: return false;
+      case I::Type::Kind::Arrow:
+        return type_is_ground(t->dom) && type_is_ground(t->cod);
+      case I::Type::Kind::Tuple:
+      case I::Type::Kind::Constr:
+        for (auto& a : t->args) if (!type_is_ground(a)) return false;
+        return true;
+      default: return false;  // Object/Variant/Link: play safe, treat as non-ground
+    }
+  }
+
+  // Structural equality of two GROUND types.  Compares constructor paths by
+  // their LAST component (mirroring Engine::unify's own path leniency, so `int`
+  // reached via two qualifications is equal), by arity, and recursively.  Used
+  // to tell whether all GADT branches agree on a single ground result -- WITHOUT
+  // routing through Engine::unify, whose `lenient` mode (on in the signature
+  // pass) would silently accept a genuine clash (int vs int list).
+  static bool ground_types_equal(const TypePtr& x0, const TypePtr& y0) {
+    TypePtr x = I::Engine::repr(x0), y = I::Engine::repr(y0);
+    if (x->kind != y->kind) return false;
+    switch (x->kind) {
+      case I::Type::Kind::Arrow:
+        return ground_types_equal(x->dom, y->dom) && ground_types_equal(x->cod, y->cod);
+      case I::Type::Kind::Tuple:
+        if (x->args.size() != y->args.size()) return false;
+        for (size_t i = 0; i < x->args.size(); ++i)
+          if (!ground_types_equal(x->args[i], y->args[i])) return false;
+        return true;
+      case I::Type::Kind::Constr: {
+        auto last = [](const std::string& p) {
+          auto d = p.rfind('.'); return d == std::string::npos ? p : p.substr(d + 1); };
+        if (last(x->path) != last(y->path) || x->args.size() != y->args.size()) return false;
+        for (size_t i = 0; i < x->args.size(); ++i)
+          if (!ground_types_equal(x->args[i], y->args[i])) return false;
+        return true;
+      }
+      default: return false;
+    }
+  }
+
   // Does a pattern (recursively) use a GADT constructor?  Such a match refines
   // types branch-locally, so we must not unify its patterns/results globally.
   bool pat_has_gadt_ctor(const Pattern& p) {
@@ -2848,6 +2897,16 @@ struct Checker {
       // erase value kinds it records).
       bool window = gadt && !record_kinds_;
       TypePtr rt = eng.fresh_var();
+      // For a windowed (GADT) match, recover the result type when EVERY branch,
+      // after its refinement is rolled back, yields the SAME ground type: then
+      // the result genuinely is that type (e.g. all arms return `unit`/`string`),
+      // not an abstract per-branch one.  If arms disagree on a ground type
+      // (`Int -> 100` vs `Ptr -> p` : int vs int list) OR any arm is non-ground,
+      // the result is abstract (`: a`) and must stay open -- so a later
+      // annotation (`: a`) can pin it.  This flips w04_failure without
+      // over-specialising register_typing.
+      bool all_ground = window, ground_clash = false;
+      TypePtr gacc = nullptr;
       for (auto& c : m->cases) {
         check_case_structure(c);
         venv.emplace_back();
@@ -2859,9 +2918,17 @@ struct Checker {
         TypePtr br = infer_expr(*c.rhs);
         if (window) soft_unify(br, rt);
         else if (!gadt) try_unify(br, rt);
-        if (window) eng.undo_to(wm);
+        if (window) {
+          eng.undo_to(wm);
+          TypePtr brr = I::Engine::repr(br);
+          if (type_is_ground(brr)) {
+            if (!gacc) gacc = brr;
+            else if (!ground_types_equal(gacc, brr)) ground_clash = true;
+          } else all_ground = false;
+        }
         venv.pop_back();
       }
+      if (window && all_ground && !ground_clash && gacc) soft_unify(rt, gacc);
       match_partial[&e] = compute_partial(se, m->cases);  // for the dump (Slice 3)
       return rt;
     }
