@@ -638,6 +638,37 @@ qualification), each a dedicated slice — not session freebies. Best next path-
 naming investment: the from_cmi top-level-type qualification (specialized), the
 most self-contained of the three.
 
+## SESSION 2026-07-01 (k): from_cmi parent-module qualification (specialized, +1)
+
+Took session (j)'s recommended next slice — the "from_cmi top-level-type
+qualification" (specialized) — and it landed clean.
+
+- **`specialized.ml` (`('a,'b) kind` -> `Bigarray.kind`) — DONE & committed**
+  (`infer: qualify parent-module cmi types via enclosing scopes`). The sole diff:
+  `test`'s param printed `('a,'b) kind` vs oracle `('a,'b) Bigarray.kind`. Root:
+  `kind` is a TOP-LEVEL type of Bigarray but is referenced from the SUBMODULE value
+  `Array1.create` (via `open Bigarray`). module_values set a single
+  (cmi_types_ctx_, cmi_mod_prefix_) = (Array1's types, "Bigarray.Array1"); the
+  Pident `kind` isn't in Array1's type list, so the qualification loop found
+  nothing and left it bare (whereas Array1's OWN `t` qualified fine).
+  - Fix: module_values now records EACH module level's `(types, cumulative-prefix)`
+    as an enclosing scope (`cmi_scopes_`, outermost..innermost); from_cmi's
+    qualification step searches them innermost->outermost, so a parent-owned type
+    resolves to its own module (`Bigarray.kind`, not `Bigarray.Array1.kind`).
+    Abbreviation-expansion still uses the innermost ctx only (unchanged surface).
+    Other call sites (functor_result, load_module_record_fields) leave cmi_scopes_
+    empty and hit the original single-ctx fallback.
+  - **sig 480->481 (91.6%), reject 0.0%, lambda 54.2% flat, 0 crashes / 1853,
+    match-set delta exactly +1 (specialized.ml), 0 regressions** (verified per-file
+    via stash-and-rebuild, not just aggregate counts).
+
+**Baseline now: sig 481/525 (91.6%), reject 0.0%, lambda 54.2%, 0 crashes.** Two
+of session (j)'s three named path-naming residues remain (each distinct): the
+constr-node access-path-through-unify machinery (qsort `string`↔`String.t`,
+lazy_t↔Lazy.t with the hamming witness) and functor-result paths (ephetest3, pr6944).
+Both need node-identity-stable access-path tracking through generalize/instantiate —
+a dedicated slice, not a session freebie.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
