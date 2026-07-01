@@ -475,6 +475,16 @@ void count_refs(const TypePtr& t0, std::unordered_map<Type*, int>& rc,
   }
 }
 
+// Type-variable display name for the i-th distinct printed variable, matching
+// ocamlc's scheme: 'a..'z, then 'a1..'z1, 'a2..  (letter = i mod 26, numeric
+// suffix = i / 26, empty when 0).  Using a single letter (i % 26) collides past
+// 'z, which under first-appearance normalisation merges distinct vars.
+static std::string tvar_letter(size_t i) {
+  std::string s(1, (char)('a' + i % 26));
+  if (i >= 26) s += std::to_string(i / 26);
+  return s;
+}
+
 // `cp` = context precedence required by the parent position: 0 top (arrow ok),
 // 1 arrow-domain (tuple ok, arrow needs parens), 2 atom (both need parens).
 // A row node referenced 2+ times (`rc`) -- shared across the type OR recursive --
@@ -496,7 +506,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
     case Type::Kind::Var: {
       auto it = names.find(t.get());
       if (it == names.end()) {
-        std::string n = "'" + std::string(1, 'a' + (char)(names.size() % 26));
+        std::string n = "'" + tvar_letter(names.size());
         if (t->level == GENERIC_LEVEL) n += "";  // generic: plain 'a
         else n = "'_" + std::to_string(t->id);   // weak/free: '_N
         it = names.emplace(t.get(), n).first;
@@ -570,7 +580,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       bool multi = shared || weak;
       if (multi) {
         if (!names.count(t.get()))
-          names[t.get()] = "'" + std::string(1, 'a' + (char)(names.size() % 26));
+          names[t.get()] = "'" + tvar_letter(names.size());
         printed.insert(t.get());
       }
       std::string body;
