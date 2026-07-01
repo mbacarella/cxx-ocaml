@@ -1642,7 +1642,7 @@ struct Checker {
       // as `float dyn`, not the generic `'a dyn`.  Non-strict only: in the strict
       // pass the per-branch refinement needs windowing we keep conservative.
       TypePtr result = (!strict && c.res) ? from_coretype(**c.res, vars)
-                                          : eng.constr(d.name.txt, params, type_stamp_[&d]);
+                                          : eng.constr(mod_prefix_ + d.name.txt, params, type_stamp_[&d]);
       TypePtr scheme = result;
       if (auto* tup = std::get_if<Pcstr_tuple>(&c.args)) {
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
