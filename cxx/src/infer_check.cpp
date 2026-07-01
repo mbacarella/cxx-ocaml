@@ -167,6 +167,11 @@ struct Checker {
   // types is disambiguated by position instead of collapsed to ambiguous.
   std::unordered_map<const ConstructorDecl*, TypePtr> ctor_scheme_;
   std::vector<std::unordered_map<std::string, TypePtr>> cenv{{}};
+  // Module aliases `module MP = Gc.Memprof`: (target-path, alias-name).  ocamlc
+  // keeps the alias in displayed type paths (`MP.t`, not `Gc.Memprof.t`), so the
+  // signature emitter rewrites the target prefix back to the alias.  Display-only
+  // (same last path component, so unification is untouched).
+  std::vector<std::pair<std::string, std::string>> module_aliases_;
   // names that are also predefined or exception constructors: when one of these
   // is reused by a variant, OCaml disambiguates by expected type (which we lack),
   // so we keep them unknown rather than resolve to the wrong kind.
@@ -3978,6 +3983,19 @@ struct Checker {
               for (auto& [k, v] : ex) v = generic_var();
               functor_env[*mb->binding.name.txt] = std::move(ex);
             } else {
+              // `module MP = Long.Path`: remember the alias so displayed type
+              // paths keep the alias (ocamlc prints `MP.t`, not `Long.Path.t`).
+              if (auto* pi = std::get_if<Pmod_ident>(&me->desc)) {
+                std::string tgt = lid_full(pi->id.txt);
+                // Only alias an EXTERNAL target (a cmi module like Gc.Memprof).  A
+                // local target (Std2.M) can be accessed both directly and via the
+                // alias in the same file, and ocamlc keeps each occurrence's own
+                // path -- a uniform rewrite would corrupt the direct occurrences.
+                std::string head = tgt.substr(0, tgt.find('.'));
+                if (tgt.find('.') != std::string::npos && tgt != *mb->binding.name.txt &&
+                    !bound_module_names_.count(head))
+                  module_aliases_.emplace_back(tgt, *mb->binding.name.txt);
+              }
               func_bind_name_ = *mb->binding.name.txt;
               modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
               func_bind_name_.clear();
@@ -4852,10 +4870,24 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
   ck.eng.lenient = true;  // signature pass: best-effort unify (see Engine::lenient)
   ck.fold_abbrevs_ = true;  // keep abbreviations folded for display (see fold_abbrevs_)
   run_checker(ck, s);
+  // Apply `module MP = Long.Path` aliases to a rendered signature: rewrite each
+  // `Long.Path.` prefix back to `MP.`.  Longest target first so a nested alias
+  // wins over a shorter one.  Purely textual on the type-path substrings.
+  auto aliases = ck.module_aliases_;
+  std::sort(aliases.begin(), aliases.end(),
+            [](auto& a, auto& b) { return a.first.size() > b.first.size(); });
+  auto apply_aliases = [&](std::string s) {
+    for (auto& [tgt, al] : aliases) {
+      std::string from = tgt + ".", to = al + ".";
+      for (size_t p = 0; (p = s.find(from, p)) != std::string::npos; p += to.size())
+        s.replace(p, from.size(), to);
+    }
+    return s;
+  };
   std::vector<std::pair<std::string, std::string>> all;
   auto emit = [&](const std::string& nm) {
     auto f = ck.venv.back().find(nm);
-    if (f != ck.venv.back().end()) all.emplace_back(nm, I::show(f->second));
+    if (f != ck.venv.back().end()) all.emplace_back(nm, apply_aliases(I::show(f->second)));
   };
   // Resolve `include M` to the included structure (a local struct, directly or
   // via a local module binding), so we can emit its flattened value names too --
