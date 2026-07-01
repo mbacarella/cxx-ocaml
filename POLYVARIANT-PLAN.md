@@ -741,6 +741,40 @@ unchanged: the two remaining path-naming mechanisms (constr-node access-path-thr
 unify: qsort/lazy_t; functor-result paths), GADT/object over-spec, first-class-module
 recovery, weak-var/relaxed-value-restriction (testerror), Way-4 rows.
 
+## SESSION 2026-07-01 (n): tuple-pattern let generalization (+1)
+
+Re-scanned the live 42 DIFF files. Residue is overwhelmingly the known blocked
+clusters (lazy_t↔Lazy.t, GADT/object over-spec, first-class-module recovery,
+functor-result paths, sscanf-return typing, weak-var, Way-4 rows). Found ONE
+genuine reachable bug: **tuple-pattern `let` bindings never generalized their
+components.**
+
+- **`let a, b = (e1, e2)` bound each name monomorphically — genuine bug, +1.**
+  `bind_pattern_scheme`'s non-var fallback did `try_unify(infer_pat(p), te)`:
+  infer_pat minted FRESH outer-level vars for the pattern's variables and unified
+  them with the (generalized) RHS tuple type, trapping every component at the
+  current level → monomorphic, pinned by later use (`let id2, id3 = (fun x->x),
+  (fun y->y); id2 1` gave `id2:int->int, id3:'_weak` vs oracle `'a->'a` both).
+  Fix: a Ppat_tuple over a matching-arity Tuple type now recurses component-wise,
+  binding each var to its GENERALIZED sub-type (each gets its own scheme). Kept the
+  unify fallback for non-tuple patterns (a first attempt that also peeled
+  Ppat_constraint/Ppat_alias regressed alloc.ml — `let (_:int) = f ~a ~b` dropped
+  the `int` annotation that constrained `f`'s result; the fallback's infer_pat is
+  what unifies a constraint, so only the pure-structural tuple case is special-cased).
+  Second half: made a local open `M.(e)` (Pexp_struct_item wrapping an open)
+  non-expansive iff its body is, so `let a,b = Format.(x,y)` generalizes like the
+  bare tuple (matches ocamlc is_nonexpansive on Texp_open). **pp_print_custom_break
+  flips** (its `let fprintf, printf, list = Format.(..)` now stays polymorphic).
+  sig 483→484 (92.2%), reject 0.0%, lambda 54.2% flat, 0 crashes / 1853, match-set
+  delta exactly +1, 0 regressions. Committed `infer: generalize tuple-pattern let
+  bindings + local-open non-expansiveness`.
+
+**Baseline now: sig 484/525 (92.2%), reject 0.0%, lambda 54.2%, 0 crashes.** No
+other engine-free flips surfaced; residue is the documented blocked clusters
+(functor-result/first-class-module recovery, GADT/object over-spec, sscanf-return,
+weak-var, lazy_t↔Lazy.t constr-node access-path, module-shadow `Stdlib/2` display,
+Way-4 rows).
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
