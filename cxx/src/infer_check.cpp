@@ -325,6 +325,11 @@ struct Checker {
   // When set, the qualification step searches innermost->outermost; empty falls
   // back to the single (cmi_types_ctx_, cmi_mod_prefix_) above.
   std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> cmi_scopes_;
+  // Parallel to cmi_scopes_, the SUBMODULE lists per scope, for qualifying a Pdot
+  // type whose head is a submodule of the value's owning module: a top-level
+  // `Bigarray.reshape` returns `Genarray.t` (Ldot in the cmi) which must display
+  // as `Bigarray.Genarray.t`.  Searched innermost->outermost; empty => no change.
+  std::vector<std::pair<const std::vector<cmi::ModuleDecl>*, std::string>> cmi_mod_scopes_;
   // Stdlib value schemes (loaded once, lazily).
   bool stdlib_ready_ = false;
   std::unordered_map<std::string, TypePtr> stdlib_;
@@ -420,6 +425,21 @@ struct Checker {
           } else if (cmi_types_ctx_ && !cmi_mod_prefix_.empty()) {
             for (auto& td : *cmi_types_ctx_)
               if (td.name == n->path->id.name) { p = cmi_mod_prefix_ + "." + p; break; }
+          }
+        }
+        // Qualify a Pdot type whose HEAD is a submodule of the value's owning
+        // module: `Bigarray.reshape`'s result `Genarray.t` -> `Bigarray.Genarray.t`.
+        if (n->path && n->path->kind == cmi::Path::Pdot && !cmi_mod_scopes_.empty()) {
+          const cmi::Path* h = n->path.get();
+          while (h->kind == cmi::Path::Pdot && h->a) h = h->a.get();
+          if (h->kind == cmi::Path::Pident) {
+            const std::string& head = h->id.name;
+            for (auto it = cmi_mod_scopes_.rbegin(); it != cmi_mod_scopes_.rend(); ++it) {
+              bool found = false;
+              for (auto& mm : *it->first)
+                if (mm.name == head) { p = it->second + "." + p; found = true; break; }
+              if (found) break;
+            }
           }
         }
         std::vector<TypePtr> as;
@@ -994,18 +1014,24 @@ struct Checker {
       // scope, so a Pident type owned by a PARENT module qualifies to its own
       // module (`Array1.create`'s `kind` -> `Bigarray.kind`, not the submodule).
       std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> scopes;
+      std::vector<std::pair<const std::vector<cmi::ModuleDecl>*, std::string>> mscopes;
       scopes.push_back({&sig->types, comps[0]});
+      mscopes.push_back({&sig->modules, comps[0]});
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
           if (mm.name == comps[i]) { md = &mm; break; }
         sig = md ? module_sig(md->type, loaded) : nullptr;
-        if (sig) scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
+        if (sig) {
+          scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
+          mscopes.push_back({&sig->modules, mscopes.back().second + "." + comps[i]});
+        }
       }
       if (sig) {
         cmi_types_ctx_ = &sig->types;  // enable same-module abbreviation expansion
         cmi_mod_prefix_ = scopes.back().second;
         cmi_scopes_ = scopes;
+        cmi_mod_scopes_ = mscopes;
         for (auto& v : sig->values) {
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
           out[v.name] = from_cmi(v.type, memo);
@@ -1013,8 +1039,9 @@ struct Checker {
         cmi_types_ctx_ = nullptr;
         cmi_mod_prefix_.clear();
         cmi_scopes_.clear();
+        cmi_mod_scopes_.clear();
       }
-    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); cmi_scopes_.clear(); }
+    } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); cmi_scopes_.clear(); cmi_mod_scopes_.clear(); }
     return out;
   }
 
@@ -2488,8 +2515,14 @@ struct Checker {
   // The argument arrow of a format string (printf "%d %s" -> int -> string -> 'r),
   // so a format-consuming application flows argument value-kinds (x:int in
   // `printf "%d" x`).  %a consumes two args, %t one; unknown directives -> Any.
-  TypePtr format_arrow(const std::string& s, const TypePtr& result) {
+  TypePtr format_arrow(const std::string& s, const std::vector<TypePtr>& fmtargs) {
     auto isdig = [](char c) { return c >= '0' && c <= '9'; };
+    // format6 params: [0]=args-fn (built here), [1]=channel type for %a/%t
+    // printers (Format.formatter/out_channel), [2]=printer result, back()=final
+    // result.  %a ties its printer's value param to the value argument.
+    TypePtr result = fmtargs.back();
+    TypePtr chan = fmtargs.size() > 1 ? fmtargs[1] : eng.any();
+    TypePtr pres = fmtargs.size() > 2 ? fmtargs[2] : eng.any();
     std::vector<TypePtr> args;
     size_t i = 0, n = s.size();
     while (i < n) {
@@ -2523,8 +2556,13 @@ struct Checker {
         case 'f': case 'e': case 'E': case 'g': case 'G': case 'F': case 'h': case 'H':
           add(eng.constr("float")); break;
         case 'b': case 'B': add(eng.constr("bool")); break;
-        case 'a': add(eng.any()); add(eng.any()); break;  // fn + value
-        case 't': add(eng.any()); break;
+        case 'a': {  // printer `chan -> 'v -> pres` + value `'v` (tied)
+          TypePtr v = eng.fresh_var();
+          add(eng.arrow(chan, eng.arrow(v, pres)));
+          add(v);
+          break;
+        }
+        case 't': add(eng.arrow(chan, pres)); break;  // printer `chan -> pres`
         case '(': {  // %(...%): the argument is itself a format6 (substitution).
           add(eng.constr("format6"));  // so a string-literal arg is typed as a format
           int depth = 1;               // skip the inner format up to the matching %)
@@ -2567,7 +2605,7 @@ struct Checker {
         if (record_kinds_) fmt_lits_.insert(&e);  // Lambda lowers it as a format
         auto er = I::Engine::repr(expected);  // format6's arg0 ('a) is the args function
         if (er->kind == I::Type::Kind::Constr && !er->args.empty()) {
-          std::vector<TypePtr> a = er->args; a[0] = format_arrow(s->s, a.back());
+          std::vector<TypePtr> a = er->args; a[0] = format_arrow(s->s, a);
           return eng.constr(er->path, std::move(a));
         }
         return expected;

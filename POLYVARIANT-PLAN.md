@@ -702,6 +702,45 @@ cmi-arg qualification generalises session (k)'s per-occurrence-path insight from
 RESULT types to ARGUMENT types; residue is still the two blocked path-naming
 mechanisms + Way-4 rows + GADT/object over-spec + first-class-module recovery.
 
+## SESSION 2026-07-01 (m): `%a`/`%t` printer tying + cmi submodule-head qualification (+1)
+
+Re-scanned the live 43 DIFF files. Most are the known blocked clusters (lazy_t↔Lazy.t,
+GADT/object over-spec, first-class-module recovery, weak-var/relaxed-value-restriction,
+Way-4 rows). `change_layout.ml` stood out: its `val` diffs were a MIX of a genuine
+inference bug AND path-naming — clearing BOTH flipped it.
+
+- **`%a`/`%t` format printers didn't tie their element type — genuine bug, 0 flip
+  alone but correctness.** `format_arrow` (the arg-arrow built for a format literal
+  so a consumer flows value-kinds) pushed TWO untied `any()` for `%a` (fn + value).
+  ocamlc ties them: `%a`'s printer is `chan -> 'v -> pres` and its value arg is `'v`
+  (same `'v`); `%t`'s printer is `chan -> pres`. Fixed: `%a` mints a fresh `'v`,
+  builds `arrow(chan, arrow('v, pres))` + `'v`; `%t` builds `arrow(chan, pres)`.
+  `chan`/`pres` come from the expected format6's params [1]/[2] (Format.formatter /
+  unit for fprintf), passed in via the full args vector. Isolated proof:
+  `fprintf ppf "%a" pp a` now gives `pp:fmt->'a->unit, a:'a` (was `_`/`_`); cleared
+  ALL of change_layout's inference diffs (print_array/print_index/report), leaving
+  only path-naming.
+- **cmi Pdot type whose head is a submodule wasn't qualified — path-naming, +1.**
+  A top-level `Bigarray.reshape` (reached bare via `open Bigarray`) returns
+  `Genarray.t` (an Ldot in the cmi); we printed `Genarray.t`, oracle
+  `Bigarray.Genarray.t`. Session (k)'s scope-qualification only handled Pident (bare)
+  type names. Added a parallel `cmi_mod_scopes_` (submodule lists + prefix per scope,
+  set alongside `cmi_scopes_` in resolve_module_values_comps); from_cmi now, for a
+  Pdot path whose innermost head Pident is a submodule of the value's owning module,
+  prepends that module's prefix (searched innermost->outermost). Explicit `Sub.f`
+  access is unaffected (it resolves through the `Bigarray.Sub` prefix path already;
+  cmi_mod_scopes_ is only set in the open/bulk-load path).
+  **change_layout flips.** sig 482->483 (92.0%), reject 0.0%, lambda 54.2% flat, 0
+  crashes / 1853 files, match-set delta exactly +1, 0 regressions.
+
+**Baseline now: sig 483/525 (92.0%), reject 0.0%, lambda 54.2%, 0 crashes.** The `%a`
+tie is the general fix for any `%a`-printer function param resolving its element from
+the value (a printer-combinator idiom); the Pdot qualification generalises the
+per-occurrence path insight to submodule types reached via a top-level value. Residue
+unchanged: the two remaining path-naming mechanisms (constr-node access-path-through-
+unify: qsort/lazy_t; functor-result paths), GADT/object over-spec, first-class-module
+recovery, weak-var/relaxed-value-restriction (testerror), Way-4 rows.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
