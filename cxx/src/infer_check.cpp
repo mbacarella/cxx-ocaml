@@ -177,6 +177,11 @@ struct Checker {
   // so we keep them unknown rather than resolve to the wrong kind.
   std::set<std::string> predef_ctors_;
   std::set<std::string> exn_ctors_;
+  // Exception/typext AST nodes already registered, so the flat `ctors` map isn't
+  // re-populated (re-registration would spuriously mark the name ambiguous).  The
+  // top-level register_types_rec pass and the per-item process_item path can both
+  // reach the same node; register once.
+  std::unordered_set<const void*> ext_ctor_registered_;
   // For the Lambda back end: record inferred types of let/param patterns and
   // function bodies, so value kinds can be read off after inference (additive;
   // off by default so the soundness/completeness passes are unaffected).
@@ -1761,6 +1766,7 @@ struct Checker {
   // Participates in ambiguity detection so `exception E` + `type t = E` makes E
   // ambiguous (type-directed disambiguation, approximated as unknown).
   void register_exception(const ExtensionConstructor& ec) {
+    if (!ext_ctor_registered_.insert(&ec).second) return;
     TypePtr scheme = eng.constr("exn");
     if (auto* d = std::get_if<Pext_decl>(&ec.kind)) {
       std::unordered_map<std::string, TypePtr> vars;
@@ -1780,6 +1786,7 @@ struct Checker {
   // to the extension's parameters; `type exn += ..` are exceptions.  Typing these
   // lets `perform E`/`E` flow a real type instead of Any (effect return kinds).
   void register_typext(const TypeExtension& te) {
+    if (!ext_ctor_registered_.insert(&te).second) return;
     bool is_exn = lid_last(te.path.txt) == "exn";
     for (auto& ec : te.ctors) {
       auto* d = std::get_if<Pext_decl>(&ec.kind);
@@ -3946,6 +3953,14 @@ struct Checker {
               for (auto& c : v->ctors)
                 if (ctor_scheme_.count(&c)) cenv.back()[c.name.txt] = ctor_scheme_[&c];
           }
+        } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
+          // A local module's exception (`let module M = struct exception E of t ..`)
+          // is reached only here -- register_types_rec never descends into an
+          // expression's `let module`.  Register its ctor so `E x` inside pins x's
+          // type (idempotent: top-level ones are already registered).
+          register_exception(ex->exn.ctor);
+        } else if (auto* tx = std::get_if<Pstr_typext>(&it.desc)) {
+          register_typext(tx->ext);
         } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings);
         else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
