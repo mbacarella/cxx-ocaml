@@ -46,6 +46,8 @@ struct Type {
   std::vector<TypePtr> args; // Tuple / Constr / Object / Variant
   std::vector<std::string> labels;  // Object: method names; Variant: tag names
   std::vector<char> tag_has_arg;    // Variant: 1 if the tag carries an argument
+  int variant_kind = 0;             // Variant: 0 = `[> ..]` (open, from construction),
+                                    // 1 = `[< ..]` (upper bound, from a match/pattern)
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are
@@ -81,7 +83,7 @@ public:
   TypePtr constr(std::string path, std::vector<TypePtr> args = {}, int stamp = 0);
   TypePtr object_type(std::vector<std::string> names, std::vector<TypePtr> types);
   TypePtr variant_type(std::vector<std::string> tags, std::vector<TypePtr> argtys,
-                       std::vector<char> has_arg);
+                       std::vector<char> has_arg, int variant_kind = 0);
 
   // Follow Link chains to the representative (path-compressing).
   static TypePtr repr(TypePtr t);

@@ -1,7 +1,9 @@
 #include "cppcaml/infer.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace cppcaml::infer {
 
@@ -56,12 +58,13 @@ TypePtr Engine::object_type(std::vector<std::string> names, std::vector<TypePtr>
 }
 
 TypePtr Engine::variant_type(std::vector<std::string> tags, std::vector<TypePtr> argtys,
-                             std::vector<char> has_arg) {
+                             std::vector<char> has_arg, int variant_kind) {
   auto t = std::make_shared<Type>();
   t->kind = Type::Kind::Variant;
   t->labels = std::move(tags);
   t->args = std::move(argtys);
   t->tag_has_arg = std::move(has_arg);
+  t->variant_kind = variant_kind;
   t->id = next_id_++;
   return t;
 }
@@ -203,20 +206,31 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     return;
   }
   if (a->kind == Type::Kind::Variant && b->kind == Type::Kind::Variant) {
-    // Merge the two open rows into their tag-union (`[> `A]` + `[> `B]` = `[> `A
-    // | `B]`), unifying a shared tag's argument; link both sides to the merge.
+    // Merge the two rows into their tag-union (`[> `A]` + `[> `B]` = `[> `A | `B]`;
+    // two matched `[< ..]` arms union likewise), unifying a shared tag's argument;
+    // link both sides to the merge.  Link FIRST so a self-referential arg (a
+    // recursive `[> `A of 'a] as 'a`) resolves to the merge node instead of
+    // looping the shared-arg unify.
     std::vector<std::string> tags = a->labels;
     std::vector<TypePtr> ats = a->args;
     std::vector<char> has = a->tag_has_arg;
     for (size_t j = 0; j < b->labels.size(); ++j) {
       size_t k = 0;
       for (; k < tags.size(); ++k) if (tags[k] == b->labels[j]) break;
-      if (k < tags.size()) unify(ats[k], b->args[j]);
-      else { tags.push_back(b->labels[j]); ats.push_back(b->args[j]); has.push_back(b->tag_has_arg[j]); }
+      if (k >= tags.size()) { tags.push_back(b->labels[j]); ats.push_back(b->args[j]); has.push_back(b->tag_has_arg[j]); }
     }
-    TypePtr m = variant_type(std::move(tags), std::move(ats), std::move(has));
+    // The TIGHTER row kind wins the merge (exact 2 > upper `[<` 1 > open `[>` 0):
+    // an annotation `[ `A | `B ]` / `[< `A ]` unified with the body's matched/
+    // constructed rows keeps the declared bound for display.
+    int vk = std::max(a->variant_kind, b->variant_kind);
+    TypePtr m = variant_type(tags, ats, has, vk);
     note(a); a->kind = Type::Kind::Link; a->link = m;
     note(b); b->kind = Type::Kind::Link; b->link = m;
+    // Now unify shared-tag arguments (a/b already point at m, so a recursive arg
+    // that is a/b won't re-enter this merge).
+    for (size_t j = 0; j < b->labels.size(); ++j)
+      for (size_t k = 0; k < m->labels.size(); ++k)
+        if (m->labels[k] == b->labels[j]) { unify(m->args[k], b->args[j]); break; }
     return;
   }
   if (lenient) return;
@@ -323,9 +337,24 @@ namespace {
 // `cp` = context precedence required by the parent position: 0 top (arrow ok),
 // 1 arrow-domain (tuple ok, arrow needs parens), 2 atom (both need parens).
 // `*` binds tighter than `->`, so a tuple in arrow-domain position is unparen'd.
+// `on_stack` holds the row nodes (Variant/Object) currently being printed: a
+// re-entry is a cyclic (recursive) row, printed as a back-reference `'aN` and, at
+// the node's first occurrence, wrapped `(.. as 'aN)` -- exactly ocamlc's `as`
+// display, and the guard that keeps a recursive row from looping forever.
 void show_rec(const TypePtr& t0, std::string& out, int cp,
-              std::unordered_map<Type*, std::string>& names) {
+              std::unordered_map<Type*, std::string>& names,
+              std::unordered_set<Type*>& on_stack) {
   TypePtr t = Engine::repr(t0);
+  // Cyclic row back-reference: this node is already on the print stack.
+  if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object) &&
+      on_stack.count(t.get())) {
+    auto it = names.find(t.get());
+    if (it == names.end())  // allocate a type-var name from the shared pool
+      it = names.emplace(t.get(),
+                         "'" + std::string(1, 'a' + (char)(names.size() % 26))).first;
+    out += it->second;
+    return;
+  }
   switch (t->kind) {
     case Type::Kind::Var: {
       auto it = names.find(t.get());
@@ -341,37 +370,37 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
     case Type::Kind::Arrow:
       if (cp > 0) out += "(";
       if (t->arrow_label == 1) { out += t->arrow_lbl + ":";        // ~lbl:
-        show_rec(t->dom, out, 1, names);
+        show_rec(t->dom, out, 1, names, on_stack);
       } else if (t->arrow_label == 2) {  // ?lbl: -- internal type is `T option`,
         out += "?" + t->arrow_lbl + ":";  // but ocamlc displays the bare T
         TypePtr d = Engine::repr(t->dom);
         if (d->kind == Type::Kind::Constr && d->args.size() == 1 &&
             (d->path == "option" || d->path == "Stdlib.option"))
-          show_rec(d->args[0], out, 1, names);
+          show_rec(d->args[0], out, 1, names, on_stack);
         else
-          show_rec(t->dom, out, 1, names);
+          show_rec(t->dom, out, 1, names, on_stack);
       } else {
-        show_rec(t->dom, out, 1, names);   // domain: a tuple is fine unparen'd
+        show_rec(t->dom, out, 1, names, on_stack);   // domain: a tuple is fine unparen'd
       }
       out += " -> ";
-      show_rec(t->cod, out, 0, names);   // -> is right-assoc: codomain stays top
+      show_rec(t->cod, out, 0, names, on_stack);   // -> is right-assoc: codomain stays top
       if (cp > 0) out += ")";
       break;
     case Type::Kind::Tuple:
       if (cp > 1) out += "(";
       for (size_t i = 0; i < t->args.size(); ++i) {
         if (i) out += " * ";
-        show_rec(t->args[i], out, 2, names);  // components bind tighter than *
+        show_rec(t->args[i], out, 2, names, on_stack);  // components bind tighter than *
       }
       if (cp > 1) out += ")";
       break;
     case Type::Kind::Constr: {
-      if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names); out += " "; }
+      if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names, on_stack); out += " "; }
       else if (t->args.size() > 1) {
         out += "(";
         for (size_t i = 0; i < t->args.size(); ++i) {
           if (i) out += ", ";
-          show_rec(t->args[i], out, 0, names);
+          show_rec(t->args[i], out, 0, names, on_stack);
         }
         out += ") ";
       }
@@ -388,26 +417,42 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       break;
     }
     case Type::Kind::Object: {
-      out += "< ";
+      on_stack.insert(t.get());
+      std::string body = "< ";
       for (size_t i = 0; i < t->labels.size(); ++i) {
-        if (i) out += "; ";
-        out += t->labels[i] + " : ";
-        show_rec(t->args[i], out, 0, names);
+        if (i) body += "; ";
+        body += t->labels[i] + " : ";
+        show_rec(t->args[i], body, 0, names, on_stack);
       }
-      out += " >";
+      body += " >";
+      on_stack.erase(t.get());
+      if (auto rn = names.find(t.get()); rn != names.end())  // a descendant looped back
+        out += (cp > 0 ? "(" : "") + body + " as " + rn->second + (cp > 0 ? ")" : "");
+      else out += body;
       break;
     }
     case Type::Kind::Variant: {
-      out += "[> ";
-      for (size_t i = 0; i < t->labels.size(); ++i) {
-        if (i) out += " | ";
-        out += "`" + t->labels[i];
+      on_stack.insert(t.get());
+      // ocamlc prints poly-variant tags in alphabetical order.
+      std::vector<size_t> ord(t->labels.size());
+      for (size_t i = 0; i < ord.size(); ++i) ord[i] = i;
+      std::sort(ord.begin(), ord.end(),
+                [&](size_t x, size_t y) { return t->labels[x] < t->labels[y]; });
+      std::string body = t->variant_kind == 1 ? "[< " : t->variant_kind == 2 ? "[ " : "[> ";
+      for (size_t n = 0; n < ord.size(); ++n) {
+        size_t i = ord[n];
+        if (n) body += " | ";
+        body += "`" + t->labels[i];
         if (i < t->tag_has_arg.size() && t->tag_has_arg[i]) {
-          out += " of ";
-          show_rec(t->args[i], out, 0, names);
+          body += " of ";
+          show_rec(t->args[i], body, 0, names, on_stack);
         }
       }
-      out += " ]";
+      body += " ]";
+      on_stack.erase(t.get());
+      if (auto rn = names.find(t.get()); rn != names.end())
+        out += (cp > 0 ? "(" : "") + body + " as " + rn->second + (cp > 0 ? ")" : "");
+      else out += body;
       break;
     }
     case Type::Kind::Link:
@@ -422,7 +467,8 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
 std::string show(const TypePtr& t) {
   std::string out;
   std::unordered_map<Type*, std::string> names;
-  show_rec(t, out, 0, names);
+  std::unordered_set<Type*> on_stack;
+  show_rec(t, out, 0, names, on_stack);
   return out;
 }
 

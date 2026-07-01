@@ -447,10 +447,26 @@ struct Checker {
       vars[al->name] = inner;
       return inner;
     }
-    // A closed all-constant polymorphic variant is an immediate (its values are
-    // tag hashes) -- type it int so the [int] value kind flows.  Payload-carrying
-    // or open/inherited rows stay opaque.
     if (auto* pvr = std::get_if<Ptyp_variant>(&t.desc)) {
+      // Build the row from a `[ .. ]` / `[< .. ]` / `[> .. ]` annotation.  Kind:
+      // Open -> `[>` (0); Closed with present-tags (`[< .. > l]` / `[< ..]`) -> `[<`
+      // (1); Closed exact `[ .. ]` -> exact (2).  Non-strict only (rows are a
+      // non-strict feature; the strict pass keeps the immediate-int shortcut).
+      bool simple = !pvr->rows.empty();
+      for (auto& r : pvr->rows) if (!std::get_if<Rtag>(&r)) { simple = false; break; }  // Rinherit: defer
+      if (!strict && simple) {
+        std::vector<std::string> tags; std::vector<TypePtr> ats; std::vector<char> has;
+        for (auto& r : pvr->rows) {
+          auto* rt = std::get_if<Rtag>(&r);
+          tags.push_back(rt->name);
+          if (rt->types.empty()) { ats.push_back(eng.fresh_var()); has.push_back(0); }
+          else { ats.push_back(from_coretype(*rt->types[0], vars)); has.push_back(1); }
+        }
+        int vk = pvr->closed == ClosedFlag::Open ? 0 : (pvr->labels ? 1 : 2);
+        return eng.variant_type(std::move(tags), std::move(ats), std::move(has), vk);
+      }
+      // A closed all-constant variant is an immediate (tag hashes) -- type it int
+      // so the [int] value kind flows (strict pass, and payload/inherited rows).
       bool all_const = pvr->closed == ClosedFlag::Closed && !pvr->rows.empty();
       for (auto& r : pvr->rows) {
         auto* rt = std::get_if<Rtag>(&r);
@@ -2254,8 +2270,13 @@ struct Checker {
       return lt;
     }
     if (auto* pv = std::get_if<Ppat_variant>(&p.desc)) {
-      if (pv->arg) infer_pat(**pv->arg);  // bind arg vars; poly-variant type unknown
-      return eng.fresh_var();
+      // A poly-variant pattern `` `A [p] `` bounds the scrutinee ABOVE: `[< `A
+      // [of t]]`.  A match's arms merge to `[< tag-union ..]` (the scrutinee is at
+      // most those tags).  Non-strict only (matched variants are conjunctive; the
+      // strict pass stays a fresh var -- see the 1st reverted attempt).
+      TypePtr at = pv->arg ? infer_pat(**pv->arg) : eng.fresh_var();
+      if (strict) return eng.fresh_var();
+      return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)}, 1);
     }
     if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) {
       infer_pat(*ex->p);  // binds vars; matches an exn, independent of scrutinee
