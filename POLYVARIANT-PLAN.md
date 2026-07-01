@@ -328,6 +328,26 @@ Ways 1, 2, 3 all landed. Only Way 4 (the row-VARIABLE model: morematch, mixin×3
 nested-recursion arg precision, exotic coercion) remains — a dedicated project, not
 a session slice, and the last poly-variant residue.
 
+## SESSION 2026-07-01 (d): exotic coercion picked off (engine-free)
+
+- **`exotic.ml` (binding-level coercion) — DONE & committed** (`infer: binding-level
+  coercion let x:T1:>T2 -> target type`). This was mislabelled as Way-4 residue but
+  is NOT a row-variable feature at all — it's `let x : [`A] :> [> `A | `B ] = ..`,
+  where the bound name takes the coercion TARGET, same as a `(e : T1 :> T2)`
+  expression. The non-recursive binding path only handled `Pvc_constraint`; a
+  `Pvc_coercion` binding fell through to the body's (narrower) type. Adopt the
+  target for display (mirror the existing Pexp_coerce case); no unify of target
+  into body (`:>` widens). Pure display-path, off the row substrate entirely — no
+  crash surface. **sig 453->454 (86.5%), reject 0.0%, lambda 54.2% flat, 0 crashes /
+  1853 files, match-set delta exactly +1, 0 regressions.**
+
+**Cluster status: sig 454/525 (86.5%), reject 0.0%, lambda 54.2%, 0 crashes.** The
+TRUE remaining residue is now purely the row-VARIABLE model (Way 4): morematch
+(input `[<]` -> different output `[>]` rows), mixin×3 (object rows + `#ops` + mutual
+recursion), nested (nested-recursion arg precision). These genuinely need the
+`{fields; tail_var}` row rework — a dedicated project, not a session slice. No
+engine-free flips remain in the cluster.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
