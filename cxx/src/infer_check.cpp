@@ -274,6 +274,14 @@ struct Checker {
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
+  // Named type variables (`'a`, `'b`) are shared across ALL annotations of a
+  // single binding: `let f (x : 'a) (y : 'a) : 'a list = ..` ties the two params
+  // and the return to ONE `'a` (OCaml's structure-item variable scoping).  Set to
+  // a fresh map per binding group (infer_bindings); nullptr otherwise (each
+  // annotation then mints its own vars, e.g. a stray `(e : 'a)`).  When non-null,
+  // Ppat_constraint / the function return-type / the binding constraint all route
+  // their from_coretype through it.
+  std::unordered_map<std::string, TypePtr>* annot_vars_ = nullptr;
   std::set<std::string> expanding_;  // guard against cyclic abbreviations
   // match-expression node -> is-partial (the result we route back to the dump)
   std::unordered_map<const Expression*, bool> match_partial;
@@ -1718,6 +1726,26 @@ struct Checker {
     }
   }
 
+  // A GADT type declared inside an expression-level local structure (`let open
+  // struct type _ t = C : (_ -> _) t .. end in match ..`) is never seen by the
+  // top-level register_types_rec pass, so its ctors miss `gadt_ctors` and the
+  // match on them isn't windowed (its branch-local refinement then leaks into
+  // the result).  Register just the GADT markers (names) here so the window
+  // fires; the ctors' value schemes come from process_item's open handling.
+  void register_local_gadt_markers(const ast::Structure& items) {
+    for (auto& it : items)
+      if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+        for (auto& d : ty->decls)
+          if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+            bool is_gadt = false;
+            for (auto& c : v->ctors) if (c.res) is_gadt = true;
+            if (is_gadt) {
+              gadt_types.insert(d.name.txt);
+              for (auto& c : v->ctors) gadt_ctors.insert(c.name.txt);
+            }
+          }
+  }
+
   // Collect a record type's field schemes: label -> arrow((params) t, field),
   // sharing the params and carrying the type's identity stamp.  Uniqueness across
   // all record types is resolved later in finalize_fields.
@@ -2426,8 +2454,8 @@ struct Checker {
     }
     if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
       TypePtr pt = infer_pat(*ct->p);
-      std::unordered_map<std::string, TypePtr> vars;
-      TypePtr at = from_coretype(*ct->t, vars);
+      std::unordered_map<std::string, TypePtr> local;
+      TypePtr at = from_coretype(*ct->t, annot_vars_ ? *annot_vars_ : local);
       try_unify(pt, at);
       return at;
     }
@@ -3185,6 +3213,12 @@ struct Checker {
         register_exception(ex->exn.ctor);
       else if (auto* tx = std::get_if<Pstr_typext>(&sti->item->desc))
         register_typext(tx->ext);
+      else if (auto* op = std::get_if<Pstr_open>(&sti->item->desc)) {
+        // `let open struct type _ t = C : .. t .. end in ..`: register the local
+        // struct's GADT markers so a match on its ctors is windowed.
+        if (auto* ms = std::get_if<Pmod_structure>(&op->expr.desc))
+          register_local_gadt_markers(ms->items);
+      }
       process_item(*sti->item);
       TypePtr bt = infer_expr(*sti->body);
       cenv.pop_back();
@@ -3477,10 +3511,18 @@ struct Checker {
   TypePtr infer_function(const Pexp_function& f) {
     venv.emplace_back();
     // Bind all (type a) params to flexible vars first, so value-param
-    // annotations mentioning them resolve regardless of order.
+    // annotations mentioning them resolve regardless of order.  Save any
+    // shadowed outer binding of the same name and restore it on exit -- a nested
+    // function's `(type a)` must NOT clobber an enclosing `(type a)` (else the
+    // enclosing function's return annotation resolves `a` to the wrong node).
+    std::vector<std::pair<std::string, std::optional<TypePtr>>> saved_newtypes;
     for (auto& fp : f.params)
-      if (auto* nt = std::get_if<Pparam_newtype>(&fp.desc))
+      if (auto* nt = std::get_if<Pparam_newtype>(&fp.desc)) {
+        auto it = newtype_vars.find(nt->name.txt);
+        saved_newtypes.push_back({nt->name.txt,
+            it != newtype_vars.end() ? std::optional<TypePtr>(it->second) : std::nullopt});
         newtype_vars[nt->name.txt] = eng.fresh_var();
+      }
     struct Param { TypePtr ty; int lk; std::string nm; };
     std::vector<Param> params;
     for (auto& fp : f.params) {
@@ -3532,14 +3574,18 @@ struct Checker {
     // false-reject); soft elsewhere so a stray clash can't abort the pass.
     if (f.constraint_ && !strict)
       if (auto* pc = std::get_if<Pconstraint>(&*f.constraint_)) {
-        std::unordered_map<std::string, TypePtr> vars;
-        soft_unify(body, from_coretype(*pc->type, vars));
+        std::unordered_map<std::string, TypePtr> local;
+        soft_unify(body, from_coretype(*pc->type, annot_vars_ ? *annot_vars_ : local));
       }
     if (record_kinds_) rec_ret_[&f] = body;
     TypePtr t = body;
     for (auto it = params.rbegin(); it != params.rend(); ++it)
       t = eng.arrow(it->ty, t, it->lk, it->nm);
     venv.pop_back();
+    for (auto& [nm, prior] : saved_newtypes) {
+      if (prior) newtype_vars[nm] = *prior;
+      else newtype_vars.erase(nm);
+    }
     return t;
   }
 
@@ -3608,6 +3654,10 @@ struct Checker {
       return;
     }
     for (auto& b : bs) {
+      // Share named type vars across this binding's annotations (params, return,
+      // declared type): `let f (x:'a) (y:'a) : 'a = ..` ties them to one 'a.
+      std::unordered_map<std::string, TypePtr> avars;
+      auto* saved_av = annot_vars_; annot_vars_ = &avars;
       eng.enter_level();
       TypePtr te = infer_expr(*b.expr);
       TypePtr annot = nullptr;
@@ -3619,8 +3669,7 @@ struct Checker {
       if (b.constraint_)
         if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_)) {
           for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
-          std::unordered_map<std::string, TypePtr> vars;
-          annot = from_coretype(*pc->typ, vars);
+          annot = from_coretype(*pc->typ, avars);
           if (strict && expected_clash(te, annot))
             note_error("type mismatch against declared type");
           // Flow the declared type `let x : T = e` into the inferred one (pins
@@ -3651,6 +3700,7 @@ struct Checker {
       if (strict || non_expansive(*b.expr)) eng.generalize(bound);
       else eng.demote(bound);  // value restriction: lower, don't trap at inner level
       bind_pattern_scheme(b.pat, bound);
+      annot_vars_ = saved_av;
     }
   }
 

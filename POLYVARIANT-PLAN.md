@@ -848,6 +848,52 @@ lazy_t/String.t access-path-through-unify, functor-result/first-class-module
 recovery, objects (`#castable`, `< .. >`, pr14554_1), relaxed value restriction
 (testerror), Stdlib/2 shadow, %apply optarg erasure, Way-4 poly-variant rows.
 
+## SESSION 2026-07-01 (q): annotation type-var scoping + local-struct GADT window (+1)
+
+Re-scanned the live 37 DIFFs. Residue is the documented blocked clusters, but
+`measure_runtime_arity.ml` was reachable via THREE linked scoping bugs, all
+genuine (not display-naming):
+
+- **Named type vars weren't shared across a binding's annotations — genuine bug.**
+  `let f (x:'a) (y:'a) : 'a list = ..` minted a FRESH `'a` per annotation
+  (each `from_coretype` got its own map), so siblings and param↔return diverged
+  (`'a -> 'b -> 'a * 'b`, `('a->'b) -> ('c->'d) box`). It only SHOWED when nothing
+  else tied them — a non-existential return ctor (`list`) unified them anyway, but
+  an existential GADT return (`box`, `arity`) hid the tie, exposing the bug. Fix:
+  a per-binding `annot_vars_` map (set in infer_bindings, threaded through
+  `Ppat_constraint` / the function return constraint / the `let x:T` constraint),
+  so one `'a` spans all of a binding's annotations (OCaml's structure-item var
+  scoping). Fixed `runtime_arity`'s line + isolated `f (x:'a) (y:'a)`, nested-fun,
+  param↔return cases.
+- **Local-struct GADT ctors were never registered — genuine bug.** `is_function`'s
+  GADT type lives in `let open struct type _ is_function = .. Is_function : (_->_)
+  is_function end in match is_function x with ..`. register_types_rec never
+  descends an expression's `open struct`, so `Is_function` missed `gadt_ctors` →
+  the match wasn't windowed → its branch-local `a := _->_` refinement leaked into
+  the result (`('a->'b) arity`). Added `register_local_gadt_markers` (gadt name/ctor
+  markers only — no stamps/errors, so reject stays safe) in the Pexp_struct_item
+  open handler. Mirrors session (l)'s local-exception registration.
+- **`newtype_vars` wasn't scoped — genuine bug.** The map is flat/global; the inner
+  `is_function (type a)` CLOBBERED the outer `maybe_runtime_arity (type a)`, so the
+  outer's return annotation `a arity option` resolved `a` to the inner node
+  (`'a -> 'b arity option`). Fix: infer_function saves/restores the newtype names
+  it introduces, so a nested `(type a)` can't leak out.
+
+All three were required for the flip. **measure_runtime_arity flips.** sig 488->489
+(93.1%), reject 0.0%, lambda 54.2% flat, 0 crashes / 1853, match-set delta exactly
++1, 0 regressions. Committed `infer: scope annotation type-vars + newtypes; window
+local-struct GADT matches`.
+
+**Baseline now: sig 489/525 (93.1%), reject 0.0%, lambda 54.2%, 0 crashes.** The
+annotation-var-sharing and newtype-scoping fixes are general (any binding with
+repeated/tied annotation vars, any nested `(type a)`) though only this file flipped
+on them. Residue unchanged: lazy_t↔Lazy.t & String.t↔string constr-node access-path,
+full GADT/object escape-scope (`int Effect.t`, `#castable`, `< .. >`), scanf-return
+(opaque format6), functor-result/first-class-module recovery, extensible-GADT ctor
+(msg), weak-var/abbrev-expansion-in-unify (testerror `Arg.anon_fun`), abstract-alias
+display (Pos.t/Buffer.t), Stdlib/2 shadow, generalized-open sig restriction, %apply
+optarg erasure, Way-4 poly-variant rows.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
