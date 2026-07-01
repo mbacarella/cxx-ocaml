@@ -558,6 +558,9 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       // The printf format type is normalised to format6; a 3-parameter one prints
       // as its `format` abbreviation, matching ocamlc.
       if (path == "format6" && t->args.size() == 3) path = "format";
+      // A 4-parameter format6 is the `format4` abbreviation (its 3 middle params
+      // coincide); we only ever reach 4 args from a `format4` source annotation.
+      if (path == "format6" && t->args.size() == 4) path = "format4";
       // Lazy.t is the public abbreviation of CamlinternalLazy.t; print the former.
       if (path == "CamlinternalLazy.t") path = "Lazy.t";
       out += path;
