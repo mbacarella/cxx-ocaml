@@ -3067,7 +3067,6 @@ struct Checker {
     // on each argument), so a var-typed callee never false-rejects.
     for (auto& [lbl, arg] : a.args) {
       auto [lk, nm] = arglabel(lbl);
-      (void)nm;
       // A POSITIONAL arg skips past leading OPTIONAL params (they are defaulted),
       // aligning with the next non-optional param.  Without this,
       // `Location.errorf "%d" 3` aligns "%d" with `?loc` instead of the `format6`
@@ -3080,8 +3079,14 @@ struct Checker {
           ft = I::Engine::repr(c->cod); c = ft;
         }
       }
+      // Carry the argument's label onto the built arrow: for a var-typed callee
+      // (unknown spine, e.g. a `let rec` self-call `g ~first:false` or a labelled
+      // higher-order param `f ~a ~b`), this is the only place the arrow's label
+      // is set, so dropping it here loses `~first:`/`~a:` from the inferred type.
+      // soft_unify of two arrows only recurses dom/cod (labels aren't checked),
+      // so tagging a label here can never false-reject against a known callee.
       TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
-      soft_unify(ft, eng.arrow(dom, r));
+      soft_unify(ft, eng.arrow(dom, r, lk, nm));
       TypePtr at = infer_expr_expected(*arg, dom);
       soft_unify(dom, at);
       ft = I::Engine::repr(r);
