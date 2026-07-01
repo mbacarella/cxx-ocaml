@@ -3305,6 +3305,14 @@ struct Checker {
           // type so an incomplete-inference clash can't false-reject); soft so a
           // stray clash can't abort the pass.
           if (!strict) soft_unify(te, annot);
+        } else if (auto* co = std::get_if<Pvc_coercion>(&*b.constraint_)) {
+          // `let x : T1 :> T2 = e` (a binding-level coercion) binds x to the
+          // TARGET T2, exactly like a `(e : T1 :> T2)` expression coercion.  The
+          // body `e` was already inferred above for its kinds/effects; the
+          // widening `:>` deliberately loosens the type, so we do NOT unify the
+          // target back into the (narrower) body -- we only adopt it for display.
+          std::unordered_map<std::string, TypePtr> vars;
+          annot = from_coretype(*co->coercion, vars);
         }
       eng.leave_level();
       // In the --infer DISPLAY pass the binding's type IS its annotation:
