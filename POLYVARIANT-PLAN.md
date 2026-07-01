@@ -302,6 +302,32 @@ crash substrate (Way 1) is now permanent, so future row features are display-onl
 plumbing on a stable base. Best next: Way 3's inherited-type row (from_coretype +
 merge + show) or Way 4's row-VARIABLE model (morematch/mixin), both dedicated slices.
 
+## SESSION 2026-07-01 (c): Way 3 DONE & committed
+
+- **Way 3 (inherited-type variant rows `[< int u > `A ]`) — DONE & committed**
+  (`infer: inherited-type variant rows (Way 3)`). It DID turn out reachable on top
+  of the Way-1 stable base, as a display-plumbing slice (no new crash surface). A
+  `[< int u]` annotation is a `Rinherit` row; from_coretype had deferred it, so we
+  lost the annotation and printed the bare construction `[> `A ]`.
+  - Type gains an `inherited` vector (unexpanded row types = allowed-set bound).
+  - from_coretype builds a Variant carrying the inherited types; the sig pass keeps
+    abbreviations folded (`fold_abbrevs_`), so `int u`/`t s` display unexpanded like
+    the oracle (no expansion-to-`[`A|`B]` problem to solve).
+  - unify merge unions inherited; a row WITH an inherited bound routes incoming tags
+    to `present` (labels stay empty — the allowed set is the inherited type, tags
+    only mark presence). Merge now also PRESERVES `present` across the union (it was
+    silently dropped before; net-neutral on the corpus, correct-er).
+  - show renders inherited types before the tags/`>` present block.
+  - instantiate copy carries `inherited` (ground types int/t: shared unexpanded).
+  - **pr6836 flips** (`[< int u > `A ]` / `[< t s > `B ]`). sig 452->453 (86.3%),
+    reject 0.0%, lambda 54.2% flat, 0 crashes / 1853 files, match-set delta = exactly
+    +1 (pr6836), 0 regressions.
+
+**Cluster status: sig 453/525 (86.3%), reject 0.0%, lambda 54.2%, 0 crashes.**
+Ways 1, 2, 3 all landed. Only Way 4 (the row-VARIABLE model: morematch, mixin×3,
+nested-recursion arg precision, exotic coercion) remains — a dedicated project, not
+a session slice, and the last poly-variant residue.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
