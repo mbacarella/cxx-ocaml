@@ -252,6 +252,15 @@ struct Checker {
     return nullptr;
   }
   std::unordered_map<std::string, std::vector<TypePtr>> field_candidates_;
+  // A polymorphic field (`{ pf : 'a. .. }`) gets no monomorphic value scheme (it
+  // would clash across uses), so it never lands in `fields_`.  But a record
+  // PATTERN `{pf}` still identifies its record TYPE by that label -- so record the
+  // owning record type per poly-field label (unique labels only, in
+  // finalize_fields), letting the pattern resolve to `pf` while its bound field
+  // stays polymorphic (Any).  label -> record type candidates.
+  struct PolyField { TypePtr recTy; const CoreType* ftype; };
+  std::unordered_map<std::string, std::vector<PolyField>> poly_field_rec_candidates_;
+  std::unordered_map<std::string, PolyField> poly_field_rec_;
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
@@ -497,7 +506,16 @@ struct Checker {
           auto nt = newtype_vars.find(l->name);
           if (nt != newtype_vars.end()) return nt->second;
         }
-      if (is_format_base(lid_full(c->id.txt))) return eng.constr("format6");
+      // A printf format annotation: canonicalise the NAME to format6 but keep the
+      // type arguments (matching from_cmi, which preserves them).  Dropping the
+      // args left a format-typed function parameter (`g : (..) format -> 'a`)
+      // unable to resolve its result from a format-literal argument (`g "@]"` ->
+      // 'a instead of unit).  show renders a 3-arg format6 back as `format`.
+      if (is_format_base(lid_full(c->id.txt))) {
+        std::vector<TypePtr> fa;
+        for (auto& a : c->args) fa.push_back(from_coretype(*a, vars));
+        return eng.constr("format6", std::move(fa));
+      }
       std::vector<TypePtr> as;
       for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
       // Pad an under-applied type (e.g. an existential GADT's `_ raw_arity`
@@ -1660,8 +1678,10 @@ struct Checker {
       // unlowered (= segfault); cross-use clashes are soft there.  The strict
       // pass keeps the skip (a monomorphic scheme false-rejects valid reuses).
       if (std::holds_alternative<Ptyp_poly>(f.type->desc) &&
-          !(record_kinds_ && mentions_format(*f.type)))
+          !(record_kinds_ && mentions_format(*f.type))) {
+        poly_field_rec_candidates_[f.name.txt].push_back({recTy, &*f.type});  // pattern record-type resolution
         continue;
+      }
       field_candidates_[f.name.txt].push_back(eng.arrow(recTy, from_coretype(*f.type, vars)));
     }
   }
@@ -1684,6 +1704,10 @@ struct Checker {
   void finalize_fields() {
     for (auto& [k, v] : field_candidates_)
       if (v.size() == 1) fields_[k] = v[0];
+    // A poly-field label maps to its record type iff it is unique AND not also a
+    // (mono) field elsewhere -- otherwise the label is ambiguous, leave to Any.
+    for (auto& [k, v] : poly_field_rec_candidates_)
+      if (v.size() == 1 && !field_candidates_.count(k)) poly_field_rec_[k] = v.front();
   }
 
   // An inline-record constructor argument (`C of { f : t; .. }`): register each
@@ -2091,6 +2115,21 @@ struct Checker {
     // any/constant/etc: nothing to bind
   }
 
+  // Bind a polymorphic record field's sub-pattern to the field's generic scheme
+  // `fldTy` (venv holds schemes; lookup instantiates -> per-use polymorphism).
+  // Only a plain binder (`{pf}` / `{pf = q}` / `pf as x`) is supported; anything
+  // structural (the universal type can't be a tuple/constructor) returns false so
+  // the caller falls back to Any.
+  bool bind_poly_field(const Pattern& p, const TypePtr& fldTy) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) { venv.back()[v->name.txt] = fldTy; return true; }
+    if (std::holds_alternative<Ppat_any>(p.desc)) return true;
+    if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
+      venv.back()[al->name.txt] = fldTy; return bind_poly_field(*al->p, fldTy);
+    }
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return bind_poly_field(*c->p, fldTy);
+    return false;
+  }
+
   TypePtr infer_pat(const Pattern& p) {
     TypePtr t = infer_pat_impl(p);
     if (record_kinds_) rec_pat_[&p] = t;  // record every pattern's kind (params incl.)
@@ -2241,6 +2280,23 @@ struct Checker {
             TypePtr rt = eng.constr("ref", {el});
             if (recTy) try_unify(recTy, rt); else recTy = rt;
             continue;
+          }
+          // A polymorphic-field label (`{pf}`): resolve the record TYPE from it,
+          // and bind the field variable to the field's GENERALIZED type so each
+          // use in the body instantiates fresh (the universal `'a. ..` -- this is
+          // the polymorphic-record-field feature).  from_coretype mints generic
+          // vars, so storing that scheme in venv gives per-use polymorphism; a
+          // single monomorphic binding (Any) would lose the result type.
+          if (!strict) {
+            auto pit = poly_field_rec_.find(lid_last(lid.txt));
+            if (pit != poly_field_rec_.end()) {
+              std::unordered_map<std::string, TypePtr> fv;
+              TypePtr fldTy = from_coretype(*pit->second.ftype, fv);
+              if (!bind_poly_field(*sub, fldTy)) bind_pat_any(*sub);
+              TypePtr rt = eng.instantiate(pit->second.recTy);
+              if (recTy) try_unify(recTy, rt); else recTy = rt;
+              continue;
+            }
           }
           bind_pat_any(*sub); continue;
         }
