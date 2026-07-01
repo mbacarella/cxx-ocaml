@@ -809,6 +809,45 @@ recovery incl. modular-explicits `(module P : Print)`, GADT/object over-spec inc
 + `String.t`<->`string` constr-node access-path, scanf-return, weak-var, Stdlib/2
 shadow-disambiguation, Way-4 rows). No other engine-free flip surfaced in this scan.
 
+## SESSION 2026-07-01 (p): GADT-match ground result recovered (+1)
+
+Re-scanned the live 38 DIFFs (did NOT trust (o)'s "all blocked" verdict -- (j)
+cracked a cluster (o)-style scans had filed as blocked). Confirmed each file needs
+one hard mechanism; scanf-return is ALSO blocked at the substrate level (we fold
+format6 to a nullary `'a format6`, discarding the param structure, so the receiver
+arrow can't propagate -- a real format6-param-tracking rework, not a session flip).
+The one reachable BUG was inside the "GADT over-spec" cluster:
+
+- **A GADT `match` never recovered a non-abstract result -- genuine bug, +1.** A
+  GADT match types each arm inside a rolled-back window (so `a := int` in one arm
+  can't leak to the next), which ALSO discarded the arm-result unification, leaving
+  the whole match a fresh var (`w04_failure : 't repr -> 't repr -> 't -> 'b` vs
+  oracle `-> unit`). Fix: after the window rolls back the refinement, if EVERY arm
+  yields the SAME ground type it is the genuine result (all arms `()` -> `unit`) and
+  is unified outward. Arms that disagree on a ground type (`Int -> 100` : int vs
+  `Ptr -> p` : int list) or any non-ground arm leave the result OPEN, so a `: a`
+  return annotation still pins it -- this is what keeps register_typing /
+  register_typing_switch at `'a typ -> int list -> 'a` (both regressed on a first,
+  cruder "any ground arm -> pin" attempt; caught by the diff-set check).
+  - KEY GOTCHA: the agreement check must be a DIRECT structural compare
+    (`ground_types_equal`, last-component paths like the unifier), NOT
+    `Engine::unify` -- the signature pass runs `lenient`, so a real int-vs-int-list
+    clash is silently accepted and would over-specialise the result. (First fix used
+    unify-in-a-try and silently mis-pinned; the lenient flag was the culprit.)
+  **w04_failure flips.** sig 487->488 (93.0%), reject 0.0%, lambda 54.2% flat, 0
+  crashes / 1853, match-set delta exactly +1, 0 regressions. Committed `infer:
+  unify a GADT match result outward when all arms agree on one ground type`.
+
+**Baseline now: sig 488/525 (93.0%), reject 0.0%, lambda 54.2%, 0 crashes.** The
+partial GADT-result recovery also improved measure_runtime_arity's
+`arity_description` (now `'a arity -> string`) though that file stays DIFF on the
+separate `runtime_arity` arg-to-result tie. Residue is the SAME hard clusters, each
+still a dedicated project: full GADT escape-scope (effects `'a Effect.t`,
+measure_runtime_arity's `runtime_arity`), scanf-return (blocked on opaque-format6),
+lazy_t/String.t access-path-through-unify, functor-result/first-class-module
+recovery, objects (`#castable`, `< .. >`, pr14554_1), relaxed value restriction
+(testerror), Stdlib/2 shadow, %apply optarg erasure, Way-4 poly-variant rows.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
