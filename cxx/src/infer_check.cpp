@@ -3598,6 +3598,12 @@ struct Checker {
     if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) return non_expansive(*c->e);
     if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) return non_expansive(*nt->body);
     if (std::holds_alternative<Pexp_lazy>(e.desc)) return true;  // lazy is a value
+    // A local open `M.(e)` (Pexp_struct_item wrapping an open) is as expansive as
+    // its body -- the open introduces no computation.  So `let a, b = M.(x, y)`
+    // generalizes like the bare tuple would (matches ocamlc's is_nonexpansive on
+    // Texp_open).
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc))
+      return non_expansive(*si->body);
     if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
       for (auto& b : l->bindings) if (!non_expansive(*b.expr)) return false;
       return non_expansive(*l->body);
@@ -3859,6 +3865,22 @@ struct Checker {
       if (record_kinds_) rec_pat_[&p] = te;
       venv.back()[v->name.txt] = te;
       return;
+    }
+    // `let (a, b) = (e1, e2)` -- generalize component-wise.  te was generalized
+    // as a whole (its component types carry generic vars), so binding each var
+    // to its corresponding component gives each name its own polymorphic scheme
+    // (`let f, g = (fun x -> x), (fun y -> y)` => both `'a -> 'a`).  Unifying a
+    // fresh monomorphic infer_pat() var against te instead (the fallback below)
+    // would trap each name at the current level -> monomorphic, pinned by later
+    // use.  Only fires when the pattern and type shapes match; otherwise falls
+    // through to the unify path.
+    if (auto* tp = std::get_if<Ppat_tuple>(&p.desc)) {
+      TypePtr r = I::Engine::repr(te);
+      if (r->kind == I::Type::Kind::Tuple && r->args.size() == tp->elems.size()) {
+        for (size_t i = 0; i < tp->elems.size(); ++i)
+          bind_pattern_scheme(*tp->elems[i], r->args[i]);
+        return;
+      }
     }
     // complex pattern: unify and bind its vars monomorphically
     try_unify(infer_pat(p), te);
