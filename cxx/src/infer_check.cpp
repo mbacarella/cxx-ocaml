@@ -2413,6 +2413,18 @@ struct Checker {
         }
         return expected;
       }
+    // A format string can be wrapped in an `if` (`printf (if b then "a" else
+    // "b")`): push the expected format type into each branch so the literals are
+    // typed as formats and the consumer's result param resolves (else the
+    // branches type as plain `string` and printf's result stays 'a).
+    if (is_format_constr(expected))
+      if (auto* it = std::get_if<Pexp_ifthenelse>(&e.desc); it && it->else_) {
+        try_unify(infer_expr(*it->cond), eng.constr("bool"));
+        TypePtr tt = infer_expr_expected(*it->then_, expected);
+        TypePtr te = infer_expr_expected(**it->else_, expected);
+        try_unify(tt, te);
+        return tt;
+      }
     TypePtr t = infer_expr(e);
     // Type-directed bare-constructor resolution: an unqualified constructor we
     // couldn't resolve (typed Any) whose EXPECTED type is a module-qualified
