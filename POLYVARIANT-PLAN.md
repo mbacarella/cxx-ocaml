@@ -425,6 +425,53 @@ The first one was a genuine single-root BUG, not a display-naming quirk:
   and first-class-module type-path one-offs (pr6944_ok `Map.Make(String).t`,
   pr6982_ok `(module S with type t = ..)`). Assorted one-offs, low leverage.
 
+## SESSION 2026-07-01 (g): labelled-arrow bug (+2); lazy_t re-confirmed blocked
+
+Continued off the (f) pivot into the non-row axes. Full re-scan of the 61 DIFF
+files (categorised in scratchpad) to separate genuine BUGS from display-preference
+residue.
+
+- **Var-callee application dropped argument labels — GENUINE BUG, +2, committed**
+  (`infer: carry argument labels through the var-callee apply fallback`). When a
+  call's callee has an unknown arrow spine, `infer_apply`'s positional fallback
+  built `eng.arrow(dom, r)` with NO label. Two corpus shapes hit this: a `let rec`
+  self-call with a labelled arg (`g ~first:false` -> lost `first:`) and a labelled
+  higher-order parameter (`f ~a ~b` -> lost `a:`/`b:`). Fix: tag the built arrow
+  with the argument's `(lk, nm)`. Safe because arrow-unify only recurses dom/cod
+  (labels aren't compared), so it can never false-reject against a known callee.
+  **sig 464->466 (88.8%), reject 0.0%, lambda 54.2% flat, 0 crashes / 1853,
+  match-set delta = exactly +2 (partial_application, alloc), 0 regressions.**
+
+- **lazy_t vs Lazy.t — ATTEMPTED, REVERTED (re-confirms the path-naming blocker).**
+  Made `lazy e` emit `lazy_t` (display pass only; strict still returns `any()`) and
+  added a unify canonicalisation `lazy_t == Lazy.t` (last-component "lazy_t"->"t")
+  so the two access paths coexist. Isolated cases were perfect (bare `let l = lazy e`
+  -> `lazy_t`; `Lazy.force`/annotations -> `Lazy.t`; cross-path
+  `Lazy.force (lazy 1)` unifies). Corpus: **+3 (lazy7, lazy_, test_module) but -1
+  (hamming)**. hamming's `lazy` value flows into a `Lazy.t` context (`map : _ lcons
+  Lazy.t -> ..`), so the oracle prints `Lazy.t`; we print `lazy_t`. Tried an
+  in-`unify` rename (`lazy_t` node adopts the `Lazy.t` path on contact) — it FIRES
+  but on `instantiate`-COPIES of the row node, never the binding's stored scheme
+  node, so hamming stays `lazy_t`. Node identity is not stable across
+  generalize/instantiate, which is exactly the access-path-tracking machinery the
+  "type-path naming" cluster needs. Net +3/-1 can't hit the sacred 0-regression bar
+  -> reverted. **Verdict: lazy_t is NOT a freebie; it is the same blocked path-naming
+  project (record the access path on the constr node, survive unify+instantiate),
+  now with a concrete failing witness (hamming).**
+
+- **GADT-match result over-specialization (w04_failure, measure_runtime_arity) —
+  confirmed the (f) "niche, hard" cluster, not attempted.** `match r1,r2,t with ..
+  -> ()` should give result `unit`; we give `'b`. Root: `infer_function`/match GADT
+  handling windows each branch (`soft_unify(rhs, rt); undo_to`) and the rollback
+  discards the OUTER result unification too. Fixing needs distinguishing a branch
+  result that mentions the abstract type (keep local) from a ground one (unify
+  outward) — real GADT escape-scope work, deferred.
+
+**Baseline now: sig 466/525 (88.8%), reject 0.0%, lambda 54.2%, 0 crashes.** The
+remaining reachable clusters are all the two blocked ones (type-path naming incl.
+lazy_t; GADT/object over-spec) plus the Way-4 row-variable poly-variant rework —
+each a dedicated project, none a session-sized freebie.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
