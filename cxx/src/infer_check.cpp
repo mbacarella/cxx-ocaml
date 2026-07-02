@@ -353,17 +353,29 @@ struct Checker {
   // Signature AST of a local `module type S = sig .. end`, so a first-class-
   // module param `(module M : S)` can bind M's values at M-qualified types.
   std::unordered_map<std::string, const ast::Signature*> modtype_sig_asts_;
+  // Structure AST of a local `let module M = struct .. end`, so packing M
+  // against a modtype can resolve the sig's abstract types from M's own
+  // manifests (`type t1 = s1` -> the sig's t1 IS s1, not an opaque M.t1).
+  std::unordered_map<std::string, const ast::Structure*> local_module_structs_;
   // Value schemes of modtype S's signature, with S's own type names qualified
   // as `M.<name>` (the unpack param's view of its abstract types).
   std::unordered_map<std::string, TypePtr> unpack_module_values(
-      const std::string& mod_name, const ast::Signature& items) {
+      const std::string& mod_name, const ast::Signature& items,
+      const std::unordered_map<std::string, TypePtr>* argtypes = nullptr) {
     std::unordered_map<std::string, TypePtr> out;
     auto saved = functor_result_abstract_;
     for (auto& it : items)
       if (auto* pt = std::get_if<Psig_type>(&it.desc))
-        for (auto& d : pt->decls)
+        for (auto& d : pt->decls) {
+          // a `with type t = s` constraint substitutes; other abstract types
+          // are M-qualified
+          const TypePtr* sub = nullptr;
+          if (argtypes)
+            if (auto a = argtypes->find(d.name.txt); a != argtypes->end())
+              sub = &a->second;
           functor_result_abstract_[d.name.txt] =
-              eng.constr(mod_name + "." + d.name.txt);
+              sub ? *sub : eng.constr(mod_name + "." + d.name.txt);
+        }
     for (auto& it : items)
       if (auto* pv = std::get_if<Psig_value>(&it.desc)) {
         std::unordered_map<std::string, TypePtr> vars;
@@ -556,9 +568,21 @@ struct Checker {
   // (constraints `with type ..` are dropped -- best effort).  A named unpack
   // param `(module M : S)` stores M in the constr's abbrev; show prints
   // `(module M : S)` when the displayed type depends on M (modular explicits).
-  TypePtr package_type(const Ptyp_package& pk, const std::string& mod_name = "") {
+  TypePtr package_type(const Ptyp_package& pk, const std::string& mod_name = "",
+                       std::unordered_map<std::string, TypePtr>* vars = nullptr) {
     TypePtr t = eng.constr("(module " + lid_full(pk.path.txt) + ")");
     t->abbrev = mod_name;
+    // `with type t = u` constraints ride as labels/args (display + tying).
+    // Non-strict only: the strict pass keeps the bare constr, so an
+    // occurrence written without the constraint can't arity-clash.  The
+    // caller's vars map (when given) ties a constraint's `'a` to the
+    // enclosing declaration's (`Pair of (module PAIR with type t = 'a)`).
+    if (!strict)
+      for (auto& [lid, ct] : pk.constraints) {
+        std::unordered_map<std::string, TypePtr> local;
+        t->labels.push_back(lid_full(lid.txt));
+        t->args.push_back(from_coretype(*ct, vars ? *vars : local));
+      }
     return t;
   }
 
@@ -748,7 +772,7 @@ struct Checker {
       eng.finalize_family_heads(rc);
       return rc;
     }
-    if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) return package_type(*pk);
+    if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) return package_type(*pk, "", &vars);
     // `< m : t; .. >` object annotation -> an Object node (methods; inherits
     // ignored -- best-effort, non-strict rows).  Was: fresh var, which dropped
     // the annotation entirely (pr14554_1's `< bark : ('self -> unit) > t`).
@@ -1258,7 +1282,8 @@ struct Checker {
   // fully generic) clears the unbound-value false-rejections without ever
   // introducing a clash.  F is given by its (possibly qualified) module path.
   std::unordered_map<std::string, TypePtr> functor_result_values(const Longident& fpath,
-                                                                 int napp = 1) {
+                                                                 int napp = 1,
+                                                                 const ModuleExpr* arg1 = nullptr) {
     auto comps = mod_components(fpath);
     if (comps.empty()) return {};
     if (comps.size() == 1) {  // a local functor's recorded (fully-applied) body
@@ -1270,14 +1295,60 @@ struct Checker {
       const std::string& head = comps[0];
       auto cmi = cmi::CmiFile::load(head_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
+      const cmi::Signature* parent = sig;  // sig the functor was found in
       const cmi::ModuleType* mt = nullptr;
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
           if (mm.name == comps[i]) { md = &mm; break; }
         if (!md || !md->type) { sig = nullptr; break; }
+        parent = sig;
         mt = md->type.get();
         sig = (mt->kind == cmi::ModuleType::Sig) ? mt->sig.get() : nullptr;
+      }
+      // Tie a struct argument's values to the cmi functor's PARAM signature
+      // with the struct's own manifests substituted: `Set.Make(struct type t =
+      // s let compare = cmp end)` gives cmp : s -> s -> int (make_set).  Only
+      // still-unresolved (var) exports are tied.  Non-strict only.
+      // Tie a struct argument's values to the cmi functor's PARAM signature.
+      // The param signature may be a NAMED modtype (Set.Make's `OrderedType`):
+      // resolve it in the signature the functor was found in.
+      const cmi::ModuleType* fpt = nullptr;
+      if (mt && mt->kind == cmi::ModuleType::Functor && mt->functor_param_type) {
+        fpt = mt->functor_param_type.get();
+        if (fpt->kind == cmi::ModuleType::Ident && fpt->path && parent) {
+          const cmi::Path* p = fpt->path.get();
+          const std::string& nm =
+              p->kind == cmi::Path::Pdot ? p->s : p->id.name;
+          fpt = nullptr;
+          for (auto& mtd : parent->modtypes)
+            if (mtd.name == nm) { fpt = mtd.type.get(); break; }
+        }
+      }
+      if (!strict && arg1 && napp == 1 && fpt &&
+          fpt->kind == cmi::ModuleType::Sig && fpt->sig) {
+        const ModuleExpr* am = arg1;
+        while (auto* mc = std::get_if<Pmod_constraint>(&am->desc)) am = mc->me.get();
+        if (auto* as2 = std::get_if<Pmod_structure>(&am->desc)) {
+          std::unordered_map<std::string, TypePtr> manifests;
+          for (auto& it2 : as2->items)
+            if (auto* ty = std::get_if<Pstr_type>(&it2.desc))
+              for (auto& d : ty->decls)
+                if (d.manifest) {
+                  std::unordered_map<std::string, TypePtr> v;
+                  manifests[d.name.txt] = from_coretype(**d.manifest, v);
+                }
+          auto argvals = module_exports(*am);
+          cmi_abstract_subst_ = manifests;
+          for (auto& v : fpt->sig->values) {
+            auto f = argvals.find(v.name);
+            if (f == argvals.end()) continue;
+            if (I::Engine::repr(f->second)->kind != I::Type::Kind::Var) continue;
+            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            soft_unify(f->second, from_cmi(v.type, memo));
+          }
+          cmi_abstract_subst_.clear();
+        }
       }
       // Descend napp functor-body levels (curried application F(A)(B)...),
       // then take the resulting signature's value names.
@@ -3218,7 +3289,53 @@ struct Checker {
     }
     if (auto* pk = std::get_if<Pexp_pack>(&e.desc)) {
       // `(module ME : S)` is a first-class module of package type `(module S)`.
-      if (pk->pkg) return package_type(*pk->pkg);
+      if (pk->pkg) {
+        // Packing a LOCAL module ties its exports to the modtype's declared
+        // val types with the `with type` constraints substituted:
+        // `(module M : S with type t = s)` unifies M's to_string against
+        // `s -> string`, so create's param displays `('a -> string)`.
+        if (!strict) {
+          const ModuleExpr* m = pk->me.get();
+          while (auto* mc = std::get_if<Pmod_constraint>(&m->desc)) m = mc->me.get();
+          const Pmod_ident* mi = std::get_if<Pmod_ident>(&m->desc);
+          const Lident* ml = mi ? std::get_if<Lident>(&mi->id.txt.v) : nullptr;
+          auto ex = ml ? modenv.find(ml->name) : modenv.end();
+          if (ex != modenv.end()) {
+            std::unordered_map<std::string, TypePtr> argtypes;
+            for (auto& [lid, ctb] : pk->pkg->constraints) {
+              std::unordered_map<std::string, TypePtr> vars;
+              argtypes[lid_full(lid.txt)] = from_coretype(*ctb, vars);
+            }
+            // The packed struct's own manifests resolve the sig's remaining
+            // abstract types (`type t1 = s1` in P -> the sig's t1 IS s1).
+            if (auto st = local_module_structs_.find(ml->name);
+                st != local_module_structs_.end())
+              for (auto& sit : *st->second)
+                if (auto* ty = std::get_if<Pstr_type>(&sit.desc))
+                  for (auto& d : ty->decls)
+                    if (d.manifest && !argtypes.count(d.name.txt)) {
+                      std::unordered_map<std::string, TypePtr> vars;
+                      argtypes[d.name.txt] = from_coretype(**d.manifest, vars);
+                    }
+            std::unordered_map<std::string, TypePtr> schemes;
+            if (auto* pl = std::get_if<Lident>(&pk->pkg->path.txt.v)) {
+              if (auto sg = modtype_sig_asts_.find(pl->name);
+                  sg != modtype_sig_asts_.end())
+                schemes = unpack_module_values(ml->name, *sg->second, &argtypes);
+            }
+            if (schemes.empty())
+              schemes = cmi_modtype_value_schemes(pk->pkg->path.txt, argtypes);
+            // Tie only exports still UNRESOLVED (a var): flowing the sig type
+            // into a concrete export would capture free vars the other way
+            // (S.elt swallowing make_set's newtype).
+            for (auto& [nm, sch] : schemes)
+              if (auto f = ex->second.find(nm); f != ex->second.end())
+                if (I::Engine::repr(f->second)->kind == I::Type::Kind::Var)
+                  soft_unify(f->second, eng.instantiate(sch));
+          }
+        }
+        return package_type(*pk->pkg);
+      }
       return eng.any();  // unconstrained pack: type unknown without the sig
     }
     if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {
@@ -3460,6 +3577,10 @@ struct Checker {
           std::string p = resolve_local_module_path(lm->binding.expr);
           auto [f, inserted] = local_module_paths_.emplace(*lm->binding.name.txt, p);
           if (!inserted && f->second != p) f->second = "";  // conflicting rebind
+          const ModuleExpr* lme = &lm->binding.expr;
+          while (auto* mc2 = std::get_if<Pmod_constraint>(&lme->desc)) lme = mc2->me.get();
+          if (auto* ms = std::get_if<Pmod_structure>(&lme->desc))
+            local_module_structs_[*lm->binding.name.txt] = &ms->items;
         }
       }
       process_item(*sti->item);
@@ -3855,8 +3976,15 @@ struct Checker {
                 saved_mods.emplace_back(*up->name.txt,
                     prior != modenv.end() ? std::optional(prior->second)
                                           : std::nullopt);
+                // `with type t = a` constraints substitute into the bound
+                // values (M's t IS a; qualifying it M.t would capture a).
+                std::unordered_map<std::string, TypePtr> argtypes;
+                for (auto& [lid, ctb] : up->pkg->constraints) {
+                  std::unordered_map<std::string, TypePtr> vars;
+                  argtypes[lid_full(lid.txt)] = from_coretype(*ctb, vars);
+                }
                 modenv[*up->name.txt] =
-                    unpack_module_values(*up->name.txt, *sg->second);
+                    unpack_module_values(*up->name.txt, *sg->second, &argtypes);
               }
       }
     }
@@ -3905,8 +4033,17 @@ struct Checker {
     if (f.constraint_ && !strict)
       if (auto* pc = std::get_if<Pconstraint>(&*f.constraint_)) {
         std::unordered_map<std::string, TypePtr> local;
-        soft_unify(constrained ? constrained : body,
-                   from_coretype(*pc->type, annot_vars_ ? *annot_vars_ : local));
+        TypePtr at = from_coretype(*pc->type, annot_vars_ ? *annot_vars_ : local);
+        soft_unify(constrained ? constrained : body, at);
+        // A PACKAGE-typed return annotation is the result (ocamlc's ascription
+        // display): a lenient path mismatch (`(module X.S)` body vs
+        // `(module Y.S)` annotation, distinct spellings of one modtype) must
+        // not let the body's own spelling win (fstclassmod's _f).
+        if (!constrained) {
+          TypePtr ar = I::Engine::repr(at);
+          if (ar->kind == I::Type::Kind::Constr && ar->path.rfind("(module ", 0) == 0)
+            body = at;
+        }
       }
     if (record_kinds_) rec_ret_[&f] = body;
     TypePtr t = body;
@@ -4476,8 +4613,31 @@ struct Checker {
       // (val e : S ...): resolve S's value names from the expression's package type
       const Expression* ie = mu->e.get();
       if (auto* ct = std::get_if<Pexp_constraint>(&ie->desc))
-        if (auto* pk = std::get_if<Ptyp_package>(&ct->t->desc))
+        if (auto* pk = std::get_if<Ptyp_package>(&ct->t->desc)) {
+          if (!strict) {
+            // Tie the unpacked expression to the package type, so a plain
+            // param flowing in adopts `(module Set.S with type elt = 's)`
+            // (fstclassmod's `let module Set = (val set : ..)`).
+            soft_unify(infer_expr(*ct->e), package_type(*pk));
+            // Bind the module's values at the modtype's declared types with
+            // the `with type` constraints substituted (elt := s), so the
+            // body's `Set.add l Set.empty` ties l : s list.
+            std::unordered_map<std::string, TypePtr> argtypes;
+            for (auto& [lid, ctb] : pk->constraints) {
+              std::unordered_map<std::string, TypePtr> vars;
+              argtypes[lid_full(lid.txt)] = from_coretype(*ctb, vars);
+            }
+            auto vals = cmi_modtype_value_schemes(pk->path.txt, argtypes);
+            if (!vals.empty()) return vals;
+            if (auto* pl = std::get_if<Lident>(&pk->path.txt.v))
+              if (auto sg = modtype_sig_asts_.find(pl->name);
+                  sg != modtype_sig_asts_.end())
+                return unpack_module_values(
+                    func_bind_name_.empty() ? pl->name : func_bind_name_,
+                    *sg->second, &argtypes);
+          }
           return modtype_values_of(pk->path.txt);
+        }
       return {};
     }
     if (std::get_if<Pmod_apply>(&me.desc) || std::get_if<Pmod_apply_unit>(&me.desc)) {
@@ -4526,7 +4686,10 @@ struct Checker {
                         }
                       }
           }
-        return functor_result_values(fi->id.txt, napp);
+        const ModuleExpr* arg1 = nullptr;
+        if (napp == 1)
+          if (auto* ap = std::get_if<Pmod_apply>(&me.desc)) arg1 = ap->arg.get();
+        return functor_result_values(fi->id.txt, napp, arg1);
       }
       return {};
     }
@@ -4803,6 +4966,20 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
         if (mb->binding.name.txt) ck.mod_prefix_ += *mb->binding.name.txt + ".";
         register_types_rec(ck, ms->items);
         ck.mod_prefix_ = saved;
+      }
+    } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
+      // `module rec Typ : sig .. end = struct type 'a typ = Int of .. end`:
+      // register the struct bodies' types/ctors like plain modules, so
+      // `open Typ; Int TypEq.refl` resolves (fstclassmod).
+      for (auto& b : rm->bindings) {
+        const ModuleExpr* me2 = &b.expr;
+        while (auto* mc = std::get_if<Pmod_constraint>(&me2->desc)) me2 = mc->me.get();
+        if (auto* ms2 = std::get_if<Pmod_structure>(&me2->desc)) {
+          std::string saved = ck.mod_prefix_;
+          if (b.name.txt) ck.mod_prefix_ += *b.name.txt + ".";
+          register_types_rec(ck, ms2->items);
+          ck.mod_prefix_ = saved;
+        }
       }
     }
   }

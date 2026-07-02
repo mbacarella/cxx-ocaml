@@ -269,7 +269,13 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     // to canonicalize paths.  Matching on the final component avoids those
     // spurious clashes; over-accepting two distinct same-named types is a far
     // smaller cost here than false-rejecting valid code.
-    auto last = [](const std::string& p) {
+    // A package constr `(module X.S)` compares by its FULL path in the lenient
+    // (display) pass: the last-component rule would equate `(module X.S)` with
+    // `(module Y.S)` (both "S)") and link them, corrupting the display -- a
+    // mismatch is a lenient no-op.  The strict pass keeps the last-component
+    // rule (two spellings of one modtype must not false-reject).
+    auto last = [this](const std::string& p) {
+      if (lenient && p.rfind("(module ", 0) == 0) return p;
       auto d = p.rfind('.');
       return d == std::string::npos ? p : p.substr(d + 1);
     };
@@ -504,7 +510,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Variant: {
         TypePtr r;
         if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; }
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, t->args);
         else {
           r = variant_type(t->labels, t->args, t->tag_has_arg, t->variant_kind);
@@ -584,7 +590,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         TypePtr r;
         if (!changed && !weak_copy && !sch_head) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; }
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, std::move(as));
         else {
           r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
@@ -935,8 +941,12 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
           names[t.get()] = "'" + tvar_letter(names.size());
         printed.insert(t.get());
       }
+      // A package constr's args are its `with type` constraints (rendered
+      // after the path below), not type parameters.
+      bool pkg = t->path.rfind("(module ", 0) == 0;
       std::string body;
-      if (t->args.size() == 1) { show_rec(t->args[0], body, 2, names, printed, rc, cyc); body += " "; }
+      if (pkg) {
+      } else if (t->args.size() == 1) { show_rec(t->args[0], body, 2, names, printed, rc, cyc); body += " "; }
       else if (t->args.size() > 1) {
         body += "(";
         for (size_t i = 0; i < t->args.size(); ++i) {
@@ -959,9 +969,18 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       if (path == "CamlinternalLazy.t") path = "Lazy.t";
       // A package constr carrying its module name (`(module M : S)`, name in
       // abbrev) prints the name only when the shown type depends on M.
-      if (!t->abbrev.empty() && path.rfind("(module ", 0) == 0 && g_pkg_dep_heads &&
+      if (!t->abbrev.empty() && pkg && g_pkg_dep_heads &&
           g_pkg_dep_heads->count(t->abbrev))
         path = "(module " + t->abbrev + " : " + path.substr(8);
+      // Package `with type` constraints (labels/args pairs).
+      if (pkg && !t->labels.empty() && t->labels.size() == t->args.size()) {
+        path = path.substr(0, path.size() - 1);
+        for (size_t i = 0; i < t->labels.size(); ++i) {
+          path += (i ? " and type " : " with type ") + t->labels[i] + " = ";
+          show_rec(t->args[i], path, 0, names, printed, rc, cyc);
+        }
+        path += ")";
+      }
       body += path;
       if (named) body += " as " + names[t.get()];
       if (named && cp > 0) out += "(" + body + ")";
