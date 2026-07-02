@@ -1119,6 +1119,55 @@ Residue after this scan (23 files, all documented clusters):
   **package-constraint solving** (pr6954), **Pos.t abstract-alias arg paths**
   (test_generator).
 
+## SESSION 2026-07-02 (w): the first-class-module cluster CLOSED (+5, sig 96.6%)
+
+Funded the biggest remaining cluster (5 files) and landed all of it, 3 commits,
+every gate green throughout (reject 0.0%, lambda 54.2% flat, 0 crashes / 1853,
+exact match-set deltas, 0 regressions):
+
+1. **Modular explicits (+2: compiling, debuggee)** — `infer: modular explicits
+   -- named package params`.  Probed ocamlc's display rule first: a named
+   module param prints `(module M : T)` iff the type DEPENDS on M (M-headed
+   dotted path elsewhere); named-but-unused prints plain `(module T)`.
+   The package constr carries its module name in the Constr-unused abbrev
+   field (instantiate copies it); show collects dotted heads in a pre-pass.
+   An unpack param `(module M : S)` binds M's values from the local sig
+   modtype at M-qualified types (P.print x ties x : P.t).  Applying a named
+   package param to `(module String)` substitutes M.-paths in the result via
+   a share-unchanged rebuild (b : String.t * int).
+2. **Package `with type` constraints + ties (+2: fstclassmod, pr6982)** —
+   `infer: package with-type constraints + unpack/pack ties`.  Constraints
+   ride as labels/args on the package constr (non-strict only; threaded
+   through the declaration's var map so a ctor's `(module PAIR with type t =
+   'a)` ties its 'a).  Ties — each ONLY into still-var exports (a concrete
+   export must not swallow a newtype): `(val set : Set.S with type elt = s)`
+   unifies the unpacked expr + binds values with elt := s; packing
+   `(module M : S with type t = s)` ties M's exports to the sig's val types
+   with the packed struct's own manifests resolving remaining abstracts;
+   a cmi functor application ties the arg struct's values to the functor's
+   PARAM sig (named modtype like OrderedType resolved in the parent sig) —
+   make_set's cmp : 'a -> 'a -> int.  Plus: register_types_rec descends
+   `module rec` struct bodies (Typ's GADT ctors); lenient unify compares
+   package constrs by FULL path (X.S vs Y.S were linked via last-component);
+   a package-typed return annotation is the displayed result.
+3. **syntactic_arity (+1)** — `infer: module-param typext ctors;
+   default-pack annotation`.  A sig's `type t += E` binds for the module
+   param (function-scoped cenv; factored bind_sig_typext_ctors), so
+   `?(opt = M.E)` gives opt : t; a bare `?opt:((module M) = (module M1 :
+   S))` takes its package type from the default's pack annotation.
+
+**Baseline now: sig 507/525 (96.6%), reject 0.0%, lambda 54.2%, 0 crashes.**
+
+Remaining 18 DIFFs, all multi-mechanism: mixin×3 (rows+classes), effects
+(test2/frame-pointers GADT escape; issue479 match_with handler inference;
+shallow2deep local-functor body instantiation), sets (chained local
+functors), scanf-return (tscanf2_io/gen_test/common, opaque format6),
+testerror (weak-var), test_generator (Pos.t labelled-arg adoption + result
+precision — TWO fixes), pervasives_leitmotiv (Stdlib/2 shadow), apply
+(%apply optarg erasure), pr6954 (constrained-abbreviation solving —
+possibly nearer now that package constrs carry args), Tests.ml/cast
+(object rows).
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
