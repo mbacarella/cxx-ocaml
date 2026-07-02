@@ -356,6 +356,9 @@ struct Checker {
   struct FunctorDef { std::string param; const ast::ModuleType* param_sig = nullptr;
                       const ast::ModuleType* result_sig = nullptr; };
   std::unordered_map<std::string, FunctorDef> functor_defs_;
+  // A local functor's fully-unwrapped body expression (constraints and functor
+  // params stripped), for resolving applications through the body's own head.
+  std::unordered_map<std::string, const ModuleExpr*> functor_body_exprs_;
   // Ascription signature of a top-level `module M : sig .. end = ..`, so an
   // application of a functor DECLARED IN that signature (`Msg.Define(struct ..)`)
   // can be instantiated from its declared functor type.
@@ -5026,6 +5029,31 @@ struct Checker {
         const ModuleExpr* arg1 = nullptr;
         if (napp == 1)
           if (auto* ap = std::get_if<Pmod_apply>(&me.desc)) arg1 = ap->arg.get();
+        // A LOCAL functor whose body is itself a functor application resolves
+        // through the body's head: `IntSetSet = PowerSet(IntSet)(..)` with
+        // PowerSet's body `Set.Make(SetOrd(BaseSet))` takes Set.Make's result
+        // values, abstract types named after the binding (IntSetSet.t) -- the
+        // plain functor_env harvest would leave every export a generic var.
+        {
+          auto comps = mod_components(fi->id.txt);
+          if (comps.size() == 1)
+            if (auto fb = functor_body_exprs_.find(comps[0]);
+                fb != functor_body_exprs_.end()) {
+              int bnapp = 0;
+              const ModuleExpr* bh = fb->second;
+              while (true) {
+                if (auto* a2 = std::get_if<Pmod_apply>(&bh->desc)) { ++bnapp; bh = a2->f.get(); }
+                else if (auto* au2 = std::get_if<Pmod_apply_unit>(&bh->desc)) { ++bnapp; bh = au2->f.get(); }
+                else break;
+              }
+              if (bnapp > 0)
+                if (auto* bhi = std::get_if<Pmod_ident>(&bh->desc))
+                  if (mod_components(bhi->id.txt) != comps) {  // no self-recursion
+                    auto r = functor_result_values(bhi->id.txt, bnapp, nullptr);
+                    if (!r.empty()) return r;
+                  }
+            }
+        }
         return functor_result_values(fi->id.txt, napp, arg1);
       }
       return {};
@@ -5198,6 +5226,10 @@ struct Checker {
                 }
               }
               while (auto* mf = std::get_if<Pmod_functor>(&me->desc)) me = mf->body.get();
+              // Remember the fully-unwrapped body so an APPLICATION of this
+              // functor can resolve through the body's own head functor
+              // (PowerSet's body `Set.Make(SetOrd(BaseSet))` -- sets.ml).
+              functor_body_exprs_[*mb->binding.name.txt] = me;
               // Keep only the result's value *names* (fresh polymorphic types):
               // the body's concrete types depend on the (unsubstituted) argument,
               // so using them would surface spurious clashes -- names suffice to
