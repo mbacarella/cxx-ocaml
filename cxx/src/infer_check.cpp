@@ -3077,14 +3077,15 @@ struct Checker {
       return eng.any();
     }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
-      // `lazy e` : e Lazy.t -- only in the value-kinds pass (a concrete type here
-      // can clash downstream in an incomplete strict pass and false-reject).
-      // NB: rendering this as the predefined `lazy_t` (which is what ocamlc -i
-      // shows for a constructed lazy value) was tried and REVERTED: lazy_t vs the
-      // cmi-loaded Lazy.t don't unify by name, regressing reject 0.0%->0.1% and
-      // sig (a lazy value flowing into a Lazy.t context clashed).
+      // `lazy e` : the PRIMITIVE `e lazy_t` (what ocamlc -i shows for a
+      // constructed lazy value).  The engine's lazy-family unify makes lazy_t
+      // and the cmi-loaded Lazy.t compatible AND relinks a live construction
+      // that flows into a Lazy.t context (hamming), while generalize/demote's
+      // finalized-head stamp + instantiate's fresh copy protect a finished
+      // binding from later-use relinks (`let l = lazy 1;; Lazy.force l` keeps
+      // `int lazy_t`).  This is the per-occurrence access-path rule.
       TypePtr inner = infer_expr(*lz->e);
-      return strict ? eng.any() : eng.constr("Lazy.t", {inner});
+      return strict ? eng.any() : eng.constr("lazy_t", {inner});
     }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
       TypePtr ct = infer_expr(*as->e);  // infer the condition (flows operand kinds)

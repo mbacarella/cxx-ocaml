@@ -219,6 +219,31 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       if (lenient) return;
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     }
+    // The lazy family: `lazy_t` (the primitive, what a `lazy e` construction
+    // carries) and its abbreviations `Lazy.t` / `CamlinternalLazy.t`.  They
+    // unify, and -- matching ocamlc's unify3 link of the expanded heads -- the
+    // PRIMITIVE-pathed node adopts the abbreviation-pathed one, so a
+    // construction that flows into a `Lazy.t` context DURING inference displays
+    // `Lazy.t` (hamming), while finalized bindings are protected by the
+    // generic-level fresh copy in instantiate (lazy7 stays `lazy_t`).
+    auto lazy_prim = [&](const TypePtr& t) { return t->path == "lazy_t"; };
+    auto lazy_abbr = [&](const TypePtr& t) {
+      if (last(t->path) != "t") return false;
+      std::string head = t->path.substr(0, t->path.size() - 2);  // drop ".t"
+      if (head.rfind("Stdlib__", 0) == 0) head = head.substr(8);
+      else if (head.rfind("Stdlib.", 0) == 0) head = head.substr(7);
+      return head == "Lazy" || head == "CamlinternalLazy";
+    };
+    if (a->args.size() == 1 && b->args.size() == 1 &&
+        ((lazy_prim(a) && lazy_abbr(b)) || (lazy_abbr(a) && lazy_prim(b)))) {
+      const TypePtr& prim = lazy_prim(a) ? a : b;
+      const TypePtr& abbr = lazy_prim(a) ? b : a;
+      unify(prim->args[0], abbr->args[0]);
+      note(prim);
+      prim->kind = Type::Kind::Link;
+      prim->link = abbr;
+      return;
+    }
     if (last(a->path) != last(b->path) || a->args.size() != b->args.size()) {
       if (lenient) return;
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
@@ -442,7 +467,11 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         if (!on_stack.insert(t.get()).second) return t;  // cyclic back-edge: share
         TypePtr d = copy(t->dom), c = copy(t->cod);
         on_stack.erase(t.get());
-        TypePtr r = (d == t->dom && c == t->cod)
+        // Compare against the REPR of each child: a link-wrapped child (a var
+        // already resolved to a concrete type) resolves to the same node when
+        // truly unchanged -- comparing to the wrapper pointer spuriously marked
+        // it "changed" and re-copied shareable structure per use.
+        TypePtr r = (d == repr(t->dom) && c == repr(t->cod))
                       ? t  // no generic inside: share
                       : arrow(std::move(d), std::move(c), t->arrow_label, t->arrow_lbl);
         memo[t.get()] = r;
@@ -456,15 +485,23 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         std::vector<TypePtr> as;
         bool changed = false;
         as.reserve(t->args.size());
-        for (auto& a : t->args) { as.push_back(copy(a)); if (as.back() != a) changed = true; }
+        for (auto& a : t->args) {  // repr-compare: see the Arrow case
+          as.push_back(copy(a));
+          if (as.back() != repr(a)) changed = true;
+        }
         on_stack.erase(t.get());
         // A generic variant row gets a FRESH weak node per use (see `fits`), so a
         // value-restricted use (`bar = wrap ()`) can weaken its own copy without
         // touching the scheme.  Others share-unchanged when nothing changed.
         bool weak_copy = t->kind == Type::Kind::Variant &&
                          t->level == GENERIC_LEVEL && small_acyclic(t);
+        // A FINALIZED lazy head (stamped by generalize/demote) gets a fresh
+        // node per use, so unify's lazy-family relink hits the copy, never the
+        // binding's displayed node (args still shared -- constraints flow).
+        bool lazy_head = t->kind == Type::Kind::Constr &&
+                         t->level == GENERIC_LEVEL && t->path == "lazy_t";
         TypePtr r;
-        if (!changed && !weak_copy) r = t;  // monomorphic composite: share the node
+        if (!changed && !weak_copy && !lazy_head) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
         else if (t->kind == Type::Kind::Constr) r = constr(t->path, std::move(as), t->stamp);
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, std::move(as));
@@ -522,8 +559,17 @@ void Engine::generalize(const TypePtr& t0) {
         if (t->level > level) t->level = GENERIC_LEVEL;
         [[fallthrough]];
       case Type::Kind::Tuple:
-      case Type::Kind::Constr:
       case Type::Kind::Object:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        break;
+      case Type::Kind::Constr:
+        // A FINALIZED `lazy_t` head is stamped GENERIC so instantiate
+        // fresh-copies it per use: a later `Lazy.force l` / `f l` then relinks
+        // the COPY, not the binding's displayed node (ocamlc: `let l = lazy 1`
+        // stays `lazy_t` after later uses; only a same-rec-group flow -- where
+        // the node is still unstamped and shared -- adopts `Lazy.t`, hamming).
+        if (t->path == "lazy_t") t->level = GENERIC_LEVEL;
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -561,8 +607,14 @@ void Engine::demote(const TypePtr& t0) {
         if (t->level != GENERIC_LEVEL && t->level > level) { note(t); t->level = level; }
         [[fallthrough]];
       case Type::Kind::Tuple:
-      case Type::Kind::Constr:
       case Type::Kind::Object:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        break;
+      case Type::Kind::Constr:
+        // Weak bindings are FINALIZED too: stamp the lazy head (see generalize)
+        // so a later use can't relink the binding's displayed node.
+        if (t->path == "lazy_t") { note(t); t->level = GENERIC_LEVEL; }
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
