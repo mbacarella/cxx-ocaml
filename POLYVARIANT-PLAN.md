@@ -957,6 +957,43 @@ original 12 DIFF files landed** (pr10664, recursive_module_init, ref_spec,
 pr6836, bar/pr6899_second_bad, exotic, morematch, nested + the adjacent
 pr14554_1), with the crash substrate permanent and every gate green throughout.
 
+## SESSION 2026-07-02 (s): mixin.ml funded — abbreviation-carrying rows landed, 21→9 diff lines, flip blocked
+
+Attempted the recommended mixin.ml slice. The KEY INSIGHT held: ocamlc doesn't
+structurally FOLD rows back to abbreviations — it expands an annotation's
+abbreviation for unification but REMEMBERS it on the type node for display.
+Reproducing that (an `abbrev`/`abbrev_args` stamp on Variant nodes) sidesteps
+the `Names.elt`≡`string` equality problem entirely for the folded positions.
+Committed `infer: abbreviation-carrying variant rows + function-cases
+constraints` — all gates green (sig 492 flat, reject 0.0%, lambda 54.2%, 0
+crashes, 0 regressions):
+
+- from_coretype display-pass expansion of variant-abbreviation constrs with the
+  abbrev stamp; carried through merge (dropped if the tag set grows) /
+  instantiate copy / ccopy; count_refs + find_cycles walk abbrev_args.
+  TWO crash bugs found & fixed by the per-change canary run: copy(abbrev_args)
+  must be memo-registered BEFORE recursing (recursive abbrev arg → infinite
+  recursion), and a fixpoint row (`'a lambda as 'a`) must print UNFOLDED (also
+  what ocamlc does — free1/free2 etc.).
+- **infer_function bug (general, beyond mixin): a `function`-cases constraint
+  annotates the whole `arg -> rt` arrow**, not rt (`let f ~x : (t1 -> t2) =
+  function ..`) — it was silently dropped (lenient arrow-vs-result no-op).
+- build_as_type `#t as x` rebuilds an OPEN `[>` row (typecore as-types), fixing
+  map_lambda's output-row kind.
+
+**Result: mixin.ml went 21 → 9 differing val lines** (subst_var, free_var,
+free_lambda, map_lambda, free_expr, map_expr, free/subst/eval, print,
+free2/subst2/eval2 all now match). The remaining 9 are NOT display: they are
+per-occurrence arg-path products (`Subst.key` vs `string` vs `Names.elt`
+occupying arg slots — the blocked access-path-through-unify cluster, in both
+directions on different lines) plus one deep inference tie (subst_lambda's
+`free` applied to both the input's arg and the subst-map elements through the
+`Subst.fold` labelled-closure chain; the basic var-callee double-application
+tie DOES work in isolation) and eval_lambda/eval_expr row-kind/sharing shape
+divergences. **Verdict: mixin.ml cannot flip until the access-path cluster is
+funded; the abbreviation machinery (this slice) was its display half and is
+done.** mixin2/mixin3 remain the class-system project (unchanged assessment).
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
