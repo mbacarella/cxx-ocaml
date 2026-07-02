@@ -162,6 +162,13 @@ struct Checker {
   // disambiguation, so treated as unknown (a flat last-wins map picks wrong).
   // (Only consulted as a fallback for ctors not in the scoped cenv below.)
   std::set<std::string> ambiguous_ctors_;
+  // Predefined ctor names ([]/::/Some/..) redefined by a TOP-LEVEL decl (which
+  // genuinely shadows the predef for the rest of the file).  A module-NESTED
+  // redefinition doesn't touch the outer name (OCaml scoping), so a predef name
+  // absent here stays resolvable in the non-strict passes even when marked
+  // ambiguous (the strict pass keeps bailing to Any: inside the defining module
+  // the pick would need type-directed disambiguation we don't have).
+  std::set<std::string> predef_toplevel_redef_;
   // Scoped, ordered constructor resolution (mirrors tenv for types): a ctor name
   // resolves to the in-scope declaration, so a name reused across several local
   // types is disambiguated by position instead of collapsed to ambiguous.
@@ -1763,7 +1770,13 @@ struct Checker {
           }
     if (is_gadt) {
       gadt_types.insert(d.name.txt);
-      for (auto& c : v->ctors) gadt_ctors.insert(c.name.txt);
+      // A module-nested GADT redefining a predef ctor name (GPR#234's
+      // `type hlist = [] : hlist | (::) : ..`) must not turn every outer
+      // list-pattern match into a windowed GADT match -- the nested name
+      // never shadows the outer scope.
+      for (auto& c : v->ctors)
+        if (mod_prefix_.empty() || !predef_ctors_.count(c.name.txt))
+          gadt_ctors.insert(c.name.txt);
     }
     type_ctors[d.name.txt] = std::move(names);
     for (auto& c : v->ctors) {
@@ -1782,8 +1795,13 @@ struct Checker {
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
       }
       register_inline_record(c.args, result, vars);  // `C of { f : t }`
-      if (ctors.count(c.name.txt)) ambiguous_ctors_.insert(c.name.txt);
-      ctors[c.name.txt] = scheme;
+      bool nested_predef = !mod_prefix_.empty() && predef_ctors_.count(c.name.txt);
+      if (ctors.count(c.name.txt)) {
+        ambiguous_ctors_.insert(c.name.txt);
+        if (predef_ctors_.count(c.name.txt) && mod_prefix_.empty())
+          predef_toplevel_redef_.insert(c.name.txt);
+      }
+      if (!nested_predef) ctors[c.name.txt] = scheme;
       ctor_scheme_[&c] = scheme;  // for scoped (in-order) resolution via cenv
     }
   }
@@ -1947,8 +1965,13 @@ struct Checker {
     // top-level exception definition SHADOWS the stdlib ctor for an unqualified
     // `Error` -- so in the non-strict passes resolve it to the (last-registered)
     // exn scheme rather than bailing to Any.  The strict reject pass keeps bailing
-    // (an incorrect pick could false-reject).
-    if (ambiguous_ctors_.count(name) && (strict || !exn_ctors_.count(name)))
+    // (an incorrect pick could false-reject).  Likewise a predef ctor whose only
+    // redefinitions are module-NESTED (GPR#234's `type hlist = [] | (::)`) stays
+    // resolvable non-strict: the nested decl never shadowed the outer name.
+    bool predef_intact =
+        predef_ctors_.count(name) && !predef_toplevel_redef_.count(name);
+    if (ambiguous_ctors_.count(name) &&
+        (strict || (!exn_ctors_.count(name) && !predef_intact)))
       return nullptr;
     auto it = ctors.find(name);
     return it == ctors.end() ? nullptr : &it->second;
