@@ -2968,10 +2968,20 @@ struct Checker {
       if (i->suffix == 'l') return eng.constr("int32");
       if (i->suffix == 'L') return eng.constr("int64");
       if (i->suffix == 'n') return eng.constr("nativeint");
+      // A literal modifier other than l/L/n needs a ppx to interpret it; with
+      // none run, ocamlc rejects it ("Unknown modifier g for literal ..").  The
+      // oracle also runs ppx-free, so a valid file never carries one -- sound.
+      if (strict && i->suffix)
+        note_error("Unknown modifier " + std::string(1, *i->suffix) +
+                   " for literal " + i->value);
       return eng.constr("int");  // unsuffixed (or user-defined suffix => int)
     }
     if (std::holds_alternative<Pconst_char>(c.desc)) return eng.constr("char");
     if (std::holds_alternative<Pconst_string>(c.desc)) return eng.constr("string");
+    // Float literals have no built-in suffix; any modifier needs a ppx.
+    if (auto* fl = std::get_if<Pconst_float>(&c.desc); fl && strict && fl->suffix)
+      note_error("Unknown modifier " + std::string(1, *fl->suffix) +
+                 " for literal " + fl->value);
     return eng.constr("float");
   }
 
