@@ -127,7 +127,8 @@ struct Checker {
   std::unordered_map<std::string, std::vector<std::string>> type_ctors;
   // type abbreviations: name -> (param var names, manifest core_type) so that a
   // `type ('a,..) t = <manifest>` can be expanded when t is used in annotations.
-  struct Alias { std::vector<std::string> params; const CoreType* manifest; };
+  struct Alias { std::vector<std::string> params; const CoreType* manifest;
+                 const std::vector<ast::TypeConstraint>* constraints = nullptr; };
   std::unordered_map<std::string, Alias> type_aliases;
   // GADT type names (a constructor has an explicit result type): matching one
   // refines types per branch, so branch results must not be cross-unified.
@@ -732,6 +733,52 @@ struct Checker {
           r->abbrev = nm;
           r->abbrev_args = as;
         }
+        return r;
+      }
+      // A PHANTOM abbreviation (`type 'a arg_t = 'at constraint 'a = (module
+      // Y.S with type t = 'at)`) has a bare-variable manifest bound only
+      // through its constraints: expand it even in the folded display pass
+      // (the folded name displays nothing useful) and SOLVE the constraints
+      // by unifying each side under the same substitution -- `t arg_t` at
+      // t = (module X.Y.S with type t = unit) gives 'at = unit (pr6954).
+      if (fold_abbrevs_ && !strict && ai != type_aliases.end() &&
+          ai->second.params.size() == as.size() && !expanding_.count(nm) &&
+          ai->second.constraints &&
+          std::holds_alternative<Ptyp_var>(ai->second.manifest->desc)) {
+        std::unordered_map<std::string, TypePtr> sub;
+        for (size_t i = 0; i < as.size(); ++i)
+          if (!ai->second.params[i].empty()) sub[ai->second.params[i]] = as[i];
+        expanding_.insert(nm);
+        TypePtr r = from_coretype(*ai->second.manifest, sub);
+        // Solve with abbreviations EXPANDED: the constraint's sides only
+        // matter for unification (`t` must become its package manifest to
+        // meet `(module Y.S with type t = 'at)`), never for display.  A side
+        // substituted to an already-built FOLDED alias node (the annotation's
+        // arg was built in the folded display pass) is expanded one level.
+        bool saved_fold = fold_abbrevs_;
+        fold_abbrevs_ = false;
+        auto expand_for_solve = [&](TypePtr x) -> TypePtr {
+          TypePtr t = I::Engine::repr(x);
+          if (t->kind != I::Type::Kind::Constr) return x;
+          std::string p = t->path;
+          if (auto d = p.rfind('.'); d != std::string::npos) p = p.substr(d + 1);
+          auto a2 = type_aliases.find(p);
+          if (a2 == type_aliases.end() || expanding_.count(p) ||
+              a2->second.params.size() != t->args.size())
+            return x;
+          std::unordered_map<std::string, TypePtr> vars2;
+          for (size_t i = 0; i < t->args.size(); ++i)
+            if (!a2->second.params[i].empty()) vars2[a2->second.params[i]] = t->args[i];
+          expanding_.insert(p);
+          TypePtr r2 = from_coretype(*a2->second.manifest, vars2);
+          expanding_.erase(p);
+          return r2;
+        };
+        for (auto& tc : *ai->second.constraints)
+          soft_unify(expand_for_solve(from_coretype(*tc.t1, sub)),
+                     expand_for_solve(from_coretype(*tc.t2, sub)));
+        fold_abbrevs_ = saved_fold;
+        expanding_.erase(nm);
         return r;
       }
       if (!fold_abbrevs_ && ai != type_aliases.end() && ai->second.params.size() == as.size() &&
@@ -1902,7 +1949,8 @@ struct Checker {
       for (auto& p : d.params)
         ps.push_back(std::holds_alternative<Ptyp_var>(p->desc)
                          ? std::get<Ptyp_var>(p->desc).name : "");
-      type_aliases[d.name.txt] = {std::move(ps), d.manifest->get()};
+      type_aliases[d.name.txt] = {std::move(ps), d.manifest->get(),
+                                  d.constraints.empty() ? nullptr : &d.constraints};
     }
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;

@@ -269,13 +269,12 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     // to canonicalize paths.  Matching on the final component avoids those
     // spurious clashes; over-accepting two distinct same-named types is a far
     // smaller cost here than false-rejecting valid code.
-    // A package constr `(module X.S)` compares by its FULL path in the lenient
-    // (display) pass: the last-component rule would equate `(module X.S)` with
-    // `(module Y.S)` (both "S)") and link them, corrupting the display -- a
-    // mismatch is a lenient no-op.  The strict pass keeps the last-component
-    // rule (two spellings of one modtype must not false-reject).
-    auto last = [this](const std::string& p) {
-      if (lenient && p.rfind("(module ", 0) == 0) return p;
+    // Package constrs (`(module X.S)`) also compare by last component: two
+    // spellings of one modtype (X.Y.S via `module Y = X.Y`) must stay
+    // compatible so their `with type` args unify (pr6954 solves 'at = unit
+    // through exactly this).  Constr unification never LINKS the nodes, so
+    // each occurrence keeps its own written path for display.
+    auto last = [](const std::string& p) {
       auto d = p.rfind('.');
       return d == std::string::npos ? p : p.substr(d + 1);
     };
