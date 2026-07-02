@@ -356,6 +356,10 @@ struct Typer {
   // list (for <kept> fields; local records use field_registry).
   const std::unordered_map<const ast::Expression*, std::vector<std::string>>*
       record_fields = nullptr;
+  // String-literal nodes inferred at a format type: desugared to the
+  // CamlinternalFormatBasics.Format(...) tree in the dump (type-directed, so it
+  // catches unqualified/open'd/let-bound formats the syntactic path can't).
+  const std::set<const ast::Expression*>* format_lits = nullptr;
   long long next_stamp = 274;  // arbitrary base; the harness normalizes stamps
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
@@ -958,6 +962,13 @@ struct Typer {
     out.loc = e.loc;
     out.attrs = &e.attrs;
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) {
+      // A string literal inferred at a format type desugars to the
+      // CamlinternalFormatBasics.Format(...) tree (type-directed, via the
+      // inference side-table -- catches unqualified/open'd/let-bound formats
+      // the Pexp_apply syntactic path misses).
+      if (format_lits && format_lits->count(&e))
+        if (auto* ps = std::get_if<ast::Pconst_string>(&c->c.desc))
+          if (tt::ExprBox fmt = fmtlib::make(ps->s, e.loc)) return std::move(*fmt);
       out.desc = tt::Texp_constant{c->c};
     } else if (auto* id = std::get_if<Pexp_ident>(&e.desc)) {
       const std::string* ivn = nullptr;
@@ -1737,6 +1748,7 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   t.apply_plans = &aux.apply_plans;
   t.flatten_construct = &aux.flatten_construct;
   t.record_fields = &aux.record_fields;
+  t.format_lits = &aux.format_lits;
   typedtree::Structure out;
   for (auto& it : s) out.push_back(t.structure_item(it));
   return out;

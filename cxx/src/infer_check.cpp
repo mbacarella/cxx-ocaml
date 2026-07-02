@@ -233,6 +233,10 @@ struct Checker {
   // function bodies, so value kinds can be read off after inference (additive;
   // off by default so the soundness/completeness passes are unaffected).
   bool record_kinds_ = false;
+  // Record format-string literals into fmt_lits_ (for the dump).  Purely
+  // additive -- gated separately from record_kinds_ so the dump pass can collect
+  // formats without also flipping on the heavier kind-recording behaviour.
+  bool record_fmt_lits_ = false;
   std::unordered_map<const Pattern*, TypePtr> rec_pat_;
   std::unordered_map<const void*, TypePtr> rec_ret_;
   std::unordered_map<const void*, TypePtr> rec_expr_;  // every expression's type
@@ -3536,7 +3540,8 @@ struct Checker {
   TypePtr infer_expr_expected(const Expression& e, const TypePtr& expected) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc))
       if (auto* s = std::get_if<Pconst_string>(&c->c.desc); s && is_format_constr(expected)) {
-        if (record_kinds_) fmt_lits_.insert(&e);  // Lambda lowers it as a format
+        if (record_kinds_ || record_fmt_lits_)
+          fmt_lits_.insert(&e);  // Lambda lowers it as a format; dump desugars it
         auto er = I::Engine::repr(expected);  // format6's arg0 ('a) is the args function
         if (er->kind == I::Type::Kind::Constr && !er->args.empty()) {
           std::vector<TypePtr> a = er->args; a[0] = format_arrow(s->s, a);
@@ -6031,12 +6036,14 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
 
 DumpAux infer_dump_aux(const ast::Structure& s) {
   Checker ck;
+  ck.record_fmt_lits_ = true;  // collect format literals for the dump (additive)
   run_checker(ck, s);
   DumpAux out;
   out.match_partial = std::move(ck.match_partial);
   out.apply_plans = std::move(ck.apply_plans);
   out.flatten_construct = std::move(ck.flatten_construct);
   out.record_fields = std::move(ck.record_fields);
+  out.format_lits = std::move(ck.fmt_lits_);
   return out;
 }
 
