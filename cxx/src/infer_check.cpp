@@ -744,7 +744,11 @@ struct Checker {
       // ascription's value translation (test_generator's `Pos.t` params).
       auto ar = type_arity.find(lid_last(c->id.txt));
       if (ar != type_arity.end() && !as.empty())
-        while ((int)as.size() < ar->second) as.push_back(eng.any());
+        // Strict pads with Any (absorbs -- can't false-reject); the display
+        // passes pad with a fresh VAR so the slot can be pinned by the body
+        // and prints 'a, not `_` (issue479's `_ iter2gen` second param).
+        while ((int)as.size() < ar->second)
+          as.push_back(strict ? eng.any() : eng.fresh_var());
       // Expand a known type abbreviation (type (params) name = manifest), with a
       // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
       std::string nm = lid_last(c->id.txt);
@@ -1272,6 +1276,7 @@ struct Checker {
   // re-entrancy-guarded via the negative cache.
   std::unordered_map<std::string, TypePtr> abbrev_exp_cache_;
   std::set<std::string> abbrev_exp_neg_;
+  int abbrev_local_depth_ = 0;  // bounds local-alias unify-retry expansion
   TypePtr resolve_abbrev_expansion(const std::string& path,
                                    const std::vector<TypePtr>& args) {
     if (args.empty())
@@ -1284,7 +1289,35 @@ struct Checker {
       if (d == std::string::npos) { comps.push_back(path.substr(p)); break; }
       comps.push_back(path.substr(p, d - p));
     }
-    if (comps.size() < 2) { abbrev_exp_neg_.insert(path); return nullptr; }
+    if (comps.size() < 2) {
+      // A LOCAL abbreviation (`('a,'c) iter2gen = .. -> .. -> ..`): expand its
+      // manifest under the args' substitution, so the lenient cross-kind retry
+      // ties a FOLDED annotation's args to the inferred concrete type
+      // (issue479's `let iter2gen : _ iter2gen = fun iter c -> ..`).  Not
+      // negative-cached: type_aliases grows as the file processes.  Variant-
+      // row manifests are excluded (rows have their own fold-pass expansion,
+      // and re-expanding per unify retry loops on recursive rows -- mixin);
+      // the depth cap bounds alias-of-alias retry chains the expanding_ guard
+      // can't see across separate resolver calls.
+      auto ai = type_aliases.find(path);
+      if (ai != type_aliases.end() && ai->second.params.size() == args.size() &&
+          !expanding_.count(path) && abbrev_local_depth_ < 32 &&
+          !std::holds_alternative<Ptyp_variant>(ai->second.manifest->desc)) {
+        std::unordered_map<std::string, TypePtr> sub;
+        for (size_t i = 0; i < args.size(); ++i)
+          if (!ai->second.params[i].empty()) sub[ai->second.params[i]] = args[i];
+        expanding_.insert(path);
+        ++abbrev_local_depth_;
+        bool sf = fold_abbrevs_;
+        fold_abbrevs_ = false;  // the expansion feeds unify, not display
+        TypePtr r = from_coretype(*ai->second.manifest, sub);
+        fold_abbrevs_ = sf;
+        --abbrev_local_depth_;
+        expanding_.erase(path);
+        return r;
+      }
+      return nullptr;
+    }
     abbrev_exp_neg_.insert(path);  // re-entrancy guard; erased on success
     try {
       std::vector<cmi::CmiFile> loaded;
