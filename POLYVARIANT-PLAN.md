@@ -1065,6 +1065,60 @@ labelled-closure tie + eval row shapes). Known imperfection: an if-branch 2-2
 tie converges where ocamlc keeps slots separate (synthetic probe only; no
 corpus witness).
 
+## SESSION 2026-07-02 (v): four flips off the residue scan (+4, sig 95.6%)
+
+Re-scanned the live 27 DIFFs post-(u).  Four landed, each its own gated commit
+(reject 0.0%, lambda 54.2% flat, 0 crashes / 1853, exact match-set delta, 0
+regressions):
+
+1. **patmatch (+1)** — `infer: nested predef-ctor redefinitions don't poison
+   outer scope`.  GPR#234's module-nested `type hlist = [] : hlist | (::) : ..`
+   marked `[]`/`::` ambiguous file-wide AND put them in gadt_ctors, so every
+   list match in the file (test_match/test, defined EARLIER) collapsed to
+   `'a -> 'b` — the corruption came from LATER file content (forward-bisected).
+   Nested redefinitions of predef ctors no longer overwrite the flat map or
+   mark GADT; the name stays ambiguous for the STRICT pass only (Any can't
+   false-reject).  2-line repro in the commit.
+2. **pr6944 (+1)** — `infer: escaping let-module types print the applicative
+   path`.  (u)'s named residue: `let module N = Map.Make(S)` escaping ->
+   `int Map.Make(String).t` (definition path, args resolved through local
+   aliases).  Emit-time boundary-checked prefix rewrite; names shadowing a
+   top-level module or conflictingly rebound are skipped (witness-probed).
+3. **accepted_batch (+1)** — `infer: open of a functor application +
+   ascribed-open restriction`.  `open Set.Make(String)` now instantiates with
+   the applicative path as prefix (was: all exports generic vars);
+   `open (List : sig val map .. end)` restricts to the ascription's names
+   (List.hd was shadowing the file's own `hd`).
+4. **msg (+1)** — `infer: ascription val types + signature-declared functor
+   instances`.  (a) ascribed modules export the SIGNATURE's declared val types
+   (struct-inferred raise-typed `'b` leaked); (b) `Msg.Define(struct type t =
+   string end)` — a functor declared in the ascription sig — instantiates, its
+   result-sig typext ctor C bound in the scoped cenv with D.t := string (the
+   flat map holds the body's unsubstituted C; a second registration would only
+   ambiguate); (c) Pext_rebind (`+= String = StrM.C`) shares the target's
+   scheme (non-exn, NON-STRICT only — the strict variant false-rejected
+   msg.ml itself via the unsubstituted D.t scheme; caught by the reject gate
+   mid-slice and re-guarded).
+
+**Baseline now: sig 502/525 (95.6%), reject 0.0%, lambda 54.2%, 0 crashes.**
+
+Residue after this scan (23 files, all documented clusters):
+- **effects/handlers** (test2, frame-pointers/effects: GADT escape-scope
+  `'a Effect.t`; issue479: inference through match_with handler records;
+  shallow2deep: + local-functor body instantiation with applicative-path
+  types/ctors — MkReify(PC).event).
+- **first-class modules** (fstclassmod, pr6982, compiling, debuggee,
+  syntactic_arity: `(module S with type t = 'a)` recovery / modular
+  explicits).
+- **local-functor bodies** (sets: chained local functor returning
+  Set.Make(..); shallow2deep above).
+- **objects** (Tests.ml `< .. >`, cast `#castable`), **mixin×3** (rows +
+  class-system, unchanged), **scanf-return** (tscanf2_io, gen_test, common:
+  opaque format6 params), **weak-var/relaxed VR** (testerror), **Stdlib/2
+  shadow** (pervasives_leitmotiv), **%apply optarg erasure** (apply),
+  **package-constraint solving** (pr6954), **Pos.t abstract-alias arg paths**
+  (test_generator).
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
