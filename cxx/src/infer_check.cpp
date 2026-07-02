@@ -1662,9 +1662,19 @@ struct Checker {
         if (all_const) immediate_types_.insert(td.name);
       }
       for (auto& [name, ty] : found)
-        if (!ambiguous.count(name)) ctors[name] = ty;
+        if (!ambiguous.count(name)) {
+          ctors[name] = ty;
+          stdlib_ctor_types_[ty->path].push_back(name);
+        }
     } catch (...) {}
   }
+  // Stdlib types whose constant ctors register_stdlib_ctors bound, by type name
+  // -> ctor names.  Consulted when a TOP-LEVEL decl shadows the type name: the
+  // stdlib schemes are then requalified `Stdlib.name` (or `Stdlib/2.name` when
+  // the file also binds a module named Stdlib), matching ocamlc's display.
+  std::unordered_map<std::string, std::vector<std::string>> stdlib_ctor_types_;
+  bool user_stdlib_module_ = false;      // file binds a top-level `module Stdlib`
+  std::set<std::string> stdlib_keep_paths_;  // exact requalified paths, for show
 
   // Collect the type-variable names in a core type.  Sets `uncertain` when a
   // construct that can introduce/bind implicit row or universal variables
@@ -2044,6 +2054,26 @@ struct Checker {
     check_type_vars(d);
     check_unboxed(d);
     type_arity[d.name.txt] = (int)d.params.size();
+    // A top-level decl shadowing a stdlib variant type's name (`type fpclass =
+    // A` over float's fpclass): the stdlib ctors' schemes requalify so their
+    // displays stay unambiguous -- `Stdlib.fpclass`, or `Stdlib/2.fpclass`
+    // when the file also binds its own `module Stdlib` (ocamlc's out-of-scope
+    // marker).  Unify compares constr paths by last component, so the rewrite
+    // cannot introduce a clash; the immediate (int) kind is carried over.
+    if (mod_prefix_.empty())
+      if (auto sc = stdlib_ctor_types_.find(d.name.txt);
+          sc != stdlib_ctor_types_.end()) {
+        std::string q =
+            (user_stdlib_module_ ? "Stdlib/2." : "Stdlib.") + d.name.txt;
+        for (auto& cn : sc->second)
+          if (auto ci = ctors.find(cn); ci != ctors.end()) {
+            TypePtr t = I::Engine::repr(ci->second);
+            if (t->kind == I::Type::Kind::Constr && t->path == d.name.txt)
+              t->path = q;
+          }
+        if (immediate_types_.count(d.name.txt)) immediate_types_.insert(q);
+        stdlib_keep_paths_.insert(q);
+      }
     // Opaque types (variant/record/abstract-without-manifest) have a distinct
     // identity; pure abbreviations are transparent (expanded), so unstamped.
     bool opaque = std::holds_alternative<Ptype_variant>(d.kind) ||
@@ -5306,6 +5336,13 @@ static void run_checker(Checker& ck, const ast::Structure& s) {
   ck.register_predef_ctors();
   ck.register_stdlib_ctors();
   ck.collect_bound_modules(s);  // pre-collect bound module names (before type checks)
+  // A TOP-LEVEL `module Stdlib` shadows the default-open Stdlib: real-Stdlib
+  // types that need requalifying then print `Stdlib/2.` (set before
+  // register_types_rec, whose decl registration consumes it).
+  for (auto& it : s)
+    if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+      if (mb->binding.name.txt && *mb->binding.name.txt == "Stdlib")
+        ck.user_stdlib_module_ = true;
   register_types_rec(ck, s);
   ck.load_open_record_fields(s);
   ck.finalize_fields();
@@ -6178,7 +6215,14 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
       }
     }
   };
+  // Stdlib-shadow display controls (see infer.hpp): a user `module Stdlib`
+  // keeps ALL Stdlib. prefixes; a requalified shadowed type keeps its own.
+  I::g_keep_stdlib_prefix = ck.user_stdlib_module_;
+  I::g_keep_stdlib_paths =
+      ck.stdlib_keep_paths_.empty() ? nullptr : &ck.stdlib_keep_paths_;
   walk(s);
+  I::g_keep_stdlib_prefix = false;
+  I::g_keep_stdlib_paths = nullptr;
   // A shadowed name appears once in the signature, at (and with the type of) its
   // LAST binding -- keep only the final occurrence of each name.
   std::unordered_map<std::string, size_t> last;

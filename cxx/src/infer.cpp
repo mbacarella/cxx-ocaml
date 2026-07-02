@@ -753,6 +753,10 @@ void Engine::demote(const TypePtr& t0) {
   go(t0);
 }
 
+// See infer.hpp: Stdlib-shadow display controls, set by the signature pass.
+thread_local bool g_keep_stdlib_prefix = false;
+thread_local const std::set<std::string>* g_keep_stdlib_paths = nullptr;
+
 namespace {
 // Count how many times each polymorphic-variant/object row node is referenced,
 // so the printer can name a SHARED one (appears 2+ times) or a CYCLIC one
@@ -966,8 +970,14 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       }
       std::string path = t->path;
       // Stdlib is opened by default, so its types print unqualified
-      // (Stdlib.out_channel -> out_channel, Stdlib.Gc.stat -> Gc.stat).
-      if (path.rfind("Stdlib.", 0) == 0) path = path.substr(7);
+      // (Stdlib.out_channel -> out_channel, Stdlib.Gc.stat -> Gc.stat) --
+      // UNLESS the file binds its own module Stdlib (all prefixes kept: the
+      // bare name would misattribute to the user's module), or this exact
+      // path's bare name is shadowed by a top-level decl (pervasives_leitmotiv
+      // prints the real fpclass as Stdlib.fpclass).
+      if (path.rfind("Stdlib.", 0) == 0 && !g_keep_stdlib_prefix &&
+          !(g_keep_stdlib_paths && g_keep_stdlib_paths->count(path)))
+        path = path.substr(7);
       // The printf format type is normalised to format6; a 3-parameter one prints
       // as its `format` abbreviation, matching ocamlc.
       if (path == "format6" && t->args.size() == 3) path = "format";

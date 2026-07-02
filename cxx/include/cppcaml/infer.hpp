@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -154,5 +155,13 @@ private:
 
 // Render a type in OCaml-ish syntax (for tests/debugging only).
 std::string show(const TypePtr& t);
+
+// Display controls for files that shadow Stdlib names: when the bool is true,
+// show keeps `Stdlib.` prefixes (a USER module named Stdlib is in scope, so
+// stripping would misattribute its types); the set holds exact constr paths
+// (e.g. "Stdlib.fpclass") whose bare name a top-level decl shadows -- those
+// stay qualified even without a user Stdlib module.
+extern thread_local bool g_keep_stdlib_prefix;
+extern thread_local const std::set<std::string>* g_keep_stdlib_paths;
 
 }  // namespace cppcaml::infer
