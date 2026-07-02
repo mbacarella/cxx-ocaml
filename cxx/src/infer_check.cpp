@@ -3544,7 +3544,14 @@ struct Checker {
       // one arm's `a := float` cannot leak into the next arm's `a := int32`.
       // The kind pass keeps the historical skip (rolled-back bindings would
       // erase value kinds it records).
-      bool window = gadt && !record_kinds_;
+      // The DISPLAY pass needs no window at all: locally-abstract types are
+      // RIGID there, so an arm's equation (`a = float`) is a lenient constr
+      // mismatch that cannot leak -- and full unification lets an arm body's
+      // ORDINARY pins persist (`Buffer.set typ c_buffer` types the captured
+      // buffer; a window rolled those back too -- common.ml's tail).
+      bool display = fold_abbrevs_ && !strict;
+      bool window = gadt && !record_kinds_ && !display;
+      if (display) gadt = false;  // full (lenient) unify, like a plain match
       TypePtr rt = eng.fresh_var();
       // For a windowed (GADT) match, recover the result type when EVERY branch,
       // after its refinement is rolled back, yields the SAME ground type: then
@@ -4387,7 +4394,11 @@ struct Checker {
       // the kind pass (value kinds need the bindings kept).
       bool gadt = false;
       for (auto& c : fc.cases) if (pat_has_gadt_ctor(c.lhs)) gadt = true;
-      bool window = gadt && !record_kinds_;
+      // Display pass: no window -- rigid newtypes make refinements leak-proof
+      // and full unification keeps arm-body pins (see the Pexp_match twin).
+      bool display = fold_abbrevs_ && !strict;
+      bool window = gadt && !record_kinds_ && !display;
+      if (display) gadt = false;
       // Ground recovery (mirrors the Pexp_match window): when every arm,
       // after rollback, yields the SAME ground pattern/result type, that is
       // the genuine scrutinee/result (expand_test's arms all match `test`
