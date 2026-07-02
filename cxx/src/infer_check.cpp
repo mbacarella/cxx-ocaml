@@ -5320,6 +5320,86 @@ struct Checker {
         }
   }
 
+  // Value restriction (Typemod's non-generalizable-escape check): after a whole
+  // structure is typed, an EXPORTED top-level value binding whose expansive RHS
+  // leaves a weak (non-generalizable) type variable in its FINAL type is an error
+  // (`let blurp = f 0` : '_weak -> '_weak, never resolved).  A later use that
+  // pins the variable (`x := [1]`) clears it; a syntactic value generalizes.
+  //
+  // Scan a type for a weak variable in a position OCaml's RELAXED value
+  // restriction cannot generalize.  Relaxed VR generalizes a weak var that
+  // occurs only COVARIANTLY (`'a option`, `'a array list` when non-expansive) --
+  // so those must NOT be flagged.  It does NOT generalize a var reachable through
+  // a contravariant (arrow-domain) or invariant (ref/array) position (`'_weak ->
+  // '_weak`, `'_weak list ref`).  `pol`: +1 covariant, -1 contravariant, 0
+  // invariant.  We only flag a plain Var at pol != +1; we descend UNKNOWN
+  // constructors as covariant-safe (+1) so an unknown-variance user type can
+  // never cause a false reject.  `any` (our incompleteness marker) suppresses.
+  static bool invariant_ctor(const std::string& p) {
+    auto d = p.rfind('.');
+    std::string b = d == std::string::npos ? p : p.substr(d + 1);
+    return b == "ref" || b == "array" || b == "iarray";
+  }
+  static void scan_weak(const TypePtr& t0, int pol, std::set<I::Type*>& seen,
+                        bool& weak, bool& any) {
+    TypePtr t = I::Engine::repr(t0);
+    if (!seen.insert(t.get()).second) return;
+    using K = I::Type::Kind;
+    switch (t->kind) {
+      case K::Any: any = true; return;
+      case K::Var:
+        if (t->level != I::GENERIC_LEVEL && pol != 1) weak = true;
+        return;
+      case K::Arrow:
+        scan_weak(t->dom, pol == 0 ? 0 : -pol, seen, weak, any);  // domain flips
+        scan_weak(t->cod, pol, seen, weak, any);
+        return;
+      case K::Tuple:
+        for (auto& a : t->args) scan_weak(a, pol, seen, weak, any);  // covariant
+        return;
+      case K::Constr: {
+        // ref/array/iarray are invariant; every other (user/covariant) ctor we
+        // descend as covariant-safe (+1) -- sound: never flags a var OCaml might
+        // generalize under an unknown-variance parameter.
+        int cp = invariant_ctor(t->path) ? 0 : 1;
+        for (auto& a : t->args) scan_weak(a, cp, seen, weak, any);
+        return;
+      }
+      case K::Variant:
+      case K::Object:  // rows: never flag the node; descend args covariant-safe
+        for (auto& a : t->args) scan_weak(a, 1, seen, weak, any);
+        return;
+      default:
+        return;
+    }
+  }
+  // Run on a NON-STRICT checker after run_checker (value restriction respected,
+  // so weak vars survive as non-GENERIC; the strict pass force-generalizes and
+  // can't see them).  Returns the error for the first offending top-level
+  // NON-RECURSIVE simple-var binding whose expansive RHS leaves a
+  // non-generalizable weak var, else "".  (let rec generalization is subtler --
+  // `let rec x = let y = [||] in y :: x` is a value -- so those are skipped.)
+  std::string weak_escape_error(const ast::Structure& s) {
+    for (auto& it : s) {
+      auto* sv = std::get_if<Pstr_value>(&it.desc);
+      if (!sv || sv->rf == RecFlag::Recursive) continue;
+      for (auto& b : sv->bindings) {
+        auto* pv = std::get_if<Ppat_var>(&b.pat.desc);
+        if (!pv) continue;                       // simple `let x = e` only
+        if (non_expansive(*b.expr)) continue;    // value: OCaml generalizes it
+        auto f = venv.back().find(pv->name.txt);
+        if (f == venv.back().end()) continue;
+        std::set<I::Type*> seen;
+        bool weak = false, any = false;
+        scan_weak(f->second, 1, seen, weak, any);
+        if (weak && !any)
+          return "The type of this expression contains the non-generalizable "
+                 "type variable(s) (value restriction): " + pv->name.txt;
+      }
+    }
+    return "";
+  }
+
   // Builtins whose inferred type we trust enough to flag against an expected
   // type (constants, arithmetic, comparisons produce these reliably).  Excludes
   // array/list/user types, where our inference is still incomplete.
@@ -6797,6 +6877,13 @@ std::vector<std::string> structure_typecheck(const ast::Structure& s) {
   { UnboundWalk uw; uw.ck = &ck;
     for (auto& it : s) { uw.item(it); if (uw.done()) break; }
     if (uw.done()) ck.errors.push_back("Unbound module " + uw.bad); }
+  // Value restriction: a fresh NON-STRICT pass (respects value restriction, so
+  // weak vars survive) then scan exported top-level bindings for an escaping
+  // non-generalizable variable.  Isolated: reads only its own venv.
+  { Checker vk;
+    run_checker(vk, s);
+    std::string e = vk.weak_escape_error(s);
+    if (!e.empty()) ck.errors.push_back(std::move(e)); }
   return std::move(ck.errors);
 }
 
