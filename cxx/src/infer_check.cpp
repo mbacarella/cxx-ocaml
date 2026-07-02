@@ -213,6 +213,7 @@ struct Checker {
   // so we keep them unknown rather than resolve to the wrong kind.
   std::set<std::string> predef_ctors_;
   std::set<std::string> exn_ctors_;
+  std::set<const void*> ext_rebind_registered_;  // resolved Pext_rebind ctors
   // Exception/typext AST nodes already registered, so the flat `ctors` map isn't
   // re-populated (re-registration would spuriously mark the name ambiguous).  The
   // top-level register_types_rec pass and the per-item process_item path can both
@@ -345,6 +346,10 @@ struct Checker {
   struct FunctorDef { std::string param; const ast::ModuleType* param_sig = nullptr;
                       const ast::ModuleType* result_sig = nullptr; };
   std::unordered_map<std::string, FunctorDef> functor_defs_;
+  // Ascription signature of a top-level `module M : sig .. end = ..`, so an
+  // application of a functor DECLARED IN that signature (`Msg.Define(struct ..)`)
+  // can be instantiated from its declared functor type.
+  std::unordered_map<std::string, const ast::Signature*> module_sig_asts_;
   std::unordered_map<std::string, TypePtr> functor_param_subst_;     // "Elem.t" -> arg type
   std::unordered_map<std::string, TypePtr> functor_result_abstract_; // RS's bare "t" -> fresh var
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
@@ -1017,6 +1022,31 @@ struct Checker {
         std::unordered_map<std::string, TypePtr> vars;
         out[v->vd.name.txt] = from_coretype(*v->vd.type, vars);
       }
+    // A typext in the result sig (`module Define (D : Desc) : sig type 'a tag
+    // += C : D.t tag end`): bind its ctors while the substitutions are live,
+    // so `StrM.C` from `module StrM = Msg.Define(struct type t = string ..
+    // end)` gets `string tag` (msg.ml's write_string pins on it).  Into the
+    // scoped cenv, not the flat map -- the functor BODY's harvest already put
+    // an unsubstituted `C` there, and a second flat registration would only
+    // mark the name ambiguous.
+    for (auto& it : rs->items)
+      if (auto* tx = std::get_if<Psig_typext>(&it.desc))
+        for (auto& ec : tx->ext.ctors)
+          if (auto* d = std::get_if<Pext_decl>(&ec.kind)) {
+            std::unordered_map<std::string, TypePtr> vars;
+            TypePtr result;
+            if (d->res) result = from_coretype(**d->res, vars);
+            else {
+              std::vector<TypePtr> params;
+              for (auto& p : tx->ext.params) params.push_back(from_coretype(*p, vars));
+              result = eng.constr(lid_last(tx->ext.path.txt), params);
+            }
+            TypePtr scheme = result;
+            if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
+              for (auto it2 = tup->elems.rbegin(); it2 != tup->elems.rend(); ++it2)
+                scheme = eng.arrow(from_coretype(**it2, vars), scheme);
+            cenv.back()[ec.name.txt] = scheme;
+          }
     functor_param_subst_ = std::move(saved_subst);
     functor_result_abstract_ = std::move(saved_abstract);
     // Tie the argument's values to the parameter signature's expected types
@@ -1953,8 +1983,24 @@ struct Checker {
   // to the extension's parameters; `type exn += ..` are exceptions.  Typing these
   // lets `perform E`/`E` flow a real type instead of Any (effect return kinds).
   void register_typext(const TypeExtension& te) {
-    if (!ext_ctor_registered_.insert(&te).second) return;
     bool is_exn = lid_last(te.path.txt) == "exn";
+    // A non-exn rebind (`type 'a Msg.tag += String = StrM.C`) shares the target
+    // ctor's scheme under the new name.  Outside the once-guard: the target may
+    // only resolve in the in-order pass (e.g. a functor instance's cenv binding
+    // made after the up-front registration already visited this node).  Into
+    // the scoped cenv (the flat map would just mark the name ambiguous).  Exn
+    // rebinds stay unknown as before (find_ctor skips cenv for exn names).
+    // Non-strict only: the strict pass would resolve the target to a functor
+    // BODY's unsubstituted scheme (D.t) and false-reject its uses.
+    if (!is_exn && !strict)
+      for (auto& ec : te.ctors)
+        if (auto* rb = std::get_if<Pext_rebind>(&ec.kind))
+          if (!ext_rebind_registered_.count(&ec))
+            if (TypePtr* t = find_ctor(lid_last(rb->id.txt))) {
+              ext_rebind_registered_.insert(&ec);
+              cenv.back()[ec.name.txt] = *t;
+            }
+    if (!ext_ctor_registered_.insert(&te).second) return;
     for (auto& ec : te.ctors) {
       auto* d = std::get_if<Pext_decl>(&ec.kind);
       if (!d) continue;  // Pext_rebind (`+= C = M.C`): leave unknown
@@ -4268,9 +4314,48 @@ struct Checker {
           if (!restricted.empty()) {
             for (auto& [k, v] : restricted)
               if (auto f = inner.find(k); f != inner.end()) v = f->second;
-            return restricted;
+            inner = std::move(restricted);
           }
         }
+        // An ascribed val takes the SIGNATURE's declared type, which is what
+        // ocamlc reports at every outside use (`val write : 'a tag -> 'a ->
+        // unit` wins over the struct body's raise-typed `.. -> 'b`; msg.ml).
+        // Bare constrs naming the ascription's own types are qualified by the
+        // binding (`t` -> `Msg.t`) to match the struct-inferred paths.  A
+        // translation containing Any (an untranslated corner) keeps the
+        // struct-inferred type.  Non-strict only.
+        if (!strict)
+          if (auto* sg = std::get_if<Pmty_signature>(&mc->mt->desc)) {
+            std::set<std::string> own;
+            for (auto& sit : sg->items)
+              if (auto* pt = std::get_if<Psig_type>(&sit.desc))
+                for (auto& d : pt->decls) own.insert(d.name.txt);
+            // qualify own-type constrs; report whether any Any was seen
+            std::function<bool(const TypePtr&, std::set<const I::Type*>&)> qual =
+                [&](const TypePtr& t0, std::set<const I::Type*>& seen) -> bool {
+              TypePtr t = I::Engine::repr(t0);
+              if (!t || !seen.insert(t.get()).second) return true;
+              if (t->kind == I::Type::Kind::Any) return false;
+              if (t->kind == I::Type::Kind::Constr &&
+                  t->path.find('.') == std::string::npos && own.count(t->path) &&
+                  !func_bind_name_.empty())
+                t->path = func_bind_name_ + "." + t->path;
+              bool ok = true;
+              if (t->dom) ok &= qual(t->dom, seen);
+              if (t->cod) ok &= qual(t->cod, seen);
+              for (auto& a : t->args) ok &= qual(a, seen);
+              for (auto& a : t->abbrev_args) ok &= qual(a, seen);
+              for (auto& a : t->inherited) ok &= qual(a, seen);
+              return ok;
+            };
+            for (auto& sit : sg->items)
+              if (auto* pv = std::get_if<Psig_value>(&sit.desc)) {
+                std::unordered_map<std::string, TypePtr> vars;
+                TypePtr t = from_coretype(*pv->vd.type, vars);
+                std::set<const I::Type*> seen;
+                if (t && qual(t, seen)) inner[pv->vd.name.txt] = t;
+              }
+          }
         return inner;
       }
       return modtype_values(*mc->mt);  // e.g. `(val e : S)` parsed as a constraint
@@ -4306,6 +4391,28 @@ struct Checker {
                 auto r = instantiate_local_functor(fd->second, *ap->arg);
                 if (!r.empty()) return r;
               }
+            // `Msg.Define(struct ..)`: a functor DECLARED in a local module's
+            // ascription signature.  Build its FunctorDef from the declared
+            // functor type and instantiate (this also registers the result
+            // sig's typext ctors with the parameter substituted -- msg.ml).
+            if (comps.size() == 2)
+              if (auto ms = module_sig_asts_.find(comps[0]); ms != module_sig_asts_.end())
+                for (auto& sit : *ms->second)
+                  if (auto* pm = std::get_if<Psig_module>(&sit.desc))
+                    if (pm->md.name.txt && *pm->md.name.txt == comps[1])
+                      if (auto* mf = std::get_if<Pmty_functor>(&pm->md.type->desc)) {
+                        FunctorDef fd;
+                        if (auto* fn = std::get_if<Functor_named>(&mf->param)) {
+                          if (fn->name.txt) fd.param = *fn->name.txt;
+                          fd.param_sig = fn->type.get();
+                        }
+                        if (std::holds_alternative<Pmty_signature>(mf->body->desc))
+                          fd.result_sig = mf->body.get();
+                        if (!fd.param.empty() && fd.result_sig) {
+                          auto r = instantiate_local_functor(fd, *ap->arg);
+                          if (!r.empty()) return r;
+                        }
+                      }
           }
         return functor_result_values(fi->id.txt, napp);
       }
@@ -4449,6 +4556,11 @@ struct Checker {
           if (mb->binding.name.txt) {
             // A functor: record its body's exports as the application result.
             const ModuleExpr* me = &mb->binding.expr;
+            // `module M : sig .. end = ..`: keep the ascription signature so a
+            // functor DECLARED in it (`Msg.Define`) can later be instantiated.
+            if (auto* mc0 = std::get_if<Pmod_constraint>(&me->desc))
+              if (auto* sg0 = std::get_if<Pmty_signature>(&mc0->mt->desc))
+                module_sig_asts_[*mb->binding.name.txt] = &sg0->items;
             while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
             if (std::holds_alternative<Pmod_functor>(me->desc)) {
               // Record a single-parameter functor with an explicit result
