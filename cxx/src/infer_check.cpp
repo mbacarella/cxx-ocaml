@@ -444,6 +444,9 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
+  // Class CONSTRUCTOR schemes (`new c` for a class with params): the arrow
+  // over the constructor's value params to the class's object type (mixin2).
+  std::unordered_map<std::string, TypePtr> class_ctor_types_;
   // `class type ['a,'b] ops = object method m : T .. end`: params + the
   // signature AST, so a `(T1,T2) #ops` annotation can build the object row
   // with params substituted (mixin3's self coercions).
@@ -3931,10 +3934,16 @@ struct Checker {
       return eng.any();  // unconstrained pack: type unknown without the sig
     }
     if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {
-      // `new c` for a parameterless local class is its object type.
-      if (!strict)
+      // `new c` for a parameterless local class is its object type; a class
+      // with constructor params is the constructor arrow (mixin2's
+      // `lazy_fix (new lambda_ops)`).
+      if (!strict) {
         if (auto it = class_types_.find(lid_last(nw->id.txt)); it != class_types_.end())
           return eng.instantiate(it->second);
+        if (auto it = class_ctor_types_.find(lid_last(nw->id.txt));
+            it != class_ctor_types_.end())
+          return eng.instantiate(it->second);
+      }
       return eng.any();
     }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
@@ -4510,7 +4519,9 @@ struct Checker {
   // methods only -- inherited/virtual methods would need the full class model).
   TypePtr infer_object_body(const ast::ClassStructure& cs,
                          const std::vector<const ast::Pcl_fun*>* cl_params = nullptr,
-                         const std::vector<const ast::Pcl_let*>* cl_lets = nullptr) {
+                         const std::vector<const ast::Pcl_let*>* cl_lets = nullptr,
+                         std::unordered_map<std::string, TypePtr>* cvars = nullptr,
+                         std::vector<TypePtr>* param_tys = nullptr) {
     std::vector<std::string> mnames;
     std::vector<TypePtr> mtypes;
     venv.emplace_back();
@@ -4521,7 +4532,14 @@ struct Checker {
       for (auto* pf : *cl_params) {
         TypePtr pt = infer_pat(pf->pat);
         if (pf->default_) try_unify(pt, infer_expr(**pf->default_));
+        if (param_tys) param_tys->push_back(pt);
       }
+    // `constraint 'a = [> 'a lambda]` fields pin the class's type params
+    // (translated under the CLASS vars map, so 'a is the declared param).
+    if (cvars)
+      for (auto& f : cs.fields)
+        if (auto* ct = std::get_if<Pcf_constraint>(&f.desc))
+          soft_unify(from_coretype(*ct->t1, *cvars), from_coretype(*ct->t2, *cvars));
     // `class c = let .. in object`: the local bindings, before the fields.
     if (cl_lets) for (auto* lg : *cl_lets) infer_bindings(lg->rf, lg->bindings);
     // Pre-create a type variable per concrete method and bind `self` to the
@@ -4554,7 +4572,8 @@ struct Checker {
       }
       if (sct) {
         std::unordered_map<std::string, TypePtr> avars;
-        TypePtr at = I::Engine::repr(from_coretype(*sct, avars));
+        TypePtr at = I::Engine::repr(
+            from_coretype(*sct, cvars ? *cvars : avars));
         if (at->kind == I::Type::Kind::Object) {
           self_annot = at;
           soft_unify(selfTy, at);  // ties each method var to its declared type
@@ -5710,11 +5729,44 @@ struct Checker {
                 } else break;
               }
               if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
+                // The class's TYPE params (`class ['a] lambda_ops`) scope over
+                // the body's annotations and `constraint` fields; the object
+                // then carries the CLASS name (`'a lambda_ops`), and `new c`
+                // gets the constructor arrow over the value params (mixin2).
+                eng.enter_level();  // the ctor scheme generalizes like a let
+                std::unordered_map<std::string, TypePtr> cvars;
+                std::vector<TypePtr> tparams;
+                for (auto& p : d.params) {
+                  TypePtr v = eng.fresh_var();
+                  if (auto* pv2 = std::get_if<Ptyp_var>(&p->desc))
+                    cvars[pv2->name] = v;
+                  tparams.push_back(v);
+                }
+                std::vector<TypePtr> ptys;
                 TypePtr ot = infer_object_body(ps->cs, params.empty() ? nullptr : &params,
-                                               lets.empty() ? nullptr : &lets);
+                                               lets.empty() ? nullptr : &lets,
+                                               d.params.empty() ? nullptr : &cvars,
+                                               &ptys);
+                eng.leave_level();
                 // A parameterless class: `new c` is its object type.  Generalise
                 // so each `new c` instantiates fresh.
-                if (params.empty()) { eng.generalize(ot); class_types_[d.name.txt] = ot; }
+                if (params.empty() && d.params.empty()) {
+                  eng.generalize(ot);
+                  class_types_[d.name.txt] = ot;
+                } else if (!strict) {
+                  TypePtr obj = I::Engine::repr(ot);
+                  if (obj->kind == I::Type::Kind::Object && !d.params.empty()) {
+                    obj->abbrev = d.name.txt;
+                    obj->abbrev_args = tparams;
+                  }
+                  TypePtr ctor = ot;
+                  for (size_t i = ptys.size(); i-- > 0;) {
+                    auto [lk, nm] = arglabel(params[i]->label);
+                    ctor = eng.arrow(ptys[i], ctor, lk, nm);
+                  }
+                  eng.generalize(ctor);
+                  class_ctor_types_[d.name.txt] = ctor;
+                }
               }
             }
         } else if (auto* pct = std::get_if<Pstr_class_type>(&it.desc)) {

@@ -368,18 +368,26 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     // (`('a,'a) #ops` against a `(row, row lambda) ops` value -- mixin3's
     // lazy_fix), and converge on ONE node preferring the CLOSED side
     // (variant_kind 0) so the display shows `(..) ops`, not `(..) #ops`.
-    if (!a->abbrev.empty() && a->abbrev == b->abbrev &&
-        a->abbrev_args.size() == b->abbrev_args.size()) {
-      const TypePtr& keep = (a->variant_kind == 1 && b->variant_kind != 1) ? b : a;
-      const TypePtr& drop = keep == a ? b : a;
-      keep->from_inherit = keep->from_inherit || drop->from_inherit;
-      std::vector<TypePtr> da = drop->abbrev_args, ka = keep->abbrev_args;
-      if (drop->level != GENERIC_LEVEL) {  // a SCHEME node never links away
-        note(drop);
-        drop->kind = Type::Kind::Link;  // link FIRST: an arg reaching back into
-        drop->link = keep;              // drop resolves to keep, not a loop
+    // DIFFERENT class names converge too when one side is a #-SUBTYPE
+    // annotation (open): the concrete class wins the display (mixin2's
+    // `new lambda_ops` against lazy_fix's `('a,'a) #ops` -> `'a lambda_ops`)
+    // -- their params are NOT tied (different classes' params don't align).
+    if (!a->abbrev.empty() && !b->abbrev.empty()) {
+      bool same = a->abbrev == b->abbrev &&
+                  a->abbrev_args.size() == b->abbrev_args.size();
+      if (same || a->variant_kind == 1 || b->variant_kind == 1) {
+        const TypePtr& keep = (a->variant_kind == 1 && b->variant_kind != 1) ? b : a;
+        const TypePtr& drop = keep == a ? b : a;
+        keep->from_inherit = keep->from_inherit || drop->from_inherit;
+        std::vector<TypePtr> da = drop->abbrev_args, ka = keep->abbrev_args;
+        if (drop->level != GENERIC_LEVEL) {  // a SCHEME node never links away
+          note(drop);
+          drop->kind = Type::Kind::Link;  // link FIRST: an arg reaching back
+          drop->link = keep;              // into drop resolves to keep
+        }
+        if (same)
+          for (size_t i = 0; i < da.size(); ++i) unify(da[i], ka[i]);
       }
-      for (size_t i = 0; i < da.size(); ++i) unify(da[i], ka[i]);
     }
     return;
   }
