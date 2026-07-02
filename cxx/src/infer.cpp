@@ -1,6 +1,7 @@
 #include "cppcaml/infer.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
@@ -112,6 +113,27 @@ TypePtr Engine::repr(TypePtr t) {
   return t;
 }
 
+// Primitive/abbreviation families (see the unify rule): the primitive path a
+// construction carries, and the stdlib abbreviation heads that expand to it.
+// family_prim_of: is this path one of the family primitives?
+static const char* family_prim_of(const std::string& p) {
+  if (p == "lazy_t") return "lazy_t";
+  if (p == "string") return "string";
+  if (p == "bytes") return "bytes";
+  return nullptr;
+}
+// family_abbr_of: is this path `M.t` for a module M abbreviating a primitive?
+static const char* family_abbr_of(const std::string& p) {
+  if (p.size() < 3 || p.compare(p.size() - 2, 2, ".t") != 0) return nullptr;
+  std::string head = p.substr(0, p.size() - 2);
+  if (head.rfind("Stdlib__", 0) == 0) head = head.substr(8);
+  else if (head.rfind("Stdlib.", 0) == 0) head = head.substr(7);
+  if (head == "Lazy" || head == "CamlinternalLazy") return "lazy_t";
+  if (head == "String" || head == "StringLabels") return "string";
+  if (head == "Bytes" || head == "BytesLabels") return "bytes";
+  return nullptr;
+}
+
 // Occurs-check (a var must not appear in the type it's unified with) plus the
 // level-lowering that keeps generalization sound: every var reachable from t has
 // its level capped at the bound var's level.
@@ -219,30 +241,31 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       if (lenient) return;
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     }
-    // The lazy family: `lazy_t` (the primitive, what a `lazy e` construction
-    // carries) and its abbreviations `Lazy.t` / `CamlinternalLazy.t`.  They
-    // unify, and -- matching ocamlc's unify3 link of the expanded heads -- the
-    // PRIMITIVE-pathed node adopts the abbreviation-pathed one, so a
-    // construction that flows into a `Lazy.t` context DURING inference displays
-    // `Lazy.t` (hamming), while finalized bindings are protected by the
-    // generic-level fresh copy in instantiate (lazy7 stays `lazy_t`).
-    auto lazy_prim = [&](const TypePtr& t) { return t->path == "lazy_t"; };
-    auto lazy_abbr = [&](const TypePtr& t) {
-      if (last(t->path) != "t") return false;
-      std::string head = t->path.substr(0, t->path.size() - 2);  // drop ".t"
-      if (head.rfind("Stdlib__", 0) == 0) head = head.substr(8);
-      else if (head.rfind("Stdlib.", 0) == 0) head = head.substr(7);
-      return head == "Lazy" || head == "CamlinternalLazy";
-    };
-    if (a->args.size() == 1 && b->args.size() == 1 &&
-        ((lazy_prim(a) && lazy_abbr(b)) || (lazy_abbr(a) && lazy_prim(b)))) {
-      const TypePtr& prim = lazy_prim(a) ? a : b;
-      const TypePtr& abbr = lazy_prim(a) ? b : a;
-      unify(prim->args[0], abbr->args[0]);
-      note(prim);
-      prim->kind = Type::Kind::Link;
-      prim->link = abbr;
-      return;
+    // Primitive/abbreviation FAMILIES: a primitive (`lazy_t`, `string`,
+    // `bytes` -- what constructions and format literals carry) and its stdlib
+    // abbreviation (`Lazy.t`, `String.t`, ...).  They unify, and -- matching
+    // ocamlc's unify3 link of the expanded heads -- the PRIMITIVE-pathed node
+    // adopts the abbreviation-pathed one, so a value that flows into an
+    // abbreviation-typed context DURING inference displays the abbreviation
+    // (hamming's `Lazy.t`, qsort's `%s`-then-String.compare params), while
+    // finalized bindings are protected by the generic-level fresh head copy in
+    // instantiate (`let l = lazy 1` / `let s = "x"` keep lazy_t / string).
+    // Stamped (local, possibly shadowing) types are excluded.
+    if (!a->stamp && !b->stamp && a->args.size() == b->args.size()) {
+      const char* pa = family_prim_of(a->path);
+      const char* aa = family_abbr_of(a->path);
+      const char* pb = family_prim_of(b->path);
+      const char* ab = family_abbr_of(b->path);
+      if ((pa && ab && !strcmp(pa, ab)) || (aa && pb && !strcmp(aa, pb))) {
+        const TypePtr& prim = pa ? a : b;
+        const TypePtr& abbr = pa ? b : a;
+        for (size_t i = 0; i < prim->args.size(); ++i)
+          unify(prim->args[i], abbr->args[i]);
+        note(prim);
+        prim->kind = Type::Kind::Link;
+        prim->link = abbr;
+        return;
+      }
     }
     if (last(a->path) != last(b->path) || a->args.size() != b->args.size()) {
       if (lenient) return;
@@ -499,7 +522,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         // node per use, so unify's lazy-family relink hits the copy, never the
         // binding's displayed node (args still shared -- constraints flow).
         bool lazy_head = t->kind == Type::Kind::Constr &&
-                         t->level == GENERIC_LEVEL && t->path == "lazy_t";
+                         t->level == GENERIC_LEVEL && family_prim_of(t->path);
         TypePtr r;
         if (!changed && !weak_copy && !lazy_head) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
@@ -569,7 +592,7 @@ void Engine::generalize(const TypePtr& t0) {
         // the COPY, not the binding's displayed node (ocamlc: `let l = lazy 1`
         // stays `lazy_t` after later uses; only a same-rec-group flow -- where
         // the node is still unstamped and shared -- adopts `Lazy.t`, hamming).
-        if (t->path == "lazy_t") t->level = GENERIC_LEVEL;
+        if (family_prim_of(t->path)) t->level = GENERIC_LEVEL;
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -614,7 +637,7 @@ void Engine::demote(const TypePtr& t0) {
       case Type::Kind::Constr:
         // Weak bindings are FINALIZED too: stamp the lazy head (see generalize)
         // so a later use can't relink the binding's displayed node.
-        if (t->path == "lazy_t") { note(t); t->level = GENERIC_LEVEL; }
+        if (family_prim_of(t->path)) { note(t); t->level = GENERIC_LEVEL; }
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
