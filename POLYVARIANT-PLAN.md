@@ -1168,6 +1168,55 @@ precision — TWO fixes), pervasives_leitmotiv (Stdlib/2 shadow), apply
 possibly nearer now that package constrs carry args), Tests.ml/cast
 (object rows).
 
+## SESSION 2026-07-02 (x): five more flips + one negative result (+5, sig 97.5%)
+
+Six commits, all gated (reject 0.0%, lambda 54.2% flat, 0 crashes / 1853,
+exact match-set deltas):
+
+1. **pr6954 (+1)** — `infer: phantom constrained abbreviations solve their
+   constraints`.  A bare-variable-manifest abbreviation (`type 'a arg_t =
+   'at constraint 'a = (module Y.S with type t = 'at)`) expands in the
+   folded pass and SOLVES its constraints (sides translated under one
+   substitution, already-folded alias args expanded one level).  Enabled by
+   (w)'s package args; package constrs returned to last-component unify
+   compatibility (constr unify never links, so displays keep written paths).
+2. **apply (+1)** — `infer: optional-arg erasure changes the USE-SITE type
+   in the sig pass`.  The (h)-deferred %apply item, de-risked by scoping to
+   the display pass: infer_expr_expected returns a REBUILT arrow with
+   optionals dropped when the expected shape demands non-optional params.
+3. **testerror (+1)** — `infer: folded cmi abbreviations expand in lenient
+   cross-kind unify`.  Engine abbrev_resolver callback: Constr-vs-composite
+   lenient mismatch retries against the path's cmi manifest.  The documented
+   "abbrev-expansion-in-unify" blocker, scoped to manifest-carrying decls.
+4. **tscanf2_io + gen_test (+2)** — `infer: scanf receivers + opened module
+   aliases`.  The resolver generalized to PARAMETERIZED abbreviations
+   (Scanf.scanner expands to its format6 arrow at the application), plus the
+   probed literal rule: a format6 literal ties slots 3=4 (`"%S\n" : (string
+   -> 'a, 'b, 'c, 'd, 'd, 'a) format6`) — through scanner's slot4 the
+   receiver applies.  `open StdLabels` records cmi module ALIASES so bare
+   `List.map xs ~f` resolves to ListLabels' labelled map.
+5. **0-flip hardening** — function-cases ground recovery (both sides) +
+   module-nested type display qualification (stamp_path_/display_path, with
+   include-suppression and top-level-alias priority — both scope guards
+   caught by the diff-set gate).  common.ml 6 -> 4 diff lines.
+
+**NEGATIVE RESULT — split GADT window (tried, reverted):** rolling the
+pattern refinement back before the arm body (so body side effects like
+exec's `Buffer.set typ c_buffer` persist) types bodies under an un-refined
+pattern and leaks wrong bindings (-4/+1 corpus-wide: pr6216, includestruct,
+measure_runtime_arity, core_array regressed).  The remaining common.ml
+lines AND the effects pair (test2, frame-pointers) both need
+refinement-scoped windows — equation-level scoping (a rigid-newtype model),
+not trail-level rollback.  That is now THE identified substrate for the
+effects cluster; a dedicated project.
+
+**Baseline now: sig 512/525 (97.5%), reject 0.0%, lambda 54.2%, 0 crashes.**
+
+Remaining 13: mixin×3 (rows+classes), effects-equation cluster (test2,
+frame-pointers, issue479, common's tail — rigid newtypes), local-functor
+bodies (shallow2deep, sets), objects (Tests.ml, cast), Stdlib/2 shadow
+(pervasives_leitmotiv), test_generator (Pos.t labelled-arg adoption).
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
