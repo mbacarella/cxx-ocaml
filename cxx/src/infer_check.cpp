@@ -3106,6 +3106,36 @@ struct Checker {
         for (bool none_slot : slots)
           if (!none_slot) { erasures_[&e] = slots; break; }
     }
+    // SIGNATURE pass: the erasure also changes the value's TYPE at this use --
+    // `bump @@ x` (bump : ?cap:int -> int -> int, %apply expects 'a -> 'b)
+    // views bump as `int -> int`, so _f : int -> int (ocamlc's type_argument).
+    // Rebuilt (never mutated): bump's own scheme keeps its optional.  Only
+    // where the EXPECTED type is an arrow at the erased position -- an
+    // unknown/var expectation keeps the full type.  Strict and kinds passes
+    // keep today's behavior (soft propagation / erasures_ recording).
+    if (!strict && !record_kinds_) {
+      struct Kept { TypePtr dom; int lk; std::string nm; };
+      std::vector<Kept> keep;
+      bool erased = false;
+      TypePtr a = I::Engine::repr(t), ex = I::Engine::repr(expected);
+      while (a->kind == I::Type::Kind::Arrow && ex->kind == I::Type::Kind::Arrow) {
+        if (a->arrow_label == 2 &&
+            !(ex->arrow_label == 2 && ex->arrow_lbl == a->arrow_lbl)) {
+          erased = true;
+          a = I::Engine::repr(a->cod);
+          continue;
+        }
+        keep.push_back({a->dom, a->arrow_label, a->arrow_lbl});
+        a = I::Engine::repr(a->cod);
+        ex = I::Engine::repr(ex->cod);
+      }
+      if (erased) {
+        TypePtr r = a;
+        for (auto it = keep.rbegin(); it != keep.rend(); ++it)
+          r = eng.arrow(it->dom, r, it->lk, it->nm);
+        return r;
+      }
+    }
     return t;
   }
 
