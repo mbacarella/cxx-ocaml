@@ -179,6 +179,35 @@ struct Checker {
   // signature emitter rewrites the target prefix back to the alias.  Display-only
   // (same last path component, so unification is untouched).
   std::vector<std::pair<std::string, std::string>> module_aliases_;
+  // Expression-local modules (`let module N = Map.Make(S) in ..`) whose name
+  // escapes into an emitted signature: the local name is out of scope there, so
+  // ocamlc prints the module's DEFINITION path with arguments resolved through
+  // local aliases (`int Map.Make(String).t`, pr6944).  name -> resolved path;
+  // "" = unresolvable or conflictingly rebound (don't rewrite).  The signature
+  // emitter skips names also bound by a top-level module (those stay in scope).
+  std::unordered_map<std::string, std::string> local_module_paths_;
+  // The definition path of a local module expr: an ident (head resolved through
+  // earlier local bindings) or a functor application F(A) of such.
+  std::string resolve_local_module_path(const ModuleExpr& me0) {
+    const ModuleExpr* me = &me0;
+    while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
+    if (auto* pi = std::get_if<Pmod_ident>(&me->desc)) {
+      std::string p = lid_full(pi->id.txt);
+      size_t dot = p.find('.');
+      std::string head = p.substr(0, dot == std::string::npos ? p.size() : dot);
+      if (auto f = local_module_paths_.find(head); f != local_module_paths_.end())
+        return f->second.empty()
+                   ? ""
+                   : f->second + (dot == std::string::npos ? "" : p.substr(dot));
+      return p;
+    }
+    if (auto* ap = std::get_if<Pmod_apply>(&me->desc)) {
+      std::string f = resolve_local_module_path(*ap->f);
+      std::string a = resolve_local_module_path(*ap->arg);
+      return (f.empty() || a.empty()) ? "" : f + "(" + a + ")";
+    }
+    return "";
+  }
   // names that are also predefined or exception constructors: when one of these
   // is reused by a variant, OCaml disambiguates by expected type (which we lack),
   // so we keep them unknown rather than resolve to the wrong kind.
@@ -3353,6 +3382,12 @@ struct Checker {
         // struct's GADT markers so a match on its ctors is windowed.
         if (auto* ms = std::get_if<Pmod_structure>(&op->expr.desc))
           register_local_gadt_markers(ms->items);
+      } else if (auto* lm = std::get_if<Pstr_module>(&sti->item->desc)) {
+        if (lm->binding.name.txt && !strict) {
+          std::string p = resolve_local_module_path(lm->binding.expr);
+          auto [f, inserted] = local_module_paths_.emplace(*lm->binding.name.txt, p);
+          if (!inserted && f->second != p) f->second = "";  // conflicting rebind
+        }
       }
       process_item(*sti->item);
       TypePtr bt = infer_expr(*sti->body);
@@ -5337,10 +5372,33 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
     }
     return s;
   };
+  // An expression-local module name escaping into a signature prints as its
+  // definition path (`let module N = Map.Make(S) in .. : int N.t` -> ocamlc's
+  // `int Map.Make(String).t`).  A name also bound by a top-level module stays
+  // in scope at the signature, so it is NOT rewritten.  Path-boundary-checked
+  // (a match must start a path: not preceded by an identifier char or '.').
+  std::set<std::string> toplevel_mods;
+  for (auto& it : s)
+    if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+      if (mb->binding.name.txt) toplevel_mods.insert(*mb->binding.name.txt);
+  auto apply_local_mods = [&](std::string str) {
+    for (auto& [nm, path] : ck.local_module_paths_) {
+      if (path.empty() || toplevel_mods.count(nm)) continue;
+      std::string from = nm + ".", to = path + ".";
+      for (size_t p = 0; (p = str.find(from, p)) != std::string::npos;) {
+        char b = p ? str[p - 1] : ' ';
+        if (isalnum((unsigned char)b) || b == '_' || b == '\'' || b == '.') { ++p; continue; }
+        str.replace(p, from.size(), to);
+        p += to.size();
+      }
+    }
+    return str;
+  };
   std::vector<std::pair<std::string, std::string>> all;
   auto emit = [&](const std::string& nm) {
     auto f = ck.venv.back().find(nm);
-    if (f != ck.venv.back().end()) all.emplace_back(nm, apply_aliases(I::show(f->second)));
+    if (f != ck.venv.back().end())
+      all.emplace_back(nm, apply_aliases(apply_local_mods(I::show(f->second))));
   };
   // Resolve `include M` to the included structure (a local struct, directly or
   // via a local module binding), so we can emit its flattened value names too --
