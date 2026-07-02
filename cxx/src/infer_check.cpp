@@ -2340,6 +2340,24 @@ struct Checker {
     return t;
   }
 
+  // A `#t` pattern's row: t must be an abbreviation of a poly-variant row
+  // (`type rte = [ `A of .. | `B ]`); the pattern means "any of t's tags", i.e.
+  // the UPPER bound `[< tags-with-declared-args ]`.  Builds a fresh row instance
+  // per call (each gets vk=1); returns null when t isn't a known variant
+  // abbreviation.  Non-strict only (rows are a non-strict feature).
+  TypePtr hash_type_row(const ast::Longident& id) {
+    if (strict) return nullptr;
+    auto ai = type_aliases.find(lid_last(id));
+    if (ai == type_aliases.end() || !ai->second.manifest) return nullptr;
+    if (!std::holds_alternative<Ptyp_variant>(ai->second.manifest->desc)) return nullptr;
+    std::unordered_map<std::string, TypePtr> vars;
+    TypePtr row = from_coretype(*ai->second.manifest, vars);
+    row = I::Engine::repr(row);
+    if (row->kind != I::Type::Kind::Variant) return nullptr;
+    row->variant_kind = 1;  // `#t` bounds ABOVE: `[<`, not the exact `[ .. ]`
+    return row;
+  }
+
   // typecore.ml build_as_type: the variable bound by `pat as x` does not get the
   // scrutinee's type but one REBUILT from the pattern -- a constructor pattern
   // yields a fresh instance of the constructor's result type (argument slots
@@ -2380,6 +2398,23 @@ struct Checker {
       TypePtr lt = build_as_type(*o->l, tys), rt = build_as_type(*o->r, tys);
       soft_unify(lt, rt);
       return lt;
+    }
+    // A poly-variant pattern rebuilds as a FRESH OPEN row `[> tag [of t]]`
+    // (typecore build_as_type Tpat_variant): the alias-bound var is then a
+    // DIFFERENT row from the matched `[<` scrutinee, so `| `Nil | `Cons _ as x
+    // -> `A x` gives `[< `Cons|`Nil|`Snoc..] -> [> `A of [> `Cons|`Nil ] ..]`
+    // (input and output rows independent), not one shared `as 'c` row.  The tag
+    // ARG is shared with the scrutinee row's (fallback -> the inferred node).
+    if (auto* pv = std::get_if<Ppat_variant>(&p.desc)) {
+      if (strict) return fallback();
+      TypePtr at = pv->arg ? build_as_type(**pv->arg, tys) : eng.fresh_var();
+      return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)}, 0);
+    }
+    // `#t as x`: x gets its own fresh `[<` row instance of the abbreviation
+    // (independent of the scrutinee row's tag set).
+    if (auto* pt = std::get_if<Ppat_type>(&p.desc)) {
+      if (TypePtr row = hash_type_row(pt->id.txt)) return row;
+      return fallback();
     }
     return fallback();
   }
@@ -2554,6 +2589,14 @@ struct Checker {
       TypePtr at = pv->arg ? infer_pat(**pv->arg) : eng.fresh_var();
       if (strict) return eng.fresh_var();
       return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)}, 1);
+    }
+    // `#t`: matches any of the variant abbreviation t's tags -> the row
+    // `[< t's tags-with-declared-args ]` (so a scrutinee arm-merge unions the
+    // tags AND ties the shared tags' args to the DECLARED types, e.g. maf's
+    // `#recurs_type_expr` gives `` `TConstr of type_expr list ``, not a var).
+    if (auto* ht = std::get_if<Ppat_type>(&p.desc)) {
+      if (TypePtr row = hash_type_row(ht->id.txt)) return row;
+      return eng.fresh_var();
     }
     if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) {
       infer_pat(*ex->p);  // binds vars; matches an exn, independent of scrutinee
