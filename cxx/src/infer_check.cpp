@@ -444,6 +444,14 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
+  // `class type ['a,'b] ops = object method m : T .. end`: params + the
+  // signature AST, so a `(T1,T2) #ops` annotation can build the object row
+  // with params substituted (mixin3's self coercions).
+  struct ClassTypeInfo {
+    std::vector<std::string> params;  // "" for a non-var param
+    const ast::ClassSignature* sig = nullptr;
+  };
+  std::unordered_map<std::string, ClassTypeInfo> classtype_decls_;
   // True while from_coretype expands a local decl's MANIFEST (variant alias
   // fold / `#t` rows): its internal constrs are expansion nodes, not
   // source-written -- they stay adoptable (no family-head finalization).
@@ -706,6 +714,51 @@ struct Checker {
       // bound, kept unexpanded for display).  Non-strict only.
       bool simple = !pvr->rows.empty();
       if (!strict && simple) {
+        // A SINGLE inherit of a known local variant alias (`[> 'a lambda]`)
+        // is that abbreviation's expansion at the written bound: tags come
+        // from the alias (so merges union tag-wise and keep the covering
+        // name), from_inherit marks the `[ | 'a lambda ]` display form for
+        // an exact fixpoint (mixin2/mixin3).
+        if (fold_abbrevs_ && pvr->rows.size() == 1)
+          if (auto* ri0 = std::get_if<Rinherit>(&pvr->rows[0])) {
+            TypePtr ex = I::Engine::repr(from_coretype(*ri0->ct, vars));
+            if (ex->kind == I::Type::Kind::Variant && !ex->abbrev.empty()) {
+              ex->variant_kind =
+                  pvr->closed == ClosedFlag::Open ? 0 : (pvr->labels ? 1 : 2);
+              ex->from_inherit = true;
+              return ex;
+            }
+          }
+        // ALL-inherit rows of known variant aliases (`[ 'a lambda | 'a expr ]`
+        // -- lexpr's manifest): expand to the TAG UNION under one vars map, so
+        // a use ties the shared param through the tags (`#lambda as x` in
+        // lexpr_ops reaches lexpr's 'a).  A shared tag's args unify.
+        if (fold_abbrevs_ && pvr->rows.size() > 1) {
+          bool all_inh = true;
+          std::vector<TypePtr> exps;
+          for (auto& r : pvr->rows) {
+            auto* ri = std::get_if<Rinherit>(&r);
+            if (!ri) { all_inh = false; break; }
+            TypePtr ex = I::Engine::repr(from_coretype(*ri->ct, vars));
+            if (ex->kind != I::Type::Kind::Variant || ex->labels.empty()) {
+              all_inh = false;
+              break;
+            }
+            exps.push_back(ex);
+          }
+          if (all_inh) {
+            std::vector<std::string> ut; std::vector<TypePtr> ua; std::vector<char> uh;
+            for (auto& ex : exps)
+              for (size_t i = 0; i < ex->labels.size(); ++i) {
+                size_t k = 0;
+                for (; k < ut.size(); ++k) if (ut[k] == ex->labels[i]) break;
+                if (k < ut.size()) soft_unify(ua[k], ex->args[i]);
+                else { ut.push_back(ex->labels[i]); ua.push_back(ex->args[i]); uh.push_back(ex->tag_has_arg[i]); }
+              }
+            int uvk = pvr->closed == ClosedFlag::Open ? 0 : (pvr->labels ? 1 : 2);
+            return eng.variant_type(std::move(ut), std::move(ua), std::move(uh), uvk);
+          }
+        }
         std::vector<std::string> tags; std::vector<TypePtr> ats; std::vector<char> has;
         std::vector<TypePtr> inh;
         for (auto& r : pvr->rows) {
@@ -734,13 +787,36 @@ struct Checker {
       }
       if (all_const) return eng.constr("int");
     }
-    // `#castable` (a class-subtype annotation): display-faithful opaque constr
-    // in the non-strict passes -- unify treats an unknown path leniently, and
-    // the signature shows `#castable` like ocamlc.  Strict stays a fresh var.
+    // `(T1,T2) #ops` (a class-subtype annotation): when ops is a KNOWN local
+    // class type, build the OPEN object row from its signature with params
+    // substituted (abbrev carries the name for display: open prints
+    // `(..) #ops`, a closed object value `(..) ops` -- mixin3).  An unknown
+    // class stays the display-faithful opaque constr (`#castable`); the
+    // strict pass keeps a fresh var.
     if (auto* cl = std::get_if<Ptyp_class>(&t.desc)) {
       if (!strict) {
         std::vector<TypePtr> as;
         for (auto& a : cl->args) as.push_back(from_coretype(*a, vars));
+        auto cti = classtype_decls_.find(lid_last(cl->id.txt));
+        if (cti != classtype_decls_.end() && cti->second.sig &&
+            cti->second.params.size() == as.size()) {
+          std::unordered_map<std::string, TypePtr> sub;
+          for (size_t i = 0; i < as.size(); ++i)
+            if (!cti->second.params[i].empty()) sub[cti->second.params[i]] = as[i];
+          std::vector<std::string> mnames;
+          std::vector<TypePtr> mtypes;
+          for (auto& f : cti->second.sig->fields)
+            if (auto* m = std::get_if<Pctf_method>(&f.desc))
+              if (m->priv == PrivateFlag::Public) {
+                mnames.push_back(m->name.txt);
+                mtypes.push_back(from_coretype(*m->type, sub));
+              }
+          TypePtr ob = eng.object_type(std::move(mnames), std::move(mtypes));
+          ob->variant_kind = 1;  // `#ops`: open (a self type may add methods)
+          ob->abbrev = lid_last(cl->id.txt);
+          ob->abbrev_args = std::move(as);
+          return ob;
+        }
         return eng.constr("#" + lid_full(cl->id.txt), std::move(as));
       }
       return eng.fresh_var();
@@ -4454,6 +4530,10 @@ struct Checker {
     // unification ties to that method's body type.  Without this, `self` was
     // Any and every self-method-call returned Any.
     std::unordered_map<std::string, TypePtr> mvar;
+    // A self-type coercion `object (self : (T1,T2) #ops) .. end`: the
+    // annotation's object row (from the class type's signature) pins every
+    // method's type; self binds to it so self#m resolves through it (mixin3).
+    TypePtr self_annot = nullptr;
     {
       std::vector<std::string> sn;
       std::vector<TypePtr> st;
@@ -4466,7 +4546,22 @@ struct Checker {
             st.push_back(v);
           }
       TypePtr selfTy = eng.object_type(std::move(sn), std::move(st));
-      if (auto* sv = std::get_if<Ppat_var>(&cs.self.desc)) venv.back()[sv->name.txt] = selfTy;
+      const Pattern* sp = &cs.self;
+      const CoreType* sct = nullptr;
+      while (auto* pc = std::get_if<Ppat_constraint>(&sp->desc)) {
+        sct = pc->t.get();
+        sp = pc->p.get();
+      }
+      if (sct) {
+        std::unordered_map<std::string, TypePtr> avars;
+        TypePtr at = I::Engine::repr(from_coretype(*sct, avars));
+        if (at->kind == I::Type::Kind::Object) {
+          self_annot = at;
+          soft_unify(selfTy, at);  // ties each method var to its declared type
+          selfTy = at;
+        }
+      }
+      if (auto* sv = std::get_if<Ppat_var>(&sp->desc)) venv.back()[sv->name.txt] = selfTy;
     }
     for (auto& f : cs.fields)
       if (auto* v = std::get_if<Pcf_val>(&f.desc))
@@ -4493,6 +4588,7 @@ struct Checker {
             try_unify(it->second, bt);
             bt = it->second;
           }
+          if (m->priv == PrivateFlag::Private) continue;  // not in the public type
           mnames.push_back(m->name.txt);
           mtypes.push_back(bt);
         }
@@ -4504,6 +4600,16 @@ struct Checker {
       }
     }
     venv.pop_back();
+    // A self-coerced object's PUBLIC type is the annotation's row, CLOSED
+    // (an object value has exactly its methods): `(T1,T2) ops`, not `#ops`
+    // -- private methods (mixin3's `method private map`) are not public
+    // either way, since the annotation's row lists only the class type's.
+    if (self_annot) {
+      TypePtr closed = eng.object_type(self_annot->labels, self_annot->args);
+      closed->abbrev = self_annot->abbrev;
+      closed->abbrev_args = self_annot->abbrev_args;
+      return closed;
+    }
     return eng.object_type(std::move(mnames), std::move(mtypes));
   }
 
@@ -4995,6 +5101,19 @@ struct Checker {
     if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) return non_expansive(*c->e);
     if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) return non_expansive(*nt->body);
     if (std::holds_alternative<Pexp_lazy>(e.desc)) return true;  // lazy is a value
+    // An object literal is a value when its fields are (ocamlc's
+    // is_nonexpansive Texp_object: immutable vals + methods).  mixin3's
+    // `let var = object .. end` generalizes -- `([> var ], var) ops`.
+    if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
+      for (auto& f : ob->cs->fields) {
+        if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
+          if (v->mut == MutableFlag::Mutable) return false;
+          if (auto* cc = std::get_if<Cfk_concrete>(&v->kind))
+            if (!non_expansive(*cc->e)) return false;
+        }
+      }
+      return true;
+    }
     // A local open `M.(e)` (Pexp_struct_item wrapping an open) is as expansive as
     // its body -- the open introduces no computation.  So `let a, b = M.(x, y)`
     // generalizes like the bare tuple would (matches ocamlc's is_nonexpansive on
@@ -5598,6 +5717,18 @@ struct Checker {
                 if (params.empty()) { eng.generalize(ot); class_types_[d.name.txt] = ot; }
               }
             }
+        } else if (auto* pct = std::get_if<Pstr_class_type>(&it.desc)) {
+          if (!strict)
+            for (auto& d : pct->decls)
+              if (auto* cs = std::get_if<Pcty_signature>(&d.expr.desc)) {
+                ClassTypeInfo info;
+                for (auto& p : d.params) {
+                  auto* v = std::get_if<Ptyp_var>(&p->desc);
+                  info.params.push_back(v ? v->name : "");
+                }
+                info.sig = &cs->cs;
+                classtype_decls_[d.name.txt] = std::move(info);
+              }
         } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
           infer_expr(*ev->e);
         else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {

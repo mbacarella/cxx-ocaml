@@ -55,6 +55,10 @@ TypePtr Engine::object_type(std::vector<std::string> names, std::vector<TypePtr>
   t->kind = Type::Kind::Object;
   t->labels = std::move(names);
   t->args = std::move(types);
+  // Stamp the current binding level (like variant_type): generalize then
+  // promotes a generalised object's row to GENERIC, which is what lets
+  // instantiate fresh-copy it per use (mixin3's named-class objects).
+  t->level = level;
   t->id = next_id_++;
   return t;
 }
@@ -360,6 +364,23 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     for (size_t i = 0; i < a->labels.size(); ++i)
       for (size_t j = 0; j < b->labels.size(); ++j)
         if (a->labels[i] == b->labels[j]) unify(a->args[i], b->args[j]);
+    // Two instances of the SAME class type also tie their parameters
+    // (`('a,'a) #ops` against a `(row, row lambda) ops` value -- mixin3's
+    // lazy_fix), and converge on ONE node preferring the CLOSED side
+    // (variant_kind 0) so the display shows `(..) ops`, not `(..) #ops`.
+    if (!a->abbrev.empty() && a->abbrev == b->abbrev &&
+        a->abbrev_args.size() == b->abbrev_args.size()) {
+      const TypePtr& keep = (a->variant_kind == 1 && b->variant_kind != 1) ? b : a;
+      const TypePtr& drop = keep == a ? b : a;
+      keep->from_inherit = keep->from_inherit || drop->from_inherit;
+      std::vector<TypePtr> da = drop->abbrev_args, ka = keep->abbrev_args;
+      if (drop->level != GENERIC_LEVEL) {  // a SCHEME node never links away
+        note(drop);
+        drop->kind = Type::Kind::Link;  // link FIRST: an arg reaching back into
+        drop->link = keep;              // drop resolves to keep, not a loop
+      }
+      for (size_t i = 0; i < da.size(); ++i) unify(da[i], ka[i]);
+    }
     return;
   }
   if (a->kind == Type::Kind::Variant && b->kind == Type::Kind::Variant) {
@@ -409,6 +430,7 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       note(a); a->kind = Type::Kind::Link; a->link = b;
       b->variant_kind = vk;
       b->level = lv;
+      b->from_inherit = b->from_inherit || a->from_inherit;
       for (size_t i = 0; i < a->abbrev_args.size(); ++i)
         unify(a->abbrev_args[i], b->abbrev_args[i]);
       return;
@@ -463,9 +485,9 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     // when the merged tag set is still the abbreviation's (a grown set is no
     // longer that abbreviation; sets only grow in a merge, so size suffices).
     if (!a->abbrev.empty() && m->labels.size() == a->labels.size()) {
-      m->abbrev = a->abbrev; m->abbrev_args = a->abbrev_args;
+      m->abbrev = a->abbrev; m->abbrev_args = a->abbrev_args; m->from_inherit = a->from_inherit;
     } else if (!b->abbrev.empty() && m->labels.size() == b->labels.size()) {
-      m->abbrev = b->abbrev; m->abbrev_args = b->abbrev_args;
+      m->abbrev = b->abbrev; m->abbrev_args = b->abbrev_args; m->from_inherit = b->from_inherit;
     }
     // A composite's level is the min of its parts: merging a generic row with a
     // weak one yields a weak row (value restriction wins); two generics stay
@@ -572,13 +594,19 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
     bool back_edge = false, ok = true;
     std::function<void(const TypePtr&, std::unordered_set<Type*>&)> go =
         [&](const TypePtr& x0, std::unordered_set<Type*>& stk) {
-      if (!ok || seen.size() > 64) { ok = ok && seen.size() <= 64; return; }
+      if (!ok || seen.size() > 512) { ok = ok && seen.size() <= 512; return; }
       TypePtr t = repr(x0);
       if (t->kind == Type::Kind::Var || t->kind == Type::Kind::Any) return;
       if (stk.count(t.get())) { back_edge = true; return; }
       if (!seen.insert(t.get()).second) return;
       if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object) &&
-          t->level != GENERIC_LEVEL) { ok = false; return; }
+          t->level != GENERIC_LEVEL) {
+        if (getenv("CCDBG"))
+          fprintf(stderr, "[cc] non-generic row #%d (kind %d, lvl %d)\n",
+                  t->id, (int)t->kind, t->level);
+        ok = false;
+        return;
+      }
       stk.insert(t.get());
       if (t->kind == Type::Kind::Arrow) { go(t->dom, stk); go(t->cod, stk); }
       else for (auto& a : t->args) go(a, stk);
@@ -586,7 +614,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
     };
     std::unordered_set<Type*> stk;
     go(root, stk);
-    return ok && back_edge && seen.size() <= 64;
+    return ok && back_edge && seen.size() <= 512;
   };
   // Cycle-preserving copy: pre-register each composite's fresh shell in `memo`
   // BEFORE recursing, so a back-edge resolves to the in-progress copy (the
@@ -620,9 +648,14 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         TypePtr r;
         if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
         else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; }
-        else if (t->kind == Type::Kind::Object) r = object_type(t->labels, t->args);
+        else if (t->kind == Type::Kind::Object) {
+          r = object_type(t->labels, t->args);
+          r->variant_kind = t->variant_kind;
+          r->abbrev = t->abbrev;
+          r->abbrev_args = t->abbrev_args;
+        }
         else {
-          r = variant_type(t->labels, t->args, t->tag_has_arg, t->variant_kind);
+          r = variant_type(t->labels, t->args, t->tag_has_arg, t->variant_kind); r->from_inherit = t->from_inherit;
           r->present = t->present;
           r->inherited = t->inherited;
           r->abbrev = t->abbrev;
@@ -631,7 +664,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         }
         memo[t.get()] = r;
         for (auto& a : r->args) a = ccopy(a);
-        if (r->kind == Type::Kind::Variant)
+        if (r->kind == Type::Kind::Variant || r->kind == Type::Kind::Object)
           for (auto& aa : r->abbrev_args) aa = ccopy(aa);
         return r;
       }
@@ -692,7 +725,8 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         // annotation-finalized heads (GENERIC, no scheme_head) share -- copying
         // them cascaded `changed` through parents and split shared rows
         // (ref_spec's `as 'a`).
-        bool weak_copy = t->kind == Type::Kind::Variant &&
+        bool weak_copy = (t->kind == Type::Kind::Variant ||
+                          (t->kind == Type::Kind::Object && !t->abbrev.empty())) &&
                          t->level == GENERIC_LEVEL && small_acyclic(t);
         bool sch_head = t->kind == Type::Kind::Constr && t->scheme_head &&
                         t->level == GENERIC_LEVEL;
@@ -700,9 +734,17 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         if (!changed && !weak_copy && !sch_head) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
         else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; }
-        else if (t->kind == Type::Kind::Object) r = object_type(t->labels, std::move(as));
+        else if (t->kind == Type::Kind::Object) {
+          r = object_type(t->labels, std::move(as));
+          r->variant_kind = t->variant_kind;  // open marker
+          r->abbrev = t->abbrev;              // named class type (mixin3's ops)
+          r->level = weak_copy ? level : t->level;
+          memo[t.get()] = r;  // before abbrev_args: they can reach back
+          for (auto& aa : t->abbrev_args) r->abbrev_args.push_back(copy(aa));
+          return r;
+        }
         else {
-          r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
+          r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind); r->from_inherit = t->from_inherit;
           r->present = t->present;
           r->inherited = t->inherited;  // ground types (int/t): share unexpanded
           r->abbrev = t->abbrev;
@@ -782,11 +824,20 @@ void Engine::generalize(const TypePtr& t0) {
         go(t->cod);
         break;
       case Type::Kind::Variant:
-        // Promote the row's tail level too, so a generalised row prints plain.
-        if (t->level > level) t->level = GENERIC_LEVEL;
-        [[fallthrough]];
-      case Type::Kind::Tuple:
       case Type::Kind::Object:
+        // Promote the row's tail level too, so a generalised row prints
+        // plain -- and instantiate can fresh-copy it per use (an Object of a
+        // named class type must not have its scheme node linked away by a
+        // later use's same-class unify -- mixin3's `var`).
+        if (t->level > level) t->level = GENERIC_LEVEL;
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        // The DISPLAY children generalize too: an object's class-type params
+        // / a folded row's abbreviation args are reachable only here.
+        for (auto& a : t->abbrev_args) go(a);
+        for (auto& a : t->inherited) go(a);
+        break;
+      case Type::Kind::Tuple:
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -843,11 +894,23 @@ void Engine::demote(const TypePtr& t0) {
         go(t->cod);
         break;
       case Type::Kind::Variant:
-        // Lower the row's tail level too (value restriction keeps it weak).
-        if (t->level != GENERIC_LEVEL && t->level > level) { note(t); t->level = level; }
-        [[fallthrough]];
-      case Type::Kind::Tuple:
       case Type::Kind::Object:
+        // Value restriction on rows, relaxed like ocamlc's: an UPPER-BOUNDED
+        // row (`[< ..]`, still constrainable) stays weak (`bar = wrap ()` ->
+        // `[< \`Test ] as '_weak1`), while a constructed/exact row
+        // generalizes even in an expansive binding (`b = lazy_fix mk` ->
+        // `[> \`A ] box`; mixin3's lambda) -- each use then instantiates a
+        // fresh copy instead of mutating the scheme.
+        if (t->level != GENERIC_LEVEL && t->level > level) {
+          if (t->variant_kind == 1) { note(t); t->level = level; }
+          else t->level = GENERIC_LEVEL;
+        }
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        for (auto& a : t->abbrev_args) go(a);
+        for (auto& a : t->inherited) go(a);
+        break;
+      case Type::Kind::Tuple:
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -882,14 +945,23 @@ void count_refs(const TypePtr& t0, std::unordered_map<Type*, int>& rc,
   TypePtr t = Engine::repr(t0);
   switch (t->kind) {
     case Type::Kind::Variant:
-    case Type::Kind::Object:
+    case Type::Kind::Object: {
       rc[t.get()]++;
       if (!seen.insert(t.get()).second) return;
-      for (auto& a : t->args) count_refs(a, rc, seen, stk);
-      // An abbrev row prints its abbrev_args INSTEAD of its tag args, so they
-      // count as printed occurrences too (and can carry cycles).
+      // An abbrev row prints its abbrev_args INSTEAD of its tag args -- only
+      // what prints is counted (an unprinted method arg must not trigger `as`
+      // naming: mixin3's `([> var ], var) ops`).  Mirrors show_rec's branch:
+      // Objects with a name, and Variants with an intact name that aren't an
+      // unfolding fixpoint, print the name + abbrev args.
+      bool folded = !t->abbrev.empty();
+      if (folded && t->kind == Type::Kind::Variant && !t->from_inherit)
+        for (auto& aa : t->abbrev_args)
+          if (Engine::repr(aa).get() == t.get()) folded = false;  // unfolds
+      if (!folded)
+        for (auto& a : t->args) count_refs(a, rc, seen, stk);
       for (auto& aa : t->abbrev_args) count_refs(aa, rc, seen, stk);
       break;
+    }
     case Type::Kind::Arrow:
       // Guarded by the DFS STACK only: a CYCLE edge back into an arrow must not
       // inflate the inner row's refcount (the cyclic arrow gets the `as` name
@@ -1164,7 +1236,23 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         printed.insert(t.get());
       }
       std::string body;
-      if (t->kind == Type::Kind::Object) {
+      if (t->kind == Type::Kind::Object && !t->abbrev.empty()) {
+        // An object of a NAMED class type prints via the name: a value
+        // (closed) as `(T1, T2) ops`, a subtype annotation (open) as
+        // `(T1, T2) #ops` (mixin3).
+        if (t->abbrev_args.size() == 1) {
+          show_rec(t->abbrev_args[0], body, 2, names, printed, rc, cyc);
+          body += " ";
+        } else if (t->abbrev_args.size() > 1) {
+          body += "(";
+          for (size_t i = 0; i < t->abbrev_args.size(); ++i) {
+            if (i) body += ", ";
+            show_rec(t->abbrev_args[i], body, -1, names, printed, rc, cyc);
+          }
+          body += ") ";
+        }
+        body += (t->variant_kind == 1 ? "#" : "") + t->abbrev;
+      } else if (t->kind == Type::Kind::Object) {
         body = "< ";
         for (size_t i = 0; i < t->labels.size(); ++i) {
           if (i) body += "; ";
@@ -1176,16 +1264,19 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         if (t->variant_kind == 1) body += t->labels.empty() ? ".." : "; ..";
         body += " >";
       } else if (!t->abbrev.empty() &&
-                 [&] {  // a row that is its own abbreviation argument (the
-                   // fixpoint `'a lambda as 'a`, e.g. free1 = fix free_lambda)
-                   // prints UNFOLDED (ocamlc: `[ `Abs .. | `App .. ] as 'a`).
-                   for (auto& aa : t->abbrev_args)
-                     if (Engine::repr(aa).get() == t.get()) return false;
-                   return true;
-                 }()) {
+                 (t->from_inherit ||
+                  [&] {  // a row that is its own abbreviation argument (the
+                    // fixpoint `'a lambda as 'a`, e.g. free1 = fix free_lambda)
+                    // prints UNFOLDED (ocamlc: `[ `Abs .. | `App .. ] as 'a`)
+                    // -- UNLESS it came from an inherit bound, which prints
+                    // `[ | 'a lambda ]` (mixin3's lazy_fix results).
+                    for (auto& aa : t->abbrev_args)
+                      if (Engine::repr(aa).get() == t.get()) return false;
+                    return true;
+                  }())) {
         // A row expanded from an abbreviation whose tag set is intact prints
         // the NAME, like ocamlc: exact -> `'a lambda`; bounded -> `[< var ]`;
-        // open -> `[> var ]`.
+        // open -> `[> var ]`; an exact inherit -> `[ | 'a lambda ]`.
         std::string ab;
         if (t->abbrev_args.size() == 1) {
           show_rec(t->abbrev_args[0], ab, 2, names, printed, rc, cyc);
@@ -1199,7 +1290,8 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
           ab += ") ";
         }
         ab += t->abbrev;
-        body = t->variant_kind == 2 ? ab
+        body = t->variant_kind == 2
+                 ? (t->from_inherit ? "[ | " + ab + " ]" : ab)
              : (t->variant_kind == 1 ? "[< " + ab + " ]" : "[> " + ab + " ]");
       } else {
         std::vector<size_t> ord(t->labels.size());  // ocamlc: tags alphabetical
@@ -1208,6 +1300,12 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
                   [&](size_t x, size_t y) { return t->labels[x] < t->labels[y]; });
         body = t->variant_kind == 1 ? "[< " : t->variant_kind == 2 ? "[ " : "[> ";
         bool wrote = false;
+        // An EXACT row defined by inherited abbreviations alone prints them
+        // with a leading bar and no presence list -- ocamlc's
+        // `[ | 'a lambda ]` (mixin2/mixin3's fixpoints).
+        bool exact_inh = t->variant_kind == 2 && t->labels.empty() &&
+                         !t->inherited.empty();
+        if (exact_inh) body += "| ";
         for (auto& ih : t->inherited) {  // inherited row types: `[< int u | .. ]`
           if (wrote) body += " | ";
           show_rec(ih, body, 0, names, printed, rc, cyc);
@@ -1223,7 +1321,10 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
           }
           wrote = true;
         }
-        if (!t->present.empty()) {  // `[< L > `P1 `P2 ]` present tags
+        // `[< L > `P1 `P2 ]` present tags -- only meaningful under an upper
+        // bound; an open row's tags are already all present (ocamlc never
+        // prints `>` on `[>`).
+        if (!t->present.empty() && !exact_inh && t->variant_kind == 1) {
           std::vector<std::string> pr = t->present;
           std::sort(pr.begin(), pr.end());
           body += " >";

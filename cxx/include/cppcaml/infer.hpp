@@ -57,6 +57,9 @@ struct Type {
   std::vector<TypePtr> abbrev_args; // from (`'a lambda`) -- display prints the
                                     // NAME (exact: `'a lambda`; `[< var ]`) as
                                     // ocamlc does; dropped if the tag set grows.
+  bool from_inherit = false;        // Variant: expanded from an INHERIT position
+                                    // (`[> 'a lambda]`) -- an exact fixpoint then
+                                    // prints `[ | 'a lambda ]`, not unfolded.
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are
