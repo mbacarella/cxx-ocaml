@@ -1987,16 +1987,17 @@ struct Checker {
     } else if (auto* mf = std::get_if<Pmod_functor>(&me.desc)) check_dup_modtypes_me(*mf->body);
   }
   void check_dup_modtypes_sig(const ast::Signature& items) {
-    std::set<std::string> seen, seen_class, seen_classty;
+    std::set<std::string> seen, seen_class, seen_classty, seen_module;
     for (auto& it : items) {
       if (auto* mt = std::get_if<Psig_modtype>(&it.desc)) {
         if (!seen.insert(mt->name.txt).second)
           note_error("Multiple definition of the module type name " + mt->name.txt);
         if (mt->type) check_dup_modtypes_mt(*mt->type);
       } else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
+        dup_module_name(seen_module, md->md.name);
         check_dup_modtypes_mt(*md->md.type);
       } else if (auto* rm = std::get_if<Psig_recmodule>(&it.desc)) {
-        for (auto& d : rm->decls) check_dup_modtypes_mt(*d.type);
+        for (auto& d : rm->decls) { dup_module_name(seen_module, d.name); check_dup_modtypes_mt(*d.type); }
       } else if (auto* cl = std::get_if<Psig_class>(&it.desc)) {
         for (auto& d : cl->decls)
           if (!seen_class.insert(d.name.txt).second)
@@ -2008,18 +2009,27 @@ struct Checker {
       }
     }
   }
+  // A named module bound twice in the same structure/signature is an error
+  // ("Multiple definition of the module name M").  A wildcard `module _` may
+  // repeat, and an INCLUDE'd module may be shadowed by an explicit one -- so
+  // only explicit, named bindings are tracked.
+  void dup_module_name(std::set<std::string>& seen, const StrOptLoc& n) {
+    if (n.txt && *n.txt != "_" && !seen.insert(*n.txt).second)
+      note_error("Multiple definition of the module name " + *n.txt);
+  }
   void check_dup_modtypes_struct(const ast::Structure& items) {
     if (!strict) return;
-    std::set<std::string> seen, seen_class, seen_classty;
+    std::set<std::string> seen, seen_class, seen_classty, seen_module;
     for (auto& it : items) {
       if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
         if (!seen.insert(mt->name.txt).second)
           note_error("Multiple definition of the module type name " + mt->name.txt);
         if (mt->type) check_dup_modtypes_mt(*mt->type);
       } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+        dup_module_name(seen_module, mb->binding.name);
         check_dup_modtypes_me(mb->binding.expr);
       } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
-        for (auto& b : rm->bindings) check_dup_modtypes_me(b.expr);
+        for (auto& b : rm->bindings) { dup_module_name(seen_module, b.name); check_dup_modtypes_me(b.expr); }
       } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
         check_dup_modtypes_me(in->expr);
       } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
