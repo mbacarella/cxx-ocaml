@@ -994,6 +994,42 @@ divergences. **Verdict: mixin.ml cannot flip until the access-path cluster is
 funded; the abbreviation machinery (this slice) was its display half and is
 done.** mixin2/mixin3 remain the class-system project (unchanged assessment).
 
+## SESSION 2026-07-02 (t): the access-path cluster CRACKED — lazy_t + String.t axes (+5, sig 94.7%)
+
+Funded the cluster blocking mixin.ml's residue and 5 corpus files. The method:
+probe ocamlc's behavior into a decision matrix (12 witness probes), then
+engineer to the matrix — NOT to half-remembered ctype.ml internals (two hours
+of unify3 archaeology produced contradictions; the probes settled everything).
+
+ocamlc's semantics, as probed: a construction carries the PRIMITIVE path
+(`lazy 1` : lazy_t, `%s` : string); a LIVE value flowing into an
+abbreviation-typed context during inference ADOPTS the abbreviation (hamming's
+rec-group Lazy.t, qsort's String.t); a FINALIZED binding is never flipped by
+later uses (instance-copying protects it). Implementation (2 commits, all
+gates green):
+
+1. **Primitive/abbreviation family table in unify** ({lazy_t,string,bytes} ×
+   {Lazy,CamlinternalLazy,String,StringLabels,Bytes,BytesLabels}): compatible,
+   arg-unifying, and the primitive-pathed node RELINKS to the
+   abbreviation-pathed one. Stamped (shadowing) types excluded.
+2. **Finalized-head protection**: generalize/demote stamp family-primitive
+   constr heads GENERIC; instantiate fresh-copies a stamped head per use
+   (args shared — constraints still flow), so later-use relinks hit the copy.
+3. **instantiate share-unchanged bug** (the trap that killed session (g)'s
+   attempt): the copied-child comparison used the ORIGINAL arg pointer, but a
+   link-wrapped child (var resolved to concrete) reprs to a different node —
+   spuriously "changed", re-copying shareable structure per use, so relinks
+   landed on copies. Fixed: compare against the repr.
+
+**+5: afl, lazy7, lazy_, test_module, qsort. hamming verified protected.**
+sig 492→497 (94.7%), reject 0.0%, lambda 54.2%, 0 crashes, 0 regressions.
+
+Remaining access-path axis (mixin.ml's `Subst.key`, ephetest3's `HW.key`,
+pr6944's `Map.Make(String).t`): FUNCTOR-RESULT abbreviations — the same
+per-occurrence rule but the abbreviation is a functor instance, so the family
+table doesn't cover it; needs the functor-instantiation machinery to stamp
+paths on its result types. That is now the cluster's last mechanism.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
