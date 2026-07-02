@@ -121,34 +121,46 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
   // is walked once, not looped/re-exploded.  Level-lowering is monotonic, so a
   // skipped re-visit is a no-op, not a lost cap.
   std::unordered_set<Type*> seen;
-  std::function<void(const TypePtr&)> go = [&](const TypePtr& x0) {
+  std::function<void(const TypePtr&, bool)> go = [&](const TypePtr& x0, bool under_row) {
     TypePtr t = repr(x0);
     switch (t->kind) {
       case Type::Kind::Var:
-        if (t == var) throw TypeError("occurs check: recursive type");
+        // An occurrence is legal when the path passes THROUGH a row (variant/
+        // object) node: OCaml permits `let rec r = fun () -> `A r` (the cycle
+        // goes through `[> `A of ..]`) without -rectypes.  The var then links
+        // to a type containing itself; every walk is cycle-guarded (Way 1).
+        if (t == var) {
+          if (under_row) break;
+          throw TypeError("occurs check: recursive type");
+        }
         if (t->level > var->level) { note(t); t->level = var->level; }
         break;
       case Type::Kind::Arrow:
         if (!seen.insert(t.get()).second) break;
-        go(t->dom);
-        go(t->cod);
+        go(t->dom, under_row);
+        go(t->cod, under_row);
         break;
       case Type::Kind::Variant:
         // Cap the row's tail level too (keeps a row unified into a var weak).
         if (t->level != GENERIC_LEVEL && t->level > var->level) { note(t); t->level = var->level; }
-        [[fallthrough]];
-      case Type::Kind::Tuple:
-      case Type::Kind::Constr:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a, true);
+        break;
       case Type::Kind::Object:
         if (!seen.insert(t.get()).second) break;
-        for (auto& a : t->args) go(a);
+        for (auto& a : t->args) go(a, true);
+        break;
+      case Type::Kind::Tuple:
+      case Type::Kind::Constr:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a, under_row);
         break;
       case Type::Kind::Link:
       case Type::Kind::Any:
         break;  // repr already resolved / Any has no vars
     }
   };
-  go(t0);
+  go(t0, false);
 }
 
 void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
@@ -256,6 +268,17 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       for (auto& t : tags) add_present(t);
       tags.clear(); ats.clear(); has.clear();
     }
+    // An open CONSTRUCTED row `[>` (its tags are by construction PRESENT)
+    // merging with an upper bound `[<`: record the constructed tags as present;
+    // and when present covers the whole allowed set the row is EXACT (lower =
+    // upper -> ocamlc prints `[ .. ]`, e.g. matching `` `A x `` against a
+    // `[> `A of ..]` value closes the row).
+    if (inh.empty() && a->variant_kind != 2 && b->variant_kind != 2 &&
+        (a->variant_kind == 0) != (b->variant_kind == 0)) {
+      const TypePtr& lo = a->variant_kind == 0 ? a : b;
+      for (auto& tg : lo->labels) add_present(tg);
+      if (present.size() == tags.size()) { vk = 2; present.clear(); }
+    }
     TypePtr m = variant_type(tags, ats, has, vk);
     m->inherited = std::move(inh);
     m->present = std::move(present);
@@ -310,6 +333,84 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
   };
   auto small_acyclic = [&](const TypePtr& t) {
     std::unordered_set<Type*> stk; int budget = 64; return fits(t, stk, budget);
+  };
+  // A small CYCLIC generic row region (e.g. `let rec r = fun () -> `A r`'s
+  // 'a = unit -> [> `A of 'a]): the whole cycle must be copied per use so a
+  // later pattern match can CLOSE the instance's row without touching the
+  // scheme (ocamlc: `let (`A x) = r ()` gives x an exact `[ `A of 'a ]`).
+  // Guards: region bounded (<=64 composite nodes -- mixin's giant DAG shares as
+  // before), contains a back-edge, and every variant/object in it is GENERIC
+  // (a non-generic row must stay shared so its tags keep accumulating).
+  auto cyclic_region_ok = [&](const TypePtr& root) -> bool {
+    std::unordered_set<Type*> seen;
+    bool back_edge = false, ok = true;
+    std::function<void(const TypePtr&, std::unordered_set<Type*>&)> go =
+        [&](const TypePtr& x0, std::unordered_set<Type*>& stk) {
+      if (!ok || seen.size() > 64) { ok = ok && seen.size() <= 64; return; }
+      TypePtr t = repr(x0);
+      if (t->kind == Type::Kind::Var || t->kind == Type::Kind::Any) return;
+      if (stk.count(t.get())) { back_edge = true; return; }
+      if (!seen.insert(t.get()).second) return;
+      if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object) &&
+          t->level != GENERIC_LEVEL) { ok = false; return; }
+      stk.insert(t.get());
+      if (t->kind == Type::Kind::Arrow) { go(t->dom, stk); go(t->cod, stk); }
+      else for (auto& a : t->args) go(a, stk);
+      stk.erase(t.get());
+    };
+    std::unordered_set<Type*> stk;
+    go(root, stk);
+    return ok && back_edge && seen.size() <= 64;
+  };
+  // Cycle-preserving copy: pre-register each composite's fresh shell in `memo`
+  // BEFORE recursing, so a back-edge resolves to the in-progress copy (the
+  // instance gets its own cycle, isolated from the scheme's).
+  std::function<TypePtr(const TypePtr&)> ccopy = [&](const TypePtr& t0) -> TypePtr {
+    TypePtr t = repr(t0);
+    auto mit = memo.find(t.get());
+    if (mit != memo.end()) return mit->second;
+    switch (t->kind) {
+      case Type::Kind::Var: {
+        if (t->level == GENERIC_LEVEL) {
+          auto it = mapping.find(t.get());
+          TypePtr fv = it != mapping.end() ? it->second : (mapping[t.get()] = fresh_var());
+          memo[t.get()] = fv;
+          return fv;
+        }
+        memo[t.get()] = t;
+        return t;
+      }
+      case Type::Kind::Arrow: {
+        TypePtr r = arrow(t->dom, t->cod, t->arrow_label, t->arrow_lbl);
+        memo[t.get()] = r;
+        r->dom = ccopy(t->dom);
+        r->cod = ccopy(t->cod);
+        return r;
+      }
+      case Type::Kind::Tuple:
+      case Type::Kind::Constr:
+      case Type::Kind::Object:
+      case Type::Kind::Variant: {
+        TypePtr r;
+        if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
+        else if (t->kind == Type::Kind::Constr) r = constr(t->path, t->args, t->stamp);
+        else if (t->kind == Type::Kind::Object) r = object_type(t->labels, t->args);
+        else {
+          r = variant_type(t->labels, t->args, t->tag_has_arg, t->variant_kind);
+          r->present = t->present;
+          r->inherited = t->inherited;
+          r->level = level;  // fresh weak instance (the scheme's row was generic)
+        }
+        memo[t.get()] = r;
+        for (auto& a : r->args) a = ccopy(a);
+        return r;
+      }
+      case Type::Kind::Link:
+      case Type::Kind::Any:
+        memo[t.get()] = t;
+        return t;
+    }
+    return t;
   };
   std::function<TypePtr(const TypePtr&)> copy = [&](const TypePtr& t0) -> TypePtr {
     TypePtr t = repr(t0);
@@ -372,6 +473,11 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
     }
     return t;
   };
+  // A scheme whose reachable region is small, CYCLIC, and all-generic-rows is
+  // instantiated by the cycle-preserving copy, so each use gets its own cycle
+  // (a pattern match can then close the instance's row without mutating the
+  // scheme).  Everything else takes the share-unchanged copy.
+  if (cyclic_region_ok(scheme)) return ccopy(scheme);
   return copy(scheme);
 }
 
@@ -455,22 +561,64 @@ namespace {
 // (cycle-safe); the ref count is taken before the guard so a node reached via two
 // paths still counts twice.
 void count_refs(const TypePtr& t0, std::unordered_map<Type*, int>& rc,
-                std::unordered_set<Type*>& seen) {
+                std::unordered_set<Type*>& seen,
+                std::unordered_set<Type*>& stk) {
   TypePtr t = Engine::repr(t0);
   switch (t->kind) {
     case Type::Kind::Variant:
     case Type::Kind::Object:
       rc[t.get()]++;
       if (!seen.insert(t.get()).second) return;
-      for (auto& a : t->args) count_refs(a, rc, seen);
+      for (auto& a : t->args) count_refs(a, rc, seen, stk);
       break;
     case Type::Kind::Arrow:
-      count_refs(t->dom, rc, seen); count_refs(t->cod, rc, seen);
+      // Guarded by the DFS STACK only: a CYCLE edge back into an arrow must not
+      // inflate the inner row's refcount (the cyclic arrow gets the `as` name
+      // and back-refs on re-entry, so the row prints once -- ocamlc's
+      // `unit -> [> `A of 'a ] as 'a`).  A DAG-shared arrow reached again LATER
+      // however PRINTS again (arrows are only named when cyclic), so its row
+      // must be re-counted -- a full seen-guard would lose the row's `as 'a`
+      // (recursive_module_init's `stub:('a -> int) -> .. -> ('a -> int)`).
+      if (!stk.insert(t.get()).second) return;
+      count_refs(t->dom, rc, seen, stk); count_refs(t->cod, rc, seen, stk);
+      stk.erase(t.get());
       break;
     case Type::Kind::Tuple:
     case Type::Kind::Constr:
-      for (auto& a : t->args) count_refs(a, rc, seen);
+      for (auto& a : t->args) count_refs(a, rc, seen, stk);
       break;
+    default: break;
+  }
+}
+
+// Nodes that are ON a cycle entered from the root walk (re-entered while still
+// on the DFS stack).  A cyclic ARROW needs `as` naming (`unit -> [> `A of 'a ]
+// as 'a` -- ocamlc binds 'a at the arrow when the cycle closes there); a merely
+// DAG-shared arrow must NOT be named (ocamlc reprints it).  Variants/objects
+// keep their refcount-based naming (sharing OR cycles both name them).
+void find_cycles(const TypePtr& t0, std::unordered_set<Type*>& on_stack,
+                 std::unordered_set<Type*>& done, std::unordered_set<Type*>& cyc) {
+  TypePtr t = Engine::repr(t0);
+  switch (t->kind) {
+    case Type::Kind::Arrow:
+    case Type::Kind::Tuple:
+    case Type::Kind::Constr:
+    case Type::Kind::Variant:
+    case Type::Kind::Object: {
+      if (on_stack.count(t.get())) { cyc.insert(t.get()); return; }
+      if (done.count(t.get())) return;
+      on_stack.insert(t.get());
+      if (t->kind == Type::Kind::Arrow) {
+        find_cycles(t->dom, on_stack, done, cyc);
+        find_cycles(t->cod, on_stack, done, cyc);
+      } else {
+        for (auto& a : t->args) find_cycles(a, on_stack, done, cyc);
+        for (auto& ih : t->inherited) find_cycles(ih, on_stack, done, cyc);
+      }
+      on_stack.erase(t.get());
+      done.insert(t.get());
+      break;
+    }
     default: break;
   }
 }
@@ -494,10 +642,13 @@ static std::string tvar_letter(size_t i) {
 void show_rec(const TypePtr& t0, std::string& out, int cp,
               std::unordered_map<Type*, std::string>& names,
               std::unordered_set<Type*>& printed,
-              const std::unordered_map<Type*, int>& rc) {
+              const std::unordered_map<Type*, int>& rc,
+              const std::unordered_set<Type*>& cyc) {
   TypePtr t = Engine::repr(t0);
-  // A named row already being/having-been printed: emit the back-reference.
-  if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object) &&
+  // A named row (or cyclic arrow) already being/having-been printed: emit the
+  // back-reference.  Arrows only enter `printed` when cyclic-named below.
+  if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object ||
+       t->kind == Type::Kind::Arrow) &&
       printed.count(t.get())) {
     out += names[t.get()];
     return;
@@ -514,40 +665,53 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       out += it->second;
       break;
     }
-    case Type::Kind::Arrow:
-      if (cp > 0) out += "(";
-      if (t->arrow_label == 1) { out += t->arrow_lbl + ":";        // ~lbl:
-        show_rec(t->dom, out, 1, names, printed, rc);
+    case Type::Kind::Arrow: {
+      // A CYCLIC arrow (the recursion closes here, e.g. `let rec r = fun () ->
+      // `A r` where 'a = unit -> [> `A of 'a]) is named `as 'aN` at its first
+      // print and back-referenced afterwards, like a shared row.  `as` binds
+      // loosest, so at top level no parens: `unit -> [> `A of 'a ] as 'a`.
+      bool named = cyc.count(t.get());
+      if (named) {
+        if (!names.count(t.get()))
+          names[t.get()] = "'" + tvar_letter(names.size());
+        printed.insert(t.get());
+      }
+      std::string body;
+      if (t->arrow_label == 1) { body += t->arrow_lbl + ":";        // ~lbl:
+        show_rec(t->dom, body, 1, names, printed, rc, cyc);
       } else if (t->arrow_label == 2) {  // ?lbl: -- internal type is `T option`,
-        out += "?" + t->arrow_lbl + ":";  // but ocamlc displays the bare T
+        body += "?" + t->arrow_lbl + ":";  // but ocamlc displays the bare T
         TypePtr d = Engine::repr(t->dom);
         if (d->kind == Type::Kind::Constr && d->args.size() == 1 &&
             (d->path == "option" || d->path == "Stdlib.option"))
-          show_rec(d->args[0], out, 1, names, printed, rc);
+          show_rec(d->args[0], body, 1, names, printed, rc, cyc);
         else
-          show_rec(t->dom, out, 1, names, printed, rc);
+          show_rec(t->dom, body, 1, names, printed, rc, cyc);
       } else {
-        show_rec(t->dom, out, 1, names, printed, rc);   // domain: a tuple is fine unparen'd
+        show_rec(t->dom, body, 1, names, printed, rc, cyc);   // domain: a tuple is fine unparen'd
       }
-      out += " -> ";
-      show_rec(t->cod, out, 0, names, printed, rc);   // -> is right-assoc: codomain stays top
-      if (cp > 0) out += ")";
+      body += " -> ";
+      show_rec(t->cod, body, 0, names, printed, rc, cyc);   // -> is right-assoc: codomain stays top
+      if (named) body += " as " + names[t.get()];
+      if (cp > 0) out += "(" + body + ")";
+      else out += body;
       break;
+    }
     case Type::Kind::Tuple:
       if (cp > 1) out += "(";
       for (size_t i = 0; i < t->args.size(); ++i) {
         if (i) out += " * ";
-        show_rec(t->args[i], out, 2, names, printed, rc);  // components bind tighter than *
+        show_rec(t->args[i], out, 2, names, printed, rc, cyc);  // components bind tighter than *
       }
       if (cp > 1) out += ")";
       break;
     case Type::Kind::Constr: {
-      if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names, printed, rc); out += " "; }
+      if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names, printed, rc, cyc); out += " "; }
       else if (t->args.size() > 1) {
         out += "(";
         for (size_t i = 0; i < t->args.size(); ++i) {
           if (i) out += ", ";
-          show_rec(t->args[i], out, 0, names, printed, rc);
+          show_rec(t->args[i], out, 0, names, printed, rc, cyc);
         }
         out += ") ";
       }
@@ -580,7 +744,10 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       auto it = rc.find(t.get());
       bool shared = it != rc.end() && it->second >= 2 && !exact;
       bool weak = t->kind == Type::Kind::Variant && t->level != GENERIC_LEVEL && !exact;
-      bool multi = shared || weak;
+      // A row ON A CYCLE is named even when exact (`[ `Abs of .. * 'a ] as 'a`
+      // -- an exact row has no row variable, so sharing doesn't name it, but a
+      // recursive one MUST be to terminate; ocamlc prints exactly this).
+      bool multi = shared || weak || cyc.count(t.get()) != 0;
       if (multi) {
         if (!names.count(t.get()))
           names[t.get()] = "'" + tvar_letter(names.size());
@@ -592,7 +759,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         for (size_t i = 0; i < t->labels.size(); ++i) {
           if (i) body += "; ";
           body += t->labels[i] + " : ";
-          show_rec(t->args[i], body, 0, names, printed, rc);
+          show_rec(t->args[i], body, 0, names, printed, rc, cyc);
         }
         body += " >";
       } else {
@@ -604,7 +771,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         bool wrote = false;
         for (auto& ih : t->inherited) {  // inherited row types: `[< int u | .. ]`
           if (wrote) body += " | ";
-          show_rec(ih, body, 0, names, printed, rc);
+          show_rec(ih, body, 0, names, printed, rc, cyc);
           wrote = true;
         }
         for (size_t n = 0; n < ord.size(); ++n) {
@@ -613,7 +780,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
           body += "`" + t->labels[i];
           if (i < t->tag_has_arg.size() && t->tag_has_arg[i]) {
             body += " of ";
-            show_rec(t->args[i], body, 0, names, printed, rc);
+            show_rec(t->args[i], body, 0, names, printed, rc, cyc);
           }
           wrote = true;
         }
@@ -641,11 +808,13 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
 
 std::string show(const TypePtr& t) {
   std::unordered_map<Type*, int> rc;      // row-node reference counts (for `as 'a`)
-  { std::unordered_set<Type*> seen; count_refs(t, rc, seen); }
+  { std::unordered_set<Type*> seen, stk; count_refs(t, rc, seen, stk); }
+  std::unordered_set<Type*> cyc;          // cycle members (arrow `as` naming)
+  { std::unordered_set<Type*> on_stack, done; find_cycles(t, on_stack, done, cyc); }
   std::string out;
   std::unordered_map<Type*, std::string> names;
   std::unordered_set<Type*> printed;
-  show_rec(t, out, 0, names, printed, rc);
+  show_rec(t, out, 0, names, printed, rc, cyc);
   return out;
 }
 
