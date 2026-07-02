@@ -585,7 +585,11 @@ void count_refs(const TypePtr& t0, std::unordered_map<Type*, int>& rc,
       break;
     case Type::Kind::Tuple:
     case Type::Kind::Constr:
+      // Same stack-guard as Arrow: a cycle edge back into a constr/tuple gets
+      // the `as` name at that node (show_rec), so the row beneath prints once.
+      if (!stk.insert(t.get()).second) return;
       for (auto& a : t->args) count_refs(a, rc, seen, stk);
+      stk.erase(t.get());
       break;
     default: break;
   }
@@ -645,11 +649,10 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
               const std::unordered_map<Type*, int>& rc,
               const std::unordered_set<Type*>& cyc) {
   TypePtr t = Engine::repr(t0);
-  // A named row (or cyclic arrow) already being/having-been printed: emit the
-  // back-reference.  Arrows only enter `printed` when cyclic-named below.
-  if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object ||
-       t->kind == Type::Kind::Arrow) &&
-      printed.count(t.get())) {
+  // A named row (or cyclic arrow/constr/tuple) already being/having-been
+  // printed: emit the back-reference.  Non-row nodes only enter `printed` when
+  // cyclic-named below, so a merely DAG-shared one still reprints.
+  if (t->kind != Type::Kind::Var && printed.count(t.get())) {
     out += names[t.get()];
     return;
   }
@@ -697,23 +700,41 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       else out += body;
       break;
     }
-    case Type::Kind::Tuple:
-      if (cp > 1) out += "(";
-      for (size_t i = 0; i < t->args.size(); ++i) {
-        if (i) out += " * ";
-        show_rec(t->args[i], out, 2, names, printed, rc, cyc);  // components bind tighter than *
+    case Type::Kind::Tuple: {
+      bool named = cyc.count(t.get()) != 0;  // cyclic: `(.. * ..) as 'aN`
+      if (named) {
+        if (!names.count(t.get()))
+          names[t.get()] = "'" + tvar_letter(names.size());
+        printed.insert(t.get());
       }
-      if (cp > 1) out += ")";
+      std::string body;
+      for (size_t i = 0; i < t->args.size(); ++i) {
+        if (i) body += " * ";
+        show_rec(t->args[i], body, 2, names, printed, rc, cyc);  // components bind tighter than *
+      }
+      if (named) body += " as " + names[t.get()];
+      if (cp > (named ? 0 : 1)) out += "(" + body + ")";
+      else out += body;
       break;
+    }
     case Type::Kind::Constr: {
-      if (t->args.size() == 1) { show_rec(t->args[0], out, 2, names, printed, rc, cyc); out += " "; }
+      // A cyclic constr is `as`-named like a cyclic arrow (`< bark : 'a ->
+      // unit > t as 'a` -- ocamlc binds 'a at the constr the cycle re-enters).
+      bool named = cyc.count(t.get()) != 0;
+      if (named) {
+        if (!names.count(t.get()))
+          names[t.get()] = "'" + tvar_letter(names.size());
+        printed.insert(t.get());
+      }
+      std::string body;
+      if (t->args.size() == 1) { show_rec(t->args[0], body, 2, names, printed, rc, cyc); body += " "; }
       else if (t->args.size() > 1) {
-        out += "(";
+        body += "(";
         for (size_t i = 0; i < t->args.size(); ++i) {
-          if (i) out += ", ";
-          show_rec(t->args[i], out, 0, names, printed, rc, cyc);
+          if (i) body += ", ";
+          show_rec(t->args[i], body, 0, names, printed, rc, cyc);
         }
-        out += ") ";
+        body += ") ";
       }
       std::string path = t->path;
       // Stdlib is opened by default, so its types print unqualified
@@ -727,7 +748,10 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       if (path == "format6" && t->args.size() == 4) path = "format4";
       // Lazy.t is the public abbreviation of CamlinternalLazy.t; print the former.
       if (path == "CamlinternalLazy.t") path = "Lazy.t";
-      out += path;
+      body += path;
+      if (named) body += " as " + names[t.get()];
+      if (named && cp > 0) out += "(" + body + ")";
+      else out += body;
       break;
     }
     case Type::Kind::Object:

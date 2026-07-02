@@ -641,6 +641,20 @@ struct Checker {
       return eng.constr(std::move(path), std::move(as), stamp);
     }
     if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) return package_type(*pk);
+    // `< m : t; .. >` object annotation -> an Object node (methods; inherits
+    // ignored -- best-effort, non-strict rows).  Was: fresh var, which dropped
+    // the annotation entirely (pr14554_1's `< bark : ('self -> unit) > t`).
+    if (auto* ob = std::get_if<Ptyp_object>(&t.desc)) {
+      if (strict) return eng.fresh_var();
+      std::vector<std::string> ms;
+      std::vector<TypePtr> ts;
+      for (auto& f : ob->fields)
+        if (auto* ot = std::get_if<Otag>(&f)) {
+          ms.push_back(ot->name.txt);
+          ts.push_back(from_coretype(*ot->type, vars));
+        }
+      return eng.object_type(std::move(ms), std::move(ts));
+    }
     return eng.fresh_var();
   }
 
