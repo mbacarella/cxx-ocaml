@@ -1030,6 +1030,41 @@ per-occurrence rule but the abbreviation is a functor instance, so the family
 table doesn't cover it; needs the functor-instantiation machinery to stamp
 paths on its result types. That is now the cluster's last mechanism.
 
+## SESSION 2026-07-02 (u): functor-instance abbreviations — the family model completed (+1, sig 94.9%)
+
+Funded the third access-path axis (`HW.key`/`Subst.key`). Hardest slice of the
+cluster: FIVE mid-flight corrections, each caught by the probe/witness suite
+(ref_spec's shared-row split, boxedints' annotation flip, fill_hw's capture
+timing, lib-seq's folded tail, nested's zip-cycle) — the per-change witness
+discipline carried the whole thing. Committed `infer: functor-instance
+abbreviations join the family relink`:
+
+- from_cmi marks manifest-carrying functor-result types `functor_abbrev`.
+- unify's family rule generalized to a PRIORITY model: functor abbrev (2) >
+  stdlib abbrev (1) > predef primitive (0); lower relinks to higher on live
+  contact; 2-2 ties link first→second. All scalar primitives + their stdlib
+  modules participate now (int/Int64.t etc., not just lazy/string/bytes).
+- TWO finalization flavors: annotation-written paths + toplevel bindings stamp
+  GENERIC (unify guard: never relink); SCHEME heads (cmi/functor/external)
+  also mark scheme_head → instantiate fresh-copies per use (live instances
+  adopt; scheme nodes never change). Copying annotation heads instead
+  cascaded `changed` and split ref_spec's `as 'a` row.
+- occurs_and_lower finalizes heads captured by an OUTER binding's var
+  (ephetest3's `hw` keeps `SW.data` through later HW.key contacts).
+- rec-binding display ZIPS te's arrow doms (adopted param paths — fill_hw :
+  HW.key) with tv's tail (folded abbreviations — infinite : .. Seq.t).
+
+**ephetest3 flips.** sig 497→498 (94.9%), reject 0.0%, lambda 54.2%, 0 crashes,
+0 regressions. mixin.ml: 9→8 diff lines (its Subst.key positions improved).
+
+**Access-path cluster status: all three mechanisms landed** (stdlib families,
+per-occurrence paths, functor instances). Cluster residue: pr6944's APPLICATIVE
+PATH display (`Map.Make(String).t` for an unnamed application's abstract t — a
+display-only naming feature), and mixin.ml's last mixed lines (the Subst.fold
+labelled-closure tie + eval row shapes). Known imperfection: an if-branch 2-2
+tie converges where ocamlc keeps slots separate (synthetic probe only; no
+corpus witness).
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
