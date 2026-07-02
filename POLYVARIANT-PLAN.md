@@ -894,6 +894,69 @@ full GADT/object escape-scope (`int Effect.t`, `#castable`, `< .. >`), scanf-ret
 display (Pos.t/Buffer.t), Stdlib/2 shadow, generalized-open sig restriction, %apply
 optarg erasure, Way-4 poly-variant rows.
 
+## SESSION 2026-07-02 (r): Way-4 FUNDED AND (mostly) LANDED — morematch, nested, +pr14554_1 (+3, sig 93.7%)
+
+The user explicitly funded the Way-4 project. Verdict up front: **the plan's
+"row-VARIABLE model required" framing was wrong for 2 of the 5 residue files.**
+morematch needed typecore's build_as_type variant case (per-occurrence fresh
+rows); nested needed the occurs relaxation + cyclic instantiation + cycle-aware
+display. Neither needed `{fields; tail_var}`. Three commits, each gated
+(reject 0.0%, lambda 54.2% flat, 0 crashes / 1853, exact match-set delta, 0
+regressions):
+
+1. **morematch (+1)** — `infer: variant-pattern alias rebuilds a fresh [> row;
+   #t patterns bound [< by their abbreviation`. (a) build_as_type gains the
+   Tpat_variant case: `| `Nil | `Cons _ as x -> `A x` binds x to a FRESH open
+   `[>` row (tag args shared with the scrutinee row's) — input `[<` and output
+   `[>` rows become independent, exactly ocamlc. (b) `#t` patterns (Ppat_type,
+   previously falling to fresh var) build `[< t's tags-with-DECLARED-args ]`
+   from the abbreviation manifest (maf's `#recurs_type_expr` ties `` `TConstr
+   of type_expr list ``).
+2. **nested (+1)** — `infer: recursive rows through occurs; cyclic-instance
+   copy; arrow/exact-row as display`. Four pieces: (a) occurs_and_lower allows
+   an occurrence whose path passes THROUGH a row node (OCaml's no-rectypes
+   rule; strict passes build no rows → reject structurally protected); (b)
+   instantiate cycle-preserving ccopy for small (≤64) all-generic-row cyclic
+   scheme regions (fresh shells pre-registered in the memo; each use gets its
+   own cycle so a match can close the instance without mutating the scheme);
+   (c) merge rule: `[>` meeting `[<` records constructed tags as present, and
+   present covering the allowed set closes the row EXACT (`let (`A x) = r ()`
+   → `[ `A of 'a ]`); (d) show: cyclic ARROWS `as`-named via a find_cycles
+   pass; count_refs guards arrows by DFS STACK only (cycle edges don't inflate
+   the inner row's rc, DAG-shared arrows still re-count — preserves
+   recursive_module_init); a row ON a cycle is named even when EXACT.
+   **Mid-session catch:** the exact-cyclic-row combination initially crashed
+   mixin (exact rows were excluded from as-naming → infinite print); the cyc
+   set fixed it and mixin's subst1 now prints the oracle's exact recursive row.
+3. **pr14554_1 (+1 BONUS, outside the cluster)** — `infer: object-type
+   annotations + cyclic constr/tuple as naming`. Ptyp_object was entirely
+   unhandled in from_coretype (annotation dropped); cyclic CONSTR/TUPLE nodes
+   now `as`-name like arrows (`< bark : 'a -> unit > t as 'a`). The flip
+   stacked on session (q)'s per-binding annot map ('this ties across
+   annotations) + the occurs relaxation (object cycle) — three sessions'
+   features composing.
+
+**Cluster status: sig 492/525 (93.7%), reject 0.0%, lambda 54.2%, 0 crashes.**
+The exhaustive remaining poly-variant residue (oracle sig contains backticks)
+is exactly the 3 mixins:
+
+- **mixin** — needs variant-abbreviation display FOLDING (`'a lambda`/`var`
+  for structural rows). Blocked underneath by alias equality (`Names.elt` ≡
+  `string` via functor — the same access-path/alias cluster as qsort
+  String.t↔string), plus true row-variable input→output tail relationships
+  for map_lambda's `[>` output kind.
+- **mixin2** — total inference loss (`val lambda : 'a`): lazy fixpoints
+  through object rows, plus `[ | 'a lambda ] as 'a` inherited-row display.
+- **mixin3** — object-row abbreviation folding to `(.., ..) ops` + `#ops`
+  (open object type) display on top of everything mixin needs.
+
+These stack 2-4 features each, half of them on the BLOCKED alias-equality
+cluster — genuinely the dedicated project the plan describes, and much smaller
+now (3 files). **The poly-variant plan is otherwise put to bed: 9 of the
+original 12 DIFF files landed** (pr10664, recursive_module_init, ref_spec,
+pr6836, bar/pr6899_second_bad, exotic, morematch, nested + the adjacent
+pr14554_1), with the crash substrate permanent and every gate green throughout.
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
