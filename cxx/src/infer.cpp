@@ -282,6 +282,14 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     TypePtr m = variant_type(tags, ats, has, vk);
     m->inherited = std::move(inh);
     m->present = std::move(present);
+    // Carry an abbreviation stamp (`'a lambda`) through the merge -- but only
+    // when the merged tag set is still the abbreviation's (a grown set is no
+    // longer that abbreviation; sets only grow in a merge, so size suffices).
+    if (!a->abbrev.empty() && m->labels.size() == a->labels.size()) {
+      m->abbrev = a->abbrev; m->abbrev_args = a->abbrev_args;
+    } else if (!b->abbrev.empty() && m->labels.size() == b->labels.size()) {
+      m->abbrev = b->abbrev; m->abbrev_args = b->abbrev_args;
+    }
     // A composite's level is the min of its parts: merging a generic row with a
     // weak one yields a weak row (value restriction wins); two generics stay
     // generic.  (variant_type stamped the engine level; override with the merge.)
@@ -399,10 +407,14 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
           r = variant_type(t->labels, t->args, t->tag_has_arg, t->variant_kind);
           r->present = t->present;
           r->inherited = t->inherited;
+          r->abbrev = t->abbrev;
+          r->abbrev_args = t->abbrev_args;
           r->level = level;  // fresh weak instance (the scheme's row was generic)
         }
         memo[t.get()] = r;
         for (auto& a : r->args) a = ccopy(a);
+        if (r->kind == Type::Kind::Variant)
+          for (auto& aa : r->abbrev_args) aa = ccopy(aa);
         return r;
       }
       case Type::Kind::Link:
@@ -460,7 +472,15 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
           r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
           r->present = t->present;
           r->inherited = t->inherited;  // ground types (int/t): share unexpanded
+          r->abbrev = t->abbrev;
           r->level = weak_copy ? level : t->level;  // fresh weak, else preserve
+          // Register BEFORE copying abbrev_args: an abbreviation arg can reach
+          // back into this very row (`'a lambda` with 'a tied to the row), and
+          // t is already off the on_stack here -- without the memo entry the
+          // re-entry recurses forever (mixin stack-overflow).
+          memo[t.get()] = r;
+          for (auto& aa : t->abbrev_args) r->abbrev_args.push_back(copy(aa));
+          return r;
         }
         memo[t.get()] = r;
         return r;
@@ -570,6 +590,9 @@ void count_refs(const TypePtr& t0, std::unordered_map<Type*, int>& rc,
       rc[t.get()]++;
       if (!seen.insert(t.get()).second) return;
       for (auto& a : t->args) count_refs(a, rc, seen, stk);
+      // An abbrev row prints its abbrev_args INSTEAD of its tag args, so they
+      // count as printed occurrences too (and can carry cycles).
+      for (auto& aa : t->abbrev_args) count_refs(aa, rc, seen, stk);
       break;
     case Type::Kind::Arrow:
       // Guarded by the DFS STACK only: a CYCLE edge back into an arrow must not
@@ -618,6 +641,7 @@ void find_cycles(const TypePtr& t0, std::unordered_set<Type*>& on_stack,
       } else {
         for (auto& a : t->args) find_cycles(a, on_stack, done, cyc);
         for (auto& ih : t->inherited) find_cycles(ih, on_stack, done, cyc);
+        for (auto& aa : t->abbrev_args) find_cycles(aa, on_stack, done, cyc);
       }
       on_stack.erase(t.get());
       done.insert(t.get());
@@ -786,6 +810,32 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
           show_rec(t->args[i], body, 0, names, printed, rc, cyc);
         }
         body += " >";
+      } else if (!t->abbrev.empty() &&
+                 [&] {  // a row that is its own abbreviation argument (the
+                   // fixpoint `'a lambda as 'a`, e.g. free1 = fix free_lambda)
+                   // prints UNFOLDED (ocamlc: `[ `Abs .. | `App .. ] as 'a`).
+                   for (auto& aa : t->abbrev_args)
+                     if (Engine::repr(aa).get() == t.get()) return false;
+                   return true;
+                 }()) {
+        // A row expanded from an abbreviation whose tag set is intact prints
+        // the NAME, like ocamlc: exact -> `'a lambda`; bounded -> `[< var ]`;
+        // open -> `[> var ]`.
+        std::string ab;
+        if (t->abbrev_args.size() == 1) {
+          show_rec(t->abbrev_args[0], ab, 2, names, printed, rc, cyc);
+          ab += " ";
+        } else if (t->abbrev_args.size() > 1) {
+          ab += "(";
+          for (size_t i = 0; i < t->abbrev_args.size(); ++i) {
+            if (i) ab += ", ";
+            show_rec(t->abbrev_args[i], ab, 0, names, printed, rc, cyc);
+          }
+          ab += ") ";
+        }
+        ab += t->abbrev;
+        body = t->variant_kind == 2 ? ab
+             : (t->variant_kind == 1 ? "[< " + ab + " ]" : "[> " + ab + " ]");
       } else {
         std::vector<size_t> ord(t->labels.size());  // ocamlc: tags alphabetical
         for (size_t i = 0; i < ord.size(); ++i) ord[i] = i;

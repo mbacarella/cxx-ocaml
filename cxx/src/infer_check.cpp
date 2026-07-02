@@ -583,6 +583,27 @@ struct Checker {
       // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
       std::string nm = lid_last(c->id.txt);
       auto ai = type_aliases.find(nm);
+      // DISPLAY pass, variant abbreviation (`type 'a lambda = [ `Var .. ]` used
+      // as `_ lambda`): expand to the ROW so it unifies with the body's rows
+      // (tying tag args to the DECLARED types), but STAMP the abbreviation on
+      // the node -- show prints `'a lambda`, matching ocamlc's abbrev memory.
+      // (A folded constr would silently fail to unify with a row and the
+      // annotation would be lost -- mixin's `: _ lambda -> _`.)
+      if (fold_abbrevs_ && !strict && ai != type_aliases.end() &&
+          ai->second.params.size() == as.size() && !expanding_.count(nm) &&
+          std::holds_alternative<Ptyp_variant>(ai->second.manifest->desc)) {
+        std::unordered_map<std::string, TypePtr> sub;
+        for (size_t i = 0; i < as.size(); ++i)
+          if (!ai->second.params[i].empty()) sub[ai->second.params[i]] = as[i];
+        expanding_.insert(nm);
+        TypePtr r = I::Engine::repr(from_coretype(*ai->second.manifest, sub));
+        expanding_.erase(nm);
+        if (r->kind == I::Type::Kind::Variant) {
+          r->abbrev = nm;
+          r->abbrev_args = as;
+        }
+        return r;
+      }
       if (!fold_abbrevs_ && ai != type_aliases.end() && ai->second.params.size() == as.size() &&
           !expanding_.count(nm)) {
         std::unordered_map<std::string, TypePtr> sub;
@@ -2369,6 +2390,7 @@ struct Checker {
     row = I::Engine::repr(row);
     if (row->kind != I::Type::Kind::Variant) return nullptr;
     row->variant_kind = 1;  // `#t` bounds ABOVE: `[<`, not the exact `[ .. ]`
+    if (ai->second.params.empty()) row->abbrev = lid_last(id);  // `[< var ]` display
     return row;
   }
 
@@ -2424,10 +2446,15 @@ struct Checker {
       TypePtr at = pv->arg ? build_as_type(**pv->arg, tys) : eng.fresh_var();
       return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)}, 0);
     }
-    // `#t as x`: x gets its own fresh `[<` row instance of the abbreviation
-    // (independent of the scrutinee row's tag set).
+    // `#t as x`: x gets its own fresh row instance of the abbreviation --
+    // OPEN (`[>`), like the variant case above (typecore's as-types are open):
+    // `#var as v -> v` flowing to an output merges `[> `Var .. ]` into it, not
+    // an upper bound that would pollute the constructed row's kind.
     if (auto* pt = std::get_if<Ppat_type>(&p.desc)) {
-      if (TypePtr row = hash_type_row(pt->id.txt)) return row;
+      if (TypePtr row = hash_type_row(pt->id.txt)) {
+        row->variant_kind = 0;
+        return row;
+      }
       return fallback();
     }
     return fallback();
@@ -3594,6 +3621,7 @@ struct Checker {
       }
     }
     TypePtr body;
+    TypePtr constrained = nullptr;  // what f.constraint_ annotates, when not `body`
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
       body = infer_expr(*fb->e);
     } else {
@@ -3624,15 +3652,21 @@ struct Checker {
       }
       params.push_back({arg, 0, ""});
       body = rt;
+      constrained = eng.arrow(arg, rt);  // the constraint annotates arg -> rt
     }
     // A return-type annotation (`fun .. : t -> e`) pins the body's type to t --
     // resolving fresh/Any results in the signature.  Skipped in the strict pass
     // (our incomplete inference could make a valid body clash with t and
     // false-reject); soft elsewhere so a stray clash can't abort the pass.
+    // For a `function`-cases body the annotation covers the WHOLE `arg -> rt`
+    // arrow (`let f ~x : (t1 -> t2) = function ..`) -- unifying it against rt
+    // alone silently dropped it (arrow vs result: lenient no-op), losing e.g.
+    // mixin's `: _ lambda -> _` row annotations.
     if (f.constraint_ && !strict)
       if (auto* pc = std::get_if<Pconstraint>(&*f.constraint_)) {
         std::unordered_map<std::string, TypePtr> local;
-        soft_unify(body, from_coretype(*pc->type, annot_vars_ ? *annot_vars_ : local));
+        soft_unify(constrained ? constrained : body,
+                   from_coretype(*pc->type, annot_vars_ ? *annot_vars_ : local));
       }
     if (record_kinds_) rec_ret_[&f] = body;
     TypePtr t = body;
