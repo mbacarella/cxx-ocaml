@@ -4259,6 +4259,18 @@ struct Checker {
       if (is_struct || !inner.empty()) {
         check_sig_missing(inner, *mc->mt, !body_has_toplevel_open(*mc->me));
         check_sig_types(*mc->me, *mc->mt);
+        // `(M : S)` with M a named module ascribes: only S's names are visible
+        // outside, at M's types.  `open (List : sig val map : .. end)` must not
+        // leak List.hd over a user-defined `hd` (accepted_batch).  A literal
+        // struct keeps its full exports (the ascription was checked above).
+        if (!is_struct) {
+          auto restricted = modtype_values(*mc->mt);
+          if (!restricted.empty()) {
+            for (auto& [k, v] : restricted)
+              if (auto f = inner.find(k); f != inner.end()) v = f->second;
+            return restricted;
+          }
+        }
         return inner;
       }
       return modtype_values(*mc->mt);  // e.g. `(val e : S)` parsed as a constraint
@@ -4417,7 +4429,15 @@ struct Checker {
         } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc))
           infer_expr(*ev->e);
         else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
+          // `open F(X)`: name the functor result's abstract types by the
+          // applicative path (`Set.Make(String).t`), as ocamlc displays them.
+          // Save/restore func_bind_name_ -- this open may sit inside a module
+          // binding whose own prefix is mid-flight.
+          std::string saved_fbn = func_bind_name_;
+          if (!strict && std::holds_alternative<Pmod_apply>(op->expr.desc))
+            func_bind_name_ = resolve_local_module_path(op->expr);
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
+          func_bind_name_ = saved_fbn;
           if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc)) {  // open M -> M's submodules
             for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
             if (!strict) {
