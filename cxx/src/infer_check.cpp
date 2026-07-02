@@ -1194,6 +1194,46 @@ struct Checker {
 
   // Value schemes of a cmi module type `M.S` (e.g. Map.OrderedType), with its
   // abstract types substituted by the functor argument's types.
+  // Resolve a folded cmi abbreviation path ("Arg.anon_fun") to its manifest
+  // translation, for unify's lenient cross-kind expansion.  Only PARAMETERLESS
+  // manifest-carrying (non-extensible) decls; memoized, negative-cached, and
+  // re-entrancy-guarded via the negative cache.
+  std::unordered_map<std::string, TypePtr> abbrev_exp_cache_;
+  std::set<std::string> abbrev_exp_neg_;
+  TypePtr resolve_abbrev_expansion(const std::string& path) {
+    if (auto it = abbrev_exp_cache_.find(path); it != abbrev_exp_cache_.end())
+      return it->second;
+    if (!abbrev_exp_neg_.insert(path).second) return nullptr;
+    std::vector<std::string> comps;
+    for (size_t p = 0, d; p < path.size(); p = d + 1) {
+      d = path.find('.', p);
+      if (d == std::string::npos) { comps.push_back(path.substr(p)); break; }
+      comps.push_back(path.substr(p, d - p));
+    }
+    if (comps.size() < 2) return nullptr;
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (!sig) return nullptr;
+      for (auto& td : sig->types)
+        if (td.name == comps.back()) {
+          if (!td.manifest || !td.params.empty() || td.kind == cmi::TypeDecl::Open)
+            return nullptr;
+          std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+          TypePtr r = from_cmi(td.manifest, memo);
+          if (r) abbrev_exp_cache_[path] = r;
+          return r;
+        }
+    } catch (...) {}
+    return nullptr;
+  }
+
   std::unordered_map<std::string, TypePtr> cmi_modtype_value_schemes(
       const Longident& path, const std::unordered_map<std::string, TypePtr>& argtypes) {
     std::unordered_map<std::string, TypePtr> out;
@@ -5085,6 +5125,11 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
 // Shared setup: register constructors, then run best-effort inference over the
 // structure (populating ck.match_partial and ck.errors as it traverses).
 static void run_checker(Checker& ck, const ast::Structure& s) {
+  // unify's lenient cross-kind expansion of folded cmi abbreviations
+  // (Arg.anon_fun vs an arrow); consulted by the lenient pass only.
+  ck.eng.abbrev_resolver = [&ck](const std::string& p) {
+    return ck.resolve_abbrev_expansion(p);
+  };
   ck.register_predef_ctors();
   ck.register_stdlib_ctors();
   ck.collect_bound_modules(s);  // pre-collect bound module names (before type checks)

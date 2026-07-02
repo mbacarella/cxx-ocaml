@@ -10,6 +10,7 @@
 // isolation.  Wiring into the expression typer comes next.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -87,6 +88,11 @@ public:
   // abstract functor-result type: the `int`/`key` clash must not stop `'a` from
   // being linked to int.  Never set in the strict (reject) or value-kinds pass.
   bool lenient = false;
+  // Resolver for a folded cmi abbreviation path ("Arg.anon_fun" -> its
+  // manifest translation, null if not an expandable abbreviation), provided
+  // by the checker.  Used by unify (lenient pass only) when a Constr meets a
+  // non-Constr shape, so the folded name still ties the other side.
+  std::function<TypePtr(const std::string&)> abbrev_resolver;
   void enter_level() { ++level; }
   void leave_level() { --level; }
 

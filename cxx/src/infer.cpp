@@ -411,6 +411,16 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
         if (m->labels[k] == b->labels[j]) { unify(m->args[k], b->args[j]); break; }
     return;
   }
+  // Cross-kind mismatch where one side is a FOLDED cmi abbreviation
+  // (`Arg.anon_fun` meeting `'a -> unit`): expand via the checker-provided
+  // resolver and retry, so the abbreviation's manifest ties the other side
+  // (testerror's anon slot resolves string).  Lenient (display) pass only.
+  if (lenient && abbrev_resolver) {
+    if (a->kind == Type::Kind::Constr && b->kind != Type::Kind::Constr)
+      if (TypePtr e = abbrev_resolver(a->path)) { unify(e, b); return; }
+    if (b->kind == Type::Kind::Constr && a->kind != Type::Kind::Constr)
+      if (TypePtr e = abbrev_resolver(b->path)) { unify(a, e); return; }
+  }
   if (lenient) return;
   throw TypeError("cannot unify incompatible types");
 }
