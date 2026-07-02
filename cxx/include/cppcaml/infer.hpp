@@ -147,6 +147,10 @@ public:
 
 private:
   int next_id_ = 0;
+  // >0 while unifying a merged row's shared-tag ARGUMENTS: same-family constrs
+  // then keep their own names (no relink) -- the merged slot's representative
+  // was chosen by family priority instead (see unify's Variant merge).
+  int row_field_depth_ = 0;
   TypePtr any_;  // singleton Any node
   void occurs_and_lower(const TypePtr& var, const TypePtr& t);
 

@@ -202,13 +202,20 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
         for (auto& a : t->args) go(a, true);
         break;
       case Type::Kind::Constr:
-        // A structure captured by a var from an OUTER (older) binding escapes
-        // the current item: finalize its family heads so a later contact can't
+        // A structure captured by a var from an OUTER (older) ITEM escapes
+        // the current one: finalize its family heads so a later contact can't
         // relink the now-stored path (ephetest3's `hw` -- its weak 'a takes
         // fill_hw's SW.data, which must survive the HW.key contacts; the rec
         // binding's own display uses the fun's arrow, so this doesn't hide
-        // the param's adopted path).
+        // the param's adopted path).  Cross-ITEM only: a previous top-level
+        // binding's weak var was demoted to the structure level (0), while
+        // every var of the item in progress lives at >= 1 -- an intra-item
+        // capture (a param var one level shallower than an annotation's
+        // expansion) must stay adoptable (mixin's `Var slot takes Subst.key).
         if (var->level < level && family_prio(t.get()) >= 0) {
+          if (getenv("STAMPDBG"))
+            fprintf(stderr, "[stamp] %s#%d by var#%d(lvl %d) at engine lvl %d\n",
+                    t->path.c_str(), t->id, var->id, var->level, level);
           note(t);
           t->level = GENERIC_LEVEL;
         }
@@ -305,6 +312,11 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     if (last(a->path) != last(b->path) &&
         a->args.size() == b->args.size()) {
       int fa = family_prio(a.get()), fb = family_prio(b.get());
+      if (getenv("FAMDBG") && (a->path.find("key") != std::string::npos ||
+                               b->path.find("key") != std::string::npos))
+        fprintf(stderr, "[fam] %s(p%d,l%d,id%d) vs %s(p%d,l%d,id%d)\n",
+                a->path.c_str(), fa, a->level, a->id,
+                b->path.c_str(), fb, b->level, b->id);
       bool differ = fa >= 0 && fb >= 0 && fa != fb &&
           // prim/stdlib-abbr pairs must agree on WHICH primitive; a functor
           // abbreviation's expansion is unknown, so priority 2 pairs with any.
@@ -319,7 +331,14 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
         const TypePtr& hi = tie ? b : (fa < fb ? b : a);
         for (size_t i = 0; i < lo->args.size(); ++i)
           unify(lo->args[i], hi->args[i]);
-        if (lo->level != GENERIC_LEVEL) {  // finalized nodes keep their path
+        // Inside a ROW-FIELD unification the nodes keep their own names --
+        // ocamlc's merged row picks a representative per SLOT; renaming here
+        // would leak one slot's abbreviation into every other slot sharing
+        // the node (mixin's `Abs(name, ..) / `Var name: the `Var slot shows
+        // Subst.key while name itself stays string).  Direct unifications
+        // (an application's argument against `Subst.find`'s key) still
+        // rename, which is what displays the abbreviation at use sites.
+        if (lo->level != GENERIC_LEVEL) {
           note(lo);
           lo->kind = Type::Kind::Link;
           lo->link = hi;
@@ -344,6 +363,56 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     return;
   }
   if (a->kind == Type::Kind::Variant && b->kind == Type::Kind::Variant) {
+    // Two INTACT instances of the SAME abbreviation unify like the folded
+    // constr they came from (ocamlc unifies `'x lambda ~ 'y lambda` by path +
+    // args; the expansions' FIELD nodes never meet): tie the abbreviation
+    // args only and link.  A body contact renaming one instance's field
+    // (mixin's scrutinee `Abs slot adopting Names.elt) then can't leak into
+    // the other instance's display (map_lambda keeps `Abs of string).
+    if (!a->abbrev.empty() && a->abbrev == b->abbrev &&
+        a->abbrev_args.size() == b->abbrev_args.size() &&
+        a->labels.size() == b->labels.size()) {
+      int vk = std::max(a->variant_kind, b->variant_kind);
+      int lv = std::min(a->level, b->level);
+      // Reconcile display SLOTS before linking: the survivor keeps, per tag,
+      // the more-abbreviated field node (a leaf `Subst.key` over a fresh
+      // expansion `string`; tuple components likewise) -- an instance whose
+      // field adopted an abbreviation must not lose it to the other
+      // instance's decl-fresh face (subst1's `Var of Subst.key).  Pointer
+      // choice only -- the fields are NOT unified (that is the point of the
+      // folded-constr fast path).
+      auto pick = [&](const TypePtr& av, const TypePtr& bv,
+                      auto&& pick_ref) -> TypePtr {
+        TypePtr ar = repr(av), br = repr(bv);
+        if (ar->kind == Type::Kind::Constr && br->kind == Type::Kind::Constr &&
+            ar->args.empty() && br->args.empty() &&
+            family_prio(ar.get()) > family_prio(br.get()))
+          return av;
+        if (ar->kind == Type::Kind::Tuple && br->kind == Type::Kind::Tuple &&
+            ar->args.size() == br->args.size()) {
+          std::vector<TypePtr> es;
+          bool changed = false;
+          for (size_t i = 0; i < ar->args.size(); ++i) {
+            es.push_back(pick_ref(ar->args[i], br->args[i], pick_ref));
+            if (repr(es.back()) != repr(br->args[i])) changed = true;
+          }
+          if (changed) return tuple(std::move(es));
+        }
+        return bv;
+      };
+      for (size_t i = 0; i < a->labels.size(); ++i)
+        for (size_t j = 0; j < b->labels.size(); ++j)
+          if (a->labels[i] == b->labels[j]) {
+            b->args[j] = pick(a->args[i], b->args[j], pick);
+            break;
+          }
+      note(a); a->kind = Type::Kind::Link; a->link = b;
+      b->variant_kind = vk;
+      b->level = lv;
+      for (size_t i = 0; i < a->abbrev_args.size(); ++i)
+        unify(a->abbrev_args[i], b->abbrev_args[i]);
+      return;
+    }
     // Merge the two rows into their tag-union (`[> `A]` + `[> `B]` = `[> `A | `B]`;
     // two matched `[< ..]` arms union likewise), unifying a shared tag's argument;
     // link both sides to the merge.  Link FIRST so a self-referential arg (a
@@ -405,10 +474,41 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     note(a); a->kind = Type::Kind::Link; a->link = m;
     note(b); b->kind = Type::Kind::Link; b->link = m;
     // Now unify shared-tag arguments (a/b already point at m, so a recursive arg
-    // that is a/b won't re-enter this merge).
+    // that is a/b won't re-enter this merge).  When the two SLOT nodes are
+    // compatible same-family constr LEAVES (string vs Subst.key), the merged
+    // slot keeps the more abbreviated node and NEITHER is renamed -- ocamlc's
+    // row merge picks a representative per slot, so `Abs(name, ..) sharing
+    // `Var name's node shows Subst.key at `Var while name stays string.
+    // Anything deeper (a tuple whose component later meets Subst.add's key)
+    // unifies normally and can still rename.
     for (size_t j = 0; j < b->labels.size(); ++j)
       for (size_t k = 0; k < m->labels.size(); ++k)
-        if (m->labels[k] == b->labels[j]) { unify(m->args[k], b->args[j]); break; }
+        if (m->labels[k] == b->labels[j]) {
+          TypePtr ma = repr(m->args[k]), ba = repr(b->args[j]);
+          auto last2 = [](const std::string& p) {
+            auto d = p.rfind('.');
+            return d == std::string::npos ? p : p.substr(d + 1);
+          };
+          if (ma->kind == Type::Kind::Constr && ba->kind == Type::Kind::Constr &&
+              ma->args.empty() && ba->args.empty() &&
+              last2(ma->path) != last2(ba->path)) {
+            int fm = family_prio(ma.get()), fb2 = family_prio(ba.get());
+            bool compat = fm >= 0 && fb2 >= 0 && fm != fb2 &&
+                (fm == 2 || fb2 == 2 ||
+                 ((fm == 0 ? ma->path : std::string(family_abbr_of(ma->path))) ==
+                  (fb2 == 0 ? ba->path : std::string(family_abbr_of(ba->path)))));
+            bool tie2 = (fm == 2 && fb2 == 2) ||
+                        (fm == 1 && fb2 == 1 &&
+                         std::string(family_abbr_of(ma->path)) ==
+                             family_abbr_of(ba->path));
+            if (compat || tie2) {
+              if (fb2 > fm) m->args[k] = b->args[j];
+              break;
+            }
+          }
+          unify(m->args[k], b->args[j]);
+          break;
+        }
     return;
   }
   // Cross-kind mismatch where one side is a FOLDED cmi abbreviation
@@ -987,7 +1087,9 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         body += "(";
         for (size_t i = 0; i < t->args.size(); ++i) {
           if (i) body += ", ";
-          show_rec(t->args[i], body, 0, names, printed, rc, cyc);
+          // comma-delimited arg: a named row prints bare, like at top
+          // (ocamlc's `([> 'a lambda ] as 'a, 'a) #ops`)
+          show_rec(t->args[i], body, -1, names, printed, rc, cyc);
         }
         body += ") ";
       }
@@ -1024,6 +1126,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         path += ")";
       }
       body += path;
+      if (getenv("SHOWIDS")) body += "#" + std::to_string(t->id);
       if (named) body += " as " + names[t.get()];
       if (named && cp > 0) out += "(" + body + ")";
       else out += body;
@@ -1047,6 +1150,14 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       // -- an exact row has no row variable, so sharing doesn't name it, but a
       // recursive one MUST be to terminate; ocamlc prints exactly this).
       bool multi = shared || weak || cyc.count(t.get()) != 0;
+      // An exact row printing as a bare zero-argument abbreviation (`lexpr`)
+      // needs no `as` name: the tags (and any cycle through them) never print,
+      // so each occurrence just reprints the name -- ocamlc's `lexpr -> lexpr`,
+      // not `(lexpr as 'a) -> 'a`.  (An abbreviation WITH args keeps naming:
+      // an arg cycle prints through the name -- `([ | 'a lambda ] as 'a)`.)
+      if (t->kind == Type::Kind::Variant && exact && !t->abbrev.empty() &&
+          t->abbrev_args.empty())
+        multi = false;
       if (multi) {
         if (!names.count(t.get()))
           names[t.get()] = "'" + tvar_letter(names.size());
@@ -1120,8 +1231,12 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         }
         body += " ]";
       }
+      if (getenv("SHOWIDS")) body += "{#" + std::to_string(t->id) + "}";
       if (multi)
-        out += (cp > 0 ? "(" : "") + body + " as " + names[t.get()] + (cp > 0 ? ")" : "");
+        // ocamlc parenthesizes a named row in every non-top position --
+        // including an arrow CODOMAIN (`'a -> ([> `Num of int ] as 'b)`);
+        // only the absolute top of a printed type goes bare (cp < 0).
+        out += (cp >= 0 ? "(" : "") + body + " as " + names[t.get()] + (cp >= 0 ? ")" : "");
       else out += body;
       break;
     }
@@ -1145,7 +1260,7 @@ std::string show(const TypePtr& t) {
   std::string out;
   std::unordered_map<Type*, std::string> names;
   std::unordered_set<Type*> printed;
-  show_rec(t, out, 0, names, printed, rc, cyc);
+  show_rec(t, out, -1, names, printed, rc, cyc);
   g_pkg_dep_heads = nullptr;
   return out;
 }

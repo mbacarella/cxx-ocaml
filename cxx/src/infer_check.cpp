@@ -444,6 +444,15 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
+  // True while from_coretype expands a local decl's MANIFEST (variant alias
+  // fold / `#t` rows): its internal constrs are expansion nodes, not
+  // source-written -- they stay adoptable (no family-head finalization).
+  // Only honoured under adoptable_annot_ (a FUNCTION-constraint translation,
+  // `: var -> _`): ocamlc adopts through those (subst_var's `Var slot takes
+  // Subst.key) but keeps the decl face for a PARAM annotation (`(v : var)`
+  // stays `Var of string).
+  bool manifest_expansion_ = false;
+  bool adoptable_annot_ = false;
   // local module-type name -> its signature's value names (first-class modules):
   // (val e : S) unpacks bring S's values into scope.
   std::unordered_map<std::string, std::vector<std::string>> modtype_env;
@@ -792,7 +801,10 @@ struct Checker {
         for (size_t i = 0; i < as.size(); ++i)
           if (!ai->second.params[i].empty()) sub[ai->second.params[i]] = as[i];
         expanding_.insert(nm);
+        bool saved_me = manifest_expansion_;
+        manifest_expansion_ = true;
         TypePtr r = I::Engine::repr(from_coretype(*ai->second.manifest, sub));
+        manifest_expansion_ = saved_me;
         expanding_.erase(nm);
         if (r->kind == I::Type::Kind::Variant) {
           r->abbrev = nm;
@@ -918,7 +930,12 @@ struct Checker {
       // A SOURCE-WRITTEN path never relinks to a family abbreviation: the user
       // wrote it and ocamlc displays it as written (`(a : int32)` stays int32
       // even after `Int32.unsigned_compare a b`).  Finalize its family heads.
-      eng.finalize_family_heads(rc);
+      // NOT during a decl-manifest expansion: the manifest's internals
+      // (`type var = [`Var of string]`'s string) are ocamlc's fresh expansion
+      // nodes, which stay adoptable (subst_var's `Var slot takes Subst.key);
+      // the decl's own face is re-established at finalization by
+      // restore_abbrev_rows.
+      if (!(manifest_expansion_ && adoptable_annot_)) eng.finalize_family_heads(rc);
       return rc;
     }
     if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) return package_type(*pk, "", &vars);
@@ -987,7 +1004,16 @@ struct Checker {
     if (auto* l = std::get_if<Lident>(&lid.v)) {
       for (auto it = venv.rbegin(); it != venv.rend(); ++it) {
         auto f = it->find(l->name);
-        if (f != it->end()) return eng.instantiate(f->second);
+        if (f != it->end()) {
+          TypePtr t = eng.instantiate(f->second);
+          // ocamlc re-expands a folded abbreviation from its decl at each
+          // use: an intact-abbrev row instance arriving from a previous
+          // binding resets its DECL-GROUND fields (free_lambda's `Names.elt`
+          // contamination doesn't reach free1), then THIS binding's contacts
+          // re-adopt (subst1's `Var slot takes subst_lambda's Subst.key).
+          if (fold_abbrevs_ && !strict) restore_abbrev_rows(t);
+          return t;
+        }
       }
       auto& s = stdlib_schemes();
       auto f = s.find(l->name);
@@ -1529,6 +1555,15 @@ struct Checker {
     if (comps.size() == 1) {  // a local functor's recorded (fully-applied) body
       auto it = functor_env.find(comps[0]);
       if (it != functor_env.end()) return it->second;
+    }
+    // An opened module's SUBMODULE functor (`open MoreLabels` then
+    // `Map.Make(..)`): the head resolves through the open, so the LABELLED
+    // value schemes apply (MoreLabels.Map's fold has ~f/~init; Map's doesn't).
+    if (auto q = opened_submod_quals_.find(comps[0]);
+        q != opened_submod_quals_.end()) {
+      auto qc = mod_components_str(q->second);
+      qc.insert(qc.end(), comps.begin() + 1, comps.end());
+      comps = std::move(qc);
     }
     std::unordered_map<std::string, TypePtr> out;
     try {
@@ -2911,7 +2946,10 @@ struct Checker {
     if (ai == type_aliases.end() || !ai->second.manifest) return nullptr;
     if (!std::holds_alternative<Ptyp_variant>(ai->second.manifest->desc)) return nullptr;
     std::unordered_map<std::string, TypePtr> vars;
+    bool saved_me = manifest_expansion_;
+    manifest_expansion_ = true;
     TypePtr row = from_coretype(*ai->second.manifest, vars);
+    manifest_expansion_ = saved_me;
     row = I::Engine::repr(row);
     if (row->kind != I::Type::Kind::Variant) return nullptr;
     row->variant_kind = 1;  // `#t` bounds ABOVE: `[<`, not the exact `[ .. ]`
@@ -2971,11 +3009,25 @@ struct Checker {
       TypePtr at = pv->arg ? build_as_type(**pv->arg, tys) : eng.fresh_var();
       return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)}, 0);
     }
-    // `#t as x`: x gets its own fresh row instance of the abbreviation --
-    // OPEN (`[>`), like the variant case above (typecore's as-types are open):
-    // `#var as v -> v` flowing to an output merges `[> `Var .. ]` into it, not
-    // an upper bound that would pollute the constructed row's kind.
+    // `#t as x`: x gets a fresh OPEN row (typecore's as-types are open) whose
+    // FIELDS are the matched row's own nodes -- typecore's `{row with more =
+    // newvar}`: fresh row variable, shared tag args.  Sharing is what ties a
+    // downstream use of x back to the scrutinee's element types (mixin's
+    // `#expr as e -> map_expr .. e` equates the scrutinee's param with
+    // map_expr's row element).  Falls back to a fresh abbreviation instance
+    // when the matched type isn't a row.
     if (auto* pt = std::get_if<Ppat_type>(&p.desc)) {
+      if (!strict) {
+        auto it = tys.find(&p);
+        TypePtr inf = it != tys.end() ? I::Engine::repr(it->second) : nullptr;
+        if (inf && inf->kind == I::Type::Kind::Variant) {
+          TypePtr row =
+              eng.variant_type(inf->labels, inf->args, inf->tag_has_arg, 0);
+          row->abbrev = inf->abbrev;
+          row->abbrev_args = inf->abbrev_args;
+          return row;
+        }
+      }
       if (TypePtr row = hash_type_row(pt->id.txt)) {
         row->variant_kind = 0;
         return row;
@@ -2984,6 +3036,113 @@ struct Checker {
     }
     return fallback();
   }
+  // -- pressure-lite (ocamlc's Parmatch.pressure_variants approximation) --
+  // A variant/`#t` pattern row is an upper bound `[<` ONLY when the match
+  // needs closing for exhaustiveness.  A position whose column has a
+  // catch-all (a var/`_` at the position or at an ancestor; a `#t` at a
+  // strict ancestor -- its sub-positions are unconstrained) keeps the row
+  // OPEN: its tags are lower-bound presence, like construction
+  // (`function `A -> 1 | x -> 2` : `[> `A ] -> int`).  Guarded cases never
+  // make a match exhaustive, so they contribute no wildcards.  Positions are
+  // encoded as step-paths ("/`Abs/0/"); marked nodes are consumed by
+  // infer_pat's Ppat_variant/Ppat_type row builders.
+  std::unordered_set<const Pattern*> open_row_pats_;
+  void mark_open_row_pats(const std::vector<Case>& cases) {
+    if (strict) return;
+    std::vector<std::string> wild_sub, wild_kids;
+    auto covered = [&](const std::string& path) {
+      for (auto& w : wild_sub)  // var/`_` at the position or an ancestor
+        if (path.compare(0, w.size(), w) == 0) return true;
+      for (auto& w : wild_kids)  // `#t` at a strict ancestor
+        if (path.size() > w.size() && path.compare(0, w.size(), w) == 0)
+          return true;
+      return false;
+    };
+    // Is a pattern irrefutable (matches every value of its type)?
+    // Conservative: constructors/variants/constants/#t count refutable.
+    std::function<bool(const Pattern&)> irref = [&](const Pattern& p) -> bool {
+      if (std::holds_alternative<Ppat_var>(p.desc) ||
+          std::holds_alternative<Ppat_any>(p.desc))
+        return true;
+      if (auto* al = std::get_if<Ppat_alias>(&p.desc)) return irref(*al->p);
+      if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) return irref(*ct->p);
+      if (auto* op = std::get_if<Ppat_open>(&p.desc)) return irref(*op->p);
+      if (auto* o = std::get_if<Ppat_or>(&p.desc)) return irref(*o->l) || irref(*o->r);
+      if (auto* tu = std::get_if<Ppat_tuple>(&p.desc)) {
+        for (auto& e : tu->elems)
+          if (!irref(*e)) return false;
+        return true;
+      }
+      if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+        for (auto& [id, fp] : r->fields)
+          if (!irref(*fp)) return false;
+        return true;
+      }
+      if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return irref(*lz->p);
+      return false;
+    };
+    // `ctx_ok` carries "every OFF-PATH sibling above is irrefutable": a
+    // wildcard only covers its column when the arm can't fail elsewhere --
+    // ocamlc's pressure specializes the whole matrix, so `_, `Unchanged`'s
+    // `_` does NOT open the first component (morematch).
+    std::function<void(const Pattern&, const std::string&, bool, bool)> walk =
+        [&](const Pattern& p, const std::string& path, bool collect,
+            bool ctx_ok) {
+      if (collect && ctx_ok &&
+          (std::holds_alternative<Ppat_var>(p.desc) ||
+           std::holds_alternative<Ppat_any>(p.desc))) {
+        wild_sub.push_back(path);
+        return;
+      }
+      if (auto* al = std::get_if<Ppat_alias>(&p.desc)) return walk(*al->p, path, collect, ctx_ok);
+      if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) return walk(*ct->p, path, collect, ctx_ok);
+      if (auto* op = std::get_if<Ppat_open>(&p.desc)) return walk(*op->p, path, collect, ctx_ok);
+      if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+        walk(*o->l, path, collect, ctx_ok);
+        walk(*o->r, path, collect, ctx_ok);
+        return;
+      }
+      if (std::holds_alternative<Ppat_type>(p.desc)) {
+        if (collect) {
+          if (ctx_ok) wild_kids.push_back(path);
+        } else if (covered(path)) open_row_pats_.insert(&p);
+        return;
+      }
+      if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+        if (!collect && covered(path)) open_row_pats_.insert(&p);
+        if (v->arg) walk(**v->arg, path + "`" + v->label + "/", collect, ctx_ok);
+        return;
+      }
+      if (auto* tu = std::get_if<Ppat_tuple>(&p.desc)) {
+        for (size_t i = 0; i < tu->elems.size(); ++i) {
+          bool ok = ctx_ok;
+          for (size_t j = 0; ok && j < tu->elems.size(); ++j)
+            if (j != i && !irref(*tu->elems[j])) ok = false;
+          walk(*tu->elems[i], path + std::to_string(i) + "/", collect, ok);
+        }
+        return;
+      }
+      if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
+        if (k->arg) walk(**k->arg, path + lid_last(k->id.txt) + "/", collect, ctx_ok);
+        return;
+      }
+      if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+        for (auto& [id, fp] : r->fields) {
+          bool ok = ctx_ok;
+          for (auto& [id2, fp2] : r->fields)
+            if (fp2.get() != fp.get() && !irref(*fp2)) ok = false;
+          walk(*fp, path + "." + lid_last(id.txt) + "/", collect, ok);
+        }
+        return;
+      }
+      if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return walk(*lz->p, path + "lazy/", collect, ctx_ok);
+    };
+    for (auto& c : cases)
+      if (!c.guard) walk(c.lhs, "/", /*collect=*/true, /*ctx_ok=*/true);
+    if (wild_sub.empty() && wild_kids.empty()) return;
+    for (auto& c : cases) walk(c.lhs, "/", /*collect=*/false, /*ctx_ok=*/true);
+  }
+
   TypePtr infer_pat_impl(const Pattern& p) {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
       auto t = eng.fresh_var();
@@ -3152,16 +3311,22 @@ struct Checker {
       // [of t]]`.  A match's arms merge to `[< tag-union ..]` (the scrutinee is at
       // most those tags).  Non-strict only (matched variants are conjunctive; the
       // strict pass stays a fresh var -- see the 1st reverted attempt).
+      // A column with a catch-all needs no closing (pressure-lite): OPEN row,
+      // the tag is lower-bound presence.
       TypePtr at = pv->arg ? infer_pat(**pv->arg) : eng.fresh_var();
       if (strict) return eng.fresh_var();
-      return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)}, 1);
+      return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)},
+                              open_row_pats_.count(&p) ? 0 : 1);
     }
     // `#t`: matches any of the variant abbreviation t's tags -> the row
     // `[< t's tags-with-declared-args ]` (so a scrutinee arm-merge unions the
     // tags AND ties the shared tags' args to the DECLARED types, e.g. maf's
     // `#recurs_type_expr` gives `` `TConstr of type_expr list ``, not a var).
     if (auto* ht = std::get_if<Ppat_type>(&p.desc)) {
-      if (TypePtr row = hash_type_row(ht->id.txt)) return row;
+      if (TypePtr row = hash_type_row(ht->id.txt)) {
+        if (open_row_pats_.count(&p)) row->variant_kind = 0;  // pressure-lite
+        return row;
+      }
       return eng.fresh_var();
     }
     if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) {
@@ -3592,6 +3757,7 @@ struct Checker {
       // (A SPLIT window -- rolling the refinement back before the arm body so
       // body side effects persist -- was tried and reverted: arm bodies typed
       // under an un-refined pattern leak wrong bindings; -4/+1 corpus-wide.)
+      mark_open_row_pats(m->cases);
       for (auto& c : m->cases) {
         check_case_structure(c);
         venv.emplace_back();
@@ -4434,6 +4600,24 @@ struct Checker {
       bool pat_all_ground = window, pat_clash = false;
       bool res_all_ground = window, res_clash = false;
       TypePtr pacc = nullptr, racc = nullptr;
+      mark_open_row_pats(fc.cases);
+      // Display pass: flow the return annotation DOWN before the cases, like
+      // ocamlc's expected-type propagation.  A `: _ lambda -> _` row
+      // annotation then meets the patterns as the scrutinee, so a pattern var
+      // binds the DECL expansion's (finalized) nodes -- a body contact
+      // (`Names.remove s`) can no longer rename a decl arg in place (mixin's
+      // free_lambda keeps `Abs of string).  The post-loop constraint
+      // processing still runs (idempotent for what's already unified).
+      if (fold_abbrevs_ && !strict && f.constraint_)
+        if (auto* pc0 = std::get_if<Pconstraint>(&*f.constraint_)) {
+          std::unordered_map<std::string, TypePtr> local0;
+          bool saved_ad = adoptable_annot_;
+          adoptable_annot_ = true;
+          TypePtr at0 =
+              from_coretype(*pc0->type, annot_vars_ ? *annot_vars_ : local0);
+          adoptable_annot_ = saved_ad;
+          soft_unify(eng.arrow(arg, rt), at0);
+        }
       for (auto& c : fc.cases) {
         venv.emplace_back();
         size_t wm = window ? eng.mark() : 0;
@@ -4515,6 +4699,113 @@ struct Checker {
     return t;
   }
 
+  // ocamlc re-expands a folded abbreviation from its DECL at each use, so a
+  // name adopted during one binding's body (free_lambda's `Names.remove s`
+  // renaming the lambda expansion's `string` to `Names.elt`) never leaks into
+  // later uses -- but a live row CAN adopt within its own binding (subst_var's
+  // `[> `Var of Subst.key ]`).  Our expansion rows are shared into the scheme,
+  // so at top-level finalization (display pass) each INTACT abbreviation row
+  // restores its DECL-GROUND tag args from the declaration: zip the manifest's
+  // Rtag types against the row's args, re-pointing a position the decl spells
+  // as a ground constr back to a decl-named node.  Var/param positions keep
+  // the live nodes (the instance's ties).
+  void restore_abbrev_rows(const TypePtr& t0) {
+    std::unordered_set<I::Type*> seen;
+    std::function<TypePtr(const CoreType&, const TypePtr&)> zip =
+        [&](const CoreType& ct, const TypePtr& cur) -> TypePtr {
+      TypePtr c = I::Engine::repr(cur);
+      if (auto* cc = std::get_if<Ptyp_constr>(&ct.desc)) {
+        // Only PRIM-ish decl leaves (string, int, M.t) re-expand; a decl
+        // position that is itself a local ALIAS would recurse through its
+        // manifest (morematch's recursive `type_expr` overflowed the stack).
+        if (type_aliases.count(lid_last(cc->id.txt))) return cur;
+        std::unordered_map<std::string, TypePtr> vars;
+        // The re-expanded node is a fresh EXPANSION node: adoptable, so the
+        // new binding's own contacts can rename it (subst1's `Var of key).
+        bool sm = manifest_expansion_, sa = adoptable_annot_;
+        manifest_expansion_ = adoptable_annot_ = true;
+        TypePtr fresh = from_coretype(ct, vars);
+        manifest_expansion_ = sm;
+        adoptable_annot_ = sa;
+        if (!vars.empty()) return cur;  // decl mentions params: keep live node
+        TypePtr fr = I::Engine::repr(fresh);
+        if (fr->kind != I::Type::Kind::Constr) return cur;  // decl side expands
+        // Always the FRESH node -- even when the name still matches: the
+        // point is breaking the scheme's arg-row/result-row SHARING (ocamlc's
+        // instance re-expands the folded arg, so a use-site rename of the arg
+        // field can't reach the result row -- subst_lambda keeps map_lambda's
+        // `Abs of string while the scrutinee's own field adopts Subst.key).
+        // The replacement inherits the old node's finalization ONLY for a
+        // source-written face (a PARAM annotation's expansion: GENERIC
+        // without scheme_head) -- `(v : var)` keeps `Var of string.  A
+        // SCHEME-finalized node (scheme_head) is exactly what this
+        // re-expansion replaces: the fresh node stays adoptable, so the new
+        // binding's contacts can rename it (subst1's `Var of Subst.key).
+        if (c->kind == I::Type::Kind::Constr && c->level == I::GENERIC_LEVEL &&
+            !c->scheme_head && fr->kind == I::Type::Kind::Constr)
+          fr->level = I::GENERIC_LEVEL;
+        return fresh;
+      }
+      if (auto* tu = std::get_if<Ptyp_tuple>(&ct.desc)) {
+        if (c->kind == I::Type::Kind::Tuple && c->args.size() == tu->elems.size()) {
+          std::vector<TypePtr> es;
+          bool changed = false;
+          for (size_t i = 0; i < tu->elems.size(); ++i) {
+            es.push_back(zip(*tu->elems[i], c->args[i]));
+            if (I::Engine::repr(es.back()) != I::Engine::repr(c->args[i]))
+              changed = true;
+          }
+          if (changed) return eng.tuple(std::move(es));
+        }
+      }
+      return cur;
+    };
+    // Iterative worklist + node budget: this runs per lookup_value
+    // instantiation, and a morematch-sized shared graph would be re-walked
+    // (and its ground fields re-freshened) at every use -- quadratic.  Small
+    // types (where the re-expansion display matters) fit the budget; giant
+    // graphs bail unchanged.
+    std::vector<TypePtr> work{t0};
+    int budget = 512;
+    while (!work.empty()) {
+      if (--budget < 0) return;
+      TypePtr t = I::Engine::repr(work.back());
+      work.pop_back();
+      if (!seen.insert(t.get()).second) continue;
+      if (t->kind == I::Type::Kind::Arrow) {
+        work.push_back(t->dom);
+        work.push_back(t->cod);
+        continue;
+      }
+      bool self_fix = false;  // fixpoint (`'a lambda as 'a`): a LIVE row that
+      for (auto& aa : t->abbrev_args) {  // displays unfolded -- ocamlc keeps
+        TypePtr ar = I::Engine::repr(aa);  // its nodes.  An instantiated
+        if (ar.get() == t.get() ||         // fixpoint's back-edge may point at
+            (ar->kind == I::Type::Kind::Variant &&  // the SCHEME's row (plain
+             ar->abbrev == t->abbrev))     // copy shares back-edges) -- same
+          self_fix = true;                 // abbreviation counts.
+      }
+      if (t->kind == I::Type::Kind::Variant && !t->abbrev.empty() && !self_fix) {
+        auto ai = type_aliases.find(t->abbrev);
+        if (ai != type_aliases.end() && ai->second.manifest &&
+            ai->second.params.size() == t->abbrev_args.size()) {
+          if (auto* pv = std::get_if<Ptyp_variant>(&ai->second.manifest->desc)) {
+            for (auto& r : pv->rows) {
+              auto* rt = std::get_if<Rtag>(&r);
+              if (!rt || rt->types.empty()) continue;
+              for (size_t i = 0; i < t->labels.size(); ++i)
+                if (t->labels[i] == rt->name && i < t->args.size())
+                  t->args[i] = zip(*rt->types[0], t->args[i]);
+            }
+          }
+        }
+      }
+      for (auto& a : t->args) work.push_back(a);
+      for (auto& a : t->abbrev_args) work.push_back(a);
+      for (auto& a : t->inherited) work.push_back(a);
+    }
+  }
+
   // Bind a let group (generalizing each RHS at the outer level).  `toplevel`
   // marks a STRUCTURE-ITEM binding: its family-participant constr heads are
   // finalized (stamped GENERIC) so later items' uses can't relink the
@@ -4538,6 +4829,7 @@ struct Checker {
       eng.enter_level();
       std::vector<TypePtr> tv(bs.size(), nullptr);      // plain: the recursion var
       std::vector<TypePtr> bound(bs.size(), nullptr);   // scheme to generalize
+      std::vector<char> plain_annot(bs.size(), 0);      // `let rec x : T = e`, no univars
       // Named type vars are shared across each binding's annotations exactly
       // like the non-recursive path (`let rec run (c : 'c event) : 'c = ..`
       // ties the param and return to ONE 'c) -- essential when the body is a
@@ -4559,8 +4851,11 @@ struct Checker {
           // name to the annotation rather than the (possibly Any) body, so a
           // body that infers Any (`(module struct end)`) or an under-determined
           // value (`[||]`) doesn't erase the declared type.  tv stays null: the
-          // body is still inferred below (effects/kinds) but not unified back.
+          // body is still inferred below (effects/kinds); it soft-unifies INTO
+          // the annotation (below), pinning flexible holes (`lexpr -> _`)
+          // while the annotation stays the displayed face.
           bound[i] = from_coretype(*pc->typ, avmaps[i]);
+          plain_annot[i] = true;
           bind_pattern_scheme(b.pat, bound[i]);
         } else {
           tv[i] = infer_pat(b.pat);
@@ -4572,6 +4867,11 @@ struct Checker {
         annot_vars_ = &avmaps[i];
         TypePtr te = infer_expr(*bs[i].expr);  // check body (best-effort)
         annot_vars_ = saved_av;
+        // Pin a plain annotation's flexible holes from the body (display/kind
+        // passes): `let rec eval : lexpr -> _ = ..` fills the `_` even when no
+        // recursive use does.  Soft and INTO the annotation: the declared type
+        // stays the face; an Any body can't erase it.
+        if (plain_annot[i] && bound[i]) soft_unify(te, bound[i]);
         if (tv[i]) {
           try_unify(tv[i], te);
           // Display slots: while BOTH spines are arrows, take the DOM from the
