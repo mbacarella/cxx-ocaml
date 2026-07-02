@@ -452,7 +452,22 @@ struct Checker {
         }
         std::vector<TypePtr> as;
         for (auto& a : n->args) as.push_back(from_cmi(a, memo));
-        return eng.constr(std::move(p), std::move(as));
+        TypePtr r = eng.constr(std::move(p), std::move(as));
+        // A functor-result type WITH a manifest (`type key = K.t` in
+        // Ephemeron.K1.Make's result -> `HW.key`) is a transparent
+        // functor-instance abbreviation: TOP priority in unify's family relink
+        // (an int64/Int64.t-typed value used with `HW.mem` displays HW.key --
+        // ocamlc's per-occurrence access path).  Abstract result types
+        // (`'a HW.t`) stay unmarked: genuinely distinct.
+        if (func_result_mode_ && r->args.empty() && cmi_types_ctx_ &&
+            n->path && n->path->kind == cmi::Path::Pident)
+          for (auto& td : *cmi_types_ctx_)
+            if (td.name == n->path->id.name) {
+              if (td.manifest && td.kind != cmi::TypeDecl::Open)
+                r->functor_abbrev = true;
+              break;
+            }
+        return r;
       }
       case cmi::TypeExpr::Tpoly:
         return from_cmi(n->link, memo);
@@ -659,7 +674,12 @@ struct Checker {
               q != opened_submod_quals_.end())
             path = q->second + path.substr(dot);
       }
-      return eng.constr(std::move(path), std::move(as), stamp);
+      TypePtr rc = eng.constr(std::move(path), std::move(as), stamp);
+      // A SOURCE-WRITTEN path never relinks to a family abbreviation: the user
+      // wrote it and ocamlc displays it as written (`(a : int32)` stays int32
+      // even after `Int32.unsigned_compare a b`).  Finalize its family heads.
+      eng.finalize_family_heads(rc);
+      return rc;
     }
     if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) return package_type(*pk);
     // `< m : t; .. >` object annotation -> an Object node (methods; inherits
@@ -888,6 +908,7 @@ struct Checker {
       for (auto& v : cmi.values()) {
         std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
         stdlib_[v.name] = from_cmi(v.type, memo);
+        eng.finalize_family_heads(stdlib_[v.name], /*scheme=*/true);
       }
     } catch (...) {}
     return stdlib_;
@@ -1025,6 +1046,7 @@ struct Checker {
       for (auto& v : mt->sig->values) {
         std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
         out[v.name] = from_cmi(v.type, memo);
+        eng.finalize_family_heads(out[v.name], /*scheme=*/true);
       }
       cmi_abstract_subst_.clear();
     } catch (...) { cmi_abstract_subst_.clear(); }
@@ -1078,6 +1100,7 @@ struct Checker {
         for (auto& v : sig->values) {
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
           out[v.name] = from_cmi(v.type, memo);
+          eng.finalize_family_heads(out[v.name], /*scheme=*/true);
         }
         cmi_types_ctx_ = nullptr;
         cmi_mod_prefix_.clear();
@@ -1182,6 +1205,10 @@ struct Checker {
           if (real && v.type) {
             std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
             out[v.name] = from_cmi(v.type, memo);
+            // A SCHEME's family heads are finalized: uses relink fresh copies,
+            // never the shared scheme node (a live value adopting `HW.key`
+            // must not corrupt HW.mem's own dom for the rest of the file).
+            eng.finalize_family_heads(out[v.name], /*scheme=*/true);
           } else {
             out[v.name] = generic_var();
           }
@@ -3681,8 +3708,13 @@ struct Checker {
     return t;
   }
 
-  // Bind a let group (generalizing each RHS at the outer level).
-  void infer_bindings(RecFlag rf, const std::vector<ValueBinding>& bs) {
+  // Bind a let group (generalizing each RHS at the outer level).  `toplevel`
+  // marks a STRUCTURE-ITEM binding: its family-participant constr heads are
+  // finalized (stamped GENERIC) so later items' uses can't relink the
+  // displayed path -- while an inner let/rec-group node stays live and adopts
+  // abbreviations on contact (ephetest3's `let y = hashcons .. in fill_hw y`).
+  void infer_bindings(RecFlag rf, const std::vector<ValueBinding>& bs,
+                      bool toplevel = false) {
     if (rf == RecFlag::Recursive) {
       // Pre-bind each name; a `let rec f : type a. T = ...` annotation makes f
       // polymorphic-recursive -- bind it to the (generic) annotation so recursive
@@ -3724,7 +3756,31 @@ struct Checker {
       }
       for (size_t i = 0; i < bs.size(); ++i) {
         TypePtr te = infer_expr(*bs[i].expr);  // check body (best-effort)
-        if (tv[i]) try_unify(tv[i], te);
+        if (tv[i]) {
+          try_unify(tv[i], te);
+          // Display slots: while BOTH spines are arrows, take the DOM from the
+          // FUN's own arrow (te) -- the recursion var's arrow may have come
+          // from a recursive-call fallback embedding an ARG node in the dom
+          // (fill_hw must show the param's adopted HW.key, not the argument's
+          // SW.data) -- but the TAIL from the recursion var (a partial
+          // recursive application pins it to the FOLDED abbreviation:
+          // infinite's `Seq.t`, not te's raw `unit -> .. Seq.node`).  The two
+          // sides are dom/cod-unified, so this is display-slot choice only.
+          std::function<TypePtr(const TypePtr&, const TypePtr&, int)> zip =
+              [&](const TypePtr& tvx, const TypePtr& tex, int d) -> TypePtr {
+            TypePtr tr = I::Engine::repr(tvx), er = I::Engine::repr(tex);
+            if (tr == er || d > 32) return tvx;  // shared graph: nothing to pick
+            if (tr->kind == I::Type::Kind::Arrow && er->kind == I::Type::Kind::Arrow)
+              return eng.arrow(er->dom, zip(tr->cod, er->cod, d + 1),
+                               er->arrow_label, er->arrow_lbl);
+            return tvx;  // tv's tail keeps folded abbreviations
+          };
+          TypePtr disp = zip(tv[i], te, 0);
+          if (disp != tv[i]) {
+            bound[i] = disp;
+            bind_pattern_scheme(bs[i].pat, disp);
+          }
+        }
         // A plain declared type `let rec f : T = e` must not clash with the
         // body (reliable check only; mirrors the non-recursive path below).
         if (strict && bs[i].constraint_)
@@ -3742,6 +3798,7 @@ struct Checker {
         if (bound[i]) {
           if (strict || non_expansive(*bs[i].expr)) eng.generalize(bound[i]);
           else eng.demote(bound[i]);
+          if (toplevel && !strict) eng.finalize_family_heads(bound[i], /*scheme=*/true);
         }
       return;
     }
@@ -3791,6 +3848,7 @@ struct Checker {
       // over-eager weak var could false-reject a valid polymorphic use).
       if (strict || non_expansive(*b.expr)) eng.generalize(bound);
       else eng.demote(bound);  // value restriction: lower, don't trap at inner level
+      if (toplevel && !strict) eng.finalize_family_heads(bound, /*scheme=*/true);
       bind_pattern_scheme(b.pat, bound);
       annot_vars_ = saved_av;
     }
@@ -4274,7 +4332,7 @@ struct Checker {
         } else if (auto* tx = std::get_if<Pstr_typext>(&it.desc)) {
           register_typext(tx->ext);
         } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
-          infer_bindings(sv->rf, sv->bindings);
+          infer_bindings(sv->rf, sv->bindings, /*toplevel=*/true);
         else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
           if (!strict)  // value kinds + signature: class method bodies (Pexp_object)
             for (auto& d : pc->decls) {
@@ -4404,6 +4462,7 @@ struct Checker {
             TypePtr ty = from_coretype(*pr->prim.type, vars);
             eng.leave_level();
             eng.generalize(ty);
+            eng.finalize_family_heads(ty, /*scheme=*/true);
             venv.back()[pr->prim.name.txt] = ty;
           }
         } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {

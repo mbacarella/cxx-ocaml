@@ -114,15 +114,23 @@ TypePtr Engine::repr(TypePtr t) {
 }
 
 // Primitive/abbreviation families (see the unify rule): the primitive path a
-// construction carries, and the stdlib abbreviation heads that expand to it.
-// family_prim_of: is this path one of the family primitives?
+// construction/literal carries, and the stdlib abbreviation heads that expand
+// to it.  family_prim_of: is this path one of the family primitives whose
+// finalized heads instantiate fresh-copies (the original lazy/string slice)?
 static const char* family_prim_of(const std::string& p) {
   if (p == "lazy_t") return "lazy_t";
   if (p == "string") return "string";
   if (p == "bytes") return "bytes";
   return nullptr;
 }
-// family_abbr_of: is this path `M.t` for a module M abbreviating a primitive?
+// Any predefined scalar primitive (family relink priority 0).
+static bool known_prim(const std::string& p) {
+  return p == "int" || p == "char" || p == "float" || p == "bool" ||
+         p == "unit" || p == "int32" || p == "int64" || p == "nativeint" ||
+         p == "string" || p == "bytes" || p == "lazy_t";
+}
+// family_abbr_of: is this path `M.t` for a stdlib module M abbreviating a
+// primitive?  (family relink priority 1)
 static const char* family_abbr_of(const std::string& p) {
   if (p.size() < 3 || p.compare(p.size() - 2, 2, ".t") != 0) return nullptr;
   std::string head = p.substr(0, p.size() - 2);
@@ -131,7 +139,27 @@ static const char* family_abbr_of(const std::string& p) {
   if (head == "Lazy" || head == "CamlinternalLazy") return "lazy_t";
   if (head == "String" || head == "StringLabels") return "string";
   if (head == "Bytes" || head == "BytesLabels") return "bytes";
+  if (head == "Int") return "int";
+  if (head == "Char") return "char";
+  if (head == "Float") return "float";
+  if (head == "Bool") return "bool";
+  if (head == "Unit") return "unit";
+  if (head == "Int32") return "int32";
+  if (head == "Int64") return "int64";
+  if (head == "Nativeint") return "nativeint";
   return nullptr;
+}
+// Family relink priority: -1 = not a participant; 0 = predef primitive;
+// 1 = stdlib abbreviation; 2 = functor-instance abbreviation (`HW.key`).
+// Probed rule (ocamlc): on contact the LOWER-priority node adopts the higher
+// (an int64-typed value used with `HW.mem` displays HW.key); equal priorities
+// leave both (first-contact wins in the var's slot).
+static int family_prio(const Type* t) {
+  if (t->stamp) return -1;
+  if (t->functor_abbrev) return 2;
+  if (family_abbr_of(t->path)) return 1;
+  if (known_prim(t->path)) return 0;
+  return -1;
 }
 
 // Occurs-check (a var must not appear in the type it's unified with) plus the
@@ -172,8 +200,19 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a, true);
         break;
-      case Type::Kind::Tuple:
       case Type::Kind::Constr:
+        // A structure captured by a var from an OUTER (older) binding escapes
+        // the current item: finalize its family heads so a later contact can't
+        // relink the now-stored path (ephetest3's `hw` -- its weak 'a takes
+        // fill_hw's SW.data, which must survive the HW.key contacts; the rec
+        // binding's own display uses the fun's arrow, so this doesn't hide
+        // the param's adopted path).
+        if (var->level < level && family_prio(t.get()) >= 0) {
+          note(t);
+          t->level = GENERIC_LEVEL;
+        }
+        [[fallthrough]];
+      case Type::Kind::Tuple:
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a, under_row);
         break;
@@ -242,28 +281,43 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     }
     // Primitive/abbreviation FAMILIES: a primitive (`lazy_t`, `string`,
-    // `bytes` -- what constructions and format literals carry) and its stdlib
-    // abbreviation (`Lazy.t`, `String.t`, ...).  They unify, and -- matching
-    // ocamlc's unify3 link of the expanded heads -- the PRIMITIVE-pathed node
-    // adopts the abbreviation-pathed one, so a value that flows into an
+    // `int64` -- what constructions and literals carry), a stdlib abbreviation
+    // of it (`Lazy.t`, `String.t`, `Int64.t`), or a functor-instance
+    // abbreviation (`HW.key` -- marked at from_cmi).  Compatible pairs unify,
+    // and -- matching ocamlc's unify3 link of the expanded heads -- the
+    // LOWER-priority node adopts the higher one, so a value flowing into an
     // abbreviation-typed context DURING inference displays the abbreviation
-    // (hamming's `Lazy.t`, qsort's `%s`-then-String.compare params), while
-    // finalized bindings are protected by the generic-level fresh head copy in
-    // instantiate (`let l = lazy 1` / `let s = "x"` keep lazy_t / string).
-    // Stamped (local, possibly shadowing) types are excluded.
-    if (!a->stamp && !b->stamp && a->args.size() == b->args.size()) {
-      const char* pa = family_prim_of(a->path);
-      const char* aa = family_abbr_of(a->path);
-      const char* pb = family_prim_of(b->path);
-      const char* ab = family_abbr_of(b->path);
-      if ((pa && ab && !strcmp(pa, ab)) || (aa && pb && !strcmp(aa, pb))) {
-        const TypePtr& prim = pa ? a : b;
-        const TypePtr& abbr = pa ? b : a;
-        for (size_t i = 0; i < prim->args.size(); ++i)
-          unify(prim->args[i], abbr->args[i]);
-        note(prim);
-        prim->kind = Type::Kind::Link;
-        prim->link = abbr;
+    // (hamming's Lazy.t, qsort's String.t, ephetest3's HW.key), while a
+    // FINALIZED (GENERIC-stamped) node never relinks (`let l = lazy 1` /
+    // `let z = 1L` keep their paths; instantiate's fresh head copies protect
+    // the lazy/string slice the same way).  A priority TIE between two functor
+    // abbreviations (HW.key vs SW.data -- same underlying type in a well-typed
+    // program) links the FIRST argument to the second (ocamlc's unify3
+    // link_type t1' t2'), so both display slots converge on one node.  Stamped
+    // (local, possibly shadowing) types are excluded; prim-vs-prim and
+    // abbr-vs-abbr of the SAME family pair only via a real path mismatch below.
+    if (last(a->path) != last(b->path) &&
+        a->args.size() == b->args.size()) {
+      int fa = family_prio(a.get()), fb = family_prio(b.get());
+      bool differ = fa >= 0 && fb >= 0 && fa != fb &&
+          // prim/stdlib-abbr pairs must agree on WHICH primitive; a functor
+          // abbreviation's expansion is unknown, so priority 2 pairs with any.
+          (fa == 2 || fb == 2 ||
+           ((fa == 0 ? a->path : std::string(family_abbr_of(a->path))) ==
+            (fb == 0 ? b->path : std::string(family_abbr_of(b->path)))));
+      bool tie = (fa == 2 && fb == 2) ||
+                 (fa == 1 && fb == 1 &&
+                  std::string(family_abbr_of(a->path)) == family_abbr_of(b->path));
+      if (differ || tie) {
+        const TypePtr& lo = tie ? a : (fa < fb ? a : b);
+        const TypePtr& hi = tie ? b : (fa < fb ? b : a);
+        for (size_t i = 0; i < lo->args.size(); ++i)
+          unify(lo->args[i], hi->args[i]);
+        if (lo->level != GENERIC_LEVEL) {  // finalized nodes keep their path
+          note(lo);
+          lo->kind = Type::Kind::Link;
+          lo->link = hi;
+        }
         return;
       }
     }
@@ -449,7 +503,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Variant: {
         TypePtr r;
         if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
-        else if (t->kind == Type::Kind::Constr) r = constr(t->path, t->args, t->stamp);
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; }
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, t->args);
         else {
           r = variant_type(t->labels, t->args, t->tag_has_arg, t->variant_kind);
@@ -516,17 +570,20 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         // A generic variant row gets a FRESH weak node per use (see `fits`), so a
         // value-restricted use (`bar = wrap ()`) can weaken its own copy without
         // touching the scheme.  Others share-unchanged when nothing changed.
+        // A SCHEME family head (cmi/functor value) also copies per use: the
+        // live instance can adopt abbreviations (fill_hw's SW.merge result
+        // relinking to HW.key) while the scheme node never changes.  Plain
+        // annotation-finalized heads (GENERIC, no scheme_head) share -- copying
+        // them cascaded `changed` through parents and split shared rows
+        // (ref_spec's `as 'a`).
         bool weak_copy = t->kind == Type::Kind::Variant &&
                          t->level == GENERIC_LEVEL && small_acyclic(t);
-        // A FINALIZED lazy head (stamped by generalize/demote) gets a fresh
-        // node per use, so unify's lazy-family relink hits the copy, never the
-        // binding's displayed node (args still shared -- constraints flow).
-        bool lazy_head = t->kind == Type::Kind::Constr &&
-                         t->level == GENERIC_LEVEL && family_prim_of(t->path);
+        bool sch_head = t->kind == Type::Kind::Constr && t->scheme_head &&
+                        t->level == GENERIC_LEVEL;
         TypePtr r;
-        if (!changed && !weak_copy && !lazy_head) r = t;  // monomorphic composite: share the node
+        if (!changed && !weak_copy && !sch_head) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
-        else if (t->kind == Type::Kind::Constr) r = constr(t->path, std::move(as), t->stamp);
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; }
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, std::move(as));
         else {
           r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
@@ -561,6 +618,37 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
   return copy(scheme);
 }
 
+void Engine::finalize_family_heads(const TypePtr& t0, bool scheme) {
+  std::unordered_set<Type*> seen;
+  std::function<void(const TypePtr&)> go = [&](const TypePtr& x0) {
+    TypePtr t = repr(x0);
+    switch (t->kind) {
+      case Type::Kind::Arrow:
+        if (!seen.insert(t.get()).second) break;
+        go(t->dom);
+        go(t->cod);
+        break;
+      case Type::Kind::Constr:
+        if (family_prio(t.get()) >= 0) {
+          t->level = GENERIC_LEVEL;
+          if (scheme) t->scheme_head = true;
+        }
+        [[fallthrough]];
+      case Type::Kind::Tuple:
+      case Type::Kind::Variant:
+      case Type::Kind::Object:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        break;
+      case Type::Kind::Var:
+      case Type::Kind::Link:
+      case Type::Kind::Any:
+        break;
+    }
+  };
+  go(t0);
+}
+
 void Engine::generalize(const TypePtr& t0) {
   // Visited-guarded (see occurs_and_lower): promoting a var to GENERIC is
   // idempotent, so guarding composite re-visits is pure cycle/DAG safety with
@@ -592,7 +680,7 @@ void Engine::generalize(const TypePtr& t0) {
         // the COPY, not the binding's displayed node (ocamlc: `let l = lazy 1`
         // stays `lazy_t` after later uses; only a same-rec-group flow -- where
         // the node is still unstamped and shared -- adopts `Lazy.t`, hamming).
-        if (family_prim_of(t->path)) t->level = GENERIC_LEVEL;
+        // (family-head finalization moved to finalize_family_heads -- top-level only)
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -637,7 +725,7 @@ void Engine::demote(const TypePtr& t0) {
       case Type::Kind::Constr:
         // Weak bindings are FINALIZED too: stamp the lazy head (see generalize)
         // so a later use can't relink the binding's displayed node.
-        if (family_prim_of(t->path)) { note(t); t->level = GENERIC_LEVEL; }
+        // (family-head finalization moved to finalize_family_heads -- top-level only)
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;

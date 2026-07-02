@@ -59,6 +59,13 @@ struct Type {
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are
                              // distinct types even if their paths match.
+  bool functor_abbrev = false;  // Constr: a functor-instance abbreviation
+                             // (`HW.key`, manifest-carrying result-sig type) --
+                             // top priority in the family relink (see unify).
+  bool scheme_head = false;  // Constr: a family head inside a SCHEME (cmi /
+                             // functor-result value): instantiate fresh-copies
+                             // it per use so the live instance can relink
+                             // while the scheme node never does.
 
   TypePtr link;              // Link: forwarding pointer (union-find)
 };
@@ -105,6 +112,14 @@ public:
 
   // Generalize: any variable with level > the current level becomes generic.
   void generalize(const TypePtr& t);
+  // Stamp family-participant constr heads GENERIC: a FINALIZED (structure-item
+  // binding / annotation / cmi scheme) node's display path never relinks on
+  // later use.  `scheme` additionally marks heads for per-use fresh copies in
+  // instantiate (cmi/functor value schemes: their INSTANCES must stay live so
+  // a use can adopt abbreviations, while the scheme node never changes).
+  // Within an item (params, inner lets, rec groups) nodes stay unstamped and
+  // adopt abbreviations on contact, matching ocamlc.  See unify's family rule.
+  void finalize_family_heads(const TypePtr& t, bool scheme = false);
 
   // Lower (not generalize) a value-restricted binding's vars to the current
   // level, so a later sibling's generalize() can't wrongly make them generic.
