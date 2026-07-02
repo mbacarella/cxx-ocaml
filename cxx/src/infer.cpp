@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -503,7 +504,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Variant: {
         TypePtr r;
         if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; }
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, t->args);
         else {
           r = variant_type(t->labels, t->args, t->tag_has_arg, t->variant_kind);
@@ -583,7 +584,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         TypePtr r;
         if (!changed && !weak_copy && !sch_head) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; }
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, std::move(as));
         else {
           r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
@@ -830,6 +831,27 @@ static std::string tvar_letter(size_t i) {
 // is named `as 'aN` at its first full print and back-referenced `'aN` afterwards,
 // matching ocamlc.  `printed` marks nodes whose print has begun (so a re-entry,
 // cyclic or a later occurrence, emits the back-reference and can't loop).
+// Heads of dotted constr paths in the type currently being shown (set by
+// show()): a named first-class-module param `(module M : S)` (name stored in
+// the constr's abbrev) prints its name only when the shown type actually
+// depends on M -- ocamlc's modular-explicits display rule.
+thread_local const std::set<std::string>* g_pkg_dep_heads = nullptr;
+
+void collect_dotted_heads(const TypePtr& t0, std::set<std::string>& heads,
+                          std::unordered_set<Type*>& seen) {
+  TypePtr t = Engine::repr(t0);
+  if (!t || !seen.insert(t.get()).second) return;
+  if (t->kind == Type::Kind::Constr && t->path.rfind("(module ", 0) != 0) {
+    size_t dot = t->path.find('.');
+    if (dot != std::string::npos) heads.insert(t->path.substr(0, dot));
+  }
+  if (t->dom) collect_dotted_heads(t->dom, heads, seen);
+  if (t->cod) collect_dotted_heads(t->cod, heads, seen);
+  for (auto& a : t->args) collect_dotted_heads(a, heads, seen);
+  for (auto& a : t->abbrev_args) collect_dotted_heads(a, heads, seen);
+  for (auto& a : t->inherited) collect_dotted_heads(a, heads, seen);
+}
+
 void show_rec(const TypePtr& t0, std::string& out, int cp,
               std::unordered_map<Type*, std::string>& names,
               std::unordered_set<Type*>& printed,
@@ -935,6 +957,11 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       if (path == "format6" && t->args.size() == 4) path = "format4";
       // Lazy.t is the public abbreviation of CamlinternalLazy.t; print the former.
       if (path == "CamlinternalLazy.t") path = "Lazy.t";
+      // A package constr carrying its module name (`(module M : S)`, name in
+      // abbrev) prints the name only when the shown type depends on M.
+      if (!t->abbrev.empty() && path.rfind("(module ", 0) == 0 && g_pkg_dep_heads &&
+          g_pkg_dep_heads->count(t->abbrev))
+        path = "(module " + t->abbrev + " : " + path.substr(8);
       body += path;
       if (named) body += " as " + names[t.get()];
       if (named && cp > 0) out += "(" + body + ")";
@@ -1048,10 +1075,14 @@ std::string show(const TypePtr& t) {
   { std::unordered_set<Type*> seen, stk; count_refs(t, rc, seen, stk); }
   std::unordered_set<Type*> cyc;          // cycle members (arrow `as` naming)
   { std::unordered_set<Type*> on_stack, done; find_cycles(t, on_stack, done, cyc); }
+  std::set<std::string> heads;            // dotted-path heads (package naming)
+  { std::unordered_set<Type*> seen; collect_dotted_heads(t, heads, seen); }
+  g_pkg_dep_heads = &heads;
   std::string out;
   std::unordered_map<Type*, std::string> names;
   std::unordered_set<Type*> printed;
   show_rec(t, out, 0, names, printed, rc, cyc);
+  g_pkg_dep_heads = nullptr;
   return out;
 }
 

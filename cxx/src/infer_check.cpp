@@ -350,6 +350,28 @@ struct Checker {
   // application of a functor DECLARED IN that signature (`Msg.Define(struct ..)`)
   // can be instantiated from its declared functor type.
   std::unordered_map<std::string, const ast::Signature*> module_sig_asts_;
+  // Signature AST of a local `module type S = sig .. end`, so a first-class-
+  // module param `(module M : S)` can bind M's values at M-qualified types.
+  std::unordered_map<std::string, const ast::Signature*> modtype_sig_asts_;
+  // Value schemes of modtype S's signature, with S's own type names qualified
+  // as `M.<name>` (the unpack param's view of its abstract types).
+  std::unordered_map<std::string, TypePtr> unpack_module_values(
+      const std::string& mod_name, const ast::Signature& items) {
+    std::unordered_map<std::string, TypePtr> out;
+    auto saved = functor_result_abstract_;
+    for (auto& it : items)
+      if (auto* pt = std::get_if<Psig_type>(&it.desc))
+        for (auto& d : pt->decls)
+          functor_result_abstract_[d.name.txt] =
+              eng.constr(mod_name + "." + d.name.txt);
+    for (auto& it : items)
+      if (auto* pv = std::get_if<Psig_value>(&it.desc)) {
+        std::unordered_map<std::string, TypePtr> vars;
+        out[pv->vd.name.txt] = from_coretype(*pv->vd.type, vars);
+      }
+    functor_result_abstract_ = std::move(saved);
+    return out;
+  }
   std::unordered_map<std::string, TypePtr> functor_param_subst_;     // "Elem.t" -> arg type
   std::unordered_map<std::string, TypePtr> functor_result_abstract_; // RS's bare "t" -> fresh var
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
@@ -531,9 +553,13 @@ struct Checker {
     return "";
   }
   // A first-class-module type `(module S)`: a constr whose path renders verbatim
-  // (constraints `with type ..` are dropped -- best effort).
-  TypePtr package_type(const Ptyp_package& pk) {
-    return eng.constr("(module " + lid_full(pk.path.txt) + ")");
+  // (constraints `with type ..` are dropped -- best effort).  A named unpack
+  // param `(module M : S)` stores M in the constr's abbrev; show prints
+  // `(module M : S)` when the displayed type depends on M (modular explicits).
+  TypePtr package_type(const Ptyp_package& pk, const std::string& mod_name = "") {
+    TypePtr t = eng.constr("(module " + lid_full(pk.path.txt) + ")");
+    t->abbrev = mod_name;
+    return t;
   }
 
   TypePtr from_coretype(const CoreType& t,
@@ -2789,7 +2815,8 @@ struct Checker {
     // `(module M : S)`: a first-class-module parameter has the package type
     // `(module S)` (the module name M is bound to a module, not a value).
     if (auto* up = std::get_if<Ppat_unpack>(&p.desc))
-      return up->pkg ? package_type(*up->pkg) : eng.fresh_var();
+      return up->pkg ? package_type(*up->pkg, up->name.txt ? *up->name.txt : "")
+                     : eng.fresh_var();
     return eng.fresh_var();
   }
 
@@ -3520,6 +3547,49 @@ struct Checker {
         }
     if (!trivial) apply_plans[&enode] = std::move(m.slots);
   }
+  // Rebuild `t` with constr paths under head `from` ("M.") reheaded to `to`
+  // ("String."), SHARING unaffected subtrees (the instantiated type may share
+  // nodes with the callee's scheme, which must keep its own M.t display).
+  // Cyclic back-edges resolve to the original node (pre-registered memo).
+  TypePtr subst_path_head(const TypePtr& t0, const std::string& from,
+                          const std::string& to,
+                          std::unordered_map<I::Type*, TypePtr>& memo) {
+    TypePtr t = I::Engine::repr(t0);
+    if (auto m = memo.find(t.get()); m != memo.end()) return m->second;
+    memo[t.get()] = t;
+    switch (t->kind) {
+      case I::Type::Kind::Arrow: {
+        TypePtr d = subst_path_head(t->dom, from, to, memo);
+        TypePtr c = subst_path_head(t->cod, from, to, memo);
+        if (d.get() == I::Engine::repr(t->dom).get() &&
+            c.get() == I::Engine::repr(t->cod).get())
+          return t;
+        TypePtr r = eng.arrow(d, c, t->arrow_label, t->arrow_lbl);
+        memo[t.get()] = r;
+        return r;
+      }
+      case I::Type::Kind::Tuple:
+      case I::Type::Kind::Constr: {
+        bool hit = t->kind == I::Type::Kind::Constr && t->path.rfind(from, 0) == 0;
+        std::vector<TypePtr> as;
+        bool changed = hit;
+        for (auto& a : t->args) {
+          as.push_back(subst_path_head(a, from, to, memo));
+          if (as.back().get() != I::Engine::repr(a).get()) changed = true;
+        }
+        if (!changed) return t;
+        TypePtr r = t->kind == I::Type::Kind::Tuple
+                        ? eng.tuple(std::move(as))
+                        : eng.constr(hit ? to + t->path.substr(from.size()) : t->path,
+                                     std::move(as), t->stamp);
+        memo[t.get()] = r;
+        return r;
+      }
+      default:
+        return t;
+    }
+  }
+
   TypePtr infer_apply(const Pexp_apply& a, const Expression& enode) {
     TypePtr ft = infer_expr(*a.fn);
     record_apply_plan(a, enode, ft);
@@ -3589,11 +3659,26 @@ struct Checker {
                               // later LABELLED arg commutes past an optional WITHOUT
                               // erasing it (`f ~check:false ~rebind:false` keeps the
                               // intervening `?shape` in the result type).
+      // A named package param `(module M : T)` applied to `(module String)`
+      // substitutes M's paths in the RESULT: `g (module String) "x"` gives
+      // `String.t * int`, per ocamlc's dependent-application rule.
+      std::vector<std::pair<std::string, std::string>> pkg_substs;
       for (auto& [lbl, arg] : a.args) {
         auto [lk, nm] = arglabel(lbl);
         int idx = match_param(spine, used, lk, nm);
         used[idx] = true;
         if (lk == 0 && idx > maxc) maxc = idx;
+        if (!strict) {
+          TypePtr dr = I::Engine::repr(spine[idx]->dom);
+          if (dr->kind == I::Type::Kind::Constr && !dr->abbrev.empty() &&
+              dr->path.rfind("(module ", 0) == 0)
+            if (auto* pk2 = std::get_if<Pexp_pack>(&arg->desc)) {
+              const ModuleExpr* m = pk2->me.get();
+              while (auto* mc = std::get_if<Pmod_constraint>(&m->desc)) m = mc->me.get();
+              if (auto* mi = std::get_if<Pmod_ident>(&m->desc))
+                pkg_substs.emplace_back(dr->abbrev + ".", lid_full(mi->id.txt) + ".");
+            }
+        }
         TypePtr at = infer_expr_expected(*arg, spine[idx]->dom);
         // Restrict to a literal-constant argument: its type is certain, whereas a
         // GADT/abstract-typed expression argument may be mis-inferred.
@@ -3609,6 +3694,10 @@ struct Checker {
         if (used[i]) continue;
         if (spine[i]->arrow_label == 2 && i < maxc) continue;  // erased optional
         res = eng.arrow(spine[i]->dom, res, spine[i]->arrow_label, spine[i]->arrow_lbl);
+      }
+      for (auto& [from, to] : pkg_substs) {
+        std::unordered_map<I::Type*, TypePtr> memo;
+        res = subst_path_head(res, from, to, memo);
       }
       return res;
     }
@@ -3741,6 +3830,12 @@ struct Checker {
       }
     struct Param { TypePtr ty; int lk; std::string nm; };
     std::vector<Param> params;
+    // First-class-module params `(module M : S)` bind M's values (at
+    // M-qualified abstract types) for the body -- `P.print x` ties x : P.t.
+    // Saved/restored around the body so M doesn't leak past the function.
+    std::vector<std::pair<std::string,
+                          std::optional<std::unordered_map<std::string, TypePtr>>>>
+        saved_mods;
     for (auto& fp : f.params) {
       // (type a) introduces a locally-abstract type, not a value argument, so it
       // contributes no arrow to the function's type.
@@ -3750,6 +3845,19 @@ struct Checker {
         // an optional parameter's type is its default's type: `?(c = 100)` => int
         if (pv->default_) try_unify(pt, infer_expr(**pv->default_));
         params.push_back({pt, lk, nm});
+        if (!strict)
+          if (auto* up = std::get_if<Ppat_unpack>(&pv->pat.desc);
+              up && up->name.txt && up->pkg)
+            if (auto* pl = std::get_if<Lident>(&up->pkg->path.txt.v))
+              if (auto sg = modtype_sig_asts_.find(pl->name);
+                  sg != modtype_sig_asts_.end()) {
+                auto prior = modenv.find(*up->name.txt);
+                saved_mods.emplace_back(*up->name.txt,
+                    prior != modenv.end() ? std::optional(prior->second)
+                                          : std::nullopt);
+                modenv[*up->name.txt] =
+                    unpack_module_values(*up->name.txt, *sg->second);
+              }
       }
     }
     TypePtr body;
@@ -3808,6 +3916,10 @@ struct Checker {
     for (auto& [nm, prior] : saved_newtypes) {
       if (prior) newtype_vars[nm] = *prior;
       else newtype_vars.erase(nm);
+    }
+    for (auto& [nm, prior] : saved_mods) {
+      if (prior) modenv[nm] = std::move(*prior);
+      else modenv.erase(nm);
     }
     return t;
   }
@@ -4657,8 +4769,10 @@ struct Checker {
           }
         } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
           if (mt->type)  // record a signature module type's value names for unpacks
-            if (auto* sg = std::get_if<Pmty_signature>(&mt->type->desc))
+            if (auto* sg = std::get_if<Pmty_signature>(&mt->type->desc)) {
               collect_sig_values(sg->items, modtype_env[mt->name.txt]);
+              modtype_sig_asts_[mt->name.txt] = &sg->items;
+            }
         }
       } catch (const I::TypeError&) {
       }
