@@ -716,8 +716,13 @@ struct Checker {
       // Pad an under-applied type (e.g. an existential GADT's `_ raw_arity`
       // written with fewer wildcards than the type's arity) with Any, so it
       // unifies with the fully-applied form instead of clashing on arity.
+      // Only when at least one argument was WRITTEN: type_arity is a flat
+      // bare-name map, so a zero-ary type sharing its name with some other
+      // module's parameterized type (`Pos.t` vs `Immutable_array.'a t`) would
+      // otherwise grow a spurious Any arg -- which poisons a signature
+      // ascription's value translation (test_generator's `Pos.t` params).
       auto ar = type_arity.find(lid_last(c->id.txt));
-      if (ar != type_arity.end())
+      if (ar != type_arity.end() && !as.empty())
         while ((int)as.size() < ar->second) as.push_back(eng.any());
       // Expand a known type abbreviation (type (params) name = manifest), with a
       // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
@@ -3665,37 +3670,94 @@ struct Checker {
       return eng.any();
     }
     if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
-      // Record update `{ e with ... }` flows the base record through incomplete
-      // inference (e.g. recursive maps over a record tree) and clashes; its
-      // soundness value is low, so type only plain construction.
+      // Record update `{ e with ... }`: ocamlc types the result as a FRESH
+      // instance of the record type, tied to the base only through the KEPT
+      // (non-overridden) fields (typecore's unify_kept).  A type parameter that
+      // appears only in overridden fields may therefore CHANGE across the
+      // update: `{ node with schedule = f node.schedule }` maps `'a node` to
+      // `'b node`.  Soundness value is low, so all of this stays non-strict.
       if (rc->base) {
         bool sv = strict; strict = false;
         TypePtr bt = infer_expr(**rc->base);
-        for (auto& [lbl, val] : rc->fields) {
-          TypePtr vt = infer_expr(*val);
+        std::vector<std::pair<std::string, TypePtr>> overr;
+        for (auto& [lbl, val] : rc->fields)
+          overr.emplace_back(lid_last(lbl.txt), infer_expr(*val));
+        // Pin the base's record identity through the first resolvable label so
+        // the decl lookup below sees a Constr even when the base is a bare var.
+        for (auto& [lbl, vt] : overr)
+          if (TypePtr fsch = field_scheme(lbl)) {
+            TypePtr s = I::Engine::repr(eng.instantiate(fsch));
+            try_unify(bt, s->dom);
+            break;
+          }
+        // The two-instance model needs the decl's full field list (to know the
+        // kept fields), with every field's scheme resolvable and every written
+        // label belonging to the decl; otherwise fall back to result == base.
+        TypePtr rb = I::Engine::repr(bt);
+        const TypeDeclaration* decl = nullptr;
+        if (rb->kind == I::Type::Kind::Constr) {
+          if (rb->stamp) { auto it = stamp_record_decl_.find(rb->stamp);
+                           if (it != stamp_record_decl_.end()) decl = it->second; }
+          if (!decl && !ambiguous_record_names_.count(rb->path)) {
+            auto it = name_record_decl_.find(rb->path);
+            if (it != name_record_decl_.end()) decl = it->second;
+          }
+        }
+        const Ptype_record* rec =
+            decl ? std::get_if<Ptype_record>(&decl->kind) : nullptr;
+        bool split = rec != nullptr;
+        if (split) {
+          std::set<std::string> declset;
+          for (auto& f : rec->fields) declset.insert(f.name.txt);
+          for (auto& f : rec->fields)
+            if (!field_scheme(f.name.txt)) { split = false; break; }
+          for (auto& [lbl, vt] : overr)
+            if (!declset.count(lbl)) { split = false; break; }
+        }
+        TypePtr resTy = nullptr;
+        if (split) {
+          std::set<std::string> overrset;
+          for (auto& [lbl, vt] : overr) {
+            overrset.insert(lbl);
+            TypePtr s = I::Engine::repr(eng.instantiate(field_scheme(lbl)));
+            if (resTy) try_unify(resTy, s->dom); else resTy = s->dom;
+            try_unify(vt, s->cod);
+          }
+          for (auto& f : rec->fields) {  // unify_kept
+            if (overrset.count(f.name.txt)) continue;
+            TypePtr fsch = field_scheme(f.name.txt);
+            TypePtr s1 = I::Engine::repr(eng.instantiate(fsch));
+            try_unify(s1->dom, bt);
+            TypePtr s2 = I::Engine::repr(eng.instantiate(fsch));
+            try_unify(s2->dom, resTy);
+            try_unify(s1->cod, s2->cod);
+          }
+        } else {
           // Constrain each overridden field to its declared type, tying the field
           // scheme's record-type (dom) to the base record so its type parameters are
           // shared: `{ M.null_tracker with alloc_minor }` recovers alloc_minor's
           // type (`M.allocation -> 'a option`) instead of leaking a free var.
-          if (TypePtr fsch = field_scheme(lid_last(lbl.txt))) {
-            TypePtr s = I::Engine::repr(eng.instantiate(fsch));
-            try_unify(bt, s->dom);
-            try_unify(vt, s->cod);
-          }
+          for (auto& [lbl, vt] : overr)
+            if (TypePtr fsch = field_scheme(lbl)) {
+              TypePtr s = I::Engine::repr(eng.instantiate(fsch));
+              try_unify(bt, s->dom);
+              try_unify(vt, s->cod);
+            }
+          // The update's type IS the base record's type; returning it (instead
+          // of `any`) lets a field read on the result (`let it = {super with ..}
+          // in it.it_module_type`) resolve its label through that record type.
+          resTy = bt;
         }
         strict = sv;
         // For the dump's `<kept>` fields, resolve an EXTERNAL record type's full
         // ordered field list from the cmis (local records use the transcriber's
         // own field registry).
-        { TypePtr rb = I::Engine::repr(bt);
-          if (rb->kind == I::Type::Kind::Constr) {
-            auto fs = cmi_record_fields(rb->path);
+        { TypePtr rb2 = I::Engine::repr(bt);
+          if (rb2->kind == I::Type::Kind::Constr) {
+            auto fs = cmi_record_fields(rb2->path);
             if (!fs.empty()) record_fields[&e] = std::move(fs);
           } }
-        // The update's type IS the base record's type; returning it (instead of
-        // `any`) lets a field read on the result (`let it = {super with ..} in
-        // it.it_module_type`) resolve its label through that record type.
-        return bt;
+        return resTy;
       }
       TypePtr recTy = nullptr;
       for (auto& [lbl, val] : rc->fields) {
