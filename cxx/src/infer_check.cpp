@@ -357,6 +357,30 @@ struct Checker {
   // against a modtype can resolve the sig's abstract types from M's own
   // manifests (`type t1 = s1` -> the sig's t1 IS s1, not an opaque M.t1).
   std::unordered_map<std::string, const ast::Structure*> local_module_structs_;
+  // Bind a signature's typext ctors (`type t += E [of u]`) into the innermost
+  // cenv scope, translating under the current substitution context.  Scoped
+  // (not the flat map): a second flat registration of an already-registered
+  // name would only mark it ambiguous.
+  void bind_sig_typext_ctors(const ast::Signature& items) {
+    for (auto& it : items)
+      if (auto* tx = std::get_if<Psig_typext>(&it.desc))
+        for (auto& ec : tx->ext.ctors)
+          if (auto* d = std::get_if<Pext_decl>(&ec.kind)) {
+            std::unordered_map<std::string, TypePtr> vars;
+            TypePtr result;
+            if (d->res) result = from_coretype(**d->res, vars);
+            else {
+              std::vector<TypePtr> params;
+              for (auto& p : tx->ext.params) params.push_back(from_coretype(*p, vars));
+              result = eng.constr(lid_last(tx->ext.path.txt), params);
+            }
+            TypePtr scheme = result;
+            if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
+              for (auto it2 = tup->elems.rbegin(); it2 != tup->elems.rend(); ++it2)
+                scheme = eng.arrow(from_coretype(**it2, vars), scheme);
+            cenv.back()[ec.name.txt] = scheme;
+          }
+  }
   // Value schemes of modtype S's signature, with S's own type names qualified
   // as `M.<name>` (the unpack param's view of its abstract types).
   std::unordered_map<std::string, TypePtr> unpack_module_values(
@@ -1079,24 +1103,7 @@ struct Checker {
     // scoped cenv, not the flat map -- the functor BODY's harvest already put
     // an unsubstituted `C` there, and a second flat registration would only
     // mark the name ambiguous.
-    for (auto& it : rs->items)
-      if (auto* tx = std::get_if<Psig_typext>(&it.desc))
-        for (auto& ec : tx->ext.ctors)
-          if (auto* d = std::get_if<Pext_decl>(&ec.kind)) {
-            std::unordered_map<std::string, TypePtr> vars;
-            TypePtr result;
-            if (d->res) result = from_coretype(**d->res, vars);
-            else {
-              std::vector<TypePtr> params;
-              for (auto& p : tx->ext.params) params.push_back(from_coretype(*p, vars));
-              result = eng.constr(lid_last(tx->ext.path.txt), params);
-            }
-            TypePtr scheme = result;
-            if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
-              for (auto it2 = tup->elems.rbegin(); it2 != tup->elems.rend(); ++it2)
-                scheme = eng.arrow(from_coretype(**it2, vars), scheme);
-            cenv.back()[ec.name.txt] = scheme;
-          }
+    bind_sig_typext_ctors(rs->items);
     functor_param_subst_ = std::move(saved_subst);
     functor_result_abstract_ = std::move(saved_abstract);
     // Tie the argument's values to the parameter signature's expected types
@@ -3936,6 +3943,7 @@ struct Checker {
 
   TypePtr infer_function(const Pexp_function& f) {
     venv.emplace_back();
+    cenv.emplace_back();  // scope for module-param ctor bindings (see below)
     // Bind all (type a) params to flexible vars first, so value-param
     // annotations mentioning them resolve regardless of order.  Save any
     // shadowed outer binding of the same name and restore it on exit -- a nested
@@ -3966,10 +3974,16 @@ struct Checker {
         // an optional parameter's type is its default's type: `?(c = 100)` => int
         if (pv->default_) try_unify(pt, infer_expr(**pv->default_));
         params.push_back({pt, lk, nm});
-        if (!strict)
-          if (auto* up = std::get_if<Ppat_unpack>(&pv->pat.desc);
-              up && up->name.txt && up->pkg)
-            if (auto* pl = std::get_if<Lident>(&up->pkg->path.txt.v))
+        if (!strict) {
+          const Ppat_unpack* up = std::get_if<Ppat_unpack>(&pv->pat.desc);
+          const Ptyp_package* upkg = up && up->pkg ? &*up->pkg : nullptr;
+          // `?opt:((module M) = (module M1 : S))`: the bare unpack's package
+          // type comes from the default's pack annotation.
+          if (up && !upkg && pv->default_)
+            if (auto* dp = std::get_if<Pexp_pack>(&(*pv->default_)->desc))
+              if (dp->pkg) upkg = &*dp->pkg;
+          if (up && up->name.txt && upkg)
+            if (auto* pl = std::get_if<Lident>(&upkg->path.txt.v))
               if (auto sg = modtype_sig_asts_.find(pl->name);
                   sg != modtype_sig_asts_.end()) {
                 auto prior = modenv.find(*up->name.txt);
@@ -3979,13 +3993,17 @@ struct Checker {
                 // `with type t = a` constraints substitute into the bound
                 // values (M's t IS a; qualifying it M.t would capture a).
                 std::unordered_map<std::string, TypePtr> argtypes;
-                for (auto& [lid, ctb] : up->pkg->constraints) {
+                for (auto& [lid, ctb] : upkg->constraints) {
                   std::unordered_map<std::string, TypePtr> vars;
                   argtypes[lid_full(lid.txt)] = from_coretype(*ctb, vars);
                 }
                 modenv[*up->name.txt] =
                     unpack_module_values(*up->name.txt, *sg->second, &argtypes);
+                // The sig's typext ctors (`type t += E`) resolve as `M.E` in
+                // the body (binding1's `?(opt = M.E)`) -- function-scoped cenv.
+                bind_sig_typext_ctors(*sg->second);
               }
+        }
       }
     }
     TypePtr body;
@@ -4049,6 +4067,7 @@ struct Checker {
     TypePtr t = body;
     for (auto it = params.rbegin(); it != params.rend(); ++it)
       t = eng.arrow(it->ty, t, it->lk, it->nm);
+    cenv.pop_back();
     venv.pop_back();
     for (auto& [nm, prior] : saved_newtypes) {
       if (prior) newtype_vars[nm] = *prior;
