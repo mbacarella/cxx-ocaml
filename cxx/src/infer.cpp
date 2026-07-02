@@ -417,9 +417,9 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
   // (testerror's anon slot resolves string).  Lenient (display) pass only.
   if (lenient && abbrev_resolver) {
     if (a->kind == Type::Kind::Constr && b->kind != Type::Kind::Constr)
-      if (TypePtr e = abbrev_resolver(a->path)) { unify(e, b); return; }
+      if (TypePtr e = abbrev_resolver(a->path, a->args)) { unify(e, b); return; }
     if (b->kind == Type::Kind::Constr && a->kind != Type::Kind::Constr)
-      if (TypePtr e = abbrev_resolver(b->path)) { unify(a, e); return; }
+      if (TypePtr e = abbrev_resolver(b->path, b->args)) { unify(a, e); return; }
   }
   if (lenient) return;
   throw TypeError("cannot unify incompatible types");

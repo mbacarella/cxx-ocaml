@@ -92,7 +92,7 @@ public:
   // manifest translation, null if not an expandable abbreviation), provided
   // by the checker.  Used by unify (lenient pass only) when a Constr meets a
   // non-Constr shape, so the folded name still ties the other side.
-  std::function<TypePtr(const std::string&)> abbrev_resolver;
+  std::function<TypePtr(const std::string&, const std::vector<TypePtr>&)> abbrev_resolver;
   void enter_level() { ++level; }
   void leave_level() { --level; }
 
