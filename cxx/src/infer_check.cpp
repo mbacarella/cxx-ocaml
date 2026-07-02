@@ -4424,14 +4424,21 @@ struct Checker {
       eng.enter_level();
       std::vector<TypePtr> tv(bs.size(), nullptr);      // plain: the recursion var
       std::vector<TypePtr> bound(bs.size(), nullptr);   // scheme to generalize
+      // Named type vars are shared across each binding's annotations exactly
+      // like the non-recursive path (`let rec run (c : 'c event) : 'c = ..`
+      // ties the param and return to ONE 'c) -- essential when the body is a
+      // windowed GADT match whose structural unifications roll back, leaving
+      // the annotation tie as the only source of the result type.
+      std::vector<std::unordered_map<std::string, TypePtr>> avmaps(bs.size());
+      auto* saved_av = annot_vars_;
       for (size_t i = 0; i < bs.size(); ++i) {
         const ValueBinding& b = bs[i];
+        annot_vars_ = &avmaps[i];
         const Pvc_constraint* pc =
             b.constraint_ ? std::get_if<Pvc_constraint>(&*b.constraint_) : nullptr;
         if (pc && !pc->univars.empty()) {
           for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
-          std::unordered_map<std::string, TypePtr> vars;
-          bound[i] = from_coretype(*pc->typ, vars);
+          bound[i] = from_coretype(*pc->typ, avmaps[i]);
           bind_pattern_scheme(b.pat, bound[i]);
         } else if (pc && !strict) {
           // A plain declared type `let rec x : T = e` pins x to T -- bind the
@@ -4439,16 +4446,18 @@ struct Checker {
           // body that infers Any (`(module struct end)`) or an under-determined
           // value (`[||]`) doesn't erase the declared type.  tv stays null: the
           // body is still inferred below (effects/kinds) but not unified back.
-          std::unordered_map<std::string, TypePtr> vars;
-          bound[i] = from_coretype(*pc->typ, vars);
+          bound[i] = from_coretype(*pc->typ, avmaps[i]);
           bind_pattern_scheme(b.pat, bound[i]);
         } else {
           tv[i] = infer_pat(b.pat);
           bound[i] = tv[i];
         }
       }
+      annot_vars_ = saved_av;
       for (size_t i = 0; i < bs.size(); ++i) {
+        annot_vars_ = &avmaps[i];
         TypePtr te = infer_expr(*bs[i].expr);  // check body (best-effort)
+        annot_vars_ = saved_av;
         if (tv[i]) {
           try_unify(tv[i], te);
           // Display slots: while BOTH spines are arrows, take the DOM from the
@@ -5185,6 +5194,38 @@ struct Checker {
           std::string saved_fbn = func_bind_name_;
           if (!strict && std::holds_alternative<Pmod_apply>(op->expr.desc))
             func_bind_name_ = resolve_local_module_path(op->expr);
+          // `open F(X)` of a LOCAL functor with a struct body: register the
+          // body's type decls and (GADT) ctors under the applicative path, so
+          // an opened `'a event` annotation displays `MkReify(PC).event` and
+          // a match on Ret/Eff resolves + windows (shallow2deep).
+          if (!strict && !func_bind_name_.empty())
+            if (auto* ap = std::get_if<Pmod_apply>(&op->expr.desc))
+              if (auto* fh = std::get_if<Pmod_ident>(&ap->f->desc)) {
+                auto comps = mod_components(fh->id.txt);
+                if (comps.size() == 1)
+                  if (auto fb = functor_body_exprs_.find(comps[0]);
+                      fb != functor_body_exprs_.end())
+                    if (auto* bs = std::get_if<Pmod_structure>(&fb->second->desc)) {
+                      std::string savedp = mod_prefix_;
+                      mod_prefix_ = func_bind_name_ + ".";
+                      for (auto& bit : bs->items)
+                        if (auto* ty2 = std::get_if<Pstr_type>(&bit.desc)) {
+                          for (auto& d : ty2->decls) {
+                            register_type_decl(d);
+                            register_record_decl(d);
+                          }
+                          for (auto& d : ty2->decls) {
+                            if (type_stamp_.count(&d))
+                              tenv.back()[d.name.txt] = type_stamp_[&d];
+                            if (auto* v2 = std::get_if<Ptype_variant>(&d.kind))
+                              for (auto& c : v2->ctors)
+                                if (ctor_scheme_.count(&c))
+                                  cenv.back()[c.name.txt] = ctor_scheme_[&c];
+                          }
+                        }
+                      mod_prefix_ = savedp;
+                    }
+              }
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
           func_bind_name_ = saved_fbn;
           if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc)) {  // open M -> M's submodules
