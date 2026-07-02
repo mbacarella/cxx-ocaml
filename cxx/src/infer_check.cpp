@@ -1025,6 +1025,30 @@ struct Checker {
       }
     } catch (...) {}
   }
+  // `open M` where M's cmi declares module ALIASES (StdLabels's `module List =
+  // ListLabels`): a bare `List.map` afterwards resolves through the alias
+  // target, so the LABELLED map applies (`List.map xs ~f`).  bare name ->
+  // target path components.
+  std::unordered_map<std::string, std::vector<std::string>> opened_module_aliases_;
+  void load_open_module_aliases(const Longident& m) {
+    auto comps = mod_components(m);
+    if (comps.empty()) return;
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (sig)
+        for (auto& mm : sig->modules)
+          if (mm.type && mm.type->kind == cmi::ModuleType::Alias && mm.type->path)
+            opened_module_aliases_[mm.name] =
+                mod_components_str(cmi_path_str(*mm.type->path));
+    } catch (...) {}
+  }
   // resolve_module_values memoized by module path (cmi loads are expensive and a
   // file may reference M.x many times).
   std::unordered_map<std::string, std::unordered_map<std::string, TypePtr>> modvals_cache_;
@@ -1200,17 +1224,20 @@ struct Checker {
   // re-entrancy-guarded via the negative cache.
   std::unordered_map<std::string, TypePtr> abbrev_exp_cache_;
   std::set<std::string> abbrev_exp_neg_;
-  TypePtr resolve_abbrev_expansion(const std::string& path) {
-    if (auto it = abbrev_exp_cache_.find(path); it != abbrev_exp_cache_.end())
-      return it->second;
-    if (!abbrev_exp_neg_.insert(path).second) return nullptr;
+  TypePtr resolve_abbrev_expansion(const std::string& path,
+                                   const std::vector<TypePtr>& args) {
+    if (args.empty())
+      if (auto it = abbrev_exp_cache_.find(path); it != abbrev_exp_cache_.end())
+        return it->second;
+    if (abbrev_exp_neg_.count(path)) return nullptr;
     std::vector<std::string> comps;
     for (size_t p = 0, d; p < path.size(); p = d + 1) {
       d = path.find('.', p);
       if (d == std::string::npos) { comps.push_back(path.substr(p)); break; }
       comps.push_back(path.substr(p, d - p));
     }
-    if (comps.size() < 2) return nullptr;
+    if (comps.size() < 2) { abbrev_exp_neg_.insert(path); return nullptr; }
+    abbrev_exp_neg_.insert(path);  // re-entrancy guard; erased on success
     try {
       std::vector<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
@@ -1220,16 +1247,20 @@ struct Checker {
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
         sig = md ? module_sig(md->type, loaded) : nullptr;
       }
-      if (!sig) return nullptr;
-      for (auto& td : sig->types)
-        if (td.name == comps.back()) {
-          if (!td.manifest || !td.params.empty() || td.kind == cmi::TypeDecl::Open)
-            return nullptr;
-          std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
-          TypePtr r = from_cmi(td.manifest, memo);
-          if (r) abbrev_exp_cache_[path] = r;
-          return r;
-        }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == comps.back()) {
+            if (!td.manifest || td.params.size() != args.size() ||
+                td.kind == cmi::TypeDecl::Open)
+              return nullptr;
+            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            for (size_t i = 0; i < args.size(); ++i)
+              memo[td.params[i].get()] = args[i];
+            TypePtr r = from_cmi(td.manifest, memo);
+            abbrev_exp_neg_.erase(path);
+            if (r && args.empty()) abbrev_exp_cache_[path] = r;
+            return r;
+          }
     } catch (...) {}
     return nullptr;
   }
@@ -1277,6 +1308,14 @@ struct Checker {
     {
       auto it = modenv.find(comps.back());
       if (it != modenv.end()) return it->second;
+    }
+    // An opened module's ALIAS member (`open StdLabels` -> List = ListLabels):
+    // reroute the head through the alias target.
+    if (auto al = opened_module_aliases_.find(comps[0]);
+        al != opened_module_aliases_.end()) {
+      std::vector<std::string> t = al->second;
+      t.insert(t.end(), comps.begin() + 1, comps.end());
+      comps = std::move(t);
     }
     std::unordered_map<std::string, TypePtr> out;
     try {
@@ -3088,6 +3127,13 @@ struct Checker {
         auto er = I::Engine::repr(expected);  // format6's arg0 ('a) is the args function
         if (er->kind == I::Type::Kind::Constr && !er->args.empty()) {
           std::vector<TypePtr> a = er->args; a[0] = format_arrow(s->s, a);
+          // A literal's format6 ties slots 3 and 4 (oracle: `"%S\n" :
+          // (string -> 'a, 'b, 'c, 'd, 'd, 'a) format6`).  This routes a
+          // scanf receiver: Scanf.scanner's slot4 `'a -> 'd` flows into
+          // slot3 'c (the scanner result), so `bscanf ib "%S\n" recv`
+          // applies recv : (string -> 'x) -> 'x.  Printf formats already
+          // have the slots equal, so the tie is a no-op there.
+          if (a.size() >= 5) soft_unify(a[3], a[4]);
           return eng.constr(er->path, std::move(a));
         }
         return expected;
@@ -4962,6 +5008,7 @@ struct Checker {
             if (!strict) {
               load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
               open_module_ctors(pi->id.txt);     // bare ctor -> M's variant ctor
+              load_open_module_aliases(pi->id.txt);  // bare List -> ListLabels
             }
           }
         } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
@@ -5127,8 +5174,8 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
 static void run_checker(Checker& ck, const ast::Structure& s) {
   // unify's lenient cross-kind expansion of folded cmi abbreviations
   // (Arg.anon_fun vs an arrow); consulted by the lenient pass only.
-  ck.eng.abbrev_resolver = [&ck](const std::string& p) {
-    return ck.resolve_abbrev_expansion(p);
+  ck.eng.abbrev_resolver = [&ck](const std::string& p, const std::vector<I::TypePtr>& as) {
+    return ck.resolve_abbrev_expansion(p, as);
   };
   ck.register_predef_ctors();
   ck.register_stdlib_ctors();
