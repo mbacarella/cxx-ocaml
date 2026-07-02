@@ -1217,6 +1217,84 @@ frame-pointers, issue479, common's tail — rigid newtypes), local-functor
 bodies (shallow2deep, sets), objects (Tests.ml, cast), Stdlib/2 shadow
 (pervasives_leitmotiv), test_generator (Pos.t labelled-arg adoption).
 
+## SESSION 2026-07-02 (y): ten flips — the rigid-newtype substrate LANDS (sig 99.4%)
+
+Seven commits, every gate green throughout (reject 0.0% = 744/744, lambda
+flat at 412 MATCH [note: the harness now reports 55.7%, re-measured at HEAD —
+the 54.2% in earlier logs was measured under older conditions; 412 matches
+flat before/after every commit], 0 crashes / 1853, exact match-set deltas,
+0 regressions).  512 → 522 / 525.
+
+1. **test_generator (+1)** — `infer: record-update unify_kept + no zero-arg
+   arity padding`.  TWO root causes: (a) `{ e with .. }` now follows
+   typecore's model — result is a FRESH record instance tied to the base
+   only through KEPT fields (unify_kept), so `map` over a record tree gets
+   ('a -> 'b) and links' int-list result survives; falls back to
+   result==base when the decl/schemes don't resolve.  (b) The under-applied
+   Any-padding no longer fires on ZERO-arg references: flat-map arity
+   collision (`Pos.t` vs nested `'a Immutable_array.t`) grew a spurious Any
+   that made the sig-ascription rebuild reject itself and leak the struct's
+   raw types.  Bonus: accept_parity 66 → 53 false-accepts.
+2. **pervasives_leitmotiv (+1)** — `infer: Stdlib-shadow display
+   qualification`.  Probed rules: a top-level decl shadowing a stdlib
+   variant type's name requalifies the stdlib ctor schemes (`Stdlib.fpclass`,
+   or `Stdlib/2.fpclass` when the file also binds `module Stdlib`); show's
+   default-open strip is suppressed for user-Stdlib files and the exact
+   requalified paths (thread-local display controls).
+3. **sets (+1)** — `infer: local-functor application resolves through the
+   body's head functor`.  `PowerSet(IntSet)(..)` with body
+   `Set.Make(SetOrd(BaseSet))` routes to Set.Make's cmi result with
+   binding-named abstract types (IntSetSet.t), replacing the functor_env
+   harvest's generic vars.
+4. **shallow2deep (+1)** — `infer: opened local-functor body types +
+   rec-binding annotation vars`.  `open MkReify(PC)` registers the body's
+   type decls + GADT ctors under the applicative path (displays
+   `MkReify(PC).event`); AND `let rec` now shares named type vars across a
+   binding's annotations (per-binding annot_vars_, like the non-rec path) —
+   the GADT window rolls back structural ties, so the annotation tie is the
+   only source of `(c : 'c event) : 'c`.
+5. **test2 + frame-pointers (+2)** — `infer: rigid locally-abstract types in
+   the display pass`.  THE SUBSTRATE from session (x), realized WITHOUT
+   trail-window splitting: in the display pass, `type a.` univars and
+   `(type a)` bind a RIGID constr node — a GADT arm's equation `a = int` is
+   a lenient constr mismatch that never leaks, while ordinary pins
+   ('b := int) persist.  show prints rigid nodes as type variables;
+   type_is_ground treats them non-ground.  Scope end = generalization:
+   Engine::generalize converts a rigid node above the current level into a
+   generic VAR (this repaired all three first-attempt regressions:
+   localexn, iterators, regression_value_kinds — escaped newtypes must pin
+   per-instantiation).  Plus: a function RETURN annotation in the display
+   pass is the displayed result after the body soft-unifies into it (same
+   rule as `(e : T)`), Any-guarded.
+6. **issue479 (+1)** — `infer: local abbreviations expand in lenient
+   cross-kind unify`.  resolve_abbrev_expansion extended to LOCAL
+   (single-component) abbreviations from type_aliases, so a folded
+   `_ iter2gen` annotation ties its args to the inferred arrow (int flows
+   from string_of_int through the ref cell).  Guards: variant-row manifests
+   excluded (per-retry re-expansion looped on mixin's recursive rows — a
+   segfault caught by the crash gate mid-session and fixed), depth cap 32.
+   Padding now uses fresh VARs non-strict (displays 'a, pinnable), Any in
+   strict.
+7. **common (+1)** — `infer: no GADT windows in the display pass`.  With
+   rigid newtypes, the display pass types GADT matches with FULL (lenient)
+   unification: arm-body pins persist (`Buffer.set typ c_buffer` types the
+   captured buffers).  The effects-equation cluster is CLOSED — and it took
+   equation-level rigidity, exactly as (x) predicted, not rollback
+   splitting.
+8. **Tests.ml + cast (+2)** — `infer: open-object cmi display + #class
+   annotations`.  from_cmi translates Tobject to an OPEN empty Object row
+   (`< .. >`, memoized for `as 'a` sharing; show gains the open-row
+   ellipsis); `#castable` (Ptyp_class) becomes an opaque `#castable` constr
+   non-strict.
+
+**Baseline now: sig 522/525 (99.4%), reject 0.0%, lambda 412 MATCH (55.7%),
+accept 7.8% (53), 0 crashes.**
+
+Remaining 3 DIFFs: mixin, mixin2, mixin3 — the documented object-row +
+class-system + alias-equality residue (put to bed 2026-07-02; see
+polyvariant-cluster-status).  The sig_parity metric is effectively at its
+tractable ceiling; the next lever is a different axis (typedtree/cmi).
+
 ## Honest scope notes
 - The `.cmi` bridge currently makes Variant opaque (a fresh var). This plan
   improves the DISPLAY/sig metric; emitting correct variant `.cmi`s is a separate
