@@ -1060,6 +1060,9 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
           body += t->labels[i] + " : ";
           show_rec(t->args[i], body, 0, names, printed, rc, cyc);
         }
+        // An OPEN object row (`< .. >`, variant_kind reused as the marker):
+        // ocamlc's ellipsis for a free row tail (Oo.id's parameter).
+        if (t->variant_kind == 1) body += t->labels.empty() ? ".." : "; ..";
         body += " >";
       } else if (!t->abbrev.empty() &&
                  [&] {  // a row that is its own abbreviation argument (the

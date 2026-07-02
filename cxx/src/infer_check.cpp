@@ -601,6 +601,21 @@ struct Checker {
       }
       case cmi::TypeExpr::Tpoly:
         return from_cmi(n->link, memo);
+      case cmi::TypeExpr::Tobject: {
+        // The reader keeps no field structure, but the OPEN empty object
+        // (`< .. >`, Oo.id's parameter) still displays faithfully as an open
+        // Object row.  Memoized so a shared `(< .. > as 'a) -> 'a` scheme
+        // keeps its sharing.  Non-strict only (the strict pass never reasons
+        // about Object nodes -- keep its generic var).
+        if (strict) return generic_var();
+        auto it = memo.find(const_cast<cmi::TypeExpr*>(n));
+        if (it != memo.end()) return it->second;
+        TypePtr o = eng.object_type({}, {});
+        o->variant_kind = 1;  // open row marker
+        o->level = I::GENERIC_LEVEL;
+        memo[const_cast<cmi::TypeExpr*>(n)] = o;
+        return o;
+      }
       default:
         return generic_var();  // object/variant/package/etc: unknown for now
     }
@@ -709,6 +724,17 @@ struct Checker {
         if (!rt || !rt->constant) { all_const = false; break; }
       }
       if (all_const) return eng.constr("int");
+    }
+    // `#castable` (a class-subtype annotation): display-faithful opaque constr
+    // in the non-strict passes -- unify treats an unknown path leniently, and
+    // the signature shows `#castable` like ocamlc.  Strict stays a fresh var.
+    if (auto* cl = std::get_if<Ptyp_class>(&t.desc)) {
+      if (!strict) {
+        std::vector<TypePtr> as;
+        for (auto& a : cl->args) as.push_back(from_coretype(*a, vars));
+        return eng.constr("#" + lid_full(cl->id.txt), std::move(as));
+      }
+      return eng.fresh_var();
     }
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
       // a qualified type `M.t` whose head module is unbound is a soundness error
