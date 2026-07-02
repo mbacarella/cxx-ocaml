@@ -519,7 +519,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Variant: {
         TypePtr r;
         if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; }
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, t->args);
         else {
           r = variant_type(t->labels, t->args, t->tag_has_arg, t->variant_kind);
@@ -599,7 +599,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         TypePtr r;
         if (!changed && !weak_copy && !sch_head) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; }
         else if (t->kind == Type::Kind::Object) r = object_type(t->labels, std::move(as));
         else {
           r = variant_type(t->labels, std::move(as), t->tag_has_arg, t->variant_kind);
@@ -691,6 +691,19 @@ void Engine::generalize(const TypePtr& t0) {
         for (auto& a : t->args) go(a);
         break;
       case Type::Kind::Constr:
+        // A RIGID locally-abstract type created INSIDE this binding (level >
+        // current): its scope ends here, so it generalizes into an ordinary
+        // generic type VARIABLE (ocamlc's newtype model) -- each later use
+        // then instantiates a fresh copy that can be pinned independently
+        // (localexn's escaped `t`, iterators' two collections).  The rigid
+        // flag is kept (kind Var ignores it) so a window rollback restoring
+        // kind=Constr restores the rigid face intact.
+        if (t->rigid && t->level > level) {
+          note(t);
+          t->kind = Type::Kind::Var;
+          t->level = GENERIC_LEVEL;
+          break;
+        }
         // A FINALIZED `lazy_t` head is stamped GENERIC so instantiate
         // fresh-copies it per use: a later `Lazy.force l` / `f l` then relinks
         // the COPY, not the binding's displayed node (ocamlc: `let l = lazy 1`
@@ -946,6 +959,16 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       break;
     }
     case Type::Kind::Constr: {
+      // A RIGID locally-abstract type (`type a.`, display pass) prints as a
+      // type variable -- that is how it appears once the binding generalizes
+      // (ocamlc's Printtyp on the newtype's generalized occurrence).
+      if (t->rigid) {
+        auto it = names.find(t.get());
+        if (it == names.end())
+          it = names.emplace(t.get(), "'" + tvar_letter(names.size())).first;
+        out += it->second;
+        break;
+      }
       // A cyclic constr is `as`-named like a cyclic arrow (`< bark : 'a ->
       // unit > t as 'a` -- ocamlc binds 'a at the constr the cycle re-enters).
       bool named = cyc.count(t.get()) != 0;

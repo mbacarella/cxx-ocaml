@@ -64,6 +64,12 @@ struct Type {
   bool functor_abbrev = false;  // Constr: a functor-instance abbreviation
                              // (`HW.key`, manifest-carrying result-sig type) --
                              // top priority in the family relink (see unify).
+  bool rigid = false;        // Constr: a rigid locally-abstract type (`type a.`
+                             // / `(type a)`) in the DISPLAY pass -- unify never
+                             // links or refines it (a GADT arm's equation
+                             // `a = int` is swallowed leniently instead of
+                             // leaking), and show prints it as a type VARIABLE
+                             // ('a), which is how it appears once generalized.
   bool scheme_head = false;  // Constr: a family head inside a SCHEME (cmi /
                              // functor-result value): instantiate fresh-copies
                              // it per use so the live instance can relink

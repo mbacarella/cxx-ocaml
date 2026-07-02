@@ -321,6 +321,24 @@ struct Checker {
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
+  // The binding for one locally-abstract type.  The DISPLAY pass binds a RIGID
+  // node (ocamlc's newtype model): a GADT arm's equation `a = int` is then a
+  // lenient constr mismatch that never LEAKS into the signature, while the
+  // arm's ordinary unifications ('b := int) persist -- no trail window needed.
+  // show prints a rigid node as a type variable ('a), its generalized face.
+  // The strict and value-kind passes keep the flexible var (the reject pass
+  // needs the equations to type arm bodies; the kind pass needs their kinds).
+  TypePtr newtype_binding() {
+    if (fold_abbrevs_ && !strict) {
+      TypePtr t = eng.constr("");
+      t->rigid = true;
+      // Creation level: when the binding that scopes this newtype generalizes
+      // (level popped below this), the rigid node becomes a generic VAR.
+      t->level = eng.level;
+      return t;
+    }
+    return eng.fresh_var();
+  }
   // Named type variables (`'a`, `'b`) are shared across ALL annotations of a
   // single binding: `let f (x : 'a) (y : 'a) : 'a list = ..` ties the two params
   // and the return to ONE `'a` (OCaml's structure-item variable scoping).  Set to
@@ -2664,6 +2682,23 @@ struct Checker {
     else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) collect_ctors(*a->p, out);
   }
   // Is `t` fully GROUND -- no type variable (and no Any) anywhere in its tree?
+  // Does a type reach an Any node (an untranslated/unknown corner)?  Cycle-safe.
+  static bool type_mentions_any(const TypePtr& t0) {
+    std::set<const I::Type*> seen;
+    std::function<bool(const TypePtr&)> go = [&](const TypePtr& x) -> bool {
+      TypePtr t = I::Engine::repr(x);
+      if (!t || !seen.insert(t.get()).second) return false;
+      if (t->kind == I::Type::Kind::Any) return true;
+      if (t->dom && go(t->dom)) return true;
+      if (t->cod && go(t->cod)) return true;
+      for (auto& a : t->args) if (go(a)) return true;
+      for (auto& a : t->abbrev_args) if (go(a)) return true;
+      for (auto& a : t->inherited) if (go(a)) return true;
+      return false;
+    };
+    return go(t0);
+  }
+
   // Used after a GADT branch window is rolled back: a branch result that is
   // still ground did NOT depend on the (now-undone) refinement, so it is the
   // genuine match result and may be unified outward.  Any is treated as
@@ -2677,6 +2712,7 @@ struct Checker {
         return type_is_ground(t->dom) && type_is_ground(t->cod);
       case I::Type::Kind::Tuple:
       case I::Type::Kind::Constr:
+        if (t->rigid) return false;  // a locally-abstract type is NOT ground
         for (auto& a : t->args) if (!type_is_ground(a)) return false;
         return true;
       default: return false;  // Object/Variant/Link: play safe, treat as non-ground
@@ -3314,7 +3350,7 @@ struct Checker {
       return infer_apply(*a, e);
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return infer_function(*f);
     if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) {  // fun (type a) -> e
-      newtype_vars[nt->name.txt] = eng.fresh_var();
+      newtype_vars[nt->name.txt] = newtype_binding();
       return infer_expr(*nt->body);
     }
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
@@ -4253,7 +4289,7 @@ struct Checker {
         auto it = newtype_vars.find(nt->name.txt);
         saved_newtypes.push_back({nt->name.txt,
             it != newtype_vars.end() ? std::optional<TypePtr>(it->second) : std::nullopt});
-        newtype_vars[nt->name.txt] = eng.fresh_var();
+        newtype_vars[nt->name.txt] = newtype_binding();
       }
     struct Param { TypePtr ty; int lk; std::string nm; };
     std::vector<Param> params;
@@ -4382,6 +4418,14 @@ struct Checker {
           TypePtr ar = I::Engine::repr(at);
           if (ar->kind == I::Type::Kind::Constr && ar->path.rfind("(module ", 0) == 0)
             body = at;
+          // In the DISPLAY pass the return annotation IS the displayed result
+          // (the soft_unify above flowed the body's pins into its flexible
+          // vars), matching the `(e : T)` and `let x : T = ..` display rules.
+          // A body typed at `((int,int) continuation -> int) option` under a
+          // rigid `a = int` arm keeps the annotation's `(a, int)` face
+          // (frame-pointers' effc handler).  Skipped when the translation has
+          // an untranslated corner (Any) -- the inferred body knows more.
+          else if (fold_abbrevs_ && !type_mentions_any(at)) body = at;
         }
       }
     if (record_kinds_) rec_ret_[&f] = body;
@@ -4437,7 +4481,7 @@ struct Checker {
         const Pvc_constraint* pc =
             b.constraint_ ? std::get_if<Pvc_constraint>(&*b.constraint_) : nullptr;
         if (pc && !pc->univars.empty()) {
-          for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
+          for (auto& u : pc->univars) newtype_vars[u.txt] = newtype_binding();
           bound[i] = from_coretype(*pc->typ, avmaps[i]);
           bind_pattern_scheme(b.pat, bound[i]);
         } else if (pc && !strict) {
@@ -4519,7 +4563,7 @@ struct Checker {
       // false-reject (e.g. array vs iarray); the identity layer is reliable.
       if (b.constraint_)
         if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_)) {
-          for (auto& u : pc->univars) newtype_vars[u.txt] = generic_var();
+          for (auto& u : pc->univars) newtype_vars[u.txt] = newtype_binding();
           annot = from_coretype(*pc->typ, avars);
           if (strict && expected_clash(te, annot))
             note_error("type mismatch against declared type");
