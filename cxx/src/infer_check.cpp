@@ -128,8 +128,17 @@ struct Checker {
   // type abbreviations: name -> (param var names, manifest core_type) so that a
   // `type ('a,..) t = <manifest>` can be expanded when t is used in annotations.
   struct Alias { std::vector<std::string> params; const CoreType* manifest;
-                 const std::vector<ast::TypeConstraint>* constraints = nullptr; };
+                 const std::vector<ast::TypeConstraint>* constraints = nullptr;
+                 // module-qualified display path for a module-nested alias
+                 // (`Buffer.t`), used when the folded pass keeps the name
+                 std::string display_path; };
   std::unordered_map<std::string, Alias> type_aliases;
+  // stamped (opaque) module-nested decls: stamp -> qualified display path
+  std::unordered_map<int, std::string> stamp_path_;
+  // module prefixes ("A.") whose contents are re-exported bare by a top-level
+  // `include A`: their type names display UNqualified (ocamlc shows the
+  // included bare name -- includestruct's `val x : t`).
+  std::set<std::string> included_module_prefixes_;
   // GADT type names (a constructor has an explicit result type): matching one
   // refines types per branch, so branch results must not be cross-unified.
   std::set<std::string> gadt_types;
@@ -829,6 +838,19 @@ struct Checker {
             return eng.constr(q->second, std::move(as));
       // `Array1.t` after `open Bigarray` -> `Bigarray.Array1.t` (opened submodule).
       std::string path = lid_full(c->id.txt);
+      // A bare reference to a module-nested type displays with the module's
+      // qualification (`t` inside `module Buffer` -> `Buffer.t`), matching how
+      // ocamlc names it once it escapes the module.  Unify still compares last
+      // components, so the qualified path stays compatible with bare uses.
+      if (std::holds_alternative<Lident>(c->id.txt.v)) {
+        if (stamp) {
+          if (auto sp = stamp_path_.find(stamp); sp != stamp_path_.end())
+            path = sp->second;
+        } else if (fold_abbrevs_ && ai != type_aliases.end() &&
+                   !ai->second.display_path.empty()) {
+          path = ai->second.display_path;
+        }
+      }
       if (std::holds_alternative<Ldot>(c->id.txt.v)) {
         auto dot = path.find('.');
         if (dot != std::string::npos)
@@ -2022,14 +2044,28 @@ struct Checker {
     bool opaque = std::holds_alternative<Ptype_variant>(d.kind) ||
                   std::holds_alternative<Ptype_record>(d.kind) ||
                   (std::holds_alternative<Ptype_abstract>(d.kind) && !d.manifest);
-    if (opaque) type_stamp_[&d] = next_type_stamp_++;
+    // A module re-exported bare by a top-level `include A` displays its type
+    // names unqualified (ocamlc shows the included name).
+    bool inc = included_module_prefixes_.count(mod_prefix_) != 0;
+    if (opaque) {
+      type_stamp_[&d] = next_type_stamp_++;
+      if (!mod_prefix_.empty() && !inc)
+        stamp_path_[type_stamp_[&d]] = mod_prefix_ + d.name.txt;
+    }
     if (d.manifest) {  // `type (params) t = <manifest>`: a type abbreviation
       std::vector<std::string> ps;
       for (auto& p : d.params)
         ps.push_back(std::holds_alternative<Ptyp_var>(p->desc)
                          ? std::get<Ptyp_var>(p->desc).name : "");
-      type_aliases[d.name.txt] = {std::move(ps), d.manifest->get(),
-                                  d.constraints.empty() ? nullptr : &d.constraints};
+      Alias na = {std::move(ps), d.manifest->get(),
+                  d.constraints.empty() ? nullptr : &d.constraints,
+                  mod_prefix_.empty() || inc ? "" : mod_prefix_ + d.name.txt};
+      auto [f, ins] = type_aliases.emplace(d.name.txt, na);
+      // A TOP-LEVEL alias keeps priority in the flat map over a module-NESTED
+      // same-named one: a bare `t` outside the module means the top-level t
+      // (core_array's `'a t` vs the nested Permissioned.Int.t).
+      if (!ins && !(f->second.display_path.empty() && !na.display_path.empty()))
+        f->second = std::move(na);
     }
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;
@@ -3413,6 +3449,9 @@ struct Checker {
       // over-specialising register_typing.
       bool all_ground = window, ground_clash = false;
       TypePtr gacc = nullptr;
+      // (A SPLIT window -- rolling the refinement back before the arm body so
+      // body side effects persist -- was tried and reverted: arm bodies typed
+      // under an un-refined pattern leak wrong bindings; -4/+1 corpus-wide.)
       for (auto& c : m->cases) {
         check_case_structure(c);
         venv.emplace_back();
@@ -4185,14 +4224,35 @@ struct Checker {
       bool gadt = false;
       for (auto& c : fc.cases) if (pat_has_gadt_ctor(c.lhs)) gadt = true;
       bool window = gadt && !record_kinds_;
+      // Ground recovery (mirrors the Pexp_match window): when every arm,
+      // after rollback, yields the SAME ground pattern/result type, that is
+      // the genuine scrutinee/result (expand_test's arms all match `test`
+      // ctors and all build `Test (..)` : simplified_test).  Arms that
+      // disagree on a ground type or any non-ground arm leave it open, so a
+      // `: a` annotation still pins it.
+      bool pat_all_ground = window, pat_clash = false;
+      bool res_all_ground = window, res_clash = false;
+      TypePtr pacc = nullptr, racc = nullptr;
       for (auto& c : fc.cases) {
         venv.emplace_back();
         size_t wm = window ? eng.mark() : 0;
         if (window) {
-          soft_unify(infer_pat(c.lhs), arg);
+          TypePtr pt = infer_pat(c.lhs);
+          soft_unify(pt, arg);
           if (c.guard) infer_expr(**c.guard);
-          soft_unify(infer_expr(*c.rhs), rt);
+          TypePtr br = infer_expr(*c.rhs);
+          soft_unify(br, rt);
           eng.undo_to(wm);
+          TypePtr pr = I::Engine::repr(pt);
+          if (type_is_ground(pr)) {
+            if (!pacc) pacc = pr;
+            else if (!ground_types_equal(pacc, pr)) pat_clash = true;
+          } else pat_all_ground = false;
+          TypePtr brr = I::Engine::repr(br);
+          if (type_is_ground(brr)) {
+            if (!racc) racc = brr;
+            else if (!ground_types_equal(racc, brr)) res_clash = true;
+          } else res_all_ground = false;
         } else {
           try_unify(infer_pat(c.lhs), arg);
           if (c.guard) infer_expr(**c.guard);  // flows operand kinds; not bool-constrained
@@ -4200,6 +4260,8 @@ struct Checker {
         }
         venv.pop_back();
       }
+      if (window && pat_all_ground && !pat_clash && pacc) soft_unify(arg, pacc);
+      if (window && res_all_ground && !res_clash && racc) soft_unify(rt, racc);
       params.push_back({arg, 0, ""});
       body = rt;
       constrained = eng.arrow(arg, rt);  // the constraint annotates arg -> rt
@@ -4900,8 +4962,10 @@ struct Checker {
         }
       } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
         collect_bound_modules_me(in->expr);
-        if (auto* pi = std::get_if<Pmod_ident>(&in->expr.desc))
+        if (auto* pi = std::get_if<Pmod_ident>(&in->expr.desc)) {
           for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
+          included_module_prefixes_.insert(lid_full(pi->id.txt) + ".");
+        }
       } else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
         // `open M` brings M's submodules into bare scope -- collect now (before
         // type declarations referencing them are checked).
