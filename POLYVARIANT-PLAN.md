@@ -1302,3 +1302,65 @@ tractable ceiling; the next lever is a different axis (typedtree/cmi).
 - Success = Tiers 1–3 land (~7 files, sig ~85.3%→~86.5%) with zero regression and
   zero crashes; Tier 4 documented if deferred. That "puts to bed" the tractable
   poly-variant work and converts the open-ended risk into a bounded residue.
+
+## SESSION 2026-07-02 (z): THE LAST THREE FLIP -- sig_parity 100.0% (525/525)
+
+Three commits, every gate green throughout (reject 0.0% = 744/744, lambda
+412 MATCH flat, accept 7.8% flat, 0 crashes / 1853).  522 -> 525/525.
+The "put to bed" mixin residue is CLOSED.  Method: 17-probe witness suite
+re-run after every sub-change; three mid-flight regressions (morematch
+segfault-then-timeout, lib-bytes-utf, c3/c4 probes) each caught by the
+suite/gates and fixed forward.
+
+1. **mixin (+1)** -- `infer: MoreLabels functors, pressure-lite rows,
+   per-site abbreviation naming`.  SIX mechanisms:
+   (a) functor_result_values requalifies an opened module's SUBMODULE
+   functor (open MoreLabels; Map.Make) through opened_submod_quals_, so
+   labelled fold/exists schemes load -- this alone collapsed
+   subst_lambda/subst_expr to oracle shape.
+   (b) PRESSURE-LITE (Parmatch.pressure_variants approximation): a
+   variant/#t pattern row closes to `[<` ONLY when its column lacks a
+   catch-all; a wildcard covers its column only when the arm is
+   irrefutable OFF-PATH (morematch's `_, `Unchanged` doesn't open comp 0);
+   `#t` covers strict descendants only.
+   (c) `#t as x` rebuilds share the matched row's ARG NODES ({row with
+   more=newvar}), tying the scrutinee's param through uses.
+   (d) THE BIG ONE -- ocamlc's re-expansion model for folded abbreviations:
+   manifest-expansion constrs stay ADOPTABLE (source-written annotations
+   finalize; adoptable only under a function-constraint translation);
+   restore_abbrev_rows re-expands an intact-abbrev row's DECL-GROUND
+   fields at each lookup_value instantiation (budgeted iterative walk,
+   512 nodes; skips self-fixpoints incl. instance back-edges); same-abbrev
+   rows unify like the FOLDED CONSTR (abbrev args only, fields never meet)
+   with display slots reconciled by family priority; row-field merges pick
+   the higher-priority slot node WITHOUT renaming (renames only in direct
+   unifications).  This resolved the string/Subst.key/Names.elt per-site
+   naming that blocked the cluster.
+   (e) Function-cases constraints flow DOWN before the cases (display
+   pass); let-rec plain annotations pin holes from the body.
+   (f) Display: `as`-rows parenthesize in every non-top position; comma
+   args bare; exact zero-arg abbreviation rows reprint their name.
+2. **mixin3 (+1)** -- `infer: class types + #ops self-coercions`.
+   class-type registry; `(T1,T2) #ops` builds the OPEN object row from the
+   signature (abbrev = name); `object (self : .. #ops)` pins methods,
+   excludes private ones, value = CLOSED row (`(..) ops` vs `#ops`);
+   Objects joined the Variant scheme machinery (level-stamped, generalized
+   THROUGH abbrev_args/inherited, weak-copied per use, same-class
+   convergence on the closed node, never a GENERIC scheme node); RELAXED
+   value restriction (constructed/exact rows generalize in expansive
+   bindings -- `lazy_fix`; only `[<` stays weak); inherit bounds expand to
+   TAGS (from_inherit marks the `[ | 'a lambda ]` display; all-inherit
+   manifests union tags under one vars map); object literals non-expansive;
+   count_refs counts only PRINTED children.
+3. **mixin2 (+1)** -- `infer: parameterized class declarations`.  Class
+   type params scope over body annotations + `constraint` fields
+   (Pcf_constraint); the object carries the CLASS name ('a lambda_ops);
+   `new c` = generalized ctor arrow (body typed at a raised level); OPEN
+   #-annotations converge on a concrete object of a DIFFERENT class
+   (params tie only same-class).
+
+**FINAL: sig 525/525 (100.0%), reject 0.0% (744/744), lambda 412 MATCH
+(55.7%), accept 7.8% (53), 0 crashes.  The signature-inference metric that
+gates separate compilation is at CEILING.  Next levers are other axes:
+accept_parity's 53 false-accepts, lambda/typedtree parity, .cmi emission
+(cppcaml-cmi-goal).**
