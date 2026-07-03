@@ -8,7 +8,7 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | Goal | Harness | Start of project | **Now** |
 |---|---|---|---|
 | **Completeness** — never reject valid code | `reject_parity.sh` | 0.1% false-reject | **0.0% (744/744)** ✅ |
-| **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **6.0% (41 files)** |
+| **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.4% (37 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.5% |
 | **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **25.1% (465/1853; 38.1% of the 1222 typeable)** |
