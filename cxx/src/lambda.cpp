@@ -650,6 +650,9 @@ struct Translator {
       std::fprintf(stderr, "%s\n", line.c_str());
     }
   }
+  // MODSIG-MISMATCH lines go to CPPCAML_MODSIG_LOG (appended) if set, else
+  // stderr -- like coerce_report, so a harness whose per-file stderr is
+  // redirected (the bootstrap) can still collect them.
   static void msig_report(const char* where, const std::string& what,
                           const std::vector<std::string>& got,
                           const std::vector<std::string>& want) {
@@ -658,8 +661,17 @@ struct Translator {
       for (auto& n : v) { if (!s.empty()) s += ' '; s += n; }
       return s;
     };
-    std::fprintf(stderr, "MODSIG-MISMATCH %s %s: msig=[%s] layout=[%s]\n",
-                 where, what.c_str(), join(got).c_str(), join(want).c_str());
+    char line[4096];
+    std::snprintf(line, sizeof line, "MODSIG-MISMATCH %s %s: msig=[%s] layout=[%s]",
+                  where, what.c_str(), join(got).c_str(), join(want).c_str());
+    static const char* path = std::getenv("CPPCAML_MODSIG_LOG");
+    if (path) {
+      if (std::FILE* f = std::fopen(path, "a")) {
+        std::fputs(line, f); std::fputc('\n', f); std::fclose(f);
+      }
+    } else {
+      std::fprintf(stderr, "%s\n", line);
+    }
   }
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
   // unqualified name resolves as `M.x` (a stdlib field or an external prim).
@@ -1753,10 +1765,63 @@ struct Translator {
         (full != head && !full.empty() ? " (referenced as " + full + ")" : "") +
         ": cannot find " + low + ".cmi on the include path (is the -I path correct?)");
   }
+  // --- modsig P3 S4: Env-first (scoped) layout resolution -------------------
+  // The scoped Sig of a (possibly dotted) local module path, from the Env
+  // ALONE (no cmi ladder): non-null only when the head is Env-bound with a
+  // known Sig and every dotted step lands on a Module item carrying a sub-Sig.
+  // Null = "the Env doesn't know"; callers fall back to the flat layouts.
+  // A functor marker Sig answers null too: a functor has no field layout.
+  modsig::SigPtr env_scoped_sig(const std::string& dotted) {
+    auto bound = menv_.find_module(dotted.substr(0, dotted.find('.')));
+    if (!bound || !*bound) return nullptr;
+    modsig::SigPtr s = menv_.lookup_module_path(dotted);
+    if (s && msig_is_functor(*s)) return nullptr;
+    return s;
+  }
+  // Flat-layout member-lookup semantics over a namespaced Sig: the LAST
+  // runtime item with this name, any namespace; -1 when absent.
+  static int sig_member_index(const modsig::Sig& s, const std::string& n) {
+    for (auto it = s.items.rbegin(); it != s.items.rend(); ++it)
+      if (it->runtime && it->name == n) return it->pos;
+    return -1;
+  }
+  // Env-first field index of `member` in the local module at `key`: the
+  // scoped Env answer is authoritative when it knows the module (the flat
+  // map's bare/dotted keys get clobbered by unrelated deeper bindings --
+  // MPR7761 -- while Env frames pop with their scope); the flat
+  // module_layout_ serves modules the Env doesn't know.  A disagreement
+  // between the two is reported under CPPCAML_MODSIG_CHECK.
+  std::optional<int> local_member_index(const std::string& key,
+                                        const std::string& member) {
+    modsig::SigPtr es = env_scoped_sig(key);
+    int ei = es ? sig_member_index(*es, member) : -1;
+    int fi = -1;
+    if (auto li = module_layout_.find(key); li != module_layout_.end())
+      if (auto f = li->second.find(member); f != li->second.end()) fi = f->second;
+    if (es && msig_check_enabled() && !msig_checking_ && ei != fi) {
+      // Two report classes (env-positive/flat-absent is EXPECTED -- the Env
+      // serves members the flat dotted keys never registered -- and silent):
+      // a positive-positive CONFLICT is the clobbering class; env-negative
+      // with a flat answer marks an incomplete derived Sig (the blocker for
+      // making negative answers authoritative).
+      if (ei >= 0 && fi >= 0)
+        msig_report("env-member", key + "." + member,
+                    {std::to_string(ei)}, {std::to_string(fi)});
+      else if (ei < 0)
+        msig_report("env-member-missing", key + "." + member,
+                    {std::to_string(ei)}, {std::to_string(fi)});
+    }
+    // A POSITIVE scoped answer wins (the flat key may be clobbered, MPR7761);
+    // a negative one still falls back to the flat map -- a derived Sig can be
+    // incomplete (e.g. an include of an unresolved functor application), and
+    // S4a must not turn that into a lost member.
+    int ix = ei >= 0 ? ei : fi;
+    return ix >= 0 ? std::optional<int>(ix) : std::nullopt;
+  }
   // Resolve a (possibly dotted) local module path to its base expression plus
-  // the module_layout_ key holding its field layout; base is null when the
+  // the layout key/scoped Sig for its field layout; base is null when the
   // head isn't a local module or a step's layout is unknown.
-  struct ModPath { LamPtr base; std::string key; };
+  struct ModPath { LamPtr base; std::string key; modsig::SigPtr sig; };
   ModPath resolve_module_path(const std::string& dotted) {
     size_t p = dotted.find('.');
     std::string head = p == std::string::npos ? dotted : dotted.substr(0, p);
@@ -1767,15 +1832,13 @@ struct Translator {
       size_t q = dotted.find('.', p + 1);
       std::string comp =
           dotted.substr(p + 1, (q == std::string::npos ? dotted.size() : q) - p - 1);
-      auto li = module_layout_.find(key);
-      if (li == module_layout_.end()) return {};
-      auto fi = li->second.find(comp);
-      if (fi == li->second.end()) return {};
-      base = fieldimm(fi->second, base);
+      std::optional<int> ix = local_member_index(key, comp);
+      if (!ix) return {};
+      base = fieldimm(*ix, base);
       key += '.'; key += comp;
       p = q;
     }
-    return {base, key};
+    return {base, key, env_scoped_sig(key)};
   }
   // `M.E` / `A.B.E`: a constructor qualified by a bound local module whose
   // layout EXPORTS it (an exception or extension constructor -- regular variant
@@ -1790,11 +1853,9 @@ struct Translator {
     if (!lid_to_dotted(*dq->prefix, prefix)) return nullptr;
     ModPath mp = resolve_module_path(prefix);
     if (!mp.base) return nullptr;
-    auto li = module_layout_.find(mp.key);
-    if (li == module_layout_.end()) return nullptr;
-    auto fi = li->second.find(dq->name);
-    if (fi == li->second.end()) return nullptr;
-    return fieldimm(fi->second, mp.base);
+    std::optional<int> ix = local_member_index(mp.key, dq->name);
+    if (!ix) return nullptr;
+    return fieldimm(*ix, mp.base);
   }
   // The identity value of a QUALIFIED exn/extension ctor `M.E` (M local OR
   // imported, possibly nested): a runtime field of M's block.  Null when `M.E`
@@ -5852,9 +5913,8 @@ struct Translator {
           if (auto* d = std::get_if<Ldot>(&k->id.txt.v))
             if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
               if (LamPtr base = module_base(pl->name)) {
-                auto& lay = module_layout_[pl->name];
-                if (auto f = lay.find(d->name); f != lay.end())
-                  id0 = fieldimm(f->second, base);
+                if (auto f = local_member_index(pl->name, d->name))
+                  id0 = fieldimm(*f, base);
               }
               if (!id0) {
                 auto& fm = fields_of(pl->name);
@@ -10465,10 +10525,9 @@ struct Translator {
         // they SHADOW the pervasives (open Random; float = Random.float).
         for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
           if (LamPtr base = module_base(*it)) {  // local module (binding or alias)
-            auto& lay = module_layout_[*it];
-            if (auto f = lay.find(l->name); f != lay.end()) {
+            if (auto f = local_member_index(*it, l->name)) {
               auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
-              fi->prim_arg = f->second; fi->args = {base};
+              fi->prim_arg = *f; fi->args = {base};
               return fi;
             }
           }
@@ -10476,12 +10535,11 @@ struct Translator {
             // a LOCAL nested submodule path (`open M.Ops`, M a functor param):
             // resolve the path and read the member from its registered layout
             if (auto mp = resolve_module_path(*it); mp.base)
-              if (auto li = module_layout_.find(mp.key); li != module_layout_.end())
-                if (auto f = li->second.find(l->name); f != li->second.end()) {
-                  auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
-                  fi->prim_arg = f->second; fi->args = {mp.base};
-                  return fi;
-                }
+              if (auto f = local_member_index(mp.key, l->name)) {
+                auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+                fi->prim_arg = *f; fi->args = {mp.base};
+                return fi;
+              }
             if (LamPtr v = submodule_value(*it, l->name)) return v;  // stdlib submodule
             if (StdPrim sp = submodule_prim(*it, l->name); !sp.name.empty())
               if (LamPtr s = prim_stub(sp)) return s;
@@ -10504,10 +10562,9 @@ struct Translator {
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
           // Qualified M.x where M is a local submodule: field of its block.
           if (LamPtr base = module_base(pl->name)) {
-            auto& lay = module_layout_[pl->name];
-            if (auto f = lay.find(d->name); f != lay.end()) {
+            if (auto f = local_member_index(pl->name, d->name)) {
               auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
-              fi->prim_arg = f->second; fi->args = {base};
+              fi->prim_arg = *f; fi->args = {base};
               return fi;
             }
             // A submodule's EXTERNAL member (no runtime field) used as a value:
@@ -10567,9 +10624,8 @@ struct Translator {
         std::string pdotted;
         if (lid_to_dotted(*d->prefix, pdotted) && pdotted.find('.') != std::string::npos)
           if (auto mp = resolve_module_path(pdotted); mp.base)
-            if (auto li = module_layout_.find(mp.key); li != module_layout_.end())
-              if (auto f = li->second.find(d->name); f != li->second.end())
-                return fieldimm(f->second, mp.base);
+            if (auto f = local_member_index(mp.key, d->name))
+              return fieldimm(*f, mp.base);
       }
       // Qualified M.S.x through a stdlib submodule path (Effect.Deep.continue),
       // including an opened head (`Array1.x` under `open Bigarray`) and the
@@ -10585,11 +10641,10 @@ struct Translator {
           for (auto& cand : cands) {
             // a LOCAL module's submodule (`include Int_base; Set.empty`, with
             // Int_base a functor-result module whose nested layouts we
-            // registered): field-read through the registered module_layout_.
+            // registered): field-read through its layout (Env-first).
             if (auto mp = resolve_module_path(cand); mp.base)
-              if (auto li = module_layout_.find(mp.key); li != module_layout_.end())
-                if (auto f = li->second.find(d->name); f != li->second.end())
-                  return fieldimm(f->second, mp.base);
+              if (auto f = local_member_index(mp.key, d->name))
+                return fieldimm(*f, mp.base);
             if (LamPtr v = submodule_value(cand, d->name)) return v;
             if (StdPrim sp = submodule_prim(cand, d->name); !sp.name.empty())
               if (LamPtr s = prim_stub(sp)) return s;
@@ -11270,9 +11325,8 @@ struct Translator {
         if (!clsval)  // an include/open'd module's class (include E; new c)
           for (auto it = opened_.rbegin(); !clsval && it != opened_.rend(); ++it)
             if (LamPtr base = module_base(*it)) {
-              auto& lay = module_layout_[*it];
-              if (auto f = lay.find(l->name); f != lay.end())
-                clsval = fieldimm(f->second, base);
+              if (auto f = local_member_index(*it, l->name))
+                clsval = fieldimm(*f, base);
             }
       } else if (std::get_if<Ldot>(&nw->id.txt.v)) {
         std::string dotted;  // a class at a (possibly deep) local module path
@@ -11511,12 +11565,11 @@ struct Translator {
           // under which it was registered when the (functor) body was compiled.
           if (mit == class_meta_.end()) mit = class_meta_.find(d->name);
           LamPtr base = module_base(ml2->name);
-          auto& lay = module_layout_[ml2->name];
-          auto fi = lay.find(d->name);
-          if (mit == class_meta_.end() || !base || fi == lay.end()) return nullptr;
+          auto fi = local_member_index(ml2->name, d->name);
+          if (mit == class_meta_.end() || !base || !fi) return nullptr;
           parent_meta = &mit->second;
           auto f0 = mk(Lam::K::Prim); f0->prim = Prim::FieldImm;
-          f0->prim_arg = fi->second; f0->args = {base};
+          f0->prim_arg = *fi; f0->args = {base};
           parent_val = f0;
         } else return nullptr;
       } else if (std::get_if<ast::Pcf_constraint>(&f.desc) ||
@@ -13178,11 +13231,11 @@ struct Translator {
     while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
     if (auto* pi = std::get_if<Pmod_ident>(&me->desc)) {
       if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
-        if (auto it = module_layout_.find(l->name); it != module_layout_.end()) {
-          std::vector<std::string> v(it->second.size());
-          for (auto& [n, i] : it->second) if (i >= 0 && i < (int)v.size()) v[i] = n;
+        // Env-first, then the flat key; a PRESENT key returns even an empty
+        // layout (a local module shadows a stdlib namesake's fields below).
+        if (auto v = layout_vec(l->name);
+            !v.empty() || module_layout_.count(l->name))
           return v;
-        }
         if (!fields_of(l->name).empty()) {
           auto& fm = fields_of(l->name);
           std::vector<std::string> v(fm.size());
@@ -13836,10 +13889,9 @@ struct Translator {
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))  // M.Sub -> field of M's block
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
           if (LamPtr base = module_base(pl->name)) {
-            auto& lay = module_layout_[pl->name];
-            if (auto f = lay.find(d->name); f != lay.end()) {
+            if (auto f = local_member_index(pl->name, d->name)) {
               auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
-              fi->prim_arg = f->second; fi->args = {base};
+              fi->prim_arg = *f; fi->args = {base};
               return fi;
             }
           }
@@ -13938,13 +13990,29 @@ struct Translator {
     }
     return out;
   }
-  // The field-name vector of a registered (possibly dotted) layout key.
-  std::vector<std::string> layout_vec(const std::string& key) {
+  // The field-name vector of a registered (possibly dotted) layout key, from
+  // the flat map alone (the env-nested shadow check compares against this).
+  std::vector<std::string> layout_vec_flat(const std::string& key) {
     auto it = module_layout_.find(key);
     if (it == module_layout_.end()) return {};
     std::vector<std::string> v(it->second.size());
     for (auto& [n, i] : it->second) if (i >= 0 && i < (int)v.size()) v[i] = n;
     return v;
+  }
+  // Env-first field-name vector of a (possibly dotted) local module: the
+  // scoped Sig's runtime names when the Env knows the module (immune to the
+  // flat map's bare/dotted-key clobbering), else the flat layout.
+  std::vector<std::string> layout_vec(const std::string& key) {
+    if (modsig::SigPtr es = env_scoped_sig(key)) {
+      auto names = es->runtime_names();
+      if (msig_check_enabled() && !msig_checking_) {
+        auto flat = layout_vec_flat(key);
+        if (!flat.empty() && names != flat)
+          msig_report("env-vs-flat", key, names, flat);
+      }
+      if (!names.empty()) return names;
+    }
+    return layout_vec_flat(key);
   }
   // P3 stage 1 shadow check: the msig-derived result Sig must reproduce the
   // flat result layout wherever both are known (mismatch = MODSIG-MISMATCH
@@ -14333,9 +14401,8 @@ struct Translator {
               // where T : TableFormat.TABLES exposes `exception Error`): read its
               // field from the in-scope module value.
               if (auto mi = module_ident_.find(modp); mi != module_ident_.end())
-                if (auto ml = module_layout_.find(modp); ml != module_layout_.end())
-                  if (auto f = ml->second.find(en); f != ml->second.end())
-                    v = fieldimm(f->second, varof(mi->second));
+                if (auto f = local_member_index(modp, en))
+                  v = fieldimm(*f, varof(mi->second));
               if (!v && modp.find('.') != std::string::npos) v = submodule_value(modp, en);
               else if (!v && !module_base(modp) && !fields_of(modp).empty()) {
                 auto& fm = fields_of(modp);
@@ -14777,7 +14844,7 @@ struct Translator {
             if (msig_check_enabled() && submsig)
               for (auto& nm : inner_mods) {
                 std::string dk = *mb.name.txt + "." + nm;
-                auto dv = layout_vec(dk);
+                auto dv = layout_vec_flat(dk);
                 modsig::SigPtr nested = menv_.lookup_module_path(dk);
                 if (!dv.empty() &&
                     (!nested || nested->runtime_names() != dv))
