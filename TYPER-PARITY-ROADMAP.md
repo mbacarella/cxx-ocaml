@@ -11,7 +11,7 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.5% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **25.1% (465/1853; 38.1% of the 1222 typeable)** |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **25.5% (473/1853; 38.7% of the 1222 typeable)** |
 | `c++type` crashes | — | 7 (SIGABRT) | **0** ✅ |
 
 Two of the three original goals are essentially closed: **completeness is perfect**

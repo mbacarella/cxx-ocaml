@@ -127,10 +127,19 @@ Net: A is the project; B and C are optional tails. A alone should move
   catches unqualified/`open`'d/`let`-bound/user-format-typed literals the
   syntactic path missed. Guardrails held: reject 0.0% (744/744), sig 100%
   (525/525), lambda unaffected.
-- **Remaining (36 DIFF files, none regressed):** 7 are format literals whose
-  directives `fmtlib::make` can't build yet (box `@[`/`@]`, `@,`/`@;` breaks,
-  `Formatting_gen`/`Open_box`, scan counters, custom breaks) -- extend the
-  `fmtlib` parser. The rest are small singletons: `Tpat_var` stamp/naming (3),
-  `alloc_major`/GC-stat expr types (3), module_expr/functor cases (3),
-  poly-variant & object row `type_declaration`s, `extra`-node ghosts, etc.
-  No single cluster now dominates the way formats did.
+- **Format-directive extension: DONE 2026-07-03 (+7 files, 466 -> 473).** All 7
+  remaining format-cluster files flipped by extending `fmtlib` to the full
+  directive set the corpus uses: boxes/tags `@[<...>`/`@{` (`Formatting_gen` /
+  `Open_box`/`Open_tag` with the `<...>` sub-format), parametrised breaks
+  `@;<w o>`, magic size `@<n>`, `@@`/`@%%`/`%@` escapes, `Scan_indic`, scan
+  counters `%n %l %N %L` (+ `%_` ignored forms -> `Ignored_param`), `%a`/`%t`,
+  and `%(...%)` (`Format_subst` with an `fmtty` derived by walking the built
+  sub-tree). Plus one inference-side addition, gated `record_fmt_lits_`-only
+  (dump pass; provably invisible to strict/value-kinds/back end): a
+  format-expected match/try/let/sequence records its result-position string
+  literals into `fmt_lits_` (oracle type_expect pushes the format type into arm
+  bodies -- gen_test's `pr "%(%d%)" (match ... -> "x%d")`).
+- **Remaining (29 DIFF files, none regressed):** small singletons: `Tpat_var`
+  stamp/naming (3), `alloc_major`/GC-stat expr types (3), module_expr/functor
+  cases (3), poly-variant & object row `type_declaration`s, `extra`-node
+  ghosts, etc. No dominant cluster remains.
