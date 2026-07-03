@@ -1735,11 +1735,23 @@ struct Translator {
   // is never turned into a spurious error -- only a genuinely-absent module fails.
   bool module_head_resolvable(const std::string& head) {
     if (head.empty()) return true;
-    // NB: NOT mod_fields.count -- fields_of() inserts the key even when the cmi
-    // failed to load (an empty layout), so it is true for an absent module too.
-    if (module_base(head) || module_layout_.count(head) ||
-        module_ident_.count(head) || module_alias_.count(head) ||
-        submod_alias_.count(head) || module_functor_src_.count(head))
+    // modsig P3 S4b: the scoped Env is the primary local answer -- every
+    // module-shaped binding shadows it in lockstep (structures, functor
+    // params, aliases, rec/let modules, spliced includes), including null
+    // tombstones ("local, Sig unknown"), so ANY binding means resolvable.
+    // The flat module_ident_/module_layout_ bare-key checks are gone: a key
+    // leaked from an already-popped scope must not resurrect an unbound
+    // head (the MPR7761 clobbering class).
+    if (menv_.find_module(head)) return true;
+    // Postlude conveniences the Env deliberately does NOT bind (upstream
+    // scoping doesn't either, but references through them still compile):
+    // a built submodule's bare-name aliases, dotted-target aliases, functor
+    // sources.
+    // NB: NOT mod_fields.count -- fields_of() inserts the key even when the
+    // cmi failed to load (an empty layout), so it is true for an absent
+    // module too.
+    if (module_alias_.count(head) || submod_alias_.count(head) ||
+        module_functor_src_.count(head))
       return true;
     for (const std::string& o : opened_)
       if (o == head || o.rfind(head + ".", 0) == 0) return true;
@@ -2218,10 +2230,8 @@ struct Translator {
         if (!res)
           if (auto a = modtype_ast_.find(d->name); a != modtype_ast_.end()) res = a->second;
       }
-      if (!res || guard > 8) {  // no local sig AST: flat layout only
-        auto lay = sig_layout(*m);
-        auto& ml = module_layout_[prefix]; ml.clear();
-        for (int i = 0; i < (int)lay.size(); ++i) ml[lay[i]] = i;
+      if (!res || guard > 8) {  // no local sig AST
+        register_layout_msig_first(prefix, mt, sig_layout(*m));
         return;
       }
       m = res;
@@ -2282,17 +2292,28 @@ struct Translator {
       }
     }
     names = dedup_keep_last(std::move(names));
-    for (int i = 0; i < (int)names.size(); ++i) ml[names[i]] = i;
-    // modsig P1 parity: the namespaced derivation of the ORIGINAL module type
-    // (its own ident resolution mirrors the loop above) must reproduce this
-    // runtime layout.
-    if (msig_check_enabled() && !msig_checking_) {
+    register_layout_msig_first(prefix, mt, std::move(names));
+  }
+  // modsig P3 S4b: write `prefix`'s registered layout msig-FIRST -- the
+  // namespaced derivation is authoritative when TRUSTED (its modtype
+  // resolution is scoped, where the flat loop resolves bare names through
+  // globals: the source.ml abstract-modtype divergence); the flat name list
+  // serves untrusted/unresolved sigs.  Divergence reported under
+  // CPPCAML_MODSIG_CHECK (was the P1 register_sig_layouts parity assert).
+  void register_layout_msig_first(const std::string& prefix, const ModuleType& mt,
+                                  std::vector<std::string> names) {
+    modsig::SigPtr ms;
+    if (!msig_checking_) {
       msig_checking_ = true;
-      auto ms = msig_of_modtype(mt);
-      if (ms->runtime_names() != names)
-        msig_report("register_sig_layouts", prefix, ms->runtime_names(), names);
+      ms = msig_of_modtype(mt);
       msig_checking_ = false;
     }
+    if (msig_check_enabled() && ms && ms->runtime_names() != names)
+      msig_report("register_sig_layouts", prefix, ms->runtime_names(), names);
+    if (ms && modsig::trusted(*ms) && !ms->items.empty())
+      names = ms->runtime_names();
+    auto& ml = module_layout_[prefix]; ml.clear();
+    for (int i = 0; i < (int)names.size(); ++i) ml[names[i]] = i;
   }
   // Register the field layouts of a decoded cmi signature under dotted keys,
   // recursing into structural submodules: module_layout_[prefix.Sub] etc.  Used
@@ -13027,6 +13048,33 @@ struct Translator {
     out->number();
     return out;
   }
+  // Does `mt` RESOLVE to a literal signature AST (with-peel + local named-
+  // modtype indirection)?  When it does, its layout is exact -- INCLUDING an
+  // empty runtime layout: an empty ascription means an empty block.  The
+  // legacy fall-back-to-the-inner-expression exists only for UNRESOLVED
+  // module types (and destructive `with .. :=`, whose layout the AST walk
+  // cannot see -- excluded here).
+  bool modtype_resolves_to_sig(const ModuleType& mt0) {
+    const ModuleType* m = &mt0;
+    for (int guard = 0; guard <= 8; ++guard) {
+      if (auto* pw = std::get_if<Pmty_with>(&m->desc)) {
+        if (!with_keeps_layout(*pw)) return false;
+        m = pw->mt.get(); continue;
+      }
+      auto* pi = std::get_if<Pmty_ident>(&m->desc);
+      if (!pi) break;
+      const ModuleType* res = nullptr;
+      std::string dotted;
+      if (lid_to_dotted(pi->id.txt, dotted))
+        if (auto a = modtype_ast_.find(dotted); a != modtype_ast_.end()) res = a->second;
+      if (!res)
+        if (auto a = modtype_ast_.find(lid_last(pi->id.txt)); a != modtype_ast_.end())
+          res = a->second;
+      if (!res) return false;
+      m = res;
+    }
+    return std::holds_alternative<Pmty_signature>(m->desc);
+  }
   // The namespaced Sig a module EXPRESSION evaluates to; null = "don't know".
   modsig::SigPtr msig_of_module_expr(const ModuleExpr& me, int depth = 0) {
     if (depth > 24) return nullptr;
@@ -13034,10 +13082,12 @@ struct Translator {
       return msig_of_structure(ps->items, depth);
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
       auto ms = msig_of_modtype(*pc->mt, depth + 1);
-      // bug-compatible with module_result_layout: an ascription with no
-      // runtime fields falls back to the inner expression (the MPR7761-
-      // compounding fallback; made strict at the consumers in P3 stage 4)
       if (ms && !ms->runtime_names().empty()) return ms;
+      // modsig P3 S4b: an ascription that resolves to a literal signature is
+      // exact even with an EMPTY runtime layout; only an unresolved modtype
+      // falls back to the inner expression (was: always fell back, the
+      // MPR7761-compounding bug-compatibility).
+      if (ms && modtype_resolves_to_sig(*pc->mt)) return ms;
       return msig_of_module_expr(*pc->me, depth + 1);
     }
     if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) {
@@ -14033,7 +14083,12 @@ struct Translator {
     if (auto* ps = std::get_if<Pmod_structure>(&me.desc)) return struct_export_names(ps->items);
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
       auto s = sig_layout(*pc->mt);
-      return s.empty() ? module_result_layout(*pc->me) : s;
+      if (!s.empty()) return s;
+      // modsig P3 S4b: a RESOLVED empty ascription means an empty block --
+      // do not resurrect the inner expression's fields (the MPR7761
+      // compounding class); only an unresolved modtype falls back.
+      if (modtype_resolves_to_sig(*pc->mt)) return s;
+      return module_result_layout(*pc->me);
     }
     if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) return module_result_layout(*pf->body);
     if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {  // a module path
