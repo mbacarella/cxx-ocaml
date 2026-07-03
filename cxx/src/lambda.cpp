@@ -604,6 +604,25 @@ struct Translator {
   // A named module type's Sig, keyed like modtype_layout_ (bare + dotted).
   std::unordered_map<std::string, modsig::SigPtr> modtype_msig_;
   bool msig_checking_ = false;  // re-entrancy guard for the parity asserts
+  // modsig P3: a module binding scoped to an EXPRESSION (`let module M = ..`,
+  // a single-param functor helper): shadows in the innermost Env frame and
+  // restores that frame's entry on destruction, in lockstep with the
+  // module_ident_ save/restore the enclosing code already does.  A null Sig is
+  // a tombstone ("local, Sig unknown") that stops fallback resolution.
+  struct EnvModBind {
+    modsig::Env* env; std::string nm; bool had; modsig::SigPtr old;
+    EnvModBind(modsig::Env& e, const std::string& n, modsig::SigPtr s)
+        : env(&e), nm(n) {
+      auto& m = e.frames.back().modules;
+      had = m.count(n) != 0;
+      if (had) old = m[n];
+      m[n] = std::move(s);
+    }
+    ~EnvModBind() {
+      auto& m = env->frames.back().modules;
+      if (had) m[nm] = old; else m.erase(nm);
+    }
+  };
   // P2 stage 3+: coverage counters for the computed-coercion switch (logged
   // under CPPCAML_COERCE_CHECK) -- how often the ascription/constraint tails
   // took the computed path vs fell back to the legacy name-list.
@@ -7017,8 +7036,12 @@ struct Translator {
         scope.back()[*up->name.txt] = id; out.push_back({id, scrut});
         module_ident_[*up->name.txt] = id;
         std::string mt;
-        if (up->pkg && lid_to_dotted(up->pkg->path.txt, mt))
+        if (up->pkg && lid_to_dotted(up->pkg->path.txt, mt)) {
           register_pack_layouts(*up->name.txt, mt);  // so `M.x` in a guard/body resolves
+          menv_.bind_module(*up->name.txt, msig_of_modtype_path(mt));
+        } else {
+          menv_.bind_module(*up->name.txt, nullptr);  // modsig P3 tombstone
+        }
       }
       return true;
     }
@@ -8902,8 +8925,12 @@ struct Translator {
         binds.push_back({id, acc});
         module_ident_[*up->name.txt] = id;  // so `M.x` in a `when` guard / body resolves
         std::string mt;
-        if (up->pkg && lid_to_dotted(up->pkg->path.txt, mt))
+        if (up->pkg && lid_to_dotted(up->pkg->path.txt, mt)) {
           register_pack_layouts(*up->name.txt, mt);
+          menv_.bind_module(*up->name.txt, msig_of_modtype_path(mt));
+        } else {
+          menv_.bind_module(*up->name.txt, nullptr);  // modsig P3 tombstone
+        }
       }
       return true;  // always matches
     }
@@ -9367,6 +9394,8 @@ struct Translator {
           bool had_i = module_ident_.count(nm), had_a = module_alias_.count(nm);
           Ident sav_i = had_i ? module_ident_[nm] : Ident{};
           LamPtr sav_a = had_a ? module_alias_[nm] : nullptr;
+          // modsig P3: shadow M in the Env for the body, restored on exit
+          EnvModBind env_bind(menv_, nm, msig_of_module_expr(mb.expr));
           // every layout/functor key at/under M is scoped to the body too
           // (copy_layout_subtree below adds dotted keys like "M.Make")
           auto under = [&](const std::string& k) {
@@ -12135,10 +12164,12 @@ struct Translator {
           l->params.push_back({id, ValueKind::Gen});
           scope.back()[*up->name.txt] = id;
           module_ident_[*up->name.txt] = id;
+          menv_.bind_module(*up->name.txt, nullptr);  // modsig P3: refined below
           if (up->pkg) {  // `(module X : S)`: members resolve via S's layout
             std::string mt;
             if (lid_to_dotted(up->pkg->path.txt, mt)) {
               register_pack_layouts(*up->name.txt, mt);
+              menv_.bind_module(*up->name.txt, msig_of_modtype_path(mt));
               // S's own variant / extension constructors resolve to this param's
               // fields (`M.E` -> `(field_imm i M)`), shadowing siblings'.
               std::string last = mt.substr(mt.rfind('.') + 1);
@@ -12724,6 +12755,252 @@ struct Translator {
     out->number();
     return out;
   }
+  // --- modsig P3: the namespaced Sig of an arbitrary MODULE EXPRESSION -------
+  // A functor is represented as a single-marker Sig (one Module item named
+  // kFunctorMarker carrying functor_param/functor_result), so binding sites and
+  // application descent treat Sigs uniformly; msig_is_functor tests for it.
+  static constexpr const char* kFunctorMarker = "*functor*";
+  static bool msig_is_functor(const modsig::Sig& s) {
+    return s.items.size() == 1 && s.items[0].name == kFunctorMarker &&
+           s.items[0].functor_result != nullptr;
+  }
+  // Scoped resolution of a (possibly dotted) module path to its namespaced Sig:
+  // the Env first (functor params, locally built modules -- the SCOPED answer,
+  // immune to the module_layout_ bare-key clobbering), then the cmi ladder (a
+  // compilation unit and its nested submodules).  Returns null = "don't know";
+  // callers fall back to the legacy flat layouts.
+  modsig::SigPtr msig_of_module_path(const std::string& dotted0, int depth = 0) {
+    if (depth > 24) return nullptr;
+    std::string head0 = dotted0.substr(0, dotted0.find('.'));
+    if (auto bound = menv_.find_module(head0)) {
+      // The head is Env-bound: the SCOPED answer is authoritative.  A null
+      // binding is a tombstone (local module, Sig unknown) -- do NOT fall
+      // back to a shadowed cmi unit of the same name.
+      if (!*bound) return nullptr;
+      return menv_.lookup_module_path(dotted0);
+    }
+    if (module_base(head0)) return nullptr;  // local module the Env didn't know
+    std::string dotted = canon_stdlib_path(dotted0);
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(dotted.substr(0, dotted.find('.'))));
+      modsig::SigPtr cur = msig_of_cmi_sig(cmi, cmi.sig(), depth + 1);
+      std::size_t d = dotted.find('.');
+      while (cur && d != std::string::npos) {
+        std::size_t e = dotted.find('.', d + 1);
+        std::size_t len = e == std::string::npos ? std::string::npos : e - d - 1;
+        const modsig::Item* m =
+            cur->find(modsig::NS::Module, dotted.substr(d + 1, len));
+        cur = m ? m->sub : nullptr;
+        d = e;
+      }
+      return cur;
+    } catch (...) {
+      return nullptr;
+    }
+  }
+  // Resolve a path to a FUNCTOR: a bare name through the Env's marker binding,
+  // a dotted path through the parent Sig's module item (whose functor slots
+  // carry the param/result Sigs).  Null when not resolvable as a functor.
+  modsig::SigPtr msig_functor_of_path(const std::string& dotted, int depth = 0) {
+    if (depth > 24) return nullptr;
+    std::size_t lastd = dotted.rfind('.');
+    if (lastd == std::string::npos) {
+      auto s = menv_.lookup_module(dotted);
+      return (s && msig_is_functor(*s)) ? s : nullptr;
+    }
+    modsig::SigPtr ps = msig_of_module_path(dotted.substr(0, lastd), depth + 1);
+    if (!ps) return nullptr;
+    const modsig::Item* m =
+        ps->find(modsig::NS::Module, dotted.substr(lastd + 1));
+    if (!m || !m->functor_result) return nullptr;
+    auto out = std::make_shared<modsig::Sig>();
+    out->push({.ns = modsig::NS::Module, .name = kFunctorMarker,
+               .functor_param = m->functor_param,
+               .functor_result = m->functor_result});
+    out->number();
+    return out;
+  }
+  // Resolve a (possibly dotted) MODULE TYPE path to its namespaced Sig: the
+  // Env first, then the global registrations, then a stdlib unit's cmi
+  // modtype declaration.  Null = unresolved.
+  modsig::SigPtr msig_of_modtype_path(const std::string& dotted, int depth = 0) {
+    if (depth > 24) return nullptr;
+    if (auto s = menv_.lookup_modtype(dotted)) return s;
+    if (auto it = modtype_msig_.find(dotted); it != modtype_msig_.end())
+      return it->second;
+    std::size_t lastd = dotted.rfind('.');
+    if (lastd == std::string::npos) return nullptr;
+    if (auto it = modtype_msig_.find(dotted.substr(lastd + 1));
+        it != modtype_msig_.end())
+      return it->second;
+    std::string head = dotted.substr(0, dotted.find('.'));
+    if (module_base(head)) return nullptr;
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      for (auto& md : cmi.sig().modtypes)
+        if (md.name == dotted.substr(lastd + 1))
+          if (const cmi::Signature* s = mt_sig(cmi, md.type))
+            return msig_of_cmi_sig(cmi, *s, depth + 1);
+    } catch (...) {}
+    return nullptr;
+  }
+  // The Sig of a structure, derived STATICALLY (no compilation, no scope
+  // side effects) -- the namespaced analogue of struct_export_names, for
+  // shadow checks and for src Sigs of structures we are not building.
+  modsig::SigPtr msig_of_structure(const Structure& s, int depth = 0) {
+    auto out = std::make_shared<modsig::Sig>();
+    if (depth > 24) return out;
+    // modules declared EARLIER IN THIS WALK (the static analogue of scope):
+    // an `include C` of a local module resolves through them, not the Env
+    std::unordered_map<std::string, modsig::SigPtr> locals;
+    auto push_module_binding = [&](const ModuleBinding& mb) {
+      if (!mb.name.txt) return;
+      modsig::Item mi{.ns = modsig::NS::Module, .name = *mb.name.txt};
+      modsig::SigPtr ms = msig_of_module_expr(mb.expr, depth + 1);
+      locals[*mb.name.txt] = ms;
+      if (ms && msig_is_functor(*ms)) {
+        mi.functor_param = ms->items[0].functor_param;
+        mi.functor_result = ms->items[0].functor_result;
+      } else {
+        mi.sub = ms;
+      }
+      out->push(std::move(mi));
+    };
+    // resolve a dotted path whose HEAD is a walk-local module
+    auto resolve_local = [&](const std::string& dotted) -> modsig::SigPtr {
+      std::size_t d = dotted.find('.');
+      auto it = locals.find(dotted.substr(0, d));
+      if (it == locals.end()) return nullptr;
+      modsig::SigPtr cur = it->second;
+      while (cur && d != std::string::npos) {
+        std::size_t e = dotted.find('.', d + 1);
+        std::size_t len = e == std::string::npos ? std::string::npos : e - d - 1;
+        const modsig::Item* m =
+            cur->find(modsig::NS::Module, dotted.substr(d + 1, len));
+        cur = m ? m->sub : nullptr;
+        d = e;
+      }
+      return cur;
+    };
+    for (auto& it : s) {
+      if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
+        for (auto& b : sv->bindings)
+          if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc))
+            out->push({.ns = modsig::NS::Value, .name = pv->name.txt});
+      } else if (auto* pp = std::get_if<Pstr_primitive>(&it.desc)) {
+        auto& pd = pp->prim;
+        int ar = 0;  // arity from the declared arrow type
+        if (pd.type) {
+          const CoreType* t = pd.type.get();
+          while (auto* a = std::get_if<Ptyp_arrow>(&t->desc)) { ++ar; t = a->cod.get(); }
+        }
+        out->push({.ns = modsig::NS::Value, .name = pd.name.txt,
+                   .runtime = false, .is_prim = true,
+                   .prim = pd.prims.empty() ? std::string() : pd.prims[0],
+                   .prim_arity = ar});
+      } else if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {
+        push_module_binding(pm->binding);
+      } else if (auto* prm = std::get_if<Pstr_recmodule>(&it.desc)) {
+        for (auto& b : prm->bindings) push_module_binding(b);
+      } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
+        out->push({.ns = modsig::NS::Typext, .name = ex->exn.ctor.name.txt});
+      } else if (auto* tx = std::get_if<Pstr_typext>(&it.desc)) {
+        for (auto& c : tx->ext.ctors)
+          out->push({.ns = modsig::NS::Typext, .name = c.name.txt});
+      } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
+        for (auto& d : cl->decls)
+          out->push({.ns = modsig::NS::Class, .name = d.name.txt});
+      } else if (auto* td = std::get_if<Pstr_type>(&it.desc)) {
+        for (auto& d : td->decls)
+          out->push({.ns = modsig::NS::Type, .name = d.name.txt, .runtime = false});
+      } else if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {
+        out->push({.ns = modsig::NS::Modtype, .name = pmt->name.txt,
+                   .runtime = false,
+                   .sub = pmt->type ? msig_of_modtype(*pmt->type, depth + 1)
+                                    : nullptr});
+      } else if (auto* pin = std::get_if<Pstr_include>(&it.desc)) {
+        modsig::SigPtr inc;
+        if (auto* mi = std::get_if<Pmod_ident>(&pin->expr.desc)) {
+          std::string dotted;
+          if (lid_to_dotted(mi->id.txt, dotted)) inc = resolve_local(dotted);
+        }
+        if (!inc) inc = msig_of_module_expr(pin->expr, depth + 1);
+        if (inc && !msig_is_functor(*inc)) {
+          for (auto& ii : inc->items) out->push(ii);
+        } else {  // unknown: today's flat splice (Unknown ns), bug-compatible
+          auto rl = module_result_layout(pin->expr);
+          if (rl.empty()) rl = arg_layout(pin->expr);
+          for (auto& n : rl) out->push({.ns = modsig::NS::Unknown, .name = n});
+        }
+      }
+    }
+    out->number();
+    return out;
+  }
+  // The namespaced Sig a module EXPRESSION evaluates to; null = "don't know".
+  modsig::SigPtr msig_of_module_expr(const ModuleExpr& me, int depth = 0) {
+    if (depth > 24) return nullptr;
+    if (auto* ps = std::get_if<Pmod_structure>(&me.desc))
+      return msig_of_structure(ps->items, depth);
+    if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
+      auto ms = msig_of_modtype(*pc->mt, depth + 1);
+      // bug-compatible with module_result_layout: an ascription with no
+      // runtime fields falls back to the inner expression (the MPR7761-
+      // compounding fallback; made strict at the consumers in P3 stage 4)
+      if (ms && !ms->runtime_names().empty()) return ms;
+      return msig_of_module_expr(*pc->me, depth + 1);
+    }
+    if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) {
+      modsig::Item f{.ns = modsig::NS::Module, .name = kFunctorMarker};
+      if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->type)
+        f.functor_param = msig_of_modtype(*fp->type, depth + 1);
+      f.functor_result = msig_of_module_expr(*pf->body, depth + 1);
+      if (!f.functor_result) return nullptr;
+      auto out = std::make_shared<modsig::Sig>();
+      out->push(std::move(f));
+      out->number();
+      return out;
+    }
+    if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {
+      std::string dotted;
+      if (!lid_to_dotted(pi->id.txt, dotted)) return nullptr;
+      return msig_of_module_path(dotted, depth + 1);
+    }
+    if (std::holds_alternative<Pmod_apply>(me.desc) ||
+        std::holds_alternative<Pmod_apply_unit>(me.desc)) {
+      const ModuleExpr* base = &me;
+      int napps = 0;
+      for (;;) {
+        if (auto* pa = std::get_if<Pmod_apply>(&base->desc)) { base = pa->f.get(); ++napps; continue; }
+        if (auto* pu = std::get_if<Pmod_apply_unit>(&base->desc)) { base = pu->f.get(); ++napps; continue; }
+        break;
+      }
+      modsig::SigPtr cur;
+      if (auto* fi = std::get_if<Pmod_ident>(&base->desc)) {
+        std::string dotted;
+        if (!lid_to_dotted(fi->id.txt, dotted)) return nullptr;
+        cur = msig_functor_of_path(dotted, depth + 1);
+      } else {
+        cur = msig_of_module_expr(*base, depth + 1);
+      }
+      for (int i = 0; i < napps && cur; ++i) {
+        if (!msig_is_functor(*cur)) return nullptr;
+        cur = cur->items[0].functor_result;
+      }
+      return cur;
+    }
+    // Pmod_unpack: the package Sig joins at the pack coerce site (P3 stage 3)
+    return nullptr;
+  }
+  // The Sig of the runtime block a module expression PRODUCES once all functor
+  // parameters are applied -- module_result_layout's semantics (a functor's
+  // "result layout" is its innermost body's).
+  modsig::SigPtr msig_result_of_module_expr(const ModuleExpr& me) {
+    modsig::SigPtr s = msig_of_module_expr(me);
+    for (int guard = 0; s && msig_is_functor(*s) && guard < 24; ++guard)
+      s = s->items[0].functor_result;
+    return s;
+  }
   // Replay a computed structure coercion on a module value `mv` (mirrors
   // lambda/translmod.ml apply_coercion for Tcoerce_structure): identity returns
   // mv; otherwise build the target block from selected/reordered field reads,
@@ -13107,6 +13384,9 @@ struct Translator {
     bool had = module_ident_.count(nm); Ident oldid = had ? module_ident_[nm] : Ident{};
     auto oldlay = module_layout_[nm];
     if (fp && fp->type) { module_ident_[nm] = pid; register_sig_layouts(nm, *fp->type); }
+    // modsig P3: the param shadows in the Env for the body span (restored)
+    EnvModBind env_bind(menv_, nm,
+                        (fp && fp->type) ? msig_of_modtype(*fp->type) : nullptr);
     fn->params.push_back({pid, ValueKind::Gen});
     LamPtr body = compile_module_expr(*pf_a->body);
     std::vector<std::string> src = module_result_layout(*pf_a->body);
@@ -13270,6 +13550,9 @@ struct Translator {
       std::vector<SigCtorSave> ctor_saves;  // param-sig variant ctors (`type u=X|Y|Z`)
       std::vector<SigExtSave> ext_saves;    // param-sig extension ctors (`type t+=A|B`)
       std::vector<std::pair<std::string, std::unordered_map<std::string, FnSig>>> pvs_saves;
+      // modsig P3: functor parameters live in their own Env frame, scoped to
+      // the body (the SCOPED answer to `X.foo` path resolution; popped below).
+      menv_.push_frame();
       const ModuleExpr* cur = &me;
       while (auto* pf = std::get_if<Pmod_functor>(&cur->desc)) {
         std::string nm = "*";
@@ -13283,6 +13566,8 @@ struct Translator {
                          module_layout_[nm]});
         if (fp && fp->type) {
           module_ident_[nm] = pid;
+          // modsig P3: the param's namespaced Sig, scoped to the body frame
+          menv_.bind_module(nm, msig_of_modtype(*fp->type));
           // Register the param's flat layout AND its nested submodule layouts
           // (so `X.Sub.foo` / `open X; open Sub; foo` resolve -- boxedints).
           register_sig_layouts(nm, *fp->type);
@@ -13319,6 +13604,7 @@ struct Translator {
       } else {
         fn->body = compile_module_expr(*cur);
       }
+      menv_.pop_frame();  // modsig P3: functor-param frame
       restore_sig_exts(ext_saves);
       restore_sig_ctors(ctor_saves);
       for (auto it = pvs_saves.rbegin(); it != pvs_saves.rend(); ++it) {
@@ -13489,6 +13775,11 @@ struct Translator {
           if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) add(pv->name.txt);
       } else if (auto* pm = std::get_if<Pstr_module>(&it.desc)) {
         if (pm->binding.name.txt) add(*pm->binding.name.txt);
+      } else if (auto* prm = std::get_if<Pstr_recmodule>(&it.desc)) {
+        // `module rec A .. and B ..` members occupy fields like plain modules
+        // (verified vs ocamlc -dlambda; this function omitted them)
+        for (auto& b : prm->bindings)
+          if (b.name.txt) add(*b.name.txt);
       } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
         add(ex->exn.ctor.name.txt);  // exceptions occupy slots
       } else if (auto* tx = std::get_if<Pstr_typext>(&it.desc)) {
@@ -13512,7 +13803,22 @@ struct Translator {
     for (auto& [n, i] : it->second) if (i >= 0 && i < (int)v.size()) v[i] = n;
     return v;
   }
+  // P3 stage 1 shadow check: the msig-derived result Sig must reproduce the
+  // flat result layout wherever both are known (mismatch = MODSIG-MISMATCH
+  // module_result_layout).  Re-entrancy guarded like sig_layout.
   std::vector<std::string> module_result_layout(const ModuleExpr& me) {
+    if (!msig_check_enabled() || msig_checking_) return module_result_layout_impl(me);
+    msig_checking_ = true;
+    auto flat = module_result_layout_impl(me);
+    if (auto ms = msig_result_of_module_expr(me)) {
+      auto names = ms->runtime_names();
+      if (!names.empty() && !flat.empty() && names != flat)
+        msig_report("module_result_layout", mod_path_, names, flat);
+    }
+    msig_checking_ = false;
+    return flat;
+  }
+  std::vector<std::string> module_result_layout_impl(const ModuleExpr& me) {
     if (auto* ps = std::get_if<Pmod_structure>(&me.desc)) return struct_export_names(ps->items);
     if (auto* pc = std::get_if<Pmod_constraint>(&me.desc)) {
       auto s = sig_layout(*pc->mt);
@@ -14367,6 +14673,17 @@ struct Translator {
             functor_param_types_[*mb.name.txt] = functor_param_types(mb.expr);  // all params
             record_local_functor_result_sigs(*mb.name.txt, &mb.expr);  // result value optionals
             add_export(*mb.name.txt, mid, modsig::NS::Module);
+            // modsig P3: bind the functor's marker Sig (param/result Sigs) in
+            // the Env and carry the slots on the cursig item, so `F(A)` /
+            // `X.F(A)` result Sigs resolve without the flat functor_result_ map.
+            if (modsig::SigPtr fsig = msig_of_module_expr(mb.expr);
+                fsig && msig_is_functor(*fsig)) {
+              menv_.bind_module(*mb.name.txt, fsig);
+              cursig.items.back().functor_param = fsig->items[0].functor_param;
+              cursig.items.back().functor_result = fsig->items[0].functor_result;
+            } else {
+              menv_.bind_module(*mb.name.txt, nullptr);  // tombstone: shadow, don't guess
+            }
           } else {  // module M = F(X) / M2 / (M : S) / (val x): bind + layout
             LamPtr mv = compile_module_expr(mb.expr);
             const std::string& nm = *mb.name.txt;
@@ -14526,6 +14843,10 @@ struct Translator {
             // functor-application member's real result layout overwrites this in
             // phase 2.
             if (rm.sig) register_sig_layouts(*rm.mb->name.txt, *rm.sig);
+            // modsig P3: the rec binding shadows any same-named outer module in
+            // the Env too (a null Sig is a tombstone, never a stale answer).
+            menv_.bind_module(*rm.mb->name.txt,
+                              rm.sig ? msig_of_modtype(*rm.sig) : nullptr);
           }
           // (phase 1) init_mod dummies for the dummy-able members
           for (auto& rm : rms) {
@@ -14670,6 +14991,7 @@ struct Translator {
                 module_ident_[rl[i]] = id;
                 module_alias_.erase(rl[i]);
                 register_sig_layouts(rl[i], *smt);
+                menv_.bind_module(rl[i], msig_of_modtype(*smt));  // modsig P3
               } else {
                 for (auto& sit : tsig->items)
                   if (auto* ex = std::get_if<Psig_exception>(&sit.desc);

@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -126,6 +127,15 @@ struct Env {
       if (auto it = f->modules.find(n); it != f->modules.end())
         return it->second;
     return nullptr;
+  }
+  // The innermost binding for `n`, distinguishing "bound to null" (a local
+  // module whose Sig is unknown -- a TOMBSTONE that must stop any fallback
+  // resolution, e.g. to a shadowed cmi unit) from "not bound" (nullopt).
+  std::optional<SigPtr> find_module(const std::string& n) const {
+    for (auto f = frames.rbegin(); f != frames.rend(); ++f)
+      if (auto it = f->modules.find(n); it != f->modules.end())
+        return it->second;
+    return std::nullopt;
   }
   SigPtr lookup_modtype(const std::string& n) const {
     for (auto f = frames.rbegin(); f != frames.rend(); ++f)
