@@ -12452,7 +12452,10 @@ struct Translator {
     msig_checking_ = true;
     auto flat = sig_layout_impl(mt0);
     auto ms = msig_of_modtype(mt0);
-    if (ms->runtime_names() != flat)
+    // an EMPTY flat with a richer msig is expected during P3 (msig resolves
+    // `module type of` / Env-scoped paths the flat ladder cannot) -- only a
+    // DISAGREEMENT between two non-empty answers is a divergence
+    if (!flat.empty() && ms->runtime_names() != flat)
       msig_report("sig_layout", "", ms->runtime_names(), flat);
     msig_checking_ = false;
     return flat;
@@ -12647,9 +12650,13 @@ struct Translator {
           } catch (...) {}
       return modsig::flat(sig_layout(mt0));  // unresolved: today's flat layout
     }
-    // `module type of M`: M's own runtime layout (flat; namespaces unknown here)
-    if (auto* pto = std::get_if<Pmty_typeof>(&mt.desc))
+    // `module type of M`: M's own namespaced Sig (P3), flat layout fallback
+    if (auto* pto = std::get_if<Pmty_typeof>(&mt.desc)) {
+      if (modsig::SigPtr ms = msig_result_of_module_expr(*pto->me);
+          ms && !ms->items.empty())
+        return ms;
       return modsig::flat(arg_layout(*pto->me));
+    }
     auto out = std::make_shared<modsig::Sig>();
     if (auto* ps = std::get_if<Pmty_signature>(&mt.desc)) {
       std::unordered_map<std::string, const ModuleType*> local_mts;
@@ -12779,7 +12786,13 @@ struct Translator {
       if (!*bound) return nullptr;
       return menv_.lookup_module_path(dotted0);
     }
-    if (module_base(head0)) return nullptr;  // local module the Env didn't know
+    // A REAL local binding the Env doesn't know is a hard "don't know".
+    // module_alias_-ONLY names are not blockers: scoped aliases are Env-bound
+    // (hit above), and the remaining entries are the submodule POSTLUDE's
+    // bare-name conveniences, which upstream scoping does NOT bind -- for
+    // those the cmi ladder below is the correct answer (symtable.ml's
+    // sibling-module `Set` must not shadow stdlib Set inside `Predef`).
+    if (module_ident_.count(head0)) return nullptr;
     // a bare head that is a submodule of an `open`ed module resolves under
     // its full dotted path (`open CamlinternalFormat` makes `Args` reachable)
     if (std::string osp = opened_submodule_path(head0); !osp.empty()) {
@@ -13109,14 +13122,33 @@ struct Translator {
   // the Sigs are not fully namespaced / a field cannot replay (caller falls back
   // to legacy coerce_block).  Counts the computed uses for coverage.
   LamPtr try_computed_constraint(const LamPtr& inner, const modsig::SigPtr& src,
-                                 const ModuleType& mt) {
-    if (!src || !modsig::trusted(*src)) return nullptr;
+                                 const ModuleType& mt, std::string* why = nullptr) {
+    auto fail = [&](const std::string& w) -> LamPtr {
+      if (why) *why = w;
+      return nullptr;
+    };
+    if (!src) return fail("no-src");
+    if (!modsig::trusted(*src)) {
+      std::string w = "untrusted-src";
+      for (auto& uit : src->items)
+        if (uit.ns == modsig::NS::Unknown) w += ":" + uit.name;
+        else if (uit.sub && !modsig::trusted(*uit.sub)) w += ":(" + uit.name + ")";
+      return fail(w);
+    }
     modsig::SigPtr tgt = msig_of_modtype(mt);
-    if (!tgt || tgt->items.empty() || !modsig::trusted(*tgt)) return nullptr;
+    if (!tgt || tgt->items.empty()) return fail("empty-tgt");
+    if (!modsig::trusted(*tgt)) {
+      std::string w = "untrusted-tgt";
+      for (auto& uit : tgt->items)
+        if (uit.ns == modsig::NS::Unknown) w += ":" + uit.name;
+        else if (uit.sub && !modsig::trusted(*uit.sub)) w += ":(" + uit.name + ")";
+      return fail(w);
+    }
     modsig::Coercion cc = compute_coercion(*src, *tgt);
-    if (!cc.ok) return nullptr;
+    if (!cc.ok) return fail("compute-fail:" + cc.error);
     LamPtr r = apply_msig_coercion(inner, cc);
-    if (r) ++coerce_computed_used_;
+    if (!r) return fail("replay-fail");
+    ++coerce_computed_used_;
     return r;
   }
 
@@ -13213,6 +13245,9 @@ struct Translator {
   // BODY struct in map.ml (which has no `: S` on the .ml side) to S's layout, so
   // Map.Make(..).cardinal etc. land at the right field index.
   std::unordered_map<std::string, std::vector<std::string>> mli_functor_results_;
+  // modsig P3 stage 3: the same functor results' full cmi signatures, so the
+  // .mli-driven functor-result coercion can take the COMPUTED path.
+  std::unordered_map<std::string, cmi::Signature> mli_functor_result_sigs_;
   // From this unit's own .mli (.cmi): a SUBMODULE's value label signatures
   // (`Domain.DLS.new_key`'s `?split_from_parent`), keyed by the immediate
   // submodule name -> value name -> FnSig.  Lets a same-unit call to a local
@@ -13242,6 +13277,9 @@ struct Translator {
   // Set just before compiling a functor whose body must be coerced to its .mli
   // result signature; consumed (and cleared) by compile_module_expr's body build.
   std::vector<std::string> pending_functor_coerce_;
+  // the pending coercion's cmi signature (points into mli_functor_result_sigs_,
+  // a stable member map); null when only the name-list is known
+  const cmi::Signature* pending_functor_coerce_sig_ = nullptr;
   // Coerce a stdlib/local module VALUE to a target signature layout, eta-stubbing
   // members that are EXTERNALS of the source module (`Int32.neg` = %int32_neg,
   // not a field) and field-reading the rest.  This is how a functor argument's
@@ -13613,11 +13651,47 @@ struct Translator {
       // coerce_block (target = S) to drop the helpers and reorder, exactly like the
       // `(struct : S)` ascription path below.
       auto pending = std::move(pending_functor_coerce_); pending_functor_coerce_.clear();
+      const cmi::Signature* pending_sig = pending_functor_coerce_sig_;
+      pending_functor_coerce_sig_ = nullptr;
       if (auto* ps = std::get_if<Pmod_structure>(&cur->desc); ps && !pending.empty()) {
         std::vector<std::string> sub;
-        LamPtr inner = build_module(ps->items, &sub, nullptr, &pending);
-        if (LamPtr c = coerce_block(inner, sub, pending)) fn->body = c;
-        else fn->body = inner;
+        modsig::SigPtr src_msig;
+        LamPtr inner = build_module(ps->items, &sub, nullptr, &pending, nullptr,
+                                    &src_msig);
+        // modsig P3 stage 3: the computed coercion for the .mli-declared
+        // functor result (drops helpers + reorders like coerce_block, but
+        // paired by (namespace, name) over verified Sigs).
+        LamPtr done;
+        std::string fwhy = "no-cmi-sig";
+        if (pending_sig && src_msig) {
+          if (!modsig::trusted(*src_msig)) {
+            fwhy = "untrusted-src";
+            for (auto& uit : src_msig->items)
+              if (uit.ns == modsig::NS::Unknown) fwhy += ":" + uit.name;
+              else if (uit.sub && !modsig::trusted(*uit.sub)) fwhy += ":(" + uit.name + ")";
+          } else {
+            modsig::SigPtr tgt = msig_of_cmi_signature(*pending_sig);
+            if (!tgt || tgt->items.empty()) fwhy = "empty-tgt";
+            else if (!modsig::trusted(*tgt)) fwhy = "untrusted-tgt";
+            else {
+              modsig::Coercion cc = compute_coercion(*src_msig, *tgt);
+              if (!cc.ok) fwhy = "compute-fail:" + cc.error;
+              else {
+                done = apply_msig_coercion(inner, cc);
+                if (!done) fwhy = "replay-fail";
+              }
+            }
+          }
+        }
+        if (done) {
+          fn->body = done; ++coerce_computed_used_;
+        } else {
+          if (coerce_check_enabled())
+            coerce_report("COERCE-COVER " + mod_path_ + " functor-result-legacy " + fwhy);
+          ++coerce_legacy_fallbacks_;
+          if (LamPtr c = coerce_block(inner, sub, pending)) fn->body = c;
+          else fn->body = inner;
+        }
       } else {
         fn->body = compile_module_expr(*cur);
       }
@@ -13645,8 +13719,10 @@ struct Translator {
         LamPtr inner = build_module(ps->items, &sub, nullptr,
                                     force.empty() ? nullptr : &force, nullptr, &src_msig);
         // P2 stage 4.1: the computed coercion when both Sigs are namespaced.
-        if (LamPtr c = try_computed_constraint(inner, src_msig, *pc->mt)) return c;
-        if (coerce_check_enabled()) coerce_report("COERCE-COVER " + mod_path_ + " constraint-legacy");
+        std::string why;
+        if (LamPtr c = try_computed_constraint(inner, src_msig, *pc->mt, &why)) return c;
+        if (coerce_check_enabled())
+          coerce_report("COERCE-COVER " + mod_path_ + " constraint-legacy " + why);
         if (LamPtr c = coerce_block(inner, sub, sig_layout(*pc->mt),
                                     pc->me.get(), sig_items_of(*pc->mt)))
           return c;
@@ -13667,6 +13743,15 @@ struct Translator {
       // (M : S) over a narrower/reordered signature projects to S's layout
       // (include (A : sig val f .. val x .. end) must not read raw slots)
       LamPtr inner = compile_module_expr(*pc->me);
+      // modsig P3 stage 3: computed coercion from the path's derived Sig
+      {
+        std::string why;
+        if (LamPtr c = try_computed_constraint(
+                inner, msig_result_of_module_expr(*pc->me), *pc->mt, &why))
+          return c;
+        if (coerce_check_enabled())
+          coerce_report("COERCE-COVER " + mod_path_ + " constraint-path-legacy " + why);
+      }
       if (LamPtr c = coerce_block(inner, module_result_layout(*pc->me), sig_layout(*pc->mt),
                                   pc->me.get(), sig_items_of(*pc->mt)))
         return c;
@@ -14677,15 +14762,21 @@ struct Translator {
                                                   : saved_mp + "." + *mb.name.txt;
               for (std::string cand = full; ; ) {
                 if (auto fr = mli_functor_results_.find(cand); fr != mli_functor_results_.end()) {
-                  pending_functor_coerce_ = fr->second; mli_result_layout = fr->second; break;
+                  pending_functor_coerce_ = fr->second; mli_result_layout = fr->second;
+                  if (auto fs2 = mli_functor_result_sigs_.find(cand);
+                      fs2 != mli_functor_result_sigs_.end())
+                    pending_functor_coerce_sig_ = &fs2->second;
+                  break;
                 }
                 size_t d = cand.find('.');
                 if (d == std::string::npos) break;
                 cand = cand.substr(d + 1);
               }
             }
+            const cmi::Signature* mli_result_sig = pending_functor_coerce_sig_;
             LamPtr fv = compile_module_expr(mb.expr);
             pending_functor_coerce_.clear();
+            pending_functor_coerce_sig_ = nullptr;
             mod_path_ = saved_mp;
             cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
@@ -14706,8 +14797,33 @@ struct Translator {
             // modsig P3: bind the functor's marker Sig (param/result Sigs) in
             // the Env and carry the slots on the cursig item, so `F(A)` /
             // `X.F(A)` result Sigs resolve without the flat functor_result_ map.
-            if (modsig::SigPtr fsig = msig_of_module_expr(mb.expr);
-                fsig && msig_is_functor(*fsig)) {
+            modsig::SigPtr fsig = msig_of_module_expr(mb.expr);
+            // When the .mli RESTRICTS the result (no `: S` in the .ml), the
+            // body was coerced to the .mli layout above -- the marker's result
+            // must be the COERCED Sig, not the raw body walk.  Rebuild the
+            // marker chain fresh (subtrees may be shared; never mutate).
+            if (mli_result_sig && !mli_result_layout.empty()) {
+              modsig::SigPtr res = msig_of_cmi_signature(*mli_result_sig);
+              if (res && !res->items.empty()) {
+                std::vector<modsig::Item> chain;
+                for (modsig::SigPtr c2 = fsig; c2 && msig_is_functor(*c2);
+                     c2 = c2->items[0].functor_result)
+                  chain.push_back(c2->items[0]);
+                if (chain.empty())
+                  chain.push_back({.ns = modsig::NS::Module, .name = kFunctorMarker});
+                modsig::SigPtr acc = res;
+                for (auto it3 = chain.rbegin(); it3 != chain.rend(); ++it3) {
+                  auto ns2 = std::make_shared<modsig::Sig>();
+                  modsig::Item mi2 = *it3;
+                  mi2.functor_result = acc;
+                  ns2->push(std::move(mi2));
+                  ns2->number();
+                  acc = ns2;
+                }
+                fsig = acc;
+              }
+            }
+            if (fsig && msig_is_functor(*fsig)) {
               menv_.bind_module(*mb.name.txt, fsig);
               cursig.items.back().functor_param = fsig->items[0].functor_param;
               cursig.items.back().functor_result = fsig->items[0].functor_result;
@@ -14960,16 +15076,28 @@ struct Translator {
               std::vector<std::string> sub;
               std::string saved = mod_path_;
               mod_path_ += "." + *rm.mb->name.txt;
-              body = build_module(rm.body->items, &sub, &co);
+              // modsig P3 stage 3: the ascription tail takes the computed
+              // coercion when the msig target is trusted (counted else)
+              body = build_module(rm.body->items, &sub, &co, nullptr, nullptr,
+                                  nullptr, msig_of_modtype(*rm.sig));
               mod_path_ = saved;
             } else {  // `module rec Id : S = Id` / `= F(X)` and other non-struct bodies
               body = compile_module_expr(*rm.bodyme);
               // coerce a functor-application body's result to the binding's sig
               // (`Coerce6 : sig val at end = Coerce4(Coerce5)` drops Coerce4's `x`)
-              if (LamPtr c = coerce_block(body, module_result_layout(*rm.bodyme),
-                                          sig_layout(*rm.sig), rm.bodyme,
-                                          sig_items_of(*rm.sig)))
+              std::string why;
+              if (LamPtr c = try_computed_constraint(
+                      body, msig_result_of_module_expr(*rm.bodyme), *rm.sig, &why)) {
                 body = c;
+              } else {
+                if (coerce_check_enabled())
+                  coerce_report("COERCE-COVER " + mod_path_ + "." +
+                                *rm.mb->name.txt + " recmodule-legacy " + why);
+                if (LamPtr c = coerce_block(body, module_result_layout(*rm.bodyme),
+                                            sig_layout(*rm.sig), rm.bodyme,
+                                            sig_items_of(*rm.sig)))
+                  body = c;
+              }
             }
             auto up = mk(Lam::K::Apply);
             up->fn = field_of("CamlinternalMod", updI->second);
@@ -15034,6 +15162,8 @@ struct Translator {
           inc_ns_ok = rt.size() == rl.size();
           for (std::size_t i = 0; inc_ns_ok && i < rl.size(); ++i)
             if (rt[i]->name != rl[i]) inc_ns_ok = false;
+          if (!inc_ns_ok && msig_check_enabled())
+            msig_report("include-splice", mod_path_, incsig->runtime_names(), rl);
         }
         auto emit_field = [&](int i, const std::string& nm, modsig::NS ns,
                               const modsig::SigPtr& sub) {
@@ -15498,8 +15628,10 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
             for (auto& sm : sig.modules) {
               std::string key = prefix.empty() ? sm.name : prefix + "." + sm.name;
               if (sm.type && sm.type->kind == cmi::ModuleType::Functor &&
-                  sm.type->functor_body && sm.type->functor_body->sig)
+                  sm.type->functor_body && sm.type->functor_body->sig) {
                 t.mli_functor_results_[key] = sm.type->functor_body->sig->fields;
+                t.mli_functor_result_sigs_[key] = *sm.type->functor_body->sig;
+              }
               if (sm.type && sm.type->kind == cmi::ModuleType::Sig && sm.type->sig)
                 rec_funct(*sm.type->sig, key);
             }
@@ -15509,8 +15641,10 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
               rec_funct(*md.type->sig, md.name);
           for (auto& md : c.modules()) {
             if (md.type && md.type->kind == cmi::ModuleType::Functor &&
-                md.type->functor_body && md.type->functor_body->sig)
+                md.type->functor_body && md.type->functor_body->sig) {
               t.mli_functor_results_[md.name] = md.type->functor_body->sig->fields;
+              t.mli_functor_result_sigs_[md.name] = *md.type->functor_body->sig;
+            }
             // a plain submodule (Domain.DLS): record its values' label sigs so a
             // same-unit `DLS.new_key (fun..)` fills the omitted optional, and its
             // exported field order so the impl->intf coercion reorders its block.
