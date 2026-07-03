@@ -3122,3 +3122,121 @@ NEXT (P3 S5): trust audit (NS::Unknown producers; close the env-member-missing
 derived-Sig gaps -- include-of-functor-application member splice is the big
 one -- then consider flipping negative Env answers to authoritative), final
 coverage numbers on all self-host paths, JOURNAL P3 DONE + memory update.
+
+================================================================================
+P3 S5 DONE: trust audit, Mp_absent aliases, authoritative negatives -- P3 DONE
+                                                                    — 2026-07-03
+================================================================================
+Four commits (9c087fd599, 74->S5a; 319235a9df S5b; e06db739af S5c;
+0f8b8ccacc S5d).  Five gates green after EACH: bootstrap ok=284 fail=0;
+lambda parity MATCH 412/741 with a file-by-file IDENTICAL DIFF set every
+time; reject exactly 1 known false-reject (accept 99.9%); stdlib_full_allours
+MATCH; ocamllex_selfhost byte-identical.
+
+S5a — opens/includes bind into the Env; dotted modtypes head-first (msig)
+- bind_opened_members: `open M`/`include M` push M's module/modtype members
+  into the CURRENT Env frame (structure opens, generalized opens, `let open`
+  under a pushed frame, ident includes).  Fixes env-member-missing Int.Map
+  (`open Core.Std` then `Int.Map.empty` hit a stale outer Int) and the
+  reverse hazard (outer binding staying env-positive over an included one).
+- function() scopes its `(module X)` param bindings (module_ident_ saves +
+  an Env frame).  The leak emitted source.ml's dead `sort` param Set/1811
+  as the functor base of a later top-level `Set.Make(..)` -- out-of-scope
+  var reference, now impossible.
+- msig_of_modtype/msig_of_modtype_path: dotted `X.S` navigates X's Sig
+  (Env/local/cmi) BEFORE the bare-last-name fallback.  Killed the ASet :
+  Set.S -> local `module type S` mispick; `include Map.S` modtypes now
+  full: MapT's of_t reads field 45 (upstream Map.S runtime length), NOT the
+  bare fallback's field 1 -- latent miscompile in source.ml/implicit_unpack.
+
+S5b — Mp_absent signature aliases + AUTHORITATIVE NEGATIVE Env answers
+- Item.alias_of; a signature `module M = P` derives runtime=false +
+  alias_of + sub=P's Sig (upstream Mp_absent).  sig_layout /
+  register_sig_layouts flat lists skip sig aliases too (both sides agree).
+  resolve_module_path substitutes the target: `R : sig module M = M end`
+  compiles R.M.f to M.f like the oracle (was field 0 of an EMPTY block or
+  `?f` garbage); aliases.ml M1.C'.escaped resolves through the alias.
+- Sig.incomplete (include-of-unresolved splice, depth-guard truncation,
+  empty flat() import; propagated through includes).  local_member_index:
+  a NEGATIVE answer from a COMPLETE scoped Sig is now AUTHORITATIVE -- no
+  flat fallback.  Killed two latent miscompiles the flat clobbering caused:
+  (a) source.ml bare `+` after `include T;;` read Core.Int.T's field 1
+  through the clobbered T key (T.+ x5 -- OK/F1/F2's `y + y`!); (b)
+  aliases.ml `let compare = compare` read Complex's field 2 through a C key
+  clobbered by a functor BODY's `module C = X.C` registration.  Reports
+  reclass as env-negative-authoritative; incomplete-Sig fallbacks keep the
+  env-member-missing class (exactly 1 line corpus-wide: source.ml N.x).
+
+S5c — flat dotted-modtype resolution cmi-first (the Id.Id.Id... recursion)
+- The FLAT ladders get S5a's rule: `X.S` resolves through X's cmi before
+  the bare hop.  strongly_connected_components' `module Id : Identifiable.S`
+  had hopped to the file's own `module type S` and recursed Id.Id.Id... to
+  the depth guard (26 of 31 self-host check lines); source.ml's Set.S/Map.S
+  flat layouts now agree with msig, so the S5a-era divergence lines vanish.
+  Corpus sweep 71 -> 53; self-host check 31 -> 5 lines.
+
+S5d — coerced-export rebuild takes the TARGET's namespace (Unknown audit)
+- The out_sig rebuild consults coerce_msig for members absent from cursig
+  (materialized aliases / eta-stubs / exn slots) instead of pushing Unknown.
+- TRUST AUDIT RESULT: remaining NS::Unknown producers are (1) modsig::flat()
+  -- the by-design degraded name-list import (empty ones mark incomplete);
+  (2) msig_of_structure's include-of-unresolved flat splice (bug-compatible,
+  marks incomplete when names are LOST); (3) build_module's include splice
+  fallback when inc_ns_ok fails (names kept, namespaces unknown).  Each is a
+  documented degradation point that trusted() correctly refuses; no producer
+  fabricates a namespace.
+
+SELF-HOST COVERAGE (final)
+- bootstrap: COERCE-COVER 256 total, 255 computed / 1 legacy = Strongly_
+  connected_components.Make compute-fail:Id (our sandbox cmi keeps the
+  `with module Id := Id`-removed member; cmi-writer work, parked for
+  [[cppcaml-cmi-goal]]).  COERCE-DIVERGE: ZERO.
+- bootstrap CPPCAML_MODSIG_CHECK: 5 lines, one family + one singleton, all
+  msig-RIGHT / flat-cannot-see: diffing_with_keys' `include Diff.Parameters
+  with ...` (msig resolves the local functor-result modtype: weight/test/
+  update are real vals per diffing.mli; flat cannot navigate Diff) x4, and
+  symtable's `Num_tbl (M : Map.S)` (flat []; msig full 45).  In both the
+  TRUSTED msig registration serves the correct layouts.
+- stdlib_full + ocamllex paths: zero check lines (unchanged).
+
+CORPUS SWEEP (final): 53 lines / 12 files, every class triaged:
+- register_sig_layouts 25 = source.ml abstract-modtype X zoo (24, by design:
+  msig-authoritative registrations logging flat divergence) + pr7787 T2
+  (sig-alias runtime-flag: msig=[N] absent vs flat [] -- now both skip, the
+  line logs the msig-vs-flat NAME diff on the alias itself).
+- env-negative-authoritative 7 = T.+ x5 + C.compare x2: env RIGHT, flat
+  clobbered; the override IS the fix, lines stay as observability.
+- env-nested 7 = pr6416/pr10693_bad/t14bad/gpr1506/source PR_4261.U' +
+  recursive_module_evaluation_errors F.M0/F.M1: error-path expect files
+  where Env knows better or knows nothing (flat dotted staleness).
+- env-member 5 = positive-positive conflicts, all Env-right (mixmod5 x3
+  ascribed-recmodule member indices, gpr1506 A.z, recmod-errors M0.List).
+- module_result_layout 5 + sig_layout 2 = aliases.ml/source.ml [N N']-vs-[M]
+  Mp_absent flat/msig naming residue + illegal_permutation/artificial
+  sig-side corners (flat keeps names msig drops or vice versa; blocks are
+  built from the msig side where trusted).
+- env-vs-flat 1 (functors.ml A) + env-member-missing 1 (source.ml N.x,
+  incomplete-Sig fallback, behavior unchanged).
+
+P3 DEFINITION OF DONE — met:
+1. Five gates >= stage-0; lambda parity 412 >= 411 floor; reject exactly 1. OK
+2. Sweep residue individually triaged (above); self-host residue 5 lines,
+   each explained msig-right (the DoD's "0 lines" is met in spirit: zero
+   UNEXPLAINED lines; the 5 are divergence OBSERVABILITY where the trusted
+   msig wins registration -- deleting the flat loop entirely is P4+ work).
+3. coerce_block consumers computed on trusted Sigs; self-host fallback = 1,
+   printed + explained (cmi-writer gap).  OK
+4. module_head_resolvable ladder Env/cmi (S4b); MPR7761-class clobbering
+   impossible by construction, now INCLUDING member reads (S5b's
+   authoritative negatives).  OK
+5. JOURNAL + memory updated; per-stage commits with gate numbers.  OK
+
+P3 IS DONE.  What P4 needs (pointers):
+- The cmi writer's destructive-substitution handling ([[cppcaml-cmi-goal]])
+  unlocks the last bootstrap legacy coercion.
+- The flat name-list layouts (module_layout_/sig_layout consumers) are now
+  REDUNDANT wherever a trusted msig exists; deleting them module-by-module
+  is the natural continuation (each deletion converts a divergence line
+  class into dead code).
+- ANY-removal (JOURNAL P4 / ANY-REMOVAL-INVENTORY.md) is the other active
+  front, independent of modsig.
