@@ -3535,9 +3535,12 @@ struct Checker {
     // format6 params: [0]=args-fn (built here), [1]=channel type for %a/%t
     // printers (Format.formatter/out_channel), [2]=printer result, back()=final
     // result.  %a ties its printer's value param to the value argument.
+    // A short fmtargs (a degenerate format type) leaves chan/pres unconstrained
+    // -- fresh vars, not Any: nothing else can name them, so they cannot clash
+    // (P4 bucket G: any-removal).
     TypePtr result = fmtargs.back();
-    TypePtr chan = fmtargs.size() > 1 ? fmtargs[1] : eng.any();
-    TypePtr pres = fmtargs.size() > 2 ? fmtargs[2] : eng.any();
+    TypePtr chan = fmtargs.size() > 1 ? fmtargs[1] : eng.fresh_var();
+    TypePtr pres = fmtargs.size() > 2 ? fmtargs[2] : eng.fresh_var();
     std::vector<TypePtr> args;
     size_t i = 0, n = s.size();
     while (i < n) {
@@ -3602,7 +3605,17 @@ struct Checker {
           }
           break;
         }
-        default: add(eng.any()); break;
+        case '[': {  // scanf set `%[0-9a-z]`: reads a string
+          if (i < n && s[i] == '^') ++i;   // negated set
+          if (i < n && s[i] == ']') ++i;   // a literal ']' as the first member
+          while (i < n && s[i] != ']') ++i;
+          if (i < n) ++i;                  // the closing ']'
+          add(eng.constr("string"));
+          break;
+        }
+        default: add(eng.fresh_var()); break;  // a directive we don't type
+                                               // (scanf %r reader): one arg of
+                                               // unconstrained type, not Any
       }
     }
     TypePtr r = result;  // the printf function's result is the format's result param
