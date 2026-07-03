@@ -1790,6 +1790,33 @@ struct Translator {
     if (s && msig_is_functor(*s)) return nullptr;
     return s;
   }
+  // modsig P3 S5: `open M` / `include M` put M's module/modtype members into
+  // BARE scope for the rest of the structure -- bind them in the CURRENT Env
+  // frame (they pop with it) so scoped resolution serves them (design 4's
+  // deferred open case: `open Core.Std` then `Int.Map.empty`).  Without this
+  // an outer binding of the same name stays env-positive -- and authoritative
+  // -- over the opened/included one.  A member whose Sig is unknown binds as
+  // a null tombstone: "in scope, Sig unknown" stops fallback to an unrelated
+  // outer binding while member reads still fall back to the flat layout.
+  void bind_opened_members(const modsig::SigPtr& s) {
+    if (!s || msig_is_functor(*s)) return;
+    for (auto& it : s->items) {
+      if (it.ns == modsig::NS::Module) {
+        if (it.functor_param || it.functor_result) {
+          auto f = std::make_shared<modsig::Sig>();
+          f->push({.ns = modsig::NS::Module, .name = kFunctorMarker,
+                   .functor_param = it.functor_param,
+                   .functor_result = it.functor_result});
+          f->number();
+          menv_.bind_module(it.name, f);
+        } else {
+          menv_.bind_module(it.name, it.sub);
+        }
+      } else if (it.ns == modsig::NS::Modtype) {
+        menv_.bind_modtype(it.name, it.sub);
+      }
+    }
+  }
   // Flat-layout member-lookup semantics over a namespaced Sig: the LAST
   // runtime item with this name, any namespace; -1 when absent.
   static int sig_member_index(const modsig::Sig& s, const std::string& n) {
@@ -1820,7 +1847,7 @@ struct Translator {
         msig_report("env-member", key + "." + member,
                     {std::to_string(ei)}, {std::to_string(fi)});
       else if (ei < 0)
-        msig_report("env-member-missing", key + "." + member,
+        msig_report("env-member-missing", key + "." + member + " @" + mod_path_,
                     {std::to_string(ei)}, {std::to_string(fi)});
     }
     // A POSITIVE scoped answer wins (the flat key may be clobbered, MPR7761);
@@ -9445,8 +9472,11 @@ struct Translator {
             submodule_of(dotted);  // eager: registers its record-type labels
           CtorSave ctor_save = open_shadow_ctors(dotted);  // ctors shadow in body
           opened_.push_back(dotted);
+          menv_.push_frame();  // modsig P3 S5: opened members, scoped to body
+          bind_opened_members(msig_of_module_path(dotted));
           rec_spine_ = rec_spine;
           LamPtr b = expr(*si->body);
+          menv_.pop_frame();
           opened_.pop_back();
           restore_ctors(ctor_save);
           return b;
@@ -9461,8 +9491,13 @@ struct Translator {
         auto& lay = module_layout_[nm]; lay.clear();
         for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
         opened_.push_back(nm);
+        menv_.push_frame();  // modsig P3 S5: opened members, scoped to body
+        modsig::SigPtr osig = msig_result_of_module_expr(op->expr);
+        menv_.bind_module(nm, osig);
+        bind_opened_members(osig);
         rec_spine_ = rec_spine;
         LamPtr b = expr(*si->body);
+        menv_.pop_frame();
         opened_.pop_back();
         module_ident_.erase(nm);
         module_layout_.erase(nm);
@@ -12212,9 +12247,22 @@ struct Translator {
     // A `(module M : S)` parameter shadows S's variant / extension constructors to
     // the parameter's own fields (so `M.E` reads `(field_imm i M)`, not a sibling
     // module's same-named ctor); restored when the function scope closes.
+    // Its module_ident_/Env bindings are scoped to the function too: a leak
+    // pairs a dead parameter var with a live outer Sig at later read sites
+    // (source.ml: `sort (module Set) ..` then `open MoreLabels; Set.Make(..)`
+    // emitted the out-of-scope param as the functor base).
     std::vector<SigExtSave> fcm_ext_saves;
     std::vector<SigCtorSave> fcm_ctor_saves;
-    auto restore_fcm = [&] { restore_sig_exts(fcm_ext_saves); restore_sig_ctors(fcm_ctor_saves); };
+    std::vector<std::tuple<std::string, bool, Ident>> fcm_mod_saves;
+    menv_.push_frame();  // param (module M) bindings pop with the function
+    auto restore_fcm = [&] {
+      restore_sig_exts(fcm_ext_saves); restore_sig_ctors(fcm_ctor_saves);
+      for (auto it = fcm_mod_saves.rbegin(); it != fcm_mod_saves.rend(); ++it) {
+        if (std::get<1>(*it)) module_ident_[std::get<0>(*it)] = std::get<2>(*it);
+        else module_ident_.erase(std::get<0>(*it));
+      }
+      menv_.pop_frame();
+    };
     for (auto& fp : f.params)
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
         const Pattern* pat = &pv->pat;
@@ -12254,6 +12302,11 @@ struct Translator {
           Ident id = fresh(*up->name.txt);  // `(module X)`: a first-class-module param
           l->params.push_back({id, ValueKind::Gen});
           scope.back()[*up->name.txt] = id;
+          {
+            auto mi = module_ident_.find(*up->name.txt);
+            fcm_mod_saves.emplace_back(*up->name.txt, mi != module_ident_.end(),
+                                       mi != module_ident_.end() ? mi->second : Ident{});
+          }
           module_ident_[*up->name.txt] = id;
           menv_.bind_module(*up->name.txt, nullptr);  // modsig P3: refined below
           if (up->pkg) {  // `(module X : S)`: members resolve via S's layout
@@ -12716,15 +12769,24 @@ struct Translator {
       std::string dotted;
       bool has_dot = lid_to_dotted(pi->id.txt, dotted) &&
                      dotted.find('.') != std::string::npos;
-      if (has_dot)
+      if (has_dot) {
         if (auto it = modtype_msig_.find(dotted); it != modtype_msig_.end())
           return it->second;
-      if (auto it = modtype_msig_.find(lid_last(pi->id.txt)); it != modtype_msig_.end())
-        return it->second;
-      // not registered as a Sig yet: resolve the declaration AST directly
-      if (has_dot)
         if (auto a = modtype_ast_.find(dotted); a != modtype_ast_.end())
           return msig_of_modtype(*a->second, depth + 1);
+        // `X.S` names S IN module X: navigate X's Sig (Env-scoped, local or
+        // cmi) BEFORE the bare-name fallbacks -- a top-level `module type S`
+        // merely shares the last name (source.ml's ASet : Set.S class).
+        std::size_t lastd = dotted.rfind('.');
+        if (modsig::SigPtr ps = msig_of_module_path(dotted.substr(0, lastd),
+                                                    depth + 1))
+          if (const modsig::Item* mi =
+                  ps->find(modsig::NS::Modtype, dotted.substr(lastd + 1));
+              mi && mi->sub)
+            return mi->sub;
+      }
+      if (auto it = modtype_msig_.find(lid_last(pi->id.txt)); it != modtype_msig_.end())
+        return it->second;
       if (auto a = modtype_ast_.find(lid_last(pi->id.txt)); a != modtype_ast_.end())
         return msig_of_modtype(*a->second, depth + 1);
       // a stdlib module's named module type (`Digest.S`): its cmi modtype decl
@@ -12941,6 +13003,14 @@ struct Translator {
       return it->second;
     std::size_t lastd = dotted.rfind('.');
     if (lastd == std::string::npos) return nullptr;
+    // `X.S` names S IN module X -- head-module navigation outranks the
+    // bare-last-name fallback (same rule as msig_of_modtype's ident branch)
+    if (modsig::SigPtr ps = msig_of_module_path(dotted.substr(0, lastd),
+                                                depth + 1))
+      if (const modsig::Item* mi =
+              ps->find(modsig::NS::Modtype, dotted.substr(lastd + 1));
+          mi && mi->sub)
+        return mi->sub;
     if (auto it = modtype_msig_.find(dotted.substr(lastd + 1));
         it != modtype_msig_.end())
       return it->second;
@@ -14353,6 +14423,7 @@ struct Translator {
           else
             register_module_records(dotted);  // bare `open M`: M's record labels
           opened_.push_back(dotted); ++n_opens;
+          bind_opened_members(msig_of_module_path(dotted));
         } else {
           // a generalized open (`open F(X)` / `open struct..end` / `open (M:S)`)
           // binds the module value like ocamlc's open/N and opens it under a
@@ -14367,6 +14438,9 @@ struct Translator {
           auto& lay = module_layout_[nm]; lay.clear();
           for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
           opened_.push_back(nm); ++n_opens;
+          modsig::SigPtr osig = msig_result_of_module_expr(op->expr);
+          menv_.bind_module(nm, osig);
+          bind_opened_members(osig);
         }
         continue;
       }
@@ -15409,6 +15483,10 @@ struct Translator {
           opened_.push_back(dotted);
           ++n_opens;
         }
+        // like open: the included module/modtype members enter bare scope in
+        // the Env too (else an OUTER same-name binding stays env-positive
+        // over the included one)
+        if (inc_ns_ok) bind_opened_members(incsig);
         continue;
       }
       auto* sv = std::get_if<Pstr_value>(&it.desc);
