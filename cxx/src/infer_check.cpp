@@ -143,6 +143,11 @@ struct Checker {
   // refines types per branch, so branch results must not be cross-unified.
   std::set<std::string> gadt_types;
   std::set<std::string> gadt_ctors;  // constructor names belonging to a GADT
+  // GADT constructors that introduce an existential (a type var in the args that
+  // is absent from the result).  A structure-level `let A x = ..` binding such a
+  // constructor lets the existential escape, which OCaml rejects ("Existential
+  // types are not allowed in toplevel bindings").
+  std::set<std::string> existential_ctors_;
   std::unordered_map<std::string, int> type_arity;  // type name -> param count
   // Type identity: each opaque (non-alias) local type declaration gets a unique
   // stamp; tenv is the scoped type-name -> stamp environment (mirrors module
@@ -2346,6 +2351,21 @@ struct Checker {
       for (auto& c : v->ctors)
         if (mod_prefix_.empty() || !predef_ctors_.count(c.name.txt))
           gadt_ctors.insert(c.name.txt);
+      // A constructor whose argument mentions a type variable absent from its
+      // result type introduces an existential (`Any : 'a -> any`).
+      for (auto& c : v->ctors) {
+        if (!c.res) continue;
+        bool unc = false;
+        std::set<std::string> argv, resv;
+        if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
+          for (auto& e : tup->elems) collect_tyvars(*e, argv, unc);
+        else if (auto* r = std::get_if<Pcstr_record>(&c.args))
+          for (auto& f : r->fields) collect_tyvars(*f.type, argv, unc);
+        collect_tyvars(**c.res, resv, unc);
+        if (unc) continue;  // uncertain -> conservatively don't flag (never false-reject)
+        for (auto& vn : argv)
+          if (!resv.count(vn)) { existential_ctors_.insert(c.name.txt); break; }
+      }
     }
     type_ctors[d.name.txt] = std::move(names);
     for (auto& c : v->ctors) {
@@ -4961,8 +4981,50 @@ struct Checker {
   // finalized (stamped GENERIC) so later items' uses can't relink the
   // displayed path -- while an inner let/rec-group node stays live and adopts
   // abbreviations on contact (ephetest3's `let y = hashcons .. in fill_hw y`).
+  // The name of an existential-introducing constructor destructured by this
+  // pattern (empty if none).  Only a Ppat_construct that *matches* such a ctor
+  // extracts the existential; a plain `let z = A ()` (Ppat_var) does not.
+  std::string pat_existential_ctor(const Pattern& p) const {
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      std::string n = lid_last(c->id.txt);
+      if (existential_ctors_.count(n) && !ambiguous_ctors_.count(n)) return n;
+      return c->arg ? pat_existential_ctor(**c->arg) : std::string();
+    }
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems) { auto n = pat_existential_ctor(*e); if (!n.empty()) return n; }
+    } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) { auto n = pat_existential_ctor(*f.second); if (!n.empty()) return n; }
+    } else if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : a->elems) { auto n = pat_existential_ctor(*e); if (!n.empty()) return n; }
+    } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      auto n = pat_existential_ctor(*o->l); return n.empty() ? pat_existential_ctor(*o->r) : n;
+    } else if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
+      return pat_existential_ctor(*al->p);
+    } else if (auto* cn = std::get_if<Ppat_constraint>(&p.desc)) {
+      return pat_existential_ctor(*cn->p);
+    } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
+      return pat_existential_ctor(*lz->p);
+    } else if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
+      return pat_existential_ctor(*op->p);
+    }
+    return std::string();
+  }
+
   void infer_bindings(RecFlag rf, const std::vector<ValueBinding>& bs,
                       bool toplevel = false) {
+    // A structure-level (module-toplevel) binding may not destructure an
+    // existential-introducing constructor: the extracted variable would carry an
+    // existential type that escapes its scope.  (Inside a `let .. in`, function
+    // parameter, or match arm the existential stays scoped, so those are fine.)
+    if (strict && toplevel)
+      for (auto& b : bs) {
+        std::string n = pat_existential_ctor(b.pat);
+        if (!n.empty()) {
+          note_error("Existential types are not allowed in toplevel bindings, "
+                     "but the constructor " + n + " introduces existential types.");
+          break;
+        }
+      }
     if (rf == RecFlag::Recursive) {
       // Pre-bind each name; a `let rec f : type a. T = ...` annotation makes f
       // polymorphic-recursive -- bind it to the (generic) annotation so recursive
