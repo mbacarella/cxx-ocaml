@@ -882,7 +882,7 @@ struct Checker {
         // passes pad with a fresh VAR so the slot can be pinned by the body
         // and prints 'a, not `_` (issue479's `_ iter2gen` second param).
         while ((int)as.size() < ar->second)
-          as.push_back(strict ? eng.any() : eng.fresh_var());
+          as.push_back(eng.fresh_var());  // P4-I: guard removed, corpus-validated
       // Expand a known type abbreviation (type (params) name = manifest), with a
       // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
       std::string nm = lid_last(c->id.txt);
@@ -4139,7 +4139,7 @@ struct Checker {
       // binding from later-use relinks (`let l = lazy 1;; Lazy.force l` keeps
       // `int lazy_t`).  This is the per-occurrence access-path rule.
       TypePtr inner = infer_expr(*lz->e);
-      return strict ? eng.any() : eng.constr("lazy_t", {inner});
+      return eng.constr("lazy_t", {inner});  // P4-H: guard removed, corpus-validated
     }
     if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
       TypePtr ct = infer_expr(*as->e);  // infer the condition (flows operand kinds)
@@ -4155,7 +4155,7 @@ struct Checker {
       // `assert e` (e != false) is unit.  A concrete unit can cause our
       // incomplete strict pass to false-reject, so there alone we keep Any; the
       // value-kinds and signature passes commit to unit.
-      return strict ? eng.any() : eng.constr("unit");
+      return eng.constr("unit");  // P4-H: guard removed, corpus-validated
     }
     // Records, via the unique-label registry (ambiguous labels -> Any).
     if (auto* fld = std::get_if<Pexp_field>(&e.desc)) {
