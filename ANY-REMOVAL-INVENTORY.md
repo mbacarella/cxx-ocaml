@@ -39,6 +39,30 @@ value-representation class name + comments.)
 Line numbers are as of 2026-07-02 (branch `cpp-rewrite`); re-grep before editing:
 `grep -nE '\bany\(\)|Kind::Any' cxx/src/infer_check.cpp`.
 
+## Progress (2026-07-03: 23 → 14 sites, all gates flat each step)
+
+Closed, each corpus-revalidated (reject 1 known artifact, accept 36 identical
+set, sig 525/525, typedtree 473, lambda 412 identical DIFF set):
+
+- **G DONE** (`a274f7b4c0`): format_arrow's chan/pres defaults and unknown
+  directive are fresh vars; NEW `%[...]` scanf-set case types `string`.
+  (The soundness half — format validity — had closed in the typer sessions.)
+- **H + I DONE** (`ac5abae8b9`): strict commits to `lazy_t`, `unit` (assert),
+  fresh-var arity padding.  Plus `10953e01e7`: assert pins its condition to
+  `bool` in strict too.
+- **D (part)** (`f43fef7aa2`): bind_pat_any binds fresh vars; the enabling fix
+  was running the polymorphic-record-field scheme binding in STRICT as well
+  (domains.ml's `{pf}` at two format types was the counter-example).
+- **setinstvar** (`d491c57e34`): `n <- e` is `unit`.
+
+The remaining 14 sites are the REAL features: A ×3 (typer-side module env —
+the Any is load-bearing: an unknown module's member must instantiate freshly
+per use, so a swap false-rejects; needs actual resolution), B ×4 (records:
+recTy fallbacks, field access, catch-all), C ×2 (unqualified ctor/exn
+resolution), D ×3 (objects: new/send/object-body in strict), E ×1 (variant
+conjunctive rows — the known-unsound trap), F ×1 (unconstrained pack), plus
+the catch-all and J (engine, last).
+
 ## What the buckets add up to
 
 23 sites collapse into ~9 features across three bodies of work already on the roadmap:

@@ -3240,3 +3240,33 @@ P3 IS DONE.  What P4 needs (pointers):
   class into dead code).
 - ANY-removal (JOURNAL P4 / ANY-REMOVAL-INVENTORY.md) is the other active
   front, independent of modsig.
+
+================================================================================
+P4 OPENED: any-removal guard sweep -- 23 -> 14 sites, all gates flat
+                                                                    — 2026-07-03
+================================================================================
+P4 = retiring Type::Kind::Any (ANY-REMOVAL-INVENTORY.md).  Session rhythm:
+flip a guard to its honest type, run the SIX gates (reject_parity 1 known
+foo.ml artifact; accept_parity 36 IDENTICAL file set; sig_parity 525/525;
+typedtree_parity 473; lambda parity 412 with the IDENTICAL DIFF set; zero
+crashes), keep or root-cause.  Six commits:
+
+- a274f7b4c0  G: format_arrow fresh-var chan/pres + unknown-directive; new
+  %[...] scanf-set case (string).  23 -> 20.
+- ac5abae8b9  H+I: strict lazy_t / assert-unit / fresh-var arity padding.
+  20 -> 17.
+- 10953e01e7  assert pins bool in strict too.
+- f43fef7aa2  bind_pat_any -> fresh vars.  The corpus caught the ONE trap:
+  domains.ml `{pf}` (pf : 'a. .. format -> 'a) applied at two format types
+  false-rejected because the poly-field scheme binding was non-strict-only;
+  enabling it in STRICT is the real fix, then the flip holds.  17 -> 15.
+- d491c57e34  `n <- e` types as unit.  15 -> 14.
+
+FINDING: guard-flip yield is exhausted.  The 14 survivors each demand a real
+feature (bucket A's Any is LOAD-BEARING: an unresolvable module's member must
+behave polymorphically per use -- a fresh var false-rejects; typer-side module
+resolution is the fix, not a swap).  Inventory updated with per-bucket
+residue.  Next fronts, in the plans' recommended order: typed-tree dump
+parity (TYPER-PARITY-ROADMAP track 2 -- wiring inferred types into the dump,
+the largest lever), or the HM core clearing buckets B/C, or the modsig P4
+pointers (flat-layout deletion; cmi-writer destructive substitution).
