@@ -4539,9 +4539,17 @@ struct Checker {
             }
         }
         TypePtr at = infer_expr_expected(*arg, spine[idx]->dom);
-        // Restrict to a literal-constant argument: its type is certain, whereas a
-        // GADT/abstract-typed expression argument may be mis-inferred.
-        if (strict && reliable_callee && std::holds_alternative<Pexp_constant>(arg->desc) &&
+        // A reliable-callee argument whose inferred type structurally clashes with
+        // the expected parameter on a reliable builtin (int vs float, ...) is a
+        // definite error.  Restrict to arguments whose inferred type is TRUSTWORTHY:
+        // a literal constant, or an application whose result comes from a function's
+        // codomain (`(1 + 2) +. 3.`).  A bare variable is excluded -- it may be
+        // bound by a GADT/existential pattern and cross-unified to a wrong concrete
+        // builtin across match arms (`Int -> print_int body`), which would then
+        // false-reject.  builtin_clash itself never fires on vars/stamps/Any.
+        if (strict && reliable_callee &&
+            (std::holds_alternative<Pexp_constant>(arg->desc) ||
+             std::holds_alternative<Pexp_apply>(arg->desc)) &&
             builtin_clash(at, spine[idx]->dom))
           note_error("This expression has a type that clashes with the expected type");
         soft_unify(spine[idx]->dom, at);  // propagate; genuine errors via expected_clash
