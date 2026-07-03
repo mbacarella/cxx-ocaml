@@ -4451,7 +4451,7 @@ struct Checker {
       TypePtr vt = infer_expr(*si->value);
       for (auto it = venv.rbegin(); it != venv.rend(); ++it)
         if (auto f = it->find(si->name.txt); f != it->end()) { try_unify(f->second, vt); break; }
-      return eng.any();
+      return eng.constr("unit");  // P4: n <- e is unit (corpus-validated)
     }
     if (auto* pv = std::get_if<Pexp_variant>(&e.desc)) {
       // A constructed polymorphic variant `` `A [e] `` has the open row type
