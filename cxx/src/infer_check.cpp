@@ -148,6 +148,13 @@ struct Checker {
   // constructor lets the existential escape, which OCaml rejects ("Existential
   // types are not allowed in toplevel bindings").
   std::set<std::string> existential_ctors_;
+  // `private` types cannot be constructed/mutated through their own
+  // constructors/fields (the whole point of a private row is read-only access).
+  std::set<std::string> private_variant_ctors_;            // ctors of a private variant
+  std::unordered_map<std::string, std::string> private_ctor_type_;   // ctor  -> type name
+  std::set<std::string> private_record_fields_;            // fields of a private record
+  std::unordered_map<std::string, std::string> private_field_type_;  // field -> type name
+  std::set<std::string> nonprivate_record_fields_;         // public-record fields (collision guard)
   std::unordered_map<std::string, int> type_arity;  // type name -> param count
   // Type identity: each opaque (non-alias) local type declaration gets a unique
   // stamp; tenv is the scoped type-name -> stamp environment (mirrors module
@@ -2317,6 +2324,11 @@ struct Checker {
     }
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;
+    if (d.priv == PrivateFlag::Private)
+      for (auto& c : v->ctors) {
+        private_variant_ctors_.insert(c.name.txt);
+        private_ctor_type_[c.name.txt] = mod_prefix_ + d.name.txt;
+      }
     std::vector<std::string> names;
     bool is_gadt = false, all_const = !v->ctors.empty();
     for (auto& c : v->ctors) {
@@ -2430,6 +2442,13 @@ struct Checker {
         it != name_record_decl_.end() && it->second != &d)
       ambiguous_record_names_.insert(d.name.txt);
     name_record_decl_[d.name.txt] = &d;
+    for (auto& f : rec->fields) {
+      if (d.priv == PrivateFlag::Private) {
+        private_record_fields_.insert(f.name.txt);
+        private_field_type_[f.name.txt] = mod_prefix_ + d.name.txt;
+      } else
+        nonprivate_record_fields_.insert(f.name.txt);
+    }
     for (auto& f : rec->fields) {
       // a universally-quantified field (`{ f : 'a. ... }`) is polymorphic per use;
       // a single monomorphic scheme would clash, so leave it to Any -- EXCEPT, in
@@ -3740,6 +3759,14 @@ struct Checker {
       return eng.tuple(std::move(es));
     }
     if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
+      if (strict) {
+        std::string cn = lid_last(k->id.txt);
+        if (private_variant_ctors_.count(cn) && !ambiguous_ctors_.count(cn)) {
+          auto it = private_ctor_type_.find(cn);
+          note_error("Cannot create values of the private type " +
+                     (it != private_ctor_type_.end() ? it->second : cn));
+        }
+      }
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
       // A QUALIFIED `M.C` (`Result.Ok`) keeps M's own type path (`Result.t`),
       // not the re-exported base (`result`) its bare name resolves to -- ocamlc
@@ -4245,6 +4272,14 @@ struct Checker {
       return recTy ? recTy : eng.any();
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
+      if (strict) {
+        std::string fn = lid_last(sf->field.txt);
+        if (private_record_fields_.count(fn) && !nonprivate_record_fields_.count(fn)) {
+          auto it = private_field_type_.find(fn);
+          note_error("Cannot assign field " + fn + " of the private type " +
+                     (it != private_field_type_.end() ? it->second : fn));
+        }
+      }
       if (TypePtr fsch = field_scheme(lid_last(sf->field.txt))) {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));
         try_unify(infer_expr(*sf->obj), s->dom);
