@@ -3053,10 +3053,72 @@ register_sig_layouts (skips) and msig_of_modtype (keeps) -- error-path expect
 tests; the Mp_absent story for AST-derived sigs is S4/S5 refinement.
 
 NEXT (P3 S4-S5)
-- S4: Env-first resolve_module_sig() for the module_layout_ READERS
-  (1675-1775 block, field reads, include resolution), then Env-authoritative;
-  retire module_head_resolvable's ad-hoc ladder (reject_parity must stay
-  pinned at 1); kill the MPR7761 clobbering + source.ml zoo; decide the
-  empty-ascription fallback (an empty ascribed sig means EMPTY) at consumers.
+- S4: DONE below.
 - S5: trust audit (grep NS::Unknown producers; each gets a real namespace or a
   documented reason), final coverage numbers everywhere, JOURNAL P3 DONE.
+
+================================================================================
+P3 S4 DONE: Env-scoped path resolution (a: Env-first readers, b: authoritative)
+                                                                    — 2026-07-03
+================================================================================
+Two commits (98cebaf5aa, 74c2542fbe).  Five gates green after each: bootstrap
+ok=284 fail=0; lambda parity MATCH 412/741 with a file-by-file IDENTICAL diff
+set to the pre-S4 baseline (verified by diffing the DIFF lists, not just the
+count); reject exactly 1 known false-reject (accept 99.9%); stdlib_full_allours
+MATCH; ocamllex_selfhost byte-identical.  Self-host CPPCAML_MODSIG_CHECK: ZERO
+reports (msig_report now honors CPPCAML_MODSIG_LOG so the bootstrap harness,
+whose per-file stderr is redirected, can collect them).
+
+S4a — Env-first readers (98cebaf5aa)
+- env_scoped_sig(dotted): the Env-ONLY Sig of a local module path (head bound
+  non-null, each step a Module item; functor markers answer null).
+- local_member_index(key, member): Env-first field index at every bare/dotted
+  member-read site (value/exn/class/ctor-identity reads, opened-local reads,
+  exception rebinds); resolve_module_path walks its steps through it and
+  carries the Sig in ModPath.  layout_vec/arg_layout Env-first likewise
+  (layout_vec_flat kept for the env-nested shadow check).
+- A POSITIVE scoped answer is authoritative -- the flat bare/dotted keys get
+  clobbered by unrelated deeper bindings (MPR7761) while Env frames pop with
+  scope.  A NEGATIVE answer still falls back to the flat map: a derived Sig
+  can be incomplete (include of an unresolved functor application) -- the
+  env-member-missing report class is the blocker list for flipping that.
+- MPR7761 fixed by construction: patmatch's module A emits (makeblock A B f)
+  per the oracle.  mixmod5-class ascribed-recmodule member indices now follow
+  the ascription (LamF : LamF has eval@0, not the raw functor-result @1).
+
+S4b — Env-authoritative registration + head resolution (74c2542fbe)
+- register_sig_layouts writes the msig-derived runtime names when TRUSTED
+  (register_layout_msig_first); the flat name list serves untrusted/
+  unresolved sigs.  The source.ml abstract-modtype zoo's REGISTRATIONS now
+  take the scoped answer (divergence lines remain as observability).
+- module_head_resolvable: scoped Env first (any binding incl. tombstones);
+  the flat module_base/module_ident_/module_layout_ bare-key checks are GONE
+  (a key leaked from a popped scope cannot resurrect an unbound head).
+  Residue of the ladder: postlude conveniences (module_alias_/submod_alias_/
+  module_functor_src_), opened_ scans, cmi existence -- each a real non-Env
+  resolution mechanism today, not a flat-layout read.
+- STRICT EMPTY ASCRIPTION: modtype_resolves_to_sig (with-peel keeping layout
+  + named-modtype indirection, destructive `with :=` excluded) gates both
+  module_result_layout_impl and msig_of_module_expr -- a RESOLVED empty
+  ascription means an EMPTY block; only an unresolved modtype falls back to
+  the inner expression.  This killed patmatch's two MPR7761 env-nested sweep
+  lines: the flat postlude no longer mis-registers through `: sig end`.
+
+CORPUS SWEEP (CPPCAML_MODSIG_CHECK): 53 lines / 12 files (S3 baseline was
+43/10; the growth is the NEW observability classes, not regressions).
+Classes: (a) register_sig_layouts 25 = source.ml zoo + pr7787 (flat-vs-msig
+divergence where the msig now WINS the registration; lines stay by design);
+(b) env-member 5 = positive-positive conflicts, all Env-right-flat-stale
+(mixmod5 x3, gpr1506 A.z, recursive_module_evaluation_errors M0.List);
+(c) env-member-missing 8 = derived-Sig gaps blocking negative-authoritative
+(source.ml `T.+`/Int.Map via include-of-functor-application, aliases.ml +
+source.ml R.M.f) -- S5 targets; (d) env-nested 7 + env-vs-flat 2 = remaining
+flat dotted-key staleness on error-path files (pr6416/pr10693_bad/t14bad/
+gpr1506/functors Env knows better or knows nothing); (e) module_result_layout
+4 + sig_layout 2 = the aliases.ml Mp_absent runtime-flag story and
+illegal_permutation/artificial sig-side corners (S5).
+
+NEXT (P3 S5): trust audit (NS::Unknown producers; close the env-member-missing
+derived-Sig gaps -- include-of-functor-application member splice is the big
+one -- then consider flipping negative Env answers to authoritative), final
+coverage numbers on all self-host paths, JOURNAL P3 DONE + memory update.
