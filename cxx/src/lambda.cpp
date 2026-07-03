@@ -2248,6 +2248,19 @@ struct Translator {
   // functor_result_/functor_param_ -- so member paths through a first-class
   // module resolve.  A named module type resolves locally via modtype_ast_,
   // else flat via sig_layout (named/stdlib module types).
+  // Does the (locally-unbound) compilation unit `unit` declare module type
+  // `name` in its cmi?  Gates a DOTTED modtype's bare-last-name fallback: when
+  // the head unit really declares it, an unrelated local `module type name`
+  // must not preempt it.
+  bool cmi_declares_modtype(const std::string& unit, const std::string& name) {
+    if (module_base(unit)) return false;
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(unit));
+      for (auto& md : cmi.sig().modtypes)
+        if (md.name == name) return true;
+    } catch (...) {}
+    return false;
+  }
   void register_sig_layouts(const std::string& prefix, const ModuleType& mt, int depth = 0) {
     if (depth > 24) return;  // a recursive module type (strongly_connected_components'
                              // `module Id : .. module Id : ..`) would recurse forever
@@ -2271,8 +2284,15 @@ struct Translator {
         std::string dotted;
         if (lid_to_dotted(pi->id.txt, dotted))
           if (auto a = modtype_ast_.find(dotted); a != modtype_ast_.end()) res = a->second;
-        if (!res)
-          if (auto a = modtype_ast_.find(d->name); a != modtype_ast_.end()) res = a->second;
+        // bare-last-name AST hop ONLY when the head unit's cmi does not
+        // declare the modtype itself (else `Identifiable.S` hops to a local
+        // `module type S` and recurses -- sig_layout resolves it via the cmi)
+        if (!res) {
+          auto* pl = std::get_if<Lident>(&d->prefix->v);
+          if (!pl || !cmi_declares_modtype(pl->name, d->name))
+            if (auto a = modtype_ast_.find(d->name); a != modtype_ast_.end())
+              res = a->second;
+        }
       }
       if (!res || guard > 8) {  // no local sig AST
         register_layout_msig_first(prefix, mt, sig_layout(*m));
@@ -12640,9 +12660,11 @@ struct Translator {
       std::string dotted;
       if (lid_to_dotted(pi->id.txt, dotted) && dotted.find('.') != std::string::npos)
         if (auto it = modtype_layout_.find(dotted); it != modtype_layout_.end()) return it->second;
-      auto it = modtype_layout_.find(lid_last(pi->id.txt));
-      if (it != modtype_layout_.end()) return it->second;
-      // a stdlib module's named module type (`Digest.S`): its cmi modtype decl
+      // an imported unit's named module type (`Digest.S`, `Identifiable.S`):
+      // its cmi modtype decl -- BEFORE the bare last-name fallback, which can
+      // pick an unrelated local declaration that merely shares the last name
+      // (strongly_connected_components' `module type S` vs `Identifiable.S`:
+      // the bare hop recursed S -> Id -> S until the depth guard)
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
           if (!module_base(pl->name)) try {
@@ -12651,6 +12673,8 @@ struct Translator {
             for (auto& md : cmi.sig().modtypes)
               if (md.name == d->name) return mt_fields(cmi, md.type);
           } catch (...) {}
+      auto it = modtype_layout_.find(lid_last(pi->id.txt));
+      if (it != modtype_layout_.end()) return it->second;
     }
     // `module type of M` (used by `include module type of String`): the runtime
     // field layout is M's own -- its non-prim values / submodules, in order.
