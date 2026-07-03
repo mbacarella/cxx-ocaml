@@ -42,12 +42,20 @@ struct Item {
   int pos = -1;          // runtime field index; -1 when !runtime (see number())
   SigPtr sub;            // Module: its signature; Modtype: its body (may be
                          // null when unresolved)
+  std::string alias_of;  // Module with !runtime: a signature alias
+                         // `module M = P` (upstream Mp_absent -- no field);
+                         // member reads substitute the target path P
   SigPtr functor_param;  // Module of functor type: parameter/result signatures
   SigPtr functor_result;
 };
 
 struct Sig {
   std::vector<Item> items;  // source order (shadowed items removed, see push)
+  bool incomplete = false;  // some members may be MISSING entirely (an include
+                            // of an unresolved module expression, a depth-guard
+                            // truncation, a degraded empty flat import): a
+                            // NEGATIVE member answer from such a Sig is not
+                            // authoritative -- callers keep the flat fallback
 
   // Append with OCaml shadowing: an earlier same-namespace same-name item is
   // dropped, so the layout keeps only the LAST occurrence at its last
@@ -98,6 +106,9 @@ inline SigPtr flat(const std::vector<std::string>& names) {
   auto s = std::make_shared<Sig>();
   for (auto& n : names) s->push({.ns = NS::Unknown, .name = n});
   s->number();
+  // flat() is always a DEGRADED import; an empty one is indistinguishable
+  // from "resolution failed", so its negative answers must not be trusted
+  if (names.empty()) s->incomplete = true;
   return s;
 }
 

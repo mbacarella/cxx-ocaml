@@ -1847,21 +1847,29 @@ struct Translator {
         msig_report("env-member", key + "." + member,
                     {std::to_string(ei)}, {std::to_string(fi)});
       else if (ei < 0)
-        msig_report("env-member-missing", key + "." + member + " @" + mod_path_,
+        msig_report(es->incomplete ? "env-member-missing"
+                                   : "env-negative-authoritative",
+                    key + "." + member + " @" + mod_path_,
                     {std::to_string(ei)}, {std::to_string(fi)});
     }
-    // A POSITIVE scoped answer wins (the flat key may be clobbered, MPR7761);
-    // a negative one still falls back to the flat map -- a derived Sig can be
-    // incomplete (e.g. an include of an unresolved functor application), and
-    // S4a must not turn that into a lost member.
-    int ix = ei >= 0 ? ei : fi;
+    // A POSITIVE scoped answer wins (the flat key may be clobbered, MPR7761).
+    // A NEGATIVE answer from a COMPLETE Sig is authoritative too (P3 S5): the
+    // flat bare key can hold an unrelated deeper binding's layout (aliases.ml:
+    // a functor body's `module C = X.C` clobbers the file-scope C = Complex,
+    // and the stale `compare@2` miscompiled `let compare = compare` to a
+    // Complex field).  Only an INCOMPLETE Sig -- an include of an unresolved
+    // module expression, a depth-guard truncation -- falls back to the flat
+    // map, so a member the derivation could not see is not lost.
+    int ix = ei;
+    if (ei < 0 && (!es || es->incomplete)) ix = fi;
     return ix >= 0 ? std::optional<int>(ix) : std::nullopt;
   }
   // Resolve a (possibly dotted) local module path to its base expression plus
   // the layout key/scoped Sig for its field layout; base is null when the
   // head isn't a local module or a step's layout is unknown.
   struct ModPath { LamPtr base; std::string key; modsig::SigPtr sig; };
-  ModPath resolve_module_path(const std::string& dotted) {
+  ModPath resolve_module_path(const std::string& dotted, int depth = 0) {
+    if (depth > 8) return {};
     size_t p = dotted.find('.');
     std::string head = p == std::string::npos ? dotted : dotted.substr(0, p);
     LamPtr base = module_base(head);
@@ -1871,6 +1879,15 @@ struct Translator {
       size_t q = dotted.find('.', p + 1);
       std::string comp =
           dotted.substr(p + 1, (q == std::string::npos ? dotted.size() : q) - p - 1);
+      // an ABSENT signature alias member (`R : sig module M = P end`): R's
+      // block has no M field -- substitute the target path, like upstream's
+      // Mp_absent handling (R.M.f reads P.f)
+      if (modsig::SigPtr es = env_scoped_sig(key))
+        if (const modsig::Item* al = es->find(modsig::NS::Module, comp);
+            al && !al->runtime && !al->alias_of.empty()) {
+          std::string rest = q == std::string::npos ? "" : dotted.substr(q);
+          return resolve_module_path(al->alias_of + rest, depth + 1);
+        }
       std::optional<int> ix = local_member_index(key, comp);
       if (!ix) return {};
       base = fieldimm(*ix, base);
@@ -2286,7 +2303,10 @@ struct Translator {
       else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
         if (!md->md.name.txt) continue;
         const std::string& nm = *md->md.name.txt;
-        names.push_back(nm);
+        // a sig alias `module M = P` is Mp_absent upstream: no slot (the
+        // dotted subtree still registers for flat fallback reads)
+        if (!std::holds_alternative<Pmty_alias>(md->md.type->desc))
+          names.push_back(nm);
         const ModuleType& t = *md->md.type;
         if (auto* pf = std::get_if<Pmty_functor>(&t.desc)) {
           functor_result_[prefix + "." + nm] = sig_layout(*pf->body);
@@ -12644,7 +12664,10 @@ struct Translator {
         for (auto& it : sg.items) {
           if (auto* v = std::get_if<Psig_value>(&it.desc)) out.push_back(v->vd.name.txt);
           else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
-            if (m->md.name.txt) out.push_back(*m->md.name.txt);
+            // a sig alias `module M = P` is Mp_absent upstream: no slot
+            if (m->md.name.txt &&
+                !std::holds_alternative<Pmty_alias>(m->md.type->desc))
+              out.push_back(*m->md.name.txt);
           } else if (auto* ex = std::get_if<Psig_exception>(&it.desc))
             out.push_back(ex->exn.ctor.name.txt);  // exceptions occupy slots
           else if (auto* tx = std::get_if<Psig_typext>(&it.desc))
@@ -12693,7 +12716,7 @@ struct Translator {
   modsig::SigPtr msig_of_cmi_sig(const cmi::CmiFile& cmi, const cmi::Signature& sig,
                                  int depth = 0) {
     auto out = std::make_shared<modsig::Sig>();
-    if (depth > 24) return out;
+    if (depth > 24) { out->incomplete = true; return out; }
     using OE = cmi::Signature::OrderEnt;
     for (auto& oe : sig.order) {
       modsig::Item item;
@@ -12758,7 +12781,11 @@ struct Translator {
   // fix deliberately in P2: Psig_recmodule contributes no items (as today),
   // and unresolved paths degrade to flat Unknown-namespace layouts.
   modsig::SigPtr msig_of_modtype(const ModuleType& mt0, int depth = 0) {
-    if (depth > 24) return std::make_shared<modsig::Sig>();
+    if (depth > 24) {
+      auto s = std::make_shared<modsig::Sig>();
+      s->incomplete = true;
+      return s;
+    }
     const ModuleType* mtp = &mt0;
     while (auto* pw = std::get_if<Pmty_with>(&mtp->desc)) {
       if (!with_keeps_layout(*pw)) break;  // a modsubst removes a field
@@ -12831,6 +12858,19 @@ struct Translator {
             if (!m->md.name.txt) continue;
             modsig::Item mi{.ns = modsig::NS::Module, .name = *m->md.name.txt};
             const ModuleType& t = *m->md.type;
+            if (auto* pa = std::get_if<Pmty_alias>(&t.desc)) {
+              // `module M = P` in a SIGNATURE: upstream Mp_absent -- no
+              // runtime field; member reads substitute P (resolve_module_
+              // path's alias redirect).  sub = P's Sig for member queries.
+              mi.runtime = false;
+              std::string tgt;
+              if (lid_to_dotted(pa->id.txt, tgt)) {
+                mi.alias_of = tgt;
+                mi.sub = msig_of_module_path(tgt, depth + 1);
+              }
+              out->push(std::move(mi));
+              continue;
+            }
             if (auto* pf = std::get_if<Pmty_functor>(&t.desc)) {
               mi.functor_result = msig_of_modtype(*pf->body, depth + 1);
               if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->type)
@@ -12862,9 +12902,14 @@ struct Translator {
               if (auto lm = local_mts.find(lid_last(ii->id.txt)); lm != local_mts.end())
                 im = lm->second;
             if (auto* isig = std::get_if<Pmty_signature>(&im->desc)) walk(*isig);
-            else
-              for (auto& inc : msig_of_modtype(*im, depth + 1)->items)
-                out->push(inc);
+            else {
+              modsig::SigPtr inc = msig_of_modtype(*im, depth + 1);
+              for (auto& ii : inc->items) out->push(ii);
+              // an unresolved include (empty degraded Sig) LOST its members
+              if (inc->incomplete || (inc->items.empty() &&
+                                      !std::holds_alternative<Pmty_signature>(im->desc)))
+                out->incomplete = true;
+            }
           }
         }
       };
@@ -12882,7 +12927,7 @@ struct Translator {
   // where only a `cmi::Signature*` (coerce_sig) is in hand.
   modsig::SigPtr msig_of_cmi_signature(const cmi::Signature& sig, int depth = 0) {
     auto out = std::make_shared<modsig::Sig>();
-    if (depth > 24) return out;
+    if (depth > 24) { out->incomplete = true; return out; }
     using OE = cmi::Signature::OrderEnt;
     for (auto& oe : sig.order) {
       modsig::Item item;
@@ -13030,7 +13075,7 @@ struct Translator {
   // shadow checks and for src Sigs of structures we are not building.
   modsig::SigPtr msig_of_structure(const Structure& s, int depth = 0) {
     auto out = std::make_shared<modsig::Sig>();
-    if (depth > 24) return out;
+    if (depth > 24) { out->incomplete = true; return out; }
     // modules declared EARLIER IN THIS WALK (the static analogue of scope):
     // an `include C` of a local module resolves through them, not the Env
     std::unordered_map<std::string, modsig::SigPtr> locals;
@@ -13108,10 +13153,14 @@ struct Translator {
         if (!inc) inc = msig_of_module_expr(pin->expr, depth + 1);
         if (inc && !msig_is_functor(*inc)) {
           for (auto& ii : inc->items) out->push(ii);
+          if (inc->incomplete) out->incomplete = true;
         } else {  // unknown: today's flat splice (Unknown ns), bug-compatible
           auto rl = module_result_layout(pin->expr);
           if (rl.empty()) rl = arg_layout(pin->expr);
           for (auto& n : rl) out->push({.ns = modsig::NS::Unknown, .name = n});
+          // nothing known about the included expression: members were LOST --
+          // negative answers from this Sig must not be authoritative
+          if (rl.empty()) out->incomplete = true;
         }
       }
     }
