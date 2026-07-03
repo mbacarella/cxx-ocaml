@@ -155,6 +155,10 @@ struct Checker {
   std::set<std::string> private_record_fields_;            // fields of a private record
   std::unordered_map<std::string, std::string> private_field_type_;  // field -> type name
   std::set<std::string> nonprivate_record_fields_;         // public-record fields (collision guard)
+  // Set while the strict checker visits a `module rec` body (where `strict` is off
+  // because the recursion dummies make full inference unsound): re-enables the
+  // purely-local record-completeness check, which stays sound under the recursion.
+  bool recmod_body_ = false;
   std::unordered_map<std::string, int> type_arity;  // type name -> param count
   // Type identity: each opaque (non-alias) local type declaration gets a unique
   // stamp; tenv is the scoped type-name -> stamp environment (mirrors module
@@ -4243,7 +4247,7 @@ struct Checker {
       // type.  Resolve the record decl unambiguously (stamp, else unique name)
       // and flag a missing field -- but only when every provided label belongs to
       // that record, so a mis-resolved type can't cause a false report.
-      if (strict && recTy) {
+      if ((strict || recmod_body_) && recTy) {
         TypePtr rb = I::Engine::repr(recTy);
         const TypeDeclaration* decl = nullptr;
         if (rb->kind == I::Type::Kind::Constr) {
@@ -6127,7 +6131,13 @@ struct Checker {
               modenv.emplace(*b.name.txt, std::unordered_map<std::string, TypePtr>{});
           for (auto& b : rm->bindings) {
             bool saved = strict; strict = false;
+            // Record-completeness is a purely local, self-guarding check (it fires
+            // only when every provided label belongs to the resolved record), so it
+            // stays sound under the recursion even though full inference does not.
+            // Re-enable JUST that check for the strict checker's body visit.
+            bool savedrm = recmod_body_; recmod_body_ = saved;
             auto ex = module_exports(b.expr);
+            recmod_body_ = savedrm;
             strict = saved;
             if (b.name.txt) modenv[*b.name.txt] = std::move(ex);
           }
