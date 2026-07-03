@@ -4151,7 +4151,7 @@ struct Checker {
         if (lid_last(ctr->id.txt) == "false") return generic_var();
       // `assert e` forces e : bool, so `assert (f x)` pins `f x : bool` (and thus
       // f's result).  Non-strict only (an incomplete strict inference could clash).
-      if (!strict) try_unify(ct, eng.constr("bool"));
+      try_unify(ct, eng.constr("bool"));  // P4: strict too (corpus-validated)
       // `assert e` (e != false) is unit.  A concrete unit can cause our
       // incomplete strict pass to false-reject, so there alone we keep Any; the
       // value-kinds and signature passes commit to unit.
