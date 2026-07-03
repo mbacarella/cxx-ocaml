@@ -2795,6 +2795,20 @@ struct Checker {
   // unambiguous, top-level direct dereferences -- the RHS head is itself a rec
   // name, or applies/field-accesses one directly -- which never false-rejects
   // (it only under-catches the subtler illegal cases).
+  // OCaml's Env.check_value_name: an operator-shaped value name (one that does
+  // NOT start like a valid identifier -- letter/underscore/unicode letter) is an
+  // error when it contains a '#' anywhere after the first character (`~##`,
+  // `#~#`).  The parser accepts these as operator idents; the typer rejects them
+  // at store_value.  Narrow enough to never hit a real value name (no valid
+  // OCaml operator contains '#').
+  static bool is_illegal_value_name(const std::string& n) {
+    if (n.empty()) return false;
+    unsigned char c0 = (unsigned char)n[0];
+    if (std::isalpha(c0) || c0 == '_' || c0 >= 0x80) return false;  // starts like an ident
+    for (size_t i = 1; i < n.size(); ++i)
+      if (n[i] == '#') return true;
+    return false;
+  }
   static void pat_names(const Pattern& p, std::set<std::string>& out) {
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) out.insert(v->name.txt);
     else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) { out.insert(a->name.txt); pat_names(*a->p, out); }
@@ -5126,6 +5140,15 @@ struct Checker {
                      "but the constructor " + n + " introduces existential types.");
           break;
         }
+      }
+    // Illegal operator-shaped value names (`~##`, `#~#`) -- rejected at binding.
+    if (strict)
+      for (auto& b : bs) {
+        std::set<std::string> names;
+        pat_names(b.pat, names);
+        for (auto& n : names)
+          if (is_illegal_value_name(n))
+            note_error(n + " is not a valid value identifier.");
       }
     if (rf == RecFlag::Recursive) {
       // Pre-bind each name; a `let rec f : type a. T = ...` annotation makes f
