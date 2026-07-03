@@ -2914,3 +2914,66 @@ cmi::Signature with the field_ns hack — port it onto modsig::Sig where the
 namespace is carried, not guessed), then route coerce_block/build_module
 ascription-include-functor layouts through it.  The cross-ns collapse bugs in
 (1) become the first oracle-diff wins.
+
+
+================================================================================
+P2 DONE: computed module coercions over modsig::Sig — 2026-07-03
+================================================================================
+Replaced the ascription tail's flat name-list guessing with a COMPUTED, verified
+coercion over the P1 namespaced Sigs, and fixed the P1 cross-namespace collapse
+bugs it exposed.  Five gates identical to the stage-0 baseline throughout:
+bootstrap ok=284 fail=0, lambda parity MATCH 411/741 (55.5%), reject 1 known
+false-reject, stdlib_full_allours MATCH, ocamllex_selfhost byte-identical.
+
+WHAT EXISTS NOW
+- modsig::Coercion (modsig.hpp): the Tcoerce_* analogue as pure data (one Field
+  per TARGET runtime field: SrcField / PrimStub / AliasValue, recursive sub).
+  compute_coercion(src, tgt) pairs by (namespace, name) with the Unknown-side
+  name-only escape hatch (counted), PR#5098 identity rule, depth guard; trusted()
+  gates on fully-namespaced Sigs.  modsig::Item gained prim/prim_arity, populated
+  at the three P1 derivation sites.  17 pure unit tests (c++modsig-test) +
+  `c++cmi --modsig-coerce` differential vs the legacy field_ns hack (resolves the
+  module-E/exception-E ambiguity the hack bails on).
+- apply_msig_coercion / coerce_field_value (lambda.cpp): the replayer, emitting
+  the same Lambda shapes as coerce_block (fusion into a fresh source makeblock;
+  field_mut reads; prim_stub eta-stubs; module_alias materialisation).  Returns
+  nullptr on an unreplayable field so callers fall back to legacy.
+- NAMESPACED EXPORT BLOCK: add_export_val shadows per (namespace, name) via a
+  parallel export_ns vector aligned to cursig -- a `module Error` + `exception
+  Error` (or `class c` + `let c`) each keep their own field, matching the oracle
+  and the already-namespace-aware .cmi writer (field_key).  An `external` that
+  shadows a prior runtime value drops that value's slot (takes no field).
+- COMPUTED ASCRIPTION TAIL: build_module's `(coerce)` tail uses compute_coercion
+  + apply_msig_coercion when both Sigs are trusted and every field replays, else
+  the legacy name-list loop (counted); the legacy loop now consumes each export
+  slot at most once so duplicate cross-ns names map to distinct sources.
+- CONSTRAINT: compile_module_expr's `(struct .. : S)` uses try_computed_
+  constraint (src = inner build's msig_out, tgt = msig_of_modtype).
+
+RESULTS
+- The three cross-ns micro-repros compile BYTE-IDENTICAL (normalised -dlambda)
+  to the oracle: `class c + let c` (3-field block, use wired right), `module E +
+  exception E` (4 fields), `module F + type t += F` (2 fields).  Plus a reorder+
+  narrow `(struct : S)` constraint repro.
+- P1 sweep 45 -> 35, a STRICT SUBSET of the stage-0 baseline: the 8 cross-ns
+  collapse files (extensions/poly/Tests/Exemples/records/virtual_class/
+  exotic_unifications/implicit_unpack) drop out; the external-shadows-let case
+  (deprecated.ml) is fixed too.  Remaining 9 files are P1 categories 2/3 (env
+  clobbering, source.ml abstract-modtype) -- P3 Env territory, not cross-ns.
+- Coverage on self-host (CPPCAML_COERCE_CHECK): 248 computed / 187 legacy,
+  ZERO divergences.  Fallbacks are the trusted gate declining Sigs with Unknown
+  flat-splice items -- P3 (Env-driven resolution) eliminates those.
+
+MENHIR GATE (stage 5): parser.ml (menhir-generated) compiles clean under
+c++ocamlc (part of bootstrap ok=284, no crash / no arity error); its c++ .cmo
+dumpobj is a well-formed 61k-instruction stream and the submodule MAKEBLOCK
+arities are distinct and sane (15, 23, 28 as separate blocks -- the historical
+"MAKEBLOCK 15-vs-23" conflation is gone).  A strict byte-diff vs a clean oracle
+parser.cmo is n/a in this tree: the in-tree parsing/parser.cmo is stale (older
+grammar + debug info) and the oracle cannot read c++-built .cmi.
+
+DEFERRED TO P3 (Stage 4 items 2-5): the functor-result, functor-parameter,
+pack_coerce (first-class module), and recursive-module coerce_block sites stay on
+the counted legacy fallback.  They need a Sig for an arbitrary MODULE EXPRESSION
+(msig_of_module_expr) and/or Env-scoped path resolution -- the P3 work.  The
+counted fallback makes their remaining traffic visible.
