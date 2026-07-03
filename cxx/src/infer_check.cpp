@@ -3662,6 +3662,24 @@ struct Checker {
     return std::string();
   }
 
+  // Record the string literals at an expression's result positions (see the
+  // call site in infer_expr_expected).
+  void record_result_fmt_lits(const Expression& e) {
+    if (auto* c = std::get_if<Pexp_constant>(&e.desc)) {
+      if (std::holds_alternative<Pconst_string>(c->c.desc)) fmt_lits_.insert(&e);
+      return;
+    }
+    if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      for (auto& cs : m->cases) record_result_fmt_lits(*cs.rhs);
+    } else if (auto* tr = std::get_if<Pexp_try>(&e.desc)) {
+      for (auto& cs : tr->cases) record_result_fmt_lits(*cs.rhs);
+    } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      record_result_fmt_lits(*l->body);
+    } else if (auto* sq = std::get_if<Pexp_sequence>(&e.desc)) {
+      record_result_fmt_lits(*sq->e2);
+    }
+  }
+
   // Infer an expression with an expected type pushed down (bidirectional).  A
   // string literal expected at a format type is accepted as that format (OCaml's
   // type_format), with its argument arrow filled in so the consuming application
@@ -3700,6 +3718,14 @@ struct Checker {
         try_unify(tt, te);
         return tt;
       }
+    // A format-expected expression built from result positions (match/try arms,
+    // let/sequence tails): the oracle's type_expect pushes the format type into
+    // those positions, so their string literals type as formats and desugar in
+    // the typed tree (`pr "%(%d%)" (match p with A -> "x%d" | ...)`).  Dump-only
+    // (record_fmt_lits_): recording retypes nothing, so inference, the strict
+    // pass, and the back end are untouched.
+    if (record_fmt_lits_ && is_format_constr(expected))
+      record_result_fmt_lits(e);
     TypePtr t = infer_expr(e);
     // Type-directed bare-constructor resolution: an unqualified constructor we
     // couldn't resolve (typed Any) whose EXPECTED type is a module-qualified

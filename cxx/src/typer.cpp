@@ -120,13 +120,105 @@ inline tt::ExprBox precision_node(bool has_p, bool arg_p, long p,
   return gctor("Lit_precision", std::move(a), g);
 }
 
-// Parse a full `%`-spec at s[i] (s[i]=='%'): %[flags][width][.prec][length]conv.
+inline tt::ExprBox parse(const std::string& s, size_t i, const Location& g);
+
+// A plain (unqualified) constructor node -- `None` / `Some` for the pad_opt of
+// a sub-format spec (the oracle's mk_int_opt uses Lident, not the
+// CamlinternalFormatBasics path).
+inline tt::ExprBox pctor(const std::string& n, std::vector<tt::ExprBox> args,
+                         const Location& g) {
+  auto e = std::make_unique<tt::Expression>();
+  e->loc = g;
+  e->desc = tt::Texp_construct{n, std::move(args)};
+  return e;
+}
+
+// fmtty_of_fmt over an already-built fmt tree: the `fmtty` of a `%(...%)`
+// sub-format (Int_ty/String_ty/... chain ending in End_of_fmtty).  Conservative
+// subset -- pad/prec must be absent (Padding_ty/Precision_ty wrappers and
+// Formatting_gen concat are not modelled); null = unsupported (caller bails).
+inline tt::ExprBox fmtty_from_tree(const tt::Expression* e, const Location& g) {
+  auto wrap1 = [&](const char* ty, const tt::Expression* rest) -> tt::ExprBox {
+    auto r = fmtty_from_tree(rest, g);
+    if (!r) return nullptr;
+    std::vector<tt::ExprBox> a;
+    a.push_back(std::move(r));
+    return gctor(ty, std::move(a), g);
+  };
+  auto is0 = [&](const tt::Expression* n, const char* want) {
+    auto* c = std::get_if<tt::Texp_construct>(&n->desc);
+    return c && c->name == ns(want);
+  };
+  while (e) {
+    auto* c = std::get_if<tt::Texp_construct>(&e->desc);
+    if (!c || c->name.rfind("CamlinternalFormatBasics.", 0) != 0) return nullptr;
+    std::string n = c->name.substr(25);
+    if (n == "End_of_format") return gctor("End_of_fmtty", {}, g);
+    // transparent nodes: type flows through to the tail (last arg)
+    if (n == "Flush" || n == "String_literal" || n == "Char_literal" ||
+        n == "Formatting_lit") { e = c->args.back().get(); continue; }
+    if (n == "Char" || n == "Caml_char") return wrap1("Char_ty", c->args[0].get());
+    if (n == "String" || n == "Caml_string") {
+      if (!is0(c->args[0].get(), "No_padding")) return nullptr;
+      return wrap1("String_ty", c->args[1].get());
+    }
+    if (n == "Int" || n == "Int32" || n == "Nativeint" || n == "Int64" ||
+        n == "Float") {
+      if (!is0(c->args[1].get(), "No_padding") ||
+          !is0(c->args[2].get(), "No_precision")) return nullptr;
+      const char* ty = n == "Int" ? "Int_ty" : n == "Int32" ? "Int32_ty"
+                     : n == "Nativeint" ? "Nativeint_ty"
+                     : n == "Int64" ? "Int64_ty" : "Float_ty";
+      return wrap1(ty, c->args[3].get());
+    }
+    if (n == "Bool") {
+      if (!is0(c->args[0].get(), "No_padding")) return nullptr;
+      return wrap1("Bool_ty", c->args[1].get());
+    }
+    if (n == "Alpha") return wrap1("Alpha_ty", c->args[0].get());
+    if (n == "Theta") return wrap1("Theta_ty", c->args[0].get());
+    if (n == "Reader") return wrap1("Reader_ty", c->args[0].get());
+    if (n == "Scan_get_counter") return wrap1("Int_ty", c->args[1].get());
+    if (n == "Scan_next_char") return wrap1("Char_ty", c->args[0].get());
+    if (n == "Scan_char_set") return wrap1("String_ty", c->args[2].get());
+    return nullptr;  // Formatting_gen (needs concat), Format_arg/subst, Ignored_*
+  }
+  return nullptr;
+}
+
+// Find the index of the '%' of the "%<c>" closing a sub-format opened by
+// "%(" / "%{" (npos on failure).  Mirrors search_subformat_end, including
+// nested sub-formats.
+inline size_t subformat_end(const std::string& s, size_t i, char close) {
+  while (i < s.size()) {
+    if (s[i] != '%') { ++i; continue; }
+    if (i + 1 >= s.size()) return std::string::npos;
+    char c = s[i + 1];
+    if (c == close) return i;
+    size_t k = i + 2;                 // index after "%<c>"
+    if (c == '_' && k < s.size()) { c = s[k]; ++k; }  // "%_(" / "%_{"
+    if (c == '{' || c == '(') {
+      size_t sub = subformat_end(s, k, c == '{' ? '}' : ')');
+      if (sub == std::string::npos) return std::string::npos;
+      i = sub + 2;
+    } else if (c == '}' || c == ')') {
+      return std::string::npos;       // mismatched closer
+    } else {
+      i = k;
+    }
+  }
+  return std::string::npos;
+}
+
+// Parse a full `%`-spec at s[i] (s[i]=='%'): %[_][flags][width][.prec][length]conv.
 // On success returns the fmt node (tail = rest) and sets consumed = #chars used;
 // ok=false for any spec we don't desugar (caller bails, leaving a plain string).
 inline tt::ExprBox pct_directive(const std::string& s, size_t i, tt::ExprBox rest,
                                  const Location& g, bool& ok, size_t& consumed) {
   ok = false;
   size_t j = i + 1;
+  bool ign = false;
+  if (j < s.size() && s[j] == '_') { ign = true; ++j; }
   bool f_minus = false, f_zero = false, f_plus = false, f_space = false,
        f_hash = false;
   for (; j < s.size(); ++j) {
@@ -151,13 +243,41 @@ inline tt::ExprBox pct_directive(const std::string& s, size_t i, tt::ExprBox res
       while (j < s.size() && std::isdigit((unsigned char)s[j])) ++j;
       p_val = (j > st) ? std::stol(s.substr(st, j - st)) : 0; }
   }
+  // l/L/n are length modifiers only when an int-base conversion follows;
+  // otherwise they ARE the conversion (a scan counter, like %N).
+  auto int_base = [](char c) {
+    return c == 'd' || c == 'i' || c == 'x' || c == 'X' || c == 'o' || c == 'u';
+  };
   char len = 0;
-  if (j < s.size() && (s[j] == 'l' || s[j] == 'L' || s[j] == 'n')) {
+  if (j < s.size() && (s[j] == 'l' || s[j] == 'L' || s[j] == 'n') &&
+      j + 1 < s.size() && int_base(s[j + 1])) {
     len = s[j]; ++j;
   }
   if (j >= s.size()) return rest;
   char d = s[j];
   consumed = (j - i) + 1;
+  // Scan counters (%n %l %N %L, and their %_ ignored forms).
+  if (d == 'n' || d == 'l' || d == 'L' || d == 'N') {
+    if (len || w_has || w_arg || p_has || f_minus || f_zero || f_plus ||
+        f_space || f_hash) return rest;
+    const char* cnt = d == 'l' ? "Line_counter"
+                    : d == 'n' ? "Char_counter" : "Token_counter";
+    std::vector<tt::ExprBox> a;
+    if (ign) {
+      std::vector<tt::ExprBox> ia;
+      ia.push_back(gctor(cnt, {}, g));
+      a.push_back(gctor("Ignored_scan_get_counter", std::move(ia), g));
+      a.push_back(std::move(rest));
+      ok = true;
+      return gctor("Ignored_param", std::move(a), g);
+    }
+    a.push_back(gctor(cnt, {}, g));
+    a.push_back(std::move(rest));
+    ok = true;
+    return gctor("Scan_get_counter", std::move(a), g);
+  }
+  // Ignored (%_) forms other than counters are not desugared yet.
+  if (ign) return rest;
   // Zeros padding needs a width; bail on a bare `0` flag.
   if (f_zero && !w_has && !w_arg) return rest;
   int padty = f_minus ? 1 : f_zero ? 2 : 0;
@@ -229,6 +349,50 @@ inline tt::ExprBox pct_directive(const std::string& s, size_t i, tt::ExprBox res
       ok = true;
       return gctor("Bool", std::move(a), g);
     }
+    case 'a': case 't': {  // %a printer / %t thunk
+      if (len || p_has || w_has || w_arg || f_minus || f_zero || f_plus ||
+          f_space || f_hash) return rest;
+      std::vector<tt::ExprBox> a;
+      a.push_back(std::move(rest));
+      ok = true;
+      return gctor(d == 'a' ? "Alpha" : "Theta", std::move(a), g);
+    }
+    case '@': {  // "%@" -- a literal at sign
+      if (len || p_has || w_has || w_arg || f_minus || f_zero || f_plus ||
+          f_space || f_hash) return rest;
+      std::vector<tt::ExprBox> a;
+      a.push_back(gchar('@', g));
+      a.push_back(std::move(rest));
+      ok = true;
+      return gctor("Char_literal", std::move(a), g);
+    }
+    case '(': {  // "%(...%)" -- format substitution
+      // Only a literal right-padding width maps to a pad_opt; anything else
+      // (flags, precision, '*') is out of scope.
+      if (len || p_has || w_arg || f_minus || f_zero || f_plus || f_space ||
+          f_hash) return rest;
+      size_t sub_end = subformat_end(s, j + 1, ')');
+      if (sub_end == std::string::npos) return rest;
+      auto sub = parse(s.substr(j + 1, sub_end - (j + 1)), 0, g);
+      if (!sub) return rest;
+      auto fmtty = fmtty_from_tree(sub.get(), g);
+      if (!fmtty) return rest;
+      tt::ExprBox pad_opt;
+      if (w_has) {
+        std::vector<tt::ExprBox> sa;
+        sa.push_back(gint(w_val, g));
+        pad_opt = pctor("Some", std::move(sa), g);
+      } else {
+        pad_opt = pctor("None", {}, g);
+      }
+      consumed = (sub_end + 2) - i;  // through the closing "%)"
+      std::vector<tt::ExprBox> a;
+      a.push_back(std::move(pad_opt));
+      a.push_back(std::move(fmtty));
+      a.push_back(std::move(rest));
+      ok = true;
+      return gctor("Format_subst", std::move(a), g);
+    }
     default: return rest;
   }
 }
@@ -267,32 +431,129 @@ inline tt::ExprBox parse(const std::string& s, size_t i, const Location& g) {
     return ok ? std::move(e) : nullptr;
   }
   if (s[i] == '@') {
-    // A Format formatting directive (@., @], @?, @ , @,, @;, @\n).  Box opens
-    // (@[ @{) and parametrised breaks (@;<>) desugar to Formatting_gen / Break
-    // with sub-formats -- not handled yet, so bail (plain-string fallback).
-    if (i + 1 >= s.size()) return nullptr;
-    char c = s[i + 1];
-    size_t consumed = 2;
-    tt::ExprBox lit;
-    if (c == '.') lit = gctor("Flush_newline", {}, g);
-    else if (c == ']') lit = gctor("Close_box", {}, g);
-    else if (c == '?') lit = gctor("FFlush", {}, g);
-    else if (c == '\n') lit = gctor("Force_newline", {}, g);
-    else if (c == ' ' || c == ',' || (c == ';' && !(i + 2 < s.size() && s[i + 2] == '<'))) {
+    // A Format formatting directive; mirrors camlinternalFormat's
+    // parse_after_at / parse_tag / parse_good_break / parse_magic_size.
+    auto lit_then = [&](tt::ExprBox lit, size_t next) -> tt::ExprBox {
+      auto r = parse(s, next, g);
+      if (!r) return nullptr;
+      std::vector<tt::ExprBox> args;
+      args.push_back(std::move(lit));
+      args.push_back(std::move(r));
+      return gctor("Formatting_lit", std::move(args), g);
+    };
+    auto break_node = [&](const std::string& org, long ns_, long ni) {
       std::vector<tt::ExprBox> b;
-      b.push_back(gstr(s.substr(i, 2), g));
-      b.push_back(gint(c == ',' ? 0 : 1, g));
-      b.push_back(gint(0, g));
-      lit = gctor("Break", std::move(b), g);
-    } else {
-      return nullptr;  // @@, @%, @[, @{, @}, @;<>, ... not handled
+      b.push_back(gstr(org, g));
+      b.push_back(gint(ns_, g));
+      b.push_back(gint(ni, g));
+      return gctor("Break", std::move(b), g);
+    };
+    // "<w [o]>" scanner shared by @; and @< (spaces allowed, ints may be
+    // negative).  On success sets the out-params and returns true.
+    auto angle_ints = [&](size_t j, long& v1, bool& has2, long& v2,
+                          size_t& after) -> bool {
+      auto spaces = [&](size_t k) { while (k < s.size() && s[k] == ' ') ++k; return k; };
+      auto integer = [&](size_t k, long& out) -> size_t {  // 0 = fail
+        size_t st = k;
+        if (k < s.size() && s[k] == '-') ++k;
+        size_t d0 = k;
+        while (k < s.size() && std::isdigit((unsigned char)s[k])) ++k;
+        if (k == d0) return 0;
+        out = std::stol(s.substr(st, k - st));
+        return k;
+      };
+      j = spaces(j);
+      j = integer(j, v1);
+      if (!j) return false;
+      j = spaces(j);
+      if (j < s.size() && s[j] == '>') { has2 = false; after = j + 1; return true; }
+      j = integer(j, v2);
+      if (!j) return false;
+      j = spaces(j);
+      if (j >= s.size() || s[j] != '>') return false;
+      has2 = true; after = j + 1;
+      return true;
+    };
+    if (i + 1 >= s.size()) {  // lone trailing '@' is a literal
+      std::vector<tt::ExprBox> a;
+      a.push_back(gchar('@', g));
+      a.push_back(gctor("End_of_format", {}, g));
+      return gctor("Char_literal", std::move(a), g);
     }
-    auto r = parse(s, i + consumed, g);
-    if (!r) return nullptr;
-    std::vector<tt::ExprBox> args;
-    args.push_back(std::move(lit));
-    args.push_back(std::move(r));
-    return gctor("Formatting_lit", std::move(args), g);
+    char c = s[i + 1];
+    switch (c) {
+      case '[': case '{': {  // open box / open tag, optional <name> sub-format
+        std::string sub_str;
+        tt::ExprBox sub_fmt;
+        size_t next = i + 2;
+        if (next < s.size() && s[next] == '<') {
+          size_t gt = s.find('>', next + 1);
+          if (gt != std::string::npos) {
+            sub_str = s.substr(next, gt - next + 1);
+            sub_fmt = parse(sub_str, 0, g);
+            if (!sub_fmt) return nullptr;
+            next = gt + 1;
+          }
+        }
+        if (!sub_fmt) sub_fmt = gctor("End_of_format", {}, g);
+        std::vector<tt::ExprBox> fa;
+        fa.push_back(std::move(sub_fmt));
+        fa.push_back(gstr(sub_str, g));
+        std::vector<tt::ExprBox> ga;
+        ga.push_back(gctor("Format", std::move(fa), g));
+        auto gen = gctor(c == '{' ? "Open_tag" : "Open_box", std::move(ga), g);
+        auto r = parse(s, next, g);
+        if (!r) return nullptr;
+        std::vector<tt::ExprBox> args;
+        args.push_back(std::move(gen));
+        args.push_back(std::move(r));
+        return gctor("Formatting_gen", std::move(args), g);
+      }
+      case ']': return lit_then(gctor("Close_box", {}, g), i + 2);
+      case '}': return lit_then(gctor("Close_tag", {}, g), i + 2);
+      case ',': return lit_then(break_node("@,", 0, 0), i + 2);
+      case ' ': return lit_then(break_node("@ ", 1, 0), i + 2);
+      case ';': {  // "@;" or "@;<width [offset]>"
+        long w = 0, off = 0; bool has2 = false; size_t after = 0;
+        if (i + 2 < s.size() && s[i + 2] == '<' &&
+            angle_ints(i + 3, w, has2, off, after))
+          return lit_then(
+              break_node(s.substr(i, after - i), w, has2 ? off : 0), after);
+        return lit_then(break_node("@;", 1, 0), i + 2);
+      }
+      case '?': return lit_then(gctor("FFlush", {}, g), i + 2);
+      case '\n': return lit_then(gctor("Force_newline", {}, g), i + 2);
+      case '.': return lit_then(gctor("Flush_newline", {}, g), i + 2);
+      case '<': {  // "@<size>" magic size, else a '<' scan indication
+        long sz = 0, dummy = 0; bool has2 = false; size_t after = 0;
+        if (angle_ints(i + 2, sz, has2, dummy, after) && !has2) {
+          std::vector<tt::ExprBox> ma;
+          ma.push_back(gstr(s.substr(i, after - i), g));
+          ma.push_back(gint(sz, g));
+          return lit_then(gctor("Magic_size", std::move(ma), g), after);
+        }
+        std::vector<tt::ExprBox> sa;
+        sa.push_back(gchar('<', g));
+        return lit_then(gctor("Scan_indic", std::move(sa), g), i + 2);
+      }
+      case '@': return lit_then(gctor("Escaped_at", {}, g), i + 2);
+      case '%':
+        if (i + 2 < s.size() && s[i + 2] == '%')
+          return lit_then(gctor("Escaped_percent", {}, g), i + 3);
+        else {  // "@%<conv>": the '@' is a plain char; reparse from the '%'
+          auto r = parse(s, i + 1, g);
+          if (!r) return nullptr;
+          std::vector<tt::ExprBox> a;
+          a.push_back(gchar('@', g));
+          a.push_back(std::move(r));
+          return gctor("Char_literal", std::move(a), g);
+        }
+      default: {  // any other char is a scan indication
+        std::vector<tt::ExprBox> sa;
+        sa.push_back(gchar(c, g));
+        return lit_then(gctor("Scan_indic", std::move(sa), g), i + 2);
+      }
+    }
   }
   size_t k = i;
   while (k < s.size() && s[k] != '%' && s[k] != '@') ++k;
