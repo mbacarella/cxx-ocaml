@@ -21,6 +21,7 @@
 #include "cppcaml/apply_match.hpp"
 #include "cppcaml/cmi.hpp"
 #include "cppcaml/infer_check.hpp"
+#include "cppcaml/modsig.hpp"
 
 namespace cppcaml::lambda {
 namespace {
@@ -595,6 +596,29 @@ struct Translator {
   int open_gen_count_ = 0;
   // A named module type's value layout, so `module F (X : S)` knows X's fields.
   std::unordered_map<std::string, std::vector<std::string>> modtype_layout_;
+  // --- modsig P1 substrate (JOURNAL "PLAN: REAL MODULE SYSTEM") ------------
+  // The ordered, NAMESPACED signatures that will replace the flat name-list
+  // layouts above: derived alongside them and asserted equal under
+  // CPPCAML_MODSIG_CHECK=1; P2 routes coercions through them.
+  modsig::Env menv_;  // scoped module/modtype -> Sig bindings
+  // A named module type's Sig, keyed like modtype_layout_ (bare + dotted).
+  std::unordered_map<std::string, modsig::SigPtr> modtype_msig_;
+  bool msig_checking_ = false;  // re-entrancy guard for the parity asserts
+  static bool msig_check_enabled() {
+    static bool on = std::getenv("CPPCAML_MODSIG_CHECK") != nullptr;
+    return on;
+  }
+  static void msig_report(const char* where, const std::string& what,
+                          const std::vector<std::string>& got,
+                          const std::vector<std::string>& want) {
+    auto join = [](const std::vector<std::string>& v) {
+      std::string s;
+      for (auto& n : v) { if (!s.empty()) s += ' '; s += n; }
+      return s;
+    };
+    std::fprintf(stderr, "MODSIG-MISMATCH %s %s: msig=[%s] layout=[%s]\n",
+                 where, what.c_str(), join(got).c_str(), join(want).c_str());
+  }
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
   // unqualified name resolves as `M.x` (a stdlib field or an external prim).
   std::vector<std::string> opened_;
@@ -2139,6 +2163,16 @@ struct Translator {
     }
     names = dedup_keep_last(std::move(names));
     for (int i = 0; i < (int)names.size(); ++i) ml[names[i]] = i;
+    // modsig P1 parity: the namespaced derivation of the ORIGINAL module type
+    // (its own ident resolution mirrors the loop above) must reproduce this
+    // runtime layout.
+    if (msig_check_enabled() && !msig_checking_) {
+      msig_checking_ = true;
+      auto ms = msig_of_modtype(mt);
+      if (ms->runtime_names() != names)
+        msig_report("register_sig_layouts", prefix, ms->runtime_names(), names);
+      msig_checking_ = false;
+    }
   }
   // Register the field layouts of a decoded cmi signature under dotted keys,
   // recursing into structural submodules: module_layout_[prefix.Sub] etc.  Used
@@ -12354,7 +12388,22 @@ struct Translator {
       if (std::holds_alternative<Pwith_modsubst>(c)) return false;
     return true;
   }
+  // P1 parity shim: sig_layout computes the flat layout as always; under
+  // CPPCAML_MODSIG_CHECK=1 the namespaced derivation (msig_of_modtype) is
+  // computed alongside and any runtime-order divergence is reported.  The
+  // guard keeps the check at the outermost call only (both functions recurse
+  // through sig_layout internally).
   std::vector<std::string> sig_layout(const ModuleType& mt0) {
+    if (!msig_check_enabled() || msig_checking_) return sig_layout_impl(mt0);
+    msig_checking_ = true;
+    auto flat = sig_layout_impl(mt0);
+    auto ms = msig_of_modtype(mt0);
+    if (ms->runtime_names() != flat)
+      msig_report("sig_layout", "", ms->runtime_names(), flat);
+    msig_checking_ = false;
+    return flat;
+  }
+  std::vector<std::string> sig_layout_impl(const ModuleType& mt0) {
     std::vector<std::string> out;
     const ModuleType* mtp = &mt0;
     while (auto* pw = std::get_if<Pmty_with>(&mtp->desc)) {
@@ -12431,6 +12480,172 @@ struct Translator {
     if (!dup) return in;
     std::vector<std::string> out; out.reserve(in.size());
     for (int i = 0; i < (int)in.size(); ++i) if (last[in[i]] == i) out.push_back(in[i]);
+    return out;
+  }
+
+  // --- modsig P1 derivations ------------------------------------------------
+  // The namespaced ordered signature of a decoded .cmi signature.  Uses the
+  // decode-time interleaved `order` (which knows each item's namespace and
+  // whether it takes a runtime field), so nothing is guessed from the bare
+  // name-list; nested module signatures resolve through the same cmi's
+  // modtypes (mt_sig).
+  modsig::SigPtr msig_of_cmi_sig(const cmi::CmiFile& cmi, const cmi::Signature& sig,
+                                 int depth = 0) {
+    auto out = std::make_shared<modsig::Sig>();
+    if (depth > 24) return out;
+    using OE = cmi::Signature::OrderEnt;
+    for (auto& oe : sig.order) {
+      modsig::Item item;
+      item.runtime = oe.runtime;
+      switch (oe.kind) {
+        case OE::Value:
+          item.ns = modsig::NS::Value;
+          item.name = sig.values[oe.idx].name;
+          item.is_prim = !oe.runtime;
+          break;
+        case OE::Type:
+          item.ns = modsig::NS::Type;
+          item.name = sig.types[oe.idx].name;
+          break;
+        case OE::Typext:
+          item.ns = modsig::NS::Typext;
+          item.name = sig.typexts[oe.idx].name;
+          break;
+        case OE::Module: {
+          auto& md = sig.modules[oe.idx];
+          item.ns = modsig::NS::Module;
+          item.name = md.name;
+          if (md.type) {
+            if (md.type->kind == cmi::ModuleType::Functor) {
+              if (md.type->functor_param_type)
+                if (const cmi::Signature* ps = mt_sig(cmi, md.type->functor_param_type))
+                  item.functor_param = msig_of_cmi_sig(cmi, *ps, depth + 1);
+              if (const cmi::Signature* rs = mt_sig(cmi, md.type->functor_body))
+                item.functor_result = msig_of_cmi_sig(cmi, *rs, depth + 1);
+            } else if (const cmi::Signature* ss = mt_sig(cmi, md.type)) {
+              item.sub = msig_of_cmi_sig(cmi, *ss, depth + 1);
+            }
+          }
+          break;
+        }
+        case OE::Modtype: {
+          auto& mtd = sig.modtypes[oe.idx];
+          item.ns = modsig::NS::Modtype;
+          item.name = mtd.name;
+          if (mtd.type)
+            if (const cmi::Signature* ss = mt_sig(cmi, mtd.type))
+              item.sub = msig_of_cmi_sig(cmi, *ss, depth + 1);
+          break;
+        }
+      }
+      out->push(std::move(item));
+    }
+    out->number();
+    if (msig_check_enabled() && out->runtime_names() != sig.fields)
+      msig_report("cmi", cmi.module_name(), out->runtime_names(), sig.fields);
+    return out;
+  }
+  // The namespaced ordered signature of a module-type AST.  Mirrors
+  // sig_layout/register_sig_layouts resolution exactly (Pmty_with peeling,
+  // named-modtype indirection dotted-path-first, `module type of`, include
+  // splicing, dedup-keep-last shadowing) -- asserted equal to sig_layout on
+  // the green corpus under CPPCAML_MODSIG_CHECK=1.  Known mirrored gaps, to
+  // fix deliberately in P2: Psig_recmodule contributes no items (as today),
+  // and unresolved paths degrade to flat Unknown-namespace layouts.
+  modsig::SigPtr msig_of_modtype(const ModuleType& mt0, int depth = 0) {
+    if (depth > 24) return std::make_shared<modsig::Sig>();
+    const ModuleType* mtp = &mt0;
+    while (auto* pw = std::get_if<Pmty_with>(&mtp->desc)) {
+      if (!with_keeps_layout(*pw)) break;  // a modsubst removes a field
+      mtp = pw->mt.get();
+    }
+    const ModuleType& mt = *mtp;
+    if (auto* pi = std::get_if<Pmty_ident>(&mt.desc)) {  // a named module type S
+      std::string dotted;
+      bool has_dot = lid_to_dotted(pi->id.txt, dotted) &&
+                     dotted.find('.') != std::string::npos;
+      if (has_dot)
+        if (auto it = modtype_msig_.find(dotted); it != modtype_msig_.end())
+          return it->second;
+      if (auto it = modtype_msig_.find(lid_last(pi->id.txt)); it != modtype_msig_.end())
+        return it->second;
+      // not registered as a Sig yet: resolve the declaration AST directly
+      if (has_dot)
+        if (auto a = modtype_ast_.find(dotted); a != modtype_ast_.end())
+          return msig_of_modtype(*a->second, depth + 1);
+      if (auto a = modtype_ast_.find(lid_last(pi->id.txt)); a != modtype_ast_.end())
+        return msig_of_modtype(*a->second, depth + 1);
+      // a stdlib module's named module type (`Digest.S`): its cmi modtype decl
+      if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+          if (!module_base(pl->name)) try {
+            auto cmi = cmi::CmiFile::load(resolve_cmi(pl->name));
+            for (auto& md : cmi.sig().modtypes)
+              if (md.name == d->name) {
+                if (const cmi::Signature* s = mt_sig(cmi, md.type))
+                  return msig_of_cmi_sig(cmi, *s);
+                return modsig::flat(mt_fields(cmi, md.type));
+              }
+          } catch (...) {}
+      return modsig::flat(sig_layout(mt0));  // unresolved: today's flat layout
+    }
+    // `module type of M`: M's own runtime layout (flat; namespaces unknown here)
+    if (auto* pto = std::get_if<Pmty_typeof>(&mt.desc))
+      return modsig::flat(arg_layout(*pto->me));
+    auto out = std::make_shared<modsig::Sig>();
+    if (auto* ps = std::get_if<Pmty_signature>(&mt.desc)) {
+      std::unordered_map<std::string, const ModuleType*> local_mts;
+      std::function<void(const Pmty_signature&)> walk = [&](const Pmty_signature& sg) {
+        for (auto& it : sg.items) {
+          if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+            out->push({.ns = modsig::NS::Value, .name = v->vd.name.txt});
+          } else if (auto* pp = std::get_if<Psig_primitive>(&it.desc)) {
+            out->push({.ns = modsig::NS::Value, .name = pp->pd.name.txt,
+                       .runtime = false, .is_prim = true});
+          } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+            if (!m->md.name.txt) continue;
+            modsig::Item mi{.ns = modsig::NS::Module, .name = *m->md.name.txt};
+            const ModuleType& t = *m->md.type;
+            if (auto* pf = std::get_if<Pmty_functor>(&t.desc)) {
+              mi.functor_result = msig_of_modtype(*pf->body, depth + 1);
+              if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->type)
+                mi.functor_param = msig_of_modtype(*fp->type, depth + 1);
+            } else {
+              mi.sub = msig_of_modtype(t, depth + 1);
+            }
+            out->push(std::move(mi));
+          } else if (auto* ex = std::get_if<Psig_exception>(&it.desc)) {
+            out->push({.ns = modsig::NS::Typext, .name = ex->exn.ctor.name.txt});
+          } else if (auto* tx = std::get_if<Psig_typext>(&it.desc)) {
+            for (auto& c : tx->ext.ctors)
+              out->push({.ns = modsig::NS::Typext, .name = c.name.txt});
+          } else if (auto* cl = std::get_if<Psig_class>(&it.desc)) {
+            for (auto& d : cl->decls)
+              out->push({.ns = modsig::NS::Class, .name = d.name.txt});
+          } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
+            for (auto& d : pt->decls)
+              out->push({.ns = modsig::NS::Type, .name = d.name.txt, .runtime = false});
+          } else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
+            if (pmt->type) local_mts[pmt->name.txt] = &*pmt->type;
+            out->push({.ns = modsig::NS::Modtype, .name = pmt->name.txt,
+                       .runtime = false,
+                       .sub = pmt->type ? msig_of_modtype(*pmt->type, depth + 1)
+                                        : nullptr});
+          } else if (auto* pin = std::get_if<Psig_include>(&it.desc)) {
+            const ModuleType* im = &pin->mt;
+            if (auto* ii = std::get_if<Pmty_ident>(&im->desc))
+              if (auto lm = local_mts.find(lid_last(ii->id.txt)); lm != local_mts.end())
+                im = lm->second;
+            if (auto* isig = std::get_if<Pmty_signature>(&im->desc)) walk(*isig);
+            else
+              for (auto& inc : msig_of_modtype(*im, depth + 1)->items)
+                out->push(inc);
+          }
+        }
+      };
+      walk(*ps);
+    }
+    out->number();
     return out;
   }
 
@@ -13215,8 +13430,10 @@ struct Translator {
   LamPtr build_module(const Structure& s, std::vector<std::string>* names,
                       const std::vector<std::string>* coerce = nullptr,
                       const std::vector<std::string>* force_export = nullptr,
-                      const cmi::Signature* coerce_sig = nullptr) {
+                      const cmi::Signature* coerce_sig = nullptr,
+                      modsig::SigPtr* msig_out = nullptr) {
     scope.emplace_back();
+    menv_.push_frame();  // modsig P1: one Env frame per structure
     // Re-register ambiguous constructors in source order within this module:
     // save their current entries and restore on exit, so a submodule's in-order
     // re-registration does not leak to the enclosing structure.
@@ -13269,11 +13486,18 @@ struct Translator {
     std::vector<Lam::Binding> cur;
     std::vector<LamPtr> exports;
     std::vector<std::string> export_names;
+    // modsig P1: the in-construction namespaced signature, built next to
+    // export_names (same shadowing, but per-namespace) and asserted equal to
+    // it at the end.  Non-runtime items (types, modtypes, elided aliases)
+    // join here even though they have no export slot.
+    modsig::Sig cursig;
     // stdlib (sub)modules `include`d here (canonical dotted/bare names): a `: S`
     // coercion eta-stubs S members that are PRIMITIVES of these (no runtime field).
     std::vector<std::string> inc_stdlib_mods;
     auto flush = [&] { if (!cur.empty()) segs.push_back({false, false, std::move(cur), nullptr}), cur.clear(); };
-    auto add_export_val = [&](const std::string& nm, LamPtr v) {
+    auto add_export_val = [&](const std::string& nm, LamPtr v,
+                              modsig::NS ns = modsig::NS::Value,
+                              modsig::SigPtr sub = nullptr) {
       // a redefinition (shadow) moves the name to its last definition's position
       for (size_t i = 0; i < export_names.size(); ++i)
         if (export_names[i] == nm) {
@@ -13283,13 +13507,19 @@ struct Translator {
         }
       exports.push_back(std::move(v));
       export_names.push_back(nm);
+      cursig.push({.ns = ns, .name = nm, .sub = std::move(sub)});
     };
-    auto add_export = [&](const std::string& nm, const Ident& id) {
-      auto v = mk(Lam::K::Var); v->var = id; add_export_val(nm, v);
+    auto add_export = [&](const std::string& nm, const Ident& id,
+                          modsig::NS ns = modsig::NS::Value,
+                          modsig::SigPtr sub = nullptr) {
+      auto v = mk(Lam::K::Var); v->var = id;
+      add_export_val(nm, v, ns, std::move(sub));
     };
     int n_opens = 0;  // top-level `open M` opened for the rest of the structure
     for (auto& it : s) {
       if (auto* td = std::get_if<Pstr_type>(&it.desc)) {
+        for (auto& d : td->decls)  // modsig P1: types are no-slot items
+          cursig.push({.ns = modsig::NS::Type, .name = d.name.txt, .runtime = false});
         // bring this type's ambiguous constructors / record fields into scope
         // (overwriting an earlier same-named one), so subsequent code resolves
         // them to THIS type
@@ -13372,6 +13602,13 @@ struct Translator {
       if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {  // module type S = mty (no slot)
         if (pmt->type) {
           auto lay = sig_layout(*pmt->type);
+          // modsig P1: the namespaced Sig registered alongside the flat layout
+          // (same keys), and scoped in the Env.
+          auto msig = msig_of_modtype(*pmt->type);
+          modtype_msig_[pmt->name.txt] = msig;
+          menv_.bind_modtype(pmt->name.txt, msig);
+          cursig.push({.ns = modsig::NS::Modtype, .name = pmt->name.txt,
+                       .runtime = false, .sub = msig});
           modtype_layout_[pmt->name.txt] = lay;
           modtype_ast_[pmt->name.txt] = &*pmt->type;
           // Also register under the unit-relative dotted path so a cross-submodule
@@ -13384,6 +13621,7 @@ struct Translator {
           if (!rel.empty()) {
             modtype_ast_[rel + "." + pmt->name.txt] = &*pmt->type;
             modtype_layout_[rel + "." + pmt->name.txt] = std::move(lay);
+            modtype_msig_[rel + "." + pmt->name.txt] = msig;
           }
         }
         continue;
@@ -13409,7 +13647,7 @@ struct Translator {
           if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
             if (auto e2 = exn_ident_.find(l->name); e2 != exn_ident_.end()) {
               exn_ident_[nm] = e2->second;
-              add_export(nm, e2->second);
+              add_export(nm, e2->second, modsig::NS::Typext);
               if (auto a = exn_arity_.find(l->name); a != exn_arity_.end())
                 exn_arity_[nm] = a->second;
               continue;
@@ -13440,7 +13678,7 @@ struct Translator {
               if (v) {
                 Ident id = fresh(nm);
                 cur.push_back({id, ValueKind::Gen, v});
-                exn_ident_[nm] = id; add_export(nm, id);
+                exn_ident_[nm] = id; add_export(nm, id, modsig::NS::Typext);
                 continue;
               }
             }
@@ -13451,7 +13689,7 @@ struct Translator {
             Ident id = fresh(nm);
             cur.push_back({id, ValueKind::Gen, v});
             exn_ident_[nm] = id;
-            add_export(nm, id);
+            add_export(nm, id, modsig::NS::Typext);
           }
           continue;
         }
@@ -13473,7 +13711,7 @@ struct Translator {
             exn_rlabels_[nm] = std::move(ls);
           }
         }
-        add_export(nm, id);
+        add_export(nm, id, modsig::NS::Typext);
         continue;
       }
       if (auto* px = std::get_if<Pstr_typext>(&it.desc)) {  // type t += E ... (incl. effects)
@@ -13486,7 +13724,8 @@ struct Translator {
           if (auto* rb = std::get_if<Pext_rebind>(&c.kind)) {  // `E = D`: alias to D
             if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
               if (auto e = exn_ident_.find(l->name); e != exn_ident_.end()) {
-                exn_ident_[nm] = e->second; add_export(nm, e->second);
+                exn_ident_[nm] = e->second;
+                add_export(nm, e->second, modsig::NS::Typext);
                 if (auto a = exn_arity_.find(l->name); a != exn_arity_.end())
                   exn_arity_[nm] = a->second;
               }
@@ -13510,7 +13749,7 @@ struct Translator {
               exn_rlabels_[nm] = std::move(ls);
             }
           }
-          add_export(nm, id);
+          add_export(nm, id, modsig::NS::Typext);
         }
         continue;
       }
@@ -13608,7 +13847,7 @@ struct Translator {
                     class_meta_[d.name.txt] = mit->second;
                   if (auto sit = fn_sig_.find(pid->stamp); sit != fn_sig_.end())
                     fn_sig_[id.stamp] = sit->second;
-                  add_export(d.name.txt, *pid);
+                  add_export(d.name.txt, *pid, modsig::NS::Class);
                   continue;
                 }
             }
@@ -13706,7 +13945,7 @@ struct Translator {
             register_class_meta(d.name.txt, ps->cs);
           }
           for (; opens_pushed > 0; --opens_pushed) opened_.pop_back();
-          add_export(d.name.txt, id);
+          add_export(d.name.txt, id, modsig::NS::Class);
           if (!v) v = mk(Lam::K::ConstInt);  // unsupported class shape: placeholder
           outs.push_back({id, v, is_virt});  // virtual classes are always dummies
         }
@@ -13794,7 +14033,9 @@ struct Translator {
             // name (domain.ml's `Raw.get_domain_count`).
             auto lprims_before = local_prims_;
             auto exts_before = externals_;
-            LamPtr body = build_module(ps->items, &sub, coerce);
+            modsig::SigPtr submsig;
+            LamPtr body = build_module(ps->items, &sub, coerce, nullptr, nullptr,
+                                       &submsig);
             for (auto& [k, v] : lprims_before) local_prims_[k] = v;
             for (auto& [k, v] : exts_before) externals_[k] = v;
             mod_path_ = saved;
@@ -13851,7 +14092,23 @@ struct Translator {
             for (auto& nm : inner_mods)
               copy_layout_subtree(nm, *mb.name.txt + "." + nm);
             module_ident_[*mb.name.txt] = mid;
-            add_export(*mb.name.txt, mid);
+            // modsig P1: the submodule's Sig enters the Env and nests in the
+            // enclosing signature.  Check that navigating it reproduces the
+            // dotted-key layouts registered above.
+            menv_.bind_module(*mb.name.txt, submsig);
+            if (msig_check_enabled() && submsig)
+              for (auto& nm : inner_mods) {
+                std::string dk = *mb.name.txt + "." + nm;
+                auto dv = layout_vec(dk);
+                modsig::SigPtr nested = menv_.lookup_module_path(dk);
+                if (!dv.empty() &&
+                    (!nested || nested->runtime_names() != dv))
+                  msig_report("env-nested", dk,
+                              nested ? nested->runtime_names()
+                                     : std::vector<std::string>{},
+                              dv);
+              }
+            add_export(*mb.name.txt, mid, modsig::NS::Module, submsig);
           } else if (std::holds_alternative<Pmod_functor>(mb.expr.desc)) {
             Ident mid = fresh(*mb.name.txt);            // a functor binds as a function
             std::string saved_mp = mod_path_;  // __FUNCTION__ inside is `..Functor.fn`
@@ -13893,19 +14150,27 @@ struct Translator {
             if (auto* pt = functor_param_type(mb.expr)) functor_param_sig_[*mb.name.txt] = pt;
             functor_param_types_[*mb.name.txt] = functor_param_types(mb.expr);  // all params
             record_local_functor_result_sigs(*mb.name.txt, &mb.expr);  // result value optionals
-            add_export(*mb.name.txt, mid);
+            add_export(*mb.name.txt, mid, modsig::NS::Module);
           } else {  // module M = F(X) / M2 / (M : S) / (val x): bind + layout
             LamPtr mv = compile_module_expr(mb.expr);
             const std::string& nm = *mb.name.txt;
+            // modsig P1: this module's Sig -- namespaced when an ascription
+            // gives us a signature, else the flat result layout (P2 derives
+            // functor results / paths properly).
+            modsig::SigPtr msub;
             {
               // Compute the layout BEFORE clearing -- a self-alias `module T = T`
               // (Identifiable.Make rebinds its parameter) would otherwise wipe the
               // param's layout and re-read it empty, so a following `include T`
               // splices nothing and the functor result is short.
               auto rl = module_result_layout(mb.expr);
+              if (auto* pc3 = std::get_if<Pmod_constraint>(&mb.expr.desc))
+                msub = msig_of_modtype(*pc3->mt);
+              if (!msub || msub->items.empty()) msub = modsig::flat(rl);
               auto& lay = module_layout_[nm]; lay.clear();
               for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
             }
+            menv_.bind_module(nm, msub);
             // A cross-module functor result's NESTED submodule layouts (M.Set/
             // M.Map for `module M = Identifiable.Make(..)`), so `include M;
             // Set.empty` resolves Set as the functor-result submodule.
@@ -13984,12 +14249,17 @@ struct Translator {
               bool forced = force_export &&
                   std::find(force_export->begin(), force_export->end(), nm) != force_export->end();
               if (std::holds_alternative<Pmod_constraint>(mb.expr.desc) || unpack || forced)
-                add_export_val(nm, mv);
+                add_export_val(nm, mv, modsig::NS::Module, msub);
+              else
+                // the elided alias still exists in the signature -- as a
+                // no-slot module item (upstream's Mp_absent)
+                cursig.push({.ns = modsig::NS::Module, .name = nm,
+                             .runtime = false, .sub = msub});
             } else {
               Ident mid = fresh(nm);
               cur.push_back({mid, ValueKind::Gen, mv});
               module_ident_[nm] = mid;
-              add_export(nm, mid);
+              add_export(nm, mid, modsig::NS::Module, msub);
             }
           }
         continue;
@@ -14096,7 +14366,8 @@ struct Translator {
           for (RM* rm : unsafe) emit(rm);
           for (RM* rm : order) {
             cur.push_back({rm->id, ValueKind::Gen, uval[rm->id.stamp]});
-            add_export(*rm->mb->name.txt, rm->id);
+            add_export(*rm->mb->name.txt, rm->id, modsig::NS::Module,
+                       rm->sig ? msig_of_modtype(*rm->sig) : nullptr);
           }
           // (phase 3) update_mod each dummy with the real structure
           for (auto& rm : rms) {
@@ -14122,7 +14393,8 @@ struct Translator {
             up->fn = field_of("CamlinternalMod", updI->second);
             up->args = {rm.shape, varof(rm.id), body};
             cur.push_back({fresh("", true), ValueKind::Gen, up});
-            add_export(*rm.mb->name.txt, rm.id);
+            add_export(*rm.mb->name.txt, rm.id, modsig::NS::Module,
+                       rm.sig ? msig_of_modtype(*rm.sig) : nullptr);
           }
         }
         continue;
@@ -14176,7 +14448,7 @@ struct Translator {
             fr->prim_arg = i; fr->args = {base};
             cur.push_back({id, ValueKind::Gen, fr, true});
             scope.back()[rl[i]] = id;
-            add_export(rl[i], id);
+            add_export(rl[i], id, modsig::NS::Unknown);
             if (tsig) {  // module / exception members register as such
               if (const ModuleType* smt = sig_member_modtype(*tsig, rl[i])) {
                 module_ident_[rl[i]] = id;
@@ -14198,9 +14470,9 @@ struct Translator {
               Ident id = fresh(rl[i]);
               cur.push_back({id, ValueKind::Gen, fi, true});  // =a alias
               scope.back()[rl[i]] = id;
-              add_export(rl[i], id);
+              add_export(rl[i], id, modsig::NS::Unknown);
             } else {
-              add_export_val(rl[i], fi);
+              add_export_val(rl[i], fi, modsig::NS::Unknown);
             }
           }
         }
@@ -14368,6 +14640,12 @@ struct Translator {
       }
     }
     flush();
+    // modsig P1 parity: the namespaced in-construction signature must
+    // reproduce the natural (pre-ascription) export layout.
+    cursig.number();
+    if (msig_check_enabled() && cursig.runtime_names() != export_names)
+      msig_report("build_module", mod_path_, cursig.runtime_names(),
+                  export_names);
     // A signature ascription `(struct .. : S)` coerces the export block to S's
     // fields (selected and reordered by name); the structure's bindings stay.
     if (coerce) {
@@ -14434,6 +14712,32 @@ struct Translator {
       exports = std::move(ce); export_names = std::move(cn);
     }
     if (names) *names = export_names;  // the (deduplicated) export layout, in order
+    if (msig_out) {  // modsig P1: the structure's (possibly ascribed) Sig
+      auto out_sig = std::make_shared<modsig::Sig>();
+      if (coerce) {
+        // the ascription selected/reordered the exports: rebuild in the
+        // coerced order, keeping each item's namespace where known
+        for (auto& nm : export_names) {
+          const modsig::Item* found = nullptr;
+          for (auto it2 = cursig.items.rbegin(); it2 != cursig.items.rend(); ++it2)
+            if (it2->name == nm) { found = &*it2; break; }
+          if (found) {
+            modsig::Item c = *found;
+            c.runtime = true;  // a materialized alias/eta-stub takes a slot
+            out_sig->push(std::move(c));
+          } else {
+            out_sig->push({.ns = modsig::NS::Unknown, .name = nm});
+          }
+        }
+        for (auto& it2 : cursig.items)  // no-slot items survive for lookup
+          if (!it2.runtime && !out_sig->find(it2.ns, it2.name))
+            out_sig->push(it2);
+      } else {
+        *out_sig = cursig;
+      }
+      out_sig->number();
+      *msig_out = std::move(out_sig);
+    }
     auto block = mk(Lam::K::Prim);
     block->prim = Prim::Makeblock; block->prim_arg = 0; block->args = std::move(exports);
     LamPtr acc = block;
@@ -14449,6 +14753,7 @@ struct Translator {
       }
     }
     for (int i = 0; i < n_opens; ++i) opened_.pop_back();
+    menv_.pop_frame();
     scope.pop_back();
     return acc;
   }

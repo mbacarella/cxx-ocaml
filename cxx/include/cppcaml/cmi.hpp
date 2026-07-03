@@ -157,6 +157,18 @@ struct Signature {
   // regular value (Val_reg, not an inlined %/C primitive), an exception, or a
   // submodule takes a field; types/modtypes do not.
   std::vector<std::string> fields;
+  // The source-interleaved item order the grouped vectors above lose: one
+  // entry per signature item in declaration order, carrying its kind, its
+  // index into the per-kind vector, and whether it takes a runtime field
+  // (decided at decode time, where val_kind/Mp_absent are visible).  This is
+  // what lets a namespaced signature be rebuilt without guessing which
+  // namespace a bare `fields` name belongs to (see field_ns in cmi.cpp).
+  struct OrderEnt {
+    enum Kind : unsigned char { Value, Type, Typext, Module, Modtype } kind;
+    int idx;       // index into the corresponding vector
+    bool runtime;  // pushed onto `fields`
+  };
+  std::vector<OrderEnt> order;
 };
 
 // A computed module coercion, Includemod-style: how to build a value of the

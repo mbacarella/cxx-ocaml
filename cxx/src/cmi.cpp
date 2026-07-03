@@ -51,8 +51,11 @@ public:
               sv.type = type(vd.fields.at(0));
               // val_kind: Val_reg is the immediate constant 0; Val_prim (an
               // inlined %/C primitive) is a block and takes no runtime field.
-              if (vd.fields.size() > 1 &&
-                  arena_[vd.fields[1]].kind == m::Value::Kind::Int)
+              bool runtime = vd.fields.size() > 1 &&
+                             arena_[vd.fields[1]].kind == m::Value::Kind::Int;
+              out.order.push_back({Signature::OrderEnt::Value,
+                                   (int)out.values.size(), runtime});
+              if (runtime)
                 out.fields.push_back(sv.name);
               else if (vd.fields.size() > 1) {
                 // Val_prim of Primitive.description: tag-0 block whose field 0 is
@@ -74,6 +77,8 @@ public:
             if (item.fields.size() == 4) {
               TypeDecl td = type_declaration(item.fields[1]);
               td.name = ident(item.fields[0]).name;
+              out.order.push_back({Signature::OrderEnt::Type,
+                                   (int)out.types.size(), false});
               out.types.push_back(std::move(td));
             }
             break;
@@ -82,6 +87,8 @@ public:
               ExtConstructor ec = ext_constructor(item.fields[1]);
               ec.name = ident(item.fields[0]).name;
               out.fields.push_back(ec.name);  // an exception/extension takes a field
+              out.order.push_back({Signature::OrderEnt::Typext,
+                                   (int)out.typexts.size(), true});
               out.typexts.push_back(std::move(ec));
             }
             break;
@@ -96,6 +103,8 @@ public:
               const m::Value& pres = arena_[item.fields[1]];
               bool absent = (pres.kind == m::Value::Kind::Int && pres.i != 0);
               if (!absent) out.fields.push_back(md.name);
+              out.order.push_back({Signature::OrderEnt::Module,
+                                   (int)out.modules.size(), !absent});
               out.modules.push_back(std::move(md));
             }
             break;
@@ -107,6 +116,8 @@ public:
               const m::Value& opt = arena_[arena_[item.fields[1]].fields.at(0)];
               if (opt.kind == m::Value::Kind::Block && opt.tag == 0)
                 mtd.type = module_type(opt.fields.at(0));
+              out.order.push_back({Signature::OrderEnt::Modtype,
+                                   (int)out.modtypes.size(), false});
               out.modtypes.push_back(std::move(mtd));
             }
             break;

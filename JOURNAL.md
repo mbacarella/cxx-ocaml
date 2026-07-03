@@ -2851,3 +2851,66 @@ via dumpobj/-dlambda):
 VALIDATION ADDITIONS: a coercion unit test (c++ harness) checking compute_coercion
 against the oracle's Tcoerce on small hand-built cases; keep the differential
 dumpobj diff (our parser.cmo vs in-tree parsing/parser.cmo) as the menhir gate.
+
+================================================================================
+P1 DONE: modsig substrate (ordered namespaced Signature + scoped Env) — 2026-07-03
+================================================================================
+Landed the P1 substrate of the module-system plan above.  NO behavior change:
+all five gates re-baselined before and identical after (bootstrap ok=284 fail=0,
+lambda parity MATCH 411/741 55.5%, reject 1 known false-reject, stdlib_full_
+allours MATCH, ocamllex_selfhost byte-identical).
+
+WHAT EXISTS NOW
+- include/cppcaml/modsig.hpp: modsig::Sig = ordered items, each with a NAMESPACE
+  (Value/Type/Typext/Module/Modtype/Class/Unknown), runtime flag + field index
+  (number() assigns positions over runtime items only, exactly includemod's
+  is_runtime_component), nested Sig for submodules, functor param/result slots.
+  push() implements dedup-keep-last shadowing per (ns,name); Unknown (a flat
+  splice) shadows cross-ns among RUNTIME items only — today's flat semantics.
+  modsig::Env = scoped frames binding module/modtype name -> Sig, with
+  lookup_module_path() navigating nested Module items for dotted paths.
+- cmi::Signature grew `order`: the source-interleaved item order (kind + index +
+  runtime flag recorded AT DECODE TIME, where val_kind/Mp_absent are visible) —
+  so a namespaced Sig is rebuilt from a .cmi without the field_ns guessing hack.
+- lambda.cpp derivations: msig_of_cmi_sig (exact, from `order`), msig_of_modtype
+  (mirrors sig_layout/register_sig_layouts resolution: with-peel, named-modtype
+  dotted-first indirection, module type of, include splice), and an incremental
+  cursig built inside build_module next to add_export (each site annotated with
+  its namespace; submodule Sig threaded out via a new msig_out param and bound
+  in menv_; elided aliases become no-slot Module items like upstream Mp_absent).
+- CPPCAML_MODSIG_CHECK=1 asserts msig == flat layout at sig_layout,
+  register_sig_layouts, build_module exit, and Env dotted-path navigation
+  ("MODSIG-MISMATCH <where>" on stderr).  Flag off = zero checking cost.
+
+ASSERTION RESULTS (the P1 gate)
+- Self-host paths CLEAN with the check ON: full stdlib (stdlib_full_allours),
+  ocamllex_selfhost, and the 284-file compiler bootstrap — ZERO mismatches.
+- testsuite corpus (~1850 files): 45 mismatch lines in 15 files, every one
+  triaged; NONE is a wrong msig on a green compile path.  Categories:
+  1. CROSS-NAMESPACE NAME REUSE (10 build_module lines): `class c` + `let c`,
+     `module E` + `exception E`, `module F` + `type t += F` — the oracle gives
+     EACH its own runtime field; our flat name-list collapses them into one
+     (verified vs ocamlc -dlambda: we emit a SHORTER block and even wire uses
+     to the wrong slot).  These are pre-existing latent miscompiles that the
+     namespaced Sig detects — and P2 fixes for free when layouts come from it.
+     Files: poly/Exemples/Tests/records/virtual_class/exotic_unifications/
+     extensions/source/implicit_unpack.
+  2. UNSCOPED module_layout_ CLOBBERING (env-nested lines): patmatch MPR7761 —
+     an unrelated deeper `module A = Z(...)` overwrites the global bare "A" key
+     before the dotted copy, so layout_vec("MPR7761.A")=[f g] while the oracle
+     (and msig) says [A B f].  Compounded by module_result_layout's
+     empty-ascription fallback (`: sig end` falls back to the struct's fields).
+     The scoped Env kills this class in P3.  Also self-nesting M.M dotted keys
+     (pr6416/pr10693_bad/gpr1506 — type-error/expect corners) and PR_4261.U'.
+  3. ABSTRACT-MODTYPE BARE-NAME DIVERGENCE (24 lines, ONE construct):
+     source.ml's `module type S = sig module type T module X : T end` — both
+     heuristics resolve the global bare "T" differently and recurse to the
+     depth guard.  Heuristic-vs-heuristic; P3's Env scoping resolves it.
+  4. illegal_permutation.ml sig-side `val one/class two` permutation corner (1).
+
+NEXT (P2): compute_coercion(src Sig, tgt Sig) -> per-target-field src index +
+sub-Coercion (cmi.cpp's compute_coercion prototype already exists over
+cmi::Signature with the field_ns hack — port it onto modsig::Sig where the
+namespace is carried, not guessed), then route coerce_block/build_module
+ascription-include-functor layouts through it.  The cross-ns collapse bugs in
+(1) become the first oracle-diff wins.
