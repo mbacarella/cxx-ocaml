@@ -608,6 +608,24 @@ struct Translator {
     static bool on = std::getenv("CPPCAML_MODSIG_CHECK") != nullptr;
     return on;
   }
+  // P2 shadow mode: compute+replay the coercion and compare with the legacy
+  // path, reporting COERCE-DIVERGE without changing behaviour.
+  static bool coerce_check_enabled() {
+    static bool on = std::getenv("CPPCAML_COERCE_CHECK") != nullptr;
+    return on;
+  }
+  // COERCE-* diagnostics go to CPPCAML_COERCE_LOG (appended) if set, else stderr
+  // -- so a multi-file harness can collect them without per-file stderr capture.
+  static void coerce_report(const std::string& line) {
+    static const char* path = std::getenv("CPPCAML_COERCE_LOG");
+    if (path) {
+      if (std::FILE* f = std::fopen(path, "a")) {
+        std::fputs(line.c_str(), f); std::fputc('\n', f); std::fclose(f);
+      }
+    } else {
+      std::fprintf(stderr, "%s\n", line.c_str());
+    }
+  }
   static void msig_report(const char* where, const std::string& what,
                           const std::vector<std::string>& got,
                           const std::vector<std::string>& want) {
@@ -12659,6 +12677,134 @@ struct Translator {
     out->number();
     return out;
   }
+  // The namespaced Sig of a decoded .cmi signature WITHOUT a live CmiFile: uses
+  // the decode-time `order` (namespace + runtime flag) and recurses into inline
+  // submodule Sigs (a unit's own .cmi has these inline).  A submodule whose type
+  // is a named-modtype reference (no inline sig) degrades to a flat runtime list
+  // -- enough for a coercion, which only needs field structure.  This is the
+  // CmiFile-free sibling of msig_of_cmi_sig, for the ascription-tail shadow check
+  // where only a `cmi::Signature*` (coerce_sig) is in hand.
+  modsig::SigPtr msig_of_cmi_signature(const cmi::Signature& sig, int depth = 0) {
+    auto out = std::make_shared<modsig::Sig>();
+    if (depth > 24) return out;
+    using OE = cmi::Signature::OrderEnt;
+    for (auto& oe : sig.order) {
+      modsig::Item item;
+      item.runtime = oe.runtime;
+      switch (oe.kind) {
+        case OE::Value:
+          item.ns = modsig::NS::Value; item.name = sig.values[oe.idx].name;
+          item.is_prim = !oe.runtime;
+          if (item.is_prim) { item.prim = sig.values[oe.idx].prim;
+                              item.prim_arity = sig.values[oe.idx].prim_arity; }
+          break;
+        case OE::Type:
+          item.ns = modsig::NS::Type; item.name = sig.types[oe.idx].name; break;
+        case OE::Typext:
+          item.ns = modsig::NS::Typext; item.name = sig.typexts[oe.idx].name; break;
+        case OE::Module: {
+          auto& md = sig.modules[oe.idx];
+          item.ns = modsig::NS::Module; item.name = md.name;
+          if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+            item.sub = msig_of_cmi_signature(*md.type->sig, depth + 1);
+          break;
+        }
+        case OE::Modtype:
+          item.ns = modsig::NS::Modtype; item.name = sig.modtypes[oe.idx].name;
+          item.runtime = false;
+          break;
+      }
+      out->push(std::move(item));
+    }
+    out->number();
+    return out;
+  }
+  // Replay a computed structure coercion on a module value `mv` (mirrors
+  // lambda/translmod.ml apply_coercion for Tcoerce_structure): identity returns
+  // mv; otherwise build the target block from selected/reordered field reads,
+  // fusing into a freshly-built source makeblock when possible (same optimisation
+  // and the same Lambda shapes as coerce_block, so lambda-parity does not churn).
+  LamPtr apply_msig_coercion(const LamPtr& mv, const modsig::Coercion& c) {
+    if (c.identity || !c.ok) return mv;
+    // FUSION: mv is `(let <binds> (makeblock 0 v0 v1 ..))` with pure fields ->
+    // rebuild the block in target order instead of allocating a second block.
+    if (mv->k == Lam::K::Let && mv->body && mv->body->k == Lam::K::Prim &&
+        mv->body->prim == Prim::Makeblock && mv->body->prim_arg == 0) {
+      bool simple = true;
+      for (auto& a : mv->body->args)
+        if (!(a->k == Lam::K::Var || a->k == Lam::K::ConstInt ||
+              a->k == Lam::K::ConstChar || a->k == Lam::K::ConstString ||
+              a->k == Lam::K::ConstFloat)) { simple = false; break; }
+      int srclen = (int)mv->body->args.size();
+      if (simple) {
+        bool in_range = true;
+        for (auto& f : c.fields)
+          if (f.from == modsig::Coercion::Field::From::SrcField &&
+              (f.src_pos < 0 || f.src_pos >= srclen)) { in_range = false; break; }
+        if (in_range) {
+          std::vector<LamPtr> fs;
+          for (auto& f : c.fields) {
+            LamPtr fr = coerce_field_value(f, mv->body->args);
+            if (!fr) { fs.clear(); break; }
+            fs.push_back(fr);
+          }
+          if (!fs.empty() || c.fields.empty()) {
+            auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+            blk->args = std::move(fs);
+            auto lt = mk(Lam::K::Let); lt->bindings = mv->bindings; lt->body = blk;
+            return lt;
+          }
+        }
+      }
+    }
+    // General case: bind mv, project each target field by field_mut read.
+    Ident id = fresh("let");
+    auto v = mk(Lam::K::Var); v->var = id;
+    std::vector<LamPtr> fs;
+    for (auto& f : c.fields) {
+      LamPtr fr = coerce_field_value(f, v);
+      if (!fr) return mv;  // an unreplayable field: leave mv unchanged (shadow)
+      fs.push_back(fr);
+    }
+    auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+    blk->args = std::move(fs);
+    auto lt = mk(Lam::K::Let); lt->bindings = {{id, ValueKind::Gen, mv}};
+    lt->body = blk;
+    return lt;
+  }
+  // One coerced field value, reading the source block through `block_var` (a Var
+  // bound to the source module value): SrcField -> `field_mut pos block_var`
+  // (recursing for a submodule sub-coercion); PrimStub -> eta-stub; AliasValue ->
+  // the elided alias's value.  Null if the field cannot be materialised here.
+  LamPtr coerce_field_value(const modsig::Coercion::Field& f, const LamPtr& block_var) {
+    using From = modsig::Coercion::Field::From;
+    if (f.from == From::PrimStub) return prim_stub({f.prim, f.prim_arity});
+    if (f.from == From::AliasValue) {
+      auto a = module_alias_.find(f.name);
+      return a != module_alias_.end() ? a->second : nullptr;
+    }
+    auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
+    fr->prim_arg = f.src_pos; fr->args = {block_var};
+    if (f.sub) return apply_msig_coercion(fr, *f.sub);
+    return fr;
+  }
+  // Overload: read the source field directly from an already-materialised vector
+  // of source field values (the ascription tail, where exports are individual
+  // values not yet assembled into a block).  cursig positions align with the
+  // exports vector, so SrcField indexes it directly.
+  LamPtr coerce_field_value(const modsig::Coercion::Field& f,
+                            const std::vector<LamPtr>& src_fields) {
+    using From = modsig::Coercion::Field::From;
+    if (f.from == From::PrimStub) return prim_stub({f.prim, f.prim_arity});
+    if (f.from == From::AliasValue) {
+      auto a = module_alias_.find(f.name);
+      return a != module_alias_.end() ? a->second : nullptr;
+    }
+    if (f.src_pos < 0 || f.src_pos >= (int)src_fields.size()) return nullptr;
+    LamPtr v = src_fields[f.src_pos];
+    if (f.sub) return apply_msig_coercion(v, *f.sub);
+    return v;
+  }
 
   // Compile a module expression to its Lambda value: a structure is a record of
   // its exports; a functor is `(function X is_a_functor <body>)`.
@@ -14725,6 +14871,54 @@ struct Translator {
             if (sp.name.empty()) continue;
             if (LamPtr s = prim_stub(sp)) { ce.push_back(s); cn.push_back(nm); break; }
           }
+        }
+      }
+      // P2 stage 2 shadow mode: compute the coercion over the namespaced Sigs
+      // (src = cursig, tgt = coerce_sig's Sig) and replay it against the ORIGINAL
+      // exports, comparing field-by-field with the legacy `ce`.  Report but do
+      // NOT act (legacy result stands).  Only where a tgt Sig is in hand.
+      if (coerce_check_enabled() && coerce_sig) {
+        modsig::SigPtr tgt = msig_of_cmi_signature(*coerce_sig);
+        modsig::Coercion cc = compute_coercion(cursig, *tgt);
+        // Canonicalise fresh-variable stamps (`name/304`) by first appearance so
+        // two alpha-equivalent field values (e.g. independently-built eta-stubs
+        // with different fresh stamps) compare equal; a genuine field-selection
+        // difference survives (field indices are prim args, not stamps).
+        auto to_s = [](const LamPtr& l) {
+          std::ostringstream os; print_dlambda(l, os);
+          std::string s = os.str(), out;
+          std::unordered_map<std::string, int> seen;
+          for (size_t i = 0; i < s.size();) {
+            if (s[i] == '/' && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1])) {
+              size_t j = i + 1;
+              while (j < s.size() && std::isdigit((unsigned char)s[j])) ++j;
+              std::string stamp = s.substr(i + 1, j - i - 1);
+              auto it = seen.find(stamp);
+              int id = it != seen.end() ? it->second : (seen[stamp] = (int)seen.size());
+              out += "/#" + std::to_string(id);
+              i = j;
+            } else out += s[i++];
+          }
+          return out;
+        };
+        if (!cc.ok) {
+          coerce_report("COERCE-BAIL " + mod_path_ + " absent " + cc.error);
+        } else {
+          for (size_t i = 0; i < cc.fields.size(); ++i) {
+            if (i >= ce.size()) break;
+            LamPtr cv = coerce_field_value(cc.fields[i], exports);
+            if (!cv)
+              coerce_report("COERCE-BAIL " + mod_path_ + " field " + cc.fields[i].name);
+            else if (to_s(cv) != to_s(ce[i])) {
+              coerce_report("COERCE-DIVERGE " + mod_path_ + " " + cc.fields[i].name);
+              if (std::getenv("CPPCAML_COERCE_DEBUG"))
+                coerce_report("  computed: " + to_s(cv) + "\n  legacy:   " + to_s(ce[i]));
+            }
+          }
+          if (cc.fields.size() != ce.size())
+            coerce_report("COERCE-DIVERGE " + mod_path_ + " <len msig=" +
+                          std::to_string(cc.fields.size()) + " legacy=" +
+                          std::to_string(ce.size()) + ">");
         }
       }
       exports = std::move(ce); export_names = std::move(cn);
