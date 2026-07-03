@@ -12729,8 +12729,11 @@ struct Translator {
   // mv; otherwise build the target block from selected/reordered field reads,
   // fusing into a freshly-built source makeblock when possible (same optimisation
   // and the same Lambda shapes as coerce_block, so lambda-parity does not churn).
+  // Returns nullptr when a field cannot be replayed here (a required prim stub or
+  // module alias is unavailable) so the caller falls back to the legacy path.
   LamPtr apply_msig_coercion(const LamPtr& mv, const modsig::Coercion& c) {
-    if (c.identity || !c.ok) return mv;
+    if (!c.ok) return nullptr;
+    if (c.identity) return mv;
     // FUSION: mv is `(let <binds> (makeblock 0 v0 v1 ..))` with pure fields ->
     // rebuild the block in target order instead of allocating a second block.
     if (mv->k == Lam::K::Let && mv->body && mv->body->k == Lam::K::Prim &&
@@ -12768,7 +12771,7 @@ struct Translator {
     std::vector<LamPtr> fs;
     for (auto& f : c.fields) {
       LamPtr fr = coerce_field_value(f, v);
-      if (!fr) return mv;  // an unreplayable field: leave mv unchanged (shadow)
+      if (!fr) return nullptr;  // unreplayable field: caller uses legacy
       fs.push_back(fr);
     }
     auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
@@ -12809,6 +12812,22 @@ struct Translator {
     LamPtr v = src_fields[f.src_pos];
     if (f.sub) return apply_msig_coercion(v, *f.sub);
     return v;
+  }
+  // A module-constraint `(me : S)` coercion via the computed path: src Sig from
+  // the inner build (msig_out), tgt = S's namespaced Sig.  Returns the coerced
+  // module value, `inner` unchanged if the coercion is identity, or nullptr when
+  // the Sigs are not fully namespaced / a field cannot replay (caller falls back
+  // to legacy coerce_block).  Counts the computed uses for coverage.
+  LamPtr try_computed_constraint(const LamPtr& inner, const modsig::SigPtr& src,
+                                 const ModuleType& mt) {
+    if (!src || !modsig::trusted(*src)) return nullptr;
+    modsig::SigPtr tgt = msig_of_modtype(mt);
+    if (!tgt || tgt->items.empty() || !modsig::trusted(*tgt)) return nullptr;
+    modsig::Coercion cc = compute_coercion(*src, *tgt);
+    if (!cc.ok) return nullptr;
+    LamPtr r = apply_msig_coercion(inner, cc);
+    if (r) ++coerce_computed_used_;
+    return r;
   }
 
   // Compile a module expression to its Lambda value: a structure is a record of
@@ -13319,7 +13338,12 @@ struct Translator {
       if (auto* ps = std::get_if<Pmod_structure>(&pc->me->desc)) {
         std::vector<std::string> force = sig_layout(*pc->mt);
         std::vector<std::string> sub;
-        LamPtr inner = build_module(ps->items, &sub, nullptr, force.empty() ? nullptr : &force);
+        modsig::SigPtr src_msig;
+        LamPtr inner = build_module(ps->items, &sub, nullptr,
+                                    force.empty() ? nullptr : &force, nullptr, &src_msig);
+        // P2 stage 4.1: the computed coercion when both Sigs are namespaced.
+        if (LamPtr c = try_computed_constraint(inner, src_msig, *pc->mt)) return c;
+        if (coerce_check_enabled()) coerce_report("COERCE-COVER " + mod_path_ + " constraint-legacy");
         if (LamPtr c = coerce_block(inner, sub, sig_layout(*pc->mt),
                                     pc->me.get(), sig_items_of(*pc->mt)))
           return c;
