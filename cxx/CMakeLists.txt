@@ -48,6 +48,11 @@ target_link_libraries(c++type PRIVATE cppcaml_core)
 add_executable(c++infer-test src/tools/cppinfer_test.cpp)
 target_link_libraries(c++infer-test PRIVATE cppcaml_core)
 
+# Header-only: modsig.hpp needs no library, so no static-lib link (avoids the
+# llvm-ar gotcha).  Just the include dir.
+add_executable(c++modsig-test src/tools/cppmodsig_test.cpp)
+target_include_directories(c++modsig-test PRIVATE include)
+
 add_executable(c++lambda src/tools/cpplambda_main.cpp)
 target_link_libraries(c++lambda PRIVATE cppcaml_core)
 

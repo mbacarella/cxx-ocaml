@@ -36,6 +36,8 @@ struct Item {
   bool is_prim = false;  // declared `external` (upstream Val_prim: no field.
                          // The AST-signature layout path currently still gives
                          // it a slot; recorded so P2 can fix that deliberately)
+  std::string prim;      // is_prim: the primitive descriptor ("%addint", C name)
+  int prim_arity = 0;    // is_prim: number of arguments (eta-stub arity)
   int pos = -1;          // runtime field index; -1 when !runtime (see number())
   SigPtr sub;            // Module: its signature; Modtype: its body (may be
                          // null when unresolved)
@@ -146,5 +148,110 @@ struct Env {
     return cur;
   }
 };
+
+// A COMPUTED module coercion over two namespaced Sigs -- the modsig analogue
+// of typing/typedtree.mli's `module_coercion` (Tcoerce_*), replayed by
+// lambda.cpp's apply_msig_coercion (mirrors lambda/translmod.ml apply_coercion).
+// PURE DATA: names/indices/prim descriptors only; the replayer consults the
+// Translator for the actual Lambda values.  One Field per TARGET runtime field,
+// in target order.
+struct Coercion;
+using CoercionPtr = std::shared_ptr<Coercion>;
+struct Coercion {
+  struct Field {
+    enum class From : unsigned char {
+      SrcField,   // read src block field `src_pos` (Tcoerce_none/_structure)
+      PrimStub,   // materialize an external as an eta-stub (Tcoerce_primitive)
+      AliasValue, // materialize an elided module alias      (Tcoerce_alias)
+    } from = From::SrcField;
+    int src_pos = -1;          // SrcField: index in the SOURCE runtime block
+    std::string name;          // the member name (all kinds; replay lookup key)
+    std::string prim;          // PrimStub: primitive descriptor
+    int prim_arity = 0;        // PrimStub: eta-stub arity
+    CoercionPtr sub;           // recursive coercion for a submodule (else null)
+  };
+  std::vector<Field> fields;
+  bool identity = false;  // src == tgt field-for-field AND same runtime length
+  bool ok = true;         // false: a required member is absent/ambiguous
+  std::string error;      // dotted path of the offending member when !ok
+  int unknown_pairings = 0;  // # of fields paired via an Unknown namespace (a
+                             // flat-splice escape hatch): observability for the
+                             // trust gate (an all-known Sig pairs 0 this way).
+};
+
+// Locate the SOURCE item that satisfies a TARGET runtime item `t`, pairing by
+// (namespace, name).  NS::Unknown on EITHER side pairs by name alone (the flat-
+// splice escape hatch).  Last occurrence wins (shadowing already applied by
+// push()).  `via_unknown` is set when the pairing crossed an Unknown namespace.
+inline const Item* coercion_find_src(const Sig& src, const Item& t,
+                                     bool& via_unknown) {
+  via_unknown = false;
+  const Item* best = nullptr;
+  for (auto it = src.items.rbegin(); it != src.items.rend(); ++it) {
+    if (it->name != t.name) continue;
+    bool exact = (it->ns == t.ns);
+    bool unknown = (it->ns == NS::Unknown || t.ns == NS::Unknown);
+    if (exact) { via_unknown = false; return &*it; }
+    if (unknown && !best) { best = &*it; via_unknown = true; }
+  }
+  return best;
+}
+
+// Compute the coercion that builds `tgt`'s runtime block from `src`'s, matching
+// includemod.signatures.  Non-runtime target items (types, modtypes, class
+// types, primitives, absent aliases) take no field and are skipped WITHOUT a
+// src presence check -- the typer owns rejection; the back end owns layout.
+inline Coercion compute_coercion(const Sig& src, const Sig& tgt, int depth = 0) {
+  Coercion c;
+  if (depth > 24) { c.identity = true; return c; }  // recursive modtype guard
+  for (const Item& t : tgt.items) {
+    if (!t.runtime) continue;  // no field: skip (see note above)
+    bool via_unknown = false;
+    const Item* s = coercion_find_src(src, t, via_unknown);
+    if (!s) { c.ok = false; c.error = t.name; return c; }
+    if (via_unknown) ++c.unknown_pairings;
+    Coercion::Field f;
+    f.name = t.name;
+    if (s->runtime) {
+      f.from = Coercion::Field::From::SrcField;
+      f.src_pos = s->pos;
+      if (s->ns == NS::Module && t.ns == NS::Module && s->sub && t.sub) {
+        Coercion sub = compute_coercion(*s->sub, *t.sub, depth + 1);
+        if (!sub.ok) { c.ok = false; c.error = t.name + "." + sub.error; return c; }
+        c.unknown_pairings += sub.unknown_pairings;
+        if (!sub.identity) f.sub = std::make_shared<Coercion>(std::move(sub));
+      }
+    } else if (s->is_prim) {  // external (no slot) exposed as a val: eta-stub it
+      f.from = Coercion::Field::From::PrimStub;
+      f.prim = s->prim;
+      f.prim_arity = s->prim_arity;
+    } else if (s->ns == NS::Module) {  // elided alias exposed: materialize it
+      f.from = Coercion::Field::From::AliasValue;
+    } else {  // a no-slot src member that is neither prim nor alias: unmatchable
+      c.ok = false; c.error = t.name; return c;
+    }
+    c.fields.push_back(std::move(f));
+  }
+  // Identity per simplify_structure_coercion + PR#5098: fields are 0,1,2,..
+  // with no subs AND the source has no EXTRA runtime fields.
+  c.identity = ((int)c.fields.size() == src.runtime_len());
+  for (std::size_t i = 0; i < c.fields.size() && c.identity; ++i)
+    if (c.fields[i].from != Coercion::Field::From::SrcField ||
+        c.fields[i].src_pos != (int)i || c.fields[i].sub)
+      c.identity = false;
+  return c;
+}
+
+// A computed coercion is TRUSTED only when derived from fully-namespaced Sigs
+// (no Unknown items, recursively) -- the migration safety valve.  An empty Sig
+// is trusted-but-useless; the call site treats it as untrusted.
+inline bool trusted(const Sig& s, int depth = 0) {
+  if (depth > 24) return false;
+  for (auto& it : s.items) {
+    if (it.ns == NS::Unknown) return false;
+    if (it.sub && !trusted(*it.sub, depth + 1)) return false;
+  }
+  return true;
+}
 
 }  // namespace cppcaml::modsig

@@ -12502,6 +12502,10 @@ struct Translator {
           item.ns = modsig::NS::Value;
           item.name = sig.values[oe.idx].name;
           item.is_prim = !oe.runtime;
+          if (item.is_prim) {  // eta-stub descriptor for a Val_prim exposed as val
+            item.prim = sig.values[oe.idx].prim;
+            item.prim_arity = sig.values[oe.idx].prim_arity;
+          }
           break;
         case OE::Type:
           item.ns = modsig::NS::Type;
@@ -12600,8 +12604,15 @@ struct Translator {
           if (auto* v = std::get_if<Psig_value>(&it.desc)) {
             out->push({.ns = modsig::NS::Value, .name = v->vd.name.txt});
           } else if (auto* pp = std::get_if<Psig_primitive>(&it.desc)) {
+            int ar = 0;  // arity walk (same as build_module's Pstr_primitive)
+            if (pp->pd.type) {
+              const CoreType* t = pp->pd.type.get();
+              while (auto* a = std::get_if<Ptyp_arrow>(&t->desc)) { ++ar; t = a->cod.get(); }
+            }
             out->push({.ns = modsig::NS::Value, .name = pp->pd.name.txt,
-                       .runtime = false, .is_prim = true});
+                       .runtime = false, .is_prim = true,
+                       .prim = pp->pd.prims.empty() ? std::string() : pp->pd.prims[0],
+                       .prim_arity = ar});
           } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
             if (!m->md.name.txt) continue;
             modsig::Item mi{.ns = modsig::NS::Module, .name = *m->md.name.txt};
@@ -13638,6 +13649,13 @@ struct Translator {
         } else if (!pd.prims.empty() && pd.type) {
           local_prims_[pd.name.txt] = {pd.prims[0], ar};  // a %-builtin
         }
+        // modsig P1: an external is a no-slot Value item (upstream Val_prim
+        // takes no runtime field); record its descriptor so a `: S` coercion
+        // can eta-stub it without guessing.
+        if (!pd.prims.empty())
+          cursig.push({.ns = modsig::NS::Value, .name = pd.name.txt,
+                       .runtime = false, .is_prim = true,
+                       .prim = pd.prims[0], .prim_arity = ar});
         continue;
       }
       if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {  // exception E [of ...]
