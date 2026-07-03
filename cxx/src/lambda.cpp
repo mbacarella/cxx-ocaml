@@ -1887,6 +1887,23 @@ struct Translator {
     if (auto it = modtype_layout_.find(last); it != modtype_layout_.end())
       target = it->second;
     if (target.empty()) return mv;
+    // modsig P3 stage 3: computed coercion over the derived Sigs (pairs by
+    // (namespace, name); eta-stubs included externals from prim descriptors)
+    {
+      modsig::SigPtr smsig = msig_result_of_module_expr(me);
+      modsig::SigPtr tmsig = msig_of_modtype_path(mtname);
+      if (smsig && tmsig && !tmsig->items.empty() &&
+          modsig::trusted(*smsig) && modsig::trusted(*tmsig)) {
+        modsig::Coercion cc = compute_coercion(*smsig, *tmsig);
+        if (cc.ok)
+          if (LamPtr c = apply_msig_coercion(mv, cc)) {
+            ++coerce_computed_used_;
+            return c;
+          }
+      }
+      if (coerce_check_enabled())
+        coerce_report("COERCE-COVER " + mod_path_ + " pack-legacy " + mtname);
+    }
     auto src = module_result_layout(me);
     if (LamPtr c = coerce_block(mv, src, target)) return c;
     // coerce_block bails when a target member is absent from src -- targetint's
@@ -13328,7 +13345,15 @@ struct Translator {
     std::vector<std::string> force = sig_layout(pmt);
     if (force.empty()) return nullptr;
     std::vector<std::string> sub;
-    LamPtr block = build_module(ps.items, &sub, nullptr, &force);
+    modsig::SigPtr src_msig;
+    LamPtr block = build_module(ps.items, &sub, nullptr, &force, nullptr, &src_msig);
+    // modsig P3 stage 3: the computed argument->parameter coercion
+    {
+      std::string why;
+      if (LamPtr c = try_computed_constraint(block, src_msig, pmt, &why)) return c;
+      if (coerce_check_enabled())
+        coerce_report("COERCE-COVER " + mod_path_ + " functor-arg-legacy " + why);
+    }
     LamPtr body = block;
     while (body && (body->k == Lam::K::Let || body->k == Lam::K::Letrec)) body = body->body;
     if (!body || body->k != Lam::K::Prim || body->prim != Prim::Makeblock ||
@@ -13395,7 +13420,23 @@ struct Translator {
   LamPtr coerce_struct_arg_cmi(const Pmod_structure& ps, const cmi::Signature& psig) {
     if (psig.fields.empty()) return nullptr;
     std::vector<std::string> sub;
-    LamPtr block = build_module(ps.items, &sub, nullptr, &psig.fields);
+    modsig::SigPtr src_msig;
+    LamPtr block = build_module(ps.items, &sub, nullptr, &psig.fields, nullptr,
+                                &src_msig);
+    // modsig P3 stage 3: the computed argument->parameter coercion (cmi param)
+    if (src_msig && modsig::trusted(*src_msig)) {
+      modsig::SigPtr tgt = msig_of_cmi_signature(psig);
+      if (tgt && !tgt->items.empty() && modsig::trusted(*tgt)) {
+        modsig::Coercion cc = compute_coercion(*src_msig, *tgt);
+        if (cc.ok)
+          if (LamPtr c = apply_msig_coercion(block, cc)) {
+            ++coerce_computed_used_;
+            return c;
+          }
+      }
+    }
+    if (coerce_check_enabled())
+      coerce_report("COERCE-COVER " + mod_path_ + " functor-arg-cmi-legacy");
     LamPtr body = block;
     while (body && (body->k == Lam::K::Let || body->k == Lam::K::Letrec)) body = body->body;
     if (!body || body->k != Lam::K::Prim || body->prim != Prim::Makeblock ||
