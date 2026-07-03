@@ -3055,9 +3055,9 @@ struct Checker {
   // Bind all variables of a pattern to Any (used for patterns in an unknown
   // context, e.g. record fields we don't type).
   void bind_pat_any(const Pattern& p) {
-    if (auto* v = std::get_if<Ppat_var>(&p.desc)) { venv.back()[v->name.txt] = eng.any(); return; }
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) { venv.back()[v->name.txt] = eng.fresh_var(); return; }  // P4-D: fresh, not Any (corpus-validated)
     if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
-      venv.back()[al->name.txt] = eng.any(); bind_pat_any(*al->p); return;
+      venv.back()[al->name.txt] = eng.fresh_var(); bind_pat_any(*al->p); return;
     }
     if (auto* tu = std::get_if<Ppat_tuple>(&p.desc)) {
       for (auto& e : tu->elems) bind_pat_any(*e); return;
@@ -3417,7 +3417,8 @@ struct Checker {
           // the polymorphic-record-field feature).  from_coretype mints generic
           // vars, so storing that scheme in venv gives per-use polymorphism; a
           // single monomorphic binding (Any) would lose the result type.
-          if (!strict) {
+          {  // strict too (P4): a fresh-var binding for a poly field would
+             // clash across its uses (domains.ml {pf} at two format types)
             auto pit = poly_field_rec_.find(lid_last(lid.txt));
             if (pit != poly_field_rec_.end()) {
               std::unordered_map<std::string, TypePtr> fv;
