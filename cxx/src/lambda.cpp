@@ -15843,7 +15843,19 @@ struct Translator {
             c.runtime = true;  // a materialized alias/eta-stub takes a slot
             out_sig->push(std::move(c));
           } else {
-            out_sig->push({.ns = modsig::NS::Unknown, .name = nm});
+            // not in cursig (a materialized alias / eta-stub / exn slot): the
+            // TARGET sig knows its namespace; Unknown only when neither side does
+            const modsig::Item* ti = nullptr;
+            if (coerce_msig)
+              for (auto it3 = coerce_msig->items.rbegin();
+                   it3 != coerce_msig->items.rend(); ++it3)
+                if (it3->runtime && it3->name == nm) { ti = &*it3; break; }
+            if (ti) {
+              modsig::Item c2 = *ti;
+              out_sig->push(std::move(c2));
+            } else {
+              out_sig->push({.ns = modsig::NS::Unknown, .name = nm});
+            }
           }
         }
         for (auto& it2 : cursig.items)  // no-slot items survive for lookup
