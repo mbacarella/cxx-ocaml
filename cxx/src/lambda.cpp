@@ -604,6 +604,11 @@ struct Translator {
   // A named module type's Sig, keyed like modtype_layout_ (bare + dotted).
   std::unordered_map<std::string, modsig::SigPtr> modtype_msig_;
   bool msig_checking_ = false;  // re-entrancy guard for the parity asserts
+  // P2 stage 3+: coverage counters for the computed-coercion switch (logged
+  // under CPPCAML_COERCE_CHECK) -- how often the ascription/constraint tails
+  // took the computed path vs fell back to the legacy name-list.
+  int coerce_computed_used_ = 0;
+  int coerce_legacy_fallbacks_ = 0;
   static bool msig_check_enabled() {
     static bool on = std::getenv("CPPCAML_MODSIG_CHECK") != nullptr;
     return on;
@@ -13643,10 +13648,16 @@ struct Translator {
     std::vector<Lam::Binding> cur;
     std::vector<LamPtr> exports;
     std::vector<std::string> export_names;
+    // P2 stage 3: the namespace of each export slot, kept index-aligned with
+    // export_names so shadowing is per-namespace -- a `module Error` and an
+    // `exception Error` (or `class c` and `let c`) each keep their own field,
+    // exactly like the oracle and the namespace-aware .cmi writer, instead of
+    // the old flat name-collapse that dropped one.
+    std::vector<modsig::NS> export_ns;
     // modsig P1: the in-construction namespaced signature, built next to
-    // export_names (same shadowing, but per-namespace) and asserted equal to
-    // it at the end.  Non-runtime items (types, modtypes, elided aliases)
-    // join here even though they have no export slot.
+    // export_names (same shadowing, per-namespace) and asserted equal to it at
+    // the end.  Non-runtime items (types, modtypes, elided aliases) join here
+    // even though they have no export slot.
     modsig::Sig cursig;
     // stdlib (sub)modules `include`d here (canonical dotted/bare names): a `: S`
     // coercion eta-stubs S members that are PRIMITIVES of these (no runtime field).
@@ -13655,15 +13666,21 @@ struct Translator {
     auto add_export_val = [&](const std::string& nm, LamPtr v,
                               modsig::NS ns = modsig::NS::Value,
                               modsig::SigPtr sub = nullptr) {
-      // a redefinition (shadow) moves the name to its last definition's position
+      // a redefinition (shadow) moves the name to its last definition's
+      // position -- but only within the SAME namespace (or across an Unknown
+      // flat-splice), mirroring cursig.push exactly so the two stay aligned.
       for (size_t i = 0; i < export_names.size(); ++i)
-        if (export_names[i] == nm) {
+        if (export_names[i] == nm &&
+            (export_ns[i] == ns || export_ns[i] == modsig::NS::Unknown ||
+             ns == modsig::NS::Unknown)) {
           export_names.erase(export_names.begin() + i);
           exports.erase(exports.begin() + i);
+          export_ns.erase(export_ns.begin() + i);
           break;
         }
       exports.push_back(std::move(v));
       export_names.push_back(nm);
+      export_ns.push_back(ns);
       cursig.push({.ns = ns, .name = nm, .sub = std::move(sub)});
     };
     auto add_export = [&](const std::string& nm, const Ident& id,
@@ -13798,10 +13815,21 @@ struct Translator {
         // modsig P1: an external is a no-slot Value item (upstream Val_prim
         // takes no runtime field); record its descriptor so a `: S` coercion
         // can eta-stub it without guessing.
-        if (!pd.prims.empty())
+        if (!pd.prims.empty()) {
           cursig.push({.ns = modsig::NS::Value, .name = pd.name.txt,
                        .runtime = false, .is_prim = true,
                        .prim = pd.prims[0], .prim_arity = ar});
+          // P2 stage 3: the external SHADOWS any prior runtime value of the
+          // same name, and it takes NO field -- so that value loses its export
+          // slot (matching the oracle and cursig.push, which just dropped it).
+          for (size_t i = 0; i < export_names.size(); ++i)
+            if (export_names[i] == pd.name.txt && export_ns[i] == modsig::NS::Value) {
+              export_names.erase(export_names.begin() + i);
+              exports.erase(exports.begin() + i);
+              export_ns.erase(export_ns.begin() + i);
+              break;
+            }
+        }
         continue;
       }
       if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {  // exception E [of ...]
@@ -14814,10 +14842,47 @@ struct Translator {
     // fields (selected and reordered by name); the structure's bindings stay.
     if (coerce) {
       std::vector<LamPtr> ce; std::vector<std::string> cn;
+      bool used_computed = false;
+      // P2 stage 3: prefer the COMPUTED coercion -- it pairs by (namespace,
+      // name), so a cross-ns `module Error` + `exception Error` (or `class c` +
+      // `let c`) map to their OWN fields instead of the flat name-list
+      // collapsing them.  Trusted only when both Sigs are fully namespaced (no
+      // Unknown flat-splice); every field must replay, else fall back (counted).
+      if (coerce_sig) {
+        modsig::SigPtr tgt = msig_of_cmi_signature(*coerce_sig);
+        if (!tgt->items.empty() && modsig::trusted(cursig) &&
+            modsig::trusted(*tgt)) {
+          modsig::Coercion cc = compute_coercion(cursig, *tgt);
+          if (cc.ok) {
+            std::vector<LamPtr> tmp; std::vector<std::string> tn;
+            bool all = true;
+            for (auto& f : cc.fields) {
+              LamPtr v = coerce_field_value(f, exports);
+              if (!v) { all = false; break; }
+              tmp.push_back(v); tn.push_back(f.name);
+            }
+            if (all) {
+              ce = std::move(tmp); cn = std::move(tn);
+              used_computed = true; ++coerce_computed_used_;
+            }
+          }
+        }
+      }
+      if (!used_computed) {
+      ++coerce_legacy_fallbacks_;
+      // Consume each export slot at most once: with the export block now
+      // namespaced (a `module Error` AND an `exception Error` both keep a slot),
+      // two same-named target fields must map to DIFFERENT source slots, in
+      // order -- not both to the first match.  (The computed path pairs by
+      // namespace; this keeps the legacy fallback correct for duplicate names.)
+      std::vector<bool> used(export_names.size(), false);
       for (auto& nm : *coerce) {
-        auto it = std::find(export_names.begin(), export_names.end(), nm);
-        if (it != export_names.end()) {
-          LamPtr val = exports[it - export_names.begin()];
+        int fi = -1;
+        for (size_t k = 0; k < export_names.size(); ++k)
+          if (!used[k] && export_names[k] == nm) { fi = (int)k; break; }
+        if (fi >= 0) {
+          used[fi] = true;
+          LamPtr val = exports[fi];
           // a submodule whose own block layout differs from its .mli signature
           // (Domain.DLS: internal field order != exposed [new_key; get; set])
           // is reprojected to the .mli order so external field reads land right.
@@ -14873,54 +14938,10 @@ struct Translator {
           }
         }
       }
-      // P2 stage 2 shadow mode: compute the coercion over the namespaced Sigs
-      // (src = cursig, tgt = coerce_sig's Sig) and replay it against the ORIGINAL
-      // exports, comparing field-by-field with the legacy `ce`.  Report but do
-      // NOT act (legacy result stands).  Only where a tgt Sig is in hand.
-      if (coerce_check_enabled() && coerce_sig) {
-        modsig::SigPtr tgt = msig_of_cmi_signature(*coerce_sig);
-        modsig::Coercion cc = compute_coercion(cursig, *tgt);
-        // Canonicalise fresh-variable stamps (`name/304`) by first appearance so
-        // two alpha-equivalent field values (e.g. independently-built eta-stubs
-        // with different fresh stamps) compare equal; a genuine field-selection
-        // difference survives (field indices are prim args, not stamps).
-        auto to_s = [](const LamPtr& l) {
-          std::ostringstream os; print_dlambda(l, os);
-          std::string s = os.str(), out;
-          std::unordered_map<std::string, int> seen;
-          for (size_t i = 0; i < s.size();) {
-            if (s[i] == '/' && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1])) {
-              size_t j = i + 1;
-              while (j < s.size() && std::isdigit((unsigned char)s[j])) ++j;
-              std::string stamp = s.substr(i + 1, j - i - 1);
-              auto it = seen.find(stamp);
-              int id = it != seen.end() ? it->second : (seen[stamp] = (int)seen.size());
-              out += "/#" + std::to_string(id);
-              i = j;
-            } else out += s[i++];
-          }
-          return out;
-        };
-        if (!cc.ok) {
-          coerce_report("COERCE-BAIL " + mod_path_ + " absent " + cc.error);
-        } else {
-          for (size_t i = 0; i < cc.fields.size(); ++i) {
-            if (i >= ce.size()) break;
-            LamPtr cv = coerce_field_value(cc.fields[i], exports);
-            if (!cv)
-              coerce_report("COERCE-BAIL " + mod_path_ + " field " + cc.fields[i].name);
-            else if (to_s(cv) != to_s(ce[i])) {
-              coerce_report("COERCE-DIVERGE " + mod_path_ + " " + cc.fields[i].name);
-              if (std::getenv("CPPCAML_COERCE_DEBUG"))
-                coerce_report("  computed: " + to_s(cv) + "\n  legacy:   " + to_s(ce[i]));
-            }
-          }
-          if (cc.fields.size() != ce.size())
-            coerce_report("COERCE-DIVERGE " + mod_path_ + " <len msig=" +
-                          std::to_string(cc.fields.size()) + " legacy=" +
-                          std::to_string(ce.size()) + ">");
-        }
-      }
+      }  // if (!used_computed): the legacy flat name-list fallback
+      if (coerce_check_enabled())
+        coerce_report("COERCE-COVER " + mod_path_ +
+                      (used_computed ? " computed" : " legacy"));
       exports = std::move(ce); export_names = std::move(cn);
     }
     if (names) *names = export_names;  // the (deduplicated) export layout, in order
