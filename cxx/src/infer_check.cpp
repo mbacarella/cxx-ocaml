@@ -3596,6 +3596,58 @@ struct Checker {
     return r;
   }
 
+  // Validate a format literal's flag / precision / conversion compatibility -- a
+  // SUBSET of OCaml's CamlinternalFormat checks, restricted to combinations that
+  // are ALWAYS an error, so this never false-rejects a valid format (printf is
+  // pervasive).  Returns an empty string when no violation is found.
+  static std::string format_validity_error(const std::string& s) {
+    auto isdig = [](char c) { return c >= '0' && c <= '9'; };
+    auto in = [](char c, const char* set) {
+      return std::string_view(set).find(c) != std::string_view::npos;
+    };
+    size_t i = 0, n = s.size();
+    while (i < n) {
+      if (s[i] != '%') { ++i; continue; }
+      ++i;
+      if (i >= n) break;
+      if (in(s[i], "%@!,")) { ++i; continue; }  // %% %@ %! %, : not conversions
+      if (s[i] == '_') ++i;                      // %_d : ignored read
+      bool fminus = false, fplus = false, fspace = false, fzero = false;
+      while (i < n && in(s[i], "-+ #0")) {
+        if (s[i] == '-') fminus = true; else if (s[i] == '+') fplus = true;
+        else if (s[i] == ' ') fspace = true; else if (s[i] == '0') fzero = true;
+        ++i;
+      }
+      bool has_width = false;
+      if (i < n && s[i] == '*') { has_width = true; ++i; }
+      else while (i < n && isdig(s[i])) { has_width = true; ++i; }
+      bool has_prec = false;
+      if (i < n && s[i] == '.') {
+        has_prec = true; ++i;
+        if (i < n && s[i] == '*') ++i; else while (i < n && isdig(s[i])) ++i;
+      }
+      if (i >= n) break;
+      if (in(s[i], "lnL") && i + 1 < n && in(s[i + 1], "dixXou")) ++i;  // length modifier
+      char c = s[i]; ++i;
+      bool is_int = in(c, "dioxXunlLN");
+      bool is_strchar = in(c, "sScC");
+      bool is_float = in(c, "feEgGFhH");
+      // '-' (left-justify) requires an explicit width.
+      if (fminus && !has_width && (is_int || is_strchar || is_float))
+        return "'-' without padding";
+      // '+' / ' ' sign flags apply only to numeric conversions.
+      if ((fplus || fspace) && is_strchar)
+        return std::string("'") + (fplus ? '+' : ' ') + "' is incompatible with '" + c + "'";
+      // Precision is incompatible with string / char conversions.
+      if (has_prec && is_strchar)
+        return std::string("precision is incompatible with '") + c + "'";
+      // The '0' pad flag is incompatible with a precision on integer conversions.
+      if (fzero && has_prec && is_int)
+        return "precision is incompatible with '0'";
+    }
+    return std::string();
+  }
+
   // Infer an expression with an expected type pushed down (bidirectional).  A
   // string literal expected at a format type is accepted as that format (OCaml's
   // type_format), with its argument arrow filled in so the consuming application
@@ -3603,6 +3655,9 @@ struct Checker {
   TypePtr infer_expr_expected(const Expression& e, const TypePtr& expected) {
     if (auto* c = std::get_if<Pexp_constant>(&e.desc))
       if (auto* s = std::get_if<Pconst_string>(&c->c.desc); s && is_format_constr(expected)) {
+        if (strict)
+          if (std::string fe = format_validity_error(s->s); !fe.empty())
+            note_error("invalid format \"" + s->s + "\": " + fe);
         if (record_kinds_ || record_fmt_lits_)
           fmt_lits_.insert(&e);  // Lambda lowers it as a format; dump desugars it
         auto er = I::Engine::repr(expected);  // format6's arg0 ('a) is the args function
