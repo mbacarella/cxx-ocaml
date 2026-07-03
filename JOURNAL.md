@@ -2977,3 +2977,86 @@ pack_coerce (first-class module), and recursive-module coerce_block sites stay o
 the counted legacy fallback.  They need a Sig for an arbitrary MODULE EXPRESSION
 (msig_of_module_expr) and/or Env-scoped path resolution -- the P3 work.  The
 counted fallback makes their remaining traffic visible.
+
+================================================================================
+P3 S1-S3 DONE: msig_of_module_expr + Env sync + all coerce sites computed
+                                                                    — 2026-07-03
+================================================================================
+Stages 1-3 of MODSIG-P3-PLAN.md.  Five gates green throughout; lambda parity
+went UP: MATCH 411/741 -> 412/741 (the computed functor-arg coercion fixed a
+corpus file).  Remaining: S4 (Env-authoritative path resolution, retire
+module_head_resolvable + module_layout_ readers) and S5 (trust audit + wrap).
+
+WHAT EXISTS NOW
+- msig_of_module_expr (lambda.cpp): the namespaced Sig of an ARBITRARY module
+  expression.  Structures walk statically (msig_of_structure, with a walk-local
+  module map for `include <local>`); constraints take the ascription (with the
+  legacy empty-runtime fallback, bug-compatible until S4); functors are
+  single-marker Sigs (kFunctorMarker item carrying param/result); applications
+  descend markers; unpack resolves the package modtype (expr_pack_modtype).
+  Path resolution (msig_of_module_path): Env FIRST (scoped), then opened-module
+  expansion, then the cmi ladder.  Env::find_module distinguishes bound-null
+  (a TOMBSTONE: local module, Sig unknown -- stops cmi fallback) from unbound.
+  msig_of_modtype_path resolves dotted MODTYPE paths (Env, registry, cmi).
+- ENV SYNC DISCIPLINE: every bare-name module bind shadows menv_ in lockstep --
+  functor params (own frame in compile_module_expr, popped with the body),
+  local functors (marker Sigs; the marker's innermost result is REBUILT from
+  the .mli result cmi sig when the .mli restricts an unascribed body -- the raw
+  body walk was WRONG there), module M = <expr> (agree-gated derived Sig),
+  recmodule phase-0, include-spliced module members, let-module + the
+  single-param helper (RAII EnvModBind restoring the frame entry), (module M)
+  unpack patterns.  Stale-Env answers (pr7818 `module rec M : S = M` seeing the
+  OLD M) are gone.  msig_of_module_path bails only on module_ident_ hits;
+  module_alias_-only names are the submodule postlude's conveniences that
+  upstream scoping does NOT bind (symtable.ml sibling `Set` must not shadow
+  stdlib Set inside `Predef`).
+- NAMESPACED INCLUDE SPLICE: Pstr_include pushes real per-item namespaces +
+  sub-Sigs into cursig when the derived Sig agrees with the flat layout
+  (runtime names+order); no-slot items (types/modtypes/EXTERNALS with prim
+  descriptors) join too, and an included external drops a shadowed value's
+  slot (the Pstr_primitive rule).  This is what flipped cursig to trusted for
+  most of the compiler: the ascription tail's legacy traffic collapsed.
+- ALL COERCE SITES COMPUTED (counted legacy fallbacks remain as safety valves):
+  ascription tail (now also takes an AST-derived coerce_msig or the unit .mli's
+  submodule cmi sig -- mli_submodule_sigs_), (struct : S) constraint,
+  (M : S) path constraint, .mli-driven functor result
+  (mli_functor_result_sigs_), functor struct-literal argument (AST + cmi param
+  variants), pack_coerce, recursive modules (struct + non-struct bodies).
+- msig_of_modtype resolves `module type of M` through the derived module Sig
+  (was: flat Unknown -> untrusted targets, Matching.Simple class).
+- OBSERVABILITY: every legacy fallback line names WHY (no-cmi-sig /
+  untrusted-src with the offending items / untrusted-tgt / compute-fail:member
+  / replay-fail); include-splice disagreements report under
+  CPPCAML_MODSIG_CHECK.
+- struct_export_names includes `module rec` members (verified vs oracle
+  -dlambda: they occupy runtime fields; cycles.ml/pr7726 layout gap fixed).
+
+COVERAGE (ascription tail, CPPCAML_COERCE_CHECK)
+- stage 0:   bootstrap 126 computed / 129 legacy / 5 constraint-legacy
+- after S3:  bootstrap 255 computed / 1 legacy;  stdlib_full 84 / 0;
+  pack/functor-arg/recmodule legacy traffic on self-host: ZERO.
+- The 1: Strongly_connected_components.Make (functor-result) -- our sandbox
+  .cmi keeps the `with module Id := Id`-REMOVED member, so the tgt demands an
+  Id field the body rightly lacks (compute-fail:Id).  The legacy path bails on
+  the same data (block stays raw either way).  ROOT CAUSE is the cmi writer's
+  destructive-substitution handling, not the coercion machinery; oracle cmi
+  confirmed Id absent.  Park for the cmi work ([[cppcaml-cmi-goal]]).
+
+CORPUS SWEEP (CPPCAML_MODSIG_CHECK, ~1850 files): 43 lines / 10 files, all
+triaged. Classes: (a) source.ml abstract-modtype zoo (24 register + 6
+module_result_layout + 1 env-nested -- S4 target); (b) 7 env-nested lines =
+the P1 category-2 module_layout_ clobbering (S4 target; gpr1506 flickers
+run-to-run -- global-key order dependence, same class); (c) illegal_permutation
++ artificial.ml sig-side corners (bare-name modtype class); (d) NEW pr7787 +
+aliases.ml: alias-in-SIGNATURE runtime-flag divergence between
+register_sig_layouts (skips) and msig_of_modtype (keeps) -- error-path expect
+tests; the Mp_absent story for AST-derived sigs is S4/S5 refinement.
+
+NEXT (P3 S4-S5)
+- S4: Env-first resolve_module_sig() for the module_layout_ READERS
+  (1675-1775 block, field reads, include resolution), then Env-authoritative;
+  retire module_head_resolvable's ad-hoc ladder (reject_parity must stay
+  pinned at 1); kill the MPR7761 clobbering + source.ml zoo; decide the
+  empty-ascription fallback (an empty ascribed sig means EMPTY) at consumers.
+- S5: trust audit (grep NS::Unknown producers; each gets a real namespace or a
+  documented reason), final coverage numbers everywhere, JOURNAL P3 DONE.
