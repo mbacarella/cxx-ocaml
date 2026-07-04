@@ -422,15 +422,23 @@ struct Tstr_recmodule {  // module rec A = .. and B = ..
 };
 // --- classes (Tstr_class) ---
 struct ClassExpr;
-struct Tcf_val { std::string name; bool mutable_; bool override_; ExprBox expr; };
-struct Tcf_method { std::string name; bool private_; bool override_; ExprBox expr; };
+// A concrete field carries expr (+ override_); a virtual field carries vtype.
+struct Tcf_val {
+  std::string name; bool mutable_; bool virtual_ = false; bool override_ = false;
+  ExprBox expr; std::optional<CoreType> vtype;
+};
+struct Tcf_method {
+  std::string name; bool private_; bool virtual_ = false; bool override_ = false;
+  ExprBox expr; std::optional<CoreType> vtype;
+};
 struct Tcf_inherit {  // inherit [!] ce [as super]
   bool override_;
   Box<ClassExpr> ce;
   std::optional<std::string> super;
 };
+struct Tcf_constraint { CoreType t1; CoreType t2; };  // constraint t1 = t2
 struct ClassField {
-  std::variant<Tcf_val, Tcf_method, Tcf_inherit> desc;
+  std::variant<Tcf_val, Tcf_method, Tcf_inherit, Tcf_constraint> desc;
   Location loc;
 };
 struct ClassStructure {
@@ -444,9 +452,17 @@ struct Tcl_fun {  // class c <pat> = ..  (a class parameter)
   Box<ClassExpr> body;
 };
 struct Tcl_ident { Path path; std::vector<CoreTypeBox> args; };  // a class path (e.g. inherit b)
-struct Tcl_constraint { Box<ClassExpr> ce; };  // None-constraint: prints nothing, just recurses
+// ct present => explicit `(ce : CT)` constraint (prints label + ce + class_type);
+// null => an inferred None-constraint (prints nothing for itself, recurses).
+struct Tcl_constraint { Box<ClassExpr> ce; Box<struct ClassType> ct; };
+struct Tcl_let {  // let [rec] bindings in ce  (the let-vars become instance vars)
+  RecFlag rf;
+  std::vector<ValueBinding> bindings;           // l1
+  std::vector<std::pair<Ident, ExprBox>> ivars; // l2: instvar id <- Texp_ident of let var
+  Box<ClassExpr> body;
+};
 struct ClassExpr {
-  std::variant<Tcl_structure, Tcl_fun, Tcl_ident, Tcl_constraint> desc;
+  std::variant<Tcl_structure, Tcl_fun, Tcl_ident, Tcl_constraint, Tcl_let> desc;
   Location loc;
 };
 struct ClassDeclaration {

@@ -858,13 +858,23 @@ struct Printer {
     }
     if (auto* m = std::get_if<Tcf_method>(&f.desc)) {
       line(i + 1, "Tcf_method \"" + m->name + "\" " + (m->private_ ? "Private" : "Public"));
-      line(i + 2, std::string("Concrete ") + (m->override_ ? "Override" : "Fresh"));
-      expression(i + 2, *m->expr);
+      if (m->virtual_) { line(i + 2, "Virtual"); core_type(i + 2, *m->vtype); }
+      else {
+        line(i + 2, std::string("Concrete ") + (m->override_ ? "Override" : "Fresh"));
+        expression(i + 2, *m->expr);
+      }
+    } else if (auto* c = std::get_if<Tcf_constraint>(&f.desc)) {
+      line(i + 1, "Tcf_constraint");
+      core_type(i + 2, c->t1);
+      core_type(i + 2, c->t2);
     } else {
       auto& v = std::get<Tcf_val>(f.desc);
       line(i + 1, "Tcf_val \"" + v.name + "\" " + (v.mutable_ ? "Mutable" : "Immutable"));
-      line(i + 2, std::string("Concrete ") + (v.override_ ? "Override" : "Fresh"));
-      expression(i + 2, *v.expr);
+      if (v.virtual_) { line(i + 2, "Virtual"); core_type(i + 2, *v.vtype); }
+      else {
+        line(i + 2, std::string("Concrete ") + (v.override_ ? "Override" : "Fresh"));
+        expression(i + 2, *v.expr);
+      }
     }
   }
   void class_expr(int i, const ClassExpr& ce) {
@@ -882,7 +892,26 @@ struct Printer {
       return;
     }
     if (auto* cn = std::get_if<Tcl_constraint>(&ce.desc)) {
-      class_expr(i + 1, *cn->ce);  // None constraint: nothing for itself, just recurse
+      if (cn->ct) {  // explicit `(ce : ct)`: label + inner class_expr + class_type
+        line(i + 1, "Tcl_constraint");
+        class_expr(i + 1, *cn->ce);
+        class_type(i + 1, *cn->ct);
+      } else {
+        class_expr(i + 1, *cn->ce);  // None constraint: nothing for itself, just recurse
+      }
+      return;
+    }
+    if (auto* lt = std::get_if<Tcl_let>(&ce.desc)) {
+      line(i + 1, std::string("Tcl_let ") +
+                      (lt->rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
+      list_bindings(i + 1, lt->rf, lt->bindings);
+      line(i + 1, "[");
+      for (auto& [id, e] : lt->ivars) {
+        line(i + 2, "<def> \"" + ident(id) + "\"");
+        expression(i + 3, *e);
+      }
+      line(i + 1, "]");
+      class_expr(i + 1, *lt->body);
       return;
     }
     auto& st = std::get<Tcl_structure>(ce.desc);

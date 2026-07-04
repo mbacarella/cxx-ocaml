@@ -2427,23 +2427,31 @@ struct Typer {
       tt::ClassField cf;
       cf.loc = f.loc;
       if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
-        auto* cc = std::get_if<Cfk_concrete>(&m->kind);
-        if (!cc) throw TypeError("virtual method");
         tt::Tcf_method tm;
         tm.name = m->name.txt;
         tm.private_ = m->priv == PrivateFlag::Private;
-        tm.override_ = cc->ovr == OverrideFlag::Override;
-        tm.expr = std::make_unique<tt::Expression>(
-            elaborate_method(*cc->e, self_n, cs.self.loc, self_name, meths));
+        if (auto* vk = std::get_if<Cfk_virtual>(&m->kind)) {  // method virtual m : t
+          tm.virtual_ = true;
+          tm.vtype = method_poly(*vk->type, f.loc, /*use_field_loc=*/false);
+        } else {
+          auto& cc = std::get<Cfk_concrete>(m->kind);
+          tm.override_ = cc.ovr == OverrideFlag::Override;
+          tm.expr = std::make_unique<tt::Expression>(
+              elaborate_method(*cc.e, self_n, cs.self.loc, self_name, meths));
+        }
         cf.desc = std::move(tm);
       } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
-        auto* cc = std::get_if<Cfk_concrete>(&v->kind);
-        if (!cc) throw TypeError("virtual val");
         tt::Tcf_val tv;
         tv.name = v->name.txt;
         tv.mutable_ = v->mut == MutableFlag::Mutable;
-        tv.override_ = cc->ovr == OverrideFlag::Override;
-        tv.expr = std::make_unique<tt::Expression>(expr(*cc->e));
+        if (auto* vk = std::get_if<Cfk_virtual>(&v->kind)) {  // val virtual v : t
+          tv.virtual_ = true;
+          tv.vtype = core_type(*vk->type);
+        } else {
+          auto& cc = std::get<Cfk_concrete>(v->kind);
+          tv.override_ = cc.ovr == OverrideFlag::Override;
+          tv.expr = std::make_unique<tt::Expression>(expr(*cc.e));
+        }
         cf.desc = std::move(tv);
       } else if (auto* in = std::get_if<Pcf_inherit>(&f.desc)) {
         tt::Tcf_inherit ti;
@@ -2455,6 +2463,11 @@ struct Typer {
         wrap.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(class_expr_t(*in->ce))};
         ti.ce = std::make_unique<tt::ClassExpr>(std::move(wrap));
         cf.desc = std::move(ti);
+      } else if (auto* c = std::get_if<Pcf_constraint>(&f.desc)) {
+        tt::Tcf_constraint tc;
+        tc.t1 = core_type(*c->t1);
+        tc.t2 = core_type(*c->t2);
+        cf.desc = std::move(tc);
       } else {
         throw TypeError("class_field#" + std::to_string(f.desc.index()));
       }
@@ -2501,7 +2514,52 @@ struct Typer {
       out.desc = std::move(ti);
       return out;
     }
+    if (auto* cn = std::get_if<Pcl_constraint>(&ce.desc)) {  // (ce : ct)
+      tt::ClassExpr out;
+      out.loc = ce.loc;
+      tt::Tcl_constraint tc;
+      tc.ce = std::make_unique<tt::ClassExpr>(class_expr_t(*cn->ce));
+      tc.ct = std::make_unique<tt::ClassType>(class_type_t(*cn->ct));
+      out.desc = std::move(tc);
+      return out;
+    }
+    if (auto* lt = std::get_if<Pcl_let>(&ce.desc)) {  // let [rec] .. in ce
+      tt::ClassExpr out;
+      out.loc = ce.loc;
+      tt::Tcl_let tl;
+      tl.rf = lt->rf;
+      // The let bindings are elaborated as ordinary value bindings; each bound
+      // variable is then captured as a fresh instance variable (l2) so method
+      // bodies see it, and shadowed as a local so the body's class_expr does not.
+      tl.bindings = value_bindings(lt->rf, lt->bindings);
+      std::vector<std::string> lvars;
+      for (auto& b : lt->bindings) collect_pat_vars(b.pat, lvars);
+      for (auto& nm : lvars) {
+        tt::Ident src = resolve_local_ident(nm);  // the let-bound var (Texp_ident)
+        tt::Ident iv = fresh_anon(nm);             // the instance-variable ident
+        auto e = std::make_unique<tt::Expression>();
+        e->loc = none_loc();
+        e->loc.ghost = true;
+        tt::Path p;
+        p.v = tt::Pident{src};
+        e->desc = tt::Texp_ident{p};
+        tl.ivars.emplace_back(iv, std::move(e));
+        scopes.back().erase(nm);
+        instvars_[nm] = iv;
+      }
+      tl.body = std::make_unique<tt::ClassExpr>(class_expr_t(*lt->body));
+      out.desc = std::move(tl);
+      return out;
+    }
     throw TypeError("class_expr#" + std::to_string(ce.desc.index()));
+  }
+  // Look up a just-bound local's ident (for class-let ivar rebinds).
+  tt::Ident resolve_local_ident(const std::string& name) {
+    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return f->second;
+    }
+    return fresh_anon(name);  // shouldn't happen for a just-bound let var
   }
   tt::ClassDeclaration class_declaration(const ast::ClassDeclaration& d) {
     tt::ClassDeclaration out;
@@ -2516,13 +2574,15 @@ struct Typer {
     instvars_ = std::move(saved_iv);
     return out;
   }
-  // A class-type method annotation is always a Ttyp_poly; a bare type is wrapped
-  // in Ttyp_poly([], _) whose loc is the enclosing field's location.
-  tt::CoreType method_poly(const CoreType& t, Location field_loc) {
+  // A method annotation is always a Ttyp_poly; a bare type is wrapped in
+  // Ttyp_poly([], _).  Class-type methods locate the wrapper at the field
+  // (use_field_loc); class-body virtual methods locate it at the inner type.
+  tt::CoreType method_poly(const CoreType& t, Location field_loc, bool use_field_loc = true) {
     if (std::holds_alternative<Ptyp_poly>(t.desc)) return core_type(t);
+    tt::CoreType inner = core_type(t);
     tt::CoreType poly;
-    poly.loc = field_loc;
-    poly.desc = tt::Ttyp_poly{{}, std::make_unique<tt::CoreType>(core_type(t))};
+    poly.loc = use_field_loc ? field_loc : inner.loc;
+    poly.desc = tt::Ttyp_poly{{}, std::make_unique<tt::CoreType>(std::move(inner))};
     return poly;
   }
   tt::ClassType class_type_t(const ast::ClassType& ct) {
