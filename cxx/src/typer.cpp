@@ -2551,6 +2551,50 @@ struct Typer {
     return out;
   }
 
+  // A structure whose inferred signature has a shadowed name (the same name
+  // bound twice in one namespace) is simplified, generating a coercion -- printed
+  // as a transparent extra module_expr layer (Tmodtype_implicit, pr5164).
+  bool structure_shadows(const std::vector<StructureItem>& items) {
+    std::set<std::string> vals, types, mods, modtypes;
+    auto dup = [](std::set<std::string>& s, const std::string& n) {
+      return !s.insert(n).second;
+    };
+    for (auto& it : items) {
+      if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
+        for (auto& b : sv->bindings) {
+          std::vector<std::string> vs;
+          collect_pat_vars(b.pat, vs);
+          for (auto& n : vs) if (dup(vals, n)) return true;
+        }
+      } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
+        if (dup(vals, pr->prim.name.txt)) return true;
+      } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+        for (auto& d : ty->decls) if (dup(types, d.name.txt)) return true;
+      } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+        if (mb->binding.name.txt && dup(mods, *mb->binding.name.txt)) return true;
+      } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
+        for (auto& b : rm->bindings)
+          if (b.name.txt && dup(mods, *b.name.txt)) return true;
+      } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
+        if (dup(modtypes, mt->name.txt)) return true;
+      }
+    }
+    return false;
+  }
+
+  // Wrap a global-rooted (cmi-loaded) module_expr ident in the transparent
+  // strengthening coercion layer; pass anything else through unchanged.
+  tt::ModuleExprBox strengthen_global(tt::ModuleExprBox me) {
+    if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc))
+      if (path_root_global(mi->path)) {
+        auto wrap = std::make_unique<tt::ModuleExpr>();
+        wrap->loc = me->loc;
+        wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
+        return wrap;
+      }
+    return me;
+  }
+
   tt::ModuleExpr module_expr(const ModuleExpr& me) {
     tt::ModuleExpr out;
     out.loc = me.loc;
@@ -2558,6 +2602,13 @@ struct Typer {
       out.desc = tt::Tmod_ident{resolve_module(mi->id.txt)};
     } else if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
       out.desc = tt::Tmod_structure{nested_structure(ms->items)};
+      if (structure_shadows(ms->items)) {  // implicit signature-simplify coercion
+        auto inner = std::make_unique<tt::ModuleExpr>(std::move(out));
+        inner->loc = me.loc;
+        out = tt::ModuleExpr{};
+        out.loc = me.loc;
+        out.desc = tt::Tmod_constraint{std::move(inner), nullptr, true};
+      }
     } else if (auto* fn = std::get_if<Pmod_functor>(&me.desc)) {
       tt::Tmod_functor tf;
       auto saved = module_scope;
@@ -2569,19 +2620,11 @@ struct Typer {
       module_scope = std::move(saved);
       out.desc = std::move(tf);
     } else if (auto* ap = std::get_if<Pmod_apply>(&me.desc)) {
-      auto fnme = std::make_unique<tt::ModuleExpr>(module_expr(*ap->f));
-      // A cmi-loaded (global-rooted) functor path carries an implicit
-      // strengthening coercion -- a transparent extra module_expr in the dump.
-      if (auto* mi = std::get_if<tt::Tmod_ident>(&fnme->desc))
-        if (path_root_global(mi->path)) {
-          auto wrap = std::make_unique<tt::ModuleExpr>();
-          wrap->loc = fnme->loc;
-          wrap->desc = tt::Tmod_constraint{std::move(fnme), nullptr, true};
-          fnme = std::move(wrap);
-        }
+      // A cmi-loaded (global-rooted) functor path AND argument each carry an
+      // implicit strengthening coercion -- a transparent extra module_expr layer.
       out.desc = tt::Tmod_apply{
-          std::move(fnme),
-          std::make_unique<tt::ModuleExpr>(module_expr(*ap->arg))};
+          strengthen_global(std::make_unique<tt::ModuleExpr>(module_expr(*ap->f))),
+          strengthen_global(std::make_unique<tt::ModuleExpr>(module_expr(*ap->arg)))};
     } else if (auto* cn = std::get_if<Pmod_constraint>(&me.desc)) {
       out.desc = tt::Tmod_constraint{
           std::make_unique<tt::ModuleExpr>(module_expr(*cn->me)),
