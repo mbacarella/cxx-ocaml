@@ -1270,6 +1270,7 @@ struct Typer {
     if (c.res) out.res = std::make_unique<tt::CoreType>(core_type(**c.res));
     if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
       if (t->elems.size() > 1) ctor_arity_[c.name.txt] = (int)t->elems.size();
+    if (!c.attrs.empty()) out.attrs = &c.attrs;
     return out;
   }
 
@@ -2789,6 +2790,7 @@ struct Typer {
     for (auto& f : cs.fields) {
       tt::ClassField cf;
       cf.loc = f.loc;
+      if (!f.attrs.empty()) cf.attrs = &f.attrs;
       if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
         tt::Tcf_method tm;
         tm.name = m->name.txt;

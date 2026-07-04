@@ -269,6 +269,7 @@ struct ConstructorDecl {
   std::vector<CoreTypeBox> args;  // Cstr_tuple argument types
   std::vector<LabelDecl> labels;  // Cstr_record (inline record); wins over args
   std::optional<CoreTypeBox> res; // GADT return type
+  const ast::Attributes* attrs = nullptr;
 };
 struct Ttype_abstract {};
 struct Ttype_variant { std::vector<ConstructorDecl> ctors; };
@@ -453,6 +454,7 @@ struct Tcf_initializer { ExprBox expr; };  // initializer e (elaborated `fun sel
 struct ClassField {
   std::variant<Tcf_val, Tcf_method, Tcf_inherit, Tcf_constraint, Tcf_initializer> desc;
   Location loc;
+  const ast::Attributes* attrs = nullptr;
 };
 struct ClassStructure {
   Box<Pattern> self;                 // synthesized self (Tpat_alias selfpat-* / Tpat_any)

@@ -211,6 +211,7 @@ struct Printer {
   void constructor_decl(int i, const ConstructorDecl& cd) {
     line(i, loc(cd.loc));
     line(i + 1, ident(cd.id));
+    if (cd.attrs) attributes(i, *cd.attrs);
     if (!cd.labels.empty()) {  // inline record: label decls instead of types
       line(i + 1, "[");
       for (auto& l : cd.labels) label_decl(i + 2, l);
@@ -879,6 +880,7 @@ struct Printer {
 
   void class_field(int i, const ClassField& f) {
     line(i, "class_field " + loc(f.loc));
+    if (f.attrs) attributes(i + 1, *f.attrs);
     if (auto* in = std::get_if<Tcf_inherit>(&f.desc)) {
       line(i + 1, std::string("Tcf_inherit ") + (in->override_ ? "Override" : "Fresh"));
       class_expr(i + 2, *in->ce);
