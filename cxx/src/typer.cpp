@@ -1007,6 +1007,7 @@ struct Typer {
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pat_irrefutable(*c->p);
     if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return pat_irrefutable(*lz->p);
     if (auto* op = std::get_if<Ppat_open>(&p.desc)) return pat_irrefutable(*op->p);
+    if (std::holds_alternative<Ppat_unpack>(p.desc)) return true;  // (module M)
     return false;
   }
 
