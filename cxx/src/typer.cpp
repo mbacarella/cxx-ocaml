@@ -903,7 +903,20 @@ struct Typer {
         p.v = tt::Pident{it->second};
         return p;
       }
+      // A class from an opened module resolves through the open's path.
+      for (auto rit = opens.rbegin(); rit != opens.rend(); ++rit)
+        if (rit->types.count(l->name)) {
+          tt::Path p;
+          p.v = tt::Pdot{std::make_shared<tt::Path>(rit->path), l->name};
+          return p;
+        }
       throw TypeError("Unbound class " + l->name);
+    }
+    if (auto* d = std::get_if<Ldot>(&lid.v)) {  // M.c class path
+      tt::Path prefix = resolve_module(*d->prefix);
+      tt::Path p;
+      p.v = tt::Pdot{std::make_shared<tt::Path>(std::move(prefix)), d->name};
+      return p;
     }
     throw TypeError("qualified class path");
   }
@@ -1093,12 +1106,16 @@ struct Typer {
       tt::Ttyp_variant tv;
       tv.closed = pv->closed == ClosedFlag::Closed;
       for (auto& row : pv->rows) {
-        auto* rt = std::get_if<Rtag>(&row);
-        if (!rt) throw TypeError("coretype#5-inherit");  // Rinherit row: defer
-        tt::Ttag tag{rt->name, rt->constant, {}};
-        for (auto& ty : rt->types)
-          tag.types.push_back(std::make_unique<tt::CoreType>(core_type(*ty)));
-        tv.tags.push_back(std::move(tag));
+        if (auto* rt = std::get_if<Rtag>(&row)) {
+          tt::Ttag tag{rt->name, rt->constant, {}};
+          for (auto& ty : rt->types)
+            tag.types.push_back(std::make_unique<tt::CoreType>(core_type(*ty)));
+          tv.rows.push_back({std::move(tag)});
+        } else {  // Rinherit: a `[ t | ... ]` inheritance row
+          auto& ri = std::get<Rinherit>(row);
+          tv.rows.push_back(
+              {tt::Tinherit{std::make_unique<tt::CoreType>(core_type(*ri.ct))}});
+        }
       }
       if (pv->labels) tv.labels = *pv->labels;
       out.desc = std::move(tv);
@@ -1106,10 +1123,12 @@ struct Typer {
       tt::Ttyp_object to;
       to.closed = ob->closed == ClosedFlag::Closed;
       for (auto& f : ob->fields) {
-        auto* ot = std::get_if<Otag>(&f);
-        if (!ot) throw TypeError("coretype#6-inherit");  // Oinherit row: defer
-        to.methods.emplace_back(ot->name.txt,
-                                std::make_unique<tt::CoreType>(poly_wrap(*ot->type)));
+        if (auto* ot = std::get_if<Otag>(&f))
+          to.fields.push_back({tt::OTmethod{
+              ot->name.txt, std::make_unique<tt::CoreType>(poly_wrap(*ot->type))}});
+        else
+          to.fields.push_back({tt::OTinherit{std::make_unique<tt::CoreType>(
+              core_type(*std::get<Oinherit>(f).type))}});
       }
       out.desc = std::move(to);
     } else if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) {

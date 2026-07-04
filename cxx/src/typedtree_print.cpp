@@ -163,18 +163,28 @@ struct Printer {
     } else if (auto* vr = std::get_if<Ttyp_variant>(&t.desc)) {
       line(j, std::string("Ttyp_variant closed=") + (vr->closed ? "Closed" : "Open"));
       line(j, "[");
-      for (auto& tg : vr->tags) {
-        line(j + 1, "Ttag \"" + tg.name + "\" " + (tg.constant ? "true" : "false"));
-        list_core_types(j + 2, tg.types);
+      for (auto& r : vr->rows) {
+        if (auto* tg = std::get_if<Ttag>(&r.v)) {
+          line(j + 1, "Ttag \"" + tg->name + "\" " + (tg->constant ? "true" : "false"));
+          list_core_types(j + 2, tg->types);
+        } else {
+          line(j + 1, "Tinherit");
+          core_type(j + 2, *std::get<Tinherit>(r.v).type);
+        }
       }
       line(j, "]");
       if (vr->labels) { line(j, "Some"); list_strings(j + 1, *vr->labels); }
       else line(j, "None");
     } else if (auto* ob = std::get_if<Ttyp_object>(&t.desc)) {
       line(j, std::string("Ttyp_object ") + (ob->closed ? "Closed" : "Open"));
-      for (auto& [name, ty] : ob->methods) {
-        line(j + 1, "method " + name);
-        core_type(j + 2, *ty);
+      for (auto& f : ob->fields) {
+        if (auto* m = std::get_if<OTmethod>(&f.v)) {
+          line(j + 1, "method " + m->name);
+          core_type(j + 2, *m->type);
+        } else {
+          line(j + 1, "OTinherit");
+          core_type(j + 2, *std::get<OTinherit>(f.v).type);
+        }
       }
     } else if (auto* pk = std::get_if<Ttyp_package>(&t.desc)) {
       line(j, "Ttyp_package");

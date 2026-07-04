@@ -55,18 +55,23 @@ struct Ttyp_constr { Path path; std::vector<CoreTypeBox> args; };
 struct Ttyp_class { Path path; std::vector<CoreTypeBox> args; };  // [args] #class
 struct Ttyp_poly { std::vector<std::string> vars; CoreTypeBox type; };
 struct Ttyp_alias { std::string name; CoreTypeBox type; };  // (t as 'name)
-struct Ttyp_object {  // < m : t ; ... >  (Otag methods only)
-  std::vector<std::pair<std::string, CoreTypeBox>> methods;  // name -> poly-wrapped type
+struct OTmethod { std::string name; CoreTypeBox type; };  // name -> poly-wrapped type
+struct OTinherit { CoreTypeBox type; };                   // < t ; ... >
+struct ObjField { std::variant<OTmethod, OTinherit> v; };
+struct Ttyp_object {  // < m : t ; t ; ... >
+  std::vector<ObjField> fields;
   bool closed = true;  // < .. > vs < .. ; .. >
 };
 struct Ttag { std::string name; bool constant; std::vector<CoreTypeBox> types; };
+struct Tinherit { CoreTypeBox type; };  // `[ t | ... ]` polyvariant inheritance row
+struct RowField { std::variant<Ttag, Tinherit> v; };
 struct PackageType {  // (module S with type t1 = u1 and ...)
   Path path;
   std::vector<std::pair<std::string, CoreTypeBox>> constraints;
 };
 struct Ttyp_package { PackageType pkg; };
-struct Ttyp_variant {  // [ `A | `B of t | ... ]  (Rtag rows only)
-  std::vector<Ttag> tags;
+struct Ttyp_variant {  // [ `A | `B of t | t | ... ]  (Ttag + Tinherit rows)
+  std::vector<RowField> rows;
   bool closed = true;  // Closed vs Open
   std::optional<std::vector<std::string>> labels;  // `[< .. > l]` present tags
 };
