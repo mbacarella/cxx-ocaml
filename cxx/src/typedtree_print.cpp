@@ -170,6 +170,9 @@ struct Printer {
         line(j + 1, "method " + name);
         core_type(j + 2, *ty);
       }
+    } else if (auto* pk = std::get_if<Ttyp_package>(&t.desc)) {
+      line(j, "Ttyp_package");
+      package_type(j, pk->pkg);
     } else {
       auto& p = std::get<Ttyp_poly>(t.desc);
       std::string s = "Ttyp_poly";
@@ -276,8 +279,14 @@ struct Printer {
     int j = i + 1;
     for (auto& ex : p.extras) {
       line(j, "extra " + loc(ex.loc));
-      line(j + 1, "Tpat_extra_constraint");
-      core_type(j + 1, ex.ctype);
+      if (ex.kind == PatExtra::Kind::Unpack) {
+        line(j + 1, "Tpat_extra_unpack");
+        if (ex.pkg) { line(j + 1, "Some"); package_type(j + 2, *ex.pkg); }
+        else line(j + 1, "None");
+      } else {
+        line(j + 1, "Tpat_extra_constraint");
+        core_type(j + 1, ex.ctype);
+      }
     }
     if (std::holds_alternative<Tpat_any>(p.desc)) {
       line(j, "Tpat_any");
@@ -319,6 +328,10 @@ struct Printer {
       line(j, "Tpat_array Mutable");
       if (ar->elems.empty()) line(j, "[]");
       else { line(j, "["); for (auto& el : ar->elems) pattern(j + 1, *el); line(j, "]"); }
+    } else if (auto* v = std::get_if<Tpat_variant>(&p.desc)) {
+      line(j, "Tpat_variant \"" + v->label + "\"");
+      if (v->arg) { line(j, "Some"); pattern(j + 1, *v->arg); }
+      else line(j, "None");
     } else if (auto* lz = std::get_if<Tpat_lazy>(&p.desc)) {
       line(j, "Tpat_lazy");
       pattern(j, *lz->inner);
@@ -438,7 +451,8 @@ struct Printer {
       line(j, m->partial ? "Texp_match (Partial)" : "Texp_match");
       expression(j, *m->scrut);
       list_cases(j, m->cases);
-      line(j, "[]");  // l2 (legacy second case list)
+      if (m->eff_cases.empty()) line(j, "[]");
+      else list_cases(j, m->eff_cases);
     } else if (auto* tr = std::get_if<Texp_try>(&e.desc)) {
       line(j, "Texp_try");
       expression(j, *tr->body);
@@ -515,6 +529,9 @@ struct Printer {
     } else if (auto* sd = std::get_if<Texp_send>(&e.desc)) {
       line(j, "Texp_send \"" + sd->meth + "\"");
       expression(j, *sd->obj);
+    } else if (auto* pk = std::get_if<Texp_pack>(&e.desc)) {
+      os << std::string(2 * j, ' ') << "Texp_pack";  // run-on: module_expr same line
+      module_expr(j, *pk->me);
     } else if (auto* ob = std::get_if<Texp_object>(&e.desc)) {
       os << std::string(2 * j, ' ') << "Texp_object";  // run-on: class_structure same line
       line(j, "class_structure");
@@ -572,6 +589,12 @@ struct Printer {
       line(j, "Tmod_apply");
       module_expr(j, *ap->fn);
       module_expr(j, *ap->arg);
+    } else if (auto* au = std::get_if<Tmod_apply_unit>(&me.desc)) {
+      line(j, "Tmod_apply_unit");
+      module_expr(j, *au->fn);
+    } else if (auto* up = std::get_if<Tmod_unpack>(&me.desc)) {
+      line(j, "Tmod_unpack");
+      expression(j, *up->e);
     } else {
       auto& cn = std::get<Tmod_constraint>(me.desc);
       if (cn.implicit) {  // transparent: just the inner module_expr (printtyped.ml)
@@ -692,6 +715,19 @@ struct Printer {
       auto& mt = std::get<Twith_modtype>(w.c);
       line(j, "Twith_modtype");
       module_type(j + 1, *mt.mt);
+    }
+  }
+
+  void package_type(int i, const PackageType& p) {
+    line(i, "package_type \"" + path_aux(p.path) + "\"");
+    if (p.constraints.empty()) line(i + 1, "[]");
+    else {
+      line(i + 1, "[");
+      for (auto& [n, ct] : p.constraints) {
+        line(i + 2, "with type " + n);
+        core_type(i + 2, *ct);
+      }
+      line(i + 1, "]");
     }
   }
 

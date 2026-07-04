@@ -58,6 +58,11 @@ struct Ttyp_object {  // < m : t ; ... >  (Otag methods only)
   bool closed = true;  // < .. > vs < .. ; .. >
 };
 struct Ttag { std::string name; bool constant; std::vector<CoreTypeBox> types; };
+struct PackageType {  // (module S with type t1 = u1 and ...)
+  Path path;
+  std::vector<std::pair<std::string, CoreTypeBox>> constraints;
+};
+struct Ttyp_package { PackageType pkg; };
 struct Ttyp_variant {  // [ `A | `B of t | ... ]  (Rtag rows only)
   std::vector<Ttag> tags;
   bool closed = true;  // Closed vs Open
@@ -65,7 +70,7 @@ struct Ttyp_variant {  // [ `A | `B of t | ... ]  (Rtag rows only)
 };
 struct CoreType {
   std::variant<Ttyp_any, Ttyp_var, Ttyp_arrow, Ttyp_tuple, Ttyp_constr, Ttyp_poly,
-               Ttyp_alias, Ttyp_variant, Ttyp_object>
+               Ttyp_alias, Ttyp_variant, Ttyp_object, Ttyp_package>
       desc;
   Location loc;
 };
@@ -96,16 +101,27 @@ struct Tpat_record {  // { l1 = p1; ... } -- only the written fields, in order
 };
 struct Tpat_array { std::vector<PatBox> elems; };  // [| ... |] (always Mutable)
 struct Tpat_lazy { PatBox inner; };                // lazy p
-struct PatExtra { CoreType ctype; Location loc; };  // Tpat_extra_constraint
+struct Tpat_variant { std::string label; PatBox arg; };  // `Tag [p]; null = no payload
+struct PatExtra {  // Tpat_extra_constraint / Tpat_extra_unpack
+  enum class Kind { Constraint, Unpack } kind = Kind::Constraint;
+  CoreType ctype;                  // Constraint
+  std::optional<PackageType> pkg;  // Unpack: `(module M : S)`; nullopt = untyped
+  Location loc;
+};
 struct Pattern {
   std::variant<Tpat_any, Tpat_var, Tpat_constant, Tpat_construct, Tpat_value,
                Tpat_tuple, Tpat_exception, Tpat_or, Tpat_alias, Tpat_record,
-               Tpat_array, Tpat_lazy>
+               Tpat_array, Tpat_lazy, Tpat_variant>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
   std::vector<PatExtra> extras;
 };
+
+// Module expressions are mutually recursive with structures and expressions,
+// so ModuleExpr is defined last and referenced through a box.
+struct ModuleExpr;
+using ModuleExprBox = Box<ModuleExpr>;
 
 // --- expressions ---
 struct Texp_constant { Constant c; };
@@ -143,7 +159,13 @@ struct Texp_let {
 };
 struct Texp_ifthenelse { ExprBox cond; ExprBox then_; std::optional<ExprBox> else_; };
 struct Texp_sequence { ExprBox e1; ExprBox e2; };
-struct Texp_match { ExprBox scrut; std::vector<Case> cases; bool partial = false; };
+struct Texp_match {
+  ExprBox scrut;
+  std::vector<Case> cases;      // value/exception (computation) cases
+  std::vector<Case> eff_cases;  // `effect P, k` cases: lhs is the effect
+                                // pattern; k binds invisibly (dump omits it)
+  bool partial = false;
+};
 struct Texp_try { ExprBox body; std::vector<Case> cases; };     // cases are value
 struct Texp_construct { std::string name; std::vector<ExprBox> args; };
 struct Texp_array { std::vector<ExprBox> elems; };
@@ -168,6 +190,7 @@ struct ClassStructure;
 struct Texp_object { Box<ClassStructure> cs; };  // object … end (an expression)
 // `let module/open/exception … in e` (fork): an embedded structure item + body.
 struct Texp_struct_item { Box<StructureItem> item; ExprBox body; };
+struct Texp_pack { ModuleExprBox me; };  // (module ME [: S])
 struct ExprExtra {  // Texp_constraint / Texp_coerce / Texp_poly / Texp_newtype
   enum class Kind { Constraint, Coerce, Poly, Newtype } kind = Kind::Constraint;
   CoreType ctype;                 // constraint type, or coerce TARGET type
@@ -181,7 +204,8 @@ struct Expression {
                Texp_let, Texp_ifthenelse, Texp_sequence, Texp_match, Texp_try,
                Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
                Texp_while, Texp_record, Texp_field, Texp_setfield, Texp_variant,
-               Texp_instvar, Texp_send, Texp_object, Texp_struct_item>
+               Texp_instvar, Texp_send, Texp_object, Texp_struct_item,
+               Texp_pack>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
@@ -239,10 +263,6 @@ struct ValueDesc {
   const ast::Attributes* attrs = nullptr;
 };
 
-// Module expressions are mutually recursive with structures and module types,
-// so ModuleExpr is defined after StructureItem and referenced through a box.
-struct ModuleExpr;
-using ModuleExprBox = Box<ModuleExpr>;
 struct ModuleType;
 using ModuleTypeBox2 = Box<ModuleType>;
 
@@ -429,9 +449,11 @@ struct Tmod_apply { ModuleExprBox fn; ModuleExprBox arg; };
 // cmi-loaded functor in `Set.Make(..)`): printed as a transparent extra
 // module_expr layer, with no "Tmod_constraint" label and no module_type.
 struct Tmod_constraint { ModuleExprBox expr; ModuleTypeBox2 type; bool implicit = false; };
+struct Tmod_unpack { ExprBox e; };       // (val e [: S])
+struct Tmod_apply_unit { ModuleExprBox fn; };  // F ()
 struct ModuleExpr {
   std::variant<Tmod_ident, Tmod_structure, Tmod_functor, Tmod_apply,
-               Tmod_constraint>
+               Tmod_constraint, Tmod_unpack, Tmod_apply_unit>
       desc;
   Location loc;
 };

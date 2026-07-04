@@ -931,6 +931,15 @@ struct Typer {
     throw TypeError("unsupported type path");
   }
 
+  tt::PackageType package_type(const Ptyp_package& p) {
+    tt::PackageType out;
+    out.path = resolve_modtype(p.path.txt);
+    for (auto& [lid, ct] : p.constraints)
+      out.constraints.emplace_back(
+          lid_str(lid.txt), std::make_unique<tt::CoreType>(core_type(*ct)));
+    return out;
+  }
+
   tt::CoreType core_type(const CoreType& t) {
     tt::CoreType out;
     out.loc = t.loc;
@@ -986,6 +995,8 @@ struct Typer {
                                 std::make_unique<tt::CoreType>(poly_wrap(*ot->type)));
       }
       out.desc = std::move(to);
+    } else if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) {
+      out.desc = tt::Ttyp_package{package_type(*pk)};
     } else {
       throw TypeError("coretype#" + std::to_string(t.desc.index()));
     }
@@ -1268,7 +1279,10 @@ struct Typer {
       out.desc = std::move(ta);
     } else if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
       out = pattern(*ct->p);  // become inner pattern; record constraint as extra
-      out.extras.push_back(tt::PatExtra{core_type(*ct->t), p.loc});
+      tt::PatExtra ex;
+      ex.ctype = core_type(*ct->t);
+      ex.loc = p.loc;
+      out.extras.push_back(std::move(ex));
     } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
       tt::Tpat_record tr;  // only the written fields, in order (label = last comp)
       for (auto& [lid, sub] : r->fields)
@@ -1281,6 +1295,24 @@ struct Typer {
       out.desc = std::move(ta);
     } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
       out.desc = tt::Tpat_lazy{std::make_unique<tt::Pattern>(pattern(*lz->p))};
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      tt::Tpat_variant tv;
+      tv.label = v->label;
+      if (v->arg) tv.arg = std::make_unique<tt::Pattern>(pattern(**v->arg));
+      out.desc = std::move(tv);
+    } else if (auto* up = std::get_if<Ppat_unpack>(&p.desc)) {
+      tt::PatExtra ex;
+      ex.kind = tt::PatExtra::Kind::Unpack;
+      if (up->pkg) ex.pkg = package_type(*up->pkg);
+      ex.loc = p.loc;
+      out.extras.push_back(std::move(ex));
+      if (up->name.txt) {
+        tt::Tpat_var tv;
+        tv.id = fresh_module(*up->name.txt);  // binds a module for the body
+        out.desc = std::move(tv);
+      } else {
+        out.desc = tt::Tpat_any{};
+      }
     } else {
       throw TypeError("pat#" + std::to_string(p.desc.index()));
     }
@@ -1456,7 +1488,23 @@ struct Typer {
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       tt::Texp_match tm;
       tm.scrut = std::make_unique<tt::Expression>(expr(*m->e));
-      for (auto& c : m->cases) tm.cases.push_back(case_(c, /*computation=*/true));
+      for (auto& c : m->cases) {
+        if (auto* pe = std::get_if<Ppat_effect>(&c.lhs.desc)) {
+          // `| effect P, k ->`: the case's printed lhs is the effect pattern;
+          // the continuation variable binds for the rhs but is not dumped.
+          push();
+          tt::Case cs;
+          cs.lhs = pattern(*pe->eff);
+          if (auto* kv = std::get_if<Ppat_var>(&pe->cont->desc))
+            fresh_local(kv->name.txt);
+          if (c.guard) cs.guard = std::make_unique<tt::Expression>(expr(**c.guard));
+          cs.rhs = std::make_unique<tt::Expression>(expr(*c.rhs));
+          pop();
+          tm.eff_cases.push_back(std::move(cs));
+          continue;
+        }
+        tm.cases.push_back(case_(c, /*computation=*/true));
+      }
       if (partiality) {
         auto it = partiality->find(&e);
         tm.partial = it != partiality->end() && it->second;
@@ -1467,6 +1515,27 @@ struct Typer {
       tt2.body = std::make_unique<tt::Expression>(expr(*tr->e));
       for (auto& c : tr->cases) tt2.cases.push_back(case_(c, /*computation=*/false));
       out.desc = std::move(tt2);
+    } else if (auto* pk = std::get_if<Pexp_pack>(&e.desc)) {
+      auto me = std::make_unique<tt::ModuleExpr>(module_expr(*pk->me));
+      if (pk->pkg) {
+        // `(module M : S)`: the ascription coerces the ident behind a
+        // transparent constraint and prints as a Ttyp_package Texp_constraint.
+        if (std::holds_alternative<tt::Tmod_ident>(me->desc)) {
+          auto wrap = std::make_unique<tt::ModuleExpr>();
+          wrap->loc = me->loc;
+          wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
+          me = std::move(wrap);
+        }
+        tt::ExprExtra ex;
+        ex.kind = tt::ExprExtra::Kind::Constraint;
+        tt::CoreType ct;
+        ct.loc = pk->pkg->path.loc;
+        ct.desc = tt::Ttyp_package{package_type(*pk->pkg)};
+        ex.ctype = std::move(ct);
+        ex.loc = e.loc;
+        out.extras.push_back(std::move(ex));
+      }
+      out.desc = tt::Texp_pack{std::move(me)};
     } else if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
       tt::Texp_construct tc;
       tc.name = lid_str(k->id.txt);
@@ -1627,6 +1696,7 @@ struct Typer {
     tt::Texp_function fn;
     push();
     auto saved_types = type_scope;
+    auto saved_modules = module_scope;  // (module M) params end with the body
     for (auto& param : f.params) {
       if (auto* nt = std::get_if<Pparam_newtype>(&param.desc)) {
         fresh_type(nt->name.txt);
@@ -1676,6 +1746,7 @@ struct Typer {
     }
     pop();
     type_scope = std::move(saved_types);  // (type a) bindings end here
+    module_scope = std::move(saved_modules);
     return fn;
   }
 
@@ -1971,6 +2042,18 @@ struct Typer {
       out.desc = tt::Tmod_constraint{
           std::make_unique<tt::ModuleExpr>(module_expr(*cn->me)),
           std::make_unique<tt::ModuleType>(module_type_t(*cn->mt))};
+    } else if (auto* au = std::get_if<Pmod_apply_unit>(&me.desc)) {
+      auto fnme = std::make_unique<tt::ModuleExpr>(module_expr(*au->f));
+      if (auto* mi = std::get_if<tt::Tmod_ident>(&fnme->desc))
+        if (path_root_global(mi->path)) {  // same strengthening as Tmod_apply
+          auto wrap = std::make_unique<tt::ModuleExpr>();
+          wrap->loc = fnme->loc;
+          wrap->desc = tt::Tmod_constraint{std::move(fnme), nullptr, true};
+          fnme = std::move(wrap);
+        }
+      out.desc = tt::Tmod_apply_unit{std::move(fnme)};
+    } else if (auto* up = std::get_if<Pmod_unpack>(&me.desc)) {
+      out.desc = tt::Tmod_unpack{std::make_unique<tt::Expression>(expr(*up->e))};
     } else {
       throw TypeError("module_expr#" + std::to_string(me.desc.index()));
     }
