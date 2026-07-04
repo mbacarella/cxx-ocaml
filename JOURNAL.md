@@ -3341,3 +3341,48 @@ Four more commits (a01006a158, 76839ab564, 1e1dc32068 + this doc):
 Remainder now 63 c++-err + 65 DIFF; the class-language cluster is the one
 big block left (Pexp_new/object/self, Pstr_class_type, Tcl_*/Tcf_* gaps,
 class row types) -- open that front next session.  Gates flat all day.
+
+--------------------------------------------------------------------------------
+Track-2 continuation, class cluster: 617 -> 633 (82.8% -> 85.0% of oracle-typed)
+--------------------------------------------------------------------------------
+Six commits.  Opened and largely cleared the class-language cluster; c++-err
+63 -> 38.  New constructs (all with the Tcl_/Tcf_/Tcty_/Tctf_ typedtree nodes +
+printtyped-exact printers):
+
+- Pexp_new (Texp_new, class path).  Object self binding: a named `(self)` binds
+  in method bodies; `self#m` emits Tmeth_val with a per-class shared meth ident
+  (the "meths" table), every other send Tmeth_name (rule from typecore: Tmeth_val
+  iff the object IS the self ident).  Method type annotations always wrap in
+  Ttyp_poly (this also un-masked several files).
+- Full class-TYPE tree: Tstr_class_type / Tsig_class (prints "class_description"
+  WITH attrs) / Tsig_class_type ("class_type_declaration", NO attrs); Tcty_constr
+  /signature/arrow; Tctf_inherit/val/method/constraint; pci_params.  A class or
+  class type also introduces an OBJECT TYPE CONSTRUCTOR (type_scope) so `'a c`
+  resolves; `#t` is Ttyp_class via resolve_class (which now takes M.c and opened
+  classes).  Class-type method poly wrapper locates at the FIELD; class-body
+  virtual method at the INNER type (an inconsistency in printtyped -- reproduce).
+- Pcl_let (let-in-class; each let var re-exposed as an instance var, the l2
+  list), Pcl_constraint(Some ct -> label+ce+class_type; None -> recurse only),
+  Pcl_open, Pcl_apply (applied class coerced via Tcl_constraint None, like a
+  parent).  Pcf_constraint, Pcf_initializer (elaborated `fun self -> e` with NO
+  Texp_poly and a non-ghost fn loc), virtual method/val (Virtual + core_type).
+- Polyvariant/object INHERIT rows: Ttyp_variant + Ttyp_object now carry
+  interleaved Ttag/Tinherit and method/OTinherit rows.
+- Ppat_type (`#t`): expands to the or-pattern of the abbreviation's tags, SORTED
+  BY OCaml's polyvariant tag hash (btype hash_variant), seeded from the first and
+  wrapped -> prints reverse-hash order; ghost Tpat_variant nodes (Some Tpat_any
+  for a tag with an arg) + a Tpat_extra_type.  Local abbrevs record their tag set
+  at type_declaration (Rinherit flattens through the referenced local type).
+- `function .. : t` return constraint now wraps the Tfunction_cases node in a
+  Texp_constraint/Texp_coerce extra (the Pfunction_body path already did).
+
+New MATCHes: t301-object, backtrace/methods, pr7293_ok, pr5156_ok, pr4824_ok,
+t13ok, class_2, t01, mixin, privrowsabate_ok (+ ~20 class unit tests).  Gates
+flat throughout (accept 36, reject 1, sig/lambda unchanged).
+
+Deferred (documented, each few files): class INHERITANCE (inherited instvars/
+methods/`super#`, intext/intext_par/woodyatt); imported-type `#t` (cmi pv_tags,
+pr11887); Param_pat polyvariant partiality (needs real exhaustiveness, mixin2/3);
+nested Tcl_let structure (toplevel_lets); ptype_constraints (range_intf); and the
+usual pre-existing non-class diffs (explicit-poly let on the pattern, first-class
+module params, constructor [@attr]).
