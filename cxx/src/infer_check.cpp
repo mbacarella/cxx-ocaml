@@ -4382,6 +4382,17 @@ struct Checker {
                 }
           }
       }
+      // Record an EXTERNAL record type's declared field order so the transcriber
+      // emits fields in decl order (not source order) -- e.g. a plain
+      // `{ MP.alloc_minor; promote; alloc_major; ... }` from a cmi record.
+      // Local records already carry their order in the transcriber's registry.
+      if (recTy) {
+        TypePtr rb = I::Engine::repr(recTy);
+        if (rb->kind == I::Type::Kind::Constr) {
+          auto fs = cmi_record_fields(rb->path);
+          if (!fs.empty()) record_fields[&e] = std::move(fs);
+        }
+      }
       return recTy ? recTy : eng.any();
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
