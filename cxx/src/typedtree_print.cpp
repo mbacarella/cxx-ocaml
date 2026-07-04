@@ -266,7 +266,13 @@ struct Printer {
       return;
     }
     line(i + 2, "Text_decl");
-    list_core_types(i + 3, c.args);
+    if (!c.labels.empty()) {  // inline record: label decls instead of types
+      line(i + 3, "[");
+      for (auto& l : c.labels) label_decl(i + 4, l);
+      line(i + 3, "]");
+    } else {
+      list_core_types(i + 3, c.args);
+    }
     if (c.res) { line(i + 3, "Some"); core_type(i + 4, **c.res); }
     else line(i + 3, "None");
   }
@@ -552,6 +558,19 @@ struct Printer {
     } else if (auto* pk = std::get_if<Texp_pack>(&e.desc)) {
       os << std::string(2 * j, ' ') << "Texp_pack";  // run-on: module_expr same line
       module_expr(j, *pk->me);
+    } else if (std::holds_alternative<Texp_unreachable>(e.desc)) {
+      os << std::string(2 * j, ' ') << "Texp_unreachable";  // run-on, no newline
+    } else if (auto* lo = std::get_if<Texp_letop>(&e.desc)) {
+      os << std::string(2 * j, ' ')  // run-on: binding_op continues the line
+         << (lo->partial ? "Texp_letop (Partial)" : "Texp_letop");
+      binding_op(j + 1, lo->let_);
+      if (lo->ands.empty()) line(j + 1, "[]");
+      else {
+        line(j + 1, "[");
+        for (auto& a : lo->ands) binding_op(j + 2, a);
+        line(j + 1, "]");
+      }
+      case_(j, *lo->body);
     } else if (auto* ob = std::get_if<Texp_object>(&e.desc)) {
       os << std::string(2 * j, ' ') << "Texp_object";  // run-on: class_structure same line
       line(j, "class_structure");
@@ -562,6 +581,11 @@ struct Printer {
       structure_item(j, *si.item);
       expression(j, *si.body);
     }
+  }
+
+  void binding_op(int i, const BindingOp& b) {
+    line(i, "binding_op \"" + path_aux(b.path) + "\" " + loc(b.loc));
+    expression(i, *b.exp);
   }
 
   void list_cases(int i, const std::vector<Case>& cases) {

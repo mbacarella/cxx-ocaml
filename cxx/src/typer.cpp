@@ -1146,7 +1146,11 @@ struct Typer {
     out.loc = c.loc;
     out.id = fresh_anon(c.name.txt);
     if (auto* decl = std::get_if<Pext_decl>(&c.kind)) {
-      out.args = ctor_args(decl->args);
+      if (auto* r = std::get_if<Pcstr_record>(&decl->args)) {
+        for (auto& f : r->fields) out.labels.push_back(label_decl(f));
+      } else {
+        out.args = ctor_args(decl->args);
+      }
       if (decl->res)
         out.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
     } else {
@@ -1480,6 +1484,11 @@ struct Typer {
   tt::Pattern to_computation(const Pattern& p) {
     tt::Pattern out;
     out.loc = p.loc;
+    // `exception P [@attr]` / or-pattern attrs live on the computation node;
+    // the value branch delegates to pattern(), which carries them itself.
+    if (!p.attrs.empty() && (std::holds_alternative<Ppat_or>(p.desc) ||
+                             std::holds_alternative<Ppat_exception>(p.desc)))
+      out.attrs = &p.attrs;
     if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
       out.desc = tt::Tpat_or{std::make_unique<tt::Pattern>(to_computation(*o->l)),
                              std::make_unique<tt::Pattern>(to_computation(*o->r))};
@@ -1671,6 +1680,45 @@ struct Typer {
       tt2.body = std::make_unique<tt::Expression>(expr(*tr->e));
       for (auto& c : tr->cases) tt2.cases.push_back(case_(c, /*computation=*/false));
       out.desc = std::move(tt2);
+    } else if (std::holds_alternative<Pexp_unreachable>(e.desc)) {
+      out.desc = tt::Texp_unreachable{};
+    } else if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) {
+      tt::Texp_letop tl;
+      auto bop = [&](const BindingOp& b) {
+        tt::BindingOp bo;
+        Longident lid;
+        lid.v = Lident{b.op.txt};
+        bo.path = resolve_value(lid, b.op.loc.start.cnum);
+        bo.loc = b.loc;
+        bo.exp = std::make_unique<tt::Expression>(expr(*b.exp));
+        return bo;
+      };
+      tl.let_ = bop(lo->let_);
+      for (auto& a : lo->ands) tl.ands.push_back(bop(a));
+      bool irr = pat_irrefutable(lo->let_.pat);
+      for (auto& a : lo->ands) irr = irr && pat_irrefutable(a.pat);
+      tl.partial = !irr;
+      push();
+      tt::Case cs;
+      // Joined pattern: each `and+` pairs with the accumulated pattern in a
+      // LEFT-nested ghost 2-tuple at the leading operator's location.
+      tt::Pattern acc = pattern(lo->let_.pat);
+      for (auto& a : lo->ands) {
+        tt::Tpat_tuple tup;
+        tup.elems.emplace_back(std::nullopt,
+                               std::make_unique<tt::Pattern>(std::move(acc)));
+        tup.elems.emplace_back(std::nullopt,
+                               std::make_unique<tt::Pattern>(pattern(a.pat)));
+        acc = tt::Pattern{};
+        acc.loc = lo->let_.op.loc;
+        acc.loc.ghost = true;
+        acc.desc = std::move(tup);
+      }
+      cs.lhs = std::move(acc);
+      cs.rhs = std::make_unique<tt::Expression>(expr(*lo->body));
+      pop();
+      tl.body = std::make_unique<tt::Case>(std::move(cs));
+      out.desc = std::move(tl);
     } else if (auto* pk = std::get_if<Pexp_pack>(&e.desc)) {
       auto me = std::make_unique<tt::ModuleExpr>(module_expr(*pk->me));
       if (pk->pkg) {

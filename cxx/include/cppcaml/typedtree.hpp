@@ -194,6 +194,18 @@ struct Texp_object { Box<ClassStructure> cs; };  // object … end (an expressio
 // `let module/open/exception … in e` (fork): an embedded structure item + body.
 struct Texp_struct_item { Box<StructureItem> item; ExprBox body; };
 struct Texp_pack { ModuleExprBox me; };  // (module ME [: S])
+struct BindingOp {  // one `let+`/`and+` binding: the operator path + rhs
+  Path path;
+  Location loc;
+  ExprBox exp;
+};
+struct Texp_letop {
+  BindingOp let_;
+  std::vector<BindingOp> ands;
+  Box<struct Case> body;  // single case: joined pattern -> body
+  bool partial = false;
+};
+struct Texp_unreachable {};  // `.` refutation case
 struct ExprExtra {  // Texp_constraint / Texp_coerce / Texp_poly / Texp_newtype
   enum class Kind { Constraint, Coerce, Poly, Newtype } kind = Kind::Constraint;
   CoreType ctype;                 // constraint type, or coerce TARGET type
@@ -208,7 +220,7 @@ struct Expression {
                Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
                Texp_while, Texp_record, Texp_field, Texp_setfield, Texp_variant,
                Texp_instvar, Texp_send, Texp_object, Texp_struct_item,
-               Texp_pack>
+               Texp_pack, Texp_letop, Texp_unreachable>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
@@ -275,6 +287,7 @@ struct ExtCtor {
   Location loc;
   Ident id;
   std::vector<CoreTypeBox> args;
+  std::vector<LabelDecl> labels;  // Cstr_record (inline record); wins over args
   std::optional<CoreTypeBox> res;
   std::optional<Path> rebind;  // Text_rebind (`exception E = F`); wins over args
   const ast::Attributes* attrs = nullptr;
