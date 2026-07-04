@@ -2555,31 +2555,47 @@ struct Typer {
   // A structure whose inferred signature has a shadowed name (the same name
   // bound twice in one namespace) is simplified, generating a coercion -- printed
   // as a transparent extra module_expr layer (Tmodtype_implicit, pr5164).
-  bool structure_shadows(const std::vector<StructureItem>& items) {
+  struct ShadowSets {
     std::set<std::string> vals, types, mods, modtypes;
-    auto dup = [](std::set<std::string>& s, const std::string& n) {
-      return !s.insert(n).second;
+  };
+  // Add an item's exported names to `s`, returning true as soon as any name
+  // collides with one already present (a signature-simplify duplicate).  An
+  // `open struct ... end` contributes the names of the anonymous structure,
+  // which is how private helpers shadow earlier bindings.
+  bool shadow_scan_item(const StructureItem& it, ShadowSets& s) {
+    auto dup = [](std::set<std::string>& set, const std::string& n) {
+      return !set.insert(n).second;
     };
-    for (auto& it : items) {
-      if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
-        for (auto& b : sv->bindings) {
-          std::vector<std::string> vs;
-          collect_pat_vars(b.pat, vs);
-          for (auto& n : vs) if (dup(vals, n)) return true;
-        }
-      } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
-        if (dup(vals, pr->prim.name.txt)) return true;
-      } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
-        for (auto& d : ty->decls) if (dup(types, d.name.txt)) return true;
-      } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
-        if (mb->binding.name.txt && dup(mods, *mb->binding.name.txt)) return true;
-      } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
-        for (auto& b : rm->bindings)
-          if (b.name.txt && dup(mods, *b.name.txt)) return true;
-      } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
-        if (dup(modtypes, mt->name.txt)) return true;
+    if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
+      for (auto& b : sv->bindings) {
+        std::vector<std::string> vs;
+        collect_pat_vars(b.pat, vs);
+        for (auto& n : vs) if (dup(s.vals, n)) return true;
       }
+    } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
+      if (dup(s.vals, pr->prim.name.txt)) return true;
+    } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+      for (auto& d : ty->decls) if (dup(s.types, d.name.txt)) return true;
+    } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+      if (mb->binding.name.txt && dup(s.mods, *mb->binding.name.txt)) return true;
+    } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
+      for (auto& b : rm->bindings)
+        if (b.name.txt && dup(s.mods, *b.name.txt)) return true;
+    } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
+      if (dup(s.modtypes, mt->name.txt)) return true;
+    } else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
+      // `open struct ... end` introduces the anonymous structure's bindings as
+      // hidden/removable signature items, so any non-empty one forces the
+      // signature-simplify coercion even when no name actually clashes.
+      if (auto* ms = std::get_if<Pmod_structure>(&op->expr.desc))
+        if (!ms->items.empty()) return true;
     }
+    return false;
+  }
+  bool structure_shadows(const std::vector<StructureItem>& items) {
+    ShadowSets s;
+    for (auto& it : items)
+      if (shadow_scan_item(it, s)) return true;
     return false;
   }
 
@@ -2631,6 +2647,9 @@ struct Typer {
           std::make_unique<tt::ModuleExpr>(module_expr(*cn->me)),
           std::make_unique<tt::ModuleType>(module_type_t(*cn->mt))};
     } else if (auto* au = std::get_if<Pmod_apply_unit>(&me.desc)) {
+      // OCaml's type_application gives the apply-unit node the functor's own
+      // location, not the parse span that also covers the `()`.
+      out.loc = au->f->loc;
       auto fnme = std::make_unique<tt::ModuleExpr>(module_expr(*au->f));
       if (auto* mi = std::get_if<tt::Tmod_ident>(&fnme->desc))
         if (path_root_global(mi->path)) {  // same strengthening as Tmod_apply
