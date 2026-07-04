@@ -395,28 +395,29 @@ struct Printer {
     expression(i + 1, *c.rhs);
   }
 
+  void expr_extra(int j, const ExprExtra& ex) {
+    line(j, "extra " + loc(ex.loc));
+    if (ex.kind == ExprExtra::Kind::Coerce) {
+      line(j + 1, "Texp_coerce");
+      if (ex.from) { line(j + 1, "Some"); core_type(j + 2, *ex.from); }
+      else line(j + 1, "None");
+      core_type(j + 1, ex.ctype);
+    } else if (ex.kind == ExprExtra::Kind::Poly) {
+      line(j + 1, "Texp_poly");
+      if (ex.poly_has_type) { line(j + 1, "Some"); core_type(j + 2, ex.ctype); }
+      else line(j + 1, "None");
+    } else if (ex.kind == ExprExtra::Kind::Newtype) {
+      line(j + 1, "Texp_newtype \"" + ex.newtype + "\"");
+    } else {
+      line(j + 1, "Texp_constraint");
+      core_type(j + 1, ex.ctype);
+    }
+  }
   void expression(int i, const Expression& e) {
     line(i, "expression " + loc(e.loc));
     if (e.attrs) attributes(i, *e.attrs);
     int j = i + 1;
-    for (auto& ex : e.extras) {
-      line(j, "extra " + loc(ex.loc));
-      if (ex.kind == ExprExtra::Kind::Coerce) {
-        line(j + 1, "Texp_coerce");
-        if (ex.from) { line(j + 1, "Some"); core_type(j + 2, *ex.from); }
-        else line(j + 1, "None");
-        core_type(j + 1, ex.ctype);
-      } else if (ex.kind == ExprExtra::Kind::Poly) {
-        line(j + 1, "Texp_poly");
-        if (ex.poly_has_type) { line(j + 1, "Some"); core_type(j + 2, ex.ctype); }
-        else line(j + 1, "None");
-      } else if (ex.kind == ExprExtra::Kind::Newtype) {
-        line(j + 1, "Texp_newtype \"" + ex.newtype + "\"");
-      } else {
-        line(j + 1, "Texp_constraint");
-        core_type(j + 1, ex.ctype);
-      }
-    }
+    for (auto& ex : e.extras) expr_extra(j, ex);
     if (auto* c = std::get_if<Texp_constant>(&e.desc)) {
       constant(j, "Texp_constant ", c->c);
     } else if (auto* id = std::get_if<Texp_ident>(&e.desc)) {
@@ -463,6 +464,7 @@ struct Printer {
       if (fn->is_cases) {
         line(j, "Tfunction_cases " + loc(fn->cases_loc));
         if (fn->cases_attrs) attributes(j + 1, *fn->cases_attrs);
+        for (auto& ex : fn->cases_extras) expr_extra(j + 1, ex);
         list_cases(j + 1, fn->cases);
       } else {
         line(j, "Tfunction_body");

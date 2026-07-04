@@ -899,6 +899,14 @@ struct Typer {
   // a `#t` pattern expands to the or-pattern of these tags.
   struct PolyTag { std::string name; bool has_arg; };
   std::unordered_map<int, std::vector<PolyTag>> polyvar_tags_;  // type-ident stamp -> tags
+  // OCaml's polymorphic-variant tag hash (btype.ml hash_variant): rows sort by it.
+  static int hash_variant(const std::string& s) {
+    unsigned accu = 0;
+    for (char c : s) accu = 223 * accu + static_cast<unsigned char>(c);
+    accu &= (1u << 31) - 1;
+    return accu > 0x3FFFFFFF ? static_cast<int>(accu) - (1 << 31)
+                             : static_cast<int>(accu);
+  }
   tt::Path resolve_class(const Longident& lid) {
     if (auto* l = std::get_if<Lident>(&lid.v)) {
       auto it = class_scope_.find(l->name);
@@ -1544,6 +1552,14 @@ struct Typer {
         if (f != polyvar_tags_.end()) tags = &f->second;
       }
       if (!tags || tags->empty()) throw TypeError("pat#type unknown tags");
+      // Polyvariant rows are ordered by tag hash; the or-pattern is seeded from
+      // the first and wraps each later tag, so it prints in reverse-hash order.
+      std::vector<PolyTag> ordered(*tags);
+      std::stable_sort(ordered.begin(), ordered.end(),
+                       [](const PolyTag& a, const PolyTag& b) {
+                         return hash_variant(a.name) < hash_variant(b.name);
+                       });
+      tags = &ordered;
       Location gloc = p.loc;
       gloc.ghost = true;
       auto mk_variant = [&](const PolyTag& t) {
@@ -2062,6 +2078,22 @@ struct Typer {
       fn.is_cases = true;
       fn.cases_loc = fc.loc;
       fn.cases_attrs = &fc.attrs;
+      // A `function .. : t` return-type annotation wraps the cases node in a
+      // Texp_constraint / Texp_coerce extra (at the cases location).
+      if (f.constraint_) {
+        tt::ExprExtra ex;
+        ex.loc = fc.loc;
+        if (auto* pc = std::get_if<Pconstraint>(&*f.constraint_)) {
+          ex.kind = tt::ExprExtra::Kind::Constraint;
+          ex.ctype = core_type(*pc->type);
+        } else {
+          auto& cc = std::get<Pcoerce>(*f.constraint_);
+          ex.kind = tt::ExprExtra::Kind::Coerce;
+          ex.ctype = core_type(*cc.to_);
+          if (cc.from) ex.from = core_type(**cc.from);
+        }
+        fn.cases_extras.push_back(std::move(ex));
+      }
       for (auto& c : fc.cases)
         fn.cases.push_back(case_(c, /*computation=*/false));  // value patterns
     }

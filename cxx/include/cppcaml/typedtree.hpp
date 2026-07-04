@@ -158,6 +158,7 @@ struct Texp_function {
   ExprBox body;                 // Tfunction_body
   Location cases_loc;           // Tfunction_cases
   const ast::Attributes* cases_attrs = nullptr;  // `function[@attr]`
+  std::vector<struct ExprExtra> cases_extras;    // `function .. : t` return constraint
   std::vector<struct Case> cases;
 };
 struct ValueBinding;  // (defined below; used by Texp_let)
