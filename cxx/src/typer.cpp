@@ -1173,6 +1173,29 @@ struct Typer {
     return out;
   }
 
+  // The typedtree analogue of Typ.varify_constructors: replace every nullary
+  // Ttyp_constr on a locally-abstract type (a `type a` newtype ident) with the
+  // corresponding Ttyp_var.  Used for the `: type a. t` pattern annotation.
+  void varify_tt(tt::CoreType& t, const std::unordered_map<int, std::string>& nt) {
+    if (auto* c = std::get_if<tt::Ttyp_constr>(&t.desc)) {
+      if (c->args.empty())
+        if (auto* pid = std::get_if<tt::Pident>(&c->path.v)) {
+          auto f = nt.find(pid->id.stamp);
+          if (f != nt.end()) { t.desc = tt::Ttyp_var{f->second}; return; }
+        }
+      for (auto& a : c->args) varify_tt(*a, nt);
+    } else if (auto* a = std::get_if<tt::Ttyp_arrow>(&t.desc)) {
+      varify_tt(*a->dom, nt);
+      varify_tt(*a->cod, nt);
+    } else if (auto* tu = std::get_if<tt::Ttyp_tuple>(&t.desc)) {
+      for (auto& [l, e] : tu->elems) varify_tt(*e, nt);
+    } else if (auto* al = std::get_if<tt::Ttyp_alias>(&t.desc)) {
+      varify_tt(*al->type, nt);
+    } else if (auto* po = std::get_if<tt::Ttyp_poly>(&t.desc)) {
+      varify_tt(*po->type, nt);
+    }
+  }
+
   // Record fields wrap their type in Ttyp_poly([], inner).
   tt::CoreType poly_wrap(const CoreType& t) {
     tt::CoreType inner = core_type(t);
@@ -2203,6 +2226,9 @@ struct Typer {
     pe.loc = out.pat.loc;
     pe.loc.ghost = true;
     out.pat.extras.push_back(std::move(pe));
+    // A polymorphic annotation (`: 'a. t`) constrains only the pattern -- the RHS
+    // stays un-annotated (it can't carry a polymorphic Texp_constraint).
+    if (std::holds_alternative<Ptyp_poly>(vc->typ->desc)) return;
     tt::ExprExtra ee;
     ee.kind = tt::ExprExtra::Kind::Constraint;
     ee.ctype = std::move(ct2);
@@ -2211,8 +2237,69 @@ struct Typer {
     out.expr.extras.push_back(std::move(ee));
   }
 
+  // `let f : type a b. t = e` (wrap_type_annotation): the newtypes scope the RHS,
+  // which gets Texp_newtype + Texp_constraint(t) extras; the pattern gets a
+  // Tpat_extra_constraint whose type is Ttyp_poly(['a;'b], varify(t)).  Returns
+  // false (leaving `out` unconstrained) if the type can't be transcribed.
+  bool apply_newtype_constraint(tt::ValueBinding& out, const ValueBinding& vb,
+                                const Pvc_constraint& vc,
+                                const std::unordered_map<int, std::string>& nt,
+                                const std::vector<std::string>& names) {
+    tt::CoreType cexpr, cpat;  // built while the newtypes are still in scope
+    try {
+      cexpr = core_type(*vc.typ);   // newtype refs stay Ttyp_constr "a"
+      cpat = core_type(*vc.typ);
+    } catch (const TypeError&) { return false; }
+    varify_tt(cpat, nt);            // pattern side: newtype refs -> Ttyp_var
+    Location tyloc = vc.typ->loc;
+    // --- expression: Texp_newtype* then Texp_constraint, on the binding span ---
+    Location espan{vb.pat.loc.start, vb.expr->loc.end, true};
+    out.expr.loc = espan;
+    tt::ExprExtra ce;
+    ce.kind = tt::ExprExtra::Kind::Constraint;
+    ce.ctype = std::move(cexpr);
+    ce.loc = espan;
+    out.expr.extras.insert(out.expr.extras.begin(), std::move(ce));
+    for (auto it = names.rbegin(); it != names.rend(); ++it) {
+      tt::ExprExtra ne;
+      ne.kind = tt::ExprExtra::Kind::Newtype;
+      ne.newtype = *it;
+      ne.loc = espan;
+      out.expr.extras.insert(out.expr.extras.begin(), std::move(ne));
+    }
+    // --- pattern: Tpat_extra_constraint of Ttyp_poly(vars, varified type) ---
+    tt::CoreType poly;
+    poly.loc = tyloc;
+    poly.desc = tt::Ttyp_poly{names, std::make_unique<tt::CoreType>(std::move(cpat))};
+    tt::PatExtra pe;
+    pe.ctype = std::move(poly);
+    pe.loc = Location{vb.pat.loc.start, tyloc.end, true};
+    out.pat.extras.push_back(std::move(pe));
+    return true;
+  }
+
   tt::ValueBinding value_binding(const ValueBinding& vb) {
     tt::ValueBinding out;
+    const Pvc_constraint* nt_vc = nullptr;
+    if (vb.constraint_)
+      if (auto* vc = std::get_if<Pvc_constraint>(&*vb.constraint_))
+        if (!vc->univars.empty()) nt_vc = vc;
+    if (nt_vc) {  // `: type a. t` scopes the newtypes over the RHS and constraints
+      auto saved = type_scope;
+      std::unordered_map<int, std::string> nt;  // newtype-ident stamp -> var name
+      std::vector<std::string> names;
+      for (auto& u : nt_vc->univars) {
+        tt::Ident id = fresh_type(u.txt);
+        nt[id.stamp] = u.txt;
+        names.push_back(u.txt);
+      }
+      out.expr = expr(*vb.expr);   // body sees the newtypes
+      out.pat = pattern(vb.pat);
+      out.attrs = &vb.attrs;
+      apply_newtype_constraint(out, vb, *nt_vc, nt, names);
+      type_scope = std::move(saved);
+      return out;
+    }
     out.expr = expr(*vb.expr);  // RHS typed before the pattern is bound (non-rec)
     out.pat = pattern(vb.pat);
     out.attrs = &vb.attrs;
