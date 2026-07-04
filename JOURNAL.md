@@ -3386,3 +3386,45 @@ pr11887); Param_pat polyvariant partiality (needs real exhaustiveness, mixin2/3)
 nested Tcl_let structure (toplevel_lets); ptype_constraints (range_intf); and the
 usual pre-existing non-class diffs (explicit-poly let on the pattern, first-class
 module params, constructor [@attr]).
+
+--------------------------------------------------------------------------------
+Track-2 continuation, post-class constructs: 633 -> 647 (85.0% -> 86.8%)
+--------------------------------------------------------------------------------
+Seven more commits after the class cluster; c++-err 38 -> 32, and the big DIFF
+buckets fell.  Method: bucket the DIFF files by their FIRST differing token
+(normalized), then attack the largest.
+
+- OBJECT subsystem finished: Texp_setinstvar (x <- e), Texp_override
+  ({< x = e >}); local opens in patterns (Ppat_open -> transparent + a
+  Tpat_extra_open extra) and in types (Ttyp_open, M.(t)); Ppat_interval
+  ('a'..'z' -> a right-nested Tpat_or of ghost Tpat_constant per byte).
+- Pexp_newtype (fun (type a) -> e): a Texp_newtype extra (the kind already
+  existed for Pparam_newtype).
+- EXPLICIT POLYMORPHISM let bindings (the single biggest lever, ~7 files) --
+  wrap_type_annotation:
+    * `: type a b. t` -- the newtypes scope the RHS; RHS gets Texp_newtype* then
+      Texp_constraint(t-with-newtypes) on the binding span; the pattern gets a
+      Tpat_extra_constraint of Ttyp_poly(vars, varify(t)), where varify_tt is a
+      typedtree analogue of Typ.varify_constructors (newtype ctors -> Ttyp_var).
+    * `: 'a. t` -- constrains ONLY the pattern (a polymorphic annotation can't
+      sit on the RHS as a Texp_constraint).  Both use the same value-binding
+      newtype scoping so `a` in the body resolves to the newtype ident.
+- poly_wrap no longer double-wraps an already-explicit `'a. t` record-field /
+  object-method type.  package_type's `with type` quotes the name (fmt_longident).
+- pr5164 signature-simplify: a struct with a shadowed name (value/type/module/
+  modtype bound twice) gets the implicit Tmod_constraint coercion (transparent
+  extra module_expr).  Functor-application ARGUMENTS (not just the functor path)
+  get the cmi strengthening wrapper (strengthen_global helper).
+- module-unpack params ((module M)) are irrefutable -> Param_pat Total.
+
+New MATCHes incl.: index_objects, exotic newtype, pr6216, evaluation_order,
+unbox_under_assign, bug13448bis, effects/test2, backtrace/names, translprim/locs,
+domains, pr5322_ok, pr5673_ok, offset, compiling.  Gates flat throughout
+(accept 36, reject 1).
+
+Remaining tail (32 c++-err, 66 DIFF): include-based shadowing (pr5164 tail),
+local-module strengthening (syntactic_arity), polyvariant Param_pat exhaustiveness
+(mixin2/3, needs real analysis), submodule sole-ctor partiality, class INHERITANCE
+(intext/woodyatt), imported-type #t (cmi pv_tags), plus assorted pre-existing
+per-file loc/stamp subtleties.  Pexp_extension ([%ext], 3), Pexp_setinstvar deep
+cases, and a handful of module-coercion locs are the next construct-shaped levers.
