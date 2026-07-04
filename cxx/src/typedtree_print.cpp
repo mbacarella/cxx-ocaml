@@ -881,6 +881,9 @@ struct Printer {
       line(i + 1, "Tcf_constraint");
       core_type(i + 2, c->t1);
       core_type(i + 2, c->t2);
+    } else if (auto* ini = std::get_if<Tcf_initializer>(&f.desc)) {
+      line(i + 1, "Tcf_initializer");
+      expression(i + 2, *ini->expr);
     } else {
       auto& v = std::get<Tcf_val>(f.desc);
       line(i + 1, "Tcf_val \"" + v.name + "\" " + (v.mutable_ ? "Mutable" : "Immutable"));
@@ -915,16 +918,38 @@ struct Printer {
       }
       return;
     }
+    if (auto* op = std::get_if<Tcl_open>(&ce.desc)) {
+      line(i + 1, std::string("Tcl_open ") + (op->override_ ? "Override" : "Fresh") +
+                      " \"" + path_aux(op->path) + "\"");
+      class_expr(i + 1, *op->body);
+      return;
+    }
+    if (auto* ap = std::get_if<Tcl_apply>(&ce.desc)) {
+      line(i + 1, "Tcl_apply");
+      class_expr(i + 1, *ap->fn);
+      if (ap->args.empty()) { line(i + 1, "[]"); return; }
+      line(i + 1, "[");
+      for (auto& [label, ex] : ap->args) {
+        line(i + 2, "<arg>");
+        arg_label(i + 3, label);
+        if (ex) expression(i + 3, *ex);
+      }
+      line(i + 1, "]");
+      return;
+    }
     if (auto* lt = std::get_if<Tcl_let>(&ce.desc)) {
       line(i + 1, std::string("Tcl_let ") +
                       (lt->rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
       list_bindings(i + 1, lt->rf, lt->bindings);
-      line(i + 1, "[");
-      for (auto& [id, e] : lt->ivars) {
-        line(i + 2, "<def> \"" + ident(id) + "\"");
-        expression(i + 3, *e);
+      if (lt->ivars.empty()) line(i + 1, "[]");
+      else {
+        line(i + 1, "[");
+        for (auto& [id, e] : lt->ivars) {
+          line(i + 2, "<def> \"" + ident(id) + "\"");
+          expression(i + 3, *e);
+        }
+        line(i + 1, "]");
       }
-      line(i + 1, "]");
       class_expr(i + 1, *lt->body);
       return;
     }

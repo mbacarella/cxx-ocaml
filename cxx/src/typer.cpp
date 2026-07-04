@@ -2455,13 +2455,15 @@ struct Typer {
   }
   tt::Expression elaborate_method(const Expression& body0, int self_n, Location selfloc,
                                   const std::optional<std::string>& self_name,
-                                  const std::shared_ptr<MethsMap>& meths) {
+                                  const std::shared_ptr<MethsMap>& meths,
+                                  bool poly = true) {
     const Expression* body = &body0;
     const CoreType* mty = nullptr;  // (method m : T = e): keep the type for the extra
-    if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) {
-      if (poly->t) mty = poly->t->get();
-      body = poly->e.get();
-    }
+    if (poly)
+      if (auto* p = std::get_if<Pexp_poly>(&body->desc)) {
+        if (p->t) mty = p->t->get();
+        body = p->e.get();
+      }
     Location floc = body0.loc;  // the synthetic function & its poly extra sit on the body
     floc.ghost = true;
     selfloc.ghost = true;       // the self parameter sits on the self location
@@ -2476,16 +2478,18 @@ struct Typer {
     }
     tt::Expression be = expr(*body);
     pop();
-    tt::ExprExtra ex;
-    ex.kind = tt::ExprExtra::Kind::Poly;
-    ex.poly_has_type = mty != nullptr;
-    // A method type annotation is always a Ttyp_poly; a bare (non-`'a.`) type is
-    // wrapped in Ttyp_poly([], _) with the inner type's location.
-    if (mty)
-      ex.ctype = std::holds_alternative<Ptyp_poly>(mty->desc) ? core_type(*mty)
-                                                              : poly_wrap(*mty);
-    ex.loc = floc;
-    be.extras.insert(be.extras.begin(), std::move(ex));  // Texp_poly first
+    if (poly) {  // methods carry a Texp_poly extra; initializers do not
+      tt::ExprExtra ex;
+      ex.kind = tt::ExprExtra::Kind::Poly;
+      ex.poly_has_type = mty != nullptr;
+      // A method type annotation is always a Ttyp_poly; a bare (non-`'a.`) type is
+      // wrapped in Ttyp_poly([], _) with the inner type's location.
+      if (mty)
+        ex.ctype = std::holds_alternative<Ptyp_poly>(mty->desc) ? core_type(*mty)
+                                                                : poly_wrap(*mty);
+      ex.loc = floc;
+      be.extras.insert(be.extras.begin(), std::move(ex));  // Texp_poly first
+    }
     // synthetic self parameter: Tpat_alias self-N (Tpat_var self-*), at the self loc
     tt::Pattern selfvar;
     selfvar.loc = selfloc;
@@ -2501,7 +2505,10 @@ struct Typer {
     fn.params.push_back(std::move(fp));
     fn.body = std::make_unique<tt::Expression>(std::move(be));
     tt::Expression out;
-    out.loc = floc;
+    // The method's synthetic function sits on the ghost body location; an
+    // initializer's function keeps the (non-ghost) initializer-expression loc.
+    out.loc = body0.loc;
+    out.loc.ghost = poly;
     out.desc = std::move(fn);
     return out;
   }
@@ -2586,6 +2593,12 @@ struct Typer {
         wrap.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(class_expr_t(*in->ce))};
         ti.ce = std::make_unique<tt::ClassExpr>(std::move(wrap));
         cf.desc = std::move(ti);
+      } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
+        tt::Tcf_initializer tin;
+        tin.expr = std::make_unique<tt::Expression>(
+            elaborate_method(*ini->e, self_n, cs.self.loc, self_name, meths,
+                             /*poly=*/false));
+        cf.desc = std::move(tin);
       } else if (auto* c = std::get_if<Pcf_constraint>(&f.desc)) {
         tt::Tcf_constraint tc;
         tc.t1 = core_type(*c->t1);
@@ -2644,6 +2657,42 @@ struct Typer {
       tc.ce = std::make_unique<tt::ClassExpr>(class_expr_t(*cn->ce));
       tc.ct = std::make_unique<tt::ClassType>(class_type_t(*cn->ct));
       out.desc = std::move(tc);
+      return out;
+    }
+    if (auto* ap = std::get_if<Pcl_apply>(&ce.desc)) {  // ce arg ..
+      tt::ClassExpr out;
+      out.loc = ce.loc;
+      tt::Tcl_apply ta;
+      // The applied class expression is coerced, like an inherited parent:
+      // Tcl_constraint(fn, None).
+      tt::ClassExpr wrap;
+      wrap.loc = ap->ce->loc;
+      wrap.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(class_expr_t(*ap->ce))};
+      ta.fn = std::make_unique<tt::ClassExpr>(std::move(wrap));
+      for (auto& [lbl, e] : ap->args)
+        ta.args.emplace_back(lbl, std::make_unique<tt::Expression>(expr(*e)));
+      out.desc = std::move(ta);
+      return out;
+    }
+    if (auto* op = std::get_if<Pcl_open>(&ce.desc)) {  // let open M in ce
+      tt::ClassExpr out;
+      out.loc = ce.loc;
+      tt::Tcl_open to;
+      to.override_ = op->ovr == OverrideFlag::Override;
+      to.path = resolve_module(op->id.txt);
+      auto saved_opens = opens;
+      OpenEntry oe;
+      oe.path = to.path;
+      load_open_names_lid(op->id.txt, oe);
+      if (const ModExports* ex = exports_by_path(oe.path)) {
+        for (auto& n : ex->values) oe.values.insert(n);
+        for (auto& n : ex->types) oe.types.insert(n);
+        for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
+      }
+      opens.push_back(std::move(oe));
+      to.body = std::make_unique<tt::ClassExpr>(class_expr_t(*op->body));
+      opens = std::move(saved_opens);
+      out.desc = std::move(to);
       return out;
     }
     if (auto* lt = std::get_if<Pcl_let>(&ce.desc)) {  // let [rec] .. in ce

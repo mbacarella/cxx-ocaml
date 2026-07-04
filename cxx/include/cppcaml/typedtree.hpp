@@ -444,8 +444,9 @@ struct Tcf_inherit {  // inherit [!] ce [as super]
   std::optional<std::string> super;
 };
 struct Tcf_constraint { CoreType t1; CoreType t2; };  // constraint t1 = t2
+struct Tcf_initializer { ExprBox expr; };  // initializer e (elaborated `fun self -> e`)
 struct ClassField {
-  std::variant<Tcf_val, Tcf_method, Tcf_inherit, Tcf_constraint> desc;
+  std::variant<Tcf_val, Tcf_method, Tcf_inherit, Tcf_constraint, Tcf_initializer> desc;
   Location loc;
 };
 struct ClassStructure {
@@ -468,8 +469,15 @@ struct Tcl_let {  // let [rec] bindings in ce  (the let-vars become instance var
   std::vector<std::pair<Ident, ExprBox>> ivars; // l2: instvar id <- Texp_ident of let var
   Box<ClassExpr> body;
 };
+struct Tcl_open { bool override_ = false; Path path; Box<ClassExpr> body; };  // let open M in ce
+struct Tcl_apply {  // ce arg ..  (a class applied to value arguments)
+  Box<ClassExpr> fn;
+  std::vector<std::pair<ArgLabel, ExprBox>> args;  // null ExprBox = an omitted arg
+};
 struct ClassExpr {
-  std::variant<Tcl_structure, Tcl_fun, Tcl_ident, Tcl_constraint, Tcl_let> desc;
+  std::variant<Tcl_structure, Tcl_fun, Tcl_ident, Tcl_constraint, Tcl_let, Tcl_open,
+               Tcl_apply>
+      desc;
   Location loc;
 };
 struct ClassDeclaration {
