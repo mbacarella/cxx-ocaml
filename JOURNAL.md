@@ -3316,3 +3316,28 @@ Hashtbl.create's ?random ghost None; signature-simplify wrapper when
 includes shadow (pr5164); local-open submodule resolution; class row
 types).  All six gates flat throughout (reject 1 foo.ml artifact, accept 36
 identical, sig 525/525, lambda 412/329, crashes 0).
+
+--------------------------------------------------------------------------------
+Track-2 continuation, same day: 594 -> 617 (82.8% of oracle-typed)
+--------------------------------------------------------------------------------
+Four more commits (a01006a158, 76839ab564, 1e1dc32068 + this doc):
+
+- Papply paths; generalized opens (`open struct..end` binds FRESH idents,
+  `open F(X)` via the functor's body exports); per-local-module export
+  tables make `open Std; Std.Hash`-style dotted uses resolve (gatien file).
+- inline-record ctors everywhere (variants, exceptions, typexts) --
+  including printtyped's Record_inlined indent-shadowing BUG (the tag int
+  is used as the indent level; reproduce bug-for-bug).
+- Text_rebind; Tprim_alias + primitive attributes ([@@noalloc] was the
+  single biggest DIFF bucket, 11 files); core_type ctyp_attributes
+  ([@untagged]).
+- Param_pat/Param_optional_default partiality: syntactic refutability with
+  local ctor sibling counts; GADT variants exempt (refinement makes their
+  single-ctor params Total).  Do NOT attempt Tfunction_cases partiality
+  syntactically -- multi-case exhaustiveness needs real analysis.
+- Texp_letop (LEFT-nested ghost tuple join pattern at the let+ token's
+  ghost loc), Texp_unreachable, computation-pattern attrs.
+
+Remainder now 63 c++-err + 65 DIFF; the class-language cluster is the one
+big block left (Pexp_new/object/self, Pstr_class_type, Tcl_*/Tcf_* gaps,
+class row types) -- open that front next session.  Gates flat all day.
