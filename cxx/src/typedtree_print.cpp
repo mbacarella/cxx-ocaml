@@ -90,6 +90,8 @@ struct Printer {
   }
   std::string path_aux(const Path& p) const {
     if (auto* pi = std::get_if<Pident>(&p.v)) return ident(pi->id);
+    if (auto* ap = std::get_if<Papply>(&p.v))
+      return path_aux(*ap->fn) + "(" + path_aux(*ap->arg) + ")";
     auto& d = std::get<Pdot>(p.v);
     return path_aux(*d.prefix) + "." + d.name;
   }

@@ -656,6 +656,103 @@ struct Typer {
   };
   std::unordered_map<long long, SigExports> modtype_exports_;
 
+  // Names a locally-defined module exports: for `open M` of a local module
+  // (resolution through the open's path, like "Std/1.Hash") and for
+  // `open F(X)` / `open struct .. end` (fresh-ident instantiation).
+  // Submodules link by stamp so dotted opens can walk down.
+  struct ModExports {
+    std::unordered_set<std::string> values, types;
+    std::unordered_map<std::string, long long> submodule_stamps;
+  };
+  std::unordered_map<long long, ModExports> module_exports_;
+
+  static void pat_var_names(const tt::Pattern& p,
+                            std::unordered_set<std::string>& out) {
+    if (auto* v = std::get_if<tt::Tpat_var>(&p.desc)) {
+      out.insert(v->id.name);
+    } else if (auto* a = std::get_if<tt::Tpat_alias>(&p.desc)) {
+      out.insert(a->id.name);
+      pat_var_names(*a->inner, out);
+    } else if (auto* t = std::get_if<tt::Tpat_tuple>(&p.desc)) {
+      for (auto& [l, e] : t->elems) pat_var_names(*e, out);
+    } else if (auto* c = std::get_if<tt::Tpat_construct>(&p.desc)) {
+      for (auto& e : c->args) pat_var_names(*e, out);
+    } else if (auto* r = std::get_if<tt::Tpat_record>(&p.desc)) {
+      for (auto& [n, e] : r->fields) pat_var_names(*e, out);
+    } else if (auto* ar = std::get_if<tt::Tpat_array>(&p.desc)) {
+      for (auto& e : ar->elems) pat_var_names(*e, out);
+    } else if (auto* o = std::get_if<tt::Tpat_or>(&p.desc)) {
+      pat_var_names(*o->left, out);
+    } else if (auto* lz = std::get_if<tt::Tpat_lazy>(&p.desc)) {
+      pat_var_names(*lz->inner, out);
+    } else if (auto* vv = std::get_if<tt::Tpat_variant>(&p.desc)) {
+      if (vv->arg) pat_var_names(*vv->arg, out);
+    }
+  }
+
+  void collect_module_exports(const std::vector<tt::StructureItem>& items,
+                              ModExports& ex) {
+    for (auto& it : items) {
+      if (auto* v = std::get_if<tt::Tstr_value>(&it.desc)) {
+        for (auto& b : v->bindings) pat_var_names(b.pat, ex.values);
+      } else if (auto* p = std::get_if<tt::Tstr_primitive>(&it.desc)) {
+        ex.values.insert(p->id.name);
+      } else if (auto* t = std::get_if<tt::Tstr_type>(&it.desc)) {
+        for (auto& d : t->decls) ex.types.insert(d.id.name);
+      } else if (auto* m = std::get_if<tt::Tstr_module>(&it.desc)) {
+        ex.submodule_stamps[m->id.name] = m->id.stamp;
+      } else if (auto* inc = std::get_if<tt::Tstr_include>(&it.desc)) {
+        if (auto* body = module_body(*inc->expr)) collect_module_exports(*body, ex);
+      }
+    }
+  }
+
+  // The structure a module expression evaluates to, syntactically: through
+  // functor bodies (their RESULT) and constraints.  Null when opaque.
+  static const std::vector<tt::StructureItem>* module_body(const tt::ModuleExpr& me) {
+    if (auto* s = std::get_if<tt::Tmod_structure>(&me.desc)) return &s->items;
+    if (auto* f = std::get_if<tt::Tmod_functor>(&me.desc)) return module_body(*f->body);
+    if (auto* c = std::get_if<tt::Tmod_constraint>(&me.desc)) return module_body(*c->expr);
+    return nullptr;
+  }
+
+  // Exports of the local module a (possibly dotted) resolved path denotes.
+  const ModExports* exports_by_path(const tt::Path& p) {
+    if (auto* pi = std::get_if<tt::Pident>(&p.v)) {
+      auto f = module_exports_.find(pi->id.stamp);
+      return f != module_exports_.end() ? &f->second : nullptr;
+    }
+    if (auto* d = std::get_if<tt::Pdot>(&p.v)) {
+      const ModExports* pre = exports_by_path(*d->prefix);
+      if (!pre) return nullptr;
+      auto s = pre->submodule_stamps.find(d->name);
+      if (s == pre->submodule_stamps.end()) return nullptr;
+      auto f = module_exports_.find(s->second);
+      return f != module_exports_.end() ? &f->second : nullptr;
+    }
+    return nullptr;
+  }
+
+  // Exports of an elaborated module expression (for generalized opens).
+  const ModExports* exports_of_modexpr(const tt::ModuleExpr& me, ModExports& tmp) {
+    if (auto* i = std::get_if<tt::Tmod_ident>(&me.desc)) {
+      if (auto* pi = std::get_if<tt::Pident>(&i->path.v)) {
+        auto f = module_exports_.find(pi->id.stamp);
+        if (f != module_exports_.end()) return &f->second;
+      }
+      return nullptr;
+    }
+    if (auto* a = std::get_if<tt::Tmod_apply>(&me.desc))
+      return exports_of_modexpr(*a->fn, tmp);
+    if (auto* c = std::get_if<tt::Tmod_constraint>(&me.desc))
+      return exports_of_modexpr(*c->expr, tmp);
+    if (auto* body = module_body(me)) {
+      collect_module_exports(*body, tmp);
+      return &tmp;
+    }
+    return nullptr;
+  }
+
   static void collect_exports(const tt::ModuleType& mt, SigExports& ex) {
     auto* sg = std::get_if<tt::Tmty_signature>(&mt.desc);
     if (!sg) return;
@@ -1189,6 +1286,12 @@ struct Typer {
       tt::Path prefix = resolve_module(*d->prefix);
       tt::Path p;
       p.v = tt::Pdot{std::make_shared<tt::Path>(std::move(prefix)), d->name};
+      return p;
+    }
+    if (auto* ap = std::get_if<Lapply>(&lid.v)) {  // F(Arg) in a path
+      tt::Path p;
+      p.v = tt::Papply{std::make_shared<tt::Path>(resolve_module(*ap->f)),
+                       std::make_shared<tt::Path>(resolve_module(*ap->x))};
       return p;
     }
     throw TypeError("unsupported module path");
@@ -2250,20 +2353,39 @@ struct Typer {
       tp.prims = pr->prim.prims;
       si.desc = std::move(tp);
     } else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
-      auto* mi = std::get_if<Pmod_ident>(&op->expr.desc);
-      if (!mi) throw TypeError("open of non-ident module");
-      tt::Path mpath = resolve_module(mi->id.txt);
       tt::Tstr_open to;
       to.override_ = op->ovr == OverrideFlag::Override;
-      to.expr = std::make_unique<tt::ModuleExpr>();
-      to.expr->loc = op->expr.loc;
-      to.expr->desc = tt::Tmod_ident{mpath};  // copy; mpath reused below
+      if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
+        // Path open: later references resolve THROUGH the path (Pdot).
+        tt::Path mpath = resolve_module(mi->id.txt);
+        to.expr = std::make_unique<tt::ModuleExpr>();
+        to.expr->loc = op->expr.loc;
+        to.expr->desc = tt::Tmod_ident{mpath};  // copy; mpath reused below
+        OpenEntry oe;
+        oe.path = std::move(mpath);
+        load_open_names_lid(mi->id.txt, oe);  // stdlib cmi names
+        if (const ModExports* ex = exports_by_path(oe.path)) {  // local module
+          for (auto& n : ex->values) oe.values.insert(n);
+          for (auto& n : ex->types) oe.types.insert(n);
+          for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
+        }
+        opens.push_back(std::move(oe));
+      } else {
+        // Generalized open (struct literal / functor application): the items
+        // instantiate FRESH idents that bind directly (Pident references).
+        to.expr = std::make_unique<tt::ModuleExpr>(module_expr(op->expr));
+        ModExports tmp;
+        if (const ModExports* ex = exports_of_modexpr(*to.expr, tmp)) {
+          for (auto& n : ex->values) fresh_local(n);
+          for (auto& n : ex->types) fresh_type(n);
+          for (auto& [n, st] : ex->submodule_stamps) {
+            auto id = fresh_module(n);
+            auto f = module_exports_.find(st);
+            if (f != module_exports_.end()) module_exports_[id.stamp] = f->second;
+          }
+        }
+      }
       si.desc = std::move(to);
-      // Bring the opened module's names into scope (stdlib modules, best effort).
-      OpenEntry oe;
-      oe.path = std::move(mpath);
-      load_open_names_lid(mi->id.txt, oe);
-      opens.push_back(std::move(oe));
     } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
       tt::Tstr_exception te;
       te.ctor = ext_ctor(ex->exn.ctor);
@@ -2300,6 +2422,16 @@ struct Typer {
       tm.expr = std::make_unique<tt::ModuleExpr>(module_expr(b.expr));
       tm.id = fresh_module(b.name.txt ? *b.name.txt : "_");
       tm.attrs = &b.attrs;
+      // Record what M exports (for later local opens / dotted resolution).
+      if (auto* body = module_body(*tm.expr)) {
+        collect_module_exports(*body, module_exports_[tm.id.stamp]);
+      } else if (auto* mi2 = std::get_if<tt::Tmod_ident>(&tm.expr->desc)) {
+        if (auto* pi = std::get_if<tt::Pident>(&mi2->path.v)) {  // module A = B
+          auto f = module_exports_.find(pi->id.stamp);
+          if (f != module_exports_.end())
+            module_exports_[tm.id.stamp] = f->second;
+        }
+      }
       si.desc = std::move(tm);
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
       auto me = std::make_unique<tt::ModuleExpr>(module_expr(in->expr));

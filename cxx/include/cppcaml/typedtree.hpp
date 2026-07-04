@@ -39,7 +39,8 @@ struct Path;
 using PathBox = std::shared_ptr<Path>;
 struct Pident { Ident id; };
 struct Pdot { PathBox prefix; std::string name; };
-struct Path { std::variant<Pident, Pdot> v; };
+struct Papply { PathBox fn; PathBox arg; };  // F(Arg) in a path
+struct Path { std::variant<Pident, Pdot, Papply> v; };
 
 // --- core types (Ttyp_*) ---
 struct CoreType;
