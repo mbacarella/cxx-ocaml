@@ -792,6 +792,10 @@ struct Typer {
   // the Record_float representation, like a bare-`float` record.
   std::set<std::string> float_abbrevs_;
 
+  // Locally-declared constructor -> number of constructors in its variant
+  // (drives param-pattern partiality: the sole ctor is irrefutable).
+  std::unordered_map<std::string, size_t> ctor_siblings_;
+
   // Locally-declared constructors of arity > 1 (`C of t1 * t2`): name -> arity.
   // A constructor of arity n applied to an n-tuple flattens its argument in the
   // typedtree (`C (a, b)` -> args [a; b]).  Keyed by simple name; external
@@ -938,8 +942,12 @@ struct Typer {
     if (std::holds_alternative<Ppat_any>(p.desc) ||
         std::holds_alternative<Ppat_var>(p.desc)) return true;
     if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
-      if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
         if (l->name == "()" && !c->arg) return true;  // unit is irrefutable
+        auto s = ctor_siblings_.find(l->name);  // sole ctor of a local variant
+        if (s != ctor_siblings_.end() && s->second == 1)
+          return !c->arg || pat_irrefutable(**c->arg);
+      }
       return false;
     }
     if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
@@ -1040,6 +1048,7 @@ struct Typer {
   tt::CoreType core_type(const CoreType& t) {
     tt::CoreType out;
     out.loc = t.loc;
+    if (!t.attrs.empty()) out.attrs = &t.attrs;
     if (std::holds_alternative<Ptyp_any>(t.desc)) {
       out.desc = tt::Ttyp_any{};
     } else if (auto* v = std::get_if<Ptyp_var>(&t.desc)) {
@@ -1120,14 +1129,37 @@ struct Typer {
     return out;
   }
 
+  // `external f [: t] = g`: the alias g resolves as a value.
+  tt::Path resolve_prim_alias(const StringLoc& alias) {
+    if (alias.txt.find('.') != std::string::npos)
+      throw TypeError("dotted primitive alias");
+    Longident lid;
+    lid.v = Lident{alias.txt};
+    return resolve_value(lid, alias.loc.start.cnum);
+  }
+
+  // Extension-constructor idents by name (`exception E = F` resolves F here).
+  std::unordered_map<std::string, tt::Ident> extctor_scope_;
+
   tt::ExtCtor ext_ctor(const ExtensionConstructor& c) {
-    auto* decl = std::get_if<Pext_decl>(&c.kind);
-    if (!decl) throw TypeError("extension rebind");
     tt::ExtCtor out;
     out.loc = c.loc;
     out.id = fresh_anon(c.name.txt);
-    out.args = ctor_args(decl->args);
-    if (decl->res) out.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
+    if (auto* decl = std::get_if<Pext_decl>(&c.kind)) {
+      out.args = ctor_args(decl->args);
+      if (decl->res)
+        out.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
+    } else {
+      auto& rb = std::get<Pext_rebind>(c.kind);
+      auto* l = std::get_if<Lident>(&rb.id.txt.v);
+      if (!l) throw TypeError("extension rebind path");
+      auto f = extctor_scope_.find(l->name);
+      if (f == extctor_scope_.end()) throw TypeError("extension rebind unknown");
+      tt::Path p;
+      p.v = tt::Pident{f->second};
+      out.rebind = std::move(p);
+    }
+    extctor_scope_[c.name.txt] = out.id;
     if (!c.attrs.empty()) out.attrs = &c.attrs;
     return out;
   }
@@ -1136,7 +1168,11 @@ struct Typer {
     tt::ConstructorDecl out;
     out.loc = c.loc;
     out.id = fresh_anon(c.name.txt);
-    out.args = ctor_args(c.args);
+    if (auto* r = std::get_if<Pcstr_record>(&c.args)) {
+      for (auto& f : r->fields) out.labels.push_back(label_decl(f));
+    } else {
+      out.args = ctor_args(c.args);
+    }
     if (c.res) out.res = std::make_unique<tt::CoreType>(core_type(**c.res));
     if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
       if (t->elems.size() > 1) ctor_arity_[c.name.txt] = (int)t->elems.size();
@@ -1159,7 +1195,24 @@ struct Typer {
       out.v = tt::Ttype_abstract{};
     } else if (auto* v = std::get_if<Ptype_variant>(&k)) {
       tt::Ttype_variant tv;
-      for (auto& c : v->ctors) tv.ctors.push_back(constructor_decl(c));
+      int block_idx = 0;  // index among non-constant ctors (the inlined tag)
+      // GADT variants (any ctor with a return type) refine at use sites, so a
+      // single-ctor pattern can be total: count them as 1 (never Partial).
+      bool gadt = false;
+      for (auto& c : v->ctors) gadt = gadt || c.res.has_value();
+      for (auto& c : v->ctors)
+        ctor_siblings_[c.name.txt] = gadt ? 1 : v->ctors.size();
+      for (auto& c : v->ctors) {
+        if (auto* r = std::get_if<Pcstr_record>(&c.args)) {
+          RecordInfo info;
+          for (auto& f : r->fields) info.decl_fields.push_back(f.name.txt);
+          info.repr = "Record_inlined " + std::to_string(block_idx);
+          for (auto& f : r->fields) field_registry[f.name.txt] = info;
+        }
+        auto* t = std::get_if<Pcstr_tuple>(&c.args);
+        if (!(t && t->elems.empty())) ++block_idx;
+        tv.ctors.push_back(constructor_decl(c));
+      }
       out.v = std::move(tv);
     } else if (auto* r = std::get_if<Ptype_record>(&k)) {
       tt::Ttype_record tr;
@@ -1816,6 +1869,7 @@ struct Typer {
       // The default expression sees the OUTER scope (not this param's binding).
       if (pv.default_)
         fp.default_ = std::make_unique<tt::Expression>(expr(**pv.default_));
+      fp.partial = !pat_irrefutable(pv.pat);
       fp.pat = std::make_unique<tt::Pattern>(pattern(pv.pat));
       fn.params.push_back(std::move(fp));
     }
@@ -2005,11 +2059,12 @@ struct Typer {
         out.attrs = &e.attrs;
         si.desc = std::move(out);
       } else if (auto* pr = std::get_if<Psig_primitive>(&it.desc)) {
-        if (!pr->pd.type || pr->pd.alias) throw TypeError("primitive alias");
         tt::Tsig_primitive tp;
+        if (pr->pd.alias) tp.alias = resolve_prim_alias(*pr->pd.alias);
         tp.id = fresh_anon(pr->pd.name.txt);
         tp.loc = pr->pd.loc;
-        tp.type = core_type(*pr->pd.type);
+        tp.attrs = &pr->pd.attrs;
+        if (pr->pd.type) tp.type = core_type(*pr->pd.type);
         tp.prims = pr->pd.prims;
         si.desc = std::move(tp);
       } else if (auto* at = std::get_if<Psig_attribute>(&it.desc)) {
@@ -2345,11 +2400,12 @@ struct Typer {
       out.decls = type_decls(ty->decls);
       si.desc = std::move(out);
     } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
-      if (!pr->prim.type || pr->prim.alias) throw TypeError("primitive alias");
       tt::Tstr_primitive tp;
+      if (pr->prim.alias) tp.alias = resolve_prim_alias(*pr->prim.alias);
       tp.id = fresh_local(pr->prim.name.txt);  // `external f : ..` binds f
       tp.loc = pr->prim.loc;
-      tp.type = core_type(*pr->prim.type);
+      tp.attrs = &pr->prim.attrs;
+      if (pr->prim.type) tp.type = core_type(*pr->prim.type);
       tp.prims = pr->prim.prims;
       si.desc = std::move(tp);
     } else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {

@@ -74,6 +74,7 @@ struct CoreType {
                Ttyp_alias, Ttyp_variant, Ttyp_object, Ttyp_package>
       desc;
   Location loc;
+  const ast::Attributes* attrs = nullptr;  // ctyp_attributes ([@untagged] ...)
 };
 
 struct Pattern;
@@ -139,7 +140,8 @@ struct Texp_apply {
 struct FunctionParam {
   ArgLabel label;
   PatBox pat;
-  ExprBox default_;  // non-null = Param_optional_default
+  ExprBox default_;      // non-null = Param_optional_default
+  bool partial = false;  // fp_partial: a refutable param pattern
 };
 struct Texp_function {
   std::vector<FunctionParam> params;
@@ -237,6 +239,7 @@ struct ConstructorDecl {
   Location loc;
   Ident id;
   std::vector<CoreTypeBox> args;  // Cstr_tuple argument types
+  std::vector<LabelDecl> labels;  // Cstr_record (inline record); wins over args
   std::optional<CoreTypeBox> res; // GADT return type
 };
 struct Ttype_abstract {};
@@ -273,6 +276,7 @@ struct ExtCtor {
   Ident id;
   std::vector<CoreTypeBox> args;
   std::optional<CoreTypeBox> res;
+  std::optional<Path> rebind;  // Text_rebind (`exception E = F`); wins over args
   const ast::Attributes* attrs = nullptr;
 };
 
@@ -304,8 +308,10 @@ struct Tsig_typext {
 struct Tsig_primitive {
   Ident id;
   Location loc;
-  CoreType type;
+  std::optional<CoreType> type;  // absent for an untyped `external f = g`
   std::vector<std::string> prims;
+  std::optional<Path> alias;     // Tprim_alias (`external f [: t] = g`)
+  const ast::Attributes* attrs = nullptr;
 };
 struct Tsig_attribute { std::string name; const ast::Structure* payload; };
 struct Tsig_open { bool override_ = false; Path path; };
@@ -360,8 +366,10 @@ struct Tstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Tstr_primitive {
   Ident id;
   Location loc;
-  CoreType type;
+  std::optional<CoreType> type;  // absent for an untyped `external f = g`
   std::vector<std::string> prims;  // the "external" strings
+  std::optional<Path> alias;     // Tprim_alias (`external f [: t] = g`)
+  const ast::Attributes* attrs = nullptr;
 };
 struct Tstr_exception {
   ExtCtor ctor;

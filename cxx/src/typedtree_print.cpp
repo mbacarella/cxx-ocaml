@@ -129,6 +129,7 @@ struct Printer {
 
   void core_type(int i, const CoreType& t) {
     line(i, "core_type " + loc(t.loc));
+    if (t.attrs) attributes(i, *t.attrs);
     int j = i + 1;
     if (std::holds_alternative<Ttyp_any>(t.desc)) {
       line(j, "Ttyp_any");
@@ -194,7 +195,13 @@ struct Printer {
   void constructor_decl(int i, const ConstructorDecl& cd) {
     line(i, loc(cd.loc));
     line(i + 1, ident(cd.id));
-    list_core_types(i + 1, cd.args);
+    if (!cd.labels.empty()) {  // inline record: label decls instead of types
+      line(i + 1, "[");
+      for (auto& l : cd.labels) label_decl(i + 2, l);
+      line(i + 1, "]");
+    } else {
+      list_core_types(i + 1, cd.args);
+    }
     if (cd.res) { line(i + 1, "Some"); core_type(i + 2, **cd.res); }
     else line(i + 1, "None");
   }
@@ -253,6 +260,11 @@ struct Printer {
     if (c.attrs) attributes(i, *c.attrs);
     line(i + 1, "pext_name = \"" + ident(c.id) + "\"");
     line(i + 1, "pext_kind =");
+    if (c.rebind) {
+      line(i + 2, "Text_rebind");
+      line(i + 3, "\"" + path_aux(*c.rebind) + "\"");
+      return;
+    }
     line(i + 2, "Text_decl");
     list_core_types(i + 3, c.args);
     if (c.res) { line(i + 3, "Some"); core_type(i + 4, **c.res); }
@@ -415,12 +427,13 @@ struct Printer {
         line(j, "[");
         for (auto& p : fn->params) {
           arg_label(j + 1, p.label);
+          const char* part = p.partial ? " (Partial)" : "";
           if (p.default_) {
-            line(j + 1, "Param_optional_default");
+            line(j + 1, std::string("Param_optional_default") + part);
             pattern(j + 2, *p.pat);
             expression(j + 2, *p.default_);
           } else {
-            line(j + 1, "Param_pat");
+            line(j + 1, std::string("Param_pat") + part);
             pattern(j + 2, *p.pat);
           }
         }
@@ -509,7 +522,12 @@ struct Printer {
         line(j + 2, "]");
       }
       line(j + 1, "representation =");
-      line(j + 2, r->representation);
+      // printtyped's Record_inlined case shadows the indent with the tag
+      // (`| Record_inlined i -> line i ppf ...`) -- reproduce bug-for-bug.
+      if (r->representation.rfind("Record_inlined ", 0) == 0)
+        line(std::atoi(r->representation.c_str() + 15), r->representation);
+      else
+        line(j + 2, r->representation);
       line(j + 1, "extended_expression =");
       if (r->extended) { line(j + 2, "Some"); expression(j + 3, **r->extended); }
       else line(j + 2, "None");
@@ -623,6 +641,25 @@ struct Printer {
     module_type(i + 1, *md.type);
   }
 
+  void primitive_description(int i, const Ident& id, const Location& l,
+                             const ast::Attributes* attrs,
+                             const std::optional<CoreType>& type,
+                             const std::vector<std::string>& prims,
+                             const std::optional<Path>& alias) {
+    line(i, "primitive_description " + ident(id) + " " + loc(l));
+    if (attrs) attributes(i, *attrs);
+    if (alias) {
+      line(i + 1, "Tprim_alias");
+      if (type) { line(i + 2, "Some"); core_type(i + 3, *type); }
+      else line(i + 2, "None");
+      line(i + 2, "\"" + path_aux(*alias) + "\"");
+    } else {
+      line(i + 1, "Tprim_decl");
+      core_type(i + 2, *type);
+      list_strings(i + 2, prims);
+    }
+  }
+
   void signature_item(int i, const SignatureItem& si) {
     line(i, "signature_item " + loc(si.loc));
     int j = i + 1;
@@ -683,10 +720,8 @@ struct Printer {
                       (tx->private_ ? "Private" : "Public"));
     } else if (auto* pr = std::get_if<Tsig_primitive>(&si.desc)) {
       line(j, "Tsig_primitive");
-      line(j, "primitive_description " + ident(pr->id) + " " + loc(pr->loc));
-      line(j + 1, "Tprim_decl");
-      core_type(j + 2, pr->type);
-      list_strings(j + 2, pr->prims);
+      primitive_description(j, pr->id, pr->loc, pr->attrs, pr->type, pr->prims,
+                            pr->alias);
     } else if (auto* at = std::get_if<Tsig_attribute>(&si.desc)) {
       line(j, "Tsig_attribute \"" + at->name + "\"");
       if (at->payload)
@@ -853,10 +888,8 @@ struct Printer {
       }
     } else if (auto* pr = std::get_if<Tstr_primitive>(&it.desc)) {
       line(j, "Tstr_primitive");
-      line(j, "primitive_description " + ident(pr->id) + " " + loc(pr->loc));
-      line(j + 1, "Tprim_decl");
-      core_type(j + 2, pr->type);
-      list_strings(j + 2, pr->prims);
+      primitive_description(j, pr->id, pr->loc, pr->attrs, pr->type, pr->prims,
+                            pr->alias);
     } else if (auto* op = std::get_if<Tstr_open>(&it.desc)) {
       line(j, std::string("Tstr_open ") + (op->override_ ? "Override" : "Fresh"));
       module_expr(j, *op->expr);
