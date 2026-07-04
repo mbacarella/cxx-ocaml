@@ -71,6 +71,11 @@ if [ "${1:-}" == "--worker" ]; then
     [ "$oempty" = 1 ] && printf 'BOTHERR\n' || printf 'CPPERR\n'
     rm -f "$rawc"; exit 0
   fi
+  if [ "$oempty" = 1 ]; then
+    # We dump, the oracle rejects: a dump-mode false-accept, NOT a diff --
+    # keeping these out of DIFF keeps the typeable denominator honest.
+    printf 'FA\n'; rm -f "$rawc"; exit 0
+  fi
   no=$(mktemp); nc=$(mktemp)
   normalize < "$ocache" > "$no"
   normalize < "$rawc" > "$nc"
@@ -106,10 +111,10 @@ if [ ! -x "$CPP" ]; then
 fi
 
 awk -v tot="${#files[@]}" '
-  $1=="M"{m++} $1=="DIFF"{d++} $1=="CPPERR"{ce++} $1=="BOTHERR"{be++}
+  $1=="M"{m++} $1=="DIFF"{d++} $1=="CPPERR"{ce++} $1=="BOTHERR"{be++} $1=="FA"{fa++}
   END{
-    typeable=tot-be
-    printf "files: %d   typedtree-identical: %d (%.1f%%)   (c++ errored on %d; %d of those the oracle also rejects)\n", \
-           tot, m, 100*m/tot, ce+be, be
-    printf "over oracle-typeable files (%d): %.1f%%\n", typeable, 100*m/typeable
+    typeable=m+d+ce   # files with a real oracle dump
+    printf "files: %d   typedtree-identical: %d (%.1f%%)   (DIFF %d, c++-err %d, dump-mode false-accepts %d, co-rejects %d)\n", \
+           tot, m, 100*m/tot, d, ce, fa, be
+    printf "over oracle-typed files (%d): %.1f%%\n", typeable, 100*m/typeable
   }' <<<"$results"

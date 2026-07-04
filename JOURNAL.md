@@ -3270,3 +3270,49 @@ residue.  Next fronts, in the plans' recommended order: typed-tree dump
 parity (TYPER-PARITY-ROADMAP track 2 -- wiring inferred types into the dump,
 the largest lever), or the HM core clearing buckets B/C, or the modsig P4
 pointers (flat-layout deletion; cmi-writer destructive substitution).
+
+================================================================================
+TRACK 2 OPENED: typed-tree dump parity 473 -> 594 (79.7% of oracle-typed)
+                                                                    — 2026-07-04
+================================================================================
+Per the roadmap recommendation, opened Slice-3 dump parity.  First finding: the
+metric's denominator was a fiction.  Only 745 corpus files have a real oracle
+dump (= accept_parity's oracle-accepted count); the old "1222 typeable" counted
+dump-mode false-accepts as typeable AND as DIFF.  Harness now classes them FA
+(soundness territory).  Honest baseline was 473/745 = 63.5%, with the real
+levers being 243 files where c++type's dump pipeline errored while --check
+accepted, and only 29 genuine diffs.
+
+Bucketed the 243 by first error and cleared the big clusters (three commits,
+26c7abbb99 / 25cf1bd5e7 + harness fix):
+
+- sig/mty cluster (~41): Tsig_module/recmodule/modtype/include/exception/
+  typext/primitive/attribute/open; Tmty_alias/functor/typeof/with.  The
+  subtle bit: `S with type t = ..` reuses the SIGNATURE's own ident stamps,
+  so Tstr/Tsig_modtype now record per-modtype export tables keyed by stamp.
+  #abstract prints run-on (no newline), matching printtyped.
+- attributes were silently dropped on module bindings, recmodule bindings,
+  includes, modtypes, and function[@attr] cases -- all printed now.
+- function params: (type a) -> Texp_newtype extras + scoped local type;
+  ?(x=e) -> Param_optional_default; `for _` -> the _for dummy ident.
+- externals: Tstr_primitive never bound its name in the value scope (!) --
+  one line, ~20 files.
+- effects: eff/continuation are PREDEFS in this fork (predef stamps added);
+  `open Effect.Deep` (dotted opens) now walks the cmi submodule signature;
+  opens must shadow predefs (resolve order fixed: local -> opens -> predef
+  -> stdlib).  `| effect P, k ->` cases go in Texp_match's second case list,
+  with k bound invisibly.
+- first-class modules end to end: Ttyp_package/package_type,
+  Tpat_extra_unpack (name binds as a module; module_scope scoped to the
+  function body), Texp_pack + transparent coercion wrap, Tmod_unpack,
+  Tmod_apply_unit.
+- strengthening wraps: `include List`-style Mty_alias includes get the
+  implicit Tmod_constraint, like cmi functor paths.
+
+Now 594/745 = 79.7%.  Remainder: 83 c++-err (classes ~15: Pexp_new/object/
+self; Pstr_class_type 6; inline record ctors 5; local dotted opens 6;
+letop 2; misc), 68 DIFF (optional-arg elimination at applications, e.g.
+Hashtbl.create's ?random ghost None; signature-simplify wrapper when
+includes shadow (pr5164); local-open submodule resolution; class row
+types).  All six gates flat throughout (reject 1 foo.ml artifact, accept 36
+identical, sig 525/525, lambda 412/329, crashes 0).
