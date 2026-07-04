@@ -831,7 +831,7 @@ struct Printer {
     else {
       line(i + 1, "[");
       for (auto& [n, ct] : p.constraints) {
-        line(i + 2, "with type " + n);
+        line(i + 2, "with type \"" + n + "\"");  // fmt_longident quotes the name
         core_type(i + 2, *ct);
       }
       line(i + 1, "]");

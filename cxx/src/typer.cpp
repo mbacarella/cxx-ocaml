@@ -1196,8 +1196,10 @@ struct Typer {
     }
   }
 
-  // Record fields wrap their type in Ttyp_poly([], inner).
+  // Record fields (and object methods) wrap their type in Ttyp_poly([], inner) --
+  // unless it is already an explicit `'a. t` polymorphic type, which stays as-is.
   tt::CoreType poly_wrap(const CoreType& t) {
+    if (std::holds_alternative<Ptyp_poly>(t.desc)) return core_type(t);
     tt::CoreType inner = core_type(t);
     tt::CoreType poly;
     poly.loc = inner.loc;
