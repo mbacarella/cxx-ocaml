@@ -665,6 +665,11 @@ struct Typer {
     std::unordered_map<std::string, long long> submodule_stamps;
   };
   std::unordered_map<long long, ModExports> module_exports_;
+  // Local module stamps defined as an alias to a module path -- `module S = P`
+  // (for any P, global or local).  Used as a functor argument, or as the root
+  // of a functor path (`S.Make(..)`), such an alias is strengthened just like a
+  // direct global path (a transparent coercion layer in the typed tree).
+  std::set<long long> alias_module_stamps_;
 
   static void pat_var_names(const tt::Pattern& p,
                             std::unordered_set<std::string>& out) {
@@ -2602,9 +2607,20 @@ struct Typer {
 
   // Wrap a global-rooted (cmi-loaded) module_expr ident in the transparent
   // strengthening coercion layer; pass anything else through unchanged.
+  // A path is strengthened when its root is a global module, or a local alias
+  // module (`module S = P`), including dotted paths through it (`S.Make`).
+  bool path_global_or_alias(const tt::Path& p) {
+    if (path_root_global(p)) return true;
+    const tt::Path* root = &p;
+    while (auto* pd = std::get_if<tt::Pdot>(&root->v)) root = pd->prefix.get();
+    if (auto* pi = std::get_if<tt::Pident>(&root->v))
+      return alias_module_stamps_.count(pi->id.stamp) > 0;
+    return false;
+  }
+
   tt::ModuleExprBox strengthen_global(tt::ModuleExprBox me) {
     if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc))
-      if (path_root_global(mi->path)) {
+      if (path_global_or_alias(mi->path)) {
         auto wrap = std::make_unique<tt::ModuleExpr>();
         wrap->loc = me->loc;
         wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
@@ -3165,6 +3181,10 @@ struct Typer {
             module_exports_[tm.id.stamp] = f->second;
         }
       }
+      // `module M = P` makes M an alias, so a later use of M as a functor
+      // argument (or as the root of a functor path M.F) is strengthened.
+      if (std::holds_alternative<tt::Tmod_ident>(tm.expr->desc))
+        alias_module_stamps_.insert(tm.id.stamp);
       si.desc = std::move(tm);
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
       auto me = std::make_unique<tt::ModuleExpr>(module_expr(in->expr));
