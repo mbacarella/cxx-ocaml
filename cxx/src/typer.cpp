@@ -28,6 +28,21 @@ const std::unordered_set<std::string>& stdlib_values() {
   return s;
 }
 
+// Type names Stdlib itself defines (ref, in_channel, format6, ...): an
+// unqualified use resolves to Stdlib!.name, like stdlib_values for values.
+const std::unordered_set<std::string>& stdlib_types() {
+  static const std::unordered_set<std::string> s = [] {
+    std::unordered_set<std::string> out;
+    try {
+      auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
+      for (auto& t : cmi.types()) out.insert(t.name);
+    } catch (...) {
+    }
+    return out;
+  }();
+  return s;
+}
+
 // Predefined type constructors (Predef idents, printed name/stamp!).  Stamp
 // values are arbitrary post-normalization; only distinctness matters.
 const std::unordered_map<std::string, long long>& predef_types() {
@@ -37,6 +52,8 @@ const std::unordered_map<std::string, long long>& predef_types() {
       {"list", 9},     {"option", 10}, {"nativeint", 11}, {"int32", 12},
       {"int64", 13},   {"lazy_t", 14}, {"string", 17}, {"floatarray", 16},
       {"extension_constructor", 15},
+      {"eff", 18},     {"continuation", 19}, {"iarray", 20},
+      {"atomic_loc", 21},
   };
   return m;
 }
@@ -630,6 +647,42 @@ struct Typer {
   std::unordered_map<std::string, tt::Ident> module_scope;
   std::unordered_map<std::string, tt::Ident> modtype_scope;
 
+  // Names a locally-declared module type exports (one level deep), keyed by the
+  // modtype ident's stamp.  `S with type t = ..` prints the constrained item
+  // with the SIGNATURE's own ident (t/274 in both places), so the with-clause
+  // needs to look idents up inside S rather than mint new ones.
+  struct SigExports {
+    std::unordered_map<std::string, tt::Ident> types, modules;
+  };
+  std::unordered_map<long long, SigExports> modtype_exports_;
+
+  static void collect_exports(const tt::ModuleType& mt, SigExports& ex) {
+    auto* sg = std::get_if<tt::Tmty_signature>(&mt.desc);
+    if (!sg) return;
+    for (auto& it : sg->items) {
+      if (auto* t = std::get_if<tt::Tsig_type>(&it.desc)) {
+        for (auto& d : t->decls) ex.types.emplace(d.id.name, d.id);
+      } else if (auto* m = std::get_if<tt::Tsig_module>(&it.desc)) {
+        ex.modules.emplace(m->md.id.name, m->md.id);
+      }
+    }
+  }
+
+  // Exports of an elaborated module type: a local Tmty_ident goes through the
+  // recorded table; an inline signature is walked directly.
+  SigExports exports_of(const tt::ModuleType& mt) {
+    if (auto* bi = std::get_if<tt::Tmty_ident>(&mt.desc)) {
+      if (auto* pi = std::get_if<tt::Pident>(&bi->path.v)) {
+        auto f = modtype_exports_.find(pi->id.stamp);
+        if (f != modtype_exports_.end()) return f->second;
+      }
+      return {};
+    }
+    SigExports ex;
+    collect_exports(mt, ex);
+    return ex;
+  }
+
   // Record fields: name -> the record type's full field list (decl order) +
   // representation.  Drives Texp_record's decl-order emission and <kept> fields.
   struct RecordInfo {
@@ -689,6 +742,37 @@ struct Typer {
       for (auto& m : cmi.modules()) oe.submodules.insert(m.name);
     } catch (...) {
       // Unknown/local module: names from it won't resolve (best effort).
+    }
+  }
+
+  // `open M.Sub[..]`: M from its stdlib cmi, then walk to the submodule's
+  // signature (e.g. Effect.Deep).  Best effort, like load_open_names.
+  void load_open_names_lid(const Longident& lid, OpenEntry& oe) {
+    std::vector<std::string> comps;
+    const Longident* cur = &lid;
+    while (auto* d = std::get_if<Ldot>(&cur->v)) {
+      comps.push_back(d->name);
+      cur = &*d->prefix;
+    }
+    auto* l = std::get_if<Lident>(&cur->v);
+    if (!l) return;
+    if (comps.empty()) return load_open_names(l->name, oe);
+    std::reverse(comps.begin(), comps.end());
+    try {
+      auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + l->name + ".cmi");
+      const cmi::Signature* sig = &cmi.sig();
+      for (auto& c : comps) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& m : sig->modules)
+          if (m.name == c) { md = &m; break; }
+        if (!md || !md->type) return;
+        if (md->type->kind != cmi::ModuleType::Sig || !md->type->sig) return;
+        sig = md->type->sig.get();
+      }
+      for (auto& v : sig->values) oe.values.insert(v.name);
+      for (auto& t : sig->types) oe.types.insert(t.name);
+      for (auto& m : sig->modules) oe.submodules.insert(m.name);
+    } catch (...) {
     }
   }
 
@@ -820,12 +904,8 @@ struct Typer {
         p.v = tt::Pident{t->second};
         return p;
       }
-      auto pd = predef_types().find(l->name);
-      if (pd != predef_types().end()) {
-        tt::Path p;
-        p.v = tt::Pident{tt::Ident{l->name, pd->second, tt::Ident::Predef}};
-        return p;
-      }
+      // Opens shadow predefs (e.g. Effect.Deep.continuation over the predef
+      // continuation), so they resolve first.
       for (auto it = opens.rbegin(); it != opens.rend(); ++it) {
         if (it->types.count(l->name)) {
           tt::Path p;
@@ -833,6 +913,13 @@ struct Typer {
           return p;
         }
       }
+      auto pd = predef_types().find(l->name);
+      if (pd != predef_types().end()) {
+        tt::Path p;
+        p.v = tt::Pident{tt::Ident{l->name, pd->second, tt::Ident::Predef}};
+        return p;
+      }
+      if (stdlib_types().count(l->name)) return stdlib_path(l->name);
       throw TypeError("Unbound type constructor " + l->name);
     }
     if (auto* d = std::get_if<Ldot>(&lid.v)) {
@@ -1326,7 +1413,7 @@ struct Typer {
       }
       out.desc = std::move(ap);
     } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
-      out.desc = function(*f);
+      out.desc = function(*f, out.extras);
     } else if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
       // `let pat = e in body` with a constructor/open-tuple/labelled-tuple
       // pattern is typed as `match e with pat -> body` (single non-rec binding,
@@ -1410,9 +1497,14 @@ struct Typer {
       tf.dir = fo->dir == DirectionFlag::Upto ? tt::Direction::Up
                                               : tt::Direction::Down;
       push();
-      auto* pv = std::get_if<Ppat_var>(&fo->var.desc);
-      if (!pv) { pop(); throw TypeError("for-var not a variable"); }
-      tf.var = fresh_local(pv->name.txt);
+      if (auto* pv = std::get_if<Ppat_var>(&fo->var.desc)) {
+        tf.var = fresh_local(pv->name.txt);
+      } else if (std::holds_alternative<Ppat_any>(fo->var.desc)) {
+        tf.var = fresh_anon("_for");  // `for _ = ..`: typecore's dummy ident
+      } else {
+        pop();
+        throw TypeError("for-var not a variable");
+      }
       tf.body = std::make_unique<tt::Expression>(expr(*fo->body));
       pop();
       out.desc = std::move(tf);
@@ -1527,16 +1619,31 @@ struct Typer {
     return out;
   }
 
-  tt::Texp_function function(const Pexp_function& f) {
+  // `extras` is the enclosing expression's extra list: `(type a)` params
+  // become Texp_newtype extras there (with `a` bound as a local type for the
+  // rest of the function), not Param_* entries.
+  tt::Texp_function function(const Pexp_function& f,
+                             std::vector<tt::ExprExtra>& extras) {
     tt::Texp_function fn;
     push();
+    auto saved_types = type_scope;
     for (auto& param : f.params) {
-      auto* pv = std::get_if<Pparam_val>(&param.desc);
-      if (!pv) { pop(); throw TypeError("unsupported function param"); }
-      if (pv->default_) { pop(); throw TypeError("optional default param"); }
+      if (auto* nt = std::get_if<Pparam_newtype>(&param.desc)) {
+        fresh_type(nt->name.txt);
+        tt::ExprExtra ex;
+        ex.kind = tt::ExprExtra::Kind::Newtype;
+        ex.newtype = nt->name.txt;
+        ex.loc = nt->name.loc;
+        extras.push_back(std::move(ex));
+        continue;
+      }
+      auto& pv = std::get<Pparam_val>(param.desc);
       tt::FunctionParam fp;
-      fp.label = pv->label;
-      fp.pat = std::make_unique<tt::Pattern>(pattern(pv->pat));
+      fp.label = pv.label;
+      // The default expression sees the OUTER scope (not this param's binding).
+      if (pv.default_)
+        fp.default_ = std::make_unique<tt::Expression>(expr(**pv.default_));
+      fp.pat = std::make_unique<tt::Pattern>(pattern(pv.pat));
       fn.params.push_back(std::move(fp));
     }
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
@@ -1563,10 +1670,12 @@ struct Typer {
       auto& fc = std::get<Pfunction_cases>(f.body->v);
       fn.is_cases = true;
       fn.cases_loc = fc.loc;
+      fn.cases_attrs = &fc.attrs;
       for (auto& c : fc.cases)
         fn.cases.push_back(case_(c, /*computation=*/false));  // value patterns
     }
     pop();
+    type_scope = std::move(saved_types);  // (type a) bindings end here
     return fn;
   }
 
@@ -1666,6 +1775,80 @@ struct Typer {
         ts.rf = t->rf;
         ts.decls = type_decls(t->decls);
         si.desc = std::move(ts);
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        tt::Tsig_module out;
+        // `module M = Path` in a signature is an alias: Mp_absent.
+        out.md.present = !std::holds_alternative<Pmty_alias>(m->md.type->desc);
+        out.md.type = std::make_unique<tt::ModuleType>(module_type_t(*m->md.type));
+        if (m->md.name.txt) out.md.id = fresh_module(*m->md.name.txt);
+        else out.md.id.stamp = -1;  // anonymous `module _ : S`, prints as `_`
+        out.md.attrs = &m->md.attrs;
+        si.desc = std::move(out);
+      } else if (auto* rm = std::get_if<Psig_recmodule>(&it.desc)) {
+        tt::Tsig_recmodule out;
+        std::vector<tt::Ident> ids;  // pre-bind all names (mutual refs)
+        for (auto& d : rm->decls)
+          ids.push_back(fresh_module(d.name.txt ? *d.name.txt : "_"));
+        for (size_t k = 0; k < rm->decls.size(); ++k) {
+          tt::ModuleDecl md;
+          md.id = ids[k];
+          md.attrs = &rm->decls[k].attrs;
+          md.type = std::make_unique<tt::ModuleType>(module_type_t(*rm->decls[k].type));
+          out.decls.push_back(std::move(md));
+        }
+        si.desc = std::move(out);
+      } else if (auto* mt = std::get_if<Psig_modtype>(&it.desc)) {
+        tt::Tsig_modtype out;
+        out.id = fresh_modtype(mt->name.txt);
+        out.attrs = &mt->attrs;
+        if (mt->type) {
+          out.type = std::make_unique<tt::ModuleType>(module_type_t(*mt->type));
+          collect_exports(*out.type, modtype_exports_[out.id.stamp]);
+        }
+        si.desc = std::move(out);
+      } else if (auto* inc = std::get_if<Psig_include>(&it.desc)) {
+        tt::Tsig_include out;
+        out.mt = std::make_unique<tt::ModuleType>(module_type_t(inc->mt));
+        out.attrs = &inc->attrs;
+        // Include instantiates FRESH idents for the included items (typemod
+        // substitutes new stamps); later sig items resolve to those.
+        for (auto& [n, id] : exports_of(*out.mt).types) type_scope[n] = fresh_anon(n);
+        for (auto& [n, id] : exports_of(*out.mt).modules) module_scope[n] = fresh_anon(n);
+        si.desc = std::move(out);
+      } else if (auto* ex = std::get_if<Psig_exception>(&it.desc)) {
+        tt::Tsig_exception te;
+        te.ctor = ext_ctor(ex->exn.ctor);
+        te.attrs = &ex->exn.attrs;
+        si.desc = std::move(te);
+      } else if (auto* tx = std::get_if<Psig_typext>(&it.desc)) {
+        auto& e = tx->ext;
+        tt::Tsig_typext out;
+        out.path = resolve_type(e.path.txt);
+        for (auto& p : e.params)
+          out.params.push_back(std::make_unique<tt::CoreType>(core_type(*p)));
+        for (auto& c : e.ctors) out.ctors.push_back(ext_ctor(c));
+        out.private_ = e.priv == PrivateFlag::Private;
+        out.attrs = &e.attrs;
+        si.desc = std::move(out);
+      } else if (auto* pr = std::get_if<Psig_primitive>(&it.desc)) {
+        if (!pr->pd.type || pr->pd.alias) throw TypeError("primitive alias");
+        tt::Tsig_primitive tp;
+        tp.id = fresh_anon(pr->pd.name.txt);
+        tp.loc = pr->pd.loc;
+        tp.type = core_type(*pr->pd.type);
+        tp.prims = pr->pd.prims;
+        si.desc = std::move(tp);
+      } else if (auto* at = std::get_if<Psig_attribute>(&it.desc)) {
+        si.desc = tt::Tsig_attribute{at->name, &at->payload};
+      } else if (auto* op = std::get_if<Psig_open>(&it.desc)) {
+        tt::Tsig_open out;
+        out.override_ = op->ovr == OverrideFlag::Override;
+        out.path = resolve_module(op->id.txt);
+        OpenEntry oe;
+        oe.path = out.path;
+        load_open_names_lid(op->id.txt, oe);
+        opens.push_back(std::move(oe));
+        si.desc = std::move(out);
       } else {
         throw TypeError("sigitem#" + std::to_string(it.desc.index()));
       }
@@ -1685,8 +1868,70 @@ struct Typer {
       out.desc = tt::Tmty_ident{resolve_modtype(id->id.txt)};
     } else if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) {
       out.desc = tt::Tmty_signature{signature(sg->items)};
+    } else if (auto* al = std::get_if<Pmty_alias>(&mt.desc)) {
+      out.desc = tt::Tmty_alias{resolve_module(al->id.txt)};
+    } else if (auto* fn = std::get_if<Pmty_functor>(&mt.desc)) {
+      tt::Tmty_functor tf;
+      auto saved = module_scope;
+      if (auto* named = std::get_if<Functor_named>(&fn->param)) {
+        tf.param_type = std::make_unique<tt::ModuleType>(module_type_t(*named->type));
+        if (named->name.txt) tf.param = fresh_module(*named->name.txt);
+      }  // Functor_unit: generative, no param/param_type
+      tf.body = std::make_unique<tt::ModuleType>(module_type_t(*fn->body));
+      module_scope = std::move(saved);
+      out.desc = std::move(tf);
+    } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
+      tt::Tmty_with tw;
+      tw.base = std::make_unique<tt::ModuleType>(module_type_t(*w->mt));
+      SigExports ex = exports_of(*tw.base);
+      for (auto& c : w->constraints) tw.constraints.push_back(with_item(c, ex));
+      out.desc = std::move(tw);
+    } else if (auto* to = std::get_if<Pmty_typeof>(&mt.desc)) {
+      out.desc = tt::Tmty_typeof{
+          std::make_unique<tt::ModuleExpr>(module_expr(*to->me))};
     } else {
       throw TypeError("module_type#" + std::to_string(mt.desc.index()));
+    }
+    return out;
+  }
+
+  // One `with ...` constraint.  The constrained item's path resolves inside the
+  // base module type's own signature (reusing its ident stamps); an unknown
+  // base (e.g. a cmi modtype) mints one shared fresh ident for both the path
+  // and the declaration, keeping the stamp correlation the dump needs.
+  tt::WithItem with_item(const WithConstraint& c, const SigExports& ex) {
+    tt::WithItem out;
+    auto lhs_type_decl = [&](const LongidentLoc& lid, const TypeDeclaration& td) {
+      auto* l = std::get_if<Lident>(&lid.txt.v);
+      if (!l) throw TypeError("with-type on dotted path");
+      auto f = ex.types.find(l->name);
+      tt::Ident id = f != ex.types.end() ? f->second : fresh_anon(l->name);
+      out.path.v = tt::Pident{id};
+      auto saved = type_scope;  // elaborate the decl under the resolved ident
+      type_scope[td.name.txt] = id;
+      auto d = type_declaration(td);
+      type_scope = std::move(saved);
+      return d;
+    };
+    auto lhs_module = [&](const LongidentLoc& lid) {
+      auto* l = std::get_if<Lident>(&lid.txt.v);
+      if (!l) throw TypeError("with-module on dotted path");
+      auto f = ex.modules.find(l->name);
+      tt::Ident id = f != ex.modules.end() ? f->second : fresh_anon(l->name);
+      out.path.v = tt::Pident{id};
+    };
+    if (auto* t = std::get_if<Pwith_type>(&c)) {
+      out.c = tt::Twith_type{lhs_type_decl(t->lid, *t->td)};
+    } else if (auto* t = std::get_if<Pwith_typesubst>(&c)) {
+      out.c = tt::Twith_typesubst{lhs_type_decl(t->lid, *t->td)};
+    } else if (auto* m = std::get_if<Pwith_module>(&c)) {
+      lhs_module(m->lid1);
+      out.c = tt::Twith_module{resolve_module(m->lid2.txt)};
+    } else if (auto* m = std::get_if<Pwith_modsubst>(&c)) {
+      lhs_module(m->lid1);
+      out.c = tt::Twith_modsubst{resolve_module(m->lid2.txt)};
+    } else {
+      throw TypeError("with-modtype constraint");
     }
     return out;
   }
@@ -1699,12 +1944,12 @@ struct Typer {
     } else if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
       out.desc = tt::Tmod_structure{nested_structure(ms->items)};
     } else if (auto* fn = std::get_if<Pmod_functor>(&me.desc)) {
-      auto* named = std::get_if<Functor_named>(&fn->param);
-      if (!named) throw TypeError("generative functor (unit param)");
       tt::Tmod_functor tf;
       auto saved = module_scope;
-      tf.param = fresh_module(named->name.txt ? *named->name.txt : "_");
-      tf.param_type = std::make_unique<tt::ModuleType>(module_type_t(*named->type));
+      if (auto* named = std::get_if<Functor_named>(&fn->param)) {
+        tf.param_type = std::make_unique<tt::ModuleType>(module_type_t(*named->type));
+        if (named->name.txt) tf.param = fresh_module(*named->name.txt);
+      }  // Functor_unit: generative, no param/param_type
       tf.body = std::make_unique<tt::ModuleExpr>(module_expr(*fn->body));
       module_scope = std::move(saved);
       out.desc = std::move(tf);
@@ -1916,7 +2161,7 @@ struct Typer {
     } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
       if (!pr->prim.type || pr->prim.alias) throw TypeError("primitive alias");
       tt::Tstr_primitive tp;
-      tp.id = fresh_anon(pr->prim.name.txt);
+      tp.id = fresh_local(pr->prim.name.txt);  // `external f : ..` binds f
       tp.loc = pr->prim.loc;
       tp.type = core_type(*pr->prim.type);
       tp.prims = pr->prim.prims;
@@ -1932,12 +2177,10 @@ struct Typer {
       to.expr->desc = tt::Tmod_ident{mpath};  // copy; mpath reused below
       si.desc = std::move(to);
       // Bring the opened module's names into scope (stdlib modules, best effort).
-      if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
-        OpenEntry oe;
-        oe.path = std::move(mpath);
-        load_open_names(l->name, oe);
-        opens.push_back(std::move(oe));
-      }
+      OpenEntry oe;
+      oe.path = std::move(mpath);
+      load_open_names_lid(mi->id.txt, oe);
+      opens.push_back(std::move(oe));
     } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc)) {
       tt::Tstr_exception te;
       te.ctor = ext_ctor(ex->exn.ctor);
@@ -1956,8 +2199,11 @@ struct Typer {
     } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
       tt::Tstr_modtype out;
       out.id = fresh_modtype(mt->name.txt);
-      if (mt->type)
+      out.attrs = &mt->attrs;
+      if (mt->type) {
         out.type = std::make_unique<tt::ModuleType>(module_type_t(*mt->type));
+        collect_exports(*out.type, modtype_exports_[out.id.stamp]);
+      }
       si.desc = std::move(out);
     } else if (auto* at = std::get_if<Pstr_attribute>(&it.desc)) {
       si.desc = tt::Tstr_attribute{at->name, &at->payload};
@@ -1970,9 +2216,20 @@ struct Typer {
       // bound for the following items.
       tm.expr = std::make_unique<tt::ModuleExpr>(module_expr(b.expr));
       tm.id = fresh_module(b.name.txt ? *b.name.txt : "_");
+      tm.attrs = &b.attrs;
       si.desc = std::move(tm);
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
-      si.desc = tt::Tstr_include{std::make_unique<tt::ModuleExpr>(module_expr(in->expr))};
+      auto me = std::make_unique<tt::ModuleExpr>(module_expr(in->expr));
+      // Including a cmi-loaded module (an Mty_alias, e.g. `include List`)
+      // expands the alias behind a transparent constraint, like functor paths.
+      if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc))
+        if (path_root_global(mi->path)) {
+          auto wrap = std::make_unique<tt::ModuleExpr>();
+          wrap->loc = me->loc;
+          wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
+          me = std::move(wrap);
+        }
+      si.desc = tt::Tstr_include{std::move(me), &in->attrs};
     } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
       tt::Tstr_class tc;
       for (auto& d : cl->decls)  // pre-register names (stamp first, mutual refs)
@@ -1990,7 +2247,9 @@ struct Typer {
         // The constrained module's typedtree location is the inner module's
         // (the `= struct ..`), not the binding's `: S = struct ..` span.
         if (auto* mc = std::get_if<Pmod_constraint>(&be.desc)) me.loc = mc->me->loc;
-        tr.bindings.emplace_back(ids[k], std::make_unique<tt::ModuleExpr>(std::move(me)));
+        tr.bindings.push_back({ids[k],
+                               std::make_unique<tt::ModuleExpr>(std::move(me)),
+                               &rm->bindings[k].attrs});
       }
       si.desc = std::move(tr);
     } else {

@@ -117,10 +117,12 @@ struct Texp_apply {
   ExprBox fn;
   std::vector<std::pair<ArgLabel, ExprBox>> args;
 };
-// A single value parameter of a Texp_function (Param_pat form).
+// A single value parameter of a Texp_function: Param_pat, or
+// Param_optional_default when a `?(x = e)` default expression is present.
 struct FunctionParam {
   ArgLabel label;
   PatBox pat;
+  ExprBox default_;  // non-null = Param_optional_default
 };
 struct Texp_function {
   std::vector<FunctionParam> params;
@@ -129,6 +131,7 @@ struct Texp_function {
   bool is_cases = false;
   ExprBox body;                 // Tfunction_body
   Location cases_loc;           // Tfunction_cases
+  const ast::Attributes* cases_attrs = nullptr;  // `function[@attr]`
   std::vector<struct Case> cases;
 };
 struct ValueBinding;  // (defined below; used by Texp_let)
@@ -165,11 +168,12 @@ struct ClassStructure;
 struct Texp_object { Box<ClassStructure> cs; };  // object … end (an expression)
 // `let module/open/exception … in e` (fork): an embedded structure item + body.
 struct Texp_struct_item { Box<StructureItem> item; ExprBox body; };
-struct ExprExtra {  // Texp_constraint / Texp_coerce / Texp_poly (method bodies)
-  enum class Kind { Constraint, Coerce, Poly } kind = Kind::Constraint;
+struct ExprExtra {  // Texp_constraint / Texp_coerce / Texp_poly / Texp_newtype
+  enum class Kind { Constraint, Coerce, Poly, Newtype } kind = Kind::Constraint;
   CoreType ctype;                 // constraint type, or coerce TARGET type
   std::optional<CoreType> from;   // coerce SOURCE type (`(e : t1 :> t2)`), else none
   bool poly_has_type = false;     // Poly: whether a method type annotation is present
+  std::string newtype;            // Newtype: the abstract type's source name
   Location loc;
 };
 struct Expression {
@@ -234,24 +238,89 @@ struct ValueDesc {
   Location loc;
   const ast::Attributes* attrs = nullptr;
 };
+
+// Module expressions are mutually recursive with structures and module types,
+// so ModuleExpr is defined after StructureItem and referenced through a box.
+struct ModuleExpr;
+using ModuleExprBox = Box<ModuleExpr>;
+struct ModuleType;
+using ModuleTypeBox2 = Box<ModuleType>;
+
+// An extension constructor (Text_decl form): shared by exceptions and typexts.
+struct ExtCtor {
+  Location loc;
+  Ident id;
+  std::vector<CoreTypeBox> args;
+  std::optional<CoreTypeBox> res;
+  const ast::Attributes* attrs = nullptr;
+};
+
+// module_declaration: name + declared module type (presence per printtyped).
+struct ModuleDecl {
+  bool present = true;  // Absent iff the declared type is an alias
+  Ident id;
+  ModuleTypeBox2 type;
+  const ast::Attributes* attrs = nullptr;
+};
 struct Tsig_value { ValueDesc vd; };
 struct Tsig_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
+struct Tsig_module { ModuleDecl md; };
+struct Tsig_recmodule { std::vector<ModuleDecl> decls; };
+struct Tsig_modtype {  // type null = #abstract
+  Ident id;
+  ModuleTypeBox2 type;
+  const ast::Attributes* attrs = nullptr;
+};
+struct Tsig_include { ModuleTypeBox2 mt; const ast::Attributes* attrs = nullptr; };
+struct Tsig_exception { ExtCtor ctor; const ast::Attributes* attrs = nullptr; };
+struct Tsig_typext {
+  Path path;
+  std::vector<CoreTypeBox> params;
+  std::vector<ExtCtor> ctors;
+  bool private_ = false;
+  const ast::Attributes* attrs = nullptr;
+};
+struct Tsig_primitive {
+  Ident id;
+  Location loc;
+  CoreType type;
+  std::vector<std::string> prims;
+};
+struct Tsig_attribute { std::string name; const ast::Structure* payload; };
+struct Tsig_open { bool override_ = false; Path path; };
 struct SignatureItem {
-  std::variant<Tsig_value, Tsig_type> desc;
+  std::variant<Tsig_value, Tsig_type, Tsig_module, Tsig_recmodule, Tsig_modtype,
+               Tsig_include, Tsig_exception, Tsig_typext, Tsig_primitive,
+               Tsig_attribute, Tsig_open>
+      desc;
   Location loc;
 };
 struct Tmty_ident { Path path; };
 struct Tmty_signature { std::vector<SignatureItem> items; };
+struct Tmty_alias { Path path; };
+// param==nullopt with a param_type -> anonymous "(_ : S)"; param_type==null ->
+// generative "()" (printed `Tmty_functor ()`, no parameter module_type).
+struct Tmty_functor {
+  std::optional<Ident> param;
+  ModuleTypeBox2 param_type;
+  ModuleTypeBox2 body;
+};
+struct Twith_type { TypeDeclaration td; };
+struct Twith_typesubst { TypeDeclaration td; };
+struct Twith_module { Path path; };
+struct Twith_modsubst { Path path; };
+struct Twith_modtype { ModuleTypeBox2 mt; };
+using WithConstraint = std::variant<Twith_type, Twith_typesubst, Twith_module,
+                                    Twith_modsubst, Twith_modtype>;
+struct WithItem { Path path; WithConstraint c; };  // the constrained item + rhs
+struct Tmty_with { ModuleTypeBox2 base; std::vector<WithItem> constraints; };
+struct Tmty_typeof { ModuleExprBox expr; };
 struct ModuleType {
-  std::variant<Tmty_ident, Tmty_signature> desc;
+  std::variant<Tmty_ident, Tmty_signature, Tmty_alias, Tmty_functor, Tmty_with,
+               Tmty_typeof>
+      desc;
   Location loc;
 };
-using ModuleTypeBox2 = Box<ModuleType>;
-
-// Module expressions are mutually recursive with structures, so ModuleExpr is
-// defined after StructureItem and referenced here through a box.
-struct ModuleExpr;
-using ModuleExprBox = Box<ModuleExpr>;
 
 // --- structure ---
 struct Tstr_value {
@@ -260,21 +329,18 @@ struct Tstr_value {
 };
 struct Tstr_eval { ExprBox e; };
 struct Tstr_open { bool override_ = false; ModuleExprBox expr; };
-struct Tstr_module { bool present = true; Ident id; ModuleExprBox expr; };
+struct Tstr_module {
+  bool present = true;
+  Ident id;
+  ModuleExprBox expr;
+  const ast::Attributes* attrs = nullptr;
+};
 struct Tstr_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Tstr_primitive {
   Ident id;
   Location loc;
   CoreType type;
   std::vector<std::string> prims;  // the "external" strings
-};
-// An extension constructor (Text_decl form): shared by exceptions and typexts.
-struct ExtCtor {
-  Location loc;
-  Ident id;
-  std::vector<CoreTypeBox> args;
-  std::optional<CoreTypeBox> res;
-  const ast::Attributes* attrs = nullptr;
 };
 struct Tstr_exception {
   ExtCtor ctor;
@@ -288,10 +354,22 @@ struct Tstr_typext {
   const ast::Attributes* attrs = nullptr;
 };
 struct Tstr_attribute { std::string name; const ast::Structure* payload; };
-struct Tstr_modtype { Ident id; ModuleTypeBox2 type; };  // type null = abstract
-struct Tstr_include { ModuleExprBox expr; };  // include M
+struct Tstr_modtype {
+  Ident id;
+  ModuleTypeBox2 type;  // null = abstract
+  const ast::Attributes* attrs = nullptr;
+};
+struct Tstr_include {  // include M
+  ModuleExprBox expr;
+  const ast::Attributes* attrs = nullptr;
+};
+struct RecmoduleBinding {
+  Ident id;
+  ModuleExprBox expr;
+  const ast::Attributes* attrs = nullptr;
+};
 struct Tstr_recmodule {  // module rec A = .. and B = ..
-  std::vector<std::pair<Ident, ModuleExprBox>> bindings;
+  std::vector<RecmoduleBinding> bindings;
 };
 // --- classes (Tstr_class) ---
 struct ClassExpr;

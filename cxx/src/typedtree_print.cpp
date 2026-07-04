@@ -362,6 +362,8 @@ struct Printer {
         line(j + 1, "Texp_poly");
         if (ex.poly_has_type) { line(j + 1, "Some"); core_type(j + 2, ex.ctype); }
         else line(j + 1, "None");
+      } else if (ex.kind == ExprExtra::Kind::Newtype) {
+        line(j + 1, "Texp_newtype \"" + ex.newtype + "\"");
       } else {
         line(j + 1, "Texp_constraint");
         core_type(j + 1, ex.ctype);
@@ -398,13 +400,20 @@ struct Printer {
         line(j, "[");
         for (auto& p : fn->params) {
           arg_label(j + 1, p.label);
-          line(j + 1, "Param_pat");
-          pattern(j + 2, *p.pat);
+          if (p.default_) {
+            line(j + 1, "Param_optional_default");
+            pattern(j + 2, *p.pat);
+            expression(j + 2, *p.default_);
+          } else {
+            line(j + 1, "Param_pat");
+            pattern(j + 2, *p.pat);
+          }
         }
         line(j, "]");
       }
       if (fn->is_cases) {
         line(j, "Tfunction_cases " + loc(fn->cases_loc));
+        if (fn->cases_attrs) attributes(j + 1, *fn->cases_attrs);
         list_cases(j + 1, fn->cases);
       } else {
         line(j, "Tfunction_body");
@@ -552,8 +561,12 @@ struct Printer {
         line(j, "]");
       }
     } else if (auto* fn = std::get_if<Tmod_functor>(&me.desc)) {
-      line(j, "Tmod_functor \"" + (fn->param ? ident(*fn->param) : "*") + "\"");
-      if (fn->param_type) module_type(j, *fn->param_type);
+      if (!fn->param_type) {  // generative: functor () -> ...
+        line(j, "Tmod_functor ()");
+      } else {
+        line(j, "Tmod_functor \"" + (fn->param ? ident(*fn->param) : "_") + "\"");
+        module_type(j, *fn->param_type);
+      }
       module_expr(j, *fn->body);
     } else if (auto* ap = std::get_if<Tmod_apply>(&me.desc)) {
       line(j, "Tmod_apply");
@@ -577,38 +590,147 @@ struct Printer {
     core_type(i + 1, vd.type);
   }
 
+  // module_declaration (printtyped): the name line, attributes, then the
+  // declared module type one level deeper.  A None md_id prints as bare `_`.
+  void module_declaration(int i, const ModuleDecl& md) {
+    line(i, md.id.stamp < 0 ? "_" : ident(md.id));
+    if (md.attrs) attributes(i, *md.attrs);
+    module_type(i + 1, *md.type);
+  }
+
   void signature_item(int i, const SignatureItem& si) {
     line(i, "signature_item " + loc(si.loc));
     int j = i + 1;
     if (auto* v = std::get_if<Tsig_value>(&si.desc)) {
       line(j, "Tsig_value");
       value_desc(j, v->vd);
-    } else {
-      auto& ty = std::get<Tsig_type>(si.desc);
+    } else if (auto* ty = std::get_if<Tsig_type>(&si.desc)) {
       line(j, std::string("Tsig_type ") +
-                  (ty.rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
-      if (ty.decls.empty()) line(j, "[]");
+                  (ty->rf == RecFlag::Nonrecursive ? "Nonrec" : "Rec"));
+      if (ty->decls.empty()) line(j, "[]");
       else {
         line(j, "[");
-        for (auto& d : ty.decls) type_declaration(j + 1, d);
+        for (auto& d : ty->decls) type_declaration(j + 1, d);
         line(j, "]");
       }
+    } else if (auto* md = std::get_if<Tsig_module>(&si.desc)) {
+      line(j, std::string("Tsig_module (") +
+                  (md->md.present ? "Present" : "Absent") + ")");
+      module_declaration(j, md->md);
+    } else if (auto* rm = std::get_if<Tsig_recmodule>(&si.desc)) {
+      line(j, "Tsig_recmodule");
+      if (rm->decls.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& d : rm->decls) module_declaration(j + 1, d);
+        line(j, "]");
+      }
+    } else if (auto* mt = std::get_if<Tsig_modtype>(&si.desc)) {
+      line(j, "Tsig_modtype \"" + ident(mt->id) + "\"");
+      if (mt->attrs) attributes(j, *mt->attrs);
+      if (mt->type) module_type(j + 1, *mt->type);
+      else os << std::string(2 * j, ' ') << "#abstract";  // run-on, no newline
+    } else if (auto* inc = std::get_if<Tsig_include>(&si.desc)) {
+      line(j, "Tsig_include");
+      if (inc->attrs) attributes(j, *inc->attrs);
+      module_type(j, *inc->mt);
+    } else if (auto* ex = std::get_if<Tsig_exception>(&si.desc)) {
+      line(j, "Tsig_exception");
+      line(j, "type_exception");
+      if (ex->attrs) attributes(j, *ex->attrs);
+      line(j + 1, "ptyext_constructor =");
+      extension_constructor(j + 2, ex->ctor);
+    } else if (auto* tx = std::get_if<Tsig_typext>(&si.desc)) {
+      line(j, "Tsig_typext");
+      line(j, "type_extension");
+      if (tx->attrs) attributes(j, *tx->attrs);
+      line(j + 1, "ptyext_path = \"" + path_aux(tx->path) + "\"");
+      line(j + 1, "ptyext_params =");
+      list_core_types(j + 2, tx->params);
+      line(j + 1, "ptyext_constructors =");
+      if (tx->ctors.empty()) line(j + 2, "[]");
+      else {
+        line(j + 2, "[");
+        for (auto& c : tx->ctors) extension_constructor(j + 3, c);
+        line(j + 2, "]");
+      }
+      line(j + 1, std::string("ptyext_private = ") +
+                      (tx->private_ ? "Private" : "Public"));
+    } else if (auto* pr = std::get_if<Tsig_primitive>(&si.desc)) {
+      line(j, "Tsig_primitive");
+      line(j, "primitive_description " + ident(pr->id) + " " + loc(pr->loc));
+      line(j + 1, "Tprim_decl");
+      core_type(j + 2, pr->type);
+      list_strings(j + 2, pr->prims);
+    } else if (auto* at = std::get_if<Tsig_attribute>(&si.desc)) {
+      line(j, "Tsig_attribute \"" + at->name + "\"");
+      if (at->payload)
+        ast::print_payload_structure(*at->payload, j, os, fname, dirfiles);
+      else
+        line(j, "[]");
+    } else {
+      auto& op = std::get<Tsig_open>(si.desc);
+      line(j, std::string("Tsig_open ") + (op.override_ ? "Override" : "Fresh") +
+                  " \"" + path_aux(op.path) + "\"");
+    }
+  }
+
+  void with_item(int i, const WithItem& w) {
+    line(i, "\"" + path_aux(w.path) + "\"");
+    int j = i + 1;
+    if (auto* t = std::get_if<Twith_type>(&w.c)) {
+      line(j, "Twith_type");
+      type_declaration(j + 1, t->td);
+    } else if (auto* t = std::get_if<Twith_typesubst>(&w.c)) {
+      line(j, "Twith_typesubst");
+      type_declaration(j + 1, t->td);
+    } else if (auto* m = std::get_if<Twith_module>(&w.c)) {
+      line(j, "Twith_module \"" + path_aux(m->path) + "\"");
+    } else if (auto* m = std::get_if<Twith_modsubst>(&w.c)) {
+      line(j, "Twith_modsubst \"" + path_aux(m->path) + "\"");
+    } else {
+      auto& mt = std::get<Twith_modtype>(w.c);
+      line(j, "Twith_modtype");
+      module_type(j + 1, *mt.mt);
     }
   }
 
   void module_type(int i, const ModuleType& mt) {
     line(i, "module_type " + loc(mt.loc));
+    int j = i + 1;
     if (auto* id = std::get_if<Tmty_ident>(&mt.desc)) {
-      line(i + 1, "Tmty_ident \"" + path_aux(id->path) + "\"");
-    } else {
-      auto& sg = std::get<Tmty_signature>(mt.desc);
-      line(i + 1, "Tmty_signature");
-      if (sg.items.empty()) line(i + 1, "[]");
+      line(j, "Tmty_ident \"" + path_aux(id->path) + "\"");
+    } else if (auto* sg = std::get_if<Tmty_signature>(&mt.desc)) {
+      line(j, "Tmty_signature");
+      if (sg->items.empty()) line(j, "[]");
       else {
-        line(i + 1, "[");
-        for (auto& s : sg.items) signature_item(i + 2, s);
-        line(i + 1, "]");
+        line(j, "[");
+        for (auto& s : sg->items) signature_item(j + 1, s);
+        line(j, "]");
       }
+    } else if (auto* al = std::get_if<Tmty_alias>(&mt.desc)) {
+      line(j, "Tmty_alias \"" + path_aux(al->path) + "\"");
+    } else if (auto* fn = std::get_if<Tmty_functor>(&mt.desc)) {
+      if (!fn->param_type) {  // generative: functor () -> ...
+        line(j, "Tmty_functor ()");
+      } else {
+        line(j, "Tmty_functor \"" + (fn->param ? ident(*fn->param) : "_") + "\"");
+        module_type(j, *fn->param_type);
+      }
+      module_type(j, *fn->body);
+    } else if (auto* w = std::get_if<Tmty_with>(&mt.desc)) {
+      line(j, "Tmty_with");
+      module_type(j, *w->base);
+      if (w->constraints.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& c : w->constraints) with_item(j + 1, c);
+        line(j, "]");
+      }
+    } else {
+      auto& to = std::get<Tmty_typeof>(mt.desc);
+      line(j, "Tmty_typeof");
+      module_expr(j, *to.expr);
     }
   }
 
@@ -703,6 +825,7 @@ struct Printer {
     } else if (auto* md = std::get_if<Tstr_module>(&it.desc)) {
       line(j, std::string("Tstr_module (") + (md->present ? "Present" : "Absent") + ")");
       line(j, ident(md->id));
+      if (md->attrs) attributes(j, *md->attrs);
       module_expr(j + 1, *md->expr);
     } else if (auto* at = std::get_if<Tstr_attribute>(&it.desc)) {
       line(j, "Tstr_attribute \"" + at->name + "\"");
@@ -712,16 +835,20 @@ struct Printer {
         line(j, "[]");
     } else if (auto* mt = std::get_if<Tstr_modtype>(&it.desc)) {
       line(j, "Tstr_modtype \"" + ident(mt->id) + "\"");
+      if (mt->attrs) attributes(j, *mt->attrs);
       if (mt->type) module_type(j + 1, *mt->type);
+      else os << std::string(2 * j, ' ') << "#abstract";  // run-on, no newline
     } else if (auto* inc = std::get_if<Tstr_include>(&it.desc)) {
-      os << std::string(2 * j, ' ') << "Tstr_include";  // run-on: module_expr on the same line
+      os << std::string(2 * j, ' ') << "Tstr_include";  // run-on: next line's indent follows
+      if (inc->attrs) attributes(j, *inc->attrs);
       module_expr(j, *inc->expr);
     } else if (auto* rm = std::get_if<Tstr_recmodule>(&it.desc)) {
       line(j, "Tstr_recmodule");
       line(j, "[");
-      for (auto& [id, me] : rm->bindings) {
-        line(j + 1, ident(id));
-        module_expr(j + 2, *me);
+      for (auto& b : rm->bindings) {
+        line(j + 1, ident(b.id));
+        if (b.attrs) attributes(j + 1, *b.attrs);
+        module_expr(j + 2, *b.expr);
       }
       line(j, "]");
     } else if (auto* cl = std::get_if<Tstr_class>(&it.desc)) {
