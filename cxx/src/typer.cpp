@@ -2002,6 +2002,17 @@ struct Typer {
           }
         }
       out.desc = tt::Texp_send{std::move(objexpr), sd->meth.txt, mid};
+    } else if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) {  // fun (type a) -> e
+      auto saved = type_scope;
+      fresh_type(nt->name.txt);
+      out = expr(*nt->body);
+      type_scope = std::move(saved);
+      out.loc = e.loc;  // keep the newtype expression's outer location
+      tt::ExprExtra ex;
+      ex.kind = tt::ExprExtra::Kind::Newtype;
+      ex.newtype = nt->name.txt;
+      ex.loc = nt->name.loc;
+      out.extras.insert(out.extras.begin(), std::move(ex));
     } else if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {
       out.desc = tt::Texp_new{resolve_class(nw->id.txt)};
     } else if (auto* sv = std::get_if<Pexp_setinstvar>(&e.desc)) {  // x <- e
