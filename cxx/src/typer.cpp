@@ -1335,6 +1335,10 @@ struct Typer {
       td.params.push_back(std::make_unique<tt::CoreType>(core_type(*p)));
     td.kind = type_kind(d.kind);
     td.private_ = d.priv == PrivateFlag::Private;
+    for (auto& c : d.constraints)
+      td.constraints.push_back({std::make_unique<tt::CoreType>(core_type(*c.t1)),
+                                std::make_unique<tt::CoreType>(core_type(*c.t2)),
+                                c.loc});
     if (d.manifest) {
       td.manifest = std::make_unique<tt::CoreType>(core_type(**d.manifest));
       // Record a polymorphic-variant abbreviation's tag set (for `#t` patterns).

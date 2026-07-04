@@ -165,17 +165,20 @@ struct Printer {
       core_type(j, *al->type);
     } else if (auto* vr = std::get_if<Ttyp_variant>(&t.desc)) {
       line(j, std::string("Ttyp_variant closed=") + (vr->closed ? "Closed" : "Open"));
-      line(j, "[");
-      for (auto& r : vr->rows) {
-        if (auto* tg = std::get_if<Ttag>(&r.v)) {
-          line(j + 1, "Ttag \"" + tg->name + "\" " + (tg->constant ? "true" : "false"));
-          list_core_types(j + 2, tg->types);
-        } else {
-          line(j + 1, "Tinherit");
-          core_type(j + 2, *std::get<Tinherit>(r.v).type);
+      if (vr->rows.empty()) line(j, "[]");
+      else {
+        line(j, "[");
+        for (auto& r : vr->rows) {
+          if (auto* tg = std::get_if<Ttag>(&r.v)) {
+            line(j + 1, "Ttag \"" + tg->name + "\" " + (tg->constant ? "true" : "false"));
+            list_core_types(j + 2, tg->types);
+          } else {
+            line(j + 1, "Tinherit");
+            core_type(j + 2, *std::get<Tinherit>(r.v).type);
+          }
         }
+        line(j, "]");
       }
-      line(j, "]");
       if (vr->labels) { line(j, "Some"); list_strings(j + 1, *vr->labels); }
       else line(j, "None");
     } else if (auto* ob = std::get_if<Ttyp_object>(&t.desc)) {
@@ -263,7 +266,16 @@ struct Printer {
     line(j, "ptype_params =");
     list_core_types(j + 1, td.params);
     line(j, "ptype_constraints =");
-    line(j + 1, "[]");
+    if (td.constraints.empty()) line(j + 1, "[]");
+    else {
+      line(j + 1, "[");
+      for (auto& c : td.constraints) {
+        line(j + 2, "<constraint> " + loc(c.loc));
+        core_type(j + 3, *c.t1);
+        core_type(j + 3, *c.t2);
+      }
+      line(j + 1, "]");
+    }
     line(j, "ptype_kind =");
     type_kind(j + 1, td.kind);
     line(j, std::string("ptype_private = ") + (td.private_ ? "Private" : "Public"));

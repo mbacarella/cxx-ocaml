@@ -278,6 +278,7 @@ struct Ttype_open {};
 struct TypeKind {
   std::variant<Ttype_abstract, Ttype_variant, Ttype_record, Ttype_open> v;
 };
+struct TypeConstraint { CoreTypeBox t1, t2; Location loc; };  // constraint t1 = t2
 struct TypeDeclaration {
   Ident id;
   Location loc;
@@ -286,6 +287,7 @@ struct TypeDeclaration {
   bool private_ = false;
   std::optional<CoreTypeBox> manifest;
   const ast::Attributes* attrs = nullptr;
+  std::vector<TypeConstraint> constraints;  // ptype_constraints
 };
 
 // --- module types / signatures (fragment) ---
