@@ -154,6 +154,9 @@ struct Printer {
     } else if (auto* c = std::get_if<Ttyp_constr>(&t.desc)) {
       line(j, "Ttyp_constr \"" + path_aux(c->path) + "\"");
       list_core_types(j, c->args);
+    } else if (auto* cl = std::get_if<Ttyp_class>(&t.desc)) {
+      line(j, "Ttyp_class \"" + path_aux(cl->path) + "\"");
+      list_core_types(j, cl->args);
     } else if (auto* al = std::get_if<Ttyp_alias>(&t.desc)) {
       line(j, "Ttyp_alias \"" + al->name + "\"");
       core_type(j, *al->type);
@@ -553,7 +556,8 @@ struct Printer {
     } else if (auto* iv = std::get_if<Texp_instvar>(&e.desc)) {
       line(j, "Texp_instvar \"" + ident(iv->id) + "\"");
     } else if (auto* sd = std::get_if<Texp_send>(&e.desc)) {
-      line(j, "Texp_send \"" + sd->meth + "\"");
+      // Tmeth_val/ancestor print the ident (name/stamp); Tmeth_name just the name.
+      line(j, "Texp_send \"" + (sd->meth_id ? ident(*sd->meth_id) : sd->meth) + "\"");
       expression(j, *sd->obj);
     } else if (auto* pk = std::get_if<Texp_pack>(&e.desc)) {
       os << std::string(2 * j, ' ') << "Texp_pack";  // run-on: module_expr same line
@@ -575,6 +579,8 @@ struct Printer {
       os << std::string(2 * j, ' ') << "Texp_object";  // run-on: class_structure same line
       line(j, "class_structure");
       class_structure_p(j, *ob->cs);
+    } else if (auto* nw = std::get_if<Texp_new>(&e.desc)) {
+      line(j, "Texp_new \"" + path_aux(nw->path) + "\"");
     } else {
       auto& si = std::get<Texp_struct_item>(e.desc);
       line(j, "Texp_struct_item");
@@ -752,6 +758,16 @@ struct Printer {
         ast::print_payload_structure(*at->payload, j, os, fname, dirfiles);
       else
         line(j, "[]");
+    } else if (auto* cl = std::get_if<Tsig_class>(&si.desc)) {
+      line(j, "Tsig_class");
+      line(j, "[");
+      for (auto& d : cl->decls) class_description(j + 1, *d);
+      line(j, "]");
+    } else if (auto* clt = std::get_if<Tsig_class_type>(&si.desc)) {
+      line(j, "Tsig_class_type");
+      line(j, "[");
+      for (auto& d : clt->decls) class_type_declaration(j + 1, *d);
+      line(j, "]");
     } else {
       auto& op = std::get<Tsig_open>(si.desc);
       line(j, std::string("Tsig_open ") + (op.override_ ? "Override" : "Fresh") +
@@ -881,14 +897,81 @@ struct Printer {
     for (auto& f : cs.fields) class_field(i + 2, f);
     line(i + 1, "]");
   }
+  void pci_params(int i, const std::vector<CoreType>& params) {
+    line(i, "pci_params =");
+    if (params.empty()) { line(i + 1, "[]"); return; }
+    line(i + 1, "[");
+    for (auto& p : params) core_type(i + 2, p);
+    line(i + 1, "]");
+  }
   void class_declaration(int i, const ClassDeclaration& d) {
     line(i, "class_declaration " + loc(d.loc));
     line(i + 1, std::string("pci_virt = ") + (d.virt ? "Virtual" : "Concrete"));
-    line(i + 1, "pci_params =");
-    line(i + 2, "[]");
+    pci_params(i + 1, d.params);
     line(i + 1, "pci_name = \"" + d.name + "\"");
     line(i + 1, "pci_expr =");
     class_expr(i + 2, d.expr);
+  }
+  void class_type(int i, const ClassType& ct) {
+    line(i, "class_type " + loc(ct.loc));
+    if (auto* cn = std::get_if<Tcty_constr>(&ct.desc)) {
+      line(i + 1, "Tcty_constr \"" + path_aux(cn->path) + "\"");
+      if (cn->args.empty()) line(i + 1, "[]");
+      else { line(i + 1, "["); for (auto& a : cn->args) core_type(i + 2, *a); line(i + 1, "]"); }
+    } else if (auto* ar = std::get_if<Tcty_arrow>(&ct.desc)) {
+      line(i + 1, "Tcty_arrow");
+      arg_label(i + 1, ar->label);
+      core_type(i + 1, *ar->dom);
+      class_type(i + 1, *ar->cod);
+    } else {
+      auto& sg = std::get<Tcty_signature>(ct.desc);
+      line(i + 1, "Tcty_signature");
+      line(i + 1, "class_signature");
+      core_type(i + 2, sg.cs.self);
+      if (sg.cs.fields.empty()) { line(i + 2, "[]"); return; }
+      line(i + 2, "[");
+      for (auto& f : sg.cs.fields) class_type_field(i + 3, f);
+      line(i + 2, "]");
+    }
+  }
+  void class_type_field(int i, const ClassTypeField& f) {
+    line(i, "class_type_field " + loc(f.loc));
+    if (auto* in = std::get_if<Tctf_inherit>(&f.desc)) {
+      line(i + 1, "Tctf_inherit");
+      class_type(i + 1, *in->ct);
+    } else if (auto* v = std::get_if<Tctf_val>(&f.desc)) {
+      line(i + 1, "Tctf_val \"" + v->name + "\" " + (v->mutable_ ? "Mutable" : "Immutable") +
+                      " " + (v->virtual_ ? "Virtual" : "Concrete"));
+      core_type(i + 2, v->type);
+    } else if (auto* m = std::get_if<Tctf_method>(&f.desc)) {
+      line(i + 1, "Tctf_method \"" + m->name + "\" " + (m->private_ ? "Private" : "Public") +
+                      " " + (m->virtual_ ? "Virtual" : "Concrete"));
+      core_type(i + 2, m->type);
+    } else {
+      auto& c = std::get<Tctf_constraint>(f.desc);
+      line(i + 1, "Tctf_constraint");
+      core_type(i + 2, c.t1);
+      core_type(i + 2, c.t2);
+    }
+  }
+  // The class-infos body (shared by class_description / class_type_declaration).
+  void class_infos_body(int i, const ClassTypeDeclaration& d) {
+    line(i + 1, std::string("pci_virt = ") + (d.virt ? "Virtual" : "Concrete"));
+    pci_params(i + 1, d.params);
+    line(i + 1, "pci_name = \"" + d.name + "\"");
+    line(i + 1, "pci_expr =");
+    class_type(i + 2, d.expr);
+  }
+  void class_type_declaration(int i, const ClassTypeDeclaration& d) {
+    line(i, "class_type_declaration " + loc(d.loc));
+    class_infos_body(i, d);
+  }
+  // A class description (Tsig_class item): like class_type_declaration but the
+  // header reads "class_description" and prints the declaration's attributes.
+  void class_description(int i, const ClassTypeDeclaration& d) {
+    line(i, "class_description " + loc(d.loc));
+    if (d.attrs) attributes(i, *d.attrs);
+    class_infos_body(i, d);
   }
 
   void structure_item(int i, const StructureItem& it) {
@@ -950,6 +1033,11 @@ struct Printer {
       line(j, "Tstr_class");
       line(j, "[");
       for (auto& d : cl->decls) class_declaration(j + 1, d);
+      line(j, "]");
+    } else if (auto* clt = std::get_if<Tstr_class_type>(&it.desc)) {
+      line(j, "Tstr_class_type");
+      line(j, "[");
+      for (auto& d : clt->decls) class_type_declaration(j + 1, d);
       line(j, "]");
     } else if (auto* tx = std::get_if<Tstr_typext>(&it.desc)) {
       line(j, "Tstr_typext");

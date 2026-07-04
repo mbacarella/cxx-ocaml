@@ -52,6 +52,7 @@ struct Ttyp_tuple {
   std::vector<std::pair<std::optional<std::string>, CoreTypeBox>> elems;
 };
 struct Ttyp_constr { Path path; std::vector<CoreTypeBox> args; };
+struct Ttyp_class { Path path; std::vector<CoreTypeBox> args; };  // [args] #class
 struct Ttyp_poly { std::vector<std::string> vars; CoreTypeBox type; };
 struct Ttyp_alias { std::string name; CoreTypeBox type; };  // (t as 'name)
 struct Ttyp_object {  // < m : t ; ... >  (Otag methods only)
@@ -71,7 +72,7 @@ struct Ttyp_variant {  // [ `A | `B of t | ... ]  (Rtag rows only)
 };
 struct CoreType {
   std::variant<Ttyp_any, Ttyp_var, Ttyp_arrow, Ttyp_tuple, Ttyp_constr, Ttyp_poly,
-               Ttyp_alias, Ttyp_variant, Ttyp_object, Ttyp_package>
+               Ttyp_alias, Ttyp_variant, Ttyp_object, Ttyp_package, Ttyp_class>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;  // ctyp_attributes ([@untagged] ...)
@@ -188,7 +189,10 @@ struct Texp_field { ExprBox record; std::string name; };
 struct Texp_setfield { ExprBox record; std::string name; ExprBox value; };  // r.l <- v
 struct Texp_variant { std::string label; std::optional<ExprBox> arg; };  // `A [e]
 struct Texp_instvar { Ident id; };  // an instance-variable reference inside a method
-struct Texp_send { ExprBox obj; std::string meth; };  // e # m
+// meth_id present => Tmeth_val/Tmeth_ancestor (prints "meth/stamp"); absent =>
+// Tmeth_name (prints just "meth").  A self-send resolves to the method's ident.
+struct Texp_send { ExprBox obj; std::string meth; std::optional<Ident> meth_id; };  // e # m
+struct Texp_new { Path path; };  // new M.c
 struct ClassStructure;
 struct Texp_object { Box<ClassStructure> cs; };  // object … end (an expression)
 // `let module/open/exception … in e` (fork): an embedded structure item + body.
@@ -220,7 +224,7 @@ struct Expression {
                Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
                Texp_while, Texp_record, Texp_field, Texp_setfield, Texp_variant,
                Texp_instvar, Texp_send, Texp_object, Texp_struct_item,
-               Texp_pack, Texp_letop, Texp_unreachable>
+               Texp_pack, Texp_letop, Texp_unreachable, Texp_new>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
@@ -328,10 +332,13 @@ struct Tsig_primitive {
 };
 struct Tsig_attribute { std::string name; const ast::Structure* payload; };
 struct Tsig_open { bool override_ = false; Path path; };
+struct ClassTypeDeclaration;  // defined with the class-type section below
+struct Tsig_class { std::vector<Box<ClassTypeDeclaration>> decls; };      // class c : ct
+struct Tsig_class_type { std::vector<Box<ClassTypeDeclaration>> decls; };  // class type c = ct
 struct SignatureItem {
   std::variant<Tsig_value, Tsig_type, Tsig_module, Tsig_recmodule, Tsig_modtype,
                Tsig_include, Tsig_exception, Tsig_typext, Tsig_primitive,
-               Tsig_attribute, Tsig_open>
+               Tsig_attribute, Tsig_open, Tsig_class, Tsig_class_type>
       desc;
   Location loc;
 };
@@ -445,14 +452,44 @@ struct ClassExpr {
 struct ClassDeclaration {
   bool virt = false;
   std::string name;
+  std::vector<CoreType> params;  // pci_params: the class' type parameters
   ClassExpr expr;
   Location loc;
 };
 struct Tstr_class { std::vector<ClassDeclaration> decls; };
+
+// --- class types (Tstr_class_type / Tsig_class / Tsig_class_type) ---
+struct ClassType;
+struct Tctf_inherit { Box<ClassType> ct; };
+struct Tctf_val { std::string name; bool mutable_; bool virtual_; CoreType type; };
+// method type is Ttyp_poly-wrapped
+struct Tctf_method { std::string name; bool private_; bool virtual_; CoreType type; };
+struct Tctf_constraint { CoreType t1; CoreType t2; };
+struct ClassTypeField {
+  std::variant<Tctf_inherit, Tctf_val, Tctf_method, Tctf_constraint> desc;
+  Location loc;
+};
+struct ClassSignature { CoreType self; std::vector<ClassTypeField> fields; };
+struct Tcty_constr { Path path; std::vector<CoreTypeBox> args; };
+struct Tcty_signature { ClassSignature cs; };
+struct Tcty_arrow { ArgLabel label; CoreTypeBox dom; Box<ClassType> cod; };
+struct ClassType {
+  std::variant<Tcty_constr, Tcty_signature, Tcty_arrow> desc;
+  Location loc;
+};
+struct ClassTypeDeclaration {
+  bool virt = false;
+  std::string name;
+  std::vector<CoreType> params;
+  ClassType expr;
+  Location loc;
+  const ast::Attributes* attrs = nullptr;  // printed only in class_description (Tsig_class)
+};
+struct Tstr_class_type { std::vector<ClassTypeDeclaration> decls; };
 struct StructureItem {
   std::variant<Tstr_value, Tstr_eval, Tstr_type, Tstr_primitive, Tstr_exception,
                Tstr_open, Tstr_module, Tstr_attribute, Tstr_typext, Tstr_modtype,
-               Tstr_include, Tstr_recmodule, Tstr_class>
+               Tstr_include, Tstr_recmodule, Tstr_class, Tstr_class_type>
       desc;
   Location loc;
 };

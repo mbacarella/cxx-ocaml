@@ -890,6 +890,11 @@ struct Typer {
   // instance-variable reference (Texp_instvar), not an ordinary identifier.
   std::unordered_map<std::string, tt::Ident> instvars_;
   std::unordered_map<std::string, tt::Ident> class_scope_;  // class names -> Ident
+  // Method self-sends: each class' methods get a shared ident (the "meths" table).
+  // A send whose object is the enclosing self resolves the method to its ident
+  // (Tmeth_val); every other send prints the name only (Tmeth_name).
+  using MethsMap = std::unordered_map<std::string, tt::Ident>;
+  std::unordered_map<int, std::shared_ptr<MethsMap>> self_meths_;  // self-ident stamp -> class' meths
   tt::Path resolve_class(const Longident& lid) {
     if (auto* l = std::get_if<Lident>(&lid.v)) {
       auto it = class_scope_.find(l->name);
@@ -1070,6 +1075,12 @@ struct Typer {
       tt::Ttyp_constr tc;
       tc.path = resolve_type(c->id.txt);
       for (auto& arg : c->args)
+        tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*arg)));
+      out.desc = std::move(tc);
+    } else if (auto* cl = std::get_if<Ptyp_class>(&t.desc)) {  // `[args] #class`
+      tt::Ttyp_class tc;
+      tc.path = resolve_class(cl->id.txt);
+      for (auto& arg : cl->args)
         tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*arg)));
       out.desc = std::move(tc);
     } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
@@ -1814,7 +1825,21 @@ struct Typer {
       if (vr->arg) tv.arg = std::make_unique<tt::Expression>(expr(**vr->arg));
       out.desc = std::move(tv);
     } else if (auto* sd = std::get_if<Pexp_send>(&e.desc)) {
-      out.desc = tt::Texp_send{std::make_unique<tt::Expression>(expr(*sd->obj)), sd->meth.txt};
+      auto objexpr = std::make_unique<tt::Expression>(expr(*sd->obj));
+      // A self-send (object is the enclosing self ident, method is one of its
+      // methods) resolves the method to its ident (Tmeth_val); else Tmeth_name.
+      std::optional<tt::Ident> mid;
+      if (auto* oi = std::get_if<tt::Texp_ident>(&objexpr->desc))
+        if (auto* pid = std::get_if<tt::Pident>(&oi->path.v)) {
+          auto it = self_meths_.find(pid->id.stamp);
+          if (it != self_meths_.end()) {
+            auto mit = it->second->find(sd->meth.txt);
+            if (mit != it->second->end()) mid = mit->second;
+          }
+        }
+      out.desc = tt::Texp_send{std::move(objexpr), sd->meth.txt, mid};
+    } else if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {
+      out.desc = tt::Texp_new{resolve_class(nw->id.txt)};
     } else if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
       out.desc = tt::Texp_object{std::make_unique<tt::ClassStructure>(build_class_structure(*ob->cs))};
     } else if (auto* rec = std::get_if<Pexp_record>(&e.desc)) {
@@ -2126,6 +2151,26 @@ struct Typer {
         load_open_names_lid(op->id.txt, oe);
         opens.push_back(std::move(oe));
         si.desc = std::move(out);
+      } else if (auto* cl = std::get_if<Psig_class>(&it.desc)) {
+        tt::Tsig_class out;
+        for (auto& d : cl->decls) {
+          class_scope_[d.name.txt] = fresh_anon(d.name.txt);
+          type_scope[d.name.txt] = fresh_anon(d.name.txt);
+        }
+        for (auto& d : cl->decls)
+          out.decls.push_back(std::make_unique<tt::ClassTypeDeclaration>(
+              class_type_declaration(d)));
+        si.desc = std::move(out);
+      } else if (auto* clt = std::get_if<Psig_class_type>(&it.desc)) {
+        tt::Tsig_class_type out;
+        for (auto& d : clt->decls) {
+          class_scope_[d.name.txt] = fresh_anon(d.name.txt);
+          type_scope[d.name.txt] = fresh_anon(d.name.txt);
+        }
+        for (auto& d : clt->decls)
+          out.decls.push_back(std::make_unique<tt::ClassTypeDeclaration>(
+              class_type_declaration(d)));
+        si.desc = std::move(out);
       } else {
         throw TypeError("sigitem#" + std::to_string(it.desc.index()));
       }
@@ -2278,7 +2323,16 @@ struct Typer {
   // Texp_poly extra on the body.  (Instance-variable references in the body would
   // become Texp_instvar -- handled once vals are tracked.)
   int object_no_ = 0;  // global per-object counter for the self-N display name
-  tt::Expression elaborate_method(const Expression& body0, int self_n, Location selfloc) {
+  // The self name bound in a class/object (`object (self) .. end`), or none for an
+  // anonymous self.  Extracted from the parsed self pattern.
+  std::optional<std::string> self_pat_name(const ast::Pattern& p) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) return v->name.txt;
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return self_pat_name(*c->p);
+    return std::nullopt;
+  }
+  tt::Expression elaborate_method(const Expression& body0, int self_n, Location selfloc,
+                                  const std::optional<std::string>& self_name,
+                                  const std::shared_ptr<MethsMap>& meths) {
     const Expression* body = &body0;
     const CoreType* mty = nullptr;  // (method m : T = e): keep the type for the extra
     if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) {
@@ -2288,20 +2342,34 @@ struct Typer {
     Location floc = body0.loc;  // the synthetic function & its poly extra sit on the body
     floc.ghost = true;
     selfloc.ghost = true;       // the self parameter sits on the self location
+    // The self parameter's idents are allocated BEFORE the body so a self-send in
+    // the body resolves to the alias ident (self-N).  Bind the self name to it.
+    tt::Ident self_inner = fresh_anon("self-*");
+    tt::Ident self_alias = fresh_anon("self-" + std::to_string(self_n));
+    push();
+    if (self_name) {
+      scopes.back()[*self_name] = self_alias;
+      self_meths_[self_alias.stamp] = meths;
+    }
     tt::Expression be = expr(*body);
+    pop();
     tt::ExprExtra ex;
     ex.kind = tt::ExprExtra::Kind::Poly;
     ex.poly_has_type = mty != nullptr;
-    if (mty) ex.ctype = core_type(*mty);
+    // A method type annotation is always a Ttyp_poly; a bare (non-`'a.`) type is
+    // wrapped in Ttyp_poly([], _) with the inner type's location.
+    if (mty)
+      ex.ctype = std::holds_alternative<Ptyp_poly>(mty->desc) ? core_type(*mty)
+                                                              : poly_wrap(*mty);
     ex.loc = floc;
     be.extras.insert(be.extras.begin(), std::move(ex));  // Texp_poly first
     // synthetic self parameter: Tpat_alias self-N (Tpat_var self-*), at the self loc
     tt::Pattern selfvar;
     selfvar.loc = selfloc;
-    selfvar.desc = tt::Tpat_var{fresh_anon("self-*")};
+    selfvar.desc = tt::Tpat_var{self_inner};
     tt::Pattern selfpat;
     selfpat.loc = selfloc;
-    selfpat.desc = tt::Tpat_alias{fresh_anon("self-" + std::to_string(self_n)),
+    selfpat.desc = tt::Tpat_alias{self_alias,
                                   std::make_unique<tt::Pattern>(std::move(selfvar))};
     tt::FunctionParam fp;
     fp.label = ArgLabel{};
@@ -2323,13 +2391,21 @@ struct Typer {
   // Build a class_structure (shared by classes and inline `object .. end`).
   tt::ClassStructure build_class_structure(const ast::ClassStructure& cs) {
     tt::ClassStructure ts;
-    // self pattern: Tpat_alias "selfpat-*" (Tpat_any).  The inner sits on the
-    // self location (a zero-width point), the alias on the _none_ location.
-    Location selfloc = cs.self.loc;
-    selfloc.ghost = true;
+    push();  // contain the self / instance-variable bindings to this structure
+    // self pattern: Tpat_alias "selfpat-*" (<self>).  For an anonymous self the
+    // inner is Tpat_any at the (zero-width) self location; for a named self it is
+    // the elaborated self pattern (Tpat_var, plus a Tpat_extra_constraint for
+    // `(self : 'ty)`).  The alias sits on the _none_ location.
+    std::optional<std::string> self_name = self_pat_name(cs.self);
     tt::Pattern inner;
-    inner.loc = selfloc;
-    inner.desc = tt::Tpat_any{};
+    if (std::holds_alternative<Ppat_any>(cs.self.desc)) {
+      Location selfloc = cs.self.loc;
+      selfloc.ghost = true;
+      inner.loc = selfloc;
+      inner.desc = tt::Tpat_any{};
+    } else {
+      inner = pattern(cs.self);
+    }
     tt::Pattern selfp;
     selfp.loc = none_loc();
     selfp.desc = tt::Tpat_alias{fresh_anon("selfpat-*"),
@@ -2340,6 +2416,12 @@ struct Typer {
     for (auto& f : cs.fields)
       if (auto* v = std::get_if<Pcf_val>(&f.desc))
         instvars_[v->name.txt] = fresh_anon(v->name.txt);
+    // Each method gets a shared ident (the class' "meths" table); a self-send
+    // resolves the method to this ident (Tmeth_val).
+    auto meths = std::make_shared<MethsMap>();
+    for (auto& f : cs.fields)
+      if (auto* m = std::get_if<Pcf_method>(&f.desc))
+        (*meths)[m->name.txt] = fresh_anon(m->name.txt);
     int self_n = ++object_no_;  // this object's self-N (shared by all its methods)
     for (auto& f : cs.fields) {
       tt::ClassField cf;
@@ -2351,7 +2433,8 @@ struct Typer {
         tm.name = m->name.txt;
         tm.private_ = m->priv == PrivateFlag::Private;
         tm.override_ = cc->ovr == OverrideFlag::Override;
-        tm.expr = std::make_unique<tt::Expression>(elaborate_method(*cc->e, self_n, cs.self.loc));
+        tm.expr = std::make_unique<tt::Expression>(
+            elaborate_method(*cc->e, self_n, cs.self.loc, self_name, meths));
         cf.desc = std::move(tm);
       } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
         auto* cc = std::get_if<Cfk_concrete>(&v->kind);
@@ -2378,6 +2461,7 @@ struct Typer {
       ts.fields.push_back(std::move(cf));
     }
     instvars_ = std::move(saved_iv);
+    pop();
     return ts;
   }
   void collect_pat_vars(const Pattern& p, std::vector<std::string>& out) {
@@ -2424,11 +2508,89 @@ struct Typer {
     out.loc = d.loc;
     out.virt = d.virt == VirtualFlag::Virtual;
     out.name = d.name.txt;
+    for (auto& p : d.params) out.params.push_back(core_type(*p));
     auto saved_iv = instvars_;
     push();  // a scope for class parameters
     out.expr = class_expr_t(d.expr);
     pop();
     instvars_ = std::move(saved_iv);
+    return out;
+  }
+  // A class-type method annotation is always a Ttyp_poly; a bare type is wrapped
+  // in Ttyp_poly([], _) whose loc is the enclosing field's location.
+  tt::CoreType method_poly(const CoreType& t, Location field_loc) {
+    if (std::holds_alternative<Ptyp_poly>(t.desc)) return core_type(t);
+    tt::CoreType poly;
+    poly.loc = field_loc;
+    poly.desc = tt::Ttyp_poly{{}, std::make_unique<tt::CoreType>(core_type(t))};
+    return poly;
+  }
+  tt::ClassType class_type_t(const ast::ClassType& ct) {
+    tt::ClassType out;
+    out.loc = ct.loc;
+    if (auto* cn = std::get_if<Pcty_constr>(&ct.desc)) {
+      tt::Tcty_constr tc;
+      tc.path = resolve_class(cn->id.txt);
+      for (auto& a : cn->args)
+        tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*a)));
+      out.desc = std::move(tc);
+    } else if (auto* sg = std::get_if<Pcty_signature>(&ct.desc)) {
+      out.desc = tt::Tcty_signature{class_signature(sg->cs)};
+    } else if (auto* ar = std::get_if<Pcty_arrow>(&ct.desc)) {
+      tt::Tcty_arrow ta;
+      ta.label = ar->label;
+      ta.dom = std::make_unique<tt::CoreType>(core_type(*ar->dom));
+      ta.cod = std::make_unique<tt::ClassType>(class_type_t(*ar->cod));
+      out.desc = std::move(ta);
+    } else {
+      throw TypeError("class_type#" + std::to_string(ct.desc.index()));
+    }
+    return out;
+  }
+  tt::ClassSignature class_signature(const ast::ClassSignature& cs) {
+    tt::ClassSignature out;
+    out.self = core_type(*cs.self);
+    for (auto& f : cs.fields) {
+      tt::ClassTypeField cf;
+      cf.loc = f.loc;
+      if (auto* in = std::get_if<Pctf_inherit>(&f.desc)) {
+        cf.desc = tt::Tctf_inherit{std::make_unique<tt::ClassType>(class_type_t(*in->ct))};
+      } else if (auto* v = std::get_if<Pctf_val>(&f.desc)) {
+        tt::Tctf_val tv;
+        tv.name = v->name.txt;
+        tv.mutable_ = v->mut == MutableFlag::Mutable;
+        tv.virtual_ = v->virt == VirtualFlag::Virtual;
+        tv.type = core_type(*v->type);
+        cf.desc = std::move(tv);
+      } else if (auto* m = std::get_if<Pctf_method>(&f.desc)) {
+        tt::Tctf_method tm;
+        tm.name = m->name.txt;
+        tm.private_ = m->priv == PrivateFlag::Private;
+        tm.virtual_ = m->virt == VirtualFlag::Virtual;
+        tm.type = method_poly(*m->type, f.loc);
+        cf.desc = std::move(tm);
+      } else if (auto* c = std::get_if<Pctf_constraint>(&f.desc)) {
+        tt::Tctf_constraint tc;
+        tc.t1 = core_type(*c->t1);
+        tc.t2 = core_type(*c->t2);
+        cf.desc = std::move(tc);
+      } else {
+        throw TypeError("class_type_field#" + std::to_string(f.desc.index()));
+      }
+      out.fields.push_back(std::move(cf));
+    }
+    return out;
+  }
+  tt::ClassTypeDeclaration class_type_declaration(const ast::ClassTypeDeclaration& d) {
+    tt::ClassTypeDeclaration out;
+    out.loc = d.loc;
+    out.virt = d.virt == VirtualFlag::Virtual;
+    out.name = d.name.txt;
+    out.attrs = &d.attrs;
+    for (auto& p : d.params) out.params.push_back(core_type(*p));
+    push();  // a scope for the class-type parameters
+    out.expr = class_type_t(d.expr);
+    pop();
     return out;
   }
 
@@ -2551,9 +2713,19 @@ struct Typer {
       si.desc = tt::Tstr_include{std::move(me), &in->attrs};
     } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
       tt::Tstr_class tc;
-      for (auto& d : cl->decls)  // pre-register names (stamp first, mutual refs)
+      for (auto& d : cl->decls) {  // pre-register names (stamp first, mutual refs)
         class_scope_[d.name.txt] = fresh_anon(d.name.txt);
+        type_scope[d.name.txt] = fresh_anon(d.name.txt);  // the object type ctor
+      }
       for (auto& d : cl->decls) tc.decls.push_back(class_declaration(d));
+      si.desc = std::move(tc);
+    } else if (auto* clt = std::get_if<Pstr_class_type>(&it.desc)) {
+      tt::Tstr_class_type tc;
+      for (auto& d : clt->decls) {  // a class type introduces the `#c` class name
+        class_scope_[d.name.txt] = fresh_anon(d.name.txt);
+        type_scope[d.name.txt] = fresh_anon(d.name.txt);  // and the object type ctor
+      }
+      for (auto& d : clt->decls) tc.decls.push_back(class_type_declaration(d));
       si.desc = std::move(tc);
     } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
       tt::Tstr_recmodule tr;
