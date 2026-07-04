@@ -895,6 +895,10 @@ struct Typer {
   // (Tmeth_val); every other send prints the name only (Tmeth_name).
   using MethsMap = std::unordered_map<std::string, tt::Ident>;
   std::unordered_map<int, std::shared_ptr<MethsMap>> self_meths_;  // self-ident stamp -> class' meths
+  // Local polymorphic-variant abbreviations (`type t = [ `A | `B of u | .. ]`):
+  // a `#t` pattern expands to the or-pattern of these tags.
+  struct PolyTag { std::string name; bool has_arg; };
+  std::unordered_map<int, std::vector<PolyTag>> polyvar_tags_;  // type-ident stamp -> tags
   tt::Path resolve_class(const Longident& lid) {
     if (auto* l = std::get_if<Lident>(&lid.v)) {
       auto it = class_scope_.find(l->name);
@@ -1269,9 +1273,35 @@ struct Typer {
       td.params.push_back(std::make_unique<tt::CoreType>(core_type(*p)));
     td.kind = type_kind(d.kind);
     td.private_ = d.priv == PrivateFlag::Private;
-    if (d.manifest)
+    if (d.manifest) {
       td.manifest = std::make_unique<tt::CoreType>(core_type(**d.manifest));
+      // Record a polymorphic-variant abbreviation's tag set (for `#t` patterns).
+      if (auto* pv = std::get_if<Ptyp_variant>(&(*d.manifest)->desc)) {
+        std::vector<PolyTag> tags;
+        collect_polyvar_tags(*pv, tags);
+        polyvar_tags_[td.id.stamp] = std::move(tags);
+      }
+    }
     return td;
+  }
+  // Flatten a polyvariant manifest's tags (Rtag direct, Rinherit via the
+  // referenced local abbreviation).
+  void collect_polyvar_tags(const Ptyp_variant& pv, std::vector<PolyTag>& out) {
+    for (auto& row : pv.rows) {
+      if (auto* rt = std::get_if<Rtag>(&row)) {
+        out.push_back({rt->name, !rt->constant});
+      } else if (auto* ri = std::get_if<Rinherit>(&row)) {
+        if (auto* c = std::get_if<Ptyp_constr>(&ri->ct->desc))
+          if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
+            auto t = type_scope.find(l->name);
+            if (t != type_scope.end()) {
+              auto f = polyvar_tags_.find(t->second.stamp);
+              if (f != polyvar_tags_.end())
+                for (auto& pt : f->second) out.push_back(pt);
+            }
+          }
+      }
+    }
   }
 
   // Transcribe a (recursive) type-declaration group: pre-bind names, register
@@ -1503,6 +1533,48 @@ struct Typer {
       } else {
         out.desc = tt::Tpat_any{};
       }
+    } else if (auto* ty = std::get_if<Ppat_type>(&p.desc)) {  // #t
+      // `#t` expands to the or-pattern of t's polyvariant tags (in decl order,
+      // seeded from the first: A | B | C  ->  Or(C, Or(B, A))), with a
+      // Tpat_extra_type recording the type path.  All nodes are ghost at #t's loc.
+      tt::Path tp = resolve_type(ty->id.txt);
+      const std::vector<PolyTag>* tags = nullptr;
+      if (auto* pid = std::get_if<tt::Pident>(&tp.v)) {
+        auto f = polyvar_tags_.find(pid->id.stamp);
+        if (f != polyvar_tags_.end()) tags = &f->second;
+      }
+      if (!tags || tags->empty()) throw TypeError("pat#type unknown tags");
+      Location gloc = p.loc;
+      gloc.ghost = true;
+      auto mk_variant = [&](const PolyTag& t) {
+        tt::Pattern v;
+        v.loc = gloc;
+        tt::Tpat_variant tv;
+        tv.label = t.name;
+        if (t.has_arg) {
+          auto arg = std::make_unique<tt::Pattern>();
+          arg->loc = none_loc();
+          arg->loc.ghost = true;
+          arg->desc = tt::Tpat_any{};
+          tv.arg = std::move(arg);
+        }
+        v.desc = std::move(tv);
+        return v;
+      };
+      tt::Pattern acc = mk_variant((*tags)[0]);
+      for (size_t k = 1; k < tags->size(); ++k) {
+        tt::Pattern orp;
+        orp.loc = gloc;
+        orp.desc = tt::Tpat_or{std::make_unique<tt::Pattern>(mk_variant((*tags)[k])),
+                               std::make_unique<tt::Pattern>(std::move(acc))};
+        acc = std::move(orp);
+      }
+      out.desc = std::move(acc.desc);  // top node is non-ghost, carries the extra
+      tt::PatExtra ex;
+      ex.kind = tt::PatExtra::Kind::Type;
+      ex.type_path = std::move(tp);
+      ex.loc = p.loc;
+      out.extras.push_back(std::move(ex));
     } else {
       throw TypeError("pat#" + std::to_string(p.desc.index()));
     }

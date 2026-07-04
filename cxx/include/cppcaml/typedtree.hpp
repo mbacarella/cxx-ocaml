@@ -110,10 +110,11 @@ struct Tpat_record {  // { l1 = p1; ... } -- only the written fields, in order
 struct Tpat_array { std::vector<PatBox> elems; };  // [| ... |] (always Mutable)
 struct Tpat_lazy { PatBox inner; };                // lazy p
 struct Tpat_variant { std::string label; PatBox arg; };  // `Tag [p]; null = no payload
-struct PatExtra {  // Tpat_extra_constraint / Tpat_extra_unpack
-  enum class Kind { Constraint, Unpack } kind = Kind::Constraint;
+struct PatExtra {  // Tpat_extra_constraint / Tpat_extra_unpack / Tpat_extra_type
+  enum class Kind { Constraint, Unpack, Type } kind = Kind::Constraint;
   CoreType ctype;                  // Constraint
   std::optional<PackageType> pkg;  // Unpack: `(module M : S)`; nullopt = untyped
+  Path type_path;                  // Type: the `#t` type path
   Location loc;
 };
 struct Pattern {

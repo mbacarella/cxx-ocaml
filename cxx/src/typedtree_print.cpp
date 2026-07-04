@@ -316,6 +316,8 @@ struct Printer {
         line(j + 1, "Tpat_extra_unpack");
         if (ex.pkg) { line(j + 1, "Some"); package_type(j + 2, *ex.pkg); }
         else line(j + 1, "None");
+      } else if (ex.kind == PatExtra::Kind::Type) {
+        line(j + 1, "Tpat_extra_type \"" + path_aux(ex.type_path) + "\"");
       } else {
         line(j + 1, "Tpat_extra_constraint");
         core_type(j + 1, ex.ctype);
