@@ -3428,3 +3428,51 @@ local-module strengthening (syntactic_arity), polyvariant Param_pat exhaustivene
 (intext/woodyatt), imported-type #t (cmi pv_tags), plus assorted pre-existing
 per-file loc/stamp subtleties.  Pexp_extension ([%ext], 3), Pexp_setinstvar deep
 cases, and a handful of module-coercion locs are the next construct-shaped levers.
+
+--------------------------------------------------------------------------------
+Track-2 continuation, module-coercion + attributes + constraints: 647 -> 664
+(86.8% -> 89.1% of oracle-typed)
+--------------------------------------------------------------------------------
+Six commits, DIFF 66 -> 49, c++-err flat at 32.  Method unchanged: ttp_diffcat.sh
+buckets the DIFF files by their first differing token; attack the largest bucket.
+
+- MODULE-EXPR locs/coercions (biggest bucket):
+  * Generative functor application `F(X) ()` -- the Tmod_apply_unit node takes
+    the FUNCTOR sub-expression's location, not the parse span that also covers
+    the `()` (OCaml's type_application).  [globroots]
+  * A structure containing a non-empty `open struct ... end` ALWAYS gets the
+    implicit signature-simplify coercion (the transparent extra module_expr),
+    even with no name clash: the anonymous struct's bindings are hidden/removable
+    signature items -> non-identity coercion.  Verified against the oracle.
+    [shadowing, clambda_optim]
+  * Functor argument / functor-path STRENGTHENING generalized beyond direct
+    global paths: a path whose root (following dotted prefixes) is a LOCAL ALIAS
+    module (`module S = P`, any P) is wrapped too.  Rule pinned by oracle probes:
+    `module A = struct..end`(not alias) unwrapped; `module B = A`(alias) wrapped;
+    global path wrapped.  Track every `module M = <ident>` stamp in
+    alias_module_stamps_.  [pr6944, pr6485]  (First-class-module packing
+    `(module A)` has a separate always-strengthen rule -- pr6982 left for the
+    package cluster.)
+
+- ATTRIBUTES the transcriber silently dropped:
+  * Variant constructor decls (constructor_decl never copied c.attrs).
+  * Class fields (tt::ClassField had no attrs) -- e.g. a method's ocaml.doc.
+  [Alerts_impl, Inline_records_bis, deprecated_module_assigment, Functions]
+
+- RECORD field order: a plain literal of an EXTERNAL cmi record (`{ MP.alloc_minor;
+  promote; alloc_major; .. }`, MP = Gc.Memprof) was emitted in source order --
+  inference only populated the decl-order side-table for record UPDATES.  Mirror
+  it in the plain-literal branch via cmi_record_fields.  [statmemprof x3]
+
+- ptype_constraints: `type 'a t = .. constraint 'a = T` clauses were parsed but
+  dropped (printer hardcoded `[]`).  Carry a TypeConstraint{t1,t2,loc} list,
+  transcribe in the decl's tyvar scope, print as <constraint> nodes.  Also fixed
+  Ttyp_variant printing empty rows as `[`/`]` instead of `[]`.
+  [range_intf, pr6954, pr4775]
+
+Remaining tail (49 DIFF, 32 c++-err): the module-coercion HARD core (Includemod
+through functors / first-class-module packing pr6982 & pr6485-siblings, arg
+coercion non-identity detection); Param_pat polyvariant exhaustiveness (mixin2/3);
+Tpat_var stamp/loc subtleties (4); #row ghost type_declarations (3); the deep
+attributes.ml torture test (module/modtype/extra attrs + a stamp divergence);
+assorted single-file extra/core_type locs.
