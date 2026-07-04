@@ -157,6 +157,9 @@ struct Printer {
     } else if (auto* cl = std::get_if<Ttyp_class>(&t.desc)) {
       line(j, "Ttyp_class \"" + path_aux(cl->path) + "\"");
       list_core_types(j, cl->args);
+    } else if (auto* op = std::get_if<Ttyp_open>(&t.desc)) {
+      line(j, "Ttyp_open \"" + path_aux(op->path) + "\"");
+      core_type(j, *op->type);
     } else if (auto* al = std::get_if<Ttyp_alias>(&t.desc)) {
       line(j, "Ttyp_alias \"" + al->name + "\"");
       core_type(j, *al->type);
@@ -318,6 +321,8 @@ struct Printer {
         else line(j + 1, "None");
       } else if (ex.kind == PatExtra::Kind::Type) {
         line(j + 1, "Tpat_extra_type \"" + path_aux(ex.type_path) + "\"");
+      } else if (ex.kind == PatExtra::Kind::Open) {
+        line(j + 1, "Tpat_extra_open \"" + path_aux(ex.type_path) + "\"");
       } else {
         line(j + 1, "Tpat_extra_constraint");
         core_type(j + 1, ex.ctype);
@@ -569,6 +574,17 @@ struct Printer {
       else line(j, "None");
     } else if (auto* iv = std::get_if<Texp_instvar>(&e.desc)) {
       line(j, "Texp_instvar \"" + ident(iv->id) + "\"");
+    } else if (auto* sv = std::get_if<Texp_setinstvar>(&e.desc)) {
+      line(j, "Texp_setinstvar \"" + ident(sv->id) + "\"");
+      expression(j, *sv->value);
+    } else if (auto* ov = std::get_if<Texp_override>(&e.desc)) {
+      line(j, "Texp_override");
+      line(j, "[");
+      for (auto& [id, ex] : ov->fields) {
+        line(j + 1, "<override> \"" + ident(id) + "\"");
+        expression(j + 2, *ex);
+      }
+      line(j, "]");
     } else if (auto* sd = std::get_if<Texp_send>(&e.desc)) {
       // Tmeth_val/ancestor print the ident (name/stamp); Tmeth_name just the name.
       line(j, "Texp_send \"" + (sd->meth_id ? ident(*sd->meth_id) : sd->meth) + "\"");

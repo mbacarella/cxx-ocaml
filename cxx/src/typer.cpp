@@ -877,6 +877,20 @@ struct Typer {
     }
   }
 
+  // Build an OpenEntry for a module path (stdlib cmi names + local exports),
+  // resolving its path.  Used by local opens in expressions, patterns and types.
+  OpenEntry make_open_entry(const Longident& lid) {
+    OpenEntry oe;
+    oe.path = resolve_module(lid);
+    load_open_names_lid(lid, oe);
+    if (const ModExports* ex = exports_by_path(oe.path)) {
+      for (auto& n : ex->values) oe.values.insert(n);
+      for (auto& n : ex->types) oe.types.insert(n);
+      for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
+    }
+    return oe;
+  }
+
   tt::Ident fresh_local(const std::string& name) {
     tt::Ident id{name, next_stamp++, tt::Ident::Local};
     scopes.back()[name] = id;
@@ -1145,6 +1159,14 @@ struct Typer {
       out.desc = std::move(to);
     } else if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) {
       out.desc = tt::Ttyp_package{package_type(*pk)};
+    } else if (auto* op = std::get_if<Ptyp_open>(&t.desc)) {  // M.(t)
+      tt::Ttyp_open to;
+      to.path = resolve_module(op->mod_.txt);
+      auto saved = opens;
+      opens.push_back(make_open_entry(op->mod_.txt));
+      to.type = std::make_unique<tt::CoreType>(core_type(*op->type));
+      opens = std::move(saved);
+      out.desc = std::move(to);
     } else {
       throw TypeError("coretype#" + std::to_string(t.desc.index()));
     }
@@ -1541,6 +1563,41 @@ struct Typer {
       } else {
         out.desc = tt::Tpat_any{};
       }
+    } else if (auto* iv = std::get_if<Ppat_interval>(&p.desc)) {  // 'a'..'z'
+      // An interval expands to a right-nested or-pattern of every value in range.
+      auto* a = std::get_if<Pconst_char>(&iv->c1.desc);
+      auto* b = std::get_if<Pconst_char>(&iv->c2.desc);
+      if (!a || !b) throw TypeError("pat#interval non-char");
+      Location gloc = p.loc;
+      gloc.ghost = true;  // every expansion node is ghost; only the top isn't
+      auto mk_char = [&](int ch) {
+        tt::Pattern cp;
+        cp.loc = gloc;
+        ast::Constant k;
+        k.desc = ast::Pconst_char{ch};
+        cp.desc = tt::Tpat_constant{k};
+        return cp;
+      };
+      int lo = a->code, hi = b->code;
+      tt::Pattern acc = mk_char(hi);
+      for (int ch = hi - 1; ch >= lo; --ch) {
+        tt::Pattern orp;
+        orp.loc = gloc;
+        orp.desc = tt::Tpat_or{std::make_unique<tt::Pattern>(mk_char(ch)),
+                               std::make_unique<tt::Pattern>(std::move(acc))};
+        acc = std::move(orp);
+      }
+      out.desc = std::move(acc.desc);  // out keeps the non-ghost top loc
+    } else if (auto* op = std::get_if<Ppat_open>(&p.desc)) {  // M.(P)
+      auto saved = opens;
+      opens.push_back(make_open_entry(op->mod_.txt));
+      out = pattern(*op->p);  // the open only affects resolution of P
+      opens = std::move(saved);
+      tt::PatExtra pe;  // ..but records a Tpat_extra_open with the module path
+      pe.kind = tt::PatExtra::Kind::Open;
+      pe.type_path = resolve_module(op->mod_.txt);
+      pe.loc = p.loc;
+      out.extras.insert(out.extras.begin(), std::move(pe));
     } else if (auto* ty = std::get_if<Ppat_type>(&p.desc)) {  // #t
       // `#t` expands to the or-pattern of t's polyvariant tags (in decl order,
       // seeded from the first: A | B | C  ->  Or(C, Or(B, A))), with a
@@ -1947,6 +2004,19 @@ struct Typer {
       out.desc = tt::Texp_send{std::move(objexpr), sd->meth.txt, mid};
     } else if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {
       out.desc = tt::Texp_new{resolve_class(nw->id.txt)};
+    } else if (auto* sv = std::get_if<Pexp_setinstvar>(&e.desc)) {  // x <- e
+      auto iv = instvars_.find(sv->name.txt);
+      if (iv == instvars_.end()) throw TypeError("Unbound instance variable " + sv->name.txt);
+      out.desc = tt::Texp_setinstvar{iv->second,
+                                     std::make_unique<tt::Expression>(expr(*sv->value))};
+    } else if (auto* ov = std::get_if<Pexp_override>(&e.desc)) {  // {< x = e >}
+      tt::Texp_override to;
+      for (auto& [nm, ev] : ov->fields) {
+        auto iv = instvars_.find(nm.txt);
+        if (iv == instvars_.end()) throw TypeError("Unbound instance variable " + nm.txt);
+        to.fields.emplace_back(iv->second, std::make_unique<tt::Expression>(expr(*ev)));
+      }
+      out.desc = std::move(to);
     } else if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
       out.desc = tt::Texp_object{std::make_unique<tt::ClassStructure>(build_class_structure(*ob->cs))};
     } else if (auto* rec = std::get_if<Pexp_record>(&e.desc)) {

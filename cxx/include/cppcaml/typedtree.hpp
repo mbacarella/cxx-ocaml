@@ -53,6 +53,7 @@ struct Ttyp_tuple {
 };
 struct Ttyp_constr { Path path; std::vector<CoreTypeBox> args; };
 struct Ttyp_class { Path path; std::vector<CoreTypeBox> args; };  // [args] #class
+struct Ttyp_open { Path path; CoreTypeBox type; };  // M.(t)
 struct Ttyp_poly { std::vector<std::string> vars; CoreTypeBox type; };
 struct Ttyp_alias { std::string name; CoreTypeBox type; };  // (t as 'name)
 struct OTmethod { std::string name; CoreTypeBox type; };  // name -> poly-wrapped type
@@ -77,7 +78,8 @@ struct Ttyp_variant {  // [ `A | `B of t | t | ... ]  (Ttag + Tinherit rows)
 };
 struct CoreType {
   std::variant<Ttyp_any, Ttyp_var, Ttyp_arrow, Ttyp_tuple, Ttyp_constr, Ttyp_poly,
-               Ttyp_alias, Ttyp_variant, Ttyp_object, Ttyp_package, Ttyp_class>
+               Ttyp_alias, Ttyp_variant, Ttyp_object, Ttyp_package, Ttyp_class,
+               Ttyp_open>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;  // ctyp_attributes ([@untagged] ...)
@@ -110,11 +112,11 @@ struct Tpat_record {  // { l1 = p1; ... } -- only the written fields, in order
 struct Tpat_array { std::vector<PatBox> elems; };  // [| ... |] (always Mutable)
 struct Tpat_lazy { PatBox inner; };                // lazy p
 struct Tpat_variant { std::string label; PatBox arg; };  // `Tag [p]; null = no payload
-struct PatExtra {  // Tpat_extra_constraint / Tpat_extra_unpack / Tpat_extra_type
-  enum class Kind { Constraint, Unpack, Type } kind = Kind::Constraint;
+struct PatExtra {  // Tpat_extra_constraint / _unpack / _type / _open
+  enum class Kind { Constraint, Unpack, Type, Open } kind = Kind::Constraint;
   CoreType ctype;                  // Constraint
   std::optional<PackageType> pkg;  // Unpack: `(module M : S)`; nullopt = untyped
-  Path type_path;                  // Type: the `#t` type path
+  Path type_path;                  // Type: the `#t` type path / Open: the module path
   Location loc;
 };
 struct Pattern {
@@ -196,6 +198,8 @@ struct Texp_field { ExprBox record; std::string name; };
 struct Texp_setfield { ExprBox record; std::string name; ExprBox value; };  // r.l <- v
 struct Texp_variant { std::string label; std::optional<ExprBox> arg; };  // `A [e]
 struct Texp_instvar { Ident id; };  // an instance-variable reference inside a method
+struct Texp_setinstvar { Ident id; ExprBox value; };            // x <- e
+struct Texp_override { std::vector<std::pair<Ident, ExprBox>> fields; };  // {< x = e >}
 // meth_id present => Tmeth_val/Tmeth_ancestor (prints "meth/stamp"); absent =>
 // Tmeth_name (prints just "meth").  A self-send resolves to the method's ident.
 struct Texp_send { ExprBox obj; std::string meth; std::optional<Ident> meth_id; };  // e # m
@@ -231,7 +235,8 @@ struct Expression {
                Texp_construct, Texp_array, Texp_assert, Texp_for, Texp_lazy,
                Texp_while, Texp_record, Texp_field, Texp_setfield, Texp_variant,
                Texp_instvar, Texp_send, Texp_object, Texp_struct_item,
-               Texp_pack, Texp_letop, Texp_unreachable, Texp_new>
+               Texp_pack, Texp_letop, Texp_unreachable, Texp_new,
+               Texp_setinstvar, Texp_override>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
