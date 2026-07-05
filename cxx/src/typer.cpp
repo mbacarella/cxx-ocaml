@@ -896,9 +896,25 @@ struct Typer {
     return oe;
   }
 
+  // When typing a single pattern tree, a variable NAME resolves to one Ident.
+  // The only way a name recurs in a well-formed pattern is across the branches
+  // of an or-pattern, where OCaml gives both occurrences the SAME stamp.  So
+  // while this map is active (set for the duration of one case/binding lhs),
+  // fresh_local reuses the first ident minted for a name -- reproducing OCaml's
+  // or-pattern variable sharing, including nested ors.
+  std::unordered_map<std::string, tt::Ident>* pat_vars_ = nullptr;
+
   tt::Ident fresh_local(const std::string& name) {
+    if (pat_vars_) {
+      auto it = pat_vars_->find(name);
+      if (it != pat_vars_->end()) {
+        scopes.back()[name] = it->second;
+        return it->second;
+      }
+    }
     tt::Ident id{name, next_stamp++, tt::Ident::Local};
     scopes.back()[name] = id;
+    if (pat_vars_) (*pat_vars_)[name] = id;
     return id;
   }
   tt::Ident fresh_anon(const std::string& name) {  // stamped, not scoped
@@ -1522,7 +1538,19 @@ struct Typer {
            (size_t)it->second == tuple_n;
   }
 
+  // Top-level entry: the FIRST pattern() (or to_computation()) on a case/binding
+  // lhs installs a name->ident map so or-pattern branches share variable stamps;
+  // recursive calls inherit it.  See pat_vars_.
   tt::Pattern pattern(const Pattern& p) {
+    if (pat_vars_) return pattern_impl(p);
+    std::unordered_map<std::string, tt::Ident> vars;
+    pat_vars_ = &vars;
+    tt::Pattern r = pattern_impl(p);
+    pat_vars_ = nullptr;
+    return r;
+  }
+
+  tt::Pattern pattern_impl(const Pattern& p) {
     tt::Pattern out;
     out.loc = p.loc;
     out.attrs = &p.attrs;
@@ -1693,6 +1721,15 @@ struct Typer {
   // Build a computation pattern (match case lhs): or distributes, `exception P`
   // becomes Tpat_exception, and any other (value) pattern is wrapped Tpat_value.
   tt::Pattern to_computation(const Pattern& p) {
+    if (pat_vars_) return to_computation_impl(p);
+    std::unordered_map<std::string, tt::Ident> vars;
+    pat_vars_ = &vars;
+    tt::Pattern r = to_computation_impl(p);
+    pat_vars_ = nullptr;
+    return r;
+  }
+
+  tt::Pattern to_computation_impl(const Pattern& p) {
     tt::Pattern out;
     out.loc = p.loc;
     // `exception P [@attr]` / or-pattern attrs live on the computation node;
