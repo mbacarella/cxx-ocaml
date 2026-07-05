@@ -2762,6 +2762,29 @@ struct Typer {
   // (The `: type a. t` polymorphic form involves newtypes -- left unhandled.)
   void apply_value_constraint(tt::ValueBinding& out, const ValueBinding& vb) {
     if (!vb.constraint_) return;
+    // `let p [: t1] :> t2 = e`: the pattern gets a Tpat_extra_constraint at the
+    // coercion type t2, the RHS a Texp_coerce (Some t1 / None, then t2).
+    if (auto* co = std::get_if<Pvc_coercion>(&*vb.constraint_)) {
+      tt::CoreType cpat, ctgt, cfrom;
+      try {
+        cpat = core_type(*co->coercion);
+        ctgt = core_type(*co->coercion);
+        if (co->ground) cfrom = core_type(**co->ground);
+      } catch (const TypeError&) { return; }
+      tt::PatExtra pe;
+      pe.ctype = std::move(cpat);
+      pe.loc = vb.pat.loc; pe.loc.ghost = true;
+      out.pat.extras.insert(out.pat.extras.begin(), std::move(pe));
+      tt::ExprExtra ee;
+      ee.kind = tt::ExprExtra::Kind::Coerce;
+      ee.ctype = std::move(ctgt);
+      if (co->ground) ee.from = std::move(cfrom);
+      ee.loc = vb.expr->loc; ee.loc.ghost = true;  // the whole RHS span, not its core
+      // The binding's coercion is the OUTER extra: it conses to the front, before
+      // any constraint the RHS carries itself (`(\`A : [\`A])`).
+      out.expr.extras.insert(out.expr.extras.begin(), std::move(ee));
+      return;
+    }
     auto* vc = std::get_if<Pvc_constraint>(&*vb.constraint_);
     if (!vc || !vc->univars.empty()) return;
     // core_type may throw on a construct we don't transcribe; if so leave the
@@ -3458,6 +3481,16 @@ struct Typer {
     tt::Expression be = expr(*body);
     pop();
     for (auto& [fi, kv] : hidden) scopes[fi][kv.first] = kv.second;
+    // A `method f : type t. T = e` desugars to a Pexp_newtype chain; OCaml puts
+    // the resulting Texp_newtype / Texp_constraint extras on the method-type
+    // annotation span, not the raw newtype-name / inner-constraint locs.
+    if (mty && std::holds_alternative<Pexp_newtype>(body->desc)) {
+      Location mloc = mty->loc; mloc.ghost = false;  // annotation span, NON-ghost
+      for (auto& ee : be.extras)
+        if (ee.kind == tt::ExprExtra::Kind::Newtype ||
+            ee.kind == tt::ExprExtra::Kind::Constraint)
+          ee.loc = mloc;
+    }
     if (poly) {  // methods carry a Texp_poly extra; initializers do not
       tt::ExprExtra ex;
       ex.kind = tt::ExprExtra::Kind::Poly;
@@ -3866,7 +3899,9 @@ struct Typer {
         tm.name = m->name.txt;
         tm.private_ = m->priv == PrivateFlag::Private;
         tm.virtual_ = m->virt == VirtualFlag::Virtual;
-        tm.type = method_poly(*m->type, f.loc);
+        // A concrete class-type method's poly wrapper sits at the field loc; a
+        // VIRTUAL one at the inner type loc (like a class-body virtual method).
+        tm.type = method_poly(*m->type, f.loc, /*use_field_loc=*/!tm.virtual_);
         cf.desc = std::move(tm);
       } else if (auto* c = std::get_if<Pctf_constraint>(&f.desc)) {
         tt::Tctf_constraint tc;
