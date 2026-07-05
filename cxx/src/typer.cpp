@@ -759,8 +759,34 @@ struct Typer {
       }
       return nullptr;
     }
-    if (auto* a = std::get_if<tt::Tmod_apply>(&me.desc))
+    if (auto* a = std::get_if<tt::Tmod_apply>(&me.desc)) {
+      // A cmi functor's application: the members come from the functor's
+      // RESULT signature (Set.Make -> Set.S with elt fixed).  Peel the
+      // strengthening constraint the apply path was wrapped in.
+      const tt::ModuleExpr* fn = &*a->fn;
+      while (auto* c = std::get_if<tt::Tmod_constraint>(&fn->desc))
+        fn = &*c->expr;
+      if (auto* i = std::get_if<tt::Tmod_ident>(&fn->desc))
+        if (path_root_global(i->path)) {
+          std::vector<std::string> comps;
+          if (tt_path_comps(i->path, comps) && comps.size() >= 2) {
+            std::string fname = std::move(comps.back());
+            comps.pop_back();
+            if (const cmi::Signature* pre = cmi_sig_of_comps(comps))
+              for (auto& m : pre->modules)
+                if (m.name == fname) {
+                  const cmi::ModuleType* ft = m.type.get();
+                  while (ft && ft->kind == cmi::ModuleType::Functor)
+                    ft = ft->functor_body.get();  // curried: peel to the result
+                  if (const cmi::Signature* rs = cmi_resolve_mt(ft, pre, 0)) {
+                    modexports_of_cmisig(*rs, tmp);
+                    return &tmp;
+                  }
+                }
+          }
+        }
       return exports_of_modexpr(*a->fn, tmp);
+    }
     if (auto* c = std::get_if<tt::Tmod_constraint>(&me.desc))
       return exports_of_modexpr(*c->expr, tmp);
     if (auto* body = module_body(me)) {
@@ -860,46 +886,16 @@ struct Typer {
   };
   std::vector<OpenEntry> opens;
 
-  void load_open_names(const std::string& modname, OpenEntry& oe) {
-    try {
-      auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + modname + ".cmi");
-      for (auto& v : cmi.values()) oe.values.insert(v.name);
-      for (auto& t : cmi.types()) oe.types.insert(t.name);
-      for (auto& m : cmi.modules()) oe.submodules.insert(m.name);
-    } catch (...) {
-      // Unknown/local module: names from it won't resolve (best effort).
-    }
-  }
-
-  // `open M.Sub[..]`: M from its stdlib cmi, then walk to the submodule's
-  // signature (e.g. Effect.Deep).  Best effort, like load_open_names.
+  // `open M.Sub[..]`: walk the cmi signature graph (aliases, named module
+  // types, an explicit Stdlib root all resolve — see the walker below).
   void load_open_names_lid(const Longident& lid, OpenEntry& oe) {
     std::vector<std::string> comps;
-    const Longident* cur = &lid;
-    while (auto* d = std::get_if<Ldot>(&cur->v)) {
-      comps.push_back(d->name);
-      cur = &*d->prefix;
-    }
-    auto* l = std::get_if<Lident>(&cur->v);
-    if (!l) return;
-    if (comps.empty()) return load_open_names(l->name, oe);
-    std::reverse(comps.begin(), comps.end());
-    try {
-      auto cmi = cmi::CmiFile::load("stdlib/stdlib__" + l->name + ".cmi");
-      const cmi::Signature* sig = &cmi.sig();
-      for (auto& c : comps) {
-        const cmi::ModuleDecl* md = nullptr;
-        for (auto& m : sig->modules)
-          if (m.name == c) { md = &m; break; }
-        if (!md || !md->type) return;
-        if (md->type->kind != cmi::ModuleType::Sig || !md->type->sig) return;
-        sig = md->type->sig.get();
-      }
-      for (auto& v : sig->values) oe.values.insert(v.name);
-      for (auto& t : sig->types) oe.types.insert(t.name);
-      for (auto& m : sig->modules) oe.submodules.insert(m.name);
-    } catch (...) {
-    }
+    if (!lid_comps(lid, comps)) return;
+    const cmi::Signature* sig = cmi_sig_of_comps(comps);
+    if (!sig) return;
+    for (auto& v : sig->values) oe.values.insert(v.name);
+    for (auto& t : sig->types) oe.types.insert(t.name);
+    for (auto& m : sig->modules) oe.submodules.insert(m.name);
   }
 
   // Build an OpenEntry for a module path (stdlib cmi names + local exports),
@@ -914,6 +910,171 @@ struct Typer {
       for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
     }
     return oe;
+  }
+
+  // --- cmi name-level module resolution ------------------------------------
+  // General walker over cmi signatures: dotted module paths (Stdlib-rooted or
+  // unit-rooted), module ALIASES (stdlib.cmi's Float -> Stdlib__Float), named
+  // MODULE TYPES (Digest.S), and functor RESULTS (Set.Make's sig).  Name-level
+  // only: it answers "what members does this thing have".
+  std::unordered_map<std::string, cmi::CmiFile> cmi_units_;  // keeps sigs alive
+  const cmi::CmiFile* cmi_unit(const std::string& unit) {
+    auto it = cmi_units_.find(unit);
+    if (it != cmi_units_.end()) return &it->second;
+    try {
+      std::string path = unit == "Stdlib" ? "stdlib/stdlib.cmi"
+                                          : "stdlib/stdlib__" + unit + ".cmi";
+      return &cmi_units_.emplace(unit, cmi::CmiFile::load(path)).first->second;
+    } catch (...) {
+      return nullptr;
+    }
+  }
+  static bool tt_path_comps(const tt::Path& p, std::vector<std::string>& out) {
+    if (auto* pi = std::get_if<tt::Pident>(&p.v)) {
+      out.push_back(pi->id.name);
+      return true;
+    }
+    if (auto* d = std::get_if<tt::Pdot>(&p.v)) {
+      if (!tt_path_comps(*d->prefix, out)) return false;
+      out.push_back(d->name);
+      return true;
+    }
+    return false;
+  }
+  static bool lid_comps(const Longident& lid, std::vector<std::string>& out) {
+    if (auto* l = std::get_if<Lident>(&lid.v)) { out.push_back(l->name); return true; }
+    if (auto* d = std::get_if<Ldot>(&lid.v)) {
+      if (!lid_comps(*d->prefix, out)) return false;
+      out.push_back(d->name);
+      return true;
+    }
+    return false;  // Lapply
+  }
+  // Resolve a cmi module type to a concrete signature.  `home` is the
+  // signature whose modtypes a bare Ident path (same-unit module type) names.
+  const cmi::Signature* cmi_resolve_mt(const cmi::ModuleType* mt,
+                                       const cmi::Signature* home, int depth) {
+    if (!mt || depth > 8) return nullptr;
+    switch (mt->kind) {
+      case cmi::ModuleType::Sig:
+        return mt->sig.get();
+      case cmi::ModuleType::Alias:
+        return cmi_sig_of_cmipath(mt->path.get(), depth + 1);
+      case cmi::ModuleType::Ident: {
+        const cmi::Path* p = mt->path.get();
+        if (!p) return nullptr;
+        if (p->kind == cmi::Path::Pident) {
+          if (!home) return nullptr;
+          for (auto& d : home->modtypes)
+            if (d.name == p->id.name)
+              return cmi_resolve_mt(d.type.get(), home, depth + 1);
+          return nullptr;
+        }
+        if (p->kind == cmi::Path::Pdot) {
+          const cmi::Signature* pre = cmi_sig_of_cmipath(p->a.get(), depth + 1);
+          if (!pre) return nullptr;
+          for (auto& d : pre->modtypes)
+            if (d.name == p->s) return cmi_resolve_mt(d.type.get(), pre, depth + 1);
+          return nullptr;
+        }
+        return nullptr;
+      }
+      case cmi::ModuleType::Functor:
+        return nullptr;  // callers peel functor_body explicitly
+    }
+    return nullptr;
+  }
+  // Signature of the global module a cmi Path denotes ("Stdlib__Float",
+  // Pdot(Stdlib, "Sys"), ...).
+  const cmi::Signature* cmi_sig_of_cmipath(const cmi::Path* p, int depth) {
+    if (!p || depth > 8) return nullptr;
+    if (p->kind == cmi::Path::Pident) {
+      std::string n = p->id.name;
+      if (n.rfind("Stdlib__", 0) == 0) n = n.substr(8);
+      const cmi::CmiFile* f = cmi_unit(n);
+      return f ? &f->sig() : nullptr;
+    }
+    if (p->kind == cmi::Path::Pdot) {
+      const cmi::Signature* pre = cmi_sig_of_cmipath(p->a.get(), depth + 1);
+      if (!pre) return nullptr;
+      for (auto& m : pre->modules)
+        if (m.name == p->s) return cmi_resolve_mt(m.type.get(), pre, depth + 1);
+      return nullptr;
+    }
+    return nullptr;
+  }
+  // Signature of the module a dotted source path denotes, rooted at a stdlib
+  // unit name or an explicit "Stdlib".
+  const cmi::Signature* cmi_sig_of_comps(const std::vector<std::string>& comps) {
+    if (comps.empty()) return nullptr;
+    const cmi::CmiFile* f = cmi_unit(comps[0]);
+    if (!f) return nullptr;
+    const cmi::Signature* sig = &f->sig();
+    for (size_t i = 1; i < comps.size() && sig; ++i) {
+      const cmi::ModuleDecl* md = nullptr;
+      for (auto& m : sig->modules)
+        if (m.name == comps[i]) { md = &m; break; }
+      sig = md ? cmi_resolve_mt(md->type.get(), sig, 0) : nullptr;
+    }
+    return sig;
+  }
+  static void modexports_of_cmisig(const cmi::Signature& sig, ModExports& ex) {
+    for (auto& v : sig.values) ex.values.insert(v.name);
+    for (auto& t : sig.types) ex.types.insert(t.name);
+    for (auto& m : sig.modules) ex.submodule_stamps.emplace(m.name, -1);
+  }
+
+  // --- name-level members of a module TYPE ----------------------------------
+  // For binding sites whose members come from a signature rather than a
+  // structure: functor parameters, module-rec constraints, first-class
+  // package unpacks.  Local named module types are recorded here as they are
+  // declared; cmi-side ones resolve through the walker above.
+  std::unordered_map<long long, ModExports> modtype_members_;
+  void members_of_modtype_lid(const Longident& lid, ModExports& ex, int depth) {
+    if (depth > 8) return;
+    if (auto* l = std::get_if<Lident>(&lid.v)) {
+      auto m = modtype_scope.find(l->name);
+      if (m != modtype_scope.end()) {
+        auto f = modtype_members_.find(m->second.stamp);
+        if (f == modtype_members_.end()) return;
+        for (auto& n : f->second.values) ex.values.insert(n);
+        for (auto& n : f->second.types) ex.types.insert(n);
+        for (auto& [n, st] : f->second.submodule_stamps)
+          ex.submodule_stamps.emplace(n, st);
+        return;
+      }
+      return;
+    }
+    std::vector<std::string> comps;  // dotted: a cmi module type
+    if (!lid_comps(lid, comps) || comps.size() < 2) return;
+    std::string last = std::move(comps.back());
+    comps.pop_back();
+    if (const cmi::Signature* pre = cmi_sig_of_comps(comps))
+      for (auto& d : pre->modtypes)
+        if (d.name == last)
+          if (const cmi::Signature* s = cmi_resolve_mt(d.type.get(), pre, depth))
+            modexports_of_cmisig(*s, ex);
+  }
+  void members_of_ast_modtype(const ast::ModuleType& mt, ModExports& ex,
+                              int depth) {
+    if (depth > 8) return;
+    if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) {
+      for (auto& it : sg->items) {
+        if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+          ex.values.insert(v->vd.name.txt);
+        } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+          for (auto& d : t->decls) ex.types.insert(d.name.txt);
+        } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+          if (m->md.name.txt) ex.submodule_stamps.emplace(*m->md.name.txt, -1);
+        } else if (auto* inc = std::get_if<Psig_include>(&it.desc)) {
+          members_of_ast_modtype(inc->mt, ex, depth + 1);
+        }
+      }
+    } else if (auto* id = std::get_if<Pmty_ident>(&mt.desc)) {
+      members_of_modtype_lid(id->id.txt, ex, depth + 1);
+    } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
+      members_of_ast_modtype(*w->mt, ex, depth + 1);  // constraints keep names
+    }
   }
 
   // When typing a single pattern tree, a variable NAME resolves to one Ident.
@@ -2635,6 +2796,7 @@ struct Typer {
         if (mt->type) {
           out.type = std::make_unique<tt::ModuleType>(module_type_t(*mt->type));
           collect_exports(*out.type, modtype_exports_[out.id.stamp]);
+          members_of_ast_modtype(*mt->type, modtype_members_[out.id.stamp], 0);
         }
         si.desc = std::move(out);
       } else if (auto* inc = std::get_if<Psig_include>(&it.desc)) {
@@ -2878,7 +3040,14 @@ struct Typer {
       auto saved = module_scope;
       if (auto* named = std::get_if<Functor_named>(&fn->param)) {
         tf.param_type = std::make_unique<tt::ModuleType>(module_type_t(*named->type));
-        if (named->name.txt) tf.param = fresh_module(*named->name.txt);
+        if (named->name.txt) {
+          tf.param = fresh_module(*named->name.txt);
+          // The param's signature members resolve inside the body (`open X`,
+          // dotted access): register them like a local module's exports.
+          ModExports ex;
+          members_of_ast_modtype(*named->type, ex, 0);
+          module_exports_[tf.param->stamp] = std::move(ex);
+        }
       }  // Functor_unit: generative, no param/param_type
       tf.body = std::make_unique<tt::ModuleExpr>(module_expr(*fn->body));
       module_scope = std::move(saved);
@@ -3391,6 +3560,7 @@ struct Typer {
       if (mt->type) {
         out.type = std::make_unique<tt::ModuleType>(module_type_t(*mt->type));
         collect_exports(*out.type, modtype_exports_[out.id.stamp]);
+        members_of_ast_modtype(*mt->type, modtype_members_[out.id.stamp], 0);
       }
       si.desc = std::move(out);
     } else if (auto* at = std::get_if<Pstr_attribute>(&it.desc)) {
@@ -3416,6 +3586,17 @@ struct Typer {
           auto f = module_exports_.find(pi->id.stamp);
           if (f != module_exports_.end())
             module_exports_[tm.id.stamp] = f->second;
+        }
+      } else if (tm.id.stamp >= 0) {  // functor application, unpack, ...
+        ModExports tmp;
+        if (auto* up = std::get_if<Pmod_unpack>(&b.expr.desc)) {
+          // `module M = (val e : S)`: members from the package's module type.
+          if (auto* ce = std::get_if<Pexp_constraint>(&up->e->desc))
+            if (auto* pk = std::get_if<Ptyp_package>(&ce->t->desc))
+              members_of_modtype_lid(pk->path.txt, tmp, 0);
+          module_exports_[tm.id.stamp] = std::move(tmp);
+        } else if (const ModExports* ex = exports_of_modexpr(*tm.expr, tmp)) {
+          module_exports_[tm.id.stamp] = *ex;
         }
       }
       // `module M = P` makes M an alias, so a later use of M as a functor
@@ -3450,6 +3631,11 @@ struct Typer {
           for (auto& n : ex->types) src.types.insert(n);
           for (auto& [n, st] : ex->submodule_stamps) src.submodule_stamps[n] = st;
         }
+      } else if (auto* up = std::get_if<Pmod_unpack>(&in->expr.desc)) {
+        // `include (val e : S)`: members from the package's module type.
+        if (auto* ce = std::get_if<Pexp_constraint>(&up->e->desc))
+          if (auto* pk = std::get_if<Ptyp_package>(&ce->t->desc))
+            members_of_modtype_lid(pk->path.txt, src, 0);
       } else {
         ModExports tmp;
         if (const ModExports* ex = exports_of_modexpr(*me, tmp)) src = *ex;
@@ -3489,6 +3675,16 @@ struct Typer {
       for (auto& b : rm->bindings) {
         if (b.name.txt) ids.push_back(fresh_module(*b.name.txt));
         else ids.push_back(tt::Ident{"_", -1, tt::Ident::Local});  // anon: no stamp
+      }
+      // Each rec module's members come from its ascribed signature; register
+      // them before typing any body (mutual references).
+      for (size_t k = 0; k < rm->bindings.size(); ++k) {
+        if (ids[k].stamp < 0) continue;
+        if (auto* mc = std::get_if<Pmod_constraint>(&rm->bindings[k].expr.desc)) {
+          ModExports ex;
+          members_of_ast_modtype(*mc->mt, ex, 0);
+          module_exports_[ids[k].stamp] = std::move(ex);
+        }
       }
       for (size_t k = 0; k < rm->bindings.size(); ++k) {
         const ModuleExpr& be = rm->bindings[k].expr;
