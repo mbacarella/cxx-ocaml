@@ -687,7 +687,7 @@ struct Typer {
   // `open F(X)` / `open struct .. end` (fresh-ident instantiation).
   // Submodules link by stamp so dotted opens can walk down.
   struct ModExports {
-    std::unordered_set<std::string> values, types;
+    std::unordered_set<std::string> values, types, modtypes;
     std::unordered_map<std::string, long long> submodule_stamps;
   };
   std::unordered_map<long long, ModExports> module_exports_;
@@ -753,6 +753,8 @@ struct Typer {
         for (auto& d : t->decls) ex.types.insert(d.id.name);
       } else if (auto* m = std::get_if<tt::Tstr_module>(&it.desc)) {
         ex.submodule_stamps[m->id.name] = m->id.stamp;
+      } else if (auto* mt = std::get_if<tt::Tstr_modtype>(&it.desc)) {
+        ex.modtypes.insert(mt->id.name);
       } else if (auto* inc = std::get_if<tt::Tstr_include>(&it.desc)) {
         auto f = include_exports_.find(inc->expr.get());
         if (f != include_exports_.end()) {
@@ -925,6 +927,7 @@ struct Typer {
     tt::Path path;
     std::unordered_set<std::string> values;
     std::unordered_set<std::string> types;
+    std::unordered_set<std::string> modtypes;    // for `open M; (module _ : T)` -> M.T
     std::unordered_set<std::string> submodules;  // for `open M; Sub.x` -> M.Sub.x
   };
   std::vector<OpenEntry> opens;
@@ -938,6 +941,7 @@ struct Typer {
     if (!sig) return;
     for (auto& v : sig->values) oe.values.insert(v.name);
     for (auto& t : sig->types) oe.types.insert(t.name);
+    for (auto& t : sig->modtypes) oe.modtypes.insert(t.name);
     for (auto& m : sig->modules) oe.submodules.insert(m.name);
   }
 
@@ -950,6 +954,7 @@ struct Typer {
     if (const ModExports* ex = exports_by_path(oe.path)) {
       for (auto& n : ex->values) oe.values.insert(n);
       for (auto& n : ex->types) oe.types.insert(n);
+      for (auto& n : ex->modtypes) oe.modtypes.insert(n);
       for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
     }
     return oe;
@@ -1155,6 +1160,8 @@ struct Typer {
             ex.submodule_stamps.emplace(*m->md.name.txt,
                                         register_virtual_module(std::move(sub)));
           }
+        } else if (auto* mt2 = std::get_if<Psig_modtype>(&it.desc)) {
+          ex.modtypes.insert(mt2->name.txt);
         } else if (auto* inc = std::get_if<Psig_include>(&it.desc)) {
           members_of_ast_modtype(inc->mt, ex, depth + 1);
         }
@@ -1937,6 +1944,14 @@ struct Typer {
         tt::Path p;
         p.v = tt::Pident{m->second};
         return p;
+      }
+      // A module type brought in via `open M` resolves through M's path (M.T).
+      for (auto it = opens.rbegin(); it != opens.rend(); ++it) {
+        if (it->modtypes.count(l->name)) {
+          tt::Path p;
+          p.v = tt::Pdot{std::make_shared<tt::Path>(it->path), l->name};
+          return p;
+        }
       }
       throw TypeError("Unbound module type " + l->name);
     }
@@ -3034,6 +3049,7 @@ struct Typer {
   std::vector<tt::StructureItem> nested_structure(const ast::Structure& s) {
     auto st = type_scope;
     auto md = module_scope;
+    auto mt = modtype_scope;
     auto op = opens;
     push();
     std::vector<tt::StructureItem> out;
@@ -3041,6 +3057,7 @@ struct Typer {
     pop();
     type_scope = std::move(st);
     module_scope = std::move(md);
+    modtype_scope = std::move(mt);
     opens = std::move(op);
     return out;
   }
@@ -3989,6 +4006,7 @@ struct Typer {
         if (const ModExports* ex = exports_by_path(oe.path)) {  // local module
           for (auto& n : ex->values) oe.values.insert(n);
           for (auto& n : ex->types) oe.types.insert(n);
+          for (auto& n : ex->modtypes) oe.modtypes.insert(n);
           for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
         }
         opens.push_back(std::move(oe));
