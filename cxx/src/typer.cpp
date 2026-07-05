@@ -2388,9 +2388,12 @@ struct Typer {
     } catch (const TypeError&) { return; }
     tt::PatExtra pe;
     pe.ctype = std::move(ct1);
-    pe.loc = out.pat.loc;
+    pe.loc = vb.pat.loc;  // the WHOLE binding pattern span (incl. an inner `(p:t)`)
     pe.loc.ghost = true;
-    out.pat.extras.push_back(std::move(pe));
+    // OCaml conses pat_extra, so the outer binding constraint (added after the
+    // pattern's own inner constraints) prints FIRST: `let (_ : t1) : t2 = e`
+    // dumps the ghost outer t2 extra before the inner t1 extra.
+    out.pat.extras.insert(out.pat.extras.begin(), std::move(pe));
     // A polymorphic annotation (`: 'a. t`) constrains only the pattern -- the RHS
     // stays un-annotated (it can't carry a polymorphic Texp_constraint).
     if (std::holds_alternative<Ptyp_poly>(vc->typ->desc)) return;
