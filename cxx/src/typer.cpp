@@ -3407,7 +3407,11 @@ struct Typer {
   // Elaborate a method body the way the typer does: `fun self-N -> body`, with a
   // Texp_poly extra on the body.  (Instance-variable references in the body would
   // become Texp_instvar -- handled once vals are tracked.)
-  int object_no_ = 0;  // global per-object counter for the self-N display name
+  int object_no_ = 0;  // global per-class/object counter for the self-N display name
+  // A class declaration reserves its class_num before its body is transcribed,
+  // so a class whose body is NOT an object structure (`class u = base`) still
+  // advances the counter, and its structure body (if any) uses this number.
+  int pending_class_num_ = 0;
   // The self name bound in a class/object (`object (self) .. end`), or none for an
   // anonymous self.  Extracted from the parsed self pattern.
   std::optional<std::string> self_pat_name(const ast::Pattern& p) {
@@ -3525,7 +3529,13 @@ struct Typer {
     for (auto& f : cs.fields)
       if (auto* m = std::get_if<Pcf_method>(&f.desc))
         (*meths)[m->name.txt] = fresh_anon(m->name.txt);
-    int self_n = ++object_no_;  // this object's self-N (shared by all its methods)
+    // self-N shared by all this object's methods.  A class DECLARATION reserves
+    // its number up front (pending_class_num_) -- even a non-structure body
+    // consumes one (typeclass.ml's class_num); a standalone/nested `object` gets
+    // a fresh number here.
+    int self_n;
+    if (pending_class_num_) { self_n = pending_class_num_; pending_class_num_ = 0; }
+    else self_n = ++object_no_;
     for (auto& f : cs.fields) {
       tt::ClassField cf;
       cf.loc = f.loc;
@@ -3783,7 +3793,13 @@ struct Typer {
     for (auto& p : d.params) out.params.push_back(core_type(*p));
     auto saved_iv = instvars_;
     push();  // a scope for class parameters
+    // Reserve this declaration's class_num (consumed by its structure body, or
+    // dropped if the body is a class ident/apply) so self-N numbering matches
+    // OCaml's global counter [yamagata].
+    int saved_pending = pending_class_num_;
+    pending_class_num_ = ++object_no_;
     out.expr = class_expr_t(d.expr);
+    pending_class_num_ = saved_pending;
     pop();
     instvars_ = std::move(saved_iv);
     // Record this class' (own + inherited) val/method names so a later subclass
