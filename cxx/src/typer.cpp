@@ -2061,6 +2061,10 @@ struct Typer {
         ex.kind = tt::ExprExtra::Kind::Constraint;
         tt::CoreType ct;
         ct.loc = pk->pkg->path.loc;
+        // The package core_type spans `S with type .. = u` -- extend past the
+        // path to the end of the last `with type` constraint.
+        if (!pk->pkg->constraints.empty())
+          ct.loc.end = pk->pkg->constraints.back().second->loc.end;
         ct.desc = tt::Ttyp_package{package_type(*pk->pkg)};
         ex.ctype = std::move(ct);
         ex.loc = e.loc;
