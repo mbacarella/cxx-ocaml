@@ -480,7 +480,9 @@ struct Printer {
         line(j, "]");
       }
       if (fn->is_cases) {
-        line(j, "Tfunction_cases " + loc(fn->cases_loc));
+        line(j, std::string("Tfunction_cases") +
+                    (fn->cases_partial ? " (Partial)" : "") + " " +
+                    loc(fn->cases_loc));
         if (fn->cases_attrs) attributes(j + 1, *fn->cases_attrs);
         for (auto& ex : fn->cases_extras) expr_extra(j + 1, ex);
         list_cases(j + 1, fn->cases);

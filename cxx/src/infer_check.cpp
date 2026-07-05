@@ -370,6 +370,8 @@ struct Checker {
   std::set<std::string> expanding_;  // guard against cyclic abbreviations
   // match-expression node -> is-partial (the result we route back to the dump)
   std::unordered_map<const Expression*, bool> match_partial;
+  // Pfunction_cases node -> is-partial (bare `function ..`; for the dump)
+  std::unordered_map<const void*, bool> function_cases_partial;
   // Pexp_apply node -> reconstructed argument slots (callee-param order, omitted
   // optionals filled), for the dump.  Only stored when non-trivial (see infer_apply).
   std::unordered_map<const Expression*, std::vector<applymatch::Slot>> apply_plans;
@@ -3017,6 +3019,9 @@ struct Checker {
   bool compute_partial(const TypePtr& scrut, const std::vector<Case>& cases) {
     for (auto& c : cases)
       if (!c.guard && is_catchall(c.lhs)) return false;  // unguarded catch-all
+    bool any_unguarded = false;  // every case guarded -> a value can fall through
+    for (auto& c : cases) if (!c.guard) any_unguarded = true;
+    if (!any_unguarded) return true;
     TypePtr s = I::Engine::repr(scrut);
     if (s->kind != I::Type::Kind::Constr) return false;  // unknown type
     static const std::set<std::string> inf = {
@@ -4992,6 +4997,16 @@ struct Checker {
       }
       if (window && pat_all_ground && !pat_clash && pacc) soft_unify(arg, pacc);
       if (window && res_all_ground && !res_clash && racc) soft_unify(rt, racc);
+      // Exhaustiveness of the cases against the parameter type, for the dump's
+      // Tfunction_cases (Partial) marker (same conservative check as a match).
+      // GADT scrutinees are exempt: refinement (a ctor at an incompatible type
+      // index can't match) makes them total in ways compute_partial can't see,
+      // so claiming Partial would be wrong (switch_opts' `int gadt` omits the
+      // `string gadt` ctors yet is total).
+      TypePtr sarg = I::Engine::repr(arg);
+      bool arg_gadt =
+          sarg->kind == I::Type::Kind::Constr && gadt_types.count(sarg->path);
+      function_cases_partial[&fc] = !arg_gadt && compute_partial(arg, fc.cases);
       params.push_back({arg, 0, ""});
       body = rt;
       constrained = eng.arrow(arg, rt);  // the constraint annotates arg -> rt
@@ -6392,6 +6407,7 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
   run_checker(ck, s);
   DumpAux out;
   out.match_partial = std::move(ck.match_partial);
+  out.function_cases_partial = std::move(ck.function_cases_partial);
   out.apply_plans = std::move(ck.apply_plans);
   out.flatten_construct = std::move(ck.flatten_construct);
   out.record_fields = std::move(ck.record_fields);

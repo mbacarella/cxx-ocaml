@@ -157,6 +157,7 @@ struct Texp_function {
   // Exactly one form is used: Tfunction_body (body set) when there are params,
   // or Tfunction_cases (is_cases) for a bare `function ... | ...`.
   bool is_cases = false;
+  bool cases_partial = false;   // Tfunction_cases (Partial)
   ExprBox body;                 // Tfunction_body
   Location cases_loc;           // Tfunction_cases
   const ast::Attributes* cases_attrs = nullptr;  // `function[@attr]`

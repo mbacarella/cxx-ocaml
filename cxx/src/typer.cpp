@@ -623,6 +623,8 @@ tt::Path stdlib_path(const std::string& name) {
 struct Typer {
   // Side-table from the inference pass: match nodes that are non-exhaustive.
   const std::unordered_map<const ast::Expression*, bool>* partiality = nullptr;
+  // Bare `function ..` nodes that are non-exhaustive (keyed by Pfunction_cases).
+  const std::unordered_map<const void*, bool>* function_cases_partial = nullptr;
   // Slice 3: per Pexp_apply, the reconstructed argument slots (consumed at
   // Pexp_apply in step 3).
   const std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>>*
@@ -2708,6 +2710,10 @@ struct Typer {
       fn.is_cases = true;
       fn.cases_loc = fc.loc;
       fn.cases_attrs = &fc.attrs;
+      if (function_cases_partial) {
+        auto it = function_cases_partial->find(&fc);
+        fn.cases_partial = it != function_cases_partial->end() && it->second;
+      }
       // A `function .. : t` return-type annotation wraps the cases node in a
       // Texp_constraint / Texp_coerce extra (at the cases location).
       if (f.constraint_) {
@@ -4046,6 +4052,7 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   Typer t;
   auto aux = infer_dump_aux(s);  // inference side-tables (Slice 3)
   t.partiality = &aux.match_partial;
+  t.function_cases_partial = &aux.function_cases_partial;
   t.apply_plans = &aux.apply_plans;
   t.flatten_construct = &aux.flatten_construct;
   t.record_fields = &aux.record_fields;

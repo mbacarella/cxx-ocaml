@@ -42,6 +42,9 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
 // positional pass-through.
 struct DumpAux {
   std::unordered_map<const ast::Expression*, bool> match_partial;
+  // Partiality of a bare `function .. | ..` (Tfunction_cases), keyed by the
+  // Pfunction_cases node pointer (its cases match the single parameter).
+  std::unordered_map<const void*, bool> function_cases_partial;
   std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>> apply_plans;
   // Construct nodes (Pexp_construct / Ppat_construct) whose argument tuple the
   // dump flattens because the resolved constructor has arity>1 (incl. cmi ctors).
