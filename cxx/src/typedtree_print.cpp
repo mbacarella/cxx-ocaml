@@ -671,6 +671,7 @@ struct Printer {
 
   void module_expr(int i, const ModuleExpr& me) {
     line(i, "module_expr " + loc(me.loc));
+    if (me.attrs) attributes(i, *me.attrs);
     int j = i + 1;
     if (auto* mi = std::get_if<Tmod_ident>(&me.desc)) {
       line(j, "Tmod_ident \"" + path_aux(mi->path) + "\"");
@@ -865,6 +866,7 @@ struct Printer {
 
   void module_type(int i, const ModuleType& mt) {
     line(i, "module_type " + loc(mt.loc));
+    if (mt.attrs) attributes(i, *mt.attrs);
     int j = i + 1;
     if (auto* id = std::get_if<Tmty_ident>(&mt.desc)) {
       line(j, "Tmty_ident \"" + path_aux(id->path) + "\"");

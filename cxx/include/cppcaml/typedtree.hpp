@@ -392,6 +392,7 @@ struct ModuleType {
                Tmty_typeof>
       desc;
   Location loc;
+  const ast::Attributes* attrs = nullptr;  // mty_attributes
 };
 
 // --- structure ---
@@ -567,6 +568,7 @@ struct ModuleExpr {
                Tmod_constraint, Tmod_unpack, Tmod_apply_unit>
       desc;
   Location loc;
+  const ast::Attributes* attrs = nullptr;  // mod_attributes
 };
 
 // Render a structure in `ocamlc -dtypedtree` format.

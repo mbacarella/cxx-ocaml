@@ -3139,6 +3139,7 @@ struct Typer {
   tt::ModuleType module_type_t(const ModuleType& mt) {
     tt::ModuleType out;
     out.loc = mt.loc;
+    if (!mt.attrs.empty()) out.attrs = &mt.attrs;
     if (auto* id = std::get_if<Pmty_ident>(&mt.desc)) {
       out.desc = tt::Tmty_ident{resolve_modtype(id->id.txt)};
     } else if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) {
@@ -3322,6 +3323,7 @@ struct Typer {
       if (path_global_or_alias(mi->path)) {
         auto wrap = std::make_unique<tt::ModuleExpr>();
         wrap->loc = me->loc;
+        wrap->attrs = me->attrs;  // typemod's `{md with ..}` copies attrs to both
         wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
         return wrap;
       }
@@ -3331,6 +3333,7 @@ struct Typer {
   tt::ModuleExpr module_expr(const ModuleExpr& me) {
     tt::ModuleExpr out;
     out.loc = me.loc;
+    if (!me.attrs.empty()) out.attrs = &me.attrs;
     if (auto* mi = std::get_if<Pmod_ident>(&me.desc)) {
       out.desc = tt::Tmod_ident{resolve_module(mi->id.txt)};
     } else if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
