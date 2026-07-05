@@ -1290,7 +1290,9 @@ struct Typer {
     if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return pat_irrefutable(*lz->p);
     if (auto* op = std::get_if<Ppat_open>(&p.desc)) return pat_irrefutable(*op->p);
     if (std::holds_alternative<Ppat_unpack>(p.desc)) return true;  // (module M)
-    if (std::holds_alternative<Ppat_or>(p.desc)) {
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      // An or-pattern with an irrefutable branch (`M.Ex | _`) always matches.
+      if (pat_irrefutable(*o->l) || pat_irrefutable(*o->r)) return true;
       // `A | B` over `type t = A | B` is exhaustive -> irrefutable.  Collect the
       // distinct constructors named in the or-tree; they are irrefutable iff they
       // all belong to ONE variant and together cover every sibling (each with an
