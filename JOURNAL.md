@@ -3476,3 +3476,57 @@ coercion non-identity detection); Param_pat polyvariant exhaustiveness (mixin2/3
 Tpat_var stamp/loc subtleties (4); #row ghost type_declarations (3); the deep
 attributes.ml torture test (module/modtype/extra attrs + a stamp divergence);
 assorted single-file extra/core_type locs.
+
+--------------------------------------------------------------------------------
+Track-2 continuation, pattern-variable stamps + irrefutability + anon modules:
+664 -> 674 (89.1% -> 90.5% of oracle-typed)
+--------------------------------------------------------------------------------
+Four commits, DIFF 49 -> 39, c++-err flat at 32.  Same ttp_diffcat.sh method:
+bucket the DIFF files by first differing token, attack the largest bucket.
+
+- OR-PATTERN VARIABLE STAMP SHARING (biggest bucket, cleared it outright):
+  In `Some x, None | None, Some x -> ..`, both `x` occurrences are the SAME
+  variable -- OCaml unifies the two or-branches' variable sets and gives them a
+  single Ident/stamp.  c++type minted a fresh stamp per occurrence, so the right
+  branch's `x` and EVERY stamp after it were off by one, propagating through the
+  whole dump.  Fix: while typing one case/binding lhs, keep a name->Ident map
+  (pat_vars_); fresh_local reuses the first ident minted for a name.  Since the
+  only way a name recurs in a well-formed pattern is across or-branches, this is
+  exactly OCaml's sharing (nested ors included).  Installed at the top-level
+  pattern()/to_computation() entry -- a top-level or distributes through
+  to_computation() into two separate pattern() calls that must share the map.
+  [maps, morematch, allocation, gpr1370 + siblings]
+
+- PARAM_PAT IRREFUTABILITY (Total vs Partial on function params):
+  * `let g N.(A|B) = ..` over `type t = A | B`: an or-pattern covering every
+    constructor of one variant is exhaustive, hence irrefutable -> Total.  Added
+    a per-variant-decl group id (ctor_group_) and or_ctor_cover, which walks the
+    or-tree; the ctors are irrefutable iff all share one group and their distinct
+    count == the sibling count, each with an irrefutable arg.  [w33]
+  * `let f A Stdlib.B = ..`: pat_irrefutable only recognized bare-Lident sole
+    ctors; match on lid_last so a module-qualified `Stdlib.B` resolves its
+    sole-ctor sibling count too.  [pervasives_leitmotiv]
+  (mixin2/3 remain: polyvariant Param_pat exhaustiveness needs real row analysis.)
+
+- ANONYMOUS MODULES CONSUME NO STAMP: `module _ = ..` / `and _ : S = ..` bind no
+  name (oracle mb_id = Ident.t option = None), allocate NO stamp, and print `_`.
+  c++type minted a real stamp per anonymous module, offsetting every later stamp
+  by the count of `_` modules seen.  Give struct/recmodule anon bindings the
+  sentinel stamp -1 (no next_stamp bump), matching the existing signature
+  `module _ : S` case, and teach the Tstr_module / Tstr_recmodule printers the
+  `stamp < 0 -> "_"` rule.  [anonymous]
+
+- UNPACK EXTRA LOC (asymmetric): the Tpat_extra_unpack of `(module M : S)` takes
+  the WHOLE pattern span when named but just the `_` span when anonymous --
+  OCaml's typecore uses `loc` in the Tpat_var/Some branch and `name.loc` in the
+  Tpat_any/None branch.  `up->name.txt ? p.loc : up->name.loc`.  (First tried
+  name.loc unconditionally, which regressed debuggee/compiling; corrected.)
+  [anonymous; debuggee/compiling still differ later at a functor module_expr]
+
+Remaining tail (39 DIFF, 32 c++-err): module-coercion HARD core (Includemod
+through functors, first-class-module packing pr6982/pr6485, non-identity arg
+coercion, `Stdlib!.String` functor-path strengthening in debuggee); Param_pat
+polyvariant exhaustiveness (mixin2/3); #row ghost type_declarations (3); label-
+driven application + optional-arg defaulting (htbl/optargs/w06 -- needs the type
+of the callee); type-directed iarray Immutable; attributes.ml torture test;
+assorted single-file extra/core_type locs.
