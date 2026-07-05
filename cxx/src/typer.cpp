@@ -977,6 +977,17 @@ struct Typer {
       if (it->count(name)) return true;
     return false;
   }
+  const tt::Ident* local_ident(const std::string& name) {
+    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return &f->second;
+    }
+    return nullptr;
+  }
+  // Local `external` bound to the %apply / %revapply primitive (stamp -> kind:
+  // 2 = %apply like `@@`, 1 = %revapply like `|>`).  Applications through such
+  // an external are rewritten to a plain Texp_apply, same as Stdlib's operators.
+  std::unordered_map<long long, int> prim_apply_stamp_;
   // Mirrors typecore's `turn_let_into_match`: a `let pat = e in body` is typed as
   // `match e with pat -> body` (and dumped as Texp_match) when the pattern
   // contains a constructor, an open tuple, or a labelled tuple.
@@ -1081,8 +1092,13 @@ struct Typer {
     if (!id) return 0;
     auto* l = std::get_if<Lident>(&id->id.txt.v);
     if (!l) return 0;
+    // A local external redefining the operator via %apply/%revapply (apply.ml).
+    if (const tt::Ident* li = local_ident(l->name)) {
+      auto it = prim_apply_stamp_.find(li->stamp);
+      return it != prim_apply_stamp_.end() ? it->second : 0;
+    }
     int kind = l->name == "|>" ? 1 : l->name == "@@" ? 2 : 0;
-    if (!kind || is_local(l->name)) return 0;
+    if (!kind) return 0;
     tt::Path p = resolve_value(id->id.txt, fn.loc.start.cnum);
     auto* d = std::get_if<tt::Pdot>(&p.v);
     if (!d || d->name != l->name) return 0;
@@ -3224,6 +3240,10 @@ struct Typer {
       tp.attrs = &pr->prim.attrs;
       if (pr->prim.type) tp.type = core_type(*pr->prim.type);
       tp.prims = pr->prim.prims;
+      for (auto& s : pr->prim.prims) {  // record %apply / %revapply externals
+        if (s == "%apply") prim_apply_stamp_[tp.id.stamp] = 2;
+        else if (s == "%revapply") prim_apply_stamp_[tp.id.stamp] = 1;
+      }
       si.desc = std::move(tp);
     } else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
       tt::Tstr_open to;
