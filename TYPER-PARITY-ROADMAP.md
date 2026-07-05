@@ -11,14 +11,14 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **38.4% (712/1853; 95.6% of the 745 oracle-typed)** |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **38.5% (714/1853; 95.8% of the 745 oracle-typed)** |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
 > already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-05): 1
-> c++-err (pr11887, imported #type polyvariant tags) + 32 DIFF files.  The
+> c++-err (pr11887, imported #type polyvariant tags) + 30 DIFF files.  The
 > remaining tail is genuinely hard and type-directed: polyvariant param
 > exhaustiveness (mixin2/3 — a `` `Var s `` param is total by its closed
 > inferred row), GADT abstract-index exhaustiveness (pr7284/robustmatch/
