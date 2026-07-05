@@ -1631,9 +1631,14 @@ struct Typer {
     return out;
   }
 
-  tt::TypeDeclaration type_declaration(const TypeDeclaration& d) {
+  tt::TypeDeclaration type_declaration(
+      const TypeDeclaration& d,
+      std::optional<tt::Ident> id = std::nullopt) {
     tt::TypeDeclaration td;
-    td.id = type_scope.at(d.name.txt);
+    // For a `nonrec` group the declaration's own ident is passed explicitly (the
+    // name has been rebound to the OUTER type in type_scope so the body resolves
+    // there); otherwise the name maps to this declaration.
+    td.id = id ? *id : type_scope.at(d.name.txt);
     td.loc = d.loc;
     td.attrs = &d.attrs;
     for (auto& p : d.params)
@@ -1692,14 +1697,27 @@ struct Typer {
   // Transcribe a (recursive) type-declaration group: pre-bind names, register
   // record fields, then transcribe bodies.  Shared by Pstr_type and Psig_type.
   std::vector<tt::TypeDeclaration> type_decls(
-      const std::vector<TypeDeclaration>& decls) {
+      const std::vector<TypeDeclaration>& decls, RecFlag rf = RecFlag::Recursive) {
+    bool nonrec = rf == RecFlag::Nonrecursive;
     // `#row` companions are stamped first (in decl order), before the real types.
     std::vector<std::pair<const TypeDeclaration*, tt::Ident>> rows;
     for (auto& d : decls)
       if (needs_row_type(d))
         rows.emplace_back(&d, tt::Ident{d.name.txt + "#row", next_stamp++,
                                         tt::Ident::Local});
-    for (auto& d : decls) fresh_type(d.name.txt);
+    // `type nonrec t = .. t ..`: the body's `t` refers to the OUTER (pre-existing)
+    // t, not the one being declared.  Save the outer type-scope bindings so we
+    // can restore them for body transcription, while the declaration's own ident
+    // is the fresh one (passed explicitly to type_declaration).
+    std::vector<std::optional<tt::Ident>> outer;   // per decl (nonrec only)
+    std::vector<tt::Ident> new_ids;                // the fresh declaration idents
+    if (nonrec)
+      for (auto& d : decls) {
+        auto it = type_scope.find(d.name.txt);
+        outer.push_back(it != type_scope.end() ? std::optional(it->second)
+                                               : std::nullopt);
+      }
+    for (auto& d : decls) new_ids.push_back(fresh_type(d.name.txt));
     for (auto& d : decls) type_arity_[d.name.txt] = (int)d.params.size();
     // Register float abbreviations first (`type t = [private] float`, or an alias
     // of an already-known float type), so a same-group float record sees them.
@@ -1739,7 +1757,17 @@ struct Typer {
       rd.private_ = true;
       out.push_back(std::move(rd));
     }
-    for (auto& d : decls) out.push_back(type_declaration(d));
+    if (nonrec)  // bodies resolve names to the outer types, not this group
+      for (size_t i = 0; i < decls.size(); ++i) {
+        if (outer[i]) type_scope[decls[i].name.txt] = *outer[i];
+        else type_scope.erase(decls[i].name.txt);
+      }
+    for (size_t i = 0; i < decls.size(); ++i)
+      out.push_back(type_declaration(
+          decls[i], nonrec ? std::optional(new_ids[i]) : std::nullopt));
+    if (nonrec)  // after the group, the new types ARE in scope for later items
+      for (size_t i = 0; i < decls.size(); ++i)
+        type_scope[decls[i].name.txt] = new_ids[i];
     return out;
   }
 
@@ -2901,7 +2929,7 @@ struct Typer {
       } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
         tt::Tsig_type ts;
         ts.rf = t->rf;
-        ts.decls = type_decls(t->decls);
+        ts.decls = type_decls(t->decls, t->rf);
         si.desc = std::move(ts);
       } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
         tt::Tsig_module out;
@@ -3712,7 +3740,7 @@ struct Typer {
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
       tt::Tstr_type out;
       out.rf = ty->rf;
-      out.decls = type_decls(ty->decls);
+      out.decls = type_decls(ty->decls, ty->rf);
       si.desc = std::move(out);
     } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
       tt::Tstr_primitive tp;
