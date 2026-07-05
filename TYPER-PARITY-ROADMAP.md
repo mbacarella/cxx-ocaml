@@ -11,21 +11,31 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **38.5% (714/1853; 95.8% of the 745 oracle-typed)** |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.1% (724/1853; 97.2% of the 745 oracle-typed)** |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
-> already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-05): 1
-> c++-err (pr11887, imported #type polyvariant tags) + 30 DIFF files.  The
-> remaining tail is genuinely hard and type-directed: polyvariant param
-> exhaustiveness (mixin2/3 — a `` `Var s `` param is total by its closed
-> inferred row), GADT abstract-index exhaustiveness (pr7284/robustmatch/
-> morematch), functor-application type paths (`Set.Make(Bool).t`,
-> accepted_batch), `module type of` stamp propagation (t02), and optional-arg
-> elimination ghosts at applications (htbl/apply — need callee cmi types).
-> Blockers cleared this session: structure-level include, first-class-module
+> already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-05, pm):
+> 1 c++-err (pr11887, imported #type polyvariant tags) + 20 DIFF files.  The
+> remaining tail is genuinely hard and type-directed: GADT abstract-index
+> exhaustiveness (pr7284/robustmatch/morematch — a partial match the type index
+> can't refute), functor-application type paths (`Set.Make(Bool).t`,
+> accepted_batch), `module type of` stamp propagation (t02), the shadowed
+> apply operator `A.@@` (apply.ml), attribute preservation on core_type /
+> module_type / signature-item nodes (w53, attributes), object rows
+> (woodyatt/yamagata), class-level `Tcl_let` placement (toplevel_lets), and
+> immutable-array `Texp` nodes (test_iarray).
+> Optional-arg elimination ghosts — CLOSED this session for direct callees,
+> functor-parameter members (htbl: `H : Hashtbl.SeededS`; pr7601: a local
+> modtype), and `let rec` self-calls (optargs).
+> Blockers cleared this session (714 -> 724): external all-float record ->
+> Record_float (bigarrays); include-aware signature-simplify implicit
+> Tmod_constraint (pr5164 + 4 more); functor-param member optional-arg
+> desugaring (htbl, pr7601{,a}); let-rec self-call optional-arg desugaring
+> (optargs).
+> Earlier blockers cleared: structure-level include, first-class-module
 > pack coercion layers + local-alias strengthening, `type nonrec` outer
 > resolution, inherited class instvars/methods + `as super`, class-parameter
 > val-vs-method scoping, member exports through module types (cmi walker),
