@@ -665,6 +665,16 @@ struct Typer {
     std::unordered_map<std::string, long long> submodule_stamps;
   };
   std::unordered_map<long long, ModExports> module_exports_;
+  // Virtual stamps for module-type submodules whose members we track but which
+  // never appear in the typed tree (so they must not consume next_stamp and
+  // shift real idents).  Kept in a high range that can't collide with the small
+  // per-file real stamps; only ever used as module_exports_ keys, never printed.
+  long long virt_next_ = (1LL << 30);
+  long long register_virtual_module(ModExports ex) {
+    long long vs = virt_next_++;
+    module_exports_[vs] = std::move(ex);
+    return vs;
+  }
   // What each `include ME` contributed to its enclosing structure (keyed by the
   // Tstr_include's ModuleExpr): lets collect_module_exports see path/cmi
   // includes, whose members aren't recoverable from the typed items alone.
@@ -1018,10 +1028,17 @@ struct Typer {
     }
     return sig;
   }
-  static void modexports_of_cmisig(const cmi::Signature& sig, ModExports& ex) {
+  void modexports_of_cmisig(const cmi::Signature& sig, ModExports& ex,
+                            int depth = 0) {
     for (auto& v : sig.values) ex.values.insert(v.name);
     for (auto& t : sig.types) ex.types.insert(t.name);
-    for (auto& m : sig.modules) ex.submodule_stamps.emplace(m.name, -1);
+    for (auto& m : sig.modules) {
+      ModExports sub;
+      if (depth < 6)
+        if (const cmi::Signature* s = cmi_resolve_mt(m.type.get(), &sig, 0))
+          modexports_of_cmisig(*s, sub, depth + 1);
+      ex.submodule_stamps.emplace(m.name, register_virtual_module(std::move(sub)));
+    }
   }
 
   // --- name-level members of a module TYPE ----------------------------------
@@ -1065,7 +1082,12 @@ struct Typer {
         } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
           for (auto& d : t->decls) ex.types.insert(d.name.txt);
         } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
-          if (m->md.name.txt) ex.submodule_stamps.emplace(*m->md.name.txt, -1);
+          if (m->md.name.txt) {
+            ModExports sub;
+            members_of_ast_modtype(*m->md.type, sub, depth + 1);
+            ex.submodule_stamps.emplace(*m->md.name.txt,
+                                        register_virtual_module(std::move(sub)));
+          }
         } else if (auto* inc = std::get_if<Psig_include>(&it.desc)) {
           members_of_ast_modtype(inc->mt, ex, depth + 1);
         }
@@ -1518,12 +1540,17 @@ struct Typer {
         out.res = std::make_unique<tt::CoreType>(core_type(**decl->res));
     } else {
       auto& rb = std::get<Pext_rebind>(c.kind);
-      auto* l = std::get_if<Lident>(&rb.id.txt.v);
-      if (!l) throw TypeError("extension rebind path");
-      auto f = extctor_scope_.find(l->name);
-      if (f == extctor_scope_.end()) throw TypeError("extension rebind unknown");
       tt::Path p;
-      p.v = tt::Pident{f->second};
+      if (auto* l = std::get_if<Lident>(&rb.id.txt.v)) {  // `E = F` (local)
+        auto f = extctor_scope_.find(l->name);
+        if (f == extctor_scope_.end()) throw TypeError("extension rebind unknown");
+        p.v = tt::Pident{f->second};
+      } else if (auto* d = std::get_if<Ldot>(&rb.id.txt.v)) {  // `E = M.F`
+        tt::Path prefix = resolve_module(*d->prefix);
+        p.v = tt::Pdot{std::make_shared<tt::Path>(std::move(prefix)), d->name};
+      } else {
+        throw TypeError("extension rebind path");
+      }
       out.rebind = std::move(p);
     }
     extctor_scope_[c.name.txt] = out.id;
@@ -2831,6 +2858,9 @@ struct Typer {
         tp.attrs = &pr->pd.attrs;
         if (pr->pd.type) tp.type = core_type(*pr->pd.type);
         tp.prims = pr->pd.prims;
+        // A later `external v = z` in the same signature aliases this one, so
+        // bind the name in the enclosing (signature) value scope.
+        scopes.back()[pr->pd.name.txt] = tp.id;
         si.desc = std::move(tp);
       } else if (auto* at = std::get_if<Psig_attribute>(&it.desc)) {
         si.desc = tt::Tsig_attribute{at->name, &at->payload};
