@@ -3530,3 +3530,40 @@ polyvariant exhaustiveness (mixin2/3); #row ghost type_declarations (3); label-
 driven application + optional-arg defaulting (htbl/optargs/w06 -- needs the type
 of the callee); type-directed iarray Immutable; attributes.ml torture test;
 assorted single-file extra/core_type locs.
+
+--------------------------------------------------------------------------------
+Track-2 continuation, #row companions + package/prim locations: 674 -> 677
+(90.5% -> 90.9% of oracle-typed)
+--------------------------------------------------------------------------------
+Three more commits, DIFF 39 -> 36, c++-err flat at 32.
+
+- GHOST `t#row` COMPANION (biggest remaining bucket, 3 files): a `private` type
+  whose manifest is an OPEN row -- open polymorphic variant (`[> ]` / `[< ]`) or
+  open object (`< ..; .. >`) -- gets a hidden `type t#row` in the typedtree:
+  abstract, private, manifest None, params mirroring the real type, located at
+  the decl span but ghost, and stamped BEFORE the real `t` (a recursive group
+  emits all `#row`s first: a#row, b#row, a, b).  c++type emitted neither the node
+  nor its stamp, so the real type's stamp and everything after were off by one.
+  Trigger pinned against the oracle: private + open row ONLY (closed/exact
+  `[ `A ]`, closed `< foo:int >`, or any non-private -> none).  [pr4933, pr6985;
+  pr7284 #row fixed, still differs later at a Tfunction_cases exhaustiveness flag]
+
+- PACKAGE core_type SPAN: the Ttyp_package of `(module M : S with type t = u)`
+  was located at just the modtype path `S`; it spans the whole `S with type t=u`.
+  Extend ct.loc.end to the last `with type` constraint's type end.  [t03]
+
+- LOCAL %apply/%revapply EXTERNALS: the `|> / @@ -> Texp_apply` rewrite was gated
+  on Stdlib resolution, so a local `external ( @@ ) = "%apply"` (apply.ml) stayed
+  an unrewritten 2-arg apply.  The oracle rewrites on the PRIMITIVE, not origin;
+  record local %apply(2)/%revapply(1) externals by stamp, consult in
+  revapply_kind before the Stdlib path.  Moves apply.ml's first divergence well
+  down (to optional-arg defaulting + module-qualified `A.@@`, both still open);
+  no count change but strictly more correct.
+
+Investigated, deferred (each needs real machinery, not transcription):
+`_ t` arity expansion -- a lone `_` arg to an N-ary constructor expands to N
+Ttyp_any at the `_` loc, needs a type-arity registry [issue479]; label-driven
+application + optional-arg `?x -> None` defaulting, needs the callee's type
+[htbl, optargs, w06, apply tail]; type-directed iarray Immutable [test_iarray];
+match/function exhaustiveness -> Partial [robustmatch, pr10338, pr7284 tail];
+module-coercion HARD core [pr5164, pr6982, debuggee/compiling functor paths].
