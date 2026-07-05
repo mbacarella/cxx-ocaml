@@ -526,4 +526,11 @@ void print_payload_structure(const Structure& s, int indent, std::ostream& os,
                              std::string_view fname,
                              const std::vector<std::string>& dirfiles);
 
+// Print an attribute's payload (PStr / PTyp `: t` / PPat `? p [when g]`) in
+// printast format -- the typedtree printer's attributes handler.
+struct Attribute;
+void print_attribute_payload(const Attribute& a, int indent, std::ostream& os,
+                             std::string_view fname,
+                             const std::vector<std::string>& dirfiles);
+
 }  // namespace cppcaml::ast

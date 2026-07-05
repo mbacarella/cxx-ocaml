@@ -1199,4 +1199,15 @@ void print_payload_structure(const Structure& s, int indent, std::ostream& os,
   p.structure_list(indent, s);
 }
 
+void print_attribute_payload(const Attribute& a, int indent, std::ostream& os,
+                             std::string_view fname,
+                             const std::vector<std::string>& dirfiles) {
+  Printer p{os, std::string(fname), dirfiles};
+  if (a.typ) p.core_type(indent, *a.typ);              // PTyp: `[@name : t]`
+  else if (a.pat) {                                    // PPat: `[@name ? p [when g]]`
+    p.pattern(indent, *a.pat);
+    if (a.guard) { p.line(indent, "<when>"); p.expression(indent + 1, *a.guard); }
+  } else p.structure_list(indent, a.payload);          // PStr
+}
+
 }  // namespace cppcaml::ast

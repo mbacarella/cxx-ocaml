@@ -318,7 +318,7 @@ struct Printer {
   void attributes(int i, const ast::Attributes& attrs) {
     for (auto& a : attrs) {
       line(i + 1, "attribute \"" + a.name + "\"");
-      ast::print_payload_structure(a.payload, i + 2, os, fname, dirfiles);
+      ast::print_attribute_payload(a, i + 2, os, fname, dirfiles);
     }
   }
 
