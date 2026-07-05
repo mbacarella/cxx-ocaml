@@ -3409,6 +3409,8 @@ struct Typer {
         tc.t1 = core_type(*c->t1);
         tc.t2 = core_type(*c->t2);
         cf.desc = std::move(tc);
+      } else if (auto* at = std::get_if<Pcf_attribute>(&f.desc)) {  // [@@@attr]
+        cf.desc = tt::Tcf_attribute{at->name, &at->payload};
       } else {
         throw TypeError("class_field#" + std::to_string(f.desc.index()));
       }

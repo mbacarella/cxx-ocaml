@@ -462,8 +462,10 @@ struct Tcf_inherit {  // inherit [!] ce [as super]
 };
 struct Tcf_constraint { CoreType t1; CoreType t2; };  // constraint t1 = t2
 struct Tcf_initializer { ExprBox expr; };  // initializer e (elaborated `fun self -> e`)
+struct Tcf_attribute { std::string name; const ast::Structure* payload; };  // [@@@attr]
 struct ClassField {
-  std::variant<Tcf_val, Tcf_method, Tcf_inherit, Tcf_constraint, Tcf_initializer> desc;
+  std::variant<Tcf_val, Tcf_method, Tcf_inherit, Tcf_constraint, Tcf_initializer,
+               Tcf_attribute> desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;
 };

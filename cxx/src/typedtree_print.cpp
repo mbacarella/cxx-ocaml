@@ -924,6 +924,10 @@ struct Printer {
     } else if (auto* ini = std::get_if<Tcf_initializer>(&f.desc)) {
       line(i + 1, "Tcf_initializer");
       expression(i + 2, *ini->expr);
+    } else if (auto* at = std::get_if<Tcf_attribute>(&f.desc)) {
+      line(i + 1, "Tcf_attribute \"" + at->name + "\"");
+      if (at->payload) ast::print_payload_structure(*at->payload, i + 1, os, fname, dirfiles);
+      else line(i + 1, "[]");
     } else {
       auto& v = std::get<Tcf_val>(f.desc);
       line(i + 1, "Tcf_val \"" + v.name + "\" " + (v.mutable_ ? "Mutable" : "Immutable"));
