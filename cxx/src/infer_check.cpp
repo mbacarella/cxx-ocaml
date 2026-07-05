@@ -1424,6 +1424,25 @@ struct Checker {
     return out;
   }
 
+  // An arrow carrying just the SYNTACTIC parameter labels of a `let rec` RHS
+  // function (fresh var types), to unify with the recursion var so a self-call's
+  // optional args are desugared.  Null when the RHS isn't syntactically a fun.
+  TypePtr syntactic_fun_arrow(const Expression& rhs) {
+    auto* f = std::get_if<Pexp_function>(&rhs.desc);
+    if (!f) return nullptr;
+    std::vector<std::pair<int, std::string>> labels;
+    for (auto& fp : f->params)
+      if (auto* pv = std::get_if<Pparam_val>(&fp.desc))
+        labels.push_back(arglabel(pv->label));
+    bool cases = f->body && std::holds_alternative<Pfunction_cases>(f->body->v);
+    if (labels.empty() && !cases) return nullptr;
+    TypePtr arr = eng.fresh_var();                            // result
+    if (cases) arr = eng.arrow(eng.fresh_var(), arr, 0, "");  // the `function` param
+    for (auto it = labels.rbegin(); it != labels.rend(); ++it)
+      arr = eng.arrow(eng.fresh_var(), arr, it->first, it->second);
+    return arr;
+  }
+
   std::unordered_map<std::string, TypePtr> param_sig_value_schemes(
       const ModuleType& ps, const std::unordered_map<std::string, TypePtr>& argtypes) {
     std::unordered_map<std::string, TypePtr> out;
@@ -5369,6 +5388,11 @@ struct Checker {
         } else {
           tv[i] = infer_pat(b.pat);
           bound[i] = tv[i];
+          // Give the recursion var the RHS function's syntactic parameter labels
+          // up front, so a self-call omitting an optional param is desugared
+          // (ghost None) -- the body inference otherwise only unifies the arrow
+          // AFTER the self-call is typed, leaving it label-less (optargs).
+          if (TypePtr arr = syntactic_fun_arrow(*b.expr)) try_unify(tv[i], arr);
         }
       }
       annot_vars_ = saved_av;
