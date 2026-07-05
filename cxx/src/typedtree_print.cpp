@@ -1100,7 +1100,7 @@ struct Printer {
       module_expr(j, *op->expr);
     } else if (auto* md = std::get_if<Tstr_module>(&it.desc)) {
       line(j, std::string("Tstr_module (") + (md->present ? "Present" : "Absent") + ")");
-      line(j, ident(md->id));
+      line(j, md->id.stamp < 0 ? "_" : ident(md->id));
       if (md->attrs) attributes(j, *md->attrs);
       module_expr(j + 1, *md->expr);
     } else if (auto* at = std::get_if<Tstr_attribute>(&it.desc)) {
@@ -1122,7 +1122,7 @@ struct Printer {
       line(j, "Tstr_recmodule");
       line(j, "[");
       for (auto& b : rm->bindings) {
-        line(j + 1, ident(b.id));
+        line(j + 1, b.id.stamp < 0 ? "_" : ident(b.id));
         if (b.attrs) attributes(j + 1, *b.attrs);
         module_expr(j + 2, *b.expr);
       }

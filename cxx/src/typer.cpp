@@ -1662,7 +1662,7 @@ struct Typer {
       tt::PatExtra ex;
       ex.kind = tt::PatExtra::Kind::Unpack;
       if (up->pkg) ex.pkg = package_type(*up->pkg);
-      ex.loc = p.loc;
+      ex.loc = up->name.loc;  // the module NAME's span (`M`/`_`), not the whole pat
       out.extras.push_back(std::move(ex));
       if (up->name.txt) {
         tt::Tpat_var tv;
@@ -3254,7 +3254,10 @@ struct Typer {
       // bound (so `module M = struct .. M.x .. end` sees an OUTER M), then M is
       // bound for the following items.
       tm.expr = std::make_unique<tt::ModuleExpr>(module_expr(b.expr));
-      tm.id = fresh_module(b.name.txt ? *b.name.txt : "_");
+      // Anonymous `module _ = E` binds no name and allocates no stamp (matching
+      // the oracle's Ident.t option = None); it prints as `_`.
+      if (b.name.txt) tm.id = fresh_module(*b.name.txt);
+      else { tm.id.name = "_"; tm.id.stamp = -1; }
       tm.attrs = &b.attrs;
       // Record what M exports (for later local opens / dotted resolution).
       if (auto* body = module_body(*tm.expr)) {
@@ -3302,8 +3305,10 @@ struct Typer {
     } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
       tt::Tstr_recmodule tr;
       std::vector<tt::Ident> ids;  // pre-bind all names (stamp order + mutual refs)
-      for (auto& b : rm->bindings)
-        ids.push_back(fresh_module(b.name.txt ? *b.name.txt : "_"));
+      for (auto& b : rm->bindings) {
+        if (b.name.txt) ids.push_back(fresh_module(*b.name.txt));
+        else ids.push_back(tt::Ident{"_", -1, tt::Ident::Local});  // anon: no stamp
+      }
       for (size_t k = 0; k < rm->bindings.size(); ++k) {
         const ModuleExpr& be = rm->bindings[k].expr;
         auto me = module_expr(be);
