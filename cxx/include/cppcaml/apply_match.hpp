@@ -53,6 +53,13 @@ inline Result match(const std::vector<Param>& params, const std::vector<Arg>& ar
         break;
       }
     }
+    // A required (Labelled, non-optional) parameter with no explicitly-labelled
+    // argument is filled by the next positional (Nolabel) argument: OCaml lets
+    // `foo 2` supply `~bar` positionally.  The slot still carries the param's
+    // label so the typed tree records `Labelled "bar"`.
+    if (found < 0 && p.label == 1)
+      for (size_t i = 0; i < args.size(); ++i)
+        if (!used[i] && args[i].label == 0) { found = (int)i; break; }
     Slot s;
     s.param_label = p.label;
     s.param_name = p.name;

@@ -4523,11 +4523,19 @@ struct Checker {
     if (!m.ok) return;
     bool trivial = m.slots.size() == args.size();
     if (trivial)
-      for (size_t i = 0; i < m.slots.size(); ++i)
-        if (m.slots[i].omitted || m.slots[i].some_wrap || m.slots[i].arg_index != (int)i) {
+      for (size_t i = 0; i < m.slots.size(); ++i) {
+        const auto& s = m.slots[i];
+        if (s.omitted || s.some_wrap || s.arg_index != (int)i) {
           trivial = false;
           break;
         }
+        // A positional arg placed against a labelled parameter must be recorded
+        // so the transcriber emits the parameter's label, not the source's.
+        if (s.param_label != args[i].label || s.param_name != args[i].name) {
+          trivial = false;
+          break;
+        }
+      }
     if (!trivial) apply_plans[&enode] = std::move(m.slots);
   }
   // Rebuild `t` with constr paths under head `from` ("M.") reheaded to `to`
