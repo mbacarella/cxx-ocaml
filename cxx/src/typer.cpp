@@ -646,6 +646,7 @@ struct Typer {
   // CamlinternalFormatBasics.Format(...) tree in the dump (type-directed, so it
   // catches unqualified/open'd/let-bound formats the syntactic path can't).
   const std::set<const ast::Expression*>* format_lits = nullptr;
+  const std::set<const ast::Expression*>* iarray_lits = nullptr;
   long long next_stamp = 274;  // arbitrary base; the harness normalizes stamps
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
@@ -2501,6 +2502,7 @@ struct Typer {
       out.desc = std::move(tc);
     } else if (auto* ar = std::get_if<Pexp_array>(&e.desc)) {
       tt::Texp_array ta;
+      ta.immutable = iarray_lits && iarray_lits->count(&e);
       for (auto& el : ar->elems)
         ta.elems.push_back(std::make_unique<tt::Expression>(expr(*el)));
       out.desc = std::move(ta);
@@ -4224,6 +4226,7 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   t.record_fields = &aux.record_fields;
   t.record_reprs = &aux.record_reprs;
   t.format_lits = &aux.format_lits;
+  t.iarray_lits = &aux.iarray_lits;
   typedtree::Structure out;
   for (auto& it : s) out.push_back(t.structure_item(it));
   return out;

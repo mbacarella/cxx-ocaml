@@ -182,7 +182,7 @@ struct Texp_match {
 };
 struct Texp_try { ExprBox body; std::vector<Case> cases; };     // cases are value
 struct Texp_construct { std::string name; std::vector<ExprBox> args; };
-struct Texp_array { std::vector<ExprBox> elems; };
+struct Texp_array { std::vector<ExprBox> elems; bool immutable = false; };
 struct Texp_assert { ExprBox e; };
 enum class Direction { Up, Down };
 struct Texp_for { Ident var; Direction dir; ExprBox lo; ExprBox hi; ExprBox body; };

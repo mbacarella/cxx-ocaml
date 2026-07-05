@@ -300,6 +300,20 @@ struct Checker {
     }
   }
   std::set<const Expression*> fmt_lits_;  // string literals inferred at format type
+  std::set<const Expression*> iarray_lits_;  // `[|..|]` expected at an iarray type
+  // An array literal `[|..|]` (possibly under `: t` constraints) whose EXPECTED
+  // type is `iarray` prints as `Texp_array Immutable`.  Dump-only recording.
+  void mark_if_iarray(const Expression& e, const TypePtr& expected) {
+    if (!record_kinds_ && !record_fmt_lits_) return;
+    TypePtr er = I::Engine::repr(expected);
+    if (er->kind != I::Type::Kind::Constr) return;
+    auto d = er->path.rfind('.');
+    std::string b = d == std::string::npos ? er->path : er->path.substr(d + 1);
+    if (b != "iarray") return;
+    const Expression* inner = &e;
+    while (auto* c = std::get_if<Pexp_constraint>(&inner->desc)) inner = c->e.get();
+    if (std::holds_alternative<Pexp_array>(inner->desc)) iarray_lits_.insert(inner);
+  }
   // Optional-argument erasure: an expression of type `?l:.. -> ..` used where a
   // non-optional arrow is expected is eta-expanded with None for each erased
   // optional.  The bool vector is the application's argument slots in order
@@ -3808,6 +3822,7 @@ struct Checker {
   // type_format), with its argument arrow filled in so the consuming application
   // (printf/sprintf/...) flows argument value-kinds.
   TypePtr infer_expr_expected(const Expression& e, const TypePtr& expected) {
+    mark_if_iarray(e, expected);  // `[|..|]` expected at iarray -> Immutable dump
     if (auto* c = std::get_if<Pexp_constant>(&e.desc))
       if (auto* s = std::get_if<Pconst_string>(&c->c.desc); s && is_format_constr(expected)) {
         if (strict)
@@ -4162,6 +4177,7 @@ struct Checker {
       TypePtr at = from_coretype(*ct->t, vars);
       if (strict && expected_clash(et, at))  // (e : T) with e of a clashing type
         note_error("expression does not match the type constraint");
+      mark_if_iarray(*ct->e, at);  // `([|..|] : _ iarray)` -> Immutable dump
       // Flow the annotation into the inner expression in the NON-strict passes
       // (value-kinds AND signature): `ignore (f s : int)` then pins `f : _ -> int`
       // in the inferred signature, not just the value kinds.  Not in the strict
@@ -5470,6 +5486,7 @@ struct Checker {
           annot = from_coretype(*pc->typ, avars);
           if (strict && expected_clash(te, annot))
             note_error("type mismatch against declared type");
+          mark_if_iarray(*b.expr, annot);  // `let a : _ iarray = [|..|]` -> Immutable
           // Flow the declared type `let x : T = e` into the inferred one (pins
           // an under-determined result, e.g. `let why : unit -> unit = fun () ->
           // raise Exit`).  Non-strict only (the strict pass keeps the inferred
@@ -6560,6 +6577,7 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
   out.record_fields = std::move(ck.record_fields);
   out.record_reprs = std::move(ck.record_reprs);
   out.format_lits = std::move(ck.fmt_lits_);
+  out.iarray_lits = std::move(ck.iarray_lits_);
   return out;
 }
 

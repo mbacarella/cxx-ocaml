@@ -62,6 +62,10 @@ struct DumpAux {
   // "%d"`, `let f : _ format = "%d"`, ...): the dump desugars them to the
   // CamlinternalFormatBasics.Format(...) tree, exactly as OCaml's type_format.
   std::set<const ast::Expression*> format_lits;
+  // Array literals `[| .. |]` whose expected/inferred type is `iarray` (not
+  // `array`): the dump prints them as `Texp_array Immutable`.  Type-directed --
+  // `[||]` is polymorphic between array and iarray, resolved by expected type.
+  std::set<const ast::Expression*> iarray_lits;
 };
 DumpAux infer_dump_aux(const ast::Structure& s);
 

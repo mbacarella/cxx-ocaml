@@ -525,7 +525,7 @@ struct Printer {
         line(j, "]");
       }
     } else if (auto* ar = std::get_if<Texp_array>(&e.desc)) {
-      line(j, "Texp_array Mutable");
+      line(j, ar->immutable ? "Texp_array Immutable" : "Texp_array Mutable");
       if (ar->elems.empty()) line(j, "[]");
       else {
         line(j, "[");
