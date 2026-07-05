@@ -2320,11 +2320,15 @@ struct Typer {
       if (pk->pkg) {
         // `(module M : S)`: the ascription coerces the ident behind a
         // transparent constraint and prints as a Ttyp_package Texp_constraint.
-        if (std::holds_alternative<tt::Tmod_ident>(me->desc)) {
-          auto wrap = std::make_unique<tt::ModuleExpr>();
-          wrap->loc = me->loc;
-          wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
-          me = std::move(wrap);
+        // A global path is additionally strengthened (a second implicit layer).
+        if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc)) {
+          int layers = path_root_global(mi->path) ? 2 : 1;
+          for (int k = 0; k < layers; ++k) {
+            auto wrap = std::make_unique<tt::ModuleExpr>();
+            wrap->loc = me->loc;
+            wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
+            me = std::move(wrap);
+          }
         }
         tt::ExprExtra ex;
         ex.kind = tt::ExprExtra::Kind::Constraint;
