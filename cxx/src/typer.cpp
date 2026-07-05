@@ -3561,11 +3561,10 @@ struct Typer {
         tt::Tcf_inherit ti;
         ti.override_ = in->ovr == OverrideFlag::Override;
         if (in->as_) ti.super = in->as_->txt;
-        // the typer coerces the parent class: Tcl_constraint(parent, None)
-        tt::ClassExpr wrap;
-        wrap.loc = in->ce->loc;
-        wrap.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(class_expr_t(*in->ce))};
-        ti.ce = std::make_unique<tt::ClassExpr>(std::move(wrap));
+        // The parent class-expr carries its own coercion when it is an ident
+        // (Pcl_constr -> Tcl_constraint); a non-ident parent (e.g. `inherit (c
+        // args)`) is transcribed directly, matching typeclass.ml.
+        ti.ce = std::make_unique<tt::ClassExpr>(class_expr_t(*in->ce));
         // Inherited instance variables become fresh instvars of this class
         // (minted here, after the parent class-expr, matching OCaml's order) so
         // a later method/initializer body sees `y` as Texp_instvar.  Ancestor
@@ -3641,12 +3640,17 @@ struct Typer {
     if (auto* ps = std::get_if<Pcl_structure>(&ce.desc))
       return class_structure_expr(ps->cs, ce.loc);
     if (auto* cc = std::get_if<Pcl_constr>(&ce.desc)) {  // a class path, e.g. `inherit b`
-      tt::ClassExpr out;
-      out.loc = ce.loc;
       tt::Tcl_ident ti;
       ti.path = resolve_class(cc->id.txt);
       for (auto& a : cc->args) ti.args.push_back(std::make_unique<tt::CoreType>(core_type(*a)));
-      out.desc = std::move(ti);
+      tt::ClassExpr inner;
+      inner.loc = ce.loc;
+      inner.desc = std::move(ti);
+      // A class ident is ALWAYS coerced to its class type: Tcl_constraint(_, None),
+      // a transparent extra class_expr layer at the same loc (typeclass.ml).
+      tt::ClassExpr out;
+      out.loc = ce.loc;
+      out.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(std::move(inner))};
       return out;
     }
     if (auto* cn = std::get_if<Pcl_constraint>(&ce.desc)) {  // (ce : ct)
@@ -3662,12 +3666,9 @@ struct Typer {
       tt::ClassExpr out;
       out.loc = ce.loc;
       tt::Tcl_apply ta;
-      // The applied class expression is coerced, like an inherited parent:
-      // Tcl_constraint(fn, None).
-      tt::ClassExpr wrap;
-      wrap.loc = ap->ce->loc;
-      wrap.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(class_expr_t(*ap->ce))};
-      ta.fn = std::make_unique<tt::ClassExpr>(std::move(wrap));
+      // `(ce) args`: the function part is transcribed directly -- OCaml's
+      // typeclass does NOT wrap it in a Tcl_constraint (toplevel_lets).
+      ta.fn = std::make_unique<tt::ClassExpr>(class_expr_t(*ap->ce));
       for (auto& [lbl, e] : ap->args)
         ta.args.emplace_back(lbl, std::make_unique<tt::Expression>(expr(*e)));
       out.desc = std::move(ta);
