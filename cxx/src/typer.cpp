@@ -1330,7 +1330,14 @@ struct Typer {
     out.id = fresh_anon(c.name.txt);
     if (auto* decl = std::get_if<Pext_decl>(&c.kind)) {
       if (auto* r = std::get_if<Pcstr_record>(&decl->args)) {
-        for (auto& f : r->fields) out.labels.push_back(label_decl(f));
+        RecordInfo info;  // `exception E of {..}` / `t += E of {..}` -> extension
+        info.repr = "Record_extension \"" + out.id.name + "/" +
+                    std::to_string(out.id.stamp) + "\"";
+        for (auto& f : r->fields) {
+          out.labels.push_back(label_decl(f));
+          info.decl_fields.push_back(f.name.txt);
+        }
+        for (auto& f : r->fields) field_registry[f.name.txt] = info;
       } else {
         out.args = ctor_args(decl->args);
       }
