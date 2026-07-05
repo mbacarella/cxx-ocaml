@@ -11,26 +11,28 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.3% (728/1853; 97.7% of the 745 oracle-typed)** |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.3% (729/1853; 97.9% of the 745 oracle-typed)** |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
 > already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-05, pm2):
-> 1 c++-err (pr11887, imported #type polyvariant tags) + 16 DIFF files.  Closed
-> this sub-session (724 -> 728): toplevel_lets + yamagata (class-ident coercion
+> 1 c++-err (pr11887, imported #type polyvariant tags) + 15 DIFF files.  Closed
+> this sub-session (724 -> 729): toplevel_lets + yamagata (class-ident coercion
 > wrap moved to the ident; self-N counter advances per class DECLARATION incl.
 > non-structure bodies), w53 (module_expr/module_type attributes, incl. the
 > strengthening wrapper duplicating them), exotic (let `:>` coercion binding,
 > virtual class-type method poly loc, `method : type t.` newtype extra
-> relocation).  Remaining 16 DIFF: pr7284/robustmatch/morematch (GADT
-> abstract-index exhaustiveness), accepted_batch (functor-app type paths), t02 +
-> attributes.ml (module-type-of STAMP offsets), apply (shadowed `A.@@` resolved
-> as builtin %apply), woodyatt (format-through-method `y#x "str"`), fstclassmod
-> (module-rec package_type path Typ.PAIR), pr6922 (poly object), test_iarray
-> (immutable-array Texp), cast/pr7657/index_aliases/fragile_matching/
-> backtrace_deprecated.  The
+> relocation), t02 (module type of preserves member stamps -> `T with type u :=`
+> reuses M's u stamp).  Remaining 15 DIFF: pr7284/robustmatch/morematch (GADT
+> abstract-index exhaustiveness), accepted_batch (functor-app type paths),
+> attributes.ml (`include (module type of M) with type t :=` STAMP offsets +
+> package_type span), apply (shadowed `A.@@` resolved as builtin %apply),
+> woodyatt (format-through-method `y#x "str"`), fstclassmod (module-rec
+> package_type path Typ.PAIR), pr6922 (poly object), test_iarray (immutable-
+> array Texp), cast/pr7657/index_aliases/fragile_matching/backtrace_deprecated.
+> The
 > remaining tail is genuinely hard and type-directed: GADT abstract-index
 > exhaustiveness (pr7284/robustmatch/morematch — a partial match the type index
 > can't refute), functor-application type paths (`Set.Make(Bool).t`,
