@@ -800,6 +800,11 @@ struct Typer {
   // Locally-declared constructor -> number of constructors in its variant
   // (drives param-pattern partiality: the sole ctor is irrefutable).
   std::unordered_map<std::string, size_t> ctor_siblings_;
+  // Constructor -> a per-variant-declaration group id, so an or-pattern can be
+  // checked for covering ALL siblings of ONE type (`A|B` over `type t = A | B`
+  // is exhaustive, hence irrefutable).
+  std::unordered_map<std::string, int> ctor_group_;
+  int ctor_group_seq_ = 0;
 
   // Locally-declared constructors of arity > 1 (`C of t1 * t2`): name -> arity.
   // A constructor of arity n applied to an n-tuple flattens its argument in the
@@ -1007,12 +1012,13 @@ struct Typer {
     if (std::holds_alternative<Ppat_any>(p.desc) ||
         std::holds_alternative<Ppat_var>(p.desc)) return true;
     if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
-      if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
-        if (l->name == "()" && !c->arg) return true;  // unit is irrefutable
-        auto s = ctor_siblings_.find(l->name);  // sole ctor of a local variant
-        if (s != ctor_siblings_.end() && s->second == 1)
-          return !c->arg || pat_irrefutable(**c->arg);
-      }
+      if (std::holds_alternative<Lident>(c->id.txt.v) &&
+          lid_last(c->id.txt) == "()" && !c->arg)
+        return true;  // unit is irrefutable
+      // Sole ctor of a local variant (bare or module-qualified, `Stdlib.B`).
+      auto s = ctor_siblings_.find(lid_last(c->id.txt));
+      if (s != ctor_siblings_.end() && s->second == 1)
+        return !c->arg || pat_irrefutable(**c->arg);
       return false;
     }
     if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
@@ -1029,6 +1035,41 @@ struct Typer {
     if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) return pat_irrefutable(*lz->p);
     if (auto* op = std::get_if<Ppat_open>(&p.desc)) return pat_irrefutable(*op->p);
     if (std::holds_alternative<Ppat_unpack>(p.desc)) return true;  // (module M)
+    if (std::holds_alternative<Ppat_or>(p.desc)) {
+      // `A | B` over `type t = A | B` is exhaustive -> irrefutable.  Collect the
+      // distinct constructors named in the or-tree; they are irrefutable iff they
+      // all belong to ONE variant and together cover every sibling (each with an
+      // irrefutable argument).
+      std::set<std::string> names;
+      int group = -1;
+      if (or_ctor_cover(p, names, group) && group >= 0 &&
+          !names.empty() && names.size() == ctor_siblings_[*names.begin()])
+        return true;
+      return false;
+    }
+    return false;
+  }
+
+  // Walk an or-pattern tree; every leaf must be a bare-Lident constructor of the
+  // same variant `group`, with an irrefutable argument.  Records their names.
+  bool or_ctor_cover(const ast::Pattern& p, std::set<std::string>& names,
+                     int& group) {
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return or_ctor_cover(*o->l, names, group) &&
+             or_ctor_cover(*o->r, names, group);
+    if (auto* op = std::get_if<Ppat_open>(&p.desc))
+      return or_ctor_cover(*op->p, names, group);
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      auto* l = std::get_if<Lident>(&c->id.txt.v);
+      if (!l) return false;
+      auto g = ctor_group_.find(l->name);
+      if (g == ctor_group_.end()) return false;
+      if (group == -1) group = g->second;
+      else if (group != g->second) return false;
+      if (c->arg && !pat_irrefutable(**c->arg)) return false;
+      names.insert(l->name);
+      return true;
+    }
     return false;
   }
 
@@ -1316,8 +1357,11 @@ struct Typer {
       // single-ctor pattern can be total: count them as 1 (never Partial).
       bool gadt = false;
       for (auto& c : v->ctors) gadt = gadt || c.res.has_value();
-      for (auto& c : v->ctors)
+      int group = ctor_group_seq_++;
+      for (auto& c : v->ctors) {
         ctor_siblings_[c.name.txt] = gadt ? 1 : v->ctors.size();
+        ctor_group_[c.name.txt] = group;
+      }
       for (auto& c : v->ctors) {
         if (auto* r = std::get_if<Pcstr_record>(&c.args)) {
           RecordInfo info;
