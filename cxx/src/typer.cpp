@@ -2337,7 +2337,7 @@ struct Typer {
         // module_expr line), plus one more for a global path (also strengthened).
         int layers = 1;
         if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc))
-          if (path_root_global(mi->path)) layers = 2;
+          if (path_global_or_alias(mi->path)) layers = 2;  // strengthened
         for (int k = 0; k < layers; ++k) {
           auto wrap = std::make_unique<tt::ModuleExpr>();
           wrap->loc = me->loc;
@@ -2350,7 +2350,7 @@ struct Typer {
         // transparent constraint and prints as a Ttyp_package Texp_constraint.
         // A global path is additionally strengthened (a second implicit layer).
         if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc)) {
-          int layers = path_root_global(mi->path) ? 2 : 1;
+          int layers = path_global_or_alias(mi->path) ? 2 : 1;  // strengthened
           for (int k = 0; k < layers; ++k) {
             auto wrap = std::make_unique<tt::ModuleExpr>();
             wrap->loc = me->loc;
@@ -3857,10 +3857,11 @@ struct Typer {
       si.desc = std::move(tm);
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
       auto me = std::make_unique<tt::ModuleExpr>(module_expr(in->expr));
-      // Including a cmi-loaded module (an Mty_alias, e.g. `include List`)
-      // expands the alias behind a transparent constraint, like functor paths.
+      // Including an aliased module (a cmi Mty_alias like `include List`, or a
+      // local `module A = ..` alias) expands it behind a transparent
+      // strengthening constraint, like functor paths.
       if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc))
-        if (path_root_global(mi->path)) {
+        if (path_global_or_alias(mi->path)) {
           auto wrap = std::make_unique<tt::ModuleExpr>();
           wrap->loc = me->loc;
           wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
