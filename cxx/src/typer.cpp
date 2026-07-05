@@ -1133,6 +1133,11 @@ struct Typer {
   // (Tmeth_val); every other send prints the name only (Tmeth_name).
   using MethsMap = std::unordered_map<std::string, tt::Ident>;
   std::unordered_map<int, std::shared_ptr<MethsMap>> self_meths_;  // self-ident stamp -> class' meths
+  // Per-class (by class-ident stamp) instance-variable and method names in
+  // declaration order, INCLUDING inherited ones -- so `inherit P` can bring P's
+  // vals/methods into a subclass (fresh instvar idents; ancestor method idents).
+  std::unordered_map<int, std::vector<std::string>> class_vals_;
+  std::unordered_map<int, std::vector<std::string>> class_methods_;
   // Local polymorphic-variant abbreviations (`type t = [ `A | `B of u | .. ]`):
   // a `#t` pattern expands to the or-pattern of these tags.
   struct PolyTag { std::string name; bool has_arg; };
@@ -3236,6 +3241,16 @@ struct Typer {
     // the body resolves to the alias ident (self-N).  Bind the self name to it.
     tt::Ident self_inner = fresh_anon("self-*");
     tt::Ident self_alias = fresh_anon("self-" + std::to_string(self_n));
+    // Hide any local that is also an instance variable (a class parameter) so
+    // its reference in this body resolves to Texp_instvar, not the outer local.
+    std::vector<std::pair<size_t, std::pair<std::string, tt::Ident>>> hidden;
+    for (auto& [nm, id] : instvars_)
+      for (size_t fi = scopes.size(); fi-- > 0;)
+        if (auto f = scopes[fi].find(nm); f != scopes[fi].end()) {
+          hidden.push_back({fi, {nm, f->second}});
+          scopes[fi].erase(f);
+          break;
+        }
     push();
     if (self_name) {
       scopes.back()[*self_name] = self_alias;
@@ -3243,6 +3258,7 @@ struct Typer {
     }
     tt::Expression be = expr(*body);
     pop();
+    for (auto& [fi, kv] : hidden) scopes[fi][kv.first] = kv.second;
     if (poly) {  // methods carry a Texp_poly extra; initializers do not
       tt::ExprExtra ex;
       ex.kind = tt::ExprExtra::Kind::Poly;
@@ -3358,6 +3374,29 @@ struct Typer {
         wrap.loc = in->ce->loc;
         wrap.desc = tt::Tcl_constraint{std::make_unique<tt::ClassExpr>(class_expr_t(*in->ce))};
         ti.ce = std::make_unique<tt::ClassExpr>(std::move(wrap));
+        // Inherited instance variables become fresh instvars of this class
+        // (minted here, after the parent class-expr, matching OCaml's order) so
+        // a later method/initializer body sees `y` as Texp_instvar.  Ancestor
+        // methods get fresh idents; `as super` sees them as a self-send table.
+        int pstamp = parent_class_stamp(*in->ce);
+        if (pstamp >= 0) {
+          auto vi = class_vals_.find(pstamp);
+          if (vi != class_vals_.end())
+            for (auto& n : vi->second) instvars_[n] = fresh_anon(n);
+          auto mi = class_methods_.find(pstamp);
+          if (mi != class_methods_.end()) {
+            auto anc = std::make_shared<MethsMap>();
+            for (auto& n : mi->second) {
+              tt::Ident id = fresh_anon(n);
+              (*anc)[n] = id;
+              (*meths)[n] = id;  // self can also call inherited methods
+            }
+            if (in->as_) {
+              tt::Ident sup = fresh_local(in->as_->txt);  // `as super` binds a value
+              self_meths_[sup.stamp] = anc;
+            }
+          }
+        }
         cf.desc = std::move(ti);
       } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
         tt::Tcf_initializer tin;
@@ -3393,14 +3432,14 @@ struct Typer {
       tt::Tcl_fun tf;
       tf.label = fn->label;
       tf.pat = std::make_unique<tt::Pattern>(pattern(fn->pat));  // the param ident
-      // A class parameter is captured as an instance variable (a fresh ident):
-      // method bodies see it via the self object (Texp_instvar), not as a local.
+      // A class parameter is ALSO captured as an instance variable (a distinct
+      // fresh ident): a method/initializer body sees it via self (Texp_instvar),
+      // but a `val` initializer -- evaluated in the parameter scope before the
+      // object exists -- sees the plain local (Texp_ident).  So keep the local
+      // AND register the instvar; elaborate_method hides the local.
       std::vector<std::string> pvars;
       collect_pat_vars(fn->pat, pvars);
-      for (auto& nm : pvars) {
-        scopes.back().erase(nm);
-        instvars_[nm] = fresh_anon(nm);
-      }
+      for (auto& nm : pvars) instvars_[nm] = fresh_anon(nm);
       tf.body = std::make_unique<tt::ClassExpr>(class_expr_t(*fn->body));
       out.desc = std::move(tf);
       return out;
@@ -3499,6 +3538,48 @@ struct Typer {
     }
     return fresh_anon(name);  // shouldn't happen for a just-bound let var
   }
+  // The class-ident stamp a parent class-expr (`inherit P` / `inherit P a`)
+  // denotes, if it's a locally-known class path; -1 otherwise.
+  int parent_class_stamp(const ClassExpr& ce) {
+    const ClassExpr* cur = &ce;
+    while (auto* ap = std::get_if<Pcl_apply>(&cur->desc)) cur = &*ap->ce;
+    if (auto* cn = std::get_if<Pcl_constr>(&cur->desc))
+      if (auto* l = std::get_if<Lident>(&cn->id.txt.v)) {
+        auto it = class_scope_.find(l->name);
+        if (it != class_scope_.end()) return it->second.stamp;
+      }
+    return -1;
+  }
+  // A class' val/method names in declaration order, following `inherit` parents
+  // (their names already recorded in class_{vals,methods}_).  Unwraps the
+  // class-expr down to its structure.
+  void collect_class_members(const ClassExpr& ce, std::vector<std::string>& vals,
+                             std::vector<std::string>& meths) {
+    const ClassExpr* cur = &ce;
+    while (true) {
+      if (auto* fn = std::get_if<Pcl_fun>(&cur->desc)) { cur = &*fn->body; continue; }
+      if (auto* cn = std::get_if<Pcl_constraint>(&cur->desc)) { cur = &*cn->ce; continue; }
+      break;
+    }
+    auto* ps = std::get_if<Pcl_structure>(&cur->desc);
+    if (!ps) return;
+    for (auto& f : ps->cs.fields) {
+      if (auto* v = std::get_if<Pcf_val>(&f.desc)) vals.push_back(v->name.txt);
+      else if (auto* m = std::get_if<Pcf_method>(&f.desc)) meths.push_back(m->name.txt);
+      else if (auto* in = std::get_if<Pcf_inherit>(&f.desc)) {
+        int ps2 = parent_class_stamp(*in->ce);
+        if (ps2 >= 0) {
+          auto vi = class_vals_.find(ps2);
+          if (vi != class_vals_.end())
+            for (auto& n : vi->second) vals.push_back(n);
+          auto mi = class_methods_.find(ps2);
+          if (mi != class_methods_.end())
+            for (auto& n : mi->second) meths.push_back(n);
+        }
+      }
+    }
+  }
+
   tt::ClassDeclaration class_declaration(const ast::ClassDeclaration& d) {
     tt::ClassDeclaration out;
     out.loc = d.loc;
@@ -3510,6 +3591,12 @@ struct Typer {
     out.expr = class_expr_t(d.expr);
     pop();
     instvars_ = std::move(saved_iv);
+    // Record this class' (own + inherited) val/method names so a later subclass
+    // can inherit them.
+    auto cs = class_scope_.find(d.name.txt);
+    if (cs != class_scope_.end())
+      collect_class_members(d.expr, class_vals_[cs->second.stamp],
+                            class_methods_[cs->second.stamp]);
     return out;
   }
   // A method annotation is always a Ttyp_poly; a bare type is wrapped in
