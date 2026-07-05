@@ -2303,6 +2303,20 @@ struct Typer {
       out.desc = std::move(tl);
     } else if (auto* pk = std::get_if<Pexp_pack>(&e.desc)) {
       auto me = std::make_unique<tt::ModuleExpr>(module_expr(*pk->me));
+      if (!pk->pkg) {
+        // An unannotated `(module ME)` is still coerced to the expected package
+        // signature: one implicit Tmod_constraint layer (each an extra
+        // module_expr line), plus one more for a global path (also strengthened).
+        int layers = 1;
+        if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc))
+          if (path_root_global(mi->path)) layers = 2;
+        for (int k = 0; k < layers; ++k) {
+          auto wrap = std::make_unique<tt::ModuleExpr>();
+          wrap->loc = me->loc;
+          wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
+          me = std::move(wrap);
+        }
+      }
       if (pk->pkg) {
         // `(module M : S)`: the ascription coerces the ident behind a
         // transparent constraint and prints as a Ttyp_package Texp_constraint.
