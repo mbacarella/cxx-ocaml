@@ -663,6 +663,24 @@ struct Typer {
     std::unordered_map<std::string, tt::Ident> types, modules;
   };
   std::unordered_map<long long, SigExports> modtype_exports_;
+  // A local module's type/module member IDENTS (name -> Ident, stamps intact),
+  // keyed by the module's stamp, so `module type of M` reuses M's stamps -- a
+  // later `... with type u := ..` then binds u to M's original u ident (t02).
+  std::unordered_map<long long, SigExports> module_sig_exports_;
+  // Collect a transcribed structure's type/module member idents (decl order
+  // irrelevant; name -> Ident), for module_sig_exports_.
+  static void collect_sig_idents(const std::vector<tt::StructureItem>& items,
+                                 SigExports& ex) {
+    for (auto& it : items) {
+      if (auto* t = std::get_if<tt::Tstr_type>(&it.desc)) {
+        for (auto& d : t->decls) ex.types.emplace(d.id.name, d.id);
+      } else if (auto* m = std::get_if<tt::Tstr_module>(&it.desc)) {
+        if (m->id.stamp >= 0) ex.modules.emplace(m->id.name, m->id);
+      } else if (auto* inc = std::get_if<tt::Tstr_include>(&it.desc)) {
+        if (auto* body = module_body(*inc->expr)) collect_sig_idents(*body, ex);
+      }
+    }
+  }
 
   // Names a locally-defined module exports: for `open M` of a local module
   // (resolution through the open's path, like "Std/1.Hash") and for
@@ -4013,6 +4031,14 @@ struct Typer {
         modtype_ast_[mt->name.txt] = &*mt->type;
         out.type = std::make_unique<tt::ModuleType>(module_type_t(*mt->type));
         collect_exports(*out.type, modtype_exports_[out.id.stamp]);
+        // `module type T = module type of M` inherits M's member idents, so a
+        // later `T with type u := ..` reuses M's u stamp (t02).
+        if (auto* tof = std::get_if<tt::Tmty_typeof>(&out.type->desc))
+          if (auto* mi = std::get_if<tt::Tmod_ident>(&tof->expr->desc))
+            if (auto* pi = std::get_if<tt::Pident>(&mi->path.v))
+              if (auto f = module_sig_exports_.find(pi->id.stamp);
+                  f != module_sig_exports_.end())
+                modtype_exports_[out.id.stamp] = f->second;
         members_of_ast_modtype(*mt->type, modtype_members_[out.id.stamp], 0);
       }
       si.desc = std::move(out);
@@ -4042,6 +4068,7 @@ struct Typer {
       // Record what M exports (for later local opens / dotted resolution).
       if (auto* body = module_body(*tm.expr)) {
         collect_module_exports(*body, module_exports_[tm.id.stamp]);
+        if (tm.id.stamp >= 0) collect_sig_idents(*body, module_sig_exports_[tm.id.stamp]);
       } else if (auto* mi2 = std::get_if<tt::Tmod_ident>(&tm.expr->desc)) {
         if (auto* pi = std::get_if<tt::Pident>(&mi2->path.v)) {  // module A = B
           auto f = module_exports_.find(pi->id.stamp);
