@@ -1498,9 +1498,22 @@ struct Typer {
       tt::Ttyp_open to;
       to.path = resolve_module(op->mod_.txt);
       auto saved = opens;
-      opens.push_back(make_open_entry(op->mod_.txt));
+      OpenEntry oe = make_open_entry(op->mod_.txt);
+      // The local open shadows outer type bindings of the same name, so `N.(t)`
+      // resolves `t` to `N.t` even when an outer `type t` exists.  Temporarily
+      // remove the shadowed names so resolve_type falls through to the open.
+      std::vector<std::pair<std::string, tt::Ident>> shadowed;
+      for (auto& n : oe.types) {
+        auto it = type_scope.find(n);
+        if (it != type_scope.end()) {
+          shadowed.emplace_back(n, it->second);
+          type_scope.erase(it);
+        }
+      }
+      opens.push_back(std::move(oe));
       to.type = std::make_unique<tt::CoreType>(core_type(*op->type));
       opens = std::move(saved);
+      for (auto& [n, id] : shadowed) type_scope[n] = id;
       out.desc = std::move(to);
     } else {
       throw TypeError("coretype#" + std::to_string(t.desc.index()));
@@ -2148,6 +2161,17 @@ struct Typer {
     } else {
       tt::Pattern inner = pattern(p);
       out.loc = inner.loc;
+      // A top-level type CONSTRAINT on a match-case pattern (`(_ : t)`) sits on
+      // the COMPUTATION pattern in OCaml; the other extras (#type, unpack, open)
+      // stay on the wrapped value pattern.
+      std::vector<tt::PatExtra> keep;
+      for (auto& e : inner.extras) {
+        if (e.kind == tt::PatExtra::Kind::Constraint)
+          out.extras.push_back(std::move(e));
+        else
+          keep.push_back(std::move(e));
+      }
+      inner.extras = std::move(keep);
       out.desc = tt::Tpat_value{std::make_unique<tt::Pattern>(std::move(inner))};
     }
     return out;
