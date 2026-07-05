@@ -811,6 +811,9 @@ struct Typer {
   // typedtree (`C (a, b)` -> args [a; b]).  Keyed by simple name; external
   // (cmi) constructors aren't here, so they keep the single (tuple) argument.
   std::unordered_map<std::string, int> ctor_arity_;
+  // Locally-declared type constructors: simple name -> parameter count.  Drives
+  // the `_ t` expansion (a lone `_` argument fills every arity slot).
+  std::unordered_map<std::string, int> type_arity_;
 
   static std::string lid_last(const Longident& x) {
     if (auto* p = std::get_if<Lident>(&x.v)) return p->name;
@@ -1192,8 +1195,20 @@ struct Typer {
     } else if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
       tt::Ttyp_constr tc;
       tc.path = resolve_type(c->id.txt);
-      for (auto& arg : c->args)
-        tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*arg)));
+      // A lone `_` argument to an N-ary constructor (`_ t`, t of arity N) fills
+      // every slot: N copies of Ttyp_any, all at the written `_`'s location.
+      int expand = 0;
+      if (c->args.size() == 1 &&
+          std::holds_alternative<Ptyp_any>(c->args[0]->desc)) {
+        auto ar = type_arity_.find(lid_last(c->id.txt));
+        if (ar != type_arity_.end() && ar->second != 1) expand = ar->second;
+      }
+      if (expand)
+        for (int k = 0; k < expand; ++k)
+          tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*c->args[0])));
+      else
+        for (auto& arg : c->args)
+          tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*arg)));
       out.desc = std::move(tc);
     } else if (auto* cl = std::get_if<Ptyp_class>(&t.desc)) {  // `[args] #class`
       tt::Ttyp_class tc;
@@ -1471,6 +1486,7 @@ struct Typer {
         rows.emplace_back(&d, tt::Ident{d.name.txt + "#row", next_stamp++,
                                         tt::Ident::Local});
     for (auto& d : decls) fresh_type(d.name.txt);
+    for (auto& d : decls) type_arity_[d.name.txt] = (int)d.params.size();
     // Register float abbreviations first (`type t = [private] float`, or an alias
     // of an already-known float type), so a same-group float record sees them.
     auto is_float_ty = [&](const CoreType& t) {
