@@ -906,7 +906,7 @@ struct Printer {
     if (auto* in = std::get_if<Tcf_inherit>(&f.desc)) {
       line(i + 1, std::string("Tcf_inherit ") + (in->override_ ? "Override" : "Fresh"));
       class_expr(i + 2, *in->ce);
-      if (in->super) line(i + 2, "Some \"" + *in->super + "\"");
+      if (in->super) { line(i + 2, "Some"); line(i + 3, "\"" + *in->super + "\""); }
       else line(i + 2, "None");
       return;
     }
