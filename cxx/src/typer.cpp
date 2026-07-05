@@ -2010,7 +2010,10 @@ struct Typer {
       tt::PatExtra ex;
       ex.ctype = core_type(*ct->t);
       ex.loc = p.loc;
-      out.extras.push_back(std::move(ex));
+      // OCaml conses pat_extra, so the OUTER constraint prints before any extra
+      // the inner pattern already carries (e.g. `((module X) : pkg)` prints the
+      // constraint before the unpack).
+      out.extras.insert(out.extras.begin(), std::move(ex));
     } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
       tt::Tpat_record tr;  // only the written fields, in order (label = last comp)
       for (auto& [lid, sub] : r->fields)
