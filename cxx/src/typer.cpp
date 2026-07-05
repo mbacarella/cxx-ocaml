@@ -638,6 +638,10 @@ struct Typer {
   // list (for <kept> fields; local records use field_registry).
   const std::unordered_map<const ast::Expression*, std::vector<std::string>>*
       record_fields = nullptr;
+  // Parallel to record_fields: an external record node's non-default repr
+  // (Record_float); absent => Record_regular.
+  const std::unordered_map<const ast::Expression*, std::string>*
+      record_reprs = nullptr;
   // String-literal nodes inferred at a format type: desugared to the
   // CamlinternalFormatBasics.Format(...) tree in the dump (type-directed, so it
   // catches unqualified/open'd/let-bound formats the syntactic path can't).
@@ -2578,6 +2582,10 @@ struct Typer {
       else if (record_fields) {
         auto it = record_fields->find(&e);
         if (it != record_fields->end()) decl_fields = &it->second;
+        if (record_reprs) {
+          auto ir = record_reprs->find(&e);
+          if (ir != record_reprs->end()) repr = ir->second;
+        }
       }
       if (decl_fields) {  // emit all fields in declaration order, <kept> for omitted
         std::unordered_map<std::string, std::pair<std::string, const ExprBox*>> prov;
@@ -4067,6 +4075,7 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   t.apply_plans = &aux.apply_plans;
   t.flatten_construct = &aux.flatten_construct;
   t.record_fields = &aux.record_fields;
+  t.record_reprs = &aux.record_reprs;
   t.format_lits = &aux.format_lits;
   typedtree::Structure out;
   for (auto& it : s) out.push_back(t.structure_item(it));

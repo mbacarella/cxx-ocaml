@@ -54,6 +54,10 @@ struct DumpAux {
   // Functional record-update nodes whose base is an EXTERNAL record type -> its
   // full ordered field list (for the dump's <kept> fields).
   std::unordered_map<const ast::Expression*, std::vector<std::string>> record_fields;
+  // Record-construction/update nodes whose type is an EXTERNAL record with a
+  // non-default representation (currently: all-`float` fields -> Record_float).
+  // Local records carry their repr in the transcriber's own field registry.
+  std::unordered_map<const ast::Expression*, std::string> record_reprs;
   // String-literal expressions inferred at a printf-family format type (`printf
   // "%d"`, `let f : _ format = "%d"`, ...): the dump desugars them to the
   // CamlinternalFormatBasics.Format(...) tree, exactly as OCaml's type_format.
