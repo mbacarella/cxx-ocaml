@@ -2515,9 +2515,28 @@ struct Typer {
       for (size_t i = 0; i < vbs.size(); ++i) {
         tt::ValueBinding b;
         b.pat = std::move(pats[i]);
-        b.expr = expr(*vbs[i].expr);
-        b.attrs = &vbs[i].attrs;
-        apply_value_constraint(b, vbs[i]);
+        const Pvc_constraint* nt_vc = nullptr;
+        if (vbs[i].constraint_)
+          if (auto* vc = std::get_if<Pvc_constraint>(&*vbs[i].constraint_))
+            if (!vc->univars.empty()) nt_vc = vc;
+        if (nt_vc) {  // `let rec f : type a. t = e`: newtypes scope the RHS
+          auto saved = type_scope;
+          std::unordered_map<int, std::string> nt;
+          std::vector<std::string> names;
+          for (auto& u : nt_vc->univars) {
+            tt::Ident id = fresh_type(u.txt);
+            nt[id.stamp] = u.txt;
+            names.push_back(u.txt);
+          }
+          b.expr = expr(*vbs[i].expr);
+          b.attrs = &vbs[i].attrs;
+          apply_newtype_constraint(b, vbs[i], *nt_vc, nt, names);
+          type_scope = std::move(saved);
+        } else {
+          b.expr = expr(*vbs[i].expr);
+          b.attrs = &vbs[i].attrs;
+          apply_value_constraint(b, vbs[i]);
+        }
         out.push_back(std::move(b));
       }
     } else {
