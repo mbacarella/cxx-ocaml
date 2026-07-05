@@ -3567,3 +3567,43 @@ application + optional-arg `?x -> None` defaulting, needs the callee's type
 [htbl, optargs, w06, apply tail]; type-directed iarray Immutable [test_iarray];
 match/function exhaustiveness -> Partial [robustmatch, pr10338, pr7284 tail];
 module-coercion HARD core [pr5164, pr6982, debuggee/compiling functor paths].
+
+--------------------------------------------------------------------------------
+Track-2 continuation, arity expansion + double-constraint + record-extension:
+677 -> 681 (90.9% -> 91.4% of oracle-typed)
+--------------------------------------------------------------------------------
+Four more commits, DIFF 36 -> 32, c++-err flat at 32.  Two of the four are the
+same "lone `_` fills every slot" rule, once for types and once for constructors.
+
+- `_ t` ARITY EXPANSION: `_ iter2gen` over `type ('a,'b) iter2gen` elaborates to
+  `iter2gen` applied to N copies of Ttyp_any, ALL at the single `_`'s location --
+  OCaml fills every arity slot from the lone wildcard.  Added a local type_arity_
+  registry (name -> param count, populated in type_decls); the Ptyp_constr path
+  expands when the sole arg is Ptyp_any and arity != 1.  [issue479]
+
+- `C _` CONSTRUCTOR EXPANSION (same rule, patterns): `Intron_point _` over an
+  arity-2 ctor -> `Tpat_construct [_; _]`.  Reused the existing ctor_arity_
+  registry; when the ctor's arg is a lone Ppat_any and arity>1, emit N copies.
+  [test_generator]
+
+- DOUBLE-CONSTRAINT `let (_ : t1) : t2 = e`: two Tpat_extra_constraint on the
+  pattern.  OCaml conses pat_extra, so the OUTER binding constraint (added last)
+  prints FIRST and is ghost, and BOTH extras carry the whole `(_ : t1)` span --
+  not the unwrapped inner `_` loc.  c++ appended the outer (printed second) at the
+  inner loc; insert at front + use vb.pat.loc.  Plain `let x : t = e` unchanged.
+  [topeval]
+
+- Record_extension REPR: `exception Exn of {..}` / `t += E of {..}` inline
+  records have representation `Record_extension "E/n"`.  ext_ctor built the label
+  decls but never registered them in field_registry, so a construction fell back
+  to Record_regular; register with the extension-ctor repr.  [index_constrs_records]
+
+Remaining tail (32 DIFF, 32 c++-err): module-coercion HARD core (Mp_present vs
+Mp_absent for functor-param aliases [index_functor], Includemod-through-functor
+coercions, first-class-module packing pr6982, functor-path strengthening in
+debuggee/compiling); match/function exhaustiveness -> Partial [morematch,
+robustmatch, pr10338, pr7284 tail]; label-driven application + optional-arg
+`?x -> None` defaulting [htbl, optargs, w06, apply tail, pr7657]; method-body
+newtype `method f : type t. u` [exotic]; type-directed iarray Immutable;
+external-record Record_float (Complex.t, needs cmi repr) [bigarrays]; the
+attributes.ml torture test; assorted single-file extra/core_type locs.
