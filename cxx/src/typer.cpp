@@ -1684,9 +1684,18 @@ struct Typer {
         bool plain = tup && tup->closed == ClosedFlag::Closed &&
                      std::none_of(tup->labels.begin(), tup->labels.end(),
                                   [](auto& l) { return l.has_value(); });
+        size_t dot = tc.name.rfind('.');
+        auto ar = ctor_arity_.find(dot == std::string::npos ? tc.name
+                                                            : tc.name.substr(dot + 1));
+        int arity = ar != ctor_arity_.end() ? ar->second : 0;
         if (plain && flattens(tc.name, tup->elems.size(), &p)) {
           for (auto& el : tup->elems)
             tc.args.push_back(std::make_unique<tt::Pattern>(pattern(*el)));
+        } else if (arity > 1 &&
+                   std::holds_alternative<Ppat_any>((*k->arg)->desc)) {
+          // `C _` for an arity-N ctor: the lone `_` fills every slot (N Tpat_any).
+          for (int i = 0; i < arity; ++i)
+            tc.args.push_back(std::make_unique<tt::Pattern>(pattern(**k->arg)));
         } else {
           tc.args.push_back(std::make_unique<tt::Pattern>(pattern(**k->arg)));
         }
