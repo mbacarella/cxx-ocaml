@@ -625,6 +625,8 @@ struct Typer {
   const std::unordered_map<const ast::Expression*, bool>* partiality = nullptr;
   // Bare `function ..` nodes that are non-exhaustive (keyed by Pfunction_cases).
   const std::unordered_map<const void*, bool>* function_cases_partial = nullptr;
+  // Param patterns' exhaustiveness (keyed by the AST pattern node).
+  const std::unordered_map<const void*, bool>* param_partial = nullptr;
   // Slice 3: per Pexp_apply, the reconstructed argument slots (consumed at
   // Pexp_apply in step 3).
   const std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>>*
@@ -2681,7 +2683,15 @@ struct Typer {
       // The default expression sees the OUTER scope (not this param's binding).
       if (pv.default_)
         fp.default_ = std::make_unique<tt::Expression>(expr(**pv.default_));
+      // The syntactic check is authoritative for Total (it handles GADT
+      // refinement etc.); the inference-computed verdict only DOWNGRADES a
+      // syntactic Partial to Total when the resolved type proves exhaustive
+      // (e.g. a `` `Var s `` param over a closed polyvariant row).
       fp.partial = !pat_irrefutable(pv.pat);
+      if (fp.partial && param_partial) {
+        auto it = param_partial->find(&pv.pat);
+        if (it != param_partial->end() && !it->second) fp.partial = false;
+      }
       fp.pat = std::make_unique<tt::Pattern>(pattern(pv.pat));
       fn.params.push_back(std::move(fp));
     }
@@ -4053,6 +4063,7 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   auto aux = infer_dump_aux(s);  // inference side-tables (Slice 3)
   t.partiality = &aux.match_partial;
   t.function_cases_partial = &aux.function_cases_partial;
+  t.param_partial = &aux.param_partial;
   t.apply_plans = &aux.apply_plans;
   t.flatten_construct = &aux.flatten_construct;
   t.record_fields = &aux.record_fields;

@@ -372,6 +372,8 @@ struct Checker {
   std::unordered_map<const Expression*, bool> match_partial;
   // Pfunction_cases node -> is-partial (bare `function ..`; for the dump)
   std::unordered_map<const void*, bool> function_cases_partial;
+  // Param-pattern node -> is-partial (Param_pat (Partial)); against the type
+  std::unordered_map<const void*, bool> param_partial;
   // Pexp_apply node -> reconstructed argument slots (callee-param order, omitted
   // optionals filled), for the dump.  Only stored when non-trivial (see infer_apply).
   std::unordered_map<const Expression*, std::vector<applymatch::Slot>> apply_plans;
@@ -3035,6 +3037,55 @@ struct Checker {
     return false;  // covers all top-level ctors => Total (conservative)
   }
 
+  // Collect the polyvariant tags a pattern matches (through alias/or/constraint).
+  void collect_variant_tags(const Pattern& p, std::set<std::string>& out) {
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc)) out.insert(v->label);
+    else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) collect_variant_tags(*a->p, out);
+    else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) collect_variant_tags(*c->p, out);
+    else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      collect_variant_tags(*o->l, out);
+      collect_variant_tags(*o->r, out);
+    }
+  }
+  // Exhaustiveness of a SINGLE (parameter/let) pattern against its type: total
+  // (false) unless a top-level constructor/tag is missing.  A polyvariant over a
+  // closed row is total iff the pattern covers every row label; a non-variant,
+  // non-Constr type (tuple/record/abstract/unknown) is total.
+  // A `#t` pattern (through alias/constraint) matches every tag of type t, so it
+  // is exhaustive for that polyvariant.
+  static bool pat_is_hash_type(const Pattern& p) {
+    if (std::holds_alternative<Ppat_type>(p.desc)) return true;
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pat_is_hash_type(*a->p);
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pat_is_hash_type(*c->p);
+    return false;
+  }
+  bool param_pattern_partial(const TypePtr& scrut, const Pattern& pat) {
+    if (is_catchall(pat)) return false;
+    if (pat_is_hash_type(pat)) return false;  // `#t` covers its type
+    TypePtr s = I::Engine::repr(scrut);
+    if (s->kind == I::Type::Kind::Variant) {
+      if (s->variant_kind == 0 && s->labels.empty()) return false;  // open, unknown
+      std::set<std::string> covered;
+      collect_variant_tags(pat, covered);
+      for (auto& l : s->labels)
+        if (!covered.count(l)) return true;  // a present tag is unmatched
+      return false;
+    }
+    if (s->kind != I::Type::Kind::Constr) return false;  // tuple/record/abstract
+    static const std::set<std::string> inf = {
+        "int", "char", "string", "float", "int32", "int64", "nativeint", "bytes"};
+    if (inf.count(s->path)) return true;  // infinite type, single pattern
+    auto it = type_ctors.find(s->path);
+    // Unknown / extensible type (exn, `type t = ..`): can't prove total, so keep
+    // the syntactic verdict (this is consulted downgrade-only) -- a single
+    // extension/exception ctor `M.E` param IS partial.
+    if (it == type_ctors.end()) return true;
+    std::set<std::string> covered;
+    collect_ctors(pat, covered);
+    for (auto& ctor : it->second) if (!covered.count(ctor)) return true;
+    return false;
+  }
+
   TypePtr constant_type(const Constant& c) {
     if (auto* i = std::get_if<Pconst_integer>(&c.desc)) {
       if (i->suffix == 'l') return eng.constr("int32");
@@ -4875,6 +4926,7 @@ struct Checker {
       }
     struct Param { TypePtr ty; int lk; std::string nm; };
     std::vector<Param> params;
+    std::vector<std::pair<const Pattern*, TypePtr>> ppat_types;  // param partiality
     // First-class-module params `(module M : S)` bind M's values (at
     // M-qualified abstract types) for the body -- `P.print x` ties x : P.t.
     // Saved/restored around the body so M doesn't leak past the function.
@@ -4890,6 +4942,7 @@ struct Checker {
         // an optional parameter's type is its default's type: `?(c = 100)` => int
         if (pv->default_) try_unify(pt, infer_expr(**pv->default_));
         params.push_back({pt, lk, nm});
+        ppat_types.emplace_back(&pv->pat, pt);  // for param-pattern partiality
         if (!strict) {
           const Ppat_unpack* up = std::get_if<Ppat_unpack>(&pv->pat.desc);
           const Ptyp_package* upkg = up && up->pkg ? &*up->pkg : nullptr;
@@ -5043,6 +5096,13 @@ struct Checker {
         }
       }
     if (record_kinds_) rec_ret_[&f] = body;
+    // Param-pattern exhaustiveness (for Param_pat (Partial)), now that the body
+    // has constrained each param type: a `` `Var s `` param over a closed row is
+    // total, an unannotated variant/tuple/record is total, `Some x` over option
+    // is partial.  Computed against the resolved type -- more precise than the
+    // syntactic pat_irrefutable the transcriber falls back to.
+    for (auto& [pp, pt] : ppat_types)
+      param_partial[pp] = param_pattern_partial(pt, *pp);
     TypePtr t = body;
     for (auto it = params.rbegin(); it != params.rend(); ++it)
       t = eng.arrow(it->ty, t, it->lk, it->nm);
@@ -6408,6 +6468,7 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
   DumpAux out;
   out.match_partial = std::move(ck.match_partial);
   out.function_cases_partial = std::move(ck.function_cases_partial);
+  out.param_partial = std::move(ck.param_partial);
   out.apply_plans = std::move(ck.apply_plans);
   out.flatten_construct = std::move(ck.flatten_construct);
   out.record_fields = std::move(ck.record_fields);

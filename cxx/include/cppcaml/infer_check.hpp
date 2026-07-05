@@ -45,6 +45,8 @@ struct DumpAux {
   // Partiality of a bare `function .. | ..` (Tfunction_cases), keyed by the
   // Pfunction_cases node pointer (its cases match the single parameter).
   std::unordered_map<const void*, bool> function_cases_partial;
+  // Param-pattern node -> is-partial (Param_pat (Partial)), against its type.
+  std::unordered_map<const void*, bool> param_partial;
   std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>> apply_plans;
   // Construct nodes (Pexp_construct / Ppat_construct) whose argument tuple the
   // dump flattens because the resolved constructor has arity>1 (incl. cmi ctors).
