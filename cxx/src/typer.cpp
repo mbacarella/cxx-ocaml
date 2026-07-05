@@ -1662,7 +1662,9 @@ struct Typer {
       tt::PatExtra ex;
       ex.kind = tt::PatExtra::Kind::Unpack;
       if (up->pkg) ex.pkg = package_type(*up->pkg);
-      ex.loc = up->name.loc;  // the module NAME's span (`M`/`_`), not the whole pat
+      // OCaml's asymmetry: a named `(module M : S)` extra spans the whole pattern;
+      // anonymous `(module _ : S)` (Tpat_any) spans just the `_`.
+      ex.loc = up->name.txt ? p.loc : up->name.loc;
       out.extras.push_back(std::move(ex));
       if (up->name.txt) {
         tt::Tpat_var tv;
