@@ -684,6 +684,13 @@ struct Typer {
   // of a functor path (`S.Make(..)`), such an alias is strengthened just like a
   // direct global path (a transparent coercion layer in the typed tree).
   std::set<long long> alias_module_stamps_;
+  // Module idents bound as a functor PARAMETER: aliasing one (`module M = X`)
+  // stays Mp_present (the parameter has no static address to strengthen away),
+  // unlike a plain `module M = P` alias which is Mp_absent.
+  std::set<long long> functor_param_stamps_;
+  // Named module types by name -> their AST body (for resolving `X : T` params
+  // when T is a named `module type T = sig .. end`).
+  std::unordered_map<std::string, const ast::ModuleType*> modtype_ast_;
 
   static void pat_var_names(const tt::Pattern& p,
                             std::unordered_set<std::string>& out) {
@@ -1071,6 +1078,40 @@ struct Typer {
         if (d.name == last)
           if (const cmi::Signature* s = cmi_resolve_mt(d.type.get(), pre, depth))
             modexports_of_cmisig(*s, ex);
+  }
+  // Register the inline-record constructors of a signature's type declarations
+  // into field_registry (Record_inlined <block-tag>), mirroring type_kind but
+  // persisting past the signature's own scope -- so a functor body referencing
+  // `X.B { .. }` (B an inline-record ctor from param X's sig) gets the repr.
+  void register_sig_inline_records(const ast::ModuleType& mt) {
+    if (auto* id = std::get_if<Pmty_ident>(&mt.desc)) {  // a named `module type T`
+      if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
+        auto f = modtype_ast_.find(l->name);
+        if (f != modtype_ast_.end()) register_sig_inline_records(*f->second);
+      }
+      return;
+    }
+    auto* sg = std::get_if<Pmty_signature>(&mt.desc);
+    if (!sg) return;
+    for (auto& it : sg->items) {
+      auto* t = std::get_if<Psig_type>(&it.desc);
+      if (!t) continue;
+      for (auto& d : t->decls) {
+        auto* v = std::get_if<Ptype_variant>(&d.kind);
+        if (!v) continue;
+        int block_idx = 0;
+        for (auto& c : v->ctors) {
+          if (auto* r = std::get_if<Pcstr_record>(&c.args)) {
+            RecordInfo info;
+            for (auto& f : r->fields) info.decl_fields.push_back(f.name.txt);
+            info.repr = "Record_inlined " + std::to_string(block_idx);
+            for (auto& f : r->fields) field_registry[f.name.txt] = info;
+          }
+          auto* tp = std::get_if<Pcstr_tuple>(&c.args);
+          if (!(tp && tp->elems.empty())) ++block_idx;
+        }
+      }
+    }
   }
   void members_of_ast_modtype(const ast::ModuleType& mt, ModExports& ex,
                               int depth) {
@@ -3209,11 +3250,16 @@ struct Typer {
         tf.param_type = std::make_unique<tt::ModuleType>(module_type_t(*named->type));
         if (named->name.txt) {
           tf.param = fresh_module(*named->name.txt);
+          functor_param_stamps_.insert(tf.param->stamp);
           // The param's signature members resolve inside the body (`open X`,
           // dotted access): register them like a local module's exports.
           ModExports ex;
           members_of_ast_modtype(*named->type, ex, 0);
           module_exports_[tf.param->stamp] = std::move(ex);
+          // An inline-record constructor from the param's signature (`X.B { r }`)
+          // keeps its Record_inlined repr in the body -- the signature scope
+          // reverts field_registry, so register those fields persistently here.
+          register_sig_inline_records(*named->type);
         }
       }  // Functor_unit: generative, no param/param_type
       tf.body = std::make_unique<tt::ModuleExpr>(module_expr(*fn->body));
@@ -3809,6 +3855,7 @@ struct Typer {
       out.id = fresh_modtype(mt->name.txt);
       out.attrs = &mt->attrs;
       if (mt->type) {
+        modtype_ast_[mt->name.txt] = &*mt->type;
         out.type = std::make_unique<tt::ModuleType>(module_type_t(*mt->type));
         collect_exports(*out.type, modtype_exports_[out.id.stamp]);
         members_of_ast_modtype(*mt->type, modtype_members_[out.id.stamp], 0);
@@ -3820,6 +3867,14 @@ struct Typer {
       auto& b = mb->binding;
       tt::Tstr_module tm;
       tm.present = !std::holds_alternative<Pmod_ident>(b.expr.desc);  // alias=Absent
+      // ...but aliasing a bare functor PARAMETER stays Present.
+      if (auto* mi = std::get_if<Pmod_ident>(&b.expr.desc))
+        if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
+          auto it = module_scope.find(l->name);
+          if (it != module_scope.end() &&
+              functor_param_stamps_.count(it->second.stamp))
+            tm.present = true;
+        }
       // A plain `module M = E` is non-recursive: E is elaborated with M NOT yet
       // bound (so `module M = struct .. M.x .. end` sees an OUTER M), then M is
       // bound for the following items.
