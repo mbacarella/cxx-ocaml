@@ -1402,23 +1402,41 @@ struct Checker {
   // A parameter signature PS's value name -> expected type, with PS's abstract
   // types substituted by the functor argument's (`t` -> the arg's t).  PS may be
   // an inline `sig .. end`, a cmi module-type ident (Map.OrderedType), or `S with`.
+  // Value name -> declared type of a signature's `val` items, with the abstract
+  // types named in `argtypes` substituted (arrow labels are preserved, so an
+  // optional param survives).
+  std::unordered_map<std::string, TypePtr> sig_items_value_schemes(
+      const ast::Signature& items,
+      const std::unordered_map<std::string, TypePtr>& argtypes) {
+    std::unordered_map<std::string, TypePtr> out;
+    auto saved = functor_result_abstract_;
+    for (auto& it : items)
+      if (auto* t = std::get_if<Psig_type>(&it.desc))
+        for (auto& d : t->decls)
+          if (auto a = argtypes.find(d.name.txt); a != argtypes.end())
+            functor_result_abstract_[d.name.txt] = a->second;
+    for (auto& it : items)
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+        std::unordered_map<std::string, TypePtr> vars;
+        out[v->vd.name.txt] = from_coretype(*v->vd.type, vars);
+      }
+    functor_result_abstract_ = std::move(saved);
+    return out;
+  }
+
   std::unordered_map<std::string, TypePtr> param_sig_value_schemes(
       const ModuleType& ps, const std::unordered_map<std::string, TypePtr>& argtypes) {
     std::unordered_map<std::string, TypePtr> out;
     if (auto* sg = std::get_if<Pmty_signature>(&ps.desc)) {
-      auto saved = functor_result_abstract_;
-      for (auto& it : sg->items)
-        if (auto* t = std::get_if<Psig_type>(&it.desc))
-          for (auto& d : t->decls)
-            if (auto a = argtypes.find(d.name.txt); a != argtypes.end())
-              functor_result_abstract_[d.name.txt] = a->second;
-      for (auto& it : sg->items)
-        if (auto* v = std::get_if<Psig_value>(&it.desc)) {
-          std::unordered_map<std::string, TypePtr> vars;
-          out[v->vd.name.txt] = from_coretype(*v->vd.type, vars);
-        }
-      functor_result_abstract_ = std::move(saved);
+      return sig_items_value_schemes(sg->items, argtypes);
     } else if (auto* mi = std::get_if<Pmty_ident>(&ps.desc)) {
+      // A LOCAL `module type S = sig .. end` first (so a functor param `M : S`
+      // whose S is defined in this file resolves M's members), else a cmi one.
+      if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
+        auto it = modtype_sig_asts_.find(l->name);
+        if (it != modtype_sig_asts_.end())
+          return sig_items_value_schemes(*it->second, argtypes);
+      }
       out = cmi_modtype_value_schemes(mi->id.txt, argtypes);
     } else if (auto* mw = std::get_if<Pmty_with>(&ps.desc)) {
       return param_sig_value_schemes(*mw->mt, argtypes);
@@ -6309,11 +6327,32 @@ struct Checker {
                   break;
                 }
               }
+              // Collect the parameters (name + signature) as we unwrap to the body.
+              std::vector<std::pair<std::string, const ModuleType*>> fparams;
+              for (const ModuleExpr* w = me;
+                   auto* mf = std::get_if<Pmod_functor>(&w->desc); w = mf->body.get())
+                if (auto* fn = std::get_if<Functor_named>(&mf->param))
+                  if (fn->name.txt && fn->type)
+                    fparams.emplace_back(*fn->name.txt, fn->type.get());
               while (auto* mf = std::get_if<Pmod_functor>(&me->desc)) me = mf->body.get();
               // Remember the fully-unwrapped body so an APPLICATION of this
               // functor can resolve through the body's own head functor
               // (PowerSet's body `Set.Make(SetOrd(BaseSet))` -- sets.ml).
               functor_body_exprs_[*mb->binding.name.txt] = me;
+              // Register each parameter's value members with their REAL types
+              // (arrow labels intact) so `M.x` / `include M` inside the body
+              // resolves an optional param -> the transcriber fills the omitted
+              // optionals with ghost None (htbl, pr7601).  The param abstract
+              // types stay abstract (no arg substitution).  Saved/restored around
+              // the harvest so the params don't leak into the sibling scope.
+              std::vector<std::pair<std::string,
+                  std::optional<std::unordered_map<std::string, TypePtr>>>> saved_penv;
+              for (auto& [pn, psig] : fparams) {
+                auto prev = modenv.find(pn);
+                saved_penv.emplace_back(
+                    pn, prev != modenv.end() ? std::optional(prev->second) : std::nullopt);
+                modenv[pn] = param_sig_value_schemes(*psig, {});
+              }
               // Keep only the result's value *names* (fresh polymorphic types):
               // the body's concrete types depend on the (unsubstituted) argument,
               // so using them would surface spurious clashes -- names suffice to
@@ -6324,6 +6363,9 @@ struct Checker {
               strict = false;
               auto ex = module_exports(*me);
               strict = saved;
+              for (auto& [pn, prev] : saved_penv) {
+                if (prev) modenv[pn] = std::move(*prev); else modenv.erase(pn);
+              }
               for (auto& [k, v] : ex) v = generic_var();
               functor_env[*mb->binding.name.txt] = std::move(ex);
             } else {
