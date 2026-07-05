@@ -1430,10 +1430,30 @@ struct Typer {
     }
   }
 
+  // A `private` type whose manifest is an OPEN row -- an open polymorphic
+  // variant (`[> ]` / `[< ]`) or an open object (`< ..; .. >`) -- gets a hidden
+  // companion `t#row` type_declaration (abstract, private, no manifest), emitted
+  // (and stamped) BEFORE the real `t`.  Matches OCaml's fixed-row abbreviations.
+  bool needs_row_type(const TypeDeclaration& d) {
+    if (d.priv != PrivateFlag::Private || !d.manifest) return false;
+    auto& m = **d.manifest;
+    if (auto* pv = std::get_if<Ptyp_variant>(&m.desc))
+      return pv->closed == ClosedFlag::Open || pv->labels.has_value();
+    if (auto* ob = std::get_if<Ptyp_object>(&m.desc))
+      return ob->closed == ClosedFlag::Open;
+    return false;
+  }
+
   // Transcribe a (recursive) type-declaration group: pre-bind names, register
   // record fields, then transcribe bodies.  Shared by Pstr_type and Psig_type.
   std::vector<tt::TypeDeclaration> type_decls(
       const std::vector<TypeDeclaration>& decls) {
+    // `#row` companions are stamped first (in decl order), before the real types.
+    std::vector<std::pair<const TypeDeclaration*, tt::Ident>> rows;
+    for (auto& d : decls)
+      if (needs_row_type(d))
+        rows.emplace_back(&d, tt::Ident{d.name.txt + "#row", next_stamp++,
+                                        tt::Ident::Local});
     for (auto& d : decls) fresh_type(d.name.txt);
     // Register float abbreviations first (`type t = [private] float`, or an alias
     // of an already-known float type), so a same-group float record sees them.
@@ -1460,6 +1480,19 @@ struct Typer {
       }
     }
     std::vector<tt::TypeDeclaration> out;
+    // All `#row` companions first (ghost, abstract, private, params mirror the
+    // real type, no constraints/manifest), then the real declarations.
+    for (auto& [dp, rid] : rows) {
+      tt::TypeDeclaration rd;
+      rd.id = rid;
+      rd.loc = dp->loc;
+      rd.loc.ghost = true;
+      for (auto& p : dp->params)
+        rd.params.push_back(std::make_unique<tt::CoreType>(core_type(*p)));
+      rd.kind.v = tt::Ttype_abstract{};
+      rd.private_ = true;
+      out.push_back(std::move(rd));
+    }
     for (auto& d : decls) out.push_back(type_declaration(d));
     return out;
   }
