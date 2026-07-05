@@ -10,16 +10,19 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Completeness** — never reject valid code | `reject_parity.sh` | 0.1% false-reject | **0.0% (744/744)** ✅ |
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
-| Lambda back end | `lambda_parity.sh` | 52.8% | 55.5% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **36.8% (681/1853; 91.4% of the 745 oracle-typed)** |
+| Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **37.7% (698/1853; 93.7% of the 745 oracle-typed)** |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
-> already tracked by `accept_parity.sh`).  Remaining dump work: 63 c++-err +
-> 65 DIFF files — the class-language cluster (Pexp_new/object/self,
-> Pstr_class_type, class row types, ~25 files) is the biggest remaining block.
+> already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-05): 7
+> c++-err + 40 DIFF files.  The **class-language / inheritance cluster** is now
+> the biggest remaining block (intext, cast, woodyatt, yamagata, mixin2/3,
+> toplevel_lets — inherited instvars/methods, `super#`); then first-class-module
+> pack coercion layers (debuggee/syntactic_arity, pr6982), Includemod-through-
+> functor coercions, and match exhaustiveness → `Partial`.
 | `c++type` crashes | — | 7 (SIGABRT) | **0** ✅ |
 
 Two of the three original goals are essentially closed: **completeness is perfect**
