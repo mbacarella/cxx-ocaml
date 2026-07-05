@@ -1390,6 +1390,8 @@ struct Typer {
     tt::LabelDecl out;
     out.loc = f.loc;
     out.mutable_ = f.mut == MutableFlag::Mutable;
+    for (auto& a : f.attrs)  // `mutable x : t [@atomic]` (fork)
+      if (a.name == "atomic") out.atomic = true;
     out.id = fresh_anon(f.name.txt);
     out.type = poly_wrap(*f.type);
     if (!f.attrs.empty()) out.attrs = &f.attrs;
@@ -2301,6 +2303,28 @@ struct Typer {
       modtype_scope = std::move(mt); field_registry = std::move(fr);
       opens = std::move(op);
       out.desc = tt::Texp_struct_item{std::move(item), std::move(body)};
+    } else if (auto* xt = std::get_if<Pexp_extension>(&e.desc)) {
+      // Extension nodes the compiler types natively (no ppx):
+      // [%extension_constructor P] and the fork's [%atomic.loc r.f].
+      const Expression* payload = nullptr;
+      if (xt->payload.str.size() == 1)
+        if (auto* ev = std::get_if<Pstr_eval>(&xt->payload.str[0].desc))
+          payload = &*ev->e;
+      if (xt->name == "extension_constructor" && payload) {
+        if (auto* c = std::get_if<Pexp_construct>(&payload->desc))
+          out.desc = tt::Texp_extension_ctor{lid_str(c->id.txt)};
+        else
+          throw TypeError("extension_constructor payload");
+      } else if (xt->name == "atomic.loc" && payload) {
+        if (auto* fd = std::get_if<Pexp_field>(&payload->desc))
+          out.desc = tt::Texp_atomic_loc{
+              std::make_unique<tt::Expression>(expr(*fd->e)),
+              lid_str(fd->field.txt)};
+        else
+          throw TypeError("atomic.loc payload");
+      } else {
+        throw TypeError("expr extension [%" + xt->name + "]");
+      }
     } else {
       throw TypeError("expr#" + std::to_string(e.desc.index()));
     }

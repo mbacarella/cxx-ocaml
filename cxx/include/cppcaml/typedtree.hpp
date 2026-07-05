@@ -221,6 +221,11 @@ struct Texp_letop {
   bool partial = false;
 };
 struct Texp_unreachable {};  // `.` refutation case
+// [%extension_constructor P]: the extension constructor's runtime slot.
+// Prints the longident as written (fmt_longident), run-on.
+struct Texp_extension_ctor { std::string lid; };
+// [%atomic.loc r.f] (fork): a record field's atomic location.
+struct Texp_atomic_loc { ExprBox record; std::string field; };
 struct ExprExtra {  // Texp_constraint / Texp_coerce / Texp_poly / Texp_newtype
   enum class Kind { Constraint, Coerce, Poly, Newtype } kind = Kind::Constraint;
   CoreType ctype;                 // constraint type, or coerce TARGET type
@@ -236,7 +241,8 @@ struct Expression {
                Texp_while, Texp_record, Texp_field, Texp_setfield, Texp_variant,
                Texp_instvar, Texp_send, Texp_object, Texp_struct_item,
                Texp_pack, Texp_letop, Texp_unreachable, Texp_new,
-               Texp_setinstvar, Texp_override>
+               Texp_setinstvar, Texp_override, Texp_extension_ctor,
+               Texp_atomic_loc>
       desc;
   Location loc;
   const ast::Attributes* attrs = nullptr;

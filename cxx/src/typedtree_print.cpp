@@ -607,6 +607,14 @@ struct Printer {
       module_expr(j, *pk->me);
     } else if (std::holds_alternative<Texp_unreachable>(e.desc)) {
       os << std::string(2 * j, ' ') << "Texp_unreachable";  // run-on, no newline
+    } else if (auto* xc = std::get_if<Texp_extension_ctor>(&e.desc)) {
+      // run-on, no newline (printtyped has no trailing \n here)
+      os << std::string(2 * j, ' ') << "Texp_extension_constructor \"" +
+                                           xc->lid + "\"";
+    } else if (auto* al = std::get_if<Texp_atomic_loc>(&e.desc)) {
+      line(j, "Texp_atomic_loc");
+      expression(j, *al->record);
+      line(j, "\"" + al->field + "\"");
     } else if (auto* lo = std::get_if<Texp_letop>(&e.desc)) {
       os << std::string(2 * j, ' ')  // run-on: binding_op continues the line
          << (lo->partial ? "Texp_letop (Partial)" : "Texp_letop");
