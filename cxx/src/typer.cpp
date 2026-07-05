@@ -2715,6 +2715,90 @@ struct Typer {
     return out;
   }
 
+  // Value_rec_check.classify_expression: a `let rec` binding's RHS has a
+  // statically-known size (Static -> <def_rec>) or not (Dynamic ->
+  // <def_rec_dynamic>).  `env` maps a locally-let-bound ident stamp to its own
+  // classification (nested lets refine what a bare variable resolves to); a
+  // variable not in env (bound outside this size analysis) is Dynamic.
+  enum class Sd { Static, Dynamic };
+  Sd classify_rec_expr(const tt::Expression& e,
+                       const std::unordered_map<long long, Sd>& env) {
+    using namespace tt;
+    if (std::holds_alternative<Texp_function>(e.desc)) return Sd::Static;
+    if (auto* id = std::get_if<Texp_ident>(&e.desc)) {
+      if (auto* pi = std::get_if<Pident>(&id->path.v)) {
+        auto f = env.find(pi->id.stamp);
+        return f != env.end() ? f->second : Sd::Dynamic;
+      }
+      return Sd::Dynamic;  // Pdot / Papply
+    }
+    if (auto* lt = std::get_if<Texp_let>(&e.desc)) {
+      auto env2 = env;  // classify each binding in the OLD env, then the body
+      for (auto& b : lt->bindings)
+        if (auto* v = std::get_if<Tpat_var>(&b.pat.desc))
+          env2[v->id.stamp] = classify_rec_expr(b.expr, env);
+      return classify_rec_expr(*lt->body, env2);
+    }
+    if (auto* sq = std::get_if<Texp_sequence>(&e.desc))
+      return classify_rec_expr(*sq->e2, env);
+    if (auto* si = std::get_if<Texp_struct_item>(&e.desc))
+      return classify_rec_expr(*si->body, env);
+    if (auto* pk = std::get_if<Texp_pack>(&e.desc))
+      return classify_rec_modexpr(*pk->me, env);
+    if (auto* ap = std::get_if<Texp_apply>(&e.desc)) {
+      // `ref e` (%makemutable) is a statically-sized allocation.
+      if (auto* cid = std::get_if<Texp_ident>(&ap->fn->desc)) {
+        std::string last;
+        if (auto* pd = std::get_if<Pdot>(&cid->path.v)) last = pd->name;
+        if (last == "ref" && path_root_global(cid->path)) return Sd::Static;
+      }
+      // A partial application (some argument omitted/abstracted -> a null arg
+      // expr) builds a closure, which has a statically-known size.
+      for (auto& a : ap->args)
+        if (!a.second) return Sd::Static;
+      return Sd::Dynamic;
+    }
+    // Statically-sized forms (constructors, records, tuples, functions,
+    // arrays, unit-returning writes, constants, ...).
+    if (std::holds_alternative<Texp_construct>(e.desc) ||
+        std::holds_alternative<Texp_record>(e.desc) ||
+        std::holds_alternative<Texp_variant>(e.desc) ||
+        std::holds_alternative<Texp_tuple>(e.desc) ||
+        std::holds_alternative<Texp_constant>(e.desc) ||
+        std::holds_alternative<Texp_array>(e.desc) ||
+        std::holds_alternative<Texp_for>(e.desc) ||
+        std::holds_alternative<Texp_setfield>(e.desc) ||
+        std::holds_alternative<Texp_while>(e.desc) ||
+        std::holds_alternative<Texp_setinstvar>(e.desc) ||
+        std::holds_alternative<Texp_lazy>(e.desc) ||
+        std::holds_alternative<Texp_atomic_loc>(e.desc) ||
+        std::holds_alternative<Texp_extension_ctor>(e.desc) ||
+        std::holds_alternative<Texp_unreachable>(e.desc))
+      return Sd::Static;
+    // Everything else (apply, match, if, field, assert, try, send, new,
+    // object, instvar, override, letop) has no statically-known size.
+    return Sd::Dynamic;
+  }
+  Sd classify_rec_modexpr(const tt::ModuleExpr& me,
+                          const std::unordered_map<long long, Sd>& env) {
+    using namespace tt;
+    if (auto* mi = std::get_if<Tmod_ident>(&me.desc)) {
+      if (auto* pi = std::get_if<Pident>(&mi->path.v)) {
+        auto f = env.find(pi->id.stamp);
+        return f != env.end() ? f->second : Sd::Dynamic;
+      }
+      return Sd::Dynamic;
+    }
+    if (std::holds_alternative<Tmod_structure>(me.desc) ||
+        std::holds_alternative<Tmod_functor>(me.desc))
+      return Sd::Static;
+    if (auto* c = std::get_if<Tmod_constraint>(&me.desc))
+      return classify_rec_modexpr(*c->expr, env);  // approx: Tcoerce_none
+    if (auto* u = std::get_if<Tmod_unpack>(&me.desc))
+      return classify_rec_expr(*u->e, env);
+    return Sd::Dynamic;  // apply / apply_unit
+  }
+
   // For `let rec`, bind all pattern names before typing any RHS so the names are
   // in scope in their own and siblings' bodies.
   std::vector<tt::ValueBinding> value_bindings(RecFlag rf,
@@ -2749,6 +2833,8 @@ struct Typer {
           b.attrs = &vbs[i].attrs;
           apply_value_constraint(b, vbs[i]);
         }
+        // Value_rec_check size classification for <def_rec[_dynamic]>.
+        b.rec_dynamic = classify_rec_expr(b.expr, {}) == Sd::Dynamic;
         out.push_back(std::move(b));
       }
     } else {

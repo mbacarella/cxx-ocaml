@@ -253,6 +253,9 @@ struct ValueBinding {
   Pattern pat;
   Expression expr;
   const ast::Attributes* attrs = nullptr;
+  // For a `let rec` binding: Value_rec_check's size classification, printed as
+  // <def_rec> (Static) vs <def_rec_dynamic> (Dynamic).  Ignored when non-rec.
+  bool rec_dynamic = false;
 };
 struct Case {
   Pattern lhs;

@@ -659,7 +659,9 @@ struct Printer {
   }
 
   void value_binding(int i, RecFlag rf, const ValueBinding& vb) {
-    line(i, rf == RecFlag::Nonrecursive ? "<def>" : "<def_rec>");
+    line(i, rf == RecFlag::Nonrecursive
+                ? "<def>"
+                : (vb.rec_dynamic ? "<def_rec_dynamic>" : "<def_rec>"));
     if (vb.attrs) attributes(i + 1, *vb.attrs);
     pattern(i + 1, vb.pat);
     expression(i + 1, vb.expr);
