@@ -665,6 +665,10 @@ struct Typer {
     std::unordered_map<std::string, long long> submodule_stamps;
   };
   std::unordered_map<long long, ModExports> module_exports_;
+  // What each `include ME` contributed to its enclosing structure (keyed by the
+  // Tstr_include's ModuleExpr): lets collect_module_exports see path/cmi
+  // includes, whose members aren't recoverable from the typed items alone.
+  std::unordered_map<const tt::ModuleExpr*, ModExports> include_exports_;
   // Local module stamps defined as an alias to a module path -- `module S = P`
   // (for any P, global or local).  Used as a functor argument, or as the root
   // of a functor path (`S.Make(..)`), such an alias is strengthened just like a
@@ -707,7 +711,15 @@ struct Typer {
       } else if (auto* m = std::get_if<tt::Tstr_module>(&it.desc)) {
         ex.submodule_stamps[m->id.name] = m->id.stamp;
       } else if (auto* inc = std::get_if<tt::Tstr_include>(&it.desc)) {
-        if (auto* body = module_body(*inc->expr)) collect_module_exports(*body, ex);
+        auto f = include_exports_.find(inc->expr.get());
+        if (f != include_exports_.end()) {
+          for (auto& n : f->second.values) ex.values.insert(n);
+          for (auto& n : f->second.types) ex.types.insert(n);
+          for (auto& [n, st] : f->second.submodule_stamps)
+            ex.submodule_stamps[n] = st;
+        } else if (auto* body = module_body(*inc->expr)) {
+          collect_module_exports(*body, ex);
+        }
       }
     }
   }
@@ -3379,6 +3391,38 @@ struct Typer {
           wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
           me = std::move(wrap);
         }
+      // `include ME` splices ME's members into the enclosing structure under
+      // FRESH idents (Env.enter_signature refreshes every item, even for a
+      // struct literal or a path -- verified against the oracle), so later
+      // bare references bind to the include's idents, not the source's.
+      ModExports src;
+      if (auto* mi = std::get_if<Pmod_ident>(&in->expr.desc)) {
+        OpenEntry oe;
+        load_open_names_lid(mi->id.txt, oe);  // cmi module members
+        src.values = std::move(oe.values);
+        src.types = std::move(oe.types);
+        for (auto& n : oe.submodules) src.submodule_stamps.emplace(n, -1);
+        if (const ModExports* ex = exports_by_path(resolve_module(mi->id.txt))) {
+          for (auto& n : ex->values) src.values.insert(n);
+          for (auto& n : ex->types) src.types.insert(n);
+          for (auto& [n, st] : ex->submodule_stamps) src.submodule_stamps[n] = st;
+        }
+      } else {
+        ModExports tmp;
+        if (const ModExports* ex = exports_of_modexpr(*me, tmp)) src = *ex;
+      }
+      ModExports fresh;  // this include's contribution to the enclosing module
+      for (auto& n : src.values) { fresh_local(n); fresh.values.insert(n); }
+      for (auto& n : src.types) { fresh_type(n); fresh.types.insert(n); }
+      for (auto& [n, st] : src.submodule_stamps) {
+        auto id = fresh_module(n);
+        if (st >= 0) {
+          auto f = module_exports_.find(st);
+          if (f != module_exports_.end()) module_exports_[id.stamp] = f->second;
+        }
+        fresh.submodule_stamps[n] = id.stamp;
+      }
+      include_exports_[me.get()] = std::move(fresh);
       si.desc = tt::Tstr_include{std::move(me), &in->attrs};
     } else if (auto* cl = std::get_if<Pstr_class>(&it.desc)) {
       tt::Tstr_class tc;
