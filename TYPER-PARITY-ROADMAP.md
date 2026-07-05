@@ -11,21 +11,23 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **38.1% (706/1853; 94.8% of the 745 oracle-typed)** |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **38.2% (708/1853; 95.0% of the 745 oracle-typed)** |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
 > already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-05): 1
-> c++-err (pr11887, imported #type polyvariant tags) + 38 DIFF files.  The
-> remaining tail is genuinely hard: match exhaustiveness → `Partial`
-> (pr7284/robustmatch/morematch/pr10338), functor-application type paths
-> (`Set.Make(Bool).t`, accepted_batch/index_*), class polyvariant mixins
-> (mixin2/3), format-string lowering through a method type (woodyatt), and a
-> single-file stamp-correlation drift (core_array_reduced).  Blockers cleared
-> this session: structure-level include, first-class-module pack coercion
-> layers (debuggee/syntactic_arity/immediate64), inherited class instvars/
+> c++-err (pr11887, imported #type polyvariant tags) + 36 DIFF files.  The
+> remaining tail is genuinely hard: match exhaustiveness → `Partial` with GADT
+> abstract-index refinement (pr7284/robustmatch/morematch/pr10338), functor-
+> application type paths (`Set.Make(Bool).t`, accepted_batch/index_*), class
+> polyvariant mixins (mixin2/3), `module type of` stamp propagation (t02),
+> Mp_present/absent for functor aliases (index_functor), and format-string
+> lowering through a method type (woodyatt).  Blockers cleared this session:
+> structure-level include, first-class-module pack coercion layers +
+> local-alias strengthening (debuggee/syntactic_arity/immediate64/pr6982),
+> `type nonrec` outer resolution (core_array_reduced), inherited class instvars/
 > methods + `as super` sends (intext/intext_par), class-parameter val-vs-method
 > scoping, member exports through module types (a cmi signature walker), and
 > `<def_rec_dynamic>` classification.
