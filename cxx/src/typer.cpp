@@ -3258,6 +3258,52 @@ struct Typer {
     return false;
   }
 
+  // As above, but over the TRANSCRIBED items -- so an `include ME` contributes
+  // the members it actually spliced in (from include_exports_ / cmi), letting a
+  // later `let x`/second `include` that collides with an included name trigger
+  // the signature-simplify coercion (pr5164, pr7601).  A miss here is harmless
+  // (no wrapper, still valid); a false positive would add a spurious wrapper, so
+  // only names we can resolve precisely are counted.
+  bool structure_shadows_tt(const std::vector<tt::StructureItem>& items) {
+    ShadowSets s;
+    auto dup = [](std::set<std::string>& set, const std::string& n) {
+      return !set.insert(n).second;
+    };
+    for (auto& it : items) {
+      if (auto* v = std::get_if<tt::Tstr_value>(&it.desc)) {
+        for (auto& b : v->bindings) {
+          std::unordered_set<std::string> vs;
+          pat_var_names(b.pat, vs);
+          for (auto& n : vs) if (dup(s.vals, n)) return true;
+        }
+      } else if (auto* p = std::get_if<tt::Tstr_primitive>(&it.desc)) {
+        if (dup(s.vals, p->id.name)) return true;
+      } else if (auto* t = std::get_if<tt::Tstr_type>(&it.desc)) {
+        for (auto& d : t->decls) if (dup(s.types, d.id.name)) return true;
+      } else if (auto* m = std::get_if<tt::Tstr_module>(&it.desc)) {
+        if (dup(s.mods, m->id.name)) return true;
+      } else if (auto* rm = std::get_if<tt::Tstr_recmodule>(&it.desc)) {
+        for (auto& b : rm->bindings) if (dup(s.mods, b.id.name)) return true;
+      } else if (auto* mt = std::get_if<tt::Tstr_modtype>(&it.desc)) {
+        if (dup(s.modtypes, mt->id.name)) return true;
+      } else if (auto* inc = std::get_if<tt::Tstr_include>(&it.desc)) {
+        ModExports iex;
+        auto f = include_exports_.find(inc->expr.get());
+        if (f != include_exports_.end()) iex = f->second;
+        else if (auto* body = module_body(*inc->expr)) collect_module_exports(*body, iex);
+        for (auto& n : iex.values) if (dup(s.vals, n)) return true;
+        for (auto& n : iex.types) if (dup(s.types, n)) return true;
+        for (auto& [n, st] : iex.submodule_stamps) if (dup(s.mods, n)) return true;
+      } else if (auto* op = std::get_if<tt::Tstr_open>(&it.desc)) {
+        // `open struct ... end`: the anon structure's bindings become hidden,
+        // removable signature items, forcing the coercion even absent a clash.
+        if (auto* body = module_body(*op->expr))
+          if (!body->empty()) return true;
+      }
+    }
+    return false;
+  }
+
   // Wrap a global-rooted (cmi-loaded) module_expr ident in the transparent
   // strengthening coercion layer; pass anything else through unchanged.
   // A path is strengthened when its root is a global module, or a local alias
@@ -3289,7 +3335,8 @@ struct Typer {
       out.desc = tt::Tmod_ident{resolve_module(mi->id.txt)};
     } else if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
       out.desc = tt::Tmod_structure{nested_structure(ms->items)};
-      if (structure_shadows(ms->items)) {  // implicit signature-simplify coercion
+      if (structure_shadows_tt(std::get<tt::Tmod_structure>(out.desc).items)) {
+        // implicit signature-simplify coercion (Tmodtype_implicit)
         auto inner = std::make_unique<tt::ModuleExpr>(std::move(out));
         inner->loc = me.loc;
         out = tt::ModuleExpr{};
