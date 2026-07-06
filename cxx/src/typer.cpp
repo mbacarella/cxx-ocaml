@@ -2134,6 +2134,7 @@ struct Typer {
       out = pattern(*ct->p);  // become inner pattern; record constraint as extra
       tt::PatExtra ex;
       ex.ctype = core_type(*ct->t);
+      ex.attrs = &ct->p->attrs;  // typecore copies the INNER pattern's attrs
       ex.loc = p.loc;
       // OCaml conses pat_extra, so the OUTER constraint prints before any extra
       // the inner pattern already carries (e.g. `((module X) : pkg)` prints the
@@ -2682,11 +2683,16 @@ struct Typer {
         tt::ExprExtra ex;
         ex.kind = tt::ExprExtra::Kind::Constraint;
         tt::CoreType ct;
-        ct.loc = pk->pkg->path.loc;
-        // The package core_type spans `S with type .. = u` -- extend past the
-        // path to the end of the last `with type` constraint.
-        if (!pk->pkg->constraints.empty())
-          ct.loc.end = pk->pkg->constraints.back().second->loc.end;
+        // The package core_type spans the whole `S with type .. = u [@a]` --
+        // the parser's ppt_loc when recorded, else path extended to the last
+        // `with type` constraint.
+        if (pk->pkg->loc.end.cnum > 0) {
+          ct.loc = pk->pkg->loc;
+        } else {
+          ct.loc = pk->pkg->path.loc;
+          if (!pk->pkg->constraints.empty())
+            ct.loc.end = pk->pkg->constraints.back().second->loc.end;
+        }
         ct.desc = tt::Ttyp_package{package_type(*pk->pkg)};
         ex.ctype = std::move(ct);
         ex.loc = e.loc;
@@ -3025,6 +3031,7 @@ struct Typer {
       } catch (const TypeError&) { return; }
       tt::PatExtra pe;
       pe.ctype = std::move(cpat);
+      pe.attrs = &vb.pat.attrs;  // ghost Ppat_constraint wraps vb.pat -> its attrs
       pe.loc = vb.pat.loc; pe.loc.ghost = true;
       out.pat.extras.insert(out.pat.extras.begin(), std::move(pe));
       tt::ExprExtra ee;
@@ -3048,6 +3055,7 @@ struct Typer {
     } catch (const TypeError&) { return; }
     tt::PatExtra pe;
     pe.ctype = std::move(ct1);
+    pe.attrs = &vb.pat.attrs;  // ghost Ppat_constraint wraps vb.pat -> its attrs
     pe.loc = vb.pat.loc;  // the WHOLE binding pattern span (incl. an inner `(p:t)`)
     pe.loc.ghost = true;
     // OCaml conses pat_extra, so the outer binding constraint (added after the
@@ -3101,6 +3109,7 @@ struct Typer {
     poly.desc = tt::Ttyp_poly{names, std::make_unique<tt::CoreType>(std::move(cpat))};
     tt::PatExtra pe;
     pe.ctype = std::move(poly);
+    pe.attrs = &vb.pat.attrs;  // ghost Ppat_constraint wraps vb.pat -> its attrs
     pe.loc = Location{vb.pat.loc.start, tyloc.end, true};
     out.pat.extras.push_back(std::move(pe));
     return true;
@@ -3444,6 +3453,15 @@ struct Typer {
       tt::Tmty_with tw;
       tw.base = std::make_unique<tt::ModuleType>(module_type_t(*w->mt));
       SigExports ex = exports_of(*tw.base);
+      // `(module type of M) with type t := ..` reuses M's ORIGINAL member
+      // idents (typemod keeps the typeof signature's stamps), same as the
+      // `module type T = module type of M` binding path (t02).
+      if (auto* tof = std::get_if<tt::Tmty_typeof>(&tw.base->desc))
+        if (auto* mi = std::get_if<tt::Tmod_ident>(&tof->expr->desc))
+          if (auto* pi = std::get_if<tt::Pident>(&mi->path.v))
+            if (auto f = module_sig_exports_.find(pi->id.stamp);
+                f != module_sig_exports_.end())
+              ex = f->second;
       for (auto& c : w->constraints) tw.constraints.push_back(with_item(c, ex));
       out.desc = std::move(tw);
     } else if (auto* to = std::get_if<Pmty_typeof>(&mt.desc)) {

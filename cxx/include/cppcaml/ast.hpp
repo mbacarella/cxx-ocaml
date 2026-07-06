@@ -124,6 +124,10 @@ struct Ptyp_package {  // (module S [with type t = u and …])
   LongidentLoc path;
   std::vector<std::pair<LongidentLoc, CoreTypeBox>> constraints;
   Attributes attrs;  // `(module M : (S [@a]))` — attrs on the package_type itself
+  // ppt_loc: the whole `S with type .. [@a]` span (incl. trailing attrs and any
+  // wrapping parens), like the grammar's $sloc.  Default (zero) when the parse
+  // path doesn't compute it; consumers must fall back.
+  Location loc{};
 };
 struct Ptyp_class { LongidentLoc id; std::vector<CoreTypeBox> args; };  // [args] #class
 struct Ptyp_alias { CoreTypeBox type; std::string name; };  // (t as 'a)

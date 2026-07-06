@@ -118,6 +118,10 @@ struct PatExtra {  // Tpat_extra_constraint / _unpack / _type / _open
   std::optional<PackageType> pkg;  // Unpack: `(module M : S)`; nullopt = untyped
   Path type_path;                  // Type: the `#t` type path / Open: the module path
   Location loc;
+  // A constraint extra carries the INNER pattern's attributes (typecore's
+  // Ppat_constraint branch copies sp.ppat_attributes onto the extra, so
+  // `let (x[@foo]) : t = ..` prints "foo" on both the pattern and the extra).
+  const ast::Attributes* attrs = nullptr;
 };
 struct Pattern {
   std::variant<Tpat_any, Tpat_var, Tpat_constant, Tpat_construct, Tpat_value,

@@ -330,14 +330,18 @@ struct Printer {
       line(j, "extra " + loc(ex.loc));
       if (ex.kind == PatExtra::Kind::Unpack) {
         line(j + 1, "Tpat_extra_unpack");
+        if (ex.attrs) attributes(j + 1, *ex.attrs);
         if (ex.pkg) { line(j + 1, "Some"); package_type(j + 2, *ex.pkg); }
         else line(j + 1, "None");
       } else if (ex.kind == PatExtra::Kind::Type) {
         line(j + 1, "Tpat_extra_type \"" + path_aux(ex.type_path) + "\"");
+        if (ex.attrs) attributes(j + 1, *ex.attrs);
       } else if (ex.kind == PatExtra::Kind::Open) {
         line(j + 1, "Tpat_extra_open \"" + path_aux(ex.type_path) + "\"");
+        if (ex.attrs) attributes(j + 1, *ex.attrs);
       } else {
         line(j + 1, "Tpat_extra_constraint");
+        if (ex.attrs) attributes(j + 1, *ex.attrs);
         core_type(j + 1, ex.ctype);
       }
     }

@@ -1547,7 +1547,11 @@ class Parser {
     return Ptyp_package{std::move(path), std::move(cons)};
   }
   // A package type optionally wrapped in parens: `(module M : (S with type …))`.
+  // Records the package_type's own span (ppt_loc): the whole `S with type ..`
+  // INCLUDING trailing attrs and any wrapping parens (the grammar's $sloc) --
+  // the pack ascription's ghost Ttyp_package core_type takes this span.
   Ptyp_package parse_package_type_maybe_paren() {
+    Position symstart = position(cur().start);
     if (cur().kind == Kind::LPAREN) {
       advance();
       Ptyp_package p = parse_package_type_body();
@@ -1555,12 +1559,14 @@ class Parser {
         advance(); p.attrs.push_back(parse_attribute_body());
       }
       expect(Kind::RPAREN, ")");
+      p.loc = span(symstart, position(tokens_[idx_ - 1].end));
       return p;
     }
     Ptyp_package p = parse_package_type_body();
     while (cur().kind == Kind::LBRACKETAT) {  // `module M : T [@a]` -> attrs on the package_type
       advance(); p.attrs.push_back(parse_attribute_body());
     }
+    p.loc = span(symstart, position(tokens_[idx_ - 1].end));
     return p;
   }
   CoreTypeBox parse_type_arrow() {
