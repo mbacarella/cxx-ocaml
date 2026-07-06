@@ -230,6 +230,8 @@ struct Ty {
   std::string name;            // Constr: type-ctor name ("int","list","M.t",...)
   std::vector<TyPtr> args;     // Constr: type args; Arrow: {dom, cod}; Tuple: elems
   int var = 0;                 // Var: identity within one signature item
+  std::string var_name;        // Var: source name (Tvar Some) -- a type decl's
+                               // params keep their written names ('outputValue)
   int label_kind = 0;          // Arrow: 0 Nolabel, 1 Labelled, 2 Optional
   std::string label;           // Arrow: label name (Labelled/Optional)
   std::vector<std::string> pv_tags;  // Variant: polymorphic-variant tag names

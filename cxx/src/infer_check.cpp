@@ -8684,11 +8684,21 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
                             std::vector<cmi::cmiw::SigItem>& out) {
+  size_t first_new = out.size();
   for (auto& d : decls) {
     std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
     std::vector<cmi::cmiw::TyPtr> params;
-    for (auto& p : d.params) params.push_back(bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar));
+    for (auto& p : d.params) {
+      auto pv = bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar);
+      // Params keep their SOURCE names (Tvar Some): ocamlc prints
+      // `('outputValue, 'message) fieldStatus` back verbatim.  The shared
+      // var node carries the name into every ctor/label occurrence.
+      if (pv->k == cmi::cmiw::Ty::Var) {
+        if (auto* v = std::get_if<Ptyp_var>(&p->desc)) pv->var_name = v->name;
+      }
+      params.push_back(std::move(pv));
+    }
     // A variant type: emit its constructors (Cstr_tuple args OR an inline record
     // `Ctor of {l;..}`), with the GADT return type (`Any : 'a -> any`) in cd_res.
     if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
@@ -8754,6 +8764,10 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     si.type_private = (d.priv == PrivateFlag::Private);
     out.push_back(std::move(si));
   }
+  // A `type a .. and b ..` group: Trec_first on the head, Trec_next after
+  // (ocamlc prints the group back with `and`).
+  for (size_t i = first_new; i < out.size(); ++i)
+    out[i].rec_status = (i == first_new) ? 1 : 2;
 }
 
 // ---- include module type of M: splice M's (already-compiled) cmi signature ----
@@ -9381,6 +9395,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
   Checker ck;
   ck.record_kinds_ = true;
   run_checker(ck, s);  // leaves top-level bindings in venv.back()
+  // Emission phase: checking is DONE, every from_coretype below only converts
+  // declaration types for the .cmi -- keep local abbreviations as written
+  // (`startDate : (int, message) fieldStatus` stores `message`, not string).
+  ck.keep_local_abbrevs_ = true;
   std::vector<cmi::cmiw::SigItem> out;
   for (auto& it : s) {
     if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {

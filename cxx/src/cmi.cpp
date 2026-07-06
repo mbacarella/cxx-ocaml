@@ -903,7 +903,10 @@ struct TyEmit {
     switch (t->k) {
       case Ty::Var: {
         if (auto it = vars.find(t->var); it != vars.end()) return it->second;
-        o::ValPtr te = texpr(o::vblock(0, {o::vint(0)}));  // Tvar None
+        o::ValPtr nm = t->var_name.empty()
+                           ? o::vint(0)                                // None
+                           : o::vblock(0, {o::vstr(t->var_name)});     // Some name
+        o::ValPtr te = texpr(o::vblock(0, {nm}));  // Tvar
         vars[t->var] = te;
         return te;
       }
@@ -1192,7 +1195,11 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           loc_none(),                                  // type_loc
           o::vint(0), o::vint(0), o::vint(0),          // attrs [], immediate Unknown, unboxed false
           o::vint(0)});                                // type_uid = Uid.Internal
-      sig.push_back(o::vblock(1, {ident, tdecl, o::vint(1) /*Trec_first*/, o::vint(0) /*Exported*/}));
+      sig.push_back(o::vblock(1, {ident, tdecl,
+                                  // Trec_first, or Trec_next for the `and`
+                                  // members of a mutually-recursive group
+                                  o::vint(it.rec_status ? it.rec_status : 1),
+                                  o::vint(0) /*Exported*/}));
     }
   }
   return sig;
