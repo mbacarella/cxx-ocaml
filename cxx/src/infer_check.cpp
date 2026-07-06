@@ -9362,6 +9362,15 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     const std::string& name, const ast::ModuleExpr& me) {
   if (auto* ms = std::get_if<Pmod_structure>(&me.desc))
     return cmi::cmiw::sig_module(name, infer_signature(ms->items));
+  if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {
+    // `module MP = Gc.Memprof` / `module Alias = A`: a module alias binding.
+    // ocamlc records Mty_alias(<target path>) (Mp_absent -- transparent, takes
+    // no runtime field), printed `module MP = Gc.Memprof`.  A functor
+    // application (Lapply) has no path form -- leave it dropped.
+    if (!std::holds_alternative<Lapply>(pi->id.txt.v))
+      return cmi::cmiw::sig_module_alias(name, lid_full(pi->id.txt));
+    return std::nullopt;
+  }
   if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
     if (mc->mt)
       if (auto* ps = std::get_if<Pmty_signature>(&mc->mt->desc))
