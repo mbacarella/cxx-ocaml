@@ -57,8 +57,12 @@ is closed in two commits (`9f41329d16`, `8b22e61dfe`), all other gates flat:
   `Ppat_open` opening the module's ctors (`Unix.(Unix_error (ENOENT,_,_))`).
 
 New baseline: typedtree **886/886 (100.0%)** over oracle-typed; reject 1,
-accept 37, sig 614/11, lambda 327 unchanged. Remaining lib-corpus frontier =
-the 11 sig DIFFs (display work).
+accept 37, lambda 327 unchanged. The sig frontier then fell 614/11 →
+**623/2** same day (while-true expected type, qualified field paths pin the
+base, qualified ctors through opened submodules, open object rows, and the
+String.t/Bytes.t abbreviation-display pair — see JOURNAL). Left: lib-seq
+(Seq.t eta-fold display) + test_caml_counters (weak-var pinning through an
+optional callback) — engine-core, parked.
 
 ## Progress (2026-07-06: bucket A's otherlibs population WIRED — corpus 745 → 886)
 
