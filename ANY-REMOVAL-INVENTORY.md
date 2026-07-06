@@ -39,6 +39,37 @@ value-representation class name + comments.)
 Line numbers are as of 2026-07-02 (branch `cpp-rewrite`); re-grep before editing:
 `grep -nE '\bany\(\)|Kind::Any' cxx/src/infer_check.cpp`.
 
+## Progress (2026-07-06 later: 9 → 6 sites — bucket D CLEARED)
+
+The three D sites are gone and, more importantly, the **strict pass now has a
+class/object model**. Commits `37d30fa441..9d7a0642c6`, each gate-checked
+(reject 1, accept 36, sig 524/1, typedtree 745/745, lambda DIFF 327 — same sets):
+
+- **`Pexp_new`**: class lookup (`class_types_` / `class_ctor_types_`) now runs
+  in strict; unknown class → per-occurrence fresh var (B/C argument).
+- **`Pexp_send`**: the class-Constr reroute + object-row method lookup now run
+  in strict; unknown receiver/absent method → fresh var.
+- **`Pexp_object`**: strict types the body via `infer_object_body` like the
+  other passes (it was written strict-aware all along — see its `if (strict)`
+  poly-annotation branch).
+- **The real wall was elsewhere**: `process_item`'s `Pstr_class` branch was
+  wholly `!strict`-gated, so strict had NO class model (`class_types_` empty —
+  the three flips above were vacuous for class-typed receivers until this).
+  Lifted, along with the inner `class_ctor_types_` / `class_instvars_` gates.
+- **Soundness win**: `Pexp_send` joined the trustworthy argument forms for the
+  strict reliable-callee `builtin_clash` check. `print_string o#m` with
+  `m : int` now rejects — for object literals, `new c`, argument and
+  annotation positions — while every corpus gate stayed identical.
+
+The four object-related false-accepts (`pr3968_bad` class-type coercion,
+`pr4018_bad` virtual + self-type param, `pr4824a_bad`,
+`illegal_reference_to_recursive_class`) remain: they need the FULL class model
+(coercion checking against a class type, virtuals/inheritance in the row,
+recursive class types), not the concrete-method row.
+
+Left after D: A ×3 + F ×1 (deferred — separate-compilation), E ×1
+(`5317`, known-unsound conjunctive rows), J catch-all (`5328`, last).
+
 ## Progress (2026-07-06: 14 → 9 sites — buckets B + C CLEARED)
 
 The **B/C frontier is done**: all five records/fields/ctors fallbacks now return
@@ -139,18 +170,18 @@ removing it earlier just relocates the fallbacks.
 
 ## Execution plan (dependency order, refreshed 2026-07-06)
 
-State: **9 sites left** in `infer_check.cpp` (re-grep: `grep -cE '\bany\(\)'`).
+State: **6 sites left** in `infer_check.cpp` (re-grep: `grep -cE '\bany\(\)'`).
 G/H/I and part of D closed in the 2026-07-03 sweep; **B + C closed in the
-2026-07-06 sweep** (see Progress above). Module System P1–P3 is done, but the
-2026-07-06 sizing (below) shows **A/F are NOT typer-dentable** — they are blocked
-on separate-compilation infrastructure (per-test `-I` include context +
-sibling-`.ml` compilation), not on more inference. So despite being "unblocked"
-by P1–P3 on paper, **A and F are deprioritized**. With B/C done, the remaining
-typer-dentable work is the **two hard row-type cores (D, then E)**.
+2026-07-06 sweep**; **D closed later the same day** (see Progress above).
+Module System P1–P3 is done, but the 2026-07-06 sizing (below) shows **A/F are
+NOT typer-dentable** — they are blocked on separate-compilation infrastructure
+(per-test `-I` include context + sibling-`.ml` compilation), not on more
+inference. So despite being "unblocked" by P1–P3 on paper, **A and F are
+deprioritized**. With B/C/D done, the remaining typer-dentable work is **E
+(conjunctive variant rows — the known-unsound trap)**.
 
-Live site lines (2026-07-06, post-B/C): A = `1186`/`1191`/`1193`; F = `4956`;
-D = `4969` (new) / `5306` (send) / `5329` (object); E = `5319`; J catch-all =
-`5331`. Re-grep before editing.
+Live site lines (2026-07-06, post-D): A = `1186`/`1191`/`1193`; F = `4956`;
+E = `5317`; J catch-all = `5328`. Re-grep before editing.
 
 Tracked as tasks #1–#6:
 
@@ -163,14 +194,16 @@ Tracked as tasks #1–#6:
    loading exists.
 3. **[#2] F — first-class modules** (×1, `4956`). Deferred with A (same
    separate-compilation dependency for a pack's signature).
-4. **[#4] D — object rows** (×3, `4969`/`5306`/`5329`). **NEXT typer-dentable
-   frontier.** Hard core: real self/instance-var row model + subtyping in the
-   strict pass.
-5. **[#5] E — conjunctive polymorphic-variant rows** (×1, `5319`). Hard core and
-   the **known-unsound trap** — the naive row was reverted; needs presence/
-   conjunction vars. Blocked by #4.
+4. **[#4] D — object rows** — ✅ **DONE 2026-07-06** (9 → 6). The
+   concrete-method row model + strict `Pstr_class` processing sufficed; no
+   subtyping machinery was needed to hold the gates (see Progress). The full
+   class model (coercions, virtuals, inheritance rows) remains future work,
+   tracked by the four object false-accepts.
+5. **[#5] E — conjunctive polymorphic-variant rows** (×1, `5317`). **NEXT
+   typer-dentable frontier.** Hard core and the **known-unsound trap** — the
+   naive row was reverted; needs presence/conjunction vars.
 6. **[#6] J — delete the engine mechanism** (`any()` singleton + `infer.cpp`
-   absorb branch) and the catch-all (`5331`). **Last** — deletable only when the
+   absorb branch) and the catch-all (`5328`). **Last** — deletable only when the
    count hits 0. (The catch-all flip to fresh var held all gates on the corpus
    but was reverted on purpose — it must stay the absorbing "unhandled" net until
    every form is typed.) Also fix the `.cmi` bridge (`K::Any → cmiw::ty_var`) to
@@ -178,7 +211,7 @@ Tracked as tasks #1–#6:
 
 ### How progress is measured (every removal)
 
-Work counter (down): `grep -cE '\bany\(\)' cxx/src/infer_check.cpp` — 9 → 0.
+Work counter (down): `grep -cE '\bany\(\)' cxx/src/infer_check.cpp` — 6 → 0.
 Gates that must stay flat, compared as **file SETS** not totals:
 `reject_parity.sh` 744/744 (0.0%), `sig_parity.sh` 525/525,
 `typedtree_parity.sh` 745/745, 0 crashes/1853, `lambda_parity.sh` DIFF set.

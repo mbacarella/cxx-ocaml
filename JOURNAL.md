@@ -3607,3 +3607,35 @@ robustmatch, pr10338, pr7284 tail]; label-driven application + optional-arg
 newtype `method f : type t. u` [exotic]; type-directed iarray Immutable;
 external-record Record_float (Complex.t, needs cmi repr) [bigarrays]; the
 attributes.ml torture test; assorted single-file extra/core_type locs.
+
+--------------------------------------------------------------------------------
+P4 bucket D CLEARED: object rows in strict -- 9 -> 6 any() sites, all gates flat
+--------------------------------------------------------------------------------
+Four commits (37d30fa441..9d7a0642c6).  The "hard core" turned out to be a
+locked door, not a missing wing: the strict pass had NO class model because
+process_item's Pstr_class branch was wholly !strict-gated -- class_types_ was
+empty in strict, so the new/send/object any() guards protected nothing real.
+
+- Pexp_new / Pexp_send / Pexp_object: the non-strict resolution (class lookup,
+  object-row method lookup, infer_object_body) now runs in strict; unresolved
+  falls to a per-occurrence fresh var (same soundness argument as B/C: each
+  syntactic occurrence mints its own var, so only one occurrence flowing into
+  two incompatible contexts clashes -- a genuine error).
+- Pstr_class processing enabled in strict (+ inner class_ctor_types_ /
+  class_instvars_ gates lifted): infer_object_body was already strict-aware
+  (its poly-annotation branch soft-unifies under strict).
+- Soundness win: Pexp_send joined the trustworthy argument forms for the
+  reliable-callee builtin_clash check.  `print_string o#m` (m : int) now
+  REJECTS -- for object literals, `new c`, argument and annotation positions --
+  with every corpus gate identical (reject 1, accept 36, sig 524/1, typedtree
+  745/745, lambda DIFF 327, same sets).
+
+Validation rhythm unchanged: one flip -> ninja -> gate_check.sh (~22s) ->
+commit.  Gotcha (twice!): `cd cxx/build && ninja` then running gate_check from
+that cwd silently gates the STALE binary -- rc=127 masked as gate output once;
+always rebuild in cxx/build and run gates from the repo root.
+
+Left (6 sites): A x3 + F (separate-compilation, deferred), E variant
+conjunctive rows (the known-unsound trap, NEXT), J catch-all + engine (last).
+The four object false-accepts (pr3968/pr4018/pr4824a/recursive-class) need the
+FULL class model (class-type coercions, virtuals, inheritance) -- future work.
