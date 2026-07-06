@@ -1064,7 +1064,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                               o::vint(0) /*md_uid*/});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(presence), md,
-                                  o::vint(0) /*Trec_not*/, o::vint(0) /*Exported*/}));  // Sig_module
+                                  o::vint(it.rec_status) /*Trec_*/,
+                                  o::vint(0) /*Exported*/}));  // Sig_module
     } else if (it.k == SigItem::Modtype) {
       // Sig_modtype(id, modtype_declaration, vis).  mtd_type = Some(Mty_signature
       // sig).  Takes NO runtime field, so it never shifts the value layout.
@@ -1172,7 +1173,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           ps.empty() ? o::vint(0) : o::vlist(ps),     // type_params
           o::vint((long long)it.params.size()),       // type_arity
           kind,                                        // type_kind
-          o::vint(1),                                  // type_private = Public
+          o::vint(it.type_private ? 0 : 1),            // type_private (0 Private / 1 Public)
           man,                                         // type_manifest
           // type_variance / type_separability: ONE entry per parameter (OCaml
           // iter2's them against the params -- a length mismatch aborts).

@@ -566,6 +566,10 @@ struct Checker {
   // name).  NOT set in value-kinds (which needs the expanded arrow to apply a
   // `Seq.t` as a function, the float kind, etc.) or strict.
   bool fold_abbrevs_ = false;
+  // The .cmi VERBATIM path (signature_to_cmi): keep a same-signature
+  // abbreviation as its written name (`val make : float -> t` stores the
+  // local `t`, like ocamlc) instead of expanding its manifest.
+  bool keep_local_abbrevs_ = false;
   std::vector<std::string> errors;
   int cur_line_ = 0;  // line of the expression currently being inferred (for diagnostics)
   void note_error(const std::string& m) {
@@ -1012,7 +1016,8 @@ struct Checker {
         expanding_.erase(nm);
         return r;
       }
-      if (!fold_abbrevs_ && ai != type_aliases.end() && ai->second.params.size() == as.size() &&
+      if (!fold_abbrevs_ && !keep_local_abbrevs_ &&
+          ai != type_aliases.end() && ai->second.params.size() == as.size() &&
           !expanding_.count(nm)) {
         std::unordered_map<std::string, TypePtr> sub;
         for (size_t i = 0; i < as.size(); ++i)
@@ -8706,7 +8711,9 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
           }
         ctors.push_back(std::move(cc));
       }
-      out.push_back(cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors)));
+      auto si = cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors));
+      si.type_private = (d.priv == PrivateFlag::Private);
+      out.push_back(std::move(si));
       continue;
     }
     if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
@@ -8718,7 +8725,9 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
         labels.push_back(std::move(lab));
       }
-      out.push_back(cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels)));
+      auto si = cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels));
+      si.type_private = (d.priv == PrivateFlag::Private);
+      out.push_back(std::move(si));
       continue;
     }
     cmi::cmiw::TyPtr manifest = nullptr;
@@ -8742,6 +8751,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     // `type t = ..`: an extensible (Type_open) declaration, not abstract --
     // its `type t += ..` extensions cite it and ocamlc prints the `= ..`.
     si.type_open = std::holds_alternative<Ptype_open>(d.kind);
+    si.type_private = (d.priv == PrivateFlag::Private);
     out.push_back(std::move(si));
   }
 }
@@ -9024,6 +9034,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     const std::unordered_map<std::string, const ast::Signature*>* outer_mods) {
   Checker ck;
   ck.record_kinds_ = true;
+  ck.keep_local_abbrevs_ = true;  // verbatim path: `t` stays `t`, not its manifest
   // Collect `module type S = sig .. end` so a functor result `: S` (Map.Make)
   // can be resolved to S's signature items.  Inherit ENCLOSING modtypes too: a
   // nested signature (`module type S = sig include Thing; module Map : Map end`
@@ -9300,6 +9311,72 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
   return out;
 }
 
+// All variable binders of a top-level let pattern, in source (left-to-right)
+// order -- `let (a, b) = ..` / `let {x; y} = ..` / `let (C v) = ..` export
+// every binder as a value, exactly like a plain `let a = ..` does.
+static void toplevel_pat_vars(const ast::Pattern& p, std::vector<std::string>& out) {
+  if (auto* v = std::get_if<Ppat_var>(&p.desc)) { out.push_back(v->name.txt); return; }
+  if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+    for (auto& e : t->elems) toplevel_pat_vars(*e, out);
+  } else if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+    if (c->arg) toplevel_pat_vars(**c->arg, out);
+  } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
+    toplevel_pat_vars(*a->p, out); out.push_back(a->name.txt);
+  } else if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
+    toplevel_pat_vars(*ct->p, out);
+  } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+    for (auto& f : r->fields) toplevel_pat_vars(*f.second, out);
+  } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
+    toplevel_pat_vars(*lz->p, out);
+  } else if (auto* vr = std::get_if<Ppat_variant>(&p.desc)) {
+    if (vr->arg) toplevel_pat_vars(**vr->arg, out);
+  } else if (auto* ar = std::get_if<Ppat_array>(&p.desc)) {
+    for (auto& e : ar->elems) toplevel_pat_vars(*e, out);
+  } else if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
+    toplevel_pat_vars(*op->p, out);
+  } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+    toplevel_pat_vars(*o->l, out);  // both sides bind the same set
+  }
+}
+
+// The Sig_module item for one module binding, by shape: a structure body is
+// inferred recursively; `module M : sig .. end = ..` takes the CONSTRAINT
+// signature verbatim (it is authoritative, like a .mli); a functor emits
+// Mty_functor with its named param's signature and its body's.  Null when the
+// shape isn't representable yet (Pmod_ident/apply/unpack).
+static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
+    const std::string& name, const ast::ModuleExpr& me) {
+  if (auto* ms = std::get_if<Pmod_structure>(&me.desc))
+    return cmi::cmiw::sig_module(name, infer_signature(ms->items));
+  if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
+    if (mc->mt)
+      if (auto* ps = std::get_if<Pmty_signature>(&mc->mt->desc))
+        return cmi::cmiw::sig_module(name, signature_to_cmi(ps->items));
+    return module_binding_sigitem(name, *mc->me);
+  }
+  if (auto* mf = std::get_if<Pmod_functor>(&me.desc)) {
+    std::string pname;
+    std::vector<cmi::cmiw::SigItem> psig;
+    if (auto* fn = std::get_if<Functor_named>(&mf->param)) {
+      if (fn->name.txt) pname = *fn->name.txt;
+      if (fn->type)
+        if (auto* ps = std::get_if<Pmty_signature>(&fn->type->desc))
+          psig = signature_to_cmi(ps->items);
+    }
+    std::vector<cmi::cmiw::SigItem> result;
+    if (auto* bs = std::get_if<Pmod_structure>(&mf->body->desc))
+      result = infer_signature(bs->items);
+    else if (auto* bc = std::get_if<Pmod_constraint>(&mf->body->desc)) {
+      if (bc->mt)
+        if (auto* ps = std::get_if<Pmty_signature>(&bc->mt->desc))
+          result = signature_to_cmi(ps->items);
+    }
+    return cmi::cmiw::sig_module_functor(name, pname, std::move(psig),
+                                         std::move(result));
+  }
+  return std::nullopt;
+}
+
 std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
   Checker ck;
   ck.record_kinds_ = true;
@@ -9307,13 +9384,16 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
   std::vector<cmi::cmiw::SigItem> out;
   for (auto& it : s) {
     if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
-      for (auto& b : sv->bindings)
-        if (auto* v = std::get_if<Ppat_var>(&b.pat.desc)) {  // single-var top-level lets
-          auto f = ck.venv.back().find(v->name.txt);
+      for (auto& b : sv->bindings) {
+        std::vector<std::string> names;
+        toplevel_pat_vars(b.pat, names);  // every binder, incl. destructuring lets
+        for (auto& nm : names) {
+          auto f = ck.venv.back().find(nm);
           if (f == ck.venv.back().end()) continue;
           std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
-          out.push_back(cmi::cmiw::sig_value(v->name.txt, bridge_ty(f->second, vars, nextvar)));
+          out.push_back(cmi::cmiw::sig_value(nm, bridge_ty(f->second, vars, nextvar)));
         }
+      }
     } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
       // `external f : t = "prim"`: a Val_prim value (typed from the annotation).
       if (pr->prim.type && !pr->prim.prims.empty()) {
@@ -9344,13 +9424,26 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
             first = false;
           }
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
-      // A submodule `module Inner = struct ... end`: emit Sig_module so the
-      // oracle can resolve `Outer.Inner.x` and so the submodule's runtime field
-      // keeps the surrounding value layout aligned.  Inner structures are
-      // inferred recursively (self-contained submodules; outer refs not yet).
+      // A submodule: emit Sig_module so the oracle can resolve `Outer.Inner.x`
+      // and so the submodule's runtime field keeps the surrounding value layout
+      // aligned.  Structures are inferred recursively (self-contained
+      // submodules; outer refs not yet); constrained/functor shapes via
+      // module_binding_sigitem.
       if (!mb->binding.name.txt) continue;  // `module _ = ...`
-      if (auto* ms = std::get_if<Pmod_structure>(&mb->binding.expr.desc))
-        out.push_back(cmi::cmiw::sig_module(*mb->binding.name.txt, infer_signature(ms->items)));
+      if (auto item = module_binding_sigitem(*mb->binding.name.txt, mb->binding.expr))
+        out.push_back(std::move(*item));
+    } else if (auto* mr = std::get_if<Pstr_recmodule>(&it.desc)) {
+      // `module rec A .. and B ..`: each binding like Pstr_module, marked
+      // Trec_first/Trec_next so ocamlc prints the group as one `module rec`.
+      int rs = 1;
+      for (auto& b : mr->bindings) {
+        if (!b.name.txt) continue;
+        if (auto item = module_binding_sigitem(*b.name.txt, b.expr)) {
+          item->rec_status = rs;
+          out.push_back(std::move(*item));
+        }
+        rs = 2;
+      }
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
       // `include M` / `include (struct .. end)`: build_module FLATTENS the
       // included module's members into THIS module's record (each takes its own

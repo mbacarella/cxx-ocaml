@@ -302,7 +302,11 @@ struct SigItem {
   std::vector<std::string> ext_params;
   TyPtr ext_ret;
   int text_kind = 2;
-  bool type_open = false;  // Type: `type t = ..` (Type_open kind)
+  bool type_open = false;     // Type: `type t = ..` (Type_open kind)
+  bool type_private = false;  // Type: `type t = private ..`
+  // Module: rec_status (0 Trec_not / 1 Trec_first / 2 Trec_next) -- a
+  // `module rec A .. and B ..` group prints as such only when marked.
+  int rec_status = 0;
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
                                   std::vector<SigItem> param_sig,
