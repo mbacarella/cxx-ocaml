@@ -2527,17 +2527,19 @@ struct Typer {
         }
       }
       if (pk->pkg) {
-        // `(module M : S)`: the ascription coerces the ident behind a
-        // transparent constraint and prints as a Ttyp_package Texp_constraint.
-        // A global path is additionally strengthened (a second implicit layer).
-        if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc)) {
-          int layers = path_global_or_alias(mi->path) ? 2 : 1;  // strengthened
-          for (int k = 0; k < layers; ++k) {
-            auto wrap = std::make_unique<tt::ModuleExpr>();
-            wrap->loc = me->loc;
-            wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
-            me = std::move(wrap);
-          }
+        // `(module ME : S)`: the ascription coerces ME to S behind a transparent
+        // constraint and prints as a Ttyp_package Texp_constraint.  One implicit
+        // layer for a struct literal / local path (the ascription coercion), two
+        // for a GLOBAL path (additionally strengthened).  Mirrors the unannotated
+        // branch above, which also defaults a non-ident module to one layer.
+        int layers = 1;
+        if (auto* mi = std::get_if<tt::Tmod_ident>(&me->desc))
+          if (path_global_or_alias(mi->path)) layers = 2;  // strengthened
+        for (int k = 0; k < layers; ++k) {
+          auto wrap = std::make_unique<tt::ModuleExpr>();
+          wrap->loc = me->loc;
+          wrap->desc = tt::Tmod_constraint{std::move(me), nullptr, true};
+          me = std::move(wrap);
         }
         tt::ExprExtra ex;
         ex.kind = tt::ExprExtra::Kind::Constraint;
