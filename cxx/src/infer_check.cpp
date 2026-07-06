@@ -3192,6 +3192,63 @@ struct Checker {
     return false;
   }
 
+  // A type path projecting through a functor parameter / bound module (`X.v1`):
+  // abstract here, so its equality with another such projection is undecidable
+  // (a later `F(M)` could make X.v1 = X.v2).
+  bool is_param_projection(const TypePtr& t) {
+    if (t->kind != I::Type::Kind::Constr) return false;
+    auto d = t->path.find('.');
+    if (d == std::string::npos) return false;
+    return bound_module_names_.count(t->path.substr(0, d)) != 0;
+  }
+  // Could two GADT type indices coincide (so an omitted constructor at one index
+  // cannot be refuted at the other)?  Biased toward "provably distinct" (the
+  // GADT-Total default): returns true only with genuine reason to coincide -- a
+  // variable (unifiable), an abstract functor-param projection, or the same head.
+  bool index_could_be_equal(const TypePtr& a0, const TypePtr& b0) {
+    TypePtr a = I::Engine::repr(a0), b = I::Engine::repr(b0);
+    if (a == b) return true;
+    if (a->kind == I::Type::Kind::Var || b->kind == I::Type::Kind::Var) return true;
+    if (a->kind == I::Type::Kind::Any || b->kind == I::Type::Kind::Any) return true;
+    if (is_param_projection(a) || is_param_projection(b)) return true;
+    if (a->kind == I::Type::Kind::Constr && b->kind == I::Type::Kind::Constr)
+      return a->path == b->path;
+    return false;  // distinct shapes / concrete heads -> provably distinct
+  }
+  // A GADT `function`'s exhaustiveness, for the dump's Tfunction_cases (Partial)
+  // marker.  Partial iff some UNCOVERED constructor is non-refutable: its result
+  // index could equal the scrutinee's, so a value of that ctor exists at the
+  // scrutinee type (pr7284_bad's `V2 : int -> X.v2 wit` cannot be ruled out from
+  // `X.v1 wit` because X is an abstract functor parameter).  Provably-distinct
+  // indices (`int` vs `string`, switch_opts) make the ctor refutable -> Total.
+  bool gadt_function_partial(const TypePtr& scrut, const std::vector<Case>& cases) {
+    TypePtr s = I::Engine::repr(scrut);
+    if (s->kind != I::Type::Kind::Constr) return false;  // unknown -> keep Total
+    auto tc = type_ctors.find(s->path);
+    auto sc = type_ctor_schemes_.find(s->path);
+    if (tc == type_ctors.end() || sc == type_ctor_schemes_.end()) return false;
+    for (auto& c : cases)
+      if (!c.guard && is_catchall(c.lhs)) return false;  // catch-all covers all
+    std::set<std::string> covered;
+    for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
+    for (auto& cname : tc->second) {
+      if (covered.count(cname)) continue;
+      const TypePtr* schp = nullptr;
+      for (auto& [n, sch] : sc->second) if (n == cname) { schp = &sch; break; }
+      if (!schp) return false;  // unknown scheme -> can't prove non-refutable
+      TypePtr result;
+      ctor_params(eng.instantiate(*schp), result);
+      TypePtr r = I::Engine::repr(result);
+      if (r->kind != I::Type::Kind::Constr) return false;
+      bool refutable = false;  // some index position provably distinct
+      size_t n = std::min(r->args.size(), s->args.size());
+      for (size_t i = 0; i < n; ++i)
+        if (!index_could_be_equal(s->args[i], r->args[i])) { refutable = true; break; }
+      if (!refutable) return true;  // this ctor can't be ruled out -> Partial
+    }
+    return false;  // every uncovered ctor is refutable -> Total
+  }
+
   // Collect the polyvariant tags a pattern matches (through alias/or/constraint).
   void collect_variant_tags(const Pattern& p, std::set<std::string>& out) {
     if (auto* v = std::get_if<Ppat_variant>(&p.desc)) out.insert(v->label);
@@ -5220,7 +5277,12 @@ struct Checker {
       TypePtr sarg = I::Engine::repr(arg);
       bool arg_gadt =
           sarg->kind == I::Type::Kind::Constr && gadt_types.count(sarg->path);
-      function_cases_partial[&fc] = !arg_gadt && compute_partial(arg, fc.cases);
+      // A GADT scrutinee is Total by branch refinement UNLESS an omitted ctor's
+      // index can't be proven distinct from the scrutinee's (pr7284_bad); a
+      // non-GADT uses the ordinary coverage check.
+      function_cases_partial[&fc] =
+          arg_gadt ? gadt_function_partial(sarg, fc.cases)
+                   : compute_partial(arg, fc.cases);
       params.push_back({arg, 0, ""});
       body = rt;
       constrained = eng.arrow(arg, rt);  // the constraint annotates arg -> rt
@@ -6580,6 +6642,27 @@ struct Checker {
 
 // Register variant constructors from type decls, recursing into local module
 // structures (a flat ctor namespace — best-effort, so `open M; A` resolves).
+// Register ONLY the variant/record TYPE declarations of a functor body (so the
+// dump's GADT exhaustiveness marker knows the body's `type 'a wit = V1 : ..`),
+// descending into nested plain-module structures.  Deliberately does NOT touch
+// typext/exception ctors: those would enter global ctor resolution and, in a
+// non-strict pass, shadow the correct through-the-application resolution
+// (msg.ml's `C : D.t tag` must stay abstract in the body but resolve to
+// `string tag` through `Define(struct type t = string ..)`).
+static void register_functor_body_types(Checker& ck, const ast::Structure& s) {
+  for (auto& it : s) {
+    if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+      for (auto& d : ty->decls) ck.register_type_decl(d);
+      for (auto& d : ty->decls) ck.register_record_decl(d);
+    } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+      const ModuleExpr* me = &mb->binding.expr;
+      while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
+      if (auto* ms = std::get_if<Pmod_structure>(&me->desc))
+        register_functor_body_types(ck, ms->items);
+    }
+  }
+}
+
 static void register_types_rec(Checker& ck, const ast::Structure& s) {
   for (auto& it : s) {
     if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
@@ -6599,6 +6682,18 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
         if (mb->binding.name.txt) ck.mod_prefix_ += *mb->binding.name.txt + ".";
         register_types_rec(ck, ms->items);
         ck.mod_prefix_ = saved;
+      } else if (!ck.strict && std::holds_alternative<Pmod_functor>(me->desc)) {
+        // A functor body's own type declarations (`module F(X:S) = struct type
+        // 'a wit = V1 : .. end`).  Registered ONLY in the non-strict (dump/kind)
+        // passes so the exhaustiveness marker for a body `function` sees its GADT
+        // -- the strict reject pass must NOT gain the body's ctors globally (they
+        // depend on the unapplied argument and could mis-resolve a bare ctor).
+        // No name prefix: the body references its own types unqualified.
+        const ModuleExpr* b = me;
+        while (auto* mf = std::get_if<Pmod_functor>(&b->desc)) b = mf->body.get();
+        while (auto* mc = std::get_if<Pmod_constraint>(&b->desc)) b = mc->me.get();
+        if (auto* fs = std::get_if<Pmod_structure>(&b->desc))
+          register_functor_body_types(ck, fs->items);
       }
     } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
       // `module rec Typ : sig .. end = struct type 'a typ = Int of .. end`:
