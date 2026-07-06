@@ -5273,7 +5273,10 @@ struct Checker {
         }
         return package_type(*pk->pkg);
       }
-      return eng.any();  // unconstrained pack: type unknown without the sig
+      // Unconstrained pack `(module M)` (no `: S`): the package type comes
+      // from the CONTEXT (a fresh var per occurrence unifies with it); only a
+      // single occurrence meeting incompatible contexts clashes.
+      return eng.fresh_var();
     }
     if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {
       // `new c` for a parameterless local class is its object type; a class
