@@ -2565,15 +2565,23 @@ struct Typer {
       out.desc = std::move(tv);
     } else if (auto* sd = std::get_if<Pexp_send>(&e.desc)) {
       auto objexpr = std::make_unique<tt::Expression>(expr(*sd->obj));
-      // A self-send (object is the enclosing self ident, method is one of its
-      // methods) resolves the method to its ident (Tmeth_val); else Tmeth_name.
+      // A self-send (object is the enclosing self ident) ALWAYS resolves the
+      // method to an ident (Tmeth_val); a send to any other object prints the
+      // name only (Tmeth_name).  The class' meths table pre-registers methods
+      // declared/inherited here, but a method inherited from a class whose body
+      // we couldn't enumerate (e.g. a cross-module functor result) is missing --
+      // so mint a fresh shared ident on first send and cache it in the table,
+      // matching OCaml (every self-send carries a method ident).
       std::optional<tt::Ident> mid;
       if (auto* oi = std::get_if<tt::Texp_ident>(&objexpr->desc))
         if (auto* pid = std::get_if<tt::Pident>(&oi->path.v)) {
           auto it = self_meths_.find(pid->id.stamp);
           if (it != self_meths_.end()) {
-            auto mit = it->second->find(sd->meth.txt);
-            if (mit != it->second->end()) mid = mit->second;
+            auto& m = *it->second;
+            auto mit = m.find(sd->meth.txt);
+            if (mit == m.end())
+              mit = m.emplace(sd->meth.txt, fresh_anon(sd->meth.txt)).first;
+            mid = mit->second;
           }
         }
       out.desc = tt::Texp_send{std::move(objexpr), sd->meth.txt, mid};
