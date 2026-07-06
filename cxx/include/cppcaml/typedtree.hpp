@@ -359,6 +359,11 @@ struct Tsig_primitive {
   std::optional<Path> alias;     // Tprim_alias (`external f [: t] = g`)
   const ast::Attributes* attrs = nullptr;
 };
+struct Tsig_modsubst {  // module M := X.Y
+  Ident id;
+  Path manifest;
+  const ast::Attributes* attrs = nullptr;
+};
 struct Tsig_attribute { std::string name; const ast::Structure* payload; };
 struct Tsig_open { bool override_ = false; Path path; };
 struct ClassTypeDeclaration;  // defined with the class-type section below
@@ -367,7 +372,8 @@ struct Tsig_class_type { std::vector<Box<ClassTypeDeclaration>> decls; };  // cl
 struct SignatureItem {
   std::variant<Tsig_value, Tsig_type, Tsig_module, Tsig_recmodule, Tsig_modtype,
                Tsig_include, Tsig_exception, Tsig_typext, Tsig_primitive,
-               Tsig_attribute, Tsig_open, Tsig_class, Tsig_class_type>
+               Tsig_attribute, Tsig_open, Tsig_class, Tsig_class_type,
+               Tsig_modsubst>
       desc;
   Location loc;
 };

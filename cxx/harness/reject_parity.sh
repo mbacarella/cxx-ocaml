@@ -12,6 +12,9 @@ CPP=./cxx/build/c++type
 JOBS="${JOBS:-8}"
 TIMEOUT="${CPP_TIMEOUT:-10}"
 CACHE="${CACHE:-/tmp/ttp_oracle_cache}"
+# Sibling-module cmis (multi-file tests): the oracle cache is built with this
+# context, so c++type --check needs it too (cpptype_main derives the -I dir).
+export CPPCAML_SIB_CMI_ROOT="${CPPCAML_SIB_CMI_ROOT:-/tmp/sib_cmi}"
 key() { printf '%s' "$1" | tr '/' '%'; }
 
 if [ "${1:-}" == "--worker" ]; then

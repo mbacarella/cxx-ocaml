@@ -29,8 +29,15 @@ key() { printf '%s' "$1" | tr '/' '%'; }
 # instead of failing on "Unbound module Unix" the real tests never see.
 OTHERLIBS="-I otherlibs/unix -I otherlibs/str -I otherlibs/systhreads \
   -I otherlibs/runtime_events -I otherlibs/dynlink"
+# Sibling-module cmis (multi-file tests): dirs populated by sib_cmis.sh get the
+# same -I on the oracle and (via the env var) on c++type.
+export CPPCAML_SIB_CMI_ROOT="${CPPCAML_SIB_CMI_ROOT:-/tmp/sib_cmi}"
+sib_i() {  # -I flag for a source file's sibling-cmi dir, if populated
+  local d="$CPPCAML_SIB_CMI_ROOT/$(dirname "$1")"
+  [ -d "$d" ] && printf '%s' "-I $d"
+}
 oracle_raw() {
-  timeout "$CACHE_TIMEOUT" ./ocamlc.opt -nostdlib -I stdlib $OTHERLIBS \
+  timeout "$CACHE_TIMEOUT" ./ocamlc.opt -nostdlib -I stdlib $OTHERLIBS $(sib_i "$1") \
     -stop-after typing -dtypedtree "$1" 2>&1 1>/dev/null | sed -n '/^\[/,$p'
 }
 

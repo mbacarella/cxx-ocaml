@@ -1,6 +1,7 @@
 // c++type — type-check an OCaml source file and print the typedtree in
 // -dtypedtree format, byte-comparable (after stamp normalization) with
 // `ocamlc -dtypedtree -stop-after typing`.
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -31,6 +32,14 @@ int main(int argc, char** argv) {
   // repo root, so these are cwd-relative like the default stdlib dir).
   {
     std::vector<std::string> dirs;
+    // Sibling-module cmis (multi-file tests): the harness precompiles a test
+    // directory's sibling .ml files under $CPPCAML_SIB_CMI_ROOT/<dir> (see
+    // cxx/harness/sib_cmis.sh) and the oracle gets the same dir via -I.
+    if (const char* sibroot = std::getenv("CPPCAML_SIB_CMI_ROOT")) {
+      std::string sib =
+          std::string(sibroot) + "/" + std::filesystem::path(path).parent_path().string();
+      if (std::filesystem::exists(sib)) dirs.push_back(std::move(sib));
+    }
     for (const char* d : {"otherlibs/unix", "otherlibs/str",
                           "otherlibs/systhreads", "otherlibs/runtime_events",
                           "otherlibs/dynlink"})
@@ -68,11 +77,22 @@ int main(int argc, char** argv) {
       // A companion `.mli` with no compiled `.cmi` makes ocamlc reject before
       // typing ("Could not find the .cmi file for interface ..."); match that
       // deterministic build error (a valid file's .cmi would be present).
+      // The harness's sibling-cmi dir counts as a place the .cmi can live
+      // (the oracle gets it via -I; see sib_cmis.sh).
       {
         std::string p = path;
         if (p.size() > 3 && p.compare(p.size() - 3, 3, ".ml") == 0) {
-          std::ifstream mli(p + "i"), cmi(p.substr(0, p.size() - 3) + ".cmi");
-          if (mli.good() && !cmi.good()) {
+          std::string base = p.substr(0, p.size() - 3);
+          bool have_cmi = std::filesystem::exists(base + ".cmi");
+          if (!have_cmi)
+            if (const char* sibroot = std::getenv("CPPCAML_SIB_CMI_ROOT")) {
+              std::filesystem::path bp(base);
+              have_cmi = std::filesystem::exists(
+                  std::string(sibroot) + "/" + bp.parent_path().string() +
+                  "/" + bp.filename().string() + ".cmi");
+            }
+          std::ifstream mli(p + "i");
+          if (mli.good() && !have_cmi) {
             std::cout << "Error: Could not find the .cmi file for interface\n";
             return 1;
           }

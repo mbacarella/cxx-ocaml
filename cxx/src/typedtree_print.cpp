@@ -777,6 +777,9 @@ struct Printer {
         for (auto& d : rm->decls) module_declaration(j + 1, d);
         line(j, "]");
       }
+    } else if (auto* ms = std::get_if<Tsig_modsubst>(&si.desc)) {
+      line(j, "Tsig_modsubst \"" + ident(ms->id) + "\" = \"" + path_aux(ms->manifest) + "\"");
+      if (ms->attrs) attributes(j, *ms->attrs);
     } else if (auto* mt = std::get_if<Tsig_modtype>(&si.desc)) {
       line(j, "Tsig_modtype \"" + ident(mt->id) + "\"");
       if (mt->attrs) attributes(j, *mt->attrs);

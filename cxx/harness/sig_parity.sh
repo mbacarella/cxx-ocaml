@@ -22,11 +22,15 @@ TIMEOUT="${TIMEOUT:-15}"
 # val-lines only, type-var tokens -> a canonical per-line first-appearance seq.
 norm() { perl "$(dirname "$SELF")/signorm.pl"; }
 
+# Sibling-module cmis (multi-file tests) -- same context on both sides.
+export CPPCAML_SIB_CMI_ROOT="${CPPCAML_SIB_CMI_ROOT:-/tmp/sib_cmi}"
+
 if [ "${1:-}" == "--worker" ]; then
   f="$2"
+  sib=""; sd="$CPPCAML_SIB_CMI_ROOT/$(dirname "$f")"; [ -d "$sd" ] && sib="-I $sd"
   o=$(timeout "$TIMEOUT" "$ORACLE" -nostdlib -I stdlib -I otherlibs/unix \
       -I otherlibs/str -I otherlibs/systhreads -I otherlibs/runtime_events \
-      -I otherlibs/dynlink -i "$f" 2>/dev/null); orc=$?
+      -I otherlibs/dynlink $sib -i "$f" 2>/dev/null); orc=$?
   [ $orc -ne 0 ] && { printf 'OERR\n'; exit 0; }          # oracle didn't type it
   on=$(printf '%s\n' "$o" | norm)
   [ -z "$on" ] && { printf 'NOVAL\n'; exit 0; }            # no value bindings to compare

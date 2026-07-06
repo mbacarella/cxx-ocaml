@@ -1197,6 +1197,11 @@ struct Checker {
           }
         if (strict && module_head_unbound(*d->prefix))  // genuinely unbound -> error
           note_error("Unbound module " + mod_components(*d->prefix).front());
+        // Empty exports can also mean the module RESOLVES but has no values
+        // (a types-only sibling unit: `A.y` with a.ml = one type decl).  If
+        // its cmi signature walks cleanly, the member is genuinely absent.
+        else if (strict && cmi_path_sig_resolves(*d->prefix))
+          note_error("Unbound value " + lid_full(lid));
         return eng.any();   // else stay dynamic (a module we just can't load)
       }
       if (auto f = ex.find(d->name); f != ex.end())
@@ -1236,6 +1241,29 @@ struct Checker {
     if (modenv.count(head) || functor_env.count(head)) return false;
     if (opened_submodules_.count(head) || bound_module_names_.count(head)) return false;
     return !cmi_module_loads(head);
+  }
+  // Whether a dotted module path walks cleanly to a concrete cmi signature.
+  // Distinguishes "module resolves but exports no values" (a genuine
+  // Unbound-value on a missing member: types-only sibling a.ml vs `A.y`)
+  // from "module we just can't load" (stay dynamic).  Local modules answer
+  // false: their (possibly partial) exports are handled upstream.
+  bool cmi_path_sig_resolves(const Longident& m) {
+    auto comps = mod_components(m);
+    if (comps.empty()) return false;
+    if (modenv.count(comps.back())) return false;
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      return sig != nullptr;
+    } catch (...) {}
+    return false;
   }
   // The submodule names of a (cmi-resolvable) module path, so `open M` / `include
   // M` can bring them into bare scope (e.g. `open Bigarray` -> Array1, Array2..).
@@ -1279,10 +1307,28 @@ struct Checker {
       }
       if (sig) {
         for (auto& td : sig->types) opened_type_quals_[td.name] = full + "." + td.name;
-        // A submodule `Array1` of an opened `Bigarray`: a `Array1.t` annotation
-        // qualifies to `Bigarray.Array1.t`.
-        for (auto& mm : sig->modules) opened_submod_quals_[mm.name] = full + "." + mm.name;
       }
+    } catch (...) {}
+  }
+  // A submodule `Array1` of an opened `Bigarray`: `Array1.t` / `open Array1`
+  // qualifies through `Bigarray.Array1`.  Runs in EVERY pass (strict needs the
+  // reroute to resolve `open M; ... x` for M a sibling/otherlibs submodule).
+  void load_open_submod_quals(const Longident& m) {
+    auto comps = mod_components(m);
+    if (comps.empty() || comps[0] == "Stdlib") return;
+    std::string full = lid_full(m);
+    if (full.rfind("Stdlib.", 0) == 0) return;
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (sig)
+        for (auto& mm : sig->modules) opened_submod_quals_[mm.name] = full + "." + mm.name;
     } catch (...) {}
   }
   // `open M` where M's cmi declares module ALIASES (StdLabels's `module List =
@@ -1380,11 +1426,25 @@ struct Checker {
     if (mt->kind == cmi::ModuleType::Alias && mt->path && loaded.size() < 16) {
       std::string p = cmi_path_str(*mt->path);  // e.g. "Stdlib__Array"
       if (p.empty()) return nullptr;
-      if (p[0] >= 'A' && p[0] <= 'Z') p[0] += 32;  // file is first-char-lowercased
+      std::string low = p;
+      if (low[0] >= 'A' && low[0] <= 'Z') low[0] += 32;  // first-char-lowercased
       try {
-        loaded.push_back(cmi::CmiFile::load(stdpath(p + ".cmi")));
+        loaded.push_back(cmi::CmiFile::load(stdpath(low + ".cmi")));
         return &loaded.back().sig();
-      } catch (...) { return nullptr; }
+      } catch (...) {}
+      // Not a stdlib-dir unit: an alias to a separately compiled unit
+      // (`module A2235 = A2235` in a sibling lib) resolves through the same
+      // search as any head module (stdlib__X naming + the -I dirs).
+      std::string unit = p.rfind("Stdlib__", 0) == 0 ? p.substr(8)
+                       : p.rfind("Stdlib.", 0) == 0 ? p.substr(7)
+                                                    : p;
+      if (unit.find('.') == std::string::npos) {
+        try {
+          loaded.push_back(cmi::CmiFile::load(head_cmi(unit)));
+          return &loaded.back().sig();
+        } catch (...) {}
+      }
+      return nullptr;
     }
     return nullptr;
   }
@@ -1465,6 +1525,14 @@ struct Checker {
         for (auto& d : t->decls)
           if (auto a = argtypes.find(d.name.txt); a != argtypes.end())
             functor_result_abstract_[d.name.txt] = a->second;
+    // Sig-local `module Env : S` binds Env for the val types that follow
+    // (`val code0 : Env.in_t -> out0`); count it bound so strict's
+    // unbound-module check can't false-fire (flat over-inclusive set, like
+    // the other bound_module_names_ producers).
+    for (auto& it : items)
+      if (auto* md = std::get_if<Psig_module>(&it.desc)) {
+        if (md->md.name.txt) bound_module_names_.insert(*md->md.name.txt);
+      }
     for (auto& it : items)
       if (auto* v = std::get_if<Psig_value>(&it.desc)) {
         std::unordered_map<std::string, TypePtr> vars;
@@ -1640,6 +1708,14 @@ struct Checker {
     if (auto al = opened_module_aliases_.find(comps[0]);
         al != opened_module_aliases_.end()) {
       std::vector<std::string> t = al->second;
+      t.insert(t.end(), comps.begin() + 1, comps.end());
+      comps = std::move(t);
+    }
+    // An opened module's SUBMODULE (`open Deprecated_module` -> M): reroute
+    // the head through the parent path so its values load from the cmi.
+    else if (auto q = opened_submod_quals_.find(comps[0]);
+             q != opened_submod_quals_.end()) {
+      std::vector<std::string> t = mod_components_str(q->second);
       t.insert(t.end(), comps.begin() + 1, comps.end());
       comps = std::move(t);
     }
@@ -7383,6 +7459,7 @@ struct Checker {
             // (the submodule's int64 field never registered, so the ambiguity
             // that forces type-directed resolution never arose).
             load_module_record_fields(pi->id.txt);
+            load_open_submod_quals(pi->id.txt);  // bare Sub -> M.Sub (every pass)
             if (!strict) {
               load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
               open_module_ctors(pi->id.txt);     // bare ctor -> M's variant ctor

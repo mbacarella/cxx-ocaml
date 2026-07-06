@@ -682,7 +682,7 @@ struct Typer {
   // with the SIGNATURE's own ident (t/274 in both places), so the with-clause
   // needs to look idents up inside S rather than mint new ones.
   struct SigExports {
-    std::unordered_map<std::string, tt::Ident> types, modules;
+    std::unordered_map<std::string, tt::Ident> types, modules, modtypes;
   };
   std::unordered_map<long long, SigExports> modtype_exports_;
   // A local module's type/module member IDENTS (name -> Ident, stamps intact),
@@ -870,6 +870,8 @@ struct Typer {
         for (auto& d : t->decls) ex.types.emplace(d.id.name, d.id);
       } else if (auto* m = std::get_if<tt::Tsig_module>(&it.desc)) {
         ex.modules.emplace(m->md.id.name, m->md.id);
+      } else if (auto* mt2 = std::get_if<tt::Tsig_modtype>(&it.desc)) {
+        ex.modtypes.emplace(mt2->id.name, mt2->id);
       }
     }
   }
@@ -980,6 +982,17 @@ struct Typer {
     std::vector<std::string> comps;
     if (!lid_comps(lid, comps)) return;
     const cmi::Signature* sig = cmi_sig_of_comps(comps);
+    if (!sig) {
+      // The head may be a SUBMODULE of an earlier open (`open Deprecated_module`
+      // then `open M`): reroute through the opening module's path.
+      for (auto it = opens.rbegin(); it != opens.rend() && !sig; ++it)
+        if (it->submodules.count(comps[0])) {
+          std::vector<std::string> pc;
+          if (!tt_path_comps(it->path, pc)) continue;
+          pc.insert(pc.end(), comps.begin(), comps.end());
+          sig = cmi_sig_of_comps(pc);
+        }
+    }
     if (!sig) return;
     for (auto& v : sig->values) oe.values.insert(v.name);
     for (auto& t : sig->types) oe.types.insert(t.name);
@@ -2373,12 +2386,14 @@ struct Typer {
     } else {
       tt::Pattern inner = pattern(p);
       out.loc = inner.loc;
-      // A top-level type CONSTRAINT on a match-case pattern (`(_ : t)`) sits on
-      // the COMPUTATION pattern in OCaml; the other extras (#type, unpack, open)
-      // stay on the wrapped value pattern.
+      // A top-level type CONSTRAINT (`(_ : t)`) or local OPEN (`A.(0)`) on a
+      // match-case pattern sits on the COMPUTATION pattern in OCaml (typecore
+      // records the extra at the syntactic level it appears); the other
+      // extras (#type, unpack) stay on the wrapped value pattern.
       std::vector<tt::PatExtra> keep;
       for (auto& e : inner.extras) {
-        if (e.kind == tt::PatExtra::Kind::Constraint)
+        if (e.kind == tt::PatExtra::Kind::Constraint ||
+            e.kind == tt::PatExtra::Kind::Open)
           out.extras.push_back(std::move(e));
         else
           keep.push_back(std::move(e));
@@ -3387,6 +3402,13 @@ struct Typer {
         else out.md.id.stamp = -1;  // anonymous `module _ : S`, prints as `_`
         out.md.attrs = &m->md.attrs;
         si.desc = std::move(out);
+      } else if (auto* ms = std::get_if<Psig_modsubst>(&it.desc)) {
+        // `module G := A`: the substituted module binds (then vanishes from
+        // the sig); the dump keeps its ident and the manifest path.
+        tt::Tsig_modsubst out;
+        out.manifest = resolve_module(ms->manifest.txt);
+        out.id = fresh_module(ms->name.txt ? *ms->name.txt : "_");
+        si.desc = std::move(out);
       } else if (auto* rm = std::get_if<Psig_recmodule>(&it.desc)) {
         tt::Tsig_recmodule out;
         std::vector<tt::Ident> ids;  // pre-bind all names (mutual refs)
@@ -3455,6 +3477,12 @@ struct Typer {
         OpenEntry oe;
         oe.path = out.path;
         load_open_names_lid(op->id.txt, oe);
+        if (const ModExports* ex = exports_by_path(oe.path)) {  // local module
+          for (auto& n : ex->values) oe.values.insert(n);
+          for (auto& n : ex->types) oe.types.insert(n);
+          for (auto& n : ex->modtypes) oe.modtypes.insert(n);
+          for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
+        }
         // A sig-level open makes its members resolve THROUGH the open's path
         // (abstract -- `open Set.Make(Bool)` gives `Set.Make(Bool).t`),
         // shadowing any same-named outer binding.  resolve_type checks
@@ -3549,16 +3577,35 @@ struct Typer {
   tt::WithItem with_item(const WithConstraint& c, const SigExports& ex) {
     tt::WithItem out;
     auto lhs_type_decl = [&](const LongidentLoc& lid, const TypeDeclaration& td) {
-      auto* l = std::get_if<Lident>(&lid.txt.v);
-      if (!l) throw TypeError("with-type on dotted path");
-      auto f = ex.types.find(l->name);
-      tt::Ident id = f != ex.types.end() ? f->second : fresh_anon(l->name);
-      out.path.v = tt::Pident{id};
-      auto saved = type_scope;  // elaborate the decl under the resolved ident
-      type_scope[td.name.txt] = id;
-      auto d = type_declaration(td);
-      type_scope = std::move(saved);
-      return d;
+      if (auto* l = std::get_if<Lident>(&lid.txt.v)) {
+        auto f = ex.types.find(l->name);
+        tt::Ident id = f != ex.types.end() ? f->second : fresh_anon(l->name);
+        out.path.v = tt::Pident{id};
+        auto saved = type_scope;  // elaborate the decl under the resolved ident
+        type_scope[td.name.txt] = id;
+        auto d = type_declaration(td);
+        type_scope = std::move(saved);
+        return d;
+      }
+      // Dotted `with type Endpoint.t = ..`: the path's HEAD is the base
+      // signature's module (minted fresh when the base is a cmi modtype we
+      // don't enumerate), inner components stay name-level, and the
+      // DECLARATION keeps its own fresh ident distinct from the path
+      // (ocamlc: "Endpoint/277.t" vs type_declaration t/283).
+      std::vector<std::string> comps;
+      if (!lid_comps(lid.txt, comps) || comps.size() < 2)
+        throw TypeError("with-type path");
+      auto fh = ex.modules.find(comps[0]);
+      tt::Ident hid = fh != ex.modules.end() ? fh->second : fresh_anon(comps[0]);
+      auto p = std::make_shared<tt::Path>();
+      p->v = tt::Pident{hid};
+      for (size_t i = 1; i + 1 < comps.size(); ++i) {
+        auto np = std::make_shared<tt::Path>();
+        np->v = tt::Pdot{p, comps[i]};
+        p = np;
+      }
+      out.path.v = tt::Pdot{p, comps.back()};
+      return type_declaration(td, fresh_anon(td.name.txt));
     };
     auto lhs_module = [&](const LongidentLoc& lid) {
       auto* l = std::get_if<Lident>(&lid.txt.v);
@@ -3577,8 +3624,18 @@ struct Typer {
     } else if (auto* m = std::get_if<Pwith_modsubst>(&c)) {
       lhs_module(m->lid1);
       out.c = tt::Twith_modsubst{resolve_module(m->lid2.txt)};
+    } else if (auto* m = std::get_if<Pwith_modtype>(&c)) {
+      // `with module type MT = AS`: LHS is the base sig's module-type ident
+      // (minted when the base isn't enumerable), RHS a full module type.
+      auto* l = std::get_if<Lident>(&m->lid.txt.v);
+      if (!l) throw TypeError("with-modtype on dotted path");
+      auto f = ex.modtypes.find(l->name);
+      tt::Ident id = f != ex.modtypes.end() ? f->second : fresh_anon(l->name);
+      out.path.v = tt::Pident{id};
+      out.c = tt::Twith_modtype{
+          std::make_unique<tt::ModuleType>(module_type_t(*m->mty))};
     } else {
-      throw TypeError("with-modtype constraint");
+      throw TypeError("with-modtype-subst constraint");
     }
     return out;
   }
@@ -3653,7 +3710,8 @@ struct Typer {
       } else if (auto* t = std::get_if<tt::Tstr_type>(&it.desc)) {
         for (auto& d : t->decls) if (dup(s.types, d.id.name)) return true;
       } else if (auto* m = std::get_if<tt::Tstr_module>(&it.desc)) {
-        if (dup(s.mods, m->id.name)) return true;
+        // `module _ = ..` adds no signature entry at all, so it can't clash.
+        if (m->id.stamp >= 0 && dup(s.mods, m->id.name)) return true;
       } else if (auto* rm = std::get_if<tt::Tstr_recmodule>(&it.desc)) {
         for (auto& b : rm->bindings) if (dup(s.mods, b.id.name)) return true;
       } else if (auto* mt = std::get_if<tt::Tstr_modtype>(&it.desc)) {
@@ -3681,11 +3739,34 @@ struct Typer {
   // A path is strengthened when its root is a global module, or a local alias
   // module (`module S = P`), including dotted paths through it (`S.Make`).
   bool path_global_or_alias(const tt::Path& p) {
-    if (path_root_global(p)) return true;
+    if (path_root_global(p)) return global_path_traverses_alias(p);
     const tt::Path* root = &p;
     while (auto* pd = std::get_if<tt::Pdot>(&root->v)) root = pd->prefix.get();
     if (auto* pi = std::get_if<tt::Pident>(&root->v))
       return alias_module_stamps_.count(pi->id.stamp) > 0;
+    return false;
+  }
+
+  // ocamlc only inserts the implicit strengthening constraint when
+  // type_module's find of the path returns an Mty_alias -- i.e. when some
+  // component of the dotted path is a module ALIAS declaration (every Stdlib
+  // submodule: `module Set = Stdlib__Set`).  A direct submodule chain of a
+  // unit (sibling Globroots.Test) is NOT wrapped.  Unknown components keep
+  // the historical wrap (the corpus-validated stdlib behavior).
+  bool global_path_traverses_alias(const tt::Path& p) {
+    std::vector<std::string> comps;
+    if (!tt_path_comps(p, comps) || comps.size() < 2) return false;
+    const cmi::CmiFile* f = cmi_unit(comps[0]);
+    if (!f) return true;
+    const cmi::Signature* sig = &f->sig();
+    for (size_t i = 1; i < comps.size() && sig; ++i) {
+      const cmi::ModuleDecl* md = nullptr;
+      for (auto& m : sig->modules)
+        if (m.name == comps[i]) { md = &m; break; }
+      if (!md || !md->type) return true;
+      if (md->type->kind == cmi::ModuleType::Alias) return true;
+      if (i + 1 < comps.size()) sig = cmi_resolve_mt(md->type.get(), sig, 0);
+    }
     return false;
   }
 
@@ -3753,15 +3834,8 @@ struct Typer {
       // OCaml's type_application gives the apply-unit node the functor's own
       // location, not the parse span that also covers the `()`.
       out.loc = au->f->loc;
-      auto fnme = std::make_unique<tt::ModuleExpr>(module_expr(*au->f));
-      if (auto* mi = std::get_if<tt::Tmod_ident>(&fnme->desc))
-        if (path_root_global(mi->path)) {  // same strengthening as Tmod_apply
-          auto wrap = std::make_unique<tt::ModuleExpr>();
-          wrap->loc = fnme->loc;
-          wrap->desc = tt::Tmod_constraint{std::move(fnme), nullptr, true};
-          fnme = std::move(wrap);
-        }
-      out.desc = tt::Tmod_apply_unit{std::move(fnme)};
+      out.desc = tt::Tmod_apply_unit{
+          strengthen_global(std::make_unique<tt::ModuleExpr>(module_expr(*au->f)))};
     } else if (auto* up = std::get_if<Pmod_unpack>(&me.desc)) {
       out.desc = tt::Tmod_unpack{std::make_unique<tt::Expression>(expr(*up->e))};
     } else {
@@ -4410,14 +4484,19 @@ struct Typer {
       auto& b = mb->binding;
       tt::Tstr_module tm;
       tm.present = !std::holds_alternative<Pmod_ident>(b.expr.desc);  // alias=Absent
-      // ...but aliasing a bare functor PARAMETER stays Present.
-      if (auto* mi = std::get_if<Pmod_ident>(&b.expr.desc))
-        if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
+      // ...but a path ROOTED at a functor PARAMETER stays Present (the
+      // parameter has no static address, so the alias isn't aliasable):
+      // bare `module M = X` and dotted `module E = Range.Endpoint` alike.
+      if (auto* mi = std::get_if<Pmod_ident>(&b.expr.desc)) {
+        const Longident* root = &mi->id.txt;
+        while (auto* dd = std::get_if<Ldot>(&root->v)) root = dd->prefix.get();
+        if (auto* l = std::get_if<Lident>(&root->v)) {
           auto it = module_scope.find(l->name);
           if (it != module_scope.end() &&
               functor_param_stamps_.count(it->second.stamp))
             tm.present = true;
         }
+      }
       // A plain `module M = E` is non-recursive: E is elaborated with M NOT yet
       // bound (so `module M = struct .. M.x .. end` sees an OUTER M), then M is
       // bound for the following items.
