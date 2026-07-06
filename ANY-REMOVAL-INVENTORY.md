@@ -39,6 +39,35 @@ value-representation class name + comments.)
 Line numbers are as of 2026-07-02 (branch `cpp-rewrite`); re-grep before editing:
 `grep -nE '\bany\(\)|Kind::Any' cxx/src/infer_check.cpp`.
 
+## Progress (2026-07-06: 14 → 9 sites — buckets B + C CLEARED)
+
+The **B/C frontier is done**: all five records/fields/ctors fallbacks now return
+a fresh var instead of the absorbing `any()`, each corpus-revalidated with every
+gate identical (reject 1, accept 36, sig 524/1, typedtree 745/745, lambda DIFF
+327 — same sets). Commits (2026-07-06):
+
+- **C — unknown expr ctor** (`Pexp_construct`, unresolvable bare/qualified name):
+  fresh var; unification against context pins the ctor's real type.
+- **C — unknown ctor pattern** (`Ppat_construct`): mirror of the above in every
+  pass (the kind pass already returned fresh var).
+- **B — unresolved record pattern** (`Ppat_record`, no label resolves): fresh var.
+- **B — unresolved record construct** (`Pexp_record`) + **unresolved field access**
+  (`Pexp_field`): fresh vars.
+
+Why safe (not just lucky): each *syntactic occurrence* mints its OWN fresh var,
+so two uses of the same unknown ctor/label never clash through one var — only a
+single occurrence flowing into two incompatible contexts clashes, which is a
+genuine error the oracle also rejects. `any()`'s absorbing property was therefore
+unnecessary conservatism here, not load-bearing (contrast bucket A, where it *is*
+load-bearing — an unknown module member must instantiate fresh per use).
+
+Left after B/C: A ×3 (`1186`/`1191`/`1193`, deferred — separate-compilation),
+F ×1 (`4956`, deferred with A), D ×3 (`4969` new / `5306` send / `5329` object,
+hard object-row core), E ×1 (`5319`, known-unsound conjunctive rows), J catch-all
+(`5331`, last). NB: the catch-all flip to fresh var *also* held all gates on the
+corpus but was **reverted on purpose** — it is the genuine "unhandled form" net
+and must stay absorbing (bucket J) until every form is really typed.
+
 ## Progress (2026-07-03: 23 → 14 sites, all gates flat each step)
 
 Closed, each corpus-revalidated (reject 1 known artifact, accept 36 identical
@@ -63,6 +92,38 @@ resolution), D ×3 (objects: new/send/object-body in strict), E ×1 (variant
 conjunctive rows — the known-unsound trap), F ×1 (unconstrained pack), plus
 the catch-all and J (engine, last).
 
+### Bucket A sizing + negative result (2026-07-06)
+
+Instrumented the three A-sites across the 1853-file corpus: **346 files hit
+site 1186** (unresolvable qualified module → Any), 3939 hits; site 1191
+(resolved module, absent value) 126 hits; site 1193 (`Lapply` value path) ~0.
+Site 1186 splits into two populations:
+
+- **otherlibs** — `Unix` (1013), `Thread` (392), `Dynlink` (305), `Str` (170),
+  `Runtime_events` (56): real modules whose `.cmi` exists but is off our search
+  path, and whose oracle dumps were generated *with* the test's `-I +unix`-style
+  include context. Resolving them needs the per-test include set, i.e. real
+  **separate-compilation** wiring, not a typer edit.
+- **test-local `.ml` siblings** — `Store`, `Waitgroup`, `M`/`A`/`B`, `User`,
+  `Key`, `Callbacks`, `Plugin_*` …: modules defined in *other files* of a
+  multi-file test. Fundamentally need sibling compilation.
+
+**Negative result — do NOT retry without the inference core.** The one purely
+internal sub-case (local-open `Bigarray.(Array1.init ..)` / `Scanf.(Scanning..)`
+not registering the opened module's submodules for reroute, unlike top-level
+`open`) *looked* safe. Wiring it (mirror the structure-level `load_open_type_quals`
+/ `open_module_ctors` into the `Pexp_struct_item`+`Pstr_open` branch, scoped with
+snapshot/restore) resolved the minimal repros but **regressed reject-parity 1 → 5**:
+`lib-seq/test.ml` is a genuine **unify clash** (real `Seq` ctor types conflict
+where `any()` absorbed — the load-bearing wall, unfixable without full HM ctor
+inference), and `fuzzy.ml` / `inline_traversal_test.ml` / `marshal_bigarray.ml`
+threw **"Unbound module"** in the *strict* pass (the submodule reroute at
+`~1177` fires in the display pass but not strict). Reverted. Confirms empirically
+what the table's "High risk" note asserted: **bucket A cannot be dented by a
+typer edit** — it is blocked on separate-compilation infrastructure, so it should
+be de-prioritized behind the HM-value-inference buckets (B/C/H/I) despite being
+"unblocked" by P1–P3 on paper.
+
 ## What the buckets add up to
 
 23 sites collapse into ~9 features across three bodies of work already on the roadmap:
@@ -76,15 +137,55 @@ the catch-all and J (engine, last).
 The engine mechanism (**J**) is deletable only once all 23 call sites are gone;
 removing it earlier just relocates the fallbacks.
 
-## Suggested order (respects dependencies)
+## Execution plan (dependency order, refreshed 2026-07-06)
 
-1. **G — format strings.** Independent of everything above, low risk, already on
-   the accept-parity list (~5 files). The cheapest real dent; doesn't wait on P1–P3.
-2. **P1–P3 Module System** → clears **A**, enables **F**.
-3. **HM value inference** → clears **B, C, H, I**; re-validate each guard.
-4. **Hard cores** → **D** (object rows), then **E** (conjunctive variants; needs
-   presence/conjunction vars — a naive row is unsound).
-5. **J** — delete `any()` and the absorb branch. `Any` is gone.
+State: **9 sites left** in `infer_check.cpp` (re-grep: `grep -cE '\bany\(\)'`).
+G/H/I and part of D closed in the 2026-07-03 sweep; **B + C closed in the
+2026-07-06 sweep** (see Progress above). Module System P1–P3 is done, but the
+2026-07-06 sizing (below) shows **A/F are NOT typer-dentable** — they are blocked
+on separate-compilation infrastructure (per-test `-I` include context +
+sibling-`.ml` compilation), not on more inference. So despite being "unblocked"
+by P1–P3 on paper, **A and F are deprioritized**. With B/C done, the remaining
+typer-dentable work is the **two hard row-type cores (D, then E)**.
+
+Live site lines (2026-07-06, post-B/C): A = `1186`/`1191`/`1193`; F = `4956`;
+D = `4969` (new) / `5306` (send) / `5329` (object); E = `5319`; J catch-all =
+`5331`. Re-grep before editing.
+
+Tracked as tasks #1–#6:
+
+1. **[#3] B + C — records/fields + unqualified ctors** — ✅ **DONE 2026-07-06**
+   (14 → 9). Five fresh-var flips, all gates identical. No further B/C sites.
+2. **[#1] A — module-path resolution** (×3, `1186`/`1191`/`1193`). **DEFERRED —
+   blocked on separate-compilation, not inference** (see the 2026-07-06 negative
+   result). Do NOT attempt as a typer edit: real types here false-reject
+   (`lib-seq` unify clash). Revisit only once sibling-`.ml` / `-I` include
+   loading exists.
+3. **[#2] F — first-class modules** (×1, `4956`). Deferred with A (same
+   separate-compilation dependency for a pack's signature).
+4. **[#4] D — object rows** (×3, `4969`/`5306`/`5329`). **NEXT typer-dentable
+   frontier.** Hard core: real self/instance-var row model + subtyping in the
+   strict pass.
+5. **[#5] E — conjunctive polymorphic-variant rows** (×1, `5319`). Hard core and
+   the **known-unsound trap** — the naive row was reverted; needs presence/
+   conjunction vars. Blocked by #4.
+6. **[#6] J — delete the engine mechanism** (`any()` singleton + `infer.cpp`
+   absorb branch) and the catch-all (`5331`). **Last** — deletable only when the
+   count hits 0. (The catch-all flip to fresh var held all gates on the corpus
+   but was reverted on purpose — it must stay the absorbing "unhandled" net until
+   every form is typed.) Also fix the `.cmi` bridge (`K::Any → cmiw::ty_var`) to
+   emit real types. Blocked by #1–#5.
+
+### How progress is measured (every removal)
+
+Work counter (down): `grep -cE '\bany\(\)' cxx/src/infer_check.cpp` — 9 → 0.
+Gates that must stay flat, compared as **file SETS** not totals:
+`reject_parity.sh` 744/744 (0.0%), `sig_parity.sh` 525/525,
+`typedtree_parity.sh` 745/745, 0 crashes/1853, `lambda_parity.sh` DIFF set.
+The metric that should improve: `accept_parity.sh` (36 false-accepts → fewer).
+Per-site loop: snapshot failing sets → flip one site → rebuild → run the five
+gates → confirm sets identical + note any accept shrink → decrement this doc →
+commit.
 
 ## Guardrails
 
