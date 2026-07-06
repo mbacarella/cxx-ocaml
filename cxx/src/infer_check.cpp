@@ -5319,12 +5319,11 @@ struct Checker {
       return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)});
     }
     if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
-      // Non-strict passes type the method bodies and build the object type
+      // All passes type the method bodies and build the object type
       // `< m : t; .. >` (the signature pass renders it; the value-kind pass needs
-      // the bodies for kinds/format literals).  The strict pass stays dynamic --
-      // its self/instance-var model is incomplete (avoid false-rejects).
-      if (!strict) return infer_object_body(*ob->cs);
-      return eng.any();
+      // the bodies for kinds/format literals; strict checks the bodies -- the
+      // same routine already runs in strict for class declarations).
+      return infer_object_body(*ob->cs);
     }
     return eng.any();  // records/fields/objects/etc. unhandled: dynamic, no clash
   }
