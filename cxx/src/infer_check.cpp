@@ -2915,10 +2915,46 @@ struct Checker {
   TypePtr qualified_ctor_scheme(const Longident& id) {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return nullptr;
-    auto* pl = std::get_if<Lident>(&d->prefix->v);
-    if (!pl) return nullptr;
+    auto comps = mod_components(*d->prefix);
+    if (comps.empty()) return nullptr;
+    // The head may be an OPENED submodule (`open Runtime_events` then
+    // `Type.Begin` -> Runtime_events.Type) or a file-local alias.
+    if (auto q = opened_submod_quals_.find(comps[0]);
+        q != opened_submod_quals_.end()) {
+      std::vector<std::string> qc = mod_components_str(q->second);
+      qc.insert(qc.end(), comps.begin() + 1, comps.end());
+      comps = std::move(qc);
+    } else
+      for (auto& [tgt, al] : module_aliases_)
+        if (al == comps[0]) {
+          std::vector<std::string> tc = mod_components_str(tgt);
+          tc.insert(tc.end(), comps.begin() + 1, comps.end());
+          comps = std::move(tc);
+          break;
+        }
     try {
-      auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      // Parent scopes: a ctor-arg type owned by an enclosing module qualifies
+      // to its own module, as in resolve_module_values.
+      std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> scopes;
+      std::vector<std::pair<const std::vector<cmi::ModuleDecl>*, std::string>> mscopes;
+      scopes.push_back({&sig->types, comps[0]});
+      mscopes.push_back({&sig->modules, comps[0]});
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+        if (sig) {
+          scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
+          mscopes.push_back({&sig->modules, mscopes.back().second + "." + comps[i]});
+        }
+      }
+      if (!sig) return nullptr;
+      std::string pfx;
+      for (auto& cmp : comps) { if (!pfx.empty()) pfx += '.'; pfx += cmp; }
       // A ctor ARGUMENT that names a same-module type (`Cons of 'a * 'a t` in Seq)
       // must qualify to that module (`'a Seq.t`), matching ocamlc's per-occurrence
       // path -- but WITHOUT expanding the abbreviation (`t` stays `Seq.t`, not
@@ -2927,15 +2963,19 @@ struct Checker {
       auto* saved_ctx = cmi_types_ctx_;
       std::string saved_pfx = cmi_mod_prefix_;
       bool saved_fold = fold_abbrevs_;
-      cmi_types_ctx_ = &cmi.types();
-      cmi_mod_prefix_ = pl->name;
+      auto saved_scopes = cmi_scopes_;
+      auto saved_mscopes = cmi_mod_scopes_;
+      cmi_types_ctx_ = &sig->types;
+      cmi_mod_prefix_ = pfx;
+      cmi_scopes_ = scopes;
+      cmi_mod_scopes_ = mscopes;
       // Folded abbreviations are for DISPLAY (lenient unify swallows the
       // fold-vs-expansion contact); strict unify has no abbrev expansion, so a
       // folded `Seq.t` in the scheme would clash with its own expansion
       // (iterators.ml's `fun () -> Seq.Cons(..)` vs `int Seq.t`).  Expand there.
       fold_abbrevs_ = !strict;
       TypePtr scheme = nullptr;
-      for (auto& td : cmi.types()) {
+      for (auto& td : sig->types) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors) {
           if (c.name != d->name || c.is_inline_record) continue;
@@ -2947,7 +2987,7 @@ struct Checker {
             params.push_back(v);
           }
           TypePtr result = c.res ? from_cmi(c.res, memo)
-                                 : eng.constr(pl->name + "." + td.name, params);
+                                 : eng.constr(pfx + "." + td.name, params);
           scheme = result;
           for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
             scheme = eng.arrow(from_cmi(*it, memo), scheme);
@@ -2959,7 +2999,7 @@ struct Checker {
       // (Dynlink.Error, whose bare name would otherwise hit result's Error):
       // args -> the extended type (exn for exceptions).
       if (!scheme)
-        for (auto& x : cmi.sig().typexts) {
+        for (auto& x : sig->typexts) {
           if (x.name != d->name || x.is_inline_record) continue;
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
           TypePtr result;
@@ -2967,7 +3007,7 @@ struct Checker {
           else {
             std::string tp = x.type_path ? cmi_path_str(*x.type_path) : "exn";
             result = eng.constr(tp == "exn" || tp.find('.') != std::string::npos
-                                    ? tp : pl->name + "." + tp);
+                                    ? tp : pfx + "." + tp);
           }
           scheme = result;
           for (auto it = x.args.rbegin(); it != x.args.rend(); ++it)
@@ -2976,9 +3016,14 @@ struct Checker {
         }
       cmi_types_ctx_ = saved_ctx;
       cmi_mod_prefix_ = saved_pfx;
+      cmi_scopes_ = std::move(saved_scopes);
+      cmi_mod_scopes_ = std::move(saved_mscopes);
       fold_abbrevs_ = saved_fold;
       return scheme;
-    } catch (...) {}
+    } catch (...) {
+      cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
+      cmi_scopes_.clear(); cmi_mod_scopes_.clear();
+    }
     return nullptr;
   }
 
