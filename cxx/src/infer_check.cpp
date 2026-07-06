@@ -5602,8 +5602,20 @@ struct Checker {
             local_module_structs_[*lm->binding.name.txt] = &ms->items;
         }
       }
+      // A `let open M in e` is scoped to `e`, but process_item mutates the
+      // file-wide display-qualification maps (bare `t` -> M.t) in place.  Save
+      // and restore them across a scoped open so the open does not leak past `e`
+      // -- otherwise `let open Printexc` (after `open Effect`) rewrites the
+      // earlier `type _ t += ..`'s `t` to Printexc.t at the later emission phase.
+      bool scoped_open = std::holds_alternative<Pstr_open>(sti->item->desc);
+      auto saved_type_quals = opened_type_quals_;
+      auto saved_submod_quals = opened_submod_quals_;
       process_item(*sti->item);
       TypePtr bt = infer_expr(*sti->body);
+      if (scoped_open) {
+        opened_type_quals_ = std::move(saved_type_quals);
+        opened_submod_quals_ = std::move(saved_submod_quals);
+      }
       cenv.pop_back();
       venv.pop_back();
       return bt;
