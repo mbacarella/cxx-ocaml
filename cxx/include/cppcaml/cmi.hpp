@@ -328,6 +328,20 @@ struct SigItem {
   // Module: rec_status (0 Trec_not / 1 Trec_first / 2 Trec_next) -- a
   // `module rec A .. and B ..` group prints as such only when marked.
   int rec_status = 0;
+  // Functor: curried parameters AFTER the first (`(X : S) (Y : T) -> ..`), in
+  // source order.  Parallel arrays (a nested param struct can't hold a vector
+  // of the still-incomplete SigItem by name).
+  std::vector<std::string> more_param_names;
+  std::vector<std::vector<SigItem>> more_param_sigs;
+  std::vector<char> more_param_units;
+  // Functor: a parameter whose source modtype is a NAMED reference
+  // (`(K : Key)`) emits Mty_ident(Key), not the inlined signature -- ocamlc
+  // stores (and prints) the name.  Empty = inline param_sig.
+  std::string functor_param_ref;
+  std::vector<std::string> more_param_refs;
+  // Module: `module MD5 : S` -- the decl's modtype is the NAMED reference S
+  // (Mty_ident), not S's expansion.  Empty = Mty_signature(sub).
+  std::string modtype_ref;
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
                                   std::vector<SigItem> param_sig,

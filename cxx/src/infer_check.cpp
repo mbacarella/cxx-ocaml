@@ -9330,7 +9330,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           // `module Make (Ord : _) : S with ...` (Map/Set/Hashtbl): emit a functor
           // module so Make takes a field and Make(Arg).x resolves via S's layout.
           // Peel curried params; the result body is the innermost non-functor mt.
-          std::string param;
+          std::string param, param_ref;
           std::vector<cmi::cmiw::SigItem> param_sig;
           if (auto* fn = std::get_if<Functor_named>(&pf->param)) {
             if (fn->name.txt) param = *fn->name.txt;
@@ -9344,25 +9344,64 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
               else  // a QUALIFIED parameter modtype (`MakeEngineTable (T :
                     // TableFormat.TABLES)`): resolve it so the ARGUMENT is projected.
                 param_sig = qual_modtype_items(*fn->type);
+              // A NAMED param modtype (`(Ord : OrderedType)`) is stored by
+              // ocamlc as Mty_ident; the resolved sig stays the fallback.
+              if (auto* pid = std::get_if<Pmty_ident>(&fn->type->desc))
+                param_ref = lid_full(pid->id.txt);
             }
           }
+          // Peel the curried parameter chain, KEEPING each inner parameter
+          // (`(Cfg : ..) (K : Key) -> ..`); the result body is the innermost
+          // non-functor mt.
+          struct P { std::string name, ref; std::vector<cmi::cmiw::SigItem> sig; bool unit = false; };
+          std::vector<P> more;
           const ast::ModuleType* body = pf->body.get();
-          while (auto* pf2 = std::get_if<Pmty_functor>(&body->desc)) body = pf2->body.get();
+          while (auto* pf2 = std::get_if<Pmty_functor>(&body->desc)) {
+            P p;
+            p.unit = std::holds_alternative<Functor_unit>(pf2->param);
+            if (auto* fn2 = std::get_if<Functor_named>(&pf2->param)) {
+              if (fn2->name.txt) p.name = *fn2->name.txt;
+              if (fn2->type) {
+                if (const ast::Signature* psg2 = body_sig(*fn2->type))
+                  p.sig = signature_to_cmi(*psg2, &modtypes, &module_sigs);
+                else
+                  p.sig = qual_modtype_items(*fn2->type);
+                if (auto* pid2 = std::get_if<Pmty_ident>(&fn2->type->desc))
+                  p.ref = lid_full(pid2->id.txt);
+              }
+            }
+            more.push_back(std::move(p));
+            body = pf2->body.get();
+          }
           std::vector<cmi::cmiw::SigItem> result;
           if (const ast::Signature* rs = body_sig(*body))
             result = signature_to_cmi(*rs, &modtypes, &module_sigs);
           else  // a QUALIFIED result modtype (`MakeEngineTable (..) : EngineTypes.TABLE
                 // with ..`): resolve it through the local/cross-module signature.
             result = qual_modtype_items(*body);
-          out.push_back(cmi::cmiw::sig_module_functor(*pm->md.name.txt, param,
-                          std::move(param_sig), std::move(result)));
+          auto fitem = cmi::cmiw::sig_module_functor(*pm->md.name.txt, param,
+                          std::move(param_sig), std::move(result));
+          fitem.functor_unit = std::holds_alternative<Functor_unit>(pf->param);
+          fitem.functor_param_ref = std::move(param_ref);
+          for (auto& p : more) {
+            fitem.more_param_names.push_back(std::move(p.name));
+            fitem.more_param_sigs.push_back(std::move(p.sig));
+            fitem.more_param_units.push_back(p.unit ? 1 : 0);
+            fitem.more_param_refs.push_back(std::move(p.ref));
+          }
+          out.push_back(std::move(fitem));
         } else if (const ast::Signature* bs = body_sig(*pm->md.type)) {
           // `module MD5 : S` (a NAMED module type) or `S with ...`: emit the
           // submodule with S's resolved signature inline, so a consumer can
           // resolve `Digest.MD5.bytes` to its field (else the module is dropped).
           auto items = signature_to_cmi(*bs, &modtypes, &module_sigs);
           drop_modsubst(items, with_modsubst_names(*pm->md.type));
-          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items)));
+          auto mitem = cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items));
+          // A plain NAMED modtype (`module MD5 : S`, no `with`) is stored by
+          // ocamlc as Mty_ident(S); the resolved sig stays the fallback.
+          if (auto* pid = std::get_if<Pmty_ident>(&pm->md.type->desc))
+            mitem.modtype_ref = lid_full(pid->id.txt);
+          out.push_back(std::move(mitem));
         } else if (auto items = qual_modtype_items(*pm->md.type); !items.empty()) {
           // `module Set : Set.S with ..` (a qualified functor-result module type).
           drop_modsubst(items, with_modsubst_names(*pm->md.type));
@@ -9491,32 +9530,62 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     return std::nullopt;
   }
   if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
-    if (mc->mt)
+    if (mc->mt) {
       if (auto* ps = std::get_if<Pmty_signature>(&mc->mt->desc))
         return cmi::cmiw::sig_module(name, signature_to_cmi(ps->items));
+      if (auto* pid = std::get_if<Pmty_ident>(&mc->mt->desc)) {
+        // `module M : S = struct .. end`: ocamlc records Mty_ident(S); the
+        // inferred structure stays the fallback layout.
+        auto inner = module_binding_sigitem(name, *mc->me);
+        if (!inner) inner = cmi::cmiw::sig_module(name, {});
+        if (inner->k == cmi::cmiw::SigItem::Module && !inner->is_functor &&
+            inner->alias.empty())
+          inner->modtype_ref = lid_full(pid->id.txt);
+        return inner;
+      }
+    }
     return module_binding_sigitem(name, *mc->me);
   }
-  if (auto* mf = std::get_if<Pmod_functor>(&me.desc)) {
-    std::string pname;
-    std::vector<cmi::cmiw::SigItem> psig;
-    if (auto* fn = std::get_if<Functor_named>(&mf->param)) {
-      if (fn->name.txt) pname = *fn->name.txt;
-      if (fn->type)
-        if (auto* ps = std::get_if<Pmty_signature>(&fn->type->desc))
-          psig = signature_to_cmi(ps->items);
+  if (std::holds_alternative<Pmod_functor>(me.desc)) {
+    // Collect the whole CURRIED parameter chain (`(X : S) (Y : T) -> ..` --
+    // each parameter after the first lives in a nested Pmod_functor body).
+    struct P { std::string name, ref; std::vector<cmi::cmiw::SigItem> sig; bool unit = false; };
+    std::vector<P> ps;
+    const ast::ModuleExpr* cur = &me;
+    while (auto* f = std::get_if<Pmod_functor>(&cur->desc)) {
+      P p;
+      p.unit = std::holds_alternative<Functor_unit>(f->param);  // generative `()`
+      if (auto* fn = std::get_if<Functor_named>(&f->param)) {
+        if (fn->name.txt) p.name = *fn->name.txt;
+        if (fn->type) {
+          if (auto* psg = std::get_if<Pmty_signature>(&fn->type->desc))
+            p.sig = signature_to_cmi(psg->items);
+          if (auto* pid = std::get_if<Pmty_ident>(&fn->type->desc))
+            p.ref = lid_full(pid->id.txt);
+        }
+      }
+      ps.push_back(std::move(p));
+      cur = f->body.get();
     }
     std::vector<cmi::cmiw::SigItem> result;
-    if (auto* bs = std::get_if<Pmod_structure>(&mf->body->desc))
+    if (auto* bs = std::get_if<Pmod_structure>(&cur->desc))
       result = infer_signature(bs->items);
-    else if (auto* bc = std::get_if<Pmod_constraint>(&mf->body->desc)) {
+    else if (auto* bc = std::get_if<Pmod_constraint>(&cur->desc)) {
       if (bc->mt)
-        if (auto* ps = std::get_if<Pmty_signature>(&bc->mt->desc))
-          result = signature_to_cmi(ps->items);
+        if (auto* psg = std::get_if<Pmty_signature>(&bc->mt->desc))
+          result = signature_to_cmi(psg->items);
     }
-    auto item = cmi::cmiw::sig_module_functor(name, pname, std::move(psig),
+    auto item = cmi::cmiw::sig_module_functor(name, ps[0].name,
+                                              std::move(ps[0].sig),
                                               std::move(result));
-    // `module F () -> ..`: the parameter is Unit (generative), printed `()`.
-    item.functor_unit = std::holds_alternative<Functor_unit>(mf->param);
+    item.functor_unit = ps[0].unit;
+    item.functor_param_ref = std::move(ps[0].ref);
+    for (std::size_t i = 1; i < ps.size(); ++i) {
+      item.more_param_names.push_back(std::move(ps[i].name));
+      item.more_param_sigs.push_back(std::move(ps[i].sig));
+      item.more_param_units.push_back(ps[i].unit ? 1 : 0);
+      item.more_param_refs.push_back(std::move(ps[i].ref));
+    }
     return item;
   }
   return std::nullopt;
