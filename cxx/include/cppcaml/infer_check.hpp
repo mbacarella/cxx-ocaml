@@ -55,6 +55,12 @@ struct DumpAux {
   // Construct nodes (Pexp_construct / Ppat_construct) whose argument tuple the
   // dump flattens because the resolved constructor has arity>1 (incl. cmi ctors).
   std::unordered_set<const void*> flatten_construct;
+  // `C _` pattern nodes where C resolved to arity N>1 (incl. cmi ctors): the
+  // lone `_` fills every slot (N Tpat_any) in the dump.
+  std::unordered_map<const void*, int> construct_any_arity;
+  // `_ M.t` core-type nodes where M.t is a cmi type of arity N>1: the lone `_`
+  // fills every parameter slot (N Ttyp_any) in the dump.
+  std::unordered_map<const void*, int> type_any_arity;
   // Functional record-update nodes whose base is an EXTERNAL record type -> its
   // full ordered field list (for the dump's <kept> fields).
   std::unordered_map<const ast::Expression*, std::vector<std::string>> record_fields;

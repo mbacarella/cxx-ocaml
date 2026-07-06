@@ -414,6 +414,8 @@ struct Checker {
   // and is applied to a matching tuple -> the dump flattens the tuple into the
   // constructor's arguments.  Covers cmi constructors the transcriber can't see.
   std::unordered_set<const void*> flatten_construct;
+  std::unordered_map<const void*, int> construct_any_arity;  // `C _`, C arity N>1
+  std::unordered_map<const void*, int> type_any_arity;       // `_ M.t`, t arity N>1
   // Functional record-update nodes (`{ ext_record with .. }`) whose base resolves
   // to an EXTERNAL record type -> its full ordered field list, so the dump can
   // emit the omitted fields as <kept> (the transcriber's registry has only local
@@ -909,6 +911,15 @@ struct Checker {
         std::vector<TypePtr> fa;
         for (auto& a : c->args) fa.push_back(from_coretype(*a, vars));
         return eng.constr("format6", std::move(fa));
+      }
+      // `_ M.t` where M.t is a cmi type of arity N>1: record N so the dump can
+      // fill every parameter slot with Ttyp_any (the local type_arity_ registry
+      // in the transcriber only covers file-local declarations).
+      if (c->args.size() == 1 &&
+          std::holds_alternative<Ptyp_any>(c->args[0]->desc) &&
+          std::holds_alternative<Ldot>(c->id.txt.v)) {
+        int ar = qualified_type_arity(c->id.txt);
+        if (ar > 1) type_any_arity[&t] = ar;
       }
       std::vector<TypePtr> as;
       for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
@@ -2712,6 +2723,42 @@ struct Checker {
         for (auto& c : td.ctors)
           if (c.name == d->name) return (int)c.args.size();
       }
+      // Module-level extension ctors (`exception Unix_error of error * string
+      // * string`) flatten by the same rule as variant ctors.
+      for (auto& x : cmi.sig().typexts)
+        if (x.name == d->name) return (int)x.args.size();
+    } catch (...) {}
+    return 0;
+  }
+
+  // The parameter count of a qualified type `M.t` (M possibly deep, possibly a
+  // file-local alias of an external path like `module MP = Gc.Memprof`), read
+  // by navigating the cmis.  0 when unresolvable.
+  int qualified_type_arity(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return 0;
+    auto comps = mod_components(*d->prefix);
+    if (comps.empty()) return 0;
+    for (auto& [tgt, al] : module_aliases_)
+      if (al == comps[0]) {
+        std::vector<std::string> tc = mod_components_str(tgt);
+        tc.insert(tc.end(), comps.begin() + 1, comps.end());
+        comps = std::move(tc);
+        break;
+      }
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == d->name) return (int)td.params.size();
     } catch (...) {}
     return 0;
   }
@@ -2894,6 +2941,25 @@ struct Checker {
           eng.generalize(scheme);
           cenv.back()[c.name] = scheme;
         }
+      }
+      // Module-level EXTENSION ctors (`exception Unix_error of error * string
+      // * string`): register like variant ctors, so a bare `Unix_error (e,_,_)`
+      // after `open Unix` resolves with its real arity (and flattens).
+      for (auto& x : cmi.sig().typexts) {
+        if (x.is_inline_record) continue;
+        std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+        TypePtr result;
+        if (x.res) result = from_cmi(x.res, memo);
+        else {
+          std::string tp = x.type_path ? cmi_path_str(*x.type_path) : "exn";
+          result = eng.constr(tp == "exn" || tp.find('.') != std::string::npos
+                                  ? tp : pl->name + "." + tp);
+        }
+        TypePtr scheme = result;
+        for (auto it = x.args.rbegin(); it != x.args.rend(); ++it)
+          scheme = eng.arrow(from_cmi(*it, memo), scheme);
+        eng.generalize(scheme);
+        cenv.back()[x.name] = scheme;
       }
       cmi_types_ctx_ = saved_ctx;
       cmi_mod_prefix_ = saved_pfx;
@@ -4186,6 +4252,10 @@ struct Checker {
         if (auto* tup = k->arg ? std::get_if<Ppat_tuple>(&(*k->arg)->desc) : nullptr) {
           int ar = qualified_ctor_arity(k->id.txt);
           if (ar > 1 && (size_t)ar == tup->elems.size()) flatten_construct.insert(&p);
+        } else if (k->arg && std::holds_alternative<Ppat_any>((*k->arg)->desc)) {
+          // `M.C _`: the lone `_` fills every arity slot in the dump.
+          int ar = qualified_ctor_arity(k->id.txt);
+          if (ar > 1) construct_any_arity[&p] = ar;
         }
         // The qualified ctor's scheme pins the pattern: `Either.Left s` binds
         // s:'a and types the scrutinee `('a, 'b) Either.t`.
@@ -4220,6 +4290,11 @@ struct Checker {
           flatten_construct.insert(&p);
           for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_pat(*tup->elems[i]));
         } else if (!ps.empty()) {
+          // `C _`: the lone `_` fills every arity slot in the dump (the local
+          // ctor_arity_ registry covers local decls; this covers cmi ctors
+          // brought into bare scope by an open).
+          if (ps.size() > 1 && std::holds_alternative<Ppat_any>((*k->arg)->desc))
+            construct_any_arity[&p] = (int)ps.size();
           try_unify(ps[0], infer_pat(**k->arg));
         } else {
           infer_pat(**k->arg);
@@ -4351,10 +4426,13 @@ struct Checker {
     }
     if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
       venv.emplace_back();
+      cenv.emplace_back();  // M.(C ..): M's ctors resolve bare inside the pattern
       open_into(op->mod_.txt);
+      if (!strict) open_module_ctors(op->mod_.txt);
       std::set<std::string> opened;  // names introduced by the open, not by the pat
       for (auto& [k, v] : venv.back()) opened.insert(k);
       TypePtr t = infer_pat(*op->p);
+      cenv.pop_back();
       auto inner = std::move(venv.back());
       venv.pop_back();
       // hoist only the pattern's own bound vars; the opened names stay scoped out
@@ -7436,6 +7514,8 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
   out.param_partial = std::move(ck.param_partial);
   out.apply_plans = std::move(ck.apply_plans);
   out.flatten_construct = std::move(ck.flatten_construct);
+  out.construct_any_arity = std::move(ck.construct_any_arity);
+  out.type_any_arity = std::move(ck.type_any_arity);
   out.record_fields = std::move(ck.record_fields);
   out.record_reprs = std::move(ck.record_reprs);
   out.format_lits = std::move(ck.fmt_lits_);

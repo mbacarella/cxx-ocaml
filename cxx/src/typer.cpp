@@ -648,6 +648,10 @@ struct Typer {
   // Construct nodes whose argument tuple flattens (resolved arity>1, incl. cmi
   // constructors that the local ctor_arity_ registry can't see).
   const std::unordered_set<const void*>* flatten_construct = nullptr;
+  // `C _` pattern nodes where C resolved to arity N>1 (incl. cmi ctors).
+  const std::unordered_map<const void*, int>* construct_any_arity = nullptr;
+  // `_ M.t` core-type nodes where M.t is a cmi type of arity N>1.
+  const std::unordered_map<const void*, int>* type_any_arity = nullptr;
   // Functional record-update nodes -> the EXTERNAL record type's ordered field
   // list (for <kept> fields; local records use field_registry).
   const std::unordered_map<const ast::Expression*, std::vector<std::string>>*
@@ -1589,6 +1593,10 @@ struct Typer {
           std::holds_alternative<Ptyp_any>(c->args[0]->desc)) {
         auto ar = type_arity_.find(lid_last(c->id.txt));
         if (ar != type_arity_.end() && ar->second != 1) expand = ar->second;
+        // The inference side-table covers cmi types the local registry can't see.
+        else if (type_any_arity)
+          if (auto f = type_any_arity->find(&t); f != type_any_arity->end())
+            expand = f->second;
       }
       if (expand)
         for (int k = 0; k < expand; ++k)
@@ -2144,6 +2152,10 @@ struct Typer {
         auto ar = ctor_arity_.find(dot == std::string::npos ? tc.name
                                                             : tc.name.substr(dot + 1));
         int arity = ar != ctor_arity_.end() ? ar->second : 0;
+        // The inference side-table covers cmi ctors the local registry can't see.
+        if (!arity && construct_any_arity)
+          if (auto f = construct_any_arity->find(&p); f != construct_any_arity->end())
+            arity = f->second;
         if (plain && flattens(tc.name, tup->elems.size(), &p)) {
           for (auto& el : tup->elems)
             tc.args.push_back(std::make_unique<tt::Pattern>(pattern(*el)));
@@ -4564,6 +4576,8 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   t.param_partial = &aux.param_partial;
   t.apply_plans = &aux.apply_plans;
   t.flatten_construct = &aux.flatten_construct;
+  t.construct_any_arity = &aux.construct_any_arity;
+  t.type_any_arity = &aux.type_any_arity;
   t.record_fields = &aux.record_fields;
   t.record_reprs = &aux.record_reprs;
   t.format_lits = &aux.format_lits;
