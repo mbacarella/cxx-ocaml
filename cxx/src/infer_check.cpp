@@ -1202,14 +1202,25 @@ struct Checker {
         // its cmi signature walks cleanly, the member is genuinely absent.
         else if (strict && cmi_path_sig_resolves(*d->prefix))
           note_error("Unbound value " + lid_full(lid));
-        return eng.any();   // else stay dynamic (a module we just can't load)
+        if (std::getenv("ANY_A_DBG"))
+          fprintf(stderr, "ANY_A site1 %s\n", lid_full(lid).c_str());
+        // Each occurrence minted fresh: an unresolvable module member only
+        // clashes when a SINGLE occurrence meets incompatible contexts (a
+        // genuine error).  The remaining population here is local module
+        // machinery (functor-param submodules, recursive modules, unpacks);
+        // the separate-compilation population resolves via the sibling cmis.
+        return eng.fresh_var();
       }
       if (auto f = ex.find(d->name); f != ex.end())
         return eng.instantiate(f->second);  // present: use its real type
       if (strict) note_error("Unbound value " + lid_full(lid));  // genuinely absent
-      return eng.any();
+      if (std::getenv("ANY_A_DBG"))
+        fprintf(stderr, "ANY_A site2 %s\n", lid_full(lid).c_str());
+      return eng.fresh_var();
     }
-    return eng.any();
+    if (std::getenv("ANY_A_DBG"))
+      fprintf(stderr, "ANY_A site3 %s\n", lid_full(lid).c_str());
+    return eng.fresh_var();  // Lapply value path (0 corpus hits)
   }
 
   // Whether a stdlib (sub)module's cmi is loadable (cached): the head module of a
