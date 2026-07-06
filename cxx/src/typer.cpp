@@ -1663,8 +1663,13 @@ struct Typer {
       out.args = ctor_args(c.args);
     }
     if (c.res) out.res = std::make_unique<tt::CoreType>(core_type(**c.res));
+    // Record THIS declaration's arity, overwriting any earlier same-named ctor
+    // (a later type shadows for bare-name resolution, as the inference `ctors`
+    // map already does).  Must overwrite even with a lower arity: `B of (int *
+    // int)` (arity 1, a single tuple arg) after `B of int * int` (arity 2) must
+    // reset B to 1, else `B (_, x)` is wrongly flattened / `D _` over-expanded.
     if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
-      if (t->elems.size() > 1) ctor_arity_[c.name.txt] = (int)t->elems.size();
+      ctor_arity_[c.name.txt] = (int)t->elems.size();
     if (!c.attrs.empty()) out.attrs = &c.attrs;
     return out;
   }
