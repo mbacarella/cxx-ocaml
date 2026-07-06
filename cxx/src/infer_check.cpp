@@ -4264,7 +4264,7 @@ struct Checker {
         try_unify(infer_pat(*sub), s->cod);
         if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
       }
-      return recTy ? recTy : eng.any();
+      return recTy ? recTy : eng.fresh_var();  // P4-B: no field resolved -> fresh var
     }
     if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
       // `[| x; y |]` matches `'a array`, all elements sharing the element type.
