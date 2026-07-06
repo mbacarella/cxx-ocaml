@@ -3666,3 +3666,45 @@ separate-compilation: per-test -I includes + sibling-.ml builds) and the J
 catch-all/engine (last).  No typer-dentable any() sites remain -- the next
 counter movement goes through the separate-compilation front (which is also
 the .cmi-emission goal's dependency).
+
+--------------------------------------------------------------------------------
+P4 bucket A, half one: otherlibs wiring -- typer corpus 745 -> 886, reject 1/886
+--------------------------------------------------------------------------------
+The A-sizing said the biggest population (Unix 1013 / Thread 392 / Dynlink 305
+/ Str 170 / Runtime_events 56 hits) needed "separate-compilation wiring".  It
+turned out to be an INCLUDE-PATH wiring problem, not an inference one: the
+oracle cache was built with bare `ocamlc -nostdlib -I stdlib`, so every
+lib-unix/lib-threads/... test was "oracle-rejected" and invisible to the typer
+gates -- and c++type had no otherlibs dirs either, so both sides agreed by
+mutual blindness.  Gave BOTH sides the same otherlibs -I set
+(typedtree_parity/ttp_one/sig_parity oracles + cpptype_main's default search
+dirs), regenerated the cache: 141 real lib tests entered the corpus.
+
+The migration exposed 9 genuine false-rejects; all fixed (477752df7b):
+- Dynlink.Error (8 files): the bare-name registry resolved the qualified
+  exception ctor to RESULT's Error.  qualified_ctor_scheme now also scans the
+  cmi's typexts (module-level extension ctors), and the
+  prefer-qualified-over-bare rule runs in strict.
+- iterators.ml (regression from the above): strict schemes must be built
+  EXPANDED (fold_abbrevs_ = !strict) -- folded `Seq.t` is display-only and
+  clashed with its own expansion under strict unify.
+- test_corrupted.ml: `Unix.LargeFile.((fstat fd).st_size)` typed int, not
+  int64 -- a local open never loaded the opened module's record fields, so
+  st_size stayed spuriously UNIQUE at the parent Unix.stats' int (and engine
+  unify links same-last-name constrs, hiding the mismatch).  Local opens now
+  load record fields like qualified uses do; the ambiguity forces the correct
+  type-directed resolution in every pass.
+Bonus find: stdlib/camlinternalOO.cmi was CLOBBERED (the in-place-compile
+gotcha; self-CRC e0357562 vs the eb791b7a that Oo.cmi/stdlib.cma expect) --
+restored from boot/camlinternalOO.cmi (byte-consistent imports), un-poisoning
+the oracle on Oo-touching files.
+
+Gates on the migrated corpus: reject 1/886 = 99.9% (the foo.ml artifact ONLY),
+accept 37 (the +1 is test_unixlabels, `module U : module type of Unix =
+UnixLabels` -- genuine Includemod hard core), sig 614/625 (98.2%; +100 judged,
+11 DIFF = new display work), typedtree 745 identical + DIFF 113 + err 28 over
+886 (the new files' dump parity = reopened track-2 frontier), lambda DIFF set
+file-identical (MATCH 412 -> 414).  gate_check.sh baselines updated.
+
+A's remaining half: test-local .ml SIBLING modules (Store, M/A/B, ...) need
+sibling compilation.  Then re-size the A sites and evaluate the flip.

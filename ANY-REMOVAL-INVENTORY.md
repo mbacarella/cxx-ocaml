@@ -39,6 +39,32 @@ value-representation class name + comments.)
 Line numbers are as of 2026-07-02 (branch `cpp-rewrite`); re-grep before editing:
 `grep -nE '\bany\(\)|Kind::Any' cxx/src/infer_check.cpp`.
 
+## Progress (2026-07-06 latest: bucket A's otherlibs population WIRED — corpus 745 → 886)
+
+No site-count change (A ×3 still `any()`), but the **separate-compilation
+blocker's biggest half fell**: the typer harness oracles + `c++type` now share
+the testsuite's otherlibs `-I` set (`unix`/`str`/`systhreads`/`runtime_events`/
+`dynlink`), so `Unix.*`/`Thread.*`/... resolve to REAL cmi types instead of
+falling into site `1186`. The oracle cache was regenerated with the same
+context: **141 lib-test files entered the typer corpus** (745 → 886
+oracle-typed). Migration exposed 9 real false-rejects, all fixed
+(`477752df7b`): qualified EXCEPTION ctors (`Dynlink.Error` hit result's
+`Error` via the bare-name registry — typext resolution added +
+prefer-qualified now runs in strict), strict schemes built expanded
+(folded `Seq.t` clashed with its own expansion), and local-open record-field
+loading (`Unix.LargeFile.(..).st_size` read the parent's `int`, not the
+submodule's `int64`). Also repaired a clobbered `stdlib/camlinternalOO.cmi`
+(from `boot/`) that was poisoning the oracle.
+
+New baselines: reject **1/886** (the foo.ml artifact only), accept 37
+(+`test_unixlabels`, a genuine Includemod hard case), sig 614/625, typedtree
+745 identical / **DIFF 113 / err 28** over 886 (the new files' dump-detail
+parity = the reopened track-2 frontier), lambda DIFF set unchanged.
+
+What's left of A: the **test-local `.ml` sibling population** (Store, M/A/B,
+Waitgroup, ...) needs sibling compilation; then re-size the three A sites
+(ANY_A_DBG recipe) and evaluate the flip.
+
 ## Progress (2026-07-06 later: 6 → 5 sites — bucket E site CLEARED)
 
 Commits `21efe918ea` + bonus. The known-unsound trap was dissected rather than
