@@ -326,6 +326,8 @@ struct Checker {
   // (true = a None for an erased optional, false = an eta-expansion parameter);
   // the Lambda back end builds `(let (arg = e) (function eta.. (apply arg ..)))`.
   std::unordered_map<const Expression*, std::vector<bool>> erasures_;
+  // As erasures_ but with each slot's label/name, for the dump's eta-expansion.
+  std::unordered_map<const Expression*, std::vector<EtaSlot>> eta_erasures_;
   // Local variant types whose constructors are all constant (nullary): these have
   // an immediate (int) runtime representation, so a value of such a type gets the
   // [int] value kind in the Lambda dump.
@@ -4027,8 +4029,9 @@ struct Checker {
     // with None for the omitted optional(s).  Recorded for the Lambda back end;
     // only in the value-kinds pass (the strict pass uses soft propagation, so the
     // un-erased type returned here never causes a false-rejection).
-    if (record_kinds_) {
+    if (record_kinds_ || record_fmt_lits_) {
       std::vector<bool> slots;
+      std::vector<EtaSlot> eslots;
       bool erased = false;
       TypePtr a = I::Engine::repr(t), ex = I::Engine::repr(expected);
       while (a->kind == I::Type::Kind::Arrow) {
@@ -4036,20 +4039,25 @@ struct Checker {
         if (a->arrow_label == 2 &&
             !(ex_arrow && ex->arrow_label == 2 && ex->arrow_lbl == a->arrow_lbl)) {
           slots.push_back(true);  // erase this optional -> None
+          eslots.push_back({true, a->arrow_label, a->arrow_lbl});
           erased = true;
           a = I::Engine::repr(a->cod);
           continue;
         }
         if (!ex_arrow) break;
         slots.push_back(false);  // a kept parameter -> eta param
+        eslots.push_back({false, a->arrow_label, a->arrow_lbl});
         a = I::Engine::repr(a->cod);
         ex = I::Engine::repr(ex->cod);
       }
       // Need at least one erased optional and at least one kept (eta) parameter:
       // a trailing-only optional with nothing after it isn't eta-expandable here.
-      if (erased)
-        for (bool none_slot : slots)
-          if (!none_slot) { erasures_[&e] = slots; break; }
+      bool has_kept = false;
+      for (bool none_slot : slots) if (!none_slot) has_kept = true;
+      if (erased && has_kept) {
+        if (record_kinds_) erasures_[&e] = std::move(slots);
+        if (record_fmt_lits_) eta_erasures_[&e] = std::move(eslots);
+      }
     }
     // SIGNATURE pass: the erasure also changes the value's TYPE at this use --
     // `bump @@ x` (bump : ?cap:int -> int -> int, %apply expects 'a -> 'b)
@@ -6804,6 +6812,7 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
   out.record_reprs = std::move(ck.record_reprs);
   out.format_lits = std::move(ck.fmt_lits_);
   out.iarray_lits = std::move(ck.iarray_lits_);
+  out.eta_erasures = std::move(ck.eta_erasures_);
   return out;
 }
 

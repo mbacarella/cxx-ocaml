@@ -647,6 +647,9 @@ struct Typer {
   // catches unqualified/open'd/let-bound formats the syntactic path can't).
   const std::set<const ast::Expression*>* format_lits = nullptr;
   const std::set<const ast::Expression*>* iarray_lits = nullptr;
+  const std::unordered_map<const ast::Expression*, std::vector<EtaSlot>>*
+      eta_erasures = nullptr;
+  std::set<const ast::Expression*> eta_active_;  // guards eta_expand recursion
   long long next_stamp = 274;  // arbitrary base; the harness normalizes stamps
   // Scope frames mapping value name -> local ident; innermost last.
   std::vector<std::unordered_map<std::string, tt::Ident>> scopes{{}};
@@ -2318,7 +2321,76 @@ struct Typer {
     return out;
   }
 
+  // `let arg = e in fun eta -> arg ?l:None eta` -- the eta-expansion OCaml applies
+  // when an argument of type `?l:.. -> ..` meets a non-optional arrow parameter.
+  tt::Expression eta_expand(const ast::Expression& e, tt::Expression inner,
+                            const std::vector<EtaSlot>& slots) {
+    int kept = 0;
+    for (auto& s : slots) if (!s.erased) kept++;
+    if (kept != 1) return inner;  // only the single-eta shape is reproduced
+    tt::Ident arg_id{"arg", next_stamp++, tt::Ident::Local};
+    tt::Ident eta_id{"eta", next_stamp++, tt::Ident::Local};
+    auto ident_expr = [&](const tt::Ident& id) {
+      auto x = std::make_unique<tt::Expression>();
+      x->loc = none_loc();
+      tt::Path p; p.v = tt::Pident{id};
+      x->desc = tt::Texp_ident{std::move(p)};
+      return x;
+    };
+    auto label_of = [](const EtaSlot& s) -> ArgLabel {
+      return s.label == 2 ? ArgLabel{Optional{s.name}}
+           : s.label == 1 ? ArgLabel{Labelled{s.name}} : ArgLabel{Nolabel{}};
+    };
+    tt::Texp_apply ap;
+    ap.fn = ident_expr(arg_id);
+    for (auto& s : slots) {
+      if (s.erased) {
+        auto none = std::make_unique<tt::Expression>();
+        none->loc = e.loc;  // the ghost None carries the argument-expression span
+        none->desc = tt::Texp_construct{"None", {}};
+        ap.args.emplace_back(label_of(s), std::move(none));
+      } else {
+        ap.args.emplace_back(label_of(s), ident_expr(eta_id));
+      }
+    }
+    auto applyexpr = std::make_unique<tt::Expression>();
+    applyexpr->loc = none_loc();
+    applyexpr->desc = std::move(ap);
+    tt::Case cs;
+    cs.lhs.loc = none_loc();
+    cs.lhs.desc = tt::Tpat_var{eta_id};
+    cs.rhs = std::move(applyexpr);
+    auto fn = std::make_unique<tt::Expression>();
+    fn->loc = none_loc();
+    tt::Texp_function tf;
+    tf.is_cases = true;
+    tf.cases_loc = none_loc();
+    tf.cases.push_back(std::move(cs));
+    fn->desc = std::move(tf);
+    tt::ValueBinding vb;
+    vb.pat.loc = none_loc();
+    vb.pat.desc = tt::Tpat_var{arg_id};
+    vb.expr = std::move(inner);
+    tt::Texp_let tl;
+    tl.rf = RecFlag::Nonrecursive;
+    tl.bindings.push_back(std::move(vb));
+    tl.body = std::move(fn);
+    tt::Expression out;
+    out.loc = e.loc;
+    out.desc = std::move(tl);
+    return out;
+  }
+
   tt::Expression expr(const Expression& e) {
+    if (eta_erasures && !eta_active_.count(&e)) {
+      auto it = eta_erasures->find(&e);
+      if (it != eta_erasures->end()) {
+        eta_active_.insert(&e);
+        tt::Expression inner = expr(e);
+        eta_active_.erase(&e);
+        return eta_expand(e, std::move(inner), it->second);
+      }
+    }
     tt::Expression out;
     out.loc = e.loc;
     out.attrs = &e.attrs;
@@ -2362,7 +2434,12 @@ struct Typer {
         auto& fexpr = rev == 1 ? a->args[1].second : a->args[0].second;
         auto& aexpr = rev == 1 ? a->args[0].second : a->args[1].second;
         tt::Texp_apply ap;
+        // The collapse itself defaults the function operand's skipped optionals
+        // (via the plan below), so it must NOT also be eta-expanded (`bump @@ x`
+        // -> `bump ?cap:None x`, not `(let arg=bump in fun eta->..) @@ x`).
+        eta_active_.insert(fexpr.get());
         ap.fn = std::make_unique<tt::Expression>(expr(*fexpr));
+        eta_active_.erase(fexpr.get());
         // The collapsed call `fn aexpr` may skip fn's leading optionals, which
         // OCaml fills with a ghost `None` (inference records this as the node's
         // apply_plan: `bump @@ x` -> `bump ?cap:None x`).
@@ -4414,6 +4491,7 @@ typedtree::Structure type_structure(const ast::Structure& s) {
   t.record_reprs = &aux.record_reprs;
   t.format_lits = &aux.format_lits;
   t.iarray_lits = &aux.iarray_lits;
+  t.eta_erasures = &aux.eta_erasures;
   typedtree::Structure out;
   for (auto& it : s) out.push_back(t.structure_item(it));
   return out;

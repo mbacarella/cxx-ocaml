@@ -40,6 +40,10 @@ std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
 // (callee-parameter order, omitted optionals filled with None, labelled args
 // reordered) -- present only when the call's args don't already match a plain
 // positional pass-through.
+// One parameter position of an optional-erasure eta-expansion (`?x:.. -> y -> ..`
+// used where `y -> ..` is expected): erased => filled with None, else an eta
+// parameter passed through.  `label` is 0/1/2 (Nolabel/Labelled/Optional).
+struct EtaSlot { bool erased; int label; std::string name; };
 struct DumpAux {
   std::unordered_map<const ast::Expression*, bool> match_partial;
   // Partiality of a bare `function .. | ..` (Tfunction_cases), keyed by the
@@ -66,6 +70,10 @@ struct DumpAux {
   // `array`): the dump prints them as `Texp_array Immutable`.  Type-directed --
   // `[||]` is polymorphic between array and iarray, resolved by expected type.
   std::set<const ast::Expression*> iarray_lits;
+  // Argument expressions of type `?l:.. -> ..` used where a NON-optional arrow is
+  // expected: OCaml eta-expands them (`let arg = e in fun eta -> arg ?l:None
+  // eta`).  The slot list drives the ghost desugaring in the dump.
+  std::unordered_map<const ast::Expression*, std::vector<EtaSlot>> eta_erasures;
 };
 DumpAux infer_dump_aux(const ast::Structure& s);
 
