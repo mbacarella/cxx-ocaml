@@ -3749,3 +3749,37 @@ mechanism before any code was touched.
 New gate_check baseline: typedtree 886/886 (100.0% over oracle-typed).  The
 lib-corpus frontier left: 11 sig DIFFs (display), then bucket A's second
 half (sibling-.ml compilation) for the any() counter.
+
+--------------------------------------------------------------------------------
+sig parity on the lib corpus: 614/11 -> 623/2 (five mechanisms, all probed)
+--------------------------------------------------------------------------------
+Commits 8b22e61dfe..HEAD.  Each fix pinned by oracle micro-tests before code:
+
+- while true do .. done takes the EXPECTED type (typecore special-cases the
+  Texp_construct "true" condition): fresh var, not unit.  beat/sockets/
+  torture ('-> 'a' never-returning thread loops).
+- Qualified field paths e.M[.P].label resolve authoritatively through the
+  WRITTEN path and PIN the base's record type: new qualified_field_scheme
+  (cmi navigation, module_aliases_ reroute, cmi_scopes_ parent
+  qualification).  truncate / blocking_in_callback / mltest.
+- qualified_ctor_scheme generalized: deep paths, opened-submodule reroute
+  (open Runtime_events; Type.Begin -> Runtime_events.Type.span), parent
+  scopes.  test_user_event.
+- A written open object annotation < m : int; .. > keeps its row (Ptyp_object
+  Open flag -> variant_kind marker).  bytecode-opcode-coverage.
+- The String.t/Bytes.t abbreviation-display pair (lib-str/parallel +
+  lib-bytes-utf holding): (a) occurs_and_lower's family-head finalization is
+  cross-ITEM only -- test var->level < 1, not < current level (an outer param
+  captured inside a nested let stays adoptable); (b) inner lets finalize their
+  OWN family heads per-use (finalize_owned_family_heads) -- emulates ocamlc's
+  per-instance copies of generic scheme nodes, ownership judged by creation
+  level stamped on instantiate's scheme-head copies.  The probe matrix
+  (t1-t8 in the journal-adjacent commit message) distinguishes param-var
+  adoption (String.t) from let-local decoupling (bytes stays).
+
+Left (2): lib-seq/test.ml -- 'unit -> 'a node' should display the folded
+'a Seq.t via the rec-var's abbreviation memory (needs lenient constr-vs-arrow
+contact to link through the cmi expansion); test_caml_counters.ml -- weak-var
+pinning through Callbacks.create's OPTIONAL callback (the tbl's weak vars
+should pin from the labelled arg's instantiation).  Both single-file,
+engine-core; parked.
