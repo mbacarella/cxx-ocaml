@@ -8652,20 +8652,24 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
 // nodes of equal identity within one value's scheme (so `'a -> 'a` is one var);
 // Any becomes a fresh var (opaque).  Constr paths are passed through -- the cmi
 // writer keeps predefined ones and renders the rest as opaque vars.
+struct BridgeCtx {
+  std::unordered_set<const I::Type*> visiting;   // cycle guard (recursive rows)
+  std::unordered_map<const I::Type*, cmi::cmiw::TyPtr> nodes;  // shared rows -> one Ty node
+};
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
-                                      std::unordered_set<const I::Type*>& visiting);
+                                      BridgeCtx& ctx);
 static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
                                   std::unordered_map<const I::Type*, int>& vars, int& nextvar) {
-  std::unordered_set<const I::Type*> visiting;
-  return bridge_ty_rec(t0, vars, nextvar, visiting);
+  BridgeCtx ctx;
+  return bridge_ty_rec(t0, vars, nextvar, ctx);
 }
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
-                                      std::unordered_set<const I::Type*>& visiting) {
+                                      BridgeCtx& ctx) {
   TypePtr t = I::Engine::repr(t0);
   auto bridge_ty = [&](const TypePtr& u, std::unordered_map<const I::Type*, int>& v, int& nv) {
-    return bridge_ty_rec(u, v, nv, visiting);
+    return bridge_ty_rec(u, v, nv, ctx);
   };
   using K = I::Type::Kind;
   switch (t->kind) {
@@ -8675,16 +8679,52 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
       int id = nextvar++; vars[t.get()] = id; return cmi::cmiw::ty_var(id);
     }
     case K::Object: {  // closed structural object `< m1 : t1; m2 : t2 >`
-      // A RECURSIVE object type (`< bark : 'self -> unit > as 'self`) is a
-      // cycle in the engine graph the writer can't express -- degrade the
-      // inner recursive occurrence to an opaque var instead of looping.
-      if (!visiting.insert(t.get()).second) return cmi::cmiw::ty_var(nextvar++);
+      // A row referenced twice in one scheme must bridge to ONE Ty node (the
+      // writer then marshals it shared and Printtyp names it `as 'a`); a
+      // RECURSIVE object type (`< bark : 'self -> unit > as 'self`) is a cycle
+      // the writer can't express -- degrade the inner occurrence to a var.
+      if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
+      if (!ctx.visiting.insert(t.get()).second) return cmi::cmiw::ty_var(nextvar++);
       std::vector<cmi::cmiw::TyPtr> mtys;
       for (auto& a : t->args) mtys.push_back(bridge_ty(a, vars, nextvar));
-      visiting.erase(t.get());
-      return cmi::cmiw::ty_object(t->labels, std::move(mtys));
+      ctx.visiting.erase(t.get());
+      auto ty = cmi::cmiw::ty_object(t->labels, std::move(mtys));
+      ctx.nodes[t.get()] = ty;
+      return ty;
     }
-    case K::Variant: return cmi::cmiw::ty_var(nextvar++);  // opaque in the .cmi for now
+    case K::Variant: {  // polymorphic-variant row
+      // Cycle guard FIRST: a fixpoint row is its own abbreviation argument
+      // (`'a lambda as 'a`), so even the abbrev branch below can recurse into
+      // this same node -- degrade the inner occurrence to a var.
+      if (!ctx.visiting.insert(t.get()).second) return cmi::cmiw::ty_var(nextvar++);
+      struct Guard {
+        BridgeCtx& c; const I::Type* p;
+        ~Guard() { c.visiting.erase(p); }
+      } guard{ctx, t.get()};
+      // An abbreviated EXACT row (`val crash : var_t`) is stored by ocamlc as a
+      // plain Tconstr of the abbreviation, not the expanded row.
+      if (!t->abbrev.empty() && t->variant_kind == 2 && !t->from_inherit) {
+        std::vector<cmi::cmiw::TyPtr> as;
+        for (auto& a : t->abbrev_args) as.push_back(bridge_ty(a, vars, nextvar));
+        return cmi::cmiw::ty_constr(t->abbrev, std::move(as));
+      }
+      // Named open/upper rows (`[> var ]`), inherited-row bounds and weak
+      // (non-generalized) rows stay opaque for now.
+      if (!t->abbrev.empty() || !t->inherited.empty() ||
+          t->level != I::GENERIC_LEVEL)
+        return cmi::cmiw::ty_var(nextvar++);
+      if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
+      std::vector<cmi::cmiw::TyPtr> targs;
+      for (std::size_t i = 0; i < t->labels.size(); ++i) {
+        bool has = i < t->tag_has_arg.size() && t->tag_has_arg[i] &&
+                   i < t->args.size() && t->args[i];
+        targs.push_back(has ? bridge_ty(t->args[i], vars, nextvar) : nullptr);
+      }
+      auto ty = cmi::cmiw::ty_variant_row(t->labels, std::move(targs),
+                                          t->variant_kind, t->present);
+      ctx.nodes[t.get()] = ty;
+      return ty;
+    }
     case K::Arrow:
       return cmi::cmiw::ty_arrow_lbl(bridge_ty(t->dom, vars, nextvar),
                                      bridge_ty(t->cod, vars, nextvar),
@@ -8809,12 +8849,20 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       // INHERITS another polyvariant (`[ Simple.view | `Or ]`) is left abstract --
       // emitting only its direct tags would be an INCOMPLETE set (wrongly matching).
       if (auto* pv = std::get_if<Ptyp_variant>(&d.manifest->get()->desc)) {
-        std::vector<std::string> tags; bool all_tag = true;
+        std::vector<std::string> tags; std::vector<cmi::cmiw::TyPtr> targs;
+        bool all_tag = pv->closed == ClosedFlag::Closed && !pv->labels;
         for (auto& rf : pv->rows) {
-          if (auto* rt = std::get_if<Rtag>(&rf)) tags.push_back(rt->name);
-          else { all_tag = false; break; }
+          auto* rt = std::get_if<Rtag>(&rf);
+          if (!rt || rt->types.size() > 1) { all_tag = false; break; }  // inherit / `of t1 & t2`
+          tags.push_back(rt->name);
+          targs.push_back(rt->constant || rt->types.empty()
+                              ? nullptr
+                              : bridge_ty(ck.from_coretype(*rt->types[0], tvars),
+                                          bvars, nextvar));
         }
-        if (all_tag && !tags.empty()) manifest = cmi::cmiw::ty_variant(std::move(tags));
+        if (all_tag && !tags.empty())
+          manifest = cmi::cmiw::ty_variant_row(std::move(tags), std::move(targs),
+                                               2 /*exact*/, {});
       }
       if (!manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
     }
@@ -9477,6 +9525,12 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
 std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
   Checker ck;
   ck.record_kinds_ = true;
+  // Mirror the sig-display pass: ocamlc's .cmi stores SOURCE abbreviations
+  // (Scanf.Scanning.in_channel, not its expansion), which only the folded
+  // pass keeps; folding skips from_cmi abbreviation expansion, so unification
+  // must be best-effort like the display pass (see infer_structure_types).
+  ck.eng.lenient = true;
+  ck.fold_abbrevs_ = true;
   run_checker(ck, s);  // leaves top-level bindings in venv.back()
   // Emission phase: checking is DONE, every from_coretype below only converts
   // declaration types for the .cmi -- keep local abbreviations as written

@@ -229,7 +229,9 @@ struct Ty {
   enum K { Constr, Arrow, Tuple, Var, Variant, Object } k = Constr;
   std::string name;            // Constr: type-ctor name ("int","list","M.t",...)
   std::vector<TyPtr> args;     // Constr: type args; Arrow: {dom, cod}; Tuple:
-                               // elems; Object: method types (parallel to pv_tags)
+                               // elems; Object: method types (parallel to
+                               // pv_tags); Variant: per-tag arg types (parallel
+                               // to pv_tags, null = constant tag)
   int var = 0;                 // Var: identity within one signature item
   std::string var_name;        // Var: source name (Tvar Some) -- a type decl's
                                // params keep their written names ('outputValue)
@@ -237,8 +239,12 @@ struct Ty {
   std::string label;           // Arrow: label name (Labelled/Optional)
   std::vector<std::string> pv_tags;  // Variant: polymorphic-variant tag names;
                                      // Object: method names
+  int row_kind = 2;            // Variant: 0 open `[>`, 1 upper `[<`, 2 exact `[ ]`
+  std::vector<std::string> pv_present;  // Variant: `[< L > `P ]` present tags
 };
-TyPtr ty_variant(std::vector<std::string> tags);      // polymorphic-variant abbrev
+TyPtr ty_variant(std::vector<std::string> tags);      // exact all-constant row
+TyPtr ty_variant_row(std::vector<std::string> tags, std::vector<TyPtr> args,
+                     int row_kind, std::vector<std::string> present);
 TyPtr ty_object(std::vector<std::string> names, std::vector<TyPtr> tys);  // closed `< m : t >`
 TyPtr ty_predef(const std::string& name);             // nullary predef constr
 TyPtr ty_constr(const std::string& name, std::vector<TyPtr> args);

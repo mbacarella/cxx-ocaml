@@ -6,8 +6,10 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <algorithm>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace cppcaml::cmi {
 
@@ -749,6 +751,11 @@ TyPtr ty_arrow_lbl(const TyPtr& d, const TyPtr& c, int lk, const std::string& lb
   t->label_kind = lk; t->label = lbl; return t; }
 TyPtr ty_tuple(std::vector<TyPtr> es) { auto t = std::make_shared<Ty>(); t->k = Ty::Tuple; t->args = std::move(es); return t; }
 TyPtr ty_variant(std::vector<std::string> tags) { auto t = std::make_shared<Ty>(); t->k = Ty::Variant; t->pv_tags = std::move(tags); return t; }
+TyPtr ty_variant_row(std::vector<std::string> tags, std::vector<TyPtr> args,
+                     int row_kind, std::vector<std::string> present) {
+  auto t = std::make_shared<Ty>(); t->k = Ty::Variant;
+  t->pv_tags = std::move(tags); t->args = std::move(args);
+  t->row_kind = row_kind; t->pv_present = std::move(present); return t; }
 TyPtr ty_object(std::vector<std::string> names, std::vector<TyPtr> tys) {
   auto t = std::make_shared<Ty>(); t->k = Ty::Object;
   t->pv_tags = std::move(names); t->args = std::move(tys); return t; }
@@ -902,7 +909,19 @@ struct TyEmit {
     }
     return nullptr;
   }
+  // Object/Variant nodes shared within one scheme must marshal as ONE node
+  // (omarshal CODE_SHARED back-reference) so the reader sees the sharing and
+  // Printtyp names the row `as 'a` -- two structural copies print unnamed.
+  std::unordered_map<const Ty*, o::ValPtr> shared_nodes;
   o::ValPtr emit(const TyPtr& t) {
+    if (t->k == Ty::Object || t->k == Ty::Variant)
+      if (auto it = shared_nodes.find(t.get()); it != shared_nodes.end())
+        return it->second;
+    o::ValPtr res = emit_fresh(t);
+    if (t->k == Ty::Object || t->k == Ty::Variant) shared_nodes[t.get()] = res;
+    return res;
+  }
+  o::ValPtr emit_fresh(const TyPtr& t) {
     switch (t->k) {
       case Ty::Var: {
         if (auto it = vars.find(t->var); it != vars.end()) return it->second;
@@ -956,16 +975,39 @@ struct TyEmit {
         return texpr(o::vblock(2, {o::vlist(elems)}));  // Ttuple of (so * te) list
       }
       case Ty::Variant: {
-        // A closed polymorphic-variant abbreviation (`type view = [ `A | `B .. ]`):
-        // emit just enough row_desc for a consumer's `#view` pattern to read the
-        // tag set.  row_field is a dummy RFabsent (the reader only reads labels).
+        // A polymorphic-variant row.  ocamlc stores row_fields in
+        // REVERSE-alphabetical order (the printer reads them back reversed, so
+        // the printed row is alphabetical); an exact row's row_more is Tnil, an
+        // open/upper one's a Tvar.  Fields are RFpresent(arg option), except an
+        // upper `[<` row's non-present tags which are RFeither{no_arg; arg_type;
+        // matched=false; ext=ref RFnone}.
         // row_desc = { row_fields; row_more; row_closed; row_fixed; row_name }.
+        std::vector<std::size_t> ord(t->pv_tags.size());
+        for (std::size_t i = 0; i < ord.size(); ++i) ord[i] = i;
+        std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
+          return t->pv_tags[a] > t->pv_tags[b];
+        });
+        std::unordered_set<std::string> present(t->pv_present.begin(),
+                                                t->pv_present.end());
         std::vector<o::ValPtr> fields;
-        for (auto& tag : t->pv_tags)
-          fields.push_back(o::vblock(0, {o::vstr(tag), o::vint(0) /*RFabsent*/}));  // (label, row_field)
-        o::ValPtr more = texpr(o::vblock(0, {o::vint(0)}));  // row_more = Tvar None
+        for (std::size_t i : ord) {
+          TyPtr arg = i < t->args.size() ? t->args[i] : nullptr;
+          o::ValPtr rf;
+          if (t->row_kind == 1 && !present.count(t->pv_tags[i])) {
+            rf = o::vblock(1, {o::vint(arg ? 0 : 1) /*no_arg*/,
+                               arg ? o::vlist({emit(arg)}) : o::vint(0) /*arg_type*/,
+                               o::vint(0) /*matched=false*/,
+                               o::vblock(0, {o::vint(1)}) /*ext=ref RFnone*/});  // RFeither
+          } else {
+            rf = o::vblock(0, {arg ? o::vblock(0, {emit(arg)}) : o::vint(0)});  // RFpresent
+          }
+          fields.push_back(o::vblock(0, {o::vstr(t->pv_tags[i]), rf}));  // (label, row_field)
+        }
+        o::ValPtr more = t->row_kind == 2
+                             ? texpr(o::vint(0))                    // Tnil (exact)
+                             : texpr(o::vblock(0, {o::vint(0)}));   // Tvar None
         o::ValPtr rd = o::vblock(0, {fields.empty() ? o::vint(0) : o::vlist(fields),
-                                     more, o::vint(1) /*row_closed=true*/,
+                                     more, o::vint(t->row_kind != 0 ? 1 : 0) /*row_closed*/,
                                      o::vint(0) /*row_fixed=None*/, o::vint(0) /*row_name=None*/});
         return texpr(o::vblock(6, {rd}));  // Tvariant of row_desc
       }
