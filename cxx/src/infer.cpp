@@ -644,7 +644,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Variant: {
         TypePtr r;
         if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; r->rigid_name = t->rigid_name; }
         else if (t->kind == Type::Kind::Object) {
           r = object_type(t->labels, t->args);
           r->variant_kind = t->variant_kind;
@@ -732,7 +732,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         else if (t->kind == Type::Kind::Constr) {
           r = constr(t->path, std::move(as), t->stamp);
           r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev;
-          r->labels = t->labels; r->rigid = t->rigid;
+          r->labels = t->labels; r->rigid = t->rigid; r->rigid_name = t->rigid_name;
           // Stamp a scheme-head copy with its creation level, so an inner
           // let's generalization can tell an OWNED head (created at its level;
           // becomes a per-use scheme head) from a CAPTURED one (created

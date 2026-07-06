@@ -67,6 +67,10 @@ struct Type {
   bool functor_abbrev = false;  // Constr: a functor-instance abbreviation
                              // (`HW.key`, manifest-carrying result-sig type) --
                              // top priority in the family relink (see unify).
+  std::string rigid_name;    // Constr rigid: the SOURCE name (`(type t)` binds
+                             // "t") -- ocamlc's .cmi stores the generalized
+                             // face as Tvar(Some "t"), so the cmi bridge
+                             // carries it through
   bool rigid = false;        // Constr: a rigid locally-abstract type (`type a.`
                              // / `(type a)`) in the DISPLAY pass -- unify never
                              // links or refines it (a GADT arm's equation

@@ -381,10 +381,13 @@ struct Checker {
   // show prints a rigid node as a type variable ('a), its generalized face.
   // The strict and value-kind passes keep the flexible var (the reject pass
   // needs the equations to type arm bodies; the kind pass needs their kinds).
-  TypePtr newtype_binding() {
+  TypePtr newtype_binding(const std::string& name = "") {
     if (fold_abbrevs_ && !strict) {
       TypePtr t = eng.constr("");
       t->rigid = true;
+      // The SOURCE name (`(type t)` / `'t.`): ocamlc's .cmi stores the
+      // generalized face as Tvar(Some "t"), so the cmi bridge needs it.
+      t->rigid_name = name;
       // Creation level: when the binding that scopes this newtype generalizes
       // (level popped below this), the rigid node becomes a generic VAR.
       t->level = eng.level;
@@ -4965,7 +4968,7 @@ struct Checker {
       return infer_apply(*a, e);
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return infer_function(*f);
     if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) {  // fun (type a) -> e
-      newtype_vars[nt->name.txt] = newtype_binding();
+      newtype_vars[nt->name.txt] = newtype_binding(nt->name.txt);
       return infer_expr(*nt->body);
     }
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
@@ -6130,7 +6133,7 @@ struct Checker {
         auto it = newtype_vars.find(nt->name.txt);
         saved_newtypes.push_back({nt->name.txt,
             it != newtype_vars.end() ? std::optional<TypePtr>(it->second) : std::nullopt});
-        newtype_vars[nt->name.txt] = newtype_binding();
+        newtype_vars[nt->name.txt] = newtype_binding(nt->name.txt);
       }
     struct Param { TypePtr ty; int lk; std::string nm; };
     std::vector<Param> params;
@@ -6527,7 +6530,7 @@ struct Checker {
         const Pvc_constraint* pc =
             b.constraint_ ? std::get_if<Pvc_constraint>(&*b.constraint_) : nullptr;
         if (pc && !pc->univars.empty()) {
-          for (auto& u : pc->univars) newtype_vars[u.txt] = newtype_binding();
+          for (auto& u : pc->univars) newtype_vars[u.txt] = newtype_binding(u.txt);
           bound[i] = from_coretype(*pc->typ, avmaps[i]);
           bind_pattern_scheme(b.pat, bound[i]);
         } else if (pc && !strict) {
@@ -6623,7 +6626,7 @@ struct Checker {
       // false-reject (e.g. array vs iarray); the identity layer is reliable.
       if (b.constraint_)
         if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_)) {
-          for (auto& u : pc->univars) newtype_vars[u.txt] = newtype_binding();
+          for (auto& u : pc->univars) newtype_vars[u.txt] = newtype_binding(u.txt);
           annot = from_coretype(*pc->typ, avars);
           if (strict && expected_clash(te, annot))
             note_error("type mismatch against declared type");
@@ -8655,6 +8658,9 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
 struct BridgeCtx {
   std::unordered_set<const I::Type*> visiting;   // cycle guard (recursive rows)
   std::unordered_map<const I::Type*, cmi::cmiw::TyPtr> nodes;  // shared rows -> one Ty node
+  // SOURCE names for engine vars (a type decl's coretype tvars map reversed):
+  // a GADT ctor's existential (`Test : 'b * 'a * ..`) keeps its written name.
+  std::unordered_map<const I::Type*, std::string> var_names;
 };
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
@@ -8662,6 +8668,16 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
 static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
                                   std::unordered_map<const I::Type*, int>& vars, int& nextvar) {
   BridgeCtx ctx;
+  return bridge_ty_rec(t0, vars, nextvar, ctx);
+}
+// As bridge_ty, but with the declaration's written tvar names (`name -> var`),
+// so fresh vars carry Tvar(Some name) like ocamlc stores them.
+static cmi::cmiw::TyPtr bridge_ty_named(const TypePtr& t0,
+                                        std::unordered_map<const I::Type*, int>& vars, int& nextvar,
+                                        const std::unordered_map<std::string, TypePtr>& tvars) {
+  BridgeCtx ctx;
+  for (auto& [n, tp] : tvars)
+    if (tp) ctx.var_names[I::Engine::repr(tp).get()] = n;
   return bridge_ty_rec(t0, vars, nextvar, ctx);
 }
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
@@ -8676,7 +8692,13 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
     case K::Var: {
       auto it = vars.find(t.get());
       if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
-      int id = nextvar++; vars[t.get()] = id; return cmi::cmiw::ty_var(id);
+      int id = nextvar++; vars[t.get()] = id;
+      auto v = cmi::cmiw::ty_var(id);
+      if (auto nm = ctx.var_names.find(t.get()); nm != ctx.var_names.end())
+        v->var_name = nm->second;
+      else if (!t->rigid_name.empty())
+        v->var_name = t->rigid_name;  // a generalized `(type t)` newtype
+      return v;
     }
     case K::Object: {  // closed structural object `< m1 : t1; m2 : t2 >`
       // A row referenced twice in one scheme must bridge to ONE Ty node (the
@@ -8735,6 +8757,17 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
       return cmi::cmiw::ty_tuple(std::move(as));
     }
     case K::Constr: {
+      // A generalized rigid newtype (`let f (type t) () = ..` escaping into
+      // f's scheme): ocamlc stores its face as Tvar(Some "t") -- one shared
+      // var per node, carrying the SOURCE name.
+      if (t->rigid && t->path.empty()) {
+        auto it = vars.find(t.get());
+        if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
+        int id = nextvar++; vars[t.get()] = id;
+        auto v = cmi::cmiw::ty_var(id);
+        v->var_name = t->rigid_name;
+        return v;
+      }
       std::vector<cmi::cmiw::TyPtr> as;
       for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));
       std::string path = t->path;
@@ -8779,7 +8812,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
     std::vector<cmi::cmiw::TyPtr> params;
     for (auto& p : d.params) {
-      auto pv = bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar);
+      auto pv = bridge_ty_named(ck.from_coretype(*p, tvars), bvars, nextvar, tvars);
       // Params keep their SOURCE names (Tvar Some): ocamlc prints
       // `('outputValue, 'message) fieldStatus` back verbatim.  The shared
       // var node carries the name into every ctor/label occurrence.  An
@@ -8802,9 +8835,9 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       std::vector<cmi::cmiw::Ctor> ctors;
       for (auto& c : var->ctors) {
         cmi::cmiw::Ctor cc; cc.name = c.name.txt;
-        if (c.res) cc.res = bridge_ty(ck.from_coretype(**c.res, tvars), bvars, nextvar);
+        if (c.res) cc.res = bridge_ty_named(ck.from_coretype(**c.res, tvars), bvars, nextvar, tvars);
         if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
-          for (auto& a : tup->elems) cc.args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
+          for (auto& a : tup->elems) cc.args.push_back(bridge_ty_named(ck.from_coretype(*a, tvars), bvars, nextvar, tvars));
         else if (auto* r = std::get_if<Pcstr_record>(&c.args))
           // Inline record (Typedtree's `Texp_record of {fields; representation;
           // extended_expression}`): emit the labels so a consumer matching
@@ -8813,7 +8846,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
             cmi::cmiw::Label lab;
             lab.name = f.name.txt;
             lab.mut = (f.mut == MutableFlag::Mutable);
-            lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
+            lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
             cc.inline_record.push_back(std::move(lab));
           }
         ctors.push_back(std::move(cc));
@@ -8831,7 +8864,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         cmi::cmiw::Label lab;
         lab.name = f.name.txt;
         lab.mut = (f.mut == MutableFlag::Mutable);
-        lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
+        lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
         labels.push_back(std::move(lab));
       }
       auto si = cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels));
@@ -8857,14 +8890,14 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
           tags.push_back(rt->name);
           targs.push_back(rt->constant || rt->types.empty()
                               ? nullptr
-                              : bridge_ty(ck.from_coretype(*rt->types[0], tvars),
-                                          bvars, nextvar));
+                              : bridge_ty_named(ck.from_coretype(*rt->types[0], tvars),
+                                                bvars, nextvar, tvars));
         }
         if (all_tag && !tags.empty())
           manifest = cmi::cmiw::ty_variant_row(std::move(tags), std::move(targs),
                                                2 /*exact*/, {});
       }
-      if (!manifest) manifest = bridge_ty(ck.from_coretype(**d.manifest, tvars), bvars, nextvar);
+      if (!manifest) manifest = bridge_ty_named(ck.from_coretype(**d.manifest, tvars), bvars, nextvar, tvars);
     }
     auto si = cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest);
     // `type t = ..`: an extensible (Type_open) declaration, not abstract --
@@ -9129,7 +9162,7 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
       cmi::cmiw::Label lab;
       lab.name = f.name.txt;
       lab.mut = (f.mut == MutableFlag::Mutable);
-      lab.ty = bridge_ty(ck.from_coretype(*f.type, tvars), bvars, nextvar);
+      lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
       labels.push_back(std::move(lab));
     }
     item = cmi::cmiw::sig_exception_record(name, std::move(labels));
@@ -9137,11 +9170,11 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
     std::vector<cmi::cmiw::TyPtr> args;
     if (auto* tup = std::get_if<Pcstr_tuple>(&pd.args))
       for (auto& a : tup->elems)
-        args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
+        args.push_back(bridge_ty_named(ck.from_coretype(*a, tvars), bvars, nextvar, tvars));
     item = cmi::cmiw::sig_exception(name, std::move(args));
   }
   if (pd.res)
-    item.ext_ret = bridge_ty(ck.from_coretype(**pd.res, tvars), bvars, nextvar);
+    item.ext_ret = bridge_ty_named(ck.from_coretype(**pd.res, tvars), bvars, nextvar, tvars);
   if (ext) {
     item.ext_path = typext_path(ck, ext->path.txt);
     item.ext_params = typext_param_names(*ext);
@@ -9300,12 +9333,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       std::unordered_map<std::string, TypePtr> tvars;
       std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
       out.push_back(cmi::cmiw::sig_value(pv->vd.name.txt,
-                      bridge_ty(ck.from_coretype(*pv->vd.type, tvars), bvars, nextvar)));
+                      bridge_ty_named(ck.from_coretype(*pv->vd.type, tvars), bvars, nextvar, tvars)));
     } else if (auto* pr = std::get_if<Psig_primitive>(&it.desc)) {
       if (pr->pd.type && !pr->pd.prims.empty()) {
         std::unordered_map<std::string, TypePtr> tvars;
         std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
-        auto ty = bridge_ty(ck.from_coretype(*pr->pd.type, tvars), bvars, nextvar);
+        auto ty = bridge_ty_named(ck.from_coretype(*pr->pd.type, tvars), bvars, nextvar, tvars);
         std::string native = pr->pd.prims.size() > 1 ? pr->pd.prims[1] : "";
         auto item = cmi::cmiw::sig_external(pr->pd.name.txt, ty, pr->pd.prims[0], native);
         apply_prim_attrs(pr->pd, out, item);
@@ -9623,7 +9656,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       if (pr->prim.type && !pr->prim.prims.empty()) {
         std::unordered_map<std::string, TypePtr> tvars;
         std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
-        auto ty = bridge_ty(ck.from_coretype(*pr->prim.type, tvars), bvars, nextvar);
+        auto ty = bridge_ty_named(ck.from_coretype(*pr->prim.type, tvars), bvars, nextvar, tvars);
         std::string native = pr->prim.prims.size() > 1 ? pr->prim.prims[1] : "";
         auto item = cmi::cmiw::sig_external(pr->prim.name.txt, ty, pr->prim.prims[0], native);
         apply_prim_attrs(pr->prim, out, item);
