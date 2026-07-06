@@ -2249,6 +2249,19 @@ struct Typer {
       if (auto* pid = std::get_if<tt::Pident>(&tp.v)) {
         auto f = polyvar_tags_.find(pid->id.stamp);
         if (f != polyvar_tags_.end()) tags = &f->second;
+      } else if (auto* pd = std::get_if<tt::Pdot>(&tp.v)) {
+        // `#M.t`: recover the member declaration's own ident through the local
+        // module's recorded member idents, then its tags (stamp-keyed as usual).
+        if (auto* pre = std::get_if<tt::Pident>(&pd->prefix->v)) {
+          auto se = module_sig_exports_.find(pre->id.stamp);
+          if (se != module_sig_exports_.end()) {
+            auto ti = se->second.types.find(pd->name);
+            if (ti != se->second.types.end()) {
+              auto f = polyvar_tags_.find(ti->second.stamp);
+              if (f != polyvar_tags_.end()) tags = &f->second;
+            }
+          }
+        }
       }
       if (!tags || tags->empty()) throw TypeError("pat#type unknown tags");
       // Polyvariant rows are ordered by tag hash; the or-pattern is seeded from
