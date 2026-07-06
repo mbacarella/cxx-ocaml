@@ -291,6 +291,9 @@ struct SigItem {
   // Mty_functor(Named(P, <opaque>), Mty_signature(sub)).  The param's own
   // signature is left opaque (consumers only need the result layout).
   bool is_functor = false;
+  // A GENERATIVE functor `module F () -> ..`: the parameter is Unit, not Named.
+  // Printtyp renders it `()`; a Named-with-empty-sig came out `( : sig end)`.
+  bool functor_unit = false;
   std::string functor_param;  // the parameter's name (e.g. "Ord")
   std::vector<SigItem> param_sig;  // the parameter's signature items (OrderedType)
   // Exception: a `type t += ..` extension constructor rather than a plain

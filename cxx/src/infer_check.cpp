@@ -9431,8 +9431,11 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         if (auto* ps = std::get_if<Pmty_signature>(&bc->mt->desc))
           result = signature_to_cmi(ps->items);
     }
-    return cmi::cmiw::sig_module_functor(name, pname, std::move(psig),
-                                         std::move(result));
+    auto item = cmi::cmiw::sig_module_functor(name, pname, std::move(psig),
+                                              std::move(result));
+    // `module F () -> ..`: the parameter is Unit (generative), printed `()`.
+    item.functor_unit = std::holds_alternative<Functor_unit>(mf->param);
+    return item;
   }
   return std::nullopt;
 }

@@ -1057,9 +1057,16 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // Mty_functor(Named(Some param, Mty_signature[]), Mty_signature(result)).
         // The parameter's own signature is left empty (consumers resolve members
         // via the RESULT signature only); the functor still takes a field.
-        auto pident = o::vblock(0, {o::vstr(it.functor_param), o::vint(stamp++)});  // Ident.Local
-        auto psig = o::vblock(1, {o::vlist(emit_sig_items(it.param_sig, referenced, stamp, &visible))});  // Mty_signature
-        auto param = o::vblock(0, {o::vblock(0, {pident}) /*Some*/, psig});  // Named(Some, <param sig>)
+        // A generative functor's parameter is Unit (the int constructor 0);
+        // otherwise Named(Some id, <param sig>).
+        o::ValPtr param;
+        if (it.functor_unit) {
+          param = o::vint(0);  // functor_parameter = Unit
+        } else {
+          auto pident = o::vblock(0, {o::vstr(it.functor_param), o::vint(stamp++)});  // Ident.Local
+          auto psig = o::vblock(1, {o::vlist(emit_sig_items(it.param_sig, referenced, stamp, &visible))});  // Mty_signature
+          param = o::vblock(0, {o::vblock(0, {pident}) /*Some*/, psig});  // Named(Some, <param sig>)
+        }
         auto body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible))});  // Mty_signature(result)
         mty = o::vblock(2, {param, body});  // Mty_functor
       } else if (!it.alias.empty()) {
