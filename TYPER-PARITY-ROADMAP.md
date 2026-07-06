@@ -60,7 +60,19 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 > exhaustiveness (pr7284/robustmatch/morematch — a partial match the type index
 > can't refute), functor-application type paths (`Set.Make(Bool).t`,
 > accepted_batch), `module type of` stamp propagation (t02), the shadowed
-> apply operator `A.@@` (apply.ml), attribute preservation on core_type /
+> apply operator `A.@@` (apply.ml — two independent roots, investigated
+> 2026-07-06: (1) `revapply_kind` inlines any local `%apply` external, but
+> typecore's `check_apply_prim_type` only rewrites `f @@ x` -> `f x` when the
+> external's declared type is the fully-generic `('a->'b)->'a->'b` shape; a
+> monomorphic redefinition `external (@@): f -> x -> int` must stay a plain
+> `Texp_apply`.  Adding that type-shape gate is easy and correct.  (2) but the
+> REAL blocker: inside `A.(succ @@ zero)` the `open A` should shadow the outer
+> top-level generic `@@`, yet `resolve_value` searches the whole `scopes` stack
+> BEFORE `opens`, so the outer `@@` wins and gets inlined.  Fixing this needs a
+> unified scope/open ordering (a monotonic sequence number per scope-frame and
+> open, resolving to the most-recent match) — a general resolution change.
+> apply.ml ALSO has a separate `Optional "cap"` omitted-arg ghost, so it needs
+> all three.), attribute preservation on core_type /
 > module_type / signature-item nodes (w53, attributes), object rows
 > (woodyatt/yamagata), class-level `Tcl_let` placement (toplevel_lets), and
 > immutable-array `Texp` nodes (test_iarray).
