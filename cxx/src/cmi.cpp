@@ -867,7 +867,17 @@ struct TyEmit {
           }
           std::string g = global_of(comps[0]);
           if (referenced) (*referenced)[g] = true;  // a real type ref needs the CRC
-          path = o::vblock(0, {o::vblock(2, {o::vstr(g)})});  // Pident(Global head)
+          if (g.rfind("Stdlib__", 0) == 0) {
+            // ocamlc resolves a pervasive head THROUGH the Stdlib alias module:
+            // `Buffer.t` is stored Pdot(Pdot(Pident(Global Stdlib), "Buffer"),
+            // "t"), never the mangled unit Pident(Global Stdlib__Buffer).  The
+            // path cites Stdlib, so import its CRC too (ocamlc does both).
+            if (referenced) (*referenced)["Stdlib"] = true;
+            path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});  // Pident(Global Stdlib)
+            path = o::vblock(1, {path, o::vstr(g.substr(8))});         // Pdot(_, alias member)
+          } else {
+            path = o::vblock(0, {o::vblock(2, {o::vstr(g)})});  // Pident(Global head)
+          }
           for (std::size_t i = 1; i < comps.size(); ++i)
             path = o::vblock(1, {path, o::vstr(comps[i])});   // Pdot(path, comp)
         } else if (int st = predef_stamp(t->name)) {
