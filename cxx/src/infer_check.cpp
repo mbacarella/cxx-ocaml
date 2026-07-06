@@ -5295,13 +5295,13 @@ struct Checker {
       // A class-typed receiver (`y : alfa`, y coerced/annotated to a class): the
       // object appears as the class's Constr, so resolve the method through the
       // class's object row (woodyatt: `y#x` where x : format -> 'a).
-      if (!strict && ot->kind == I::Type::Kind::Constr)
+      if (ot->kind == I::Type::Kind::Constr)
         if (auto it = class_types_.find(ot->path); it != class_types_.end())
           ot = I::Engine::repr(eng.instantiate(it->second));
-      if (!strict && ot->kind == I::Type::Kind::Object)
+      if (ot->kind == I::Type::Kind::Object)
         for (size_t i = 0; i < ot->labels.size(); ++i)
           if (ot->labels[i] == sd->meth.txt) return ot->args[i];
-      return eng.any();
+      return eng.fresh_var();  // P4-D: unknown receiver/method, per-occurrence var
     }
     if (auto* si = std::get_if<Pexp_setinstvar>(&e.desc)) {  // n <- e: e has n's type
       TypePtr vt = infer_expr(*si->value);
