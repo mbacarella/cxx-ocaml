@@ -5311,10 +5311,11 @@ struct Checker {
     }
     if (auto* pv = std::get_if<Pexp_variant>(&e.desc)) {
       // A constructed polymorphic variant `` `A [e] `` has the open row type
-      // `[> `A [of t]]`; rows merge through unification (if/match branches).  The
-      // strict pass stays dynamic (matched-only variants are conjunctive -- a
-      // naive row there is unsound; see the reverted attempt).
-      if (strict) { if (pv->arg) infer_expr(**pv->arg); return eng.any(); }
+      // `[> `A [of t]]`; rows merge through unification (if/match branches).
+      // Construction rows unify shared-tag args -- OCaml's semantics for `[>`
+      // (two `` `A `` at clashing arg types IS an error).  The conjunctive trap
+      // is the MATCHED side only (`[<` args conjoin, not unify), and strict's
+      // Ppat_variant stays a fresh var, so no `[<` row reaches strict unify.
       TypePtr at = pv->arg ? infer_expr(**pv->arg) : eng.fresh_var();
       return eng.variant_type({pv->label}, {at}, {(char)(pv->arg ? 1 : 0)});
     }
