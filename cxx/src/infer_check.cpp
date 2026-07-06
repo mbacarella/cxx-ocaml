@@ -4812,6 +4812,48 @@ struct Checker {
       }
     if (!trivial) apply_plans[&enode] = std::move(m.slots);
   }
+  // A %apply/%revapply COLLAPSE (`bump @@ x` -> `bump x`) inserts a ghost None
+  // for any optional the FUNCTION operand skips (`bump : ?cap:int -> int -> int`
+  // applied to just `x` -> `Optional "cap" None`).  Record the collapsed call's
+  // plan keyed by the operator node, so the dump's revapply branch emits it.
+  // Only for the GENERIC operator (its function-operand parameter is an arrow),
+  // not a monomorphic `external (@@) : f -> x -> int` which is a plain 2-arg
+  // application (apply.ml's A.@@).  Dump pass only.
+  void record_revapply_plan(const Pexp_apply& a, const Expression& enode,
+                            const TypePtr& ft) {
+    if (strict) return;
+    if (a.args.size() != 2 || !std::holds_alternative<Nolabel>(a.args[0].first) ||
+        !std::holds_alternative<Nolabel>(a.args[1].first))
+      return;
+    auto* fid = std::get_if<Pexp_ident>(&a.fn->desc);
+    auto* fl = fid ? std::get_if<Lident>(&fid->id.txt.v) : nullptr;
+    int kind = fl ? (fl->name == "@@" ? 2 : fl->name == "|>" ? 1 : 0) : 0;
+    if (!kind) return;
+    // The operator's function-operand parameter position must be an arrow/var.
+    TypePtr op = I::Engine::repr(ft);
+    if (op->kind != I::Type::Kind::Arrow) return;
+    TypePtr fnpos = I::Engine::repr(kind == 2 ? op->dom
+                                              : (I::Engine::repr(op->cod)->kind ==
+                                                         I::Type::Kind::Arrow
+                                                     ? I::Engine::repr(op->cod)->dom
+                                                     : op->cod));
+    if (fnpos->kind != I::Type::Kind::Arrow && fnpos->kind != I::Type::Kind::Var)
+      return;
+    // The function operand's parameter spine vs the single argument operand.
+    const Expression& fnop = kind == 2 ? *a.args[0].second : *a.args[1].second;
+    TypePtr cur = I::Engine::repr(infer_expr(fnop));
+    std::vector<applymatch::Param> params;
+    while (cur->kind == I::Type::Kind::Arrow) {
+      params.push_back({cur->arrow_label, cur->arrow_lbl});
+      cur = I::Engine::repr(cur->cod);
+    }
+    if (params.empty()) return;
+    applymatch::Result m = applymatch::match(params, {{0, ""}});  // one Nolabel arg
+    if (!m.ok) return;
+    bool trivial = m.slots.size() == 1 && !m.slots[0].omitted &&
+                   !m.slots[0].some_wrap && m.slots[0].param_label == 0;
+    if (!trivial) apply_plans[&enode] = std::move(m.slots);
+  }
   // Rebuild `t` with constr paths under head `from` ("M.") reheaded to `to`
   // ("String."), SHARING unaffected subtrees (the instantiated type may share
   // nodes with the callee's scheme, which must keep its own M.t display).
@@ -4858,6 +4900,7 @@ struct Checker {
   TypePtr infer_apply(const Pexp_apply& a, const Expression& enode) {
     TypePtr ft = infer_expr(*a.fn);
     record_apply_plan(a, enode, ft);
+    record_revapply_plan(a, enode, ft);
     // Applying a value of a reliable non-function type (`1 2`, `"x" y`) is a
     // definite error -- a builtin like int/string is never an arrow.
     if (strict && !a.args.empty()) {

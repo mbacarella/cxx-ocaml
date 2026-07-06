@@ -1281,10 +1281,18 @@ struct Typer {
       if (it->count(name)) return true;
     return false;
   }
+  // A scope entry with this stamp is a SHADOW marker: an `open M` that shadows an
+  // outer binding of the same value name places one in the current frame, so
+  // resolve_value / local_ident skip past it to the opens (and thus to M's
+  // member) rather than the outer binding.  push/pop scopes its lifetime; a later
+  // `let name` overwrites it.  This gives an inner `open` priority over an outer
+  // value binding (apply.ml's `A.(succ @@ zero)` -> A.@@, not the top-level @@).
+  static constexpr long long OPEN_SHADOW_STAMP = -0x5EED1;
   const tt::Ident* local_ident(const std::string& name) {
     for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
       auto f = it->find(name);
-      if (f != it->end()) return &f->second;
+      if (f != it->end())
+        return f->second.stamp == OPEN_SHADOW_STAMP ? nullptr : &f->second;
     }
     return nullptr;
   }
@@ -1412,6 +1420,21 @@ struct Typer {
       if (std::holds_alternative<Pstr_open>(si->item->desc))
         return is_inferred(*si->body);
     return false;
+  }
+  // Does a local `external`'s declared type qualify it for the %apply/%revapply
+  // collapse -- i.e. is it an instance of the generic `('a -> 'b) -> 'a -> 'b`?
+  // The FUNCTION-operand parameter (1st for %apply `f @@ x`, 2nd for %revapply
+  // `x |> f`) must be an arrow or a type variable (both unify with `'a -> 'b`); a
+  // concrete non-arrow (`f -> x -> int`, f abstract) does not, so it stays a
+  // plain application (apply.ml's A.@@).
+  static bool prim_apply_type_ok(const CoreType& t, int kind) {
+    auto* a1 = std::get_if<Ptyp_arrow>(&t.desc);
+    if (!a1) return false;                              // needs >= 2 params
+    auto* a2 = std::get_if<Ptyp_arrow>(&a1->cod->desc);
+    if (!a2) return false;
+    const CoreType* fn_param = (kind == 2) ? a1->dom.get() : a2->dom.get();
+    return std::holds_alternative<Ptyp_arrow>(fn_param->desc) ||
+           std::holds_alternative<Ptyp_var>(fn_param->desc);
   }
   // `a |> b` (%revapply) and `b @@ a` (%apply) are rewritten by the typer to the
   // application `b a`.  Returns 1 for an unshadowed Stdlib `|>`, 2 for `@@`, else
@@ -1921,6 +1944,7 @@ struct Typer {
       for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
         auto f = it->find(l->name);
         if (f != it->end()) {
+          if (f->second.stamp == OPEN_SHADOW_STAMP) break;  // shadowed -> via opens
           tt::Path p;
           p.v = tt::Pident{f->second};
           return p;
@@ -2339,8 +2363,40 @@ struct Typer {
         auto& aexpr = rev == 1 ? a->args[0].second : a->args[1].second;
         tt::Texp_apply ap;
         ap.fn = std::make_unique<tt::Expression>(expr(*fexpr));
-        ap.args.emplace_back(ArgLabel{Nolabel{}},
-                             std::make_unique<tt::Expression>(expr(*aexpr)));
+        // The collapsed call `fn aexpr` may skip fn's leading optionals, which
+        // OCaml fills with a ghost `None` (inference records this as the node's
+        // apply_plan: `bump @@ x` -> `bump ?cap:None x`).
+        const std::vector<applymatch::Slot>* plan = nullptr;
+        if (apply_plans) { auto it = apply_plans->find(&e); if (it != apply_plans->end()) plan = &it->second; }
+        if (plan) {
+          for (auto& s : *plan) {
+            ArgLabel label = Nolabel{};
+            if (s.param_label == 1) label = Labelled{s.param_name};
+            else if (s.param_label == 2) label = Optional{s.param_name};
+            tt::ExprBox av;
+            if (s.omitted) {
+              if (s.none_fill) {
+                av = std::make_unique<tt::Expression>();
+                av->loc = none_loc();
+                av->desc = tt::Texp_construct{"None", {}};
+              }
+            } else {
+              av = std::make_unique<tt::Expression>(expr(*aexpr));  // the sole arg
+              if (s.some_wrap) {
+                auto some = std::make_unique<tt::Expression>();
+                some->loc = av->loc;
+                std::vector<tt::ExprBox> sa;
+                sa.push_back(std::move(av));
+                some->desc = tt::Texp_construct{"Some", std::move(sa)};
+                av = std::move(some);
+              }
+            }
+            ap.args.emplace_back(std::move(label), std::move(av));
+          }
+        } else {
+          ap.args.emplace_back(ArgLabel{Nolabel{}},
+                               std::make_unique<tt::Expression>(expr(*aexpr)));
+        }
         out.desc = std::move(ap);
         return out;
       }
@@ -4086,8 +4142,13 @@ struct Typer {
       if (pr->prim.type) tp.type = core_type(*pr->prim.type);
       tp.prims = pr->prim.prims;
       for (auto& s : pr->prim.prims) {  // record %apply / %revapply externals
-        if (s == "%apply") prim_apply_stamp_[tp.id.stamp] = 2;
-        else if (s == "%revapply") prim_apply_stamp_[tp.id.stamp] = 1;
+        int k = s == "%apply" ? 2 : s == "%revapply" ? 1 : 0;
+        // Only a GENERIC-typed `@@`/`|>` (its type an instance of
+        // `('a -> 'b) -> 'a -> 'b`) collapses `f @@ x` to `f x`.  A monomorphic
+        // `external (@@) : f -> x -> int` (f abstract) is a plain 2-arg apply --
+        // apply.ml's `A.(succ @@ zero)` stays `Texp_apply A.@@ [succ; zero]`.
+        if (k && pr->prim.type && prim_apply_type_ok(*pr->prim.type, k))
+          prim_apply_stamp_[tp.id.stamp] = k;
       }
       si.desc = std::move(tp);
     } else if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
@@ -4108,12 +4169,19 @@ struct Typer {
           for (auto& n : ex->modtypes) oe.modtypes.insert(n);
           for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
         }
-        // A structure-level `open M` SHADOWS an earlier same-named local type
-        // binding (an earlier `type t` / `include`): remove the opened type names
-        // from type_scope so resolve_type falls through to the open (`open FArg`
-        // after `include G` -> a bare `t` is FArg.t, not the included A.t).  A
-        // LATER `type t` re-binds via fresh_type, correctly winning again.
+        // An `open M` SHADOWS an earlier same-named binding of the same name.
+        // TYPES: remove the opened names from type_scope so resolve_type falls
+        // through to the open (`open FArg` after `include G` -> `t` is FArg.t).
+        // VALUES: `scopes` is a stack, so drop a SHADOW marker in the current
+        // frame for any opened value that currently resolves in scope, so
+        // resolve_value skips to the open (apply.ml's `A.(succ @@ zero)` -> A.@@,
+        // not the top-level `@@`).  A LATER `type t` / `let name` re-binds and
+        // correctly wins again.
         for (auto& n : oe.types) type_scope.erase(n);
+        if (!scopes.empty())
+          for (auto& n : oe.values)
+            if (local_ident(n))
+              scopes.back()[n] = tt::Ident{n, OPEN_SHADOW_STAMP, tt::Ident::Local};
         opens.push_back(std::move(oe));
       } else {
         // Generalized open (struct literal / functor application): the items
