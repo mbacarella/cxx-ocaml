@@ -926,7 +926,16 @@ struct TyEmit {
         // In this trunk a Tarrow's DOMAIN is wrapped in Tpoly(ty, []) (to allow
         // first-class-poly arguments); the codomain stays bare.  OCaml asserts
         // (btype.tpoly_get_mono) if the argument isn't a Tpoly.
-        o::ValPtr dom = texpr(o::vblock(8, {emit(t->args[0]), o::vint(0) /*[]*/}));  // Tpoly
+        o::ValPtr inner = emit(t->args[0]);
+        if (t->label_kind == 2 &&
+            !(t->args[0]->k == Ty::Constr && t->args[0]->name == "option")) {
+          // An OPTIONAL argument's stored domain is `d option` (the printer
+          // strips it back to `?x:d`; a bare domain prints `?x:<hidden>`).
+          auto opath = o::vblock(0, {o::vblock(3, {o::vstr("option"), o::vint(12)})});
+          inner = texpr(o::vblock(3, {opath, o::vlist({inner}),
+                                      o::vblock(0, {o::vint(0)})}));  // Tconstr option
+        }
+        o::ValPtr dom = texpr(o::vblock(8, {inner, o::vint(0) /*[]*/}));  // Tpoly
         o::ValPtr c = emit(t->args[1]);
         // arg_label = Nolabel (int 0) | Labelled of string (block tag 0)
         //           | Optional of string (block tag 1)
