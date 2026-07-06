@@ -136,6 +136,7 @@ public:
   // Within an item (params, inner lets, rec groups) nodes stay unstamped and
   // adopt abbreviations on contact, matching ocamlc.  See unify's family rule.
   void finalize_family_heads(const TypePtr& t, bool scheme = false);
+  void finalize_owned_family_heads(const TypePtr& t);
 
   // Lower (not generalize) a value-restricted binding's vars to the current
   // level, so a later sibling's generalize() can't wrongly make them generic.

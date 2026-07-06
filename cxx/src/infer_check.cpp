@@ -6493,6 +6493,7 @@ struct Checker {
           if (strict || non_expansive(*bs[i].expr)) eng.generalize(bound[i]);
           else eng.demote(bound[i]);
           if (toplevel && !strict) eng.finalize_family_heads(bound[i], /*scheme=*/true);
+          else if (!strict) eng.finalize_owned_family_heads(bound[i]);
         }
       return;
     }
@@ -6544,6 +6545,7 @@ struct Checker {
       if (strict || non_expansive(*b.expr)) eng.generalize(bound);
       else eng.demote(bound);  // value restriction: lower, don't trap at inner level
       if (toplevel && !strict) eng.finalize_family_heads(bound, /*scheme=*/true);
+      else if (!strict) eng.finalize_owned_family_heads(bound);
       bind_pattern_scheme(b.pat, bound);
       annot_vars_ = saved_av;
     }

@@ -216,7 +216,11 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
         // every var of the item in progress lives at >= 1 -- an intra-item
         // capture (a param var one level shallower than an annotation's
         // expansion) must stay adoptable (mixin's `Var slot takes Subst.key).
-        if (var->level < level && family_prio(t.get()) >= 0) {
+        // NB `var->level < 1`, not `< level`: an outer PARAM var (level 1)
+        // capturing inside a nested `let` (level 2+) is still intra-item --
+        // its head must stay adoptable (`let re = Str.regexp str in ..
+        // String.equal s str` displays String.t; lib-str/parallel.ml).
+        if (var->level < 1 && family_prio(t.get()) >= 0) {
           if (getenv("STAMPDBG"))
             fprintf(stderr, "[stamp] %s#%d by var#%d(lvl %d) at engine lvl %d\n",
                     t->path.c_str(), t->id, var->id, var->level, level);
@@ -741,7 +745,16 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         TypePtr r;
         if (!changed && !weak_copy && !sch_head) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, std::move(as), t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; }
+        else if (t->kind == Type::Kind::Constr) {
+          r = constr(t->path, std::move(as), t->stamp);
+          r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev;
+          r->labels = t->labels; r->rigid = t->rigid;
+          // Stamp a scheme-head copy with its creation level, so an inner
+          // let's generalization can tell an OWNED head (created at its level;
+          // becomes a per-use scheme head) from a CAPTURED one (created
+          // shallower; stays shared/adoptable) -- see finalize_owned_family_heads.
+          if (sch_head) r->level = level;
+        }
         else if (t->kind == Type::Kind::Object) {
           r = object_type(t->labels, std::move(as));
           r->variant_kind = t->variant_kind;  // open marker
@@ -798,6 +811,49 @@ void Engine::finalize_family_heads(const TypePtr& t0, bool scheme) {
         if (family_prio(t.get()) >= 0) {
           t->level = GENERIC_LEVEL;
           if (scheme) t->scheme_head = true;
+        }
+        [[fallthrough]];
+      case Type::Kind::Tuple:
+      case Type::Kind::Variant:
+      case Type::Kind::Object:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        break;
+      case Type::Kind::Var:
+      case Type::Kind::Link:
+      case Type::Kind::Any:
+        break;
+    }
+  };
+  go(t0);
+}
+
+// Family heads OWNED by a just-ended inner `let` (created at a deeper level
+// than the current one) become per-use scheme heads, so a later abbreviation
+// contact at one use site can't rename another use's display -- ocamlc
+// fresh-copies generic scheme nodes per instance, decoupling uses:
+// `let b = Bytes.create 3 in ignore (f b); Bytes.equal b b` keeps
+// f : bytes -> _ while the equal contact adopts only its own copy.
+// CAPTURED heads (lowered to the current level or below by an outer var)
+// stay shared and adoptable (`let re = Str.regexp str in .. String.equal s
+// str` displays String.t).  Already-GENERIC heads are left alone: cmi scheme
+// heads are finalized at load, and annotation-finalized heads must NOT gain
+// scheme_head (copying them splits shared rows -- ref_spec's `as 'a`).
+void Engine::finalize_owned_family_heads(const TypePtr& t0) {
+  std::unordered_set<Type*> seen;
+  std::function<void(const TypePtr&)> go = [&](const TypePtr& x0) {
+    TypePtr t = repr(x0);
+    switch (t->kind) {
+      case Type::Kind::Arrow:
+        if (!seen.insert(t.get()).second) break;
+        go(t->dom);
+        go(t->cod);
+        break;
+      case Type::Kind::Constr:
+        if (t->level != GENERIC_LEVEL && t->level > level &&
+            family_prio(t.get()) >= 0) {
+          t->level = GENERIC_LEVEL;
+          t->scheme_head = true;
         }
         [[fallthrough]];
       case Type::Kind::Tuple:
