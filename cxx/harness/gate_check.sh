@@ -22,7 +22,7 @@ new=$(comm -13 /tmp/base_accept_sorted.txt /tmp/cur_accept.txt)
 fixed=$(comm -23 /tmp/base_accept_sorted.txt /tmp/cur_accept.txt)
 [ -n "$fixed" ] && { echo "FIXED (shrunk):"; echo "$fixed"; }
 
-echo "--- sig (baseline MATCH 614 / DIFF 11) ---"; echo "MATCH=$sig DIFF=$sigd"
+echo "--- sig (baseline MATCH 620 / DIFF 5) ---"; echo "MATCH=$sig DIFF=$sigd"
 echo "--- typedtree (baseline 100.0% over 886: identical 886, DIFF 0, err 0) ---"; echo "$tt"
 echo "--- lambda DIFF set (baseline 327) ---"
 if diff -q /tmp/base_lambda_diff.txt /tmp/cur_lambda_diff.txt >/dev/null; then echo "PASS ($(wc -l </tmp/cur_lambda_diff.txt))"; else echo "CHANGED"; echo "new-diff:"; comm -13 /tmp/base_lambda_diff.txt /tmp/cur_lambda_diff.txt; echo "gone-diff:"; comm -23 /tmp/base_lambda_diff.txt /tmp/cur_lambda_diff.txt; fi

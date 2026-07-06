@@ -1720,6 +1720,84 @@ struct Checker {
       cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
     } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
   }
+  // A module-qualified field `e.M[.P].label`: the explicit path names the
+  // record's module authoritatively (OCaml's path-directed disambiguation), so
+  // resolve the owning record decl from the cmis and return its accessor scheme
+  // (recTy -> fieldTy, generalized), like field_scheme for local records.  The
+  // LAST matching decl in the signature wins (later decls shadow earlier ones).
+  // M's head reroutes through a file-local alias (`module MP = Gc.Memprof`).
+  TypePtr qualified_field_scheme(const Longident& field) {
+    auto* d = std::get_if<Ldot>(&field.v);
+    if (!d) return nullptr;
+    auto comps = mod_components(*d->prefix);
+    if (comps.empty()) return nullptr;
+    for (auto& [tgt, al] : module_aliases_)
+      if (al == comps[0]) {
+        std::vector<std::string> tc = mod_components_str(tgt);
+        tc.insert(tc.end(), comps.begin() + 1, comps.end());
+        comps = std::move(tc);
+        break;
+      }
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      // Track each module level's (types, cumulative-prefix) so a field type
+      // owned by a PARENT module qualifies to its own module
+      // (LargeFile.stats' `st_kind : file_kind` -> `Unix.file_kind`).
+      std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> scopes;
+      std::vector<std::pair<const std::vector<cmi::ModuleDecl>*, std::string>> mscopes;
+      scopes.push_back({&sig->types, comps[0]});
+      mscopes.push_back({&sig->modules, comps[0]});
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+        if (sig) {
+          scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
+          mscopes.push_back({&sig->modules, mscopes.back().second + "." + comps[i]});
+        }
+      }
+      if (!sig) return nullptr;
+      std::string pfx;
+      for (auto& cmp : comps) { if (!pfx.empty()) pfx += '.'; pfx += cmp; }
+      auto* saved_ctx = cmi_types_ctx_;
+      std::string saved_pfx = cmi_mod_prefix_;
+      bool saved_fold = fold_abbrevs_;
+      auto saved_scopes = cmi_scopes_;
+      auto saved_mscopes = cmi_mod_scopes_;
+      cmi_types_ctx_ = &sig->types;
+      cmi_mod_prefix_ = pfx;
+      cmi_scopes_ = scopes;
+      cmi_mod_scopes_ = mscopes;
+      fold_abbrevs_ = !strict;
+      TypePtr scheme = nullptr;
+      for (auto it = sig->types.rbegin(); it != sig->types.rend() && !scheme; ++it) {
+        if (it->kind != cmi::TypeDecl::Record) continue;
+        for (auto& l : it->labels)
+          if (l.name == d->name) {
+            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            std::vector<TypePtr> params;
+            for (auto& p : it->params) params.push_back(from_cmi(p, memo));
+            TypePtr recTy = eng.constr(pfx + "." + it->name, params);
+            scheme = eng.arrow(recTy, from_cmi(l.type, memo));
+            break;
+          }
+      }
+      cmi_types_ctx_ = saved_ctx;
+      cmi_mod_prefix_ = saved_pfx;
+      cmi_scopes_ = std::move(saved_scopes);
+      cmi_mod_scopes_ = std::move(saved_mscopes);
+      fold_abbrevs_ = saved_fold;
+      return scheme;
+    } catch (...) {
+      cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
+      cmi_scopes_.clear(); cmi_mod_scopes_.clear();
+    }
+    return nullptr;
+  }
+
   // Scan top-level `open M` / `include M` (M a plain module path) and load their
   // record fields, so external record constructions resolve.
   void load_open_record_fields(const ast::Structure& items) {
@@ -4901,6 +4979,11 @@ struct Checker {
     if (auto* wh = std::get_if<Pexp_while>(&e.desc)) {
       try_unify(infer_expr(*wh->cond), eng.constr("bool"));
       infer_expr(*wh->body);
+      // `while true do .. done` never terminates, so it takes the expected
+      // type (typecore's Texp_construct "true" special case): a fresh var here.
+      if (auto* k = std::get_if<Pexp_construct>(&wh->cond->desc))
+        if (auto* l = std::get_if<Lident>(&k->id.txt.v); l && l->name == "true" && !k->arg)
+          return eng.fresh_var();
       return eng.constr("unit");
     }
     if (auto* tr = std::get_if<Pexp_try>(&e.desc)) {
@@ -5098,6 +5181,18 @@ struct Checker {
     }
     // Records, via the unique-label registry (ambiguous labels -> Any).
     if (auto* fld = std::get_if<Pexp_field>(&e.desc)) {
+      // A QUALIFIED label `e.M[.P].label` resolves through its written path
+      // (OCaml's path-directed disambiguation) BEFORE the bare-name registry:
+      // the path is authoritative, and it also PINS the base's record type
+      // (`(stat file).Unix.st_size` gives stat : 'a -> Unix.stats).
+      if (std::holds_alternative<Ldot>(fld->field.txt.v))
+        if (TypePtr qfs = qualified_field_scheme(fld->field.txt)) {
+          TypePtr s = I::Engine::repr(eng.instantiate(qfs));
+          TypePtr bt = infer_expr(*fld->e);
+          try_unify(bt, s->dom);
+          if (record_kinds_) pending_field_.push_back({&e, bt, lid_last(fld->field.txt)});
+          return s->cod;
+        }
       if (TypePtr fsch = field_scheme(lid_last(fld->field.txt))) {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));  // recTy -> fldTy
         TypePtr bt = infer_expr(*fld->e);
