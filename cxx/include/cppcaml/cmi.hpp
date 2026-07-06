@@ -306,6 +306,9 @@ struct SigItem {
   int text_kind = 2;
   bool type_open = false;     // Type: `type t = ..` (Type_open kind)
   bool type_private = false;  // Type: `type t = private ..`
+  // Type: Type_immediacy (0 Unknown / 1 Always / 2 Always_on_64bits) from a
+  // `[@@immediate]` / `[@@immediate64]` attribute (Printtyp renders it back).
+  int type_immediate = 0;
   // Module: rec_status (0 Trec_not / 1 Trec_first / 2 Trec_next) -- a
   // `module rec A .. and B ..` group prints as such only when marked.
   int rec_status = 0;

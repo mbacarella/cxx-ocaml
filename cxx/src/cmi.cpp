@@ -1203,7 +1203,19 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
           o::vint(0), o::vint(0),                      // is_newtype false, expansion_scope 0
           loc_none(),                                  // type_loc
-          o::vint(0), o::vint(0), o::vint(0),          // attrs [], immediate Unknown, unboxed false
+          // type_attributes: Printtyp derives the printed `[@@immediate]` /
+          // `[@@immediate64]` from Type_immediacy.of_attributes of THIS field (not
+          // from type_immediate), so emit the real attribute when marked.
+          [&]() -> o::ValPtr {
+            if (!it.type_immediate) return o::vint(0);  // []
+            const char* nm = it.type_immediate == 2 ? "immediate64" : "immediate";
+            auto attr = o::vblock(0, {
+                o::vblock(0, {o::vstr(nm), loc_none()}),  // attr_name : string loc
+                o::vblock(0, {o::vint(0)}),               // attr_payload = PStr []
+                loc_none()});                             // attr_loc
+            return o::vlist({attr});
+          }(),
+          o::vint(it.type_immediate), o::vint(0),      // type_immediate, unboxed false
           o::vint(0)});                                // type_uid = Uid.Internal
       sig.push_back(o::vblock(1, {ident, tdecl,
                                   // Trec_first, or Trec_next for the `and`
