@@ -936,6 +936,27 @@ struct Typer {
   // `open M.Sub[..]`: walk the cmi signature graph (aliases, named module
   // types, an explicit Stdlib root all resolve — see the walker below).
   void load_open_names_lid(const Longident& lid, OpenEntry& oe) {
+    // A functor-application open (`open Set.Make(Bool)`): its members come from
+    // the functor's RESULT signature.  Build the apply module-expr and reuse the
+    // functor-result peeling in exports_of_modexpr; oe.path is already the
+    // Papply, so a member resolves as `Set.Make(Bool).t` (name-level, abstract).
+    if (auto* ap = std::get_if<Lapply>(&lid.v)) {
+      tt::Tmod_apply ta;
+      ta.fn = std::make_unique<tt::ModuleExpr>();
+      ta.fn->desc = tt::Tmod_ident{resolve_module(*ap->f)};
+      ta.arg = std::make_unique<tt::ModuleExpr>();
+      ta.arg->desc = tt::Tmod_ident{resolve_module(*ap->x)};
+      tt::ModuleExpr appme;
+      appme.desc = std::move(ta);
+      ModExports tmp;
+      if (const ModExports* ex = exports_of_modexpr(appme, tmp)) {
+        for (auto& n : ex->values) oe.values.insert(n);
+        for (auto& n : ex->types) oe.types.insert(n);
+        for (auto& n : ex->modtypes) oe.modtypes.insert(n);
+        for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
+      }
+      return;
+    }
     std::vector<std::string> comps;
     if (!lid_comps(lid, comps)) return;
     const cmi::Signature* sig = cmi_sig_of_comps(comps);
@@ -3218,6 +3239,13 @@ struct Typer {
         OpenEntry oe;
         oe.path = out.path;
         load_open_names_lid(op->id.txt, oe);
+        // A sig-level open makes its members resolve THROUGH the open's path
+        // (abstract -- `open Set.Make(Bool)` gives `Set.Make(Bool).t`),
+        // shadowing any same-named outer binding.  resolve_type checks
+        // type_scope before opens, so drop the opened type names from the
+        // (sig-local, restored-on-exit) type_scope, else a leaked outer type
+        // (a structure-level functor-app open mints fresh local `t`s) wins.
+        for (auto& n : oe.types) type_scope.erase(n);
         opens.push_back(std::move(oe));
         si.desc = std::move(out);
       } else if (auto* cl = std::get_if<Psig_class>(&it.desc)) {

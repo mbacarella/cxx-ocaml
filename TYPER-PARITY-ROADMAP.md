@@ -11,15 +11,26 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.7% (735/1853; 98.7% of the 745 oracle-typed)** |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.7% (736/1853; 98.8% of the 745 oracle-typed)** |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
 > already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-06):
-> 1 c++-err (pr11887, imported #type polyvariant tags) + 9 DIFF files.
-> Correctness (counter-neutral): `open (M : S)` of a global/alias module IDENT
+> 1 c++-err (pr11887, imported #type polyvariant tags) + 8 DIFF files.  Closed
+> most recently (735 -> 736): accepted_batch — a SIGNATURE-level `open
+> Set.Make(Bool)` (a functor-application path) whose member type is referenced
+> (`type nonrec t = t` -> `Set.Make(Bool).t`).  Two combined fixes: (1)
+> load_open_names_lid now handles an `Lapply` longident by building the apply
+> module-expr and reusing exports_of_modexpr's functor-result peeling (oe.path
+> is already the Papply, so a member resolves as the abstract path); (2) a
+> sig-level open drops its opened TYPE names from the (sig-local, restored-on-
+> exit) type_scope so resolve_type falls through to the open -- else a leaked
+> outer `t` (a STRUCTURE-level functor-app open mints fresh local `t`s, which is
+> correct there: the oracle shows `empty/482` stamps, not paths) wins.  The
+> struct-vs-sig asymmetry is the crux: struct-level = fresh stamps, sig-level =
+> abstract paths.  Correctness (counter-neutral): `open (M : S)` of a global/alias module IDENT
 > now strengthens M against its own path (the transparent extra module_expr
 > layer INSIDE the constraint) — open-specific, so it lives in the Pstr_open
 > path, NOT module_expr's Pmod_constraint case (a module-binding constraint
