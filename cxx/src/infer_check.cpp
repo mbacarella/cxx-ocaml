@@ -5570,7 +5570,8 @@ struct Checker {
         if (strict && reliable_callee &&
             (std::holds_alternative<Pexp_constant>(arg->desc) ||
              std::holds_alternative<Pexp_apply>(arg->desc) ||
-             std::holds_alternative<Pexp_send>(arg->desc)) &&
+             std::holds_alternative<Pexp_send>(arg->desc) ||
+             std::holds_alternative<Pexp_variant>(arg->desc)) &&
             builtin_clash(at, spine[idx]->dom))
           note_error("This expression has a type that clashes with the expected type");
         soft_unify(spine[idx]->dom, at);  // propagate; genuine errors via expected_clash
@@ -6644,6 +6645,16 @@ struct Checker {
       size_t n = std::min(a->args.size(), b->args.size());
       for (size_t i = 0; i < n; ++i) if (builtin_clash(a->args[i], b->args[i])) return true;
     }
+    // A polymorphic-variant row can never be a scalar builtin (a Constr
+    // ABBREVIATING a variant has its own path, not a builtin's, so it never
+    // reaches this arm).
+    auto scalar = [](const TypePtr& t) {
+      return t->kind == I::Type::Kind::Constr && t->args.empty() &&
+             reliable_builtin(t->path);
+    };
+    if ((a->kind == I::Type::Kind::Variant && scalar(b)) ||
+        (b->kind == I::Type::Kind::Variant && scalar(a)))
+      return true;
     return false;
   }
   static bool expected_clash(const TypePtr& a0, const TypePtr& b0) {
