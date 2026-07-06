@@ -10,16 +10,21 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Completeness** — never reject valid code | `reject_parity.sh` | 0.1% false-reject | **0.0% (744/744)** ✅ |
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
-| Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.7% (736/1853; 98.8% of the 745 oracle-typed)** |
+| Lambda back end | `lambda_parity.sh` | 52.8% | 55.9% |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **40.2% (745/1853; 100.0% of the 745 oracle-typed)** ✅ |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
-> already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-06):
-> 1 c++-err (pr11887, imported #type polyvariant tags) + 8 DIFF files.  Closed
-> most recently (735 -> 736): accepted_batch — a SIGNATURE-level `open
+> already tracked by `accept_parity.sh`).  **DUMP PARITY COMPLETE 2026-07-06:
+> 745/745 oracle-typed files match (DIFF 0, c++-err 0).**  The last two:
+> cast.ml (a `class c` decl mints THREE idents — obj_id/ty_id/id; Tcty_constr
+> and Ttyp_class print ty_id, Tcl_ident/Texp_new print id — c++ had merged
+> ty_id into the class ident) and pr11887 (`#M.t` type-pattern tags through a
+> local module path: recover the member decl's ident via module_sig_exports_,
+> then the stamp-keyed polyvar_tags_ as usual).  Closed
+> before that (735 -> 736): accepted_batch — a SIGNATURE-level `open
 > Set.Make(Bool)` (a functor-application path) whose member type is referenced
 > (`type nonrec t = t` -> `Set.Make(Bool).t`).  Two combined fixes: (1)
 > load_open_names_lid now handles an `Lapply` longident by building the apply
