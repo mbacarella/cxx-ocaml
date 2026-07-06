@@ -781,6 +781,22 @@ std::string global_of(const std::string& mod) {
   return mod;  // a separately-compiled local module
 }
 
+// Bare type names declared at stdlib.cmi's own top level (`ref`,
+// `in_channel`, `format4`, ...): in source they resolve through the implicit
+// `open Stdlib`, and ocamlc stores them as Pdot(Pident(Global Stdlib), name).
+// Loaded lazily from stdlib.cmi itself so the set tracks the tree.
+bool stdlib_toplevel_type(const std::string& n) {
+  static std::set<std::string>* names = nullptr;
+  if (!names) {
+    names = new std::set<std::string>();
+    try {
+      for (const auto& d : CmiFile::load(g_stdlib_dir + "/stdlib.cmi").types())
+        names->insert(d.name);
+    } catch (const std::exception&) {}  // -nostdlib: set stays empty
+  }
+  return names->count(n) > 0;
+}
+
 // A compilation-unit global -> its .cmi path.  Mirrors lambda's resolve_cmi but
 // keyed by the already-resolved global name.
 std::string resolve_cmi_global(const std::string& g) {
@@ -889,6 +905,12 @@ struct TyEmit {
           // type instead of an opaque variable.
           int st = local_types->at(t->name);
           path = o::vblock(0, {o::vblock(0, {o::vstr(t->name), o::vint(st)})});  // Pident(Local)
+        } else if (stdlib_toplevel_type(t->name)) {
+          // A bare Stdlib-toplevel type (`ref`): resolved through the implicit
+          // `open Stdlib`, stored Pdot(Pident(Global Stdlib), name).
+          if (referenced) (*referenced)["Stdlib"] = true;
+          path = o::vblock(1, {o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})}),
+                               o::vstr(t->name)});  // Pdot(Pident(Global Stdlib), name)
         } else {
           return texpr(o::vblock(0, {o::vint(0)}));  // unknown -> Tvar None
         }
