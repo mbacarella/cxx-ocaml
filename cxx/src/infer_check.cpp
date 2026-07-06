@@ -8945,7 +8945,16 @@ static std::string typext_path(Checker& ck, const Longident& lid) {
       return q->second;
     return l->name;
   }
-  return lid_full(lid);
+  // A dotted extended-type path (`User.tag`): if the HEAD module was pulled into
+  // scope by an `open` (open Runtime_events => User = Runtime_events.User),
+  // qualify it so the .cmi stores the resolved path -- ocamlc records
+  // `Runtime_events.User.tag`, not the source-written `User.tag`.
+  std::string full = lid_full(lid);
+  if (auto dot = full.find('.'); dot != std::string::npos)
+    if (auto q = ck.opened_submod_quals_.find(full.substr(0, dot));
+        q != ck.opened_submod_quals_.end())
+      return q->second + full.substr(dot);
+  return full;
 }
 
 // The engine canonicalises the builtin `eff` to its public alias Effect.t so
