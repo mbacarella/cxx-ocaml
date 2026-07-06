@@ -4181,8 +4181,7 @@ struct Checker {
         // then resolves the unqualified constructor through that type
         // (type-directed disambiguation: Visible/Hidden : Load_path.visibility
         // matched without `open Load_path`).  The strict pass keeps Any.
-        if (record_kinds_) return eng.fresh_var();
-        return eng.any();  // unknown/ambiguous constructor: dynamic
+        return eng.fresh_var();  // P4-C: unknown ctor pattern -> fresh var (was Any)
       }
       TypePtr result;
       auto ps = ctor_params(eng.instantiate(*sch), result);
