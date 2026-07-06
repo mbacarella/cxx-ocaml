@@ -1364,6 +1364,29 @@ struct Typer {
     return false;
   }
 
+  // typecore's is_inferred: an expression whose type is found without an
+  // expected type pushed in.  The %revapply (`|>`) collapse fires ONLY when the
+  // function operand is inferred, so `x |> function ..` / `x |> fun ..` keeps
+  // `|>` as a plain applied ident (a function needs an expected type).
+  static bool is_inferred(const ast::Expression& e) {
+    const auto& d = e.desc;
+    if (std::holds_alternative<Pexp_ident>(d) ||
+        std::holds_alternative<Pexp_apply>(d) ||
+        std::holds_alternative<Pexp_field>(d) ||
+        std::holds_alternative<Pexp_constraint>(d) ||
+        std::holds_alternative<Pexp_coerce>(d) ||
+        std::holds_alternative<Pexp_send>(d) ||
+        std::holds_alternative<Pexp_new>(d))
+      return true;
+    if (auto* p = std::get_if<Pexp_pack>(&d)) return p->pkg.has_value();
+    if (auto* s = std::get_if<Pexp_sequence>(&d)) return is_inferred(*s->e2);
+    if (auto* i = std::get_if<Pexp_ifthenelse>(&d))
+      return i->else_ && is_inferred(*i->then_) && is_inferred(**i->else_);
+    if (auto* si = std::get_if<Pexp_struct_item>(&d))
+      if (std::holds_alternative<Pstr_open>(si->item->desc))
+        return is_inferred(*si->body);
+    return false;
+  }
   // `a |> b` (%revapply) and `b @@ a` (%apply) are rewritten by the typer to the
   // application `b a`.  Returns 1 for an unshadowed Stdlib `|>`, 2 for `@@`, else
   // 0 -- gated on the operator resolving to Stdlib (not a local/opened rebinding).
@@ -2263,8 +2286,12 @@ struct Typer {
       int rev = 0;
       if (a->args.size() == 2 &&
           std::holds_alternative<Nolabel>(a->args[0].first) &&
-          std::holds_alternative<Nolabel>(a->args[1].first))
+          std::holds_alternative<Nolabel>(a->args[1].first)) {
         rev = revapply_kind(*a->fn);
+        // %revapply also requires the function operand (the RHS of `|>`) to be
+        // is_inferred, else `|>` stays a plain applied ident.
+        if (rev == 1 && !is_inferred(*a->args[1].second)) rev = 0;
+      }
       if (rev) {
         auto& fexpr = rev == 1 ? a->args[1].second : a->args[0].second;
         auto& aexpr = rev == 1 ? a->args[0].second : a->args[1].second;

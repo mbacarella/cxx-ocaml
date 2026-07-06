@@ -11,15 +11,23 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.6% (733/1853; 98.4% of the 745 oracle-typed)** |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.6% (734/1853; 98.5% of the 745 oracle-typed)** |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
 > already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-06):
-> 1 c++-err (pr11887, imported #type polyvariant tags) + 11 DIFF files.  Closed
-> most recently (732 -> 733): pr6922 — a self-send whose method is inherited from
+> 1 c++-err (pr11887, imported #type polyvariant tags) + 10 DIFF files.  Closed
+> most recently (733 -> 734): backtrace_deprecated — `x |> function ..` is NOT
+> rewritten to `(function ..) x`.  typecore only collapses `%revapply` (`|>`)
+> when the function operand is `is_inferred` (an expr typed without an expected
+> type: ident/apply/field/constraint/coerce/send/new/pack-with-annot, or a
+> seq/if/local-open ending in one).  A `function`/`fun`/`match` is NOT inferred
+> (it needs an expected type), so `|>` stays a plain applied `Texp_ident
+> Stdlib.|>`.  Added `is_inferred` and gated the rev==1 (%revapply) collapse on
+> it (%apply/`@@` has no such gate).  Closed
+> earlier (732 -> 733): pr6922 — a self-send whose method is inherited from
 > a class we can't enumerate (here `Basic.agent`, a cross-module functor result)
 > now still resolves to `Tmeth_val` (a stamped method ident) rather than bare
 > `Tmeth_name`.  In OCaml EVERY self-send carries a method ident; the class'
