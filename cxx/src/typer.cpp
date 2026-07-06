@@ -1232,6 +1232,10 @@ struct Typer {
   // instance-variable reference (Texp_instvar), not an ordinary identifier.
   std::unordered_map<std::string, tt::Ident> instvars_;
   std::unordered_map<std::string, tt::Ident> class_scope_;  // class names -> Ident
+  // The class-TYPE ident (typeclass's ty_id): a `class c` declaration mints a
+  // ty_id DISTINCT from the class ident, and Tcty_constr/Ttyp_class print it;
+  // a `class type c` has no separate class value, so both maps share one ident.
+  std::unordered_map<std::string, tt::Ident> cltype_scope_;
   // Method self-sends: each class' methods get a shared ident (the "meths" table).
   // A send whose object is the enclosing self resolves the method to its ident
   // (Tmeth_val); every other send prints the name only (Tmeth_name).
@@ -1253,6 +1257,19 @@ struct Typer {
     accu &= (1u << 31) - 1;
     return accu > 0x3FFFFFFF ? static_cast<int>(accu) - (1 << 31)
                              : static_cast<int>(accu);
+  }
+  // Resolve a name in class-TYPE position (Tcty_constr / Ttyp_class): a local
+  // `class c` yields its ty_id, not the class ident.
+  tt::Path resolve_cltype(const Longident& lid) {
+    if (auto* l = std::get_if<Lident>(&lid.v)) {
+      auto it = cltype_scope_.find(l->name);
+      if (it != cltype_scope_.end()) {
+        tt::Path p;
+        p.v = tt::Pident{it->second};
+        return p;
+      }
+    }
+    return resolve_class(lid);
   }
   tt::Path resolve_class(const Longident& lid) {
     if (auto* l = std::get_if<Lident>(&lid.v)) {
@@ -1564,7 +1581,7 @@ struct Typer {
       out.desc = std::move(tc);
     } else if (auto* cl = std::get_if<Ptyp_class>(&t.desc)) {  // `[args] #class`
       tt::Ttyp_class tc;
-      tc.path = resolve_class(cl->id.txt);
+      tc.path = resolve_cltype(cl->id.txt);
       for (auto& arg : cl->args)
         tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*arg)));
       out.desc = std::move(tc);
@@ -3402,6 +3419,7 @@ struct Typer {
         for (auto& d : cl->decls) {
           class_scope_[d.name.txt] = fresh_anon(d.name.txt);
           type_scope[d.name.txt] = fresh_anon(d.name.txt);
+          cltype_scope_[d.name.txt] = fresh_anon(d.name.txt);  // ty_id, distinct
         }
         for (auto& d : cl->decls)
           out.decls.push_back(std::make_unique<tt::ClassTypeDeclaration>(
@@ -3412,6 +3430,7 @@ struct Typer {
         for (auto& d : clt->decls) {
           class_scope_[d.name.txt] = fresh_anon(d.name.txt);
           type_scope[d.name.txt] = fresh_anon(d.name.txt);
+          cltype_scope_[d.name.txt] = class_scope_[d.name.txt];  // no separate value
         }
         for (auto& d : clt->decls)
           out.decls.push_back(std::make_unique<tt::ClassTypeDeclaration>(
@@ -4141,7 +4160,7 @@ struct Typer {
     out.loc = ct.loc;
     if (auto* cn = std::get_if<Pcty_constr>(&ct.desc)) {
       tt::Tcty_constr tc;
-      tc.path = resolve_class(cn->id.txt);
+      tc.path = resolve_cltype(cn->id.txt);
       for (auto& a : cn->args)
         tc.args.push_back(std::make_unique<tt::CoreType>(core_type(*a)));
       out.desc = std::move(tc);
@@ -4449,6 +4468,7 @@ struct Typer {
       for (auto& d : cl->decls) {  // pre-register names (stamp first, mutual refs)
         class_scope_[d.name.txt] = fresh_anon(d.name.txt);
         type_scope[d.name.txt] = fresh_anon(d.name.txt);  // the object type ctor
+        cltype_scope_[d.name.txt] = fresh_anon(d.name.txt);  // ty_id, distinct
       }
       for (auto& d : cl->decls) tc.decls.push_back(class_declaration(d));
       si.desc = std::move(tc);
@@ -4457,6 +4477,7 @@ struct Typer {
       for (auto& d : clt->decls) {  // a class type introduces the `#c` class name
         class_scope_[d.name.txt] = fresh_anon(d.name.txt);
         type_scope[d.name.txt] = fresh_anon(d.name.txt);  // and the object type ctor
+        cltype_scope_[d.name.txt] = class_scope_[d.name.txt];  // no separate value
       }
       for (auto& d : clt->decls) tc.decls.push_back(class_type_declaration(d));
       si.desc = std::move(tc);
