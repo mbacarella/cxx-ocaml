@@ -16,13 +16,6 @@ TypePtr Engine::fresh_var() {
   t->id = next_id_++;
   return t;
 }
-TypePtr Engine::any() {
-  if (!any_) {
-    any_ = std::make_shared<Type>();
-    any_->kind = Type::Kind::Any;
-  }
-  return any_;
-}
 TypePtr Engine::arrow(TypePtr dom, TypePtr cod, int label, std::string lbl) {
   auto t = std::make_shared<Type>();
   t->kind = Type::Kind::Arrow;
@@ -233,8 +226,7 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
         for (auto& a : t->args) go(a, under_row);
         break;
       case Type::Kind::Link:
-      case Type::Kind::Any:
-        break;  // repr already resolved / Any has no vars
+        break;  // repr already resolved
     }
   };
   go(t0, false);
@@ -243,13 +235,6 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
 void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
   TypePtr a = repr(a0), b = repr(b0);
   if (a == b) return;
-  // Any absorbs: it unifies with anything.  If the other side is a variable,
-  // link it to Any so it too becomes dynamic and can't later clash.
-  if (a->kind == Type::Kind::Any || b->kind == Type::Kind::Any) {
-    TypePtr var = a->kind == Type::Kind::Var ? a : b->kind == Type::Kind::Var ? b : nullptr;
-    if (var) { note(var); var->kind = Type::Kind::Link; var->link = any(); }
-    return;
-  }
   if (a->kind == Type::Kind::Var) {
     occurs_and_lower(a, b);
     note(a);
@@ -583,7 +568,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       [&](const TypePtr& x0, std::unordered_set<Type*>& stk, int& budget) -> bool {
     TypePtr t = repr(x0);
     if (--budget < 0) return false;
-    if (t->kind == Type::Kind::Var || t->kind == Type::Kind::Any) return true;
+    if (t->kind == Type::Kind::Var) return true;
     if (!stk.insert(t.get()).second) return false;  // back-edge: cyclic
     bool ok = true;
     if (t->kind == Type::Kind::Arrow) ok = fits(t->dom, stk, budget) && fits(t->cod, stk, budget);
@@ -608,7 +593,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         [&](const TypePtr& x0, std::unordered_set<Type*>& stk) {
       if (!ok || seen.size() > 512) { ok = ok && seen.size() <= 512; return; }
       TypePtr t = repr(x0);
-      if (t->kind == Type::Kind::Var || t->kind == Type::Kind::Any) return;
+      if (t->kind == Type::Kind::Var) return;
       if (stk.count(t.get())) { back_edge = true; return; }
       if (!seen.insert(t.get()).second) return;
       if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object) &&
@@ -681,7 +666,6 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         return r;
       }
       case Type::Kind::Link:
-      case Type::Kind::Any:
         memo[t.get()] = t;
         return t;
     }
@@ -783,9 +767,6 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       }
       case Type::Kind::Link:
         return copy(t);  // repr already resolved; unreachable
-      case Type::Kind::Any:
-        memo[t.get()] = t;
-        return t;  // dynamic: shared, not copied
     }
     return t;
   };
@@ -821,7 +802,6 @@ void Engine::finalize_family_heads(const TypePtr& t0, bool scheme) {
         break;
       case Type::Kind::Var:
       case Type::Kind::Link:
-      case Type::Kind::Any:
         break;
     }
   };
@@ -864,7 +844,6 @@ void Engine::finalize_owned_family_heads(const TypePtr& t0) {
         break;
       case Type::Kind::Var:
       case Type::Kind::Link:
-      case Type::Kind::Any:
         break;
     }
   };
@@ -929,7 +908,6 @@ void Engine::generalize(const TypePtr& t0) {
         for (auto& a : t->args) go(a);
         break;
       case Type::Kind::Link:
-      case Type::Kind::Any:
         break;
     }
   };
@@ -986,7 +964,6 @@ void Engine::demote(const TypePtr& t0) {
         for (auto& a : t->args) go(a);
         break;
       case Type::Kind::Link:
-      case Type::Kind::Any:
         break;
     }
   };
@@ -1406,9 +1383,6 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       break;
     }
     case Type::Kind::Link:
-      break;
-    case Type::Kind::Any:
-      out += "_";
       break;
   }
 }

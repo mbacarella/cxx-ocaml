@@ -28,16 +28,16 @@ using TypePtr = std::shared_ptr<Type>;
 constexpr int GENERIC_LEVEL = 1'000'000'000;
 
 struct Type {
-  // Any is a dynamic/unknown type for values we cannot infer (qualified lookups,
-  // unresolved record fields, ambiguous constructors): it unifies with anything
-  // without clashing or propagating, so it never causes a false rejection.
   // Object is a structural object type `< m1 : t1; m2 : t2 >` (method names in
   // `labels`, types in `args`).  It is produced ONLY in the non-strict passes
   // (signature/value-kinds), so the strict pass never has to reason about it.
   // Variant is an open polymorphic-variant row `[> `A | `B of t]` (tag names in
   // `labels`, per-tag arg types in `args`, presence in `tag_has_arg`).  Like
   // Object, only produced in the non-strict passes.
-  enum class Kind { Var, Arrow, Tuple, Constr, Link, Any, Object, Variant };
+  // (Kind::Any -- the absorbing dynamic type that once backed every
+  // cannot-infer fallback -- was retired when the last producer flipped to
+  // fresh vars; see ANY-REMOVAL-INVENTORY.md.)
+  enum class Kind { Var, Arrow, Tuple, Constr, Link, Object, Variant };
   Kind kind = Kind::Var;
   int level = 0;             // Var: binding level (GENERIC_LEVEL if generalized)
   int id = 0;                // unique id (occurs-check / debug printing)
@@ -107,7 +107,6 @@ public:
   void leave_level() { --level; }
 
   TypePtr fresh_var();
-  TypePtr any();  // the shared dynamic/unknown type
   TypePtr arrow(TypePtr dom, TypePtr cod, int label = 0, std::string lbl = "");
   TypePtr tuple(std::vector<TypePtr> elems);
   TypePtr constr(std::string path, std::vector<TypePtr> args = {}, int stamp = 0);
@@ -155,7 +154,6 @@ private:
   // then keep their own names (no relink) -- the merged slot's representative
   // was chosen by family priority instead (see unify's Variant merge).
   int row_field_depth_ = 0;
-  TypePtr any_;  // singleton Any node
   void occurs_and_lower(const TypePtr& var, const TypePtr& t);
 
   struct Trail { TypePtr node; Type::Kind kind; TypePtr link; int level; };

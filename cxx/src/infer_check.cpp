@@ -3326,33 +3326,13 @@ struct Checker {
     } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) collect_ctors(*c->p, out);
     else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) collect_ctors(*a->p, out);
   }
-  // Is `t` fully GROUND -- no type variable (and no Any) anywhere in its tree?
-  // Does a type reach an Any node (an untranslated/unknown corner)?  Cycle-safe.
-  static bool type_mentions_any(const TypePtr& t0) {
-    std::set<const I::Type*> seen;
-    std::function<bool(const TypePtr&)> go = [&](const TypePtr& x) -> bool {
-      TypePtr t = I::Engine::repr(x);
-      if (!t || !seen.insert(t.get()).second) return false;
-      if (t->kind == I::Type::Kind::Any) return true;
-      if (t->dom && go(t->dom)) return true;
-      if (t->cod && go(t->cod)) return true;
-      for (auto& a : t->args) if (go(a)) return true;
-      for (auto& a : t->abbrev_args) if (go(a)) return true;
-      for (auto& a : t->inherited) if (go(a)) return true;
-      return false;
-    };
-    return go(t0);
-  }
-
   // Used after a GADT branch window is rolled back: a branch result that is
   // still ground did NOT depend on the (now-undone) refinement, so it is the
-  // genuine match result and may be unified outward.  Any is treated as
-  // non-ground (conservative: we don't want to pin the result to `_`).
+  // genuine match result and may be unified outward.
   static bool type_is_ground(const TypePtr& t0) {
     TypePtr t = I::Engine::repr(t0);
     switch (t->kind) {
       case I::Type::Kind::Var: return false;
-      case I::Type::Kind::Any: return false;
       case I::Type::Kind::Arrow:
         return type_is_ground(t->dom) && type_is_ground(t->cod);
       case I::Type::Kind::Tuple:
@@ -3533,7 +3513,6 @@ struct Checker {
     TypePtr a = I::Engine::repr(a0), b = I::Engine::repr(b0);
     if (a == b) return true;
     if (a->kind == I::Type::Kind::Var || b->kind == I::Type::Kind::Var) return true;
-    if (a->kind == I::Type::Kind::Any || b->kind == I::Type::Kind::Any) return true;
     if (is_param_projection(a) || is_param_projection(b)) return true;
     if (a->kind == I::Type::Kind::Constr && b->kind == I::Type::Kind::Constr)
       return a->path == b->path;
@@ -3715,7 +3694,6 @@ struct Checker {
     b = mx_resolve(b, su);
     if (a.get() == b.get()) return true;
     using K = I::Type::Kind;
-    if (a->kind == K::Any || b->kind == K::Any) return true;
     if (a->kind == K::Var) { su[a.get()] = b; return true; }
     if (b->kind == K::Var) { su[b.get()] = a; return true; }
     if (a->kind == K::Tuple && b->kind == K::Tuple) {
@@ -5661,7 +5639,33 @@ struct Checker {
       // same routine already runs in strict for class declarations).
       return infer_object_body(*ob->cs);
     }
-    return eng.any();  // records/fields/objects/etc. unhandled: dynamic, no clash
+    if (auto* ov = std::get_if<Pexp_override>(&e.desc)) {
+      // `{< x = e >}`: each e takes the instance variable's type; the result
+      // is the SELF type, which the engine doesn't model -- fresh per
+      // occurrence (the object rows core remains future work).
+      for (auto& [nm, fe] : ov->fields) infer_expr(*fe);
+      return eng.fresh_var();
+    }
+    if (auto* xt = std::get_if<Pexp_extension>(&e.desc)) {
+      // The compiler-interpreted expression extensions type for real; any
+      // other extension is what ocamlc rejects as uninterpreted.
+      if (xt->name == "extension_constructor" || xt->name == "ocaml.extension_constructor")
+        return eng.constr("extension_constructor");
+      if (xt->name == "atomic.loc" && !xt->payload.str.empty())
+        if (auto* ev = std::get_if<Pstr_eval>(&xt->payload.str[0].desc))
+          return eng.constr("Atomic.Loc.t", {infer_expr(*ev->e)});
+      if (strict) note_error("Uninterpreted extension '" + xt->name + "'.");
+      return eng.fresh_var();
+    }
+    if (std::holds_alternative<Pexp_unreachable>(e.desc))
+      return eng.fresh_var();  // `.` refutation body: types as anything
+    if (std::getenv("ANY_A_DBG"))
+      fprintf(stderr, "ANY_J expr#%d\n", (int)e.desc.index());
+    // The unhandled-form net: nothing on the 1853-file corpus reaches here
+    // (the last three forms -- override, extension, unreachable -- are
+    // handled above); a future unhandled form takes a fresh var per
+    // occurrence like every other incomplete corner.
+    return eng.fresh_var();
   }
 
   // Type an application, matching arguments to parameters by label (OCaml allows
@@ -6284,7 +6288,7 @@ struct Checker {
           // rigid `a = int` arm keeps the annotation's `(a, int)` face
           // (frame-pointers' effc handler).  Skipped when the translation has
           // an untranslated corner (Any) -- the inferred body knows more.
-          else if (fold_abbrevs_ && !type_mentions_any(at)) body = at;
+          else if (fold_abbrevs_) body = at;
         }
       }
     if (record_kinds_) rec_ret_[&f] = body;
@@ -6887,7 +6891,6 @@ struct Checker {
     if (!seen.insert(t.get()).second) return;
     using K = I::Type::Kind;
     switch (t->kind) {
-      case K::Any: any = true; return;
       case K::Var:
         if (t->level != I::GENERIC_LEVEL && pol != 1) weak = true;
         return;
@@ -7116,12 +7119,11 @@ struct Checker {
             for (auto& sit : sg->items)
               if (auto* pt = std::get_if<Psig_type>(&sit.desc))
                 for (auto& d : pt->decls) own.insert(d.name.txt);
-            // qualify own-type constrs; report whether any Any was seen
+            // qualify own-type constrs
             std::function<bool(const TypePtr&, std::set<const I::Type*>&)> qual =
                 [&](const TypePtr& t0, std::set<const I::Type*>& seen) -> bool {
               TypePtr t = I::Engine::repr(t0);
               if (!t || !seen.insert(t.get()).second) return true;
-              if (t->kind == I::Type::Kind::Any) return false;
               if (t->kind == I::Type::Kind::Constr &&
                   t->path.find('.') == std::string::npos && own.count(t->path) &&
                   !func_bind_name_.empty())
@@ -8643,7 +8645,6 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
       if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
       int id = nextvar++; vars[t.get()] = id; return cmi::cmiw::ty_var(id);
     }
-    case K::Any: return cmi::cmiw::ty_var(nextvar++);
     case K::Object: return cmi::cmiw::ty_var(nextvar++);  // opaque in the .cmi for now
     case K::Variant: return cmi::cmiw::ty_var(nextvar++);  // opaque in the .cmi for now
     case K::Arrow:
