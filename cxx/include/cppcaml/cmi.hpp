@@ -312,6 +312,10 @@ struct SigItem {
   // Type: Type_immediacy (0 Unknown / 1 Always / 2 Always_on_64bits) from a
   // `[@@immediate]` / `[@@immediate64]` attribute (Printtyp renders it back).
   int type_immediate = 0;
+  // Type: `[@@unboxed]` -- emitted as the Variant_unboxed / Record_unboxed
+  // REPRESENTATION (Printtyp derives the printed attr from the representation,
+  // not an attribute node).
+  bool type_unboxed = false;
   // Module: rec_status (0 Trec_not / 1 Trec_first / 2 Trec_next) -- a
   // `module rec A .. and B ..` group prints as such only when marked.
   int rec_status = 0;

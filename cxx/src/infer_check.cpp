@@ -8708,9 +8708,11 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     // `[@@immediate]` / `[@@immediate64]` -> the type_declaration's Type_immediacy
     // (Always / Always_on_64bits); Printtyp renders it back as the attribute.
     int immed = 0;
+    bool unboxed = false;
     for (auto& a : d.attrs) {
       if (a.name == "immediate64") immed = 2;
       else if (a.name == "immediate" && immed == 0) immed = 1;
+      else if (a.name == "unboxed" || a.name == "ocaml.unboxed") unboxed = true;
     }
     std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
@@ -8758,6 +8760,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       auto si = cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors));
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed;
+      si.type_unboxed = unboxed;
       out.push_back(std::move(si));
       continue;
     }
@@ -8773,6 +8776,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       auto si = cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels));
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed;
+      si.type_unboxed = unboxed;
       out.push_back(std::move(si));
       continue;
     }

@@ -1182,7 +1182,9 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           cds.push_back(o::vblock(0, {cid, cargs, cres, loc_none(),
                                       o::vint(0) /*attrs*/, o::vint(0) /*Uid.Internal*/}));
         }
-        kind = o::vblock(2, {o::vlist(cds), o::vint(0) /*Variant_regular*/});  // Type_variant
+        // variant_representation: Variant_regular (0) or Variant_unboxed (1),
+        // the latter for a single single-field ctor marked `[@@unboxed]`.
+        kind = o::vblock(2, {o::vlist(cds), o::vint(it.type_unboxed ? 1 : 0)});  // Type_variant
       } else if (!it.labels.empty()) {
         int lstamp = 280;
         std::vector<o::ValPtr> lds;
@@ -1192,7 +1194,11 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                       o::vint(0) /*ld_atomic Nonatomic*/, te.emit(l.ty),
                                       loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
         }
-        kind = o::vblock(1, {o::vlist(lds), o::vint(0) /*Record_regular*/});  // Type_record
+        // record_representation: Record_regular (const 0) or, for a single-field
+        // `[@@unboxed]` record, Record_unboxed of bool (block tag 0; false = not
+        // an inlined record).
+        auto rep = it.type_unboxed ? o::vblock(0, {o::vint(0)}) : o::vint(0);
+        kind = o::vblock(1, {o::vlist(lds), rep});  // Type_record
       } else if (it.type_open) {
         kind = o::vint(0);  // Type_open (`type t = ..`), the lone constant ctor
       } else {
