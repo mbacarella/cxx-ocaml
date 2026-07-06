@@ -711,6 +711,10 @@ struct Typer {
   // of a functor path (`S.Make(..)`), such an alias is strengthened just like a
   // direct global path (a transparent coercion layer in the typed tree).
   std::set<long long> alias_module_stamps_;
+  // `let x = (module .. : S)`: the value x carries package modtype S, so a later
+  // `module X = (val x)` can recover S's members (index_aliases).  Keyed by value
+  // name -> the modtype Longident (borrowed from the AST, which outlives us).
+  std::unordered_map<std::string, const Longident*> value_pkg_modtype_;
   // Module idents bound as a functor PARAMETER: aliasing one (`module M = X`)
   // stays Mp_present (the parameter has no static address to strengthen away),
   // unlike a plain `module M = P` alias which is Mp_absent.
@@ -798,13 +802,8 @@ struct Typer {
 
   // Exports of an elaborated module expression (for generalized opens).
   const ModExports* exports_of_modexpr(const tt::ModuleExpr& me, ModExports& tmp) {
-    if (auto* i = std::get_if<tt::Tmod_ident>(&me.desc)) {
-      if (auto* pi = std::get_if<tt::Pident>(&i->path.v)) {
-        auto f = module_exports_.find(pi->id.stamp);
-        if (f != module_exports_.end()) return &f->second;
-      }
-      return nullptr;
-    }
+    if (auto* i = std::get_if<tt::Tmod_ident>(&me.desc))
+      return exports_by_path(i->path);  // Pident or a dotted path (X.F)
     if (auto* a = std::get_if<tt::Tmod_apply>(&me.desc)) {
       // A cmi functor's application: the members come from the functor's
       // RESULT signature (Set.Make -> Set.S with elt fixed).  Peel the
@@ -1178,7 +1177,13 @@ struct Typer {
         } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
           if (m->md.name.txt) {
             ModExports sub;
-            members_of_ast_modtype(*m->md.type, sub, depth + 1);
+            // A functor member (`module F : functor (_:S) -> sig type t end`):
+            // register F's RESULT-signature members, so an application `X.F(A)`
+            // resolves through F's declared result (index_aliases' FArg.t).  For
+            // dump name-resolution only -- functors aren't accessed as modules.
+            const ast::ModuleType* mty = m->md.type.get();
+            while (auto* fn = std::get_if<Pmty_functor>(&mty->desc)) mty = fn->body.get();
+            members_of_ast_modtype(*mty, sub, depth + 1);
             ex.submodule_stamps.emplace(*m->md.name.txt,
                                         register_virtual_module(std::move(sub)));
           }
@@ -4058,6 +4063,12 @@ struct Typer {
       tt::Tstr_value out;
       out.rf = sv->rf;
       out.bindings = value_bindings(sv->rf, sv->bindings);
+      // Remember `let x = (module .. : S)` so `module X = (val x)` recovers S.
+      for (auto& vb : sv->bindings)
+        if (auto* pv = std::get_if<Ppat_var>(&vb.pat.desc))
+          if (auto* pk = std::get_if<Pexp_pack>(&vb.expr->desc))
+            if (pk->pkg)
+              value_pkg_modtype_[pv->name.txt] = &pk->pkg->path.txt;
       si.desc = std::move(out);
     } else if (auto* ev = std::get_if<Pstr_eval>(&it.desc)) {
       si.desc = tt::Tstr_eval{std::make_unique<tt::Expression>(expr(*ev->e))};
@@ -4097,6 +4108,12 @@ struct Typer {
           for (auto& n : ex->modtypes) oe.modtypes.insert(n);
           for (auto& [n, st] : ex->submodule_stamps) oe.submodules.insert(n);
         }
+        // A structure-level `open M` SHADOWS an earlier same-named local type
+        // binding (an earlier `type t` / `include`): remove the opened type names
+        // from type_scope so resolve_type falls through to the open (`open FArg`
+        // after `include G` -> a bare `t` is FArg.t, not the included A.t).  A
+        // LATER `type t` re-binds via fresh_type, correctly winning again.
+        for (auto& n : oe.types) type_scope.erase(n);
         opens.push_back(std::move(oe));
       } else {
         // Generalized open (struct literal / functor application): the items
@@ -4192,9 +4209,18 @@ struct Typer {
         ModExports tmp;
         if (auto* up = std::get_if<Pmod_unpack>(&b.expr.desc)) {
           // `module M = (val e : S)`: members from the package's module type.
-          if (auto* ce = std::get_if<Pexp_constraint>(&up->e->desc))
-            if (auto* pk = std::get_if<Ptyp_package>(&ce->t->desc))
-              members_of_modtype_lid(pk->path.txt, tmp, 0);
+          // The modtype S comes from an inline `(val (e : (module S)))`, or --
+          // for a bare `(val x)` -- from the value x's recorded pack modtype.
+          const Longident* mtlid = nullptr;
+          if (auto* ce = std::get_if<Pexp_constraint>(&up->e->desc)) {
+            if (auto* pk = std::get_if<Ptyp_package>(&ce->t->desc)) mtlid = &pk->path.txt;
+          } else if (auto* id = std::get_if<Pexp_ident>(&up->e->desc)) {
+            if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
+              auto f = value_pkg_modtype_.find(l->name);
+              if (f != value_pkg_modtype_.end()) mtlid = f->second;
+            }
+          }
+          if (mtlid) members_of_modtype_lid(*mtlid, tmp, 0);
           module_exports_[tm.id.stamp] = std::move(tmp);
         } else if (const ModExports* ex = exports_of_modexpr(*tm.expr, tmp)) {
           module_exports_[tm.id.stamp] = *ex;
