@@ -1105,7 +1105,9 @@ struct Checker {
           ms.push_back(ot->name.txt);
           ts.push_back(from_coretype(*ot->type, vars));
         }
-      return eng.object_type(std::move(ms), std::move(ts));
+      TypePtr r = eng.object_type(std::move(ms), std::move(ts));
+      if (ob->closed == ClosedFlag::Open) r->variant_kind = 1;  // `< ..; .. >`
+      return r;
     }
     return eng.fresh_var();
   }
