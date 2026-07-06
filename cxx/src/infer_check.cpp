@@ -8868,18 +8868,28 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
 // and the whole match collapses to its first arm (the cause of the bootstrapped
 // includemod_errorprinter's `Includemod.Apply_error {..}` collapse + crash).
 // The extended type's writer path for a `type t += ..` item: a bare name
-// resolves like a bare Ptyp_constr head would -- the engine's builtin `eff`
-// shows as its public alias `Effect.t`, and a name brought in by `open M`
-// takes M's qualification (`t` under `open Effect` -> "Effect.t").  A dotted
-// path is taken verbatim (the writer's ladder resolves its head).
+// resolves like a bare Ptyp_constr head would -- a name brought in by
+// `open M` takes M's qualification (`t` under `open Effect` -> "Effect.t").
+// Bare `eff` stays the predef (ocamlc stores what the source wrote: predef
+// eff for `type _ eff +=`, Stdlib.Effect.t for `type _ Effect.t +=`).  A
+// dotted path is taken verbatim (the writer's ladder resolves its head).
 static std::string typext_path(Checker& ck, const Longident& lid) {
   if (auto* l = std::get_if<Lident>(&lid.v)) {
-    if (l->name == "eff") return "Effect.t";
     if (auto q = ck.opened_type_quals_.find(l->name); q != ck.opened_type_quals_.end())
       return q->second;
     return l->name;
   }
   return lid_full(lid);
+}
+
+// The engine canonicalises the builtin `eff` to its public alias Effect.t so
+// annotations and Effect.perform unify/print alike; a typext that extends
+// bare `eff` keeps the PREDEF path in the .cmi (ocamlc stores the source
+// form, `Conversion_failure : string -> int eff`), so rewrite it back.
+static void rewrite_eff_back(const cmi::cmiw::TyPtr& t) {
+  if (!t) return;
+  if (t->k == cmi::cmiw::Ty::Constr && t->name == "Effect.t") t->name = "eff";
+  for (auto& a : t->args) rewrite_eff_back(a);
 }
 
 // The declared params' SOURCE names ("_" for Ptyp_any): ocamlc stores each as
@@ -8932,6 +8942,13 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
     item.ext_path = typext_path(ck, ext->path.txt);
     item.ext_params = typext_param_names(*ext);
     item.text_kind = first ? 0 : 1;  // Text_first / Text_next
+    if (item.ext_path == "eff") {
+      for (auto& c : item.ctors) {
+        for (auto& a : c.args) rewrite_eff_back(a);
+        for (auto& l : c.inline_record) rewrite_eff_back(l.ty);
+      }
+      rewrite_eff_back(item.ext_ret);
+    }
   }
   return item;
 }
