@@ -24,7 +24,9 @@ norm() { perl "$(dirname "$SELF")/signorm.pl"; }
 
 if [ "${1:-}" == "--worker" ]; then
   f="$2"
-  o=$(timeout "$TIMEOUT" "$ORACLE" -nostdlib -I stdlib -i "$f" 2>/dev/null); orc=$?
+  o=$(timeout "$TIMEOUT" "$ORACLE" -nostdlib -I stdlib -I otherlibs/unix \
+      -I otherlibs/str -I otherlibs/systhreads -I otherlibs/runtime_events \
+      -I otherlibs/dynlink -i "$f" 2>/dev/null); orc=$?
   [ $orc -ne 0 ] && { printf 'OERR\n'; exit 0; }          # oracle didn't type it
   on=$(printf '%s\n' "$o" | norm)
   [ -z "$on" ] && { printf 'NOVAL\n'; exit 0; }            # no value bindings to compare

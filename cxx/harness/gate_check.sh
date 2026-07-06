@@ -14,7 +14,7 @@ JOBS=$J bash cxx/harness/lambda_parity.sh >/dev/null 2>&1;    sort /tmp/.lambda_
 echo "--- reject (must equal baseline set) ---"
 if diff -q /tmp/base_reject.txt /tmp/cur_reject.txt >/dev/null; then echo "PASS ($(wc -l </tmp/cur_reject.txt))"; else echo "FAIL"; echo "NEW false-rejects:"; comm -13 /tmp/base_reject.txt /tmp/cur_reject.txt; echo "gone:"; comm -23 /tmp/base_reject.txt /tmp/cur_reject.txt; fi
 
-echo "--- accept (baseline 36; shrinking = win, growth = FAIL) ---"
+echo "--- accept (baseline 37; shrinking = win, growth = FAIL) ---"
 b=$(wc -l </tmp/base_accept_sorted.txt); c=$(wc -l </tmp/cur_accept.txt)
 echo "baseline=$b current=$c"
 new=$(comm -13 /tmp/base_accept_sorted.txt /tmp/cur_accept.txt)
@@ -22,7 +22,7 @@ new=$(comm -13 /tmp/base_accept_sorted.txt /tmp/cur_accept.txt)
 fixed=$(comm -23 /tmp/base_accept_sorted.txt /tmp/cur_accept.txt)
 [ -n "$fixed" ] && { echo "FIXED (shrunk):"; echo "$fixed"; }
 
-echo "--- sig (baseline MATCH 524 / DIFF 1) ---"; echo "MATCH=$sig DIFF=$sigd"
-echo "--- typedtree (baseline 100.0%) ---"; echo "$tt"
+echo "--- sig (baseline MATCH 614 / DIFF 11) ---"; echo "MATCH=$sig DIFF=$sigd"
+echo "--- typedtree (baseline 84.1% over 886: identical 745, DIFF 113, err 28) ---"; echo "$tt"
 echo "--- lambda DIFF set (baseline 327) ---"
 if diff -q /tmp/base_lambda_diff.txt /tmp/cur_lambda_diff.txt >/dev/null; then echo "PASS ($(wc -l </tmp/cur_lambda_diff.txt))"; else echo "CHANGED"; echo "new-diff:"; comm -13 /tmp/base_lambda_diff.txt /tmp/cur_lambda_diff.txt; echo "gone-diff:"; comm -23 /tmp/base_lambda_diff.txt /tmp/cur_lambda_diff.txt; fi

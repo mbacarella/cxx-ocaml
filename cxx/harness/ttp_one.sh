@@ -5,7 +5,9 @@ cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 f="$1"; quiet="${2:-}"
 norm() { perl -0777 -pe 'BEGIN{%m=();$n=0} s{/(\d+)}{"/".($m{$1}//=++$n)}ge; s/\s+\z//'; }
 o=$(mktemp); c=$(mktemp)
-./ocamlc.opt -nostdlib -I stdlib -stop-after typing -dtypedtree "$f" 2>&1 1>/dev/null | sed -n '/^\[/,$p' | norm > "$o"
+./ocamlc.opt -nostdlib -I stdlib -I otherlibs/unix -I otherlibs/str \
+  -I otherlibs/systhreads -I otherlibs/runtime_events -I otherlibs/dynlink \
+  -stop-after typing -dtypedtree "$f" 2>&1 1>/dev/null | sed -n '/^\[/,$p' | norm > "$o"
 ./cxx/build/c++type "$f" 2>/dev/null | norm > "$c"
 if [ "$(head -c 10 "$c")" = "TYPE_ERROR" ]; then
   echo "CPPERR: $(head -1 "$c")"; rm -f "$o" "$c"; exit 2

@@ -24,9 +24,14 @@ key() { printf '%s' "$1" | tr '/' '%'; }
 
 # The -dtypedtree dump (like every -d* dump) goes to stderr and starts at a bare
 # "[".  Strip any leading warning preamble by anchoring on ^\[.
+# The otherlibs -I set mirrors the testsuite's `-I +unix`-style includes (and
+# c++type's built-in search dirs), so lib-unix/lib-threads/... tests type
+# instead of failing on "Unbound module Unix" the real tests never see.
+OTHERLIBS="-I otherlibs/unix -I otherlibs/str -I otherlibs/systhreads \
+  -I otherlibs/runtime_events -I otherlibs/dynlink"
 oracle_raw() {
-  timeout "$CACHE_TIMEOUT" ./ocamlc.opt -nostdlib -I stdlib -stop-after typing \
-    -dtypedtree "$1" 2>&1 1>/dev/null | sed -n '/^\[/,$p'
+  timeout "$CACHE_TIMEOUT" ./ocamlc.opt -nostdlib -I stdlib $OTHERLIBS \
+    -stop-after typing -dtypedtree "$1" 2>&1 1>/dev/null | sed -n '/^\[/,$p'
 }
 
 # Stamp normalization: ident stamps print as name/NNN, both inside quotes
