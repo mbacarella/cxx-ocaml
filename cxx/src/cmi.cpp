@@ -1199,7 +1199,14 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           man,                                         // type_manifest
           // type_variance / type_separability: ONE entry per parameter (OCaml
           // iter2's them against the params -- a length mismatch aborts).
-          [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
+          // Variance = Variance.unknown (May_pos|May_neg = 1|6 = 7), the value
+          // OCaml assigns a param whose variance it can't derive.  Printtyp shows
+          // variance when with_variance is true (abstract, private, or GADT decls:
+          // out_type.ml `abstr`): unknown's get_upper = (true,true) prints as
+          // NoVariance (nothing), matching the oracle -- whereas null (0) would
+          // print Bivariant `+-` on every GADT param.  Concrete non-private decls
+          // set with_variance=false, so the stored value is not shown either way.
+          [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(7)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
           [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
           o::vint(0), o::vint(0),                      // is_newtype false, expansion_scope 0
           loc_none(),                                  // type_loc
