@@ -5075,7 +5075,7 @@ struct Checker {
               return ft;
         }
       }
-      return eng.any();
+      return eng.fresh_var();  // P4-B: unresolved field access -> fresh var (was Any)
     }
     if (auto* rc = std::get_if<Pexp_record>(&e.desc)) {
       // Record update `{ e with ... }`: ocamlc types the result as a FRESH
@@ -5234,7 +5234,7 @@ struct Checker {
           if (!repr.empty()) record_reprs[&e] = std::move(repr);
         }
       }
-      return recTy ? recTy : eng.any();
+      return recTy ? recTy : eng.fresh_var();  // P4-B: no field resolved -> fresh var
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
       if (strict) {
