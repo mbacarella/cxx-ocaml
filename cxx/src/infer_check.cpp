@@ -8678,13 +8678,20 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
       for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));
       std::string path = t->path;
       // The printf-family format type (format/format4/format6, all canonicalised
-      // to "format6" by from_coretype) lives in CamlinternalFormatBasics.  Qualify
-      // it so the cmi writer emits a real Tconstr (Pdot) instead of degrading the
-      // bare name to a Tvar -- otherwise a `val printf : (...) format -> 'a`
-      // records as `'_ -> '_`, the reader can't see the format type, and format
-      // string literals aren't lowered to fmt values (Printf then gets a raw
-      // string and dies in make_printf).
-      if (path == "format6") path = "CamlinternalFormatBasics.format6";
+      // to "format6" by from_coretype) lives in CamlinternalFormatBasics, but
+      // ocamlc stores the SOURCE abbreviation, not the expansion: a 3-visible-arg
+      // format prints back as `format`, a 4-arg one as `format4` (both are
+      // Stdlib-toplevel aliases the cmi writer emits as a real Pdot Tconstr the
+      // reader still recognises via is_format_base); only a genuine 6-arg one
+      // keeps the CamlinternalFormatBasics.format6 name.  Emitting the expansion
+      // instead was a gratuitous DIFF vs the oracle's .cmi.
+      if (path == "format6")
+        path = as.size() == 3   ? "format"
+             : as.size() == 4   ? "format4"
+                                : "CamlinternalFormatBasics.format6";
+      // Lazy.t is the public Stdlib abbreviation of CamlinternalLazy.t; ocamlc
+      // stores the abbreviation, so emit it too rather than the internal name.
+      else if (path == "CamlinternalLazy.t") path = "Lazy.t";
       return cmi::cmiw::ty_constr(path, std::move(as));
     }
     case K::Link: return bridge_ty(t->link, vars, nextvar);
