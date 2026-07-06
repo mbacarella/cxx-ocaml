@@ -8719,9 +8719,17 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       auto pv = bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar);
       // Params keep their SOURCE names (Tvar Some): ocamlc prints
       // `('outputValue, 'message) fieldStatus` back verbatim.  The shared
-      // var node carries the name into every ctor/label occurrence.
+      // var node carries the name into every ctor/label occurrence.  An
+      // ANONYMOUS param (`type _ t`, common on GADT indices) is stored by ocamlc
+      // as Tvar (Some "_") -- Printtyp renders that as `_` and never registers
+      // it as a real name -- so carry the literal "_" too; without it the writer
+      // emits Tvar None and Printtyp invents `'a`.  (With a manifest ocamlc may
+      // rewrite the `_` back to a real name if it occurs there; our failing cases
+      // are all manifest-free, so scope the "_" to that case.)
       if (pv->k == cmi::cmiw::Ty::Var) {
         if (auto* v = std::get_if<Ptyp_var>(&p->desc)) pv->var_name = v->name;
+        else if (std::holds_alternative<Ptyp_any>(p->desc) && !d.manifest)
+          pv->var_name = "_";
       }
       params.push_back(std::move(pv));
     }
