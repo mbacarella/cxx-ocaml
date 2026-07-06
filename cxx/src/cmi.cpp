@@ -7,6 +7,7 @@
 #include <iterator>
 #include <map>
 #include <algorithm>
+#include <functional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -1111,8 +1112,12 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   std::vector<int> item_stamp(items.size());
   std::unordered_map<std::string, int> local_types, local_modtypes;
   for (std::size_t i = 0; i < items.size(); ++i) {
-    item_stamp[i] = stamp++;
+    item_stamp[i] = stamp;
+    // A Class takes THREE idents: the class, its ghost class type, and its
+    // ghost object type `type c` (which is what value types cite as `c`).
+    stamp += items[i].k == SigItem::Class ? 3 : 1;
     if (items[i].k == SigItem::Type) local_types[items[i].name] = item_stamp[i];
+    if (items[i].k == SigItem::Class) local_types[items[i].name] = item_stamp[i] + 2;
     if (items[i].k == SigItem::Modtype) local_modtypes[items[i].name] = item_stamp[i];
   }
   // Types visible here = enclosing-scope types overlaid with this level's own
@@ -1313,6 +1318,108 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                   loc_none(), o::vint(0) /*ext_attributes*/, o::vint(0) /*ext_uid*/});
       sig.push_back(o::vblock(2, {ident, extcon, o::vint(status),
                                   o::vint(0) /*Exported*/}));  // Sig_typext
+    } else if (it.k == SigItem::Class) {
+      // Sig_class(id, class_declaration, Trec_first, Exported), followed by
+      // its two GHOST companions Sig_class_type + Sig_type (same name; the
+      // reader's Signature_group asserts they follow a class, the printer
+      // never shows them).  The printer reads csig_vars/csig_meths (Map.fold
+      // order = alphabetical); csig_self only matters for self-aliased
+      // classes, which we don't emit.
+      int s_class = item_stamp[i];
+      // (mutable/privacy, virtual, ty) String.Map as a balanced marshal tree:
+      // Node{l; v; d; r; h} (block tag 0), Empty = int 0.
+      struct MapEnt { std::string name; o::ValPtr d; };
+      auto build_map = [](std::vector<MapEnt> es) -> o::ValPtr {
+        std::sort(es.begin(), es.end(),
+                  [](const MapEnt& a, const MapEnt& b) { return a.name < b.name; });
+        std::function<std::pair<o::ValPtr, int>(std::size_t, std::size_t)> go =
+            [&](std::size_t lo, std::size_t hi) -> std::pair<o::ValPtr, int> {
+          if (lo >= hi) return {o::vint(0), 0};
+          std::size_t mid = lo + (hi - lo) / 2;
+          auto [l, hl] = go(lo, mid);
+          auto [r, hr] = go(mid + 1, hi);
+          int h = 1 + std::max(hl, hr);
+          return {o::vblock(0, {l, o::vstr(es[mid].name), es[mid].d, r, o::vint(h)}), h};
+        };
+        return go(0, es.size()).first;
+      };
+      std::vector<MapEnt> vars_m, meths_m;
+      std::vector<std::string> mnames; std::vector<TyPtr> mtys;  // for cty_new/self
+      for (auto& f : it.class_fields) {
+        if (f.is_method) {
+          o::ValPtr priv = f.priv ? o::vblock(0, {o::vint(2) /*FKabsent*/})  // Mprivate
+                                  : o::vint(0);                              // Mpublic
+          o::ValPtr mty = te.texpr(o::vblock(8, {te.emit(f.ty), o::vint(0)}));  // Tpoly(ty,[])
+          meths_m.push_back({f.name, o::vblock(0, {priv, o::vint(f.virt ? 0 : 1), mty})});
+          if (!f.priv) { mnames.push_back(f.name); mtys.push_back(f.ty); }
+        } else {
+          vars_m.push_back({f.name, o::vblock(0, {o::vint(f.mut ? 1 : 0),
+                                                  o::vint(f.virt ? 0 : 1), te.emit(f.ty)})});
+        }
+      }
+      // self type: an OPEN object over the public methods (row ends in a Tvar
+      // shared with csig_self_row)
+      o::ValPtr row_var = te.texpr(o::vblock(0, {o::vint(0)}));  // Tvar None
+      o::ValPtr chain = row_var;
+      for (std::size_t m = mnames.size(); m-- > 0;) {
+        o::ValPtr pty = te.texpr(o::vblock(8, {te.emit(mtys[m]), o::vint(0)}));  // Tpoly
+        chain = te.texpr(o::vblock(5, {o::vstr(mnames[m]), o::vint(1) /*FKpublic*/,
+                                       pty, chain}));  // Tfield
+      }
+      o::ValPtr self = te.texpr(o::vblock(4, {chain, o::vblock(0, {o::vint(0)})}));  // Tobject
+      auto csig = o::vblock(0, {self, row_var, o::vint(2) /*dummy FKabsent*/,
+                                build_map(std::move(vars_m)), build_map(std::move(meths_m))});
+      o::ValPtr cty = o::vblock(1, {csig});  // Cty_signature
+      for (std::size_t p = it.class_arrow_doms.size(); p-- > 0;) {
+        int lk = p < it.class_arrow_lks.size() ? it.class_arrow_lks[p] : 0;
+        const std::string& lb = p < it.class_arrow_lbls.size() ? it.class_arrow_lbls[p]
+                                                               : it.name /*unused*/;
+        o::ValPtr lbl = lk == 1 ? o::vblock(0, {o::vstr(lb)})
+                      : lk == 2 ? o::vblock(1, {o::vstr(lb)})
+                                : o::vint(0);
+        TyPtr dom = it.class_arrow_doms[p];
+        if (lk == 2 && !(dom->k == Ty::Constr && dom->name == "option"))
+          dom = ty_constr("option", {dom});  // optional param's stored domain
+        cty = o::vblock(2, {lbl, te.emit(dom), cty});  // Cty_arrow
+      }
+      // cty_new: None for a virtual class; else the constructor's value type
+      // params -> <closed object of public methods>
+      o::ValPtr cnew;
+      if (it.class_virtual) {
+        cnew = o::vint(0);
+      } else {
+        TyPtr nt = ty_object(mnames, mtys);
+        for (std::size_t p = it.class_arrow_doms.size(); p-- > 0;)
+          nt = ty_arrow_lbl(it.class_arrow_doms[p], nt,
+                            p < it.class_arrow_lks.size() ? it.class_arrow_lks[p] : 0,
+                            p < it.class_arrow_lbls.size() ? it.class_arrow_lbls[p] : "");
+        cnew = o::vblock(0, {te.emit(nt)});
+      }
+      auto cpath = o::vblock(0, {o::vblock(0, {o::vstr(it.name), o::vint(s_class + 2)})});
+      auto cdecl = o::vblock(0, {o::vint(0) /*cty_params*/, cty, cpath, cnew,
+                                 o::vint(0) /*variance*/, loc_none(),
+                                 o::vint(0) /*attrs*/, o::vint(0) /*uid*/});
+      sig.push_back(o::vblock(5, {ident, cdecl, o::vint(1) /*Trec_first*/,
+                                  o::vint(0) /*Exported*/}));  // Sig_class
+      // ghost type_declaration builder (14 fields, no params)
+      auto mk_tdecl = [&](o::ValPtr man) {
+        return o::vblock(0, {o::vint(0), o::vint(0),
+                             o::vblock(0, {o::vint(0)}) /*Type_abstract*/,
+                             o::vint(1) /*Public*/, man,
+                             o::vint(0), o::vint(0), o::vint(0), o::vint(0),
+                             loc_none(), o::vint(0), o::vint(0), o::vint(0),
+                             o::vint(0) /*uid*/});
+      };
+      // ghost Sig_class_type: shares cty; clty_hash_type is a bare abstract decl
+      auto clty = o::vblock(0, {o::vint(0) /*clty_params*/, cty, cpath,
+                                mk_tdecl(o::vint(0)), o::vint(0) /*variance*/,
+                                loc_none(), o::vint(0), o::vint(0)});
+      auto clty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_class + 1)});
+      sig.push_back(o::vblock(6, {clty_ident, clty, o::vint(1), o::vint(0)}));  // Sig_class_type
+      // ghost Sig_type c = <closed public object> (what `val o : c` cites)
+      auto ty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_class + 2)});
+      auto g_tdecl = mk_tdecl(o::vblock(0, {te.emit(ty_object(mnames, mtys))}));
+      sig.push_back(o::vblock(1, {ty_ident, g_tdecl, o::vint(1), o::vint(0)}));  // Sig_type
     } else {
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
       // alias (`type t = manifest`).  Variant/record kinds: the climb.

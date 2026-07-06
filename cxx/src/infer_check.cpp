@@ -9711,6 +9711,85 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       if (pmt->type)
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
           out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
+    } else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
+      // `class c [params] = object .. end`: emit Sig_class (the writer adds
+      // the two ghost companions).  Member TYPES come from the checker
+      // (class_types_ / class_ctor_types_ hold the generalized object /
+      // constructor arrow; class_instvars_ the vals); member FLAGS
+      // (mutable/private/virtual) from the AST fields.  Type-parameterized
+      // classes (['a] c) aren't representable yet -- skipped.
+      for (auto& d : pc->decls) {
+        if (!d.params.empty()) continue;
+        const ast::ClassExpr* ce = &d.expr;
+        std::vector<const Pcl_fun*> cparams;
+        for (;;) {
+          if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) { cparams.push_back(pf); ce = pf->body.get(); }
+          else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) ce = pl->body.get();
+          else break;
+        }
+        auto* pst = std::get_if<Pcl_structure>(&ce->desc);
+        if (!pst) continue;  // `class c = other_class` etc.
+        cmi::cmiw::SigItem ci;
+        ci.k = cmi::cmiw::SigItem::Class;
+        ci.name = d.name.txt;
+        ci.class_virtual = (d.virt == VirtualFlag::Virtual);
+        std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
+        // constructor arrows + the final object type
+        TypePtr ct;
+        if (cparams.empty()) {
+          if (auto f = ck.class_types_.find(d.name.txt); f != ck.class_types_.end()) ct = f->second;
+        } else if (auto f = ck.class_ctor_types_.find(d.name.txt); f != ck.class_ctor_types_.end()) {
+          ct = f->second;
+        }
+        TypePtr obj = ct ? I::Engine::repr(ct) : nullptr;
+        while (obj && obj->kind == I::Type::Kind::Arrow) {
+          ci.class_arrow_doms.push_back(bridge_ty(obj->dom, cvars, cnext));
+          ci.class_arrow_lks.push_back(obj->arrow_label);
+          ci.class_arrow_lbls.push_back(obj->arrow_lbl);
+          obj = I::Engine::repr(obj->cod);
+        }
+        // method name -> engine type (from the object row)
+        std::unordered_map<std::string, TypePtr> mtypes;
+        if (obj && obj->kind == I::Type::Kind::Object)
+          for (std::size_t m = 0; m < obj->labels.size() && m < obj->args.size(); ++m)
+            mtypes[obj->labels[m]] = obj->args[m];
+        std::unordered_map<std::string, TypePtr> vtypes;
+        if (auto f = ck.class_instvars_.find(d.name.txt); f != ck.class_instvars_.end())
+          for (auto& [vn, vt] : f->second) vtypes[vn] = vt;
+        for (auto& cf : pst->cs.fields) {
+          if (auto* pv = std::get_if<Pcf_val>(&cf.desc)) {
+            cmi::cmiw::ClassField f;
+            f.name = pv->name.txt;
+            f.mut = (pv->mut == MutableFlag::Mutable);
+            if (auto* cv = std::get_if<Cfk_virtual>(&pv->kind)) {
+              f.virt = true;
+              std::unordered_map<std::string, TypePtr> tv;
+              f.ty = bridge_ty(ck.from_coretype(*cv->type, tv), cvars, cnext);
+            } else if (auto v = vtypes.find(f.name); v != vtypes.end()) {
+              f.ty = bridge_ty(v->second, cvars, cnext);
+            } else {
+              f.ty = cmi::cmiw::ty_var(cnext++);
+            }
+            ci.class_fields.push_back(std::move(f));
+          } else if (auto* pm = std::get_if<Pcf_method>(&cf.desc)) {
+            cmi::cmiw::ClassField f;
+            f.name = pm->name.txt;
+            f.is_method = true;
+            f.priv = (pm->priv == PrivateFlag::Private);
+            if (auto* cv = std::get_if<Cfk_virtual>(&pm->kind)) {
+              f.virt = true;
+              std::unordered_map<std::string, TypePtr> tv;
+              f.ty = bridge_ty(ck.from_coretype(*cv->type, tv), cvars, cnext);
+            } else if (auto m = mtypes.find(f.name); m != mtypes.end()) {
+              f.ty = bridge_ty(m->second, cvars, cnext);
+            } else {
+              f.ty = cmi::cmiw::ty_var(cnext++);
+            }
+            ci.class_fields.push_back(std::move(f));
+          }
+        }
+        out.push_back(std::move(ci));
+      }
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       // A submodule: emit Sig_module so the oracle can resolve `Outer.Inner.x`
       // and so the submodule's runtime field keeps the surrounding value layout

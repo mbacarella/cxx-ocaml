@@ -265,6 +265,11 @@ struct Import { std::string name; std::string crc; };
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
 struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty; };  // record field
+// One member of a class body: a val (mut/virt) or a method (priv/virt).
+struct ClassField {
+  std::string name; TyPtr ty;
+  bool is_method = false, mut = false, virt = false, priv = false;
+};
 struct Ctor {
   std::string name;
   std::vector<TyPtr> args;           // Cstr_tuple args
@@ -275,7 +280,7 @@ struct Ctor {
 };
 struct SigItem;
 struct SigItem {
-  enum K { Value, Type, Module, Modtype, Exception } k = Value;
+  enum K { Value, Type, Module, Modtype, Exception, Class } k = Value;
   std::string name;
   TyPtr ty;                   // Value: the value's type
   std::vector<TyPtr> params;  // Type: type parameters (Var descriptors)
@@ -346,6 +351,15 @@ struct SigItem {
   // Module: `module MD5 : S` -- the decl's modtype is the NAMED reference S
   // (Mty_ident), not S's expansion.  Empty = Mty_signature(sub).
   std::string modtype_ref;
+  // Class: `class name : dom1 -> .. -> object <fields> end`.  Emitted as
+  // Sig_class followed by its two GHOST companions (Sig_class_type + Sig_type
+  // of the same name -- the reader's Signature_group asserts they follow, the
+  // printer never shows them).  A Class item takes THREE idents/stamps.
+  std::vector<ClassField> class_fields;   // vals + methods, source order
+  std::vector<TyPtr> class_arrow_doms;    // constructor params, outermost first
+  std::vector<int> class_arrow_lks;       // 0 Nolabel / 1 Labelled / 2 Optional
+  std::vector<std::string> class_arrow_lbls;
+  bool class_virtual = false;             // `class virtual c` -> cty_new = None
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
                                   std::vector<SigItem> param_sig,
