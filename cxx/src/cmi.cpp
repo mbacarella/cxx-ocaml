@@ -986,10 +986,12 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
 // must cite that decl's exact stamp).
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              std::map<std::string, bool>& referenced,
-                                             int& stamp);
+                                             int& stamp,
+                                             const std::unordered_map<std::string, int>* outer_types = nullptr);
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              std::map<std::string, bool>& referenced,
-                                             int& stamp) {
+                                             int& stamp,
+                                             const std::unordered_map<std::string, int>* outer_types) {
   // Pre-pass: give every item its stamp up front and record the local type
   // names, so a value emitted before/after a type can still cite it by stamp.
   std::vector<int> item_stamp(items.size());
@@ -998,10 +1000,18 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     item_stamp[i] = stamp++;
     if (items[i].k == SigItem::Type) local_types[items[i].name] = item_stamp[i];
   }
+  // Types visible here = enclosing-scope types overlaid with this level's own
+  // (locals shadow).  A nested `module M = struct type t += A end` extending the
+  // ENCLOSING file's `type t = ..` resolves `t` through this map to the outer
+  // Local ident (printed just `t`); without it the typext degrades to a plain
+  // exception.  Passed as the outer scope to nested signatures.
+  std::unordered_map<std::string, int> visible;
+  if (outer_types) visible = *outer_types;
+  for (auto& [n, s] : local_types) visible[n] = s;
   std::vector<o::ValPtr> sig;
   for (std::size_t i = 0; i < items.size(); ++i) {
     const SigItem& it = items[i];
-    TyEmit te; te.referenced = &referenced; te.local_types = &local_types;
+    TyEmit te; te.referenced = &referenced; te.local_types = &visible;
     auto ident = o::vblock(0, {o::vstr(it.name), o::vint(item_stamp[i])});  // Ident.Local{name;stamp}
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
@@ -1048,9 +1058,9 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // The parameter's own signature is left empty (consumers resolve members
         // via the RESULT signature only); the functor still takes a field.
         auto pident = o::vblock(0, {o::vstr(it.functor_param), o::vint(stamp++)});  // Ident.Local
-        auto psig = o::vblock(1, {o::vlist(emit_sig_items(it.param_sig, referenced, stamp))});  // Mty_signature
+        auto psig = o::vblock(1, {o::vlist(emit_sig_items(it.param_sig, referenced, stamp, &visible))});  // Mty_signature
         auto param = o::vblock(0, {o::vblock(0, {pident}) /*Some*/, psig});  // Named(Some, <param sig>)
-        auto body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature(result)
+        auto body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible))});  // Mty_signature(result)
         mty = o::vblock(2, {param, body});  // Mty_functor
       } else if (!it.alias.empty()) {
         // `module name = <target>`: Mty_alias(path), Mp_absent -- an alias is
@@ -1071,7 +1081,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         mty = o::vblock(3, {path});  // Mty_alias
         presence = 1;  // Mp_absent
       } else {
-        mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature
+        mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible))});  // Mty_signature
       }
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                               o::vint(0) /*md_uid*/});  // module_declaration
@@ -1081,7 +1091,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     } else if (it.k == SigItem::Modtype) {
       // Sig_modtype(id, modtype_declaration, vis).  mtd_type = Some(Mty_signature
       // sig).  Takes NO runtime field, so it never shifts the value layout.
-      auto msig = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp))});  // Mty_signature
+      auto msig = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible))});  // Mty_signature
       auto mtd = o::vblock(0, {o::vblock(0, {msig}) /*Some*/, o::vint(0) /*attrs*/,
                                loc_none(), o::vint(0) /*mtd_uid*/});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
