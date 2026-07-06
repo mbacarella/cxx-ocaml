@@ -9450,6 +9450,13 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
             out.push_back(exn_sigitem(ck, ec.name.txt, *pd, &px->ext, first));
             first = false;
           }
+    } else if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {
+      // `module type S = sig .. end` in a .ml (no .mli): emit Sig_modtype so the
+      // inferred .cmi carries it (a modtype takes no runtime field, so it never
+      // shifts the value layout).  Only the signature body is representable yet.
+      if (pmt->type)
+        if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
+          out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       // A submodule: emit Sig_module so the oracle can resolve `Outer.Inner.x`
       // and so the submodule's runtime field keeps the surrounding value layout
