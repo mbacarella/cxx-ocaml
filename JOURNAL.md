@@ -3639,3 +3639,30 @@ Left (6 sites): A x3 + F (separate-compilation, deferred), E variant
 conjunctive rows (the known-unsound trap, NEXT), J catch-all + engine (last).
 The four object false-accepts (pr3968/pr4018/pr4824a/recursive-class) need the
 FULL class model (class-type coercions, virtuals, inheritance) -- future work.
+
+--------------------------------------------------------------------------------
+P4 bucket E site CLEARED by dissection -- 6 -> 5 any() sites, all gates flat
+--------------------------------------------------------------------------------
+The "known-unsound conjunctive trap" fell without the hard core, by splitting
+the polarity: conjunctive semantics live on the MATCHED side only ([< rows
+conjoin shared-tag args -- unifying them is what the reverted attempt got
+wrong), but the any() site (Pexp_variant, strict) was the CONSTRUCTION side,
+where unifying shared-tag args IS OCaml's semantics.  Strict's Ppat_variant
+still returns a fresh var, so no [< row ever reaches strict unify.
+
+- Strict now builds the same open [> row as the other passes on construction.
+  [`A 1; `A "x"] rejects (genuine error); the conjunctive counter-example
+  (f = function `A x -> x+1 ..., g = function `A s -> String.length s ...,
+  h v = f v + g v) verified still ACCEPTED.
+- Bonus: builtin_clash knows Variant-vs-scalar-builtin is a definite clash
+  (an abbreviation has its own path, never a builtin's), and Pexp_variant
+  joined the trustworthy strict argument forms: print_string (`A 1) rejects.
+- All five gates identical throughout (reject 1, accept 36, sig 524/1,
+  typedtree 745/745, lambda DIFF 327).
+
+The full conjunctive model (typing the matched side in strict) is now a
+COMPLETENESS item, not an any() site.  Counter: 5 left = A x3 + F (blocked on
+separate-compilation: per-test -I includes + sibling-.ml builds) and the J
+catch-all/engine (last).  No typer-dentable any() sites remain -- the next
+counter movement goes through the separate-compilation front (which is also
+the .cmi-emission goal's dependency).

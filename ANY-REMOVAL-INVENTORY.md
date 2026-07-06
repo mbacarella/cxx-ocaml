@@ -39,6 +39,28 @@ value-representation class name + comments.)
 Line numbers are as of 2026-07-02 (branch `cpp-rewrite`); re-grep before editing:
 `grep -nE '\bany\(\)|Kind::Any' cxx/src/infer_check.cpp`.
 
+## Progress (2026-07-06 later: 6 → 5 sites — bucket E site CLEARED)
+
+Commits `21efe918ea` + bonus. The known-unsound trap was dissected rather than
+solved whole: conjunctive semantics apply to the **matched** side only (`[<`
+rows conjoin shared-tag args), but site `5317` was the **construction** side,
+where unifying shared-tag args IS OCaml's semantics — `` [`A 1; `A "x"] `` is a
+genuine error (now rejected). Strict's `Ppat_variant` still returns a fresh var
+(infer_check.cpp `~4307`), so no `[<` row ever reaches strict unify and the
+conjunctive counter-example (two matchers with different `` `A `` arg types,
+both applied to one value) stays accepted — verified directly. Bonus:
+`builtin_clash` knows a Variant row is never a scalar builtin, and
+`Pexp_variant` joined the trustworthy strict argument forms
+(``print_string (`A 1)`` rejects).
+
+NB the FULL conjunctive model (typing the matched side in strict — presence/
+conjunction vars) remains future work, but it is a *completeness* item now,
+not an `any()` site: the strict pattern fresh-var is the remaining guard.
+
+Left after E: A ×3 + F ×1 (deferred — separate-compilation), J catch-all
+(`5329`, last). **No typer-dentable `any()` sites remain** — the counter can
+only move again via separate-compilation infrastructure (A/F) and then J.
+
 ## Progress (2026-07-06 later: 9 → 6 sites — bucket D CLEARED)
 
 The three D sites are gone and, more importantly, the **strict pass now has a
@@ -170,18 +192,17 @@ removing it earlier just relocates the fallbacks.
 
 ## Execution plan (dependency order, refreshed 2026-07-06)
 
-State: **6 sites left** in `infer_check.cpp` (re-grep: `grep -cE '\bany\(\)'`).
-G/H/I and part of D closed in the 2026-07-03 sweep; **B + C closed in the
-2026-07-06 sweep**; **D closed later the same day** (see Progress above).
-Module System P1–P3 is done, but the 2026-07-06 sizing (below) shows **A/F are
-NOT typer-dentable** — they are blocked on separate-compilation infrastructure
-(per-test `-I` include context + sibling-`.ml` compilation), not on more
-inference. So despite being "unblocked" by P1–P3 on paper, **A and F are
-deprioritized**. With B/C/D done, the remaining typer-dentable work is **E
-(conjunctive variant rows — the known-unsound trap)**.
+State: **5 sites left** in `infer_check.cpp` (re-grep: `grep -cE '\bany\(\)'`).
+G/H/I and part of D closed in the 2026-07-03 sweep; **B + C, then D, then the
+E site all closed 2026-07-06** (see Progress above). Module System P1–P3 is
+done, but the 2026-07-06 sizing (below) shows **A/F are NOT typer-dentable** —
+they are blocked on separate-compilation infrastructure (per-test `-I` include
+context + sibling-`.ml` compilation), not on more inference. **All remaining
+sites are A/F (deferred) + J (last): the next counter movement requires the
+separate-compilation front.**
 
-Live site lines (2026-07-06, post-D): A = `1186`/`1191`/`1193`; F = `4956`;
-E = `5317`; J catch-all = `5328`. Re-grep before editing.
+Live site lines (2026-07-06, post-E): A = `1186`/`1191`/`1193`; F = `4956`;
+J catch-all = `5329`. Re-grep before editing.
 
 Tracked as tasks #1–#6:
 
@@ -199,11 +220,12 @@ Tracked as tasks #1–#6:
    subtyping machinery was needed to hold the gates (see Progress). The full
    class model (coercions, virtuals, inheritance rows) remains future work,
    tracked by the four object false-accepts.
-5. **[#5] E — conjunctive polymorphic-variant rows** (×1, `5317`). **NEXT
-   typer-dentable frontier.** Hard core and the **known-unsound trap** — the
-   naive row was reverted; needs presence/conjunction vars.
+5. **[#5] E — conjunctive polymorphic-variant rows** — ✅ **site DONE
+   2026-07-06** (6 → 5). Construction rows unify shared-tag args soundly; the
+   conjunctive trap is confined to the matched side, which stays a fresh var
+   in strict (a completeness item, no longer an `any()` site).
 6. **[#6] J — delete the engine mechanism** (`any()` singleton + `infer.cpp`
-   absorb branch) and the catch-all (`5328`). **Last** — deletable only when the
+   absorb branch) and the catch-all (`5329`). **Last** — deletable only when the
    count hits 0. (The catch-all flip to fresh var held all gates on the corpus
    but was reverted on purpose — it must stay the absorbing "unhandled" net until
    every form is typed.) Also fix the `.cmi` bridge (`K::Any → cmiw::ty_var`) to
@@ -211,7 +233,7 @@ Tracked as tasks #1–#6:
 
 ### How progress is measured (every removal)
 
-Work counter (down): `grep -cE '\bany\(\)' cxx/src/infer_check.cpp` — 6 → 0.
+Work counter (down): `grep -cE '\bany\(\)' cxx/src/infer_check.cpp` — 5 → 0.
 Gates that must stay flat, compared as **file SETS** not totals:
 `reject_parity.sh` 744/744 (0.0%), `sig_parity.sh` 525/525,
 `typedtree_parity.sh` 745/745, 0 crashes/1853, `lambda_parity.sh` DIFF set.
