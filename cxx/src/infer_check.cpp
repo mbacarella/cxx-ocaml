@@ -8768,6 +8768,19 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
         v->var_name = t->rigid_name;
         return v;
       }
+      // A first-class module `(module S)` is an engine Constr with the parened
+      // path; `with type` constraints live in labels/args.  ocamlc stores
+      // Tpackage{pack_path; pack_constraints}.
+      if (t->path.rfind("(module ", 0) == 0 && t->path.back() == ')') {
+        std::string mty = t->path.substr(8, t->path.size() - 9);
+        std::vector<cmi::cmiw::TyPtr> ctys;
+        std::vector<std::string> cnames;
+        if (!t->labels.empty() && t->labels.size() == t->args.size()) {
+          cnames = t->labels;
+          for (auto& a : t->args) ctys.push_back(bridge_ty(a, vars, nextvar));
+        }
+        return cmi::cmiw::ty_package(std::move(mty), std::move(cnames), std::move(ctys));
+      }
       std::vector<cmi::cmiw::TyPtr> as;
       for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));
       std::string path = t->path;
@@ -8846,6 +8859,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
             cmi::cmiw::Label lab;
             lab.name = f.name.txt;
             lab.mut = (f.mut == MutableFlag::Mutable);
+        for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
             lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
             cc.inline_record.push_back(std::move(lab));
           }
@@ -8864,6 +8878,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         cmi::cmiw::Label lab;
         lab.name = f.name.txt;
         lab.mut = (f.mut == MutableFlag::Mutable);
+        for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
         lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
         labels.push_back(std::move(lab));
       }
@@ -8976,7 +8991,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
     if (td.kind == cmi::TypeDecl::Record) {
       std::vector<cmi::cmiw::Label> ls;
       for (auto& l : td.labels)
-        ls.push_back({l.name, l.mutable_, conv_cmi_ty(l.type, vars, nv)});
+        ls.push_back({l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv)});
       out.push_back(cmi::cmiw::sig_record(td.name, std::move(params), std::move(ls)));
     } else if (td.kind == cmi::TypeDecl::Variant) {
       std::vector<cmi::cmiw::Ctor> cs;
@@ -9162,6 +9177,7 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
       cmi::cmiw::Label lab;
       lab.name = f.name.txt;
       lab.mut = (f.mut == MutableFlag::Mutable);
+        for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
       lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
       labels.push_back(std::move(lab));
     }

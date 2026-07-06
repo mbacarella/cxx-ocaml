@@ -759,6 +759,9 @@ TyPtr ty_variant_row(std::vector<std::string> tags, std::vector<TyPtr> args,
 TyPtr ty_object(std::vector<std::string> names, std::vector<TyPtr> tys) {
   auto t = std::make_shared<Ty>(); t->k = Ty::Object;
   t->pv_tags = std::move(names); t->args = std::move(tys); return t; }
+TyPtr ty_package(std::string mty, std::vector<std::string> cnames, std::vector<TyPtr> ctys) {
+  auto t = std::make_shared<Ty>(); t->k = Ty::Package; t->name = std::move(mty);
+  t->pv_tags = std::move(cnames); t->args = std::move(ctys); return t; }
 TyPtr ty_var(int id) { auto t = std::make_shared<Ty>(); t->k = Ty::Var; t->var = id; return t; }
 
 namespace {
@@ -864,8 +867,38 @@ struct TyEmit {
   // circular dependency, e.g. stdlib.cmi <-> stdlib__List.cmi).
   std::map<std::string, bool>* referenced = nullptr;
   const std::unordered_map<std::string, int>* local_types = nullptr;  // same-sig type -> stamp
+  const std::unordered_map<std::string, int>* local_modtypes = nullptr;  // same-sig modtype -> stamp
   o::ValPtr texpr(o::ValPtr desc) {  // type_expr = {desc; level; scope; id}
     return o::vblock(0, {desc, o::vint(GENERIC_LEVEL), o::vint(0), o::vint(id--)});
+  }
+  // The Path.t for a Tpackage's modtype name: dotted through the head unit's
+  // global (importing it); bare via the visible modtype map's Local stamp.
+  o::ValPtr mty_path(const std::string& ref) {
+    if (auto dot = ref.find('.'); dot != std::string::npos) {
+      std::string head = global_of(ref.substr(0, dot));
+      if (referenced) (*referenced)[head] = true;
+      o::ValPtr path;
+      if (head.rfind("Stdlib__", 0) == 0) {
+        // a pervasive head goes THROUGH the Stdlib alias (Set.OrderedType =
+        // Pdot(Pdot(Pident(Global Stdlib), "Set"), ..)), like type_path
+        if (referenced) (*referenced)["Stdlib"] = true;
+        path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+        path = o::vblock(1, {path, o::vstr(head.substr(8))});
+      } else {
+        path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global)
+      }
+      for (std::size_t pos = dot; pos != std::string::npos;) {
+        std::size_t nd = ref.find('.', pos + 1);
+        path = o::vblock(1, {path, o::vstr(ref.substr(pos + 1,
+            nd == std::string::npos ? std::string::npos : nd - pos - 1))});  // Pdot
+        pos = nd;
+      }
+      return path;
+    }
+    if (local_modtypes)
+      if (auto it = local_modtypes->find(ref); it != local_modtypes->end())
+        return o::vblock(0, {o::vblock(0, {o::vstr(ref), o::vint(it->second)})});  // Pident(Local)
+    return nullptr;
   }
   // The Path.t for a type-ctor name, via the resolution ladder: dotted name ->
   // Pdot chain off the head's compilation-unit global (a Stdlib__ head goes
@@ -1025,6 +1058,26 @@ struct TyEmit {
         }
         return texpr(o::vblock(4, {row, o::vblock(0, {o::vint(0)})}));  // Tobject(row, ref None)
       }
+      case Ty::Package: {
+        // Tpackage { pack_path; pack_constraints: (string list * type_expr) list }.
+        o::ValPtr path = mty_path(t->name);
+        if (!path) return texpr(o::vblock(0, {o::vint(0)}));  // unplaceable -> Tvar None
+        std::vector<o::ValPtr> cs;
+        for (std::size_t i = 0; i < t->pv_tags.size() && i < t->args.size(); ++i) {
+          // the constraint's type name, split on dots into a string list
+          std::vector<o::ValPtr> comps;
+          const std::string& n = t->pv_tags[i];
+          for (std::size_t s = 0, e; s <= n.size(); s = e + 1) {
+            e = n.find('.', s);
+            if (e == std::string::npos) e = n.size();
+            comps.push_back(o::vstr(n.substr(s, e - s)));
+            if (e == n.size()) break;
+          }
+          cs.push_back(o::vblock(0, {o::vlist(comps), emit(t->args[i])}));
+        }
+        auto package = o::vblock(0, {path, cs.empty() ? o::vint(0) : o::vlist(cs)});
+        return texpr(o::vblock(9, {package}));  // Tpackage
+      }
     }
     return o::vint(0);
   }
@@ -1099,7 +1152,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   std::vector<o::ValPtr> sig;
   for (std::size_t i = 0; i < items.size(); ++i) {
     const SigItem& it = items[i];
-    TyEmit te; te.referenced = &referenced; te.local_types = &visible;
+    TyEmit te; te.referenced = &referenced; te.local_types = &visible; te.local_modtypes = &visible_mt;
     auto ident = o::vblock(0, {o::vstr(it.name), o::vint(item_stamp[i])});  // Ident.Local{name;stamp}
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
@@ -1239,7 +1292,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         for (auto& l : it.ctors[0].inline_record) {
           auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
-                                      o::vint(0) /*ld_atomic Nonatomic*/, te.emit(l.ty),
+                                      o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
                                       loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
         }
         cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
@@ -1279,7 +1332,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
             for (auto& l : c.inline_record) {
               auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
               lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
-                                          o::vint(0) /*ld_atomic Nonatomic*/, te.emit(l.ty),
+                                          o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
                                           loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
             }
             cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
@@ -1301,7 +1354,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         for (auto& l : it.labels) {
           auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
-                                      o::vint(0) /*ld_atomic Nonatomic*/, te.emit(l.ty),
+                                      o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
                                       loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
         }
         // record_representation: Record_regular (const 0) or, for a single-field

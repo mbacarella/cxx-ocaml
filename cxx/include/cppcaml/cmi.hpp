@@ -226,8 +226,9 @@ namespace cmiw {
 struct Ty;
 using TyPtr = std::shared_ptr<Ty>;
 struct Ty {
-  enum K { Constr, Arrow, Tuple, Var, Variant, Object } k = Constr;
-  std::string name;            // Constr: type-ctor name ("int","list","M.t",...)
+  enum K { Constr, Arrow, Tuple, Var, Variant, Object, Package } k = Constr;
+  std::string name;            // Constr: type-ctor name ("int","list","M.t",...);
+                               // Package: the modtype path ("S", "Set.OrderedType")
   std::vector<TyPtr> args;     // Constr: type args; Arrow: {dom, cod}; Tuple:
                                // elems; Object: method types (parallel to
                                // pv_tags); Variant: per-tag arg types (parallel
@@ -246,6 +247,9 @@ TyPtr ty_variant(std::vector<std::string> tags);      // exact all-constant row
 TyPtr ty_variant_row(std::vector<std::string> tags, std::vector<TyPtr> args,
                      int row_kind, std::vector<std::string> present);
 TyPtr ty_object(std::vector<std::string> names, std::vector<TyPtr> tys);  // closed `< m : t >`
+// First-class module `(module S)` / `(module S with type t = u ...)`:
+// constraint names in pv_tags (dotted), constraint types in args.
+TyPtr ty_package(std::string mty, std::vector<std::string> cnames, std::vector<TyPtr> ctys);
 TyPtr ty_predef(const std::string& name);             // nullary predef constr
 TyPtr ty_constr(const std::string& name, std::vector<TyPtr> args);
 TyPtr ty_arrow(const TyPtr& dom, const TyPtr& cod);
@@ -260,7 +264,7 @@ struct Import { std::string name; std::string crc; };
 // One signature item, in source order.  A Type item emits Sig_type (it takes no
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
-struct Label { std::string name; bool mut = false; TyPtr ty; };  // record field
+struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty; };  // record field
 struct Ctor {
   std::string name;
   std::vector<TyPtr> args;           // Cstr_tuple args
