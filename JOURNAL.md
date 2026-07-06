@@ -3708,3 +3708,44 @@ file-identical (MATCH 412 -> 414).  gate_check.sh baselines updated.
 
 A's remaining half: test-local .ml SIBLING modules (Store, M/A/B, ...) need
 sibling compilation.  Then re-size the A sites and evaluate the flip.
+
+--------------------------------------------------------------------------------
+track-2 dump parity RE-CLOSED on the 886 corpus: 745 -> 886/886 identical
+--------------------------------------------------------------------------------
+The reopened frontier (DIFF 113 / err 28 on the 141 otherlibs lib-test files)
+fell in two commits, every other gate identical (reject 1, accept 37, sig
+614/11, lambda 327).
+
+Commit 9f41329d16 -- one root cause was ~121 of the 141 files: typer.cpp has
+its OWN name-level cmi walker (separate from infer_check's), and its cmi_unit
+only knew the stdlib naming pattern (stdlib/stdlib__X.cmi).  So `open Unix`
+imported no names at all (the 28 "Unbound value openfile"-style errs -- the
+dump typer threw before printing), and qualified uses resolved through the
+"bare head = auto-opened Stdlib submodule" fallback, dumping Stdlib!.Unix.pipe
+where the oracle has Unix!.pipe (the bulk of the 113 DIFFs).  Fix: cmi_unit
+falls back to the otherlibs -I dirs (new infer_module_dirs() getter shares
+c++type's dir list), and resolve_module roots a dirs-resolvable unit as its
+own GLOBAL ident (Unix!), like Stdlib itself.
+
+Commit 8b22e61dfe -- the 13 residuals were all "n-ary cmi ctor/type, dump
+can't size it" shapes:
+- qualified_ctor_arity now also scans module-level typexts, so
+  Unix.Unix_error (a,b,c) flattens its tuple like a variant ctor (8 files).
+- `C _` with C a cmi ctor of arity N>1: new construct_any_arity side-table
+  (DumpAux) expands the lone _ to N Tpat_any -- populated at both the
+  in-scope and qualified pattern sites.
+- `_ MP.tracker` (MP = Gc.Memprof, a local alias): new type_any_arity
+  side-table + qualified_type_arity, which reroutes the head through
+  module_aliases_ then navigates the cmis for the type's param count.
+- Ppat_open (`Unix.(Unix_error (ENOENT, _, _))`) only opened VALUES; it now
+  opens the module's ctors into a scoped cenv frame (non-strict, like
+  open_module_ctors' other callers), so the bare ctor gets its real arity.
+
+Method note: the 28 errs + 113 DIFFs looked like a long tail but were FOUR
+mechanisms, one of them ~85% of the total.  Diffing ONE file per error
+cluster (TYPE_ERROR head, then normalized-dump diff head) identified each
+mechanism before any code was touched.
+
+New gate_check baseline: typedtree 886/886 (100.0% over oracle-typed).  The
+lib-corpus frontier left: 11 sig DIFFs (display), then bucket A's second
+half (sibling-.ml compilation) for the any() counter.

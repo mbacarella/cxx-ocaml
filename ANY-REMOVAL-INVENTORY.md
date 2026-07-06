@@ -39,7 +39,28 @@ value-representation class name + comments.)
 Line numbers are as of 2026-07-02 (branch `cpp-rewrite`); re-grep before editing:
 `grep -nE '\bany\(\)|Kind::Any' cxx/src/infer_check.cpp`.
 
-## Progress (2026-07-06 latest: bucket A's otherlibs population WIRED — corpus 745 → 886)
+## Progress (2026-07-06 latest: track-2 dump parity RE-CLOSED — 886/886 identical)
+
+The reopened dump-detail frontier (DIFF 113 / err 28 on the 141 new lib files)
+is closed in two commits (`9f41329d16`, `8b22e61dfe`), all other gates flat:
+
+- **One root cause was 121 of the 141**: typer.cpp's name-level cmi walker
+  (`cmi_unit`) only knew the stdlib naming pattern, so `open Unix` imported
+  nothing (the 28 errs) and qualified uses dumped as `Stdlib!.Unix.pipe`
+  (most of the 113 DIFFs). `cmi_unit` now falls back to the otherlibs `-I`
+  dirs (new `infer_module_dirs()` getter) and `resolve_module` roots such a
+  unit as its own global ident (`Unix!`).
+- The 13 residuals were n-ary cmi ctor/type shapes: typext arity
+  (`Unix.Unix_error (a,b,c)` flattens), `C _` → N `Tpat_any`
+  (`construct_any_arity` side-table), `_ MP.tracker` → N `Ttyp_any`
+  (`type_any_arity` + `qualified_type_arity`, alias-rerouted), and
+  `Ppat_open` opening the module's ctors (`Unix.(Unix_error (ENOENT,_,_))`).
+
+New baseline: typedtree **886/886 (100.0%)** over oracle-typed; reject 1,
+accept 37, sig 614/11, lambda 327 unchanged. Remaining lib-corpus frontier =
+the 11 sig DIFFs (display work).
+
+## Progress (2026-07-06: bucket A's otherlibs population WIRED — corpus 745 → 886)
 
 No site-count change (A ×3 still `any()`), but the **separate-compilation
 blocker's biggest half fell**: the typer harness oracles + `c++type` now share
