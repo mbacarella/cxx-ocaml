@@ -2803,7 +2803,11 @@ struct Checker {
       bool saved_fold = fold_abbrevs_;
       cmi_types_ctx_ = &cmi.types();
       cmi_mod_prefix_ = pl->name;
-      fold_abbrevs_ = true;
+      // Folded abbreviations are for DISPLAY (lenient unify swallows the
+      // fold-vs-expansion contact); strict unify has no abbrev expansion, so a
+      // folded `Seq.t` in the scheme would clash with its own expansion
+      // (iterators.ml's `fun () -> Seq.Cons(..)` vs `int Seq.t`).  Expand there.
+      fold_abbrevs_ = !strict;
       TypePtr scheme = nullptr;
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
@@ -2825,6 +2829,25 @@ struct Checker {
         }
         if (scheme) break;
       }
+      // A module-level EXTENSION constructor -- usually `exception Error of ..`
+      // (Dynlink.Error, whose bare name would otherwise hit result's Error):
+      // args -> the extended type (exn for exceptions).
+      if (!scheme)
+        for (auto& x : cmi.sig().typexts) {
+          if (x.name != d->name || x.is_inline_record) continue;
+          std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+          TypePtr result;
+          if (x.res) result = from_cmi(x.res, memo);
+          else {
+            std::string tp = x.type_path ? cmi_path_str(*x.type_path) : "exn";
+            result = eng.constr(tp == "exn" || tp.find('.') != std::string::npos
+                                    ? tp : pl->name + "." + tp);
+          }
+          scheme = result;
+          for (auto it = x.args.rbegin(); it != x.args.rend(); ++it)
+            scheme = eng.arrow(from_cmi(*it, memo), scheme);
+          break;
+        }
       cmi_types_ctx_ = saved_ctx;
       cmi_mod_prefix_ = saved_pfx;
       fold_abbrevs_ = saved_fold;
@@ -4151,8 +4174,10 @@ struct Checker {
       // A QUALIFIED pattern ctor (`Float.FP_normal`) keeps M's own type path
       // (`Float.fpclass`), not the base its bare name resolves to -- ocamlc
       // follows the access path.  Prefer the qualified scheme when M's cmi
-      // yields the ctor (falls through to the qualified branch).  Non-strict.
-      if (sch && !strict && std::holds_alternative<Ldot>(k->id.txt.v) &&
+      // yields the ctor (falls through to the qualified branch).  All passes:
+      // the bare-name hit can be an UNRELATED type's ctor (Dynlink.Error vs
+      // result's Error), which false-rejects in strict.
+      if (sch && std::holds_alternative<Ldot>(k->id.txt.v) &&
           qualified_ctor_scheme(k->id.txt))
         sch = nullptr;
       if (!sch) {
@@ -4162,8 +4187,8 @@ struct Checker {
           if (ar > 1 && (size_t)ar == tup->elems.size()) flatten_construct.insert(&p);
         }
         // The qualified ctor's scheme pins the pattern: `Either.Left s` binds
-        // s:'a and types the scrutinee `('a, 'b) Either.t`.  Non-strict only.
-        if (TypePtr scheme = !strict ? qualified_ctor_scheme(k->id.txt) : nullptr) {
+        // s:'a and types the scrutinee `('a, 'b) Either.t`.
+        if (TypePtr scheme = qualified_ctor_scheme(k->id.txt)) {
           TypePtr result;
           auto ps = ctor_params(scheme, result);
           if (k->arg) {
@@ -4720,9 +4745,10 @@ struct Checker {
       // A QUALIFIED `M.C` (`Result.Ok`) keeps M's own type path (`Result.t`),
       // not the re-exported base (`result`) its bare name resolves to -- ocamlc
       // follows the access path.  When M's cmi yields the ctor, prefer that
-      // scheme by falling through to the qualified branch below.  Non-strict
-      // only (that branch's pinning can't reach the reject pass).
-      if (sch && !strict && std::holds_alternative<Ldot>(k->id.txt.v) &&
+      // scheme by falling through to the qualified branch below.  All passes:
+      // the bare-name hit can be an UNRELATED type's ctor (Dynlink.Error vs
+      // result's Error), which false-rejects in strict.
+      if (sch && std::holds_alternative<Ldot>(k->id.txt.v) &&
           qualified_ctor_scheme(k->id.txt))
         sch = nullptr;
       if (!sch) {
@@ -4733,10 +4759,8 @@ struct Checker {
           if (ar > 1 && (size_t)ar == tup->elems.size()) flatten_construct.insert(&e);
         }
         // The qualified ctor's full scheme pins its argument: `Either.Left "s"`
-        // gives `(string, 'b) Either.t`, not `('a, 'b) Either.t`.  Non-strict
-        // only -- pinning the arg in the strict pass can false-reject when our
-        // incomplete inference mis-types the argument.
-        if (TypePtr scheme = !strict ? qualified_ctor_scheme(k->id.txt) : nullptr) {
+        // gives `(string, 'b) Either.t`, not `('a, 'b) Either.t`.
+        if (TypePtr scheme = qualified_ctor_scheme(k->id.txt)) {
           TypePtr result;
           auto ps = ctor_params(scheme, result);
           if (k->arg) {
@@ -7129,6 +7153,13 @@ struct Checker {
           func_bind_name_ = saved_fbn;
           if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc)) {  // open M -> M's submodules
             for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
+            // Load the opened module's record fields into the label registry --
+            // a QUALIFIED M.x use does this via module_values_cached, but a
+            // local open `Unix.LargeFile.(..)` was skipping it, leaving
+            // `st_size` spuriously UNIQUE at the parent's `Unix.stats : int`
+            // (the submodule's int64 field never registered, so the ambiguity
+            // that forces type-directed resolution never arose).
+            load_module_record_fields(pi->id.txt);
             if (!strict) {
               load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
               open_module_ctors(pi->id.txt);     // bare ctor -> M's variant ctor

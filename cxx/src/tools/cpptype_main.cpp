@@ -1,10 +1,12 @@
 // c++type — type-check an OCaml source file and print the typedtree in
 // -dtypedtree format, byte-comparable (after stamp normalization) with
 // `ocamlc -dtypedtree -stop-after typing`.
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "cppcaml/infer_check.hpp"
 #include "cppcaml/lexer.hpp"
@@ -23,6 +25,17 @@ int main(int argc, char** argv) {
   if (!path) {
     std::cerr << "usage: c++type [--infer|--check] <file.ml>\n";
     return 2;
+  }
+  // The testsuite oracle runs with the tests' `-I +unix`-style otherlibs
+  // includes; give the typer the same resolution power (harness runs from the
+  // repo root, so these are cwd-relative like the default stdlib dir).
+  {
+    std::vector<std::string> dirs;
+    for (const char* d : {"otherlibs/unix", "otherlibs/str",
+                          "otherlibs/systhreads", "otherlibs/runtime_events",
+                          "otherlibs/dynlink"})
+      if (std::filesystem::exists(d)) dirs.push_back(d);
+    if (!dirs.empty()) cppcaml::set_infer_module_dirs(std::move(dirs));
   }
   std::ifstream in(path, std::ios::binary);
   if (!in) {
