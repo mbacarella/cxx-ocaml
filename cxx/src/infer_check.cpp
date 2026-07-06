@@ -5568,7 +5568,8 @@ struct Checker {
         // false-reject.  builtin_clash itself never fires on vars/stamps/Any.
         if (strict && reliable_callee &&
             (std::holds_alternative<Pexp_constant>(arg->desc) ||
-             std::holds_alternative<Pexp_apply>(arg->desc)) &&
+             std::holds_alternative<Pexp_apply>(arg->desc) ||
+             std::holds_alternative<Pexp_send>(arg->desc)) &&
             builtin_clash(at, spine[idx]->dom))
           note_error("This expression has a type that clashes with the expected type");
         soft_unify(spine[idx]->dom, at);  // propagate; genuine errors via expected_clash
@@ -7000,7 +7001,7 @@ struct Checker {
         } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings, /*toplevel=*/true);
         else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
-          if (!strict)  // value kinds + signature: class method bodies (Pexp_object)
+          {  // all passes: class method bodies (Pexp_object) + class_types_ for `new`
             for (auto& d : pc->decls) {
               const ClassExpr* ce = &d.expr;
               std::vector<const Pcl_fun*> params;  // `class c x = ...` parameters
@@ -7035,13 +7036,13 @@ struct Checker {
                                                d.params.empty() ? nullptr : &cvars,
                                                &ptys, &instvars);
                 eng.leave_level();
-                if (!strict) class_instvars_[d.name.txt] = std::move(instvars);
+                class_instvars_[d.name.txt] = std::move(instvars);
                 // A parameterless class: `new c` is its object type.  Generalise
                 // so each `new c` instantiates fresh.
                 if (params.empty() && d.params.empty()) {
                   eng.generalize(ot);
                   class_types_[d.name.txt] = ot;
-                } else if (!strict) {
+                } else {
                   TypePtr obj = I::Engine::repr(ot);
                   if (obj->kind == I::Type::Kind::Object && !d.params.empty()) {
                     obj->abbrev = d.name.txt;
@@ -7057,6 +7058,7 @@ struct Checker {
                 }
               }
             }
+          }
         } else if (auto* pct = std::get_if<Pstr_class_type>(&it.desc)) {
           if (!strict)
             for (auto& d : pct->decls)
