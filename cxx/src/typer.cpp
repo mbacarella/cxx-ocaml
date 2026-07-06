@@ -2087,10 +2087,26 @@ struct Typer {
       // constraint before the unpack).
       out.extras.insert(out.extras.begin(), std::move(ex));
     } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
-      tt::Tpat_record tr;  // only the written fields, in order (label = last comp)
+      tt::Tpat_record tr;  // the written fields (label = last comp)
       for (auto& [lid, sub] : r->fields)
         tr.fields.emplace_back(lid_last(lid.txt),
                                std::make_unique<tt::Pattern>(pattern(*sub)));
+      // OCaml orders Tpat_record fields by their DECLARATION position (lbl_num),
+      // not source order -- so `{ b = ..; a = .. }` over `type t = { a; b }`
+      // prints a before b.  Look the record up by any field (field_registry is
+      // decl-order) and stable-sort; leave unregistered records (cmi-only) alone.
+      if (!tr.fields.empty()) {
+        auto ri = field_registry.find(tr.fields[0].first);
+        if (ri != field_registry.end()) {
+          auto& decl = ri->second.decl_fields;
+          auto pos = [&](const std::string& n) -> size_t {
+            auto d = std::find(decl.begin(), decl.end(), n);
+            return d == decl.end() ? decl.size() : size_t(d - decl.begin());
+          };
+          std::stable_sort(tr.fields.begin(), tr.fields.end(),
+                           [&](auto& a, auto& b) { return pos(a.first) < pos(b.first); });
+        }
+      }
       out.desc = std::move(tr);
     } else if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
       tt::Tpat_array ta;
