@@ -4959,14 +4959,12 @@ struct Checker {
       // `new c` for a parameterless local class is its object type; a class
       // with constructor params is the constructor arrow (mixin2's
       // `lazy_fix (new lambda_ops)`).
-      if (!strict) {
-        if (auto it = class_types_.find(lid_last(nw->id.txt)); it != class_types_.end())
-          return eng.instantiate(it->second);
-        if (auto it = class_ctor_types_.find(lid_last(nw->id.txt));
-            it != class_ctor_types_.end())
-          return eng.instantiate(it->second);
-      }
-      return eng.any();
+      if (auto it = class_types_.find(lid_last(nw->id.txt)); it != class_types_.end())
+        return eng.instantiate(it->second);
+      if (auto it = class_ctor_types_.find(lid_last(nw->id.txt));
+          it != class_ctor_types_.end())
+        return eng.instantiate(it->second);
+      return eng.fresh_var();  // P4-D: unknown class, per-occurrence var
     }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
       // `lazy e` : the PRIMITIVE `e lazy_t` (what ocamlc -i shows for a
