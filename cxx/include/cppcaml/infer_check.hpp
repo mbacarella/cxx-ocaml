@@ -133,6 +133,7 @@ void set_infer_stdlib_dir(const std::string& dir);
 // Extra -I dirs the inferencer searches for a separately-compiled local module's
 // .cmi (so a dependent gets real types for `A.x`, not Any).
 void set_infer_module_dirs(std::vector<std::string> dirs);
+const std::vector<std::string>& infer_module_dirs();
 
 // A compilation unit's top-level signature (in source order) as cmiw items --
 // the input to cmi::cmiw::write_cmi.  Single-var `let` bindings -> Sig_value

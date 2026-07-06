@@ -1,5 +1,6 @@
 #include "cppcaml/typer.hpp"
 
+#include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -611,6 +612,19 @@ bool path_root_global(const tt::Path& p) {
   return false;
 }
 
+// Path of a non-stdlib unit's .cmi in the extra -I dirs (otherlibs: Unix,
+// Thread, ...), "" when absent.  Such a unit is its own global root
+// (`Unix!.pipe`), not a Stdlib submodule.
+std::string extern_unit_cmi(const std::string& unit) {
+  if (unit.empty()) return "";
+  std::string low = (char)std::tolower((unsigned char)unit[0]) + unit.substr(1);
+  for (const std::string& d : infer_module_dirs()) {
+    if (std::filesystem::exists(d + "/" + low + ".cmi")) return d + "/" + low + ".cmi";
+    if (std::filesystem::exists(d + "/" + unit + ".cmi")) return d + "/" + unit + ".cmi";
+  }
+  return "";
+}
+
 // Build the Stdlib path Stdlib!.name (Pdot over a global Stdlib ident).
 tt::Path stdlib_path(const std::string& name) {
   auto pre = std::make_shared<tt::Path>();
@@ -997,9 +1011,13 @@ struct Typer {
       std::string path = unit == "Stdlib" ? "stdlib/stdlib.cmi"
                                           : "stdlib/stdlib__" + unit + ".cmi";
       return &cmi_units_.emplace(unit, cmi::CmiFile::load(path)).first->second;
-    } catch (...) {
-      return nullptr;
-    }
+    } catch (...) {}
+    // A separately compiled unit on the extra -I dirs (Unix, Thread, ...).
+    if (std::string p = extern_unit_cmi(unit); !p.empty())
+      try {
+        return &cmi_units_.emplace(unit, cmi::CmiFile::load(p)).first->second;
+      } catch (...) {}
+    return nullptr;
   }
   static bool tt_path_comps(const tt::Path& p, std::vector<std::string>& out) {
     if (auto* pi = std::get_if<tt::Pident>(&p.v)) {
@@ -2011,6 +2029,13 @@ struct Typer {
       if (l->name == "Stdlib") {
         tt::Path p;
         p.v = tt::Pident{tt::Ident{"Stdlib", 0, tt::Ident::Global}};
+        return p;
+      }
+      // A separately compiled unit on the extra -I dirs is its own global
+      // root (`Unix!.pipe`), not a Stdlib submodule.
+      if (!extern_unit_cmi(l->name).empty()) {
+        tt::Path p;
+        p.v = tt::Pident{tt::Ident{l->name, 0, tt::Ident::Global}};
         return p;
       }
       // Other bare names are auto-opened Stdlib submodules (`List` -> Stdlib.List).

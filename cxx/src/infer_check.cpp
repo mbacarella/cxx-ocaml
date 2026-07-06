@@ -18,6 +18,7 @@ static std::string g_stdlib_dir = "stdlib";
 static std::vector<std::string> g_infer_module_dirs;  // extra -I dirs for local .cmi
 void set_infer_stdlib_dir(const std::string& dir) { g_stdlib_dir = dir; }
 void set_infer_module_dirs(std::vector<std::string> dirs) { g_infer_module_dirs = std::move(dirs); }
+const std::vector<std::string>& infer_module_dirs() { return g_infer_module_dirs; }
 
 namespace {
 
