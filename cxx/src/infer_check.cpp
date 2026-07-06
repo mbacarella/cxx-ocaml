@@ -171,6 +171,16 @@ struct Checker {
   // scopes), so a shadowed `type t` resolves to the right identity.
   int next_type_stamp_ = 1;
   std::unordered_map<const TypeDeclaration*, int> type_stamp_;
+  // Reverse maps for the tuple-GADT exhaustiveness analysis: a stamped opaque
+  // decl's AST (constructor/field lists for the mcomp-lite compatibility check)
+  // and its key into type_ctor_schemes_ (mod_prefix-qualified name).
+  std::unordered_map<int, const TypeDeclaration*> stamp_type_decl_;
+  std::unordered_map<int, std::string> stamp_ctor_key_;
+  // Qualified opaque-decl name -> stamp (registration-scoped resolution of the
+  // bare names inside ctor SCHEMES, which are built before tenv exists), and
+  // bare name -> stamp when the bare name is declared exactly once (-1 = dup).
+  std::unordered_map<std::string, int> qual_type_stamp_;
+  std::unordered_map<std::string, int> bare_unique_stamp_;
   std::vector<std::unordered_map<std::string, int>> tenv{{}};
   // The path prefix of the submodule currently being type-registered (e.g.
   // "Float_record."), so a record type defined there is named `Float_record.s`
@@ -2380,6 +2390,11 @@ struct Checker {
       type_stamp_[&d] = next_type_stamp_++;
       if (!mod_prefix_.empty() && !inc)
         stamp_path_[type_stamp_[&d]] = mod_prefix_ + d.name.txt;
+      stamp_type_decl_[type_stamp_[&d]] = &d;  // decl AST by identity (mcomp-lite)
+      stamp_ctor_key_[type_stamp_[&d]] = mod_prefix_ + d.name.txt;
+      qual_type_stamp_[mod_prefix_ + d.name.txt] = type_stamp_[&d];
+      auto [bu, ins] = bare_unique_stamp_.emplace(d.name.txt, type_stamp_[&d]);
+      if (!ins) bu->second = -1;  // bare name declared twice -> ambiguous
     }
     if (d.manifest) {  // `type (params) t = <manifest>`: a type abbreviation
       std::vector<std::string> ps;
@@ -3105,6 +3120,7 @@ struct Checker {
     for (auto& c : cases) if (!c.guard) any_unguarded = true;
     if (!any_unguarded) return true;
     TypePtr s = I::Engine::repr(scrut);
+    if (s->kind == I::Type::Kind::Tuple) return tuple_gadt_partial(s, cases);
     if (s->kind != I::Type::Kind::Constr) return false;  // unknown type
     static const std::set<std::string> inf = {
         "int", "char", "string", "float", "int32", "int64", "nativeint", "bytes"};
@@ -3253,6 +3269,546 @@ struct Checker {
       if (!refutable) return true;  // this ctor can't be ruled out -> Partial
     }
     return false;  // every uncovered ctor is refutable -> Total
+  }
+
+  // ---- Tuple-scrutinee GADT exhaustiveness (robustmatch) -----------------
+  // A Maranget usefulness check of the all-wildcard vector against the
+  // (unguarded) pattern matrix, with per-branch GADT index refinement:
+  // specializing a column on a GADT constructor records its index equations
+  // in a LOCAL substitution (the scrutinee's `(type a)` newtype is a shared
+  // Var node, so one binding refines every column), and a constructor whose
+  // instantiated index is incompatible with the refined column type is
+  // uninhabited there -- refuted, never a candidate.  Compatibility mirrors
+  // Ctype.mcomp's over-approximation: abstract/unknown types are compatible
+  // with everything; two DISTINCT variant (record) types are incompatible
+  // only when their constructor (field) descriptions differ structurally --
+  // `ab`=A|B vs `mab`=A|B stay compatible (module coherence!), A|B|C vs
+  // X|Y|Z refute.  Rows whose head is impossible under the branch equations
+  // (a string constant at a `c` column) are GADT-dead and simply drop.
+  // Anything unmodeled throws MxBail -> Total (the pre-existing default), so
+  // the analysis only adds Partial verdicts it can prove: a value shape that
+  // avoids every row and is well-typed under the accumulated equations.
+  struct MxBail {};
+  using MxSubst = std::map<const I::Type*, TypePtr>;
+  using MxRow = std::vector<const Pattern*>;  // null cell = wildcard
+  int mx_fuel_ = 0;
+
+  TypePtr mx_resolve(TypePtr t, const MxSubst& su) {
+    t = I::Engine::repr(t);
+    for (int i = 0; t->kind == I::Type::Kind::Var && i < 64; ++i) {
+      auto it = su.find(t.get());
+      if (it == su.end()) break;
+      t = I::Engine::repr(it->second);
+    }
+    return t;
+  }
+
+  static std::string mx_base(const std::string& path) {
+    auto d = path.rfind('.');
+    return d == std::string::npos ? path : path.substr(d + 1);
+  }
+
+  struct MxClass {
+    enum K { Variant, PredefVariant, Record, External, Open, Abstract, Unknown };
+    K k = Unknown;
+    const TypeDeclaration* decl = nullptr;  // Variant/Record when locally declared
+    std::string key;   // Variant: type_ctor_schemes_ key ("" = flat fallback)
+    std::string name;  // External: builtin base; PredefVariant/flat Variant: type name
+  };
+
+  MxClass mx_classify(const TypePtr& c) {
+    MxClass r;
+    std::string b = mx_base(c->path);
+    if (c->stamp) {
+      auto it = stamp_type_decl_.find(c->stamp);
+      if (it == stamp_type_decl_.end()) return r;  // Unknown
+      const TypeDeclaration* d = it->second;
+      if (std::holds_alternative<Ptype_variant>(d->kind)) {
+        r.k = MxClass::Variant; r.decl = d; r.key = stamp_ctor_key_[c->stamp];
+      } else if (std::holds_alternative<Ptype_record>(d->kind)) {
+        r.k = MxClass::Record; r.decl = d;
+      } else if (std::holds_alternative<Ptype_open>(d->kind)) r.k = MxClass::Open;
+      else if (std::holds_alternative<Ptype_external>(d->kind)) {
+        r.k = MxClass::External; r.name = b;
+      } else r.k = MxClass::Abstract;  // opaque abstract
+      return r;
+    }
+    static const std::set<std::string> ext = {
+        "int",   "char",  "string",     "float",  "bytes",  "int32",
+        "int64", "nativeint", "floatarray", "array", "lazy_t", "format6"};
+    static const std::set<std::string> predefv = {"bool", "option", "list",
+                                                  "result", "unit"};
+    bool bare = c->path.find('.') == std::string::npos;
+    if (ext.count(b) && (bare || c->path.rfind("Stdlib.", 0) == 0)) {
+      r.k = MxClass::External; r.name = b;
+      return r;
+    }
+    if (bare) {
+      if (b == "exn" || b == "eff") { r.k = MxClass::Open; return r; }
+      if (predefv.count(b)) { r.k = MxClass::PredefVariant; r.name = b; return r; }
+      if (type_ctor_schemes_.count(c->path)) {
+        r.k = MxClass::Variant; r.key = c->path;
+        return r;
+      }
+      if (type_ctors.count(c->path)) {  // names known, schemes via the flat map
+        r.k = MxClass::Variant; r.name = c->path;
+        return r;
+      }
+      if (auto rd = name_record_decl_.find(b);
+          rd != name_record_decl_.end() && !ambiguous_record_names_.count(b)) {
+        r.k = MxClass::Record; r.decl = rd->second;
+        return r;
+      }
+      return r;  // Unknown
+    }
+    if (type_ctor_schemes_.count(c->path)) {  // module-qualified local variant
+      r.k = MxClass::Variant; r.key = c->path;
+      return r;
+    }
+    return r;  // dotted cmi/abstract type -> Unknown (compatible with all)
+  }
+
+  // Structural constructor description of a variant, for the mcomp variant
+  // comparison: name + argument shape + GADT-result marker, in decl order.
+  static std::vector<std::string> mx_variant_desc(const TypeDeclaration& d) {
+    std::vector<std::string> out;
+    for (auto& c : std::get<Ptype_variant>(d.kind).ctors) {
+      std::string s = c.name.txt + "/";
+      if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
+        s += std::to_string(t->elems.size());
+      else {
+        s += "r";
+        for (auto& f : std::get<Pcstr_record>(c.args).fields) s += ":" + f.name.txt;
+      }
+      if (c.res) s += "/g";
+      out.push_back(std::move(s));
+    }
+    return out;
+  }
+  static std::vector<std::string> mx_predef_desc(const std::string& name) {
+    if (name == "bool") return {"false/0", "true/0"};
+    if (name == "unit") return {"()/0"};
+    if (name == "option") return {"None/0", "Some/1"};
+    if (name == "list") return {"[]/0", "::/2"};
+    if (name == "result") return {"Ok/1", "Error/1"};
+    return {};
+  }
+  static std::vector<std::string> mx_desc_of(const MxClass& c) {
+    if (c.k == MxClass::PredefVariant) return mx_predef_desc(c.name);
+    if (c.k == MxClass::Variant && c.decl) return mx_variant_desc(*c.decl);
+    return {};  // unknown description -> over-approximate compatible
+  }
+  static std::vector<std::string> mx_record_desc(const TypeDeclaration& d) {
+    std::vector<std::string> out;
+    for (auto& f : std::get<Ptype_record>(d.kind).fields)
+      out.push_back(f.name.txt + (f.mut == MutableFlag::Mutable ? "/m" : ""));
+    return out;
+  }
+
+  // Could `a` and `b` be equal under some implementation, given (and
+  // extending) the equations in `su`?  False only when provably distinct.
+  bool mx_compat(TypePtr a, TypePtr b, MxSubst& su) {
+    if (--mx_fuel_ <= 0) throw MxBail{};
+    a = mx_resolve(a, su);
+    b = mx_resolve(b, su);
+    if (a.get() == b.get()) return true;
+    using K = I::Type::Kind;
+    if (a->kind == K::Any || b->kind == K::Any) return true;
+    if (a->kind == K::Var) { su[a.get()] = b; return true; }
+    if (b->kind == K::Var) { su[b.get()] = a; return true; }
+    if (a->kind == K::Tuple && b->kind == K::Tuple) {
+      if (a->args.size() != b->args.size()) return false;
+      for (size_t i = 0; i < a->args.size(); ++i)
+        if (!mx_compat(a->args[i], b->args[i], su)) return false;
+      return true;
+    }
+    if (a->kind == K::Arrow && b->kind == K::Arrow)
+      return mx_compat(a->dom, b->dom, su) && mx_compat(a->cod, b->cod, su);
+    if (a->kind == K::Variant && b->kind == K::Variant) return true;  // rows: over-approx
+    if (a->kind == K::Object && b->kind == K::Object) return true;
+    if (a->kind == K::Constr && b->kind == K::Constr) {
+      MxClass ca = mx_classify(a), cb = mx_classify(b);
+      bool same = (a->stamp && a->stamp == b->stamp) ||
+                  (!a->stamp && !b->stamp && a->path == b->path);
+      auto args_compat = [&]() {
+        if (a->args.size() != b->args.size()) return false;
+        for (size_t i = 0; i < a->args.size(); ++i)
+          if (!mx_compat(a->args[i], b->args[i], su)) return false;
+        return true;
+      };
+      if (same) {
+        // datatype params are injective (compare); abstract ones are not.
+        if (ca.k == MxClass::Abstract || ca.k == MxClass::Unknown) return true;
+        return args_compat();
+      }
+      if (ca.k == MxClass::Abstract || ca.k == MxClass::Unknown ||
+          cb.k == MxClass::Abstract || cb.k == MxClass::Unknown)
+        return true;
+      if (ca.k == MxClass::Open && cb.k == MxClass::Open) return true;
+      if (ca.k == MxClass::External && cb.k == MxClass::External)
+        return ca.name == cb.name && args_compat();
+      bool va = ca.k == MxClass::Variant || ca.k == MxClass::PredefVariant;
+      bool vb = cb.k == MxClass::Variant || cb.k == MxClass::PredefVariant;
+      if (va && vb) {
+        auto da = mx_desc_of(ca), db = mx_desc_of(cb);
+        if (da.empty() || db.empty()) return true;  // unknown desc -> compatible
+        if (da != db) return false;
+        return args_compat();
+      }
+      if (ca.k == MxClass::Record && cb.k == MxClass::Record) {
+        if (!ca.decl || !cb.decl) return true;
+        if (mx_record_desc(*ca.decl) != mx_record_desc(*cb.decl)) return false;
+        return args_compat();
+      }
+      return false;  // distinct concrete kinds (variant vs record vs external)
+    }
+    if (a->kind == K::Constr || b->kind == K::Constr) {
+      // a datatype can't alias a structural shape; an abstract type could.
+      MxClass cc = mx_classify(a->kind == K::Constr ? a : b);
+      return cc.k == MxClass::Abstract || cc.k == MxClass::Unknown;
+    }
+    return false;
+  }
+
+  // The (name, scheme) list of an enumerable variant column.  Per-type map
+  // when the type's key is known; otherwise names from type_ctors + schemes
+  // from the flat ctor map, sanity-checked to build the column's type.
+  std::vector<std::pair<std::string, TypePtr>> mx_ctor_schemes(const MxClass& c,
+                                                               const TypePtr& col) {
+    if (c.k == MxClass::Variant && !c.key.empty()) {
+      auto it = type_ctor_schemes_.find(c.key);
+      if (it == type_ctor_schemes_.end()) throw MxBail{};
+      return it->second;
+    }
+    auto names = type_ctors.find(c.name);
+    if (names == type_ctors.end()) throw MxBail{};
+    std::string colb = mx_base(col->path);
+    std::vector<std::pair<std::string, TypePtr>> out;
+    for (auto& n : names->second) {
+      auto ci = ctors.find(n);
+      if (ci == ctors.end()) throw MxBail{};
+      TypePtr result;
+      ctor_params(ci->second, result);
+      TypePtr r = I::Engine::repr(result);
+      if (r->kind != I::Type::Kind::Constr || mx_base(r->path) != colb)
+        throw MxBail{};  // flat entry shadowed by another type's ctor
+      out.emplace_back(n, ci->second);
+    }
+    return out;
+  }
+
+  // Ctor schemes are built at registration time, BEFORE tenv exists, so their
+  // internal constr nodes carry bare stamp-0 paths (`c1`, not M3.c1/stamp).
+  // Resolve such names lexically under the scheme's OWNING module prefix
+  // (innermost first, then outer, then a globally-unique bare declaration) so
+  // classification and enumeration find the right declaration.
+  int mx_resolve_bare_stamp(const std::string& name, const std::string& prefix) {
+    std::string p = prefix;
+    for (;;) {
+      auto it = qual_type_stamp_.find(p + name);
+      if (it != qual_type_stamp_.end()) return it->second;
+      if (p.empty()) break;
+      auto d = p.rfind('.', p.size() - 2);  // strip the innermost "X."
+      p = d == std::string::npos ? "" : p.substr(0, d + 1);
+    }
+    auto b = bare_unique_stamp_.find(name);
+    return b != bare_unique_stamp_.end() && b->second > 0 ? b->second : 0;
+  }
+  // Deep-copy a (freshly instantiated, analysis-local) scheme, stamping bare
+  // constr nodes resolved under `prefix`.  Vars/Any/rows are shared as-is.
+  TypePtr mx_qualify(const TypePtr& t0, const std::string& prefix,
+                     std::unordered_map<const I::Type*, TypePtr>& memo) {
+    if (--mx_fuel_ <= 0) throw MxBail{};
+    TypePtr t = I::Engine::repr(t0);
+    if (auto m = memo.find(t.get()); m != memo.end()) return m->second;
+    using K = I::Type::Kind;
+    if (t->kind == K::Constr) {
+      int stamp = t->stamp;
+      if (!stamp && t->path.find('.') == std::string::npos)
+        stamp = mx_resolve_bare_stamp(t->path, prefix);
+      TypePtr n = eng.constr(t->path, {}, stamp);
+      memo[t.get()] = n;  // before recursing: recursive schemes terminate
+      for (auto& a : t->args) n->args.push_back(mx_qualify(a, prefix, memo));
+      return n;
+    }
+    if (t->kind == K::Tuple) {
+      TypePtr n = eng.tuple({});
+      memo[t.get()] = n;
+      for (auto& a : t->args) n->args.push_back(mx_qualify(a, prefix, memo));
+      return n;
+    }
+    if (t->kind == K::Arrow) {
+      TypePtr n = eng.arrow(nullptr, nullptr, t->arrow_label, t->arrow_lbl);
+      memo[t.get()] = n;
+      n->dom = mx_qualify(t->dom, prefix, memo);
+      n->cod = mx_qualify(t->cod, prefix, memo);
+      return n;
+    }
+    return t;  // Var/Any/Variant/Object: shared (row tag args left as-is)
+  }
+
+  // Peel wrappers that don't affect matching (constraint/alias/local open).
+  static const Pattern* mx_peel(const Pattern* p) {
+    while (p) {
+      if (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+      else if (auto* a = std::get_if<Ppat_alias>(&p->desc)) p = a->p.get();
+      else if (auto* o = std::get_if<Ppat_open>(&p->desc)) p = o->p.get();
+      else break;
+    }
+    return p;
+  }
+  static bool mx_wild(const Pattern* p) {
+    return !p || std::holds_alternative<Ppat_any>(p->desc) ||
+           std::holds_alternative<Ppat_var>(p->desc);
+  }
+
+  // Is the all-wildcard vector useful against `rows` at column types `cols`
+  // under the equations in `su`?  True = some well-typed value avoids every
+  // row = the match is Partial.
+  bool mx_useful(std::vector<MxRow> rows, std::vector<TypePtr> cols, MxSubst su) {
+    if (--mx_fuel_ <= 0) throw MxBail{};
+    if (rows.empty()) return true;
+    if (cols.empty()) return false;
+    // Normalize column 0: peel wrappers, split or-patterns into extra rows.
+    for (size_t i = 0; i < rows.size();) {
+      const Pattern* p = mx_peel(rows[i][0]);
+      rows[i][0] = p;
+      if (p)
+        if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+          MxRow r2 = rows[i];
+          rows[i][0] = o->l.get();
+          r2[0] = o->r.get();
+          rows.insert(rows.begin() + i + 1, std::move(r2));
+          continue;  // reprocess the left branch (may itself wrap/or)
+        }
+      ++i;
+    }
+    auto tail_of = [](const MxRow& r) { return MxRow(r.begin() + 1, r.end()); };
+    bool allw = true;
+    for (auto& r : rows) if (!mx_wild(r[0])) { allw = false; break; }
+    if (allw) {  // type-agnostic: candidate picks any inhabitant
+      std::vector<MxRow> m2;
+      for (auto& r : rows) m2.push_back(tail_of(r));
+      return mx_useful(std::move(m2), {cols.begin() + 1, cols.end()}, std::move(su));
+    }
+    TypePtr t = mx_resolve(cols[0], su);
+    std::vector<TypePtr> rest(cols.begin() + 1, cols.end());
+    using K = I::Type::Kind;
+    // D(M): rows with a wildcard in column 0, the column dropped.  Sound
+    // whenever a candidate outside every listed head shape exists.
+    auto default_matrix = [&]() {
+      std::vector<MxRow> d;
+      for (auto& r : rows) if (mx_wild(r[0])) d.push_back(tail_of(r));
+      return d;
+    };
+    if (t->kind == K::Tuple) {
+      size_t n = t->args.size();
+      std::vector<MxRow> m2;
+      for (auto& r : rows) {
+        MxRow r2;
+        if (mx_wild(r[0])) r2.assign(n, nullptr);
+        else if (auto* tp = std::get_if<Ppat_tuple>(&r[0]->desc)) {
+          if (tp->elems.size() != n || tp->closed != ClosedFlag::Closed) throw MxBail{};
+          for (auto& l : tp->labels) if (l) throw MxBail{};
+          for (auto& e : tp->elems) r2.push_back(e.get());
+        } else continue;  // non-tuple head at tuple type: GADT-dead row
+        r2.insert(r2.end(), r.begin() + 1, r.end());
+        m2.push_back(std::move(r2));
+      }
+      std::vector<TypePtr> cols2 = t->args;
+      cols2.insert(cols2.end(), rest.begin(), rest.end());
+      return mx_useful(std::move(m2), std::move(cols2), std::move(su));
+    }
+    if (t->kind == K::Variant) {  // exact closed polyvariant row [ `A | `B ]
+      if (t->labels.empty() || !t->inherited.empty() || t->variant_kind != 2)
+        throw MxBail{};
+      for (size_t ti = 0; ti < t->labels.size(); ++ti) {
+        bool has_arg = t->tag_has_arg[ti];
+        MxSubst su2 = su;
+        std::vector<MxRow> s;
+        bool in_sigma = false;
+        for (auto& r : rows) {
+          MxRow r2;
+          if (mx_wild(r[0])) {
+            if (has_arg) r2.push_back(nullptr);
+          } else if (auto* v = std::get_if<Ppat_variant>(&r[0]->desc)) {
+            if (v->label != t->labels[ti]) continue;
+            in_sigma = true;
+            if ((bool)v->arg != has_arg) throw MxBail{};
+            if (has_arg) r2.push_back(v->arg->get());
+          } else if (std::holds_alternative<Ppat_type>(r[0]->desc)) {
+            throw MxBail{};  // #t covers a whole type's tags: unmodeled
+          } else continue;  // dead row
+          r2.insert(r2.end(), r.begin() + 1, r.end());
+          s.push_back(std::move(r2));
+        }
+        std::vector<TypePtr> cols2;
+        if (has_arg) cols2.push_back(t->args[ti]);
+        cols2.insert(cols2.end(), rest.begin(), rest.end());
+        if (in_sigma) {
+          if (mx_useful(std::move(s), std::move(cols2), std::move(su2))) return true;
+        } else if (mx_useful(default_matrix(), rest, std::move(su2))) return true;
+      }
+      return false;
+    }
+    if (t->kind != K::Constr) throw MxBail{};  // Var/Arrow/Object column w/ patterns
+    MxClass tc = mx_classify(t);
+    if (tc.k == MxClass::External && tc.name == "lazy_t" && t->args.size() == 1) {
+      std::vector<MxRow> m2;  // lazy: a single transparent constructor
+      for (auto& r : rows) {
+        MxRow r2;
+        if (mx_wild(r[0])) r2.push_back(nullptr);
+        else if (auto* lz = std::get_if<Ppat_lazy>(&r[0]->desc)) r2.push_back(lz->p.get());
+        else continue;  // dead row
+        r2.insert(r2.end(), r.begin() + 1, r.end());
+        m2.push_back(std::move(r2));
+      }
+      std::vector<TypePtr> cols2 = {t->args[0]};
+      cols2.insert(cols2.end(), rest.begin(), rest.end());
+      return mx_useful(std::move(m2), std::move(cols2), std::move(su));
+    }
+    if (tc.k == MxClass::External || tc.k == MxClass::Open) {
+      // Never-complete columns (infinite constants, array lengths, open
+      // types): a candidate outside every listed head always exists.
+      // Intervals cover ranges we don't model -- a covering interval set
+      // would make this a false Partial, so bail instead.
+      for (auto& r : rows)
+        if (r[0] && std::holds_alternative<Ppat_interval>(r[0]->desc)) throw MxBail{};
+      return mx_useful(default_matrix(), std::move(rest), std::move(su));
+    }
+    if (tc.k == MxClass::Record) {
+      if (!tc.decl) throw MxBail{};
+      auto& fields = std::get<Ptype_record>(tc.decl->kind).fields;
+      if (tc.decl->params.size() != t->args.size()) throw MxBail{};
+      std::unordered_map<std::string, TypePtr> vars;
+      for (size_t i = 0; i < t->args.size(); ++i)
+        if (auto* pv = std::get_if<Ptyp_var>(&tc.decl->params[i]->desc))
+          vars[pv->name] = t->args[i];
+      std::vector<TypePtr> cols2;
+      for (auto& f : fields) cols2.push_back(from_coretype(*f.type, vars));
+      cols2.insert(cols2.end(), rest.begin(), rest.end());
+      std::vector<MxRow> m2;
+      for (auto& r : rows) {
+        MxRow r2;
+        if (mx_wild(r[0])) r2.assign(fields.size(), nullptr);
+        else if (auto* rp = std::get_if<Ppat_record>(&r[0]->desc)) {
+          r2.assign(fields.size(), nullptr);
+          for (auto& [lid, pb] : rp->fields) {
+            std::string fn = lid_last(lid.txt);
+            size_t k = 0;
+            for (; k < fields.size(); ++k) if (fields[k].name.txt == fn) break;
+            if (k == fields.size()) throw MxBail{};  // foreign label
+            r2[k] = pb.get();
+          }
+        } else continue;  // dead row
+        r2.insert(r2.end(), r.begin() + 1, r.end());
+        m2.push_back(std::move(r2));
+      }
+      return mx_useful(std::move(m2), std::move(cols2), std::move(su));
+    }
+    if (tc.k == MxClass::Variant || tc.k == MxClass::PredefVariant) {
+      auto list = mx_ctor_schemes(tc, t);
+      // the schemes' bare internal names resolve under their owning module
+      std::string prefix;
+      if (!tc.key.empty())
+        if (auto d = tc.key.rfind('.'); d != std::string::npos)
+          prefix = tc.key.substr(0, d + 1);
+      for (auto& [cname, scheme] : list) {
+        MxSubst su2 = su;
+        TypePtr result;
+        std::unordered_map<const I::Type*, TypePtr> memo;
+        auto params =
+            ctor_params(mx_qualify(eng.instantiate(scheme), prefix, memo), result);
+        TypePtr r = I::Engine::repr(result);
+        if (r->kind != K::Constr || r->args.size() != t->args.size()) throw MxBail{};
+        bool inhabited = true;  // index equations flow into su2 here
+        for (size_t i = 0; inhabited && i < r->args.size(); ++i)
+          inhabited = mx_compat(r->args[i], t->args[i], su2);
+        if (!inhabited) continue;  // refuted at this (refined) index
+        std::vector<MxRow> s;
+        bool in_sigma = false;
+        for (auto& row : rows) {
+          MxRow r2;
+          if (mx_wild(row[0])) r2.assign(params.size(), nullptr);
+          else if (auto* k = std::get_if<Ppat_construct>(&row[0]->desc)) {
+            if (lid_last(k->id.txt) != cname) continue;  // other head / dead
+            if (!k->vars.empty()) throw MxBail{};  // `C (type a) p`: unmodeled
+            if (!k->arg) {
+              if (!params.empty()) continue;  // arity mismatch: foreign dead ctor
+            } else {
+              const Pattern* ap = mx_peel(k->arg->get());
+              if (params.empty()) continue;  // arity mismatch: foreign dead ctor
+              if (params.size() == 1) r2.push_back(ap);
+              else if (mx_wild(ap)) r2.assign(params.size(), nullptr);
+              else if (auto* tp = std::get_if<Ppat_tuple>(&ap->desc)) {
+                if (tp->elems.size() != params.size()) continue;  // foreign arity
+                for (auto& l : tp->labels) if (l) throw MxBail{};
+                for (auto& e : tp->elems) r2.push_back(e.get());
+              } else if (std::holds_alternative<Ppat_record>(ap->desc)) {
+                throw MxBail{};  // inline-record argument: unmodeled
+              } else if (std::holds_alternative<Ppat_or>(ap->desc)) {
+                throw MxBail{};  // or at a multi-slot argument: unmodeled
+              } else continue;  // foreign shape
+            }
+            in_sigma = true;
+          } else continue;  // constant/tuple/... at variant type: dead row
+          r2.insert(r2.end(), row.begin() + 1, row.end());
+          s.push_back(std::move(r2));
+        }
+        std::vector<TypePtr> cols2 = params;
+        cols2.insert(cols2.end(), rest.begin(), rest.end());
+        if (in_sigma) {
+          if (mx_useful(std::move(s), std::move(cols2), std::move(su2))) return true;
+        } else if (mx_useful(default_matrix(), rest, std::move(su2))) return true;
+      }
+      return false;
+    }
+    throw MxBail{};  // abstract/unknown column with real patterns
+  }
+
+  bool tuple_gadt_partial(const TypePtr& s, const std::vector<Case>& cases) {
+    if (strict) return false;  // the reject pass discards partiality anyway
+    bool gadt = false;  // gate: only GADT-involving tuple matches
+    for (auto& el0 : s->args) {
+      TypePtr el = I::Engine::repr(el0);
+      if (el->kind == I::Type::Kind::Constr && gadt_types.count(mx_base(el->path)))
+        gadt = true;
+    }
+    for (auto& c : cases) if (pat_has_gadt_ctor(c.lhs)) gadt = true;
+    if (!gadt) return false;
+    try {
+      size_t n = s->args.size();
+      std::vector<MxRow> rows;
+      // flatten a top-level or into separate rows; drop exception/effect rows
+      std::function<void(const Pattern*)> add = [&](const Pattern* p) {
+        p = mx_peel(p);
+        if (!p) return;
+        if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+          add(o->l.get());
+          add(o->r.get());
+          return;
+        }
+        if (std::holds_alternative<Ppat_exception>(p->desc) ||
+            std::holds_alternative<Ppat_effect>(p->desc))
+          return;  // no value coverage
+        MxRow r;
+        if (mx_wild(p)) r.assign(n, nullptr);
+        else if (auto* tp = std::get_if<Ppat_tuple>(&p->desc)) {
+          if (tp->elems.size() != n || tp->closed != ClosedFlag::Closed) throw MxBail{};
+          for (auto& l : tp->labels) if (l) throw MxBail{};
+          for (auto& e : tp->elems) r.push_back(e.get());
+        } else throw MxBail{};
+        rows.push_back(std::move(r));
+      };
+      for (auto& c : cases)
+        if (!c.guard) add(&c.lhs);
+      mx_fuel_ = 20000;
+      return mx_useful(std::move(rows), s->args, MxSubst{});
+    } catch (const MxBail&) {
+      return false;  // unanalyzable -> Total (the pre-existing default)
+    } catch (const I::TypeError&) {
+      return false;
+    }
   }
 
   // Collect the polyvariant tags a pattern matches (through alias/or/constraint).
