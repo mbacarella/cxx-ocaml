@@ -11,14 +11,21 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 | **Soundness** — reject invalid code | `accept_parity.sh` | 13.6% false-accept (93) | **5.3% (36 files)** |
 | Front-end parsing | `parse_parity.sh` | ~100% | **100%** |
 | Lambda back end | `lambda_parity.sh` | 52.8% | 55.6% |
-| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.4% (731/1853; 98.1% of the 745 oracle-typed)** |
+| **Typed-tree dump** — produce the exact typed tree | `typedtree_parity.sh` | 25.4% | **39.5% (732/1853; 98.3% of the 745 oracle-typed)** |
 
 > Denominator fix (2026-07-04): the old "1222 typeable" figure was an artifact —
 > the harness counted c++-accepted-but-oracle-rejected files both as "typeable"
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
-> already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-05, pm3):
-> 1 c++-err (pr11887, imported #type polyvariant tags) + 13 DIFF files.  Closed
+> already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-06):
+> 1 c++-err (pr11887, imported #type polyvariant tags) + 12 DIFF files.  Closed
+> most recently (731 -> 732): morematch — polyvariant-argument exhaustiveness
+> (`A (`A|`C)` over the closed row `[ `A | `C | `D ]` leaves `A `D` unmatched
+> -> Partial).  A dump-only `compute_partial` extension: for each covered ctor,
+> substitute the scrutinee's actual type args into the ctor's per-type scheme
+> and, for any argument position that is a closed polyvariant, flag Partial when
+> a row tag is matched by no branch and none wildcards.  Sound and conservative
+> (skips the strict pass; bails on any unanalyzable position).  Closed
 > this sub-session (729 -> 731): fstclassmod (a `module type` brought into scope
 > by `open M` where M is a module now resolves as `M.T` (Pdot) not a fresh local
 > Pident — modtype names flow through ModExports/OpenEntry, and nested module

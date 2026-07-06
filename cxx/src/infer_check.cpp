@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <unordered_set>
@@ -125,6 +126,11 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> ctors;
   // finite variant types: type name -> its full constructor-name set
   std::unordered_map<std::string, std::vector<std::string>> type_ctors;
+  // type path -> its ctors' generic schemes (arg1->..->argN->result), kept per
+  // type so a later same-named ctor (in the flat `ctors` map, last-wins) can't
+  // shadow it -- used to check polyvariant-argument exhaustiveness (compute_partial).
+  std::unordered_map<std::string, std::vector<std::pair<std::string, TypePtr>>>
+      type_ctor_schemes_;
   // type abbreviations: name -> (param var names, manifest core_type) so that a
   // `type ('a,..) t = <manifest>` can be expanded when t is used in annotations.
   struct Alias { std::vector<std::string> params; const CoreType* manifest;
@@ -2466,6 +2472,7 @@ struct Checker {
       }
       if (!nested_predef) ctors[c.name.txt] = scheme;
       ctor_scheme_[&c] = scheme;  // for scoped (in-order) resolution via cenv
+      type_ctor_schemes_[mod_prefix_ + d.name.txt].emplace_back(c.name.txt, scheme);
     }
   }
 
@@ -3101,7 +3108,88 @@ struct Checker {
     std::set<std::string> covered;
     for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
     for (auto& ctor : it->second) if (!covered.count(ctor)) return true;  // missing
+    // All top-level ctors covered, but a constructor's polyvariant ARGUMENT may
+    // still be under-covered (`A (`A|`C)` leaves `A `D` unmatched).
+    if (poly_arg_partial(s, cases)) return true;
     return false;  // covers all top-level ctors => Total (conservative)
+  }
+
+  // A pattern built ENTIRELY of polyvariant tags (through or/alias/constraint),
+  // with no data-carrying tag: collects the tags and returns true.  Anything
+  // else (a nested pattern, a `` `A x `` with a non-catchall arg) returns false
+  // so the caller conservatively treats the position as possibly-covering.
+  static bool pure_variant_tags(const Pattern& p, std::set<std::string>& out) {
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      if (v->arg && !is_catchall(**v->arg)) return false;  // `` `A (nested) ``
+      out.insert(v->label);
+      return true;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return pure_variant_tags(*o->l, out) && pure_variant_tags(*o->r, out);
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pure_variant_tags(*c->p, out);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pure_variant_tags(*a->p, out);
+    return false;
+  }
+  // Collect (ctor-name -> argument-pattern) from a case pattern, descending
+  // through a top-level or/alias/constraint.  A no-argument ctor maps to null.
+  void collect_ctor_args(const Pattern& p,
+                         std::multimap<std::string, const Pattern*>& out) {
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc))
+      out.emplace(lid_last(k->id.txt), k->arg ? &**k->arg : nullptr);
+    else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      collect_ctor_args(*o->l, out);
+      collect_ctor_args(*o->r, out);
+    } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) collect_ctor_args(*c->p, out);
+    else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) collect_ctor_args(*a->p, out);
+  }
+  // The sub-pattern at argument position `i` of a ctor's `arg` pattern: for an
+  // arity-1 ctor the whole `arg`; for arity>1 the i-th element of its tuple.
+  static const Pattern* arg_position(const Pattern* arg, size_t i, size_t n) {
+    if (!arg) return nullptr;
+    while (auto* c = std::get_if<Ppat_constraint>(&arg->desc)) arg = c->p.get();
+    if (n == 1) return i == 0 ? arg : nullptr;
+    if (auto* t = std::get_if<Ppat_tuple>(&arg->desc))
+      return i < t->elems.size() ? t->elems[i].get() : nullptr;
+    return nullptr;  // a var/`_` covering the whole tuple -> caller sees no tuple
+  }
+  // Non-exhaustiveness via an under-covered polyvariant constructor ARGUMENT.
+  // Only fires when a ctor's argument position has a CLOSED polyvariant type
+  // (non-empty row) with a tag that no branch matches and none wildcards --
+  // sound: such a value is unmatched by every branch.  Conservative elsewhere
+  // (unanalyzable position / open row / non-variant arg => not flagged).
+  bool poly_arg_partial(const TypePtr& scrut, const std::vector<Case>& cases) {
+    if (strict) return false;  // dump-only; its try_unify must not touch the
+                               // reject pass's inference (match_partial is
+                               // discarded there anyway)
+    TypePtr s = I::Engine::repr(scrut);
+    if (s->kind != I::Type::Kind::Constr) return false;
+    auto schemes = type_ctor_schemes_.find(s->path);
+    if (schemes == type_ctor_schemes_.end()) return false;
+    std::multimap<std::string, const Pattern*> args;
+    for (auto& c : cases) if (!c.guard) collect_ctor_args(c.lhs, args);
+    for (auto& [cname, sch] : schemes->second) {
+      auto range = args.equal_range(cname);
+      if (range.first == range.second) continue;  // ctor not matched here
+      TypePtr result;
+      auto ps = ctor_params(eng.instantiate(sch), result);
+      if (ps.empty()) continue;  // constant ctor
+      try_unify(result, s);      // fresh instantiation vars only -> safe
+      for (size_t i = 0; i < ps.size(); ++i) {
+        TypePtr pt = I::Engine::repr(ps[i]);
+        if (pt->kind != I::Type::Kind::Variant || pt->labels.empty()) continue;
+        std::set<std::string> covered;
+        bool wildcard = false, analyzable = true;
+        for (auto it = range.first; it != range.second; ++it) {
+          const Pattern* pos = arg_position(it->second, i, ps.size());
+          if (!pos || is_catchall(*pos)) { wildcard = true; break; }
+          if (!pure_variant_tags(*pos, covered)) { analyzable = false; break; }
+        }
+        if (wildcard || !analyzable) continue;
+        for (auto& tag : pt->labels)
+          if (!covered.count(tag)) return true;  // uncovered row tag -> Partial
+      }
+    }
+    return false;
   }
 
   // Collect the polyvariant tags a pattern matches (through alias/or/constraint).
