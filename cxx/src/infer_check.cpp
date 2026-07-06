@@ -4754,7 +4754,7 @@ struct Checker {
           return qt;
         }
         if (k->arg) infer_expr(**k->arg);
-        return eng.any();
+        return eng.fresh_var();  // P4-C: unknown ctor -> fresh var (corpus-validated)
       }
       TypePtr result;
       auto ps = ctor_params(eng.instantiate(*sch), result);
