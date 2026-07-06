@@ -857,6 +857,48 @@ struct TyEmit {
   o::ValPtr texpr(o::ValPtr desc) {  // type_expr = {desc; level; scope; id}
     return o::vblock(0, {desc, o::vint(GENERIC_LEVEL), o::vint(0), o::vint(id--)});
   }
+  // The Path.t for a type-ctor name, via the resolution ladder: dotted name ->
+  // Pdot chain off the head's compilation-unit global (a Stdlib__ head goes
+  // THROUGH the Stdlib alias module -- `Buffer.t` is stored
+  // Pdot(Pdot(Pident(Global Stdlib), "Buffer"), "t"), never the mangled unit,
+  // and cites Stdlib's CRC too, like ocamlc); predef; sig-local declaration;
+  // bare Stdlib-toplevel type (`ref`, resolved through the implicit
+  // `open Stdlib`).  Null when the name can't be placed.
+  o::ValPtr type_path(const std::string& name) {
+    if (auto dot = name.find('.'); dot != std::string::npos) {
+      std::vector<std::string> comps;
+      for (std::size_t i = 0, j; i <= name.size(); i = j + 1) {
+        j = name.find('.', i);
+        if (j == std::string::npos) j = name.size();
+        comps.push_back(name.substr(i, j - i));
+      }
+      std::string g = global_of(comps[0]);
+      if (referenced) (*referenced)[g] = true;  // a real type ref needs the CRC
+      o::ValPtr path;
+      if (g.rfind("Stdlib__", 0) == 0) {
+        if (referenced) (*referenced)["Stdlib"] = true;
+        path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});  // Pident(Global Stdlib)
+        path = o::vblock(1, {path, o::vstr(g.substr(8))});         // Pdot(_, alias member)
+      } else {
+        path = o::vblock(0, {o::vblock(2, {o::vstr(g)})});  // Pident(Global head)
+      }
+      for (std::size_t i = 1; i < comps.size(); ++i)
+        path = o::vblock(1, {path, o::vstr(comps[i])});   // Pdot(path, comp)
+      return path;
+    }
+    if (int st = predef_stamp(name))
+      return o::vblock(0, {o::vblock(3, {o::vstr(name), o::vint(st)})});  // Pident(Predef)
+    if (local_types && local_types->count(name)) {
+      int st = local_types->at(name);
+      return o::vblock(0, {o::vblock(0, {o::vstr(name), o::vint(st)})});  // Pident(Local)
+    }
+    if (stdlib_toplevel_type(name)) {
+      if (referenced) (*referenced)["Stdlib"] = true;
+      return o::vblock(1, {o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})}),
+                           o::vstr(name)});  // Pdot(Pident(Global Stdlib), name)
+    }
+    return nullptr;
+  }
   o::ValPtr emit(const TyPtr& t) {
     switch (t->k) {
       case Ty::Var: {
@@ -873,47 +915,8 @@ struct TyEmit {
         // name emits Pident(Predef) with the predef.ml stamp.  Anything else (a
         // bare user/local type we can't yet place) degrades to an opaque Tvar --
         // valid, just over-general.
-        o::ValPtr path;
-        if (auto dot = t->name.find('.'); dot != std::string::npos) {
-          std::vector<std::string> comps;
-          for (std::size_t i = 0, j; i <= t->name.size(); i = j + 1) {
-            j = t->name.find('.', i);
-            if (j == std::string::npos) j = t->name.size();
-            comps.push_back(t->name.substr(i, j - i));
-          }
-          std::string g = global_of(comps[0]);
-          if (referenced) (*referenced)[g] = true;  // a real type ref needs the CRC
-          if (g.rfind("Stdlib__", 0) == 0) {
-            // ocamlc resolves a pervasive head THROUGH the Stdlib alias module:
-            // `Buffer.t` is stored Pdot(Pdot(Pident(Global Stdlib), "Buffer"),
-            // "t"), never the mangled unit Pident(Global Stdlib__Buffer).  The
-            // path cites Stdlib, so import its CRC too (ocamlc does both).
-            if (referenced) (*referenced)["Stdlib"] = true;
-            path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});  // Pident(Global Stdlib)
-            path = o::vblock(1, {path, o::vstr(g.substr(8))});         // Pdot(_, alias member)
-          } else {
-            path = o::vblock(0, {o::vblock(2, {o::vstr(g)})});  // Pident(Global head)
-          }
-          for (std::size_t i = 1; i < comps.size(); ++i)
-            path = o::vblock(1, {path, o::vstr(comps[i])});   // Pdot(path, comp)
-        } else if (int st = predef_stamp(t->name)) {
-          path = o::vblock(0, {o::vblock(3, {o::vstr(t->name), o::vint(st)})});  // Pident(Predef)
-        } else if (local_types && local_types->count(t->name)) {
-          // A same-module type (`type t` referenced bare in this module's own
-          // value/type signatures): Pident(Local{name; stamp}) with the stamp of
-          // its declaration in this signature, so the reader resolves it to that
-          // type instead of an opaque variable.
-          int st = local_types->at(t->name);
-          path = o::vblock(0, {o::vblock(0, {o::vstr(t->name), o::vint(st)})});  // Pident(Local)
-        } else if (stdlib_toplevel_type(t->name)) {
-          // A bare Stdlib-toplevel type (`ref`): resolved through the implicit
-          // `open Stdlib`, stored Pdot(Pident(Global Stdlib), name).
-          if (referenced) (*referenced)["Stdlib"] = true;
-          path = o::vblock(1, {o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})}),
-                               o::vstr(t->name)});  // Pdot(Pident(Global Stdlib), name)
-        } else {
-          return texpr(o::vblock(0, {o::vint(0)}));  // unknown -> Tvar None
-        }
+        o::ValPtr path = type_path(t->name);
+        if (!path) return texpr(o::vblock(0, {o::vint(0)}));  // unknown -> Tvar None
         std::vector<o::ValPtr> as;
         for (auto& a : t->args) as.push_back(emit(a));
         auto abbrev = o::vblock(0, {o::vint(0)});  // ref Mnil
@@ -1054,9 +1057,22 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                loc_none(), o::vint(0) /*mtd_uid*/});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
     } else if (it.k == SigItem::Exception) {
-      // Sig_typext(id, extension_constructor, Text_exception, vis).  An exception
-      // is an extension of the predefined `exn` type and TAKES a runtime field.
-      auto path = o::vblock(0, {o::vblock(3, {o::vstr("exn"), o::vint(7)})});  // Pident(Predef exn)
+      // Sig_typext(id, extension_constructor, ext_status, vis).  A plain
+      // exception extends the predefined `exn` (Text_exception); a `type t +=`
+      // extension constructor carries the extended type's path, its declared
+      // params (fresh vars, printed `_`), a GADT return type when written
+      // (`E : unit Effect.t`), and Text_first/Text_next so ocamlc prints the
+      // group as one `type t += A | B`.  Both TAKE a runtime field.
+      o::ValPtr path;
+      const std::vector<std::string>* eparams = nullptr;
+      int status = 2;  // Text_exception
+      if (!it.ext_path.empty()) {
+        path = te.type_path(it.ext_path);
+        if (path) { eparams = &it.ext_params; status = it.text_kind; }
+        // an unplaceable extended type degrades to a plain exception (valid)
+      }
+      if (!path)
+        path = o::vblock(0, {o::vblock(3, {o::vstr("exn"), o::vint(7)})});  // Pident(Predef exn)
       o::ValPtr cargs;
       if (!it.ctors.empty() && !it.ctors[0].inline_record.empty()) {
         // Cstr_record inline-record payload (`exception E of {l;..}`): emit the
@@ -1076,10 +1092,17 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (!it.ctors.empty()) for (auto& a : it.ctors[0].args) args.push_back(te.emit(a));
         cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
       }
-      auto extcon = o::vblock(0, {path, o::vint(0) /*ext_type_params []*/, cargs,
-                                  o::vint(0) /*ext_ret_type None*/, o::vint(0) /*ext_private Public*/,
+      std::vector<o::ValPtr> tparams;
+      if (eparams)
+        for (const std::string& pn : *eparams)  // Tvar(Some source-name), e.g. "_"
+          tparams.push_back(te.texpr(o::vblock(0, {o::vblock(0, {o::vstr(pn)})})));
+      auto ret = it.ext_ret ? o::vblock(0, {te.emit(it.ext_ret)}) : o::vint(0);  // Some/None
+      auto extcon = o::vblock(0, {path,
+                                  tparams.empty() ? o::vint(0) : o::vlist(tparams),  // ext_type_params
+                                  cargs, ret,
+                                  o::vint(1) /*ext_private Public*/,
                                   loc_none(), o::vint(0) /*ext_attributes*/, o::vint(0) /*ext_uid*/});
-      sig.push_back(o::vblock(2, {ident, extcon, o::vint(2) /*Text_exception*/,
+      sig.push_back(o::vblock(2, {ident, extcon, o::vint(status),
                                   o::vint(0) /*Exported*/}));  // Sig_typext
     } else {
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
@@ -1123,6 +1146,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                       loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
         }
         kind = o::vblock(1, {o::vlist(lds), o::vint(0) /*Record_regular*/});  // Type_record
+      } else if (it.type_open) {
+        kind = o::vint(0);  // Type_open (`type t = ..`), the lone constant ctor
       } else {
         kind = o::vblock(0, {o::vint(0)});  // Type_abstract(Definition)
       }

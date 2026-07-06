@@ -282,6 +282,18 @@ struct SigItem {
   bool is_functor = false;
   std::string functor_param;  // the parameter's name (e.g. "Ord")
   std::vector<SigItem> param_sig;  // the parameter's signature items (OrderedType)
+  // Exception: a `type t += ..` extension constructor rather than a plain
+  // exception.  ext_path is the extended type's source path ("Effect.t";
+  // empty = the predefined exn), ext_params its declared params' source names
+  // ("_" for `type _ t +=` -- ocamlc stores Tvar(Some "_"), printed back
+  // verbatim), ext_ret the GADT return type (`E : unit Effect.t`; null =
+  // none), text_kind the Sig_typext ext_status (0 Text_first / 1 Text_next /
+  // 2 Text_exception).
+  std::string ext_path;
+  std::vector<std::string> ext_params;
+  TyPtr ext_ret;
+  int text_kind = 2;
+  bool type_open = false;  // Type: `type t = ..` (Type_open kind)
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
                                   std::vector<SigItem> param_sig,
