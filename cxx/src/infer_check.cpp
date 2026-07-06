@@ -8652,9 +8652,21 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
 // nodes of equal identity within one value's scheme (so `'a -> 'a` is one var);
 // Any becomes a fresh var (opaque).  Constr paths are passed through -- the cmi
 // writer keeps predefined ones and renders the rest as opaque vars.
+static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
+                                      std::unordered_map<const I::Type*, int>& vars, int& nextvar,
+                                      std::unordered_set<const I::Type*>& visiting);
 static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
                                   std::unordered_map<const I::Type*, int>& vars, int& nextvar) {
+  std::unordered_set<const I::Type*> visiting;
+  return bridge_ty_rec(t0, vars, nextvar, visiting);
+}
+static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
+                                      std::unordered_map<const I::Type*, int>& vars, int& nextvar,
+                                      std::unordered_set<const I::Type*>& visiting) {
   TypePtr t = I::Engine::repr(t0);
+  auto bridge_ty = [&](const TypePtr& u, std::unordered_map<const I::Type*, int>& v, int& nv) {
+    return bridge_ty_rec(u, v, nv, visiting);
+  };
   using K = I::Type::Kind;
   switch (t->kind) {
     case K::Var: {
@@ -8662,7 +8674,16 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
       if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
       int id = nextvar++; vars[t.get()] = id; return cmi::cmiw::ty_var(id);
     }
-    case K::Object: return cmi::cmiw::ty_var(nextvar++);  // opaque in the .cmi for now
+    case K::Object: {  // closed structural object `< m1 : t1; m2 : t2 >`
+      // A RECURSIVE object type (`< bark : 'self -> unit > as 'self`) is a
+      // cycle in the engine graph the writer can't express -- degrade the
+      // inner recursive occurrence to an opaque var instead of looping.
+      if (!visiting.insert(t.get()).second) return cmi::cmiw::ty_var(nextvar++);
+      std::vector<cmi::cmiw::TyPtr> mtys;
+      for (auto& a : t->args) mtys.push_back(bridge_ty(a, vars, nextvar));
+      visiting.erase(t.get());
+      return cmi::cmiw::ty_object(t->labels, std::move(mtys));
+    }
     case K::Variant: return cmi::cmiw::ty_var(nextvar++);  // opaque in the .cmi for now
     case K::Arrow:
       return cmi::cmiw::ty_arrow_lbl(bridge_ty(t->dom, vars, nextvar),

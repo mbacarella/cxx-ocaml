@@ -749,6 +749,9 @@ TyPtr ty_arrow_lbl(const TyPtr& d, const TyPtr& c, int lk, const std::string& lb
   t->label_kind = lk; t->label = lbl; return t; }
 TyPtr ty_tuple(std::vector<TyPtr> es) { auto t = std::make_shared<Ty>(); t->k = Ty::Tuple; t->args = std::move(es); return t; }
 TyPtr ty_variant(std::vector<std::string> tags) { auto t = std::make_shared<Ty>(); t->k = Ty::Variant; t->pv_tags = std::move(tags); return t; }
+TyPtr ty_object(std::vector<std::string> names, std::vector<TyPtr> tys) {
+  auto t = std::make_shared<Ty>(); t->k = Ty::Object;
+  t->pv_tags = std::move(names); t->args = std::move(tys); return t; }
 TyPtr ty_var(int id) { auto t = std::make_shared<Ty>(); t->k = Ty::Var; t->var = id; return t; }
 
 namespace {
@@ -965,6 +968,20 @@ struct TyEmit {
                                      more, o::vint(1) /*row_closed=true*/,
                                      o::vint(0) /*row_fixed=None*/, o::vint(0) /*row_name=None*/});
         return texpr(o::vblock(6, {rd}));  // Tvariant of row_desc
+      }
+      case Ty::Object: {
+        // A closed structural object type `< m1 : t1; m2 : t2 >`:
+        // Tobject(Tfield(m1, FKpublic, Tpoly(t1,[]), ... Tnil), ref None).
+        // Each method type is Tpoly-wrapped (ocamlc stores even monomorphic
+        // methods as Tpoly(ty, [])); the row terminates in Tnil (closed).
+        // The printer sorts fields by name, so emission order is source order.
+        o::ValPtr row = texpr(o::vint(0));  // Tnil (a full type_expr node)
+        for (std::size_t i = t->pv_tags.size(); i-- > 0;) {
+          o::ValPtr mty = texpr(o::vblock(8, {emit(t->args[i]), o::vint(0)}));  // Tpoly(ty,[])
+          row = texpr(o::vblock(5, {o::vstr(t->pv_tags[i]), o::vint(1) /*FKpublic*/,
+                                    mty, row}));  // Tfield
+        }
+        return texpr(o::vblock(4, {row, o::vblock(0, {o::vint(0)})}));  // Tobject(row, ref None)
       }
     }
     return o::vint(0);
