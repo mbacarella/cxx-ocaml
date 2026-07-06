@@ -18,7 +18,14 @@ Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 > and as DIFF.  Only 745 corpus files produce a real oracle dump; the harness
 > now classes the rest as dump-mode false-accepts (soundness territory,
 > already tracked by `accept_parity.sh`).  Remaining dump work (2026-07-06):
-> 1 c++-err (pr11887, imported #type polyvariant tags) + 9 DIFF files.  Closed
+> 1 c++-err (pr11887, imported #type polyvariant tags) + 9 DIFF files.
+> Correctness (counter-neutral): `open (M : S)` of a global/alias module IDENT
+> now strengthens M against its own path (the transparent extra module_expr
+> layer INSIDE the constraint) — open-specific, so it lives in the Pstr_open
+> path, NOT module_expr's Pmod_constraint case (a module-binding constraint
+> `module X : S = M` must NOT strengthen — verified: lib-pqueue's `module Prio
+> : OrderedType = Int`).  Reduced accepted_batch to its single remaining root
+> (the `Set.Make(Bool).t` functor-app type path).  Closed
 > most recently (734 -> 735): fragile_matching — a record PATTERN's fields print
 > in the record's DECLARATION order (lbl_num), not source order (`{ b; a }` over
 > `type t = { a; b }` prints a then b).  c++ kept source order; now stable-sorts

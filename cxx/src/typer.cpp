@@ -4072,6 +4072,13 @@ struct Typer {
         // Generalized open (struct literal / functor application): the items
         // instantiate FRESH idents that bind directly (Pident references).
         to.expr = std::make_unique<tt::ModuleExpr>(module_expr(op->expr));
+        // `open (M : S)` of a global/alias module IDENT strengthens M against
+        // its own path -- a transparent extra module_expr layer INSIDE the
+        // constraint.  This is open-specific: a module-binding constraint
+        // (`module X : S = M`) leaves the inner ident un-strengthened, so the
+        // strengthening lives here, not in module_expr's Pmod_constraint case.
+        if (auto* c = std::get_if<tt::Tmod_constraint>(&to.expr->desc))
+          c->expr = strengthen_global(std::move(c->expr));
         ModExports tmp;
         if (const ModExports* ex = exports_of_modexpr(*to.expr, tmp)) {
           for (auto& n : ex->values) fresh_local(n);
