@@ -1,5 +1,33 @@
 # `Any`-removal inventory — the work-list to retire `Type::Kind::Any`
 
+## ✅ COMPLETE 2026-07-06 — `Type::Kind::Any` IS DELETED
+
+All 23 sites and the engine mechanism are gone (`grep -cE '\bany\(\)'` = 0;
+`Kind::Any` no longer exists).  The final session (commits
+`ebe96f1b0d..35a16b470a`) closed A, F and J in sequence:
+
+- **A (sibling-.ml wiring + flip)**: `cxx/harness/sib_cmis.sh` gives BOTH the
+  oracle and c++type per-test-dir sibling cmis (`$CPPCAML_SIB_CMI_ROOT`);
+  corpus grew 886 → **1016 oracle-typed**, all gates re-closed (six c++type
+  fixes — alias-traversal strengthening predicate, module_sig alias-into-unit,
+  strict opened-submodule reroutes, sig-local module binding, `with type
+  M.t`/`with module type`/`Tsig_modsubst`, pattern-open extras).  Re-sizing
+  showed the surviving A population was LOCAL module machinery, per-occurrence
+  → fresh-var flip held every gate.
+- **F**: unconstrained pack takes its package type from the context — fresh
+  var per occurrence, gates flat.
+- **J**: the catch-all covered exactly three forms (unreachable/extension/
+  override, 324 corpus hits) — each handled on its own terms (two extensions
+  type for REAL; uninterpreted extensions error in strict), then the engine
+  mechanism was deleted outright (absorb branch, walker cases, cmi bridge).
+  Lambda parity IMPROVED by one file in the process.
+
+Gates at completion: reject 1/1016 (the known stray-foo.cmi artifact),
+accept 38/408, sig 686/692, typedtree 1016/1016 (100.0%), lambda MATCH 415.
+What used to be this file's frontier is now tracked by the normal parity
+dashboards (sig DIFF 6 = engine-core display items; accept 38 = Includemod
+hard cases).  The rest of this file is kept as the historical record.
+
 `Type::Kind::Any` is the inferencer's best-effort escape hatch: an **absorbing**
 type that unifies with anything and drags plain variables into itself so they
 "can't later clash" (`infer.cpp:242-247`). It's what keeps completeness perfect

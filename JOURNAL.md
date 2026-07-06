@@ -3783,3 +3783,67 @@ contact to link through the cmi expansion); test_caml_counters.ml -- weak-var
 pinning through Callbacks.create's OPTIONAL callback (the tbl's weak vars
 should pin from the labelled arg's instantiation).  Both single-file,
 engine-core; parked.
+
+--------------------------------------------------------------------------------
+P4 COMPLETE: Type::Kind::Any DELETED -- 23 sites -> 0, mechanism gone
+--------------------------------------------------------------------------------
+Commits ebe96f1b0d..HEAD, one session.  The Any-removal project (see
+ANY-REMOVAL-INVENTORY.md) finished in four moves, every step gate-checked
+against the (growing) corpus.
+
+1. Bucket A half two -- sibling-.ml wiring (corpus 886 -> 1016).  Mirror of
+   the otherlibs -I win: cxx/harness/sib_cmis.sh probes oracle-rejected files
+   for sibling-resolvable "Unbound module X" (118 files / 42 dirs), then
+   fixpoint-compiles each dir's .ml/.mli into /tmp/sib_cmi/<dir>.  The oracle
+   adds -I $SIBROOT/<dir>; c++type derives the same dir from
+   $CPPCAML_SIB_CMI_ROOT (all five harnesses export it; --check's mli-no-cmi
+   rule looks there too).  Cache rebuild: +130 oracle-typed files, ZERO
+   previously-typed dumps changed.  Re-closing the gates took:
+   - the STRENGTHENING predicate: ocamlc's implicit transparent constraint
+     appears iff the path TRAVERSES a module alias (all Stdlib submodules are
+     aliases -- why root-global ever matched).  Globroots.Test (direct
+     submodule of a unit) is NOT wrapped.  Probed via gr.ml/gr2.ml micro-cmis;
+     Tmod_apply_unit joined strengthen_global.
+   - module_sig follows Alias decls into non-stdlib units + "Stdlib.X" dotted
+     alias paths (StdLabels.List -> ListLabels; lib2235's unit alias).
+   - strict pass: opened-submodule quals populate in EVERY pass (new
+     load_open_submod_quals) + reroute in resolve_module_values_comps
+     (open M of an opened unit's submodule); sig-local `module Env : S` counts
+     bound while converting the sig's val types; empty-exports now
+     distinguishes "resolves but no values" (genuine Unbound value -- b_bad's
+     A.y, a types-only sibling) from "can't load" (stay dynamic).
+   - dump pass: sig-level `open A` (local module) merges exports; a dotted
+     path rooted at a functor PARAM stays Mp_present (ranged.ml); dotted
+     `with type Endpoint.t=..` + `with module type` + Tsig_modsubst
+     (`module G := A`) elaborate; pattern-open extras sit on the COMPUTATION
+     pattern like constraints (index.ml's `A.(0)` match case).
+2. A flip (5 -> 2).  ANY_A_DBG re-sizing: 3939 hits/346 files fell to 1089/110
+   (19 oracle-typed), and the POPULATION CHANGED CHARACTER: what remains is
+   local module machinery (functor-param submodules T.Env.*, recursive-module
+   members M.f1..f5, first-class unpacks) -- per-occurrence lookups, so the
+   B/C fresh-var argument applies.  The old lib-seq counter-example depended
+   on an unresolved Seq, which now resolves.  All gates flat.
+3. F flip (2 -> 1).  Unconstrained `(module M)` takes its type from context;
+   fresh var per occurrence.  Gates flat.
+4. J (1 -> 0, then delete).  The catch-all's real coverage was THREE forms
+   (324 corpus hits): Pexp_unreachable (fresh var), Pexp_extension
+   ([%extension_constructor] : extension_constructor and [%atomic.loc] :
+   t Atomic.Loc.t type for real; others are strict "Uninterpreted extension"
+   errors), Pexp_override (field exprs typed; self type = fresh var until
+   object rows).  Then the mechanism went: any() singleton, unify's absorbing
+   branch, every walker case, type_mentions_any, the .cmi writer's
+   K::Any -> ty_var bridge.  Lambda parity IMPROVED by one file
+   (callback_effects_domains_gc.ml -- a phantom mentions-Any check had been
+   suppressing a correct fold-abbrevs path).
+
+Gates at the end (new baselines in gate_check.sh): reject 1/1016 = the known
+stray-root-foo.cmi artifact; accept 38/408 (+4 typing-sigsubst Includemod
+`with type` mismatches newly visible, -3 fixed); sig 686/692 (6 DIFF: 2 parked
+engine-core + 4 new-frontier -- sibling functor results, GADT inline record
+via sibling cmi, cmi-modtype member navigation); typedtree 1016/1016 (100.0%);
+lambda MATCH 415/DIFF 327-1.  c++ocamlc smoke-compiles and runs hello.
+
+The inferencer no longer has a dynamic type: every value is a var or a
+structure.  What Any used to hide is now visible as ordinary parity-dashboard
+items (sig DIFFs, accept false-accepts) -- the P4 "finish the inferencer"
+epic continues there, but the ESCAPE HATCH is gone.
