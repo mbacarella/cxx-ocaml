@@ -496,6 +496,10 @@ struct Checker {
   // Class CONSTRUCTOR schemes (`new c` for a class with params): the arrow
   // over the constructor's value params to the class's object type (mixin2).
   std::unordered_map<std::string, TypePtr> class_ctor_types_;
+  // Each class's instance-variable types (name -> type), so `inherit P` brings
+  // P's vals into the subclass body (woodyatt: charlie inherits bravo's `y`).
+  std::unordered_map<std::string, std::vector<std::pair<std::string, TypePtr>>>
+      class_instvars_;
   // `class type ['a,'b] ops = object method m : T .. end`: params + the
   // signature AST, so a `(T1,T2) #ops` annotation can build the object row
   // with params substituted (mixin3's self coercions).
@@ -4735,6 +4739,12 @@ struct Checker {
     }
     if (auto* sd = std::get_if<Pexp_send>(&e.desc)) {  // o#m: the method's type
       TypePtr ot = I::Engine::repr(infer_expr(*sd->obj));
+      // A class-typed receiver (`y : alfa`, y coerced/annotated to a class): the
+      // object appears as the class's Constr, so resolve the method through the
+      // class's object row (woodyatt: `y#x` where x : format -> 'a).
+      if (!strict && ot->kind == I::Type::Kind::Constr)
+        if (auto it = class_types_.find(ot->path); it != class_types_.end())
+          ot = I::Engine::repr(eng.instantiate(it->second));
       if (!strict && ot->kind == I::Type::Kind::Object)
         for (size_t i = 0; i < ot->labels.size(); ++i)
           if (ot->labels[i] == sd->meth.txt) return ot->args[i];
@@ -5066,7 +5076,8 @@ struct Checker {
                          const std::vector<const ast::Pcl_fun*>* cl_params = nullptr,
                          const std::vector<const ast::Pcl_let*>* cl_lets = nullptr,
                          std::unordered_map<std::string, TypePtr>* cvars = nullptr,
-                         std::vector<TypePtr>* param_tys = nullptr) {
+                         std::vector<TypePtr>* param_tys = nullptr,
+                         std::vector<std::pair<std::string, TypePtr>>* out_instvars = nullptr) {
     std::vector<std::string> mnames;
     std::vector<TypePtr> mtypes;
     venv.emplace_back();
@@ -5127,10 +5138,27 @@ struct Checker {
       }
       if (auto* sv = std::get_if<Ppat_var>(&sp->desc)) venv.back()[sv->name.txt] = selfTy;
     }
+    // `inherit P args`: bring P's instance vars into scope so the subclass'
+    // methods/initializers resolve them (charlie's `y` from bravo).  Done before
+    // this class' own vals, which may shadow.
+    for (auto& f : cs.fields)
+      if (auto* inh = std::get_if<Pcf_inherit>(&f.desc)) {
+        const ClassExpr* pce = inh->ce.get();
+        while (auto* ap = std::get_if<Pcl_apply>(&pce->desc)) pce = ap->ce.get();
+        if (auto* pc = std::get_if<Pcl_constr>(&pce->desc))
+          if (auto it = class_instvars_.find(lid_last(pc->id.txt)); it != class_instvars_.end())
+            for (auto& [nm, ty] : it->second) {
+              venv.back()[nm] = ty;
+              if (out_instvars) out_instvars->emplace_back(nm, ty);
+            }
+      }
     for (auto& f : cs.fields)
       if (auto* v = std::get_if<Pcf_val>(&f.desc))
-        if (auto* cc = std::get_if<Cfk_concrete>(&v->kind))
-          venv.back()[v->name.txt] = infer_expr(*cc->e);
+        if (auto* cc = std::get_if<Cfk_concrete>(&v->kind)) {
+          TypePtr vt = infer_expr(*cc->e);
+          venv.back()[v->name.txt] = vt;
+          if (out_instvars) out_instvars->emplace_back(v->name.txt, vt);
+        }
     for (auto& f : cs.fields) {
       if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
         if (auto* cc = std::get_if<Cfk_concrete>(&m->kind)) {
@@ -6449,11 +6477,13 @@ struct Checker {
                   tparams.push_back(v);
                 }
                 std::vector<TypePtr> ptys;
+                std::vector<std::pair<std::string, TypePtr>> instvars;
                 TypePtr ot = infer_object_body(ps->cs, params.empty() ? nullptr : &params,
                                                lets.empty() ? nullptr : &lets,
                                                d.params.empty() ? nullptr : &cvars,
-                                               &ptys);
+                                               &ptys, &instvars);
                 eng.leave_level();
+                if (!strict) class_instvars_[d.name.txt] = std::move(instvars);
                 // A parameterless class: `new c` is its object type.  Generalise
                 // so each `new c` instantiates fresh.
                 if (params.empty() && d.params.empty()) {
