@@ -8685,11 +8685,12 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     std::vector<cmi::cmiw::TyPtr> params;
     for (auto& p : d.params) params.push_back(bridge_ty(ck.from_coretype(*p, tvars), bvars, nextvar));
     // A variant type: emit its constructors (Cstr_tuple args OR an inline record
-    // `Ctor of {l;..}`; GADT results are dropped to a no-arg ctor for now).
+    // `Ctor of {l;..}`), with the GADT return type (`Any : 'a -> any`) in cd_res.
     if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
       std::vector<cmi::cmiw::Ctor> ctors;
       for (auto& c : var->ctors) {
         cmi::cmiw::Ctor cc; cc.name = c.name.txt;
+        if (c.res) cc.res = bridge_ty(ck.from_coretype(**c.res, tvars), bvars, nextvar);
         if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
           for (auto& a : tup->elems) cc.args.push_back(bridge_ty(ck.from_coretype(*a, tvars), bvars, nextvar));
         else if (auto* r = std::get_if<Pcstr_record>(&c.args))
@@ -8890,6 +8891,66 @@ static void rewrite_eff_back(const cmi::cmiw::TyPtr& t) {
   if (!t) return;
   if (t->k == cmi::cmiw::Ty::Constr && t->name == "Effect.t") t->name = "eff";
   for (auto& a : t->args) rewrite_eff_back(a);
+}
+
+// ---- external representation attributes ------------------------------------
+// [@@noalloc] -> prim_alloc=false; [@@unboxed]/[@@untagged] (or the per-arg
+// `(int [@untagged])` form) -> the native_repr of each eligible arg/result,
+// mirroring typedecl.ml's native_repr_of_type: unboxed applies to
+// float/int32/int64/nativeint, untagged to immediates (int/char/bool/unit and
+// local all-constant variants).  Ineligible positions stay Same_as_ocaml_repr.
+static bool attrs_have(const ast::Attributes& attrs, const char* n) {
+  for (auto& a : attrs) if (a.name == n) return true;
+  return false;
+}
+static int native_repr_code(const CoreType& t, int kind,
+                            const std::set<std::string>& immediates) {
+  if (attrs_have(t.attrs, "unboxed")) kind = 1;
+  else if (attrs_have(t.attrs, "untagged")) kind = 2;
+  if (!kind) return 0;
+  auto* c = std::get_if<Ptyp_constr>(&t.desc);
+  if (!c) return 0;
+  std::string n = lid_full(c->id.txt);
+  if (kind == 1) {
+    if (n == "float") return 1;
+    if (n == "int32") return 3;
+    if (n == "int64") return 4;
+    if (n == "nativeint") return 5;
+    return 0;
+  }
+  if (n == "int" || n == "char" || n == "bool" || n == "unit" ||
+      immediates.count(n))
+    return 2;
+  return 0;
+}
+// Local all-constant-constructor variants already emitted into `out` (they are
+// Lambda.Immediate, so `[@untagged]` applies to them, e.g. c-api's `data`).
+static std::set<std::string> local_immediates(const std::vector<cmi::cmiw::SigItem>& out) {
+  std::set<std::string> s;
+  for (auto& it : out) {
+    if (it.k != cmi::cmiw::SigItem::Type || it.ctors.empty() || it.type_open) continue;
+    bool allconst = true;
+    for (auto& c : it.ctors)
+      if (!c.args.empty() || !c.inline_record.empty()) { allconst = false; break; }
+    if (allconst) s.insert(it.name);
+  }
+  return s;
+}
+static void apply_prim_attrs(const ast::PrimitiveDescription& pd,
+                             const std::vector<cmi::cmiw::SigItem>& out,
+                             cmi::cmiw::SigItem& item) {
+  item.prim_alloc = !attrs_have(pd.attrs, "noalloc");
+  int gkind = attrs_have(pd.attrs, "unboxed") ? 1
+            : attrs_have(pd.attrs, "untagged") ? 2 : 0;
+  std::set<std::string> immediates = local_immediates(out);
+  const CoreType* t = pd.type ? &*pd.type : nullptr;
+  while (t) {
+    auto* ar = std::get_if<Ptyp_arrow>(&t->desc);
+    if (!ar) break;
+    item.prim_reprs.push_back(native_repr_code(*ar->dom, gkind, immediates));
+    t = &*ar->cod;
+  }
+  if (t) item.prim_repr_res = native_repr_code(*t, gkind, immediates);
 }
 
 // The declared params' SOURCE names ("_" for Ptyp_any): ocamlc stores each as
@@ -9102,7 +9163,9 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
         auto ty = bridge_ty(ck.from_coretype(*pr->pd.type, tvars), bvars, nextvar);
         std::string native = pr->pd.prims.size() > 1 ? pr->pd.prims[1] : "";
-        out.push_back(cmi::cmiw::sig_external(pr->pd.name.txt, ty, pr->pd.prims[0], native));
+        auto item = cmi::cmiw::sig_external(pr->pd.name.txt, ty, pr->pd.prims[0], native);
+        apply_prim_attrs(pr->pd, out, item);
+        out.push_back(std::move(item));
       }
     } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
       emit_type_decls(ck, pt->decls, out);
@@ -9258,7 +9321,9 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
         std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
         auto ty = bridge_ty(ck.from_coretype(*pr->prim.type, tvars), bvars, nextvar);
         std::string native = pr->prim.prims.size() > 1 ? pr->prim.prims[1] : "";
-        out.push_back(cmi::cmiw::sig_external(pr->prim.name.txt, ty, pr->prim.prims[0], native));
+        auto item = cmi::cmiw::sig_external(pr->prim.name.txt, ty, pr->prim.prims[0], native);
+        apply_prim_attrs(pr->prim, out, item);
+        out.push_back(std::move(item));
       }
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
       emit_type_decls(ck, ty->decls, out);

@@ -255,6 +255,8 @@ struct Ctor {
   std::vector<TyPtr> args;           // Cstr_tuple args
   std::vector<Label> inline_record;  // Cstr_record (inline-record ctor); when
                                      // non-empty, takes precedence over args
+  TyPtr res;                         // cd_res: GADT return (`Any : 'a -> any`);
+                                     // null = ordinary constructor
 };
 struct SigItem;
 struct SigItem {
@@ -269,6 +271,13 @@ struct SigItem {
   // primitive by consumers and taking NO module field (so it doesn't shift the
   // value field layout).
   std::string prim, prim_native;
+  // Val_prim: prim_alloc (false = [@@noalloc]) and the native_repr of each
+  // argument / the result.  Codes: 0 Same_as_ocaml_repr, 1 Unboxed_float,
+  // 2 Untagged_immediate, 3/4/5 Unboxed_integer int32/int64/nativeint.
+  // prim_reprs shorter than the arity is padded with Same_as.
+  bool prim_alloc = true;
+  std::vector<int> prim_reprs;
+  int prim_repr_res = 0;
   std::vector<SigItem> sub;   // Module: the submodule's signature items; for a
                               // functor (functor_param set) these are the RESULT
                               // signature items (Map.Make's S).

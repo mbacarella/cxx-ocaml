@@ -993,17 +993,33 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     auto ident = o::vblock(0, {o::vstr(it.name), o::vint(item_stamp[i])});  // Ident.Local{name;stamp}
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
-      if (it.prim.empty()) {
+      if (it.prim.empty() && it.prim_native.empty()) {
+        // `external f : t = "" "native"` has an EMPTY bytecode prim name but is
+        // still Val_prim; only a value with neither name is Val_reg.
         valkind = o::vint(0);  // Val_reg
       } else {
         // Val_prim(Primitive.description): an external; inlined by consumers and
         // taking no module field.  prim_native_repr_args length must = arity.
         int arity = 0;
         for (TyPtr a = it.ty; a && a->k == Ty::Arrow; a = a->args[1]) ++arity;
-        std::vector<o::ValPtr> reprs(arity, o::vint(0));  // Same_as_ocaml_repr per arg
-        auto desc = o::vblock(0, {o::vstr(it.prim), o::vint(arity), o::vint(1) /*alloc*/,
+        auto repr_val = [](int c) -> o::ValPtr {
+          switch (c) {
+            case 1: return o::vint(1);                  // Unboxed_float
+            case 2: return o::vint(2);                  // Untagged_immediate
+            case 3: return o::vblock(0, {o::vint(1)});  // Unboxed_integer Pint32
+            case 4: return o::vblock(0, {o::vint(2)});  // Unboxed_integer Pint64
+            case 5: return o::vblock(0, {o::vint(0)});  // Unboxed_integer Pnativeint
+            default: return o::vint(0);                 // Same_as_ocaml_repr
+          }
+        };
+        std::vector<o::ValPtr> reprs;
+        for (int i = 0; i < arity; ++i)
+          reprs.push_back(repr_val(i < (int)it.prim_reprs.size() ? it.prim_reprs[i] : 0));
+        auto desc = o::vblock(0, {o::vstr(it.prim), o::vint(arity),
+                                  o::vint(it.prim_alloc ? 1 : 0),
                                   o::vstr(it.prim_native),
-                                  reprs.empty() ? o::vint(0) : o::vlist(reprs), o::vint(0) /*res repr*/});
+                                  reprs.empty() ? o::vint(0) : o::vlist(reprs),
+                                  repr_val(it.prim_repr_res)});
         valkind = o::vblock(0, {desc});  // Val_prim
       }
       auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, loc_none(),
@@ -1132,7 +1148,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
             for (auto& a : c.args) args.push_back(te.emit(a));
             cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
           }
-          cds.push_back(o::vblock(0, {cid, cargs, o::vint(0) /*cd_res None*/, loc_none(),
+          auto cres = c.res ? o::vblock(0, {te.emit(c.res)}) : o::vint(0);  // cd_res Some/None
+          cds.push_back(o::vblock(0, {cid, cargs, cres, loc_none(),
                                       o::vint(0) /*attrs*/, o::vint(0) /*Uid.Internal*/}));
         }
         kind = o::vblock(2, {o::vlist(cds), o::vint(0) /*Variant_regular*/});  // Type_variant
