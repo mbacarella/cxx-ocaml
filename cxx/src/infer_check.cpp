@@ -9476,9 +9476,17 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       // the inferred .cmi carries the exception (it takes a runtime field, and a
       // qualified `M.E` use must resolve it -- otherwise the match collapses).
       const ExtensionConstructor& ec = pe->exn.ctor;
-      if (!ec.name.txt.empty())
+      if (!ec.name.txt.empty()) {
         if (auto* pd = std::get_if<Pext_decl>(&ec.kind))
           out.push_back(exn_sigitem(ck, ec.name.txt, *pd));
+        else if (std::holds_alternative<Pext_rebind>(ec.kind))
+          // `exception F = E`: a rebind over the predefined exn.  ocamlc records a
+          // Sig_typext (Text_exception, Text_rebind) that Printtyp prints as bare
+          // `exception F`; without it a submodule `struct exception F = E end`
+          // came out `sig end`.  (The signature path already handles this at the
+          // Psig_typext rebind branch.)
+          out.push_back(cmi::cmiw::sig_exception(ec.name.txt, {}));
+      }
     } else if (auto* px = std::get_if<Pstr_typext>(&it.desc)) {
       bool first = true;
       for (auto& ec : px->ext.ctors)
