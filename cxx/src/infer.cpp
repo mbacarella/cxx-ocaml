@@ -787,6 +787,15 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
           r->level = weak_copy ? level : t->level;
           memo[t.get()] = r;  // before abbrev_args: they can reach back
           for (auto& aa : t->abbrev_args) r->abbrev_args.push_back(copy(aa));
+          // Explicit-poly method binders ride along (memo keeps them tied to
+          // the copied method bodies), so a copied `#c` row still emits its
+          // `'a.` quantifiers.
+          r->method_poly_names = t->method_poly_names;
+          for (auto& row : t->method_polys) {
+            std::vector<TypePtr> nr;
+            for (auto& b : row) nr.push_back(copy(b));
+            r->method_polys.push_back(std::move(nr));
+          }
           return r;
         }
         else {

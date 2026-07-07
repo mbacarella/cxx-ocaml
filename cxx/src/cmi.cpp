@@ -1316,15 +1316,27 @@ struct TyEmit {
         // methods as Tpoly(ty, [])); the row terminates in Tnil (closed) or a
         // Tvar for an OPEN row (`< m : t; .. >`, row_kind 0).
         // The printer sorts fields by name, so emission order is source order.
+        o::ValPtr tailvar;  // the OPEN row's terminating Tvar (shared with nm)
         o::ValPtr row = t->row_kind == 0
-                            ? texpr(o::vblock(0, {o::vint(0)}))  // Tvar None (open)
+                            ? (tailvar = texpr(o::vblock(0, {o::vint(0)})))  // Tvar None (open)
                             : texpr(o::vint(0));                 // Tnil (a full type_expr node)
         for (std::size_t i = t->pv_tags.size(); i-- > 0;) {
           o::ValPtr mty = texpr(o::vblock(8, {emit(t->args[i]), o::vint(0)}));  // Tpoly(ty,[])
           row = texpr(o::vblock(5, {o::vstr(t->pv_tags[i]), o::vint(1) /*FKpublic*/,
                                     mty, row}));  // Tfield
         }
-        return texpr(o::vblock(4, {row, o::vblock(0, {o::vint(0)})}));  // Tobject(row, ref None)
+        // A NAMED open row (`#c`): Tobject's name = ref Some(c, rowvar ::
+        // params).  Printtyp prints `#c` while the first arg is still a Tvar
+        // (the reader's normalize resets the name once it instantiates).
+        o::ValPtr nm = o::vblock(0, {o::vint(0)});  // ref None
+        if (!t->row_name.empty() && tailvar)
+          if (o::ValPtr rp = type_path(t->row_name)) {
+            std::vector<o::ValPtr> na{tailvar};
+            for (auto& a : t->row_name_args) na.push_back(emit(a));
+            // ref (Some (p, args)): ref cell -> Some -> the (p, list) pair
+            nm = o::vblock(0, {o::vblock(0, {o::vblock(0, {rp, o::vlist(na)})})});
+          }
+        return texpr(o::vblock(4, {row, nm}));  // Tobject(row, name)
       }
       case Ty::Package: {
         if (o::ValPtr package = pack_payload(*t))

@@ -5612,7 +5612,29 @@ struct Checker {
     }
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) {
       // A coercion `(e :> T)` or `(e : T1 :> T2)` has the TARGET type T/T2.
-      infer_expr(*co->e);  // infer the source for its kinds/effects
+      TypePtr src = infer_expr(*co->e);  // infer the source for its kinds/effects
+      // `(a :> c)` for a local class c and a still-unconstrained source:
+      // ocamlc types the SOURCE as #c (enlarge_type) -- the OPEN row of c's
+      // methods with the abbreviation carried.  A class param var pinned this
+      // way is what the ctor arrow stores (`class bravo : #alfa -> ..`,
+      // woodyatt).  Conservative: bare paramless class, source still a var.
+      if (!strict && !co->from && src)
+        if (auto* pc = std::get_if<Ptyp_constr>(&co->to_->desc);
+            pc && pc->args.empty())
+          if (auto* l = std::get_if<Lident>(&pc->id.txt.v))
+            if (auto ct = class_types_.find(l->name); ct != class_types_.end())
+              if (I::Engine::repr(src)->kind == I::Type::Kind::Var) {
+                TypePtr inst = I::Engine::repr(eng.instantiate(ct->second));
+                if (inst->kind == I::Type::Kind::Object) {
+                  TypePtr open_ = eng.object_type(inst->labels, inst->args);
+                  open_->variant_kind = 1;  // open row (`< .. ; .. >`)
+                  open_->abbrev = inst->abbrev.empty() ? l->name : inst->abbrev;
+                  open_->abbrev_args = inst->abbrev_args;
+                  open_->method_polys = inst->method_polys;
+                  open_->method_poly_names = inst->method_poly_names;
+                  soft_unify(src, open_);
+                }
+              }
       std::unordered_map<std::string, TypePtr> vars;
       return from_coretype(*co->to_, vars);
     }
@@ -6594,8 +6616,26 @@ struct Checker {
       } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
         infer_expr(*ini->e);
       } else if (auto* inh = std::get_if<Pcf_inherit>(&f.desc)) {
-        if (auto* ap = std::get_if<Pcl_apply>(&inh->ce->desc))
-          for (auto& [l, e] : ap->args) infer_expr(*e);
+        if (auto* ap = std::get_if<Pcl_apply>(&inh->ce->desc)) {
+          // `inherit P args`: each arg meets P's constructor parameter type
+          // (charlie's `a` adopts bravo's `#alfa` domain -- woodyatt).
+          TypePtr ctor = nullptr;
+          if (auto* pc = std::get_if<Pcl_constr>(&ap->ce->desc))
+            if (auto it = class_ctor_types_.find(lid_last(pc->id.txt));
+                it != class_ctor_types_.end())
+              ctor = eng.instantiate(it->second);
+          for (auto& [l, e] : ap->args) {
+            TypePtr at = infer_expr(*e);
+            if (!ctor) continue;
+            TypePtr c = I::Engine::repr(ctor);
+            if (c->kind == I::Type::Kind::Arrow) {
+              soft_unify(at, c->dom);
+              ctor = c->cod;
+            } else {
+              ctor = nullptr;
+            }
+          }
+        }
       }
     }
     venv.pop_back();
@@ -9458,11 +9498,14 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       // its type params) is stored by ocamlc as a Tconstr of the class ghost
       // type (`let o = new c` gives `val o : c`), which the writer resolves
       // through the class item's Local ident.
-      if (!t->abbrev.empty()) {
+      if (!t->abbrev.empty() && t->variant_kind != 1) {
         std::vector<cmi::cmiw::TyPtr> as;
         for (auto& a : t->abbrev_args) as.push_back(bridge_ty(a, vars, nextvar));
         return cmi::cmiw::ty_constr(t->abbrev, std::move(as));
       }
+      // A named OPEN object (`#c`, e.g. a coerced class param): the full row
+      // with Tobject's name = Some(c, rowvar :: params); Printtyp prints `#c`.
+      // The emitter supplies the row variable as the first name arg.
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
       std::vector<cmi::cmiw::TyPtr> mtys;
       for (std::size_t mi = 0; mi < t->args.size(); ++mi) {
@@ -9491,6 +9534,11 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       auto ty = cmi::cmiw::ty_object(t->labels, std::move(mtys));
       // engine variant_kind 1 on an Object marks an OPEN row (`< ..; .. >`)
       if (t->variant_kind == 1) ty->row_kind = 0;
+      if (!t->abbrev.empty() && t->variant_kind == 1) {
+        ty->row_name = t->abbrev;
+        for (auto& a : t->abbrev_args)
+          ty->row_name_args.push_back(bridge_ty(a, vars, nextvar));
+      }
       ctx.nodes[t.get()] = ty;
       return ty;
     }
