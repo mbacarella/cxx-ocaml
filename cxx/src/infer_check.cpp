@@ -9632,9 +9632,15 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
           auto& v = sig.values.at(oe.idx);
           std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
           std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
-          if (!v.prim.empty())
-            out.push_back(cmi::cmiw::sig_external(v.name, conv_cmi_ty(v.type, vars, nv, &nodes), v.prim, ""));
-          else
+          if (!v.prim.empty()) {
+            auto se = cmi::cmiw::sig_external(
+                v.name, conv_cmi_ty(v.type, vars, nv, &nodes), v.prim,
+                v.prim_native);
+            se.prim_alloc = v.prim_alloc;
+            se.prim_reprs = v.prim_reprs;
+            se.prim_repr_res = v.prim_repr_res;
+            out.push_back(std::move(se));
+          } else
             out.push_back(cmi::cmiw::sig_value(v.name, conv_cmi_ty(v.type, vars, nv, &nodes)));
           break;
         }
@@ -9664,7 +9670,12 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
     if (v.prim.empty()) continue;
     std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
     std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
-    out.push_back(cmi::cmiw::sig_external(v.name, conv_cmi_ty(v.type, vars, nv, &nodes), v.prim, ""));
+    auto se = cmi::cmiw::sig_external(
+        v.name, conv_cmi_ty(v.type, vars, nv, &nodes), v.prim, v.prim_native);
+    se.prim_alloc = v.prim_alloc;
+    se.prim_reprs = v.prim_reprs;
+    se.prim_repr_res = v.prim_repr_res;
+    out.push_back(std::move(se));
   }
   // Field-taking items in the recorded runtime field order, so the spliced
   // layout matches the .cmo block (`include M` copies M's non-prim fields).

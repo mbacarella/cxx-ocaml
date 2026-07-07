@@ -85,6 +85,14 @@ struct SigValue {
   // (e.g. "%compare", "caml_format_int"); empty for an ordinary Val_reg value.
   std::string prim;
   int prim_arity = 0;  // Primitive.description prim_arity (number of arguments)
+  // Rest of the Primitive.description, in the WRITER's encoding (cmiw::SigItem
+  // prim_* fields) so a cmi splice round-trips `external f = "a" "b"
+  // [@@unboxed] [@@noalloc]` faithfully: second (native) name, prim_alloc
+  // (false = [@@noalloc]), per-arg native_repr codes and the result's.
+  std::string prim_native;
+  bool prim_alloc = true;
+  std::vector<int> prim_reprs;
+  int prim_repr_res = 0;
 };
 
 // label_declaration / constructor_declaration (typing/types.mli).

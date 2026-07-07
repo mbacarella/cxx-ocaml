@@ -66,11 +66,39 @@ public:
                 const m::Value& vk = arena_[vd.fields[1]];
                 if (!vk.fields.empty()) {
                   const m::Value& desc = arena_[vk.fields[0]];
-                  // description record: field 0 = prim_name, field 1 = prim_arity.
+                  // description record: {prim_name; prim_arity; prim_alloc;
+                  // prim_native_name; prim_native_repr_args; prim_native_repr_res}
                   if (!desc.fields.empty()) sv.prim = arena_[desc.fields[0]].str;
                   if (desc.fields.size() > 1 &&
                       arena_[desc.fields[1]].kind == m::Value::Kind::Int)
                     sv.prim_arity = (int)arena_[desc.fields[1]].i;
+                  // native_repr -> the writer's code: Same_as=0, Unboxed_float=1,
+                  // Untagged_immediate=2, Unboxed_integer Pint32/Pint64/
+                  // Pnativeint = 3/4/5 (inverse of TyEmit's repr_val).
+                  auto repr_code = [&](const m::Value& v) -> int {
+                    if (v.kind == m::Value::Kind::Int) return (int)v.i;
+                    if (!v.fields.empty() &&
+                        arena_[v.fields[0]].kind == m::Value::Kind::Int)
+                      switch (arena_[v.fields[0]].i) {
+                        case 1: return 3;
+                        case 2: return 4;
+                        default: return 5;
+                      }
+                    return 0;
+                  };
+                  if (desc.fields.size() > 2 &&
+                      arena_[desc.fields[2]].kind == m::Value::Kind::Int)
+                    sv.prim_alloc = arena_[desc.fields[2]].i != 0;
+                  if (desc.fields.size() > 3)
+                    sv.prim_native = arena_[desc.fields[3]].str;
+                  if (desc.fields.size() > 4)
+                    for (std::size_t c = desc.fields[4];
+                         arena_[c].kind == m::Value::Kind::Block &&
+                         arena_[c].fields.size() == 2;
+                         c = arena_[c].fields[1])
+                      sv.prim_reprs.push_back(repr_code(arena_[arena_[c].fields[0]]));
+                  if (desc.fields.size() > 5)
+                    sv.prim_repr_res = repr_code(arena_[desc.fields[5]]);
                 }
               }
               out.values.push_back(std::move(sv));
