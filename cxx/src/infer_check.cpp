@@ -537,6 +537,10 @@ struct Checker {
   // the cmi producer maps it to csig_self so method types citing the self
   // (`unit -> 'self`) marshal as the shared node and print `object ('a) ..`.
   std::unordered_map<const ast::ClassDeclaration*, TypePtr> class_self_types_;
+  // ALIAS classes (`class c = other [args]`, through lets/opens/parens): the
+  // target class path as written -- the producer emits Cty_constr(target)
+  // (`class c : with_param`, toplevel_lets M3/M4).
+  std::unordered_map<const ast::ClassDeclaration*, std::string> class_alias_refs_;
   // Each class's instance-variable types (name -> type), so `inherit P` brings
   // P's vals into the subclass body (woodyatt: charlie inherits bravo's `y`).
   std::unordered_map<std::string, std::vector<std::pair<std::string, TypePtr>>>
@@ -7896,10 +7900,52 @@ struct Checker {
               } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
                 lets.push_back(pl);
                 ce = pl->body.get();
+              } else if (auto* pcn = std::get_if<Pcl_constraint>(&ce->desc)) {
+                ce = pcn->ce.get();  // `(object .. end : object .. end)`
+              } else if (auto* po = std::get_if<Pcl_open>(&ce->desc)) {
+                ce = po->body.get();  // `let open M in object .. end`
               } else break;
             }
             auto* ps = std::get_if<Pcl_structure>(&ce->desc);
-            if (!ps) continue;
+            if (!ps) {
+              // `class c = other [args]` (possibly through applications):
+              // an ALIAS class.  Register c's object type as the target's
+              // (value-param arrows consumed by the applied args), renamed
+              // to c, and remember the target path for Cty_constr emission.
+              const ClassExpr* h = ce;
+              int napp = 0;
+              for (;;) {
+                if (auto* ap = std::get_if<Pcl_apply>(&h->desc)) {
+                  napp += (int)ap->args.size(); h = ap->ce.get();
+                } else if (auto* pl2 = std::get_if<Pcl_let>(&h->desc)) h = pl2->body.get();
+                else if (auto* po2 = std::get_if<Pcl_open>(&h->desc)) h = po2->body.get();
+                else if (auto* pcn2 = std::get_if<Pcl_constraint>(&h->desc)) h = pcn2->ce.get();
+                else break;
+              }
+              if (auto* pcr = std::get_if<Pcl_constr>(&h->desc)) {
+                std::string tgt = lid_last(pcr->id.txt);
+                TypePtr t;
+                if (auto f = class_types_.find(tgt); f != class_types_.end()) t = f->second;
+                else if (auto f2 = class_ctor_types_.find(tgt); f2 != class_ctor_types_.end())
+                  t = f2->second;
+                if (t) {
+                  TypePtr obj = I::Engine::repr(eng.instantiate(t));
+                  while (napp-- > 0 && obj->kind == I::Type::Kind::Arrow)
+                    obj = I::Engine::repr(obj->cod);
+                  if (obj->kind == I::Type::Kind::Object) {
+                    // a FRESH node (mutating the target's own abbrev would
+                    // rename the target class everywhere)
+                    TypePtr named = eng.object_type(obj->labels, obj->args);
+                    named->abbrev = d.name.txt;
+                    class_types_[d.name.txt] = named;
+                    class_node_types_[&d] = named;
+                    class_alias_refs_[&d] = lid_full(pcr->id.txt);
+                    pend.push_back({&d, {}, {}, nullptr, named, true});
+                  }
+                }
+              }
+              continue;
+            }
             bool paramless = params.empty() && d.params.empty();
             // Build an OBJECT SHELL (public concrete method names -> fresh
             // vars) so a forward `new sibling`'s `#meth arg` resolves against a
@@ -7926,6 +7972,7 @@ struct Checker {
             pend.push_back({&d, std::move(params), std::move(lets), ps, ph, paramless});
           }
           for (auto& pe : pend) {
+            if (!pe.ps) continue;  // alias class: no body to infer
             const ClassDeclaration& d = *pe.d;
             // The class's TYPE params (`class ['a] lambda_ops`) scope over the
             // body's annotations and `constraint` fields; the object then
@@ -7953,6 +8000,15 @@ struct Checker {
             // placeholder) flow back into this class' body.
             if (pe.paramless) {
               try_unify(pe.placeholder, ot);
+              // Name the class object: a value `let o = new c` is typed BY
+              // NAME in ocamlc (`val o : c`, the class ghost type), so the
+              // bridge must see which class the row came from.
+              TypePtr obj = I::Engine::repr(ot);
+              if (obj->kind == I::Type::Kind::Object && obj->abbrev.empty())
+                obj->abbrev = d.name.txt;
+              TypePtr ph2 = I::Engine::repr(pe.placeholder);
+              if (ph2->kind == I::Type::Kind::Object && ph2->abbrev.empty())
+                ph2->abbrev = d.name.txt;
             } else {
               TypePtr obj = I::Engine::repr(ot);
               if (obj->kind == I::Type::Kind::Object && !d.params.empty()) {
@@ -9372,8 +9428,15 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       // writer then marshals it shared and Printtyp names it `as 'a`); a
       // RECURSIVE object type (`< bark : 'self -> unit > as 'self`) closes
       // through the wrapper's in_progress node.
-      // Named class-type objects (abbrev, `(T1,T2) ops`) stay opaque for now.
-      if (!t->abbrev.empty()) return cmi::cmiw::ty_var(nextvar++);
+      // A NAMED class object (abbrev = the class / class-type name, args =
+      // its type params) is stored by ocamlc as a Tconstr of the class ghost
+      // type (`let o = new c` gives `val o : c`), which the writer resolves
+      // through the class item's Local ident.
+      if (!t->abbrev.empty()) {
+        std::vector<cmi::cmiw::TyPtr> as;
+        for (auto& a : t->abbrev_args) as.push_back(bridge_ty(a, vars, nextvar));
+        return cmi::cmiw::ty_constr(t->abbrev, std::move(as));
+      }
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
       std::vector<cmi::cmiw::TyPtr> mtys;
       for (std::size_t mi = 0; mi < t->args.size(); ++mi) {
@@ -12467,10 +12530,38 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) { cparams.push_back(pf); ce = pf->body.get(); }
           else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) ce = pl->body.get();
           else if (auto* pcn = std::get_if<Pcl_constraint>(&ce->desc)) ce = pcn->ce.get();
+          else if (auto* po = std::get_if<Pcl_open>(&ce->desc)) ce = po->body.get();
           else break;
         }
         auto* pst = std::get_if<Pcl_structure>(&ce->desc);
-        if (!pst) continue;  // `class c = other_class` etc.
+        if (!pst) {
+          // An ALIAS class (`class c = with_param args`, recorded by the
+          // checker): emit Cty_constr(target) with the target's methods as
+          // the inner signature.
+          auto ar = ck.class_alias_refs_.find(&d);
+          if (ar == ck.class_alias_refs_.end()) { continue; }
+          cmi::cmiw::SigItem ci;
+          ci.k = cmi::cmiw::SigItem::Class;
+          ci.name = d.name.txt;
+          ci.rec_status = class_rs; class_rs = 2;
+          ci.class_virtual = (d.virt == VirtualFlag::Virtual);
+          ci.class_constr_ref = ar->second;
+          std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
+          BridgeCtx cctx;
+          if (auto f = ck.class_node_types_.find(&d); f != ck.class_node_types_.end()) {
+            TypePtr obj = I::Engine::repr(f->second);
+            if (obj->kind == I::Type::Kind::Object)
+              for (std::size_t m = 0; m < obj->labels.size() && m < obj->args.size(); ++m) {
+                cmi::cmiw::ClassField cf2;
+                cf2.name = obj->labels[m];
+                cf2.is_method = true;
+                cf2.ty = bridge_ty_rec(obj->args[m], cvars, cnext, cctx);
+                ci.class_fields.push_back(std::move(cf2));
+              }
+          }
+          out.push_back(std::move(ci));
+          continue;
+        }
         cmi::cmiw::SigItem ci;
         ci.k = cmi::cmiw::SigItem::Class;
         ci.name = d.name.txt;

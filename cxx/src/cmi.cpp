@@ -1357,6 +1357,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   // names, so a value emitted before/after a type can still cite it by stamp.
   std::vector<int> item_stamp(items.size());
   std::unordered_map<std::string, int> local_types, local_modtypes, local_mods;
+  std::unordered_map<std::string, int> local_classes;  // class name -> CLASS ident
   for (std::size_t i = 0; i < items.size(); ++i) {
     item_stamp[i] = stamp;
     // A Class takes THREE idents (class, ghost class type, ghost object type
@@ -1365,6 +1366,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     stamp += nid;
     if (items[i].k == SigItem::Type) local_types[items[i].name] = item_stamp[i];
     if (items[i].k == SigItem::Class) local_types[items[i].name] = item_stamp[i] + nid - 1;
+    if (items[i].k == SigItem::Class) local_classes[items[i].name] = item_stamp[i];
     if (items[i].k == SigItem::Modtype) local_modtypes[items[i].name] = item_stamp[i];
     if (items[i].k == SigItem::Module) local_mods[items[i].name] = item_stamp[i];
   }
@@ -1730,6 +1732,17 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       auto csig = o::vblock(0, {self, row_var, o::vint(2) /*dummy FKabsent*/,
                                 build_map(std::move(vars_m)), build_map(std::move(meths_m))});
       o::ValPtr cty = o::vblock(1, {csig});  // Cty_signature
+      // An ALIAS class (`class c = with_param args`): the stored class type
+      // is Cty_constr(target, [], inner) -- Printtyp prints `class c :
+      // with_param` from the path.  Bare local targets only for now.
+      if (!it.class_constr_ref.empty() &&
+          it.class_constr_ref.find('.') == std::string::npos)
+        if (auto lc = local_classes.find(it.class_constr_ref);
+            lc != local_classes.end()) {
+          o::ValPtr cp = o::vblock(0, {o::vblock(0,
+              {o::vstr(it.class_constr_ref), o::vint(lc->second)})});  // Pident(Local)
+          cty = o::vblock(0, {cp, o::vint(0) /*[]*/, cty});  // Cty_constr
+        }
       for (std::size_t p = it.class_arrow_doms.size(); p-- > 0;) {
         int lk = p < it.class_arrow_lks.size() ? it.class_arrow_lks[p] : 0;
         const std::string& lb = p < it.class_arrow_lbls.size() ? it.class_arrow_lbls[p]
@@ -1747,6 +1760,9 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       o::ValPtr cnew;
       if (it.class_virtual) {
         cnew = o::vint(0);
+      } else if (!it.class_constr_ref.empty()) {
+        // alias class: ocamlc stores cty_new = Tconstr(target's ghost type)
+        cnew = o::vblock(0, {te.emit(ty_constr(it.class_constr_ref, {}))});
       } else {
         TyPtr nt = ty_object(mnames, mtys);
         for (std::size_t p = it.class_arrow_doms.size(); p-- > 0;)

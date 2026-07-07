@@ -378,6 +378,11 @@ struct SigItem {
   // class), and the writer maps it to the emitted csig_self, so Printtyp
   // prints `object ('a) .. method m : unit -> 'a end`.
   TyPtr class_self;
+  // Class: an ALIAS of another class (`class c = with_param args`): the
+  // target path as written.  The writer wraps the signature in
+  // Cty_constr(target, [], inner) -- Printtyp prints `class c : with_param`
+  // -- and cty_new becomes Tconstr(target's ghost type).
+  std::string class_constr_ref;
   // Type: Type_immediacy (0 Unknown / 1 Always / 2 Always_on_64bits) from a
   // `[@@immediate]` / `[@@immediate64]` attribute (Printtyp renders it back).
   int type_immediate = 0;
