@@ -11236,33 +11236,97 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       // after the include sits one slot too low and a cross-module read lands on
       // the wrong field (ocamlbuild's Log: `module Debug = ..; include Debug`).
       const ast::Structure* inc = nullptr;
+      std::string inc_path;  // non-empty = `include <local path>`: strengthen
       if (auto* ms = std::get_if<Pmod_structure>(&in->expr.desc))
         inc = &ms->items;                              // include (struct .. end)
       else if (auto* mi = std::get_if<Pmod_ident>(&in->expr.desc)) {
         std::string nm = lid_last(mi->id.txt);         // include LocalModule
-        for (auto& it2 : s)
-          if (auto* mb2 = std::get_if<Pstr_module>(&it2.desc))
-            if (mb2->binding.name.txt && *mb2->binding.name.txt == nm) {
-              if (auto* ms2 = std::get_if<Pmod_structure>(&mb2->binding.expr.desc))
-                inc = &ms2->items;
-              break;
+        // Chase local ALIAS bindings (`module A_alias = A; include A_alias`):
+        // ocamlc strengthens through the RESOLVED path (A, not A_alias).
+        for (int hops = 0; hops < 8 && !inc; ++hops) {
+          const ast::ModuleExpr* tgt = nullptr;
+          for (auto& it2 : s)
+            if (auto* mb2 = std::get_if<Pstr_module>(&it2.desc))
+              if (mb2->binding.name.txt && *mb2->binding.name.txt == nm) {
+                tgt = &mb2->binding.expr;
+                break;
+              }
+          if (!tgt) break;
+          if (auto* ms2 = std::get_if<Pmod_structure>(&tgt->desc)) {
+            inc = &ms2->items;
+            inc_path = nm;
+          } else if (auto* mi2 = std::get_if<Pmod_ident>(&tgt->desc)) {
+            if (auto* l2 = std::get_if<Lident>(&mi2->id.txt.v)) nm = l2->name;
+            else break;
+          } else {
+            break;
+          }
+        }
+        // `include X` where X is a module of the ENCLOSING structure
+        // (`module Y = struct include X end` -- X outer): splice X's
+        // already-emitted items, strengthened through X (fstclassmod).
+        // Alias items are chased to their target (`module A_alias = A;
+        // .. include A_alias` strengthens through A, pr6982).
+        if (!inc && saved_enclosing &&
+            std::holds_alternative<Lident>(mi->id.txt.v)) {
+          std::string tnm = lid_last(mi->id.txt);
+          for (int hops = 0; hops < 8; ++hops) {
+            const cmi::cmiw::SigItem* found = nullptr;
+            for (auto& si : *saved_enclosing)
+              if (si.k == cmi::cmiw::SigItem::Module && si.name == tnm &&
+                  !si.is_functor) {
+                found = &si;
+                break;
+              }
+            if (!found) break;
+            if (!found->alias.empty()) {
+              if (found->alias.find('.') != std::string::npos) break;
+              tnm = found->alias;
+              continue;
             }
+            auto items = found->sub;
+            strengthen_abstract(items, tnm);
+            for (auto& s2 : items) {
+              if (s2.k == cmi::cmiw::SigItem::Modtype) {
+                s2.modtype_ref = tnm + "." + s2.name;
+                s2.modtype_abstract = false;
+              }
+              out.push_back(std::move(s2));
+            }
+            inc_path = tnm;  // mark handled (skip the fparam fallback)
+            break;
+          }
+        }
         // `include X` of a FUNCTOR PARAMETER: splice the param's signature
         // items, strengthened through the param path (ocamlc records
         // `type t = X.t` and X's vals as this module's own fields).
-        if (!inc && fparams && std::holds_alternative<Lident>(mi->id.txt.v))
+        if (!inc && inc_path.empty() && fparams &&
+            std::holds_alternative<Lident>(mi->id.txt.v))
           for (auto& fp : *fparams)
-            if (fp.first == nm && fp.second) {
+            if (fp.first == lid_last(mi->id.txt) && fp.second) {
               std::string ref;
               std::vector<cmi::cmiw::SigItem> sub;
               annot_modtype_items(&ck, *fp.second, ref, sub);
-              strengthen_abstract(sub, nm);
+              strengthen_abstract(sub, lid_last(mi->id.txt));
               for (auto& si : sub) out.push_back(std::move(si));
               break;
             }
       }
-      if (inc)
-        for (auto& si : infer_signature(*inc)) out.push_back(si);
+      if (inc) {
+        auto items = infer_signature(*inc);
+        if (!inc_path.empty()) {
+          // `include A` (a module PATH): ocamlc strengthens the spliced items
+          // -- abstract types get `= A.t` manifests, and MODTYPE decls become
+          // aliases `module type S = A.S` (pr6982, fstclassmod).
+          strengthen_abstract(items, inc_path);
+          for (auto& si : items)
+            if (si.k == cmi::cmiw::SigItem::Modtype) {
+              si.modtype_ref = inc_path + "." + si.name;
+              si.modtype_abstract = false;
+            }
+        }
+        for (auto& si : items) out.push_back(std::move(si));
+      }
     }
   }
   // Canonical shadowing dedup: a name bound twice at top level (e.g. ocamllex's
