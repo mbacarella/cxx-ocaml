@@ -989,6 +989,17 @@ struct TyEmit {
         if (j == std::string::npos) j = name.size();
         comps.push_back(name.substr(i, j - i));
       }
+      // A LOCAL module head (`module MP = Gc.Memprof` then MP.allocation):
+      // Pdot chain off the sibling's Local ident, like ocamlc -- not a bogus
+      // Global that would demand an interface CRC for "MP".
+      if (local_mods)
+        if (auto lm = local_mods->find(comps[0]); lm != local_mods->end()) {
+          o::ValPtr path = o::vblock(0, {o::vblock(0, {o::vstr(comps[0]),
+                                                       o::vint(lm->second)})});
+          for (std::size_t i = 1; i < comps.size(); ++i)
+            path = o::vblock(1, {path, o::vstr(comps[i])});  // Pdot
+          return path;
+        }
       std::string g = global_of(comps[0]);
       if (referenced) (*referenced)[g] = true;  // a real type ref needs the CRC
       o::ValPtr path;

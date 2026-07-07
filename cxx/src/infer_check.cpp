@@ -9954,6 +9954,36 @@ static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
   }
 }
 
+// Walk every type in a SigItem tree, applying `fn` to each Constr/Package
+// path name (in place -- nodes here are freshly built per item, and prefix
+// rewrites are idempotent under the sharing a local-functor copy introduces).
+static void rewrite_ty_names(const cmi::cmiw::TyPtr& t,
+                             const std::function<void(std::string&)>& fn) {
+  if (!t) return;
+  if (t->k == cmi::cmiw::Ty::Constr || t->k == cmi::cmiw::Ty::Package) fn(t->name);
+  for (auto& a : t->args) rewrite_ty_names(a, fn);
+}
+static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
+                                  const std::function<void(std::string&)>& fn) {
+  for (auto& si : items) {
+    rewrite_ty_names(si.ty, fn);
+    rewrite_ty_names(si.manifest, fn);
+    for (auto& p : si.params) rewrite_ty_names(p, fn);
+    for (auto& c : si.ctors) {
+      for (auto& a : c.args) rewrite_ty_names(a, fn);
+      for (auto& l : c.inline_record) rewrite_ty_names(l.ty, fn);
+      rewrite_ty_names(c.res, fn);
+    }
+    for (auto& l : si.labels) rewrite_ty_names(l.ty, fn);
+    rewrite_ty_names(si.ext_ret, fn);
+    for (auto& f : si.class_fields) rewrite_ty_names(f.ty, fn);
+    for (auto& d : si.class_arrow_doms) rewrite_ty_names(d, fn);
+    rewrite_item_ty_names(si.sub, fn);
+    rewrite_item_ty_names(si.param_sig, fn);
+    for (auto& ps : si.more_param_sigs) rewrite_item_ty_names(ps, fn);
+  }
+}
+
 static std::vector<std::string> split_dotted(const std::string& s) {
   std::vector<std::string> out;
   for (std::size_t p = 0, d; p <= s.size(); p = d + 1) {
@@ -10618,6 +10648,18 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // external `Lexer.token` reads the wrong block field (a closure where a token is
   // expected -> a SWITCH past its table -> heap corruption).  The explicit-.mli
   // path (signature_to_cmi) already dedups identically.
+  // `module MP = Gc.Memprof` aliases: ocamlc records value types THROUGH the
+  // alias (MP.allocation, a Local-ident head), so rewrite each aliased prefix
+  // back onto the emitted constr paths.  Longest target first (nested aliases).
+  if (!ck.module_aliases_.empty()) {
+    auto aliases = ck.module_aliases_;
+    std::sort(aliases.begin(), aliases.end(),
+              [](auto& a, auto& b) { return a.first.size() > b.first.size(); });
+    rewrite_item_ty_names(out, [&](std::string& nm) {
+      for (auto& [tgt, al] : aliases)
+        if (nm.rfind(tgt + ".", 0) == 0) { nm = al + nm.substr(tgt.size()); break; }
+    });
+  }
   out = cmi::cmiw::dedup_shadowed_fields(std::move(out));
   g_outer_modtype_asts = saved_mt_asts;
   g_outer_modtype_quals = saved_mt_quals;
