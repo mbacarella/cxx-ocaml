@@ -1312,18 +1312,24 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // Mty_signature(result))): the curried parameter chain, innermost last.
         // A generative parameter is Unit (the int constructor 0); otherwise
         // Named(Some id, <param sig>).  The functor takes a runtime field.
+        // Params are visible to LATER param sigs and the result (a partial-
+        // application manifest `Outcome.Make(IntT)(N).t` cites param N by its
+        // Local ident).
+        std::unordered_map<std::string, int> visible_mod_body = visible_mod;
         auto mk_param = [&](bool unit, const std::string& pname,
                             const std::vector<SigItem>& psig_items,
                             const std::string& ref) -> o::ValPtr {
           if (unit) return o::vint(0);  // functor_parameter = Unit
-          auto pident = o::vblock(0, {o::vstr(pname), o::vint(stamp++)});  // Ident.Local
+          int pstamp = stamp++;
+          auto pident = o::vblock(0, {o::vstr(pname), o::vint(pstamp)});  // Ident.Local
+          visible_mod_body[pname] = pstamp;
           // A NAMED param modtype (`(K : Key)`) emits Mty_ident(Key) like
           // ocamlc; the inlined signature is the fallback.
           o::ValPtr psig;
           if (!ref.empty())
             if (o::ValPtr mp = modtype_path(ref)) psig = o::vblock(0, {mp});  // Mty_ident
           if (!psig)
-            psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod))});  // Mty_signature
+            psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body))});  // Mty_signature
           return o::vblock(0, {o::vblock(0, {pident}) /*Some*/, psig});  // Named(Some, <param sig>)
         };
         std::vector<o::ValPtr> params;
@@ -1336,7 +1342,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                                                   : std::vector<SigItem>{},
                                     p < it.more_param_refs.size() ? it.more_param_refs[p]
                                                                   : std::string()));
-        o::ValPtr body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod))});  // Mty_signature(result)
+        o::ValPtr body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body))});  // Mty_signature(result)
         for (auto p = params.rbegin(); p != params.rend(); ++p)
           body = o::vblock(2, {*p, body});  // Mty_functor
         mty = body;
