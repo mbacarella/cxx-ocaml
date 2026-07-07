@@ -10665,6 +10665,29 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
           }
         }
         continue;
+      } else if (auto* wmt = std::get_if<Pwith_modtype>(&c)) {
+        // `with module type MT = AS`: replace the abstract `module type MT`
+        // decl with a manifest.  A named RHS (`= AS`, `= M.T`) sets the
+        // modtype_ref so the writer emits Some(Mty_ident) (shape-index's MSA);
+        // an inline `sig .. end` RHS is left best-effort (rare).
+        std::vector<std::string> ncomps = split_dotted(lid_full(wmt->lid.txt));
+        std::vector<cmi::cmiw::SigItem>* ncur = &items;
+        cmi::cmiw::SigItem* nitem = nullptr;
+        for (std::size_t i = 0; i < ncomps.size() && ncur; ++i) {
+          nitem = nullptr;
+          for (auto& si : *ncur)
+            if ((i + 1 < ncomps.size() ? si.k == cmi::cmiw::SigItem::Module
+                                       : si.k == cmi::cmiw::SigItem::Modtype) &&
+                si.name == ncomps[i]) { nitem = &si; break; }
+          ncur = nitem ? &nitem->sub : nullptr;
+        }
+        if (nitem)
+          if (auto* pid = std::get_if<Pmty_ident>(&wmt->mty->desc);
+              pid && !std::holds_alternative<Lapply>(pid->id.txt.v)) {
+            nitem->modtype_abstract = false;
+            nitem->modtype_ref = lid_full(pid->id.txt);
+          }
+        continue;
       } else continue;
       // Descend a dotted `with type M.t = ..` through submodule items.
       std::string full = lid_full(lid->txt);
@@ -10697,7 +10720,22 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
         return si.k == cmi::cmiw::SigItem::Type && si.name == comps.back();
       });
       if (tgt == cur->end()) continue;
-      if (subst) { cur->erase(tgt); continue; }
+      if (subst) {
+        cur->erase(tgt);
+        // `type t := u` (destructive): besides erasing `type t`, substitute
+        // t -> u in the remaining items, so a later `val x : t` becomes
+        // `val x : u` instead of degrading to a fresh var (mirrors the
+        // Pwith_modsubst rewrite above; shape-index's MSB include).  Only a
+        // path (Constr) RHS -- the `t := u` / `t := M.t` shape.
+        if (td->manifest)
+          if (auto* pc = std::get_if<Ptyp_constr>(&(*td->manifest)->desc)) {
+            std::string newname = lid_full(pc->id.txt);
+            rewrite_item_ty_names(items, [&](std::string& n) {
+              if (n == full) n = newname;
+            });
+          }
+        continue;
+      }
       if (!td->manifest) continue;
       // Params first, then the manifest, sharing the var table -- so `'a` in
       // `with type 'a t = 'a list` is the same Var node in both.
@@ -10792,6 +10830,18 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         modtypes[pms->name.txt] = &ps->items;
     if (auto* po = std::get_if<Psig_open>(&it.desc)) {
       auto* l = std::get_if<Lident>(&po->id.txt.v);
+      // `open A` of a LOCAL module of the enclosing structure (A emitted just
+      // above): register each of A's type names `t` -> `A.t` so a val
+      // annotation `val c : t` in this sig resolves to `A.t` instead of a
+      // fresh var (shape-index's `module C : sig open A val c : t end`).
+      if (l && g_enclosing_struct_items)
+        for (auto& si : *g_enclosing_struct_items)
+          if (si.k == cmi::cmiw::SigItem::Module && si.name == l->name) {
+            for (auto& msi : si.sub)
+              if (msi.k == cmi::cmiw::SigItem::Type)
+                ck.opened_type_quals_[msi.name] = l->name + "." + msi.name;
+            break;
+          }
       if (l && module_sigs.count(l->name)) {
         import_modtypes_of(*module_sigs.at(l->name));
       } else if (!std::holds_alternative<Lapply>(po->id.txt.v)) {
