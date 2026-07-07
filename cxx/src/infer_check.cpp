@@ -9718,6 +9718,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       // constructor arrow; class_instvars_ the vals); member FLAGS
       // (mutable/private/virtual) from the AST fields.  Type-parameterized
       // classes (['a] c) aren't representable yet -- skipped.
+      int class_rs = 1;  // Trec_first, then Trec_next for the `and` members
       for (auto& d : pc->decls) {
         if (!d.params.empty()) continue;
         const ast::ClassExpr* ce = &d.expr;
@@ -9725,6 +9726,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
         for (;;) {
           if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) { cparams.push_back(pf); ce = pf->body.get(); }
           else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) ce = pl->body.get();
+          else if (auto* pcn = std::get_if<Pcl_constraint>(&ce->desc)) ce = pcn->ce.get();
           else break;
         }
         auto* pst = std::get_if<Pcl_structure>(&ce->desc);
@@ -9732,6 +9734,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
         cmi::cmiw::SigItem ci;
         ci.k = cmi::cmiw::SigItem::Class;
         ci.name = d.name.txt;
+        ci.rec_status = class_rs; class_rs = 2;
         ci.class_virtual = (d.virt == VirtualFlag::Virtual);
         std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
         // constructor arrows + the final object type
@@ -9789,6 +9792,47 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
           }
         }
         out.push_back(std::move(ci));
+      }
+    } else if (auto* pct = std::get_if<Pstr_class_type>(&it.desc)) {
+      // `class type ct = object .. end`: Sig_class_type + its ghost Sig_type.
+      // Member types come straight from the written coretypes.
+      int ct_rs = 1;
+      for (auto& d : pct->decls) {
+        if (!d.params.empty()) continue;  // ['a] class types not representable yet
+        auto* cs = std::get_if<Pcty_signature>(&d.expr.desc);
+        if (!cs) continue;
+        cmi::cmiw::SigItem ci;
+        ci.k = cmi::cmiw::SigItem::Class;
+        ci.class_is_type = true;
+        ci.name = d.name.txt;
+        ci.rec_status = ct_rs; ct_rs = 2;
+        ci.class_virtual = (d.virt == VirtualFlag::Virtual);
+        std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
+        std::unordered_map<std::string, TypePtr> tv;  // shared 'a across members
+        bool ok = true;
+        for (auto& cf : cs->cs.fields) {
+          if (auto* pv = std::get_if<Pctf_val>(&cf.desc)) {
+            cmi::cmiw::ClassField f;
+            f.name = pv->name.txt;
+            f.mut = (pv->mut == MutableFlag::Mutable);
+            f.virt = (pv->virt == VirtualFlag::Virtual);
+            f.ty = bridge_ty_named(ck.from_coretype(*pv->type, tv), cvars, cnext, tv);
+            ci.class_fields.push_back(std::move(f));
+          } else if (auto* pm = std::get_if<Pctf_method>(&cf.desc)) {
+            cmi::cmiw::ClassField f;
+            f.name = pm->name.txt;
+            f.is_method = true;
+            f.priv = (pm->priv == PrivateFlag::Private);
+            f.virt = (pm->virt == VirtualFlag::Virtual);
+            f.ty = bridge_ty_named(ck.from_coretype(*pm->type, tv), cvars, cnext, tv);
+            ci.class_fields.push_back(std::move(f));
+          } else if (std::holds_alternative<Pctf_inherit>(cf.desc) ||
+                     std::holds_alternative<Pctf_constraint>(cf.desc)) {
+            ok = false;  // inherited/constrained bodies aren't representable yet
+            break;
+          }
+        }
+        if (ok) out.push_back(std::move(ci));
       }
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       // A submodule: emit Sig_module so the oracle can resolve `Outer.Inner.x`

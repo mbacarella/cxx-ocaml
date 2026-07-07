@@ -360,6 +360,9 @@ struct SigItem {
   std::vector<int> class_arrow_lks;       // 0 Nolabel / 1 Labelled / 2 Optional
   std::vector<std::string> class_arrow_lbls;
   bool class_virtual = false;             // `class virtual c` -> cty_new = None
+  // `class type ct = object .. end`: emit only Sig_class_type + its ghost
+  // Sig_type (TWO stamps); arrows/cty_new don't apply.
+  bool class_is_type = false;
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
                                   std::vector<SigItem> param_sig,

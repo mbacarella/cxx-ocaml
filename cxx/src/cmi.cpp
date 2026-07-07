@@ -1113,11 +1113,12 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   std::unordered_map<std::string, int> local_types, local_modtypes;
   for (std::size_t i = 0; i < items.size(); ++i) {
     item_stamp[i] = stamp;
-    // A Class takes THREE idents: the class, its ghost class type, and its
-    // ghost object type `type c` (which is what value types cite as `c`).
-    stamp += items[i].k == SigItem::Class ? 3 : 1;
+    // A Class takes THREE idents (class, ghost class type, ghost object type
+    // `type c` -- what value types cite as `c`); a `class type` decl TWO.
+    int nid = items[i].k == SigItem::Class ? (items[i].class_is_type ? 2 : 3) : 1;
+    stamp += nid;
     if (items[i].k == SigItem::Type) local_types[items[i].name] = item_stamp[i];
-    if (items[i].k == SigItem::Class) local_types[items[i].name] = item_stamp[i] + 2;
+    if (items[i].k == SigItem::Class) local_types[items[i].name] = item_stamp[i] + nid - 1;
     if (items[i].k == SigItem::Modtype) local_modtypes[items[i].name] = item_stamp[i];
   }
   // Types visible here = enclosing-scope types overlaid with this level's own
@@ -1326,6 +1327,13 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // order = alphabetical); csig_self only matters for self-aliased
       // classes, which we don't emit.
       int s_class = item_stamp[i];
+      // The class's rec_status flows to its ghosts too (`class a .. and b`:
+      // a's three items are all Trec_first, b's all Trec_next).
+      int rs = it.rec_status ? it.rec_status : 1;
+      // A `class type` decl has no Sig_class item: its idents are
+      // (class_type, ghost type) at s_class / s_class+1.
+      int s_clty = it.class_is_type ? s_class : s_class + 1;
+      int s_ty = it.class_is_type ? s_class + 1 : s_class + 2;
       // (mutable/privacy, virtual, ty) String.Map as a balanced marshal tree:
       // Node{l; v; d; r; h} (block tag 0), Empty = int 0.
       struct MapEnt { std::string name; o::ValPtr d; };
@@ -1395,12 +1403,14 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                             p < it.class_arrow_lbls.size() ? it.class_arrow_lbls[p] : "");
         cnew = o::vblock(0, {te.emit(nt)});
       }
-      auto cpath = o::vblock(0, {o::vblock(0, {o::vstr(it.name), o::vint(s_class + 2)})});
-      auto cdecl = o::vblock(0, {o::vint(0) /*cty_params*/, cty, cpath, cnew,
-                                 o::vint(0) /*variance*/, loc_none(),
-                                 o::vint(0) /*attrs*/, o::vint(0) /*uid*/});
-      sig.push_back(o::vblock(5, {ident, cdecl, o::vint(1) /*Trec_first*/,
-                                  o::vint(0) /*Exported*/}));  // Sig_class
+      auto cpath = o::vblock(0, {o::vblock(0, {o::vstr(it.name), o::vint(s_ty)})});
+      if (!it.class_is_type) {
+        auto cdecl = o::vblock(0, {o::vint(0) /*cty_params*/, cty, cpath, cnew,
+                                   o::vint(0) /*variance*/, loc_none(),
+                                   o::vint(0) /*attrs*/, o::vint(0) /*uid*/});
+        sig.push_back(o::vblock(5, {ident, cdecl, o::vint(rs),
+                                    o::vint(0) /*Exported*/}));  // Sig_class
+      }
       // ghost type_declaration builder (14 fields, no params)
       auto mk_tdecl = [&](o::ValPtr man) {
         return o::vblock(0, {o::vint(0), o::vint(0),
@@ -1410,16 +1420,17 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                              loc_none(), o::vint(0), o::vint(0), o::vint(0),
                              o::vint(0) /*uid*/});
       };
-      // ghost Sig_class_type: shares cty; clty_hash_type is a bare abstract decl
+      // Sig_class_type: a ghost after a class, the REAL item for `class type`;
+      // shares cty; clty_hash_type is a bare abstract decl
       auto clty = o::vblock(0, {o::vint(0) /*clty_params*/, cty, cpath,
                                 mk_tdecl(o::vint(0)), o::vint(0) /*variance*/,
                                 loc_none(), o::vint(0), o::vint(0)});
-      auto clty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_class + 1)});
-      sig.push_back(o::vblock(6, {clty_ident, clty, o::vint(1), o::vint(0)}));  // Sig_class_type
+      auto clty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_clty)});
+      sig.push_back(o::vblock(6, {clty_ident, clty, o::vint(rs), o::vint(0)}));  // Sig_class_type
       // ghost Sig_type c = <closed public object> (what `val o : c` cites)
-      auto ty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_class + 2)});
+      auto ty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_ty)});
       auto g_tdecl = mk_tdecl(o::vblock(0, {te.emit(ty_object(mnames, mtys))}));
-      sig.push_back(o::vblock(1, {ty_ident, g_tdecl, o::vint(1), o::vint(0)}));  // Sig_type
+      sig.push_back(o::vblock(1, {ty_ident, g_tdecl, o::vint(rs), o::vint(0)}));  // Sig_type
     } else {
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
       // alias (`type t = manifest`).  Variant/record kinds: the climb.
