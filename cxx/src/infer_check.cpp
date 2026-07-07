@@ -752,6 +752,25 @@ struct Checker {
   TypePtr from_coretype(const CoreType& t,
                         std::unordered_map<std::string, TypePtr>& vars) {
     if (std::holds_alternative<Ptyp_any>(t.desc)) return eng.fresh_var();
+    if (auto* op = std::get_if<Ptyp_open>(&t.desc)) {
+      // `N.(t)`: a type-scope local open.  A bare non-predef constr head
+      // inside resolves through N (ocamlc stores the qualified path N.t);
+      // anything else converts as written.
+      if (auto* c = std::get_if<Ptyp_constr>(&op->type->desc))
+        if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
+          static const std::set<std::string> predefs = {
+              "int", "char", "bytes", "float", "bool", "unit", "exn", "eff",
+              "continuation", "array", "list", "option", "nativeint", "int32",
+              "int64", "lazy_t", "string", "extension_constructor", "floatarray"};
+          if (!predefs.count(l->name)) {
+            std::vector<TypePtr> as;
+            for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
+            return eng.constr(lid_full(op->mod_.txt) + "." + l->name,
+                              std::move(as));
+          }
+        }
+      return from_coretype(*op->type, vars);
+    }
     if (auto* v = std::get_if<Ptyp_var>(&t.desc)) {
       auto it = vars.find(v->name);
       if (it != vars.end()) return it->second;
@@ -8802,6 +8821,10 @@ struct BridgeCtx {
   // Universally-quantified names (a poly field's `'a.` binders): matching
   // vars emit as Tunivar, not Tvar.
   std::unordered_set<std::string> univars;
+  // Bridging a WRITTEN declaration coretype (bridge_ty_named/bridge_label_ty):
+  // open/upper rows are as-written, never weak '_weak rows, so they are
+  // emittable even at non-generic level (`val bar : [< `A | `B ] t -> unit`).
+  bool written = false;
 };
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
@@ -8817,6 +8840,7 @@ static cmi::cmiw::TyPtr bridge_ty_named(const TypePtr& t0,
                                         std::unordered_map<const I::Type*, int>& vars, int& nextvar,
                                         const std::unordered_map<std::string, TypePtr>& tvars) {
   BridgeCtx ctx;
+  ctx.written = true;
   for (auto& [n, tp] : tvars)
     if (tp) ctx.var_names[I::Engine::repr(tp).get()] = n;
   return bridge_ty_rec(t0, vars, nextvar, ctx);
@@ -8832,6 +8856,7 @@ static cmi::cmiw::TyPtr bridge_label_ty(Checker& ck, const ast::CoreType& ct,
     return bridge_ty_named(ck.from_coretype(ct, tvars), vars, nextvar, tvars);
   TypePtr body = ck.from_coretype(ct, tvars);  // strips the poly, binds names
   BridgeCtx ctx;
+  ctx.written = true;
   for (auto& [n, tp] : tvars)
     if (tp) ctx.var_names[I::Engine::repr(tp).get()] = n;
   for (auto& n : pp->vars) ctx.univars.insert(n);
@@ -8929,9 +8954,11 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
       // (non-generalized, '_weak) open/upper rows stay opaque for now.  An
       // EXACT row is emittable regardless of level: declaration coretypes
       // converted during the emission phase are never generalized, and a
-      // weak row is never exact.
+      // weak row is never exact.  A WRITTEN open/upper row (ctx.written --
+      // sig val / decl coretypes) is as-written, never weak: emittable too.
       if (!t->abbrev.empty() || !t->inherited.empty() ||
-          (t->level != I::GENERIC_LEVEL && t->variant_kind != 2))
+          (t->level != I::GENERIC_LEVEL && t->variant_kind != 2 &&
+           !ctx.written))
         return cmi::cmiw::ty_var(nextvar++);
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
       std::vector<cmi::cmiw::TyPtr> targs;
@@ -9189,6 +9216,17 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     si.type_open = std::holds_alternative<Ptype_open>(d.kind);
     si.type_private = (d.priv == PrivateFlag::Private);
     si.type_immediate = immed;
+    // Written variance/injectivity (`type +!'a t`) survives on ABSTRACT
+    // manifest-free decls -- the only place Printtyp prints it back
+    // (concrete/manifest decls carry COMPUTED variance, printed as nothing).
+    if (!manifest && !si.type_open &&
+        d.param_variances.size() == si.params.size()) {
+      bool annotated = false;
+      for (int v : d.param_variances) if (v != 7) annotated = true;
+      if (annotated)
+        si.type_variances.assign(d.param_variances.begin(),
+                                 d.param_variances.end());
+    }
     out.push_back(std::move(si));
   }
   // A `type a .. and b ..` group: Trec_first on the head, Trec_next after
@@ -10616,6 +10654,41 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           // refinements (ocamlc stores the expanded, refined param sig).
           if (std::holds_alternative<Pmty_with>(fn->type->desc))
             annot_modtype_items(ckp, *fn->type, p.ref, p.sig);
+          // `(Baz : module type of struct include Bar end)` where Bar is an
+          // EARLIER param: Bar's sig strengthened through Bar -- every type
+          // gets `= Bar.t` (private dropped: ocamlc's Mtype.strengthen makes
+          // a strengthened decl public).  pr6985.
+          if (auto* ptf = std::get_if<Pmty_typeof>(&fn->type->desc))
+            if (auto* tms = std::get_if<Pmod_structure>(&ptf->me->desc))
+              for (auto& sit : tms->items)
+                if (auto* pin = std::get_if<Pstr_include>(&sit.desc))
+                  if (auto* imi = std::get_if<Pmod_ident>(&pin->expr.desc))
+                    if (auto* il = std::get_if<Lident>(&imi->id.txt.v))
+                      for (auto& prev : ps)
+                        if (prev.name == il->name && prev.mt_ast) {
+                          std::vector<cmi::cmiw::SigItem> inc = prev.sig;
+                          if (inc.empty())
+                            if (auto* pbs = std::get_if<Pmty_signature>(
+                                    &prev.mt_ast->desc))
+                              inc = signature_to_cmi(pbs->items);
+                          for (auto& si : inc) {
+                            if (si.k == cmi::cmiw::SigItem::Type &&
+                                si.ctors.empty() && si.labels.empty() &&
+                                !si.type_open && !si.type_empty_variant) {
+                              std::vector<cmi::cmiw::TyPtr> as(
+                                  si.params.begin(), si.params.end());
+                              si.manifest = cmi::cmiw::ty_constr(
+                                  prev.name + "." + si.name, std::move(as));
+                              si.type_private = false;
+                            } else if (si.k == cmi::cmiw::SigItem::Module &&
+                                       !si.is_functor && si.alias.empty()) {
+                              strengthen_abstract(si.sub,
+                                                  prev.name + "." + si.name);
+                            }
+                          }
+                          for (auto& si : inc) p.sig.push_back(std::move(si));
+                          break;
+                        }
         }
       }
       ps.push_back(std::move(p));

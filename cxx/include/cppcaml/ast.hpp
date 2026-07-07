@@ -302,7 +302,11 @@ using TypeKind = std::variant<Ptype_abstract, Ptype_variant, Ptype_record, Ptype
 struct TypeConstraint { CoreTypeBox t1; CoreTypeBox t2; Location loc; };  // constraint t1 = t2
 struct TypeDeclaration {
   StringLoc name;
-  std::vector<CoreTypeBox> params;  // type_parameter (variance dropped)
+  std::vector<CoreTypeBox> params;  // type_parameter
+  // Written variance/injectivity per param as raw Variance.t ints (`+'a`=1,
+  // `-'a`=6, unannotated=7; `!` sets bit 8: `!'a`=15, `+!'a`=9).  Parallel
+  // to params; may be empty when the parse path carries no variance slot.
+  std::vector<int> param_variances;
   TypeKind kind;
   PrivateFlag priv = PrivateFlag::Public;
   std::optional<CoreTypeBox> manifest;

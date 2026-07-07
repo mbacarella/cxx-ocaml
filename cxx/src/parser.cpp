@@ -2498,25 +2498,45 @@ class Parser {
       return t.text == "!+" || t.text == "!-" || t.text == "!+-" || t.text == "!-+";
     return false;
   }
-  CoreTypeBox parse_type_param() {
-    if (cur().kind == Kind::PLUS || cur().kind == Kind::MINUS) advance();  // variance (dropped)
-    if (cur().kind == Kind::BANG) advance();  // injectivity `!` (dropped)
-    if (is_variance_tok(cur()) && cur().kind != Kind::UNDERSCORE) advance();  // +! / -!
+  CoreTypeBox parse_type_param(int* variance = nullptr) {
+    // Written variance/injectivity, folded into a raw Variance.t int
+    // (unannotated=7; `+` -> 1, `-` -> 6; `!` sets bit 8).
+    int v = 7;
+    while (is_variance_tok(cur()) && cur().kind != Kind::UNDERSCORE) {
+      // single-char operator tokens carry no text -- switch on the kind
+      if (cur().kind == Kind::PLUS) v = (v & 8) | 1;
+      else if (cur().kind == Kind::MINUS) v = (v & 8) | 6;
+      else if (cur().kind == Kind::BANG) v |= 8;
+      else for (char c : cur().text) {
+        if (c == '+') v = (v & 8) | 1;
+        else if (c == '-') v = (v & 8) | 6;
+        else if (c == '!') v |= 8;
+      }
+      advance();
+    }
+    if (variance) *variance = v;
     if (cur().kind == Kind::UNDERSCORE) {
       Token u = cur(); advance();
       return box(CoreType{Ptyp_any{}, tokloc(u)});
     }
     return parse_type_atom();  // 'a
   }
-  std::vector<CoreTypeBox> parse_type_params() {
+  std::vector<CoreTypeBox> parse_type_params(std::vector<int>* variances = nullptr) {
     std::vector<CoreTypeBox> params;
+    int v = 7;
     Kind k = cur().kind;
     if (k == Kind::QUOTE || k == Kind::UNDERSCORE || is_variance_tok(cur())) {
-      params.push_back(parse_type_param());
+      params.push_back(parse_type_param(&v));
+      if (variances) variances->push_back(v);
     } else if (k == Kind::LPAREN) {
       advance();
-      params.push_back(parse_type_param());
-      while (cur().kind == Kind::COMMA) { advance(); params.push_back(parse_type_param()); }
+      params.push_back(parse_type_param(&v));
+      if (variances) variances->push_back(v);
+      while (cur().kind == Kind::COMMA) {
+        advance();
+        params.push_back(parse_type_param(&v));
+        if (variances) variances->push_back(v);
+      }
       expect(Kind::RPAREN, ")");
     }
     return params;
@@ -2589,7 +2609,8 @@ class Parser {
     return Ptype_variant{std::move(ctors)};
   }
   TypeDeclaration parse_type_declaration(Position declStart) {
-    std::vector<CoreTypeBox> params = parse_type_params();
+    std::vector<int> pvariances;
+    std::vector<CoreTypeBox> params = parse_type_params(&pvariances);
     Token nm = cur();
     if (nm.kind != Kind::LIDENT) throw ParseError("expected type name", nm.start);
     advance();
@@ -2644,6 +2665,7 @@ class Parser {
     while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
     Location l = span(declStart, position(tokens_[idx_ - 1].end));
     return TypeDeclaration{StringLoc{nm.text, tokloc(nm)}, std::move(params),
+                           std::move(pvariances),
                            std::move(kind), priv, std::move(manifest), l, std::move(attrs),
                            std::move(constraints)};
   }
@@ -3541,7 +3563,8 @@ class Parser {
       std::string lastnm = lid_last_name(lid.txt);
       Location nameloc = lid.loc;  // `with type M.t` -> name "t", loc spans the full path
       Location dl = span(kw, position(tokens_[idx_ - 1].end));
-      auto td = box(TypeDeclaration{StringLoc{lastnm, nameloc}, std::move(params), TypeKind{Ptype_abstract{}},
+      auto td = box(TypeDeclaration{StringLoc{lastnm, nameloc}, std::move(params), {},
+                                    TypeKind{Ptype_abstract{}},
                                     priv, std::move(manifest), dl, {}, std::move(constraints)});
       if (subst) return Pwith_typesubst{std::move(lid), std::move(td)};
       return Pwith_type{std::move(lid), std::move(td)};
