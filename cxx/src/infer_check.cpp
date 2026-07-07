@@ -520,6 +520,11 @@ struct Checker {
   // Class CONSTRUCTOR schemes (`new c` for a class with params): the arrow
   // over the constructor's value params to the class's object type (mixin2).
   std::unordered_map<std::string, TypePtr> class_ctor_types_;
+  // The same types keyed by DECLARATION NODE: the flat name maps above are
+  // clobbered by a shadowing declaration (`class c ..; open struct class c ..
+  // end` -- generalized-open/shadowing), but the cmi emission wants the type
+  // of the exact declaration it's walking.
+  std::unordered_map<const ast::ClassDeclaration*, TypePtr> class_node_types_;
   // Each class's instance-variable types (name -> type), so `inherit P` brings
   // P's vals into the subclass body (woodyatt: charlie inherits bravo's `y`).
   std::unordered_map<std::string, std::vector<std::pair<std::string, TypePtr>>>
@@ -7723,6 +7728,7 @@ struct Checker {
             }
             if (paramless) class_types_[d.name.txt] = ph;
             else class_ctor_types_[d.name.txt] = ph;
+            class_node_types_[&d] = ph;
             pend.push_back({&d, std::move(params), std::move(lets), ps, ph, paramless});
           }
           for (auto& pe : pend) {
@@ -12194,7 +12200,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         // (a `['a] c` with no value params still has a ctor scheme carrying its
         // tvars), so consult both.
         TypePtr ct;
-        if (auto f = ck.class_types_.find(d.name.txt); f != ck.class_types_.end()) ct = f->second;
+        // The node-keyed entry is exact (a later shadowing `class c` inside an
+        // `open struct` clobbers the flat name maps); fall back to the names.
+        if (auto f = ck.class_node_types_.find(&d); f != ck.class_node_types_.end()) ct = f->second;
+        else if (auto f = ck.class_types_.find(d.name.txt); f != ck.class_types_.end()) ct = f->second;
         else if (auto f = ck.class_ctor_types_.find(d.name.txt); f != ck.class_ctor_types_.end())
           ct = f->second;
         TypePtr obj = ct ? I::Engine::repr(ct) : nullptr;
