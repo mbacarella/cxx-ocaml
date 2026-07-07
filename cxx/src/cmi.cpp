@@ -855,6 +855,9 @@ std::vector<std::string> g_module_dirs;
 // A source module head ("Buffer", "List", a local "A") -> its compilation-unit
 // global ("Stdlib__Buffer", "A").  Mirrors lambda's global_of.
 std::string global_of(const std::string& mod) {
+  // "Stdlib/2" is the checker's out-of-scope marker (the REAL Stdlib when the
+  // file binds its own `module Stdlib`); the cmi stores the plain unit global.
+  if (mod == "Stdlib/2") return "Stdlib";
   if (mod == "Stdlib" || mod.rfind("Stdlib__", 0) == 0) return mod;
   if (mod.rfind("Camlinternal", 0) == 0) return mod;
   if (std::filesystem::exists(g_stdlib_dir + "/stdlib__" + mod + ".cmi"))
