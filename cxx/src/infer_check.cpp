@@ -10972,6 +10972,12 @@ static const std::unordered_map<std::string, std::string>*
 static const std::unordered_map<std::string,
                                 std::unordered_map<std::string, TypePtr>>*
     g_outer_modenv = nullptr;
+// The emitting file's top-level VALUE scopes (Checker::venv), seeded the same
+// way: a functor body calling an enclosing let (`print (module P) x` inside
+// PList, typing-modular-explicits/compiling) types with the real scheme
+// instead of degrading everything it touches to fresh vars.
+static const std::vector<std::unordered_map<std::string, TypePtr>>*
+    g_outer_venv = nullptr;
 // The ENCLOSING module's already-emitted items, visible to functor-BODY
 // inference so `module Y = G(X)` inside a functor body resolves the sibling
 // functor G declared in the outer scope (set around the body's
@@ -12041,6 +12047,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // functor params seeded below must win over an outer module of the same name.
   if (g_outer_modenv)
     for (auto& [n, ex] : *g_outer_modenv) ck.modenv.emplace(n, ex);
+  if (g_outer_venv && !g_outer_venv->empty() && !ck.venv.empty())
+    for (auto& [n, v] : g_outer_venv->front()) ck.venv.front().emplace(n, v);
   if (fparams) {
     if (g_outer_modtype_asts) ck.modtype_sig_asts_ = *g_outer_modtype_asts;
     if (g_outer_modtype_quals) ck.opened_modtype_quals_ = *g_outer_modtype_quals;
@@ -12060,9 +12068,11 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   auto* saved_mt_quals = g_outer_modtype_quals;
   auto* saved_enclosing = g_enclosing_struct_items;
   auto* saved_modenv = g_outer_modenv;
+  auto* saved_venv = g_outer_venv;
   g_outer_modtype_asts = &ck.modtype_sig_asts_;
   g_outer_modtype_quals = &ck.opened_modtype_quals_;
   g_outer_modenv = &ck.modenv;
+  g_outer_venv = &ck.venv;
   // Emission phase: checking is DONE, every from_coretype below only converts
   // declaration types for the .cmi -- keep local abbreviations as written
   // (`startDate : (int, message) fieldStatus` stores `message`, not string).
@@ -12844,6 +12854,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   g_enclosing_struct_items = saved_enclosing;
   g_inherited_opens = saved_inherited_opens;
   g_outer_modenv = saved_modenv;
+  g_outer_venv = saved_venv;
   return out;
 }
 
