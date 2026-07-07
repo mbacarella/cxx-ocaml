@@ -9445,6 +9445,12 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
 // records the CONSTRAINED decl: `S with type in_t = T0.t` stores in_t's
 // manifest).  `with type t := ..` (destructive) erases the decl instead --
 // types take no runtime field, so erasure can't shift the value layout.
+// The ENCLOSING structure's already-emitted items (set by infer_signature
+// around its emission loop; restored on return).  Lets a SIGNATURE body
+// resolve `module type of Foo` where Foo is a local struct module (t02's
+// `module type Gee = sig module M : module type of Foo .. end`).
+static const std::vector<cmi::cmiw::SigItem>* g_enclosing_struct_items = nullptr;
+
 static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
                                    std::vector<cmi::cmiw::SigItem>& items) {
   const ast::ModuleType* m = &mt;
@@ -9783,7 +9789,27 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           // end`): emit an opaque submodule so it still TAKES A FIELD -- else the
           // surrounding value layout is short of the .cmo and every following
           // member (Persistent_env.empty) resolves to the wrong slot.
-          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, {}));
+          auto mitem = cmi::cmiw::sig_module(*pm->md.name.txt, {});
+          // `module M : module type of Foo` where Foo is a local struct
+          // module: its already-emitted items are the signature (t02's Gee).
+          if (auto* pto = std::get_if<Pmty_typeof>(&pm->md.type->desc)) {
+            if (auto* pi2 = std::get_if<Pmod_ident>(&pto->me->desc))
+              if (auto* l2 = std::get_if<Lident>(&pi2->id.txt.v)) {
+                if (g_enclosing_struct_items)
+                  for (auto& si : *g_enclosing_struct_items)
+                    if (si.k == cmi::cmiw::SigItem::Module &&
+                        si.name == l2->name && !si.is_functor &&
+                        si.alias.empty()) {
+                      mitem.sub = si.sub;
+                      break;
+                    }
+              }
+          }
+          // `module X : T` where T is a local ABSTRACT modtype (no items to
+          // resolve): the Mty_ident reference is still kept (pr6651).
+          if (auto* pid = std::get_if<Pmty_ident>(&pm->md.type->desc))
+            mitem.modtype_ref = lid_full(pid->id.txt);
+          out.push_back(std::move(mitem));
         }
       }
     } else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
@@ -9920,10 +9946,23 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       // included members are absent and the field layout is short of the .cmo.
       if (auto* pto = std::get_if<Pmty_typeof>(&pinc->mt.desc)) {
         if (auto* pi = std::get_if<Pmod_ident>(&pto->me->desc))
-          if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) try {
-            auto cmi = cmi::CmiFile::load(head_cmi(l->name));
-            for (auto& si : cmi_sig_to_items(cmi.sig(), l->name)) out.push_back(std::move(si));
-          } catch (...) {}
+          if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
+            // A LOCAL struct module shadows a compilation unit of the same
+            // name: splice its already-emitted items (t02's Gee).
+            bool local = false;
+            if (g_enclosing_struct_items)
+              for (auto& si : *g_enclosing_struct_items)
+                if (si.k == cmi::cmiw::SigItem::Module && si.name == l->name &&
+                    !si.is_functor && si.alias.empty()) {
+                  for (auto& s2 : si.sub) out.push_back(s2);
+                  local = true;
+                  break;
+                }
+            if (!local) try {
+              auto cmi = cmi::CmiFile::load(head_cmi(l->name));
+              for (auto& si : cmi_sig_to_items(cmi.sig(), l->name)) out.push_back(std::move(si));
+            } catch (...) {}
+          }
       } else if (const ast::Signature* bs = body_sig(pinc->mt)) {
         // `include S` (named local modtype) / `include sig .. end`
         auto items = signature_to_cmi(*bs, &modtypes, &module_sigs);
@@ -10109,6 +10148,11 @@ static const std::unordered_map<std::string, const ast::Signature*>*
     g_outer_modtype_asts = nullptr;
 static const std::unordered_map<std::string, std::string>*
     g_outer_modtype_quals = nullptr;
+// The ENCLOSING module's already-emitted items, visible to functor-BODY
+// inference so `module Y = G(X)` inside a functor body resolves the sibling
+// functor G declared in the outer scope (set around the body's
+// infer_signature call; restored so recursion nests correctly).
+static const std::vector<cmi::cmiw::SigItem>* g_outer_prior = nullptr;
 
 // Strengthen a functor-application result whose arguments are all PATHS: every
 // abstract type gets the applied-functor manifest ocamlc records
@@ -10391,30 +10435,70 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       std::vector<std::pair<std::string, const ast::ModuleType*>> fps;
       for (auto& p : ps)
         if (!p.name.empty() && p.mt_ast) fps.emplace_back(p.name, p.mt_ast);
+      auto* saved_prior = g_outer_prior;
+      g_outer_prior = prior;
       result = infer_signature(bs->items, fps.empty() ? nullptr : &fps);
+      g_outer_prior = saved_prior;
     }
     else if (auto* bi = std::get_if<Pmod_ident>(&cur->desc)) {
       // `module Id (S : S) = S` (an identity functor): ocamlc's result is the
       // PARAMETER's signature strengthened through the param path
-      // (`sig type 'a t = 'a S.t end`), not an empty sig.
-      if (auto* l = std::get_if<Lident>(&bi->id.txt.v))
-        for (auto& p : ps)
-          if (!p.name.empty() && p.name == l->name) {
-            if (!p.sig.empty())
-              result = p.sig;
-            else if (!p.ref.empty()) {
-              if (p.ref.find('.') == std::string::npos) {
-                if (ckp)
-                  if (auto a = ckp->modtype_sig_asts_.find(p.ref);
-                      a != ckp->modtype_sig_asts_.end())
-                    result = signature_to_cmi(*a->second);
-              } else {
-                result = cmi_modtype_items(split_dotted(p.ref));
-              }
+      // (`sig type 'a t = 'a S.t end`), not an empty sig.  A DOTTED body
+      // `module F (X : S) = X.X` projects the param's submodule: a named
+      // submodule modtype keeps its ref qualified through the param
+      // (`(X : S) -> X.T`, pr6651); inline items strengthen through `X.X`.
+      std::string hd;
+      std::vector<std::string> rest;
+      if (auto* l = std::get_if<Lident>(&bi->id.txt.v)) hd = l->name;
+      else if (!std::holds_alternative<Lapply>(bi->id.txt.v)) {
+        rest = split_dotted(lid_full(bi->id.txt));
+        hd = rest.front();
+        rest.erase(rest.begin());
+      }
+      for (auto& p : ps)
+        if (!hd.empty() && p.name == hd) {
+          std::vector<cmi::cmiw::SigItem> psig;
+          if (!p.sig.empty())
+            psig = p.sig;
+          else if (!p.ref.empty()) {
+            if (p.ref.find('.') == std::string::npos) {
+              if (ckp)
+                if (auto a = ckp->modtype_sig_asts_.find(p.ref);
+                    a != ckp->modtype_sig_asts_.end())
+                  psig = signature_to_cmi(*a->second);
+            } else {
+              psig = cmi_modtype_items(split_dotted(p.ref));
             }
-            strengthen_abstract(result, p.name);
-            break;
           }
+          if (rest.empty()) {
+            result = std::move(psig);
+            strengthen_abstract(result, p.name);
+          } else {
+            // descend the param's sig through the dotted components
+            std::string path = p.name;
+            const std::vector<cmi::cmiw::SigItem>* cur_items = &psig;
+            const cmi::cmiw::SigItem* found = nullptr;
+            for (std::size_t i = 0; i < rest.size() && cur_items; ++i) {
+              found = nullptr;
+              for (auto& si : *cur_items)
+                if (si.k == cmi::cmiw::SigItem::Module && si.name == rest[i]) {
+                  found = &si; break;
+                }
+              if (!found) break;
+              path += "." + rest[i];
+              cur_items = &found->sub;
+            }
+            if (found) {
+              if (!found->modtype_ref.empty() &&
+                  found->modtype_ref.find('.') == std::string::npos)
+                // a BARE ref names a sibling inside the param's sig: X.T
+                result_ref = p.name + "." + found->modtype_ref;
+              result = found->sub;
+              strengthen_abstract(result, path);
+            }
+          }
+          break;
+        }
     }
     else if (auto* bc = std::get_if<Pmod_constraint>(&cur->desc)) {
       if (bc->mt) {
@@ -10483,22 +10567,26 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     std::vector<cmi::cmiw::SigItem> result;
     std::string result_ref;  // a local functor's Mty_ident result (`: Priv`)
     bool resolved = false;
-    if (comps.size() == 1 && prior) {  // a local functor emitted earlier
+    if (comps.size() == 1) {  // a local functor emitted earlier
       // An EMPTY result sig is legitimate (`module F (A : ..) = struct let _ =
       // .. end; module B = F(X)` -- ocamlc emits `module B : sig end`);
       // requiring items here dropped B entirely (a layout shift, B takes a
-      // runtime field).
-      for (auto& si : *prior)
-        if (si.k == cmi::cmiw::SigItem::Module && si.is_functor &&
-            si.name == comps[0] &&
-            args.size() == 1 + si.more_param_names.size()) {
-          pnames.push_back(si.functor_param);
-          for (auto& n : si.more_param_names) pnames.push_back(n);
-          result = si.sub;  // fresh item; subst clones every node it touches
-          result_ref = si.functor_result_ref;
-          resolved = true;
-          break;
-        }
+      // runtime field).  Inside a functor body, a sibling functor from the
+      // ENCLOSING scope (g_outer_prior) resolves too.
+      for (auto* scope : {prior, g_outer_prior}) {
+        if (!scope || resolved) continue;
+        for (auto& si : *scope)
+          if (si.k == cmi::cmiw::SigItem::Module && si.is_functor &&
+              si.name == comps[0] &&
+              args.size() == 1 + si.more_param_names.size()) {
+            pnames.push_back(si.functor_param);
+            for (auto& n : si.more_param_names) pnames.push_back(n);
+            result = si.sub;  // fresh item; subst clones every node it touches
+            result_ref = si.functor_result_ref;
+            resolved = true;
+            break;
+          }
+      }
     }
     // An opened module's submodule head (`open MoreLabels` then `Map.Make`):
     // requalify so the LABELLED Map/Set/Hashtbl is the one loaded.
@@ -10733,6 +10821,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // through submodule structures).
   auto* saved_mt_asts = g_outer_modtype_asts;
   auto* saved_mt_quals = g_outer_modtype_quals;
+  auto* saved_enclosing = g_enclosing_struct_items;
   g_outer_modtype_asts = &ck.modtype_sig_asts_;
   g_outer_modtype_quals = &ck.opened_modtype_quals_;
   // Emission phase: checking is DONE, every from_coretype below only converts
@@ -10740,6 +10829,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // (`startDate : (int, message) fieldStatus` stores `message`, not string).
   ck.keep_local_abbrevs_ = true;
   std::vector<cmi::cmiw::SigItem> out;
+  g_enclosing_struct_items = &out;  // sig-side `module type of <local module>`
   for (auto& it : s) {
     if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
       for (auto& b : sv->bindings) {
@@ -10792,7 +10882,50 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     } else if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {
       // `module type S = sig .. end` in a .ml (no .mli): emit Sig_modtype so the
       // inferred .cmi carries it (a modtype takes no runtime field, so it never
-      // shifts the value layout).  Only the signature body is representable yet.
+      // shifts the value layout).
+      // Resolve a modtype BODY to items: a literal signature; a bare ident
+      // through an earlier Modtype item (covers `= module type of ..` bodies
+      // annot_modtype_items can't see) or the checker's signature ASTs; a
+      // `module type of M` through M's already-emitted item or a literal
+      // struct; `S with ..` resolves the base then grafts.
+      std::function<std::optional<std::vector<cmi::cmiw::SigItem>>(
+          const ast::ModuleType&)> mt_items =
+          [&](const ast::ModuleType& mt)
+              -> std::optional<std::vector<cmi::cmiw::SigItem>> {
+        if (auto* ps = std::get_if<Pmty_signature>(&mt.desc))
+          return signature_to_cmi(ps->items);
+        if (auto* pid = std::get_if<Pmty_ident>(&mt.desc)) {
+          if (auto* l = std::get_if<Lident>(&pid->id.txt.v)) {
+            for (auto& si : out)
+              if (si.k == cmi::cmiw::SigItem::Modtype && si.name == l->name &&
+                  !si.modtype_abstract)
+                return si.sub;
+            if (auto a = ck.modtype_sig_asts_.find(l->name);
+                a != ck.modtype_sig_asts_.end())
+              return signature_to_cmi(*a->second);
+          }
+          return std::nullopt;
+        }
+        if (auto* pt = std::get_if<Pmty_typeof>(&mt.desc)) {
+          if (auto* ms = std::get_if<Pmod_structure>(&pt->me->desc))
+            return infer_signature(ms->items);
+          if (auto* mi = std::get_if<Pmod_ident>(&pt->me->desc))
+            if (auto* l = std::get_if<Lident>(&mi->id.txt.v))
+              for (auto& si : out)
+                if (si.k == cmi::cmiw::SigItem::Module && si.name == l->name &&
+                    !si.is_functor && si.alias.empty())
+                  return si.sub;
+          return std::nullopt;
+        }
+        if (auto* pw = std::get_if<Pmty_with>(&mt.desc)) {
+          auto base = mt_items(*pw->mt);
+          if (!base) return std::nullopt;
+          apply_with_constraints(ck, mt, *base);
+          drop_modsubst(*base, with_modsubst_names(mt));
+          return base;
+        }
+        return std::nullopt;
+      };
       if (!pmt->type)  // ABSTRACT `module type S` in a struct (pr7112)
         out.push_back(cmi::cmiw::sig_modtype_abstract(pmt->name.txt));
       else if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
@@ -10804,10 +10937,18 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           std::string ref;
           std::vector<cmi::cmiw::SigItem> sub;
           annot_modtype_items(&ck, *pmt->type, ref, sub);
+          if (sub.empty())
+            if (auto r = mt_items(*pmt->type)) sub = std::move(*r);
           auto s = cmi::cmiw::sig_modtype(pmt->name.txt, std::move(sub));
           s.modtype_ref = std::move(ref);
           out.push_back(std::move(s));
         }
+      } else if (std::holds_alternative<Pmty_typeof>(pmt->type->desc) ||
+                 std::holds_alternative<Pmty_with>(pmt->type->desc)) {
+        // `module type TFoo = module type of Foo` / `= TFoo with type u := ..`
+        // (t02): resolved to the expanded signature (ocamlc stores it too).
+        if (auto r = mt_items(*pmt->type))
+          out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, std::move(*r)));
       }
     } else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
       // `class c [params] = object .. end`: emit Sig_class (the writer adds
@@ -11051,6 +11192,19 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
                 inc = &ms2->items;
               break;
             }
+        // `include X` of a FUNCTOR PARAMETER: splice the param's signature
+        // items, strengthened through the param path (ocamlc records
+        // `type t = X.t` and X's vals as this module's own fields).
+        if (!inc && fparams && std::holds_alternative<Lident>(mi->id.txt.v))
+          for (auto& fp : *fparams)
+            if (fp.first == nm && fp.second) {
+              std::string ref;
+              std::vector<cmi::cmiw::SigItem> sub;
+              annot_modtype_items(&ck, *fp.second, ref, sub);
+              strengthen_abstract(sub, nm);
+              for (auto& si : sub) out.push_back(std::move(si));
+              break;
+            }
       }
       if (inc)
         for (auto& si : infer_signature(*inc)) out.push_back(si);
@@ -11079,6 +11233,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   out = cmi::cmiw::dedup_shadowed_fields(std::move(out));
   g_outer_modtype_asts = saved_mt_asts;
   g_outer_modtype_quals = saved_mt_quals;
+  g_enclosing_struct_items = saved_enclosing;
   return out;
 }
 

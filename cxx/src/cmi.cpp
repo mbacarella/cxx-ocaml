@@ -1244,10 +1244,28 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   for (auto& [n, s] : local_mods) visible_mod[n] = s;
   // The Path.t for a named modtype reference: a dotted name goes through the
   // head unit's global (importing it), a bare one through the visible map's
-  // Local stamp.  Null when the name can't be placed (caller falls back to
-  // the inlined signature).
-  auto modtype_path = [&](const std::string& ref) -> o::ValPtr {
+  // Local stamp.  A dotted head that is a VISIBLE LOCAL MODULE -- a functor's
+  // own parameter (`(X : S) -> X.T`, extra_mods) or a sibling module --
+  // resolves by stamp instead (Pdot(Pident(Local X), "T")).  Null when the
+  // name can't be placed (caller falls back to the inlined signature).
+  auto modtype_path = [&](const std::string& ref,
+                          const std::unordered_map<std::string, int>*
+                              extra_mods = nullptr) -> o::ValPtr {
     if (auto dot = ref.find('.'); dot != std::string::npos) {
+      std::string h = ref.substr(0, dot);
+      for (auto* m : {extra_mods, (const std::unordered_map<std::string, int>*)&visible_mod})
+        if (m)
+          if (auto f = m->find(h); f != m->end()) {
+            o::ValPtr path = o::vblock(0,
+                {o::vblock(0, {o::vstr(h), o::vint(f->second)})});  // Pident(Local)
+            for (std::size_t pos = dot; pos != std::string::npos;) {
+              std::size_t nd = ref.find('.', pos + 1);
+              path = o::vblock(1, {path, o::vstr(ref.substr(pos + 1,
+                  nd == std::string::npos ? std::string::npos : nd - pos - 1))});  // Pdot
+              pos = nd;
+            }
+            return path;
+          }
       std::string head = global_of(ref.substr(0, dot));
       referenced.emplace(head, true);
       o::ValPtr path;
@@ -1347,7 +1365,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           // ocamlc; the inlined signature is the fallback.
           o::ValPtr psig;
           if (!ref.empty())
-            if (o::ValPtr mp = modtype_path(ref)) psig = o::vblock(0, {mp});  // Mty_ident
+            if (o::ValPtr mp = modtype_path(ref, &visible_mod_body)) psig = o::vblock(0, {mp});  // Mty_ident
           if (!psig)
             psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body))});  // Mty_signature
           return o::vblock(0, {name_opt, psig});  // Named(name_opt, <param sig>)
@@ -1366,7 +1384,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // the resolved items are the fallback.
         o::ValPtr body;
         if (!it.functor_result_ref.empty())
-          if (o::ValPtr rp = modtype_path(it.functor_result_ref))
+          if (o::ValPtr rp = modtype_path(it.functor_result_ref, &visible_mod_body))
             body = o::vblock(0, {rp});  // Mty_ident
         if (!body)
           body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body))});  // Mty_signature(result)
