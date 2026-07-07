@@ -9827,6 +9827,24 @@ static void subst_param_items(std::vector<cmi::cmiw::SigItem>& items,
   }
 }
 
+// Strengthen a functor-application result whose arguments are all PATHS: every
+// abstract type gets the applied-functor manifest ocamlc records
+// (`module S = Set.Make(Loc)` gives `type t = Set.Make(Loc).t`), recursively
+// through plain submodules.  `app` is the applied path ("Set.Make(Loc)").
+static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
+                                const std::string& app) {
+  for (auto& si : items) {
+    if (si.k == cmi::cmiw::SigItem::Type && !si.manifest && si.ctors.empty() &&
+        si.labels.empty() && !si.type_open && !si.type_empty_variant) {
+      std::vector<cmi::cmiw::TyPtr> as(si.params.begin(), si.params.end());
+      si.manifest = cmi::cmiw::ty_constr(app + "." + si.name, std::move(as));
+    } else if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
+               si.alias.empty()) {
+      strengthen_abstract(si.sub, app + "." + si.name);
+    }
+  }
+}
+
 // The Sig_module item for one module binding, by shape: a structure body is
 // inferred recursively; `module M : sig .. end = ..` takes the CONSTRAINT
 // signature verbatim (it is authoritative, like a .mli); a functor emits
@@ -10016,6 +10034,27 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         subs.push_back(std::move(s));
     }
     if (!subs.empty()) subst_param_items(result, subs);
+    // All-path arguments (no anonymous struct, no generative `()`): ocamlc
+    // strengthens the result's abstract types with the applied-path manifest.
+    bool all_paths = !args.empty();
+    std::vector<std::string> argpaths;
+    for (auto* a : args) {
+      const ast::ModuleExpr* am = a;
+      while (am) {
+        if (auto* amc = std::get_if<Pmod_constraint>(&am->desc)) am = amc->me.get();
+        else break;
+      }
+      auto* api = am ? std::get_if<Pmod_ident>(&am->desc) : nullptr;
+      if (api && !std::holds_alternative<Lapply>(api->id.txt.v))
+        argpaths.push_back(lid_full(api->id.txt));
+      else { all_paths = false; break; }
+    }
+    if (all_paths) {
+      std::string app;
+      for (auto& cp : comps) { if (!app.empty()) app += '.'; app += cp; }
+      for (auto& ap : argpaths) app += "(" + ap + ")";
+      strengthen_abstract(result, app);
+    }
     return cmi::cmiw::sig_module(name, std::move(result));
   }
   return std::nullopt;
