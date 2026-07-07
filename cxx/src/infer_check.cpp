@@ -10833,6 +10833,16 @@ static const std::unordered_map<std::string, const ast::Signature*>*
     g_outer_modtype_asts = nullptr;
 static const std::unordered_map<std::string, std::string>*
     g_outer_modtype_quals = nullptr;
+// The emitting file's module value exports (Checker::modenv, flat by simple
+// name), seeded into a submodule's re-inference so references to ENCLOSING
+// local modules don't degrade to fresh vars -- `module Test = struct open
+// ExtUnix.All; let module B = BigEndian in B.get_uint8 x 0 end` types int
+// only if the sub-checker can resolve the outer file's modules (pr6726).
+// The main pass types submodules in the SAME checker, so it never loses
+// them; only the emission re-inference (a fresh Checker) did.
+static const std::unordered_map<std::string,
+                                std::unordered_map<std::string, TypePtr>>*
+    g_outer_modenv = nullptr;
 // The ENCLOSING module's already-emitted items, visible to functor-BODY
 // inference so `module Y = G(X)` inside a functor body resolves the sibling
 // functor G declared in the outer scope (set around the body's
@@ -11895,6 +11905,13 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // harvest), so body exports don't degrade to fresh vars.  The outer file's
   // `module type` ASTs come along (g_outer_modtype_asts) so a `(H : S)` with a
   // LOCAL S resolves -- the body structure itself doesn't contain S.
+  // Enclosing-scope module exports: seed them so a submodule body's reference
+  // to an outer local module (opened, aliased with `let module`, or dotted)
+  // resolves instead of degrading to a fresh var.  emplace, not assignment:
+  // run_checker's own (re-)bindings overwrite local names later anyway, and
+  // functor params seeded below must win over an outer module of the same name.
+  if (g_outer_modenv)
+    for (auto& [n, ex] : *g_outer_modenv) ck.modenv.emplace(n, ex);
   if (fparams) {
     if (g_outer_modtype_asts) ck.modtype_sig_asts_ = *g_outer_modtype_asts;
     if (g_outer_modtype_quals) ck.opened_modtype_quals_ = *g_outer_modtype_quals;
@@ -11913,8 +11930,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   auto* saved_mt_asts = g_outer_modtype_asts;
   auto* saved_mt_quals = g_outer_modtype_quals;
   auto* saved_enclosing = g_enclosing_struct_items;
+  auto* saved_modenv = g_outer_modenv;
   g_outer_modtype_asts = &ck.modtype_sig_asts_;
   g_outer_modtype_quals = &ck.opened_modtype_quals_;
+  g_outer_modenv = &ck.modenv;
   // Emission phase: checking is DONE, every from_coretype below only converts
   // declaration types for the .cmi -- keep local abbreviations as written
   // (`startDate : (int, message) fieldStatus` stores `message`, not string).
@@ -12692,6 +12711,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   g_outer_modtype_quals = saved_mt_quals;
   g_enclosing_struct_items = saved_enclosing;
   g_inherited_opens = saved_inherited_opens;
+  g_outer_modenv = saved_modenv;
   return out;
 }
 
