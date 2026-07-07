@@ -506,6 +506,10 @@ struct Checker {
   }
   std::unordered_map<std::string, TypePtr> functor_param_subst_;     // "Elem.t" -> arg type
   std::unordered_map<std::string, TypePtr> functor_result_abstract_; // RS's bare "t" -> fresh var
+  // PARAMETERIZED functor-param types (`type +'a t` under `(T : S)`): bare
+  // name -> qualified path; uses rebuild `('r) T.t` with the written args
+  // (the nullary map above can't carry args).  Scoped like the map above.
+  std::unordered_map<std::string, std::string> functor_param_type_quals_;
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
@@ -1115,6 +1119,15 @@ struct Checker {
           if (auto s = functor_result_abstract_.find(l->name);
               s != functor_result_abstract_.end())
             return s->second;
+      // A PARAMETERIZED functor-param type used bare in the param's own sig
+      // (`val foo : [ `A ] t -> unit` under `(T : S)`): rebuild with the
+      // written args at the qualified path (`[ `A ] T.t`), so body vals
+      // unifying through it export the access path (pr7199).
+      if (!functor_param_type_quals_.empty())
+        if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+          if (auto s = functor_param_type_quals_.find(l->name);
+              s != functor_param_type_quals_.end())
+            return eng.constr(s->second, std::move(as));
       // A bare reference to a local opaque type carries its identity stamp.
       int stamp = 0;
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
@@ -1650,6 +1663,7 @@ struct Checker {
       const std::string& qual = "") {
     std::unordered_map<std::string, TypePtr> out;
     auto saved = functor_result_abstract_;
+    auto saved_pq = functor_param_type_quals_;
     for (auto& it : items)
       if (auto* t = std::get_if<Psig_type>(&it.desc))
         for (auto& d : t->decls) {
@@ -1663,6 +1677,8 @@ struct Checker {
           else if (!qual.empty() && d.params.empty())
             functor_result_abstract_[d.name.txt] =
                 eng.constr(qual + "." + d.name.txt, {});
+          else if (!qual.empty())
+            functor_param_type_quals_[d.name.txt] = qual + "." + d.name.txt;
         }
     // Sig-local `module Env : S` binds Env for the val types that follow
     // (`val code0 : Env.in_t -> out0`); count it bound so strict's
@@ -1678,6 +1694,7 @@ struct Checker {
         out[v->vd.name.txt] = from_coretype(*v->vd.type, vars);
       }
     functor_result_abstract_ = std::move(saved);
+    functor_param_type_quals_ = std::move(saved_pq);
     return out;
   }
 

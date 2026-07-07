@@ -437,13 +437,23 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     // link both sides to the merge.  Link FIRST so a self-referential arg (a
     // recursive `[> `A of 'a] as 'a`) resolves to the merge node instead of
     // looping the shared-arg unify.
+    // ONE side exact, the other a bound (`[<` / `[>`): the exact side FIXES
+    // the tag set -- don't widen it with the partner's other tags (pr7199's
+    // `[ `A ]` meeting `[< `A | `B ]` stays `[ `A ]`).  Normalize the exact
+    // side into `a` so the union below starts from it; shared-tag arguments
+    // still unify through the loop at the end.
+    if (b->variant_kind == 2 && a->variant_kind != 2) std::swap(a, b);
+    bool fixed_set = a->variant_kind == 2 && b->variant_kind != 2;
     std::vector<std::string> tags = a->labels;
     std::vector<TypePtr> ats = a->args;
     std::vector<char> has = a->tag_has_arg;
     for (size_t j = 0; j < b->labels.size(); ++j) {
       size_t k = 0;
       for (; k < tags.size(); ++k) if (tags[k] == b->labels[j]) break;
-      if (k >= tags.size()) { tags.push_back(b->labels[j]); ats.push_back(b->args[j]); has.push_back(b->tag_has_arg[j]); }
+      if (k >= tags.size()) {
+        if (fixed_set) continue;
+        tags.push_back(b->labels[j]); ats.push_back(b->args[j]); has.push_back(b->tag_has_arg[j]);
+      }
     }
     // The TIGHTER row kind wins the merge (exact 2 > upper `[<` 1 > open `[>` 0):
     // an annotation `[ `A | `B ]` / `[< `A ]` unified with the body's matched/
