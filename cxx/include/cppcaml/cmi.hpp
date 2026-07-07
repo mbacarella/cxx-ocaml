@@ -474,12 +474,14 @@ inline SigItem sig_record(std::string n, std::vector<TyPtr> ps, std::vector<Labe
   return {SigItem::Type, std::move(n), nullptr, std::move(ps), nullptr, {}, std::move(ls)};
 }
 
-// The runtime-field NAMESPACE+name of a field-taking SigItem, or "" if it takes no
-// field (type / modtype / `external` value).  Values, modules and exception ctors
-// are SEPARATE namespaces: a value `x` and a module `x` each take a field.
+// The shadowing NAMESPACE+name of a SigItem, or "" if it doesn't shadow here
+// (type / modtype).  Values, modules and exception ctors are SEPARATE
+// namespaces.  An `external` is in the VALUE namespace like ocamlc (a
+// duplicated `external (@@)` keeps one entry; a val/external pair keeps the
+// later) -- it still takes no runtime field, and lambda's modsig push()
+// erases same-namespace duplicates identically, so field layouts agree.
 inline std::string field_key(const SigItem& s) {
-  if (s.k == SigItem::Value && s.prim.empty() && !s.prim_external)
-    return "v:" + s.name;
+  if (s.k == SigItem::Value) return "v:" + s.name;
   if (s.k == SigItem::Module) return "m:" + s.name;
   if (s.k == SigItem::Exception) return "e:" + s.name;
   return "";

@@ -6095,6 +6095,62 @@ struct Checker {
     TypePtr ft = infer_expr(*a.fn);
     record_apply_plan(a, enode, ft);
     record_revapply_plan(a, enode, ft);
+    // The %apply/%revapply SPECIALIZED TYPING rule (typecore's
+    // check_apply_prim_type): `f @@ x` / `x |> f` types as the DIRECT
+    // application `f x`, so a leading optional parameter of f is defaulted
+    // and erased (`bump @@ x` with bump : ?cap:int -> int -> int gives int,
+    // not int -> int).  Only when the operator's own type has the generic
+    // (a -> b) -> a -> b shape with SHARED vars -- a monomorphic
+    // `external (@@) : f -> x -> int` stays a plain 2-arg application.
+    if (a.args.size() == 2 &&
+        std::holds_alternative<Nolabel>(a.args[0].first) &&
+        std::holds_alternative<Nolabel>(a.args[1].first)) {
+      auto* fid = std::get_if<Pexp_ident>(&a.fn->desc);
+      auto* fl = fid ? std::get_if<Lident>(&fid->id.txt.v) : nullptr;
+      int kind = fl ? (fl->name == "@@" ? 2 : fl->name == "|>" ? 1 : 0) : 0;
+      TypePtr op = kind ? I::Engine::repr(ft) : nullptr;
+      bool generic = false;
+      if (op && op->kind == I::Type::Kind::Arrow && op->arrow_label == 0) {
+        TypePtr c1 = I::Engine::repr(op->cod);
+        if (c1->kind == I::Type::Kind::Arrow && c1->arrow_label == 0) {
+          TypePtr fpos = I::Engine::repr(kind == 2 ? op->dom : c1->dom);
+          TypePtr xpos = I::Engine::repr(kind == 2 ? c1->dom : op->dom);
+          TypePtr res = I::Engine::repr(c1->cod);
+          if (fpos->kind == I::Type::Kind::Arrow && fpos->arrow_label == 0) {
+            TypePtr fa = I::Engine::repr(fpos->dom);
+            TypePtr fr = I::Engine::repr(fpos->cod);
+            generic = fa->kind == I::Type::Kind::Var &&
+                      fr->kind == I::Type::Kind::Var &&
+                      fa.get() == xpos.get() && fr.get() == res.get();
+          }
+        }
+      }
+      if (generic) {
+        const Expression& fexp = kind == 2 ? *a.args[0].second : *a.args[1].second;
+        const Expression& xexp = kind == 2 ? *a.args[1].second : *a.args[0].second;
+        TypePtr fty = I::Engine::repr(infer_expr(fexp));
+        std::vector<TypePtr> fsp;
+        TypePtr fcur = fty;
+        while (fcur->kind == I::Type::Kind::Arrow) {
+          fsp.push_back(fcur);
+          fcur = I::Engine::repr(fcur->cod);
+        }
+        // The positional argument consumes the first NON-OPTIONAL param;
+        // skipped leading optionals are defaulted (erased from the result).
+        std::size_t idx = 0;
+        while (idx < fsp.size() && fsp[idx]->arrow_label == 2) ++idx;
+        if (idx < fsp.size() && fsp[idx]->arrow_label == 0) {
+          TypePtr at = infer_expr_expected(xexp, fsp[idx]->dom);
+          soft_unify(fsp[idx]->dom, at);
+          TypePtr r = fcur;
+          for (std::size_t j = fsp.size(); j-- > idx + 1;)
+            r = eng.arrow(fsp[j]->dom, r, fsp[j]->arrow_label, fsp[j]->arrow_lbl);
+          return r;
+        }
+        // f's spine unknown (a var): the generic operator scheme already
+        // gives the same result as direct application -- fall through.
+      }
+    }
     // Applying a value of a reliable non-function type (`1 2`, `"x" y`) is a
     // definite error -- a builtin like int/string is never an arrow.
     if (strict && !a.args.empty()) {
