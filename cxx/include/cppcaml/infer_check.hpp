@@ -146,7 +146,12 @@ const std::vector<std::string>& infer_module_dirs();
 // (matching the .cmo's exported field order); `type` declarations -> Sig_type
 // (abstract / manifest; they take no runtime field).  A type using an
 // unsupported construct becomes a fresh type variable (opaque but valid).
-std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s);
+// `fparams` (optional): enclosing functor parameters as (name, param modtype)
+// -- bound into the checker so a functor BODY's exports type against them
+// (`module F (H : S) = struct let f x = H.g x end` keeps H.g's real type).
+std::vector<cmi::cmiw::SigItem> infer_signature(
+    const ast::Structure& s,
+    const std::vector<std::pair<std::string, const ast::ModuleType*>>* fparams = nullptr);
 
 // Build the .cmi signature from a hand-written interface (.mli).  Unlike
 // infer_signature this reads types verbatim from the declarations (no

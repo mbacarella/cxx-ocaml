@@ -1346,10 +1346,16 @@ struct Checker {
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
         sig = md ? module_sig(md->type, loaded) : nullptr;
       }
-      if (sig)
+      if (sig) {
         for (auto& mm : sig->modules) opened_submod_quals_[mm.name] = full + "." + mm.name;
+        // Its MODULE TYPES too: `open Globroots` then `(G : GLOBREF)` cites
+        // Globroots.GLOBREF (the cmi writer records the qualified Mty_ident).
+        for (auto& mt : sig->modtypes)
+          opened_modtype_quals_[mt.name] = full + "." + mt.name;
+      }
     } catch (...) {}
   }
+  std::unordered_map<std::string, std::string> opened_modtype_quals_;
   // `open M` where M's cmi declares module ALIASES (StdLabels's `module List =
   // ListLabels`): a bare `List.map` afterwards resolves through the alias
   // target, so the LABELLED map applies (`List.map xs ~f`).  bare name ->
@@ -1536,14 +1542,22 @@ struct Checker {
   // optional param survives).
   std::unordered_map<std::string, TypePtr> sig_items_value_schemes(
       const ast::Signature& items,
-      const std::unordered_map<std::string, TypePtr>& argtypes) {
+      const std::unordered_map<std::string, TypePtr>& argtypes,
+      const std::string& qual = "") {
     std::unordered_map<std::string, TypePtr> out;
     auto saved = functor_result_abstract_;
     for (auto& it : items)
       if (auto* t = std::get_if<Psig_type>(&it.desc))
-        for (auto& d : t->decls)
+        for (auto& d : t->decls) {
           if (auto a = argtypes.find(d.name.txt); a != argtypes.end())
             functor_result_abstract_[d.name.txt] = a->second;
+          // A functor PARAMETER's abstract nullary type is the param's own
+          // (`(G : GLOBREF)` makes bare `t` mean `G.t`), so body exports show
+          // the qualified type instead of a fresh var.
+          else if (!qual.empty() && !d.manifest && d.params.empty())
+            functor_result_abstract_[d.name.txt] =
+                eng.constr(qual + "." + d.name.txt, {});
+        }
     // Sig-local `module Env : S` binds Env for the val types that follow
     // (`val code0 : Env.in_t -> out0`); count it bound so strict's
     // unbound-module check can't false-fire (flat over-inclusive set, like
@@ -1581,21 +1595,22 @@ struct Checker {
   }
 
   std::unordered_map<std::string, TypePtr> param_sig_value_schemes(
-      const ModuleType& ps, const std::unordered_map<std::string, TypePtr>& argtypes) {
+      const ModuleType& ps, const std::unordered_map<std::string, TypePtr>& argtypes,
+      const std::string& qual = "") {
     std::unordered_map<std::string, TypePtr> out;
     if (auto* sg = std::get_if<Pmty_signature>(&ps.desc)) {
-      return sig_items_value_schemes(sg->items, argtypes);
+      return sig_items_value_schemes(sg->items, argtypes, qual);
     } else if (auto* mi = std::get_if<Pmty_ident>(&ps.desc)) {
       // A LOCAL `module type S = sig .. end` first (so a functor param `M : S`
       // whose S is defined in this file resolves M's members), else a cmi one.
       if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
         auto it = modtype_sig_asts_.find(l->name);
         if (it != modtype_sig_asts_.end())
-          return sig_items_value_schemes(*it->second, argtypes);
+          return sig_items_value_schemes(*it->second, argtypes, qual);
       }
-      out = cmi_modtype_value_schemes(mi->id.txt, argtypes);
+      out = cmi_modtype_value_schemes(mi->id.txt, argtypes, qual);
     } else if (auto* mw = std::get_if<Pmty_with>(&ps.desc)) {
-      return param_sig_value_schemes(*mw->mt, argtypes);
+      return param_sig_value_schemes(*mw->mt, argtypes, qual);
     }
     return out;
   }
@@ -1679,10 +1694,17 @@ struct Checker {
   }
 
   std::unordered_map<std::string, TypePtr> cmi_modtype_value_schemes(
-      const Longident& path, const std::unordered_map<std::string, TypePtr>& argtypes) {
+      const Longident& path, const std::unordered_map<std::string, TypePtr>& argtypes,
+      const std::string& qual = "") {
     std::unordered_map<std::string, TypePtr> out;
     auto comps = mod_components(path);
     if (comps.empty()) return out;
+    // A BARE name declared by an opened module (`open Globroots` then
+    // `(G : GLOBREF)`) resolves through the open's qualification.
+    if (comps.size() == 1)
+      if (auto q = opened_modtype_quals_.find(comps[0]);
+          q != opened_modtype_quals_.end())
+        comps = mod_components_str(q->second);
     try {
       std::vector<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
@@ -1697,13 +1719,25 @@ struct Checker {
       for (auto& mtd : sig->modtypes) if (mtd.name == comps.back()) { mt = mtd.type.get(); break; }
       if (!mt || mt->kind != cmi::ModuleType::Sig || !mt->sig) return out;
       cmi_abstract_subst_ = argtypes;
+      // With a qualifier (a functor PARAM's name), local abstract types take
+      // the param-qualified path: `(G : GLOBREF)` types G.register as
+      // string -> G.t, not string -> 'a (globroots).
+      if (!qual.empty()) {
+        cmi_types_ctx_ = &mt->sig->types;
+        cmi_mod_prefix_ = qual;
+        func_result_mode_ = true;
+      }
       for (auto& v : mt->sig->values) {
         std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
         out[v.name] = from_cmi(v.type, memo);
         eng.finalize_family_heads(out[v.name], /*scheme=*/true);
       }
       cmi_abstract_subst_.clear();
-    } catch (...) { cmi_abstract_subst_.clear(); }
+      cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); func_result_mode_ = false;
+    } catch (...) {
+      cmi_abstract_subst_.clear();
+      cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); func_result_mode_ = false;
+    }
     return out;
   }
 
@@ -9827,6 +9861,14 @@ static void subst_param_items(std::vector<cmi::cmiw::SigItem>& items,
   }
 }
 
+// The emitting file's `module type` ASTs and opened-modtype qualifications,
+// visible to nested functor-body inference (set by infer_signature around its
+// emission loop; restored on return so recursion nests correctly).
+static const std::unordered_map<std::string, const ast::Signature*>*
+    g_outer_modtype_asts = nullptr;
+static const std::unordered_map<std::string, std::string>*
+    g_outer_modtype_quals = nullptr;
+
 // Strengthen a functor-application result whose arguments are all PATHS: every
 // abstract type gets the applied-functor manifest ocamlc records
 // (`module S = Set.Make(Loc)` gives `type t = Set.Make(Loc).t`), recursively
@@ -9889,7 +9931,8 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
   if (std::holds_alternative<Pmod_functor>(me.desc)) {
     // Collect the whole CURRIED parameter chain (`(X : S) (Y : T) -> ..` --
     // each parameter after the first lives in a nested Pmod_functor body).
-    struct P { std::string name, ref; std::vector<cmi::cmiw::SigItem> sig; bool unit = false; };
+    struct P { std::string name, ref; std::vector<cmi::cmiw::SigItem> sig;
+               bool unit = false; const ast::ModuleType* mt_ast = nullptr; };
     std::vector<P> ps;
     const ast::ModuleExpr* cur = &me;
     while (auto* f = std::get_if<Pmod_functor>(&cur->desc)) {
@@ -9898,18 +9941,30 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       if (auto* fn = std::get_if<Functor_named>(&f->param)) {
         if (fn->name.txt) p.name = *fn->name.txt;
         if (fn->type) {
+          p.mt_ast = fn->type.get();
           if (auto* psg = std::get_if<Pmty_signature>(&fn->type->desc))
             p.sig = signature_to_cmi(psg->items);
-          if (auto* pid = std::get_if<Pmty_ident>(&fn->type->desc))
+          if (auto* pid = std::get_if<Pmty_ident>(&fn->type->desc)) {
             p.ref = lid_full(pid->id.txt);
+            // A bare ref declared by an opened module cites the QUALIFIED
+            // name (`open Globroots` + `(G : GLOBREF)` -> Globroots.GLOBREF).
+            if (ckp && p.ref.find('.') == std::string::npos)
+              if (auto q = ckp->opened_modtype_quals_.find(p.ref);
+                  q != ckp->opened_modtype_quals_.end())
+                p.ref = q->second;
+          }
         }
       }
       ps.push_back(std::move(p));
       cur = f->body.get();
     }
     std::vector<cmi::cmiw::SigItem> result;
-    if (auto* bs = std::get_if<Pmod_structure>(&cur->desc))
-      result = infer_signature(bs->items);
+    if (auto* bs = std::get_if<Pmod_structure>(&cur->desc)) {
+      std::vector<std::pair<std::string, const ast::ModuleType*>> fps;
+      for (auto& p : ps)
+        if (!p.name.empty() && p.mt_ast) fps.emplace_back(p.name, p.mt_ast);
+      result = infer_signature(bs->items, fps.empty() ? nullptr : &fps);
+    }
     else if (auto* bc = std::get_if<Pmod_constraint>(&cur->desc)) {
       if (bc->mt)
         if (auto* psg = std::get_if<Pmty_signature>(&bc->mt->desc))
@@ -10019,8 +10074,17 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       }
       if (am && !s.param.empty()) {
         if (auto* api = std::get_if<Pmod_ident>(&am->desc)) {
-          if (!std::holds_alternative<Lapply>(api->id.txt.v))
+          if (!std::holds_alternative<Lapply>(api->id.txt.v)) {
             s.arg_path = lid_full(api->id.txt);
+            // An opened submodule argument cites its qualified path
+            // (`open Globroots` + Test(Classic) -> Globroots.Classic).
+            if (ckp) {
+              std::string head = s.arg_path.substr(0, s.arg_path.find('.'));
+              if (auto q = ckp->opened_submod_quals_.find(head);
+                  q != ckp->opened_submod_quals_.end())
+                s.arg_path = q->second + s.arg_path.substr(head.size());
+            }
+          }
         } else if (auto* ast_ = std::get_if<Pmod_structure>(&am->desc)) {
           // An anonymous struct argument: its manifests eliminate the
           // parameter (`Ord.t` -> `int`).  Arity-0 substitution only.
@@ -10045,9 +10109,16 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         else break;
       }
       auto* api = am ? std::get_if<Pmod_ident>(&am->desc) : nullptr;
-      if (api && !std::holds_alternative<Lapply>(api->id.txt.v))
-        argpaths.push_back(lid_full(api->id.txt));
-      else { all_paths = false; break; }
+      if (api && !std::holds_alternative<Lapply>(api->id.txt.v)) {
+        std::string ap = lid_full(api->id.txt);
+        if (ckp) {  // opened submodule argument -> qualified path
+          std::string head = ap.substr(0, ap.find('.'));
+          if (auto q = ckp->opened_submod_quals_.find(head);
+              q != ckp->opened_submod_quals_.end())
+            ap = q->second + ap.substr(head.size());
+        }
+        argpaths.push_back(std::move(ap));
+      } else { all_paths = false; break; }
     }
     if (all_paths) {
       std::string app;
@@ -10060,7 +10131,9 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
   return std::nullopt;
 }
 
-std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
+std::vector<cmi::cmiw::SigItem> infer_signature(
+    const ast::Structure& s,
+    const std::vector<std::pair<std::string, const ast::ModuleType*>>* fparams) {
   Checker ck;
   ck.record_kinds_ = true;
   // Mirror the sig-display pass: ocamlc's .cmi stores SOURCE abbreviations
@@ -10069,7 +10142,27 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
   // must be best-effort like the display pass (see infer_structure_types).
   ck.eng.lenient = true;
   ck.fold_abbrevs_ = true;
+  // Enclosing functor parameters: bind each param's value members with their
+  // REAL declared types (same registration the main pass does at its functor
+  // harvest), so body exports don't degrade to fresh vars.  The outer file's
+  // `module type` ASTs come along (g_outer_modtype_asts) so a `(H : S)` with a
+  // LOCAL S resolves -- the body structure itself doesn't contain S.
+  if (fparams) {
+    if (g_outer_modtype_asts) ck.modtype_sig_asts_ = *g_outer_modtype_asts;
+    if (g_outer_modtype_quals) ck.opened_modtype_quals_ = *g_outer_modtype_quals;
+    for (auto& [pn, psig] : *fparams) {
+      ck.bound_module_names_.insert(pn);
+      if (psig) ck.modenv[pn] = ck.param_sig_value_schemes(*psig, {}, pn);
+    }
+  }
   run_checker(ck, s);  // leaves top-level bindings in venv.back()
+  // Expose this file's modtype ASTs / opened-modtype quals to nested
+  // functor-body inference (saved / restored: infer_signature recurses
+  // through submodule structures).
+  auto* saved_mt_asts = g_outer_modtype_asts;
+  auto* saved_mt_quals = g_outer_modtype_quals;
+  g_outer_modtype_asts = &ck.modtype_sig_asts_;
+  g_outer_modtype_quals = &ck.opened_modtype_quals_;
   // Emission phase: checking is DONE, every from_coretype below only converts
   // declaration types for the .cmi -- keep local abbreviations as written
   // (`startDate : (int, message) fieldStatus` stores `message`, not string).
@@ -10308,6 +10401,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
   // expected -> a SWITCH past its table -> heap corruption).  The explicit-.mli
   // path (signature_to_cmi) already dedups identically.
   out = cmi::cmiw::dedup_shadowed_fields(std::move(out));
+  g_outer_modtype_asts = saved_mt_asts;
+  g_outer_modtype_quals = saved_mt_quals;
   return out;
 }
 
