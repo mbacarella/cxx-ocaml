@@ -1713,8 +1713,11 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           o::vint(0)});                                // type_uid = Uid.Internal
       sig.push_back(o::vblock(1, {ident, tdecl,
                                   // Trec_first, or Trec_next for the `and`
-                                  // members of a mutually-recursive group
-                                  o::vint(it.rec_status ? it.rec_status : 1),
+                                  // members of a mutually-recursive group;
+                                  // -1 = an explicit `type nonrec` (Trec_not)
+                                  o::vint(it.rec_status < 0
+                                              ? 0
+                                              : it.rec_status ? it.rec_status : 1),
                                   o::vint(0) /*Exported*/}));
     }
   }

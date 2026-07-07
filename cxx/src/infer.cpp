@@ -1216,6 +1216,11 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
       if (path.rfind("Stdlib.", 0) == 0 && !g_keep_stdlib_prefix &&
           !(g_keep_stdlib_paths && g_keep_stdlib_paths->count(path)))
         path = path.substr(7);
+      // A RAW mangled unit head (`Stdlib__Set.Make(String).t`, carried so the
+      // cmi writer emits the raw path a generalized open stores) DISPLAYS
+      // alias-routed, as ocamlc -i prints it.
+      if (path.rfind("Stdlib__", 0) == 0 && !g_keep_stdlib_prefix)
+        path = path.substr(8);
       // The printf format type is normalised to format6; a 3-parameter one prints
       // as its `format` abbreviation, matching ocamlc.
       if (path == "format6" && t->args.size() == 3) path = "format";

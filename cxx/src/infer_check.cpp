@@ -7598,8 +7598,24 @@ struct Checker {
           // Save/restore func_bind_name_ -- this open may sit inside a module
           // binding whose own prefix is mid-flight.
           std::string saved_fbn = func_bind_name_;
-          if (!strict && std::holds_alternative<Pmod_apply>(op->expr.desc))
+          if (!strict && std::holds_alternative<Pmod_apply>(op->expr.desc)) {
             func_bind_name_ = resolve_local_module_path(op->expr);
+            // ocamlc names a generalized open's result types by the RAW unit
+            // path (Stdlib__Set.Make(String).t) -- the mangled head keys the
+            // writer's raw emission; a source-written Set.Make(X).t stays
+            // alias-routed (accepted_batch).
+            if (!func_bind_name_.empty()) {
+              std::string head =
+                  func_bind_name_.substr(0, func_bind_name_.find_first_of(".("));
+              if (!head.empty() && head.rfind("Stdlib__", 0) != 0) {
+                std::string hc = head_cmi(head);
+                std::string base = hc.substr(hc.rfind('/') + 1);
+                if (base.rfind("stdlib__", 0) == 0 &&
+                    std::filesystem::exists(hc))
+                  func_bind_name_ = "Stdlib__" + func_bind_name_;
+              }
+            }
+          }
           // `open F(X)` of a LOCAL functor with a struct body: register the
           // body's type decls and (GADT) ctors under the applicative path, so
           // an opened `'a event` annotation displays `MkReify(PC).event` and
@@ -9106,7 +9122,8 @@ static cmi::cmiw::TyPtr pv_row_manifest(
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
-                            std::vector<cmi::cmiw::SigItem>& out) {
+                            std::vector<cmi::cmiw::SigItem>& out,
+                            bool nonrec_ = false) {
   size_t first_new = out.size();
   for (auto& d : decls) {
     // `[@@immediate]` / `[@@immediate64]` -> the type_declaration's Type_immediacy
@@ -9230,9 +9247,11 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     out.push_back(std::move(si));
   }
   // A `type a .. and b ..` group: Trec_first on the head, Trec_next after
-  // (ocamlc prints the group back with `and`).
+  // (ocamlc prints the group back with `and`).  A `type nonrec` head is
+  // Trec_not -- carried as -1 (0 doubles as "unset -> Trec_first" in the
+  // writer); Printtyp prints the keyword back from it.
   for (size_t i = first_new; i < out.size(); ++i)
-    out[i].rec_status = (i == first_new) ? 1 : 2;
+    out[i].rec_status = (i == first_new) ? (nonrec_ ? -1 : 1) : 2;
 }
 
 // ---- include module type of M: splice M's (already-compiled) cmi signature ----
@@ -9819,7 +9838,14 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     return {};
   };
   std::vector<cmi::cmiw::SigItem> out;
+  // `open F(X)` in this signature: the applied path, so a following nonrec
+  // self-manifest can qualify through it.
+  std::string sig_open_app;
   for (auto& it : s) {
+    if (auto* po = std::get_if<Psig_open>(&it.desc)) {
+      if (std::holds_alternative<Lapply>(po->id.txt.v))
+        sig_open_app = lid_full(po->id.txt);
+    }
     if (auto* pv = std::get_if<Psig_value>(&it.desc)) {
       if (!pv->vd.type) continue;
       std::unordered_map<std::string, TypePtr> tvars;
@@ -9837,7 +9863,18 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         out.push_back(std::move(item));
       }
     } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
-      emit_type_decls(ck, pt->decls, out);
+      bool nonrec_ = pt->rf == RecFlag::Nonrecursive;
+      std::size_t before = out.size();
+      emit_type_decls(ck, pt->decls, out, nonrec_);
+      // Under `open F(X)` in this signature, a nonrec self-manifest
+      // (`type nonrec t = t`) resolves the RHS through the OPEN, not the
+      // decl itself: qualify it with the applied path (accepted_batch).
+      if (nonrec_ && !sig_open_app.empty())
+        for (std::size_t i = before; i < out.size(); ++i)
+          if (out[i].k == cmi::cmiw::SigItem::Type && out[i].manifest &&
+              out[i].manifest->k == cmi::cmiw::Ty::Constr &&
+              out[i].manifest->name == out[i].name)
+            out[i].manifest->name = sig_open_app + "." + out[i].manifest->name;
     } else if (auto* prm = std::get_if<Psig_recmodule>(&it.desc)) {
       // `module rec A : (FOO with type t = ..) and B : FOO` in a SIGNATURE:
       // each decl emits like Psig_module (ident kept as Mty_ident, `with`
@@ -11218,7 +11255,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         out.push_back(std::move(item));
       }
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
-      emit_type_decls(ck, ty->decls, out);
+      emit_type_decls(ck, ty->decls, out, ty->rf == RecFlag::Nonrecursive);
     } else if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {
       // `exception E [of ..]` in a .ml without a .mli: emit the Sig_typext so
       // the inferred .cmi carries the exception (it takes a runtime field, and a
