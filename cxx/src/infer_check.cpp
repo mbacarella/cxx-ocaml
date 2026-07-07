@@ -1655,10 +1655,12 @@ struct Checker {
         for (auto& d : t->decls) {
           if (auto a = argtypes.find(d.name.txt); a != argtypes.end())
             functor_result_abstract_[d.name.txt] = a->second;
-          // A functor PARAMETER's abstract nullary type is the param's own
-          // (`(G : GLOBREF)` makes bare `t` mean `G.t`), so body exports show
-          // the qualified type instead of a fresh var.
-          else if (!qual.empty() && !d.manifest && d.params.empty())
+          // A functor PARAMETER's nullary type is the param's own (`(G :
+          // GLOBREF)` makes bare `t` mean `G.t`), so body exports show the
+          // qualified type instead of a fresh var.  MANIFESTED decls too:
+          // `(X : sig type t = int val x : t end)` gives `val y = X.x` the
+          // stored type X.t, exactly ocamlc (index_functor's G).
+          else if (!qual.empty() && d.params.empty())
             functor_result_abstract_[d.name.txt] =
                 eng.constr(qual + "." + d.name.txt, {});
         }
@@ -1717,6 +1719,74 @@ struct Checker {
       return param_sig_value_schemes(*mw->mt, argtypes, qual);
     }
     return out;
+  }
+
+  // Functor-param DATATYPE members: `(X : T)` where T declares variants /
+  // records / typexts.  Qualified body uses (`X.A`, `{ X.x = () }`, `X.E`)
+  // resolve through these; without them the body's exported vals degrade to
+  // fresh vars (index_functor's I).  Ctor schemes land in
+  // param_ctor_schemes_ ("X.A" -> generic arg1->..->result); record labels
+  // land in the flat fields_ map (emplace -- a local record's own labels,
+  // registered later by run_checker's assignment, still win).
+  std::unordered_map<std::string, TypePtr> param_ctor_schemes_;
+  void register_param_sig_members(const std::string& pn, const ModuleType& ps) {
+    const ast::Signature* items = nullptr;
+    if (auto* sg = std::get_if<Pmty_signature>(&ps.desc)) items = &sg->items;
+    else if (auto* mi = std::get_if<Pmty_ident>(&ps.desc)) {
+      if (auto* l = std::get_if<Lident>(&mi->id.txt.v))
+        if (auto it = modtype_sig_asts_.find(l->name);
+            it != modtype_sig_asts_.end())
+          items = it->second;
+    } else if (auto* mw = std::get_if<Pmty_with>(&ps.desc)) {
+      return register_param_sig_members(pn, *mw->mt);
+    }
+    if (!items) return;
+    auto reg_ctor = [&](const std::string& cname, const TypePtr& result,
+                        const ConstructorArguments& cargs,
+                        std::unordered_map<std::string, TypePtr>& vars) {
+      TypePtr scheme = result;
+      if (auto* tup = std::get_if<Pcstr_tuple>(&cargs)) {
+        for (auto it2 = tup->elems.rbegin(); it2 != tup->elems.rend(); ++it2)
+          scheme = eng.arrow(from_coretype(**it2, vars), scheme);
+      } else if (std::get_if<Pcstr_record>(&cargs)) {
+        // Inline record: a loose one-arg arrow (the payload types stay
+        // unmodelled; the RESULT type is what the export needs).
+        scheme = eng.arrow(generic_var(), scheme);
+      }
+      param_ctor_schemes_[pn + "." + cname] = scheme;
+    };
+    for (auto& it : *items) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls) {
+          std::unordered_map<std::string, TypePtr> vars;
+          std::vector<TypePtr> params;
+          for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
+          TypePtr result = eng.constr(pn + "." + d.name.txt, params);
+          if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
+            for (auto& c : var->ctors) {
+              TypePtr res = c.res ? from_coretype(**c.res, vars) : result;
+              reg_ctor(c.name.txt, res, c.args, vars);
+            }
+          } else if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
+            for (auto& f : rec->fields)
+              fields_.emplace(f.name.txt,
+                              eng.arrow(result, from_coretype(*f.type, vars)));
+          }
+        }
+      } else if (auto* tx = std::get_if<Psig_typext>(&it.desc)) {
+        // `type e += E ..`: the EXTENDED type keeps its own path (the
+        // enclosing scope's e, not X.e).
+        std::unordered_map<std::string, TypePtr> vars;
+        std::vector<TypePtr> params;
+        for (auto& p : tx->ext.params) params.push_back(from_coretype(*p, vars));
+        TypePtr result = eng.constr(lid_full(tx->ext.path.txt), params);
+        for (auto& c : tx->ext.ctors)
+          if (auto* dc = std::get_if<Pext_decl>(&c.kind)) {
+            TypePtr res = dc->res ? from_coretype(**dc->res, vars) : result;
+            reg_ctor(c.name.txt, res, dc->args, vars);
+          }
+      }
+    }
   }
 
   // Value schemes of a cmi module type `M.S` (e.g. Map.OrderedType), with its
@@ -3150,6 +3220,11 @@ struct Checker {
   TypePtr qualified_ctor_scheme(const Longident& id) {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return nullptr;
+    // A functor PARAMETER's ctor (`X.A` under `(X : T)` -- registered from
+    // the param signature) resolves before any cmi lookup.
+    if (auto pc = param_ctor_schemes_.find(lid_full(id));
+        pc != param_ctor_schemes_.end())
+      return pc->second;
     auto comps = mod_components(*d->prefix);
     if (comps.empty()) return nullptr;
     // The head may be an OPENED submodule (`open Runtime_events` then
@@ -11499,7 +11574,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     if (g_outer_modtype_quals) ck.opened_modtype_quals_ = *g_outer_modtype_quals;
     for (auto& [pn, psig] : *fparams) {
       ck.bound_module_names_.insert(pn);
-      if (psig) ck.modenv[pn] = ck.param_sig_value_schemes(*psig, {}, pn);
+      if (psig) {
+        ck.modenv[pn] = ck.param_sig_value_schemes(*psig, {}, pn);
+        ck.register_param_sig_members(pn, *psig);
+      }
     }
   }
   run_checker(ck, s);  // leaves top-level bindings in venv.back()
@@ -11963,6 +12041,68 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           continue;
         }
       }
+      // `module Y = X` where X is a FUNCTOR PARAMETER (possibly `= X.M`):
+      // a parameter path is not aliasable -- ocamlc stores the param's
+      // signature EXPANDED (named-modtype submodules materialized, like
+      // Mtype.strengthen's scrape) and strengthened at the path
+      // (index_functor's `module M = X` / G's `module Y = X`).
+      if (fparams) {
+        auto* pi2 = std::get_if<Pmod_ident>(&mb->binding.expr.desc);
+        std::vector<std::string> acomps;
+        if (pi2 && !std::holds_alternative<Lapply>(pi2->id.txt.v))
+          acomps = split_dotted(lid_full(pi2->id.txt));
+        const ast::ModuleType* pmt = nullptr;
+        if (!acomps.empty())
+          for (auto& fp : *fparams)
+            if (fp.first == acomps[0] && fp.second) pmt = fp.second;
+        if (pmt) {
+          std::function<void(std::vector<cmi::cmiw::SigItem>&)> mat_refs =
+              [&](std::vector<cmi::cmiw::SigItem>& items) {
+                for (auto& si : items) {
+                  if (si.k != cmi::cmiw::SigItem::Module || si.is_functor ||
+                      !si.alias.empty())
+                    continue;
+                  if (si.sub.empty() && !si.modtype_ref.empty()) {
+                    std::vector<cmi::cmiw::SigItem> m;
+                    if (si.modtype_ref.find('.') == std::string::npos) {
+                      if (auto a = ck.modtype_sig_asts_.find(si.modtype_ref);
+                          a != ck.modtype_sig_asts_.end())
+                        m = signature_to_cmi(*a->second);
+                    } else {
+                      m = cmi_modtype_items(split_dotted(si.modtype_ref));
+                    }
+                    if (!m.empty()) { si.sub = std::move(m); si.modtype_ref.clear(); }
+                  }
+                  mat_refs(si.sub);
+                }
+              };
+          std::string ref;
+          std::vector<cmi::cmiw::SigItem> sub;
+          annot_modtype_items(&ck, *pmt, ref, sub);
+          mat_refs(sub);
+          // Descend a dotted target (`= X.M`) to the cited submodule.
+          bool ok = true;
+          std::string path = acomps[0];
+          for (std::size_t i = 1; i < acomps.size() && ok; ++i) {
+            ok = false;
+            for (auto& si : sub)
+              if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
+                  si.name == acomps[i]) {
+                auto inner = std::move(si.sub);
+                sub = std::move(inner);
+                path += "." + acomps[i];
+                ok = true;
+                break;
+              }
+          }
+          if (ok) {
+            strengthen_abstract(sub, path);
+            out.push_back(
+                cmi::cmiw::sig_module(*mb->binding.name.txt, std::move(sub)));
+            continue;
+          }
+        }
+      }
       if (auto item = module_binding_sigitem(*mb->binding.name.txt,
                                              mb->binding.expr, &out, &ck))
         out.push_back(std::move(*item));
@@ -12076,6 +12216,21 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               annot_modtype_items(&ck, *fp.second, ref, sub);
               strengthen_abstract(sub, lid_last(mi->id.txt));
               for (auto& si : sub) out.push_back(std::move(si));
+              break;
+            }
+        // `include N` where N's binding wasn't a plain struct (a functor
+        // APPLICATION, `module N = F(..)`): splice N's already-EMITTED
+        // items, alias-strengthened at N -- `module M = N.M`
+        // (index_functor).
+        if (!inc && inc_path.empty() &&
+            std::holds_alternative<Lident>(mi->id.txt.v))
+          for (auto& si : out)
+            if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
+                si.name == lid_last(mi->id.txt) && !si.sub.empty()) {
+              std::vector<cmi::cmiw::SigItem> sub = si.sub;
+              strengthen_abstract(sub, si.name, /*aliasable=*/true);
+              for (auto& s2 : sub) out.push_back(std::move(s2));
+              inc_path = si.name;  // mark handled
               break;
             }
       }
