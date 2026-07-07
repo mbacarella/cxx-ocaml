@@ -843,7 +843,7 @@ int predef_stamp(const std::string& n) {
       {"unit", 6}, {"exn", 7}, {"eff", 8}, {"continuation", 9}, {"array", 10},
       {"list", 11}, {"option", 12}, {"nativeint", 13}, {"int32", 14},
       {"int64", 15}, {"lazy_t", 16}, {"string", 17}, {"extension_constructor", 18},
-      {"floatarray", 19}};
+      {"floatarray", 19}, {"iarray", 20}, {"atomic_loc", 21}, {"todo_info", 22}};
   auto it = s.find(n);
   return it == s.end() ? 0 : it->second;
 }

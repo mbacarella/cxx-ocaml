@@ -6237,7 +6237,18 @@ struct Checker {
                 pkg_substs.emplace_back(dr->abbrev + ".", lid_full(mi->id.txt) + ".");
             }
         }
-        TypePtr at = infer_expr_expected(*arg, spine[idx]->dom);
+        TypePtr expected = spine[idx]->dom;
+        // `~l:v` passed to an OPTIONAL `?l` parameter Some-wraps (typecore):
+        // v unifies with the option PAYLOAD, not the option itself --
+        // `Callbacks.create ~runtime_counter` pins the callback's declared
+        // arrow onto the local function (test_caml_counters' value : int).
+        if (lk == 1 && spine[idx]->arrow_label == 2) {
+          TypePtr dr = I::Engine::repr(expected);
+          if (dr->kind == I::Type::Kind::Constr && dr->path == "option" &&
+              dr->args.size() == 1)
+            expected = dr->args[0];
+        }
+        TypePtr at = infer_expr_expected(*arg, expected);
         // A reliable-callee argument whose inferred type structurally clashes with
         // the expected parameter on a reliable builtin (int vs float, ...) is a
         // definite error.  Restrict to arguments whose inferred type is TRUSTWORTHY:
@@ -6251,9 +6262,9 @@ struct Checker {
              std::holds_alternative<Pexp_apply>(arg->desc) ||
              std::holds_alternative<Pexp_send>(arg->desc) ||
              std::holds_alternative<Pexp_variant>(arg->desc)) &&
-            builtin_clash(at, spine[idx]->dom))
+            builtin_clash(at, expected))
           note_error("This expression has a type that clashes with the expected type");
-        soft_unify(spine[idx]->dom, at);  // propagate; genuine errors via expected_clash
+        soft_unify(expected, at);  // propagate; genuine errors via expected_clash
       }
       // result = unconsumed params chained onto the tail, erasing any leading
       // optional that precedes a consumed positional (it is defaulted).
