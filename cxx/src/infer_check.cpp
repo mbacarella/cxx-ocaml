@@ -10628,6 +10628,31 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
             }
           mcur = mitem ? &mitem->sub : nullptr;
         }
+        // When Y is a LOCAL module of the enclosing structure (`with module
+        // M = M` where a sibling `module M = struct type t = int * .. end`
+        // exists), ocamlc takes Y's OWN signature -- carrying Y's manifests --
+        // strengthened at Y, not X's abstract face strengthened.  Seeding
+        // mitem->sub from Y keeps `type t = int * (<m:'a> as 'a)` instead of
+        // degrading to `type t = M.t` (pr6371).
+        if (mitem && g_enclosing_struct_items) {
+          std::vector<std::string> ycomps = split_dotted(lid_full(wmo->lid2.txt));
+          const std::vector<cmi::cmiw::SigItem>* ycur = g_enclosing_struct_items;
+          const cmi::cmiw::SigItem* yitem = nullptr;
+          for (std::size_t i = 0; i < ycomps.size() && ycur; ++i) {
+            yitem = nullptr;
+            for (auto& si : *ycur)
+              if (si.k == cmi::cmiw::SigItem::Module && si.name == ycomps[i]) {
+                yitem = &si; break;
+              }
+            ycur = yitem ? &yitem->sub : nullptr;
+          }
+          if (yitem && !yitem->sub.empty()) {
+            mitem->sub = yitem->sub;
+            mitem->modtype_ref.clear();
+            strengthen_abstract(mitem->sub, lid_full(wmo->lid2.txt));
+            continue;
+          }
+        }
         if (mitem) {
           if (mitem->sub.empty() && !mitem->modtype_ref.empty() &&
               mitem->modtype_ref.find('.') != std::string::npos) {
