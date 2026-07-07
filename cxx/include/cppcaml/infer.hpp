@@ -47,6 +47,12 @@ struct Type {
   std::string arrow_lbl;     // Arrow: label name (when Labelled/Optional)
   std::vector<TypePtr> args; // Tuple / Constr / Object / Variant
   std::vector<std::string> labels;  // Object: method names; Variant: tag names
+  // Object: per-method `'a.` poly binders from a WRITTEN `< m : 'a. 'a >`
+  // (empty when no method is explicitly polymorphic).  The engine itself
+  // ignores them; the cmi bridge wraps such methods in Tpoly so the binder
+  // survives into the artifact.  Parallel to labels when non-empty.
+  std::vector<std::vector<TypePtr>> method_polys;
+  std::vector<std::vector<std::string>> method_poly_names;
   std::vector<char> tag_has_arg;    // Variant: 1 if the tag carries an argument
   int variant_kind = 0;             // Variant: 0 = `[> ..]` (open, from construction),
                                     // 1 = `[< ..]` (upper bound, from a match/pattern)

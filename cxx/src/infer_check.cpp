@@ -1108,10 +1108,27 @@ struct Checker {
       if (strict) return eng.fresh_var();
       std::vector<std::string> ms;
       std::vector<TypePtr> ts;
+      std::vector<std::vector<TypePtr>> mpv;
+      std::vector<std::vector<std::string>> mpn;
+      bool any_poly = false;
       for (auto& f : ob->fields) {
         if (auto* ot = std::get_if<Otag>(&f)) {
           ms.push_back(ot->name.txt);
-          ts.push_back(from_coretype(*ot->type, vars));
+          // An explicitly polymorphic method `< m : 'a. 'a t >`: the binders
+          // scope to the METHOD (fresh vars in a scoped copy of `vars`), and
+          // are recorded on the object node so the cmi bridge emits Tpoly.
+          auto* pp = std::get_if<Ptyp_poly>(&ot->type->desc);
+          if (pp && !pp->vars.empty()) {
+            auto sub = vars;
+            std::vector<TypePtr> bs;
+            for (auto& n : pp->vars) { auto fv = generic_var(); sub[n] = fv; bs.push_back(fv); }
+            ts.push_back(from_coretype(*pp->type, sub));
+            mpv.push_back(std::move(bs)); mpn.push_back(pp->vars);
+            any_poly = true;
+          } else {
+            ts.push_back(from_coretype(*ot->type, vars));
+            mpv.emplace_back(); mpn.emplace_back();
+          }
         } else if (auto* oi = std::get_if<Oinherit>(&f)) {
           // `< foo : int; ob; .. >`: an INHERITED local object abbreviation
           // splices its fields (one level; t01's obj_type gets ob's `f`).
@@ -1126,10 +1143,15 @@ struct Checker {
                       if (auto* ot2 = std::get_if<Otag>(&f2)) {
                         ms.push_back(ot2->name.txt);
                         ts.push_back(from_coretype(*ot2->type, vars));
+                        mpv.emplace_back(); mpn.emplace_back();
                       }
         }
       }
       TypePtr r = eng.object_type(std::move(ms), std::move(ts));
+      if (any_poly) {
+        r->method_polys = std::move(mpv);
+        r->method_poly_names = std::move(mpn);
+      }
       if (ob->closed == ClosedFlag::Open) r->variant_kind = 1;  // `< ..; .. >`
       return r;
     }
@@ -8831,9 +8853,13 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
   using K = I::Type::Kind;
   switch (t->kind) {
     case K::Var: {
+      // Every occurrence carries the name (not just the first-bridged one):
+      // TyEmit memoizes vars by id in MARSHAL order, so if an unnamed
+      // duplicate (e.g. a GADT ctor's cd_args copy, marshalled before cd_res)
+      // reached the writer first, the name would be lost (`'f` printed 'a).
       auto it = vars.find(t.get());
-      if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
-      int id = nextvar++; vars[t.get()] = id;
+      int id = (it != vars.end()) ? it->second : nextvar++;
+      if (it == vars.end()) vars[t.get()] = id;
       auto v = cmi::cmiw::ty_var(id);
       if (auto nm = ctx.var_names.find(t.get()); nm != ctx.var_names.end())
         v->var_name = nm->second;
@@ -8853,7 +8879,29 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
       if (!ctx.visiting.insert(t.get()).second) return cmi::cmiw::ty_var(nextvar++);
       std::vector<cmi::cmiw::TyPtr> mtys;
-      for (auto& a : t->args) mtys.push_back(bridge_ty(a, vars, nextvar));
+      for (std::size_t mi = 0; mi < t->args.size(); ++mi) {
+        // A WRITTEN poly method `< m : 'a. 'a t >` (binders recorded by
+        // from_coretype): register the binder names as univars, bridge the
+        // body, and wrap it in Tpoly citing the binder ids.
+        if (mi < t->method_polys.size() && !t->method_polys[mi].empty()) {
+          std::vector<std::string> added;
+          for (std::size_t bj = 0; bj < t->method_polys[mi].size(); ++bj) {
+            const auto& bn = t->method_poly_names[mi][bj];
+            auto* bp = I::Engine::repr(t->method_polys[mi][bj]).get();
+            ctx.var_names[bp] = bn;
+            if (ctx.univars.insert(bn).second) added.push_back(bn);
+          }
+          auto body = bridge_ty(t->args[mi], vars, nextvar);
+          std::vector<int> pids;
+          for (auto& bv : t->method_polys[mi])
+            if (auto vi = vars.find(I::Engine::repr(bv).get()); vi != vars.end())
+              pids.push_back(vi->second);
+          for (auto& n : added) ctx.univars.erase(n);
+          mtys.push_back(cmi::cmiw::ty_poly(std::move(body), std::move(pids)));
+        } else {
+          mtys.push_back(bridge_ty(t->args[mi], vars, nextvar));
+        }
+      }
       ctx.visiting.erase(t.get());
       auto ty = cmi::cmiw::ty_object(t->labels, std::move(mtys));
       // engine variant_kind 1 on an Object marks an OPEN row (`< ..; .. >`)
@@ -9045,9 +9093,17 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     }
     std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
+    // bvars keys are raw Type*: every bridged root must stay alive for the
+    // whole decl, else a freed Ptyp_any fresh var's address gets reused and
+    // two `_` params collide into ONE emitted node (`type (_, _) t` printed
+    // back as `(_, 'a) t constraint 'a = _`).
+    std::vector<TypePtr> keep;
+    auto fc = [&](const ast::CoreType& c) -> const TypePtr& {
+      keep.push_back(ck.from_coretype(c, tvars)); return keep.back();
+    };
     std::vector<cmi::cmiw::TyPtr> params;
     for (auto& p : d.params) {
-      auto pv = bridge_ty_named(ck.from_coretype(*p, tvars), bvars, nextvar, tvars);
+      auto pv = bridge_ty_named(fc(*p), bvars, nextvar, tvars);
       // Params keep their SOURCE names (Tvar Some): ocamlc prints
       // `('outputValue, 'message) fieldStatus` back verbatim.  The shared
       // var node carries the name into every ctor/label occurrence.  An
@@ -9070,9 +9126,9 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       std::vector<cmi::cmiw::Ctor> ctors;
       for (auto& c : var->ctors) {
         cmi::cmiw::Ctor cc; cc.name = c.name.txt;
-        if (c.res) cc.res = bridge_ty_named(ck.from_coretype(**c.res, tvars), bvars, nextvar, tvars);
+        if (c.res) cc.res = bridge_ty_named(fc(**c.res), bvars, nextvar, tvars);
         if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
-          for (auto& a : tup->elems) cc.args.push_back(bridge_ty_named(ck.from_coretype(*a, tvars), bvars, nextvar, tvars));
+          for (auto& a : tup->elems) cc.args.push_back(bridge_ty_named(fc(*a), bvars, nextvar, tvars));
         else if (auto* r = std::get_if<Pcstr_record>(&c.args))
           // Inline record (Typedtree's `Texp_record of {fields; representation;
           // extended_expression}`): emit the labels so a consumer matching
@@ -9097,7 +9153,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       // Some (Tconstr t) alongside Type_variant.  Bridge the manifest (sharing
       // the param var-ids) so Printtyp renders the `= t =` link.
       if (d.manifest)
-        si.manifest = bridge_ty_named(ck.from_coretype(**d.manifest, tvars), bvars, nextvar, tvars);
+        si.manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars);
       out.push_back(std::move(si));
       continue;
     }
@@ -9118,14 +9174,14 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       // A re-exported record (`type s = t = { .. }`) keeps its `= t` manifest
       // alongside the record kind, just like the variant case above.
       if (d.manifest)
-        si.manifest = bridge_ty_named(ck.from_coretype(**d.manifest, tvars), bvars, nextvar, tvars);
+        si.manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars);
       out.push_back(std::move(si));
       continue;
     }
     cmi::cmiw::TyPtr manifest = nullptr;
     if (d.manifest) {
       manifest = pv_row_manifest(ck, **d.manifest, tvars, bvars, nextvar);
-      if (!manifest) manifest = bridge_ty_named(ck.from_coretype(**d.manifest, tvars), bvars, nextvar, tvars);
+      if (!manifest) manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars);
     }
     auto si = cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest);
     // `type t = ..`: an extensible (Type_open) declaration, not abstract --
@@ -9506,6 +9562,11 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
 // `module type Gee = sig module M : module type of Foo .. end`).
 static const std::vector<cmi::cmiw::SigItem>* g_enclosing_struct_items = nullptr;
 
+static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
+                                  const std::function<void(std::string&)>& fn);
+static void annot_modtype_items(Checker* ckp, const ast::ModuleType& mt,
+                                std::string& ref,
+                                std::vector<cmi::cmiw::SigItem>& sig);
 static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
                                    std::vector<cmi::cmiw::SigItem>& items) {
   const ast::ModuleType* m = &mt;
@@ -9517,6 +9578,16 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
       if (auto* wt = std::get_if<Pwith_type>(&c)) { td = &*wt->td; lid = &wt->lid; }
       else if (auto* ws = std::get_if<Pwith_typesubst>(&c)) {
         td = &*ws->td; lid = &ws->lid; subst = true;
+      } else if (auto* wm = std::get_if<Pwith_modsubst>(&c)) {
+        // `with module X := Y` substitutes Y for X everywhere: references
+        // `X.t` in the remaining items become `Y.t` (the X item itself is
+        // dropped by the caller via drop_modsubst).
+        std::string from = lid_full(wm->lid1.txt) + ".";
+        std::string to = lid_full(wm->lid2.txt) + ".";
+        rewrite_item_ty_names(items, [&](std::string& n) {
+          if (n.rfind(from, 0) == 0) n = to + n.substr(from.size());
+        });
+        continue;
       } else continue;
       // Descend a dotted `with type M.t = ..` through submodule items.
       std::string full = lid_full(lid->txt);
@@ -9729,6 +9800,27 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       }
     } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
       emit_type_decls(ck, pt->decls, out);
+    } else if (auto* prm = std::get_if<Psig_recmodule>(&it.desc)) {
+      // `module rec A : (FOO with type t = ..) and B : FOO` in a SIGNATURE:
+      // each decl emits like Psig_module (ident kept as Mty_ident, `with`
+      // expanded), marked Trec_first/Trec_next so Printtyp prints the group
+      // back as one `module rec .. and ..`.
+      int rs = 1;
+      for (auto& md : prm->decls) {
+        if (!md.name.txt || !md.type) continue;
+        std::vector<cmi::cmiw::SigItem> items;
+        if (const ast::Signature* bs = body_sig(*md.type))
+          items = signature_to_cmi(*bs, &modtypes, &module_sigs);
+        else
+          items = qual_modtype_items(*md.type);
+        apply_with_constraints(ck, *md.type, items);
+        drop_modsubst(items, with_modsubst_names(*md.type));
+        auto mi = cmi::cmiw::sig_module(*md.name.txt, std::move(items));
+        if (auto* pid = std::get_if<Pmty_ident>(&md.type->desc))
+          mi.modtype_ref = lid_full(pid->id.txt);
+        mi.rec_status = rs; rs = 2;
+        out.push_back(std::move(mi));
+      }
     } else if (auto* pm = std::get_if<Psig_module>(&it.desc)) {
       if (pm->md.name.txt && pm->md.type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
@@ -10365,6 +10457,51 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       return cmi::cmiw::sig_module_alias(name, lid_full(pi->id.txt));
     return std::nullopt;
   }
+  if (auto* mu = std::get_if<Pmod_unpack>(&me.desc)) {
+    // `module T = (val e : S with type t = ..)`: ocamlc types T at the
+    // package modtype EXPANDED, with-refinements grafted onto the items.
+    if (auto* uc = std::get_if<Pexp_constraint>(&mu->e->desc))
+      if (auto* pk = std::get_if<Ptyp_package>(&uc->t->desc)) {
+        std::string ref = lid_full(pk->path.txt);
+        std::vector<cmi::cmiw::SigItem> items;
+        if (ckp && ref.find('.') == std::string::npos) {
+          if (auto q = ckp->opened_modtype_quals_.find(ref);
+              q != ckp->opened_modtype_quals_.end())
+            ref = q->second;
+          else if (auto a = ckp->modtype_sig_asts_.find(ref);
+                   a != ckp->modtype_sig_asts_.end())
+            items = signature_to_cmi(*a->second);
+        }
+        if (items.empty() && ref.find('.') != std::string::npos)
+          items = cmi_modtype_items(split_dotted(ref));
+        if (!items.empty() && ckp) {
+          for (auto& [clid, cty] : pk->constraints) {
+            auto comps = split_dotted(lid_full(clid.txt));
+            std::vector<cmi::cmiw::SigItem>* cur = &items;
+            for (std::size_t i = 0; i + 1 < comps.size() && cur; ++i) {
+              std::vector<cmi::cmiw::SigItem>* next = nullptr;
+              for (auto& si : *cur)
+                if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[i]) {
+                  next = &si.sub; break;
+                }
+              cur = next;
+            }
+            if (!cur) continue;
+            for (auto& si : *cur)
+              if (si.k == cmi::cmiw::SigItem::Type && si.name == comps.back() &&
+                  si.params.empty()) {
+                std::unordered_map<std::string, TypePtr> tvars;
+                std::unordered_map<const I::Type*, int> bvars; int nv = 0;
+                si.manifest = bridge_ty_named(ckp->from_coretype(*cty, tvars),
+                                              bvars, nv, tvars);
+                break;
+              }
+          }
+          return cmi::cmiw::sig_module(name, std::move(items));
+        }
+      }
+    return std::nullopt;
+  }
   if (auto* mc = std::get_if<Pmod_constraint>(&me.desc)) {
     if (mc->mt) {
       if (auto* ps = std::get_if<Pmty_signature>(&mc->mt->desc))
@@ -10984,7 +11121,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       if (!pmt->type)  // ABSTRACT `module type S` in a struct (pr7112)
         out.push_back(cmi::cmiw::sig_modtype_abstract(pmt->name.txt));
       else if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
-        out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
+        // Earlier top-level modtypes travel along so a nested `FOO with ..`
+        // (e.g. a `module rec` decl's annotation, pr7082) resolves FOO.
+        out.push_back(cmi::cmiw::sig_modtype(
+            pmt->name.txt, signature_to_cmi(ps->items, &ck.modtype_sig_asts_)));
       else if (auto* pid = std::get_if<Pmty_ident>(&pmt->type->desc)) {
         // `module type S2 = S1` / `= M.T` in a struct: an ALIAS -- mtd_type
         // stays Mty_ident; the resolved items are the fallback layout.
