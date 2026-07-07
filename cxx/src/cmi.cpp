@@ -763,6 +763,9 @@ TyPtr ty_object(std::vector<std::string> names, std::vector<TyPtr> tys) {
 TyPtr ty_package(std::string mty, std::vector<std::string> cnames, std::vector<TyPtr> ctys) {
   auto t = std::make_shared<Ty>(); t->k = Ty::Package; t->name = std::move(mty);
   t->pv_tags = std::move(cnames); t->args = std::move(ctys); return t; }
+TyPtr ty_poly(TyPtr body, std::vector<int> poly_ids) {
+  auto t = std::make_shared<Ty>(); t->k = Ty::Poly;
+  t->args = {std::move(body)}; t->poly_ids = std::move(poly_ids); return t; }
 TyPtr ty_var(int id) { auto t = std::make_shared<Ty>(); t->k = Ty::Var; t->var = id; return t; }
 
 namespace {
@@ -962,9 +965,19 @@ struct TyEmit {
         o::ValPtr nm = t->var_name.empty()
                            ? o::vint(0)                                // None
                            : o::vblock(0, {o::vstr(t->var_name)});     // Some name
-        o::ValPtr te = texpr(o::vblock(0, {nm}));  // Tvar
+        // Tunivar for a poly field's `'a.` binder, Tvar otherwise
+        o::ValPtr te = texpr(o::vblock(t->univar ? 7 : 0, {nm}));
         vars[t->var] = te;
         return te;
+      }
+      case Ty::Poly: {
+        // Tpoly(body, [the quantified Tunivar nodes]) -- body emitted first so
+        // its univars register in `vars` and can be cited (shared) here.
+        o::ValPtr body = emit(t->args[0]);
+        std::vector<o::ValPtr> us;
+        for (int pid : t->poly_ids)
+          if (auto it = vars.find(pid); it != vars.end()) us.push_back(it->second);
+        return texpr(o::vblock(8, {body, us.empty() ? o::vint(0) : o::vlist(us)}));
       }
       case Ty::Constr: {
         // A qualified name (`Buffer.t`, `A.Inner.t`) emits a Tconstr whose path
@@ -994,7 +1007,10 @@ struct TyEmit {
           inner = texpr(o::vblock(3, {opath, o::vlist({inner}),
                                       o::vblock(0, {o::vint(0)})}));  // Tconstr option
         }
-        o::ValPtr dom = texpr(o::vblock(8, {inner, o::vint(0) /*[]*/}));  // Tpoly
+        // An already-poly domain (`('a. 'a -> 'a) -> ..`) is its own Tpoly.
+        o::ValPtr dom = t->args[0]->k == Ty::Poly
+                            ? inner
+                            : texpr(o::vblock(8, {inner, o::vint(0) /*[]*/}));  // Tpoly
         o::ValPtr c = emit(t->args[1]);
         // arg_label = Nolabel (int 0) | Labelled of string (block tag 0)
         //           | Optional of string (block tag 1)

@@ -226,7 +226,7 @@ namespace cmiw {
 struct Ty;
 using TyPtr = std::shared_ptr<Ty>;
 struct Ty {
-  enum K { Constr, Arrow, Tuple, Var, Variant, Object, Package } k = Constr;
+  enum K { Constr, Arrow, Tuple, Var, Variant, Object, Package, Poly } k = Constr;
   std::string name;            // Constr: type-ctor name ("int","list","M.t",...);
                                // Package: the modtype path ("S", "Set.OrderedType")
   std::vector<TyPtr> args;     // Constr: type args; Arrow: {dom, cod}; Tuple:
@@ -242,6 +242,9 @@ struct Ty {
                                      // Object: method names
   int row_kind = 2;            // Variant: 0 open `[>`, 1 upper `[<`, 2 exact `[ ]`
   std::vector<std::string> pv_present;  // Variant: `[< L > `P ]` present tags
+  bool univar = false;         // Var: a universally-quantified var (Tunivar) --
+                               // a poly field's `'a.` binder
+  std::vector<int> poly_ids;   // Poly: the quantified vars' ids (args[0] = body)
 };
 TyPtr ty_variant(std::vector<std::string> tags);      // exact all-constant row
 TyPtr ty_variant_row(std::vector<std::string> tags, std::vector<TyPtr> args,
@@ -250,6 +253,9 @@ TyPtr ty_object(std::vector<std::string> names, std::vector<TyPtr> tys);  // clo
 // First-class module `(module S)` / `(module S with type t = u ...)`:
 // constraint names in pv_tags (dotted), constraint types in args.
 TyPtr ty_package(std::string mty, std::vector<std::string> cnames, std::vector<TyPtr> ctys);
+// Explicit polymorphism `'a. t` (a record field / method type): body + the
+// quantified vars' ids (the body's matching Var nodes carry univar=true).
+TyPtr ty_poly(TyPtr body, std::vector<int> poly_ids);
 TyPtr ty_predef(const std::string& name);             // nullary predef constr
 TyPtr ty_constr(const std::string& name, std::vector<TyPtr> args);
 TyPtr ty_arrow(const TyPtr& dom, const TyPtr& cod);

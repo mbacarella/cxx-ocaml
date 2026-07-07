@@ -8661,6 +8661,9 @@ struct BridgeCtx {
   // SOURCE names for engine vars (a type decl's coretype tvars map reversed):
   // a GADT ctor's existential (`Test : 'b * 'a * ..`) keeps its written name.
   std::unordered_map<const I::Type*, std::string> var_names;
+  // Universally-quantified names (a poly field's `'a.` binders): matching
+  // vars emit as Tunivar, not Tvar.
+  std::unordered_set<std::string> univars;
 };
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
@@ -8680,6 +8683,28 @@ static cmi::cmiw::TyPtr bridge_ty_named(const TypePtr& t0,
     if (tp) ctx.var_names[I::Engine::repr(tp).get()] = n;
   return bridge_ty_rec(t0, vars, nextvar, ctx);
 }
+// Bridge a DECLARATION field/label coretype: a `'a. t` poly field becomes
+// Ty::Poly over Tunivar binders; anything else = bridge_ty_named.
+static cmi::cmiw::TyPtr bridge_label_ty(Checker& ck, const ast::CoreType& ct,
+                                        std::unordered_map<std::string, TypePtr>& tvars,
+                                        std::unordered_map<const I::Type*, int>& vars,
+                                        int& nextvar) {
+  auto* pp = std::get_if<Ptyp_poly>(&ct.desc);
+  if (!pp || pp->vars.empty())
+    return bridge_ty_named(ck.from_coretype(ct, tvars), vars, nextvar, tvars);
+  TypePtr body = ck.from_coretype(ct, tvars);  // strips the poly, binds names
+  BridgeCtx ctx;
+  for (auto& [n, tp] : tvars)
+    if (tp) ctx.var_names[I::Engine::repr(tp).get()] = n;
+  for (auto& n : pp->vars) ctx.univars.insert(n);
+  auto b = bridge_ty_rec(body, vars, nextvar, ctx);
+  std::vector<int> pids;
+  for (auto& n : pp->vars)
+    if (auto tv2 = tvars.find(n); tv2 != tvars.end())
+      if (auto vi = vars.find(I::Engine::repr(tv2->second).get()); vi != vars.end())
+        pids.push_back(vi->second);
+  return cmi::cmiw::ty_poly(std::move(b), std::move(pids));
+}
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
                                       BridgeCtx& ctx) {
@@ -8698,6 +8723,8 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
         v->var_name = nm->second;
       else if (!t->rigid_name.empty())
         v->var_name = t->rigid_name;  // a generalized `(type t)` newtype
+      if (!v->var_name.empty() && ctx.univars.count(v->var_name))
+        v->univar = true;  // a poly field's `'a.` binder -> Tunivar
       return v;
     }
     case K::Object: {  // closed structural object `< m1 : t1; m2 : t2 >`
@@ -8863,7 +8890,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
             lab.name = f.name.txt;
             lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
-            lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
+            lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar);
             cc.inline_record.push_back(std::move(lab));
           }
         ctors.push_back(std::move(cc));
@@ -8882,7 +8909,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         lab.name = f.name.txt;
         lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
-        lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
+        lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar);
         labels.push_back(std::move(lab));
       }
       auto si = cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels));
@@ -9181,7 +9208,7 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
       lab.name = f.name.txt;
       lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
-      lab.ty = bridge_ty_named(ck.from_coretype(*f.type, tvars), bvars, nextvar, tvars);
+      lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar);
       labels.push_back(std::move(lab));
     }
     item = cmi::cmiw::sig_exception_record(name, std::move(labels));
