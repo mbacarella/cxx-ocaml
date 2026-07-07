@@ -252,6 +252,9 @@ struct Ty {
                                      // Object: method names
   int row_kind = 2;            // Variant: 0 open `[>`, 1 upper `[<`, 2 exact `[ ]`
   std::vector<std::string> pv_present;  // Variant: `[< L > `P ]` present tags
+  std::vector<char> pv_conj;   // Variant: per-tag CONJUNCTIVE-constant flag
+                               // (`` `A of & t ``: Reither no_arg=true WITH an
+                               // arg list); empty = none
   bool univar = false;         // Var: a universally-quantified var (Tunivar) --
                                // a poly field's `'a.` binder
   std::vector<int> poly_ids;   // Poly: the quantified vars' ids (args[0] = body)

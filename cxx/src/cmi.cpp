@@ -1154,9 +1154,10 @@ struct TyEmit {
         std::vector<o::ValPtr> fields;
         for (std::size_t i : ord) {
           TyPtr arg = i < t->args.size() ? t->args[i] : nullptr;
+          bool conj = i < t->pv_conj.size() && t->pv_conj[i];
           o::ValPtr rf;
           if (t->row_kind == 1 && !present.count(t->pv_tags[i])) {
-            rf = o::vblock(1, {o::vint(arg ? 0 : 1) /*no_arg*/,
+            rf = o::vblock(1, {o::vint((!arg || conj) ? 1 : 0) /*no_arg*/,
                                arg ? o::vlist({emit(arg)}) : o::vint(0) /*arg_type*/,
                                o::vint(0) /*matched=false*/,
                                o::vblock(0, {o::vint(1)}) /*ext=ref RFnone*/});  // RFeither

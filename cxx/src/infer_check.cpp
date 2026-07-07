@@ -794,8 +794,17 @@ struct Checker {
     if (auto* pl = std::get_if<Ptyp_poly>(&t.desc))
       return from_coretype(*pl->type, vars);
     // `(t as 'a)`: the inner type, with 'a bound to it for later references.
+    // An ALREADY-BOUND 'a (a decl param: `type 'a t = <.. [< `A ] as 'a ..>`)
+    // UNIFIES with the aliased type -- the param becomes the row, which is
+    // what ocamlc stores (the decl prints back with a `constraint 'a = ..`
+    // clause).  Rebinding instead silently dropped the tie (Entities).
     if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
       TypePtr inner = from_coretype(*al->type, vars);
+      auto ex = vars.find(al->name);
+      if (ex != vars.end()) {
+        soft_unify(ex->second, inner);
+        return I::Engine::repr(ex->second);
+      }
       vars[al->name] = inner;
       return inner;
     }
@@ -867,7 +876,11 @@ struct Checker {
           if (auto* rt = std::get_if<Rtag>(&r)) {
             tags.push_back(rt->name);
             if (rt->types.empty()) { ats.push_back(eng.fresh_var()); has.push_back(0); }
-            else { ats.push_back(from_coretype(*rt->types[0], vars)); has.push_back(1); }
+            // has=2: CONJUNCTIVE constant (`` `A of & t ``, constant flag AND
+            // an arg type -- Reither{no_arg=true; arg_type=[t]}); truthy for
+            // every has-an-arg consumer, distinguished by the writer bridge.
+            else { ats.push_back(from_coretype(*rt->types[0], vars));
+                   has.push_back(rt->constant ? 2 : 1); }
           } else {
             auto* ri = std::get_if<Rinherit>(&r);
             inh.push_back(from_coretype(*ri->ct, vars));
@@ -9032,13 +9045,20 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
         return cmi::cmiw::ty_var(nextvar++);
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
       std::vector<cmi::cmiw::TyPtr> targs;
+      std::vector<char> conj;
+      bool any_conj = false;
       for (std::size_t i = 0; i < t->labels.size(); ++i) {
         bool has = i < t->tag_has_arg.size() && t->tag_has_arg[i] &&
                    i < t->args.size() && t->args[i];
         targs.push_back(has ? bridge_ty(t->args[i], vars, nextvar) : nullptr);
+        // tag_has_arg == 2: conjunctive constant (`` `A of & t ``)
+        bool c = has && t->tag_has_arg[i] == 2;
+        conj.push_back(c ? 1 : 0);
+        any_conj |= c;
       }
       auto ty = cmi::cmiw::ty_variant_row(t->labels, std::move(targs),
                                           t->variant_kind, t->present);
+      if (any_conj) ty->pv_conj = std::move(conj);
       ctx.nodes[t.get()] = ty;
       return ty;
     }
@@ -9214,6 +9234,14 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       TypePtr rhs = fc(*con.t2);  // reallocate and dangle a prior fc ref
       ck.soft_unify(lhs, rhs);
     }
+    // An ABSTRACT decl's manifest converts to the ENGINE before the params
+    // bridge: an `as 'a` alias to a param inside it (`type 'a t = <..
+    // [< `A of & amp ] as 'a ..>` -- Entities) unifies the param with the
+    // row, and the bridge then shares the one node.
+    TypePtr eman = nullptr;
+    if (d.manifest && !std::holds_alternative<Ptype_variant>(d.kind) &&
+        !std::holds_alternative<Ptype_record>(d.kind))
+      eman = fc(**d.manifest);
     std::vector<cmi::cmiw::TyPtr> params;
     for (size_t pi = 0; pi < d.params.size(); ++pi) {
       auto& p = d.params[pi];
@@ -9310,8 +9338,17 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     }
     cmi::cmiw::TyPtr manifest = nullptr;
     if (d.manifest) {
-      manifest = pv_row_manifest(ck, **d.manifest, tvars, bvars, nextvar);
-      if (!manifest) manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars, &dctx);
+      // With a CONSTRAINED param (non-var repr after the manifest/constraint
+      // unifications above), the manifest must bridge through the ENGINE node
+      // so the param sharing survives -- the AST-level pv_row_manifest would
+      // build an unshared copy.
+      bool constrained_param = false;
+      for (auto& ep : eparams)
+        if (I::Engine::repr(ep)->kind != I::Type::Kind::Var)
+          constrained_param = true;
+      if (!constrained_param)
+        manifest = pv_row_manifest(ck, **d.manifest, tvars, bvars, nextvar);
+      if (!manifest) manifest = bridge_ty_named(eman, bvars, nextvar, tvars, &dctx);
     }
     auto si = cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest);
     // `type t = ..`: an extensible (Type_open) declaration, not abstract --
