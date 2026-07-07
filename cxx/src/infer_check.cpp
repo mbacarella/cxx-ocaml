@@ -8931,6 +8931,39 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
   return cmi::cmiw::ty_var(nextvar++);
 }
 
+// A FLAT polymorphic-variant abbreviation with all-direct tags (no inheritance,
+// no conjunctive `of t1 & t2`): emit its row so a consumer's `#view` pattern
+// resolves the tags cross-module and Printtyp renders the `[ .. ]` / `[> .. ]`
+// / `[< .. ]` bound verbatim.  The bound maps to a row_kind: exact `[ ]` -> 2
+// (row_more Tnil), open `[> ]` -> 0 (row_more Tvar, all RFpresent), upper
+// `[< .. > present]` -> 1 (present tags RFpresent, the rest RFeither).  An
+// abbreviation that INHERITS another polyvariant (`[ Simple.view | `Or ]`)
+// returns null (emitting only its direct tags would be an INCOMPLETE set).
+static cmi::cmiw::TyPtr pv_row_manifest(
+    Checker& ck, const ast::CoreType& t,
+    std::unordered_map<std::string, TypePtr>& tvars,
+    std::unordered_map<const I::Type*, int>& bvars, int& nextvar) {
+  auto* pv = std::get_if<Ptyp_variant>(&t.desc);
+  if (!pv) return nullptr;
+  std::vector<std::string> tags; std::vector<cmi::cmiw::TyPtr> targs;
+  for (auto& rf : pv->rows) {
+    auto* rt = std::get_if<Rtag>(&rf);
+    if (!rt || rt->types.size() > 1) return nullptr;  // inherit / `of t1 & t2`
+    tags.push_back(rt->name);
+    targs.push_back(rt->constant || rt->types.empty()
+                        ? nullptr
+                        : bridge_ty_named(ck.from_coretype(*rt->types[0], tvars),
+                                          bvars, nextvar, tvars));
+  }
+  if (tags.empty()) return nullptr;
+  int rk; std::vector<std::string> present;
+  if (pv->closed == ClosedFlag::Open) rk = 0;            // `[> .. ]`
+  else if (pv->labels) { rk = 1; present = *pv->labels; }  // `[< .. > present]`
+  else rk = 2;                                            // `[ .. ]` exact
+  return cmi::cmiw::ty_variant_row(std::move(tags), std::move(targs), rk,
+                                   std::move(present));
+}
+
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
@@ -9027,36 +9060,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     }
     cmi::cmiw::TyPtr manifest = nullptr;
     if (d.manifest) {
-      // A FLAT polymorphic-variant abbreviation with all-direct tags (no
-      // inheritance, no conjunctive `of t1 & t2`): emit its row so a consumer's
-      // `#view` pattern resolves the tags cross-module and Printtyp renders the
-      // `[ .. ]` / `[> .. ]` / `[< .. ]` bound verbatim.  The bound maps to a
-      // row_kind: exact `[ ]` -> 2 (row_more Tnil), open `[> ]` -> 0 (row_more
-      // Tvar, all RFpresent), upper `[< .. > present]` -> 1 (present tags
-      // RFpresent, the rest RFeither).  An abbreviation that INHERITS another
-      // polyvariant (`[ Simple.view | `Or ]`) is left abstract -- emitting only
-      // its direct tags would be an INCOMPLETE set (wrongly matching).
-      if (auto* pv = std::get_if<Ptyp_variant>(&d.manifest->get()->desc)) {
-        std::vector<std::string> tags; std::vector<cmi::cmiw::TyPtr> targs;
-        bool all_tag = true;
-        for (auto& rf : pv->rows) {
-          auto* rt = std::get_if<Rtag>(&rf);
-          if (!rt || rt->types.size() > 1) { all_tag = false; break; }  // inherit / `of t1 & t2`
-          tags.push_back(rt->name);
-          targs.push_back(rt->constant || rt->types.empty()
-                              ? nullptr
-                              : bridge_ty_named(ck.from_coretype(*rt->types[0], tvars),
-                                                bvars, nextvar, tvars));
-        }
-        if (all_tag && !tags.empty()) {
-          int rk; std::vector<std::string> present;
-          if (pv->closed == ClosedFlag::Open) rk = 0;            // `[> .. ]`
-          else if (pv->labels) { rk = 1; present = *pv->labels; }  // `[< .. > present]`
-          else rk = 2;                                            // `[ .. ]` exact
-          manifest = cmi::cmiw::ty_variant_row(std::move(tags), std::move(targs),
-                                               rk, std::move(present));
-        }
-      }
+      manifest = pv_row_manifest(ck, **d.manifest, tvars, bvars, nextvar);
       if (!manifest) manifest = bridge_ty_named(ck.from_coretype(**d.manifest, tvars), bvars, nextvar, tvars);
     }
     auto si = cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest);
@@ -9476,8 +9480,12 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
       }
       if (params.size() != tgt->params.size()) continue;  // arity mismatch: keep as-is
       tgt->params = std::move(params);
-      tgt->manifest = bridge_ty_named(ck.from_coretype(**td->manifest, tvars),
-                                      bvars, nextvar, tvars);
+      // `with type a = private [> `A]`: a polyvariant manifest keeps its row
+      // (the generic bridge degrades an open/upper row to a bare var).
+      tgt->manifest = pv_row_manifest(ck, **td->manifest, tvars, bvars, nextvar);
+      if (!tgt->manifest)
+        tgt->manifest = bridge_ty_named(ck.from_coretype(**td->manifest, tvars),
+                                        bvars, nextvar, tvars);
       tgt->type_private = (td->priv == PrivateFlag::Private);
     }
     m = pw->mt.get();
@@ -9671,6 +9679,9 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
               else  // a QUALIFIED parameter modtype (`MakeEngineTable (T :
                     // TableFormat.TABLES)`): resolve it so the ARGUMENT is projected.
                 param_sig = qual_modtype_items(*fn->type);
+              // `(Html5 : T with type 'a wrap = 'a)`: graft the refinements
+              // onto the resolved param sig (ocamlc stores them expanded).
+              apply_with_constraints(ck, *fn->type, param_sig);
               // A NAMED param modtype (`(Ord : OrderedType)`) is stored by
               // ocamlc as Mty_ident; the resolved sig stays the fallback.
               if (auto* pid = std::get_if<Pmty_ident>(&fn->type->desc))
@@ -9693,6 +9704,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
                   p.sig = signature_to_cmi(*psg2, &modtypes, &module_sigs);
                 else
                   p.sig = qual_modtype_items(*fn2->type);
+                apply_with_constraints(ck, *fn2->type, p.sig);
                 if (auto* pid2 = std::get_if<Pmty_ident>(&fn2->type->desc))
                   p.ref = lid_full(pid2->id.txt);
               }
@@ -9752,10 +9764,11 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     } else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
       // `module type S = sig .. end`: emit it so a functor parameter typed by S
       // (`Make (H : Hashtbl.HashedType)`) can resolve H's members to fields.
-      if (pmt->type)
-        if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
-          out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt,
-                                               signature_to_cmi(ps->items, &modtypes, &module_sigs)));
+      if (!pmt->type)  // ABSTRACT `module type S` in a signature
+        out.push_back(cmi::cmiw::sig_modtype_abstract(pmt->name.txt));
+      else if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
+        out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt,
+                                             signature_to_cmi(ps->items, &modtypes, &module_sigs)));
     } else if (std::get_if<Psig_class>(&it.desc) ||
                std::get_if<Psig_class_type>(&it.desc)) {
       // `class c : <arrows> -> object .. end` / `class type ct = object .. end`
@@ -10125,6 +10138,53 @@ static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
   return {};
 }
 
+// Resolve a module-type ANNOTATION position (a struct-side functor param or
+// result) into (ref, sig): a literal signature converts verbatim; a named ref
+// is kept as Mty_ident (a local decl's / dotted cmi's items stay the fallback
+// layout); `S with ..` resolves the base and grafts the refinements (ocamlc
+// stores those expanded -- a `with` can't stay a plain Mty_ident).
+static void annot_modtype_items(Checker* ckp, const ast::ModuleType& mt,
+                                std::string& ref,
+                                std::vector<cmi::cmiw::SigItem>& sig) {
+  if (auto* psg = std::get_if<Pmty_signature>(&mt.desc)) {
+    sig = signature_to_cmi(psg->items);
+  } else if (auto* pid = std::get_if<Pmty_ident>(&mt.desc)) {
+    ref = lid_full(pid->id.txt);
+    if (ckp && ref.find('.') == std::string::npos) {
+      if (auto q = ckp->opened_modtype_quals_.find(ref);
+          q != ckp->opened_modtype_quals_.end())
+        ref = q->second;
+      else if (auto a = ckp->modtype_sig_asts_.find(ref);
+               a != ckp->modtype_sig_asts_.end())
+        sig = signature_to_cmi(*a->second);
+    }
+    if (sig.empty() && ref.find('.') != std::string::npos)
+      sig = cmi_modtype_items(split_dotted(ref));
+  } else if (ckp && std::holds_alternative<Pmty_with>(mt.desc)) {
+    const ast::ModuleType* base = &mt;
+    while (auto* pw = std::get_if<Pmty_with>(&base->desc)) base = pw->mt.get();
+    if (auto* bid = std::get_if<Pmty_ident>(&base->desc)) {
+      std::string bref = lid_full(bid->id.txt);
+      if (bref.find('.') == std::string::npos) {
+        if (auto q = ckp->opened_modtype_quals_.find(bref);
+            q != ckp->opened_modtype_quals_.end())
+          bref = q->second;
+        else if (auto a = ckp->modtype_sig_asts_.find(bref);
+                 a != ckp->modtype_sig_asts_.end())
+          sig = signature_to_cmi(*a->second);
+      }
+      if (sig.empty() && bref.find('.') != std::string::npos)
+        sig = cmi_modtype_items(split_dotted(bref));
+    } else if (auto* bsg = std::get_if<Pmty_signature>(&base->desc)) {
+      sig = signature_to_cmi(bsg->items);
+    }
+    if (!sig.empty()) {
+      apply_with_constraints(*ckp, mt, sig);
+      drop_modsubst(sig, with_modsubst_names(mt));
+    }
+  }
+}
+
 // The Sig_module item for one module binding, by shape: a structure body is
 // inferred recursively; `module M : sig .. end = ..` takes the CONSTRAINT
 // signature verbatim (it is authoritative, like a .mli); a functor emits
@@ -10192,6 +10252,45 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           inner->modtype_ref = lid_full(pid->id.txt);
         return inner;
       }
+      if (std::holds_alternative<Pmty_functor>(mc->mt->desc)) {
+        // `module F2 : S1 -> S1 -> T = functor (X : S) -> ..`: ocamlc stores
+        // the ANNOTATION (an anonymous `S1 ->` param = Named(None, Mty_ident
+        // S1)), not the expression's named params / inferred body.
+        struct P { std::string name, ref; std::vector<cmi::cmiw::SigItem> sig;
+                   bool unit = false; };
+        std::vector<P> ps;
+        auto conv = [&](const ast::ModuleType& mt, std::string& ref,
+                        std::vector<cmi::cmiw::SigItem>& sig) {
+          annot_modtype_items(ckp, mt, ref, sig);
+        };
+        const ast::ModuleType* body = mc->mt.get();
+        while (auto* f = std::get_if<Pmty_functor>(&body->desc)) {
+          P p;
+          p.unit = std::holds_alternative<Functor_unit>(f->param);
+          if (auto* fn = std::get_if<Functor_named>(&f->param)) {
+            if (fn->name.txt) p.name = *fn->name.txt;
+            if (fn->type) conv(*fn->type, p.ref, p.sig);
+          }
+          ps.push_back(std::move(p));
+          body = f->body.get();
+        }
+        std::vector<cmi::cmiw::SigItem> result;
+        std::string result_ref;
+        conv(*body, result_ref, result);
+        auto item = cmi::cmiw::sig_module_functor(name, ps[0].name,
+                                                  std::move(ps[0].sig),
+                                                  std::move(result));
+        item.functor_result_ref = std::move(result_ref);
+        item.functor_unit = ps[0].unit;
+        item.functor_param_ref = std::move(ps[0].ref);
+        for (std::size_t i = 1; i < ps.size(); ++i) {
+          item.more_param_names.push_back(std::move(ps[i].name));
+          item.more_param_sigs.push_back(std::move(ps[i].sig));
+          item.more_param_units.push_back(ps[i].unit ? 1 : 0);
+          item.more_param_refs.push_back(std::move(ps[i].ref));
+        }
+        return item;
+      }
     }
     return module_binding_sigitem(name, *mc->me, prior, ckp);
   }
@@ -10220,6 +10319,10 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
                   q != ckp->opened_modtype_quals_.end())
                 p.ref = q->second;
           }
+          // `(Bar : S with type a = private [> `A])`: resolve S and graft the
+          // refinements (ocamlc stores the expanded, refined param sig).
+          if (std::holds_alternative<Pmty_with>(fn->type->desc))
+            annot_modtype_items(ckp, *fn->type, p.ref, p.sig);
         }
       }
       ps.push_back(std::move(p));
@@ -10232,6 +10335,29 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       for (auto& p : ps)
         if (!p.name.empty() && p.mt_ast) fps.emplace_back(p.name, p.mt_ast);
       result = infer_signature(bs->items, fps.empty() ? nullptr : &fps);
+    }
+    else if (auto* bi = std::get_if<Pmod_ident>(&cur->desc)) {
+      // `module Id (S : S) = S` (an identity functor): ocamlc's result is the
+      // PARAMETER's signature strengthened through the param path
+      // (`sig type 'a t = 'a S.t end`), not an empty sig.
+      if (auto* l = std::get_if<Lident>(&bi->id.txt.v))
+        for (auto& p : ps)
+          if (!p.name.empty() && p.name == l->name) {
+            if (!p.sig.empty())
+              result = p.sig;
+            else if (!p.ref.empty()) {
+              if (p.ref.find('.') == std::string::npos) {
+                if (ckp)
+                  if (auto a = ckp->modtype_sig_asts_.find(p.ref);
+                      a != ckp->modtype_sig_asts_.end())
+                    result = signature_to_cmi(*a->second);
+              } else {
+                result = cmi_modtype_items(split_dotted(p.ref));
+              }
+            }
+            strengthen_abstract(result, p.name);
+            break;
+          }
     }
     else if (auto* bc = std::get_if<Pmod_constraint>(&cur->desc)) {
       if (bc->mt) {
@@ -10249,6 +10375,12 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
                      a != ckp->modtype_sig_asts_.end())
               result = signature_to_cmi(*a->second);
           }
+        }
+        else if (std::holds_alternative<Pmty_with>(bc->mt->desc)) {
+          // `module Apply (Arg : ..) : S with type elt = Arg.t = struct ..`:
+          // resolve S and graft the refinements (ocamlc stores them expanded).
+          std::string wref;
+          annot_modtype_items(ckp, *bc->mt, wref, result);
         }
       }
     }
@@ -10294,9 +10426,13 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     std::vector<cmi::cmiw::SigItem> result;
     bool resolved = false;
     if (comps.size() == 1 && prior) {  // a local functor emitted earlier
+      // An EMPTY result sig is legitimate (`module F (A : ..) = struct let _ =
+      // .. end; module B = F(X)` -- ocamlc emits `module B : sig end`);
+      // requiring items here dropped B entirely (a layout shift, B takes a
+      // runtime field).
       for (auto& si : *prior)
         if (si.k == cmi::cmiw::SigItem::Module && si.is_functor &&
-            si.name == comps[0] && !si.sub.empty() &&
+            si.name == comps[0] &&
             args.size() == 1 + si.more_param_names.size()) {
           pnames.push_back(si.functor_param);
           for (auto& n : si.more_param_names) pnames.push_back(n);
@@ -10589,9 +10725,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       // `module type S = sig .. end` in a .ml (no .mli): emit Sig_modtype so the
       // inferred .cmi carries it (a modtype takes no runtime field, so it never
       // shifts the value layout).  Only the signature body is representable yet.
-      if (pmt->type)
-        if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
-          out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
+      if (!pmt->type)  // ABSTRACT `module type S` in a struct (pr7112)
+        out.push_back(cmi::cmiw::sig_modtype_abstract(pmt->name.txt));
+      else if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
+        out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
     } else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
       // `class c [params] = object .. end`: emit Sig_class (the writer adds
       // the two ghost companions).  Member TYPES come from the checker

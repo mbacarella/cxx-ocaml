@@ -387,6 +387,9 @@ struct SigItem {
   // `class type ct = object .. end`: emit only Sig_class_type + its ghost
   // Sig_type (TWO stamps); arrows/cty_new don't apply.
   bool class_is_type = false;
+  // Modtype: an ABSTRACT declaration `module type S` -- mtd_type = None
+  // (Printtyp prints it back as bare `module type S`).
+  bool modtype_abstract = false;
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
                                   std::vector<SigItem> param_sig,
@@ -403,6 +406,11 @@ inline SigItem sig_module(std::string n, std::vector<SigItem> items) {
 // functor parameter `(H : Hashtbl.HashedType)` resolve H.equal/H.hash to fields.
 inline SigItem sig_modtype(std::string n, std::vector<SigItem> items) {
   SigItem s; s.k = SigItem::Modtype; s.name = std::move(n); s.sub = std::move(items); return s;
+}
+// An ABSTRACT `module type S` (no body): mtd_type = None.
+inline SigItem sig_modtype_abstract(std::string n) {
+  SigItem s; s.k = SigItem::Modtype; s.name = std::move(n); s.modtype_abstract = true;
+  return s;
 }
 // An `exception E [of t1 * ..]` declaration.  Emitted as Sig_typext over the
 // predefined `exn` type; TAKES A RUNTIME FIELD, so it must appear in the .cmi to
