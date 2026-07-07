@@ -10696,7 +10696,6 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       // Member types come straight from the written coretypes.
       int ct_rs = 1;
       for (auto& d : pct->decls) {
-        if (!d.params.empty()) continue;  // ['a] class types not representable yet
         auto* cs = std::get_if<Pcty_signature>(&d.expr.desc);
         if (!cs) continue;
         cmi::cmiw::SigItem ci;
@@ -10707,6 +10706,14 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         ci.class_virtual = (d.virt == VirtualFlag::Virtual);
         std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
         std::unordered_map<std::string, TypePtr> tv;  // shared 'a across members
+        // `['a] o2` class-type params: pre-bind each so members and cty_params
+        // share the same tvar node (Printtyp names them consistently).
+        std::vector<TypePtr> ctparams;
+        for (auto& p : d.params) {
+          TypePtr v = ck.eng.fresh_var();
+          if (auto* pv = std::get_if<Ptyp_var>(&p->desc)) tv[pv->name] = v;
+          ctparams.push_back(v);
+        }
         bool ok = true;
         for (auto& cf : cs->cs.fields) {
           if (auto* pv = std::get_if<Pctf_val>(&cf.desc)) {
@@ -10730,6 +10737,18 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             break;
           }
         }
+        // cty_params (after members, so their tvars already have numbers), plus
+        // the `object ('a)` self-param index (its self type IS a class param).
+        for (std::size_t pi = 0; pi < d.params.size(); ++pi) {
+          auto pv = bridge_ty(ctparams[pi], cvars, cnext);
+          if (std::holds_alternative<Ptyp_any>(d.params[pi]->desc)) pv->var_name = "_";
+          ci.class_params.push_back(pv);
+        }
+        if (!ci.class_params.empty())
+          if (auto* sv = std::get_if<Ptyp_var>(&cs->cs.self->desc); sv && !sv->name.empty())
+            for (std::size_t pi = 0; pi < d.params.size(); ++pi)
+              if (auto* pv = std::get_if<Ptyp_var>(&d.params[pi]->desc); pv && pv->name == sv->name)
+                ci.class_self_param = (int)pi;
         if (ok) out.push_back(std::move(ci));
       }
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
