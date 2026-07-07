@@ -3074,7 +3074,20 @@ struct Checker {
       else {
         std::vector<TypePtr> params;
         for (auto& p : te.params) params.push_back(from_coretype(*p, vars));
-        result = is_exn ? eng.constr("exn") : eng.constr(lid_last(te.path.txt), params);
+        // A DOTTED extended type (`type Common.msg += Reload ..`) keeps its
+        // qualified path (typext_path semantics): a bare "msg" resolves to no
+        // local decl, so the ctor's uses (and the cmi writer) degrade to a
+        // var.  Non-strict only -- the strict pass would false-reject a
+        // dotted-vs-bare unification against the module's own exports.
+        std::string tpath = lid_last(te.path.txt);
+        if (!strict && std::holds_alternative<Ldot>(te.path.txt.v)) {
+          tpath = lid_full(te.path.txt);
+          if (auto dot = tpath.find('.'); dot != std::string::npos)
+            if (auto q = opened_submod_quals_.find(tpath.substr(0, dot));
+                q != opened_submod_quals_.end())
+              tpath = q->second + tpath.substr(dot);
+        }
+        result = is_exn ? eng.constr("exn") : eng.constr(tpath, params);
       }
       TypePtr scheme = result;
       if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
