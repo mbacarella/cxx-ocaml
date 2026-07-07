@@ -10582,6 +10582,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         std::unordered_map<std::string, TypePtr> vtypes;
         if (auto f = ck.class_instvars_.find(d.name.txt); f != ck.class_instvars_.end())
           for (auto& [vn, vt] : f->second) vtypes[vn] = vt;
+        std::unordered_set<std::string> own_meths, own_vals;
         for (auto& cf : pst->cs.fields) {
           if (auto* pv = std::get_if<Pcf_val>(&cf.desc)) {
             cmi::cmiw::ClassField f;
@@ -10596,6 +10597,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             } else {
               f.ty = cmi::cmiw::ty_var(cnext++);
             }
+            own_vals.insert(f.name);
             ci.class_fields.push_back(std::move(f));
           } else if (auto* pm = std::get_if<Pcf_method>(&cf.desc)) {
             cmi::cmiw::ClassField f;
@@ -10611,7 +10613,31 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             } else {
               f.ty = cmi::cmiw::ty_var(cnext++);
             }
+            own_meths.insert(f.name);
             ci.class_fields.push_back(std::move(f));
+          }
+        }
+        // `inherit P [args]`: P's members are part of this class' signature too.
+        // Splice the (already-emitted) parent SigItem's fields that this class
+        // does not itself override (intext's `class bar = object inherit foo ..`
+        // carries foo's data1..3 / test1..4).  Best-effort: only a same-signature
+        // local parent, found by name in `out`.
+        for (auto& cf : pst->cs.fields) {
+          auto* inh = std::get_if<Pcf_inherit>(&cf.desc);
+          if (!inh) continue;
+          const ast::ClassExpr* pce = inh->ce.get();
+          while (auto* ap = std::get_if<Pcl_apply>(&pce->desc)) pce = ap->ce.get();
+          auto* pc = std::get_if<Pcl_constr>(&pce->desc);
+          if (!pc) continue;
+          std::string pname = lid_last(pc->id.txt);
+          for (auto& pit : out) {
+            if (pit.k != cmi::cmiw::SigItem::Class || pit.name != pname) continue;
+            for (auto& pf : pit.class_fields) {
+              auto& seen = pf.is_method ? own_meths : own_vals;
+              if (!seen.insert(pf.name).second) continue;  // overridden / already have
+              ci.class_fields.push_back(pf);  // copy the parent's typed field
+            }
+            break;
           }
         }
         out.push_back(std::move(ci));
