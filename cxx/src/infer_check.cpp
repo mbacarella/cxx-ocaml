@@ -1364,6 +1364,14 @@ struct Checker {
   // Names brought into bare module scope by `open M` / `include M` (M's submodules)
   // -- so a reference to one of them is not flagged unbound.
   std::set<std::string> opened_submodules_;
+  // Enclosing-scope `open M` module paths to replay before this checker's own
+  // body is inferred.  The emission pass re-infers each submodule with a FRESH
+  // checker (module_binding_sigitem -> infer_signature), which otherwise loses
+  // the outer file's opens -- so `open Printf; module M = struct let f x =
+  // eprintf "%s" (List.hd x) end` degraded M.f's arg to a fresh var (the format
+  // constraint on `eprintf`, unresolvable when `eprintf` is unbound, never
+  // fired).  Set from g_inherited_opens; applied by run_checker.
+  std::vector<const ast::Longident*> replay_opens_;
   // The head module of a path is unbound: not a local module/functor, not opened,
   // and no loadable cmi.  Conservative -- used only to record a soundness error.
   // Module names bound somewhere in this file that the value resolution doesn't
@@ -7320,6 +7328,22 @@ struct Checker {
     for (auto& [k, v] : resolve_module_values(m)) venv.back()[k] = v;
   }
 
+  // Replay an enclosing-scope `open M` (module identifier) into this checker's
+  // top scope: values, submodule names, record fields, and (non-strict)
+  // ctor/type/alias qualifications -- mirroring the structure-level Pstr_open
+  // path so a re-inferred submodule body sees the same names.
+  void replay_open_module(const Longident& m) {
+    for (auto& [k, v] : resolve_module_values(m)) venv.back()[k] = v;
+    for (auto& s : module_submodule_names(m)) opened_submodules_.insert(s);
+    load_module_record_fields(m);
+    load_open_submod_quals(m);
+    if (!strict) {
+      load_open_type_quals(m);
+      open_module_ctors(m);
+      load_open_module_aliases(m);
+    }
+  }
+
   // The value exports of a module expression (value name -> scheme).
   std::unordered_map<std::string, TypePtr> module_exports(const ModuleExpr& me) {
     if (auto* ms = std::get_if<Pmod_structure>(&me.desc)) {
@@ -8058,6 +8082,9 @@ static void run_checker(Checker& ck, const ast::Structure& s) {
       if (mb->binding.name.txt && *mb->binding.name.txt == "Stdlib")
         ck.user_stdlib_module_ = true;
   register_types_rec(ck, s);
+  // Replay enclosing-scope opens (set by infer_signature when re-inferring a
+  // submodule) so this level's value inference sees the outer file's `open`s.
+  for (auto* m : ck.replay_opens_) ck.replay_open_module(*m);
   ck.load_open_record_fields(s);
   ck.finalize_fields();
   ck.check_cyclic_aliases();
@@ -10686,6 +10713,11 @@ static const std::unordered_map<std::string, std::string>*
 // infer_signature call; restored so recursion nests correctly).
 static const std::vector<cmi::cmiw::SigItem>* g_outer_prior = nullptr;
 
+// Enclosing-scope `open M` module paths active where a submodule is emitted, so
+// its re-inference (a fresh Checker) sees the outer file's opens.  Set around
+// the submodule's infer_signature call; restored so recursion nests correctly.
+static const std::vector<const ast::Longident*>* g_inherited_opens = nullptr;
+
 // Strengthen a functor-application result whose arguments are all PATHS: every
 // abstract type gets the applied-functor manifest ocamlc records
 // (`module S = Set.Make(Loc)` gives `type t = Set.Make(Loc).t`), recursively
@@ -11581,6 +11613,13 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // must be best-effort like the display pass (see infer_structure_types).
   ck.eng.lenient = true;
   ck.fold_abbrevs_ = true;
+  // Enclosing-scope opens (this file is a re-inferred submodule): replay them so
+  // its value inference matches the main pass, which typed it with those opens
+  // in scope.  `active` accumulates them plus this level's own opens, for
+  // deeper submodules.
+  std::vector<const ast::Longident*> active;
+  if (g_inherited_opens) active = *g_inherited_opens;
+  ck.replay_opens_ = active;
   // Enclosing functor parameters: bind each param's value members with their
   // REAL declared types (same registration the main pass does at its functor
   // harvest), so body exports don't degrade to fresh vars.  The outer file's
@@ -11650,7 +11689,16 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   }
   std::vector<cmi::cmiw::SigItem> out;
   g_enclosing_struct_items = &out;  // sig-side `module type of <local module>`
+  // A submodule emitted below is re-inferred with a fresh checker; hand it the
+  // opens active here (inherited + this level's, accumulated in source order).
+  auto* saved_inherited_opens = g_inherited_opens;
+  g_inherited_opens = &active;
   for (auto& it : s) {
+    if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
+      if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc);
+          pi && !std::holds_alternative<Lapply>(pi->id.txt.v))
+        active.push_back(&pi->id.txt);
+    }
     if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
       for (auto& b : sv->bindings) {
         std::vector<std::string> names;
@@ -12293,6 +12341,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   g_outer_modtype_asts = saved_mt_asts;
   g_outer_modtype_quals = saved_mt_quals;
   g_enclosing_struct_items = saved_enclosing;
+  g_inherited_opens = saved_inherited_opens;
   return out;
 }
 
