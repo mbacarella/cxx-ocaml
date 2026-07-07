@@ -10078,6 +10078,11 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
   Checker ck;
   ck.record_kinds_ = true;
   ck.keep_local_abbrevs_ = true;  // verbatim path: `t` stays `t`, not its manifest
+  // Keep CROSS-MODULE source abbreviations as written too: a declared
+  // `val to_seq : t -> float Seq.t` stores Seq.t, not its manifest expansion
+  // `unit -> float Seq.node` (floatarray's module type S).
+  ck.fold_abbrevs_ = true;
+  ck.eng.lenient = true;  // fold_abbrevs_ requires best-effort unification
   // Collect `module type S = sig .. end` so a functor result `: S` (Map.Make)
   // can be resolved to S's signature items.  Inherit ENCLOSING modtypes too: a
   // nested signature (`module type S = sig include Thing; module Map : Map end`
