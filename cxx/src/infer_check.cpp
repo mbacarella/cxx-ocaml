@@ -9771,6 +9771,54 @@ static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
       si.modtype_ref = origin + "." + si.modtype_ref;
     return si;
   }
+  if (md.type && md.type->kind == cmi::ModuleType::Functor) {
+    // A FUNCTOR member (Hashtbl's Make): rebuild the curried parameter chain
+    // and result so a spliced signature round-trips it (previously an opaque
+    // `sig end` -- same field count, but the printed sig lost the functor).
+    // A bare Mty_ident param ref ("HashedType") stays bare: the sibling
+    // modtype item travels in the same spliced signature.
+    struct P {
+      std::string name, ref;
+      std::vector<cmi::cmiw::SigItem> sig;
+      bool unit = false;
+    };
+    std::vector<P> ps;
+    const cmi::ModuleType* cur = md.type.get();
+    while (cur && cur->kind == cmi::ModuleType::Functor) {
+      P p;
+      p.unit = cur->functor_unit;
+      if (cur->functor_param) p.name = *cur->functor_param;
+      if (const cmi::ModuleType* pt = cur->functor_param_type.get()) {
+        if (pt->kind == cmi::ModuleType::Sig && pt->sig)
+          p.sig = cmi_sig_to_items(*pt->sig, origin);
+        else if (pt->kind == cmi::ModuleType::Ident && pt->path)
+          p.ref = bare_cmi_path(*pt->path);
+      }
+      ps.push_back(std::move(p));
+      cur = cur->functor_body.get();
+    }
+    std::vector<cmi::cmiw::SigItem> result;
+    std::string result_ref;
+    if (cur) {
+      if (cur->kind == cmi::ModuleType::Sig && cur->sig)
+        result = cmi_sig_to_items(*cur->sig, origin);
+      else if (cur->kind == cmi::ModuleType::Ident && cur->path)
+        result_ref = bare_cmi_path(*cur->path);
+    }
+    auto item = cmi::cmiw::sig_module_functor(name, ps[0].name,
+                                              std::move(ps[0].sig),
+                                              std::move(result));
+    item.functor_unit = ps[0].unit;
+    item.functor_param_ref = std::move(ps[0].ref);
+    item.functor_result_ref = std::move(result_ref);
+    for (std::size_t i = 1; i < ps.size(); ++i) {
+      item.more_param_names.push_back(std::move(ps[i].name));
+      item.more_param_sigs.push_back(std::move(ps[i].sig));
+      item.more_param_units.push_back(ps[i].unit ? 1 : 0);
+      item.more_param_refs.push_back(std::move(ps[i].ref));
+    }
+    return item;
+  }
   return cmi::cmiw::sig_module(name, {});  // opaque, but keeps the field
 }
 
@@ -9949,6 +9997,28 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
 // resolve `module type of Foo` where Foo is a local struct module (t02's
 // `module type Gee = sig module M : module type of Foo .. end`).
 static const std::vector<cmi::cmiw::SigItem>* g_enclosing_struct_items = nullptr;
+
+// Enclosing-scope `open M` module paths active where a submodule is emitted, so
+// its re-inference (a fresh Checker) sees the outer file's opens.  Set around
+// the submodule's infer_signature call; restored so recursion nests correctly.
+static const std::vector<const ast::Longident*>* g_inherited_opens = nullptr;
+
+// `module type of <path>` resolution (Typemod.type_module_type_of +
+// Mtype.remove_aliases): the path's DECLARED module type with aliases
+// expanded.  The result is strengthened at the NORMALIZED path exactly when
+// resolution passed through an alias binding -- a plain local module or a
+// direct -I unit stays abstract, while `module Alias = M`, an aliased member
+// of an opened module, or a stdlib unit (reached through the `Stdlib.X`
+// alias member) all strengthen.
+struct TypeofResolved {
+  std::vector<cmi::cmiw::SigItem> items;
+  std::string norm;           // normalized path (strengthening base)
+  bool through_alias = false; // resolution crossed an alias -> strengthen
+  bool ok = false;
+};
+static TypeofResolved resolve_typeof_path(
+    const std::vector<cmi::cmiw::SigItem>* scope, const std::string& dotted,
+    int depth = 0);
 
 static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
                                   const std::function<void(std::string&)>& fn);
@@ -10549,11 +10619,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       // included members are absent and the field layout is short of the .cmo.
       if (auto* pto = std::get_if<Pmty_typeof>(&pinc->mt.desc)) {
         if (auto* pi = std::get_if<Pmod_ident>(&pto->me->desc))
-          if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) {
+          if (!std::holds_alternative<Lapply>(pi->id.txt.v)) {
             // A LOCAL struct module shadows a compilation unit of the same
             // name: splice its already-emitted items (t02's Gee).
             bool local = false;
-            if (g_enclosing_struct_items)
+            if (auto* l = std::get_if<Lident>(&pi->id.txt.v);
+                l && g_enclosing_struct_items)
               for (auto& si : *g_enclosing_struct_items)
                 if (si.k == cmi::cmiw::SigItem::Module && si.name == l->name &&
                     !si.is_functor && si.alias.empty()) {
@@ -10561,10 +10632,21 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
                   local = true;
                   break;
                 }
-            if (!local) try {
-              auto cmi = cmi::CmiFile::load(head_cmi(l->name));
-              for (auto& si : cmi_sig_to_items(cmi.sig(), l->name)) out.push_back(std::move(si));
-            } catch (...) {}
+            // Otherwise resolve the path like `module type of` everywhere:
+            // through opened local modules, alias chains (strengthening at
+            // the normalized path), or a unit's cmi (a stdlib unit routes
+            // through the Stdlib alias member, so it strengthens too --
+            // `include module type of Hashtbl` records `= ('a, 'b)
+            // Stdlib__Hashtbl.t` manifests; gatien_baron's Hash2).
+            if (!local) {
+              auto t = resolve_typeof_path(g_enclosing_struct_items,
+                                           lid_full(pi->id.txt));
+              if (t.ok) {
+                if (t.through_alias)
+                  strengthen_abstract(t.items, t.norm, false);
+                for (auto& si : t.items) out.push_back(std::move(si));
+              }
+            }
           }
       } else if (const ast::Signature* bs = body_sig(pinc->mt)) {
         // `include S` (named local modtype) / `include sig .. end`
@@ -10757,11 +10839,6 @@ static const std::unordered_map<std::string, std::string>*
 // infer_signature call; restored so recursion nests correctly).
 static const std::vector<cmi::cmiw::SigItem>* g_outer_prior = nullptr;
 
-// Enclosing-scope `open M` module paths active where a submodule is emitted, so
-// its re-inference (a fresh Checker) sees the outer file's opens.  Set around
-// the submodule's infer_signature call; restored so recursion nests correctly.
-static const std::vector<const ast::Longident*>* g_inherited_opens = nullptr;
-
 // Strengthen a functor-application result whose arguments are all PATHS: every
 // abstract type gets the applied-functor manifest ocamlc records
 // (`module S = Set.Make(Loc)` gives `type t = Set.Make(Loc).t`), recursively
@@ -10790,6 +10867,25 @@ static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
       } else {
         strengthen_abstract(si.sub, app + "." + si.name, false);
       }
+    } else if (si.k == cmi::cmiw::SigItem::Module && si.is_functor &&
+               si.alias.empty() && !si.functor_unit && !aliasable) {
+      // An APPLICATIVE functor member: Mtype.strengthen strengthens its
+      // RESULT at Papply(p.F, param) -- `type 'a t = 'a Stdlib__Hashtbl.
+      // Make(H).t`.  A generative `()` param doesn't strengthen; an anonymous
+      // param is skipped (the writer binds only NAMED params, so a synthetic
+      // "Arg" head would emit an unresolvable path).
+      std::string ap = app + "." + si.name;
+      ap += si.functor_param.empty() ? "" : "(" + si.functor_param + ")";
+      bool strengthenable = !si.functor_param.empty();
+      for (std::size_t i = 0;
+           strengthenable && i < si.more_param_names.size(); ++i) {
+        if ((i < si.more_param_units.size() && si.more_param_units[i]) ||
+            si.more_param_names[i].empty())
+          strengthenable = false;
+        else
+          ap += "(" + si.more_param_names[i] + ")";
+      }
+      if (strengthenable) strengthen_abstract(si.sub, ap, false);
     }
   }
 }
@@ -10952,6 +11048,100 @@ static void annot_modtype_items(Checker* ckp, const ast::ModuleType& mt,
 // surrounding checker (opened-submodule heads: `open MoreLabels` + Map.Make
 // must take the LABELLED Map).  Null when the shape isn't representable yet
 // (unpack, unresolvable application).
+static TypeofResolved resolve_typeof_path(
+    const std::vector<cmi::cmiw::SigItem>* scope, const std::string& dotted,
+    int depth) {
+  TypeofResolved r;
+  if (depth > 8 || dotted.empty() ||
+      dotted.find('(') != std::string::npos)  // no functor-application paths
+    return r;
+  std::vector<std::string> comps = split_dotted(dotted);
+  std::vector<cmi::cmiw::SigItem> items;  // current module's members
+  std::string norm;                       // its normalized path so far
+  bool ta = false;
+  std::size_t next = 1;  // first comps index still to descend
+  // HEAD: an emitted local module -- directly in scope, or a member of an
+  // `open`ed local module (gatien_baron's `open Std; .. module type of Hash`).
+  const cmi::cmiw::SigItem* head = nullptr;
+  if (scope)
+    for (auto& si : *scope)
+      if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[0]) {
+        head = &si;
+        break;
+      }
+  cmi::cmiw::SigItem opened_head;  // owns a member found through an open
+  if (!head && scope && g_inherited_opens)
+    for (auto oi = g_inherited_opens->rbegin();
+         oi != g_inherited_opens->rend() && !head; ++oi) {
+      auto op = resolve_typeof_path(scope, lid_full(**oi), depth + 1);
+      if (!op.ok) continue;
+      for (auto& si : op.items)
+        if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[0]) {
+          opened_head = std::move(si);
+          head = &opened_head;
+          break;
+        }
+    }
+  if (head) {
+    if (!head->alias.empty()) {
+      // Chase the alias: re-resolve its target plus our remaining components
+      // from the top scope (best effort -- the target was written in the
+      // aliasing module's own context, but a local sibling or unit name
+      // resolves the same from here).
+      std::string rest = head->alias;
+      for (std::size_t i = 1; i < comps.size(); ++i) rest += "." + comps[i];
+      auto t = resolve_typeof_path(scope, rest, depth + 1);
+      if (t.ok) t.through_alias = true;
+      return t;
+    }
+    if (head->is_functor) return r;
+    items = head->sub;
+    norm = comps[0];
+  } else {
+    // A compilation unit.  A bare stdlib name resolves through the `Stdlib.X`
+    // alias member, so it normalizes to the MANGLED unit and strengthens; a
+    // direct -I unit is a plain persistent signature (no alias, abstract).
+    std::string ucmi = head_cmi(comps[0]);
+    if (!std::filesystem::exists(ucmi)) return r;
+    try {
+      auto cmif = cmi::CmiFile::load(ucmi);
+      items = cmi_sig_to_items(cmif.sig(), comps[0]);
+      norm = cmif.module_name().empty() ? comps[0] : cmif.module_name();
+    } catch (...) {
+      return r;
+    }
+    std::string base = ucmi.substr(ucmi.rfind('/') + 1);
+    ta = base.rfind("stdlib__", 0) == 0 &&
+         comps[0].rfind("Stdlib__", 0) != 0;
+  }
+  for (; next < comps.size(); ++next) {
+    const cmi::cmiw::SigItem* m = nullptr;
+    for (auto& si : items)
+      if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[next]) {
+        m = &si;
+        break;
+      }
+    if (!m) return r;
+    if (!m->alias.empty()) {
+      std::string rest = m->alias;
+      for (std::size_t i = next + 1; i < comps.size(); ++i)
+        rest += "." + comps[i];
+      auto t = resolve_typeof_path(scope, rest, depth + 1);
+      if (t.ok) t.through_alias = true;
+      return t;
+    }
+    if (m->is_functor) return r;
+    auto sub = m->sub;
+    items = std::move(sub);
+    norm += "." + comps[next];
+  }
+  r.items = std::move(items);
+  r.norm = std::move(norm);
+  r.through_alias = ta;
+  r.ok = true;
+  return r;
+}
+
 static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     const std::string& name, const ast::ModuleExpr& me,
     const std::vector<cmi::cmiw::SigItem>* prior = nullptr,
@@ -11068,6 +11258,21 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           apply_with_constraints(*ckp, *mc->mt, items);
           drop_modsubst(items, with_modsubst_names(*mc->mt));
           return cmi::cmiw::sig_module(name, std::move(items));
+        }
+      }
+      if (auto* pto = std::get_if<Pmty_typeof>(&mc->mt->desc)) {
+        // `module Hash1 : module type of Hash = Hash` / `module M' : module
+        // type of Std'.M = Std2.M`: the ascription is authoritative -- ocamlc
+        // records the typeof signature (strengthened iff the path crossed an
+        // alias), NOT an alias to the RHS (gatien_baron).
+        if (auto* pi2 = std::get_if<Pmod_ident>(&pto->me->desc);
+            pi2 && !std::holds_alternative<Lapply>(pi2->id.txt.v)) {
+          auto t = resolve_typeof_path(prior ? prior : g_enclosing_struct_items,
+                                       lid_full(pi2->id.txt));
+          if (t.ok) {
+            if (t.through_alias) strengthen_abstract(t.items, t.norm, false);
+            return cmi::cmiw::sig_module(name, std::move(t.items));
+          }
         }
       }
       if (auto* pid = std::get_if<Pmty_ident>(&mc->mt->desc)) {
