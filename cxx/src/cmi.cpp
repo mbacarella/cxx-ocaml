@@ -1146,12 +1146,22 @@ struct TyEmit {
   }
   std::unordered_map<const Ty*, o::ValPtr> shared_nodes;
   o::ValPtr emit(const TyPtr& t) {
-    if (t->k != Ty::Var)
-      if (auto it = shared_nodes.find(t.get()); it != shared_nodes.end())
-        return it->second;
+    if (t->k == Ty::Var) return emit_fresh(t);
+    if (auto it = shared_nodes.find(t.get()); it != shared_nodes.end())
+      return it->second;
+    // Register a type_expr shell BEFORE emitting the children so a CYCLIC Ty
+    // graph (a recursive row/object, `< bark : 'a -> unit > t as 'a`) closes
+    // back onto this node; omarshal's seen-map turns the loop into a
+    // CODE_SHARED back-reference, which is exactly how ocamlc stores it.
+    o::ValPtr shell = texpr(o::vint(0));
+    shared_nodes[t.get()] = shell;
     o::ValPtr res = emit_fresh(t);
-    if (t->k != Ty::Var) shared_nodes[t.get()] = res;
-    return res;
+    if (res->k != o::Value::Block) {  // degenerate fallback, not a type_expr
+      shared_nodes[t.get()] = res;
+      return res;
+    }
+    shell->fields = res->fields;
+    return shell;
   }
   o::ValPtr emit_fresh(const TyPtr& t) {
     switch (t->k) {

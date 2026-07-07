@@ -9169,7 +9169,11 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
 // Any becomes a fresh var (opaque).  Constr paths are passed through -- the cmi
 // writer keeps predefined ones and renders the rest as opaque vars.
 struct BridgeCtx {
-  std::unordered_set<const I::Type*> visiting;   // cycle guard (recursive rows)
+  // In-progress nodes, pre-registered before their children bridge: a CYCLIC
+  // engine graph (a recursive row/object, `< bark : 'a -> unit > t as 'a`)
+  // closes back onto the one node instead of unrolling; the writer marshals
+  // the loop as a CODE_SHARED back-reference and Printtyp prints `as 'a`.
+  std::unordered_map<const I::Type*, cmi::cmiw::TyPtr> in_progress;
   std::unordered_map<const I::Type*, cmi::cmiw::TyPtr> nodes;  // shared rows -> one Ty node
   // SOURCE names for engine vars (a type decl's coretype tvars map reversed):
   // a GADT ctor's existential (`Test : 'b * 'a * ..`) keeps its written name.
@@ -9235,6 +9239,9 @@ static cmi::cmiw::TyPtr bridge_label_ty(Checker& ck, const ast::CoreType& ct,
         pids.push_back(vi->second);
   return cmi::cmiw::ty_poly(std::move(b), std::move(pids));
 }
+static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
+                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
+                                       BridgeCtx& ctx);
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
                                       BridgeCtx& ctx) {
@@ -9248,6 +9255,27 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
       t->kind != I::Type::Kind::Object)
     if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end())
       return it->second;
+  if (t->kind == I::Type::Kind::Var || t->kind == I::Type::Kind::Link)
+    return bridge_ty_body(t, vars, nextvar, ctx);
+  // Pre-register an in-progress node: a cycle through this node returns it
+  // instead of unrolling/degrading, and the finished shape is grafted in
+  // below.  A body result that nothing cycled onto is returned as-is.
+  if (auto it = ctx.in_progress.find(t.get()); it != ctx.in_progress.end())
+    return it->second;
+  auto node = std::make_shared<cmi::cmiw::Ty>();
+  ctx.in_progress[t.get()] = node;
+  auto res = bridge_ty_body(t, vars, nextvar, ctx);
+  ctx.in_progress.erase(t.get());
+  if (node.use_count() == 1) return res;  // no cycle closed onto the node
+  *node = *res;  // graft (copy: res may be a previously-registered shared node)
+  // A registration the body just made must keep pointing at the SURVIVING node.
+  if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end() && it->second == res)
+    it->second = node;
+  return node;
+}
+static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
+                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
+                                       BridgeCtx& ctx) {
   auto bridge_ty = [&](const TypePtr& u, std::unordered_map<const I::Type*, int>& v, int& nv) {
     return bridge_ty_rec(u, v, nv, ctx);
   };
@@ -9275,12 +9303,11 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
     case K::Object: {  // structural object `< m1 : t1; m2 : t2 [; ..] >`
       // A row referenced twice in one scheme must bridge to ONE Ty node (the
       // writer then marshals it shared and Printtyp names it `as 'a`); a
-      // RECURSIVE object type (`< bark : 'self -> unit > as 'self`) is a cycle
-      // the writer can't express -- degrade the inner occurrence to a var.
+      // RECURSIVE object type (`< bark : 'self -> unit > as 'self`) closes
+      // through the wrapper's in_progress node.
       // Named class-type objects (abbrev, `(T1,T2) ops`) stay opaque for now.
       if (!t->abbrev.empty()) return cmi::cmiw::ty_var(nextvar++);
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
-      if (!ctx.visiting.insert(t.get()).second) return cmi::cmiw::ty_var(nextvar++);
       std::vector<cmi::cmiw::TyPtr> mtys;
       for (std::size_t mi = 0; mi < t->args.size(); ++mi) {
         // A WRITTEN poly method `< m : 'a. 'a t >` (binders recorded by
@@ -9305,7 +9332,6 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
           mtys.push_back(bridge_ty(t->args[mi], vars, nextvar));
         }
       }
-      ctx.visiting.erase(t.get());
       auto ty = cmi::cmiw::ty_object(t->labels, std::move(mtys));
       // engine variant_kind 1 on an Object marks an OPEN row (`< ..; .. >`)
       if (t->variant_kind == 1) ty->row_kind = 0;
@@ -9313,14 +9339,9 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
       return ty;
     }
     case K::Variant: {  // polymorphic-variant row
-      // Cycle guard FIRST: a fixpoint row is its own abbreviation argument
-      // (`'a lambda as 'a`), so even the abbrev branch below can recurse into
-      // this same node -- degrade the inner occurrence to a var.
-      if (!ctx.visiting.insert(t.get()).second) return cmi::cmiw::ty_var(nextvar++);
-      struct Guard {
-        BridgeCtx& c; const I::Type* p;
-        ~Guard() { c.visiting.erase(p); }
-      } guard{ctx, t.get()};
+      // A fixpoint row (`'a lambda as 'a`) recursing into this same node --
+      // even through the abbrev branch below -- closes onto the wrapper's
+      // in_progress node.
       // An abbreviated EXACT row (`val crash : var_t`) is stored by ocamlc as a
       // plain Tconstr of the abbreviation, not the expanded row.
       if (!t->abbrev.empty() && t->variant_kind == 2 && !t->from_inherit) {
