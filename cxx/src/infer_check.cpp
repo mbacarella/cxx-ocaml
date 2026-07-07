@@ -9737,6 +9737,50 @@ struct FunctorArgSubst {
   std::string arg_path;  // path argument ("String", "Digest.MD5")
   std::unordered_map<std::string, cmi::cmiw::TyPtr> manifests;  // struct argument
 };
+// Does `name` contain `comp` as a whole PATH COMPONENT?  Components are
+// delimited by '.', '(' and ')' -- so "Ord" is found in "Ord.t" and in
+// "Map.Make(Ord).t" but not in "Order.t".
+static bool path_has_component(const std::string& name, const std::string& comp) {
+  for (std::size_t p = name.find(comp); p != std::string::npos;
+       p = name.find(comp, p + 1)) {
+    bool lok = p == 0 || name[p - 1] == '.' || name[p - 1] == '(';
+    std::size_t e = p + comp.size();
+    bool rok = e == name.size() || name[e] == '.' || name[e] == ')' || name[e] == '(';
+    if (lok && rok) return true;
+  }
+  return false;
+}
+// Rewrite every whole-component occurrence of `comp` in a path to `repl`.
+static std::string path_replace_component(const std::string& name,
+                                          const std::string& comp,
+                                          const std::string& repl) {
+  std::string out;
+  for (std::size_t p = 0; p < name.size();) {
+    if (name.compare(p, comp.size(), comp) == 0) {
+      bool lok = p == 0 || name[p - 1] == '.' || name[p - 1] == '(';
+      std::size_t e = p + comp.size();
+      bool rok = e == name.size() || name[e] == '.' || name[e] == ')' || name[e] == '(';
+      if (lok && rok) { out += repl; p = e; continue; }
+    }
+    out += name[p++];
+  }
+  return out;
+}
+// Does the type still reference any parameter that had NO path to rewrite to
+// (an anonymous struct argument)?  Such a reference cannot appear in the
+// recorded signature -- ocamlc erases the manifest (nondep) instead.
+static bool ty_mentions_unsubst_param(const cmi::cmiw::TyPtr& t,
+                                      const std::vector<FunctorArgSubst>& subs) {
+  if (!t) return false;
+  if (t->k == cmi::cmiw::Ty::Constr || t->k == cmi::cmiw::Ty::Package)
+    for (auto& s : subs)
+      if (!s.param.empty() && s.arg_path.empty() &&
+          path_has_component(t->name, s.param))
+        return true;
+  for (auto& a : t->args)
+    if (ty_mentions_unsubst_param(a, subs)) return true;
+  return false;
+}
 static cmi::cmiw::TyPtr subst_param_ty(const cmi::cmiw::TyPtr& t,
                                        const std::vector<FunctorArgSubst>& subs) {
   if (!t) return t;
@@ -9744,15 +9788,14 @@ static cmi::cmiw::TyPtr subst_param_ty(const cmi::cmiw::TyPtr& t,
   for (auto& a : r->args) a = subst_param_ty(a, subs);
   if (r->k == cmi::cmiw::Ty::Constr || r->k == cmi::cmiw::Ty::Package) {
     for (auto& s : subs) {
-      if (s.param.empty()) continue;
-      std::string pfx = s.param + ".";
-      if (r->name.rfind(pfx, 0) != 0) continue;
-      if (r->k == cmi::cmiw::Ty::Constr && r->args.empty())
-        if (auto m = s.manifests.find(r->name.substr(pfx.size()));
+      if (s.param.empty() || !path_has_component(r->name, s.param)) continue;
+      if (r->k == cmi::cmiw::Ty::Constr && r->args.empty() &&
+          r->name.rfind(s.param + ".", 0) == 0)
+        if (auto m = s.manifests.find(r->name.substr(s.param.size() + 1));
             m != s.manifests.end())
           return m->second;
       if (!s.arg_path.empty())
-        r->name = s.arg_path + r->name.substr(s.param.size());
+        r->name = path_replace_component(r->name, s.param, s.arg_path);
       break;
     }
   }
@@ -9762,7 +9805,13 @@ static void subst_param_items(std::vector<cmi::cmiw::SigItem>& items,
                               const std::vector<FunctorArgSubst>& subs) {
   for (auto& si : items) {
     si.ty = subst_param_ty(si.ty, subs);
+    // A manifest that STILL mentions an anonymous-argument parameter after
+    // substitution can't be expressed (`'a t = 'a Map.Make(Ord).t`): erase it,
+    // leaving the decl abstract with its recorded variance -- as ocamlc does.
     si.manifest = subst_param_ty(si.manifest, subs);
+    if (si.k == cmi::cmiw::SigItem::Type && si.manifest &&
+        ty_mentions_unsubst_param(si.manifest, subs))
+      si.manifest = nullptr;
     for (auto& c : si.ctors) {
       for (auto& a : c.args) a = subst_param_ty(a, subs);
       for (auto& l : c.inline_record) l.ty = subst_param_ty(l.ty, subs);
@@ -9783,11 +9832,14 @@ static void subst_param_items(std::vector<cmi::cmiw::SigItem>& items,
 // signature verbatim (it is authoritative, like a .mli); a functor emits
 // Mty_functor with its named param's signature and its body's; a functor
 // APPLICATION emits the substituted result signature (above).  `prior` is the
-// surrounding module's already-emitted items (local-functor lookup).  Null
-// when the shape isn't representable yet (unpack, unresolvable application).
+// surrounding module's already-emitted items (local-functor lookup); `ckp` the
+// surrounding checker (opened-submodule heads: `open MoreLabels` + Map.Make
+// must take the LABELLED Map).  Null when the shape isn't representable yet
+// (unpack, unresolvable application).
 static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     const std::string& name, const ast::ModuleExpr& me,
-    const std::vector<cmi::cmiw::SigItem>* prior = nullptr) {
+    const std::vector<cmi::cmiw::SigItem>* prior = nullptr,
+    Checker* ckp = nullptr) {
   if (auto* ms = std::get_if<Pmod_structure>(&me.desc))
     return cmi::cmiw::sig_module(name, infer_signature(ms->items));
   if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {
@@ -9806,7 +9858,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       if (auto* pid = std::get_if<Pmty_ident>(&mc->mt->desc)) {
         // `module M : S = struct .. end`: ocamlc records Mty_ident(S); the
         // inferred structure stays the fallback layout.
-        auto inner = module_binding_sigitem(name, *mc->me, prior);
+        auto inner = module_binding_sigitem(name, *mc->me, prior, ckp);
         if (!inner) inner = cmi::cmiw::sig_module(name, {});
         if (inner->k == cmi::cmiw::SigItem::Module && !inner->is_functor &&
             inner->alias.empty())
@@ -9814,7 +9866,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         return inner;
       }
     }
-    return module_binding_sigitem(name, *mc->me, prior);
+    return module_binding_sigitem(name, *mc->me, prior, ckp);
   }
   if (std::holds_alternative<Pmod_functor>(me.desc)) {
     // Collect the whole CURRIED parameter chain (`(X : S) (Y : T) -> ..` --
@@ -9897,6 +9949,20 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           break;
         }
     }
+    // An opened module's submodule head (`open MoreLabels` then `Map.Make`):
+    // requalify so the LABELLED Map/Set/Hashtbl is the one loaded.
+    if (!resolved && ckp)
+      if (auto q = ckp->opened_submod_quals_.find(comps[0]);
+          q != ckp->opened_submod_quals_.end()) {
+        std::vector<std::string> qc;
+        for (std::size_t p = 0, d; p <= q->second.size(); p = d + 1) {
+          d = q->second.find('.', p);
+          if (d == std::string::npos) d = q->second.size();
+          qc.push_back(q->second.substr(p, d - p));
+        }
+        qc.insert(qc.end(), comps.begin() + 1, comps.end());
+        comps = std::move(qc);
+      }
     if (!resolved && comps.size() >= 2) {  // a functor from a compiled .cmi
       try {
         auto cmif = cmi::CmiFile::load(head_cmi(comps[0]));
@@ -10157,7 +10223,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       // module_binding_sigitem.
       if (!mb->binding.name.txt) continue;  // `module _ = ...`
       if (auto item = module_binding_sigitem(*mb->binding.name.txt,
-                                             mb->binding.expr, &out))
+                                             mb->binding.expr, &out, &ck))
         out.push_back(std::move(*item));
     } else if (auto* mr = std::get_if<Pstr_recmodule>(&it.desc)) {
       // `module rec A .. and B ..`: each binding like Pstr_module, marked
@@ -10165,7 +10231,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       int rs = 1;
       for (auto& b : mr->bindings) {
         if (!b.name.txt) continue;
-        if (auto item = module_binding_sigitem(*b.name.txt, b.expr, &out)) {
+        if (auto item = module_binding_sigitem(*b.name.txt, b.expr, &out, &ck)) {
           item->rec_status = rs;
           out.push_back(std::move(*item));
         }

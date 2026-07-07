@@ -1199,9 +1199,9 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     auto ident = o::vblock(0, {o::vstr(it.name), o::vint(item_stamp[i])});  // Ident.Local{name;stamp}
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
-      if (it.prim.empty() && it.prim_native.empty()) {
-        // `external f : t = "" "native"` has an EMPTY bytecode prim name but is
-        // still Val_prim; only a value with neither name is Val_reg.
+      if (it.prim.empty() && it.prim_native.empty() && !it.prim_external) {
+        // Only a value that isn't a declared external is Val_reg: even
+        // `external f : t = ""` (both names empty) stays Val_prim.
         valkind = o::vint(0);  // Val_reg
       } else {
         // Val_prim(Primitive.description): an external; inlined by consumers and

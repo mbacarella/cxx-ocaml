@@ -300,6 +300,9 @@ struct SigItem {
   // primitive by consumers and taking NO module field (so it doesn't shift the
   // value field layout).
   std::string prim, prim_native;
+  // Val_prim even when BOTH prim names are empty: `external p : t = ""` is
+  // still an external (Printtyp prints it back; it takes no runtime field).
+  bool prim_external = false;
   // Val_prim: prim_alloc (false = [@@noalloc]) and the native_repr of each
   // argument / the result.  Codes: 0 Same_as_ocaml_repr, 1 Unboxed_float,
   // 2 Untagged_immediate, 3/4/5 Unboxed_integer int32/int64/nativeint.
@@ -419,7 +422,8 @@ inline SigItem sig_module_alias(std::string n, std::string target) {
 inline SigItem sig_value(std::string n, TyPtr t) { return {SigItem::Value, std::move(n), std::move(t), {}, nullptr, {}, {}, "", ""}; }
 inline SigItem sig_external(std::string n, TyPtr t, std::string prim, std::string native) {
   SigItem s; s.k = SigItem::Value; s.name = std::move(n); s.ty = std::move(t);
-  s.prim = std::move(prim); s.prim_native = std::move(native); return s;
+  s.prim = std::move(prim); s.prim_native = std::move(native);
+  s.prim_external = true; return s;
 }
 inline SigItem sig_type(std::string n, std::vector<TyPtr> ps, TyPtr man) {
   return {SigItem::Type, std::move(n), nullptr, std::move(ps), std::move(man), {}};
@@ -435,7 +439,8 @@ inline SigItem sig_record(std::string n, std::vector<TyPtr> ps, std::vector<Labe
 // field (type / modtype / `external` value).  Values, modules and exception ctors
 // are SEPARATE namespaces: a value `x` and a module `x` each take a field.
 inline std::string field_key(const SigItem& s) {
-  if (s.k == SigItem::Value && s.prim.empty()) return "v:" + s.name;
+  if (s.k == SigItem::Value && s.prim.empty() && !s.prim_external)
+    return "v:" + s.name;
   if (s.k == SigItem::Module) return "m:" + s.name;
   if (s.k == SigItem::Exception) return "e:" + s.name;
   return "";
