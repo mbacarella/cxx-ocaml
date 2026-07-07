@@ -8731,9 +8731,12 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
         return cmi::cmiw::ty_constr(t->abbrev, std::move(as));
       }
       // Named open/upper rows (`[> var ]`), inherited-row bounds and weak
-      // (non-generalized) rows stay opaque for now.
+      // (non-generalized, '_weak) open/upper rows stay opaque for now.  An
+      // EXACT row is emittable regardless of level: declaration coretypes
+      // converted during the emission phase are never generalized, and a
+      // weak row is never exact.
       if (!t->abbrev.empty() || !t->inherited.empty() ||
-          t->level != I::GENERIC_LEVEL)
+          (t->level != I::GENERIC_LEVEL && t->variant_kind != 2))
         return cmi::cmiw::ty_var(nextvar++);
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
       std::vector<cmi::cmiw::TyPtr> targs;
@@ -9470,6 +9473,61 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
           out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt,
                                                signature_to_cmi(ps->items, &modtypes, &module_sigs)));
+    } else if (std::get_if<Psig_class>(&it.desc) ||
+               std::get_if<Psig_class_type>(&it.desc)) {
+      // `class c : <arrows> -> object .. end` / `class type ct = object .. end`
+      // in a SIGNATURE: member types come straight from the written coretypes
+      // (a class takes a runtime field, so dropping it would shift the layout).
+      auto* pcd = std::get_if<Psig_class>(&it.desc);
+      const std::vector<ClassTypeDeclaration>& decls =
+          pcd ? pcd->decls : std::get_if<Psig_class_type>(&it.desc)->decls;
+      int crs = 1;
+      for (auto& d : decls) {
+        if (!d.params.empty()) continue;  // ['a] not representable yet
+        cmi::cmiw::SigItem ci;
+        ci.k = cmi::cmiw::SigItem::Class;
+        ci.class_is_type = !pcd;
+        ci.name = d.name.txt;
+        ci.rec_status = crs; crs = 2;
+        ci.class_virtual = (d.virt == VirtualFlag::Virtual);
+        std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
+        std::unordered_map<std::string, TypePtr> tv;
+        const ast::ClassType* ct = &d.expr;
+        bool ok = true;
+        while (auto* pa = std::get_if<Pcty_arrow>(&ct->desc)) {  // class c : t -> ...
+          auto [lk, lb] = arglabel(pa->label);
+          ci.class_arrow_doms.push_back(
+              bridge_ty_named(ck.from_coretype(*pa->dom, tv), cvars, cnext, tv));
+          ci.class_arrow_lks.push_back(lk);
+          ci.class_arrow_lbls.push_back(lb);
+          ct = pa->cod.get();
+        }
+        auto* cs = std::get_if<Pcty_signature>(&ct->desc);
+        if (!cs) continue;
+        for (auto& cf : cs->cs.fields) {
+          if (auto* pv = std::get_if<Pctf_val>(&cf.desc)) {
+            cmi::cmiw::ClassField f;
+            f.name = pv->name.txt;
+            f.mut = (pv->mut == MutableFlag::Mutable);
+            f.virt = (pv->virt == VirtualFlag::Virtual);
+            f.ty = bridge_ty_named(ck.from_coretype(*pv->type, tv), cvars, cnext, tv);
+            ci.class_fields.push_back(std::move(f));
+          } else if (auto* pm = std::get_if<Pctf_method>(&cf.desc)) {
+            cmi::cmiw::ClassField f;
+            f.name = pm->name.txt;
+            f.is_method = true;
+            f.priv = (pm->priv == PrivateFlag::Private);
+            f.virt = (pm->virt == VirtualFlag::Virtual);
+            f.ty = bridge_ty_named(ck.from_coretype(*pm->type, tv), cvars, cnext, tv);
+            ci.class_fields.push_back(std::move(f));
+          } else if (std::holds_alternative<Pctf_inherit>(cf.desc) ||
+                     std::holds_alternative<Pctf_constraint>(cf.desc)) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) out.push_back(std::move(ci));
+      }
     } else if (auto* pe = std::get_if<Psig_exception>(&it.desc)) {
       // `exception E [of t..]`: emit Sig_typext (takes a runtime field).  Without
       // it the .cmi value layout is short of the .cmo (Parsing.Parse_error/YYexit
