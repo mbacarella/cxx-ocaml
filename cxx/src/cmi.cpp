@@ -211,6 +211,15 @@ public:
     const m::Value& man = arena_[d.fields.at(4)];
     if (man.kind == m::Value::Kind::Block && man.tag == 0)
       td.manifest = type(man.fields.at(0));
+    // type_variance : Variance.t list (field 5) -- raw ints, one per param.
+    if (d.fields.size() > 5)
+      for (std::size_t cur = d.fields[5];
+           arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();) {
+        const m::Value& cons = arena_[cur];
+        if (arena_[cons.fields.at(0)].kind == m::Value::Kind::Int)
+          td.variances.push_back(arena_[cons.fields[0]].i);
+        cur = cons.fields[1];
+      }
     return td;
   }
 
@@ -1530,7 +1539,13 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           // NoVariance (nothing), matching the oracle -- whereas null (0) would
           // print Bivariant `+-` on every GADT param.  Concrete non-private decls
           // set with_variance=false, so the stored value is not shown either way.
-          [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(7)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
+          [&] {
+            std::vector<o::ValPtr> v;
+            for (std::size_t i = 0; i < it.params.size(); ++i)
+              v.push_back(o::vint(i < it.type_variances.size()
+                                      ? it.type_variances[i] : 7));
+            return v.empty() ? o::vint(0) : o::vlist(v);
+          }(),
           [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
           o::vint(0), o::vint(0),                      // is_newtype false, expansion_scope 0
           loc_none(),                                  // type_loc

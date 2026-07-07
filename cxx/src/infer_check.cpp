@@ -8993,7 +8993,10 @@ static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
     case cmi::TypeExpr::Tunivar: {
       auto it = vars.find(t.get());
       if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
-      int id = nextvar++; vars[t.get()] = id; return cmi::cmiw::ty_var(id);
+      int id = nextvar++; vars[t.get()] = id;
+      auto r = cmi::cmiw::ty_var(id);
+      if (t->name) r->var_name = *t->name;  // keep Tvar(Some "acc") -> 'acc
+      return r;
     }
     case cmi::TypeExpr::Tarrow:
       return cmi::cmiw::ty_arrow_lbl(conv_cmi_ty(t->dom, vars, nextvar),
@@ -9040,6 +9043,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
       cmi::cmiw::TyPtr man = td.manifest ? conv_cmi_ty(td.manifest, vars, nv) : nullptr;
       out.push_back(cmi::cmiw::sig_type(td.name, std::move(params), man));
     }
+    out.back().type_variances = td.variances;
   }
   for (auto& mt : sig.modtypes)
     if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig)
@@ -9245,6 +9249,68 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
 // path, used when an interface file exists.  Types are taken verbatim from the
 // declarations (no inference); local type names are pre-registered so qualified
 // and same-module references resolve.
+// Apply the `with type ...` refinements of a Pmty_with chain onto resolved
+// signature items (body_sig / qual_modtype_items strip the chain, but ocamlc
+// records the CONSTRAINED decl: `S with type in_t = T0.t` stores in_t's
+// manifest).  `with type t := ..` (destructive) erases the decl instead --
+// types take no runtime field, so erasure can't shift the value layout.
+static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
+                                   std::vector<cmi::cmiw::SigItem>& items) {
+  const ast::ModuleType* m = &mt;
+  while (auto* pw = std::get_if<Pmty_with>(&m->desc)) {
+    for (auto& c : pw->constraints) {
+      const ast::TypeDeclaration* td = nullptr;
+      const LongidentLoc* lid = nullptr;
+      bool subst = false;
+      if (auto* wt = std::get_if<Pwith_type>(&c)) { td = &*wt->td; lid = &wt->lid; }
+      else if (auto* ws = std::get_if<Pwith_typesubst>(&c)) {
+        td = &*ws->td; lid = &ws->lid; subst = true;
+      } else continue;
+      // Descend a dotted `with type M.t = ..` through submodule items.
+      std::string full = lid_full(lid->txt);
+      std::vector<std::string> comps;
+      for (std::size_t p = 0, d; p <= full.size(); p = d + 1) {
+        d = full.find('.', p);
+        if (d == std::string::npos) d = full.size();
+        comps.push_back(full.substr(p, d - p));
+      }
+      std::vector<cmi::cmiw::SigItem>* cur = &items;
+      for (std::size_t i = 0; i + 1 < comps.size() && cur; ++i) {
+        std::vector<cmi::cmiw::SigItem>* next = nullptr;
+        for (auto& si : *cur)
+          if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[i]) {
+            next = &si.sub; break;
+          }
+        cur = next;
+      }
+      if (!cur) continue;
+      auto tgt = std::find_if(cur->begin(), cur->end(), [&](const cmi::cmiw::SigItem& si) {
+        return si.k == cmi::cmiw::SigItem::Type && si.name == comps.back();
+      });
+      if (tgt == cur->end()) continue;
+      if (subst) { cur->erase(tgt); continue; }
+      if (!td->manifest) continue;
+      // Params first, then the manifest, sharing the var table -- so `'a` in
+      // `with type 'a t = 'a list` is the same Var node in both.
+      std::unordered_map<std::string, TypePtr> tvars;
+      std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
+      std::vector<cmi::cmiw::TyPtr> params;
+      for (auto& p : td->params) {
+        auto pv = bridge_ty_named(ck.from_coretype(*p, tvars), bvars, nextvar, tvars);
+        if (pv->k == cmi::cmiw::Ty::Var)
+          if (auto* v = std::get_if<Ptyp_var>(&p->desc)) pv->var_name = v->name;
+        params.push_back(std::move(pv));
+      }
+      if (params.size() != tgt->params.size()) continue;  // arity mismatch: keep as-is
+      tgt->params = std::move(params);
+      tgt->manifest = bridge_ty_named(ck.from_coretype(**td->manifest, tvars),
+                                      bvars, nextvar, tvars);
+      tgt->type_private = (td->priv == PrivateFlag::Private);
+    }
+    m = pw->mt.get();
+  }
+}
+
 std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     const ast::Signature& s,
     const std::unordered_map<std::string, const ast::Signature*>* outer,
@@ -9463,6 +9529,8 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           else  // a QUALIFIED result modtype (`MakeEngineTable (..) : EngineTypes.TABLE
                 // with ..`): resolve it through the local/cross-module signature.
             result = qual_modtype_items(*body);
+          apply_with_constraints(ck, *body, result);
+          drop_modsubst(result, with_modsubst_names(*body));
           auto fitem = cmi::cmiw::sig_module_functor(*pm->md.name.txt, param,
                           std::move(param_sig), std::move(result));
           fitem.functor_unit = std::holds_alternative<Functor_unit>(pf->param);
@@ -9479,6 +9547,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           // submodule with S's resolved signature inline, so a consumer can
           // resolve `Digest.MD5.bytes` to its field (else the module is dropped).
           auto items = signature_to_cmi(*bs, &modtypes, &module_sigs);
+          apply_with_constraints(ck, *pm->md.type, items);
           drop_modsubst(items, with_modsubst_names(*pm->md.type));
           auto mitem = cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items));
           // A plain NAMED modtype (`module MD5 : S`, no `with`) is stored by
@@ -9488,6 +9557,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           out.push_back(std::move(mitem));
         } else if (auto items = qual_modtype_items(*pm->md.type); !items.empty()) {
           // `module Set : Set.S with ..` (a qualified functor-result module type).
+          apply_with_constraints(ck, *pm->md.type, items);
           drop_modsubst(items, with_modsubst_names(*pm->md.type));
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items)));
         } else {
@@ -9599,7 +9669,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           } catch (...) {}
       } else if (const ast::Signature* bs = body_sig(pinc->mt)) {
         // `include S` (named local modtype) / `include sig .. end`
-        for (auto& si : signature_to_cmi(*bs, &modtypes, &module_sigs)) out.push_back(std::move(si));
+        auto items = signature_to_cmi(*bs, &modtypes, &module_sigs);
+        // Type-level `with` refinements only: module substitutions in an
+        // include are left to the existing layout handling (lambda.cpp's AST
+        // walk doesn't apply them, and cmi/cmo layouts must agree).
+        apply_with_constraints(ck, pinc->mt, items);
+        for (auto& si : items) out.push_back(std::move(si));
       } else if (auto items = qual_modtype_items(pinc->mt); !items.empty()) {
         // `include Identifiable.S with type t = int` (a QUALIFIED cross-module
         // module type): splice its members from the head module's cmi, so the
@@ -9650,13 +9725,69 @@ static void toplevel_pat_vars(const ast::Pattern& p, std::vector<std::string>& o
   }
 }
 
+// ---- functor application results ------------------------------------------
+// `module IntSet = Set.Make(..)`: ocamlc records the functor's RESULT signature
+// with the parameter substituted away.  We rebuild that: the result sig comes
+// from the functor's own .cmi (or a local functor's already-emitted SigItem),
+// and every constr path headed by the parameter name is rewritten -- to the
+// argument's path (`Ord.t` -> `String.t`) or, for an anonymous struct argument,
+// to the struct's own manifest (`Ord.t` -> `int`).
+struct FunctorArgSubst {
+  std::string param;     // parameter name ("Ord"); empty = nothing to rewrite
+  std::string arg_path;  // path argument ("String", "Digest.MD5")
+  std::unordered_map<std::string, cmi::cmiw::TyPtr> manifests;  // struct argument
+};
+static cmi::cmiw::TyPtr subst_param_ty(const cmi::cmiw::TyPtr& t,
+                                       const std::vector<FunctorArgSubst>& subs) {
+  if (!t) return t;
+  auto r = std::make_shared<cmi::cmiw::Ty>(*t);  // never mutate shared nodes
+  for (auto& a : r->args) a = subst_param_ty(a, subs);
+  if (r->k == cmi::cmiw::Ty::Constr || r->k == cmi::cmiw::Ty::Package) {
+    for (auto& s : subs) {
+      if (s.param.empty()) continue;
+      std::string pfx = s.param + ".";
+      if (r->name.rfind(pfx, 0) != 0) continue;
+      if (r->k == cmi::cmiw::Ty::Constr && r->args.empty())
+        if (auto m = s.manifests.find(r->name.substr(pfx.size()));
+            m != s.manifests.end())
+          return m->second;
+      if (!s.arg_path.empty())
+        r->name = s.arg_path + r->name.substr(s.param.size());
+      break;
+    }
+  }
+  return r;
+}
+static void subst_param_items(std::vector<cmi::cmiw::SigItem>& items,
+                              const std::vector<FunctorArgSubst>& subs) {
+  for (auto& si : items) {
+    si.ty = subst_param_ty(si.ty, subs);
+    si.manifest = subst_param_ty(si.manifest, subs);
+    for (auto& c : si.ctors) {
+      for (auto& a : c.args) a = subst_param_ty(a, subs);
+      for (auto& l : c.inline_record) l.ty = subst_param_ty(l.ty, subs);
+      c.res = subst_param_ty(c.res, subs);
+    }
+    for (auto& l : si.labels) l.ty = subst_param_ty(l.ty, subs);
+    si.ext_ret = subst_param_ty(si.ext_ret, subs);
+    for (auto& f : si.class_fields) f.ty = subst_param_ty(f.ty, subs);
+    for (auto& d : si.class_arrow_doms) d = subst_param_ty(d, subs);
+    subst_param_items(si.sub, subs);
+    subst_param_items(si.param_sig, subs);
+    for (auto& ps : si.more_param_sigs) subst_param_items(ps, subs);
+  }
+}
+
 // The Sig_module item for one module binding, by shape: a structure body is
 // inferred recursively; `module M : sig .. end = ..` takes the CONSTRAINT
 // signature verbatim (it is authoritative, like a .mli); a functor emits
-// Mty_functor with its named param's signature and its body's.  Null when the
-// shape isn't representable yet (Pmod_ident/apply/unpack).
+// Mty_functor with its named param's signature and its body's; a functor
+// APPLICATION emits the substituted result signature (above).  `prior` is the
+// surrounding module's already-emitted items (local-functor lookup).  Null
+// when the shape isn't representable yet (unpack, unresolvable application).
 static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
-    const std::string& name, const ast::ModuleExpr& me) {
+    const std::string& name, const ast::ModuleExpr& me,
+    const std::vector<cmi::cmiw::SigItem>* prior = nullptr) {
   if (auto* ms = std::get_if<Pmod_structure>(&me.desc))
     return cmi::cmiw::sig_module(name, infer_signature(ms->items));
   if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {
@@ -9675,7 +9806,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       if (auto* pid = std::get_if<Pmty_ident>(&mc->mt->desc)) {
         // `module M : S = struct .. end`: ocamlc records Mty_ident(S); the
         // inferred structure stays the fallback layout.
-        auto inner = module_binding_sigitem(name, *mc->me);
+        auto inner = module_binding_sigitem(name, *mc->me, prior);
         if (!inner) inner = cmi::cmiw::sig_module(name, {});
         if (inner->k == cmi::cmiw::SigItem::Module && !inner->is_functor &&
             inner->alias.empty())
@@ -9683,7 +9814,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         return inner;
       }
     }
-    return module_binding_sigitem(name, *mc->me);
+    return module_binding_sigitem(name, *mc->me, prior);
   }
   if (std::holds_alternative<Pmod_functor>(me.desc)) {
     // Collect the whole CURRIED parameter chain (`(X : S) (Y : T) -> ..` --
@@ -9726,6 +9857,100 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       item.more_param_refs.push_back(std::move(ps[i].ref));
     }
     return item;
+  }
+  if (std::holds_alternative<Pmod_apply>(me.desc) ||
+      std::holds_alternative<Pmod_apply_unit>(me.desc)) {
+    // Peel the (possibly curried) application chain: F(A)(B)() -> head F,
+    // args [A, B, null] (null = a generative `()` application).
+    std::vector<const ast::ModuleExpr*> args;
+    const ast::ModuleExpr* h = &me;
+    while (true) {
+      if (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+        args.push_back(a->arg.get()); h = a->f.get();
+      } else if (auto* au = std::get_if<Pmod_apply_unit>(&h->desc)) {
+        args.push_back(nullptr); h = au->f.get();
+      } else break;
+    }
+    std::reverse(args.begin(), args.end());
+    auto* fi = std::get_if<Pmod_ident>(&h->desc);
+    if (!fi || std::holds_alternative<Lapply>(fi->id.txt.v)) return std::nullopt;
+    std::string fpath = lid_full(fi->id.txt);
+    std::vector<std::string> comps;
+    for (std::size_t p = 0, d; p <= fpath.size(); p = d + 1) {
+      d = fpath.find('.', p);
+      if (d == std::string::npos) d = fpath.size();
+      comps.push_back(fpath.substr(p, d - p));
+    }
+    // Resolve the functor: one param name per application level + result items.
+    std::vector<std::string> pnames;
+    std::vector<cmi::cmiw::SigItem> result;
+    bool resolved = false;
+    if (comps.size() == 1 && prior) {  // a local functor emitted earlier
+      for (auto& si : *prior)
+        if (si.k == cmi::cmiw::SigItem::Module && si.is_functor &&
+            si.name == comps[0] && !si.sub.empty() &&
+            args.size() == 1 + si.more_param_names.size()) {
+          pnames.push_back(si.functor_param);
+          for (auto& n : si.more_param_names) pnames.push_back(n);
+          result = si.sub;  // fresh item; subst clones every node it touches
+          resolved = true;
+          break;
+        }
+    }
+    if (!resolved && comps.size() >= 2) {  // a functor from a compiled .cmi
+      try {
+        auto cmif = cmi::CmiFile::load(head_cmi(comps[0]));
+        const cmi::Signature* sig = &cmif.sig();
+        const cmi::ModuleType* mt = nullptr;
+        for (std::size_t i = 1; i < comps.size(); ++i) {
+          if (!sig) { mt = nullptr; break; }
+          const cmi::ModuleDecl* md = nullptr;
+          for (auto& mm : sig->modules)
+            if (mm.name == comps[i]) { md = &mm; break; }
+          if (!md || !md->type) { mt = nullptr; break; }
+          mt = md->type.get();
+          sig = mt->kind == cmi::ModuleType::Sig ? mt->sig.get() : nullptr;
+        }
+        const cmi::ModuleType* cur = mt;
+        for (std::size_t i = 0; i < args.size() && cur; ++i) {
+          if (cur->kind != cmi::ModuleType::Functor) { cur = nullptr; break; }
+          pnames.push_back(cur->functor_param.value_or(""));
+          cur = cur->functor_body.get();
+        }
+        if (cur && cur->kind == cmi::ModuleType::Sig && cur->sig) {
+          result = cmi_sig_to_items(*cur->sig);
+          resolved = true;
+        }
+      } catch (...) {}
+    }
+    if (!resolved) return std::nullopt;
+    std::vector<FunctorArgSubst> subs;
+    for (std::size_t i = 0; i < args.size() && i < pnames.size(); ++i) {
+      FunctorArgSubst s;
+      s.param = pnames[i];
+      const ast::ModuleExpr* am = args[i];
+      while (am) {
+        if (auto* amc = std::get_if<Pmod_constraint>(&am->desc)) am = amc->me.get();
+        else break;
+      }
+      if (am && !s.param.empty()) {
+        if (auto* api = std::get_if<Pmod_ident>(&am->desc)) {
+          if (!std::holds_alternative<Lapply>(api->id.txt.v))
+            s.arg_path = lid_full(api->id.txt);
+        } else if (auto* ast_ = std::get_if<Pmod_structure>(&am->desc)) {
+          // An anonymous struct argument: its manifests eliminate the
+          // parameter (`Ord.t` -> `int`).  Arity-0 substitution only.
+          for (auto& ai : infer_signature(ast_->items))
+            if (ai.k == cmi::cmiw::SigItem::Type && ai.manifest &&
+                ai.params.empty())
+              s.manifests[ai.name] = ai.manifest;
+        }
+      }
+      if (!s.param.empty() && (!s.arg_path.empty() || !s.manifests.empty()))
+        subs.push_back(std::move(s));
+    }
+    if (!subs.empty()) subst_param_items(result, subs);
+    return cmi::cmiw::sig_module(name, std::move(result));
   }
   return std::nullopt;
 }
@@ -9931,7 +10156,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       // submodules; outer refs not yet); constrained/functor shapes via
       // module_binding_sigitem.
       if (!mb->binding.name.txt) continue;  // `module _ = ...`
-      if (auto item = module_binding_sigitem(*mb->binding.name.txt, mb->binding.expr))
+      if (auto item = module_binding_sigitem(*mb->binding.name.txt,
+                                             mb->binding.expr, &out))
         out.push_back(std::move(*item));
     } else if (auto* mr = std::get_if<Pstr_recmodule>(&it.desc)) {
       // `module rec A .. and B ..`: each binding like Pstr_module, marked
@@ -9939,7 +10165,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(const ast::Structure& s) {
       int rs = 1;
       for (auto& b : mr->bindings) {
         if (!b.name.txt) continue;
-        if (auto item = module_binding_sigitem(*b.name.txt, b.expr)) {
+        if (auto item = module_binding_sigitem(*b.name.txt, b.expr, &out)) {
           item->rec_status = rs;
           out.push_back(std::move(*item));
         }

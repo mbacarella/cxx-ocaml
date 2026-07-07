@@ -106,6 +106,9 @@ struct TypeDecl {
   std::vector<ConstructorDecl> ctors;   // Variant
   std::string external_name;            // External
   TypePtr manifest;                     // type_manifest option (abbreviation)
+  // type_variance, one RAW Variance.t int per parameter (a bitfield Printtyp
+  // renders as `+`/`-`/`!`); empty when the decl predates the decode.
+  std::vector<long long> variances;
 };
 
 struct Signature;
@@ -342,6 +345,9 @@ struct SigItem {
   bool type_unboxed = false;
   // Type: an EMPTY variant (`type empty = |`) -- Type_variant([]), not abstract.
   bool type_empty_variant = false;
+  // Type: raw Variance.t per parameter (a functor result spliced from a read
+  // .cmi keeps `type +!'a t`).  Empty = Variance.unknown (7) for every param.
+  std::vector<long long> type_variances;
   // Module: rec_status (0 Trec_not / 1 Trec_first / 2 Trec_next) -- a
   // `module rec A .. and B ..` group prints as such only when marked.
   int rec_status = 0;
