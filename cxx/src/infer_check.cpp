@@ -6118,7 +6118,11 @@ struct Checker {
           }
           TypePtr bt = infer_expr(*body);
           if (pty) {  // an annotated method type pins the signature
+            // The class' TYPE params scope over method annotations, so `'a` in
+            // `method bar : 'a -> 'a` binds to the class param `['a] c` (else it
+            // would be a fresh var, printed apart from the class' `'a`).
             std::unordered_map<std::string, TypePtr> vars;
+            if (cvars) vars = *cvars;
             TypePtr at = from_coretype(*pty, vars);
             if (strict) soft_unify(bt, at); else { try { try_unify(bt, at); } catch (...) {} bt = at; }
           }
@@ -7500,6 +7504,17 @@ struct Checker {
                 ctor = eng.arrow(ptys[i], ctor, lk, nm);
               }
               try_unify(pe.placeholder, ctor);
+            }
+            // The writer reads the class type from the map (= the placeholder,
+            // which object-object unify does NOT link to `ot`), so record the
+            // type params on the PLACEHOLDER's own object node too.
+            if (!d.params.empty()) {
+              TypePtr ph = I::Engine::repr(pe.placeholder);
+              while (ph->kind == I::Type::Kind::Arrow) ph = I::Engine::repr(ph->cod);
+              if (ph->kind == I::Type::Kind::Object) {
+                ph->abbrev = d.name.txt;
+                ph->abbrev_args = tparams;
+              }
             }
           }
           eng.leave_level();
@@ -10543,7 +10558,6 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       // classes (['a] c) aren't representable yet -- skipped.
       int class_rs = 1;  // Trec_first, then Trec_next for the `and` members
       for (auto& d : pc->decls) {
-        if (!d.params.empty()) continue;
         const ast::ClassExpr* ce = &d.expr;
         std::vector<const Pcl_fun*> cparams;
         for (;;) {
@@ -10560,13 +10574,14 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         ci.rec_status = class_rs; class_rs = 2;
         ci.class_virtual = (d.virt == VirtualFlag::Virtual);
         std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
-        // constructor arrows + the final object type
+        // constructor arrows + the final object type.  A paramless class lives
+        // in class_types_; one with value OR type params in class_ctor_types_
+        // (a `['a] c` with no value params still has a ctor scheme carrying its
+        // tvars), so consult both.
         TypePtr ct;
-        if (cparams.empty()) {
-          if (auto f = ck.class_types_.find(d.name.txt); f != ck.class_types_.end()) ct = f->second;
-        } else if (auto f = ck.class_ctor_types_.find(d.name.txt); f != ck.class_ctor_types_.end()) {
+        if (auto f = ck.class_types_.find(d.name.txt); f != ck.class_types_.end()) ct = f->second;
+        else if (auto f = ck.class_ctor_types_.find(d.name.txt); f != ck.class_ctor_types_.end())
           ct = f->second;
-        }
         TypePtr obj = ct ? I::Engine::repr(ct) : nullptr;
         while (obj && obj->kind == I::Type::Kind::Arrow) {
           ci.class_arrow_doms.push_back(bridge_ty(obj->dom, cvars, cnext));
@@ -10579,6 +10594,19 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         if (obj && obj->kind == I::Type::Kind::Object)
           for (std::size_t m = 0; m < obj->labels.size() && m < obj->args.size(); ++m)
             mtypes[obj->labels[m]] = obj->args[m];
+        // `['a, _] c` type params: the checker stashes the class' tvars on the
+        // inferred object's abbrev_args.  Bridge them FIRST (sharing cvars) so a
+        // method's `'a` resolves to the same printed var as the class param.
+        if (!d.params.empty() && obj && obj->kind == I::Type::Kind::Object &&
+            obj->abbrev_args.size() == d.params.size())
+          for (std::size_t pi = 0; pi < obj->abbrev_args.size(); ++pi) {
+            auto pv = bridge_ty(obj->abbrev_args[pi], cvars, cnext);
+            // An anonymous param `_` is stored as Tvar(Some "_") so Printtyp
+            // renders it `_` (`['a, _] c`) rather than naming it 'b.
+            if (std::holds_alternative<Ptyp_any>(d.params[pi]->desc))
+              pv->var_name = "_";
+            ci.class_params.push_back(pv);
+          }
         std::unordered_map<std::string, TypePtr> vtypes;
         if (auto f = ck.class_instvars_.find(d.name.txt); f != ck.class_instvars_.end())
           for (auto& [vn, vt] : f->second) vtypes[vn] = vt;

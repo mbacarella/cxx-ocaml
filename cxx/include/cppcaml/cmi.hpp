@@ -376,6 +376,7 @@ struct SigItem {
   // of the same name -- the reader's Signature_group asserts they follow, the
   // printer never shows them).  A Class item takes THREE idents/stamps.
   std::vector<ClassField> class_fields;   // vals + methods, source order
+  std::vector<TyPtr> class_params;        // `['a, _] c` type params (cty_params)
   std::vector<TyPtr> class_arrow_doms;    // constructor params, outermost first
   std::vector<int> class_arrow_lks;       // 0 Nolabel / 1 Labelled / 2 Optional
   std::vector<std::string> class_arrow_lbls;

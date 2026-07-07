@@ -1535,9 +1535,22 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         cnew = o::vblock(0, {te.emit(nt)});
       }
       auto cpath = o::vblock(0, {o::vblock(0, {o::vstr(it.name), o::vint(s_ty)})});
+      // cty_params : the `['a, _] c` type params, and one Variance per param
+      // (Variance.unknown = 7 -- Printtyp shows nothing, as the oracle does).
+      auto cty_params = [&] {
+        if (it.class_params.empty()) return o::vint(0);
+        std::vector<o::ValPtr> ps;
+        for (auto& p : it.class_params) ps.push_back(te.emit(p));
+        return o::vlist(ps);
+      };
+      auto cty_variance = [&] {
+        if (it.class_params.empty()) return o::vint(0);
+        std::vector<o::ValPtr> v(it.class_params.size(), o::vint(7));
+        return o::vlist(v);
+      };
       if (!it.class_is_type) {
-        auto cdecl = o::vblock(0, {o::vint(0) /*cty_params*/, cty, cpath, cnew,
-                                   o::vint(0) /*variance*/, loc_none(),
+        auto cdecl = o::vblock(0, {cty_params(), cty, cpath, cnew,
+                                   cty_variance(), loc_none(),
                                    o::vint(0) /*attrs*/, o::vint(0) /*uid*/});
         sig.push_back(o::vblock(5, {ident, cdecl, o::vint(rs),
                                     o::vint(0) /*Exported*/}));  // Sig_class
@@ -1553,8 +1566,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       };
       // Sig_class_type: a ghost after a class, the REAL item for `class type`;
       // shares cty; clty_hash_type is a bare abstract decl
-      auto clty = o::vblock(0, {o::vint(0) /*clty_params*/, cty, cpath,
-                                mk_tdecl(o::vint(0)), o::vint(0) /*variance*/,
+      auto clty = o::vblock(0, {cty_params(), cty, cpath,
+                                mk_tdecl(o::vint(0)), cty_variance(),
                                 loc_none(), o::vint(0), o::vint(0)});
       auto clty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_clty)});
       sig.push_back(o::vblock(6, {clty_ident, clty, o::vint(rs), o::vint(0)}));  // Sig_class_type
