@@ -9768,6 +9768,8 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         }
         auto* cs = std::get_if<Pcty_signature>(&ct->desc);
         if (!cs) continue;
+        std::unordered_set<std::string> own_meths, own_vals;
+        std::vector<std::string> sig_inherits;  // `inherit ct` parents to splice
         for (auto& cf : cs->cs.fields) {
           if (auto* pv = std::get_if<Pctf_val>(&cf.desc)) {
             cmi::cmiw::ClassField f;
@@ -9775,6 +9777,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
             f.mut = (pv->mut == MutableFlag::Mutable);
             f.virt = (pv->virt == VirtualFlag::Virtual);
             f.ty = bridge_ty_named(ck.from_coretype(*pv->type, tv), cvars, cnext, tv);
+            own_vals.insert(f.name);
             ci.class_fields.push_back(std::move(f));
           } else if (auto* pm = std::get_if<Pctf_method>(&cf.desc)) {
             cmi::cmiw::ClassField f;
@@ -9783,12 +9786,33 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
             f.priv = (pm->priv == PrivateFlag::Private);
             f.virt = (pm->virt == VirtualFlag::Virtual);
             f.ty = bridge_ty_named(ck.from_coretype(*pm->type, tv), cvars, cnext, tv);
+            own_meths.insert(f.name);
             ci.class_fields.push_back(std::move(f));
-          } else if (std::holds_alternative<Pctf_inherit>(cf.desc) ||
-                     std::holds_alternative<Pctf_constraint>(cf.desc)) {
+          } else if (auto* inh = std::get_if<Pctf_inherit>(&cf.desc)) {
+            // `class dt : object inherit ct end`: splice ct's members (a local
+            // same-signature class type).  Bail only if the parent isn't a plain
+            // class-type name we can resolve.
+            const ast::ClassType* pct2 = inh->ct.get();
+            if (auto* cc = std::get_if<Pcty_constr>(&pct2->desc)) sig_inherits.push_back(lid_last(cc->id.txt));
+            else { ok = false; break; }
+          } else if (std::holds_alternative<Pctf_constraint>(cf.desc)) {
             ok = false;
             break;
           }
+        }
+        for (auto& pname : sig_inherits) {
+          bool found = false;
+          for (auto& pit : out) {
+            if (pit.k != cmi::cmiw::SigItem::Class || pit.name != pname) continue;
+            for (auto& pf : pit.class_fields) {
+              auto& seen = pf.is_method ? own_meths : own_vals;
+              if (!seen.insert(pf.name).second) continue;
+              ci.class_fields.push_back(pf);
+            }
+            found = true;
+            break;
+          }
+          if (!found) ok = false;  // unresolved parent -> don't emit a partial class
         }
         if (ok) out.push_back(std::move(ci));
       }
