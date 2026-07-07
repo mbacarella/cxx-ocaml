@@ -7406,64 +7406,106 @@ struct Checker {
         } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings, /*toplevel=*/true);
         else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
-          {  // all passes: class method bodies (Pexp_object) + class_types_ for `new`
-            for (auto& d : pc->decls) {
-              const ClassExpr* ce = &d.expr;
-              std::vector<const Pcl_fun*> params;  // `class c x = ...` parameters
-              std::vector<const Pcl_let*> lets;    // `class c = let .. in object`
-              for (;;) {
-                if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
-                  params.push_back(pf);
-                  ce = pf->body.get();
-                } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
-                  lets.push_back(pl);
-                  ce = pl->body.get();
-                } else break;
-              }
-              if (auto* ps = std::get_if<Pcl_structure>(&ce->desc)) {
-                // The class's TYPE params (`class ['a] lambda_ops`) scope over
-                // the body's annotations and `constraint` fields; the object
-                // then carries the CLASS name (`'a lambda_ops`), and `new c`
-                // gets the constructor arrow over the value params (mixin2).
-                eng.enter_level();  // the ctor scheme generalizes like a let
-                std::unordered_map<std::string, TypePtr> cvars;
-                std::vector<TypePtr> tparams;
-                for (auto& p : d.params) {
-                  TypePtr v = eng.fresh_var();
-                  if (auto* pv2 = std::get_if<Ptyp_var>(&p->desc))
-                    cvars[pv2->name] = v;
-                  tparams.push_back(v);
+          // A `class .. and ..` group is mutually recursive: `new sibling arg`
+          // in one body must resolve to (and pin) the sibling's constructor,
+          // even a sibling defined later.  So we PRE-REGISTER a placeholder var
+          // per class (shared, non-generic), infer every body against it, then
+          // generalize once the whole group is closed.  Without this, a forward
+          // `new bar "asdf"` saw no bar yet, so bar's unused param stayed 'a
+          // instead of string (backtrace/methods, names).
+          struct ClassPend {
+            const ClassDeclaration* d;
+            std::vector<const Pcl_fun*> params;  // `class c x = ...` parameters
+            std::vector<const Pcl_let*> lets;    // `class c = let .. in object`
+            const Pcl_structure* ps;
+            TypePtr placeholder;  // the node registered in class_types_/ctor_
+            bool paramless;
+          };
+          std::vector<ClassPend> pend;
+          eng.enter_level();  // the ctor schemes generalize like a let group
+          for (auto& d : pc->decls) {
+            const ClassExpr* ce = &d.expr;
+            std::vector<const Pcl_fun*> params;
+            std::vector<const Pcl_let*> lets;
+            for (;;) {
+              if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) {
+                params.push_back(pf);
+                ce = pf->body.get();
+              } else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) {
+                lets.push_back(pl);
+                ce = pl->body.get();
+              } else break;
+            }
+            auto* ps = std::get_if<Pcl_structure>(&ce->desc);
+            if (!ps) continue;
+            bool paramless = params.empty() && d.params.empty();
+            // Build an OBJECT SHELL (public concrete method names -> fresh
+            // vars) so a forward `new sibling`'s `#meth arg` resolves against a
+            // real row and pins the method's arg types -- a bare var receiver
+            // would make `#meth` return a disconnected fresh var, losing the
+            // pin (backtrace/methods' `other#go 1 2 3`).  Pass 2 unifies this
+            // shell with the class' truly-inferred object, merging the rows.
+            std::vector<std::string> shnames;
+            std::vector<TypePtr> shvars;
+            for (auto& f : ps->cs.fields)
+              if (auto* m = std::get_if<Pcf_method>(&f.desc))
+                if (std::get_if<Cfk_concrete>(&m->kind) && m->priv != PrivateFlag::Private) {
+                  shnames.push_back(m->name.txt);
+                  shvars.push_back(eng.fresh_var());
                 }
-                std::vector<TypePtr> ptys;
-                std::vector<std::pair<std::string, TypePtr>> instvars;
-                TypePtr ot = infer_object_body(ps->cs, params.empty() ? nullptr : &params,
-                                               lets.empty() ? nullptr : &lets,
-                                               d.params.empty() ? nullptr : &cvars,
-                                               &ptys, &instvars);
-                eng.leave_level();
-                class_instvars_[d.name.txt] = std::move(instvars);
-                // A parameterless class: `new c` is its object type.  Generalise
-                // so each `new c` instantiates fresh.
-                if (params.empty() && d.params.empty()) {
-                  eng.generalize(ot);
-                  class_types_[d.name.txt] = ot;
-                } else {
-                  TypePtr obj = I::Engine::repr(ot);
-                  if (obj->kind == I::Type::Kind::Object && !d.params.empty()) {
-                    obj->abbrev = d.name.txt;
-                    obj->abbrev_args = tparams;
-                  }
-                  TypePtr ctor = ot;
-                  for (size_t i = ptys.size(); i-- > 0;) {
-                    auto [lk, nm] = arglabel(params[i]->label);
-                    ctor = eng.arrow(ptys[i], ctor, lk, nm);
-                  }
-                  eng.generalize(ctor);
-                  class_ctor_types_[d.name.txt] = ctor;
-                }
+            TypePtr ph = eng.object_type(shnames, shvars);
+            for (size_t i = params.size(); i-- > 0;) {
+              auto [lk, nm] = arglabel(params[i]->label);
+              ph = eng.arrow(eng.fresh_var(), ph, lk, nm);  // value-param arrow
+            }
+            if (paramless) class_types_[d.name.txt] = ph;
+            else class_ctor_types_[d.name.txt] = ph;
+            pend.push_back({&d, std::move(params), std::move(lets), ps, ph, paramless});
+          }
+          for (auto& pe : pend) {
+            const ClassDeclaration& d = *pe.d;
+            // The class's TYPE params (`class ['a] lambda_ops`) scope over the
+            // body's annotations and `constraint` fields; the object then
+            // carries the CLASS name (`'a lambda_ops`), and `new c` gets the
+            // constructor arrow over the value params (mixin2).
+            std::unordered_map<std::string, TypePtr> cvars;
+            std::vector<TypePtr> tparams;
+            for (auto& p : d.params) {
+              TypePtr v = eng.fresh_var();
+              if (auto* pv2 = std::get_if<Ptyp_var>(&p->desc))
+                cvars[pv2->name] = v;
+              tparams.push_back(v);
+            }
+            std::vector<TypePtr> ptys;
+            std::vector<std::pair<std::string, TypePtr>> instvars;
+            TypePtr ot = infer_object_body(pe.ps->cs, pe.params.empty() ? nullptr : &pe.params,
+                                           pe.lets.empty() ? nullptr : &pe.lets,
+                                           d.params.empty() ? nullptr : &cvars,
+                                           &ptys, &instvars);
+            class_instvars_[d.name.txt] = std::move(instvars);
+            // Unify the pre-registered placeholder with the real inferred
+            // ctor/object type so forward `new` uses (which grabbed the
+            // placeholder) flow back into this class' body.
+            if (pe.paramless) {
+              try_unify(pe.placeholder, ot);
+            } else {
+              TypePtr obj = I::Engine::repr(ot);
+              if (obj->kind == I::Type::Kind::Object && !d.params.empty()) {
+                obj->abbrev = d.name.txt;
+                obj->abbrev_args = tparams;
               }
+              TypePtr ctor = ot;
+              for (size_t i = ptys.size(); i-- > 0;) {
+                auto [lk, nm] = arglabel(pe.params[i]->label);
+                ctor = eng.arrow(ptys[i], ctor, lk, nm);
+              }
+              try_unify(pe.placeholder, ctor);
             }
           }
+          eng.leave_level();
+          // Generalise each scheme now that the group is closed, so each later
+          // `new c` instantiates fresh.
+          for (auto& pe : pend) eng.generalize(pe.placeholder);
         } else if (auto* pct = std::get_if<Pstr_class_type>(&it.desc)) {
           if (!strict)
             for (auto& d : pct->decls)
