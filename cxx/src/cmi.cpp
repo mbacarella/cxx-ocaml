@@ -922,7 +922,6 @@ struct TyEmit {
   // Papply(Pdot(Pident(G Stdlib__Set), "Make"), Pdot(Pident(G Stdlib), "String")).
   // Null when a component can't be placed.
   o::ValPtr module_app_path(const std::string& s) {
-    bool has_app = s.find('(') != std::string::npos;
     o::ValPtr path;
     std::size_t i = 0;
     while (i < s.size()) {
@@ -937,7 +936,11 @@ struct TyEmit {
         } else {
           std::string g = global_of(id);
           if (referenced) (*referenced)[g] = true;
-          if (g.rfind("Stdlib__", 0) == 0 && !has_app) {
+          // A head WRITTEN as the mangled unit (a strengthening manifest the
+          // writer generated itself) stays the raw unit global; a source-
+          // written pervasive head routes through the Stdlib alias, printing
+          // back as written (`Set.Make(X).t` in a declared signature).
+          if (g.rfind("Stdlib__", 0) == 0 && id.rfind("Stdlib__", 0) != 0) {
             if (referenced) (*referenced)["Stdlib"] = true;
             path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
             path = o::vblock(1, {path, o::vstr(g.substr(8))});

@@ -9887,6 +9887,39 @@ static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
   }
 }
 
+static std::vector<std::string> split_dotted(const std::string& s) {
+  std::vector<std::string> out;
+  for (std::size_t p = 0, d; p <= s.size(); p = d + 1) {
+    d = s.find('.', p);
+    if (d == std::string::npos) d = s.size();
+    out.push_back(s.substr(p, d - p));
+  }
+  return out;
+}
+
+// Signature items of a QUALIFIED named module type ("Set.S",
+// "Pqueue.OrderedType"), resolved through the head module's compiled cmi.
+static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
+    const std::vector<std::string>& comps) {
+  if (comps.size() < 2) return {};
+  try {
+    auto cmif = cmi::CmiFile::load(head_cmi(comps[0]));
+    const cmi::Signature* sig = &cmif.sig();
+    for (std::size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+      const cmi::ModuleDecl* md = nullptr;
+      for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+      sig = (md && md->type && md->type->kind == cmi::ModuleType::Sig)
+                ? md->type->sig.get() : nullptr;
+    }
+    if (!sig) return {};
+    for (auto& mtd : sig->modtypes)
+      if (mtd.name == comps.back() && mtd.type &&
+          mtd.type->kind == cmi::ModuleType::Sig && mtd.type->sig)
+        return cmi_sig_to_items(*mtd.type->sig);
+  } catch (...) {}
+  return {};
+}
+
 // The Sig_module item for one module binding, by shape: a structure body is
 // inferred recursively; `module M : sig .. end = ..` takes the CONSTRAINT
 // signature verbatim (it is authoritative, like a .mli); a functor emits
@@ -9915,6 +9948,35 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     if (mc->mt) {
       if (auto* ps = std::get_if<Pmty_signature>(&mc->mt->desc))
         return cmi::cmiw::sig_module(name, signature_to_cmi(ps->items));
+      // `module M : S with type t = u = ..`: ocamlc records the constrained
+      // signature EXPANDED (the ascription is authoritative; a `with` can't
+      // stay a plain Mty_ident).  Resolve the base modtype (local AST or the
+      // head module's cmi) and graft the refinements.
+      if (ckp && std::holds_alternative<Pmty_with>(mc->mt->desc)) {
+        const ast::ModuleType* base = mc->mt.get();
+        while (auto* pw = std::get_if<Pmty_with>(&base->desc)) base = pw->mt.get();
+        std::vector<cmi::cmiw::SigItem> items;
+        if (auto* pid = std::get_if<Pmty_ident>(&base->desc)) {
+          std::string ref = lid_full(pid->id.txt);
+          if (ref.find('.') == std::string::npos) {
+            if (auto q = ckp->opened_modtype_quals_.find(ref);
+                q != ckp->opened_modtype_quals_.end())
+              ref = q->second;
+            else if (auto a = ckp->modtype_sig_asts_.find(ref);
+                     a != ckp->modtype_sig_asts_.end())
+              items = signature_to_cmi(*a->second);
+          }
+          if (items.empty() && ref.find('.') != std::string::npos)
+            items = cmi_modtype_items(split_dotted(ref));
+        } else if (auto* psg = std::get_if<Pmty_signature>(&base->desc)) {
+          items = signature_to_cmi(psg->items);
+        }
+        if (!items.empty()) {
+          apply_with_constraints(*ckp, *mc->mt, items);
+          drop_modsubst(items, with_modsubst_names(*mc->mt));
+          return cmi::cmiw::sig_module(name, std::move(items));
+        }
+      }
       if (auto* pid = std::get_if<Pmty_ident>(&mc->mt->desc)) {
         // `module M : S = struct .. end`: ocamlc records Mty_ident(S); the
         // inferred structure stays the fallback layout.
@@ -10036,9 +10098,13 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         qc.insert(qc.end(), comps.begin() + 1, comps.end());
         comps = std::move(qc);
       }
+    bool stdlib_unit_head = false;  // strengthen with the mangled unit head
     if (!resolved && comps.size() >= 2) {  // a functor from a compiled .cmi
       try {
-        auto cmif = cmi::CmiFile::load(head_cmi(comps[0]));
+        std::string hc = head_cmi(comps[0]);
+        std::string base = hc.substr(hc.rfind('/') + 1);
+        stdlib_unit_head = base.rfind("stdlib__", 0) == 0;
+        auto cmif = cmi::CmiFile::load(hc);
         const cmi::Signature* sig = &cmif.sig();
         const cmi::ModuleType* mt = nullptr;
         for (std::size_t i = 1; i < comps.size(); ++i) {
@@ -10121,8 +10187,13 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       } else { all_paths = false; break; }
     }
     if (all_paths) {
+      // ocamlc's strengthening cites the RAW compilation unit
+      // (Stdlib__Set.Make(X).t) -- unlike a source-written path, which keeps
+      // the pervasive alias form.  The writer keys the raw form off the
+      // explicit Stdlib__ prefix.
       std::string app;
       for (auto& cp : comps) { if (!app.empty()) app += '.'; app += cp; }
+      if (stdlib_unit_head) app = "Stdlib__" + app;
       for (auto& ap : argpaths) app += "(" + ap + ")";
       strengthen_abstract(result, app);
     }
