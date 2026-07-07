@@ -9027,14 +9027,18 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     }
     cmi::cmiw::TyPtr manifest = nullptr;
     if (d.manifest) {
-      // A FLAT closed polymorphic-variant abbreviation (`type view = [ `A | `B ]`,
-      // all direct tags, no inheritance): emit its tag set so a consumer's
-      // `#view` pattern resolves the tags cross-module.  An abbreviation that
-      // INHERITS another polyvariant (`[ Simple.view | `Or ]`) is left abstract --
-      // emitting only its direct tags would be an INCOMPLETE set (wrongly matching).
+      // A FLAT polymorphic-variant abbreviation with all-direct tags (no
+      // inheritance, no conjunctive `of t1 & t2`): emit its row so a consumer's
+      // `#view` pattern resolves the tags cross-module and Printtyp renders the
+      // `[ .. ]` / `[> .. ]` / `[< .. ]` bound verbatim.  The bound maps to a
+      // row_kind: exact `[ ]` -> 2 (row_more Tnil), open `[> ]` -> 0 (row_more
+      // Tvar, all RFpresent), upper `[< .. > present]` -> 1 (present tags
+      // RFpresent, the rest RFeither).  An abbreviation that INHERITS another
+      // polyvariant (`[ Simple.view | `Or ]`) is left abstract -- emitting only
+      // its direct tags would be an INCOMPLETE set (wrongly matching).
       if (auto* pv = std::get_if<Ptyp_variant>(&d.manifest->get()->desc)) {
         std::vector<std::string> tags; std::vector<cmi::cmiw::TyPtr> targs;
-        bool all_tag = pv->closed == ClosedFlag::Closed && !pv->labels;
+        bool all_tag = true;
         for (auto& rf : pv->rows) {
           auto* rt = std::get_if<Rtag>(&rf);
           if (!rt || rt->types.size() > 1) { all_tag = false; break; }  // inherit / `of t1 & t2`
@@ -9044,9 +9048,14 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
                               : bridge_ty_named(ck.from_coretype(*rt->types[0], tvars),
                                                 bvars, nextvar, tvars));
         }
-        if (all_tag && !tags.empty())
+        if (all_tag && !tags.empty()) {
+          int rk; std::vector<std::string> present;
+          if (pv->closed == ClosedFlag::Open) rk = 0;            // `[> .. ]`
+          else if (pv->labels) { rk = 1; present = *pv->labels; }  // `[< .. > present]`
+          else rk = 2;                                            // `[ .. ]` exact
           manifest = cmi::cmiw::ty_variant_row(std::move(tags), std::move(targs),
-                                               2 /*exact*/, {});
+                                               rk, std::move(present));
+        }
       }
       if (!manifest) manifest = bridge_ty_named(ck.from_coretype(**d.manifest, tvars), bvars, nextvar, tvars);
     }
