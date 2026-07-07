@@ -1108,11 +1108,27 @@ struct Checker {
       if (strict) return eng.fresh_var();
       std::vector<std::string> ms;
       std::vector<TypePtr> ts;
-      for (auto& f : ob->fields)
+      for (auto& f : ob->fields) {
         if (auto* ot = std::get_if<Otag>(&f)) {
           ms.push_back(ot->name.txt);
           ts.push_back(from_coretype(*ot->type, vars));
+        } else if (auto* oi = std::get_if<Oinherit>(&f)) {
+          // `< foo : int; ob; .. >`: an INHERITED local object abbreviation
+          // splices its fields (one level; t01's obj_type gets ob's `f`).
+          if (auto* pc = std::get_if<Ptyp_constr>(&oi->type->desc))
+            if (pc->args.empty())
+              if (auto* l = std::get_if<Lident>(&pc->id.txt.v))
+                if (auto ai = type_aliases.find(l->name);
+                    ai != type_aliases.end() && ai->second.manifest)
+                  if (auto* iob = std::get_if<Ptyp_object>(
+                          &ai->second.manifest->desc))
+                    for (auto& f2 : iob->fields)
+                      if (auto* ot2 = std::get_if<Otag>(&f2)) {
+                        ms.push_back(ot2->name.txt);
+                        ts.push_back(from_coretype(*ot2->type, vars));
+                      }
         }
+      }
       TypePtr r = eng.object_type(std::move(ms), std::move(ts));
       if (ob->closed == ClosedFlag::Open) r->variant_kind = 1;  // `< ..; .. >`
       return r;
@@ -8948,6 +8964,49 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
 // `[< .. > present]` -> 1 (present tags RFpresent, the rest RFeither).  An
 // abbreviation that INHERITS another polyvariant (`[ Simple.view | `Or ]`)
 // returns null (emitting only its direct tags would be an INCOMPLETE set).
+// Collect a Ptyp_variant's tags.  An INHERITED row (`[ `B | g | `C ]`) is
+// spliced when it resolves to a local abbreviation whose manifest is itself an
+// EXACT flat polyvariant (a complete tag set), recursively; the writer stores
+// row_fields sorted, so splice position doesn't matter (ocamlc prints
+// alphabetically).  Returns false when any field isn't representable
+// (conjunctive `of t1 & t2`, an unresolvable/open inherit).
+static bool collect_pv_row(
+    Checker& ck, const Ptyp_variant& pv,
+    std::vector<std::string>& tags, std::vector<cmi::cmiw::TyPtr>& targs,
+    std::unordered_map<std::string, TypePtr>& tvars,
+    std::unordered_map<const I::Type*, int>& bvars, int& nextvar,
+    std::set<std::string>& visiting, bool allow_inherit) {
+  for (auto& rf : pv.rows) {
+    if (auto* rt = std::get_if<Rtag>(&rf)) {
+      if (rt->types.size() > 1) return false;  // conjunctive `of t1 & t2`
+      tags.push_back(rt->name);
+      targs.push_back(rt->constant || rt->types.empty()
+                          ? nullptr
+                          : bridge_ty_named(ck.from_coretype(*rt->types[0], tvars),
+                                            bvars, nextvar, tvars));
+    } else if (auto* ri = std::get_if<Rinherit>(&rf)) {
+      if (!allow_inherit) return false;
+      auto* pc = std::get_if<Ptyp_constr>(&ri->ct->desc);
+      if (!pc || !pc->args.empty()) return false;
+      auto* l = std::get_if<Lident>(&pc->id.txt.v);
+      if (!l || visiting.count(l->name)) return false;
+      auto ai = ck.type_aliases.find(l->name);
+      if (ai == ck.type_aliases.end() || !ai->second.manifest) return false;
+      auto* ipv = std::get_if<Ptyp_variant>(&ai->second.manifest->desc);
+      if (!ipv || ipv->closed != ClosedFlag::Closed || ipv->labels)
+        return false;  // only an EXACT inherited row is a complete tag set
+      visiting.insert(l->name);
+      if (!collect_pv_row(ck, *ipv, tags, targs, tvars, bvars, nextvar,
+                          visiting, true))
+        return false;
+      visiting.erase(l->name);
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
 static cmi::cmiw::TyPtr pv_row_manifest(
     Checker& ck, const ast::CoreType& t,
     std::unordered_map<std::string, TypePtr>& tvars,
@@ -8955,20 +9014,16 @@ static cmi::cmiw::TyPtr pv_row_manifest(
   auto* pv = std::get_if<Ptyp_variant>(&t.desc);
   if (!pv) return nullptr;
   std::vector<std::string> tags; std::vector<cmi::cmiw::TyPtr> targs;
-  for (auto& rf : pv->rows) {
-    auto* rt = std::get_if<Rtag>(&rf);
-    if (!rt || rt->types.size() > 1) return nullptr;  // inherit / `of t1 & t2`
-    tags.push_back(rt->name);
-    targs.push_back(rt->constant || rt->types.empty()
-                        ? nullptr
-                        : bridge_ty_named(ck.from_coretype(*rt->types[0], tvars),
-                                          bvars, nextvar, tvars));
-  }
-  if (tags.empty()) return nullptr;
   int rk; std::vector<std::string> present;
   if (pv->closed == ClosedFlag::Open) rk = 0;            // `[> .. ]`
   else if (pv->labels) { rk = 1; present = *pv->labels; }  // `[< .. > present]`
   else rk = 2;                                            // `[ .. ]` exact
+  std::set<std::string> visiting;
+  // Inherit-splicing only inside an EXACT row (the spliced set stays complete).
+  if (!collect_pv_row(ck, *pv, tags, targs, tvars, bvars, nextvar, visiting,
+                      /*allow_inherit=*/rk == 2))
+    return nullptr;
+  if (tags.empty()) return nullptr;
   return cmi::cmiw::ty_variant_row(std::move(tags), std::move(targs), rk,
                                    std::move(present));
 }
