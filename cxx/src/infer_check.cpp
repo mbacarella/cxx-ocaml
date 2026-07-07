@@ -12526,10 +12526,18 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       for (auto& d : pc->decls) {
         const ast::ClassExpr* ce = &d.expr;
         std::vector<const Pcl_fun*> cparams;
+        // `class b : B.a = object .. end`: a NAMED class-type annotation is
+        // stored by ocamlc as Cty_constr(B.a, args, inner) and printed
+        // `class b : B.a` -- capture the name while unwrapping.
+        std::string annot_ref;
         for (;;) {
           if (auto* pf = std::get_if<Pcl_fun>(&ce->desc)) { cparams.push_back(pf); ce = pf->body.get(); }
           else if (auto* pl = std::get_if<Pcl_let>(&ce->desc)) ce = pl->body.get();
-          else if (auto* pcn = std::get_if<Pcl_constraint>(&ce->desc)) ce = pcn->ce.get();
+          else if (auto* pcn = std::get_if<Pcl_constraint>(&ce->desc)) {
+            if (auto* cc = std::get_if<Pcty_constr>(&pcn->ct->desc))
+              annot_ref = lid_full(cc->id.txt);
+            ce = pcn->ce.get();
+          }
           else if (auto* po = std::get_if<Pcl_open>(&ce->desc)) ce = po->body.get();
           else break;
         }
@@ -12567,6 +12575,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         ci.name = d.name.txt;
         ci.rec_status = class_rs; class_rs = 2;
         ci.class_virtual = (d.virt == VirtualFlag::Virtual);
+        ci.class_constr_ref = annot_ref;
         std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
         // ONE bridge context spans the whole class: fields citing the self
         // object (or any shared row) bridge to the SAME Ty node, so the

@@ -1732,17 +1732,22 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       auto csig = o::vblock(0, {self, row_var, o::vint(2) /*dummy FKabsent*/,
                                 build_map(std::move(vars_m)), build_map(std::move(meths_m))});
       o::ValPtr cty = o::vblock(1, {csig});  // Cty_signature
-      // An ALIAS class (`class c = with_param args`): the stored class type
+      // An ALIAS class (`class c = with_param args`) or a NAMED class-type
+      // annotation (`class b : B.a = object..end`): the stored class type
       // is Cty_constr(target, [], inner) -- Printtyp prints `class c :
-      // with_param` from the path.  Bare local targets only for now.
-      if (!it.class_constr_ref.empty() &&
-          it.class_constr_ref.find('.') == std::string::npos)
-        if (auto lc = local_classes.find(it.class_constr_ref);
-            lc != local_classes.end()) {
-          o::ValPtr cp = o::vblock(0, {o::vblock(0,
-              {o::vstr(it.class_constr_ref), o::vint(lc->second)})});  // Pident(Local)
-          cty = o::vblock(0, {cp, o::vint(0) /*[]*/, cty});  // Cty_constr
+      // with_param` from the path.
+      if (!it.class_constr_ref.empty()) {
+        o::ValPtr cp;
+        if (it.class_constr_ref.find('.') == std::string::npos) {
+          if (auto lc = local_classes.find(it.class_constr_ref);
+              lc != local_classes.end())
+            cp = o::vblock(0, {o::vblock(0,
+                {o::vstr(it.class_constr_ref), o::vint(lc->second)})});  // Pident(Local)
+        } else {
+          cp = te.type_path(it.class_constr_ref);  // local-mod / global Pdot chain
         }
+        if (cp) cty = o::vblock(0, {cp, o::vint(0) /*[]*/, cty});  // Cty_constr
+      }
       for (std::size_t p = it.class_arrow_doms.size(); p-- > 0;) {
         int lk = p < it.class_arrow_lks.size() ? it.class_arrow_lks[p] : 0;
         const std::string& lb = p < it.class_arrow_lbls.size() ? it.class_arrow_lbls[p]
