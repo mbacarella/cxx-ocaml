@@ -10346,8 +10346,12 @@ static const std::vector<cmi::cmiw::SigItem>* g_outer_prior = nullptr;
 static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
                                 const std::string& app) {
   for (auto& si : items) {
-    if (si.k == cmi::cmiw::SigItem::Type && !si.manifest && si.ctors.empty() &&
-        si.labels.empty() && !si.type_open && !si.type_empty_variant) {
+    // Like Mtype.strengthen: abstract AND datatype (record/variant) decls
+    // gain the `= path.t` manifest alongside their kind (`type t = A.t =
+    // { x : int; }`); the params are SHARED into the manifest args so
+    // `type 'a t = 'a A.t = ..` prints one var.
+    if (si.k == cmi::cmiw::SigItem::Type && !si.manifest &&
+        !si.type_open && !si.type_empty_variant) {
       std::vector<cmi::cmiw::TyPtr> as(si.params.begin(), si.params.end());
       si.manifest = cmi::cmiw::ty_constr(app + "." + si.name, std::move(as));
     } else if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
@@ -10384,6 +10388,41 @@ static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
     rewrite_item_ty_names(si.sub, fn);
     rewrite_item_ty_names(si.param_sig, fn);
     for (auto& ps : si.more_param_sigs) rewrite_item_ty_names(ps, fn);
+  }
+}
+
+// Deep-copy the Ty trees hanging off SigItems (memo preserves node sharing,
+// so `as 'a` rows survive).  Needed before an IN-PLACE rewrite of items copied
+// from another SigItem -- the TyPtr nodes are shared with the original.
+static cmi::cmiw::TyPtr ty_deep_copy(
+    const cmi::cmiw::TyPtr& t,
+    std::unordered_map<const cmi::cmiw::Ty*, cmi::cmiw::TyPtr>& memo) {
+  if (!t) return nullptr;
+  if (auto it = memo.find(t.get()); it != memo.end()) return it->second;
+  auto c = std::make_shared<cmi::cmiw::Ty>(*t);
+  memo[t.get()] = c;
+  for (auto& a : c->args) a = ty_deep_copy(a, memo);
+  return c;
+}
+static void items_deep_copy_tys(
+    std::vector<cmi::cmiw::SigItem>& items,
+    std::unordered_map<const cmi::cmiw::Ty*, cmi::cmiw::TyPtr>& memo) {
+  for (auto& si : items) {
+    auto cp = [&](cmi::cmiw::TyPtr& p) { p = ty_deep_copy(p, memo); };
+    cp(si.ty); cp(si.manifest);
+    for (auto& p : si.params) cp(p);
+    for (auto& c : si.ctors) {
+      for (auto& a : c.args) cp(a);
+      for (auto& l : c.inline_record) cp(l.ty);
+      cp(c.res);
+    }
+    for (auto& l : si.labels) cp(l.ty);
+    cp(si.ext_ret);
+    for (auto& f : si.class_fields) cp(f.ty);
+    for (auto& d : si.class_arrow_doms) cp(d);
+    items_deep_copy_tys(si.sub, memo);
+    items_deep_copy_tys(si.param_sig, memo);
+    for (auto& ps : si.more_param_sigs) items_deep_copy_tys(ps, memo);
   }
 }
 
@@ -10485,7 +10524,15 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     const std::vector<cmi::cmiw::SigItem>* prior = nullptr,
     Checker* ckp = nullptr) {
   if (auto* ms = std::get_if<Pmod_structure>(&me.desc))
-    return cmi::cmiw::sig_module(name, infer_signature(ms->items));
+  {
+    // The enclosing scope's items travel as g_outer_prior so a nested
+    // `module R = M(T)` resolves an OUTER local functor M (pr5469).
+    auto* saved_prior = g_outer_prior;
+    if (prior) g_outer_prior = prior;
+    auto items = infer_signature(ms->items);
+    g_outer_prior = saved_prior;
+    return cmi::cmiw::sig_module(name, std::move(items));
+  }
   if (auto* pi = std::get_if<Pmod_ident>(&me.desc)) {
     // `module MP = Gc.Memprof` / `module Alias = A`: a module alias binding.
     // ocamlc records Mty_alias(<target path>) (Mp_absent -- transparent, takes
@@ -10853,6 +10900,58 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           }
       }
     }
+    // A DOTTED head whose module chain is LOCAL (`module StrM =
+    // Msg.Define(..)` with Msg bound above): descend the already-emitted
+    // items to the functor.  Bare refs in its result that name the enclosing
+    // module's members requalify through it (`tag` -> `Msg.tag`) -- outside
+    // Msg they no longer resolve locally.
+    if (!resolved && comps.size() >= 2) {
+      for (auto* scope : {prior, g_outer_prior}) {
+        if (!scope || resolved) continue;
+        const std::vector<cmi::cmiw::SigItem>* cur = scope;
+        for (std::size_t i = 0; i + 1 < comps.size() && cur; ++i) {
+          const std::vector<cmi::cmiw::SigItem>* next = nullptr;
+          for (auto& si : *cur)
+            if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
+                si.name == comps[i]) { next = &si.sub; break; }
+          cur = next;
+        }
+        if (!cur) continue;
+        for (auto& si : *cur)
+          if (si.k == cmi::cmiw::SigItem::Module && si.is_functor &&
+              si.name == comps.back() &&
+              args.size() == 1 + si.more_param_names.size()) {
+            pnames.push_back(si.functor_param);
+            for (auto& n : si.more_param_names) pnames.push_back(n);
+            result = si.sub;
+            result_ref = si.functor_result_ref;
+            {  // unshare before the in-place qual rewrite below
+              std::unordered_map<const cmi::cmiw::Ty*, cmi::cmiw::TyPtr> memo;
+              items_deep_copy_tys(result, memo);
+            }
+            std::string prefix = comps[0];
+            for (std::size_t i = 1; i + 1 < comps.size(); ++i)
+              prefix += "." + comps[i];
+            std::set<std::string> encl, own;
+            for (auto& x : *cur)
+              if (x.k == cmi::cmiw::SigItem::Type ||
+                  x.k == cmi::cmiw::SigItem::Module) encl.insert(x.name);
+            for (auto& x : result)
+              if (x.k == cmi::cmiw::SigItem::Type ||
+                  x.k == cmi::cmiw::SigItem::Module) own.insert(x.name);
+            auto qual = [&](std::string& n) {
+              std::string head = n.substr(0, n.find('.'));
+              if (encl.count(head) && !own.count(head)) n = prefix + "." + n;
+            };
+            rewrite_item_ty_names(result, qual);
+            for (auto& x : result)
+              if (x.k == cmi::cmiw::SigItem::Exception && !x.ext_path.empty())
+                qual(x.ext_path);
+            resolved = true;
+            break;
+          }
+      }
+    }
     // An opened module's submodule head (`open MoreLabels` then `Map.Make`):
     // requalify so the LABELLED Map/Set/Hashtbl is the one loaded.
     if (!resolved && ckp)
@@ -11138,12 +11237,41 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       }
     } else if (auto* px = std::get_if<Pstr_typext>(&it.desc)) {
       bool first = true;
-      for (auto& ec : px->ext.ctors)
-        if (!ec.name.txt.empty())
-          if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
-            out.push_back(exn_sigitem(ck, ec.name.txt, *pd, &px->ext, first));
-            first = false;
+      for (auto& ec : px->ext.ctors) {
+        if (ec.name.txt.empty()) continue;
+        if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
+          out.push_back(exn_sigitem(ck, ec.name.txt, *pd, &px->ext, first));
+          first = false;
+        } else if (auto* rb = std::get_if<Pext_rebind>(&ec.kind)) {
+          // `type 'a Msg.tag += String = StrM.C`: clone the target ctor's
+          // typext item (args/return travel along) under the new name.
+          auto comps = split_dotted(lid_full(rb->id.txt));
+          const std::vector<cmi::cmiw::SigItem>* cur = &out;
+          for (std::size_t i = 0; i + 1 < comps.size() && cur; ++i) {
+            const std::vector<cmi::cmiw::SigItem>* next = nullptr;
+            for (auto& si : *cur)
+              if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
+                  si.name == comps[i]) { next = &si.sub; break; }
+            cur = next;
           }
+          if (!cur) continue;
+          for (auto& si : *cur)
+            if (si.k == cmi::cmiw::SigItem::Exception &&
+                si.name == comps.back()) {
+              cmi::cmiw::SigItem ni = si;
+              std::vector<cmi::cmiw::SigItem> one{std::move(ni)};
+              std::unordered_map<const cmi::cmiw::Ty*, cmi::cmiw::TyPtr> memo;
+              items_deep_copy_tys(one, memo);
+              one[0].name = ec.name.txt;
+              one[0].ext_path = lid_full(px->ext.path.txt);
+              one[0].ext_params = typext_param_names(px->ext);
+              one[0].text_kind = first ? 0 : 1;
+              out.push_back(std::move(one[0]));
+              first = false;
+              break;
+            }
+        }
+      }
     } else if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {
       // `module type S = sig .. end` in a .ml (no .mli): emit Sig_modtype so the
       // inferred .cmi carries it (a modtype takes no runtime field, so it never
