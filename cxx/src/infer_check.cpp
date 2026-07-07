@@ -1679,6 +1679,24 @@ struct Checker {
   // Value name -> declared type of a signature's `val` items, with the abstract
   // types named in `argtypes` substituted (arrow labels are preserved, so an
   // optional param survives).
+  // Is this coretype a CLOSED simple shape (constrs/tuples/arrows of concrete
+  // names, no type variables)?  Conservative: anything else says no, so the
+  // phantom-abbreviation fold below only fires on shapes we can translate.
+  static bool closed_simple_coretype(const CoreType& t) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      for (auto& a : c->args)
+        if (!closed_simple_coretype(*a)) return false;
+      return true;
+    }
+    if (auto* ar = std::get_if<Ptyp_arrow>(&t.desc))
+      return closed_simple_coretype(*ar->dom) && closed_simple_coretype(*ar->cod);
+    if (auto* tp = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : tp->elems)
+        if (!closed_simple_coretype(*e)) return false;
+      return true;
+    }
+    return false;
+  }
   std::unordered_map<std::string, TypePtr> sig_items_value_schemes(
       const ast::Signature& items,
       const std::unordered_map<std::string, TypePtr>& argtypes,
@@ -1699,6 +1717,17 @@ struct Checker {
           else if (!qual.empty() && d.params.empty())
             functor_result_abstract_[d.name.txt] =
                 eng.constr(qual + "." + d.name.txt, {});
+          // A parameterized abbreviation with a CLOSED manifest (`type 'a u
+          // = string`, phantom params) folds to the manifest at use sites --
+          // ocamlc gives `let t = M.f ()` (f : unit -> 'a u t) the type
+          // `string M.t`, not `'a M.u M.t`; a manifest citing its params
+          // (`'a u = 'a list`) stays qualified (pr5663).
+          else if (!qual.empty() && d.manifest &&
+                   closed_simple_coretype(**d.manifest)) {
+            std::unordered_map<std::string, TypePtr> mv;
+            functor_result_abstract_[d.name.txt] =
+                from_coretype(**d.manifest, mv);
+          }
           else if (!qual.empty())
             functor_param_type_quals_[d.name.txt] = qual + "." + d.name.txt;
         }
