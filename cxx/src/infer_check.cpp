@@ -522,6 +522,9 @@ struct Checker {
   // name -> qualified path; uses rebuild `('r) T.t` with the written args
   // (the nullary map above can't carry args).  Scoped like the map above.
   std::unordered_map<std::string, std::string> functor_param_type_quals_;
+  // ROW-PHANTOM aliases from a functor-param/include sig (`type 'a mr =
+  // [< .. ] as 'a`): an application expands to the arg tied to the bound.
+  std::unordered_map<std::string, Alias> row_phantom_aliases_;
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
@@ -1128,6 +1131,48 @@ struct Checker {
         }
         return r;
       }
+      // A ROW-PHANTOM alias registered from a functor-param/include sig:
+      // `R mr` IS R (manifest = the param), tied to the row bound -- return
+      // the arg so inferred use sites hold the bare row (pr7601's Make).
+      if (!strict && !expanding_.count(nm))
+        if (auto rp = row_phantom_aliases_.find(nm);
+            rp != row_phantom_aliases_.end() &&
+            rp->second.params.size() == as.size()) {
+          auto* al = std::get_if<Ptyp_alias>(&rp->second.manifest->desc);
+          std::size_t pi = rp->second.params.size();
+          for (std::size_t i = 0; i < rp->second.params.size(); ++i)
+            if (rp->second.params[i] == al->name) { pi = i; break; }
+          if (pi < as.size()) {
+            std::unordered_map<std::string, TypePtr> sub;
+            for (std::size_t i = 0; i < as.size(); ++i)
+              if (!rp->second.params[i].empty()) sub[rp->second.params[i]] = as[i];
+            expanding_.insert(nm);
+            from_coretype(*rp->second.manifest, sub);  // ties the arg to the bound
+            expanding_.erase(nm);
+            return I::Engine::repr(as[pi]);
+          }
+        }
+      // A ROW-PHANTOM alias (`type 'a mr = [< `L of t .. ] as 'a` -- the
+      // param IS the row): applying it ties the WRITTEN arg to the row bound,
+      // pinning the arg's `_` slots to the declared types (pr7601's
+      // `[ `Location of _ | .. ] maybe_region`).  Side effect only -- the
+      // application still emits as the folded opaque Tconstr below.
+      if (!strict && ai != type_aliases.end() &&
+          ai->second.params.size() == as.size() && !as.empty() &&
+          !expanding_.count(nm))
+        if (auto* al = std::get_if<Ptyp_alias>(&ai->second.manifest->desc))
+          if (std::holds_alternative<Ptyp_variant>(al->type->desc)) {
+            bool is_param = false;
+            for (auto& p : ai->second.params) is_param |= (p == al->name);
+            if (is_param) {
+              std::unordered_map<std::string, TypePtr> sub;
+              for (size_t i = 0; i < as.size(); ++i)
+                if (!ai->second.params[i].empty()) sub[ai->second.params[i]] = as[i];
+              expanding_.insert(nm);
+              from_coretype(*ai->second.manifest, sub);  // Ptyp_alias unifies the arg with the bound
+              expanding_.erase(nm);
+            }
+          }
       // A PHANTOM abbreviation (`type 'a arg_t = 'at constraint 'a = (module
       // Y.S with type t = 'at)`) has a bare-variable manifest bound only
       // through its constraints: expand it even in the folded display pass
@@ -1775,6 +1820,7 @@ struct Checker {
     std::unordered_map<std::string, TypePtr> out;
     auto saved = functor_result_abstract_;
     auto saved_pq = functor_param_type_quals_;
+    auto saved_rp = row_phantom_aliases_;
     for (auto& it : items)
       if (auto* t = std::get_if<Psig_type>(&it.desc))
         for (auto& d : t->decls) {
@@ -1799,6 +1845,30 @@ struct Checker {
             functor_result_abstract_[d.name.txt] =
                 from_coretype(**d.manifest, mv);
           }
+          // A ROW-PHANTOM alias (`type 'a mr = [< .. ] as 'a`): an application
+          // `R mr` IS R tied to the bound, so the include/param scheme holds
+          // the EXPANSION -- ocamlc's inferred use sites print the bare row
+          // (pr7601's Make).  Registered for the val conversions below.
+          else if (!d.params.empty() && d.manifest) {
+            if (auto* al = std::get_if<Ptyp_alias>(&(*d.manifest)->desc);
+                al && std::holds_alternative<Ptyp_variant>(al->type->desc)) {
+              Alias a;
+              for (auto& p : d.params) {
+                auto* v = std::get_if<Ptyp_var>(&p->desc);
+                a.params.push_back(v ? v->name : "");
+              }
+              bool is_param = false;
+              for (auto& p : a.params) is_param |= (p == al->name);
+              if (is_param) {
+                a.manifest = d.manifest->get();
+                row_phantom_aliases_[d.name.txt] = std::move(a);
+              } else if (!qual.empty()) {
+                functor_param_type_quals_[d.name.txt] = qual + "." + d.name.txt;
+              }
+            } else if (!qual.empty()) {
+              functor_param_type_quals_[d.name.txt] = qual + "." + d.name.txt;
+            }
+          }
           else if (!qual.empty())
             functor_param_type_quals_[d.name.txt] = qual + "." + d.name.txt;
         }
@@ -1817,6 +1887,7 @@ struct Checker {
       }
     functor_result_abstract_ = std::move(saved);
     functor_param_type_quals_ = std::move(saved_pq);
+    row_phantom_aliases_ = std::move(saved_rp);
     return out;
   }
 
@@ -11336,6 +11407,8 @@ static void rewrite_ty_names(const cmi::cmiw::TyPtr& t,
   if (!t) return;
   if (t->k == cmi::cmiw::Ty::Constr || t->k == cmi::cmiw::Ty::Package) fn(t->name);
   for (auto& a : t->args) rewrite_ty_names(a, fn);
+  if (!t->row_name.empty()) fn(t->row_name);
+  for (auto& a : t->row_name_args) rewrite_ty_names(a, fn);
 }
 static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
                                   const std::function<void(std::string&)>& fn) {
@@ -12437,6 +12510,11 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         local_mod_defs[nm] = raw_applied(path);
   }
   std::vector<cmi::cmiw::SigItem> out;
+  // `include <functor param>` re-exports the param's types locally
+  // (`type t = Analysis.t`): later inferred vals citing the param-qualified
+  // path are rewritten to the LOCAL re-export, like ocamlc's strengthened
+  // include (pr7601's Make).
+  std::unordered_map<std::string, std::string> include_requal;
   g_enclosing_struct_items = &out;  // sig-side `module type of <local module>`
   // A submodule emitted below is re-inferred with a fresh checker; hand it the
   // opens active here (inherited + this level's, accumulated in source order).
@@ -12468,6 +12546,11 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               std::string head = n.substr(0, n.find('.'));
               if (auto d = local_mod_defs.find(head); d != local_mod_defs.end())
                 n = d->second + n.substr(head.size());
+            });
+          if (!include_requal.empty())
+            rewrite_ty_names(ty, [&](std::string& n) {
+              if (auto q = include_requal.find(n); q != include_requal.end())
+                n = q->second;
             });
           out.push_back(cmi::cmiw::sig_value(nm, std::move(ty)));
         }
@@ -13090,7 +13173,11 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               std::vector<cmi::cmiw::SigItem> sub;
               annot_modtype_items(&ck, *fp.second, ref, sub);
               strengthen_abstract(sub, lid_last(mi->id.txt));
-              for (auto& si : sub) out.push_back(std::move(si));
+              for (auto& si : sub) {
+                if (si.k == cmi::cmiw::SigItem::Type)
+                  include_requal[fp.first + "." + si.name] = si.name;
+                out.push_back(std::move(si));
+              }
               break;
             }
         // `include N` where N's binding wasn't a plain struct (a functor
