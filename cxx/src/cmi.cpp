@@ -1331,9 +1331,18 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                             const std::vector<SigItem>& psig_items,
                             const std::string& ref) -> o::ValPtr {
           if (unit) return o::vint(0);  // functor_parameter = Unit
-          int pstamp = stamp++;
-          auto pident = o::vblock(0, {o::vstr(pname), o::vint(pstamp)});  // Ident.Local
-          visible_mod_body[pname] = pstamp;
+          // An anonymous parameter (`sig .. end -> X` or `functor (_ : S)`) has
+          // no binder: ocamlc stores Named(None, <sig>), which Printtyp collapses
+          // to the arrow form `<sig> -> ..` (no `( : ..)` wrapper).
+          o::ValPtr name_opt;
+          if (pname.empty()) {
+            name_opt = o::vint(0);  // None
+          } else {
+            int pstamp = stamp++;
+            auto pident = o::vblock(0, {o::vstr(pname), o::vint(pstamp)});  // Ident.Local
+            visible_mod_body[pname] = pstamp;
+            name_opt = o::vblock(0, {pident});  // Some
+          }
           // A NAMED param modtype (`(K : Key)`) emits Mty_ident(Key) like
           // ocamlc; the inlined signature is the fallback.
           o::ValPtr psig;
@@ -1341,7 +1350,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
             if (o::ValPtr mp = modtype_path(ref)) psig = o::vblock(0, {mp});  // Mty_ident
           if (!psig)
             psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body))});  // Mty_signature
-          return o::vblock(0, {o::vblock(0, {pident}) /*Some*/, psig});  // Named(Some, <param sig>)
+          return o::vblock(0, {name_opt, psig});  // Named(name_opt, <param sig>)
         };
         std::vector<o::ValPtr> params;
         params.push_back(mk_param(it.functor_unit, it.functor_param, it.param_sig,
