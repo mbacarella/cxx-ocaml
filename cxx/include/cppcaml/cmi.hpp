@@ -389,6 +389,12 @@ struct SigItem {
   // (`(K : Key)`) emits Mty_ident(Key), not the inlined signature -- ocamlc
   // stores (and prints) the name.  Empty = inline param_sig.
   std::string functor_param_ref;
+  // Functor: a FIRST parameter that is ITSELF a functor (higher-order,
+  // `(MakeDiet : (X : ORD) -> SET with ..)`): 0 or 1 element, a Module
+  // SigItem with is_functor describing the parameter's module type; the
+  // emitter reuses functor-module emission and takes its md_type.  When
+  // non-empty it overrides param_sig/functor_param_ref.
+  std::vector<SigItem> param_functor;
   std::vector<std::string> more_param_refs;
   // Module: `module MD5 : S` -- the decl's modtype is the NAMED reference S
   // (Mty_ident), not S's expansion.  Empty = Mty_signature(sub).

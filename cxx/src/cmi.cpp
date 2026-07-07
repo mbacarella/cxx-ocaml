@@ -1466,7 +1466,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         std::unordered_map<std::string, int> visible_mod_body = visible_mod;
         auto mk_param = [&](bool unit, const std::string& pname,
                             const std::vector<SigItem>& psig_items,
-                            const std::string& ref) -> o::ValPtr {
+                            const std::string& ref,
+                            const std::vector<SigItem>* pfunc = nullptr) -> o::ValPtr {
           if (unit) return o::vint(0);  // functor_parameter = Unit
           // An anonymous parameter (`sig .. end -> X` or `functor (_ : S)`) has
           // no binder: ocamlc stores Named(None, <sig>), which Printtyp collapses
@@ -1483,7 +1484,18 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           // A NAMED param modtype (`(K : Key)`) emits Mty_ident(Key) like
           // ocamlc; the inlined signature is the fallback.
           o::ValPtr psig;
-          if (!ref.empty())
+          // A HIGHER-ORDER param (`(F : (X : S) -> T)`): emit the carried
+          // functor Module item through this very function (recursion) and
+          // reuse its module_declaration's md_type as the parameter type.
+          // Sig_module = block(3, {ident, presence, md, ..}); md_type = md[0].
+          if (pfunc && !pfunc->empty()) {
+            auto emitted = emit_sig_items({(*pfunc)[0]}, referenced, stamp,
+                                          &visible, &visible_mt, &visible_mod_body);
+            if (emitted.size() == 1 && emitted[0]->fields.size() >= 3 &&
+                !emitted[0]->fields[2]->fields.empty())
+              psig = emitted[0]->fields[2]->fields[0];
+          }
+          if (!psig && !ref.empty())
             if (o::ValPtr mp = modtype_path(ref, &visible_mod_body)) psig = o::vblock(0, {mp});  // Mty_ident
           if (!psig)
             psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body))});  // Mty_signature
@@ -1491,7 +1503,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         };
         std::vector<o::ValPtr> params;
         params.push_back(mk_param(it.functor_unit, it.functor_param, it.param_sig,
-                                  it.functor_param_ref));
+                                  it.functor_param_ref, &it.param_functor));
         for (std::size_t p = 0; p < it.more_param_names.size(); ++p)
           params.push_back(mk_param(p < it.more_param_units.size() && it.more_param_units[p],
                                     it.more_param_names[p],

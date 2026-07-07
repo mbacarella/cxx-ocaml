@@ -11476,6 +11476,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     // Collect the whole CURRIED parameter chain (`(X : S) (Y : T) -> ..` --
     // each parameter after the first lives in a nested Pmod_functor body).
     struct P { std::string name, ref; std::vector<cmi::cmiw::SigItem> sig;
+               std::vector<cmi::cmiw::SigItem> fsig;  // higher-order param
                bool unit = false; const ast::ModuleType* mt_ast = nullptr; };
     std::vector<P> ps;
     const ast::ModuleExpr* cur = &me;
@@ -11488,6 +11489,28 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           p.mt_ast = fn->type.get();
           if (auto* psg = std::get_if<Pmty_signature>(&fn->type->desc))
             p.sig = signature_to_cmi(psg->items);
+          // A HIGHER-ORDER parameter (`(MakeDiet : functor (X : ORD) -> SET
+          // with ..)`, t17ok): describe the param as a functor Module item;
+          // the emitter reuses functor emission for its module type.
+          if (auto* hpf = std::get_if<Pmty_functor>(&fn->type->desc)) {
+            std::string ipname, ipref, iresref;
+            std::vector<cmi::cmiw::SigItem> ipsig, ires;
+            bool iunit = std::holds_alternative<Functor_unit>(hpf->param);
+            if (auto* ifn = std::get_if<Functor_named>(&hpf->param)) {
+              if (ifn->name.txt) ipname = *ifn->name.txt;
+              if (ifn->type) annot_modtype_items(ckp, *ifn->type, ipref, ipsig);
+            }
+            const ast::ModuleType* ibody = hpf->body.get();
+            annot_modtype_items(ckp, *ibody, iresref, ires);
+            if (!std::holds_alternative<Pmty_ident>(ibody->desc)) iresref.clear();
+            auto fit = cmi::cmiw::sig_module_functor(p.name, ipname,
+                                                     std::move(ipsig),
+                                                     std::move(ires));
+            fit.functor_unit = iunit;
+            fit.functor_param_ref = std::move(ipref);
+            fit.functor_result_ref = std::move(iresref);
+            p.fsig.push_back(std::move(fit));
+          }
           if (auto* pid = std::get_if<Pmty_ident>(&fn->type->desc)) {
             p.ref = lid_full(pid->id.txt);
             // A bare ref declared by an opened module cites the QUALIFIED
@@ -11643,6 +11666,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     item.functor_result_ref = std::move(result_ref);
     item.functor_unit = ps[0].unit;
     item.functor_param_ref = std::move(ps[0].ref);
+    item.param_functor = std::move(ps[0].fsig);
     for (std::size_t i = 1; i < ps.size(); ++i) {
       item.more_param_names.push_back(std::move(ps[i].name));
       item.more_param_sigs.push_back(std::move(ps[i].sig));
