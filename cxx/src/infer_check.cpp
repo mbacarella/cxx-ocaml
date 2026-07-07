@@ -530,6 +530,11 @@ struct Checker {
   // constraints against its args (pr4775's `'a A.t` pins 'a to `[> ]`), and
   // a bare-var (phantom) manifest expands to the arg in constraint position.
   std::unordered_map<std::string, Alias> param_sig_type_decls_;
+  // Every type name a functor param's sig declares (abstract included), keyed by
+  // the param name: `open X` (X a functor param, no cmi on disk) registers each
+  // `t` -> `X.t` in opened_type_quals_ so a bare `'a op` after `open X` resolves
+  // to `'a X.op` instead of degrading to a fresh var (shallow2deep).
+  std::unordered_map<std::string, std::vector<std::string>> param_sig_type_names_;
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
@@ -1577,6 +1582,18 @@ struct Checker {
   // qualified; Stdlib is the default-open we instead SHORTEN, so skip it).
   std::unordered_map<std::string, std::string> opened_type_quals_;
   std::unordered_map<std::string, std::string> opened_submod_quals_;  // Array1 -> Bigarray.Array1
+  // `open X` where X is an enclosing FUNCTOR PARAMETER (no cmi on disk): its
+  // sig's type names were harvested into param_sig_type_names_ at param
+  // registration; register each `t` -> `X.t` so a bare use afterwards resolves
+  // to the qualified path (shallow2deep's `'a op` -> `'a X.op`).
+  void load_open_param_type_quals(const Longident& m) {
+    auto* pl = std::get_if<Lident>(&m.v);
+    if (!pl) return;
+    auto it = param_sig_type_names_.find(pl->name);
+    if (it == param_sig_type_names_.end()) return;
+    for (auto& t : it->second)
+      opened_type_quals_[t] = pl->name + "." + t;
+  }
   void load_open_type_quals(const Longident& m) {
     auto comps = mod_components(m);
     if (comps.empty() || comps[0] == "Stdlib") return;
@@ -2007,6 +2024,7 @@ struct Checker {
     for (auto& it : *items) {
       if (auto* t = std::get_if<Psig_type>(&it.desc)) {
         for (auto& d : t->decls) {
+          param_sig_type_names_[pn].push_back(d.name.txt);
           if (d.manifest || !d.constraints.empty()) {
             Alias a;
             for (auto& p : d.params) {
@@ -7751,6 +7769,7 @@ struct Checker {
     load_open_submod_quals(m);
     if (!strict) {
       load_open_type_quals(m);
+      load_open_param_type_quals(m);
       open_module_ctors(m);
       load_open_module_aliases(m);
     }
@@ -8308,6 +8327,7 @@ struct Checker {
             load_open_submod_quals(pi->id.txt);  // bare Sub -> M.Sub (every pass)
             if (!strict) {
               load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
+              load_open_param_type_quals(pi->id.txt);  // functor-param X.t
               open_module_ctors(pi->id.txt);     // bare ctor -> M's variant ctor
               load_open_module_aliases(pi->id.txt);  // bare List -> ListLabels
             }
