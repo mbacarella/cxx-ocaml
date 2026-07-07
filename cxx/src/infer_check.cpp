@@ -2243,6 +2243,16 @@ struct Checker {
       const cmi::ModuleType* cur = mt;
       for (int i = 0; i < napp && cur; ++i)
         cur = (cur->kind == cmi::ModuleType::Functor) ? cur->functor_body.get() : nullptr;
+      // A NAMED result modtype (`module F() : Ret`): resolve Ret in the
+      // signature the functor was found in, like the param side above
+      // (missing_set_of_closures' `let module X = A.F() in X.g`).
+      if (cur && cur->kind == cmi::ModuleType::Ident && cur->path && parent) {
+        const cmi::Path* p = cur->path.get();
+        const std::string& nm = p->kind == cmi::Path::Pdot ? p->s : p->id.name;
+        cur = nullptr;
+        for (auto& mtd : parent->modtypes)
+          if (mtd.name == nm) { cur = mtd.type.get(); break; }
+      }
       if (cur && cur->kind == cmi::ModuleType::Sig && cur->sig) {
         // Name the result's abstract types after the binding (`M.t`), by
         // translating the value schemes with the result sig as the same-module
