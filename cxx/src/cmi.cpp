@@ -1030,7 +1030,11 @@ struct TyEmit {
       std::string g = global_of(comps[0]);
       if (referenced) (*referenced)[g] = true;  // a real type ref needs the CRC
       o::ValPtr path;
-      if (g.rfind("Stdlib__", 0) == 0) {
+      // Like module_app_path: a head WRITTEN as the mangled unit (a
+      // strengthening manifest the writer generated itself, `type 'a t =
+      // 'a Stdlib__Queue.t`) stays the raw unit global; a source-written
+      // pervasive head routes through the Stdlib alias.
+      if (g.rfind("Stdlib__", 0) == 0 && comps[0].rfind("Stdlib__", 0) != 0) {
         if (referenced) (*referenced)["Stdlib"] = true;
         path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});  // Pident(Global Stdlib)
         path = o::vblock(1, {path, o::vstr(g.substr(8))});         // Pdot(_, alias member)

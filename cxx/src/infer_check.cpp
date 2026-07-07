@@ -11723,6 +11723,11 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // opens active here (inherited + this level's, accumulated in source order).
   auto* saved_inherited_opens = g_inherited_opens;
   g_inherited_opens = &active;
+  // `include <compilation unit>` splices, recorded for the end-of-emission
+  // requalification pass: (emitted size after the splice, unit name as
+  // written, the spliced top-level type names).
+  std::vector<std::tuple<std::size_t, std::string, std::set<std::string>>>
+      unit_includes;
   for (auto& it : s) {
     if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
       if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc);
@@ -12332,6 +12337,43 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               inc_path = si.name;  // mark handled
               break;
             }
+        // `include Queue` of a COMPILATION UNIT (stdlib or a -I dir), bound
+        // by nothing local: splice its compiled cmi signature strengthened at
+        // the unit path -- ocamlc records `type 'a t = 'a Stdlib__Queue.t`,
+        // `exception Empty`, and every included val citing the spliced LOCAL
+        // t (lib-queue, lib-stack).  Members inferred AFTER the include cite
+        // that local t too (ocamlc's env binds the included ident), so the
+        // spliced type names are requalified over the tail of this module
+        // once emission finishes (unit_includes).
+        if (!inc && inc_path.empty() &&
+            std::holds_alternative<Lident>(mi->id.txt.v)) {
+          std::string unm = lid_last(mi->id.txt);
+          bool bound_local = false;
+          for (auto& it2 : s)
+            if (auto* mb2 = std::get_if<Pstr_module>(&it2.desc))
+              if (mb2->binding.name.txt && *mb2->binding.name.txt == unm)
+                bound_local = true;
+          if (fparams)
+            for (auto& fp : *fparams)
+              if (fp.first == unm) bound_local = true;
+          std::string ucmi = head_cmi(unm);
+          if (!bound_local && std::filesystem::exists(ucmi)) try {
+            auto cmif = cmi::CmiFile::load(ucmi);
+            auto items = cmi_sig_to_items(cmif.sig(), unm);
+            // Strengthen at the unit's MANGLED name: ocamlc's manifests keep
+            // the raw path (`type 'a t = 'a Stdlib__Queue.t`).
+            strengthen_abstract(items, cmif.module_name().empty()
+                                           ? unm
+                                           : cmif.module_name(),
+                                /*aliasable=*/true);
+            std::set<std::string> tnames;
+            for (auto& si : items)
+              if (si.k == cmi::cmiw::SigItem::Type) tnames.insert(si.name);
+            for (auto& si : items) out.push_back(std::move(si));
+            unit_includes.push_back({out.size(), unm, std::move(tnames)});
+            inc_path = unm;  // mark handled
+          } catch (...) {}
+        }
       }
       if (inc) {
         auto items = infer_signature(*inc);
@@ -12359,6 +12401,26 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // external `Lexer.token` reads the wrong block field (a closure where a token is
   // expected -> a SWITCH past its table -> heap corruption).  The explicit-.mli
   // path (signature_to_cmi) already dedups identically.
+  // `include <unit>` requalification: members emitted after the splice cite
+  // the spliced LOCAL types (`val to_list : 'a t`, not 'a Stdlib__Queue.t --
+  // ocamlc's env binds the included type ident); the strengthening manifests
+  // and pre-include members keep the qualified path.
+  for (auto& [istart, iunit, itnames] : unit_includes) {
+    if (istart >= out.size()) continue;
+    std::vector<cmi::cmiw::SigItem> tail(
+        std::make_move_iterator(out.begin() + (std::ptrdiff_t)istart),
+        std::make_move_iterator(out.end()));
+    out.resize(istart);
+    rewrite_item_ty_names(tail, [&](std::string& nm) {
+      auto d = nm.rfind('.');
+      if (d == std::string::npos) return;
+      std::string t = nm.substr(d + 1);
+      if (!itnames.count(t)) return;
+      std::string head = nm.substr(0, d);
+      if (head == iunit || head == "Stdlib__" + iunit) nm = t;
+    });
+    for (auto& si : tail) out.push_back(std::move(si));
+  }
   // `module MP = Gc.Memprof` aliases: ocamlc records value types THROUGH the
   // alias (MP.allocation, a Local-ident head), so rewrite each aliased prefix
   // back onto the emitted constr paths.  Longest target first (nested aliases).
