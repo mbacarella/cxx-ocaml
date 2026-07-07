@@ -381,6 +381,9 @@ struct SigItem {
   std::vector<int> class_arrow_lks;       // 0 Nolabel / 1 Labelled / 2 Optional
   std::vector<std::string> class_arrow_lbls;
   bool class_virtual = false;             // `class virtual c` -> cty_new = None
+  int class_self_param = -1;              // `object (self : 'a)`: the cty_params
+                                          // index whose var IS csig_self, so
+                                          // Printtyp shows `object ('a) constraint`
   // `class type ct = object .. end`: emit only Sig_class_type + its ghost
   // Sig_type (TWO stamps); arrows/cty_new don't apply.
   bool class_is_type = false;

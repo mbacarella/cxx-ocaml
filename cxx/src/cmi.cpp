@@ -1540,7 +1540,11 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       auto cty_params = [&] {
         if (it.class_params.empty()) return o::vint(0);
         std::vector<o::ValPtr> ps;
-        for (auto& p : it.class_params) ps.push_back(te.emit(p));
+        for (std::size_t pi = 0; pi < it.class_params.size(); ++pi)
+          // A self-typed param (`object (self : 'a)`) shares the SAME node as
+          // csig_self, so Printtyp aliases it and prints `object ('a) constraint`.
+          ps.push_back((int)pi == it.class_self_param ? self
+                                                      : te.emit(it.class_params[pi]));
         return o::vlist(ps);
       };
       auto cty_variance = [&] {

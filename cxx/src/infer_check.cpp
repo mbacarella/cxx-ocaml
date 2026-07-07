@@ -10607,6 +10607,27 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               pv->var_name = "_";
             ci.class_params.push_back(pv);
           }
+        // `object (self : 'a)` or `(self : T as 'a)` where 'a is a class param:
+        // the self type IS that param, so record its index -- the writer then
+        // shares csig_self with cty_params[idx] and Printtyp shows `object ('a)
+        // constraint 'a = <..>` (pr4766, pr5156).
+        if (!ci.class_params.empty()) {
+          const ast::Pattern* sp = &pst->cs.self;
+          const ast::CoreType* sct = nullptr;
+          while (auto* pcn = std::get_if<Ppat_constraint>(&sp->desc)) {
+            sct = pcn->t.get();
+            sp = pcn->p.get();
+          }
+          std::string selfvar;
+          if (sct) {
+            if (auto* pv = std::get_if<Ptyp_var>(&sct->desc)) selfvar = pv->name;
+            else if (auto* pa = std::get_if<Ptyp_alias>(&sct->desc)) selfvar = pa->name;
+          }
+          if (!selfvar.empty())
+            for (std::size_t pi = 0; pi < d.params.size(); ++pi)
+              if (auto* pv = std::get_if<Ptyp_var>(&d.params[pi]->desc); pv && pv->name == selfvar)
+                ci.class_self_param = (int)pi;
+        }
         std::unordered_map<std::string, TypePtr> vtypes;
         if (auto f = ck.class_instvars_.find(d.name.txt); f != ck.class_instvars_.end())
           for (auto& [vn, vt] : f->second) vtypes[vn] = vt;
