@@ -8995,6 +8995,12 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed;
       si.type_unboxed = unboxed;
+      // A re-exported datatype (`type s = t = A | B`) carries BOTH a manifest
+      // (the `= t` equation) and the variant kind: ocamlc stores type_manifest =
+      // Some (Tconstr t) alongside Type_variant.  Bridge the manifest (sharing
+      // the param var-ids) so Printtyp renders the `= t =` link.
+      if (d.manifest)
+        si.manifest = bridge_ty_named(ck.from_coretype(**d.manifest, tvars), bvars, nextvar, tvars);
       out.push_back(std::move(si));
       continue;
     }
@@ -9012,6 +9018,10 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed;
       si.type_unboxed = unboxed;
+      // A re-exported record (`type s = t = { .. }`) keeps its `= t` manifest
+      // alongside the record kind, just like the variant case above.
+      if (d.manifest)
+        si.manifest = bridge_ty_named(ck.from_coretype(**d.manifest, tvars), bvars, nextvar, tvars);
       out.push_back(std::move(si));
       continue;
     }
