@@ -525,6 +525,11 @@ struct Checker {
   // ROW-PHANTOM aliases from a functor-param/include sig (`type 'a mr =
   // [< .. ] as 'a`): an application expands to the arg tied to the bound.
   std::unordered_map<std::string, Alias> row_phantom_aliases_;
+  // Functor-param sig type decls with manifests/constraints, keyed by the
+  // QUALIFIED name ("A.t"): an application in the body solves the decl's
+  // constraints against its args (pr4775's `'a A.t` pins 'a to `[> ]`), and
+  // a bare-var (phantom) manifest expands to the arg in constraint position.
+  std::unordered_map<std::string, Alias> param_sig_type_decls_;
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
@@ -882,7 +887,9 @@ struct Checker {
       // Accept rows built from explicit tags (`Rtag`) and/or inherited row types
       // (`Rinherit`, e.g. `[< int u]` -- the inherited type's tags form the allowed
       // bound, kept unexpanded for display).  Non-strict only.
-      bool simple = !pvr->rows.empty();
+      // An EMPTY open row `[> ]` is legal (pr4775's `constraint 'a = [> ]`);
+      // an empty exact/upper row is not written syntax.
+      bool simple = !pvr->rows.empty() || pvr->closed == ClosedFlag::Open;
       if (!strict && simple) {
         // A SINGLE inherit of a known local variant alias (`[> 'a lambda]`)
         // is that abbreviation's expansion at the written bound: tags come
@@ -1069,7 +1076,12 @@ struct Checker {
       // module's parameterized type (`Pos.t` vs `Immutable_array.'a t`) would
       // otherwise grow a spurious Any arg -- which poisons a signature
       // ascription's value translation (test_generator's `Pos.t` params).
-      auto ar = type_arity.find(lid_last(c->id.txt));
+      // Bare names only: a DOTTED head's arity is its own module's business --
+      // padding `'a A.t` from the flat bare-name map (keyed "t", possibly this
+      // body's own 2-ary t) invented `('a, 'd) A.t` (pr4775).
+      auto ar = std::holds_alternative<Lident>(c->id.txt.v)
+                    ? type_arity.find(lid_last(c->id.txt))
+                    : type_arity.end();
       if (ar != type_arity.end() && !as.empty())
         // Strict pads with Any (absorbs -- can't false-reject); the display
         // passes pad with a fresh VAR so the slot can be pinned by the body
@@ -1939,6 +1951,33 @@ struct Checker {
   // land in the flat fields_ map (emplace -- a local record's own labels,
   // registered later by run_checker's assignment, still win).
   std::unordered_map<std::string, TypePtr> param_ctor_schemes_;
+  // Solve a functor-param decl's constraints against an application's args
+  // (`'a A.t` under A : Poly pins 'a to `[> ]`, pr4775).  Returns the PHANTOM
+  // expansion (a bare-var manifest bound to a param -> that arg) or null;
+  // callers in constraint position substitute it, manifest callers keep the
+  // fold and take the side effect only.
+  TypePtr solve_param_sig_constraints(const TypePtr& t0) {
+    if (strict) return nullptr;
+    TypePtr t = I::Engine::repr(t0);
+    if (t->kind != I::Type::Kind::Constr) return nullptr;
+    auto pd = param_sig_type_decls_.find(t->path);
+    if (pd == param_sig_type_decls_.end() ||
+        pd->second.params.size() != t->args.size() || expanding_.count(t->path))
+      return nullptr;
+    std::unordered_map<std::string, TypePtr> sub;
+    for (std::size_t i = 0; i < t->args.size(); ++i)
+      if (!pd->second.params[i].empty()) sub[pd->second.params[i]] = t->args[i];
+    expanding_.insert(t->path);
+    if (pd->second.constraints)
+      for (auto& tc : *pd->second.constraints)
+        soft_unify(from_coretype(*tc.t1, sub), from_coretype(*tc.t2, sub));
+    TypePtr rep = nullptr;
+    if (pd->second.manifest)
+      if (auto* v = std::get_if<Ptyp_var>(&pd->second.manifest->desc))
+        if (auto s = sub.find(v->name); s != sub.end()) rep = s->second;
+    expanding_.erase(t->path);
+    return rep;
+  }
   void register_param_sig_members(const std::string& pn, const ModuleType& ps) {
     const ast::Signature* items = nullptr;
     if (auto* sg = std::get_if<Pmty_signature>(&ps.desc)) items = &sg->items;
@@ -1968,6 +2007,16 @@ struct Checker {
     for (auto& it : *items) {
       if (auto* t = std::get_if<Psig_type>(&it.desc)) {
         for (auto& d : t->decls) {
+          if (d.manifest || !d.constraints.empty()) {
+            Alias a;
+            for (auto& p : d.params) {
+              auto* v = std::get_if<Ptyp_var>(&p->desc);
+              a.params.push_back(v ? v->name : "");
+            }
+            a.manifest = d.manifest ? d.manifest->get() : nullptr;
+            if (!d.constraints.empty()) a.constraints = &d.constraints;
+            param_sig_type_decls_[pn + "." + d.name.txt] = std::move(a);
+          }
           std::unordered_map<std::string, TypePtr> vars;
           std::vector<TypePtr> params;
           for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
@@ -9853,6 +9902,11 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     for (auto& con : d.constraints) {
       TypePtr lhs = fc(*con.t1);  // sequenced: fc's keep.push_back can
       TypePtr rhs = fc(*con.t2);  // reallocate and dangle a prior fc ref
+      // A functor-param type in constraint position (`'b B.t`) solves its
+      // decl's own constraints and, when phantom, EXPANDS to the arg --
+      // ocamlc stores `constraint 'b = 'a`, not the folded B.t (pr4775).
+      if (TypePtr ex = ck.solve_param_sig_constraints(lhs)) lhs = ex;
+      if (TypePtr ex = ck.solve_param_sig_constraints(rhs)) rhs = ex;
       ck.soft_unify(lhs, rhs);
     }
     // An ABSTRACT decl's manifest converts to the ENGINE before the params
@@ -9861,8 +9915,12 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     // row, and the bridge then shares the one node.
     TypePtr eman = nullptr;
     if (d.manifest && !std::holds_alternative<Ptype_variant>(d.kind) &&
-        !std::holds_alternative<Ptype_record>(d.kind))
+        !std::holds_alternative<Ptype_record>(d.kind)) {
       eman = fc(**d.manifest);
+      // A functor-param type as the manifest (`= 'a A.t`) keeps the fold but
+      // still solves its decl's constraints (pinning 'a to `[> ]`, pr4775).
+      ck.solve_param_sig_constraints(eman);
+    }
     std::vector<cmi::cmiw::TyPtr> params;
     for (size_t pi = 0; pi < d.params.size(); ++pi) {
       auto& p = d.params[pi];
@@ -11222,6 +11280,9 @@ struct FunctorArgSubst {
   std::string param;     // parameter name ("Ord"); empty = nothing to rewrite
   std::string arg_path;  // path argument ("String", "Digest.MD5")
   std::unordered_map<std::string, cmi::cmiw::TyPtr> manifests;  // struct argument
+  // struct argument, PHANTOM decl (`type 'a t = 'a ..`: manifest == params[i]):
+  // an application substitutes to its i-th argument (pr4775's `'a A.t` -> 'a)
+  std::unordered_map<std::string, int> phantoms;
 };
 // Does `name` contain `comp` as a whole PATH COMPONENT?  Components are
 // delimited by '.', '(' and ')' -- so "Ord" is found in "Ord.t" and in
@@ -11267,11 +11328,18 @@ static bool ty_mentions_unsubst_param(const cmi::cmiw::TyPtr& t,
     if (ty_mentions_unsubst_param(a, subs)) return true;
   return false;
 }
-static cmi::cmiw::TyPtr subst_param_ty(const cmi::cmiw::TyPtr& t,
-                                       const std::vector<FunctorArgSubst>& subs) {
+static cmi::cmiw::TyPtr subst_param_ty(
+    const cmi::cmiw::TyPtr& t, const std::vector<FunctorArgSubst>& subs,
+    std::unordered_map<const cmi::cmiw::Ty*, cmi::cmiw::TyPtr>& memo) {
   if (!t) return t;
+  // Memoized per item: a node cited twice (a constrained param shared into
+  // the manifest) must substitute to ONE node, or Printtyp loses the `'a`
+  // aliasing (pr4775's `type ('a,'b) t = 'a`); also terminates cyclic types.
+  if (auto it = memo.find(t.get()); it != memo.end()) return it->second;
   auto r = std::make_shared<cmi::cmiw::Ty>(*t);  // never mutate shared nodes
-  for (auto& a : r->args) a = subst_param_ty(a, subs);
+  memo[t.get()] = r;
+  for (auto& a : r->args) a = subst_param_ty(a, subs, memo);
+  for (auto& a : r->row_name_args) a = subst_param_ty(a, subs, memo);
   if (r->k == cmi::cmiw::Ty::Constr || r->k == cmi::cmiw::Ty::Package) {
     for (auto& s : subs) {
       if (s.param.empty() || !path_has_component(r->name, s.param)) continue;
@@ -11279,7 +11347,14 @@ static cmi::cmiw::TyPtr subst_param_ty(const cmi::cmiw::TyPtr& t,
           r->name.rfind(s.param + ".", 0) == 0)
         if (auto m = s.manifests.find(r->name.substr(s.param.size() + 1));
             m != s.manifests.end())
-          return m->second;
+          return memo[t.get()] = m->second;
+      if (r->k == cmi::cmiw::Ty::Constr && !r->args.empty() &&
+          r->name.rfind(s.param + ".", 0) == 0)
+        if (auto ph = s.phantoms.find(r->name.substr(s.param.size() + 1));
+            ph != s.phantoms.end() &&
+            (std::size_t)ph->second < r->args.size())
+          // args already substituted above
+          return memo[t.get()] = r->args[ph->second];
       if (!s.arg_path.empty())
         r->name = path_replace_component(r->name, s.param, s.arg_path);
       break;
@@ -11290,23 +11365,25 @@ static cmi::cmiw::TyPtr subst_param_ty(const cmi::cmiw::TyPtr& t,
 static void subst_param_items(std::vector<cmi::cmiw::SigItem>& items,
                               const std::vector<FunctorArgSubst>& subs) {
   for (auto& si : items) {
-    si.ty = subst_param_ty(si.ty, subs);
+    std::unordered_map<const cmi::cmiw::Ty*, cmi::cmiw::TyPtr> memo;
+    si.ty = subst_param_ty(si.ty, subs, memo);
     // A manifest that STILL mentions an anonymous-argument parameter after
     // substitution can't be expressed (`'a t = 'a Map.Make(Ord).t`): erase it,
     // leaving the decl abstract with its recorded variance -- as ocamlc does.
-    si.manifest = subst_param_ty(si.manifest, subs);
+    si.manifest = subst_param_ty(si.manifest, subs, memo);
     if (si.k == cmi::cmiw::SigItem::Type && si.manifest &&
         ty_mentions_unsubst_param(si.manifest, subs))
       si.manifest = nullptr;
+    for (auto& p : si.params) p = subst_param_ty(p, subs, memo);
     for (auto& c : si.ctors) {
-      for (auto& a : c.args) a = subst_param_ty(a, subs);
-      for (auto& l : c.inline_record) l.ty = subst_param_ty(l.ty, subs);
-      c.res = subst_param_ty(c.res, subs);
+      for (auto& a : c.args) a = subst_param_ty(a, subs, memo);
+      for (auto& l : c.inline_record) l.ty = subst_param_ty(l.ty, subs, memo);
+      c.res = subst_param_ty(c.res, subs, memo);
     }
-    for (auto& l : si.labels) l.ty = subst_param_ty(l.ty, subs);
-    si.ext_ret = subst_param_ty(si.ext_ret, subs);
-    for (auto& f : si.class_fields) f.ty = subst_param_ty(f.ty, subs);
-    for (auto& d : si.class_arrow_doms) d = subst_param_ty(d, subs);
+    for (auto& l : si.labels) l.ty = subst_param_ty(l.ty, subs, memo);
+    si.ext_ret = subst_param_ty(si.ext_ret, subs, memo);
+    for (auto& f : si.class_fields) f.ty = subst_param_ty(f.ty, subs, memo);
+    for (auto& d : si.class_arrow_doms) d = subst_param_ty(d, subs, memo);
     subst_param_items(si.sub, subs);
     subst_param_items(si.param_sig, subs);
     for (auto& ps : si.more_param_sigs) subst_param_items(ps, subs);
@@ -12290,14 +12367,25 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           }
         } else if (auto* ast_ = std::get_if<Pmod_structure>(&am->desc)) {
           // An anonymous struct argument: its manifests eliminate the
-          // parameter (`Ord.t` -> `int`).  Arity-0 substitution only.
+          // parameter (`Ord.t` -> `int`).  Arity-0 substitution, plus
+          // PHANTOM decls (manifest == a param: `'a t = 'a`) which
+          // substitute an application to its argument.
           for (auto& ai : infer_signature(ast_->items))
-            if (ai.k == cmi::cmiw::SigItem::Type && ai.manifest &&
-                ai.params.empty())
-              s.manifests[ai.name] = ai.manifest;
+            if (ai.k == cmi::cmiw::SigItem::Type && ai.manifest) {
+              if (ai.params.empty()) {
+                s.manifests[ai.name] = ai.manifest;
+              } else {
+                for (std::size_t pi = 0; pi < ai.params.size(); ++pi)
+                  if (ai.params[pi].get() == ai.manifest.get()) {
+                    s.phantoms[ai.name] = (int)pi;
+                    break;
+                  }
+              }
+            }
         }
       }
-      if (!s.param.empty() && (!s.arg_path.empty() || !s.manifests.empty()))
+      if (!s.param.empty() &&
+          (!s.arg_path.empty() || !s.manifests.empty() || !s.phantoms.empty()))
         subs.push_back(std::move(s));
     }
     // Build the bound item: a plain module, or (partial application) a
