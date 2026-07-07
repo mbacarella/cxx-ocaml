@@ -9636,6 +9636,10 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
                           std::move(param_sig), std::move(result));
           fitem.functor_unit = std::holds_alternative<Functor_unit>(pf->param);
           fitem.functor_param_ref = std::move(param_ref);
+          // `module Make : (M : ..) -> S`: ocamlc stores Mty_ident(S) as the
+          // result; the resolved items above stay the fallback layout.
+          if (auto* rid = std::get_if<Pmty_ident>(&body->desc))
+            fitem.functor_result_ref = lid_full(rid->id.txt);
           for (auto& p : more) {
             fitem.more_param_names.push_back(std::move(p.name));
             fitem.more_param_sigs.push_back(std::move(p.sig));
@@ -10122,6 +10126,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       cur = f->body.get();
     }
     std::vector<cmi::cmiw::SigItem> result;
+    std::string result_ref;
     if (auto* bs = std::get_if<Pmod_structure>(&cur->desc)) {
       std::vector<std::pair<std::string, const ast::ModuleType*>> fps;
       for (auto& p : ps)
@@ -10129,13 +10134,28 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       result = infer_signature(bs->items, fps.empty() ? nullptr : &fps);
     }
     else if (auto* bc = std::get_if<Pmod_constraint>(&cur->desc)) {
-      if (bc->mt)
+      if (bc->mt) {
         if (auto* psg = std::get_if<Pmty_signature>(&bc->mt->desc))
           result = signature_to_cmi(psg->items);
+        else if (auto* rid = std::get_if<Pmty_ident>(&bc->mt->desc)) {
+          // `module F () : Ret = struct .. end`: Mty_ident(Ret) result; the
+          // local modtype's items stay the fallback layout.
+          result_ref = lid_full(rid->id.txt);
+          if (ckp && result_ref.find('.') == std::string::npos) {
+            if (auto q = ckp->opened_modtype_quals_.find(result_ref);
+                q != ckp->opened_modtype_quals_.end())
+              result_ref = q->second;
+            else if (auto a = ckp->modtype_sig_asts_.find(result_ref);
+                     a != ckp->modtype_sig_asts_.end())
+              result = signature_to_cmi(*a->second);
+          }
+        }
+      }
     }
     auto item = cmi::cmiw::sig_module_functor(name, ps[0].name,
                                               std::move(ps[0].sig),
                                               std::move(result));
+    item.functor_result_ref = std::move(result_ref);
     item.functor_unit = ps[0].unit;
     item.functor_param_ref = std::move(ps[0].ref);
     for (std::size_t i = 1; i < ps.size(); ++i) {

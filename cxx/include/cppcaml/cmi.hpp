@@ -368,6 +368,9 @@ struct SigItem {
   // Module: `module MD5 : S` -- the decl's modtype is the NAMED reference S
   // (Mty_ident), not S's expansion.  Empty = Mty_signature(sub).
   std::string modtype_ref;
+  // Functor: a NAMED result modtype (`module F () : Ret`) emits
+  // Mty_ident(Ret) as the body; `sub` stays the resolved fallback layout.
+  std::string functor_result_ref;
   // Class: `class name : dom1 -> .. -> object <fields> end`.  Emitted as
   // Sig_class followed by its two GHOST companions (Sig_class_type + Sig_type
   // of the same name -- the reader's Signature_group asserts they follow, the

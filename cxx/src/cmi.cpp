@@ -1353,7 +1353,14 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                                                   : std::vector<SigItem>{},
                                     p < it.more_param_refs.size() ? it.more_param_refs[p]
                                                                   : std::string()));
-        o::ValPtr body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body))});  // Mty_signature(result)
+        // A NAMED result modtype (`module F () : Ret`) is stored Mty_ident;
+        // the resolved items are the fallback.
+        o::ValPtr body;
+        if (!it.functor_result_ref.empty())
+          if (o::ValPtr rp = modtype_path(it.functor_result_ref))
+            body = o::vblock(0, {rp});  // Mty_ident
+        if (!body)
+          body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body))});  // Mty_signature(result)
         for (auto p = params.rbegin(); p != params.rend(); ++p)
           body = o::vblock(2, {*p, body});  // Mty_functor
         mty = body;
