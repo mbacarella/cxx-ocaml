@@ -123,6 +123,10 @@ struct Checker {
   I::Engine eng;
   // value scopes: name -> scheme (a possibly-generalized type)
   std::vector<std::unordered_map<std::string, TypePtr>> venv{{}};
+  // current object's self type, one entry per nested object body -- `{< .. >}`
+  // (Pexp_override) returns the innermost self, making a `method m = {< >}`
+  // recursive so Printtyp emits the `object ('a) .. method m : 'a end` binder.
+  std::vector<TypePtr> self_ty_stack_;
   // constructor schemes: ctor name -> a chain arg1->..->argN->result (generic)
   std::unordered_map<std::string, TypePtr> ctors;
   // finite variant types: type name -> its full constructor-name set
@@ -5902,6 +5906,9 @@ struct Checker {
       // is the SELF type, which the engine doesn't model -- fresh per
       // occurrence (the object rows core remains future work).
       for (auto& [nm, fe] : ov->fields) infer_expr(*fe);
+      // `{< .. >}` has the self type of the enclosing object; returning it (not a
+      // fresh var) makes `method m = {< >}` recursive so its type IS self.
+      if (!self_ty_stack_.empty()) return self_ty_stack_.back();
       return eng.fresh_var();
     }
     if (auto* xt = std::get_if<Pexp_extension>(&e.desc)) {
@@ -6289,6 +6296,7 @@ struct Checker {
         }
       }
       if (auto* sv = std::get_if<Ppat_var>(&sp->desc)) venv.back()[sv->name.txt] = selfTy;
+      self_ty_stack_.push_back(selfTy);
     }
     // `inherit P args`: bring P's instance vars into scope so the subclass'
     // methods/initializers resolve them (charlie's `y` from bravo).  Done before
@@ -6348,6 +6356,7 @@ struct Checker {
       }
     }
     venv.pop_back();
+    self_ty_stack_.pop_back();
     // A self-coerced object's PUBLIC type is the annotation's row, CLOSED
     // (an object value has exactly its methods): `(T1,T2) ops`, not `#ops`
     // -- private methods (mixin3's `method private map`) are not public
@@ -11602,6 +11611,27 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
   return std::nullopt;
 }
 
+// Does object type `r` appear within its own method args (a recursive self
+// type, as produced by a `method m = {< >}`)?  Such a method's type IS the
+// class' self, which the writer emits as the shared csig_self node.
+static bool object_cites_self(const TypePtr& t) {
+  TypePtr r = I::Engine::repr(t);
+  if (!r || r->kind != I::Type::Kind::Object) return false;
+  std::unordered_set<const I::Type*> seen;
+  std::function<bool(const TypePtr&)> dfs = [&](const TypePtr& x) -> bool {
+    TypePtr xr = I::Engine::repr(x);
+    if (!xr) return false;
+    if (xr.get() == r.get()) return true;
+    if (!seen.insert(xr.get()).second) return false;
+    for (auto& a : xr->args) if (dfs(a)) return true;
+    if (xr->dom && dfs(xr->dom)) return true;
+    if (xr->cod && dfs(xr->cod)) return true;
+    return false;
+  };
+  for (auto& a : r->args) if (dfs(a)) return true;
+  return false;
+}
+
 std::vector<cmi::cmiw::SigItem> infer_signature(
     const ast::Structure& s,
     const std::vector<std::pair<std::string, const ast::ModuleType*>>* fparams) {
@@ -11966,6 +11996,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               std::unordered_map<std::string, TypePtr> tv;
               f.ty = bridge_ty(ck.from_coretype(*cv->type, tv), cvars, cnext);
             } else if (auto m = mtypes.find(f.name); m != mtypes.end()) {
+              // `method m = {< >}` returns self: its type is the recursive self
+              // object.  Flag it so the writer emits the shared csig_self node
+              // (Printtyp then prints `object ('a) .. method m : 'a end`).
+              f.self_ref = object_cites_self(m->second);
               f.ty = bridge_ty(m->second, cvars, cnext);
             } else {
               f.ty = cmi::cmiw::ty_var(cnext++);

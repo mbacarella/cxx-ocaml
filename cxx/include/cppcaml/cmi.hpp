@@ -288,6 +288,10 @@ struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty
 struct ClassField {
   std::string name; TyPtr ty;
   bool is_method = false, mut = false, virt = false, priv = false;
+  // A method whose inferred type IS the object's own self type (`method m =
+  // {< >}`): the writer emits the shared csig_self node so Printtyp aliases the
+  // self-row proxy and prints `object ('a) .. method m : 'a end`.
+  bool self_ref = false;
 };
 struct Ctor {
   std::string name;

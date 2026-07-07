@@ -1558,30 +1558,37 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         };
         return go(0, es.size()).first;
       };
+      // self type: an OPEN object over the public methods (row ends in a Tvar
+      // shared with csig_self_row).  Built up front as a patched placeholder so
+      // a self-returning method (`method m = {< >}`, f.self_ref) can cite the
+      // SAME node -- Printtyp then aliases the self-row proxy and prints
+      // `object ('a) .. method m : 'a end`.
+      o::ValPtr row_var = te.texpr(o::vblock(0, {o::vint(0)}));  // Tvar None
+      o::ValPtr self = te.texpr(o::vint(0));  // Tobject desc patched below
       std::vector<MapEnt> vars_m, meths_m;
-      std::vector<std::string> mnames; std::vector<TyPtr> mtys;  // for cty_new/self
+      std::vector<std::string> mnames;
+      std::vector<o::ValPtr> memit;  // each public method's emitted type node
+      std::vector<TyPtr> mtys;       // for cty_new
       for (auto& f : it.class_fields) {
         if (f.is_method) {
           o::ValPtr priv = f.priv ? o::vblock(0, {o::vint(2) /*FKabsent*/})  // Mprivate
                                   : o::vint(0);                              // Mpublic
-          o::ValPtr mty = te.texpr(o::vblock(8, {te.emit(f.ty), o::vint(0)}));  // Tpoly(ty,[])
+          o::ValPtr fty = f.self_ref ? self : te.emit(f.ty);
+          o::ValPtr mty = te.texpr(o::vblock(8, {fty, o::vint(0)}));  // Tpoly(ty,[])
           meths_m.push_back({f.name, o::vblock(0, {priv, o::vint(f.virt ? 0 : 1), mty})});
-          if (!f.priv) { mnames.push_back(f.name); mtys.push_back(f.ty); }
+          if (!f.priv) { mnames.push_back(f.name); memit.push_back(fty); mtys.push_back(f.ty); }
         } else {
           vars_m.push_back({f.name, o::vblock(0, {o::vint(f.mut ? 1 : 0),
                                                   o::vint(f.virt ? 0 : 1), te.emit(f.ty)})});
         }
       }
-      // self type: an OPEN object over the public methods (row ends in a Tvar
-      // shared with csig_self_row)
-      o::ValPtr row_var = te.texpr(o::vblock(0, {o::vint(0)}));  // Tvar None
       o::ValPtr chain = row_var;
       for (std::size_t m = mnames.size(); m-- > 0;) {
-        o::ValPtr pty = te.texpr(o::vblock(8, {te.emit(mtys[m]), o::vint(0)}));  // Tpoly
+        o::ValPtr pty = te.texpr(o::vblock(8, {memit[m], o::vint(0)}));  // Tpoly
         chain = te.texpr(o::vblock(5, {o::vstr(mnames[m]), o::vint(1) /*FKpublic*/,
                                        pty, chain}));  // Tfield
       }
-      o::ValPtr self = te.texpr(o::vblock(4, {chain, o::vblock(0, {o::vint(0)})}));  // Tobject
+      self->fields[0] = o::vblock(4, {chain, o::vblock(0, {o::vint(0)})});  // Tobject
       auto csig = o::vblock(0, {self, row_var, o::vint(2) /*dummy FKabsent*/,
                                 build_map(std::move(vars_m)), build_map(std::move(meths_m))});
       o::ValPtr cty = o::vblock(1, {csig});  // Cty_signature
