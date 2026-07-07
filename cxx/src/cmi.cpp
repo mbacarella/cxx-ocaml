@@ -1161,7 +1161,16 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     if (auto dot = ref.find('.'); dot != std::string::npos) {
       std::string head = global_of(ref.substr(0, dot));
       referenced.emplace(head, true);
-      o::ValPtr path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global)
+      o::ValPtr path;
+      if (head.rfind("Stdlib__", 0) == 0) {
+        // pervasive head through the Stdlib alias: `(Elem : Map.OrderedType)`
+        // is Pdot(Pdot(Pident(Global Stdlib), "Map"), "OrderedType")
+        referenced.emplace("Stdlib", true);
+        path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+        path = o::vblock(1, {path, o::vstr(head.substr(8))});
+      } else {
+        path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global)
+      }
       for (std::size_t pos = dot; pos != std::string::npos;) {
         std::size_t nd = ref.find('.', pos + 1);
         path = o::vblock(1, {path, o::vstr(ref.substr(pos + 1,
