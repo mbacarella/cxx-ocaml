@@ -274,6 +274,10 @@ struct Ty {
                                // Lets the writer cite the RIGHT `t` when a
                                // module shadows an outer decl of the same name
                                // (ocamlc prints the outer one `t/2`).
+  std::string row_name;        // Variant: a named row bound (`[< int u]`) -- the
+                               // abbreviation's path, emitted as row_desc.row_name
+  std::vector<TyPtr> row_name_args;  // = Some(path, args); Printtyp prints
+                                     // `[< int u > `A ]` instead of the raw tags
 };
 TyPtr ty_variant(std::vector<std::string> tags);      // exact all-constant row
 TyPtr ty_variant_row(std::vector<std::string> tags, std::vector<TyPtr> args,

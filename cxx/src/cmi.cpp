@@ -1294,9 +1294,19 @@ struct TyEmit {
         o::ValPtr more = t->row_kind == 2
                              ? texpr(o::vint(0))                    // Tnil (exact)
                              : texpr(o::vblock(0, {o::vint(0)}));   // Tvar None
+        // A named row bound (`[< int u]`): row_name = Some(path, args) -- the
+        // printer shows `[< int u > `A ]` from the name instead of the raw tags.
+        o::ValPtr rname = o::vint(0);
+        if (!t->row_name.empty())
+          if (o::ValPtr rp = type_path(t->row_name)) {
+            std::vector<o::ValPtr> ra;
+            for (auto& a : t->row_name_args) ra.push_back(emit(a));
+            rname = o::vblock(0, {o::vblock(0, {rp, ra.empty() ? o::vint(0)
+                                                               : o::vlist(ra)})});
+          }
         o::ValPtr rd = o::vblock(0, {fields.empty() ? o::vint(0) : o::vlist(fields),
                                      more, o::vint(t->row_kind != 0 ? 1 : 0) /*row_closed*/,
-                                     o::vint(0) /*row_fixed=None*/, o::vint(0) /*row_name=None*/});
+                                     o::vint(0) /*row_fixed=None*/, rname});
         return texpr(o::vblock(6, {rd}));  // Tvariant of row_desc
       }
       case Ty::Object: {

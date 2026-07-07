@@ -886,14 +886,40 @@ struct Checker {
         // from the alias (so merges union tag-wise and keep the covering
         // name), from_inherit marks the `[ | 'a lambda ]` display form for
         // an exact fixpoint (mixin2/mixin3).
-        if (fold_abbrevs_ && pvr->rows.size() == 1)
+        if ((fold_abbrevs_ || keep_local_abbrevs_) && pvr->rows.size() == 1)
           if (auto* ri0 = std::get_if<Rinherit>(&pvr->rows[0])) {
             TypePtr ex = I::Engine::repr(from_coretype(*ri0->ct, vars));
             if (ex->kind == I::Type::Kind::Variant && !ex->abbrev.empty()) {
               ex->variant_kind =
                   pvr->closed == ClosedFlag::Open ? 0 : (pvr->labels ? 1 : 2);
               ex->from_inherit = true;
+              if (pvr->labels && !pvr->labels->empty())
+                ex->present = *pvr->labels;
               return ex;
+            }
+            // A CHAINED abbreviation (`[< int u]` where u = t, t = [`A|`B]):
+            // the folded conversion stays an opaque constr.  Expand with
+            // folding OFF to reach the row, then stamp the abbreviation AS
+            // WRITTEN back on it -- ocamlc stores the full row with row_name
+            // = (u, [int]) and prints `[< int u > `A ]`.  Exact `[ int u ]`
+            // keeps the old path (a named exact row is a plain Tconstr).
+            int ivk = pvr->closed == ClosedFlag::Open ? 0 : (pvr->labels ? 1 : 2);
+            if (ex->kind == I::Type::Kind::Constr && !ex->path.empty() &&
+                ivk != 2) {
+              bool sf = fold_abbrevs_, sk = keep_local_abbrevs_;
+              fold_abbrevs_ = false; keep_local_abbrevs_ = false;
+              TypePtr deep = I::Engine::repr(from_coretype(*ri0->ct, vars));
+              fold_abbrevs_ = sf; keep_local_abbrevs_ = sk;
+              if (deep->kind == I::Type::Kind::Variant &&
+                  !deep->labels.empty()) {
+                deep->variant_kind = ivk;
+                deep->abbrev = ex->path;
+                deep->abbrev_args = ex->args;
+                deep->from_inherit = true;
+                if (pvr->labels && !pvr->labels->empty())
+                  deep->present = *pvr->labels;
+                return deep;
+              }
             }
           }
         // ALL-inherit rows of known variant aliases (`[ 'a lambda | 'a expr ]`
@@ -9479,16 +9505,34 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
         for (auto& a : t->abbrev_args) as.push_back(bridge_ty(a, vars, nextvar));
         return cmi::cmiw::ty_constr(t->abbrev, std::move(as));
       }
-      // Named open/upper rows (`[> var ]`), inherited-row bounds and weak
-      // (non-generalized, '_weak) open/upper rows stay opaque for now.  An
-      // EXACT row is emittable regardless of level: declaration coretypes
-      // converted during the emission phase are never generalized, and a
-      // weak row is never exact.  A WRITTEN open/upper row (ctx.written --
-      // sig val / decl coretypes) is as-written, never weak: emittable too.
-      if (!t->abbrev.empty() || !t->inherited.empty() ||
+      // A NAMED row bound (`[< int u]` -- an inherit expanded to its full
+      // tag set with the abbreviation stamped back): emittable as the row
+      // plus row_desc.row_name = (u, [int]); Printtyp prints
+      // `[< int u > `A ]`, exactly ocamlc's storage.
+      bool named_bound = !t->abbrev.empty() && t->variant_kind != 2 &&
+                         t->from_inherit && !t->labels.empty() &&
+                         t->inherited.empty();
+      // Anonymous inherited-row bounds and weak (non-generalized, '_weak)
+      // open/upper rows stay opaque for now.  An EXACT row is emittable
+      // regardless of level: declaration coretypes converted during the
+      // emission phase are never generalized, and a weak row is never exact.
+      // A WRITTEN open/upper row (ctx.written -- sig val / decl coretypes)
+      // is as-written, never weak: emittable too.
+      if ((!named_bound && (!t->abbrev.empty() || !t->inherited.empty())) ||
           (t->level != I::GENERIC_LEVEL && t->variant_kind != 2 &&
-           !ctx.written))
+           !ctx.written)) {
+        if (getenv("ROWDBG")) {
+          fprintf(stderr, "[rowdbg] abbrev=%s vk=%d from_inh=%d lvl=%d written=%d labels=[",
+                  t->abbrev.c_str(), t->variant_kind, (int)t->from_inherit,
+                  t->level, (int)ctx.written);
+          for (auto& l : t->labels) fprintf(stderr, "%s,", l.c_str());
+          fprintf(stderr, "] present=[");
+          for (auto& p : t->present) fprintf(stderr, "%s,", p.c_str());
+          fprintf(stderr, "] inh=%zu abbrev_args=%zu\n", t->inherited.size(),
+                  t->abbrev_args.size());
+        }
         return cmi::cmiw::ty_var(nextvar++);
+      }
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
       std::vector<cmi::cmiw::TyPtr> targs;
       std::vector<char> conj;
@@ -9505,6 +9549,11 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       auto ty = cmi::cmiw::ty_variant_row(t->labels, std::move(targs),
                                           t->variant_kind, t->present);
       if (any_conj) ty->pv_conj = std::move(conj);
+      if (named_bound) {
+        ty->row_name = t->abbrev;
+        for (auto& a : t->abbrev_args)
+          ty->row_name_args.push_back(bridge_ty(a, vars, nextvar));
+      }
       ctx.nodes[t.get()] = ty;
       return ty;
     }
