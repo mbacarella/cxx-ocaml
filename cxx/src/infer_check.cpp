@@ -174,7 +174,11 @@ struct Checker {
   // Type identity: each opaque (non-alias) local type declaration gets a unique
   // stamp; tenv is the scoped type-name -> stamp environment (mirrors module
   // scopes), so a shadowed `type t` resolves to the right identity.
-  int next_type_stamp_ = 1;
+  // PROCESS-GLOBAL (inline static): schemes seeded across checkers (a module
+  // body's emission re-inference receiving the outer checker's cenv/venv) must
+  // keep outer and inner decls of the same name DISTINCT -- per-checker
+  // counters made an outer `t` and an inner re-declared `t` collide on stamp.
+  inline static int next_type_stamp_ = 1;
   std::unordered_map<const TypeDeclaration*, int> type_stamp_;
   // Reverse maps for the tuple-GADT exhaustiveness analysis: a stamped opaque
   // decl's AST (constructor/field lists for the mcomp-lite compatibility check)
@@ -9433,7 +9437,11 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       // Lazy.t is the public Stdlib abbreviation of CamlinternalLazy.t; ocamlc
       // stores the abbreviation, so emit it too rather than the internal name.
       else if (path == "CamlinternalLazy.t") path = "Lazy.t";
-      return cmi::cmiw::ty_constr(path, std::move(as));
+      auto r = cmi::cmiw::ty_constr(path, std::move(as));
+      r->engine_stamp = t->stamp;  // decl identity for shadow-aware citation
+      if (getenv("BRIDGEDBG"))
+        fprintf(stderr, "[bridge] constr %s stamp=%d\n", r->name.c_str(), t->stamp);
+      return r;
     }
     case K::Link: return bridge_ty(t->link, vars, nextvar);
   }
@@ -9610,6 +9618,8 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         ctors.push_back(std::move(cc));
       }
       auto si = cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors));
+      if (auto ts = ck.type_stamp_.find(&d); ts != ck.type_stamp_.end())
+        si.engine_stamp = ts->second;
       si.type_empty_variant = var->ctors.empty();  // `type empty = |`
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed;
@@ -9634,6 +9644,8 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         labels.push_back(std::move(lab));
       }
       auto si = cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels));
+      if (auto ts = ck.type_stamp_.find(&d); ts != ck.type_stamp_.end())
+        si.engine_stamp = ts->second;
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed;
       si.type_unboxed = unboxed;
@@ -9670,6 +9682,8 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       if (!manifest) manifest = bridge_ty_named(eman, bvars, nextvar, tvars, &dctx);
     }
     auto si = cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest);
+    if (auto ts = ck.type_stamp_.find(&d); ts != ck.type_stamp_.end())
+      si.engine_stamp = ts->second;
     // `type t = ..`: an extensible (Type_open) declaration, not abstract --
     // its `type t += ..` extensions cite it and ocamlc prints the `= ..`.
     si.type_open = std::holds_alternative<Ptype_open>(d.kind);
@@ -11028,6 +11042,12 @@ static const std::unordered_map<std::string,
 // instead of degrading everything it touches to fresh vars.
 static const std::vector<std::unordered_map<std::string, TypePtr>>*
     g_outer_venv = nullptr;
+// The emitting file's top-level CONSTRUCTOR scopes (Checker::cenv), seeded the
+// same way: a module body's pattern/expression citing an ENCLOSING type's ctor
+// (`type t = A;; module B = struct type t = B let f A = B end` -- pr4791)
+// types with the OUTER t instead of degrading the argument to a fresh var.
+static const std::vector<std::unordered_map<std::string, TypePtr>>*
+    g_outer_cenv = nullptr;
 // The ENCLOSING module's already-emitted items, visible to functor-BODY
 // inference so `module Y = G(X)` inside a functor body resolves the sibling
 // functor G declared in the outer scope (set around the body's
@@ -12123,6 +12143,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     for (auto& [n, ex] : *g_outer_modenv) ck.modenv.emplace(n, ex);
   if (g_outer_venv && !g_outer_venv->empty() && !ck.venv.empty())
     for (auto& [n, v] : g_outer_venv->front()) ck.venv.front().emplace(n, v);
+  if (g_outer_cenv && !g_outer_cenv->empty() && !ck.cenv.empty())
+    for (auto& [n, v] : g_outer_cenv->front()) ck.cenv.front().emplace(n, v);
   if (fparams) {
     if (g_outer_modtype_asts) ck.modtype_sig_asts_ = *g_outer_modtype_asts;
     if (g_outer_modtype_quals) ck.opened_modtype_quals_ = *g_outer_modtype_quals;
@@ -12143,10 +12165,12 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   auto* saved_enclosing = g_enclosing_struct_items;
   auto* saved_modenv = g_outer_modenv;
   auto* saved_venv = g_outer_venv;
+  auto* saved_cenv = g_outer_cenv;
   g_outer_modtype_asts = &ck.modtype_sig_asts_;
   g_outer_modtype_quals = &ck.opened_modtype_quals_;
   g_outer_modenv = &ck.modenv;
   g_outer_venv = &ck.venv;
+  g_outer_cenv = &ck.cenv;
   // Emission phase: checking is DONE, every from_coretype below only converts
   // declaration types for the .cmi -- keep local abbreviations as written
   // (`startDate : (int, message) fieldStatus` stores `message`, not string).
@@ -12214,6 +12238,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           auto f = ck.venv.back().find(nm);
           if (f == ck.venv.back().end()) continue;
           std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
+          if (getenv("BRIDGEDBG")) fprintf(stderr, "[bridge-val] %s\n", nm.c_str());
           auto ty = bridge_ty(f->second, vars, nextvar);
           if (!local_mod_defs.empty())
             rewrite_ty_names(ty, [&](std::string& n) {
@@ -12929,6 +12954,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   g_inherited_opens = saved_inherited_opens;
   g_outer_modenv = saved_modenv;
   g_outer_venv = saved_venv;
+  g_outer_cenv = saved_cenv;
   return out;
 }
 

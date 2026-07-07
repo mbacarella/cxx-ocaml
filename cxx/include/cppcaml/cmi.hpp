@@ -269,6 +269,11 @@ struct Ty {
   std::string binder;          // Package: the dependent binder (`(module M : T)`
                                // as a parameter) -- when the codomain cites
                                // `M.t`, the writer emits Tfunctor, not Tarrow
+  int engine_stamp = 0;        // Constr: the engine decl's identity stamp
+                               // (globally unique across checkers; 0 = none).
+                               // Lets the writer cite the RIGHT `t` when a
+                               // module shadows an outer decl of the same name
+                               // (ocamlc prints the outer one `t/2`).
 };
 TyPtr ty_variant(std::vector<std::string> tags);      // exact all-constant row
 TyPtr ty_variant_row(std::vector<std::string> tags, std::vector<TyPtr> args,
@@ -364,6 +369,10 @@ struct SigItem {
   int text_kind = 2;
   bool type_open = false;     // Type: `type t = ..` (Type_open kind)
   bool type_private = false;  // Type: `type t = private ..`
+  // Type: the checker's decl-identity stamp (matches Ty::engine_stamp on
+  // Constr nodes citing this decl; 0 = none).  The writer maps it to the
+  // emitted Local ident so a shadowed outer decl is cited correctly (`t/2`).
+  int engine_stamp = 0;
   // Type: Type_immediacy (0 Unknown / 1 Always / 2 Always_on_64bits) from a
   // `[@@immediate]` / `[@@immediate64]` attribute (Printtyp renders it back).
   int type_immediate = 0;

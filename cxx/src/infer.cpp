@@ -1,5 +1,7 @@
 #include "cppcaml/infer.hpp"
 
+#include <execinfo.h>
+
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -40,6 +42,13 @@ TypePtr Engine::constr(std::string path, std::vector<TypePtr> args, int stamp) {
   t->args = std::move(args);
   t->stamp = stamp;
   t->id = next_id_++;
+  if (stamp == 0) {
+    if (const char* dbg = getenv("CONSTRDBG"); dbg && t->path == dbg) {
+      void* bt[14]; int n = ::backtrace(bt, 14);
+      fprintf(stderr, "[constr0] %s id=%d\n", t->path.c_str(), t->id);
+      ::backtrace_symbols_fd(bt, n, 2);
+    }
+  }
   return t;
 }
 
@@ -290,6 +299,17 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     if (a->stamp && b->stamp && a->stamp != b->stamp) {
       if (lenient) return;
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
+    }
+    // LENIENT (display/emission) only: a same-named unstamped occurrence
+    // adopts the other side's decl stamp.  Ctor schemes are built before tenv
+    // exists, so a ctor's declared args cite their own type UNSTAMPED; when
+    // that node lands in a value's scheme slot, the writer must still know
+    // WHICH `t` it is (a module shadowing an outer `t` prints `t/2` --
+    // pr6323).  Unify has already committed to "same type" here, so carrying
+    // the stamp adds no new rejections (and lenient never throws on stamps).
+    if (lenient && last(a->path) == last(b->path)) {
+      if (a->stamp && !b->stamp) b->stamp = a->stamp;
+      else if (b->stamp && !a->stamp) a->stamp = b->stamp;
     }
     // Primitive/abbreviation FAMILIES: a primitive (`lazy_t`, `string`,
     // `int64` -- what constructions and literals carry), a stdlib abbreviation
