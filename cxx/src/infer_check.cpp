@@ -730,8 +730,41 @@ struct Checker {
         memo[const_cast<cmi::TypeExpr*>(n)] = o;
         return o;
       }
+      case cmi::TypeExpr::Tvariant: {
+        // A fully-decoded polymorphic-variant row converts to a real engine
+        // row, so a cmi GADT result like `[< `X ] t` (typing-multifile's D.C)
+        // survives into an inferred val instead of degrading to a var.
+        // Non-strict only (the strict pass never reasons about Variant nodes);
+        // a tags-only legacy decode keeps the old generic var.  Memoized fresh
+        // var FIRST: a self-citing fixpoint row degrades its inner occurrence
+        // (matching conv_cmi_ty's guard) instead of recursing forever.
+        if (strict || n->pv_args.size() != n->pv_tags.size() ||
+            n->pv_present.size() != n->pv_tags.size())
+          return generic_var();
+        auto it = memo.find(const_cast<cmi::TypeExpr*>(n));
+        if (it != memo.end()) return it->second;
+        memo[const_cast<cmi::TypeExpr*>(n)] = generic_var();
+        bool all_present = true;
+        for (char p : n->pv_present) if (!p) all_present = false;
+        int vk = !n->row_closed ? 0 : (n->row_more_nil && all_present ? 2 : 1);
+        std::vector<TypePtr> ats;
+        std::vector<char> has;
+        std::vector<std::string> present;
+        for (std::size_t i = 0; i < n->pv_tags.size(); ++i) {
+          has.push_back(n->pv_args[i] ? 1 : 0);
+          ats.push_back(n->pv_args[i] ? from_cmi(n->pv_args[i], memo)
+                                      : eng.fresh_var());
+          if (vk == 1 && n->pv_present[i]) present.push_back(n->pv_tags[i]);
+        }
+        TypePtr row = eng.variant_type(n->pv_tags, std::move(ats),
+                                       std::move(has), vk);
+        row->present = std::move(present);
+        row->level = I::GENERIC_LEVEL;
+        memo[const_cast<cmi::TypeExpr*>(n)] = row;
+        return row;
+      }
       default:
-        return generic_var();  // object/variant/package/etc: unknown for now
+        return generic_var();  // package/etc: unknown for now
     }
   }
 
@@ -3467,7 +3500,6 @@ struct Checker {
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors) {
-          if (c.is_inline_record) continue;
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
           std::vector<TypePtr> params;
           for (auto& p : td.params) {
@@ -3477,6 +3509,19 @@ struct Checker {
           }
           TypePtr result = c.res ? from_cmi(c.res, memo)
                                  : eng.constr(pl->name + "." + td.name, params);
+          // An inline-record ctor (`C : { f : .. } -> ..`) mirrors the local
+          // registration: scheme = result only, fields via field_candidates_
+          // (a pattern `C { f }` resolves f through the field registry).
+          if (c.is_inline_record) {
+            for (auto& l : c.inline_record) {
+              TypePtr fa = eng.arrow(result, from_cmi(l.type, memo));
+              eng.generalize(fa);
+              field_candidates_[l.name].push_back(std::move(fa));
+            }
+            eng.generalize(result);
+            cenv.back()[c.name] = result;
+            continue;
+          }
           TypePtr scheme = result;
           for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
             scheme = eng.arrow(from_cmi(*it, memo), scheme);
