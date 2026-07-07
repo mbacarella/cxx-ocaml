@@ -10326,10 +10326,17 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     if (auto* pms = std::get_if<Psig_modtypesubst>(&it.desc))
       if (auto* ps = std::get_if<Pmty_signature>(&pms->type.desc))
         modtypes[pms->name.txt] = &ps->items;
-    if (auto* po = std::get_if<Psig_open>(&it.desc))
-      if (auto* l = std::get_if<Lident>(&po->id.txt.v))
-        if (auto f = module_sigs.find(l->name); f != module_sigs.end())
-          import_modtypes_of(*f->second);
+    if (auto* po = std::get_if<Psig_open>(&it.desc)) {
+      auto* l = std::get_if<Lident>(&po->id.txt.v);
+      if (l && module_sigs.count(l->name)) {
+        import_modtypes_of(*module_sigs.at(l->name));
+      } else if (!std::holds_alternative<Lapply>(po->id.txt.v)) {
+        // `open Terms` of a separately-compiled unit (or dotted submodule):
+        // its bare type names must resolve qualified (`term` -> `Terms.term`)
+        // or every declared use degrades to a fresh var (misc-kb .mli files).
+        ck.load_open_type_quals(po->id.txt);
+      }
+    }
   }
   // Resolve a module type to its signature items (Pmty_signature directly, a
   // named modtype `S`, or `S with ...` -- the with-constraints are ignored).
