@@ -828,13 +828,20 @@ struct Checker {
         // -- lexpr's manifest): expand to the TAG UNION under one vars map, so
         // a use ties the shared param through the tags (`#lambda as x` in
         // lexpr_ops reaches lexpr's 'a).  A shared tag's args unify.
-        if (fold_abbrevs_ && pvr->rows.size() > 1) {
+        // The VERBATIM path (keep_local_abbrevs_) takes it too -- ocamlc
+        // stores the expanded union for `[< finite | infinite ]` bounds in
+        // sig items (range_intf) -- with the inherited abbreviation itself
+        // expanded in display mode.
+        if ((fold_abbrevs_ || keep_local_abbrevs_) && pvr->rows.size() > 1) {
           bool all_inh = true;
           std::vector<TypePtr> exps;
           for (auto& r : pvr->rows) {
             auto* ri = std::get_if<Rinherit>(&r);
             if (!ri) { all_inh = false; break; }
+            bool sf = fold_abbrevs_, sk = keep_local_abbrevs_;
+            fold_abbrevs_ = true; keep_local_abbrevs_ = false;
             TypePtr ex = I::Engine::repr(from_coretype(*ri->ct, vars));
+            fold_abbrevs_ = sf; keep_local_abbrevs_ = sk;
             if (ex->kind != I::Type::Kind::Variant || ex->labels.empty()) {
               all_inh = false;
               break;
@@ -964,6 +971,33 @@ struct Checker {
         // and prints 'a, not `_` (issue479's `_ iter2gen` second param).
         while ((int)as.size() < ar->second)
           as.push_back(eng.fresh_var());  // P4-I: guard removed, corpus-validated
+      // A KIND-ful local decl with `constraint 'a = ..` clauses (record/
+      // variant/abstract -- constrained ALIASES go through the phantom path
+      // below) enforces them at every application: `'a range` pins the use's
+      // 'a to the declared bound, which is what ocamlc stores back in the
+      // val's scheme (`([< finite | infinite ] as 'a) range` -- range_intf).
+      if (!strict)
+        if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+          if (!expanding_.count(l->name)) {
+            auto bi = bare_unique_stamp_.find(l->name);
+            auto di = bi != bare_unique_stamp_.end() && bi->second > 0
+                          ? stamp_type_decl_.find(bi->second)
+                          : stamp_type_decl_.end();
+            if (di != stamp_type_decl_.end() && di->second &&
+                !di->second->constraints.empty() && !di->second->manifest &&
+                di->second->params.size() == as.size()) {
+              const TypeDeclaration& dd = *di->second;
+              std::unordered_map<std::string, TypePtr> sub;
+              for (size_t i = 0; i < as.size(); ++i)
+                if (auto* pv2 = std::get_if<Ptyp_var>(&dd.params[i]->desc))
+                  sub[pv2->name] = as[i];
+              expanding_.insert(l->name);
+              for (auto& tc : dd.constraints)
+                soft_unify(from_coretype(*tc.t1, sub),
+                           from_coretype(*tc.t2, sub));
+              expanding_.erase(l->name);
+            }
+          }
       // Expand a known type abbreviation (type (params) name = manifest), with a
       // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
       std::string nm = lid_last(c->id.txt);
@@ -8851,11 +8885,16 @@ static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
   return bridge_ty_rec(t0, vars, nextvar, ctx);
 }
 // As bridge_ty, but with the declaration's written tvar names (`name -> var`),
-// so fresh vars carry Tvar(Some name) like ocamlc stores them.
+// so fresh vars carry Tvar(Some name) like ocamlc stores them.  A `shared`
+// BridgeCtx spans several calls (one type DECLARATION's params + kind +
+// manifest), so a non-var node reached twice -- a constrained param row also
+// cited by a label -- bridges to ONE writer node and Printtyp names it 'a.
 static cmi::cmiw::TyPtr bridge_ty_named(const TypePtr& t0,
                                         std::unordered_map<const I::Type*, int>& vars, int& nextvar,
-                                        const std::unordered_map<std::string, TypePtr>& tvars) {
-  BridgeCtx ctx;
+                                        const std::unordered_map<std::string, TypePtr>& tvars,
+                                        BridgeCtx* shared = nullptr) {
+  BridgeCtx local;
+  BridgeCtx& ctx = shared ? *shared : local;
   ctx.written = true;
   for (auto& [n, tp] : tvars)
     if (tp) ctx.var_names[I::Engine::repr(tp).get()] = n;
@@ -8866,17 +8905,23 @@ static cmi::cmiw::TyPtr bridge_ty_named(const TypePtr& t0,
 static cmi::cmiw::TyPtr bridge_label_ty(Checker& ck, const ast::CoreType& ct,
                                         std::unordered_map<std::string, TypePtr>& tvars,
                                         std::unordered_map<const I::Type*, int>& vars,
-                                        int& nextvar) {
+                                        int& nextvar,
+                                        BridgeCtx* shared = nullptr) {
   auto* pp = std::get_if<Ptyp_poly>(&ct.desc);
   if (!pp || pp->vars.empty())
-    return bridge_ty_named(ck.from_coretype(ct, tvars), vars, nextvar, tvars);
+    return bridge_ty_named(ck.from_coretype(ct, tvars), vars, nextvar, tvars,
+                           shared);
   TypePtr body = ck.from_coretype(ct, tvars);  // strips the poly, binds names
-  BridgeCtx ctx;
+  BridgeCtx local;
+  BridgeCtx& ctx = shared ? *shared : local;
   ctx.written = true;
   for (auto& [n, tp] : tvars)
     if (tp) ctx.var_names[I::Engine::repr(tp).get()] = n;
-  for (auto& n : pp->vars) ctx.univars.insert(n);
+  std::vector<std::string> added;
+  for (auto& n : pp->vars)
+    if (ctx.univars.insert(n).second) added.push_back(n);
   auto b = bridge_ty_rec(body, vars, nextvar, ctx);
+  for (auto& n : added) ctx.univars.erase(n);
   std::vector<int> pids;
   for (auto& n : pp->vars)
     if (auto tv2 = tvars.find(n); tv2 != tvars.end())
@@ -8888,6 +8933,15 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
                                       BridgeCtx& ctx) {
   TypePtr t = I::Engine::repr(t0);
+  // A node explicitly registered for sharing (a constrained decl PARAM --
+  // its label/manifest citations must Tlink to the one emitted node so
+  // Printtyp prints the param's alias name back) short-circuits here.
+  // Var nodes are never registered: their branch re-applies the source
+  // name on every occurrence.
+  if (t->kind != I::Type::Kind::Var && t->kind != I::Type::Kind::Variant &&
+      t->kind != I::Type::Kind::Object)
+    if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end())
+      return it->second;
   auto bridge_ty = [&](const TypePtr& u, std::unordered_map<const I::Type*, int>& v, int& nv) {
     return bridge_ty_rec(u, v, nv, ctx);
   };
@@ -9137,6 +9191,8 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     }
     std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
+    BridgeCtx dctx;  // ONE bridge context per decl: a non-var node cited from
+                     // two slots (constrained param row in a label) emits once
     // bvars keys are raw Type*: every bridged root must stay alive for the
     // whole decl, else a freed Ptyp_any fresh var's address gets reused and
     // two `_` params collide into ONE emitted node (`type (_, _) t` printed
@@ -9145,9 +9201,23 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     auto fc = [&](const ast::CoreType& c) -> const TypePtr& {
       keep.push_back(ck.from_coretype(c, tvars)); return keep.back();
     };
+    // Build every param's engine type FIRST, then apply the decl-level
+    // `constraint t1 = t2` clauses under the same param scope: a constrained
+    // param var BECOMES the constraint type (ocamlc stores the row/package in
+    // type_params; Printtyp prints a fresh var back plus the `constraint 'a =
+    // ..` clause).  Bridging afterwards shares the constrained node into the
+    // kind/manifest occurrences.  Best-effort: a clash leaves the sides as-is.
+    std::vector<TypePtr> eparams;
+    for (auto& p : d.params) eparams.push_back(fc(*p));
+    for (auto& con : d.constraints) {
+      TypePtr lhs = fc(*con.t1);  // sequenced: fc's keep.push_back can
+      TypePtr rhs = fc(*con.t2);  // reallocate and dangle a prior fc ref
+      ck.soft_unify(lhs, rhs);
+    }
     std::vector<cmi::cmiw::TyPtr> params;
-    for (auto& p : d.params) {
-      auto pv = bridge_ty_named(fc(*p), bvars, nextvar, tvars);
+    for (size_t pi = 0; pi < d.params.size(); ++pi) {
+      auto& p = d.params[pi];
+      auto pv = bridge_ty_named(eparams[pi], bvars, nextvar, tvars, &dctx);
       // Params keep their SOURCE names (Tvar Some): ocamlc prints
       // `('outputValue, 'message) fieldStatus` back verbatim.  The shared
       // var node carries the name into every ctor/label occurrence.  An
@@ -9161,6 +9231,11 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         if (auto* v = std::get_if<Ptyp_var>(&p->desc)) pv->var_name = v->name;
         else if (std::holds_alternative<Ptyp_any>(p->desc) && !d.manifest)
           pv->var_name = "_";
+      } else {
+        // A CONSTRAINED param (unified to its bound above): register the
+        // emitted node so kind/manifest citations Tlink to it and Printtyp
+        // prints the param's fresh alias name (`{ v : 'a; } constraint ..`).
+        dctx.nodes[I::Engine::repr(eparams[pi]).get()] = pv;
       }
       params.push_back(std::move(pv));
     }
@@ -9170,9 +9245,9 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       std::vector<cmi::cmiw::Ctor> ctors;
       for (auto& c : var->ctors) {
         cmi::cmiw::Ctor cc; cc.name = c.name.txt;
-        if (c.res) cc.res = bridge_ty_named(fc(**c.res), bvars, nextvar, tvars);
+        if (c.res) cc.res = bridge_ty_named(fc(**c.res), bvars, nextvar, tvars, &dctx);
         if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
-          for (auto& a : tup->elems) cc.args.push_back(bridge_ty_named(fc(*a), bvars, nextvar, tvars));
+          for (auto& a : tup->elems) cc.args.push_back(bridge_ty_named(fc(*a), bvars, nextvar, tvars, &dctx));
         else if (auto* r = std::get_if<Pcstr_record>(&c.args))
           // Inline record (Typedtree's `Texp_record of {fields; representation;
           // extended_expression}`): emit the labels so a consumer matching
@@ -9182,7 +9257,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
             lab.name = f.name.txt;
             lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
-            lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar);
+            lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar, &dctx);
             cc.inline_record.push_back(std::move(lab));
           }
         ctors.push_back(std::move(cc));
@@ -9197,7 +9272,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       // Some (Tconstr t) alongside Type_variant.  Bridge the manifest (sharing
       // the param var-ids) so Printtyp renders the `= t =` link.
       if (d.manifest)
-        si.manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars);
+        si.manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars, &dctx);
       out.push_back(std::move(si));
       continue;
     }
@@ -9208,24 +9283,35 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         lab.name = f.name.txt;
         lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
-        lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar);
+        lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar, &dctx);
         labels.push_back(std::move(lab));
       }
       auto si = cmi::cmiw::sig_record(d.name.txt, std::move(params), std::move(labels));
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed;
       si.type_unboxed = unboxed;
+      // A CONSTRAINED param is stored as its bound (not a var), so Printtyp
+      // prints its variance chip even on concrete decls -- carry the WRITTEN
+      // annotation (`type +'a range = { .. } constraint ..` -- range_intf).
+      if (!d.constraints.empty() &&
+          d.param_variances.size() == si.params.size()) {
+        bool annotated = false;
+        for (int v : d.param_variances) if (v != 7) annotated = true;
+        if (annotated)
+          si.type_variances.assign(d.param_variances.begin(),
+                                   d.param_variances.end());
+      }
       // A re-exported record (`type s = t = { .. }`) keeps its `= t` manifest
       // alongside the record kind, just like the variant case above.
       if (d.manifest)
-        si.manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars);
+        si.manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars, &dctx);
       out.push_back(std::move(si));
       continue;
     }
     cmi::cmiw::TyPtr manifest = nullptr;
     if (d.manifest) {
       manifest = pv_row_manifest(ck, **d.manifest, tvars, bvars, nextvar);
-      if (!manifest) manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars);
+      if (!manifest) manifest = bridge_ty_named(fc(**d.manifest), bvars, nextvar, tvars, &dctx);
     }
     auto si = cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest);
     // `type t = ..`: an extensible (Type_open) declaration, not abstract --

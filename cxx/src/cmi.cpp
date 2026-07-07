@@ -1027,16 +1027,20 @@ struct TyEmit {
     }
     return nullptr;
   }
-  // Object/Variant nodes shared within one scheme must marshal as ONE node
-  // (omarshal CODE_SHARED back-reference) so the reader sees the sharing and
-  // Printtyp names the row `as 'a` -- two structural copies print unnamed.
+  // A Ty node cited twice within one item must marshal as ONE node (omarshal
+  // CODE_SHARED back-reference) so the reader sees the sharing: Printtyp
+  // names a shared row `as 'a`, and a constrained decl PARAM's citations in
+  // labels/manifest print the param's alias name (`{ v : 'a; } constraint
+  // ..`) -- two structural copies print unnamed/inline.  Vars are excluded:
+  // they share through `vars` by id (several distinct Ty::Var nodes may
+  // carry one id).
   std::unordered_map<const Ty*, o::ValPtr> shared_nodes;
   o::ValPtr emit(const TyPtr& t) {
-    if (t->k == Ty::Object || t->k == Ty::Variant)
+    if (t->k != Ty::Var)
       if (auto it = shared_nodes.find(t.get()); it != shared_nodes.end())
         return it->second;
     o::ValPtr res = emit_fresh(t);
-    if (t->k == Ty::Object || t->k == Ty::Variant) shared_nodes[t.get()] = res;
+    if (t->k != Ty::Var) shared_nodes[t.get()] = res;
     return res;
   }
   o::ValPtr emit_fresh(const TyPtr& t) {
