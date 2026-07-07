@@ -783,6 +783,7 @@ struct Checker {
       auto it = vars.find(v->name);
       if (it != vars.end()) return it->second;
       auto g = generic_var();
+      g->var_hint = v->name;  // keep the written name for the cmi's Tvar(Some _)
       vars[v->name] = g;
       return g;
     }
@@ -9117,6 +9118,8 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
         v->var_name = nm->second;
       else if (!t->rigid_name.empty())
         v->var_name = t->rigid_name;  // a generalized `(type t)` newtype
+      else if (!t->var_hint.empty())
+        v->var_name = t->var_hint;  // source-annotated var in an INFERRED val
       if (!v->var_name.empty() && ctx.univars.count(v->var_name))
         v->univar = true;  // a poly field's `'a.` binder -> Tunivar
       return v;

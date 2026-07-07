@@ -238,6 +238,11 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
   if (a->kind == Type::Kind::Var) {
     occurs_and_lower(a, b);
     note(a);
+    // Var-var: the surviving representative inherits the absorbed var's
+    // SOURCE name (cosmetic; ocamlc's Tvar(Some _) survives unification the
+    // same way, so an annotated `'elt` names the inferred scheme's var).
+    if (b->kind == Type::Kind::Var && b->var_hint.empty())
+      b->var_hint = a->var_hint;
     a->kind = Type::Kind::Link;
     a->link = b;
     return;
@@ -634,6 +639,9 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Var: {
         if (t->level == GENERIC_LEVEL) {
           auto it = mapping.find(t.get());
+          // NB: the fresh copy does NOT inherit var_hint -- ocamlc's copy
+          // drops Tvar names on instantiation (keep_names=false), so a use of
+          // a constructor/value scheme prints plain 'a, not the decl's name.
           TypePtr fv = it != mapping.end() ? it->second : (mapping[t.get()] = fresh_var());
           memo[t.get()] = fv;
           return fv;
@@ -689,6 +697,9 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Var:
         if (t->level == GENERIC_LEVEL) {
           auto it = mapping.find(t.get());
+          // NB: the fresh copy does NOT inherit var_hint -- ocamlc's copy
+          // drops Tvar names on instantiation (keep_names=false), so a use of
+          // a constructor/value scheme prints plain 'a, not the decl's name.
           TypePtr fv = it != mapping.end() ? it->second : (mapping[t.get()] = fresh_var());
           memo[t.get()] = fv;
           return fv;

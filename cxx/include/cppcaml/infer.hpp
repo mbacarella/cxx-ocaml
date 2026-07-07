@@ -73,6 +73,11 @@ struct Type {
   bool functor_abbrev = false;  // Constr: a functor-instance abbreviation
                              // (`HW.key`, manifest-carrying result-sig type) --
                              // top priority in the family relink (see unify).
+  std::string var_hint;      // Var: SOURCE-written name (`'elt` in a param
+                             // annotation) -- cosmetic only, carried into the
+                             // cmi as Tvar(Some name) like ocamlc keeps it;
+                             // propagated to the surviving representative on
+                             // var-var unification and into instantiate copies
   std::string rigid_name;    // Constr rigid: the SOURCE name (`(type t)` binds
                              // "t") -- ocamlc's .cmi stores the generalized
                              // face as Tvar(Some "t"), so the cmi bridge
