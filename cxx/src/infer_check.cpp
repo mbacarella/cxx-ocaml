@@ -9801,7 +9801,8 @@ static std::vector<std::string> split_dotted(const std::string& s);
 static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
     const std::vector<std::string>& comps);
 static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
-                                const std::string& app);
+                                const std::string& app,
+                                bool aliasable = false);
 static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
                                    std::vector<cmi::cmiw::SigItem>& items) {
   const ast::ModuleType* m = &mt;
@@ -10598,7 +10599,7 @@ static const std::vector<cmi::cmiw::SigItem>* g_outer_prior = nullptr;
 // (`module S = Set.Make(Loc)` gives `type t = Set.Make(Loc).t`), recursively
 // through plain submodules.  `app` is the applied path ("Set.Make(Loc)").
 static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
-                                const std::string& app) {
+                                const std::string& app, bool aliasable) {
   for (auto& si : items) {
     // Like Mtype.strengthen: abstract AND datatype (record/variant) decls
     // gain the `= path.t` manifest alongside their kind (`type t = A.t =
@@ -10610,7 +10611,17 @@ static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
       si.manifest = cmi::cmiw::ty_constr(app + "." + si.name, std::move(as));
     } else if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
                si.alias.empty()) {
-      strengthen_abstract(si.sub, app + "." + si.name);
+      // With `aliasable` (a nameable module path -- `include M`), a
+      // submodule strengthens to Mty_alias(M.Set) like Mtype.strengthen's
+      // strengthen_decl ~aliasable:true; a functor-application path can't
+      // be aliased, so those callers recurse instead.
+      if (aliasable) {
+        si.alias = app + "." + si.name;
+        si.sub.clear();
+        si.modtype_ref.clear();
+      } else {
+        strengthen_abstract(si.sub, app + "." + si.name, false);
+      }
     }
   }
 }
@@ -11854,6 +11865,46 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       // submodules; outer refs not yet); constrained/functor shapes via
       // module_binding_sigitem.
       if (!mb->binding.name.txt) continue;  // `module _ = ...`
+      // `module V0 = V0.U` whose HEAD is bound by an `open struct .. end` in
+      // THIS structure: the target has no nameable path (the opened struct is
+      // anonymous), so ocamlc stores the target's SIGNATURE, not an alias
+      // (clambda_optim).  Resolve the dotted path through the opened struct's
+      // (possibly nested) structure bindings and emit that module expression.
+      {
+        const ast::ModuleExpr* anon_tgt = nullptr;
+        if (auto* pi = std::get_if<Pmod_ident>(&mb->binding.expr.desc);
+            pi && !std::holds_alternative<Lapply>(pi->id.txt.v)) {
+          std::vector<std::string> comps = split_dotted(lid_full(pi->id.txt));
+          for (auto& it2 : s) {
+            auto* op2 = std::get_if<Pstr_open>(&it2.desc);
+            if (!op2) continue;
+            auto* os = std::get_if<Pmod_structure>(&op2->expr.desc);
+            if (!os) continue;
+            const ast::Structure* scope = &os->items;
+            const ast::ModuleExpr* tgt = nullptr;
+            for (std::size_t ci = 0; ci < comps.size(); ++ci) {
+              tgt = nullptr;
+              if (!scope) break;
+              for (auto& it3 : *scope)
+                if (auto* mb3 = std::get_if<Pstr_module>(&it3.desc))
+                  if (mb3->binding.name.txt &&
+                      *mb3->binding.name.txt == comps[ci])
+                    tgt = &mb3->binding.expr;
+              scope = nullptr;
+              if (tgt)
+                if (auto* ts = std::get_if<Pmod_structure>(&tgt->desc))
+                  scope = &ts->items;
+            }
+            if (tgt) { anon_tgt = tgt; break; }
+          }
+        }
+        if (anon_tgt) {
+          if (auto item = module_binding_sigitem(*mb->binding.name.txt,
+                                                 *anon_tgt, &out, &ck))
+            out.push_back(std::move(*item));
+          continue;
+        }
+      }
       if (auto item = module_binding_sigitem(*mb->binding.name.txt,
                                              mb->binding.expr, &out, &ck))
         out.push_back(std::move(*item));
@@ -11956,9 +12007,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         auto items = infer_signature(*inc);
         if (!inc_path.empty()) {
           // `include A` (a module PATH): ocamlc strengthens the spliced items
-          // -- abstract types get `= A.t` manifests, and MODTYPE decls become
-          // aliases `module type S = A.S` (pr6982, fstclassmod).
-          strengthen_abstract(items, inc_path);
+          // -- abstract types get `= A.t` manifests, submodules become
+          // ALIASES `module Set = A.Set` (offset.ml), and MODTYPE decls
+          // become aliases `module type S = A.S` (pr6982, fstclassmod).
+          strengthen_abstract(items, inc_path, /*aliasable=*/true);
           for (auto& si : items)
             if (si.k == cmi::cmiw::SigItem::Modtype) {
               si.modtype_ref = inc_path + "." + si.name;

@@ -1430,8 +1430,15 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // Pdot(Pident(Global head), comp..).  Record the HEAD unit as imported.
         size_t dot = it.alias.find('.');
         std::string head = dot == std::string::npos ? it.alias : it.alias.substr(0, dot);
-        referenced.emplace(head, false);
-        o::ValPtr path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global head)
+        o::ValPtr path;
+        if (auto lm = visible_mod.find(head); lm != visible_mod.end()) {
+          // A LOCAL sibling head (`include M` strengthened `module Set =
+          // M.Set`): Pident(Local{M, stamp}), not a unit global.
+          path = o::vblock(0, {o::vblock(0, {o::vstr(head), o::vint(lm->second)})});
+        } else {
+          referenced.emplace(head, false);
+          path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global head)
+        }
         for (size_t pos = dot; pos != std::string::npos;) {
           size_t nd = it.alias.find('.', pos + 1);
           std::string comp = it.alias.substr(pos + 1,
