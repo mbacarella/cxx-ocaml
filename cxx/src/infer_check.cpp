@@ -375,6 +375,10 @@ struct Checker {
   struct PolyField { TypePtr recTy; const CoreType* ftype; };
   std::unordered_map<std::string, std::vector<PolyField>> poly_field_rec_candidates_;
   std::unordered_map<std::string, PolyField> poly_field_rec_;
+  // Poly-field labels the KIND pass also registered as mono format arrows
+  // (see register_record_decl) -- excluded from finalize_fields' ambiguity
+  // test, and the PATTERN path prefers the poly binding for them.
+  std::set<std::string> poly_format_labels_;
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
@@ -2976,9 +2980,18 @@ struct Checker {
       // 'a }`): its uses must type string literals at format type or they stay
       // unlowered (= segfault); cross-use clashes are soft there.  The strict
       // pass keeps the skip (a monomorphic scheme false-rejects valid reuses).
-      if (std::holds_alternative<Ptyp_poly>(f.type->desc) &&
-          !(record_kinds_ && mentions_format(*f.type))) {
+      if (std::holds_alternative<Ptyp_poly>(f.type->desc)) {
         poly_field_rec_candidates_[f.name.txt].push_back({recTy, &*f.type});  // pattern record-type resolution
+        // The kind pass ALSO registers a format-typed poly field as a mono
+        // arrow so expression-side uses ({pf=Format.eprintf}) type string
+        // literals at format type; the PATTERN side still binds the
+        // generalized poly scheme (poly_field_rec_ wins there), so cross-use
+        // instances don't clash through one var (domains.ml's test).
+        if (record_kinds_ && mentions_format(*f.type)) {
+          poly_format_labels_.insert(f.name.txt);
+          field_candidates_[f.name.txt].push_back(
+              eng.arrow(recTy, from_coretype(*f.type, vars)));
+        }
         continue;
       }
       field_candidates_[f.name.txt].push_back(eng.arrow(recTy, from_coretype(*f.type, vars)));
@@ -3005,8 +3018,13 @@ struct Checker {
       if (v.size() == 1) fields_[k] = v[0];
     // A poly-field label maps to its record type iff it is unique AND not also a
     // (mono) field elsewhere -- otherwise the label is ambiguous, leave to Any.
+    // The kind pass's own format-poly mono registration doesn't count as
+    // "elsewhere" (it's the same declaration, see register_record_decl).
     for (auto& [k, v] : poly_field_rec_candidates_)
-      if (v.size() == 1 && !field_candidates_.count(k)) poly_field_rec_[k] = v.front();
+      if (v.size() == 1 &&
+          (!field_candidates_.count(k) ||
+           (poly_format_labels_.count(k) && field_candidates_[k].size() == 1)))
+        poly_field_rec_[k] = v.front();
   }
 
   // An inline-record constructor argument (`C of { f : t; .. }`): register each
@@ -4790,6 +4808,11 @@ struct Checker {
       TypePtr recTy = nullptr;
       for (auto& [lid, sub] : r->fields) {
         auto it = fields_.find(lid_last(lid.txt));
+        // A format-poly field is in BOTH maps (kind pass); the pattern binds
+        // the GENERALIZED poly scheme so each body use instantiates fresh.
+        if (it != fields_.end() && poly_format_labels_.count(lid_last(lid.txt)) &&
+            poly_field_rec_.count(lid_last(lid.txt)))
+          it = fields_.end();
         if (it == fields_.end()) {
           // The predefined `'a ref = { mutable contents : 'a }`: a `{contents=x}`
           // pattern types as `'a ref`, binding x:'a (non-strict only -- strict
