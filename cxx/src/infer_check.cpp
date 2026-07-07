@@ -10808,6 +10808,23 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     return std::nullopt;
   }
   if (auto* mu = std::get_if<Pmod_unpack>(&me.desc)) {
+    // `module X = (val x)` with NO annotation: x's inferred package type
+    // (engine Constr "(module S)") names the modtype; ocamlc stores
+    // Mty_ident S (index_aliases).
+    if (auto* ui = std::get_if<Pexp_ident>(&mu->e->desc); ui && ckp)
+      if (auto* l = std::get_if<Lident>(&ui->id.txt.v);
+          l && !ckp->venv.empty()) {
+        auto f = ckp->venv.back().find(l->name);
+        if (f != ckp->venv.back().end()) {
+          TypePtr t = I::Engine::repr(f->second);
+          if (t->kind == I::Type::Kind::Constr &&
+              t->path.rfind("(module ", 0) == 0 && t->path.back() == ')') {
+            auto si = cmi::cmiw::sig_module(name, {});
+            si.modtype_ref = t->path.substr(8, t->path.size() - 9);
+            return si;
+          }
+        }
+      }
     // `module T = (val e : S with type t = ..)`: ocamlc types T at the
     // package modtype EXPANDED, with-refinements grafted onto the items.
     if (auto* uc = std::get_if<Pexp_constraint>(&mu->e->desc))
@@ -11144,6 +11161,23 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     std::vector<cmi::cmiw::SigItem> result;
     std::string result_ref;  // a local functor's Mty_ident result (`: Priv`)
     bool resolved = false;
+    // Chase local ALIAS bindings first (`module F' = F; module C = F'(A)`):
+    // a bare alias item redirects the head to its target (index_aliases).
+    for (int hop = 0; hop < 4 && comps.size() == 1; ++hop) {
+      bool changed = false;
+      for (auto* scope : {prior, g_outer_prior}) {
+        if (!scope || changed) continue;
+        for (auto& si : *scope)
+          if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
+              si.name == comps[0] && !si.alias.empty() &&
+              si.alias.find('.') == std::string::npos) {
+            comps[0] = si.alias;
+            changed = true;
+            break;
+          }
+      }
+      if (!changed) break;
+    }
     if (comps.size() == 1) {  // a local functor emitted earlier
       // An EMPTY result sig is legitimate (`module F (A : ..) = struct let _ =
       // .. end; module B = F(X)` -- ocamlc emits `module B : sig end`);
@@ -11171,6 +11205,10 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     // module's members requalify through it (`tag` -> `Msg.tag`) -- outside
     // Msg they no longer resolve locally.
     if (!resolved && comps.size() >= 2) {
+      // Keeps sigs MATERIALIZED during the descent alive (a chain component
+      // held as a named modtype ref -- `module X : S` with the functor F
+      // declared inside S -- has no inline sub; resolve the ref instead).
+      std::vector<std::unique_ptr<std::vector<cmi::cmiw::SigItem>>> mat_store;
       for (auto* scope : {prior, g_outer_prior}) {
         if (!scope || resolved) continue;
         const std::vector<cmi::cmiw::SigItem>* cur = scope;
@@ -11178,7 +11216,27 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           const std::vector<cmi::cmiw::SigItem>* next = nullptr;
           for (auto& si : *cur)
             if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
-                si.name == comps[i]) { next = &si.sub; break; }
+                si.name == comps[i]) {
+              if (!si.sub.empty()) { next = &si.sub; break; }
+              if (!si.modtype_ref.empty()) {
+                std::vector<cmi::cmiw::SigItem> m;
+                if (si.modtype_ref.find('.') == std::string::npos) {
+                  if (ckp)
+                    if (auto a = ckp->modtype_sig_asts_.find(si.modtype_ref);
+                        a != ckp->modtype_sig_asts_.end())
+                      m = signature_to_cmi(*a->second);
+                } else {
+                  m = cmi_modtype_items(split_dotted(si.modtype_ref));
+                }
+                if (!m.empty()) {
+                  mat_store.push_back(
+                      std::make_unique<std::vector<cmi::cmiw::SigItem>>(
+                          std::move(m)));
+                  next = mat_store.back().get();
+                }
+              }
+              break;
+            }
           cur = next;
         }
         if (!cur) continue;
@@ -11908,6 +11966,24 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       if (auto item = module_binding_sigitem(*mb->binding.name.txt,
                                              mb->binding.expr, &out, &ck))
         out.push_back(std::move(*item));
+    } else if (auto* po2 = std::get_if<Pstr_open>(&it.desc)) {
+      // `open M` where M is a LOCAL module already emitted above (`module
+      // FArg = X.F(Arg); open FArg; type u = t`): register its type members
+      // as open-quals so a following bare `t` that resolves to nothing local
+      // renders qualified (`FArg.t`), like ocamlc stores it.  The
+      // from_coretype consumer only fires when the bare name has no local
+      // stamp, so genuinely local types keep priority (index_aliases).
+      if (auto* omi = std::get_if<Pmod_ident>(&po2->expr.desc))
+        if (auto* ol = std::get_if<Lident>(&omi->id.txt.v))
+          for (auto& si : out)
+            if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
+                si.name == ol->name) {
+              for (auto& m : si.sub)
+                if (m.k == cmi::cmiw::SigItem::Type)
+                  ck.opened_type_quals_.emplace(m.name,
+                                                si.name + "." + m.name);
+              break;
+            }
     } else if (auto* mr = std::get_if<Pstr_recmodule>(&it.desc)) {
       // `module rec A .. and B ..`: each binding like Pstr_module, marked
       // Trec_first/Trec_next so ocamlc prints the group as one `module rec`.
