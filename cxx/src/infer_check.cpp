@@ -9360,7 +9360,10 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
           cnames = t->labels;
           for (auto& a : t->args) ctys.push_back(bridge_ty(a, vars, nextvar));
         }
-        return cmi::cmiw::ty_package(std::move(mty), std::move(cnames), std::move(ctys));
+        auto pk = cmi::cmiw::ty_package(std::move(mty), std::move(cnames),
+                                        std::move(ctys));
+        pk->binder = t->abbrev;  // `(module M : T)` param: M, else empty
+        return pk;
       }
       std::vector<cmi::cmiw::TyPtr> as;
       for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));

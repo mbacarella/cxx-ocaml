@@ -940,6 +940,10 @@ struct TyEmit {
   const std::unordered_map<std::string, int>* local_types = nullptr;  // same-sig type -> stamp
   const std::unordered_map<std::string, int>* local_modtypes = nullptr;  // same-sig modtype -> stamp
   const std::unordered_map<std::string, int>* local_mods = nullptr;  // visible module -> stamp
+  // Dependent-arrow binders in scope (`(module M : T) -> M.t`): binder name ->
+  // the SHARED Ident.Unscoped ValPtr cited by both the Tfunctor node and every
+  // `M.t` path in its codomain (ocamlc shares them physically).
+  std::unordered_map<std::string, o::ValPtr> unscoped_mods;
   o::ValPtr texpr(o::ValPtr desc) {  // type_expr = {desc; level; scope; id}
     return o::vblock(0, {desc, o::vint(GENERIC_LEVEL), o::vint(0), o::vint(id--)});
   }
@@ -1047,6 +1051,14 @@ struct TyEmit {
         if (j == std::string::npos) j = name.size();
         comps.push_back(name.substr(i, j - i));
       }
+      // A dependent-arrow binder head (`(module M : T) -> M.t`): Pdot chain
+      // off the SHARED Unscoped ident of the enclosing Tfunctor.
+      if (auto um = unscoped_mods.find(comps[0]); um != unscoped_mods.end()) {
+        o::ValPtr path = o::vblock(0, {o::vblock(4, {um->second})});  // Pident(Unscoped)
+        for (std::size_t i = 1; i < comps.size(); ++i)
+          path = o::vblock(1, {path, o::vstr(comps[i])});  // Pdot
+        return path;
+      }
       // A LOCAL module head (`module MP = Gc.Memprof` then MP.allocation):
       // Pdot chain off the sibling's Local ident, like ocamlc -- not a bogus
       // Global that would demand an interface CRC for "MP".
@@ -1096,6 +1108,42 @@ struct TyEmit {
   // ..`) -- two structural copies print unnamed/inline.  Vars are excluded:
   // they share through `vars` by id (several distinct Ty::Var nodes may
   // carry one id).
+  // The Types.package record {pack_path; pack_constraints} of a Package Ty
+  // (shared by Tpackage and Tfunctor); null when the modtype can't be placed.
+  o::ValPtr pack_payload(const Ty& t) {
+    o::ValPtr path = mty_path(t.name);
+    if (!path) return nullptr;
+    std::vector<o::ValPtr> cs;
+    for (std::size_t i = 0; i < t.pv_tags.size() && i < t.args.size(); ++i) {
+      // the constraint's type name, split on dots into a string list
+      std::vector<o::ValPtr> comps;
+      const std::string& n = t.pv_tags[i];
+      for (std::size_t s = 0, e; s <= n.size(); s = e + 1) {
+        e = n.find('.', s);
+        if (e == std::string::npos) e = n.size();
+        comps.push_back(o::vstr(n.substr(s, e - s)));
+        if (e == n.size()) break;
+      }
+      cs.push_back(o::vblock(0, {o::vlist(comps), emit(t.args[i])}));
+    }
+    return o::vblock(0, {path, cs.empty() ? o::vint(0) : o::vlist(cs)});
+  }
+  // Does the type cite a module path headed by binder `b` (`b.t`, `b.P.t`)?
+  static bool mentions_mod_head(const TyPtr& t, const std::string& b) {
+    if (!t) return false;
+    if (t->k == Ty::Constr && t->name.size() > b.size() &&
+        t->name.compare(0, b.size(), b) == 0 && t->name[b.size()] == '.')
+      return true;
+    for (auto& a : t->args)
+      if (mentions_mod_head(a, b)) return true;
+    return false;
+  }
+  // Stamps for writer-invented Unscoped binder idents: far above any sig item
+  // stamp so they never collide within one signature.
+  static int next_unscoped_stamp() {
+    static int s = 90000000;
+    return ++s;
+  }
   std::unordered_map<const Ty*, o::ValPtr> shared_nodes;
   o::ValPtr emit(const TyPtr& t) {
     if (t->k != Ty::Var)
@@ -1142,6 +1190,30 @@ struct TyEmit {
         return texpr(o::vblock(3, {path, as.empty() ? o::vint(0) : o::vlist(as), abbrev}));  // Tconstr
       }
       case Ty::Arrow: {
+        // arg_label = Nolabel (int 0) | Labelled of string (block tag 0)
+        //           | Optional of string (block tag 1)
+        o::ValPtr lbl = t->label_kind == 1 ? o::vblock(0, {o::vstr(t->label)})
+                      : t->label_kind == 2 ? o::vblock(1, {o::vstr(t->label)})
+                      : o::vint(0) /*Nolabel*/;
+        // A DEPENDENT arrow `(module M : T) -> .. M.t ..` (the named unpack
+        // binder escapes into the codomain) is Tfunctor(lbl, Unscoped M,
+        // package, cod), and the codomain's `M.t` paths cite the SAME
+        // Unscoped ident.  A binder that does not escape stays a plain
+        // Tarrow(Tpackage) -- exactly ocamlc's split.
+        if (t->args[0]->k == Ty::Package && !t->args[0]->binder.empty() &&
+            mentions_mod_head(t->args[1], t->args[0]->binder)) {
+          if (o::ValPtr package = pack_payload(*t->args[0])) {
+            const std::string& b = t->args[0]->binder;
+            o::ValPtr uns = o::vblock(0, {o::vblock(0, {o::vblock(0,
+                {o::vstr(b), o::vint(next_unscoped_stamp())})})});
+            auto prev = unscoped_mods.find(b);
+            o::ValPtr saved = prev != unscoped_mods.end() ? prev->second : nullptr;
+            unscoped_mods[b] = uns;
+            o::ValPtr c = emit(t->args[1]);
+            if (saved) unscoped_mods[b] = saved; else unscoped_mods.erase(b);
+            return texpr(o::vblock(10, {lbl, uns, package, c}));  // Tfunctor
+          }
+        }
         // In this trunk a Tarrow's DOMAIN is wrapped in Tpoly(ty, []) (to allow
         // first-class-poly arguments); the codomain stays bare.  OCaml asserts
         // (btype.tpoly_get_mono) if the argument isn't a Tpoly.
@@ -1159,11 +1231,6 @@ struct TyEmit {
                             ? inner
                             : texpr(o::vblock(8, {inner, o::vint(0) /*[]*/}));  // Tpoly
         o::ValPtr c = emit(t->args[1]);
-        // arg_label = Nolabel (int 0) | Labelled of string (block tag 0)
-        //           | Optional of string (block tag 1)
-        o::ValPtr lbl = t->label_kind == 1 ? o::vblock(0, {o::vstr(t->label)})
-                      : t->label_kind == 2 ? o::vblock(1, {o::vstr(t->label)})
-                      : o::vint(0) /*Nolabel*/;
         return texpr(o::vblock(1, {lbl, dom, c, o::vint(0) /*Cok*/}));  // Tarrow
       }
       case Ty::Tuple: {
@@ -1227,24 +1294,9 @@ struct TyEmit {
         return texpr(o::vblock(4, {row, o::vblock(0, {o::vint(0)})}));  // Tobject(row, ref None)
       }
       case Ty::Package: {
-        // Tpackage { pack_path; pack_constraints: (string list * type_expr) list }.
-        o::ValPtr path = mty_path(t->name);
-        if (!path) return texpr(o::vblock(0, {o::vint(0)}));  // unplaceable -> Tvar None
-        std::vector<o::ValPtr> cs;
-        for (std::size_t i = 0; i < t->pv_tags.size() && i < t->args.size(); ++i) {
-          // the constraint's type name, split on dots into a string list
-          std::vector<o::ValPtr> comps;
-          const std::string& n = t->pv_tags[i];
-          for (std::size_t s = 0, e; s <= n.size(); s = e + 1) {
-            e = n.find('.', s);
-            if (e == std::string::npos) e = n.size();
-            comps.push_back(o::vstr(n.substr(s, e - s)));
-            if (e == n.size()) break;
-          }
-          cs.push_back(o::vblock(0, {o::vlist(comps), emit(t->args[i])}));
-        }
-        auto package = o::vblock(0, {path, cs.empty() ? o::vint(0) : o::vlist(cs)});
-        return texpr(o::vblock(9, {package}));  // Tpackage
+        if (o::ValPtr package = pack_payload(*t))
+          return texpr(o::vblock(9, {package}));  // Tpackage
+        return texpr(o::vblock(0, {o::vint(0)}));  // unplaceable -> Tvar None
       }
     }
     return o::vint(0);

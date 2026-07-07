@@ -266,6 +266,9 @@ struct Ty {
   bool univar = false;         // Var: a universally-quantified var (Tunivar) --
                                // a poly field's `'a.` binder
   std::vector<int> poly_ids;   // Poly: the quantified vars' ids (args[0] = body)
+  std::string binder;          // Package: the dependent binder (`(module M : T)`
+                               // as a parameter) -- when the codomain cites
+                               // `M.t`, the writer emits Tfunctor, not Tarrow
 };
 TyPtr ty_variant(std::vector<std::string> tags);      // exact all-constant row
 TyPtr ty_variant_row(std::vector<std::string> tags, std::vector<TyPtr> args,
