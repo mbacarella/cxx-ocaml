@@ -373,6 +373,11 @@ struct SigItem {
   // Constr nodes citing this decl; 0 = none).  The writer maps it to the
   // emitted Local ident so a shadowed outer decl is cited correctly (`t/2`).
   int engine_stamp = 0;
+  // Class: the bridged SELF object node.  Class fields citing it (a method
+  // `unit -> 'self`) share this exact Ty node (one BridgeCtx spans the whole
+  // class), and the writer maps it to the emitted csig_self, so Printtyp
+  // prints `object ('a) .. method m : unit -> 'a end`.
+  TyPtr class_self;
   // Type: Type_immediacy (0 Unknown / 1 Always / 2 Always_on_64bits) from a
   // `[@@immediate]` / `[@@immediate64]` attribute (Printtyp renders it back).
   int type_immediate = 0;

@@ -533,6 +533,10 @@ struct Checker {
   // end` -- generalized-open/shadowing), but the cmi emission wants the type
   // of the exact declaration it's walking.
   std::unordered_map<const ast::ClassDeclaration*, TypePtr> class_node_types_;
+  // The SELF object node inferred for each class body (what `self` bound to):
+  // the cmi producer maps it to csig_self so method types citing the self
+  // (`unit -> 'self`) marshal as the shared node and print `object ('a) ..`.
+  std::unordered_map<const ast::ClassDeclaration*, TypePtr> class_self_types_;
   // Each class's instance-variable types (name -> type), so `inherit P` brings
   // P's vals into the subclass body (woodyatt: charlie inherits bravo's `y`).
   std::unordered_map<std::string, std::vector<std::pair<std::string, TypePtr>>>
@@ -6433,7 +6437,8 @@ struct Checker {
                          const std::vector<const ast::Pcl_let*>* cl_lets = nullptr,
                          std::unordered_map<std::string, TypePtr>* cvars = nullptr,
                          std::vector<TypePtr>* param_tys = nullptr,
-                         std::vector<std::pair<std::string, TypePtr>>* out_instvars = nullptr) {
+                         std::vector<std::pair<std::string, TypePtr>>* out_instvars = nullptr,
+                         TypePtr* out_self = nullptr) {
     std::vector<std::string> mnames;
     std::vector<TypePtr> mtypes;
     venv.emplace_back();
@@ -6464,6 +6469,10 @@ struct Checker {
     // annotation's object row (from the class type's signature) pins every
     // method's type; self binds to it so self#m resolves through it (mixin3).
     TypePtr self_annot = nullptr;
+    // `object (self : 'self)`: the self TYPE VARIABLE names the self object
+    // for the whole body, so a method annotation `unit -> 'self` cites THE
+    // self node (ocamlc prints `object ('a) .. method m : unit -> 'a`).
+    std::string self_tyvar;
     {
       std::vector<std::string> sn;
       std::vector<TypePtr> st;
@@ -6483,6 +6492,8 @@ struct Checker {
         sp = pc->p.get();
       }
       if (sct) {
+        if (auto* pv = std::get_if<Ptyp_var>(&sct->desc)) self_tyvar = pv->name;
+        else if (auto* pa = std::get_if<Ptyp_alias>(&sct->desc)) self_tyvar = pa->name;
         std::unordered_map<std::string, TypePtr> avars;
         TypePtr at = I::Engine::repr(
             from_coretype(*sct, cvars ? *cvars : avars));
@@ -6493,6 +6504,7 @@ struct Checker {
         }
       }
       if (auto* sv = std::get_if<Ppat_var>(&sp->desc)) venv.back()[sv->name.txt] = selfTy;
+      if (out_self) *out_self = selfTy;
       self_ty_stack_.push_back(selfTy);
     }
     // `inherit P args`: bring P's instance vars into scope so the subclass'
@@ -6529,9 +6541,13 @@ struct Checker {
           if (pty) {  // an annotated method type pins the signature
             // The class' TYPE params scope over method annotations, so `'a` in
             // `method bar : 'a -> 'a` binds to the class param `['a] c` (else it
-            // would be a fresh var, printed apart from the class' `'a`).
+            // would be a fresh var, printed apart from the class' `'a`).  The
+            // self pattern's type var (`object (self : 'self)`) scopes over
+            // them too: `s -> 'self` cites the self object itself (pr7293).
             std::unordered_map<std::string, TypePtr> vars;
             if (cvars) vars = *cvars;
+            if (!self_tyvar.empty())
+              vars.emplace(self_tyvar, self_ty_stack_.back());
             TypePtr at = from_coretype(*pty, vars);
             if (strict) soft_unify(bt, at); else { try { try_unify(bt, at); } catch (...) {} bt = at; }
           }
@@ -7925,10 +7941,12 @@ struct Checker {
             }
             std::vector<TypePtr> ptys;
             std::vector<std::pair<std::string, TypePtr>> instvars;
+            TypePtr selfty;
             TypePtr ot = infer_object_body(pe.ps->cs, pe.params.empty() ? nullptr : &pe.params,
                                            pe.lets.empty() ? nullptr : &pe.lets,
                                            d.params.empty() ? nullptr : &cvars,
-                                           &ptys, &instvars);
+                                           &ptys, &instvars, &selfty);
+            if (selfty) class_self_types_[&d] = selfty;
             class_instvars_[d.name.txt] = std::move(instvars);
             // Unify the pre-registered placeholder with the real inferred
             // ctor/object type so forward `new` uses (which grabbed the
@@ -12459,6 +12477,17 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         ci.rec_status = class_rs; class_rs = 2;
         ci.class_virtual = (d.virt == VirtualFlag::Virtual);
         std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
+        // ONE bridge context spans the whole class: fields citing the self
+        // object (or any shared row) bridge to the SAME Ty node, so the
+        // writer sharing (csig_self, `as 'a`) survives.
+        BridgeCtx cctx;
+        auto cbridge = [&](const TypePtr& t) {
+          return bridge_ty_rec(t, cvars, cnext, cctx);
+        };
+        // The inferred self node maps to the writer csig_self.
+        if (auto sf = ck.class_self_types_.find(&d);
+            sf != ck.class_self_types_.end())
+          ci.class_self = cbridge(sf->second);
         // constructor arrows + the final object type.  A paramless class lives
         // in class_types_; one with value OR type params in class_ctor_types_
         // (a `['a] c` with no value params still has a ctor scheme carrying its
@@ -12472,7 +12501,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           ct = f->second;
         TypePtr obj = ct ? I::Engine::repr(ct) : nullptr;
         while (obj && obj->kind == I::Type::Kind::Arrow) {
-          ci.class_arrow_doms.push_back(bridge_ty(obj->dom, cvars, cnext));
+          ci.class_arrow_doms.push_back(cbridge(obj->dom));
           ci.class_arrow_lks.push_back(obj->arrow_label);
           ci.class_arrow_lbls.push_back(obj->arrow_lbl);
           obj = I::Engine::repr(obj->cod);
@@ -12488,7 +12517,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         if (!d.params.empty() && obj && obj->kind == I::Type::Kind::Object &&
             obj->abbrev_args.size() == d.params.size())
           for (std::size_t pi = 0; pi < obj->abbrev_args.size(); ++pi) {
-            auto pv = bridge_ty(obj->abbrev_args[pi], cvars, cnext);
+            auto pv = cbridge(obj->abbrev_args[pi]);
             // An anonymous param `_` is stored as Tvar(Some "_") so Printtyp
             // renders it `_` (`['a, _] c`) rather than naming it 'b.
             if (std::holds_alternative<Ptyp_any>(d.params[pi]->desc))
@@ -12528,9 +12557,9 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             if (auto* cv = std::get_if<Cfk_virtual>(&pv->kind)) {
               f.virt = true;
               std::unordered_map<std::string, TypePtr> tv;
-              f.ty = bridge_ty(ck.from_coretype(*cv->type, tv), cvars, cnext);
+              f.ty = cbridge(ck.from_coretype(*cv->type, tv));
             } else if (auto v = vtypes.find(f.name); v != vtypes.end()) {
-              f.ty = bridge_ty(v->second, cvars, cnext);
+              f.ty = cbridge(v->second);
             } else {
               f.ty = cmi::cmiw::ty_var(cnext++);
             }
@@ -12544,13 +12573,13 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             if (auto* cv = std::get_if<Cfk_virtual>(&pm->kind)) {
               f.virt = true;
               std::unordered_map<std::string, TypePtr> tv;
-              f.ty = bridge_ty(ck.from_coretype(*cv->type, tv), cvars, cnext);
+              f.ty = cbridge(ck.from_coretype(*cv->type, tv));
             } else if (auto m = mtypes.find(f.name); m != mtypes.end()) {
               // `method m = {< >}` returns self: its type is the recursive self
               // object.  Flag it so the writer emits the shared csig_self node
               // (Printtyp then prints `object ('a) .. method m : 'a end`).
               f.self_ref = object_cites_self(m->second);
-              f.ty = bridge_ty(m->second, cvars, cnext);
+              f.ty = cbridge(m->second);
             } else {
               f.ty = cmi::cmiw::ty_var(cnext++);
             }

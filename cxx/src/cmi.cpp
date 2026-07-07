@@ -1698,6 +1698,11 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // `object ('a) .. method m : 'a end`.
       o::ValPtr row_var = te.texpr(o::vblock(0, {o::vint(0)}));  // Tvar None
       o::ValPtr self = te.texpr(o::vint(0));  // Tobject desc patched below
+      // The bridged self node (one shared Ty across the class fields) maps to
+      // csig_self, so a method type citing `'self` (`unit -> 'self`) emits a
+      // back-reference to THIS node -- Printtyp then aliases the self row and
+      // prints `object ('a) .. method m : unit -> 'a end` (pr7293).
+      if (it.class_self) te.shared_nodes[it.class_self.get()] = self;
       std::vector<MapEnt> vars_m, meths_m;
       std::vector<std::string> mnames;
       std::vector<o::ValPtr> memit;  // each public method's emitted type node
