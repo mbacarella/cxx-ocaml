@@ -367,6 +367,8 @@ struct SigItem {
   std::vector<std::string> more_param_refs;
   // Module: `module MD5 : S` -- the decl's modtype is the NAMED reference S
   // (Mty_ident), not S's expansion.  Empty = Mty_signature(sub).
+  // Modtype: an ALIAS body `module type S2 = S1` / `= M.T` -- mtd_type =
+  // Some(Mty_ident); `sub` stays the resolved fallback layout.
   std::string modtype_ref;
   // Functor: a NAMED result modtype (`module F () : Ret`) emits
   // Mty_ident(Ret) as the body; `sub` stays the resolved fallback layout.

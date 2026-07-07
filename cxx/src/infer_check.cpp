@@ -7731,11 +7731,20 @@ struct Checker {
             venv.back()[pr->prim.name.txt] = ty;
           }
         } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
-          if (mt->type)  // record a signature module type's value names for unpacks
+          if (mt->type) {  // record a signature module type's value names for unpacks
             if (auto* sg = std::get_if<Pmty_signature>(&mt->type->desc)) {
               collect_sig_values(sg->items, modtype_env[mt->name.txt]);
               modtype_sig_asts_[mt->name.txt] = &sg->items;
             }
+            // `module type S2 = S1`: the alias resolves to the target's items.
+            else if (auto* pid = std::get_if<Pmty_ident>(&mt->type->desc))
+              if (auto* l = std::get_if<Lident>(&pid->id.txt.v))
+                if (auto f = modtype_sig_asts_.find(l->name);
+                    f != modtype_sig_asts_.end()) {
+                  modtype_sig_asts_[mt->name.txt] = f->second;
+                  collect_sig_values(*f->second, modtype_env[mt->name.txt]);
+                }
+          }
         }
       } catch (const I::TypeError&) {
       }
@@ -9239,6 +9248,11 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
     cmi::cmiw::TyPtr man = td.manifest ? conv_cmi_ty(td.manifest, vars, nv) : nullptr;
     si = cmi::cmiw::sig_type(td.name, std::move(params), man);
   }
+  // A re-exported datatype (List's `type 'a t = 'a list = [] | ..`) keeps its
+  // manifest ALONGSIDE the kind (Printtyp renders the `= 'a list =` link).
+  if (!si.manifest && td.manifest &&
+      (td.kind == cmi::TypeDecl::Record || td.kind == cmi::TypeDecl::Variant))
+    si.manifest = conv_cmi_ty(td.manifest, vars, nv);
   si.type_variances = td.variances;
   return si;
 }
@@ -9535,9 +9549,15 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     if (auto* pt = std::get_if<Psig_type>(&it.desc))
       for (auto& d : pt->decls) ck.register_type_decl(d);
     if (auto* pmt = std::get_if<Psig_modtype>(&it.desc))
-      if (pmt->type)
+      if (pmt->type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
           modtypes[pmt->name.txt] = &ps->items;
+        // `module type S2 = S1`: the alias resolves to the target's items.
+        else if (auto* pid = std::get_if<Pmty_ident>(&pmt->type->desc))
+          if (auto* l = std::get_if<Lident>(&pid->id.txt.v))
+            if (auto f = modtypes.find(l->name); f != modtypes.end())
+              modtypes[pmt->name.txt] = f->second;
+      }
     // `module type S := sig .. end` (a destructive modtype SUBSTITUTION): S takes
     // no field and is erased from the output, but a later `include S with ..` must
     // still expand to its members.  printtyp.mli declares `module type Printers :=`
@@ -9752,7 +9772,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           // `module Set : Set.S with ..` (a qualified functor-result module type).
           apply_with_constraints(ck, *pm->md.type, items);
           drop_modsubst(items, with_modsubst_names(*pm->md.type));
-          out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items)));
+          auto mitem = cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items));
+          // A plain DOTTED named modtype (`module M : Original.T`, no `with`)
+          // stays Mty_ident like ocamlc; the resolved sig is the fallback.
+          if (auto* pid = std::get_if<Pmty_ident>(&pm->md.type->desc))
+            mitem.modtype_ref = lid_full(pid->id.txt);
+          out.push_back(std::move(mitem));
         } else {
           // Any other module type (`module Consistbl : module type of struct ..
           // end`): emit an opaque submodule so it still TAKES A FIELD -- else the
@@ -9769,6 +9794,20 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       else if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
         out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt,
                                              signature_to_cmi(ps->items, &modtypes, &module_sigs)));
+      else if (auto* pid = std::get_if<Pmty_ident>(&pmt->type->desc)) {
+        // `module type S2 = S1` / `= M.T`: an ALIAS -- mtd_type stays
+        // Mty_ident like ocamlc; the resolved items are the fallback layout.
+        if (!std::holds_alternative<Lapply>(pid->id.txt.v)) {
+          std::vector<cmi::cmiw::SigItem> sub;
+          if (const ast::Signature* bs = body_sig(*pmt->type))
+            sub = signature_to_cmi(*bs, &modtypes, &module_sigs);
+          else
+            sub = qual_modtype_items(*pmt->type);
+          auto s = cmi::cmiw::sig_modtype(pmt->name.txt, std::move(sub));
+          s.modtype_ref = lid_full(pid->id.txt);
+          out.push_back(std::move(s));
+        }
+      }
     } else if (std::get_if<Psig_class>(&it.desc) ||
                std::get_if<Psig_class_type>(&it.desc)) {
       // `class c : <arrows> -> object .. end` / `class type ct = object .. end`
@@ -9912,6 +9951,24 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
   // functor-param index everywhere.  Values / modules / exception ctors are
   // separate namespaces (a value `x` and a module `x` both take a field).
   out = cmi::cmiw::dedup_shadowed_fields(std::move(out));
+  // TYPE declarations too (no runtime field, but one namespace per sig): two
+  // `include module type of ..` both carrying `type 'a t` keep one (pr5164).
+  {
+    std::unordered_map<std::string, std::size_t> lastt;
+    bool tdup = false;
+    for (std::size_t i = 0; i < out.size(); ++i)
+      if (out[i].k == cmi::cmiw::SigItem::Type) {
+        if (lastt.count(out[i].name)) tdup = true;
+        lastt[out[i].name] = i;
+      }
+    if (tdup) {
+      std::vector<cmi::cmiw::SigItem> ded; ded.reserve(out.size());
+      for (std::size_t i = 0; i < out.size(); ++i)
+        if (out[i].k != cmi::cmiw::SigItem::Type || lastt[out[i].name] == i)
+          ded.push_back(std::move(out[i]));
+      out = std::move(ded);
+    }
+  }
   return out;
 }
 
@@ -10424,6 +10481,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     // Resolve the functor: one param name per application level + result items.
     std::vector<std::string> pnames;
     std::vector<cmi::cmiw::SigItem> result;
+    std::string result_ref;  // a local functor's Mty_ident result (`: Priv`)
     bool resolved = false;
     if (comps.size() == 1 && prior) {  // a local functor emitted earlier
       // An EMPTY result sig is legitimate (`module F (A : ..) = struct let _ =
@@ -10437,6 +10495,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           pnames.push_back(si.functor_param);
           for (auto& n : si.more_param_names) pnames.push_back(n);
           result = si.sub;  // fresh item; subst clones every node it touches
+          result_ref = si.functor_result_ref;
           resolved = true;
           break;
         }
@@ -10563,6 +10622,15 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     cmi::cmiw::SigItem item;
     if (part_params.empty()) {
       item = cmi::cmiw::sig_module(name, std::move(result));
+      // `module A = Make(..)` where Make's result is a NAMED modtype (`: Priv`)
+      // that doesn't cite a parameter: ocamlc keeps Mty_ident(Priv) as A's
+      // modtype; the substituted items stay the fallback layout.
+      if (!result_ref.empty()) {
+        std::string head = result_ref.substr(0, result_ref.find('.'));
+        bool param_rel = false;
+        for (auto& pn : pnames) if (!pn.empty() && pn == head) param_rel = true;
+        if (!param_rel) item.modtype_ref = result_ref;
+      }
     } else {
       item = cmi::cmiw::sig_module_functor(name, part_params[0].name,
                                            std::move(part_params[0].sig),
@@ -10729,6 +10797,18 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         out.push_back(cmi::cmiw::sig_modtype_abstract(pmt->name.txt));
       else if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
         out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, signature_to_cmi(ps->items)));
+      else if (auto* pid = std::get_if<Pmty_ident>(&pmt->type->desc)) {
+        // `module type S2 = S1` / `= M.T` in a struct: an ALIAS -- mtd_type
+        // stays Mty_ident; the resolved items are the fallback layout.
+        if (!std::holds_alternative<Lapply>(pid->id.txt.v)) {
+          std::string ref;
+          std::vector<cmi::cmiw::SigItem> sub;
+          annot_modtype_items(&ck, *pmt->type, ref, sub);
+          auto s = cmi::cmiw::sig_modtype(pmt->name.txt, std::move(sub));
+          s.modtype_ref = std::move(ref);
+          out.push_back(std::move(s));
+        }
+      }
     } else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
       // `class c [params] = object .. end`: emit Sig_class (the writer adds
       // the two ghost companions).  Member TYPES come from the checker

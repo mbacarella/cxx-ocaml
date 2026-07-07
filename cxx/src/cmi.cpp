@@ -1406,12 +1406,17 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                   o::vint(0) /*Exported*/}));  // Sig_module
     } else if (it.k == SigItem::Modtype) {
       // Sig_modtype(id, modtype_declaration, vis).  mtd_type = Some(Mty_signature
-      // sig), or None for an ABSTRACT `module type S`.  Takes NO runtime field,
-      // so it never shifts the value layout.
+      // sig), Some(Mty_ident) for an ALIAS `module type S2 = S1` / `= M.T`, or
+      // None for an ABSTRACT `module type S`.  Takes NO runtime field, so it
+      // never shifts the value layout.
       o::ValPtr mto;
       if (it.modtype_abstract)
         mto = o::vint(0);  // None
-      else
+      else if (!it.modtype_ref.empty()) {
+        if (o::ValPtr mp = modtype_path(it.modtype_ref))
+          mto = o::vblock(0, {o::vblock(0, {mp})});  // Some(Mty_ident)
+      }
+      if (!mto)
         mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod))})});  // Some(Mty_signature)
       auto mtd = o::vblock(0, {mto, o::vint(0) /*attrs*/,
                                loc_none(), o::vint(0) /*mtd_uid*/});  // modtype_declaration
