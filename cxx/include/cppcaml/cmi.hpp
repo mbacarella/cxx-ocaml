@@ -340,6 +340,8 @@ struct SigItem {
   // REPRESENTATION (Printtyp derives the printed attr from the representation,
   // not an attribute node).
   bool type_unboxed = false;
+  // Type: an EMPTY variant (`type empty = |`) -- Type_variant([]), not abstract.
+  bool type_empty_variant = false;
   // Module: rec_status (0 Trec_not / 1 Trec_first / 2 Trec_next) -- a
   // `module rec A .. and B ..` group prints as such only when marked.
   int rec_status = 0;

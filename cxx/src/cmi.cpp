@@ -1062,12 +1062,15 @@ struct TyEmit {
         return texpr(o::vblock(6, {rd}));  // Tvariant of row_desc
       }
       case Ty::Object: {
-        // A closed structural object type `< m1 : t1; m2 : t2 >`:
+        // A structural object type `< m1 : t1; m2 : t2 >`:
         // Tobject(Tfield(m1, FKpublic, Tpoly(t1,[]), ... Tnil), ref None).
         // Each method type is Tpoly-wrapped (ocamlc stores even monomorphic
-        // methods as Tpoly(ty, [])); the row terminates in Tnil (closed).
+        // methods as Tpoly(ty, [])); the row terminates in Tnil (closed) or a
+        // Tvar for an OPEN row (`< m : t; .. >`, row_kind 0).
         // The printer sorts fields by name, so emission order is source order.
-        o::ValPtr row = texpr(o::vint(0));  // Tnil (a full type_expr node)
+        o::ValPtr row = t->row_kind == 0
+                            ? texpr(o::vblock(0, {o::vint(0)}))  // Tvar None (open)
+                            : texpr(o::vint(0));                 // Tnil (a full type_expr node)
         for (std::size_t i = t->pv_tags.size(); i-- > 0;) {
           o::ValPtr mty = texpr(o::vblock(8, {emit(t->args[i]), o::vint(0)}));  // Tpoly(ty,[])
           row = texpr(o::vblock(5, {o::vstr(t->pv_tags[i]), o::vint(1) /*FKpublic*/,
@@ -1498,6 +1501,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         kind = o::vblock(1, {o::vlist(lds), rep});  // Type_record
       } else if (it.type_open) {
         kind = o::vint(0);  // Type_open (`type t = ..`), the lone constant ctor
+      } else if (it.type_empty_variant) {
+        kind = o::vblock(2, {o::vint(0), o::vint(0)});  // Type_variant([], regular)
       } else {
         kind = o::vblock(0, {o::vint(0)});  // Type_abstract(Definition)
       }

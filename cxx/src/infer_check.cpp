@@ -8727,17 +8727,21 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
         v->univar = true;  // a poly field's `'a.` binder -> Tunivar
       return v;
     }
-    case K::Object: {  // closed structural object `< m1 : t1; m2 : t2 >`
+    case K::Object: {  // structural object `< m1 : t1; m2 : t2 [; ..] >`
       // A row referenced twice in one scheme must bridge to ONE Ty node (the
       // writer then marshals it shared and Printtyp names it `as 'a`); a
       // RECURSIVE object type (`< bark : 'self -> unit > as 'self`) is a cycle
       // the writer can't express -- degrade the inner occurrence to a var.
+      // Named class-type objects (abbrev, `(T1,T2) ops`) stay opaque for now.
+      if (!t->abbrev.empty()) return cmi::cmiw::ty_var(nextvar++);
       if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end()) return it->second;
       if (!ctx.visiting.insert(t.get()).second) return cmi::cmiw::ty_var(nextvar++);
       std::vector<cmi::cmiw::TyPtr> mtys;
       for (auto& a : t->args) mtys.push_back(bridge_ty(a, vars, nextvar));
       ctx.visiting.erase(t.get());
       auto ty = cmi::cmiw::ty_object(t->labels, std::move(mtys));
+      // engine variant_kind 1 on an Object marks an OPEN row (`< ..; .. >`)
+      if (t->variant_kind == 1) ty->row_kind = 0;
       ctx.nodes[t.get()] = ty;
       return ty;
     }
@@ -8896,6 +8900,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         ctors.push_back(std::move(cc));
       }
       auto si = cmi::cmiw::sig_variant(d.name.txt, std::move(params), std::move(ctors));
+      si.type_empty_variant = var->ctors.empty();  // `type empty = |`
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed;
       si.type_unboxed = unboxed;
