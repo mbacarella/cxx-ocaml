@@ -70,6 +70,12 @@ struct TypeExpr {
   // Tvariant: the directly-named polymorphic-variant tags (row_fields labels),
   // so a `#poly` type pattern over an imported abbreviation resolves its tag set.
   std::vector<std::string> pv_tags;
+  // Tvariant full row shape (parallel to pv_tags; pv_args empty on a row that
+  // didn't decode cleanly -- consumers must handle the tags-only form):
+  std::vector<TypePtr> pv_args;        // tag argument, null = constant tag
+  std::vector<char> pv_present;        // RFpresent (vs Reither) per tag
+  bool row_closed = false;             // row_desc.row_closed
+  bool row_more_nil = false;           // row_more is Tnil (an exact row)
 };
 
 struct SigValue {
@@ -105,6 +111,7 @@ struct TypeDecl {
   std::vector<LabelDecl> labels;        // Record
   std::vector<ConstructorDecl> ctors;   // Variant
   std::string external_name;            // External
+  bool priv = false;                    // type_private = Private
   TypePtr manifest;                     // type_manifest option (abbreviation)
   // type_variance, one RAW Variance.t int per parameter (a bitfield Printtyp
   // renders as `+`/`-`/`!`); empty when the decl predates the decode.

@@ -207,6 +207,9 @@ public:
     if (arena_[d.fields.at(1)].kind == m::Value::Kind::Int)
       td.arity = static_cast<int>(arena_[d.fields[1]].i);
     type_kind(d.fields.at(2), td);
+    // type_private : private_flag (field 3; 0 Private / 1 Public).
+    if (arena_[d.fields.at(3)].kind == m::Value::Kind::Int)
+      td.priv = arena_[d.fields[3]].i == 0;
     // type_manifest : type_expr option (field 4).
     const m::Value& man = arena_[d.fields.at(4)];
     if (man.kind == m::Value::Kind::Block && man.tag == 0)
@@ -406,21 +409,45 @@ private:
         switch (d.tag) {
           case 4: t.kind = TypeExpr::Tobject; break;
           case 5: t.kind = TypeExpr::Tfield; break;
-          case 6: {  // Tvariant of row_desc; row_desc.field0 = row_fields list.
+          case 6: {  // Tvariant of row_desc
             t.kind = TypeExpr::Tvariant;
-            // row_desc = { row_fields:(label*row_field) list; row_more; .. }.
+            // row_desc = { row_fields:(label*row_field) list; row_more;
+            //              row_closed; row_fixed; row_name }.
             if (d.fields.empty()) break;
             const m::Value& rd = arena_[d.fields[0]];
-            if (!rd.fields.empty())
-              for (std::size_t cur = rd.fields[0];
-                   arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();
-                   cur = arena_[cur].fields[1]) {       // cons cell: (head, tail)
-                const m::Value& pair = arena_[arena_[cur].fields[0]];  // (label, row_field)
-                if (!pair.fields.empty()) {
-                  const m::Value& lbl = arena_[pair.fields[0]];
-                  if (lbl.kind == m::Value::Kind::String) t.pv_tags.push_back(lbl.str);
-                }
+            if (rd.fields.empty()) break;
+            for (std::size_t cur = rd.fields[0];
+                 arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();
+                 cur = arena_[cur].fields[1]) {       // cons cell: (head, tail)
+              const m::Value& pair = arena_[arena_[cur].fields[0]];  // (label, row_field)
+              if (pair.fields.size() < 2) continue;
+              const m::Value& lbl = arena_[pair.fields[0]];
+              if (lbl.kind != m::Value::Kind::String) continue;
+              // row_field: RFpresent(te option) block 0 / RFeither{no_arg;
+              // arg_type:te list; matched; ext} block 1 / RFabsent (Int).
+              const m::Value& rf = arena_[pair.fields[1]];
+              if (rf.kind == m::Value::Kind::Int) continue;  // RFabsent: dropped tag
+              t.pv_tags.push_back(lbl.str);
+              if (rf.tag == 0) {  // RFpresent
+                t.pv_present.push_back(1);
+                const m::Value& oa = arena_[rf.fields.at(0)];
+                t.pv_args.push_back(oa.kind == m::Value::Kind::Int
+                                        ? nullptr : type(oa.fields.at(0)));
+              } else {            // RFeither
+                t.pv_present.push_back(0);
+                std::vector<TypePtr> ats = type_list(rf.fields.at(1));
+                t.pv_args.push_back(ats.empty() ? nullptr : ats[0]);
               }
+            }
+            if (rd.fields.size() >= 3) {
+              TypePtr more = type(rd.fields[1]);
+              while (more && (more->kind == TypeExpr::Tlink ||
+                              more->kind == TypeExpr::Tsubst))
+                more = more->link;
+              t.row_more_nil = more && more->kind == TypeExpr::Tnil;
+              const m::Value& rc = arena_[rd.fields[2]];
+              t.row_closed = rc.kind == m::Value::Kind::Int && rc.i != 0;
+            }
             break;
           }
           case 9: t.kind = TypeExpr::Tpackage; break;

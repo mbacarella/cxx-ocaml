@@ -9349,10 +9349,17 @@ static std::string bare_cmi_path(const cmi::Path& p) {
   return s;
 }
 // cmi reader type -> cmi writer type.  Best-effort: shapes the back end / arg
-// matching cares about (arrows + labels, tuples, constructors, vars) are
+// matching cares about (arrows + labels, tuples, constructors, vars, and --
+// when a `nodes` sharing map is supplied -- polymorphic-variant rows) are
 // preserved; anything else degrades to a fresh type variable (always valid).
+// `nodes` spans one item/decl conversion: a node cited twice (a constrained
+// decl param in its labels, a row shared through a val scheme) converts to
+// ONE writer node so the marshal sharing -- and Printtyp's `as 'a` naming --
+// survives the round trip.  A nullptr entry marks in-progress conversion
+// (cycle guard: a self-citing fixpoint row degrades to a var, as before).
 static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
-    std::unordered_map<const cmi::TypeExpr*, int>& vars, int& nextvar) {
+    std::unordered_map<const cmi::TypeExpr*, int>& vars, int& nextvar,
+    std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr>* nodes = nullptr) {
   cmi::TypePtr t = t0;
   // Unwrap Tlink/Tsubst indirections AND Tpoly: a module type's polymorphic
   // value (`val eprintf : ('a,..) format -> 'a` in Signatures.LOG) reaches us as
@@ -9365,36 +9372,71 @@ static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
                t->kind == cmi::TypeExpr::Tpoly))
     t = t->link;
   if (!t) return cmi::cmiw::ty_var(nextvar++);
+  if (t->kind == cmi::TypeExpr::Tvar || t->kind == cmi::TypeExpr::Tunivar) {
+    auto it = vars.find(t.get());
+    if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
+    int id = nextvar++; vars[t.get()] = id;
+    auto r = cmi::cmiw::ty_var(id);
+    if (t->name) r->var_name = *t->name;  // keep Tvar(Some "acc") -> 'acc
+    return r;
+  }
+  if (nodes) {
+    auto it = nodes->find(t.get());
+    if (it != nodes->end())
+      return it->second ? it->second : cmi::cmiw::ty_var(nextvar++);
+    (*nodes)[t.get()] = nullptr;  // visiting marker
+  }
+  cmi::cmiw::TyPtr r;
   switch (t->kind) {
-    case cmi::TypeExpr::Tvar:
-    case cmi::TypeExpr::Tunivar: {
-      auto it = vars.find(t.get());
-      if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
-      int id = nextvar++; vars[t.get()] = id;
-      auto r = cmi::cmiw::ty_var(id);
-      if (t->name) r->var_name = *t->name;  // keep Tvar(Some "acc") -> 'acc
-      return r;
-    }
     case cmi::TypeExpr::Tarrow:
-      return cmi::cmiw::ty_arrow_lbl(conv_cmi_ty(t->dom, vars, nextvar),
-                                     conv_cmi_ty(t->cod, vars, nextvar),
-                                     t->label_kind, t->label);
+      r = cmi::cmiw::ty_arrow_lbl(conv_cmi_ty(t->dom, vars, nextvar, nodes),
+                                  conv_cmi_ty(t->cod, vars, nextvar, nodes),
+                                  t->label_kind, t->label);
+      break;
     case cmi::TypeExpr::Ttuple: {
       std::vector<cmi::cmiw::TyPtr> es;
-      for (auto& e : t->elems) es.push_back(conv_cmi_ty(e.second, vars, nextvar));
-      return cmi::cmiw::ty_tuple(std::move(es));
+      for (auto& e : t->elems) es.push_back(conv_cmi_ty(e.second, vars, nextvar, nodes));
+      r = cmi::cmiw::ty_tuple(std::move(es));
+      break;
     }
     case cmi::TypeExpr::Tconstr:
     case cmi::TypeExpr::Texpand: {
       std::vector<cmi::cmiw::TyPtr> as;
-      for (auto& a : t->args) as.push_back(conv_cmi_ty(a, vars, nextvar));
+      for (auto& a : t->args) as.push_back(conv_cmi_ty(a, vars, nextvar, nodes));
       std::string nm = t->path ? bare_cmi_path(*t->path) : "";
-      if (nm.empty()) return cmi::cmiw::ty_var(nextvar++);
-      return cmi::cmiw::ty_constr(nm, std::move(as));
+      r = nm.empty() ? cmi::cmiw::ty_var(nextvar++)
+                     : cmi::cmiw::ty_constr(nm, std::move(as));
+      break;
+    }
+    case cmi::TypeExpr::Tvariant: {
+      // A fully-decoded row converts faithfully (only under a `nodes` map --
+      // it doubles as the cycle guard); a tags-only legacy decode degrades.
+      if (!nodes || t->pv_args.size() != t->pv_tags.size() ||
+          t->pv_present.size() != t->pv_tags.size()) {
+        r = cmi::cmiw::ty_var(nextvar++);
+        break;
+      }
+      bool all_present = true;
+      for (char p : t->pv_present) if (!p) all_present = false;
+      int rk = !t->row_closed ? 0 : (t->row_more_nil && all_present ? 2 : 1);
+      std::vector<cmi::cmiw::TyPtr> targs;
+      std::vector<std::string> present;
+      for (std::size_t i = 0; i < t->pv_tags.size(); ++i) {
+        targs.push_back(t->pv_args[i]
+                            ? conv_cmi_ty(t->pv_args[i], vars, nextvar, nodes)
+                            : nullptr);
+        if (rk == 1 && t->pv_present[i]) present.push_back(t->pv_tags[i]);
+      }
+      r = cmi::cmiw::ty_variant_row(t->pv_tags, std::move(targs), rk,
+                                    std::move(present));
+      break;
     }
     default:
-      return cmi::cmiw::ty_var(nextvar++);
+      r = cmi::cmiw::ty_var(nextvar++);
+      break;
   }
+  if (nodes) (*nodes)[t.get()] = r;
+  return r;
 }
 static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td);
 static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
@@ -9424,10 +9466,11 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
         case cmi::Signature::OrderEnt::Value: {
           auto& v = sig.values.at(oe.idx);
           std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
+          std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
           if (!v.prim.empty())
-            out.push_back(cmi::cmiw::sig_external(v.name, conv_cmi_ty(v.type, vars, nv), v.prim, ""));
+            out.push_back(cmi::cmiw::sig_external(v.name, conv_cmi_ty(v.type, vars, nv, &nodes), v.prim, ""));
           else
-            out.push_back(cmi::cmiw::sig_value(v.name, conv_cmi_ty(v.type, vars, nv)));
+            out.push_back(cmi::cmiw::sig_value(v.name, conv_cmi_ty(v.type, vars, nv, &nodes)));
           break;
         }
         case cmi::Signature::OrderEnt::Module:
@@ -9455,7 +9498,8 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
   for (auto& v : sig.values) {
     if (v.prim.empty()) continue;
     std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
-    out.push_back(cmi::cmiw::sig_external(v.name, conv_cmi_ty(v.type, vars, nv), v.prim, ""));
+    std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
+    out.push_back(cmi::cmiw::sig_external(v.name, conv_cmi_ty(v.type, vars, nv, &nodes), v.prim, ""));
   }
   // Field-taking items in the recorded runtime field order, so the spliced
   // layout matches the .cmo block (`include M` copies M's non-prim fields).
@@ -9468,7 +9512,8 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
   for (auto& fn : sig.fields) {
     if (auto it = vmap.find(fn); it != vmap.end()) {
       std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
-      out.push_back(cmi::cmiw::sig_value(fn, conv_cmi_ty(it->second->type, vars, nv)));
+      std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
+      out.push_back(cmi::cmiw::sig_value(fn, conv_cmi_ty(it->second->type, vars, nv, &nodes)));
     } else if (auto it = mmap.find(fn); it != mmap.end()) {
       out.push_back(cmi_module_to_item(fn, *it->second, origin));
     } else if (auto it = xmap.find(fn); it != xmap.end()) {
@@ -9482,31 +9527,36 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
 }
 static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
   std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
+  // ONE sharing map across the decl: a constrained param (stored as its
+  // bound, not a var) cited from a label/manifest converts to the same
+  // writer node, so Printtyp prints the `constraint 'a = ..` clause back.
+  std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
   std::vector<cmi::cmiw::TyPtr> params;
-  for (auto& p : td.params) params.push_back(conv_cmi_ty(p, vars, nv));
+  for (auto& p : td.params) params.push_back(conv_cmi_ty(p, vars, nv, &nodes));
   cmi::cmiw::SigItem si;
   if (td.kind == cmi::TypeDecl::Record) {
     std::vector<cmi::cmiw::Label> ls;
     for (auto& l : td.labels)
-      ls.push_back({l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv)});
+      ls.push_back({l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)});
     si = cmi::cmiw::sig_record(td.name, std::move(params), std::move(ls));
   } else if (td.kind == cmi::TypeDecl::Variant) {
     std::vector<cmi::cmiw::Ctor> cs;
     for (auto& c : td.ctors) {
       std::vector<cmi::cmiw::TyPtr> as;
-      for (auto& a : c.args) as.push_back(conv_cmi_ty(a, vars, nv));
+      for (auto& a : c.args) as.push_back(conv_cmi_ty(a, vars, nv, &nodes));
       cs.push_back({c.name, std::move(as)});
     }
     si = cmi::cmiw::sig_variant(td.name, std::move(params), std::move(cs));
   } else {
-    cmi::cmiw::TyPtr man = td.manifest ? conv_cmi_ty(td.manifest, vars, nv) : nullptr;
+    cmi::cmiw::TyPtr man = td.manifest ? conv_cmi_ty(td.manifest, vars, nv, &nodes) : nullptr;
     si = cmi::cmiw::sig_type(td.name, std::move(params), man);
   }
   // A re-exported datatype (List's `type 'a t = 'a list = [] | ..`) keeps its
   // manifest ALONGSIDE the kind (Printtyp renders the `= 'a list =` link).
   if (!si.manifest && td.manifest &&
       (td.kind == cmi::TypeDecl::Record || td.kind == cmi::TypeDecl::Variant))
-    si.manifest = conv_cmi_ty(td.manifest, vars, nv);
+    si.manifest = conv_cmi_ty(td.manifest, vars, nv, &nodes);
+  si.type_private = td.priv;
   si.type_variances = td.variances;
   return si;
 }
@@ -9710,6 +9760,11 @@ static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
 static void annot_modtype_items(Checker* ckp, const ast::ModuleType& mt,
                                 std::string& ref,
                                 std::vector<cmi::cmiw::SigItem>& sig);
+static std::vector<std::string> split_dotted(const std::string& s);
+static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
+    const std::vector<std::string>& comps);
+static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
+                                const std::string& app);
 static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
                                    std::vector<cmi::cmiw::SigItem>& items) {
   const ast::ModuleType* m = &mt;
@@ -9731,6 +9786,36 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
           if (n.rfind(from, 0) == 0) n = to + n.substr(from.size());
         });
         continue;
+      } else if (auto* wmo = std::get_if<Pwith_module>(&c)) {
+        // `with module X = Y`: ocamlc replaces X's decl with Y's signature
+        // strengthened at Y (`module Endpoint : sig type t = Endpoint.t
+        // end`).  Best effort: materialize X's OWN sig (a named cross-unit
+        // ref resolves through its cmi) and strengthen its abstract types at
+        // Y -- equivalent whenever Y was ascribed that same modtype, the
+        // common source shape (range.ml's `with module Endpoint = Endpoint`).
+        std::vector<std::string> mcomps = split_dotted(lid_full(wmo->lid1.txt));
+        std::vector<cmi::cmiw::SigItem>* mcur = &items;
+        cmi::cmiw::SigItem* mitem = nullptr;
+        for (std::size_t i = 0; i < mcomps.size() && mcur; ++i) {
+          mitem = nullptr;
+          for (auto& si : *mcur)
+            if (si.k == cmi::cmiw::SigItem::Module && si.name == mcomps[i]) {
+              mitem = &si; break;
+            }
+          mcur = mitem ? &mitem->sub : nullptr;
+        }
+        if (mitem) {
+          if (mitem->sub.empty() && !mitem->modtype_ref.empty() &&
+              mitem->modtype_ref.find('.') != std::string::npos) {
+            auto mats = cmi_modtype_items(split_dotted(mitem->modtype_ref));
+            if (!mats.empty()) mitem->sub = std::move(mats);
+          }
+          if (!mitem->sub.empty()) {
+            mitem->modtype_ref.clear();
+            strengthen_abstract(mitem->sub, lid_full(wmo->lid2.txt));
+          }
+        }
+        continue;
       } else continue;
       // Descend a dotted `with type M.t = ..` through submodule items.
       std::string full = lid_full(lid->txt);
@@ -9745,6 +9830,15 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
         std::vector<cmi::cmiw::SigItem>* next = nullptr;
         for (auto& si : *cur)
           if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[i]) {
+            // A submodule held as a NAMED modtype ref (`module Endpoint :
+            // Range_intf.Endpoint_intf`): the refinement forces it inline --
+            // ocamlc stores `sig type t = Endpoint.t end` -- so materialize
+            // the referenced modtype's items and drop the ref.
+            if (si.sub.empty() && !si.modtype_ref.empty() &&
+                si.modtype_ref.find('.') != std::string::npos) {
+              auto mats = cmi_modtype_items(split_dotted(si.modtype_ref));
+              if (!mats.empty()) { si.sub = std::move(mats); si.modtype_ref.clear(); }
+            }
             next = &si.sub; break;
           }
         cur = next;
