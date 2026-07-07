@@ -7433,6 +7433,22 @@ struct Checker {
           }
         return inner;
       }
+      // `(A : S)` with A unresolvable here (an enclosing-scope module seen
+      // during a submodule's re-inference): bind S's values at their DECLARED
+      // types, not fresh vars -- `include (A : S); let z = f x` must infer
+      // z : int through the sig's f : t -> int (includestruct).  Non-strict
+      // only; the strict pass keeps the old degrade.
+      if (!strict)
+        if (auto* sg = std::get_if<Pmty_signature>(&mc->mt->desc)) {
+          std::unordered_map<std::string, TypePtr> declared;
+          for (auto& sit : sg->items)
+            if (auto* pv = std::get_if<Psig_value>(&sit.desc)) {
+              std::unordered_map<std::string, TypePtr> vars;
+              if (TypePtr t = from_coretype(*pv->vd.type, vars))
+                declared[pv->vd.name.txt] = t;
+            }
+          if (!declared.empty()) return declared;
+        }
       return modtype_values(*mc->mt);  // e.g. `(val e : S)` parsed as a constraint
     }
     if (auto* mu = std::get_if<Pmod_unpack>(&me.desc)) {
@@ -12385,6 +12401,20 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             inc_path = unm;  // mark handled
           } catch (...) {}
         }
+      } else if (auto* pc = std::get_if<Pmod_constraint>(&in->expr.desc)) {
+        // `include (A : S)` / `include (struct .. end : S)`: ocamlc splices
+        // S's items verbatim -- the constrained expression is not a path, so
+        // nothing strengthens (`type t` stays abstract; includestruct).
+        std::string cref;
+        std::vector<cmi::cmiw::SigItem> csub;
+        if (pc->mt) annot_modtype_items(&ck, *pc->mt, cref, csub);
+        for (auto& si : csub) out.push_back(std::move(si));
+      } else if (std::holds_alternative<Pmod_apply>(in->expr.desc)) {
+        // `include F(struct end)`: the application's result items, computed by
+        // the same machinery as `module N = F(..)`; no strengthening (an
+        // application with a struct argument is not a path; includestruct's D).
+        if (auto item = module_binding_sigitem("", in->expr, &out, &ck))
+          for (auto& si : item->sub) out.push_back(std::move(si));
       }
       if (inc) {
         auto items = infer_signature(*inc);
