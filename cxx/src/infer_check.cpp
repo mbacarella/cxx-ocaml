@@ -11229,6 +11229,44 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // declaration types for the .cmi -- keep local abbreviations as written
   // (`startDate : (int, message) fieldStatus` stores `message`, not string).
   ck.keep_local_abbrevs_ = true;
+  // An expression-local module escaping into an inferred val type is stored
+  // by ocamlc as its definition path with RAW unit heads (`let module N =
+  // Map.Make(S) in .. : int N.t` -> int Stdlib__Map.Make(Stdlib__String).t;
+  // the display pass alias-routes it back).  A name also bound by a
+  // top-level module stays in scope and is NOT rewritten (pr6944).
+  std::unordered_map<std::string, std::string> local_mod_defs;
+  {
+    std::set<std::string> toplevel_mods;
+    for (auto& it : s)
+      if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+        if (mb->binding.name.txt) toplevel_mods.insert(*mb->binding.name.txt);
+    auto stdlib_unit = [](const std::string& m) {
+      if (m.empty() || m.rfind("Stdlib__", 0) == 0) return false;
+      std::string hc = head_cmi(m);
+      std::string base = hc.substr(hc.rfind('/') + 1);
+      return base.rfind("stdlib__", 0) == 0 && std::filesystem::exists(hc);
+    };
+    auto raw_applied = [&](const std::string& p) {
+      std::string r;
+      for (std::size_t i = 0; i < p.size();) {
+        if (i == 0 || p[i - 1] == '(') {  // a path head: start or functor arg
+          std::size_t j = i;
+          while (j < p.size() &&
+                 (std::isalnum((unsigned char)p[j]) || p[j] == '_')) ++j;
+          std::string id = p.substr(i, j - i);
+          r += stdlib_unit(id) ? "Stdlib__" + id : id;
+          i = j;
+        } else {
+          r += p[i++];
+        }
+      }
+      return r;
+    };
+    for (auto& [nm, path] : ck.local_module_paths_)
+      if (!path.empty() && path.find('(') != std::string::npos &&
+          !toplevel_mods.count(nm))
+        local_mod_defs[nm] = raw_applied(path);
+  }
   std::vector<cmi::cmiw::SigItem> out;
   g_enclosing_struct_items = &out;  // sig-side `module type of <local module>`
   for (auto& it : s) {
@@ -11240,7 +11278,14 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           auto f = ck.venv.back().find(nm);
           if (f == ck.venv.back().end()) continue;
           std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
-          out.push_back(cmi::cmiw::sig_value(nm, bridge_ty(f->second, vars, nextvar)));
+          auto ty = bridge_ty(f->second, vars, nextvar);
+          if (!local_mod_defs.empty())
+            rewrite_ty_names(ty, [&](std::string& n) {
+              std::string head = n.substr(0, n.find('.'));
+              if (auto d = local_mod_defs.find(head); d != local_mod_defs.end())
+                n = d->second + n.substr(head.size());
+            });
+          out.push_back(cmi::cmiw::sig_value(nm, std::move(ty)));
         }
       }
     } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
