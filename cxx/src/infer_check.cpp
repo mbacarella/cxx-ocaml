@@ -1309,7 +1309,14 @@ struct Checker {
           if (auto sp = stamp_path_.find(stamp); sp != stamp_path_.end())
             path = sp->second;
         } else if (fold_abbrevs_ && ai != type_aliases.end() &&
-                   !ai->second.display_path.empty()) {
+                   !ai->second.display_path.empty() &&
+                   // Only when the alias's ARITY matches the written args: a bare
+                   // `t` applied to more (or fewer) args than the same-named local
+                   // abbreviation isn't that abbreviation -- it's an OUTER type the
+                   // submodule's checker can't see (pr7152's `_ t` is `Simple.t`,
+                   // arity 1, not the nested `Data.t = int`, arity 0).  Requalifying
+                   // to the nested alias printed `'a Data.t` for `Simple.M`'s key.
+                   ai->second.params.size() == as.size()) {
           path = ai->second.display_path;
         }
       }
@@ -1929,9 +1936,18 @@ struct Checker {
     // (`val code0 : Env.in_t -> out0`); count it bound so strict's
     // unbound-module check can't false-fire (flat over-inclusive set, like
     // the other bound_module_names_ producers).
+    auto saved_sq = opened_submod_quals_;
     for (auto& it : items)
       if (auto* md = std::get_if<Psig_module>(&it.desc)) {
-        if (md->md.name.txt) bound_module_names_.insert(*md->md.name.txt);
+        if (md->md.name.txt) {
+          bound_module_names_.insert(*md->md.name.txt);
+          // A functor PARAMETER's SUBMODULE member type is qualified through the
+          // param (`(D : sig module Data : sig type t end val key : Data.t t end)`
+          // makes `Data.t` mean `D.Data.t`), so a body val citing it exports the
+          // param-qualified path -- pr7152's `Register (D:S)`'s key : D.Data.t t.
+          if (!qual.empty())
+            opened_submod_quals_[*md->md.name.txt] = qual + "." + *md->md.name.txt;
+        }
       }
     for (auto& it : items)
       if (auto* v = std::get_if<Psig_value>(&it.desc)) {
@@ -1941,6 +1957,7 @@ struct Checker {
     functor_result_abstract_ = std::move(saved);
     functor_param_type_quals_ = std::move(saved_pq);
     row_phantom_aliases_ = std::move(saved_rp);
+    opened_submod_quals_ = std::move(saved_sq);
     return out;
   }
 
