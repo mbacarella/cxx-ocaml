@@ -5066,11 +5066,13 @@ struct Checker {
       return at;
     }
     if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
-      if (record_kinds_) {  // kind pass: the scrutinee type gives the better kind
-        TypePtr t = infer_pat(*al->p);
-        venv.back()[al->name.txt] = t;
-        return t;
-      }
+      // `pat as x`: x is bound not to the scrutinee's type but to one REBUILT
+      // from the pattern (typecore build_as_type), so a poly-variant or-pattern
+      // `` `Nil | `Cons _ as x `` gives x its own OPEN sub-row `[> `Nil | `Cons ]`
+      // independent of the `[<` scrutinee -- both the kind (emit) pass and the
+      // display pass need this, else `` `A x `` ties the output row back to the
+      // whole input (morematch's shared `as 'a`).  The sub-pattern types feed
+      // build_as_type through as_map_.
       std::unordered_map<const Pattern*, TypePtr> tys;
       auto* saved = as_map_;
       as_map_ = &tys;
