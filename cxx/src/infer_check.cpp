@@ -224,6 +224,12 @@ struct Checker {
   // resolves to the in-scope declaration, so a name reused across several local
   // types is disambiguated by position instead of collapsed to ambiguous.
   std::unordered_map<const ConstructorDecl*, TypePtr> ctor_scheme_;
+  // Same idea for `type t += C` extension constructors (keyed by the extension
+  // ctor AST node): process_item overlays them into the enclosing module's cenv
+  // so a local `type t += B` shadows an outer variant's `B` when a value in the
+  // module matches on it (patmatch's MPR7761 -- else `B` resolved to the file's
+  // top-level `type t = B of int | ..` and cited the wrong `t`).
+  std::unordered_map<const void*, TypePtr> ext_ctor_scheme_;
   std::vector<std::unordered_map<std::string, TypePtr>> cenv{{}};
   // Module aliases `module MP = Gc.Memprof`: (target-path, alias-name).  ocamlc
   // keeps the alias in displayed type paths (`MP.t`, not `Gc.Memprof.t`), so the
@@ -3098,10 +3104,15 @@ struct Checker {
         if (immediate_types_.count(d.name.txt)) immediate_types_.insert(q);
         stdlib_keep_paths_.insert(q);
       }
-    // Opaque types (variant/record/abstract-without-manifest) have a distinct
-    // identity; pure abbreviations are transparent (expanded), so unstamped.
+    // Opaque types (variant/record/extensible/abstract-without-manifest) have a
+    // distinct nominal identity; pure abbreviations are transparent (expanded),
+    // so unstamped.  An extensible `type t = ..` (Ptype_open) is nominal too --
+    // without a stamp a nested `type t = ..` shadowing an enclosing `t` (its
+    // `type t += ..` ctors, and any value matching on them) mis-resolved bare
+    // `t` to the OUTER decl, so Printtyp disambiguated the cite as `t/2`.
     bool opaque = std::holds_alternative<Ptype_variant>(d.kind) ||
                   std::holds_alternative<Ptype_record>(d.kind) ||
+                  std::holds_alternative<Ptype_open>(d.kind) ||
                   (std::holds_alternative<Ptype_abstract>(d.kind) && !d.manifest);
     // A module re-exported bare by a top-level `include A` displays its type
     // names unqualified (ocamlc shows the included name).
@@ -3396,7 +3407,14 @@ struct Checker {
                 q != opened_submod_quals_.end())
               tpath = q->second + tpath.substr(dot);
         }
-        result = is_exn ? eng.constr("exn") : eng.constr(tpath, params);
+        // Cite the extended decl's own stamp (now that `type t = ..` is
+        // stamped) so a value matching on this ctor carries the extended type's
+        // identity, not an outer same-named decl's.  Bare tpath only; a dotted
+        // path keeps the current unstamped (var-degrading) behaviour.
+        int est = tpath.find('.') == std::string::npos
+                      ? mx_resolve_bare_stamp(tpath, mod_prefix_)
+                      : 0;
+        result = is_exn ? eng.constr("exn") : eng.constr(tpath, params, est);
       }
       TypePtr scheme = result;
       if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
@@ -3405,6 +3423,7 @@ struct Checker {
       register_inline_record(d->args, result, vars);  // `type t += C of { f }`
       if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
       ctors[ec.name.txt] = scheme;
+      if (!is_exn) ext_ctor_scheme_[&ec] = scheme;  // for in-scope cenv overlay
       if (is_exn) exn_ctors_.insert(ec.name.txt);
     }
   }
@@ -3416,7 +3435,13 @@ struct Checker {
   TypePtr* find_ctor(const std::string& name) {
     // A variant constructor reusing a predef/exception name needs type-directed
     // disambiguation we don't have -> leave unknown rather than pick wrong.
-    if (!predef_ctors_.count(name) && !exn_ctors_.count(name))
+    // Exception: in the NON-STRICT (dump/cmi) pass a predef name IS consulted in
+    // the scoped cenv, so a value INSIDE the module that redefined `::`/`[]`
+    // (GPR#234's `type hlist = [] | (::)`) resolves to the local ctor by lexical
+    // scoping -- cenv only holds `::` where an enclosing decl bound it, so outer
+    // uses still fall through to the predef.  Strict stays conservative (a
+    // type-directed re-pick we can't do could otherwise false-reject).
+    if (!exn_ctors_.count(name) && (!predef_ctors_.count(name) || !strict))
       for (auto it = cenv.rbegin(); it != cenv.rend(); ++it) {
         auto f = it->find(name);
         if (f != it->end()) return &f->second;
@@ -8114,6 +8139,11 @@ struct Checker {
           register_exception(ex->exn.ctor);
         } else if (auto* tx = std::get_if<Pstr_typext>(&it.desc)) {
           register_typext(tx->ext);
+          // Overlay this module's extension ctors so they shadow an outer
+          // same-named ctor for values later in the module (see ext_ctor_scheme_).
+          for (auto& ec : tx->ext.ctors)
+            if (auto s = ext_ctor_scheme_.find(&ec); s != ext_ctor_scheme_.end())
+              cenv.back()[ec.name.txt] = s->second;
         } else if (auto* sv = std::get_if<Pstr_value>(&it.desc))
           infer_bindings(sv->rf, sv->bindings, /*toplevel=*/true);
         else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
