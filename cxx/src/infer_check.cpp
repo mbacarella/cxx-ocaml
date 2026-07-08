@@ -10498,6 +10498,44 @@ static void apply_prim_attrs(const ast::PrimitiveDescription& pd,
   if (t) item.prim_repr_res = native_repr_code(*t, gkind, immediates);
 }
 
+// The most recent external in `out` named `name` (reverse scan = shadowing).
+static const cmi::cmiw::SigItem* find_prim_alias_target(
+    const std::vector<cmi::cmiw::SigItem>& out, const std::string& name) {
+  for (auto it = out.rbegin(); it != out.rend(); ++it)
+    if (it->k == cmi::cmiw::SigItem::Value && it->name == name &&
+        (it->prim_external || !it->prim.empty()))
+      return &*it;
+  return nullptr;
+}
+
+// `external f [: t] = g` (Pprim_alias): ocamlc copies g's ENTIRE primitive
+// description -- prim name(s), alloc + native reprs -- and keeps f's explicit
+// type when given, else g's.  The decl's own [@@noalloc]/[@unboxed] attrs are
+// IGNORED (they trigger warning 53), so we do NOT run apply_prim_attrs here.
+// Returns nullopt when the target isn't a resolvable local external (dotted
+// aliases aren't supported), so the item is left dropped as before.
+static std::optional<cmi::cmiw::SigItem> emit_prim_alias(
+    Checker& ck, const ast::PrimitiveDescription& pd,
+    const std::vector<cmi::cmiw::SigItem>& out) {
+  if (!pd.alias || pd.alias->txt.find('.') != std::string::npos) return std::nullopt;
+  const cmi::cmiw::SigItem* tgt = find_prim_alias_target(out, pd.alias->txt);
+  if (!tgt) return std::nullopt;
+  cmi::cmiw::TyPtr ty;
+  if (pd.type) {
+    std::unordered_map<std::string, TypePtr> tvars;
+    std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
+    ty = bridge_ty_named(ck.from_coretype(*pd.type, tvars), bvars, nextvar, tvars);
+  } else {
+    ty = tgt->ty;  // no annotation: inherit the aliased primitive's type
+  }
+  cmi::cmiw::SigItem item =
+      cmi::cmiw::sig_external(pd.name.txt, ty, tgt->prim, tgt->prim_native);
+  item.prim_alloc = tgt->prim_alloc;
+  item.prim_reprs = tgt->prim_reprs;
+  item.prim_repr_res = tgt->prim_repr_res;
+  return item;
+}
+
 // The declared params' SOURCE names ("_" for Ptyp_any): ocamlc stores each as
 // Tvar(Some name) in ext_type_params and prints it back verbatim.
 static std::vector<std::string> typext_param_names(const ast::TypeExtension& ext) {
@@ -11046,6 +11084,8 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         auto item = cmi::cmiw::sig_external(pr->pd.name.txt, ty, pr->pd.prims[0], native);
         apply_prim_attrs(pr->pd, out, item);
         out.push_back(std::move(item));
+      } else if (pr->pd.alias) {  // `external f [: t] = g`: copy g's primitive
+        if (auto item = emit_prim_alias(ck, pr->pd, out)) out.push_back(std::move(*item));
       }
     } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
       bool nonrec_ = pt->rf == RecFlag::Nonrecursive;
@@ -12778,6 +12818,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         auto item = cmi::cmiw::sig_external(pr->prim.name.txt, ty, pr->prim.prims[0], native);
         apply_prim_attrs(pr->prim, out, item);
         out.push_back(std::move(item));
+      } else if (pr->prim.alias) {  // `external f [: t] = g`: copy g's primitive
+        if (auto item = emit_prim_alias(ck, pr->prim, out)) out.push_back(std::move(*item));
       }
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
       emit_type_decls(ck, ty->decls, out, ty->rf == RecFlag::Nonrecursive);
