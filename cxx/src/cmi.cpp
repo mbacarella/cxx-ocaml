@@ -946,6 +946,14 @@ struct TyEmit {
   const std::unordered_map<int, int>* engine_types = nullptr;
   const std::unordered_map<std::string, int>* local_modtypes = nullptr;  // same-sig modtype -> stamp
   const std::unordered_map<std::string, int>* local_mods = nullptr;  // visible module -> stamp
+  // Visible local modules by simple name, OUTER->INNER, plus each module's
+  // directly-declared member names (types/modules/...).  A dotted type head
+  // `M.t` resolves to the innermost `M` that actually DECLARES `t`, not just
+  // the innermost `M`: pr7402's inner `F.M` shadows the outer `M` but has no
+  // `t`, so `M.t` cites the OUTER decl (Printtyp prints it `M/2`).  Null =
+  // fall back to local_mods' innermost stamp.
+  const std::unordered_map<std::string, std::vector<int>>* mods_by_name = nullptr;
+  const std::unordered_map<int, std::set<std::string>>* mod_members = nullptr;
   // Dependent-arrow binders in scope (`(module M : T) -> M.t`): binder name ->
   // the SHARED Ident.Unscoped ValPtr cited by both the Tfunctor node and every
   // `M.t` path in its codomain (ocamlc shares them physically).
@@ -1070,8 +1078,20 @@ struct TyEmit {
       // Global that would demand an interface CRC for "MP".
       if (local_mods)
         if (auto lm = local_mods->find(comps[0]); lm != local_mods->end()) {
+          int mstamp = lm->second;
+          // Pick the innermost visible `M` that DECLARES the next component
+          // (`t` in `M.t`): the innermost `M` alone can be the wrong one when a
+          // nested module shadows an outer of the same name (pr7402).
+          if (comps.size() >= 2 && mods_by_name && mod_members)
+            if (auto bn = mods_by_name->find(comps[0]); bn != mods_by_name->end())
+              for (auto s = bn->second.rbegin(); s != bn->second.rend(); ++s)
+                if (auto mm = mod_members->find(*s);
+                    mm != mod_members->end() && mm->second.count(comps[1])) {
+                  mstamp = *s;
+                  break;
+                }
           o::ValPtr path = o::vblock(0, {o::vblock(0, {o::vstr(comps[0]),
-                                                       o::vint(lm->second)})});
+                                                       o::vint(mstamp)})});
           for (std::size_t i = 1; i < comps.size(); ++i)
             path = o::vblock(1, {path, o::vstr(comps[i])});  // Pdot
           return path;
@@ -1357,6 +1377,24 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
 }
 }  // namespace
 
+// Visible local modules threaded through nested signatures so a dotted type
+// head resolves to the module that truly declares the member (see TyEmit).
+struct ModScope {
+  std::unordered_map<std::string, std::vector<int>> by_name;  // name -> stamps, outer->inner
+  std::unordered_map<int, std::set<std::string>> members;     // stamp -> declared member names
+};
+
+// The member names a module's signature declares directly (types, submodules,
+// module types, classes) -- the components a dotted path off it can name.
+static std::set<std::string> module_member_names(const std::vector<SigItem>& sub) {
+  std::set<std::string> names;
+  for (auto& it : sub)
+    if (it.k == SigItem::Type || it.k == SigItem::Module ||
+        it.k == SigItem::Modtype || it.k == SigItem::Class)
+      names.insert(it.name);
+  return names;
+}
+
 // Marshal a list of signature items (recursive: a submodule's items nest under
 // Mty_signature).  `stamp` is a counter shared across the whole cmi so every
 // local ident is unique (a value's type referencing a same-module `type t`
@@ -1367,14 +1405,16 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              const std::unordered_map<std::string, int>* outer_types = nullptr,
                                              const std::unordered_map<std::string, int>* outer_modtypes = nullptr,
                                              const std::unordered_map<std::string, int>* outer_mods = nullptr,
-                                             const std::unordered_map<int, int>* outer_eng = nullptr);
+                                             const std::unordered_map<int, int>* outer_eng = nullptr,
+                                             const ModScope* outer_modscope = nullptr);
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              std::map<std::string, bool>& referenced,
                                              int& stamp,
                                              const std::unordered_map<std::string, int>* outer_types,
                                              const std::unordered_map<std::string, int>* outer_modtypes,
                                              const std::unordered_map<std::string, int>* outer_mods,
-                                             const std::unordered_map<int, int>* outer_eng) {
+                                             const std::unordered_map<int, int>* outer_eng,
+                                             const ModScope* outer_modscope) {
   // Pre-pass: give every item its stamp up front and record the local type
   // names, so a value emitted before/after a type can still cite it by stamp.
   std::vector<int> item_stamp(items.size());
@@ -1410,6 +1450,16 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   std::unordered_map<std::string, int> visible_mod;
   if (outer_mods) visible_mod = *outer_mods;
   for (auto& [n, s] : local_mods) visible_mod[n] = s;
+  // Module scope for member-directed head resolution: inherit the enclosing
+  // one, then append THIS level's modules (outer entries stay first, so a
+  // name's stamp vector runs outer->inner).
+  ModScope modscope;
+  if (outer_modscope) modscope = *outer_modscope;
+  for (std::size_t i = 0; i < items.size(); ++i)
+    if (items[i].k == SigItem::Module) {
+      modscope.by_name[items[i].name].push_back(item_stamp[i]);
+      modscope.members[item_stamp[i]] = module_member_names(items[i].sub);
+    }
   // Engine-stamped type decls visible here (outer + this level's own; stamps
   // are globally unique so there is no shadowing among KEYS -- shadowing is
   // exactly what the two distinct entries express).
@@ -1505,7 +1555,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // Sig_module = block(3, {ident, presence, md, ..}); md_type = md[0].
       if (pfunc && !pfunc->empty()) {
         auto emitted = emit_sig_items({(*pfunc)[0]}, referenced, stamp,
-                                      &visible, &visible_mt, &visible_mod_body, &visible_eng);
+                                      &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope);
         if (emitted.size() == 1 && emitted[0]->fields.size() >= 3 &&
             !emitted[0]->fields[2]->fields.empty())
           psig = emitted[0]->fields[2]->fields[0];
@@ -1513,7 +1563,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       if (!psig && !ref.empty())
         if (o::ValPtr mp = modtype_path(ref, &visible_mod_body)) psig = o::vblock(0, {mp});  // Mty_ident
       if (!psig)
-        psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng))});  // Mty_signature
+        psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope))});  // Mty_signature
       return o::vblock(0, {name_opt, psig});  // Named(name_opt, <param sig>)
     };
     std::vector<o::ValPtr> params;
@@ -1533,7 +1583,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       if (o::ValPtr rp = modtype_path(it.functor_result_ref, &visible_mod_body))
         body = o::vblock(0, {rp});  // Mty_ident
     if (!body)
-      body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng))});  // Mty_signature(result)
+      body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope))});  // Mty_signature(result)
     for (auto p = params.rbegin(); p != params.rend(); ++p)
       body = o::vblock(2, {*p, body});  // Mty_functor
     return body;
@@ -1544,6 +1594,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     TyEmit te; te.referenced = &referenced; te.local_types = &visible;
     te.local_modtypes = &visible_mt; te.local_mods = &visible_mod;
     te.engine_types = &visible_eng;
+    te.mods_by_name = &modscope.by_name; te.mod_members = &modscope.members;
     auto ident = o::vblock(0, {o::vstr(it.name), o::vint(item_stamp[i])});  // Ident.Local{name;stamp}
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
@@ -1620,7 +1671,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (!it.modtype_ref.empty())
           if (o::ValPtr mp = modtype_path(it.modtype_ref)) mty = o::vblock(0, {mp});  // Mty_ident
         if (!mty)
-          mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng))});  // Mty_signature
+          mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope))});  // Mty_signature
       }
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                               o::vint(0) /*md_uid*/});  // module_declaration
@@ -1644,7 +1695,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           mto = o::vblock(0, {o::vblock(0, {mp})});  // Some(Mty_ident)
       }
       if (!mto)
-        mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng))})});  // Some(Mty_signature)
+        mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope))})});  // Some(Mty_signature)
       auto mtd = o::vblock(0, {mto, o::vint(0) /*attrs*/,
                                loc_none(), o::vint(0) /*mtd_uid*/});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
