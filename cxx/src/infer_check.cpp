@@ -2249,22 +2249,41 @@ struct Checker {
       std::vector<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(head)));
       const cmi::Signature* sig = &loaded.back().sig();
-      // Record each module level's (types, cumulative-prefix) as an enclosing
-      // scope, so a Pident type owned by a PARENT module qualifies to its own
-      // module (`Array1.create`'s `kind` -> `Bigarray.kind`, not the submodule).
+      // ocamlc's `Mtype.strengthen` roots a cmi-loaded value's type references at
+      // the ACCESS path P of the value's own module (alias route, `Bigarray.Array1`
+      // -> `Stdlib.Bigarray.Array1`) -- but ONLY for types owned by that module or
+      // a descendant.  A type owned by a STRICT ANCESTOR of the value's module is
+      // free in the accessed signature and keeps the CANONICAL compilation-unit
+      // path baked in the cmi (`Array1.create`'s `kind` -> `Stdlib__Bigarray.kind`,
+      // not `Stdlib.Bigarray.kind`).  So ancestor scopes use the canonical head; the
+      // deepest (accessed) scope and its submodules use the alias head.
+      std::string canon_head = loaded.back().module_name();
+      if (canon_head.empty()) canon_head = comps[0];
+      // Record each module level's (types, cumulative-prefix) as an enclosing scope.
+      // Ancestor levels carry the canonical prefix; the accessed (deepest) level is
+      // rewritten to the alias prefix once the walk finishes.
       std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> scopes;
       std::vector<std::pair<const std::vector<cmi::ModuleDecl>*, std::string>> mscopes;
-      scopes.push_back({&sig->types, comps[0]});
-      mscopes.push_back({&sig->modules, comps[0]});
+      std::string alias_pfx = comps[0];       // access route, joined from comps
+      std::string canon_pfx = canon_head;     // canonical unit-rooted route
+      scopes.push_back({&sig->types, canon_pfx});
+      mscopes.push_back({&sig->modules, canon_pfx});
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
           if (mm.name == comps[i]) { md = &mm; break; }
         sig = md ? module_sig(md->type, loaded) : nullptr;
         if (sig) {
-          scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
-          mscopes.push_back({&sig->modules, mscopes.back().second + "." + comps[i]});
+          alias_pfx += "." + comps[i];
+          canon_pfx += "." + comps[i];
+          scopes.push_back({&sig->types, canon_pfx});
+          mscopes.push_back({&sig->modules, canon_pfx});
         }
+      }
+      // The accessed module (deepest scope) and its own members use the alias route.
+      if (sig && !scopes.empty()) {
+        scopes.back().second = alias_pfx;
+        mscopes.back().second = alias_pfx;
       }
       if (sig) {
         cmi_types_ctx_ = &sig->types;  // enable same-module abbreviation expansion
