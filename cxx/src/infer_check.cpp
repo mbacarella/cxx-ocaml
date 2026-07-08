@@ -10730,6 +10730,9 @@ static TypeofResolved resolve_typeof_path(
 
 static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
                                   const std::function<void(std::string&)>& fn);
+static void qualify_enclosing_types(std::vector<cmi::cmiw::SigItem>& result,
+                                    const cmi::Signature& outer_sig,
+                                    const std::string& unit_path);
 static void annot_modtype_items(Checker* ckp, const ast::ModuleType& mt,
                                 std::string& ref,
                                 std::vector<cmi::cmiw::SigItem>& sig);
@@ -11073,7 +11076,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           std::string origin;
           for (std::size_t i = 0; i + 1 < comps.size(); ++i)
             origin += (i ? "." : "") + comps[i];
-          return cmi_sig_to_items(*md.type->sig, origin);
+          auto result = cmi_sig_to_items(*md.type->sig, origin);
+          std::string unit_path = cmi.module_name();
+          for (std::size_t i = 1; i + 1 < comps.size(); ++i)
+            unit_path += "." + comps[i];
+          qualify_enclosing_types(result, *sig, unit_path);
+          return result;
         }
     } catch (...) {}
     return {};
@@ -11811,6 +11819,36 @@ static std::vector<std::string> split_dotted(const std::string& s) {
   return out;
 }
 
+// A value inside a resolved modtype may cite a type declared at the ENCLOSING
+// unit level (Hashtbl's `statistics`, cited bare by `SeededS.stats`): its cmi
+// Pident decodes to a bare `statistics` that no longer resolves once the
+// modtype is spliced into a functor result, degrading to a fresh var
+// (`stats : 'a t -> 'b`).  Requalify such refs to the enclosing unit's real
+// path (`Stdlib__Hashtbl.statistics`).  Only names the modtype does NOT itself
+// declare are rewritten, so its own abstract `t`/`key` (which shadow any
+// same-named unit type) stay bare.  `outer_sig` is the signature that CONTAINS
+// the modtype decl; `unit_path` the real compiled path of that signature.
+static void qualify_enclosing_types(std::vector<cmi::cmiw::SigItem>& result,
+                                    const cmi::Signature& outer_sig,
+                                    const std::string& unit_path) {
+  std::set<std::string> outer;
+  for (auto& td : outer_sig.types) outer.insert(td.name);
+  if (outer.empty()) return;
+  std::set<std::string> shadow;
+  std::function<void(const std::vector<cmi::cmiw::SigItem>&)> collect =
+      [&](const std::vector<cmi::cmiw::SigItem>& its) {
+        for (auto& si : its) {
+          if (si.k == cmi::cmiw::SigItem::Type) shadow.insert(si.name);
+          collect(si.sub);
+        }
+      };
+  collect(result);
+  rewrite_item_ty_names(result, [&](std::string& n) {
+    if (n.find('.') == std::string::npos && outer.count(n) && !shadow.count(n))
+      n = unit_path + "." + n;
+  });
+}
+
 // Signature items of a QUALIFIED named module type ("Set.S",
 // "Pqueue.OrderedType"), resolved through the head module's compiled cmi.
 static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
@@ -11828,12 +11866,18 @@ static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
     if (!sig) return {};
     for (auto& mtd : sig->modtypes)
       if (mtd.name == comps.back() && mtd.type &&
-          mtd.type->kind == cmi::ModuleType::Sig && mtd.type->sig)
-        return cmi_sig_to_items(*mtd.type->sig, [&] {
+          mtd.type->kind == cmi::ModuleType::Sig && mtd.type->sig) {
+        auto result = cmi_sig_to_items(*mtd.type->sig, [&] {
           std::string o;
           for (std::size_t i = 0; i + 1 < comps.size(); ++i) o += (i ? "." : "") + comps[i];
           return o;
         }());
+        std::string unit_path = cmif.module_name();
+        for (std::size_t i = 1; i + 1 < comps.size(); ++i)
+          unit_path += "." + comps[i];
+        qualify_enclosing_types(result, *sig, unit_path);
+        return result;
+      }
   } catch (...) {}
   return {};
 }
@@ -12565,8 +12609,22 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         std::string origin;
         for (std::size_t i = 0; i + 1 < comps.size(); ++i)
           origin += (i ? "." : "") + comps[i];
+        // The enclosing unit signature + its real path, so a functor RESULT's
+        // bare refs to a unit-level type (Hashtbl's `statistics`) requalify --
+        // see qualify_enclosing_types (MakeSeeded(SS)'s `stats : .. -> 'b`).
+        const cmi::Signature* encl = &cmif.sig();
+        std::string unit_path = cmif.module_name();
+        for (std::size_t i = 1; i + 1 < comps.size() && encl; ++i) {
+          const cmi::ModuleDecl* emd = nullptr;
+          for (auto& mm : encl->modules)
+            if (mm.name == comps[i]) { emd = &mm; break; }
+          encl = (emd && emd->type && emd->type->kind == cmi::ModuleType::Sig)
+                     ? emd->type->sig.get() : nullptr;
+          unit_path += "." + comps[i];
+        }
         if (cur && cur->kind == cmi::ModuleType::Sig && cur->sig) {
           result = cmi_sig_to_items(*cur->sig, origin);
+          if (encl) qualify_enclosing_types(result, *encl, unit_path);
           resolved = true;
         } else if (cur && cur->kind == cmi::ModuleType::Functor) {
           // PARTIAL application (`Outcome.Make(IntT)(IntT)` of a 4-param
@@ -12593,6 +12651,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           }
           if (w && w->kind == cmi::ModuleType::Sig && w->sig) {
             result = cmi_sig_to_items(*w->sig, origin);
+            if (encl) qualify_enclosing_types(result, *encl, unit_path);
             resolved = true;
           } else {
             part_params.clear();
