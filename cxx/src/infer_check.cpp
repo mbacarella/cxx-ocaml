@@ -1619,6 +1619,24 @@ struct Checker {
       }
     } catch (...) {}
   }
+  // `open M` where M is a LOCAL module declared in this file (no cmi on disk):
+  // register each type it declares as a bare -> `M.t` qual, so a following
+  // annotation `(x : t)` resolves to `M.t`.  load_open_type_quals only reaches
+  // on-disk modules; without this a bare opaque type (variant/record) fell to
+  // an unresolved constr and was dropped to a fresh var (robustmatch's
+  // `f (t1 : x t)` under `open M`).  Abbreviations already resolve via the flat
+  // type_aliases map; registering them here too is harmless (same `M.t` path).
+  void load_open_local_type_quals(const Longident& m) {
+    auto* pl = std::get_if<Lident>(&m.v);
+    if (!pl) return;
+    auto it = module_direct_types_.find(pl->name);
+    if (it == module_direct_types_.end()) return;
+    for (auto& n : it->second) opened_type_quals_[n] = pl->name + "." + n;
+  }
+  // Simple module name -> the type names DIRECTLY declared in its struct body,
+  // filled by register_types_rec (which already descends every module).  Used
+  // only to seed opened_type_quals_ on `open M` for a local module.
+  std::unordered_map<std::string, std::vector<std::string>> module_direct_types_;
   // A submodule `Array1` of an opened `Bigarray`: `Array1.t` / `open Array1`
   // qualifies through `Bigarray.Array1`.  Runs in EVERY pass (strict needs the
   // reroute to resolve `open M; ... x` for M a sibling/otherlibs submodule).
@@ -8397,6 +8415,7 @@ struct Checker {
             load_open_submod_quals(pi->id.txt);  // bare Sub -> M.Sub (every pass)
             if (!strict) {
               load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
+              load_open_local_type_quals(pi->id.txt);  // local M: bare type -> M.t
               load_open_param_type_quals(pi->id.txt);  // functor-param X.t
               open_module_ctors(pi->id.txt);     // bare ctor -> M's variant ctor
               load_open_module_aliases(pi->id.txt);  // bare List -> ListLabels
@@ -8602,7 +8621,13 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
       while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
       if (auto* ms = std::get_if<Pmod_structure>(&me->desc)) {
         std::string saved = ck.mod_prefix_;
-        if (mb->binding.name.txt) ck.mod_prefix_ += *mb->binding.name.txt + ".";
+        if (mb->binding.name.txt) {
+          ck.mod_prefix_ += *mb->binding.name.txt + ".";
+          auto& names = ck.module_direct_types_[*mb->binding.name.txt];
+          for (auto& sit : ms->items)
+            if (auto* ty2 = std::get_if<Pstr_type>(&sit.desc))
+              for (auto& d : ty2->decls) names.push_back(d.name.txt);
+        }
         register_types_rec(ck, ms->items);
         ck.mod_prefix_ = saved;
       } else if (!ck.strict && std::holds_alternative<Pmod_functor>(me->desc)) {
