@@ -3,6 +3,7 @@
 // peephole pass) plus a minimal OCaml Marshal *writer* for the
 // Cmo_format.compilation_unit descriptor.
 #include "cppcaml/cmo.hpp"
+#include "cppcaml/cmi.hpp"
 #include "cppcaml/omarshal.hpp"
 
 #include <cstdint>
@@ -423,6 +424,33 @@ void write_cmo(const bytecode::Code& code, const std::string& module_name,
   for (auto& r : em.relocs)
     if (r.k == Reloc::Primitive) prims.push_back(vstr(r.name));
 
+  // cu_imports: the (interface name, crc) list this unit assumes.  Two sources,
+  // deduped by name: (1) this module's own .cmi (self + interfaces its SIGNATURE
+  // cites), which the driver writes before the .cmo; (2) the units this unit's
+  // CODE references (GetCompunit relocs) -- an implementation dependency like
+  // `Lexer` that the signature doesn't mention, but whose runtime layout we
+  // still assume.  Lets the linker reject units built against inconsistent
+  // interfaces instead of segfaulting at run time.  Empty when nothing resolves.
+  std::vector<ValPtr> imports;
+  {
+    std::map<std::string, std::string> crcs;  // name -> crc ("" = None); ordered
+    std::vector<std::string> order;
+    auto add = [&](const std::string& name, const std::string& crc) {
+      auto it = crcs.find(name);
+      if (it == crcs.end()) { crcs.emplace(name, crc); order.push_back(name); }
+      else if (it->second.empty() && !crc.empty()) it->second = crc;  // upgrade None->Some
+    };
+    std::string cmi_path = path;
+    if (cmi_path.size() > 4 && cmi_path.substr(cmi_path.size() - 4) == ".cmo")
+      cmi_path.replace(cmi_path.size() - 4, 4, ".cmi");
+    for (auto& [name, crc] : cppcaml::cmi::cmiw::read_cmi_crcs(cmi_path)) add(name, crc);
+    for (auto& r : em.relocs)
+      if (r.k == Reloc::GetCompunit) add(r.name, cppcaml::cmi::cmiw::module_cmi_crc(r.name));
+    for (auto& name : order)
+      imports.push_back(vblock(0, {vstr(name),
+                                   crcs[name].empty() ? vint(0) : vblock(0, {vstr(crcs[name])})}));
+  }
+
   const int pos_code = 16;  // magic(12) + 4-byte compunit-offset placeholder
   int codesize = (int)em.code.size();
   int pos_compunit = pos_code + codesize;
@@ -432,7 +460,7 @@ void write_cmo(const bytecode::Code& code, const std::string& module_name,
       vint(pos_code),             // cu_pos
       vint(codesize),             // cu_codesize
       vlist(relocs),              // cu_reloc
-      vint(0),                    // cu_imports = []
+      imports.empty() ? vint(0) : vlist(imports),  // cu_imports
       [&]{ std::vector<ValPtr> rc; for (auto& n : required_compunits) rc.push_back(vstr(n));
            return vlist(rc); }(),  // cu_required_compunits
 

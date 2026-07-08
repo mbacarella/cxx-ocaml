@@ -2015,6 +2015,49 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   return sig;
 }
 
+// Read a .cmi's WHOLE crcs list: (interface name, crc) for the module itself and
+// every interface it imports.  crc is empty for a `None` entry (module alias, no
+// digest).  Used to populate a .cmo's cu_imports so the linker can reject units
+// built against inconsistent interfaces.  Empty vector on any failure.
+std::vector<std::pair<std::string, std::string>> read_cmi_crcs(const std::string& path) {
+  std::vector<std::pair<std::string, std::string>> r;
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return r;
+  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+  std::size_t off = 0;
+  for (; off + 4 <= bytes.size(); ++off)
+    if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
+        (bytes[off + 3] == 0xBE || bytes[off + 3] == 0xBF || bytes[off + 3] == 0xBD))
+      break;
+  if (off + 4 > bytes.size()) return r;
+  try {
+    m::Arena arena;
+    m::read_value(bytes.data(), bytes.size(), off, arena);          // header
+    std::size_t cur = m::read_value(bytes.data(), bytes.size(), off, arena);  // crc list
+    while (arena[cur].kind == m::Value::Kind::Block && arena[cur].fields.size() == 2) {
+      const m::Value& entry = arena[arena[cur].fields[0]];          // (name, crc option)
+      if (entry.kind == m::Value::Kind::Block && entry.fields.size() >= 2) {
+        std::string name = arena[entry.fields[0]].str, crc;
+        const m::Value& crcopt = arena[entry.fields[1]];
+        if (crcopt.kind == m::Value::Kind::Block && !crcopt.fields.empty())
+          crc = arena[crcopt.fields[0]].str;                        // Some digest
+        r.emplace_back(std::move(name), std::move(crc));
+      }
+      cur = arena[cur].fields[1];                                   // list tail
+    }
+  } catch (const std::exception&) {
+    return {};
+  }
+  return r;
+}
+
+// The interface CRC of a compilation-unit global (`A`, `Lexer`, `Stdlib__List`):
+// locate its .cmi on the include path and read its self-CRC.  Empty if not found.
+std::string module_cmi_crc(const std::string& mod) {
+  return read_cmi_self_crc(resolve_cmi_global(mod));
+}
+
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
                       const std::vector<Import>& imports) {

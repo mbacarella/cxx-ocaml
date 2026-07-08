@@ -58,6 +58,9 @@ struct Unit {
   std::vector<Reloc> relocs;
   bool force_link = false;             // cu_force_link: link even if unreferenced
   std::vector<std::string> required;   // cu_required_compunits (pack submodules)
+  // cu_imports: (interface name, crc) this unit was compiled against.  An empty
+  // crc is `None` (no digest recorded); used for the link-time consistency check.
+  std::vector<std::pair<std::string, std::string>> imports;
   bool selected = false;               // chosen by the reachability pass
   // Units this unit references / provides (from GetCompunit / SetCompunit relocs).
   std::vector<std::string> req_units() const {
@@ -75,6 +78,7 @@ struct Unit {
 // units transitively required).
 struct InputFile {
   bool archive;
+  std::string path;   // source .cmo/.cma path (for consistency-check diagnostics)
   std::vector<Unit> units;
   // lib_dllibs from a .cma: (suffixed, name) pairs naming the C-stub shared
   // libraries the library needs (e.g. (true, "-lunixbyt")).  Drives the DLLS
@@ -125,6 +129,18 @@ Unit parse_unit(const m::Arena& a, std::size_t cu, const std::vector<std::uint8_
   if (r.fields.size() > 5)
     for (std::size_t e : list_elems(a, r.fields[5])) u.required.push_back(a[e].str);
   if (r.fields.size() > 7) u.force_link = a[r.fields[7]].i != 0;
+  // cu_imports (field 4): (modname * crc option) list.  crc is `None` (immediate)
+  // or `Some digest` (a block whose field 0 is the raw digest string).
+  if (r.fields.size() > 4)
+    for (std::size_t e : list_elems(a, r.fields[4])) {
+      const m::Value& pair = a[e];
+      if (pair.fields.size() < 2) continue;
+      std::string name = a[pair.fields[0]].str, crc;
+      const m::Value& opt = a[pair.fields[1]];
+      if (opt.kind == m::Value::Kind::Block && !opt.fields.empty())
+        crc = a[opt.fields[0]].str;   // Some digest
+      u.imports.emplace_back(std::move(name), std::move(crc));
+    }
   for (std::size_t e : list_elems(a, r.fields[3])) {  // cu_reloc: (reloc_info * int) list
     const m::Value& pair = a[e];
     const m::Value& info = a[pair.fields[0]];
@@ -151,6 +167,7 @@ InputFile read_objects(const std::string& path) {
   m::Arena arena;
   std::size_t root = m::read_value(file.data(), file.size(), off, arena);
   InputFile in;
+  in.path = path;
   if (magic == "Caml1999O038") {            // .cmo: one compilation_unit
     in.archive = false;
     in.units.push_back(parse_unit(arena, root, file));
@@ -242,6 +259,29 @@ void link_executable(const std::vector<std::string>& inputs,
   for (auto fi = files.rbegin(); fi != files.rend(); ++fi)
     for (auto ui = fi->units.rbegin(); ui != fi->units.rend(); ++ui)
       if (!fi->archive || ui->force_link || missing.count(ui->name)) take(*ui);
+
+  // Interface-consistency check (bytelink's Consistbl / check_consistency): every
+  // unit records the CRC of each .cmi it was compiled against (cu_imports).  Two
+  // linked units that assume different CRCs for the same interface were built
+  // against incompatible versions of it -- the runtime layout they expect differs,
+  // so linking them yields code that reads wrong fields and crashes.  Reject that
+  // here with a clear error instead of letting the interpreter segfault later.
+  {
+    std::map<std::string, std::pair<std::string, std::string>> seen;  // intf -> (crc, file)
+    for (const InputFile& f : files)
+      for (const Unit& u : f.units) {
+        if (!u.selected) continue;
+        for (const auto& [name, crc] : u.imports) {
+          if (crc.empty()) continue;                 // None: no assumption recorded
+          auto it = seen.find(name);
+          if (it == seen.end()) { seen[name] = {crc, f.path}; continue; }
+          if (it->second.first != crc)
+            throw std::runtime_error(
+                "Files " + f.path + " and " + it->second.second +
+                " make inconsistent assumptions over interface " + name);
+        }
+      }
+  }
 
   // Pass 2 -- resolve relocations of the selected units, in original link order,
   // and concatenate their code.  Alongside, record each unit's start (in code

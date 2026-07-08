@@ -174,8 +174,8 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     lap("translate (infer+lambda)", tp);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     lap("bytegen", tp);
-    cppcaml::cmo::write_cmo(instrs, mod, cmo_out, required_globals);
-    lap("write_cmo", tp);
+    // Write the .cmi BEFORE the .cmo so write_cmo can read the interface CRCs it
+    // records (a hand-written .mli's .cmi already exists on disk from earlier).
     try {  // best-effort .cmi from inference (unless a hand-written .mli owns it)
       fs::path cmi_path = fs::path(cmo_out).replace_extension(".cmi");
       bool has_mli = fs::exists(fs::path(in_path).replace_extension(".mli"));
@@ -184,6 +184,8 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
     }
+    cppcaml::cmo::write_cmo(instrs, mod, cmo_out, required_globals);
+    lap("write_cmo", tp);
     if (prof)
       std::cerr << "  TOTAL compile " << in_path << ": "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
@@ -254,6 +256,7 @@ int main(int argc, char** argv) {
     else if (a == "-a") make_lib = true;
     else if (a == "-pack") pack_name = "?";  // resolved from -o once known
     else if (a == "-nostdlib") nostdlib = true;
+    else if (a == "-stdlib") stdlib_flag = need_arg("-stdlib");
     else if (a == "-version") { std::cout << kVersion << '\n'; return 0; }
     else if (a == "-vnum") { std::cout << kVersion << '\n'; return 0; }
     else if (a == "-where") { std::cout << discover_stdlib(stdlib_flag) << '\n'; return 0; }
@@ -298,12 +301,16 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  // stdlib_dir = the -I dir that actually holds stdlib.cmi, else discovery.
-  std::string stdlib_dir;
-  for (const std::string& d : incdirs_raw)
-    if (d.empty() || d[0] != '+')
-      if (fs::exists(fs::path(d) / "stdlib.cmi")) { stdlib_dir = d; break; }
-  stdlib_dir = discover_stdlib(stdlib_dir.empty() ? stdlib_flag : stdlib_dir);
+  // stdlib_dir: an explicit -stdlib wins (pins every unit to one stdlib so their
+  // interface CRCs stay consistent -- vital when bootstrapping against a stdlib
+  // that is still being built and whose stdlib.cmi may not exist yet); else the
+  // -I dir that actually holds stdlib.cmi; else discovery.
+  std::string stdlib_dir = stdlib_flag;
+  if (stdlib_dir.empty())
+    for (const std::string& d : incdirs_raw)
+      if (d.empty() || d[0] != '+')
+        if (fs::exists(fs::path(d) / "stdlib.cmi")) { stdlib_dir = d; break; }
+  stdlib_dir = discover_stdlib(stdlib_dir);
 
   std::vector<std::string> incdirs;  // resolved (+unix -> <stdlib>/unix)
   for (const std::string& d : incdirs_raw) incdirs.push_back(resolve_incdir(d, stdlib_dir));

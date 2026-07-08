@@ -564,6 +564,15 @@ std::string write_cmi(const std::string& path, const std::string& modname,
 std::string write_packed_cmi(const std::string& path, const std::string& pack_name,
                              const std::vector<std::string>& member_cmis);
 
+// Read a .cmi's whole (interface name, crc) list -- the module itself plus every
+// interface it imports (crc empty for a `None`/alias entry).  Drives a .cmo's
+// cu_imports for the linker's interface-consistency check.
+std::vector<std::pair<std::string, std::string>> read_cmi_crcs(const std::string& path);
+
+// Interface CRC of a compilation-unit global (locate its .cmi, read its self-CRC).
+// Empty if not found.  Used to record code-referenced units in cu_imports.
+std::string module_cmi_crc(const std::string& mod);
+
 }  // namespace cmiw
 
 }  // namespace cppcaml::cmi

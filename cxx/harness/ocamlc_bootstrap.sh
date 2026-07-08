@@ -45,11 +45,11 @@ for phase in cmi cmo; do
     done
     if [ "$phase" = cmi ]; then [ -f "$WD/$s.mli" ] || continue; src="$WD/$s.mli"
     else src="$WD/$s.ml"; [ -f "$src" ] || continue; fi
-    ( cd "$WD" && "$CPP" -c $(flags "$m") -I "$WD" "$(basename "$src")" ) 2>"$WD/err" \
+    ( cd "$WD" && "$CPP" -c $(flags "$m") -stdlib "$WD" -I "$WD" "$(basename "$src")" ) 2>"$WD/err" \
       || { echo "FAIL: stdlib $(basename "$src")"; sed 's/^/  /' "$WD/err"; exit 1; }
   done
 done
-cp "$STD/std_exit.ml" "$WD/"; ( cd "$WD" && "$CPP" -c -I "$WD" std_exit.ml ) 2>/dev/null
+cp "$STD/std_exit.ml" "$WD/"; ( cd "$WD" && "$CPP" -c -stdlib "$WD" -I "$WD" std_exit.ml ) 2>/dev/null
 echo "stdlib: built"
 
 # ---- 2. compiler sources, in dependency order ------------------------------
@@ -93,7 +93,7 @@ parsing/ast_iterator.mli parsing/ast_iterator.ml
 parsing/builtin_attributes.mli parsing/builtin_attributes.ml
 parsing/camlinternalMenhirLib.mli parsing/camlinternalMenhirLib.ml
 parsing/parser.mli parsing/parser.ml
-parsing/lexer.ml
+parsing/lexer.mli parsing/lexer.ml
 parsing/pprintast.mli parsing/pprintast.ml
 parsing/parse.mli parsing/parse.ml
 parsing/printast.mli parsing/printast.ml
@@ -203,16 +203,19 @@ driver/compile.mli driver/compile.ml
 driver/maindriver.mli driver/maindriver.ml
 driver/main.mli driver/main.ml"
 
-# include dirs for the in-tree .cmi deps of multi-dir modules
-INCS="-I $WD -I $ROOT/utils -I $ROOT/parsing -I $ROOT/typing -I $ROOT/lambda \
--I $ROOT/file_formats -I $ROOT/bytecomp -I $ROOT/driver"
+# Only WD is on the include path: every module (sources flattened into WD) is
+# compiled there in dependency order, so each dep's freshly-built .cmi is present
+# when needed.  Adding the in-tree source dirs would let a module resolve a dep's
+# STALE real .cmi (a different interface CRC) before WD's exists -> the linker's
+# consistency check then rejects the mix.  WD-only keeps every CRC self-consistent.
+INCS="-I $WD"
 
 ok=0; fail=0; order=""
 compile_list() {
   for f in $1; do
     base=$(basename "$f"); [ -f "$ROOT/$f" ] || { echo "MISSING $f"; exit 1; }
     cp "$ROOT/$f" "$WD/$base"
-    if ( cd "$WD" && "$CPP" -c $INCS "$base" ) >"$WD/cerr" 2>&1; then
+    if ( cd "$WD" && "$CPP" -c -stdlib "$WD" $INCS "$base" ) >"$WD/cerr" 2>&1; then
       ok=$((ok+1)); [ "${base##*.}" = ml ] && order="$order ${base%.ml}"
     else
       fail=$((fail+1)); echo "[FAIL $f]"; sed 's/^/   /' "$WD/cerr" | head -6
@@ -232,7 +235,15 @@ if ! "$LINK" -nostdlib -runtime "$RUN" $stdobjs $clobjs "$WD/std_exit.cmo" -o "$
 fi
 echo "linked: $WD/ocamlc"
 
-# ---- 4. smoke test the bootstrapped ocamlc ---------------------------------
+# ---- 4. smoke test: the bootstrapped ocamlc must actually COMPILE and the
+# produced program must RUN.  (Testing only `-version` hides codegen bugs that
+# crash on real input -- the compiler can start up fine yet segfault compiling.)
 echo 'let () = Printf.printf "hello from bootstrapped ocamlc: %d\n" (List.fold_left (+) 0 [1;2;3;4])' > "$WD/hello.ml"
-"$RUN" "$WD/ocamlc" -version 2>&1 | sed 's/^/  ocamlc -version: /'
-echo "OK: compiler bootstrap built a runnable bytecode ocamlc"
+if ( cd "$WD" && "$RUN" ./ocamlc -nostdlib -I "$WD" hello.ml -o hello.exe ) 2>"$WD/serr" \
+   && out=$("$RUN" "$WD/hello.exe" 2>&1) && [ "$out" = "hello from bootstrapped ocamlc: 10" ]; then
+  echo "OK: bootstrapped ocamlc compiled+ran a program -> $out"
+else
+  echo "FAIL: bootstrapped ocamlc did not compile+run a program"
+  sed 's/^/  /' "$WD/serr" 2>/dev/null | head -5
+  exit 1
+fi
