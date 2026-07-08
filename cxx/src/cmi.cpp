@@ -1466,6 +1466,78 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       return o::vblock(0, {o::vblock(0, {o::vstr(ref), o::vint(it->second)})});  // Pident(Local)
     return nullptr;
   };
+  // Build the Mty_functor value for a functor SigItem (is_functor): the curried
+  // parameter chain (innermost last) wrapping the result signature.  Shared by a
+  // functor MODULE decl (`module Make (Ord : _) : S`) and a functor MODULE TYPE
+  // decl (`module type S1 = (S0 -> S0') -> S0`, shape_size_blowup) -- both
+  // marshal to the identical Mty_functor.
+  auto emit_functor_mty = [&](const SigItem& it) -> o::ValPtr {
+    // Mty_functor(Named(Some p1, ..), Mty_functor(Named(Some p2, ..), ..
+    // Mty_signature(result))): the curried parameter chain, innermost last.
+    // A generative parameter is Unit (the int constructor 0); otherwise
+    // Named(Some id, <param sig>).  Params are visible to LATER param sigs and
+    // the result (a partial-application manifest `Outcome.Make(IntT)(N).t` cites
+    // param N by its Local ident).
+    std::unordered_map<std::string, int> visible_mod_body = visible_mod;
+    auto mk_param = [&](bool unit, const std::string& pname,
+                        const std::vector<SigItem>& psig_items,
+                        const std::string& ref,
+                        const std::vector<SigItem>* pfunc = nullptr) -> o::ValPtr {
+      if (unit) return o::vint(0);  // functor_parameter = Unit
+      // An anonymous parameter (`sig .. end -> X` or `functor (_ : S)`) has
+      // no binder: ocamlc stores Named(None, <sig>), which Printtyp collapses
+      // to the arrow form `<sig> -> ..` (no `( : ..)` wrapper).
+      o::ValPtr name_opt;
+      if (pname.empty()) {
+        name_opt = o::vint(0);  // None
+      } else {
+        int pstamp = stamp++;
+        auto pident = o::vblock(0, {o::vstr(pname), o::vint(pstamp)});  // Ident.Local
+        visible_mod_body[pname] = pstamp;
+        name_opt = o::vblock(0, {pident});  // Some
+      }
+      // A NAMED param modtype (`(K : Key)`) emits Mty_ident(Key) like
+      // ocamlc; the inlined signature is the fallback.
+      o::ValPtr psig;
+      // A HIGHER-ORDER param (`(F : (X : S) -> T)`): emit the carried
+      // functor Module item through this very function (recursion) and
+      // reuse its module_declaration's md_type as the parameter type.
+      // Sig_module = block(3, {ident, presence, md, ..}); md_type = md[0].
+      if (pfunc && !pfunc->empty()) {
+        auto emitted = emit_sig_items({(*pfunc)[0]}, referenced, stamp,
+                                      &visible, &visible_mt, &visible_mod_body, &visible_eng);
+        if (emitted.size() == 1 && emitted[0]->fields.size() >= 3 &&
+            !emitted[0]->fields[2]->fields.empty())
+          psig = emitted[0]->fields[2]->fields[0];
+      }
+      if (!psig && !ref.empty())
+        if (o::ValPtr mp = modtype_path(ref, &visible_mod_body)) psig = o::vblock(0, {mp});  // Mty_ident
+      if (!psig)
+        psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng))});  // Mty_signature
+      return o::vblock(0, {name_opt, psig});  // Named(name_opt, <param sig>)
+    };
+    std::vector<o::ValPtr> params;
+    params.push_back(mk_param(it.functor_unit, it.functor_param, it.param_sig,
+                              it.functor_param_ref, &it.param_functor));
+    for (std::size_t p = 0; p < it.more_param_names.size(); ++p)
+      params.push_back(mk_param(p < it.more_param_units.size() && it.more_param_units[p],
+                                it.more_param_names[p],
+                                p < it.more_param_sigs.size() ? it.more_param_sigs[p]
+                                                              : std::vector<SigItem>{},
+                                p < it.more_param_refs.size() ? it.more_param_refs[p]
+                                                              : std::string()));
+    // A NAMED result modtype (`module F () : Ret`) is stored Mty_ident;
+    // the resolved items are the fallback.
+    o::ValPtr body;
+    if (!it.functor_result_ref.empty())
+      if (o::ValPtr rp = modtype_path(it.functor_result_ref, &visible_mod_body))
+        body = o::vblock(0, {rp});  // Mty_ident
+    if (!body)
+      body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng))});  // Mty_signature(result)
+    for (auto p = params.rbegin(); p != params.rend(); ++p)
+      body = o::vblock(2, {*p, body});  // Mty_functor
+    return body;
+  };
   std::vector<o::ValPtr> sig;
   for (std::size_t i = 0; i < items.size(); ++i) {
     const SigItem& it = items[i];
@@ -1514,72 +1586,9 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       o::ValPtr mty;
       int presence = 0;  // Mp_present: takes a runtime field
       if (it.is_functor) {
-        // Mty_functor(Named(Some p1, ..), Mty_functor(Named(Some p2, ..), ..
-        // Mty_signature(result))): the curried parameter chain, innermost last.
-        // A generative parameter is Unit (the int constructor 0); otherwise
-        // Named(Some id, <param sig>).  The functor takes a runtime field.
-        // Params are visible to LATER param sigs and the result (a partial-
-        // application manifest `Outcome.Make(IntT)(N).t` cites param N by its
-        // Local ident).
-        std::unordered_map<std::string, int> visible_mod_body = visible_mod;
-        auto mk_param = [&](bool unit, const std::string& pname,
-                            const std::vector<SigItem>& psig_items,
-                            const std::string& ref,
-                            const std::vector<SigItem>* pfunc = nullptr) -> o::ValPtr {
-          if (unit) return o::vint(0);  // functor_parameter = Unit
-          // An anonymous parameter (`sig .. end -> X` or `functor (_ : S)`) has
-          // no binder: ocamlc stores Named(None, <sig>), which Printtyp collapses
-          // to the arrow form `<sig> -> ..` (no `( : ..)` wrapper).
-          o::ValPtr name_opt;
-          if (pname.empty()) {
-            name_opt = o::vint(0);  // None
-          } else {
-            int pstamp = stamp++;
-            auto pident = o::vblock(0, {o::vstr(pname), o::vint(pstamp)});  // Ident.Local
-            visible_mod_body[pname] = pstamp;
-            name_opt = o::vblock(0, {pident});  // Some
-          }
-          // A NAMED param modtype (`(K : Key)`) emits Mty_ident(Key) like
-          // ocamlc; the inlined signature is the fallback.
-          o::ValPtr psig;
-          // A HIGHER-ORDER param (`(F : (X : S) -> T)`): emit the carried
-          // functor Module item through this very function (recursion) and
-          // reuse its module_declaration's md_type as the parameter type.
-          // Sig_module = block(3, {ident, presence, md, ..}); md_type = md[0].
-          if (pfunc && !pfunc->empty()) {
-            auto emitted = emit_sig_items({(*pfunc)[0]}, referenced, stamp,
-                                          &visible, &visible_mt, &visible_mod_body, &visible_eng);
-            if (emitted.size() == 1 && emitted[0]->fields.size() >= 3 &&
-                !emitted[0]->fields[2]->fields.empty())
-              psig = emitted[0]->fields[2]->fields[0];
-          }
-          if (!psig && !ref.empty())
-            if (o::ValPtr mp = modtype_path(ref, &visible_mod_body)) psig = o::vblock(0, {mp});  // Mty_ident
-          if (!psig)
-            psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng))});  // Mty_signature
-          return o::vblock(0, {name_opt, psig});  // Named(name_opt, <param sig>)
-        };
-        std::vector<o::ValPtr> params;
-        params.push_back(mk_param(it.functor_unit, it.functor_param, it.param_sig,
-                                  it.functor_param_ref, &it.param_functor));
-        for (std::size_t p = 0; p < it.more_param_names.size(); ++p)
-          params.push_back(mk_param(p < it.more_param_units.size() && it.more_param_units[p],
-                                    it.more_param_names[p],
-                                    p < it.more_param_sigs.size() ? it.more_param_sigs[p]
-                                                                  : std::vector<SigItem>{},
-                                    p < it.more_param_refs.size() ? it.more_param_refs[p]
-                                                                  : std::string()));
-        // A NAMED result modtype (`module F () : Ret`) is stored Mty_ident;
-        // the resolved items are the fallback.
-        o::ValPtr body;
-        if (!it.functor_result_ref.empty())
-          if (o::ValPtr rp = modtype_path(it.functor_result_ref, &visible_mod_body))
-            body = o::vblock(0, {rp});  // Mty_ident
-        if (!body)
-          body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng))});  // Mty_signature(result)
-        for (auto p = params.rbegin(); p != params.rend(); ++p)
-          body = o::vblock(2, {*p, body});  // Mty_functor
-        mty = body;
+        // Mty_functor for `module Make (Ord : _) : S`: the functor takes a
+        // runtime field (see emit_functor_mty for the parameter-chain encoding).
+        mty = emit_functor_mty(it);
       } else if (!it.alias.empty()) {
         // `module name = <target>`: Mty_alias(path), Mp_absent -- an alias is
         // transparent and takes NO runtime field.  A single-component target is
@@ -1626,6 +1635,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       o::ValPtr mto;
       if (it.modtype_abstract)
         mto = o::vint(0);  // None
+      else if (it.is_functor)
+        // `module type S1 = (S0 -> S0') -> S0`: the body is a functor type, not
+        // a signature -- mtd_type = Some(Mty_functor(..)) (shape_size_blowup).
+        mto = o::vblock(0, {emit_functor_mty(it)});  // Some(Mty_functor)
       else if (!it.modtype_ref.empty()) {
         if (o::ValPtr mp = modtype_path(it.modtype_ref))
           mto = o::vblock(0, {o::vblock(0, {mp})});  // Some(Mty_ident)
