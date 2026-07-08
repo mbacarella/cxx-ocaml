@@ -4857,18 +4857,48 @@ struct Checker {
   // abbreviation.  Non-strict only (rows are a non-strict feature).
   TypePtr hash_type_row(const ast::Longident& id) {
     if (strict) return nullptr;
-    auto ai = type_aliases.find(lid_last(id));
-    if (ai == type_aliases.end() || !ai->second.manifest) return nullptr;
-    if (!std::holds_alternative<Ptyp_variant>(ai->second.manifest->desc)) return nullptr;
+    const ast::CoreType* manifest = nullptr;
+    bool params_empty = true;
+    bool local = false;  // t comes from an expression-local module (unnameable)
+    // `#M.t` where M is an expression-local module (`let module M = struct..`):
+    // resolve `t` through M's OWN type decls, not the flat bare-name alias map
+    // (lid_last would collide `M.t` with an enclosing same-named `t` -- pr11887
+    // has an outer `a1=[`CA]` and a local `T.a1=[`Common|..]`; `#T.a1` must pick
+    // T's row, not the outer one).
+    if (auto* dot = std::get_if<ast::Ldot>(&id.v))
+      if (auto* head = std::get_if<ast::Lident>(&dot->prefix->v)) {
+        auto st = local_module_structs_.find(head->name);
+        if (st != local_module_structs_.end()) {
+          for (auto& it : *st->second)
+            if (auto* ty = std::get_if<ast::Pstr_type>(&it.desc))
+              for (auto& d : ty->decls)
+                if (d.name.txt == dot->name && d.manifest) {
+                  manifest = d.manifest->get();
+                  params_empty = d.params.empty();
+                  local = true;
+                }
+          if (!manifest) return nullptr;  // local M but no such alias decl
+        }
+      }
+    if (!manifest) {
+      auto ai = type_aliases.find(lid_last(id));
+      if (ai == type_aliases.end() || !ai->second.manifest) return nullptr;
+      manifest = ai->second.manifest;
+      params_empty = ai->second.params.empty();
+    }
+    if (!std::holds_alternative<Ptyp_variant>(manifest->desc)) return nullptr;
     std::unordered_map<std::string, TypePtr> vars;
     bool saved_me = manifest_expansion_;
     manifest_expansion_ = true;
-    TypePtr row = from_coretype(*ai->second.manifest, vars);
+    TypePtr row = from_coretype(*manifest, vars);
     manifest_expansion_ = saved_me;
     row = I::Engine::repr(row);
     if (row->kind != I::Type::Kind::Variant) return nullptr;
     row->variant_kind = 1;  // `#t` bounds ABOVE: `[<`, not the exact `[ .. ]`
-    if (ai->second.params.empty()) row->abbrev = lid_last(id);  // `[< var ]` display
+    // A local-module type has no signature-level name, so ocamlc expands its
+    // tags (`[< `Common | ..]`) rather than citing the abbreviation; stamping
+    // `a1` here would misname it as the enclosing same-named type.
+    if (params_empty && !local) row->abbrev = lid_last(id);  // `[< var ]` display
     return row;
   }
 
@@ -9809,9 +9839,12 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       // tag set with the abbreviation stamped back): emittable as the row
       // plus row_desc.row_name = (u, [int]); Printtyp prints
       // `[< int u > `A ]`, exactly ocamlc's storage.
+      // from_inherit is NOT required: a `#t` pattern's row (hash_type_row) is a
+      // named `[< t]` upper bound too (pr11887's `#T.a1` scrutinee), stored by
+      // ocamlc as the row with row_name = (t, args) -- Printtyp prints `[< t]`.
+      // A weak (non-generic) such row is still caught by the level guard below.
       bool named_bound = !t->abbrev.empty() && t->variant_kind != 2 &&
-                         t->from_inherit && !t->labels.empty() &&
-                         t->inherited.empty();
+                         !t->labels.empty() && t->inherited.empty();
       // Anonymous inherited-row bounds and weak (non-generalized, '_weak)
       // open/upper rows stay opaque for now.  An EXACT row is emittable
       // regardless of level: declaration coretypes converted during the
