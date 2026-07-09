@@ -1102,6 +1102,17 @@ struct Translator {
   // A stdlib module's variant constructors, loaded on demand from its cmi
   // (Arg.spec's Unit/Set/String/...): name -> CtorInfo per module.
   std::unordered_map<std::string, std::unordered_map<std::string, CtorInfo>> mod_ctor_cache_;
+  // Same ctors grouped per TYPE (module -> type -> [(name, info)]).  The flat
+  // name-keyed map above drops a ctor DECLARED IN TWO TYPES of one module
+  // (warnings.mli's `Unused` in both field_usage_warning and
+  // constructor_usage_warning) -- type-directed registration must see the
+  // full per-type list or it undercounts and leaves the shared name
+  // unresolved.
+  std::unordered_map<
+      std::string,
+      std::unordered_map<std::string,
+                         std::vector<std::pair<std::string, CtorInfo>>>>
+      mod_type_ctors_;
   const std::unordered_map<std::string, CtorInfo>& module_ctors(const std::string& mod) {
     if (auto it = mod_ctor_cache_.find(mod); it != mod_ctor_cache_.end()) return it->second;
     auto& out = mod_ctor_cache_[mod];
@@ -1158,13 +1169,28 @@ struct Translator {
                 }
                 ci.arg_type_names.push_back(std::move(an));
               }
+            mod_type_ctors_[mod][td.name].emplace_back(c.name, ci);
             out[c.name] = std::move(ci);
+          } else {
+            // flat-map slot already claimed (a same-named ctor of an earlier
+            // type): the per-type list still needs this one.
+            CtorInfo ci2{td.name, block ? nb : nc, block, arity,
+                         td.unboxed && arity == 1};
+            mod_type_ctors_[mod][td.name].emplace_back(c.name, std::move(ci2));
           }
           if (block) ++nb; else ++nc;
         }
       }
     } catch (...) {}
     return out;
+  }
+  // The per-type ctor list of an imported module's type (loads the cmi on
+  // first use).  Complete even when a ctor name collides across the module's
+  // types; empty when the type is unknown / not a variant.
+  const std::vector<std::pair<std::string, CtorInfo>>& module_type_ctors(
+      const std::string& mod, const std::string& ty) {
+    module_ctors(mod);  // ensure both caches are filled
+    return mod_type_ctors_[mod][ty];
   }
   // A LOCAL `module M = struct include <ImportedUnit> .. end` re-exports the
   // unit's constructors under M's name (ctype.ml's `module Path = struct
@@ -1301,47 +1327,39 @@ struct Translator {
     // resolves type-directedly against it).  Try the full chain via
     // module_ctors' submodule walk first; fall back to the last component.
     if (auto md = mod.rfind('.'); md != std::string::npos) {
-      bool nested = false;
-      if (!module_base(mod.substr(0, mod.find('.')))) {
-        auto& mcn = module_ctors(mod);
-        for (auto& [nm, info] : mcn)
-          if (info.type == ty) { nested = true; break; }
-      }
+      bool nested = !module_base(mod.substr(0, mod.find('.'))) &&
+                    !module_type_ctors(mod, ty).empty();
       if (!nested) mod = mod.substr(md + 1);
     }
     if (module_base(mod)) return;                     // a local module: skip
-    auto& mc = module_ctors(mod);
+    auto& tl = module_type_ctors(mod, ty);
+    if (tl.empty()) return;
     int nc = 0, nb = 0;
-    bool found = false;
-    for (auto& [nm, info] : mc) if (info.type == ty) { (info.is_block ? nb : nc)++; found = true; }
-    if (!found) return;
-    for (auto& [nm, info] : mc)
-      if (info.type == ty && !ctor_info_.count(nm)) {
+    for (auto& [nm, info] : tl) (info.is_block ? nb : nc)++;
+    for (auto& [nm, info] : tl)
+      if (!ctor_info_.count(nm)) {
         ctor_info_[nm] = info; builtin_ctors_.insert(nm);
       }
     type_ctors_.emplace(ty, std::make_pair(nc, nb));
-    register_sibling_arg_ctors(mc, ty);
+    register_sibling_arg_ctors(mod, ty);
   }
   // Register the SIBLING variants a type's ctors destructure into (Path.t's
   // `Pextra_ty of t * extra_ty`): the inner `match extra with Pcstr_ty name ..`
   // has no pat_constr (the engine binds `extra` as a fresh var), so extra_ty's
   // ctors must already be resolvable.  One level only; fallback-only guards.
-  void register_sibling_arg_ctors(
-      const std::unordered_map<std::string, CtorInfo>& mc,
-      const std::string& ty) {
+  void register_sibling_arg_ctors(const std::string& mod,
+                                  const std::string& ty) {
     std::set<std::string> argtys;
-    for (auto& [nm, info] : mc)
-      if (info.type == ty)
-        for (auto& at : info.arg_type_names)
-          if (!at.empty() && at != ty) argtys.insert(at);
+    for (auto& [nm, info] : module_type_ctors(mod, ty))
+      for (auto& at : info.arg_type_names)
+        if (!at.empty() && at != ty) argtys.insert(at);
     for (auto& at : argtys) {
+      auto& tl = module_type_ctors(mod, at);
+      if (tl.empty()) continue;
       int nc2 = 0, nb2 = 0;
-      bool found2 = false;
-      for (auto& [nm, info] : mc)
-        if (info.type == at) { (info.is_block ? nb2 : nc2)++; found2 = true; }
-      if (!found2) continue;
-      for (auto& [nm, info] : mc)
-        if (info.type == at && !ctor_info_.count(nm)) {
+      for (auto& [nm, info] : tl) (info.is_block ? nb2 : nc2)++;
+      for (auto& [nm, info] : tl)
+        if (!ctor_info_.count(nm)) {
           ctor_info_[nm] = info; builtin_ctors_.insert(nm);
         }
       type_ctors_.emplace(at, std::make_pair(nc2, nb2));
@@ -1376,34 +1394,28 @@ struct Translator {
     // Value/Type/... against it, and a same-named local `t` squats
     // type_ctors_["t"]), falling back to the last component for a re-exported
     // unit alias (`Stdlib.Either.t` -> stdlib__either.cmi).
-    const auto* mcp = &module_ctors(mod);
     if (auto md = mod.rfind('.'); md != std::string::npos) {
-      bool nested = false;
-      for (auto& [nm, info] : *mcp)
-        if (info.type == ty) { nested = true; break; }
-      if (!nested) {
+      if (module_type_ctors(mod, ty).empty()) {
         std::string tail = mod.substr(md + 1);
         if (module_base(tail)) return saved;
-        mcp = &module_ctors(tail);
+        mod = tail;
       }
     }
-    auto& mc = *mcp;
+    auto& tl = module_type_ctors(mod, ty);
+    if (tl.empty()) return saved;
     int nc = 0, nb = 0;
-    bool any = false;
-    for (auto& [nm, info] : mc) if (info.type == ty) { (info.is_block ? nb : nc)++; any = true; }
-    if (!any) return saved;
-    for (auto& [nm, info] : mc)
-      if (info.type == ty) {
-        auto it = ctor_info_.find(nm);
-        if (it == ctor_info_.end() || it->second.type != ty ||
-            it->second.arity != info.arity || it->second.tag != info.tag) {
-          saved.ci.emplace_back(nm, it == ctor_info_.end() ? std::optional<CtorInfo>()
-                                                            : std::optional<CtorInfo>(it->second));
-          ctor_info_[nm] = info;
-          saved.forced.push_back(nm);       // arm bodies re-resolve this name via expr type
-          forced_ctor_depth_[nm]++;
-        }
+    for (auto& [nm, info] : tl) (info.is_block ? nb : nc)++;
+    for (auto& [nm, info] : tl) {
+      auto it = ctor_info_.find(nm);
+      if (it == ctor_info_.end() || it->second.type != ty ||
+          it->second.arity != info.arity || it->second.tag != info.tag) {
+        saved.ci.emplace_back(nm, it == ctor_info_.end() ? std::optional<CtorInfo>()
+                                                          : std::optional<CtorInfo>(it->second));
+        ctor_info_[nm] = info;
+        saved.forced.push_back(nm);       // arm bodies re-resolve this name via expr type
+        forced_ctor_depth_[nm]++;
       }
+    }
     auto tcit = type_ctors_.find(ty);
     saved.tc.emplace_back(ty, tcit == type_ctors_.end()
                                   ? std::optional<std::pair<int, int>>()
@@ -1412,7 +1424,7 @@ struct Translator {
     // Sibling arg-type ctors register PERMANENTLY (fallback-only), matching
     // register_ctors_of_type -- the destructured-arg inner match compiles
     // while this force-register is active.
-    register_sibling_arg_ctors(mc, ty);
+    register_sibling_arg_ctors(mod, ty);
     return saved;
   }
   // Register the type owning constructor `ctorname` from module `mod` (an imported
@@ -7881,6 +7893,17 @@ struct Translator {
     return amb;
   }
 
+  // An EXN-typed constructor pattern (the engine typed the scrutinee as exn):
+  // it must take the extension-identity reading even when a same-named VARIANT
+  // ctor squats ctor_info_ -- tmc.ml's handler `function Error (loc, ..) ->`
+  // vs result's builtin Error compiled to a variant TAG test, misreading every
+  // foreign exception during error reporting (bootstrap bug #13).
+  bool exn_typed_pat(const Pattern* p, const std::string& cn) {
+    auto it = vk.pat_constr.find(p);
+    if (it == vk.pat_constr.end() || it->second != "exn") return false;
+    return exn_ident_.count(cn) || exn_field_.count(cn) ||
+           is_predef_exn_name(cn);
+  }
   LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc,
                     const LamPtr& dflt = nullptr) {
     if (rows.empty()) return nullptr;
@@ -7916,6 +7939,8 @@ struct Translator {
       if (r.guard && !std::holds_alternative<Ppat_construct>(r.lhs->desc)) return nullptr;
       auto* k = std::get_if<Ppat_construct>(&r.lhs->desc);
       if (!k) return nullptr;
+      if (exn_typed_pat(r.lhs, ctor_of(*r.lhs))) return nullptr;  // extension:
+                                                  // the if-chain path tests identity
       const CtorInfo* cip = pat_ctor_resolve(r.lhs, ctor_of(*r.lhs));
       if (!cip) return nullptr;
       auto& ci = *cip;
@@ -8554,6 +8579,13 @@ struct Translator {
       // shadowed builtin (`exception Error` vs result's Error).  A predefined
       // exception (Failure/Invalid_argument/..) counts as an exception ctor too:
       // without this, `function Failure s -> ..` collapses and drops `s`.
+      if (getenv("CTDBG"))
+        fprintf(stderr,
+                "[CTDBG] exn-pat %s qual=%d exn_i=%d exn_f=%d predef=%d "
+                "ctor=%d builtin=%d\n",
+                n.c_str(), (int)qualified_exn, (int)exn_ident_.count(n),
+                (int)exn_field_.count(n), (int)is_predef_exn_name(n),
+                (int)ctor_info_.count(n), (int)builtin_ctors_.count(n));
       if (!qualified_exn &&
           ((!exn_ident_.count(n) && !exn_field_.count(n) && !is_predef_exn_name(n)) ||
            (ctor_info_.count(n) && !builtin_ctors_.count(n))))
@@ -9371,7 +9403,7 @@ struct Translator {
     if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
       std::string cn = ctor_of(*p);
       auto ci = ctor_info_.find(cn);
-      if (ci == ctor_info_.end()) {
+      if (ci == ctor_info_.end() || exn_typed_pat(p, cn)) {
         // an EXTENSION constructor (exn_ident_/exn_field_): test the identity
         // (the value itself when nullary, else field 0), like ext_match -- so a
         // pattern containing one (`Some B`, `(Some A|Some B), A`) matches in the

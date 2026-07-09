@@ -8854,7 +8854,13 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
         fprintf(stderr, "[CTDBG] rec_pat construct kind=%d path=%s\n",
                 (int)r->kind,
                 r->kind == I::Type::Kind::Constr ? r->path.c_str() : "-");
-      if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
+      // "exn" (dotless) is recorded too: an EXN-typed ctor pattern must take
+      // the extension-identity reading even when a same-named variant ctor
+      // squats the flat map (tmc.ml's error handler `function Error (..) ->`
+      // vs result's builtin Error -- matching by variant TAG misread foreign
+      // exceptions and crashed every error report).
+      if (r->kind == I::Type::Kind::Constr &&
+          (r->path.find('.') != std::string::npos || r->path == "exn"))
         vk.pat_constr[p] = r->path;
     }
     // A record pattern's matched-value type (resolved by unify with the
