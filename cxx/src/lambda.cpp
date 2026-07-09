@@ -1149,6 +1149,19 @@ struct Translator {
     } catch (...) {}
     return out;
   }
+  // A LOCAL `module M = struct include <ImportedUnit> .. end` re-exports the
+  // unit's constructors under M's name (ctype.ml's `module Path = struct
+  // include Path .. end` shadows the unit; `Path.Pident id` must still build
+  // the unit's ctor).  Maps the local module name -> the included unit.
+  std::unordered_map<std::string, std::string> local_include_units_;
+  // The module whose cmi declares the ctors reachable as `name.Ctor`: the
+  // name itself when it is an imported unit, the included unit for a local
+  // include-wrapper module, empty when unresolvable (a plain local module).
+  std::string ctor_module_of(const std::string& name) {
+    if (!module_base(name)) return name;
+    auto li = local_include_units_.find(name);
+    return li == local_include_units_.end() ? "" : li->second;
+  }
   // Resolve a constructor through its explicit stdlib-module qualification, or
   // through the opened modules when bare.  Local modules take no part (their
   // ctors register through the normal paths).
@@ -1187,8 +1200,9 @@ struct Translator {
           submodule_of(prefix);
         return;
       }
-      if (module_base(pl->name)) return;
-      ctor_name = d->name; mod = pl->name;
+      mod = ctor_module_of(pl->name);
+      if (mod.empty()) return;
+      ctor_name = d->name;
     } else if (auto* l = std::get_if<Lident>(&id.v)) {  // bare `C` via an `open M`
       // A constructor brought into scope by `open CamlinternalFormatBasics` etc.
       // must register its whole type too, else the match compiler can't find the
@@ -1225,9 +1239,11 @@ struct Translator {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return;
     auto* pl = std::get_if<Lident>(&d->prefix->v);
-    if (!pl || module_base(pl->name)) return;
+    if (!pl) return;
+    std::string mod = ctor_module_of(pl->name);
+    if (mod.empty()) return;
     if (ctor_info_.count(d->name)) return;
-    auto& mc = module_ctors(pl->name);
+    auto& mc = module_ctors(mod);
     auto f = mc.find(d->name);
     if (f == mc.end()) return;
     ctor_info_[d->name] = f->second; builtin_ctors_.insert(d->name);
@@ -1245,8 +1261,10 @@ struct Translator {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return nullptr;
     auto* pl = std::get_if<Lident>(&d->prefix->v);
-    if (!pl || module_base(pl->name)) return nullptr;
-    auto& mc = module_ctors(pl->name);
+    if (!pl) return nullptr;
+    std::string mod = ctor_module_of(pl->name);
+    if (mod.empty()) return nullptr;
+    auto& mc = module_ctors(mod);
     auto f = mc.find(d->name);
     return f == mc.end() ? nullptr : &f->second;
   }
@@ -1498,8 +1516,13 @@ struct Translator {
               if (auto* inc = std::get_if<Pstr_include>(&sit.desc))
                 if (auto* mi = std::get_if<Pmod_ident>(&inc->expr.desc)) {
                   std::string dotted;
-                  if (lid_to_dotted(mi->id.txt, dotted))
+                  if (lid_to_dotted(mi->id.txt, dotted)) {
                     register_pv_types_from(*pm->binding.name.txt, dotted);
+                    // ctype.ml's `module Path = struct include Path .. end`:
+                    // a qualified `Path.Pident` must resolve through the
+                    // INCLUDED unit's ctors (see ctor_module_of).
+                    local_include_units_[*pm->binding.name.txt] = dotted;
+                  }
                 }
     each_decl([&](const TypeDeclaration& d) {  // then records
       if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
@@ -10738,6 +10761,17 @@ struct Translator {
               }
             }
           }
+      if (getenv("CTDBG")) {
+        std::string dotted;
+        lid_to_dotted(k->id.txt, dotted);
+        const CtorInfo* qi = std::holds_alternative<Ldot>(k->id.txt.v)
+                                 ? qualified_ctor_info(k->id.txt) : nullptr;
+        fprintf(stderr,
+                "[CTDBG] FALLTHRU ctor %s (lid=%s) ctor_info=%d qual=%d "
+                "exn_shadows-path\n",
+                n.c_str(), dotted.c_str(), (int)ctor_info_.count(n),
+                qi != nullptr);
+      }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + n);  // user ctor: needs its tag (defer)
       return v;
     }

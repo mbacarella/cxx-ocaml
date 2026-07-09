@@ -11113,7 +11113,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       return false;  // Lapply: unsupported
     };
     if (!flat(&pi->id.txt) || comps.size() < 2) return {};
-    const std::string& mtname = comps.back();
+    const std::string mtname = comps.back();  // by value: comps may re-root
     // The head may be a LOCAL submodule (`IncrementalEngine.INCREMENTAL_ENGINE`
     // where IncrementalEngine is a sibling, not a separate cmi): find its
     // module-type decl in the threaded module signatures and emit its items.
@@ -11147,18 +11147,38 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     // so the whole `include` was dropped (the parser's MenhirInterpreter lost the
     // 23 INCREMENTAL_ENGINE values -> a short module block -> a wild call at parse).
     try {
+      // An intermediate component may be an ALIAS member (`Stdlib.Set.S`:
+      // stdlib.cmi's Set = Stdlib__Set, Mp_absent) -- re-root the remaining
+      // path at the target and walk again (ident.mli's `module Set :
+      // Stdlib.Set.S with type elt = t` emitted an EMPTY sig without this,
+      // and the bootstrapped ocamlc then read garbage Set fields).
+      for (int guard = 0; guard < 8; ++guard) {
       auto cmi = cmi::CmiFile::load(head_cmi(comps[0]));
       const cmi::Signature* sig = &cmi.sig();
-      for (size_t i = 1; i + 1 < comps.size(); ++i) {  // walk submodules
+      bool rerooted = false;
+      for (size_t i = 1; i + 1 < comps.size() && !rerooted; ++i) {
         const cmi::Signature* next = nullptr;
         for (auto& md : sig->modules)
-          if (md.name == comps[i] && md.type &&
-              md.type->kind == cmi::ModuleType::Sig && md.type->sig) {
-            next = md.type->sig.get(); break;
+          if (md.name == comps[i] && md.type) {
+            if (md.type->kind == cmi::ModuleType::Alias && md.type->path) {
+              std::string tgt = cmi_path_str(*md.type->path);
+              if (!tgt.empty()) {
+                auto nc = split_dotted(tgt);
+                nc.insert(nc.end(), comps.begin() + i + 1, comps.end());
+                comps = std::move(nc);
+                rerooted = true;
+              }
+              break;
+            }
+            if (md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+              next = md.type->sig.get();
+            break;
           }
+        if (rerooted) break;
         if (!next) return {};
         sig = next;
       }
+      if (rerooted) continue;
       for (auto& md : sig->modtypes)
         if (md.name == mtname && md.type &&
             md.type->kind == cmi::ModuleType::Sig && md.type->sig) {
@@ -11172,6 +11192,8 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           qualify_enclosing_types(result, *sig, unit_path);
           return result;
         }
+      return {};
+      }
     } catch (...) {}
     return {};
   };
@@ -11941,17 +11963,36 @@ static void qualify_enclosing_types(std::vector<cmi::cmiw::SigItem>& result,
 // Signature items of a QUALIFIED named module type ("Set.S",
 // "Pqueue.OrderedType"), resolved through the head module's compiled cmi.
 static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
-    const std::vector<std::string>& comps) {
-  if (comps.size() < 2) return {};
+    const std::vector<std::string>& comps0) {
+  if (comps0.size() < 2) return {};
   try {
+    // A component may be an ALIAS member (`Stdlib.Set.S`: stdlib.cmi's Set is
+    // `module Set = Stdlib__Set`, Mp_absent) -- re-root the remaining path at
+    // the alias target and walk again (ident.mli's `module Set :
+    // Stdlib.Set.S with type elt = t` wrote an EMPTY sig without this).
+    std::vector<std::string> comps = comps0;
+    for (int guard = 0; guard < 8; ++guard) {
     auto cmif = cmi::CmiFile::load(head_cmi(comps[0]));
     const cmi::Signature* sig = &cmif.sig();
+    bool rerooted = false;
     for (std::size_t i = 1; i + 1 < comps.size() && sig; ++i) {
       const cmi::ModuleDecl* md = nullptr;
       for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+      if (md && md->type && md->type->kind == cmi::ModuleType::Alias &&
+          md->type->path) {
+        std::string tgt = cmi_path_str(*md->type->path);
+        if (!tgt.empty()) {
+          std::vector<std::string> nc = split_dotted(tgt);
+          nc.insert(nc.end(), comps.begin() + i + 1, comps.end());
+          comps = std::move(nc);
+          rerooted = true;
+          break;
+        }
+      }
       sig = (md && md->type && md->type->kind == cmi::ModuleType::Sig)
                 ? md->type->sig.get() : nullptr;
     }
+    if (rerooted) continue;
     if (!sig) return {};
     for (auto& mtd : sig->modtypes)
       if (mtd.name == comps.back() && mtd.type &&
@@ -11967,6 +12008,8 @@ static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
         qualify_enclosing_types(result, *sig, unit_path);
         return result;
       }
+    return {};  // modtype not found in the resolved signature
+    }           // guard: re-rooted alias walk
   } catch (...) {}
   return {};
 }
