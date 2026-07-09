@@ -12949,9 +12949,32 @@ struct Translator {
   // -- enough for a coercion, which only needs field structure.  This is the
   // CmiFile-free sibling of msig_of_cmi_sig, for the ascription-tail shadow check
   // where only a `cmi::Signature*` (coerce_sig) is in hand.
-  modsig::SigPtr msig_of_cmi_signature(const cmi::Signature& sig, int depth = 0) {
+  // Resolve a cmi module type to its concrete Signature, following an Ident
+  // modtype reference (`module Main : FullS`, stored as an Ident) through the
+  // modtype declarations visible in the enclosing signature scope (innermost
+  // first).  Without this the referenced modtype contributes no sub-layout, so
+  // the impl->intf coercion passes the submodule RAW -- and a consumer/functor
+  // reading it at the interface's (deduped) field order gets the wrong field
+  // (Main_args.Default.Main : Bytecomp_options: `_c` reads `_warn_error`).
+  static const cmi::Signature* resolve_cmi_module_sig(
+      const cmi::ModuleTypePtr& mt,
+      const std::vector<const cmi::Signature*>& scope, int d = 0) {
+    if (!mt || d > 16) return nullptr;
+    if (mt->kind == cmi::ModuleType::Sig) return mt->sig.get();
+    if (mt->kind == cmi::ModuleType::Ident && mt->path &&
+        mt->path->kind == cmi::Path::Pident) {
+      const std::string& nm = mt->path->id.name;
+      for (auto it = scope.rbegin(); it != scope.rend(); ++it)
+        for (auto& mtd : (*it)->modtypes)
+          if (mtd.name == nm) return resolve_cmi_module_sig(mtd.type, scope, d + 1);
+    }
+    return nullptr;
+  }
+  modsig::SigPtr msig_of_cmi_signature(const cmi::Signature& sig, int depth = 0,
+                                       std::vector<const cmi::Signature*> scope = {}) {
     auto out = std::make_shared<modsig::Sig>();
     if (depth > 24) { out->incomplete = true; return out; }
+    scope.push_back(&sig);  // this level's modtypes are visible to inner Idents
     using OE = cmi::Signature::OrderEnt;
     for (auto& oe : sig.order) {
       modsig::Item item;
@@ -12970,8 +12993,8 @@ struct Translator {
         case OE::Module: {
           auto& md = sig.modules[oe.idx];
           item.ns = modsig::NS::Module; item.name = md.name;
-          if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
-            item.sub = msig_of_cmi_signature(*md.type->sig, depth + 1);
+          if (const cmi::Signature* msig = resolve_cmi_module_sig(md.type, scope))
+            item.sub = msig_of_cmi_signature(*msig, depth + 1, scope);
           break;
         }
         case OE::Modtype:
