@@ -1242,7 +1242,47 @@ struct Checker {
         expanding_.erase(nm);
         return r;
       }
-      if (!fold_abbrevs_ && !keep_local_abbrevs_ &&
+      // A BARE name can never refer to ANOTHER module's nested abbreviation
+      // (OCaml scoping) -- expand through the flat map only when the alias is
+      // top-level (display_path empty) or we are inside its declaring module.
+      // shape.ml's nested `Item.t = string * K.t` squatted the flat "t" and
+      // hijacked the outer recursive record `t` inside `desc`'s ctor types:
+      // the tuple-vs-record clash collapsed of_path's letrec inference and
+      // the Path.t match degenerated to one unconditional arm (bug #12).
+      // A NESTED alias (display_path "Item.t") must not capture an unrelated
+      // same-last-name reference through the flat map -- shape.ml's
+      // `Item.t = string * K.t` hijacked both the outer record `t` and the
+      // dotted `Sig_component_kind.t`, collapsing of_path's inference and
+      // degenerating the Path.t match to one unconditional arm (bug #12).
+      // BARE name: blocked when an enclosing OPAQUE decl owns it (tenv stamp
+      // in scope; inside the alias's own module the alias has no stamp, so
+      // AbstractFloat's `float -> t` still expands and keeps its [float]
+      // kind).  DOTTED name: it must actually NAME the alias (dp == the
+      // written path, or dp declared deeper and ending in ".<path>").
+      bool nested_shadowed = false;
+      if (ai != type_aliases.end() && !ai->second.display_path.empty()) {
+        const std::string& dp = ai->second.display_path;
+        if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
+          if (tenv_lookup(l->name)) nested_shadowed = true;
+        } else {
+          std::string full = lid_full(c->id.txt);
+          bool names_it =
+              dp == full ||
+              (dp.size() > full.size() &&
+               dp.compare(dp.size() - full.size() - 1, full.size() + 1,
+                          "." + full) == 0);
+          if (!names_it) nested_shadowed = true;
+        }
+      }
+      if (getenv("CTDBG") && ai != type_aliases.end() && nm == "t")
+        fprintf(stderr,
+                "[CTDBG] expand? nm=t lident=%d fold=%d keep=%d shadowed=%d "
+                "dp=%s modpfx=%s\n",
+                (int)std::holds_alternative<Lident>(c->id.txt.v),
+                (int)fold_abbrevs_, (int)keep_local_abbrevs_,
+                (int)nested_shadowed, ai->second.display_path.c_str(),
+                mod_prefix_.c_str());
+      if (!fold_abbrevs_ && !keep_local_abbrevs_ && !nested_shadowed &&
           ai != type_aliases.end() && ai->second.params.size() == as.size() &&
           !expanding_.count(nm)) {
         std::unordered_map<std::string, TypePtr> sub;

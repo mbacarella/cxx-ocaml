@@ -8153,6 +8153,12 @@ struct Translator {
       for (auto& r : rows) {
         if (!std::holds_alternative<Ppat_construct>(effective_pat(r.lhs)->desc)) continue;
         auto it = vk.pat_constr.find(effective_pat(r.lhs));
+        if (getenv("CTDBG")) {
+          auto* kk = std::get_if<Ppat_construct>(&effective_pat(r.lhs)->desc);
+          fprintf(stderr, "[CTDBG] match row ctor %s pat_constr=%s\n",
+                  kk ? lid_last(kk->id.txt).c_str() : "?",
+                  it != vk.pat_constr.end() ? it->second.c_str() : "<none>");
+        }
         if (it == vk.pat_constr.end() || it->second.find('.') == std::string::npos) continue;
         ctor_save = force_register_type_ctors(it->second);
         if (!ctor_save.empty()) break;
