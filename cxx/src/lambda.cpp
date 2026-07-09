@@ -8018,6 +8018,25 @@ struct Translator {
     if (scrut->k == Lam::K::Var)
       if (auto vp = var_record_path_.find(scrut->var.stamp); vp != var_record_path_.end())
         ctor_save = force_register_type_ctors(vp->second);
+    // If the scrutinee's type path is unknown but a row uses a QUALIFIED constructor
+    // (`Type_immediacy.Unknown`), that pattern names the type directly -- force-register
+    // `Mod.type` so its true (n_const,n_block) overrides a stale same-short-name entry in
+    // type_ctors_ (many types are named `t`; `emplace` in register_qualified_ctor cannot
+    // correct a `t` already squatted by an unrelated 4-block-ctor type).
+    if (ctor_save.empty())
+      for (auto& r : rows) {
+        auto* k = std::get_if<Ppat_construct>(&effective_pat(r.lhs)->desc);
+        if (!k) continue;
+        auto* d = std::get_if<Ldot>(&k->id.txt.v);
+        if (!d) continue;
+        auto* pl = std::get_if<Lident>(&d->prefix->v);
+        if (!pl || module_base(pl->name)) continue;
+        auto& mc = module_ctors(pl->name);
+        auto f = mc.find(d->name);
+        if (f == mc.end()) continue;
+        ctor_save = force_register_type_ctors(pl->name + "." + f->second.type);
+        break;
+      }
     struct CtorGuard { Translator* self; CtorSave sv;
                        ~CtorGuard() { self->restore_ctors(sv); } } ctor_guard{this, std::move(ctor_save)};
     // Resolve any qualified stdlib constructors in the rows (Seq.Cons, ...) so
