@@ -553,7 +553,8 @@ struct Translator {
   // Modules required (linked) because a C external of theirs is used in `l`.
   void collect_required_globals(const LamPtr& l, std::set<std::string>& out) {
     if (!l) return;
-    if (l->k == Lam::K::Prim && l->prim == Prim::Ccall)
+    if (l->k == Lam::K::Prim && l->prim == Prim::Ccall &&
+        !local_ext_cprims_.count(l->prim_id))
       if (auto it = prim_to_mod_.find(l->prim_id); it != prim_to_mod_.end())
         out.insert(global_of(it->second));
     collect_required_globals(l->fn, out); collect_required_globals(l->body, out);
@@ -718,6 +719,12 @@ struct Translator {
   // User C externals: value name -> C primitive name (the `external f = "cname"`
   // string) + declared arity.  Applying one emits (cname args).
   std::unordered_map<std::string, StdPrim> externals_;
+  // C primitive names declared by THIS unit's own `external f = "cname"` bindings.
+  // A bare local `external` is a Pident access, which real ocaml's
+  // add_used_primitive ignores (it records only qualified `M.foo` Pdot accesses),
+  // so such a Ccall must NOT force-require the stdlib module that also declares
+  // that C prim (e.g. stdlib.ml's own caml_create_bytes must not require Bytes).
+  std::set<std::string> local_ext_cprims_;
   // Locally-declared %-builtins (`external f : t -> u = "%bswap16"`): name ->
   // (primitive, arity), routed through prim_to_lam at application sites.
   std::unordered_map<std::string, std::pair<std::string, int>> local_prims_;
@@ -14705,6 +14712,7 @@ struct Translator {
         }
         if (!pd.prims.empty() && pd.prims[0][0] != '%') {  // C call
           externals_[pd.name.txt] = {pd.prims[0], ar};
+          local_ext_cprims_.insert(pd.prims[0]);
         } else if (!pd.prims.empty() && pd.type) {
           local_prims_[pd.name.txt] = {pd.prims[0], ar};  // a %-builtin
         }
