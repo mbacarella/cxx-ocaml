@@ -878,6 +878,13 @@ struct Translator {
     // record (`Pattern {penv : Pattern_env.t}` -> "Pattern_env.t"), else "".  Lets a
     // var bound to such a field resolve its own AMBIGUOUS labels by that type.
     std::vector<std::string> rftypes;
+    // Each tuple ARG's type name (last path component) when it is a Tconstr,
+    // else "" (`Pextra_ty of t * extra_ty` -> {"t","extra_ty"}).  Lets
+    // register_ctors_of_type pull in a SIBLING variant the ctor destructures
+    // into (the inner `match extra with Pcstr_ty ..` after
+    // `Pextra_ty (path, extra)` -- the engine types `extra` as a bare var, so
+    // no pat_constr reaches the back end for the inner match).
+    std::vector<std::string> arg_type_names;
   };
   std::unordered_map<std::string, CtorInfo> ctor_info_;
   // A var bound to an inline-record field of NAMED RECORD type (`Pattern {penv}`,
@@ -1141,6 +1148,16 @@ struct Translator {
                 ci.rfmut.push_back(l.mutable_);
                 ci.rftypes.push_back("");
               }
+            else
+              for (auto& a : c.args) {
+                std::string an;
+                if (a && a->kind == cmi::TypeExpr::Tconstr && a->path) {
+                  an = cmi_path_dotted(*a->path);
+                  if (auto d2 = an.rfind('.'); d2 != std::string::npos)
+                    an = an.substr(d2 + 1);
+                }
+                ci.arg_type_names.push_back(std::move(an));
+              }
             out[c.name] = std::move(ci);
           }
           if (block) ++nb; else ++nc;
@@ -1303,6 +1320,32 @@ struct Translator {
         ctor_info_[nm] = info; builtin_ctors_.insert(nm);
       }
     type_ctors_.emplace(ty, std::make_pair(nc, nb));
+    register_sibling_arg_ctors(mc, ty);
+  }
+  // Register the SIBLING variants a type's ctors destructure into (Path.t's
+  // `Pextra_ty of t * extra_ty`): the inner `match extra with Pcstr_ty name ..`
+  // has no pat_constr (the engine binds `extra` as a fresh var), so extra_ty's
+  // ctors must already be resolvable.  One level only; fallback-only guards.
+  void register_sibling_arg_ctors(
+      const std::unordered_map<std::string, CtorInfo>& mc,
+      const std::string& ty) {
+    std::set<std::string> argtys;
+    for (auto& [nm, info] : mc)
+      if (info.type == ty)
+        for (auto& at : info.arg_type_names)
+          if (!at.empty() && at != ty) argtys.insert(at);
+    for (auto& at : argtys) {
+      int nc2 = 0, nb2 = 0;
+      bool found2 = false;
+      for (auto& [nm, info] : mc)
+        if (info.type == at) { (info.is_block ? nb2 : nc2)++; found2 = true; }
+      if (!found2) continue;
+      for (auto& [nm, info] : mc)
+        if (info.type == at && !ctor_info_.count(nm)) {
+          ctor_info_[nm] = info; builtin_ctors_.insert(nm);
+        }
+      type_ctors_.emplace(at, std::make_pair(nc2, nb2));
+    }
   }
   // A scoped save of ctor_info_ AND type_ctors_ entries, restored after a match.
   // `tc` is essential: force_register_type_ctors overwrites type_ctors_[ty] and MUST
@@ -1366,6 +1409,10 @@ struct Translator {
                                   ? std::optional<std::pair<int, int>>()
                                   : std::optional<std::pair<int, int>>(tcit->second));
     type_ctors_[ty] = std::make_pair(nc, nb);
+    // Sibling arg-type ctors register PERMANENTLY (fallback-only), matching
+    // register_ctors_of_type -- the destructured-arg inner match compiles
+    // while this force-register is active.
+    register_sibling_arg_ctors(mc, ty);
     return saved;
   }
   // Register the type owning constructor `ctorname` from module `mod` (an imported
@@ -1401,6 +1448,10 @@ struct Translator {
       if (std::holds_alternative<Lident>(k->id.txt.v) &&
           !ctor_info_.count(lid_last(k->id.txt))) {
         auto it = vk.pat_constr.find(&p);
+        if (getenv("CTDBG"))
+          fprintf(stderr, "[CTDBG] scan_pat ctor %s pat_constr=%s\n",
+                  lid_last(k->id.txt).c_str(),
+                  it != vk.pat_constr.end() ? it->second.c_str() : "<none>");
         if (it != vk.pat_constr.end()) register_ctors_of_type(it->second);
       }
       if (k->arg) { tag_ctor_record_args(lid_last(k->id.txt), k->arg->get()); scan_pat_ctors(**k->arg); }

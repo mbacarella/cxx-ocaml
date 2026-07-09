@@ -8850,6 +8850,10 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
     // record the path so the back end can register that type's constructors.
     if (std::holds_alternative<ast::Ppat_construct>(p->desc)) {
       TypePtr r = I::Engine::repr(t);
+      if (getenv("CTDBG"))
+        fprintf(stderr, "[CTDBG] rec_pat construct kind=%d path=%s\n",
+                (int)r->kind,
+                r->kind == I::Type::Kind::Constr ? r->path.c_str() : "-");
       if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
         vk.pat_constr[p] = r->path;
     }
