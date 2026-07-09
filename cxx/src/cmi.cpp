@@ -272,6 +272,12 @@ public:
           td.labels.push_back(label_decl(cons.fields[0]));
           cur = cons.fields[1];
         }
+        // record_representation: Record_regular(0)/Record_float(1) are constants;
+        // Record_unboxed of bool is block tag 0 (a single-field unboxed record).
+        if (k.fields.size() > 1) {
+          const m::Value& rep = arena_[k.fields[1]];
+          td.unboxed = rep.kind == m::Value::Kind::Block && rep.tag == 0;
+        }
         break;
       case 2:  // Type_variant of constructor_declaration list * variant_repr
         td.kind = TypeDecl::Variant;
@@ -280,6 +286,12 @@ public:
           const m::Value& cons = arena_[cur];
           td.ctors.push_back(ctor_decl(cons.fields[0]));
           cur = cons.fields[1];
+        }
+        // variant_representation: Variant_regular(0)/Variant_unboxed(1) are both
+        // constant constructors, so unboxed <=> the repr int is 1.
+        if (k.fields.size() > 1) {
+          const m::Value& rep = arena_[k.fields[1]];
+          td.unboxed = rep.kind == m::Value::Kind::Int && rep.i == 1;
         }
         break;
       case 3:  // Type_external of string

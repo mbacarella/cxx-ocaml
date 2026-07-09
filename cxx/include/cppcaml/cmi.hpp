@@ -119,6 +119,9 @@ struct TypeDecl {
   std::vector<LabelDecl> labels;        // Record
   std::vector<ConstructorDecl> ctors;   // Variant
   std::string external_name;            // External
+  // `[@@unboxed]`: a single single-field ctor (Variant_unboxed) or single-field
+  // record (Record_unboxed) whose value IS its argument -- no box, no field read.
+  bool unboxed = false;
   bool priv = false;                    // type_private = Private
   TypePtr manifest;                     // type_manifest option (abbreviation)
   // type_variance, one RAW Variance.t int per parameter (a bitfield Printtyp

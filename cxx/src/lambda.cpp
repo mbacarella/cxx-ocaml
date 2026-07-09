@@ -1071,7 +1071,8 @@ struct Translator {
           bool block = !c.args.empty() || c.is_inline_record;
           int arity = c.is_inline_record ? 1 : (int)c.args.size();
           if (found.count(c.name) || ctor_info_.count(c.name)) ambiguous.insert(c.name);
-          found[c.name] = {td.name, block ? nb : nc, block, arity};
+          found[c.name] = {td.name, block ? nb : nc, block, arity,
+                           td.unboxed && arity == 1};
           if (block) ++nb; else ++nc;
         }
         if (!gadt) type_ctors_.emplace(td.name, std::make_pair(nc, nb));
@@ -1101,7 +1102,8 @@ struct Translator {
           bool block = !c.args.empty() || c.is_inline_record;
           int arity = c.is_inline_record ? 1 : (int)c.args.size();
           if (!out.count(c.name)) {
-            CtorInfo ci{td.name, block ? nb : nc, block, arity};
+            CtorInfo ci{td.name, block ? nb : nc, block, arity,
+                        td.unboxed && arity == 1};
             // An INLINE-RECORD ctor of an imported module (Typedtree's
             // `Texp_record of {fields; representation; extended_expression}`):
             // carry its label order so `open Typedtree; match e with Texp_record
@@ -2769,7 +2771,8 @@ struct Translator {
             bool block = !c.args.empty() || c.is_inline_record;
             int arity = c.is_inline_record ? 1 : (int)c.args.size();
             if (!ctor_info_.count(c.name) && !ambiguous_ctors_.count(c.name)) {
-              CtorInfo ci{td.name, block ? nb : nc, block, arity};
+              CtorInfo ci{td.name, block ? nb : nc, block, arity,
+                          td.unboxed && arity == 1};
               // An inline-record ctor (Patterns.Head's `Variant of {tag; cstr_row;
               // ..}`): carry its label order so a `M.Sub.Variant {tag; cstr_row}`
               // pattern binds the fields (else they fall to `?tag`/`?cstr_row`).
@@ -3186,7 +3189,8 @@ struct Translator {
         bool block = arity > 0;
         if (!ctor_info_.count(c.name)) {
           builtin_ctors_.erase(c.name);
-          ctor_info_[c.name] = {td.name, block ? nb : nc, block, arity};
+          ctor_info_[c.name] = {td.name, block ? nb : nc, block, arity,
+                                td.unboxed && arity == 1};
         }
         if (block) ++nb; else ++nc;
       }
@@ -3233,7 +3237,8 @@ struct Translator {
                                               ? std::optional<CtorInfo>()
                                               : std::optional<CtorInfo>(it->second));
             builtin_ctors_.erase(c.name);
-            ctor_info_[c.name] = {td.name, tag, block, arity};
+            ctor_info_[c.name] = {td.name, tag, block, arity,
+                                  td.unboxed && arity == 1};
           }
           if (block) ++nb; else ++nc;
         }
