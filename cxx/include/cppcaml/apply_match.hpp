@@ -40,6 +40,16 @@ inline Result match(const std::vector<Param>& params, const std::vector<Arg>& ar
   Result r;
   std::vector<bool> used(args.size(), false);
   int last_arg = -1;
+  // OCaml fills a required labelled parameter POSITIONALLY (label omitted at the
+  // call) only in a TOTAL application -- one supplying enough arguments to cover
+  // every non-optional parameter.  In a PARTIAL application the positional args
+  // fill only the Nolabel parameters, and each still-unmatched labelled parameter
+  // stays pending (an eta parameter of the resulting closure): `let g ~x a b in
+  // g 1 2` is `fun ~x -> g ~x 1 2`, NOT `g ~x:1 2 <partial>`.  Count non-optional
+  // params; the app is total when at least that many arguments are supplied.
+  size_t nreq = 0;
+  for (const Param& p : params) if (p.label != 2) ++nreq;
+  bool total = args.size() >= nreq;
   for (const Param& p : params) {
     int found = -1, fk = 0;
     for (size_t i = 0; i < args.size(); ++i) {
@@ -54,10 +64,11 @@ inline Result match(const std::vector<Param>& params, const std::vector<Arg>& ar
       }
     }
     // A required (Labelled, non-optional) parameter with no explicitly-labelled
-    // argument is filled by the next positional (Nolabel) argument: OCaml lets
-    // `foo 2` supply `~bar` positionally.  The slot still carries the param's
+    // argument is filled by the next positional (Nolabel) argument -- but only in
+    // a total application (see `total` above); OCaml lets `foo 2` supply `~bar`
+    // positionally when saturating the call.  The slot still carries the param's
     // label so the typed tree records `Labelled "bar"`.
-    if (found < 0 && p.label == 1)
+    if (found < 0 && p.label == 1 && total)
       for (size_t i = 0; i < args.size(); ++i)
         if (!used[i] && args[i].label == 0) { found = (int)i; break; }
     Slot s;

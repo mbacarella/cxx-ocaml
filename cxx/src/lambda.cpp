@@ -1232,7 +1232,12 @@ struct Translator {
     auto d = path.rfind('.');
     if (d == std::string::npos) return;
     std::string mod = path.substr(0, d), ty = path.substr(d + 1);
-    if (mod.find('.') != std::string::npos) return;  // nested module: unhandled
+    // A stdlib submodule read through a cmi arrives fully qualified
+    // (`Stdlib.Either.t`); its type lives in the aliased unit named by the LAST
+    // module component (`Either` -> stdlib__either.cmi).  Take that component so
+    // the ctors resolve.  For a genuinely nested local module the component won't
+    // resolve to a cmi and module_ctors yields nothing -> harmless no-op.
+    if (auto md = mod.rfind('.'); md != std::string::npos) mod = mod.substr(md + 1);
     if (module_base(mod)) return;                     // a local module: skip
     auto& mc = module_ctors(mod);
     int nc = 0, nb = 0;
