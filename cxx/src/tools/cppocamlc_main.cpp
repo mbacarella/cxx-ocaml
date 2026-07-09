@@ -84,6 +84,9 @@ static void print_help(std::ostream& os) {
       "  -runtime <file> Use <file> as the ocamlrun launched by the output exe\n"
       "  -strict-flags   Turn accepted-but-ignored and unknown options into\n"
       "                  errors instead of silently dropping them\n"
+      "  -dparsetree     Dump the parsed AST to stdout, then keep compiling\n"
+      "  -dlambda        Dump the Lambda IR to stdout, then keep compiling\n"
+      "  -dinstr         Dump the bytecode instructions to stdout, then keep going\n"
       "  -config         Print the compiler configuration and exit\n"
       "  -version        Print the compiler version and exit\n"
       "  -vnum           Print the compiler version number and exit\n"
@@ -148,6 +151,13 @@ static const std::set<std::string> kBoolIgnore2 = {"-labels", "-nolabels"};
 
 // Compile a single .ml -> .cmo (+ .cmi unless a hand-written .mli exists).
 // Returns 0 on success.  `cmo_out` is where the .cmo is written.
+// -d* debug dumps (like ocamlc's): print an intermediate representation to
+// stdout during compilation and keep going.  Byte-comparable (after the usual
+// label/stamp normalization) with the matching `ocamlc -d*` and with the
+// standalone c++parse / c++lambda / c++instr tools.
+struct DumpFlags { bool parsetree = false, lambda = false, instr = false; };
+static DumpFlags g_dump;
+
 static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                       const std::string& stdlib_dir, bool prof) {
   std::ifstream in(in_path, std::ios::binary);
@@ -168,12 +178,16 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
     lap("parse", tp);
+    if (g_dump.parsetree)
+      cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
     std::vector<std::string> required_globals;
     auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, in_path,
                                                           &required_globals);
     lap("translate (infer+lambda)", tp);
+    if (g_dump.lambda) cppcaml::lambda::print_dlambda(code, std::cout);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     lap("bytegen", tp);
+    if (g_dump.instr) cppcaml::bytecode::print_dinstr(instrs, std::cout);
     // Write the .cmi BEFORE the .cmo so write_cmo can read the interface CRCs it
     // records (a hand-written .mli's .cmi already exists on disk from earlier).
     try {  // best-effort .cmi from inference (unless a hand-written .mli owns it)
@@ -253,6 +267,9 @@ int main(int argc, char** argv) {
     else if (a == "-I") incdirs_raw.push_back(need_arg("-I"));
     else if (a == "-runtime") runtime = need_arg("-runtime");
     else if (a == "-c") compile_only = true;
+    else if (a == "-dparsetree") g_dump.parsetree = true;   // dump AST, keep going
+    else if (a == "-dlambda") g_dump.lambda = true;         // dump Lambda IR
+    else if (a == "-dinstr") g_dump.instr = true;           // dump bytecode instrs
     else if (a == "-a") make_lib = true;
     else if (a == "-pack") pack_name = "?";  // resolved from -o once known
     else if (a == "-nostdlib") nostdlib = true;
