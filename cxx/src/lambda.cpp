@@ -1250,7 +1250,20 @@ struct Translator {
       }
     type_ctors_.emplace(ty, std::make_pair(nc, nb));
   }
-  using CtorSave = std::vector<std::pair<std::string, std::optional<CtorInfo>>>;
+  // A scoped save of ctor_info_ AND type_ctors_ entries, restored after a match.
+  // `tc` is essential: force_register_type_ctors overwrites type_ctors_[ty] and MUST
+  // put it back, else a type sharing the SHORT name key (many are named `t`/`list`)
+  // reads the wrong (n_const,n_block) in a later match.
+  struct CtorSave {
+    std::vector<std::pair<std::string, std::optional<CtorInfo>>> ci;
+    std::vector<std::pair<std::string, std::optional<std::pair<int, int>>>> tc;
+    std::vector<std::string> forced;  // ctor names whose ambient resolution is overridden
+    bool empty() const { return ci.empty() && tc.empty() && forced.empty(); }
+  };
+  // Ctor names currently force-registered for a PATTERN scope (scrutinee-type override).
+  // A same-named EXPRESSION construction in an arm body must re-resolve via its own
+  // inferred type instead of the temporarily-rebound ctor_info_ (see Pexp_construct).
+  std::unordered_map<std::string, int> forced_ctor_depth_;
   // FORCE-register an imported type's constructors with their cmi tag/arity,
   // OVERRIDING a wrong global resolution, scoped to one match.  `Named` is shared
   // by 6 types at arities 1/2/3; a `match (arg_opt : Parsetree.functor_parameter)
@@ -1271,11 +1284,17 @@ struct Translator {
         auto it = ctor_info_.find(nm);
         if (it == ctor_info_.end() || it->second.type != ty ||
             it->second.arity != info.arity || it->second.tag != info.tag) {
-          saved.emplace_back(nm, it == ctor_info_.end() ? std::optional<CtorInfo>()
-                                                        : std::optional<CtorInfo>(it->second));
+          saved.ci.emplace_back(nm, it == ctor_info_.end() ? std::optional<CtorInfo>()
+                                                            : std::optional<CtorInfo>(it->second));
           ctor_info_[nm] = info;
+          saved.forced.push_back(nm);       // arm bodies re-resolve this name via expr type
+          forced_ctor_depth_[nm]++;
         }
       }
+    auto tcit = type_ctors_.find(ty);
+    saved.tc.emplace_back(ty, tcit == type_ctors_.end()
+                                  ? std::optional<std::pair<int, int>>()
+                                  : std::optional<std::pair<int, int>>(tcit->second));
     type_ctors_[ty] = std::make_pair(nc, nb);
     return saved;
   }
@@ -3210,9 +3229,9 @@ struct Translator {
           // override an ambiguous name bound to a DIFFERENT type, or add a fresh
           // one -- both scoped: the open's ctors are only visible in its body.
           if (it == ctor_info_.end() || it->second.type != td.name) {
-            saved.emplace_back(c.name, it == ctor_info_.end()
-                                           ? std::optional<CtorInfo>()
-                                           : std::optional<CtorInfo>(it->second));
+            saved.ci.emplace_back(c.name, it == ctor_info_.end()
+                                              ? std::optional<CtorInfo>()
+                                              : std::optional<CtorInfo>(it->second));
             builtin_ctors_.erase(c.name);
             ctor_info_[c.name] = {td.name, tag, block, arity};
           }
@@ -3223,10 +3242,17 @@ struct Translator {
     return saved;
   }
   void restore_ctors(const CtorSave& saved) {
-    for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+    for (auto it = saved.ci.rbegin(); it != saved.ci.rend(); ++it) {
       if (it->second) ctor_info_[it->first] = *it->second;
       else ctor_info_.erase(it->first);
     }
+    for (auto it = saved.tc.rbegin(); it != saved.tc.rend(); ++it) {
+      if (it->second) type_ctors_[it->first] = *it->second;
+      else type_ctors_.erase(it->first);
+    }
+    for (auto& nm : saved.forced)
+      if (auto f = forced_ctor_depth_.find(nm); f != forced_ctor_depth_.end() && --f->second <= 0)
+        forced_ctor_depth_.erase(f);
   }
   // The runtime fields of a (possibly nested) stdlib functor's result after
   // `napps` applications -- "Sys.Immediate64.Make" applied twice yields its
@@ -7701,6 +7727,31 @@ struct Translator {
     return l;
   }
 
+  // Resolve a constructor PATTERN through its inferred type (vk.pat_constr) when the
+  // ambient flat ctor_info_ resolved it to a DIFFERENT type -- a same-named ctor of
+  // another (often same-file) type squatted the slot: `lambda_of_const`'s `Const_float`
+  // pattern is Asttypes.constant (tag 3) but the local Lambda.structured_constant.Const_float
+  // (tag 2) won ctor_info_.  NON-MUTATING (returns a pointer into a stable member cache),
+  // so arm BODIES keep resolving the same name at its own EXPRESSION type's tag.
+  const CtorInfo* pat_ctor_resolve(const Pattern* p, const std::string& cn) {
+    auto base = ctor_info_.find(cn);
+    const CtorInfo* amb = base != ctor_info_.end() ? &base->second : nullptr;
+    auto pc = vk.pat_constr.find(p);
+    if (pc == vk.pat_constr.end()) return amb;
+    auto dot = pc->second.rfind('.');
+    if (dot == std::string::npos) return amb;
+    std::string mod = pc->second.substr(0, dot), ty = pc->second.substr(dot + 1);
+    if (amb && amb->type == ty) return amb;                 // ambient already correct
+    if (auto ti = type_ctor_info_.find(ty); ti != type_ctor_info_.end())  // a local type
+      if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
+    if (auto md = mod.rfind('.'); md != std::string::npos) mod = mod.substr(md + 1);
+    if (!module_base(mod)) {                                // an imported module's type
+      auto& mc = module_ctors(mod);
+      if (auto ci = mc.find(cn); ci != mc.end() && ci->second.type == ty) return &ci->second;
+    }
+    return amb;
+  }
+
   LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc,
                     const LamPtr& dflt = nullptr) {
     if (rows.empty()) return nullptr;
@@ -7736,9 +7787,9 @@ struct Translator {
       if (r.guard && !std::holds_alternative<Ppat_construct>(r.lhs->desc)) return nullptr;
       auto* k = std::get_if<Ppat_construct>(&r.lhs->desc);
       if (!k) return nullptr;
-      auto it = ctor_info_.find(ctor_of(*r.lhs));
-      if (it == ctor_info_.end()) return nullptr;
-      auto& ci = it->second;
+      const CtorInfo* cip = pat_ctor_resolve(r.lhs, ctor_of(*r.lhs));
+      if (!cip) return nullptr;
+      auto& ci = *cip;
       if (type.empty()) type = ci.type;
       else if (type != ci.type) return nullptr;
       if (r.guard && !ci.is_block) return nullptr;  // guarded constant: bail (rare)
@@ -7760,7 +7811,7 @@ struct Translator {
     for (auto& [v, r] : crow)
       cmap[v] = with_alias(r, [&] { return expr(*r->rhs); });
     for (auto& [tag, rs] : brows) {
-      auto& ci = ctor_info_.at(ctor_of(*rs[0]->lhs));
+      auto& ci = *pat_ctor_resolve(rs[0]->lhs, ctor_of(*rs[0]->lhs));
       // an aliased row in a multi-row group would need per-sub-row scoping: bail
       if (rs.size() > 1)
         for (auto* r : rs)
@@ -8036,6 +8087,20 @@ struct Translator {
         if (f == mc.end()) continue;
         ctor_save = force_register_type_ctors(pl->name + "." + f->second.type);
         break;
+      }
+    // Still unknown, but a row's UNqualified ctor pattern has an inferred module-qualified
+    // type (vk.pat_constr): all rows share the scrutinee type, so ONE recorded path fixes
+    // the whole match.  `lambda_of_const`'s `Const_string` records Asttypes.constant while
+    // its sibling `Const_float` (also in Lambda.structured_constant) does not -- registering
+    // Asttypes.constant routes every arm to the right tag.  Arm-body constructions of the
+    // same name re-resolve via vk.expr_constr (guarded by forced_ctor_depth_).
+    if (ctor_save.empty())
+      for (auto& r : rows) {
+        if (!std::holds_alternative<Ppat_construct>(effective_pat(r.lhs)->desc)) continue;
+        auto it = vk.pat_constr.find(effective_pat(r.lhs));
+        if (it == vk.pat_constr.end() || it->second.find('.') == std::string::npos) continue;
+        ctor_save = force_register_type_ctors(it->second);
+        if (!ctor_save.empty()) break;
       }
     struct CtorGuard { Translator* self; CtorSave sv;
                        ~CtorGuard() { self->restore_ctors(sv); } } ctor_guard{this, std::move(ctor_save)};
@@ -9197,20 +9262,23 @@ struct Translator {
         }
         return false;
       }
-      auto tc = type_ctors_.find(ci->second.type);
+      // Resolve the pattern ctor through its inferred type (non-mutating), so a same-named
+      // ctor of another type that squatted ctor_info_ doesn't give the wrong tag/type here.
+      const CtorInfo& C = *pat_ctor_resolve(p, cn);
+      auto tc = type_ctors_.find(C.type);
       int nc = tc != type_ctors_.end() ? tc->second.first : -1;
       int nb = tc != type_ctors_.end() ? tc->second.second : -1;
-      if (!ci->second.is_block) {
+      if (!C.is_block) {
         LamPtr t;
         if (nb == 0) {  // constants only: a plain integer compare
           auto e2 = mk(Lam::K::Prim); e2->prim = Prim::EqInt;
-          e2->args = {acc, cint(ci->second.tag)};
+          e2->args = {acc, cint(C.tag)};
           t = e2;
         } else {
           auto ii = mk(Lam::K::Prim); ii->prim = Prim::IntCmp;
           ii->prim_id = "isint"; ii->args = {acc};
           auto e2 = mk(Lam::K::Prim); e2->prim = Prim::EqInt;
-          e2->args = {acc, cint(ci->second.tag)};
+          e2->args = {acc, cint(C.tag)};
           auto g = mk(Lam::K::IfThenElse);
           g->cond = ii; g->then_ = e2; g->else_ = cint(0);
           t = g;
@@ -9219,11 +9287,11 @@ struct Translator {
         return true;
       }
       // block ctor: tag test (caml_obj_tag of an immediate is out of range)
-      if (!(nb == 1 && nc >= 0 && ci->second.tag == 0)) {
+      if (!(nb == 1 && nc >= 0 && C.tag == 0)) {
         auto tg = mk(Lam::K::Prim); tg->prim = Prim::Ccall;
         tg->prim_id = "caml_obj_tag"; tg->args = {acc};
         auto e2 = mk(Lam::K::Prim); e2->prim = Prim::EqInt;
-        e2->args = {tg, cint(ci->second.tag)};
+        e2->args = {tg, cint(C.tag)};
         test = if_and(test, e2);
       } else if (nc > 0) {  // sole block ctor of a mixed type: non-immediate test
         auto ii = mk(Lam::K::Prim); ii->prim = Prim::IntCmp;
@@ -9241,18 +9309,20 @@ struct Translator {
         if (auto cap = ctor_arg_paths_.find(lid_last(k->id.txt)); cap != ctor_arg_paths_.end())
           for (auto& ap : cap->second) {
             auto s = force_register_type_ctors(ap);
-            argsv.insert(argsv.end(), std::make_move_iterator(s.begin()),
-                         std::make_move_iterator(s.end()));
+            argsv.ci.insert(argsv.ci.end(), std::make_move_iterator(s.ci.begin()),
+                            std::make_move_iterator(s.ci.end()));
+            argsv.tc.insert(argsv.tc.end(), std::make_move_iterator(s.tc.begin()),
+                            std::make_move_iterator(s.tc.end()));
           }
         struct G { Translator* self; CtorSave sv; ~G() { self->restore_ctors(sv); } }
           arg_guard{this, std::move(argsv)};
-        if (ci->second.unboxed) return pat_test(k->arg->get(), acc, test, binds);
+        if (C.unboxed) return pat_test(k->arg->get(), acc, test, binds);
         auto* at = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
-        if (ci->second.arity > 1 && at && (int)at->elems.size() == ci->second.arity) {
-          for (int i = 0; i < ci->second.arity; ++i)
+        if (C.arity > 1 && at && (int)at->elems.size() == C.arity) {
+          for (int i = 0; i < C.arity; ++i)
             if (!pat_test(at->elems[i].get(), fieldimm(i, acc), test, binds))
               return false;
-        } else if (!ci->second.rlabels.empty()) {
+        } else if (!C.rlabels.empty()) {
           // inline record (`Cons {next = Nil}`): the record's labels are the
           // constructor block's FLAT fields, so match the record pattern against
           // the block itself (acc), not `field 0 acc` -- else next reads
@@ -9262,19 +9332,19 @@ struct Translator {
           const Pattern* ap = effective_pat(k->arg->get());
           if (auto* pv = std::get_if<Ppat_var>(&ap->desc)) {
             Ident id = fresh(pv->name.txt);
-            inline_rec_var_[id.stamp] = &ci->second;
+            inline_rec_var_[id.stamp] = &C;
             binds.push_back({id, acc});
           } else if (auto* pr = std::get_if<Ppat_record>(&ap->desc)) {
             // `Predef { stamp = s1; _ }`: match each label at its rlabels index of
             // the block directly -- find_field would bail on an AMBIGUOUS label
             // (Ident's `stamp`, shared by Local/Predef/Scoped).
-            auto& L = ci->second.rlabels;
+            auto& L = C.rlabels;
             for (auto& [lbl, sub] : pr->fields) {
               int ix = -1;
               for (size_t i2 = 0; i2 < L.size(); ++i2)
                 if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
               if (ix < 0) return false;
-              FieldInfo fi{ci->second.type, ix, ci->second.rfmut[ix], ci->second.rshape[ix]};
+              FieldInfo fi{C.type, ix, C.rfmut[ix], C.rshape[ix]};
               if (!pat_test(sub.get(), field_read(&fi, acc), test, binds)) return false;
             }
           } else if (!pat_test(k->arg->get(), acc, test, binds)) return false;
@@ -10418,6 +10488,20 @@ struct Translator {
                             ? qualified_ctor_info(k->id.txt) : nullptr;
       const CtorInfo* cip = qci;
       if (!cip) { auto ci = ctor_info_.find(n); if (ci != ctor_info_.end()) cip = &ci->second; }
+      // If a surrounding pattern match force-registered a same-named ctor of the SCRUTINEE
+      // type (rebinding ctor_info_[n]), this arm-body construction must still use its OWN
+      // expression type's ctor.  Inside `lambda_of_const`, the Asttypes.constant match
+      // rebinds ctor_info_["Const_float"] to Asttypes (tag 3), but `Lconst (Const_float f)`
+      // is Lambda.structured_constant (tag 2).  Only fires while such an override is active.
+      if (cip && !qci && forced_ctor_depth_.count(n)) {
+        if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end()) {
+          std::string ety = ec->second;
+          if (auto d = ety.rfind('.'); d != std::string::npos) ety = ety.substr(d + 1);
+          if (ety != cip->type)
+            if (auto ti = type_ctor_info_.find(ety); ti != type_ctor_info_.end())
+              if (auto ci2 = ti->second.find(n); ci2 != ti->second.end()) cip = &ci2->second;
+        }
+      }
       if (cip && !exn_shadows) {
         if (!cip->is_block) return cint(cip->tag);  // constant -> its tag
         // inline record (`T {pos}`): the labels are the block's fields, in
