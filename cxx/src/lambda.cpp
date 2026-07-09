@@ -1309,8 +1309,24 @@ struct Translator {
     auto d = path.rfind('.');
     if (d == std::string::npos) return saved;
     std::string mod = path.substr(0, d), ty = path.substr(d + 1);
-    if (mod.find('.') != std::string::npos || module_base(mod)) return saved;
-    auto& mc = module_ctors(mod);
+    if (module_base(mod.substr(0, mod.find('.')))) return saved;  // local: AST-visible
+    // A dotted module prefix: try the full nested-submodule chain first
+    // (`Shape.Sig_component_kind.t` -- env.ml's find_shape matches bare
+    // Value/Type/... against it, and a same-named local `t` squats
+    // type_ctors_["t"]), falling back to the last component for a re-exported
+    // unit alias (`Stdlib.Either.t` -> stdlib__either.cmi).
+    const auto* mcp = &module_ctors(mod);
+    if (auto md = mod.rfind('.'); md != std::string::npos) {
+      bool nested = false;
+      for (auto& [nm, info] : *mcp)
+        if (info.type == ty) { nested = true; break; }
+      if (!nested) {
+        std::string tail = mod.substr(md + 1);
+        if (module_base(tail)) return saved;
+        mcp = &module_ctors(tail);
+      }
+    }
+    auto& mc = *mcp;
     int nc = 0, nb = 0;
     bool any = false;
     for (auto& [nm, info] : mc) if (info.type == ty) { (info.is_block ? nb : nc)++; any = true; }
