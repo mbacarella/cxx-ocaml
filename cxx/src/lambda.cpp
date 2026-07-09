@@ -1099,8 +1099,26 @@ struct Translator {
     if (auto it = mod_ctor_cache_.find(mod); it != mod_ctor_cache_.end()) return it->second;
     auto& out = mod_ctor_cache_[mod];
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
-      for (auto& td : cmi.sig().types) {
+      // A DOTTED name is a genuinely nested submodule of an imported unit
+      // (`Bytesections.Name`): load the head unit's cmi and walk the submodule
+      // chain to that signature.
+      size_t dot = mod.find('.');
+      auto cmi = cmi::CmiFile::load(
+          resolve_cmi(dot == std::string::npos ? mod : mod.substr(0, dot)));
+      const cmi::Signature* sig = &cmi.sig();
+      std::vector<std::shared_ptr<cmi::CmiFile>> keep;  // park cross-unit cmis
+      for (size_t pos = dot; sig && pos != std::string::npos;) {
+        size_t nd = mod.find('.', pos + 1);
+        std::string comp =
+            mod.substr(pos + 1, nd == std::string::npos ? std::string::npos
+                                                        : nd - pos - 1);
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comp) { md = &mm; break; }
+        sig = md ? mt_sig_x(cmi, md->type, keep) : nullptr;
+        pos = nd;
+      }
+      if (sig)
+      for (auto& td : sig->types) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         // GADT constructors follow the same constant/block tag rules (Bigarray's
         // `kind`: Float32=0, Float64=1, ...), so they resolve like plain variants.
@@ -1241,12 +1259,21 @@ struct Translator {
     auto d = path.rfind('.');
     if (d == std::string::npos) return;
     std::string mod = path.substr(0, d), ty = path.substr(d + 1);
-    // A stdlib submodule read through a cmi arrives fully qualified
-    // (`Stdlib.Either.t`); its type lives in the aliased unit named by the LAST
-    // module component (`Either` -> stdlib__either.cmi).  Take that component so
-    // the ctors resolve.  For a genuinely nested local module the component won't
-    // resolve to a cmi and module_ctors yields nothing -> harmless no-op.
-    if (auto md = mod.rfind('.'); md != std::string::npos) mod = mod.substr(md + 1);
+    // A dotted module prefix is EITHER a re-exported unit alias
+    // (`Stdlib.Either.t` -- the type lives in the unit named by the LAST
+    // component, stdlib__either.cmi) OR a genuinely nested submodule of an
+    // imported unit (`Bytesections.Name.t` -- bytelink.ml's bare `SYMB`
+    // resolves type-directedly against it).  Try the full chain via
+    // module_ctors' submodule walk first; fall back to the last component.
+    if (auto md = mod.rfind('.'); md != std::string::npos) {
+      bool nested = false;
+      if (!module_base(mod.substr(0, mod.find('.')))) {
+        auto& mcn = module_ctors(mod);
+        for (auto& [nm, info] : mcn)
+          if (info.type == ty) { nested = true; break; }
+      }
+      if (!nested) mod = mod.substr(md + 1);
+    }
     if (module_base(mod)) return;                     // a local module: skip
     auto& mc = module_ctors(mod);
     int nc = 0, nb = 0;
@@ -10457,6 +10484,9 @@ struct Translator {
       // Mirrors scan_pat_ctors' pattern-side type-directed registration.
       if (std::holds_alternative<Lident>(k->id.txt.v) && !ctor_info_.count(n)) {
         auto itc = vk.expr_constr.find(&e);
+        if (getenv("CTDBG"))
+          fprintf(stderr, "[CTDBG] bare ctor %s expr_constr=%s\n", n.c_str(),
+                  itc != vk.expr_constr.end() ? itc->second.c_str() : "<none>");
         if (itc != vk.expr_constr.end()) register_ctors_of_type(itc->second);
       }
       // a constructor qualified by a bound module that exports it (an exception /

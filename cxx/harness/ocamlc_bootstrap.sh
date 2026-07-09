@@ -235,6 +235,17 @@ if ! "$LINK" -nostdlib -runtime "$RUN" $stdobjs $clobjs "$WD/std_exit.cmo" -o "$
 fi
 echo "linked: $WD/ocamlc"
 
+# ---- 3.5 stdlib.cma + runtime-launch-info: the bootstrapped ocamlc's OWN
+# bytelink auto-loads stdlib.cma (even under -nostdlib) and reads
+# runtime-launch-info from the stdlib dir, so the smoke test's LINK step needs
+# both in WD.  Like the real distribution, std_exit.cmo stays OUTSIDE the
+# archive (bytelink auto-appends it from the search path).
+if ! "$CPP" -a -nostdlib -I "$WD" $stdobjs -o "$WD/stdlib.cma" 2>"$WD/aerr"; then
+  echo "FAIL: stdlib.cma archive"; sed 's/^/  /' "$WD/aerr" | head -5; exit 1
+fi
+cp "$ROOT/stdlib/runtime-launch-info" "$WD/"
+echo "archived: $WD/stdlib.cma"
+
 # ---- 4. smoke test: the bootstrapped ocamlc must actually COMPILE and the
 # produced program must RUN.  (Testing only `-version` hides codegen bugs that
 # crash on real input -- the compiler can start up fine yet segfault compiling.)
