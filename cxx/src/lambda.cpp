@@ -2952,9 +2952,25 @@ struct Translator {
     if (!mt || depth > 8) return {};
     if (mt->kind == cmi::ModuleType::Sig && mt->sig) return mt->sig->fields;
     if (mt->kind == cmi::ModuleType::Ident && mt->path) {
-      const std::string& nm = mt->path->kind == cmi::Path::Pident ? mt->path->id.name : mt->path->s;
-      for (auto& md : cmi.sig().modtypes)
-        if (md.name == nm) return mt_fields(cmi, md.type, depth + 1);
+      if (mt->path->kind == cmi::Path::Pident) {
+        for (auto& md : cmi.sig().modtypes)
+          if (md.name == mt->path->id.name) return mt_fields(cmi, md.type, depth + 1);
+      } else if (mt->path->kind == cmi::Path::Pdot && mt->path->a &&
+                 mt->path->a->kind == cmi::Path::Pident) {
+        // A modtype named in a SIBLING submodule of this unit (a functor param
+        // `TableFormat.TABLES`): navigate to the submodule, then its modtype
+        // decl.  The last-name-only lookup above missed it (TABLES is not a
+        // top-level modtype) AND, when two submodules share a modtype name
+        // (menhir's TableFormat.TABLES vs InspectionTableFormat.TABLES), picked
+        // the wrong one -- so a functor argument was passed UNCOERCED, its
+        // fields read at the parameter sig's indices -> wrong values (menhir
+        // MakeEngineTable's T.start/action/log, bootstrap bug #3).
+        for (auto& md : cmi.sig().modules)
+          if (md.name == mt->path->a->id.name)
+            if (const cmi::Signature* ss = mt_sig(cmi, md.type))
+              for (auto& mtd : ss->modtypes)
+                if (mtd.name == mt->path->s) return mt_fields(cmi, mtd.type, depth + 1);
+      }
     }
     return {};
   }

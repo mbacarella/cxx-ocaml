@@ -11082,8 +11082,24 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         for (auto& mit : *f->second)
           if (auto* pmt = std::get_if<Psig_modtype>(&mit.desc))
             if (pmt->name.txt == mtname && pmt->type)
-              if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
-                return signature_to_cmi(ps->items, &modtypes, &module_sigs);
+              if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc)) {
+                // MT's body may cite SIBLING modtypes declared in the head module
+                // (`EngineTypes.TABLE`'s `module Log : LOG with ..` refers to the
+                // sibling `EngineTypes.LOG`) -- pulling MT out via the dotted path
+                // loses that scope, so import the head's own modtype decls before
+                // recursing.  Without them body_sig can't resolve `LOG`, Log's sig
+                // comes out empty, and the .cmi records an empty submodule; a
+                // consumer/functor coercing to that sig then builds an empty block,
+                // so `Log.state` reads field 0 of an atom -> segfault (menhir
+                // MakeEngineTable's result TABLE, bootstrap bug #3).
+                auto sib = modtypes;
+                for (auto& hit : *f->second)
+                  if (auto* hmt = std::get_if<Psig_modtype>(&hit.desc))
+                    if (hmt->type)
+                      if (auto* hps = std::get_if<Pmty_signature>(&hmt->type->desc))
+                        sib[hmt->name.txt] = &hps->items;
+                return signature_to_cmi(ps->items, &sib, &module_sigs);
+              }
     // Cross-module, possibly DEEP (`CamlinternalMenhirLib.IncrementalEngine.
     // INCREMENTAL_ENGINE`): load the head cmi, navigate intermediate submodules,
     // then read the module-type's signature.  Previously only a single-component
