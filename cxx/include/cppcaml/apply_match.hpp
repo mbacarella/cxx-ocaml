@@ -99,7 +99,16 @@ inline Result match(const std::vector<Param>& params, const std::vector<Arg>& ar
       if (args[i].label != 0) return r;  // stray labelled over-app -> bail (ok=false)
       r.leftover.push_back((int)i);
     }
-  if (!r.leftover.empty() && has_omitted) return r;  // over-app + gap: too complex
+  // Over-application past omitted parameters is fine when every omitted slot is
+  // an optional defaulted to None -- the leftover positionals themselves force
+  // the defaults (translcore fills None and applies the leftovers to the
+  // result).  A genuinely pending (eta) omitted parameter with leftover args
+  // remains too complex -> verbatim bail.  (Bailing here is NOT safe on a
+  // labelled call: the verbatim apply passes args in written order, unwrapped
+  // -- bootstrap bug#13 put a longident in Location.aligned_error_hint's fmt.)
+  if (!r.leftover.empty() && has_omitted)
+    for (const Slot& s : r.slots)
+      if (s.omitted && !s.none_fill) return r;
   r.ok = true;
   return r;
 }

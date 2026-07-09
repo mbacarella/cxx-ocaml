@@ -5373,6 +5373,16 @@ struct Checker {
     return t->kind == I::Type::Kind::Constr && is_format_base(t->path);
   }
 
+  // A syntactic format annotation (`(_,_,_) format` / format4 / format6,
+  // possibly qualified).  An annotated expression (`(e : _ format)`, `let f :
+  // _ format = e`) must have the format type pushed INTO it before inference —
+  // OCaml's type_expect types its string literals as formats, and the back end
+  // lowers them to CamlinternalFormatBasics values only when so marked.
+  static bool coretype_is_format(const CoreType& t) {
+    auto* c = std::get_if<Ptyp_constr>(&t.desc);
+    return c && is_format_base(lid_full(c->id.txt));
+  }
+
   // The argument arrow of a format string (printf "%d %s" -> int -> string -> 'r),
   // so a format-consuming application flows argument value-kinds (x:int in
   // `printf "%d" x`).  %a consumes two args, %t one; unknown directives -> Any.
@@ -5536,6 +5546,9 @@ struct Checker {
       record_result_fmt_lits(*l->body);
     } else if (auto* sq = std::get_if<Pexp_sequence>(&e.desc)) {
       record_result_fmt_lits(*sq->e2);
+    } else if (auto* it = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      record_result_fmt_lits(*it->then_);
+      if (it->else_) record_result_fmt_lits(**it->else_);
     }
   }
 
@@ -5581,10 +5594,11 @@ struct Checker {
     // A format-expected expression built from result positions (match/try arms,
     // let/sequence tails): the oracle's type_expect pushes the format type into
     // those positions, so their string literals type as formats and desugar in
-    // the typed tree (`pr "%(%d%)" (match p with A -> "x%d" | ...)`).  Dump-only
-    // (record_fmt_lits_): recording retypes nothing, so inference, the strict
-    // pass, and the back end are untouched.
-    if (record_fmt_lits_ && is_format_constr(expected))
+    // the typed tree (`pr "%(%d%)" (match p with A -> "x%d" | ...)`).  Recording
+    // retypes nothing; in the kinds pass it marks the literals so the back end
+    // LOWERS them as formats (a plain-string lowering is a miscompile: the
+    // value flows into make_printf as a raw string — bootstrap bug#13).
+    if ((record_fmt_lits_ || record_kinds_) && is_format_constr(expected))
       record_result_fmt_lits(e);
     TypePtr t = infer_expr(e);
     // Type-directed bare-constructor resolution: an unqualified constructor we
@@ -5904,9 +5918,17 @@ struct Checker {
       return rt;
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
-      TypePtr et = infer_expr(*ct->e);
+      TypePtr et, at;
       std::unordered_map<std::string, TypePtr> vars;
-      TypePtr at = from_coretype(*ct->t, vars);
+      if (coretype_is_format(*ct->t)) {
+        // `("%s" : _ format)`: push the format type into the expression so its
+        // string literals type (and lower) as formats, not plain strings.
+        at = from_coretype(*ct->t, vars);
+        et = infer_expr_expected(*ct->e, at);
+      } else {
+        et = infer_expr(*ct->e);
+        at = from_coretype(*ct->t, vars);
+      }
       if (strict && expected_clash(et, at))  // (e : T) with e of a clashing type
         note_error("expression does not match the type constraint");
       mark_if_iarray(*ct->e, at);  // `([|..|] : _ iarray)` -> Immutable dump
@@ -7399,7 +7421,11 @@ struct Checker {
       annot_vars_ = saved_av;
       for (size_t i = 0; i < bs.size(); ++i) {
         annot_vars_ = &avmaps[i];
-        TypePtr te = infer_expr(*bs[i].expr);  // check body (best-effort)
+        // check body (best-effort); a format-annotated rec binding pushes the
+        // declared format type into the body (string literals lower as formats)
+        TypePtr te = (bound[i] && is_format_constr(bound[i]))
+                         ? infer_expr_expected(*bs[i].expr, bound[i])
+                         : infer_expr(*bs[i].expr);
         annot_vars_ = saved_av;
         // Pin a plain annotation's flexible holes from the body (display/kind
         // passes): `let rec eval : lexpr -> _ = ..` fills the `_` even when no
@@ -7459,7 +7485,15 @@ struct Checker {
       std::unordered_map<std::string, TypePtr> avars;
       auto* saved_av = annot_vars_; annot_vars_ = &avars;
       eng.enter_level();
-      TypePtr te = infer_expr(*b.expr);
+      // `let f : _ format = e`: build the annotation FIRST and push it into the
+      // body, so string literals in result positions type (and lower) as formats.
+      TypePtr fmt_annot = nullptr;
+      if (b.constraint_)
+        if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_))
+          if (pc->univars.empty() && coretype_is_format(*pc->typ))
+            fmt_annot = from_coretype(*pc->typ, avars);
+      TypePtr te = fmt_annot ? infer_expr_expected(*b.expr, fmt_annot)
+                             : infer_expr(*b.expr);
       TypePtr annot = nullptr;
       // A declared type `let f : T = e`: check the inferred type's identities
       // against T (a distinct local type used where another is declared is an
@@ -7469,7 +7503,7 @@ struct Checker {
       if (b.constraint_)
         if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_)) {
           for (auto& u : pc->univars) newtype_vars[u.txt] = newtype_binding(u.txt);
-          annot = from_coretype(*pc->typ, avars);
+          annot = fmt_annot ? fmt_annot : from_coretype(*pc->typ, avars);
           if (strict && expected_clash(te, annot))
             note_error("type mismatch against declared type");
           mark_if_iarray(*b.expr, annot);  // `let a : _ iarray = [|..|]` -> Immutable
