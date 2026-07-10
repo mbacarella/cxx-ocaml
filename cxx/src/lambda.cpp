@@ -9855,6 +9855,17 @@ struct Translator {
           // (`open Types` then `Variance.(contravariant, covariant)`): resolve it
           // to the full path so its members resolve.
           if (std::string p = opened_submodule_path(dotted); !p.empty()) dotted = p;
+          // a local ALIAS of a unit submodule (typemod's `module
+          // Sig_component_kind = Shape.Sig_component_kind` then `let open
+          // Sig_component_kind in match ..`): open the TARGET so its ctors
+          // shadow same-named ones from earlier opens (Typedtree's
+          // item_declaration block ctors squatted the bare constant ctors --
+          // table_for matched obj_tag on an immediate; bootstrap bug#13)
+          if (auto sa = submod_alias_.find(dotted); sa != submod_alias_.end())
+            dotted = sa->second;
+          if (getenv("CTDBG"))
+            fprintf(stderr, "[CTDBG] expr-open dotted=%s alias=%d\n",
+                    dotted.c_str(), (int)submod_alias_.count(dotted));
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
           else
@@ -15340,6 +15351,22 @@ struct Translator {
         if (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) {
           coerce_store = sig_layout(*pc->mt); coerce = &coerce_store; me = pc->me.get();
           sub_coerce_msig = msig_of_modtype(*pc->mt);
+          // an ascribed local module (`module M : sig val f : ?check:.. -> ..
+          // end = struct .. end`): record each labelled val's sig so `M.f a b`
+          // None-fills the omitted optionals -- a verbatim apply silently
+          // PARTIALLY applies f (typetexp's TyVarEnv.remember_used never ran;
+          // bootstrap bug#13)
+          if (mb.name.txt)
+            if (const Pmty_signature* psig = sig_items_of(*pc->mt))
+              for (auto& sit : psig->items)
+                if (auto* pv = std::get_if<Psig_value>(&sit.desc)) {
+                  FnSig fs = coretype_label_sig(pv->vd.type.get());
+                  for (auto& [k, n2] : fs)
+                    if (k != 0) {
+                      local_member_sig_[*mb.name.txt][pv->vd.name.txt] = fs;
+                      break;
+                    }
+                }
         }
         // No explicit `: S`, but THIS unit's own .mli declares the submodule's
         // field order: coerce the submodule body to it so members the impl gives
@@ -15570,8 +15597,24 @@ struct Translator {
               // param's layout and re-read it empty, so a following `include T`
               // splices nothing and the functor result is short.
               auto rl = module_result_layout(mb.expr);
-              if (auto* pc3 = std::get_if<Pmod_constraint>(&mb.expr.desc))
+              if (auto* pc3 = std::get_if<Pmod_constraint>(&mb.expr.desc)) {
                 msub = msig_of_modtype(*pc3->mt);
+                // an ascribed local module (`module M : sig val f : ?check:..
+                // -> .. end = struct .. end`): record each labelled val's sig
+                // so `M.f a b` None-fills the omitted optionals -- a verbatim
+                // apply silently PARTIALLY applies f (typetexp's TyVarEnv
+                // .remember_used never ran; bootstrap bug#13)
+                if (const Pmty_signature* psig = sig_items_of(*pc3->mt))
+                  for (auto& sit : psig->items)
+                    if (auto* pv = std::get_if<Psig_value>(&sit.desc)) {
+                      FnSig fs = coretype_label_sig(pv->vd.type.get());
+                      for (auto& [k, n2] : fs)
+                        if (k != 0) {
+                          local_member_sig_[nm][pv->vd.name.txt] = fs;
+                          break;
+                        }
+                    }
+              }
               // modsig P3 stage 2: the namespaced Sig of the RHS when it
               // agrees with the flat layout in use (a functor marker compares
               // its innermost result); disagreement keeps the flat Unknown Sig

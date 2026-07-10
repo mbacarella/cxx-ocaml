@@ -3796,18 +3796,47 @@ struct Checker {
   void open_module_ctors(const Longident& modid) {
     auto* pl = std::get_if<Lident>(&modid.v);
     if (!pl) return;  // single-name modules only (matches qualified_ctor_scheme)
+    // `open M` where M is a local ALIAS of a unit SUBMODULE (typemod's `module
+    // Sig_component_kind = Shape.Sig_component_kind` then `let open
+    // Sig_component_kind in match ..`): open the TARGET's ctors, result-typed
+    // at the full dotted path, so the match rows record a dotted pat_constr
+    // and the back end force-registers the right type -- otherwise the bare
+    // constant ctors resolved to Typedtree.item_declaration's same-named BLOCK
+    // ctors and the match tag-tested immediates (bootstrap bug#13).
+    std::string path = pl->name;
+    if (auto f = local_module_paths_.find(pl->name);
+        f != local_module_paths_.end() && !f->second.empty() &&
+        f->second.find('.') != std::string::npos)
+      path = f->second;
+    std::vector<std::string> comps;
+    for (size_t p0 = 0;;) {
+      size_t q = path.find('.', p0);
+      comps.push_back(
+          path.substr(p0, q == std::string::npos ? std::string::npos : q - p0));
+      if (q == std::string::npos) break;
+      p0 = q + 1;
+    }
     try {
-      auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* msig = &loaded.back().sig();
+      for (size_t i = 1; i < comps.size() && msig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : msig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        msig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (!msig) return;
       // Qualify (not expand) same-module ctor-arg types, as in qualified_ctor_scheme
       // -- so `Seq.(Cons (.., tail))` gives the tail `Seq.t`, matching the explicit
       // `Seq.Cons` path (ocamlc's per-occurrence path).
       auto* saved_ctx = cmi_types_ctx_;
       std::string saved_pfx = cmi_mod_prefix_;
       bool saved_fold = fold_abbrevs_;
-      cmi_types_ctx_ = &cmi.types();
-      cmi_mod_prefix_ = pl->name;
+      cmi_types_ctx_ = &msig->types;
+      cmi_mod_prefix_ = path;
       fold_abbrevs_ = true;
-      for (auto& td : cmi.types()) {
+      for (auto& td : msig->types) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors) {
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
@@ -3818,7 +3847,7 @@ struct Checker {
             params.push_back(v);
           }
           TypePtr result = c.res ? from_cmi(c.res, memo)
-                                 : eng.constr(pl->name + "." + td.name, params);
+                                 : eng.constr(path + "." + td.name, params);
           // An inline-record ctor (`C : { f : .. } -> ..`) mirrors the local
           // registration: scheme = result only, fields via field_candidates_
           // (a pattern `C { f }` resolves f through the field registry).
@@ -3842,7 +3871,7 @@ struct Checker {
       // Module-level EXTENSION ctors (`exception Unix_error of error * string
       // * string`): register like variant ctors, so a bare `Unix_error (e,_,_)`
       // after `open Unix` resolves with its real arity (and flattens).
-      for (auto& x : cmi.sig().typexts) {
+      for (auto& x : msig->typexts) {
         if (x.is_inline_record) continue;
         std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
         TypePtr result;
@@ -3850,7 +3879,7 @@ struct Checker {
         else {
           std::string tp = x.type_path ? cmi_path_str(*x.type_path) : "exn";
           result = eng.constr(tp == "exn" || tp.find('.') != std::string::npos
-                                  ? tp : pl->name + "." + tp);
+                                  ? tp : path + "." + tp);
         }
         TypePtr scheme = result;
         for (auto it = x.args.rbegin(); it != x.args.rend(); ++it)
@@ -8544,6 +8573,21 @@ struct Checker {
           }
         } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
           if (mb->binding.name.txt) {
+            // Record the alias TARGET path (`module Sig_component_kind =
+            // Shape.Sig_component_kind`) so a later `open Sig_component_kind`
+            // opens the target's ctors (open_module_ctors; bootstrap bug#13).
+            // ONLY plain module-path aliases: recording a functor/struct
+            // binding (empty path) poisoned resolve_local_module_path for a
+            // later `open F(X)` (shallow2deep's MkReify(PC).event collapsed).
+            if (!strict &&
+                std::holds_alternative<Pmod_ident>(mb->binding.expr.desc)) {
+              std::string p = resolve_local_module_path(mb->binding.expr);
+              if (!p.empty()) {
+                auto [f, ins] =
+                    local_module_paths_.emplace(*mb->binding.name.txt, p);
+                if (!ins && f->second != p) f->second = "";  // conflicting rebind
+              }
+            }
             // A functor: record its body's exports as the application result.
             const ModuleExpr* me = &mb->binding.expr;
             // `module M : sig .. end = ..`: keep the ascription signature so a
