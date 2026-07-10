@@ -6358,12 +6358,14 @@ struct Translator {
         lhsp = effective_pat(pa->p.get());
       }
       if (is_catchall(*lhsp)) {  // `_`/var: handle (guard permitting)
+        scope.emplace_back();  // the binder scopes over its arm (guard+body) only
         if (auto* pv = std::get_if<Ppat_var>(&lhsp->desc)) scope.back()[pv->name.txt] = exn;
         for (auto& nm : row_aliases) scope.back()[nm] = exn;
-        if (!c.guard) return expr(*c.rhs);
+        if (!c.guard) { LamPtr b = expr(*c.rhs); scope.pop_back(); return b; }
         // `with x when g -> body`: test the guard, else fall to the rest.
         auto iff = mk(Lam::K::IfThenElse);
         iff->cond = expr(*c.guard); iff->then_ = expr(*c.rhs);
+        scope.pop_back();
         iff->else_ = exn_dispatch(exn, rows, i + 1);
         return iff;
       }
@@ -8457,8 +8459,10 @@ struct Translator {
     int nt = count_tests(pat);
     if (nt <= 0 || nt >= 999) return nullptr;  // pure var / unsupported -> existing path
     if (nt == 1) {  // single test: inline the fallback as the else branch
+      scope.emplace_back();  // the catch-all binder scopes over its arm only
       bind_catchall(*rows[1].lhs, scrut);
       LamPtr fb = expr(*rows[1].rhs);
+      scope.pop_back();
       scope.emplace_back();
       LamPtr m = match_pat(scrut, pat, [&] { return expr(*rows[0].rhs); }, fb);
       scope.pop_back();
@@ -8470,8 +8474,10 @@ struct Translator {
     LamPtr m = match_pat(scrut, pat, [&] { return expr(*rows[0].rhs); }, exitL);
     scope.pop_back();
     if (!m) { --next_exit_; return nullptr; }
+    scope.emplace_back();  // the catch-all binder scopes over its arm only
     bind_catchall(*rows[1].lhs, scrut);
     LamPtr fb = expr(*rows[1].rhs);
+    scope.pop_back();
     auto c = mk(Lam::K::Catch); c->cond = m; c->prim_arg = eid; c->then_ = fb;
     return c;
   }
@@ -8564,9 +8570,20 @@ struct Translator {
         if (!r.guard)
           if (auto* pv = std::get_if<Ppat_var>(&r.lhs->desc)) {
             Ident nid = fresh(pv->name.txt);
-            scope.back()[pv->name.txt] = nid;
+            // The binder scopes over THIS match only -- save/restore the
+            // frame entry.  It previously leaked into the code AFTER the
+            // match: mtype.ml's remove_aliases_mty epilogue `(pres, mty)`
+            // read the `| mty ->` arm's binder (out of stack scope by then,
+            // so bytegen emitted a bogus env access) and the bootstrapped
+            // ocamlc fed a closure into Subst on every functor declaration.
+            auto& frame = scope.back();
+            bool had = frame.count(pv->name.txt) != 0;
+            Ident saved = had ? frame[pv->name.txt] : Ident{};
+            frame[pv->name.txt] = nid;
             auto v = mk(Lam::K::Var); v->var = nid;
             auto body = compile_match(v, rows, mloc);
+            if (had) scope.back()[pv->name.txt] = saved;
+            else scope.back().erase(pv->name.txt);
             auto l = mk(Lam::K::Let);
             l->bindings = {{nid, ValueKind::Gen, scrut, is_field_access(scrut)}};
             l->body = body;
@@ -8605,8 +8622,10 @@ struct Translator {
         auto exitL = mk(Lam::K::Staticraise); exitL->prim_arg = eid;
         std::vector<Row> inner(rows.begin(), rows.end() - 1);
         if (LamPtr body = ctor_match(scrut, inner, mloc, exitL)) {
+          scope.emplace_back();  // the catch-all binder scopes over its arm only
           bind_catchall(*rows.back().lhs, scrut);
           LamPtr fb = expr(*rows.back().rhs);
+          scope.pop_back();
           auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = eid; c->then_ = fb;
           return c;
         }
@@ -8894,8 +8913,11 @@ struct Translator {
   LamPtr ext_match_arm(const Ident& sid, const std::vector<Row>& rows, size_t i) {
     auto sv = [&] { auto v = mk(Lam::K::Var); v->var = sid; return v; };
     if (i + 1 == rows.size()) {
+      scope.emplace_back();  // the catch-all binder scopes over its arm only
       bind_catchall(*rows[i].lhs, sv());
-      return expr(*rows[i].rhs);
+      LamPtr b = expr(*rows[i].rhs);
+      scope.pop_back();
+      return b;
     }
     const Pattern* lp = effective_pat(rows[i].lhs);
     std::vector<std::string> aliases;
@@ -11008,6 +11030,37 @@ struct Translator {
           if (ety != cip->type)
             if (auto ti = type_ctor_info_.find(ety); ti != type_ctor_info_.end())
               if (auto ci2 = ti->second.find(n); ci2 != ti->second.end()) cip = &ci2->second;
+        }
+      }
+      // The flat entry's ARITY can belong to another type sharing the ctor
+      // name (`Named` exists at arities 1/2/3): when it disagrees with the
+      // WRITTEN application shape, re-resolve through the node's inferred
+      // constructed type -- typemod's typedtree `Named (id, param, mty)` was
+      // built arity-1 (all three args wrapped in one tuple field), and
+      // Tast_iterator walked garbage on every functor declaration.  Only a
+      // candidate whose arity matches the written shape overrides.
+      if (cip && !qci && k->arg && cip->is_block && cip->rlabels.empty()) {
+        auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+        int written = at ? (int)at->elems.size() : 1;
+        if (cip->arity != written) {
+          if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end()) {
+            std::string ety = ec->second, emod;
+            if (auto d = ety.rfind('.'); d != std::string::npos) {
+              emod = ety.substr(0, d); ety = ety.substr(d + 1);
+            }
+            const CtorInfo* better = nullptr;
+            if (auto ti = type_ctor_info_.find(ety); ti != type_ctor_info_.end())
+              if (auto c2 = ti->second.find(n); c2 != ti->second.end())
+                better = &c2->second;
+            if (!better && !emod.empty() &&
+                !module_base(emod.substr(0, emod.find('.')))) {
+              auto& tl = module_type_ctors(emod, ety);
+              for (auto& [nm2, info2] : tl)
+                if (nm2 == n) { better = &info2; break; }
+            }
+            if (better && better->is_block && better->arity == written)
+              cip = better;
+          }
         }
       }
       if (cip && !exn_shadows) {
