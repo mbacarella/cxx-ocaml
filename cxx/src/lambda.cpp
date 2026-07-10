@@ -6374,7 +6374,13 @@ struct Translator {
               auto t = mk(Lam::K::Prim);
               if (it->string_eq) { t->prim = Prim::Ccall; t->prim_id = "caml_string_equal"; }
               else { t->prim = Prim::IntCmp; t->prim_id = "=="; }
-              t->args = {fieldimm(it->idx, exv()), it->rhs};
+              LamPtr lhsf = fieldimm(it->idx, exv());
+              if (it->tag_test) {
+                auto tg = mk(Lam::K::Prim); tg->prim = Prim::Ccall;
+                tg->prim_id = "caml_obj_tag"; tg->args = {lhsf};
+                lhsf = tg;
+              }
+              t->args = {lhsf, it->rhs};
               auto pf = mk(Lam::K::IfThenElse);
               pf->cond = t; pf->then_ = then; pf->else_ = exitL();
               then = pf;
@@ -6437,7 +6443,11 @@ struct Translator {
     }
     return {};
   }
-  struct PayloadTest { int idx; LamPtr rhs; bool string_eq; };
+  struct PayloadTest { int idx; LamPtr rhs; bool string_eq;
+                       // tag_test: compare caml_obj_tag(field idx) against rhs
+                       // (a block variant-ctor payload; an immediate's tag is
+                       // out of range so no separate isint guard is needed)
+                       bool tag_test = false; };
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
                        const Expression& rhs,
                        std::vector<PayloadTest>* tests = nullptr,
@@ -6542,6 +6552,45 @@ struct Translator {
           continue;
         }
         ok = false;
+      } else if (auto* kc = std::get_if<Ppat_construct>(&fp->desc);
+                 kc && kc->arg && tests) {
+        // a BLOCK variant-ctor payload with simple binders
+        // (`Error.In_context (Lookup_error (loc, env, err))`, env.ml's
+        // lookup_all_labels wrapper): tag-test the payload field, bind the
+        // ctor's args off a payload temp.  Without this the whole arm was
+        // dropped to a bare reraise, so the deferred lookup error escaped.
+        if (std::holds_alternative<Lident>(kc->id.txt.v))
+          register_opened_ctor(ctor_of(*fp));
+        auto ci = ctor_info_.find(ctor_of(*fp));
+        ok = false;
+        if (ci != ctor_info_.end() && ci->second.is_block &&
+            !ci->second.unboxed && ci->second.rlabels.empty()) {
+          int carity = ci->second.arity;
+          auto cfps = ctor_field_pats(kc, carity);
+          if ((int)cfps.size() == carity) {
+            Ident tv = fresh("", true);
+            std::vector<std::pair<Ident, LamPtr>> sb;
+            bool sok = true;
+            for (int p = 0; sok && p < carity; ++p) {
+              const Pattern* sp = effective_pat(cfps[p]);
+              if (std::holds_alternative<Ppat_any>(sp->desc)) continue;
+              if (std::holds_alternative<Ppat_var>(sp->desc) ||
+                  std::holds_alternative<Ppat_alias>(sp->desc)) {
+                auto tvv = mk(Lam::K::Var); tvv->var = tv;
+                sok = collect_binders(*sp, fieldimm(p, tvv), sb);
+              } else
+                sok = false;
+            }
+            if (sok) {
+              tests->push_back({j + 1, cint(ci->second.tag), false,
+                                /*tag_test=*/true});
+              temps.push_back({tv, acc});
+              sub_binders.push_back(std::move(sb));
+              ok = true;
+              continue;
+            }
+          }
+        }
       } else if (auto* pc = std::get_if<Ppat_constant>(&fp->desc); pc && tests) {
         // constant payload (`Ex "!!!!!"`, `Code 42`): value test on the field
         if (auto* ps = std::get_if<Pconst_string>(&pc->c.desc)) {
@@ -8824,7 +8873,13 @@ struct Translator {
         auto t = mk(Lam::K::Prim);
         if (it->string_eq) { t->prim = Prim::Ccall; t->prim_id = "caml_string_equal"; }
         else { t->prim = Prim::IntCmp; t->prim_id = "=="; }
-        t->args = {fieldimm(it->idx, sv()), it->rhs};
+        LamPtr lhsf = fieldimm(it->idx, sv());
+        if (it->tag_test) {
+          auto tg = mk(Lam::K::Prim); tg->prim = Prim::Ccall;
+          tg->prim_id = "caml_obj_tag"; tg->args = {lhsf};
+          lhsf = tg;
+        }
+        t->args = {lhsf, it->rhs};
         auto pf = mk(Lam::K::IfThenElse);
         pf->cond = t; pf->then_ = body; pf->else_ = exitL();
         body = pf;

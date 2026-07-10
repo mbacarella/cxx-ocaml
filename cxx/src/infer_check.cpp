@@ -144,6 +144,12 @@ struct Checker {
                  // (`Buffer.t`), used when the folded pass keeps the name
                  std::string display_path; };
   std::unordered_map<std::string, Alias> type_aliases;
+  // `type t := rhs` (Psig_typesubst): every following citation of `t` is
+  // REPLACED by rhs (the decl itself takes no signature item).  Unlike
+  // type_aliases these expand unconditionally -- printtyp.mli's
+  // `type namespace := Shape.Sig_component_kind.t` must substitute into each
+  // val or the vals degrade to a free 'a.
+  std::unordered_map<std::string, Alias> type_substs_;
   // stamped (opaque) module-nested decls: stamp -> qualified display path
   std::unordered_map<int, std::string> stamp_path_;
   // module prefixes ("A.") whose contents are re-exported bare by a top-level
@@ -870,7 +876,14 @@ struct Checker {
     if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
       std::vector<TypePtr> es;
       for (auto& e : tu->elems) es.push_back(from_coretype(*e, vars));
-      return eng.tuple(std::move(es));
+      TypePtr r = eng.tuple(std::move(es));
+      // A LABELED tuple (`arg_label list * is_ret_tvar:bool`, ctype.mli):
+      // keep the component labels ("" = unlabeled) -- `labels` is otherwise
+      // unused on a Tuple node.  Dropping them made the cmi a plain tuple,
+      // so a consumer's labeled pattern failed to match.
+      if (!tu->labels.empty())
+        for (auto& l : tu->labels) r->labels.push_back(l ? *l : "");
+      return r;
     }
     // `'a 'b. t` (method poly types): the quantified body, vars as fresh.
     if (auto* pl = std::get_if<Ptyp_poly>(&t.desc))
@@ -1129,6 +1142,21 @@ struct Checker {
       // Expand a known type abbreviation (type (params) name = manifest), with a
       // recursion guard so a cyclic/recursive abbreviation falls back to opaque.
       std::string nm = lid_last(c->id.txt);
+      // A `type t := rhs` substitution: a BARE citation of t expands to rhs
+      // unconditionally (the subst is erased from the signature, so keeping
+      // the name would cite nothing).
+      if (std::holds_alternative<Lident>(c->id.txt.v))
+        if (auto si = type_substs_.find(nm);
+            si != type_substs_.end() && !expanding_.count(nm) &&
+            si->second.params.size() == as.size()) {
+          std::unordered_map<std::string, TypePtr> sub;
+          for (size_t i = 0; i < as.size(); ++i)
+            if (!si->second.params[i].empty()) sub[si->second.params[i]] = as[i];
+          expanding_.insert(nm);
+          TypePtr r = from_coretype(*si->second.manifest, sub);
+          expanding_.erase(nm);
+          return r;
+        }
       auto ai = type_aliases.find(nm);
       // DISPLAY pass, variant abbreviation (`type 'a lambda = [ `Var .. ]` used
       // as `_ lambda`): expand to the ROW so it unifies with the body's rows
@@ -10041,7 +10069,10 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
     case K::Tuple: {
       std::vector<cmi::cmiw::TyPtr> as;
       for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));
-      return cmi::cmiw::ty_tuple(std::move(as));
+      auto r = cmi::cmiw::ty_tuple(std::move(as));
+      // Labeled-tuple component labels ride pv_tags ("" = unlabeled).
+      if (!t->labels.empty()) r->pv_tags = t->labels;
+      return r;
     }
     case K::Constr: {
       // A generalized rigid newtype (`let f (type t) () = ..` escaping into
@@ -10086,9 +10117,11 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
         path = as.size() == 3   ? "format"
              : as.size() == 4   ? "format4"
                                 : "CamlinternalFormatBasics.format6";
-      // Lazy.t is the public Stdlib abbreviation of CamlinternalLazy.t; ocamlc
-      // stores the abbreviation, so emit it too rather than the internal name.
-      else if (path == "CamlinternalLazy.t") path = "Lazy.t";
+      // (A source-written `CamlinternalLazy.t` stays as written: ocamlc stores
+      // the declared path -- lazy.mli's own `type 'a t = 'a CamlinternalLazy.t`
+      // must cite the internal unit, not fold back to `Lazy.t` (self-capture).
+      // The engine's inferred lazies are canonical `lazy_t`, not this path, so
+      // no display back-map is needed here.)
       auto r = cmi::cmiw::ty_constr(path, std::move(as));
       r->engine_stamp = t->stamp;  // decl identity for shadow-aware citation
       if (getenv("BRIDGEDBG"))
@@ -10909,6 +10942,8 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
     item.ext_path = typext_path(ck, ext->path.txt);
     item.ext_params = typext_param_names(*ext);
     item.text_kind = first ? 0 : 1;  // Text_first / Text_next
+    // `type exn += private In_context of error` (env.mli): ext_private.
+    item.type_private = ext->priv == PrivateFlag::Private;
     if (item.ext_path == "eff") {
       for (auto& c : item.ctors) {
         for (auto& a : c.args) rewrite_eff_back(a);
@@ -11163,10 +11198,11 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
   }
 }
 
-std::vector<cmi::cmiw::SigItem> signature_to_cmi(
+static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     const ast::Signature& s,
     const std::unordered_map<std::string, const ast::Signature*>* outer,
-    const std::unordered_map<std::string, const ast::Signature*>* outer_mods) {
+    const std::unordered_map<std::string, const ast::Signature*>* outer_mods,
+    const Checker* outer_ck) {
   Checker ck;
   ck.record_kinds_ = true;
   ck.keep_local_abbrevs_ = true;  // verbatim path: `t` stays `t`, not its manifest
@@ -11175,6 +11211,17 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
   // `unit -> float Seq.node` (floatarray's module type S).
   ck.fold_abbrevs_ = true;
   ck.eng.lenient = true;  // fold_abbrevs_ requires best-effort unification
+  // A nested signature (`module Lazy : sig .. end` after a top-level
+  // `open Types`) sees the enclosing scope's opens: without inheriting them a
+  // nested `Uid.t` was written as a bare GLOBAL `Uid` (no such unit) instead of
+  // `Types.Uid.t` (subst.mli's mdl_uid, data_types.mli's cstr_uid).  Local
+  // decls in the nested sig still shadow: the pre-pass below erases entries.
+  if (outer_ck) {
+    ck.opened_type_quals_ = outer_ck->opened_type_quals_;
+    ck.opened_submod_quals_ = outer_ck->opened_submod_quals_;
+    ck.opened_modtype_quals_ = outer_ck->opened_modtype_quals_;
+    ck.type_substs_ = outer_ck->type_substs_;
+  }
   // Collect `module type S = sig .. end` so a functor result `: S` (Map.Make)
   // can be resolved to S's signature items.  Inherit ENCLOSING modtypes too: a
   // nested signature (`module type S = sig include Thing; module Map : Map end`
@@ -11218,7 +11265,26 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         // everything typed against that cmi walked garbage (bootstrap #13).
         // A LATER `open` re-seeds the entry, preserving open-over-decl order.
         ck.opened_type_quals_.erase(d.name.txt);
+        ck.type_substs_.erase(d.name.txt);  // a real decl shadows a `:=`
       }
+    // Same shadowing rule for a locally-declared module vs an opened (or
+    // inherited) submodule qual: `module Uid : sig .. end` here must not have
+    // `Uid.t` requalify through an earlier `open Types`.
+    if (auto* pmd = std::get_if<Psig_module>(&it.desc))
+      if (pmd->md.name.txt) ck.opened_submod_quals_.erase(*pmd->md.name.txt);
+    // `type t := rhs`: register the substitution (citations expand to rhs;
+    // the item itself is erased from the emitted signature).
+    if (auto* pts = std::get_if<Psig_typesubst>(&it.desc))
+      for (auto& d : pts->decls)
+        if (d.manifest) {
+          Checker::Alias al;
+          for (auto& p : d.params)
+            al.params.push_back(std::holds_alternative<Ptyp_var>(p->desc)
+                                    ? std::get<Ptyp_var>(p->desc).name : "");
+          al.manifest = d.manifest->get();
+          ck.type_substs_[d.name.txt] = std::move(al);
+          ck.opened_type_quals_.erase(d.name.txt);
+        }
     if (auto* pmt = std::get_if<Psig_modtype>(&it.desc))
       if (pmt->type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
@@ -11259,6 +11325,9 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         // its bare type names must resolve qualified (`term` -> `Terms.term`)
         // or every declared use degrades to a fresh var (misc-kb .mli files).
         ck.load_open_type_quals(po->id.txt);
+        // Its submodules too: `open Types` then `Uid.t` must cite
+        // `Types.Uid.t`, not a bare global `Uid` (data_types.mli).
+        ck.load_open_submod_quals(po->id.txt);
       }
     }
   }
@@ -11394,7 +11463,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       if (fn->name.txt) param = *fn->name.txt;
       if (fn->type) {
         if (const ast::Signature* psg = body_sig(*fn->type))
-          param_sig = signature_to_cmi(*psg, &modtypes, &module_sigs);
+          param_sig = signature_to_cmi_i(*psg, &modtypes, &module_sigs, &ck);
         else
           param_sig = qual_modtype_items(*fn->type);
         apply_with_constraints(ck, *fn->type, param_sig);
@@ -11423,7 +11492,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         if (fn2->name.txt) p.name = *fn2->name.txt;
         if (fn2->type) {
           if (const ast::Signature* psg2 = body_sig(*fn2->type))
-            p.sig = signature_to_cmi(*psg2, &modtypes, &module_sigs);
+            p.sig = signature_to_cmi_i(*psg2, &modtypes, &module_sigs, &ck);
           else
             p.sig = qual_modtype_items(*fn2->type);
           apply_with_constraints(ck, *fn2->type, p.sig);
@@ -11436,7 +11505,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     }
     std::vector<cmi::cmiw::SigItem> result;
     if (const ast::Signature* rs = body_sig(*body))
-      result = signature_to_cmi(*rs, &modtypes, &module_sigs);
+      result = signature_to_cmi_i(*rs, &modtypes, &module_sigs, &ck);
     else
       result = qual_modtype_items(*body);
     apply_with_constraints(ck, *body, result);
@@ -11506,7 +11575,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         if (!md.name.txt || !md.type) continue;
         std::vector<cmi::cmiw::SigItem> items;
         if (const ast::Signature* bs = body_sig(*md.type))
-          items = signature_to_cmi(*bs, &modtypes, &module_sigs);
+          items = signature_to_cmi_i(*bs, &modtypes, &module_sigs, &ck);
         else
           items = qual_modtype_items(*md.type);
         apply_with_constraints(ck, *md.type, items);
@@ -11521,7 +11590,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
       if (pm->md.name.txt && pm->md.type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt,
-                                              signature_to_cmi(ps->items, &modtypes, &module_sigs)));
+                                              signature_to_cmi_i(ps->items, &modtypes, &module_sigs, &ck)));
         else if (auto* al = std::get_if<Pmty_alias>(&pm->md.type->desc)) {
           // `module M = Target` (stdlib.mli's `module List = Stdlib__List`, or a
           // DOTTED target like types.mli's `module Uid = Shape.Uid`).  Emit the
@@ -11538,7 +11607,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           // `module MD5 : S` (a NAMED module type) or `S with ...`: emit the
           // submodule with S's resolved signature inline, so a consumer can
           // resolve `Digest.MD5.bytes` to its field (else the module is dropped).
-          auto items = signature_to_cmi(*bs, &modtypes, &module_sigs);
+          auto items = signature_to_cmi_i(*bs, &modtypes, &module_sigs, &ck);
           apply_with_constraints(ck, *pm->md.type, items);
           drop_modsubst(items, with_modsubst_names(*pm->md.type));
           auto mitem = cmi::cmiw::sig_module(*pm->md.name.txt, std::move(items));
@@ -11592,7 +11661,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         out.push_back(cmi::cmiw::sig_modtype_abstract(pmt->name.txt));
       else if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
         out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt,
-                                             signature_to_cmi(ps->items, &modtypes, &module_sigs)));
+                                             signature_to_cmi_i(ps->items, &modtypes, &module_sigs, &ck)));
       else if (auto* pf = std::get_if<Pmty_functor>(&pmt->type->desc)) {
         // `module type F = functor (X : _) -> ..` (w53's TestInlineSig): the body
         // is a functor type -- emit Mty_functor, not a signature.
@@ -11605,7 +11674,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         if (!std::holds_alternative<Lapply>(pid->id.txt.v)) {
           std::vector<cmi::cmiw::SigItem> sub;
           if (const ast::Signature* bs = body_sig(*pmt->type))
-            sub = signature_to_cmi(*bs, &modtypes, &module_sigs);
+            sub = signature_to_cmi_i(*bs, &modtypes, &module_sigs, &ck);
           else
             sub = qual_modtype_items(*pmt->type);
           auto s = cmi::cmiw::sig_modtype(pmt->name.txt, std::move(sub));
@@ -11756,7 +11825,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
           }
       } else if (const ast::Signature* bs = body_sig(pinc->mt)) {
         // `include S` (named local modtype) / `include sig .. end`
-        auto items = signature_to_cmi(*bs, &modtypes, &module_sigs);
+        auto items = signature_to_cmi_i(*bs, &modtypes, &module_sigs, &ck);
         // Type-level `with` refinements only: module substitutions in an
         // include are left to the existing layout handling (lambda.cpp's AST
         // walk doesn't apply them, and cmi/cmo layouts must agree).
@@ -11806,6 +11875,13 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     }
   }
   return out;
+}
+
+std::vector<cmi::cmiw::SigItem> signature_to_cmi(
+    const ast::Signature& s,
+    const std::unordered_map<std::string, const ast::Signature*>* outer,
+    const std::unordered_map<std::string, const ast::Signature*>* outer_mods) {
+  return signature_to_cmi_i(s, outer, outer_mods, nullptr);
 }
 
 // All variable binders of a top-level let pattern, in source (left-to-right)

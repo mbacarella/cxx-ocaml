@@ -1363,7 +1363,14 @@ struct TyEmit {
       }
       case Ty::Tuple: {
         std::vector<o::ValPtr> elems;
-        for (auto& e : t->args) elems.push_back(o::vblock(0, {o::vint(0) /*None*/, emit(e)}));  // (label,ty)
+        for (std::size_t k = 0; k < t->args.size(); ++k) {
+          // Labeled-tuple component labels ride pv_tags ("" = unlabeled).
+          o::ValPtr lbl =
+              k < t->pv_tags.size() && !t->pv_tags[k].empty()
+                  ? o::vblock(0, {o::vstr(t->pv_tags[k])})  // Some label
+                  : o::vint(0);                             // None
+          elems.push_back(o::vblock(0, {lbl, emit(t->args[k])}));  // (label,ty)
+        }
         return texpr(o::vblock(2, {o::vlist(elems)}));  // Ttuple of (so * te) list
       }
       case Ty::Variant: {
@@ -1559,6 +1566,57 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   for (std::size_t i = 0; i < items.size(); ++i)
     if (items[i].k == SigItem::Type && items[i].engine_stamp)
       visible_eng[items[i].engine_stamp] = item_stamp[i];
+  // Decl-order visibility for TYPE declarations: signature items scope in
+  // order -- a type's manifest/body sees EARLIER siblings and its own rec
+  // group (`type t .. and u ..`), but not later decls, and under `nonrec`
+  // not the group being declared either.  shape.mli's `module Map : sig
+  // type shape = t  type nonrec t = t Item.Map.t end` cites the ENCLOSING
+  // Shape.t in both -- the flat `visible` map self-captured them to Map's
+  // own t.  Values keep the flat map (ocamlc binds a val's citations against
+  // the final sig, and inferred .ml items may sit before their type).
+  // type_vis_end[i] = index below which local type/class names are in scope
+  // for item i's own emission; items.size() = no restriction (flat map).
+  std::vector<std::size_t> type_vis_end(items.size(), items.size());
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (items[i].k != SigItem::Type || items[i].rec_status == 0) continue;
+    std::size_t h = i;  // group head (rec_status 1 or -1)
+    while (h > 0 && items[h].rec_status == 2 && items[h].k == SigItem::Type)
+      --h;
+    std::size_t e = h + 1;  // one past the group's last member
+    while (e < items.size() && items[e].k == SigItem::Type &&
+           items[e].rec_status == 2)
+      ++e;
+    // nonrec: the group's own names are NOT visible in its bodies.
+    type_vis_end[i] = items[h].rec_status == -1 ? h : e;
+  }
+  std::map<std::size_t, std::unordered_map<std::string, int>> ordvis_cache;
+  auto ordered_types = [&](std::size_t end) {
+    auto f = ordvis_cache.find(end);
+    if (f == ordvis_cache.end()) {
+      std::unordered_map<std::string, int> m;
+      if (outer_types) m = *outer_types;
+      for (std::size_t j = 0; j < end; ++j) {
+        if (items[j].k == SigItem::Type) m[items[j].name] = item_stamp[j];
+        if (items[j].k == SigItem::Class)
+          m[items[j].name] = item_stamp[j] + (items[j].class_is_type ? 1 : 2);
+      }
+      f = ordvis_cache.emplace(end, std::move(m)).first;
+    }
+    return &f->second;
+  };
+  std::map<std::size_t, std::unordered_map<int, int>> ordeng_cache;
+  auto ordered_eng = [&](std::size_t end) {
+    auto f = ordeng_cache.find(end);
+    if (f == ordeng_cache.end()) {
+      std::unordered_map<int, int> m;
+      if (outer_eng) m = *outer_eng;
+      for (std::size_t j = 0; j < end; ++j)
+        if (items[j].k == SigItem::Type && items[j].engine_stamp)
+          m[items[j].engine_stamp] = item_stamp[j];
+      f = ordeng_cache.emplace(end, std::move(m)).first;
+    }
+    return &f->second;
+  };
   // Scope stack of per-level visible-types maps (outermost..this level): a
   // `with type`-spliced manifest resolves its bare names in the scope where
   // the constraint was WRITTEN (with_scope_skip levels up), never against the
@@ -1849,7 +1907,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       auto extcon = o::vblock(0, {path,
                                   tparams.empty() ? o::vint(0) : o::vlist(tparams),  // ext_type_params
                                   cargs, ret,
-                                  o::vint(1) /*ext_private Public*/,
+                                  o::vint(it.type_private ? 0 : 1) /*ext_private*/,
                                   loc_none(), o::vint(0) /*ext_attributes*/, o::vint(0) /*ext_uid*/});
       sig.push_back(o::vblock(2, {ident, extcon, o::vint(status),
                                   o::vint(0) /*Exported*/}));  // Sig_typext
@@ -2017,6 +2075,12 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
       // alias (`type t = manifest`).  Variant/record kinds: the climb.
       std::vector<o::ValPtr> ps;
+      // Decl-order scoping (see type_vis_end above): this decl's own citation
+      // maps exclude later siblings / a nonrec self so they resolve outward.
+      if (type_vis_end[i] != items.size()) {
+        te.local_types = ordered_types(type_vis_end[i]);
+        te.engine_types = ordered_eng(type_vis_end[i]);
+      }
       // A `with type`-spliced decl: its params+manifest were written
       // with_scope_skip levels up, so bare names there resolve against THAT
       // scope's types (no capture by the refined sig's own decls).  The kind
