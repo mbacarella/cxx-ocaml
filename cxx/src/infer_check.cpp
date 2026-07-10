@@ -11793,7 +11793,20 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       // .cmi records M's values (with prim flags) and types -- otherwise the
       // included members are absent and the field layout is short of the .cmo.
       if (auto* pto = std::get_if<Pmty_typeof>(&pinc->mt.desc)) {
-        if (auto* pi = std::get_if<Pmod_ident>(&pto->me->desc))
+        // `include module type of struct include List end` (the classic
+        // de-aliasing idiom, misc.mli's Stdlib.List): resolve the inner
+        // include's target like a plain `module type of List`, but WITHOUT
+        // strengthening -- the struct-include re-binds the types as their
+        // own decls (`type 'a t = 'a list` stays the source manifest).
+        const ast::Pmod_ident* pi = std::get_if<Pmod_ident>(&pto->me->desc);
+        bool via_struct_include = false;
+        if (!pi)
+          if (auto* ms = std::get_if<Pmod_structure>(&pto->me->desc);
+              ms && ms->items.size() == 1)
+            if (auto* inc2 = std::get_if<Pstr_include>(&ms->items[0].desc))
+              if ((pi = std::get_if<Pmod_ident>(&inc2->expr.desc)))
+                via_struct_include = true;
+        if (pi)
           if (!std::holds_alternative<Lapply>(pi->id.txt.v)) {
             // A LOCAL struct module shadows a compilation unit of the same
             // name: splice its already-emitted items (t02's Gee).
@@ -11817,7 +11830,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
               auto t = resolve_typeof_path(g_enclosing_struct_items,
                                            lid_full(pi->id.txt));
               if (t.ok) {
-                if (t.through_alias)
+                if (t.through_alias && !via_struct_include)
                   strengthen_abstract(t.items, t.norm, false);
                 for (auto& si : t.items) out.push_back(std::move(si));
               }
