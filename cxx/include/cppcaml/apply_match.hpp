@@ -107,11 +107,21 @@ inline Result match(const std::vector<Param>& params, const std::vector<Arg>& ar
   r.slots.resize(last_arg + 1);        // drop trailing omitted (params beyond the call)
   bool has_omitted = false;
   for (const Slot& s : r.slots) if (s.omitted) has_omitted = true;
+  size_t stray_labelled = 0;
   for (size_t i = 0; i < args.size(); ++i)
     if (!used[i]) {
-      if (args[i].label != 0) return r;  // stray labelled over-app -> bail (ok=false)
+      if (args[i].label != 0) ++stray_labelled;
       r.leftover.push_back((int)i);
     }
+  // A leftover LABELLED argument belongs to the callee's RESULT arrow (the
+  // known param list under-describes the arrow): `choice ctx ~tail:true body`
+  // where the local `choice ctx t` returns a `tail:bool -> _` closure -- the
+  // written ~tail:true must commute PAST body into the over-application
+  // (tmc.ml:918/969; the verbatim bail passed `true` as t -> Match_failure).
+  // Labels are erased at runtime, so a SINGLE leftover is order-trivial;
+  // several leftovers with a labelled one would need the result arrow's param
+  // order, which we don't have -> keep bailing.
+  if (stray_labelled && r.leftover.size() != 1) return r;
   // Over-application past omitted parameters is fine when every omitted slot is
   // an optional defaulted to None -- the leftover positionals themselves force
   // the defaults (translcore fills None and applies the leftovers to the

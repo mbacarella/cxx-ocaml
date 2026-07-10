@@ -154,6 +154,7 @@ typing/typedecl_variance.mli typing/typedecl_variance.ml
 typing/typedecl_unboxed.mli typing/typedecl_unboxed.ml
 typing/typedecl_immediacy.mli typing/typedecl_immediacy.ml
 typing/typedecl_separability.mli typing/typedecl_separability.ml
+lambda/debuginfo.mli lambda/lambda.mli
 typing/typeopt.mli typing/typeopt.ml
 typing/typedecl.mli typing/typedecl.ml
 typing/value_rec_check.mli typing/value_rec_check.ml

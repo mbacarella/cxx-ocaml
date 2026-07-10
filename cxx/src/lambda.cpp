@@ -3620,6 +3620,33 @@ struct Translator {
   }
   // The tail expression a syntactic function reduces to once its parameters,
   // any nested `fun` layers, and the binding/sequence spine are peeled off.
+  // A function let/letrec-bound inside `f`'s body under `name` (last binding
+  // wins, mirroring shadowing), following the same spine fn_tail_expr walks.
+  static const Pexp_function* body_local_fn(const Pexp_function& f,
+                                            const std::string& name) {
+    auto* fb = std::get_if<Pfunction_body>(&f.body->v);
+    if (!fb) return nullptr;
+    const Expression* e = fb->e.get();
+    const Pexp_function* found = nullptr;
+    while (e) {
+      if (auto* sq = std::get_if<Pexp_sequence>(&e->desc)) { e = sq->e2.get(); continue; }
+      if (auto* le = std::get_if<Pexp_let>(&e->desc)) {
+        for (auto& vb : le->bindings)
+          if (auto* pv = std::get_if<Ppat_var>(&vb.pat.desc))
+            if (pv->name.txt == name)
+              if (auto* fe = std::get_if<Pexp_function>(&vb.expr->desc))
+                found = fe;
+        e = le->body.get(); continue;
+      }
+      if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) { e = ct->e.get(); continue; }
+      if (auto* nf = std::get_if<Pexp_function>(&e->desc)) {
+        if (const Pexp_function* deeper = body_local_fn(*nf, name)) return deeper;
+        return found;
+      }
+      break;
+    }
+    return found;
+  }
   static const Expression* fn_tail_expr(const Pexp_function& f) {
     auto* fb = std::get_if<Pfunction_body>(&f.body->v);
     if (!fb) return nullptr;  // `function ...` cases: no simple tail
@@ -3718,6 +3745,17 @@ struct Translator {
       if (const Expression* body = fn_tail_expr(*f))
         if (auto* ap = std::get_if<Pexp_apply>(&body->desc)) {
           FnSig callee = callee_sig(ap->fn.get());
+          // The tail callee may be a function let-bound INSIDE this body --
+          // not in venv yet at registration time (tmc's outer `choice ctx t`
+          // tail-calls the inner `let rec choice ctx ~tail t`, so the outer's
+          // residual `~tail` was never recorded and `choice ctx ~tail:true
+          // body` applied verbatim, feeding `true` as the lambda term).
+          // Resolve it syntactically from the body's let/letrec bindings.
+          if (callee.empty())
+            if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
+              if (auto* fl = std::get_if<Lident>(&fid->id.txt.v))
+                if (const Pexp_function* lf = body_local_fn(*f, fl->name))
+                  callee = fn_param_labels(*lf);
           if (!callee.empty()) {
             FnSig resid = residual_after_apply(callee, ap->args);
             s.insert(s.end(), resid.begin(), resid.end());
