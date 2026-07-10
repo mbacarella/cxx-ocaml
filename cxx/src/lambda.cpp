@@ -8315,6 +8315,16 @@ struct Translator {
     if (arity > 1) {
       if (auto* tup = std::get_if<Ppat_tuple>(&arg.desc))
         for (auto& e : tup->elems) v.push_back(e.get());
+      else if (std::holds_alternative<Ppat_any>(effective_pat(&arg)->desc)) {
+        // `C _` on a multi-arg ctor: ONE wildcard spans ALL args (legal
+        // OCaml).  ctype.ml's `with Non_closed _ -> false` (arity 2) was
+        // otherwise dropped to a bare reraise -- the bootstrapped compiler
+        // died with an escaping Non_closed on every GADT unification.
+        static const Pattern any_pat = [] {
+          Pattern p; p.desc = Ppat_any{}; return p;
+        }();
+        for (int i = 0; i < arity; ++i) v.push_back(&any_pat);
+      }
     } else {
       v.push_back(&arg);
     }
