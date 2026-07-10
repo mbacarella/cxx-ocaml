@@ -1664,6 +1664,14 @@ struct Translator {
                   ambiguous_fields_.insert(f.name.txt);  // shared label: unusable bare
                 else
                   field_info_[f.name.txt] = {key, idx, m, k};
+                // A labelled-function field in a NESTED module's record needs its
+                // label sig too (mirrors the top-level pass): tmc.ml's Dps.t
+                // `code : delayed:.. -> 'a dps` called `d.code ~tail ~dst
+                // ~delayed:[]` must REORDER to the declared (delayed,tail,dst)
+                // -- verbatim application shifted every argument (bootstrap #13
+                // part 12, misc.ml crash at Tmc: add_dst_args got dst=[]).
+                if (FnSig fs = coretype_label_sig(f.type.get()); !fs.empty())
+                  field_fn_sig_.emplace(f.name.txt, std::move(fs));
                 ++idx;
               }
               rec_types_[key] = std::move(rt);
@@ -3592,6 +3600,42 @@ struct Translator {
         FnSig fs = fn_param_labels(*fn);
         for (auto& [k, n] : fs)
           if (k != 0) { local_functor_member_sig_[fname][nm->name.txt] = fs; break; }
+      }
+    }
+  }
+  // A local `module M = struct .. end` (ascribed or not): record each
+  // let-bound function with labelled params so a qualified call `M.f
+  // ~lbl:.. x` reorders to the declared parameter order / None-fills
+  // omitted optionals.  tmc.ml's UNASCRIBED Choice (`let dps c ~tail ~dst`
+  // called `Choice.dps ~tail:.. ~dst:.. fun_choice`) got a verbatim apply
+  // that shifted every argument (bootstrap #13 part 12, misc.ml Tmc crash).
+  // emplace: an ascription-harvested sig (authoritative) is not overwritten.
+  void harvest_local_module_value_sigs(const std::string& nm,
+                                       const ModuleExpr* me) {
+    while (me) {
+      if (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) {
+        me = pc->me.get();
+        continue;
+      }
+      break;
+    }
+    if (!me) return;
+    auto* ps = std::get_if<Pmod_structure>(&me->desc);
+    if (!ps) return;
+    for (auto& it : ps->items) {
+      auto* pv = std::get_if<Pstr_value>(&it.desc);
+      if (!pv) continue;
+      for (auto& b : pv->bindings) {
+        auto* nmp = std::get_if<Ppat_var>(&b.pat.desc);
+        if (!nmp || !b.expr) continue;
+        auto* fn = std::get_if<Pexp_function>(&b.expr->desc);
+        if (!fn) continue;
+        FnSig fs = fn_param_labels(*fn);
+        for (auto& [k, n] : fs)
+          if (k != 0) {
+            local_member_sig_[nm].emplace(nmp->name.txt, fs);
+            break;
+          }
       }
     }
   }
@@ -15460,6 +15504,9 @@ struct Translator {
                     }
                 }
         }
+        // Plain-struct members' labelled sigs too (Choice.dps).
+        if (mb.name.txt)
+          harvest_local_module_value_sigs(*mb.name.txt, &mb.expr);
         // No explicit `: S`, but THIS unit's own .mli declares the submodule's
         // field order: coerce the submodule body to it so members the impl gives
         // as EXTERNALS (Stdlib.LargeFile's seek_in etc. -- all externals, hence a
@@ -15707,6 +15754,8 @@ struct Translator {
                         }
                     }
               }
+              // Plain-struct members' labelled sigs too (Choice.dps).
+              harvest_local_module_value_sigs(nm, &mb.expr);
               // modsig P3 stage 2: the namespaced Sig of the RHS when it
               // agrees with the flat layout in use (a functor marker compares
               // its innermost result); disagreement keeps the flat Unknown Sig
