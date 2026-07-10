@@ -9,12 +9,28 @@
 #pragma once
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "cppcaml/ast.hpp"
 
 namespace cppcaml::lambda {
+
+// An unresolvable module reference: the head module is not bound locally and
+// has no .cmi on the include path.  ocamlc's Env raises "Unbound module" here;
+// carrying the head and source span lets the driver print the identical report
+// (File/line/chars + excerpt + carets) and exit 2 like ocamlc, instead of
+// silently compiling garbage (bootstrap #13: typeopt.ml compiled with no
+// lambda.cmi emitted unresolved-ctor code that crashed the built compiler).
+struct UnboundModuleError : std::runtime_error {
+  std::string head;
+  int line;                  // 1-based source line of the reference
+  int col_start, col_end;    // 0-based columns within that line
+  UnboundModuleError(std::string h, int l, int cs, int ce)
+      : std::runtime_error("Unbound module " + h),
+        head(std::move(h)), line(l), col_start(cs), col_end(ce) {}
+};
 
 // Value representation kind (lambda/lambda.mli value_kind), as printed by
 // -dlambda: Pintval -> "[int]", Pfloatval -> "[float]", Pgenval -> (nothing).

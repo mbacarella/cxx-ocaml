@@ -149,6 +149,33 @@ static const std::set<std::string> kUnsupportedBool = {"-i", "-output-obj"};
 // -labels/-nolabels affect typing but not our (untyped-after-infer) output.
 static const std::set<std::string> kBoolIgnore2 = {"-labels", "-nolabels"};
 
+// ocamlc's exact "Unbound module" report: location line, source excerpt with
+// carets under the offending name, then the error -- e.g.
+//   File "a.ml", line 1, characters 5-14:
+//   1 | open Nosuchmod
+//            ^^^^^^^^^
+//   Error: Unbound module Nosuchmod
+static void report_unbound_module(const std::string& in_path, const std::string& src,
+                                  const cppcaml::lambda::UnboundModuleError& e) {
+  std::cerr << "File \"" << in_path << "\", line " << e.line
+            << ", characters " << e.col_start << '-' << e.col_end << ":\n";
+  // find the source line (1-based)
+  size_t pos = 0;
+  for (int l = 1; l < e.line && pos != std::string::npos; ++l)
+    pos = src.find('\n', pos) == std::string::npos ? std::string::npos
+                                                   : src.find('\n', pos) + 1;
+  if (pos != std::string::npos) {
+    size_t eol = src.find('\n', pos);
+    std::string text = src.substr(pos, eol == std::string::npos ? std::string::npos
+                                                                : eol - pos);
+    std::string num = std::to_string(e.line);
+    std::cerr << num << " | " << text << '\n';
+    std::cerr << std::string(num.size() + 3 + e.col_start, ' ')
+              << std::string(std::max(1, e.col_end - e.col_start), '^') << '\n';
+  }
+  std::cerr << "Error: Unbound module " << e.head << '\n';
+}
+
 // Compile a single .ml -> .cmo (+ .cmi unless a hand-written .mli exists).
 // Returns 0 on success.  `cmo_out` is where the .cmo is written.
 // -d* debug dumps (like ocamlc's): print an intermediate representation to
@@ -203,6 +230,9 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     if (prof)
       std::cerr << "  TOTAL compile " << in_path << ": "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
+  } catch (const cppcaml::lambda::UnboundModuleError& e) {
+    report_unbound_module(in_path, ss.str(), e);
+    return 2;  // ocamlc's exit code for a type error
   } catch (const cppcaml::ParseError& e) {
     std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
     return 1;

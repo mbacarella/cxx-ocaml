@@ -105,9 +105,9 @@ typing/annot.mli
 typing/value_rec_types.mli
 typing/ident.mli typing/ident.ml
 typing/path.mli typing/path.ml
-typing/primitive.mli typing/primitive.ml
 typing/type_immediacy.mli typing/type_immediacy.ml
 typing/outcometree.mli
+typing/primitive.mli typing/primitive.ml
 typing/shape.mli typing/shape.ml
 typing/types.mli typing/types.ml
 typing/data_types.mli typing/data_types.ml

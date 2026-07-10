@@ -1929,9 +1929,16 @@ struct Translator {
     return std::filesystem::exists(resolve_cmi(head));
   }
   // A path resolution dead end: the head module is not bound anywhere.  Matches
-  // OCaml's `Unbound module` (which its type checker raises in Env BEFORE codegen)
-  // plus a hint, since the usual cause is the include path.
-  [[noreturn]] void unbound_module(const std::string& head, const std::string& full) {
+  // OCaml's `Unbound module` (which its type checker raises in Env BEFORE codegen).
+  // With a source location the driver prints ocamlc's exact report (excerpt +
+  // carets under the head, exit 2); without one, a plain message with a hint,
+  // since the usual cause is the include path.
+  [[noreturn]] void unbound_module(const std::string& head, const std::string& full,
+                                   const Location* loc = nullptr) {
+    if (loc && !loc->ghost && loc->start.lnum > 0 && loc->start.file_id == 0) {
+      int col = loc->start.cnum - loc->start.bol;
+      throw UnboundModuleError(head, loc->start.lnum, col, col + (int)head.size());
+    }
     std::string low = head.empty() ? head
                     : std::string(1, (char)std::tolower((unsigned char)head[0])) + head.substr(1);
     throw std::runtime_error(
@@ -9891,6 +9898,10 @@ struct Translator {
         if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
           std::string dotted;  // a dotted submodule path opens under its full path
           if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+          // `let open M in ..` / `M.(..)` with M bound nowhere: hard error like
+          // ocamlc (see the structure-level Pstr_open check).
+          if (std::string head = lid_head(mi->id.txt); !module_head_resolvable(head))
+            unbound_module(head, dotted, &mi->id.loc);
           // a bare local open of a submodule of an already-opened module
           // (`open Types` then `Variance.(contravariant, covariant)`): resolve it
           // to the full path so its members resolve.
@@ -11229,7 +11240,7 @@ struct Translator {
         std::string head = lid_head(id->id.txt);
         if (!module_head_resolvable(head)) {
           std::string full; lid_to_dotted(id->id.txt, full);
-          unbound_module(head, full);
+          unbound_module(head, full, &id->id.loc);
         }
       }
       auto v = mk(Lam::K::Var); v->var = fresh("?" + lid_last(id->id.txt));  // unresolved (will DIFF)
@@ -14642,7 +14653,7 @@ struct Translator {
         std::string head = lid_head(pi->id.txt);
         if (!module_head_resolvable(head)) {
           std::string full; lid_to_dotted(pi->id.txt, full);
-          unbound_module(head, full);
+          unbound_module(head, full, &pi->id.loc);
         }
       }
     return mk(Lam::K::ConstInt);  // other module exprs: best-effort
@@ -14976,6 +14987,12 @@ struct Translator {
         if (auto* mi = std::get_if<Pmod_ident>(&op->expr.desc)) {
           std::string dotted;  // a dotted submodule path opens under its full path
           if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+          // `open M` with M bound nowhere (no local binding, no cmi): hard error
+          // like ocamlc's Env -- silently continuing emits unresolved-`?` garbage
+          // for every name the open was to provide (bootstrap #13: typeopt.ml
+          // compiled before lambda.cmi existed).
+          if (std::string head = lid_head(mi->id.txt); !module_head_resolvable(head))
+            unbound_module(head, dotted, &mi->id.loc);
           // a bare `open Ops` where Ops is a submodule of an already-opened module
           // (e.g. `open M; open Ops`, M a functor param): open it as `M.Ops`.
           if (dotted.find('.') == std::string::npos && !module_base(dotted) &&
@@ -15955,6 +15972,13 @@ struct Translator {
         continue;
       }
       if (auto* pin = std::get_if<Pstr_include>(&it.desc)) {  // include ME
+        // `include M` with M bound nowhere: hard error like ocamlc (the splice
+        // below would silently produce an empty export set otherwise).
+        if (auto* imi = std::get_if<Pmod_ident>(&pin->expr.desc))
+          if (std::string head = lid_head(imi->id.txt); !module_head_resolvable(head)) {
+            std::string full; lid_to_dotted(imi->id.txt, full);
+            unbound_module(head, full, &imi->id.loc);
+          }
         // Splice ME's exported value fields into this structure.  A pure path
         // (an already-evaluated module) needs no binding; a computation (e.g. a
         // functor application) is bound to `include/N` first for its effect.
