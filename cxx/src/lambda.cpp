@@ -2094,6 +2094,32 @@ struct Translator {
       return field_of(global_of(prefix), f->second);
     return nullptr;
   }
+  // A ctor qualified by a separately-compiled UNIT whose cmi declares it as an
+  // EXCEPTION / extension constructor (`Syntaxerr.Error e`): its identity is
+  // the unit's runtime field; the arity comes from the cmi typext.  Null for
+  // local modules, nested paths, inline-record payloads (layout differs), or
+  // when the name is not a typext of that unit (a variant ctor has no field).
+  LamPtr unit_exn_identity(const Longident& id, int* arity) {
+    auto* dq = std::get_if<Ldot>(&id.v);
+    if (!dq) return nullptr;
+    std::string prefix;
+    if (!lid_to_dotted(*dq->prefix, prefix)) return nullptr;
+    if (prefix.find('.') != std::string::npos || module_base(prefix))
+      return nullptr;
+    try {
+      auto cmi = cmi::CmiFile::load(resolve_cmi(prefix));
+      for (auto& tx : cmi.sig().typexts)
+        if (tx.name == dq->name) {
+          if (tx.is_inline_record) return nullptr;
+          if (arity) *arity = (int)tx.args.size();
+          auto& fm = fields_of(prefix);
+          if (auto f = fm.find(dq->name); f != fm.end())
+            return field_of(global_of(prefix), f->second);
+          return nullptr;
+        }
+    } catch (...) {}
+    return nullptr;
+  }
   // The package module-type name of `(module .. : S)` / `(e : (module S))` /
   // an ident bound to one; empty if `e` isn't a first-class-module package.
   std::string expr_pack_modtype(const Expression& e0) {
@@ -10619,10 +10645,19 @@ struct Translator {
       }
       // a constructor qualified by a bound module that exports it (an exception /
       // extension constructor): read its identity from that module's block, so
-      // `M1.E` and `M2.E` (distinct `type t += E`) stay distinct.
-      if (LamPtr cid = module_ctor_identity(k->id.txt)) {
+      // `M1.E` and `M2.E` (distinct `type t += E`) stay distinct.  A qualified
+      // UNIT exception (`Syntaxerr.Error e`) resolves the same way through the
+      // unit's cmi typexts -- without it the name fell back to a same-named
+      // variant ctor (bootstrap bug#13: result's Error, a tag-1 block, escaped
+      // parse.ml's wrap instead of a Syntaxerr.Error exception).
+      LamPtr cid = module_ctor_identity(k->id.txt);
+      int uarity = -1;
+      if (!cid && std::holds_alternative<Ldot>(k->id.txt.v))
+        cid = unit_exn_identity(k->id.txt, &uarity);
+      if (cid) {
         if (!k->arg) return cid;  // nullary: the identity value itself
-        int arity = exn_arity_.count(n) ? exn_arity_[n] : 1;  // applied: block tag 0
+        int arity = uarity >= 0 ? uarity
+                    : exn_arity_.count(n) ? exn_arity_[n] : 1;  // applied: block tag 0
         std::vector<const Expression*> fs;
         if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
             at && arity > 1 && (int)at->elems.size() == arity)
@@ -15815,6 +15850,12 @@ struct Translator {
             cur.push_back({id, ValueKind::Gen, fr, true});
             scope.back()[nm] = id;
             add_export(nm, id, ns, sub);
+            // an included EXCEPTION / extension ctor resolves by IDENTITY in
+            // expressions and patterns (`include T ... raise Error`): register
+            // the rebound field so a bare use doesn't fall back to a same-name
+            // variant ctor (bootstrap bug#13: menhir's `raise Error` built the
+            // result-Error atom instead of raising T's exception)
+            if (ns == modsig::NS::Typext) exn_ident_[nm] = id;
             if (tsig) {  // module / exception members register as such
               if (const ModuleType* smt = sig_member_modtype(*tsig, nm)) {
                 module_ident_[nm] = id;
@@ -15838,8 +15879,13 @@ struct Translator {
               cur.push_back({id, ValueKind::Gen, fi, true});  // =a alias
               scope.back()[nm] = id;
               add_export(nm, id, ns, sub);
+              if (ns == modsig::NS::Typext) exn_ident_[nm] = id;
             } else {
               add_export_val(nm, fi, ns, sub);
+              // an included exception off a module VAR (a functor parameter:
+              // `include T ... raise Error`) resolves as that field's identity
+              if (ns == modsig::NS::Typext && base->k == Lam::K::Var)
+                exn_field_[nm] = {base->var, i};
             }
           }
         };
