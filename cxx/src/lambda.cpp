@@ -1479,7 +1479,37 @@ struct Translator {
     } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
       scan_pat_ctors(*c->p);
     } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
-      for (auto& [lbl, sub] : r->fields) scan_pat_ctors(*sub);
+      // A record sub-pattern whose type the checker hinted (an imported ctor
+      // arg, e.g. Texp_construct's constructor_description): a bare ctor in
+      // a FIELD pattern resolves through the field's DECLARED type path --
+      // value_rec_check.ml's `Texp_construct (_, {cstr_tag = Cstr_unboxed},
+      // _)` otherwise left Cstr_unboxed unresolved and the whole match
+      // collapsed to one unconditional arm.
+      std::string rt;
+      if (auto h = pat_type_hint_.find(&p); h != pat_type_hint_.end())
+        rt = h->second;
+      std::string rmod;
+      std::string rbare = rt;
+      if (auto dot = rt.rfind('.'); dot != std::string::npos) {
+        rmod = rt.substr(0, dot);
+        rbare = rt.substr(dot + 1);
+      }
+      for (auto& [lbl, sub] : r->fields) {
+        if (!rt.empty()) {
+          const Pattern* sp = effective_pat(sub.get());
+          auto* kc = std::get_if<Ppat_construct>(&sp->desc);
+          if (kc && std::holds_alternative<Lident>(kc->id.txt.v) &&
+              !ctor_info_.count(lid_last(kc->id.txt))) {
+            std::string ftp = record_field_type_path(rbare, lid_last(lbl.txt));
+            if (!ftp.empty()) {
+              if (ftp.find('.') == std::string::npos && !rmod.empty())
+                ftp = rmod + "." + ftp;
+              register_ctors_of_type(ftp);
+            }
+          }
+        }
+        scan_pat_ctors(*sub);
+      }
     } else if (auto* ar = std::get_if<Ppat_array>(&p.desc)) {
       for (auto& e : ar->elems) scan_pat_ctors(*e);
     } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
