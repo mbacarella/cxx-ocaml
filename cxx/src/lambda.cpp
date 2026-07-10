@@ -537,6 +537,9 @@ struct Translator {
   // per parameter, keyed by the binder stamp -- used to match a call's arguments.
   using FnSig = std::vector<std::pair<int, std::string>>;
   std::map<int, FnSig> fn_sig_;
+  // binding stamp of a `let r : (<arrow>) ref = ..` -> the ELEMENT's sig,
+  // consulted by callee_sig for a deref'd call `!r args..`.
+  std::map<int, FnSig> ref_fn_sig_;
   // labelled value signatures of a functor parameter's signature (`H : SeededS`
   // -> create's `?random`), so `H.create 51` fills the omitted optional: param
   // name -> value name -> FnSig.
@@ -3756,14 +3759,44 @@ struct Translator {
   }
   // Record a binding's parameter labels (only if it is a function with at least
   // one labelled/optional parameter), so its call sites can reorder/wrap args.
-  void record_fn_sig(const Ident& id, const Expression* e) {
+  // The binding's annotated coretype, from either the pattern
+  // (`let (r : T) = ..`) or the pvb constraint (`let r : T = ..`).
+  static const CoreType* binding_annot(const ValueBinding& b) {
+    if (auto* pc = std::get_if<Ppat_constraint>(&b.pat.desc)) return pc->t.get();
+    if (b.constraint_)
+      if (auto* vc = std::get_if<Pvc_constraint>(&*b.constraint_))
+        return vc->typ.get();
+    return nullptr;
+  }
+  void record_fn_sig(const Ident& id, const Expression* e,
+                     const CoreType* ann = nullptr) {
     if (!e) return;
+    // `let type_open : (?used_slot:.. -> ..) ref = ref (fun ..)` -- record
+    // the ref's ELEMENT signature so a deref'd call `!type_open Fresh env
+    // loc lid` None-fills the omitted leading optional instead of applying
+    // verbatim (which shifted env<-loc and segfaulted the bootstrapped
+    // typer on any `M.{..}` pattern).
+    if (ann)
+      if (auto* cc = std::get_if<Ptyp_constr>(&ann->desc))
+        if (lid_last(cc->id.txt) == "ref" && cc->args.size() == 1)
+          if (FnSig rs = coretype_label_sig(cc->args[0].get()); !rs.empty())
+            ref_fn_sig_[id.stamp] = std::move(rs);
     // `let f : type k. t = fun ..` wraps the function in newtype/constraint nodes
     // (one Pexp_newtype per locally-abstract type); peel them so the inner
     // function's labelled signature is still recorded.
     while (e) {
       if (auto* nt = std::get_if<Pexp_newtype>(&e->desc)) { e = nt->body.get(); continue; }
-      if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) { e = ct->e.get(); continue; }
+      if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) {
+        // `let type_open : (?used_slot:.. -> ..) ref = ref (fun ..)`
+        // (typecore's forward refs): record the ref's ELEMENT signature so a
+        // deref'd call `!type_open Fresh env loc lid` None-fills the leading
+        // omitted optional instead of applying verbatim (shifting env<-loc).
+        if (auto* cc = std::get_if<Ptyp_constr>(&ct->t->desc))
+          if (lid_last(cc->id.txt) == "ref" && cc->args.size() == 1)
+            if (FnSig rs = coretype_label_sig(cc->args[0].get()); !rs.empty())
+              ref_fn_sig_[id.stamp] = std::move(rs);
+        e = ct->e.get(); continue;
+      }
       // `let do_read = let u = Bytes.create 4096 in fun ?(loop=false) ..`: the
       // binding's VALUE is the inner function (the let/seq just sets up captured
       // state), so its labelled signature is that function's.  Without peeling
@@ -3900,6 +3933,19 @@ struct Translator {
       auto it = field_fn_sig_.find(lid_last(fe->field.txt));
       if (it != field_fn_sig_.end()) return it->second;
       return {};
+    }
+    // `!type_open args..`: deref of a let-bound function REF whose annotation
+    // carried labels/optionals (typecore's forward refs).
+    if (auto* ap = std::get_if<Pexp_apply>(&fn->desc);
+        ap && ap->args.size() == 1) {
+      if (auto* did = std::get_if<Pexp_ident>(&ap->fn->desc))
+        if (auto* dl = std::get_if<Lident>(&did->id.txt.v); dl && dl->name == "!")
+          if (auto* aid = std::get_if<Pexp_ident>(&ap->args[0].second->desc))
+            if (auto* al = std::get_if<Lident>(&aid->id.txt.v))
+              if (auto* b = lookup(al->name))
+                if (auto it = ref_fn_sig_.find(b->stamp);
+                    it != ref_fn_sig_.end())
+                  return it->second;
     }
     auto* id = std::get_if<Pexp_ident>(&fn->desc);
     if (!id) return {};
@@ -11696,7 +11742,7 @@ struct Translator {
           if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
             Ident id = fresh(pv->name.txt);
             scope.back()[pv->name.txt] = id;
-            record_fn_sig(id, b.expr.get());
+            record_fn_sig(id, b.expr.get(), binding_annot(b));
             recs.push_back({&b, id});
           }
         std::vector<Ident> ids; std::vector<ValueKind> kinds; std::vector<LamPtr> vals;
@@ -11863,7 +11909,7 @@ struct Translator {
           // SYNTACTIC shape, before simplif inlines -- inlining here would flip it.
           if (rhs->k == Lam::K::Var && !rec_spine) {
             scope.back()[pv->name.txt] = rhs->var;
-            record_fn_sig(rhs->var, b.expr.get());
+            record_fn_sig(rhs->var, b.expr.get(), binding_annot(b));
             continue;
           }
           Ident id = fresh(pv->name.txt);
@@ -11872,7 +11918,7 @@ struct Translator {
           // record BEFORE binding the name: in this non-recursive let, the RHS's
           // own references resolve to the OUTER binding (`let f .. = f ..` wrapping
           // an outer f), which is what the residual-signature analysis must see.
-          record_fn_sig(id, b.expr.get());
+          record_fn_sig(id, b.expr.get(), binding_annot(b));
           record_record_lit(id, b.expr.get());
           scope.back()[pv->name.txt] = id;
         } else {  // `let (a,b) = e` / `let {a;b} = e`: the irrefutable sub-vars read
@@ -12406,7 +12452,7 @@ struct Translator {
             if (!pv) { restore(); return nullptr; }
             Ident id = fresh(pv->name.txt);
             scope.back()[pv->name.txt] = id;
-            record_fn_sig(id, b.expr.get());
+            record_fn_sig(id, b.expr.get(), binding_annot(b));
             recs.push_back({&b, id});
           }
           std::vector<Ident> ids; std::vector<ValueKind> kinds; std::vector<LamPtr> rvals;
@@ -12468,7 +12514,7 @@ struct Translator {
             }
             if (nobind) { l->bindings.push_back({fresh("", true), ValueKind::Gen, v}); continue; }
             Ident id = fresh(pv->name.txt);
-            record_fn_sig(id, b.expr.get());
+            record_fn_sig(id, b.expr.get(), binding_annot(b));
             l->bindings.push_back({id, pat_kind(&b.pat), v});
             binds.push_back({&b, id});
           }
@@ -16256,7 +16302,7 @@ struct Translator {
           if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
             Ident id = fresh(pv->name.txt);
             scope.back()[pv->name.txt] = id;
-            record_fn_sig(id, b.expr.get());
+            record_fn_sig(id, b.expr.get(), binding_annot(b));
             recs.push_back({&b, id});
           }
         std::vector<Ident> ids; std::vector<ValueKind> kinds; std::vector<LamPtr> vals;
@@ -16321,7 +16367,7 @@ struct Translator {
           cur.push_back({id, pat_kind(&b.pat),
                          fn_binding_rhs(pv->name.txt, *b.expr, b.attrs, /*module_level=*/true)});
           scope.back()[pv->name.txt] = id;
-          record_fn_sig(id, b.expr.get());
+          record_fn_sig(id, b.expr.get(), binding_annot(b));
           add_export(pv->name.txt, id);
         } else if (std::holds_alternative<Ppat_any>(b.pat.desc)) {
           flush(); segs.push_back({true, false, {}, expr(*b.expr)});  // `let _ = e` -> seq
@@ -16365,6 +16411,18 @@ struct Translator {
           std::vector<std::pair<Ident, LamPtr>> binders;
           if (collect_binders(b.pat, scrut, binders) && !binders.empty()) {
             record_tuple_sigs(b.pat, *b.expr);
+            // `let r : (<arrow>) ref = ..` / `let f : <arrow> = ..` (a
+            // CONSTRAINED single-var binding lands here, not in the Ppat_var
+            // branch): record its signature so call sites label-commute --
+            // typecore's `!type_open Fresh env loc lid` needed the leading
+            // ?used_slot None-fill.
+            if (binders.size() == 1 &&
+                std::holds_alternative<Ppat_constraint>(b.pat.desc)) {
+              if (getenv("REFDBG"))
+                fprintf(stderr, "[REFDBG] constrained let %s stamp=%d\n",
+                        binders[0].first.name.c_str(), binders[0].first.stamp);
+              record_fn_sig(binders[0].first, b.expr.get(), binding_annot(b));
+            }
             if (!direct) cur.push_back({tmp, ValueKind::Gen, val});
             auto fold = [&](const LamPtr& acc) -> std::pair<LamPtr, bool> {
               if (acc->k == Lam::K::Prim && !acc->args.empty() &&
