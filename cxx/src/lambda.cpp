@@ -3654,8 +3654,23 @@ struct Translator {
         if (pk == 1 && k == 1 && nm == pn) { found = (int)i; break; }
         if (pk == 2 && (k == 1 || k == 2) && nm == pn) { found = (int)i; break; }
       }
-      if (found < 0) resid.push_back({pk, pn});
-      else used[found] = true;
+      if (found < 0) {
+        // an omitted OPTIONAL is None-filled (not pending) when an unmatched
+        // positional argument saturates the call past it -- keeping it made
+        // the wrapper's recorded sig grow a phantom `?o` param, so its call
+        // sites built a spurious eta stub and scrambled the argument order
+        if (pk == 2) {
+          bool later_pos = false;
+          for (size_t i = 0; i < as.size(); ++i)
+            if (!used[i]) {
+              std::string nm;
+              if (alab(as[i].first, nm) == 0) { later_pos = true; break; }
+            }
+          if (later_pos) continue;
+        }
+        resid.push_back({pk, pn});
+      } else
+        used[found] = true;
     }
     return resid;
   }
@@ -4493,6 +4508,11 @@ struct Translator {
     // value type (`{ def = {params;body} }` -> {params;body} : lfunction): resolve
     // its (ambiguous) labels through that type, not a same-labelled local record
     // (bytegen's function_to_compile vs Lambda's lfunction).
+    if (getenv("CTDBG"))
+      fprintf(stderr, "[CTDBG] rec-pat field %s pat_key=%p hint=%s\n", n.c_str(),
+              pat_key,
+              pat_key && pat_type_hint_.count(pat_key)
+                  ? pat_type_hint_[pat_key].c_str() : "<none>");
     if (pat_key)
       if (auto h = pat_type_hint_.find(pat_key); h != pat_type_hint_.end()) {
         // a QUALIFIED hint (`Types.module_declaration`) names the exact record's
@@ -4786,6 +4806,10 @@ struct Translator {
       {"%greaterequal", "caml_greaterequal"},
     };
     if (auto it = poly.find(prim); it != poly.end() && n == 2) return cc(it->second);
+    // physical equality as a value (`List.filter ((!=) t)` in out_type.ml's
+    // remove_delay -- bootstrap bug#13): the EQ/NEQ word comparison
+    if (prim == "%eq" && n == 2) return ic("==");
+    if (prim == "%noteq" && n == 2) return ic("!=");
     if (prim == "%opaque" && n == 1) return ic("opaque");
     if (prim == "%ignore" && n == 1) return ic("ignore");
     {  // Sys compile-time constants, used as a value (eta-stub) -> ccall.
@@ -7525,9 +7549,29 @@ struct Translator {
   // Strip type constraints and peel `[@@unboxed]` constructor wrappers (whose
   // value is transparently their argument), giving the pattern that actually
   // tests/binds the scrutinee.
+  // `({ty; expanded} : Errortrace.expanded_type)`: a QUALIFIED annotation names
+  // the record's module -- tag the record pattern so its bare labels resolve
+  // through that record, not a same-labelled local one (typecore's
+  // copy_expanded_type left ?ty/?expanded unresolved; bootstrap bug#13).
+  void note_pat_constraint_hint(const Ppat_constraint& c) {
+    auto* tc = std::get_if<Ptyp_constr>(&c.t->desc);
+    if (!tc) return;
+    std::string dotted;
+    if (!lid_to_dotted(tc->id.txt, dotted) ||
+        dotted.find('.') == std::string::npos)
+      return;
+    const Pattern* inner = c.p.get();
+    while (auto* c2 = std::get_if<Ppat_constraint>(&inner->desc))
+      inner = c2->p.get();
+    if (std::get_if<Ppat_record>(&inner->desc))
+      pat_type_hint_.emplace((const void*)inner, dotted);
+  }
   const Pattern* effective_pat(const Pattern* p) {
     while (true) {
-      while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+      while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) {
+        note_pat_constraint_hint(*c);
+        p = c->p.get();
+      }
       // `M.(P)` / `M.{ field = .. }` (compile.ml's `to_bytecode Typedtree.{structure;
       // coercion; _}`): register M's record labels so P's unqualified labels resolve,
       // then descend into P.
@@ -9813,6 +9857,12 @@ struct Translator {
           if (std::string p = opened_submodule_path(dotted); !p.empty()) dotted = p;
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
+          else
+            register_module_records(dotted);  // bare `M.(body)` of an imported
+                                              // unit: M's record labels resolve
+                                              // in body (Errortrace.(tr.expected
+                                              // .ty) read a foreign ty offset;
+                                              // bootstrap bug#13)
           CtorSave ctor_save = open_shadow_ctors(dotted);  // ctors shadow in body
           opened_.push_back(dotted);
           menv_.push_frame();  // modsig P3 S5: opened members, scoped to body
@@ -12646,7 +12696,10 @@ struct Translator {
     for (auto& fp : f.params)
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
         const Pattern* pat = &pv->pat;
-        while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) pat = pc->p.get();
+        while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) {
+          note_pat_constraint_hint(*pc);  // ({l; ..} : M.t) param: labels via M.t
+          pat = pc->p.get();
+        }
         if (std::holds_alternative<Optional>(pv->label) && pv->default_) {
           const Ppat_var* var = std::get_if<Ppat_var>(&pat->desc);
           bool any = std::holds_alternative<Ppat_any>(pat->desc);

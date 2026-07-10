@@ -45,11 +45,24 @@ inline Result match(const std::vector<Param>& params, const std::vector<Arg>& ar
   // every non-optional parameter.  In a PARTIAL application the positional args
   // fill only the Nolabel parameters, and each still-unmatched labelled parameter
   // stays pending (an eta parameter of the resulting closure): `let g ~x a b in
-  // g 1 2` is `fun ~x -> g ~x 1 2`, NOT `g ~x:1 2 <partial>`.  Count non-optional
-  // params; the app is total when at least that many arguments are supplied.
-  size_t nreq = 0;
-  for (const Param& p : params) if (p.label != 2) ++nreq;
-  bool total = args.size() >= nreq;
+  // g 1 2` is `fun ~x -> g ~x 1 2`, NOT `g ~x:1 2 <partial>`.  Totality must
+  // count the POSITIONAL args against the non-optional params NO labelled
+  // argument names -- counting all args against all non-optional params treated
+  // `f ~a ~b ~c x y` on (?o ~a ~b ~c pos1 ~d pos2) as saturating and routed y
+  // into ~d (typedecl's is_reachable wrapper put `path` in ~from_ty; bootstrap
+  // bug#13 -- ~from_ty must stay PENDING, an eta param of the partial result).
+  size_t npos_args = 0;
+  for (const Arg& a : args) if (a.label == 0) ++npos_args;
+  size_t nreq_unnamed = 0;
+  for (const Param& p : params) {
+    if (p.label == 2) continue;
+    bool named = false;
+    if (p.label == 1)
+      for (const Arg& a : args)
+        if (a.label == 1 && a.name == p.name) { named = true; break; }
+    if (!named) ++nreq_unnamed;
+  }
+  bool total = npos_args >= nreq_unnamed;
   for (const Param& p : params) {
     int found = -1, fk = 0;
     for (size_t i = 0; i < args.size(); ++i) {
