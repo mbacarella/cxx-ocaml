@@ -6103,6 +6103,22 @@ struct Checker {
           if (record_kinds_) pending_field_.push_back({&e, bt, lid_last(fld->field.txt)});
           return s->cod;
         }
+      // A POLYMORPHIC local field (`pat: 'k . iterator -> ..`): fields_ excludes
+      // it (no mono scheme), so field_scheme would fall through to ext_fields_
+      // and adopt a FOREIGN same-labelled mono record -- tast_iterator's
+      // `sub.pat` typed sub as Ast_iterator.iterator and read its index 32
+      // instead of the local iterator's 25 (bootstrap #13).  Resolve the base's
+      // record type from the local poly field, like the pattern path does; the
+      // access's type comes from from_coretype, which mints fresh generic vars
+      // per use (per-use polymorphism).
+      if (auto pit = poly_field_rec_.find(lid_last(fld->field.txt));
+          pit != poly_field_rec_.end() && !fields_.count(lid_last(fld->field.txt))) {
+        TypePtr bt = infer_expr(*fld->e);
+        try_unify(bt, eng.instantiate(pit->second.recTy));
+        if (record_kinds_) pending_field_.push_back({&e, bt, lid_last(fld->field.txt)});
+        std::unordered_map<std::string, TypePtr> fv;
+        return from_coretype(*pit->second.ftype, fv);
+      }
       if (TypePtr fsch = field_scheme(lid_last(fld->field.txt))) {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));  // recTy -> fldTy
         TypePtr bt = infer_expr(*fld->e);
@@ -11122,7 +11138,16 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
   };
   for (auto& it : s) {
     if (auto* pt = std::get_if<Psig_type>(&it.desc))
-      for (auto& d : pt->decls) ck.register_type_decl(d);
+      for (auto& d : pt->decls) {
+        ck.register_type_decl(d);
+        // A local decl SHADOWS a same-named type brought in by an earlier
+        // `open M` -- without the erase, longident.mli's recursive
+        // `open Location  type t = .. Ldot of t loc ..` qualified every `t`
+        // (the body's recursion AND the following vals) to Location.t, and
+        // everything typed against that cmi walked garbage (bootstrap #13).
+        // A LATER `open` re-seeds the entry, preserving open-over-decl order.
+        ck.opened_type_quals_.erase(d.name.txt);
+      }
     if (auto* pmt = std::get_if<Psig_modtype>(&it.desc))
       if (pmt->type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))

@@ -33,7 +33,25 @@ let rec sigi indent s =
         Printf.printf "%stype %s%s\n" indent (stamp id)
           (match td.Types.type_manifest with
            | Some m -> " = " ^ ty m
-           | None -> "")
+           | None -> "");
+        (match td.Types.type_kind with
+         | Types.Type_record (lds, _) ->
+             List.iter (fun ld ->
+               Printf.printf "%s  { %s : %s }\n" indent
+                 (Ident.name ld.Types.ld_id) (ty ld.Types.ld_type)) lds
+         | Types.Type_variant (cds, _) ->
+             List.iter (fun cd ->
+               match cd.Types.cd_args with
+               | Types.Cstr_tuple args ->
+                   Printf.printf "%s  | %s of %s\n" indent
+                     (Ident.name cd.Types.cd_id)
+                     (String.concat " * " (List.map ty args))
+               | Types.Cstr_record lds ->
+                   List.iter (fun ld ->
+                     Printf.printf "%s  | %s { %s : %s }\n" indent
+                       (Ident.name cd.Types.cd_id)
+                       (Ident.name ld.Types.ld_id) (ty ld.Types.ld_type)) lds) cds
+         | _ -> ())
     | Types.Sig_typext (id, ec, _, _) ->
         Printf.printf "%stypext %s : extends %s\n" indent (stamp id)
           (path ec.Types.ext_type_path)

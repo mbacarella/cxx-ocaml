@@ -3016,6 +3016,8 @@ struct Translator {
     }
   }
   void register_module_records(const std::string& mod) {
+    if (getenv("RMRDBG"))
+      fprintf(stderr, "[RMRDBG] register_module_records(%s)\n", mod.c_str());
     if (mod.empty() || mod.find('.') != std::string::npos) return;
     if (module_base(mod)) {  // a locally-defined module: AST-derived records
       register_local_module_records(mod);
@@ -10161,6 +10163,31 @@ struct Translator {
           }
           return true;
         };
+        // The base's INFERRED module-qualified type path is checked FIRST: it
+        // is the only source that can't land on the wrong record when the
+        // SHORT name and the updated label both collide with a local record
+        // (`{Ast_iterator.default_iterator with location=..}` inside
+        // Tast_iterator, whose OWN `iterator` also has a `location` field --
+        // the flat find_field hit below picked the 46-field local layout for
+        // a 51-field foreign record, bootstrap #13).
+        if (auto itc = expr_constr_of(&e, rc->base->get());
+            itc != vk.expr_constr.end()) {
+          const std::string& p = itc->second;
+          auto dpos = p.rfind('.');
+          if (dpos != std::string::npos && p.find('.') == dpos)
+            if (auto sr = stdlib_record_layout_named(p.substr(0, dpos),
+                                                     p.substr(dpos + 1));
+                sr && [&] { std_rt.labels = sr->labels; return has_all_labels(&std_rt); }()) {
+              std_rt.labels = std::move(sr->labels);
+              std_rt.shape = std::move(sr->shape);
+              std_rt.mut = false;
+              for (bool m : sr->mut) if (m) std_rt.mut = true;
+              std_rt.flat = sr->flat;
+              fmut = std::move(sr->mut);
+              rt = &std_rt;
+            }
+        }
+        if (!rt)
         if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
           if (auto it = rec_types_.find(f0->type);
               it != rec_types_.end() && has_all_labels(&it->second)) {
@@ -10456,6 +10483,10 @@ struct Translator {
         if (auto* l = std::get_if<Lident>(&id->id.txt.v))
           if (auto* b = lookup(l->name))
             if (auto vp = var_record_path_.find(b->stamp); vp != var_record_path_.end()) {
+              if (getenv("RMRDBG"))
+                fprintf(stderr, "[RMRDBG] field %s: var_record_path %s.%s\n",
+                        l->name.c_str(), vp->second.c_str(),
+                        lid_last(fe->field.txt).c_str());
               if (auto rf = resolve_field_in_record_path(vp->second, lid_last(fe->field.txt))) {
                 auto lp = mk(Lam::K::Prim);
                 auto rt = rec_types_.find(rf->type);
@@ -10471,6 +10502,9 @@ struct Translator {
       // identity (the bare find_field below cannot disambiguate same-named
       // records -- Sign_diff.t.untypables@4 vs signature_symptom.untypables@8).
       if (auto it = vk.field_resolved.find(&e); it != vk.field_resolved.end()) {
+        if (getenv("RMRDBG"))
+          fprintf(stderr, "[RMRDBG] field %s: vk.field_resolved idx=%d\n",
+                  lid_last(fe->field.txt).c_str(), it->second.index);
         auto l = mk(Lam::K::Prim);
         l->prim = it->second.kind == "int" ? Prim::FieldInt
                   : it->second.mut         ? Prim::FieldMut
@@ -10488,6 +10522,9 @@ struct Translator {
         const std::string& p = it->second;
         auto dpos = p.rfind('.');
         std::string lbl = lid_last(fe->field.txt);
+        if (getenv("RMRDBG"))
+          fprintf(stderr, "[RMRDBG] field %s: base expr_constr=%s\n",
+                  lbl.c_str(), p.c_str());
         if (dpos != std::string::npos && p.find('.') == dpos) {
           std::string mod = p.substr(0, dpos), ty = p.substr(dpos + 1);
           // A LOCAL nested-module record (`module Measure = struct type t = {..}`;

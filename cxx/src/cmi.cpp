@@ -1126,12 +1126,17 @@ struct TyEmit {
         path = o::vblock(1, {path, o::vstr(comps[i])});   // Pdot(path, comp)
       return path;
     }
-    if (int st = predef_stamp(name))
-      return o::vblock(0, {o::vblock(3, {o::vstr(name), o::vint(st)})});  // Pident(Predef)
+    // A same-sig decl SHADOWS a predefined name: typedtree.mli declares its
+    // own `extension_constructor` (also a predef), and every bare cite --
+    // including ones earlier in the mutually-recursive and-chain -- means the
+    // local decl.  Citing the predef instead gave the field a foreign type
+    // identity, so consumers (Tast_iterator) read garbage (bootstrap #13).
     if (local_types && local_types->count(name)) {
       int st = local_types->at(name);
       return o::vblock(0, {o::vblock(0, {o::vstr(name), o::vint(st)})});  // Pident(Local)
     }
+    if (int st = predef_stamp(name))
+      return o::vblock(0, {o::vblock(3, {o::vstr(name), o::vint(st)})});  // Pident(Predef)
     if (stdlib_toplevel_type(name)) {
       if (referenced) (*referenced)["Stdlib"] = true;
       return o::vblock(1, {o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})}),
