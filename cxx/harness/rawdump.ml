@@ -59,10 +59,23 @@ let rec sigi indent s =
         Printf.printf "%sval %s : %s\n" indent (stamp id) (ty vd.Types.val_type)
     | Types.Sig_module (id, _, md, _, _) ->
         Printf.printf "%smodule %s =\n" indent (stamp id);
-        (match md.Types.md_type with
-         | Types.Mty_signature s -> sigi (indent ^ "  ") s
-         | _ -> Printf.printf "%s  <non-sig>\n" indent)
+        mty (indent ^ "  ") md.Types.md_type
+    | Types.Sig_modtype (id, mtd, _) ->
+        Printf.printf "%smodule type %s =\n" indent (stamp id);
+        (match mtd.Types.mtd_type with
+         | Some m -> mty (indent ^ "  ") m
+         | None -> Printf.printf "%s  <abstract>\n" indent)
     | _ -> ()) s
+
+and mty indent = function
+  | Types.Mty_signature s -> sigi indent s
+  | Types.Mty_ident p -> Printf.printf "%s= [%s]\n" indent (path p)
+  | Types.Mty_alias p -> Printf.printf "%s= alias [%s]\n" indent (path p)
+  | Types.Mty_functor (p, body) ->
+      (match p with
+       | Types.Named (_, pm) -> mty (indent ^ "(param)") pm
+       | Types.Unit -> ());
+      mty (indent ^ "(res)") body
 
 let () =
   let cmi = Cmi_format.read_cmi Sys.argv.(1) in

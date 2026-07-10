@@ -10373,10 +10373,17 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
 
 // ---- include module type of M: splice M's (already-compiled) cmi signature ----
 // Render a cmi type path as the writer's bare name convention (no Stdlib__).
+// A FUNCTOR-APPLICATION path keeps the explicit Stdlib head: `Set.Make(T).t`
+// re-emitted bare would let a sibling `module Set` CAPTURE the head
+// (ident.mli's spliced Identifiable.S Set.t = Stdlib.Set.Make(T).t cited
+// ident's own Set -> the oracle looped expanding the recursive manifest).
 static std::string bare_cmi_path(const cmi::Path& p) {
   std::string s = cmi_path_str(p);
-  if (s.rfind("Stdlib__", 0) == 0) s = s.substr(8);
-  else if (s.rfind("Stdlib.", 0) == 0) s = s.substr(7);
+  bool has_app = s.find('(') != std::string::npos;
+  if (s.rfind("Stdlib__", 0) == 0)
+    s = has_app ? "Stdlib." + s.substr(8) : s.substr(8);
+  else if (s.rfind("Stdlib.", 0) == 0 && !has_app)
+    s = s.substr(7);
   return s;
 }
 // cmi reader type -> cmi writer type.  Best-effort: shapes the back end / arg
@@ -10435,6 +10442,8 @@ static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
       std::vector<cmi::cmiw::TyPtr> as;
       for (auto& a : t->args) as.push_back(conv_cmi_ty(a, vars, nextvar, nodes));
       std::string nm = t->path ? bare_cmi_path(*t->path) : "";
+      if (nm.find('(') != std::string::npos && getenv("CONVDBG"))
+        fprintf(stderr, "[CONVDBG] conv_cmi_ty app name: %s\n", nm.c_str());
       r = nm.empty() ? cmi::cmiw::ty_var(nextvar++)
                      : cmi::cmiw::ty_constr(nm, std::move(as));
       break;
@@ -10469,16 +10478,58 @@ static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
   if (nodes) (*nodes)[t.get()] = r;
   return r;
 }
+// Per-signature-level map of type name -> the decl's own Ident stamp, stacked
+// outermost..innermost while materializing a cmi signature.  Lets the
+// converter RECONSTRUCT SigItem::with_scope_skip: a stored manifest that cites
+// an ENCLOSING level's decl by a bare Pident (a `with type t = t` splice kept
+// in the cmi as a stamped ident) degrades to a bare NAME here, and re-emission
+// inside the inner sig would self-capture without the skip.
+using StampScope = std::unordered_map<std::string, long long>;
+static int manifest_scope_skip(const cmi::TypeDecl& td,
+                               const std::vector<const StampScope*>& stack) {
+  if (!td.manifest) return 0;
+  const cmi::TypeExpr* m = td.manifest.get();
+  while (m && (m->kind == cmi::TypeExpr::Tlink || m->kind == cmi::TypeExpr::Tsubst) &&
+         m->link)
+    m = m->link.get();
+  if (!m || m->kind != cmi::TypeExpr::Tconstr || !m->path) return 0;
+  if (m->path->kind != cmi::Path::Pident) return 0;
+  const cmi::Ident& id = m->path->id;
+  if (id.stamp == 0) return 0;
+  // Find the level whose decl OWNS the cited stamp (innermost..outermost).
+  for (int up = 0; up < (int)stack.size(); ++up) {
+    auto f = stack[stack.size() - 1 - up]->find(id.name);
+    if (f != stack[stack.size() - 1 - up]->end() && f->second == id.stamp)
+      return up;
+  }
+  return 0;
+}
 static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td);
 static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
                                              const cmi::ModuleDecl& md,
-                                             const std::string& origin);
+                                             const std::string& origin,
+                                             const std::vector<const StampScope*>* outer_stamps = nullptr);
 // `origin`: the module path the signature was READ from ("Opt", "Outcome") --
 // a BARE Mty_ident modtype ref inside it (same-unit Pident) requalifies as
 // origin.ref, which is how ocamlc records the spliced form (Opt.Config).
 static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& sig,
-                                                        const std::string& origin = "") {
+                                                        const std::string& origin = "",
+                                                        const std::vector<const StampScope*>* outer_stamps = nullptr) {
   std::vector<cmi::cmiw::SigItem> out;
+  // This level's type-decl stamps, stacked under the enclosing levels': lets
+  // a bare-Pident manifest citing an ENCLOSING decl (a stored `with type`
+  // splice) reconstruct with_scope_skip -- see manifest_scope_skip.
+  StampScope own;
+  for (auto& td : sig.types)
+    if (td.stamp) own[td.name] = td.stamp;
+  std::vector<const StampScope*> stack;
+  if (outer_stamps) stack = *outer_stamps;
+  stack.push_back(&own);
+  auto conv_type = [&](const cmi::TypeDecl& td) {
+    auto si = cmi_type_to_item(td);
+    si.with_scope_skip = manifest_scope_skip(td, stack);
+    return si;
+  };
   // The decode-time `order` table interleaves the items exactly as declared
   // (type t / val make / type in_t -- shared.mli): follow it when present, so
   // a spliced signature prints back in source order.
@@ -10486,12 +10537,12 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
     for (auto& oe : sig.order) {
       switch (oe.kind) {
         case cmi::Signature::OrderEnt::Type:
-          out.push_back(cmi_type_to_item(sig.types.at(oe.idx)));
+          out.push_back(conv_type(sig.types.at(oe.idx)));
           break;
         case cmi::Signature::OrderEnt::Modtype: {
           auto& mt = sig.modtypes.at(oe.idx);
           if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig)
-            out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig, origin)));
+            out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig, origin, &stack)));
           break;
         }
         case cmi::Signature::OrderEnt::Value: {
@@ -10512,7 +10563,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
         }
         case cmi::Signature::OrderEnt::Module:
           out.push_back(cmi_module_to_item(sig.modules.at(oe.idx).name,
-                                           sig.modules.at(oe.idx), origin));
+                                           sig.modules.at(oe.idx), origin, &stack));
           break;
         case cmi::Signature::OrderEnt::Typext: {
           auto& x = sig.typexts.at(oe.idx);
@@ -10527,10 +10578,10 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
     return out;
   }
   // Types and module-types take no runtime field; emit them first.
-  for (auto& td : sig.types) out.push_back(cmi_type_to_item(td));
+  for (auto& td : sig.types) out.push_back(conv_type(td));
   for (auto& mt : sig.modtypes)
     if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig)
-      out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig, origin)));
+      out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig, origin, &stack)));
   // Primitive values take no field either; emit before the field-takers.
   for (auto& v : sig.values) {
     if (v.prim.empty()) continue;
@@ -10557,7 +10608,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
       std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
       out.push_back(cmi::cmiw::sig_value(fn, conv_cmi_ty(it->second->type, vars, nv, &nodes)));
     } else if (auto it = mmap.find(fn); it != mmap.end()) {
-      out.push_back(cmi_module_to_item(fn, *it->second, origin));
+      out.push_back(cmi_module_to_item(fn, *it->second, origin, &stack));
     } else if (auto it = xmap.find(fn); it != xmap.end()) {
       std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
       std::vector<cmi::cmiw::TyPtr> args;
@@ -10604,9 +10655,10 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
 }
 static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
                                              const cmi::ModuleDecl& md,
-                                             const std::string& origin) {
+                                             const std::string& origin,
+                                             const std::vector<const StampScope*>* outer_stamps) {
   if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
-    return cmi::cmiw::sig_module(name, cmi_sig_to_items(*md.type->sig, origin));
+    return cmi::cmiw::sig_module(name, cmi_sig_to_items(*md.type->sig, origin, outer_stamps));
   if (md.type && md.type->kind == cmi::ModuleType::Alias && md.type->path)
     return cmi::cmiw::sig_module_alias(name, bare_cmi_path(*md.type->path));
   if (md.type && md.type->kind == cmi::ModuleType::Ident && md.type->path) {
@@ -10907,6 +10959,10 @@ static TypeofResolved resolve_typeof_path(
 
 static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
                                   const std::function<void(std::string&)>& fn);
+static void subst_type_citations(std::vector<cmi::cmiw::SigItem>& items,
+                                 const std::string& name,
+                                 const std::string& newname, int d,
+                                 bool shadowed);
 static void qualify_enclosing_types(std::vector<cmi::cmiw::SigItem>& result,
                                     const cmi::Signature& outer_sig,
                                     const std::string& unit_path);
@@ -10919,8 +10975,12 @@ static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
 static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
                                 const std::string& app,
                                 bool aliasable = false);
+// depth_bias: how many scope levels the `items` vector itself sits BELOW the
+// scope where the constraint was written -- 1 when they become a module's sub
+// (`module Map : Map.S with type ..`), 0 when spliced flat by an include.
 static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
-                                   std::vector<cmi::cmiw::SigItem>& items) {
+                                   std::vector<cmi::cmiw::SigItem>& items,
+                                   int depth_bias = 1) {
   const ast::ModuleType* m = &mt;
   while (auto* pw = std::get_if<Pmty_with>(&m->desc)) {
     for (auto& c : pw->constraints) {
@@ -11060,9 +11120,15 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
         if (td->manifest)
           if (auto* pc = std::get_if<Ptyp_constr>(&(*td->manifest)->desc)) {
             std::string newname = lid_full(pc->id.txt);
-            rewrite_item_ty_names(items, [&](std::string& n) {
-              if (n == full) n = newname;
-            });
+            if (full.find('.') == std::string::npos)
+              // Bare erased name: referent-aware (a SHADOWING inner decl's
+              // own citations stay; a skip-spliced manifest reaching the
+              // subst level is rewritten) -- see subst_type_citations.
+              subst_type_citations(items, full, newname, 0, false);
+            else
+              rewrite_item_ty_names(items, [&](std::string& n) {
+                if (n == full) n = newname;
+              });
           }
         continue;
       }
@@ -11087,6 +11153,11 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
         tgt->manifest = bridge_ty_named(ck.from_coretype(**td->manifest, tvars),
                                         bvars, nextvar, tvars);
       tgt->type_private = (td->priv == PrivateFlag::Private);
+      // The RHS was written OUTSIDE the refined signature: bare names in the
+      // manifest must not be captured by the refined sig's own decls (`Map.S
+      // with type key = t` cites the enclosing t, not Map.S's t).  The item
+      // sits comps.size()-1 levels below `items` plus the caller's bias.
+      tgt->with_scope_skip = (int)comps.size() - 1 + depth_bias;
     }
     m = pw->mt.get();
   }
@@ -11689,7 +11760,7 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         // Type-level `with` refinements only: module substitutions in an
         // include are left to the existing layout handling (lambda.cpp's AST
         // walk doesn't apply them, and cmi/cmo layouts must agree).
-        apply_with_constraints(ck, pinc->mt, items);
+        apply_with_constraints(ck, pinc->mt, items, /*depth_bias=*/0);
         for (auto& si : items) out.push_back(std::move(si));
       } else if (auto items = qual_modtype_items(pinc->mt); !items.empty()) {
         // `include Identifiable.S with type t = int` (a QUALIFIED cross-module
@@ -11697,6 +11768,12 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
         // .cmi records the included values/submodules (Numbers.Int gets Map/Set/
         // compare).  Without it a downstream `include Numbers.Int` builds a short
         // block missing Key.Map -> Arg_helper.Make's parsed record is garbage.
+        // qual_modtype_items STRIPS the Pmty_with chain, so apply the type
+        // refinements here: `with type t := t` must ERASE S's abstract t
+        // (ident.mli -- without the erasure the dedup pass replaced the
+        // enclosing record decl with S's abstract one, dropping the labels).
+        // Module substitutions stay layout-handled elsewhere (see above).
+        apply_with_constraints(ck, pinc->mt, items, /*depth_bias=*/0);
         for (auto& si : items) out.push_back(std::move(si));
       }
     }
@@ -11995,6 +12072,49 @@ static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
     rewrite_item_ty_names(si.sub, fn);
     rewrite_item_ty_names(si.param_sig, fn);
     for (auto& ps : si.more_param_sigs) rewrite_item_ty_names(ps, fn);
+  }
+}
+
+// `with type t := u` citation rewrite, referent-aware (Identifiable.S in
+// ident.mli/identifiable.mli's Make): a PLAIN bare citation of `name` refers
+// to the erased decl only while NO intervening level declares its own `name`
+// (Set's `val empty : t` means Set's t -- untouched); a `with type`-spliced
+// item whose with_scope_skip reaches EXACTLY the subst level refers to the
+// erased decl THROUGH the shadow (S's `module T : Thing with type t = t`) and
+// is rewritten regardless.
+static void subst_type_citations(std::vector<cmi::cmiw::SigItem>& items,
+                                 const std::string& name,
+                                 const std::string& newname, int d,
+                                 bool shadowed) {
+  bool here = false;
+  for (auto& si : items)
+    if (si.k == cmi::cmiw::SigItem::Type && si.name == name) here = true;
+  bool active = !shadowed && !(d > 0 && here);
+  auto fn = [&](std::string& n) { if (n == name) n = newname; };
+  for (auto& si : items) {
+    bool skip_hit = si.k == cmi::cmiw::SigItem::Type && d > 0 &&
+                    si.with_scope_skip == d;
+    if (active || skip_hit) {
+      rewrite_ty_names(si.manifest, fn);
+      for (auto& p : si.params) rewrite_ty_names(p, fn);
+    }
+    if (active) {
+      rewrite_ty_names(si.ty, fn);
+      for (auto& c : si.ctors) {
+        for (auto& a : c.args) rewrite_ty_names(a, fn);
+        for (auto& l : c.inline_record) rewrite_ty_names(l.ty, fn);
+        rewrite_ty_names(c.res, fn);
+      }
+      for (auto& l : si.labels) rewrite_ty_names(l.ty, fn);
+      rewrite_ty_names(si.ext_ret, fn);
+      for (auto& f : si.class_fields) rewrite_ty_names(f.ty, fn);
+      for (auto& d2 : si.class_arrow_doms) rewrite_ty_names(d2, fn);
+    }
+    bool child_shadowed = shadowed || (d > 0 && here);
+    subst_type_citations(si.sub, name, newname, d + 1, child_shadowed);
+    subst_type_citations(si.param_sig, name, newname, d + 1, child_shadowed);
+    for (auto& ps : si.more_param_sigs)
+      subst_type_citations(ps, name, newname, d + 1, child_shadowed);
   }
 }
 

@@ -113,6 +113,7 @@ struct ConstructorDecl {
 // type_declaration (the subset Env/typing needs first).
 struct TypeDecl {
   std::string name;
+  long long stamp = 0;  // the decl's own Ident stamp (Sig_type's ident)
   std::vector<TypePtr> params;
   int arity = 0;
   enum Kind { Abstract, Record, Variant, Open, External } kind = Abstract;
@@ -399,6 +400,12 @@ struct SigItem {
   bool type_unboxed = false;
   // Type: an EMPTY variant (`type empty = |`) -- Type_variant([]), not abstract.
   bool type_empty_variant = false;
+  // Type: params+manifest came from a `with type` constraint whose RHS was
+  // written N scope levels OUTSIDE this item's own signature level.  The
+  // writer resolves the manifest's bare type names skipping the innermost N
+  // scopes, so `Map.S with type key = t` cites the ENCLOSING t, not Map.S's
+  // own abstract `t` (self-capture).
+  int with_scope_skip = 0;
   // Type: raw Variance.t per parameter (a functor result spliced from a read
   // .cmi keeps `type +!'a t`).  Empty = Variance.unknown (7) for every param.
   std::vector<long long> type_variances;

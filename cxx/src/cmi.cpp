@@ -108,6 +108,7 @@ public:
             if (item.fields.size() == 4) {
               TypeDecl td = type_declaration(item.fields[1]);
               td.name = ident(item.fields[0]).name;
+              td.stamp = ident(item.fields[0]).stamp;
               out.order.push_back({Signature::OrderEnt::Type,
                                    (int)out.types.size(), false});
               out.types.push_back(std::move(td));
@@ -958,6 +959,15 @@ struct TyEmit {
   const std::unordered_map<int, int>* engine_types = nullptr;
   const std::unordered_map<std::string, int>* local_modtypes = nullptr;  // same-sig modtype -> stamp
   const std::unordered_map<std::string, int>* local_mods = nullptr;  // visible module -> stamp
+  // The name and emitted stamp of the module whose items are being emitted
+  // (empty/0 at unit level).  Inside a (non-recursive) module's own signature
+  // its name is NOT in scope, so a path head naming it must not self-capture:
+  // identifiable.mli's S member `module Set : Set with ..` carries the
+  // manifest `t = Set.Make(T).t`, whose head is STDLIB Set, not the member;
+  // Make's result member `module T : sig type t = T.t end` cites the functor
+  // PARAM T, not itself (stamp-guard in the member-directed lookups).
+  std::string self_mod;
+  int self_stamp = 0;
   // Visible local modules by simple name, OUTER->INNER, plus each module's
   // directly-declared member names (types/modules/...).  A dotted type head
   // `M.t` resolves to the innermost `M` that actually DECLARES `t`, not just
@@ -1018,9 +1028,54 @@ struct TyEmit {
       std::string id = s.substr(i, j - i);
       if (!path) {  // head component
         if (id.empty()) return nullptr;
-        if (local_mods && local_mods->count(id)) {
+        // A local-module hit must actually DECLARE the next dotted component
+        // (member-directed, like type_path's pr7402 rule): S's member Map
+        // citing `Set.Make(T).t` means STDLIB Set, not the sibling member
+        // `module Set : Set.S` (which has no Make).  Applied heads (`F(A)`)
+        // keep the plain hit -- a local functor is exactly that.
+        bool local_ok = local_mods && local_mods->count(id);
+        int head_stamp = local_ok ? local_mods->at(id) : 0;
+        if (local_ok && j < s.size() && s[j] == '.' && mods_by_name &&
+            mod_members) {
+          std::size_t j2 = j + 1;
+          while (j2 < s.size() && s[j2] != '.' && s[j2] != '(') ++j2;
+          std::string next = s.substr(j + 1, j2 - j - 1);
+          int flat = head_stamp;
+          local_ok = false;
+          if (auto bn = mods_by_name->find(id); bn != mods_by_name->end())
+            for (auto st = bn->second.rbegin(); st != bn->second.rend(); ++st) {
+              if (*st == self_stamp) continue;  // own name: not in scope inside own sig
+              if (auto mm = mod_members->find(*st);
+                  mm != mod_members->end() && mm->second.count(next)) {
+                head_stamp = *st;
+                local_ok = true;
+                break;
+              }
+            }
+          // No local declares the member: only prefer the global route when
+          // the head names a real stdlib unit (Set w/o Make -> Stdlib Set);
+          // otherwise keep the flat local hit (a bogus global is worse).
+          if (!local_ok && flat != self_stamp && global_of(id) == id) {
+            head_stamp = flat;
+            local_ok = true;
+          }
+        } else if (local_ok && !self_mod.empty() && id == self_mod &&
+                   head_stamp == self_stamp) {
+          // Applied/terminal head naming the module being emitted: prefer any
+          // non-self same-named module; else fall to the global ladder.
+          local_ok = false;
+          if (mods_by_name)
+            if (auto bn = mods_by_name->find(id); bn != mods_by_name->end())
+              for (auto st = bn->second.rbegin(); st != bn->second.rend(); ++st)
+                if (*st != self_stamp) {
+                  head_stamp = *st;
+                  local_ok = true;
+                  break;
+                }
+        }
+        if (local_ok) {
           path = o::vblock(0, {o::vblock(0, {o::vstr(id),
-                                             o::vint(local_mods->at(id))})});  // Pident(Local)
+                                             o::vint(head_stamp)})});  // Pident(Local)
         } else {
           std::string g = global_of(id);
           if (referenced) (*referenced)[g] = true;
@@ -1093,20 +1148,33 @@ struct TyEmit {
           int mstamp = lm->second;
           // Pick the innermost visible `M` that DECLARES the next component
           // (`t` in `M.t`): the innermost `M` alone can be the wrong one when a
-          // nested module shadows an outer of the same name (pr7402).
+          // nested module shadows an outer of the same name (pr7402).  The
+          // module CURRENTLY BEING EMITTED is excluded -- its own name is not
+          // in scope inside its own signature (Make's result member
+          // `module T : sig type t = T.t end` cites the functor param T).
           if (comps.size() >= 2 && mods_by_name && mod_members)
             if (auto bn = mods_by_name->find(comps[0]); bn != mods_by_name->end())
-              for (auto s = bn->second.rbegin(); s != bn->second.rend(); ++s)
+              for (auto s = bn->second.rbegin(); s != bn->second.rend(); ++s) {
+                if (*s == self_stamp) continue;
                 if (auto mm = mod_members->find(*s);
                     mm != mod_members->end() && mm->second.count(comps[1])) {
                   mstamp = *s;
                   break;
                 }
-          o::ValPtr path = o::vblock(0, {o::vblock(0, {o::vstr(comps[0]),
-                                                       o::vint(mstamp)})});
-          for (std::size_t i = 1; i < comps.size(); ++i)
-            path = o::vblock(1, {path, o::vstr(comps[i])});  // Pdot
-          return path;
+              }
+          if (mstamp == self_stamp && mods_by_name)
+            if (auto bn = mods_by_name->find(comps[0]); bn != mods_by_name->end())
+              for (auto s = bn->second.rbegin(); s != bn->second.rend(); ++s)
+                if (*s != self_stamp) { mstamp = *s; break; }
+          if (mstamp != self_stamp) {
+            o::ValPtr path = o::vblock(0, {o::vblock(0, {o::vstr(comps[0]),
+                                                         o::vint(mstamp)})});
+            for (std::size_t i = 1; i < comps.size(); ++i)
+              path = o::vblock(1, {path, o::vstr(comps[i])});  // Pdot
+            return path;
+          }
+          // else: the only visible candidate is the module itself -- fall
+          // through to the global ladder.
         }
       std::string g = global_of(comps[0]);
       if (referenced) (*referenced)[g] = true;  // a real type ref needs the CRC
@@ -1423,7 +1491,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              const std::unordered_map<std::string, int>* outer_modtypes = nullptr,
                                              const std::unordered_map<std::string, int>* outer_mods = nullptr,
                                              const std::unordered_map<int, int>* outer_eng = nullptr,
-                                             const ModScope* outer_modscope = nullptr);
+                                             const ModScope* outer_modscope = nullptr,
+                                             const std::vector<const std::unordered_map<std::string, int>*>* outer_scopes = nullptr,
+                                             const std::string& self_name = "",
+                                             int self_stamp = 0);
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              std::map<std::string, bool>& referenced,
                                              int& stamp,
@@ -1431,7 +1502,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              const std::unordered_map<std::string, int>* outer_modtypes,
                                              const std::unordered_map<std::string, int>* outer_mods,
                                              const std::unordered_map<int, int>* outer_eng,
-                                             const ModScope* outer_modscope) {
+                                             const ModScope* outer_modscope,
+                                             const std::vector<const std::unordered_map<std::string, int>*>* outer_scopes,
+                                             const std::string& self_name,
+                                             int self_stamp) {
   // Pre-pass: give every item its stamp up front and record the local type
   // names, so a value emitted before/after a type can still cite it by stamp.
   std::vector<int> item_stamp(items.size());
@@ -1485,6 +1559,14 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   for (std::size_t i = 0; i < items.size(); ++i)
     if (items[i].k == SigItem::Type && items[i].engine_stamp)
       visible_eng[items[i].engine_stamp] = item_stamp[i];
+  // Scope stack of per-level visible-types maps (outermost..this level): a
+  // `with type`-spliced manifest resolves its bare names in the scope where
+  // the constraint was WRITTEN (with_scope_skip levels up), never against the
+  // refined signature's own same-named decls (`Map.S with type key = t` cites
+  // the enclosing t, not Map.S's own abstract t).
+  std::vector<const std::unordered_map<std::string, int>*> scopes;
+  if (outer_scopes) scopes = *outer_scopes;
+  scopes.push_back(&visible);
   // The Path.t for a named modtype reference: a dotted name goes through the
   // head unit's global (importing it), a bare one through the visible map's
   // Local stamp.  A dotted head that is a VISIBLE LOCAL MODULE -- a functor's
@@ -1546,6 +1628,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     // the result (a partial-application manifest `Outcome.Make(IntT)(N).t` cites
     // param N by its Local ident).
     std::unordered_map<std::string, int> visible_mod_body = visible_mod;
+    // Params join the module scope of the body/result too (member-directed
+    // head resolution): Make's result member `module T : sig type t = T.t
+    // end` must see the PARAM T (which declares t) past its own name.
+    ModScope modscope_body = modscope;
     auto mk_param = [&](bool unit, const std::string& pname,
                         const std::vector<SigItem>& psig_items,
                         const std::string& ref,
@@ -1561,6 +1647,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         int pstamp = stamp++;
         auto pident = o::vblock(0, {o::vstr(pname), o::vint(pstamp)});  // Ident.Local
         visible_mod_body[pname] = pstamp;
+        modscope_body.by_name[pname].push_back(pstamp);
+        modscope_body.members[pstamp] = module_member_names(psig_items);
         name_opt = o::vblock(0, {pident});  // Some
       }
       // A NAMED param modtype (`(K : Key)`) emits Mty_ident(Key) like
@@ -1572,7 +1660,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // Sig_module = block(3, {ident, presence, md, ..}); md_type = md[0].
       if (pfunc && !pfunc->empty()) {
         auto emitted = emit_sig_items({(*pfunc)[0]}, referenced, stamp,
-                                      &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope);
+                                      &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope, &scopes);
         if (emitted.size() == 1 && emitted[0]->fields.size() >= 3 &&
             !emitted[0]->fields[2]->fields.empty())
           psig = emitted[0]->fields[2]->fields[0];
@@ -1580,7 +1668,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       if (!psig && !ref.empty())
         if (o::ValPtr mp = modtype_path(ref, &visible_mod_body)) psig = o::vblock(0, {mp});  // Mty_ident
       if (!psig)
-        psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope))});  // Mty_signature
+        psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope, &scopes))});  // Mty_signature
       return o::vblock(0, {name_opt, psig});  // Named(name_opt, <param sig>)
     };
     std::vector<o::ValPtr> params;
@@ -1600,7 +1688,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       if (o::ValPtr rp = modtype_path(it.functor_result_ref, &visible_mod_body))
         body = o::vblock(0, {rp});  // Mty_ident
     if (!body)
-      body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope))});  // Mty_signature(result)
+      body = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope_body, &scopes))});  // Mty_signature(result)
     for (auto p = params.rbegin(); p != params.rend(); ++p)
       body = o::vblock(2, {*p, body});  // Mty_functor
     return body;
@@ -1609,6 +1697,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const SigItem& it = items[i];
     TyEmit te; te.referenced = &referenced; te.local_types = &visible;
+    te.self_mod = self_name; te.self_stamp = self_stamp;
     te.local_modtypes = &visible_mt; te.local_mods = &visible_mod;
     te.engine_types = &visible_eng;
     te.mods_by_name = &modscope.by_name; te.mod_members = &modscope.members;
@@ -1688,7 +1777,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (!it.modtype_ref.empty())
           if (o::ValPtr mp = modtype_path(it.modtype_ref)) mty = o::vblock(0, {mp});  // Mty_ident
         if (!mty)
-          mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope))});  // Mty_signature
+          mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, item_stamp[i]))});  // Mty_signature
       }
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                               o::vint(0) /*md_uid*/});  // module_declaration
@@ -1712,7 +1801,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           mto = o::vblock(0, {o::vblock(0, {mp})});  // Some(Mty_ident)
       }
       if (!mto)
-        mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope))})});  // Some(Mty_signature)
+        mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes))})});  // Some(Mty_signature)
       auto mtd = o::vblock(0, {mto, o::vint(0) /*attrs*/,
                                loc_none(), o::vint(0) /*mtd_uid*/});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
@@ -1928,8 +2017,17 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an
       // alias (`type t = manifest`).  Variant/record kinds: the climb.
       std::vector<o::ValPtr> ps;
+      // A `with type`-spliced decl: its params+manifest were written
+      // with_scope_skip levels up, so bare names there resolve against THAT
+      // scope's types (no capture by the refined sig's own decls).  The kind
+      // (ctors/labels, from the base modtype body) still resolves here.
+      const std::unordered_map<std::string, int>* cur_types = te.local_types;
+      if (it.with_scope_skip > 0 &&
+          scopes.size() > (std::size_t)it.with_scope_skip)
+        te.local_types = scopes[scopes.size() - 1 - it.with_scope_skip];
       for (auto& p : it.params) ps.push_back(te.emit(p));
       auto man = it.manifest ? o::vblock(0, {te.emit(it.manifest)}) : o::vint(0);  // Some/None
+      te.local_types = cur_types;
       o::ValPtr kind;
       if (!it.ctors.empty()) {
         int cstamp = 270;
