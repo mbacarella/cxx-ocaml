@@ -144,6 +144,11 @@ struct Checker {
                  // (`Buffer.t`), used when the folded pass keeps the name
                  std::string display_path; };
   std::unordered_map<std::string, Alias> type_aliases;
+  // Resolver for a SIBLING inline-sig module's type manifest
+  // (`module Simple : sig type view = [..] end` then `[ Simple.view | .. ]`
+  // in a later sibling) -- set by signature_to_cmi over its module_sigs map.
+  std::function<const CoreType*(const std::string&, const std::string&)>
+      sibling_type_manifest_;
   // `type t := rhs` (Psig_typesubst): every following citation of `t` is
   // REPLACED by rhs (the decl itself takes no signature item).  Unlike
   // type_aliases these expand unconditionally -- printtyp.mli's
@@ -1006,6 +1011,38 @@ struct Checker {
                    has.push_back(rt->constant ? 2 : 1); }
           } else {
             auto* ri = std::get_if<Rinherit>(&r);
+            // A MIXED row's inherit (`[ Simple.view | \`Or of .. ]`) expands
+            // its tags into the union like the all-inherit path -- ocamlc's
+            // .cmi stores the flattened row (patterns.mli Half_simple.view).
+            // An unexpandable inherit keeps the previous opaque handling.
+            if (fold_abbrevs_ || keep_local_abbrevs_) {
+              // A SIBLING-module citation (`Simple.view`) expands through its
+              // AST manifest directly (the flat alias map keys by LAST name,
+              // so three sibling `view`s would collide).
+              const CoreType* src = ri->ct.get();
+              if (sibling_type_manifest_)
+                if (auto* c2 = std::get_if<Ptyp_constr>(&src->desc))
+                  if (auto* dd = std::get_if<Ldot>(&c2->id.txt.v))
+                    if (auto* pl2 = std::get_if<Lident>(&dd->prefix->v))
+                      if (const CoreType* man =
+                              sibling_type_manifest_(pl2->name, dd->name))
+                        src = man;
+              bool sf = fold_abbrevs_, sk = keep_local_abbrevs_;
+              fold_abbrevs_ = true; keep_local_abbrevs_ = false;
+              TypePtr ex = I::Engine::repr(from_coretype(*src, vars));
+              fold_abbrevs_ = sf; keep_local_abbrevs_ = sk;
+              if (ex->kind == I::Type::Kind::Variant && !ex->labels.empty()) {
+                for (size_t i = 0; i < ex->labels.size(); ++i) {
+                  size_t k = 0;
+                  for (; k < tags.size(); ++k) if (tags[k] == ex->labels[i]) break;
+                  if (k < tags.size()) soft_unify(ats[k], ex->args[i]);
+                  else { tags.push_back(ex->labels[i]);
+                         ats.push_back(ex->args[i]);
+                         has.push_back(ex->tag_has_arg[i]); }
+                }
+                continue;
+              }
+            }
             inh.push_back(from_coretype(*ri->ct, vars));
           }
         }
@@ -11241,6 +11278,19 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
           module_sigs[*pm->md.name.txt] = &ps->items;
   }
+  // Row inherits citing a sibling module's type (`[ Simple.view | .. ]`)
+  // expand through the sibling's AST manifest (see sibling_type_manifest_).
+  ck.sibling_type_manifest_ = [&module_sigs](const std::string& m,
+                                             const std::string& t)
+      -> const ast::CoreType* {
+    auto it2 = module_sigs.find(m);
+    if (it2 == module_sigs.end()) return nullptr;
+    for (auto& sit : *it2->second)
+      if (auto* pt2 = std::get_if<Psig_type>(&sit.desc))
+        for (auto& d2 : pt2->decls)
+          if (d2.name.txt == t && d2.manifest) return d2.manifest->get();
+    return nullptr;
+  };
   // Import the module-type decls of an opened module (`open EngineTypes`) so a
   // following unqualified `: ENGINE` / `(T : TABLE)` resolves to its members.
   auto import_modtypes_of = [&](const ast::Signature& msig) {
@@ -11258,13 +11308,11 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     if (auto* pt = std::get_if<Psig_type>(&it.desc))
       for (auto& d : pt->decls) {
         ck.register_type_decl(d);
-        // A local decl SHADOWS a same-named type brought in by an earlier
-        // `open M` -- without the erase, longident.mli's recursive
-        // `open Location  type t = .. Ldot of t loc ..` qualified every `t`
-        // (the body's recursion AND the following vals) to Location.t, and
-        // everything typed against that cmi walked garbage (bootstrap #13).
-        // A LATER `open` re-seeds the entry, preserving open-over-decl order.
-        ck.opened_type_quals_.erase(d.name.txt);
+        // NOTE: the opened_type_quals_ shadow-erase for a local decl happens
+        // in the EMISSION loop (decl-order-aware), not here: erasing in this
+        // pre-pass made an EARLIER item's citation of the opened name degrade
+        // to a fresh var (patterns.mli's Simple.view row cites `pattern` =
+        // Typedtree.pattern BEFORE the local `type pattern` decl).
         ck.type_substs_.erase(d.name.txt);  // a real decl shadows a `:=`
       }
     // Same shadowing rule for a locally-declared module vs an opened (or
@@ -11555,7 +11603,19 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
       bool nonrec_ = pt->rf == RecFlag::Nonrecursive;
       std::size_t before = out.size();
+      // A local decl SHADOWS a same-named type brought in by an earlier
+      // `open M` (longident.mli's recursive `open Location  type t = ..
+      // Ldot of t loc ..` must NOT qualify its own t to Location.t).  The
+      // erase is decl-order-aware: an ORDINARY group's names shadow from
+      // the group itself (recursion included), a `nonrec` group's only
+      // AFTER it (its RHS still sees the open).  Earlier items citing the
+      // opened name keep the qual (patterns.mli's Simple.view row cites
+      // `pattern` = Typedtree.pattern BEFORE the local decl).
+      if (!nonrec_)
+        for (auto& d : pt->decls) ck.opened_type_quals_.erase(d.name.txt);
       emit_type_decls(ck, pt->decls, out, nonrec_);
+      if (nonrec_)
+        for (auto& d : pt->decls) ck.opened_type_quals_.erase(d.name.txt);
       // Under `open F(X)` in this signature, a nonrec self-manifest
       // (`type nonrec t = t`) resolves the RHS through the OPEN, not the
       // decl itself: qualify it with the applied path (accepted_batch).
