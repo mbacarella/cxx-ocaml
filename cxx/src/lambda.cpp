@@ -3947,6 +3947,17 @@ struct Translator {
           return functor_result_value_sig(fs->second.first, fs->second.second, d->name);
         FnSig s = stdlib_value_sig(pl->name, d->name);
         for (auto& [k, n] : s) if (k != 0) return s;
+        // `module Fmt = Format_doc` (a local alias of another UNIT): Fmt.f
+        // carries the target's labelled sig -- location.ml's
+        // `Fmt.pp_two_columns ~sep ~max_lines` needed the Some-wrap; the
+        // verbatim apply passed a raw int into the ?max_lines match and the
+        // bootstrapped compiler segfaulted (bug #13 part 14).
+        if (auto sa = submod_alias_.find(pl->name);
+            sa != submod_alias_.end() &&
+            sa->second.find('.') == std::string::npos) {
+          FnSig s2 = stdlib_value_sig(sa->second, d->name);
+          for (auto& [k, n] : s2) if (k != 0) return s2;
+        }
         // `open StdLabels; List.map` -> the label sig of ListLabels.map.
         for (auto oit = opened_.rbegin(); oit != opened_.rend(); ++oit) {
           if (module_base(*oit)) continue;
