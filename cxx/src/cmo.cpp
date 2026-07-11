@@ -11,6 +11,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -444,8 +445,20 @@ void write_cmo(const bytecode::Code& code, const std::string& module_name,
     if (cmi_path.size() > 4 && cmi_path.substr(cmi_path.size() - 4) == ".cmo")
       cmi_path.replace(cmi_path.size() - 4, 4, ".cmi");
     for (auto& [name, crc] : cppcaml::cmi::cmiw::read_cmi_crcs(cmi_path)) add(name, crc);
+    // Resolve each referenced unit's interface CRC AT MOST ONCE.  module_cmi_crc
+    // probes the include path (stat storm) and reads+parses the whole .cmi, and
+    // there is one GetCompunit reloc per external-module reference in the code
+    // (thousands), but only ~dozens of distinct units.  Memoizing per name turned
+    // write_cmo from ~85% of a typecore compile into noise.
+    std::unordered_map<std::string, std::string> crc_memo;
+    auto cmi_crc = [&](const std::string& n) -> const std::string& {
+      auto it = crc_memo.find(n);
+      if (it == crc_memo.end())
+        it = crc_memo.emplace(n, cppcaml::cmi::cmiw::module_cmi_crc(n)).first;
+      return it->second;
+    };
     for (auto& r : em.relocs)
-      if (r.k == Reloc::GetCompunit) add(r.name, cppcaml::cmi::cmiw::module_cmi_crc(r.name));
+      if (r.k == Reloc::GetCompunit) add(r.name, cmi_crc(r.name));
     for (auto& name : order)
       imports.push_back(vblock(0, {vstr(name),
                                    crcs[name].empty() ? vint(0) : vblock(0, {vstr(crcs[name])})}));

@@ -1,4 +1,5 @@
 #include "cppcaml/infer.hpp"
+#include "cppcaml/dbgenv.hpp"
 
 #include <execinfo.h>
 
@@ -43,7 +44,7 @@ TypePtr Engine::constr(std::string path, std::vector<TypePtr> args, int stamp) {
   t->stamp = stamp;
   t->id = next_id_++;
   if (stamp == 0) {
-    if (const char* dbg = getenv("CONSTRDBG"); dbg && t->path == dbg) {
+    if (const char* dbg = cppcaml::dbg_env("CONSTRDBG"); dbg && t->path == dbg) {
       void* bt[14]; int n = ::backtrace(bt, 14);
       fprintf(stderr, "[constr0] %s id=%d\n", t->path.c_str(), t->id);
       ::backtrace_symbols_fd(bt, n, 2);
@@ -223,7 +224,7 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
         // its head must stay adoptable (`let re = Str.regexp str in ..
         // String.equal s str` displays String.t; lib-str/parallel.ml).
         if (var->level < 1 && family_prio(t.get()) >= 0) {
-          if (getenv("STAMPDBG"))
+          if (cppcaml::dbg_env("STAMPDBG"))
             fprintf(stderr, "[stamp] %s#%d by var#%d(lvl %d) at engine lvl %d\n",
                     t->path.c_str(), t->id, var->id, var->level, level);
           note(t);
@@ -330,7 +331,7 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     if (last(a->path) != last(b->path) &&
         a->args.size() == b->args.size()) {
       int fa = family_prio(a.get()), fb = family_prio(b.get());
-      if (getenv("FAMDBG") && (a->path.find("key") != std::string::npos ||
+      if (cppcaml::dbg_env("FAMDBG") && (a->path.find("key") != std::string::npos ||
                                b->path.find("key") != std::string::npos))
         fprintf(stderr, "[fam] %s(p%d,l%d,id%d) vs %s(p%d,l%d,id%d)\n",
                 a->path.c_str(), fa, a->level, a->id,
@@ -633,7 +634,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       if (!seen.insert(t.get()).second) return;
       if ((t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object) &&
           t->level != GENERIC_LEVEL) {
-        if (getenv("CCDBG"))
+        if (cppcaml::dbg_env("CCDBG"))
           fprintf(stderr, "[cc] non-generic row #%d (kind %d, lvl %d)\n",
                   t->id, (int)t->kind, t->level);
         ok = false;
@@ -1294,7 +1295,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         path += ")";
       }
       body += path;
-      if (getenv("SHOWIDS")) body += "#" + std::to_string(t->id);
+      if (cppcaml::dbg_env("SHOWIDS")) body += "#" + std::to_string(t->id);
       if (named) body += " as " + names[t.get()];
       if (named && cp > 0) out += "(" + body + ")";
       else out += body;
@@ -1428,7 +1429,7 @@ void show_rec(const TypePtr& t0, std::string& out, int cp,
         }
         body += " ]";
       }
-      if (getenv("SHOWIDS")) body += "{#" + std::to_string(t->id) + "}";
+      if (cppcaml::dbg_env("SHOWIDS")) body += "{#" + std::to_string(t->id) + "}";
       if (multi)
         // ocamlc parenthesizes a named row in every non-top position --
         // including an arrow CODOMAIN (`'a -> ([> `Num of int ] as 'b)`);

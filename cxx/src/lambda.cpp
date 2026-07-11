@@ -1,4 +1,5 @@
 #include "cppcaml/lambda.hpp"
+#include "cppcaml/dbgenv.hpp"
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -1476,7 +1477,7 @@ struct Translator {
       if (std::holds_alternative<Lident>(k->id.txt.v) &&
           !ctor_info_.count(lid_last(k->id.txt))) {
         auto it = vk.pat_constr.find(&p);
-        if (getenv("CTDBG"))
+        if (cppcaml::dbg_env("CTDBG"))
           fprintf(stderr, "[CTDBG] scan_pat ctor %s pat_constr=%s\n",
                   lid_last(k->id.txt).c_str(),
                   it != vk.pat_constr.end() ? it->second.c_str() : "<none>");
@@ -3090,7 +3091,7 @@ struct Translator {
     }
   }
   void register_module_records(const std::string& mod) {
-    if (getenv("RMRDBG"))
+    if (cppcaml::dbg_env("RMRDBG"))
       fprintf(stderr, "[RMRDBG] register_module_records(%s)\n", mod.c_str());
     if (mod.empty() || mod.find('.') != std::string::npos) return;
     if (module_base(mod)) {  // a locally-defined module: AST-derived records
@@ -4726,7 +4727,7 @@ struct Translator {
     // value type (`{ def = {params;body} }` -> {params;body} : lfunction): resolve
     // its (ambiguous) labels through that type, not a same-labelled local record
     // (bytegen's function_to_compile vs Lambda's lfunction).
-    if (getenv("CTDBG"))
+    if (cppcaml::dbg_env("CTDBG"))
       fprintf(stderr, "[CTDBG] rec-pat field %s pat_key=%p hint=%s\n", n.c_str(),
               pat_key,
               pat_key && pat_type_hint_.count(pat_key)
@@ -8619,7 +8620,7 @@ struct Translator {
       for (auto& r : rows) {
         if (!std::holds_alternative<Ppat_construct>(effective_pat(r.lhs)->desc)) continue;
         auto it = vk.pat_constr.find(effective_pat(r.lhs));
-        if (getenv("CTDBG")) {
+        if (cppcaml::dbg_env("CTDBG")) {
           auto* kk = std::get_if<Ppat_construct>(&effective_pat(r.lhs)->desc);
           fprintf(stderr, "[CTDBG] match row ctor %s pat_constr=%s\n",
                   kk ? lid_last(kk->id.txt).c_str() : "?",
@@ -8959,7 +8960,7 @@ struct Translator {
       // shadowed builtin (`exception Error` vs result's Error).  A predefined
       // exception (Failure/Invalid_argument/..) counts as an exception ctor too:
       // without this, `function Failure s -> ..` collapses and drops `s`.
-      if (getenv("CTDBG"))
+      if (cppcaml::dbg_env("CTDBG"))
         fprintf(stderr,
                 "[CTDBG] exn-pat %s qual=%d exn_i=%d exn_f=%d predef=%d "
                 "ctor=%d builtin=%d\n",
@@ -10186,7 +10187,7 @@ struct Translator {
           // table_for matched obj_tag on an immediate; bootstrap bug#13)
           if (auto sa = submod_alias_.find(dotted); sa != submod_alias_.end())
             dotted = sa->second;
-          if (getenv("CTDBG"))
+          if (cppcaml::dbg_env("CTDBG"))
             fprintf(stderr, "[CTDBG] expr-open dotted=%s alias=%d\n",
                     dotted.c_str(), (int)submod_alias_.count(dotted));
           if (dotted.find('.') != std::string::npos)
@@ -10804,7 +10805,7 @@ struct Translator {
         if (auto* l = std::get_if<Lident>(&id->id.txt.v))
           if (auto* b = lookup(l->name))
             if (auto vp = var_record_path_.find(b->stamp); vp != var_record_path_.end()) {
-              if (getenv("RMRDBG"))
+              if (cppcaml::dbg_env("RMRDBG"))
                 fprintf(stderr, "[RMRDBG] field %s: var_record_path %s.%s\n",
                         l->name.c_str(), vp->second.c_str(),
                         lid_last(fe->field.txt).c_str());
@@ -10823,7 +10824,7 @@ struct Translator {
       // identity (the bare find_field below cannot disambiguate same-named
       // records -- Sign_diff.t.untypables@4 vs signature_symptom.untypables@8).
       if (auto it = vk.field_resolved.find(&e); it != vk.field_resolved.end()) {
-        if (getenv("RMRDBG"))
+        if (cppcaml::dbg_env("RMRDBG"))
           fprintf(stderr, "[RMRDBG] field %s: vk.field_resolved idx=%d\n",
                   lid_last(fe->field.txt).c_str(), it->second.index);
         auto l = mk(Lam::K::Prim);
@@ -10843,7 +10844,7 @@ struct Translator {
         const std::string& p = it->second;
         auto dpos = p.rfind('.');
         std::string lbl = lid_last(fe->field.txt);
-        if (getenv("RMRDBG"))
+        if (cppcaml::dbg_env("RMRDBG"))
           fprintf(stderr, "[RMRDBG] field %s: base expr_constr=%s\n",
                   lbl.c_str(), p.c_str());
         if (dpos != std::string::npos && p.find('.') == dpos) {
@@ -11076,7 +11077,7 @@ struct Translator {
       // Mirrors scan_pat_ctors' pattern-side type-directed registration.
       if (std::holds_alternative<Lident>(k->id.txt.v) && !ctor_info_.count(n)) {
         auto itc = vk.expr_constr.find(&e);
-        if (getenv("CTDBG"))
+        if (cppcaml::dbg_env("CTDBG"))
           fprintf(stderr, "[CTDBG] bare ctor %s expr_constr=%s\n", n.c_str(),
                   itc != vk.expr_constr.end() ? itc->second.c_str() : "<none>");
         if (itc != vk.expr_constr.end()) register_ctors_of_type(itc->second);
@@ -11385,7 +11386,7 @@ struct Translator {
               }
             }
           }
-      if (getenv("CTDBG")) {
+      if (cppcaml::dbg_env("CTDBG")) {
         std::string dotted;
         lid_to_dotted(k->id.txt, dotted);
         const CtorInfo* qi = std::holds_alternative<Ldot>(k->id.txt.v)
@@ -16621,7 +16622,7 @@ struct Translator {
             // ?used_slot None-fill.
             if (binders.size() == 1 &&
                 std::holds_alternative<Ppat_constraint>(b.pat.desc)) {
-              if (getenv("REFDBG"))
+              if (cppcaml::dbg_env("REFDBG"))
                 fprintf(stderr, "[REFDBG] constrained let %s stamp=%d\n",
                         binders[0].first.name.c_str(), binders[0].first.stamp);
               record_fn_sig(binders[0].first, b.expr.get(), binding_annot(b));
