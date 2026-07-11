@@ -228,12 +228,21 @@ class Parser {
   Position position(size_t cnum) const {
     int ans = phys_line_index(cnum);
     Position p{ans + 1, line_starts_[ans], static_cast<int>(cnum), 0};
-    for (int i = static_cast<int>(dirs_.size()) - 1; i >= 0; --i)  // latest directive ≤ cnum
-      if (dirs_[i].anchor_cnum <= static_cast<int>(cnum)) {
-        p.lnum = dirs_[i].line + (ans - dirs_[i].phys_line);  // renumbered from N
-        p.file_id = dirs_[i].file_id;
-        break;
-      }
+    // dirs_ is in source order, so anchor_cnum is ascending: binary-search the
+    // latest directive with anchor_cnum <= cnum.  A backward linear scan here is
+    // O(#directives) per lookup = O(n^2) on generated files carrying thousands
+    // of `# N "file"` directives (parser.ml has ~7500); it dominated that file's
+    // compile (~36% of the whole build's parse time).
+    int lo = 0, hi = static_cast<int>(dirs_.size()) - 1, di = -1;
+    while (lo <= hi) {
+      int mid = (lo + hi) / 2;
+      if (dirs_[mid].anchor_cnum <= static_cast<int>(cnum)) { di = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    if (di >= 0) {  // renumbered from N
+      p.lnum = dirs_[di].line + (ans - dirs_[di].phys_line);
+      p.file_id = dirs_[di].file_id;
+    }
     return p;
   }
   Location tokloc(const Token& t) const {
