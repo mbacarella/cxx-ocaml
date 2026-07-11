@@ -4509,31 +4509,32 @@ struct Translator {
             stem2path.emplace(ent.path().stem().string(), ent.path().string());
       }
     }
-    std::set<std::string> want;  // file stems to index
+    // A cmi already full-decoded by inference is reused straight from load()'s
+    // cache (its sig().types are identical to the lean decode's, and load() now
+    // fills imports() too) -- so the ~half of the scope that inference touched
+    // costs no second decode; only the crc-expanded extras get a lean decode.
+    std::map<std::string, std::string> full_by_stem;
     for (auto& p : cmi::CmiFile::loaded_paths())
-      want.insert(std::filesystem::path(p).stem().string());
+      full_by_stem[std::filesystem::path(p).stem().string()] = p;
+    auto cmi_for = [&](const std::string& stem) -> const cmi::CmiFile* {
+      if (auto f = full_by_stem.find(stem); f != full_by_stem.end())
+        try { return &cmi::CmiFile::load(f->second); } catch (...) {}
+      if (auto it = stem2path.find(stem); it != stem2path.end())
+        try { return &cmi::CmiFile::load_types_only(it->second); } catch (...) {}
+      return nullptr;
+    };
+    std::set<std::string> want;  // file stems to index
+    for (auto& [s, _] : full_by_stem) want.insert(s);
     for (auto& o : opened_) want.insert(to_stem(o));
     // Expand each seed by its transitive imports (crc table).
     std::set<std::string> seed = want;
-    for (auto& s : seed) {
-      auto it = stem2path.find(s);
-      if (it == stem2path.end()) continue;
-      try {
-        for (auto& imp : cmi::CmiFile::load_types_only(it->second).imports())
-          want.insert(to_stem(imp));
-      } catch (...) {}
-    }
-    std::set<std::string> paths;
-    for (auto& s : want)
-      if (auto it = stem2path.find(s); it != stem2path.end()) paths.insert(it->second);
-    auto index_cmi = [&](const std::string& path) {
+    for (auto& s : seed)
+      if (const cmi::CmiFile* c = cmi_for(s))
+        for (auto& imp : c->imports()) want.insert(to_stem(imp));
+    auto index_cmi = [&](const std::string& stem, const cmi::CmiFile& cmi) {
       ++nfiles;
       try {
-        // The index reads only top-level records/variants; a lean types-only
-        // decode skips value type-graphs and submodule sigs (the bulk of a
-        // full decode).
-        const auto& cmi = cmi::CmiFile::load_types_only(path);
-        std::string modname = std::filesystem::path(path).stem().string();
+        std::string modname = stem;
         if (!modname.empty()) modname[0] = (char)std::toupper((unsigned char)modname[0]);
         for (auto& td : cmi.sig().types) {
             if (td.kind == cmi::TypeDecl::Variant && !td.ctors.empty())
@@ -4586,7 +4587,8 @@ struct Translator {
           }
       } catch (...) {}
     };
-    for (auto& p : paths) index_cmi(p);
+    for (auto& s : want)
+      if (const cmi::CmiFile* c = cmi_for(s)) index_cmi(s, *c);
     if (prof) {
       auto ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();

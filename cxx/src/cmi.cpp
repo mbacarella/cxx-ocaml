@@ -608,11 +608,13 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
   auto& cache = g_load_cache;
   if (auto it = cache.find(filepath); it != cache.end()) return it->second;
   m::Arena arena;
-  std::size_t header = read_cmi_arena(filepath, arena);
+  CmiFile cmi;
+  // Fill imports() too (the crc table is a cheap tail read): the labelset index
+  // reuses full-loaded cmis and needs their transitive-import set for scoping.
+  std::size_t header = read_cmi_arena(filepath, arena, &cmi.imports_);
   const m::Value& tuple = arena[header];  // (modname, signature)
 
   Decoder dec(arena);
-  CmiFile cmi;
   cmi.module_name_ = arena[tuple.fields.at(0)].str;
   cmi.sig_ = dec.signature(tuple.fields.at(1));
   return cache.emplace(filepath, std::move(cmi)).first->second;
