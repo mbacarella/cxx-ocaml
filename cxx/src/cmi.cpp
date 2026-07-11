@@ -1374,17 +1374,29 @@ struct TyEmit {
         return texpr(o::vblock(2, {o::vlist(elems)}));  // Ttuple of (so * te) list
       }
       case Ty::Variant: {
-        // A polymorphic-variant row.  ocamlc stores row_fields in
-        // REVERSE-alphabetical order (the printer reads them back reversed, so
-        // the printed row is alphabetical); an exact row's row_more is Tnil, an
-        // open/upper one's a Tvar.  Fields are RFpresent(arg option), except an
-        // upper `[<` row's non-present tags which are RFeither{no_arg; arg_type;
+        // A polymorphic-variant row.  ocamlc stores row_fields sorted by tag
+        // HASH descending (Btype.hash_variant -- the merge-joins in
+        // Ctype.subtype/unify pair tags positionally over hash-sorted rows,
+        // so any other order silently mispairs: patterns.cmi's
+        // `Half_simple.pattern :> General.pattern` width coercion was
+        // rejected with "does not allow tag(s) `Alias, `Var" under
+        // reverse-ALPHABETICAL order, which coincides with hash order only
+        // for small rows); an exact row's row_more is Tnil, an open/upper
+        // one's a Tvar.  Fields are RFpresent(arg option), except an upper
+        // `[<` row's non-present tags which are RFeither{no_arg; arg_type;
         // matched=false; ext=ref RFnone}.
         // row_desc = { row_fields; row_more; row_closed; row_fixed; row_name }.
+        auto hash_variant = [](const std::string& s) -> long long {
+          unsigned long long accu = 0;
+          for (unsigned char c : s) accu = 223 * accu + c;
+          long long r = (long long)(accu & ((1ULL << 31) - 1));
+          if (r > 0x3FFFFFFF) r -= (1LL << 31);
+          return r;
+        };
         std::vector<std::size_t> ord(t->pv_tags.size());
         for (std::size_t i = 0; i < ord.size(); ++i) ord[i] = i;
         std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
-          return t->pv_tags[a] > t->pv_tags[b];
+          return hash_variant(t->pv_tags[a]) > hash_variant(t->pv_tags[b]);
         });
         std::unordered_set<std::string> present(t->pv_present.begin(),
                                                 t->pv_present.end());

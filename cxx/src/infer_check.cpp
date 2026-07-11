@@ -3003,6 +3003,76 @@ struct Checker {
       collect_bare_type_names(*po->type, out);
     }
   }
+  // ---- Variance computation (Typedecl_variance port, cmi-writer side) ----
+  // ocamlc COMPUTES type_variance for concrete decls; the reader's subtype/
+  // unify checks consume it (patterns.cmi's `Half_simple.pattern :>
+  // General.pattern` width coercion was rejected because pattern_data's
+  // param carried Variance.unknown instead of the computed covariance).
+  // Computed (finalized) variances of decls already emitted by this checker,
+  // keyed by bare name -- consulted when a later decl's body cites them.
+  std::unordered_map<std::string, std::vector<int>> computed_variances_;
+  // The variance signature of an EXTERNAL type constructor: predef table,
+  // locally computed decls, or the head unit's cmi (reader-parsed
+  // td.variances).  Empty = unknown (caller walks args with unknown).
+  std::vector<int> external_type_variance_sig(const Ptyp_constr& c,
+                                              std::size_t arity) {
+    static const int COV = 25, FULL = 63;
+    auto builtin = [&](const std::string& n) -> std::vector<int> {
+      if (arity == 1 &&
+          (n == "list" || n == "option" || n == "lazy_t" || n == "iarray" ||
+           n == "Lazy.t" || n == "Seq.t"))
+        return {COV};
+      if (arity == 1 && (n == "array" || n == "ref" || n == "atomic_loc" ||
+                         n == "eff" || n == "Atomic.t"))
+        return {FULL};
+      if (arity == 2 && n == "result") return {COV, COV};
+      if (arity == 2 && n == "continuation") return {46, COV};
+      return {};
+    };
+    std::string dotted;
+    if (auto* l = std::get_if<Lident>(&c.id.txt.v)) {
+      if (auto f = computed_variances_.find(l->name);
+          f != computed_variances_.end() && f->second.size() == arity)
+        return f->second;
+      if (auto b = builtin(l->name); !b.empty()) return b;
+      if (auto q = opened_type_quals_.find(l->name);
+          q != opened_type_quals_.end())
+        dotted = q->second;
+      else
+        return {};
+    } else if (std::holds_alternative<Ldot>(c.id.txt.v)) {
+      dotted = lid_full(c.id.txt);
+    } else {
+      return {};
+    }
+    if (auto b = builtin(dotted); !b.empty()) return b;
+    // Navigate the head unit's cmi (same pattern as expand_qualified_abbrev).
+    auto dp = dotted.rfind('.');
+    if (dp == std::string::npos) return {};
+    std::string tyname = dotted.substr(dp + 1);
+    std::vector<std::string> comps;
+    for (std::size_t p = 0, d2; p < dp; p = d2 + 1) {
+      d2 = dotted.find('.', p);
+      if (d2 == std::string::npos || d2 > dp) d2 = dp;
+      comps.push_back(dotted.substr(p, d2 - p));
+    }
+    try {
+      std::vector<cmi::CmiFile> loaded;
+      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back().sig();
+      for (std::size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == tyname && td.variances.size() == arity)
+            return std::vector<int>(td.variances.begin(), td.variances.end());
+    } catch (...) {}
+    return {};
+  }
   // Cyclic type-abbreviation check: an abbreviation whose expansion refers back
   // to itself (`type t = t * t`, `type a = b and b = a`) is rejected (no
   // -rectypes).  Only file-local aliases participate, so this never
@@ -10353,6 +10423,312 @@ static cmi::cmiw::TyPtr pv_row_manifest(
                                    std::move(present));
 }
 
+// ---- Variance computation (Typedecl_variance port) ----
+// Types.Variance bit encoding: May_pos=1, May_neg=2+4, May_weak=4, Inj=8,
+// Pos=16+8+1, Neg=32+8+4+2, Inv=63; unknown=7, covariant=Pos, full=Inv.
+namespace vrn {
+constexpr int MAY_POS = 1, MAY_NEG = 6, MAY_WEAK = 4, INJ = 8, POS = 25,
+              NEG = 46, INV = 63, UNKNOWN = 7;
+inline bool mem(int f, int v) { return (v & f) == f; }
+inline int set_if(bool b, int f, int v) { return b ? (v | f) : v; }
+inline int make(bool p, bool n, bool i) {
+  return set_if(p, MAY_POS, set_if(n, MAY_NEG, set_if(i, INJ, 0)));
+}
+inline int conjugate(int v) {
+  int vp = v & (INJ | MAY_WEAK);
+  int r = set_if(mem(MAY_NEG, v), MAY_POS, set_if(mem(MAY_POS, v), MAY_NEG, vp));
+  return set_if(mem(NEG, v), POS, set_if(mem(POS, v), NEG, r));
+}
+inline int compose(int v1, int v2) {
+  if (mem(INV, v1) && mem(INJ, v2)) return INV;
+  bool mp = (mem(MAY_POS, v1) && mem(MAY_POS, v2)) ||
+            (mem(MAY_NEG, v1) && mem(MAY_NEG, v2));
+  bool mn = (mem(MAY_POS, v1) && mem(MAY_NEG, v2)) ||
+            (mem(MAY_NEG, v1) && mem(MAY_POS, v2));
+  bool mw = (mem(MAY_WEAK, v1) && v2 != 0) || (v1 != 0 && mem(MAY_WEAK, v2));
+  bool inj = mem(INJ, v1) && mem(INJ, v2);
+  bool pos = (mem(POS, v1) && mem(POS, v2)) || (mem(NEG, v1) && mem(NEG, v2));
+  bool neg = (mem(POS, v1) && mem(NEG, v2)) || (mem(NEG, v1) && mem(POS, v2));
+  int v = 0;
+  v = set_if(mp, MAY_POS, v); v = set_if(mn, MAY_NEG, v);
+  v = set_if(mw, MAY_WEAK, v); v = set_if(inj, INJ, v);
+  v = set_if(pos, POS, v); v = set_if(neg, NEG, v);
+  return v;
+}
+inline int strengthen(int v) {
+  return mem(MAY_NEG, v) ? v : (v & (INV - MAY_WEAK));
+}
+}  // namespace vrn
+
+// Occurrence walk over an AST core type (compute_variance's shape).  `slot`
+// maps a param var name to its index; Tconstr args compose through the
+// callee's variance signature (current group iterate, earlier local decls,
+// predef table, or the head unit's cmi); an unresolvable callee walks its
+// args with Variance.unknown, exactly like ocamlc's Not_found branch.
+static void variance_walk(
+    Checker& ck, const CoreType& t, int v,
+    const std::map<std::string, std::size_t>& slot, std::vector<int>& vari,
+    const std::map<std::string, std::vector<int>>& group, int depth = 0) {
+  if (depth > 60) return;
+  auto same = [&](const CoreType& t2) {
+    variance_walk(ck, t2, v, slot, vari, group, depth + 1);
+  };
+  if (auto* var = std::get_if<Ptyp_var>(&t.desc)) {
+    if (auto s = slot.find(var->name); s != slot.end())
+      vari[s->second] |= v;
+  } else if (auto* ar = std::get_if<Ptyp_arrow>(&t.desc)) {
+    variance_walk(ck, *ar->dom, vrn::conjugate(v), slot, vari, group, depth + 1);
+    same(*ar->cod);
+  } else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+    for (auto& e : tu->elems) same(*e);
+  } else if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+    if (c->args.empty()) return;
+    std::vector<int> sig;
+    if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+      if (auto g = group.find(l->name);
+          g != group.end() && g->second.size() == c->args.size())
+        sig = g->second;
+    if (sig.empty()) sig = ck.external_type_variance_sig(*c, c->args.size());
+    for (std::size_t i = 0; i < c->args.size(); ++i)
+      variance_walk(ck, *c->args[i],
+                    sig.size() == c->args.size() ? vrn::compose(v, sig[i])
+                                                 : vrn::UNKNOWN,
+                    slot, vari, group, depth + 1);
+  } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+    if (auto s = slot.find(al->name); s != slot.end()) vari[s->second] |= v;
+    same(*al->type);
+  } else if (auto* pv = std::get_if<Ptyp_variant>(&t.desc)) {
+    std::set<std::string> present;
+    if (pv->labels) present.insert(pv->labels->begin(), pv->labels->end());
+    bool upper = pv->closed == ClosedFlag::Closed && pv->labels;
+    for (auto& r : pv->rows) {
+      if (auto* rt = std::get_if<Rtag>(&r)) {
+        int fv = (upper && !present.count(rt->name)) ? (v & vrn::UNKNOWN) : v;
+        for (auto& ty : rt->types)
+          variance_walk(ck, *ty, fv, slot, vari, group, depth + 1);
+      } else if (auto* ri = std::get_if<Rinherit>(&r)) {
+        same(*ri->ct);
+      }
+    }
+  } else if (auto* ob = std::get_if<Ptyp_object>(&t.desc)) {
+    for (auto& f : ob->fields) {
+      if (auto* ot = std::get_if<Otag>(&f)) same(*ot->type);
+      else if (auto* oi = std::get_if<Oinherit>(&f)) same(*oi->type);
+    }
+  } else if (auto* po = std::get_if<Ptyp_poly>(&t.desc)) {
+    same(*po->type);
+  } else if (auto* pk = std::get_if<Ptyp_package>(&t.desc)) {
+    for (auto& [_, ct] : pk->constraints)
+      variance_walk(ck, *ct, vrn::compose(v, vrn::INV), slot, vari, group,
+                    depth + 1);
+  } else if (auto* cl = std::get_if<Ptyp_class>(&t.desc)) {
+    for (auto& a : cl->args)
+      variance_walk(ck, *a, vrn::UNKNOWN, slot, vari, group, depth + 1);
+  }
+}
+
+// compute_variance_type's finalization for one decl.  `is_var[i]` = the
+// param is still a type VARIABLE at type level; a row-aliased param
+// (`[< .. ] as 'a` -- the param IS the row) takes ocamlc's non-Tvar
+// branches: required (p,n) always applied, plus full/covariant on concrete
+// kinds.
+static std::vector<int> variance_finalize(
+    const TypeDeclaration& d, const std::vector<int>& vari, bool concr,
+    bool do_strengthen, const std::vector<bool>& is_var) {
+  std::vector<int> out(vari.size());
+  for (std::size_t i = 0; i < vari.size(); ++i) {
+    int req = i < d.param_variances.size() ? d.param_variances[i] : 7;
+    bool p = (req & 1) != 0, n = (req & 2) != 0;
+    bool priv = d.priv == PrivateFlag::Private;
+    bool set_pn = priv || !is_var[i];
+    int v = vari[i] |
+            vrn::make(set_pn ? p : false, set_pn ? n : false, concr);
+    if (concr && !is_var[i])
+      v |= p ? (n ? vrn::INV : vrn::POS) : vrn::conjugate(vrn::POS);
+    out[i] = do_strengthen ? vrn::strengthen(v) : v;
+  }
+  return out;
+}
+
+// Does the core type contain `.. as 'name` (a row/object alias binding)?
+static bool has_alias_named(const CoreType& t, const std::string& name,
+                            int depth = 0) {
+  if (depth > 60) return false;
+  if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+    if (al->name == name) return true;
+    return has_alias_named(*al->type, name, depth + 1);
+  }
+  if (auto* ar = std::get_if<Ptyp_arrow>(&t.desc))
+    return has_alias_named(*ar->dom, name, depth + 1) ||
+           has_alias_named(*ar->cod, name, depth + 1);
+  if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+    for (auto& e : tu->elems)
+      if (has_alias_named(*e, name, depth + 1)) return true;
+    return false;
+  }
+  if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+    for (auto& a : c->args)
+      if (has_alias_named(*a, name, depth + 1)) return true;
+    return false;
+  }
+  if (auto* pv = std::get_if<Ptyp_variant>(&t.desc)) {
+    for (auto& r : pv->rows) {
+      if (auto* rt = std::get_if<Rtag>(&r)) {
+        for (auto& ty : rt->types)
+          if (has_alias_named(*ty, name, depth + 1)) return true;
+      } else if (auto* ri = std::get_if<Rinherit>(&r)) {
+        if (has_alias_named(*ri->ct, name, depth + 1)) return true;
+      }
+    }
+    return false;
+  }
+  if (auto* ob = std::get_if<Ptyp_object>(&t.desc)) {
+    for (auto& f : ob->fields) {
+      if (auto* ot = std::get_if<Otag>(&f)) {
+        if (has_alias_named(*ot->type, name, depth + 1)) return true;
+      } else if (auto* oi = std::get_if<Oinherit>(&f)) {
+        if (has_alias_named(*oi->type, name, depth + 1)) return true;
+      }
+    }
+    return false;
+  }
+  if (auto* po = std::get_if<Ptyp_poly>(&t.desc))
+    return has_alias_named(*po->type, name, depth + 1);
+  return false;
+}
+
+// One decl's computed variance list, or empty when the decl keeps the
+// writer's current behavior (abstract-without-manifest, constrained).
+static std::vector<int> compute_decl_variance(
+    Checker& ck, const TypeDeclaration& d,
+    const std::map<std::string, std::vector<int>>& group) {
+  if (d.params.empty() || !d.constraints.empty()) return {};
+  auto* rec = std::get_if<Ptype_record>(&d.kind);
+  auto* var = std::get_if<Ptype_variant>(&d.kind);
+  bool abstract_kind = !rec && !var;
+  if (abstract_kind && !d.manifest) return {};
+  std::map<std::string, std::size_t> slot;
+  for (std::size_t i = 0; i < d.params.size(); ++i)
+    if (auto* pv = std::get_if<Ptyp_var>(&d.params[i]->desc))
+      slot[pv->name] = i;
+  bool is_gadt = false;
+  if (var)
+    for (auto& c : var->ctors)
+      if (c.res) is_gadt = true;
+  if (!is_gadt) {
+    std::vector<int> vari(d.params.size(), 0);
+    if (d.manifest)
+      variance_walk(ck, **d.manifest, vrn::POS, slot, vari, group);
+    if (rec)
+      for (auto& f : rec->fields)
+        variance_walk(ck, *f.type,
+                      f.mut == MutableFlag::Mutable ? vrn::INV : vrn::POS,
+                      slot, vari, group);
+    if (var)
+      for (auto& c : var->ctors) {
+        if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
+          for (auto& e : tup->elems)
+            variance_walk(ck, *e, vrn::POS, slot, vari, group);
+        else if (auto* r = std::get_if<Pcstr_record>(&c.args))
+          for (auto& f : r->fields)
+            variance_walk(ck, *f.type,
+                          f.mut == MutableFlag::Mutable ? vrn::INV : vrn::POS,
+                          slot, vari, group);
+      }
+    bool concr = !abstract_kind;
+    bool do_strengthen = !d.manifest || !abstract_kind;
+    // A row-aliased param (`[< .. ] as 'a` anywhere in the body): the param
+    // is INSTANTIATED to the row at type level -- non-Tvar finalization.
+    std::vector<bool> is_var(d.params.size(), true);
+    for (std::size_t i = 0; i < d.params.size(); ++i) {
+      auto* pv2 = std::get_if<Ptyp_var>(&d.params[i]->desc);
+      if (!pv2) { is_var[i] = false; continue; }
+      auto aliased = [&](const CoreType& t) {
+        return has_alias_named(t, pv2->name);
+      };
+      if (d.manifest && aliased(**d.manifest)) is_var[i] = false;
+      if (rec)
+        for (auto& f : rec->fields)
+          if (aliased(*f.type)) is_var[i] = false;
+      if (var)
+        for (auto& c : var->ctors) {
+          if (auto* tup = std::get_if<Pcstr_tuple>(&c.args)) {
+            for (auto& e : tup->elems)
+              if (aliased(*e)) is_var[i] = false;
+          } else if (auto* r = std::get_if<Pcstr_record>(&c.args)) {
+            for (auto& f : r->fields)
+              if (aliased(*f.type)) is_var[i] = false;
+          }
+        }
+    }
+    return variance_finalize(d, vari, concr, do_strengthen, is_var);
+  }
+  // GADT: per-constructor computation with the result type's args standing
+  // in for the params (compute_variance_gadt), unioned; type_private forced
+  // Private per part; strengthen applied to the union (kind is concrete).
+  std::vector<int> acc(d.params.size(), 0);
+  bool any_part = false;
+  auto add_part = [&](const std::vector<int>& part) {
+    for (std::size_t i = 0; i < acc.size() && i < part.size(); ++i)
+      acc[i] |= part[i];
+    any_part = true;
+  };
+  TypeDeclaration dpriv_proto;  // finalize under Private via a flag instead
+  if (d.manifest) {
+    std::vector<int> vari(d.params.size(), 0);
+    variance_walk(ck, **d.manifest, vrn::POS, slot, vari, group);
+    std::vector<int> part(vari.size());
+    for (std::size_t i = 0; i < vari.size(); ++i) {
+      int req = i < d.param_variances.size() ? d.param_variances[i] : 7;
+      part[i] = vari[i] | vrn::make((req & 1) != 0, (req & 2) != 0, true);
+    }
+    add_part(part);
+  }
+  for (auto& c : var->ctors) {
+    std::map<std::string, std::size_t> cslot;
+    // Which per-position "params" are type VARIABLES: a GADT ctor's result
+    // args stand in for the params (compute_variance_gadt), and a CONCRETE
+    // ret arg (`V : value cat`) takes the non-Tvar finalization -- union
+    // with full/covariant per the required (p,n).
+    std::vector<bool> is_var(d.params.size(), true);
+    if (c.res) {
+      if (auto* rc = std::get_if<Ptyp_constr>(&(*c.res)->desc))
+        for (std::size_t i = 0; i < d.params.size(); ++i) {
+          if (i < rc->args.size() &&
+              std::holds_alternative<Ptyp_var>(rc->args[i]->desc))
+            cslot[std::get<Ptyp_var>(rc->args[i]->desc).name] = i;
+          else
+            is_var[i] = false;
+        }
+    } else {
+      cslot = slot;
+    }
+    std::vector<int> vari(d.params.size(), 0);
+    if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
+      for (auto& e : tup->elems)
+        variance_walk(ck, *e, vrn::POS, cslot, vari, group);
+    else if (auto* r = std::get_if<Pcstr_record>(&c.args))
+      for (auto& f : r->fields)
+        variance_walk(ck, *f.type,
+                      f.mut == MutableFlag::Mutable ? vrn::INV : vrn::POS,
+                      cslot, vari, group);
+    std::vector<int> part(vari.size());
+    for (std::size_t i = 0; i < vari.size(); ++i) {
+      int req = i < d.param_variances.size() ? d.param_variances[i] : 7;
+      bool p = (req & 1) != 0, n = (req & 2) != 0;
+      // Private per compute_variance_gadt: required (p,n) applied.
+      part[i] = vari[i] | vrn::make(p, n, true);
+      if (!is_var[i])
+        part[i] |= p ? (n ? vrn::INV : vrn::POS) : vrn::conjugate(vrn::POS);
+    }
+    add_part(part);
+  }
+  (void)dpriv_proto;
+  if (!any_part) return {};
+  for (auto& v : acc) v = vrn::strengthen(v);
+  return acc;
+}
+
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
@@ -10543,6 +10919,36 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
                                  d.param_variances.end());
     }
     out.push_back(std::move(si));
+  }
+  // COMPUTED variance for concrete decls (record/variant/manifest), fixed
+  // point over the recursive group -- ocamlc's Typedecl_properties iterate.
+  // Abstract-without-manifest and constrained decls keep the written/default
+  // behavior above (compute_decl_variance returns empty for them).
+  {
+    std::map<std::string, std::vector<int>> cur;
+    for (auto& d : decls)
+      if (!d.params.empty())
+        cur[d.name.txt] = std::vector<int>(d.params.size(), 0);
+    for (int iter = 0; iter < 16; ++iter) {
+      bool changed = false;
+      for (auto& d : decls) {
+        auto v = compute_decl_variance(ck, d, cur);
+        if (v.empty()) continue;
+        auto& slotv = cur[d.name.txt];
+        if (slotv != v) { slotv = v; changed = true; }
+      }
+      if (!changed) break;
+    }
+    for (auto& d : decls) {
+      auto v = compute_decl_variance(ck, d, cur);
+      if (v.empty()) continue;
+      ck.computed_variances_[d.name.txt] = v;
+      for (size_t i = first_new; i < out.size(); ++i)
+        if (out[i].k == cmi::cmiw::SigItem::Type && out[i].name == d.name.txt) {
+          out[i].type_variances.assign(v.begin(), v.end());
+          break;
+        }
+    }
   }
   // A `type a .. and b ..` group: Trec_first on the head, Trec_next after
   // (ocamlc prints the group back with `and`).  A `type nonrec` head is
