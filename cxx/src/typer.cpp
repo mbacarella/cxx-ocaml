@@ -19,7 +19,7 @@ const std::unordered_set<std::string>& stdlib_values() {
   static const std::unordered_set<std::string> s = [] {
     std::unordered_set<std::string> out;
     try {
-      auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
+      const auto& cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
       for (auto& v : cmi.values()) out.insert(v.name);
     } catch (...) {
       // No stdlib found: only locals will resolve.
@@ -35,7 +35,7 @@ const std::unordered_set<std::string>& stdlib_types() {
   static const std::unordered_set<std::string> s = [] {
     std::unordered_set<std::string> out;
     try {
-      auto cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
+      const auto& cmi = cmi::CmiFile::load("stdlib/stdlib.cmi");
       for (auto& t : cmi.types()) out.insert(t.name);
     } catch (...) {
     }

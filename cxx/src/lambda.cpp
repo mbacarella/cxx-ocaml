@@ -963,7 +963,7 @@ struct Translator {
     std::string head = dot == std::string::npos ? dotted : dotted.substr(0, dot);
     if (module_base(head)) return;  // a local module: its types are AST-visible
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t pos = dot; pos != std::string::npos;) {
         size_t nd = dotted.find('.', pos + 1);
@@ -1089,7 +1089,7 @@ struct Translator {
   // Skips names already known (predef wins) and names ambiguous across stdlib types.
   void register_stdlib_ctors() {
     try {
-      auto cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
+      const auto& cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
       std::set<std::string> ambiguous;
       std::unordered_map<std::string, CtorInfo> found;
       for (auto& td : cmi.sig().types) {
@@ -1138,7 +1138,7 @@ struct Translator {
       // (`Bytesections.Name`): load the head unit's cmi and walk the submodule
       // chain to that signature.
       size_t dot = mod.find('.');
-      auto cmi = cmi::CmiFile::load(
+      const auto& cmi = cmi::CmiFile::load(
           resolve_cmi(dot == std::string::npos ? mod : mod.substr(0, dot)));
       const cmi::Signature* sig = &cmi.sig();
       std::vector<std::shared_ptr<cmi::CmiFile>> keep;  // park cross-unit cmis
@@ -2182,7 +2182,7 @@ struct Translator {
     if (prefix.find('.') != std::string::npos || module_base(prefix))
       return nullptr;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(prefix));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(prefix));
       for (auto& tx : cmi.sig().typexts)
         if (tx.name == dq->name) {
           if (tx.is_inline_record) return nullptr;
@@ -2238,7 +2238,7 @@ struct Translator {
     if (dot != std::string::npos) {  // Head.S -> the head module's cmi modtype
       std::string head = mtname.substr(0, dot);
       if (head.find('.') == std::string::npos && !module_base(head)) try {
-        auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+        const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
         for (auto& md : cmi.sig().modtypes)
           if (md.name == last) return mt_fields(cmi, md.type);
       } catch (...) {}
@@ -2518,7 +2518,7 @@ struct Translator {
   bool cmi_declares_modtype(const std::string& unit, const std::string& name) {
     if (module_base(unit)) return false;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(unit));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(unit));
       for (auto& md : cmi.sig().modtypes)
         if (md.name == name) return true;
     } catch (...) {}
@@ -2670,7 +2670,7 @@ struct Translator {
     auto* pl = std::get_if<Lident>(&d->prefix->v);
     if (!pl || module_base(pl->name) || fields_of(pl->name).empty()) return;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(pl->name));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(pl->name));
       for (auto& md : cmi.sig().modules)
         if (md.name == d->name && md.type && md.type->kind == cmi::ModuleType::Functor)
           if (const cmi::Signature* rs = mt_sig(cmi, md.type->functor_body))
@@ -2804,7 +2804,7 @@ struct Translator {
     std::unordered_map<std::string, int> m;
     std::unordered_map<std::string, StdPrim> pr;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       int i = 0;
       for (auto& f : cmi.sig().fields) m[f] = i++;
       for (auto& v : cmi.values()) if (!v.prim.empty()) {
@@ -2834,7 +2834,7 @@ struct Translator {
     if (auto it = alias_target_cache_.find(ck); it != alias_target_cache_.end()) return it->second;
     std::string tgt;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& md : cmi.sig().modules)
         if (md.name == sub && md.type && md.type->kind == cmi::ModuleType::Alias && md.type->path) {
           std::string nm = md.type->path->kind == cmi::Path::Pident ? md.type->path->id.name
@@ -2912,7 +2912,7 @@ struct Translator {
     size_t dot = dotted.find('.');
     if (dot != std::string::npos) try {
       std::string head = dotted.substr(0, dot);
-      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       std::vector<std::shared_ptr<cmi::CmiFile>> keep;  // park cross-unit cmis
       size_t pos = dot + 1;
@@ -3105,7 +3105,7 @@ struct Translator {
     // must register so `item.psig_desc` resolves to a field read (not 0).
     if (!module_records_done_.insert(mod).second) return;    // once
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.sig().types) {
         if (td.kind == cmi::TypeDecl::Record) {
           // An ALL-FLOAT record (Complex.t = {re;im}) has the flat Double_array_tag
@@ -3291,7 +3291,7 @@ struct Translator {
     try {
       size_t dot = moddotted.find('.');
       std::string head = dot == std::string::npos ? moddotted : moddotted.substr(0, dot);
-      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       // navigate submodules for `MoreLabels.Map` (the functor's containing module)
       for (size_t pos = dot; pos != std::string::npos;) {
@@ -3337,7 +3337,7 @@ struct Translator {
     if (mod.rfind("Stdlib__", 0) == 0) mod = mod.substr(8);
     if (module_base(mod)) return {};
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& md : cmi.sig().modtypes)
         if (md.name == ty) return mt_fields(cmi, md.type);
     } catch (...) {}
@@ -3354,7 +3354,7 @@ struct Translator {
     std::string head = headd == std::string::npos ? container : container.substr(0, headd);
     if (module_base(head) || fields_of(head).empty()) return {};
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t pos = headd; pos != std::string::npos;) {  // navigate Ephemeron.K1
         size_t nd = container.find('.', pos + 1);
@@ -3383,7 +3383,7 @@ struct Translator {
     std::string head = dotted.substr(0, dot);
     if (module_base(head) || fields_of(head).empty()) return {};
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t pos = dot; pos != std::string::npos;) {
         size_t nd = dotted.find('.', pos + 1);
@@ -3405,7 +3405,7 @@ struct Translator {
     if (fi == fm.end()) return fs;
     fs.idx = fi->second;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& md : cmi.sig().modules) {
         if (md.name != name || !md.type || md.type->kind != cmi::ModuleType::Functor) continue;
         fs.param = mt_fields(cmi, md.type->functor_param_type);
@@ -3449,7 +3449,7 @@ struct Translator {
     std::string unit = (d0 == std::string::npos) ? dotted : dotted.substr(0, d0);
     if (module_base(unit)) return saved;  // a local module: ctors register via AST
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(unit));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(unit));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t p = d0; p != std::string::npos;) {
         size_t q = dotted.find('.', p + 1);
@@ -3508,7 +3508,7 @@ struct Translator {
     std::string unit = dotted.substr(0, d0);
     if (module_base(unit)) return {};
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(unit));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(unit));
       const cmi::Signature* sig = &cmi.sig();
       cmi::ModuleTypePtr mt;
       for (size_t p = d0; p != std::string::npos;) {
@@ -3543,7 +3543,7 @@ struct Translator {
   std::vector<int> stdlib_value_labels(const std::string& mod, const std::string& name) {
     std::vector<int> labels;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& v : cmi.values())
         if (v.name == name) {
           cmi::TypePtr t = v.type;
@@ -3564,7 +3564,7 @@ struct Translator {
   FnSig stdlib_value_sig(const std::string& mod, const std::string& name) {
     FnSig s;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& v : cmi.values())
         if (v.name == name) {
           cmi::TypePtr t = v.type;
@@ -3604,7 +3604,7 @@ struct Translator {
           if (mod.rfind("Stdlib__", 0) == 0) mod = mod.substr(8);
           if (module_base(mod) || fields_of(mod).empty()) return;
           try {
-            auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+            const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
             for (auto& mtd : cmi.sig().modtypes)
               if (mtd.name == d->name)
                 if (const cmi::Signature* sig = mt_sig(cmi, mtd.type))
@@ -4262,7 +4262,7 @@ struct Translator {
   }
   std::optional<StdField> stdlib_record_field(const std::string& mod, const std::string& label) {
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record) continue;
         for (int i = 0; i < (int)td.labels.size(); ++i)
@@ -4313,7 +4313,7 @@ struct Translator {
                                                       const std::string& ty,
                                                       const std::string& label) {
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record || td.name != ty) continue;
         for (int i = 0; i < (int)td.labels.size(); ++i)
@@ -4332,7 +4332,7 @@ struct Translator {
     size_t dot = dotted.find('.');
     if (dot == std::string::npos) return toplevel_typed_record_field(dotted, ty, label);
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(dotted.substr(0, dot)));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(dotted.substr(0, dot)));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t pos = dot; pos != std::string::npos;) {
         size_t nd = dotted.find('.', pos + 1);
@@ -4391,7 +4391,7 @@ struct Translator {
                   bool flat = false; };  // all-float -> a flat float block (Complex.t)
   std::optional<StdRec> stdlib_record_layout(const std::string& mod, const std::string& label) {
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record) continue;
         bool has = false;
@@ -4416,7 +4416,7 @@ struct Translator {
   std::optional<StdRec> stdlib_record_layout_named(const std::string& mod,
                                                    const std::string& ty) {
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record || td.name != ty) continue;
         StdRec r;
@@ -4482,7 +4482,7 @@ struct Translator {
       for (auto& ent : std::filesystem::directory_iterator(d, ec)) {
         if (ent.path().extension() != ".cmi") continue;
         try {
-          auto cmi = cmi::CmiFile::load(ent.path().string());
+          const auto& cmi = cmi::CmiFile::load(ent.path().string());
           std::string modname = ent.path().stem().string();
           if (!modname.empty()) modname[0] = (char)std::toupper((unsigned char)modname[0]);
           for (auto& td : cmi.sig().types) {
@@ -4631,7 +4631,7 @@ struct Translator {
     std::string head = dotted.substr(0, dot);
     if (module_base(head) || fields_of(head).empty()) return std::nullopt;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t pos = dot; pos != std::string::npos;) {
         size_t nd = dotted.find('.', pos + 1);
@@ -6391,7 +6391,7 @@ struct Translator {
     for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
       if (it->find('.') != std::string::npos) continue;
       try {
-        auto cmi = cmi::CmiFile::load(resolve_cmi(*it));
+        const auto& cmi = cmi::CmiFile::load(resolve_cmi(*it));
         for (auto& tx : cmi.sig().typexts)
           if (tx.name == name && !tx.is_inline_record) return (int)tx.args.size();
       } catch (...) {}
@@ -6563,7 +6563,7 @@ struct Translator {
       if (lid_to_dotted(*d->prefix, dotted)) {
         try {
           size_t dot = dotted.find('.');
-          auto cmi = cmi::CmiFile::load(resolve_cmi(dot == std::string::npos
+          const auto& cmi = cmi::CmiFile::load(resolve_cmi(dot == std::string::npos
                                                     ? dotted : dotted.substr(0, dot)));
           const cmi::Signature* sig = &cmi.sig();
           for (size_t pos = dot; pos != std::string::npos;) {
@@ -13518,7 +13518,7 @@ struct Translator {
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
           if (!module_base(pl->name)) try {
-            auto cmi = cmi::CmiFile::load(
+            const auto& cmi = cmi::CmiFile::load(
                 resolve_cmi(pl->name));
             for (auto& md : cmi.sig().modtypes)
               if (md.name == d->name) return mt_fields(cmi, md.type);
@@ -13694,7 +13694,7 @@ struct Translator {
       if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v))
           if (!module_base(pl->name)) try {
-            auto cmi = cmi::CmiFile::load(resolve_cmi(pl->name));
+            const auto& cmi = cmi::CmiFile::load(resolve_cmi(pl->name));
             for (auto& md : cmi.sig().modtypes)
               if (md.name == d->name) {
                 if (const cmi::Signature* s = mt_sig(cmi, md.type))
@@ -13897,7 +13897,7 @@ struct Translator {
     }
     std::string dotted = canon_stdlib_path(dotted0);
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(dotted.substr(0, dotted.find('.'))));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(dotted.substr(0, dotted.find('.'))));
       modsig::SigPtr cur = msig_of_cmi_sig(cmi, cmi.sig(), depth + 1);
       std::size_t d = dotted.find('.');
       while (cur && d != std::string::npos) {
@@ -13959,7 +13959,7 @@ struct Translator {
     std::string head = dotted.substr(0, dotted.find('.'));
     if (module_base(head)) return nullptr;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       for (auto& md : cmi.sig().modtypes)
         if (md.name == dotted.substr(lastd + 1))
           if (const cmi::Signature* s = mt_sig(cmi, md.type))
@@ -14518,7 +14518,7 @@ struct Translator {
                               cmi::Signature& out) {
     if (module_base(mod) || fields_of(mod).empty()) return false;
     try {
-      auto cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
       for (auto& md : cmi.sig().modules)
         if (md.name == name && md.type &&
             md.type->kind == cmi::ModuleType::Functor && md.type->functor_param_type)
@@ -16864,7 +16864,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.register_stdlib_ctors();
   t.register_types(s);
   try {  // Stdlib value -> module field index, for pervasive resolution
-    auto cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
+    const auto& cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
     int i = 0;
     for (auto& f : cmi.sig().fields) t.stdlib_fields[f] = i++;
     for (auto& v : cmi.values())
@@ -16886,7 +16886,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     fs::path cmi = fs::path(file_name); cmi.replace_extension(".cmi");
     if (fs::exists(mli) && fs::exists(cmi)) {
       try {
-        auto c = cmi::CmiFile::load(cmi.string());
+        const auto& c = cmi::CmiFile::load(cmi.string());
         if (c.module_name() == module_name) {
           mli_fields = c.sig().fields;
           t.mli_cmi_sig_ = c.sig(); t.has_mli_cmi_ = true;  // for nested coercion
