@@ -37,7 +37,36 @@ struct UnboundModuleError : std::runtime_error {
 enum class ValueKind { Gen, Int, Float, Boxedint32, Boxedint64, Nativeint };
 
 struct Lam;
-using LamPtr = std::shared_ptr<Lam>;
+
+// Non-owning handle to a Lam node.  Every Lam lives in a process-lifetime bump
+// arena (see lambda.cpp) that is never freed mid-compile, so ownership is
+// meaningless: a Lam is alive for the whole process regardless of how many
+// handles point at it.  Dropping shared_ptr removes the atomic refcount on
+// every copy (the translation + simplify passes copy handles constantly), the
+// per-node control block, and ~Lam teardown.  The interface mirrors the
+// shared_ptr subset the codebase actually used (operator->/*/bool/==, .get(),
+// .reset(), null default-construction) so the use sites compile unchanged; only
+// the factory sites that used to make_shared<Lam> now call lam_alloc/
+// lam_alloc_copy below.
+struct LamPtr {
+  Lam* p_ = nullptr;
+  constexpr LamPtr() noexcept = default;
+  constexpr LamPtr(std::nullptr_t) noexcept {}
+  explicit constexpr LamPtr(Lam* p) noexcept : p_(p) {}
+  Lam* operator->() const noexcept { return p_; }
+  Lam& operator*() const noexcept { return *p_; }
+  Lam* get() const noexcept { return p_; }
+  explicit constexpr operator bool() const noexcept { return p_ != nullptr; }
+  void reset() noexcept { p_ = nullptr; }
+  friend constexpr bool operator==(LamPtr a, LamPtr b) noexcept { return a.p_ == b.p_; }
+  friend constexpr bool operator!=(LamPtr a, LamPtr b) noexcept { return a.p_ != b.p_; }
+  friend constexpr bool operator<(LamPtr a, LamPtr b) noexcept { return a.p_ < b.p_; }
+};
+
+// Allocate a Lam from the process-lifetime arena (see lambda.cpp).  lam_alloc
+// default-constructs; lam_alloc_copy copy-constructs from an existing node.
+LamPtr lam_alloc();
+LamPtr lam_alloc_copy(const Lam& src);
 
 // An identifier with a stamp (normalized by first dump appearance, like the
 // typedtree harness).  name "" for compiler temporaries shown as *match*.

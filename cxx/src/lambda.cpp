@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <climits>
 #include <cstdlib>
+#include <new>
 
 #include <algorithm>
 #include <cctype>
@@ -25,6 +26,34 @@
 #include "cppcaml/modsig.hpp"
 
 namespace cppcaml::lambda {
+
+namespace {
+// Process-lifetime bump arena for Lam nodes.  Every Lam is placement-new'd into
+// a big slab and never individually freed; the slabs are never freed either
+// (the process compiles one module then exits, and the compiler already
+// fast-exits, skipping static teardown).  This replaces make_shared<Lam>: no
+// per-node malloc + control block, no atomic refcount on the handle copies the
+// translation/simplify passes make constantly, no ~Lam.  Slabs never move, so
+// the raw Lam* inside every LamPtr stays valid for the whole compile.
+// Single-threaded by construction (one translation active at a time).
+struct LamArena {
+  static constexpr std::size_t kSlab = 1024;
+  std::vector<Lam*> slabs_;
+  std::size_t used_ = kSlab;  // == kSlab forces a fresh slab on first alloc
+  Lam* raw() {                // uninitialized storage for one Lam; caller constructs
+    if (used_ == kSlab) {
+      slabs_.push_back(static_cast<Lam*>(::operator new(kSlab * sizeof(Lam))));
+      used_ = 0;
+    }
+    return slabs_.back() + used_++;
+  }
+};
+LamArena g_lam_arena;
+}  // namespace
+
+LamPtr lam_alloc() { return LamPtr{new (g_lam_arena.raw()) Lam()}; }
+LamPtr lam_alloc_copy(const Lam& src) { return LamPtr{new (g_lam_arena.raw()) Lam(src)}; }
+
 namespace {
 using namespace ast;
 
@@ -430,7 +459,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
 // ---- translation (parsetree -> Lambda), slice 1 ----
 int stamp_counter = 300;  // arbitrary; normalized on print
 
-LamPtr mk(Lam::K k) { auto l = std::make_shared<Lam>(); l->k = k; return l; }
+LamPtr mk(Lam::K k) { auto l = lam_alloc(); l->k = k; return l; }
 
 ValueKind vkind(const std::string& s) {
   if (s == "int") return ValueKind::Int;
@@ -5642,7 +5671,7 @@ struct Translator {
     bool makeblk = b->k == Lam::K::Prim &&
                    (b->prim == Prim::Makeblock || b->prim == Prim::Makemutable);
     if (!makeblk && b->k != Lam::K::ConstBlock) return nullptr;
-    auto r = std::make_shared<Lam>(*b);
+    auto r = lam_alloc_copy(*b);
     r->prim_arg = (int)t->int_val;
     return r;
   }
@@ -7685,7 +7714,7 @@ struct Translator {
       auto handlers = std::move(it->second);
       lf_static_.erase(it);
       for (auto& [st, fnp] : handlers) {
-        auto inner = std::make_shared<Lam>(*l);
+        auto inner = lam_alloc_copy(*l);
         LamPtr hb = fnp->body;
         lf_rewrite(hb);
         auto cat = mk(Lam::K::Catch);

@@ -112,7 +112,7 @@ struct Bytegen {
     if (auto* h = head(cont))
       if (h->op == Op::Acc || h->op == Op::Const || h->op == Op::Getglobal || h->op == Op::PushRetaddr)
         return cont;
-    auto z = std::make_shared<Lam>(); z->k = Lam::K::ConstInt; z->int_val = 0;
+    auto z = lambda::lam_alloc(); z->k = Lam::K::ConstInt; z->int_val = 0;
     Instr k = I(Op::Const); k.cst = z;
     return cons(k, cont);
   }
@@ -453,7 +453,7 @@ struct Bytegen {
         for (auto& p : exp->params) params.push_back(p.first);
         functions_to_compile.push_back({params, exp->body, lbl, entries, 0});
         std::vector<LamPtr> fvargs;
-        for (auto& id : fv) { auto v = std::make_shared<Lam>(); v->k = K::Var; v->var = id; fvargs.push_back(v); }
+        for (auto& id : fv) { auto v = lambda::lam_alloc(); v->k = K::Var; v->var = id; fvargs.push_back(v); }
         Instr cl = I(Op::Closure); cl.a = lbl; cl.b = (int)fv.size();
         return comp_args(env, fvargs, sz, cons(cl, cont));
       }
@@ -482,7 +482,7 @@ struct Bytegen {
         Env benv = env;  // rec idents live on the stack at sz+1..sz+ndecl
         for (int i = 0; i < ndecl; ++i) benv.stack[exp->bindings[i].id.stamp] = sz + 1 + i;
         std::vector<LamPtr> fvargs;
-        for (auto& id : fv) { auto v = std::make_shared<Lam>(); v->k = K::Var; v->var = id; fvargs.push_back(v); }
+        for (auto& id : fv) { auto v = lambda::lam_alloc(); v->k = K::Var; v->var = id; fvargs.push_back(v); }
         Instr cr = I(Op::Closurerec); cr.a = ndecl; cr.b = (int)fv.size(); cr.labels = labels;
         return comp_args(env, fvargs, sz,
                  cons(cr, comp_expr(benv, exp->body, sz + ndecl, add_pop(ndecl, cont))));
@@ -589,7 +589,7 @@ struct Bytegen {
               auto sw = swap_cmp.find(exp->prim_id);
               if (sw != swap_cmp.end() && exp->args.size() == 2 &&
                   (exp->args[1]->k == K::ConstInt || exp->args[1]->k == K::ConstChar)) {
-                auto e2 = std::make_shared<Lam>(*exp);
+                auto e2 = lambda::lam_alloc_copy(*exp);
                 e2->prim_id = sw->second;
                 e2->args = {exp->args[1], exp->args[0]};
                 return comp_args(env, e2->args, sz, cons(comp_primitive(e2), cont));
@@ -688,7 +688,7 @@ struct Bytegen {
         Code body = comp_expr(env, exp->cond, sz + nvars,
                               add_pop(nvars, cons(branch1, hcode)));
         for (int i = 0; i < nvars; ++i) {  // push_dummies
-          auto z = std::make_shared<Lam>(); z->k = K::ConstInt; z->int_val = 0;
+          auto z = lambda::lam_alloc(); z->k = K::ConstInt; z->int_val = 0;
           Instr c = I(Op::Const); c.cst = z;
           body = cons(c, cons(I(Op::Push), body));
         }
@@ -701,7 +701,7 @@ struct Bytegen {
         // the catch's reserved slots.
         auto it = static_lbl_.find(exp->prim_arg);
         if (it == static_lbl_.end()) {  // shouldn't happen; degrade to unit
-          auto z = std::make_shared<Lam>(); z->k = K::ConstInt;
+          auto z = lambda::lam_alloc(); z->k = K::ConstInt;
           Instr c = I(Op::Const); c.cst = z; return cons(c, cont);
         }
         Code c0 = branch_to(it->second.lbl, discard_dead_code(cont));
@@ -727,7 +727,7 @@ struct Bytegen {
       }
       case K::Switch: return comp_switch(env, exp, sz, cont);
       default:
-        { auto z = std::make_shared<Lam>(); z->k = K::ConstInt; z->int_val = 0;
+        { auto z = lambda::lam_alloc(); z->k = K::ConstInt; z->int_val = 0;
           Instr k = I(Op::Const); k.cst = z; return cons(k, cont); }
     }
   }
@@ -813,7 +813,7 @@ struct Bytegen {
     int used_safe = max_stack_ + 6;  // Config.stack_safety_margin
     max_stack_ = saved;
     if (used_safe > 32) {  // Config.stack_threshold: deep blocks check capacity first
-      auto n = std::make_shared<Lam>(); n->k = Lam::K::ConstInt; n->int_val = used_safe;
+      auto n = lambda::lam_alloc(); n->k = Lam::K::ConstInt; n->int_val = used_safe;
       Instr kconst = I(Op::Const); kconst.cst = n;
       return cons(kconst, cons(cc("caml_ensure_stack_capacity", 1), code));
     }
