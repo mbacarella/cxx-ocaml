@@ -465,5 +465,8 @@ int main(int argc, char** argv) {
   std::cout.flush();
   std::cerr.flush();
   std::fflush(nullptr);
+  // Leak-checkers (asan/valgrind) and -pg profiling need the normal exit path
+  // (static destructors, atexit-registered gmon writer) to run; opt out there.
+  if (std::getenv("CPPCAML_NO_FASTEXIT")) return rc;
   std::_Exit(rc);
 }
