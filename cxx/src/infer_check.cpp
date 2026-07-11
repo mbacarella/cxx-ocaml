@@ -1579,9 +1579,9 @@ struct Checker {
     if (comps.empty()) return nullptr;
     auto* saved = cmi_types_ctx_;
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
@@ -1727,9 +1727,9 @@ struct Checker {
     if (comps.empty()) return false;
     if (modenv.count(comps.back())) return false;
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
@@ -1748,9 +1748,9 @@ struct Checker {
     if (comps.empty()) return out;
     try {
       const std::string& head = comps[0];
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(head)));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(head)));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
@@ -1784,9 +1784,9 @@ struct Checker {
     std::string full = lid_full(m);
     if (full.rfind("Stdlib.", 0) == 0) return;
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
@@ -1824,9 +1824,9 @@ struct Checker {
     std::string full = lid_full(m);
     if (full.rfind("Stdlib.", 0) == 0) return;
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
@@ -1851,9 +1851,9 @@ struct Checker {
     auto comps = mod_components(m);
     if (comps.empty()) return;
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
@@ -1907,7 +1907,7 @@ struct Checker {
     if (stdlib_ready_) return stdlib_;
     stdlib_ready_ = true;
     try {
-      auto cmi = cmi::CmiFile::load(stdpath("stdlib.cmi"));
+      const auto& cmi = cmi::CmiFile::load(stdpath("stdlib.cmi"));
       for (auto& v : cmi.values()) {
         std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
         stdlib_[v.name] = from_cmi(v.type, memo);
@@ -1931,7 +1931,7 @@ struct Checker {
   // The signature of a module-decl type, following an alias (e.g. stdlib's
   // `module Array = Stdlib__Array`) by loading the aliased cmi into `loaded`.
   const cmi::Signature* module_sig(const cmi::ModuleTypePtr& mt,
-                                   std::deque<cmi::CmiFile>& loaded) {
+                                   std::deque<const cmi::CmiFile*>& loaded) {
     if (!mt) return nullptr;
     if (mt->kind == cmi::ModuleType::Sig) return mt->sig.get();
     if (mt->kind == cmi::ModuleType::Alias && mt->path && loaded.size() < 16) {
@@ -1940,8 +1940,8 @@ struct Checker {
       std::string low = p;
       if (low[0] >= 'A' && low[0] <= 'Z') low[0] += 32;  // first-char-lowercased
       try {
-        loaded.push_back(cmi::CmiFile::load(stdpath(low + ".cmi")));
-        return &loaded.back().sig();
+        loaded.push_back(&cmi::CmiFile::load(stdpath(low + ".cmi")));
+        return &loaded.back()->sig();
       } catch (...) {}
       // Not a stdlib-dir unit: an alias to a separately compiled unit
       // (`module A2235 = A2235` in a sibling lib) resolves through the same
@@ -1951,8 +1951,8 @@ struct Checker {
                                                     : p;
       if (unit.find('.') == std::string::npos) {
         try {
-          loaded.push_back(cmi::CmiFile::load(head_cmi(unit)));
-          return &loaded.back().sig();
+          loaded.push_back(&cmi::CmiFile::load(head_cmi(unit)));
+          return &loaded.back()->sig();
         } catch (...) {}
       }
       return nullptr;
@@ -2330,9 +2330,9 @@ struct Checker {
     }
     abbrev_exp_neg_.insert(path);  // re-entrancy guard; erased on success
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
@@ -2388,9 +2388,9 @@ struct Checker {
           q != opened_modtype_quals_.end())
         comps = mod_components_str(q->second);
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {  // navigate submodules
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
@@ -2458,9 +2458,9 @@ struct Checker {
     try {
       const std::string& head = comps[0];
       // cmis stay alive for the whole walk; sig points into the last one.
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(head)));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(head)));
+      const cmi::Signature* sig = &loaded.back()->sig();
       // ocamlc's `Mtype.strengthen` roots a cmi-loaded value's type references at
       // the ACCESS path P of the value's own module (alias route, `Bigarray.Array1`
       // -> `Stdlib.Bigarray.Array1`) -- but ONLY for types owned by that module or
@@ -2469,7 +2469,7 @@ struct Checker {
       // path baked in the cmi (`Array1.create`'s `kind` -> `Stdlib__Bigarray.kind`,
       // not `Stdlib.Bigarray.kind`).  So ancestor scopes use the canonical head; the
       // deepest (accessed) scope and its submodules use the alias head.
-      std::string canon_head = loaded.back().module_name();
+      std::string canon_head = loaded.back()->module_name();
       if (canon_head.empty()) canon_head = comps[0];
       // Record each module level's (types, cumulative-prefix) as an enclosing scope.
       // Ancestor levels carry the canonical prefix; the accessed (deepest) level is
@@ -2527,9 +2527,9 @@ struct Checker {
     // re-loading would push each label twice and make it spuriously ambiguous.
     if (!loaded_field_mods_.insert(lid_full(m)).second) return;
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
@@ -2571,9 +2571,9 @@ struct Checker {
         break;
       }
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       // Track each module level's (types, cumulative-prefix) so a field type
       // owned by a PARENT module qualifies to its own module
       // (LargeFile.stats' `st_kind : file_kind` -> `Unix.file_kind`).
@@ -2669,7 +2669,7 @@ struct Checker {
     std::unordered_map<std::string, TypePtr> out;
     try {
       const std::string& head = comps[0];
-      auto cmi = cmi::CmiFile::load(head_cmi(head));
+      const auto& cmi = cmi::CmiFile::load(head_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       const cmi::Signature* parent = sig;  // sig the functor was found in
       const cmi::ModuleType* mt = nullptr;
@@ -2852,7 +2852,7 @@ struct Checker {
   // `minor_heap_size`), instantiated into our type universe; null if not found.
   TypePtr stdlib_field_type(const std::string& mod, const std::string& label) {
     try {
-      auto cmi = cmi::CmiFile::load(head_cmi(mod));
+      const auto& cmi = cmi::CmiFile::load(head_cmi(mod));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Record) continue;
         for (auto& l : td.labels)
@@ -2866,7 +2866,7 @@ struct Checker {
   }
   void register_stdlib_ctors() {
     try {
-      auto cmi = cmi::CmiFile::load(stdpath("stdlib.cmi"));
+      const auto& cmi = cmi::CmiFile::load(stdpath("stdlib.cmi"));
       std::set<std::string> ambiguous, seen;
       std::unordered_map<std::string, TypePtr> found;
       for (auto& td : cmi.types()) {
@@ -3058,9 +3058,9 @@ struct Checker {
       comps.push_back(dotted.substr(p, d2 - p));
     }
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (std::size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
@@ -3799,7 +3799,7 @@ struct Checker {
     auto* pl = std::get_if<Lident>(&d->prefix->v);
     if (!pl) return 0;
     try {
-      auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      const auto& cmi = cmi::CmiFile::load(head_cmi(pl->name));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors)
@@ -3829,9 +3829,9 @@ struct Checker {
         break;
       }
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
@@ -3867,7 +3867,7 @@ struct Checker {
       comps.push_back(modpath.substr(i, d - i)); i = d + 1;
     }
     try {
-      auto cmi = cmi::CmiFile::load(head_cmi(comps[0]));
+      const auto& cmi = cmi::CmiFile::load(head_cmi(comps[0]));
       const std::vector<cmi::TypeDecl>* types = &cmi.types();
       const std::vector<cmi::ModuleDecl>* modules = &cmi.modules();
       for (size_t k = 1; k < comps.size(); ++k) {
@@ -3899,7 +3899,7 @@ struct Checker {
     auto* pl = std::get_if<Lident>(&d->prefix->v);
     if (!pl) return nullptr;  // nested-module qualifier: best-effort skip
     try {
-      auto cmi = cmi::CmiFile::load(head_cmi(pl->name));
+      const auto& cmi = cmi::CmiFile::load(head_cmi(pl->name));
       for (auto& td : cmi.types()) {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors)
@@ -3942,9 +3942,9 @@ struct Checker {
           break;
         }
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* sig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
       // Parent scopes: a ctor-arg type owned by an enclosing module qualifies
       // to its own module, as in resolve_module_values.
       std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> scopes;
@@ -4064,9 +4064,9 @@ struct Checker {
       p0 = q + 1;
     }
     try {
-      std::deque<cmi::CmiFile> loaded;
-      loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
-      const cmi::Signature* msig = &loaded.back().sig();
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* msig = &loaded.back()->sig();
       for (size_t i = 1; i < comps.size() && msig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : msig->modules)
@@ -12147,7 +12147,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       // Stdlib.Set.S with type elt = t` emitted an EMPTY sig without this,
       // and the bootstrapped ocamlc then read garbage Set fields).
       for (int guard = 0; guard < 8; ++guard) {
-      auto cmi = cmi::CmiFile::load(head_cmi(comps[0]));
+      const auto& cmi = cmi::CmiFile::load(head_cmi(comps[0]));
       const cmi::Signature* sig = &cmi.sig();
       bool rerooted = false;
       for (size_t i = 1; i + 1 < comps.size() && !rerooted; ++i) {
@@ -13145,7 +13145,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
     // Stdlib.Set.S with type elt = t` wrote an EMPTY sig without this).
     std::vector<std::string> comps = comps0;
     for (int guard = 0; guard < 8; ++guard) {
-    auto cmif = cmi::CmiFile::load(head_cmi(comps[0]));
+    const auto& cmif = cmi::CmiFile::load(head_cmi(comps[0]));
     const cmi::Signature* sig = &cmif.sig();
     bool rerooted = false;
     for (std::size_t i = 1; i + 1 < comps.size() && sig; ++i) {
@@ -13302,7 +13302,7 @@ static TypeofResolved resolve_typeof_path(
     std::string ucmi = head_cmi(comps[0]);
     if (!std::filesystem::exists(ucmi)) return r;
     try {
-      auto cmif = cmi::CmiFile::load(ucmi);
+      const auto& cmif = cmi::CmiFile::load(ucmi);
       items = cmi_sig_to_items(cmif.sig(), comps[0]);
       norm = cmif.module_name().empty() ? comps[0] : cmif.module_name();
     } catch (...) {
@@ -13894,7 +13894,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         std::string hc = head_cmi(comps[0]);
         std::string base = hc.substr(hc.rfind('/') + 1);
         stdlib_unit_head = base.rfind("stdlib__", 0) == 0;
-        auto cmif = cmi::CmiFile::load(hc);
+        const auto& cmif = cmi::CmiFile::load(hc);
         const cmi::Signature* sig = &cmif.sig();
         const cmi::ModuleType* mt = nullptr;
         for (std::size_t i = 1; i < comps.size(); ++i) {
@@ -14931,7 +14931,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               if (fp.first == unm) bound_local = true;
           std::string ucmi = head_cmi(unm);
           if (!bound_local && std::filesystem::exists(ucmi)) try {
-            auto cmif = cmi::CmiFile::load(ucmi);
+            const auto& cmif = cmi::CmiFile::load(ucmi);
             auto items = cmi_sig_to_items(cmif.sig(), unm);
             // Strengthen at the unit's MANGLED name: ocamlc's manifests keep
             // the raw path (`type 'a t = 'a Stdlib__Queue.t`).
