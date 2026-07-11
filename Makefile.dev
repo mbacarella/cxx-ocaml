@@ -58,12 +58,19 @@ clean-all-asts:
 
 # Diverse Double-Compiling (Wheeler) trusting-trust verification.
 # See cxx/harness/ddc.sh and the DDC plan in the project notes.
-#   make ddc         run the full DDC check (fresh bootstrap -> S1 -> S2 vs official)
-#   make ddc WD=...  reuse an existing KEEP=1 bootstrap workdir for S1
-#   make ddc-lint    guard the harness against the pipe-rc antipattern
+#   make ddc              run the full compiler DDC (bootstrap -> S1 -> S2 vs official)
+#   make ddc WD=...       reuse an existing KEEP=1 bootstrap workdir for S1
+#   make stdlib-ddc S2DIR=/tmp/ddc_s2.XXXX   diverse-verify the stdlib (S2 vs
+#                         official bytecode ./ocamlc; run `make ddc` first, it
+#                         prints S2=...).  In-place build, backed up + restored.
+#   make ddc-lint         guard the harness against the pipe-rc antipattern
 .PHONY: ddc
 ddc:
 	WD="$(WD)" bash cxx/harness/ddc.sh
+
+.PHONY: stdlib-ddc
+stdlib-ddc:
+	S2DIR="$(S2DIR)" bash cxx/harness/stdlib_ddc.sh
 
 .PHONY: ddc-lint
 ddc-lint:
