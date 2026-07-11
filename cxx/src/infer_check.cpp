@@ -1,6 +1,7 @@
 #include "cppcaml/infer_check.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -1578,7 +1579,7 @@ struct Checker {
     if (comps.empty()) return nullptr;
     auto* saved = cmi_types_ctx_;
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -1726,7 +1727,7 @@ struct Checker {
     if (comps.empty()) return false;
     if (modenv.count(comps.back())) return false;
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -1747,7 +1748,7 @@ struct Checker {
     if (comps.empty()) return out;
     try {
       const std::string& head = comps[0];
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(head)));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -1783,7 +1784,7 @@ struct Checker {
     std::string full = lid_full(m);
     if (full.rfind("Stdlib.", 0) == 0) return;
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -1823,7 +1824,7 @@ struct Checker {
     std::string full = lid_full(m);
     if (full.rfind("Stdlib.", 0) == 0) return;
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -1850,7 +1851,7 @@ struct Checker {
     auto comps = mod_components(m);
     if (comps.empty()) return;
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -1930,7 +1931,7 @@ struct Checker {
   // The signature of a module-decl type, following an alias (e.g. stdlib's
   // `module Array = Stdlib__Array`) by loading the aliased cmi into `loaded`.
   const cmi::Signature* module_sig(const cmi::ModuleTypePtr& mt,
-                                   std::vector<cmi::CmiFile>& loaded) {
+                                   std::deque<cmi::CmiFile>& loaded) {
     if (!mt) return nullptr;
     if (mt->kind == cmi::ModuleType::Sig) return mt->sig.get();
     if (mt->kind == cmi::ModuleType::Alias && mt->path && loaded.size() < 16) {
@@ -2329,7 +2330,7 @@ struct Checker {
     }
     abbrev_exp_neg_.insert(path);  // re-entrancy guard; erased on success
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
@@ -2387,7 +2388,7 @@ struct Checker {
           q != opened_modtype_quals_.end())
         comps = mod_components_str(q->second);
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {  // navigate submodules
@@ -2457,7 +2458,7 @@ struct Checker {
     try {
       const std::string& head = comps[0];
       // cmis stay alive for the whole walk; sig points into the last one.
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(head)));
       const cmi::Signature* sig = &loaded.back().sig();
       // ocamlc's `Mtype.strengthen` roots a cmi-loaded value's type references at
@@ -2526,7 +2527,7 @@ struct Checker {
     // re-loading would push each label twice and make it spuriously ambiguous.
     if (!loaded_field_mods_.insert(lid_full(m)).second) return;
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -2570,7 +2571,7 @@ struct Checker {
         break;
       }
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       // Track each module level's (types, cumulative-prefix) so a field type
@@ -3057,7 +3058,7 @@ struct Checker {
       comps.push_back(dotted.substr(p, d2 - p));
     }
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (std::size_t i = 1; i < comps.size() && sig; ++i) {
@@ -3828,7 +3829,7 @@ struct Checker {
         break;
       }
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && sig; ++i) {
@@ -3941,7 +3942,7 @@ struct Checker {
           break;
         }
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back().sig();
       // Parent scopes: a ctor-arg type owned by an enclosing module qualifies
@@ -4063,7 +4064,7 @@ struct Checker {
       p0 = q + 1;
     }
     try {
-      std::vector<cmi::CmiFile> loaded;
+      std::deque<cmi::CmiFile> loaded;
       loaded.push_back(cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* msig = &loaded.back().sig();
       for (size_t i = 1; i < comps.size() && msig; ++i) {
