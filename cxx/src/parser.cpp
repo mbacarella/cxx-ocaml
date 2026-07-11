@@ -258,10 +258,10 @@ class Parser {
   }
   // signed_constant: a constant optionally preceded by a {- +} sign (INT/FLOAT only).
   Constant read_signed_constant() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::MINUS || t.kind == Kind::PLUS) {
       advance();
-      Token lit = cur(); advance();
+      const Token& lit = cur(); advance();
       Location cl = span(position(t.start), position(lit.end));
       std::string txt = (t.kind == Kind::MINUS) ? "-" + lit.text : lit.text;
       return (lit.kind == Kind::INT)
@@ -324,10 +324,10 @@ class Parser {
   // vs lowercase (value/field).
   struct PathResult { LongidentLoc lid; bool final_upper; };
   PathResult parse_dotted_path() {
-    Token first = cur();
+    const Token& first = cur();
     advance();
     Longident lid{Lident{first.text}};
-    Token last = first;
+    const Token* last = &first;
     bool upper = first.kind == Kind::UIDENT;
     // A value/constructor path continues only through uppercase module prefixes;
     // once a lowercase value component is consumed the path is done, so a
@@ -335,13 +335,13 @@ class Parser {
     while (upper && cur().kind == Kind::DOT &&
            (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
       advance();
-      Token nm = cur();
+      const Token& nm = cur();
       advance();
       lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
-      last = nm;
+      last = &nm;
       upper = nm.kind == Kind::UIDENT;
     }
-    return {LongidentLoc{std::move(lid), span(position(first.start), position(last.end))}, upper};
+    return {LongidentLoc{std::move(lid), span(position(first.start), position(last->end))}, upper};
   }
 
   // M.(e) / M.[…] / M.{…} / M.[|…|]  -> Pexp_struct_item over a ghost Pstr_open,
@@ -359,11 +359,11 @@ class Parser {
     advance();  // '.'
     Position openStart = pr.lid.loc.start;
     if (cur().kind == Kind::LPAREN) {
-      Token lp = cur();
+      const Token& lp = cur();
       if (peek(1).kind == Kind::COLONCOLON && peek(2).kind == Kind::RPAREN) {  // M.(::) qualified cons
         advance();  // (
         advance();  // ::
-        Token c = cur(); advance();  // )
+        const Token& c = cur(); advance();  // )
         Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), "::"}};
         Location cloc = span(openStart, position(c.end));
         LongidentLoc ctorid{std::move(qual), cloc};
@@ -377,7 +377,7 @@ class Parser {
       if (operator_name(peek(1)) && peek(2).kind == Kind::RPAREN) {  // M.(op) -> "M.op"
         advance();  // (
         auto op = operator_name(cur()); advance();
-        Token c = cur(); advance();  // )
+        const Token& c = cur(); advance();  // )
         Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), *op}};
         Location l = span(openStart, position(c.end));
         return E({Pexp_ident{LongidentLoc{std::move(qual), l}}, l});
@@ -390,7 +390,7 @@ class Parser {
       } else {
         inner = parse_expr();
       }
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect(Kind::RPAREN, ")");
       return make_local_open(pr.lid, std::move(inner), span(openStart, position(c.end)));
     }
     ExprBox inner = parse_atom();  // M.[…] / M.{…} / M.[|…|]
@@ -402,19 +402,19 @@ class Parser {
   // uppercase module prefixes; the first lowercase component is the terminal label
   // (so `r.a.b` is two field accesses, not a single label "a.b").
   LongidentLoc parse_field_longident() {
-    Token first = cur();
+    const Token& first = cur();
     advance();
     Longident lid{Lident{first.text}};
-    Token last = first;
-    while (last.kind == Kind::UIDENT && cur().kind == Kind::DOT &&
+    const Token* last = &first;
+    while (last->kind == Kind::UIDENT && cur().kind == Kind::DOT &&
            (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
       advance();
-      Token nm = cur();
+      const Token& nm = cur();
       advance();
       lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
-      last = nm;
+      last = &nm;
     }
-    return LongidentLoc{std::move(lid), span(position(first.start), position(last.end))};
+    return LongidentLoc{std::move(lid), span(position(first.start), position(last->end))};
   }
 
   // postfix record-field access  e.lbl (.lbl)*
@@ -470,7 +470,7 @@ class Parser {
   }
   // index-op get `e.op[…]` (cur() is the DOTOP), optionally module-qualified `e.M.op[…]`.
   ExprBox parse_dotop_index(ExprBox e, const std::vector<std::string>& mods) {
-    Token dop = cur(); advance();
+    const Token& dop = cur(); advance();
     const char* openc; const char* closec; Kind closeK;
     switch (cur().kind) {
       case Kind::LPAREN:   openc = "("; closec = ")"; closeK = Kind::RPAREN;   break;
@@ -482,7 +482,7 @@ class Parser {
     std::vector<ExprBox> idxs;  // `;`-separated index list (expr_semi_list)
     idxs.push_back(parse_expr_no_seq());
     while (cur().kind == Kind::SEMI) { advance(); idxs.push_back(parse_expr_no_seq()); }
-    Token c = cur(); expect(closeK, closec);
+    const Token& c = cur(); expect(closeK, closec);
     Position end = position(c.end);
     bool many = idxs.size() > 1;  // multi-index -> Pexp_array arg, name carries `;..`
     std::string name = "." + dop.text + openc + (many ? ";.." : "") + closec;
@@ -525,25 +525,25 @@ class Parser {
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {
         advance(); advance();  // . (
         ExprBox idx = parse_expr();
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         e = indexed_get(std::move(e), std::move(idx), position(c.end), "Array");
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LBRACKET) {
         advance(); advance();  // . [
         ExprBox idx = parse_expr();
-        Token c = cur(); expect(Kind::RBRACKET, "]");
+        const Token& c = cur(); expect(Kind::RBRACKET, "]");
         e = indexed_get(std::move(e), std::move(idx), position(c.end), "String");
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LBRACE) {
         advance(); advance();  // . {   (bigarray indexing; commas separate indices)
         std::vector<ExprBox> idxs;
         idxs.push_back(parse_binop(0));
         while (cur().kind == Kind::COMMA) { advance(); idxs.push_back(parse_binop(0)); }
-        Token c = cur(); expect(Kind::RBRACE, "}");
+        const Token& c = cur(); expect(Kind::RBRACE, "}");
         e = bigarray_get(std::move(e), std::move(idxs), position(c.end));
       } else if (cur().kind == Kind::DOTOP) {  // e.op(i) / e.op[i] / e.op{i;j} index-op get
         e = parse_dotop_index(std::move(e), {});
       } else if (cur().kind == Kind::HASH && peek(1).kind == Kind::LIDENT) {
         advance();  // #
-        Token m = cur(); advance();
+        const Token& m = cur(); advance();
         Location l = span(e->loc.start, position(m.end));
         e = E({Pexp_send{std::move(e), StringLoc{m.text, tokloc(m)}}, l});
       } else {
@@ -554,7 +554,7 @@ class Parser {
   }
 
   ExprBox parse_atom() {
-    Token t = cur();
+    const Token& t = cur();
     switch (t.kind) {
       case Kind::INT: case Kind::FLOAT: case Kind::CHAR: case Kind::STRING:
         advance();
@@ -577,7 +577,7 @@ class Parser {
       }
       case Kind::BACKQUOTE: {  // `Tag as a simple expr (no argument) — e.g. an app arg
         advance();
-        Token tag = cur(); advance();
+        const Token& tag = cur(); advance();
         return E({Pexp_variant{tag.text, std::nullopt}, span(position(t.start), position(tag.end))});
       }
       case Kind::TRUE: advance(); return mk_construct(lid0("true", tokloc(t)), std::nullopt, tokloc(t));
@@ -585,7 +585,7 @@ class Parser {
       case Kind::LPAREN: {
         advance();
         if (cur().kind == Kind::RPAREN) {
-          Token c = cur(); advance();
+          const Token& c = cur(); advance();
           Location l = span(position(t.start), position(c.end));
           return mk_construct(lid0("()", l), std::nullopt, l);
         }
@@ -598,14 +598,14 @@ class Parser {
             advance();
             pkg = parse_package_type_maybe_paren();  // path [with type …], possibly parenthesised
           }
-          Token c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur(); expect(Kind::RPAREN, ")");
           return wrap_ext(E({Pexp_pack{box(std::move(me)), std::move(pkg)},
                     span(position(t.start), position(c.end))}), std::move(ext), std::move(attrs));
         }
         {  // (+), (>>=), (!), (.%[]), …  -> Pexp_ident spanning the parens
           size_t save = idx_;
           if (auto op = parse_operator_name_tokens(); op && cur().kind == Kind::RPAREN) {
-            Token c = cur(); advance();  // RPAREN
+            const Token& c = cur(); advance();  // RPAREN
             Location l = span(position(t.start), position(c.end));
             return E({Pexp_ident{lid0(*op, l)}, l});
           }
@@ -618,22 +618,22 @@ class Parser {
           if (cur().kind == Kind::COLONGREATER) {  // (e : t :> t2)
             advance();
             CoreTypeBox ty2 = parse_core_type();
-            Token c = cur(); expect(Kind::RPAREN, ")");
+            const Token& c = cur(); expect(Kind::RPAREN, ")");
             return E({Pexp_coerce{std::move(inner), std::move(ty), std::move(ty2)},
                       span(position(t.start), position(c.end))});
           }
-          Token c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur(); expect(Kind::RPAREN, ")");
           return E({Pexp_constraint{std::move(inner), std::move(ty)},
                     span(position(t.start), position(c.end))});
         }
         if (cur().kind == Kind::COLONGREATER) {  // (e :> t)
           advance();
           CoreTypeBox ty2 = parse_core_type();
-          Token c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur(); expect(Kind::RPAREN, ")");
           return E({Pexp_coerce{std::move(inner), std::nullopt, std::move(ty2)},
                     span(position(t.start), position(c.end))});
         }
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         inner->loc = span(position(t.start), position(c.end));  // reloc to parens
         return inner;
       }
@@ -646,7 +646,7 @@ class Parser {
       case Kind::LBRACKET: {
         advance();
         if (cur().kind == Kind::RBRACKET) {
-          Token c = cur(); advance();
+          const Token& c = cur(); advance();
           Location l = span(position(t.start), position(c.end));
           return mk_construct(lid0("[]", l), std::nullopt, l);
         }
@@ -657,7 +657,7 @@ class Parser {
           if (cur().kind == Kind::RBRACKET) break;  // trailing ';'
           elems.push_back(parse_expr_no_seq());
         }
-        Token c = cur(); expect(Kind::RBRACKET, "]");
+        const Token& c = cur(); expect(Kind::RBRACKET, "]");
         return build_expr_list(elems, position(t.start), position(c.start), position(c.end));
       }
       case Kind::LBRACE: {
@@ -700,7 +700,7 @@ class Parser {
           }
           if (cur().kind == Kind::SEMI) advance(); else break;
         }
-        Token c = cur(); expect(Kind::RBRACE, "}");
+        const Token& c = cur(); expect(Kind::RBRACE, "}");
         return E({Pexp_record{std::move(fields), std::move(base)},
                   span(position(t.start), position(c.end))});
       }
@@ -710,7 +710,7 @@ class Parser {
         Attributes battrs;  // `begin[@attr] … end` -> on the inner expression
         while (cur().kind == Kind::LBRACKETAT) { advance(); battrs.push_back(parse_attribute_body()); }
         if (cur().kind == Kind::END) {  // `begin end` -> unit, spanning begin..end
-          Token c = cur(); advance();
+          const Token& c = cur(); advance();
           Location l = span(position(t.start), position(c.end));
           ExprBox u = mk_construct(lid0("()", l), std::nullopt, l);
           for (auto& a : battrs) u->attrs.push_back(std::move(a));
@@ -718,7 +718,7 @@ class Parser {
         }
         ExprBox inner = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before end
-        Token c = cur(); expect(Kind::END, "end");
+        const Token& c = cur(); expect(Kind::END, "end");
         inner->loc = span(position(t.start), position(c.end));
         for (auto& a : battrs) inner->attrs.push_back(std::move(a));
         return wrap_ext(std::move(inner), std::move(ext));
@@ -740,7 +740,7 @@ class Parser {
         advance();
         std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // object%ext[@attr]
         ClassStructure cs = parse_class_structure_body();
-        Token c = cur(); expect(Kind::END, "end");
+        const Token& c = cur(); expect(Kind::END, "end");
         return wrap_ext(E({Pexp_object{box(std::move(cs))}, span(position(t.start), position(c.end))}),
                         std::move(ext), std::move(attrs));
       }
@@ -754,7 +754,7 @@ class Parser {
         advance();
         std::vector<std::pair<StringLoc, ExprBox>> fields;
         while (cur().kind != Kind::GREATERRBRACE) {
-          Token nm = cur(); advance();
+          const Token& nm = cur(); advance();
           StringLoc name{nm.text, tokloc(nm)};
           if (cur().kind == Kind::EQUAL) { advance(); fields.emplace_back(name, parse_expr_no_seq()); }
           else {  // punning {< x >}: the label loc is ghost, the value ident is real
@@ -763,7 +763,7 @@ class Parser {
           }
           if (cur().kind == Kind::SEMI) advance(); else break;
         }
-        Token c = cur(); expect(Kind::GREATERRBRACE, ">}");
+        const Token& c = cur(); expect(Kind::GREATERRBRACE, ">}");
         return E({Pexp_override{std::move(fields)}, span(position(t.start), position(c.end))});
       }
       case Kind::LBRACKETBAR: {
@@ -777,7 +777,7 @@ class Parser {
             elems.push_back(parse_expr_no_seq());
           }
         }
-        Token c = cur(); expect(Kind::BARRBRACKET, "|]");
+        const Token& c = cur(); expect(Kind::BARRBRACKET, "|]");
         return E({Pexp_array{std::move(elems)}, span(position(t.start), position(c.end))});
       }
       default:
@@ -807,27 +807,27 @@ class Parser {
     for (;;) {
       Kind k = cur().kind;
       if (k == Kind::LABEL) {  // ~lbl:e
-        Token lt = cur(); advance();
+        const Token& lt = cur(); advance();
         args.emplace_back(Labelled{lt.text}, postfix_field(parse_atom()));
       } else if (k == Kind::OPTLABEL) {  // ?lbl:e
-        Token lt = cur(); advance();
+        const Token& lt = cur(); advance();
         args.emplace_back(Optional{lt.text}, postfix_field(parse_atom()));
       } else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x punning
-        advance(); Token id = cur(); advance();
+        advance(); const Token& id = cur(); advance();
         args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id)));
       } else if (k == Kind::TILDE && peek(1).kind == Kind::LPAREN &&
                  peek(2).kind == Kind::LIDENT && peek(3).kind == Kind::COLON) {  // ~(x : t)
         advance();  // ~
-        Token lp = cur(); advance();  // (
-        Token id = cur(); advance();  // x
+        const Token& lp = cur(); advance();  // (
+        const Token& id = cur(); advance();  // x
         expect(Kind::COLON, ":");
         CoreTypeBox ty = parse_core_type();
-        Token rp = cur(); expect(Kind::RPAREN, ")");
+        const Token& rp = cur(); expect(Kind::RPAREN, ")");
         Location cl{position(lp.start), position(rp.end), false};
         ExprBox v = E({Pexp_constraint{ident_expr(id.text, tokloc(id)), std::move(ty)}, cl});
         args.emplace_back(Labelled{id.text}, std::move(v));
       } else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) {  // ?x punning
-        advance(); Token id = cur(); advance();
+        advance(); const Token& id = cur(); advance();
         args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id)));
       } else if (is_atom_start(k)) {
         args.emplace_back(Nolabel{}, postfix_field(parse_atom()));
@@ -843,7 +843,7 @@ class Parser {
 
   ExprBox parse_app() {
     if (cur().kind == Kind::ASSERT) {
-      Token t = cur(); advance();
+      const Token& t = cur(); advance();
       std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // assert%ext[@attr]
       ExprBox arg = parse_atom_postfix();
       Position ae = arg->loc.end;
@@ -851,7 +851,7 @@ class Parser {
       return wrap_ext(E({Pexp_assert{std::move(arg), kw}, kw}), std::move(ext), std::move(attrs));
     }
     if (cur().kind == Kind::LAZY) {
-      Token t = cur(); advance();
+      const Token& t = cur(); advance();
       std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
       ExprBox arg = parse_atom_postfix();
       Position ae = arg->loc.end;
@@ -874,7 +874,7 @@ class Parser {
       return collect_app(attach_expr_attrs(postfix_field(E({Pexp_ident{.id = std::move(pr.lid)}, l}))));
     }
     if (cur().kind == Kind::TRUE || cur().kind == Kind::FALSE) {
-      Token t = cur();
+      const Token& t = cur();
       advance();
       LongidentLoc cl = lid0(t.kind == Kind::TRUE ? "true" : "false", tokloc(t));
       if (is_atom_start(cur().kind)) {  // `true arg` -> Pexp_construct(_, Some arg), not Pexp_apply
@@ -885,8 +885,8 @@ class Parser {
       return collect_app(mk_construct(cl, std::nullopt, cl.loc));
     }
     if (cur().kind == Kind::BACKQUOTE) {  // polymorphic variant  `Tag [arg]
-      Token t = cur(); advance();
-      Token tag = cur(); advance();
+      const Token& t = cur(); advance();
+      const Token& tag = cur(); advance();
       if (is_atom_start(cur().kind)) {
         ExprBox arg = parse_atom_postfix();
         Location l = span(position(t.start), arg->loc.end);
@@ -899,7 +899,7 @@ class Parser {
   }
 
   ExprBox parse_unary() {
-    Token t = cur();
+    const Token& t = cur();
     // A keyword-led expression (match/function/fun/try/if/let) appearing in
     // operand position (e.g. the RHS of an infix operator) extends to the right
     // and is a full expression — delegate to parse_expr_no_seq.
@@ -923,7 +923,7 @@ class Parser {
       bool fold = (nk == Kind::INT && !dot) || nk == Kind::FLOAT;
       if (fold) {
         advance();
-        Token lit = cur(); advance();
+        const Token& lit = cur(); advance();
         Location cl = span(position(t.start), position(lit.end));
         std::string txt = sub ? ("-" + lit.text) : lit.text;
         Constant c = (lit.kind == Kind::INT)
@@ -1007,7 +1007,7 @@ class Parser {
       return make_assignment(std::move(left), std::move(right), l);
     }
     if (cur().kind == Kind::COLONEQUAL) {
-      Token op = cur(); advance();
+      const Token& op = cur(); advance();
       ExprBox right = parse_assign();
       Location opl = tokloc(op);
       ExprBox fn = E({Pexp_ident{LongidentLoc{{Lident{":="}}, opl}}, opl});
@@ -1024,7 +1024,7 @@ class Parser {
     for (;;) {
       // cons '::' is right-assoc at level 6 and builds a construct, not an apply.
       if (cur().kind == Kind::COLONCOLON && 6 >= min_prec) {
-        Token optok = cur();
+        const Token& optok = cur();
         advance();
         ExprBox right = parse_binop(6);
         Position ls = left->loc.start, re = right->loc.end;
@@ -1038,7 +1038,7 @@ class Parser {
       }
       auto op = infix_op(cur());
       if (!op || op->prec < min_prec) break;
-      Token optok = cur();
+      const Token& optok = cur();
       advance();
       ExprBox right = parse_binop(op->right ? op->prec : op->prec + 1);
       Location opl = tokloc(optok);
@@ -1055,22 +1055,22 @@ class Parser {
   // One (possibly labeled) tuple element: `~x:e`, `~x` (punning), or `e`.
   std::pair<std::optional<std::string>, ExprBox> parse_labeled_tuple_elem() {
     if (cur().kind == Kind::LABEL) {  // ~x:v  -> label, value (value is simple_expr)
-      Token lt = cur(); advance();
+      const Token& lt = cur(); advance();
       return {lt.text, parse_atom_postfix()};
     }
     if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x  (punning)
       advance();
-      Token id = cur(); advance();
+      const Token& id = cur(); advance();
       ExprBox e = E({Pexp_ident{LongidentLoc{{Lident{id.text}}, tokloc(id)}}, tokloc(id)});
       return {id.text, std::move(e)};
     }
     if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {  // ~(x:t) punning+constraint
       advance();  // ~
-      Token lp = cur(); advance();  // (
-      Token id = cur(); advance();
+      const Token& lp = cur(); advance();  // (
+      const Token& id = cur(); advance();
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_core_type();
-      Token rp = cur(); expect(Kind::RPAREN, ")");
+      const Token& rp = cur(); expect(Kind::RPAREN, ")");
       ExprBox ide = E({Pexp_ident{LongidentLoc{{Lident{id.text}}, tokloc(id)}}, tokloc(id)});
       Location cl = span(position(lp.start), position(rp.end));
       elem_punned_constr_ = true;
@@ -1117,7 +1117,7 @@ class Parser {
     // A labeled tuple's element values are simple_expr, so a trailing `::` conses
     // the *whole* tuple as the head (`(~a:x, ~b:y) :: l`).
     if (labeled && cur().kind == Kind::COLONCOLON) {
-      Token optok = cur(); advance();
+      const Token& optok = cur(); advance();
       ExprBox right = parse_binop(6);
       Position ls = tup->loc.start, re = right->loc.end;
       Location gl = gloc(ls, re);
@@ -1149,7 +1149,7 @@ class Parser {
     expect(Kind::MINUSGREATER, "->");
     ExprBox rhs;
     if (cur().kind == Kind::DOT) {  // refutation  -> .
-      Token d = cur(); advance();
+      const Token& d = cur(); advance();
       rhs = E({Pexp_unreachable{}, tokloc(d)});
       last_case_end_ = position(d.end);
     } else {
@@ -1220,7 +1220,7 @@ class Parser {
     return E({Pexp_extension{std::move(*ext), std::move(ep)}, outer});
   }
   ExprBox parse_expr_no_seq() {
-    Token t = cur();
+    const Token& t = cur();
     switch (t.kind) {
       case Kind::LET: {
         if (peek(1).kind == Kind::OPEN || peek(1).kind == Kind::MODULE ||
@@ -1316,7 +1316,7 @@ class Parser {
         // `fun params -> function cases` is one Pexp_function whose body is the
         // Pfunction_cases directly (not a nested function under Pfunction_body).
         if (!all_newtype && cur().kind == Kind::FUNCTION) {
-          Token fkw = cur(); advance();
+          const Token& fkw = cur(); advance();
           Attributes fnattrs;  // `function[@attr] …` — attaches to the Pfunction_cases
           while (cur().kind == Kind::LBRACKETAT) { advance(); fnattrs.push_back(parse_attribute_body()); }
           std::vector<Case> cs = parse_cases();
@@ -1349,7 +1349,7 @@ class Parser {
         expect(Kind::DO, "do");
         ExprBox body = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before done
-        Token c = cur(); expect(Kind::DONE, "done");
+        const Token& c = cur(); expect(Kind::DONE, "done");
         return wrap_ext(E({Pexp_while{std::move(cond), std::move(body)},
                   span(position(t.start), position(c.end))}), std::move(ext), std::move(attrs));
       }
@@ -1368,12 +1368,12 @@ class Parser {
         expect(Kind::DO, "do");
         ExprBox body = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before done
-        Token c = cur(); expect(Kind::DONE, "done");
+        const Token& c = cur(); expect(Kind::DONE, "done");
         return wrap_ext(E({Pexp_for{std::move(var), std::move(lo), std::move(hi), dir, std::move(body)},
                   span(position(t.start), position(c.end))}), std::move(ext), std::move(attrs));
       }
       case Kind::LETOP: {  // let* p [: t] [= e0] [and* …] in e
-        Token op = cur(); advance();
+        const Token& op = cur(); advance();
         Pattern pat = parse_letop_binding_pat();
         Position letPatStart = pat.loc.start;
         StringLoc letop_name{op.text, tokloc(op)};
@@ -1390,7 +1390,7 @@ class Parser {
         // letop (op..body), each and_ spans the let-pattern start..its own expr end.
         std::vector<BindingOp> ands;
         while (cur().kind == Kind::ANDOP) {
-          Token aop = cur(); advance();
+          const Token& aop = cur(); advance();
           Pattern ap = parse_letop_binding_pat();
           ExprBox ae;
           if (cur().kind == Kind::EQUAL) { advance(); ae = parse_expr(); }
@@ -1416,23 +1416,23 @@ class Parser {
   // A dotted path of identifiers; the kinds allowed at each step are the
   // caller's concern (value path ends in lident, module/constr path in uident).
   LongidentLoc parse_longident_path() {
-    Token first = cur();
+    const Token& first = cur();
     advance();
     Longident lid{Lident{first.text}};
-    Token last = first;
+    const Token* last = &first;
     while (cur().kind == Kind::DOT &&
            (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
       advance();
-      Token nm = cur();
+      const Token& nm = cur();
       advance();
       lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
-      last = nm;
+      last = &nm;
     }
-    return LongidentLoc{std::move(lid), span(position(first.start), position(last.end))};
+    return LongidentLoc{std::move(lid), span(position(first.start), position(last->end))};
   }
   // A type/module path that may contain functor applications: F(X).t, M.F(A.B).u
   LongidentLoc parse_type_path() {
-    Token first = cur();
+    const Token& first = cur();
     if (first.kind != Kind::LIDENT && first.kind != Kind::UIDENT)
       throw ParseError("expected a type path", first.start);
     advance();
@@ -1442,14 +1442,14 @@ class Parser {
       if (cur().kind == Kind::LPAREN) {  // functor application F(Arg)
         advance();
         LongidentLoc arg = parse_type_path();
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         lid = Longident{Lapply{std::make_shared<Longident>(std::move(lid)),
                                std::make_shared<Longident>(std::move(arg.txt))}};
         end = position(c.end);
       } else if (cur().kind == Kind::DOT &&
                  (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
         advance();
-        Token nm = cur(); advance();
+        const Token& nm = cur(); advance();
         lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
         end = position(nm.end);
       } else {
@@ -1516,7 +1516,7 @@ class Parser {
     while (cur().kind == Kind::AS && peek(1).kind == Kind::QUOTE) {  // t as 'a
       advance();  // as
       advance();  // '
-      Token id = cur();
+      const Token& id = cur();
       if (id.kind != Kind::LIDENT) throw ParseError("expected type variable", id.start);
       advance();
       Location l = span(symstart, position(id.end));
@@ -1591,7 +1591,7 @@ class Parser {
       if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::MODULE &&
           peek(2).kind == Kind::UIDENT && peek(3).kind == Kind::COLON) {
         advance(); advance();  // ( module
-        Token nm = cur(); advance();  // M
+        const Token& nm = cur(); advance();  // M
         expect(Kind::COLON, ":");
         Ptyp_package pkg = parse_package_type_body();
         expect(Kind::RPAREN, ")");
@@ -1694,7 +1694,7 @@ class Parser {
     return t;
   }
   CoreTypeBox parse_type_atom() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::UNDERSCORE) { advance(); return box(CoreType{Ptyp_any{}, tokloc(t)}); }
     if (t.kind == Kind::QUOTED_STRING_EXPR) {  // {%ext|…|} -> Ptyp_extension
       advance();
@@ -1703,7 +1703,7 @@ class Parser {
     }
     if (t.kind == Kind::QUOTE) {
       advance();
-      Token nm = cur();
+      const Token& nm = cur();
       if (nm.kind != Kind::LIDENT && nm.kind != Kind::UIDENT)  // `'a` or `'A_name`
         throw ParseError("expected type variable", nm.start);
       advance();
@@ -1760,7 +1760,7 @@ class Parser {
           break;
         }
       }
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect(Kind::RPAREN, ")");
       CoreTypeBox pkg = box(CoreType{Ptyp_package{std::move(path), std::move(cons)},
                           span(position(t.start), position(c.end))});
       for (auto& a : pattrs) pkg->attrs.push_back(std::move(a));
@@ -1792,7 +1792,7 @@ class Parser {
         return box(CoreType{.desc = Ptyp_constr{.id = name, .args = std::move(args)},
                             .loc = span(position(t.start), name.loc.end)});
       }
-      Token rp = cur(); expect(Kind::RPAREN, ")");
+      const Token& rp = cur(); expect(Kind::RPAREN, ")");
       // core types keep the inner loc (no paren reloc) — except a parenthesised
       // poly type `('a. t)`, which spans the parens.
       if (std::holds_alternative<Ptyp_poly>(inner->desc))
@@ -1806,7 +1806,7 @@ class Parser {
       std::vector<RowField> rows;
       if (cur().kind == Kind::BAR) advance();
       if (cur().kind == Kind::RBRACKET) {  // `[> ]` / `[< ]` — empty row list
-        Token c = cur(); advance();
+        const Token& c = cur(); advance();
         return box(CoreType{.desc = Ptyp_variant{std::move(rows), closed, std::nullopt},
                             .loc = span(position(t.start), position(c.end))});
       }
@@ -1821,7 +1821,7 @@ class Parser {
         while (cur().kind == Kind::BACKQUOTE) { advance(); ls.push_back(cur().text); advance(); }
         labels = std::move(ls);
       }
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      const Token& c = cur(); expect(Kind::RBRACKET, "]");
       return box(CoreType{.desc = Ptyp_variant{std::move(rows), closed, std::move(labels)},
                           .loc = span(position(t.start), position(c.end))});
     }
@@ -1831,7 +1831,7 @@ class Parser {
       ClosedFlag closed = ClosedFlag::Closed;
       while (cur().kind != Kind::GREATER) {
         if (cur().kind == Kind::DOTDOT) { advance(); closed = ClosedFlag::Open; break; }
-        Token nm = cur();
+        const Token& nm = cur();
         if (nm.kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
           advance(); advance();  // name :
           bool save_sup = suppress_type_trailing_attr_;
@@ -1858,7 +1858,7 @@ class Parser {
         }
         if (cur().kind == Kind::SEMI) advance(); else break;
       }
-      Token c = cur(); expect(Kind::GREATER, ">");
+      const Token& c = cur(); expect(Kind::GREATER, ">");
       return box(CoreType{Ptyp_object{std::move(fields), closed},
                           span(position(t.start), position(c.end))});
     }
@@ -1868,7 +1868,7 @@ class Parser {
   RowField parse_row_field() {
     if (cur().kind == Kind::BACKQUOTE) {
       advance();
-      Token tag = cur();
+      const Token& tag = cur();
       advance();
       std::vector<CoreTypeBox> types;
       bool amp = false;  // `\`A of & t` is still a "constant" tag (empty-conjunction prefix)
@@ -1904,7 +1904,7 @@ class Parser {
   }
   Pattern parse_pattern() {
     if (cur().kind == Kind::EFFECT) {  // effect P, k  (effect handler pattern)
-      Token t = cur(); advance();
+      const Token& t = cur(); advance();
       Pattern eff = parse_pat_app();
       expect(Kind::COMMA, ",");
       Pattern cont = parse_simple_pattern();
@@ -1915,13 +1915,13 @@ class Parser {
   }
   // `as` alias name: a value identifier or a parenthesised operator (`as (+)`).
   StringLoc parse_alias_name() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::LIDENT) { advance(); return StringLoc{t.text, tokloc(t)}; }
     if (t.kind == Kind::LPAREN) {
       size_t save = idx_;
       advance();
       if (auto op = parse_operator_name_tokens(); op && cur().kind == Kind::RPAREN) {
-        Token c = cur(); advance();
+        const Token& c = cur(); advance();
         return StringLoc{*op, span(position(t.start), position(c.end))};
       }
       idx_ = save;
@@ -1942,7 +1942,7 @@ class Parser {
   // operand here (`exception P | Q` == `(exception P) | Q`).
   Pattern parse_pat_or_operand() {
     if (cur().kind == Kind::EXCEPTION) {
-      Token e = cur(); advance();
+      const Token& e = cur(); advance();
       std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // exception%ext[@attr]
       bool save = suppress_pat_cons_attr_;
       suppress_pat_cons_attr_ = true;  // a trailing `[@a]` binds to `exception P`, not P
@@ -1963,7 +1963,7 @@ class Parser {
       if (cur().kind == Kind::AS && peek(1).kind == Kind::LIDENT &&
           peek(2).kind == Kind::BAR) {
         advance();
-        Token nm = cur(); advance();
+        const Token& nm = cur(); advance();
         Location l = span(p.loc.start, position(nm.end));
         p = Pattern{Ppat_alias{box(std::move(p)), StringLoc{nm.text, tokloc(nm)}}, l};
       }
@@ -1978,27 +1978,27 @@ class Parser {
   // One (possibly labeled) tuple-pattern element: `~x:p`, `~x` (punning), or `p`.
   std::pair<std::optional<std::string>, Pattern> parse_labeled_pat_elem() {
     if (cur().kind == Kind::EXCEPTION) {  // a tuple element may be `exception p`
-      Token e = cur(); advance();
+      const Token& e = cur(); advance();
       Pattern inner = parse_pat_cons();
       Location l = span(position(e.start), inner.loc.end);
       return {std::nullopt, Pattern{Ppat_exception{box(std::move(inner))}, l}};
     }
     if (cur().kind == Kind::LABEL) {  // ~x:p
-      Token lt = cur(); advance();
+      const Token& lt = cur(); advance();
       return {lt.text, parse_pat_cons()};
     }
     if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x  (punning)
       advance();
-      Token id = cur(); advance();
+      const Token& id = cur(); advance();
       return {id.text, Pattern{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)}};
     }
     if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {  // ~(x:t) punning+constraint
       advance();  // ~
-      Token lp = cur(); advance();  // (
-      Token id = cur(); advance();
+      const Token& lp = cur(); advance();  // (
+      const Token& id = cur(); advance();
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_core_type();
-      Token rp = cur(); expect(Kind::RPAREN, ")");
+      const Token& rp = cur(); expect(Kind::RPAREN, ")");
       Pattern var{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location cl = span(position(lp.start), position(rp.end));
       return {id.text, Pattern{Ppat_constraint{box(std::move(var)), std::move(ty)}, cl}};
@@ -2011,7 +2011,7 @@ class Parser {
     while (peek(k).kind == Kind::AS && peek(k + 1).kind == Kind::LIDENT) k += 2;
     if (k > 0 && peek(k).kind == Kind::COMMA)
       for (int j = 0; j < k; j += 2) {
-        advance(); Token id = cur(); advance();
+        advance(); const Token& id = cur(); advance();
         Location l = span(p.loc.start, position(id.end));
         p = Pattern{Ppat_alias{box(std::move(p)), StringLoc{id.text, tokloc(id)}}, l};
       }
@@ -2074,7 +2074,7 @@ class Parser {
       p = Pattern{Ppat_alias{box(std::move(p)), nm}, al};
     }
     if (cur().kind != Kind::COLONCOLON) return p;
-    Token optok = cur();
+    const Token& optok = cur();
     advance();
     Pattern r = parse_pat_cons_core();  // right-assoc; trailing attr handled by the caller
     Position ls = p.loc.start, re = r.loc.end;
@@ -2097,15 +2097,15 @@ class Parser {
   }
   Pattern parse_pat_app() {
     if (cur().kind == Kind::LAZY) {
-      Token t = cur(); advance();
+      const Token& t = cur(); advance();
       std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
       Pattern arg = parse_simple_pattern();
       Location l = span(position(t.start), arg.loc.end);
       return wrap_pat_ext(Pattern{Ppat_lazy{box(std::move(arg))}, l}, std::move(ext), std::move(attrs));
     }
     if (cur().kind == Kind::BACKQUOTE) {
-      Token t = cur(); advance();
-      Token tag = cur(); advance();
+      const Token& t = cur(); advance();
+      const Token& tag = cur(); advance();
       if (is_simple_pattern_start(cur().kind)) {
         // `\`Tag p` arg is a full `pattern` at prec_constr_appl, so `\`Tag Some x`
         // is `\`Tag (Some x)` (mirrors the constructor-pattern arg below).
@@ -2122,18 +2122,18 @@ class Parser {
           peek(2).kind == Kind::COLONCOLON && peek(3).kind == Kind::RPAREN) {  // M.(::) qualified cons
         advance(); advance();  // . (
         advance();  // ::
-        Token rp = cur(); advance();  // )
+        const Token& rp = cur(); advance();  // )
         cl = LongidentLoc{Longident{Ldot{std::make_shared<Longident>(cl.txt), "::"}},
                           span(cl.loc.start, position(rp.end))};
         // fall through to the constructor-argument handling below
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P) local open
         advance();  // .
-        Token lp = cur(); advance();  // (
+        const Token& lp = cur(); advance();  // (
         Pattern inner = (cur().kind == Kind::RPAREN)  // M.()  -> unit pattern
                             ? ppat_unit_open(span(cl.loc.start, position(cur().end)),
                                              span(position(lp.start), position(cur().end)))
                             : parse_pattern();
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
       }
       if (cur().kind == Kind::DOT &&
@@ -2154,7 +2154,7 @@ class Parser {
       if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
         advance(); advance();  // ( type
         while (cur().kind == Kind::LIDENT) {
-          Token id = cur(); advance();
+          const Token& id = cur(); advance();
           vars.push_back(StringLoc{id.text, tokloc(id)});
         }
         expect(Kind::RPAREN, ")");
@@ -2193,7 +2193,7 @@ class Parser {
     return acc;
   }
   Pattern parse_simple_pattern() {
-    Token t = cur();
+    const Token& t = cur();
     switch (t.kind) {
       case Kind::UNDERSCORE: advance(); return {Ppat_any{}, tokloc(t)};
       case Kind::QUOTED_STRING_EXPR:  // {%ext|…|} -> Ppat_extension
@@ -2221,7 +2221,7 @@ class Parser {
       }
       case Kind::BACKQUOTE: {  // `Tag as a simple pattern (no argument)
         advance();
-        Token tag = cur(); advance();
+        const Token& tag = cur(); advance();
         return {Ppat_variant{tag.text, std::nullopt}, span(position(t.start), position(tag.end))};
       }
       case Kind::TRUE: advance(); return ppat_construct0("true", tokloc(t));
@@ -2230,12 +2230,12 @@ class Parser {
         LongidentLoc cl = parse_longident_path();
         if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P)
           advance();  // .
-          Token lp = cur(); advance();  // (
+          const Token& lp = cur(); advance();  // (
           Pattern inner = (cur().kind == Kind::RPAREN)  // M.()  -> unit
                               ? ppat_unit_open(span(cl.loc.start, position(cur().end)),
                                                span(position(lp.start), position(cur().end)))
                               : parse_pattern();
-          Token c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur(); expect(Kind::RPAREN, ")");
           return {Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
         }
         if (cur().kind == Kind::DOT &&
@@ -2251,27 +2251,27 @@ class Parser {
       case Kind::LPAREN: {
         advance();
         if (cur().kind == Kind::RPAREN) {
-          Token c = cur(); advance();
+          const Token& c = cur(); advance();
           return ppat_construct0("()", span(position(t.start), position(c.end)));
         }
         if (cur().kind == Kind::MODULE) {  // (module M [: S])
           advance();
           StrOptLoc name;
-          if (cur().kind == Kind::UIDENT) { Token nm = cur(); advance(); name = StrOptLoc{nm.text, tokloc(nm)}; }
-          else if (cur().kind == Kind::UNDERSCORE) { Token nm = cur(); advance(); name = StrOptLoc{std::nullopt, tokloc(nm)}; }
+          if (cur().kind == Kind::UIDENT) { const Token& nm = cur(); advance(); name = StrOptLoc{nm.text, tokloc(nm)}; }
+          else if (cur().kind == Kind::UNDERSCORE) { const Token& nm = cur(); advance(); name = StrOptLoc{std::nullopt, tokloc(nm)}; }
           else throw ParseError("expected module name", cur().start);
           std::optional<Ptyp_package> pkg;
           if (cur().kind == Kind::COLON) {  // (module M : S [with type …] / (S [@a]))
             advance();
             pkg = parse_package_type_maybe_paren();
           }
-          Token c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur(); expect(Kind::RPAREN, ")");
           return {Ppat_unpack{std::move(name), std::move(pkg)}, span(position(t.start), position(c.end))};
         }
         if (peek(1).kind == Kind::RPAREN) {
           if (auto op = operator_name(cur())) {  // (+) x = …  -> Ppat_var "+"
             advance();
-            Token c = cur(); advance();  // RPAREN
+            const Token& c = cur(); advance();  // RPAREN
             Location l = span(position(t.start), position(c.end));
             return {Ppat_var{StringLoc{*op, l}}, l};
           }
@@ -2280,7 +2280,7 @@ class Parser {
         if (cur().kind == Kind::COLON) {
           advance();
           CoreTypeBox ty = parse_poly_type(/*ghost=*/false);  // (pat : 'a. t) poly constraint
-          Token c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur(); expect(Kind::RPAREN, ")");
           // a poly-type constraint takes the inner pat..type span; a plain type
           // takes the parenthesised span.
           Location l = std::holds_alternative<Ptyp_poly>(ty->desc)
@@ -2288,14 +2288,14 @@ class Parser {
                            : span(position(t.start), position(c.end));
           return {Ppat_constraint{box(std::move(p)), std::move(ty)}, l};
         }
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         p.loc = span(position(t.start), position(c.end));  // reloc to parens
         return p;
       }
       case Kind::LBRACKET: {
         advance();
         if (cur().kind == Kind::RBRACKET) {
-          Token c = cur(); advance();
+          const Token& c = cur(); advance();
           return ppat_construct0("[]", span(position(t.start), position(c.end)));
         }
         std::vector<Pattern> elems;
@@ -2305,7 +2305,7 @@ class Parser {
           if (cur().kind == Kind::RBRACKET) break;
           elems.push_back(parse_pattern());
         }
-        Token c = cur(); expect(Kind::RBRACKET, "]");
+        const Token& c = cur(); expect(Kind::RBRACKET, "]");
         return build_pat_list(elems, position(t.start), position(c.start), position(c.end));
       }
       case Kind::LBRACKETBAR: {  // [| p; … |]
@@ -2319,7 +2319,7 @@ class Parser {
             elems.push_back(box(parse_pattern()));
           }
         }
-        Token c = cur(); expect(Kind::BARRBRACKET, "|]");
+        const Token& c = cur(); expect(Kind::BARRBRACKET, "|]");
         return {Ppat_array{std::move(elems)}, span(position(t.start), position(c.end))};
       }
       case Kind::LBRACKETPERCENT: {  // [%id payload]
@@ -2372,7 +2372,7 @@ class Parser {
           }
           if (cur().kind == Kind::SEMI) advance(); else break;
         }
-        Token c = cur(); expect(Kind::RBRACE, "}");
+        const Token& c = cur(); expect(Kind::RBRACE, "}");
         return {Ppat_record{std::move(fields), closed}, span(position(t.start), position(c.end))};
       }
       default: throw ParseError("unsupported pattern", t.start);
@@ -2384,10 +2384,10 @@ class Parser {
     std::vector<LabelDecl> fields;
     expect(Kind::LBRACE, "{");
     while (cur().kind != Kind::RBRACE) {
-      Token start = cur();
+      const Token& start = cur();
       MutableFlag mut = MutableFlag::Immutable;
       if (cur().kind == Kind::MUTABLE) { advance(); mut = MutableFlag::Mutable; }
-      Token nm = cur();
+      const Token& nm = cur();
       if (nm.kind != Kind::LIDENT) throw ParseError("expected field name", nm.start);
       advance();
       expect(Kind::COLON, ":");
@@ -2421,17 +2421,17 @@ class Parser {
   }
   // A constructor name: UIDENT, `true`/`false`, or `[]`/`(::)`/`()`.
   StringLoc parse_constructor_name() {
-    Token nm = cur();
+    const Token& nm = cur();
     if (nm.kind == Kind::LBRACKET && peek(1).kind == Kind::RBRACKET) {
-      advance(); Token c = cur(); advance();
+      advance(); const Token& c = cur(); advance();
       return StringLoc{"[]", span(position(nm.start), position(c.end))};
     }
     if (nm.kind == Kind::LPAREN && peek(1).kind == Kind::RPAREN) {  // ()
-      advance(); Token c = cur(); advance();
+      advance(); const Token& c = cur(); advance();
       return StringLoc{"()", span(position(nm.start), position(c.end))};
     }
     if (nm.kind == Kind::LPAREN && peek(1).kind == Kind::COLONCOLON) {
-      advance(); advance(); Token c = cur(); expect(Kind::RPAREN, ")");
+      advance(); advance(); const Token& c = cur(); expect(Kind::RPAREN, ")");
       return StringLoc{"::", span(position(nm.start), position(c.end))};
     }
     std::string text;
@@ -2525,7 +2525,7 @@ class Parser {
     }
     if (variance) *variance = v;
     if (cur().kind == Kind::UNDERSCORE) {
-      Token u = cur(); advance();
+      const Token& u = cur(); advance();
       return box(CoreType{Ptyp_any{}, tokloc(u)});
     }
     return parse_type_atom();  // 'a
@@ -2551,7 +2551,7 @@ class Parser {
     return params;
   }
   ExtensionConstructor parse_ext_ctor(Position start) {
-    Token nm = cur();
+    const Token& nm = cur();
     if (nm.kind != Kind::UIDENT) throw ParseError("expected constructor name", nm.start);
     advance();
     std::variant<Pext_decl, Pext_rebind> kind;
@@ -2620,7 +2620,7 @@ class Parser {
   TypeDeclaration parse_type_declaration(Position declStart) {
     std::vector<int> pvariances;
     std::vector<CoreTypeBox> params = parse_type_params(&pvariances);
-    Token nm = cur();
+    const Token& nm = cur();
     if (nm.kind != Kind::LIDENT) throw ParseError("expected type name", nm.start);
     advance();
     TypeKind kind = Ptype_abstract{};
@@ -2632,7 +2632,7 @@ class Parser {
       if (cur().kind == Kind::PRIVATE) { advance(); priv = PrivateFlag::Private; }
       if (cur().kind == Kind::EXTERNAL) {  // `type t = external "s"` (fork extension)
         advance();
-        Token s = cur(); expect(Kind::STRING, "primitive string");
+        const Token& s = cur(); expect(Kind::STRING, "primitive string");
         kind = Ptype_external{s.text};
         // fall through to constraints/attrs handling below (skip kind/manifest)
       } else {
@@ -2688,11 +2688,11 @@ class Parser {
   // params sharing the parens location (ghost when there is more than one).
   void parse_params_into(std::vector<FunctionParam>& out) {
     if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
-      Token lp = cur(); advance(); advance();  // ( type
+      const Token& lp = cur(); advance(); advance();  // ( type
       std::vector<Token> ids;
       while (cur().kind == Kind::LIDENT) { ids.push_back(cur()); advance(); }
       if (ids.empty()) throw ParseError("expected type name", cur().start);
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect(Kind::RPAREN, ")");
       bool ghost = ids.size() > 1;
       Location pl{position(lp.start), position(c.end), ghost};
       for (auto& id : ids)
@@ -2702,20 +2702,20 @@ class Parser {
     out.push_back(parse_param());
   }
   FunctionParam parse_param() {
-    Token t = cur();
+    const Token& t = cur();
     // (type a)  locally abstract type parameter
     if (t.kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // ( type
-      Token id = cur();
+      const Token& id = cur();
       if (id.kind != Kind::LIDENT) throw ParseError("expected type name", id.start);
       advance();
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect(Kind::RPAREN, ")");
       return FunctionParam{Pparam_newtype{StringLoc{id.text, tokloc(id)},
                                           span(position(t.start), position(c.end))}};
     }
     // ~x  (labelled punning)
     if (t.kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {
-      advance(); Token id = cur(); advance();
+      advance(); const Token& id = cur(); advance();
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location loc = span(position(t.start), position(id.end));
       return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p)}};
@@ -2723,10 +2723,10 @@ class Parser {
     // ~(x:t)  (labelled punning with a type constraint, possibly poly)
     if (t.kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {
       advance(); advance();  // ~ (
-      Token id = cur(); advance();
+      const Token& id = cur(); advance();
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect(Kind::RPAREN, ")");
       Pattern var{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location pl = span(position(id.start), ty->loc.end);  // inner: x..type
       Pattern p{Ppat_constraint{box(std::move(var)), std::move(ty)}, pl};
@@ -2735,7 +2735,7 @@ class Parser {
     }
     // ?x  (optional punning)
     if (t.kind == Kind::QUESTION && peek(1).kind == Kind::LIDENT) {
-      advance(); Token id = cur(); advance();
+      advance(); const Token& id = cur(); advance();
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location loc = span(position(t.start), position(id.end));
       return FunctionParam{Pparam_val{loc, Optional{id.text}, std::nullopt, std::move(p)}};
@@ -2760,7 +2760,7 @@ class Parser {
         }
         std::optional<ExprBox> def;
         if (cur().kind == Kind::EQUAL) { advance(); def = parse_expr(); }
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         Location loc = span(position(t.start), position(c.end));
         return FunctionParam{Pparam_val{loc, Optional{t.text}, std::move(def), std::move(p)}};
       }
@@ -2771,7 +2771,7 @@ class Parser {
     // ?(x [: t] = e)  optional with default
     if (t.kind == Kind::QUESTION && peek(1).kind == Kind::LPAREN) {
       advance(); advance();  // ? (
-      Token id = cur();
+      const Token& id = cur();
       if (id.kind != Kind::LIDENT) throw ParseError("expected label name", id.start);
       advance();
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
@@ -2782,7 +2782,7 @@ class Parser {
       }
       std::optional<ExprBox> def;
       if (cur().kind == Kind::EQUAL) { advance(); def = parse_expr(); }
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect(Kind::RPAREN, ")");
       Location loc = span(position(t.start), position(c.end));
       return FunctionParam{Pparam_val{loc, Optional{id.text}, std::move(def), std::move(p)}};
     }
@@ -2806,7 +2806,7 @@ class Parser {
   // `.op( [;..] )` / `.op[ … ]` / `.op{ … }` with an optional `<-`.  Consumes the
   // tokens on success (matching parser.mly's `operator` rule).
   std::optional<std::string> parse_operator_name_tokens() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::DOTOP) {
       advance();
       const char* openc; const char* closec; Kind closeK;
@@ -2835,16 +2835,16 @@ class Parser {
   std::optional<StringLoc> try_paren_operator() {
     if (cur().kind != Kind::LPAREN) return std::nullopt;
     size_t save = idx_;
-    Token lp = cur(); advance();
+    const Token& lp = cur(); advance();
     auto nm = parse_operator_name_tokens();
     if (!nm || cur().kind != Kind::RPAREN) { idx_ = save; return std::nullopt; }
-    Token c = cur(); advance();
+    const Token& c = cur(); advance();
     return StringLoc{*nm, span(position(lp.start), position(c.end))};
   }
   // A value name: a plain `LIDENT`, or `( operator )`.
   StringLoc parse_value_name() {
     if (auto op = try_paren_operator()) return std::move(*op);
-    Token nm = cur();
+    const Token& nm = cur();
     if (nm.kind != Kind::LIDENT) throw ParseError("expected external name", nm.start);
     advance();
     return StringLoc{nm.text, tokloc(nm)};
@@ -2852,18 +2852,18 @@ class Parser {
   // `external f [: t] = path` alias target: a value path printed as a dotted string.
   StringLoc parse_prim_alias() {
     if (auto op = try_paren_operator()) return std::move(*op);  // ( + )
-    Token first = cur();
+    const Token& first = cur();
     if (first.kind != Kind::LIDENT && first.kind != Kind::UIDENT)
       throw ParseError("expected value identifier", first.start);
     advance();
     std::string s = first.text;
-    Token last = first;
-    while (last.kind == Kind::UIDENT && cur().kind == Kind::DOT &&
+    const Token* last = &first;
+    while (last->kind == Kind::UIDENT && cur().kind == Kind::DOT &&
            (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
-      advance(); Token nm = cur(); advance();
-      s += "." + nm.text; last = nm;
+      advance(); const Token& nm = cur(); advance();
+      s += "." + nm.text; last = &nm;
     }
-    return StringLoc{s, span(position(first.start), position(last.end))};
+    return StringLoc{s, span(position(first.start), position(last->end))};
   }
   ValueBinding parse_value_binding_core() {
     // val_ident form (`let f p.. = e` / `let (+) p.. = e`) vs pattern form.
@@ -2906,7 +2906,7 @@ class Parser {
     if (op_ident) {
       name = std::move(*opname);  // `( op )` already consumed by try_paren_operator
     } else {
-      Token nt = cur(); advance();
+      const Token& nt = cur(); advance();
       name = StringLoc{nt.text, tokloc(nt)};
     }
     Location nl = name.loc;
@@ -2929,7 +2929,7 @@ class Parser {
         advance();
         std::vector<StringLoc> univars;
         while (cur().kind == Kind::LIDENT) {
-          Token id = cur(); advance();
+          const Token& id = cur(); advance();
           univars.push_back(StringLoc{id.text, tokloc(id)});
         }
         expect(Kind::DOT, ".");
@@ -2956,7 +2956,7 @@ class Parser {
     // `let f p.. [: t] = function cases` desugars to a ghost Pexp_function whose
     // body is the Pfunction_cases directly (not a nested function body).
     if (cur().kind == Kind::FUNCTION && (!params.empty() || fconstr)) {
-      Token fkw = cur(); advance();
+      const Token& fkw = cur(); advance();
       Attributes fattrs;  // `function[@attr] …` — attaches to the Pfunction_cases
       while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
       std::vector<Case> cs = parse_cases();
@@ -3080,7 +3080,7 @@ class Parser {
     return {std::move(name), std::move(ep)};
   }
   StructureItem parse_structure_item() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::QUOTED_STRING_ITEM) {  // {%%ext|…|} -> Pstr_extension(ext, [string])
       advance();
       return StructureItem{Pstr_extension{t.ext_id, quoted_payload(t)},
@@ -3286,7 +3286,7 @@ class Parser {
       advance(); advance();  // module type
       std::optional<std::string> mt_ext = take_ext();  // `module type%ext …`
       Attributes mtattrs = take_attrs();  // `module type%ext[@attr] …` -> pmtd_attributes (prefix)
-      Token nm = cur();
+      const Token& nm = cur();
       if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
         throw ParseError("expected module type name", nm.start);
       advance();
@@ -3414,7 +3414,7 @@ class Parser {
       advance();
       std::string name = parse_attr_name();
       Structure payload = parse_structure_until(Kind::RBRACKET);
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      const Token& c = cur(); expect(Kind::RBRACKET, "]");
       return StructureItem{Pstr_attribute{std::move(name), std::move(payload)},
                            span(position(t.start), position(c.end))};
     }
@@ -3434,7 +3434,7 @@ class Parser {
   }
 
   std::string parse_attr_name() {
-    Token first = cur();
+    const Token& first = cur();
     if (first.kind != Kind::LIDENT && first.kind != Kind::UIDENT)
       throw ParseError("expected attribute name", first.start);
     advance();
@@ -3471,7 +3471,7 @@ class Parser {
   }
 
   StrOptLoc parse_module_name() {
-    Token nm = cur();
+    const Token& nm = cur();
     if (nm.kind == Kind::UIDENT) { advance(); return StrOptLoc{nm.text, tokloc(nm)}; }
     if (nm.kind == Kind::UNDERSCORE) { advance(); return StrOptLoc{std::nullopt, tokloc(nm)}; }
     throw ParseError("expected module name", nm.start);
@@ -3546,7 +3546,7 @@ class Parser {
     return mt;
   }
   WithConstraint parse_with_constraint() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::TYPE) {
       Position kw = position(t.start);
       advance();
@@ -3599,7 +3599,7 @@ class Parser {
     throw ParseError("unsupported with constraint", t.start);
   }
   ModuleType parse_module_type_base() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pmty_extension
       advance();
       auto [name, payload] = parse_ext_body();
@@ -3610,7 +3610,7 @@ class Parser {
       advance();
       Attributes attrs = take_attrs();  // `sig[@attr] … end` -> pmty_attributes
       Signature items = parse_signature_until(Kind::END);
-      Token c = cur(); expect(Kind::END, "end");
+      const Token& c = cur(); expect(Kind::END, "end");
       ModuleType m{Pmty_signature{std::move(items)}, span(position(t.start), position(c.end)), {}};
       m.attrs = std::move(attrs);
       return m;
@@ -3703,7 +3703,7 @@ class Parser {
     return SignatureItem{Psig_extension{std::move(*ext), std::move(ep)}, outer};
   }
   SignatureItem parse_signature_item() {
-    Token t = cur();
+    const Token& t = cur();
     auto here = [&] { return span(position(t.start), position(tokens_[idx_ - 1].end)); };
     if (t.kind == Kind::QUOTED_STRING_ITEM) {  // {%%ext|…|} -> Psig_extension
       advance();
@@ -3714,12 +3714,12 @@ class Parser {
       advance();
       std::optional<std::string> ext = take_ext();  // `val%ext …`
       Attributes attrs = take_attrs();  // `val%ext[@attr] …` -> val_attributes (prefix)
-      Token nm = cur();
+      const Token& nm = cur();
       if (nm.kind != Kind::LIDENT && nm.kind != Kind::LPAREN)
         throw ParseError("expected value name", nm.start);
       StringLoc vname;
       if (nm.kind == Kind::LPAREN && operator_name(peek(1)) && peek(2).kind == Kind::RPAREN) {
-        advance(); auto op = operator_name(cur()); advance(); Token c = cur(); advance();
+        advance(); auto op = operator_name(cur()); advance(); const Token& c = cur(); advance();
         vname = StringLoc{*op, span(position(nm.start), position(c.end))};
       } else { advance(); vname = StringLoc{nm.text, tokloc(nm)}; }
       expect(Kind::COLON, ":");
@@ -3845,7 +3845,7 @@ class Parser {
       advance(); advance();  // module type
       std::optional<std::string> mt_ext = take_ext();  // `module type%ext …`
       Attributes mtattrs = take_attrs();  // `module type%ext[@attr] …` -> pmtd_attributes (prefix)
-      Token nm = cur();
+      const Token& nm = cur();
       if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
         throw ParseError("expected module type name", nm.start);
       advance();
@@ -3954,7 +3954,7 @@ class Parser {
       advance();
       std::string name = parse_attr_name();
       Structure payload = parse_structure_until(Kind::RBRACKET);
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      const Token& c = cur(); expect(Kind::RBRACKET, "]");
       return SignatureItem{Psig_attribute{std::move(name), std::move(payload)},
                            span(position(t.start), position(c.end))};
     }
@@ -4013,7 +4013,7 @@ class Parser {
       Location cl = span(e->loc.start, pkg->loc.end);
       e = E({Pexp_constraint{std::move(e), std::move(pkg)}, cl});
     }
-    Token c = cur(); expect(Kind::RPAREN, ")");
+    const Token& c = cur(); expect(Kind::RPAREN, ")");
     ModuleExpr m{Pmod_unpack{std::move(e)}, span(lparenStart, position(c.end))};
     for (auto& a : vattrs) m.attrs.push_back(std::move(a));
     return m;
@@ -4025,9 +4025,9 @@ class Parser {
     // to `X` — an attributed module_expr can still be a functor.
     for (;;) {
       if (cur().kind == Kind::LPAREN) {  // F(X) / F()  functor application
-        Token lp = cur(); advance();
+        const Token& lp = cur(); advance();
         if (cur().kind == Kind::RPAREN) {  // F ()  generative application
-          Token c = cur(); advance();
+          const Token& c = cur(); advance();
           me = ModuleExpr{Pmod_apply_unit{box(std::move(me))}, span(symstart, position(c.end))};
           continue;
         }
@@ -4038,7 +4038,7 @@ class Parser {
           continue;
         }
         ModuleExpr arg = parse_module_expr();
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))},
                         span(symstart, position(c.end))};
       } else if (cur().kind == Kind::LBRACKETAT) {  // me [@attr]  -> pmod_attributes
@@ -4051,7 +4051,7 @@ class Parser {
     return me;
   }
   ModuleExpr parse_module_expr_head() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pmod_extension
       advance();
       auto [name, payload] = parse_ext_body();
@@ -4062,7 +4062,7 @@ class Parser {
       advance();
       Attributes sattrs = take_attrs();  // `struct[@attr] … end` -> on the Pmod_structure
       Structure items = parse_structure_until(Kind::END);
-      Token c = cur(); expect(Kind::END, "end");
+      const Token& c = cur(); expect(Kind::END, "end");
       ModuleExpr m{Pmod_structure{std::move(items)}, span(position(t.start), position(c.end))};
       for (auto& a : sattrs) m.attrs.push_back(std::move(a));
       return m;
@@ -4095,11 +4095,11 @@ class Parser {
       if (cur().kind == Kind::COLON) {  // (me : mt)
         advance();
         ModuleType mt = parse_module_type();
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         return ModuleExpr{Pmod_constraint{box(std::move(me)), box(std::move(mt))},
                           span(position(t.start), position(c.end))};
       }
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect(Kind::RPAREN, ")");
       return me;  // grouping keeps inner loc
     }
     if (t.kind == Kind::UIDENT) {
@@ -4152,16 +4152,16 @@ class Parser {
     size_t bodyBegin = idx_ > 0 ? tokens_[idx_ - 1].end : 0;  // end of `object`
     Pattern self;
     if (cur().kind == Kind::LPAREN) {
-      Token lp = cur(); advance();
+      const Token& lp = cur(); advance();
       self = parse_pattern();
       if (cur().kind == Kind::COLON) {
         advance();
         CoreTypeBox ty = parse_core_type();
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         self = Pattern{Ppat_constraint{box(std::move(self)), std::move(ty)},
                        span(position(lp.start), position(c.end))};
       } else {
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         self.loc = span(position(lp.start), position(c.end));  // reloc_pat
       }
     } else {
@@ -4194,13 +4194,13 @@ class Parser {
     return f;
   }
   ClassField parse_class_field_core() {
-    Token t = cur();
+    const Token& t = cur();
     Position fs = position(t.start);
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@attr]  -> Pcf_attribute (floating)
       advance();
       std::string name = parse_attr_name();
       Structure payload = parse_structure_until(Kind::RBRACKET);
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      const Token& c = cur(); expect(Kind::RBRACKET, "]");
       return ClassField{Pcf_attribute{std::move(name), std::move(payload)},
                         span(fs, position(c.end)), {}};
     }
@@ -4219,7 +4219,7 @@ class Parser {
       std::optional<StringLoc> as_;
       if (cur().kind == Kind::AS) {
         advance();
-        Token nm = cur(); expect(Kind::LIDENT, "identifier");
+        const Token& nm = cur(); expect(Kind::LIDENT, "identifier");
         as_ = StringLoc{nm.text, tokloc(nm)};
       }
       skip_post_attrs();
@@ -4239,7 +4239,7 @@ class Parser {
         else if (cur().kind == Kind::VIRTUAL) { advance(); virt = true; }
         else break;
       }
-      Token nm = cur(); advance();
+      const Token& nm = cur(); advance();
       StringLoc name{nm.text, tokloc(nm)};
       ClassFieldKind kind;
       if (virt) {
@@ -4275,7 +4275,7 @@ class Parser {
         else if (cur().kind == Kind::VIRTUAL) { advance(); virt = true; }
         else break;
       }
-      Token nm = cur(); advance();
+      const Token& nm = cur(); advance();
       StringLoc name{nm.text, tokloc(nm)};
       ClassFieldKind kind;
       if (virt) {
@@ -4331,7 +4331,7 @@ class Parser {
         // `method m p.. = function cases` merges into one Pexp_function (params +
         // Pfunction_cases), mirroring the let/fun desugaring.
         if (!params.empty() && cur().kind == Kind::FUNCTION) {
-          Token fkw = cur(); advance();
+          const Token& fkw = cur(); advance();
           Attributes fattrs;  // `function[@attr] …` — attaches to the Pfunction_cases
           while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
           std::vector<Case> cs = parse_cases();
@@ -4387,7 +4387,7 @@ class Parser {
   }
 
   ClassExpr parse_class_expr() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::FUN) {
       advance();
       Attributes attrs = take_attrs();  // `fun[@attr] …` -> on the Pcl_fun
@@ -4417,10 +4417,10 @@ class Parser {
     std::vector<std::pair<ArgLabel, ExprBox>> args;
     for (;;) {
       Kind k = cur().kind;
-      if (k == Kind::LABEL) { Token lt = cur(); advance(); args.emplace_back(Labelled{lt.text}, parse_atom_postfix()); }
-      else if (k == Kind::OPTLABEL) { Token lt = cur(); advance(); args.emplace_back(Optional{lt.text}, parse_atom_postfix()); }
-      else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) { advance(); Token id = cur(); advance(); args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id))); }
-      else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) { advance(); Token id = cur(); advance(); args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id))); }
+      if (k == Kind::LABEL) { const Token& lt = cur(); advance(); args.emplace_back(Labelled{lt.text}, parse_atom_postfix()); }
+      else if (k == Kind::OPTLABEL) { const Token& lt = cur(); advance(); args.emplace_back(Optional{lt.text}, parse_atom_postfix()); }
+      else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) { advance(); const Token& id = cur(); advance(); args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id))); }
+      else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) { advance(); const Token& id = cur(); advance(); args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id))); }
       else if (is_atom_start(k)) args.emplace_back(Nolabel{}, parse_atom_postfix());
       else break;
     }
@@ -4451,7 +4451,7 @@ class Parser {
   }
 
   ClassExpr parse_class_simple_expr() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pcl_extension
       advance();
       auto [name, payload] = parse_ext_body();
@@ -4463,7 +4463,7 @@ class Parser {
       Attributes oattrs;  // `object[@attr] …` -> attrs on the Pcl_structure
       while (cur().kind == Kind::LBRACKETAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       ClassStructure cs = parse_class_structure_body();
-      Token c = cur(); expect(Kind::END, "end");
+      const Token& c = cur(); expect(Kind::END, "end");
       return ClassExpr{Pcl_structure{std::move(cs)}, span(position(t.start), position(c.end)), std::move(oattrs)};
     }
     if (t.kind == Kind::LPAREN) {
@@ -4472,11 +4472,11 @@ class Parser {
       if (cur().kind == Kind::COLON) {
         advance();
         ClassType ct = parse_class_type();
-        Token c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect(Kind::RPAREN, ")");
         return ClassExpr{Pcl_constraint{box(std::move(ce)), box(std::move(ct))},
                          span(position(t.start), position(c.end)), {}};
       }
-      Token c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect(Kind::RPAREN, ")");
       return ce;  // parenthesized class expr keeps inner loc
     }
     // actual_class_parameters class_longident -> Pcl_constr
@@ -4503,7 +4503,7 @@ class Parser {
     return ct;
   }
   ClassType parse_class_type_core() {
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pcty_extension
       advance();
       auto [name, payload] = parse_ext_body();
@@ -4542,7 +4542,7 @@ class Parser {
       Attributes oattrs;  // `object[@attr] …` -> attrs on the Pcty_signature
       while (cur().kind == Kind::LBRACKETAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       ClassSignature cs = parse_class_sig_body();
-      Token c = cur(); expect(Kind::END, "end");
+      const Token& c = cur(); expect(Kind::END, "end");
       return ClassType{Pcty_signature{std::move(cs)}, span(position(t.start), position(c.end)), std::move(oattrs)};
     }
     if (t.kind == Kind::LBRACKET) {  // [tys] clty_longident
@@ -4616,13 +4616,13 @@ class Parser {
     return f;
   }
   ClassTypeField parse_class_sig_field_core() {
-    Token t = cur();
+    const Token& t = cur();
     Position fs = position(t.start);
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@attr]  -> Pctf_attribute (floating)
       advance();
       std::string name = parse_attr_name();
       Structure payload = parse_structure_until(Kind::RBRACKET);
-      Token c = cur(); expect(Kind::RBRACKET, "]");
+      const Token& c = cur(); expect(Kind::RBRACKET, "]");
       return ClassTypeField{Pctf_attribute{std::move(name), std::move(payload)},
                             span(fs, position(c.end)), {}};
     }
@@ -4650,7 +4650,7 @@ class Parser {
         else if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
         else break;
       }
-      Token nm = cur(); advance();
+      const Token& nm = cur(); advance();
       StringLoc name{nm.text, tokloc(nm)};
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_core_type();
@@ -4668,7 +4668,7 @@ class Parser {
         else if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
         else break;
       }
-      Token nm = cur(); advance();
+      const Token& nm = cur(); advance();
       StringLoc name{nm.text, tokloc(nm)};
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_possibly_poly_type();
@@ -4695,7 +4695,7 @@ class Parser {
     VirtualFlag virt = VirtualFlag::Concrete;
     if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
     std::vector<CoreTypeBox> params = parse_class_params();
-    Token nm = cur();
+    const Token& nm = cur();
     if (nm.kind != Kind::LIDENT) throw ParseError("expected class name", nm.start);
     advance();
     StringLoc name{nm.text, tokloc(nm)};
@@ -4706,7 +4706,7 @@ class Parser {
                             span(kw, position(tokens_[idx_ - 1].end)), std::move(attrs)};
   }
   ClassExpr parse_class_fun_binding() {  // = ce | : ct = ce | param fun_binding
-    Token t = cur();
+    const Token& t = cur();
     if (t.kind == Kind::EQUAL) { advance(); return parse_class_expr(); }
     if (t.kind == Kind::COLON) {
       advance();
@@ -4728,7 +4728,7 @@ class Parser {
     VirtualFlag virt = VirtualFlag::Concrete;
     if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
     std::vector<CoreTypeBox> params = parse_class_params();
-    Token nm = cur();
+    const Token& nm = cur();
     if (nm.kind != Kind::LIDENT) throw ParseError("expected class type name", nm.start);
     advance();
     StringLoc name{nm.text, tokloc(nm)};
@@ -4745,7 +4745,7 @@ class Parser {
     VirtualFlag virt = VirtualFlag::Concrete;
     if (cur().kind == Kind::VIRTUAL) { advance(); virt = VirtualFlag::Virtual; }
     std::vector<CoreTypeBox> params = parse_class_params();
-    Token nm = cur();
+    const Token& nm = cur();
     if (nm.kind != Kind::LIDENT) throw ParseError("expected class name", nm.start);
     advance();
     StringLoc name{nm.text, tokloc(nm)};
