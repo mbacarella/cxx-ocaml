@@ -515,11 +515,15 @@ private:
 
 }  // namespace
 
-CmiFile CmiFile::load(const std::string& filepath) {
+const CmiFile& CmiFile::load(const std::string& filepath) {
   // A .cmi is immutable for the lifetime of a compile, but several passes (the
   // inferencer, register_stdlib_ctors, pervasive resolution) each re-decode the
   // same file -- stdlib.cmi alone is decoded 3x.  Memoise by path: the Marshal
-  // decode (the costly part, ~2 ms for stdlib.cmi) then happens once.
+  // decode (the costly part, ~2 ms for stdlib.cmi) then happens once.  Return a
+  // reference into the (static, never-erased) cache -- unordered_map keeps
+  // element references stable across rehash -- so callers that bind `const
+  // auto&` share the decoded signature instead of deep-copying it (the whole
+  // SigValue/ConstructorDecl/LabelDecl graph) on every access.
   static std::unordered_map<std::string, CmiFile> cache;
   if (auto it = cache.find(filepath); it != cache.end()) return it->second;
   std::ifstream in(filepath, std::ios::binary);
@@ -543,8 +547,7 @@ CmiFile CmiFile::load(const std::string& filepath) {
   CmiFile cmi;
   cmi.module_name_ = arena[tuple.fields.at(0)].str;
   cmi.sig_ = dec.signature(tuple.fields.at(1));
-  cache.emplace(filepath, cmi);
-  return cmi;
+  return cache.emplace(filepath, std::move(cmi)).first->second;
 }
 
 const SigValue* CmiFile::find_value(const std::string& name) const {

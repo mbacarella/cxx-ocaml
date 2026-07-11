@@ -218,7 +218,7 @@ ModCoercion compute_coercion(const Signature& src, const Signature& tgt);
 // Type graphs are decoded on demand.
 class CmiFile {
 public:
-  static CmiFile load(const std::string& path);
+  static const CmiFile& load(const std::string& path);
 
   const std::string& module_name() const { return module_name_; }
   const Signature& sig() const { return sig_; }
