@@ -1048,6 +1048,7 @@ std::string read_cmi_self_crc(const std::string& path) {
   if (off + 4 > bytes.size()) return "";
   try {
     m::Arena arena;
+    arena.reserve(bytes.size() * 2 / 3);  // node count ~0.5x bytes; avoid grow-and-move
     m::read_value(bytes.data(), bytes.size(), off, arena);          // header
     std::size_t crcs = m::read_value(bytes.data(), bytes.size(), off, arena);  // crc list
     const m::Value& cell = arena[crcs];                             // first cons cell
@@ -2347,6 +2348,7 @@ std::vector<std::pair<std::string, std::string>> read_cmi_crcs(const std::string
   if (off + 4 > bytes.size()) return r;
   try {
     m::Arena arena;
+    arena.reserve(bytes.size() * 2 / 3);  // node count ~0.5x bytes; avoid grow-and-move
     m::read_value(bytes.data(), bytes.size(), off, arena);          // header
     std::size_t cur = m::read_value(bytes.data(), bytes.size(), off, arena);  // crc list
     while (arena[cur].kind == m::Value::Kind::Block && arena[cur].fields.size() == 2) {
@@ -2471,6 +2473,7 @@ o::ValPtr read_cmi_sign(const std::string& path, std::string* out_name) {
       break;
   if (off + 4 > bytes.size()) throw std::runtime_error("no marshal header in " + path);
   m::Arena arena;
+  arena.reserve(bytes.size() * 2 / 3);  // node count ~0.5x bytes; avoid grow-and-move
   std::size_t hid = m::read_value(bytes.data(), bytes.size(), off, arena);  // (name, sign)
   const m::Value& hv = arena[hid];
   if (hv.kind != m::Value::Kind::Block || hv.fields.size() < 2)
