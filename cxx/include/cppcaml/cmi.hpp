@@ -225,6 +225,10 @@ public:
   // only their records/variants.  Kept in a SEPARATE cache from load() so a
   // partial signature never satisfies a caller that needs the full one.
   static const CmiFile& load_types_only(const std::string& path);
+  // Paths of every .cmi that a full load() has decoded so far this compile --
+  // i.e. the modules actually referenced (their signatures were needed to
+  // type-check).  A module not in this set is not in scope for disambiguation.
+  static std::vector<std::string> loaded_paths();
 
   const std::string& module_name() const { return module_name_; }
   const Signature& sig() const { return sig_; }
@@ -234,10 +238,15 @@ public:
   const SigValue* find_value(const std::string& name) const;
   const TypeDecl* find_type(const std::string& name) const;
   const ModuleDecl* find_module(const std::string& name) const;
+  // The module names in this cmi's crc table ("Interfaces imported") -- every
+  // interface the unit was type-checked against, i.e. its transitive type
+  // dependencies.  Used to scope the labelset index to reachable modules.
+  const std::vector<std::string>& imports() const { return imports_; }
 
 private:
   std::string module_name_;
   Signature sig_;
+  std::vector<std::string> imports_;
 };
 
 // Render a type_expr / type declaration / module type in OCaml-ish syntax.

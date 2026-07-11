@@ -542,7 +542,18 @@ namespace {
 // `arena`; returns the id of the header value (the (modname, signature) tuple).
 // Shared by both load paths -- the arena build is identical; only which parts of
 // the signature the Decoder then materialises differs.
-std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena) {
+// Advance `off` to the next Marshal magic byte (0x84 0x95 0xA6 0xB{D,E,F}) at or
+// after its current value; returns false if none is found before end.
+bool find_marshal_magic(const std::vector<std::uint8_t>& bytes, std::size_t& off) {
+  for (; off + 4 <= bytes.size(); ++off)
+    if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
+        (bytes[off + 3] == 0xBE || bytes[off + 3] == 0xBF || bytes[off + 3] == 0xBD))
+      return true;
+  return false;
+}
+
+std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena,
+                           std::vector<std::string>* imports = nullptr) {
   std::ifstream in(filepath, std::ios::binary);
   if (!in) throw m::Error("cannot open " + filepath);
   std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
@@ -550,18 +561,39 @@ std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena) {
 
   // Skip the cmi magic string and decode the header value (name, signature).
   std::size_t off = 0;
-  for (; off + 4 <= bytes.size(); ++off)
-    if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
-        (bytes[off + 3] == 0xBE || bytes[off + 3] == 0xBF || bytes[off + 3] == 0xBD))
-      break;
-  if (off + 4 > bytes.size()) throw m::Error("no Marshal magic in " + filepath);
+  if (!find_marshal_magic(bytes, off)) throw m::Error("no Marshal magic in " + filepath);
 
   // The decoded node count is roughly proportional to the file size; reserve up
   // front so the arena (a vector of ~140-byte Values) does not repeatedly
   // reallocate and move every node as it grows during decode.
   arena.reserve(bytes.size() / 2);
-  return m::read_value(bytes.data(), bytes.size(), off, arena);
+  std::size_t header = m::read_value(bytes.data(), bytes.size(), off, arena);
+
+  // The cmi_crcs table ("Interfaces imported") is a SECOND, independently
+  // marshalled value right after the header (see file_formats/cmi_format.ml:
+  // output_value oc (crcs : (modname * digest option) list)).  Decode just its
+  // module names when the caller wants the import set.
+  if (imports) {
+    if (find_marshal_magic(bytes, off)) {
+      try {
+        std::size_t crcs = m::read_value(bytes.data(), bytes.size(), off, arena);
+        for (std::size_t cur = crcs; arena[cur].kind == m::Value::Kind::Block &&
+                                     arena[cur].fields.size() == 2;) {
+          const m::Value& pair = arena[arena[cur].fields[0]];  // (modname, digest opt)
+          if (!pair.fields.empty()) imports->push_back(arena[pair.fields[0]].str);
+          cur = arena[cur].fields[1];
+        }
+      } catch (...) {}
+    }
+  }
+  return header;
 }
+}  // namespace
+
+namespace {
+// The full-decode cache, at file scope so loaded_paths() can enumerate which
+// modules this compile has actually referenced (their .cmi got loaded).
+std::unordered_map<std::string, CmiFile> g_load_cache;
 }  // namespace
 
 const CmiFile& CmiFile::load(const std::string& filepath) {
@@ -573,7 +605,7 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
   // element references stable across rehash -- so callers that bind `const
   // auto&` share the decoded signature instead of deep-copying it (the whole
   // SigValue/ConstructorDecl/LabelDecl graph) on every access.
-  static std::unordered_map<std::string, CmiFile> cache;
+  auto& cache = g_load_cache;
   if (auto it = cache.find(filepath); it != cache.end()) return it->second;
   m::Arena arena;
   std::size_t header = read_cmi_arena(filepath, arena);
@@ -586,6 +618,13 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
   return cache.emplace(filepath, std::move(cmi)).first->second;
 }
 
+std::vector<std::string> CmiFile::loaded_paths() {
+  std::vector<std::string> out;
+  out.reserve(g_load_cache.size());
+  for (auto& [p, _] : g_load_cache) out.push_back(p);
+  return out;
+}
+
 const CmiFile& CmiFile::load_types_only(const std::string& filepath) {
   // A SEPARATE cache from load(): this stores a partial signature (only
   // sig().types), so it must never satisfy a caller that expects a full decode.
@@ -594,11 +633,11 @@ const CmiFile& CmiFile::load_types_only(const std::string& filepath) {
   static std::unordered_map<std::string, CmiFile> cache;
   if (auto it = cache.find(filepath); it != cache.end()) return it->second;
   m::Arena arena;
-  std::size_t header = read_cmi_arena(filepath, arena);
+  CmiFile cmi;
+  std::size_t header = read_cmi_arena(filepath, arena, &cmi.imports_);
   const m::Value& tuple = arena[header];  // (modname, signature)
 
   Decoder dec(arena);
-  CmiFile cmi;
   cmi.module_name_ = arena[tuple.fields.at(0)].str;
   cmi.sig_ = dec.signature_types_only(tuple.fields.at(1));
   return cache.emplace(filepath, std::move(cmi)).first->second;

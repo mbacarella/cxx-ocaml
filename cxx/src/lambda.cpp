@@ -4474,21 +4474,68 @@ struct Translator {
   void build_labelset_index() {
     if (labelset_index_built_) return;
     labelset_index_built_ = true;
-    std::vector<std::string> dirs = module_dirs_;
-    dirs.push_back(stdlib_dir);
-    for (auto& d : dirs) {
-      std::error_code ec;
-      if (d.empty() || !std::filesystem::is_directory(d, ec)) continue;
-      for (auto& ent : std::filesystem::directory_iterator(d, ec)) {
-        if (ent.path().extension() != ".cmi") continue;
-        try {
-          // The index reads only top-level records/variants; a lean types-only
-          // decode skips value type-graphs and submodule sigs (the bulk of a
-          // full decode) across the ~200 in-scope cmis of a single compile.
-          const auto& cmi = cmi::CmiFile::load_types_only(ent.path().string());
-          std::string modname = ent.path().stem().string();
-          if (!modname.empty()) modname[0] = (char)std::toupper((unsigned char)modname[0]);
-          for (auto& td : cmi.sig().types) {
+    bool prof = std::getenv("CPPCAML_LSPROF") != nullptr;
+    auto t0 = std::chrono::steady_clock::now();
+    int nfiles = 0;
+    // Scope the index to modules TYPE-REACHABLE from this compile, instead of
+    // decoding every .cmi on disk.  The seed = modules directly referenced (their
+    // .cmi got a full load() during inference) or `open`ed; each is expanded by
+    // the module names in its cmi crc table ("Interfaces imported"), which OCaml
+    // records as the unit's full transitive type dependencies.  So a record only
+    // reachable via a referenced type (e.g. Types.constructor_description reached
+    // through Typedtree) is still indexed, even though the compiler never
+    // full-loads types.cmi itself -- while not-yet-compiled sibling units and
+    // unrelated modules are skipped.  The index's ambiguity verdict is a pure
+    // function of the SET of files (order-independent), so only the set matters.
+    auto to_stem = [](std::string m) {
+      size_t dot = m.find('.');  // an `open M.Sub` seeds on head module M
+      if (dot != std::string::npos) m = m.substr(0, dot);
+      if (!m.empty()) m[0] = (char)std::tolower((unsigned char)m[0]);
+      return m;
+    };
+    // Cheap: enumerate the in-scope .cmi FILES (no decode) as stem -> path.
+    std::map<std::string, std::string> stem2path;
+    {
+      std::vector<std::string> dirs = module_dirs_;
+      dirs.push_back(stdlib_dir);
+      std::set<std::string> seen_dirs;
+      for (auto& d : dirs) {
+        std::error_code ec;
+        if (d.empty() || !std::filesystem::is_directory(d, ec)) continue;
+        std::string canon = std::filesystem::weakly_canonical(d, ec).string();
+        if (!seen_dirs.insert(canon.empty() ? d : canon).second) continue;
+        for (auto& ent : std::filesystem::directory_iterator(d, ec))
+          if (ent.path().extension() == ".cmi")
+            stem2path.emplace(ent.path().stem().string(), ent.path().string());
+      }
+    }
+    std::set<std::string> want;  // file stems to index
+    for (auto& p : cmi::CmiFile::loaded_paths())
+      want.insert(std::filesystem::path(p).stem().string());
+    for (auto& o : opened_) want.insert(to_stem(o));
+    // Expand each seed by its transitive imports (crc table).
+    std::set<std::string> seed = want;
+    for (auto& s : seed) {
+      auto it = stem2path.find(s);
+      if (it == stem2path.end()) continue;
+      try {
+        for (auto& imp : cmi::CmiFile::load_types_only(it->second).imports())
+          want.insert(to_stem(imp));
+      } catch (...) {}
+    }
+    std::set<std::string> paths;
+    for (auto& s : want)
+      if (auto it = stem2path.find(s); it != stem2path.end()) paths.insert(it->second);
+    auto index_cmi = [&](const std::string& path) {
+      ++nfiles;
+      try {
+        // The index reads only top-level records/variants; a lean types-only
+        // decode skips value type-graphs and submodule sigs (the bulk of a
+        // full decode).
+        const auto& cmi = cmi::CmiFile::load_types_only(path);
+        std::string modname = std::filesystem::path(path).stem().string();
+        if (!modname.empty()) modname[0] = (char)std::toupper((unsigned char)modname[0]);
+        for (auto& td : cmi.sig().types) {
             if (td.kind == cmi::TypeDecl::Variant && !td.ctors.empty())
               for (auto& c : td.ctors) {
                 if (ctor_arg_paths_ambig_.count(c.name)) continue;
@@ -4537,8 +4584,13 @@ struct Translator {
               labelset_index_.erase(it); labelset_ambiguous_.insert(key);
             }
           }
-        } catch (...) {}
-      }
+      } catch (...) {}
+    };
+    for (auto& p : paths) index_cmi(p);
+    if (prof) {
+      auto ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+      std::cerr << "  [labelset_index] " << nfiles << " cmi in " << ms << " ms\n";
     }
   }
   // A var bound to a record LITERAL whose label set uniquely identifies one record
