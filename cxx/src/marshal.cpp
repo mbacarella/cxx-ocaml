@@ -57,6 +57,13 @@ public:
     return root;
   }
 
+  // Parse only the header and jump to the value's end, decoding nothing.
+  std::size_t skip_root() {
+    parse_header();
+    pos_ = data_end_;
+    return pos_;
+  }
+
   std::size_t pos() const { return pos_; }
 
 private:
@@ -292,6 +299,12 @@ std::size_t read_value(const std::uint8_t* data, std::size_t len,
   std::size_t root = r.read_root();
   off = r.pos();
   return root;
+}
+
+void skip_value(const std::uint8_t* data, std::size_t len, std::size_t& off) {
+  Arena unused;  // never touched by skip_root
+  Reader r(data, len, off, unused);
+  off = r.skip_root();
 }
 
 }  // namespace cppcaml::marshal

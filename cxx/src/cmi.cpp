@@ -1056,15 +1056,13 @@ std::string read_cmi_self_crc(const std::string& path) {
   if (!in) return "";
   std::vector<std::uint8_t> bytes = slurp_bytes(in);
   std::size_t off = 0;
-  for (; off + 4 <= bytes.size(); ++off)
-    if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
-        (bytes[off + 3] == 0xBE || bytes[off + 3] == 0xBF || bytes[off + 3] == 0xBD))
-      break;
-  if (off + 4 > bytes.size()) return "";
+  if (!find_marshal_magic(bytes, off)) return "";
   try {
     m::Arena arena;
-    arena.reserve(bytes.size() * 2 / 3);  // node count ~0.5x bytes; avoid grow-and-move
-    m::read_value(bytes.data(), bytes.size(), off, arena);          // header
+    // We only need the crc table (the 2nd Marshal value), not the signature: skip
+    // the header value by its declared length rather than decoding its whole graph.
+    m::skip_value(bytes.data(), bytes.size(), off);
+    if (!find_marshal_magic(bytes, off)) return "";
     std::size_t crcs = m::read_value(bytes.data(), bytes.size(), off, arena);  // crc list
     const m::Value& cell = arena[crcs];                             // first cons cell
     if (cell.kind != m::Value::Kind::Block || cell.fields.size() < 1) return "";
@@ -2355,15 +2353,13 @@ std::vector<std::pair<std::string, std::string>> read_cmi_crcs(const std::string
   if (!in) return r;
   std::vector<std::uint8_t> bytes = slurp_bytes(in);
   std::size_t off = 0;
-  for (; off + 4 <= bytes.size(); ++off)
-    if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
-        (bytes[off + 3] == 0xBE || bytes[off + 3] == 0xBF || bytes[off + 3] == 0xBD))
-      break;
-  if (off + 4 > bytes.size()) return r;
+  if (!find_marshal_magic(bytes, off)) return r;
   try {
     m::Arena arena;
-    arena.reserve(bytes.size() * 2 / 3);  // node count ~0.5x bytes; avoid grow-and-move
-    m::read_value(bytes.data(), bytes.size(), off, arena);          // header
+    // Only the crc table (2nd Marshal value) is needed: skip the signature by its
+    // declared length instead of decoding its whole node graph.
+    m::skip_value(bytes.data(), bytes.size(), off);
+    if (!find_marshal_magic(bytes, off)) return r;
     std::size_t cur = m::read_value(bytes.data(), bytes.size(), off, arena);  // crc list
     while (arena[cur].kind == m::Value::Kind::Block && arena[cur].fields.size() == 2) {
       const m::Value& entry = arena[arena[cur].fields[0]];          // (name, crc option)

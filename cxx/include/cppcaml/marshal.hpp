@@ -80,4 +80,11 @@ private:
 std::size_t read_value(const std::uint8_t* data, std::size_t len,
                        std::size_t& off, Arena& arena);
 
+// Advance `off` past one Marshal value (which must begin at its 4-byte magic)
+// WITHOUT decoding its body -- reads only the header's declared data length and
+// jumps to the value's end.  Used to skip over a value we don't need (e.g. a
+// cmi's signature) to reach the next one (its crc table) without materialising
+// the whole node graph.  Throws marshal::Error on a bad/short header.
+void skip_value(const std::uint8_t* data, std::size_t len, std::size_t& off);
+
 }  // namespace cppcaml::marshal
