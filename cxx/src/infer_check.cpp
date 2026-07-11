@@ -11483,6 +11483,14 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           }
       if (l && module_sigs.count(l->name)) {
         import_modtypes_of(*module_sigs.at(l->name));
+        // Its TYPE decls too: `open D` of a module known by its AST sig (a
+        // functor parameter, or a local module) must qualify bare type cites
+        // (`left` -> `D.left`) or every use in a following val/decl degrades
+        // to a fresh var (diffing.mli's `Define(D:Defs): sig open D ..`).
+        for (auto& msi : *module_sigs.at(l->name))
+          if (auto* pt2 = std::get_if<Psig_type>(&msi.desc))
+            for (auto& d2 : pt2->decls)
+              ck.opened_type_quals_[d2.name.txt] = l->name + "." + d2.name.txt;
       } else if (!std::holds_alternative<Lapply>(po->id.txt.v)) {
         // `open Terms` of a separately-compiled unit (or dotted submodule):
         // its bare type names must resolve qualified (`term` -> `Terms.term`)
@@ -11666,9 +11674,30 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       more.push_back(std::move(p));
       body = pf2->body.get();
     }
+    // The BODY sees each NAMED param as a module (its AST sig): `open D`
+    // inside the result signature then qualifies D's types (diffing.mli's
+    // `module Define(D:Defs): sig open D  type nonrec change = (left,..)
+    // change .. end` -- without it left/right/eq/diff degraded to fresh
+    // vars and ocamlc rejected diffing.ml against the cmi).
+    std::unordered_map<std::string, const ast::Signature*> body_mods =
+        module_sigs;
+    if (auto* fn = std::get_if<Functor_named>(&pf.param))
+      if (fn->name.txt && fn->type)
+        if (const ast::Signature* psg = body_sig(*fn->type))
+          body_mods[*fn->name.txt] = psg;
+    {
+      const ast::ModuleType* b2 = pf.body.get();
+      while (auto* pf2 = std::get_if<Pmty_functor>(&b2->desc)) {
+        if (auto* fn2 = std::get_if<Functor_named>(&pf2->param))
+          if (fn2->name.txt && fn2->type)
+            if (const ast::Signature* psg2 = body_sig(*fn2->type))
+              body_mods[*fn2->name.txt] = psg2;
+        b2 = pf2->body.get();
+      }
+    }
     std::vector<cmi::cmiw::SigItem> result;
     if (const ast::Signature* rs = body_sig(*body))
-      result = signature_to_cmi_i(*rs, &modtypes, &module_sigs, &ck);
+      result = signature_to_cmi_i(*rs, &modtypes, &body_mods, &ck);
     else
       result = qual_modtype_items(*body);
     apply_with_constraints(ck, *body, result);

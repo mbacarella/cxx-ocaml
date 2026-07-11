@@ -933,9 +933,17 @@ struct Translator {
   void collect_pv_tags_lid(const Longident& id, std::set<long long>& out,
                            std::set<std::string>& seen) {
     std::string dotted;
-    if (lid_to_dotted(id, dotted) && dotted.find('.') != std::string::npos &&
-        pv_raw_tags_.count(dotted)) {
-      collect_pv_tags(dotted, out, seen); return;
+    if (lid_to_dotted(id, dotted) && dotted.find('.') != std::string::npos) {
+      // `#A.base` (A a separately-compiled unit, or a nested `#A.B.t`): the
+      // abbreviation isn't in any local AST decl -- load the enclosing
+      // module path's polyvariant abbrevs from its cmi (typeopt.ml's
+      // `Some #Predef.data_type_constr` arm classified EVERY type Float
+      // without this, fataling extract_float on big string-array consts).
+      if (!pv_raw_tags_.count(dotted)) {
+        std::string mod = dotted.substr(0, dotted.rfind('.'));
+        register_pv_types_from(mod, mod);
+      }
+      if (pv_raw_tags_.count(dotted)) { collect_pv_tags(dotted, out, seen); return; }
     }
     collect_pv_tags(lid_last(id), out, seen);
   }
@@ -1859,12 +1867,17 @@ struct Translator {
         if (key == ty || (key.size() > ty.size() + 1 &&
                           key.compare(0, ty.size(), ty) == 0 && key[ty.size()] == '#'))
           if (auto fi = in_key(key)) return fi;
-    if (mod.find('.') == std::string::npos)  // an imported top-level module's record
+    if (mod.find('.') == std::string::npos) {  // an imported top-level module's record
       if (auto sr = stdlib_record_layout_named(mod, ty)) {
         for (int i = 0; i < (int)sr->labels.size(); ++i)
           if (sr->labels[i] == label)
             return FieldInfo{ty, i, sr->mut[i], sr->shape[i]};
       }
+    } else if (auto sf = nested_typed_record_field(mod, ty, label)) {
+      // a DEEP nested-module path ("Signature_matching.Suggestion.report"):
+      // navigate the head unit's cmi through the submodules
+      return FieldInfo{ty, sf->index, sf->mut, sf->kind};
+    }
     return std::nullopt;
   }
   // Tag a var bound by an inline-record-ctor field pattern (`Pattern {penv}`) with
@@ -4699,6 +4712,20 @@ struct Translator {
         if (auto rf = resolve_field_in_record_path(h->second, n)) { store = *rf; return &store; }
         if (const FieldInfo* fi = named_record_field(h->second, n, store)) return fi;
       }
+    // The checker's inferred record type for the WHOLE pattern (unified with
+    // the scrutinee): authoritative for a foreign record with no qualifier
+    // and no local registration (includemod_errorprinter's
+    // `match Signature_matching.suggest sgs with { alterations = _::_; _ }`
+    // -- Suggestion.report lives only in signature_matching.cmi's submodule;
+    // every fallback below missed and the whole match was DROPPED, leaving
+    // the arm binders unresolved).
+    if (pat_key)
+      if (auto pt = vk.pat_record_type.find(pat_key); pt != vk.pat_record_type.end())
+        if (pt->second.find('.') != std::string::npos)
+          if (auto rf = resolve_field_in_record_path(pt->second, n)) {
+            store = *rf;
+            return &store;
+          }
     // A bare label whose record is pinned by a QUALIFIED SIBLING field
     // (`{Types.cd_id; cd_args; cd_res}`): OCaml requires all fields of one record,
     // so the sibling's module is authoritative -- resolve `cd_args` as
@@ -10824,6 +10851,25 @@ struct Translator {
                 l->prim_arg = (int)i; l->args = {expr(*fe->e)};
                 return l;
               }
+        } else if (dpos != std::string::npos) {
+          // A DEEP nested-module type path (`sgs : Includemod.Error.
+          // signature_symptom` then `sgs.incompatibles`): navigate the head
+          // unit's cmi through the submodules.  The bare find_field below
+          // would take a same-named label of an unrelated record
+          // (signature_matching's own Suggestion.report has incompatibles@1;
+          // signature_symptom declares it @5 -- the wrong read put a list
+          // where a Subst.t was expected and segfaulted every interface-
+          // mismatch report of the bootstrapped compiler).
+          std::string mod = p.substr(0, dpos), ty = p.substr(dpos + 1);
+          if (auto rf = nested_typed_record_field(mod, ty, lbl)) {
+            auto l = mk(Lam::K::Prim);
+            l->prim = rf->flat                     ? Prim::Floatfield
+                      : rf->kind == ValueKind::Int ? Prim::FieldInt
+                      : rf->mut                    ? Prim::FieldMut
+                                                   : Prim::FieldImm;
+            l->prim_arg = rf->index; l->args = {expr(*fe->e)};
+            return l;
+          }
         }
       }
       // A var bound to a record LITERAL of a label-set-determined type: resolve the
