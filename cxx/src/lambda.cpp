@@ -3897,6 +3897,20 @@ struct Translator {
       // five optionals) was otherwise called raw, dropping an argument.
       FnSig s = callee_sig(e);
       for (auto& [k, n] : s) if (k != 0) { fn_sig_[id.stamp] = s; break; }
+    } else if (auto* ap = std::get_if<Pexp_apply>(&e->desc)) {
+      // `let return = return_payload ~late_typedtree:()`: a let-bound
+      // PARTIAL APPLICATION of a labelled/optional function.  Record the
+      // RESIDUAL signature so the binding's own call sites still reorder
+      // and None-fill -- typemod's `return ~ghosts ~replace_by path` left
+      // `?paths` unfilled, so the patch closure returned a partial-
+      // application CLOSURE where Some(..) was expected and the
+      // bootstrapped compiler segfaulted on any `with module T := T`.
+      FnSig callee = callee_sig(ap->fn.get());
+      if (!callee.empty()) {
+        FnSig resid = residual_after_apply(callee, ap->args);
+        for (auto& [k, n] : resid)
+          if (k != 0) { fn_sig_[id.stamp] = resid; break; }
+      }
     }
   }
   // `let f, g = M.(a, b)`: each tuple component that aliases a labelled function
