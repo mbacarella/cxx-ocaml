@@ -155,6 +155,58 @@ struct Checker {
   // `type namespace := Shape.Sig_component_kind.t` must substitute into each
   // val or the vals degrade to a free 'a.
   std::unordered_map<std::string, Alias> type_substs_;
+  // Decl-position opened quals for a manifest's bare type names.  OCaml
+  // resolves a manifest at its DECL position, but expansion here happens
+  // lazily at USE position, where a LATER local decl may already have
+  // shadowed an opened name (patterns.mli: Simple.view's row cites `pattern`
+  // = Typedtree.pattern via `open Typedtree`; the local `type pattern` two
+  // items later erases the qual before `val omega`/`val erase` expand the
+  // row, so the cite degraded to the local decl).  Keyed by the manifest AST
+  // node and SHARED across a signature's sub-checkers, so a sibling-module
+  // manifest expansion (sibling_type_manifest_) sees the declaring module's
+  // snapshot.
+  std::shared_ptr<std::unordered_map<
+      const CoreType*, std::vector<std::pair<std::string, std::string>>>>
+      manifest_decl_quals_ = std::make_shared<std::unordered_map<
+          const CoreType*, std::vector<std::pair<std::string, std::string>>>>();
+  // Names declared in this checker's own scope so far (decl order): a
+  // manifest citing one of these means the LOCAL decl, not an opened qual,
+  // so it takes no snapshot entry.
+  std::set<std::string> local_declared_;
+  // RAII: resolve a manifest's bare names as of its DECL position -- restores
+  // the snapshotted opened quals and hides a later-declared same-named local
+  // alias for the expansion's duration.  No-op for a manifest without a
+  // snapshot or whose names still resolve as they did at decl time.
+  struct DeclQualOverlay {
+    Checker& ck;
+    std::vector<std::pair<std::string, std::optional<std::string>>> squals;
+    std::vector<std::pair<std::string, Alias>> saliases;
+    DeclQualOverlay(Checker& c, const CoreType* man) : ck(c) {
+      auto it = ck.manifest_decl_quals_->find(man);
+      if (it == ck.manifest_decl_quals_->end()) return;
+      for (auto& [n, q] : it->second) {
+        auto qi = ck.opened_type_quals_.find(n);
+        if (qi != ck.opened_type_quals_.end() && qi->second == q &&
+            !ck.type_aliases.count(n))
+          continue;  // still resolves as at decl time
+        squals.emplace_back(n, qi != ck.opened_type_quals_.end()
+                                   ? std::optional<std::string>(qi->second)
+                                   : std::nullopt);
+        ck.opened_type_quals_[n] = q;
+        if (auto ai = ck.type_aliases.find(n); ai != ck.type_aliases.end()) {
+          saliases.emplace_back(n, ai->second);
+          ck.type_aliases.erase(ai);
+        }
+      }
+    }
+    ~DeclQualOverlay() {
+      for (auto& [n, q] : squals) {
+        if (q) ck.opened_type_quals_[n] = *q;
+        else ck.opened_type_quals_.erase(n);
+      }
+      for (auto& [n, a] : saliases) ck.type_aliases[n] = a;
+    }
+  };
   // stamped (opaque) module-nested decls: stamp -> qualified display path
   std::unordered_map<int, std::string> stamp_path_;
   // module prefixes ("A.") whose contents are re-exported bare by a top-level
@@ -1029,7 +1081,12 @@ struct Checker {
                         src = man;
               bool sf = fold_abbrevs_, sk = keep_local_abbrevs_;
               fold_abbrevs_ = true; keep_local_abbrevs_ = false;
-              TypePtr ex = I::Engine::repr(from_coretype(*src, vars));
+              TypePtr ex;
+              {  // a sibling MANIFEST resolves its bare cites at ITS decl
+                 // position (patterns.mli Half_simple.view's `pattern`)
+                DeclQualOverlay dq(*this, src);
+                ex = I::Engine::repr(from_coretype(*src, vars));
+              }
               fold_abbrevs_ = sf; keep_local_abbrevs_ = sk;
               if (ex->kind == I::Type::Kind::Variant && !ex->labels.empty()) {
                 for (size_t i = 0; i < ex->labels.size(); ++i) {
@@ -1210,7 +1267,11 @@ struct Checker {
         expanding_.insert(nm);
         bool saved_me = manifest_expansion_;
         manifest_expansion_ = true;
-        TypePtr r = I::Engine::repr(from_coretype(*ai->second.manifest, sub));
+        TypePtr r;
+        {  // decl-position name resolution for the manifest's bare cites
+          DeclQualOverlay dq(*this, ai->second.manifest);
+          r = I::Engine::repr(from_coretype(*ai->second.manifest, sub));
+        }
         manifest_expansion_ = saved_me;
         expanding_.erase(nm);
         if (r->kind == I::Type::Kind::Variant) {
@@ -1354,7 +1415,11 @@ struct Checker {
         for (size_t i = 0; i < as.size(); ++i)
           if (!ai->second.params[i].empty()) sub[ai->second.params[i]] = as[i];
         expanding_.insert(nm);
-        TypePtr r = from_coretype(*ai->second.manifest, sub);
+        TypePtr r;
+        {  // decl-position name resolution for the manifest's bare cites
+          DeclQualOverlay dq(*this, ai->second.manifest);
+          r = from_coretype(*ai->second.manifest, sub);
+        }
         expanding_.erase(nm);
         return r;
       }
@@ -2910,6 +2975,34 @@ struct Checker {
       collect_alias_refs(*al->type, out);
     }
   }
+  // Bare (unqualified) type names cited anywhere in a core type -- unlike
+  // collect_alias_refs (cyclic-abbreviation check) it recurses into variant
+  // rows and doesn't filter by the alias map: it feeds the decl-position
+  // qual snapshot (manifest_decl_quals_).
+  void collect_bare_type_names(const CoreType& t, std::set<std::string>& out) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v)) out.insert(l->name);
+      for (auto& a : c->args) collect_bare_type_names(*a, out);
+    } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      collect_bare_type_names(*a->dom, out);
+      collect_bare_type_names(*a->cod, out);
+    } else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : tu->elems) collect_bare_type_names(*e, out);
+    } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+      collect_bare_type_names(*al->type, out);
+    } else if (auto* pv = std::get_if<Ptyp_variant>(&t.desc)) {
+      for (auto& r : pv->rows) {
+        if (auto* rt = std::get_if<Rtag>(&r))
+          for (auto& ty : rt->types) collect_bare_type_names(*ty, out);
+        else if (auto* ri = std::get_if<Rinherit>(&r))
+          collect_bare_type_names(*ri->ct, out);
+      }
+    } else if (auto* cl = std::get_if<Ptyp_class>(&t.desc)) {
+      for (auto& a : cl->args) collect_bare_type_names(*a, out);
+    } else if (auto* po = std::get_if<Ptyp_poly>(&t.desc)) {
+      collect_bare_type_names(*po->type, out);
+    }
+  }
   // Cyclic type-abbreviation check: an abbreviation whose expansion refers back
   // to itself (`type t = t * t`, `type a = b and b = a`) is rejected (no
   // -rectypes).  Only file-local aliases participate, so this never
@@ -3281,7 +3374,25 @@ struct Checker {
       // (core_array's `'a t` vs the nested Permissioned.Int.t).
       if (!ins && !(f->second.display_path.empty() && !na.display_path.empty()))
         f->second = std::move(na);
+      // Decl-position snapshot (see manifest_decl_quals_): record the opened
+      // qual of every bare name the manifest cites that isn't already a
+      // local decl or alias -- a LATER local decl shadowing the name must
+      // not capture this manifest's citation.  Skips names that resolve to
+      // an existing alias/subst (use-time resolution prefers those anyway).
+      std::set<std::string> bare;
+      collect_bare_type_names(*d.manifest->get(), bare);
+      std::vector<std::pair<std::string, std::string>> snap;
+      for (auto& n : bare) {
+        if (n == d.name.txt || local_declared_.count(n) ||
+            type_aliases.count(n) || type_substs_.count(n))
+          continue;
+        if (auto q = opened_type_quals_.find(n); q != opened_type_quals_.end())
+          snap.emplace_back(n, q->second);
+      }
+      if (!snap.empty())
+        (*manifest_decl_quals_)[d.manifest->get()] = std::move(snap);
     }
+    local_declared_.insert(d.name.txt);
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;
     if (d.priv == PrivateFlag::Private)
@@ -11258,6 +11369,10 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     ck.opened_submod_quals_ = outer_ck->opened_submod_quals_;
     ck.opened_modtype_quals_ = outer_ck->opened_modtype_quals_;
     ck.type_substs_ = outer_ck->type_substs_;
+    // SHARED decl-position qual snapshots: a sibling module's manifest
+    // (sibling_type_manifest_) expands under the snapshot its own
+    // sub-checker recorded.
+    ck.manifest_decl_quals_ = outer_ck->manifest_decl_quals_;
   }
   // Collect `module type S = sig .. end` so a functor result `: S` (Map.Make)
   // can be resolved to S's signature items.  Inherit ENCLOSING modtypes too: a
