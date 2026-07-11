@@ -17,6 +17,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -261,7 +262,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   return 0;
 }
 
-int main(int argc, char** argv) {
+static int run_main(int argc, char** argv) {
   std::string out_path, stdlib_flag, runtime;
   std::vector<std::string> incdirs_raw;  // -I dirs (may be `+unix`), in order
   std::vector<std::string> inputs;       // positional files (.ml/.mli/.cmo/.cma)
@@ -447,4 +448,22 @@ int main(int argc, char** argv) {
   }
   chmod(out_path.c_str(), 0755);
   return 0;
+}
+
+int main(int argc, char** argv) {
+  // Every .cmo/.cmi/executable is written through a local, RAII std::ofstream
+  // that has already flushed and closed by the time run_main returns; the only
+  // process-lifetime streams are std::cout/std::cerr (dumps, diagnostics).  So
+  // once those are flushed there is nothing left to do but free memory the OS
+  // is about to reclaim anyway -- and that teardown is not cheap: the never-
+  // erased cmi cache (g_load_cache) holds a large shared_ptr<TypeExpr> graph
+  // whose recursive destruction was the single hottest function at exit (~6%
+  // of a warm compile).  Skip all static destructors and atexit handlers with
+  // _Exit; the output bytes are identical, we just stop paying to unbuild the
+  // in-memory graphs on the way out.
+  int rc = run_main(argc, argv);
+  std::cout.flush();
+  std::cerr.flush();
+  std::fflush(nullptr);
+  std::_Exit(rc);
 }
