@@ -540,6 +540,10 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
   if (off + 4 > bytes.size()) throw m::Error("no Marshal magic in " + filepath);
 
   m::Arena arena;
+  // The decoded node count is roughly proportional to the file size; reserve up
+  // front so the arena (a vector of ~140-byte Values) does not repeatedly
+  // reallocate and move every node as it grows during decode.
+  arena.reserve(bytes.size() / 2);
   std::size_t header = m::read_value(bytes.data(), bytes.size(), off, arena);
   const m::Value& tuple = arena[header];  // (modname, signature)
 

@@ -57,6 +57,7 @@ public:
     return nodes_.size() - 1;
   }
   Value& at(std::size_t id) { return nodes_[id]; }
+  void reserve(std::size_t n) { nodes_.reserve(n); }
 
 private:
   std::vector<Value> nodes_;
