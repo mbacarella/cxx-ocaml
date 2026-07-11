@@ -11583,7 +11583,9 @@ static void subst_type_citations(std::vector<cmi::cmiw::SigItem>& items,
                                  bool shadowed);
 static void qualify_enclosing_types(std::vector<cmi::cmiw::SigItem>& result,
                                     const cmi::Signature& outer_sig,
-                                    const std::string& unit_path);
+                                    const std::string& unit_path,
+                                    const std::set<std::string>* unit_submods = nullptr,
+                                    const std::string& unit_name = "");
 static void annot_modtype_items(Checker* ckp, const ast::ModuleType& mt,
                                 std::string& ref,
                                 std::vector<cmi::cmiw::SigItem>& sig);
@@ -12180,7 +12182,13 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           std::string unit_path = cmi.module_name();
           for (std::size_t i = 1; i + 1 < comps.size(); ++i)
             unit_path += "." + comps[i];
-          qualify_enclosing_types(result, *sig, unit_path);
+          // Sibling submodules of the UNIT (`General` alongside
+          // IncrementalEngine) must requalify with the bare unit name, not the
+          // deeper unit_path, when cited by a bare path in the spliced modtype.
+          std::set<std::string> unit_submods;
+          for (auto& um : cmi.sig().modules) unit_submods.insert(um.name);
+          qualify_enclosing_types(result, *sig, unit_path, &unit_submods,
+                                  cmi.module_name());
           return result;
         }
       return {};
@@ -13087,10 +13095,13 @@ static std::vector<std::string> split_dotted(const std::string& s) {
 // the modtype decl; `unit_path` the real compiled path of that signature.
 static void qualify_enclosing_types(std::vector<cmi::cmiw::SigItem>& result,
                                     const cmi::Signature& outer_sig,
-                                    const std::string& unit_path) {
+                                    const std::string& unit_path,
+                                    const std::set<std::string>* unit_submods,
+                                    const std::string& unit_name) {
   std::set<std::string> outer;
   for (auto& td : outer_sig.types) outer.insert(td.name);
-  if (outer.empty()) return;
+  bool have_submods = unit_submods && !unit_submods->empty() && !unit_name.empty();
+  if (outer.empty() && !have_submods) return;
   std::set<std::string> shadow;
   std::function<void(const std::vector<cmi::cmiw::SigItem>&)> collect =
       [&](const std::vector<cmi::cmiw::SigItem>& its) {
@@ -13101,8 +13112,23 @@ static void qualify_enclosing_types(std::vector<cmi::cmiw::SigItem>& result,
       };
   collect(result);
   rewrite_item_ty_names(result, [&](std::string& n) {
-    if (n.find('.') == std::string::npos && outer.count(n) && !shadow.count(n))
-      n = unit_path + "." + n;
+    auto dot = n.find('.');
+    if (dot == std::string::npos) {
+      // A BARE type name owned by the enclosing module -> qualify with the
+      // full unit_path (`position` -> `CamlinternalMenhirLib.IncrementalEngine.
+      // position`).
+      if (outer.count(n) && !shadow.count(n)) n = unit_path + "." + n;
+    } else if (have_submods) {
+      // A path whose HEAD is a SIBLING submodule of the unit (a top-level
+      // module of the loaded cmi, not in scope in the including unit):
+      // `General.stream` -> `CamlinternalMenhirLib.General.stream`.  The modtype
+      // was written with `General` in scope (an `open General` / sibling ref);
+      // spliced into another unit that bare path resolves to nothing and ocamlc
+      // reports `General.stream is abstract, no cmi found` -> segfault here.
+      std::string head = n.substr(0, dot);
+      if (unit_submods->count(head) && !shadow.count(head) && head != unit_name)
+        n = unit_name + "." + n;
+    }
   });
 }
 
@@ -13151,7 +13177,10 @@ static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
         std::string unit_path = cmif.module_name();
         for (std::size_t i = 1; i + 1 < comps.size(); ++i)
           unit_path += "." + comps[i];
-        qualify_enclosing_types(result, *sig, unit_path);
+        std::set<std::string> unit_submods;
+        for (auto& um : cmif.sig().modules) unit_submods.insert(um.name);
+        qualify_enclosing_types(result, *sig, unit_path, &unit_submods,
+                                cmif.module_name());
         return result;
       }
     return {};  // modtype not found in the resolved signature
