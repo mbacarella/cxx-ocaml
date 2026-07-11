@@ -11163,7 +11163,16 @@ struct Translator {
                   !exn_ident_.count(n) && !exn_field_.count(n))))
               if (auto ti = type_ctor_info_.find(ety); ti != type_ctor_info_.end())
                 if (auto ci2 = ti->second.find(n); ci2 != ti->second.end())
-                  cip = &ci2->second;
+                  // Shape guard: never install a candidate the WRITTEN construct
+                  // cannot be (a block ctor with no argument / a constant ctor
+                  // with one).  The checker's dotless inference is wrong exactly
+                  // there -- a functor param's `type u = X|Y|Z` under `open T`
+                  // infers as an unrelated file-level `X of string`, and the
+                  // override clobbered register_sig_ctors' correct entry
+                  // (patmatch PR#7661-E: `f A Y X` passed [0] for X).
+                  if (ci2->second.is_block == k->arg.has_value() ||
+                      forced_ctor_depth_.count(n))
+                    cip = &ci2->second;
           }
         }
       }
@@ -11174,9 +11183,13 @@ struct Translator {
       // built arity-1 (all three args wrapped in one tuple field), and
       // Tast_iterator walked garbage on every functor declaration.  Only a
       // candidate whose arity matches the written shape overrides.
-      if (cip && !qci && k->arg && cip->is_block && cip->rlabels.empty()) {
-        auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
-        int written = at ? (int)at->elems.size() : 1;
+      // The no-argument case is the same class: a bare `X` can never be the
+      // flat entry's block ctor (patmatch's t6674 `X of string` vs a functor
+      // param's `type u = X|Y|Z` under `open T` -- the call site emitted an
+      // empty block [0] where the constant ctor 0 was meant).
+      if (cip && !qci && cip->is_block && cip->rlabels.empty()) {
+        auto* at = k->arg ? std::get_if<Pexp_tuple>(&(*k->arg)->desc) : nullptr;
+        int written = k->arg ? (at ? (int)at->elems.size() : 1) : 0;
         if (cip->arity != written) {
           if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end()) {
             std::string ety = ec->second, emod;
@@ -11193,7 +11206,9 @@ struct Translator {
               for (auto& [nm2, info2] : tl)
                 if (nm2 == n) { better = &info2; break; }
             }
-            if (better && better->is_block && better->arity == written)
+            if (better && (k->arg.has_value()
+                               ? (better->is_block && better->arity == written)
+                               : !better->is_block))
               cip = better;
           }
         }

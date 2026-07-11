@@ -11240,9 +11240,18 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
   } else if (td.kind == cmi::TypeDecl::Variant) {
     std::vector<cmi::cmiw::Ctor> cs;
     for (auto& c : td.ctors) {
-      std::vector<cmi::cmiw::TyPtr> as;
-      for (auto& a : c.args) as.push_back(conv_cmi_ty(a, vars, nv, &nodes));
-      cs.push_back({c.name, std::move(as)});
+      cmi::cmiw::Ctor cw;
+      cw.name = c.name;
+      for (auto& a : c.args) cw.args.push_back(conv_cmi_ty(a, vars, nv, &nodes));
+      for (auto& l : c.inline_record)
+        cw.inline_record.push_back(
+            {l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)});
+      // GADT return (`Element : 'a lr1state * .. -> element`): dropping cd_res
+      // here turned the ctor into a PLAIN one, so a spliced functor-result sig
+      // no longer matched the engine's own decl (parser.mli's MenhirInterpreter
+      // include -- oracle: "is not included in").
+      if (c.res) cw.res = conv_cmi_ty(c.res, vars, nv, &nodes);
+      cs.push_back(std::move(cw));
     }
     si = cmi::cmiw::sig_variant(td.name, std::move(params), std::move(cs));
   } else {
@@ -11955,10 +11964,59 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         // functor parameter, or a local module) must qualify bare type cites
         // (`left` -> `D.left`) or every use in a following val/decl degrades
         // to a fresh var (diffing.mli's `Define(D:Defs): sig open D ..`).
-        for (auto& msi : *module_sigs.at(l->name))
-          if (auto* pt2 = std::get_if<Psig_type>(&msi.desc))
-            for (auto& d2 : pt2->decls)
-              ck.opened_type_quals_[d2.name.txt] = l->name + "." + d2.name.txt;
+        // Includes are flattened transitively: menhirLib's `open I` where
+        // I : EVERYTHING = `include INCREMENTAL_ENGINE; include INSPECTION`
+        // -- xsymbol/element live behind the includes.
+        std::function<void(const ast::Signature&, int)> seed_types =
+            [&](const ast::Signature& sg2, int depth) {
+              if (depth > 6) return;
+              for (auto& msi : sg2) {
+                if (auto* pt2 = std::get_if<Psig_type>(&msi.desc))
+                  for (auto& d2 : pt2->decls)
+                    ck.opened_type_quals_[d2.name.txt] =
+                        l->name + "." + d2.name.txt;
+                if (auto* pi2 = std::get_if<Psig_include>(&msi.desc)) {
+                  const ast::ModuleType* m2 = &pi2->mt;
+                  while (auto* pw2 = std::get_if<Pmty_with>(&m2->desc))
+                    m2 = pw2->mt.get();
+                  if (auto* pid2 = std::get_if<Pmty_ident>(&m2->desc)) {
+                    const ast::Signature* inc = nullptr;
+                    if (auto* il = std::get_if<Lident>(&pid2->id.txt.v)) {
+                      if (auto mf = modtypes.find(il->name);
+                          mf != modtypes.end())
+                        inc = mf->second;
+                      // a modtype declared inside a SIBLING module (EVERYTHING
+                      // includes INCREMENTAL_ENGINE, both members of
+                      // IncrementalEngine -- the bare name is in scope THERE)
+                      if (!inc)
+                        for (auto& [mn2, msig2] : module_sigs) {
+                          for (auto& mit3 : *msig2)
+                            if (auto* pmt3 =
+                                    std::get_if<Psig_modtype>(&mit3.desc))
+                              if (pmt3->name.txt == il->name && pmt3->type)
+                                if (auto* ps3 = std::get_if<Pmty_signature>(
+                                        &pmt3->type->desc))
+                                  inc = &ps3->items;
+                          if (inc) break;
+                        }
+                    } else if (auto* dd2 = std::get_if<Ldot>(&pid2->id.txt.v)) {
+                      if (auto* pl2 = std::get_if<Lident>(&dd2->prefix->v))
+                        if (auto f2 = module_sigs.find(pl2->name);
+                            f2 != module_sigs.end())
+                          for (auto& mit2 : *f2->second)
+                            if (auto* pmt2 =
+                                    std::get_if<Psig_modtype>(&mit2.desc))
+                              if (pmt2->name.txt == dd2->name && pmt2->type)
+                                if (auto* ps2 = std::get_if<Pmty_signature>(
+                                        &pmt2->type->desc))
+                                  inc = &ps2->items;
+                    }
+                    if (inc) seed_types(*inc, depth + 1);
+                  }
+                }
+              }
+            };
+        seed_types(*module_sigs.at(l->name), 0);
       } else if (!std::holds_alternative<Lapply>(po->id.txt.v)) {
         // `open Terms` of a separately-compiled unit (or dotted submodule):
         // its bare type names must resolve qualified (`term` -> `Terms.term`)
@@ -12030,7 +12088,48 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
                     if (hmt->type)
                       if (auto* hps = std::get_if<Pmty_signature>(&hmt->type->desc))
                         sib[hmt->name.txt] = &hps->items;
-                return signature_to_cmi(ps->items, &sib, &module_sigs);
+                // The head module's own TOPLEVEL types are in scope inside
+                // MT's body and must splice QUALIFIED: INCREMENTAL_ENGINE's
+                // `val offer : .. token * position * position ..` cites the
+                // enclosing IncrementalEngine's `type position = Lexing.
+                // position` -- without the qual it degraded to fresh vars
+                // and ocamlc rejected camlinternalMenhirLib.ml against the
+                // cmi.  Seed the quals for the sub-conversion (restored
+                // after; MT's own same-named decls still shadow via the
+                // emission-loop erase).
+                std::vector<std::pair<std::string, std::optional<std::string>>>
+                    saved_q;
+                auto seed = [&](const std::string& n2, const std::string& q) {
+                  auto old = ck.opened_type_quals_.find(n2);
+                  saved_q.emplace_back(
+                      n2, old != ck.opened_type_quals_.end()
+                              ? std::optional<std::string>(old->second)
+                              : std::nullopt);
+                  ck.opened_type_quals_[n2] = q;
+                };
+                for (auto& hit : *f->second) {
+                  if (auto* hpt = std::get_if<Psig_type>(&hit.desc))
+                    for (auto& d2 : hpt->decls)
+                      seed(d2.name.txt, comps[0] + "." + d2.name.txt);
+                  // an `open General` at the head module's top level is in
+                  // scope inside MT too (INCREMENTAL_ENGINE's `type stack =
+                  // element stream` means General.stream)
+                  if (auto* hop = std::get_if<Psig_open>(&hit.desc))
+                    if (auto* ol = std::get_if<Lident>(&hop->id.txt.v))
+                      if (auto of2 = module_sigs.find(ol->name);
+                          of2 != module_sigs.end())
+                        for (auto& oit : *of2->second)
+                          if (auto* opt2 = std::get_if<Psig_type>(&oit.desc))
+                            for (auto& d3 : opt2->decls)
+                              seed(d3.name.txt, ol->name + "." + d3.name.txt);
+                }
+                auto r =
+                    signature_to_cmi_i(ps->items, &sib, &module_sigs, &ck);
+                for (auto& [nm2, q2] : saved_q) {
+                  if (q2) ck.opened_type_quals_[nm2] = *q2;
+                  else ck.opened_type_quals_.erase(nm2);
+                }
+                return r;
               }
     // Cross-module, possibly DEEP (`CamlinternalMenhirLib.IncrementalEngine.
     // INCREMENTAL_ENGINE`): load the head cmi, navigate intermediate submodules,
@@ -12149,16 +12248,36 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     // vars and ocamlc rejected diffing.ml against the cmi).
     std::unordered_map<std::string, const ast::Signature*> body_mods =
         module_sigs;
+    // A param's modtype may be a DOTTED sibling-module member
+    // (`(I : IncrementalEngine.EVERYTHING)`): body_sig only resolves bare
+    // names, so look the member up in the sibling's AST sig too -- the
+    // body's `open I` then seeds I's types (menhirLib's Printers.Make).
+    auto param_sig_ast = [&](const ast::ModuleType& mt) -> const ast::Signature* {
+      if (const ast::Signature* s2 = body_sig(mt)) return s2;
+      const ast::ModuleType* m2 = &mt;
+      while (auto* pw2 = std::get_if<Pmty_with>(&m2->desc)) m2 = pw2->mt.get();
+      if (auto* pi2 = std::get_if<Pmty_ident>(&m2->desc))
+        if (auto* dd2 = std::get_if<Ldot>(&pi2->id.txt.v))
+          if (auto* pl2 = std::get_if<Lident>(&dd2->prefix->v))
+            if (auto f2 = module_sigs.find(pl2->name); f2 != module_sigs.end())
+              for (auto& mit2 : *f2->second)
+                if (auto* pmt2 = std::get_if<Psig_modtype>(&mit2.desc))
+                  if (pmt2->name.txt == dd2->name && pmt2->type)
+                    if (auto* ps2 =
+                            std::get_if<Pmty_signature>(&pmt2->type->desc))
+                      return &ps2->items;
+      return nullptr;
+    };
     if (auto* fn = std::get_if<Functor_named>(&pf.param))
       if (fn->name.txt && fn->type)
-        if (const ast::Signature* psg = body_sig(*fn->type))
+        if (const ast::Signature* psg = param_sig_ast(*fn->type))
           body_mods[*fn->name.txt] = psg;
     {
       const ast::ModuleType* b2 = pf.body.get();
       while (auto* pf2 = std::get_if<Pmty_functor>(&b2->desc)) {
         if (auto* fn2 = std::get_if<Functor_named>(&pf2->param))
           if (fn2->name.txt && fn2->type)
-            if (const ast::Signature* psg2 = body_sig(*fn2->type))
+            if (const ast::Signature* psg2 = param_sig_ast(*fn2->type))
               body_mods[*fn2->name.txt] = psg2;
         b2 = pf2->body.get();
       }
