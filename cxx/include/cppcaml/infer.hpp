@@ -21,7 +21,31 @@
 namespace cppcaml::infer {
 
 struct Type;
-using TypePtr = std::shared_ptr<Type>;
+
+// Non-owning handle to a Type node.  Every Type lives in a process-lifetime
+// bump arena (see infer.cpp) that is never freed mid-compile, so ownership is
+// meaningless here: a Type is alive for the whole process regardless of how
+// many handles point at it.  Dropping shared_ptr removes the atomic refcount on
+// every copy (repr takes/returns by value; unify/instantiate/the value-kind
+// side-table copy constantly), the per-node control block, and ~Type teardown.
+// The interface mirrors the shared_ptr subset the codebase actually used
+// (operator->/*/bool/==, .get(), .reset(), null default-construction) so the
+// ~850 use sites compile unchanged; only the 6 factory methods that used to
+// make_shared<Type> now allocate from the arena.
+struct TypePtr {
+  Type* p_ = nullptr;
+  constexpr TypePtr() noexcept = default;
+  constexpr TypePtr(std::nullptr_t) noexcept {}
+  explicit constexpr TypePtr(Type* p) noexcept : p_(p) {}
+  Type* operator->() const noexcept { return p_; }
+  Type& operator*() const noexcept { return *p_; }
+  Type* get() const noexcept { return p_; }
+  explicit constexpr operator bool() const noexcept { return p_ != nullptr; }
+  void reset() noexcept { p_ = nullptr; }
+  friend constexpr bool operator==(TypePtr a, TypePtr b) noexcept { return a.p_ == b.p_; }
+  friend constexpr bool operator!=(TypePtr a, TypePtr b) noexcept { return a.p_ != b.p_; }
+  friend constexpr bool operator<(TypePtr a, TypePtr b) noexcept { return a.p_ < b.p_; }
+};
 
 // Generic (generalized) variables carry this level; ordinary vars carry the
 // binding depth at which they were created.

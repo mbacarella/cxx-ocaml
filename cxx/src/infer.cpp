@@ -6,21 +6,47 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <new>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace cppcaml::infer {
 
+namespace {
+// Process-lifetime bump arena for Type nodes.  Every Type is placement-new'd
+// into a big slab and never individually freed; the slabs themselves are never
+// freed either (the process compiles one module then exits, so the leak is
+// bounded and the OS reclaims it -- the compiler already fast-exits, skipping
+// static teardown).  This replaces make_shared<Type>: no per-node malloc (~1
+// slab alloc per 4096 nodes vs one per node), no atomic refcount on the
+// millions of handle copies, no ~Type.  Slabs never move, so the raw Type*
+// inside every TypePtr stays valid for the whole compile.  Single-threaded by
+// construction (one Engine active at a time, like the rest of infer).
+struct TypeArena {
+  static constexpr std::size_t kSlab = 4096;
+  std::vector<Type*> slabs_;
+  std::size_t used_ = kSlab;  // == kSlab forces a fresh slab on first alloc
+  Type* alloc() {
+    if (used_ == kSlab) {
+      slabs_.push_back(static_cast<Type*>(::operator new(kSlab * sizeof(Type))));
+      used_ = 0;
+    }
+    return new (slabs_.back() + used_++) Type();  // construct in place
+  }
+};
+TypeArena g_type_arena;
+}  // namespace
+
 TypePtr Engine::fresh_var() {
-  auto t = std::make_shared<Type>();
+  TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Var;
   t->level = level;
   t->id = next_id_++;
   return t;
 }
 TypePtr Engine::arrow(TypePtr dom, TypePtr cod, int label, std::string lbl) {
-  auto t = std::make_shared<Type>();
+  TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Arrow;
   t->dom = std::move(dom);
   t->cod = std::move(cod);
@@ -30,14 +56,14 @@ TypePtr Engine::arrow(TypePtr dom, TypePtr cod, int label, std::string lbl) {
   return t;
 }
 TypePtr Engine::tuple(std::vector<TypePtr> elems) {
-  auto t = std::make_shared<Type>();
+  TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Tuple;
   t->args = std::move(elems);
   t->id = next_id_++;
   return t;
 }
 TypePtr Engine::constr(std::string path, std::vector<TypePtr> args, int stamp) {
-  auto t = std::make_shared<Type>();
+  TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Constr;
   t->path = std::move(path);
   t->args = std::move(args);
@@ -54,7 +80,7 @@ TypePtr Engine::constr(std::string path, std::vector<TypePtr> args, int stamp) {
 }
 
 TypePtr Engine::object_type(std::vector<std::string> names, std::vector<TypePtr> types) {
-  auto t = std::make_shared<Type>();
+  TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Object;
   t->labels = std::move(names);
   t->args = std::move(types);
@@ -68,7 +94,7 @@ TypePtr Engine::object_type(std::vector<std::string> names, std::vector<TypePtr>
 
 TypePtr Engine::variant_type(std::vector<std::string> tags, std::vector<TypePtr> argtys,
                              std::vector<char> has_arg, int variant_kind) {
-  auto t = std::make_shared<Type>();
+  TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Variant;
   t->labels = std::move(tags);
   t->args = std::move(argtys);
