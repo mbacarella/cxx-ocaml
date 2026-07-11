@@ -235,6 +235,9 @@ if ! "$LINK" -nostdlib -runtime "$RUN" $stdobjs $clobjs "$WD/std_exit.cmo" -o "$
   echo "FAIL: link"; sed 's/^/  /' "$WD/lerr"; exit 1
 fi
 echo "linked: $WD/ocamlc"
+# Persist the compiler .cmo link order so swap/relink/multistage/ddc harnesses
+# find it without re-deriving from CL_COMMON/CL_BYTE (DDC footgun 6).
+printf '%s\n' $order > "$WD/.cl_order"
 
 # ---- 3.5 stdlib.cma + runtime-launch-info: the bootstrapped ocamlc's OWN
 # bytelink auto-loads stdlib.cma (even under -nostdlib) and reads
