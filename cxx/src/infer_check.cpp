@@ -11142,6 +11142,8 @@ static TypeofResolved resolve_typeof_path(
 
 static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
                                   const std::function<void(std::string&)>& fn);
+static void rewrite_item_ty_nodes(std::vector<cmi::cmiw::SigItem>& items,
+                                  const std::function<void(cmi::cmiw::TyPtr&)>& fn);
 static void subst_type_citations(std::vector<cmi::cmiw::SigItem>& items,
                                  const std::string& name,
                                  const std::string& newname, int d,
@@ -11300,9 +11302,24 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
         // `val x : u` instead of degrading to a fresh var (mirrors the
         // Pwith_modsubst rewrite above; shape-index's MSB include).  Only a
         // path (Constr) RHS -- the `t := u` / `t := M.t` shape.
-        if (td->manifest)
+        if (td->manifest) {
           if (auto* pc = std::get_if<Ptyp_constr>(&(*td->manifest)->desc)) {
             std::string newname = lid_full(pc->id.txt);
+            // A BARE RHS written in the constraint's outer scope resolves
+            // there (diffing.mli's `Parameters with type update_result :=
+            // state` under `open D` means D.state): prefer the checker's
+            // resolution when it only QUALIFIES the written name -- an
+            // unresolvable bare citation degrades to a fresh var in the
+            // emitted items.
+            if (std::holds_alternative<Lident>(pc->id.txt.v)) {
+              std::unordered_map<std::string, TypePtr> tv2;
+              TypePtr r = I::Engine::repr(ck.from_coretype(**td->manifest, tv2));
+              if (r->kind == I::Type::Kind::Constr &&
+                  r->path.size() > newname.size() &&
+                  r->path.compare(r->path.size() - newname.size() - 1,
+                                  newname.size() + 1, "." + newname) == 0)
+                newname = r->path;
+            }
             if (full.find('.') == std::string::npos)
               // Bare erased name: referent-aware (a SHADOWING inner decl's
               // own citations stay; a skip-spliced manifest reaching the
@@ -11312,7 +11329,34 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
               rewrite_item_ty_names(items, [&](std::string& n) {
                 if (n == full) n = newname;
               });
+          } else if (td->params.empty() &&
+                     full.find('.') == std::string::npos) {
+            // A NON-path RHS (`update_result := state * left array`):
+            // replace each citing Constr NODE with a fresh bridge of the
+            // manifest (a name rewrite can't represent a tuple).  Only for
+            // an unparameterized bare subst, and only when the bridged tree
+            // is var-free (a leaked var would collide with the item's own
+            // numbering).
+            std::function<bool(const cmi::cmiw::TyPtr&)> has_var =
+                [&](const cmi::cmiw::TyPtr& t) -> bool {
+              if (!t) return false;
+              if (t->k == cmi::cmiw::Ty::Var) return true;
+              for (auto& a : t->args) if (has_var(a)) return true;
+              return false;
+            };
+            rewrite_item_ty_nodes(items, [&](cmi::cmiw::TyPtr& t) {
+              if (!t || t->k != cmi::cmiw::Ty::Constr || t->name != full ||
+                  !t->args.empty())
+                return;
+              std::unordered_map<std::string, TypePtr> tv2;
+              std::unordered_map<const I::Type*, int> bv2;
+              int nv2 = 0;
+              auto rep = bridge_ty_named(
+                  ck.from_coretype(**td->manifest, tv2), bv2, nv2, tv2);
+              if (rep && !has_var(rep)) t = rep;
+            });
           }
+        }
         continue;
       }
       if (!td->manifest) continue;
@@ -12365,6 +12409,39 @@ static void rewrite_item_ty_names(std::vector<cmi::cmiw::SigItem>& items,
     rewrite_item_ty_names(si.sub, fn);
     rewrite_item_ty_names(si.param_sig, fn);
     for (auto& ps : si.more_param_sigs) rewrite_item_ty_names(ps, fn);
+  }
+}
+// NODE-level rewrite: fn may REPLACE the pointed-to node wholesale (used by
+// `with type t := <non-path>` substitution, where a tuple RHS can't be
+// expressed as a name rewrite).  fn is applied to each node BEFORE its args
+// are walked; a replaced node's args are not re-walked.
+static void rewrite_ty_nodes(cmi::cmiw::TyPtr& t,
+                             const std::function<void(cmi::cmiw::TyPtr&)>& fn) {
+  if (!t) return;
+  auto* before = t.get();
+  fn(t);
+  if (t.get() != before) return;  // replaced: the new tree is final
+  for (auto& a : t->args) rewrite_ty_nodes(a, fn);
+  for (auto& a : t->row_name_args) rewrite_ty_nodes(a, fn);
+}
+static void rewrite_item_ty_nodes(std::vector<cmi::cmiw::SigItem>& items,
+                                  const std::function<void(cmi::cmiw::TyPtr&)>& fn) {
+  for (auto& si : items) {
+    rewrite_ty_nodes(si.ty, fn);
+    rewrite_ty_nodes(si.manifest, fn);
+    for (auto& p : si.params) rewrite_ty_nodes(p, fn);
+    for (auto& c : si.ctors) {
+      for (auto& a : c.args) rewrite_ty_nodes(a, fn);
+      for (auto& l : c.inline_record) rewrite_ty_nodes(l.ty, fn);
+      rewrite_ty_nodes(c.res, fn);
+    }
+    for (auto& l : si.labels) rewrite_ty_nodes(l.ty, fn);
+    rewrite_ty_nodes(si.ext_ret, fn);
+    for (auto& f : si.class_fields) rewrite_ty_nodes(f.ty, fn);
+    for (auto& d : si.class_arrow_doms) rewrite_ty_nodes(d, fn);
+    rewrite_item_ty_nodes(si.sub, fn);
+    rewrite_item_ty_nodes(si.param_sig, fn);
+    for (auto& ps : si.more_param_sigs) rewrite_item_ty_nodes(ps, fn);
   }
 }
 
