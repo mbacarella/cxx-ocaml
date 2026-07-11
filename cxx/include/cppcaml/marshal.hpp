@@ -56,6 +56,16 @@ public:
     nodes_.push_back(std::move(v));
     return nodes_.size() - 1;
   }
+  // Construct a fresh (default) node in place and return its id, avoiding the
+  // temporary-plus-double-move of push(): the reader fills it via at(id).  A
+  // Value holds two std::strings and two std::vectors, so ~1M nodes/compile
+  // otherwise pay for those moves.  NOTE: a reference from at() is invalidated
+  // by any later new_node()/push (vector realloc), so callers must re-fetch by
+  // id across recursive reads (mk_block already does).
+  std::size_t new_node() {
+    nodes_.emplace_back();
+    return nodes_.size() - 1;
+  }
   Value& at(std::size_t id) { return nodes_[id]; }
   void reserve(std::size_t n) { nodes_.reserve(n); }
 

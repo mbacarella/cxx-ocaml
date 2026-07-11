@@ -565,8 +565,12 @@ std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena,
 
   // The decoded node count is roughly proportional to the file size; reserve up
   // front so the arena (a vector of ~140-byte Values) does not repeatedly
-  // reallocate and move every node as it grows during decode.
-  arena.reserve(bytes.size() / 2);
+  // reallocate and move every node as it grows during decode.  Node count runs
+  // ~0.4-0.55x the file size across our .cmi corpus, so reserve 2/3 of it:
+  // enough to avoid the grow-and-move-every-node realloc for every observed
+  // file, without the 2x transient memory of reserving in full.  The arena is
+  // freed when load() returns, so an over-reserve is only transient.
+  arena.reserve(bytes.size() * 2 / 3);
   std::size_t header = m::read_value(bytes.data(), bytes.size(), off, arena);
 
   // The cmi_crcs table ("Interfaces imported") is a SECOND, independently

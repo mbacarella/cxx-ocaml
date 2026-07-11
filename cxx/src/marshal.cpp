@@ -104,18 +104,18 @@ private:
   // (blocks of size>0, strings, doubles, double arrays, custom).  CODE_SHARED
   // back-references an earlier entry by relative distance.
   std::size_t mk_int(long long v) {
-    Value val;
-    val.kind = Value::Kind::Int;
+    std::size_t id = arena_.new_node();  // ints are not registered for sharing
+    Value& val = arena_.at(id);          // Kind defaults to Int
     val.i = v;
-    return arena_.push(std::move(val));  // ints are not registered for sharing
+    return id;
   }
 
   std::size_t mk_string(std::uint64_t n) {
-    Value val;
+    std::size_t id = arena_.new_node();
+    Value& val = arena_.at(id);
     val.kind = Value::Kind::String;
     val.str.resize(n);
     for (std::uint64_t k = 0; k < n; ++k) val.str[k] = static_cast<char>(u8());
-    std::size_t id = arena_.push(std::move(val));
     objs_.push_back(id);
     return id;
   }
@@ -132,41 +132,41 @@ private:
   }
 
   std::size_t mk_double(bool little) {
-    Value val;
+    double d = read_f64(little);  // read before allocating (no ordering dep)
+    std::size_t id = arena_.new_node();
+    Value& val = arena_.at(id);
     val.kind = Value::Kind::Double;
-    val.d = read_f64(little);
-    std::size_t id = arena_.push(std::move(val));
+    val.d = d;
     objs_.push_back(id);
     return id;
   }
 
   std::size_t mk_double_array(std::uint64_t n, bool little) {
-    Value val;
+    // Reserve the arena slot/registration before reading elements, matching the
+    // runtime's allocate-then-fill order.  read_f64 does not touch the arena, so
+    // holding the node reference across the fill loop is safe.
+    std::size_t id = arena_.new_node();
+    Value& val = arena_.at(id);
     val.kind = Value::Kind::DoubleArray;
     val.darr.reserve(n);
-    // Reserve the arena slot/registration before reading elements, matching the
-    // runtime's allocate-then-fill order.
-    std::size_t id = arena_.push(std::move(val));
     objs_.push_back(id);
-    for (std::uint64_t k = 0; k < n; ++k) arena_.at(id).darr.push_back(read_f64(little));
+    for (std::uint64_t k = 0; k < n; ++k) val.darr.push_back(read_f64(little));
     return id;
   }
 
   std::size_t mk_block(unsigned tag, std::uint64_t size) {
-    if (size == 0) {
-      // Atom: a zero-size block is an immediate, not registered for sharing.
-      Value val;
+    std::size_t id = arena_.new_node();
+    {
+      Value& val = arena_.at(id);
       val.kind = Value::Kind::Block;
       val.tag = tag;
-      return arena_.push(std::move(val));
+      if (size == 0)
+        return id;  // Atom: a zero-size block is an immediate, not registered.
+      val.fields.resize(size);
     }
-    Value val;
-    val.kind = Value::Kind::Block;
-    val.tag = tag;
-    val.fields.resize(size);
     // Register the block BEFORE reading fields so a field may reference the
-    // block itself (cyclic graphs, e.g. recursive type_expr).
-    std::size_t id = arena_.push(std::move(val));
+    // block itself (cyclic graphs, e.g. recursive type_expr).  read_value() may
+    // grow the arena and invalidate the reference, so re-fetch by id each field.
     objs_.push_back(id);
     for (std::uint64_t k = 0; k < size; ++k) {
       std::size_t child = read_value();
@@ -208,7 +208,8 @@ private:
     } else {
       throw Error("marshal: unsupported custom block '" + id + "'");
     }
-    Value v;
+    std::size_t r = arena_.new_node();
+    Value& v = arena_.at(r);
     if (scalar) {  // int32/int64/nativeint: an Int for the reader, raw for the linker
       v.kind = Value::Kind::Int;
       v.i = val;
@@ -218,7 +219,6 @@ private:
       v.kind = Value::Kind::String;
       v.str.assign(reinterpret_cast<const char*>(data_ + start), pos_ - start);
     }
-    std::size_t r = arena_.push(std::move(v));
     objs_.push_back(r);
     return r;
   }
