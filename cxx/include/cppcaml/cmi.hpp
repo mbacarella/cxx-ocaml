@@ -219,6 +219,12 @@ ModCoercion compute_coercion(const Signature& src, const Signature& tgt);
 class CmiFile {
 public:
   static const CmiFile& load(const std::string& path);
+  // A lean decode that fills ONLY the top-level type declarations (sig().types),
+  // skipping module values and nested-module signatures -- the dominant decode
+  // cost.  Used by the labelset index, which walks every in-scope cmi but reads
+  // only their records/variants.  Kept in a SEPARATE cache from load() so a
+  // partial signature never satisfies a caller that needs the full one.
+  static const CmiFile& load_types_only(const std::string& path);
 
   const std::string& module_name() const { return module_name_; }
   const Signature& sig() const { return sig_; }

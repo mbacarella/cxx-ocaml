@@ -4482,7 +4482,10 @@ struct Translator {
       for (auto& ent : std::filesystem::directory_iterator(d, ec)) {
         if (ent.path().extension() != ".cmi") continue;
         try {
-          const auto& cmi = cmi::CmiFile::load(ent.path().string());
+          // The index reads only top-level records/variants; a lean types-only
+          // decode skips value type-graphs and submodule sigs (the bulk of a
+          // full decode) across the ~200 in-scope cmis of a single compile.
+          const auto& cmi = cmi::CmiFile::load_types_only(ent.path().string());
           std::string modname = ent.path().stem().string();
           if (!modname.empty()) modname[0] = (char)std::toupper((unsigned char)modname[0]);
           for (auto& td : cmi.sig().types) {

@@ -162,6 +162,28 @@ public:
     return out;
   }
 
+  // Like signature(), but decodes ONLY top-level Sig_type items into out.types
+  // -- no value type-graphs (Sig_value), no recursion into submodule signatures
+  // (Sig_module -> module_type -> signature).  Those two are the bulk of a full
+  // decode; the labelset index needs only the records/variants this leaves.
+  Signature signature_types_only(std::size_t list_id) {
+    Signature out;
+    for (std::size_t cur = list_id; arena_[cur].kind == m::Value::Kind::Block &&
+                                    !arena_[cur].fields.empty();) {
+      const m::Value& cons = arena_[cur];
+      const m::Value& item = arena_[cons.fields[0]];
+      if (item.kind == m::Value::Kind::Block && item.tag == 1 &&
+          item.fields.size() == 4) {  // Sig_type of Ident * type_declaration * ..
+        TypeDecl td = type_declaration(item.fields[1]);
+        td.name = ident(item.fields[0]).name;
+        td.stamp = ident(item.fields[0]).stamp;
+        out.types.push_back(std::move(td));
+      }
+      cur = cons.fields[1];  // tail
+    }
+    return out;
+  }
+
   // module_type (typing/types.mli): Mty_ident / Mty_signature / Mty_functor /
   // Mty_alias.
   ModuleTypePtr module_type(std::size_t id) {
@@ -515,17 +537,12 @@ private:
 
 }  // namespace
 
-const CmiFile& CmiFile::load(const std::string& filepath) {
-  // A .cmi is immutable for the lifetime of a compile, but several passes (the
-  // inferencer, register_stdlib_ctors, pervasive resolution) each re-decode the
-  // same file -- stdlib.cmi alone is decoded 3x.  Memoise by path: the Marshal
-  // decode (the costly part, ~2 ms for stdlib.cmi) then happens once.  Return a
-  // reference into the (static, never-erased) cache -- unordered_map keeps
-  // element references stable across rehash -- so callers that bind `const
-  // auto&` share the decoded signature instead of deep-copying it (the whole
-  // SigValue/ConstructorDecl/LabelDecl graph) on every access.
-  static std::unordered_map<std::string, CmiFile> cache;
-  if (auto it = cache.find(filepath); it != cache.end()) return it->second;
+namespace {
+// Read a .cmi file, locate its Marshal header, and decode the byte stream into
+// `arena`; returns the id of the header value (the (modname, signature) tuple).
+// Shared by both load paths -- the arena build is identical; only which parts of
+// the signature the Decoder then materialises differs.
+std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena) {
   std::ifstream in(filepath, std::ios::binary);
   if (!in) throw m::Error("cannot open " + filepath);
   std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
@@ -539,18 +556,51 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
       break;
   if (off + 4 > bytes.size()) throw m::Error("no Marshal magic in " + filepath);
 
-  m::Arena arena;
   // The decoded node count is roughly proportional to the file size; reserve up
   // front so the arena (a vector of ~140-byte Values) does not repeatedly
   // reallocate and move every node as it grows during decode.
   arena.reserve(bytes.size() / 2);
-  std::size_t header = m::read_value(bytes.data(), bytes.size(), off, arena);
+  return m::read_value(bytes.data(), bytes.size(), off, arena);
+}
+}  // namespace
+
+const CmiFile& CmiFile::load(const std::string& filepath) {
+  // A .cmi is immutable for the lifetime of a compile, but several passes (the
+  // inferencer, register_stdlib_ctors, pervasive resolution) each re-decode the
+  // same file -- stdlib.cmi alone is decoded 3x.  Memoise by path: the Marshal
+  // decode (the costly part, ~2 ms for stdlib.cmi) then happens once.  Return a
+  // reference into the (static, never-erased) cache -- unordered_map keeps
+  // element references stable across rehash -- so callers that bind `const
+  // auto&` share the decoded signature instead of deep-copying it (the whole
+  // SigValue/ConstructorDecl/LabelDecl graph) on every access.
+  static std::unordered_map<std::string, CmiFile> cache;
+  if (auto it = cache.find(filepath); it != cache.end()) return it->second;
+  m::Arena arena;
+  std::size_t header = read_cmi_arena(filepath, arena);
   const m::Value& tuple = arena[header];  // (modname, signature)
 
   Decoder dec(arena);
   CmiFile cmi;
   cmi.module_name_ = arena[tuple.fields.at(0)].str;
   cmi.sig_ = dec.signature(tuple.fields.at(1));
+  return cache.emplace(filepath, std::move(cmi)).first->second;
+}
+
+const CmiFile& CmiFile::load_types_only(const std::string& filepath) {
+  // A SEPARATE cache from load(): this stores a partial signature (only
+  // sig().types), so it must never satisfy a caller that expects a full decode.
+  // The arena is still fully read (the Marshal stream is sequential), but the
+  // Decoder skips the value type-graphs and submodule recursion.
+  static std::unordered_map<std::string, CmiFile> cache;
+  if (auto it = cache.find(filepath); it != cache.end()) return it->second;
+  m::Arena arena;
+  std::size_t header = read_cmi_arena(filepath, arena);
+  const m::Value& tuple = arena[header];  // (modname, signature)
+
+  Decoder dec(arena);
+  CmiFile cmi;
+  cmi.module_name_ = arena[tuple.fields.at(0)].str;
+  cmi.sig_ = dec.signature_types_only(tuple.fields.at(1));
   return cache.emplace(filepath, std::move(cmi)).first->second;
 }
 
