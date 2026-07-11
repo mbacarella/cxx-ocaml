@@ -9219,6 +9219,24 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
     TypePtr r = I::Engine::repr(t);
     if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
       vk.expr_constr[e] = r->path;  // module-qualified type, e.g. "Gc.stat"
+    else if (r->kind == I::Type::Kind::Constr && !r->path.empty() &&
+             std::holds_alternative<ast::Pexp_construct>(
+                 static_cast<const ast::Expression*>(e)->desc)) {
+      // A CONSTRUCT node's inferred type is recorded even when FILE-LOCAL
+      // (dotless): the back end verifies the flat ctor entry's owning type
+      // against it -- lambda.ml's own `lambda_of_const` builds
+      // Lambda.structured_constant ctors whose names ALSO exist in the
+      // opened Asttypes.constant at different tags (Const_nativeint 5 vs 6);
+      // the flat map silently built the wrong tag and every nativeint/float
+      // CONSTANT the bootstrapped compiler emitted was a corrupt block.
+      // ONLY when the bare name uniquely identifies the decl AND the
+      // inferred stamp agrees -- a shadowed name (patmatch's several `t`s,
+      // functor-param types under `open T`) is unreliable here.
+      auto bu = ck.bare_unique_stamp_.find(r->path);
+      if (bu != ck.bare_unique_stamp_.end() && bu->second > 0 &&
+          bu->second == r->stamp)
+        vk.expr_constr[e] = r->path;
+    }
   }
   for (auto& [e, fr] : ck.field_resolved_)
     vk.field_resolved[e] = {std::get<0>(fr), std::get<1>(fr), std::get<2>(fr)};

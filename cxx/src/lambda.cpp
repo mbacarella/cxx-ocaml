@@ -907,6 +907,11 @@ struct Translator {
   // scoping), not the flat last-registered one.
   std::unordered_map<std::string, std::unordered_map<std::string, CtorInfo>> type_ctor_info_;
   std::set<std::string> ambiguous_ctors_;
+  // Type NAMES declared by more than one distinct decl (local shadowing /
+  // functor-param types): type_ctor_info_[name] is last-wins there, so the
+  // inferred-type ctor override must not trust it.
+  std::set<std::string> ambiguous_type_names_;
+  std::unordered_map<std::string, const void*> type_name_owner_;
   std::unordered_map<std::string, std::pair<int, int>> type_ctors_;  // type -> (n_const, n_block)
   std::set<std::string> immediate_local_;  // local all-constant variant type names
   std::set<std::string> gadt_types_;        // variant types with a GADT constructor
@@ -1570,6 +1575,14 @@ struct Translator {
           if (ctor_info_.count(c.name.txt) &&
               ctor_info_[c.name.txt].type != d.name.txt)
             ambiguous_ctors_.insert(c.name.txt);  // same name, a different type
+          // TWO DISTINCT decls sharing a type name (`type t` twice, or a
+          // functor param's `t` under `open T` vs a local `t`): the flat
+          // type_ctor_info_["t"] holds only the last -- record the
+          // ambiguity so the inferred-type ctor override won't trust it.
+          if (auto ow = type_name_owner_.find(d.name.txt);
+              ow != type_name_owner_.end() && ow->second != (const void*)&d)
+            ambiguous_type_names_.insert(d.name.txt);
+          type_name_owner_[d.name.txt] = (const void*)&d;
           type_ctor_info_[d.name.txt][c.name.txt] = ci;
           ctor_info_[c.name.txt] = std::move(ci);
           if (block) ++nb; else ++nc;
@@ -11118,18 +11131,40 @@ struct Translator {
                             ? qualified_ctor_info(k->id.txt) : nullptr;
       const CtorInfo* cip = qci;
       if (!cip) { auto ci = ctor_info_.find(n); if (ci != ctor_info_.end()) cip = &ci->second; }
-      // If a surrounding pattern match force-registered a same-named ctor of the SCRUTINEE
-      // type (rebinding ctor_info_[n]), this arm-body construction must still use its OWN
-      // expression type's ctor.  Inside `lambda_of_const`, the Asttypes.constant match
-      // rebinds ctor_info_["Const_float"] to Asttypes (tag 3), but `Lconst (Const_float f)`
-      // is Lambda.structured_constant (tag 2).  Only fires while such an override is active.
-      if (cip && !qci && forced_ctor_depth_.count(n)) {
+      // The node's INFERRED constructed type outranks the flat entry when they
+      // disagree on the OWNING TYPE: same-named ctors across enums can differ
+      // in TAG at equal arity, which the arity check below can't catch.
+      // Inside `lambda_of_const`, `Lconst (Const_float f)` is
+      // Lambda.structured_constant tag 2, but Asttypes.constant's Const_float
+      // (tag 3) owned the flat entry -- every float/int32/int64/nativeint
+      // CONSTANT the bootstrapped compiler emitted was mis-tagged, and the
+      // nativeint case (Asttypes tag 6 = Lambda's Const_block) put a custom
+      // block where (int * list) was expected: heap-corruption segfaults on
+      // `let x = 0n`.  (Previously gated on a surrounding match's forced
+      // rebinding, which doesn't fire when compiling lambda.ml itself.)
+      if (cip && !qci) {
         if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end()) {
           std::string ety = ec->second;
-          if (auto d = ety.rfind('.'); d != std::string::npos) ety = ety.substr(d + 1);
-          if (ety != cip->type)
-            if (auto ti = type_ctor_info_.find(ety); ti != type_ctor_info_.end())
-              if (auto ci2 = ti->second.find(n); ci2 != ti->second.end()) cip = &ci2->second;
+          bool dotless = ety.find('.') == std::string::npos;
+          // A DOTTED inferred path may cite a foreign/functor-param type
+          // (patmatch's `T.t` under `open T`) whose bare last component
+          // collides with an unrelated local type in type_ctor_info_ --
+          // only trust it under a forced rebinding (the original gate).
+          // A DOTLESS path names a file-local decl and is authoritative.
+          if (dotless || forced_ctor_depth_.count(n)) {
+            if (auto d = ety.rfind('.'); d != std::string::npos)
+              ety = ety.substr(d + 1);
+            if (ety != cip->type &&
+                (forced_ctor_depth_.count(n) ||
+                 (!ambiguous_type_names_.count(ety) &&
+                  // an EXTENSION constructor's identity never comes from a
+                  // variant tag map (patmatch's `t += A|B|C` under a functor
+                  // param: the inferred bare `t` named an unrelated variant)
+                  !exn_ident_.count(n) && !exn_field_.count(n))))
+              if (auto ti = type_ctor_info_.find(ety); ti != type_ctor_info_.end())
+                if (auto ci2 = ti->second.find(n); ci2 != ti->second.end())
+                  cip = &ci2->second;
+          }
         }
       }
       // The flat entry's ARITY can belong to another type sharing the ctor
