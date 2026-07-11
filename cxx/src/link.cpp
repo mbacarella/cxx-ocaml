@@ -91,18 +91,18 @@ ValPtr conv(const m::Arena& a, std::size_t id) {
   const m::Value& v = a[id];
   switch (v.kind) {
     case m::Value::Kind::Int:
-      if (!v.custom_raw.empty())  // a boxed int32/int64/nativeint literal
-        return omarshal::vcustom(v.custom_raw, 1 + (v.custom_bsize + 7) / 8);
+      if (!v.custom_raw().empty())  // a boxed int32/int64/nativeint literal
+        return omarshal::vcustom(v.custom_raw(), 1 + (v.custom_bsize() + 7) / 8);
       return omarshal::vint(v.i);
-    case m::Value::Kind::String: return omarshal::vstr(v.str);
-    case m::Value::Kind::Double: return omarshal::vdbl(v.d);
+    case m::Value::Kind::String: return omarshal::vstr(v.str());
+    case m::Value::Kind::Double: return omarshal::vdbl(v.d());
     case m::Value::Kind::Block: {
       std::vector<ValPtr> fs;
       for (auto f : v.fields) fs.push_back(conv(a, f));
       return omarshal::vblock((int)v.tag, std::move(fs));
     }
     case m::Value::Kind::DoubleArray:
-      return omarshal::vdblarr(v.darr);
+      return omarshal::vdblarr(v.darr());
   }
   return omarshal::vint(0);
 }
@@ -121,13 +121,13 @@ std::vector<std::size_t> list_elems(const m::Arena& a, std::size_t id) {
 Unit parse_unit(const m::Arena& a, std::size_t cu, const std::vector<std::uint8_t>& file) {
   const m::Value& r = a[cu];
   Unit u;
-  u.name = a[r.fields[0]].str;
+  u.name = a[r.fields[0]].str();
   int cu_pos = (int)a[r.fields[1]].i;
   int cu_codesize = (int)a[r.fields[2]].i;
   u.code.assign(file.begin() + cu_pos, file.begin() + cu_pos + cu_codesize);
   // cu_required_compunits (field 5, a string list) and cu_force_link (field 7).
   if (r.fields.size() > 5)
-    for (std::size_t e : list_elems(a, r.fields[5])) u.required.push_back(a[e].str);
+    for (std::size_t e : list_elems(a, r.fields[5])) u.required.push_back(a[e].str());
   if (r.fields.size() > 7) u.force_link = a[r.fields[7]].i != 0;
   // cu_imports (field 4): (modname * crc option) list.  crc is `None` (immediate)
   // or `Some digest` (a block whose field 0 is the raw digest string).
@@ -135,10 +135,10 @@ Unit parse_unit(const m::Arena& a, std::size_t cu, const std::vector<std::uint8_
     for (std::size_t e : list_elems(a, r.fields[4])) {
       const m::Value& pair = a[e];
       if (pair.fields.size() < 2) continue;
-      std::string name = a[pair.fields[0]].str, crc;
+      std::string name = a[pair.fields[0]].str(), crc;
       const m::Value& opt = a[pair.fields[1]];
       if (opt.kind == m::Value::Kind::Block && !opt.fields.empty())
-        crc = a[opt.fields[0]].str;   // Some digest
+        crc = a[opt.fields[0]].str();   // Some digest
       u.imports.emplace_back(std::move(name), std::move(crc));
     }
   for (std::size_t e : list_elems(a, r.fields[3])) {  // cu_reloc: (reloc_info * int) list
@@ -148,10 +148,10 @@ Unit parse_unit(const m::Arena& a, std::size_t cu, const std::vector<std::uint8_
     Reloc rel; rel.pos = pos;
     switch (info.tag) {
       case 0: rel.k = Reloc::Literal; rel.lit = conv(a, info.fields[0]); break;
-      case 1: rel.k = Reloc::GetCompunit; rel.name = a[info.fields[0]].str; break;
-      case 2: rel.k = Reloc::GetPredef; rel.name = a[info.fields[0]].str; break;
-      case 3: rel.k = Reloc::SetCompunit; rel.name = a[info.fields[0]].str; break;
-      case 4: rel.k = Reloc::Primitive; rel.name = a[info.fields[0]].str; break;
+      case 1: rel.k = Reloc::GetCompunit; rel.name = a[info.fields[0]].str(); break;
+      case 2: rel.k = Reloc::GetPredef; rel.name = a[info.fields[0]].str(); break;
+      case 3: rel.k = Reloc::SetCompunit; rel.name = a[info.fields[0]].str(); break;
+      case 4: rel.k = Reloc::Primitive; rel.name = a[info.fields[0]].str(); break;
       default: continue;
     }
     u.relocs.push_back(std::move(rel));
@@ -180,7 +180,7 @@ InputFile read_objects(const std::string& path) {
       for (std::size_t e : list_elems(arena, arena[root].fields[4])) {
         const m::Value& d = arena[e];
         if (d.kind == m::Value::Kind::Block && d.fields.size() >= 2)
-          in.dllibs.emplace_back(arena[d.fields[0]].i != 0, arena[d.fields[1]].str);
+          in.dllibs.emplace_back(arena[d.fields[0]].i != 0, arena[d.fields[1]].str());
       }
     }
   } else {

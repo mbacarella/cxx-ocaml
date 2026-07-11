@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27,19 +28,52 @@ namespace cppcaml::marshal {
 // exactly as the runtime intended.
 struct Value {
   enum class Kind { Int, String, Double, Block, DoubleArray };
-  Kind kind = Kind::Int;
 
-  long long i = 0;              // Int (scalar boxed ints decode to Int too)
-  std::string str;             // String (raw bytes, may contain NULs)
-  double d = 0.0;              // Double
-  unsigned tag = 0;            // Block tag
+  // Cold payload for the rare node kinds (String / Double / DoubleArray and the
+  // scalar boxed-int customs).  ~90% of the ~500k nodes decoded per compile are
+  // Int or Block and touch only i/tag/fields, so keeping these five members
+  // out-of-line shrinks Value from ~152 to ~48 bytes -- a large cut in the
+  // per-node construct/move/destruct churn and memory traffic over the arena.
+  struct Extra {
+    std::string str;             // String (raw bytes, may contain NULs)
+    double d = 0.0;              // Double
+    std::vector<double> darr;    // DoubleArray
+    // A scalar boxed-int custom (int32/int64/nativeint) decodes to an Int for
+    // the type reader, but also keeps its verbatim on-disk bytes so the linker
+    // can round-trip the boxed value into the DATA section unchanged.
+    std::string custom_raw;
+    int custom_bsize = 0;        // in-memory data size in bytes
+  };
+
+  Kind kind = Kind::Int;
+  long long i = 0;                  // Int (scalar boxed ints decode to Int too)
+  unsigned tag = 0;                 // Block tag
   std::vector<std::size_t> fields;  // Block: arena ids of fields, in order
-  std::vector<double> darr;    // DoubleArray
-  // A scalar boxed-int custom (int32/int64/nativeint) decodes to an Int for the
-  // type reader, but also keeps its verbatim on-disk bytes so the linker can
-  // round-trip the boxed value into the DATA section unchanged.
-  std::string custom_raw;
-  int custom_bsize = 0;        // in-memory data size in bytes
+  // Allocated only for String/Double/DoubleArray/custom nodes; null otherwise.
+  std::unique_ptr<Extra> extra;
+
+  // Lazily materialise the cold payload (write path, marshal decoder only).
+  Extra& ensure_extra() {
+    if (!extra) extra = std::make_unique<Extra>();
+    return *extra;
+  }
+  // Read accessors that degrade gracefully when the node has no Extra: an Int or
+  // Block reads an empty string / zero / empty array, matching the old inline
+  // default-constructed members.
+  const std::string& str() const {
+    static const std::string kEmpty;
+    return extra ? extra->str : kEmpty;
+  }
+  double d() const { return extra ? extra->d : 0.0; }
+  const std::vector<double>& darr() const {
+    static const std::vector<double> kEmpty;
+    return extra ? extra->darr : kEmpty;
+  }
+  const std::string& custom_raw() const {
+    static const std::string kEmpty;
+    return extra ? extra->custom_raw : kEmpty;
+  }
+  int custom_bsize() const { return extra ? extra->custom_bsize : 0; }
 };
 
 struct Error : std::runtime_error {

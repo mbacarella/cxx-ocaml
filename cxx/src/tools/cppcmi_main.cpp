@@ -35,14 +35,14 @@ static void print_summary(const m::Arena& a, std::size_t id, int depth) {
       std::printf("Int %lld\n", v.i);
       break;
     case m::Value::Kind::String:
-      std::printf("String[%zu] \"%.*s\"\n", v.str.size(),
-                  static_cast<int>(v.str.size()), v.str.c_str());
+      std::printf("String[%zu] \"%.*s\"\n", v.str().size(),
+                  static_cast<int>(v.str().size()), v.str().c_str());
       break;
     case m::Value::Kind::Double:
-      std::printf("Double %g\n", v.d);
+      std::printf("Double %g\n", v.d());
       break;
     case m::Value::Kind::DoubleArray:
-      std::printf("DoubleArray[%zu]\n", v.darr.size());
+      std::printf("DoubleArray[%zu]\n", v.darr().size());
       break;
     case m::Value::Kind::Block:
       std::printf("Block tag=%u size=%zu\n", v.tag, v.fields.size());

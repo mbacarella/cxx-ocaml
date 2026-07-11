@@ -121,8 +121,9 @@ private:
     std::size_t id = arena_.new_node();
     Value& val = arena_.at(id);
     val.kind = Value::Kind::String;
-    val.str.resize(n);
-    for (std::uint64_t k = 0; k < n; ++k) val.str[k] = static_cast<char>(u8());
+    auto& s = val.ensure_extra().str;
+    s.resize(n);
+    for (std::uint64_t k = 0; k < n; ++k) s[k] = static_cast<char>(u8());
     objs_.push_back(id);
     return id;
   }
@@ -143,7 +144,7 @@ private:
     std::size_t id = arena_.new_node();
     Value& val = arena_.at(id);
     val.kind = Value::Kind::Double;
-    val.d = d;
+    val.ensure_extra().d = d;
     objs_.push_back(id);
     return id;
   }
@@ -155,9 +156,10 @@ private:
     std::size_t id = arena_.new_node();
     Value& val = arena_.at(id);
     val.kind = Value::Kind::DoubleArray;
-    val.darr.reserve(n);
+    auto& da = val.ensure_extra().darr;
+    da.reserve(n);
     objs_.push_back(id);
-    for (std::uint64_t k = 0; k < n; ++k) val.darr.push_back(read_f64(little));
+    for (std::uint64_t k = 0; k < n; ++k) da.push_back(read_f64(little));
     return id;
   }
 
@@ -220,11 +222,12 @@ private:
     if (scalar) {  // int32/int64/nativeint: an Int for the reader, raw for the linker
       v.kind = Value::Kind::Int;
       v.i = val;
-      v.custom_raw.assign(reinterpret_cast<const char*>(data_ + start), pos_ - start);
-      v.custom_bsize = (int)bsize;
+      auto& ex = v.ensure_extra();
+      ex.custom_raw.assign(reinterpret_cast<const char*>(data_ + start), pos_ - start);
+      ex.custom_bsize = (int)bsize;
     } else {       // a digest etc.: opaque payload bytes
       v.kind = Value::Kind::String;
-      v.str.assign(reinterpret_cast<const char*>(data_ + start), pos_ - start);
+      v.ensure_extra().str.assign(reinterpret_cast<const char*>(data_ + start), pos_ - start);
     }
     objs_.push_back(r);
     return r;

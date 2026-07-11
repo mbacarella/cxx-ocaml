@@ -85,7 +85,7 @@ public:
                   const m::Value& desc = arena_[vk.fields[0]];
                   // description record: {prim_name; prim_arity; prim_alloc;
                   // prim_native_name; prim_native_repr_args; prim_native_repr_res}
-                  if (!desc.fields.empty()) sv.prim = arena_[desc.fields[0]].str;
+                  if (!desc.fields.empty()) sv.prim = arena_[desc.fields[0]].str();
                   if (desc.fields.size() > 1 &&
                       arena_[desc.fields[1]].kind == m::Value::Kind::Int)
                     sv.prim_arity = (int)arena_[desc.fields[1]].i;
@@ -107,7 +107,7 @@ public:
                       arena_[desc.fields[2]].kind == m::Value::Kind::Int)
                     sv.prim_alloc = arena_[desc.fields[2]].i != 0;
                   if (desc.fields.size() > 3)
-                    sv.prim_native = arena_[desc.fields[3]].str;
+                    sv.prim_native = arena_[desc.fields[3]].str();
                   if (desc.fields.size() > 4)
                     for (std::size_t c = desc.fields[4];
                          arena_[c].kind == m::Value::Kind::Block &&
@@ -336,7 +336,7 @@ public:
         break;
       case 3:  // Type_external of string
         td.kind = TypeDecl::External;
-        td.external_name = arena_[k.fields.at(0)].str;
+        td.external_name = arena_[k.fields.at(0)].str();
         break;
       default:
         td.kind = TypeDecl::Abstract;
@@ -381,7 +381,7 @@ private:
     const m::Value& v = arena_[id];
     Ident out;
     out.kind = static_cast<Ident::Kind>(v.tag);
-    if (!v.fields.empty()) out.name = arena_[v.fields[0]].str;
+    if (!v.fields.empty()) out.name = arena_[v.fields[0]].str();
     if (v.fields.size() > 1 && arena_[v.fields[1]].kind == m::Value::Kind::Int)
       out.stamp = arena_[v.fields[1]].i;
     return out;
@@ -397,7 +397,7 @@ private:
         break;
       case Path::Pdot:
         p->a = path(v.fields.at(0));
-        p->s = arena_[v.fields.at(1)].str;
+        p->s = arena_[v.fields.at(1)].str();
         break;
       case Path::Papply:
         p->a = path(v.fields.at(0));
@@ -415,7 +415,7 @@ private:
   std::optional<std::string> opt_string(std::size_t id) {
     const m::Value& v = arena_[id];
     if (v.kind == m::Value::Kind::Int) return std::nullopt;  // None
-    return arena_[v.fields.at(0)].str;                       // Some s
+    return arena_[v.fields.at(0)].str();                       // Some s
   }
 
   std::vector<TypePtr> type_list(std::size_t id) {
@@ -507,7 +507,7 @@ private:
               // arg_type:te list; matched; ext} block 1 / RFabsent (Int).
               const m::Value& rf = arena_[pair.fields[1]];
               if (rf.kind == m::Value::Kind::Int) continue;  // RFabsent: dropped tag
-              t.pv_tags.push_back(lbl.str);
+              t.pv_tags.push_back(lbl.str());
               if (rf.tag == 0) {  // RFpresent
                 t.pv_present.push_back(1);
                 const m::Value& oa = arena_[rf.fields.at(0)];
@@ -545,7 +545,7 @@ private:
       return;
     }
     t.label_kind = v.tag == 0 ? 1 : 2;  // Labelled / Optional
-    t.label = arena_[v.fields.at(0)].str;
+    t.label = arena_[v.fields.at(0)].str();
   }
 
   const m::Arena& arena_;
@@ -600,7 +600,7 @@ std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena,
         for (std::size_t cur = crcs; arena[cur].kind == m::Value::Kind::Block &&
                                      arena[cur].fields.size() == 2;) {
           const m::Value& pair = arena[arena[cur].fields[0]];  // (modname, digest opt)
-          if (!pair.fields.empty()) imports->push_back(arena[pair.fields[0]].str);
+          if (!pair.fields.empty()) imports->push_back(arena[pair.fields[0]].str());
           cur = arena[cur].fields[1];
         }
       } catch (...) {}
@@ -635,7 +635,7 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
   const m::Value& tuple = arena[header];  // (modname, signature)
 
   Decoder dec(arena);
-  cmi.module_name_ = arena[tuple.fields.at(0)].str;
+  cmi.module_name_ = arena[tuple.fields.at(0)].str();
   cmi.sig_ = dec.signature(tuple.fields.at(1));
   return cache.emplace(filepath, std::move(cmi)).first->second;
 }
@@ -660,7 +660,7 @@ const CmiFile& CmiFile::load_types_only(const std::string& filepath) {
   const m::Value& tuple = arena[header];  // (modname, signature)
 
   Decoder dec(arena);
-  cmi.module_name_ = arena[tuple.fields.at(0)].str;
+  cmi.module_name_ = arena[tuple.fields.at(0)].str();
   cmi.sig_ = dec.signature_types_only(tuple.fields.at(1));
   return cache.emplace(filepath, std::move(cmi)).first->second;
 }
@@ -1070,7 +1070,7 @@ std::string read_cmi_self_crc(const std::string& path) {
     if (entry.kind != m::Value::Kind::Block || entry.fields.size() < 2) return "";
     const m::Value& crcopt = arena[entry.fields[1]];               // None=Int 0 / Some=Block{str}
     if (crcopt.kind != m::Value::Kind::Block || crcopt.fields.empty()) return "";
-    return arena[crcopt.fields[0]].str;
+    return arena[crcopt.fields[0]].str();
   } catch (const std::exception&) {
     return "";
   }
@@ -2364,10 +2364,10 @@ std::vector<std::pair<std::string, std::string>> read_cmi_crcs(const std::string
     while (arena[cur].kind == m::Value::Kind::Block && arena[cur].fields.size() == 2) {
       const m::Value& entry = arena[arena[cur].fields[0]];          // (name, crc option)
       if (entry.kind == m::Value::Kind::Block && entry.fields.size() >= 2) {
-        std::string name = arena[entry.fields[0]].str, crc;
+        std::string name = arena[entry.fields[0]].str(), crc;
         const m::Value& crcopt = arena[entry.fields[1]];
         if (crcopt.kind == m::Value::Kind::Block && !crcopt.fields.empty())
-          crc = arena[crcopt.fields[0]].str;                        // Some digest
+          crc = arena[crcopt.fields[0]].str();                        // Some digest
         r.emplace_back(std::move(name), std::move(crc));
       }
       cur = arena[cur].fields[1];                                   // list tail
@@ -2454,17 +2454,17 @@ o::ValPtr conv_value(const m::Arena& a, std::size_t id) {
   const m::Value& v = a[id];
   switch (v.kind) {
     case m::Value::Kind::Int:
-      if (!v.custom_raw.empty())
-        return o::vcustom(v.custom_raw, 1 + (v.custom_bsize + 7) / 8);
+      if (!v.custom_raw().empty())
+        return o::vcustom(v.custom_raw(), 1 + (v.custom_bsize() + 7) / 8);
       return o::vint(v.i);
-    case m::Value::Kind::String: return o::vstr(v.str);
-    case m::Value::Kind::Double: return o::vdbl(v.d);
+    case m::Value::Kind::String: return o::vstr(v.str());
+    case m::Value::Kind::Double: return o::vdbl(v.d());
     case m::Value::Kind::Block: {
       std::vector<o::ValPtr> fs;
       for (auto f : v.fields) fs.push_back(conv_value(a, f));
       return o::vblock((int)v.tag, std::move(fs));
     }
-    case m::Value::Kind::DoubleArray: return o::vdblarr(v.darr);
+    case m::Value::Kind::DoubleArray: return o::vdblarr(v.darr());
   }
   return o::vint(0);
 }
@@ -2487,7 +2487,7 @@ o::ValPtr read_cmi_sign(const std::string& path, std::string* out_name) {
   const m::Value& hv = arena[hid];
   if (hv.kind != m::Value::Kind::Block || hv.fields.size() < 2)
     throw std::runtime_error("malformed cmi header in " + path);
-  if (out_name) *out_name = arena[hv.fields[0]].str;
+  if (out_name) *out_name = arena[hv.fields[0]].str();
   return conv_value(arena, hv.fields[1]);
 }
 }  // namespace
