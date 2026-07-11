@@ -230,6 +230,7 @@ int main(int argc, char** argv) {
     std::size_t off = find_marshal_magic(bytes);
     m::Arena arena;
     std::size_t root = m::read_value(bytes.data(), bytes.size(), off, arena);
+    arena.finalize();
     std::printf("=== header value ===\n");
     print_summary(arena, root, 0);
   } catch (const std::exception& e) {

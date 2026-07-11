@@ -592,18 +592,27 @@ std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena,
   // The cmi_crcs table ("Interfaces imported") is a SECOND, independently
   // marshalled value right after the header (see file_formats/cmi_format.ml:
   // output_value oc (crcs : (modname * digest option) list)).  Decode just its
-  // module names when the caller wants the import set.
-  if (imports) {
-    if (find_marshal_magic(bytes, off)) {
-      try {
-        std::size_t crcs = m::read_value(bytes.data(), bytes.size(), off, arena);
-        for (std::size_t cur = crcs; arena[cur].kind == m::Value::Kind::Block &&
-                                     arena[cur].fields.size() == 2;) {
-          const m::Value& pair = arena[arena[cur].fields[0]];  // (modname, digest opt)
-          if (!pair.fields.empty()) imports->push_back(arena[pair.fields[0]].str());
-          cur = arena[cur].fields[1];
-        }
-      } catch (...) {}
+  // module names into the same arena when the caller wants the import set.
+  bool have_crcs = false;
+  std::size_t crcs = 0;
+  if (imports && find_marshal_magic(bytes, off)) {
+    try {
+      crcs = m::read_value(bytes.data(), bytes.size(), off, arena);
+      have_crcs = true;
+    } catch (...) {}
+  }
+
+  // All marshal reads are done: seal every node's field span into the contiguous
+  // pool so it is valid for the reads below and for the Decoder that consumes
+  // this arena after we return.
+  arena.finalize();
+
+  if (have_crcs) {
+    for (std::size_t cur = crcs; arena[cur].kind == m::Value::Kind::Block &&
+                                 arena[cur].fields.size() == 2;) {
+      const m::Value& pair = arena[arena[cur].fields[0]];  // (modname, digest opt)
+      if (!pair.fields.empty()) imports->push_back(arena[pair.fields[0]].str());
+      cur = arena[cur].fields[1];
     }
   }
   return header;
@@ -1064,6 +1073,7 @@ std::string read_cmi_self_crc(const std::string& path) {
     m::skip_value(bytes.data(), bytes.size(), off);
     if (!find_marshal_magic(bytes, off)) return "";
     std::size_t crcs = m::read_value(bytes.data(), bytes.size(), off, arena);  // crc list
+    arena.finalize();
     const m::Value& cell = arena[crcs];                             // first cons cell
     if (cell.kind != m::Value::Kind::Block || cell.fields.size() < 1) return "";
     const m::Value& entry = arena[cell.fields[0]];                  // (name, crc option)
@@ -2361,6 +2371,7 @@ std::vector<std::pair<std::string, std::string>> read_cmi_crcs(const std::string
     m::skip_value(bytes.data(), bytes.size(), off);
     if (!find_marshal_magic(bytes, off)) return r;
     std::size_t cur = m::read_value(bytes.data(), bytes.size(), off, arena);  // crc list
+    arena.finalize();
     while (arena[cur].kind == m::Value::Kind::Block && arena[cur].fields.size() == 2) {
       const m::Value& entry = arena[arena[cur].fields[0]];          // (name, crc option)
       if (entry.kind == m::Value::Kind::Block && entry.fields.size() >= 2) {
@@ -2484,6 +2495,7 @@ o::ValPtr read_cmi_sign(const std::string& path, std::string* out_name) {
   m::Arena arena;
   arena.reserve(bytes.size() * 2 / 3);  // node count ~0.5x bytes; avoid grow-and-move
   std::size_t hid = m::read_value(bytes.data(), bytes.size(), off, arena);  // (name, sign)
+  arena.finalize();
   const m::Value& hv = arena[hid];
   if (hv.kind != m::Value::Kind::Block || hv.fields.size() < 2)
     throw std::runtime_error("malformed cmi header in " + path);

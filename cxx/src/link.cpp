@@ -166,6 +166,7 @@ InputFile read_objects(const std::string& path) {
   std::size_t off = be32(file, 12);
   m::Arena arena;
   std::size_t root = m::read_value(file.data(), file.size(), off, arena);
+  arena.finalize();
   InputFile in;
   in.path = path;
   if (magic == "Caml1999O038") {            // .cmo: one compilation_unit
@@ -392,6 +393,7 @@ void archive(const std::vector<std::string>& cmos, const std::string& out_path) 
     std::size_t off = be32(file, 12);
     m::Arena arena;
     std::size_t root = m::read_value(file.data(), file.size(), off, arena);
+    arena.finalize();
     int cu_pos = (int)arena[arena[root].fields[1]].i;
     int codesize = (int)arena[arena[root].fields[2]].i;
     ValPtr cu = conv(arena, root);

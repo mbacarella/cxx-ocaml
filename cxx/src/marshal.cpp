@@ -171,15 +171,16 @@ private:
       val.tag = tag;
       if (size == 0)
         return id;  // Atom: a zero-size block is an immediate, not registered.
-      val.fields.resize(size);
     }
+    // Reserve this block's contiguous field slice in the pool BEFORE reading its
+    // children (whose slices are reserved further along, keeping ours intact).
+    arena_.begin_block(id, size);
     // Register the block BEFORE reading fields so a field may reference the
-    // block itself (cyclic graphs, e.g. recursive type_expr).  read_value() may
-    // grow the arena and invalidate the reference, so re-fetch by id each field.
+    // block itself (cyclic graphs, e.g. recursive type_expr).
     objs_.push_back(id);
     for (std::uint64_t k = 0; k < size; ++k) {
       std::size_t child = read_value();
-      arena_.at(id).fields[k] = child;
+      arena_.set_field(id, k, child);  // by stable index; fpool_ may have realloc'd
     }
     return id;
   }
