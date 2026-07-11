@@ -18,6 +18,23 @@ namespace {
 
 namespace m = marshal;
 
+// Slurp an open binary stream into a byte vector in one bulk read (size via
+// seek, then a single read), instead of istreambuf_iterator's byte-at-a-time
+// push_back that reallocs-and-moves the buffer repeatedly.  Runs once per .cmi
+// decode (75+ per compile), so it showed up as a vector<uint8_t> realloc hotspot.
+inline std::vector<std::uint8_t> slurp_bytes(std::ifstream& in) {
+  in.seekg(0, std::ios::end);
+  std::streampos sz = in.tellg();
+  in.seekg(0, std::ios::beg);
+  if (sz <= 0)  // non-seekable/empty: fall back to the iterator slurp
+    return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in),
+                                     std::istreambuf_iterator<char>());
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(sz));
+  in.read(reinterpret_cast<char*>(bytes.data()), sz);
+  bytes.resize(static_cast<std::size_t>(in.gcount()));
+  return bytes;
+}
+
 // Walks a decoded Marshal arena and reconstructs Types structures on demand.
 class Decoder {
 public:
@@ -556,8 +573,7 @@ std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena,
                            std::vector<std::string>* imports = nullptr) {
   std::ifstream in(filepath, std::ios::binary);
   if (!in) throw m::Error("cannot open " + filepath);
-  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());
+  std::vector<std::uint8_t> bytes = slurp_bytes(in);
 
   // Skip the cmi magic string and decode the header value (name, signature).
   std::size_t off = 0;
@@ -1038,8 +1054,7 @@ std::string resolve_cmi_global(const std::string& g) {
 std::string read_cmi_self_crc(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) return "";
-  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());
+  std::vector<std::uint8_t> bytes = slurp_bytes(in);
   std::size_t off = 0;
   for (; off + 4 <= bytes.size(); ++off)
     if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
@@ -2338,8 +2353,7 @@ std::vector<std::pair<std::string, std::string>> read_cmi_crcs(const std::string
   std::vector<std::pair<std::string, std::string>> r;
   std::ifstream in(path, std::ios::binary);
   if (!in) return r;
-  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());
+  std::vector<std::uint8_t> bytes = slurp_bytes(in);
   std::size_t off = 0;
   for (; off + 4 <= bytes.size(); ++off)
     if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
@@ -2464,8 +2478,7 @@ o::ValPtr conv_value(const m::Arena& a, std::size_t id) {
 o::ValPtr read_cmi_sign(const std::string& path, std::string* out_name) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("cannot open " + path);
-  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());
+  std::vector<std::uint8_t> bytes = slurp_bytes(in);
   std::size_t off = 0;
   for (; off + 4 <= bytes.size(); ++off)
     if (bytes[off] == 0x84 && bytes[off + 1] == 0x95 && bytes[off + 2] == 0xA6 &&
