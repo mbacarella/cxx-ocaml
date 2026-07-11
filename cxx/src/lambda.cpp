@@ -4526,11 +4526,17 @@ struct Translator {
     std::set<std::string> want;  // file stems to index
     for (auto& [s, _] : full_by_stem) want.insert(s);
     for (auto& o : opened_) want.insert(to_stem(o));
-    // Expand each seed by its transitive imports (crc table).
+    // Expand each seed by its transitive imports (crc table).  `stdlib` is
+    // skipped: its crcs list every stdlib submodule (stdlib.ml uses them all
+    // internally), but a submodule's records are only in scope where that
+    // submodule is itself referenced -- in which case it is already loaded or
+    // pulled in by a non-pervasive module's crcs.
     std::set<std::string> seed = want;
-    for (auto& s : seed)
+    for (auto& s : seed) {
+      if (s == "stdlib") continue;
       if (const cmi::CmiFile* c = cmi_for(s))
         for (auto& imp : c->imports()) want.insert(to_stem(imp));
+    }
     auto index_cmi = [&](const std::string& stem, const cmi::CmiFile& cmi) {
       ++nfiles;
       try {
