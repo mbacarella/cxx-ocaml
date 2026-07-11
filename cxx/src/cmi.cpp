@@ -867,6 +867,20 @@ std::vector<std::string> g_module_dirs;
 
 // A source module head ("Buffer", "List", a local "A") -> its compilation-unit
 // global ("Stdlib__Buffer", "A").  Mirrors lambda's global_of.
+// Member ALIAS modules of stdlib.cmi (`module Bigarray = Stdlib__Bigarray`):
+// loaded lazily like stdlib_toplevel_type.
+static bool stdlib_alias_module(const std::string& n) {
+  static std::set<std::string>* names = nullptr;
+  if (!names) {
+    names = new std::set<std::string>();
+    try {
+      for (const auto& m : CmiFile::load(g_stdlib_dir + "/stdlib.cmi").sig().modules)
+        names->insert(m.name);
+    } catch (const std::exception&) {}  // -nostdlib: set stays empty
+  }
+  return names->count(n) > 0;
+}
+
 std::string global_of(const std::string& mod) {
   // "Stdlib/2" is the checker's out-of-scope marker (the REAL Stdlib when the
   // file binds its own `module Stdlib`); the cmi stores the plain unit global.
@@ -875,6 +889,13 @@ std::string global_of(const std::string& mod) {
   if (mod.rfind("Camlinternal", 0) == 0) return mod;
   if (std::filesystem::exists(g_stdlib_dir + "/stdlib__" + mod + ".cmi"))
     return "Stdlib__" + mod;
+  // The cmi-file probe misses a stdlib member whose unit builds LATER in
+  // the stdlib order (out_channel.mli cites Bigarray, built after it):
+  // ocamlc resolves through Stdlib's ALIAS module regardless, so consult
+  // stdlib.cmi's member list too -- the degraded bare `Bigarray` unit
+  // global was unloadable and the bootstrapped compiler typed every
+  // In_channel/Out_channel bigarray val abstract (bytelink/emitcode).
+  if (stdlib_alias_module(mod)) return "Stdlib__" + mod;
   return mod;  // a separately-compiled local module
 }
 
