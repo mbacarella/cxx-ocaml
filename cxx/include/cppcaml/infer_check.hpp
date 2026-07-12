@@ -134,6 +134,14 @@ struct ValueKinds {
   // lowers the generic caml_compare/caml_equal/... to the type-specialized
   // opcode (Translprim.specialize_comparison), matching official ocamlc's .cmo.
   std::unordered_map<const void*, std::string> cmp_operand;
+  // Match expressions the typer proved NON-exhaustive (Partial).  A match ABSENT
+  // from this map (and present in the program) is Total -- the back end may then
+  // omit the impossible `raise Match_failure` default (and its final test), exactly
+  // as ocamlc does when Translcore passes it `Total`.  Keyed by the Pexp_match /
+  // `function` Expression*.
+  std::unordered_map<const ast::Expression*, bool> match_partial;
+  // Same, for a bare `function ..` (Pfunction_cases), keyed by the node address.
+  std::unordered_map<const void*, bool> function_cases_partial;
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 

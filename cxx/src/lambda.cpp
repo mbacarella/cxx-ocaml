@@ -937,10 +937,15 @@ struct Translator {
     return v;
   }
   // `(raise (makeblock 0 (global Exn/s!) [0: file line char]))` for a compiler-
-  // raised predefined exception (Match_failure / Assert_failure).
+  // raised predefined exception (Match_failure / Assert_failure).  The match
+  // compiler / assert lowering reference the predefined path DIRECTLY
+  // (`transl_normal_path Predef.path_match_failure`), i.e. a bare global -- NOT
+  // through the `Stdlib` re-export field that a user-written `Match_failure` ref
+  // resolves to (predef_exn_ident); so use predef_global here regardless of
+  // pervasives.
   LamPtr raise_predef(const std::string& exn, const Location& loc) {
     auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
-    blk->args = {predef_exn_ident(exn), loc_block(loc)};
+    blk->args = {predef_global(exn), loc_block(loc)};
     auto r = mk(Lam::K::Prim); r->prim = Prim::Raise; r->args = {blk};
     return r;
   }
@@ -9282,12 +9287,26 @@ struct Translator {
     return c;
   }
 
-  LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases,
-                       const Location& mloc) {
-    return compile_match(scrut, rows_of(cases), mloc);
+  // The typer's exhaustiveness verdict for a `match` Expression (absent => Total).
+  bool match_is_total(const ast::Expression* e) const {
+    auto it = vk.match_partial.find(e);
+    return it == vk.match_partial.end() || !it->second;
   }
+  // Same for a bare `function` node (keyed by its Pfunction_cases address).
+  bool function_is_total(const void* fc) const {
+    auto it = vk.function_cases_partial.find(fc);
+    return it == vk.function_cases_partial.end() || !it->second;
+  }
+  LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases,
+                       const Location& mloc, bool total = false) {
+    return compile_match(scrut, rows_of(cases), mloc, total);
+  }
+  // `total` (from the typer's exhaustiveness): when set, the naive last-resort
+  // matcher omits the impossible `raise Match_failure` default and its final test,
+  // exactly as ocamlc does when Translcore lowers a Total match.  Only the outer
+  // match propagates it; nested field sub-matches default to false (irrefutable).
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Row>& rows,
-                       const Location& mloc) {
+                       const Location& mloc, bool total = false) {
     // If the scrutinee is a var of a known imported type, force-register that type's
     // constructors (correct arity/tag) for THIS match, so an ambiguous ctor name
     // (`Named`, shared by 6 types at arities 1/2/3) resolves through the scrutinee's
@@ -9360,7 +9379,7 @@ struct Translator {
     if (unbox) {
       std::vector<Row> ur;
       for (auto& r : rows) ur.push_back({effective_pat(r.lhs), r.rhs, r.guard});
-      return compile_match(scrut, ur, mloc);
+      return compile_match(scrut, ur, mloc, total);
     }
     // A non-variable scrutinee with a `| n -> ...` catch-all is bound to n first
     // (`let n = scrut in ...`), so n refers to it inside the arms (matches ocamlc).
@@ -9488,7 +9507,7 @@ struct Translator {
     if (LamPtr r = int_cases(scrut, rows, 0, /*strict=*/true)) return r;
     // shapes the structured paths can't express compile through the correct
     // per-row chain instead of silently collapsing
-    if (LamPtr r = naive_match(scrut, rows, mloc)) return r;
+    if (LamPtr r = naive_match(scrut, rows, mloc, total)) return r;
     return int_cases(scrut, rows, 0);
   }
 
@@ -10734,7 +10753,7 @@ struct Translator {
     return false;  // lazy / unpack: unmodeled
   }
   LamPtr naive_match(const LamPtr& scrut0, const std::vector<Row>& rows0,
-                     const Location& mloc) {
+                     const Location& mloc, bool total = false) {
     LamPtr scrut = scrut0;
     Ident stmp;
     bool tempd = false;
@@ -10814,8 +10833,13 @@ struct Translator {
         chain = cat;
       } else {
         LamPtr body = wrap_binders(expr(*it->rhs), binds);
-        if (!test) {
-          chain = body;  // irrefutable row: the rest is unreachable
+        // An irrefutable row, OR -- for a Total match (typer-proven exhaustive) --
+        // the LAST row, whose test is redundant: if no earlier row matched, this
+        // one must, so ocamlc emits it unconditionally and drops the impossible
+        // `raise Match_failure`.  (A guarded last row keeps its test/fallback: it
+        // takes the guard branch above, and a Total match never ends in a guard.)
+        if (!test || (total && it == rows.rbegin())) {
+          chain = body;  // the rest (Match_failure or a later test) is unreachable
         } else {
           auto o = mk(Lam::K::IfThenElse);
           o->cond = test; o->then_ = body; o->else_ = chain;
@@ -11161,11 +11185,11 @@ struct Translator {
         cat->cond = tr; cat->prim_arg = eid; cat->catch_vars = {v};
         cat->catch_var_kinds = {expr_kind(m->e.get())};
         scope.emplace_back();
-        cat->then_ = compile_match(varof(v), vrows, e.loc);
+        cat->then_ = compile_match(varof(v), vrows, e.loc, match_is_total(&e));
         scope.pop_back();
         return cat;
       }
-      return compile_match(expr(*m->e), m->cases, e.loc);
+      return compile_match(expr(*m->e), m->cases, e.loc, match_is_total(&e));
     }
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
@@ -14000,7 +14024,8 @@ struct Translator {
       // the param's kind is the scrutinee type = any case pattern's (unified)
       l->params.push_back({pid, pat_kind(&fc->cases[0].lhs)});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
-      l->body = wrap_optdefs(wrap_binders(compile_match(scrut, fc->cases, floc), binders));
+      l->body = wrap_optdefs(wrap_binders(
+          compile_match(scrut, fc->cases, floc, function_is_total(fc)), binders));
     } else {
       l->body = mk(Lam::K::ConstInt);
     }

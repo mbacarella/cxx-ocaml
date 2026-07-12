@@ -9272,6 +9272,8 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
     vk.field_resolved[e] = {std::get<0>(fr), std::get<1>(fr), std::get<2>(fr)};
   vk.format_lits = std::move(ck.fmt_lits_);
   vk.optional_erasures = std::move(ck.erasures_);
+  vk.match_partial = std::move(ck.match_partial);
+  vk.function_cases_partial = std::move(ck.function_cases_partial);
   return vk;
 }
 
