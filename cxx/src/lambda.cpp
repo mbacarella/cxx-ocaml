@@ -818,6 +818,12 @@ struct Translator {
   // matcher bails to the general path; healthy matches stay far under it.  Set by
   // the gmatch entry points; env CPPCAML_GMBUDGET overrides for calibration.
   int g_gm_budget_ = -1;  // <0 = inactive
+  // When set, gmatch destructures a nested tuple/record column into its element
+  // columns (no tag test -- every value of the type is a k-block).  Off by default:
+  // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
+  // cartesian var-spread of parallel columns can't explode uncapped (matching.ml
+  // shares default sub-matrices; we bail instead).  See gmatch_top's two-pass wrap.
+  bool g_gm_tuples_ = false;
 
   // A predefined exception's identity.  With pervasives (the default) it is
   // reached through the implicit `open Stdlib`, i.e. its Stdlib re-export FIELD
@@ -9061,6 +9067,57 @@ struct Translator {
         }
         return gmatch(std::move(comps), std::move(ex), mloc, deid);
       }
+    // Nested tuple column: a tuple type is monomorphic, so every value is a k-block
+    // and we destructure unconditionally (no tag test) into k leading columns.  Only
+    // under g_gm_tuples_ (gmatch_top's second pass) and budgeted, since parallel
+    // columns can cartesian-explode the un-shared var-spread.
+    if (g_gm_tuples_) {
+      size_t tk = 0; bool anytup = false;
+      for (auto& r : rows)
+        if (auto* tp = std::get_if<Ppat_tuple>(&r.cols[0]->desc)) {
+          if (tp->closed != ClosedFlag::Closed) return nullptr;
+          for (auto& lbl : tp->labels) if (lbl) return nullptr;   // labeled tuple: bail
+          anytup = true; tk = tp->elems.size(); break;
+        }
+      if (anytup) {
+        if (comps[0]->k != Lam::K::Var) return nullptr;   // need a Var for field reads
+        for (auto& r : rows) {                            // rows: tuple(same k) or var/any
+          auto& d = r.cols[0]->desc;
+          if (auto* tp = std::get_if<Ppat_tuple>(&d)) {
+            if (tp->elems.size() != tk || tp->closed != ClosedFlag::Closed) return nullptr;
+            for (auto& lbl : tp->labels) if (lbl) return nullptr;
+          } else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d)) return nullptr;
+        }
+        if (g_gm_budget_ == 0) return nullptr;
+        if (g_gm_budget_ > 0) --g_gm_budget_;
+        std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
+        std::vector<Ident> fids; std::vector<LamPtr> fvars;
+        for (size_t j = 0; j < tk; ++j) { Ident f = fresh("", true); fids.push_back(f); fvars.push_back(varof(f)); }
+        std::vector<LamPtr> ncomps = fvars; ncomps.insert(ncomps.end(), rest.begin(), rest.end());
+        static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
+        std::vector<MRow> sub;
+        for (auto& r : rows) {
+          MRow nr = r; nr.cols.clear();                   // preserve rhs/binds/guard/aid/vnames
+          if (auto* tp = std::get_if<Ppat_tuple>(&r.cols[0]->desc)) {
+            for (auto& el : tp->elems) nr.cols.push_back(effective_pat(el.get()));
+          } else {
+            if (auto* pv = std::get_if<Ppat_var>(&r.cols[0]->desc))
+              nr.binds.push_back({pv->name.txt, comps[0]->var});
+            for (size_t j = 0; j < tk; ++j) nr.cols.push_back(&any_pat);
+          }
+          nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
+          sub.push_back(std::move(nr));
+        }
+        LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, deid);
+        if (!cb) return nullptr;
+        for (int j = (int)tk - 1; j >= 0; --j) {
+          LamPtr fread = fieldimm(j, comps[0]);
+          if (count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+          else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ValueKind::Gen, fread, true}}; l->body = cb; cb = l; }
+        }
+        return cb;
+      }
+    }
     // Only var/any and (non-exn, non-inline, non-unboxed) constructor columns.
     bool anyctor = false;
     for (auto& r : rows) {
@@ -9261,7 +9318,18 @@ struct Translator {
       mrows[i].aid = arms[i].aid; mrows[i].vnames = &arms[i].vnames;
     }
     int deid = ++next_exit_;
+    // Pass 1: no tuple destructuring, no budget -- the committed single-scrutinee
+    // ctor path (never explodes: col 0 is the sole column, split into bounded
+    // fields).  Pass 2 (only if pass 1 bails): allow nested tuple columns under a
+    // budget so a ctor-wrapped tuple (`K (a, B x)`) becomes a switch instead of the
+    // caml_obj_tag if-chain, while the cartesian var-spread stays capped (bails back
+    // to int_cases = the pre-existing path, so this can only add captures).
     LamPtr body = gmatch({sv}, mrows, mloc, deid);
+    if (!body) {
+      g_gm_tuples_ = true; g_gm_budget_ = gm_budget();
+      body = gmatch({sv}, mrows, mloc, deid);
+      g_gm_tuples_ = false; g_gm_budget_ = -1;
+    }
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
     wire_garms(body, arms);
     LamPtr dbody;
