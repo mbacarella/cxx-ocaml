@@ -9118,6 +9118,70 @@ struct Translator {
         return cb;
       }
     }
+    // Nested record column: also monomorphic -> one column per mentioned field
+    // (union across rows, ordered by record-block index), no tag test.  Same
+    // second-pass/budget guard as the tuple column above.
+    if (g_gm_tuples_) {
+      bool anyrec = false;
+      for (auto& r : rows)
+        if (std::get_if<Ppat_record>(&r.cols[0]->desc)) { anyrec = true; break; }
+      if (anyrec) {
+        if (comps[0]->k != Lam::K::Var) return nullptr;
+        std::map<int, FieldInfo> cols_fi;                     // block index -> field
+        std::vector<std::map<int, const Pattern*>> rowmap(rows.size());  // row -> idx -> subpat
+        for (size_t ri = 0; ri < rows.size(); ++ri) {
+          auto& d = rows[ri].cols[0]->desc;
+          if (auto* pr = std::get_if<Ppat_record>(&d)) {
+            std::vector<std::string> flds;
+            for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
+            for (auto& [lbl, sub] : pr->fields) {
+              FieldInfo nfi;
+              const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi,
+                                       rows[ri].cols[0], pat_record_qual_mod(*pr));
+              if (!fi) return nullptr;
+              cols_fi[fi->index] = *fi;
+              rowmap[ri][fi->index] = effective_pat(sub.get());
+            }
+          } else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d))
+            return nullptr;
+        }
+        if (cols_fi.empty()) return nullptr;
+        if (g_gm_budget_ == 0) return nullptr;
+        if (g_gm_budget_ > 0) --g_gm_budget_;
+        std::vector<int> order; std::vector<FieldInfo> ofi;   // columns in index order
+        for (auto& [ix, fi] : cols_fi) { order.push_back(ix); ofi.push_back(fi); }
+        size_t nc = order.size();
+        std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
+        std::vector<Ident> fids; std::vector<LamPtr> fvars;
+        for (size_t j = 0; j < nc; ++j) { Ident f = fresh("", true); fids.push_back(f); fvars.push_back(varof(f)); }
+        std::vector<LamPtr> ncomps = fvars; ncomps.insert(ncomps.end(), rest.begin(), rest.end());
+        static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
+        std::vector<MRow> sub;
+        for (size_t ri = 0; ri < rows.size(); ++ri) {
+          MRow nr = rows[ri]; nr.cols.clear();
+          if (std::get_if<Ppat_record>(&rows[ri].cols[0]->desc)) {
+            for (size_t j = 0; j < nc; ++j) {
+              auto it = rowmap[ri].find(order[j]);
+              nr.cols.push_back(it != rowmap[ri].end() ? it->second : &any_pat);
+            }
+          } else {
+            if (auto* pv = std::get_if<Ppat_var>(&rows[ri].cols[0]->desc))
+              nr.binds.push_back({pv->name.txt, comps[0]->var});
+            for (size_t j = 0; j < nc; ++j) nr.cols.push_back(&any_pat);
+          }
+          nr.cols.insert(nr.cols.end(), rows[ri].cols.begin() + 1, rows[ri].cols.end());
+          sub.push_back(std::move(nr));
+        }
+        LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, deid);
+        if (!cb) return nullptr;
+        for (int j = (int)nc - 1; j >= 0; --j) {
+          LamPtr fread = field_read(&ofi[j], comps[0]);
+          if (count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+          else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ofi[j].kind, fread, true}}; l->body = cb; cb = l; }
+        }
+        return cb;
+      }
+    }
     // Only var/any and (non-exn, non-inline, non-unboxed) constructor columns.
     bool anyctor = false;
     for (auto& r : rows) {
@@ -9252,10 +9316,12 @@ struct Translator {
   int gm_budget() {
     static int b = [] {
       const char* e = std::getenv("CPPCAML_GMBUDGET");
-      // 60 = calibrated on the 139 compiler modules: the total-opcode-divergence
-      // minimum (75018) with margin before the ctype-style combinatorial explosion
-      // that sets in past ~63; deeper matrices trade obj_tag for net-more BRANCH etc.
-      return e ? std::atoi(e) : 60;
+      // 55 = re-calibrated on the 139 compiler modules once gmatch_top's second pass
+      // (nested tuple/record columns) began sharing this budget: the total-opcode-
+      // divergence minimum (60936), a sharp min with a cliff at 56 (62808) where a
+      // large matrix just fits and its un-shared var-spread explodes.  Within the old
+      // gmatch_tuple_top plateau (50-63), so that matcher is unaffected.
+      return e ? std::atoi(e) : 55;
     }();
     return b;
   }
