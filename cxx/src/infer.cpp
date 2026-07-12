@@ -34,9 +34,29 @@ struct TypeArena {
     }
     return new (slabs_.back() + used_++) Type();  // construct in place
   }
+  // Destruct every constructed node (Type has string/vector members whose heap
+  // must be freed) and release the slabs.  Used by the compile daemon between
+  // requests -- one process compiles many modules, so the "never freed" leak
+  // that is fine for a one-shot process would grow unbounded there.  Safe only
+  // when no TypePtr from this compile is still live (true once run_main returns:
+  // the Engine/env and their Types are gone, and the cmi cache holds SEPARATE
+  // cmi::TypeExpr graphs, not these arena Types).
+  void reset() {
+    for (std::size_t s = 0; s < slabs_.size(); ++s) {
+      std::size_t n = (s + 1 == slabs_.size()) ? used_ : kSlab;
+      for (std::size_t i = 0; i < n; ++i) slabs_[s][i].~Type();
+      ::operator delete(slabs_[s]);
+    }
+    slabs_.clear();
+    used_ = kSlab;
+  }
 };
 TypeArena g_type_arena;
 }  // namespace
+
+// Reclaim the per-compile Type scratch arena (see TypeArena::reset).  A no-op
+// for a one-shot process (it fast-exits); called by the daemon between compiles.
+void reset_type_arena() { g_type_arena.reset(); }
 
 TypePtr Engine::fresh_var() {
   TypePtr t{g_type_arena.alloc()};
