@@ -428,6 +428,7 @@ std::vector<Token> Lexer::tokenize() {
   auto rev = [](std::vector<Docstring> v) { std::reverse(v.begin(), v.end()); return v; };
 
   std::vector<Token> out;
+  out.reserve(src_.size() / 4 + 16);  // ~avg token length; avoids realloc-move churn
   size_t prev_end = 0;  // post_pos: end of the previous real token
   for (;;) {
     Lines lines = NoLine;
@@ -464,7 +465,7 @@ std::vector<Token> Lexer::tokenize() {
         lines = NoLine;
         continue;
       }
-      tok = rt;  // a real token: attach the accumulated docs and stop
+      tok = std::move(rt);  // a real token: attach the accumulated docs and stop
       break;
     }
     size_t pre_pos = tok.start;
@@ -484,9 +485,10 @@ std::vector<Token> Lexer::tokenize() {
       if (!blank) { put(docs_.floating, pre_pos, rev(docs.f)); put(docs_.pre, pre_pos, docs.b); }
       else put(docs_.floating, pre_pos, fb);
     }
-    out.push_back(tok);
+    Kind k = tok.kind;
     prev_end = tok.end;
-    if (tok.kind == Kind::TEOF) break;
+    out.push_back(std::move(tok));
+    if (k == Kind::TEOF) break;
   }
   return out;
 }
