@@ -7312,6 +7312,51 @@ struct Translator {
     const Expression* rhs;
     std::vector<std::pair<std::string, Ident>> binds;
   };
+  // Guard mm_cols' preconditions: it assumes every column is a var/any, or a
+  // constructor of a 1-const/1-block or all-constant type whose argument (if any)
+  // is itself a var/any -- deeper nesting or multi-block types would trip its
+  // unguarded ctor_info_.at()/silently drop nested sub-patterns.  Mirrors the
+  // inline validation in multi_match; returns false to make the caller bail.
+  bool mm_cols_ok(const std::vector<MRow>& rows, size_t k) {
+    for (size_t c = 0; c < k; ++c) {
+      bool anyvar = false, anyctor = false, all_const_type = false, ext_col = false;
+      std::string type;
+      for (auto& r : rows) {
+        std::vector<const Pattern*> alts;
+        flatten_or(r.cols[c], alts);
+        for (const Pattern* p : alts) {
+          if (std::get_if<Ppat_var>(&p->desc) ||
+              std::holds_alternative<Ppat_any>(p->desc)) { anyvar = true; continue; }
+          auto* kc = std::get_if<Ppat_construct>(&p->desc);
+          if (!kc) return false;
+          auto ci = ctor_info_.find(ctor_of(*p));
+          if (ci == ctor_info_.end()) {
+            std::string cn = ctor_of(*p);
+            if ((exn_ident_.count(cn) || exn_field_.count(cn)) && !kc->arg) {
+              ext_col = true; anyctor = true; continue;
+            }
+            return false;
+          }
+          auto tc = type_ctors_.find(ci->second.type);
+          if (tc == type_ctors_.end()) return false;
+          bool one_one = tc->second.first == 1 && tc->second.second == 1;
+          bool allc = tc->second.second == 0;
+          if (!one_one && !allc) return false;
+          if (type.empty()) { type = ci->second.type; all_const_type = allc; }
+          else if (type != ci->second.type) return false;
+          if (kc->arg) {
+            if (ci->second.arity != 1) return false;
+            const Pattern* ap = effective_pat(kc->arg->get());
+            if (!std::get_if<Ppat_var>(&ap->desc) &&
+                !std::holds_alternative<Ppat_any>(ap->desc)) return false;
+          }
+          anyctor = true;
+        }
+      }
+      if (anyvar && anyctor && !all_const_type && !ext_col) return false;
+    }
+    return true;
+  }
   LamPtr multi_match(const Pexp_tuple* tu, const std::vector<Row>& vrows,
                      const std::vector<Row>& erows, const Location& mloc) {
     size_t k = tu->elems.size();
@@ -8373,7 +8418,45 @@ struct Translator {
       FieldInfo fi{ci.type, col, ci.rfmut[col], ci.rshape[col]};
       return compile_match(field_read(&fi, scrut), sub, mloc);
     }
-    if (ci.arity != 1) return nullptr;  // multi-field multi-row: multi-column, bail
+    // Multi-field group (arity >= 2) with several rows: rather than bail to the
+    // caml_obj_tag if-chain, decompose the constructor's fields into a column
+    // matrix and reuse the matrix matcher (mm_cols), which emits Switch/if per
+    // column.  Only when no shared default is active (dflt == nullptr): mm_cols
+    // fills uncovered sub-values with Match_failure, which is the correct
+    // fall-through for an all-constructor (ctor_match) match but NOT for a
+    // catch/guard context that expects the shared default.
+    if (ci.arity != 1) {
+      if (dflt) return nullptr;
+      int ar = ci.arity;
+      std::vector<LamPtr> comps;
+      std::vector<Ident> fids;
+      for (int j = 0; j < ar; ++j) {
+        Ident t = fresh("", true); fids.push_back(t); comps.push_back(varof(t));
+      }
+      std::vector<MRow> mrows;
+      for (auto* r : rs) {
+        auto* k = std::get_if<Ppat_construct>(&r->lhs->desc);
+        if (!k) return nullptr;
+        auto fps = ctor_field_pats(k, ar);
+        if ((int)fps.size() != ar) return nullptr;
+        MRow mr; mr.rhs = r->rhs;
+        for (auto* fp : fps) mr.cols.push_back(effective_pat(fp));
+        mrows.push_back(std::move(mr));
+      }
+      if (!mm_cols_ok(mrows, (size_t)ar)) return nullptr;
+      LamPtr body = mm_cols(comps, std::move(mrows), 0, mloc);
+      if (!body) return nullptr;
+      for (int j = ar - 1; j >= 0; --j) {
+        LamPtr fread = fieldimm(j, scrut);
+        if (count_var(body, fids[j]) <= 1) subst_var(body, fids[j], fread);
+        else {
+          auto l = mk(Lam::K::Let);
+          l->bindings = {{fids[j], ValueKind::Gen, fread, true}};
+          l->body = body; body = l;
+        }
+      }
+      return body;
+    }
     LamPtr field0 = fieldimm(0, scrut);
     std::vector<Row> sub;
     bool has_var = false;  // a row whose inner pattern is a plain variable
