@@ -12350,8 +12350,12 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         auto item = cmi::cmiw::sig_external(pr->pd.name.txt, ty, pr->pd.prims[0], native);
         apply_prim_attrs(pr->pd, out, item);
         out.push_back(std::move(item));
+        out.back().loc = conv_loc(pr->pd.loc);
       } else if (pr->pd.alias) {  // `external f [: t] = g`: copy g's primitive
-        if (auto item = emit_prim_alias(ck, pr->pd, out)) out.push_back(std::move(*item));
+        if (auto item = emit_prim_alias(ck, pr->pd, out)) {
+          out.push_back(std::move(*item));
+          out.back().loc = conv_loc(pr->pd.loc);
+        }
       }
     } else if (auto* pt = std::get_if<Psig_type>(&it.desc)) {
       bool nonrec_ = pt->rf == RecFlag::Nonrecursive;
@@ -12403,6 +12407,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         out.push_back(std::move(mi));
       }
     } else if (auto* pm = std::get_if<Psig_module>(&it.desc)) {
+      std::size_t mbefore = out.size();
       if (pm->md.name.txt && pm->md.type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pm->md.type->desc))
           out.push_back(cmi::cmiw::sig_module(*pm->md.name.txt,
@@ -12470,7 +12475,9 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           out.push_back(std::move(mitem));
         }
       }
+      if (out.size() > mbefore) out.back().loc = conv_loc(it.loc);
     } else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
+      std::size_t mtbefore = out.size();
       // `module type S = sig .. end`: emit it so a functor parameter typed by S
       // (`Make (H : Hashtbl.HashedType)`) can resolve H's members to fields.
       if (!pmt->type)  // ABSTRACT `module type S` in a signature
@@ -12498,6 +12505,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           out.push_back(std::move(s));
         }
       }
+      if (out.size() > mtbefore) out.back().loc = conv_loc(it.loc);
     } else if (std::get_if<Psig_class>(&it.desc) ||
                std::get_if<Psig_class_type>(&it.desc)) {
       // `class c : <arrows> -> object .. end` / `class type ct = object .. end`

@@ -2022,7 +2022,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (!mty)
           mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, item_stamp[i]))});  // Mty_signature
       }
-      auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
+      auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, emit_loc(it.loc),
                               emit_uid(it.uid)});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(presence), md,
                                   o::vint(it.rec_status) /*Trec_*/,
@@ -2046,7 +2046,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       if (!mto)
         mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes))})});  // Some(Mty_signature)
       auto mtd = o::vblock(0, {mto, o::vint(0) /*attrs*/,
-                               loc_none(), emit_uid(it.uid)});  // modtype_declaration
+                               emit_loc(it.loc), emit_uid(it.uid)});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
     } else if (it.k == SigItem::Exception) {
       // Sig_typext(id, extension_constructor, ext_status, vis).  A plain
