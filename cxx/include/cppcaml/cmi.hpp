@@ -78,9 +78,21 @@ struct TypeExpr {
   bool row_more_nil = false;           // row_more is Tnil (an exact row)
 };
 
+// A source Location.t decoded from a cmi (val_loc / type_loc / cd_loc / …), kept
+// so an `include`d / functor-applied member re-emits the DEPENDENCY's original
+// location (`Set.empty` keeps `set.mli:77:4`).  pos_fname is the same for start
+// and end in every real location, so one `fname` suffices.  ghost => the decl
+// had Location.none (nothing to preserve).
+struct RLoc {
+  std::string fname;
+  int l_s = 0, b_s = 0, c_s = -1, l_e = 0, b_e = 0, c_e = -1;
+  bool ghost = true;
+};
+
 struct SigValue {
   std::string name;
   TypePtr type;
+  RLoc loc;
   // For a Val_prim value (`external x = "%op"` / C primitive), its prim_name
   // (e.g. "%compare", "caml_format_int"); empty for an ordinary Val_reg value.
   std::string prim;
@@ -100,6 +112,7 @@ struct LabelDecl {
   std::string name;
   bool mutable_ = false;
   TypePtr type;
+  RLoc loc;
 };
 
 struct ConstructorDecl {
@@ -108,6 +121,7 @@ struct ConstructorDecl {
   std::vector<LabelDecl> inline_record;  // Cstr_record (inline record args)
   bool is_inline_record = false;
   TypePtr res;                     // cd_res (GADT return type), may be null
+  RLoc loc;
 };
 
 // type_declaration (the subset Env/typing needs first).
@@ -128,6 +142,7 @@ struct TypeDecl {
   // type_variance, one RAW Variance.t int per parameter (a bitfield Printtyp
   // renders as `+`/`-`/`!`); empty when the decl predates the decode.
   std::vector<long long> variances;
+  RLoc loc;                             // type_loc
 };
 
 struct Signature;
@@ -138,11 +153,13 @@ using SignaturePtr = std::shared_ptr<Signature>;
 struct ModuleDecl {
   std::string name;
   ModuleTypePtr type;
+  RLoc loc;  // md_loc
 };
 
 struct ModtypeDecl {
   std::string name;
   ModuleTypePtr type;  // null => abstract module type
+  RLoc loc;  // mtd_loc
 };
 
 // extension_constructor (the typext payload), simplified.
@@ -277,7 +294,11 @@ struct Uid {
 // to a filename at emit time via write_cmi's filename table (0 = source path,
 // >0 = a `# N "file"` directive).  Default = ghost -> Location.none (what the
 // writer emitted before locations were modelled).
-struct WPos { int lnum = 0, bol = 0, cnum = -1, file_id = 0; };
+// file_id resolves to a filename via write_cmi's table; but a location READ
+// from a dependency's cmi (an `include`d / functor-applied member) carries a
+// FOREIGN pos_fname (e.g. "set.mli") that isn't in this unit's table -- store
+// it verbatim in `fname` and emit_pos prefers it over the file_id lookup.
+struct WPos { int lnum = 0, bol = 0, cnum = -1, file_id = 0; std::string fname; };
 struct Loc { WPos start, end; bool ghost = true; };
 
 struct Ty;

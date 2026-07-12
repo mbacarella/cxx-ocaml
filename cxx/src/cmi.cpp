@@ -66,9 +66,11 @@ public:
             if (item.fields.size() == 3) {
               SigValue sv;
               sv.name = ident(item.fields[0]).name;
-              // value_description: field 0 = val_type, field 1 = val_kind.
+              // value_description: field 0 = val_type, field 1 = val_kind,
+              // field 2 = val_loc.
               const m::Value& vd = arena_[item.fields[1]];
               sv.type = type(vd.fields.at(0));
+              if (vd.fields.size() > 2) sv.loc = decode_loc(vd.fields[2]);
               // val_kind: Val_reg is the immediate constant 0; Val_prim (an
               // inlined %/C primitive) is a block and takes no runtime field.
               bool runtime = vd.fields.size() > 1 &&
@@ -145,8 +147,10 @@ public:
             if (item.fields.size() == 5) {
               ModuleDecl md;
               md.name = ident(item.fields[0]).name;
-              // module_declaration.md_type is field 0 of the record.
+              // module_declaration: md_type(0), md_attributes(1), md_loc(2).
               md.type = module_type(arena_[item.fields[2]].fields.at(0));
+              if (arena_[item.fields[2]].fields.size() > 2)
+                md.loc = decode_loc(arena_[item.fields[2]].fields[2]);
               // Only a present submodule (Mp_present = int 0) takes a runtime
               // field; an Mp_absent module alias is transparent (no field).
               const m::Value& pres = arena_[item.fields[1]];
@@ -161,10 +165,13 @@ public:
             if (item.fields.size() == 3) {
               ModtypeDecl mtd;
               mtd.name = ident(item.fields[0]).name;
-              // modtype_declaration.mtd_type is field 0: module_type option.
+              // modtype_declaration: mtd_type(0) option, mtd_attributes(1),
+              // mtd_loc(2).
               const m::Value& opt = arena_[arena_[item.fields[1]].fields.at(0)];
               if (opt.kind == m::Value::Kind::Block && opt.tag == 0)
                 mtd.type = module_type(opt.fields.at(0));
+              if (arena_[item.fields[1]].fields.size() > 2)
+                mtd.loc = decode_loc(arena_[item.fields[1]].fields[2]);
               out.order.push_back({Signature::OrderEnt::Modtype,
                                    (int)out.modtypes.size(), false});
               out.modtypes.push_back(std::move(mtd));
@@ -291,6 +298,7 @@ public:
           td.variances.push_back(arena_[cons.fields[0]].i);
         cur = cons.fields[1];
       }
+    if (d.fields.size() > 9) td.loc = decode_loc(d.fields[9]);  // type_loc
     return td;
   }
 
@@ -351,6 +359,7 @@ public:
     ld.mutable_ = arena_[v.fields.at(1)].kind == m::Value::Kind::Int &&
                   arena_[v.fields[1]].i != 0;  // mutable_flag: Mutable = 1
     ld.type = type(v.fields.at(3));
+    if (v.fields.size() > 4) ld.loc = decode_loc(v.fields[4]);  // ld_loc
     return ld;
   }
 
@@ -373,7 +382,32 @@ public:
     const m::Value& res = arena_[v.fields.at(2)];  // cd_res : type_expr option
     if (res.kind == m::Value::Kind::Block && res.tag == 0)
       cd.res = type(res.fields.at(0));
+    if (v.fields.size() > 3) cd.loc = decode_loc(v.fields[3]);  // cd_loc
     return cd;
+  }
+
+  // Location.t = { loc_start; loc_end; loc_ghost }; each position is
+  // { pos_fname; pos_lnum; pos_bol; pos_cnum }.  Decoded so a spliced member
+  // re-emits the dependency's original source location (pos_fname included).
+  RLoc decode_loc(std::size_t loc_id) {
+    RLoc r;
+    const m::Value& loc = arena_[loc_id];
+    if (loc.kind != m::Value::Kind::Block || loc.fields.size() < 3) return r;
+    const m::Value& g = arena_[loc.fields[2]];  // loc_ghost
+    if (g.kind == m::Value::Kind::Int && g.i != 0) return r;  // ghost -> default
+    auto rdpos = [&](std::size_t pid, std::string& fn, int& l, int& b, int& c) {
+      const m::Value& p = arena_[pid];
+      if (p.kind != m::Value::Kind::Block || p.fields.size() < 4) return;
+      fn = arena_[p.fields[0]].str();
+      if (arena_[p.fields[1]].kind == m::Value::Kind::Int) l = (int)arena_[p.fields[1]].i;
+      if (arena_[p.fields[2]].kind == m::Value::Kind::Int) b = (int)arena_[p.fields[2]].i;
+      if (arena_[p.fields[3]].kind == m::Value::Kind::Int) c = (int)arena_[p.fields[3]].i;
+    };
+    std::string fe;
+    rdpos(loc.fields[0], r.fname, r.l_s, r.b_s, r.c_s);
+    rdpos(loc.fields[1], fe, r.l_e, r.b_e, r.c_e);
+    r.ghost = false;
+    return r;
   }
 
 private:
@@ -1631,7 +1665,10 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
 // to resolve a position's file_id to its pos_fname.
 static std::vector<std::string> g_cmi_src_files;
 o::ValPtr emit_pos(const cmiw::WPos& p) {  // Lexing.position
-  const std::string& fn = (p.file_id >= 0 && (std::size_t)p.file_id < g_cmi_src_files.size())
+  // A foreign pos_fname (read from a dependency's cmi) is authoritative; else
+  // resolve the file_id through this unit's source-file table.
+  const std::string& fn = !p.fname.empty() ? p.fname
+      : (p.file_id >= 0 && (std::size_t)p.file_id < g_cmi_src_files.size())
                               ? g_cmi_src_files[p.file_id] : g_cmi_src_files.empty() ? "" : g_cmi_src_files[0];
   return o::vblock(0, {o::vstr(fn), o::vint(p.lnum), o::vint(p.bol), o::vint(p.cnum)});
 }

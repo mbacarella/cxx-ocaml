@@ -11112,6 +11112,15 @@ static int manifest_scope_skip(const cmi::TypeDecl& td,
   }
   return 0;
 }
+// A source location decoded from a dependency's cmi -> the writer's Loc, with
+// the foreign pos_fname carried verbatim (emit_pos prefers it over file_id).
+static cmi::cmiw::Loc rloc_to_loc(const cmi::RLoc& r) {
+  cmi::cmiw::Loc l;
+  l.ghost = r.ghost;
+  l.start = {r.l_s, r.b_s, r.c_s, 0, r.fname};
+  l.end = {r.l_e, r.b_e, r.c_e, 0, r.fname};
+  return l;
+}
 static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td);
 static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
                                              const cmi::ModuleDecl& md,
@@ -11149,8 +11158,10 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
           break;
         case cmi::Signature::OrderEnt::Modtype: {
           auto& mt = sig.modtypes.at(oe.idx);
-          if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig)
+          if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig) {
             out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig, origin, &stack)));
+            out.back().loc = rloc_to_loc(mt.loc);
+          }
           break;
         }
         case cmi::Signature::OrderEnt::Value: {
@@ -11167,12 +11178,16 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
             out.push_back(std::move(se));
           } else
             out.push_back(cmi::cmiw::sig_value(v.name, conv_cmi_ty(v.type, vars, nv, &nodes)));
+          out.back().loc = rloc_to_loc(v.loc);
           break;
         }
-        case cmi::Signature::OrderEnt::Module:
-          out.push_back(cmi_module_to_item(sig.modules.at(oe.idx).name,
-                                           sig.modules.at(oe.idx), origin, &stack));
+        case cmi::Signature::OrderEnt::Module: {
+          auto mit = cmi_module_to_item(sig.modules.at(oe.idx).name,
+                                        sig.modules.at(oe.idx), origin, &stack);
+          mit.loc = rloc_to_loc(sig.modules.at(oe.idx).loc);
+          out.push_back(std::move(mit));
           break;
+        }
         case cmi::Signature::OrderEnt::Typext: {
           auto& x = sig.typexts.at(oe.idx);
           std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
@@ -11188,8 +11203,10 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
   // Types and module-types take no runtime field; emit them first.
   for (auto& td : sig.types) out.push_back(conv_type(td));
   for (auto& mt : sig.modtypes)
-    if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig)
+    if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig) {
       out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig, origin, &stack)));
+      out.back().loc = rloc_to_loc(mt.loc);
+    }
   // Primitive values take no field either; emit before the field-takers.
   for (auto& v : sig.values) {
     if (v.prim.empty()) continue;
@@ -11200,6 +11217,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
     se.prim_alloc = v.prim_alloc;
     se.prim_reprs = v.prim_reprs;
     se.prim_repr_res = v.prim_repr_res;
+    se.loc = rloc_to_loc(v.loc);
     out.push_back(std::move(se));
   }
   // Field-taking items in the recorded runtime field order, so the spliced
@@ -11215,8 +11233,11 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
       std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
       std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
       out.push_back(cmi::cmiw::sig_value(fn, conv_cmi_ty(it->second->type, vars, nv, &nodes)));
+      out.back().loc = rloc_to_loc(it->second->loc);
     } else if (auto it = mmap.find(fn); it != mmap.end()) {
-      out.push_back(cmi_module_to_item(fn, *it->second, origin, &stack));
+      auto mit = cmi_module_to_item(fn, *it->second, origin, &stack);
+      mit.loc = rloc_to_loc(it->second->loc);
+      out.push_back(std::move(mit));
     } else if (auto it = xmap.find(fn); it != xmap.end()) {
       std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
       std::vector<cmi::cmiw::TyPtr> args;
@@ -11237,18 +11258,24 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
   cmi::cmiw::SigItem si;
   if (td.kind == cmi::TypeDecl::Record) {
     std::vector<cmi::cmiw::Label> ls;
-    for (auto& l : td.labels)
-      ls.push_back({l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)});
+    for (auto& l : td.labels) {
+      cmi::cmiw::Label lw{l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)};
+      lw.loc = rloc_to_loc(l.loc);
+      ls.push_back(std::move(lw));
+    }
     si = cmi::cmiw::sig_record(td.name, std::move(params), std::move(ls));
   } else if (td.kind == cmi::TypeDecl::Variant) {
     std::vector<cmi::cmiw::Ctor> cs;
     for (auto& c : td.ctors) {
       cmi::cmiw::Ctor cw;
       cw.name = c.name;
+      cw.loc = rloc_to_loc(c.loc);
       for (auto& a : c.args) cw.args.push_back(conv_cmi_ty(a, vars, nv, &nodes));
-      for (auto& l : c.inline_record)
-        cw.inline_record.push_back(
-            {l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)});
+      for (auto& l : c.inline_record) {
+        cmi::cmiw::Label lw{l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)};
+        lw.loc = rloc_to_loc(l.loc);
+        cw.inline_record.push_back(std::move(lw));
+      }
       // GADT return (`Element : 'a lr1state * .. -> element`): dropping cd_res
       // here turned the ctor into a PLAIN one, so a spliced functor-result sig
       // no longer matched the engine's own decl (parser.mli's MenhirInterpreter
@@ -11268,6 +11295,7 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
     si.manifest = conv_cmi_ty(td.manifest, vars, nv, &nodes);
   si.type_private = td.priv;
   si.type_variances = td.variances;
+  si.loc = rloc_to_loc(td.loc);
   return si;
 }
 static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
@@ -11818,6 +11846,10 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
         tgt->manifest = bridge_ty_named(ck.from_coretype(**td->manifest, tvars),
                                         bvars, nextvar, tvars);
       tgt->type_private = (td->priv == PrivateFlag::Private);
+      // The refined type is re-declared AT the `with type X = ..` clause, so its
+      // location becomes that clause's (OCaml: `Map.key` in `Map : Map.S with
+      // type key = t` carries the local `type key = t` loc, not map.mli's).
+      tgt->loc = conv_loc(td->loc);
       // The RHS was written OUTSIDE the refined signature: bare names in the
       // manifest must not be captured by the refined sig's own decls (`Map.S
       // with type key = t` cites the enclosing t, not Map.S's t).  The item
