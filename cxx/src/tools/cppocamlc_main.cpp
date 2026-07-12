@@ -272,6 +272,7 @@ static int run_main(int argc, char** argv) {
   bool make_lib = false;                 // -a : build a .cma archive
   std::string pack_name;                 // -pack : build a packed unit (name from -o)
   bool nostdlib = false;                 // -nostdlib : do not auto-link stdlib
+  bool nopervasives = false;             // -nopervasives : Stdlib not implicitly opened
   bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
 
   // -strict-flags makes accepted-but-ignored / unknown options hard errors.
@@ -306,6 +307,7 @@ static int run_main(int argc, char** argv) {
     else if (a == "-a") make_lib = true;
     else if (a == "-pack") pack_name = "?";  // resolved from -o once known
     else if (a == "-nostdlib") nostdlib = true;
+    else if (a == "-nopervasives") nopervasives = true;
     else if (a == "-stdlib") stdlib_flag = need_arg("-stdlib");
     else if (a == "-version") { std::cout << kVersion << '\n'; return 0; }
     else if (a == "-vnum") { std::cout << kVersion << '\n'; return 0; }
@@ -365,6 +367,7 @@ static int run_main(int argc, char** argv) {
   std::vector<std::string> incdirs;  // resolved (+unix -> <stdlib>/unix)
   for (const std::string& d : incdirs_raw) incdirs.push_back(resolve_incdir(d, stdlib_dir));
   cppcaml::lambda::set_module_dirs(incdirs);
+  cppcaml::lambda::set_nopervasives(nopervasives);
   cppcaml::set_infer_module_dirs(incdirs);
   cppcaml::set_infer_stdlib_dir(stdlib_dir);
   cppcaml::cmi::cmiw::set_module_dirs(stdlib_dir, incdirs);

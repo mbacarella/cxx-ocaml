@@ -782,7 +782,21 @@ struct Translator {
   // Predefined exception globals (Match_failure/Assert_failure): a stable stamp per
   // name so the dump's first-appearance normalization is consistent within a file.
   std::unordered_map<std::string, int> predef_global_stamp_;
+  bool no_pervasives_ = false;  // -nopervasives: Stdlib not implicitly opened
   int next_exit_ = 0;  // static-exception ids (normalized in the dump, so value is free)
+
+  // A predefined exception's identity.  With pervasives (the default) it is
+  // reached through the implicit `open Stdlib`, i.e. its Stdlib re-export FIELD
+  // (`GETGLOBALFIELD Stdlib, N`), matching official ocamlc.  Under -nopervasives
+  // (stdlib.ml / camlinternalFormatBasics) Stdlib is not in scope, so its Predef
+  // global (`GETGLOBAL name`) is used -- which also avoids a self-reference when
+  // stdlib.ml itself writes `exception Match_failure = Match_failure`.
+  LamPtr predef_exn_ident(const std::string& name) {
+    if (!no_pervasives_)
+      if (auto sf = stdlib_fields.find(name); sf != stdlib_fields.end())
+        return field_of("Stdlib", sf->second);
+    return predef_global(name);
+  }
 
   // ===== The Switcher: a faithful port of lambda/switch.ml + matching.ml's
   // as_interval/call_switcher glue (see switcher_match below).  State that the
@@ -892,7 +906,7 @@ struct Translator {
   // raised predefined exception (Match_failure / Assert_failure).
   LamPtr raise_predef(const std::string& exn, const Location& loc) {
     auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
-    blk->args = {predef_global(exn), loc_block(loc)};
+    blk->args = {predef_exn_ident(exn), loc_block(loc)};
     auto r = mk(Lam::K::Prim); r->prim = Prim::Raise; r->args = {blk};
     return r;
   }
@@ -6491,11 +6505,11 @@ struct Translator {
       if (auto f = fm.find(name); f != fm.end())
         return field_of(global_of(*it), f->second);
     }
-    // A predefined exception's identity is the predef global -- checked BEFORE the
-    // stdlib_fields path so `exception Match_failure = Match_failure` while
-    // compiling stdlib.ml ITSELF doesn't resolve to `(field i Stdlib)` (a
-    // self-reference); the predef global is the same value Stdlib re-exports.
-    if (is_predef_exn_name(name)) return predef_global(name);
+    // A predefined exception: with pervasives it is the Stdlib re-export field,
+    // else (stdlib.ml itself / -nopervasives) the Predef global -- see
+    // predef_exn_ident.  Checked before the plain stdlib_fields path so the
+    // -nopervasives self-reference case stays on the predef global.
+    if (is_predef_exn_name(name)) return predef_exn_ident(name);
     if (auto sf = stdlib_fields.find(name); sf != stdlib_fields.end())
       return field_of("Stdlib", sf->second);
     return nullptr;
@@ -11484,18 +11498,14 @@ struct Translator {
         }
         return block_of(sci->tag, fs);
       }
-      // A predefined exception (Not_found, Match_failure, ...): ALWAYS use the
-      // predef global as its identity -- the same value Stdlib re-exports (so
-      // it's correct from any module) AND the same one exn_value/raise_predef use
-      // (so `raise`/`with` agree).  Crucially this is checked BEFORE the
-      // stdlib_fields path: now that stdlib.cmi carries these as fields, resolving
-      // them to `(field i Stdlib)` while COMPILING stdlib.ml itself
-      // (`exception Match_failure = Match_failure`) would be a self-reference ->
-      // "undefined global Stdlib referenced by Stdlib" at link.
+      // A predefined exception (Not_found, Match_failure, ...): its identity is
+      // the Stdlib re-export field with pervasives, else the Predef global (see
+      // predef_exn_ident).  Both point to the SAME underlying exception value, so
+      // `raise`/`with` still agree even if another site picks the other spelling.
       if (is_predef_exn_name(n)) {
-        if (!k->arg) return predef_global(n);
+        if (!k->arg) return predef_exn_ident(n);
         auto b = mk(Lam::K::Prim); b->prim = Prim::Makeblock; b->prim_arg = 0;
-        b->args = {predef_global(n), expr(**k->arg)};
+        b->args = {predef_exn_ident(n), expr(**k->arg)};
         b->blk_shape = {ValueKind::Gen, expr_kind(k->arg->get())};
         return b;
       }
@@ -16972,6 +16982,8 @@ struct Translator {
 
 static std::vector<std::string> g_module_dirs;
 void set_module_dirs(std::vector<std::string> dirs) { g_module_dirs = std::move(dirs); }
+static bool g_nopervasives = false;
+void set_nopervasives(bool b) { g_nopervasives = b; }
 
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
                                 const std::string& stdlib_dir, const std::string& file_name,
@@ -16989,6 +17001,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   Translator t;
   t.stdlib_dir = stdlib_dir;
   t.module_dirs_ = g_module_dirs;
+  t.no_pervasives_ = g_nopervasives;
   t.file_name_ = file_name;
   set_infer_stdlib_dir(stdlib_dir);  // the inferencer reads .cmi files too
   t.vk = infer_value_kinds(s);

@@ -181,5 +181,9 @@ std::string const_instruction(const LamPtr& c);
 // Extra -I directories searched (after the stdlib pattern) for a separately
 // compiled local module's .cmi -- enables cross-module separate compilation.
 void set_module_dirs(std::vector<std::string> dirs);
+// -nopervasives: Stdlib is NOT implicitly opened, so a predefined exception
+// resolves to its Predef global directly (GETGLOBAL) rather than through the
+// Stdlib re-export field (GETGLOBALFIELD Stdlib, N).
+void set_nopervasives(bool b);
 
 }  // namespace cppcaml::lambda
