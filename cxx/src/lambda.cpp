@@ -5112,7 +5112,8 @@ struct Translator {
     auto m = mem.find(prim);
     return m == mem.end() ? nullptr : &m->second;
   }
-  LamPtr prim_stub_body(const std::string& prim, const std::vector<LamPtr>& argv) {
+  LamPtr prim_stub_body(const std::string& prim, const std::vector<LamPtr>& argv,
+                        const std::string& operand = "") {
     int n = (int)argv.size();
     if (const std::string* sp = mem_access_spelling(prim)) {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp;
@@ -5130,7 +5131,40 @@ struct Translator {
       {"%lessequal", "caml_lessequal"}, {"%greaterthan", "caml_greaterthan"},
       {"%greaterequal", "caml_greaterequal"},
     };
-    if (auto it = poly.find(prim); it != poly.end() && n == 2) return cc(it->second);
+    if (auto it = poly.find(prim); it != poly.end() && n == 2) {
+      // Type-specialize the comparison when the operand kind is known (the
+      // eta-stub analog of Translprim.specialize_comparison), matching official
+      // ocamlc: int -> EQ/GEINT/caml_int_compare, float -> the `.` opcodes,
+      // string/boxints -> the typed C compare.  Mirrors the direct-application
+      // path (poly_cmp); an unknown/generic operand keeps the polymorphic call.
+      if (!operand.empty()) {
+        // %-prim -> pervasive operator spelling (poly_cmp maps that to IntCmp).
+        static const std::unordered_map<std::string, std::string> cmpop = {
+          {"%equal", "="}, {"%notequal", "<>"}, {"%lessthan", "<"},
+          {"%lessequal", "<="}, {"%greaterthan", ">"}, {"%greaterequal", ">="},
+        };
+        if (operand == "int") {
+          if (prim == "%compare") return ic("compare_ints");
+          return ic(poly_cmp(cmpop.at(prim)).first);
+        }
+        if (operand == "float") {
+          if (prim == "%compare") return ic("compare_floats");
+          return ic(poly_cmp(cmpop.at(prim)).first + ".");
+        }
+        if (operand == "string") {
+          if (prim == "%compare") return cc("caml_string_compare");
+          return cc("caml_string_" + poly_cmp(cmpop.at(prim)).second.substr(5));
+        }
+        if (operand == "int32" || operand == "int64" || operand == "nativeint") {
+          const char* mod = operand == "int32" ? "Int32."
+                          : operand == "int64" ? "Int64." : "Nativeint.";
+          if (prim != "%compare") return ic(mod + poly_cmp(cmpop.at(prim)).first);
+          // %compare on a boxed int keeps the polymorphic call (no dedicated
+          // int-compare spelling in the direct path either).
+        }
+      }
+      return cc(it->second);
+    }
     // physical equality as a value (`List.filter ((!=) t)` in out_type.ml's
     // remove_delay -- bootstrap bug#13): the EQ/NEQ word comparison
     if (prim == "%eq" && n == 2) return ic("==");
@@ -5294,7 +5328,14 @@ struct Translator {
   // applying the primitive to its parameters: `compare` -> `(function prim prim
   // stub (caml_compare prim prim))`, `succ` -> `(function prim stub (1+ prim))`.
   // Returns null for prims we don't lower this way.
-  LamPtr prim_stub(const StdPrim& p) {
+  // The operand kind for a comparison primitive used as a value (from the
+  // inferencer's cmp_operand side-table), so the eta-stub can specialize.
+  std::string cmp_operand_of(const Expression* e) {
+    if (!e) return "";
+    auto it = vk.cmp_operand.find(e);
+    return it == vk.cmp_operand.end() ? std::string() : it->second;
+  }
+  LamPtr prim_stub(const StdPrim& p, const std::string& operand = "") {
     bool poly = p.name == "%compare" || p.name == "%equal" || p.name == "%notequal" ||
                 p.name == "%lessthan" || p.name == "%lessequal" ||
                 p.name == "%greaterthan" || p.name == "%greaterequal";
@@ -5306,7 +5347,7 @@ struct Translator {
       fn->params.push_back({pp, ValueKind::Gen});
       auto v = mk(Lam::K::Var); v->var = pp; argv.push_back(v);
     }
-    LamPtr body = prim_stub_body(p.name, argv);
+    LamPtr body = prim_stub_body(p.name, argv, operand);
     if (!body) return nullptr;
     fn->body = body;
     return fn;
@@ -11591,7 +11632,7 @@ struct Translator {
         auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
         if (auto pi = stdlib_prims.find(l->name); pi != stdlib_prims.end())  // prim as value
-          if (LamPtr s = prim_stub(pi->second)) return s;
+          if (LamPtr s = prim_stub(pi->second, cmp_operand_of(&e))) return s;
       }
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
@@ -11651,7 +11692,7 @@ struct Translator {
           if (auto pv = prim_value(sp.name)) return pv;
           // Otherwise a primitive in value position eta-expands to a stub
           // (`Int64.add` -> `(function p p stub (Int64.add p p))`).
-          if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) return s;
+          if (!sp.name.empty()) if (LamPtr s = prim_stub(sp, cmp_operand_of(&e))) return s;
         }
       // Qualified M.S.x through a *local* deep module path (alias chains,
       // first-class-module members): resolve the prefix, field-read the member.

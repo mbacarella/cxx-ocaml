@@ -9217,6 +9217,16 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
     vk.expr[e] = kind_str(t, ck.immediate_types_);
     std::string ek;
     if (array_elem_str(t, ck.immediate_types_, ek)) vk.array_elem[e] = ek;  // "" = gen element
+    // A function-typed reference whose first parameter is a specializable base
+    // type: record the operand kind so an eta-expanded comparison primitive
+    // lowers to the type-specialized comparison (int_replace_polymorphic_compare
+    // -- `let (=) : int -> int -> bool = Stdlib.(=)`).
+    if (TypePtr rt = I::Engine::repr(t); rt->kind == I::Type::Kind::Arrow) {
+      std::string dk = kind_str(rt->dom, ck.immediate_types_);
+      if (dk == "int" || dk == "float" || dk == "string" || dk == "int32" ||
+          dk == "int64" || dk == "nativeint")
+        vk.cmp_operand[e] = dk;
+    }
     TypePtr r = I::Engine::repr(t);
     if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
       vk.expr_constr[e] = r->path;  // module-qualified type, e.g. "Gc.stat"

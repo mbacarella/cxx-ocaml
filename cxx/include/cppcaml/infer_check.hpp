@@ -128,6 +128,12 @@ struct ValueKinds {
   // cannot disambiguate (Sign_diff.t.untypables@4 vs signature_symptom.untypables@8).
   struct FieldResolved { int index; bool mut; std::string kind; };
   std::unordered_map<const ast::Expression*, FieldResolved> field_resolved;
+  // For a comparison primitive used as a first-class VALUE (`let (=) : int -> int
+  // -> bool = Stdlib.(=)`), the kind_str of the instantiated FIRST-parameter type
+  // ("int"/"float"/"string"/"int32"/"int64"/"nativeint").  The eta-stub then
+  // lowers the generic caml_compare/caml_equal/... to the type-specialized
+  // opcode (Translprim.specialize_comparison), matching official ocamlc's .cmo.
+  std::unordered_map<const void*, std::string> cmp_operand;
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 
