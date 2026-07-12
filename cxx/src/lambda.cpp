@@ -811,6 +811,13 @@ struct Translator {
   std::unordered_map<std::string, int> predef_global_stamp_;
   bool no_pervasives_ = false;  // -nopervasives: Stdlib not implicitly opened
   int next_exit_ = 0;  // static-exception ids (normalized in the dump, so value is free)
+  // Decision-node budget for the general matrix matcher (gmatch): each gmatch call
+  // is one decision-tree node, so this caps the tree size.  A combinatorial matrix
+  // (a var row spreading across many tag x tag combinations, which we -- unlike
+  // matching.ml -- do NOT share via default sub-matrices) blows the budget and the
+  // matcher bails to the general path; healthy matches stay far under it.  Set by
+  // the gmatch entry points; env CPPCAML_GMBUDGET overrides for calibration.
+  int g_gm_budget_ = -1;  // <0 = inactive
 
   // A predefined exception's identity.  With pervasives (the default) it is
   // reached through the implicit `open Stdlib`, i.e. its Stdlib re-export FIELD
@@ -7311,6 +7318,13 @@ struct Translator {
     std::vector<const Pattern*> cols;
     const Expression* rhs;
     std::vector<std::pair<std::string, Ident>> binds;
+    // Action-sharing (gmatch_top): the arm this row belongs to.  `aid` is a static
+    // exit id whose handler is the arm body compiled ONCE; `vnames` is the arm's
+    // bound-variable names in canonical (exit-arg / catch-var) order.  A leaf emits
+    // `(exit aid <bound values>)` instead of duplicating the body.  -1 = not shared
+    // (the old inline-at-leaf path, used when gmatch is driven outside gmatch_top).
+    int aid = -1;
+    const std::vector<std::string>* vnames = nullptr;
   };
   // Guard mm_cols' preconditions: it assumes every column is a var/any, or a
   // constructor of a 1-const/1-block or all-constant type whose argument (if any)
@@ -8824,6 +8838,36 @@ struct Translator {
     return c;
   }
 
+  // Collect an arm pattern's bound-variable names in the same left-to-right order
+  // gmatch descends (constraint/open stripped without side effects; construct-arg,
+  // tuple, or-branches recursed; or-branches bind the same names -> dedup).  This
+  // fixes the canonical order shared by the exit args and the handler's catch-vars.
+  void collect_gvars(const Pattern* p, std::vector<std::string>& out) {
+    for (;;) {
+      if (auto* c = std::get_if<Ppat_constraint>(&p->desc)) { p = c->p.get(); continue; }
+      if (auto* o = std::get_if<Ppat_open>(&p->desc)) { p = o->p.get(); continue; }
+      break;
+    }
+    auto add = [&](const std::string& n) {
+      for (auto& x : out) if (x == n) return;
+      out.push_back(n);
+    };
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+      add(pa->name.txt); collect_gvars(pa->p.get(), out); return;
+    }
+    if (auto* pv = std::get_if<Ppat_var>(&p->desc)) { add(pv->name.txt); return; }
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
+      if (k->arg) collect_gvars(k->arg->get(), out); return;
+    }
+    if (auto* t = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (auto& e : t->elems) collect_gvars(e.get(), out); return;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+      collect_gvars(o->l.get(), out); collect_gvars(o->r.get(), out); return;
+    }
+    // any/constant/interval/record/array/variant/lazy: gmatch bails on these as
+    // columns, so no leaf ever binds through them -- nothing to collect here.
+  }
   // ===== general matrix matcher (matching.ml decomposition) ====================
   // Dispatch column 0 by head constructor via a dense Switch*/if, EXPANDING each
   // matched block constructor's fields into new leading columns, and recursing on
@@ -8836,10 +8880,23 @@ struct Translator {
   // shared fallback (uncovered tags -> `(exit deid)`), set up by gmatch_top.
   LamPtr gmatch(std::vector<LamPtr> comps, std::vector<MRow> rows,
                 const Location& mloc, int deid) {
+    if (g_gm_budget_ == 0) return nullptr;         // decision-tree too large: bail
+    if (g_gm_budget_ > 0) --g_gm_budget_;
     auto mkexit = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = deid; return e; };
     if (rows.empty()) return mkexit();
     if (comps.empty()) {                 // all columns consumed: first row wins
       auto& r = rows[0];
+      if (r.aid >= 0) {                  // action-sharing: exit to the shared handler
+        auto ex = mk(Lam::K::Staticraise); ex->prim_arg = r.aid;
+        for (auto& nm : *r.vnames) {
+          Ident id{}; bool found = false;
+          for (auto it = r.binds.rbegin(); it != r.binds.rend(); ++it)
+            if (it->first == nm) { id = it->second; found = true; break; }
+          if (!found) return nullptr;    // arm var never bound here -> bail (safe)
+          ex->args.push_back(varof(id));
+        }
+        return ex;
+      }
       scope.emplace_back();
       for (auto& [nm, id] : r.binds) scope.back()[nm] = id;
       LamPtr b = expr(*r.rhs);
@@ -8989,6 +9046,56 @@ struct Translator {
     }
     return const_dispatch(comps[0], consts);   // NB == 0
   }
+  // Action-sharing arm: an arm body compiled ONCE behind static exit `aid`, so a
+  // body reached from several matrix leaves (var-row spreading, or-patterns, or
+  // extra tuple columns) is emitted once, not duplicated.  `vnames` is the arm's
+  // bound-variable names in canonical order; `cvars`/`kinds` the handler's catch
+  // parameters that a leaf's `(exit aid <values>)` supplies in that same order.
+  struct GArm { int aid; const Expression* rhs; std::vector<std::string> vnames;
+                std::vector<Ident> cvars; std::vector<ValueKind> kinds; };
+  // The gmatch decision-node budget (env-overridable for calibration).
+  int gm_budget() {
+    static int b = [] {
+      const char* e = std::getenv("CPPCAML_GMBUDGET");
+      // 60 = calibrated on the 139 compiler modules: the total-opcode-divergence
+      // minimum (75018) with margin before the ctype-style combinatorial explosion
+      // that sets in past ~63; deeper matrices trade obj_tag for net-more BRANCH etc.
+      return e ? std::atoi(e) : 60;
+    }();
+    return b;
+  }
+  // Set up an arm from its full pattern (var collection) and body.  Allocates the
+  // exit id + fresh catch-vars; the caller points its MRow(s) at &a.vnames/a.aid.
+  GArm setup_garm(const Pattern* full, const Expression* rhs) {
+    GArm a; a.rhs = rhs;
+    collect_gvars(full, a.vnames);
+    a.aid = ++next_exit_;
+    for (size_t k = 0; k < a.vnames.size(); ++k) {
+      a.cvars.push_back(fresh("", true)); a.kinds.push_back(ValueKind::Gen);
+    }
+    return a;
+  }
+  // After gmatch produces `body` (whose leaves exit to each arm), compile each
+  // reachable handler ONCE and wire it in: inline single-use handlers (simplif
+  // then drops the `let cv = Lvar id` -> byte-identical to inline-at-leaf), keep a
+  // shared catch for genuinely-duplicated arms.
+  void wire_garms(LamPtr& body, std::vector<GArm>& arms) {
+    for (auto& a : arms) {
+      int bad = 0; int uses = count_exit(body, a.aid, false, bad);
+      if (uses == 0) continue;                       // arm unreachable (dead row)
+      scope.emplace_back();
+      for (size_t k = 0; k < a.vnames.size(); ++k) scope.back()[a.vnames[k]] = a.cvars[k];
+      LamPtr handler = expr(*a.rhs);
+      scope.pop_back();
+      if (uses == 1 && bad == 0)
+        inline_exit(body, a.aid, a.cvars, a.kinds, handler);
+      else {
+        auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = a.aid;
+        c->catch_vars = a.cvars; c->catch_var_kinds = a.kinds; c->then_ = handler;
+        body = c;
+      }
+    }
+  }
   // Entry for the general matrix matcher on a single scrutinee: peel a trailing
   // catch-all as the shared default (else Match_failure), run gmatch, and wrap the
   // fallback in a shared static-catch (inlined when used at most once).
@@ -8997,16 +9104,24 @@ struct Translator {
     for (auto& r : rows) if (r.guard) return nullptr;
     const Row* catchall = nullptr;
     std::vector<MRow> mrows;
+    std::vector<const Pattern*> apats;
     for (size_t i = 0; i < rows.size(); ++i) {
       if (i + 1 == rows.size() && is_catchall(*rows[i].lhs)) { catchall = &rows[i]; break; }
       MRow mr; mr.rhs = rows[i].rhs; mr.cols.push_back(rows[i].lhs); mrows.push_back(std::move(mr));
+      apats.push_back(rows[i].lhs);
     }
     if (mrows.empty()) return nullptr;
     LamPtr sv = scrut; Ident tv; bool need_temp = scrut->k != Lam::K::Var;
     if (need_temp) { tv = fresh("", true); sv = varof(tv); }
+    std::vector<GArm> arms(mrows.size());
+    for (size_t i = 0; i < mrows.size(); ++i) {
+      arms[i] = setup_garm(apats[i], mrows[i].rhs);
+      mrows[i].aid = arms[i].aid; mrows[i].vnames = &arms[i].vnames;
+    }
     int deid = ++next_exit_;
     LamPtr body = gmatch({sv}, mrows, mloc, deid);
-    if (!body) { --next_exit_; return nullptr; }
+    if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
+    wire_garms(body, arms);
     LamPtr dbody;
     if (catchall) {
       scope.emplace_back(); bind_catchall(*catchall->lhs, sv);
@@ -9021,6 +9136,72 @@ struct Translator {
       if (count_var(res, tv) <= 1) subst_var(res, tv, scrut);
       else { auto l = mk(Lam::K::Let); l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = res; res = l; }
     }
+    return res;
+  }
+  // General matrix matcher on a tuple-literal scrutinee (`match e1, e2 with ..`),
+  // the multi-column analogue of gmatch_top and the fallback when multi_match bails
+  // on a shape it can't model (nested/multi-block columns).  Splits the scrutinee
+  // into per-component values (no tuple allocation, like multi_match), runs gmatch
+  // over the k columns, and shares each arm body via a static exit (action-sharing)
+  // -- which is what makes multi-column matching a net win: without it the matrix's
+  // row-spreading/or-expansion would duplicate bodies faster than switches replace
+  // the caml_obj_tag if-chains.  Only a `_` trailing catch-all is peeled (a named
+  // catch-all binds the whole tuple, never materialized here -> bail); exception
+  // rows are handled by the caller before this is reached.
+  LamPtr gmatch_tuple_top(const Pexp_tuple* tu, const std::vector<Row>& vrows,
+                          const Location& mloc) {
+    size_t k = tu->elems.size();
+    if (k < 2) return nullptr;
+    const Row* catchall = nullptr;
+    std::vector<std::pair<const Row*, std::vector<std::vector<const Pattern*>>>> srcs;
+    for (size_t i = 0; i < vrows.size(); ++i) {
+      if (vrows[i].guard) return nullptr;
+      if (i + 1 == vrows.size() && is_catchall(*vrows[i].lhs)) {
+        if (!std::holds_alternative<Ppat_any>(vrows[i].lhs->desc)) return nullptr;
+        catchall = &vrows[i]; break;
+      }
+      std::vector<const Pattern*> alts; flatten_or(vrows[i].lhs, alts);
+      std::vector<std::vector<const Pattern*>> altcols;
+      for (auto* a : alts) {
+        auto* tp = std::get_if<Ppat_tuple>(&effective_pat(a)->desc);
+        if (!tp || tp->elems.size() != k) return nullptr;
+        for (auto& lbl : tp->labels) if (lbl) return nullptr;   // labeled tuple: bail
+        std::vector<const Pattern*> cols;
+        for (auto& el : tp->elems) cols.push_back(el.get());
+        altcols.push_back(std::move(cols));
+      }
+      srcs.push_back({&vrows[i], std::move(altcols)});
+    }
+    if (srcs.empty()) return nullptr;
+    std::vector<LamPtr> comps; std::vector<Lam::Binding> temps;
+    for (auto& el : tu->elems) {
+      LamPtr v = expr(*el);
+      if (v->k != Lam::K::Var) { Ident t = fresh("", true); temps.push_back({t, expr_kind(el.get()), v}); v = varof(t); }
+      comps.push_back(v);
+    }
+    std::vector<GArm> arms(srcs.size());
+    for (size_t i = 0; i < srcs.size(); ++i)
+      arms[i] = setup_garm(srcs[i].first->lhs, srcs[i].first->rhs);
+    std::vector<MRow> mrows;
+    for (size_t i = 0; i < srcs.size(); ++i)
+      for (auto& cols : srcs[i].second) {
+        MRow mr; mr.rhs = srcs[i].first->rhs; mr.cols = cols;
+        mr.aid = arms[i].aid; mr.vnames = &arms[i].vnames;
+        mrows.push_back(std::move(mr));
+      }
+    int deid = ++next_exit_;
+    g_gm_budget_ = gm_budget();
+    LamPtr body = gmatch(comps, mrows, mloc, deid);
+    g_gm_budget_ = -1;
+    if (!body) return nullptr;
+    wire_garms(body, arms);
+    LamPtr dbody = catchall ? expr(*catchall->rhs) : raise_predef("Match_failure", mloc);
+    int bad = 0; int uses = count_exit(body, deid, false, bad);
+    LamPtr res;
+    if (uses == 0) res = body;
+    else if (uses == 1 && bad == 0) { inline_exit(body, deid, {}, {}, dbody); res = body; }
+    else { auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = deid; c->then_ = dbody; res = c; }
+    if (!temps.empty()) { auto l = mk(Lam::K::Let); l->bindings = std::move(temps); l->body = res; res = l; }
     return res;
   }
   // Drive a `<ctor pattern> -> body | _ -> fallback` match.  One failure point (a
@@ -10899,9 +11080,13 @@ struct Translator {
       // Multiple values (`match e1, e2 with ..`): match the components
       // column-by-column without building the tuple.
       if (frows.empty() && !vrows.empty())
-        if (auto* tu = std::get_if<Pexp_tuple>(&m->e->desc))
+        if (auto* tu = std::get_if<Pexp_tuple>(&m->e->desc)) {
           if (LamPtr r = multi_match(tu, vrows, erows, e.loc))
             return r;
+          if (erows.empty())
+            if (LamPtr r = gmatch_tuple_top(tu, vrows, e.loc))
+              return r;
+        }
       if (!erows.empty() && !vrows.empty() && frows.empty()) {
         int eid = ++next_exit_;
         auto ex = mk(Lam::K::Staticraise);
