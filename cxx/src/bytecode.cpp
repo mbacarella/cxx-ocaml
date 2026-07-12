@@ -562,6 +562,21 @@ struct Bytegen {
             if (exp->args.size() == 2 && exp->args[1]->k == K::ConstInt && is_immed(-exp->args[1]->int_val))
               return comp_expr(env, exp->args[0], sz, cons(Iop(Op::Offsetint, -(int)exp->args[1]->int_val), cont));
             break;
+          case Prim::EqInt:
+          case Prim::NotEqInt:
+            // (Peqint/Pneqint [arg; const]) -> reorder to [const; arg] so the
+            // constant lands in the accumulator and the emitcode branch/compare
+            // peephole (Push; Const; cmp; branch -> BEQ/BNEQ n) fires -- the same
+            // reordering IntCmp does below.  Eq/Neq are symmetric, so no swap.
+            // Without it a `match n with C -> ..` int test emitted the unfused
+            // `Const; Push; Neqint; Branchifnot` instead of ocamlc's `BNEQ n`.
+            if (exp->args.size() == 2 &&
+                (exp->args[1]->k == K::ConstInt || exp->args[1]->k == K::ConstChar)) {
+              auto e2 = lambda::lam_alloc_copy(*exp);
+              e2->args = {exp->args[1], exp->args[0]};
+              return comp_args(env, e2->args, sz, cons(comp_primitive(e2), cont));
+            }
+            break;
           case Prim::IntCmp:
             if (exp->prim_id == "&&" && exp->args.size() == 2)
               return comp_seq_and(env, exp->args[0], exp->args[1], sz, cont);
