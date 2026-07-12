@@ -1626,6 +1626,19 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
   auto p = dummy_pos();
   return o::vblock(0, {p, p, o::vint(1)});
 }
+// Shape.Uid.t marshal repr.  Constant ctor Internal -> immediate 0.  Non-constant
+// ctors in declaration order: Compilation_unit(0), Item(1), Local_opaque_item(2),
+// Predef(3).  Item's `from` is Unit_info.intf_or_impl = Intf(0) | Impl(1).
+o::ValPtr emit_uid(const cmiw::Uid& u) {
+  switch (u.k) {
+    case cmiw::Uid::Item:
+      return o::vblock(1, {o::vstr(u.unit), o::vint(u.id), o::vint(u.intf ? 0 : 1)});
+    case cmiw::Uid::CompUnit: return o::vblock(0, {o::vstr(u.unit)});
+    case cmiw::Uid::Predef:   return o::vblock(3, {o::vstr(u.unit)});
+    case cmiw::Uid::Internal: break;
+  }
+  return o::vint(0);  // Internal
+}
 }  // namespace
 
 // Visible local modules threaded through nested signatures so a dotted type
@@ -1951,7 +1964,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         valkind = o::vblock(0, {desc});  // Val_prim
       }
       auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, loc_none(),
-                                 o::vint(0) /*[] attrs*/, o::vint(0) /*Uid.Internal*/});
+                                 o::vint(0) /*[] attrs*/, emit_uid(it.uid)});
       sig.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
     } else if (it.k == SigItem::Module) {
       // Sig_module(id, Mp_present, module_declaration, rec_status, visibility).
@@ -1997,7 +2010,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, item_stamp[i]))});  // Mty_signature
       }
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
-                              o::vint(0) /*md_uid*/});  // module_declaration
+                              emit_uid(it.uid)});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(presence), md,
                                   o::vint(it.rec_status) /*Trec_*/,
                                   o::vint(0) /*Exported*/}));  // Sig_module
@@ -2020,7 +2033,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       if (!mto)
         mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes))})});  // Some(Mty_signature)
       auto mtd = o::vblock(0, {mto, o::vint(0) /*attrs*/,
-                               loc_none(), o::vint(0) /*mtd_uid*/});  // modtype_declaration
+                               loc_none(), emit_uid(it.uid)});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
     } else if (it.k == SigItem::Exception) {
       // Sig_typext(id, extension_constructor, ext_status, vis).  A plain
@@ -2050,7 +2063,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                      loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
+                                      loc_none(), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
         }
         cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
       } else {
@@ -2067,7 +2080,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                   tparams.empty() ? o::vint(0) : o::vlist(tparams),  // ext_type_params
                                   cargs, ret,
                                   o::vint(it.type_private ? 0 : 1) /*ext_private*/,
-                                  loc_none(), o::vint(0) /*ext_attributes*/, o::vint(0) /*ext_uid*/});
+                                  loc_none(), o::vint(0) /*ext_attributes*/, emit_uid(it.uid)});
       sig.push_back(o::vblock(2, {ident, extcon, o::vint(status),
                                   o::vint(0) /*Exported*/}));  // Sig_typext
     } else if (it.k == SigItem::Class) {
@@ -2265,7 +2278,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
               auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
               lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                           o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                          loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
+                                          loc_none(), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
             }
             cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
           } else {
@@ -2275,7 +2288,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           }
           auto cres = c.res ? o::vblock(0, {te.emit(c.res)}) : o::vint(0);  // cd_res Some/None
           cds.push_back(o::vblock(0, {cid, cargs, cres, loc_none(),
-                                      o::vint(0) /*attrs*/, o::vint(0) /*Uid.Internal*/}));
+                                      o::vint(0) /*attrs*/, emit_uid(c.uid)}));
         }
         // variant_representation: Variant_regular (0) or Variant_unboxed (1),
         // the latter for a single single-field ctor marked `[@@unboxed]`.
@@ -2287,7 +2300,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                      loc_none(), o::vint(0) /*attrs*/, o::vint(0) /*Uid*/}));
+                                      loc_none(), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
         }
         // record_representation: Record_regular (const 0) or, for a single-field
         // `[@@unboxed]` record, Record_unboxed of bool (block tag 0; false = not
@@ -2339,7 +2352,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
             return o::vlist({attr});
           }(),
           o::vint(it.type_immediate), o::vint(0),      // type_immediate, unboxed false
-          o::vint(0)});                                // type_uid = Uid.Internal
+          emit_uid(it.uid)});                          // type_uid
       sig.push_back(o::vblock(1, {ident, tdecl,
                                   // Trec_first, or Trec_next for the `and`
                                   // members of a mutually-recursive group;
@@ -2395,9 +2408,66 @@ std::string module_cmi_crc(const std::string& mod) {
   return read_cmi_self_crc(resolve_cmi_global(mod));
 }
 
+// Assign Shape.Uid to every genuinely-new declaration in the current unit,
+// mirroring the typer's traversal so the ids match ocamlc's byte-for-byte:
+// signature items in document order; a `type .. and ..` recursion group (a head
+// with rec_status 0/1/-1 followed by rec_status==2 continuations) is TWO-PASS --
+// all its type_uids first, then all its ctor/label uids (an inline-record ctor's
+// labels before its own cd_uid); a submodule's contents get uids before the
+// module's own (post-order).  `c` is the per-unit counter (shared, starts 0).
+// NOTE: does not yet PRESERVE uids for include/functor/alias members (they carry
+// their source unit's uid) -- correct for self-contained modules; see the
+// byte-identity plan.
+static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
+                        bool intf, int& c) {
+  auto mk = [&]() { cmiw::Uid u; u.k = cmiw::Uid::Item; u.unit = unit;
+                    u.id = c++; u.intf = intf; return u; };
+  for (std::size_t i = 0; i < items.size();) {
+    SigItem& it = items[i];
+    if (it.k == SigItem::Type) {
+      std::size_t j = i + 1;  // gather the recursion group [i, j)
+      while (j < items.size() && items[j].k == SigItem::Type &&
+             items[j].rec_status == 2) ++j;
+      for (std::size_t k = i; k < j; ++k) items[k].uid = mk();  // pass 1: type_uids
+      int inline_ctors = 0;
+      for (std::size_t k = i; k < j; ++k) {                     // pass 2: ctors/labels
+        for (auto& ct : items[k].ctors) {
+          for (auto& l : ct.inline_record) l.uid = mk();  // inline labels before cd
+          ct.uid = mk();
+          if (!ct.inline_record.empty()) ++inline_ctors;
+        }
+        for (auto& l : items[k].labels) l.uid = mk();
+      }
+      // Pass 3: each inline-record constructor made datarepr build a HIDDEN
+      // record type_declaration (typing/datarepr.ml ~94), burning 5 uids that
+      // never reach the signature -- advance the counter so the NEXT visible
+      // decl's id matches ocamlc (measured constant: 5 per inline-record ctor,
+      // independent of field count; e.g. outcometree's out_type group = 2 -> 10).
+      c += 5 * inline_ctors;
+      i = j;
+    } else if (it.k == SigItem::Value) {
+      it.uid = mk(); ++i;
+    } else if (it.k == SigItem::Exception) {
+      it.uid = mk();
+      for (auto& ct : it.ctors) for (auto& l : ct.inline_record) l.uid = mk();
+      ++i;
+    } else if (it.k == SigItem::Module) {
+      assign_uids(it.sub, unit, intf, c);  // contents first (post-order)
+      it.uid = mk(); ++i;
+    } else if (it.k == SigItem::Modtype) {
+      it.uid = mk(); ++i;
+    } else {
+      ++i;  // Class: uids not yet modelled
+    }
+  }
+}
+
 std::string write_cmi(const std::string& path, const std::string& modname,
-                      const std::vector<SigItem>& items,
-                      const std::vector<Import>& imports) {
+                      const std::vector<SigItem>& items_in,
+                      const std::vector<Import>& imports, bool intf) {
+  std::vector<SigItem> items = items_in;  // mutable copy: uids assigned in place
+  int uid_counter = 0;
+  assign_uids(items, modname, intf, uid_counter);
   std::map<std::string, bool> referenced;  // cited global unit -> needs real CRC
   int stamp = 300;
   auto header = o::vblock(0, {o::vstr(modname), o::vlist(emit_sig_items(items, referenced, stamp))});

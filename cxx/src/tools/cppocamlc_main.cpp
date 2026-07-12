@@ -221,8 +221,9 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     try {  // best-effort .cmi from inference (unless a hand-written .mli owns it)
       fs::path cmi_path = fs::path(cmo_out).replace_extension(".cmi");
       bool has_mli = fs::exists(fs::path(in_path).replace_extension(".mli"));
-      if (!has_mli)
-        cppcaml::cmi::cmiw::write_cmi(cmi_path.string(), mod, cppcaml::infer_signature(structure));
+      if (!has_mli)  // inferred from the .ml -> Impl provenance in the uids
+        cppcaml::cmi::cmiw::write_cmi(cmi_path.string(), mod,
+                                      cppcaml::infer_signature(structure), {}, /*intf=*/false);
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
     }

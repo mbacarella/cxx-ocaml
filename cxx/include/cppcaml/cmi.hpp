@@ -260,6 +260,19 @@ std::string print_module_type(const ModuleType& mt);
 // (predefined constructors first, then arrows / tuples / variables).
 namespace cmiw {
 
+// Shape.Uid.t (typing/shape.ml).  Every declaration in a cmi carries one: a
+// genuinely-new decl in the current unit gets `Item{comp_unit; id; from}` with
+// `id` a per-unit counter (0,1,2,.. in typing-traversal order); a decl pulled
+// in via include/functor/alias keeps its ORIGINAL uid (its own comp_unit+id),
+// read from the source cmi.  `Internal` (the default) marshals as the immediate
+// 0 -- what the writer emitted before uids were modelled.
+struct Uid {
+  enum K { Internal, Item, Predef, CompUnit } k = Internal;
+  std::string unit;   // Item: comp_unit;  Predef/CompUnit: the name
+  int id = 0;         // Item
+  bool intf = true;   // Item: `from` (Intf when compiling a .mli, else Impl)
+};
+
 struct Ty;
 using TyPtr = std::shared_ptr<Ty>;
 struct Ty {
@@ -322,7 +335,7 @@ struct Import { std::string name; std::string crc; };
 // One signature item, in source order.  A Type item emits Sig_type (it takes no
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
-struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty; };  // record field
+struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty; Uid uid; };  // record field
 // One member of a class body: a val (mut/virt) or a method (priv/virt).
 struct ClassField {
   std::string name; TyPtr ty;
@@ -339,6 +352,7 @@ struct Ctor {
                                      // non-empty, takes precedence over args
   TyPtr res;                         // cd_res: GADT return (`Any : 'a -> any`);
                                      // null = ordinary constructor
+  Uid uid;
 };
 struct SigItem;
 struct SigItem {
@@ -471,6 +485,9 @@ struct SigItem {
   // Modtype: an ABSTRACT declaration `module type S` -- mtd_type = None
   // (Printtyp prints it back as bare `module type S`).
   bool modtype_abstract = false;
+  // This item's Shape.Uid, assigned by write_cmi's assign_uids pass (kept last
+  // so the positional aggregate initialisers above stay valid).
+  Uid uid;
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
                                   std::vector<SigItem> param_sig,
@@ -575,7 +592,7 @@ void set_module_dirs(const std::string& stdlib_dir,
 // prepended automatically with the computed CRC).  Returns the self-CRC.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
-                      const std::vector<Import>& imports = {});
+                      const std::vector<Import>& imports = {}, bool intf = true);
 // Convenience: a values-only signature.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<std::pair<std::string, TyPtr>>& values,
