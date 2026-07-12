@@ -7944,6 +7944,17 @@ struct Translator {
   bool collect_binders(const Pattern& p0, const LamPtr& scrut,
                        std::vector<std::pair<Ident, LamPtr>>& out) {
     const Pattern* p = effective_pat(&p0);
+    // Materialize a non-trivial sub-scrutinee before reading several fields off
+    // it: `let Cell(Cell(a,b,c),..) = s` reads the inner cell (a field access)
+    // three times.  ocamlc binds that intermediate to an alias var and lets
+    // simplif inline it only when used at most once; passing the field-read
+    // expression straight into the recursion instead re-walks the access chain
+    // per sub-field (extra GETFIELDs).  Binding it here (and relying on
+    // wrap_binders to inline single-use temps) mirrors ocamlc exactly.
+    auto materialize = [&](const LamPtr& s) -> LamPtr {
+      if (s->k == Lam::K::Var) return s;
+      Ident t = fresh("", true); out.push_back({t, s}); return varof(t);
+    };
     if (std::holds_alternative<Ppat_any>(p->desc)) return true;
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
       Ident id = fresh(pv->name.txt);
@@ -7971,11 +7982,13 @@ struct Translator {
       return collect_binders(*pa->p, scrut, out);
     }
     if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
+      LamPtr sv = materialize(scrut);
       for (size_t i = 0; i < pt->elems.size(); ++i)
-        if (!collect_binders(*pt->elems[i], fieldimm((int)i, scrut), out)) return false;
+        if (!collect_binders(*pt->elems[i], fieldimm((int)i, sv), out)) return false;
       return true;
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      LamPtr sv = materialize(scrut);
       std::vector<std::string> flds;
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
       for (auto& [lbl, sub] : pr->fields) {
@@ -7988,14 +8001,14 @@ struct Translator {
           // body, so it isn't read until full saturation -- syntactic_arity).
           if (lid_last(lbl.txt) == "contents" && pr->fields.size() == 1) {
             auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut;
-            fm->prim_arg = 0; fm->args = {scrut};
+            fm->prim_arg = 0; fm->args = {sv};
             mutfield_reads_.insert(fm.get());
             if (!collect_binders(*sub, fm, out)) return false;
             continue;
           }
           return false;
         }
-        if (!collect_binders(*sub, field_read(fi, scrut), out)) return false;
+        if (!collect_binders(*sub, field_read(fi, sv), out)) return false;
       }
       return true;
     }
@@ -8015,6 +8028,7 @@ struct Translator {
         auto* pr = pk->arg ? std::get_if<Ppat_record>(&effective_pat(pk->arg->get())->desc)
                            : nullptr;
         if (!pr) return false;
+        LamPtr sv = materialize(scrut);
         auto& L = ci->second.rlabels;
         for (auto& [lbl, sub] : pr->fields) {
           int ix = -1;
@@ -8022,15 +8036,16 @@ struct Translator {
             if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
           if (ix < 0) return false;
           FieldInfo fi{ci->second.type, ix, ci->second.rfmut[ix], ci->second.rshape[ix]};
-          if (!collect_binders(*sub, field_read(&fi, scrut), out)) return false;
+          if (!collect_binders(*sub, field_read(&fi, sv), out)) return false;
           tag_inline_field_var(sub.get(), ci->second, ix);
         }
         return true;
       }
       auto fps = ctor_field_pats(pk, ci->second.arity);
       if ((int)fps.size() != ci->second.arity) return false;
+      LamPtr sv = materialize(scrut);
       for (size_t i = 0; i < fps.size(); ++i) {
-        if (!collect_binders(*fps[i], fieldimm((int)i, scrut), out)) return false;
+        if (!collect_binders(*fps[i], fieldimm((int)i, sv), out)) return false;
         if (auto* pv = std::get_if<Ppat_var>(&effective_pat(fps[i])->desc))
           if (auto* b = lookup(pv->name.txt)) apply_var_node_path(effective_pat(fps[i]), *b);
       }
@@ -8253,20 +8268,32 @@ struct Translator {
   // variable reads its field access -- inlined when used at most once, `=a`-aliased
   // (a field read is an alias) otherwise; exactly ocamlc's matcher + simplif.
   LamPtr wrap_binders(LamPtr body, std::vector<std::pair<Ident, LamPtr>>& binders) {
-    std::vector<Lam::Binding> aliases;
-    for (auto& [id, acc] : binders) {
+    // Fold OUTER-LAST (reverse order) into nested lets so a kept binding's access
+    // participates in later occurrence counts: a materialized sub-scrutinee temp
+    // whose only uses are inside another KEPT sibling binding (not in `body`) must
+    // still be counted -- count_var/subst_var descend into let-binding RHS, so
+    // wrapping inner bindings first exposes those uses.  A flat let with N
+    // bindings and N nested single-binding lets emit identical bytecode
+    // (comp_let evaluates each RHS in the scope of the prior ones), so ordering
+    // is preserved: the first binder ends up outermost, matching ocamlc's
+    // field-read order.
+    auto wraplet = [&](const Lam::Binding& b, LamPtr inner) {
+      auto l = mk(Lam::K::Let); l->bindings = {b}; l->body = inner; return l;
+    };
+    for (auto it = binders.rbegin(); it != binders.rend(); ++it) {
+      auto& id = it->first; auto& acc = it->second;
       // A lazy-force binder is an effectful computation: always kept, strict,
       // never inlined into its use (Simplif only inlines alias lets).
-      if (lazy_force_binders_.count(id.stamp))
-        aliases.push_back({id, ValueKind::Gen, acc, false});
-      else if (count_var(body, id) <= 1) subst_var(body, id, acc);
-      else if (is_mut_field_access(acc)) {  // mutable field -> StrictOpt (`=o`)
-        Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = acc;
-        b.strict_opt = true; aliases.push_back(b);
-      } else aliases.push_back({id, ValueKind::Gen, acc, is_field_access(acc)});
+      if (lazy_force_binders_.count(id.stamp)) {
+        body = wraplet({id, ValueKind::Gen, acc, false}, body); continue;
+      }
+      if (count_var(body, id) <= 1) { subst_var(body, id, acc); continue; }
+      Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = acc;
+      if (is_mut_field_access(acc)) b.strict_opt = true;   // mutable -> StrictOpt (`=o`)
+      else b.alias = is_field_access(acc);
+      body = wraplet(b, body);
     }
-    if (aliases.empty()) return body;
-    auto l = mk(Lam::K::Let); l->bindings = std::move(aliases); l->body = body; return l;
+    return body;
   }
   std::set<int> lazy_force_binders_;  // binder stamps holding a lazy force
   // An IMMUTABLE field read -- the alias (`=a`) class.  A mutable read
@@ -8297,6 +8324,15 @@ struct Translator {
     scope.emplace_back();
     std::vector<std::pair<Ident, LamPtr>> binders;  // bound var -> field-access path
     bool ok = true;
+    // Materialize a non-trivial sub-scrutinee before reading several fields off it
+    // (see collect_binders): a nested tuple/record off a field access is read once
+    // per sub-field; ocamlc binds that intermediate and lets simplif inline it only
+    // when single-use, so passing the field-read expression straight down re-walks
+    // the access chain.  wrap-style reverse folding below inlines single-use temps.
+    auto materialize = [&](const LamPtr& s) -> LamPtr {
+      if (s->k == Lam::K::Var) return s;
+      Ident t = fresh("", true); binders.push_back({t, s}); return varof(t);
+    };
     // Destructure a constructor field, binding its variables to the field-read
     // chain.  Handles a nested *tuple/record* sub-pattern (`Some (x, y)`,
     // `Ok {a; b}`) but bails on a nested constructor (it would add a tag test we
@@ -8315,10 +8351,12 @@ struct Translator {
         binders.push_back({id, acc}); destruct(*pa->p, acc); return;
       }
       if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
-        for (size_t i = 0; i < pt->elems.size(); ++i) destruct(*pt->elems[i], fieldimm((int)i, acc));
+        LamPtr sv = materialize(acc);
+        for (size_t i = 0; i < pt->elems.size(); ++i) destruct(*pt->elems[i], fieldimm((int)i, sv));
         return;
       }
       if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+        LamPtr sv = materialize(acc);
         std::vector<std::string> flds;
         for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
         for (auto& [lbl, sub] : pr->fields) {
@@ -8326,7 +8364,7 @@ struct Translator {
           const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
           tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
           if (!fi) { ok = false; return; }
-          destruct(*sub, field_read(fi, acc));
+          destruct(*sub, field_read(fi, sv));
         }
         return;
       }
@@ -8378,13 +8416,16 @@ struct Translator {
       body = i;
     }
     scope.pop_back();
-    std::vector<Lam::Binding> aliases;
-    for (auto& [id, fa] : binders) {
-      if (count_var(body, id) <= 1) subst_var(body, id, fa);
-      else aliases.push_back({id, ValueKind::Gen, fa, true});
+    // Reverse-fold into nested lets so a materialized sub-scrutinee whose uses are
+    // only inside kept sibling bindings is still counted (count_var descends into
+    // let-RHS); emits identically to a flat let.
+    for (auto it = binders.rbegin(); it != binders.rend(); ++it) {
+      auto& id = it->first; auto& fa = it->second;
+      if (count_var(body, id) <= 1) { subst_var(body, id, fa); continue; }
+      auto l = mk(Lam::K::Let); l->bindings = {{id, ValueKind::Gen, fa, true}};
+      l->body = body; body = l;
     }
-    if (aliases.empty()) return body;
-    auto l = mk(Lam::K::Let); l->bindings = std::move(aliases); l->body = body; return l;
+    return body;
   }
 
   // Match over constructor patterns of one variant type.  Two exact shapes:
