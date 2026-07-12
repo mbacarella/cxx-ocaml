@@ -11838,6 +11838,38 @@ static cmi::cmiw::Loc conv_loc(const ast::Location& l) {
   return r;
 }
 
+// A `with` refinement that carries a DESTRUCTIVE substitution (`:=`) forces
+// OCaml's Subst.signature over the ascribed module type, which relocates every
+// resulting declaration to the ascription's location (printtyp.mli's
+// `module Doc : Printers with type 'a printer := ..` -> all of Doc's members
+// carry line 100's loc, not Printers' original positions).  A plain `=`
+// refinement does NOT relocate (the members keep their source cmi locations).
+static bool with_has_destructive_subst(const ast::ModuleType& mt) {
+  auto* pw = std::get_if<Pmty_with>(&mt.desc);
+  if (!pw) return false;
+  for (auto& c : pw->constraints)
+    if (std::holds_alternative<Pwith_typesubst>(c) ||
+        std::holds_alternative<Pwith_modsubst>(c) ||
+        std::holds_alternative<Pwith_modtypesubst>(c))
+      return true;
+  return false;
+}
+static void relocate_sig_locs(std::vector<cmi::cmiw::SigItem>& items,
+                              const cmi::cmiw::Loc& loc);
+static void relocate_sig_item(cmi::cmiw::SigItem& si, const cmi::cmiw::Loc& loc) {
+  si.loc = loc;
+  for (auto& c : si.ctors) {
+    c.loc = loc;
+    for (auto& l : c.inline_record) l.loc = loc;
+  }
+  for (auto& l : si.labels) l.loc = loc;
+  relocate_sig_locs(si.sub, loc);
+}
+static void relocate_sig_locs(std::vector<cmi::cmiw::SigItem>& items,
+                              const cmi::cmiw::Loc& loc) {
+  for (auto& si : items) relocate_sig_item(si, loc);
+}
+
 static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     const ast::Signature& s,
     const std::unordered_map<std::string, const ast::Signature*>* outer,
@@ -12475,7 +12507,13 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           out.push_back(std::move(mitem));
         }
       }
-      if (out.size() > mbefore) out.back().loc = conv_loc(it.loc);
+      if (out.size() > mbefore) {
+        out.back().loc = conv_loc(it.loc);
+        // `module M : S with type t := ..`: the destructive subst relocates
+        // every member of M to the ascription's location.
+        if (pm->md.type && with_has_destructive_subst(*pm->md.type))
+          relocate_sig_locs(out.back().sub, conv_loc(pm->md.type->loc));
+      }
     } else if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
       std::size_t mtbefore = out.size();
       // `module type S = sig .. end`: emit it so a functor parameter typed by S
@@ -12505,7 +12543,11 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           out.push_back(std::move(s));
         }
       }
-      if (out.size() > mtbefore) out.back().loc = conv_loc(it.loc);
+      if (out.size() > mtbefore) {
+        out.back().loc = conv_loc(it.loc);
+        if (pmt->type && with_has_destructive_subst(*pmt->type))
+          relocate_sig_locs(out.back().sub, conv_loc(pmt->type->loc));
+      }
     } else if (std::get_if<Psig_class>(&it.desc) ||
                std::get_if<Psig_class_type>(&it.desc)) {
       // `class c : <arrows> -> object .. end` / `class type ct = object .. end`
@@ -12613,6 +12655,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         first = false;
       }
     } else if (auto* pinc = std::get_if<Psig_include>(&it.desc)) {
+      std::size_t incbefore = out.size();
       // `include module type of M`: splice M's compiled cmi signature here so the
       // .cmi records M's values (with prim flags) and types -- otherwise the
       // included members are absent and the field layout is short of the .cmo.
@@ -12681,6 +12724,14 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         // Module substitutions stay layout-handled elsewhere (see above).
         apply_with_constraints(ck, pinc->mt, items, /*depth_bias=*/0);
         for (auto& si : items) out.push_back(std::move(si));
+      }
+      // `include S with type t := ..`: the destructive subst relocates every
+      // spliced member to the included module-type expression's location
+      // (identifiable.mli's `include Hashtbl.HashedType with type t := t`).
+      if (with_has_destructive_subst(pinc->mt)) {
+        cmi::cmiw::Loc rl = conv_loc(pinc->mt.loc);
+        for (std::size_t i = incbefore; i < out.size(); ++i)
+          relocate_sig_item(out[i], rl);
       }
     }
   }
