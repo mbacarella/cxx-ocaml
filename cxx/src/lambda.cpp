@@ -943,7 +943,9 @@ struct Translator {
   // through the `Stdlib` re-export field that a user-written `Match_failure` ref
   // resolves to (predef_exn_ident); so use predef_global here regardless of
   // pervasives.
-  LamPtr raise_predef(const std::string& exn, const Location& loc) {
+  LamPtr raise_predef(const std::string& exn, const Location& loc, const char* site = "?") {
+    if (exn == "Match_failure" && cppcaml::dbg_env("MFDBG"))
+      fprintf(stderr, "[MFDBG] Match_failure site=%s\n", site);
     auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
     blk->args = {predef_global(exn), loc_block(loc)};
     auto r = mk(Lam::K::Prim); r->prim = Prim::Raise; r->args = {blk};
@@ -7493,7 +7495,7 @@ struct Translator {
   }
   LamPtr mm_cols(const std::vector<LamPtr>& comps, std::vector<MRow> rows,
                  size_t i, const Location& mloc) {
-    if (rows.empty()) return raise_predef("Match_failure", mloc);
+    if (rows.empty()) return raise_predef("Match_failure", mloc, "mm_empty");
     if (i == comps.size()) {
       auto& r = rows[0];
       scope.emplace_back();
@@ -7571,7 +7573,7 @@ struct Translator {
         if (keys.size() >= 2 && i + 1 < comps.size()) return nullptr;
         std::vector<MRow> dft;
         for (auto& r : rows) if (!is_ctor(r, i)) dft.push_back(bindv(r));
-        LamPtr acc = dft.empty() ? raise_predef("Match_failure", mloc)
+        LamPtr acc = dft.empty() ? raise_predef("Match_failure", mloc, "mm_ext_dft")
                                  : mm_cols(comps, dft, i + 1, mloc);
         if (!acc) return nullptr;
         for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
@@ -7621,7 +7623,7 @@ struct Translator {
         return r; };
       std::vector<MRow> dft_rows;
       for (auto& r : rows) if (!is_ctor(r, i)) dft_rows.push_back(bind(r));
-      LamPtr dft_body = dft_rows.empty() ? raise_predef("Match_failure", mloc)
+      LamPtr dft_body = dft_rows.empty() ? raise_predef("Match_failure", mloc, "mm_enum_dft")
                                          : mm_cols(comps, dft_rows, i + 1, mloc);
       if (!dft_body) return nullptr;
       auto sw = mk(Lam::K::Switch); sw->cond = comps[i];
@@ -8217,7 +8219,7 @@ struct Translator {
     }
     auto tc = type_ctors_.find(type);  // non-exhaustive -> Match_failure default
     if (tc == type_ctors_.end() || (int)arms.size() != tc->second.first + tc->second.second)
-      sw->sw_default = raise_predef("Match_failure", loc);
+      sw->sw_default = raise_predef("Match_failure", loc, "ctor_sw_dft");
     result = sw;
     return true;
   }
@@ -8652,7 +8654,7 @@ struct Translator {
     }
     // A missing constructor's slot raises Match_failure, or jumps to the shared
     // default (exit) when one was supplied (a catch context).
-    auto miss = [&] { return dflt ? dflt : raise_predef("Match_failure", mloc); };
+    auto miss = [&] { return dflt ? dflt : raise_predef("Match_failure", mloc, "ctor_miss"); };
     std::vector<Lam::SwitchCase> consts, blocks;
     for (int v = 0; v < NC; ++v)
       consts.push_back({v, cmap.count(v) ? cmap[v] : miss()});
@@ -9172,7 +9174,7 @@ struct Translator {
     if (catchall) {
       scope.emplace_back(); bind_catchall(*catchall->lhs, sv);
       dbody = expr(*catchall->rhs); scope.pop_back();
-    } else dbody = raise_predef("Match_failure", mloc);
+    } else dbody = raise_predef("Match_failure", mloc, "gmatch_dft");
     int bad = 0; int uses = count_exit(body, deid, false, bad);
     LamPtr res;
     if (uses == 0) res = body;                     // exhaustive: fallback unreachable
@@ -9241,7 +9243,7 @@ struct Translator {
     g_gm_budget_ = -1;
     if (!body) return nullptr;
     wire_garms(body, arms);
-    LamPtr dbody = catchall ? expr(*catchall->rhs) : raise_predef("Match_failure", mloc);
+    LamPtr dbody = catchall ? expr(*catchall->rhs) : raise_predef("Match_failure", mloc, "gmatch_tuple_dft");
     int bad = 0; int uses = count_exit(body, deid, false, bad);
     LamPtr res;
     if (uses == 0) res = body;
@@ -9453,7 +9455,7 @@ struct Translator {
         // no explicit catch-all: a guard failure falls to Match_failure (inlined
         // when single-use; ocamlc shares multi-use defaults behind a catch)
         if (LamPtr body = ctor_match(scrut, rows, mloc,
-                                     raise_predef("Match_failure", mloc)))
+                                     raise_predef("Match_failure", mloc, "guard_nocatch")))
           return body;
       }
     }
@@ -10185,30 +10187,7 @@ struct Translator {
   // ocamlc would *share* two equal bodies in a switch (which we don't model) so
   // we can bail to int_cases.  Returns "" for terms ocamlc's make_key rejects
   // (functions/letrec/loops) -- those are never shared, so never trigger a bail.
-  static std::string make_lam_key(const LamPtr& l) {
-    if (!l) return "_";
-    using K = Lam::K;
-    switch (l->k) {
-      case K::Function: case K::Letrec: case K::For: case K::While: return "";
-      case K::Var: return "v" + l->var.name + "#" + std::to_string(l->var.stamp);
-      case K::Mutvar: return "m" + l->var.name + "#" + std::to_string(l->var.stamp);
-      case K::ConstInt: return "i" + std::to_string(l->int_val);
-      case K::ConstChar: return "c" + std::to_string(l->int_val);
-      case K::ConstFloat: return "f" + l->str_val;
-      case K::ConstString: return "s" + l->str_val;
-      default: break;
-    }
-    std::string r = "(" + std::to_string((int)l->k);
-    if (l->k == K::Prim) r += ":" + std::to_string((int)l->prim) + ":" + l->prim_id + ":" + std::to_string(l->prim_arg);
-    auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key(c); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
-    add(l->fn); add(l->cond); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
-    for (auto& a : l->args) add(a);
-    for (auto& b : l->bindings) { if (!r.empty()) r += " b" + std::to_string(b.id.stamp); add(b.val); }
-    for (auto& sc : l->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
-    for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
-    if (r.empty()) return "";
-    return r + ")";
-  }
+  static std::string make_lam_key(const LamPtr& l) { return cppcaml::lambda::make_lam_key(l); }
   // Entry point: an int/char-constant match with a trailing catch-all.  Returns
   // null (deferring to int_cases) unless at least one jump table is generated --
   // i.e. unless ocamlc would emit a switch rather than a plain if-chain.
@@ -10800,7 +10779,7 @@ struct Translator {
         for (auto& ch : choices) rows.push_back({a, r.rhs, r.guard, als, std::move(ch)});
       }
     }
-    LamPtr chain = raise_predef("Match_failure", mloc);
+    LamPtr chain = raise_predef("Match_failure", mloc, "naive_chain");
     for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
       LamPtr test;
       std::vector<std::pair<Ident, LamPtr>> binds;

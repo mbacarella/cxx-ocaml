@@ -163,6 +163,38 @@ struct Lam {
   std::vector<ValueKind> catch_var_kinds;
 };
 
+// Alpha-normalized structural key of a Lambda term (the analog of
+// Lambda.make_key): two terms with the same key are shared as one switch action
+// by the bytecode emitter, matching ocamlc's Bytegen.Storer.  Returns "" for
+// terms that ocamlc treats as Not_simple (closures / letrec / for / while), so
+// those are never shared.  Bound-var stamps are used literally (so distinct-var
+// arms are conservatively NOT merged), which under-shares relative to ocamlc but
+// never over-shares.
+inline std::string make_lam_key(const LamPtr& l) {
+  if (!l) return "_";
+  using K = Lam::K;
+  switch (l->k) {
+    case K::Function: case K::Letrec: case K::For: case K::While: return "";
+    case K::Var: return "v" + l->var.name + "#" + std::to_string(l->var.stamp);
+    case K::Mutvar: return "m" + l->var.name + "#" + std::to_string(l->var.stamp);
+    case K::ConstInt: return "i" + std::to_string(l->int_val);
+    case K::ConstChar: return "c" + std::to_string(l->int_val);
+    case K::ConstFloat: return "f" + l->str_val;
+    case K::ConstString: return "s" + l->str_val;
+    default: break;
+  }
+  std::string r = "(" + std::to_string((int)l->k);
+  if (l->k == K::Prim) r += ":" + std::to_string((int)l->prim) + ":" + l->prim_id + ":" + std::to_string(l->prim_arg);
+  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key(c); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+  add(l->fn); add(l->cond); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
+  for (auto& a : l->args) add(a);
+  for (auto& b : l->bindings) { if (!r.empty()) r += " b" + std::to_string(b.id.stamp); add(b.val); }
+  for (auto& sc : l->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
+  for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
+  if (r.empty()) return "";
+  return r + ")";
+}
+
 // Translate a structure into the module's Lambda term (the setglobal form).
 // `module_name` is the capitalized file basename (e.g. "L0").
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,

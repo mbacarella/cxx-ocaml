@@ -747,25 +747,42 @@ struct Bytegen {
     }
   }
 
-  // Lswitch: compile each action behind a label, then a Kswitch over the
-  // const/block tag vectors.  (No action sharing -- our switches have distinct
-  // arms -- and the only failaction case is sw_default.)
+  // Lswitch: dedup the actions (bytegen's Storer), compile each DISTINCT action
+  // once behind a label, then a Kswitch over the const/block tag vectors with
+  // gaps and repeated arms pointing at the shared label.  Mirrors
+  // Bytegen.comp_switch: the failaction (sw_default) is stored first (index 0),
+  // then the const cases, then the block cases, in source order, deduped by the
+  // alpha-normalized structural key (Lambda.make_key); distinct actions are then
+  // compiled in reverse index order so the offsets match ocamlc's.
   Code comp_switch(const Env& env, const LamPtr& exp, int sz, Code cont) {
     auto [branch, cont1] = make_branch(cont);
     Code c = discard_dead_code(cont1);
     int nconsts = (int)exp->sw_consts.size();
     int nblocks = (int)exp->sw_blocks.size();
+    // ---- Storer: assign each action an index, sharing structurally-equal ones.
+    std::vector<LamPtr> acts;
+    std::unordered_map<std::string, int> keymap;
+    auto store = [&](const LamPtr& act) -> int {
+      std::string key = lambda::make_lam_key(act);
+      if (!key.empty()) { auto it = keymap.find(key); if (it != keymap.end()) return it->second; }
+      int idx = (int)acts.size(); acts.push_back(act);
+      if (!key.empty()) keymap.emplace(std::move(key), idx);
+      return idx;
+    };
+    if (exp->sw_default) store(exp->sw_default);          // failaction is index 0
+    std::vector<int> act_consts(nconsts), act_blocks(nblocks);
+    for (int i = 0; i < nconsts; ++i) act_consts[i] = store(exp->sw_consts[i].body);
+    for (int i = 0; i < nblocks; ++i) act_blocks[i] = store(exp->sw_blocks[i].body);
+    // ---- compile the distinct actions in reverse index order.
+    std::vector<int> lbls(acts.size(), 0);
+    for (int i = (int)acts.size() - 1; i >= 0; --i) {
+      auto [lbl, c1] = label_code(comp_expr(env, acts[i], sz, cons(branch, c)));
+      lbls[i] = lbl; c = discard_dead_code(c1);
+    }
+    // ---- build the (position-indexed) label vectors, gaps share the failaction.
     std::vector<int> lbl_consts(nconsts, 0), lbl_blocks(nblocks, 0);
-    // actions in reverse: blocks (high tag first) then consts, so the lowest
-    // const tag's code ends up first -- matching the reverse loop in bytegen.
-    for (int i = nblocks - 1; i >= 0; --i) {
-      auto [lbl, c1] = label_code(comp_expr(env, exp->sw_blocks[i].body, sz, cons(branch, c)));
-      lbl_blocks[i] = lbl; c = discard_dead_code(c1);
-    }
-    for (int i = nconsts - 1; i >= 0; --i) {
-      auto [lbl, c1] = label_code(comp_expr(env, exp->sw_consts[i].body, sz, cons(branch, c)));
-      lbl_consts[i] = lbl; c = discard_dead_code(c1);
-    }
+    for (int i = 0; i < nconsts; ++i) lbl_consts[i] = lbls[act_consts[i]];
+    for (int i = 0; i < nblocks; ++i) lbl_blocks[i] = lbls[act_blocks[i]];
     Instr sw = I(Op::Switch);
     sw.nconsts = nconsts;
     sw.labels = lbl_consts;
