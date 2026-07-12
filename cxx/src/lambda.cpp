@@ -7332,6 +7332,10 @@ struct Translator {
     // (the old inline-at-leaf path, used when gmatch is driven outside gmatch_top).
     int aid = -1;
     const std::vector<std::string>* vnames = nullptr;
+    // A `when` guard on this row's arm (or nullptr).  At the all-columns-consumed
+    // leaf, a guarded row tests its guard in the matrix-bound scope and falls
+    // through to the next surviving row on failure (matching.ml's guarded action).
+    const Expression* guard = nullptr;
   };
   // Guard mm_cols' preconditions: it assumes every column is a var/any, or a
   // constructor of a 1-const/1-block or all-constant type whose argument (if any)
@@ -8995,24 +8999,47 @@ struct Translator {
     if (g_gm_budget_ > 0) --g_gm_budget_;
     auto mkexit = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = deid; return e; };
     if (rows.empty()) return mkexit();
-    if (comps.empty()) {                 // all columns consumed: first row wins
-      auto& r = rows[0];
-      if (r.aid >= 0) {                  // action-sharing: exit to the shared handler
-        auto ex = mk(Lam::K::Staticraise); ex->prim_arg = r.aid;
-        for (auto& nm : *r.vnames) {
-          Ident id{}; bool found = false;
-          for (auto it = r.binds.rbegin(); it != r.binds.rend(); ++it)
-            if (it->first == nm) { id = it->second; found = true; break; }
-          if (!found) return nullptr;    // arm var never bound here -> bail (safe)
-          ex->args.push_back(varof(id));
+    if (comps.empty()) {                 // all columns consumed: rows fully matched
+      // The first UNGUARDED row always fires (its pattern matched, no `when`).
+      // Guarded rows before it test their guard in the matrix-bound scope and, on
+      // failure, fall through to the next surviving row (matching.ml's guarded
+      // action) -- or to the shared default (deid) if every row was guarded.
+      auto row_action = [&](MRow& r) -> LamPtr {
+        if (r.aid >= 0) {                // action-sharing: exit to the shared handler
+          auto ex = mk(Lam::K::Staticraise); ex->prim_arg = r.aid;
+          for (auto& nm : *r.vnames) {
+            Ident id{}; bool found = false;
+            for (auto it = r.binds.rbegin(); it != r.binds.rend(); ++it)
+              if (it->first == nm) { id = it->second; found = true; break; }
+            if (!found) return nullptr;  // arm var never bound here -> bail (safe)
+            ex->args.push_back(varof(id));
+          }
+          return ex;
         }
-        return ex;
+        scope.emplace_back();
+        for (auto& [nm, id] : r.binds) scope.back()[nm] = id;
+        LamPtr b = expr(*r.rhs);
+        scope.pop_back();
+        return b;
+      };
+      size_t n = rows.size();            // rows after the first unguarded one are dead
+      for (size_t i = 0; i < rows.size(); ++i)
+        if (!rows[i].guard) { n = i + 1; break; }
+      LamPtr chain = mkexit();           // all guards failed -> shared default
+      for (size_t ii = n; ii-- > 0; ) {
+        MRow& r = rows[ii];
+        LamPtr act = row_action(r);
+        if (!act) return nullptr;
+        if (r.guard) {                   // if guard then action else <fall through>
+          scope.emplace_back();
+          for (auto& [nm, id] : r.binds) scope.back()[nm] = id;
+          LamPtr g = expr(*r.guard);
+          scope.pop_back();
+          auto iff = mk(Lam::K::IfThenElse);
+          iff->cond = g; iff->then_ = act; iff->else_ = chain; chain = iff;
+        } else chain = act;              // unguarded: always fires
       }
-      scope.emplace_back();
-      for (auto& [nm, id] : r.binds) scope.back()[nm] = id;
-      LamPtr b = expr(*r.rhs);
-      scope.pop_back();
-      return b;
+      return chain;
     }
     // Peel `pat as x` and constraints/opens in column 0 (bind x to this column).
     for (auto& r : rows)
@@ -9112,13 +9139,13 @@ struct Translator {
           if (!ci->is_block || ci->tag != t) continue;
           auto fps = ctor_field_pats(k, a);
           if ((int)fps.size() != a) return nullptr;       // shape we can't split
-          MRow nr; nr.rhs = r.rhs; nr.binds = r.binds;
+          MRow nr; nr.rhs = r.rhs; nr.binds = r.binds; nr.guard = r.guard;
           for (auto* fp : fps) nr.cols.push_back(fp);
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
         } else {
           bind0(r);
-          MRow nr; nr.rhs = r.rhs; nr.binds = r.binds;
+          MRow nr; nr.rhs = r.rhs; nr.binds = r.binds; nr.guard = r.guard;
           for (int j = 0; j < a; ++j) nr.cols.push_back(&any_pat);
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
@@ -9212,13 +9239,17 @@ struct Translator {
   // fallback in a shared static-catch (inlined when used at most once).
   LamPtr gmatch_top(const LamPtr& scrut, const std::vector<Row>& rows,
                     const Location& mloc) {
-    for (auto& r : rows) if (r.guard) return nullptr;
     const Row* catchall = nullptr;
     std::vector<MRow> mrows;
     std::vector<const Pattern*> apats;
     for (size_t i = 0; i < rows.size(); ++i) {
-      if (i + 1 == rows.size() && is_catchall(*rows[i].lhs)) { catchall = &rows[i]; break; }
-      MRow mr; mr.rhs = rows[i].rhs; mr.cols.push_back(rows[i].lhs); mrows.push_back(std::move(mr));
+      // Only an UNGUARDED trailing `_` is the unconditional default; `_ when g`
+      // stays a normal (guarded) row that can fall through to Match_failure.
+      if (i + 1 == rows.size() && !rows[i].guard && is_catchall(*rows[i].lhs)) {
+        catchall = &rows[i]; break;
+      }
+      MRow mr; mr.rhs = rows[i].rhs; mr.cols.push_back(rows[i].lhs);
+      mr.guard = rows[i].guard; mrows.push_back(std::move(mr));
       apats.push_back(rows[i].lhs);
     }
     if (mrows.empty()) return nullptr;
