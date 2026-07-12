@@ -10748,6 +10748,8 @@ static std::vector<int> compute_decl_variance(
   return acc;
 }
 
+static cmi::cmiw::Loc conv_loc(const ast::Location& l);  // defined below
+
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
@@ -10836,7 +10838,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
       std::vector<cmi::cmiw::Ctor> ctors;
       for (auto& c : var->ctors) {
-        cmi::cmiw::Ctor cc; cc.name = c.name.txt;
+        cmi::cmiw::Ctor cc; cc.name = c.name.txt; cc.loc = conv_loc(c.loc);
         if (c.res) cc.res = bridge_ty_named(fc(**c.res), bvars, nextvar, tvars, &dctx);
         if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
           for (auto& a : tup->elems) cc.args.push_back(bridge_ty_named(fc(*a), bvars, nextvar, tvars, &dctx));
@@ -10846,7 +10848,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
           // `Ctor {l = ..}` resolves the labels via the ctor's rlabels.
           for (auto& f : r->fields) {
             cmi::cmiw::Label lab;
-            lab.name = f.name.txt;
+            lab.name = f.name.txt; lab.loc = conv_loc(f.loc);
             lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
             lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar, &dctx);
@@ -10874,7 +10876,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       std::vector<cmi::cmiw::Label> labels;
       for (auto& f : rec->fields) {
         cmi::cmiw::Label lab;
-        lab.name = f.name.txt;
+        lab.name = f.name.txt; lab.loc = conv_loc(f.loc);
         lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
         lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar, &dctx);
@@ -11826,6 +11828,16 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
   }
 }
 
+// ast::Location -> the cmi writer's Loc (file_id resolved to pos_fname later, in
+// write_cmi via its filename table).
+static cmi::cmiw::Loc conv_loc(const ast::Location& l) {
+  cmi::cmiw::Loc r;
+  r.ghost = l.ghost;
+  r.start = {l.start.lnum, l.start.bol, l.start.cnum, l.start.file_id};
+  r.end = {l.end.lnum, l.end.bol, l.end.cnum, l.end.file_id};
+  return r;
+}
+
 static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     const ast::Signature& s,
     const std::unordered_map<std::string, const ast::Signature*>* outer,
@@ -12328,6 +12340,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
       out.push_back(cmi::cmiw::sig_value(pv->vd.name.txt,
                       bridge_ty_named(ck.from_coretype(*pv->vd.type, tvars), bvars, nextvar, tvars)));
+      out.back().loc = conv_loc(pv->vd.loc);
     } else if (auto* pr = std::get_if<Psig_primitive>(&it.desc)) {
       if (pr->pd.type && !pr->pd.prims.empty()) {
         std::unordered_map<std::string, TypePtr> tvars;
@@ -12354,6 +12367,9 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       if (!nonrec_)
         for (auto& d : pt->decls) ck.opened_type_quals_.erase(d.name.txt);
       emit_type_decls(ck, pt->decls, out, nonrec_);
+      // emit_type_decls appends one Type SigItem per declaration, in order.
+      for (std::size_t j = 0; before + j < out.size() && j < pt->decls.size(); ++j)
+        out[before + j].loc = conv_loc(pt->decls[j].loc);
       if (nonrec_)
         for (auto& d : pt->decls) ck.opened_type_quals_.erase(d.name.txt);
       // Under `open F(X)` in this signature, a nonrec self-manifest

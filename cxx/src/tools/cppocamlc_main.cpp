@@ -252,7 +252,8 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   std::ostringstream ss; ss << in.rdbuf();
   try {
     auto sig = cppcaml::parse_signature(ss.str());
-    cppcaml::cmi::cmiw::write_cmi(cmi_out, module_name(in_path), cppcaml::signature_to_cmi(sig));
+    cppcaml::cmi::cmiw::write_cmi(cmi_out, module_name(in_path), cppcaml::signature_to_cmi(sig),
+                                  {}, /*intf=*/true, /*src_files=*/{in_path});
   } catch (const cppcaml::ParseError& e) {
     std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
     return 1;

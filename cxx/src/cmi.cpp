@@ -1626,6 +1626,19 @@ o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
   auto p = dummy_pos();
   return o::vblock(0, {p, p, o::vint(1)});
 }
+// The source filenames for the cmi being written: [0] = the source path (file_id
+// 0), [k] = the k-th `# N "file"` directive.  Set by write_cmi; read by emit_loc
+// to resolve a position's file_id to its pos_fname.
+static std::vector<std::string> g_cmi_src_files;
+o::ValPtr emit_pos(const cmiw::WPos& p) {  // Lexing.position
+  const std::string& fn = (p.file_id >= 0 && (std::size_t)p.file_id < g_cmi_src_files.size())
+                              ? g_cmi_src_files[p.file_id] : g_cmi_src_files.empty() ? "" : g_cmi_src_files[0];
+  return o::vblock(0, {o::vstr(fn), o::vint(p.lnum), o::vint(p.bol), o::vint(p.cnum)});
+}
+o::ValPtr emit_loc(const cmiw::Loc& l) {  // Location.t
+  if (l.ghost) return loc_none();
+  return o::vblock(0, {emit_pos(l.start), emit_pos(l.end), o::vint(0) /*loc_ghost=false*/});
+}
 // Shape.Uid.t marshal repr.  Constant ctor Internal -> immediate 0.  Non-constant
 // ctors in declaration order: Compilation_unit(0), Item(1), Local_opaque_item(2),
 // Predef(3).  Item's `from` is Unit_info.intf_or_impl = Intf(0) | Impl(1).
@@ -1963,7 +1976,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                   repr_val(it.prim_repr_res)});
         valkind = o::vblock(0, {desc});  // Val_prim
       }
-      auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, loc_none(),
+      auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, emit_loc(it.loc),
                                  o::vint(0) /*[] attrs*/, emit_uid(it.uid)});
       sig.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
     } else if (it.k == SigItem::Module) {
@@ -2278,7 +2291,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
               auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
               lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                           o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                          loc_none(), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
+                                          emit_loc(l.loc), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
             }
             cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
           } else {
@@ -2287,7 +2300,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
             cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
           }
           auto cres = c.res ? o::vblock(0, {te.emit(c.res)}) : o::vint(0);  // cd_res Some/None
-          cds.push_back(o::vblock(0, {cid, cargs, cres, loc_none(),
+          cds.push_back(o::vblock(0, {cid, cargs, cres, emit_loc(c.loc),
                                       o::vint(0) /*attrs*/, emit_uid(c.uid)}));
         }
         // variant_representation: Variant_regular (0) or Variant_unboxed (1),
@@ -2300,7 +2313,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                      loc_none(), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
+                                      emit_loc(l.loc), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
         }
         // record_representation: Record_regular (const 0) or, for a single-field
         // `[@@unboxed]` record, Record_unboxed of bool (block tag 0; false = not
@@ -2338,7 +2351,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           }(),
           [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
           o::vint(0), o::vint(0),                      // is_newtype false, expansion_scope 0
-          loc_none(),                                  // type_loc
+          emit_loc(it.loc),                            // type_loc
           // type_attributes: Printtyp derives the printed `[@@immediate]` /
           // `[@@immediate64]` from Type_immediacy.of_attributes of THIS field (not
           // from type_immediate), so emit the real attribute when marked.
@@ -2464,7 +2477,9 @@ static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
 
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items_in,
-                      const std::vector<Import>& imports, bool intf) {
+                      const std::vector<Import>& imports, bool intf,
+                      const std::vector<std::string>& src_files) {
+  g_cmi_src_files = src_files;  // resolve position file_ids to pos_fname (emit_loc)
   std::vector<SigItem> items = items_in;  // mutable copy: uids assigned in place
   int uid_counter = 0;
   assign_uids(items, modname, intf, uid_counter);

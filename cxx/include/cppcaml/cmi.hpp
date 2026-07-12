@@ -273,6 +273,13 @@ struct Uid {
   bool intf = true;   // Item: `from` (Intf when compiling a .mli, else Impl)
 };
 
+// A declaration's source Location.t, mirroring ast::Location.  file_id resolves
+// to a filename at emit time via write_cmi's filename table (0 = source path,
+// >0 = a `# N "file"` directive).  Default = ghost -> Location.none (what the
+// writer emitted before locations were modelled).
+struct WPos { int lnum = 0, bol = 0, cnum = -1, file_id = 0; };
+struct Loc { WPos start, end; bool ghost = true; };
+
 struct Ty;
 using TyPtr = std::shared_ptr<Ty>;
 struct Ty {
@@ -335,7 +342,7 @@ struct Import { std::string name; std::string crc; };
 // One signature item, in source order.  A Type item emits Sig_type (it takes no
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
-struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty; Uid uid; };  // record field
+struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty; Uid uid; Loc loc; };  // record field
 // One member of a class body: a val (mut/virt) or a method (priv/virt).
 struct ClassField {
   std::string name; TyPtr ty;
@@ -353,6 +360,7 @@ struct Ctor {
   TyPtr res;                         // cd_res: GADT return (`Any : 'a -> any`);
                                      // null = ordinary constructor
   Uid uid;
+  Loc loc;
 };
 struct SigItem;
 struct SigItem {
@@ -488,6 +496,9 @@ struct SigItem {
   // This item's Shape.Uid, assigned by write_cmi's assign_uids pass (kept last
   // so the positional aggregate initialisers above stay valid).
   Uid uid;
+  // This declaration's source location (val_loc/type_loc/md_loc/...); ghost by
+  // default so unset items emit Location.none as before.
+  Loc loc;
 };
 inline SigItem sig_module_functor(std::string n, std::string param,
                                   std::vector<SigItem> param_sig,
@@ -592,7 +603,8 @@ void set_module_dirs(const std::string& stdlib_dir,
 // prepended automatically with the computed CRC).  Returns the self-CRC.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
-                      const std::vector<Import>& imports = {}, bool intf = true);
+                      const std::vector<Import>& imports = {}, bool intf = true,
+                      const std::vector<std::string>& src_files = {});
 // Convenience: a values-only signature.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<std::pair<std::string, TyPtr>>& values,
