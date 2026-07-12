@@ -8567,9 +8567,12 @@ struct Translator {
     if (NB < 1) return nullptr;  // const-only -> const_switch handles it
     bool exhaustive = (int)cseen.size() == NC && (int)brows.size() == NB;
     // A partial multi-block match over a type that ALSO has constant ctors needs
-    // the matcher's isint-split heuristic we don't replicate; bail.  (Pure-block
-    // types -- NC==0, e.g. result -- just fill missing tags with Match_failure.)
-    if (!exhaustive && NB >= 2 && NC >= 1) return nullptr;
+    // the matcher's isint-split heuristic we don't replicate; bail -- UNLESS a
+    // shared default (dflt) is supplied, in which case every uncovered value
+    // (const or block) simply routes to that default through the Switch*'s gap
+    // slots, so the isint split is unnecessary.  (Pure-block types -- NC==0, e.g.
+    // result -- just fill missing tags with Match_failure.)
+    if (!exhaustive && NB >= 2 && NC >= 1 && !dflt) return nullptr;
     // Eligible: compile covered arms, then fill missing ctors with Match_failure
     // (a missing constructor's slot raises, exactly as ocamlc fills partial matches).
     std::map<int, LamPtr> cmap, bmap;
@@ -8796,6 +8799,29 @@ struct Translator {
     if (count_var(inner, tv) <= 1) { subst_var(inner, tv, scrut); return inner; }
     auto l = mk(Lam::K::Let);
     l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = inner; return l;
+  }
+  // Drive a `C1 .. -> .. | C2 .. -> .. | .. | _ -> fallback` match: two or more
+  // unguarded constructor rows of one variant type followed by a trailing
+  // catch-all.  ocamlc lowers this as a Switch* over the tags with the shared
+  // fallback as the default for every uncovered tag; reuse ctor_match's Switch
+  // machinery by peeling the catch-all into a static-exit default (uncovered
+  // tags and failed sub-matches route to `(exit N)`, wrapped in a shared catch).
+  LamPtr ctor_match_catchall(const LamPtr& scrut, const std::vector<Row>& rows,
+                             const Location& mloc) {
+    if (rows.size() < 3) return nullptr;             // 2-row shape -> nested_match
+    const Row& last = rows.back();
+    if (last.guard || !is_catchall(*last.lhs)) return nullptr;
+    std::vector<Row> crows(rows.begin(), rows.end() - 1);
+    int eid = ++next_exit_;
+    auto exitL = mk(Lam::K::Staticraise); exitL->prim_arg = eid;
+    LamPtr m = ctor_match(scrut, crows, mloc, exitL);
+    if (!m) { --next_exit_; return nullptr; }        // not an all-ctor prefix
+    scope.emplace_back();                            // catch-all binder scopes its arm
+    bind_catchall(*last.lhs, scrut);
+    LamPtr fb = expr(*last.rhs);
+    scope.pop_back();
+    auto c = mk(Lam::K::Catch); c->cond = m; c->prim_arg = eid; c->then_ = fb;
+    return c;
   }
   // Drive a `<ctor pattern> -> body | _ -> fallback` match.  One failure point (a
   // single top constructor with simple fields) inlines the fallback as the else
@@ -9033,6 +9059,7 @@ struct Translator {
     if (auto sw = const_switch(scrut, rows)) return sw;
     if (auto ds = switcher_match(scrut, rows)) return ds;
     if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
+    if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
     if (LamPtr r = int_cases(scrut, rows, 0, /*strict=*/true)) return r;
