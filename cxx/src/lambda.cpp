@@ -8823,6 +8823,206 @@ struct Translator {
     auto c = mk(Lam::K::Catch); c->cond = m; c->prim_arg = eid; c->then_ = fb;
     return c;
   }
+
+  // ===== general matrix matcher (matching.ml decomposition) ====================
+  // Dispatch column 0 by head constructor via a dense Switch*/if, EXPANDING each
+  // matched block constructor's fields into new leading columns, and recursing on
+  // the remaining columns -- until columns run out (first surviving row wins).
+  // Correct for arbitrary nesting and multi-block types; emits Switch/if instead
+  // of the caml_obj_tag + EqInt if-chain that int_cases would.  Bails (nullptr)
+  // on any shape it does not model (guards, extension/exn ctors, inline-record or
+  // unboxed ctors, poly-variants, arrays, records, ranges, lazy, ...), so the
+  // caller falls through to the existing path.  `deid` is a static-exit id for the
+  // shared fallback (uncovered tags -> `(exit deid)`), set up by gmatch_top.
+  LamPtr gmatch(std::vector<LamPtr> comps, std::vector<MRow> rows,
+                const Location& mloc, int deid) {
+    auto mkexit = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = deid; return e; };
+    if (rows.empty()) return mkexit();
+    if (comps.empty()) {                 // all columns consumed: first row wins
+      auto& r = rows[0];
+      scope.emplace_back();
+      for (auto& [nm, id] : r.binds) scope.back()[nm] = id;
+      LamPtr b = expr(*r.rhs);
+      scope.pop_back();
+      return b;
+    }
+    // Peel `pat as x` and constraints/opens in column 0 (bind x to this column).
+    for (auto& r : rows)
+      for (;;) {
+        if (auto* pa = std::get_if<Ppat_alias>(&r.cols[0]->desc)) {
+          r.binds.push_back({pa->name.txt, comps[0]->var}); r.cols[0] = pa->p.get(); continue;
+        }
+        const Pattern* e = effective_pat(r.cols[0]);
+        if (e != r.cols[0]) { r.cols[0] = e; continue; }
+        break;
+      }
+    // Expand an or-pattern in column 0 into separate rows (order preserved).
+    for (auto& r : rows)
+      if (std::get_if<Ppat_or>(&r.cols[0]->desc)) {
+        std::vector<MRow> ex;
+        for (auto& rr : rows) {
+          std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
+          for (auto* a : alts) { MRow nr = rr; nr.cols[0] = effective_pat(a); ex.push_back(std::move(nr)); }
+        }
+        return gmatch(std::move(comps), std::move(ex), mloc, deid);
+      }
+    // Only var/any and (non-exn, non-inline, non-unboxed) constructor columns.
+    bool anyctor = false;
+    for (auto& r : rows) {
+      auto& d = r.cols[0]->desc;
+      if (std::get_if<Ppat_construct>(&d)) anyctor = true;
+      else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d)) return nullptr;
+    }
+    auto bind0 = [&](MRow& r) {           // record a var/any binding for column 0
+      if (auto* pv = std::get_if<Ppat_var>(&r.cols[0]->desc))
+        r.binds.push_back({pv->name.txt, comps[0]->var});
+    };
+    std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
+    if (!anyctor) {                       // whole column is var/any: bind and drop it
+      std::vector<MRow> sub;
+      for (auto& r : rows) { bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr)); }
+      return gmatch(std::move(rest), std::move(sub), mloc, deid);
+    }
+    if (comps[0]->k != Lam::K::Var) return nullptr;   // need a Var for field reads
+    // Resolve the column's variant type (all ctor rows must share it).
+    std::string type; const CtorInfo* any_ci = nullptr;
+    for (auto& r : rows)
+      if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
+        const std::string cn = ctor_of(*r.cols[0]);
+        if (exn_typed_pat(r.cols[0], cn)) return nullptr;
+        const CtorInfo* ci = pat_ctor_resolve(r.cols[0], cn);
+        if (!ci || !ci->rlabels.empty() || ci->unboxed) return nullptr;
+        if (type.empty()) { type = ci->type; any_ci = ci; }
+        else if (type != ci->type) return nullptr;
+      }
+    auto tcit = type_ctors_.find(type);
+    if (tcit == type_ctors_.end() || !any_ci) return nullptr;
+    int NC = tcit->second.first, NB = tcit->second.second;
+    // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
+    std::map<int, const CtorInfo*> const_ci, block_ci;   // tag -> a resolved ctor
+    for (auto& r : rows)
+      if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
+        const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]));
+        (ci->is_block ? block_ci : const_ci)[ci->tag] = ci;
+      }
+    // Build the body for one constant tag t: matching-t const rows + all var rows.
+    auto const_body = [&](int t) -> LamPtr {
+      std::vector<MRow> sub;
+      for (auto& r : rows) {
+        auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
+        if (k) {
+          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]));
+          if (ci->is_block || ci->tag != t) continue;
+          MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
+        } else { bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr)); }
+      }
+      std::vector<LamPtr> cc = rest;
+      return gmatch(std::move(cc), std::move(sub), mloc, deid);
+    };
+    // Build the body for one block tag t, expanding its `arity` fields as columns.
+    auto block_body = [&](int t) -> LamPtr {
+      auto bi = block_ci.find(t);
+      if (bi == block_ci.end()) {         // gap tag: only var rows reach it (no field probe)
+        std::vector<MRow> sub;
+        for (auto& r : rows)
+          if (!std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
+            bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
+          }
+        std::vector<LamPtr> cc = rest;
+        return gmatch(std::move(cc), std::move(sub), mloc, deid);
+      }
+      int a = bi->second->arity;
+      std::vector<Ident> fids; std::vector<LamPtr> fvars;
+      for (int j = 0; j < a; ++j) { Ident f = fresh("", true); fids.push_back(f); fvars.push_back(varof(f)); }
+      std::vector<LamPtr> ncomps = fvars; ncomps.insert(ncomps.end(), rest.begin(), rest.end());
+      static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
+      std::vector<MRow> sub;
+      for (auto& r : rows) {
+        auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
+        if (k) {
+          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]));
+          if (!ci->is_block || ci->tag != t) continue;
+          auto fps = ctor_field_pats(k, a);
+          if ((int)fps.size() != a) return nullptr;       // shape we can't split
+          MRow nr; nr.rhs = r.rhs; nr.binds = r.binds;
+          for (auto* fp : fps) nr.cols.push_back(fp);
+          nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
+          sub.push_back(std::move(nr));
+        } else {
+          bind0(r);
+          MRow nr; nr.rhs = r.rhs; nr.binds = r.binds;
+          for (int j = 0; j < a; ++j) nr.cols.push_back(&any_pat);
+          nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
+          sub.push_back(std::move(nr));
+        }
+      }
+      LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, deid);
+      if (!cb) return nullptr;
+      for (int j = a - 1; j >= 0; --j) {
+        LamPtr fread = fieldimm(j, comps[0]);
+        if (count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+        else {
+          auto l = mk(Lam::K::Let);
+          l->bindings = {{fids[j], ValueKind::Gen, fread, true}}; l->body = cb; cb = l;
+        }
+      }
+      return cb;
+    };
+    std::vector<Lam::SwitchCase> consts, blocks;
+    for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b}); }
+    for (int t = 0; t < NB; ++t) { LamPtr b = block_body(t); if (!b) return nullptr; blocks.push_back({t, b}); }
+    // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
+    if (NC == 1 && NB == 1) {
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = comps[0]; i->then_ = blocks[0].body; i->else_ = consts[0].body; return i;
+    }
+    if (NB >= 2) {
+      auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
+      sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks); return sw;
+    }
+    if (NB == 1 && NC == 0) return blocks[0].body;
+    if (NB == 1 && NC >= 2) {
+      auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp; isint->prim_id = "isint";
+      isint->args = {comps[0]};
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = isint; i->then_ = const_dispatch(comps[0], consts); i->else_ = blocks[0].body; return i;
+    }
+    return const_dispatch(comps[0], consts);   // NB == 0
+  }
+  // Entry for the general matrix matcher on a single scrutinee: peel a trailing
+  // catch-all as the shared default (else Match_failure), run gmatch, and wrap the
+  // fallback in a shared static-catch (inlined when used at most once).
+  LamPtr gmatch_top(const LamPtr& scrut, const std::vector<Row>& rows,
+                    const Location& mloc) {
+    for (auto& r : rows) if (r.guard) return nullptr;
+    const Row* catchall = nullptr;
+    std::vector<MRow> mrows;
+    for (size_t i = 0; i < rows.size(); ++i) {
+      if (i + 1 == rows.size() && is_catchall(*rows[i].lhs)) { catchall = &rows[i]; break; }
+      MRow mr; mr.rhs = rows[i].rhs; mr.cols.push_back(rows[i].lhs); mrows.push_back(std::move(mr));
+    }
+    if (mrows.empty()) return nullptr;
+    LamPtr sv = scrut; Ident tv; bool need_temp = scrut->k != Lam::K::Var;
+    if (need_temp) { tv = fresh("", true); sv = varof(tv); }
+    int deid = ++next_exit_;
+    LamPtr body = gmatch({sv}, mrows, mloc, deid);
+    if (!body) { --next_exit_; return nullptr; }
+    LamPtr dbody;
+    if (catchall) {
+      scope.emplace_back(); bind_catchall(*catchall->lhs, sv);
+      dbody = expr(*catchall->rhs); scope.pop_back();
+    } else dbody = raise_predef("Match_failure", mloc);
+    int bad = 0; int uses = count_exit(body, deid, false, bad);
+    LamPtr res;
+    if (uses == 0) res = body;                     // exhaustive: fallback unreachable
+    else if (uses == 1 && bad == 0) { inline_exit(body, deid, {}, {}, dbody); res = body; }
+    else { auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = deid; c->then_ = dbody; res = c; }
+    if (need_temp) {
+      if (count_var(res, tv) <= 1) subst_var(res, tv, scrut);
+      else { auto l = mk(Lam::K::Let); l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = res; res = l; }
+    }
+    return res;
+  }
   // Drive a `<ctor pattern> -> body | _ -> fallback` match.  One failure point (a
   // single top constructor with simple fields) inlines the fallback as the else
   // branch; two or more share it once behind `(catch .. with (N) fallback)`, with
@@ -9062,6 +9262,7 @@ struct Translator {
     if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
+    if (auto gm = gmatch_top(scrut, rows, mloc)) return gm;
     if (LamPtr r = int_cases(scrut, rows, 0, /*strict=*/true)) return r;
     // shapes the structured paths can't express compile through the correct
     // per-row chain instead of silently collapsing
