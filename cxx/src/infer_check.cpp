@@ -17,8 +17,20 @@ namespace cppcaml {
 // Where the stdlib .cmi files live; see set_infer_stdlib_dir below.
 static std::string g_stdlib_dir = "stdlib";
 static std::vector<std::string> g_infer_module_dirs;  // extra -I dirs for local .cmi
-void set_infer_stdlib_dir(const std::string& dir) { g_stdlib_dir = dir; }
-void set_infer_module_dirs(std::vector<std::string> dirs) { g_infer_module_dirs = std::move(dirs); }
+// head module name -> resolved .cmi path (head_cmi below).  Valid only while
+// the filesystem is stable: flushed on any dir reconfiguration and at the start
+// of each compiled unit (an earlier unit in the same invocation writes a .cmi
+// a later unit may reference).
+static std::unordered_map<std::string, std::string> g_head_cmi_memo;
+void clear_head_cmi_cache() { g_head_cmi_memo.clear(); }
+void set_infer_stdlib_dir(const std::string& dir) {
+  g_stdlib_dir = dir;
+  g_head_cmi_memo.clear();
+}
+void set_infer_module_dirs(std::vector<std::string> dirs) {
+  g_infer_module_dirs = std::move(dirs);
+  g_head_cmi_memo.clear();
+}
 const std::vector<std::string>& infer_module_dirs() { return g_infer_module_dirs; }
 
 namespace {
@@ -30,7 +42,7 @@ using namespace ast;
 std::string stdpath(const std::string& file) { return g_stdlib_dir + "/" + file; }
 // The .cmi of a head module: the stdlib naming pattern, else (for a separately
 // compiled local module like `A`) the first <head>.cmi found in the -I dirs.
-std::string head_cmi(const std::string& head) {
+std::string head_cmi_uncached(const std::string& head) {
   std::string sp = stdpath(head == "Stdlib" ? "stdlib.cmi" : "stdlib__" + head + ".cmi");
   if (std::filesystem::exists(sp)) return sp;
   std::string low = (char)std::tolower((unsigned char)head[0]) + head.substr(1);
@@ -42,6 +54,13 @@ std::string head_cmi(const std::string& head) {
     if (std::filesystem::exists(d + "/" + head + ".cmi")) return d + "/" + head + ".cmi";
   }
   return sp;
+}
+std::string head_cmi(const std::string& head) {
+  auto it = g_head_cmi_memo.find(head);
+  if (it != g_head_cmi_memo.end()) return it->second;
+  std::string r = head_cmi_uncached(head);
+  g_head_cmi_memo.emplace(head, r);
+  return r;
 }
 using I::TypePtr;
 

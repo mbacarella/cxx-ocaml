@@ -147,6 +147,11 @@ void set_infer_stdlib_dir(const std::string& dir);
 void set_infer_module_dirs(std::vector<std::string> dirs);
 const std::vector<std::string>& infer_module_dirs();
 
+// Drop the module-name -> .cmi-path memo.  Must run before each compiled unit:
+// a unit compiled earlier in the same invocation writes a .cmi that a later
+// unit's lookups must see.
+void clear_head_cmi_cache();
+
 // A compilation unit's top-level signature (in source order) as cmiw items --
 // the input to cmi::cmiw::write_cmi.  Single-var `let` bindings -> Sig_value
 // (matching the .cmo's exported field order); `type` declarations -> Sig_type

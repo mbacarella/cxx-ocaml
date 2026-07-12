@@ -532,6 +532,10 @@ struct Translator {
   // own `Bool` vs `Stdlib.Bool`), matching ocamlc's include-path-before-stdlib
   // search.  Empty when no -I dir (other than stdlib) provides the unit.
   std::string local_unit_cmi(const std::string& mod) const {
+    if (auto it = local_unit_memo_.find(mod); it != local_unit_memo_.end()) return it->second;
+    return local_unit_memo_.emplace(mod, local_unit_cmi_uncached(mod)).first->second;
+  }
+  std::string local_unit_cmi_uncached(const std::string& mod) const {
     if (mod == "Stdlib" || mod.rfind("Camlinternal", 0) == 0) return "";
     std::string low = (char)std::tolower((unsigned char)mod[0]) + mod.substr(1);
     for (const std::string& d : module_dirs_) {
@@ -541,7 +545,13 @@ struct Translator {
     }
     return "";
   }
+  // Memoized per Translator, i.e. per compiled unit: the .cmi set on disk is
+  // stable for the duration of one translate (our own .cmi is written after).
   std::string resolve_cmi(const std::string& mod) const {
+    if (auto it = resolve_cmi_memo_.find(mod); it != resolve_cmi_memo_.end()) return it->second;
+    return resolve_cmi_memo_.emplace(mod, resolve_cmi_uncached(mod)).first->second;
+  }
+  std::string resolve_cmi_uncached(const std::string& mod) const {
     std::string sp;
     if (mod == "Stdlib") sp = stdlib_dir + "/stdlib.cmi";
     else if (mod.rfind("Camlinternal", 0) == 0)
@@ -559,6 +569,8 @@ struct Translator {
     }
     return sp;  // not found: keep the stdlib path (load throws -> caller handles)
   }
+  mutable std::unordered_map<std::string, std::string> resolve_cmi_memo_;
+  mutable std::unordered_map<std::string, std::string> local_unit_memo_;
   std::vector<std::unordered_map<std::string, Ident>> scope{{}};
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
   struct StdPrim { std::string name; int arity; };  // an external's prim_name + arity
