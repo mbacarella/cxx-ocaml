@@ -8444,6 +8444,68 @@ struct Translator {
   // One block constructor's arm, given all rows that select it (in source order).
   // A single simple-argument row uses the inlining fast path; multiple rows (or a
   // complex argument) sub-match the constructor's single field (arity 1 only).
+  // Several same-tag rows, at least one guarded (`K p when g1 -> a | K q when g2
+  // -> b | ...`): ocamlc emits ONE switch case that binds the constructor's
+  // fields once (shared `=a` aliases) then chains the guards
+  // (`if g1 a (if g2 b <default>)`), the last guard (or an unguarded final row)
+  // falling to the shared default.  Handles only irrefutable field patterns
+  // (var / wildcard per field); any nesting -> bail (caller falls back).
+  LamPtr build_guarded_group_arm(const LamPtr& scrut, const CtorInfo& ci,
+                                 const std::vector<const Row*>& rs,
+                                 const LamPtr& dflt) {
+    if (!dflt || ci.arity < 1 || !ci.rlabels.empty() || ci.unboxed) return nullptr;
+    int ar = ci.arity;
+    // An unguarded row makes subsequent same-tag rows unreachable: truncate there.
+    size_t ng = rs.size();
+    for (size_t i = 0; i < rs.size(); ++i) if (!rs[i]->guard) { ng = i + 1; break; }
+    // Pre-extract + validate every row's field patterns (all var/wildcard).
+    std::vector<std::vector<const Pattern*>> rowfps(ng);
+    for (size_t i = 0; i < ng; ++i) {
+      auto* k = std::get_if<Ppat_construct>(&rs[i]->lhs->desc);
+      if (!k) return nullptr;
+      auto fps = ctor_field_pats(k, ar);
+      if ((int)fps.size() != ar) return nullptr;
+      for (auto* fp : fps) {
+        const Pattern* p = effective_pat(fp);
+        if (!std::holds_alternative<Ppat_any>(p->desc) &&
+            !std::holds_alternative<Ppat_var>(p->desc)) return nullptr;
+      }
+      rowfps[i].assign(fps.begin(), fps.end());
+    }
+    std::vector<Ident> fids(ar);
+    for (int j = 0; j < ar; ++j) fids[j] = fresh("", true);
+    std::vector<bool> fused(ar, false);
+    // Build the guard chain last-to-first; the innermost fall-through is dflt.
+    LamPtr chain = dflt;
+    for (int i = (int)ng - 1; i >= 0; --i) {
+      scope.emplace_back();
+      for (int j = 0; j < ar; ++j) {
+        const Pattern* p = effective_pat(rowfps[i][j]);
+        if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
+          scope.back()[pv->name.txt] = fids[j];
+          apply_var_node_path(p, fids[j]); fused[j] = true;
+        }
+      }
+      LamPtr body = expr(*rs[i]->rhs);
+      if (rs[i]->guard) {
+        auto iff = mk(Lam::K::IfThenElse);
+        iff->cond = expr(*rs[i]->guard); iff->then_ = body; iff->else_ = chain;
+        body = iff;
+      }
+      scope.pop_back();
+      chain = body;  // an unguarded row discards the (dead) accumulated chain
+    }
+    // Bind each used field once (`=a`), reverse-folded, single-use inlined.
+    for (int j = ar - 1; j >= 0; --j) {
+      if (!fused[j]) continue;
+      LamPtr fread = fieldimm(j, scrut);
+      if (count_var(chain, fids[j]) <= 1) { subst_var(chain, fids[j], fread); continue; }
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{fids[j], ValueKind::Gen, fread, true}};
+      l->body = chain; chain = l;
+    }
+    return chain;
+  }
   LamPtr build_ctor_group_arm(const LamPtr& scrut, const CtorInfo& ci,
                               const std::vector<const Row*>& rs, const Location& mloc,
                               const LamPtr& dflt) {
@@ -8452,7 +8514,8 @@ struct Translator {
       const Expression* g = rs[0]->guard;  // a `when` on this single row -> if/dflt
       if (LamPtr a = build_block_arm(scrut, ci, k, *rs[0]->rhs, g, dflt)) return a;
     }
-    for (auto* r : rs) if (r->guard) return nullptr;  // multi-row guards: bail
+    for (auto* r : rs) if (r->guard)  // multi-row guards: chain them, else bail
+      return build_guarded_group_arm(scrut, ci, rs, dflt);
     // An INLINE-RECORD ctor with multiple rows (`Tfunction_cases {cases=..}` in two
     // arms): the block IS the inline record.  Map each row's record pattern to its
     // positional field sub-patterns; if they all constrain a SINGLE common field,
@@ -9506,6 +9569,20 @@ struct Translator {
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
     if (auto gm = gmatch_top(scrut, rows, mloc)) return gm;
+    if (cppcaml::dbg_env("BAILDBG")) {
+      int nguard = 0, nctor = 0, nor = 0, nother = 0;
+      std::string ctors;
+      for (auto& r : rows) {
+        if (r.guard) nguard++;
+        const Pattern* p = effective_pat(r.lhs);
+        if (auto* k = std::get_if<Ppat_construct>(&p->desc)) { nctor++; if (ctors.size()<120){ctors+=lid_last(k->id.txt)+(k->arg?"(_)":"")+" ";} }
+        else if (std::holds_alternative<Ppat_or>(p->desc)) nor++;
+        else if (is_catchall(*p)) {}
+        else nother++;
+      }
+      fprintf(stderr, "[BAILDBG] n=%zu guard=%d ctor=%d or=%d other=%d :: %s\n",
+              rows.size(), nguard, nctor, nor, nother, ctors.c_str());
+    }
     if (LamPtr r = int_cases(scrut, rows, 0, /*strict=*/true)) return r;
     // shapes the structured paths can't express compile through the correct
     // per-row chain instead of silently collapsing
@@ -10550,6 +10627,9 @@ struct Translator {
       }
       // block ctor: tag test (caml_obj_tag of an immediate is out of range)
       if (!(nb == 1 && nc >= 0 && C.tag == 0)) {
+        if (cppcaml::dbg_env("OTDBG"))
+          fprintf(stderr, "[OTDBG] obj_tag ctor=%s type=%s nb=%d nc=%d\n",
+                  lid_last(k->id.txt).c_str(), C.type.c_str(), nb, nc);
         auto tg = mk(Lam::K::Prim); tg->prim = Prim::Ccall;
         tg->prim_id = "caml_obj_tag"; tg->args = {acc};
         auto e2 = mk(Lam::K::Prim); e2->prim = Prim::EqInt;
