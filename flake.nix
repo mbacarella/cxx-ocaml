@@ -12,6 +12,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
         llvm = pkgs.llvmPackages_20;   # clang 20: full C++23 language surface
+        mimalloc = pkgs.mimalloc;      # allocator override, static-linked (see CMakeLists.txt)
         # One toolchain, clang, for everything: it builds the C++ rewrite *and*
         # the OCaml trunk oracle (clang is a Tier-1, CI-tested C compiler for
         # OCaml on Linux, and the only one on macOS). Using clang as the shell's
@@ -30,6 +31,7 @@
             pkgs.gnumake        # for the OCaml trunk build
             pkgs.binutils
             pkgs.pkg-config
+            mimalloc            # statically linked into the tools: ~9% faster builds
 
             # --- OCaml host tools: write oracle token/AST dumpers,
             #     regenerate .mll/.mly when we need to read the tables ---
@@ -47,6 +49,9 @@
           shellHook = ''
             export CC=clang
             export CXX=clang++
+            # Let CMake's find_file locate mimalloc.o (nix's cmake hook does not
+            # populate CMAKE_PREFIX_PATH in an interactive shell).
+            export CMAKE_PREFIX_PATH="${mimalloc}''${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
             {
               echo "c++caml dev shell (clang-only)"
               echo "  C/C++ : $(clang --version | head -1)"
