@@ -1423,7 +1423,42 @@ struct Translator {
   // Used for type-directed disambiguation of an unqualified constructor pattern
   // whose type lives in a module that is NOT opened (persistent_env matches
   // `Visible`/`Hidden` of `Load_path.visibility` with no `open Load_path`).
-  void register_ctors_of_type(const std::string& path) {
+  // The abbreviation target of an imported type (`Lambda.scoped_location` ->
+  // `Debuginfo.Scoped_location.t`): follows the cmi manifest through Tlink/Tsubst
+  // to a Tconstr and returns its dotted path.  Empty if not an abbreviation or the
+  // type/module isn't found.  Lets register_ctors_of_type chase an alias to the
+  // underlying variant so a bare type-directed ctor (translobj's `Loc_unknown`,
+  // opened via `open Lambda`) resolves.
+  std::string type_manifest_path(const std::string& mod, const std::string& ty) {
+    std::string head = mod;
+    if (auto dot = mod.find('.'); dot != std::string::npos) head = mod.substr(0, dot);
+    if (module_base(head)) return "";
+    try {
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = mod.find('.'); pos != std::string::npos;) {
+        size_t nd = mod.find('.', pos + 1);
+        std::string comp = mod.substr(pos + 1,
+            nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return "";
+        sig = next; pos = nd;
+      }
+      for (auto& td : sig->types) {
+        if (td.name != ty) continue;
+        cmi::TypePtr m = td.manifest;
+        while (m && (m->kind == cmi::TypeExpr::Tlink || m->kind == cmi::TypeExpr::Tsubst))
+          m = m->link;
+        if (m && m->kind == cmi::TypeExpr::Tconstr && m->path)
+          return cmi_path_dotted(*m->path);
+        return "";
+      }
+    } catch (...) {}
+    return "";
+  }
+  void register_ctors_of_type(const std::string& path, int depth = 0) {
     auto d = path.rfind('.');
     if (d == std::string::npos) return;
     std::string mod = path.substr(0, d), ty = path.substr(d + 1);
@@ -1440,7 +1475,15 @@ struct Translator {
     }
     if (module_base(mod)) return;                     // a local module: skip
     auto& tl = module_type_ctors(mod, ty);
-    if (tl.empty()) return;
+    if (tl.empty()) {
+      // The type is an abbreviation to another module's variant (`scoped_location
+      // = Debuginfo.Scoped_location.t`): chase the manifest and register there.
+      if (depth < 4) {
+        std::string tgt = type_manifest_path(mod, ty);
+        if (!tgt.empty() && tgt != path) register_ctors_of_type(tgt, depth + 1);
+      }
+      return;
+    }
     int nc = 0, nb = 0;
     for (auto& [nm, info] : tl) (info.is_block ? nb : nc)++;
     for (auto& [nm, info] : tl)
