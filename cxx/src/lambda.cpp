@@ -8214,8 +8214,13 @@ struct Translator {
     // expression straight into the recursion instead re-walks the access chain
     // per sub-field (extra GETFIELDs).  Binding it here (and relying on
     // wrap_binders to inline single-use temps) mirrors ocamlc exactly.
+    // A structured CONSTANT is not materialized: reading its field folds to
+    // the element (a constant is atomic to ocamlc's matcher too), and the
+    // toplevel-let consumer relies on that fold -- a temp here put the temp's
+    // definition AFTER its uses in that consumer's reversed emission, reading
+    // garbage at module init (the makedepend S1-segfault regression).
     auto materialize = [&](const LamPtr& s) -> LamPtr {
-      if (s->k == Lam::K::Var) return s;
+      if (s->k == Lam::K::Var || s->k == Lam::K::ConstBlock) return s;
       Ident t = fresh("", true); out.push_back({t, s}); return varof(t);
     };
     if (std::holds_alternative<Ppat_any>(p->desc)) return true;
@@ -8602,7 +8607,7 @@ struct Translator {
     // when single-use, so passing the field-read expression straight down re-walks
     // the access chain.  wrap-style reverse folding below inlines single-use temps.
     auto materialize = [&](const LamPtr& s) -> LamPtr {
-      if (s->k == Lam::K::Var) return s;
+      if (s->k == Lam::K::Var || s->k == Lam::K::ConstBlock) return s;
       Ident t = fresh("", true); binders.push_back({t, s}); return varof(t);
     };
     // Destructure a constructor field, binding its variables to the field-read
@@ -18123,11 +18128,24 @@ struct Translator {
               }
               return {acc, is_field_access(acc)};  // a field read -> `=a` alias
             };
+            // Unnamed binders are INTERNAL temps (a materialized sub-scrutinee
+            // or a lazy force), not components of the pattern: they must be
+            // DEFINED before the field reads that use them, so emit them first
+            // in collection order (a temp's RHS references only earlier temps
+            // or the scrutinee), then the named components in ocamlc's reverse
+            // field order -- and they are never exported.
+            for (auto& [id, acc] : binders)
+              if (id.name.empty())
+                cur.push_back({id, ValueKind::Gen, acc,
+                               !lazy_force_binders_.count(id.stamp) &&
+                                   is_field_access(acc)});
             for (auto it2 = binders.rbegin(); it2 != binders.rend(); ++it2) {
+              if (it2->first.name.empty()) continue;
               auto [v, alias] = fold(it2->second);
               cur.push_back({it2->first, ValueKind::Gen, v, alias});
             }
-            for (auto& [id, acc] : binders) add_export(id.name, id);
+            for (auto& [id, acc] : binders)
+              if (!id.name.empty()) add_export(id.name, id);
           } else {  // `let () = e` and other refutable patterns: a bare *match* temp
             cur.push_back({fresh("", true), ValueKind::Gen, val});
           }
