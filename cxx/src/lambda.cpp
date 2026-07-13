@@ -9354,12 +9354,17 @@ struct Translator {
   int gm_budget() {
     static int b = [] {
       const char* e = std::getenv("CPPCAML_GMBUDGET");
-      // 55 = re-calibrated on the 139 compiler modules once gmatch_top's second pass
-      // (nested tuple/record columns) began sharing this budget: the total-opcode-
-      // divergence minimum (60936), a sharp min with a cliff at 56 (62808) where a
-      // large matrix just fits and its un-shared var-spread explodes.  Within the old
-      // gmatch_tuple_top plateau (50-63), so that matcher is unaffected.
-      return e ? std::atoi(e) : 55;
+      // 200 = re-calibrated once gap tags began SHARING the default sub-matrix (so a
+      // wide sparse match no longer burns the budget once per gap tag).  Sharing lets
+      // the budget rise far higher without the un-shared var-spread exploding, and
+      // every direction-consistent discrimination signal keeps converging toward the
+      // ocamlc reference across 55->200 (obj_tag 2645->1851, EQ 3700->3061, BNEQ
+      // 2132->1770, ISINT 1556->1238, even GETFIELD0 20971->19878).  The non-parser
+      // aggregate |diff| bottoms in a flat 180-220 basin (~39878) then falls off a
+      // cliff at 240 (a large matrix just fits and its field-materialize reshuffle
+      // diverges from REF).  Whole-build total|diff| rises past 55 purely from the
+      // parser's menhir GETFIELD/PUSHENVACC reshuffle (DDC-bit-identical noise).
+      return e ? std::atoi(e) : 200;
     }();
     return b;
   }
