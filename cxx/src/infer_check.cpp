@@ -8957,6 +8957,19 @@ struct Checker {
                   // overridden field's type.  The alias display rewrite (above) maps
                   // the loaded `Long.Path.` prefix back to the alias.
                   load_module_record_fields(pi->id.txt);
+                } else if (tgt.find('.') == std::string::npos &&
+                           tgt != *mb->binding.name.txt &&
+                           !bound_module_names_.count(tgt)) {
+                  // `module T = Typedtree`: a bare top-level UNIT alias.  Unlike a
+                  // dotted alias we DON'T display-rewrite (ocaml keeps each written
+                  // path per-occurrence, and rewriting `Typedtree.` -> `T.` would
+                  // corrupt cmi type paths), but type-directed disambiguation of a
+                  // bare `exp.exp_desc` field / `Texp_ident` ctor against the unit's
+                  // types still needs its records + ctors loaded -- otherwise a
+                  // whole `match exp.exp_desc with ..` degenerates to arm 0 with
+                  // unresolved `?`-vars (untypeast's mapper).  No-op if T has no cmi.
+                  load_module_record_fields(pi->id.txt);
+                  if (!strict) open_module_ctors(pi->id.txt);
                 }
               }
               func_bind_name_ = *mb->binding.name.txt;
