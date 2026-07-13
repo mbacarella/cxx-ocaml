@@ -9322,12 +9322,19 @@ struct Translator {
           if (inl) {
             const Pattern* ap = k->arg ? effective_pat(k->arg->get()) : nullptr;
             auto* pr = ap ? std::get_if<Ppat_record>(&ap->desc) : nullptr;
-            if (!pr) return nullptr;                        // whole-block bind etc.: bail
-            for (auto& lbl : rlab) {
-              const Pattern* fp = &any_pat;
-              for (auto& [l, s2] : pr->fields) if (lid_last(l.txt) == lbl) { fp = effective_pat(s2.get()); break; }
-              fps.push_back(fp);
-            }
+            if (!pr) {
+              // `K _` (or no arg): every inline-record field is a wildcard -- span
+              // them all, like ctor_field_pats does for a plain `C _` on a multi-arg
+              // ctor.  A whole inline-record value bind (`K x`) is not expressible in
+              // OCaml, so a non-record, non-wildcard arg is genuinely unsupported.
+              if (ap && !std::holds_alternative<Ppat_any>(ap->desc)) return nullptr;
+              for (size_t j = 0; j < rlab.size(); ++j) fps.push_back(&any_pat);
+            } else
+              for (auto& lbl : rlab) {
+                const Pattern* fp = &any_pat;
+                for (auto& [l, s2] : pr->fields) if (lid_last(l.txt) == lbl) { fp = effective_pat(s2.get()); break; }
+                fps.push_back(fp);
+              }
           } else {
             fps = ctor_field_pats(k, a);
             if ((int)fps.size() != a) return nullptr;       // shape we can't split
