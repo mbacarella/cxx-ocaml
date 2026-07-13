@@ -7082,6 +7082,35 @@ struct Translator {
     for (auto& sc : l->sw_blocks) c += count_var(sc.body, id, w);
     return c;
   }
+  // The maximum number of uses of `id` along ANY single execution path: sums
+  // sequential parts (fn/args/bindings/body/cond) but takes the MAX across the
+  // mutually-exclusive arms of an if/switch/catch.  ocamlc inlines a (pure) field
+  // read into each branch when it is used at most once per path -- re-reading in
+  // disjoint arms rather than hoisting a shared binding that stays live across the
+  // whole match -- and binds only when a single path reads it twice.  Matching this
+  // is what lets the matrix matcher's decomposed columns share fields like ocamlc.
+  static int max_path_count_var(const LamPtr& l, const Ident& id, int w = 1) {
+    if (!l) return 0;
+    if (l->k == Lam::K::Var)
+      return (l->var.stamp == id.stamp && l->var.name == id.name) ? w : 0;
+    // A static Catch's handler (then_) runs only on the exit path -- disjoint from
+    // the normal completion of the body (cond) -- so it is an alternative, not a
+    // sequential continuation.  (Over-counting a use in cond-before-exit plus the
+    // handler is harmless here: the counted values are pure field reads.)
+    if (l->k == Lam::K::Catch)
+      return std::max(max_path_count_var(l->cond, id, w), max_path_count_var(l->then_, id, w));
+    int wb = l->k == Lam::K::Function ? 2 : w;
+    int seq = max_path_count_var(l->fn, id, w) + max_path_count_var(l->body, id, wb) +
+              max_path_count_var(l->cond, id, w);
+    for (auto& a : l->args) seq += max_path_count_var(a, id, w);
+    for (auto& b : l->bindings) seq += max_path_count_var(b.val, id, w);
+    int br = std::max({max_path_count_var(l->then_, id, w),
+                       max_path_count_var(l->else_, id, w),
+                       max_path_count_var(l->sw_default, id, w)});
+    for (auto& sc : l->sw_consts) br = std::max(br, max_path_count_var(sc.body, id, w));
+    for (auto& sc : l->sw_blocks) br = std::max(br, max_path_count_var(sc.body, id, w));
+    return seq + br;
+  }
   static void subst_var(LamPtr& l, const Ident& id, const LamPtr& repl) {
     if (!l) return;
     if (l->k == Lam::K::Var && l->var.stamp == id.stamp && l->var.name == id.name) { l = repl; return; }
@@ -9118,7 +9147,7 @@ struct Translator {
         if (!cb) return nullptr;
         for (int j = (int)tk - 1; j >= 0; --j) {
           LamPtr fread = fieldimm(j, comps[0]);
-          if (count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+          if (max_path_count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
           else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ValueKind::Gen, fread, true}}; l->body = cb; cb = l; }
         }
         return cb;
@@ -9182,7 +9211,7 @@ struct Translator {
         if (!cb) return nullptr;
         for (int j = (int)nc - 1; j >= 0; --j) {
           LamPtr fread = field_read(&ofi[j], comps[0]);
-          if (count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+          if (max_path_count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
           else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ofi[j].kind, fread, true}}; l->body = cb; cb = l; }
         }
         return cb;
@@ -9430,7 +9459,7 @@ struct Translator {
       if (!cb) return nullptr;
       for (int j = a - 1; j >= 0; --j) {
         LamPtr fread = fieldimm(j, comps[0]);
-        if (count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+        if (max_path_count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
         else {
           auto l = mk(Lam::K::Let);
           l->bindings = {{fids[j], ValueKind::Gen, fread, true}}; l->body = cb; cb = l;
