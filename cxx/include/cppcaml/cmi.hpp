@@ -266,13 +266,6 @@ private:
   std::vector<std::string> imports_;
 };
 
-// Enable (size,mtime) revalidation of CmiFile::load cache hits.  The compile
-// daemon keeps decoded cmis warm across many client compiles, so a .cmi
-// rewritten between compiles must be re-decoded rather than served stale.  Off
-// by default (a single process sees each .cmi as immutable), so it costs
-// nothing on the normal path.
-void set_cmi_cache_validate(bool on);
-
 // Render a type_expr / type declaration / module type in OCaml-ish syntax.
 std::string print_type(const TypePtr& t);
 std::string print_type_decl(const TypeDecl& d);

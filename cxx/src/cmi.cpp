@@ -2,9 +2,6 @@
 #include "cppcaml/omarshal.hpp"
 #include "cppcaml/blake2.hpp"
 
-#include <sys/stat.h>
-
-#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -660,42 +657,7 @@ namespace {
 // The full-decode cache, at file scope so loaded_paths() can enumerate which
 // modules this compile has actually referenced (their .cmi got loaded).
 std::unordered_map<std::string, CmiFile> g_load_cache;
-
-// When true (set by the compile daemon), a cache hit is REVALIDATED against the
-// file's (size, mtime) before it is trusted: the daemon keeps decoded cmis warm
-// across many client compiles, and a .cmi rewritten between compiles must not be
-// served stale.  Off in the normal single-process path (a .cmi is immutable for
-// one process's lifetime), so this adds no cost there.
-bool g_cmi_validate = false;
-std::unordered_map<std::string, std::pair<std::uint64_t, std::uint64_t>> g_load_tok, g_types_tok;
-
-bool cmi_tok(const std::string& p, std::pair<std::uint64_t, std::uint64_t>& out) {
-  struct stat st;
-  if (::stat(p.c_str(), &st) != 0) return false;
-  out = {(std::uint64_t)st.st_size,
-         (std::uint64_t)st.st_mtim.tv_sec * 1000000000ull + (std::uint64_t)st.st_mtim.tv_nsec};
-  return true;
-}
-// True if `path`'s cached entry (token map `tok`) is still valid; on staleness
-// erases the token so the caller re-decodes (its cache entry is erased too).
-bool cache_fresh(const std::string& path,
-                 std::unordered_map<std::string, std::pair<std::uint64_t, std::uint64_t>>& tok) {
-  if (!g_cmi_validate) return true;
-  std::pair<std::uint64_t, std::uint64_t> cur;
-  auto it = tok.find(path);
-  if (it != tok.end() && cmi_tok(path, cur) && cur == it->second) return true;
-  tok.erase(path);
-  return false;
-}
-void cache_stamp(const std::string& path,
-                 std::unordered_map<std::string, std::pair<std::uint64_t, std::uint64_t>>& tok) {
-  if (!g_cmi_validate) return;
-  std::pair<std::uint64_t, std::uint64_t> cur;
-  if (cmi_tok(path, cur)) tok[path] = cur;
-}
 }  // namespace
-
-void set_cmi_cache_validate(bool on) { g_cmi_validate = on; }
 
 const CmiFile& CmiFile::load(const std::string& filepath) {
   // A .cmi is immutable for the lifetime of a compile, but several passes (the
@@ -707,10 +669,7 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
   // auto&` share the decoded signature instead of deep-copying it (the whole
   // SigValue/ConstructorDecl/LabelDecl graph) on every access.
   auto& cache = g_load_cache;
-  if (auto it = cache.find(filepath); it != cache.end()) {
-    if (cache_fresh(filepath, g_load_tok)) return it->second;
-    cache.erase(it);  // daemon mode: the .cmi changed since we cached it
-  }
+  if (auto it = cache.find(filepath); it != cache.end()) return it->second;
   m::Arena arena;
   CmiFile cmi;
   // Fill imports() too (the crc table is a cheap tail read): the labelset index
@@ -721,7 +680,6 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
   Decoder dec(arena);
   cmi.module_name_ = arena[tuple.fields.at(0)].str();
   cmi.sig_ = dec.signature(tuple.fields.at(1));
-  cache_stamp(filepath, g_load_tok);
   return cache.emplace(filepath, std::move(cmi)).first->second;
 }
 
@@ -738,10 +696,7 @@ const CmiFile& CmiFile::load_types_only(const std::string& filepath) {
   // The arena is still fully read (the Marshal stream is sequential), but the
   // Decoder skips the value type-graphs and submodule recursion.
   static std::unordered_map<std::string, CmiFile> cache;
-  if (auto it = cache.find(filepath); it != cache.end()) {
-    if (cache_fresh(filepath, g_types_tok)) return it->second;
-    cache.erase(it);
-  }
+  if (auto it = cache.find(filepath); it != cache.end()) return it->second;
   m::Arena arena;
   CmiFile cmi;
   std::size_t header = read_cmi_arena(filepath, arena, &cmi.imports_);
@@ -750,7 +705,6 @@ const CmiFile& CmiFile::load_types_only(const std::string& filepath) {
   Decoder dec(arena);
   cmi.module_name_ = arena[tuple.fields.at(0)].str();
   cmi.sig_ = dec.signature_types_only(tuple.fields.at(1));
-  cache_stamp(filepath, g_types_tok);
   return cache.emplace(filepath, std::move(cmi)).first->second;
 }
 

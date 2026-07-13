@@ -160,10 +160,6 @@ const std::vector<std::string>& infer_module_dirs();
 // unit's lookups must see.
 void clear_head_cmi_cache();
 
-// Reclaim the per-compile Type scratch arena (defined in infer.cpp).  Only the
-// compile daemon needs this; a one-shot process fast-exits.
-namespace infer { void reset_type_arena(); }
-
 // A compilation unit's top-level signature (in source order) as cmiw items --
 // the input to cmi::cmiw::write_cmi.  Single-var `let` bindings -> Sig_value
 // (matching the .cmo's exported field order); `type` declarations -> Sig_type

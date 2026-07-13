@@ -47,27 +47,12 @@ struct LamArena {
     }
     return slabs_.back() + used_++;
   }
-  // Destruct every constructed node and release the slabs (see the mirror in
-  // infer.cpp's TypeArena::reset).  For the compile daemon, which reuses one
-  // process across many modules; safe once run_main returns (no LamPtr survives
-  // a compile -- translation output is consumed by bytegen and dropped).
-  void reset() {
-    for (std::size_t s = 0; s < slabs_.size(); ++s) {
-      std::size_t n = (s + 1 == slabs_.size()) ? used_ : kSlab;
-      for (std::size_t i = 0; i < n; ++i) slabs_[s][i].~Lam();
-      ::operator delete(slabs_[s]);
-    }
-    slabs_.clear();
-    used_ = kSlab;
-  }
 };
 LamArena g_lam_arena;
 }  // namespace
 
 LamPtr lam_alloc() { return LamPtr{new (g_lam_arena.raw()) Lam()}; }
 LamPtr lam_alloc_copy(const Lam& src) { return LamPtr{new (g_lam_arena.raw()) Lam(src)}; }
-// Reclaim the per-compile Lam scratch arena; called by the daemon between compiles.
-void reset_lam_arena() { g_lam_arena.reset(); }
 
 namespace {
 using namespace ast;

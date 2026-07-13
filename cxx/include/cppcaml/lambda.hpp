@@ -67,10 +67,6 @@ struct LamPtr {
 // default-constructs; lam_alloc_copy copy-constructs from an existing node.
 LamPtr lam_alloc();
 LamPtr lam_alloc_copy(const Lam& src);
-// Reclaim the per-compile Lam scratch arena (destruct nodes + free slabs).  Only
-// the compile daemon needs this -- a one-shot process fast-exits.  Safe once a
-// compile's run_main returns: no LamPtr outlives the translation.
-void reset_lam_arena();
 
 // An identifier with a stamp (normalized by first dump appearance, like the
 // typedtree harness).  name "" for compiler temporaries shown as *match*.
