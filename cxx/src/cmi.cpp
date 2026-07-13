@@ -2,6 +2,8 @@
 #include "cppcaml/omarshal.hpp"
 #include "cppcaml/blake2.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -11,6 +13,14 @@
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+
+// Region-contained cmi decode (the mmap cmi cache) needs the mimalloc arena/
+// heap API and mmap/mprotect; without them load() just always decodes normally.
+#if defined(CPPCAML_HAVE_MIMALLOC) && defined(__linux__)
+#define CPPCAML_CMI_REGIONS 1
+#include <mimalloc.h>
+#include <sys/mman.h>
+#endif
 
 namespace cppcaml::cmi {
 
@@ -25,18 +35,24 @@ namespace {
 // can later redirect where slabs land.
 struct GraphArena {
   static constexpr std::size_t kSlab = 1 << 18;  // 256KB
-  std::vector<void*> slabs_;
+  char* cur_ = nullptr;       // current slab; past slabs are intentionally
+                              // leaked (nodes live for the whole process)
   std::size_t used_ = kSlab;  // == kSlab forces a fresh slab on first alloc
   void* alloc(std::size_t n, std::size_t a) {
     used_ = (used_ + a - 1) & ~(a - 1);
     if (used_ + n > kSlab) {
-      slabs_.push_back(::operator new(kSlab));
+      cur_ = static_cast<char*>(::operator new(kSlab));
       used_ = 0;
     }
-    void* p = static_cast<char*>(slabs_.back()) + used_;
+    void* p = cur_ + used_;
     used_ += n;
     return p;
   }
+  // Abandon the current slab's tail: the next alloc starts a fresh slab from
+  // whatever heap is then active.  Called around a region-contained decode so
+  // one slab never holds nodes of two different regions (a node written into
+  // an earlier, already-sealed region would fault on its PROT_READ pages).
+  void fresh() { used_ = kSlab; }
 };
 GraphArena g_graph_arena;
 
@@ -84,16 +100,20 @@ inline std::vector<std::uint8_t> slurp_bytes(std::ifstream& in) {
 // Walks a decoded Marshal arena and reconstructs Types structures on demand.
 class Decoder {
 public:
-  explicit Decoder(const m::Arena& arena) : arena_(arena) {}
+  // The memo is preallocated dense (arena ids index it directly) at
+  // construction time, so decoding performs no memo allocation: during a
+  // region-contained decode the Decoder is constructed BEFORE the region heap
+  // takes over, keeping this purely-transient table out of the sealed dump.
+  explicit Decoder(const m::Arena& arena)
+      : arena_(arena), memo_(arena.size()) {}
 
   // type_expr is the transient_expr record { desc; level; scope; id };
   // field 0 is the type_desc.  Memoize by arena id so shared/cyclic graphs
   // map to shared/cyclic C++ nodes.
   TypePtr type(std::size_t id) {
-    auto it = memo_.find(id);
-    if (it != memo_.end()) return it->second;
+    if (TypePtr t = memo_[id]) return t;
     TypePtr t = type_alloc();
-    memo_.emplace(id, t);
+    memo_[id] = t;
     decode_desc(arena_[id].fields.at(0), *t);
     return t;
   }
@@ -629,7 +649,7 @@ private:
   }
 
   const m::Arena& arena_;
-  std::unordered_map<std::size_t, TypePtr> memo_;
+  std::vector<TypePtr> memo_;  // dense by arena id; null = not yet decoded
 };
 
 }  // namespace
@@ -702,31 +722,150 @@ std::size_t read_cmi_arena(const std::string& filepath, m::Arena& arena,
 namespace {
 // The full-decode cache, at file scope so loaded_paths() can enumerate which
 // modules this compile has actually referenced (their .cmi got loaded).
-std::unordered_map<std::string, CmiFile> g_load_cache;
+// Holds pointers: a decoded CmiFile either lives on the normal heap (never
+// freed -- the cache is never erased and the compiler fast-exits) or inside a
+// sealed read-only region (the mmap cmi cache).
+std::unordered_map<std::string, const CmiFile*> g_load_cache;
+
+#ifdef CPPCAML_CMI_REGIONS
+// One region per cmi: a private VA reservation whose pages hold every byte
+// reachable from the decoded CmiFile.  Real graphs are 0.05-3MB; 32MB gives
+// 10x headroom over the largest observed while keeping the arena's metadata
+// (bitmaps sized by slice count) small -- a graph that somehow outgrows it
+// just falls back to a normal decode.  Pages commit on touch (MAP_NORESERVE).
+constexpr std::size_t kRegionSize = 32ull << 20;
+// mi_manage_os_memory_ex wants the arena start slice-aligned (64KB); it would
+// self-align an unaligned start, but then the arena base != our map base and
+// a future fixed-address remap would drift.  Align it ourselves.
+constexpr std::size_t kSliceAlign = 64ull << 10;
+
+// CPPCAML_CMIMAP=<dir> opts in (the dir is the step-3 blob store; region
+// containment alone only needs it non-empty).  Off by default.
+const char* cmimap_dir() {
+  static const char* d = std::getenv("CPPCAML_CMIMAP");
+  return d;
+}
+bool cmimap_dbg() {
+  static const bool b = std::getenv("CPPCAML_CMIMAP_DBG") != nullptr;
+  return b;
+}
+#endif
 }  // namespace
+
+#ifdef CPPCAML_CMI_REGIONS
+const CmiFile* CmiFile::decode_in_region(const std::string& filepath,
+                                         const m::Arena& arena,
+                                         std::size_t header,
+                                         const std::vector<std::string>& imports) {
+  // Reserve the region.  Over-map by one slice so the arena base can be
+  // slice-aligned; the (at most 64KB) head is dead reservation, never touched.
+  const std::size_t map_size = kRegionSize + kSliceAlign;
+  void* map = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (map == MAP_FAILED) return nullptr;
+  auto base_u = (reinterpret_cast<std::uintptr_t>(map) + kSliceAlign - 1) &
+                ~(kSliceAlign - 1);
+  void* base = reinterpret_cast<void*>(base_u);
+
+  // Hand the region to mimalloc as an exclusive arena and decode under a heap
+  // bound to it.  Exclusive means allocations from that heap come from this
+  // region or fail loudly (no silent OS fallback): containment is guaranteed,
+  // not hoped for.  bad_alloc on a >256MB graph falls back to normal decode.
+  mi_arena_id_t aid = nullptr;
+  if (!mi_manage_os_memory_ex(base, kRegionSize, /*is_committed=*/true,
+                              /*is_pinned=*/true, /*is_zero=*/true,
+                              /*numa_node=*/-1, /*exclusive=*/true, &aid)) {
+    munmap(map, map_size);
+    return nullptr;
+  }
+  auto unload_arena = [&] {
+    void* rb = nullptr;
+    std::size_t accessed = 0, full = 0;
+    mi_arena_unload(aid, &rb, &accessed, &full);
+    return accessed;
+  };
+  mi_heap_t* heap = mi_heap_new_in_arena(aid);
+  if (!heap) {
+    unload_arena();
+    munmap(map, map_size);
+    return nullptr;
+  }
+
+  // Decode with the region heap as the default allocation target.  The
+  // transient marshal arena was already parsed on the normal heap (it is
+  // discarded after decode -- caching it was the proven session-14 wash);
+  // everything allocated from here to the restore -- the CmiFile object, its
+  // strings/vectors, every graph node slab -- lands in the region.  The
+  // Decoder's memo lives and dies in the region too: bounded dump waste,
+  // zero risk of a normal-heap pointer sneaking into the graph.
+  CmiFile* cmi = nullptr;
+  Decoder dec(arena);  // its memo is a normal-heap transient (see Decoder)
+  mi_heap_t* prev = mi_heap_set_default(heap);
+  g_graph_arena.fresh();
+  try {
+    cmi = new CmiFile();
+    cmi->module_name_ = std::string(arena[arena[header].fields.at(0)].str());
+    cmi->imports_ = imports;  // deep-copies into the region
+    cmi->sig_ = dec.signature(arena[header].fields.at(1));
+  } catch (...) {
+    g_graph_arena.fresh();
+    mi_heap_set_default(prev);
+    mi_heap_unload(heap);
+    unload_arena();
+    munmap(map, map_size);
+    return nullptr;  // fall back to a normal decode
+  }
+  g_graph_arena.fresh();
+  mi_heap_set_default(prev);
+
+  // Seal: detach the arena from mimalloc (nothing may allocate or free here
+  // ever again -- consumers only read), then enforce exactly that.  Any code
+  // path that mutates a decoded graph now faults instead of corrupting the
+  // shared cache: PROT_READ is the containment probe.
+  mi_heap_unload(heap);
+  std::size_t accessed = unload_arena();
+  mprotect(base, kRegionSize, PROT_READ);
+  if (cmimap_dbg()) {
+    // The dump-size truth is the pages actually touched (resident), not the
+    // slice-granular `accessed`: mimalloc's 64KB slices inflate the latter.
+    std::vector<unsigned char> res((accessed + 4095) / 4096);
+    std::size_t touched = 0;
+    if (!res.empty() && mincore(base, accessed, res.data()) == 0)
+      for (unsigned char r : res) touched += (r & 1) ? 4096 : 0;
+    std::fprintf(stderr, "[cmimap] %s: region %p accessed %zuKB touched %zuKB\n",
+                 filepath.c_str(), base, accessed >> 10, touched >> 10);
+  }
+  return cmi;
+}
+#endif  // CPPCAML_CMI_REGIONS
 
 const CmiFile& CmiFile::load(const std::string& filepath) {
   // A .cmi is immutable for the lifetime of a compile, but several passes (the
   // inferencer, register_stdlib_ctors, pervasive resolution) each re-decode the
   // same file -- stdlib.cmi alone is decoded 3x.  Memoise by path: the Marshal
   // decode (the costly part, ~2 ms for stdlib.cmi) then happens once.  Return a
-  // reference into the (static, never-erased) cache -- unordered_map keeps
-  // element references stable across rehash -- so callers that bind `const
-  // auto&` share the decoded signature instead of deep-copying it (the whole
-  // SigValue/ConstructorDecl/LabelDecl graph) on every access.
+  // reference to the (static, never-erased) cache entry so callers that bind
+  // `const auto&` share the decoded signature instead of deep-copying it (the
+  // whole SigValue/ConstructorDecl/LabelDecl graph) on every access.
   auto& cache = g_load_cache;
-  if (auto it = cache.find(filepath); it != cache.end()) return it->second;
+  if (auto it = cache.find(filepath); it != cache.end()) return *it->second;
   m::Arena arena;
-  CmiFile cmi;
+  auto cmi = std::make_unique<CmiFile>();
   // Fill imports() too (the crc table is a cheap tail read): the labelset index
   // reuses full-loaded cmis and needs their transitive-import set for scoping.
-  std::size_t header = read_cmi_arena(filepath, arena, &cmi.imports_);
+  std::size_t header = read_cmi_arena(filepath, arena, &cmi->imports_);
   const m::Value& tuple = arena[header];  // (modname, signature)
 
+#ifdef CPPCAML_CMI_REGIONS
+  if (cmimap_dir())
+    if (const CmiFile* r =
+            decode_in_region(filepath, arena, header, cmi->imports_))
+      return *cache.emplace(filepath, r).first->second;
+#endif
   Decoder dec(arena);
-  cmi.module_name_ = arena[tuple.fields.at(0)].str();
-  cmi.sig_ = dec.signature(tuple.fields.at(1));
-  return cache.emplace(filepath, std::move(cmi)).first->second;
+  cmi->module_name_ = arena[tuple.fields.at(0)].str();
+  cmi->sig_ = dec.signature(tuple.fields.at(1));
+  return *cache.emplace(filepath, cmi.release()).first->second;
 }
 
 std::vector<std::string> CmiFile::loaded_paths() {

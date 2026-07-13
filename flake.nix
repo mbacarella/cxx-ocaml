@@ -42,6 +42,11 @@
             pkgs.gdb
             pkgs.diffutils
             pkgs.git
+            # `perf` for sampling profiles of c++ocamlc (real cycles / cache
+            # misses, no -pg instrumentation skew).  Needs the container to be
+            # launched with the perf_flags in docker-dev.sh (CAP_PERFMON +
+            # seccomp=unconfined) or perf_event_open returns EPERM.
+            pkgs.linuxPackages_latest.perf
           ];
 
           # Banner goes to stderr so `nix develop --command <tool>` keeps a clean
@@ -49,9 +54,10 @@
           shellHook = ''
             export CC=clang
             export CXX=clang++
-            # Let CMake's find_file locate mimalloc.o (nix's cmake hook does not
-            # populate CMAKE_PREFIX_PATH in an interactive shell).
-            export CMAKE_PREFIX_PATH="${mimalloc}''${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+            # Let CMake's find_file locate mimalloc.o and find_path locate
+            # mimalloc.h -- the dev output holds the headers (nix's cmake hook
+            # does not populate CMAKE_PREFIX_PATH in an interactive shell).
+            export CMAKE_PREFIX_PATH="${mimalloc}:${mimalloc.dev}''${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
             {
               echo "c++caml dev shell (clang-only)"
               echo "  C/C++ : $(clang --version | head -1)"

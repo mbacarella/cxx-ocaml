@@ -47,6 +47,15 @@ if(CPPCAML_MIMALLOC)
   if(MIMALLOC_OBJECT)
     message(STATUS "mimalloc override: ${MIMALLOC_OBJECT}")
     target_link_libraries(cppcaml_core PUBLIC ${MIMALLOC_OBJECT})
+    # The mmap pre-decoded cmi cache (cmi.cpp) uses the mi_* arena/heap API to
+    # contain a cmi's decoded graph in one region; it degrades to the normal
+    # decode path when the header is absent.
+    find_path(MIMALLOC_INCLUDE_DIR mimalloc.h DOC "mimalloc header directory")
+    if(MIMALLOC_INCLUDE_DIR)
+      message(STATUS "mimalloc headers: ${MIMALLOC_INCLUDE_DIR}")
+      target_include_directories(cppcaml_core PUBLIC ${MIMALLOC_INCLUDE_DIR})
+      target_compile_definitions(cppcaml_core PUBLIC CPPCAML_HAVE_MIMALLOC=1)
+    endif()
   else()
     message(FATAL_ERROR
       "mimalloc.o not found (add pkgs.mimalloc / set CMAKE_PREFIX_PATH, "

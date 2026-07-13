@@ -294,6 +294,17 @@ public:
   const std::vector<std::string>& imports() const { return imports_; }
 
 private:
+  // Decode a parsed cmi (the header value at arena id `header`) with every
+  // allocation reachable from the returned CmiFile contained in one private
+  // memory region, sealed read-only afterwards -- the in-memory form of the
+  // mmap cmi cache (see cmi.cpp).  Returns null when region decode is
+  // unavailable or fails; the caller then decodes normally.  Only built when
+  // the mimalloc arena API is present (CPPCAML_HAVE_MIMALLOC).
+  static const CmiFile* decode_in_region(const std::string& path,
+                                         const marshal::Arena& arena,
+                                         std::size_t header,
+                                         const std::vector<std::string>& imports);
+
   std::string module_name_;
   Signature sig_;
   std::vector<std::string> imports_;
