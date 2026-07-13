@@ -9971,9 +9971,12 @@ struct Translator {
     // (`Named`, shared by 6 types at arities 1/2/3) resolves through the scrutinee's
     // type, not the globally last-registered one.  Restored on return.
     CtorSave ctor_save;
+    std::string forced_type_path;  // the scrutinee's type path, once force-registered
     if (scrut->k == Lam::K::Var)
-      if (auto vp = var_record_path_.find(scrut->var.stamp); vp != var_record_path_.end())
+      if (auto vp = var_record_path_.find(scrut->var.stamp); vp != var_record_path_.end()) {
         ctor_save = force_register_type_ctors(vp->second);
+        if (!ctor_save.empty()) forced_type_path = vp->second;
+      }
     // If the scrutinee's type path is unknown but a row uses a QUALIFIED constructor
     // (`Type_immediacy.Unknown`), that pattern names the type directly -- force-register
     // `Mod.type` so its true (n_const,n_block) overrides a stale same-short-name entry in
@@ -9991,6 +9994,7 @@ struct Translator {
         auto f = mc.find(d->name);
         if (f == mc.end()) continue;
         ctor_save = force_register_type_ctors(pl->name + "." + f->second.type);
+        if (!ctor_save.empty()) forced_type_path = pl->name + "." + f->second.type;
         break;
       }
     // Still unknown, but a row's UNqualified ctor pattern has an inferred module-qualified
@@ -10011,7 +10015,7 @@ struct Translator {
         }
         if (it == vk.pat_constr.end() || it->second.find('.') == std::string::npos) continue;
         ctor_save = force_register_type_ctors(it->second);
-        if (!ctor_save.empty()) break;
+        if (!ctor_save.empty()) { forced_type_path = it->second; break; }
       }
     // Still unresolved, but a row buries a QUALIFIED ctor under a tuple/record
     // (`_, Internal_names.Equation {lhs;rhs}`): the flat ctor_info_["Equation"]
@@ -10024,10 +10028,38 @@ struct Translator {
         std::string tp = nested_qualified_ctor_type(*r.lhs);
         if (tp.empty()) continue;
         ctor_save = force_register_type_ctors(tp);
-        if (!ctor_save.empty()) break;
+        if (!ctor_save.empty()) { forced_type_path = tp; break; }
       }
-    struct CtorGuard { Translator* self; CtorSave sv;
-                       ~CtorGuard() { self->restore_ctors(sv); } } ctor_guard{this, std::move(ctor_save)};
+    // A row `Change (Type {..})` on the scrutinee's now-registered variant carries an
+    // INNER ctor (`Type`) belonging to the OUTER ctor's ARGUMENT type (`Mod.mismatch`),
+    // not to the scrutinee's own type.  register_sibling_arg_ctors registers it only as a
+    // FALLBACK, so a local same-named `Type` squats the flat ctor_info_ slot and the
+    // nested record fields fall unbound (?got/?expected/?reason -- includecore).  FORCE-
+    // register the outer ctor's declared arg type (override + save/restore) so the inner
+    // ctor/record resolves through it.  Gated on a nested construct/record sub-pattern.
+    std::vector<CtorSave> arg_saves;
+    if (!forced_type_path.empty())
+      if (auto sd = forced_type_path.rfind('.'); sd != std::string::npos) {
+        std::string smod = forced_type_path.substr(0, sd);
+        for (auto& r : rows) {
+          auto* oc = std::get_if<Ppat_construct>(&effective_pat(r.lhs)->desc);
+          if (!oc || !oc->arg) continue;
+          const Pattern* sub = effective_pat(&**oc->arg);
+          if (!std::holds_alternative<Ppat_construct>(sub->desc) &&
+              !std::holds_alternative<Ppat_record>(sub->desc)) continue;
+          auto ci = ctor_info_.find(lid_last(oc->id.txt));
+          if (ci == ctor_info_.end() || ci->second.arg_type_names.empty() ||
+              ci->second.arg_type_names[0].empty()) continue;
+          CtorSave s = force_register_type_ctors(smod + "." + ci->second.arg_type_names[0]);
+          if (!s.empty()) arg_saves.push_back(std::move(s));
+        }
+      }
+    struct CtorGuard { Translator* self; CtorSave sv; std::vector<CtorSave> args;
+                       ~CtorGuard() {
+                         for (auto it = args.rbegin(); it != args.rend(); ++it)
+                           self->restore_ctors(*it);
+                         self->restore_ctors(sv);
+                       } } ctor_guard{this, std::move(ctor_save), std::move(arg_saves)};
     // Resolve any qualified stdlib constructors in the rows (Seq.Cons, ...) so
     // the matcher below has their tag/arity like local/predef constructors.
     for (auto& r : rows) scan_pat_ctors(*r.lhs);
