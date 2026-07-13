@@ -12,6 +12,12 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 
+# A GNU build-id note in every binary.  The mmap cmi cache stamps its blobs
+# with the producing compiler's build-id: any rebuild (struct layout, decoder
+# logic, libstdc++ headers) yields a new id and silently invalidates every
+# blob, so a stale cache can never survive a compiler change.
+add_link_options(-Wl,--build-id=sha1)
+
 # Core compiler library (grows one pipeline stage at a time).
 add_library(cppcaml_core
   src/token.cpp

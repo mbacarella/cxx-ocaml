@@ -16,10 +16,18 @@
 
 // Region-contained cmi decode (the mmap cmi cache) needs the mimalloc arena/
 // heap API and mmap/mprotect; without them load() just always decodes normally.
-#if defined(CPPCAML_HAVE_MIMALLOC) && defined(__linux__)
+#include <cstdint>
+#if defined(CPPCAML_HAVE_MIMALLOC) && defined(__linux__) && \
+    UINTPTR_MAX > 0xffffffffu  // fixed VA slots need a 64-bit address space
 #define CPPCAML_CMI_REGIONS 1
 #include <mimalloc.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <link.h>   // dl_iterate_phdr: our own GNU build-id
+#include <climits>
+#include <cstring>
 #endif
 
 namespace cppcaml::cmi {
@@ -734,20 +742,183 @@ std::unordered_map<std::string, const CmiFile*> g_load_cache;
 // (bitmaps sized by slice count) small -- a graph that somehow outgrows it
 // just falls back to a normal decode.  Pages commit on touch (MAP_NORESERVE).
 constexpr std::size_t kRegionSize = 32ull << 20;
-// mi_manage_os_memory_ex wants the arena start slice-aligned (64KB); it would
-// self-align an unaligned start, but then the arena base != our map base and
-// a future fixed-address remap would drift.  Align it ourselves.
-constexpr std::size_t kSliceAlign = 64ull << 10;
+// Every cmi decodes AT A FIXED VIRTUAL ADDRESS derived from its absolute
+// path, so a dumped region maps back later with all internal pointers valid
+// as-is (the GCC-PCH trick): zero fixup, zero per-node work.  2^18 slots of
+// one region each span 8TB starting at 0x4800'0000'0000 -- clear of the PIE
+// executable range (~0x55..) and the top-down mmap area (~0x7f..) on x86-64
+// Linux.  ~300 cmis into 2^18 slots makes a same-process collision unlikely;
+// MAP_FIXED_NOREPLACE turns any collision or overlap into a clean fallback
+// (normal decode, no cache) rather than a corrupted mapping.  32MB regions
+// are naturally 64KB-aligned as mi_manage_os_memory_ex requires.
+constexpr std::uintptr_t kSlotBase = 0x4800'0000'0000ull;
+constexpr std::size_t kSlotCount = 1ull << 18;
 
-// CPPCAML_CMIMAP=<dir> opts in (the dir is the step-3 blob store; region
-// containment alone only needs it non-empty).  Off by default.
+std::uint64_t fnv1a64(const char* s) {
+  std::uint64_t h = 1469598103934665603ull;
+  for (; *s; ++s) h = (h ^ static_cast<unsigned char>(*s)) * 1099511628211ull;
+  return h;
+}
+void* slot_of(const char* abspath) {
+  return reinterpret_cast<void*>(kSlotBase +
+                                 (fnv1a64(abspath) % kSlotCount) * kRegionSize);
+}
+
+// The producing compiler's own GNU build-id (linked in via -Wl,--build-id).
+// Blobs are stamped with it: ANY rebuild of the compiler -- decoder change,
+// struct layout, libstdc++ headers -- yields a different id and silently
+// invalidates every existing blob.  The blob format IS the process image, so
+// this is the only versioning that can be trusted.  len 0 = no note found;
+// the cache then disables itself entirely.
+struct BuildId {
+  unsigned char bytes[32] = {};
+  unsigned len = 0;
+};
+const BuildId& own_build_id() {
+  static const BuildId id = [] {
+    BuildId out{};
+    dl_iterate_phdr(
+        [](dl_phdr_info* info, std::size_t, void* data) -> int {
+          if (info->dlpi_name && info->dlpi_name[0]) return 0;  // main exe only
+          auto* o = static_cast<BuildId*>(data);
+          for (int i = 0; i < info->dlpi_phnum; ++i) {
+            const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_NOTE) continue;
+            const char* p =
+                reinterpret_cast<const char*>(info->dlpi_addr + ph.p_vaddr);
+            const char* end = p + ph.p_memsz;
+            while (p + sizeof(ElfW(Nhdr)) <= end) {
+              auto* n = reinterpret_cast<const ElfW(Nhdr)*>(p);
+              const char* name = p + sizeof(ElfW(Nhdr));
+              const char* desc = name + ((n->n_namesz + 3) & ~3u);
+              if (desc + n->n_descsz > end) break;
+              if (n->n_type == NT_GNU_BUILD_ID && n->n_namesz == 4 &&
+                  std::memcmp(name, "GNU", 4) == 0) {
+                o->len = n->n_descsz > sizeof(o->bytes) ? sizeof(o->bytes)
+                                                        : n->n_descsz;
+                std::memcpy(o->bytes, desc, o->len);
+                return 1;
+              }
+              p = desc + ((n->n_descsz + 3) & ~3u);
+            }
+          }
+          return 1;  // main executable processed; stop iterating
+        },
+        &out);
+    return out;
+  }();
+  return id;
+}
+
+// Blob layout: one 4KB header page, then the region's bytes [base, base+used)
+// at file offset 4096 (page-aligned, so the data maps directly).  Untouched
+// pages inside `used` are file holes (written sparsely from the mincore map),
+// so the on-disk footprint is the touched pages only.
+struct CmimapHeader {
+  char magic[8];                   // "CPPCMIM1"
+  std::uint32_t version;           // bump on any layout change here
+  std::uint32_t build_id_len;
+  unsigned char build_id[32];
+  std::uint64_t cmi_size;          // source .cmi stat: size
+  std::uint64_t cmi_mtime_ns;      //   and mtime (ns)
+  std::uint64_t region_base;       // the fixed slot this region decoded at
+  std::uint64_t used;              // region bytes in this file
+  std::uint64_t entry;             // the CmiFile* inside the region
+  std::uint32_t path_len;
+  char path[3968];                 // NUL-terminated absolute cmi path
+};
+static_assert(sizeof(CmimapHeader) <= 4096);
+constexpr char kCmimapMagic[8] = {'C', 'P', 'P', 'C', 'M', 'I', 'M', '1'};
+constexpr std::uint32_t kCmimapVersion = 1;
+
+// CPPCAML_CMIMAP=<blob dir> opts the cache in; off by default.  Disabled
+// (null) when the dir cannot be created or the compiler has no build-id.
 const char* cmimap_dir() {
-  static const char* d = std::getenv("CPPCAML_CMIMAP");
+  static const char* d = []() -> const char* {
+    const char* dir = std::getenv("CPPCAML_CMIMAP");
+    if (!dir || !*dir) return nullptr;
+    if (own_build_id().len == 0) return nullptr;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return ec ? nullptr : dir;
+  }();
   return d;
 }
 bool cmimap_dbg() {
   static const bool b = std::getenv("CPPCAML_CMIMAP_DBG") != nullptr;
   return b;
+}
+
+std::string blob_path(const char* dir, const char* abspath) {
+  const char* slash = std::strrchr(abspath, '/');
+  char hex[17];
+  std::snprintf(hex, sizeof hex, "%016llx",
+                static_cast<unsigned long long>(fnv1a64(abspath)));
+  return std::string(dir) + "/" + (slash ? slash + 1 : abspath) + "-" + hex +
+         ".cmimap";
+}
+
+// (size, mtime_ns) of the source .cmi -- the staleness key.
+bool cmi_stat(const char* path, std::uint64_t& size, std::uint64_t& mtime_ns) {
+  struct stat st;
+  if (::stat(path, &st) != 0) return false;
+  size = static_cast<std::uint64_t>(st.st_size);
+  mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1000000000ull +
+             static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
+  return true;
+}
+
+// Write the sealed region [base, base+used) to <dir>/<blob>, sparsely (only
+// resident pages; untouched ones stay holes), atomically (tmp + rename), and
+// durably (fsync before rename -- a torn blob after a crash must not be
+// mistakable for a complete one; there is no load-time checksum, checksums
+// would defeat the zero-copy load).  Failure is silent: worst case the cmi
+// just stays uncached.
+void dump_blob(const char* dir, const char* abspath, std::uint64_t cmi_size,
+               std::uint64_t cmi_mtime_ns, void* base, std::size_t used,
+               const CmiFile* entry) {
+  if (std::strlen(abspath) >= sizeof(CmimapHeader::path)) return;
+  std::string final_path = blob_path(dir, abspath);
+  std::string tmp = final_path + ".tmp." + std::to_string(::getpid());
+  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd < 0) return;
+  bool ok = ::ftruncate(fd, 4096 + static_cast<off_t>(used)) == 0;
+
+  CmimapHeader h{};
+  std::memcpy(h.magic, kCmimapMagic, 8);
+  h.version = kCmimapVersion;
+  const BuildId& bid = own_build_id();
+  h.build_id_len = bid.len;
+  std::memcpy(h.build_id, bid.bytes, sizeof h.build_id);
+  h.cmi_size = cmi_size;
+  h.cmi_mtime_ns = cmi_mtime_ns;
+  h.region_base = reinterpret_cast<std::uint64_t>(base);
+  h.used = used;
+  h.entry = reinterpret_cast<std::uint64_t>(entry);
+  h.path_len = static_cast<std::uint32_t>(std::strlen(abspath));
+  std::memcpy(h.path, abspath, h.path_len + 1);
+  ok = ok && ::pwrite(fd, &h, sizeof h, 0) == static_cast<ssize_t>(sizeof h);
+
+  // Sparse data: write runs of resident pages, seek over the rest.
+  const std::size_t npages = (used + 4095) / 4096;
+  std::vector<unsigned char> res(npages);
+  ok = ok && ::mincore(base, used, res.data()) == 0;
+  for (std::size_t i = 0; ok && i < npages;) {
+    if (!(res[i] & 1)) { ++i; continue; }
+    std::size_t j = i;
+    while (j < npages && (res[j] & 1)) ++j;
+    std::size_t off = i * 4096, len = std::min(j * 4096, used) - off;
+    ok = ::pwrite(fd, static_cast<char*>(base) + off, len,
+                  4096 + static_cast<off_t>(off)) == static_cast<ssize_t>(len);
+    i = j;
+  }
+  ok = ok && ::fsync(fd) == 0;
+  ::close(fd);
+  if (ok) ok = ::rename(tmp.c_str(), final_path.c_str()) == 0;
+  if (!ok) ::unlink(tmp.c_str());
+  if (cmimap_dbg())
+    std::fprintf(stderr, "[cmimap] dump %s: %s\n", final_path.c_str(),
+                 ok ? "ok" : "FAILED");
 }
 #endif
 }  // namespace
@@ -757,25 +928,31 @@ const CmiFile* CmiFile::decode_in_region(const std::string& filepath,
                                          const m::Arena& arena,
                                          std::size_t header,
                                          const std::vector<std::string>& imports) {
-  // Reserve the region.  Over-map by one slice so the arena base can be
-  // slice-aligned; the (at most 64KB) head is dead reservation, never touched.
-  const std::size_t map_size = kRegionSize + kSliceAlign;
-  void* map = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (map == MAP_FAILED) return nullptr;
-  auto base_u = (reinterpret_cast<std::uintptr_t>(map) + kSliceAlign - 1) &
-                ~(kSliceAlign - 1);
-  void* base = reinterpret_cast<void*>(base_u);
+  // The region must live at the path's fixed slot, or the dump would be
+  // useless (pointers are absolute).  MAP_FIXED_NOREPLACE: a slot collision
+  // or any pre-existing overlap fails cleanly and we just decode normally.
+  const char* dir = cmimap_dir();
+  char abspath[PATH_MAX];
+  if (!dir || !::realpath(filepath.c_str(), abspath)) return nullptr;
+  std::uint64_t cmi_size = 0, cmi_mtime_ns = 0;
+  if (!cmi_stat(abspath, cmi_size, cmi_mtime_ns)) return nullptr;
+  void* slot = slot_of(abspath);
+  void* base = mmap(slot, kRegionSize, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+                        MAP_FIXED_NOREPLACE,
+                    -1, 0);
+  if (base == MAP_FAILED) return nullptr;
 
   // Hand the region to mimalloc as an exclusive arena and decode under a heap
   // bound to it.  Exclusive means allocations from that heap come from this
   // region or fail loudly (no silent OS fallback): containment is guaranteed,
-  // not hoped for.  bad_alloc on a >256MB graph falls back to normal decode.
+  // not hoped for.  bad_alloc on a graph outgrowing the region falls back to
+  // a normal decode.
   mi_arena_id_t aid = nullptr;
   if (!mi_manage_os_memory_ex(base, kRegionSize, /*is_committed=*/true,
                               /*is_pinned=*/true, /*is_zero=*/true,
                               /*numa_node=*/-1, /*exclusive=*/true, &aid)) {
-    munmap(map, map_size);
+    munmap(base, kRegionSize);
     return nullptr;
   }
   auto unload_arena = [&] {
@@ -787,19 +964,18 @@ const CmiFile* CmiFile::decode_in_region(const std::string& filepath,
   mi_heap_t* heap = mi_heap_new_in_arena(aid);
   if (!heap) {
     unload_arena();
-    munmap(map, map_size);
+    munmap(base, kRegionSize);
     return nullptr;
   }
 
   // Decode with the region heap as the default allocation target.  The
   // transient marshal arena was already parsed on the normal heap (it is
-  // discarded after decode -- caching it was the proven session-14 wash);
+  // discarded after decode -- caching it was the proven session-14 wash),
+  // and the Decoder's memo is a normal-heap transient (see Decoder);
   // everything allocated from here to the restore -- the CmiFile object, its
-  // strings/vectors, every graph node slab -- lands in the region.  The
-  // Decoder's memo lives and dies in the region too: bounded dump waste,
-  // zero risk of a normal-heap pointer sneaking into the graph.
+  // strings/vectors, every graph node slab -- lands in the region.
   CmiFile* cmi = nullptr;
-  Decoder dec(arena);  // its memo is a normal-heap transient (see Decoder)
+  Decoder dec(arena);
   mi_heap_t* prev = mi_heap_set_default(heap);
   g_graph_arena.fresh();
   try {
@@ -812,7 +988,7 @@ const CmiFile* CmiFile::decode_in_region(const std::string& filepath,
     mi_heap_set_default(prev);
     mi_heap_unload(heap);
     unload_arena();
-    munmap(map, map_size);
+    munmap(base, kRegionSize);
     return nullptr;  // fall back to a normal decode
   }
   g_graph_arena.fresh();
@@ -820,8 +996,8 @@ const CmiFile* CmiFile::decode_in_region(const std::string& filepath,
 
   // Seal: detach the arena from mimalloc (nothing may allocate or free here
   // ever again -- consumers only read), then enforce exactly that.  Any code
-  // path that mutates a decoded graph now faults instead of corrupting the
-  // shared cache: PROT_READ is the containment probe.
+  // path that mutates a decoded graph now faults instead of silently
+  // corrupting the dump: PROT_READ is the containment probe.
   mi_heap_unload(heap);
   std::size_t accessed = unload_arena();
   mprotect(base, kRegionSize, PROT_READ);
@@ -835,7 +1011,54 @@ const CmiFile* CmiFile::decode_in_region(const std::string& filepath,
     std::fprintf(stderr, "[cmimap] %s: region %p accessed %zuKB touched %zuKB\n",
                  filepath.c_str(), base, accessed >> 10, touched >> 10);
   }
+  dump_blob(dir, abspath, cmi_size, cmi_mtime_ns, base, accessed, cmi);
   return cmi;
+}
+
+const CmiFile* CmiFile::load_from_blob(const std::string& filepath) {
+  const char* dir = cmimap_dir();
+  char abspath[PATH_MAX];
+  if (!dir || !::realpath(filepath.c_str(), abspath)) return nullptr;
+  std::uint64_t cmi_size = 0, cmi_mtime_ns = 0;
+  if (!cmi_stat(abspath, cmi_size, cmi_mtime_ns)) return nullptr;
+  int fd = ::open(blob_path(dir, abspath).c_str(), O_RDONLY);
+  if (fd < 0) return nullptr;
+
+  // Validate the header: right format, right COMPILER BUILD, right source
+  // .cmi (size+mtime), right path (guards a blob-name hash collision), and
+  // an entry pointer inside the region.  Any mismatch -> decode normally
+  // (and the cold path will rename a fresh blob over this one).
+  CmimapHeader h;
+  bool ok = ::pread(fd, &h, sizeof h, 0) == static_cast<ssize_t>(sizeof h) &&
+            std::memcmp(h.magic, kCmimapMagic, 8) == 0 &&
+            h.version == kCmimapVersion;
+  const BuildId& bid = own_build_id();
+  ok = ok && h.build_id_len == bid.len &&
+       std::memcmp(h.build_id, bid.bytes, sizeof h.build_id) == 0;
+  ok = ok && h.cmi_size == cmi_size && h.cmi_mtime_ns == cmi_mtime_ns;
+  ok = ok && h.path_len < sizeof h.path && h.path[h.path_len] == '\0' &&
+       std::strcmp(h.path, abspath) == 0;
+  void* slot = slot_of(abspath);
+  ok = ok && h.region_base == reinterpret_cast<std::uint64_t>(slot);
+  ok = ok && h.used > 0 && h.used <= kRegionSize &&
+       h.entry >= h.region_base + sizeof(void*) &&
+       h.entry + sizeof(CmiFile) <= h.region_base + h.used;
+  if (!ok) {
+    ::close(fd);
+    return nullptr;
+  }
+
+  // Map the region bytes back at their recorded address, read-only, private.
+  // File offset 4096 is page-aligned; holes read back as the zero pages they
+  // were.  The pointers inside are valid the instant the map exists.
+  void* m = mmap(slot, h.used, PROT_READ,
+                 MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, 4096);
+  ::close(fd);  // the mapping keeps the file alive
+  if (m == MAP_FAILED) return nullptr;
+  if (cmimap_dbg())
+    std::fprintf(stderr, "[cmimap] warm %s: %zuKB at %p\n", filepath.c_str(),
+                 static_cast<std::size_t>(h.used) >> 10, m);
+  return reinterpret_cast<const CmiFile*>(h.entry);
 }
 #endif  // CPPCAML_CMI_REGIONS
 
@@ -849,6 +1072,14 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
   // whole SigValue/ConstructorDecl/LabelDecl graph) on every access.
   auto& cache = g_load_cache;
   if (auto it = cache.find(filepath); it != cache.end()) return *it->second;
+#ifdef CPPCAML_CMI_REGIONS
+  // Warm path of the mmap cmi cache: map a previously dumped, pre-decoded
+  // region back at its fixed address -- no read, no Marshal parse, no graph
+  // build.  Falls through to a normal decode on any mismatch.
+  if (cmimap_dir())
+    if (const CmiFile* r = load_from_blob(filepath))
+      return *cache.emplace(filepath, r).first->second;
+#endif
   m::Arena arena;
   auto cmi = std::make_unique<CmiFile>();
   // Fill imports() too (the crc table is a cheap tail read): the labelset index

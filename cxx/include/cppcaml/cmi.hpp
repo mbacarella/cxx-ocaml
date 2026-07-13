@@ -304,6 +304,10 @@ private:
                                          const marshal::Arena& arena,
                                          std::size_t header,
                                          const std::vector<std::string>& imports);
+  // Map a previously dumped region blob for `path` back at its recorded fixed
+  // address (read-only, zero decode, zero fixup).  Returns null when there is
+  // no valid blob (absent, stale, wrong compiler build, address taken).
+  static const CmiFile* load_from_blob(const std::string& path);
 
   std::string module_name_;
   Signature sig_;
