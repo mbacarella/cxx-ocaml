@@ -1239,6 +1239,19 @@ struct Translator {
                                                         : nd - pos - 1);
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comp) { md = &mm; break; }
+        // A submodule ALIAS (`module Uid = Shape.Uid`) carries no inline
+        // signature (Mp_absent); resolve it to its target unit path plus the
+        // remaining components and read the ctors from THERE, as submodule_of
+        // does for value fields.  (unordered_map references survive the
+        // recursive insert, so `out` stays valid.)
+        if (md && md->type && md->type->kind == cmi::ModuleType::Alias &&
+            md->type->path) {
+          std::string tgt = cmi_path_dotted(*md->type->path);
+          if (!tgt.empty()) {
+            std::string rest = (nd == std::string::npos) ? "" : mod.substr(nd);
+            return out = module_ctors(tgt + rest);
+          }
+        }
         sig = md ? mt_sig_x(cmi, md->type, keep) : nullptr;
         pos = nd;
       }
@@ -1410,13 +1423,28 @@ struct Translator {
   const CtorInfo* qualified_ctor_info(const Longident& id) {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return nullptr;
-    auto* pl = std::get_if<Lident>(&d->prefix->v);
-    if (!pl) return nullptr;
-    std::string mod = ctor_module_of(pl->name);
-    if (mod.empty()) return nullptr;
-    auto& mc = module_ctors(mod);
-    auto f = mc.find(d->name);
-    return f == mc.end() ? nullptr : &f->second;
+    if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+      std::string mod = ctor_module_of(pl->name);
+      if (mod.empty()) return nullptr;
+      auto& mc = module_ctors(mod);
+      auto f = mc.find(d->name);
+      return f == mc.end() ? nullptr : &f->second;
+    }
+    // A NESTED-module-qualified ctor `A.B.C` (the prefix `A.B` is itself
+    // dotted): resolve the full submodule path, expanding an aliased head
+    // (`Uid.Deps.Declaration_to_declaration` where `Uid` is opened from Types =
+    // Shape.Uid) and trying opened prefixes, like the value-resolution path.
+    std::string dotted;
+    if (!lid_to_dotted(*d->prefix, dotted)) return nullptr;
+    dotted = expand_alias_head(dotted);
+    std::vector<std::string> cands{dotted};
+    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
+      if (it->find('.') == std::string::npos) cands.push_back(*it + "." + dotted);
+    for (auto& cand : cands) {
+      auto& mc = module_ctors(cand);
+      if (auto f = mc.find(d->name); f != mc.end()) return &f->second;
+    }
+    return nullptr;
   }
   // Register ALL constructors of a module-qualified variant type ("Vmod.vis")
   // into ctor_info_/type_ctors_, given the type's full path from the inferencer.
