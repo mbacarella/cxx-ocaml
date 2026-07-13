@@ -3666,6 +3666,50 @@ struct Translator {
     } catch (...) {}
     return fs;
   }
+  // As mt_sig, but resolve a modtype-Ident against a GIVEN signature's modtype
+  // decls first (a functor result's `module type S` is declared inside that
+  // result sig, not at the cmi top level), then fall back to the cmi top-level.
+  static const cmi::Signature* mt_sig_in(const cmi::CmiFile& cmi,
+                                         const cmi::ModuleTypePtr& mt,
+                                         const cmi::Signature& sig, int depth = 0) {
+    if (!mt || depth > 8) return nullptr;
+    if (mt->kind == cmi::ModuleType::Sig) return mt->sig.get();
+    if (mt->kind == cmi::ModuleType::Ident && mt->path) {
+      const std::string& nm = mt->path->kind == cmi::Path::Pident ? mt->path->id.name
+                                                                  : mt->path->s;
+      for (auto& mtd : sig.modtypes)
+        if (mtd.name == nm) return mt_sig_in(cmi, mtd.type, sig, depth + 1);
+      return mt_sig(cmi, mt, depth + 1);
+    }
+    return nullptr;
+  }
+  // Result field layout of a submodule FUNCTOR nested in an EXTERNAL functor's
+  // result signature: `Diffing.Define(_).Simple(_)` -> Simple's result S={diff}.
+  // `unit`=Diffing, `outer`=Define, `inner`=Simple.  A 2nd-order functor result:
+  // read Define's result sig, find the `inner` functor member, resolve ITS
+  // result sig (following a modtype-Ident like `-> S` inside Define's result).
+  std::vector<std::string> ext_functor_submodule_functor_result(
+      const std::string& unit, const std::string& outer, const std::string& inner) {
+    if (module_base(unit) || fields_of(unit).empty()) return {};
+    try {
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(unit));
+      const cmi::Signature* defsig = nullptr;
+      for (auto& md : cmi.sig().modules)
+        if (md.name == outer && md.type &&
+            md.type->kind == cmi::ModuleType::Functor) {
+          defsig = mt_sig(cmi, md.type->functor_body);
+          break;
+        }
+      if (!defsig) return {};
+      for (auto& md : defsig->modules)
+        if (md.name == inner && md.type &&
+            md.type->kind == cmi::ModuleType::Functor)
+          if (const cmi::Signature* rs =
+                  mt_sig_in(cmi, md.type->functor_body, *defsig))
+            return rs->fields;
+    } catch (...) {}
+    return {};
+  }
   // Register a cmi signature's variant constructors (fill-absent, like nested
   // local decls) so matches over a stdlib functor result's constructors
   // compile (Sys.Immediate64.Make's Immediate/Non_immediate).
@@ -16617,12 +16661,23 @@ struct Translator {
             if (auto it = functor_result_.find(dotted); it != functor_result_.end())
               return it->second;
         }
-        if (auto* d = std::get_if<Ldot>(&fi->id.txt.v))  // a stdlib functor M.Make
+        if (auto* d = std::get_if<Ldot>(&fi->id.txt.v)) {  // a stdlib functor M.Make
           if (auto* pl = std::get_if<Lident>(&d->prefix->v))
             if (!module_base(pl->name) && !fields_of(pl->name).empty()) {
               auto fs = stdlib_functor(pl->name, d->name);
               if (fs.ok) return fs.result;
             }
+          // `Diff.Simple(Impl)` where local `Diff = Diffing.Define(..)` is bound
+          // to an EXTERNAL functor's result: `Simple` is a functor MEMBER of
+          // Define's result sig; return its own result layout (2nd-order).
+          if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+            if (auto fs = module_functor_src_.find(pl->name);
+                fs != module_functor_src_.end()) {
+              auto v = ext_functor_submodule_functor_result(
+                  fs->second.first, fs->second.second, d->name);
+              if (!v.empty()) return v;
+            }
+        }
       }
     {  // curried / deep-path stdlib functors (Sys.Immediate64.Make(Int)(Int64)):
        // descend one functor result per application
