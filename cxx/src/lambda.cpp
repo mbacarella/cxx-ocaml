@@ -9202,17 +9202,22 @@ struct Translator {
     if (comps[0]->k != Lam::K::Var) return nullptr;   // need a Var for field reads
     // Resolve the column's variant type (all ctor rows must share it).
     std::string type; const CtorInfo* any_ci = nullptr;
+    auto GB = [&](const char* r, const std::string& cn) -> LamPtr {
+      if (cppcaml::dbg_env("GBAIL")) fprintf(stderr, "[GBAIL] %s ctor=%s\n", r, cn.c_str());
+      return nullptr;
+    };
     for (auto& r : rows)
       if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
         const std::string cn = ctor_of(*r.cols[0]);
-        if (exn_typed_pat(r.cols[0], cn)) return nullptr;
+        if (exn_typed_pat(r.cols[0], cn)) return GB("exn", cn);
         const CtorInfo* ci = pat_ctor_resolve(r.cols[0], cn);
-        if (!ci || !ci->rlabels.empty() || ci->unboxed) return nullptr;
+        if (!ci) return GB("noresolve", cn);
+        if (ci->unboxed) return GB("unboxed", cn);
         if (type.empty()) { type = ci->type; any_ci = ci; }
-        else if (type != ci->type) return nullptr;
+        else if (type != ci->type) return GB("typemismatch", cn + " " + ci->type + "!=" + type);
       }
     auto tcit = type_ctors_.find(type);
-    if (tcit == type_ctors_.end() || !any_ci) return nullptr;
+    if (tcit == type_ctors_.end() || !any_ci) return GB("no-type_ctors", type);
     int NC = tcit->second.first, NB = tcit->second.second;
     // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
     std::map<int, const CtorInfo*> const_ci, block_ci;   // tag -> a resolved ctor
@@ -9262,7 +9267,14 @@ struct Translator {
         std::vector<LamPtr> cc = rest;
         return gmatch(std::move(cc), std::move(sub), mloc, deid);
       }
-      int a = bi->second->arity;
+      // Inline-record ctor (`K of { l1; l2 }`): the labels are the block's FLAT
+      // fields at label (rlabels) order, so a `K { l1 = p1; .. }` pattern splits
+      // into rlabels.size() positional columns read via fieldimm -- mirroring the
+      // fallback build_block_arm.  We handle only record-destructuring rows here;
+      // a whole-block bind (`K x`, arg is a var) is rarer and still bails.
+      const auto& rlab = bi->second->rlabels;
+      bool inl = !rlab.empty();
+      int a = inl ? (int)rlab.size() : bi->second->arity;
       std::vector<Ident> fids; std::vector<LamPtr> fvars;
       for (int j = 0; j < a; ++j) { Ident f = fresh("", true); fids.push_back(f); fvars.push_back(varof(f)); }
       std::vector<LamPtr> ncomps = fvars; ncomps.insert(ncomps.end(), rest.begin(), rest.end());
@@ -9273,8 +9285,20 @@ struct Translator {
         if (k) {
           const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]));
           if (!ci->is_block || ci->tag != t) continue;
-          auto fps = ctor_field_pats(k, a);
-          if ((int)fps.size() != a) return nullptr;       // shape we can't split
+          std::vector<const Pattern*> fps;
+          if (inl) {
+            const Pattern* ap = k->arg ? effective_pat(k->arg->get()) : nullptr;
+            auto* pr = ap ? std::get_if<Ppat_record>(&ap->desc) : nullptr;
+            if (!pr) return nullptr;                        // whole-block bind etc.: bail
+            for (auto& lbl : rlab) {
+              const Pattern* fp = &any_pat;
+              for (auto& [l, s2] : pr->fields) if (lid_last(l.txt) == lbl) { fp = effective_pat(s2.get()); break; }
+              fps.push_back(fp);
+            }
+          } else {
+            fps = ctor_field_pats(k, a);
+            if ((int)fps.size() != a) return nullptr;       // shape we can't split
+          }
           MRow nr; nr.rhs = r.rhs; nr.binds = r.binds; nr.guard = r.guard;
           for (auto* fp : fps) nr.cols.push_back(fp);
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
