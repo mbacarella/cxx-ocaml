@@ -821,13 +821,32 @@ struct Bytegen {
   }
 
   // if-then-else (code_as_jump is always None for us: no Lstaticraise).
+  // ocamlc's `code_as_jump`: an `(exit N)` with no args whose handler sits at the
+  // current stack depth and try-block nesting compiles to a bare `branch` -- so a
+  // conditional whose then/else IS that exit can use `branchif`/`branchifnot`
+  // straight to the handler label and inline the other arm, rather than a
+  // branchifnot-over-a-branch.  Enables the do_tests_fail layout (shared default
+  // behind a `branchif`) the matrix matcher's constant/ctor columns rely on.
+  bool code_as_jump(const LamPtr& e, int sz, int& out_lbl) {
+    if (e->k != Lam::K::Staticraise || !e->args.empty()) return false;
+    auto it = static_lbl_.find(e->prim_arg);
+    if (it == static_lbl_.end()) return false;
+    if (it->second.sz != sz || it->second.tb_depth != try_blocks_.size()) return false;
+    out_lbl = it->second.lbl;
+    return true;
+  }
   Code comp_binary_test(const Env& env, const LamPtr& cond, const LamPtr& ifso,
                         const LamPtr& ifnot, int sz, Code cont) {
     Code cont_cond;
     bool ifnot_unit = ifnot->k == Lam::K::ConstInt && ifnot->int_val == 0;
+    int jlbl;
     if (ifnot_unit) {
       auto [lbl_end, cont1] = label_code(cont);
       cont_cond = cons(Iop(Op::Strictbranchifnot, lbl_end), comp_expr(env, ifso, sz, cont1));
+    } else if (code_as_jump(ifso, sz, jlbl)) {
+      cont_cond = cons(Iop(Op::Branchif, jlbl), comp_expr(env, ifnot, sz, cont));
+    } else if (code_as_jump(ifnot, sz, jlbl)) {
+      cont_cond = cons(Iop(Op::Branchifnot, jlbl), comp_expr(env, ifso, sz, cont));
     } else {
       auto [branch_end, cont1] = make_branch(cont);
       auto [lbl_not, cont2] = label_code(comp_expr(env, ifnot, sz, cont1));
