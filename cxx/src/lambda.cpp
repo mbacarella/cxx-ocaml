@@ -8276,10 +8276,19 @@ struct Translator {
       return true;
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      // The type-checker unified the WHOLE pattern with a concrete, module-qualified
+      // record (`{c_lhs; c_guard; c_rhs}` : Typedtree.case under `open Typedtree`):
+      // its labels are foreign so find_field misses them, but collect_binders
+      // resolves each via vk.pat_record_type (strategy 3).  A record pattern always
+      // matches, so this is irrefutable -- else the param falls to the refutable
+      // compile_match path and the body's field vars are left unbound (?c_lhs).
+      bool ext_resolved = false;
+      if (auto pt = vk.pat_record_type.find(p); pt != vk.pat_record_type.end())
+        ext_resolved = pt->second.find('.') != std::string::npos;
       for (auto& [lbl, sub] : pr->fields) {
         // The predefined `'a ref` cell `{contents=p}` is always destructurable
         // even though `contents` isn't in the user field registry.
-        if (!find_field(lid_last(lbl.txt)) &&
+        if (!find_field(lid_last(lbl.txt)) && !ext_resolved &&
             !(lid_last(lbl.txt) == "contents" && pr->fields.size() == 1))
           return false;
         if (!is_irrefutable(*sub)) return false;
