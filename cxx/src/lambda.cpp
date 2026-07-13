@@ -2410,6 +2410,41 @@ struct Translator {
     } catch (...) {}
     return nullptr;
   }
+  // The identity + arity of a NESTED-module extension/exception ctor
+  // (`Misc.Style.Style`, where `type Format.stag += Style of ..` lives in the
+  // Misc.Style submodule): navigate the head unit's cmi to the submodule,
+  // confirm the name is a typext there (a bare variant ctor is not), read its
+  // arity, and take the runtime field from the submodule's block.
+  // unit_exn_identity bails on nested paths; this covers them.
+  LamPtr nested_exn_identity(const Longident& id, int* arity) {
+    auto* dq = std::get_if<Ldot>(&id.v);
+    if (!dq) return nullptr;
+    std::string prefix;
+    if (!lid_to_dotted(*dq->prefix, prefix)) return nullptr;
+    size_t dot = prefix.find('.');
+    if (dot == std::string::npos) return nullptr;  // top-level: unit_exn_identity
+    try {
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(prefix.substr(0, dot)));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = prefix.find('.', pos + 1);
+        std::string comp = prefix.substr(pos + 1, nd == std::string::npos
+                                                      ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return nullptr;
+        sig = next; pos = nd;
+      }
+      for (auto& tx : sig->typexts)
+        if (tx.name == dq->name) {
+          if (tx.is_inline_record) return nullptr;
+          if (arity) *arity = (int)tx.args.size();
+          return submodule_value(prefix, dq->name);
+        }
+    } catch (...) {}
+    return nullptr;
+  }
   // The package module-type name of `(module .. : S)` / `(e : (module S))` /
   // an ident bound to one; empty if `e` isn't a first-class-module package.
   std::string expr_pack_modtype(const Expression& e0) {
@@ -12465,6 +12500,8 @@ struct Translator {
       int uarity = -1;
       if (!cid && std::holds_alternative<Ldot>(k->id.txt.v))
         cid = unit_exn_identity(k->id.txt, &uarity);
+      if (!cid && std::holds_alternative<Ldot>(k->id.txt.v))
+        cid = nested_exn_identity(k->id.txt, &uarity);
       if (cid) {
         if (!k->arg) return cid;  // nullary: the identity value itself
         int arity = uarity >= 0 ? uarity
