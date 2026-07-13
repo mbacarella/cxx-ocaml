@@ -9216,13 +9216,27 @@ struct Translator {
     int NC = tcit->second.first, NB = tcit->second.second;
     // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
     std::map<int, const CtorInfo*> const_ci, block_ci;   // tag -> a resolved ctor
+    bool has_var = false;
     for (auto& r : rows)
       if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
         const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]));
         (ci->is_block ? block_ci : const_ci)[ci->tag] = ci;
-      }
+      } else has_var = true;
+    // Default-sub-matrix sharing (matching.ml's D(P)): every GAP tag (no explicit
+    // ctor row) is reached only by the var/any rows, which are identical for all
+    // gaps.  Rather than recompile that sub-matrix once per gap tag -- which burns
+    // the decision-node budget N_gap times and blows up wide sparse matches (ctype/
+    // typecore) so they fall back to the caml_obj_tag if-chain -- compile it ONCE
+    // behind a fresh static exit and have each gap tag emit `(exit dflt_exit)`.
+    bool has_gap = false;
+    for (int t = 0; t < NC && !has_gap; ++t) if (!const_ci.count(t)) has_gap = true;
+    for (int t = 0; t < NB && !has_gap; ++t) if (!block_ci.count(t)) has_gap = true;
+    bool share_dflt = has_var && has_gap;
+    int dflt_exit = share_dflt ? ++next_exit_ : -1;
+    auto mkdflt = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = dflt_exit; return e; };
     // Build the body for one constant tag t: matching-t const rows + all var rows.
     auto const_body = [&](int t) -> LamPtr {
+      if (share_dflt && !const_ci.count(t)) return mkdflt();   // gap: shared default
       std::vector<MRow> sub;
       for (auto& r : rows) {
         auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
@@ -9239,6 +9253,7 @@ struct Translator {
     auto block_body = [&](int t) -> LamPtr {
       auto bi = block_ci.find(t);
       if (bi == block_ci.end()) {         // gap tag: only var rows reach it (no field probe)
+        if (share_dflt) return mkdflt();                      // shared default
         std::vector<MRow> sub;
         for (auto& r : rows)
           if (!std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
@@ -9288,22 +9303,45 @@ struct Translator {
     for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b}); }
     for (int t = 0; t < NB; ++t) { LamPtr b = block_body(t); if (!b) return nullptr; blocks.push_back({t, b}); }
     // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
+    LamPtr result;
     if (NC == 1 && NB == 1) {
       auto i = mk(Lam::K::IfThenElse);
-      i->cond = comps[0]; i->then_ = blocks[0].body; i->else_ = consts[0].body; return i;
-    }
-    if (NB >= 2) {
+      i->cond = comps[0]; i->then_ = blocks[0].body; i->else_ = consts[0].body; result = i;
+    } else if (NB >= 2) {
       auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
-      sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks); return sw;
-    }
-    if (NB == 1 && NC == 0) return blocks[0].body;
-    if (NB == 1 && NC >= 2) {
+      sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks); result = sw;
+    } else if (NB == 1 && NC == 0) {
+      result = blocks[0].body;
+    } else if (NB == 1 && NC >= 2) {
       auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp; isint->prim_id = "isint";
       isint->args = {comps[0]};
       auto i = mk(Lam::K::IfThenElse);
-      i->cond = isint; i->then_ = const_dispatch(comps[0], consts); i->else_ = blocks[0].body; return i;
+      i->cond = isint; i->then_ = const_dispatch(comps[0], consts); i->else_ = blocks[0].body; result = i;
+    } else {
+      result = const_dispatch(comps[0], consts);   // NB == 0
     }
-    return const_dispatch(comps[0], consts);   // NB == 0
+    // Compile the shared default sub-matrix ONCE and wire it to dflt_exit (inline
+    // when used at most once -> simplif drops the trivial exit, byte-identical to
+    // the per-gap-tag recompile; kept as a shared catch when several gaps reach it).
+    if (share_dflt) {
+      std::vector<MRow> dsub;
+      for (auto& r : rows)
+        if (!std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
+          MRow nr = r;
+          if (auto* pv = std::get_if<Ppat_var>(&nr.cols[0]->desc))
+            nr.binds.push_back({pv->name.txt, comps[0]->var});
+          nr.cols.erase(nr.cols.begin()); dsub.push_back(std::move(nr));
+        }
+      std::vector<LamPtr> cc = rest;
+      LamPtr dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid);
+      if (!dbody) return nullptr;
+      int bad = 0; int uses = count_exit(result, dflt_exit, false, bad);
+      if (uses == 1 && bad == 0) inline_exit(result, dflt_exit, {}, {}, dbody);
+      else if (uses > 0) {
+        auto c = mk(Lam::K::Catch); c->cond = result; c->prim_arg = dflt_exit; c->then_ = dbody; result = c;
+      }
+    }
+    return result;
   }
   // Action-sharing arm: an arm body compiled ONCE behind static exit `aid`, so a
   // body reached from several matrix leaves (var-row spreading, or-patterns, or
