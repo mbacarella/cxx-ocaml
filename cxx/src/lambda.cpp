@@ -12813,6 +12813,12 @@ struct Translator {
           if (dotted.find('.') != std::string::npos) cands.push_back(dotted);
           for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
             if (it->find('.') == std::string::npos) cands.push_back(*it + "." + dotted);
+          // A submodule of the default-opened Stdlib (`LargeFile.seek_in` =
+          // Stdlib.LargeFile.seek_in): Stdlib is never a literal opened_ entry
+          // (the pervasives resolve through stdlib_fields), so the loop above
+          // never forms this path -- add it when Stdlib really exports the head.
+          if (dotted.find('.') == std::string::npos && fields_of("Stdlib").count(dotted))
+            cands.push_back("Stdlib." + dotted);
           for (auto& cand : cands) {
             // a LOCAL module's submodule (`include Int_base; Set.empty`, with
             // Int_base a functor-result module whose nested layouts we
