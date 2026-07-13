@@ -463,7 +463,7 @@ int main(int argc, char** argv) {
   // process-lifetime streams are std::cout/std::cerr (dumps, diagnostics).  So
   // once those are flushed there is nothing left to do but free memory the OS
   // is about to reclaim anyway -- and that teardown is not cheap: the never-
-  // erased cmi cache (g_load_cache) holds a large shared_ptr<TypeExpr> graph
+  // erased cmi cache (g_load_cache) held a large shared_ptr<TypeExpr> graph
   // whose recursive destruction was the single hottest function at exit (~6%
   // of a warm compile).  Skip all static destructors and atexit handlers with
   // _Exit; the output bytes are identical, we just stop paying to unbuild the

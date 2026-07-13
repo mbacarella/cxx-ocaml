@@ -16,6 +16,52 @@ namespace cppcaml::cmi {
 
 namespace {
 
+// Process-lifetime bump arena for the decoded cmi graph (TypeExpr / Path /
+// ModuleType / Signature nodes).  Nodes are never freed: a decoded .cmi lives
+// in the load cache for the whole process (the compiler fast-exits, skipping
+// teardown), so there is no ownership to track -- GraphPtr handles are plain
+// pointers.  Slabs never move, so raw node pointers stay valid.  Slab memory
+// comes from plain operator new so a region-scoped heap (the mmap cmi cache)
+// can later redirect where slabs land.
+struct GraphArena {
+  static constexpr std::size_t kSlab = 1 << 18;  // 256KB
+  std::vector<void*> slabs_;
+  std::size_t used_ = kSlab;  // == kSlab forces a fresh slab on first alloc
+  void* alloc(std::size_t n, std::size_t a) {
+    used_ = (used_ + a - 1) & ~(a - 1);
+    if (used_ + n > kSlab) {
+      slabs_.push_back(::operator new(kSlab));
+      used_ = 0;
+    }
+    void* p = static_cast<char*>(slabs_.back()) + used_;
+    used_ += n;
+    return p;
+  }
+};
+GraphArena g_graph_arena;
+
+}  // namespace
+
+TypePtr type_alloc() {
+  return TypePtr{new (g_graph_arena.alloc(sizeof(TypeExpr), alignof(TypeExpr)))
+                     TypeExpr()};
+}
+PathPtr path_alloc() {
+  return PathPtr{new (g_graph_arena.alloc(sizeof(Path), alignof(Path))) Path()};
+}
+ModuleTypePtr modtype_alloc() {
+  return ModuleTypePtr{
+      new (g_graph_arena.alloc(sizeof(ModuleType), alignof(ModuleType)))
+          ModuleType()};
+}
+SignaturePtr sig_alloc(Signature&& s) {
+  return SignaturePtr{
+      new (g_graph_arena.alloc(sizeof(Signature), alignof(Signature)))
+          Signature(std::move(s))};
+}
+
+namespace {
+
 namespace m = marshal;
 
 // Slurp an open binary stream into a byte vector in one bulk read (size via
@@ -46,7 +92,7 @@ public:
   TypePtr type(std::size_t id) {
     auto it = memo_.find(id);
     if (it != memo_.end()) return it->second;
-    auto t = std::make_shared<TypeExpr>();
+    TypePtr t = type_alloc();
     memo_.emplace(id, t);
     decode_desc(arena_[id].fields.at(0), *t);
     return t;
@@ -212,7 +258,7 @@ public:
   // Mty_alias.
   ModuleTypePtr module_type(std::size_t id) {
     const m::Value& v = arena_[id];
-    auto mt = std::make_shared<ModuleType>();
+    ModuleTypePtr mt = modtype_alloc();
     switch (v.tag) {
       case 0:  // Mty_ident of Path.t
         mt->kind = ModuleType::Ident;
@@ -220,7 +266,7 @@ public:
         break;
       case 1:  // Mty_signature of signature
         mt->kind = ModuleType::Sig;
-        mt->sig = std::make_shared<Signature>(signature(v.fields.at(0)));
+        mt->sig = sig_alloc(signature(v.fields.at(0)));
         break;
       case 2:  // Mty_functor of functor_parameter * module_type
         mt->kind = ModuleType::Functor;
@@ -423,7 +469,7 @@ private:
 
   PathPtr path(std::size_t id) {
     const m::Value& v = arena_[id];
-    auto p = std::make_shared<Path>();
+    PathPtr p = path_alloc();
     p->kind = static_cast<Path::Kind>(v.tag);
     switch (v.tag) {
       case Path::Pident:

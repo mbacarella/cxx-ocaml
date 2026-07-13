@@ -20,6 +20,32 @@
 
 namespace cppcaml::cmi {
 
+// Non-owning handle to a node of the decoded cmi graph (Path / TypeExpr /
+// ModuleType / Signature).  Every node lives in a process-lifetime bump arena
+// (see cmi.cpp) that is never freed mid-compile: a decoded .cmi stays in the
+// load cache for the whole process, so ownership is meaningless and no
+// consumer mutates a decoded graph.  Dropping shared_ptr removes the atomic
+// refcount writes on every handle copy -- a prerequisite for mapping a
+// pre-decoded graph read-only (refcounts would write into the mapped pages).
+// The interface mirrors the shared_ptr subset the codebase actually uses
+// (operator->/*/bool/==/</get/reset, null default-construction) so use sites
+// compile unchanged; only the factory sites changed (*_alloc below).
+template <class T>
+struct GraphPtr {
+  T* p_ = nullptr;
+  constexpr GraphPtr() noexcept = default;
+  constexpr GraphPtr(std::nullptr_t) noexcept {}
+  explicit constexpr GraphPtr(T* p) noexcept : p_(p) {}
+  T* operator->() const noexcept { return p_; }
+  T& operator*() const noexcept { return *p_; }
+  T* get() const noexcept { return p_; }
+  explicit constexpr operator bool() const noexcept { return p_ != nullptr; }
+  void reset() noexcept { p_ = nullptr; }
+  friend constexpr bool operator==(GraphPtr a, GraphPtr b) noexcept { return a.p_ == b.p_; }
+  friend constexpr bool operator!=(GraphPtr a, GraphPtr b) noexcept { return a.p_ != b.p_; }
+  friend constexpr bool operator<(GraphPtr a, GraphPtr b) noexcept { return a.p_ < b.p_; }
+};
+
 // Ident.t (typing/ident.ml): name is always field 0 in every variant.
 struct Ident {
   enum Kind { Local = 0, Scoped = 1, Global = 2, Predef = 3, Unscoped = 4 };
@@ -29,7 +55,7 @@ struct Ident {
 };
 
 struct Path;
-using PathPtr = std::shared_ptr<Path>;
+using PathPtr = GraphPtr<Path>;
 
 // Path.t (typing/path.ml).
 struct Path {
@@ -41,7 +67,7 @@ struct Path {
 };
 
 struct TypeExpr;
-using TypePtr = std::shared_ptr<TypeExpr>;
+using TypePtr = GraphPtr<TypeExpr>;
 
 // type_desc (typing/types.mli), this tree's constructor order.  Only the cases
 // reachable from the values we currently decode are fully populated; the rest
@@ -147,8 +173,15 @@ struct TypeDecl {
 
 struct Signature;
 struct ModuleType;
-using ModuleTypePtr = std::shared_ptr<ModuleType>;
-using SignaturePtr = std::shared_ptr<Signature>;
+using ModuleTypePtr = GraphPtr<ModuleType>;
+using SignaturePtr = GraphPtr<Signature>;
+
+// Allocate a graph node from the process-lifetime cmi arena (cmi.cpp).  These
+// are the only factories; the graph is built exclusively by the cmi Decoder.
+TypePtr type_alloc();
+PathPtr path_alloc();
+ModuleTypePtr modtype_alloc();
+SignaturePtr sig_alloc(Signature&& s);
 
 struct ModuleDecl {
   std::string name;
