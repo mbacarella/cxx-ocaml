@@ -9188,6 +9188,81 @@ struct Translator {
         return cb;
       }
     }
+    // Nested INT-constant column: a column whose rows are integer literals (`Pfield
+    // 0`, tags, ...) plus var/any -- dispatch the value with an if-chain of NotEqInt
+    // tests (matching.ml's do_tests_fail) and share the var/any default sub-matrix
+    // once behind a fresh exit.  Without this, one constant sub-pattern in any arm
+    // bails the WHOLE wide match to the caml_obj_tag if-chain (simplif/bytegen's
+    // `lambda`-type matches).  Second-pass + budgeted like the tuple/record columns.
+    if (g_gm_tuples_) {
+      bool anyconst = false, purecol = true;
+      for (auto& r : rows) {
+        auto& d = r.cols[0]->desc;
+        if (auto* pc = std::get_if<Ppat_constant>(&d)) {
+          if (!std::get_if<Pconst_integer>(&pc->c.desc)) { purecol = false; break; }
+          anyconst = true;
+        } else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d)) {
+          purecol = false; break;
+        }
+      }
+      if (anyconst && purecol) {
+        if (comps[0]->k != Lam::K::Var) return nullptr;
+        if (g_gm_budget_ == 0) return nullptr;
+        if (g_gm_budget_ > 0) --g_gm_budget_;
+        auto colval = [&](const Pattern* p) -> long long {
+          auto* pc = std::get_if<Ppat_constant>(&p->desc);
+          return parse_ocaml_int(std::get_if<Pconst_integer>(&pc->c.desc)->value);
+        };
+        std::vector<long long> vals;   // distinct values, in row order
+        for (auto& r : rows)
+          if (std::get_if<Ppat_constant>(&r.cols[0]->desc)) {
+            long long v = colval(r.cols[0]);
+            if (std::find(vals.begin(), vals.end(), v) == vals.end()) vals.push_back(v);
+          }
+        std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
+        int cdflt = ++next_exit_;                // shared default (var/any rows)
+        auto mkcd = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = cdflt; return e; };
+        // S(v): the const rows with value v (col0 dropped); a miss exits to cdflt.
+        auto sub_for = [&](long long v) -> LamPtr {
+          std::vector<MRow> sub;
+          for (auto& r : rows)
+            if (std::get_if<Ppat_constant>(&r.cols[0]->desc) && colval(r.cols[0]) == v) {
+              MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
+            }
+          std::vector<LamPtr> cc = rest;
+          return gmatch(std::move(cc), std::move(sub), mloc, cdflt);
+        };
+        // Chain: if col0 <> v0 then (.. else cdflt) else S(v0).  The last value's
+        // else is the shared default -- so S(vLast) stays inline and the default
+        // rides a `branchif`, matching ocamlc's do_tests_fail layout.
+        LamPtr chain = mkcd();
+        for (int idx = (int)vals.size() - 1; idx >= 0; --idx) {
+          LamPtr sv = sub_for(vals[idx]);
+          if (!sv) return nullptr;
+          auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt; ne->args = {comps[0], cint(vals[idx])};
+          auto iff = mk(Lam::K::IfThenElse); iff->cond = ne; iff->then_ = chain; iff->else_ = sv;
+          chain = iff;
+        }
+        // The var/any default sub-matrix, compiled once behind cdflt.
+        std::vector<MRow> dsub;
+        for (auto& r : rows) {
+          auto& d = r.cols[0]->desc;
+          if (std::get_if<Ppat_constant>(&d)) continue;
+          MRow nr = r;
+          if (auto* pv = std::get_if<Ppat_var>(&d)) nr.binds.push_back({pv->name.txt, comps[0]->var});
+          nr.cols.erase(nr.cols.begin()); dsub.push_back(std::move(nr));
+        }
+        std::vector<LamPtr> cc = rest;
+        LamPtr dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid);
+        if (!dbody) return nullptr;
+        int bad = 0; int uses = count_exit(chain, cdflt, false, bad);
+        if (uses == 1 && bad == 0) inline_exit(chain, cdflt, {}, {}, dbody);
+        else if (uses > 0) {
+          auto c = mk(Lam::K::Catch); c->cond = chain; c->prim_arg = cdflt; c->then_ = dbody; chain = c;
+        }
+        return chain;
+      }
+    }
     // Only var/any and (non-exn, non-inline, non-unboxed) constructor columns.
     bool anyctor = false;
     for (auto& r : rows) {
