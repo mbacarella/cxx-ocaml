@@ -8620,7 +8620,13 @@ struct Translator {
   // pattern is Asttypes.constant (tag 3) but the local Lambda.structured_constant.Const_float
   // (tag 2) won ctor_info_.  NON-MUTATING (returns a pointer into a stable member cache),
   // so arm BODIES keep resolving the same name at its own EXPRESSION type's tag.
-  const CtorInfo* pat_ctor_resolve(const Pattern* p, const std::string& cn) {
+  const CtorInfo* pat_ctor_resolve(const Pattern* p, const std::string& cn,
+                                   const std::string& want_type = {}) {
+    // Caller already knows the authoritative variant type (e.g. gmatch recovered
+    // it for a same-unit ambiguous ctor): resolve straight against that local type.
+    if (!want_type.empty())
+      if (auto ti = type_ctor_info_.find(want_type); ti != type_ctor_info_.end())
+        if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
     auto base = ctor_info_.find(cn);
     const CtorInfo* amb = base != ctor_info_.end() ? &base->second : nullptr;
     auto pc = vk.pat_constr.find(p);
@@ -9206,6 +9212,8 @@ struct Translator {
       if (cppcaml::dbg_env("GBAIL")) fprintf(stderr, "[GBAIL] %s ctor=%s\n", r, cn.c_str());
       return nullptr;
     };
+    std::vector<std::string> col_cns;  // constructor names in this column, in row order
+    bool tydisagree = false;
     for (auto& r : rows)
       if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
         const std::string cn = ctor_of(*r.cols[0]);
@@ -9213,9 +9221,34 @@ struct Translator {
         const CtorInfo* ci = pat_ctor_resolve(r.cols[0], cn);
         if (!ci) return GB("noresolve", cn);
         if (ci->unboxed) return GB("unboxed", cn);
+        col_cns.push_back(cn);
+        if (cppcaml::dbg_env("TMDBG")) {
+          auto pc = vk.pat_constr.find(r.cols[0]);
+          fprintf(stderr, "[TM] cn=%s ci_ty=%s pc=%s\n", cn.c_str(), ci->type.c_str(),
+                  pc != vk.pat_constr.end() ? pc->second.c_str() : "(none)");
+        }
         if (type.empty()) { type = ci->type; any_ci = ci; }
-        else if (type != ci->type) return GB("typemismatch", cn + " " + ci->type + "!=" + type);
+        else if (type != ci->type) tydisagree = true;
       }
+    // The column's ctors resolved to different type NAMES: the per-ctor ambient
+    // disambiguation disagreed on a constructor name shared by several same-unit
+    // variants (inference recorded only a dotless local scrutinee path we don't
+    // thread here).  A well-typed column shares ONE variant type -- find the single
+    // local variant that holds ALL the column's ctors and adopt it; then every
+    // per-tag pat_ctor_resolve below takes `type` as an authoritative hint.
+    if (tydisagree) {
+      const std::string* common = nullptr;
+      for (auto& [tn, cm] : type_ctor_info_) {
+        bool all = true;
+        for (auto& cn : col_cns) if (!cm.count(cn)) { all = false; break; }
+        if (!all) continue;
+        if (common) { common = nullptr; break; }   // >1 candidate covers all: ambiguous
+        common = &tn;
+      }
+      if (!common) return GB("typemismatch", col_cns.empty() ? "" : col_cns[0]);
+      type = *common;
+      any_ci = &type_ctor_info_.at(type).at(col_cns[0]);
+    }
     auto tcit = type_ctors_.find(type);
     if (tcit == type_ctors_.end() || !any_ci) return GB("no-type_ctors", type);
     int NC = tcit->second.first, NB = tcit->second.second;
@@ -9224,7 +9257,7 @@ struct Translator {
     bool has_var = false;
     for (auto& r : rows)
       if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
-        const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]));
+        const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]), type);
         (ci->is_block ? block_ci : const_ci)[ci->tag] = ci;
       } else has_var = true;
     // Default-sub-matrix sharing (matching.ml's D(P)): every GAP tag (no explicit
@@ -9246,7 +9279,7 @@ struct Translator {
       for (auto& r : rows) {
         auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
         if (k) {
-          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]));
+          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]), type);
           if (ci->is_block || ci->tag != t) continue;
           MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
         } else { bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr)); }
@@ -9283,7 +9316,7 @@ struct Translator {
       for (auto& r : rows) {
         auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
         if (k) {
-          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]));
+          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]), type);
           if (!ci->is_block || ci->tag != t) continue;
           std::vector<const Pattern*> fps;
           if (inl) {
