@@ -9030,8 +9030,16 @@ struct Translator {
     if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
       collect_gvars(o->l.get(), out); collect_gvars(o->r.get(), out); return;
     }
-    // any/constant/interval/record/array/variant/lazy: gmatch bails on these as
-    // columns, so no leaf ever binds through them -- nothing to collect here.
+    // A record column IS decomposed by gmatch's second pass (g_gm_tuples_), whose
+    // leaf binds each field's sub-pattern var -- so those names MUST appear in the
+    // arm's vnames, else action-sharing's shared handler has no parameter for them
+    // and the arm body reads them unbound (`?default`/`?constrs`).
+    if (auto* r = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [lbl, sub] : r->fields) collect_gvars(sub.get(), out);
+      return;
+    }
+    // any/constant/interval/array/variant/lazy: gmatch bails on these as columns,
+    // so no leaf ever binds through them -- nothing to collect here.
   }
   // ===== general matrix matcher (matching.ml decomposition) ====================
   // Dispatch column 0 by head constructor via a dense Switch*/if, EXPANDING each
