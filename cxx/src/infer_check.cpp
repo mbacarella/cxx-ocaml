@@ -5531,6 +5531,14 @@ struct Checker {
       // sub-pattern vars bind to Any (a polymorphic field used at several types
       // must not clash through one monomorphic var).
       TypePtr recTy = nullptr;
+      // Whether any label is a LOCAL record field: if so this pattern is
+      // anchored to a local record and we must NOT let an externally-loaded
+      // same-named label (a red herring from another unit's record) hijack
+      // recTy.  Only a PURELY-external pattern (`{rf_loc; rf_desc; ..}` under
+      // `module T = Typedtree`) falls back to ext_fields_ (below).
+      bool any_local = false;
+      for (auto& [lid, sub] : r->fields)
+        if (fields_.count(lid_last(lid.txt))) { any_local = true; break; }
       for (auto& [lid, sub] : r->fields) {
         auto it = fields_.find(lid_last(lid.txt));
         // A format-poly field is in BOTH maps (kind pass); the pattern binds
@@ -5564,6 +5572,24 @@ struct Checker {
               TypePtr rt = eng.instantiate(pit->second.recTy);
               if (recTy) try_unify(recTy, rt); else recTy = rt;
               continue;
+            }
+          }
+          // A label owned by an EXTERNALLY-loaded record (`{rf_loc; rf_desc; ..}`
+          // destructuring a `Typedtree.row_field` under `module T = Typedtree`):
+          // resolve the record type from the unique ext_fields_ accessor so the
+          // pattern binds real field types -- otherwise the whole function body's
+          // type-directed match degenerates.  Only when the label is UNAMBIGUOUS
+          // (a single external record declares it); non-strict, so the corpus's
+          // strict pass is untouched.
+          if (!strict && !any_local) {
+            auto eit = ext_fields_.find(lid_last(lid.txt));
+            if (eit != ext_fields_.end() && eit->second.size() == 1) {
+              TypePtr s = I::Engine::repr(eng.instantiate(eit->second[0]));
+              if (s->kind == I::Type::Kind::Arrow) {
+                try_unify(infer_pat(*sub), s->cod);
+                if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
+                continue;
+              }
             }
           }
           bind_pat_any(*sub); continue;
