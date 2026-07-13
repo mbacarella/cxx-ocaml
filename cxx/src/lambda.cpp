@@ -1463,10 +1463,34 @@ struct Translator {
     if (auto* k = std::get_if<ast::Ppat_construct>(&p->desc)) {
       if (std::holds_alternative<ast::Ldot>(k->id.txt.v)) {
         std::string tp = qualified_ctor_type_path(k->id.txt);
+        if (cppcaml::dbg_env("CTDBG"))
+          fprintf(stderr, "[CTDBG] nqct construct %s tp=%s\n",
+                  lid_last(k->id.txt).c_str(), tp.empty() ? "<none>" : tp.c_str());
         if (!tp.empty()) {
           std::string ty = tp.substr(tp.rfind('.') + 1);
           auto ci = ctor_info_.find(lid_last(k->id.txt));
           if (ci != ctor_info_.end() && ci->second.type != ty) return tp;
+          // The ctor's flat slot can AGREE while the TYPE-level tag universe
+          // (type_ctors_[ty], bare-keyed) is squatted by a same-named local
+          // type with different constructors (typecore's Datatype_kind.t over
+          // Longident.t): the matrix matcher then dispatches this column over
+          // the wrong (n_const, n_block) and silently drops its rows.  Compare
+          // against the owning module's real counts.
+          {
+            auto tc = type_ctors_.find(ty);
+            auto& tl = module_type_ctors(tp.substr(0, tp.rfind('.')), ty);
+            int nc = 0, nb = 0;
+            for (auto& [nm, info] : tl) (info.is_block ? nb : nc)++;
+            if (cppcaml::dbg_env("CTDBG"))
+              fprintf(stderr,
+                      "[CTDBG] nqct ty=%s ambient=%s(%d,%d) mod=(%d,%d)\n",
+                      ty.c_str(), tc == type_ctors_.end() ? "absent" : "present",
+                      tc == type_ctors_.end() ? -1 : tc->second.first,
+                      tc == type_ctors_.end() ? -1 : tc->second.second, nc, nb);
+            if (tc != type_ctors_.end() && !tl.empty() &&
+                tc->second != std::make_pair(nc, nb))
+              return tp;
+          }
         }
       }
       return k->arg ? nested_qualified_ctor_type(**k->arg) : std::string();
@@ -8776,6 +8800,13 @@ struct Translator {
     }
     return chain;
   }
+  // Whether a sub-row set is trivially TOTAL: some unguarded row is a
+  // catch-all, so compile_match can never reach its Match_failure fill.
+  static bool sub_rows_total(const std::vector<Row>& sub) {
+    for (auto& r : sub)
+      if (!r.guard && is_catchall(*r.lhs)) return true;
+    return false;
+  }
   LamPtr build_ctor_group_arm(const LamPtr& scrut, const CtorInfo& ci,
                               const std::vector<const Row*>& rs, const Location& mloc,
                               const LamPtr& dflt) {
@@ -8810,6 +8841,13 @@ struct Translator {
       std::vector<Row> sub;
       for (size_t ri = 0; ri < rs.size(); ++ri)
         sub.push_back({rowfps[ri][col], rs[ri]->rhs, rs[ri]->guard});
+      // Under a shared default (a catch-all context), a FAILING field sub-match
+      // must route to that default; compile_match fills failures with
+      // Match_failure instead (right for an all-constructor match, wrong here).
+      // Bail unless the sub-match is total on its own -- same rule as the
+      // arity>=2 path below (the subst.ml `norm` S1 miscompile: `Tvar None`'s
+      // Some-case raised instead of taking the `_ -> d` arm).
+      if (dflt && !sub_rows_total(sub)) return nullptr;
       FieldInfo fi{ci.type, col, ci.rfmut[col], ci.rshape[col]};
       return compile_match(field_read(&fi, scrut), sub, mloc);
     }
@@ -8864,6 +8902,9 @@ struct Translator {
     }
     // With a variable sub-pattern, compile_match binds the field to that user name.
     if (has_var) return compile_match(field0, sub, mloc);
+    // Same shared-default rule as the paths above: compile_match would fill a
+    // failing sub-match with Match_failure, not the active catch-all default.
+    if (dflt && !sub_rows_total(sub)) return nullptr;
     // Otherwise bind the (possibly reused) field to a *match* temp -- aliased if
     // used more than once, inlined if not (as ocamlc's matcher does).
     Ident tv = fresh("", true);
@@ -9912,6 +9953,37 @@ struct Translator {
       srcs.push_back({&vrows[i], std::move(altcols)});
     }
     if (srcs.empty()) return nullptr;
+    // The ambient flat ctor tables are keyed by BARE type names; a local type
+    // sharing a column type's short name (typecore's Datatype_kind.t squatting
+    // Longident.t -- both `t`) makes gmatch read the wrong (n_const, n_block):
+    // the column's real rows are filtered out by the wrong tag universe and
+    // every leaf silently lands on the default exit (the S2 "Unbound record
+    // field" miscompile).  The single-scrutinee match path force-registers the
+    // inferred module-qualified scrutinee type before matching; do the same
+    // here for every ctor column whose pattern carries an inferred qualified
+    // type, restoring on every exit path.
+    std::vector<CtorSave> col_saves;
+    std::set<std::string> col_regd;
+    for (auto& [row, altcols] : srcs)
+      for (auto& cols : altcols)
+        for (auto* cp : cols) {
+          const Pattern* ep = effective_pat(cp);
+          if (!std::holds_alternative<Ppat_construct>(ep->desc)) continue;
+          auto pc = vk.pat_constr.find(cp);
+          if (pc == vk.pat_constr.end()) pc = vk.pat_constr.find(ep);
+          if (pc == vk.pat_constr.end() ||
+              pc->second.find('.') == std::string::npos) continue;
+          if (!col_regd.insert(pc->second).second) continue;
+          CtorSave s = force_register_type_ctors(pc->second);
+          if (!s.empty()) col_saves.push_back(std::move(s));
+        }
+    struct ColGuard {
+      Translator* self; std::vector<CtorSave>* sv;
+      ~ColGuard() {
+        for (auto it = sv->rbegin(); it != sv->rend(); ++it)
+          self->restore_ctors(*it);
+      }
+    } col_guard{this, &col_saves};
     std::vector<LamPtr> comps; std::vector<Lam::Binding> temps;
     for (auto& el : tu->elems) {
       LamPtr v = expr(*el);
@@ -10060,8 +10132,14 @@ struct Translator {
     if (ctor_save.empty())
       for (auto& r : rows) {
         std::string tp = nested_qualified_ctor_type(*r.lhs);
+        if (cppcaml::dbg_env("CTDBG"))
+          fprintf(stderr, "[CTDBG] nested-qual row tp=%s\n",
+                  tp.empty() ? "<none>" : tp.c_str());
         if (tp.empty()) continue;
         ctor_save = force_register_type_ctors(tp);
+        if (cppcaml::dbg_env("CTDBG"))
+          fprintf(stderr, "[CTDBG] nested-qual force-register %s -> %s\n",
+                  tp.c_str(), ctor_save.empty() ? "EMPTY" : "REGISTERED");
         if (!ctor_save.empty()) { forced_type_path = tp; break; }
       }
     // A row `Change (Type {..})` on the scrutinee's now-registered variant carries an
