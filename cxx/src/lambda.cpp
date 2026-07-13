@@ -1415,6 +1415,29 @@ struct Translator {
     for (auto& [nm, info] : mc) if (info.type == f->second.type) (info.is_block ? nb : nc)++;
     type_ctors_.emplace(f->second.type, std::make_pair(nc, nb));
   }
+  // The candidate module paths a qualified ctor `M.C` (or `A.B.C`) could live in:
+  // M as an imported unit; M as a SUBMODULE of an opened unit
+  // (`Internal_names.Equation` where Internal_names is a submodule of the opened
+  // Out_type); or a nested/aliased path (`Uid.Deps.C` where Uid = Shape.Uid).
+  std::vector<std::string> qualified_ctor_cands(const Ldot& d) {
+    std::vector<std::string> cands;
+    if (auto* pl = std::get_if<Lident>(&d.prefix->v)) {
+      std::string mod = ctor_module_of(pl->name);
+      if (!mod.empty()) cands.push_back(mod);
+      for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
+        if (it->find('.') == std::string::npos && !module_base(*it))
+          cands.push_back(*it + "." + pl->name);
+    } else {
+      std::string dotted;
+      if (lid_to_dotted(*d.prefix, dotted)) {
+        dotted = expand_alias_head(dotted);
+        cands.push_back(dotted);
+        for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
+          if (it->find('.') == std::string::npos) cands.push_back(*it + "." + dotted);
+      }
+    }
+    return cands;
+  }
   // The CtorInfo of a QUALIFIED variant constructor `M.C` from M's own type --
   // authoritative over a same-named LOCAL/bare ctor (typecore's `Env.Pattern`
   // -- constructor_usage.Pattern, tag 1 -- vs its local `wrong_kind_context.
@@ -1423,28 +1446,57 @@ struct Translator {
   const CtorInfo* qualified_ctor_info(const Longident& id) {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return nullptr;
-    if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
-      std::string mod = ctor_module_of(pl->name);
-      if (mod.empty()) return nullptr;
-      auto& mc = module_ctors(mod);
-      auto f = mc.find(d->name);
-      return f == mc.end() ? nullptr : &f->second;
-    }
-    // A NESTED-module-qualified ctor `A.B.C` (the prefix `A.B` is itself
-    // dotted): resolve the full submodule path, expanding an aliased head
-    // (`Uid.Deps.Declaration_to_declaration` where `Uid` is opened from Types =
-    // Shape.Uid) and trying opened prefixes, like the value-resolution path.
-    std::string dotted;
-    if (!lid_to_dotted(*d->prefix, dotted)) return nullptr;
-    dotted = expand_alias_head(dotted);
-    std::vector<std::string> cands{dotted};
-    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it)
-      if (it->find('.') == std::string::npos) cands.push_back(*it + "." + dotted);
-    for (auto& cand : cands) {
+    for (auto& cand : qualified_ctor_cands(*d)) {
       auto& mc = module_ctors(cand);
       if (auto f = mc.find(d->name); f != mc.end()) return &f->second;
     }
     return nullptr;
+  }
+  // The full "module.type" path of a qualified ctor's OWNING type (empty if
+  // unresolved), so compile_match can force-register that type when the flat
+  // ctor_info_ slot is SQUATTED by a same-named ctor of a different type
+  // (`_, Internal_names.Equation {..}` where Types.Equation squats "Equation").
+  std::string qualified_ctor_type_path(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return "";
+    for (auto& cand : qualified_ctor_cands(*d)) {
+      auto& mc = module_ctors(cand);
+      if (auto f = mc.find(d->name); f != mc.end()) return cand + "." + f->second.type;
+    }
+    return "";
+  }
+  // Find the first module-qualified ctor NESTED under a tuple/record in a pattern
+  // whose flat ctor_info_ slot is SQUATTED by a same-named ctor of a DIFFERENT
+  // type, returning its owning "module.type" path (else "").  Lets compile_match
+  // force-register the right type for a ctor buried under a tuple
+  // (`_, Internal_names.Equation {..}` where Types.Equation squats "Equation") --
+  // the top-level row scans only see a directly-Ppat_construct row.  Restricted to
+  // the genuine-squat case so a nested qualified ctor whose flat slot already
+  // agrees is left untouched (force-registering its whole type perturbs siblings).
+  std::string nested_qualified_ctor_type(const ast::Pattern& p0) {
+    const ast::Pattern* p = effective_pat(&p0);
+    if (auto* k = std::get_if<ast::Ppat_construct>(&p->desc)) {
+      if (std::holds_alternative<ast::Ldot>(k->id.txt.v)) {
+        std::string tp = qualified_ctor_type_path(k->id.txt);
+        if (!tp.empty()) {
+          std::string ty = tp.substr(tp.rfind('.') + 1);
+          auto ci = ctor_info_.find(lid_last(k->id.txt));
+          if (ci != ctor_info_.end() && ci->second.type != ty) return tp;
+        }
+      }
+      return k->arg ? nested_qualified_ctor_type(**k->arg) : std::string();
+    }
+    if (auto* t = std::get_if<ast::Ppat_tuple>(&p->desc)) {
+      for (auto& e : t->elems) if (std::string r = nested_qualified_ctor_type(*e); !r.empty()) return r;
+      return "";
+    }
+    if (auto* r = std::get_if<ast::Ppat_record>(&p->desc)) {
+      for (auto& [l, sub] : r->fields) if (std::string x = nested_qualified_ctor_type(*sub); !x.empty()) return x;
+      return "";
+    }
+    if (auto* a = std::get_if<ast::Ppat_alias>(&p->desc)) return nested_qualified_ctor_type(*a->p);
+    if (auto* lz = std::get_if<ast::Ppat_lazy>(&p->desc)) return nested_qualified_ctor_type(*lz->p);
+    return "";
   }
   // Register ALL constructors of a module-qualified variant type ("Vmod.vis")
   // into ctor_info_/type_ctors_, given the type's full path from the inferencer.
@@ -8895,10 +8947,23 @@ struct Translator {
     // each inline field by index.  Without this the record arg matched no shape and
     // ctor_field_pats returned empty -> a bound var (`c_rhs`) was left unresolved.
     if (auto* pr = std::get_if<Ppat_record>(&effective_pat(&arg)->desc)) {
-      auto ci = ctor_info_.find(lid_last(k->id.txt));
-      if (ci != ctor_info_.end() && !ci->second.rlabels.empty()) {
+      // A QUALIFIED inline-record ctor (`Internal_names.Equation {lhs;rhs}` where
+      // Internal_names is a submodule of an opened unit): the bare-name
+      // ctor_info_ slot may be SQUATTED by a same-named NON-inline ctor of a
+      // different type (Types.Equation), whose empty rlabels would skip this
+      // branch and drop the field vars (?lhs/?rhs).  Resolve rlabels through the
+      // qualified path first (handles opened/aliased/nested prefixes).
+      const CtorInfo* cinfo = nullptr;
+      if (std::holds_alternative<Ldot>(k->id.txt.v))
+        if (const CtorInfo* qc = qualified_ctor_info(k->id.txt); qc && !qc->rlabels.empty())
+          cinfo = qc;
+      if (!cinfo) {
+        auto ci = ctor_info_.find(lid_last(k->id.txt));
+        if (ci != ctor_info_.end() && !ci->second.rlabels.empty()) cinfo = &ci->second;
+      }
+      if (cinfo) {
         static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
-        for (auto& lbl : ci->second.rlabels) {
+        for (auto& lbl : cinfo->rlabels) {
           const Pattern* fp = &any_pat;
           for (auto& [l, sub] : pr->fields)
             if (lid_last(l.txt) == lbl) { fp = sub.get(); break; }
@@ -9881,6 +9946,19 @@ struct Translator {
         }
         if (it == vk.pat_constr.end() || it->second.find('.') == std::string::npos) continue;
         ctor_save = force_register_type_ctors(it->second);
+        if (!ctor_save.empty()) break;
+      }
+    // Still unresolved, but a row buries a QUALIFIED ctor under a tuple/record
+    // (`_, Internal_names.Equation {lhs;rhs}`): the flat ctor_info_["Equation"]
+    // slot may be squatted by a same-named ctor of another type (Types.Equation),
+    // which has no rlabels and a different tag/arity -- collapsing the match and
+    // dropping the field vars (?lhs/?rhs).  Force-register the owning type so
+    // every arm resolves through it.
+    if (ctor_save.empty())
+      for (auto& r : rows) {
+        std::string tp = nested_qualified_ctor_type(*r.lhs);
+        if (tp.empty()) continue;
+        ctor_save = force_register_type_ctors(tp);
         if (!ctor_save.empty()) break;
       }
     struct CtorGuard { Translator* self; CtorSave sv;
