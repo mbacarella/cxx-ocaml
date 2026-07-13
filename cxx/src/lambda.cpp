@@ -1722,18 +1722,20 @@ struct Translator {
         rbare = rt.substr(dot + 1);
       }
       for (auto& [lbl, sub] : r->fields) {
-        if (!rt.empty()) {
-          const Pattern* sp = effective_pat(sub.get());
-          auto* kc = std::get_if<Ppat_construct>(&sp->desc);
-          if (kc && std::holds_alternative<Lident>(kc->id.txt.v) &&
-              !ctor_info_.count(lid_last(kc->id.txt))) {
-            std::string ftp = record_field_type_path(rbare, lid_last(lbl.txt));
-            if (!ftp.empty()) {
-              if (ftp.find('.') == std::string::npos && !rmod.empty())
-                ftp = rmod + "." + ftp;
-              register_ctors_of_type(ftp);
-            }
+        const Pattern* sp = effective_pat(sub.get());
+        auto* kc = std::get_if<Ppat_construct>(&sp->desc);
+        if (kc && std::holds_alternative<Lident>(kc->id.txt.v) &&
+            !ctor_info_.count(lid_last(kc->id.txt))) {
+          std::string ftp;
+          if (!rt.empty()) {
+            ftp = record_field_type_path(rbare, lid_last(lbl.txt));
+            if (!ftp.empty() && ftp.find('.') == std::string::npos && !rmod.empty())
+              ftp = rmod + "." + ftp;
           }
+          // No inferred record hint (the record type never made it to the
+          // checker): resolve through the field label's OWN module qualifier.
+          if (ftp.empty()) ftp = qualified_field_ctor_type(lbl.txt);
+          if (!ftp.empty()) register_ctors_of_type(ftp);
         }
         scan_pat_ctors(*sub);
       }
@@ -4485,6 +4487,34 @@ struct Translator {
       }
     } catch (...) {}
     return std::nullopt;
+  }
+  // The constructor type path of a QUALIFIED record-field pattern label
+  // (`Data_types.cstr_tag`): load the qualifier module's cmi, find the record
+  // owning `label`, and return that field's declared type path (qualified with
+  // the module when the type is local to it).  The qualifier is authoritative,
+  // so this resolves a bare ctor in the field's sub-pattern even when the record
+  // type was never inferred (cmt_format's `{Data_types.cstr_tag = Cstr_extension
+  // ..}` -- the Data_types records are not loaded into ext_fields_, so the
+  // checker left the whole 3-arm match with no record hint and it collapsed).
+  std::string qualified_field_ctor_type(const Longident& lid) {
+    auto* d = std::get_if<Ldot>(&lid.v);
+    if (!d) return "";
+    auto* pl = std::get_if<Lident>(&d->prefix->v);
+    if (!pl) return "";
+    const std::string& mod = pl->name;
+    try {
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Record) continue;
+        for (auto& l : td.labels)
+          if (l.name == d->name) {
+            std::string fp = cmi_type_ctor_path(l.type);
+            if (!fp.empty() && fp.find('.') == std::string::npos) fp = mod + "." + fp;
+            return fp;
+          }
+      }
+    } catch (...) {}
+    return "";
   }
   // A qualified label `M.label` where M is a LOCAL (same-unit) submodule: the
   // field of M's record type (via mod_record_types_).  The qualifier is
