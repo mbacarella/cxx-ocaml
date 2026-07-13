@@ -11394,6 +11394,12 @@ struct Translator {
         }
         // `let open F(X) / struct..end / (M:S) in body`: bind open/N over body
         LamPtr mv = compile_module_expr(op->expr);
+        // An inline `let open struct type tag = A | B end in ..`: build_module
+        // registers the struct's variant/record types only within its own scope,
+        // so the body's bare `A`/`B` (opened) would be left unresolved (`?A`).
+        // Re-register the struct's own type declarations so they persist over body.
+        if (const Pmod_structure* ps = peel_to_structure(op->expr))
+          register_types(ps->items);
         auto rl = module_result_layout(op->expr);
         if (rl.empty()) rl = arg_layout(op->expr);
         std::string nm = "open#" + std::to_string(++open_gen_count_);
