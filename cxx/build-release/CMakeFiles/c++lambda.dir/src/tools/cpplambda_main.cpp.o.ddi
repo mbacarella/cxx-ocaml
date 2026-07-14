@@ -1,9 +1,0 @@
-{
-  "revision": 0,
-  "rules": [
-    {
-      "primary-output": "CMakeFiles/c++lambda.dir/src/tools/cpplambda_main.cpp.o"
-    }
-  ],
-  "version": 1
-}

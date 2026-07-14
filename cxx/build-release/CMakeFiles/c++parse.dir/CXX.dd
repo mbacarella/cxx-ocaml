@@ -1,3 +1,0 @@
-ninja_dyndep_version = 1.0
-build CMakeFiles/c++parse.dir/src/tools/cppparse_main.cpp.o: dyndep
-

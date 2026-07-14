@@ -1,9 +1,0 @@
-{
-  "revision": 0,
-  "rules": [
-    {
-      "primary-output": "CMakeFiles/c++cmi.dir/src/tools/cppcmi_main.cpp.o"
-    }
-  ],
-  "version": 1
-}

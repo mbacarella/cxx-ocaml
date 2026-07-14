@@ -1,9 +1,0 @@
-{
-  "revision": 0,
-  "rules": [
-    {
-      "primary-output": "CMakeFiles/c++parse.dir/src/tools/cppparse_main.cpp.o"
-    }
-  ],
-  "version": 1
-}

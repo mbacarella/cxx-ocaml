@@ -1,9 +1,0 @@
-{
-  "revision": 0,
-  "rules": [
-    {
-      "primary-output": "CMakeFiles/c++ocamlc.dir/src/tools/cppocamlc_main.cpp.o"
-    }
-  ],
-  "version": 1
-}

@@ -1,9 +1,0 @@
-{
-  "revision": 0,
-  "rules": [
-    {
-      "primary-output": "CMakeFiles/c++cmo.dir/src/tools/cppcmo_main.cpp.o"
-    }
-  ],
-  "version": 1
-}

@@ -1,9 +1,0 @@
-{
-  "revision": 0,
-  "rules": [
-    {
-      "primary-output": "CMakeFiles/c++link.dir/src/tools/cpplink_main.cpp.o"
-    }
-  ],
-  "version": 1
-}

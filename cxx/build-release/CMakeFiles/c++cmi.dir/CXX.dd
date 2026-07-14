@@ -1,3 +1,0 @@
-ninja_dyndep_version = 1.0
-build CMakeFiles/c++cmi.dir/src/tools/cppcmi_main.cpp.o: dyndep
-

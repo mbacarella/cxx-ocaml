@@ -1,9 +1,0 @@
-{
-  "revision": 0,
-  "rules": [
-    {
-      "primary-output": "CMakeFiles/cppcaml_core.dir/src/lambda.cpp.o"
-    }
-  ],
-  "version": 1
-}

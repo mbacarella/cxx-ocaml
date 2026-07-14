@@ -1,3 +1,0 @@
-ninja_dyndep_version = 1.0
-build CMakeFiles/c++instr.dir/src/tools/cppinstr_main.cpp.o: dyndep
-
