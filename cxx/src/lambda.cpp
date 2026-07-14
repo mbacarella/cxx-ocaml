@@ -16613,6 +16613,29 @@ struct Translator {
   // projected (by field name, via field_mut) to F's parameter signature when it
   // has extra/reordered fields, and a global-path operand is bound to an (unused)
   // `let/N` then re-read.
+  // Whether a Pmod_ident module expression's path is resolved THROUGH the
+  // Stdlib umbrella alias (`Set.Make`, `String` = Stdlib.Set.Make /
+  // Stdlib.String where `Stdlib.Set : Mty_alias Stdlib__Set`): its leftmost
+  // component is not locally bound and its global is the Stdlib__-mangled
+  // unit, not the bare name.  Such paths type as Mty_alias in ocamlc and get
+  // the Tcoerce_alias discarded-read wrap; direct unit members do not.
+  bool path_through_stdlib_alias(const ModuleExpr* me) {
+    while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+    auto* pi = std::get_if<Pmod_ident>(&me->desc);
+    if (!pi) return false;
+    const Longident* h = &pi->id.txt;
+    const Longident* h2 = nullptr;  // component right above the leftmost
+    while (auto* d = std::get_if<Ldot>(&h->v)) { h2 = h; h = d->prefix.get(); }
+    auto* l = std::get_if<Lident>(&h->v);
+    if (!l || module_base(l->name)) return false;
+    if (global_of(l->name) != l->name) return true;
+    // An EXPLICIT `Stdlib.Set.Make` spells the umbrella out: the hop is the
+    // second component (`Stdlib.Set : Mty_alias Stdlib__Set`).
+    if (l->name == "Stdlib" && h2)
+      if (auto* d2 = std::get_if<Ldot>(&h2->v))
+        return global_of(d2->name) != d2->name;
+    return false;
+  }
   LamPtr compile_functor_apply(const Pmod_apply& pa) {
     LamPtr fval; std::vector<std::string> param;
     const ModuleType* param_mt = nullptr;
@@ -16639,6 +16662,20 @@ struct Translator {
       }
     }
     if (!fval) fval = compile_module_expr(*pa.f);
+    // ocamlc wraps a module path that resolves THROUGH a module alias in
+    // `(let (let/N = <path>) <path>)`: typemod turns a Pmod_ident whose
+    // find_module type is Mty_alias (any member reached through the Stdlib
+    // umbrella, e.g. Set.Make = Stdlib.Set.Make with `Stdlib.Set : Mty_alias
+    // Stdlib__Set` -- alias-scraped components are strengthened ~aliasable so
+    // even functor members become aliases) into Tcoerce_alias, and translmod's
+    // apply_coercion binds the original read (discarded) then re-translates the
+    // alias target.  A member of a plain compilation unit (Diffing_with_keys.
+    // Define, Consistbl.Make) is NOT an alias and gets no wrap.
+    if (path_through_stdlib_alias(pa.f.get()) && is_global_path(fval)) {
+      Ident id = fresh("let");
+      auto l = mk(Lam::K::Let); l->bindings = {{id, ValueKind::Gen, fval}}; l->body = fval;
+      fval = l;
+    }
     // A FUNCTOR-typed formal parameter (a higher-order functor like Set's PowerSet
     // SetOrd): coerce the functor argument's RESULT to the declared result sig.
     {
@@ -16688,7 +16725,16 @@ struct Translator {
     }
     // Project only when the argument's layout is known and differs from the
     // parameter signature; an unknown layout (e.g. a struct literal) is passed as is.
+    bool arg_alias = path_through_stdlib_alias(pa.arg.get());
     if (!param.empty() && !alay.empty() && param != alay) {
+      // An alias-resolved argument (Tcoerce_alias) re-reads the path per field
+      // with the original read bound-and-discarded; any other global argument
+      // is bound ONCE (translmod's name_lambda) and projected from the var.
+      LamPtr src = aval; std::optional<Ident> bind;
+      if (!arg_alias && is_global_path(aval)) {
+        bind = fresh("let");
+        auto v = mk(Lam::K::Var); v->var = *bind; src = v;
+      }
       std::vector<LamPtr> fs;
       for (auto& nm : param) {
         int idx = -1;
@@ -16700,20 +16746,24 @@ struct Translator {
           if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) { fs.push_back(s); continue; }
         }
         if (idx < 0) idx = 0;  // last-resort (unknown value): field 0 as before
-        auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut; fr->prim_arg = idx; fr->args = {aval};
+        auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut; fr->prim_arg = idx; fr->args = {src};
         fs.push_back(fr);
       }
       auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
       blk->args = std::move(fs); acoerced = blk;
+      if (bind) {
+        auto l = mk(Lam::K::Let); l->bindings = {{*bind, ValueKind::Gen, aval}};
+        l->body = acoerced; acoerced = l;
+      }
     }
-    auto wrap = [&](const LamPtr& src, const LamPtr& body) -> LamPtr {
-      if (!is_global_path(src)) return body;
+    if (arg_alias && is_global_path(aval)) {
       Ident id = fresh("let");
-      auto l = mk(Lam::K::Let); l->bindings = {{id, ValueKind::Gen, src}}; l->body = body; return l;
-    };
+      auto l = mk(Lam::K::Let); l->bindings = {{id, ValueKind::Gen, aval}}; l->body = acoerced;
+      acoerced = l;
+    }
     auto a = mk(Lam::K::Apply);
-    a->fn = wrap(fval, fval);
-    a->args = {wrap(aval, acoerced)};
+    a->fn = fval;
+    a->args = {acoerced};
     return a;
   }
   LamPtr compile_module_expr(const ModuleExpr& me) {
