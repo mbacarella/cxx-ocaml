@@ -9657,6 +9657,54 @@ struct Translator {
     auto tcit = type_ctors_.find(type);
     if (tcit == type_ctors_.end() || !any_ci) return GB("no-type_ctors", type);
     int NC = tcit->second.first, NB = tcit->second.second;
+    // `type` is a BARE name shared across modules (`t`, `expression_desc`):
+    // the flat type_ctors_ counts can belong to a same-named squatter, and a
+    // wrong universe here silently drops arms / emits off-table switches
+    // (typecore's type_newtype `Tconstr (Path.Pident id', ..)` sub-column:
+    // Path.t is 0-const/4-block, but a 1-const/1-block `t` squatted the key
+    // and the Pident arm vanished -- the bootstrapped compiler never replaced
+    // the newtype and crashed unifying the escaped type).  A QUALIFIED row
+    // ctor (`Path.Pident`) or a row's DOTTED inferred type names the true
+    // owner: take the counts from that module's own type when it owns the
+    // ctor at this type name.  This descent never passes through
+    // compile_match's force-register cascade, so correct it here.
+    for (auto& r : rows) {
+      auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
+      if (!k) continue;
+      std::string qmod;
+      if (auto* dq = std::get_if<Ldot>(&k->id.txt.v)) {
+        if (auto* pl = std::get_if<Lident>(&dq->prefix->v))
+          if (!module_base(pl->name)) qmod = pl->name;
+      }
+      if (qmod.empty()) {
+        auto pc = vk.pat_constr.find(r.cols[0]);
+        if (pc != vk.pat_constr.end()) {
+          auto pd = pc->second.rfind('.');
+          if (pd != std::string::npos && pc->second.substr(pd + 1) == type) {
+            std::string m2 = pc->second.substr(0, pd);
+            if (!module_base(m2.substr(0, m2.find('.')))) qmod = m2;
+          }
+        }
+      }
+      if (qmod.empty()) continue;
+      auto& tl = module_type_ctors(qmod, type);
+      if (tl.empty()) continue;
+      std::string cn = ctor_of(*r.cols[0]);
+      bool owns = false;
+      int nc2 = 0, nb2 = 0;
+      for (auto& [nm, info] : tl) {
+        (info.is_block ? nb2 : nc2)++;
+        if (nm == cn) owns = true;
+      }
+      if (!owns) continue;
+      if (NC != nc2 || NB != nb2) {
+        if (cppcaml::dbg_env("TMDBG"))
+          fprintf(stderr, "[TM] gmatch col %s universe %s (%d,%d) -> (%d,%d)\n",
+                  type.c_str(), qmod.c_str(), NC, NB, nc2, nb2);
+        NC = nc2; NB = nb2;
+      }
+      break;
+    }
     if (cppcaml::dbg_env("TMDBG"))
       fprintf(stderr, "[TM] gmatch col type=%s NC=%d NB=%d\n", type.c_str(), NC, NB);
     // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
