@@ -9657,6 +9657,8 @@ struct Translator {
     auto tcit = type_ctors_.find(type);
     if (tcit == type_ctors_.end() || !any_ci) return GB("no-type_ctors", type);
     int NC = tcit->second.first, NB = tcit->second.second;
+    if (cppcaml::dbg_env("TMDBG"))
+      fprintf(stderr, "[TM] gmatch col type=%s NC=%d NB=%d\n", type.c_str(), NC, NB);
     // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
     std::map<int, const CtorInfo*> const_ci, block_ci;   // tag -> a resolved ctor
     bool has_var = false;
@@ -10271,6 +10273,69 @@ struct Translator {
           if (!s.empty()) arg_saves.push_back(std::move(s));
         }
       }
+    // A TUPLE row's ctor COMPONENT (`match a, pat.ppat_desc, exp.pexp_desc
+    // with .., .., Pexp_constraint (_, sty)`): none of the stages above look
+    // inside tuple rows, so the column's TAG UNIVERSE comes from the bare
+    // type_ctors_ key, which a same-named type of another unit can squat --
+    // `expression_desc` exists in Parsetree (33 block ctors) AND Typedtree
+    // (31): gmatch emitted a CLOSED switch* with cases 0..30 and the
+    // bootstrapped compiler jumped off the jump table (SIGILL) typing any
+    // `let _ = <letop/extension>` (vb_pat_constraint).  Force-register each
+    // component ctor's DOTTED inferred type when its true counts disagree
+    // with the ambient entry.
+    std::set<std::string> tuple_col_forced;
+    std::vector<const Ppat_tuple*> tuple_row_pats;
+    {
+      std::function<void(const Pattern*)> collect_tuples = [&](const Pattern* p) {
+        p = effective_pat(p);
+        if (auto* o2 = std::get_if<Ppat_or>(&p->desc)) {
+          collect_tuples(o2->l.get());
+          collect_tuples(o2->r.get());
+        } else if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
+          tuple_row_pats.push_back(tu);
+        }
+      };
+      for (auto& r : rows) collect_tuples(r.lhs);
+    }
+    for (auto* tu : tuple_row_pats) {
+      for (auto& el : tu->elems) {
+        const Pattern* c = effective_pat(el.get());
+        auto* k = std::get_if<Ppat_construct>(&c->desc);
+        if (!k) continue;
+        auto pc = vk.pat_constr.find(c);
+        if (pc == vk.pat_constr.end()) continue;
+        if (!tuple_col_forced.insert(pc->second).second) continue;
+        auto pd = pc->second.rfind('.');
+        if (pd == std::string::npos) continue;
+        std::string pmod = pc->second.substr(0, pd), pty = pc->second.substr(pd + 1);
+        if (module_base(pmod.substr(0, pmod.find('.')))) continue;
+        auto& tl = module_type_ctors(pmod, pty);
+        if (tl.empty()) continue;
+        std::string cn = lid_last(k->id.txt);
+        bool owns = false;
+        int nc2 = 0, nb2 = 0;
+        for (auto& [nm, info] : tl) {
+          (info.is_block ? nb2 : nc2)++;
+          if (nm == cn) owns = true;
+        }
+        if (!owns) continue;                     // hint doesn't own the ctor: distrust
+        auto tc = type_ctors_.find(pty);
+        if (cppcaml::dbg_env("TMDBG"))
+          fprintf(stderr, "[TM] tuple-col %s.%s hint=(%d,%d) ambient=(%d,%d)\n",
+                  pmod.c_str(), pty.c_str(), nc2, nb2,
+                  tc != type_ctors_.end() ? tc->second.first : -1,
+                  tc != type_ctors_.end() ? tc->second.second : -1);
+        if (tc != type_ctors_.end() && tc->second.first == nc2 &&
+            tc->second.second == nb2)
+          continue;                              // ambient counts already right
+        CtorSave s = force_register_type_ctors(pmod + "." + pty);
+        if (cppcaml::dbg_env("CTDBG"))
+          fprintf(stderr, "[CTDBG] tuple-col force-register %s.%s (%d,%d) -> %s\n",
+                  pmod.c_str(), pty.c_str(), nc2, nb2,
+                  s.empty() ? "EMPTY" : "REGISTERED");
+        if (!s.empty()) arg_saves.push_back(std::move(s));
+      }
+    }
     struct CtorGuard { Translator* self; CtorSave sv; std::vector<CtorSave> args;
                        ~CtorGuard() {
                          for (auto it = args.rbegin(); it != args.rend(); ++it)
