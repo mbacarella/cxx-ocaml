@@ -12718,6 +12718,20 @@ struct Translator {
                 l->prim_arg = (int)i; l->args = {expr(*fe->e)};
                 return l;
               }
+          // A non-stdlib top-level module record (a compiler-internal type like
+          // `(i : Ast_iterator.iterator).structure`): read the field's index from
+          // `mod`'s cmi.  Type-directed and AUTHORITATIVE, so it must beat the bare
+          // find_field below, which takes the last-registered same-named record
+          // (Ast_mapper.mapper's `structure`@38, not iterator's @37).
+          if (auto rf = toplevel_typed_record_field(mod, ty, lbl)) {
+            auto l = mk(Lam::K::Prim);
+            l->prim = rf->flat                     ? Prim::Floatfield
+                      : rf->kind == ValueKind::Int ? Prim::FieldInt
+                      : rf->mut                    ? Prim::FieldMut
+                                                   : Prim::FieldImm;
+            l->prim_arg = rf->index; l->args = {expr(*fe->e)};
+            return l;
+          }
         } else if (dpos != std::string::npos) {
           // A DEEP nested-module type path (`sgs : Includemod.Error.
           // signature_symptom` then `sgs.incompatibles`): navigate the head

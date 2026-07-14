@@ -1179,6 +1179,16 @@ struct Checker {
         if (auto* d = std::get_if<Ldot>(&c->id.txt.v))
           if (module_head_unbound(*d->prefix))
             note_error("Unbound module " + mod_components(*d->prefix).front());
+      // Loading a qualified type `M.t` in an annotation (`i : Ast_iterator.
+      // iterator`) also brings M's record fields into ext_fields_, so a label
+      // M shares with another record (`structure`, also in Ast_mapper.mapper)
+      // is seen as AMBIGUOUS -- and field_scheme returns null instead of
+      // adopting whichever module happened to be loaded first (a value ref to
+      // Ast_mapper), which would wrongly pin `i` to mapper and read its
+      // `structure`@38 instead of iterator's @37.  Codegen pass only.
+      if (record_kinds_)
+        if (auto* d = std::get_if<Ldot>(&c->id.txt.v))
+          load_module_record_fields(*d->prefix);
       // a bare locally-abstract type name resolves to its flexible var
       if (c->args.empty())
         if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
@@ -2570,6 +2580,22 @@ struct Checker {
       }
       cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
     } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
+  }
+  // Walk a written type and load the record fields of every qualified type's
+  // module (`M.t` -> M).  Called on a binding's declared type BEFORE the body is
+  // inferred, so a label the annotation's module shares with another record is
+  // already AMBIGUOUS when the body's field access is typed -- otherwise the
+  // body pins the base to whichever module happened to be loaded first (a value
+  // reference elsewhere in the unit).  Codegen pass only.
+  void preload_annot_record_fields(const CoreType& t) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      if (auto* d = std::get_if<Ldot>(&c->id.txt.v)) load_module_record_fields(*d->prefix);
+      for (auto& a : c->args) preload_annot_record_fields(*a);
+    } else if (auto* ar = std::get_if<Ptyp_arrow>(&t.desc)) {
+      preload_annot_record_fields(*ar->dom); preload_annot_record_fields(*ar->cod);
+    } else if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& x : tu->elems) preload_annot_record_fields(*x);
+    }
   }
   // A module-qualified field `e.M[.P].label`: the explicit path names the
   // record's module authoritatively (OCaml's path-directed disambiguation), so
@@ -6224,6 +6250,16 @@ struct Checker {
         TypePtr br = infer_expr(*c.rhs);
         if (window) soft_unify(br, rt);
         else if (!gadt) try_unify(br, rt);
+        // The value-kinds/lambda pass skips the arm-result unify for a GADT match
+        // (above), so an enclosing annotation on the match (`meth : iterator ->
+        // .. -> a -> unit`) never reaches the arm bodies -- and an arm's field
+        // base (`fun i -> i.structure`, i : iterator) is left an unresolved var,
+        // so the back end guesses the wrong same-named record (Ast_mapper.mapper's
+        // `structure`@38, not iterator's @37).  Softly tie each arm body to the
+        // result type (NOT the pattern/scrutinee, whose GADT refinement must stay
+        // branch-local) so the annotation flows in and the field base gets its
+        // record identity; lenient, so a payload clash across arms is swallowed.
+        else if (gadt && record_kinds_) soft_unify(br, rt);
         if (window) {
           eng.undo_to(wm);
           TypePtr brr = I::Engine::repr(br);
@@ -7822,6 +7858,12 @@ struct Checker {
       std::unordered_map<std::string, TypePtr> avars;
       auto* saved_av = annot_vars_; annot_vars_ = &avars;
       eng.enter_level();
+      // Load the declared type's modules' record fields before inferring the
+      // body, so a shared label (`i : Ast_iterator.iterator` then `i.structure`,
+      // a label Ast_mapper.mapper also declares) is ambiguous at the field read.
+      if (record_kinds_ && b.constraint_)
+        if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_))
+          preload_annot_record_fields(*pc->typ);
       // `let f : _ format = e`: build the annotation FIRST and push it into the
       // body, so string literals in result positions type (and lower) as formats.
       TypePtr fmt_annot = nullptr;
