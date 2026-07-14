@@ -8352,9 +8352,13 @@ struct Translator {
       scope.back()[pa->name.txt] = id; out.push_back({id, scrut});
       return collect_binders(*pa->p, scrut, out);
     }
+    // Field iteration below is RIGHT-TO-LEFT at every level: ocamlc's matcher
+    // binds an irrefutable destructure's components in reverse field order
+    // (`let ((x,y),z) = p` emits z, *match*=field0, y, x), with a materialized
+    // sub-scrutinee temp still bound before (outside) its own sub-fields.
     if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
       LamPtr sv = materialize(scrut);
-      for (size_t i = 0; i < pt->elems.size(); ++i)
+      for (size_t i = pt->elems.size(); i-- > 0;)
         if (!collect_binders(*pt->elems[i], fieldimm((int)i, sv), out)) return false;
       return true;
     }
@@ -8362,7 +8366,8 @@ struct Translator {
       LamPtr sv = materialize(scrut);
       std::vector<std::string> flds;
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
-      for (auto& [lbl, sub] : pr->fields) {
+      for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
+        auto& [lbl, sub] = *rit;
         FieldInfo nfi;
         const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
         tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
@@ -8401,7 +8406,8 @@ struct Translator {
         if (!pr) return false;
         LamPtr sv = materialize(scrut);
         auto& L = ci->second.rlabels;
-        for (auto& [lbl, sub] : pr->fields) {
+        for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
+          auto& [lbl, sub] = *rit;
           int ix = -1;
           for (size_t i2 = 0; i2 < L.size(); ++i2)
             if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
@@ -8415,7 +8421,7 @@ struct Translator {
       auto fps = ctor_field_pats(pk, ci->second.arity);
       if ((int)fps.size() != ci->second.arity) return false;
       LamPtr sv = materialize(scrut);
-      for (size_t i = 0; i < fps.size(); ++i) {
+      for (size_t i = fps.size(); i-- > 0;) {
         if (!collect_binders(*fps[i], fieldimm((int)i, sv), out)) return false;
         if (auto* pv = std::get_if<Ppat_var>(&effective_pat(fps[i])->desc))
           if (auto* b = lookup(pv->name.txt)) apply_var_node_path(effective_pat(fps[i]), *b);
@@ -18707,24 +18713,24 @@ struct Translator {
               }
               return {acc, is_field_access(acc)};  // a field read -> `=a` alias
             };
-            // Unnamed binders are INTERNAL temps (a materialized sub-scrutinee
-            // or a lazy force), not components of the pattern: they must be
-            // DEFINED before the field reads that use them, so emit them first
-            // in collection order (a temp's RHS references only earlier temps
-            // or the scrutinee), then the named components in ocamlc's reverse
-            // field order -- and they are never exported.
-            for (auto& [id, acc] : binders)
-              if (id.name.empty())
+            // collect_binders already produces ocamlc's order (right-to-left
+            // per level, a materialized temp before its own sub-fields), so
+            // emit in collection order.  Unnamed binders are INTERNAL temps
+            // (a materialized sub-scrutinee or a lazy force), never exported.
+            for (auto& [id, acc] : binders) {
+              if (id.name.empty()) {
                 cur.push_back({id, ValueKind::Gen, acc,
                                !lazy_force_binders_.count(id.stamp) &&
                                    is_field_access(acc)});
-            for (auto it2 = binders.rbegin(); it2 != binders.rend(); ++it2) {
-              if (it2->first.name.empty()) continue;
-              auto [v, alias] = fold(it2->second);
-              cur.push_back({it2->first, ValueKind::Gen, v, alias});
+                continue;
+              }
+              auto [v, alias] = fold(acc);
+              cur.push_back({id, ValueKind::Gen, v, alias});
             }
-            for (auto& [id, acc] : binders)
-              if (!id.name.empty()) add_export(id.name, id);
+            // Exports stay in SOURCE (field) order: collection is right-to-
+            // left, so walk it backwards.
+            for (auto it2 = binders.rbegin(); it2 != binders.rend(); ++it2)
+              if (!it2->first.name.empty()) add_export(it2->first.name, it2->first);
           } else {  // `let () = e` and other refutable patterns: a bare *match* temp
             cur.push_back({fresh("", true), ValueKind::Gen, val});
           }
