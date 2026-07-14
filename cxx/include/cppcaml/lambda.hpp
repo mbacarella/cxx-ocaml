@@ -157,6 +157,13 @@ struct Lam {
   // Staticraise (Lstaticraise): exit id in `prim_arg`, args in `args`.
   std::vector<Ident> catch_vars;
   std::vector<ValueKind> catch_var_kinds;
+  // keep_catch: a static catch that must NOT be simplified away even if its exit
+  // is raised only once.  ocamlc's expand_stringswitch builds its shared default
+  // behind a catch inside Bytegen (after Simplif), so a single-use string-switch
+  // default reaches the code generator as a live `(exit N)` -> `branchif`.  Our
+  // string_switch builds the same structure during lambda generation, so this
+  // flag exempts it from simplify_static_catches to match that layout.
+  bool keep_catch = false;
 };
 
 // Alpha-normalized structural key of a Lambda term (the analog of

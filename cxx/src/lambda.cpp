@@ -7532,6 +7532,7 @@ struct Translator {
     for (auto& sc : l->sw_consts) simplify_static_catches(sc.body);
     for (auto& sc : l->sw_blocks) simplify_static_catches(sc.body);
     if (l->k != Lam::K::Catch) return;
+    if (l->keep_catch) return;  // string_switch default: keep live for `branchif`
     int bad = 0;
     int n = count_exit(l->cond, l->prim_arg, false, bad);
     if (n == 0) { l = l->cond; return; }  // exit never raised -> drop handler
@@ -10612,6 +10613,7 @@ struct Translator {
       fprintf(stderr, "[BAILDBG] n=%zu guard=%d ctor=%d or=%d other=%d :: %s\n",
               rows.size(), nguard, nctor, nor, nother, ctors.c_str());
     }
+    if (LamPtr r = string_switch(scrut, rows, mloc)) return r;
     if (LamPtr r = int_cases(scrut, rows, 0, /*strict=*/true)) return r;
     // shapes the structured paths can't express compile through the correct
     // per-row chain instead of silently collapsing
@@ -11849,6 +11851,67 @@ struct Translator {
       return true;
     }
     return false;  // lazy / unpack: unmodeled
+  }
+  // A match whose non-default rows are all bare string-constant patterns with a
+  // trailing catch-all, compiled exactly like ocamlc's Matching.expand_stringswitch:
+  // bind the scrutinee (if not already a var), then a right-fold of
+  // `if caml_string_notequal(arg,"s") then <rest> else <arm>` whose innermost
+  // `rest` is an `(exit N)` to the shared default behind a static catch.  The
+  // exit makes bytegen's comp_binary_test emit `branchif default` for the last
+  // test (the arm falls through), reproducing ocamlc's layout.  The dichotomic
+  // caml_string_compare tree (>8 strings) is not modelled -- those fall to the
+  // naive matcher (still correct, via caml_string_equal).
+  LamPtr string_switch(const LamPtr& scrut, const std::vector<Row>& rows,
+                       const Location&) {
+    std::vector<std::pair<std::string, const Expression*>> arms;
+    const Row* dflt = nullptr;
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const Row& r = rows[i];
+      if (r.guard) return nullptr;              // guards: leave to the naive matcher
+      const Pattern* p = effective_pat(r.lhs);
+      if (is_catchall(*p)) {
+        if (i + 1 != rows.size()) return nullptr;  // rows after the default: bail
+        dflt = &r; break;
+      }
+      auto* pc = std::get_if<Ppat_constant>(&p->desc);
+      if (!pc) return nullptr;
+      auto* ps = std::get_if<Pconst_string>(&pc->c.desc);
+      if (!ps) return nullptr;
+      arms.push_back({ps->s, r.rhs});
+    }
+    if (arms.empty() || !dflt) return nullptr;  // a string match needs a wildcard
+    if (arms.size() > 8) return nullptr;        // dichotomic tree: not modelled
+
+    // bind_sw: evaluate the scrutinee once into a `switch` local unless it is
+    // already a variable (ocamlc re-reads a Lvar directly, no let).
+    LamPtr arg = scrut; Ident sw_id; bool bound = false;
+    if (scrut->k != Lam::K::Var) { sw_id = fresh("switch"); arg = varof(sw_id); bound = true; }
+
+    // The shared default sits behind an (exit N); the innermost test's `then`
+    // raises it, so the final test compiles to `branchif <default>`.
+    int eid = ++next_exit_;
+    LamPtr k = mk(Lam::K::Staticraise); k->prim_arg = eid;
+    for (auto it = arms.rbegin(); it != arms.rend(); ++it) {
+      auto sv = mk(Lam::K::ConstString); sv->str_val = it->first;
+      auto ne = mk(Lam::K::Prim); ne->prim = Prim::Ccall;
+      ne->prim_id = "caml_string_notequal"; ne->args = {arg, sv};
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = ne; iff->then_ = k; iff->else_ = expr(*it->second);
+      k = iff;
+    }
+    // the default body binds its catch-all var (if any) to the scrutinee var
+    scope.emplace_back();
+    bind_catchall(*dflt->lhs, arg);
+    LamPtr dbody = expr(*dflt->rhs);
+    scope.pop_back();
+    auto cat = mk(Lam::K::Catch); cat->cond = k; cat->prim_arg = eid; cat->then_ = dbody;
+    cat->keep_catch = true;
+    LamPtr body = cat;
+    if (bound) {
+      auto l = mk(Lam::K::Let); l->bindings = {{sw_id, ValueKind::Gen, scrut, false}};
+      l->body = body; body = l;
+    }
+    return body;
   }
   LamPtr naive_match(const LamPtr& scrut0, const std::vector<Row>& rows0,
                      const Location& mloc, bool total = false) {
