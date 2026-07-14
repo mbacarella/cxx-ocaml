@@ -7484,6 +7484,39 @@ struct Translator {
     if (keep.empty()) { l = l->body; return; }
     l->bindings = std::move(keep);
   }
+  // Collapse an exhaustive switch (no failaction) over a plain variable whose
+  // arms are ALL structurally identical: the tag is then irrelevant, so replace
+  // the switch with the single arm body.  ocamlc does this in Matching --
+  // `A x | B x -> x` lowers to `field 0 param`, no switch.  Guarded on the
+  // scrutinee being a Var so dropping the discrimination is effect-neutral; run
+  // after inline_var_aliases so aliased field reads have already been unified.
+  void collapse_equal_switches(LamPtr& l) {
+    if (!l) return;
+    collapse_equal_switches(l->fn);
+    collapse_equal_switches(l->body);
+    collapse_equal_switches(l->cond);
+    collapse_equal_switches(l->then_);
+    collapse_equal_switches(l->else_);
+    collapse_equal_switches(l->sw_default);
+    for (auto& a : l->args) collapse_equal_switches(a);
+    for (auto& b : l->bindings) collapse_equal_switches(b.val);
+    for (auto& sc : l->sw_consts) collapse_equal_switches(sc.body);
+    for (auto& sc : l->sw_blocks) collapse_equal_switches(sc.body);
+    if (l->k != Lam::K::Switch || l->sw_default || !l->cond ||
+        l->cond->k != Lam::K::Var) return;
+    if (l->sw_consts.empty() && l->sw_blocks.empty()) return;
+    std::string k0; bool allsame = true;
+    auto chk = [&](const LamPtr& b) {
+      std::string k = make_lam_key(b);
+      if (k.empty()) allsame = false;
+      else if (k0.empty()) k0 = k;
+      else if (k != k0) allsame = false;
+    };
+    for (auto& sc : l->sw_consts) { chk(sc.body); if (!allsame) return; }
+    for (auto& sc : l->sw_blocks) { chk(sc.body); if (!allsame) return; }
+    if (k0.empty()) return;
+    l = !l->sw_blocks.empty() ? l->sw_blocks[0].body : l->sw_consts[0].body;
+  }
   // Collapse a static-catch whose exit is raised 0 times (drop the handler) or
   // exactly once and not under an inner try (inline the handler at that site).
   void simplify_static_catches(LamPtr& l) {
@@ -18836,6 +18869,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.simplify_local_functions(root);
   t.simplify_static_catches(root);
   t.inline_var_aliases(root);
+  t.collapse_equal_switches(root);
   lap("simplify");
   if (required_globals) {
     std::set<std::string> rg;
