@@ -10820,6 +10820,7 @@ static std::vector<int> compute_decl_variance(
 
 static cmi::cmiw::Loc conv_loc(const ast::Location& l);  // defined below
 
+static void rewrite_eff_back(const cmi::cmiw::TyPtr& t);  // defined below
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
@@ -10990,6 +10991,14 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         manifest = pv_row_manifest(ck, **d.manifest, tvars, bvars, nextvar);
       if (!manifest) manifest = bridge_ty_named(eman, bvars, nextvar, tvars, &dctx);
     }
+    // An EXTENSIBLE re-export of the predef `eff` (`type 'a t = 'a eff = ..`,
+    // i.e. Effect.t itself): the engine canonicalised the manifest `eff` to its
+    // public alias Effect.t, but writing that as t's OWN manifest makes it
+    // self-referential (`t = Effect.t = t`) -- a cyclic manifest the typer loops
+    // on when a later `type _ Effect.t += ..` expands it.  Restore the predef
+    // path so the manifest stays `eff` (like the typext arg/return rewrite).
+    if (std::holds_alternative<Ptype_open>(d.kind) && manifest)
+      rewrite_eff_back(manifest);
     auto si = cmi::cmiw::sig_type(d.name.txt, std::move(params), manifest);
     if (auto ts = ck.type_stamp_.find(&d); ts != ck.type_stamp_.end())
       si.engine_stamp = ts->second;
