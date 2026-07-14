@@ -11,6 +11,7 @@
 set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
+source cxx/harness/_require_fresh.sh; require_fresh c++type
 CPP=./cxx/build/c++type
 JOBS="${JOBS:-4}"
 TIMEOUT="${CPP_TIMEOUT:-10}"

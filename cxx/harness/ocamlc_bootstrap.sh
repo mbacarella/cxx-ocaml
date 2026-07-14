@@ -11,6 +11,7 @@ set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
+source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc c++link
 CPP=$ROOT/cxx/build/c++ocamlc
 LINK=$ROOT/cxx/build/c++link
 RUN=$ROOT/runtime/ocamlrun

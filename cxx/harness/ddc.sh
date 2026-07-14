@@ -30,6 +30,7 @@ set -o pipefail                       # FOOTGUN 1: never let a pipe hide a rc
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
+source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc c++link
 RUN=$ROOT/runtime/ocamlrun
 OPT=$ROOT/ocamlc.opt
 LINK=$ROOT/cxx/build/c++link

@@ -8,6 +8,7 @@
 set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
+source cxx/harness/_require_fresh.sh; require_fresh c++lambda
 CPP=./cxx/build/c++lambda
 JOBS="${JOBS:-4}"
 TIMEOUT="${CPP_TIMEOUT:-10}"
