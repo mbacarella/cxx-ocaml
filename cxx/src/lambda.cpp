@@ -722,6 +722,19 @@ struct Translator {
   // Modules brought into scope by `open M` / `M.(e)` (innermost last), so an
   // unqualified name resolves as `M.x` (a stdlib field or an external prim).
   std::vector<std::string> opened_;
+  // A module-level `open M` (M a LOCAL module) shadows an EARLIER same-level
+  // value binding of a name M also exports: `let f = ..; module M = struct let
+  // f = .. end; open M; <use f>` must resolve `f` through M (a field read),
+  // not the outer `f` that `lookup` finds first.  Maps each such name to the
+  // local module key; set at the open, ERASED when the name is re-bound at
+  // module level afterwards (so declaration order decides).  Only consulted
+  // for a module-level reference -- a nested param/let-in is more local and
+  // still wins.  (The typer resolves this via the typed path; we re-resolve by
+  // name and otherwise miss the shadow -- translclass's `open M`-shadowed
+  // `builtin_meths` fed a (string,args) pair where a lambda list was expected,
+  // corrupting every compiled object.)
+  struct OpenShadow { std::string key; size_t depth; };  // module key + scope depth at the open
+  std::unordered_map<std::string, OpenShadow> local_open_shadow_;
   // Object-method translation state.  Inside a method body `cur_self_` is the
   // method's self parameter and `inst_vars_` maps each instance-variable name to
   // its var-id binder (so `n` -> (field_computed self n) and `n<-e` ->
@@ -2263,6 +2276,20 @@ struct Translator {
   // -- over the opened/included one.  A member whose Sig is unknown binds as
   // a null tombstone: "in scope, Sig unknown" stops fallback to an unrelated
   // outer binding while member reads still fall back to the flat layout.
+  // Record, for a LOCAL module `open M`, the value names M exports that a later
+  // module-level reference must resolve through M (field read) rather than an
+  // earlier same-level binding `lookup` would find first.  No-op for stdlib /
+  // imported modules (those have no runtime base to field-read).  See
+  // local_open_shadow_.
+  void register_local_open_shadows(const std::string& key, const modsig::SigPtr& s) {
+    if (!s || msig_is_functor(*s)) return;
+    if (!module_base(key)) return;               // only local modules
+    for (auto& it : s->items) {
+      if (it.ns == modsig::NS::Value && it.runtime)
+        if (local_member_index(key, it.name))
+          local_open_shadow_[it.name] = {key, scope.size()};
+    }
+  }
   void bind_opened_members(const modsig::SigPtr& s) {
     if (!s || msig_is_functor(*s)) return;
     for (auto& it : s->items) {
@@ -13260,6 +13287,25 @@ struct Translator {
             return fc;
           }
         }
+        // A module-level `open M` shadow (local_open_shadow_): resolve through
+        // M unless a NESTED (more local) binding of the name is in scope -- a
+        // param / let-in still wins over the open.
+        if (!local_open_shadow_.empty())
+          if (auto os = local_open_shadow_.find(l->name); os != local_open_shadow_.end()) {
+            // A binding at a frame DEEPER than the open (a param / let-in
+            // entered after it) is more local and wins; a binding at the open's
+            // own frame or an enclosing one is what the open shadows.
+            bool nested = false;
+            for (size_t d = os->second.depth; d < scope.size(); ++d)
+              if (scope[d].count(l->name)) { nested = true; break; }
+            if (!nested)
+              if (LamPtr base = module_base(os->second.key))
+                if (auto f = local_member_index(os->second.key, l->name)) {
+                  auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+                  fi->prim_arg = *f; fi->args = {base};
+                  return fi;
+                }
+          }
         if (auto* b = lookup(l->name)) { auto v = mk(Lam::K::Var); v->var = *b; return v; }
         if (l->name.size() > 4 && l->name[0] == '_' && l->name[1] == '_')
           if (LamPtr lp = loc_primitive(l->name, e.loc)) return lp;
@@ -17102,6 +17148,9 @@ struct Translator {
     auto add_export_val = [&](const std::string& nm, LamPtr v,
                               modsig::NS ns = modsig::NS::Value,
                               modsig::SigPtr sub = nullptr) {
+      // A module-level value binding of `nm` after a shadowing `open M`
+      // re-shadows M (declaration order): drop any recorded open-shadow.
+      if (ns == modsig::NS::Value) local_open_shadow_.erase(nm);
       // a redefinition (shadow) moves the name to its last definition's
       // position -- but only within the SAME namespace (or across an Unknown
       // flat-splice), mirroring cursig.push exactly so the two stay aligned.
@@ -17198,7 +17247,9 @@ struct Translator {
           else
             register_module_records(dotted);  // bare `open M`: M's record labels
           opened_.push_back(dotted); ++n_opens;
-          bind_opened_members(msig_of_module_path(dotted));
+          modsig::SigPtr osig = msig_of_module_path(dotted);
+          bind_opened_members(osig);
+          register_local_open_shadows(dotted, osig);
         } else {
           // a generalized open (`open F(X)` / `open struct..end` / `open (M:S)`)
           // binds the module value like ocamlc's open/N and opens it under a
@@ -17216,6 +17267,7 @@ struct Translator {
           modsig::SigPtr osig = msig_result_of_module_expr(op->expr);
           menv_.bind_module(nm, osig);
           bind_opened_members(osig);
+          register_local_open_shadows(nm, osig);
         }
         continue;
       }
