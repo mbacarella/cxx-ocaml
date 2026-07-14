@@ -4700,9 +4700,23 @@ struct Translator {
         size_t nd = dotted.find('.', pos + 1);
         std::string comp = dotted.substr(pos + 1, nd == std::string::npos
                                                       ? std::string::npos : nd - pos - 1);
-        const cmi::Signature* next = nullptr;
+        const cmi::ModuleDecl* found = nullptr;
         for (auto& md : sig->modules)
-          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+          if (md.name == comp) { found = &md; break; }
+        if (!found) return std::nullopt;
+        // A submodule ALIAS (Stdlib's `module Lexing = Lexing`) carries no
+        // inline signature; resolve at the alias target plus the remaining
+        // components (`Stdlib.Lexing.position` -> Stdlib__Lexing's position),
+        // as module_ctors does for variant ctors.
+        if (found->type && found->type->kind == cmi::ModuleType::Alias &&
+            found->type->path) {
+          std::string tgt = cmi_path_dotted(*found->type->path);
+          if (!tgt.empty()) {
+            std::string rest = (nd == std::string::npos) ? "" : dotted.substr(nd);
+            return nested_typed_record_field(tgt + rest, ty, label);
+          }
+        }
+        const cmi::Signature* next = mt_sig(cmi, found->type);
         if (!next) return std::nullopt;
         sig = next; pos = nd;
       }
@@ -12805,6 +12819,10 @@ struct Translator {
           // where a Subst.t was expected and segfaulted every interface-
           // mismatch report of the bootstrapped compiler).
           std::string mod = p.substr(0, dpos), ty = p.substr(dpos + 1);
+          if (cppcaml::dbg_env("RMRDBG"))
+            fprintf(stderr, "[RMRDBG] field %s: nested_typed(%s, %s) -> %d\n",
+                    lbl.c_str(), mod.c_str(), ty.c_str(),
+                    (bool)nested_typed_record_field(mod, ty, lbl));
           if (auto rf = nested_typed_record_field(mod, ty, lbl)) {
             auto l = mk(Lam::K::Prim);
             l->prim = rf->flat                     ? Prim::Floatfield
@@ -12855,6 +12873,11 @@ struct Translator {
                 lp->prim_arg = rf->index; lp->args = {expr(*fe->e)};
                 return lp;
               }
+      if (cppcaml::dbg_env("RMRDBG"))
+        fprintf(stderr, "[RMRDBG] field %s: fell to find_field=%d expr_constr_base=%d\n",
+                lid_last(fe->field.txt).c_str(),
+                (bool)find_field(lid_last(fe->field.txt)),
+                (int)vk.expr_constr.count(fe->e.get()));
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);

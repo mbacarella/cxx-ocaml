@@ -6450,6 +6450,13 @@ struct Checker {
       if (TypePtr fsch = field_scheme(lid_last(fld->field.txt))) {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));  // recTy -> fldTy
         TypePtr bt = infer_expr(*fld->e);
+        if (std::getenv("FLDDBG")) {
+          TypePtr rb = I::Engine::repr(bt), rd = I::Engine::repr(s->dom);
+          fprintf(stderr, "[FLDDBG] scheme %s: bt=%s dom=%s\n",
+                  lid_last(fld->field.txt).c_str(),
+                  rb->kind == I::Type::Kind::Constr ? rb->path.c_str() : "<var>",
+                  rd->kind == I::Type::Kind::Constr ? rd->path.c_str() : "<var>");
+        }
         try_unify(bt, s->dom);
         // A label the inferencer sees as UNIQUE (it models only local records) can
         // still be ambiguous to the back end (the opened `type_expr.level` vs the
@@ -6459,6 +6466,12 @@ struct Checker {
         return s->cod;
       }
       TypePtr bt = infer_expr(*fld->e);
+      if (std::getenv("FLDDBG")) {
+        TypePtr rb = I::Engine::repr(bt);
+        fprintf(stderr, "[FLDDBG] ambiguous %s: bt=%s\n",
+                lid_last(fld->field.txt).c_str(),
+                rb->kind == I::Type::Kind::Constr ? rb->path.c_str() : "<var/other>");
+      }
       // An AMBIGUOUS label (omitted from fields_) resolved through the base's
       // type IDENTITY: find the stamped record decl and read the field's index/
       // mutability/kind, so the back end need not guess between same-named records.
