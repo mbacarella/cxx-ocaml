@@ -13897,6 +13897,16 @@ struct Translator {
         if (!a->inline_attr.empty()) a->inline_attr += " ";
         a->inline_attr += "tailcall";
       }
+      // translcore's lapply: an application whose function is itself an
+      // application merges into ONE apply (`Format.(fprintf std_formatter)
+      // "%a@." ..`), which bytegen emits as a single APPLY n instead of two
+      // chained applies.  Argument evaluation order is unchanged (right-to-
+      // left across the merged list = outer args, then inner args, then fn).
+      if (a->fn->k == Lam::K::Apply && a->inline_attr.empty()) {
+        LamPtr inner = a->fn;
+        for (auto& x : a->args) inner->args.push_back(std::move(x));
+        return inner;
+      }
       return a;
     }
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
