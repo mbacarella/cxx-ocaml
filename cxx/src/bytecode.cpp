@@ -582,6 +582,19 @@ struct Bytegen {
               return comp_seq_and(env, exp->args[0], exp->args[1], sz, cont);
             if (exp->prim_id == "||" && exp->args.size() == 2)
               return comp_seq_or(env, exp->args[0], exp->args[1], sz, cont);
+            if (exp->prim_id == "not" && exp->args.size() == 1) {
+              // Pnot: if the continuation begins with a conditional branch,
+              // invert its sense and drop the boolnot; else emit boolnot
+              // (bytegen `Lprim(Pnot, [arg])`).
+              Code newcont;
+              if (auto* h = head(cont); h && h->op == Op::Branchif)
+                newcont = cons(Iop(Op::Branchifnot, h->a), cont->tail);
+              else if (auto* h = head(cont); h && h->op == Op::Branchifnot)
+                newcont = cons(Iop(Op::Branchif, h->a), cont->tail);
+              else
+                newcont = cons(I(Op::Boolnot), cont);
+              return comp_expr(env, exp->args[0], sz, newcont);
+            }
             if (exp->prim_id == "ignore" && exp->args.size() == 1)
               // (ignore x): evaluate x for effect; the unit result is elided when
               // the continuation immediately reloads the accumulator (add_const_unit).
