@@ -1644,6 +1644,10 @@ struct Translator {
     if (tl.empty()) return saved;
     int nc = 0, nb = 0;
     for (auto& [nm, info] : tl) (info.is_block ? nb : nc)++;
+    if (cppcaml::dbg_env("CTDBG"))
+      for (auto& [nm, info] : tl)
+        fprintf(stderr, "[CTDBG] force-register %s ctor %s arity=%d tag=%d block=%d\n",
+                path.c_str(), nm.c_str(), info.arity, info.tag, (int)info.is_block);
     for (auto& [nm, info] : tl) {
       auto it = ctor_info_.find(nm);
       if (it == ctor_info_.end() || it->second.type != ty ||
@@ -9112,6 +9116,10 @@ struct Translator {
         return v;
       }
     }
+    if (cppcaml::dbg_env("CTDBG"))
+      fprintf(stderr, "[CTDBG] ctor_field_pats %s arity=%d arg_is_tuple=%d\n",
+              lid_last(k->id.txt).c_str(), arity,
+              (int)(std::get_if<Ppat_tuple>(&arg.desc) != nullptr));
     if (arity > 1) {
       if (auto* tup = std::get_if<Ppat_tuple>(&arg.desc))
         for (auto& e : tup->elems) v.push_back(e.get());
@@ -10052,6 +10060,101 @@ struct Translator {
     return c;
   }
 
+  // Whether a candidate type's ctor list is SHAPE-CONSISTENT with every ctor
+  // row of a match: each row's ctor must exist in the list with an arity its
+  // argument pattern could have under correct typing (a 2-tuple arg fits arity
+  // 2 or a tuple-payload arity 1, never arity 3; a bare ctor fits a constant).
+  bool ctor_rows_fit(const std::vector<Row>& rows,
+                     const std::vector<std::pair<std::string, CtorInfo>>& tl) {
+    bool dbg = cppcaml::dbg_env("CTDBG");
+    auto fail = [&](const char* why, const std::string& nm, int arity, int n) {
+      if (dbg)
+        fprintf(stderr, "[CTDBG] rows-fit FAIL %s ctor=%s arity=%d n=%d\n",
+                why, nm.c_str(), arity, n);
+      return false;
+    };
+    if (tl.empty()) return fail("empty-tl", "", -1, -1);
+    for (auto& r : rows) {
+      auto* k = std::get_if<Ppat_construct>(&effective_pat(r.lhs)->desc);
+      if (!k) continue;
+      const CtorInfo* ci = nullptr;
+      std::string nm = lid_last(k->id.txt);
+      for (auto& [cn, info] : tl) if (cn == nm) { ci = &info; break; }
+      if (!ci) return fail("no-ctor", nm, -1, -1); // row ctor not in this type
+      if (!k->arg) { if (ci->is_block) return fail("bare-on-block", nm, ci->arity, 0); continue; }
+      if (!ci->is_block) return fail("arg-on-const", nm, ci->arity, -1);
+      const Pattern* a = effective_pat(k->arg->get());
+      if (std::holds_alternative<Ppat_any>(a->desc)) continue;  // `C _` spans any arity
+      if (auto* tu = std::get_if<Ppat_tuple>(&a->desc)) {
+        if (ci->arity != (int)tu->elems.size() && ci->arity != 1)
+          return fail("tuple-arity", nm, ci->arity, (int)tu->elems.size());
+      } else if (std::holds_alternative<Ppat_record>(a->desc)) {
+        if (ci->rlabels.empty() && ci->arity != 1)
+          return fail("record-arity", nm, ci->arity, -1);
+      } else if (ci->arity != 1) {                 // var/alias/ctor/const arg
+        return fail("single-arity", nm, ci->arity, -1);
+      }
+    }
+    return true;
+  }
+  // The typer's pat_constr hint names the type through the module the BARE
+  // ctor resolved to by scope (the innermost `open`), NOT the scrutinee's true
+  // module -- OCaml resolves such a pattern by type-directed disambiguation,
+  // which the engine lacks.  typemod's `match arg_opt with Unit -> .. |
+  // Named (param, smty) -> ..` (arg_opt : Parsetree.functor_parameter, arity-2
+  // Named) hinted TYPEDTREE.functor_parameter (arity-3 Named, from `open
+  // Typedtree`); the tuple then destructured through field 0 and the
+  // bootstrapped compiler segfaulted on every named functor parameter.
+  // Validate the hinted type against the rows' shapes; on contradiction,
+  // re-resolve the SAME type name through the opens (any shape-consistent
+  // same-named candidate is representation-identical as far as the match
+  // reads it: tag/arity/const-vs-block).  "" = no consistent candidate.
+  std::string shape_checked_hint(const std::string& hint,
+                                 const std::vector<Row>& rows) {
+    auto d = hint.rfind('.');
+    if (d == std::string::npos) return hint;
+    std::string mod = hint.substr(0, d), ty = hint.substr(d + 1);
+    if (module_base(mod.substr(0, mod.find('.')))) return hint;  // local type
+    if (ctor_rows_fit(rows, module_type_ctors(mod, ty))) return hint;
+    // Mirror force_register_type_ctors' dotted-prefix fallback (re-exported
+    // unit alias: `Stdlib.Either.t` -> the tail unit's cmi).
+    if (auto md = mod.rfind('.'); md != std::string::npos) {
+      std::string tail = mod.substr(md + 1);
+      if (!module_base(tail) && ctor_rows_fit(rows, module_type_ctors(tail, ty)))
+        return tail + "." + ty;
+    }
+    // The hinted TYPE NAME itself can be the wrong same-named pick within the
+    // right module (bare `Value` category rows hint Typedtree.ITEM_DECLARATION
+    // -- whose Value is an arity-1 block -- over Typedtree.pattern_category's
+    // constant): scan the hinted module's OTHER types for one that fits ALL
+    // rows, and use it only when the fit is unique (sorted scan: the cache is
+    // an unordered_map and a hash-order pick would be nondeterministic).
+    {
+      module_ctors(mod);  // fill mod_type_ctors_[mod]
+      std::vector<std::string> fits;
+      for (auto& [tyname, tl] : mod_type_ctors_[mod])
+        if (tyname != ty && ctor_rows_fit(rows, tl)) fits.push_back(tyname);
+      if (fits.size() == 1) {
+        if (cppcaml::dbg_env("CTDBG"))
+          fprintf(stderr, "[CTDBG] shape-checked hint %s -> %s.%s (module scan)\n",
+                  hint.c_str(), mod.c_str(), fits[0].c_str());
+        return mod + "." + fits[0];
+      }
+    }
+    for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+      if (*it == mod || module_base(it->substr(0, it->find('.')))) continue;
+      if (ctor_rows_fit(rows, module_type_ctors(*it, ty))) {
+        if (cppcaml::dbg_env("CTDBG"))
+          fprintf(stderr, "[CTDBG] shape-checked hint %s -> %s.%s\n",
+                  hint.c_str(), it->c_str(), ty.c_str());
+        return *it + "." + ty;
+      }
+    }
+    if (cppcaml::dbg_env("CTDBG"))
+      fprintf(stderr, "[CTDBG] shape-checked hint %s REJECTED (no candidate)\n",
+              hint.c_str());
+    return "";
+  }
   // The typer's exhaustiveness verdict for a `match` Expression (absent => Total).
   bool match_is_total(const ast::Expression* e) const {
     auto it = vk.match_partial.find(e);
@@ -10120,8 +10223,10 @@ struct Translator {
                   it != vk.pat_constr.end() ? it->second.c_str() : "<none>");
         }
         if (it == vk.pat_constr.end() || it->second.find('.') == std::string::npos) continue;
-        ctor_save = force_register_type_ctors(it->second);
-        if (!ctor_save.empty()) { forced_type_path = it->second; break; }
+        std::string use = shape_checked_hint(it->second, rows);
+        if (use.empty()) continue;
+        ctor_save = force_register_type_ctors(use);
+        if (!ctor_save.empty()) { forced_type_path = use; break; }
       }
     // Still unresolved, but a row buries a QUALIFIED ctor under a tuple/record
     // (`_, Internal_names.Equation {lhs;rhs}`): the flat ctor_info_["Equation"]
@@ -11441,6 +11546,16 @@ struct Translator {
               if (!pat_test(sub.get(), field_read(&fi, acc), test, binds)) return false;
             }
           } else if (!pat_test(k->arg->get(), acc, test, binds)) return false;
+        } else if (C.arity > 1 && at && (int)at->elems.size() > 1) {
+          // A multi-arg ctor whose tuple arg has a DIFFERENT size: the
+          // resolution is wrong (a same-named ctor of another type at another
+          // arity) -- destructuring the tuple through field 0 would misread
+          // every field.  Bail so a correct matcher (or the caller's fallback)
+          // handles the row.
+          if (cppcaml::dbg_env("CTDBG"))
+            fprintf(stderr, "[CTDBG] pat_test BAIL ctor=%s arity=%d tuple=%d\n",
+                    cn.c_str(), C.arity, (int)at->elems.size());
+          return false;
         } else if (!pat_test(k->arg->get(), fieldimm(0, acc), test, binds)) {
           return false;
         }
@@ -12764,6 +12879,34 @@ struct Translator {
                                ? (better->is_block && better->arity == written)
                                : !better->is_block))
               cip = better;
+            // A NO-ARG construct can never be a block ctor, so when the hinted
+            // TYPE's own ctor is a block too (the engine resolves a bare ctor
+            // by scope, not by expected type: typecore's `Value` category
+            // hints Typedtree.ITEM_DECLARATION, whose Value is an arity-1
+            // block, over pattern_category's constant -- the construct emitted
+            // an empty [0] atom where the immediate 0 was meant, and fixing
+            // the CONSUMING matches alone broke producer/consumer agreement),
+            // scan the hinted module's OTHER types for a same-named CONSTANT
+            // ctor; a unique fit wins (sorted collect: hash-order picks would
+            // be nondeterministic).
+            if (cip->is_block && !k->arg.has_value() && !emod.empty() &&
+                !module_base(emod.substr(0, emod.find('.')))) {
+              module_ctors(emod);  // fill mod_type_ctors_[emod]
+              std::vector<const CtorInfo*> fits;
+              std::vector<std::string> fitnames;
+              for (auto& [tyname, tl] : mod_type_ctors_[emod])
+                for (auto& [nm2, info2] : tl)
+                  if (nm2 == n && !info2.is_block) {
+                    fits.push_back(&info2); fitnames.push_back(tyname);
+                  }
+              if (fits.size() == 1) {
+                if (cppcaml::dbg_env("CTDBG"))
+                  fprintf(stderr, "[CTDBG] bare-ctor %s -> %s.%s const tag=%d\n",
+                          n.c_str(), emod.c_str(), fitnames[0].c_str(),
+                          fits[0]->tag);
+                cip = fits[0];
+              }
+            }
           }
         }
       }
