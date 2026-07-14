@@ -591,7 +591,30 @@
       "Bash(nohup docker build --progress=plain -t cppcaml .)",
       "Bash(docker build *)",
       "Bash(docker run *)",
-      "Bash(./docker-dev.sh bash -c ' *)"
+      "Bash(./docker-dev.sh bash -c ' *)",
+      "Bash(KEEP=1 timeout 600 bash cxx/harness/ocamlc_bootstrap.sh)",
+      "Bash(/home/mbac/code/c++caml/ocamlc.opt -nostdlib -I /home/mbac/code/c++caml/stdlib -dlambda -stop-after lambda -c a3.ml)",
+      "Bash(/home/mbac/code/c++caml/cxx/build/c++lambda -I /home/mbac/code/c++caml/stdlib a3.ml)",
+      "Bash(/home/mbac/code/c++caml/ocamlc.opt -nostdlib -I /home/mbac/code/c++caml/stdlib -dlambda -stop-after lambda -c c.ml)",
+      "Bash(/home/mbac/code/c++caml/cxx/build/c++lambda -I /home/mbac/code/c++caml/stdlib c.ml)",
+      "Bash(/home/mbac/code/c++caml/ocamlc.opt -nostdlib -I /home/mbac/code/c++caml/stdlib -dlambda -stop-after lambda -c d.ml)",
+      "Bash(/home/mbac/code/c++caml/cxx/build/c++lambda -I /home/mbac/code/c++caml/stdlib d.ml)",
+      "Bash(/home/mbac/code/c++caml/ocamlc.opt -nostdlib -I /home/mbac/code/c++caml/stdlib -dlambda -stop-after lambda -c e.ml)",
+      "Bash(/home/mbac/code/c++caml/cxx/build/c++lambda -I /home/mbac/code/c++caml/stdlib e.ml)",
+      "Bash(/home/mbac/code/c++caml/ocamlc.opt -nostdlib -I /home/mbac/code/c++caml/stdlib -dlambda -stop-after lambda -c f.ml)",
+      "Bash(/home/mbac/code/c++caml/cxx/build/c++lambda -I /home/mbac/code/c++caml/stdlib f.ml)",
+      "Bash(python3 -c ' *)",
+      "Bash(/home/mbac/code/c++caml/ocamlc.opt -nostdlib -I /home/mbac/code/c++caml/stdlib -dlambda -stop-after lambda -c g.ml)",
+      "Bash(/home/mbac/code/c++caml/cxx/build/c++lambda -I /home/mbac/code/c++caml/stdlib g.ml)",
+      "Bash(timeout 500 ninja)",
+      "Bash(JOBS=4 timeout 600 bash cxx/harness/lambda_parity.sh)",
+      "Bash(JOBS=4 timeout 700 bash cxx/harness/reject_parity.sh)",
+      "Bash(make -n runtime/ocamlrun)",
+      "Bash(timeout 300 make runtime/ocamlrun)",
+      "Bash(timeout 200 ninja c++link)",
+      "Bash(timeout 30 runtime/ocamlrun tools/dumpobj.byte __TRACKED_VAR__/ocamlc)",
+      "Bash(timeout 30 runtime/ocamlrun tools/dumpobj __TRACKED_VAR__/ocamlc)",
+      "Bash(timeout 30 runtime/ocamlrun tools/dumpobj __TRACKED_VAR__/includemod_errorprinter.cmo)"
     ]
   }
 }

@@ -47,5 +47,14 @@ ids=( -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" )
 tty_flags=( -i )
 if [ -t 0 ] && [ -t 1 ]; then tty_flags=( -i -t ); fi
 
+# Allow `perf` (and other perf_event_open profilers) inside the container.
+# Without these the syscall returns EPERM: Docker's default seccomp profile
+# gates perf_event_open behind a capability, and the container otherwise has
+# neither CAP_PERFMON nor CAP_SYS_ADMIN.  CAP_PERFMON (kernel >=5.8) both
+# satisfies that seccomp condition AND bypasses kernel.perf_event_paranoid, so
+# no host sysctl change is needed; seccomp=unconfined lets the syscall through
+# regardless of profile.  Dev container only -- these do weaken isolation.
+perf_flags=( --cap-add=PERFMON --security-opt seccomp=unconfined )
+
 # No args -> the image's default CMD (an interactive bash inside the dev shell).
-exec docker run --rm "${tty_flags[@]}" "${mounts[@]}" "${ids[@]}" "$IMAGE" "$@"
+exec docker run --rm "${tty_flags[@]}" "${perf_flags[@]}" "${mounts[@]}" "${ids[@]}" "$IMAGE" "$@"
