@@ -22,7 +22,29 @@ let rec ty t =
   | Types.Tnil -> "nil"
   | Types.Tfield _ -> "field"
   | Types.Tobject _ -> "obj"
-  | Types.Tvariant _ -> "variant"
+  | Types.Tvariant row ->
+      let fields = Types.row_fields row in
+      let fs = List.map (fun (l, rf) ->
+        "`" ^ l ^ (match Types.row_field_repr rf with
+          | Types.Rpresent None -> ""
+          | Types.Rpresent (Some t) -> "(P:" ^ ty t ^ ")"
+          | Types.Reither (c, ts, m) ->
+              "(E:" ^ (if c then "c" else "") ^ (if m then "m" else "")
+              ^ String.concat ";" (List.map ty ts) ^ ")"
+          | Types.Rabsent -> "(A)")) fields in
+      let closed = if Types.row_closed row then "<" else ">" in
+      let name = match Types.row_name row with
+        | Some (p, args) ->
+            " name=" ^ path p
+            ^ (if args = [] then "" else "<" ^ String.concat "," (List.map ty args) ^ ">")
+        | None -> "" in
+      let fixed = match Types.row_fixed row with
+        | Some _ -> " FIXED" | None -> "" in
+      let more = match Types.get_desc (Types.row_more row) with
+        | Types.Tvar _ -> "" | Types.Tunivar _ -> " more=univar"
+        | Types.Tnil -> " more=nil" | _ -> " more=?" in
+      "variant" ^ closed ^ "[" ^ String.concat "|" fs ^ "]" ^ name ^ fixed ^ more
+
   | Types.Tunivar _ -> "univar"
   | Types.Tpackage _ -> "package"
 
