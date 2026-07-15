@@ -9411,6 +9411,58 @@ struct Translator {
   }
   // Dispatch over a variant's constant constructors (values 0..nc-1, sorted):
   // 1 -> the arm; 2 -> `(if scrut <v1> <v0>)`; >=3 -> `(switch* scrut case int V:)`.
+  // Two lambda leaves are the "same action" when pointer-equal, both argument-less
+  // exits to the same handler (make_lam_key can't tell exit targets apart), or
+  // otherwise structurally equal.  (Member twin of gmatch's local `same_action`.)
+  bool same_action_lam(const LamPtr& a, const LamPtr& b) {
+    if (a == b) return true;
+    if (a->k == Lam::K::Staticraise && b->k == Lam::K::Staticraise) {
+      // make_lam_key ignores the exit target, so two exits are the same action
+      // only when they name the SAME handler (prim_arg) AND pass structurally
+      // identical arguments.
+      if (a->prim_arg != b->prim_arg) return false;
+      if (a->args.empty() && b->args.empty()) return true;
+      std::string ka = make_lam_key(a);
+      return !ka.empty() && ka == make_lam_key(b);
+    }
+    std::string ka = make_lam_key(a);
+    return !ka.empty() && ka == make_lam_key(b);
+  }
+  // An exhaustive constant dispatch (tags 0..N-1, each with a body) whose tags
+  // collapse into exactly TWO contiguous runs of a shared action (`0|1|2 -> A |
+  // 3|4 -> B`) is lowered by ocamlc's call_switcher to a SINGLE range test
+  // (BGTINT/BLTINT), not a flat Lswitch.  Emit that via the ported Switcher
+  // machinery; the general multi-cluster exhaustive shape is left to the flat
+  // switch (ocamlc's shape there differs subtly and churns -- see the note in
+  // const_ctor_switcher).
+  LamPtr two_run_switcher(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts) {
+    if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
+    int n = (int)consts.size();
+    for (int i = 0; i < n; ++i) if (consts[i].tag != i) return nullptr;  // want 0..n-1
+    std::vector<LamPtr> actions(1);                 // index 0 = default (unused here)
+    std::vector<int> act_of(n);
+    for (int i = 0; i < n; ++i) {
+      int found = 0;
+      for (int a = 1; a < (int)actions.size(); ++a)
+        if (same_action_lam(consts[i].body, actions[a])) { found = a; break; }
+      if (!found) { actions.push_back(consts[i].body); found = (int)actions.size() - 1; }
+      act_of[i] = found;
+    }
+    std::vector<SwCase> cases;
+    for (int i = 0; i < n; ) {
+      int j = i; while (j + 1 < n && act_of[j + 1] == act_of[i]) j++;
+      cases.push_back({(long long)i, (long long)j, act_of[i]});
+      i = j + 1;
+    }
+    if (cases.size() != 2) return nullptr;
+    sw_ok_inter_ = true;                            // tags are small (0..n-1)
+    sw_memo_.clear();
+    std::vector<int> k; comp_clusters(cases, k);
+    std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
+    make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
+    if (made_switch) return nullptr;                // a jump table: keep the flat switch
+    return c_test({0, scrut}, cl_cases, cl_acts);
+  }
   LamPtr const_dispatch(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts) {
     if (consts.size() == 1) return consts[0].body;
     if (consts.size() == 2) {
@@ -9418,6 +9470,7 @@ struct Translator {
       i->cond = scrut; i->then_ = consts[1].body; i->else_ = consts[0].body;
       return i;
     }
+    if (auto rt = two_run_switcher(scrut, consts)) return rt;
     auto sw = mk(Lam::K::Switch); sw->cond = scrut; sw->sw_consts = consts;
     return sw;
   }
@@ -11799,12 +11852,20 @@ struct Translator {
     bool exhaustive = (int)kvs.size() == NC;
     if (!dflt && !exhaustive) return nullptr;   // partial without catch-all: not our shape
     if (dflt && exhaustive) return nullptr;      // redundant catch-all: leave to other paths
-    // Restrict to a partial match with a catch-all (`Foo -> .. | _ -> ..`): a small
-    // covered set over a larger constant type, which call_switcher lowers to a range
-    // test / `if` guarding the default.  The fully-exhaustive const dispatch is left
-    // to const_switch + collapse/two_const passes (broadening here churns without
-    // closing modules -- ocamlc's exhaustive shape differs subtly).
-    if (!dflt) return nullptr;
+    // A partial match with a catch-all (`Foo -> .. | _ -> ..`) is a small covered
+    // set over a larger constant type, which call_switcher lowers to a range test /
+    // `if` guarding the default.  For an EXHAUSTIVE match (no catch-all) accept only
+    // the clean two-cluster shape: the values split into exactly two contiguous runs
+    // of a shared action (`0|1|2 -> A | 3|4 -> B`), which call_switcher lowers to a
+    // SINGLE range test (BGTINT/BLTINT).  Broader multi-cluster exhaustive dispatch
+    // is left to const_switch (ocamlc's shape there differs subtly and churns).
+    if (!dflt) {
+      int runs = 0;
+      for (size_t i = 0; i < kvs.size(); ++i)
+        if (i == 0 || kvs[i].rhs != kvs[i - 1].rhs || kvs[i].v != kvs[i - 1].v + 1)
+          runs++;
+      if (runs != 2) return nullptr;
+    }
 
     // Translate bodies once, in source order (stable stamp normalization); bail if
     // two distinct rows share a body (ocamlc shares behind a catch, unmodelled).
