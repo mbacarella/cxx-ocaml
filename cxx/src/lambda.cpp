@@ -7537,11 +7537,26 @@ struct Translator {
     }
     l = body;
   }
-  // Simplif drops `let v = (Lvar w)` for ANY let-kind, substituting v by w.  The
-  // construction-time pass only catches source lets; compiler-generated temps
-  // (an apply's function bound to a temp, a renamed parameter) need a tree-wide
-  // pass.  Runs after rec compilation, so it can't perturb letrec strategy.
-  // Mutable-local bindings (`=mut`) are Lmutlet, never inlined -- skip them.
+  // A pure, freely-duplicable term: an immutable field read (Pfield, our FieldImm)
+  // of a duplicable base, or a bare Var.  These are exactly the shapes ocamlc's
+  // Matching/Simplif bind with the Alias let-kind, so substituting one into its
+  // single use (or dropping a dead one) reorders no effects.  FieldInt/FieldMut
+  // (ref derefs) are mutable and NOT duplicable, so they are excluded.
+  static bool is_alias_dup(const LamPtr& v) {
+    if (!v) return false;
+    if (v->k == Lam::K::Var) return true;
+    if (v->k == Lam::K::Prim && v->prim == Prim::FieldImm && v->args.size() == 1)
+      return is_alias_dup(v->args[0]);
+    return false;
+  }
+  // Simplif drops `let v = (Lvar w)` for ANY let-kind, substituting v by w, and
+  // (for an Alias binding = a pure duplicable term) substitutes v into its one use
+  // or drops it when dead -- Simplif.simplify_lets's Alias case (simplif.ml:569).
+  // The construction-time pass only catches source lets; compiler-generated temps
+  // (an apply's function bound to a temp, a renamed parameter, a function's record
+  // parameter's field destructured to an alias) need a tree-wide pass.  Runs after
+  // rec compilation, so it can't perturb letrec strategy.  Mutable-local bindings
+  // (`=mut`) are Lmutlet, never inlined -- skip them.
   void inline_var_aliases(LamPtr& l) {
     if (!l) return;
     inline_var_aliases(l->fn);
@@ -7558,8 +7573,21 @@ struct Translator {
     std::vector<Lam::Binding> keep;
     for (size_t i = 0; i < l->bindings.size(); ++i) {
       auto& b = l->bindings[i];
-      if (b.val && b.val->k == Lam::K::Var && !b.mut) {
-        // substitute v -> w in the later (sequential) bindings and the body
+      bool subst = false;
+      if (b.val && !b.mut) {
+        if (b.val->k == Lam::K::Var) {
+          subst = true;                 // a Var alias is substituted regardless of count
+        } else if (b.alias && is_alias_dup(b.val)) {
+          // count_var weights a use under a lambda as 2 (ocamlc never substitutes
+          // into a closure), so <=1 means "used at most once, not captured".
+          int n = count_var(l->body, b.id);
+          for (size_t j = i + 1; j < l->bindings.size(); ++j)
+            n += count_var(l->bindings[j].val, b.id);
+          if (n <= 1) subst = true;     // 0 -> dead (dropped), 1 -> inlined
+        }
+      }
+      if (subst) {
+        // substitute v -> value in the later (sequential) bindings and the body
         for (size_t j = i + 1; j < l->bindings.size(); ++j)
           subst_var(l->bindings[j].val, b.id, b.val);
         subst_var(l->body, b.id, b.val);
