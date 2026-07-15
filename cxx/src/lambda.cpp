@@ -12931,7 +12931,23 @@ struct Translator {
         scope.pop_back();
         return cat;
       }
-      return compile_match(expr(*m->e), m->cases, e.loc, match_is_total(&e));
+      // ocamlc's Matching binds a non-variable scrutinee to a fresh `*match*`
+      // (Strict) before dispatching (matching.ml arg_to_var + bind_check), so the
+      // matcher always works on a Lvar -- `match e.f with A|B|C` becomes `let
+      // *match* = e.f in switch *match*`, keeping the value on the stack across the
+      // switch even when no arm reads a sub-field.  Bind here so downstream
+      // dispatchers (which only bind a non-var scrutinee themselves) see the var
+      // and don't double-bind.
+      LamPtr sc = expr(*m->e);
+      if (sc->k != Lam::K::Var && sc->k != Lam::K::ConstBlock) {
+        Ident mv = fresh("", true);
+        LamPtr inner = compile_match(varof(mv), m->cases, e.loc, match_is_total(&e));
+        auto l = mk(Lam::K::Let);
+        l->bindings = {{mv, expr_kind(m->e.get()), sc, false}};   // Strict
+        l->body = inner;
+        return l;
+      }
+      return compile_match(sc, m->cases, e.loc, match_is_total(&e));
     }
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
