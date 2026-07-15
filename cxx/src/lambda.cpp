@@ -10105,9 +10105,29 @@ struct Translator {
     for (int t = 0; t < NB; ++t) { LamPtr b = block_body(t); if (!b) return nullptr; blocks.push_back({t, b}); }
     // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
     LamPtr result;
+    // Two block bodies are the same action when pointer-equal, both argument-less
+    // exits to the same handler (the shared default -- make_lam_key can't tell exit
+    // targets apart), or otherwise structurally equal.
+    auto same_action = [&](const LamPtr& a, const LamPtr& b) -> bool {
+      if (a == b) return true;
+      if (a->k == Lam::K::Staticraise && b->k == Lam::K::Staticraise)
+        return a->prim_arg == b->prim_arg && a->args.empty() && b->args.empty();
+      std::string ka = make_lam_key(a);
+      return !ka.empty() && ka == make_lam_key(b);
+    };
     if (NC == 1 && NB == 1) {
       auto i = mk(Lam::K::IfThenElse);
       i->cond = comps[0]; i->then_ = blocks[0].body; i->else_ = consts[0].body; result = i;
+    } else if (NB >= 2 && NC >= 1 &&
+               [&]{ for (auto& b : blocks) if (!same_action(b.body, blocks[0].body)) return false;
+                    return true; }()) {
+      // All non-constant constructors route to ONE action (matching.ml:3302-3334's
+      // `act0 = Some act`): split on isint, exactly as ctor_match does.
+      auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp; isint->prim_id = "isint";
+      isint->args = {comps[0]};
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = isint; i->then_ = const_dispatch(comps[0], consts); i->else_ = blocks[0].body;
+      result = i;
     } else if (NB >= 2) {
       auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
       sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks); result = sw;
