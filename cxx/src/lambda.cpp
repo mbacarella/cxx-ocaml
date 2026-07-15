@@ -11497,6 +11497,26 @@ struct Translator {
   // Entry point: an int/char-constant match with a trailing catch-all.  Returns
   // null (deferring to int_cases) unless at least one jump table is generated --
   // i.e. unless ocamlc would emit a switch rather than a plain if-chain.
+  // Collect the plain int/char constant values a pattern matches, flattening
+  // or-patterns (`0 | 1 | 2`).  Returns false if any leaf is not a bare int/char
+  // constant (boxed-int suffix, string/float, or a binder/wildcard).
+  bool switch_const_vals(const Pattern* p, bool& is_int, bool& is_char,
+                         std::vector<long long>& out) {
+    p = effective_pat(p);
+    if (auto* po = std::get_if<Ppat_or>(&p->desc))
+      return switch_const_vals(po->l.get(), is_int, is_char, out) &&
+             switch_const_vals(po->r.get(), is_int, is_char, out);
+    if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
+      if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
+        if (pi->suffix) return false;  // boxed-int literal
+        is_int = true; out.push_back(parse_ocaml_int(pi->value)); return true;
+      }
+      if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc)) {
+        is_char = true; out.push_back((unsigned char)ch->code); return true;
+      }
+    }
+    return false;  // string/float/binder
+  }
   LamPtr switcher_match(const LamPtr& scrut, const std::vector<Row>& rows) {
     if (scrut->k != Lam::K::Var) return nullptr;
     struct KV { long long v; const Expression* rhs; };
@@ -11506,14 +11526,10 @@ struct Translator {
     for (auto& r : rows) {
       if (r.guard) return nullptr;
       const Pattern* p = effective_pat(r.lhs);
-      if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
+      std::vector<long long> vals;
+      if (switch_const_vals(p, is_int, is_char, vals)) {
         if (dflt) return nullptr;  // a case after the catch-all
-        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
-          if (pi->suffix) return nullptr;  // boxed-int literal
-          is_int = true; kvs.push_back({parse_ocaml_int(pi->value), r.rhs});
-        } else if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc)) {
-          is_char = true; kvs.push_back({(unsigned char)ch->code, r.rhs});
-        } else return nullptr;  // string/float
+        for (long long v : vals) kvs.push_back({v, r.rhs});
       } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
         dflt = &r;
       } else return nullptr;
@@ -11532,8 +11548,9 @@ struct Translator {
     std::vector<int> act_of(kvs.size());
     // bodies must be translated in source order for stable stamp normalization
     std::vector<const Expression*> by_src;
-    for (auto& r : rows) if (!r.guard) { const Pattern* p = effective_pat(r.lhs);
-      if (std::get_if<Ppat_constant>(&p->desc)) by_src.push_back(r.rhs); }
+    for (auto& r : rows) if (!r.guard) {
+      bool ii = false, ic = false; std::vector<long long> vs;
+      if (switch_const_vals(effective_pat(r.lhs), ii, ic, vs)) by_src.push_back(r.rhs); }
     std::unordered_map<const Expression*, int> src_idx;
     for (size_t i = 0; i < kvs.size(); ++i) {
       // find this kv's source position -> action index (1-based, source order)
