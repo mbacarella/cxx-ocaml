@@ -7569,6 +7569,33 @@ struct Translator {
     if (k0.empty()) return;
     l = !l->sw_blocks.empty() ? l->sw_blocks[0].body : l->sw_consts[0].body;
   }
+  // Lower an exhaustive two-constant switch (tags 0 and 1, no blocks, no default)
+  // to a truthy `if`.  ocamlc's Switcher always emits a single test (BRANCHIFNOT),
+  // never a jump table, for two dense constants -- the same rule const_switch
+  // applies to top-level bool-like matches, but a nested column decomposition
+  // (e.g. a `(bool, bool)` tuple match) builds the switch directly and misses it.
+  void two_const_switch_to_if(LamPtr& l) {
+    if (!l) return;
+    two_const_switch_to_if(l->fn);
+    two_const_switch_to_if(l->body);
+    two_const_switch_to_if(l->cond);
+    two_const_switch_to_if(l->then_);
+    two_const_switch_to_if(l->else_);
+    two_const_switch_to_if(l->sw_default);
+    for (auto& a : l->args) two_const_switch_to_if(a);
+    for (auto& b : l->bindings) two_const_switch_to_if(b.val);
+    for (auto& sc : l->sw_consts) two_const_switch_to_if(sc.body);
+    for (auto& sc : l->sw_blocks) two_const_switch_to_if(sc.body);
+    if (l->k != Lam::K::Switch || l->sw_default || !l->cond) return;
+    if (!l->sw_blocks.empty() || l->sw_consts.size() != 2) return;
+    int t0 = l->sw_consts[0].tag, t1 = l->sw_consts[1].tag;
+    if (std::min(t0, t1) != 0 || std::max(t0, t1) != 1) return;
+    const LamPtr& a0 = (t0 == 0 ? l->sw_consts[0].body : l->sw_consts[1].body);
+    const LamPtr& a1 = (t0 == 0 ? l->sw_consts[1].body : l->sw_consts[0].body);
+    auto i = mk(Lam::K::IfThenElse);
+    i->cond = l->cond; i->then_ = a1; i->else_ = a0;
+    l = i;
+  }
   // Collapse a static-catch whose exit is raised 0 times (drop the handler) or
   // exactly once and not under an inner try (inline the handler at that site).
   void simplify_static_catches(LamPtr& l) {
@@ -19178,6 +19205,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.simplify_static_catches(root);
   t.inline_var_aliases(root);
   t.collapse_equal_switches(root);
+  t.two_const_switch_to_if(root);
   lap("simplify");
   if (required_globals) {
     std::set<std::string> rg;
