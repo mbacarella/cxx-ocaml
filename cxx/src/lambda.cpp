@@ -10403,6 +10403,44 @@ struct Translator {
   // the caml_obj_tag if-chains.  Only a `_` trailing catch-all is peeled (a named
   // catch-all binds the whole tuple, never materialized here -> bail); exception
   // rows are handled by the caller before this is reached.
+  // A tuple-match column that matches EVERY value of its type while binding
+  // nothing: a `_`/wildcard/var, or an or-pattern of constructors covering all of
+  // the type's constructors, each with irrefutable wildcard args (e.g. `Cstr_constant
+  // _ | Cstr_block _ | Cstr_unboxed | Cstr_extension _`).  ocamlc treats a trailing
+  // tuple row whose columns are all such patterns (`(all_ctors), _ -> false`) as the
+  // ONE shared default, so every leaf failure exits to a single handler.
+  bool exhaustive_irref_col(const Pattern* col) {
+    const Pattern* ep = effective_pat(col);
+    if (std::holds_alternative<Ppat_any>(ep->desc) ||
+        std::get_if<Ppat_var>(&ep->desc)) return true;
+    if (!std::holds_alternative<Ppat_or>(ep->desc)) return false;
+    std::vector<std::string> binds; collect_gvars(col, binds);
+    if (!binds.empty()) return false;             // an alt binds a var used by the body
+    std::vector<const Pattern*> alts; flatten_or(col, alts);
+    if (alts.size() < 2) return false;
+    std::set<std::string> names; std::string type;
+    for (auto* a : alts) {
+      const Pattern* ap = effective_pat(a);
+      auto* pk = std::get_if<Ppat_construct>(&ap->desc);
+      if (!pk) return false;
+      std::string cn = ctor_of(*ap);
+      const CtorInfo* ci = pat_ctor_resolve(ap, cn);
+      if (!ci) return false;
+      if (type.empty()) type = ci->type;
+      else if (type != ci->type) return false;
+      if (!ci->rlabels.empty()) {                 // inline record: check label pats
+        auto* pr = pk->arg ? std::get_if<Ppat_record>(&effective_pat(pk->arg->get())->desc) : nullptr;
+        if (!pr) return false;
+        for (auto& [l, s] : pr->fields) if (!is_irrefutable(*s)) return false;
+      } else
+        for (auto* fp : ctor_field_pats(pk, ci->arity)) if (!is_irrefutable(*fp)) return false;
+      names.insert(cn);
+    }
+    if (type.empty()) return false;
+    auto tc = type_ctors_.find(type);
+    if (tc == type_ctors_.end()) return false;
+    return (int)names.size() == tc->second.first + tc->second.second;  // covers every ctor
+  }
   LamPtr gmatch_tuple_top(const Pexp_tuple* tu, const std::vector<Row>& vrows,
                           const Location& mloc) {
     size_t k = tu->elems.size();
@@ -10426,11 +10464,8 @@ struct Translator {
             tp && tp->elems.size() == k) {
           bool all_irr = true;
           for (auto& lbl : tp->labels) if (lbl) { all_irr = false; break; }
-          for (auto& el : tp->elems) {
-            const Pattern* cp = effective_pat(el.get());
-            if (!std::holds_alternative<Ppat_any>(cp->desc) &&
-                !std::get_if<Ppat_var>(&cp->desc)) { all_irr = false; break; }
-          }
+          for (auto& el : tp->elems)
+            if (!exhaustive_irref_col(el.get())) { all_irr = false; break; }
           if (all_irr) {
             for (auto& el : tp->elems) ca_cols.push_back(effective_pat(el.get()));
             catchall = &vrows[i]; break;
