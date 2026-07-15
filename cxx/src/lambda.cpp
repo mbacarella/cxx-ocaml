@@ -9204,7 +9204,12 @@ struct Translator {
       if (!mm_cols_ok(mrows, (size_t)ar)) return nullptr;
       LamPtr body = mm_cols(comps, std::move(mrows), 0, mloc);
       if (!body) return nullptr;
-      for (int j = ar - 1; j >= 0; --j) {
+      // ocamlc reads the discriminating (matched) column's field FIRST -- the
+      // matrix matcher skips a pure-variable leading column and splits on the
+      // first constructor column, binding that arg outermost.  Wrap forward so
+      // the last field's read ends up outermost (read first), matching ocamlc's
+      // `let *match* = field_(k-1) in let t = field_0 in ..` order.
+      for (int j = 0; j < ar; ++j) {
         LamPtr fread = fieldimm(j, scrut);
         if (count_var(body, fids[j]) <= 1) subst_var(body, fids[j], fread);
         else {
