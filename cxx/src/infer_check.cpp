@@ -440,6 +440,14 @@ struct Checker {
   // an immediate (int) runtime representation, so a value of such a type gets the
   // [int] value kind in the Lambda dump.
   std::set<std::string> immediate_types_;
+  // Local `[@@unboxed]` single-field types -> the last component of the wrapped
+  // field/argument type (`type compunit = Compunit of string [@@unboxed]` ->
+  // "string").  OCaml's Typeopt.scrape_ty sees through such wrappers, so a
+  // polymorphic compare on the type specializes to the representation's compare
+  // (caml_string_notequal for a string-wrapper).  Cross-module wrappers are
+  // resolved on demand from the cmi; see is_unboxed_string.
+  std::unordered_map<std::string, std::string> local_unboxed_inner_;
+  std::unordered_map<std::string, int> unboxed_string_cache_;  // path -> 0 no / 1 yes
   // record fields with a UNIQUE label across all record types: label -> generic
   // scheme arrow(recordType, fieldType).  Ambiguous labels are omitted (type-
   // directed disambiguation needed) and left to Any, so this can't pick wrong.
@@ -3509,6 +3517,15 @@ struct Checker {
         (*manifest_decl_quals_)[d.manifest->get()] = std::move(snap);
     }
     local_declared_.insert(d.name.txt);
+    // A local `[@@unboxed]` single-field record wrapping a string compares via
+    // caml_string_* (see is_unboxed_string); the variant form is handled below.
+    if (auto* rec = std::get_if<Ptype_record>(&d.kind); rec && rec->fields.size() == 1) {
+      bool unboxed = false;
+      for (auto& a : d.attrs) if (a.name == "unboxed" || a.name == "ocaml.unboxed") unboxed = true;
+      if (unboxed)
+        if (auto* c = std::get_if<Ptyp_constr>(&rec->fields[0].type->desc))
+          local_unboxed_inner_[d.name.txt] = lid_last(c->id.txt);
+    }
     auto* v = std::get_if<Ptype_variant>(&d.kind);
     if (!v) return;
     if (d.priv == PrivateFlag::Private)
@@ -3540,6 +3557,10 @@ struct Checker {
             if (n == "int" || n == "char" || n == "bool" || n == "unit" ||
                 immediate_types_.count(n))
               immediate_types_.insert(d.name.txt);
+            // Record the wrapped head for the string-compare specialization; a
+            // string-wrapper (`Compunit of string [@@unboxed]`) compares via
+            // caml_string_* like OCaml's scrape_ty (see is_unboxed_string).
+            local_unboxed_inner_[d.name.txt] = n;
           }
     if (is_gadt) {
       gadt_types.insert(d.name.txt);
@@ -3936,6 +3957,65 @@ struct Checker {
         }
     } catch (...) {}
     return {};
+  }
+
+  // The last component of the field/argument type wrapped by an `[@@unboxed]`
+  // single-field type named `path` ("" if `path` is not such a wrapper).  Local
+  // decls are recorded in local_unboxed_inner_; a module-qualified path is walked
+  // through the owning cmi (mirroring cmi_record_fields).
+  std::string unboxed_inner_head(const std::string& path) {
+    if (auto it = local_unboxed_inner_.find(path); it != local_unboxed_inner_.end())
+      return it->second;
+    size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return {};
+    std::string tyname = path.substr(dot + 1), modpath = path.substr(0, dot);
+    std::vector<std::string> comps;
+    for (size_t i = 0;;) {
+      size_t d = modpath.find('.', i);
+      if (d == std::string::npos) { comps.push_back(modpath.substr(i)); break; }
+      comps.push_back(modpath.substr(i, d - i)); i = d + 1;
+    }
+    try {
+      const auto& cmi = cmi::CmiFile::load(head_cmi(comps[0]));
+      const std::vector<cmi::TypeDecl>* types = &cmi.types();
+      const std::vector<cmi::ModuleDecl>* modules = &cmi.modules();
+      for (size_t k = 1; k < comps.size(); ++k) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& m : *modules) if (m.name == comps[k]) { md = &m; break; }
+        if (!md || !md->type || md->type->kind != cmi::ModuleType::Sig ||
+            !md->type->sig) return {};
+        types = &md->type->sig->types;
+        modules = &md->type->sig->modules;
+      }
+      for (auto& td : *types) {
+        if (td.name != tyname || !td.unboxed) continue;
+        cmi::TypePtr inner;
+        if (td.kind == cmi::TypeDecl::Record && !td.labels.empty())
+          inner = td.labels[0].type;
+        else if (td.kind == cmi::TypeDecl::Variant && !td.ctors.empty() &&
+                 !td.ctors[0].args.empty())
+          inner = td.ctors[0].args[0];
+        if (inner && inner->kind == cmi::TypeExpr::Tconstr && inner->path) {
+          std::string ip = cmi_path_str(*inner->path);
+          size_t id = ip.rfind('.');
+          return id == std::string::npos ? ip : ip.substr(id + 1);
+        }
+        return {};
+      }
+    } catch (...) {}
+    return {};
+  }
+  // Does `path` name an `[@@unboxed]` single-field type whose representation is
+  // (recursively) `string`?  Memoized; the cycle guard also bounds recursion.
+  bool is_unboxed_string(const std::string& path) {
+    if (path.empty()) return false;
+    if (auto c = unboxed_string_cache_.find(path); c != unboxed_string_cache_.end())
+      return c->second == 1;
+    unboxed_string_cache_[path] = 0;  // guard against a cyclic wrapper
+    std::string head = unboxed_inner_head(path);
+    bool r = head == "string" || (!head.empty() && head != path && is_unboxed_string(head));
+    unboxed_string_cache_[path] = r ? 1 : 0;
+    return r;
   }
 
   TypePtr qualified_ctor_type(const Longident& id) {
@@ -9265,7 +9345,8 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
 }
 
 // The Lambda value_kind of an inferred type, as -dlambda spells it.
-static std::string kind_str(const TypePtr& t0, const std::set<std::string>& imm) {
+static std::string kind_str(const TypePtr& t0, Checker& ck) {
+  const std::set<std::string>& imm = ck.immediate_types_;
   TypePtr t = I::Engine::repr(t0);
   // functions and tuples are always boxed (Typeopt: Paddrarray, lazy Shortcut)
   if (t->kind == I::Type::Kind::Arrow || t->kind == I::Type::Kind::Tuple) return "addr";
@@ -9280,6 +9361,11 @@ static std::string kind_str(const TypePtr& t0, const std::set<std::string>& imm)
   if (b == "int64") return "int64";
   if (b == "nativeint") return "nativeint";
   if (b == "string") return "string";  // not a value kind, but drives string compares
+  // An `[@@unboxed]` wrapper of a string is represented as its string, so a
+  // polymorphic compare on it specializes to caml_string_* (Typeopt.scrape_ty).
+  // "string" is not a value kind either -- it only differs from "addr" in
+  // enabling that specialization -- so this cannot change any value_kind.
+  if (ck.is_unboxed_string(t->path)) return "string";
   // A known boxed type (record/block-variant/string/...): not a value kind, but
   // an `addr` array element (vs a type variable, which is `gen`).
   return "addr";
@@ -9287,13 +9373,13 @@ static std::string kind_str(const TypePtr& t0, const std::set<std::string>& imm)
 
 // If `t0` is an array type, sets `out` to its element kind_str ("" for a generic
 // element) and returns true; otherwise returns false.
-static bool array_elem_str(const TypePtr& t0, const std::set<std::string>& imm, std::string& out) {
+static bool array_elem_str(const TypePtr& t0, Checker& ck, std::string& out) {
   TypePtr t = I::Engine::repr(t0);
   if (t->kind != I::Type::Kind::Constr || t->args.empty()) return false;
   auto d = t->path.rfind('.');
   std::string b = d == std::string::npos ? t->path : t->path.substr(d + 1);
   if (b != "array" && b != "iarray") return false;
-  out = kind_str(t->args[0], imm);
+  out = kind_str(t->args[0], ck);
   return true;
 }
 
@@ -9304,7 +9390,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   ck.resolve_pending_fields();  // re-resolve ambiguous field reads with final types
   ValueKinds vk;
   for (auto& [p, t] : ck.rec_pat_) {
-    vk.pat[p] = kind_str(t, ck.immediate_types_);
+    vk.pat[p] = kind_str(t, ck);
     // A constructor pattern whose type resolved to a module-qualified variant:
     // record the path so the back end can register that type's constructors.
     if (std::holds_alternative<ast::Ppat_construct>(p->desc)) {
@@ -9330,17 +9416,17 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
         vk.pat_record_type[p] = r->path;
     }
   }
-  for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck.immediate_types_);
+  for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck);
   for (auto& [e, t] : ck.rec_expr_) {
-    vk.expr[e] = kind_str(t, ck.immediate_types_);
+    vk.expr[e] = kind_str(t, ck);
     std::string ek;
-    if (array_elem_str(t, ck.immediate_types_, ek)) vk.array_elem[e] = ek;  // "" = gen element
+    if (array_elem_str(t, ck, ek)) vk.array_elem[e] = ek;  // "" = gen element
     // A function-typed reference whose first parameter is a specializable base
     // type: record the operand kind so an eta-expanded comparison primitive
     // lowers to the type-specialized comparison (int_replace_polymorphic_compare
     // -- `let (=) : int -> int -> bool = Stdlib.(=)`).
     if (TypePtr rt = I::Engine::repr(t); rt->kind == I::Type::Kind::Arrow) {
-      std::string dk = kind_str(rt->dom, ck.immediate_types_);
+      std::string dk = kind_str(rt->dom, ck);
       if (dk == "int" || dk == "float" || dk == "string" || dk == "int32" ||
           dk == "int64" || dk == "nativeint")
         vk.cmp_operand[e] = dk;
