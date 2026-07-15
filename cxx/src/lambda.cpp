@@ -5279,6 +5279,12 @@ struct Translator {
   }
 
   Ident fresh(const std::string& name, bool temp = false) { return Ident{name, stamp++, temp}; }
+  // A module/class/unpack binder: ocamlc creates these Ident.create_scoped;
+  // Scoped sorts before Local in Ident.compare, so closure fv layouts place
+  // them first (see Ident.scoped).
+  Ident fresh_scoped(const std::string& name) {
+    Ident i = fresh(name); i.scoped = true; return i;
+  }
   ValueKind pat_kind(const Pattern* p) {
     auto it = vk.pat.find(p);
     return it == vk.pat.end() ? ValueKind::Gen : vkind(it->second);
@@ -8359,7 +8365,7 @@ struct Translator {
       pat_pre_ids_.emplace(p, fresh(pa->name.txt)); return;
     }
     if (auto* up = std::get_if<Ppat_unpack>(&p->desc)) {
-      if (up->name.txt) pat_pre_ids_.emplace(p, fresh(*up->name.txt));
+      if (up->name.txt) pat_pre_ids_.emplace(p, fresh_scoped(*up->name.txt));
       return;
     }
     if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
@@ -8430,11 +8436,36 @@ struct Translator {
     // binds an irrefutable destructure's components in reverse field order
     // (`let ((x,y),z) = p` emits z, *match*=field0, y, x), with a materialized
     // sub-scrutinee temp still bound before (outside) its own sub-fields.
+    // A LAZY field splits the level at the first lazy column j (probes over
+    // every position/multiplicity): temp_j =a access_j binds FIRST, then
+    // columns 0..j-1 right-to-left, then the force of temp_j, then the same
+    // rule over the remaining columns -- `(x, lazy d, y)` emits
+    // *match*=field1, x, d=force(*match*), y.
+    auto bind_field_list = [&](const std::vector<const Pattern*>& subs,
+                               auto&& acc_at) -> bool {
+      std::function<bool(size_t)> go = [&](size_t lo) -> bool {
+        size_t j = subs.size();
+        for (size_t i = lo; i < subs.size(); ++i)
+          if (std::holds_alternative<Ppat_lazy>(effective_pat(subs[i])->desc)) { j = i; break; }
+        if (j == subs.size()) {
+          for (size_t i = subs.size(); i-- > lo;)
+            if (!collect_binders(*subs[i], acc_at(i), out)) return false;
+          return true;
+        }
+        Ident t = fresh("", true);
+        out.push_back({t, acc_at(j)});
+        for (size_t i = j; i-- > lo;)
+          if (!collect_binders(*subs[i], acc_at(i), out)) return false;
+        if (!collect_binders(*subs[j], varof(t), out)) return false;
+        return go(j + 1);
+      };
+      return go(0);
+    };
     if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
       LamPtr sv = materialize(scrut);
-      for (size_t i = pt->elems.size(); i-- > 0;)
-        if (!collect_binders(*pt->elems[i], fieldimm((int)i, sv), out)) return false;
-      return true;
+      std::vector<const Pattern*> subs;
+      for (auto& el : pt->elems) subs.push_back(el.get());
+      return bind_field_list(subs, [&](size_t i) { return fieldimm((int)i, sv); });
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
       LamPtr sv = materialize(scrut);
@@ -8495,11 +8526,12 @@ struct Translator {
       auto fps = ctor_field_pats(pk, ci->second.arity);
       if ((int)fps.size() != ci->second.arity) return false;
       LamPtr sv = materialize(scrut);
-      for (size_t i = fps.size(); i-- > 0;) {
-        if (!collect_binders(*fps[i], fieldimm((int)i, sv), out)) return false;
-        if (auto* pv = std::get_if<Ppat_var>(&effective_pat(fps[i])->desc))
-          if (auto* b = lookup(pv->name.txt)) apply_var_node_path(effective_pat(fps[i]), *b);
-      }
+      std::vector<const Pattern*> subs(fps.begin(), fps.end());
+      if (!bind_field_list(subs, [&](size_t i) { return fieldimm((int)i, sv); }))
+        return false;
+      for (auto* fp : fps)
+        if (auto* pv = std::get_if<Ppat_var>(&effective_pat(fp)->desc))
+          if (auto* b = lookup(pv->name.txt)) apply_var_node_path(effective_pat(fp), *b);
       return true;
     }
     // A polymorphic-variant pattern: the block is [hash; arg], the payload at
@@ -11700,7 +11732,7 @@ struct Translator {
     }
     if (auto* up = std::get_if<Ppat_unpack>(&p->desc)) {  // `(module M [: S])`: bind M
       if (up->name.txt) {
-        Ident id = fresh(*up->name.txt);
+        Ident id = fresh_scoped(*up->name.txt);
         binds.push_back({id, acc});
         module_ident_[*up->name.txt] = id;  // so `M.x` in a `when` guard / body resolves
         std::string mt;
@@ -12251,7 +12283,7 @@ struct Translator {
         auto rl = module_result_layout(op->expr);
         if (rl.empty()) rl = arg_layout(op->expr);
         std::string nm = "open#" + std::to_string(++open_gen_count_);
-        Ident oid = fresh("open");
+        Ident oid = fresh_scoped("open");
         module_ident_[nm] = oid;
         auto& lay = module_layout_[nm]; lay.clear();
         for (int i = 0; i < (int)rl.size(); ++i) lay[rl[i]] = i;
@@ -12327,7 +12359,7 @@ struct Translator {
             module_alias_[nm] = modval; module_ident_.erase(nm);
             result = expr(*si->body);
           } else {
-            Ident mid = fresh(nm);
+            Ident mid = fresh_scoped(nm);
             module_ident_[nm] = mid; module_alias_.erase(nm);
             auto l = mk(Lam::K::Let);
             l->bindings = {{mid, ValueKind::Gen, modval}}; l->body = expr(*si->body);
@@ -15305,7 +15337,7 @@ struct Translator {
           l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
         } else if (auto* up = std::get_if<Ppat_unpack>(&pat->desc); up && up->name.txt) {
-          Ident id = fresh(*up->name.txt);  // `(module X)`: a first-class-module param
+          Ident id = fresh_scoped(*up->name.txt);  // `(module X)`: a first-class-module param
           l->params.push_back({id, ValueKind::Gen});
           scope.back()[*up->name.txt] = id;
           {
@@ -16712,7 +16744,7 @@ struct Translator {
     auto fn = mk(Lam::K::Function); fn->inline_attr = "is_a_functor";
     const Functor_named* fp = std::get_if<Functor_named>(&pf_a->param);
     std::string nm = fp ? (fp->name.txt ? *fp->name.txt : "_") : "*";
-    Ident pid = fresh(nm);
+    Ident pid = fresh_scoped(nm);
     bool had = module_ident_.count(nm); Ident oldid = had ? module_ident_[nm] : Ident{};
     auto oldlay = module_layout_[nm];
     if (fp && fp->type) { module_ident_[nm] = pid; register_sig_layouts(nm, *fp->type); }
@@ -16940,7 +16972,7 @@ struct Translator {
         std::string nm = "*";
         const Functor_named* fp = std::get_if<Functor_named>(&pf->param);
         if (fp) nm = fp->name.txt ? *fp->name.txt : "_";  // anonymous param prints `_`
-        Ident pid = fresh(nm);
+        Ident pid = fresh_scoped(nm);
         // Bind the parameter X (with its signature's value layout) so `X.foo`
         // inside the body resolves to `(field_imm i X)`.  Save/restore for nesting.
         saves.push_back({nm, module_ident_.count(nm) != 0,
@@ -18069,7 +18101,7 @@ struct Translator {
             for (auto& [k, v] : lprims_before) local_prims_[k] = v;
             for (auto& [k, v] : exts_before) externals_[k] = v;
             mod_path_ = saved;
-            Ident mid = fresh(*mb.name.txt);
+            Ident mid = fresh_scoped(*mb.name.txt);
             cur.push_back({mid, ValueKind::Gen, body});
             auto& lay = module_layout_[*mb.name.txt]; lay.clear();
             for (int i = 0; i < (int)sub.size(); ++i) lay[sub[i]] = i;
@@ -18140,7 +18172,7 @@ struct Translator {
               }
             add_export(*mb.name.txt, mid, modsig::NS::Module, submsig);
           } else if (std::holds_alternative<Pmod_functor>(mb.expr.desc)) {
-            Ident mid = fresh(*mb.name.txt);            // a functor binds as a function
+            Ident mid = fresh_scoped(*mb.name.txt);     // a functor binds as a function
             std::string saved_mp = mod_path_;  // __FUNCTION__ inside is `..Functor.fn`
             mod_path_ += (mod_path_.empty() ? "" : ".") + *mb.name.txt;
             // .mli-driven functor-result coercion: lay this functor's body struct
@@ -18361,7 +18393,7 @@ struct Translator {
                 cursig.push({.ns = modsig::NS::Module, .name = nm,
                              .runtime = false, .sub = msub});
             } else {
-              Ident mid = fresh(nm);
+              Ident mid = fresh_scoped(nm);
               cur.push_back({mid, ValueKind::Gen, mv});
               module_ident_[nm] = mid;
               add_export(nm, mid, modsig::NS::Module, msub);
@@ -18407,7 +18439,7 @@ struct Translator {
           // (phase 0) register every name first, so mutual refs resolve in every
           // body; a dummy-able member also registers its signature layout.
           for (auto& rm : rms) {
-            rm.id = fresh(*rm.mb->name.txt);
+            rm.id = fresh_scoped(*rm.mb->name.txt);
             module_ident_[*rm.mb->name.txt] = rm.id;
             // register the signature layout (for ALL members, not just dummy-able)
             // so a sibling body's `M.member` resolves from M's sig -- e.g. an

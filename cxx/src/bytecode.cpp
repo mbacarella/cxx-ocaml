@@ -206,12 +206,22 @@ struct Bytegen {
       }
     }
   }
+  // ocamlc's Ident.compare sorts Scoped idents (module/class binders, unpack
+  // pattern vars) BEFORE Local ones regardless of stamp, then by stamp; the
+  // closure env layout comes from Ident.Set.elements in that order.
+  static void sort_fv_ocamlc(std::vector<Ident>& r) {
+    std::stable_sort(r.begin(), r.end(), [](const Ident& a, const Ident& b) {
+      if (a.scoped != b.scoped) return a.scoped;  // Scoped first
+      return a.stamp < b.stamp;
+    });
+  }
   std::vector<Ident> free_vars(const LamPtr& e) {
     std::set<int> bound;
     std::map<int, Ident> out;  // ordered by stamp
     fvs(e, bound, out);
     std::vector<Ident> r;
     for (auto& [s, id] : out) r.push_back(id);
+    sort_fv_ocamlc(r);
     return r;
   }
 
@@ -465,6 +475,7 @@ struct Bytegen {
         for (auto& b : exp->bindings) fvs(b.val, bound, fvm);
         std::vector<Ident> fv;
         for (auto& [s, id] : fvm) fv.push_back(id);
+        sort_fv_ocamlc(fv);
         // closure_entries Multiple_recursive: functions at 0,3,6..; free vars after
         std::map<int, std::pair<bool, int>> entries;
         for (int i = 0; i < ndecl; ++i) entries[exp->bindings[i].id.stamp] = {true, 3 * i};

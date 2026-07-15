@@ -74,6 +74,10 @@ struct Ident {
   std::string name;
   int stamp = 0;
   bool temp = false;  // a compiler-generated binder (printed *name*/stamp)
+  // ocamlc's Ident.create_scoped class (module/class binders, unpack pattern
+  // vars) -- Ident.compare sorts Scoped BEFORE Local regardless of stamp, so
+  // a closure's free-var layout puts these first (bytegen Ident.Set.elements).
+  bool scoped = false;
 };
 
 // Lambda primitives we emit so far (printlambda spelling in the comment).
