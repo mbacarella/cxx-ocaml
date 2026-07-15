@@ -8715,7 +8715,14 @@ struct Translator {
       if (lazy_force_binders_.count(id.stamp)) {
         body = wraplet({id, ValueKind::Gen, acc, false}, body); continue;
       }
-      if (count_var(body, id) <= 1) { subst_var(body, id, acc); continue; }
+      // A single-use MUTABLE read stays let-bound: ocamlc's simplif inlines
+      // only Alias lets, and a field_mut binding is StrictOpt (`=o`), kept
+      // even at one use (local_store's `Ref {r; snapshot} -> r := snapshot`).
+      // Zero uses still drop it (StrictOpt: evaluate only if used).
+      int n = count_var(body, id);
+      if (n == 0 || (n <= 1 && !is_mut_field_access(acc))) {
+        subst_var(body, id, acc); continue;
+      }
       Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = acc;
       if (is_mut_field_access(acc)) b.strict_opt = true;   // mutable -> StrictOpt (`=o`)
       else b.alias = is_field_access(acc);
@@ -8876,11 +8883,19 @@ struct Translator {
     scope.pop_back();
     // Reverse-fold into nested lets so a materialized sub-scrutinee whose uses are
     // only inside kept sibling bindings is still counted (count_var descends into
-    // let-RHS); emits identically to a flat let.
+    // let-RHS); emits identically to a flat let.  Same kept-mutable-read rule as
+    // wrap_binders: a field_mut binding is StrictOpt, kept even single-use.
     for (auto it = binders.rbegin(); it != binders.rend(); ++it) {
       auto& id = it->first; auto& fa = it->second;
-      if (count_var(body, id) <= 1) { subst_var(body, id, fa); continue; }
-      auto l = mk(Lam::K::Let); l->bindings = {{id, ValueKind::Gen, fa, true}};
+      int n = count_var(body, id);
+      if (n == 0 || (n <= 1 && !is_mut_field_access(fa))) {
+        subst_var(body, id, fa); continue;
+      }
+      auto l = mk(Lam::K::Let);
+      Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = fa;
+      if (is_mut_field_access(fa)) b.strict_opt = true;
+      else b.alias = true;
+      l->bindings = {b};
       l->body = body; body = l;
     }
     return body;
