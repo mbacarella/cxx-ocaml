@@ -12462,6 +12462,53 @@ struct Translator {
   // test (the arm falls through), reproducing ocamlc's layout.  The dichotomic
   // caml_string_compare tree (>8 strings) is not modelled -- those fall to the
   // naive matcher (still correct, via caml_string_equal).
+  // ocamlc's Matching.make_string_test_sequence: a right-fold of
+  // `if caml_string_notequal(arg,"s") then k else act` sharing the default `d`.
+  LamPtr string_test_seq(const LamPtr& arg,
+                         const std::vector<std::pair<std::string, LamPtr>>& sw,
+                         const LamPtr& d) {
+    LamPtr k = d;
+    for (auto it = sw.rbegin(); it != sw.rend(); ++it) {
+      auto sv = mk(Lam::K::ConstString); sv->str_val = it->first;
+      auto ne = mk(Lam::K::Prim); ne->prim = Prim::Ccall;
+      ne->prim_id = "caml_string_notequal"; ne->args = {arg, sv};
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = ne; iff->then_ = k; iff->else_ = it->second;
+      k = iff;
+    }
+    return k;
+  }
+  // ocamlc's Matching.do_make_string_test_tree: a dichotomic search via
+  // caml_string_compare down to <= strings_test_threshold(8)+delta leaves, then
+  // a linear caml_string_notequal sequence.  `sw` is sorted; `d` is the shared
+  // default.  The split takes the middle element as pivot (ocamlc's `split`),
+  // and tree_way_test dispatches r<0 -> lt, r>0 -> gt, r=0 -> pivot action.
+  LamPtr string_test_tree(const LamPtr& arg,
+                          const std::vector<std::pair<std::string, LamPtr>>& sw,
+                          int delta, const LamPtr& d) {
+    int len = (int)sw.size();
+    if (len <= 8 + delta) return string_test_seq(arg, sw, d);
+    int p = 0; for (int k = len; k > 1; k -= 2) p++;  // pivot index (ocamlc split)
+    std::vector<std::pair<std::string, LamPtr>> lt(sw.begin(), sw.begin() + p);
+    const auto& piv = sw[p];
+    std::vector<std::pair<std::string, LamPtr>> gt(sw.begin() + p + 1, sw.end());
+    auto sv = mk(Lam::K::ConstString); sv->str_val = piv.first;
+    auto cmp = mk(Lam::K::Prim); cmp->prim = Prim::Ccall;
+    cmp->prim_id = "caml_string_compare"; cmp->args = {arg, sv};
+    Ident rid = fresh("switch"); LamPtr r = varof(rid);
+    auto ltc = mk(Lam::K::Prim); ltc->prim = Prim::IntCmp; ltc->prim_id = "<";
+    ltc->args = {r, cint(0)};                       // r < 0
+    auto gtc = mk(Lam::K::Prim); gtc->prim = Prim::IntCmp; gtc->prim_id = "<";
+    gtc->args = {cint(0), r};                       // 0 < r
+    auto inner = mk(Lam::K::IfThenElse); inner->cond = gtc;
+    inner->then_ = string_test_tree(arg, gt, delta, d); inner->else_ = piv.second;
+    auto outer = mk(Lam::K::IfThenElse); outer->cond = ltc;
+    outer->then_ = string_test_tree(arg, lt, delta, d); outer->else_ = inner;
+    auto let = mk(Lam::K::Let);
+    let->bindings = {{rid, ValueKind::Gen, cmp, false}};  // Strict `switch`
+    let->body = outer;
+    return let;
+  }
   LamPtr string_switch(const LamPtr& scrut, const std::vector<Row>& rows,
                        const Location&) {
     std::vector<std::pair<std::string, const Expression*>> arms;
@@ -12481,33 +12528,48 @@ struct Translator {
       arms.push_back({ps->s, r.rhs});
     }
     if (arms.empty() || !dflt) return nullptr;  // a string match needs a wildcard
-    if (arms.size() > 8) return nullptr;        // dichotomic tree: not modelled
 
     // bind_sw: evaluate the scrutinee once into a `switch` local unless it is
     // already a variable (ocamlc re-reads a Lvar directly, no let).
     LamPtr arg = scrut; Ident sw_id; bool bound = false;
     if (scrut->k != Lam::K::Var) { sw_id = fresh("switch"); arg = varof(sw_id); bound = true; }
 
-    // The shared default sits behind an (exit N); the innermost test's `then`
-    // raises it, so the final test compiles to `branchif <default>`.
-    int eid = ++next_exit_;
-    LamPtr k = mk(Lam::K::Staticraise); k->prim_arg = eid;
-    for (auto it = arms.rbegin(); it != arms.rend(); ++it) {
-      auto sv = mk(Lam::K::ConstString); sv->str_val = it->first;
-      auto ne = mk(Lam::K::Prim); ne->prim = Prim::Ccall;
-      ne->prim_id = "caml_string_notequal"; ne->args = {arg, sv};
-      auto iff = mk(Lam::K::IfThenElse);
-      iff->cond = ne; iff->then_ = k; iff->else_ = expr(*it->second);
-      k = iff;
-    }
+    // Compile arm bodies once, in source order (stamp-stable), then sort the
+    // (string,body) pairs like ocamlc's Matching.sort_lambda_list (stable_sort
+    // by String.compare, adjacent-duplicate removal keeping the earliest arm).
+    std::vector<std::pair<std::string, LamPtr>> sw;
+    sw.reserve(arms.size());
+    for (auto& [s, e] : arms) sw.push_back({s, expr(*e)});
+    std::stable_sort(sw.begin(), sw.end(),
+                     [](auto& a, auto& b) { return a.first < b.first; });
+    sw.erase(std::unique(sw.begin(), sw.end(),
+                         [](auto& a, auto& b) { return a.first == b.first; }),
+             sw.end());
+
     // the default body binds its catch-all var (if any) to the scrutinee var
     scope.emplace_back();
     bind_catchall(*dflt->lhs, arg);
     LamPtr dbody = expr(*dflt->rhs);
     scope.pop_back();
-    auto cat = mk(Lam::K::Catch); cat->cond = k; cat->prim_arg = eid; cat->then_ = dbody;
-    cat->keep_catch = true;
-    LamPtr body = cat;
+
+    // make_catch: the shared default sits behind an (exit N) so the leaves' `then`
+    // raise it (compiling to `branchif <default>`); but a default that is already
+    // a bare `(exit j)` is reused directly, with no fresh catch.
+    bool dflt_is_exit = dbody->k == Lam::K::Staticraise && dbody->args.empty();
+    int eid = dflt_is_exit ? dbody->prim_arg : ++next_exit_;
+    LamPtr d;
+    if (dflt_is_exit) d = dbody;
+    else { d = mk(Lam::K::Staticraise); d->prim_arg = eid; }
+
+    // A string match always carries a wildcard default, so delta = 1 (ocamlc's
+    // expand_stringswitch Some-branch): <= 9 strings stay a linear sequence.
+    LamPtr tree = string_test_tree(arg, sw, /*delta=*/1, d);
+
+    LamPtr body = tree;
+    if (!dflt_is_exit) {
+      auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid;
+      cat->then_ = dbody; cat->keep_catch = true; body = cat;
+    }
     if (bound) {
       auto l = mk(Lam::K::Let); l->bindings = {{sw_id, ValueKind::Gen, scrut, false}};
       l->body = body; body = l;
