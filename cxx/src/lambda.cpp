@@ -10445,9 +10445,13 @@ struct Translator {
         mrows.push_back(std::move(mr));
       }
     int deid = ++next_exit_;
-    g_gm_budget_ = gm_budget();
+    // Enable nested tuple/record column decomposition (budget-guarded) so a record
+    // sub-column -- `match a, b with Ldot ({txt;_}, _), .. ` -- is split into field
+    // reads instead of bailing (which would force the whole tuple scrutinee to be
+    // allocated as a block and matched via caml_obj_tag).
+    g_gm_tuples_ = true; g_gm_budget_ = gm_budget();
     LamPtr body = gmatch(comps, mrows, mloc, deid);
-    g_gm_budget_ = -1;
+    g_gm_tuples_ = false; g_gm_budget_ = -1;
     if (!body) return nullptr;
     wire_garms(body, arms);
     LamPtr dbody;
