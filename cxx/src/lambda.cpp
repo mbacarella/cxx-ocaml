@@ -9309,6 +9309,29 @@ struct Translator {
       i->cond = scrut; i->then_ = blocks[0].body; i->else_ = consts[0].body;
       return i;
     }
+    // All non-constant constructors route to ONE action (matching.ml:3302-3334's
+    // `act0 = Some act`): ocamlc splits on isint rather than building a combined
+    // switch -- `(if (isint scrut) <const-dispatch> <that action>)`.  Covers the
+    // frequent `match x with C -> .. | _ -> ..` over a type with both const and
+    // block ctors (all blocks fall to the shared default/exit).
+    if (blocks.size() >= 2 && !consts.empty()) {
+      const LamPtr& b0 = blocks[0].body;
+      bool share = true;
+      std::string k0;
+      for (auto& b : blocks) {
+        if (b.body == b0) continue;         // same term (e.g. the shared default exit)
+        if (k0.empty()) k0 = make_lam_key(b0);
+        std::string k = make_lam_key(b.body);
+        if (k.empty() || k != k0) { share = false; break; }
+      }
+      if (share) {
+        auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
+        isint->prim_id = "isint"; isint->args = {scrut};
+        auto i = mk(Lam::K::IfThenElse);
+        i->cond = isint; i->then_ = const_dispatch(scrut, consts); i->else_ = b0;
+        return i;
+      }
+    }
     // nb>=2 -> one (switch* scrut case int V: .. case tag T: ..) over both.
     if (blocks.size() >= 2) {
       auto sw = mk(Lam::K::Switch); sw->cond = scrut;
