@@ -8307,8 +8307,50 @@ struct Translator {
   // single-constructor) to field reads of `scrut`, recording (ident, access) in
   // `out` and binding the names in the current scope.  Returns false on any shape
   // that isn't irrefutably destructurable (the caller falls back to a plain temp).
+  // ocamlc creates pattern-var idents at TYPING time in SOURCE order (an alias
+  // var right after its sub-pattern's vars), and only then binds them in the
+  // matcher's reverse field order.  Stamp order decides a closure's free-var
+  // layout (Ident.Set.elements -> ENVACC indices), so pre-assign idents by a
+  // source-order walk; the binding sites look them up (pre_or_fresh).  Keyed
+  // by AST node (stable and position-unique), so a matcher retry or a second
+  // path over the same pattern reuses the same ident, as ocamlc's typing-time
+  // assignment does.  Matching-time temps (*match*) stay fresh()-at-bind.
+  std::map<const Pattern*, Ident> pat_pre_ids_;
+  void preassign_pat_vars(const Pattern& p0) {
+    const Pattern* p = effective_pat(&p0);
+    if (pat_pre_ids_.count(p)) return;  // node (and thus subtree) already walked
+    if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
+      pat_pre_ids_.emplace(p, fresh(pv->name.txt)); return;
+    }
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+      preassign_pat_vars(*pa->p);
+      pat_pre_ids_.emplace(p, fresh(pa->name.txt)); return;
+    }
+    if (auto* up = std::get_if<Ppat_unpack>(&p->desc)) {
+      if (up->name.txt) pat_pre_ids_.emplace(p, fresh(*up->name.txt));
+      return;
+    }
+    if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (auto& el : pt->elems) preassign_pat_vars(*el); return;
+    }
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [l, s] : pr->fields) preassign_pat_vars(*s); return;
+    }
+    if (auto* pk = std::get_if<Ppat_construct>(&p->desc)) {
+      if (pk->arg) preassign_pat_vars(**pk->arg); return;
+    }
+    if (auto* pvr = std::get_if<Ppat_variant>(&p->desc)) {
+      if (pvr->arg) preassign_pat_vars(**pvr->arg); return;
+    }
+    if (auto* pz = std::get_if<Ppat_lazy>(&p->desc)) { preassign_pat_vars(*pz->p); return; }
+  }
+  Ident pre_or_fresh(const Pattern* p, const std::string& name) {
+    auto it = pat_pre_ids_.find(p);
+    return it != pat_pre_ids_.end() ? it->second : fresh(name);
+  }
   bool collect_binders(const Pattern& p0, const LamPtr& scrut,
                        std::vector<std::pair<Ident, LamPtr>>& out) {
+    preassign_pat_vars(p0);
     const Pattern* p = effective_pat(&p0);
     // Materialize a non-trivial sub-scrutinee before reading several fields off
     // it: `let Cell(Cell(a,b,c),..) = s` reads the inner cell (a field access)
@@ -8328,13 +8370,13 @@ struct Translator {
     };
     if (std::holds_alternative<Ppat_any>(p->desc)) return true;
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
-      Ident id = fresh(pv->name.txt);
+      Ident id = pre_or_fresh(p, pv->name.txt);
       scope.back()[pv->name.txt] = id; apply_var_node_path(p, id);
       out.push_back({id, scrut}); return true;
     }
     if (auto* up = std::get_if<Ppat_unpack>(&p->desc)) {  // `(module M [: S])`: bind M
       if (up->name.txt) {
-        Ident id = fresh(*up->name.txt);
+        Ident id = pre_or_fresh(p, *up->name.txt);
         scope.back()[*up->name.txt] = id; out.push_back({id, scrut});
         module_ident_[*up->name.txt] = id;
         std::string mt;
@@ -8348,7 +8390,7 @@ struct Translator {
       return true;
     }
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {  // `pat as x`: bind x and recurse
-      Ident id = fresh(pa->name.txt);
+      Ident id = pre_or_fresh(p, pa->name.txt);
       scope.back()[pa->name.txt] = id; out.push_back({id, scrut});
       return collect_binders(*pa->p, scrut, out);
     }
@@ -8441,7 +8483,7 @@ struct Translator {
       const Pattern* sub = effective_pat(pz->p.get());
       Ident id;
       if (auto* pv = std::get_if<Ppat_var>(&sub->desc)) {
-        id = fresh(pv->name.txt);
+        id = pre_or_fresh(sub, pv->name.txt);
         scope.back()[pv->name.txt] = id;
       } else {
         id = fresh("", true);
@@ -8710,6 +8752,21 @@ struct Translator {
     scope.emplace_back();
     std::vector<std::pair<Ident, LamPtr>> binders;  // bound var -> field-access path
     bool ok = true;
+    // ocamlc creates pattern-var idents at TYPING time, in SOURCE order (an
+    // alias var right after its sub-pattern's vars), and only then binds them
+    // in the matcher's reverse field order.  Stamp order decides a closure's
+    // free-var layout (Ident.Set.elements), so pre-assign idents source-first;
+    // destruct below (which walks fields right-to-left) looks them up.
+    // Matching-time temps (*match*) stay fresh()-at-bind like ocamlc's.
+    std::map<const Pattern*, Ident> pre;
+    std::function<void(const Pattern&)> prewalk = [&](const Pattern& q0) {
+      const Pattern* q = effective_pat(&q0);
+      if (auto* pv = std::get_if<Ppat_var>(&q->desc)) { pre.emplace(q, fresh(pv->name.txt)); return; }
+      if (auto* pa = std::get_if<Ppat_alias>(&q->desc)) { prewalk(*pa->p); pre.emplace(q, fresh(pa->name.txt)); return; }
+      if (auto* pt = std::get_if<Ppat_tuple>(&q->desc)) { for (auto& el : pt->elems) prewalk(*el); return; }
+      if (auto* pr = std::get_if<Ppat_record>(&q->desc)) { for (auto& [l, s] : pr->fields) prewalk(*s); return; }
+      // anything else (nested ctor/constant/or) makes destruct bail -- skip
+    };
     // Materialize a non-trivial sub-scrutinee before reading several fields off it
     // (see collect_binders): a nested tuple/record off a field access is read once
     // per sub-field; ocamlc binds that intermediate and lets simplif inline it only
@@ -8728,24 +8785,37 @@ struct Translator {
       const Pattern* p = effective_pat(&p0);
       if (std::holds_alternative<Ppat_any>(p->desc)) return;
       if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
-        Ident id = fresh(pv->name.txt); scope.back()[pv->name.txt] = id;
+        auto pi = pre.find(p);
+        Ident id = pi != pre.end() ? pi->second : fresh(pv->name.txt);
+        scope.back()[pv->name.txt] = id;
         apply_var_node_path(p, id);  // a ctor-arg var: tag its record type
         binders.push_back({id, acc}); return;
       }
       if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
-        Ident id = fresh(pa->name.txt); scope.back()[pa->name.txt] = id;
-        binders.push_back({id, acc}); destruct(*pa->p, acc); return;
+        auto pi = pre.find(p);
+        Ident id = pi != pre.end() ? pi->second : fresh(pa->name.txt);
+        scope.back()[pa->name.txt] = id;
+        binders.push_back({id, acc});
+        // sub-fields read off the alias var itself (ocamlc's matcher reuses the
+        // bound alias as the sub-scrutinee; a separate *match* temp would both
+        // duplicate the read and misorder the let group)
+        destruct(*pa->p, varof(id)); return;
       }
+      // Field iteration is RIGHT-TO-LEFT like collect_binders: ocamlc's matcher
+      // binds an arm's destructured components in reverse field order, the
+      // materialized sub-scrutinee temp still bound before (outside) its own
+      // sub-fields.  The reverse fold below then emits collection order.
       if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
         LamPtr sv = materialize(acc);
-        for (size_t i = 0; i < pt->elems.size(); ++i) destruct(*pt->elems[i], fieldimm((int)i, sv));
+        for (size_t i = pt->elems.size(); i-- > 0;) destruct(*pt->elems[i], fieldimm((int)i, sv));
         return;
       }
       if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
         LamPtr sv = materialize(acc);
         std::vector<std::string> flds;
         for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
-        for (auto& [lbl, sub] : pr->fields) {
+        for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
+          auto& [lbl, sub] = *rit;
           FieldInfo nfi;
           const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
           tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
@@ -8759,6 +8829,7 @@ struct Translator {
     auto bind_field = [&](int idx, const Pattern& p) { destruct(p, fieldimm(idx, scrut)); };
     if (k->arg) {
       const Pattern& arg = **k->arg;
+      prewalk(arg);
       if (!ci.rlabels.empty()) {
         // inline record: the argument pattern matches the block itself
         // (`T r` binds r to the scrutinee; `T {cnt}` reads the labels' fields).
@@ -8769,7 +8840,8 @@ struct Translator {
         const Pattern* ap = effective_pat(&arg);
         if (auto* pr = std::get_if<Ppat_record>(&ap->desc)) {
           auto& L = ci.rlabels;
-          for (auto& [lbl, sub] : pr->fields) {
+          for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
+            auto& [lbl, sub] = *rit;
             int ix = -1;
             for (size_t i2 = 0; i2 < L.size(); ++i2)
               if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
@@ -8789,7 +8861,7 @@ struct Translator {
       } else if (ci.arity > 1) {
         auto* tup = std::get_if<Ppat_tuple>(&arg.desc);
         if (!tup || (int)tup->elems.size() != ci.arity) ok = false;
-        else for (int idx = 0; idx < ci.arity && ok; ++idx) bind_field(idx, *tup->elems[idx]);
+        else for (int idx = ci.arity; ok && idx-- > 0;) bind_field(idx, *tup->elems[idx]);
       } else {
         bind_field(0, arg);
       }
