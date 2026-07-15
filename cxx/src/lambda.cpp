@@ -7503,6 +7503,40 @@ struct Translator {
     for (auto& sc : l->sw_consts) inline_exit(sc.body, id, vars, kinds, handler);
     for (auto& sc : l->sw_blocks) inline_exit(sc.body, id, vars, kinds, handler);
   }
+  // Compile-time beta-reduction of an immediately-applied function literal
+  // (Simplif.simplify_lets, lambda/simplif.ml:518-531 via beta_reduce):
+  //   Apply(Function{params; body}, args)  with |args| == |params|
+  //     -> let paramN = argN in ... let param1 = arg1 in body
+  // This is what makes `x |> (fun v -> v, rg)` and `(fun v -> ..) e` avoid a
+  // separate closure + tail-apply.  The lets are Strict (kept, never further
+  // substituted), so evaluation order and side effects are preserved -- only the
+  // Curried exact-arity case is modelled (our Functions are all Curried); an
+  // over- or under-application stays a real Apply, matching find_exact_application.
+  void beta_reduce_applied(LamPtr& l) {
+    if (!l) return;
+    beta_reduce_applied(l->fn);
+    beta_reduce_applied(l->body);
+    beta_reduce_applied(l->cond);
+    beta_reduce_applied(l->then_);
+    beta_reduce_applied(l->else_);
+    beta_reduce_applied(l->sw_default);
+    for (auto& a : l->args) beta_reduce_applied(a);
+    for (auto& b : l->bindings) beta_reduce_applied(b.val);
+    for (auto& sc : l->sw_consts) beta_reduce_applied(sc.body);
+    for (auto& sc : l->sw_blocks) beta_reduce_applied(sc.body);
+    if (l->k != Lam::K::Apply || !l->fn || l->fn->k != Lam::K::Function) return;
+    if (l->fn->params.size() != l->args.size() || l->args.empty()) return;
+    LamPtr body = l->fn->body;
+    // fold_left2: param0/arg0 end up innermost, the last param outermost, so
+    // argN is evaluated first -- the order ocamlc's nested Llet chain produces.
+    for (size_t i = 0; i < l->fn->params.size(); ++i) {
+      auto let = mk(Lam::K::Let);
+      let->bindings = {{ l->fn->params[i].first, l->fn->params[i].second, l->args[i] }};
+      let->body = body;
+      body = let;
+    }
+    l = body;
+  }
   // Simplif drops `let v = (Lvar w)` for ANY let-kind, substituting v by w.  The
   // construction-time pass only catches source lets; compiler-generated temps
   // (an apply's function bound to a temp, a renamed parameter) need a tree-wide
@@ -19387,6 +19421,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   LamPtr root = sg;
   t.simplify_local_functions(root);
   t.simplify_static_catches(root);
+  t.beta_reduce_applied(root);
   t.inline_var_aliases(root);
   t.collapse_equal_switches(root);
   t.two_const_switch_to_if(root);
