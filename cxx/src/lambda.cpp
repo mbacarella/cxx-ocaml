@@ -10355,12 +10355,34 @@ struct Translator {
     size_t k = tu->elems.size();
     if (k < 2) return nullptr;
     const Row* catchall = nullptr;
+    std::vector<const Pattern*> ca_cols;   // catch-all's k column patterns (tuple form)
     std::vector<std::pair<const Row*, std::vector<std::vector<const Pattern*>>>> srcs;
     for (size_t i = 0; i < vrows.size(); ++i) {
       if (vrows[i].guard) return nullptr;
       if (i + 1 == vrows.size() && is_catchall(*vrows[i].lhs)) {
         if (!std::holds_alternative<Ppat_any>(vrows[i].lhs->desc)) return nullptr;
         catchall = &vrows[i]; break;
+      }
+      // A trailing `p1, .., pk` whose every column is irrefutable (`_`/var) matches
+      // unconditionally -- ocamlc peels it as the ONE shared default (all leaf
+      // failures exit to it) rather than a normal arm; recognizing only a bare `_`
+      // here would instead route each column's gap tags to its own per-branch catch.
+      if (i + 1 == vrows.size()) {
+        const Pattern* ep = effective_pat(vrows[i].lhs);
+        if (auto* tp = std::get_if<Ppat_tuple>(&ep->desc);
+            tp && tp->elems.size() == k) {
+          bool all_irr = true;
+          for (auto& lbl : tp->labels) if (lbl) { all_irr = false; break; }
+          for (auto& el : tp->elems) {
+            const Pattern* cp = effective_pat(el.get());
+            if (!std::holds_alternative<Ppat_any>(cp->desc) &&
+                !std::get_if<Ppat_var>(&cp->desc)) { all_irr = false; break; }
+          }
+          if (all_irr) {
+            for (auto& el : tp->elems) ca_cols.push_back(effective_pat(el.get()));
+            catchall = &vrows[i]; break;
+          }
+        }
       }
       std::vector<const Pattern*> alts; flatten_or(vrows[i].lhs, alts);
       std::vector<std::vector<const Pattern*>> altcols;
@@ -10428,7 +10450,16 @@ struct Translator {
     g_gm_budget_ = -1;
     if (!body) return nullptr;
     wire_garms(body, arms);
-    LamPtr dbody = catchall ? expr(*catchall->rhs) : raise_predef("Match_failure", mloc, "gmatch_tuple_dft");
+    LamPtr dbody;
+    if (catchall) {
+      // Bind any named columns of a `x, y -> ..` tuple catch-all to their components.
+      scope.emplace_back();
+      for (size_t c = 0; c < ca_cols.size(); ++c)
+        if (auto* pv = std::get_if<Ppat_var>(&ca_cols[c]->desc))
+          scope.back()[pv->name.txt] = comps[c]->var;
+      dbody = expr(*catchall->rhs);
+      scope.pop_back();
+    } else dbody = raise_predef("Match_failure", mloc, "gmatch_tuple_dft");
     int bad = 0; int uses = count_exit(body, deid, false, bad);
     LamPtr res;
     if (uses == 0) res = body;
