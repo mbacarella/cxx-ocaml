@@ -6912,6 +6912,21 @@ struct Translator {
       std::vector<Row> expanded;
       for (auto* a : alts) expanded.push_back({a, c.rhs, c.guard});
       for (size_t j = i + 1; j < rows.size(); ++j) expanded.push_back(rows[j]);
+      // A non-binding alternation shares ONE action behind a static catch --
+      // each alternative (exit N)s to it, like ocamlc's matcher (cmi_format's
+      // `End_of_file | Failure _ -> ... raise (Error ..)` emits the raise once,
+      // the identity tests branching to it).  Alternatives that bind variables
+      // would need exit ARGS: keep the duplicating path for those.
+      if (!c.guard && !pattern_binds(lhsp)) {
+        int eid = ++next_exit_;
+        exn_shared_exit_[c.rhs] = eid;
+        LamPtr disp = exn_dispatch(exn, expanded, 0);
+        exn_shared_exit_.erase(c.rhs);
+        auto cat = mk(Lam::K::Catch);
+        cat->cond = disp; cat->prim_arg = eid;
+        cat->then_ = expr(*c.rhs);
+        return cat;
+      }
       return exn_dispatch(exn, expanded, 0);
     }
     {
@@ -6926,7 +6941,13 @@ struct Translator {
         scope.emplace_back();  // the binder scopes over its arm (guard+body) only
         if (auto* pv = std::get_if<Ppat_var>(&lhsp->desc)) scope.back()[pv->name.txt] = exn;
         for (auto& nm : row_aliases) scope.back()[nm] = exn;
-        if (!c.guard) { LamPtr b = expr(*c.rhs); scope.pop_back(); return b; }
+        if (!c.guard) {
+          LamPtr b;
+          if (auto sh = exn_shared_exit_.find(c.rhs); sh != exn_shared_exit_.end()) {
+            b = mk(Lam::K::Staticraise); b->prim_arg = sh->second;
+          } else b = expr(*c.rhs);
+          scope.pop_back(); return b;
+        }
         // `with x when g -> body`: test the guard, else fall to the rest.
         auto iff = mk(Lam::K::IfThenElse);
         iff->cond = expr(*c.guard); iff->then_ = expr(*c.rhs);
@@ -6984,9 +7005,13 @@ struct Translator {
           auto exitL = [&] {
             auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x;
           };
+          LamPtr shared_body = nullptr;  // shared or-alternation action: (exit N)
+          if (auto sh = exn_shared_exit_.find(c.rhs); sh != exn_shared_exit_.end()) {
+            shared_body = mk(Lam::K::Staticraise); shared_body->prim_arg = sh->second;
+          }
           LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs, &ptests,
                                       &row_aliases, c.guard,
-                                      c.guard ? exitL() : nullptr);
+                                      c.guard ? exitL() : nullptr, shared_body);
           if (!then) return exn_dispatch(exn, rows, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
           test->args = {lhs, id};
@@ -7072,15 +7097,21 @@ struct Translator {
                        // (a block variant-ctor payload; an immediate's tag is
                        // out of range so no separate isint guard is needed)
                        bool tag_test = false; };
+  // rhs of a non-binding or-alternation being shared behind a static catch:
+  // rows citing it compile to (exit N) instead of duplicating the action.
+  std::map<const Expression*, int> exn_shared_exit_;
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
                        const Expression& rhs,
                        std::vector<PayloadTest>* tests = nullptr,
                        const std::vector<std::string>* aliases = nullptr,
-                       const Expression* guard = nullptr, LamPtr guard_else = nullptr) {
+                       const Expression* guard = nullptr, LamPtr guard_else = nullptr,
+                       LamPtr body_override = nullptr) {
     // Compile `rhs`, or -- when the case carries a `when` guard -- the
     // `if guard then rhs else guard_else` test, with both evaluated in the
-    // scope that holds the payload binders.
+    // scope that holds the payload binders.  body_override (a shared-action
+    // exit) replaces the rhs compile; its rows never carry a guard.
     auto with_guard = [&]() -> LamPtr {
+      if (body_override) return body_override;
       if (!guard) return expr(rhs);
       LamPtr g = expr(*guard);
       auto iff = mk(Lam::K::IfThenElse);
@@ -7088,7 +7119,8 @@ struct Translator {
       return iff;
     };
     if (!k->arg) {
-      if ((!aliases || aliases->empty()) && !guard) return expr(rhs);
+      if ((!aliases || aliases->empty()) && !guard)
+        return body_override ? body_override : expr(rhs);
       scope.emplace_back();
       if (aliases) for (auto& nm : *aliases) scope.back()[nm] = exn;
       LamPtr b = with_guard();
