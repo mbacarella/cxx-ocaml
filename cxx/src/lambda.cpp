@@ -17793,8 +17793,8 @@ struct Translator {
         // caml_alloc_dummy(3) scheme like translclass.
         std::vector<Ident> gids;
         for (auto& d : pc->decls) {
-          gids.push_back(fresh(d.name.txt));
-          scope.back()[d.name.txt] = gids.back();
+          gids.push_back(fresh_scoped(d.name.txt));  // typeclass creates class
+          scope.back()[d.name.txt] = gids.back();    // idents Ident.create_scoped
           class_ids_.insert(gids.back().stamp);
         }
         struct ClsOut { Ident id; LamPtr v; bool dummy; };
