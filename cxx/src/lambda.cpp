@@ -10792,6 +10792,7 @@ struct Translator {
     }
     if (auto sw = const_switch(scrut, rows)) return sw;
     if (auto ds = switcher_match(scrut, rows)) return ds;
+    if (auto cs = const_ctor_switcher(scrut, rows)) return cs;
     if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
     if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
@@ -11592,6 +11593,129 @@ struct Translator {
     std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
     make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
     if (!made_switch) return nullptr;  // ocamlc emits an if-chain -> let int_cases match
+
+    LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
+    int nd = count_default_leaves(tree);
+    if (nd == 0) return tree;
+    if (nd == 1) { rewrite_default_leaves(tree, 0, default_body); return tree; }
+    int eid = ++next_exit_;
+    rewrite_default_leaves(tree, eid, nullptr);
+    auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid; cat->then_ = default_body;
+    return cat;
+  }
+  // Collect the constant-constructor tags a pattern matches, flattening
+  // or-patterns (`Red | Green`), of a single uniform type.  Returns false on any
+  // block ctor, argument-bearing ctor, mixed type, or non-constructor leaf.
+  bool ctor_switch_vals(const Pattern* p, std::string& type, std::vector<int>& out) {
+    p = effective_pat(p);
+    if (auto* po = std::get_if<Ppat_or>(&p->desc))
+      return ctor_switch_vals(po->l.get(), type, out) &&
+             ctor_switch_vals(po->r.get(), type, out);
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
+      if (k->arg) return false;  // constant ctor only
+      if (exn_typed_pat(p, ctor_of(*p))) return false;  // extension: identity-tested
+      const CtorInfo* ci = pat_ctor_resolve(p, ctor_of(*p));
+      if (!ci || ci->is_block) return false;
+      if (type.empty()) type = ci->type;
+      else if (type != ci->type) return false;
+      out.push_back(ci->tag);
+      return true;
+    }
+    return false;
+  }
+  // The constant-constructor analog of switcher_match: ocamlc routes a match over
+  // a constant-only variant (with an optional catch-all default) through
+  // call_switcher exactly like an int-literal match, so `match p with Parsing ->
+  // .. | _ -> ..` becomes a single `if` (BRANCHIFNOT) or a jump table guarded by a
+  // range test, not the flat Lswitch const_switch/ctor_match would build.  Values
+  // are the ctor tags, bounded to the type's range [0, NC-1] (call_switcher's
+  // ~low:0 ~high:(n-1)); unlike the int path we always emit the c_test tree (there
+  // is no int_cases fallback for constructors).
+  LamPtr const_ctor_switcher(const LamPtr& scrut, const std::vector<Row>& rows) {
+    if (scrut->k != Lam::K::Var) return nullptr;
+    struct KV { int v; const Expression* rhs; };
+    std::vector<KV> kvs;
+    const Row* dflt = nullptr;
+    std::string type;
+    for (auto& r : rows) {
+      if (r.guard) return nullptr;
+      const Pattern* p = effective_pat(r.lhs);
+      std::vector<int> vals;
+      if (ctor_switch_vals(p, type, vals)) {
+        if (dflt) return nullptr;  // a case after the catch-all
+        for (int v : vals) kvs.push_back({v, r.rhs});
+      } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
+        dflt = &r;
+      } else return nullptr;
+    }
+    if (kvs.empty()) return nullptr;
+    auto tc = type_ctors_.find(type);
+    if (tc == type_ctors_.end()) return nullptr;
+    int NC = tc->second.first, NB = tc->second.second;
+    if (NB != 0) return nullptr;  // blocks need the isint split (ctor_match's job)
+    std::sort(kvs.begin(), kvs.end(), [](auto& a, auto& b) { return a.v < b.v; });
+    for (size_t i = 1; i < kvs.size(); ++i)
+      if (kvs[i].v == kvs[i - 1].v) return nullptr;  // duplicate tag
+    bool exhaustive = (int)kvs.size() == NC;
+    if (!dflt && !exhaustive) return nullptr;   // partial without catch-all: not our shape
+    if (dflt && exhaustive) return nullptr;      // redundant catch-all: leave to other paths
+    // Restrict to a partial match with a catch-all (`Foo -> .. | _ -> ..`): a small
+    // covered set over a larger constant type, which call_switcher lowers to a range
+    // test / `if` guarding the default.  The fully-exhaustive const dispatch is left
+    // to const_switch + collapse/two_const passes (broadening here churns without
+    // closing modules -- ocamlc's exhaustive shape differs subtly).
+    if (!dflt) return nullptr;
+
+    // Translate bodies once, in source order (stable stamp normalization); bail if
+    // two distinct rows share a body (ocamlc shares behind a catch, unmodelled).
+    std::vector<LamPtr> actions(1);
+    actions.resize(kvs.size() + 1);
+    std::vector<int> act_of(kvs.size());
+    std::vector<const Expression*> by_src;
+    for (auto& r : rows) if (!r.guard) {
+      std::string ty2; std::vector<int> vs2;
+      if (ctor_switch_vals(effective_pat(r.lhs), ty2, vs2)) by_src.push_back(r.rhs); }
+    for (size_t i = 0; i < kvs.size(); ++i) {
+      int pos = 0; for (size_t s = 0; s < by_src.size(); ++s) if (by_src[s] == kvs[i].rhs) { pos = (int)s; break; }
+      act_of[i] = pos + 1;
+    }
+    std::vector<std::string> body_keys;
+    for (size_t s = 0; s < by_src.size(); ++s) {
+      LamPtr b = expr(*by_src[s]);
+      std::string key = make_lam_key(b);
+      for (auto& bk : body_keys) if (bk == key && !key.empty()) return nullptr;  // shared body
+      body_keys.push_back(key);
+      actions[s + 1] = b;
+    }
+    LamPtr default_body;
+    if (dflt) {
+      scope.emplace_back();
+      bind_catchall(*dflt->lhs, scrut);
+      default_body = expr(*dflt->rhs);
+      scope.pop_back();
+      std::string dk = make_lam_key(default_body);
+      if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) return nullptr;
+    }
+
+    // Interval cover bounded to the type's range [0, NC-1] (no out-of-range
+    // sentinels: the variant value is always in range).  Uncovered tags route to
+    // the default (act 0) via gap intervals; an exhaustive match leaves no gaps.
+    const long long LOW = 0, HIGH = NC - 1;
+    std::vector<SwCase> cases;
+    long long firstv = kvs.front().v, lastv = kvs.back().v;
+    if (LOW < firstv) cases.push_back({LOW, firstv - 1, 0});
+    for (size_t i = 0; i < kvs.size(); ++i) {
+      cases.push_back({(long long)kvs[i].v, (long long)kvs[i].v, act_of[i]});
+      if (i + 1 < kvs.size() && kvs[i + 1].v > kvs[i].v + 1)
+        cases.push_back({(long long)kvs[i].v + 1, (long long)kvs[i + 1].v - 1, 0});
+    }
+    if (lastv < HIGH) cases.push_back({lastv + 1, HIGH, 0});
+
+    sw_ok_inter_ = true;  // tags are small (0..NC-1)
+    sw_memo_.clear();
+    std::vector<int> k; comp_clusters(cases, k);
+    std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
+    make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
 
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     int nd = count_default_leaves(tree);
