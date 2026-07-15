@@ -7547,6 +7547,10 @@ struct Translator {
     if (v->k == Lam::K::Var) return true;
     if (v->k == Lam::K::Prim && v->prim == Prim::FieldImm && v->args.size() == 1)
       return is_alias_dup(v->args[0]);
+    // `x + n` (the Switcher's shifted `switcher` alias): pure and cheap, so
+    // Simplif substitutes its single use just like a Var alias (count==1 case).
+    if (v->k == Lam::K::Prim && v->prim == Prim::Offsetint && v->args.size() == 1)
+      return is_alias_dup(v->args[0]);
     return false;
   }
   // Simplif drops `let v = (Lvar w)` for ANY let-kind, substituting v by w, and
@@ -11772,27 +11776,70 @@ struct Translator {
     }
     return false;  // string/float/binder
   }
+  // Like switch_const_vals but yields closed ranges [lo,hi]: a bare constant is
+  // [v,v], an interval pattern `lo..hi` its full span.  Feeds switcher_match's
+  // interval cover so char/int RANGE arms compile through the Switcher's `isout`
+  // dichotomy (matching ocamlc's call_switcher) instead of the naive
+  // `>=lo && <=hi` chain the fallback matcher emits.
+  bool switch_const_ranges(const Pattern* p, bool& is_int, bool& is_char,
+                           std::vector<std::pair<long long, long long>>& out) {
+    p = effective_pat(p);
+    if (auto* po = std::get_if<Ppat_or>(&p->desc))
+      return switch_const_ranges(po->l.get(), is_int, is_char, out) &&
+             switch_const_ranges(po->r.get(), is_int, is_char, out);
+    if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
+      if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
+        if (pi->suffix) return false;  // boxed-int literal
+        long long v = parse_ocaml_int(pi->value);
+        is_int = true; out.push_back({v, v}); return true;
+      }
+      if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc)) {
+        is_char = true; long long v = (unsigned char)ch->code; out.push_back({v, v}); return true;
+      }
+      return false;
+    }
+    if (auto* iv = std::get_if<Ppat_interval>(&p->desc)) {
+      auto bound = [&](const Constant& c, long long& o) -> bool {
+        if (auto* ch = std::get_if<Pconst_char>(&c.desc)) { is_char = true; o = (unsigned char)ch->code; return true; }
+        if (auto* in = std::get_if<Pconst_integer>(&c.desc)) {
+          if (in->suffix) return false; is_int = true; o = parse_ocaml_int(in->value); return true;
+        }
+        return false;
+      };
+      long long lo, hi;
+      if (!bound(iv->c1, lo) || !bound(iv->c2, hi)) return false;
+      if (lo > hi) std::swap(lo, hi);
+      out.push_back({lo, hi}); return true;
+    }
+    return false;  // string/float/binder
+  }
   LamPtr switcher_match(const LamPtr& scrut, const std::vector<Row>& rows) {
     if (scrut->k != Lam::K::Var) return nullptr;
-    struct KV { long long v; const Expression* rhs; };
+    struct KV { long long lo, hi; const Expression* rhs; };
     std::vector<KV> kvs;
     const Row* dflt = nullptr;
-    bool is_int = false, is_char = false;
+    bool is_int = false, is_char = false, has_interval = false;
     for (auto& r : rows) {
       if (r.guard) return nullptr;
       const Pattern* p = effective_pat(r.lhs);
-      std::vector<long long> vals;
-      if (switch_const_vals(p, is_int, is_char, vals)) {
+      std::vector<std::pair<long long, long long>> vals;
+      if (switch_const_ranges(p, is_int, is_char, vals)) {
         if (dflt) return nullptr;  // a case after the catch-all
-        for (long long v : vals) kvs.push_back({v, r.rhs});
+        for (auto& v : vals) {
+          kvs.push_back({v.first, v.second, r.rhs});
+          if (v.second > v.first) has_interval = true;
+        }
       } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
         dflt = &r;
       } else return nullptr;
     }
-    if ((is_int && is_char) || !dflt || kvs.size() < 2) return nullptr;
-    std::sort(kvs.begin(), kvs.end(), [](auto& a, auto& b) { return a.v < b.v; });
+    // A single discrete value goes through the simpler const path; but a lone
+    // interval arm still needs the Switcher to get `isout` instead of two-sided.
+    if ((is_int && is_char) || !dflt || kvs.empty() ||
+        (kvs.size() < 2 && !has_interval)) return nullptr;
+    std::sort(kvs.begin(), kvs.end(), [](auto& a, auto& b) { return a.lo < b.lo; });
     for (size_t i = 1; i < kvs.size(); ++i)
-      if (kvs[i].v == kvs[i - 1].v) return nullptr;  // duplicate value: bail
+      if (kvs[i].lo <= kvs[i - 1].hi) return nullptr;  // overlapping ranges: bail
 
     // Translate the case bodies (source order) and the default body once.  If
     // any two bodies are structurally identical, ocamlc would *share* them in
@@ -11804,8 +11851,8 @@ struct Translator {
     // bodies must be translated in source order for stable stamp normalization
     std::vector<const Expression*> by_src;
     for (auto& r : rows) if (!r.guard) {
-      bool ii = false, ic = false; std::vector<long long> vs;
-      if (switch_const_vals(effective_pat(r.lhs), ii, ic, vs)) by_src.push_back(r.rhs); }
+      bool ii = false, ic = false; std::vector<std::pair<long long, long long>> vs;
+      if (switch_const_ranges(effective_pat(r.lhs), ii, ic, vs)) by_src.push_back(r.rhs); }
     std::unordered_map<const Expression*, int> src_idx;
     for (size_t i = 0; i < kvs.size(); ++i) {
       // find this kv's source position -> action index (1-based, source order)
@@ -11832,12 +11879,12 @@ struct Translator {
     const long long LOW = is_char ? 0 : (LLONG_MIN / 4);
     const long long HIGH = is_char ? 255 : (LLONG_MAX / 4);
     std::vector<SwCase> cases;
-    long long firstv = kvs.front().v, lastv = kvs.back().v;
+    long long firstv = kvs.front().lo, lastv = kvs.back().hi;
     if (LOW < firstv) cases.push_back({LOW, firstv - 1, 0});
     for (size_t i = 0; i < kvs.size(); ++i) {
-      cases.push_back({kvs[i].v, kvs[i].v, act_of[i]});
-      if (i + 1 < kvs.size() && kvs[i + 1].v > kvs[i].v + 1)
-        cases.push_back({kvs[i].v + 1, kvs[i + 1].v - 1, 0});
+      cases.push_back({kvs[i].lo, kvs[i].hi, act_of[i]});
+      if (i + 1 < kvs.size() && kvs[i + 1].lo > kvs[i].hi + 1)
+        cases.push_back({kvs[i].hi + 1, kvs[i + 1].lo - 1, 0});
     }
     if (lastv < HIGH) cases.push_back({lastv + 1, HIGH, 0});
 
@@ -11846,7 +11893,10 @@ struct Translator {
     std::vector<int> k; comp_clusters(cases, k);
     std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
     make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
-    if (!made_switch) return nullptr;  // ocamlc emits an if-chain -> let int_cases match
+    // ocamlc emits an if-chain -> let int_cases match it byte-for-byte.  But
+    // int_cases lowers a range arm to the naive `>=lo && <=hi`, so when the
+    // cover has a genuine interval we MUST emit the Switcher's `isout` test tree.
+    if (!made_switch && !has_interval) return nullptr;
 
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     int nd = count_default_leaves(tree);
