@@ -8560,6 +8560,27 @@ struct Translator {
       LamPtr sv = materialize(scrut);
       std::vector<std::string> flds;
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
+      // ocamlc reads a record pattern's fields in reverse DECLARATION-INDEX order,
+      // not the pattern's mention order -- so `{pparam_desc; pparam_loc}` (where
+      // pparam_loc is field 0) reads field 1 first.  Resolve every field's block
+      // index up front; when all resolve, emit reads by descending index.  Keep the
+      // reverse-mention path for the `ref`/{contents} mutable-field case (field
+      // unresolved by resolve_record_pat_field).
+      struct RF { int index; const Pattern* sub; FieldInfo fi; };
+      std::vector<RF> rfs; bool all_ok = true;
+      for (auto& [lbl, sub] : pr->fields) {
+        FieldInfo nfi;
+        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
+        tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
+        if (!fi) { all_ok = false; break; }
+        rfs.push_back({fi->index, sub.get(), *fi});
+      }
+      if (all_ok) {
+        std::sort(rfs.begin(), rfs.end(), [](const RF& a, const RF& b) { return a.index > b.index; });
+        for (auto& rf : rfs)
+          if (!collect_binders(*rf.sub, field_read(&rf.fi, sv), out)) return false;
+        return true;
+      }
       for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
         auto& [lbl, sub] = *rit;
         FieldInfo nfi;
