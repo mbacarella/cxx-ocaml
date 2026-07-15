@@ -12825,10 +12825,6 @@ struct Translator {
           // where a Subst.t was expected and segfaulted every interface-
           // mismatch report of the bootstrapped compiler).
           std::string mod = p.substr(0, dpos), ty = p.substr(dpos + 1);
-          if (cppcaml::dbg_env("RMRDBG"))
-            fprintf(stderr, "[RMRDBG] field %s: nested_typed(%s, %s) -> %d\n",
-                    lbl.c_str(), mod.c_str(), ty.c_str(),
-                    (bool)nested_typed_record_field(mod, ty, lbl));
           if (auto rf = nested_typed_record_field(mod, ty, lbl)) {
             auto l = mk(Lam::K::Prim);
             l->prim = rf->flat                     ? Prim::Floatfield
@@ -12879,11 +12875,6 @@ struct Translator {
                 lp->prim_arg = rf->index; lp->args = {expr(*fe->e)};
                 return lp;
               }
-      if (cppcaml::dbg_env("RMRDBG"))
-        fprintf(stderr, "[RMRDBG] field %s: fell to find_field=%d expr_constr_base=%d\n",
-                lid_last(fe->field.txt).c_str(),
-                (bool)find_field(lid_last(fe->field.txt)),
-                (int)vk.expr_constr.count(fe->e.get()));
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);

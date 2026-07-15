@@ -6450,28 +6450,33 @@ struct Checker {
       if (TypePtr fsch = field_scheme(lid_last(fld->field.txt))) {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));  // recTy -> fldTy
         TypePtr bt = infer_expr(*fld->e);
-        if (std::getenv("FLDDBG")) {
-          TypePtr rb = I::Engine::repr(bt), rd = I::Engine::repr(s->dom);
-          fprintf(stderr, "[FLDDBG] scheme %s: bt=%s dom=%s\n",
-                  lid_last(fld->field.txt).c_str(),
-                  rb->kind == I::Type::Kind::Constr ? rb->path.c_str() : "<var>",
-                  rd->kind == I::Type::Kind::Constr ? rd->path.c_str() : "<var>");
-        }
         try_unify(bt, s->dom);
         // A label the inferencer sees as UNIQUE (it models only local records) can
         // still be ambiguous to the back end (the opened `type_expr.level` vs the
         // local `pool.level`); record the base+label so the post-inference pass
         // emits the resolved index and the back end doesn't pick the wrong offset.
         if (record_kinds_) pending_field_.push_back({&e, bt, lid_last(fld->field.txt)});
+        // The scheme's dom is the field's OWNING record type; when it is a
+        // module-qualified (dotted) path but the base's own repr stays a bare
+        // LOCAL alias (`a : t` where `type t = Location.error`, unexpanded), the
+        // base gets no expr_constr and a foreign label falls to a const-0 read
+        // (typing_recovery's Error_set `a.main.loc..`).  Force the base's
+        // recorded type to the dotted dom (bt and s->dom are already unified, so
+        // this only picks the resolvable representative).  Restricted to a base
+        // whose OWN repr is not already a dotted Constr -- overriding a base that
+        // resolved on its own changes which same-named record a label picks
+        // (profile/signature_matching).  Dump/kinds pass only.
+        if (record_kinds_) {
+          TypePtr rb = I::Engine::repr(bt), rd = I::Engine::repr(s->dom);
+          bool base_dotted = rb->kind == I::Type::Kind::Constr &&
+                             rb->path.find('.') != std::string::npos;
+          if (!base_dotted && rd->kind == I::Type::Kind::Constr &&
+              rd->path.find('.') != std::string::npos)
+            rec_expr_[fld->e.get()] = s->dom;
+        }
         return s->cod;
       }
       TypePtr bt = infer_expr(*fld->e);
-      if (std::getenv("FLDDBG")) {
-        TypePtr rb = I::Engine::repr(bt);
-        fprintf(stderr, "[FLDDBG] ambiguous %s: bt=%s\n",
-                lid_last(fld->field.txt).c_str(),
-                rb->kind == I::Type::Kind::Constr ? rb->path.c_str() : "<var/other>");
-      }
       // An AMBIGUOUS label (omitted from fields_) resolved through the base's
       // type IDENTITY: find the stamped record decl and read the field's index/
       // mutability/kind, so the back end need not guess between same-named records.
