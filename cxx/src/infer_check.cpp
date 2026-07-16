@@ -3490,6 +3490,67 @@ struct Checker {
               out.insert(d.name.txt);
     return out;
   }
+  // Memoized: does a DOTTED type path ("Obj.t", "Stdlib.Obj.t") name an
+  // ABSTRACT (or external) manifest-less type in the owning unit's cmi?  This
+  // is Env.find_type + Typeopt.classify's `Type_abstract _ | Type_external _
+  // -> Any` case: such an array element is GENERIC.  A local module shadowing
+  // a unit name is excluded by the caller (bound_module_names_).
+  std::unordered_map<std::string, bool> cmi_abstract_memo_;
+  bool cmi_type_is_abstract(const std::string& path) {
+    if (auto it = cmi_abstract_memo_.find(path); it != cmi_abstract_memo_.end())
+      return it->second;
+    bool r = false;
+    std::vector<std::string> comps = mod_components_str(path);
+    if (comps.size() >= 2) try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == comps.back()) {
+            r = (td.kind == cmi::TypeDecl::Abstract ||
+                 td.kind == cmi::TypeDecl::External) && !td.manifest;
+            break;
+          }
+    } catch (...) {}
+    cmi_abstract_memo_[path] = r;
+    return r;
+  }
+  // The abstract-without-manifest type names of a CROSS-MODULE named module
+  // type ("Identifiable.S", "Map.S"), read from the owning unit's cmi -- the
+  // cross-module analog of mty_top_abstract, for a functor param typed by a
+  // foreign modtype (`Make (Id : Identifiable.S)`).
+  std::set<std::string> cmi_modtype_abstract_names(const std::string& path) {
+    std::set<std::string> out;
+    std::vector<std::string> comps = mod_components_str(path);
+    if (comps.size() < 2) return out;
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (!sig) return out;
+      const cmi::ModuleType* mt = nullptr;
+      for (auto& mtd : sig->modtypes)
+        if (mtd.name == comps.back()) { mt = mtd.type.get(); break; }
+      if (mt && mt->kind == cmi::ModuleType::Sig && mt->sig)
+        for (auto& td : mt->sig->types)
+          if ((td.kind == cmi::TypeDecl::Abstract ||
+               td.kind == cmi::TypeDecl::External) && !td.manifest)
+            out.insert(td.name);
+    } catch (...) {}
+    return out;
+  }
+
   void ck_param(const ast::FunctorParam& fp) {
     auto* nm = std::get_if<ast::Functor_named>(&fp);
     if (!nm || !nm->type) return;
@@ -3497,9 +3558,12 @@ struct Checker {
     std::string pn = nm->name.txt.value_or("");
     if (pn.empty()) return;
     for (auto& n : mty_top_abstract(*nm->type)) param_abstract_quals_.insert(pn + "." + n);
-    if (auto* mi = std::get_if<ast::Pmty_ident>(&nm->type->desc))
+    if (auto* mi = std::get_if<ast::Pmty_ident>(&nm->type->desc)) {
       if (auto* l = std::get_if<ast::Lident>(&mi->id.txt.v))
         pending_param_modtypes_.push_back({pn, l->name});
+      else if (std::holds_alternative<ast::Ldot>(mi->id.txt.v))
+        pending_param_modtypes_.push_back({pn, lid_full(mi->id.txt)});
+    }
   }
   void ck_walk_mty(const ast::ModuleType& mt) {
     if (auto* sg = std::get_if<ast::Pmty_signature>(&mt.desc)) ck_walk_sig(sg->items);
@@ -3536,9 +3600,16 @@ struct Checker {
   // Entry point: walk the whole file, then resolve deferred named-modtype params.
   void collect_type_kinds(const ast::Structure& s) {
     ck_walk_struct(s);
-    for (auto& [pn, s2] : pending_param_modtypes_)
-      if (auto it = modtype_abstract_.find(s2); it != modtype_abstract_.end())
+    for (auto& [pn, s2] : pending_param_modtypes_) {
+      if (auto it = modtype_abstract_.find(s2); it != modtype_abstract_.end()) {
         for (auto& n : it->second) param_abstract_quals_.insert(pn + "." + n);
+      } else if (s2.find('.') != std::string::npos) {
+        // A CROSS-MODULE modtype (`(Id : Identifiable.S)`): its abstract type
+        // names come from the owning unit's cmi.
+        for (auto& n : cmi_modtype_abstract_names(s2))
+          param_abstract_quals_.insert(pn + "." + n);
+      }
+    }
   }
 
   // Register a user variant: A of t1*..*tn -> scheme t1->..->tn->(params) name.
@@ -9522,6 +9593,14 @@ static std::string array_kind_str(const TypePtr& t0, Checker& ck) {
   // conflating a cross-module concrete `Path.t`/`Location.t` (a variant/record)
   // with a same-named local abstract `t`.
   if (ck.param_abstract_quals_.count(t->path)) return "";
+  // A CROSS-MODULE type (`Obj.t`, `Stdlib.Obj.t`): consult the owning unit's
+  // cmi for the decl's kind -- exactly what Env.find_type gives classify.
+  // Skipped when the HEAD is a locally bound module (a local `module Obj`
+  // shadows the unit; bound_module_names_ is over-inclusive, which only costs
+  // a missed widening, never a wrong one).
+  std::string headm = t->path.substr(0, t->path.find('.'));
+  if (!ck.bound_module_names_.count(headm) && ck.cmi_type_is_abstract(t->path))
+    return "";
   return k;
 }
 
