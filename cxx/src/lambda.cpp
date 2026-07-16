@@ -12151,9 +12151,124 @@ struct Translator {
     auto it = vk.function_cases_partial.find(fc);
     return it == vk.function_cases_partial.end() || !it->second;
   }
+  // Count `(exit id)` (no args) occurrences in a compiled subtree.
+  int count_bare_exit(const LamPtr& l, int id) {
+    if (!l) return 0;
+    int n = (l->k == Lam::K::Staticraise && l->args.empty() && l->prim_arg == id) ? 1 : 0;
+    for (const LamPtr* c : {&l->fn, &l->body, &l->cond, &l->then_, &l->else_, &l->sw_default})
+      n += count_bare_exit(*c, id);
+    for (auto& a : l->args) n += count_bare_exit(a, id);
+    for (auto& b : l->bindings) n += count_bare_exit(b.val, id);
+    for (auto& sc : l->sw_consts) n += count_bare_exit(sc.body, id);
+    for (auto& sc : l->sw_blocks) n += count_bare_exit(sc.body, id);
+    return n;
+  }
+  // Whether a `(exit id)` occurs inside a `try` BODY (a deeper try-depth than
+  // the match root).  Simplif.simplify_exits inlines a single-use catch only
+  // when `max_depth <= try_depth` -- i.e. NOT under an inner try -- so a shared
+  // body whose sole exit sits under a try stays behind its catch.
+  bool exit_under_try(const LamPtr& l, int id, bool under) {
+    if (!l) return false;
+    if (l->k == Lam::K::Staticraise && l->args.empty() && l->prim_arg == id) return under;
+    if (l->k == Lam::K::Try) {
+      if (exit_under_try(l->body, id, true)) return true;   // try body: depth+1
+      return exit_under_try(l->then_, id, under);           // handler: same depth
+    }
+    for (const LamPtr* c : {&l->fn, &l->body, &l->cond, &l->then_, &l->else_, &l->sw_default})
+      if (exit_under_try(*c, id, under)) return true;
+    for (auto& a : l->args) if (exit_under_try(a, id, under)) return true;
+    for (auto& b : l->bindings) if (exit_under_try(b.val, id, under)) return true;
+    for (auto& sc : l->sw_consts) if (exit_under_try(sc.body, id, under)) return true;
+    for (auto& sc : l->sw_blocks) if (exit_under_try(sc.body, id, under)) return true;
+    return false;
+  }
+  // Replace the single `(exit id)` (no args) with `body` in place.
+  bool replace_bare_exit(LamPtr& l, int id, const LamPtr& body) {
+    if (!l) return false;
+    if (l->k == Lam::K::Staticraise && l->args.empty() && l->prim_arg == id) { l = body; return true; }
+    for (LamPtr* c : {&l->fn, &l->body, &l->cond, &l->then_, &l->else_, &l->sw_default})
+      if (replace_bare_exit(*c, id, body)) return true;
+    for (auto& a : l->args) if (replace_bare_exit(a, id, body)) return true;
+    for (auto& b : l->bindings) if (replace_bare_exit(b.val, id, body)) return true;
+    for (auto& sc : l->sw_consts) if (replace_bare_exit(sc.body, id, body)) return true;
+    for (auto& sc : l->sw_blocks) if (replace_bare_exit(sc.body, id, body)) return true;
+    return false;
+  }
+  // ocamlc's Matching.precompile_or: a NON-BINDING or-pattern arm whose body is
+  // reached from several (non-mergeable) leaves compiles that body ONCE behind
+  // an Lstaticcatch, each leaf raising `(exit N)` into it -- then
+  // Simplif.simplify_exits drops a 0-use catch and inlines a 1-use one (which
+  // is what makes an adjacent-tag or-pattern like `A|B->e` collapse back to a
+  // single inlined body via the switcher's range merge).  Register each such
+  // arm's rhs in shared_action_exit_ so the expr() choke turns every citation
+  // into its exit; the body itself is compiled once here, after the match.
+  std::vector<std::pair<int, const Expression*>> register_value_or_shares(
+      const std::vector<Case>& cases) {
+    std::vector<std::pair<int, const Expression*>> wraps;
+    for (auto& c : cases) {
+      if (c.guard) continue;
+      std::vector<const Pattern*> leaves;
+      flatten_or(&c.lhs, leaves);
+      if (leaves.size() < 2) continue;            // not an or-pattern
+      bool bind = false;
+      for (auto* l : leaves) if (pattern_binds(l)) { bind = true; break; }
+      if (bind) continue;                          // a binding leaf needs exit args
+      // An or-pattern whose every leaf is decided by its top CONSTRUCTOR TAG
+      // alone (a constant, or a constructor/variant with an IRREFUTABLE argument
+      // -- `A _ | B | C`) is merged natively by ocamlc's Switcher (a jump table /
+      // tag switch with the action inline), NOT precompile_or's static catch.
+      // Only share when a leaf carries a nested REFUTABLE sub-pattern that forces
+      // a deeper test (`Some {processed=true}` reads a field), so its body is
+      // reached at a distinct tree depth from the other alternatives.
+      auto tag_decided = [&](const Pattern* l) {
+        const Pattern* p = effective_pat(l);
+        if (auto* k = std::get_if<Ppat_construct>(&p->desc))
+          return !k->arg || is_irrefutable(*effective_pat(k->arg->get()));
+        if (auto* v = std::get_if<Ppat_variant>(&p->desc))
+          return !v->arg || is_irrefutable(*effective_pat(v->arg->get()));
+        return std::holds_alternative<Ppat_constant>(p->desc);
+      };
+      bool all_tag = true;
+      for (auto* l : leaves) if (!tag_decided(l)) { all_tag = false; break; }
+      if (all_tag) continue;
+      // A bare immediate-constant body (`false`, `0`, a nullary constructor) is
+      // what ocamlc's Switcher lowers as an inline switch action folded into its
+      // own default handling; sharing it behind a catch collides with that
+      // (default-vs-enumerated-tags) rather than matching it.  Non-immediate
+      // bodies (a raise, an allocation, an application) are the precompile_or
+      // catch's real domain.
+      const Expression* rb = &*c.rhs;
+      while (auto* cs = std::get_if<Pexp_constraint>(&rb->desc)) rb = cs->e.get();
+      if (std::holds_alternative<Pexp_constant>(rb->desc)) continue;
+      if (auto* ct = std::get_if<Pexp_construct>(&rb->desc); ct && !ct->arg) continue;
+      if (shared_action_exit_.count(c.rhs.get())) continue;  // already registered
+      int eid = ++next_exit_;
+      shared_action_exit_[c.rhs.get()] = eid;
+      wraps.push_back({eid, c.rhs.get()});
+    }
+    return wraps;
+  }
+  // Apply the registered shares to a compiled match: count each exit's uses and
+  // reproduce Simplif's rule (0 -> drop, 1 -> inline, >=2 -> keep the catch).
+  LamPtr apply_value_or_shares(LamPtr body,
+                               std::vector<std::pair<int, const Expression*>>& wraps) {
+    for (auto& w : wraps) shared_action_exit_.erase(w.second);
+    for (auto it = wraps.rbegin(); it != wraps.rend(); ++it) {
+      int id = it->first, n = count_bare_exit(body, id);
+      if (n == 0) continue;
+      if (n == 1 && !exit_under_try(body, id, false)) {
+        LamPtr hb = expr(*it->second); replace_bare_exit(body, id, hb); continue;
+      }
+      auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = id; c->then_ = expr(*it->second);
+      body = c;
+    }
+    return body;
+  }
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases,
                        const Location& mloc, bool total = false) {
-    return compile_match(scrut, rows_of(cases), mloc, total);
+    auto wraps = register_value_or_shares(cases);
+    LamPtr body = compile_match(scrut, rows_of(cases), mloc, total);
+    return apply_value_or_shares(body, wraps);
   }
   // `total` (from the typer's exhaustiveness): when set, the naive last-resort
   // matcher omits the impossible `raise Match_failure` default and its final test,
