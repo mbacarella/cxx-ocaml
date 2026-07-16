@@ -9625,6 +9625,9 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   ValueKinds vk;
   for (auto& [p, t] : ck.rec_pat_) {
     vk.pat[p] = kind_str(t, ck);
+    // An abstract-ctor-typed PATTERN (an array pattern's element): a generic
+    // array element even though boxed -- mirrors the expression-side marking.
+    if (vk.pat[p] == "addr" && array_kind_str(t, ck).empty()) vk.abstract_elem.insert(p);
     // A constructor pattern whose type resolved to a module-qualified variant:
     // record the path so the back end can register that type's constructors.
     if (std::holds_alternative<ast::Ppat_construct>(p->desc)) {

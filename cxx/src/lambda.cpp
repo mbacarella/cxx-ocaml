@@ -12712,17 +12712,50 @@ struct Translator {
     }
     if (auto* arr = std::get_if<Ppat_array>(&p->desc)) {
       // `[|p0;..;pn-1|]`: a length test (== n) gates per-element matches.
-      // Generic array access (correct for every element kind, incl. flat
-      // float arrays); feeds the naive matcher, so correctness not byte-parity.
+      // ocamlc's make_array_matching reads elements with Parrayrefu
+      // (array_pattern_kind pat) -- UNSAFE (the length test guards) and
+      // KIND-specialized: an addr/int element is GETVECTITEM, a float element
+      // caml_floatarray_unsafe_get, and only a gen element (type variable or
+      // abstract, which could be a flat float array) the generic C call.  The
+      // element kind comes from the element pattern's own inferred type
+      // (vk.pat), with the abstract-ctor downgrade shared with expressions.
       int n = (int)arr->elems.size();
       auto len = mk(Lam::K::Prim); len->prim = Prim::IntCmp;
       len->prim_id = "array.length[gen]"; len->args = {acc};
       auto lt = mk(Lam::K::Prim); lt->prim = Prim::EqInt; lt->args = {len, cint(n)};
       test = if_and(test, lt);  // length first: short-circuits the element gets
       for (int i = 0; i < n; ++i) {
+        const Pattern* ep = arr->elems[i].get();
+        std::string k = "gen";
+        if (!vk.abstract_elem.count(ep)) {
+          auto it = vk.pat.find(ep);
+          std::string s = it == vk.pat.end() ? "" : it->second;
+          if (s == "int") k = "int";
+          else if (s == "float") k = "float";
+          else if (s == "addr" || s == "string") k = "addr";
+          else if (s.empty()) {
+            // Inference didn't record this sub-pattern: fall back to the
+            // pattern's own SHAPE, which pins the classification structurally
+            // (a tuple/record pattern is a boxed non-float; a constant pins
+            // its base type).  Anything else stays gen (safe).
+            const Pattern* sp = effective_pat(ep);
+            if (std::holds_alternative<Ppat_tuple>(sp->desc) ||
+                std::holds_alternative<Ppat_record>(sp->desc))
+              k = "addr";
+            else if (auto* pc = std::get_if<Ppat_constant>(&sp->desc)) {
+              if (std::holds_alternative<Pconst_integer>(pc->c.desc) ||
+                  std::holds_alternative<Pconst_char>(pc->c.desc))
+                k = "int";
+              else if (std::holds_alternative<Pconst_string>(pc->c.desc))
+                k = "addr";
+              else if (std::holds_alternative<Pconst_float>(pc->c.desc))
+                k = "float";
+            }
+          }
+        }
         auto get = mk(Lam::K::Prim); get->prim = Prim::IntCmp;
-        get->prim_id = "array.get[gen]"; get->args = {acc, cint(i)};
-        if (!pat_test(arr->elems[i].get(), get, test, binds)) return false;
+        get->prim_id = "array.unsafe_get[" + k + "]"; get->args = {acc, cint(i)};
+        if (!pat_test(ep, get, test, binds)) return false;
       }
       return true;
     }
