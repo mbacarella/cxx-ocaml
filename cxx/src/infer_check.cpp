@@ -440,6 +440,25 @@ struct Checker {
   // an immediate (int) runtime representation, so a value of such a type gets the
   // [int] value kind in the Lambda dump.
   std::set<std::string> immediate_types_;
+  // Type names declared ABSTRACT (Ptype_abstract, no manifest) somewhere in the
+  // file -- in a struct, or in a functor-param / module-type signature (`type
+  // t`, `type act`).  Typeopt.classify maps an abstract type constructor to
+  // `Any` (a GENERIC array element, `caml_array_get`), not `Addr` -- so an
+  // `act array` access must NOT specialize to `caml_array_get_addr` the way a
+  // known record/variant element does.  Consulted by array_kind_str; a name
+  // that is ALSO declared concrete (algebraic_names_) is excluded so a same-file
+  // concrete type is never mis-widened.
+  std::set<std::string> abstract_names_;
+  // Type names declared with a concrete algebraic definition (record / variant /
+  // extensible open).  Such elements ARE `Addr` in Typeopt.classify, so they
+  // keep the `[addr]` array specialization; they veto abstract_names_ on a name
+  // collision.
+  std::set<std::string> algebraic_names_;
+  // Qualified names ("A.t") of abstract-without-manifest types declared by a
+  // FUNCTOR PARAMETER's signature -- the precise (collision-free) form for
+  // widening a dotted `A.t array` element to gen.  Collected by the pre-pass
+  // in infer_value_kinds; matched exactly against the element's path.
+  std::set<std::string> param_abstract_quals_;
   // Local `[@@unboxed]` single-field types -> the last component of the wrapped
   // field/argument type (`type compunit = Compunit of string [@@unboxed]` ->
   // "string").  OCaml's Typeopt.scrape_ty sees through such wrappers, so a
@@ -2274,6 +2293,7 @@ struct Checker {
       if (auto* t = std::get_if<Psig_type>(&it.desc)) {
         for (auto& d : t->decls) {
           param_sig_type_names_[pn].push_back(d.name.txt);
+          note_type_kind(d);
           if (d.manifest || !d.constraints.empty()) {
             Alias a;
             for (auto& p : d.params) {
@@ -3436,10 +3456,96 @@ struct Checker {
                  "constructor with a single argument, or one field");
   }
 
+  // Record a type declaration's concrete/abstract kind for array_kind_str, so an
+  // abstract element (`type act`) drops its `[addr]` array specialization (see
+  // abstract_names_).  An abstract type WITH a manifest is a transparent
+  // abbreviation -- classify scrapes through it -- so it is neither abstract nor
+  // algebraic here.
+  void note_type_kind(const TypeDeclaration& d) {
+    if (std::holds_alternative<Ptype_record>(d.kind) ||
+        std::holds_alternative<Ptype_variant>(d.kind) ||
+        std::holds_alternative<Ptype_open>(d.kind))
+      algebraic_names_.insert(d.name.txt);
+    else if (std::holds_alternative<Ptype_abstract>(d.kind) && !d.manifest)
+      abstract_names_.insert(d.name.txt);
+  }
+
+  // ---- array_kind_str pre-pass: collect type-decl kinds file-wide -------------
+  // A named module type's abstract-without-manifest top-level type names, so a
+  // functor param `(A : S)` can resolve `A.t`'s kind.
+  std::unordered_map<std::string, std::set<std::string>> modtype_abstract_;
+  // Deferred `(param, modtype-name)` functor params, resolved against
+  // modtype_abstract_ once the whole file (all `module type` decls) is walked.
+  std::vector<std::pair<std::string, std::string>> pending_param_modtypes_;
+
+  // Abstract-without-manifest type names declared at a module type's TOP level
+  // (only a literal signature exposes them structurally).
+  std::set<std::string> mty_top_abstract(const ast::ModuleType& mt) {
+    std::set<std::string> out;
+    if (auto* sg = std::get_if<ast::Pmty_signature>(&mt.desc))
+      for (auto& it : sg->items)
+        if (auto* t = std::get_if<ast::Psig_type>(&it.desc))
+          for (auto& d : t->decls)
+            if (std::holds_alternative<ast::Ptype_abstract>(d.kind) && !d.manifest)
+              out.insert(d.name.txt);
+    return out;
+  }
+  void ck_param(const ast::FunctorParam& fp) {
+    auto* nm = std::get_if<ast::Functor_named>(&fp);
+    if (!nm || !nm->type) return;
+    ck_walk_mty(*nm->type);
+    std::string pn = nm->name.txt.value_or("");
+    if (pn.empty()) return;
+    for (auto& n : mty_top_abstract(*nm->type)) param_abstract_quals_.insert(pn + "." + n);
+    if (auto* mi = std::get_if<ast::Pmty_ident>(&nm->type->desc))
+      if (auto* l = std::get_if<ast::Lident>(&mi->id.txt.v))
+        pending_param_modtypes_.push_back({pn, l->name});
+  }
+  void ck_walk_mty(const ast::ModuleType& mt) {
+    if (auto* sg = std::get_if<ast::Pmty_signature>(&mt.desc)) ck_walk_sig(sg->items);
+    else if (auto* fn = std::get_if<ast::Pmty_functor>(&mt.desc)) { ck_param(fn->param); ck_walk_mty(*fn->body); }
+    else if (auto* w = std::get_if<ast::Pmty_with>(&mt.desc)) ck_walk_mty(*w->mt);
+    else if (auto* to = std::get_if<ast::Pmty_typeof>(&mt.desc)) ck_walk_me(*to->me);
+  }
+  void ck_walk_me(const ast::ModuleExpr& me) {
+    if (auto* ms = std::get_if<ast::Pmod_structure>(&me.desc)) ck_walk_struct(ms->items);
+    else if (auto* fn = std::get_if<ast::Pmod_functor>(&me.desc)) { ck_param(fn->param); ck_walk_me(*fn->body); }
+    else if (auto* c = std::get_if<ast::Pmod_constraint>(&me.desc)) { ck_walk_me(*c->me); ck_walk_mty(*c->mt); }
+    else if (auto* a = std::get_if<ast::Pmod_apply>(&me.desc)) { ck_walk_me(*a->f); ck_walk_me(*a->arg); }
+  }
+  void ck_walk_sig(const ast::Signature& items) {
+    for (auto& it : items) {
+      if (auto* t = std::get_if<ast::Psig_type>(&it.desc)) for (auto& d : t->decls) note_type_kind(d);
+      else if (auto* mt = std::get_if<ast::Psig_modtype>(&it.desc)) {
+        if (mt->type) { modtype_abstract_[mt->name.txt] = mty_top_abstract(*mt->type); ck_walk_mty(*mt->type); }
+      } else if (auto* md = std::get_if<ast::Psig_module>(&it.desc)) ck_walk_mty(*md->md.type);
+      else if (auto* rm = std::get_if<ast::Psig_recmodule>(&it.desc)) for (auto& d : rm->decls) ck_walk_mty(*d.type);
+      else if (auto* inc = std::get_if<ast::Psig_include>(&it.desc)) ck_walk_mty(inc->mt);
+    }
+  }
+  void ck_walk_struct(const ast::Structure& items) {
+    for (auto& it : items) {
+      if (auto* t = std::get_if<ast::Pstr_type>(&it.desc)) for (auto& d : t->decls) note_type_kind(d);
+      else if (auto* mt = std::get_if<ast::Pstr_modtype>(&it.desc)) {
+        if (mt->type) { modtype_abstract_[mt->name.txt] = mty_top_abstract(*mt->type); ck_walk_mty(*mt->type); }
+      } else if (auto* m = std::get_if<ast::Pstr_module>(&it.desc)) ck_walk_me(m->binding.expr);
+      else if (auto* rm = std::get_if<ast::Pstr_recmodule>(&it.desc)) for (auto& b : rm->bindings) ck_walk_me(b.expr);
+      else if (auto* inc = std::get_if<ast::Pstr_include>(&it.desc)) ck_walk_me(inc->expr);
+    }
+  }
+  // Entry point: walk the whole file, then resolve deferred named-modtype params.
+  void collect_type_kinds(const ast::Structure& s) {
+    ck_walk_struct(s);
+    for (auto& [pn, s2] : pending_param_modtypes_)
+      if (auto it = modtype_abstract_.find(s2); it != modtype_abstract_.end())
+        for (auto& n : it->second) param_abstract_quals_.insert(pn + "." + n);
+  }
+
   // Register a user variant: A of t1*..*tn -> scheme t1->..->tn->(params) name.
   void register_type_decl(const TypeDeclaration& d) {
     check_type_vars(d);
     check_unboxed(d);
+    note_type_kind(d);
     type_arity[d.name.txt] = (int)d.params.size();
     // A top-level decl shadowing a stdlib variant type's name (`type fpclass =
     // A` over float's fpclass): the stdlib ctors' schemes requalify so their
@@ -9389,6 +9495,36 @@ static std::string kind_str(const TypePtr& t0, Checker& ck) {
   return "addr";
 }
 
+// The array-element kind for `t0`, tracking Typeopt.array_type_kind rather than
+// the value_kind: an ABSTRACT type constructor classifies as `Any` (a GENERIC
+// element -> `caml_array_get`), NOT `Addr`, even though it is boxed.  kind_str
+// defaults any non-base Constr to "addr"; here we downgrade that to "" (gen)
+// when the element's type name is known abstract (declared `type t` with no
+// manifest in a sig/struct) and NOT also concretely defined -- matching
+// ocamlc, which specializes to `caml_array_get_addr` only for record/variant
+// elements.  Widening addr->gen is always runtime-safe (the generic accessor
+// handles every element kind), so a missed abstract only costs fidelity.
+static std::string array_kind_str(const TypePtr& t0, Checker& ck) {
+  std::string k = kind_str(t0, ck);
+  if (k != "addr") return k;
+  TypePtr t = I::Engine::repr(t0);
+  if (t->kind != I::Type::Kind::Constr) return k;
+  auto d = t->path.rfind('.');
+  if (d == std::string::npos) {
+    // Bare element name (`act`, a local/param abstract un-qualified in scope):
+    // widen to gen only when the file declares it abstract and never concrete.
+    const std::string& b = t->path;
+    if (ck.abstract_names_.count(b) && !ck.algebraic_names_.count(b)) return "";
+    return k;
+  }
+  // Dotted `Q.b`: widen only for a FUNCTOR-PARAMETER abstract type (`A.t`,
+  // `Id.t`) with no manifest -- collected exactly as "Q.b".  This avoids
+  // conflating a cross-module concrete `Path.t`/`Location.t` (a variant/record)
+  // with a same-named local abstract `t`.
+  if (ck.param_abstract_quals_.count(t->path)) return "";
+  return k;
+}
+
 // If `t0` is an array type, sets `out` to its element kind_str ("" for a generic
 // element) and returns true; otherwise returns false.
 static bool array_elem_str(const TypePtr& t0, Checker& ck, std::string& out) {
@@ -9397,13 +9533,14 @@ static bool array_elem_str(const TypePtr& t0, Checker& ck, std::string& out) {
   auto d = t->path.rfind('.');
   std::string b = d == std::string::npos ? t->path : t->path.substr(d + 1);
   if (b != "array" && b != "iarray") return false;
-  out = kind_str(t->args[0], ck);
+  out = array_kind_str(t->args[0], ck);
   return true;
 }
 
 ValueKinds infer_value_kinds(const ast::Structure& s) {
   Checker ck;
   ck.record_kinds_ = true;
+  ck.collect_type_kinds(s);  // file-wide concrete/abstract type-decl kinds (array_kind_str)
   run_checker(ck, s);
   ck.resolve_pending_fields();  // re-resolve ambiguous field reads with final types
   ValueKinds vk;
@@ -9437,6 +9574,9 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck);
   for (auto& [e, t] : ck.rec_expr_) {
     vk.expr[e] = kind_str(t, ck);
+    // An abstract-ctor-typed expr (`a.(i) : Id.t`) is a GENERIC array element
+    // even though it is boxed ("addr"): array_kind_str downgrades it to gen.
+    if (vk.expr[e] == "addr" && array_kind_str(t, ck).empty()) vk.abstract_elem.insert(e);
     std::string ek;
     if (array_elem_str(t, ck, ek)) vk.array_elem[e] = ek;  // "" = gen element
     // A function-typed reference whose first parameter is a specializable base

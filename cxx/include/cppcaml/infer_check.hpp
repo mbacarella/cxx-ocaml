@@ -102,6 +102,13 @@ struct ValueKinds {
   // "float"/"addr"/"string"/""), so the back end can annotate Array.length /
   // empty `[||]` with the element kind (which the array's own kind can't give).
   std::unordered_map<const void*, std::string> array_elem;
+  // Expressions whose type is an ABSTRACT type constructor (`Id.t`) -- boxed, so
+  // kind_str spells them "addr", yet Typeopt.classify treats them as `Any`, a
+  // GENERIC array element.  When such an expression is the RESULT of `a.(i)` (or
+  // the value stored by `a.(i) <- v`), the back end must emit `array.get[gen]`,
+  // not `[addr]`.  Consumed ONLY by array_elem_kind, so it cannot perturb any
+  // other value_kind (e.g. the lazy-forward classification).
+  std::set<const void*> abstract_elem;
   // For an expression whose type is a module-qualified constr ("Gc.stat"), the
   // full path -- the back end resolves unqualified record labels through the
   // base expression's inferred type (heap_stats.major_collections).

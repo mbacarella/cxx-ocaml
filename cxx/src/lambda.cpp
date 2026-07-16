@@ -5387,6 +5387,9 @@ struct Translator {
   // Array element kind from an element expression's inferred type: int / float /
   // addr (a known boxed type, e.g. string/record) / gen (a type variable).
   std::string array_elem_kind(const Expression* e) {
+    // An abstract-ctor element (`Id.t`) is boxed ("addr") but a GENERIC array
+    // element per Typeopt.classify -- caml_array_get, not caml_array_get_addr.
+    if (vk.abstract_elem.count(e)) return "gen";
     auto it = vk.expr.find(e);
     std::string s = it == vk.expr.end() ? "" : it->second;
     if (s == "int") return "int";
