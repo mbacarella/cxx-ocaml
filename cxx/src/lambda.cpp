@@ -10696,6 +10696,1200 @@ struct Translator {
     if (tc == type_ctors_.end()) return false;
     return (int)names.size() == tc->second.first + tc->second.second;  // covers every ctor
   }
+  // ===== faithful matching.ml port: constant-ctor tuple matches ==============
+  // Domain: `match e1, .., ek with ..` where every column is a constant-only
+  // variant, no guards, no bindings.  Reproduces ocamlc's exact or-pattern
+  // machinery -- split_or / Or_matrix / precompile_or (each or-row's body
+  // compiled ONCE behind an exit, alternatives explode to `(exit n)` rows),
+  // default environments + mk_failaction_pos (per-gap-tag exit threading),
+  // Context/Jumps tracking, and the Switcher -- then replays the relevant
+  // Simplif.simplify_exits rules locally (exit aliasing, 0/1-use catches).
+  // Everything is restricted to tag bitsets, which makes each matching.ml
+  // notion (compat/le/lub/specialize) exact set arithmetic.
+  struct OcPat {
+    bool omega = true;
+    std::vector<int> alts;   // leaf tags in source order (size>=1 when !omega)
+    uint32_t set = 0;        // bitset of alts
+  };
+  using OcRow = std::vector<OcPat>;
+  using OcMatrix = std::vector<OcRow>;
+  struct OcClause { OcRow cols; LamPtr act; };
+  struct OcDefEnv { std::vector<std::pair<int, OcMatrix>> env; int final_exit = -1; };
+  struct OcCtxRow { OcRow left, right; };  // left index 0 = most recent (matching.ml list head)
+  using OcCtx = std::vector<OcCtxRow>;
+  struct OcJumps { std::map<int, OcCtx> env; bool partial = false; };
+  struct OcPartial { bool cur_total; bool glob_total; };
+  struct OcRes { LamPtr lam; OcJumps jumps; };  // wrapped in optional<>: nullopt = Unused
+  static OcPat oc_omega() { return {}; }
+  static OcPat oc_const(int t) {
+    OcPat p; p.omega = false; p.alts = {t}; p.set = 1u << t; return p;
+  }
+  static bool oc_compat(const OcPat& a, const OcPat& b) {
+    return a.omega || b.omega || (a.set & b.set) != 0;
+  }
+  static bool oc_compats(const OcRow& a, const OcRow& b) {
+    for (size_t i = 0; i < a.size(); ++i) if (!oc_compat(a[i], b[i])) return false;
+    return true;
+  }
+  // le(a,b): a matches everything b matches (a more general).
+  static bool oc_le(const OcPat& a, const OcPat& b) {
+    if (a.omega) return true;
+    if (b.omega) return false;
+    return (b.set & ~a.set) == 0;
+  }
+  static bool oc_les(const OcRow& a, const OcRow& b) {
+    for (size_t i = 0; i < a.size(); ++i) if (!oc_le(a[i], b[i])) return false;
+    return true;
+  }
+  static bool oc_equiv(const OcPat& a, const OcPat& b) {
+    return oc_le(a, b) && oc_le(b, a);
+  }
+  // lub = intersection (alts keep a's source order); false when incompatible.
+  static bool oc_lub(const OcPat& a, const OcPat& b, OcPat& out) {
+    if (a.omega) { out = b; return true; }
+    if (b.omega) { out = a; return true; }
+    if (!(a.set & b.set)) return false;
+    out.omega = false; out.alts.clear(); out.set = 0;
+    for (int t : a.alts)
+      if (b.set & (1u << t)) { out.alts.push_back(t); out.set |= 1u << t; }
+    return true;
+  }
+  // -- Context (matching.ml Context module, bitset semantics) --
+  static OcCtx oc_ctx_start(size_t k) {
+    OcCtxRow r; r.right.assign(k, oc_omega()); return {r};
+  }
+  static bool oc_ctx_row_le(const OcCtxRow& a, const OcCtxRow& b) {
+    return a.left.size() == b.left.size() && a.right.size() == b.right.size() &&
+           oc_les(a.left, b.left) && oc_les(a.right, b.right);
+  }
+  // Parmatch.get_mins: drop rows dominated by a LATER row; two passes.
+  static OcCtx oc_get_mins(OcCtx rows) {
+    auto pass = [](const OcCtx& in) {
+      OcCtx r;
+      for (size_t i = 0; i < in.size(); ++i) {
+        bool dom = false;
+        for (size_t j = i + 1; j < in.size() && !dom; ++j)
+          if (oc_ctx_row_le(in[j], in[i])) dom = true;
+        if (!dom) r.insert(r.begin(), in[i]);   // select_rec prepends -> reversed
+      }
+      return r;
+    };
+    return pass(pass(std::move(rows)));
+  }
+  static OcCtx oc_ctx_union(const OcCtx& a, const OcCtx& b) {
+    OcCtx r = a; r.insert(r.end(), b.begin(), b.end());
+    return oc_get_mins(std::move(r));
+  }
+  static OcCtx oc_ctx_lshift(const OcCtx& ctx) {
+    if ((int)ctx.size() < 32) {                    // Clflags.match_context_rows
+      OcCtx r;
+      for (auto& row : ctx) {
+        OcCtxRow n = row;
+        n.left.insert(n.left.begin(), n.right.front());
+        n.right.erase(n.right.begin());
+        r.push_back(std::move(n));
+      }
+      return r;
+    }
+    OcCtx r;                                       // pruning: lforget + get_mins
+    for (auto& row : ctx) {
+      OcCtxRow n = row;
+      n.left.insert(n.left.begin(), oc_omega());
+      n.right.erase(n.right.begin());
+      r.push_back(std::move(n));
+    }
+    return oc_get_mins(std::move(r));
+  }
+  static OcCtx oc_ctx_rshift(const OcCtx& ctx) {
+    OcCtx r;
+    for (auto& row : ctx) {
+      OcCtxRow n = row;
+      n.right.insert(n.right.begin(), n.left.front());
+      n.left.erase(n.left.begin());
+      r.push_back(std::move(n));
+    }
+    return r;
+  }
+  static OcCtx oc_ctx_rshift_num(int n, const OcCtx& ctx) {
+    OcCtx r;
+    for (auto& row : ctx) {
+      OcCtxRow x = row;
+      for (int i = 0; i < n; ++i) {
+        x.right.insert(x.right.begin(), x.left.front());
+        x.left.erase(x.left.begin());
+      }
+      r.push_back(std::move(x));
+    }
+    return r;
+  }
+  // combine: pop the specialized constant from left back into right (set_args
+  // of an arity-0 head is the head itself).
+  static OcCtx oc_ctx_combine(const OcCtx& ctx) { return oc_ctx_rshift(ctx); }
+  static OcCtx oc_ctx_specialize(int t, const OcCtx& ctx) {
+    OcCtx r;
+    for (auto& row : ctx) {
+      const OcPat& p = row.right.front();
+      auto push = [&] {
+        OcCtxRow n;
+        n.left = row.left; n.left.insert(n.left.begin(), oc_const(t));
+        n.right.assign(row.right.begin() + 1, row.right.end());
+        r.push_back(std::move(n));
+      };
+      if (p.omega) push();
+      else
+        for (int a : p.alts) if (a == t) push();   // per matching or-alternative
+    }
+    return r;
+  }
+  static OcCtx oc_ctx_lub(const OcPat& p, const OcCtx& ctx) {
+    OcCtx r;
+    for (auto& row : ctx) {
+      OcPat inter;
+      if (!oc_lub(row.right.front(), p, inter)) continue;
+      OcCtxRow n = row; n.right.front() = inter; r.push_back(std::move(n));
+    }
+    return r;
+  }
+  static bool oc_ctx_matches(const OcCtx& ctx, const OcMatrix& pss) {
+    for (auto& row : ctx)
+      for (auto& ps : pss)
+        if (oc_compats(row.right, ps)) return true;
+    return false;
+  }
+  // select_columns: pin the ctx's next n columns to a provenance row's patterns
+  // (per provenance row x ctx row), moving them to `left`.
+  static OcCtx oc_ctx_select_columns(const OcMatrix& pss, const OcCtx& ctx) {
+    size_t n = pss.empty() ? 0 : pss[0].size();
+    OcCtx r;
+    for (auto& ps : pss)
+      for (auto& row : ctx) {
+        OcCtxRow x;
+        bool ok = true;
+        std::vector<OcPat> inter(n);
+        for (size_t i = 0; i < n && ok; ++i)
+          ok = oc_lub(row.right[i], ps[i], inter[i]);
+        if (!ok) continue;
+        // left is most-recent-first: column n-1 was consumed last.
+        for (size_t i = 0; i < n; ++i) x.left.push_back(inter[n - 1 - i]);
+        x.left.insert(x.left.end(), row.left.begin(), row.left.end());
+        x.right.assign(row.right.begin() + n, row.right.end());
+        r.push_back(std::move(x));
+      }
+    return r;
+  }
+  // -- Jumps --
+  static void oc_jumps_add(OcJumps& j, int i, const OcCtx& ctx) {
+    if (ctx.empty()) return;
+    auto it = j.env.find(i);
+    if (it == j.env.end()) j.env[i] = ctx;
+    else it->second = oc_ctx_union(it->second, ctx);
+  }
+  static OcJumps oc_jumps_union(const OcJumps& a, const OcJumps& b) {
+    OcJumps r = a; r.partial = a.partial || b.partial;
+    for (auto& [i, c] : b.env) oc_jumps_add(r, i, c);
+    return r;
+  }
+  template <class F>
+  static OcJumps oc_jumps_map(F f, const OcJumps& j) {
+    OcJumps r; r.partial = j.partial;
+    for (auto& [i, c] : j.env) r.env[i] = f(c);
+    return r;
+  }
+  static OcCtx oc_jumps_extract(OcJumps& j, int i) {
+    auto it = j.env.find(i);
+    if (it == j.env.end()) return {};
+    OcCtx c = std::move(it->second); j.env.erase(it);
+    return c;
+  }
+  // -- Default environment --
+  static OcDefEnv oc_def_cons(const OcMatrix& m, int i, const OcDefEnv& def) {
+    if (m.empty()) return def;
+    OcDefEnv r = def; r.env.insert(r.env.begin(), {i, m});
+    return r;
+  }
+  // specialize_ arity 0 with a per-row keep test; truncation on a width-0 row.
+  template <class Keep>
+  static OcDefEnv oc_def_filter(const OcDefEnv& def, Keep keep) {
+    OcDefEnv r; r.final_exit = def.final_exit;
+    for (auto& [i, m] : def.env) {
+      if (!m.empty() && m[0].empty()) {            // already width 0: matches all
+        r.env.push_back({i, {OcRow{}}});
+        return r;
+      }
+      OcMatrix nm;
+      for (auto& row : m)
+        if (keep(row[0])) nm.push_back(OcRow(row.begin() + 1, row.end()));
+      if (nm.empty()) continue;
+      if (nm[0].empty()) { r.env.push_back({i, {OcRow{}}}); return r; }
+      r.env.push_back({i, std::move(nm)});
+    }
+    return r;
+  }
+  static OcDefEnv oc_def_specialize(int t, const OcDefEnv& def) {
+    return oc_def_filter(def, [&](const OcPat& p) { return p.omega || (p.set >> t) & 1; });
+  }
+  static OcDefEnv oc_def_pop_column(const OcDefEnv& def) {
+    return oc_def_filter(def, [](const OcPat&) { return true; });
+  }
+  static OcDefEnv oc_def_pop_compat(const OcPat& q, const OcDefEnv& def) {
+    return oc_def_filter(def, [&](const OcPat& p) { return oc_compat(p, q); });
+  }
+  // -- precompiled halves --
+  struct OcPm { int argpos = 0; std::vector<OcClause> cases; OcDefEnv def; };
+  struct OcPmh;
+  using OcPmhPtr = std::shared_ptr<OcPmh>;
+  struct OcHandler { OcMatrix provenance; int exit; OcPm pm; };
+  struct OcPmh {
+    int kind = 0;                         // 0 Pm, 1 PmVar, 2 PmOr
+    OcPm pm;                              // kind 0
+    OcPmhPtr inside;                      // kind 1
+    OcPm body; std::vector<OcHandler> handlers;  // kind 2
+    OcMatrix matrix;                      // as_matrix at creation (rebuild_matrix)
+  };
+  struct OcPmhInfo { OcPmhPtr me; OcMatrix matrix; OcDefEnv top_default; };
+  using OcNexts = std::vector<std::pair<int, OcPmhPtr>>;
+  // per-match state
+  std::vector<int> oc_nc_;                // NC per column
+  std::vector<LamPtr> oc_comps_;          // per-column scrutinee vars
+  std::set<int> oc_my_exits_;             // exits allocated by this match
+  int oc_alloc_exit() { int e = ++next_exit_; oc_my_exits_.insert(e); return e; }
+  LamPtr oc_exit(int i) { auto e = mk(Lam::K::Staticraise); e->prim_arg = i; return e; }
+  static bool oc_is_exit(const LamPtr& l) {
+    return l && l->k == Lam::K::Staticraise && l->args.empty();
+  }
+  static OcMatrix oc_as_matrix(const std::vector<OcClause>& cls) {
+    OcMatrix m; for (auto& c : cls) m.push_back(c.cols);
+    return m;
+  }
+  // Lambda.make_key equality, EXIT-AWARE (ocamlc's make_key keeps staticraise
+  // ids; the exit-blind same_action_lam would merge dispatches to distinct
+  // handlers -- a miscompile in this port's store/safe_before).
+  static bool oc_same_action(const LamPtr& a, const LamPtr& b) {
+    if (a == b) return true;
+    if (oc_is_exit(a) && oc_is_exit(b)) return a->prim_arg == b->prim_arg;
+    std::string ka = cppcaml::lambda::make_lam_key(a, /*exit_aware=*/true);
+    return !ka.empty() && ka == cppcaml::lambda::make_lam_key(b, /*exit_aware=*/true);
+  }
+  static bool oc_head_is_or(const OcClause& c) {
+    return !c.cols[0].omega && c.cols[0].alts.size() > 1;
+  }
+  // safe_before (matching.ml:1341): same action (make_key) or incompatible rows.
+  bool oc_safe_before(const OcClause& c, const std::vector<OcClause>& l) {
+    for (auto& q : l) {
+      if (oc_same_action(c.act, q.act)) continue;
+      if (oc_compats(c.cols, q.cols)) return false;
+    }
+    return true;
+  }
+  // ---- split_or / Or_matrix / split_no_or / precompile (k-column stage) ----
+  std::pair<OcPmhInfo, OcNexts> oc_split_or(std::vector<OcClause> cls, int argpos,
+                                            const OcDefEnv& def) {
+    std::vector<OcClause> before, ors, no;
+    auto rest_of = [](const OcClause& c) { return OcRow(c.cols.begin() + 1, c.cols.end()); };
+    // Or_matrix.safe_below: unguarded && le_pats(rest_q, rest_p).
+    auto safe_below = [&](const OcClause& q, const OcClause& p) {
+      return oc_les(rest_of(q), rest_of(p));
+    };
+    auto insert_or_append = [&](const OcClause& p) {
+      // walk the or-matrix most-recent-first (ocaml rev_ors head = ors.back()).
+      for (int idx = (int)ors.size() - 1; idx >= 0; --idx) {
+        const OcClause& q = ors[idx];
+        bool q_or = oc_head_is_or(q);
+        if (!q_or || !oc_compat(p.cols[0], q.cols[0])) continue;  // seen += q
+        if (oc_equiv(p.cols[0], q.cols[0])) {
+          // attempt insertion for equivalent or-heads (no vars in this domain):
+          // append condition vs the OLDER or-rows, insert condition vs the newer.
+          bool ok = true;
+          {  // extract_equiv_head over the older rows (indices idx-1 .. 0)
+            int j = idx - 1;
+            while (j >= 0 && oc_head_is_or(ors[j]) && oc_equiv(p.cols[0], ors[j].cols[0])) --j;
+            for (; j >= 0 && ok; --j) {            // not_e: safe_below_or_matrix
+              if (!oc_head_is_or(ors[j])) continue;
+              if (!oc_compat(p.cols[0], ors[j].cols[0])) continue;   // disjoint
+              if (!safe_below(ors[j], p)) ok = false;
+            }
+          }
+          for (size_t j = idx + 1; j < ors.size() && ok; ++j)        // seen: disjoint
+            if (oc_compat(p.cols[0], ors[j].cols[0])) ok = false;
+          if (ok) ors.insert(ors.begin() + idx + 1, p);
+          else no.push_back(p);
+          return;
+        }
+        if (safe_below(q, p)) continue;            // ordering condition holds
+        no.push_back(p);
+        return;
+      }
+      ors.push_back(p);
+    };
+    for (auto& cl : cls) {
+      if (!oc_safe_before(cl, no)) { no.push_back(cl); continue; }
+      if (!oc_head_is_or(cl) && oc_safe_before(cl, ors)) before.push_back(cl);
+      else insert_or_append(cl);
+    }
+    // cons_next
+    OcDefEnv def2 = def;
+    OcNexts nexts;
+    if (!no.empty()) {
+      auto [info2, nexts2] = oc_split_or(std::move(no), argpos, def);
+      int idef = oc_alloc_exit();
+      def2 = oc_def_cons(info2.matrix, idef, info2.top_default);
+      nexts.push_back({idef, info2.me});
+      nexts.insert(nexts.end(), nexts2.begin(), nexts2.end());
+    }
+    if (ors.empty()) return oc_split_no_or(std::move(before), argpos, def2, std::move(nexts));
+    return oc_precompile_or(std::move(before), std::move(ors), argpos, def2, std::move(nexts));
+  }
+  std::pair<OcPmhInfo, OcNexts> oc_split_no_or(std::vector<OcClause> cls, int argpos,
+                                               const OcDefEnv& def, OcNexts k) {
+    // collect: group rows sharing the discriminating head kind (Any vs Const),
+    // with safe_before reordering and the last-row-all-omega extra division.
+    std::function<std::pair<OcPmhInfo, OcNexts>(std::vector<OcClause>)> split =
+        [&](std::vector<OcClause> cs) -> std::pair<OcPmhInfo, OcNexts> {
+      bool discr_any = cs[0].cols[0].omega;
+      std::vector<OcClause> yes, no;
+      for (size_t i = 0; i < cs.size(); ++i) {
+        const OcClause& cl = cs[i];
+        bool last_omega_split = i + 1 == cs.size() && !yes.empty() && cl.cols[0].omega &&
+                                [&] { for (auto& p : cl.cols) if (!p.omega) return false;
+                                      return true; }();
+        if (last_omega_split) { no.push_back(cl); break; }
+        bool groups = discr_any ? cl.cols[0].omega : !cl.cols[0].omega;
+        if (groups && oc_safe_before(cl, no)) yes.push_back(cl);
+        else no.push_back(cl);
+      }
+      // insert_split
+      if (no.empty()) return oc_precompile_group(discr_any, std::move(yes), argpos, def, k);
+      auto [info2, nexts2] = split(std::move(no));
+      int idef = oc_alloc_exit();
+      OcDefEnv d2 = oc_def_cons(info2.matrix, idef, info2.top_default);
+      OcNexts nn;
+      nn.push_back({idef, info2.me});
+      nn.insert(nn.end(), nexts2.begin(), nexts2.end());
+      return oc_precompile_group(discr_any, std::move(yes), argpos, d2, std::move(nn));
+    };
+    return split(std::move(cls));
+  }
+  std::pair<OcPmhInfo, OcNexts> oc_precompile_group(bool discr_any, std::vector<OcClause> yes,
+                                                    int argpos, const OcDefEnv& def, OcNexts k) {
+    // precompile_var: Any-headed group with several clauses and remaining columns.
+    if (discr_any && (int)oc_comps_.size() - argpos > 1 && yes.size() > 1) {
+      std::vector<OcClause> var_cls;
+      for (auto& c : yes) {
+        OcClause n; n.cols.assign(c.cols.begin() + 1, c.cols.end()); n.act = c.act;
+        var_cls.push_back(std::move(n));
+      }
+      auto [first, nexts] = oc_split_or(std::move(var_cls), argpos + 1, oc_def_pop_column(def));
+      if (!nexts.empty()) {
+        std::function<OcMatrix(const OcPmhPtr&)> rebuild = [&](const OcPmhPtr& p) -> OcMatrix {
+          if (p->kind != 1) return p->matrix;                // Pm / PmOr creation matrix
+          OcMatrix m = rebuild(p->inside);
+          for (auto& r : m) r.insert(r.begin(), oc_omega()); // add_omega_column
+          return m;
+        };
+        OcDefEnv rdef = def;
+        for (int i = (int)nexts.size() - 1; i >= 0; --i) {
+          OcMatrix m = rebuild(nexts[i].second);
+          for (auto& r : m) r.insert(r.begin(), oc_omega());
+          rdef = oc_def_cons(m, nexts[i].first, rdef);
+        }
+        auto pv = std::make_shared<OcPmh>();
+        pv->kind = 1; pv->inside = first.me;
+        OcMatrix fm = first.matrix;
+        for (auto& r : fm) r.insert(r.begin(), oc_omega());
+        pv->matrix = fm;
+        OcNexts rnexts;
+        for (auto& [e, pm] : nexts) {
+          auto w = std::make_shared<OcPmh>(); w->kind = 1; w->inside = pm;
+          rnexts.push_back({e, w});
+        }
+        rnexts.insert(rnexts.end(), k.begin(), k.end());
+        return {{pv, fm, rdef}, std::move(rnexts)};
+      }
+      // no split below: fall through to do_not_precompile
+    }
+    auto me = std::make_shared<OcPmh>();
+    me->kind = 0; me->pm = {argpos, yes, def};
+    me->matrix = oc_as_matrix(yes);
+    return {{me, me->matrix, def}, std::move(k)};
+  }
+  std::pair<OcPmhInfo, OcNexts> oc_precompile_or(std::vector<OcClause> cls,
+                                                 std::vector<OcClause> ors, int argpos,
+                                                 const OcDefEnv& def, OcNexts k) {
+    size_t w = oc_comps_.size() - argpos;
+    std::vector<OcClause> body_cases = cls;
+    std::vector<OcHandler> handlers;
+    for (size_t i = 0; i < ors.size(); ++i) {
+      if (!oc_head_is_or(ors[i])) { body_cases.push_back(ors[i]); continue; }
+      const OcPat orp = ors[i].cols[0];
+      // extract_equiv_head: following or-rows with an equivalent head join this orpm.
+      OcPm orpm; orpm.argpos = argpos + 1;
+      orpm.def = oc_def_pop_compat(orp, def);
+      OcClause self; self.cols.assign(ors[i].cols.begin() + 1, ors[i].cols.end());
+      self.act = ors[i].act;
+      orpm.cases.push_back(std::move(self));
+      while (i + 1 < ors.size() && oc_head_is_or(ors[i + 1]) &&
+             oc_equiv(orp, ors[i + 1].cols[0])) {
+        ++i;
+        OcClause o; o.cols.assign(ors[i].cols.begin() + 1, ors[i].cols.end());
+        o.act = ors[i].act;
+        orpm.cases.push_back(std::move(o));
+      }
+      int or_num = oc_alloc_exit();
+      for (int t : orp.alts) {                     // explode_or_pat, leaves in order
+        OcClause n; n.cols.push_back(oc_const(t));
+        for (size_t j = 1; j < w; ++j) n.cols.push_back(oc_omega());
+        n.act = oc_exit(or_num);
+        body_cases.push_back(std::move(n));
+      }
+      handlers.push_back({OcMatrix{OcRow{orp}}, or_num, std::move(orpm)});
+    }
+    auto me = std::make_shared<OcPmh>();
+    me->kind = 2; me->body = {argpos, std::move(body_cases), def};
+    me->handlers = std::move(handlers);
+    me->matrix = oc_as_matrix(cls);
+    for (auto& o : ors) me->matrix.push_back(o.cols);
+    return {{me, me->matrix, def}, std::move(k)};
+  }
+  // ---- compilation (compile_match / handlers / combine / failactions) ----
+  std::optional<OcRes> oc_comp_exit(const OcPartial& partial, const OcCtx& ctx,
+                                    const OcDefEnv& def) {
+    if (!def.env.empty()) {
+      OcJumps j; oc_jumps_add(j, def.env[0].first, ctx);
+      return OcRes{oc_exit(def.env[0].first), std::move(j)};
+    }
+    if (partial.glob_total) return std::nullopt;
+    OcJumps j; j.partial = true;
+    return OcRes{oc_exit(def.final_exit), std::move(j)};
+  }
+  std::optional<OcRes> oc_compile_match(const OcPartial& partial, const OcCtx& ctx,
+                                        const OcPm& pm) {
+    if (!pm.cases.empty() && pm.cases[0].cols.empty())
+      return OcRes{pm.cases[0].act, {}};           // leaf: rows below are dead
+    if (pm.cases.empty()) return oc_comp_exit(partial, ctx, pm.def);
+    auto [first, nexts] = oc_split_or(pm.cases, pm.argpos, pm.def);
+    return oc_comp_match_handlers(partial, ctx, first.me, nexts);
+  }
+  // comp_fun selector: the top-level (flattened) pms go back through the FULL
+  // split pipeline (matching.ml compile_flattened -> compile_match_nonempty);
+  // inner precompiled halves dispatch directly (do_compile_matching).
+  std::optional<OcRes> oc_comp_fun(bool flattened, const OcPartial& partial, const OcCtx& ctx,
+                                   const OcPmhPtr& pmh) {
+    if (!flattened) return oc_do_compile_matching(partial, ctx, pmh);
+    if (pmh->kind == 0) return oc_compile_match(partial, ctx, pmh->pm);
+    // FPmOr: body still carries or-heads -> full compile, then or handlers
+    auto r = oc_compile_match(partial, ctx, pmh->body);
+    if (!r) return std::nullopt;
+    return oc_compile_orhandlers(partial, r->lam, r->jumps, ctx, pmh->handlers);
+  }
+  std::optional<OcRes> oc_comp_match_handlers(const OcPartial& partial, const OcCtx& ctx,
+                                              const OcPmhPtr& first, const OcNexts& nexts,
+                                              bool flattened = false) {
+    if (nexts.empty()) return oc_comp_fun(flattened, partial, ctx, first);
+    auto fr = oc_comp_fun(flattened, {false, partial.glob_total}, ctx, first);
+    if (!fr) {
+      OcNexts rest(nexts.begin() + 1, nexts.end());
+      return oc_comp_match_handlers(partial, ctx, nexts[0].second, rest, flattened);
+    }
+    LamPtr body = fr->lam; OcJumps jumps = fr->jumps;
+    for (size_t idx = 0; idx < nexts.size(); ++idx) {
+      int i = nexts[idx].first;
+      OcJumps jrem = jumps;
+      OcCtx ctx_i = oc_jumps_extract(jrem, i);
+      if (ctx_i.empty()) continue;                 // keep jumps un-extracted
+      OcPartial p2{idx + 1 == nexts.size() ? partial.cur_total : false, partial.glob_total};
+      auto r = oc_comp_fun(flattened, p2, ctx_i, nexts[idx].second);
+      auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = i;
+      if (!r) { c->then_ = cint(0); jumps = std::move(jrem); }
+      else { c->then_ = r->lam; jumps = oc_jumps_union(r->jumps, jrem); }
+      body = c;
+    }
+    return OcRes{body, std::move(jumps)};
+  }
+  std::optional<OcRes> oc_do_compile_matching(const OcPartial& partial, const OcCtx& ctx,
+                                              const OcPmhPtr& pmh) {
+    if (pmh->kind == 1) {                          // PmVar
+      auto r = oc_do_compile_matching(partial, oc_ctx_lshift(ctx), pmh->inside);
+      if (!r) return std::nullopt;
+      r->jumps = oc_jumps_map([](const OcCtx& c) { return oc_ctx_rshift(c); }, r->jumps);
+      return r;
+    }
+    if (pmh->kind == 2) {                          // PmOr: compile_match_simplified
+      auto [first, nexts] = oc_split_no_or(pmh->body.cases, pmh->body.argpos,
+                                           pmh->body.def, {});
+      auto r = oc_comp_match_handlers(partial, ctx, first.me, nexts);
+      if (!r) return std::nullopt;
+      return oc_compile_orhandlers(partial, r->lam, r->jumps, ctx, pmh->handlers);
+    }
+    const OcPm& pm = pmh->pm;
+    if (pm.cases[0].cols[0].omega) {               // Any head: pop the column
+      OcPm inner; inner.argpos = pm.argpos + 1; inner.def = oc_def_pop_column(pm.def);
+      for (auto& c : pm.cases) {
+        OcClause n; n.cols.assign(c.cols.begin() + 1, c.cols.end()); n.act = c.act;
+        inner.cases.push_back(std::move(n));
+      }
+      auto r = oc_compile_match(partial, oc_ctx_lshift(ctx), inner);
+      if (!r) return std::nullopt;
+      r->jumps = oc_jumps_map([](const OcCtx& c) { return oc_ctx_rshift(c); }, r->jumps);
+      return r;
+    }
+    // Constant-constructor column: divide into per-tag cells (first-occurrence
+    // order), compile each under its specialized ctx/default, then combine.
+    std::vector<int> cell_tags;
+    for (auto& c : pm.cases) {
+      int t = c.cols[0].alts[0];
+      if (std::find(cell_tags.begin(), cell_tags.end(), t) == cell_tags.end())
+        cell_tags.push_back(t);
+    }
+    if (cppcaml::dbg_env("OCDBG")) {
+      fprintf(stderr, "[OC] Pm argpos=%d rows=%zu cells:", pm.argpos, pm.cases.size());
+      for (int t : cell_tags) fprintf(stderr, " %d", t);
+      fprintf(stderr, " | row heads:");
+      for (auto& c : pm.cases)
+        fprintf(stderr, " %s", c.cols[0].omega ? "w" : std::to_string(c.cols[0].alts[0]).c_str());
+      fprintf(stderr, "\n");
+    }
+    std::vector<std::pair<int, LamPtr>> cells;
+    OcJumps total;
+    for (int t : cell_tags) {
+      OcCtx cctx = oc_ctx_specialize(t, ctx);
+      if (cctx.empty()) continue;
+      OcPm cpm; cpm.argpos = pm.argpos + 1; cpm.def = oc_def_specialize(t, pm.def);
+      for (auto& c : pm.cases) {
+        if (c.cols[0].alts[0] != t) continue;
+        OcClause n; n.cols.assign(c.cols.begin() + 1, c.cols.end()); n.act = c.act;
+        cpm.cases.push_back(std::move(n));
+      }
+      auto r = oc_compile_match(partial, cctx, cpm);
+      if (!r) continue;                            // Unused cell
+      cells.push_back({t, r->lam});
+      total = oc_jumps_union(total,
+          oc_jumps_map([](const OcCtx& c) { return oc_ctx_combine(c); }, r->jumps));
+    }
+    if (cells.empty()) {                           // mk_failaction_neg
+      if (partial.cur_total) return std::nullopt;  // Unused
+      return oc_comp_exit(partial, ctx, pm.def);
+    }
+    return oc_combine_constructor(partial, ctx, pm, std::move(cells), std::move(total));
+  }
+  std::optional<OcRes> oc_combine_constructor(const OcPartial& partial, const OcCtx& ctx,
+                                              const OcPm& pm,
+                                              std::vector<std::pair<int, LamPtr>> cells,
+                                              OcJumps total) {
+    int nc = oc_nc_[pm.argpos];
+    OcJumps local;
+    std::vector<std::pair<int, LamPtr>> fails;
+    if ((int)cells.size() != nc) {                 // mk_failaction_pos
+      uint32_t seen = 0;
+      for (auto& [t, _] : cells) seen |= 1u << t;
+      std::vector<std::pair<int, OcCtx>> fail_pats;
+      for (int t = 0; t < nc; ++t) {
+        if ((seen >> t) & 1) continue;
+        OcCtx c = oc_ctx_lub(oc_const(t), ctx);
+        if (!c.empty()) fail_pats.push_back({t, std::move(c)});
+      }
+      size_t env_i = 0;
+      while (!fail_pats.empty() && env_i < pm.def.env.size()) {
+        auto& [idef, mat] = pm.def.env[env_i++];
+        std::vector<std::pair<int, OcCtx>> later;
+        OcPat now_pat; now_pat.omega = false;      // or of the tags routed here
+        bool any_now = false;
+        for (auto& fp : fail_pats) {
+          if (oc_ctx_matches(fp.second, mat)) {
+            fails.push_back({fp.first, oc_exit(idef)});
+            now_pat.alts.push_back(fp.first); now_pat.set |= 1u << fp.first;
+            any_now = true;
+          } else later.push_back(std::move(fp));
+        }
+        fail_pats = std::move(later);
+        if (any_now) oc_jumps_add(local, idef, oc_ctx_lub(now_pat, ctx));
+      }
+      if (!fail_pats.empty() && !partial.glob_total) {
+        for (auto& fp : fail_pats) fails.push_back({fp.first, oc_exit(pm.def.final_exit)});
+        local.partial = true;
+      }
+    }
+    // descr_lambda_list = fails @ cells; collapse when every action is the same.
+    std::vector<std::pair<int, LamPtr>> all = fails;
+    all.insert(all.end(), cells.begin(), cells.end());
+    OcJumps out = oc_jumps_union(local, total);
+    bool all_same = true;
+    for (auto& [t, a] : all)
+      if (!oc_same_action(a, all[0].second)) { all_same = false; break; }
+    if (all_same) return OcRes{all[0].second, std::move(out)};
+    std::sort(all.begin(), all.end(),
+              [](auto& a, auto& b) { return a.first < b.first; });
+    return OcRes{oc_call_switcher(oc_comps_[pm.argpos], all), std::move(out)};
+  }
+  std::optional<OcRes> oc_compile_orhandlers(const OcPartial& partial, LamPtr r, OcJumps total,
+                                             const OcCtx& ctx,
+                                             const std::vector<OcHandler>& handlers) {
+    for (auto& h : handlers) {
+      int n = h.provenance.empty() ? 0 : (int)h.provenance[0].size();
+      OcCtx hctx = oc_ctx_select_columns(h.provenance, ctx);
+      auto res = oc_compile_match(partial, hctx, h.pm);
+      if (!res) {                                  // Unused handler
+        auto c = mk(Lam::K::Catch); c->cond = r; c->prim_arg = h.exit; c->then_ = cint(0);
+        r = c;
+        continue;
+      }
+      if (oc_is_exit(r)) {
+        if (r->prim_arg == h.exit) {
+          // whole body is a direct exit to this handler: inline, drop the rest
+          return OcRes{res->lam,
+              oc_jumps_map([&](const OcCtx& c) { return oc_ctx_rshift_num(n, c); }, res->jumps)};
+        }
+        continue;                                  // handler dead
+      }
+      auto c = mk(Lam::K::Catch); c->cond = r; c->prim_arg = h.exit; c->then_ = res->lam;
+      r = c;
+      OcJumps t2 = total; t2.env.erase(h.exit);
+      total = oc_jumps_union(t2,
+          oc_jumps_map([&](const OcCtx& cc) { return oc_ctx_rshift_num(n, cc); }, res->jumps));
+    }
+    return OcRes{r, std::move(total)};
+  }
+  // ---- call_switcher: as_interval_nofail + Switch.Make(SArg).zyva ----
+  LamPtr oc_call_switcher(const LamPtr& scrut, const std::vector<std::pair<int, LamPtr>>& cases) {
+    // store: dedup actions by make_key; a re-stored action becomes Shared.
+    std::vector<LamPtr> acts; std::vector<bool> shared;
+    auto store = [&](const LamPtr& a, bool force_shared) {
+      for (size_t i = 0; i < acts.size(); ++i)
+        if (oc_same_action(acts[i], a)) { shared[i] = true; return (int)i; }
+      acts.push_back(a); shared.push_back(force_shared);
+      return (int)acts.size() - 1;
+    };
+    bool some_hole = false;
+    for (size_t i = 0; i + 1 < cases.size(); ++i)
+      if (cases[i + 1].first > cases[i].first + 1) some_hole = true;
+    std::vector<SwCase> inters;
+    {
+      int idx0 = store(cases[0].second, some_hole);
+      long long cur_low = cases[0].first, cur_high = cases[0].first;
+      int cur_act = idx0;
+      for (size_t i = 1; i < cases.size(); ++i) {
+        int ai = store(cases[i].second, false);
+        if (ai == cur_act) { cur_high = cases[i].first; continue; }
+        inters.push_back({cur_low, cur_high, cur_act});
+        cur_low = cur_high = cases[i].first; cur_act = ai;
+      }
+      inters.push_back({cur_low, cur_high, cur_act});
+    }
+    // abstract_shared: wrap each Shared non-exit action once; use exits in place.
+    std::vector<std::pair<int, LamPtr>> wraps;    // (exit, handler), array order
+    for (size_t i = 0; i < acts.size(); ++i) {
+      if (!shared[i]) continue;
+      if (oc_is_exit(acts[i])) continue;          // make_catch_delayed reuses the exit
+      int e = oc_alloc_exit();
+      wraps.push_back({e, acts[i]});
+      acts[i] = oc_exit(e);
+    }
+    // cluster + test tree (edges = first/last case value; tags are small).
+    sw_ok_inter_ = true;
+    sw_memo_.clear();
+    std::vector<int> kk; comp_clusters(inters, kk);
+    std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts;
+    // fresh copy per bare-exit emission so no Staticraise node is shared.
+    auto emit_act = [this, &acts](int idx) -> LamPtr {
+      if (oc_is_exit(acts[idx])) return oc_exit(acts[idx]->prim_arg);
+      return acts[idx];
+    };
+    {
+      std::unordered_map<int, int> single_idx;
+      std::vector<SwCase> rev;
+      int j = (int)inters.size() - 1;
+      while (true) {
+        int i = kk[j];
+        if (i == j) {
+          auto it = single_idx.find(inters[i].act);
+          int ci;
+          if (it != single_idx.end()) ci = it->second;
+          else {
+            ci = (int)cl_acts.size();
+            int aidx = inters[i].act;
+            cl_acts.push_back([emit_act, aidx](const SwCtx&) { return emit_act(aidx); });
+            single_idx[inters[i].act] = ci;
+          }
+          rev.push_back({inters[i].lo, inters[i].hi, ci});
+        } else {
+          long long ll = inters[i].lo, hh = inters[j].hi;
+          int len = (int)(hh - ll + 1);
+          std::vector<int> tbl(len, 0);            // holes -> action 0 (real)
+          for (int t = i; t <= j; ++t)
+            for (long long v = inters[t].lo; v <= inters[t].hi; ++v)
+              tbl[v - ll] = inters[t].act;
+          int ci = (int)cl_acts.size();
+          cl_acts.push_back([this, ll, len, tbl, emit_act](const SwCtx& sctx) -> LamPtr {
+            long long off2 = -ll - sctx.off;
+            LamPtr arg; Ident sv;
+            if (off2 == 0) arg = sctx.arg;
+            else { sv = fresh("switcher"); arg = varof(sv); }
+            // SArg.make_switch: any action used by >1 slot is shared behind one
+            // catch, its slots becoming exits (bare exits are reused as-is).
+            std::map<int, int> uses;
+            for (int s = 0; s < len; ++s) uses[tbl[s]]++;
+            std::vector<std::pair<int, LamPtr>> swraps;
+            std::map<int, LamPtr> slot_act;        // idx -> per-slot template
+            for (auto& [aidx, cnt] : uses) {
+              if (cnt > 1 && !oc_is_exit(emit_act(aidx))) {
+                int e = oc_alloc_exit();
+                swraps.push_back({e, emit_act(aidx)});
+                slot_act[aidx] = oc_exit(e);
+              }
+            }
+            auto sw = mk(Lam::K::Switch); sw->cond = arg;
+            for (int s = 0; s < len; ++s) {
+              auto it = slot_act.find(tbl[s]);
+              LamPtr a = it != slot_act.end() ? oc_exit(it->second->prim_arg)
+                                              : emit_act(tbl[s]);
+              sw->sw_consts.push_back({s, a});
+            }
+            LamPtr resl = sw;
+            for (auto& [e, hh2] : swraps) {
+              auto c = mk(Lam::K::Catch); c->cond = resl; c->prim_arg = e; c->then_ = hh2;
+              resl = c;
+            }
+            if (off2 != 0) {
+              auto offn = mk(Lam::K::Prim); offn->prim = Prim::Offsetint;
+              offn->prim_arg = (int)off2; offn->args = {sctx.arg};
+              auto l = mk(Lam::K::Let);
+              l->bindings = {{sv, ValueKind::Gen, offn, /*alias=*/true}};
+              l->body = resl; resl = l;
+            }
+            return resl;
+          });
+          rev.push_back({inters[i].lo, inters[j].hi, ci});
+        }
+        if (i <= 0) break;
+        j = i - 1;
+      }
+      cl_cases.assign(rev.rbegin(), rev.rend());
+    }
+    LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
+    for (auto it = wraps.rbegin(); it != wraps.rend(); ++it) {  // later wrap = outer
+      if (oc_is_exit(tree) && tree->prim_arg == it->first) { tree = it->second; continue; }
+      auto c = mk(Lam::K::Catch); c->cond = tree; c->prim_arg = it->first; c->then_ = it->second;
+      tree = c;
+    }
+    return tree;
+  }
+  // ---- local Simplif.simplify_exits (alias / dead / single-use), own exits only --
+  void oc_count_exits(const LamPtr& l, std::map<int, int>& cnt) {
+    if (!l) return;
+    if (l->k == Lam::K::Staticraise) {
+      if (oc_my_exits_.count(l->prim_arg)) cnt[l->prim_arg]++;
+      for (auto& a : l->args) oc_count_exits(a, cnt);
+      return;
+    }
+    if (l->k == Lam::K::Catch && oc_my_exits_.count(l->prim_arg)) {
+      oc_count_exits(l->cond, cnt);
+      int i = l->prim_arg;
+      if (l->catch_vars.empty() && oc_is_exit(l->then_)) {   // alias: i's uses become j's
+        if (oc_my_exits_.count(l->then_->prim_arg)) cnt[l->then_->prim_arg] += cnt[i];
+        return;
+      }
+      if (cnt[i] > 0) oc_count_exits(l->then_, cnt);         // dead handler: skip
+      return;
+    }
+    oc_count_exits(l->fn, cnt); oc_count_exits(l->body, cnt);
+    oc_count_exits(l->cond, cnt); oc_count_exits(l->then_, cnt);
+    oc_count_exits(l->else_, cnt); oc_count_exits(l->sw_default, cnt);
+    for (auto& a : l->args) oc_count_exits(a, cnt);
+    for (auto& b : l->bindings) oc_count_exits(b.val, cnt);
+    for (auto& sc : l->sw_consts) oc_count_exits(sc.body, cnt);
+    for (auto& sc : l->sw_blocks) oc_count_exits(sc.body, cnt);
+  }
+  void oc_simplif_exits(LamPtr& l, std::map<int, int>& cnt, std::map<int, LamPtr>& subst) {
+    if (!l) return;
+    if (l->k == Lam::K::Staticraise && l->args.empty()) {
+      auto it = subst.find(l->prim_arg);
+      if (it != subst.end())
+        l = oc_is_exit(it->second) ? oc_exit(it->second->prim_arg)  // fresh per site
+                                   : it->second;
+      return;
+    }
+    if (l->k == Lam::K::Catch && oc_my_exits_.count(l->prim_arg) && l->catch_vars.empty()) {
+      int i = l->prim_arg;
+      if (oc_is_exit(l->then_)) {                  // alias rule (any use count)
+        oc_simplif_exits(l->then_, cnt, subst);
+        subst[i] = l->then_;
+        LamPtr b = l->cond; oc_simplif_exits(b, cnt, subst); l = b;
+        return;
+      }
+      if (cnt[i] == 0) { LamPtr b = l->cond; oc_simplif_exits(b, cnt, subst); l = b; return; }
+      if (cnt[i] == 1) {                           // inline the single use
+        oc_simplif_exits(l->then_, cnt, subst);
+        subst[i] = l->then_;
+        LamPtr b = l->cond; oc_simplif_exits(b, cnt, subst); l = b;
+        return;
+      }
+      oc_simplif_exits(l->cond, cnt, subst);
+      oc_simplif_exits(l->then_, cnt, subst);
+      return;
+    }
+    oc_simplif_exits(l->fn, cnt, subst); oc_simplif_exits(l->body, cnt, subst);
+    oc_simplif_exits(l->cond, cnt, subst); oc_simplif_exits(l->then_, cnt, subst);
+    oc_simplif_exits(l->else_, cnt, subst); oc_simplif_exits(l->sw_default, cnt, subst);
+    for (auto& a : l->args) oc_simplif_exits(a, cnt, subst);
+    for (auto& b : l->bindings) oc_simplif_exits(b.val, cnt, subst);
+    for (auto& sc : l->sw_consts) oc_simplif_exits(sc.body, cnt, subst);
+    for (auto& sc : l->sw_blocks) oc_simplif_exits(sc.body, cnt, subst);
+  }
+  // ---- the tuple (1-column) stage: rows are or-trees of k-tuples ----
+  struct OcTopRow { std::vector<OcRow> alts; bool any_head; LamPtr act; };
+  using OcTopMatrix = std::vector<std::vector<OcRow>>;   // 1-col: each row = its alts
+  using OcTopEnv = std::vector<std::pair<int, OcTopMatrix>>;
+  struct OcTopPm { std::vector<OcTopRow> cases; OcTopEnv env; };
+  struct OcTopHandler { std::vector<OcRow> orp_alts; int exit; std::vector<LamPtr> acts; };
+  struct OcTopPmh {
+    int kind = 0;                                  // 0 Pm, 2 PmOr
+    OcTopPm pm;                                    // kind 0
+    OcTopPm body; std::vector<OcTopHandler> handlers;  // kind 2
+  };
+  using OcTopPmhPtr = std::shared_ptr<OcTopPmh>;
+  struct OcTopInfo { OcTopPmhPtr me; OcTopMatrix matrix; OcTopEnv top_env; };
+  using OcTopNexts = std::vector<std::pair<int, OcTopPmhPtr>>;
+  static bool oc_top_compat(const std::vector<OcRow>& a, const std::vector<OcRow>& b) {
+    for (auto& x : a) for (auto& y : b) if (oc_compats(x, y)) return true;
+    return false;
+  }
+  static bool oc_top_equiv(const std::vector<OcRow>& a, const std::vector<OcRow>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+      for (size_t c = 0; c < a[i].size(); ++c)
+        if (!oc_equiv(a[i][c], b[i][c])) return false;
+    return true;
+  }
+  bool oc_top_safe_before(const OcTopRow& r, const std::vector<OcTopRow>& l) {
+    for (auto& q : l) {
+      if (oc_same_action(r.act, q.act)) continue;
+      if (oc_top_compat(r.alts, q.alts)) return false;
+    }
+    return true;
+  }
+  struct OcTopSplitRes { OcTopInfo info; OcTopNexts nexts; };
+  OcTopSplitRes oc_top_split_or(std::vector<OcTopRow> cls, const OcTopEnv& env) {
+    std::vector<OcTopRow> before, ors, no;
+    for (auto& cl : cls) {
+      if (!oc_top_safe_before(cl, no)) { no.push_back(cl); continue; }
+      if (cl.alts.size() == 1 && oc_top_safe_before(cl, ors)) { before.push_back(cl); continue; }
+      // Or_matrix.insert_or_append, walking most-recent-first.  The rests are
+      // empty at this stage, so safe_below always holds -- only the
+      // disjointness / equivalence conditions matter.
+      bool placed = false, to_no = false;
+      for (int idx = (int)ors.size() - 1; idx >= 0; --idx) {
+        const OcTopRow& q = ors[idx];
+        if (q.alts.size() <= 1 || !oc_top_compat(cl.alts, q.alts)) continue;
+        if (oc_top_equiv(cl.alts, q.alts)) {
+          bool ok = true;                          // insert condition: newer must be disjoint
+          for (size_t j = idx + 1; j < ors.size() && ok; ++j)
+            if (oc_top_compat(cl.alts, ors[j].alts)) ok = false;
+          if (ok) { ors.insert(ors.begin() + idx + 1, cl); placed = true; }
+          else to_no = true;
+          break;
+        }
+        // else: ordering condition (safe_below) holds trivially -> keep walking
+      }
+      if (to_no) no.push_back(cl);
+      else if (!placed) ors.push_back(cl);
+    }
+    OcTopEnv env2 = env;
+    OcTopNexts nexts;
+    if (!no.empty()) {
+      OcTopSplitRes r2 = oc_top_split_or(std::move(no), env);
+      int idef = oc_alloc_exit();
+      env2 = r2.info.top_env;
+      env2.insert(env2.begin(), {idef, r2.info.matrix});
+      nexts.push_back({idef, r2.info.me});
+      nexts.insert(nexts.end(), r2.nexts.begin(), r2.nexts.end());
+    }
+    if (ors.empty())
+      return oc_top_split_no_or(std::move(before), env2, std::move(nexts));
+    return oc_top_precompile_or(std::move(before), std::move(ors), env2, std::move(nexts));
+  }
+  OcTopSplitRes oc_top_split_no_or(std::vector<OcTopRow> cls, const OcTopEnv& env,
+                                   OcTopNexts k) {
+    std::function<OcTopSplitRes(std::vector<OcTopRow>)> split =
+        [&](std::vector<OcTopRow> cs) -> OcTopSplitRes {
+      bool discr_any = cs[0].any_head;
+      std::vector<OcTopRow> yes, no;
+      for (size_t i = 0; i < cs.size(); ++i) {
+        const OcTopRow& cl = cs[i];
+        // extra division: last row is `_` (head Any; no rests at this stage)
+        if (i + 1 == cs.size() && !yes.empty() && cl.any_head) { no.push_back(cl); break; }
+        bool groups = discr_any ? cl.any_head : true;  // Tuple groups Tuple|Any
+        if (groups && oc_top_safe_before(cl, no)) yes.push_back(cl);
+        else no.push_back(cl);
+      }
+      auto mk_pm = [&](std::vector<OcTopRow> y, OcTopEnv e, OcTopNexts nx) -> OcTopSplitRes {
+        auto me = std::make_shared<OcTopPmh>();
+        OcTopMatrix m;
+        for (auto& r : y) m.push_back(r.alts);
+        me->kind = 0; me->pm = {std::move(y), e};
+        return {{me, std::move(m), std::move(e)}, std::move(nx)};
+      };
+      if (no.empty()) return mk_pm(std::move(yes), env, k);   // deepest call threads k
+      OcTopSplitRes r2 = split(std::move(no));
+      int idef = oc_alloc_exit();
+      OcTopEnv e2 = r2.info.top_env;
+      e2.insert(e2.begin(), {idef, r2.info.matrix});
+      OcTopNexts nn;
+      nn.push_back({idef, r2.info.me});
+      nn.insert(nn.end(), r2.nexts.begin(), r2.nexts.end());  // r2.nexts ends with k
+      return mk_pm(std::move(yes), std::move(e2), std::move(nn));
+    };
+    return split(std::move(cls));
+  }
+  OcTopSplitRes oc_top_precompile_or(std::vector<OcTopRow> cls, std::vector<OcTopRow> ors,
+                                     const OcTopEnv& env, OcTopNexts k) {
+    std::vector<OcTopRow> body = cls;
+    std::vector<OcTopHandler> handlers;
+    for (size_t i = 0; i < ors.size(); ++i) {
+      if (ors[i].alts.size() == 1) { body.push_back(ors[i]); continue; }
+      OcTopHandler h; h.orp_alts = ors[i].alts; h.acts = {ors[i].act};
+      while (i + 1 < ors.size() && ors[i + 1].alts.size() > 1 &&
+             oc_top_equiv(ors[i].alts, ors[i + 1].alts)) {
+        ++i; h.acts.push_back(ors[i].act);
+      }
+      h.exit = oc_alloc_exit();
+      for (auto& alt : h.orp_alts) {
+        OcTopRow n; n.alts = {alt}; n.any_head = false; n.act = oc_exit(h.exit);
+        body.push_back(std::move(n));
+      }
+      handlers.push_back(std::move(h));
+    }
+    auto me = std::make_shared<OcTopPmh>();
+    OcTopMatrix m;
+    for (auto& r : cls) m.push_back(r.alts);
+    for (auto& r : ors) m.push_back(r.alts);
+    me->kind = 2; me->body = {std::move(body), env};
+    me->handlers = std::move(handlers);
+    return {{me, std::move(m), env}, std::move(k)};
+  }
+  // flatten a top matrix (1-col or-of-tuples) into a k-col matrix
+  static OcMatrix oc_top_flatten_matrix(const OcTopMatrix& tm) {
+    OcMatrix m;
+    for (auto& row : tm)
+      for (auto& alt : row) m.push_back(alt);
+    return m;
+  }
+  OcPmhPtr oc_top_flatten(const OcTopPmhPtr& t, int final_exit) {
+    auto flat_pm = [&](const OcTopPm& pm) {
+      OcPm p; p.argpos = 0; p.def.final_exit = final_exit;
+      for (auto& [i, tm] : pm.env) p.def.env.push_back({i, oc_top_flatten_matrix(tm)});
+      for (auto& r : pm.cases)
+        for (auto& alt : r.alts) p.cases.push_back({alt, r.act});
+      return p;
+    };
+    auto r = std::make_shared<OcPmh>();
+    if (t->kind == 0) {
+      r->kind = 0; r->pm = flat_pm(t->pm);
+      r->matrix = oc_as_matrix(r->pm.cases);
+      return r;
+    }
+    r->kind = 2; r->body = flat_pm(t->body);
+    r->matrix = oc_as_matrix(r->body.cases);
+    for (auto& h : t->handlers) {
+      OcHandler nh;
+      for (auto& alt : h.orp_alts) { nh.provenance.push_back(alt); r->matrix.push_back(alt); }
+      nh.exit = h.exit;
+      nh.pm.argpos = (int)oc_comps_.size();        // zero remaining columns
+      for (auto& a : h.acts) nh.pm.cases.push_back({OcRow{}, a});
+      nh.pm.def.final_exit = final_exit;           // width-0 env, unused at leaves
+      r->handlers.push_back(std::move(nh));
+    }
+    return r;
+  }
+  // exhaustiveness over the constant domain (exact)
+  bool oc_covers(const std::vector<OcRow>& rows, size_t col) {
+    if (rows.empty()) return false;
+    if (col == oc_nc_.size()) return true;
+    for (int t = 0; t < oc_nc_[col]; ++t) {
+      std::vector<OcRow> sub;
+      for (auto& r : rows)
+        if (r[col].omega || ((r[col].set >> t) & 1)) sub.push_back(r);
+      if (!oc_covers(sub, col + 1)) return false;
+    }
+    return true;
+  }
+  // ---- entry: gate, compile pieces, run the port, local simplify ----
+  LamPtr oc_tuple_match(const Pexp_tuple* tu, const std::vector<Row>& vrows,
+                        const Location& mloc) {
+    size_t k = tu->elems.size();
+    if (k < 2 || k > 6 || vrows.empty() || vrows.size() > 32) return nullptr;
+    for (auto& lbl : tu->labels) if (lbl) return nullptr;
+    // 1) validate shapes; collect column ctor patterns (no side effects yet)
+    struct SrcAlt { std::vector<const Pattern*> cols; bool is_any; };
+    struct SrcRow { std::vector<SrcAlt> alts; const Expression* rhs; };
+    std::vector<SrcRow> srcs;
+    size_t total_alts = 0;
+    for (auto& r : vrows) {
+      if (r.guard) return nullptr;
+      std::vector<const Pattern*> leaves;
+      flatten_or(r.lhs, leaves);
+      SrcRow sr; sr.rhs = r.rhs;
+      for (auto* l : leaves) {
+        const Pattern* ep = effective_pat(l);
+        if (std::holds_alternative<Ppat_any>(ep->desc)) {
+          if (leaves.size() > 1) return nullptr;   // `_` as an or-alternative: bail
+          SrcAlt a; a.is_any = true; a.cols.assign(k, nullptr);
+          sr.alts.push_back(std::move(a));
+          continue;
+        }
+        auto* tp = std::get_if<Ppat_tuple>(&ep->desc);
+        if (!tp || tp->elems.size() != k || tp->closed != ClosedFlag::Closed) return nullptr;
+        for (auto& lbl : tp->labels) if (lbl) return nullptr;
+        SrcAlt a; a.is_any = false;
+        for (auto& el : tp->elems) a.cols.push_back(el.get());
+        sr.alts.push_back(std::move(a));
+      }
+      total_alts += sr.alts.size();
+      if (total_alts > 64) return nullptr;
+      srcs.push_back(std::move(sr));
+    }
+    // per-column: every leaf a constant ctor of one shared constant-only type
+    struct ColCtor { const Pattern* pat; std::string name; };
+    std::vector<int> col_nc(k, 0);
+    std::vector<std::vector<std::vector<std::vector<int>>>> tags(srcs.size());
+    // tags[row][alt][col] = leaf tag list ({} = omega)
+    for (size_t c = 0; c < k; ++c) {
+      std::string type;
+      std::vector<const Pattern*> ctor_pats;
+      for (auto& sr : srcs)
+        for (auto& a : sr.alts) {
+          if (a.is_any) continue;
+          const Pattern* p = effective_pat(a.cols[c]);
+          std::vector<const Pattern*> cl;
+          flatten_or(p, cl);
+          for (auto* q : cl) {
+            const Pattern* eq = effective_pat(q);
+            if (std::holds_alternative<Ppat_any>(eq->desc)) {
+              if (cl.size() > 1) return nullptr;   // `_` under an or: bail
+              continue;
+            }
+            auto* pc = std::get_if<Ppat_construct>(&eq->desc);
+            if (!pc || pc->arg) return nullptr;
+            std::string cn = ctor_of(*eq);
+            if (exn_typed_pat(eq, cn)) return nullptr;
+            const CtorInfo* ci = pat_ctor_resolve(eq, cn);
+            if (!ci || ci->is_block || ci->unboxed) return nullptr;
+            if (type.empty()) type = ci->type;
+            else if (type != ci->type) return nullptr;
+            ctor_pats.push_back(eq);
+          }
+        }
+      if (type.empty()) { col_nc[c] = 1; continue; }  // all-omega column
+      auto tc = type_ctors_.find(type);
+      if (tc == type_ctors_.end()) return nullptr;
+      int NC = tc->second.first, NB = tc->second.second;
+      if (NB != 0 || NC < 1 || NC > 30) return nullptr;
+      // consistency: every column ctor resolves (with the type hint) to a tag < NC
+      for (auto* p : ctor_pats) {
+        const CtorInfo* ci = pat_ctor_resolve(p, ctor_of(*p), type);
+        if (!ci || ci->is_block || ci->tag < 0 || ci->tag >= NC) return nullptr;
+      }
+      col_nc[c] = NC;
+    }
+    // resolve tags per row/alt/col
+    for (size_t ri = 0; ri < srcs.size(); ++ri) {
+      auto& sr = srcs[ri];
+      tags[ri].resize(sr.alts.size());
+      for (size_t ai = 0; ai < sr.alts.size(); ++ai) {
+        tags[ri][ai].resize(k);
+        if (sr.alts[ai].is_any) continue;          // all omega
+        for (size_t c = 0; c < k; ++c) {
+          const Pattern* p = effective_pat(sr.alts[ai].cols[c]);
+          std::vector<const Pattern*> cl;
+          flatten_or(p, cl);
+          bool any = false;
+          std::vector<int> ts;
+          for (auto* q : cl) {
+            const Pattern* eq = effective_pat(q);
+            if (std::holds_alternative<Ppat_any>(eq->desc)) { any = true; break; }
+            const CtorInfo* ci = pat_ctor_resolve(eq, ctor_of(*eq));
+            const CtorInfo* c2 = ci;               // re-resolve with the hint
+            if (ci) c2 = pat_ctor_resolve(eq, ctor_of(*eq), ci->type);
+            if (!c2) return nullptr;
+            ts.push_back(c2->tag);
+          }
+          if (!any) tags[ri][ai][c] = std::move(ts);
+        }
+      }
+    }
+    // no bindings anywhere (vars/aliases) -- checked by construction: any var or
+    // alias pattern fails effective_pat's construct/tuple/any tests above.
+    {  // keep the exhaustiveness check exact but bounded
+      long long prod = 1;
+      for (int nc : col_nc) { prod *= nc; if (prod > 4096) return nullptr; }
+    }
+    // 2) side effects begin: components, then arm bodies (source order).
+    // NB: arm bodies may re-enter this function (nested tuple matches), so the
+    // per-match members are only set AFTER everything below is compiled.
+    std::vector<Lam::Binding> temps;
+    std::vector<LamPtr> comps;
+    for (auto& el : tu->elems) {
+      LamPtr v = expr(*el);
+      if (v->k != Lam::K::Var) {
+        Ident t = fresh("", true);
+        temps.push_back({t, expr_kind(el.get()), v});
+        v = varof(t);
+      }
+      comps.push_back(v);
+    }
+    std::vector<LamPtr> acts;
+    for (auto& sr : srcs) acts.push_back(expr(*sr.rhs));
+    oc_nc_ = col_nc;
+    oc_comps_ = comps;
+    oc_my_exits_.clear();
+    // build top rows
+    auto mk_pat = [&](const std::vector<int>& ts) -> OcPat {
+      if (ts.empty()) return oc_omega();
+      OcPat p; p.omega = false; p.alts = ts;
+      for (int t : ts) p.set |= 1u << t;
+      return p;
+    };
+    std::vector<OcTopRow> top;
+    std::vector<OcRow> all_alt_rows;
+    for (size_t ri = 0; ri < srcs.size(); ++ri) {
+      OcTopRow tr; tr.act = acts[ri];
+      tr.any_head = srcs[ri].alts.size() == 1 && srcs[ri].alts[0].is_any;
+      for (size_t ai = 0; ai < srcs[ri].alts.size(); ++ai) {
+        OcRow row;
+        for (size_t c = 0; c < k; ++c) row.push_back(mk_pat(tags[ri][ai][c]));
+        all_alt_rows.push_back(row);
+        tr.alts.push_back(std::move(row));
+      }
+      top.push_back(std::move(tr));
+    }
+    bool total_match = oc_covers(all_alt_rows, 0);
+    int final_exit = oc_alloc_exit();
+    // 3) split / flatten / compile
+    OcTopSplitRes ts = oc_top_split_or(std::move(top), {});
+    OcPmhPtr first = oc_top_flatten(ts.info.me, final_exit);
+    OcNexts nexts;
+    for (auto& [e, tp] : ts.nexts)
+      nexts.push_back({e, oc_top_flatten(tp, final_exit)});
+    OcPartial partial{total_match, total_match};
+    auto res = oc_comp_match_handlers(partial, oc_ctx_start(k), first, nexts,
+                                      /*flattened=*/true);
+    if (!res) return nullptr;                      // cannot happen; be safe
+    LamPtr lam = res->lam;
+    if (res->jumps.partial) {
+      auto c = mk(Lam::K::Catch); c->cond = lam; c->prim_arg = final_exit;
+      c->then_ = raise_predef("Match_failure", mloc, "oc_tuple_dft");
+      lam = c;
+    }
+    // 4) local Simplif.simplify_exits replay over this subtree
+    {
+      std::map<int, int> cnt; std::map<int, LamPtr> subst;
+      oc_count_exits(lam, cnt);
+      oc_simplif_exits(lam, cnt, subst);
+    }
+    if (!temps.empty()) {
+      auto l = mk(Lam::K::Let); l->bindings = std::move(temps); l->body = lam;
+      lam = l;
+    }
+    return lam;
+  }
   LamPtr gmatch_tuple_top(const Pexp_tuple* tu, const std::vector<Row>& vrows,
                           const Location& mloc) {
     size_t k = tu->elems.size();
@@ -13309,6 +14503,11 @@ struct Translator {
       // column-by-column without building the tuple.
       if (frows.empty() && !vrows.empty())
         if (auto* tu = std::get_if<Pexp_tuple>(&m->e->desc)) {
+          // Constant-ctor columns first: the faithful matching.ml port emits
+          // ocamlc's exact or-pattern context-splitting shape for this domain.
+          if (erows.empty())
+            if (LamPtr r = oc_tuple_match(tu, vrows, e.loc))
+              return r;
           if (LamPtr r = multi_match(tu, vrows, erows, e.loc))
             return r;
           if (erows.empty())
