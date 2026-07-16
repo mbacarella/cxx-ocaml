@@ -7318,6 +7318,14 @@ struct Translator {
   // rhs of a non-binding or-alternation being shared behind a static catch:
   // rows citing it compile to (exit N) instead of duplicating the action.
   std::map<const Expression*, int> exn_shared_exit_;
+  // rhs shared between a value arm and an exception arm of one mixed
+  // value/exception or-pattern (`| exception E | () -> body`): ocamlc emits the
+  // body ONCE behind an outer catch and both the value-match arm and the exn
+  // dispatch (exit N) to it, rather than duplicating the action on each side.
+  // Consulted at the top of expr(), the single choke every arm body flows
+  // through, so both the value matcher and exn_case_body redirect to the exit
+  // without threading a map through every value-dispatch path.
+  std::map<const Expression*, int> shared_action_exit_;
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
                        const Expression& rhs,
                        std::vector<PayloadTest>* tests = nullptr,
@@ -12970,6 +12978,14 @@ struct Translator {
   }
 
   LamPtr expr(const Expression& e) {
+    // A body shared between the value and exception arm of a mixed or-pattern
+    // is emitted once behind an outer catch; every citation compiles to its
+    // (exit N).  Registered only while that arm's two sides are being built and
+    // erased before the shared body itself is compiled, so this never fires on
+    // the handler body.
+    if (auto it = shared_action_exit_.find(&e); it != shared_action_exit_.end()) {
+      auto sr = mk(Lam::K::Staticraise); sr->prim_arg = it->second; return sr;
+    }
     // Optional-argument erasure: a `?l:.. -> ..`-typed value used where a
     // non-optional arrow is expected is eta-expanded (None for the omitted
     // optional).  Re-enter once (guarded) to translate the inner value, wrap it.
@@ -13194,6 +13210,9 @@ struct Translator {
       //    with (N v) <value-arm match over v>)
       std::vector<Row> vrows, erows;
       std::vector<std::pair<const Ppat_effect*, const Expression*>> frows;
+      // (exit id, shared rhs) for each mixed value/exception or-pattern whose
+      // body is shared behind an outer catch (see shared_action_exit_).
+      std::vector<std::pair<int, const Expression*>> shared_wrap;
       bool eff_guard = false;
       for (auto& c : m->cases) {
         const Expression* g = c.guard ? c.guard->get() : nullptr;
@@ -13213,6 +13232,20 @@ struct Translator {
           };
           walk(&c.lhs);
           if (mixed && leaves.size() > 1) {
+            // Non-binding leaves on both sides can share ONE body behind an
+            // outer catch (ocamlc's scheme); a binding leaf would need the exit
+            // to carry args, so those keep duplicating the action.
+            bool any_bind = false;
+            for (auto* l : leaves) {
+              const Pattern* bp = l;
+              if (auto* pe2 = std::get_if<Ppat_exception>(&l->desc)) bp = pe2->p.get();
+              if (pattern_binds(bp)) { any_bind = true; break; }
+            }
+            if (!any_bind) {
+              int eid = ++next_exit_;
+              shared_action_exit_[c.rhs.get()] = eid;
+              shared_wrap.push_back({eid, c.rhs.get()});
+            }
             for (auto* l : leaves) {
               if (auto* pe2 = std::get_if<Ppat_exception>(&l->desc))
                 erows.push_back({pe2->p.get(), c.rhs.get(), nullptr});
@@ -13281,7 +13314,18 @@ struct Translator {
         scope.emplace_back();
         cat->then_ = compile_match(varof(v), vrows, e.loc, match_is_total(&e));
         scope.pop_back();
-        return cat;
+        // Wrap the value/exn dispatch in each shared-body catch: both sides
+        // already (exit N)ed to it via shared_action_exit_.  Erase the registry
+        // entries first so the handler bodies compile as themselves.
+        LamPtr res = cat;
+        for (auto& sw : shared_wrap) shared_action_exit_.erase(sw.second);
+        for (auto it = shared_wrap.rbegin(); it != shared_wrap.rend(); ++it) {
+          auto sc2 = mk(Lam::K::Catch);
+          sc2->cond = res; sc2->prim_arg = it->first;
+          sc2->then_ = expr(*it->second);
+          res = sc2;
+        }
+        return res;
       }
       // ocamlc's Matching binds a non-variable scrutinee to a fresh `*match*`
       // (Strict) before dispatching (matching.ml arg_to_var + bind_check), so the
