@@ -206,6 +206,10 @@ inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
   }
   std::string r = "(" + std::to_string((int)l->k);
   if (l->k == K::Prim) r += ":" + std::to_string((int)l->prim) + ":" + l->prim_id + ":" + std::to_string(l->prim_arg);
+  // A ConstBlock's tag lives in prim_arg; without it `[0: 0]` and `[1: 0]`
+  // (same fields, different tag) key alike and the switch Storer wrongly
+  // merges their arms -- a miscompile (Ok () vs Error 0 collapsing to one).
+  if (l->k == K::ConstBlock) r += ":" + std::to_string(l->prim_arg);
   if (exit_aware && l->k == K::Staticraise) r += ":X" + std::to_string(l->prim_arg);
   auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key(c, exit_aware); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
   add(l->fn); add(l->cond); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
