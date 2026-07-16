@@ -7160,6 +7160,24 @@ struct Checker {
     // Collect the function's known arrow spine.
     std::vector<TypePtr> spine;
     TypePtr cur = I::Engine::repr(ft);
+    // A callee whose type is a FOLDED abbreviation of an arrow -- `f : out_type
+    // Fmt.printer` with `type 'a printer = formatter -> 'a -> unit` (possibly a
+    // cross-module chain: Oprint.printer = 'a Fmt.printer ref, so `!f` is
+    // `out_type Fmt.printer`) -- must be expanded so the arguments unify against
+    // the real parameters.  Otherwise a bare type-directed constructor argument
+    // (`!Oprint.out_type ppf (Otyp_tuple ..)`, where Otyp_tuple is not in scope
+    // and resolves only by the expected `out_type`) stays an unpinned var: its
+    // inferred type is never recorded in expr_constr, and the back end lowers it
+    // to a dangling `?Otyp_tuple` free variable -- a miscompile (the value read
+    // is garbage; printtyp's constructor_arguments printed junk).  Value-kinds
+    // pass only (this feeds lowering, not the strict error pass); bounded
+    // against an abbreviation-of-abbreviation chain.
+    for (int g = 0; !strict && cur->kind == I::Type::Kind::Constr &&
+                    !a.args.empty() && g < 8; ++g) {
+      TypePtr ex = resolve_abbrev_expansion(cur->path, cur->args);
+      if (!ex) break;
+      cur = I::Engine::repr(ex);
+    }
     while (cur->kind == I::Type::Kind::Arrow) {
       spine.push_back(cur);
       cur = I::Engine::repr(cur->cod);
