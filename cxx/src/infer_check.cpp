@@ -3499,6 +3499,7 @@ struct Checker {
   bool cmi_type_is_abstract(const std::string& path) {
     if (auto it = cmi_abstract_memo_.find(path); it != cmi_abstract_memo_.end())
       return it->second;
+    cmi_abstract_memo_[path] = false;  // re-entrancy guard (manifest cycles)
     bool r = false;
     std::vector<std::string> comps = mod_components_str(path);
     if (comps.size() >= 2) try {
@@ -3506,15 +3507,47 @@ struct Checker {
       loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
       const cmi::Signature* sig = &loaded.back()->sig();
       for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+        // A functor-APPLICATION component (`Make(T)`): the member kinds come
+        // from the functor's RESULT signature.  No argument substitution is
+        // needed to judge abstractness -- a result manifest stays a manifest
+        // under substitution, and Env.find_type on a Papply preserves the
+        // decl's kind.  Unwrap one Functor layer per application.
+        std::string name = comps[i];
+        int applications = 0;
+        if (auto par = name.find('('); par != std::string::npos) {
+          for (char c : name) applications += c == '(';
+          name = name.substr(0, par);
+        }
         const cmi::ModuleDecl* md = nullptr;
-        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
-        sig = md ? module_sig(md->type, loaded) : nullptr;
+        for (auto& mm : sig->modules) if (mm.name == name) { md = &mm; break; }
+        if (!md) { sig = nullptr; break; }
+        cmi::ModuleTypePtr mt = md->type;
+        for (int a = 0; a < applications && mt; ++a)
+          mt = mt->kind == cmi::ModuleType::Functor ? mt->functor_body : nullptr;
+        sig = module_sig(mt, loaded);
       }
       if (sig)
         for (auto& td : sig->types)
           if (td.name == comps.back()) {
-            r = (td.kind == cmi::TypeDecl::Abstract ||
-                 td.kind == cmi::TypeDecl::External) && !td.manifest;
+            if (td.kind != cmi::TypeDecl::Abstract &&
+                td.kind != cmi::TypeDecl::External)
+              break;  // record/variant/open: concrete
+            if (!td.manifest) { r = true; break; }
+            // A manifest = an abbreviation: scrape_ty follows the chain to the
+            // TERMINAL decl (a strengthened cmi spells `module Set`'s member as
+            // `type t = Stdlib.Set.Make(T).t`, whose terminal is abstract).
+            // Hop through link nodes, then recurse on a dotted Tconstr head;
+            // any other shape (tuple/arrow/base) is concrete -- addr/int both
+            // take the _addr accessor in bytecode, so stopping is exact there.
+            const cmi::TypeExpr* m = td.manifest.get();
+            while (m && (m->kind == cmi::TypeExpr::Tlink ||
+                         m->kind == cmi::TypeExpr::Tsubst))
+              m = m->link.get();
+            if (m && m->kind == cmi::TypeExpr::Tconstr && m->path) {
+              std::string mp = cmi_path_str(*m->path);
+              if (mp != path && mp.find('.') != std::string::npos)
+                r = cmi_type_is_abstract(mp);
+            }
             break;
           }
     } catch (...) {}
