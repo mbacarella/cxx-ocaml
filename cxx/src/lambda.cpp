@@ -809,6 +809,12 @@ struct Translator {
   std::unordered_map<std::string, int> predef_global_stamp_;
   bool no_pervasives_ = false;  // -nopervasives: Stdlib not implicitly opened
   int next_exit_ = 0;  // static-exception ids (normalized in the dump, so value is free)
+  // When compiling a tuple-let over an if scrutinee, tail_tuple_exit binds each
+  // field-read tuple column to a fresh var before the static exit (as ocamlc's
+  // matcher does with bind_with_value_kind).  Left false for a MATCH scrutinee
+  // (whose switch arms would then fail to fold their per-arm freshly-bound
+  // shared actions into a single default) and cleared below a try/switch/catch.
+  bool bind_tuple_cols_ = false;
   // Decision-node budget for the general matrix matcher (gmatch): each gmatch call
   // is one decision-tree node, so this caps the tree size.  A combinatorial matrix
   // (a var row spreading across many tag x tag combinations, which we -- unlike
@@ -7991,9 +7997,54 @@ struct Translator {
     switch (l->k) {
       case Lam::K::Prim:
         if (l->prim == Prim::Makeblock && l->prim_arg == 0 && l->args.size() == k) {
+          // ocamlc binds each non-variable tuple column to a fresh var before
+          // the static exit (Lambda.bind_with_value_kind: a Lvar column is
+          // passed through, anything else gets a `let`), right-to-left so the
+          // last column's binding is outermost.  We inlined the field reads
+          // directly into the exit; matching the binding keeps the .cmo's
+          // push-all-then-assign shape (bytepackager's `state.events,
+          // state.debug_dirs` else-arm).
+          // Only a field-read column is let-bound; a constant or an allocation
+          // (makeblock) is left inline, matching ocamlc (`state.events,
+          // state.debug_dirs` binds both fields; `24, <makeblock>` does not).
+          auto is_field_read = [](const LamPtr& a) {
+            return a->k == Lam::K::Prim &&
+                   (a->prim == Prim::Field || a->prim == Prim::FieldImm ||
+                    a->prim == Prim::FieldInt || a->prim == Prim::FieldMut);
+          };
+          // A column tuple that just re-reads a single var's leading fields in
+          // order (`v.0, v.1, .., v.(k-1)`) is ocamlc's pass-through of `v`
+          // itself (it projects, no rebind -- profile's matched-pair arm); only
+          // a genuine field selection off a wider value is bound.
+          bool passthrough = true;
+          for (size_t i = 0; i < l->args.size() && passthrough; ++i) {
+            const LamPtr& a = l->args[i];
+            if (!is_field_read(a) || a->prim_arg != (int)i || a->args.empty() ||
+                a->args[0]->k != Lam::K::Var ||
+                a->args[0]->var.stamp != l->args[0]->args[0]->var.stamp)
+              passthrough = false;
+          }
+          bool do_bind = bind_tuple_cols_ && !passthrough;
+          std::vector<Lam::Binding> binds;  // outermost first
+          for (size_t i = l->args.size(); do_bind && i-- > 0; ) {
+            LamPtr& a = l->args[i];
+            if (!is_field_read(a)) continue;
+            Ident t = fresh("", true);
+            ValueKind vk = (l->blk_shape.size() == l->args.size())
+                               ? l->blk_shape[i] : ValueKind::Gen;
+            binds.push_back({t, vk, a});
+            a = varof(t);
+          }
           l->k = Lam::K::Staticraise;
           l->prim_arg = n;
           l->blk_shape.clear();
+          if (!binds.empty()) {
+            auto ex = lam_alloc_copy(*l);
+            auto lt = mk(Lam::K::Let);
+            lt->bindings = std::move(binds);
+            lt->body = ex;
+            *l = *lt;
+          }
           return true;
         }
         if (l->prim == Prim::Raise || l->prim == Prim::Reraise) return true;
@@ -8012,15 +8063,31 @@ struct Translator {
       case Lam::K::IfThenElse:
         return tail_tuple_exit(l->then_, n, k) && tail_tuple_exit(l->else_, n, k);
       case Lam::K::Switch: {
-        for (auto& c : l->sw_consts) if (!tail_tuple_exit(c.body, n, k)) return false;
-        for (auto& c : l->sw_blocks) if (!tail_tuple_exit(c.body, n, k)) return false;
-        if (l->sw_default) return tail_tuple_exit(l->sw_default, n, k);
-        return true;
+        // A switch's arms must fold their shared actions into a default; a
+        // per-arm column binding would defeat that, so stop binding below here.
+        bool save = bind_tuple_cols_; bind_tuple_cols_ = false;
+        bool ok = true;
+        for (auto& c : l->sw_consts) if (!tail_tuple_exit(c.body, n, k)) { ok = false; break; }
+        if (ok) for (auto& c : l->sw_blocks) if (!tail_tuple_exit(c.body, n, k)) { ok = false; break; }
+        if (ok && l->sw_default) ok = tail_tuple_exit(l->sw_default, n, k);
+        bind_tuple_cols_ = save;
+        return ok;
       }
-      case Lam::K::Catch:
-        return tail_tuple_exit(l->cond, n, k) && tail_tuple_exit(l->then_, n, k);
-      case Lam::K::Try:
-        return tail_tuple_exit(l->body, n, k) && tail_tuple_exit(l->then_, n, k);
+      case Lam::K::Catch: {
+        // A catch handler receives its args on the stack (shifting assign
+        // positions like a try); don't bind columns below a catch.
+        bool save = bind_tuple_cols_; bind_tuple_cols_ = false;
+        bool ok = tail_tuple_exit(l->cond, n, k) && tail_tuple_exit(l->then_, n, k);
+        bind_tuple_cols_ = save;
+        return ok;
+      }
+      case Lam::K::Try: {
+        // A try's trap-stack offset shifts the assign positions; don't bind below.
+        bool save = bind_tuple_cols_; bind_tuple_cols_ = false;
+        bool ok = tail_tuple_exit(l->body, n, k) && tail_tuple_exit(l->then_, n, k);
+        bind_tuple_cols_ = save;
+        return ok;
+      }
       default: return false;
     }
   }
@@ -16340,7 +16407,14 @@ struct Translator {
                           std::get_if<Pexp_ifthenelse>(&rhs->desc))) {
             LamPtr mm = expr(*rhs);
             int n = ++next_exit_;
-            if (tail_tuple_exit(mm, n, tp->elems.size())) {
+            // Bind non-var tuple columns only for an if scrutinee: a match
+            // lowers to a switch whose arms must fold their shared actions, and
+            // a try's trap-stack offset shifts the assign positions.
+            bool save_btc = bind_tuple_cols_;
+            bind_tuple_cols_ = std::get_if<Pexp_ifthenelse>(&rhs->desc) != nullptr;
+            bool tte = tail_tuple_exit(mm, n, tp->elems.size());
+            bind_tuple_cols_ = save_btc;
+            if (tte) {
               auto cat = mk(Lam::K::Catch);
               cat->cond = mm;
               cat->prim_arg = n;
