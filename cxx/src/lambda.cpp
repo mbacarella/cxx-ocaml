@@ -16045,6 +16045,16 @@ struct Translator {
     scope.emplace_back();
     auto l = mk(Lam::K::Function);
     std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured params
+    // Collect one parameter's sub-var binders, FRONT-inserting the group so later
+    // parameters' binders wrap outermost: ocamlc reads the parameter list
+    // right-to-left, so `fun (a,b) (c,d) -> ..` binds d,c (last param) before b,a
+    // (first param).  collect_binders is already right-to-left WITHIN a pattern;
+    // this only reverses the ACROSS-parameter order.
+    auto add_param_binders = [&](const Pattern& p, const LamPtr& scrut) {
+      std::vector<std::pair<Ident, LamPtr>> grp;
+      collect_binders(p, scrut, grp);
+      binders.insert(binders.begin(), grp.begin(), grp.end());
+    };
     // An `?(x=default)` parameter becomes a `*opt*` param plus a body let binding
     // `x = (if *opt* (field_imm 0 *opt*) default)` -- unwrap the option or use the
     // default.  (A `?x` without a default keeps the option itself as the param.)
@@ -16093,7 +16103,7 @@ struct Translator {
             // params are already in scope, which is correct.
             LamPtr dlam = expr(*pv->default_->get());
             if (var) scope.back()[var->name.txt] = xid;
-            else if (!any) collect_binders(*pat, varof(xid), binders);
+            else if (!any) add_param_binders(*pat, varof(xid));
             ValueKind ok = var ? pat_kind(pat) : ValueKind::Gen;  // a *match* temp is unannotated
             optdefs.push_back({xid, optid, std::move(dlam), ok, /*discard=*/any});
             continue;
@@ -16139,7 +16149,7 @@ struct Translator {
           Ident pid = fresh("param");
           l->params.push_back({pid, pat_kind(pat)});
           auto pvar = mk(Lam::K::Var); pvar->var = pid;
-          collect_binders(*pat, pvar, binders);
+          add_param_binders(*pat, pvar);
         } else {
           Ident pid = fresh("param");
           l->params.push_back({pid, pat_kind(pat)});
@@ -16195,7 +16205,7 @@ struct Translator {
           Ident pid = fresh("param");
           l->params.push_back({pid, pat_kind(pat)});
           auto pvar = mk(Lam::K::Var); pvar->var = pid;
-          collect_binders(*pat, pvar, binders);
+          add_param_binders(*pat, pvar);
           l->body = wrap_optdefs(wrap_binders(expr(*fc->cases[0].rhs), binders));
           restore_fcm();
           scope.pop_back();
