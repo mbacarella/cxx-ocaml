@@ -787,16 +787,31 @@ struct Bytegen {
     std::vector<LamPtr> acts;
     std::unordered_map<std::string, int> keymap;
     auto store = [&](const LamPtr& act) -> int {
-      std::string key = lambda::make_lam_key(act);
+      // exit_aware: actions may be (or contain) distinct static raises, which
+      // must NOT merge to one label -- bytegen's real key (Lambda.make_key)
+      // keeps the static-exception id.
+      std::string key = lambda::make_lam_key(act, /*exit_aware=*/true);
       if (!key.empty()) { auto it = keymap.find(key); if (it != keymap.end()) return it->second; }
       int idx = (int)acts.size(); acts.push_back(act);
       if (!key.empty()) keymap.emplace(std::move(key), idx);
       return idx;
     };
     if (exp->sw_default) store(exp->sw_default);          // failaction is index 0
-    std::vector<int> act_consts(nconsts), act_blocks(nblocks);
-    for (int i = 0; i < nconsts; ++i) act_consts[i] = store(exp->sw_consts[i].body);
-    for (int i = 0; i < nblocks; ++i) act_blocks[i] = store(exp->sw_blocks[i].body);
+    // The jump tables span the matched type's ctor counts when known
+    // (sw_numconsts/sw_numblocks, ocamlc's Lswitch fields); tags absent from
+    // the case lists fall to action 0 = the failaction.  -1 = dense lists.
+    int tconsts = exp->sw_numconsts >= 0 ? exp->sw_numconsts : nconsts;
+    int tblocks = exp->sw_numblocks >= 0 ? exp->sw_numblocks : nblocks;
+    std::vector<int> act_consts(tconsts, 0), act_blocks(tblocks, 0);
+    if (exp->sw_numconsts >= 0 || exp->sw_numblocks >= 0) {  // sparse: fill by TAG
+      for (int i = 0; i < nconsts; ++i)
+        act_consts.at(exp->sw_consts[i].tag) = store(exp->sw_consts[i].body);
+      for (int i = 0; i < nblocks; ++i)
+        act_blocks.at(exp->sw_blocks[i].tag) = store(exp->sw_blocks[i].body);
+    } else {  // dense: positional (tag == index for every pre-existing producer)
+      for (int i = 0; i < nconsts; ++i) act_consts[i] = store(exp->sw_consts[i].body);
+      for (int i = 0; i < nblocks; ++i) act_blocks[i] = store(exp->sw_blocks[i].body);
+    }
     // ---- compile the distinct actions in reverse index order.
     std::vector<int> lbls(acts.size(), 0);
     for (int i = (int)acts.size() - 1; i >= 0; --i) {
@@ -804,11 +819,11 @@ struct Bytegen {
       lbls[i] = lbl; c = discard_dead_code(c1);
     }
     // ---- build the (position-indexed) label vectors, gaps share the failaction.
-    std::vector<int> lbl_consts(nconsts, 0), lbl_blocks(nblocks, 0);
-    for (int i = 0; i < nconsts; ++i) lbl_consts[i] = lbls[act_consts[i]];
-    for (int i = 0; i < nblocks; ++i) lbl_blocks[i] = lbls[act_blocks[i]];
+    std::vector<int> lbl_consts(tconsts, 0), lbl_blocks(tblocks, 0);
+    for (int i = 0; i < tconsts; ++i) lbl_consts[i] = lbls[act_consts[i]];
+    for (int i = 0; i < tblocks; ++i) lbl_blocks[i] = lbls[act_blocks[i]];
     Instr sw = I(Op::Switch);
-    sw.nconsts = nconsts;
+    sw.nconsts = tconsts;
     sw.labels = lbl_consts;
     sw.labels.insert(sw.labels.end(), lbl_blocks.begin(), lbl_blocks.end());
     return comp_expr(env, exp->cond, sz, cons(sw, c));

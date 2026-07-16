@@ -7003,6 +7003,218 @@ struct Translator {
           } else {
             lhs = exv();
           }
+          // ONE payload field that is a (possibly or-) CONSTRUCTOR sub-pattern
+          // with no binders, the others wildcards or plain vars -- ocamlc lowers
+          //   `| exception E ((A _ | B), n) [when g] -> body`
+          // to the identity test then a `switch` on that payload field over the
+          // matched ctor tags, default and identity-fail exiting to the dispatch
+          // remainder (both behind catches); var fields alias their field reads
+          // over the body, and a guard tests inside the handler with guard-fail
+          // exiting to the remainder.  exn_case_body only handles var/any/const
+          // payload fields, so this row was previously SKIPPED -- a silent
+          // miscompile: parse.ml skip_phrase's `Lexer.Error
+          // (Unterminated_comment _ | ..)` clause was dropped and error-recovery
+          // re-raised instead of skipping.
+          if (k->arg) {
+            std::string cn = lid_last(k->id.txt);
+            int arity = exn_arity_.count(cn) ? exn_arity_[cn] : 1;
+            auto fps = ctor_field_pats(k, arity);
+            int cidx = -1;
+            bool viable = !fps.empty();
+            struct SubTag { int tag; bool block; };
+            std::vector<SubTag> tags;
+            std::string vty_of_tags;  // the payload variant's type name
+            std::vector<std::pair<std::string, int>> var_fields;  // name, field idx
+            for (size_t fi = 0; fi < fps.size() && viable; ++fi) {
+              const Pattern* f = effective_pat(fps[fi]);
+              if (std::holds_alternative<Ppat_any>(f->desc)) continue;
+              if (auto* pv2 = std::get_if<Ppat_var>(&f->desc)) {
+                var_fields.push_back({pv2->name.txt, (int)fi});
+                continue;
+              }
+              bool ctorish = std::holds_alternative<Ppat_or>(f->desc) ||
+                             std::holds_alternative<Ppat_construct>(f->desc);
+              if (!ctorish || cidx >= 0 || pattern_binds(f)) { viable = false; break; }
+              std::vector<const Pattern*> alts;
+              flatten_or(f, alts);
+              for (auto* a : alts) {
+                auto* ak = std::get_if<Ppat_construct>(&a->desc);
+                const CtorInfo* ci = ak ? pat_ctor_resolve(a, ctor_of(*a)) : nullptr;
+                if (!ci) { viable = false; break; }
+                if (vty_of_tags.empty()) vty_of_tags = ci->type;
+                else if (vty_of_tags != ci->type) { viable = false; break; }
+                // an argumented alternative must not test its own payload
+                if (ak->arg && !is_irrefutable(*effective_pat(ak->arg->get()))) {
+                  viable = false; break;
+                }
+                tags.push_back({ci->tag, ci->is_block});
+              }
+              if (viable) cidx = (int)fi;
+            }
+            // de-duplicate repeated alternatives (same tag+shape)
+            if (viable) {
+              std::sort(tags.begin(), tags.end(), [](const SubTag& a, const SubTag& b) {
+                return a.block != b.block ? a.block < b.block : a.tag < b.tag; });
+              tags.erase(std::unique(tags.begin(), tags.end(),
+                                     [](const SubTag& a, const SubTag& b) {
+                                       return a.tag == b.tag && a.block == b.block; }),
+                         tags.end());
+            }
+            if (viable && cidx >= 0 && !tags.empty()) {
+              int rest_eid = ++next_exit_;
+              auto restL = [&] {
+                auto x = mk(Lam::K::Staticraise); x->prim_arg = rest_eid; return x;
+              };
+              // the arm body: the or-alternation's shared exit if one is open,
+              // else the compiled rhs (row aliases bound to the exn value, var
+              // payload fields aliased to their field reads, a guard tested
+              // with guard-fail exiting to the remainder)
+              LamPtr body = nullptr;
+              if (!c.guard)
+                if (auto sh = exn_shared_exit_.find(c.rhs); sh != exn_shared_exit_.end()) {
+                  body = mk(Lam::K::Staticraise); body->prim_arg = sh->second;
+                }
+              if (!body) {
+                scope.emplace_back();
+                for (auto& nm : row_aliases) scope.back()[nm] = exn;
+                std::vector<Lam::Binding> field_binds;
+                for (auto& [nm, fi2] : var_fields) {
+                  Ident b = fresh(nm);
+                  scope.back()[nm] = b;
+                  field_binds.push_back(
+                      {b, ValueKind::Gen, fieldimm(fi2 + 1, exv()), /*alias=*/true});
+                }
+                body = expr(*c.rhs);
+                if (c.guard) {  // `when g`: guard-fail falls to the remainder
+                  auto gi = mk(Lam::K::IfThenElse);
+                  gi->cond = expr(*c.guard); gi->then_ = body; gi->else_ = restL();
+                  body = gi;
+                }
+                if (!field_binds.empty()) {
+                  auto bl = mk(Lam::K::Let);
+                  bl->bindings = std::move(field_binds);
+                  bl->body = body;
+                  body = bl;
+                }
+                scope.pop_back();
+              }
+              bool body_is_exit =
+                  body->k == Lam::K::Staticraise && body->args.empty();
+              // ocamlc (combine_regular_constructor): the payload is a REGULAR
+              // ctor match with the dispatch remainder as its failure.  With the
+              // type's ctor counts known, mirror mk_failaction_pos (missing
+              // ctors become explicit `(exit rest)` cases -> exhaustive
+              // switch*), then reintroduce_fail (a bare exit cited >=3 times
+              // becomes the sw_failaction/default, its cases removed; ties
+              // prefer the smaller exit id).  Unknown/ambiguous type -> the
+              // plain default shape (correct, just not ocamlc's).
+              int nc = -1, nb = -1;
+              if (!vty_of_tags.empty() && !ambiguous_type_names_.count(vty_of_tags))
+                if (auto tc = type_ctors_.find(vty_of_tags); tc != type_ctors_.end()) {
+                  nc = tc->second.first; nb = tc->second.second;
+                }
+              bool refine = nc >= 0 && nc + nb > 0 && (int)tags.size() < nc + nb;
+              std::vector<char> cset(std::max(nc, 0), 0), bset(std::max(nb, 0), 0);
+              if (refine)
+                for (auto& t : tags) {
+                  int n2 = t.block ? nb : nc;
+                  if (t.tag < 0 || t.tag >= n2) { refine = false; break; }
+                  (t.block ? bset : cset)[t.tag] = 1;
+                }
+              // sig-complete payload (every ctor matched): no switch at all --
+              // ocamlc's same_actions collapses it to the body directly.
+              bool complete = nc >= 0 && nc + nb > 0 && (int)tags.size() == nc + nb;
+              int body_eid =
+                  (!complete && tags.size() >= 2 && !body_is_exit) ? ++next_exit_ : 0;
+              int body_target = body_is_exit ? body->prim_arg : (body_eid ? body_eid : -1);
+              auto case_body = [&]() -> LamPtr {
+                if (body_target >= 0) {
+                  auto x = mk(Lam::K::Staticraise); x->prim_arg = body_target; return x;
+                }
+                return body;  // single citation: inline
+              };
+              LamPtr then_part;
+              if (complete) {
+                then_part = body_is_exit ? case_body() : body;
+              } else if (refine) {
+                auto sw = mk(Lam::K::Switch);
+                sw->cond = fieldimm(cidx + 1, exv());
+                sw->sw_numconsts = nc; sw->sw_numblocks = nb;
+                int missing = nc + nb - (int)tags.size();
+                // reintroduce_fail: default = the bare exit with the most
+                // citations when that count >= 3 (tie -> smaller exit id)
+                int def_target = -1, c_max = -1;
+                auto consider = [&](int id, int cnt) {
+                  if (cnt > c_max || (cnt == c_max && id < def_target)) {
+                    c_max = cnt; def_target = id;
+                  }
+                };
+                if (missing > 0) consider(rest_eid, missing);
+                if (body_target >= 0) consider(body_target, (int)tags.size());
+                if (c_max < 3) def_target = -1;
+                for (int t2 = 0; t2 < nc; ++t2) {
+                  LamPtr act = cset[t2] ? case_body() : restL();
+                  int tgt = cset[t2] ? body_target : rest_eid;
+                  if (def_target >= 0 && tgt == def_target &&
+                      act->k == Lam::K::Staticraise) continue;
+                  sw->sw_consts.push_back({t2, act});
+                }
+                for (int t2 = 0; t2 < nb; ++t2) {
+                  LamPtr act = bset[t2] ? case_body() : restL();
+                  int tgt = bset[t2] ? body_target : rest_eid;
+                  if (def_target >= 0 && tgt == def_target &&
+                      act->k == Lam::K::Staticraise) continue;
+                  sw->sw_blocks.push_back({t2, act});
+                }
+                if (def_target >= 0) {
+                  auto x = mk(Lam::K::Staticraise); x->prim_arg = def_target;
+                  sw->sw_default = x;
+                }  // else exhaustive switch*
+                then_part = sw;
+                if (body_eid) {  // body shared behind a catch around the switch
+                  auto bc = mk(Lam::K::Catch);
+                  bc->cond = then_part; bc->prim_arg = body_eid; bc->then_ = body;
+                  then_part = bc;
+                }
+              } else {
+                // Unknown ctor counts: a switch's jump tables need the type's
+                // totals, so test each matched tag directly instead -- a const
+                // ctor by physical equality (a block never equals an
+                // immediate), a block ctor by caml_obj_tag (an immediate tags
+                // as 1000, never a variant tag).
+                LamPtr chain = restL();
+                for (auto it = tags.rbegin(); it != tags.rend(); ++it) {
+                  LamPtr lhsf = fieldimm(cidx + 1, exv());
+                  if (it->block) {
+                    auto tg = mk(Lam::K::Prim); tg->prim = Prim::Ccall;
+                    tg->prim_id = "caml_obj_tag"; tg->args = {lhsf};
+                    lhsf = tg;
+                  }
+                  auto t2 = mk(Lam::K::Prim);
+                  t2->prim = Prim::IntCmp; t2->prim_id = "==";
+                  t2->args = {lhsf, cint(it->tag)};
+                  auto f2 = mk(Lam::K::IfThenElse);
+                  f2->cond = t2; f2->then_ = case_body(); f2->else_ = chain;
+                  chain = f2;
+                }
+                then_part = chain;
+                if (body_eid) {
+                  auto bc = mk(Lam::K::Catch);
+                  bc->cond = then_part; bc->prim_arg = body_eid; bc->then_ = body;
+                  then_part = bc;
+                }
+              }
+              auto test = mk(Lam::K::Prim);
+              test->prim = Prim::IntCmp; test->prim_id = "==";
+              test->args = {lhs, id};
+              auto iff = mk(Lam::K::IfThenElse);
+              iff->cond = test; iff->then_ = then_part; iff->else_ = restL();
+              auto rc = mk(Lam::K::Catch);
+              rc->cond = iff; rc->prim_arg = rest_eid;
+              rc->then_ = exn_dispatch(exn, rows, i + 1);
+              return rc;
+            }
+          }
           std::vector<PayloadTest> ptests;
           // A `when` guard (and any payload identity test) needs the dispatch's
           // remainder at several failure points, so share it behind a catch/exit
@@ -7625,7 +7837,9 @@ struct Translator {
     if (l->sw_consts.empty() && l->sw_blocks.empty()) return;
     std::string k0; bool allsame = true;
     auto chk = [&](const LamPtr& b) {
-      std::string k = make_lam_key(b);
+      // exit_aware: a switch dispatching to DISTINCT exits (bare or nested in an
+      // arm) must NOT collapse to the first arm -- keep the static-exception ids.
+      std::string k = cppcaml::lambda::make_lam_key(b, /*exit_aware=*/true);
       if (k.empty()) allsame = false;
       else if (k0.empty()) k0 = k;
       else if (k != k0) allsame = false;

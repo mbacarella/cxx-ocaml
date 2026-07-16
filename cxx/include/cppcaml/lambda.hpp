@@ -151,9 +151,15 @@ struct Lam {
 
   // Switch (Lswitch): scrutinee in `cond`; integer-constant and block-tag arms;
   // sw_default null => exhaustive (printed "switch*"), else "switch".
+  // sw_numconsts/sw_numblocks: the matched TYPE's total const/block ctor counts
+  // (ocamlc's sw_numconsts/sw_numblocks) -- the bytecode jump tables are sized
+  // by these, with tags absent from the case lists jumping to the failaction.
+  // -1 (the default) = dense: every tag 0..len-1 is present in the list, so the
+  // list length is the table size (all pre-existing producers).
   struct SwitchCase { int tag; LamPtr body; };
   std::vector<SwitchCase> sw_consts, sw_blocks;
   LamPtr sw_default;
+  int sw_numconsts = -1, sw_numblocks = -1;
 
   // Catch (Lstaticcatch): protected body in `cond`, handler in `then_`, static
   // exception id in `prim_arg`, handler-bound vars in `catch_vars` (with their
@@ -177,7 +183,15 @@ struct Lam {
 // those are never shared.  Bound-var stamps are used literally (so distinct-var
 // arms are conservatively NOT merged), which under-shares relative to ocamlc but
 // never over-shares.
-inline std::string make_lam_key(const LamPtr& l) {
+//
+// `exit_aware` controls whether static exits are distinguished by target.  The
+// default (false) deliberately ignores Lstaticraise targets -- two exits "look
+// alike" -- which is what the DEFAULT-exit-sharing call sites rely on (they
+// compare arms against one known shared default).  Pass true wherever a
+// switch/collapse dedups arbitrary action bodies that may BE or CONTAIN static
+// raises: there, exit-blind keying would wrongly merge dispatches to DISTINCT
+// handlers (a real miscompile -- ocamlc's Lambda.make_key keeps the exit id).
+inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
   if (!l) return "_";
   using K = Lam::K;
   switch (l->k) {
@@ -192,7 +206,8 @@ inline std::string make_lam_key(const LamPtr& l) {
   }
   std::string r = "(" + std::to_string((int)l->k);
   if (l->k == K::Prim) r += ":" + std::to_string((int)l->prim) + ":" + l->prim_id + ":" + std::to_string(l->prim_arg);
-  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key(c); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+  if (exit_aware && l->k == K::Staticraise) r += ":X" + std::to_string(l->prim_arg);
+  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key(c, exit_aware); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
   add(l->fn); add(l->cond); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
   for (auto& a : l->args) add(a);
   for (auto& b : l->bindings) { if (!r.empty()) r += " b" + std::to_string(b.id.stamp); add(b.val); }
