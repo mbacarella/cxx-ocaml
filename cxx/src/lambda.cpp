@@ -13686,6 +13686,19 @@ struct Translator {
       bool isint = false, ctor = false; long long val = 0;
       if (auto* pc = std::get_if<Ppat_constant>(&lhs->desc)) {
         if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) { isint = true; val = parse_ocaml_int(pi->value); }
+        // A LONE char literal immediately before the catch-all is matched by its
+        // integer code, exactly like an int: ocamlc's call_switcher emits
+        // `(if (!= c code) <default> <act>)`, but without this we fell through to
+        // naive_match's `==` form.  Multi-char matches want ocamlc's sorted
+        // switcher / jump table, which int_cases' source-order chain doesn't
+        // reproduce -- leave those to the switcher / naive_match (this gate keeps
+        // them there, avoiding a worse `!=` source-order chain).
+        else if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc)) {
+          if (i + 2 == rows.size() && !rows[i + 1].guard &&
+              is_catchall(*effective_pat(rows[i + 1].lhs))) {
+            isint = true; val = (unsigned char)ch->code;
+          }
+        }
       } else if (auto* k = std::get_if<Ppat_construct>(&lhs->desc); k && !k->arg) {
         auto it = ctor_info_.find(ctor_of(*lhs));
         if (it != ctor_info_.end() && !it->second.is_block) { isint = true; val = it->second.tag; ctor = true; }
