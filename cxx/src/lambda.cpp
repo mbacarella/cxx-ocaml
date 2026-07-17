@@ -809,11 +809,10 @@ struct Translator {
   std::unordered_map<std::string, int> predef_global_stamp_;
   bool no_pervasives_ = false;  // -nopervasives: Stdlib not implicitly opened
   int next_exit_ = 0;  // static-exception ids (normalized in the dump, so value is free)
-  // When compiling a tuple-let over an if scrutinee, tail_tuple_exit binds each
-  // field-read tuple column to a fresh var before the static exit (as ocamlc's
-  // matcher does with bind_with_value_kind).  Left false for a MATCH scrutinee
-  // (whose switch arms would then fail to fold their per-arm freshly-bound
-  // shared actions into a single default) and cleared below a try/switch/catch.
+  // When compiling a tuple-let, tail_tuple_exit binds each non-var tuple
+  // column to a fresh var before the static exit (ocamlc's assign_pat
+  // sublets; a var column simplif-substitutes away), in every tail context --
+  // if arms, switch arms, both sides of a try (Matching.for_let/map_return).
   bool bind_tuple_cols_ = false;
   // Decision-node budget for the general matrix matcher (gmatch): each gmatch call
   // is one decision-tree node, so this caps the tree size.  A combinatorial matrix
@@ -6223,7 +6222,7 @@ struct Translator {
     std::vector<Lam::Binding> keep;
     for (auto it = shared_consts_.rbegin(); it != shared_consts_.rend(); ++it) {
       auto& b = it->second;
-      if (count_var(body, b.id) <= 1) subst_var(body, b.id, b.val);
+      if (count_var(body, b.id) <= 1) subst_alias(body, b.id, b.val);
       else keep.push_back(b);
     }
     if (keep.empty()) return body;
@@ -7674,6 +7673,14 @@ struct Translator {
     for (auto& sc : l->sw_consts) subst_var(sc.body, id, repl);
     for (auto& sc : l->sw_blocks) subst_var(sc.body, id, repl);
   }
+  // Inline a single-use binder's value in place of its variable (the matcher's
+  // alias-let elision, ocamlc's Simplif Alias rule).  Tags the node from_alias:
+  // at ocamlc's pre-Simplif stage this position held the binder's Lvar, and
+  // consumers replicating pre-Simplif decisions (tail_tuple_exit) test the tag.
+  static void subst_alias(LamPtr& l, const Ident& id, const LamPtr& repl) {
+    repl->from_alias = true;
+    subst_var(l, id, repl);
+  }
   LamPtr fieldimm(int i, const LamPtr& s) {
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = i; f->args = {s}; return f;
   }
@@ -7998,37 +8005,28 @@ struct Translator {
       case Lam::K::Prim:
         if (l->prim == Prim::Makeblock && l->prim_arg == 0 && l->args.size() == k) {
           // ocamlc binds each non-variable tuple column to a fresh var before
-          // the static exit (Lambda.bind_with_value_kind: a Lvar column is
-          // passed through, anything else gets a `let`), right-to-left so the
-          // last column's binding is outermost.  We inlined the field reads
-          // directly into the exit; matching the binding keeps the .cmo's
-          // push-all-then-assign shape (bytepackager's `state.events,
-          // state.debug_dirs` else-arm).
-          // Only a field-read column is let-bound; a constant or an allocation
-          // (makeblock) is left inline, matching ocamlc (`state.events,
-          // state.debug_dirs` binds both fields; `24, <makeblock>` does not).
-          auto is_field_read = [](const LamPtr& a) {
-            return a->k == Lam::K::Prim &&
-                   (a->prim == Prim::Field || a->prim == Prim::FieldImm ||
-                    a->prim == Prim::FieldInt || a->prim == Prim::FieldMut);
+          // the static exit (Matching.assign_pat's per-component sublets:
+          // a Lvar column simplif-substitutes away, anything else -- constant,
+          // apply, field read, even a makeblock -- keeps its Strict `let`),
+          // right-to-left so the last column's binding is outermost.  We
+          // inlined the columns directly into the exit; matching the binding
+          // keeps the .cmo's push-all-then-assign shape (bytepackager's
+          // `state.events, state.debug_dirs` else-arm; ccomp's
+          // `(sprintf " > %s" .., t)` try-arm and `("", "")` tails).
+          // A column that is a variable -- or a from_alias node standing where
+          // ocamlc's pre-Simplif lambda had a pattern binder's Lvar (profile's
+          // rebuilt `(n, t)` pair) -- passes through unbound; the inline field
+          // read is exactly what ocamlc's later alias substitution leaves in
+          // the exit args.  A literal source field access (`state.events`,
+          // bytepackager) is untagged and gets its `let`.
+          auto is_bindable = [](const LamPtr& a) {
+            return a->k != Lam::K::Var && !a->from_alias;
           };
-          // A column tuple that just re-reads a single var's leading fields in
-          // order (`v.0, v.1, .., v.(k-1)`) is ocamlc's pass-through of `v`
-          // itself (it projects, no rebind -- profile's matched-pair arm); only
-          // a genuine field selection off a wider value is bound.
-          bool passthrough = true;
-          for (size_t i = 0; i < l->args.size() && passthrough; ++i) {
-            const LamPtr& a = l->args[i];
-            if (!is_field_read(a) || a->prim_arg != (int)i || a->args.empty() ||
-                a->args[0]->k != Lam::K::Var ||
-                a->args[0]->var.stamp != l->args[0]->args[0]->var.stamp)
-              passthrough = false;
-          }
-          bool do_bind = bind_tuple_cols_ && !passthrough;
+          bool do_bind = bind_tuple_cols_;
           std::vector<Lam::Binding> binds;  // outermost first
           for (size_t i = l->args.size(); do_bind && i-- > 0; ) {
             LamPtr& a = l->args[i];
-            if (!is_field_read(a)) continue;
+            if (!is_bindable(a)) continue;
             Ident t = fresh("", true);
             ValueKind vk = (l->blk_shape.size() == l->args.size())
                                ? l->blk_shape[i] : ValueKind::Gen;
@@ -8051,8 +8049,26 @@ struct Translator {
         return false;
       case Lam::K::ConstBlock:
         if (l->prim_arg == 0 && l->args.size() == k) {
+          // ocamlc's assign_pat Lconst(Const_block) case decomposes a constant
+          // tuple tail too, binding each component (`let (b = [0:..] a = 24)
+          // (exit N a b)` -- ccomp's `("", "")` arms).
+          std::vector<Lam::Binding> binds;  // outermost first
+          for (size_t i = l->args.size(); bind_tuple_cols_ && i-- > 0; ) {
+            LamPtr& a = l->args[i];
+            if (a->k == Lam::K::Var) continue;
+            Ident t = fresh("", true);
+            binds.push_back({t, ValueKind::Gen, a});
+            a = varof(t);
+          }
           l->k = Lam::K::Staticraise;
           l->prim_arg = n;
+          if (!binds.empty()) {
+            auto ex = lam_alloc_copy(*l);
+            auto lt = mk(Lam::K::Let);
+            lt->bindings = std::move(binds);
+            lt->body = ex;
+            *l = *lt;
+          }
           return true;
         }
         return false;
@@ -8063,31 +8079,34 @@ struct Translator {
       case Lam::K::IfThenElse:
         return tail_tuple_exit(l->then_, n, k) && tail_tuple_exit(l->else_, n, k);
       case Lam::K::Switch: {
-        // A switch's arms must fold their shared actions into a default; a
-        // per-arm column binding would defeat that, so stop binding below here.
-        bool save = bind_tuple_cols_; bind_tuple_cols_ = false;
+        // An arm whose action structurally DUPLICATES another arm's is our
+        // expansion of a single or-pattern row; ocamlc folds those copies into
+        // one default arm.  Binding columns inside each copy would amplify
+        // that pre-existing divergence (5 lets for ocamlc's one), so recurse
+        // into duplicated arms with binding off (signature_group's
+        // `Sig_module _ | Sig_value _ | ... -> [], q` five-tag row).
+        std::unordered_map<std::string, int> keyn;
+        for (auto& c : l->sw_consts) { std::string ky = cppcaml::lambda::make_lam_key(c.body, true); if (!ky.empty()) ++keyn[ky]; }
+        for (auto& c : l->sw_blocks) { std::string ky = cppcaml::lambda::make_lam_key(c.body, true); if (!ky.empty()) ++keyn[ky]; }
+        auto arm = [&](LamPtr& b) {
+          std::string ky = cppcaml::lambda::make_lam_key(b, true);
+          bool dup = !ky.empty() && keyn[ky] > 1;
+          bool save = bind_tuple_cols_;
+          if (dup) bind_tuple_cols_ = false;
+          bool ok = tail_tuple_exit(b, n, k);
+          bind_tuple_cols_ = save;
+          return ok;
+        };
         bool ok = true;
-        for (auto& c : l->sw_consts) if (!tail_tuple_exit(c.body, n, k)) { ok = false; break; }
-        if (ok) for (auto& c : l->sw_blocks) if (!tail_tuple_exit(c.body, n, k)) { ok = false; break; }
+        for (auto& c : l->sw_consts) if (!arm(c.body)) { ok = false; break; }
+        if (ok) for (auto& c : l->sw_blocks) if (!arm(c.body)) { ok = false; break; }
         if (ok && l->sw_default) ok = tail_tuple_exit(l->sw_default, n, k);
-        bind_tuple_cols_ = save;
         return ok;
       }
-      case Lam::K::Catch: {
-        // A catch handler receives its args on the stack (shifting assign
-        // positions like a try); don't bind columns below a catch.
-        bool save = bind_tuple_cols_; bind_tuple_cols_ = false;
-        bool ok = tail_tuple_exit(l->cond, n, k) && tail_tuple_exit(l->then_, n, k);
-        bind_tuple_cols_ = save;
-        return ok;
-      }
-      case Lam::K::Try: {
-        // A try's trap-stack offset shifts the assign positions; don't bind below.
-        bool save = bind_tuple_cols_; bind_tuple_cols_ = false;
-        bool ok = tail_tuple_exit(l->body, n, k) && tail_tuple_exit(l->then_, n, k);
-        bind_tuple_cols_ = save;
-        return ok;
-      }
+      case Lam::K::Catch:
+        return tail_tuple_exit(l->cond, n, k) && tail_tuple_exit(l->then_, n, k);
+      case Lam::K::Try:
+        return tail_tuple_exit(l->body, n, k) && tail_tuple_exit(l->then_, n, k);
       default: return false;
     }
   }
@@ -9191,6 +9210,10 @@ struct Translator {
       // Zero uses still drop it (StrictOpt: evaluate only if used).
       int n = count_var(body, id);
       if (n == 0 || (n <= 1 && !is_mut_field_access(acc))) {
+        // In ocamlc this position held the binder's Lvar until Simplif inlined
+        // the alias let; tag the substituted node so pre-Simplif-order
+        // decisions (tail_tuple_exit's column binding) still see "a variable".
+        acc->from_alias = true;
         subst_var(body, id, acc); continue;
       }
       Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = acc;
@@ -9359,7 +9382,7 @@ struct Translator {
       auto& id = it->first; auto& fa = it->second;
       int n = count_var(body, id);
       if (n == 0 || (n <= 1 && !is_mut_field_access(fa))) {
-        subst_var(body, id, fa); continue;
+        subst_alias(body, id, fa); continue;
       }
       auto l = mk(Lam::K::Let);
       Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = fa;
@@ -9435,7 +9458,7 @@ struct Translator {
     for (int j = ar - 1; j >= 0; --j) {
       if (!fused[j]) continue;
       LamPtr fread = fieldimm(j, scrut);
-      if (count_var(chain, fids[j]) <= 1) { subst_var(chain, fids[j], fread); continue; }
+      if (count_var(chain, fids[j]) <= 1) { subst_alias(chain, fids[j], fread); continue; }
       auto l = mk(Lam::K::Let);
       l->bindings = {{fids[j], ValueKind::Gen, fread, true}};
       l->body = chain; chain = l;
@@ -9528,7 +9551,7 @@ struct Translator {
       // `let *match* = field_(k-1) in let t = field_0 in ..` order.
       for (int j = 0; j < ar; ++j) {
         LamPtr fread = fieldimm(j, scrut);
-        if (count_var(body, fids[j]) <= 1) subst_var(body, fids[j], fread);
+        if (count_var(body, fids[j]) <= 1) subst_alias(body, fids[j], fread);
         else {
           auto l = mk(Lam::K::Let);
           l->bindings = {{fids[j], ValueKind::Gen, fread, true}};
@@ -9557,7 +9580,7 @@ struct Translator {
     Ident tv = fresh("", true);
     auto tvar = mk(Lam::K::Var); tvar->var = tv;
     LamPtr body = compile_match(tvar, sub, mloc);
-    if (count_var(body, tv) <= 1) { subst_var(body, tv, field0); return body; }
+    if (count_var(body, tv) <= 1) { subst_alias(body, tv, field0); return body; }
     auto l = mk(Lam::K::Let); l->bindings = {{tv, ValueKind::Gen, field0, true}}; l->body = body;
     return l;
   }
@@ -9903,7 +9926,7 @@ struct Translator {
       scope.back()[pv->name.txt] = id;
       apply_var_node_path(p, id);  // a ctor-arg var: tag its record type before k()
       LamPtr body = k();
-      if (count_var(body, id) <= 1) { subst_var(body, id, scrut); return body; }
+      if (count_var(body, id) <= 1) { subst_alias(body, id, scrut); return body; }
       auto l = mk(Lam::K::Let);
       l->bindings = {{id, ValueKind::Gen, scrut, true}}; l->body = body; return l;
     }
@@ -9941,13 +9964,13 @@ struct Translator {
             LamPtr body = k();
             if (!body) return nullptr;
             LamPtr fields;
-            if (count_var(body, id) <= 1) { subst_var(body, id, s); fields = body; }
+            if (count_var(body, id) <= 1) { subst_alias(body, id, s); fields = body; }
             else { auto l = mk(Lam::K::Let);
                    l->bindings = {{id, ValueKind::Gen, s, true}}; l->body = body; fields = l; }
             auto iff = mk(Lam::K::IfThenElse);
             iff->cond = s; iff->then_ = fields; iff->else_ = dflt; inner = iff;
             if (!need_temp) return inner;
-            if (count_var(inner, tv) <= 1) { subst_var(inner, tv, scrut); return inner; }
+            if (count_var(inner, tv) <= 1) { subst_alias(inner, tv, scrut); return inner; }
             auto l = mk(Lam::K::Let);
             l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = inner; return l;
           }
@@ -9978,7 +10001,7 @@ struct Translator {
       iff->cond = s; iff->then_ = dflt; iff->else_ = kk; inner = iff;
     }
     if (!need_temp) return inner;
-    if (count_var(inner, tv) <= 1) { subst_var(inner, tv, scrut); return inner; }
+    if (count_var(inner, tv) <= 1) { subst_alias(inner, tv, scrut); return inner; }
     auto l = mk(Lam::K::Let);
     l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = inner; return l;
   }
@@ -10167,7 +10190,7 @@ struct Translator {
         if (!cb) return nullptr;
         for (int j = (int)tk - 1; j >= 0; --j) {
           LamPtr fread = fieldimm(j, comps[0]);
-          if (max_path_count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+          if (max_path_count_var(cb, fids[j]) <= 1) subst_alias(cb, fids[j], fread);
           else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ValueKind::Gen, fread, true}}; l->body = cb; cb = l; }
         }
         return cb;
@@ -10231,7 +10254,7 @@ struct Translator {
         if (!cb) return nullptr;
         for (int j = (int)nc - 1; j >= 0; --j) {
           LamPtr fread = field_read(&ofi[j], comps[0]);
-          if (max_path_count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+          if (max_path_count_var(cb, fids[j]) <= 1) subst_alias(cb, fids[j], fread);
           else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ofi[j].kind, fread, true}}; l->body = cb; cb = l; }
         }
         return cb;
@@ -10529,7 +10552,7 @@ struct Translator {
       if (!cb) return nullptr;
       for (int j = a - 1; j >= 0; --j) {
         LamPtr fread = fieldimm(j, comps[0]);
-        if (max_path_count_var(cb, fids[j]) <= 1) subst_var(cb, fids[j], fread);
+        if (max_path_count_var(cb, fids[j]) <= 1) subst_alias(cb, fids[j], fread);
         else {
           auto l = mk(Lam::K::Let);
           l->bindings = {{fids[j], ValueKind::Gen, fread, true}}; l->body = cb; cb = l;
@@ -10710,7 +10733,7 @@ struct Translator {
     else if (uses == 1 && bad == 0) { inline_exit(body, deid, {}, {}, dbody); res = body; }
     else { auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = deid; c->then_ = dbody; res = c; }
     if (need_temp) {
-      if (count_var(res, tv) <= 1) subst_var(res, tv, scrut);
+      if (count_var(res, tv) <= 1) subst_alias(res, tv, scrut);
       else { auto l = mk(Lam::K::Let); l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = res; res = l; }
     }
     return res;
@@ -12570,7 +12593,7 @@ struct Translator {
       // single-use inlining is simplif's ALIAS rule: only a field access (or
       // var) inlines; a strict computation (apply/send/...) stays bound.
       if (count_var(body, mv) <= 1 && is_field_access(scrut)) {
-        subst_var(body, mv, scrut);
+        subst_alias(body, mv, scrut);
         return body;
       }
       // The matcher's top argument is bound Strict (`=`), never Alias: the scrutinee
@@ -16437,11 +16460,11 @@ struct Translator {
                           std::get_if<Pexp_ifthenelse>(&rhs->desc))) {
             LamPtr mm = expr(*rhs);
             int n = ++next_exit_;
-            // Bind non-var tuple columns only for an if scrutinee: a match
-            // lowers to a switch whose arms must fold their shared actions, and
-            // a try's trap-stack offset shifts the assign positions.
+            // ocamlc's map_return/assign_pat binds non-var tuple columns in
+            // every tail context it traverses -- if arms, switch arms, and both
+            // sides of a try (Matching.for_let).
             bool save_btc = bind_tuple_cols_;
-            bind_tuple_cols_ = std::get_if<Pexp_ifthenelse>(&rhs->desc) != nullptr;
+            bind_tuple_cols_ = true;
             bool tte = tail_tuple_exit(mm, n, tp->elems.size());
             bind_tuple_cols_ = save_btc;
             if (tte) {

@@ -174,6 +174,13 @@ struct Lam {
   // string_switch builds the same structure during lambda generation, so this
   // flag exempts it from simplify_static_catches to match that layout.
   bool keep_catch = false;
+  // from_alias: this node was substituted in place of a single-use pattern
+  // binder (wrap_binders' inline of an alias let).  At the corresponding point
+  // in ocamlc's pipeline (Matching/for_let, BEFORE Simplif) this position held
+  // the binder's Lvar -- consumers that replicate pre-Simplif decisions (e.g.
+  // assign_pat's non-var tuple-column binding in tail_tuple_exit) must treat a
+  // tagged node as the variable it stood for.
+  bool from_alias = false;
 };
 
 // Alpha-normalized structural key of a Lambda term (the analog of
