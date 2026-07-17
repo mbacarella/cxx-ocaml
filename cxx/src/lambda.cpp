@@ -13420,9 +13420,19 @@ struct Translator {
     std::vector<KV> kvs;
     const Row* dflt = nullptr;
     bool is_int = false, is_char = false, has_interval = false;
+    // bodies must be translated in source order for stable stamp normalization
+    std::vector<const Expression*> by_src;
+    // `('=' | ':') as c` rows: c binds to the scrutinee over that row's body
+    // (matching.ml expands the alias before the constant switch).
+    std::unordered_map<const Expression*, std::vector<std::string>> row_aliases;
     for (auto& r : rows) {
       if (r.guard) return nullptr;
       const Pattern* p = effective_pat(r.lhs);
+      std::vector<std::string> aliases;
+      while (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+        aliases.push_back(pa->name.txt);
+        p = effective_pat(pa->p.get());
+      }
       std::vector<std::pair<long long, long long>> vals;
       if (switch_const_ranges(p, is_int, is_char, vals)) {
         if (dflt) return nullptr;  // a case after the catch-all
@@ -13430,7 +13440,9 @@ struct Translator {
           kvs.push_back({v.first, v.second, r.rhs});
           if (v.second > v.first) has_interval = true;
         }
-      } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
+        by_src.push_back(r.rhs);
+        if (!aliases.empty()) row_aliases[r.rhs] = std::move(aliases);
+      } else if (aliases.empty() && is_catchall(*p) && !dflt && &r == &rows.back()) {
         dflt = &r;
       } else return nullptr;
     }
@@ -13449,19 +13461,20 @@ struct Translator {
     std::vector<std::string> body_keys;
     actions.resize(kvs.size() + 1);
     std::vector<int> act_of(kvs.size());
-    // bodies must be translated in source order for stable stamp normalization
-    std::vector<const Expression*> by_src;
-    for (auto& r : rows) if (!r.guard) {
-      bool ii = false, ic = false; std::vector<std::pair<long long, long long>> vs;
-      if (switch_const_ranges(effective_pat(r.lhs), ii, ic, vs)) by_src.push_back(r.rhs); }
-    std::unordered_map<const Expression*, int> src_idx;
     for (size_t i = 0; i < kvs.size(); ++i) {
       // find this kv's source position -> action index (1-based, source order)
       int pos = 0; for (size_t s = 0; s < by_src.size(); ++s) if (by_src[s] == kvs[i].rhs) { pos = (int)s; break; }
       act_of[i] = pos + 1;
     }
     for (size_t s = 0; s < by_src.size(); ++s) {
+      auto ita = row_aliases.find(by_src[s]);
+      bool framed = ita != row_aliases.end();
+      if (framed) {
+        scope.emplace_back();
+        for (auto& nm : ita->second) scope.back()[nm] = scrut->var;
+      }
       LamPtr b = expr(*by_src[s]);
+      if (framed) scope.pop_back();
       std::string key = make_lam_key(b);
       for (auto& bk : body_keys) if (bk == key && !key.empty()) return nullptr;  // shared body
       body_keys.push_back(key);
