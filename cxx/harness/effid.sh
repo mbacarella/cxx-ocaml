@@ -10,13 +10,14 @@
 # codegen divergences show as a diff.  Reports "effectively-identical / 139" --
 # the cmo analog of cmi's "byte-identical modulo uids" ceiling.
 #
-#   REF=<dir>   reference dir of ocamlc.opt-built .cmo (default /tmp/dp_ref.0DhNco)
+#   REF=<dir>   reference dir of ocamlc.opt-built .cmo (default /tmp/effid_ref,
+#               built on demand -- delete the dir to force a rebuild)
 #   V=1         list every divergent module with its diff-line count
 set -u
 ROOT=/home/mbac/code/c++caml; cd "$ROOT"
 RUN=$ROOT/runtime/ocamlrun; DUMP="$ROOT/runtime/ocamlrun $ROOT/tools/dumpobj -effid"
 OUR=$ROOT/cxx/build-release/c++ocamlc
-REF=${REF:-/tmp/dp_ref.0DhNco}
+REF=${REF:-/tmp/effid_ref}
 FLAGS="-strict-sequence -strict-formats -w +a-4-9-40-41-42-44-45-48-70"
 BOOTSTRAP=$ROOT/cxx/harness/ocamlc_bootstrap.sh
 
@@ -29,9 +30,18 @@ extract_cl(){ awk '
 
 STAGE=$(mktemp -d)
 while read -r f; do [ -z "$f" ] && continue; cp "$ROOT/$f" "$STAGE/$(basename "$f")"; done < <(extract_cl)
-ORDER=$(cd "$STAGE" && "$ROOT/tools/ocamldep.opt" -sort ./*.mli ./*.ml 2>/dev/null | sed 's|^\./||')
+# ocamldep -sort emits ONE line; strip every ./ prefix (an anchored sed only
+# fixed the first file) so the bare filename lands in Assert_failure payloads.
+ORDER=$(cd "$STAGE" && "$ROOT/tools/ocamldep.opt" -sort ./*.mli ./*.ml 2>/dev/null | sed 's|\./||g')
 OUT=$(mktemp -d); cp "$STAGE"/*.mli "$STAGE"/*.ml "$OUT"/ 2>/dev/null
 ( cd "$OUT"; for f in $ORDER; do $OUR -I . -I "$ROOT/stdlib" $FLAGS -c "$f" 2>/dev/null; done )
+
+# Reference dir: ocamlc.opt-built .cmo, compiled the SAME way (bare filenames,
+# its own cmi stage).  Built on demand when the REF dir is absent.
+if [ ! -f "$REF/main.cmo" ]; then
+  mkdir -p "$REF"; cp "$STAGE"/*.mli "$STAGE"/*.ml "$REF"/ 2>/dev/null
+  ( cd "$REF"; for f in $ORDER; do "$ROOT/ocamlc.opt" -nostdlib -I . -I "$ROOT/stdlib" $FLAGS -c "$f" 2>/dev/null; done )
+fi
 
 ident=0; tot=0; diffs=$(mktemp)
 for a in "$OUT"/*.cmo; do
