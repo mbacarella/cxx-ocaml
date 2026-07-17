@@ -7704,12 +7704,20 @@ struct Translator {
     if (l->k == Lam::K::Try)  // protected body is under_try; handler is not
       return count_exit(l->body, id, true, bad) +
              count_exit(l->then_, id, under_try, bad);
+    // simplif.ml's count_default: a sparse switch's failaction counts TWICE
+    // when both the const and block spaces have gap tags (it "will occur
+    // twice"), keeping its single-syntactic-use handler shared, not inlined.
+    int dmul = 1;
+    if (l->k == Lam::K::Switch && l->sw_default &&
+        l->sw_numconsts >= 0 && (int)l->sw_consts.size() < l->sw_numconsts &&
+        l->sw_numblocks >= 0 && (int)l->sw_blocks.size() < l->sw_numblocks)
+      dmul = 2;
     int c = count_exit(l->fn, id, under_try, bad) +
             count_exit(l->body, id, under_try, bad) +
             count_exit(l->cond, id, under_try, bad) +
             count_exit(l->then_, id, under_try, bad) +
             count_exit(l->else_, id, under_try, bad) +
-            count_exit(l->sw_default, id, under_try, bad);
+            dmul * count_exit(l->sw_default, id, under_try, bad);
     for (auto& a : l->args) c += count_exit(a, id, under_try, bad);
     for (auto& b : l->bindings) c += count_exit(b.val, id, under_try, bad);
     for (auto& sc : l->sw_consts) c += count_exit(sc.body, id, under_try, bad);
@@ -10631,7 +10639,30 @@ struct Translator {
       result = i;
     } else if (NB >= 2) {
       auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
-      sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks); result = sw;
+      sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks);
+      // matching.ml's reintroduce_fail: on an exhaustive switch, the exit id
+      // with the most bare `(exit i)` cases (ties -> minimal id), if it has at
+      // least 3, becomes the failaction; its cases are removed and the switch
+      // turns sparse (`case tag 1 .. case tag 3 .. default: (exit i)`).  Purely
+      // structural -- the removed tags reach the same exit through default:.
+      {
+        auto is_bare = [](const LamPtr& b) -> int {
+          return b->k == Lam::K::Staticraise && b->args.empty() ? b->prim_arg : -1; };
+        std::map<int, int> cnt;  // ascending id, so `>` keeps the minimal on ties
+        for (auto& c : sw->sw_consts) if (int i = is_bare(c.body); i >= 0) cnt[i]++;
+        for (auto& c : sw->sw_blocks) if (int i = is_bare(c.body); i >= 0) cnt[i]++;
+        int best = -1, bc = -1;
+        for (auto& [i, c] : cnt) if (c > bc) { bc = c; best = i; }
+        if (bc >= 3) {
+          auto rm = [&](std::vector<Lam::SwitchCase>& v) {
+            v.erase(std::remove_if(v.begin(), v.end(), [&](const Lam::SwitchCase& c) {
+                      return is_bare(c.body) == best; }), v.end()); };
+          rm(sw->sw_consts); rm(sw->sw_blocks);
+          auto de = mk(Lam::K::Staticraise); de->prim_arg = best;
+          sw->sw_default = de; sw->sw_numconsts = NC; sw->sw_numblocks = NB;
+        }
+      }
+      result = sw;
     } else if (NB == 1 && NC == 0) {
       result = blocks[0].body;
     } else if (NB == 1 && NC >= 2) {
