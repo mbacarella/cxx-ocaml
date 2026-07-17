@@ -12645,8 +12645,13 @@ struct Translator {
       bool guarded_nonvar = false;
       for (auto& r : rows)
         if (r.guard && !is_catchall(*r.lhs)) guarded_nonvar = true;
+      // An exhaustive binding-free or-row (`Some _ | None -> ""`) serves as the
+      // shared fallback exactly like a bare `_`: it matches whatever reaches it,
+      // so its rhs is the catch handler with no residual test (ccomp's
+      // debug_prefix_map guard).
       if (guarded_nonvar && rows.size() >= 2 && !rows.back().guard &&
-          is_catchall(*rows.back().lhs)) {
+          (is_catchall(*rows.back().lhs) ||
+           exhaustive_irref_col(rows.back().lhs))) {
         int eid = ++next_exit_;
         auto exitL = mk(Lam::K::Staticraise); exitL->prim_arg = eid;
         std::vector<Row> inner(rows.begin(), rows.end() - 1);
