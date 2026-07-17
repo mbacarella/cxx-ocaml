@@ -814,6 +814,11 @@ struct Translator {
   // sublets; a var column simplif-substitutes away), in every tail context --
   // if arms, switch arms, both sides of a try (Matching.for_let/map_return).
   bool bind_tuple_cols_ = false;
+  // Did tail_tuple_exit decompose at least one tuple tail?  Mirrors the `opt`
+  // ref assign_pat threads through map_return: a leaf tail (apply, var, send)
+  // gets its whole-pattern sublet but does NOT activate the optimization; the
+  // caller keeps the allocating form unless some tail was a real tuple.
+  bool tuple_cols_opt_ = false;
   // Decision-node budget for the general matrix matcher (gmatch): each gmatch call
   // is one decision-tree node, so this caps the tree size.  A combinatorial matrix
   // (a var row spreading across many tag x tag combinations, which we -- unlike
@@ -7994,13 +7999,38 @@ struct Translator {
   // Read record field `fi` of `s` with the spelling its kind implies (an int field
   // is field_int, a mutable boxed field field_mut, otherwise field_imm).
   // Rewrite every TAIL value of `l` that is a k-tuple construction into
-  // (exit N <components>); bottoms (raise / existing exits) stay.  Returns
-  // false when any tail produces the tuple un-decomposed (a variable, a call)
-  // -- the caller then keeps the allocating form.  This is how
+  // (exit N <components>); bottoms (raise / existing exits) stay; any other
+  // tail gets the whole-pattern leaf sublet.  The caller uses the result only
+  // when tuple_cols_opt_ reports that at least one tail really decomposed --
+  // otherwise it keeps the allocating form.  This is how
   // `let (a, b) = match .. with .. -> e1, e2` avoids building the pair
   // (Matching's exit-with-args form).
   bool tail_tuple_exit(LamPtr& l, int n, size_t k) {
     if (!l) return false;
+    // Any tail that is not a decomposable tuple construction gets ocamlc's
+    // assign_pat LEAF treatment: the whole pattern becomes one sublet,
+    // `let *match* = tail in (exit N (field_imm 0 *match*) ..)` -- a Var tail's
+    // alias lets simplif-inline to direct field reads with no let.  The leaf
+    // does NOT set tuple_cols_opt_ (upstream's `opt` stays false), so a rhs
+    // with ONLY leaf tails still takes the allocating path.
+    auto leaf = [&]() {
+      auto ex = mk(Lam::K::Staticraise);
+      ex->prim_arg = n;
+      if (l->k == Lam::K::Var) {
+        LamPtr v = lam_alloc_copy(*l);
+        for (size_t i = 0; i < k; ++i) ex->args.push_back(fieldimm((int)i, v));
+        *l = *ex;
+      } else {
+        Ident t = fresh("", true);
+        LamPtr tv = varof(t);
+        for (size_t i = 0; i < k; ++i) ex->args.push_back(fieldimm((int)i, tv));
+        auto lt = mk(Lam::K::Let);
+        lt->bindings.push_back({t, ValueKind::Gen, lam_alloc_copy(*l)});
+        lt->body = ex;
+        *l = *lt;
+      }
+      return true;
+    };
     switch (l->k) {
       case Lam::K::Prim:
         if (l->prim == Prim::Makeblock && l->prim_arg == 0 && l->args.size() == k) {
@@ -8022,6 +8052,7 @@ struct Translator {
           auto is_bindable = [](const LamPtr& a) {
             return a->k != Lam::K::Var && !a->from_alias;
           };
+          tuple_cols_opt_ = true;
           bool do_bind = bind_tuple_cols_;
           std::vector<Lam::Binding> binds;  // outermost first
           for (size_t i = l->args.size(); do_bind && i-- > 0; ) {
@@ -8046,12 +8077,13 @@ struct Translator {
           return true;
         }
         if (l->prim == Prim::Raise || l->prim == Prim::Reraise) return true;
-        return false;
+        return leaf();
       case Lam::K::ConstBlock:
         if (l->prim_arg == 0 && l->args.size() == k) {
           // ocamlc's assign_pat Lconst(Const_block) case decomposes a constant
           // tuple tail too, binding each component (`let (b = [0:..] a = 24)
           // (exit N a b)` -- ccomp's `("", "")` arms).
+          tuple_cols_opt_ = true;
           std::vector<Lam::Binding> binds;  // outermost first
           for (size_t i = l->args.size(); bind_tuple_cols_ && i-- > 0; ) {
             LamPtr& a = l->args[i];
@@ -8071,7 +8103,7 @@ struct Translator {
           }
           return true;
         }
-        return false;
+        return leaf();
       case Lam::K::Staticraise: return true;  // bottom w.r.t. the value
       case Lam::K::Let:
       case Lam::K::Letrec: return tail_tuple_exit(l->body, n, k);
@@ -8107,7 +8139,10 @@ struct Translator {
         return tail_tuple_exit(l->cond, n, k) && tail_tuple_exit(l->then_, n, k);
       case Lam::K::Try:
         return tail_tuple_exit(l->body, n, k) && tail_tuple_exit(l->then_, n, k);
-      default: return false;
+      default:
+        // Var, Apply, Send, While/For (unit -- unreachable for a tuple type),
+        // and anything else map_return treats as a hole.
+        return leaf();
     }
   }
 
@@ -16464,9 +16499,13 @@ struct Translator {
             // every tail context it traverses -- if arms, switch arms, and both
             // sides of a try (Matching.for_let).
             bool save_btc = bind_tuple_cols_;
+            bool save_opt = tuple_cols_opt_;
             bind_tuple_cols_ = true;
+            tuple_cols_opt_ = false;
             bool tte = tail_tuple_exit(mm, n, tp->elems.size());
+            tte = tte && tuple_cols_opt_;
             bind_tuple_cols_ = save_btc;
+            tuple_cols_opt_ = save_opt;
             if (tte) {
               auto cat = mk(Lam::K::Catch);
               cat->cond = mm;
