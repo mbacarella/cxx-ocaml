@@ -7727,7 +7727,9 @@ struct Translator {
         for (size_t i = 0; i < vars.size(); ++i) {
           auto let = mk(Lam::K::Let);
           ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
-          let->bindings = {{vars[i], k, l->args[i]}};  // Strict
+          // A dup-able arg (var / field_imm chain) is the pattern-var Alias
+          // binding ocamlc's leaf would have made -- simplif substitutes it.
+          let->bindings = {{vars[i], k, l->args[i], is_alias_dup(l->args[i])}};
           let->body = res; res = let;
         }
       l = res; return;
@@ -10079,7 +10081,9 @@ struct Translator {
       out.push_back(n);
     };
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
-      add(pa->name.txt); collect_gvars(pa->p.get(), out); return;
+      // iter_bound_idents visits the sub-pattern BEFORE the alias id, and this
+      // order is the or-arm's exit-arg / catch-var order (`with (N e err)`).
+      collect_gvars(pa->p.get(), out); add(pa->name.txt); return;
     }
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) { add(pv->name.txt); return; }
     if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
@@ -10572,12 +10576,14 @@ struct Translator {
             if ((int)fps.size() != a) return nullptr;       // shape we can't split
           }
           MRow nr; nr.rhs = r.rhs; nr.binds = r.binds; nr.guard = r.guard;
+          nr.aid = r.aid; nr.vnames = r.vnames;   // keep action-sharing through the split
           for (auto* fp : fps) nr.cols.push_back(fp);
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
         } else {
           bind0(r);
           MRow nr; nr.rhs = r.rhs; nr.binds = r.binds; nr.guard = r.guard;
+          nr.aid = r.aid; nr.vnames = r.vnames;   // keep action-sharing through the split
           for (int j = 0; j < a; ++j) nr.cols.push_back(&any_pat);
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
