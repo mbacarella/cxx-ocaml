@@ -10789,7 +10789,11 @@ struct Translator {
   // _ | Cstr_block _ | Cstr_unboxed | Cstr_extension _`).  ocamlc treats a trailing
   // tuple row whose columns are all such patterns (`(all_ctors), _ -> false`) as the
   // ONE shared default, so every leaf failure exits to a single handler.
-  bool exhaustive_irref_col(const Pattern* col) {
+  // need_cover=false: accept a binding-free all-irrefutable ctor or-pattern
+  // WITHOUT requiring it to cover the whole type -- valid as a match's shared
+  // fallback when the typer already proved the match Total (anything failing
+  // the earlier rows can only match this one).
+  bool exhaustive_irref_col(const Pattern* col, bool need_cover = true) {
     const Pattern* ep = effective_pat(col);
     if (std::holds_alternative<Ppat_any>(ep->desc) ||
         std::get_if<Ppat_var>(&ep->desc)) return true;
@@ -10817,6 +10821,7 @@ struct Translator {
       names.insert(cn);
     }
     if (type.empty()) return false;
+    if (!need_cover) return true;
     auto tc = type_ctors_.find(type);
     if (tc == type_ctors_.end()) return false;
     return (int)names.size() == tc->second.first + tc->second.second;  // covers every ctor
@@ -12648,10 +12653,12 @@ struct Translator {
       // An exhaustive binding-free or-row (`Some _ | None -> ""`) serves as the
       // shared fallback exactly like a bare `_`: it matches whatever reaches it,
       // so its rhs is the catch handler with no residual test (ccomp's
-      // debug_prefix_map guard).
+      // debug_prefix_map guard).  When the typer proved the match Total, the
+      // coverage requirement drops: a value failing every earlier row can only
+      // match the trailing row (`A n when g -> .. | B -> .. | A _ | C _ -> ..`).
       if (guarded_nonvar && rows.size() >= 2 && !rows.back().guard &&
           (is_catchall(*rows.back().lhs) ||
-           exhaustive_irref_col(rows.back().lhs))) {
+           exhaustive_irref_col(rows.back().lhs, /*need_cover=*/!total))) {
         int eid = ++next_exit_;
         auto exitL = mk(Lam::K::Staticraise); exitL->prim_arg = eid;
         std::vector<Row> inner(rows.begin(), rows.end() - 1);
