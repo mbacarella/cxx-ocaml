@@ -13494,10 +13494,14 @@ struct Translator {
     std::vector<int> k; comp_clusters(cases, k);
     std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
     make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
-    // ocamlc emits an if-chain -> let int_cases match it byte-for-byte.  But
-    // int_cases lowers a range arm to the naive `>=lo && <=hi`, so when the
-    // cover has a genuine interval we MUST emit the Switcher's `isout` test tree.
-    if (!made_switch && !has_interval) return nullptr;
+    // For an int if-chain, int_cases already matches ocamlc byte-for-byte, so we
+    // defer to it (int_cases lowers a range arm to the naive `>=lo && <=hi`, so a
+    // genuine interval still needs the Switcher's `isout` test tree here).  A
+    // CHAR if-chain is different: int_cases only handles a lone char, so a
+    // multi-char match falls through to naive_match's source-order `==` chain,
+    // whereas ocamlc's call_switcher emits a SORTED `!=` test sequence -- which is
+    // exactly what c_test builds below.  Route multi-char discrete matches here.
+    if (!made_switch && !has_interval && !is_char) return nullptr;
 
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     int nd = count_default_leaves(tree);
