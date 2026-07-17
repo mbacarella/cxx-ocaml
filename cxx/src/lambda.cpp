@@ -14666,7 +14666,9 @@ struct Translator {
         oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
         auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
         blk->args = {str, oid};
-        Ident id = fresh(nm);
+        // ocamlc's transl_extension_constructor makes every extension-ctor
+        // ident SCOPED (Scoped < Local in Ident.compare -> closure fv order)
+        Ident id = fresh_scoped(nm);
         // save what this local exception shadows, restore after the body
         bool had_i = exn_ident_.count(nm), had_a = exn_arity_.count(nm);
         Ident sav_i = had_i ? exn_ident_[nm] : Ident{};
@@ -20061,7 +20063,7 @@ struct Translator {
                 if (auto f = fm.find(en); f != fm.end()) v = field_of(global_of(modp), f->second);
               }
               if (v) {
-                Ident id = fresh(nm);
+                Ident id = fresh_scoped(nm);  // extension ctors are Scoped
                 cur.push_back({id, ValueKind::Gen, v});
                 exn_ident_[nm] = id; add_export(nm, id, modsig::NS::Typext);
                 continue;
@@ -20071,7 +20073,7 @@ struct Translator {
           }
           // non-local target (stdlib/qualified): bind a let to its value
           if (LamPtr v = exn_value(lid_last(rb->id.txt))) {
-            Ident id = fresh(nm);
+            Ident id = fresh_scoped(nm);  // extension ctors are Scoped
             cur.push_back({id, ValueKind::Gen, v});
             exn_ident_[nm] = id;
             add_export(nm, id, modsig::NS::Typext);
@@ -20083,7 +20085,7 @@ struct Translator {
         oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
         auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
         blk->args = {str, oid};
-        Ident id = fresh(nm);
+        Ident id = fresh_scoped(nm);  // extension ctors are Scoped
         cur.push_back({id, ValueKind::Gen, blk});
         exn_ident_[nm] = id;
         if (auto* d = std::get_if<Pext_decl>(&pe->exn.ctor.kind)) {
@@ -20121,7 +20123,7 @@ struct Translator {
           oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
           auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
           blk->args = {str, oid};
-          Ident id = fresh(nm);
+          Ident id = fresh_scoped(nm);  // extension ctors are Scoped
           cur.push_back({id, ValueKind::Gen, blk});
           exn_ident_[nm] = id;
           if (auto* d = std::get_if<Pext_decl>(&c.kind)) {
