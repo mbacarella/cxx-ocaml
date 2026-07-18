@@ -7788,6 +7788,179 @@ struct Translator {
     }
     l = body;
   }
+  // Faithful port of Lambda.make_key (lambda.ml:443) -- the alpha-normalizing
+  // structural key share_actions_sw dedups switch actions with.  Differs from
+  // make_lam_key (the bytegen Storer key, deliberately conservative): Alias
+  // lets are SUBSTITUTED into their occurrences, `let x = ex in x`
+  // (Strict/StrictOpt) collapses to ex, other let/mutlet binders are
+  // alpha-renamed so arms differing only in binder stamps share, exits keep
+  // their target id, and a term over 32 nodes -- or containing a function,
+  // letrec, for or while -- is Not_simple ("" = never shared).  Try's exn var,
+  // Assign's target and catch vars stay literal (upstream does not rename
+  // them), so those only share between textually-identical stamps.
+  static std::string oc_make_key(const LamPtr& top) {
+    int count = 0, nk = 0;
+    std::map<int, std::string> env;  // binder stamp -> replacement key text
+    std::function<std::string(const LamPtr&)> tr = [&](const LamPtr& n) -> std::string {
+      if (!n) return "_";
+      if (++count > 32) return "";  // max_raw: too big to be worth sharing
+      using K = Lam::K;
+      switch (n->k) {
+        case K::Function: case K::Letrec: case K::For: case K::While: return "";
+        case K::Var: case K::Mutvar: {
+          auto it = env.find(n->var.stamp);
+          if (it != env.end()) return it->second;
+          return (n->k == K::Var ? "v" : "m") + n->var.name + "#" + std::to_string(n->var.stamp);
+        }
+        case K::ConstInt: return "i" + std::to_string(n->int_val);
+        case K::ConstChar: return "c" + std::to_string(n->int_val);
+        case K::ConstFloat: return "f" + n->str_val;
+        case K::ConstString: return "s" + n->str_val;
+        default: break;
+      }
+      if (n->k == K::Let) {
+        // Sequential bindings = upstream's nested Llets, one node each (the
+        // first accounted by this call's ++count above).
+        std::string acc = "(L";
+        for (size_t i = 0; i < n->bindings.size(); ++i) {
+          auto& b = n->bindings[i];
+          if (i > 0 && ++count > 32) return "";
+          std::string vk = tr(b.val);
+          if (vk.empty()) return "";
+          if (b.alias && !b.mut) { env[b.id.stamp] = vk; continue; }  // substitute
+          // `let x = ex in x` (Strict/StrictOpt): the body Lvar is not visited
+          if (!b.mut && i + 1 == n->bindings.size() && acc == "(L" &&
+              n->body && n->body->k == K::Var && n->body->var.stamp == b.id.stamp)
+            return vk;
+          std::string y = "k" + std::to_string(nk++);
+          env[b.id.stamp] = (b.mut ? "m" : "v") + y;
+          acc += std::string(b.mut ? " M" : b.strict_opt ? " O" : " S") + y + ":" +
+                 std::to_string((int)b.kind) + "=" + vk;
+        }
+        std::string bk = tr(n->body);
+        if (bk.empty()) return "";
+        if (acc == "(L") return bk;  // every binding was a substituted alias
+        return acc + " " + bk + ")";
+      }
+      std::string r = "(" + std::to_string((int)n->k);
+      if (n->k == K::Prim) {
+        r += ":" + std::to_string((int)n->prim) + ":" + n->prim_id + ":" + std::to_string(n->prim_arg);
+        for (auto vk : n->blk_shape) r += "," + std::to_string((int)vk);
+      }
+      if (n->k == K::ConstBlock) r += ":" + std::to_string(n->prim_arg);
+      if (n->k == K::Staticraise || n->k == K::Catch) r += ":X" + std::to_string(n->prim_arg);
+      if (n->k == K::Assign || n->k == K::Try)
+        r += ":x" + n->var.name + "#" + std::to_string(n->var.stamp);
+      for (auto& cv : n->catch_vars) r += ":c" + cv.name + "#" + std::to_string(cv.stamp);
+      auto add = [&](const LamPtr& c) {
+        if (!c || r.empty()) return;
+        std::string k2 = tr(c);
+        if (k2.empty()) r = ""; else r += " " + k2;
+      };
+      add(n->fn); add(n->cond); add(n->then_); add(n->else_); add(n->body); add(n->sw_default);
+      for (auto& a : n->args) add(a);
+      for (auto& sc : n->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
+      for (auto& sc : n->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
+      if (n->k == K::Switch && !r.empty())
+        r += ":" + std::to_string(n->sw_numconsts) + ":" + std::to_string(n->sw_numblocks);
+      if (r.empty()) return "";
+      return r + ")";
+    };
+    return tr(top);
+  }
+  // Matching.as_simple_exit: a bare argument-less (exit i), looking through
+  // Alias lets (whose bindings an exit with no args cannot use).
+  static int as_bare_exit_thru_alias(const LamPtr& l) {
+    const Lam* p = l.get();
+    while (p->k == Lam::K::Let && !p->bindings.empty() &&
+           std::all_of(p->bindings.begin(), p->bindings.end(),
+                       [](const Lam::Binding& b) { return b.alias && !b.mut; }))
+      p = p->body.get();
+    return p->k == Lam::K::Staticraise && p->args.empty() ? p->prim_arg : -1;
+  }
+  // matching.ml:3345-3347, combine_regular_constructor's general-switch branch:
+  //   let hs, sw = share_actions_sw sw in
+  //   let sw = reintroduce_fail sw in
+  //   hs (Lswitch (arg, sw, loc))
+  // share_actions_sw: every action is stored under its Lambda.make_key; a key
+  // hit marks the slot shared.  A shared slot that is already a bare exit
+  // (through Alias lets) keeps its id; any other shared slot dispatches
+  // through a fresh exit whose handler catch wraps OUTSIDE the finished
+  // switch, in slot order (later-stored outermost).  reintroduce_fail then
+  // promotes the most-cited bare exit (>= 3, ties -> minimal id) to the
+  // failaction, turning the dense switch sparse.  Takes the freshly built
+  // DENSE switch (all type tags present, no default) and returns it wrapped
+  // in the shared-action catches.
+  LamPtr share_actions_and_refail(LamPtr sw) {
+    int NC = (int)sw->sw_consts.size(), NB = (int)sw->sw_blocks.size();
+    // --- same_actions guard (matching.ml:3284 `None, Some act -> act`): every
+    // action alpha-equal -> the first action directly, no switch at all.  When
+    // the type is NOT fully covered by real clauses, gap tags hold shared-
+    // default exits whose keys differ from any real action, so the guard
+    // fails exactly where upstream's fail_opt <> None disables it.
+    {
+      std::string k0; bool all = true; const LamPtr* first = nullptr;
+      for (auto* v : {&sw->sw_consts, &sw->sw_blocks}) {
+        for (auto& c : *v) {
+          if (!first) { first = &c.body; k0 = oc_make_key(c.body); if (k0.empty()) { all = false; break; } }
+          else if (oc_make_key(c.body) != k0) { all = false; break; }
+        }
+        if (!all) break;
+      }
+      if (all && first) return *first;
+    }
+    // --- share_actions_sw
+    struct Slot { bool shared; LamPtr act; };
+    std::vector<Slot> acts;
+    std::map<std::string, int> keyed;
+    std::vector<int> cidx, bidx;
+    auto store_act = [&](const LamPtr& a) -> int {
+      std::string k = oc_make_key(a);
+      if (!k.empty()) {
+        auto it = keyed.find(k);
+        if (it != keyed.end()) { acts[it->second].shared = true; return it->second; }
+      }
+      acts.push_back({false, a});
+      if (!k.empty()) keyed.emplace(std::move(k), (int)acts.size() - 1);
+      return (int)acts.size() - 1;
+    };
+    for (auto& c : sw->sw_consts) cidx.push_back(store_act(c.body));
+    for (auto& c : sw->sw_blocks) bidx.push_back(store_act(c.body));
+    std::vector<LamPtr> resolved(acts.size());
+    std::vector<std::pair<int, LamPtr>> catches;  // (exit id, handler), slot order
+    for (size_t j = 0; j < acts.size(); ++j) {
+      if (!acts[j].shared) { resolved[j] = acts[j].act; continue; }
+      int se = as_bare_exit_thru_alias(acts[j].act);
+      auto x = mk(Lam::K::Staticraise);
+      if (se >= 0) x->prim_arg = se;  // make_catch_delayed's `Some i`: reuse, no handler
+      else { x->prim_arg = ++next_exit_; catches.emplace_back(x->prim_arg, acts[j].act); }
+      resolved[j] = x;
+    }
+    for (size_t j = 0; j < cidx.size(); ++j) sw->sw_consts[j].body = resolved[cidx[j]];
+    for (size_t j = 0; j < bidx.size(); ++j) sw->sw_blocks[j].body = resolved[bidx[j]];
+    // --- reintroduce_fail
+    std::map<int, int> cnt;  // ascending id, so `>` keeps the minimal on ties
+    for (auto& c : sw->sw_consts) if (int i = as_bare_exit_thru_alias(c.body); i >= 0) cnt[i]++;
+    for (auto& c : sw->sw_blocks) if (int i = as_bare_exit_thru_alias(c.body); i >= 0) cnt[i]++;
+    int best = -1, bc = -1;
+    for (auto& [i, c] : cnt) if (c > bc) { bc = c; best = i; }
+    if (bc >= 3) {
+      auto rm = [&](std::vector<Lam::SwitchCase>& v) {
+        v.erase(std::remove_if(v.begin(), v.end(), [&](const Lam::SwitchCase& c) {
+                  return as_bare_exit_thru_alias(c.body) == best; }), v.end()); };
+      rm(sw->sw_consts); rm(sw->sw_blocks);
+      auto de = mk(Lam::K::Staticraise); de->prim_arg = best;
+      sw->sw_default = de; sw->sw_numconsts = NC; sw->sw_numblocks = NB;
+    }
+    // --- hs: wrap the handler catches, first-allocated innermost
+    LamPtr result = sw;
+    for (auto& [xid, h] : catches) {
+      auto c = mk(Lam::K::Catch);
+      c->cond = result; c->then_ = h; c->prim_arg = xid;
+      result = c;
+    }
+    return result;
+  }
   // A pure, freely-duplicable term: an immutable field read (Pfield, our FieldImm)
   // of a duplicable base, or a bare Var.  These are exactly the shapes ocamlc's
   // Matching/Simplif bind with the Alias let-kind, so substituting one into its
@@ -9784,11 +9957,12 @@ struct Translator {
         return i;
       }
     }
-    // nb>=2 -> one (switch* scrut case int V: .. case tag T: ..) over both.
+    // nb>=2 -> one (switch* scrut case int V: .. case tag T: ..) over both,
+    // then upstream's share_actions_sw + reintroduce_fail on the dense result.
     if (blocks.size() >= 2) {
       auto sw = mk(Lam::K::Switch); sw->cond = scrut;
       sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks);
-      return sw;
+      return share_actions_and_refail(sw);
     }
     // nb==1, nc==0 -> the single block arm directly (e.g. `type t = T of int`).
     if (consts.empty()) return blocks[0].body;
@@ -10640,29 +10814,7 @@ struct Translator {
     } else if (NB >= 2) {
       auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
       sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks);
-      // matching.ml's reintroduce_fail: on an exhaustive switch, the exit id
-      // with the most bare `(exit i)` cases (ties -> minimal id), if it has at
-      // least 3, becomes the failaction; its cases are removed and the switch
-      // turns sparse (`case tag 1 .. case tag 3 .. default: (exit i)`).  Purely
-      // structural -- the removed tags reach the same exit through default:.
-      {
-        auto is_bare = [](const LamPtr& b) -> int {
-          return b->k == Lam::K::Staticraise && b->args.empty() ? b->prim_arg : -1; };
-        std::map<int, int> cnt;  // ascending id, so `>` keeps the minimal on ties
-        for (auto& c : sw->sw_consts) if (int i = is_bare(c.body); i >= 0) cnt[i]++;
-        for (auto& c : sw->sw_blocks) if (int i = is_bare(c.body); i >= 0) cnt[i]++;
-        int best = -1, bc = -1;
-        for (auto& [i, c] : cnt) if (c > bc) { bc = c; best = i; }
-        if (bc >= 3) {
-          auto rm = [&](std::vector<Lam::SwitchCase>& v) {
-            v.erase(std::remove_if(v.begin(), v.end(), [&](const Lam::SwitchCase& c) {
-                      return is_bare(c.body) == best; }), v.end()); };
-          rm(sw->sw_consts); rm(sw->sw_blocks);
-          auto de = mk(Lam::K::Staticraise); de->prim_arg = best;
-          sw->sw_default = de; sw->sw_numconsts = NC; sw->sw_numblocks = NB;
-        }
-      }
-      result = sw;
+      result = share_actions_and_refail(sw);
     } else if (NB == 1 && NC == 0) {
       result = blocks[0].body;
     } else if (NB == 1 && NC >= 2) {
