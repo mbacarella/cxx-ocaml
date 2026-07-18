@@ -8665,7 +8665,8 @@ struct Translator {
       LamPtr dft_body = dft_rows.empty() ? raise_predef("Match_failure", mloc, "mm_enum_dft")
                                          : mm_cols(comps, dft_rows, i + 1, mloc);
       if (!dft_body) return nullptr;
-      auto sw = mk(Lam::K::Switch); sw->cond = comps[i];
+      std::vector<Lam::SwitchCase> cases;
+      bool has_gap = false;
       for (int t = 0; t < n_const; ++t) {
         std::vector<MRow> sub;
         bool explicit_t = false;
@@ -8674,11 +8675,39 @@ struct Translator {
             if (ctor_info_.at(ctor_of(*r.cols[i])).tag == t) { sub.push_back(r); explicit_t = true; }
           } else sub.push_back(bind(r));
         }
-        if (!explicit_t) { sw->sw_consts.push_back({t, dft_body}); continue; }
+        if (!explicit_t) { has_gap = true; cases.push_back({t, nullptr}); continue; }
         LamPtr cb = mm_cols(comps, std::move(sub), i + 1, mloc);
         if (!cb) return nullptr;
-        sw->sw_consts.push_back({t, cb});
+        cases.push_back({t, cb});
       }
+      // A gapped column over a var-row default is upstream's canfail shape: the
+      // var rows form a default MATRIX compiled as a static handler, uncovered
+      // tags raise its exit, and call_switcher clusters WITH the fail action
+      // (matching.ml:3301) -- e.g. one explicit tag becomes a single `!=` test,
+      // not a dense switch.  simplify_static_catches then inlines the handler
+      // when the tree raises it once, like upstream's simplify_exits.
+      // ... but only when the column actually discriminates: our division (unlike
+      // upstream's default MATRIX) copies var rows into every case's sub-matrix,
+      // so a case body can collapse to the default itself -- clustering then
+      // builds a pointless `if` with identical branches (translprim's
+      // glb_array_type).  Those stay on the dense-switch path.
+      bool discriminates = false;
+      for (auto& c : cases)
+        if (c.body && !same_action_lam(c.body, dft_body)) { discriminates = true; break; }
+      if (has_gap && discriminates && !dft_rows.empty()) {
+        int eid = ++next_exit_;
+        std::vector<Lam::SwitchCase> fills = cases;
+        for (auto& c : fills)
+          if (!c.body) { auto e = mk(Lam::K::Staticraise); e->prim_arg = eid; c.body = e; }
+        if (LamPtr tree = canfail_const_dispatch(comps[i], fills, eid)) {
+          auto cat = mk(Lam::K::Catch);
+          cat->cond = tree; cat->prim_arg = eid; cat->then_ = dft_body;
+          return cat;
+        }
+        --next_exit_;  // clustering chose a jump table: dense switch, id unused
+      }
+      auto sw = mk(Lam::K::Switch); sw->cond = comps[i];
+      for (auto& c : cases) sw->sw_consts.push_back({c.tag, c.body ? c.body : dft_body});
       return sw;  // exhaustive: switch*, no failaction
     }
     if (n_const != 1 || n_block != 1) return nullptr;  // only 1-const/1-block below
@@ -9973,7 +10002,7 @@ struct Translator {
         auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
         isint->prim_id = "isint"; isint->args = {scrut};
         auto i = mk(Lam::K::IfThenElse);
-        i->cond = isint; i->then_ = const_dispatch(scrut, consts); i->else_ = b0;
+        i->cond = isint; i->then_ = const_dispatch_gaps(scrut, consts, cseen); i->else_ = b0;
         return i;
       }
     }
@@ -9990,7 +10019,7 @@ struct Translator {
     auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
     isint->prim_id = "isint"; isint->args = {scrut};
     auto i = mk(Lam::K::IfThenElse);
-    i->cond = isint; i->then_ = const_dispatch(scrut, consts); i->else_ = blocks[0].body;
+    i->cond = isint; i->then_ = const_dispatch_gaps(scrut, consts, cseen); i->else_ = blocks[0].body;
     return i;
   }
   // Dispatch over a variant's constant constructors (values 0..nc-1, sorted):
@@ -10101,6 +10130,26 @@ struct Translator {
     // `(exit fail_exit)` -- the handler is the caller's shared-default catch.
     rewrite_default_leaves(tree, fail_exit, nullptr);
     return tree;
+  }
+  // ctor_match's twin of gmatch's const_side: when the uncovered constant slots
+  // (`covered` = explicitly matched values) were filled with a common argless
+  // exit -- the shared default in a catch context -- upstream's constant side
+  // goes through call_switcher WITH that fail (matching.ml:3301, including the
+  // act0 isint splits), so try the canfail clustering before the nofail dispatch.
+  LamPtr const_dispatch_gaps(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts,
+                             const std::set<int>& covered) {
+    int fexit = -1;
+    bool gaps_ok = true;
+    for (auto& c : consts) {
+      if (covered.count((int)c.tag)) continue;
+      const LamPtr& b = c.body;
+      if (b->k != Lam::K::Staticraise || !b->args.empty() ||
+          (fexit >= 0 && fexit != b->prim_arg)) { gaps_ok = false; break; }
+      fexit = b->prim_arg;
+    }
+    if (gaps_ok && fexit >= 0)
+      if (LamPtr t = canfail_const_dispatch(scrut, consts, fexit)) return t;
+    return const_dispatch(scrut, consts);
   }
 
   // ----- nested-pattern matcher (one ctor row + a trailing catch-all) ----------
