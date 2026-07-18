@@ -7888,17 +7888,21 @@ struct Translator {
   // through a fresh exit whose handler catch wraps OUTSIDE the finished
   // switch, in slot order (later-stored outermost).  reintroduce_fail then
   // promotes the most-cited bare exit (>= 3, ties -> minimal id) to the
-  // failaction, turning the dense switch sparse.  Takes the freshly built
-  // DENSE switch (all type tags present, no default) and returns it wrapped
-  // in the shared-action catches.
+  // failaction, turning the dense switch sparse.  Called on ctor_match's
+  // freshly built dense switches (bodies are real there) and by
+  // share_switches_rec on the gmatch pipeline's switches after wire_garms;
+  // returns the switch wrapped in the shared-action catches.
   LamPtr share_actions_and_refail(LamPtr sw) {
     int NC = (int)sw->sw_consts.size(), NB = (int)sw->sw_blocks.size();
     // --- same_actions guard (matching.ml:3284 `None, Some act -> act`): every
     // action alpha-equal -> the first action directly, no switch at all.  When
     // the type is NOT fully covered by real clauses, gap tags hold shared-
     // default exits whose keys differ from any real action, so the guard
-    // fails exactly where upstream's fail_opt <> None disables it.
-    {
+    // fails exactly where upstream's fail_opt <> None disables it.  A switch
+    // that already HAS a failaction (an earlier pass promoted one) must keep
+    // it reachable: no collapse, and refail below is skipped (upstream's
+    // `Some _ -> sw`).
+    if (!sw->sw_default) {
       std::string k0; bool all = true; const LamPtr* first = nullptr;
       for (auto* v : {&sw->sw_consts, &sw->sw_blocks}) {
         for (auto& c : *v) {
@@ -7938,19 +7942,21 @@ struct Translator {
     }
     for (size_t j = 0; j < cidx.size(); ++j) sw->sw_consts[j].body = resolved[cidx[j]];
     for (size_t j = 0; j < bidx.size(); ++j) sw->sw_blocks[j].body = resolved[bidx[j]];
-    // --- reintroduce_fail
-    std::map<int, int> cnt;  // ascending id, so `>` keeps the minimal on ties
-    for (auto& c : sw->sw_consts) if (int i = as_bare_exit_thru_alias(c.body); i >= 0) cnt[i]++;
-    for (auto& c : sw->sw_blocks) if (int i = as_bare_exit_thru_alias(c.body); i >= 0) cnt[i]++;
-    int best = -1, bc = -1;
-    for (auto& [i, c] : cnt) if (c > bc) { bc = c; best = i; }
-    if (bc >= 3) {
-      auto rm = [&](std::vector<Lam::SwitchCase>& v) {
-        v.erase(std::remove_if(v.begin(), v.end(), [&](const Lam::SwitchCase& c) {
-                  return as_bare_exit_thru_alias(c.body) == best; }), v.end()); };
-      rm(sw->sw_consts); rm(sw->sw_blocks);
-      auto de = mk(Lam::K::Staticraise); de->prim_arg = best;
-      sw->sw_default = de; sw->sw_numconsts = NC; sw->sw_numblocks = NB;
+    // --- reintroduce_fail (only when no failaction yet, upstream's None case)
+    if (!sw->sw_default) {
+      std::map<int, int> cnt;  // ascending id, so `>` keeps the minimal on ties
+      for (auto& c : sw->sw_consts) if (int i = as_bare_exit_thru_alias(c.body); i >= 0) cnt[i]++;
+      for (auto& c : sw->sw_blocks) if (int i = as_bare_exit_thru_alias(c.body); i >= 0) cnt[i]++;
+      int best = -1, bc = -1;
+      for (auto& [i, c] : cnt) if (c > bc) { bc = c; best = i; }
+      if (bc >= 3) {
+        auto rm = [&](std::vector<Lam::SwitchCase>& v) {
+          v.erase(std::remove_if(v.begin(), v.end(), [&](const Lam::SwitchCase& c) {
+                    return as_bare_exit_thru_alias(c.body) == best; }), v.end()); };
+        rm(sw->sw_consts); rm(sw->sw_blocks);
+        auto de = mk(Lam::K::Staticraise); de->prim_arg = best;
+        sw->sw_default = de; sw->sw_numconsts = NC; sw->sw_numblocks = NB;
+      }
     }
     // --- hs: wrap the handler catches, first-allocated innermost
     LamPtr result = sw;
@@ -10812,9 +10818,14 @@ struct Translator {
       i->cond = isint; i->then_ = const_dispatch(comps[0], consts); i->else_ = blocks[0].body;
       result = i;
     } else if (NB >= 2) {
+      // Plain dense switch; share_actions_sw + reintroduce_fail run in the
+      // POST-wire_garms pass (share_switches_rec) -- at this point the case
+      // bodies are still `(exit aid)` arm placeholders, so keying them here
+      // could never share alpha-equal arms the way upstream's combine (which
+      // sees compiled bodies) does.
       auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
       sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks);
-      result = share_actions_and_refail(sw);
+      result = sw;
     } else if (NB == 1 && NC == 0) {
       result = blocks[0].body;
     } else if (NB == 1 && NC >= 2) {
@@ -10905,6 +10916,29 @@ struct Translator {
       }
     }
   }
+  // The gmatch pipeline's share_actions_sw + reintroduce_fail, run AFTER
+  // wire_garms: upstream keys the COMPILED arm bodies at combine time, but
+  // gmatch's leaves are still `(exit aid)` placeholders when its switches are
+  // assembled (arms are wired afterward, single-use handlers inlined), so two
+  // separate source arms with alpha-equal bodies (ast_iterator's Ptyp_constr /
+  // Ptyp_class) only become keyable once wired.  Post-order, so an inner
+  // switch is shared before an outer switch's keys are computed (upstream
+  // combines matches inside-out).  Idempotent on an already-shared switch:
+  // equal bare exits resolve to bare exits without new handlers, and a set
+  // sw_default disables both the collapse guard and refail.  Only the
+  // blocks>=2 shape is touched -- const-only dispatches belong to upstream's
+  // call_switcher machinery, a different sharing path.
+  void share_switches_rec(LamPtr& l) {
+    if (!l) return;
+    share_switches_rec(l->fn); share_switches_rec(l->cond); share_switches_rec(l->then_);
+    share_switches_rec(l->else_); share_switches_rec(l->body); share_switches_rec(l->sw_default);
+    for (auto& a : l->args) share_switches_rec(a);
+    for (auto& b : l->bindings) share_switches_rec(b.val);
+    for (auto& sc : l->sw_consts) share_switches_rec(sc.body);
+    for (auto& sc : l->sw_blocks) share_switches_rec(sc.body);
+    if (l->k == Lam::K::Switch && l->sw_blocks.size() >= 2)
+      l = share_actions_and_refail(l);
+  }
   // Entry for the general matrix matcher on a single scrutinee: peel a trailing
   // catch-all as the shared default (else Match_failure), run gmatch, and wrap the
   // fallback in a shared static-catch (inlined when used at most once).
@@ -10946,6 +10980,7 @@ struct Translator {
     }
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
     wire_garms(body, arms);
+    share_switches_rec(body);
     LamPtr dbody;
     if (catchall) {
       scope.emplace_back(); bind_catchall(*catchall->lhs, sv);
@@ -12310,6 +12345,7 @@ struct Translator {
     g_gm_tuples_ = false; g_gm_budget_ = -1;
     if (!body) return nullptr;
     wire_garms(body, arms);
+    share_switches_rec(body);
     LamPtr dbody;
     if (catchall) {
       // Bind any named columns of a `x, y -> ..` tuple catch-all to their components.
