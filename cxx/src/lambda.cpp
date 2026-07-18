@@ -11321,7 +11321,7 @@ struct Translator {
   }
   // ===== faithful matching.ml port: constant-ctor tuple matches ==============
   // Domain: `match e1, .., ek with ..` where every column is a constant-only
-  // variant, no guards, no bindings.  Reproduces ocamlc's exact or-pattern
+  // variant or a bare var, no guards.  Reproduces ocamlc's exact or-pattern
   // machinery -- split_or / Or_matrix / precompile_or (each or-row's body
   // compiled ONCE behind an exit, alternatives explode to `(exit n)` rows),
   // default environments + mk_failaction_pos (per-gap-tag exit threading),
@@ -11561,7 +11561,13 @@ struct Translator {
   struct OcPm { int argpos = 0; std::vector<OcClause> cases; OcDefEnv def; };
   struct OcPmh;
   using OcPmhPtr = std::shared_ptr<OcPmh>;
-  struct OcHandler { OcMatrix provenance; int exit; OcPm pm; };
+  // An or-bound variable routed through a handler's exit (matching.ml's
+  // patbound_action_vars): `cols[ai]` is the column the var occupies in
+  // or-alternative `ai`, i.e. which scrutinee component that alternative's
+  // `(exit i ..)` passes.
+  struct OcHVar { Ident id; ValueKind kind; std::vector<int> cols; };
+  struct OcHandler { OcMatrix provenance; int exit; OcPm pm;
+                     std::vector<Ident> vars; std::vector<ValueKind> var_kinds; };
   struct OcPmh {
     int kind = 0;                         // 0 Pm, 1 PmVar, 2 PmOr
     OcPm pm;                              // kind 0
@@ -11952,18 +11958,25 @@ struct Translator {
       auto res = oc_compile_match(partial, hctx, h.pm);
       if (!res) {                                  // Unused handler
         auto c = mk(Lam::K::Catch); c->cond = r; c->prim_arg = h.exit; c->then_ = cint(0);
+        c->catch_vars = h.vars; c->catch_var_kinds = h.var_kinds;
         r = c;
         continue;
       }
-      if (oc_is_exit(r)) {
+      if (r->k == Lam::K::Staticraise) {           // raw_action (matching.ml:3523)
         if (r->prim_arg == h.exit) {
-          // whole body is a direct exit to this handler: inline, drop the rest
-          return OcRes{res->lam,
+          // whole body is a direct exit to this handler: Alias-bind the handler
+          // vars to the exit args (all vars, so simplify_lets substitutes),
+          // inline, drop the rest
+          LamPtr hb = res->lam;
+          for (size_t vi = 0; vi < h.vars.size() && vi < r->args.size(); ++vi)
+            subst_alias(hb, h.vars[vi], r->args[vi]);
+          return OcRes{hb,
               oc_jumps_map([&](const OcCtx& c) { return oc_ctx_rshift_num(n, c); }, res->jumps)};
         }
         continue;                                  // handler dead
       }
       auto c = mk(Lam::K::Catch); c->cond = r; c->prim_arg = h.exit; c->then_ = res->lam;
+      c->catch_vars = h.vars; c->catch_var_kinds = h.var_kinds;
       r = c;
       OcJumps t2 = total; t2.env.erase(h.exit);
       total = oc_jumps_union(t2,
@@ -12158,11 +12171,13 @@ struct Translator {
     for (auto& sc : l->sw_blocks) oc_simplif_exits(sc.body, cnt, subst);
   }
   // ---- the tuple (1-column) stage: rows are or-trees of k-tuples ----
-  struct OcTopRow { std::vector<OcRow> alts; bool any_head; LamPtr act; };
+  struct OcTopRow { std::vector<OcRow> alts; bool any_head; LamPtr act;
+                    std::vector<OcHVar> hvars; };  // or-bound vars used by act
   using OcTopMatrix = std::vector<std::vector<OcRow>>;   // 1-col: each row = its alts
   using OcTopEnv = std::vector<std::pair<int, OcTopMatrix>>;
   struct OcTopPm { std::vector<OcTopRow> cases; OcTopEnv env; };
-  struct OcTopHandler { std::vector<OcRow> orp_alts; int exit; std::vector<LamPtr> acts; };
+  struct OcTopHandler { std::vector<OcRow> orp_alts; int exit; std::vector<LamPtr> acts;
+                        std::vector<OcHVar> hvars; };
   struct OcTopPmh {
     int kind = 0;                                  // 0 Pm, 2 PmOr
     OcTopPm pm;                                    // kind 0
@@ -12269,13 +12284,20 @@ struct Translator {
     for (size_t i = 0; i < ors.size(); ++i) {
       if (ors[i].alts.size() == 1) { body.push_back(ors[i]); continue; }
       OcTopHandler h; h.orp_alts = ors[i].alts; h.acts = {ors[i].act};
+      h.hvars = ors[i].hvars;
       while (i + 1 < ors.size() && ors[i + 1].alts.size() > 1 &&
              oc_top_equiv(ors[i].alts, ors[i + 1].alts)) {
         ++i; h.acts.push_back(ors[i].act);
       }
       h.exit = oc_alloc_exit();
-      for (auto& alt : h.orp_alts) {
-        OcTopRow n; n.alts = {alt}; n.any_head = false; n.act = oc_exit(h.exit);
+      // explode_or_pat: each alternative raises the exit with ITS instances of
+      // the or-bound vars -- which are whole columns here, so directly the
+      // scrutinee components (the alias substitution upstream's simplify does).
+      for (size_t ai = 0; ai < h.orp_alts.size(); ++ai) {
+        OcTopRow n; n.alts = {h.orp_alts[ai]}; n.any_head = false;
+        auto e = mk(Lam::K::Staticraise); e->prim_arg = h.exit;
+        for (auto& hv : h.hvars) e->args.push_back(varof(oc_comps_[hv.cols[ai]]->var));
+        n.act = e;
         body.push_back(std::move(n));
       }
       handlers.push_back(std::move(h));
@@ -12315,6 +12337,9 @@ struct Translator {
       OcHandler nh;
       for (auto& alt : h.orp_alts) { nh.provenance.push_back(alt); r->matrix.push_back(alt); }
       nh.exit = h.exit;
+      for (auto& hv : h.hvars) {
+        nh.vars.push_back(hv.id); nh.var_kinds.push_back(hv.kind);
+      }
       nh.pm.argpos = (int)oc_comps_.size();        // zero remaining columns
       for (auto& a : h.acts) nh.pm.cases.push_back({OcRow{}, a});
       nh.pm.def.final_exit = final_exit;           // width-0 env, unused at leaves
@@ -12341,7 +12366,9 @@ struct Translator {
     if (k < 2 || k > 6 || vrows.empty() || vrows.size() > 32) return nullptr;
     for (auto& lbl : tu->labels) if (lbl) return nullptr;
     // 1) validate shapes; collect column ctor patterns (no side effects yet)
-    struct SrcAlt { std::vector<const Pattern*> cols; bool is_any; };
+    struct AltVar { std::string name; int col; const Pattern* node; };
+    struct SrcAlt { std::vector<const Pattern*> cols; bool is_any;
+                    std::vector<AltVar> vars; };   // bare-var columns, col order
     struct SrcRow { std::vector<SrcAlt> alts; const Expression* rhs; };
     std::vector<SrcRow> srcs;
     size_t total_alts = 0;
@@ -12389,6 +12416,11 @@ struct Translator {
               if (cl.size() > 1) return nullptr;   // `_` under an or: bail
               continue;
             }
+            if (auto* pv = std::get_if<Ppat_var>(&eq->desc)) {
+              if (cl.size() > 1) return nullptr;   // var under a column or: bail
+              a.vars.push_back({pv->name.txt, (int)c, eq});
+              continue;
+            }
             auto* pc = std::get_if<Ppat_construct>(&eq->desc);
             if (!pc || pc->arg) return nullptr;
             std::string cn = ctor_of(*eq);
@@ -12427,7 +12459,8 @@ struct Translator {
           std::vector<int> ts;
           for (auto* q : cl) {
             const Pattern* eq = effective_pat(q);
-            if (std::holds_alternative<Ppat_any>(eq->desc)) { any = true; break; }
+            if (std::holds_alternative<Ppat_any>(eq->desc) ||
+                std::get_if<Ppat_var>(&eq->desc)) { any = true; break; }
             const CtorInfo* ci = pat_ctor_resolve(eq, ctor_of(*eq));
             const CtorInfo* c2 = ci;               // re-resolve with the hint
             if (ci) c2 = pat_ctor_resolve(eq, ctor_of(*eq), ci->type);
@@ -12438,8 +12471,34 @@ struct Translator {
         }
       }
     }
-    // no bindings anywhere (vars/aliases) -- checked by construction: any var or
-    // alias pattern fails effective_pat's construct/tuple/any tests above.
+    // Bindings: bare-var COLUMNS only (aliases and vars under ctor args fail the
+    // construct/tuple tests above and bail).  Every alternative of a row must
+    // bind the same names; rv.cols[ai] records which column the name occupies in
+    // alternative ai.  A multi-alternative row routes its vars through the
+    // handler's exit args (upstream's patbound_action_vars); a single-alternative
+    // row aliases each var straight to its column's component -- the var-to-var
+    // Alias binding Simplif.simplify_lets always substitutes.
+    struct RowVar { std::string name; const Pattern* node; std::vector<int> cols; Ident id; };
+    std::vector<std::vector<RowVar>> rowvars(srcs.size());
+    for (size_t ri = 0; ri < srcs.size(); ++ri) {
+      auto& sr = srcs[ri];
+      auto& rv = rowvars[ri];
+      for (auto& av : sr.alts[0].vars) {
+        for (auto& q : rv) if (q.name == av.name) return nullptr;  // dup in one alt
+        rv.push_back({av.name, av.node, {av.col}, {}});
+      }
+      for (size_t ai = 1; ai < sr.alts.size(); ++ai) {
+        if (sr.alts[ai].vars.size() != rv.size()) return nullptr;
+        std::set<std::string> seen;
+        for (auto& av : sr.alts[ai].vars) {
+          if (!seen.insert(av.name).second) return nullptr;
+          bool found = false;
+          for (auto& q : rv)
+            if (q.name == av.name) { q.cols.push_back(av.col); found = true; break; }
+          if (!found) return nullptr;
+        }
+      }
+    }
     {  // keep the exhaustiveness check exact but bounded
       long long prod = 1;
       for (int nc : col_nc) { prod *= nc; if (prod > 4096) return nullptr; }
@@ -12459,7 +12518,18 @@ struct Translator {
       comps.push_back(v);
     }
     std::vector<LamPtr> acts;
-    for (auto& sr : srcs) acts.push_back(expr(*sr.rhs));
+    for (size_t ri = 0; ri < srcs.size(); ++ri) {
+      auto& rv = rowvars[ri];
+      if (rv.empty()) { acts.push_back(expr(*srcs[ri].rhs)); continue; }
+      bool multi = srcs[ri].alts.size() > 1;
+      scope.emplace_back();
+      for (auto& v : rv) {
+        if (multi) { v.id = fresh(v.name); scope.back()[v.name] = v.id; }
+        else scope.back()[v.name] = comps[v.cols[0]]->var;
+      }
+      acts.push_back(expr(*srcs[ri].rhs));
+      scope.pop_back();
+    }
     oc_nc_ = col_nc;
     oc_comps_ = comps;
     oc_my_exits_.clear();
@@ -12475,6 +12545,10 @@ struct Translator {
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
       OcTopRow tr; tr.act = acts[ri];
       tr.any_head = srcs[ri].alts.size() == 1 && srcs[ri].alts[0].is_any;
+      if (srcs[ri].alts.size() > 1)                // pm_fv filter: only vars the act uses
+        for (auto& v : rowvars[ri])
+          if (count_var(acts[ri], v.id) > 0)
+            tr.hvars.push_back({v.id, pat_kind(v.node), v.cols});
       for (size_t ai = 0; ai < srcs[ri].alts.size(); ++ai) {
         OcRow row;
         for (size_t c = 0; c < k; ++c) row.push_back(mk_pat(tags[ri][ai][c]));
