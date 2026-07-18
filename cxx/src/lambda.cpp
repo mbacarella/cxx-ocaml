@@ -1228,6 +1228,9 @@ struct Translator {
       std::unordered_map<std::string,
                          std::vector<std::pair<std::string, CtorInfo>>>>
       mod_type_ctors_;
+  // Imported types with any GADT constructor (mod -> type names): tag info
+  // resolves normally, but variant-shaped MATCH compilation must skip them.
+  std::unordered_map<std::string, std::set<std::string>> mod_gadt_types_;
   const std::unordered_map<std::string, CtorInfo>& module_ctors(const std::string& mod) {
     if (auto it = mod_ctor_cache_.find(mod); it != mod_ctor_cache_.end()) return it->second;
     auto& out = mod_ctor_cache_[mod];
@@ -1268,6 +1271,10 @@ struct Translator {
         if (td.kind != cmi::TypeDecl::Variant) continue;
         // GADT constructors follow the same constant/block tag rules (Bigarray's
         // `kind`: Float32=0, Float64=1, ...), so they resolve like plain variants.
+        // Still note GADT-ness: match COMPILATION must not treat such a type as
+        // an ordinary variant (typing removes ill-typed rows upstream).
+        for (auto& c : td.ctors)
+          if (c.res) { mod_gadt_types_[mod].insert(td.name); break; }
         int nc = 0, nb = 0;
         for (auto& c : td.ctors) {
           bool block = !c.args.empty() || c.is_inline_record;
@@ -11319,9 +11326,12 @@ struct Translator {
     if (tc == type_ctors_.end()) return false;
     return (int)names.size() == tc->second.first + tc->second.second;  // covers every ctor
   }
-  // ===== faithful matching.ml port: constant-ctor tuple matches ==============
-  // Domain: `match e1, .., ek with ..` where every column is a constant-only
-  // variant or a bare var, no guards.  Reproduces ocamlc's exact or-pattern
+  // ===== faithful matching.ml port: variant-ctor tuple matches ===============
+  // Domain: `match e1, .., ek with ..` where every column is a variant whose
+  // ctor patterns carry only var/wildcard arguments (so fields are bindings,
+  // never sub-tests, and dispatch stays pure tag arithmetic; tags are unified
+  // as const-tag | NC + block-tag) or a bare var, no guards.  Reproduces
+  // ocamlc's exact or-pattern
   // machinery -- split_or / Or_matrix / precompile_or (each or-row's body
   // compiled ONCE behind an exit, alternatives explode to `(exit n)` rows),
   // default environments + mk_failaction_pos (per-gap-tag exit threading),
@@ -11558,14 +11568,23 @@ struct Translator {
     return oc_def_filter(def, [&](const OcPat& p) { return oc_compat(p, q); });
   }
   // -- precompiled halves --
-  struct OcPm { int argpos = 0; std::vector<OcClause> cases; OcDefEnv def; };
+  // pending: the (column, field) args a block-ctor division prepended, not yet
+  // bound.  Upstream these are real matrix columns whose heads are all omega
+  // (var args only in this domain): each compile_match entry binds the first
+  // one (arg_to_var + bind_check/lower_bind) around its whole result, and the
+  // chunk sub-pms created by the split re-bind the remaining ones at their own
+  // tops -- Simplif then drops/substitutes the unused/single-use ones.
+  struct OcPm { int argpos = 0; std::vector<OcClause> cases; OcDefEnv def;
+                std::vector<std::pair<int, int>> pending; };
   struct OcPmh;
   using OcPmhPtr = std::shared_ptr<OcPmh>;
   // An or-bound variable routed through a handler's exit (matching.ml's
-  // patbound_action_vars): `cols[ai]` is the column the var occupies in
-  // or-alternative `ai`, i.e. which scrutinee component that alternative's
-  // `(exit i ..)` passes.
-  struct OcHVar { Ident id; ValueKind kind; std::vector<int> cols; };
+  // patbound_action_vars): `occ[ai]` is the (column, field) the var occupies in
+  // or-alternative `ai` -- field -1 = the whole column, else a ctor argument --
+  // i.e. which scrutinee component (or field read) that alternative's
+  // `(exit i ..)` passes: upstream's explode_or_pat instances after the Alias
+  // substitutions Simplif always performs (var-to-var, single-use field read).
+  struct OcHVar { Ident id; ValueKind kind; std::vector<std::pair<int, int>> occ; };
   struct OcHandler { OcMatrix provenance; int exit; OcPm pm;
                      std::vector<Ident> vars; std::vector<ValueKind> var_kinds; };
   struct OcPmh {
@@ -11578,7 +11597,22 @@ struct Translator {
   struct OcPmhInfo { OcPmhPtr me; OcMatrix matrix; OcDefEnv top_default; };
   using OcNexts = std::vector<std::pair<int, OcPmhPtr>>;
   // per-match state
-  std::vector<int> oc_nc_;                // NC per column
+  std::vector<int> oc_nc_;                // ctor-domain size per column (consts+blocks)
+  std::vector<int> oc_ncc_;               // constant-ctor count per column (tags below
+                                          // it are consts, at/above it block tags)
+  std::vector<std::map<int, int>> oc_tag_arity_;  // per column: unified tag -> arity
+  // The ONE arg variable per (column, field) -- matching.ml's arg_to_var over a
+  // specialized cell's field access: every row var at that position substitutes
+  // to it (half_simplify's var-to-var aliases), and the cell binds it via
+  // lower_bind; Simplif's count<=1 Alias rule then substitutes or keeps it.
+  std::map<std::pair<int, int>, Ident> oc_fids_;
+  const Ident& oc_fid(int c, int f, const std::string& name = "*match*") {
+    auto key = std::make_pair(c, f);
+    auto it = oc_fids_.find(key);
+    if (it == oc_fids_.end())
+      it = oc_fids_.emplace(key, fresh(name, name == "*match*")).first;
+    return it->second;
+  }
   std::vector<LamPtr> oc_comps_;          // per-column scrutinee vars
   std::set<int> oc_my_exits_;             // exits allocated by this match
   int oc_alloc_exit() { int e = ++next_exit_; oc_my_exits_.insert(e); return e; }
@@ -11779,6 +11813,58 @@ struct Translator {
     for (auto& o : ors) me->matrix.push_back(o.cols);
     return {{me, me->matrix, def}, std::move(k)};
   }
+  // matching.ml approx_present: conservative occurrence test (anything but the
+  // listed simple forms counts as a possible occurrence).
+  static bool oc_approx_present(const Ident& v, const LamPtr& l) {
+    if (!l) return false;
+    switch (l->k) {
+      case Lam::K::ConstInt: case Lam::K::ConstChar: case Lam::K::ConstFloat:
+      case Lam::K::ConstString: case Lam::K::ConstBlock:
+        return false;
+      case Lam::K::Var:
+        return l->var.stamp == v.stamp;
+      case Lam::K::Staticraise:
+      case Lam::K::Prim:
+        for (auto& a : l->args) if (oc_approx_present(v, a)) return true;
+        return false;
+      case Lam::K::Let: {                          // Llet(Alias, ..) only
+        for (auto& b : l->bindings) if (!b.alias) return true;
+        for (auto& b : l->bindings) if (oc_approx_present(v, b.val)) return true;
+        return oc_approx_present(v, l->body);
+      }
+      default: return true;
+    }
+  }
+  // matching.ml lower_bind: sink an Alias arg binding towards its (single)
+  // branch of use; bind in place otherwise.
+  LamPtr oc_lower_bind(const Ident& v, const LamPtr& arg, LamPtr lam) {
+    if (lam->k == Lam::K::IfThenElse) {
+      bool pc = oc_approx_present(v, lam->cond), ps = oc_approx_present(v, lam->then_),
+           pn = oc_approx_present(v, lam->else_);
+      if (!pc && !ps && !pn) return lam;
+      if (!pc && ps && !pn) { lam->then_ = oc_lower_bind(v, arg, lam->then_); return lam; }
+      if (!pc && !ps && pn) { lam->else_ = oc_lower_bind(v, arg, lam->else_); return lam; }
+    } else if (lam->k == Lam::K::Switch && !oc_approx_present(v, lam->cond) &&
+               lam->sw_consts.size() + lam->sw_blocks.size() == 1) {
+      auto& only = lam->sw_consts.empty() ? lam->sw_blocks[0] : lam->sw_consts[0];
+      only.body = oc_lower_bind(v, arg, only.body);
+      return lam;
+    } else if (lam->k == Lam::K::Let) {
+      bool all_alias = true, in_vals = false;
+      for (auto& b : lam->bindings) {
+        if (!b.alias) all_alias = false;
+        if (oc_approx_present(v, b.val)) in_vals = true;
+      }
+      if (all_alias && !in_vals) {
+        lam->body = oc_lower_bind(v, arg, lam->body);
+        return lam;
+      }
+    }
+    auto l = mk(Lam::K::Let);                      // bind Alias (kind Pgenval)
+    l->bindings = {{v, ValueKind::Gen, arg, /*alias=*/true}};
+    l->body = lam;
+    return l;
+  }
   // ---- compilation (compile_match / handlers / combine / failactions) ----
   std::optional<OcRes> oc_comp_exit(const OcPartial& partial, const OcCtx& ctx,
                                     const OcDefEnv& def) {
@@ -11790,34 +11876,58 @@ struct Translator {
     OcJumps j; j.partial = true;
     return OcRes{oc_exit(def.final_exit), std::move(j)};
   }
+  LamPtr oc_bind_field(int c, int f, LamPtr lam) {
+    return oc_lower_bind(oc_fid(c, f), fieldimm(f, varof(oc_comps_[c]->var)),
+                         std::move(lam));
+  }
   std::optional<OcRes> oc_compile_match(const OcPartial& partial, const OcCtx& ctx,
                                         const OcPm& pm) {
-    if (!pm.cases.empty() && pm.cases[0].cols.empty())
-      return OcRes{pm.cases[0].act, {}};           // leaf: rows below are dead
-    if (pm.cases.empty()) return oc_comp_exit(partial, ctx, pm.def);
+    if (!pm.cases.empty() && pm.cases[0].cols.empty()) {
+      LamPtr a = pm.cases[0].act;                  // leaf: rows below are dead
+      for (auto it = pm.pending.rbegin(); it != pm.pending.rend(); ++it)
+        a = oc_bind_field(it->first, it->second, a);
+      return OcRes{a, {}};
+    }
+    if (pm.cases.empty()) return oc_comp_exit(partial, ctx, pm.def);  // binds dead: skip
     auto [first, nexts] = oc_split_or(pm.cases, pm.argpos, pm.def);
-    return oc_comp_match_handlers(partial, ctx, first.me, nexts);
+    if (pm.pending.empty())
+      return oc_comp_match_handlers(partial, ctx, first.me, nexts);
+    // First pending field binds around the whole chunk chain (this entry);
+    // the rest re-bind at each chunk's own top (the next entries -- chunk
+    // re-splits are stable, so they stack directly).
+    std::vector<std::pair<int, int>> p1(pm.pending.begin() + 1, pm.pending.end());
+    auto r = oc_comp_match_handlers(partial, ctx, first.me, nexts, false, &p1);
+    if (r) r->lam = oc_bind_field(pm.pending[0].first, pm.pending[0].second, r->lam);
+    return r;
   }
   // comp_fun selector: the top-level (flattened) pms go back through the FULL
   // split pipeline (matching.ml compile_flattened -> compile_match_nonempty);
   // inner precompiled halves dispatch directly (do_compile_matching).
   std::optional<OcRes> oc_comp_fun(bool flattened, const OcPartial& partial, const OcCtx& ctx,
-                                   const OcPmhPtr& pmh) {
-    if (!flattened) return oc_do_compile_matching(partial, ctx, pmh);
-    if (pmh->kind == 0) return oc_compile_match(partial, ctx, pmh->pm);
+                                   const OcPmhPtr& pmh,
+                                   const std::vector<std::pair<int, int>>* pend1 = nullptr) {
+    auto wrap = [&](std::optional<OcRes> r) {
+      if (r && pend1)
+        for (auto it = pend1->rbegin(); it != pend1->rend(); ++it)
+          r->lam = oc_bind_field(it->first, it->second, r->lam);
+      return r;
+    };
+    if (!flattened) return wrap(oc_do_compile_matching(partial, ctx, pmh));
+    if (pmh->kind == 0) return wrap(oc_compile_match(partial, ctx, pmh->pm));
     // FPmOr: body still carries or-heads -> full compile, then or handlers
     auto r = oc_compile_match(partial, ctx, pmh->body);
     if (!r) return std::nullopt;
-    return oc_compile_orhandlers(partial, r->lam, r->jumps, ctx, pmh->handlers);
+    return wrap(oc_compile_orhandlers(partial, r->lam, r->jumps, ctx, pmh->handlers));
   }
   std::optional<OcRes> oc_comp_match_handlers(const OcPartial& partial, const OcCtx& ctx,
                                               const OcPmhPtr& first, const OcNexts& nexts,
-                                              bool flattened = false) {
-    if (nexts.empty()) return oc_comp_fun(flattened, partial, ctx, first);
-    auto fr = oc_comp_fun(flattened, {false, partial.glob_total}, ctx, first);
+                                              bool flattened = false,
+                                              const std::vector<std::pair<int, int>>* pend1 = nullptr) {
+    if (nexts.empty()) return oc_comp_fun(flattened, partial, ctx, first, pend1);
+    auto fr = oc_comp_fun(flattened, {false, partial.glob_total}, ctx, first, pend1);
     if (!fr) {
       OcNexts rest(nexts.begin() + 1, nexts.end());
-      return oc_comp_match_handlers(partial, ctx, nexts[0].second, rest, flattened);
+      return oc_comp_match_handlers(partial, ctx, nexts[0].second, rest, flattened, pend1);
     }
     LamPtr body = fr->lam; OcJumps jumps = fr->jumps;
     for (size_t idx = 0; idx < nexts.size(); ++idx) {
@@ -11826,7 +11936,7 @@ struct Translator {
       OcCtx ctx_i = oc_jumps_extract(jrem, i);
       if (ctx_i.empty()) continue;                 // keep jumps un-extracted
       OcPartial p2{idx + 1 == nexts.size() ? partial.cur_total : false, partial.glob_total};
-      auto r = oc_comp_fun(flattened, p2, ctx_i, nexts[idx].second);
+      auto r = oc_comp_fun(flattened, p2, ctx_i, nexts[idx].second, pend1);
       auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = i;
       if (!r) { c->then_ = cint(0); jumps = std::move(jrem); }
       else { c->then_ = r->lam; jumps = oc_jumps_union(r->jumps, jrem); }
@@ -11883,6 +11993,9 @@ struct Translator {
       OcCtx cctx = oc_ctx_specialize(t, ctx);
       if (cctx.empty()) continue;
       OcPm cpm; cpm.argpos = pm.argpos + 1; cpm.def = oc_def_specialize(t, pm.def);
+      if (auto ta = oc_tag_arity_[pm.argpos].find(t); ta != oc_tag_arity_[pm.argpos].end())
+        for (int f = 0; f < ta->second; ++f)       // block cell: its field args,
+          cpm.pending.push_back({pm.argpos, f});   // bound at the cell's entries
       for (auto& c : pm.cases) {
         if (c.cols[0].alts[0] != t) continue;
         OcClause n; n.cols.assign(c.cols.begin() + 1, c.cols.end()); n.act = c.act;
@@ -11946,8 +12059,105 @@ struct Translator {
       if (!oc_same_action(a, all[0].second)) { all_same = false; break; }
     if (all_same) return OcRes{all[0].second, std::move(out)};
     std::sort(all.begin(), all.end(),
-              [](auto& a, auto& b) { return a.first < b.first; });
-    return OcRes{oc_call_switcher(oc_comps_[pm.argpos], all), std::move(out)};
+              [](auto& a, auto& b) { return a.first < b.first; });     // split_cases sorts
+    int NCc = oc_ncc_[pm.argpos], NBc = nc - NCc;
+    if (NBc == 0)                                  // const-only type: call_switcher
+      return OcRes{oc_call_switcher(oc_comps_[pm.argpos], all), std::move(out)};
+    // matching.ml combine_regular_constructor's ladder over a mixed type.
+    // fail_opt is always None in this domain: either sig_complete, or
+    // mk_failaction_pos's explicit-fails branch (nc is capped well below
+    // match_context_rows), so only the fail_opt=None arms are live.
+    std::vector<std::pair<int, LamPtr>> consts, blocks;
+    for (auto& [u, a] : all)
+      (u < NCc ? consts : blocks).push_back({u < NCc ? u : u - NCc, a});
+    LamPtr arg = varof(oc_comps_[pm.argpos]->var);
+    if (NCc == 1 && NBc == 1 && consts.size() == 1 && blocks.size() == 1) {
+      // options and lists: transl_match_on_option, bytecode side
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = arg; i->then_ = blocks[0].second; i->else_ = consts[0].second;
+      return OcRes{i, std::move(out)};
+    }
+    LamPtr act0;                                   // same_actions nonconsts
+    if (!blocks.empty()) {
+      act0 = blocks[0].second;
+      for (auto& [t, a] : blocks)
+        if (!oc_same_action(a, act0)) { act0 = nullptr; break; }
+    }
+    if (act0 && !consts.empty()) {                 // all blocks -> one action: isint split
+      auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
+      isint->prim_id = "isint"; isint->args = {arg};
+      auto i = mk(Lam::K::IfThenElse);
+      i->cond = isint; i->then_ = oc_call_switcher(oc_comps_[pm.argpos], consts);
+      i->else_ = act0;
+      return OcRes{i, std::move(out)};
+    }
+    // general case: Lswitch, via share_actions_sw + reintroduce_fail.
+    // share_actions_sw: dedup actions by make_key; an action stored twice or
+    // more is Shared -> wrapped once behind a catch outside the switch (a
+    // bare/Alias-wrapped exit is reused instead: make_catch_delayed), its
+    // switch slots becoming exits.  First-stored shared handler ends up
+    // innermost (handle_shared's composition order).
+    struct SwEntry { LamPtr act; int uses = 0; };
+    std::vector<SwEntry> store;
+    auto store_act = [&](const LamPtr& a) -> int {
+      for (size_t i = 0; i < store.size(); ++i)
+        if (oc_same_action(store[i].act, a)) { store[i].uses++; return (int)i; }
+      store.push_back({a, 1});
+      return (int)store.size() - 1;
+    };
+    std::vector<std::pair<int, int>> cidx, bidx;   // tag -> store index
+    for (auto& [t, a] : consts) cidx.push_back({t, store_act(a)});
+    for (auto& [t, a] : blocks) bidx.push_back({t, store_act(a)});
+    // as_simple_exit: an argless raise, looking through Alias lets
+    std::function<int(const LamPtr&)> simple_exit = [&](const LamPtr& l) -> int {
+      if (!l) return -1;
+      if (l->k == Lam::K::Staticraise && l->args.empty()) return l->prim_arg;
+      if (l->k == Lam::K::Let) {
+        for (auto& b : l->bindings) if (!b.alias) return -1;
+        return simple_exit(l->body);
+      }
+      return -1;
+    };
+    std::vector<std::pair<int, LamPtr>> wraps;     // (exit, handler), store order
+    std::vector<LamPtr> resolved(store.size());
+    for (size_t i = 0; i < store.size(); ++i) {
+      if (store[i].uses < 2) { resolved[i] = store[i].act; continue; }
+      int se = simple_exit(store[i].act);
+      if (se >= 0) { resolved[i] = oc_exit(se); continue; }
+      int e = oc_alloc_exit();
+      wraps.push_back({e, store[i].act});
+      resolved[i] = oc_exit(e);
+    }
+    // fresh node per bare-exit slot so no Staticraise node is shared
+    auto emit_slot = [&](int i) -> LamPtr {
+      return oc_is_exit(resolved[i]) ? oc_exit(resolved[i]->prim_arg) : resolved[i];
+    };
+    auto sw = mk(Lam::K::Switch);
+    sw->cond = arg;
+    sw->sw_numconsts = NCc; sw->sw_numblocks = NBc;
+    for (auto& [t, i] : cidx) sw->sw_consts.push_back({t, emit_slot(i)});
+    for (auto& [t, i] : bidx) sw->sw_blocks.push_back({t, emit_slot(i)});
+    {  // reintroduce_fail: an exit reached by >= 3 cases becomes the default
+      std::map<int, int> cnt2;
+      for (auto& c : sw->sw_consts) { int j = simple_exit(c.body); if (j >= 0) cnt2[j]++; }
+      for (auto& c : sw->sw_blocks) { int j = simple_exit(c.body); if (j >= 0) cnt2[j]++; }
+      int best = -1, bc = -1;
+      for (auto& [j, c] : cnt2) if (c > bc) { best = j; bc = c; }   // ties: minimal exit
+      if (bc >= 3) {
+        auto rm = [&](std::vector<Lam::SwitchCase>& v) {
+          v.erase(std::remove_if(v.begin(), v.end(), [&](const Lam::SwitchCase& c) {
+                    return simple_exit(c.body) == best; }), v.end());
+        };
+        rm(sw->sw_consts); rm(sw->sw_blocks);
+        sw->sw_default = oc_exit(best);
+      }
+    }
+    LamPtr resl = sw;
+    for (auto& [e, h] : wraps) {
+      auto c = mk(Lam::K::Catch); c->cond = resl; c->prim_arg = e; c->then_ = h;
+      resl = c;
+    }
+    return OcRes{resl, std::move(out)};
   }
   std::optional<OcRes> oc_compile_orhandlers(const OcPartial& partial, LamPtr r, OcJumps total,
                                              const OcCtx& ctx,
@@ -12129,6 +12339,12 @@ struct Translator {
     oc_count_exits(l->fn, cnt); oc_count_exits(l->body, cnt);
     oc_count_exits(l->cond, cnt); oc_count_exits(l->then_, cnt);
     oc_count_exits(l->else_, cnt); oc_count_exits(l->sw_default, cnt);
+    // simplif.ml count_default: a sparse switch's failaction counts TWICE when
+    // both the const and block spaces have gap tags, keeping its handler shared
+    if (l->k == Lam::K::Switch && l->sw_default &&
+        l->sw_numconsts >= 0 && (int)l->sw_consts.size() < l->sw_numconsts &&
+        l->sw_numblocks >= 0 && (int)l->sw_blocks.size() < l->sw_numblocks)
+      oc_count_exits(l->sw_default, cnt);
     for (auto& a : l->args) oc_count_exits(a, cnt);
     for (auto& b : l->bindings) oc_count_exits(b.val, cnt);
     for (auto& sc : l->sw_consts) oc_count_exits(sc.body, cnt);
@@ -12296,7 +12512,13 @@ struct Translator {
       for (size_t ai = 0; ai < h.orp_alts.size(); ++ai) {
         OcTopRow n; n.alts = {h.orp_alts[ai]}; n.any_head = false;
         auto e = mk(Lam::K::Staticraise); e->prim_arg = h.exit;
-        for (auto& hv : h.hvars) e->args.push_back(varof(oc_comps_[hv.cols[ai]]->var));
+        for (auto& hv : h.hvars) {
+          auto [hc, hf] = hv.occ[ai];
+          // a whole column -> its component; a ctor field -> the shared field
+          // arg var (the cell binds it; Simplif substitutes single uses)
+          e->args.push_back(hf < 0 ? varof(oc_comps_[hc]->var)
+                                   : varof(oc_fid(hc, hf)));
+        }
         n.act = e;
         body.push_back(std::move(n));
       }
@@ -12366,7 +12588,7 @@ struct Translator {
     if (k < 2 || k > 6 || vrows.empty() || vrows.size() > 32) return nullptr;
     for (auto& lbl : tu->labels) if (lbl) return nullptr;
     // 1) validate shapes; collect column ctor patterns (no side effects yet)
-    struct AltVar { std::string name; int col; const Pattern* node; };
+    struct AltVar { std::string name; int col; int field; const Pattern* node; };
     struct SrcAlt { std::vector<const Pattern*> cols; bool is_any;
                     std::vector<AltVar> vars; };   // bare-var columns, col order
     struct SrcRow { std::vector<SrcAlt> alts; const Expression* rhs; };
@@ -12396,11 +12618,12 @@ struct Translator {
       if (total_alts > 64) return nullptr;
       srcs.push_back(std::move(sr));
     }
-    // per-column: every leaf a constant ctor of one shared constant-only type
-    struct ColCtor { const Pattern* pat; std::string name; };
-    std::vector<int> col_nc(k, 0);
+    // per-column: every leaf a ctor of one shared variant type, block ctors
+    // carrying only var/wildcard arguments (vars only outside a column or)
+    std::vector<int> col_nc(k, 0), col_ncc(k, 0);
+    std::vector<std::map<int, int>> col_arity(k);  // unified tag -> block arity
     std::vector<std::vector<std::vector<std::vector<int>>>> tags(srcs.size());
-    // tags[row][alt][col] = leaf tag list ({} = omega)
+    // tags[row][alt][col] = leaf unified-tag list ({} = omega)
     for (size_t c = 0; c < k; ++c) {
       std::string type;
       std::vector<const Pattern*> ctor_pats;
@@ -12418,31 +12641,94 @@ struct Translator {
             }
             if (auto* pv = std::get_if<Ppat_var>(&eq->desc)) {
               if (cl.size() > 1) return nullptr;   // var under a column or: bail
-              a.vars.push_back({pv->name.txt, (int)c, eq});
+              a.vars.push_back({pv->name.txt, (int)c, -1, eq});
               continue;
             }
             auto* pc = std::get_if<Ppat_construct>(&eq->desc);
-            if (!pc || pc->arg) return nullptr;
+            if (!pc) return nullptr;
             std::string cn = ctor_of(*eq);
             if (exn_typed_pat(eq, cn)) return nullptr;
             const CtorInfo* ci = pat_ctor_resolve(eq, cn);
-            if (!ci || ci->is_block || ci->unboxed) return nullptr;
+            if (!ci || ci->unboxed) return nullptr;
+            bool ocdbg = cppcaml::dbg_env("OCDBG");
+            if (ci->is_block) {
+              if (!ci->rlabels.empty()) {
+                if (ocdbg) fprintf(stderr, "[OCgate] %s: rlabels\n", cn.c_str());
+                return nullptr;  // inline record: bail
+              }
+              auto fps = ctor_field_pats(pc, ci->arity);
+              if ((int)fps.size() != ci->arity) {
+                if (ocdbg) fprintf(stderr, "[OCgate] %s: fps %zu != arity %d\n", cn.c_str(), fps.size(), ci->arity);
+                return nullptr;
+              }
+              for (size_t fi = 0; fi < fps.size(); ++fi) {
+                const Pattern* fp = effective_pat(fps[fi]);
+                if (std::holds_alternative<Ppat_any>(fp->desc)) continue;
+                auto* fv = std::get_if<Ppat_var>(&fp->desc);
+                // nested tests/aliases, or a bind under a column or: bail
+                if (!fv || cl.size() > 1) {
+                  if (ocdbg) fprintf(stderr, "[OCgate] %s: field %zu not var/any\n", cn.c_str(), fi);
+                  return nullptr;
+                }
+                a.vars.push_back({fv->name.txt, (int)c, (int)fi, fp});
+              }
+            } else if (pc->arg) return nullptr;
             if (type.empty()) type = ci->type;
-            else if (type != ci->type) return nullptr;
+            else if (type != ci->type) {
+              if (ocdbg) fprintf(stderr, "[OCgate] %s: type '%s' vs '%s'\n", cn.c_str(), type.c_str(), ci->type.c_str());
+              return nullptr;
+            }
             ctor_pats.push_back(eq);
           }
         }
-      if (type.empty()) { col_nc[c] = 1; continue; }  // all-omega column
-      auto tc = type_ctors_.find(type);
-      if (tc == type_ctors_.end()) return nullptr;
-      int NC = tc->second.first, NB = tc->second.second;
-      if (NB != 0 || NC < 1 || NC > 30) return nullptr;
-      // consistency: every column ctor resolves (with the type hint) to a tag < NC
+      if (type.empty()) { col_nc[c] = 1; col_ncc[c] = 1; continue; }  // all-omega column
+      // Constructor counts.  The flat type_ctors_ table is keyed by SHORT type
+      // name ("t" collides across modules!), so when the typer recorded the
+      // column type's real module path, count consts/blocks from that module's
+      // cmi instead -- registering NOTHING, to keep the flat ctor namespace
+      // free of sibling squatting.  Mirrors pat_ctor_resolve's module walk.
+      int NC = -1, NB = -1;
+      if (auto pcit = vk.pat_constr.find(ctor_pats[0]); pcit != vk.pat_constr.end()) {
+        auto dot = pcit->second.rfind('.');
+        if (dot != std::string::npos && pcit->second.substr(dot + 1) == type) {
+          std::string mod = pcit->second.substr(0, dot);
+          if (auto md = mod.rfind('.'); md != std::string::npos) mod = mod.substr(md + 1);
+          if (!module_base(mod)) {
+            int nc2 = 0, nb2 = 0;
+            for (auto& [nm, info] : module_type_ctors(mod, type))
+              (info.is_block ? nb2 : nc2)++;
+            if (nc2 + nb2 > 0) {
+              if (mod_gadt_types_[mod].count(type)) return nullptr;  // GADT: bail
+              NC = nc2; NB = nb2;
+            }
+          }
+        }
+      }
+      if (NC < 0) {
+        if (auto tc = type_ctors_.find(type); tc != type_ctors_.end()) {
+          NC = tc->second.first; NB = tc->second.second;
+        } else {
+          if (cppcaml::dbg_env("OCDBG")) fprintf(stderr, "[OCgate] no type_ctors for '%s'\n", type.c_str());
+          return nullptr;
+        }
+      }
+      if (NC + NB < 1 || NC + NB > 30) {
+        if (cppcaml::dbg_env("OCDBG")) fprintf(stderr, "[OCgate] '%s' NC=%d NB=%d out of range\n", type.c_str(), NC, NB);
+        return nullptr;
+      }
+      // consistency: every column ctor resolves (with the type hint) in range
       for (auto* p : ctor_pats) {
         const CtorInfo* ci = pat_ctor_resolve(p, ctor_of(*p), type);
-        if (!ci || ci->is_block || ci->tag < 0 || ci->tag >= NC) return nullptr;
+        if (!ci || ci->tag < 0 || ci->tag >= (ci->is_block ? NB : NC)) {
+          if (cppcaml::dbg_env("OCDBG"))
+            fprintf(stderr, "[OCgate] '%s' ctor %s reresolve %s tag=%d NC=%d NB=%d\n", type.c_str(),
+                    ctor_of(*p).c_str(), ci ? "ok" : "NULL", ci ? ci->tag : -99, NC, NB);
+          return nullptr;
+        }
+        if (ci->is_block && ci->arity > 0) col_arity[c][NC + ci->tag] = ci->arity;
       }
-      col_nc[c] = NC;
+      col_nc[c] = NC + NB;
+      col_ncc[c] = NC;
     }
     // resolve tags per row/alt/col
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
@@ -12465,27 +12751,31 @@ struct Translator {
             const CtorInfo* c2 = ci;               // re-resolve with the hint
             if (ci) c2 = pat_ctor_resolve(eq, ctor_of(*eq), ci->type);
             if (!c2) return nullptr;
-            ts.push_back(c2->tag);
+            ts.push_back(c2->is_block ? col_ncc[c] + c2->tag : c2->tag);
           }
           if (!any) tags[ri][ai][c] = std::move(ts);
         }
       }
     }
-    // Bindings: bare-var COLUMNS only (aliases and vars under ctor args fail the
-    // construct/tuple tests above and bail).  Every alternative of a row must
-    // bind the same names; rv.cols[ai] records which column the name occupies in
-    // alternative ai.  A multi-alternative row routes its vars through the
-    // handler's exit args (upstream's patbound_action_vars); a single-alternative
-    // row aliases each var straight to its column's component -- the var-to-var
-    // Alias binding Simplif.simplify_lets always substitutes.
-    struct RowVar { std::string name; const Pattern* node; std::vector<int> cols; Ident id; };
+    // Bindings: bare-var columns (field -1) and block-ctor argument vars
+    // (aliases and nested tests fail the construct/tuple tests above and bail).
+    // Every alternative of a row must bind the same names; rv.occ[ai] records
+    // the (column, field) the name occupies in alternative ai.  A
+    // multi-alternative row routes its vars through the handler's exit args
+    // (upstream's patbound_action_vars); a single-alternative row aliases each
+    // column var straight to its component -- the var-to-var Alias binding
+    // Simplif.simplify_lets always substitutes -- and each ctor-argument var to
+    // an Alias-let field read, which Simplif substitutes when used at most once
+    // (is_alias_dup) and keeps otherwise, exactly upstream's bind_alias residue.
+    struct RowVar { std::string name; const Pattern* node;
+                    std::vector<std::pair<int, int>> occ; Ident id; };
     std::vector<std::vector<RowVar>> rowvars(srcs.size());
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
       auto& sr = srcs[ri];
       auto& rv = rowvars[ri];
       for (auto& av : sr.alts[0].vars) {
         for (auto& q : rv) if (q.name == av.name) return nullptr;  // dup in one alt
-        rv.push_back({av.name, av.node, {av.col}, {}});
+        rv.push_back({av.name, av.node, {{av.col, av.field}}, {}});
       }
       for (size_t ai = 1; ai < sr.alts.size(); ++ai) {
         if (sr.alts[ai].vars.size() != rv.size()) return nullptr;
@@ -12494,7 +12784,7 @@ struct Translator {
           if (!seen.insert(av.name).second) return nullptr;
           bool found = false;
           for (auto& q : rv)
-            if (q.name == av.name) { q.cols.push_back(av.col); found = true; break; }
+            if (q.name == av.name) { q.occ.push_back({av.col, av.field}); found = true; break; }
           if (!found) return nullptr;
         }
       }
@@ -12517,6 +12807,17 @@ struct Translator {
       }
       comps.push_back(v);
     }
+    // Field vars all substitute to the ONE arg var of their (column, field) --
+    // upstream's arg_to_var binding, which each specialized cell later wraps
+    // via lower_bind.  Built locally (arm bodies may re-enter this function);
+    // becomes oc_fids_ with the other per-match members below.
+    std::map<std::pair<int, int>, Ident> fids;
+    auto getfid = [&](int c, int f, const std::string& name) -> const Ident& {
+      auto key = std::make_pair(c, f);
+      auto it = fids.find(key);
+      if (it == fids.end()) it = fids.emplace(key, fresh(name)).first;
+      return it->second;
+    };
     std::vector<LamPtr> acts;
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
       auto& rv = rowvars[ri];
@@ -12524,13 +12825,23 @@ struct Translator {
       bool multi = srcs[ri].alts.size() > 1;
       scope.emplace_back();
       for (auto& v : rv) {
-        if (multi) { v.id = fresh(v.name); scope.back()[v.name] = v.id; }
-        else scope.back()[v.name] = comps[v.cols[0]]->var;
+        if (multi) {
+          // handler exit args reference the field arg vars: make sure they exist
+          v.id = fresh(v.name); scope.back()[v.name] = v.id;
+          for (auto& [oc, of] : v.occ) if (of >= 0) getfid(oc, of, v.name);
+        } else if (v.occ[0].second >= 0) {
+          scope.back()[v.name] = getfid(v.occ[0].first, v.occ[0].second, v.name);
+        } else {
+          scope.back()[v.name] = comps[v.occ[0].first]->var;
+        }
       }
       acts.push_back(expr(*srcs[ri].rhs));
       scope.pop_back();
     }
     oc_nc_ = col_nc;
+    oc_ncc_ = col_ncc;
+    oc_tag_arity_ = col_arity;
+    oc_fids_ = std::move(fids);
     oc_comps_ = comps;
     oc_my_exits_.clear();
     // build top rows
@@ -12548,7 +12859,7 @@ struct Translator {
       if (srcs[ri].alts.size() > 1)                // pm_fv filter: only vars the act uses
         for (auto& v : rowvars[ri])
           if (count_var(acts[ri], v.id) > 0)
-            tr.hvars.push_back({v.id, pat_kind(v.node), v.cols});
+            tr.hvars.push_back({v.id, pat_kind(v.node), v.occ});
       for (size_t ai = 0; ai < srcs[ri].alts.size(); ++ai) {
         OcRow row;
         for (size_t c = 0; c < k; ++c) row.push_back(mk_pat(tags[ri][ai][c]));
@@ -15362,7 +15673,7 @@ struct Translator {
       // column-by-column without building the tuple.
       if (frows.empty() && !vrows.empty())
         if (auto* tu = std::get_if<Pexp_tuple>(&m->e->desc)) {
-          // Constant-ctor columns first: the faithful matching.ml port emits
+          // Variant-ctor columns first: the faithful matching.ml port emits
           // ocamlc's exact or-pattern context-splitting shape for this domain.
           if (erows.empty())
             if (LamPtr r = oc_tuple_match(tu, vrows, e.loc))
