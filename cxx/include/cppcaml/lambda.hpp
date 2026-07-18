@@ -174,6 +174,19 @@ struct Lam {
   // string_switch builds the same structure during lambda generation, so this
   // flag exempts it from simplify_static_catches to match that layout.
   bool keep_catch = false;
+  // gm_str_dflt: gmatch's string-column default catch (the fresh exit
+  // expand_stringswitch's make_catch would create in Bytegen).  If arm wiring
+  // leaves its handler a BARE `(exit j)` (the default arm was multi-use, so
+  // upstream's Simplif would not have inlined it into the stringswitch fail
+  // slot and make_catch would have reused the bare exit directly),
+  // collapse_str_dflt_catches retargets the tree at j and drops the catch.
+  bool gm_str_dflt = false;
+  // gm_str_bind: gmatch's string-column arg binding (Bytegen bind_sw).  The
+  // tree is built against an internal `switch` var so the enclosing split sees
+  // exactly ONE nominal use (the stringswitch node's arg slot).  Collapse
+  // resolves it after all substitutions: value still a Var -> strip the let
+  // (bind_sw's Lvar no-op); value a field read -> a real Strict `switch` let.
+  bool gm_str_bind = false;
   // from_alias: this node was substituted in place of a single-use pattern
   // binder (wrap_binders' inline of an alias let).  At the corresponding point
   // in ocamlc's pipeline (Matching/for_let, BEFORE Simplif) this position held

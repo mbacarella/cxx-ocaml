@@ -10576,6 +10576,102 @@ struct Translator {
         return chain;
       }
     }
+    // Nested STRING-constant column: string literals plus var/any rows.
+    // Upstream: combine_constant Const_string sorts + dedups the (string,
+    // action) pairs (sort_lambda_list), then Bytegen's expand_stringswitch
+    // emits the dichotomic/linear caml_string_notequal tree with delta=1 and
+    // the default behind a FRESH catch (make_catch runs AFTER Simplif inlined
+    // a single-use fail into the stringswitch node) -- so the default always
+    // rides a `branchif`, its handler placed right after the tree.  Our
+    // defaults are still `(exit aid)` arm placeholders here, so make_catch's
+    // bare-exit-reuse decision can't be made yet: always wrap the fresh exit
+    // and let collapse_str_dflt_catches (post-wire_garms) rewrite the
+    // multi-use case back to the direct bare exit.  Second-pass + budgeted
+    // like the INT column above.
+    if (g_gm_tuples_) {
+      bool anystr = false, strcol = true;
+      for (auto& r : rows) {
+        auto& d = r.cols[0]->desc;
+        if (auto* pc = std::get_if<Ppat_constant>(&d)) {
+          if (!std::holds_alternative<Pconst_string>(pc->c.desc)) { strcol = false; break; }
+          anystr = true;
+        } else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d)) {
+          strcol = false; break;
+        }
+      }
+      if (anystr && strcol) {
+        if (comps[0]->k != Lam::K::Var) return nullptr;
+        if (g_gm_budget_ == 0) return nullptr;
+        if (g_gm_budget_ > 0) --g_gm_budget_;
+        auto colstr = [&](const Pattern* p) -> const std::string& {
+          return std::get_if<Pconst_string>(
+              &std::get_if<Ppat_constant>(&p->desc)->c.desc)->s;
+        };
+        std::vector<std::string> vals;      // distinct strings, in row order
+        for (auto& r : rows)
+          if (std::get_if<Ppat_constant>(&r.cols[0]->desc)) {
+            const std::string& s = colstr(r.cols[0]);
+            if (std::find(vals.begin(), vals.end(), s) == vals.end()) vals.push_back(s);
+          }
+        std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
+        bool havedflt = false;
+        for (auto& r : rows)
+          if (!std::get_if<Ppat_constant>(&r.cols[0]->desc)) { havedflt = true; break; }
+        // One fresh exit serves both the tree's default AND the per-string
+        // sub-matrix misses (upstream: both land in the string split's fail).
+        int fid = ++next_exit_;
+        // Per-string sub-matrices, compiled in first-occurrence row order
+        // (stamp-stable), THEN sorted by the string; vals are distinct so
+        // sort_lambda_list's uniq is a no-op.
+        std::vector<std::pair<std::string, LamPtr>> sw;
+        for (auto& s : vals) {
+          std::vector<MRow> sub;
+          for (auto& r : rows)
+            if (std::get_if<Ppat_constant>(&r.cols[0]->desc) && colstr(r.cols[0]) == s) {
+              MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
+            }
+          std::vector<LamPtr> cc = rest;
+          LamPtr sb = gmatch(std::move(cc), std::move(sub), mloc, fid);
+          if (!sb) return nullptr;
+          sw.push_back({s, std::move(sb)});
+        }
+        std::stable_sort(sw.begin(), sw.end(),
+                         [](auto& a, auto& b) { return a.first < b.first; });
+        auto fexit = mk(Lam::K::Staticraise); fexit->prim_arg = fid;
+        // Bytegen's bind_sw: the tree must present exactly ONE nominal use of
+        // the component to the enclosing split (the stringswitch node's arg
+        // slot), so its subst-vs-materialize decision matches upstream's.
+        // Build against an internal `switch` var; collapse resolves it.
+        Ident swv = fresh("switch");
+        LamPtr tree = string_test_tree(varof(swv), sw, /*delta=*/1, fexit);
+        LamPtr dbody;
+        if (havedflt) {
+          std::vector<MRow> dsub;
+          for (auto& r : rows) {
+            auto& d = r.cols[0]->desc;
+            if (std::get_if<Ppat_constant>(&d)) continue;
+            MRow nr = r;
+            if (auto* pv = std::get_if<Ppat_var>(&d)) nr.binds.push_back({pv->name.txt, comps[0]->var});
+            nr.cols.erase(nr.cols.begin()); dsub.push_back(std::move(nr));
+          }
+          std::vector<LamPtr> cc = rest;
+          dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid);
+          if (!dbody) return nullptr;
+        } else {
+          dbody = mkexit();  // no var/any rows: fail to the enclosing default
+        }
+        auto cat = mk(Lam::K::Catch);
+        cat->cond = tree; cat->prim_arg = fid; cat->then_ = dbody;
+        cat->keep_catch = true; cat->gm_str_dflt = true;
+        auto bl = mk(Lam::K::Let);
+        bl->bindings = {{swv, ValueKind::Gen, comps[0], false}};
+        bl->body = cat; bl->gm_str_bind = true;
+        if (cppcaml::dbg_env("STRDBG"))
+          fprintf(stderr, "[STRDBG] string col fid=%d havedflt=%d nstr=%zu\n",
+                  fid, (int)havedflt, sw.size());
+        return bl;
+      }
+    }
     // Only var/any and (non-exn, non-inline, non-unboxed) constructor columns.
     bool anyctor = false;
     for (auto& r : rows) {
@@ -10953,6 +11049,35 @@ struct Translator {
     if (l->k == Lam::K::Switch && l->sw_blocks.size() >= 2)
       l = share_actions_and_refail(l);
   }
+  // Second half of expand_stringswitch's make_catch: gmatch's string column
+  // always wraps its tree default in a fresh gm_str_dflt catch because the
+  // real default is still an `(exit aid)` arm placeholder at assembly.  When
+  // wiring left the handler a BARE exit (the arm was multi-use, so upstream's
+  // Simplif would NOT have inlined it into the stringswitch fail slot and
+  // Bytegen's make_catch would have reused the bare exit directly), collapse
+  // the indirection: retarget the tree's exits at the real id, drop the catch.
+  void collapse_str_dflt_catches(LamPtr& l) {
+    if (!l) return;
+    collapse_str_dflt_catches(l->fn); collapse_str_dflt_catches(l->cond);
+    collapse_str_dflt_catches(l->then_); collapse_str_dflt_catches(l->else_);
+    collapse_str_dflt_catches(l->body); collapse_str_dflt_catches(l->sw_default);
+    for (auto& a : l->args) collapse_str_dflt_catches(a);
+    for (auto& b : l->bindings) collapse_str_dflt_catches(b.val);
+    for (auto& sc : l->sw_consts) collapse_str_dflt_catches(sc.body);
+    for (auto& sc : l->sw_blocks) collapse_str_dflt_catches(sc.body);
+    if (l->k == Lam::K::Catch && l->gm_str_dflt && l->then_ &&
+        l->then_->k == Lam::K::Staticraise && l->then_->args.empty()) {
+      inline_exit(l->cond, l->prim_arg, {}, {}, l->then_);
+      l = l->cond;
+    }
+    if (l->k == Lam::K::Let && l->gm_str_bind) {
+      auto& b = l->bindings[0];
+      if (b.val->k == Lam::K::Var) {              // bind_sw's Lvar no-op
+        subst_var(l->body, b.id, b.val);
+        l = l->body;
+      } else l->gm_str_bind = false;              // real Strict `switch` bind
+    }
+  }
   // Entry for the general matrix matcher on a single scrutinee: peel a trailing
   // catch-all as the shared default (else Match_failure), run gmatch, and wrap the
   // fallback in a shared static-catch (inlined when used at most once).
@@ -10994,6 +11119,9 @@ struct Translator {
     }
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
     wire_garms(body, arms);
+    if (cppcaml::dbg_env("STRDBG")) {
+      fprintf(stderr, "[STRDBG] post-wire:\n"); print_dlambda(body, std::cerr);
+    }
     share_switches_rec(body);
     LamPtr dbody;
     if (catchall) {
@@ -11005,6 +11133,12 @@ struct Translator {
     if (uses == 0) res = body;                     // exhaustive: fallback unreachable
     else if (uses == 1 && bad == 0) { inline_exit(body, deid, {}, {}, dbody); res = body; }
     else { auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = deid; c->then_ = dbody; res = c; }
+    // AFTER the catchall inline: the string-column make_catch decision (below)
+    // must see the FINAL default content, exactly as Bytegen runs after Simplif.
+    collapse_str_dflt_catches(res);
+    if (cppcaml::dbg_env("STRDBG")) {
+      fprintf(stderr, "[STRDBG] post-collapse:\n"); print_dlambda(res, std::cerr);
+    }
     if (need_temp) {
       if (count_var(res, tv) <= 1) subst_alias(res, tv, scrut);
       else { auto l = mk(Lam::K::Let); l->bindings = {{tv, ValueKind::Gen, scrut, true}}; l->body = res; res = l; }
@@ -12375,6 +12509,8 @@ struct Translator {
     if (uses == 0) res = body;
     else if (uses == 1 && bad == 0) { inline_exit(body, deid, {}, {}, dbody); res = body; }
     else { auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = deid; c->then_ = dbody; res = c; }
+    // AFTER the catchall inline, like Bytegen after Simplif (see gmatch_top).
+    collapse_str_dflt_catches(res);
     if (!temps.empty()) { auto l = mk(Lam::K::Let); l->bindings = std::move(temps); l->body = res; res = l; }
     return res;
   }
