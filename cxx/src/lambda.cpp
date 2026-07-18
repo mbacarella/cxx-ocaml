@@ -10058,6 +10058,50 @@ struct Translator {
     auto sw = mk(Lam::K::Switch); sw->cond = scrut; sw->sw_consts = consts;
     return sw;
   }
+  // as_interval_canfail (matching.ml:2798) + Switcher clustering for gmatch's
+  // constant side when a fail action exists (call_switcher ~low:0 ~high:(n-1)
+  // with fail = Some (exit ..) from mk_failaction_neg).  `consts` arrives dense
+  // over 0..n-1 with gap tags already filled with `(exit fail_exit)`; storing
+  // fail at action index 0 and run-merging the dense list yields exactly the
+  // init_rec/nofail_rec/fail_rec interval array (holes and fail-equal cases both
+  // dedup to index 0).  Only a pure tests outcome is kept: a jump-table cluster
+  // spanning [0, n-1] is byte-identical to the caller's flat gap-expanded
+  // switch, and a MIXED tests+table clustering is not modelled yet -- defer.
+  LamPtr canfail_const_dispatch(const LamPtr& scrut, const std::vector<Lam::SwitchCase>& consts,
+                                int fail_exit) {
+    if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
+    int n = (int)consts.size();
+    if (n < 2) return nullptr;
+    auto fail = mk(Lam::K::Staticraise); fail->prim_arg = fail_exit;
+    std::vector<LamPtr> actions{fail};             // index 0 = fail (canfail invariant)
+    std::vector<int> act_of(n);
+    for (int i = 0; i < n; ++i) {
+      if (consts[i].tag != i) return nullptr;      // want the dense 0..n-1 shape
+      int found = -1;
+      for (int a = 0; a < (int)actions.size(); ++a)
+        if (same_action_lam(consts[i].body, actions[a])) { found = a; break; }
+      if (found < 0) { actions.push_back(consts[i].body); found = (int)actions.size() - 1; }
+      act_of[i] = found;
+    }
+    std::vector<SwCase> cases;
+    for (int i = 0; i < n; ) {
+      int j = i; while (j + 1 < n && act_of[j + 1] == act_of[i]) j++;
+      cases.push_back({(long long)i, (long long)j, act_of[i]});
+      i = j + 1;
+    }
+    if (cases.size() < 2) return nullptr;
+    sw_ok_inter_ = true;                           // tags are small (0..n-1)
+    sw_memo_.clear();
+    std::vector<int> k; comp_clusters(cases, k);
+    std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
+    make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
+    if (made_switch) return nullptr;
+    LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
+    // Fail leaves come out as default sentinels; each becomes its own fresh
+    // `(exit fail_exit)` -- the handler is the caller's shared-default catch.
+    rewrite_default_leaves(tree, fail_exit, nullptr);
+    return tree;
+  }
 
   // ----- nested-pattern matcher (one ctor row + a trailing catch-all) ----------
   // The sub-patterns of a block constructor `K(p0,..,pn)` (its argument fields):
@@ -10914,6 +10958,23 @@ struct Translator {
       std::string ka = make_lam_key(a);
       return !ka.empty() && ka == make_lam_key(b);
     };
+    // The const side of a match WITH a fail action goes through call_switcher
+    // canfail.  The fail is whatever common argless exit the gap tags route to:
+    // `(exit dflt_exit)` under the shared default, `(exit deid)` via the empty
+    // sub-matrix otherwise -- both are upstream's mk_failaction_neg exit.  With
+    // no gaps (or an unrecognized gap body), const_dispatch's nofail shapes stand.
+    auto const_side = [&]() -> LamPtr {
+      int fexit = -1;
+      for (int t = 0; t < NC; ++t) if (!const_ci.count(t)) {
+        const LamPtr& b = consts[t].body;
+        if (b->k != Lam::K::Staticraise || !b->args.empty() ||
+            (fexit >= 0 && fexit != b->prim_arg)) { fexit = -1; break; }
+        fexit = b->prim_arg;
+      }
+      if (fexit >= 0)
+        if (LamPtr t = canfail_const_dispatch(comps[0], consts, fexit)) return t;
+      return const_dispatch(comps[0], consts);
+    };
     if (NC == 1 && NB == 1) {
       auto i = mk(Lam::K::IfThenElse);
       i->cond = comps[0]; i->then_ = blocks[0].body; i->else_ = consts[0].body; result = i;
@@ -10925,7 +10986,7 @@ struct Translator {
       auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp; isint->prim_id = "isint";
       isint->args = {comps[0]};
       auto i = mk(Lam::K::IfThenElse);
-      i->cond = isint; i->then_ = const_dispatch(comps[0], consts); i->else_ = blocks[0].body;
+      i->cond = isint; i->then_ = const_side(); i->else_ = blocks[0].body;
       result = i;
     } else if (NB >= 2) {
       // Plain dense switch; share_actions_sw + reintroduce_fail run in the
@@ -10942,9 +11003,9 @@ struct Translator {
       auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp; isint->prim_id = "isint";
       isint->args = {comps[0]};
       auto i = mk(Lam::K::IfThenElse);
-      i->cond = isint; i->then_ = const_dispatch(comps[0], consts); i->else_ = blocks[0].body; result = i;
+      i->cond = isint; i->then_ = const_side(); i->else_ = blocks[0].body; result = i;
     } else {
-      result = const_dispatch(comps[0], consts);   // NB == 0
+      result = const_side();                       // NB == 0
     }
     // Compile the shared default sub-matrix ONCE and wire it to dflt_exit (inline
     // when used at most once -> simplif drops the trivial exit, byte-identical to
