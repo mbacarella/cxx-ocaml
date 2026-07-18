@@ -11118,6 +11118,19 @@ struct Translator {
       g_gm_tuples_ = false; g_gm_budget_ = -1;
     }
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
+    // A surviving (multi-use) default catch nests INSIDE the arm catches, like
+    // upstream: the default matrix's catch is made by combine at the split,
+    // while or-arm handlers wrap outside it -- and the default handler may
+    // raise arm exits (which must stay in scope), never the reverse.  So
+    // pre-create the catch (handler filled below) BEFORE the arms wrap; the
+    // default BODY still compiles after the arm handlers (it is the last row:
+    // stamp order is preserved).
+    int bad = 0; int uses = count_exit(body, deid, false, bad);
+    LamPtr dcatch;
+    if (uses > 0 && !(uses == 1 && bad == 0)) {
+      dcatch = mk(Lam::K::Catch); dcatch->cond = body; dcatch->prim_arg = deid;
+      body = dcatch;
+    }
     wire_garms(body, arms);
     if (cppcaml::dbg_env("STRDBG")) {
       fprintf(stderr, "[STRDBG] post-wire:\n"); print_dlambda(body, std::cerr);
@@ -11128,11 +11141,9 @@ struct Translator {
       scope.emplace_back(); bind_catchall(*catchall->lhs, sv);
       dbody = expr(*catchall->rhs); scope.pop_back();
     } else dbody = raise_predef("Match_failure", mloc, "gmatch_dft");
-    int bad = 0; int uses = count_exit(body, deid, false, bad);
-    LamPtr res;
-    if (uses == 0) res = body;                     // exhaustive: fallback unreachable
-    else if (uses == 1 && bad == 0) { inline_exit(body, deid, {}, {}, dbody); res = body; }
-    else { auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = deid; c->then_ = dbody; res = c; }
+    LamPtr res = body;
+    if (dcatch) dcatch->then_ = dbody;
+    else if (uses == 1 && bad == 0) inline_exit(res, deid, {}, {}, dbody);
     // AFTER the catchall inline: the string-column make_catch decision (below)
     // must see the FINAL default content, exactly as Bytegen runs after Simplif.
     collapse_str_dflt_catches(res);
@@ -12492,6 +12503,13 @@ struct Translator {
     LamPtr body = gmatch(comps, mrows, mloc, deid);
     g_gm_tuples_ = false; g_gm_budget_ = -1;
     if (!body) return nullptr;
+    // Multi-use default catch nests INSIDE the arm catches (see gmatch_top).
+    int bad = 0; int uses = count_exit(body, deid, false, bad);
+    LamPtr dcatch;
+    if (uses > 0 && !(uses == 1 && bad == 0)) {
+      dcatch = mk(Lam::K::Catch); dcatch->cond = body; dcatch->prim_arg = deid;
+      body = dcatch;
+    }
     wire_garms(body, arms);
     share_switches_rec(body);
     LamPtr dbody;
@@ -12504,11 +12522,9 @@ struct Translator {
       dbody = expr(*catchall->rhs);
       scope.pop_back();
     } else dbody = raise_predef("Match_failure", mloc, "gmatch_tuple_dft");
-    int bad = 0; int uses = count_exit(body, deid, false, bad);
-    LamPtr res;
-    if (uses == 0) res = body;
-    else if (uses == 1 && bad == 0) { inline_exit(body, deid, {}, {}, dbody); res = body; }
-    else { auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = deid; c->then_ = dbody; res = c; }
+    LamPtr res = body;
+    if (dcatch) dcatch->then_ = dbody;
+    else if (uses == 1 && bad == 0) inline_exit(res, deid, {}, {}, dbody);
     // AFTER the catchall inline, like Bytegen after Simplif (see gmatch_top).
     collapse_str_dflt_catches(res);
     if (!temps.empty()) { auto l = mk(Lam::K::Let); l->bindings = std::move(temps); l->body = res; res = l; }
