@@ -8029,6 +8029,20 @@ struct Translator {
         keep.push_back(std::move(b));
       }
     }
+    // Simplif's mklet/mkmutlet smart constructors (simplif.ml:498): a let of
+    // ANY kind whose body is exactly its own bound variable collapses to the
+    // bound term -- `let v = e1 in v` -> e1 (same position, single
+    // evaluation, so no purity requirement).  The shape reaches us from
+    // pattern binders on MUTABLE record fields (`{link; _} -> link` binds
+    // link =o (field_int ..) with the var as the whole body), which the
+    // Alias substitution above must not touch.
+    if (!keep.empty() && l->body &&
+        ((l->body->k == Lam::K::Var && !keep.back().mut) ||
+         (l->body->k == Lam::K::Mutvar && keep.back().mut)) &&
+        l->body->var.stamp == keep.back().id.stamp) {
+      l->body = keep.back().val;
+      keep.pop_back();
+    }
     if (keep.empty()) { l = l->body; return; }
     l->bindings = std::move(keep);
   }
