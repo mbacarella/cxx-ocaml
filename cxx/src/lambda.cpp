@@ -7869,7 +7869,13 @@ struct Translator {
       for (auto& sc : n->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
       for (auto& sc : n->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
       if (n->k == K::Switch && !r.empty())
-        r += ":" + std::to_string(n->sw_numconsts) + ":" + std::to_string(n->sw_numblocks);
+        // Lambda.make_key normalizes locations EXCEPT Lswitch's, which it
+        // keeps (lambda.ml:480) -- so switch-containing actions only key
+        // equal when the switches come from the same source term.  Node
+        // identity is this port's analog: per-cell combines build distinct
+        // nodes; a duplicated arm body is a shared pointer.
+        r += ":" + std::to_string(n->sw_numconsts) + ":" + std::to_string(n->sw_numblocks) +
+             ":@" + std::to_string(reinterpret_cast<uintptr_t>(n.get()));
       if (r.empty()) return "";
       return r + ")";
     };
@@ -11346,7 +11352,21 @@ struct Translator {
   };
   using OcRow = std::vector<OcPat>;
   using OcMatrix = std::vector<OcRow>;
-  struct OcClause { OcRow cols; LamPtr act; };
+  // An or-bound variable routed through a handler's exit (matching.ml's
+  // patbound_action_vars): `occ[ai]` is the (column, field) the var occupies in
+  // or-alternative `ai` -- field -1 = the whole column, else a ctor argument --
+  // i.e. which scrutinee component (or field read) that alternative's
+  // `(exit i ..)` passes: upstream's explode_or_pat instances after the Alias
+  // substitutions Simplif always performs (var-to-var, single-use field read).
+  // `used` = the action references it (upstream's pm_fv filter); unused vars
+  // stay listed because their mere presence blocks Or_matrix insertion
+  // (pat_bound_idents is not use-filtered) but never pass through the exit.
+  struct OcHVar { Ident id; ValueKind kind; std::vector<std::pair<int, int>> occ;
+                  bool used = true; };
+  // hvars: COLUMN-level or-bound vars this clause still carries -- occ[li] per
+  // leaf of the (single) or in column occ[0].first, absolute column indices;
+  // consumed by oc_precompile_or when argpos reaches that column.
+  struct OcClause { OcRow cols; LamPtr act; std::vector<OcHVar> hvars; };
   struct OcDefEnv { std::vector<std::pair<int, OcMatrix>> env; int final_exit = -1; };
   struct OcCtxRow { OcRow left, right; };  // left index 0 = most recent (matching.ml list head)
   using OcCtx = std::vector<OcCtxRow>;
@@ -11578,13 +11598,6 @@ struct Translator {
                 std::vector<std::pair<int, int>> pending; };
   struct OcPmh;
   using OcPmhPtr = std::shared_ptr<OcPmh>;
-  // An or-bound variable routed through a handler's exit (matching.ml's
-  // patbound_action_vars): `occ[ai]` is the (column, field) the var occupies in
-  // or-alternative `ai` -- field -1 = the whole column, else a ctor argument --
-  // i.e. which scrutinee component (or field read) that alternative's
-  // `(exit i ..)` passes: upstream's explode_or_pat instances after the Alias
-  // substitutions Simplif always performs (var-to-var, single-use field read).
-  struct OcHVar { Ident id; ValueKind kind; std::vector<std::pair<int, int>> occ; };
   struct OcHandler { OcMatrix provenance; int exit; OcPm pm;
                      std::vector<Ident> vars; std::vector<ValueKind> var_kinds; };
   struct OcPmh {
@@ -11624,14 +11637,15 @@ struct Translator {
     OcMatrix m; for (auto& c : cls) m.push_back(c.cols);
     return m;
   }
-  // Lambda.make_key equality, EXIT-AWARE (ocamlc's make_key keeps staticraise
-  // ids; the exit-blind same_action_lam would merge dispatches to distinct
-  // handlers -- a miscompile in this port's store/safe_before).
+  // Lambda.make_key equality via oc_make_key: exit-aware (staticraise ids kept,
+  // so dispatches to distinct handlers never merge) AND alias-substituting /
+  // alpha-renaming exactly like upstream -- the collapse of two specialized
+  // cells that differ only in their (Alias) field-arg binds depends on it.
   static bool oc_same_action(const LamPtr& a, const LamPtr& b) {
     if (a == b) return true;
     if (oc_is_exit(a) && oc_is_exit(b)) return a->prim_arg == b->prim_arg;
-    std::string ka = cppcaml::lambda::make_lam_key(a, /*exit_aware=*/true);
-    return !ka.empty() && ka == cppcaml::lambda::make_lam_key(b, /*exit_aware=*/true);
+    std::string ka = oc_make_key(a);
+    return !ka.empty() && ka == oc_make_key(b);
   }
   static bool oc_head_is_or(const OcClause& c) {
     return !c.cols[0].omega && c.cols[0].alts.size() > 1;
@@ -11653,14 +11667,21 @@ struct Translator {
     auto safe_below = [&](const OcClause& q, const OcClause& p) {
       return oc_les(rest_of(q), rest_of(p));
     };
+    // does the clause's or-head (current column) bind variables?  Upstream's
+    // insert condition requires `pat_bound_idents p = []` -- NOT use-filtered.
+    auto head_binds = [&](const OcClause& c) {
+      for (auto& hv : c.hvars)
+        if (!hv.occ.empty() && hv.occ[0].first == argpos) return true;
+      return false;
+    };
     auto insert_or_append = [&](const OcClause& p) {
       // walk the or-matrix most-recent-first (ocaml rev_ors head = ors.back()).
       for (int idx = (int)ors.size() - 1; idx >= 0; --idx) {
         const OcClause& q = ors[idx];
         bool q_or = oc_head_is_or(q);
         if (!q_or || !oc_compat(p.cols[0], q.cols[0])) continue;  // seen += q
-        if (oc_equiv(p.cols[0], q.cols[0])) {
-          // attempt insertion for equivalent or-heads (no vars in this domain):
+        if (!head_binds(p) && !head_binds(q) && oc_equiv(p.cols[0], q.cols[0])) {
+          // attempt insertion for equivalent var-free or-heads:
           // append condition vs the OLDER or-rows, insert condition vs the newer.
           bool ok = true;
           {  // extract_equiv_head over the older rows (indices idx-1 .. 0)
@@ -11739,6 +11760,7 @@ struct Translator {
       std::vector<OcClause> var_cls;
       for (auto& c : yes) {
         OcClause n; n.cols.assign(c.cols.begin() + 1, c.cols.end()); n.act = c.act;
+        n.hvars = c.hvars;
         var_cls.push_back(std::move(n));
       }
       auto [first, nexts] = oc_split_or(std::move(var_cls), argpos + 1, oc_def_pop_column(def));
@@ -11784,27 +11806,48 @@ struct Translator {
     for (size_t i = 0; i < ors.size(); ++i) {
       if (!oc_head_is_or(ors[i])) { body_cases.push_back(ors[i]); continue; }
       const OcPat orp = ors[i].cols[0];
+      // patbound_action_vars: this or-head's bound vars (occ per leaf, leaf
+      // order); the rest of the clause's hvars belong to deeper columns and
+      // travel with the handler row.
+      std::vector<OcHVar> cur, rest;
+      for (auto& hv : ors[i].hvars)
+        (hv.occ[0].first == argpos ? cur : rest).push_back(hv);
       // extract_equiv_head: following or-rows with an equivalent head join this orpm.
       OcPm orpm; orpm.argpos = argpos + 1;
       orpm.def = oc_def_pop_compat(orp, def);
       OcClause self; self.cols.assign(ors[i].cols.begin() + 1, ors[i].cols.end());
-      self.act = ors[i].act;
+      self.act = ors[i].act; self.hvars = std::move(rest);
       orpm.cases.push_back(std::move(self));
-      while (i + 1 < ors.size() && oc_head_is_or(ors[i + 1]) &&
-             oc_equiv(orp, ors[i + 1].cols[0])) {
+      auto head_var_free = [&](const OcClause& c) {
+        for (auto& hv : c.hvars) if (hv.occ[0].first == argpos) return false;
+        return true;
+      };
+      // merge only var-free heads: upstream's merged rows drop their own
+      // or-head bindings entirely, which is only reachable for redundant rows.
+      while (cur.empty() && i + 1 < ors.size() && oc_head_is_or(ors[i + 1]) &&
+             head_var_free(ors[i + 1]) && oc_equiv(orp, ors[i + 1].cols[0])) {
         ++i;
         OcClause o; o.cols.assign(ors[i].cols.begin() + 1, ors[i].cols.end());
-        o.act = ors[i].act;
+        o.act = ors[i].act; o.hvars = ors[i].hvars;
         orpm.cases.push_back(std::move(o));
       }
       int or_num = oc_alloc_exit();
-      for (int t : orp.alts) {                     // explode_or_pat, leaves in order
-        OcClause n; n.cols.push_back(oc_const(t));
+      for (size_t li = 0; li < orp.alts.size(); ++li) {  // explode_or_pat, leaves in order
+        OcClause n; n.cols.push_back(oc_const(orp.alts[li]));
         for (size_t j = 1; j < w; ++j) n.cols.push_back(oc_omega());
-        n.act = oc_exit(or_num);
+        auto e = oc_exit(or_num);
+        // this alternative's instances of the used or-bound vars: the shared
+        // field arg var of the (column, field) the name occupies in leaf li
+        // (the specialized cell binds it; Simplif substitutes single uses)
+        for (auto& hv : cur)
+          if (hv.used) e->args.push_back(varof(oc_fid(argpos, hv.occ[li].second)));
+        n.act = e;
         body_cases.push_back(std::move(n));
       }
-      handlers.push_back({OcMatrix{OcRow{orp}}, or_num, std::move(orpm)});
+      OcHandler h{OcMatrix{OcRow{orp}}, or_num, std::move(orpm)};
+      for (auto& hv : cur)
+        if (hv.used) { h.vars.push_back(hv.id); h.var_kinds.push_back(hv.kind); }
+      handlers.push_back(std::move(h));
     }
     auto me = std::make_shared<OcPmh>();
     me->kind = 2; me->body = {argpos, std::move(body_cases), def};
@@ -11964,6 +12007,7 @@ struct Translator {
       OcPm inner; inner.argpos = pm.argpos + 1; inner.def = oc_def_pop_column(pm.def);
       for (auto& c : pm.cases) {
         OcClause n; n.cols.assign(c.cols.begin() + 1, c.cols.end()); n.act = c.act;
+        n.hvars = c.hvars;
         inner.cases.push_back(std::move(n));
       }
       auto r = oc_compile_match(partial, oc_ctx_lshift(ctx), inner);
@@ -11999,6 +12043,7 @@ struct Translator {
       for (auto& c : pm.cases) {
         if (c.cols[0].alts[0] != t) continue;
         OcClause n; n.cols.assign(c.cols.begin() + 1, c.cols.end()); n.act = c.act;
+        n.hvars = c.hvars;
         cpm.cases.push_back(std::move(n));
       }
       auto r = oc_compile_match(partial, cctx, cpm);
@@ -12388,7 +12433,9 @@ struct Translator {
   }
   // ---- the tuple (1-column) stage: rows are or-trees of k-tuples ----
   struct OcTopRow { std::vector<OcRow> alts; bool any_head; LamPtr act;
-                    std::vector<OcHVar> hvars; };  // or-bound vars used by act
+                    std::vector<OcHVar> hvars;     // ROW-level or-bound vars (used by act)
+                    std::vector<OcHVar> chvars; }; // COLUMN-level or-bound vars
+                                                   // (single-alt rows; -> OcClause.hvars)
   using OcTopMatrix = std::vector<std::vector<OcRow>>;   // 1-col: each row = its alts
   using OcTopEnv = std::vector<std::pair<int, OcTopMatrix>>;
   struct OcTopPm { std::vector<OcTopRow> cases; OcTopEnv env; };
@@ -12433,7 +12480,8 @@ struct Translator {
       for (int idx = (int)ors.size() - 1; idx >= 0; --idx) {
         const OcTopRow& q = ors[idx];
         if (q.alts.size() <= 1 || !oc_top_compat(cl.alts, q.alts)) continue;
-        if (oc_top_equiv(cl.alts, q.alts)) {
+        if (cl.hvars.empty() && cl.chvars.empty() && q.hvars.empty() &&
+            q.chvars.empty() && oc_top_equiv(cl.alts, q.alts)) {  // insert: var-free only
           bool ok = true;                          // insert condition: newer must be disjoint
           for (size_t j = idx + 1; j < ors.size() && ok; ++j)
             if (oc_top_compat(cl.alts, ors[j].alts)) ok = false;
@@ -12501,8 +12549,10 @@ struct Translator {
       if (ors[i].alts.size() == 1) { body.push_back(ors[i]); continue; }
       OcTopHandler h; h.orp_alts = ors[i].alts; h.acts = {ors[i].act};
       h.hvars = ors[i].hvars;
-      while (i + 1 < ors.size() && ors[i + 1].alts.size() > 1 &&
-             oc_top_equiv(ors[i].alts, ors[i + 1].alts)) {
+      // merge only var-free rows (upstream's merged rows drop their own
+      // or-bindings; only reachable for redundant rows)
+      while (h.hvars.empty() && i + 1 < ors.size() && ors[i + 1].alts.size() > 1 &&
+             ors[i + 1].hvars.empty() && oc_top_equiv(ors[i].alts, ors[i + 1].alts)) {
         ++i; h.acts.push_back(ors[i].act);
       }
       h.exit = oc_alloc_exit();
@@ -12544,7 +12594,7 @@ struct Translator {
       OcPm p; p.argpos = 0; p.def.final_exit = final_exit;
       for (auto& [i, tm] : pm.env) p.def.env.push_back({i, oc_top_flatten_matrix(tm)});
       for (auto& r : pm.cases)
-        for (auto& alt : r.alts) p.cases.push_back({alt, r.act});
+        for (auto& alt : r.alts) p.cases.push_back({alt, r.act, r.chvars});
       return p;
     };
     auto r = std::make_shared<OcPmh>();
@@ -12588,7 +12638,8 @@ struct Translator {
     if (k < 2 || k > 6 || vrows.empty() || vrows.size() > 32) return nullptr;
     for (auto& lbl : tu->labels) if (lbl) return nullptr;
     // 1) validate shapes; collect column ctor patterns (no side effects yet)
-    struct AltVar { std::string name; int col; int field; const Pattern* node; };
+    struct AltVar { std::string name; int col; int field; const Pattern* node;
+                    int alt; int nalts; };  // leaf index / count in the column's or
     struct SrcAlt { std::vector<const Pattern*> cols; bool is_any;
                     std::vector<AltVar> vars; };   // bare-var columns, col order
     struct SrcRow { std::vector<SrcAlt> alts; const Expression* rhs; };
@@ -12619,7 +12670,8 @@ struct Translator {
       srcs.push_back(std::move(sr));
     }
     // per-column: every leaf a ctor of one shared variant type, block ctors
-    // carrying only var/wildcard arguments (vars only outside a column or)
+    // carrying only var/wildcard arguments (binds under a column-level or are
+    // fine for single-alternative rows: they become handler exit args)
     std::vector<int> col_nc(k, 0), col_ncc(k, 0);
     std::vector<std::map<int, int>> col_arity(k);  // unified tag -> block arity
     std::vector<std::vector<std::vector<std::vector<int>>>> tags(srcs.size());
@@ -12633,15 +12685,15 @@ struct Translator {
           const Pattern* p = effective_pat(a.cols[c]);
           std::vector<const Pattern*> cl;
           flatten_or(p, cl);
-          for (auto* q : cl) {
-            const Pattern* eq = effective_pat(q);
+          for (size_t qi = 0; qi < cl.size(); ++qi) {
+            const Pattern* eq = effective_pat(cl[qi]);
             if (std::holds_alternative<Ppat_any>(eq->desc)) {
               if (cl.size() > 1) return nullptr;   // `_` under an or: bail
               continue;
             }
             if (auto* pv = std::get_if<Ppat_var>(&eq->desc)) {
               if (cl.size() > 1) return nullptr;   // var under a column or: bail
-              a.vars.push_back({pv->name.txt, (int)c, -1, eq});
+              a.vars.push_back({pv->name.txt, (int)c, -1, eq, 0, 1});
               continue;
             }
             auto* pc = std::get_if<Ppat_construct>(&eq->desc);
@@ -12665,12 +12717,15 @@ struct Translator {
                 const Pattern* fp = effective_pat(fps[fi]);
                 if (std::holds_alternative<Ppat_any>(fp->desc)) continue;
                 auto* fv = std::get_if<Ppat_var>(&fp->desc);
-                // nested tests/aliases, or a bind under a column or: bail
-                if (!fv || cl.size() > 1) {
+                // nested tests/aliases bail; a bind under a COLUMN or is fine
+                // for single-alternative rows (it routes through the or
+                // handler's exit args) but not under a ROW-level or too
+                if (!fv || (cl.size() > 1 && sr.alts.size() > 1)) {
                   if (ocdbg) fprintf(stderr, "[OCgate] %s: field %zu not var/any\n", cn.c_str(), fi);
                   return nullptr;
                 }
-                a.vars.push_back({fv->name.txt, (int)c, (int)fi, fp});
+                a.vars.push_back({fv->name.txt, (int)c, (int)fi, fp,
+                                  (int)qi, (int)cl.size()});
               }
             } else if (pc->arg) return nullptr;
             if (type.empty()) type = ci->type;
@@ -12768,15 +12823,31 @@ struct Translator {
     // an Alias-let field read, which Simplif substitutes when used at most once
     // (is_alias_dup) and keeps otherwise, exactly upstream's bind_alias residue.
     struct RowVar { std::string name; const Pattern* node;
-                    std::vector<std::pair<int, int>> occ; Ident id; };
+                    std::vector<std::pair<int, int>> occ; Ident id;
+                    int nalts = 1; };  // >1: a COLUMN-level or's var, occ per leaf
     std::vector<std::vector<RowVar>> rowvars(srcs.size());
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
       auto& sr = srcs[ri];
       auto& rv = rowvars[ri];
       for (auto& av : sr.alts[0].vars) {
-        for (auto& q : rv) if (q.name == av.name) return nullptr;  // dup in one alt
-        rv.push_back({av.name, av.node, {{av.col, av.field}}, {}});
+        RowVar* ex = nullptr;
+        for (auto& q : rv) if (q.name == av.name) { ex = &q; break; }
+        if (av.nalts > 1) {                        // a column-or's bound var
+          if (ex) {                                // this leaf's occurrence
+            if (ex->nalts != av.nalts || ex->occ[0].first != av.col ||
+                (int)ex->occ.size() != av.alt) return nullptr;
+            ex->occ.push_back({av.col, av.field});
+          } else {
+            if (av.alt != 0) return nullptr;       // leaf 0 must bind it first
+            rv.push_back({av.name, av.node, {{av.col, av.field}}, {}, av.nalts});
+          }
+          continue;
+        }
+        if (ex) return nullptr;                    // dup in one alt
+        rv.push_back({av.name, av.node, {{av.col, av.field}}, {}, 1});
       }
+      for (auto& q : rv)                           // every leaf binds every name
+        if ((int)q.occ.size() != q.nalts) return nullptr;
       for (size_t ai = 1; ai < sr.alts.size(); ++ai) {
         if (sr.alts[ai].vars.size() != rv.size()) return nullptr;
         std::set<std::string> seen;
@@ -12825,7 +12896,7 @@ struct Translator {
       bool multi = srcs[ri].alts.size() > 1;
       scope.emplace_back();
       for (auto& v : rv) {
-        if (multi) {
+        if (multi || v.nalts > 1) {                // routed through a handler exit
           // handler exit args reference the field arg vars: make sure they exist
           v.id = fresh(v.name); scope.back()[v.name] = v.id;
           for (auto& [oc, of] : v.occ) if (of >= 0) getfid(oc, of, v.name);
@@ -12856,10 +12927,16 @@ struct Translator {
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
       OcTopRow tr; tr.act = acts[ri];
       tr.any_head = srcs[ri].alts.size() == 1 && srcs[ri].alts[0].is_any;
-      if (srcs[ri].alts.size() > 1)                // pm_fv filter: only vars the act uses
+      if (srcs[ri].alts.size() > 1) {              // pm_fv filter: only vars the act uses
         for (auto& v : rowvars[ri])
           if (count_var(acts[ri], v.id) > 0)
             tr.hvars.push_back({v.id, pat_kind(v.node), v.occ});
+      } else {
+        for (auto& v : rowvars[ri])                // column-level or-bound vars
+          if (v.nalts > 1)
+            tr.chvars.push_back({v.id, pat_kind(v.node), v.occ,
+                                 count_var(acts[ri], v.id) > 0});
+      }
       for (size_t ai = 0; ai < srcs[ri].alts.size(); ++ai) {
         OcRow row;
         for (size_t c = 0; c < k; ++c) row.push_back(mk_pat(tags[ri][ai][c]));
