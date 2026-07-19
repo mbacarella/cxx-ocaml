@@ -8001,6 +8001,20 @@ struct Translator {
       return is_alias_dup(v->args[0]);
     return false;
   }
+  // A module/coercion field projection: FieldMut of a duplicable base.  ocamlc
+  // binds these with the Alias let-kind (translmod's get_field reads with
+  // `Pfield(_, Mutable)` but the enclosing Llet is Alias), which licenses
+  // substituting the SINGLE use even though the read is nominally Mutable -- a
+  // module field is immutable once the module is built.  Unlike is_alias_dup
+  // (free DUPLICATION of a pure term), this only sanctions the count<=1 case, so
+  // a multi-use module field stays bound once (matching ocamlc's Simplif).
+  static bool is_incl_field_alias(const LamPtr& v) {
+    if (!v) return false;
+    if (v->k == Lam::K::Prim && v->prim == Prim::FieldMut && v->args.size() == 1)
+      return v->args[0] &&
+             (v->args[0]->k == Lam::K::Var || is_alias_dup(v->args[0]));
+    return false;
+  }
   // Simplif drops `let v = (Lvar w)` for ANY let-kind, substituting v by w, and
   // (for an Alias binding = a pure duplicable term) substitutes v into its one use
   // or drops it when dead -- Simplif.simplify_lets's Alias case (simplif.ml:569).
@@ -8029,7 +8043,7 @@ struct Translator {
       if (b.val && !b.mut) {
         if (b.val->k == Lam::K::Var) {
           subst = true;                 // a Var alias is substituted regardless of count
-        } else if (b.alias && is_alias_dup(b.val)) {
+        } else if (b.alias && (is_alias_dup(b.val) || is_incl_field_alias(b.val))) {
           // count_var weights a use under a lambda as 2 (ocamlc never substitutes
           // into a closure), so <=1 means "used at most once, not captured".
           int n = count_var(l->body, b.id);
