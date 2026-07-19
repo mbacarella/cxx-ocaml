@@ -2049,23 +2049,42 @@ struct Translator {
                 // ever used bare, which doesn't consult rlabels).
                 bool inline_over = r && ctor_info_.count(c.name.txt) &&
                                    ctor_info_[c.name.txt].rlabels.empty();
-                if (!ctor_info_.count(c.name.txt) || inline_over) {
-                  builtin_ctors_.erase(c.name.txt);
-                  CtorInfo ci{tkey, block ? nb : nc, block, arity};
-                  if (r) {  // inline-record labels, so `Node {h}` binds h to its field
-                    int ridx = 0;
-                    for (auto& f : r->fields) {
-                      ValueKind fk = coretype_kind(*f.type);
-                      bool fm = f.mut == MutableFlag::Mutable;
-                      ci.rlabels.push_back(f.name.txt);
-                      ci.rshape.push_back(fk);
-                      ci.rfmut.push_back(fm);
-                      ci.rftypes.push_back(coretype_record_path(*f.type));
-                      if (!field_info_.count(f.name.txt))
-                        field_info_[f.name.txt] = {d.name.txt, ridx, fm, fk};
-                      ++ridx;
-                    }
+                bool do_ctor = !ctor_info_.count(c.name.txt) || inline_over;
+                CtorInfo ci{tkey, block ? nb : nc, block, arity};
+                if (r) {  // inline-record labels, so `Node {h}` binds h to its field
+                  int ridx = 0;
+                  for (auto& f : r->fields) {
+                    ValueKind fk = coretype_kind(*f.type);
+                    bool fm = f.mut == MutableFlag::Mutable;
+                    ci.rlabels.push_back(f.name.txt);
+                    ci.rshape.push_back(fk);
+                    ci.rfmut.push_back(fm);
+                    ci.rftypes.push_back(coretype_record_path(*f.type));
+                    if (do_ctor && !field_info_.count(f.name.txt))
+                      field_info_[f.name.txt] = {d.name.txt, ridx, fm, fk};
+                    ++ridx;
                   }
+                }
+                // A functor-body/submodule-local CONSTANT ctor whose bare name is
+                // already owned in the flat ctor_info_ by a same-named predef/stdlib
+                // BLOCK ctor (`type r = Ok | ..` vs result's arity-1 `Ok`): the flat
+                // ctor_info_ keeps result's arity-1 block Ok, so BOTH the construct
+                // site (emitted an empty [0] atom instead of the immediate 0) and a
+                // match on Ok (read a field off the immediate -> segfault) were wrong.
+                // Record the per-type entry AND mark the name ambiguous: build_module
+                // re-registers ambiguous ctors from type_ctor_info_ into ctor_info_ when
+                // it reaches this `type` decl (scoped to the body, restored on exit), so
+                // producer and consumer BOTH see the local constant.  Gated on !do_ctor:
+                // when the ctor DID land in ctor_info_ it already resolves directly, and
+                // a per-type entry there instead feeds the FIRST inferred-type override
+                // (a same-named constant across two local types) a candidate it lacked
+                // before -- which diverged format_doc.
+                if (!do_ctor && !block) {
+                  type_ctor_info_[tkey][c.name.txt] = ci;
+                  ambiguous_ctors_.insert(c.name.txt);
+                }
+                if (do_ctor) {
+                  builtin_ctors_.erase(c.name.txt);
                   ctor_info_[c.name.txt] = std::move(ci);
                 }
                 if (block) ++nb; else ++nc;
