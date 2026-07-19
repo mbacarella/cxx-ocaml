@@ -22678,6 +22678,29 @@ struct Translator {
           if (!inc_ns_ok && msig_check_enabled())
             msig_report("include-splice", mod_path_, incsig->runtime_names(), rl);
         }
+        // Register an include-exposed SUBMODULE (bound to alias `id`, a
+        // projection off the included block) as its own ident + layout + menv
+        // binding, so an INTERNAL reference (`Set.empty` later in the same
+        // structure) resolves through the alias with a single projection --
+        // the way ocamlc binds `Set =a field_mut i` once and routes internal
+        // uses AND the re-export through it, rather than re-projecting
+        // `field_imm k (field_imm i Base)` at each use via `open`.  The
+        // enclosing structure's close drops the name (incl_reg_submods_).
+        auto register_incl_submod = [&](const std::string& nm, const Ident& id,
+                                        const modsig::SigPtr& sub) {
+          if (!incl_reg_submods_.count(nm)) {
+            auto lit = module_layout_.find(nm);
+            incl_layout_prev_[nm] = lit != module_layout_.end()
+                ? std::optional(lit->second) : std::nullopt;
+          }
+          module_ident_[nm] = id;
+          module_alias_.erase(nm);
+          auto& lay = module_layout_[nm]; lay.clear();
+          auto rn = sub->runtime_names();
+          for (int k = 0; k < (int)rn.size(); ++k) lay[rn[k]] = k;
+          menv_.bind_module(nm, sub);
+          incl_reg_submods_.insert(nm);
+        };
         auto emit_field = [&](int i, const std::string& nm, modsig::NS ns,
                               const modsig::SigPtr& sub) {
           if (bound) {
@@ -22698,20 +22721,7 @@ struct Translator {
             // functor body's own `Set`), which is a dangling variable here and
             // segfaults at run time.  A constrained include's tsig block below
             // overrides this with the ascribed ModuleType layout.
-            if (ns == modsig::NS::Module && sub) {
-              if (!incl_reg_submods_.count(nm)) {
-                auto lit = module_layout_.find(nm);
-                incl_layout_prev_[nm] = lit != module_layout_.end()
-                    ? std::optional(lit->second) : std::nullopt;
-              }
-              module_ident_[nm] = id;
-              module_alias_.erase(nm);
-              auto& lay = module_layout_[nm]; lay.clear();
-              auto rn = sub->runtime_names();
-              for (int k = 0; k < (int)rn.size(); ++k) lay[rn[k]] = k;
-              menv_.bind_module(nm, sub);
-              incl_reg_submods_.insert(nm);
-            }
+            if (ns == modsig::NS::Module && sub) register_incl_submod(nm, id, sub);
             // an included EXCEPTION / extension ctor resolves by IDENTITY in
             // expressions and patterns (`include T ... raise Error`): register
             // the rebound field so a bare use doesn't fall back to a same-name
@@ -22736,12 +22746,20 @@ struct Translator {
             // semantics (translmod's get_field: `Pfield(pos, Pointer, Mutable)`)
             auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldMut;
             fi->prim_arg = i; fi->args = {base};
-            if (local_include && lookup(nm)) {  // shadow an enclosing binding only
+            // A submodule of a locally-included module path is aliased and
+            // registered too (not just brought into bare scope by the `open`
+            // below): an internal multi-use reference then reads `field_imm k
+            // Set` through the alias like ocamlc, and Simplif inlines the alias
+            // when the submodule is only re-exported.  (Distinct from the
+            // shadow case: no enclosing same-name binding is required.)
+            bool incl_submod = local_include && ns == modsig::NS::Module && sub;
+            if ((local_include && lookup(nm)) || incl_submod) {
               Ident id = fresh(nm);
               cur.push_back({id, ValueKind::Gen, fi, true});  // =a alias
               scope.back()[nm] = id;
               add_export(nm, id, ns, sub);
               if (ns == modsig::NS::Typext) exn_ident_[nm] = id;
+              if (incl_submod) register_incl_submod(nm, id, sub);
             } else {
               add_export_val(nm, fi, ns, sub);
               // an included exception off a module VAR (a functor parameter:
