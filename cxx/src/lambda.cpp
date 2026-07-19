@@ -17755,9 +17755,28 @@ struct Translator {
           }
           const Expression* rhs = le->bindings[0].expr.get();
           while (auto* ct = std::get_if<Pexp_constraint>(&rhs->desc)) rhs = ct->e.get();
-          if (allvars && (std::get_if<Pexp_match>(&rhs->desc) ||
-                          std::get_if<Pexp_try>(&rhs->desc) ||
-                          std::get_if<Pexp_ifthenelse>(&rhs->desc))) {
+          // ocamlc decides this form on the LAMBDA, where a plain-path local
+          // open has already vanished (scoping only) -- peel `let open M in`
+          // for the shape test but translate the full rhs so the open's
+          // scoping still applies (shape.ml's mk: `let comp_unit, from =
+          // let open Unit_info in match ..`).
+          const Expression* shp = rhs;
+          for (;;) {
+            if (auto* c2 = std::get_if<Pexp_constraint>(&shp->desc)) {
+              shp = c2->e.get();
+              continue;
+            }
+            if (auto* s2 = std::get_if<Pexp_struct_item>(&shp->desc))
+              if (auto* op = std::get_if<Pstr_open>(&s2->item->desc))
+                if (std::get_if<Pmod_ident>(&op->expr.desc)) {
+                  shp = s2->body.get();
+                  continue;
+                }
+            break;
+          }
+          if (allvars && (std::get_if<Pexp_match>(&shp->desc) ||
+                          std::get_if<Pexp_try>(&shp->desc) ||
+                          std::get_if<Pexp_ifthenelse>(&shp->desc))) {
             LamPtr mm = expr(*rhs);
             int n = ++next_exit_;
             // ocamlc's map_return/assign_pat binds non-var tuple columns in
