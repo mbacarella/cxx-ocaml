@@ -10544,6 +10544,187 @@ struct Translator {
     for (auto* c : r.cols) if (!pat_omega_like(c)) return false;
     return true;
   }
+  // Upstream Matching's Default_environment: the stack of pending half-match
+  // chunks (split_no_or splits a column's rows into maximal groupable runs;
+  // each later run is entered through a static exit).  An entry is (exit id,
+  // pattern matrix over the CURRENT column vector); a nullptr cell is omega.
+  // Entries are specialized at every column consumption: an entry whose matrix
+  // empties is dropped, and an entry left with a zero-column row matches
+  // everything, truncating the stack below it.  A miss exits to the top entry
+  // (mk_failaction_neg's pop); a gap tag's sub-compile receives the
+  // tag-specialized stack, so its empty-matrix exit lands on the first entry
+  // compatible with that tag (mk_failaction_pos's partition).  Only the
+  // chunked string-column driver pushes entries; `deid` stays the final exit.
+  struct GmDef { int eid; std::vector<std::vector<const Pattern*>> mat; };
+  const Pattern* gmdef_peel(const Pattern* p) {
+    if (!p) return nullptr;
+    for (;;) {
+      if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { p = pa->p.get(); continue; }
+      const Pattern* e = effective_pat(p);
+      if (e != p) { p = e; continue; }
+      return p;
+    }
+  }
+  bool gmdef_omega(const Pattern* p) {
+    if (!p) return true;
+    return std::holds_alternative<Ppat_any>(p->desc) ||
+           std::get_if<Ppat_var>(&p->desc) != nullptr;
+  }
+  // Per-entry row transform frame (specialize_matrix): peels aliases, expands
+  // an or-pattern in column 0 into one row per alternative, applies `spec`
+  // (return -1 unsupported / 0 row dropped / 1 row(s) appended), then the
+  // drop-empty-entry and truncate-below-full-match rules.
+  template <class F>
+  bool denv_map(std::vector<GmDef>& env, F spec) {
+    std::vector<GmDef> out;
+    for (auto& en : env) {
+      if (!en.mat.empty() && en.mat[0].empty()) {   // already fully matched
+        out.push_back({en.eid, {{}}});
+        env = std::move(out);
+        return true;
+      }
+      GmDef ne{en.eid, {}};
+      std::vector<std::vector<const Pattern*>> work(en.mat.rbegin(), en.mat.rend());
+      while (!work.empty()) {
+        std::vector<const Pattern*> row = std::move(work.back()); work.pop_back();
+        const Pattern* p0 = gmdef_peel(row[0]);
+        if (p0 && std::get_if<Ppat_or>(&p0->desc)) {
+          std::vector<const Pattern*> alts; flatten_or(p0, alts);
+          for (auto it = alts.rbegin(); it != alts.rend(); ++it) {
+            auto r2 = row; r2[0] = *it; work.push_back(std::move(r2));
+          }
+          continue;
+        }
+        if (spec(p0, row, ne.mat) < 0) return false;
+      }
+      if (ne.mat.empty()) continue;                 // entry unreachable: drop
+      if (ne.mat[0].empty()) {                      // fully matched: truncate
+        out.push_back({ne.eid, {{}}});
+        env = std::move(out);
+        return true;
+      }
+      out.push_back(std::move(ne));
+    }
+    env = std::move(out);
+    return true;
+  }
+  bool denv_pop_col(std::vector<GmDef>& env) {
+    return denv_map(env, [](const Pattern*, std::vector<const Pattern*>& row,
+                            std::vector<std::vector<const Pattern*>>& out) {
+      out.emplace_back(row.begin() + 1, row.end());
+      return 1;
+    });
+  }
+  bool denv_spec_string(std::vector<GmDef>& env, const std::string& s) {
+    return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
+                             std::vector<std::vector<const Pattern*>>& out) -> int {
+      if (!gmdef_omega(p0)) {
+        auto* pc = std::get_if<Ppat_constant>(&p0->desc);
+        auto* ps = pc ? std::get_if<Pconst_string>(&pc->c.desc) : nullptr;
+        if (!ps) return -1;
+        if (ps->s != s) return 0;
+      }
+      out.emplace_back(row.begin() + 1, row.end());
+      return 1;
+    });
+  }
+  bool denv_spec_ctor(std::vector<GmDef>& env, const std::string& type,
+                      bool is_block, int tag, int a,
+                      const std::vector<std::string>* rlab) {
+    return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
+                             std::vector<std::vector<const Pattern*>>& out) -> int {
+      std::vector<const Pattern*> fps(a, nullptr);
+      if (!gmdef_omega(p0)) {
+        auto* k = std::get_if<Ppat_construct>(&p0->desc);
+        if (!k) return -1;
+        const CtorInfo* ci = pat_ctor_resolve(p0, ctor_of(*p0), type);
+        if (!ci) return -1;
+        if (ci->is_block != is_block || ci->tag != tag) return 0;
+        if (rlab && !rlab->empty()) {
+          const Pattern* ap = k->arg ? effective_pat(k->arg->get()) : nullptr;
+          auto* pr = ap ? std::get_if<Ppat_record>(&ap->desc) : nullptr;
+          if (pr) {
+            fps.clear();
+            for (auto& lbl : *rlab) {
+              const Pattern* fp = nullptr;
+              for (auto& [l, s2] : pr->fields)
+                if (lid_last(l.txt) == lbl) { fp = effective_pat(s2.get()); break; }
+              fps.push_back(fp);
+            }
+          } else if (ap && !std::holds_alternative<Ppat_any>(ap->desc)) return -1;
+        } else if (a > 0) {
+          fps = ctor_field_pats(k, a);
+          if ((int)fps.size() != a) return -1;
+        }
+      }
+      fps.insert(fps.end(), row.begin() + 1, row.end());
+      out.push_back(std::move(fps));
+      return 1;
+    });
+  }
+  bool denv_spec_tuple(std::vector<GmDef>& env, size_t tk) {
+    return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
+                             std::vector<std::vector<const Pattern*>>& out) -> int {
+      std::vector<const Pattern*> nr;
+      if (gmdef_omega(p0)) nr.assign(tk, nullptr);
+      else if (auto* tp = std::get_if<Ppat_tuple>(&p0->desc)) {
+        if (tp->elems.size() != tk || tp->closed != ClosedFlag::Closed) return -1;
+        for (auto& lbl : tp->labels) if (lbl) return -1;
+        for (auto& el : tp->elems) nr.push_back(effective_pat(el.get()));
+      } else return -1;
+      nr.insert(nr.end(), row.begin() + 1, row.end());
+      out.push_back(std::move(nr));
+      return 1;
+    });
+  }
+  // Chunk driver for a string-constant column with interspersed var rows:
+  // split at the can_group boundaries (maximal const runs / var runs), compile
+  // the first run with the later runs consed onto the default environment,
+  // then attach each later run's handler in order -- inlined when its entry
+  // exit is used once, a catch otherwise (comp_match_handlers followed by
+  // Simplif's single-use exit inlining).
+  LamPtr gmatch_str_chunks(const std::vector<LamPtr>& comps, const std::vector<MRow>& rows,
+                           const Location& mloc, int deid, const std::vector<GmDef>& denv) {
+    std::vector<std::pair<size_t, size_t>> runs;     // [begin, end) maximal runs
+    for (size_t i = 0; i < rows.size(); ) {
+      bool c = std::get_if<Ppat_constant>(&rows[i].cols[0]->desc) != nullptr;
+      size_t j = i + 1;
+      while (j < rows.size() &&
+             (std::get_if<Ppat_constant>(&rows[j].cols[0]->desc) != nullptr) == c) ++j;
+      runs.push_back({i, j});
+      i = j;
+    }
+    if (runs.size() < 2) return nullptr;
+    std::vector<int> eids(runs.size(), -1);          // entry exits for runs 1..n-1
+    for (size_t k = 1; k < runs.size(); ++k) eids[k] = ++next_exit_;
+    auto env_from = [&](size_t k) {
+      std::vector<GmDef> env;
+      for (size_t m = k; m < runs.size(); ++m) {
+        GmDef e{eids[m], {}};
+        for (size_t r = runs[m].first; r < runs[m].second; ++r) e.mat.push_back(rows[r].cols);
+        env.push_back(std::move(e));
+      }
+      env.insert(env.end(), denv.begin(), denv.end());
+      return env;
+    };
+    auto chunk_rows = [&](size_t k) {
+      return std::vector<MRow>(rows.begin() + runs[k].first, rows.begin() + runs[k].second);
+    };
+    std::vector<LamPtr> cc = comps;
+    LamPtr res = gmatch(std::move(cc), chunk_rows(0), mloc, deid, env_from(1));
+    if (!res) return nullptr;
+    for (size_t k = 1; k < runs.size(); ++k) {
+      std::vector<LamPtr> ck = comps;
+      LamPtr hb = gmatch(std::move(ck), chunk_rows(k), mloc, deid, env_from(k + 1));
+      if (!hb) return nullptr;
+      // Single-use inlining deferred to inline_chunk_catches (see the
+      // trailing-row split above).
+      auto c = mk(Lam::K::Catch);
+      c->cond = res; c->prim_arg = eids[k]; c->then_ = hb; c->gm_chunk = true;
+      res = c;
+    }
+    return res;
+  }
   // Per-level wrapper replicating matching.ml's compile-entry plumbing:
   //  - Materialize a deferred field-access column when it reaches head position
   //    (upstream binds each compile entry's first arg via arg_to_var +
@@ -10557,7 +10738,7 @@ struct Translator {
   //    reusing vars this level already materialized, exactly upstream's
   //    default-matrix argument capture.
   LamPtr gmatch(std::vector<LamPtr> comps, std::vector<MRow> rows,
-                const Location& mloc, int deid) {
+                const Location& mloc, int deid, std::vector<GmDef> denv = {}) {
     if (!comps.empty() && comps[0] && comps[0]->gm_facc) {
       LamPtr proto = comps[0];
       // Upstream's name_pattern: the binding takes the first var/alias row's
@@ -10581,7 +10762,7 @@ struct Translator {
                 rows.empty() || rows[0].cols.empty() ? -1 : (int)rows[0].cols[0]->desc.index());
       gm_facc_proto_[v.stamp] = proto;   // for wire_garms' exit-arg minimization
       comps[0] = varof(v);
-      LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid);
+      LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(denv));
       if (!r) return nullptr;
       int n = count_var(r, v);
       if (n == 0) return r;
@@ -10590,27 +10771,51 @@ struct Translator {
     }
     if (rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
       int e = ++next_exit_;
+      size_t W = comps.size();
       MRow last = std::move(rows.back());
       rows.pop_back();
       std::vector<LamPtr> hcomps = comps;
-      LamPtr main = gmatch(std::move(comps), std::move(rows), mloc, e);
+      LamPtr main;
+      if (denv.empty()) {
+        main = gmatch(std::move(comps), std::move(rows), mloc, e);
+      } else {
+        // The popped row is a pending chunk NEARER than the existing entries:
+        // cons its (all-omega) matrix on top so misses in `main` still reach
+        // it first; `deid` stays the final exit underneath.
+        std::vector<GmDef> me = denv;
+        me.insert(me.begin(), {e, {std::vector<const Pattern*>(W, nullptr)}});
+        main = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(me));
+      }
       if (!main) return nullptr;
-      LamPtr hb = gmatch(std::move(hcomps), {std::move(last)}, mloc, deid);
+      LamPtr hb = gmatch(std::move(hcomps), {std::move(last)}, mloc, deid, std::move(denv));
       if (!hb) return nullptr;
-      int bad = 0; int uses = count_exit(main, e, false, bad);
-      if (uses == 0) return main;                    // popped row unreachable
-      if (uses == 1 && bad == 0) { inline_exit(main, e, {}, {}, hb); return main; }
+      if (cppcaml::dbg_env("EAGERCHUNK")) {
+        int bad = 0; int uses = count_exit(main, e, false, bad);
+        if (uses == 0) return main;
+        if (uses == 1 && bad == 0) { inline_exit(main, e, {}, {}, hb); return main; }
+        auto c0 = mk(Lam::K::Catch);
+        c0->cond = main; c0->prim_arg = e; c0->then_ = hb;
+        return c0;
+      }
+      // Keep the chunk catch through construction (single-use inlining is
+      // deferred to inline_chunk_catches): upstream's lower_bind runs against
+      // the Lstaticcatch, so enclosing column binds must not sink past it.
       auto c = mk(Lam::K::Catch);
-      c->cond = main; c->prim_arg = e; c->then_ = hb;
+      c->cond = main; c->prim_arg = e; c->then_ = hb; c->gm_chunk = true;
       return c;
     }
-    return gmatch_inner(std::move(comps), std::move(rows), mloc, deid);
+    return gmatch_inner(std::move(comps), std::move(rows), mloc, deid, std::move(denv));
   }
   LamPtr gmatch_inner(std::vector<LamPtr> comps, std::vector<MRow> rows,
-                      const Location& mloc, int deid) {
+                      const Location& mloc, int deid, std::vector<GmDef> denv = {}) {
     if (g_gm_budget_ == 0) return nullptr;         // decision-tree too large: bail
     if (g_gm_budget_ > 0) --g_gm_budget_;
-    auto mkexit = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = deid; return e; };
+    // A miss exits to the nearest pending chunk (default-env pop), else `deid`.
+    auto mkexit = [&] {
+      auto e = mk(Lam::K::Staticraise);
+      e->prim_arg = denv.empty() ? deid : denv.front().eid;
+      return e;
+    };
     if (rows.empty()) return mkexit();
     if (comps.empty()) {                 // all columns consumed: rows fully matched
       // The first UNGUARDED row always fires (its pattern matched, no `when`).
@@ -10672,7 +10877,7 @@ struct Translator {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
           for (auto* a : alts) { MRow nr = rr; nr.cols[0] = effective_pat(a); ex.push_back(std::move(nr)); }
         }
-        return gmatch(std::move(comps), std::move(ex), mloc, deid);
+        return gmatch(std::move(comps), std::move(ex), mloc, deid, std::move(denv));
       }
     // Nested tuple column: a tuple type is monomorphic, so every value is a k-block
     // and we destructure unconditionally (no tag test) into k leading columns.  Only
@@ -10719,7 +10924,8 @@ struct Translator {
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
         }
-        return gmatch(std::move(ncomps), std::move(sub), mloc, deid);
+        if (!denv_spec_tuple(denv, tk)) return nullptr;
+        return gmatch(std::move(ncomps), std::move(sub), mloc, deid, std::move(denv));
       }
     }
     // Nested record column: also monomorphic -> one column per mentioned field
@@ -10730,6 +10936,7 @@ struct Translator {
       for (auto& r : rows)
         if (std::get_if<Ppat_record>(&r.cols[0]->desc)) { anyrec = true; break; }
       if (anyrec) {
+        if (!denv.empty()) return nullptr;   // record specialization of the def env: TODO
         if (comps[0]->k != Lam::K::Var) return nullptr;
         std::map<int, FieldInfo> cols_fi;                     // block index -> field
         std::vector<std::map<int, const Pattern*>> rowmap(rows.size());  // row -> idx -> subpat
@@ -10866,7 +11073,11 @@ struct Translator {
           nr.cols.erase(nr.cols.begin()); dsub.push_back(std::move(nr));
         }
         std::vector<LamPtr> cc = rest;
-        LamPtr dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid);
+        // Const sub-matrices funnel their misses through cdflt into this var
+        // default, so only the default's own failure continues to the env.
+        std::vector<GmDef> de = denv;
+        if (!denv_pop_col(de)) return nullptr;
+        LamPtr dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid, std::move(de));
         if (!dbody) return nullptr;
         int bad = 0; int uses = count_exit(chain, cdflt, false, bad);
         if (uses == 1 && bad == 0) inline_exit(chain, cdflt, {}, {}, dbody);
@@ -10901,6 +11112,22 @@ struct Translator {
       }
       if (anystr && strcol) {
         if (comps[0]->k != Lam::K::Var) return nullptr;
+        // Const rows interspersed with var rows: upstream's split_no_or groups
+        // only maximal runs (can_group stops the group at a var row, and
+        // safe_before keeps any later const row out of it), so each run is its
+        // own half-match chained through the default environment.  Try that
+        // chunked compile; unsupported material bails back to the single-group
+        // shape below (correct, but grouped across the var rows).
+        {
+          bool seen_var = false, inter = false;
+          for (auto& r : rows) {
+            if (std::get_if<Ppat_constant>(&r.cols[0]->desc)) {
+              if (seen_var) { inter = true; break; }
+            } else seen_var = true;
+          }
+          if (inter && !cppcaml::dbg_env("NOCHUNK"))
+            if (LamPtr r = gmatch_str_chunks(comps, rows, mloc, deid, denv)) return r;
+        }
         if (g_gm_budget_ == 0) return nullptr;
         if (g_gm_budget_ > 0) --g_gm_budget_;
         auto colstr = [&](const Pattern* p) -> const std::string& {
@@ -10917,8 +11144,15 @@ struct Translator {
         bool havedflt = false;
         for (auto& r : rows)
           if (!std::get_if<Ppat_constant>(&r.cols[0]->desc)) { havedflt = true; break; }
-        // One fresh exit serves both the tree's default AND the per-string
-        // sub-matrix misses (upstream: both land in the string split's fail).
+        // With no var rows under a pending default env (a pure-const chunk),
+        // the per-string sub-matrices carry the string-specialized env so
+        // their misses land on the right chunk directly; the tree's fail
+        // keeps the fresh fid catch below (upstream's bytegen make_catch
+        // re-wraps ANY non-bare stringswitch default, so the branchif-to-back
+        // layout survives even a single-use default).  Otherwise one fresh
+        // exit serves both the tree's default AND the per-string sub-matrix
+        // misses (upstream: both land in the string split's fail).
+        bool envmode = !denv.empty() && !havedflt;
         int fid = ++next_exit_;
         // Per-string sub-matrices, compiled in first-occurrence row order
         // (stamp-stable), THEN sorted by the string; vals are distinct so
@@ -10931,7 +11165,13 @@ struct Translator {
               MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
             }
           std::vector<LamPtr> cc = rest;
-          LamPtr sb = gmatch(std::move(cc), std::move(sub), mloc, fid);
+          LamPtr sb;
+          if (envmode) {
+            std::vector<GmDef> de = denv;
+            if (!denv_spec_string(de, s)) return nullptr;
+            sb = gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(de));
+          } else
+            sb = gmatch(std::move(cc), std::move(sub), mloc, fid);
           if (!sb) return nullptr;
           sw.push_back({s, std::move(sb)});
         }
@@ -10955,7 +11195,9 @@ struct Translator {
             nr.cols.erase(nr.cols.begin()); dsub.push_back(std::move(nr));
           }
           std::vector<LamPtr> cc = rest;
-          dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid);
+          std::vector<GmDef> de = denv;
+          if (!denv_pop_col(de)) return nullptr;
+          dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid, std::move(de));
           if (!dbody) return nullptr;
         } else {
           dbody = mkexit();  // no var/any rows: fail to the enclosing default
@@ -10987,7 +11229,8 @@ struct Translator {
     if (!anyctor) {                       // whole column is var/any: bind and drop it
       std::vector<MRow> sub;
       for (auto& r : rows) { bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr)); }
-      return gmatch(std::move(rest), std::move(sub), mloc, deid);
+      if (!denv_pop_col(denv)) return nullptr;
+      return gmatch(std::move(rest), std::move(sub), mloc, deid, std::move(denv));
     }
     if (comps[0]->k != Lam::K::Var) return nullptr;   // need a Var for field reads
     // Resolve the column's variant type (all ctor rows must share it).
@@ -11119,7 +11362,9 @@ struct Translator {
         } else { bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr)); }
       }
       std::vector<LamPtr> cc = rest;
-      return gmatch(std::move(cc), std::move(sub), mloc, deid);
+      std::vector<GmDef> de = denv;
+      if (!denv_spec_ctor(de, type, /*is_block=*/false, t, 0, nullptr)) return nullptr;
+      return gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(de));
     };
     // Build the body for one block tag t, expanding its `arity` fields as columns.
     auto block_body = [&](int t) -> LamPtr {
@@ -11132,7 +11377,12 @@ struct Translator {
             bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
           }
         std::vector<LamPtr> cc = rest;
-        return gmatch(std::move(cc), std::move(sub), mloc, deid);
+        // Gap tag reached by var rows only (column dropped, not expanded):
+        // pop keeps every env row -- an over-approximation of the tag
+        // specialization, routing misses at worst one chunk early.
+        std::vector<GmDef> de = denv;
+        if (!denv_pop_col(de)) return nullptr;
+        return gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(de));
       }
       // Inline-record ctor (`K of { l1; l2 }`): the labels are the block's FLAT
       // fields at label (rlabels) order, so a `K { l1 = p1; .. }` pattern splits
@@ -11191,7 +11441,10 @@ struct Translator {
           sub.push_back(std::move(nr));
         }
       }
-      return gmatch(std::move(ncomps), std::move(sub), mloc, deid);
+      std::vector<GmDef> de = denv;
+      if (!denv_spec_ctor(de, type, /*is_block=*/true, t, a, inl ? &rlab : nullptr))
+        return nullptr;
+      return gmatch(std::move(ncomps), std::move(sub), mloc, deid, std::move(de));
     };
     std::vector<Lam::SwitchCase> consts, blocks;
     for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b}); }
@@ -11475,6 +11728,30 @@ struct Translator {
       } else l->gm_str_bind = false;              // real Strict `switch` bind
     }
   }
+  // Simplif's single-use static-exit inlining, restricted to the half-match
+  // chunk catches (gm_chunk) that construction deliberately left in place so
+  // lower_bind saw the Lstaticcatch (see the flag's comment).  Post-order:
+  // each chunk exit occurs only within its own catch's scrutinee.
+  void inline_chunk_catches(LamPtr& l) {
+    if (!l) return;
+    inline_chunk_catches(l->fn); inline_chunk_catches(l->cond);
+    inline_chunk_catches(l->then_); inline_chunk_catches(l->else_);
+    inline_chunk_catches(l->body); inline_chunk_catches(l->sw_default);
+    for (auto& a : l->args) inline_chunk_catches(a);
+    for (auto& b : l->bindings) inline_chunk_catches(b.val);
+    for (auto& sc : l->sw_consts) inline_chunk_catches(sc.body);
+    for (auto& sc : l->sw_blocks) inline_chunk_catches(sc.body);
+    if (l->k == Lam::K::Catch && l->gm_chunk) {
+      int bad = 0; int uses = count_exit(l->cond, l->prim_arg, false, bad);
+      if (uses == 0) { l = l->cond; return; }        // unreachable chunk
+      if (uses == 1 && bad == 0) {
+        inline_exit(l->cond, l->prim_arg, {}, {}, l->then_);
+        l = l->cond;
+        return;
+      }
+      l->gm_chunk = false;                           // multi-use: real catch
+    }
+  }
   // Entry for the general matrix matcher on a single scrutinee: peel a trailing
   // catch-all as the shared default (else Match_failure), run gmatch, and wrap the
   // fallback in a shared static-catch (inlined when used at most once).
@@ -11515,6 +11792,11 @@ struct Translator {
       g_gm_tuples_ = false; g_gm_budget_ = -1;
     }
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
+    // Resolve deferred chunk catches FIRST (Simplif's single-use exit inline):
+    // construction-time lower_bind has run, and everything downstream (the
+    // default-use count, arm wiring, switch sharing) must see the same tree an
+    // eager inline would have produced.
+    inline_chunk_catches(body);
     // A surviving (multi-use) default catch nests INSIDE the arm catches, like
     // upstream: the default matrix's catch is made by combine at the split,
     // while or-arm handlers wrap outside it -- and the default handler may
@@ -13349,6 +13631,8 @@ struct Translator {
     LamPtr body = gmatch(comps, mrows, mloc, deid);
     g_gm_tuples_ = false; g_gm_budget_ = -1;
     if (!body) return nullptr;
+    // Resolve deferred chunk catches first (see gmatch_top).
+    inline_chunk_catches(body);
     // Multi-use default catch nests INSIDE the arm catches (see gmatch_top).
     int bad = 0; int uses = count_exit(body, deid, false, bad);
     LamPtr dcatch;

@@ -187,6 +187,12 @@ struct Lam {
   // resolves it after all substitutions: value still a Var -> strip the let
   // (bind_sw's Lvar no-op); value a field read -> a real Strict `switch` let.
   bool gm_str_bind = false;
+  // gm_chunk: a half-match chunk catch (comp_match_handlers).  Upstream inlines
+  // a single-use chunk exit only in Simplif -- AFTER Matching's bind_check/
+  // lower_bind ran against the catch node (so column binds do NOT sink past the
+  // chunk boundary).  We keep the catch through construction for the same
+  // reason and inline single-use handlers in a late pass (inline_chunk_catches).
+  bool gm_chunk = false;
   // from_alias: this node was substituted in place of a single-use pattern
   // binder (wrap_binders' inline of an alias let).  At the corresponding point
   // in ocamlc's pipeline (Matching/for_let, BEFORE Simplif) this position held
