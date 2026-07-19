@@ -78,6 +78,12 @@ struct Ident {
   // vars) -- Ident.compare sorts Scoped BEFORE Local regardless of stamp, so
   // a closure's free-var layout puts these first (bytegen Ident.Set.elements).
   bool scoped = false;
+  // A Translcore-phase temp whose stamp ocamlc allocates only AFTER every source
+  // ident of the unit (typing stamps all source idents first).  Our single fresh()
+  // counter interleaves the two, so such a temp gets an early stamp; flag it so a
+  // captured one sorts after the source locals in a closure's free-var layout,
+  // matching ocamlc's source-before-translation-temp stamp order.
+  bool late = false;
 };
 
 // Lambda primitives we emit so far (printlambda spelling in the comment).

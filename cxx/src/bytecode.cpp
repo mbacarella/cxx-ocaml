@@ -209,9 +209,19 @@ struct Bytegen {
   // ocamlc's Ident.compare sorts Scoped idents (module/class binders, unpack
   // pattern vars) BEFORE Local ones regardless of stamp, then by stamp; the
   // closure env layout comes from Ident.Set.elements in that order.
+  //
+  // ocamlc runs typing (which stamps every SOURCE ident of the compilation unit)
+  // fully before Translcore (which stamps the temps it introduces), so a purely
+  // Translcore-introduced binder has a larger stamp than every source ident and
+  // sorts AFTER all source locals.  Our single fresh() counter interleaves the
+  // two, so such a temp (e.g. the scrutinee of `let E prev = !hierarchy`, flagged
+  // `late`) gets an early stamp; sort it after the source locals to match.  Only
+  // temps with NO source-ident counterpart carry `late` -- a match scrutinee
+  // captured through an `as` alias reuses that source ident's (early) position.
   static void sort_fv_ocamlc(std::vector<Ident>& r) {
     std::stable_sort(r.begin(), r.end(), [](const Ident& a, const Ident& b) {
       if (a.scoped != b.scoped) return a.scoped;  // Scoped first
+      if (a.late != b.late) return !a.late;       // source locals before late temps
       return a.stamp < b.stamp;
     });
   }

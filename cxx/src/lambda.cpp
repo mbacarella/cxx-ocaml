@@ -18290,7 +18290,10 @@ struct Translator {
           if (val->k == Lam::K::Var) {  // via a *match* temp bound to e
             collect_binders(b.pat, val, binders);
           } else {
-            Ident tmp = fresh("", true);
+            // The scrutinee temp is purely Translcore-introduced (no source ident):
+            // ocamlc stamps it after all source idents, so mark it `late` for the
+            // closure free-var sort (a captured `let E prev = e` value, e.g.).
+            Ident tmp = fresh("", true); tmp.late = true;
             l->bindings.push_back({tmp, ValueKind::Gen, val});
             auto tv = mk(Lam::K::Var); tv->var = tmp;
             collect_binders(b.pat, tv, binders);
