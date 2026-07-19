@@ -613,6 +613,21 @@ struct Translator {
   // Locally-defined submodules: name -> its binder, and name -> field layout
   // (export value/submodule name -> field index), for resolving `M.x`.
   std::unordered_map<std::string, Ident> module_ident_;
+  // Submodule names registered into module_ident_ by a COMPUTED include
+  // (`include F(X)`) so an INTERNAL reference resolves through the rebound
+  // field alias.  Tracked so the enclosing structure's restore does NOT promote
+  // them to a bare module_alias_ (a sibling module must still see the outer /
+  // stdlib same-named module, e.g. `module Map = Map.Make(T)` after an include
+  // that exposes a `Map`).
+  std::unordered_set<std::string> incl_reg_submods_;
+  // The module_layout_ each such name had BEFORE the include overwrote it, so
+  // the enclosing structure's restore puts it back (nullopt = was absent).
+  // Without this a leaked `module_layout_["Map"]` mis-resolves a SIBLING's
+  // `Map.Make(..)` result members.  (The menv_ binding needs no save: it lives
+  // in the per-structure frame popped when the include's structure closes.)
+  std::unordered_map<std::string,
+                     std::optional<std::unordered_map<std::string, int>>>
+      incl_layout_prev_;
   // A module alias `module F = M.Sub` resolves F to a pure path expression
   // (`(field_imm i M)`) inlined at use sites, instead of a fresh binding.
   std::unordered_map<std::string, LamPtr> module_alias_;
@@ -22133,6 +22148,20 @@ struct Translator {
             for (auto& [nm, iid] : module_ident_) {
               auto bi = mod_before.find(nm);
               if (bi != mod_before.end() && bi->second.stamp == iid.stamp) continue;
+              // A submodule exposed by a computed include inside THIS structure
+              // must not leak into the enclosing scope as a bare alias -- a
+              // sibling still sees the outer/stdlib same-named module.  (Its
+              // internal-reference role ended when the structure closed; the
+              // module_ident_ restore below drops it.)
+              if (incl_reg_submods_.count(nm)) {
+                incl_reg_submods_.erase(nm);
+                if (auto s = incl_layout_prev_.find(nm); s != incl_layout_prev_.end()) {
+                  if (s->second) module_layout_[nm] = *s->second;
+                  else module_layout_.erase(nm);
+                  incl_layout_prev_.erase(s);
+                }
+                continue;
+              }
               if (auto f = lay.find(nm); f != lay.end()) {
                 module_alias_[nm] = fieldimm(f->second, varof(mid));
                 inner_mods.push_back(nm);
@@ -22633,6 +22662,29 @@ struct Translator {
             cur.push_back({id, ValueKind::Gen, fr, true});
             scope.back()[nm] = id;
             add_export(nm, id, ns, sub);
+            // An unconstrained computed include (`include F(X)`) exposes
+            // SUBMODULE fields with no ascribed sig to drive the `tsig` block
+            // below.  Register the rebound field as the submodule's ident +
+            // layout so an INTERNAL reference (`Set.empty` later in the same
+            // structure) resolves through this alias.  Without it the bare
+            // `Set` falls back to a same-name binding from an OUTER scope (the
+            // functor body's own `Set`), which is a dangling variable here and
+            // segfaults at run time.  A constrained include's tsig block below
+            // overrides this with the ascribed ModuleType layout.
+            if (ns == modsig::NS::Module && sub) {
+              if (!incl_reg_submods_.count(nm)) {
+                auto lit = module_layout_.find(nm);
+                incl_layout_prev_[nm] = lit != module_layout_.end()
+                    ? std::optional(lit->second) : std::nullopt;
+              }
+              module_ident_[nm] = id;
+              module_alias_.erase(nm);
+              auto& lay = module_layout_[nm]; lay.clear();
+              auto rn = sub->runtime_names();
+              for (int k = 0; k < (int)rn.size(); ++k) lay[rn[k]] = k;
+              menv_.bind_module(nm, sub);
+              incl_reg_submods_.insert(nm);
+            }
             // an included EXCEPTION / extension ctor resolves by IDENTITY in
             // expressions and patterns (`include T ... raise Error`): register
             // the rebound field so a bare use doesn't fall back to a same-name
