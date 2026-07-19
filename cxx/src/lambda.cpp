@@ -8550,8 +8550,38 @@ struct Translator {
     }
     return body;
   }
+  // Per-level wrapper, mm_cols' analog of gmatch's: materialize a deferred
+  // field-access column (gm_facc) when the matcher reaches it.  Each per-case
+  // recursion at i+1 is upstream's specialized sub-pm, so a column consumed
+  // only inside the split's arms materializes PER ARM (its own read), while a
+  // tested column binds once around the whole level -- matching.ml's
+  // compile-entry arg binding + Simplif's Alias count rule (0 uses -> drop,
+  // 1 -> substitute a fresh read, >=2 -> keep the alias let).
   LamPtr mm_cols(const std::vector<LamPtr>& comps, std::vector<MRow> rows,
                  size_t i, const Location& mloc) {
+    if (i < comps.size() && comps[i] && comps[i]->gm_facc) {
+      LamPtr proto = comps[i];
+      std::string nm;  // name_pattern: first var/alias row's name
+      for (auto& r : rows) {
+        if (i >= r.cols.size()) break;
+        const Pattern* p = effective_pat(r.cols[i]);
+        if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { nm = pa->name.txt; break; }
+        if (auto* pv = std::get_if<Ppat_var>(&p->desc)) { nm = pv->name.txt; break; }
+      }
+      Ident v = fresh(nm, nm.empty());
+      std::vector<LamPtr> comps2 = comps;
+      comps2[i] = varof(v);
+      LamPtr r = mm_cols(comps2, std::move(rows), i, mloc);
+      if (!r) return nullptr;
+      int n = count_var(r, v);
+      if (n == 0) return r;
+      if (n == 1) { subst_alias(r, v, clone_facc(proto)); return r; }
+      return lower_bind(v, proto->gm_facc_kind, clone_facc(proto), r);
+    }
+    return mm_cols_inner(comps, std::move(rows), i, mloc);
+  }
+  LamPtr mm_cols_inner(const std::vector<LamPtr>& comps, std::vector<MRow> rows,
+                       size_t i, const Location& mloc) {
     if (rows.empty()) return raise_predef("Match_failure", mloc, "mm_empty");
     if (i == comps.size()) {
       auto& r = rows[0];
@@ -9811,10 +9841,15 @@ struct Translator {
     if (ci.arity != 1) {
       if (dflt) return nullptr;
       int ar = ci.arity;
+      // Fields defer their reads (gm_facc): mm_cols' wrapper binds each column
+      // where it is consumed -- a tested column once around its level, a column
+      // consumed only inside a split's arms per arm -- like upstream's
+      // get_expr_args passing the read exprs down unevaluated.
       std::vector<LamPtr> comps;
-      std::vector<Ident> fids;
       for (int j = 0; j < ar; ++j) {
-        Ident t = fresh("", true); fids.push_back(t); comps.push_back(varof(t));
+        LamPtr f = fieldimm(j, scrut);
+        f->gm_facc = true;
+        comps.push_back(f);
       }
       std::vector<MRow> mrows;
       for (auto* r : rs) {
@@ -9829,20 +9864,6 @@ struct Translator {
       if (!mm_cols_ok(mrows, (size_t)ar)) return nullptr;
       LamPtr body = mm_cols(comps, std::move(mrows), 0, mloc);
       if (!body) return nullptr;
-      // ocamlc reads the discriminating (matched) column's field FIRST -- the
-      // matrix matcher skips a pure-variable leading column and splits on the
-      // first constructor column, binding that arg outermost.  Wrap forward so
-      // the last field's read ends up outermost (read first), matching ocamlc's
-      // `let *match* = field_(k-1) in let t = field_0 in ..` order.
-      for (int j = 0; j < ar; ++j) {
-        LamPtr fread = fieldimm(j, scrut);
-        if (count_var(body, fids[j]) <= 1) subst_alias(body, fids[j], fread);
-        else {
-          auto l = mk(Lam::K::Let);
-          l->bindings = {{fids[j], ValueKind::Gen, fread, true}};
-          l->body = body; body = l;
-        }
-      }
       return body;
     }
     LamPtr field0 = fieldimm(0, scrut);
@@ -10440,6 +10461,71 @@ struct Translator {
     for (auto& a : c->args) a = clone_facc(a);
     return c;
   }
+  // matching.ml's approx_present: is v (approximately) present in lam?
+  // Anything outside the listed shapes conservatively counts as present.
+  static bool approx_present(const Ident& v, const LamPtr& l) {
+    if (!l) return false;
+    switch (l->k) {
+      case Lam::K::ConstInt: case Lam::K::ConstChar: case Lam::K::ConstFloat:
+      case Lam::K::ConstString: case Lam::K::ConstBlock:
+        return false;
+      case Lam::K::Var:
+        return l->var.stamp == v.stamp;
+      case Lam::K::Staticraise:
+      case Lam::K::Prim:
+        for (auto& a : l->args) if (approx_present(v, a)) return true;
+        return false;
+      case Lam::K::Let: {
+        for (auto& b : l->bindings) if (!b.alias) return true;
+        for (auto& b : l->bindings) if (approx_present(v, b.val)) return true;
+        return approx_present(v, l->body);
+      }
+      default:
+        return true;
+    }
+  }
+  // matching.ml's lower_bind: sink an Alias bind toward its single branch of
+  // use -- past other alias lets, into the used arm of an if, into a
+  // single-case switch -- so a tested column's let ends up OUTSIDE an earlier
+  // var column's (the discriminating field reads first).
+  LamPtr lower_bind(const Ident& v, ValueKind vk_, const LamPtr& arg, LamPtr lam) {
+    auto wrap = [&](LamPtr b) -> LamPtr {
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{v, vk_, arg, true}};
+      l->body = b;
+      return l;
+    };
+    if (lam->k == Lam::K::IfThenElse) {
+      bool pc = approx_present(v, lam->cond);
+      bool ps = approx_present(v, lam->then_);
+      bool pn = approx_present(v, lam->else_);
+      if (!pc && !ps && !pn) return lam;
+      if (!pc && ps && !pn) { lam->then_ = lower_bind(v, vk_, arg, lam->then_); return lam; }
+      if (!pc && !ps && pn) { lam->else_ = lower_bind(v, vk_, arg, lam->else_); return lam; }
+      return wrap(lam);
+    }
+    if (lam->k == Lam::K::Switch && !approx_present(v, lam->cond)) {
+      if (lam->sw_consts.size() == 1 && lam->sw_blocks.empty()) {
+        lam->sw_consts[0].body = lower_bind(v, vk_, arg, lam->sw_consts[0].body);
+        return lam;
+      }
+      if (lam->sw_consts.empty() && lam->sw_blocks.size() == 1) {
+        lam->sw_blocks[0].body = lower_bind(v, vk_, arg, lam->sw_blocks[0].body);
+        return lam;
+      }
+    }
+    if (lam->k == Lam::K::Let) {
+      bool allalias = true;
+      for (auto& b : lam->bindings) if (!b.alias) { allalias = false; break; }
+      if (allalias) {
+        for (auto& b : lam->bindings)
+          if (approx_present(v, b.val)) return wrap(lam);
+        lam->body = lower_bind(v, vk_, arg, lam->body);
+        return lam;
+      }
+    }
+    return wrap(lam);
+  }
   // A pattern that matches anything and at most binds: upstream's omega_like
   // (vars, wildcards, aliases of such).
   const Pattern* pat_deep(const Pattern* p) {
@@ -10500,10 +10586,7 @@ struct Translator {
       int n = count_var(r, v);
       if (n == 0) return r;
       if (n == 1) { subst_alias(r, v, clone_facc(proto)); return r; }
-      auto l = mk(Lam::K::Let);
-      l->bindings = {{v, proto->gm_facc_kind, clone_facc(proto), true}};
-      l->body = r;
-      return l;
+      return lower_bind(v, proto->gm_facc_kind, clone_facc(proto), r);
     }
     if (rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
       int e = ++next_exit_;
