@@ -21034,6 +21034,21 @@ struct Translator {
       auto pending = std::move(pending_functor_coerce_); pending_functor_coerce_.clear();
       const cmi::Signature* pending_sig = pending_functor_coerce_sig_;
       pending_functor_coerce_sig_ = nullptr;
+      // A functor's body may define internal submodules
+      // (`module Make (X) = struct module Map = ... end`).  Those are scoped to
+      // the body -- a functor is a closure, its internals are not fields of the
+      // enclosing structure -- yet build_module registers them in module_ident_.
+      // Snapshot here and restore the identifier map after the body so a SIBLING
+      // can't resolve `Map` to the functor's internal (dangling) binding: ocamlc
+      // rejects such a reference as Unbound; we would silently emit a read of an
+      // out-of-scope variable and segfault.  (Only module_ident_ is restored:
+      // dropping the name is enough to stop the dangling read, and the body's
+      // module_layout_ / module_alias_ entries are inert without it -- matching
+      // the pre-existing behaviour that a full restore would perturb, e.g. a
+      // recursive functor's `module Internal = Generic(..); include Internal`,
+      // whose result layout is re-walked after this returns.  menv_ is already
+      // frame-scoped -- pop_frame below; param names are handled by `saves`.)
+      auto fn_mod_before = module_ident_;
       if (auto* ps = std::get_if<Pmod_structure>(&cur->desc); ps && !pending.empty()) {
         std::vector<std::string> sub;
         modsig::SigPtr src_msig;
@@ -21075,6 +21090,18 @@ struct Translator {
         }
       } else {
         fn->body = compile_module_expr(*cur);
+      }
+      // Drop the body's internal module registrations (see snapshot above);
+      // keep only what the enclosing scope had, restoring any it shadowed.  The
+      // param entries are in the snapshot (bound above) and are re-restored to
+      // their pre-functor state by `saves` below.
+      for (auto it2 = module_ident_.begin(); it2 != module_ident_.end();) {
+        auto bi = fn_mod_before.find(it2->first);
+        if (bi != fn_mod_before.end() && bi->second.stamp == it2->second.stamp) {
+          ++it2; continue;
+        }
+        if (bi != fn_mod_before.end()) { it2->second = bi->second; ++it2; }
+        else it2 = module_ident_.erase(it2);
       }
       menv_.pop_frame();  // modsig P3: functor-param frame
       restore_sig_exts(ext_saves);
