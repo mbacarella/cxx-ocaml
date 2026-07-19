@@ -11329,11 +11329,45 @@ struct Translator {
     };
     std::vector<std::string> col_cns;  // constructor names in this column, in row order
     bool tydisagree = false;
+    // Exn-SHADOWED predef variant column (see ctor_match's pivot).  Our typer can
+    // type a pattern ctor as a local `exception E` that shadows a same-named predef
+    // variant ctor (unit_info's `Ok x | Error x` under `exception Error`: the `Error`
+    // row comes out typed `exn`).  If this column's NON-shadowed sibling rows pin one
+    // concrete predef variant type that OWNS every shadowed ctor, the scrutinee is
+    // that variant -- resolve the shadowed rows against it (ocamlc's type-directed
+    // disambiguation, reading the payload at field 0) instead of bailing to naive's
+    // caml_obj_tag extension-identity form (which reads the exn arg at field 1).
+    std::string col_pivot; {
+      bool bad = false, has_exn = false; std::string piv;
+      for (auto& r : rows) {
+        if (!std::get_if<Ppat_construct>(&r.cols[0]->desc)) continue;
+        std::string cn = ctor_of(*r.cols[0]);
+        if (exn_typed_pat(r.cols[0], cn)) { has_exn = true; continue; }  // vs pivot
+        const CtorInfo* ci = pat_ctor_resolve(r.cols[0], cn);
+        if (!ci) { bad = true; break; }
+        if (piv.empty()) piv = ci->type; else if (piv != ci->type) { bad = true; break; }
+      }
+      if (!bad && has_exn && !piv.empty())
+        for (auto& r : rows) {
+          if (!std::get_if<Ppat_construct>(&r.cols[0]->desc)) continue;
+          std::string cn = ctor_of(*r.cols[0]);
+          if (exn_typed_pat(r.cols[0], cn) && !predef_ctor_lookup(piv, cn)) { bad = true; break; }
+        }
+      if (!bad && has_exn) col_pivot = piv;  // stays empty for a genuine all-exn column
+    }
+    auto rr = [&](const Pattern* p, const std::string& cn,
+                  const std::string& hint = std::string()) -> const CtorInfo* {
+      if (!col_pivot.empty() && exn_typed_pat(p, cn))
+        if (auto* c = predef_ctor_lookup(col_pivot, cn)) return c;
+      return hint.empty() ? pat_ctor_resolve(p, cn) : pat_ctor_resolve(p, cn, hint);
+    };
     for (auto& r : rows)
       if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
         const std::string cn = ctor_of(*r.cols[0]);
-        if (exn_typed_pat(r.cols[0], cn)) return GB("exn", cn);
-        const CtorInfo* ci = pat_ctor_resolve(r.cols[0], cn);
+        if (exn_typed_pat(r.cols[0], cn) &&
+            !(!col_pivot.empty() && predef_ctor_lookup(col_pivot, cn)))
+          return GB("exn", cn);
+        const CtorInfo* ci = rr(r.cols[0], cn);
         if (!ci) return GB("noresolve", cn);
         if (ci->unboxed) return GB("unboxed", cn);
         col_cns.push_back(cn);
@@ -11422,7 +11456,7 @@ struct Translator {
     bool has_var = false;
     for (auto& r : rows)
       if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
-        const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]), type);
+        const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
         (ci->is_block ? block_ci : const_ci)[ci->tag] = ci;
       } else has_var = true;
     // Default-sub-matrix sharing (matching.ml's D(P)): every GAP tag (no explicit
@@ -11444,7 +11478,7 @@ struct Translator {
       for (auto& r : rows) {
         auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
         if (k) {
-          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]), type);
+          const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
           if (ci->is_block || ci->tag != t) continue;
           MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
         } else { bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr)); }
@@ -11492,7 +11526,7 @@ struct Translator {
       for (auto& r : rows) {
         auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
         if (k) {
-          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], ctor_of(*r.cols[0]), type);
+          const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
           if (!ci->is_block || ci->tag != t) continue;
           std::vector<const Pattern*> fps;
           if (inl) {
