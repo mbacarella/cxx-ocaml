@@ -1185,6 +1185,15 @@ struct Translator {
   // Constructor names that came from the predefs/stdlib (not local decls): a
   // LOCAL exception/extension ctor of the same name shadows them.
   std::set<std::string> builtin_ctors_;
+  // The original predef ctor info, keyed "type.ctor" and NEVER overwritten by a
+  // shadowing local `exception`/extension.  Lets a match whose scrutinee is a
+  // predef variant recover the real ctor when the flat ctor_info_ entry has been
+  // squatted by a same-named exception (`exception Error` hiding result.Error).
+  std::map<std::string, CtorInfo> predef_ctor_info_;
+  const CtorInfo* predef_ctor_lookup(const std::string& type, const std::string& cn) const {
+    auto it = predef_ctor_info_.find(type + "." + cn);
+    return it == predef_ctor_info_.end() ? nullptr : &it->second;
+  }
   void register_predef_ctor_info() {
     for (const char* c : {"None", "Some", "[]", "::", "Ok", "Error", "false", "true", "()"})
       builtin_ctors_.insert(c);
@@ -1202,6 +1211,7 @@ struct Translator {
     type_ctors_["result"] = {0, 2};
     type_ctors_["bool"]   = {2, 0};
     type_ctors_["unit"]   = {1, 0};
+    for (auto& [name, ci] : ctor_info_) predef_ctor_info_[ci.type + "." + name] = ci;
   }
 
   // Register top-level Stdlib variant constructors (e.g. fpclass's FP_normal..)
@@ -10007,6 +10017,36 @@ struct Translator {
       scope.pop_back();
       return b;
     };
+    // Pre-scan for an exn-SHADOWED predef variant match.  Our typer sometimes
+    // types a pattern ctor as the local `exception E` that shadows a same-named
+    // predef variant ctor (e.g. `exception Error` in scope makes the `Error`
+    // pattern over a `result` scrutinee come out typed `exn`).  If every
+    // non-shadowed sibling row pins one concrete predef variant type that also
+    // OWNS each shadowed ctor, the scrutinee is that variant -- not exn -- so
+    // resolve the shadowed rows against it (ocamlc's type-directed disambiguation)
+    // rather than bailing to the caml_obj_tag extension-identity if-chain.
+    std::string pivot;
+    bool pivot_bad = false;
+    for (auto& r : prows) {
+      auto* k = std::get_if<Ppat_construct>(&r.lhs->desc);
+      if (!k) { pivot_bad = true; break; }
+      std::string cn = ctor_of(*r.lhs);
+      if (exn_typed_pat(r.lhs, cn)) continue;         // resolved against pivot below
+      const CtorInfo* cip = pat_ctor_resolve(r.lhs, cn);
+      if (!cip) { pivot_bad = true; break; }
+      if (pivot.empty()) pivot = cip->type;
+      else if (pivot != cip->type) { pivot_bad = true; break; }
+    }
+    if (!pivot_bad && !pivot.empty())
+      for (auto& r : prows) {
+        std::string cn = ctor_of(*r.lhs);
+        if (exn_typed_pat(r.lhs, cn) && !predef_ctor_lookup(pivot, cn)) { pivot_bad = true; break; }
+      }
+    if (pivot_bad) pivot.clear();
+    auto resolve_row = [&](const Pattern* lhs, const std::string& cn) -> const CtorInfo* {
+      if (!pivot.empty() && exn_typed_pat(lhs, cn)) return predef_ctor_lookup(pivot, cn);
+      return pat_ctor_resolve(lhs, cn);
+    };
     std::string type;
     std::set<int> cseen;                            // covered constant values
     std::map<int, const Row*> crow;                 // const value -> its (sole) row
@@ -10016,9 +10056,9 @@ struct Translator {
       if (r.guard && !std::holds_alternative<Ppat_construct>(r.lhs->desc)) return nullptr;
       auto* k = std::get_if<Ppat_construct>(&r.lhs->desc);
       if (!k) return nullptr;
-      if (exn_typed_pat(r.lhs, ctor_of(*r.lhs))) return nullptr;  // extension:
+      if (pivot.empty() && exn_typed_pat(r.lhs, ctor_of(*r.lhs))) return nullptr;  // extension:
                                                   // the if-chain path tests identity
-      const CtorInfo* cip = pat_ctor_resolve(r.lhs, ctor_of(*r.lhs));
+      const CtorInfo* cip = resolve_row(r.lhs, ctor_of(*r.lhs));
       if (!cip) return nullptr;
       auto& ci = *cip;
       if (type.empty()) type = ci.type;
@@ -10045,7 +10085,7 @@ struct Translator {
     for (auto& [v, r] : crow)
       cmap[v] = with_alias(r, [&] { return expr(*r->rhs); });
     for (auto& [tag, rs] : brows) {
-      auto& ci = *pat_ctor_resolve(rs[0]->lhs, ctor_of(*rs[0]->lhs));
+      auto& ci = *resolve_row(rs[0]->lhs, ctor_of(*rs[0]->lhs));
       // an aliased row in a multi-row group would need per-sub-row scoping: bail
       if (rs.size() > 1)
         for (auto* r : rs)
