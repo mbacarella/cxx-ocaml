@@ -194,6 +194,16 @@ struct Lam {
   // assign_pat's non-var tuple-column binding in tail_tuple_exit) must treat a
   // tagged node as the variable it stood for.
   bool from_alias = false;
+  // gm_facc: a pattern-matrix column whose lambda is a DEFERRED field access
+  // (matching.ml passes get_expr_args' field-read expressions down unevaluated;
+  // each compile entry then binds its first arg via arg_to_var/bind_match_arg).
+  // gmatch materializes such a column when it reaches head position: bound to a
+  // fresh var for that level, then Simplif's Alias count rule (0 drop / 1
+  // substitute a fresh read / >=2 keep the let), so ctor arms and split-off
+  // catch-all rows re-read the field independently like upstream's per-sub-pm
+  // binding.  gm_facc_kind: the value kind for the materialized binding.
+  bool gm_facc = false;
+  ValueKind gm_facc_kind = ValueKind::Gen;
 };
 
 // Alpha-normalized structural key of a Lambda term (the analog of

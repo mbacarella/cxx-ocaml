@@ -826,6 +826,13 @@ struct Translator {
   // matcher bails to the general path; healthy matches stay far under it.  Set by
   // the gmatch entry points; env CPPCAML_GMBUDGET overrides for calibration.
   int g_gm_budget_ = -1;  // <0 = inactive
+  // Materialized field-access vars (gm_facc): var stamp -> the deferred access
+  // prototype it was bound to.  wire_garms uses this to expand a context var
+  // passed at every exit of a SHARED arm back into its field-read chain, so
+  // the handler re-reads it in place of a widened catch (upstream's default-pm
+  // handlers re-read their argument expressions; only or-bound vars ride the
+  // exit).
+  std::unordered_map<int, LamPtr> gm_facc_proto_;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -7648,11 +7655,9 @@ struct Translator {
   }
   // The maximum number of uses of `id` along ANY single execution path: sums
   // sequential parts (fn/args/bindings/body/cond) but takes the MAX across the
-  // mutually-exclusive arms of an if/switch/catch.  ocamlc inlines a (pure) field
-  // read into each branch when it is used at most once per path -- re-reading in
-  // disjoint arms rather than hoisting a shared binding that stays live across the
-  // whole match -- and binds only when a single path reads it twice.  Matching this
-  // is what lets the matrix matcher's decomposed columns share fields like ocamlc.
+  // mutually-exclusive arms of an if/switch/catch.  Only the matrix matcher's
+  // MUTABLE record-field columns still use this (immutable field columns defer
+  // their reads via gm_facc and follow upstream's per-half-match binding).
   static int max_path_count_var(const LamPtr& l, const Ident& id, int w = 1) {
     if (!l) return 0;
     if (l->k == Lam::K::Var)
@@ -10424,8 +10429,102 @@ struct Translator {
   // unboxed ctors, poly-variants, arrays, records, ranges, lazy, ...), so the
   // caller falls through to the existing path.  `deid` is a static-exit id for the
   // shared fallback (uncovered tags -> `(exit deid)`), set up by gmatch_top.
+  //
+  // Deep-copy a deferred field-access prototype (a small Prim-over-Var tree) so
+  // every materialized read is a fresh node -- in-place passes must never see
+  // structure sharing across match arms.
+  static LamPtr clone_facc(const LamPtr& l) {
+    LamPtr c = lam_alloc_copy(*l);
+    c->gm_facc = false;
+    c->from_alias = false;
+    for (auto& a : c->args) a = clone_facc(a);
+    return c;
+  }
+  // A pattern that matches anything and at most binds: upstream's omega_like
+  // (vars, wildcards, aliases of such).
+  const Pattern* pat_deep(const Pattern* p) {
+    for (;;) {
+      const Pattern* e = effective_pat(p);
+      if (e != p) { p = e; continue; }
+      if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { p = pa->p.get(); continue; }
+      return p;
+    }
+  }
+  bool pat_omega_like(const Pattern* p) {
+    p = pat_deep(p);
+    return std::get_if<Ppat_var>(&p->desc) || std::holds_alternative<Ppat_any>(p->desc);
+  }
+  bool row_all_var(const MRow& r) {
+    for (auto* c : r.cols) if (!pat_omega_like(c)) return false;
+    return true;
+  }
+  // Per-level wrapper replicating matching.ml's compile-entry plumbing:
+  //  - Materialize a deferred field-access column when it reaches head position
+  //    (upstream binds each compile entry's first arg via arg_to_var +
+  //    bind_match_arg, so each half-match reads the field itself), finishing
+  //    with Simplif's Alias count rule: 0 uses -> drop, 1 -> substitute a fresh
+  //    read at the use, >=2 -> keep the alias let around this level's output.
+  //  - Split a trailing all-variable row off as this level's shared default
+  //    (split_no_or's last-row division): the remaining rows compile with the
+  //    row's exit as their fallback, and the row's own pm re-binds the still
+  //    deferred columns -- so its handler re-reads later fields fresh while
+  //    reusing vars this level already materialized, exactly upstream's
+  //    default-matrix argument capture.
   LamPtr gmatch(std::vector<LamPtr> comps, std::vector<MRow> rows,
                 const Location& mloc, int deid) {
+    if (!comps.empty() && comps[0] && comps[0]->gm_facc) {
+      LamPtr proto = comps[0];
+      // Upstream's name_pattern: the binding takes the first var/alias row's
+      // name (purely cosmetic -- stamps are normalized everywhere it matters).
+      std::string nm;
+      for (auto& r : rows) {
+        if (r.cols.empty()) break;
+        const Pattern* p = r.cols[0];
+        for (;;) {
+          const Pattern* ep = effective_pat(p);
+          if (ep != p) { p = ep; continue; }
+          break;
+        }
+        if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { nm = pa->name.txt; break; }
+        if (auto* pv = std::get_if<Ppat_var>(&p->desc)) { nm = pv->name.txt; break; }
+      }
+      Ident v = fresh(nm, nm.empty());
+      if (cppcaml::dbg_env("GMFA"))
+        fprintf(stderr, "[GMFA] materialize v=%s/%d rows=%zu col0=%d\n",
+                v.name.c_str(), v.stamp, rows.size(),
+                rows.empty() || rows[0].cols.empty() ? -1 : (int)rows[0].cols[0]->desc.index());
+      gm_facc_proto_[v.stamp] = proto;   // for wire_garms' exit-arg minimization
+      comps[0] = varof(v);
+      LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid);
+      if (!r) return nullptr;
+      int n = count_var(r, v);
+      if (n == 0) return r;
+      if (n == 1) { subst_alias(r, v, clone_facc(proto)); return r; }
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{v, proto->gm_facc_kind, clone_facc(proto), true}};
+      l->body = r;
+      return l;
+    }
+    if (rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
+      int e = ++next_exit_;
+      MRow last = std::move(rows.back());
+      rows.pop_back();
+      std::vector<LamPtr> hcomps = comps;
+      LamPtr main = gmatch(std::move(comps), std::move(rows), mloc, e);
+      if (!main) return nullptr;
+      LamPtr hb = gmatch(std::move(hcomps), {std::move(last)}, mloc, deid);
+      if (!hb) return nullptr;
+      int bad = 0; int uses = count_exit(main, e, false, bad);
+      if (uses == 0) return main;                    // popped row unreachable
+      if (uses == 1 && bad == 0) { inline_exit(main, e, {}, {}, hb); return main; }
+      auto c = mk(Lam::K::Catch);
+      c->cond = main; c->prim_arg = e; c->then_ = hb;
+      return c;
+    }
+    return gmatch_inner(std::move(comps), std::move(rows), mloc, deid);
+  }
+  LamPtr gmatch_inner(std::vector<LamPtr> comps, std::vector<MRow> rows,
+                      const Location& mloc, int deid) {
     if (g_gm_budget_ == 0) return nullptr;         // decision-tree too large: bail
     if (g_gm_budget_ > 0) --g_gm_budget_;
     auto mkexit = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = deid; return e; };
@@ -10516,9 +10615,13 @@ struct Translator {
         if (g_gm_budget_ == 0) return nullptr;
         if (g_gm_budget_ > 0) --g_gm_budget_;
         std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
-        std::vector<Ident> fids; std::vector<LamPtr> fvars;
-        for (size_t j = 0; j < tk; ++j) { Ident f = fresh("", true); fids.push_back(f); fvars.push_back(varof(f)); }
-        std::vector<LamPtr> ncomps = fvars; ncomps.insert(ncomps.end(), rest.begin(), rest.end());
+        std::vector<LamPtr> ncomps;                       // deferred field reads
+        for (size_t j = 0; j < tk; ++j) {
+          LamPtr f = fieldimm((int)j, comps[0]);
+          f->gm_facc = true;
+          ncomps.push_back(f);
+        }
+        ncomps.insert(ncomps.end(), rest.begin(), rest.end());
         static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
         std::vector<MRow> sub;
         for (auto& r : rows) {
@@ -10533,14 +10636,7 @@ struct Translator {
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
         }
-        LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, deid);
-        if (!cb) return nullptr;
-        for (int j = (int)tk - 1; j >= 0; --j) {
-          LamPtr fread = fieldimm(j, comps[0]);
-          if (max_path_count_var(cb, fids[j]) <= 1) subst_alias(cb, fids[j], fread);
-          else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ValueKind::Gen, fread, true}}; l->body = cb; cb = l; }
-        }
-        return cb;
+        return gmatch(std::move(ncomps), std::move(sub), mloc, deid);
       }
     }
     // Nested record column: also monomorphic -> one column per mentioned field
@@ -10577,9 +10673,23 @@ struct Translator {
         for (auto& [ix, fi] : cols_fi) { order.push_back(ix); ofi.push_back(fi); }
         size_t nc = order.size();
         std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
-        std::vector<Ident> fids; std::vector<LamPtr> fvars;
-        for (size_t j = 0; j < nc; ++j) { Ident f = fresh("", true); fids.push_back(f); fvars.push_back(varof(f)); }
-        std::vector<LamPtr> ncomps = fvars; ncomps.insert(ncomps.end(), rest.begin(), rest.end());
+        // Immutable fields defer their read (gm_facc); MUTABLE fields keep the
+        // pre-bound var + max-path decision below (a mutable read can't be
+        // re-materialized per half-match without changing which value is seen).
+        std::vector<Ident> fids(nc);
+        std::vector<char> col_mut(nc, 0);
+        std::vector<LamPtr> ncomps;
+        for (size_t j = 0; j < nc; ++j) {
+          if (ofi[j].mut) {
+            col_mut[j] = 1; fids[j] = fresh("", true);
+            ncomps.push_back(varof(fids[j]));
+          } else {
+            LamPtr f = field_read(&ofi[j], comps[0]);
+            f->gm_facc = true; f->gm_facc_kind = ofi[j].kind;
+            ncomps.push_back(f);
+          }
+        }
+        ncomps.insert(ncomps.end(), rest.begin(), rest.end());
         static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
         std::vector<MRow> sub;
         for (size_t ri = 0; ri < rows.size(); ++ri) {
@@ -10600,6 +10710,7 @@ struct Translator {
         LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, deid);
         if (!cb) return nullptr;
         for (int j = (int)nc - 1; j >= 0; --j) {
+          if (!col_mut[j]) continue;
           LamPtr fread = field_read(&ofi[j], comps[0]);
           if (max_path_count_var(cb, fids[j]) <= 1) subst_alias(cb, fids[j], fread);
           else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ofi[j].kind, fread, true}}; l->body = cb; cb = l; }
@@ -10948,9 +11059,13 @@ struct Translator {
       const auto& rlab = bi->second->rlabels;
       bool inl = !rlab.empty();
       int a = inl ? (int)rlab.size() : bi->second->arity;
-      std::vector<Ident> fids; std::vector<LamPtr> fvars;
-      for (int j = 0; j < a; ++j) { Ident f = fresh("", true); fids.push_back(f); fvars.push_back(varof(f)); }
-      std::vector<LamPtr> ncomps = fvars; ncomps.insert(ncomps.end(), rest.begin(), rest.end());
+      std::vector<LamPtr> ncomps;                        // deferred field reads
+      for (int j = 0; j < a; ++j) {
+        LamPtr f = fieldimm(j, comps[0]);
+        f->gm_facc = true;
+        ncomps.push_back(f);
+      }
+      ncomps.insert(ncomps.end(), rest.begin(), rest.end());
       static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
       std::vector<MRow> sub;
       for (auto& r : rows) {
@@ -10993,17 +11108,7 @@ struct Translator {
           sub.push_back(std::move(nr));
         }
       }
-      LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, deid);
-      if (!cb) return nullptr;
-      for (int j = a - 1; j >= 0; --j) {
-        LamPtr fread = fieldimm(j, comps[0]);
-        if (max_path_count_var(cb, fids[j]) <= 1) subst_alias(cb, fids[j], fread);
-        else {
-          auto l = mk(Lam::K::Let);
-          l->bindings = {{fids[j], ValueKind::Gen, fread, true}}; l->body = cb; cb = l;
-        }
-      }
-      return cb;
+      return gmatch(std::move(ncomps), std::move(sub), mloc, deid);
     };
     std::vector<Lam::SwitchCase> consts, blocks;
     for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b}); }
@@ -11103,17 +11208,15 @@ struct Translator {
   int gm_budget() {
     static int b = [] {
       const char* e = std::getenv("CPPCAML_GMBUDGET");
-      // 200 = re-calibrated once gap tags began SHARING the default sub-matrix (so a
-      // wide sparse match no longer burns the budget once per gap tag).  Sharing lets
-      // the budget rise far higher without the un-shared var-spread exploding, and
-      // every direction-consistent discrimination signal keeps converging toward the
-      // ocamlc reference across 55->200 (obj_tag 2645->1851, EQ 3700->3061, BNEQ
-      // 2132->1770, ISINT 1556->1238, even GETFIELD0 20971->19878).  The non-parser
-      // aggregate |diff| bottoms in a flat 180-220 basin (~39878) then falls off a
-      // cliff at 240 (a large matrix just fits and its field-materialize reshuffle
-      // diverges from REF).  Whole-build total|diff| rises past 55 purely from the
-      // parser's menhir GETFIELD/PUSHENVACC reshuffle (DDC-bit-identical noise).
-      return e ? std::atoi(e) : 200;
+      // 1000 = re-calibrated for bind-on-consumption + the trailing-row split
+      // (both add gmatch entries per pm, so deep matrices like emitcode's
+      // peephole blew the old 200 budget and fell back to the obj_tag
+      // if-chain).  The corpus total is monotone improving in the budget and
+      // saturates by 1000 (200: 83574, 400: 80653, 1000/100000: 76817); the
+      // old 240 "cliff" (a large matrix whose field-materialize reshuffle
+      // diverged from REF) is gone now that field bindings follow upstream's
+      // per-half-match discipline.
+      return e ? std::atoi(e) : 1000;
     }();
     return b;
   }
@@ -11124,27 +11227,115 @@ struct Translator {
     collect_gvars(full, a.vnames);
     a.aid = ++next_exit_;
     for (size_t k = 0; k < a.vnames.size(); ++k) {
-      a.cvars.push_back(fresh("", true)); a.kinds.push_back(ValueKind::Gen);
+      // Catch params carry the arm's user names (upstream's or-pattern handler
+      // vars ARE the bound idents) -- cosmetic, but keeps -dlambda comparable.
+      a.cvars.push_back(fresh(a.vnames[k], false)); a.kinds.push_back(ValueKind::Gen);
     }
     return a;
+  }
+  // Expand a materialized field var into its full access chain rooted at vars
+  // that are in scope at a garm catch (the match scrutinee / outer bindings).
+  // nullptr when the var has no recorded prototype.
+  LamPtr expand_facc_var(const Ident& v) {
+    auto it = gm_facc_proto_.find(v.stamp);
+    if (it == gm_facc_proto_.end()) return nullptr;
+    LamPtr c = clone_facc(it->second);
+    expand_faccs_in(c);
+    return c;
+  }
+  void expand_faccs_in(LamPtr& l) {
+    if (!l) return;
+    if (l->k == Lam::K::Var) {
+      if (LamPtr e = expand_facc_var(l->var)) l = e;
+      return;
+    }
+    for (auto& a : l->args) expand_faccs_in(a);
+  }
+  // Collect every `(exit aid ..)` site (static exits never cross a function
+  // boundary, so nested Lfunctions contribute nothing).
+  static void collect_exit_sites(const LamPtr& l, int aid, std::vector<Lam*>& out) {
+    if (!l) return;
+    if (l->k == Lam::K::Function) return;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == aid) { out.push_back(l.get()); return; }
+    collect_exit_sites(l->fn, aid, out); collect_exit_sites(l->body, aid, out);
+    collect_exit_sites(l->cond, aid, out); collect_exit_sites(l->then_, aid, out);
+    collect_exit_sites(l->else_, aid, out); collect_exit_sites(l->sw_default, aid, out);
+    for (auto& a : l->args) collect_exit_sites(a, aid, out);
+    for (auto& b : l->bindings) collect_exit_sites(b.val, aid, out);
+    for (auto& sc : l->sw_consts) collect_exit_sites(sc.body, aid, out);
+    for (auto& sc : l->sw_blocks) collect_exit_sites(sc.body, aid, out);
   }
   // After gmatch produces `body` (whose leaves exit to each arm), compile each
   // reachable handler ONCE and wire it in: inline single-use handlers (simplif
   // then drops the `let cv = Lvar id` -> byte-identical to inline-at-leaf), keep a
   // shared catch for genuinely-duplicated arms.
+  //
+  // A SHARED arm first drops every catch param whose value at ALL exit sites is
+  // the SAME materialized field var: upstream's default-matrix handler is
+  // compiled against the argument expressions themselves, so context fields
+  // are re-read inside the handler (per its own use count) and only or-bound
+  // vars are passed through the exit.
   void wire_garms(LamPtr& body, std::vector<GArm>& arms) {
     for (auto& a : arms) {
       int bad = 0; int uses = count_exit(body, a.aid, false, bad);
       if (uses == 0) continue;                       // arm unreachable (dead row)
+      bool shared = !(uses == 1 && bad == 0);
+      // reread[k]: non-null -> param k dropped, handler re-reads this chain.
+      std::vector<LamPtr> reread(a.vnames.size());
+      if (shared) {
+        std::vector<Lam*> sites;
+        collect_exit_sites(body, a.aid, sites);
+        for (size_t k = 0; k < a.vnames.size(); ++k) {
+          const Ident* same = nullptr; bool ok = !sites.empty();
+          for (Lam* s : sites) {
+            if (k >= s->args.size() || s->args[k]->k != Lam::K::Var) { ok = false; break; }
+            const Ident& id = s->args[k]->var;
+            if (!same) same = &id;
+            else if (same->stamp != id.stamp || same->name != id.name) { ok = false; break; }
+          }
+          if (ok) reread[k] = expand_facc_var(*same);
+        }
+        if ([&] { for (auto& r : reread) if (r) return true; return false; }()) {
+          for (Lam* s : sites) {
+            std::vector<LamPtr> na;
+            for (size_t k = 0; k < s->args.size(); ++k)
+              if (k >= reread.size() || !reread[k]) na.push_back(s->args[k]);
+            s->args = std::move(na);
+          }
+        }
+      }
       scope.emplace_back();
-      for (size_t k = 0; k < a.vnames.size(); ++k) scope.back()[a.vnames[k]] = a.cvars[k];
+      std::vector<std::pair<Ident, LamPtr>> rebinds;   // vnames order
+      for (size_t k = 0; k < a.vnames.size(); ++k) {
+        if (reread[k]) {
+          Ident hv = fresh(a.vnames[k], false);
+          scope.back()[a.vnames[k]] = hv;
+          rebinds.push_back({hv, reread[k]});
+        } else
+          scope.back()[a.vnames[k]] = a.cvars[k];
+      }
       LamPtr handler = expr(*a.rhs);
       scope.pop_back();
-      if (uses == 1 && bad == 0)
+      // First dropped param outermost, like the handler pm's left-to-right
+      // argument binding; single uses substitute (Simplif's Alias rule).
+      for (size_t i = rebinds.size(); i-- > 0; ) {
+        auto& [hv, chain] = rebinds[i];
+        int n = count_var(handler, hv);
+        if (n == 0) continue;
+        if (n == 1) { subst_alias(handler, hv, chain); continue; }
+        auto lt = mk(Lam::K::Let);
+        lt->bindings = {{hv, ValueKind::Gen, chain, true}};
+        lt->body = handler;
+        handler = lt;
+      }
+      if (!shared)
         inline_exit(body, a.aid, a.cvars, a.kinds, handler);
       else {
+        std::vector<Ident> cvs; std::vector<ValueKind> cks;
+        for (size_t k = 0; k < a.cvars.size(); ++k)
+          if (k >= reread.size() || !reread[k]) { cvs.push_back(a.cvars[k]); cks.push_back(a.kinds[k]); }
         auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = a.aid;
-        c->catch_vars = a.cvars; c->catch_var_kinds = a.kinds; c->then_ = handler;
+        c->catch_vars = std::move(cvs); c->catch_var_kinds = std::move(cks); c->then_ = handler;
         body = c;
       }
     }
