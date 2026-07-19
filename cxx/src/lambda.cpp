@@ -14382,6 +14382,36 @@ struct Translator {
     for (auto& sc : l->sw_blocks) rewrite_default_leaves(sc.body, eid, inline_with);
   }
 
+  // Argless-exit occurrences of a specific id (the shared-action sentinels of
+  // const_ctor_switcher); a leaf node shared across positions counts each visit.
+  static int count_exit_leaves(const LamPtr& l, int id) {
+    if (!l) return 0;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == id && l->args.empty()) return 1;
+    int c = count_exit_leaves(l->fn, id) + count_exit_leaves(l->body, id) +
+            count_exit_leaves(l->cond, id) + count_exit_leaves(l->then_, id) +
+            count_exit_leaves(l->else_, id) + count_exit_leaves(l->sw_default, id);
+    for (auto& a : l->args) c += count_exit_leaves(a, id);
+    for (auto& b : l->bindings) c += count_exit_leaves(b.val, id);
+    for (auto& sc : l->sw_consts) c += count_exit_leaves(sc.body, id);
+    for (auto& sc : l->sw_blocks) c += count_exit_leaves(sc.body, id);
+    return c;
+  }
+  // Inline a single-use shared action in place of its exit (Simplif's
+  // single-use static-exit inlining, replayed locally).
+  static void inline_exit_leaves(const LamPtr& l, int id, const LamPtr& body) {
+    if (!l) return;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == id && l->args.empty()) {
+      *l = *body;
+      return;
+    }
+    inline_exit_leaves(l->fn, id, body); inline_exit_leaves(l->body, id, body);
+    inline_exit_leaves(l->cond, id, body); inline_exit_leaves(l->then_, id, body);
+    inline_exit_leaves(l->else_, id, body); inline_exit_leaves(l->sw_default, id, body);
+    for (auto& a : l->args) inline_exit_leaves(a, id, body);
+    for (auto& b : l->bindings) inline_exit_leaves(b.val, id, body);
+    for (auto& sc : l->sw_consts) inline_exit_leaves(sc.body, id, body);
+    for (auto& sc : l->sw_blocks) inline_exit_leaves(sc.body, id, body);
+  }
   // A conservative structural key for an action body, used only to detect when
   // ocamlc would *share* two equal bodies in a switch (which we don't model) so
   // we can bail to int_cases.  Returns "" for terms ocamlc's make_key rejects
@@ -14523,13 +14553,20 @@ struct Translator {
     }
 
     // Build the interval cover (matching.ml as_interval_canfail, distinct values).
+    // Adjacent values of the same action (or-flattened `1|2 -> e`) merge into one
+    // interval, as as_interval's run-merge does -- without it the clustering sees
+    // per-value cases and picks a jump table where upstream emits a test tree.
     const long long LOW = is_char ? 0 : (LLONG_MIN / 4);
     const long long HIGH = is_char ? 255 : (LLONG_MAX / 4);
     std::vector<SwCase> cases;
     long long firstv = kvs.front().lo, lastv = kvs.back().hi;
     if (LOW < firstv) cases.push_back({LOW, firstv - 1, 0});
     for (size_t i = 0; i < kvs.size(); ++i) {
-      cases.push_back({kvs[i].lo, kvs[i].hi, act_of[i]});
+      if (!cases.empty() && cases.back().act == act_of[i] &&
+          cases.back().hi == kvs[i].lo - 1)
+        cases.back().hi = kvs[i].hi;
+      else
+        cases.push_back({kvs[i].lo, kvs[i].hi, act_of[i]});
       if (i + 1 < kvs.size() && kvs[i + 1].lo > kvs[i].hi + 1)
         cases.push_back({kvs[i].hi + 1, kvs[i + 1].lo - 1, 0});
     }
@@ -14547,16 +14584,48 @@ struct Translator {
     // multi-char match falls through to naive_match's source-order `==` chain,
     // whereas ocamlc's call_switcher emits a SORTED `!=` test sequence -- which is
     // exactly what c_test builds below.  Route multi-char discrete matches here.
-    if (!made_switch && !has_interval && !is_char) return nullptr;
+    // An or-flattened multi-value action (occ >= 2) also stays here: int_cases
+    // cannot reproduce the shared test tree for those.
+    std::vector<int> occ(actions.size(), 0);
+    for (int a : act_of) occ[a]++;
+    bool has_multi = false;
+    for (size_t s = 1; s < occ.size(); ++s) if (occ[s] >= 2) has_multi = true;
+    if (!made_switch && !has_interval && !is_char && !has_multi) return nullptr;
+
+    // Multi-occurrence actions are Shared upstream (StoreExp key-hit):
+    // abstract_shared pre-abstracts each to a bare exit; after the tree is
+    // built, a single surviving leaf inlines (Simplif) and multiple leaves keep
+    // the catch, wrapped outside the default's (fail is store index 0, so its
+    // catch is innermost).  Installed after make_clusters: the ActFns read
+    // `actions` lazily, so the sentinels reach every leaf and table slot.
+    struct ShWrap { int eid; LamPtr body; };
+    std::vector<ShWrap> shs;
+    for (size_t s = 1; s < actions.size(); ++s)
+      if (occ[s] >= 2 && actions[s]) {
+        int e = ++next_exit_;
+        shs.push_back({e, actions[s]});
+        auto ex = mk(Lam::K::Staticraise); ex->prim_arg = e;
+        actions[s] = ex;
+      }
 
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     int nd = count_default_leaves(tree);
-    if (nd == 0) return tree;
-    if (nd == 1) { rewrite_default_leaves(tree, 0, default_body); return tree; }
-    int eid = ++next_exit_;
-    rewrite_default_leaves(tree, eid, nullptr);
-    auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid; cat->then_ = default_body;
-    return cat;
+    if (nd == 1) rewrite_default_leaves(tree, 0, default_body);
+    else if (nd > 1) {
+      int eid = ++next_exit_;
+      rewrite_default_leaves(tree, eid, nullptr);
+      auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid; cat->then_ = default_body;
+      tree = cat;
+    }
+    for (auto& sh : shs) {
+      int uses = count_exit_leaves(tree, sh.eid);
+      if (uses <= 1) inline_exit_leaves(tree, sh.eid, sh.body);
+      else {
+        auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = sh.eid; cat->then_ = sh.body;
+        tree = cat;
+      }
+    }
+    return tree;
   }
   // Collect the constant-constructor tags a pattern matches, flattening
   // or-patterns (`Red | Green`), of a single uniform type.  Returns false on any
@@ -14587,47 +14656,40 @@ struct Translator {
   // ~low:0 ~high:(n-1)); unlike the int path we always emit the c_test tree (there
   // is no int_cases fallback for constructors).
   LamPtr const_ctor_switcher(const LamPtr& scrut, const std::vector<Row>& rows) {
-    if (scrut->k != Lam::K::Var) return nullptr;
+#define CCS_BAIL(why) do { if (cppcaml::dbg_env("CCSDBG")) fprintf(stderr, "[CCS] bail %s\n", why); return nullptr; } while (0)
+    if (scrut->k != Lam::K::Var) CCS_BAIL("nonvar");
     struct KV { int v; const Expression* rhs; };
     std::vector<KV> kvs;
     const Row* dflt = nullptr;
     std::string type;
     for (auto& r : rows) {
-      if (r.guard) return nullptr;
+      if (r.guard) CCS_BAIL("guard");
       const Pattern* p = effective_pat(r.lhs);
       std::vector<int> vals;
       if (ctor_switch_vals(p, type, vals)) {
-        if (dflt) return nullptr;  // a case after the catch-all
+        if (dflt) CCS_BAIL("case-after-catchall");  // a case after the catch-all
         for (int v : vals) kvs.push_back({v, r.rhs});
       } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
         dflt = &r;
-      } else return nullptr;
+      } else CCS_BAIL("row-shape");
     }
-    if (kvs.empty()) return nullptr;
+    if (kvs.empty()) CCS_BAIL("no-kvs");
     auto tc = type_ctors_.find(type);
-    if (tc == type_ctors_.end()) return nullptr;
+    if (tc == type_ctors_.end()) CCS_BAIL("no-type");
     int NC = tc->second.first, NB = tc->second.second;
-    if (NB != 0) return nullptr;  // blocks need the isint split (ctor_match's job)
+    if (NB != 0) CCS_BAIL("blocks");  // blocks need the isint split (ctor_match's job)
     std::sort(kvs.begin(), kvs.end(), [](auto& a, auto& b) { return a.v < b.v; });
     for (size_t i = 1; i < kvs.size(); ++i)
-      if (kvs[i].v == kvs[i - 1].v) return nullptr;  // duplicate tag
+      if (kvs[i].v == kvs[i - 1].v) CCS_BAIL("dup-tag");  // duplicate tag
     bool exhaustive = (int)kvs.size() == NC;
-    if (!dflt && !exhaustive) return nullptr;   // partial without catch-all: not our shape
-    if (dflt && exhaustive) return nullptr;      // redundant catch-all: leave to other paths
+    if (!dflt && !exhaustive) CCS_BAIL("partial-nocatchall");   // partial without catch-all: not our shape
+    if (dflt && exhaustive) CCS_BAIL("redundant-catchall");      // redundant catch-all: leave to other paths
     // A partial match with a catch-all (`Foo -> .. | _ -> ..`) is a small covered
     // set over a larger constant type, which call_switcher lowers to a range test /
-    // `if` guarding the default.  For an EXHAUSTIVE match (no catch-all) accept only
-    // the clean two-cluster shape: the values split into exactly two contiguous runs
-    // of a shared action (`0|1|2 -> A | 3|4 -> B`), which call_switcher lowers to a
-    // SINGLE range test (BGTINT/BLTINT).  Broader multi-cluster exhaustive dispatch
-    // is left to const_switch (ocamlc's shape there differs subtly and churns).
-    if (!dflt) {
-      int runs = 0;
-      for (size_t i = 0; i < kvs.size(); ++i)
-        if (i == 0 || kvs[i].rhs != kvs[i - 1].rhs || kvs[i].v != kvs[i - 1].v + 1)
-          runs++;
-      if (runs != 2) return nullptr;
-    }
+    // `if` guarding the default.  An EXHAUSTIVE match (no catch-all) goes through
+    // the same clustering with no fail intervals; matches whose rows are all
+    // distinct single ctors never reach here (const_switch takes them), so the
+    // intake is or-pattern rows, whose flattened values dedup by rhs below.
 
     // Translate bodies once, in source order (stable stamp normalization); bail if
     // two distinct rows share a body (ocamlc shares behind a catch, unmodelled).
@@ -14646,7 +14708,7 @@ struct Translator {
     for (size_t s = 0; s < by_src.size(); ++s) {
       LamPtr b = expr(*by_src[s]);
       std::string key = make_lam_key(b);
-      for (auto& bk : body_keys) if (bk == key && !key.empty()) return nullptr;  // shared body
+      for (auto& bk : body_keys) if (bk == key && !key.empty()) CCS_BAIL("shared-body");  // shared body
       body_keys.push_back(key);
       actions[s + 1] = b;
     }
@@ -14657,18 +14719,42 @@ struct Translator {
       default_body = expr(*dflt->rhs);
       scope.pop_back();
       std::string dk = make_lam_key(default_body);
-      if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) return nullptr;
+      if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) CCS_BAIL("default-shared");
     }
+
+    // A multi-value action (or-flattened `A | B -> e`) is stored more than once,
+    // which upstream's StoreExp marks Shared: abstract_shared pre-abstracts it to
+    // a bare exit (make_catch_delayed), wrapping the tree in its catch; Simplif
+    // then inlines the handler when only one leaf survives.  Replay that with a
+    // sentinel exit per multi-occurrence action, counted after the tree is built.
+    std::vector<int> occ(actions.size(), 0);
+    for (int a : act_of) occ[a]++;
+    struct ShWrap { int eid; LamPtr body; };
+    std::vector<ShWrap> shs;  // action-index order: later wrap = outer (abstract_shared)
+    for (size_t s = 1; s < actions.size(); ++s)
+      if (occ[s] >= 2 && actions[s]) {
+        int e = ++next_exit_;
+        shs.push_back({e, actions[s]});
+        auto ex = mk(Lam::K::Staticraise); ex->prim_arg = e;
+        actions[s] = ex;
+      }
 
     // Interval cover bounded to the type's range [0, NC-1] (no out-of-range
     // sentinels: the variant value is always in range).  Uncovered tags route to
     // the default (act 0) via gap intervals; an exhaustive match leaves no gaps.
+    // Adjacent values of the same action merge into one interval (as_interval's
+    // i_rec run-merge) -- without it a `A -> x | B|C -> y` exhaustive match
+    // clusters into a jump table instead of upstream's single test.
     const long long LOW = 0, HIGH = NC - 1;
     std::vector<SwCase> cases;
     long long firstv = kvs.front().v, lastv = kvs.back().v;
     if (LOW < firstv) cases.push_back({LOW, firstv - 1, 0});
     for (size_t i = 0; i < kvs.size(); ++i) {
-      cases.push_back({(long long)kvs[i].v, (long long)kvs[i].v, act_of[i]});
+      if (!cases.empty() && cases.back().act == act_of[i] &&
+          cases.back().hi == (long long)kvs[i].v - 1)
+        cases.back().hi = kvs[i].v;
+      else
+        cases.push_back({(long long)kvs[i].v, (long long)kvs[i].v, act_of[i]});
       if (i + 1 < kvs.size() && kvs[i + 1].v > kvs[i].v + 1)
         cases.push_back({(long long)kvs[i].v + 1, (long long)kvs[i + 1].v - 1, 0});
     }
@@ -14682,12 +14768,23 @@ struct Translator {
 
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     int nd = count_default_leaves(tree);
-    if (nd == 0) return tree;
-    if (nd == 1) { rewrite_default_leaves(tree, 0, default_body); return tree; }
-    int eid = ++next_exit_;
-    rewrite_default_leaves(tree, eid, nullptr);
-    auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid; cat->then_ = default_body;
-    return cat;
+    if (nd == 1) rewrite_default_leaves(tree, 0, default_body);
+    else if (nd > 1) {
+      int eid = ++next_exit_;
+      rewrite_default_leaves(tree, eid, nullptr);
+      auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid; cat->then_ = default_body;
+      tree = cat;
+    }
+    for (auto& sh : shs) {
+      int uses = count_exit_leaves(tree, sh.eid);
+      if (uses <= 1) inline_exit_leaves(tree, sh.eid, sh.body);
+      else {
+        auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = sh.eid; cat->then_ = sh.body;
+        tree = cat;
+      }
+    }
+    return tree;
+#undef CCS_BAIL
   }
   // A catch-all `n -> ...` binds n to the scrutinee (which, for a var scrutinee,
   // is just an alias to its binder).
