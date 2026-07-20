@@ -848,13 +848,6 @@ struct Translator {
   // handlers re-read their argument expressions; only or-bound vars ride the
   // exit).
   std::unordered_map<int, LamPtr> gm_facc_proto_;
-  // Set only around gmatch_tuple_top's wire_garms: in a top-level tuple match the
-  // shared arm handler that wire_garms wraps around the whole match body coincides
-  // with ocamlc's placement, so eliding an ambient `as`-alias there is safe.  The
-  // general gmatch_top path can localize a shared catch tighter (e.g. inside a
-  // list `[]`/cons emptiness test), where wrapping the whole body would misplace
-  // it -- so the alias elision is restricted to this context for now.
-  bool gm_alias_ctx_ = false;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -11814,6 +11807,54 @@ struct Translator {
     for (auto& sc : l->sw_blocks) if (stamp_bound_in(sc.body, stamp)) return true;
     return false;
   }
+  // The slot at which to scope a shared static-catch for exit `aid`, tighter
+  // than the body root.  matching.ml scopes a shared catch around exactly the
+  // sub-matrix that references it, NOT the whole match; a matcher's exits are in
+  // tail position, so a tighter catch yields the same value while matching
+  // ocamlc's placement.  A full lowest-common-ancestor descent is NOT ocamlc's
+  // rule (it diverges in both directions post-Simplif), so this descends only
+  // through the control-flow shapes ocamlc's scoping actually follows.
+  LamPtr* lca_exit_slot(LamPtr* slot, int aid, bool thru_catch) {
+    // Descend ONLY through `if` arms (into the single then/else branch that
+    // holds every exit), stopping at a switch, catch, let or leaf.  A body-root
+    // catch that wraps an `if C (..exits..) other` wrongly extends over the
+    // exit-free `other` branch (e.g. bytegen's list `[]`->0 arm), costing a
+    // stack slot; ocamlc scopes it inside the branch.  It does NOT descend past
+    // a switch (whose cases hold the exits -- the switch itself is the tightest
+    // scope) or a sibling catch (descending there reorders the catch nesting,
+    // which diverges from ocamlc -- e.g. types' tag11/tag12 shared arm).
+    auto has = [&](LamPtr& cs) { int bad = 0; return cs && count_exit(cs, aid, false, bad) > 0; };
+    for (;;) {
+      Lam* l = slot->get();
+      if (l && l->k == Lam::K::IfThenElse) {
+        bool inThen = has(l->then_), inElse = has(l->else_);
+        // the condition must not itself contain an exit (it does not, for a
+        // matcher's tests) and exactly one arm must hold them all.
+        if (has(l->cond) || (inThen == inElse)) return slot;
+        slot = inThen ? &l->then_ : &l->else_; continue;
+      }
+      // For an identity arm (`as x -> x`) ocamlc scopes the catch fully tight,
+      // also inside a wrapping catch (for a DIFFERENT id) whose exits live only
+      // in its protected body -- around the switch that holds them.  For a
+      // non-identity arm, descending past such a catch reorders the catch
+      // nesting away from ocamlc (types' tag-shared arm), so stop here.
+      if (thru_catch && l && l->k == Lam::K::Catch && l->prim_arg != aid &&
+          has(l->cond) && !has(l->then_)) { slot = &l->cond; continue; }
+      return slot;
+    }
+  }
+  // Whether an arm's rhs is a bare local identifier `nm`, i.e. an identity arm
+  // `.. as nm -> nm` returning the aliased scrutinee unchanged.  ocamlc keeps
+  // such a value live on the stack (a PUSHACC of the scrutinee) rather than
+  // eliding the alias to a re-read, so dropping the param there diverges by a
+  // stack slot; leave those arms with the passed catch param.
+  static bool rhs_is_bare_ident(const Expression* e, const std::string& nm) {
+    if (!e) return false;
+    if (auto* id = std::get_if<Pexp_ident>(&e->desc))
+      if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+        return l->name == nm;
+    return false;
+  }
   // After gmatch produces `body` (whose leaves exit to each arm), compile each
   // reachable handler ONCE and wire it in: inline single-use handlers (simplif
   // then drops the `let cv = Lvar id` -> byte-identical to inline-at-leaf), keep a
@@ -11859,7 +11900,7 @@ struct Translator {
           // the body (a per-alternative field/param) must stay an exit arg --
           // dropping it there both breaks scope and over-diverges from ocamlc,
           // which only elides an `as`-alias of an already-available value.
-          if (!reread[k] && gm_alias_ctx_ && a.alias_names.count(a.vnames[k]) &&
+          if (!reread[k] && a.alias_names.count(a.vnames[k]) &&
               !stamp_bound_in(body, same->stamp))
             alias[k] = *same;
         }
@@ -11904,9 +11945,18 @@ struct Translator {
         std::vector<Ident> cvs; std::vector<ValueKind> cks;
         for (size_t k = 0; k < a.cvars.size(); ++k)
           if (!dropped(k)) { cvs.push_back(a.cvars[k]); cks.push_back(a.kinds[k]); }
-        auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = a.aid;
+        // When an ambient `as`-alias was elided, the handler references a
+        // scrutinee var directly; ocamlc scopes such a shared catch to the LCA
+        // of the exit sites, not the body root (e.g. inside a list emptiness
+        // `if`).  For a plain shared arm keep the body-root placement.
+        bool has_alias = false; bool ident_arm = false;
+        for (size_t k = 0; k < alias.size(); ++k)
+          if (alias[k]) { has_alias = true;
+            if (rhs_is_bare_ident(a.rhs, a.vnames[k])) ident_arm = true; }
+        LamPtr* slot = has_alias ? lca_exit_slot(&body, a.aid, ident_arm) : &body;
+        auto c = mk(Lam::K::Catch); c->cond = *slot; c->prim_arg = a.aid;
         c->catch_vars = std::move(cvs); c->catch_var_kinds = std::move(cks); c->then_ = handler;
-        body = c;
+        *slot = c;
       }
     }
   }
@@ -13874,9 +13924,7 @@ struct Translator {
       dcatch = mk(Lam::K::Catch); dcatch->cond = body; dcatch->prim_arg = deid;
       body = dcatch;
     }
-    gm_alias_ctx_ = true;
     wire_garms(body, arms);
-    gm_alias_ctx_ = false;
     share_switches_rec(body);
     LamPtr dbody;
     if (catchall) {
