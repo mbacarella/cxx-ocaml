@@ -848,6 +848,13 @@ struct Translator {
   // handlers re-read their argument expressions; only or-bound vars ride the
   // exit).
   std::unordered_map<int, LamPtr> gm_facc_proto_;
+  // Set only around gmatch_tuple_top's wire_garms: in a top-level tuple match the
+  // shared arm handler that wire_garms wraps around the whole match body coincides
+  // with ocamlc's placement, so eliding an ambient `as`-alias there is safe.  The
+  // general gmatch_top path can localize a shared catch tighter (e.g. inside a
+  // list `[]`/cons emptiness test), where wrapping the whole body would misplace
+  // it -- so the alias elision is restricted to this context for now.
+  bool gm_alias_ctx_ = false;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -10549,6 +10556,34 @@ struct Translator {
     // any/constant/interval/array/variant/lazy: gmatch bails on these as columns,
     // so no leaf ever binds through them -- nothing to collect here.
   }
+  // Names bound by an actual `as`-pattern (Ppat_alias) within `p`.  Only such a
+  // binding is a candidate for ocamlc's alias elision (an `as x` of an
+  // already-available value is referenced directly, never threaded through the
+  // shared handler's exit).  A plain var arm (`.. -> cont`) is NOT elided this
+  // way -- it just names the scrutinee -- so keep those out.
+  void collect_alias_names(const Pattern* p, std::set<std::string>& out) {
+    for (;;) {
+      if (auto* c = std::get_if<Ppat_constraint>(&p->desc)) { p = c->p.get(); continue; }
+      if (auto* o = std::get_if<Ppat_open>(&p->desc)) { p = o->p.get(); continue; }
+      break;
+    }
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+      out.insert(pa->name.txt); collect_alias_names(pa->p.get(), out); return;
+    }
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
+      if (k->arg) collect_alias_names(k->arg->get(), out); return;
+    }
+    if (auto* t = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (auto& e : t->elems) collect_alias_names(e.get(), out); return;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+      collect_alias_names(o->l.get(), out); collect_alias_names(o->r.get(), out); return;
+    }
+    if (auto* r = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [lbl, sub] : r->fields) collect_alias_names(sub.get(), out);
+      return;
+    }
+  }
   // ===== general matrix matcher (matching.ml decomposition) ====================
   // Dispatch column 0 by head constructor via a dense Switch*/if, EXPANDING each
   // matched block constructor's fields into new leading columns, and recursing on
@@ -11696,7 +11731,8 @@ struct Translator {
   // bound-variable names in canonical order; `cvars`/`kinds` the handler's catch
   // parameters that a leaf's `(exit aid <values>)` supplies in that same order.
   struct GArm { int aid; const Expression* rhs; std::vector<std::string> vnames;
-                std::vector<Ident> cvars; std::vector<ValueKind> kinds; };
+                std::vector<Ident> cvars; std::vector<ValueKind> kinds;
+                std::set<std::string> alias_names; };
   // The gmatch decision-node budget (env-overridable for calibration).
   int gm_budget() {
     static int b = [] {
@@ -11718,6 +11754,7 @@ struct Translator {
   GArm setup_garm(const Pattern* full, const Expression* rhs) {
     GArm a; a.rhs = rhs;
     collect_gvars(full, a.vnames);
+    collect_alias_names(full, a.alias_names);
     a.aid = ++next_exit_;
     for (size_t k = 0; k < a.vnames.size(); ++k) {
       // Catch params carry the arm's user names (upstream's or-pattern handler
@@ -11758,6 +11795,25 @@ struct Translator {
     for (auto& sc : l->sw_consts) collect_exit_sites(sc.body, aid, out);
     for (auto& sc : l->sw_blocks) collect_exit_sites(sc.body, aid, out);
   }
+  // Whether `stamp` is introduced by any binder (let / function param / catch
+  // param) within `l`.  A var free in the whole match body is ambient (bound by
+  // an enclosing let -- the scrutinee temps, added around the match AFTER
+  // wiring), so it is in scope at every handler; one bound inside is not.
+  static bool stamp_bound_in(const LamPtr& l, int stamp) {
+    if (!l) return false;
+    for (auto& b : l->bindings) if (b.id.stamp == stamp) return true;
+    for (auto& [id, k] : l->params) if (id.stamp == stamp) return true;
+    for (auto& cv : l->catch_vars) if (cv.stamp == stamp) return true;
+    if (stamp_bound_in(l->fn, stamp) || stamp_bound_in(l->body, stamp) ||
+        stamp_bound_in(l->cond, stamp) || stamp_bound_in(l->then_, stamp) ||
+        stamp_bound_in(l->else_, stamp) || stamp_bound_in(l->sw_default, stamp))
+      return true;
+    for (auto& a : l->args) if (stamp_bound_in(a, stamp)) return true;
+    for (auto& b : l->bindings) if (stamp_bound_in(b.val, stamp)) return true;
+    for (auto& sc : l->sw_consts) if (stamp_bound_in(sc.body, stamp)) return true;
+    for (auto& sc : l->sw_blocks) if (stamp_bound_in(sc.body, stamp)) return true;
+    return false;
+  }
   // After gmatch produces `body` (whose leaves exit to each arm), compile each
   // reachable handler ONCE and wire it in: inline single-use handlers (simplif
   // then drops the `let cv = Lvar id` -> byte-identical to inline-at-leaf), keep a
@@ -11774,7 +11830,16 @@ struct Translator {
       if (uses == 0) continue;                       // arm unreachable (dead row)
       bool shared = !(uses == 1 && bad == 0);
       // reread[k]: non-null -> param k dropped, handler re-reads this chain.
+      // alias[k]:  set     -> param k dropped, it aliases an ambient variable
+      //   (a scrutinee component / temp bound by the enclosing Let, in scope at
+      //   the handler) that every exit site passes -- the handler references it
+      //   directly, exactly like ocamlc's Alias for an `as x` binding of an
+      //   already-available value (`current` bound to the tuple temp `*match*`).
       std::vector<LamPtr> reread(a.vnames.size());
+      std::vector<std::optional<Ident>> alias(a.vnames.size());
+      auto dropped = [&](size_t k) {
+        return (k < reread.size() && reread[k]) || (k < alias.size() && alias[k]);
+      };
       if (shared) {
         std::vector<Lam*> sites;
         collect_exit_sites(body, a.aid, sites);
@@ -11786,13 +11851,23 @@ struct Translator {
             if (!same) same = &id;
             else if (same->stamp != id.stamp || same->name != id.name) { ok = false; break; }
           }
-          if (ok) reread[k] = expand_facc_var(*same);
+          if (!ok) continue;
+          reread[k] = expand_facc_var(*same);        // materialized field chain
+          // Else an alias to a plain variable: only reference it directly in the
+          // handler when it is AMBIENT (free in the whole match body, hence bound
+          // by an enclosing let and in scope at the handler).  A var bound inside
+          // the body (a per-alternative field/param) must stay an exit arg --
+          // dropping it there both breaks scope and over-diverges from ocamlc,
+          // which only elides an `as`-alias of an already-available value.
+          if (!reread[k] && gm_alias_ctx_ && a.alias_names.count(a.vnames[k]) &&
+              !stamp_bound_in(body, same->stamp))
+            alias[k] = *same;
         }
-        if ([&] { for (auto& r : reread) if (r) return true; return false; }()) {
+        if ([&] { for (size_t k = 0; k < a.vnames.size(); ++k) if (dropped(k)) return true; return false; }()) {
           for (Lam* s : sites) {
             std::vector<LamPtr> na;
             for (size_t k = 0; k < s->args.size(); ++k)
-              if (k >= reread.size() || !reread[k]) na.push_back(s->args[k]);
+              if (!dropped(k)) na.push_back(s->args[k]);
             s->args = std::move(na);
           }
         }
@@ -11804,6 +11879,8 @@ struct Translator {
           Ident hv = fresh(a.vnames[k], false);
           scope.back()[a.vnames[k]] = hv;
           rebinds.push_back({hv, reread[k]});
+        } else if (alias[k]) {
+          scope.back()[a.vnames[k]] = *alias[k];       // reference the ambient var
         } else
           scope.back()[a.vnames[k]] = a.cvars[k];
       }
@@ -11826,7 +11903,7 @@ struct Translator {
       else {
         std::vector<Ident> cvs; std::vector<ValueKind> cks;
         for (size_t k = 0; k < a.cvars.size(); ++k)
-          if (k >= reread.size() || !reread[k]) { cvs.push_back(a.cvars[k]); cks.push_back(a.kinds[k]); }
+          if (!dropped(k)) { cvs.push_back(a.cvars[k]); cks.push_back(a.kinds[k]); }
         auto c = mk(Lam::K::Catch); c->cond = body; c->prim_arg = a.aid;
         c->catch_vars = std::move(cvs); c->catch_var_kinds = std::move(cks); c->then_ = handler;
         body = c;
@@ -13797,7 +13874,9 @@ struct Translator {
       dcatch = mk(Lam::K::Catch); dcatch->cond = body; dcatch->prim_arg = deid;
       body = dcatch;
     }
+    gm_alias_ctx_ = true;
     wire_garms(body, arms);
+    gm_alias_ctx_ = false;
     share_switches_rec(body);
     LamPtr dbody;
     if (catchall) {
