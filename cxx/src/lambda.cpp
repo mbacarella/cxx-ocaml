@@ -10978,6 +10978,20 @@ struct Translator {
         if (e != r.cols[0]) { r.cols[0] = e; continue; }
         break;
       }
+    // A column 0 or-pattern that covers EVERY constructor of its type while
+    // binding nothing (`For_execution | For_checking`) matches exactly the same
+    // set of values as `_`; ocamlc treats it as a wildcard (no test, the row's
+    // action emitted once).  Expanding it below would instead split the row into
+    // one sub-row per alternative -- both sharing the one action behind a
+    // redundant static catch -- so rewrite it to `_` first.  Any `as x` alias was
+    // already peeled into r.binds above, so this leaves the binding intact.
+    {
+      static const Pattern gm_any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
+      for (auto& r : rows)
+        if (std::get_if<Ppat_or>(&r.cols[0]->desc) &&
+            exhaustive_irref_col(r.cols[0], /*need_cover=*/true))
+          r.cols[0] = &gm_any_pat;
+    }
     // Expand an or-pattern in column 0 into separate rows (order preserved).
     for (auto& r : rows)
       if (std::get_if<Ppat_or>(&r.cols[0]->desc)) {
