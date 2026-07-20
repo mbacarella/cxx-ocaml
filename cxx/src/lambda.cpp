@@ -11182,7 +11182,50 @@ struct Translator {
         for (int j = (int)nc - 1; j >= 0; --j) {
           if (!col_mut[j]) continue;
           LamPtr fread = field_read(&ofi[j], comps[0]);
-          if (max_path_count_var(cb, fids[j]) <= 1) subst_alias(cb, fids[j], fread);
+          // A MUTABLE field read that serves as a DISCRIMINANT (tested against a
+          // constant/constructor in some row) is bound StrictOpt (`=o`, Gen kind) and
+          // kept even when used ONCE: ocamlc reads the discriminant before an arm can
+          // setfield it and never inlines a mutable read past that mutation (mirrors
+          // wrap_binders' mutable-binder rule).  Without this get_docstring's
+          // discriminant `field_int 2 ds` (mutable ds_attached, tested `= Info`)
+          // inlined into its lone `!=` test.  When the column is only ever bound to a
+          // plain variable (`{ty = ty}`), it is NOT a discriminant -- ocamlc binds the
+          // user name directly (`ty = field_mut`), so keep the original alias/inline
+          // path there (else typecore's `ty` binding churns to an anon `*match*`).
+          bool discriminated = false;
+          for (size_t ri = 0; ri < rows.size() && !discriminated; ++ri) {
+            auto it = rowmap[ri].find(order[j]);
+            if (it != rowmap[ri].end() &&
+                !std::get_if<Ppat_var>(&it->second->desc) &&
+                !std::holds_alternative<Ppat_any>(it->second->desc))
+              discriminated = true;
+          }
+          // A field feeding a DIRECT boolean `if`/`switch` condition (`if fld ..`) is
+          // read inline by ocamlc -- a 2-value type compiles to `Lifthenelse(arg,..)`
+          // with no bind, unlike a 3+-value type's `(if (!= arg k) ..)` switcher which
+          // ocamlc DOES bind to a var.  Only the latter keeps the `=o`; the former (a
+          // bool discriminant) stays inline (matching.ml's `if (field_mut 0 m) ..`).
+          int tgt = fids[j].stamp;
+          std::function<bool(const LamPtr&)> direct_cond = [&](const LamPtr& l) -> bool {
+            if (!l) return false;
+            if ((l->k == Lam::K::IfThenElse || l->k == Lam::K::Switch) && l->cond &&
+                l->cond->k == Lam::K::Var && l->cond->var.stamp == tgt)
+              return true;
+            if (direct_cond(l->fn) || direct_cond(l->body) || direct_cond(l->cond) ||
+                direct_cond(l->then_) || direct_cond(l->else_) || direct_cond(l->sw_default))
+              return true;
+            for (auto& a : l->args) if (direct_cond(a)) return true;
+            for (auto& b : l->bindings) if (direct_cond(b.val)) return true;
+            for (auto& sc : l->sw_consts) if (direct_cond(sc.body)) return true;
+            for (auto& sc : l->sw_blocks) if (direct_cond(sc.body)) return true;
+            return false;
+          };
+          int uses = max_path_count_var(cb, fids[j]);
+          if (discriminated && uses >= 1 && !direct_cond(cb)) {
+            auto l = mk(Lam::K::Let);
+            l->bindings = {{fids[j], ValueKind::Gen, fread, false, false, /*strict_opt=*/true}};
+            l->body = cb; cb = l;
+          } else if (uses <= 1) subst_alias(cb, fids[j], fread);
           else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ofi[j].kind, fread, true}}; l->body = cb; cb = l; }
         }
         return cb;
