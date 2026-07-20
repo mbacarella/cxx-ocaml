@@ -716,26 +716,31 @@ struct Bytegen {
         // assigned by the raise site (nvars==1 passes the value in the accu).
         auto [branch1, cont1] = make_branch(cont);
         int nvars = (int)exp->catch_vars.size();
-        int lbl = new_label();
-        if (nvars == 0) {
-          static_lbl_[exp->prim_arg] = sz_lbl{lbl, sz, try_blocks_.size()};
-          Code hcode = cons(Iop(Op::Label, lbl), comp_expr(env, exp->then_, sz, cont1));
-          return comp_expr(env, exp->cond, sz, cons(branch1, hcode));
-        }
         if (nvars == 1) {
-          static_lbl_[exp->prim_arg] = sz_lbl{lbl, sz, try_blocks_.size()};
+          // small optimization for nvars = 1: the value arrives in the accu, so
+          // the handler code leads with Kpush and label_code always mints a fresh
+          // label -- identical to a manual new_label here.
           Env henv = add_var(exp->catch_vars[0], sz + 1, env);
-          Code hcode = cons(Iop(Op::Label, lbl), cons(I(Op::Push),
+          auto [lbl_handler, cont2] = label_code(cons(I(Op::Push),
               comp_expr(henv, exp->then_, sz + 1, add_pop(1, cont1))));
-          return comp_expr(env, exp->cond, sz, cons(branch1, hcode));
+          static_lbl_[exp->prim_arg] = sz_lbl{lbl_handler, sz, try_blocks_.size()};
+          return comp_expr(env, exp->cond, sz, cons(branch1, cont2));
         }
-        static_lbl_[exp->prim_arg] = sz_lbl{lbl, sz + nvars, try_blocks_.size()};
+        // General case (nvars == 0 or >= 2).  Mirror bytegen's label_code: a
+        // handler whose compiled code already begins with a branch or label must
+        // REUSE that as its handler label rather than getting a fresh Klabel
+        // prepended.  A redundant leading Klabel would stop discard_dead_code at
+        // the label and leave the now-dead join branch1 undiscarded -- e.g. the
+        // shared "greater-than" handler tail of Path.compare, whose body ends in a
+        // tail call and whose handler is itself an (exit M): ocamlc reuses M and
+        // drops the branch, we were emitting a stray Kbranch to the join.
         Env henv = env;
         for (int i = 0; i < nvars; ++i) henv = add_var(exp->catch_vars[i], sz + 1 + i, henv);
-        Code hcode = cons(Iop(Op::Label, lbl),
+        auto [lbl_handler, cont2] = label_code(
             comp_expr(henv, exp->then_, sz + nvars, add_pop(nvars, cont1)));
+        static_lbl_[exp->prim_arg] = sz_lbl{lbl_handler, sz + nvars, try_blocks_.size()};
         Code body = comp_expr(env, exp->cond, sz + nvars,
-                              add_pop(nvars, cons(branch1, hcode)));
+                              add_pop(nvars, cons(branch1, cont2)));
         for (int i = 0; i < nvars; ++i) {  // push_dummies
           auto z = lambda::lam_alloc(); z->k = K::ConstInt; z->int_val = 0;
           Instr c = I(Op::Const); c.cst = z;
