@@ -17198,9 +17198,29 @@ struct Translator {
     }
     if (auto* ar = std::get_if<Pexp_array>(&e.desc)) {  // [| ... |] -> makearray[k]
       std::string k = ar->elems.empty() ? array_arg_kind(&e) : array_elem_kind(ar->elems[0].get());
+      std::vector<LamPtr> elems; elems.reserve(ar->elems.size());
+      for (auto& el : ar->elems) elems.push_back(expr(*el));
+      // Constant-array lifting (translcore.ml Texp_array): a MUTABLE array
+      // literal whose elements are all constant and whose length exceeds
+      // use_dup_for_constant_mutable_arrays_bigger_than (= 4) is emitted as a
+      // shared structured constant duplicated at run time (Pduparray ->
+      // caml_obj_dup), not built element-by-element with makeblock.  Only the
+      // addr/int element kinds lift to a Const_block(0, ...); float uses
+      // Const_float_array and gen stays dynamic (Pgenarray -> Not_constant),
+      // so both of those keep the runtime makearray path.
+      if ((k == "addr" || k == "int") && elems.size() > 4) {
+        bool allc = true;
+        for (auto& l : elems) if (!is_const(l)) { allc = false; break; }
+        if (allc) {
+          auto cb = mk(Lam::K::ConstBlock); cb->prim_arg = 0; cb->args = std::move(elems);
+          auto dup = mk(Lam::K::Prim); dup->prim = Prim::Ccall;
+          dup->prim_id = "caml_obj_dup"; dup->args = {cb};
+          return dup;
+        }
+      }
       auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
       m->prim_id = "makearray[" + k + "]";
-      for (auto& el : ar->elems) m->args.push_back(expr(*el));
+      m->args = std::move(elems);
       return m;
     }
     if (auto* fe = std::get_if<Pexp_field>(&e.desc)) {
