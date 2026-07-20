@@ -9847,7 +9847,7 @@ struct Translator {
   }
   LamPtr build_ctor_group_arm(const LamPtr& scrut, const CtorInfo& ci,
                               const std::vector<const Row*>& rs, const Location& mloc,
-                              const LamPtr& dflt) {
+                              const LamPtr& dflt, bool arg_total = false) {
     if (rs.size() == 1) {
       auto* k = std::get_if<Ppat_construct>(&rs[0]->lhs->desc);
       const Expression* g = rs[0]->guard;  // a `when` on this single row -> if/dflt
@@ -9887,7 +9887,7 @@ struct Translator {
       // Some-case raised instead of taking the `_ -> d` arm).
       if (dflt && !sub_rows_total(sub)) return nullptr;
       FieldInfo fi{ci.type, col, ci.rfmut[col], ci.rshape[col]};
-      return compile_match(field_read(&fi, scrut), sub, mloc);
+      return compile_match(field_read(&fi, scrut), sub, mloc, arg_total);
     }
     // Multi-field group (arity >= 2) with several rows: rather than bail to the
     // caml_obj_tag if-chain, decompose the constructor's fields into a column
@@ -9935,7 +9935,7 @@ struct Translator {
       sub.push_back({ip, r->rhs, r->guard});
     }
     // With a variable sub-pattern, compile_match binds the field to that user name.
-    if (has_var) return compile_match(field0, sub, mloc);
+    if (has_var) return compile_match(field0, sub, mloc, arg_total);
     // Same shared-default rule as the paths above: compile_match would fill a
     // failing sub-match with Match_failure, not the active catch-all default.
     if (dflt && !sub_rows_total(sub)) return nullptr;
@@ -9943,7 +9943,7 @@ struct Translator {
     // used more than once, inlined if not (as ocamlc's matcher does).
     Ident tv = fresh("", true);
     auto tvar = mk(Lam::K::Var); tvar->var = tv;
-    LamPtr body = compile_match(tvar, sub, mloc);
+    LamPtr body = compile_match(tvar, sub, mloc, arg_total);
     if (count_var(body, tv) <= 1) { subst_alias(body, tv, field0); return body; }
     auto l = mk(Lam::K::Let); l->bindings = {{tv, ValueKind::Gen, field0, true}}; l->body = body;
     return l;
@@ -9992,7 +9992,7 @@ struct Translator {
            is_predef_exn_name(cn);
   }
   LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc,
-                    const LamPtr& dflt = nullptr) {
+                    const LamPtr& dflt = nullptr, bool total = false) {
     if (rows.empty()) return nullptr;
     // Peel top-level `pat as x` aliases: x binds to the scrutinee value over its
     // own row (the scrutinee must be a named var; simplif inlines the alias).
@@ -10090,8 +10090,14 @@ struct Translator {
       if (rs.size() > 1)
         for (auto* r : rs)
           if (!ralias[(size_t)(r - prows.data())].empty()) return nullptr;
+      // When the whole match is total and this ctor partition is exhaustive with no
+      // shared default, no value escapes to a Match_failure fill, so each present
+      // constructor's argument sub-match is itself total (ocamlc's matrix
+      // specialization preserves totality): thread that down so a nested
+      // poly-variant sub-match can use the pure isint split instead of hash tests.
+      bool arg_total = total && exhaustive && !dflt;
       LamPtr body = with_alias(rs[0], [&] {
-        return build_ctor_group_arm(scrut, ci, rs, mloc, dflt);
+        return build_ctor_group_arm(scrut, ci, rs, mloc, dflt, arg_total);
       });
       if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
       bmap[tag] = body;
@@ -14334,6 +14340,7 @@ struct Translator {
     }
     if (auto pm = pv_const_match(scrut, rows)) return pm;
     if (auto pt = pvtype_match(scrut, rows)) return pt;
+    if (total) if (auto pv = pv_mixed_match(scrut, rows, mloc)) return pv;
     // A single `#poly`-type row is exhaustive by typing, hence irrefutable: just
     // bind the `as` alias and run the body, no tag test (matches ocamlc, which
     // emits only the scrutinee evaluation).
@@ -14365,7 +14372,7 @@ struct Translator {
     if (auto sw = const_switch(scrut, rows)) return sw;
     if (auto ds = switcher_match(scrut, rows)) return ds;
     if (auto cs = const_ctor_switcher(scrut, rows)) return cs;
-    if (auto cm = ctor_match(scrut, rows, mloc)) return cm;
+    if (auto cm = ctor_match(scrut, rows, mloc, nullptr, total)) return cm;
     if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
@@ -14474,6 +14481,55 @@ struct Translator {
     for (int i = (int)kvs.size() - 1; i >= 0; --i)
       c = iff(cmp("==", kvs[i].h), expr(*kvs[i].rhs), c);
     return c;
+  }
+
+  // TOTAL polymorphic-variant match with exactly one CONSTANT tag and one BLOCK
+  // (arity-1) tag: ocamlc's combine_variant lowers this to a pure isint split --
+  // an immediate value must be the sole constant tag, a block must be the sole
+  // block tag, so no hash-tag comparison and no Match_failure is emitted.  Only
+  // valid when the match is total (caller gates on it): a partial match keeps the
+  // hash tests (its default arm), which the fall-through matchers still supply.
+  LamPtr pv_mixed_match(const LamPtr& scrut, const std::vector<Row>& rows,
+                        const Location& mloc) {
+    if (scrut->k != Lam::K::Var) return nullptr;
+    const Row* cst = nullptr;      // the constant-tag arm
+    const Row* blk = nullptr;      // the block-tag arm
+    const Pattern* blkarg = nullptr;
+    for (auto& r : rows) {
+      if (r.guard) return nullptr;
+      const Pattern* p = effective_pat(r.lhs);
+      auto* pv = std::get_if<Ppat_variant>(&p->desc);
+      if (!pv) return nullptr;     // a catch-all/other arm: not the pure isint shape
+      if (pv->arg) {
+        if (blk) return nullptr;   // >1 block tag: needs a tag switch, not isint
+        blk = &r; blkarg = effective_pat(pv->arg->get());
+      } else {
+        if (cst) return nullptr;   // >1 constant tag: needs a tag switch
+        cst = &r;
+      }
+    }
+    if (!cst || !blk) return nullptr;
+    // constant arm: run its body directly (an immediate carries no payload)
+    LamPtr cbody = expr(*cst->rhs);
+    // block arm: the poly-variant block is [hash; arg], so its argument is at
+    // field 1; sub-match the arg pattern against that read (total -- it is the
+    // only block tag of an exhaustive match).
+    LamPtr arg = fieldimm(1, scrut);
+    Ident tv = fresh("", true);
+    auto tvar = mk(Lam::K::Var); tvar->var = tv;
+    std::vector<Row> sub = {{blkarg, blk->rhs, blk->guard}};
+    LamPtr bbody = compile_match(tvar, sub, mloc, true);
+    if (count_var(bbody, tv) <= 1) subst_alias(bbody, tv, arg);
+    else {
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{tv, ValueKind::Gen, arg, true}};
+      l->body = bbody; bbody = l;
+    }
+    auto isi = mk(Lam::K::Prim); isi->prim = Prim::IntCmp; isi->prim_id = "isint";
+    isi->args = {scrut};
+    auto i = mk(Lam::K::IfThenElse);
+    i->cond = isi; i->then_ = cbody; i->else_ = bbody;
+    return i;
   }
 
   // Match over polymorphic-variant *type* patterns (`#lambda as x -> ..`): each
