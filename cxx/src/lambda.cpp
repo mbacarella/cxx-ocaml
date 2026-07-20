@@ -11365,6 +11365,47 @@ struct Translator {
         return bl;
       }
     }
+    // matching.ml's split_and_precompile: a LEADING GUARDED catch-all row in column
+    // 0 (a var/any whose `when` can fail) is a barrier -- the rows AFTER it are
+    // reached only on its guard failure, so they must not be spread into the
+    // constructor arms below as a shared default (const_body/block_body copy every
+    // var row into every arm, which would test the guard once per arm -- e.g.
+    // printlambda's `block_shape`, `Some l when List.for_all ..` between `Some
+    // [elt]` and `Some (h::t)`, after Some/cons dispatch reaches the tail sub-matrix
+    // `_ when g -> .. | [] -> .. | _ -> ..`).  Split at the guard: compile the
+    // leading rows[0..k] with a fresh exit as their fall-through (the guard's
+    // failure), and rows[k+1..] as that exit's handler (inlined when single-use,
+    // giving ocamlc's inline guard-false continuation).
+    //   Only when the guarded catch-all is LEADING (every earlier row is also a
+    // column-0 catch-all): a constructor row before it would make group A test that
+    // constructor and group B redundantly re-test it (the list-level split re-emits
+    // `if l` + a dead Match_failure).  A leading catch-all does no column-0 test, so
+    // the handler's dispatch is not a repeat.
+    //   And only for a SINGLE column: with more columns, group A's leading catch-all
+    // still leaves the OTHER columns to test, and group B -- compiled fresh -- repeats
+    // that test (emitcode's 2-column peephole matrix `(_, X) when g` blew up 8x this
+    // way).  A single column means group A is a pure guard with no dispatch, so group
+    // B's continuation is not a repeat.  Empty default env only (the chunked-default
+    // threading routes misses through its own env stack).
+    if (denv.empty() && comps.size() == 1)
+      for (size_t k = 0; k + 1 < rows.size(); ++k) {
+        auto& d = rows[k].cols[0]->desc;
+        bool catchall = std::get_if<Ppat_var>(&d) || std::holds_alternative<Ppat_any>(d);
+        if (!catchall) break;             // a constructor must dispatch first
+        if (!rows[k].guard) break;        // an unguarded catch-all is the total default
+        int e = ++next_exit_;
+        std::vector<MRow> A(rows.begin(), rows.begin() + k + 1);
+        std::vector<MRow> B(rows.begin() + k + 1, rows.end());
+        std::vector<LamPtr> ca = comps, cb = comps;
+        LamPtr bodyA = gmatch(std::move(ca), std::move(A), mloc, e);
+        LamPtr bodyB = bodyA ? gmatch(std::move(cb), std::move(B), mloc, deid) : nullptr;
+        if (!bodyA || !bodyB) { --next_exit_; break; }  // fall through to spread path
+        int bad = 0; int uses = count_exit(bodyA, e, false, bad);
+        if (uses == 0) { --next_exit_; return bodyA; }
+        if (uses == 1 && bad == 0) { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+        auto c = mk(Lam::K::Catch); c->cond = bodyA; c->prim_arg = e; c->then_ = bodyB;
+        return c;
+      }
     // Only var/any and (non-exn, non-inline, non-unboxed) constructor columns.
     bool anyctor = false;
     for (auto& r : rows) {
