@@ -8155,7 +8155,22 @@ struct Translator {
     for (auto& sc : l->sw_consts) { chk(sc.body); if (!allsame) return; }
     for (auto& sc : l->sw_blocks) { chk(sc.body); if (!allsame) return; }
     if (k0.empty()) return;
-    l = !l->sw_blocks.empty() ? l->sw_blocks[0].body : l->sw_consts[0].body;
+    const LamPtr& common = !l->sw_blocks.empty() ? l->sw_blocks[0].body
+                                                 : l->sw_consts[0].body;
+    // ocamlc collapses an all-identical switch only when it was combined with no
+    // failaction (matching.ml combine_regular_constructor `None, Some act -> act`),
+    // i.e. when the switch is exhaustive over its type.  A switch that covers only a
+    // strict subset of the type's constructors was combined WITH a failaction (later
+    // dropped once the residual proved unreachable), so ocamlc keeps its Lswitch even
+    // when every present arm is identical -- e.g. the shared-handler tail of a nested
+    // tuple compare (`Path.compare`).  Only collapse when we know the switch is
+    // exhaustive; a known-partial switch is left as-is.
+    bool partial = (l->sw_numconsts >= 0 &&
+                    (int)l->sw_consts.size() < l->sw_numconsts) ||
+                   (l->sw_numblocks >= 0 &&
+                    (int)l->sw_blocks.size() < l->sw_numblocks);
+    if (partial) return;
+    l = common;
   }
   // Lower an exhaustive two-constant switch (tags 0 and 1, no blocks, no default)
   // to a truthy `if`.  ocamlc's Switcher always emits a single test (BRANCHIFNOT),
