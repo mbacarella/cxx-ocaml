@@ -10906,6 +10906,22 @@ struct Translator {
       if (n == 1) { subst_alias(r, v, clone_facc(proto)); return r; }
       return lower_bind(v, proto->gm_facc_kind, clone_facc(proto), r);
     }
+    // A leading UNGUARDED all-wildcard row matches every value, so the rows after
+    // it are dead.  ocamlc drops them and emits that row's action with no column
+    // test.  Our column dispatch (const_body/block_body) would instead spread the
+    // dead rows back into each constructor arm and re-test a column pointlessly:
+    // signature_group's `None,_ | _,Some _ -> after` specializes col0 to None into
+    // `{[_]->e ; [Some _]->e}`, whose leading `[_]` fires -- but the spread `Some _`
+    // row makes the None arm re-test `replace_by` (`(if r (exit)(exit))`) where
+    // ocamlc emits a bare `(exit)`.  Truncate after the first such row (guarded
+    // rows before it may fail and are kept; a constructor row before it does a
+    // real test and its all-wildcard default stays reachable).
+    if (!comps.empty())
+      for (size_t i = 0; i < rows.size(); ++i)
+        if (!rows[i].guard && row_all_var(rows[i])) {
+          if (i + 1 < rows.size()) rows.resize(i + 1);
+          break;
+        }
     if (rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
       int e = ++next_exit_;
       size_t W = comps.size();
