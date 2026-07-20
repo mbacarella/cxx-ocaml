@@ -18587,6 +18587,49 @@ struct Translator {
             scope.pop_back();
             return l;
           }
+      // `let (a, b, ..) = (e1, e2, ..) in body`: a tuple pattern against a
+      // tuple LITERAL of the same arity.  ocamlc's Matching.for_let explodes
+      // this -- it binds each element expression directly to its variable, with
+      // NO tuple allocated and NO field projection.  The bindings come out in
+      // REVERSE source order because tuple construction evaluates right-to-left,
+      // and that order must be preserved (`let a,b = se_a(), se_b()` runs se_b
+      // first).  A bare-variable element aliases (simplif would drop the let).
+      if (le->bindings.size() == 1)
+        if (auto* tp = std::get_if<Ppat_tuple>(
+                &effective_pat(&le->bindings[0].pat)->desc)) {
+          const Expression* rhs = le->bindings[0].expr.get();
+          while (auto* ct = std::get_if<Pexp_constraint>(&rhs->desc)) rhs = ct->e.get();
+          auto* et = std::get_if<Pexp_tuple>(&rhs->desc);
+          bool allvars = et && et->elems.size() == tp->elems.size() && !tp->elems.empty();
+          if (allvars)
+            for (auto& el : tp->elems)
+              if (!std::get_if<Ppat_var>(&effective_pat(el.get())->desc)) { allvars = false; break; }
+          if (allvars) {
+            // translate every element in the OUTER scope first (an element may
+            // name a variable the pattern also binds, e.g. `let a,b = b,a`), then
+            // bind, so the pattern names never shadow the element expressions.
+            std::vector<LamPtr> vals;
+            for (auto& ee : et->elems) vals.push_back(expr(*ee));
+            auto l = mk(Lam::K::Let);
+            for (int i = (int)tp->elems.size() - 1; i >= 0; --i) {
+              const Pattern* ep = effective_pat(tp->elems[i].get());
+              auto* pv = std::get_if<Ppat_var>(&ep->desc);
+              if (vals[i]->k == Lam::K::Var) {  // alias -> no residual binding
+                scope.back()[pv->name.txt] = vals[i]->var;
+                continue;
+              }
+              Ident id = fresh(pv->name.txt);
+              l->bindings.push_back({id, pat_kind(ep), vals[i]});
+              scope.back()[pv->name.txt] = id;
+            }
+            rec_spine_ = rec_spine;
+            LamPtr body = expr(*le->body);
+            scope.pop_back();
+            if (l->bindings.empty()) return body;
+            l->body = body;
+            return l;
+          }
+        }
       // `let (a, b) = match .. in body`: when every match arm RESULT is a
       // syntactic tuple, pass the components through a static catch instead of
       // building the pair (Matching's exit-with-args form; basic/tuple_match).
