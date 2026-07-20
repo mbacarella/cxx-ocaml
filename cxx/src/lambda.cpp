@@ -21237,6 +21237,27 @@ struct Translator {
         return global_of(d2->name) != d2->name;
     return false;
   }
+  // The root global module name that a global-path lambda reads from (walking
+  // through field projections), or "" if it is not a global path.
+  static std::string fval_root_global(const LamPtr& fval) {
+    const Lam* r = fval.get();
+    while (r && r->k == Lam::K::Prim && !r->args.empty() &&
+           (r->prim == Prim::FieldImm || r->prim == Prim::FieldInt ||
+            r->prim == Prim::FieldMut))
+      r = r->args[0].get();
+    if (r && r->k == Lam::K::Prim && r->prim == Prim::Global) return r->prim_id;
+    return "";
+  }
+  // The leftmost component name of a Pmod_ident module-expression path.
+  static std::string module_path_head(const ModuleExpr* me) {
+    while (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) me = pc->me.get();
+    auto* pi = std::get_if<Pmod_ident>(&me->desc);
+    if (!pi) return "";
+    const Longident* h = &pi->id.txt;
+    while (auto* d = std::get_if<Ldot>(&h->v)) h = d->prefix.get();
+    auto* l = std::get_if<Lident>(&h->v);
+    return l ? l->name : "";
+  }
   LamPtr compile_functor_apply(const Pmod_apply& pa) {
     LamPtr fval; std::vector<std::string> param;
     const ModuleType* param_mt = nullptr;
@@ -21272,7 +21293,22 @@ struct Translator {
     // apply_coercion binds the original read (discarded) then re-translates the
     // alias target.  A member of a plain compilation unit (Diffing_with_keys.
     // Define, Consistbl.Make) is NOT an alias and gets no wrap.
-    if (path_through_stdlib_alias(pa.f.get()) && is_global_path(fval)) {
+    // A sibling submodule can leave its `module Set = Set.Make(..)` name bound in
+    // module_base (menv doesn't pop the name when leaving the struct), so
+    // path_through_stdlib_alias's module_base guard wrongly rejects a LATER
+    // sibling's identical `Set.Make`.  Detect the alias directly from the value:
+    // fval reads `field* (global Stdlib__Set!)` while the source head is the bare
+    // umbrella name `Set` (global_of "Set" = "Stdlib__Set"), which can only be the
+    // stdlib alias -- a real local functor-producing module reads from a local var,
+    // not a mangled global.  This is immune to the module_base leak.
+    bool alias_wrap = path_through_stdlib_alias(pa.f.get());
+    if (!alias_wrap && is_global_path(fval)) {
+      std::string groot = fval_root_global(fval);
+      std::string head = module_path_head(pa.f.get());
+      if (!groot.empty() && !head.empty() && global_of(head) == groot && groot != head)
+        alias_wrap = true;
+    }
+    if (alias_wrap && is_global_path(fval)) {
       Ident id = fresh("let");
       auto l = mk(Lam::K::Let); l->bindings = {{id, ValueKind::Gen, fval}}; l->body = fval;
       fval = l;
