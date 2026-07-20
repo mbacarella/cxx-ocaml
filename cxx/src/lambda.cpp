@@ -17598,6 +17598,20 @@ struct Translator {
                             ? qualified_ctor_info(k->id.txt) : nullptr;
       const CtorInfo* cip = qci;
       if (!cip) { auto ci = ctor_info_.find(n); if (ci != ctor_info_.end()) cip = &ci->second; }
+      // `open M` (M separately compiled) exporting an exception E shadows a same-
+      // named PERVASIVE variant ctor (Stdlib's result.Ok / .Error).  In RAISE
+      // position the head is exn-typed -- a variant ctor can never be raised -- so
+      // the opened exception, not the shadowed variant, is meant.  Without this,
+      // `open Syntaxerr; raise (Error e)` picked result.Error: a tag-1 variant
+      // block carrying no exception identity, which no `with Syntaxerr.Error` arm
+      // could catch (parsing/ast_helper.ml:91's Variable_in_scope raise).  Gated on
+      // raise_pos so a type-directed `(Error x : _ result)` under the same open is
+      // untouched.  A LOCAL exception (exn_ident_/exn_field_) has its own shadow
+      // path below, so exclude those here.
+      LamPtr opened_raise_exn = nullptr;
+      if (raise_pos && std::holds_alternative<Lident>(k->id.txt.v) &&
+          !exn_ident_.count(n) && !exn_field_.count(n) && builtin_ctors_.count(n))
+        opened_raise_exn = opened_module_exn_value(n);
       // The node's INFERRED constructed type outranks the flat entry when they
       // disagree on the OWNING TYPE: same-named ctors across enums can differ
       // in TAG at equal arity, which the arity check below can't catch.
@@ -17708,7 +17722,7 @@ struct Translator {
           }
         }
       }
-      if (cip && !exn_shadows) {
+      if (cip && !exn_shadows && !opened_raise_exn) {
         if (!cip->is_block) return cint(cip->tag);  // constant -> its tag
         // inline record (`T {pos}`): the labels are the block's fields, in
         // declaration order, with the declared kinds as the shape
@@ -17805,6 +17819,7 @@ struct Translator {
       // var, raising garbage that no `with Exit_OK` arm could match.
       LamPtr exnv = (exn_ident_.count(n) || exn_field_.count(n))
                         ? exn_value(n)
+                        : opened_raise_exn ? opened_raise_exn
                         : (std::holds_alternative<Lident>(k->id.txt.v) && !ctor_info_.count(n)
                                ? opened_module_exn_value(n)
                                : nullptr);
