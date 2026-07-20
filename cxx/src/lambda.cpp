@@ -10193,10 +10193,12 @@ struct Translator {
   // collapse into exactly TWO contiguous runs of a shared action (`0|1|2 -> A |
   // 3|4 -> B`) is lowered by ocamlc's call_switcher to a SINGLE range test
   // (BGTINT/BLTINT), not a flat Lswitch.  Emit that via the ported Switcher
-  // machinery; the general multi-cluster exhaustive shape is left to the flat
-  // switch (ocamlc's shape there differs subtly and churns -- see the note in
-  // const_ctor_switcher).
-  LamPtr two_run_switcher(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts) {
+  // machinery.  A three-run `a|b|a` (lone middle value) on an isint-split const
+  // side (`has_block`) is the one further shape ocamlc collapses that we track
+  // without churn; every other multi-cluster shape is left to the flat switch
+  // (ocamlc's shape there differs subtly and churns -- see const_ctor_switcher).
+  LamPtr two_run_switcher(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts,
+                          bool has_block) {
     if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
     int n = (int)consts.size();
     for (int i = 0; i < n; ++i) if (consts[i].tag != i) return nullptr;  // want 0..n-1
@@ -10215,7 +10217,17 @@ struct Translator {
       cases.push_back({(long long)i, (long long)j, act_of[i]});
       i = j + 1;
     }
-    if (cases.size() != 2) return nullptr;
+    if (cases.size() < 2) return nullptr;
+    // Two runs (`A|A -> a | B -> b`) is the proven-safe shape.  The only >2-run
+    // case ocamlc collapses that we can reproduce without churn is is_unboxed's
+    // exact `a|b|a` (three runs, two distinct actions, lone middle -> a single
+    // `!= v` test), and only as the const side of an isint SPLIT (the variant has
+    // a block constructor too), where our matcher's decision agrees with ocamlc's.
+    // A four-run [X,Y,X,Y] or a pure-constant (block-free) `a|b|a` sits in a nested
+    // sub-match whose column nesting already diverges from ocamlc's (simplif), so
+    // reshaping it only churns -- keep those a flat switch.
+    if (cases.size() > 3) return nullptr;
+    if (cases.size() == 3 && !has_block) return nullptr;
     sw_ok_inter_ = true;                            // tags are small (0..n-1)
     sw_memo_.clear();
     std::vector<int> k; comp_clusters(cases, k);
@@ -10224,14 +10236,15 @@ struct Translator {
     if (made_switch) return nullptr;                // a jump table: keep the flat switch
     return c_test({0, scrut}, cl_cases, cl_acts);
   }
-  LamPtr const_dispatch(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts) {
+  LamPtr const_dispatch(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts,
+                        bool has_block = false) {
     if (consts.size() == 1) return consts[0].body;
     if (consts.size() == 2) {
       auto i = mk(Lam::K::IfThenElse);
       i->cond = scrut; i->then_ = consts[1].body; i->else_ = consts[0].body;
       return i;
     }
-    if (auto rt = two_run_switcher(scrut, consts)) return rt;
+    if (auto rt = two_run_switcher(scrut, consts, has_block)) return rt;
     auto sw = mk(Lam::K::Switch); sw->cond = scrut; sw->sw_consts = consts;
     return sw;
   }
@@ -11718,7 +11731,7 @@ struct Translator {
       }
       if (fexit >= 0)
         if (LamPtr t = canfail_const_dispatch(comps[0], consts, fexit)) return t;
-      return const_dispatch(comps[0], consts);
+      return const_dispatch(comps[0], consts, /*has_block=*/NB > 0);
     };
     if (NC == 1 && NB == 1) {
       auto i = mk(Lam::K::IfThenElse);
