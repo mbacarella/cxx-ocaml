@@ -21091,6 +21091,17 @@ struct Translator {
   // the pending coercion's cmi signature (points into mli_functor_result_sigs_,
   // a stable member map); null when only the name-list is known
   const cmi::Signature* pending_functor_coerce_sig_ = nullptr;
+  // ocamlc's Tcoerce_functor PLACEMENT: translmod keeps a restricted functor's
+  // body in its full RAW layout and coerces at the unit's export slot with an
+  // eta-expansion `(function funarg (let r = F funarg) (makeblock (field i r)
+  // ..))`.  For a gated top-level functor (single named param, struct body, no
+  // local uses -- it is the unit's LAST item) the request flag makes the body
+  // build skip its coercion; the mapping (raw-block index per .mli member, in
+  // .mli order) is computed there against the REAL export names; the wrapper
+  // is emitted when the unit's export block is assembled (consumed + erased).
+  bool pending_functor_eta_request_ = false;
+  std::vector<int> pending_functor_eta_result_;
+  std::unordered_map<std::string, std::vector<int>> functor_export_eta_;
   // Coerce a stdlib/local module VALUE to a target signature layout, eta-stubbing
   // members that are EXTERNALS of the source module (`Int32.neg` = %int32_neg,
   // not a field) and field-reading the rest.  This is how a functor argument's
@@ -21594,6 +21605,35 @@ struct Translator {
         modsig::SigPtr src_msig;
         LamPtr inner = build_module(ps->items, &sub, nullptr, &pending, nullptr,
                                     &src_msig);
+        // Eta placement (pending_functor_eta_request_): keep the body RAW and
+        // hand the export site the .mli->raw index mapping instead.  Bail to
+        // the normal in-place coercion on a duplicate raw name, a missing
+        // member, or an identity mapping (no wrapper needed then).
+        if (pending_functor_eta_request_) {
+          pending_functor_eta_request_ = false;
+          std::vector<int> map2;
+          std::set<std::string> dup;
+          bool ok = sub.size() >= pending.size();
+          if (ok)
+            for (auto& n2 : sub)
+              if (!dup.insert(n2).second) { ok = false; break; }
+          if (ok)
+            for (auto& n2 : pending) {
+              auto p2 = std::find(sub.begin(), sub.end(), n2);
+              if (p2 == sub.end()) { ok = false; break; }
+              map2.push_back((int)(p2 - sub.begin()));
+            }
+          bool ident2 = ok && sub.size() == pending.size();
+          if (ident2)
+            for (size_t i2 = 0; i2 < map2.size(); ++i2)
+              if (map2[i2] != (int)i2) { ident2 = false; break; }
+          if (ok && !ident2) {
+            pending_functor_eta_result_ = std::move(map2);
+            fn->body = inner;
+            goto functor_body_done;
+          }
+        }
+        {
         // modsig P3 stage 3: the computed coercion for the .mli-declared
         // functor result (drops helpers + reorders like coerce_block, but
         // paired by (namespace, name) over verified Sigs).
@@ -21628,7 +21668,10 @@ struct Translator {
           if (LamPtr c = coerce_block(inner, sub, pending)) fn->body = c;
           else fn->body = inner;
         }
+        }
+        functor_body_done:;
       } else {
+        pending_functor_eta_request_ = false;  // non-struct body: unmet
         fn->body = compile_module_expr(*cur);
       }
       // Drop the body's internal module registrations (see snapshot above);
@@ -22802,10 +22845,66 @@ struct Translator {
               }
             }
             const cmi::Signature* mli_result_sig = pending_functor_coerce_sig_;
+            // Eta-placement gate (functor_export_eta_): ocamlc coerces a
+            // restricted functor at the unit's EXPORT slot, keeping the body
+            // raw.  Only for a shape we can prove safe: a TOP-LEVEL functor
+            // that is the unit's LAST item (so nothing in the unit can apply
+            // it or read its members against the coerced layout), ONE named
+            // param whose .ml layout equals the .cmi's (no argument coercion
+            // in the wrapper), a plain structure body with no `external`s
+            // (their slots would need eta-stubs, not field reads), and a
+            // result signature of plain values/exceptions (no submodule whose
+            // own layout could need a nested coercion).
+            if (!pending_functor_coerce_.empty() && mli_result_sig &&
+                saved_mp.find('.') == std::string::npos && &it == &s.back() &&
+                mli_result_sig->modules.empty()) {
+              auto* pf1 = std::get_if<Pmod_functor>(&mb.expr.desc);
+              auto* np = pf1 ? std::get_if<Functor_named>(&pf1->param) : nullptr;
+              bool clean_body = false;
+              if (np && np->type)
+                if (auto* bs = std::get_if<Pmod_structure>(&pf1->body->desc)) {
+                  clean_body = true;
+                  for (auto& bi : bs->items)
+                    if (std::holds_alternative<Pstr_primitive>(bi.desc)) {
+                      clean_body = false; break;
+                    }
+                }
+              bool param_same = false;
+              if (clean_body && has_mli_cmi_)
+                for (auto& md2 : mli_cmi_sig_.modules)
+                  if (md2.name == *mb.name.txt) {
+                    const cmi::ModuleType* pt =
+                        md2.type && md2.type->kind == cmi::ModuleType::Functor
+                            ? md2.type->functor_param_type.get()
+                            : nullptr;
+                    if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
+                      param_same =
+                          pt->sig->fields == functor_param_layout(mb.expr);
+                    else if (pt && pt->kind == cmi::ModuleType::Ident &&
+                             pt->path) {
+                      // a NAMED modtype param (`Id : Identifiable.S`): both
+                      // sides citing the same dotted path resolve to the same
+                      // signature -- no argument coercion.
+                      if (auto* pi = std::get_if<Pmty_ident>(&np->type->desc)) {
+                        std::string mlp;
+                        param_same = lid_to_dotted(pi->id.txt, mlp) &&
+                                     mlp == cmi_path_dotted(*pt->path);
+                      }
+                    }
+                    break;
+                  }
+              if (param_same) pending_functor_eta_request_ = true;
+            }
             LamPtr fv = compile_module_expr(mb.expr);
+            pending_functor_eta_request_ = false;  // consumed or unmet
             pending_functor_coerce_.clear();
             pending_functor_coerce_sig_ = nullptr;
             mod_path_ = saved_mp;
+            if (!pending_functor_eta_result_.empty()) {
+              functor_export_eta_[*mb.name.txt] =
+                  std::move(pending_functor_eta_result_);
+              pending_functor_eta_result_.clear();
+            }
             cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
             // When the .mli RESTRICTS this functor's result (the body has more
@@ -23648,6 +23747,34 @@ struct Translator {
                       (used_computed ? " computed" : " legacy " + legacy_why));
       exports = std::move(ce); export_names = std::move(cn);
     }
+    // ocamlc's Tcoerce_functor placement (see functor_export_eta_): the
+    // restricted functor kept its full raw body; its export slot carries the
+    // eta-expansion wrapper projecting the .mli members from the raw block.
+    if (!functor_export_eta_.empty())
+      for (size_t wi = 0; wi < exports.size() && wi < export_names.size(); ++wi) {
+        auto fe = functor_export_eta_.find(export_names[wi]);
+        if (fe == functor_export_eta_.end()) continue;
+        auto wf = mk(Lam::K::Function); wf->inline_attr = "is_a_functor";
+        Ident pa = fresh("funarg");
+        wf->params.push_back({pa, ValueKind::Gen});
+        auto pav = mk(Lam::K::Var); pav->var = pa;
+        auto ap2 = mk(Lam::K::Apply); ap2->fn = exports[wi]; ap2->args = {pav};
+        Ident rr = fresh("let");
+        std::vector<LamPtr> flds;
+        for (int ix : fe->second) {
+          auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut; fr->prim_arg = ix;
+          auto rv = mk(Lam::K::Var); rv->var = rr; fr->args = {rv};
+          flds.push_back(fr);
+        }
+        auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+        blk->args = std::move(flds);
+        auto lt = mk(Lam::K::Let);
+        lt->bindings.push_back({rr, ValueKind::Gen, ap2});
+        lt->body = blk;
+        wf->body = lt;
+        exports[wi] = wf;
+        functor_export_eta_.erase(fe);
+      }
     if (names) *names = export_names;  // the (deduplicated) export layout, in order
     if (msig_out) {  // modsig P1: the structure's (possibly ascribed) Sig
       auto out_sig = std::make_shared<modsig::Sig>();
