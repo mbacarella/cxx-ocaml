@@ -2111,7 +2111,7 @@ struct Translator {
                 // a per-type entry there instead feeds the FIRST inferred-type override
                 // (a same-named constant across two local types) a candidate it lacked
                 // before -- which diverged format_doc.
-                if (!do_ctor && !block) {
+                if (!do_ctor) {
                   type_ctor_info_[tkey][c.name.txt] = ci;
                   ambiguous_ctors_.insert(c.name.txt);
                 }
@@ -10034,7 +10034,20 @@ struct Translator {
     auto pc = vk.pat_constr.find(p);
     if (pc == vk.pat_constr.end()) return amb;
     auto dot = pc->second.rfind('.');
-    if (dot == std::string::npos) return amb;
+    if (dot == std::string::npos) {
+      // A DOTLESS pat_constr names a FILE-LOCAL type: the ctor-arg
+      // disambiguation records the enclosing ctor's declared arg type by its
+      // bare name (`core_sigitem_symptom`), so resolve straight against its
+      // per-type table -- the CONSUMER mirror of the construct-site override,
+      // keeping a `match Core (Class_type_declarations ..)` in lockstep with
+      // its construction (else producer/consumer tags diverge -> miscompile).
+      // "exn" (and any bare name with no per-type table) falls through to amb
+      // unchanged.
+      if (amb && amb->type == pc->second) return amb;
+      if (auto ti = type_ctor_info_.find(pc->second); ti != type_ctor_info_.end())
+        if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
+      return amb;
+    }
     std::string mod = pc->second.substr(0, dot), ty = pc->second.substr(dot + 1);
     if (amb && amb->type == ty) return amb;                 // ambient already correct
     if (auto ti = type_ctor_info_.find(ty); ti != type_ctor_info_.end())  // a local type

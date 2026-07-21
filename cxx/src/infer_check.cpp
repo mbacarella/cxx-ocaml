@@ -370,6 +370,15 @@ struct Checker {
   std::unordered_map<const Pattern*, TypePtr> rec_pat_;
   std::unordered_map<const void*, TypePtr> rec_ret_;
   std::unordered_map<const void*, TypePtr> rec_expr_;  // every expression's type
+  // A construct/pattern node used as a constructor's argument whose (ambiguous)
+  // name must be disambiguated by the enclosing ctor's DECLARED argument type,
+  // not by lexical scope.  Node -> that expected type; the back end reads it via
+  // expr_constr / pat_constr to pick the right same-named ctor's TAG.  BOTH the
+  // producer (expression) and consumer (pattern) sides must route through this,
+  // or a construct/match pair would resolve the same ctor to DIFFERENT tags (a
+  // producer/consumer miscompile).
+  std::unordered_map<const void*, TypePtr> ctor_arg_type_;      // expression args
+  std::unordered_map<const void*, TypePtr> pat_ctor_arg_type_;  // pattern args
   // Record decl by identity stamp, for resolving an AMBIGUOUS field projection
   // through the base's inferred type identity (Sign_diff.t.untypables@4).
   std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
@@ -4102,6 +4111,32 @@ struct Checker {
     return it == ctors.end() ? nullptr : &it->second;
   }
 
+  // A constructor's argument that is ITSELF a construct/pattern whose name is
+  // shared across types (`ambiguous_ctors_`): record the enclosing ctor's
+  // DECLARED argument type (`dom`) at the inner node, so the back end
+  // disambiguates that inner ctor by the EXPECTED type rather than by lexical
+  // scope -- scope may pick a same-named ctor of a different type whose TAG
+  // differs (includemod's top-level `symptom` vs `Error.core_sigitem_symptom`).
+  // infer_expr / infer_pat on a bare construct/pattern argument carries no
+  // expected type, so this is the one place the domain is known.  The producer
+  // (expr) and consumer (pat) forms MUST stay in lockstep.
+  void record_ctor_arg_type(const Expression* arg, TypePtr dom) {
+    if (!record_kinds_) return;
+    auto* k = std::get_if<Pexp_construct>(&arg->desc);
+    if (!k || !ambiguous_ctors_.count(lid_last(k->id.txt))) return;
+    TypePtr d = I::Engine::repr(dom);
+    if (d->kind == I::Type::Kind::Constr && !d->path.empty())
+      ctor_arg_type_[arg] = d;
+  }
+  void record_pat_ctor_arg_type(const Pattern* arg, TypePtr dom) {
+    if (!record_kinds_) return;
+    auto* k = std::get_if<Ppat_construct>(&arg->desc);
+    if (!k || !ambiguous_ctors_.count(lid_last(k->id.txt))) return;
+    TypePtr d = I::Engine::repr(dom);
+    if (d->kind == I::Type::Kind::Constr && !d->path.empty())
+      pat_ctor_arg_type_[arg] = d;
+  }
+
   // Resolve a QUALIFIED constructor `M.C` (M a single, non-opened module) to its
   // owning variant type `M.tname`, read from M's cmi.  `M.C` otherwise types as
   // Any (find_ctor only knows bare names), which loses the type that an optional-
@@ -5845,7 +5880,10 @@ struct Checker {
         // `A of (t1*t2)` (arity 1) unifies the whole tuple against the one arg.
         if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
           flatten_construct.insert(&p);
-          for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_pat(*tup->elems[i]));
+          for (size_t i = 0; i < ps.size(); ++i) {
+            try_unify(ps[i], infer_pat(*tup->elems[i]));
+            record_pat_ctor_arg_type(tup->elems[i].get(), ps[i]);
+          }
         } else if (!ps.empty()) {
           // `C _`: the lone `_` fills every arity slot in the dump (the local
           // ctor_arity_ registry covers local decls; this covers cmi ctors
@@ -5853,6 +5891,7 @@ struct Checker {
           if (ps.size() > 1 && std::holds_alternative<Ppat_any>((*k->arg)->desc))
             construct_any_arity[&p] = (int)ps.size();
           try_unify(ps[0], infer_pat(**k->arg));
+          record_pat_ctor_arg_type(k->arg->get(), ps[0]);
         } else {
           infer_pat(**k->arg);
         }
@@ -6468,9 +6507,13 @@ struct Checker {
         auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
         if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
           flatten_construct.insert(&e);
-          for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_expr(*tup->elems[i]));
+          for (size_t i = 0; i < ps.size(); ++i) {
+            try_unify(ps[i], infer_expr(*tup->elems[i]));
+            record_ctor_arg_type(tup->elems[i].get(), ps[i]);
+          }
         } else if (!ps.empty()) {
           try_unify(ps[0], infer_expr(**k->arg));
+          record_ctor_arg_type(k->arg->get(), ps[0]);
         } else {
           infer_expr(**k->arg);
         }
@@ -9734,6 +9777,16 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
         vk.pat_record_type[p] = r->path;
     }
   }
+  // CONSUMER half of the type-directed ctor-arg disambiguation (mirrors the
+  // producer expr_constr override below): an ambiguous ctor PATTERN used as
+  // another ctor's argument gets its owning type from the enclosing ctor's
+  // declared arg type, so pat_ctor_resolve reads the right tag (matching the
+  // construct side; a producer/consumer tag mismatch is a miscompile).
+  for (auto& [p, d] : ck.pat_ctor_arg_type_) {
+    TypePtr r = I::Engine::repr(d);
+    if (r->kind == I::Type::Kind::Constr && !r->path.empty())
+      vk.pat_constr[p] = r->path;
+  }
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck);
   for (auto& [e, t] : ck.rec_expr_) {
     vk.expr[e] = kind_str(t, ck);
@@ -9773,6 +9826,16 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
           bu->second == r->stamp)
         vk.expr_constr[e] = r->path;
     }
+  }
+  // PRODUCER half: an ambiguous ctor CONSTRUCT used as another ctor's argument
+  // gets its owning type from the enclosing ctor's declared arg type, so the
+  // back end's construct-site override reads the right tag (see the pat_constr
+  // consumer half above -- both must agree).  Authoritative even DOTLESS (a
+  // file-local type), unlike the general rec_expr_ path.
+  for (auto& [e, d] : ck.ctor_arg_type_) {
+    TypePtr r = I::Engine::repr(d);
+    if (r->kind == I::Type::Kind::Constr && !r->path.empty())
+      vk.expr_constr[e] = r->path;
   }
   for (auto& [e, fr] : ck.field_resolved_)
     vk.field_resolved[e] = {std::get<0>(fr), std::get<1>(fr), std::get<2>(fr)};
