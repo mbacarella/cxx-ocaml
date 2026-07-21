@@ -63,6 +63,13 @@ std::string lid_last(const Longident& x) {
   return "?";
 }
 
+// The full dotted path (`A.B.x`); "$" for an Lapply node.
+std::string lid_full(const Longident& x) {
+  if (auto* l = std::get_if<Lident>(&x.v)) return l->name;
+  if (auto* d = std::get_if<Ldot>(&x.v)) return lid_full(*d->prefix) + "." + d->name;
+  return "$";
+}
+
 // The outermost component of a path (`A.B.x` -> "A"); "" for an Lapply head.
 std::string lid_head(const Longident& x) {
   const Longident* p = &x;
@@ -15126,6 +15133,7 @@ struct Translator {
   LamPtr const_switch(const LamPtr& scrut, const std::vector<Row>& rows) {
     std::string type;
     std::vector<Lam::SwitchCase> arms;
+    std::vector<std::string> arm_keys;
     for (auto& r : rows) {
       if (r.guard) return nullptr;
       auto it = ctor_info_.find(ctor_of(*r.lhs));
@@ -15134,12 +15142,24 @@ struct Translator {
       if (k && k->arg) return nullptr;  // constant ctor must take no argument
       if (type.empty()) type = it->second.type;
       else if (type != it->second.type) return nullptr;
-      arms.push_back({it->second.tag, expr(*r.rhs)});
+      LamPtr b = expr(*r.rhs);
+      arm_keys.push_back(action_dedup_key(b, *r.rhs));
+      arms.push_back({it->second.tag, b});
     }
     auto t = type_ctors_.find(type);
     if (t == type_ctors_.end() || t->second.second != 0 ||
         (int)arms.size() != t->second.first)
       return nullptr;  // not exhaustive over a constant-only type
+    // Two arms with a body ocamlc's StoreExp would share (a merged interval, a
+    // `!=`/range test, or a catch) rather than test apart: defer such a match to
+    // const_ctor_switcher, which replays that sharing.  The all-distinct case keeps
+    // this direct `if`/`switch`, which already matches ocamlc.  Sharing is keyed the
+    // way StoreExp keys it (lambda shape + pre-alias source idents), so two aliases
+    // of one function -- which we inline to the same term but ocamlc keeps apart --
+    // are NOT treated as shared here.
+    for (size_t i = 0; i < arm_keys.size(); ++i)
+      for (size_t j = i + 1; j < arm_keys.size(); ++j)
+        if (!arm_keys[i].empty() && arm_keys[i] == arm_keys[j]) return nullptr;
     std::sort(arms.begin(), arms.end(),
               [](auto& x, auto& y) { return x.tag < y.tag; });
     // Exactly two constant constructors (tags 0 and 1) -> a truthy `if`, like bool;
@@ -15773,6 +15793,52 @@ struct Translator {
     }
     return false;
   }
+  // A source-level fingerprint of an expression's identifier references.  Two match
+  // bodies our lambda emitter inlines to the same term -- e.g. `normalize_value_path`
+  // and `normalize_type_path`, both `let`-aliases of `normalize_path_prefix` -- still
+  // differ here, matching ocamlc's StoreExp, which keys the PRE-Simplif lambda and so
+  // keeps such aliases apart.  Any node we don't structurally traverse appends its
+  // address, leaving that body incomparable (never deduped): we only merge bodies we
+  // can fully walk.  Paired with the lambda key, equal (lam-key, ident-sig) is exactly
+  // when ocamlc's StoreExp would share the two actions.
+  void src_ident_sig(const Expression& e, std::string& out) {
+    const auto& d = e.desc;
+    if (auto* p = std::get_if<Pexp_ident>(&d)) { out += "#"; out += lid_full(p->id.txt); }
+    else if (std::get_if<Pexp_constant>(&d)) { out += "$"; }
+    else if (auto* p = std::get_if<Pexp_apply>(&d)) {
+      out += "A("; src_ident_sig(*p->fn, out);
+      for (auto& a : p->args) { out += ","; src_ident_sig(*a.second, out); }
+      out += ")";
+    } else if (auto* p = std::get_if<Pexp_construct>(&d)) {
+      out += "C" + lid_full(p->id.txt);
+      if (p->arg) { out += "("; src_ident_sig(**p->arg, out); out += ")"; }
+    } else if (auto* p = std::get_if<Pexp_tuple>(&d)) {
+      out += "T("; for (auto& x : p->elems) { src_ident_sig(*x, out); out += ","; } out += ")";
+    } else if (auto* p = std::get_if<Pexp_field>(&d)) {
+      out += "F" + lid_full(p->field.txt) + "("; src_ident_sig(*p->e, out); out += ")";
+    } else if (auto* p = std::get_if<Pexp_setfield>(&d)) {
+      out += "S" + lid_full(p->field.txt) + "(";
+      src_ident_sig(*p->obj, out); out += "="; src_ident_sig(*p->value, out); out += ")";
+    } else if (auto* p = std::get_if<Pexp_sequence>(&d)) {
+      out += "Q("; src_ident_sig(*p->e1, out); out += ";"; src_ident_sig(*p->e2, out); out += ")";
+    } else if (auto* p = std::get_if<Pexp_ifthenelse>(&d)) {
+      out += "I("; src_ident_sig(*p->cond, out); out += ",";
+      src_ident_sig(*p->then_, out);
+      if (p->else_) { out += ","; src_ident_sig(**p->else_, out); } out += ")";
+    } else if (auto* p = std::get_if<Pexp_constraint>(&d)) {
+      src_ident_sig(*p->e, out);
+    } else {
+      out += "?"; out += std::to_string(reinterpret_cast<uintptr_t>(&e));
+    }
+  }
+  // The dedup key ocamlc's StoreExp would assign a match action: its lambda shape
+  // plus the source-identifier fingerprint that survives our earlier alias inlining.
+  std::string action_dedup_key(const LamPtr& lam, const Expression& src) {
+    std::string k = make_lam_key(lam);             // the switcher's own key convention
+    if (k.empty()) return "";                       // empty => "unkeyable", never dedups
+    std::string sig; src_ident_sig(src, sig);
+    return k + "\x01" + sig;
+  }
   // The constant-constructor analog of switcher_match: ocamlc routes a match over
   // a constant-only variant (with an optional catch-all default) through
   // call_switcher exactly like an int-literal match, so `match p with Parsing ->
@@ -15817,8 +15883,11 @@ struct Translator {
     // distinct single ctors never reach here (const_switch takes them), so the
     // intake is or-pattern rows, whose flattened values dedup by rhs below.
 
-    // Translate bodies once, in source order (stable stamp normalization); bail if
-    // two distinct rows share a body (ocamlc shares behind a catch, unmodelled).
+    // Translate bodies once, in source order (stable stamp normalization).  Two
+    // distinct rows with an identical body share ONE action, as ocamlc's StoreExp
+    // make_key dedup does: the shared action then merges adjacent values into one
+    // interval, isolates non-adjacent ones with the switch test tree, or -- when no
+    // single test separates its slots -- falls to the occ>=2 catch path below.
     std::vector<LamPtr> actions(1);
     actions.resize(kvs.size() + 1);
     std::vector<int> act_of(kvs.size());
@@ -15831,20 +15900,25 @@ struct Translator {
       act_of[i] = pos + 1;
     }
     std::vector<std::string> body_keys;
+    std::vector<int> canon(by_src.size());   // identical bodies -> earliest action index
     for (size_t s = 0; s < by_src.size(); ++s) {
       LamPtr b = expr(*by_src[s]);
-      std::string key = make_lam_key(b);
-      for (auto& bk : body_keys) if (bk == key && !key.empty()) CCS_BAIL("shared-body");  // shared body
+      std::string key = action_dedup_key(b, *by_src[s]);
+      int c = (int)s;
+      if (!key.empty())
+        for (size_t t = 0; t < s; ++t) if (body_keys[t] == key) { c = (int)t; break; }
       body_keys.push_back(key);
+      canon[s] = c;
       actions[s + 1] = b;
     }
+    for (size_t i = 0; i < kvs.size(); ++i) act_of[i] = canon[act_of[i] - 1] + 1;
     LamPtr default_body;
     if (dflt) {
       scope.emplace_back();
       bind_catchall(*dflt->lhs, scrut);
       default_body = expr(*dflt->rhs);
       scope.pop_back();
-      std::string dk = make_lam_key(default_body);
+      std::string dk = action_dedup_key(default_body, *dflt->rhs);
       if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) CCS_BAIL("default-shared");
     }
 
