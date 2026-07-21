@@ -7044,10 +7044,14 @@ struct Translator {
         // a module-qualified exception/extension ctor resolves to that module's
         // own field first (distinguishes `M1.E` from `M2.E`); else the binder.
         LamPtr id0 = module_ctor_identity(k->id.txt);
-        if (!id0) id0 = exn_value(lid_last(k->id.txt));
         // A stdlib module's exception (`Lazy.Undefined`): its identity is the
         // module's runtime export field.  A LOCAL module's (incl. one spliced
         // in by `include Stack` -- `with S.Empty ->`): its layout field.
+        // This QUALIFIED resolution must run BEFORE the bare-name fallback:
+        // a local `exception Error` does not shadow a qualified
+        // `Cmi_format.Error` arm (persistent_env matches both -- resolving
+        // the qualified arm to the local binder made the local raise take
+        // the Cmi_format arm and left the real Cmi_format.Error uncaught).
         if (!id0)
           if (auto* d = std::get_if<Ldot>(&k->id.txt.v))
             if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
@@ -7065,6 +7069,7 @@ struct Translator {
                 }
               }
             }
+        if (!id0) id0 = exn_value(lid_last(k->id.txt));
         if (LamPtr id = id0) {
           auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
           LamPtr lhs;
