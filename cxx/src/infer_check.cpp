@@ -3554,6 +3554,47 @@ struct Checker {
     cmi_abstract_memo_[path] = r;
     return r;
   }
+  // Is the CROSS-MODULE type at `path` marked Type_immediacy.Always in its
+  // owning unit's cmi (an all-constant variant like Clflags.Compiler_pass.t,
+  // or `[@@immediate]`)?  This is Env.find_type + Ctype.immediacy: ocamlc's
+  // value_kind/maybe_pointer consult the decl's type_immediate FIRST, so every
+  // kind site (comparison specialization, block shapes, param annotations)
+  // sees [int].  Always only -- Always_on_64bits is NOT immediate in bytecode
+  // (Typeopt.is_immediate).  The decl's own flag already accounts for a
+  // manifest (Typedecl_immediacy computes it through the abbreviation), so no
+  // manifest chase is needed.  Same walk as cmi_type_is_abstract above.
+  std::unordered_map<std::string, bool> cmi_immediate_memo_;
+  bool cmi_type_is_immediate(const std::string& path) {
+    if (auto it = cmi_immediate_memo_.find(path); it != cmi_immediate_memo_.end())
+      return it->second;
+    bool r = false;
+    std::vector<std::string> comps = mod_components_str(path);
+    if (comps.size() >= 2) try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+        std::string name = comps[i];
+        int applications = 0;
+        if (auto par = name.find('('); par != std::string::npos) {
+          for (char c : name) applications += c == '(';
+          name = name.substr(0, par);
+        }
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == name) { md = &mm; break; }
+        if (!md) { sig = nullptr; break; }
+        cmi::ModuleTypePtr mt = md->type;
+        for (int a = 0; a < applications && mt; ++a)
+          mt = mt->kind == cmi::ModuleType::Functor ? mt->functor_body : nullptr;
+        sig = module_sig(mt, loaded);
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == comps.back()) { r = td.immediate == 1; break; }
+    } catch (...) {}
+    cmi_immediate_memo_[path] = r;
+    return r;
+  }
   // The abstract-without-manifest type names of a CROSS-MODULE named module
   // type ("Identifiable.S", "Map.S"), read from the owning unit's cmi -- the
   // cross-module analog of mty_top_abstract, for a functor param typed by a
@@ -9584,6 +9625,13 @@ static std::string kind_str(const TypePtr& t0, Checker& ck) {
   if (b == "int" || b == "char" || b == "bool" || b == "unit")
     return "int";  // immediates (unit is the immediate 0)
   if (imm.count(t->path)) return "int";  // all-constant local variant
+  // A CROSS-MODULE type whose cmi decl is Type_immediacy.Always (see
+  // cmi_type_is_immediate).  A locally bound module shadowing the unit name is
+  // excluded (bound_module_names_, as in array_kind_str below).
+  if (d != std::string::npos &&
+      !ck.bound_module_names_.count(t->path.substr(0, t->path.find('.'))) &&
+      ck.cmi_type_is_immediate(t->path))
+    return "int";
   if (b == "float") return "float";
   if (b == "int32") return "int32";
   if (b == "int64") return "int64";
@@ -11256,6 +11304,22 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       else if (a.name == "immediate" && immed == 0) immed = 1;
       else if (a.name == "unboxed" || a.name == "ocaml.unboxed") unboxed = true;
     }
+    // The attribute as WRITTEN -- type_attributes emission keys on this, the
+    // derived immediacy below must not print `[@@immediate]` back.
+    int immed_attr = immed;
+    // Typedecl_immediacy.compute_decl: a non-unboxed variant whose ctors ALL
+    // have empty Cstr_tuple args is Always -- no-arg GADT ctors and the empty
+    // variant included, an inline-record ctor excluded.  (The unboxed and
+    // abstract-with-manifest derivations are not modelled; they stay at the
+    // attribute value, i.e. possibly Unknown where ocamlc computes Always.)
+    if (auto* var = std::get_if<Ptype_variant>(&d.kind); var && !unboxed) {
+      bool all_const = true;
+      for (auto& c : var->ctors) {
+        auto* tup = std::get_if<Pcstr_tuple>(&c.args);
+        if (!tup || !tup->elems.empty()) { all_const = false; break; }
+      }
+      if (all_const) immed = 1;
+    }
     std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
     BridgeCtx dctx;  // ONE bridge context per decl: a non-var node cited from
@@ -11351,7 +11415,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         si.engine_stamp = ts->second;
       si.type_empty_variant = var->ctors.empty();  // `type empty = |`
       si.type_private = (d.priv == PrivateFlag::Private);
-      si.type_immediate = immed;
+      si.type_immediate = immed; si.type_immediate_attr = immed_attr;
       si.type_unboxed = unboxed;
       // A re-exported datatype (`type s = t = A | B`) carries BOTH a manifest
       // (the `= t` equation) and the variant kind: ocamlc stores type_manifest =
@@ -11376,7 +11440,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       if (auto ts = ck.type_stamp_.find(&d); ts != ck.type_stamp_.end())
         si.engine_stamp = ts->second;
       si.type_private = (d.priv == PrivateFlag::Private);
-      si.type_immediate = immed;
+      si.type_immediate = immed; si.type_immediate_attr = immed_attr;
       si.type_unboxed = unboxed;
       // A CONSTRAINED param is stored as its bound (not a var), so Printtyp
       // prints its variance chip even on concrete decls -- carry the WRITTEN
@@ -11425,7 +11489,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     // its `type t += ..` extensions cite it and ocamlc prints the `= ..`.
     si.type_open = std::holds_alternative<Ptype_open>(d.kind);
     si.type_private = (d.priv == PrivateFlag::Private);
-    si.type_immediate = immed;
+    si.type_immediate = immed; si.type_immediate_attr = immed_attr;
     // Written variance/injectivity (`type +!'a t`) survives on ABSTRACT
     // manifest-free decls -- the only place Printtyp prints it back
     // (concrete/manifest decls carry COMPUTED variance, printed as nothing).
@@ -11792,6 +11856,7 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
       (td.kind == cmi::TypeDecl::Record || td.kind == cmi::TypeDecl::Variant))
     si.manifest = conv_cmi_ty(td.manifest, vars, nv, &nodes);
   si.type_private = td.priv;
+  si.type_immediate = td.immediate;
   si.type_variances = td.variances;
   si.loc = rloc_to_loc(td.loc);
   return si;

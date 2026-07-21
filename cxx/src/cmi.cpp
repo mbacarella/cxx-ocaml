@@ -373,6 +373,10 @@ public:
         cur = cons.fields[1];
       }
     if (d.fields.size() > 9) td.loc = decode_loc(d.fields[9]);  // type_loc
+    // type_immediate : Type_immediacy.t (field 11; all-constant ctors are
+    // constant, so it marshals as an int).
+    if (d.fields.size() > 11 && arena_[d.fields[11]].kind == m::Value::Kind::Int)
+      td.immediate = static_cast<int>(arena_[d.fields[11]].i);
     return td;
   }
 
@@ -2807,10 +2811,11 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           emit_loc(it.loc),                            // type_loc
           // type_attributes: Printtyp derives the printed `[@@immediate]` /
           // `[@@immediate64]` from Type_immediacy.of_attributes of THIS field (not
-          // from type_immediate), so emit the real attribute when marked.
+          // from type_immediate), so emit the real attribute when WRITTEN in
+          // source -- not for a derived all-const-variant Always.
           [&]() -> o::ValPtr {
-            if (!it.type_immediate) return o::vint(0);  // []
-            const char* nm = it.type_immediate == 2 ? "immediate64" : "immediate";
+            if (!it.type_immediate_attr) return o::vint(0);  // []
+            const char* nm = it.type_immediate_attr == 2 ? "immediate64" : "immediate";
             auto attr = o::vblock(0, {
                 o::vblock(0, {o::vstr(nm), loc_none()}),  // attr_name : string loc
                 o::vblock(0, {o::vint(0)}),               // attr_payload = PStr []

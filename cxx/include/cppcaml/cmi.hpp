@@ -164,6 +164,10 @@ struct TypeDecl {
   // record (Record_unboxed) whose value IS its argument -- no box, no field read.
   bool unboxed = false;
   bool priv = false;                    // type_private = Private
+  // type_immediate : Type_immediacy.t -- 0 Unknown / 1 Always / 2
+  // Always_on_64bits.  Only Always is an immediate in bytecode
+  // (Typeopt.is_immediate: 32-bit targets are possible at run time).
+  int immediate = 0;
   TypePtr manifest;                     // type_manifest option (abbreviation)
   // type_variance, one RAW Variance.t int per parameter (a bitfield Printtyp
   // renders as `+`/`-`/`!`); empty when the decl predates the decode.
@@ -497,9 +501,16 @@ struct SigItem {
   // Cty_constr(target, [], inner) -- Printtyp prints `class c : with_param`
   // -- and cty_new becomes Tconstr(target's ghost type).
   std::string class_constr_ref;
-  // Type: Type_immediacy (0 Unknown / 1 Always / 2 Always_on_64bits) from a
-  // `[@@immediate]` / `[@@immediate64]` attribute (Printtyp renders it back).
+  // Type: Type_immediacy (0 Unknown / 1 Always / 2 Always_on_64bits) -- from a
+  // `[@@immediate]` / `[@@immediate64]` attribute, or DERIVED for an
+  // all-constant variant (Typedecl_immediacy.compute_decl).
   int type_immediate = 0;
+  // Type: the attribute as WRITTEN in source (same encoding) -- drives the
+  // type_attributes emission only.  ocamlc's type_attributes carry the
+  // attribute node only when the user wrote it; a derived Always must NOT
+  // print `[@@immediate]` back (Printtyp reads of_attributes, not
+  // type_immediate).
+  int type_immediate_attr = 0;
   // Type: `[@@unboxed]` -- emitted as the Variant_unboxed / Record_unboxed
   // REPRESENTATION (Printtyp derives the printed attr from the representation,
   // not an attribute node).
