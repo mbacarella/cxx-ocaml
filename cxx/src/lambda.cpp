@@ -7411,8 +7411,50 @@ struct Translator {
               return r;
             }
         } catch (...) {}
+        // A local functor-application module (`module C = F(A)`): the exn's
+        // inline-record labels are declared in F's functor-BODY signature -- C
+        // has no cmi of its own and F's cmi holds them one level down, under the
+        // Functor node -- so navigate F via module_functor_src_.
+        if (auto r = functor_result_inline_labels(dotted, name); !r.empty())
+          return r;
       }
     }
+    return {};
+  }
+  // Inline-record labels of an exception declared in a local functor
+  // application's result (`module C = F(A)`, `C.Inconsistency { .. }`): F's
+  // functor-body signature carries the typext, reached through module_functor_src_.
+  std::vector<std::string> functor_result_inline_labels(const std::string& modname,
+                                                        const std::string& exn) {
+    auto fs = module_functor_src_.find(modname);
+    if (fs == module_functor_src_.end()) return {};
+    const std::string& funit = fs->second.first;   // functor unit (maybe dotted)
+    const std::string& fname = fs->second.second;  // the functor's own name
+    try {
+      size_t dot = funit.find('.');
+      const auto& cmi = cmi::CmiFile::load(
+          resolve_cmi(dot == std::string::npos ? funit : funit.substr(0, dot)));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = funit.find('.', pos + 1);
+        std::string comp = funit.substr(pos + 1,
+            nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return {};
+        sig = next; pos = nd;
+      }
+      for (auto& md : sig->modules)
+        if (md.name == fname && md.type && md.type->kind == cmi::ModuleType::Functor)
+          if (const cmi::Signature* body = mt_sig(cmi, md.type->functor_body))
+            for (auto& tx : body->typexts)
+              if (tx.name == exn && tx.is_inline_record) {
+                std::vector<std::string> r;
+                for (auto& l : tx.inline_record) r.push_back(l.name);
+                return r;
+              }
+    } catch (...) {}
     return {};
   }
   // Reorder an inline-record constructor argument's fields into DECLARATION
