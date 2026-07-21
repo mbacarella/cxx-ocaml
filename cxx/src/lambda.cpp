@@ -814,7 +814,29 @@ struct Translator {
   // of {loc; env; ..}`): the fields are FLAT in the exn block at offsets 1.. ,
   // so a `{loc; env}` pattern binds each label to field (1 + its decl index).
   std::unordered_map<std::string, std::vector<std::string>> exn_rlabels_;
-  std::string mod_path_;  // dotted module path prefix for exception names
+  std::string mod_path_;  // dotted module path prefix for __FUNCTION__/__MODULE__
+  // The path prefix for exception/extension-constructor names.  It tracks
+  // mod_path_ EXCEPT a functor component carries its parameter list --
+  // `Consistbl.Make(Module_name).Inconsistency`, matching ocamlc's Path.name of
+  // the extension (which threads the functor argument), whereas __FUNCTION__
+  // drops it (`Consistbl.Make.f`).  The two therefore need separate accumulators.
+  std::string exn_path_;
+  // The parenthesized functor-parameter suffix ocamlc appends to a functor's
+  // component in an exception path: `(P)` (named), `(_)` (anonymous), `(P)(Q)`
+  // (curried).  Empty for a generative `()` functor -- ocamlc collapses that
+  // path to the bare name, a different mechanism we leave to the fallback.
+  static std::string functor_param_suffix(const ModuleExpr& me) {
+    std::string s;
+    for (const ModuleExpr* cur = &me;;) {
+      auto* pf = std::get_if<Pmod_functor>(&cur->desc);
+      if (!pf) break;
+      if (std::holds_alternative<Functor_unit>(pf->param)) return "";
+      auto& np = std::get<Functor_named>(pf->param);
+      s += "(" + (np.name.txt ? *np.name.txt : "_") + ")";
+      cur = pf->body.get();
+    }
+    return s;
+  }
   std::string file_name_;  // source path, for Match_failure/Assert_failure locations
   std::string unit_name_;  // the compilation unit (top module) name, for __MODULE__
   std::vector<std::string> func_path_;  // enclosing function-binding names, for __FUNCTION__
@@ -16664,14 +16686,16 @@ struct Translator {
           const std::string& nm = *mb.name.txt;
           // Entering module N: __FUNCTION__ inside is `<enclosing path>.N.fn`, and
           // the enclosing-function scope resets (N is a new module scope).
-          std::string saved_mp = mod_path_;
+          std::string saved_mp = mod_path_, saved_ep = exn_path_;
           std::vector<std::string> saved_fp = func_path_;
-          std::string cur_path = mod_path_;
+          std::string cur_path = mod_path_, cur_ep = exn_path_;
           for (auto& fn : func_path_) { if (!cur_path.empty()) cur_path += "."; cur_path += fn; }
+          for (auto& fn : func_path_) { if (!cur_ep.empty()) cur_ep += "."; cur_ep += fn; }
           mod_path_ = cur_path + (cur_path.empty() ? "" : ".") + nm;
+          exn_path_ = cur_ep + (cur_ep.empty() ? "" : ".") + nm;
           func_path_.clear();
           LamPtr modval = compile_module_expr(mb.expr);
-          mod_path_ = saved_mp; func_path_ = saved_fp;
+          mod_path_ = saved_mp; func_path_ = saved_fp; exn_path_ = saved_ep;
           auto rl = module_result_layout(mb.expr);
           if (rl.empty()) rl = arg_layout(mb.expr);  // a module path -> its own fields
           // save the names this binding shadows (M is local to the body)
@@ -22356,7 +22380,7 @@ struct Translator {
           }
           continue;
         }
-        auto str = mk(Lam::K::ConstString); str->str_val = mod_path_.empty() ? nm : mod_path_ + "." + nm;
+        auto str = mk(Lam::K::ConstString); str->str_val = exn_path_.empty() ? nm : exn_path_ + "." + nm;
         auto oid = mk(Lam::K::Prim); oid->prim = Prim::Ccall;
         oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
         auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
@@ -22394,7 +22418,7 @@ struct Translator {
               }
             continue;
           }
-          auto str = mk(Lam::K::ConstString); str->str_val = mod_path_.empty() ? nm : mod_path_ + "." + nm;
+          auto str = mk(Lam::K::ConstString); str->str_val = exn_path_.empty() ? nm : exn_path_ + "." + nm;
           auto oid = mk(Lam::K::Prim); oid->prim = Prim::Ccall;
           oid->prim_id = "caml_fresh_oo_id"; oid->args = {cint(0)};
           auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 248;
@@ -22712,8 +22736,9 @@ struct Translator {
         if (mb.name.txt)
           if (auto* ps = std::get_if<Pmod_structure>(&me->desc)) {
             std::vector<std::string> sub;
-            std::string saved = mod_path_;
+            std::string saved = mod_path_, saved_ep = exn_path_;
             mod_path_ += "." + *mb.name.txt;  // nested exceptions are "Outer.M.E"
+            exn_path_ += "." + *mb.name.txt;
             auto exn_before = exn_ident_;
             auto mod_before = module_ident_;
             auto alias_before = module_alias_;
@@ -22732,7 +22757,7 @@ struct Translator {
                                        sub_coerce_sig, &submsig, sub_coerce_msig);
             for (auto& [k, v] : lprims_before) local_prims_[k] = v;
             for (auto& [k, v] : exts_before) externals_[k] = v;
-            mod_path_ = saved;
+            mod_path_ = saved; exn_path_ = saved_ep;
             Ident mid = fresh_scoped(*mb.name.txt);
             cur.push_back({mid, ValueKind::Gen, body});
             auto& lay = module_layout_[*mb.name.txt]; lay.clear();
@@ -22821,6 +22846,10 @@ struct Translator {
             Ident mid = fresh_scoped(*mb.name.txt);     // a functor binds as a function
             std::string saved_mp = mod_path_;  // __FUNCTION__ inside is `..Functor.fn`
             mod_path_ += (mod_path_.empty() ? "" : ".") + *mb.name.txt;
+            // exn names thread the functor parameters (`..Make(P).E`); __FUNCTION__ does not
+            std::string saved_ep = exn_path_;
+            exn_path_ += (exn_path_.empty() ? "" : ".") + *mb.name.txt +
+                         functor_param_suffix(mb.expr);
             // .mli-driven functor-result coercion: lay this functor's body struct
             // out per its declared result signature (the .ml has no `: S`).  Keys in
             // mli_functor_results_ are unit-relative ("Engine.Make"); saved_mp here is
@@ -22900,6 +22929,7 @@ struct Translator {
             pending_functor_coerce_.clear();
             pending_functor_coerce_sig_ = nullptr;
             mod_path_ = saved_mp;
+            exn_path_ = saved_ep;
             if (!pending_functor_eta_result_.empty()) {
               functor_export_eta_[*mb.name.txt] =
                   std::move(pending_functor_eta_result_);
@@ -23176,8 +23206,11 @@ struct Translator {
             const std::string& nm = *rm.mb->name.txt;
             std::string saved_mp = mod_path_;  // __FUNCTION__ inside is `..Rec2.fn`
             mod_path_ += (mod_path_.empty() ? "" : ".") + nm;
+            std::string saved_ep = exn_path_;
+            exn_path_ += (exn_path_.empty() ? "" : ".") + nm +
+                         functor_param_suffix(*rm.bodyme);
             LamPtr mv = compile_module_expr(*rm.bodyme);
-            mod_path_ = saved_mp;
+            mod_path_ = saved_mp; exn_path_ = saved_ep;
             if (std::holds_alternative<Pmod_functor>(rm.bodyme->desc)) {
               // a FUNCTOR member (`Rec2 : functor(X)->.. = functor(X)->..`): a
               // sibling's `Rec2(arg).m` resolves via functor_result_, not a layout.
@@ -23219,13 +23252,14 @@ struct Translator {
             if (rm.body) {
               std::vector<std::string> co = sig_layout(*rm.sig);
               std::vector<std::string> sub;
-              std::string saved = mod_path_;
+              std::string saved = mod_path_, saved_ep = exn_path_;
               mod_path_ += "." + *rm.mb->name.txt;
+              exn_path_ += "." + *rm.mb->name.txt;
               // modsig P3 stage 3: the ascription tail takes the computed
               // coercion when the msig target is trusted (counted else)
               body = build_module(rm.body->items, &sub, &co, nullptr, nullptr,
                                   nullptr, msig_of_modtype(*rm.sig));
-              mod_path_ = saved;
+              mod_path_ = saved; exn_path_ = saved_ep;
             } else {  // `module rec Id : S = Id` / `= F(X)` and other non-struct bodies
               body = compile_module_expr(*rm.bodyme);
               // coerce a functor-application body's result to the binding's sig
@@ -23267,10 +23301,12 @@ struct Translator {
         // functor application) is bound to `include/N` first for its effect.
         // an anonymous included struct's exceptions have a bare path
         // (Printexc prints "XXX", not "Unit.XXX")
-        std::string sv_path = mod_path_;
-        if (std::get_if<Pmod_ident>(&pin->expr.desc) == nullptr) mod_path_.clear();
+        std::string sv_path = mod_path_, sv_ep = exn_path_;
+        if (std::get_if<Pmod_ident>(&pin->expr.desc) == nullptr) {
+          mod_path_.clear(); exn_path_.clear();
+        }
         LamPtr mv = compile_module_expr(pin->expr);
-        mod_path_ = sv_path;
+        mod_path_ = sv_path; exn_path_ = sv_ep;
         const Pmty_signature* tsig = nullptr;  // a constrained include's sig items
         if (auto* pcst = std::get_if<Pmod_constraint>(&pin->expr.desc))
           tsig = sig_items_of(*pcst->mt);
@@ -23875,6 +23911,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   } catch (...) {}
   lap("register types/ctors + stdlib.cmi");
   t.mod_path_ = module_name;
+  t.exn_path_ = module_name;
   t.unit_name_ = module_name;
   // If this unit has a hand-written interface (.mli, already compiled to .cmi),
   // coerce the implementation's module block to the interface's field order --
