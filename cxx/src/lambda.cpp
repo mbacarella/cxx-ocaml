@@ -21672,7 +21672,15 @@ struct Translator {
         std::string nm = "*";
         const Functor_named* fp = std::get_if<Functor_named>(&pf->param);
         if (fp) nm = fp->name.txt ? *fp->name.txt : "_";  // anonymous param prints `_`
-        Ident pid = fresh_scoped(nm);
+        // ocamlc's Translmod.compile_functor renames each functor parameter
+        // (`param' = Ident.rename param`) AFTER translating the body, and
+        // Ident.rename ALWAYS yields a Local ident with a fresh stamp -- even for
+        // a Scoped typedtree param.  Simplif then inlines the `Llet Alias param =
+        // param'`, so the ident captured by the body's inner closures is that
+        // renamed param': Local, and stamped after every body ident.  So a
+        // functor param sorts LAST among a closure's Local free vars (not first
+        // like a Scoped module binder).  Model it as Local + late, not Scoped.
+        Ident pid = fresh(nm); pid.late = true;
         // Bind the parameter X (with its signature's value layout) so `X.foo`
         // inside the body resolves to `(field_imm i X)`.  Save/restore for nesting.
         saves.push_back({nm, module_ident_.count(nm) != 0,
