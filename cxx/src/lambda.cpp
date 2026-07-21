@@ -10954,6 +10954,60 @@ struct Translator {
   //    default-matrix argument capture.
   LamPtr gmatch(std::vector<LamPtr> comps, std::vector<MRow> rows,
                 const Location& mloc, int deid, std::vector<GmDef> denv = {}) {
+    // matching.ml's split_and_precompile guard barrier, in the specific shape that
+    // must run BEFORE the gm_facc field-column materialization below.  After a
+    // cons/Some dispatch decomposes the scrutinee into head/tail field columns, a
+    // spread-in leading guard row is `(_, _) when g` -- a catch-all in EVERY column.
+    // If the shared head column (comps[0], a deferred gm_facc field read) were
+    // materialized first, its `let head = field 0 l` would wrap the whole result,
+    // above the guard, whereas ocamlc reads the field only on guard failure
+    // (printlambda's `block_shape`).  Splitting here -- leading row as group A with a
+    // fresh fall-through exit, the rest as its handler -- leaves group A (a pure
+    // guard) free of any field reference, so each field materializes only inside
+    // group B where it is used.
+    //   Gated on comps[0] being a gm_facc field column: that is exactly the
+    // post-decomposition field-hoist case, and it keeps this out of the way of the
+    // single-column, post-materialization guard split below (which handles top-level
+    // scrutinee matches and the truncation/chunk preprocessing they depend on).
+    //   And only when the NEXT row is unguarded (`!rows[1].guard`): the guard must be a
+    // true barrier over more-specific UNGUARDED rows (block_shape's `_ when g` before
+    // `[elt]`/`h::t`), not one link of a same-constructor guard CHAIN (simplif's
+    // `Some {func;_} when g0 | Some {scope=..;_} when g1 | ..`, whose rows ocamlc keeps
+    // together, dispatching the constructor once and sharing the field reads across the
+    // guards).  Peeling a single link of such a chain re-reads those shared fields.
+    //   Every column of the guard row must be a pure WILDCARD (Ppat_any), not just a
+    // catch-all: a VARIABLE column binds a field, and if the guard uses that binding
+    // (`Some (id, _) when f id` in signature_group -> tuple columns `[id, _]`) group A
+    // reads the field to test the guard and group B reads it again -- duplicating a
+    // field read ocamlc shares.  A wildcard column carries no binding, so group A's
+    // guard can only reference outer values (block_shape's `l`, bound to the whole
+    // cons before decomposition), leaving each field to materialize once, inside group
+    // B.  A pure all-wildcard row also does no dispatch in group A, so group B is never
+    // a repeat regardless of column count (unlike a `(_, X) when g` mixed row, which
+    // would make group A test column 1).  Empty default env only (the chunked-default
+    // threading routes misses through its own env stack).
+    if (denv.empty() && rows.size() >= 2 && rows[0].guard && !rows[1].guard &&
+        !comps.empty() && comps[0] && comps[0]->gm_facc) {
+      bool allwild = true;                // a pure guard row: WILDCARD in EVERY column
+      for (auto* c : rows[0].cols)
+        if (!std::holds_alternative<Ppat_any>(c->desc)) { allwild = false; break; }
+      if (allwild) {
+        int e = ++next_exit_;
+        std::vector<MRow> A(rows.begin(), rows.begin() + 1);
+        std::vector<MRow> B(rows.begin() + 1, rows.end());
+        std::vector<LamPtr> ca = comps, cb = comps;
+        LamPtr bodyA = gmatch(std::move(ca), std::move(A), mloc, e);
+        LamPtr bodyB = bodyA ? gmatch(std::move(cb), std::move(B), mloc, deid) : nullptr;
+        if (bodyA && bodyB) {
+          int bad = 0; int uses = count_exit(bodyA, e, false, bad);
+          if (uses == 0) { --next_exit_; return bodyA; }
+          if (uses == 1 && bad == 0) { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          auto c = mk(Lam::K::Catch); c->cond = bodyA; c->prim_arg = e; c->then_ = bodyB;
+          return c;
+        }
+        --next_exit_;                     // fall through to the spread path
+      }
+    }
     if (!comps.empty() && comps[0] && comps[0]->gm_facc) {
       LamPtr proto = comps[0];
       // Upstream's name_pattern: the binding takes the first var/alias row's
@@ -11523,7 +11577,9 @@ struct Translator {
     // that test (emitcode's 2-column peephole matrix `(_, X) when g` blew up 8x this
     // way).  A single column means group A is a pure guard with no dispatch, so group
     // B's continuation is not a repeat.  Empty default env only (the chunked-default
-    // threading routes misses through its own env stack).
+    // threading routes misses through its own env stack).  (The gm_facc all-columns
+    // catch-all variant -- a field-hoist barrier that must run BEFORE materialization
+    // -- is handled at the top of gmatch.)
     if (denv.empty() && comps.size() == 1)
       for (size_t k = 0; k + 1 < rows.size(); ++k) {
         auto& d = rows[k].cols[0]->desc;
