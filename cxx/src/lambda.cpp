@@ -7408,6 +7408,31 @@ struct Translator {
     }
     return {};
   }
+  // Reorder an inline-record constructor argument's fields into DECLARATION
+  // order (per `labels`), for flattening directly into the exception/extension
+  // block (`E of { a; b }` -> `(makeblock 0 E a b)`, ocamlc's Cstr_inlined
+  // layout).  The inline-record labels are NOT a named record type, so a plain
+  // `expr` of the `{ .. }` would resolve no fields and drop the payload; the
+  // reorder must be driven by the ctor's own label list.  Returns false
+  // (leaving `out` untouched) unless `arg` is a plain inline record whose fields
+  // line up one-to-one with `labels`.
+  bool flatten_inline_record_arg(const Expression* arg,
+                                 const std::vector<std::string>& labels,
+                                 std::vector<const Expression*>& out) {
+    if (labels.empty()) return false;
+    auto* rc = std::get_if<Pexp_record>(&arg->desc);
+    if (!rc || rc->base || rc->fields.size() != labels.size()) return false;
+    std::vector<const Expression*> vexps(labels.size(), nullptr);
+    for (auto& [lid, ve] : rc->fields) {
+      int ix = -1;
+      for (size_t i = 0; i < labels.size(); ++i)
+        if (labels[i] == lid_last(lid.txt)) { ix = (int)i; break; }
+      if (ix < 0 || vexps[ix]) return false;
+      vexps[ix] = ve.get();
+    }
+    for (auto* ve : vexps) out.push_back(ve);
+    return true;
+  }
   struct PayloadTest { int idx; LamPtr rhs; bool string_eq;
                        // tag_test: compare caml_obj_tag(field idx) against rhs
                        // (a block variant-ctor payload; an immediate's tag is
@@ -17636,10 +17661,14 @@ struct Translator {
         int arity = uarity >= 0 ? uarity
                     : exn_arity_.count(n) ? exn_arity_[n] : 1;  // applied: block tag 0
         std::vector<const Expression*> fs;
-        if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
-            at && arity > 1 && (int)at->elems.size() == arity)
-          for (auto& el : at->elems) fs.push_back(el.get());
-        else fs.push_back(k->arg->get());
+        // an inline-record extension ctor flattens its fields into the block
+        if (!flatten_inline_record_arg(k->arg->get(),
+                                       exn_inline_labels(n, &k->id.txt), fs)) {
+          if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+              at && arity > 1 && (int)at->elems.size() == arity)
+            for (auto& el : at->elems) fs.push_back(el.get());
+          else fs.push_back(k->arg->get());
+        }
         std::vector<LamPtr> fields = {cid};
         std::vector<ValueKind> shape = {ValueKind::Gen};
         for (auto* ex : fs) { fields.push_back(expr(*ex)); shape.push_back(expr_kind(ex)); }
@@ -17904,11 +17933,16 @@ struct Translator {
         int arity = 1;
         if (auto a = exn_arity_.find(n); a != exn_arity_.end()) arity = a->second;
         std::vector<const Expression*> fs;
-        if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
-            at && arity > 1 && (int)at->elems.size() == arity)
-          for (auto& el : at->elems) fs.push_back(el.get());
-        else
-          fs.push_back(k->arg->get());
+        // an inline-record exception (`E of { a; b }`) flattens its record
+        // fields directly into the block, in declaration order
+        if (!flatten_inline_record_arg(k->arg->get(),
+                                       exn_inline_labels(n, &k->id.txt), fs)) {
+          if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+              at && arity > 1 && (int)at->elems.size() == arity)
+            for (auto& el : at->elems) fs.push_back(el.get());
+          else
+            fs.push_back(k->arg->get());
+        }
         std::vector<LamPtr> fields = {v};
         std::vector<ValueKind> shape = {ValueKind::Gen};
         for (auto* ex : fs) { fields.push_back(expr(*ex)); shape.push_back(expr_kind(ex)); }
