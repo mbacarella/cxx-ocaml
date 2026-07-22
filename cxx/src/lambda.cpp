@@ -1169,6 +1169,7 @@ struct Translator {
   std::unordered_map<std::string, std::unordered_map<std::string, FieldInfo>> type_field_info_;
   std::set<std::string> scoped_unambig_fields_;
   struct RecType { std::vector<std::string> labels; bool mut; std::vector<ValueKind> shape;
+                   std::vector<bool> fmut;  // per-field mutability, parallel to labels
                    bool flat = false; };  // all-float: a flat float block, not a record
   std::unordered_map<std::string, RecType> rec_types_;  // type name -> record layout
 
@@ -1979,6 +1980,7 @@ struct Translator {
           ValueKind k = coretype_kind(*f.type);
           bool m = f.mut == MutableFlag::Mutable;
           rt.mut |= m;
+          rt.fmut.push_back(m);
           rt.flat = rt.flat && is_float_core(*f.type);
           rt.labels.push_back(f.name.txt);
           rt.shape.push_back(k);
@@ -2037,6 +2039,7 @@ struct Translator {
                 ValueKind k = coretype_kind(*f.type);
                 bool m = f.mut == MutableFlag::Mutable;
                 rt.mut |= m;
+                rt.fmut.push_back(m);
                 rt.flat = rt.flat && is_float_core(*f.type);
                 rt.labels.push_back(f.name.txt);
                 rt.shape.push_back(k);
@@ -3394,6 +3397,7 @@ struct Translator {
             ValueKind k = cmi_field_kind(td.labels[j].type);
             bool m = td.labels[j].mutable_;
             rt.mut |= m;
+            rt.fmut.push_back(m);
             rt.labels.push_back(td.labels[j].name);
             rt.shape.push_back(k);
             if (fresh_type && !field_info_.count(td.labels[j].name) &&
@@ -3534,7 +3538,8 @@ struct Translator {
           for (int j = 0; j < (int)td.labels.size(); ++j) {
             ValueKind k = cmi_field_kind(td.labels[j].type);
             bool m = td.labels[j].mutable_;
-            rt.mut |= m; rt.labels.push_back(td.labels[j].name); rt.shape.push_back(k);
+            rt.mut |= m; rt.fmut.push_back(m);
+            rt.labels.push_back(td.labels[j].name); rt.shape.push_back(k);
             // A later `open M` SHADOWS an earlier record's label, matching
             // OCaml's resolution of a bare label to the most-recently-opened
             // record.  Two cases, BOTH last-open-wins:
@@ -5137,7 +5142,7 @@ struct Translator {
     if (!rec_types_.count(ty)) {  // make it visible to from()/find paths
       RecType rt; rt.labels = it->second.labels; rt.shape = it->second.shape;
       rt.flat = it->second.flat; rt.mut = false;
-      for (bool m : it->second.mut) rt.mut = rt.mut || m;
+      for (bool m : it->second.mut) { rt.mut = rt.mut || m; rt.fmut.push_back(m); }
       rec_types_[ty] = std::move(rt);
     }
     for (int i = 0; i < (int)it->second.labels.size(); ++i)
@@ -9390,22 +9395,67 @@ struct Translator {
       LamPtr sv = materialize(scrut);
       std::vector<std::string> flds;
       for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
-      // ocamlc reads a record pattern's fields in reverse DECLARATION-INDEX order,
-      // not the pattern's mention order -- so `{pparam_desc; pparam_loc}` (where
-      // pparam_loc is field 0) reads field 1 first.  Resolve every field's block
-      // index up front; when all resolve, emit reads by descending index.  Keep the
+      // ocamlc's record-pattern bindings come from matching.ml expanding the row
+      // to EVERY field in declaration order (all_record_args), then consuming
+      // columns left to right: an immutable field's binding is deferred onto the
+      // row and flushed in reverse accumulation order, while a MUTABLE column --
+      // even an unmentioned one -- is a StrictOpt barrier that flushes the
+      // pending immutables (reversed) before binding in place.  So an
+      // all-immutable record reads by DESCENDING declaration index, but any
+      // mutable field in the type interleaves ascending around the barriers
+      // (`{za; zd}` of `{za; zb; mutable zc; zd}` reads za then zd).  Keep the
       // reverse-mention path for the `ref`/{contents} mutable-field case (field
       // unresolved by resolve_record_pat_field).
-      struct RF { int index; const Pattern* sub; FieldInfo fi; };
+      struct RF { int index; const Pattern* sub; FieldInfo fi; std::string lbl; };
       std::vector<RF> rfs; bool all_ok = true;
       for (auto& [lbl, sub] : pr->fields) {
         FieldInfo nfi;
         const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
         tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
         if (!fi) { all_ok = false; break; }
-        rfs.push_back({fi->index, sub.get(), *fi});
+        rfs.push_back({fi->index, sub.get(), *fi, lid_last(lbl.txt)});
       }
       if (all_ok) {
+        const RecType* rty = nullptr;
+        for (auto& rf : rfs)
+          if (!rf.fi.type.empty())
+            if (auto it = rec_types_.find(rf.fi.type); it != rec_types_.end()) {
+              rty = &it->second; break;
+            }
+        if (!rty)
+          if (auto* kv = record_for_fields(flds)) rty = &kv->second;
+        bool any_mut = false;
+        if (rty && rty->fmut.size() == rty->labels.size()) {
+          for (auto& rf : rfs)
+            if (rf.index < 0 || rf.index >= (int)rty->labels.size() ||
+                rty->labels[rf.index] != rf.lbl) { rty = nullptr; break; }
+          if (rty) for (bool m : rty->fmut) any_mut = any_mut || m;
+        } else rty = nullptr;
+        if (rty && any_mut) {
+          std::sort(rfs.begin(), rfs.end(),
+                    [](const RF& a, const RF& b) { return a.index < b.index; });
+          std::vector<RF*> pending;
+          auto flush = [&]() -> bool {
+            for (auto pit = pending.rbegin(); pit != pending.rend(); ++pit)
+              if (!collect_binders(*(*pit)->sub, field_read(&(*pit)->fi, sv), out))
+                return false;
+            pending.clear();
+            return true;
+          };
+          size_t k = 0;
+          for (int col = 0; col < (int)rty->fmut.size(); ++col) {
+            bool mentioned = k < rfs.size() && rfs[k].index == col;
+            if (rty->fmut[col]) {
+              if (!flush()) return false;
+              if (mentioned) {
+                if (!collect_binders(*rfs[k].sub, field_read(&rfs[k].fi, sv), out))
+                  return false;
+                ++k;
+              }
+            } else if (mentioned) pending.push_back(&rfs[k++]);
+          }
+          return flush();
+        }
         std::sort(rfs.begin(), rfs.end(), [](const RF& a, const RF& b) { return a.index > b.index; });
         for (auto& rf : rfs)
           if (!collect_binders(*rf.sub, field_read(&rf.fi, sv), out)) return false;
