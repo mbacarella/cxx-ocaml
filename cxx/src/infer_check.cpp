@@ -5577,6 +5577,35 @@ struct Checker {
     return t;
   }
 
+  // Type-directed disambiguation of a shadowed constructor in PATTERN position
+  // (consumer twin of the infer_expr_expected producer fix): a bare pattern ctor
+  // resolves by the SCRUTINEE type, not by lexical scope.  infer_pat used
+  // find_ctor (last-in-scope), so when its recorded type disagrees with the
+  // scrutinee variant, re-record the scrutinee type -- else `match n with Type ->`
+  // (n : Shape.Sig_component_kind.t, under `open Typedtree`) tested the shadowing
+  // item_declaration.Type BLOCK tag where the constant tag was meant, disagreeing
+  // with a type-directed CONSTRUCTION of the same value (a producer/consumer
+  // miscompile the effid/DDC gates don't catch -- only a construct+match exec).
+  void disambig_pat_by_scrut(const Pattern& lhs, const TypePtr& scrut) {
+    if (!record_kinds_) return;
+    auto* k = std::get_if<ast::Ppat_construct>(&lhs.desc);
+    if (!k || !std::holds_alternative<Lident>(k->id.txt.v)) return;
+    TypePtr sr = I::Engine::repr(scrut);
+    if (sr->kind != I::Type::Kind::Constr ||
+        sr->path.find('.') == std::string::npos)
+      return;
+    auto rp = rec_pat_.find(&lhs);
+    if (rp == rec_pat_.end()) return;
+    TypePtr pr = I::Engine::repr(rp->second);
+    std::string found = pr->kind == I::Type::Kind::Constr ? pr->path : "";
+    auto lastc = [](const std::string& s) {
+      auto d = s.rfind('.');
+      return d == std::string::npos ? s : s.substr(d + 1);
+    };
+    if (!found.empty() && lastc(found) != lastc(sr->path))
+      rec_pat_[&lhs] = scrut;
+  }
+
   // A `#t` pattern's row: t must be an abbreviation of a poly-variant row
   // (`type rte = [ `A of .. | `B ]`); the pattern means "any of t's tags", i.e.
   // the UPPER bound `[< tags-with-declared-args ]`.  Builds a fresh row instance
@@ -6324,12 +6353,39 @@ struct Checker {
     // expr_constr and the back end registers the type's ctors, resolving the bare
     // ctor (predef's `decl0 ~immediate:Always`, with immediate : Type_immediacy.t).
     if (record_kinds_)
-      if (auto* k = std::get_if<Pexp_construct>(&e.desc))
-        if (!find_ctor(lid_last(k->id.txt))) {
-          TypePtr er = I::Engine::repr(expected);
-          if (er->kind == I::Type::Kind::Constr && er->path.find('.') != std::string::npos)
-            rec_expr_[&e] = expected;
-        }
+      if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
+        std::string cn = lid_last(k->id.txt);
+        TypePtr er = I::Engine::repr(expected);
+        bool er_variant = er->kind == I::Type::Kind::Constr &&
+                          er->path.find('.') != std::string::npos;
+        TypePtr* sch = find_ctor(cn);
+        if (er_variant && !sch) {
+          rec_expr_[&e] = expected;
+        } else if (er_variant && sch &&
+                   std::holds_alternative<Lident>(k->id.txt.v)) {
+            // Type-directed disambiguation of a SHADOWED constructor: a bare ctor
+            // resolves by its EXPECTED type, not by lexical scope.  find_ctor
+            // returns the LAST-in-scope scheme, so when that scheme's owning type
+            // differs from the expected variant, record the expected type instead
+            // -- the back end then reads the right tag/constant-ness.  cmt_format's
+            // `f ~namespace:Type` (expected Shape.Sig_component_kind.t) otherwise
+            // resolved to the shadowing `open Typedtree` item_declaration.Type, a
+            // tag-3 BLOCK, where the constant tag-1 was meant (a mis-tagged atom,
+            // not an immediate).  Cross-unit shadows aren't in ambiguous_ctors_,
+            // so key on the type mismatch directly; a genuinely-correct resolution
+            // has found == expected (same last component) and is left untouched.
+            TypePtr res;
+            ctor_params(eng.instantiate(*sch), res);
+            TypePtr rr = I::Engine::repr(res);
+            auto lastc = [](const std::string& s) {
+              auto d = s.rfind('.');
+              return d == std::string::npos ? s : s.substr(d + 1);
+            };
+            std::string found = rr->kind == I::Type::Kind::Constr ? rr->path : "";
+            if (!found.empty() && lastc(found) != lastc(er->path))
+              rec_expr_[&e] = expected;
+          }
+      }
     // Optional-argument erasure (ocaml's type_argument): a value of type
     // `?l:.. -> ..` used where a non-optional arrow is expected is eta-expanded
     // with None for the omitted optional(s).  Recorded for the Lambda back end;
@@ -6620,6 +6676,7 @@ struct Checker {
         TypePtr pt = infer_pat(c.lhs);
         if (window) soft_unify(pt, se);
         else if (!gadt) try_unify(pt, se);
+        disambig_pat_by_scrut(c.lhs, se);
         if (c.guard) infer_expr(**c.guard);
         TypePtr br = infer_expr(*c.rhs);
         if (window) soft_unify(br, rt);
@@ -7901,6 +7958,7 @@ struct Checker {
           } else res_all_ground = false;
         } else {
           try_unify(infer_pat(c.lhs), arg);
+          disambig_pat_by_scrut(c.lhs, arg);
           if (c.guard) infer_expr(**c.guard);  // flows operand kinds; not bool-constrained
           try_unify(infer_expr(*c.rhs), rt);
         }
