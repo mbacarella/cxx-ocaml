@@ -199,6 +199,13 @@ struct Lam {
   // chunk boundary).  We keep the catch through construction for the same
   // reason and inline single-use handlers in a late pass (inline_chunk_catches).
   bool gm_chunk = false;
+  // gm_orp: a PENDING or-handler catch created at the or-alternation expansion
+  // point in gmatch (matching.ml's precompile_or wraps the handler catch around
+  // the compile of the pm at the depth where the or-column is consumed).  The
+  // handler body and catch vars are filled in by wire_garms; if the arm turns
+  // out single-use/unreachable (or the node sits at the body root, where the
+  // wire-time root placement is already upstream's), the node is spliced out.
+  bool gm_orp = false;
   // from_alias: this node was substituted in place of a single-use pattern
   // binder (wrap_binders' inline of an alias let).  At the corresponding point
   // in ocamlc's pipeline (Matching/for_let, BEFORE Simplif) this position held

@@ -885,6 +885,14 @@ struct Translator {
   // handlers re-read their argument expressions; only or-bound vars ride the
   // exit).
   std::unordered_map<int, LamPtr> gm_facc_proto_;
+  // Arm exit-ids already wrapped in a pending or-handler catch (gm_orp) during
+  // the CURRENT body build.  Guards against wrapping the same arm twice when a
+  // duplicated row's or-column expands in two subtrees (we duplicate var-spread
+  // rows where matching.ml shares them via the default env); the second subtree
+  // stays unwrapped and wire_garms falls back to root placement.  Cleared by
+  // the top entries before each build attempt (a bailed pass-1 build would
+  // otherwise suppress the wrap on pass 2).
+  std::set<int> gm_orw_;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -11298,14 +11306,52 @@ struct Translator {
           r.cols[0] = &gm_any_pat;
     }
     // Expand an or-pattern in column 0 into separate rows (order preserved).
+    // A binding or-row also gets a PENDING handler catch wrapped around this
+    // level's result: matching.ml's precompile_or scopes the or-handler at the
+    // depth where the or-column is consumed (inside that column's scrutinee
+    // let, outside the sub-pm it splits), while an arm shared only by row
+    // duplication stays at the body root.  wire_garms fills the handler in (or
+    // splices the node out when the arm is single-use / at the root anyway).
+    // First or-row wraps first = innermost, compile_orhandlers' fold order.
     for (auto& r : rows)
       if (std::get_if<Ppat_or>(&r.cols[0]->desc)) {
+        // A guarded row anywhere in the matrix routes upstream through its
+        // context-split machinery (a different catch discipline that our
+        // wire-time root placement approximates better) -- skip the
+        // split-point wrap there (ctype's mcomp).
+        bool any_guard = false;
+        for (auto& rr : rows) if (rr.guard) { any_guard = true; break; }
         std::vector<MRow> ex;
+        std::vector<int> wrapped;
         for (auto& rr : rows) {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
+          if (!any_guard && alts.size() > 1 && rr.aid >= 0 && rr.vnames &&
+              !rr.vnames->empty() && gm_orw_.insert(rr.aid).second)
+            wrapped.push_back(rr.aid);
           for (auto* a : alts) { MRow nr = rr; nr.cols[0] = effective_pat(a); ex.push_back(std::move(nr)); }
         }
-        return gmatch(std::move(comps), std::move(ex), mloc, deid, std::move(denv));
+        std::string c0key = wrapped.empty()
+            ? std::string() : cppcaml::lambda::make_lam_key(comps[0]);
+        LamPtr sub = gmatch(std::move(comps), std::move(ex), mloc, deid, std::move(denv));
+        if (!sub) return nullptr;
+        for (int aid : wrapped) {
+          // Upstream binds the or-column's OWN scrutinee before splitting, so
+          // the catch sits inside that one materialized binding (typedecl's
+          // `*match* = field_imm 2 val`) but outside everything else -- a
+          // record-field let group of a top-level record-or stays under the
+          // catch (pp_type_expansion).  Sink through at most the single
+          // leading let that binds exactly the column-0 access.
+          LamPtr* slot = &sub;
+          Lam* l = slot->get();
+          if (l && l->k == Lam::K::Let && l->body && l->bindings.size() == 1 &&
+              !c0key.empty() && l->bindings[0].val &&
+              cppcaml::lambda::make_lam_key(l->bindings[0].val) == c0key)
+            slot = &l->body;
+          auto c = mk(Lam::K::Catch); c->prim_arg = aid; c->cond = *slot;
+          c->gm_orp = true;
+          *slot = c;
+        }
+        return sub;
       }
     // Nested tuple column: a tuple type is monomorphic, so every value is a k-block
     // and we destructure unconditionally (no tag test) into k leading columns.  Only
@@ -12170,6 +12216,25 @@ struct Translator {
     for (auto& sc : l->sw_blocks) if (stamp_bound_in(sc.body, stamp)) return true;
     return false;
   }
+  // The slot holding the pending or-handler catch (gm_orp) for `aid`, if any.
+  // Static exits never cross a function boundary, so nested Lfunctions are
+  // not searched.
+  static LamPtr* find_orp_slot(LamPtr& l, int aid) {
+    if (!l) return nullptr;
+    if (l->k == Lam::K::Catch && l->gm_orp && l->prim_arg == aid) return &l;
+    if (l->k == Lam::K::Function) return nullptr;
+    if (LamPtr* r = find_orp_slot(l->fn, aid)) return r;
+    if (LamPtr* r = find_orp_slot(l->cond, aid)) return r;
+    if (LamPtr* r = find_orp_slot(l->then_, aid)) return r;
+    if (LamPtr* r = find_orp_slot(l->else_, aid)) return r;
+    if (LamPtr* r = find_orp_slot(l->body, aid)) return r;
+    if (LamPtr* r = find_orp_slot(l->sw_default, aid)) return r;
+    for (auto& a : l->args) if (LamPtr* r = find_orp_slot(a, aid)) return r;
+    for (auto& b : l->bindings) if (LamPtr* r = find_orp_slot(b.val, aid)) return r;
+    for (auto& sc : l->sw_consts) if (LamPtr* r = find_orp_slot(sc.body, aid)) return r;
+    for (auto& sc : l->sw_blocks) if (LamPtr* r = find_orp_slot(sc.body, aid)) return r;
+    return nullptr;
+  }
   // The slot at which to scope a shared static-catch for exit `aid`, tighter
   // than the body root.  matching.ml scopes a shared catch around exactly the
   // sub-matrix that references it, NOT the whole match; a matcher's exits are in
@@ -12231,6 +12296,27 @@ struct Translator {
   void wire_garms(LamPtr& body, std::vector<GArm>& arms) {
     for (auto& a : arms) {
       int bad = 0; int uses = count_exit(body, a.aid, false, bad);
+      // A pending or-handler catch (created at the or-split point) is KEPT only
+      // when the arm is genuinely shared, every exit lives under it, and it
+      // sits deeper than the wire-time catch chain at the body root (where the
+      // root placement is already upstream's) -- else it is spliced out here
+      // and the arm takes the normal path below.
+      LamPtr* pend = find_orp_slot(body, a.aid);
+      if (pend) {
+        bool keep = uses > 1 || (uses == 1 && bad > 0);
+        if (keep) {
+          int b2 = 0;
+          if (count_exit((*pend)->cond, a.aid, false, b2) != uses) keep = false;
+        }
+        if (keep) {
+          for (LamPtr* p = &body;;) {
+            if (p == pend) { keep = false; break; }
+            Lam* l = p->get();
+            if (l && l->k == Lam::K::Catch) p = &l->cond; else break;
+          }
+        }
+        if (!keep) { LamPtr t = (*pend)->cond; *pend = t; pend = nullptr; }
+      }
       if (uses == 0) continue;                       // arm unreachable (dead row)
       bool shared = !(uses == 1 && bad == 0);
       // reread[k]: non-null -> param k dropped, handler re-reads this chain.
@@ -12316,6 +12402,14 @@ struct Translator {
         for (size_t k = 0; k < alias.size(); ++k)
           if (alias[k]) { has_alias = true;
             if (rhs_is_bare_ident(a.rhs, a.vnames[k])) ident_arm = true; }
+        if (pend && !has_alias) {   // fill the split-point catch in place
+          (*pend)->catch_vars = std::move(cvs);
+          (*pend)->catch_var_kinds = std::move(cks);
+          (*pend)->then_ = handler; (*pend)->gm_orp = false;
+          continue;
+        }
+        if (pend) { LamPtr t = (*pend)->cond; *pend = t; }  // alias arms keep the
+                                                            // calibrated lca path
         LamPtr* slot = has_alias ? lca_exit_slot(&body, a.aid, ident_arm) : &body;
         auto c = mk(Lam::K::Catch); c->cond = *slot; c->prim_arg = a.aid;
         c->catch_vars = std::move(cvs); c->catch_var_kinds = std::move(cks); c->then_ = handler;
@@ -12432,9 +12526,11 @@ struct Translator {
     // budget so a ctor-wrapped tuple (`K (a, B x)`) becomes a switch instead of the
     // caml_obj_tag if-chain, while the cartesian var-spread stays capped (bails back
     // to int_cases = the pre-existing path, so this can only add captures).
+    gm_orw_.clear();
     LamPtr body = gmatch({sv}, mrows, mloc, deid);
     if (!body) {
       g_gm_tuples_ = true; g_gm_budget_ = gm_budget();
+      gm_orw_.clear();
       body = gmatch({sv}, mrows, mloc, deid);
       g_gm_tuples_ = false; g_gm_budget_ = -1;
     }
@@ -14335,6 +14431,7 @@ struct Translator {
     // reads instead of bailing (which would force the whole tuple scrutinee to be
     // allocated as a block and matched via caml_obj_tag).
     g_gm_tuples_ = true; g_gm_budget_ = gm_budget();
+    gm_orw_.clear();
     LamPtr body = gmatch(comps, mrows, mloc, deid);
     g_gm_tuples_ = false; g_gm_budget_ = -1;
     if (!body) return nullptr;
