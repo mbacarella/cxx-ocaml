@@ -6381,9 +6381,31 @@ struct Checker {
               auto d = s.rfind('.');
               return d == std::string::npos ? s : s.substr(d + 1);
             };
+            // Same LAST component does not mean same type across modules
+            // (Parsetree and Typedtree both declare `functor_parameter`;
+            // untypeast's `Named (name, mt)` found Typedtree's arity-3 ctor
+            // where the annotated Parsetree arity-2 one was meant, boxing the
+            // written pair into one field).  When BOTH paths are dotted,
+            // compare them fully, resolving each head through file-local
+            // module aliases so `T.x` vs `Typedtree.x` stays a match.
+            auto alias_norm = [&](const std::string& s) {
+              auto d = s.find('.');
+              if (d == std::string::npos) return s;
+              auto f = local_module_paths_.find(s.substr(0, d));
+              if (f != local_module_paths_.end() && !f->second.empty())
+                return f->second + s.substr(d);
+              return s;
+            };
             std::string found = rr->kind == I::Type::Kind::Constr ? rr->path : "";
-            if (!found.empty() && lastc(found) != lastc(er->path))
-              rec_expr_[&e] = expected;
+            bool diff;
+            if (!found.empty() && found.find('.') != std::string::npos)
+              diff = alias_norm(found) != alias_norm(er->path);
+            else
+              diff = !found.empty() && lastc(found) != lastc(er->path);
+            if (getenv("CTDBG"))
+              fprintf(stderr, "[CTDBG-I] shadow-gate ctor %s found=%s expected=%s diff=%d\n",
+                      cn.c_str(), found.c_str(), er->path.c_str(), (int)diff);
+            if (diff) rec_expr_[&e] = expected;
           }
       }
     // Optional-argument erasure (ocaml's type_argument): a value of type

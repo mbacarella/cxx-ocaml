@@ -18569,24 +18569,58 @@ struct Translator {
         auto* at = k->arg ? std::get_if<Pexp_tuple>(&(*k->arg)->desc) : nullptr;
         int written = k->arg ? (at ? (int)at->elems.size() : 1) : 0;
         if (cip->arity != written) {
+          if (cppcaml::dbg_env("CTDBG"))
+            fprintf(stderr, "[CTDBG] arity-mismatch ctor %s flat(ty=%s ar=%d) written=%d expr_constr=%s\n",
+                    n.c_str(), cip->type.c_str(), cip->arity, written,
+                    vk.expr_constr.count(&e) ? vk.expr_constr.at(&e).c_str() : "<none>");
           if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end()) {
             std::string ety = ec->second, emod;
             if (auto d = ety.rfind('.'); d != std::string::npos) {
               emod = ety.substr(0, d); ety = ety.substr(d + 1);
             }
+            auto shape_fits = [&](const CtorInfo* c) {
+              return c && (k->arg.has_value()
+                               ? (c->is_block && c->arity == written)
+                               : !c->is_block);
+            };
             const CtorInfo* better = nullptr;
             if (auto ti = type_ctor_info_.find(ety); ti != type_ctor_info_.end())
               if (auto c2 = ti->second.find(n); c2 != ti->second.end())
                 better = &c2->second;
-            if (!better && !emod.empty() &&
+            // The bare-keyed local entry can be a same-named FOREIGN type's
+            // (a force-registered Typedtree.functor_parameter squatting
+            // "functor_parameter" while the inferred type is Parsetree's):
+            // when it does not fit the written shape either, resolve through
+            // the inferred type's own module cmi.
+            if (!shape_fits(better) && !emod.empty() &&
                 !module_base(emod.substr(0, emod.find('.')))) {
               auto& tl = module_type_ctors(emod, ety);
               for (auto& [nm2, info2] : tl)
                 if (nm2 == n) { better = &info2; break; }
             }
-            if (better && (k->arg.has_value()
-                               ? (better->is_block && better->arity == written)
-                               : !better->is_block))
+            // The inferred module can itself be the wrong same-named type's
+            // (the engine resolves a bare ctor by scope, not expected type:
+            // untypeast's annotated `Named (name, mt)` inferred TYPEDTREE's
+            // functor_parameter, arity 3, where Parsetree's arity-2 ctor was
+            // written).  The type NAME survives the confusion -- scan the
+            // opened units for a same-named type whose ctor fits the written
+            // shape; a unique fit wins.
+            if (!shape_fits(better)) {
+              const CtorInfo* fit = nullptr; int nfit = 0;
+              for (auto o = opened_.rbegin(); o != opened_.rend(); ++o) {
+                if (o->find('.') != std::string::npos || module_base(*o)) continue;
+                auto& tl2 = module_type_ctors(*o, ety);
+                for (auto& [nm2, info2] : tl2)
+                  if (nm2 == n && shape_fits(&info2)) { fit = &info2; ++nfit; break; }
+              }
+              if (nfit == 1) {
+                if (cppcaml::dbg_env("CTDBG"))
+                  fprintf(stderr, "[CTDBG] shape-refit ctor %s ty=%s via opened unit (tag=%d ar=%d)\n",
+                          n.c_str(), ety.c_str(), fit->tag, fit->arity);
+                better = fit;
+              }
+            }
+            if (shape_fits(better))
               cip = better;
             // A NO-ARG construct can never be a block ctor, so when the hinted
             // TYPE's own ctor is a block too (the engine resolves a bare ctor
