@@ -1381,7 +1381,7 @@ struct Translator {
                 ci.rlabels.push_back(l.name);
                 ci.rshape.push_back(cmi_field_kind(l.type));
                 ci.rfmut.push_back(l.mutable_);
-                ci.rftypes.push_back("");
+                ci.rftypes.push_back(cmi_label_record_path(l.type, mod));
               }
             else
               for (auto& a : c.args) {
@@ -3454,7 +3454,7 @@ struct Translator {
                   ci.rlabels.push_back(l.name);
                   ci.rshape.push_back(cmi_field_kind(l.type));
                   ci.rfmut.push_back(l.mutable_);
-                  ci.rftypes.push_back("");
+                  ci.rftypes.push_back(cmi_label_record_path(l.type, dotted));
                 }
               ctor_info_[c.name] = ci;
               type_ctor_info_[td.name][c.name] = std::move(ci);
@@ -4731,6 +4731,26 @@ struct Translator {
     if (n == "int" || n == "char" || n == "bool" || n == "unit") return ValueKind::Int;
     if (n == "float") return ValueKind::Float;
     return ValueKind::Gen;
+  }
+  // The declared-type path of a cmi inline-record label, qualified with the
+  // defining module when the cmi path is unit-internal -- the CtorInfo::rftypes
+  // analog of coretype_record_path for IMPORTED inline-record ctors, so
+  // tag_inline_field_var gives their pattern-bound vars an authoritative record
+  // (Texp_letop's `body : value case` -> "Typedtree.case"; without it a later
+  // `body.c_lhs` has no owning record and falls to whatever foreign unit
+  // uniquely claims the label -> a wrong or const-0 read).
+  static std::string cmi_label_record_path(const cmi::TypePtr& t0, const std::string& mod) {
+    cmi::TypePtr t = t0;
+    while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst)) t = t->link;
+    if (!t || t->kind != cmi::TypeExpr::Tconstr || !t->path) return "";
+    std::string dotted = cmi_path_dotted(*t->path);
+    if (dotted.empty()) return "";
+    if (dotted.find('.') != std::string::npos) return dotted;  // cross-unit: absolute
+    static const std::set<std::string> builtins = {
+        "int","char","bool","unit","float","string","bytes","int32","int64",
+        "nativeint","list","array","option","ref","exn","lazy_t"};
+    if (builtins.count(dotted)) return "";
+    return mod + "." + dotted;
   }
   // A record field of a stdlib (sub)module's record type, e.g. `Gc.minor_heap_size`
   // -> {field index, kind, mutable}; nullopt if not found.
@@ -11822,8 +11842,19 @@ struct Translator {
       else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d)) return nullptr;
     }
     auto bind0 = [&](MRow& r) {           // record a var/any binding for column 0
-      if (auto* pv = std::get_if<Ppat_var>(&r.cols[0]->desc))
+      if (auto* pv = std::get_if<Ppat_var>(&r.cols[0]->desc)) {
         r.binds.push_back({pv->name.txt, comps[0]->var});
+        // The column's split tagged this var node with its inline field's
+        // declared record type: carry it to the materialized binder so the
+        // arm's `.label` projections resolve through it.
+        if (auto it = var_node_path_.find((const void*)r.cols[0]);
+            it != var_node_path_.end()) {
+          var_record_path_[comps[0]->var.stamp] = it->second;
+          if (cppcaml::dbg_env("GMFA"))
+            fprintf(stderr, "[GMFA] bind0 tag %s/%d -> %s\n", pv->name.txt.c_str(),
+                    comps[0]->var.stamp, it->second.c_str());
+        }
+      }
     };
     // matching.ml's split_no_or run division on a CONSTRUCTOR column with var
     // rows whose REMAINING columns still test something: the consecutive ctor
@@ -12140,9 +12171,17 @@ struct Translator {
               if (ap && !std::holds_alternative<Ppat_any>(ap->desc)) return nullptr;
               for (size_t j = 0; j < rlab.size(); ++j) fps.push_back(&any_pat);
             } else
-              for (auto& lbl : rlab) {
+              for (size_t j2 = 0; j2 < rlab.size(); ++j2) {
+                const std::string& lbl = rlab[j2];
                 const Pattern* fp = &any_pat;
                 for (auto& [l, s2] : pr->fields) if (lid_last(l.txt) == lbl) { fp = effective_pat(s2.get()); break; }
+                // A var field-pattern of a record-typed inline field: tag the
+                // NODE with the field's declared record path so bind0's arm
+                // binding resolves later `.label` projections through it
+                // (Texp_letop's `body : value case` -> "Typedtree.case").
+                if (std::get_if<Ppat_var>(&fp->desc) &&
+                    j2 < ci->rftypes.size() && !ci->rftypes[j2].empty())
+                  var_node_path_[(const void*)fp] = ci->rftypes[j2];
                 fps.push_back(fp);
               }
           } else {
@@ -12280,6 +12319,49 @@ struct Translator {
     }();
     return b;
   }
+  // Vars bound as an inline-record ctor FIELD whose declared type is a known
+  // record (CtorInfo::rftypes): name -> record path.  Tagged onto the arm's
+  // catch params so the handler body's `.label` projections resolve through the
+  // authoritative record (Texp_letop's `body : value case` -> "Typedtree.case";
+  // without it the label falls to whatever foreign unit uniquely claims it --
+  // untypeast's `body.c_lhs` read Parsetree's letop and lowered to a const 0).
+  void collect_inline_fvar_paths(const Pattern* p0,
+                                 std::map<std::string, std::string>& out) {
+    const Pattern* p = effective_pat(p0);
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { collect_inline_fvar_paths(pa->p.get(), out); return; }
+    if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+      collect_inline_fvar_paths(o->l.get(), out);
+      collect_inline_fvar_paths(o->r.get(), out); return;
+    }
+    if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (auto& e : tu->elems) collect_inline_fvar_paths(e.get(), out); return;
+    }
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [l, s] : pr->fields) collect_inline_fvar_paths(s.get(), out); return;
+    }
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
+      if (!k->arg) return;
+      const Pattern* ap = effective_pat(k->arg->get());
+      auto ci = ctor_info_.find(ctor_of(*p));
+      if (ci != ctor_info_.end() && !ci->second.rlabels.empty())
+        if (auto* prr = std::get_if<Ppat_record>(&ap->desc)) {
+          auto& C = ci->second;
+          for (auto& [l, s] : prr->fields) {
+            const Pattern* fp = effective_pat(s.get());
+            std::string lbl = lid_last(l.txt);
+            int ix = -1;
+            for (size_t i = 0; i < C.rlabels.size(); ++i)
+              if (C.rlabels[i] == lbl) { ix = (int)i; break; }
+            if (auto* pv = std::get_if<Ppat_var>(&fp->desc)) {
+              if (ix >= 0 && ix < (int)C.rftypes.size() && !C.rftypes[ix].empty())
+                out.emplace(pv->name.txt, C.rftypes[ix]);
+            } else collect_inline_fvar_paths(fp, out);
+          }
+          return;
+        }
+      collect_inline_fvar_paths(k->arg->get(), out);
+    }
+  }
   // Set up an arm from its full pattern (var collection) and body.  Allocates the
   // exit id + fresh catch-vars; the caller points its MRow(s) at &a.vnames/a.aid.
   GArm setup_garm(const Pattern* full, const Expression* rhs) {
@@ -12287,10 +12369,14 @@ struct Translator {
     collect_gvars(full, a.vnames);
     collect_alias_names(full, a.alias_names);
     a.aid = ++next_exit_;
+    std::map<std::string, std::string> fvp;
+    collect_inline_fvar_paths(full, fvp);
     for (size_t k = 0; k < a.vnames.size(); ++k) {
       // Catch params carry the arm's user names (upstream's or-pattern handler
       // vars ARE the bound idents) -- cosmetic, but keeps -dlambda comparable.
       a.cvars.push_back(fresh(a.vnames[k], false)); a.kinds.push_back(ValueKind::Gen);
+      if (auto pit = fvp.find(a.vnames[k]); pit != fvp.end())
+        var_record_path_[a.cvars.back().stamp] = pit->second;
     }
     return a;
   }
