@@ -898,12 +898,11 @@ struct Translator {
   // exists.  The ctor-chunk driver refuses to route misses at such a deid --
   // upstream's exhaustiveness/ctx knowledge would prune the dead arm.
   int gm_fake_deid_ = -1;
-  // Entry eids to which mkexit routed a miss whose context had FULLY matched
-  // the entry's matrix through tests (head_omega false): upstream jumps
-  // straight to the matched row's arm there, so a build exiting to the entry
-  // instead diverges.  The ctor-chunk driver rejects an attempt only when
-  // the dirty entry is one of its OWN chunks (allocated during the attempt);
-  // dirt on an ENCLOSING scope's entry propagates up to that owner's check.
+  // Entry eids to which mkexit routed a DEEP fully-matched miss (see
+  // GmDef::head_dropped).  The ctor-chunk driver rejects a SPREAD-containing
+  // attempt whose own entries (eids allocated during the attempt) got such a
+  // hit; a spread-free matrix mirrors an upstream grouping and stays
+  // accepted (untypeast's class_expr Tcl_constraint sub-matrix).
   std::set<int> gm_ctx_dirty_eids_;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
@@ -8618,6 +8617,14 @@ struct Translator {
     // leaf, a guarded row tests its guard in the matrix-bound scope and falls
     // through to the next surviving row on failure (matching.ml's guarded action).
     const Expression* guard = nullptr;
+    // This row is a SPREAD COPY: a var/any row duplicated into a constructor
+    // specialization by const_body/block_body.  Upstream keeps such a row in
+    // its own half-match reached through the default environment, so a matrix
+    // containing spread copies has no upstream counterpart -- the ctor-chunk
+    // driver must not re-group it (shape_reduce's reduce_aliases_for_uid:
+    // grouping a genuine sibling with a spread copy of a top-chunk row made a
+    // deep-match handler re-test what every arrival had decided).
+    bool spread = false;
   };
   // Guard mm_cols' preconditions: it assumes every column is a var/any, or a
   // constructor of a 1-const/1-block or all-constant type whose argument (if any)
@@ -10921,10 +10928,9 @@ struct Translator {
   // chunked string-column driver pushes entries; `deid` stays the final exit.
   // head_dropped: specialization pruned the entry's original HEAD row while
   // later rows survive.  A context-fully-matched exit to such an entry is a
-  // DEEP match: upstream's finer chunk split (one half-match per var row it
-  // actually sees) skips the pruned rows' entries entirely and lands on the
-  // matched row's own chunk, whose handler drops the ctx-decided tests; our
-  // grouped entry re-tests them (see mkexit).
+  // DEEP match: upstream's finer chunk split skips the pruned rows' entries
+  // and lands on the matched row's own chunk, whose handler drops the
+  // ctx-decided tests; our grouped entry re-tests them (see mkexit).
   struct GmDef { int eid; std::vector<std::vector<const Pattern*>> mat;
                  bool head_dropped = false; };
   const Pattern* gmdef_peel(const Pattern* p) {
@@ -11265,14 +11271,10 @@ struct Translator {
     auto mkexit = [&] {
       auto e = mk(Lam::K::Staticraise);
       e->prim_arg = denv.empty() ? deid : denv.front().eid;
-      // A DEEP fully-matched exit (the denv_map truncation sentinel on an
-      // entry whose head row was pruned away): upstream's finer split gives
-      // the matched row its own chunk -- pruned entries are skipped and the
-      // landing handler drops the ctx-decided tests -- while our grouped
-      // entry re-tests them (shape_reduce's reduce_aliases_for_uid:
-      // tag-4/approx=true prunes the spread `{uid=Some;approx=false}` copy
-      // and deep-matches the `{approx=true}` row).  A HEAD-row full match is
-      // fine: mixed arrivals keep upstream's handler tests too.
+      // A DEEP fully-matched exit: the arrival context pruned the entry's
+      // head row and fully matched a later one (shape_reduce's
+      // reduce_aliases_for_uid: tag-4/approx=true prunes the spread
+      // `{uid=Some;approx=false}` copy and deep-matches `{approx=true}`).
       if (!denv.empty() && denv.front().head_dropped &&
           denv.front().mat.size() == 1 && denv.front().mat[0].empty())
         gm_ctx_dirty_eids_.insert(denv.front().eid);
@@ -11847,12 +11849,13 @@ struct Translator {
       std::set<int> ctor_aids;
       for (auto& r : rows)
         if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) ctor_aids.insert(r.aid);
-      bool anyv = false, nontriv = false, ok = true;
+      bool anyv = false, nontriv = false, ok = true, has_spread = false;
       for (auto& r : rows) {
         // Every row aid-shared: leaves emit `(exit aid)` only, so a rejected
         // attempt never runs expr() (whose side effects the state restore
         // below could not undo).
         if (r.guard || r.aid < 0) { ok = false; break; }
+        if (r.spread) has_spread = true;
         if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) continue;
         if (ctor_aids.count(r.aid)) { ok = false; break; }
         anyv = true;
@@ -11875,21 +11878,24 @@ struct Translator {
                 [](const Pattern* p) {
                   return std::get_if<Ppat_construct>(&p->desc) != nullptr;
                 });
-        // Dirt on one of THIS attempt's own entries (eids allocated during
-        // the attempt) means a fully-matched chunk exit re-tests decided
-        // columns; dirt on an enclosing entry is that owner's problem and
-        // propagates up on acceptance.
+        // A SPREAD-containing matrix (some var row is a copy const_body/
+        // block_body injected into a specialization) has no upstream
+        // counterpart, so a deep fully-matched hit on one of THIS attempt's
+        // own entries (see mkexit) marks a grouping upstream never made --
+        // reject it.  A spread-free matrix mirrors an upstream grouping and
+        // keeps its deep matches (untypeast's class_expr).  Dirt on an
+        // enclosing entry propagates up to that owner's own check.
         bool own_dirty = false;
-        for (int d : gm_ctx_dirty_eids_)
-          if (d > exit_save) { own_dirty = true; break; }
+        if (has_spread)
+          for (int d : gm_ctx_dirty_eids_)
+            if (d > exit_save) { own_dirty = true; break; }
         if (r && !own_dirty) {
           // Accept only if no miss escaped to a FAKE deid (the top entry's
           // Match_failure default of an exhaustive match): such an exit is a
           // dead arm upstream's exhaustiveness/ctx knowledge prunes
           // (shape_reduce's reduce_aliases_for_uid, uid rows Some/Some/var/
           // None re-testing uid in the trailing None chunk).  A chunked
-          // compile with no such escape -- and no ctx-dirty fully-matched
-          // chunk exit (see mkexit) -- is context-clean; reject the rest
+          // compile with no such escape is context-clean; reject the rest
           // back to the spread path, whose per-case row copies specialize
           // those misses away by construction.
           int fbad = 0;
@@ -12073,7 +12079,8 @@ struct Translator {
           const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
           if (ci->is_block || ci->tag != t) continue;
           MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
-        } else { bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr)); }
+        } else { bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin());
+                 nr.spread = true; sub.push_back(std::move(nr)); }
       }
       std::vector<LamPtr> cc = rest;
       std::vector<GmDef> de = denv;
@@ -12088,7 +12095,8 @@ struct Translator {
         std::vector<MRow> sub;
         for (auto& r : rows)
           if (!std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
-            bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
+            bind0(r); MRow nr = r; nr.cols.erase(nr.cols.begin());
+            nr.spread = true; sub.push_back(std::move(nr));
           }
         std::vector<LamPtr> cc = rest;
         // Gap tag reached by var rows only (column dropped, not expanded):
@@ -12150,6 +12158,7 @@ struct Translator {
           bind0(r);
           MRow nr; nr.rhs = r.rhs; nr.binds = r.binds; nr.guard = r.guard;
           nr.aid = r.aid; nr.vnames = r.vnames;   // keep action-sharing through the split
+          nr.spread = true;
           for (int j = 0; j < a; ++j) nr.cols.push_back(&any_pat);
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
