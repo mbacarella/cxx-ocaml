@@ -14838,6 +14838,7 @@ struct Translator {
       }
     }
     if (auto pm = pv_const_match(scrut, rows)) return pm;
+    if (auto po = pv_option_match(scrut, rows, mloc)) return po;
     if (auto pt = pvtype_match(scrut, rows)) return pt;
     if (total) if (auto pv = pv_mixed_match(scrut, rows, mloc)) return pv;
     // A single `#poly`-type row is exhaustive by typing, hence irrefutable: just
@@ -15023,6 +15024,114 @@ struct Translator {
     auto c = mk(Lam::K::Catch);
     c->cond = iff(isi, tree, oc_exit(eid));
     c->prim_arg = eid; c->then_ = bind_dflt();
+    return c;
+  }
+
+  // Match on an `option` whose Some payload is a CONSTANT polymorphic-variant:
+  //   match x with Some `A -> .. | Some (`B | `C) -> .. | Some #T | None -> ..
+  // ocamlc's combine_variant enumerates `#T` into the type's remaining tags, so the
+  // Some-payload match is TOTAL (as_interval_nofail): every listed tag and every
+  // `#T` tag maps to an action, the `#T` tags sharing None's body.  as_interval
+  // merges same-action tags across integer gaps, and the Switcher renders lone
+  // other-action tags as `!=` holes -- a compact separation tree.  The whole match
+  // is `if x` (Some/None) around a `*match* =a field_imm 0 x` binding whose nofail
+  // test_sequence tree routes the `#T`/None body through one shared static exit.
+  // Tightly gated to that family so the general matchers keep every other option
+  // match.
+  LamPtr pv_option_match(const LamPtr& scrut, const std::vector<Row>& rows,
+                         const Location& mloc) {
+    (void)mloc;
+    if (scrut->k != Lam::K::Var) return nullptr;
+    // Flatten an OR-tree of bare (no-arg) poly-variant patterns to their hashes.
+    std::function<bool(const Pattern*, std::vector<long long>&)> flat =
+      [&](const Pattern* p, std::vector<long long>& out) -> bool {
+        p = effective_pat(p);
+        if (auto* pv = std::get_if<Ppat_variant>(&p->desc)) {
+          if (pv->arg) return false;
+          out.push_back(hash_variant(pv->label)); return true;
+        }
+        if (auto* po = std::get_if<Ppat_or>(&p->desc))
+          return flat(po->l.get(), out) && flat(po->r.get(), out);
+        return false;
+      };
+    // Classify one (OR-spanning) row: gather Some-payload variant hashes and note
+    // whether it reaches None or a Some `#T` (both of which share the fail body).
+    const Longident* type_lid = nullptr;
+    struct Cls { std::vector<long long> hashes; bool none = false, sometype = false, ok = true; };
+    std::function<void(const Pattern*, Cls&)> classify =
+      [&](const Pattern* p, Cls& c) {
+        p = effective_pat(p);
+        if (auto* po = std::get_if<Ppat_or>(&p->desc)) {
+          classify(po->l.get(), c); classify(po->r.get(), c); return;
+        }
+        auto* k = std::get_if<Ppat_construct>(&p->desc);
+        if (!k) { c.ok = false; return; }
+        std::string cn = ctor_of(*p);
+        if (cn == "None" && !k->arg) { c.none = true; return; }
+        if (cn == "Some" && k->arg) {
+          const Pattern* ap = effective_pat(k->arg->get());
+          if (auto* pt = std::get_if<Ppat_type>(&ap->desc)) {
+            c.sometype = true; type_lid = &pt->id.txt; return;
+          }
+          if (flat(ap, c.hashes)) return;
+        }
+        c.ok = false;
+      };
+    std::vector<std::pair<long long, const Expression*>> cases;  // listed hash -> arm rhs
+    const Expression* fail_rhs = nullptr;
+    bool saw_none = false, saw_type = false;
+    for (auto& r : rows) {
+      if (r.guard) return nullptr;
+      Cls c; classify(r.lhs, c);
+      if (!c.ok) return nullptr;
+      if (c.none || c.sometype) {              // a fail-contributing row
+        if (!c.hashes.empty()) return nullptr;         // keep the exact shape
+        if (fail_rhs && fail_rhs != r.rhs) return nullptr;  // one shared fail body
+        fail_rhs = r.rhs;
+        if (c.none) saw_none = true;
+        if (c.sometype) saw_type = true;
+      } else {
+        for (long long h : c.hashes) cases.push_back({h, r.rhs});
+      }
+    }
+    if (!fail_rhs || !saw_none || !saw_type || cases.empty()) return nullptr;
+    std::set<long long> listed;
+    for (auto& kv : cases) {
+      if (!listed.insert(kv.first).second) return nullptr;  // duplicate tags
+    }
+    // Enumerate `#T`'s member tags (its full poly-variant tag-hash set); the ones
+    // not already listed become the fail (None-shared) cases -- this is what keeps
+    // the payload match total, matching ocamlc's expansion of `#T`.
+    std::set<long long> type_tags;
+    std::set<std::string> seen;
+    collect_pv_tags_lid(*type_lid, type_tags, seen);
+    if (type_tags.empty()) return nullptr;
+    // Compile each distinct arm body once (source order over rows).
+    std::unordered_map<const Expression*, LamPtr> body_of;
+    for (auto& r : rows)
+      if (!body_of.count(r.rhs)) body_of[r.rhs] = expr(*r.rhs);
+    // *match* =a (field_imm 0 scrut): the Some payload, tested by the tree.
+    Ident mid = fresh("match", /*temp=*/true);
+    LamPtr matchvar = varof(mid);
+    int failid = ++next_exit_;
+    // Total case set: listed tags -> their body; every remaining `#T` tag -> the
+    // shared fail exit (also reached by None through the outer else).
+    std::vector<std::pair<int, LamPtr>> cc;
+    for (auto& kv : cases) cc.push_back({(int)kv.first, body_of[kv.second]});
+    for (long long h : type_tags)
+      if (!listed.count(h)) cc.push_back({(int)h, oc_exit(failid)});
+    std::sort(cc.begin(), cc.end(),
+              [](const std::pair<int, LamPtr>& a, const std::pair<int, LamPtr>& b) {
+                return a.first < b.first;
+              });
+    LamPtr tree = oc_call_switcher(matchvar, cc, /*fail=*/nullptr, /*test_seq=*/true);
+    auto lt = mk(Lam::K::Let);
+    lt->bindings = {{mid, ValueKind::Gen, fieldimm(0, scrut), /*alias=*/true}};
+    lt->body = tree;
+    auto ifn = mk(Lam::K::IfThenElse);
+    ifn->cond = scrut; ifn->then_ = lt; ifn->else_ = oc_exit(failid);
+    auto c = mk(Lam::K::Catch);
+    c->cond = ifn; c->prim_arg = failid; c->then_ = body_of[fail_rhs];
     return c;
   }
 
