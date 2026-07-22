@@ -23774,6 +23774,20 @@ struct Translator {
           Ident iid = fresh("include");
           cur.push_back({iid, ValueKind::Gen, mv});
           auto v = mk(Lam::K::Var); v->var = iid; base = v;
+        } else if (mv && mv->k == Lam::K::Prim && mv->prim == Prim::Global) {
+          // `include <stdlib unit>`: ocamlc names the module once --
+          // `include/N =a (let (let/M = (global G!)) (global G!))`, the dead
+          // inner let being wrap_id_pos_list's -- and splices `field_mut i`
+          // off the binding, instead of re-reading the global per field.  A
+          // local-path include (`include Loc`) stays unbound: ocamlc splices
+          // its fields off the Var directly.
+          auto g2 = mk(Lam::K::Prim); g2->prim = Prim::Global; g2->prim_id = mv->prim_id;
+          auto dead = mk(Lam::K::Let);
+          dead->bindings = {{fresh("let"), ValueKind::Gen, mv}};
+          dead->body = g2;
+          Ident iid = fresh("include");
+          cur.push_back({iid, ValueKind::Gen, dead, /*alias=*/true});
+          auto v = mk(Lam::K::Var); v->var = iid; base = v;
         }
         // `include M` where M is a LOCAL module: its fields shadow enclosing
         // bindings (e.g. a function parameter), so they must enter scope as
