@@ -5341,7 +5341,9 @@ struct Translator {
       if (auto* kv = record_for_fields(fields))
         for (int i = 0; i < (int)kv->second.labels.size(); ++i)
           if (kv->second.labels[i] == n) {
-            store = FieldInfo{kv->first, i, kv->second.mut, kv->second.shape[i]};
+            bool fm = i < (int)kv->second.fmut.size() ? (bool)kv->second.fmut[i]
+                                                      : kv->second.mut;
+            store = FieldInfo{kv->first, i, fm, kv->second.shape[i]};
             return &store;
           }
     // An AMBIGUOUS field (`args` in both `pattern_matching`@1 and `division`@0)
@@ -5356,7 +5358,9 @@ struct Translator {
         if (rt == rec_types_.end()) return nullptr;
         for (int i = 0; i < (int)rt->second.labels.size(); ++i)
           if (rt->second.labels[i] == n) {
-            store = FieldInfo{ty, i, rt->second.mut, rt->second.shape[i]};
+            bool fm = i < (int)rt->second.fmut.size() ? (bool)rt->second.fmut[i]
+                                                      : rt->second.mut;
+            store = FieldInfo{ty, i, fm, rt->second.shape[i]};
             return &store;
           }
         return nullptr;
