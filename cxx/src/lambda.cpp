@@ -13397,8 +13397,14 @@ struct Translator {
       wraps.push_back({e, acts[i]});
       acts[i] = oc_exit(e);
     }
-    // cluster + test tree (edges = first/last case value; tags are small).
-    sw_ok_inter_ = true;
+    // cluster + test tree.  do_zyva (switch.ml) enables interval tests only when
+    // the switched values fit in [-2^16,2^16]; a large-valued domain (e.g.
+    // polymorphic-variant tag hashes) gives a pure separation-test tree.
+    {
+      long long low = inters.front().lo, high = inters.back().hi;
+      long long lim = 1LL << 16;
+      sw_ok_inter_ = std::llabs(low) <= lim && std::llabs(high) <= lim;
+    }
     sw_memo_.clear();
     std::vector<int> kk; comp_clusters(inters, kk);
     std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts;
@@ -14884,12 +14890,13 @@ struct Translator {
                          expr(*kvs[lo].rhs)),
                      expr(*kvs[lo + 1].rhs));
         if (n == 4) return iff(cmp(">=", kvs[lo + 2].h), tree(lo + 2, hi), tree(lo, lo + 1));
-        // larger: a correct (not byte-exact) equality chain
-        LamPtr c = expr(*kvs[hi].rhs);
-        for (int i = hi - 1; i >= lo; --i)
-          c = iff(cmp("==", kvs[i].h), expr(*kvs[i].rhs), c);
-        return c;
+        return nullptr;  // >4: routed through call_switcher below
       };
+      if (kvs.size() > 4) {
+        std::vector<std::pair<int, LamPtr>> cases;
+        for (auto& kv : kvs) cases.push_back({(int)kv.h, expr(*kv.rhs)});
+        return oc_call_switcher(scrut, cases);
+      }
       return tree(0, (int)kvs.size() - 1);
     }
     // trailing catch-all: bind its var to the scrutinee for the fallback body
