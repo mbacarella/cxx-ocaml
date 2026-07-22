@@ -223,6 +223,13 @@ struct Lam {
   // binding.  gm_facc_kind: the value kind for the materialized binding.
   bool gm_facc = false;
   ValueKind gm_facc_kind = ValueKind::Gen;
+  // gm_guard_aid: a guarded row's `(if guard (exit aid ..) next)` test, built at
+  // the gmatch leaf when the arm's action is aid-shared.  Upstream's leaf binds
+  // the row's pattern vars around the WHOLE guarded action -- `(let binds (if g
+  // rhs next))` -- and multi-use Alias binds survive Simplif in place, so when
+  // the arm turns out single-use wire_garms rebinds the exit args above this
+  // node instead of inline_exit's at-site rebind (`if g (let binds rhs) next`).
+  int gm_guard_aid = -1;
 };
 
 // Alpha-normalized structural key of a Lambda term (the analog of

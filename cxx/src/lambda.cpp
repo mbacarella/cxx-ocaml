@@ -11339,6 +11339,7 @@ struct Translator {
           scope.pop_back();
           auto iff = mk(Lam::K::IfThenElse);
           iff->cond = g; iff->then_ = act; iff->else_ = chain; chain = iff;
+          if (r.aid >= 0) iff->gm_guard_aid = r.aid;
         } else chain = act;              // unguarded: always fires
       }
       return chain;
@@ -12450,6 +12451,23 @@ struct Translator {
     for (auto& sc : l->sw_blocks) if (LamPtr* r = find_orp_slot(sc.body, aid)) return r;
     return nullptr;
   }
+  // The slot holding the leaf-built guard test (gm_guard_aid) for `aid`, if any.
+  static LamPtr* find_guard_slot(LamPtr& l, int aid) {
+    if (!l) return nullptr;
+    if (l->k == Lam::K::IfThenElse && l->gm_guard_aid == aid) return &l;
+    if (l->k == Lam::K::Function) return nullptr;
+    if (LamPtr* r = find_guard_slot(l->fn, aid)) return r;
+    if (LamPtr* r = find_guard_slot(l->cond, aid)) return r;
+    if (LamPtr* r = find_guard_slot(l->then_, aid)) return r;
+    if (LamPtr* r = find_guard_slot(l->else_, aid)) return r;
+    if (LamPtr* r = find_guard_slot(l->body, aid)) return r;
+    if (LamPtr* r = find_guard_slot(l->sw_default, aid)) return r;
+    for (auto& a : l->args) if (LamPtr* r = find_guard_slot(a, aid)) return r;
+    for (auto& b : l->bindings) if (LamPtr* r = find_guard_slot(b.val, aid)) return r;
+    for (auto& sc : l->sw_consts) if (LamPtr* r = find_guard_slot(sc.body, aid)) return r;
+    for (auto& sc : l->sw_blocks) if (LamPtr* r = find_guard_slot(sc.body, aid)) return r;
+    return nullptr;
+  }
   // The slot at which to scope a shared static-catch for exit `aid`, tighter
   // than the body root.  matching.ml scopes a shared catch around exactly the
   // sub-matrix that references it, NOT the whole match; a matcher's exits are in
@@ -12603,9 +12621,40 @@ struct Translator {
         lt->body = handler;
         handler = lt;
       }
-      if (!shared)
-        inline_exit(body, a.aid, a.cvars, a.kinds, handler);
-      else {
+      if (!shared) {
+        // A single-use GUARDED arm: its one exit is the then-branch of the
+        // leaf-built guard test.  Upstream binds the row's pattern vars around
+        // the whole guarded action via bind_check, so each dup-safe Alias bind
+        // is lower_bind-sunk from ABOVE the guard `if` -- it stays above an
+        // opaque guard (an apply: approx_present is conservatively true) but
+        // sinks into the then-branch past a transparent one (a Clflags field
+        // chain).  inline_exit's at-site rebind would instead nest every bind
+        // under the guard unconditionally.
+        LamPtr* gslot = find_guard_slot(body, a.aid);
+        Lam* site = gslot && (*gslot)->then_ ? (*gslot)->then_.get() : nullptr;
+        if (site && site->k == Lam::K::Staticraise && site->prim_arg == a.aid &&
+            site->args.size() == a.cvars.size()) {
+          std::vector<LamPtr> sargs = site->args;
+          (*gslot)->then_ = handler;
+          LamPtr res = *gslot;
+          // Descending: the first var's bind is applied last, sinking through
+          // the later vars' alias lets to end innermost -- the same relative
+          // order inline_exit's ascending wrap produced.
+          for (size_t i = a.cvars.size(); i-- > 0; ) {
+            ValueKind k2 = i < a.kinds.size() ? a.kinds[i] : ValueKind::Gen;
+            bool dup = is_alias_dup(sargs[i]);
+            if (dup && sargs[i]->k != Lam::K::Var)
+              res = lower_bind(a.cvars[i], k2, sargs[i], res);
+            else {                       // bind_check: Lvar / non-Alias args
+              auto let = mk(Lam::K::Let);  // bind in place, never lowered
+              let->bindings = {{a.cvars[i], k2, sargs[i], dup}};
+              let->body = res; res = let;
+            }
+          }
+          *gslot = res;
+        } else
+          inline_exit(body, a.aid, a.cvars, a.kinds, handler);
+      } else {
         std::vector<Ident> cvs; std::vector<ValueKind> cks;
         for (size_t k = 0; k < a.cvars.size(); ++k)
           if (!dropped(k)) { cvs.push_back(a.cvars[k]); cks.push_back(a.kinds[k]); }
