@@ -11326,7 +11326,7 @@ struct Translator {
         for (auto& rr : rows) {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
           if (!any_guard && alts.size() > 1 && rr.aid >= 0 && rr.vnames &&
-              !rr.vnames->empty() && gm_orw_.insert(rr.aid).second)
+              gm_orw_.insert(rr.aid).second)
             wrapped.push_back(rr.aid);
           for (auto* a : alts) { MRow nr = rr; nr.cols[0] = effective_pat(a); ex.push_back(std::move(nr)); }
         }
