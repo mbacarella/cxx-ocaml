@@ -2288,12 +2288,30 @@ struct Translator {
   // The base expression for a local module `m`: its alias path if `m` is a module
   // alias, else a Var of its binding; null if `m` is not a known local module.
   LamPtr module_base(const std::string& m) {
-    if (auto a = module_alias_.find(m); a != module_alias_.end()) return a->second;
+    if (auto a = module_alias_.find(m); a != module_alias_.end()) {
+      // A closed structure's inner submodule re-registers under its bare name
+      // (a postlude convenience the Env deliberately does not bind), but
+      // upstream scoping no longer sees it: after misc.ml's `module Stdlib =
+      // struct module String .. end` closes, a bare `String.sub` is the
+      // ambient Stdlib__String's field (GETGLOBALFIELD), not a read through
+      // the local block.  When the Env does not bind the name and it names a
+      // genuine stdlib unit, decline so callers fall through to the stdlib
+      // resolution.
+      if (!menv_.find_module(m) && stdlib_unit_exists(m)) return nullptr;
+      return a->second;
+    }
     if (auto i = module_ident_.find(m); i != module_ident_.end()) {
       auto v = mk(Lam::K::Var); v->var = i->second; return v;
     }
     return nullptr;
   }
+  bool stdlib_unit_exists(const std::string& m) {
+    if (auto it = stdlib_unit_cache_.find(m); it != stdlib_unit_cache_.end())
+      return it->second;
+    return stdlib_unit_cache_[m] =
+               std::filesystem::exists(stdlib_dir + "/stdlib__" + m + ".cmi");
+  }
+  std::unordered_map<std::string, bool> stdlib_unit_cache_;
   // Is the HEAD module of a path bound at all -- a local module/alias/functor
   // param, an already-loaded cmi, or a `.cmi` findable on the include path?  When
   // it is NOT, a qualified reference through it (`Lib.x`, `Lib.Make`) cannot be
