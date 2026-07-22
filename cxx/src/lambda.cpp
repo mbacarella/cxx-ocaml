@@ -13363,7 +13363,8 @@ struct Translator {
     return OcRes{r, std::move(total)};
   }
   // ---- call_switcher: as_interval_nofail + Switch.Make(SArg).zyva ----
-  LamPtr oc_call_switcher(const LamPtr& scrut, const std::vector<std::pair<int, LamPtr>>& cases) {
+  LamPtr oc_call_switcher(const LamPtr& scrut, const std::vector<std::pair<int, LamPtr>>& cases,
+                          LamPtr fail = nullptr, bool test_seq = false) {
     // store: dedup actions by make_key; a re-stored action becomes Shared.
     std::vector<LamPtr> acts; std::vector<bool> shared;
     auto store = [&](const LamPtr& a, bool force_shared) {
@@ -13372,11 +13373,11 @@ struct Translator {
       acts.push_back(a); shared.push_back(force_shared);
       return (int)acts.size() - 1;
     };
-    bool some_hole = false;
-    for (size_t i = 0; i + 1 < cases.size(); ++i)
-      if (cases[i + 1].first > cases[i].first + 1) some_hole = true;
     std::vector<SwCase> inters;
-    {
+    if (!fail) {
+      bool some_hole = false;
+      for (size_t i = 0; i + 1 < cases.size(); ++i)
+        if (cases[i + 1].first > cases[i].first + 1) some_hole = true;
       int idx0 = store(cases[0].second, some_hole);
       long long cur_low = cases[0].first, cur_high = cases[0].first;
       int cur_act = idx0;
@@ -13387,6 +13388,52 @@ struct Translator {
         cur_low = cur_high = cases[i].first; cur_act = ai;
       }
       inters.push_back({cur_low, cur_high, cur_act});
+    } else {
+      // as_interval_canfail (matching.ml): the fail action is index 0; the gaps
+      // between cases and the two out-of-range boundaries become fail intervals.
+      // low/high default to OCaml min_int/max_int (poly-variant constant match,
+      // no ?low/?high given), yielding boundary fail intervals at the extremes.
+      const long long LO = -4611686018427387904LL;   // OCaml min_int (63-bit)
+      const long long HI =  4611686018427387903LL;    // OCaml max_int
+      store(fail, false);                              // fail -> action index 0
+      std::function<void(long long, long long, size_t)> fail_rec;
+      std::function<void(long long, long long, int, size_t)> nofail_rec;
+      nofail_rec = [&](long long clow, long long chigh, int cact, size_t k) {
+        if (k == cases.size()) {
+          inters.push_back({clow, chigh, cact});
+          if (chigh != HI) inters.push_back({chigh + 1, HI, 0});
+          return;
+        }
+        long long i = cases[k].first;
+        int ai = store(cases[k].second, false);
+        if (chigh + 1 == i) {
+          if (ai == cact) nofail_rec(clow, i, cact, k + 1);
+          else if (ai == 0) { inters.push_back({clow, i - 1, cact}); fail_rec(i, i, k + 1); }
+          else { inters.push_back({clow, i - 1, cact}); nofail_rec(i, i, ai, k + 1); }
+        } else if (ai == 0) {
+          inters.push_back({clow, chigh, cact});
+          fail_rec(chigh + 1, chigh + 1, k);           // 'all': current k unconsumed
+        } else {
+          inters.push_back({clow, chigh, cact});
+          inters.push_back({chigh + 1, i - 1, 0});
+          nofail_rec(i, i, ai, k + 1);
+        }
+      };
+      fail_rec = [&](long long clow, long long chigh, size_t k) {
+        if (k == cases.size()) { inters.push_back({clow, chigh, 0}); return; }
+        long long i = cases[k].first;
+        int idx = store(cases[k].second, false);
+        if (idx == 0) fail_rec(clow, i, k + 1);
+        else { inters.push_back({clow, i - 1, 0}); nofail_rec(i, i, idx, k + 1); }
+      };
+      if (cases.empty()) inters.push_back({LO, HI, 0});   // init_rec
+      else {
+        long long i = cases[0].first;
+        int idx = store(cases[0].second, false);
+        if (idx == 0) fail_rec(LO, i, 1);
+        else if (LO < i) { inters.push_back({LO, i - 1, 0}); nofail_rec(i, i, idx, 1); }
+        else nofail_rec(i, i, idx, 1);
+      }
     }
     // abstract_shared: wrap each Shared non-exit action once; use exits in place.
     std::vector<std::pair<int, LamPtr>> wraps;    // (exit, handler), array order
@@ -13400,13 +13447,20 @@ struct Translator {
     // cluster + test tree.  do_zyva (switch.ml) enables interval tests only when
     // the switched values fit in [-2^16,2^16]; a large-valued domain (e.g.
     // polymorphic-variant tag hashes) gives a pure separation-test tree.
-    {
-      long long low = inters.front().lo, high = inters.back().hi;
+    if (test_seq) {
+      sw_ok_inter_ = false;                    // Switcher.test_sequence: separation tests only
+    } else {
+      long long low = cases.front().first, high = cases.back().first;  // get_edges
       long long lim = 1LL << 16;
       sw_ok_inter_ = std::llabs(low) <= lim && std::llabs(high) <= lim;
     }
     sw_memo_.clear();
-    std::vector<int> kk; comp_clusters(inters, kk);
+    // Switcher.test_sequence emits separation tests only -- it never groups
+    // intervals into a jump-table cluster (unlike zyva's comp_clusters), so
+    // feed every interval to c_test as its own singleton cluster.
+    std::vector<int> kk;
+    if (test_seq) { kk.resize(inters.size()); for (size_t i = 0; i < inters.size(); ++i) kk[i] = (int)i; }
+    else comp_clusters(inters, kk);
     std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts;
     // fresh copy per bare-exit emission so no Staticraise node is shared.
     auto emit_act = [this, &acts](int idx) -> LamPtr {
@@ -14852,17 +14906,29 @@ struct Translator {
     struct KV { long long h; const Expression* rhs; };
     std::vector<KV> kvs;
     const Row* dflt = nullptr;
+    bool has_group = false;
+    // Flatten an OR-tree of no-arg poly-variant patterns into their tag hashes;
+    // fails on any leaf that is not a bare `Tag (a grouped row shares one action).
+    std::function<bool(const Pattern*, std::vector<long long>&)> flat =
+      [&](const Pattern* p, std::vector<long long>& out) -> bool {
+        p = effective_pat(p);
+        if (auto* pv = std::get_if<Ppat_variant>(&p->desc)) {
+          if (pv->arg) return false;
+          out.push_back(hash_variant(pv->label)); return true;
+        }
+        if (auto* po = std::get_if<Ppat_or>(&p->desc))
+          return flat(po->l.get(), out) && flat(po->r.get(), out);
+        return false;
+      };
     for (auto& r : rows) {
       if (r.guard) return nullptr;
       const Pattern* p = effective_pat(r.lhs);
-      if (auto* pv = std::get_if<Ppat_variant>(&p->desc)) {
-        if (pv->arg || dflt) return nullptr;
-        kvs.push_back({hash_variant(pv->label), r.rhs});
-      } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
-        dflt = &r;
-      } else {
-        return nullptr;
-      }
+      if (is_catchall(*p) && !dflt && &r == &rows.back()) { dflt = &r; continue; }
+      if (dflt) return nullptr;                     // a real arm after the catch-all
+      std::vector<long long> tags;
+      if (!flat(p, tags)) return nullptr;
+      if (tags.size() > 1) has_group = true;
+      for (long long h : tags) kvs.push_back({h, r.rhs});
     }
     if (kvs.size() < (dflt ? 1u : 2u)) return nullptr;
     if (scrut->k != Lam::K::Var) return nullptr;  // bound by compile_match first
@@ -14878,6 +14944,37 @@ struct Translator {
       auto i = mk(Lam::K::IfThenElse); i->cond = c; i->then_ = a; i->else_ = b;
       return i;
     };
+    // trailing catch-all: bind its var to the scrutinee for the fallback body
+    auto bind_dflt = [&]() -> LamPtr {
+      scope.emplace_back();
+      if (auto* pv2 = std::get_if<Ppat_var>(&effective_pat(dflt->lhs)->desc))
+        scope.back()[pv2->name.txt] = scrut->var;
+      LamPtr b = expr(*dflt->rhs);
+      scope.pop_back();
+      return b;
+    };
+    // OR-pattern rows (`(`C | `D) -> e`) share one action across several tags,
+    // so ocamlc's make_test_sequence_variant_constant coalesces them; the hand-
+    // coded n<=4 trees below assume one distinct action per tag, so route every
+    // grouped match through the Switcher, compiling each arm body just once.
+    if (has_group) {
+      std::unordered_map<const Expression*, LamPtr> body_of;   // arm rhs -> its body
+      for (auto& r : rows) {                                   // source order
+        if (&r == dflt) continue;
+        if (!body_of.count(r.rhs)) body_of[r.rhs] = expr(*r.rhs);
+      }
+      std::vector<std::pair<int, LamPtr>> cases;
+      for (auto& kv : kvs) cases.push_back({(int)kv.h, body_of[kv.rhs]});
+      if (!dflt) return oc_call_switcher(scrut, cases, /*fail=*/nullptr, /*test_seq=*/true);
+      int eid = ++next_exit_;
+      LamPtr tree = oc_call_switcher(scrut, cases, oc_exit(eid), /*test_seq=*/true);
+      auto isi = mk(Lam::K::Prim); isi->prim = Prim::IntCmp;
+      isi->prim_id = "isint"; isi->args = {scrut};
+      auto c = mk(Lam::K::Catch);
+      c->cond = iff(isi, tree, oc_exit(eid));
+      c->prim_arg = eid; c->then_ = bind_dflt();
+      return c;
+    }
     if (!dflt) {
       std::function<LamPtr(int, int)> tree = [&](int lo, int hi) -> LamPtr {
         int n = hi - lo + 1;
@@ -14895,19 +14992,10 @@ struct Translator {
       if (kvs.size() > 4) {
         std::vector<std::pair<int, LamPtr>> cases;
         for (auto& kv : kvs) cases.push_back({(int)kv.h, expr(*kv.rhs)});
-        return oc_call_switcher(scrut, cases);
+        return oc_call_switcher(scrut, cases, /*fail=*/nullptr, /*test_seq=*/true);
       }
       return tree(0, (int)kvs.size() - 1);
     }
-    // trailing catch-all: bind its var to the scrutinee for the fallback body
-    auto bind_dflt = [&]() -> LamPtr {
-      scope.emplace_back();
-      if (auto* pv2 = std::get_if<Ppat_var>(&effective_pat(dflt->lhs)->desc))
-        scope.back()[pv2->name.txt] = scrut->var;
-      LamPtr b = expr(*dflt->rhs);
-      scope.pop_back();
-      return b;
-    };
     if (kvs.size() <= 2) {
       // (catch (if (isint s) <!=-chain, miss -> exit> (exit N)) with (N) fb)
       int eid = ++next_exit_;
@@ -14922,10 +15010,19 @@ struct Translator {
       c->prim_arg = eid; c->then_ = bind_dflt();
       return c;
     }
-    // larger with default: equality chain ending in the fallback (correct)
-    LamPtr c = bind_dflt();
-    for (int i = (int)kvs.size() - 1; i >= 0; --i)
-      c = iff(cmp("==", kvs[i].h), expr(*kvs[i].rhs), c);
+    // larger with default: ocamlc's make_test_sequence_variant_constant -- an
+    // isint split (immediate tag tree vs the block/fall-through) around the
+    // Switcher.test_sequence tree, whose fail leaves (exit eid) reach the shared
+    // default handler installed by the enclosing catch.
+    int eid = ++next_exit_;
+    std::vector<std::pair<int, LamPtr>> cases;
+    for (auto& kv : kvs) cases.push_back({(int)kv.h, expr(*kv.rhs)});
+    LamPtr tree = oc_call_switcher(scrut, cases, oc_exit(eid), /*test_seq=*/true);
+    auto isi = mk(Lam::K::Prim); isi->prim = Prim::IntCmp;
+    isi->prim_id = "isint"; isi->args = {scrut};
+    auto c = mk(Lam::K::Catch);
+    c->cond = iff(isi, tree, oc_exit(eid));
+    c->prim_arg = eid; c->then_ = bind_dflt();
     return c;
   }
 
