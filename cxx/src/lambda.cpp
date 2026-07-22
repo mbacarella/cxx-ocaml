@@ -893,6 +893,18 @@ struct Translator {
   // the top entries before each build attempt (a bailed pass-1 build would
   // otherwise suppress the wrap on pass 2).
   std::set<int> gm_orw_;
+  // The current top entry's deid when it is NOT backed by a user catch-all row
+  // (an exhaustive match's Match_failure default); -1 when a real catch-all
+  // exists.  The ctor-chunk driver refuses to route misses at such a deid --
+  // upstream's exhaustiveness/ctx knowledge would prune the dead arm.
+  int gm_fake_deid_ = -1;
+  // Entry eids to which mkexit routed a miss whose context had FULLY matched
+  // the entry's matrix through tests (head_omega false): upstream jumps
+  // straight to the matched row's arm there, so a build exiting to the entry
+  // instead diverges.  The ctor-chunk driver rejects an attempt only when
+  // the dirty entry is one of its OWN chunks (allocated during the attempt);
+  // dirt on an ENCLOSING scope's entry propagates up to that owner's check.
+  std::set<int> gm_ctx_dirty_eids_;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -10907,7 +10919,14 @@ struct Translator {
   // tag-specialized stack, so its empty-matrix exit lands on the first entry
   // compatible with that tag (mk_failaction_pos's partition).  Only the
   // chunked string-column driver pushes entries; `deid` stays the final exit.
-  struct GmDef { int eid; std::vector<std::vector<const Pattern*>> mat; };
+  // head_dropped: specialization pruned the entry's original HEAD row while
+  // later rows survive.  A context-fully-matched exit to such an entry is a
+  // DEEP match: upstream's finer chunk split (one half-match per var row it
+  // actually sees) skips the pruned rows' entries entirely and lands on the
+  // matched row's own chunk, whose handler drops the ctx-decided tests; our
+  // grouped entry re-tests them (see mkexit).
+  struct GmDef { int eid; std::vector<std::vector<const Pattern*>> mat;
+                 bool head_dropped = false; };
   const Pattern* gmdef_peel(const Pattern* p) {
     if (!p) return nullptr;
     for (;;) {
@@ -10931,27 +10950,35 @@ struct Translator {
     std::vector<GmDef> out;
     for (auto& en : env) {
       if (!en.mat.empty() && en.mat[0].empty()) {   // already fully matched
-        out.push_back({en.eid, {{}}});
+        out.push_back({en.eid, {{}}, en.head_dropped});
         env = std::move(out);
         return true;
       }
-      GmDef ne{en.eid, {}};
-      std::vector<std::vector<const Pattern*>> work(en.mat.rbegin(), en.mat.rend());
+      GmDef ne{en.eid, {}, en.head_dropped};
+      // Work items carry their ORIGINAL row index so we can tell whether the
+      // entry's head row survives this specialization (or-alternatives of
+      // the head all count as head material).
+      std::vector<std::pair<std::vector<const Pattern*>, size_t>> work;
+      for (size_t ri = en.mat.size(); ri-- > 0; ) work.push_back({en.mat[ri], ri});
+      bool head_alive = false;
       while (!work.empty()) {
-        std::vector<const Pattern*> row = std::move(work.back()); work.pop_back();
+        auto [row, ri] = std::move(work.back()); work.pop_back();
         const Pattern* p0 = gmdef_peel(row[0]);
         if (p0 && std::get_if<Ppat_or>(&p0->desc)) {
           std::vector<const Pattern*> alts; flatten_or(p0, alts);
           for (auto it = alts.rbegin(); it != alts.rend(); ++it) {
-            auto r2 = row; r2[0] = *it; work.push_back(std::move(r2));
+            auto r2 = row; r2[0] = *it; work.push_back({std::move(r2), ri});
           }
           continue;
         }
+        size_t before = ne.mat.size();
         if (spec(p0, row, ne.mat) < 0) return false;
+        if (ri == 0 && ne.mat.size() > before) head_alive = true;
       }
       if (ne.mat.empty()) continue;                 // entry unreachable: drop
+      if (!head_alive) ne.head_dropped = true;
       if (ne.mat[0].empty()) {                      // fully matched: truncate
-        out.push_back({ne.eid, {{}}});
+        out.push_back({ne.eid, {{}}, ne.head_dropped});
         env = std::move(out);
         return true;
       }
@@ -11029,20 +11056,22 @@ struct Translator {
       return 1;
     });
   }
-  // Chunk driver for a string-constant column with interspersed var rows:
-  // split at the can_group boundaries (maximal const runs / var runs), compile
-  // the first run with the later runs consed onto the default environment,
-  // then attach each later run's handler in order -- inlined when its entry
-  // exit is used once, a catch otherwise (comp_match_handlers followed by
-  // Simplif's single-use exit inlining).
-  LamPtr gmatch_str_chunks(const std::vector<LamPtr>& comps, const std::vector<MRow>& rows,
-                           const Location& mloc, int deid, const std::vector<GmDef>& denv) {
+  // Chunk driver for a specializable column with interspersed var rows:
+  // split at the can_group boundaries (maximal specialized runs / var runs),
+  // compile the first run with the later runs consed onto the default
+  // environment, then attach each later run's handler in order -- inlined
+  // when its entry exit is used once, a catch otherwise (comp_match_handlers
+  // followed by Simplif's single-use exit inlining).  `spec` classifies a
+  // (peeled) column-0 pattern as a specialized-run member; everything else
+  // counts as a var row.
+  LamPtr gmatch_run_chunks(const std::vector<LamPtr>& comps, const std::vector<MRow>& rows,
+                           const Location& mloc, int deid, const std::vector<GmDef>& denv,
+                           bool (*spec)(const Pattern*)) {
     std::vector<std::pair<size_t, size_t>> runs;     // [begin, end) maximal runs
     for (size_t i = 0; i < rows.size(); ) {
-      bool c = std::get_if<Ppat_constant>(&rows[i].cols[0]->desc) != nullptr;
+      bool c = spec(rows[i].cols[0]);
       size_t j = i + 1;
-      while (j < rows.size() &&
-             (std::get_if<Ppat_constant>(&rows[j].cols[0]->desc) != nullptr) == c) ++j;
+      while (j < rows.size() && spec(rows[j].cols[0]) == c) ++j;
       runs.push_back({i, j});
       i = j;
     }
@@ -11236,6 +11265,17 @@ struct Translator {
     auto mkexit = [&] {
       auto e = mk(Lam::K::Staticraise);
       e->prim_arg = denv.empty() ? deid : denv.front().eid;
+      // A DEEP fully-matched exit (the denv_map truncation sentinel on an
+      // entry whose head row was pruned away): upstream's finer split gives
+      // the matched row its own chunk -- pruned entries are skipped and the
+      // landing handler drops the ctx-decided tests -- while our grouped
+      // entry re-tests them (shape_reduce's reduce_aliases_for_uid:
+      // tag-4/approx=true prunes the spread `{uid=Some;approx=false}` copy
+      // and deep-matches the `{approx=true}` row).  A HEAD-row full match is
+      // fine: mixed arrivals keep upstream's handler tests too.
+      if (!denv.empty() && denv.front().head_dropped &&
+          denv.front().mat.size() == 1 && denv.front().mat[0].empty())
+        gm_ctx_dirty_eids_.insert(denv.front().eid);
       return e;
     };
     if (rows.empty()) return mkexit();
@@ -11637,7 +11677,11 @@ struct Translator {
             } else seen_var = true;
           }
           if (inter && !cppcaml::dbg_env("NOCHUNK"))
-            if (LamPtr r = gmatch_str_chunks(comps, rows, mloc, deid, denv)) return r;
+            if (LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
+                    [](const Pattern* p) {
+                      return std::get_if<Ppat_constant>(&p->desc) != nullptr;
+                    }))
+              return r;
         }
         if (g_gm_budget_ == 0) return nullptr;
         if (g_gm_budget_ > 0) --g_gm_budget_;
@@ -11779,6 +11823,88 @@ struct Translator {
       if (auto* pv = std::get_if<Ppat_var>(&r.cols[0]->desc))
         r.binds.push_back({pv->name.txt, comps[0]->var});
     };
+    // matching.ml's split_no_or run division on a CONSTRUCTOR column with var
+    // rows whose REMAINING columns still test something: the consecutive ctor
+    // rows form one half-match and the var rows a default matrix compiled
+    // ONCE behind a fresh exit at this split point (Default_environment).
+    // The spread path below instead copies the var rows into every case,
+    // re-emitting their own dispatch once per tag (untypeast's `pattern`: the
+    // three pat_extra-only rows re-dispatched under every pat_desc case) and
+    // turning their single-use arms multi-use (root catches upstream never
+    // makes).  A var row whose rest is all-omega adds no dispatch, so the
+    // spread compiles identically there and stays (trailing all-var rows were
+    // already peeled by the caller's chunk split).  Guarded rows fall through
+    // to the spread path: upstream's up-to-guard division cuts differently.
+    if (anyctor) {
+      // A var row that shares its arm with a ctor row is an or-ALTERNATIVE
+      // (`(Error _ as e, _) | (_, Error _ as e)` after this level's col-0 or
+      // expansion): upstream's precompile_or + jump contexts resolve those to
+      // direct arm exits at each miss point -- which is what the spread path
+      // already produces -- while a default-matrix recompile would re-dispatch
+      // a column the specialized side has fully determined, leaving a dead
+      // Match_failure arm no ctx model prunes (build_path_prefix_map's
+      // decode_pair, signature_group's `None,_ | _,Some _`).
+      std::set<int> ctor_aids;
+      for (auto& r : rows)
+        if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) ctor_aids.insert(r.aid);
+      bool anyv = false, nontriv = false, ok = true;
+      for (auto& r : rows) {
+        // Every row aid-shared: leaves emit `(exit aid)` only, so a rejected
+        // attempt never runs expr() (whose side effects the state restore
+        // below could not undo).
+        if (r.guard || r.aid < 0) { ok = false; break; }
+        if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) continue;
+        if (ctor_aids.count(r.aid)) { ok = false; break; }
+        anyv = true;
+        for (size_t j = 1; j < r.cols.size() && !nontriv; ++j)
+          if (!gmdef_omega(gmdef_peel(r.cols[j]))) nontriv = true;
+      }
+      if (ok && anyv && nontriv && !cppcaml::dbg_env("NOCTORCHUNK")) {
+        // The attempt below can be rejected, and its sub-compiles advance
+        // shared gmatch state; snapshot what the retry reads so a rejected
+        // attempt is invisible to the spread path (a leaked gm_orw_ aid
+        // suppresses that arm's or-wrap; a leaked exit id shifts wire-time
+        // id comparisons).
+        std::set<int> orw_save = gm_orw_;
+        auto facc_save = gm_facc_proto_;
+        int exit_save = next_exit_;
+        int stamp_save = stamp;
+        std::set<int> dirty_save = gm_ctx_dirty_eids_;
+        gm_ctx_dirty_eids_.clear();
+        LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
+                [](const Pattern* p) {
+                  return std::get_if<Ppat_construct>(&p->desc) != nullptr;
+                });
+        // Dirt on one of THIS attempt's own entries (eids allocated during
+        // the attempt) means a fully-matched chunk exit re-tests decided
+        // columns; dirt on an enclosing entry is that owner's problem and
+        // propagates up on acceptance.
+        bool own_dirty = false;
+        for (int d : gm_ctx_dirty_eids_)
+          if (d > exit_save) { own_dirty = true; break; }
+        if (r && !own_dirty) {
+          // Accept only if no miss escaped to a FAKE deid (the top entry's
+          // Match_failure default of an exhaustive match): such an exit is a
+          // dead arm upstream's exhaustiveness/ctx knowledge prunes
+          // (shape_reduce's reduce_aliases_for_uid, uid rows Some/Some/var/
+          // None re-testing uid in the trailing None chunk).  A chunked
+          // compile with no such escape -- and no ctx-dirty fully-matched
+          // chunk exit (see mkexit) -- is context-clean; reject the rest
+          // back to the spread path, whose per-case row copies specialize
+          // those misses away by construction.
+          int fbad = 0;
+          if (deid != gm_fake_deid_ || count_exit(r, deid, false, fbad) == 0) {
+            gm_ctx_dirty_eids_.insert(dirty_save.begin(), dirty_save.end());
+            return r;
+          }
+        }
+        gm_ctx_dirty_eids_ = std::move(dirty_save);
+        gm_orw_ = std::move(orw_save);
+        gm_facc_proto_ = std::move(facc_save);
+        next_exit_ = exit_save;
+        stamp = stamp_save;
+      }
+    }
     std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
     if (!anyctor) {                       // whole column is var/any: bind and drop it
       std::vector<MRow> sub;
@@ -12520,6 +12646,8 @@ struct Translator {
     // budget so a ctor-wrapped tuple (`K (a, B x)`) becomes a switch instead of the
     // caml_obj_tag if-chain, while the cartesian var-spread stays capped (bails back
     // to int_cases = the pre-existing path, so this can only add captures).
+    int fd_save = gm_fake_deid_;
+    gm_fake_deid_ = catchall ? -1 : deid;
     gm_orw_.clear();
     LamPtr body = gmatch({sv}, mrows, mloc, deid);
     if (!body) {
@@ -12528,6 +12656,7 @@ struct Translator {
       body = gmatch({sv}, mrows, mloc, deid);
       g_gm_tuples_ = false; g_gm_budget_ = -1;
     }
+    gm_fake_deid_ = fd_save;
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
     // Resolve deferred chunk catches FIRST (Simplif's single-use exit inline):
     // construction-time lower_bind has run, and everything downstream (the
@@ -14425,8 +14554,11 @@ struct Translator {
     // reads instead of bailing (which would force the whole tuple scrutinee to be
     // allocated as a block and matched via caml_obj_tag).
     g_gm_tuples_ = true; g_gm_budget_ = gm_budget();
+    int fd_save = gm_fake_deid_;
+    gm_fake_deid_ = catchall ? -1 : deid;
     gm_orw_.clear();
     LamPtr body = gmatch(comps, mrows, mloc, deid);
+    gm_fake_deid_ = fd_save;
     g_gm_tuples_ = false; g_gm_budget_ = -1;
     if (!body) return nullptr;
     // Resolve deferred chunk catches first (see gmatch_top).
