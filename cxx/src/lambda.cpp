@@ -11315,17 +11315,11 @@ struct Translator {
     // First or-row wraps first = innermost, compile_orhandlers' fold order.
     for (auto& r : rows)
       if (std::get_if<Ppat_or>(&r.cols[0]->desc)) {
-        // A guarded row anywhere in the matrix routes upstream through its
-        // context-split machinery (a different catch discipline that our
-        // wire-time root placement approximates better) -- skip the
-        // split-point wrap there (ctype's mcomp).
-        bool any_guard = false;
-        for (auto& rr : rows) if (rr.guard) { any_guard = true; break; }
         std::vector<MRow> ex;
         std::vector<int> wrapped;
         for (auto& rr : rows) {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
-          if (!any_guard && alts.size() > 1 && rr.aid >= 0 && rr.vnames &&
+          if (alts.size() > 1 && rr.aid >= 0 && rr.vnames &&
               gm_orw_.insert(rr.aid).second)
             wrapped.push_back(rr.aid);
           for (auto* a : alts) { MRow nr = rr; nr.cols[0] = effective_pat(a); ex.push_back(std::move(nr)); }
