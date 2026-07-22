@@ -635,6 +635,14 @@ struct Translator {
   std::unordered_map<std::string,
                      std::optional<std::unordered_map<std::string, int>>>
       incl_layout_prev_;
+  // The stdlib (sub)modules a named local structure `include`d, so a later
+  // `M.length`-style reference to a member that is a PRIMITIVE of the include
+  // (no runtime field in M's block) eta-stubs it instead of lowering to an
+  // unresolved `?length` var (a segfault at run time).  build_module leaves its
+  // structure's list in last_inc_stdlib_; the `module M = struct..end` binding
+  // site consumes it under M's name.
+  std::unordered_map<std::string, std::vector<std::string>> incl_stdlib_of_;
+  std::vector<std::string> last_inc_stdlib_;
   // A module alias `module F = M.Sub` resolves F to a pure path expression
   // (`(field_imm i M)`) inlined at use sites, instead of a fresh binding.
   std::unordered_map<std::string, LamPtr> module_alias_;
@@ -18563,6 +18571,18 @@ struct Translator {
               if (LamPtr s = prim_stub(ex->second)) return s;
             if (auto lp = local_prims_.find(d->name); lp != local_prims_.end())
               if (LamPtr s = prim_stub({lp->second.first, lp->second.second})) return s;
+            // A member that is a PRIMITIVE of a stdlib module this structure
+            // `include`d (`module B = struct include String .. end; B.length`):
+            // it has no runtime field in B's block -- eta-stub it, else it
+            // lowers to an unresolved `?length` var and segfaults at run time.
+            if (auto ii = incl_stdlib_of_.find(pl->name); ii != incl_stdlib_of_.end())
+              for (auto& im : ii->second) {
+                StdPrim sp = im.find('.') != std::string::npos
+                                 ? submodule_prim(im, d->name)
+                                 : value_prim(im, d->name);
+                if (sp.name.empty()) continue;
+                if (LamPtr s = prim_stub(sp, cmp_operand_of(&e))) return s;
+              }
           }
           // `open StdLabels` brings `List` into scope as an alias to ListLabels;
           // a `List.x` then resolves through the alias target (shadows the plain
@@ -23213,6 +23233,8 @@ struct Translator {
             modsig::SigPtr submsig;
             LamPtr body = build_module(ps->items, &sub, coerce, nullptr,
                                        sub_coerce_sig, &submsig, sub_coerce_msig);
+            incl_stdlib_of_[*mb.name.txt] = std::move(last_inc_stdlib_);
+            last_inc_stdlib_.clear();
             for (auto& [k, v] : lprims_before) local_prims_[k] = v;
             for (auto& [k, v] : exts_before) externals_[k] = v;
             mod_path_ = saved; exn_path_ = saved_ep;
@@ -24339,6 +24361,7 @@ struct Translator {
     for (int i = 0; i < n_opens; ++i) opened_.pop_back();
     menv_.pop_frame();
     scope.pop_back();
+    last_inc_stdlib_ = std::move(inc_stdlib_mods);
     return acc;
   }
 };
