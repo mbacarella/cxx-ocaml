@@ -9876,11 +9876,31 @@ struct Translator {
         subst_var(body, id, acc); continue;
       }
       Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = acc;
-      if (is_mut_field_access(acc)) b.strict_opt = true;   // mutable -> StrictOpt (`=o`)
-      else b.alias = is_field_access(acc);
-      body = wraplet(b, body);
+      if (is_mut_field_access(acc)) { b.strict_opt = true; body = wraplet(b, body); }
+      else if (is_field_access(acc) && body->k == Lam::K::IfThenElse &&
+               body->cond && body->cond->k == Lam::K::Var &&
+               sibling_binder(binders, body->cond->var)) {
+        // ocamlc bind_checks every pattern bind at match time, so an Alias
+        // field read sinks (lower_bind) into the single branch using it when
+        // the test and other branches are transparent.  On our fully-compiled
+        // body that analysis overshoots (upstream's ran on the pre-Simplif
+        // tree), so sink ONLY through the destructure's own column dispatch:
+        // an if testing a SIBLING binder's var -- `fun (name, crco) -> match
+        // crco with None -> .. | Some c -> ..name..` reads field 0 only
+        // inside the Some branch.
+        body = lower_bind(id, ValueKind::Gen, acc, body);
+      } else {
+        b.alias = is_field_access(acc);
+        body = wraplet(b, body);
+      }
     }
     return body;
+  }
+  static bool sibling_binder(const std::vector<std::pair<Ident, LamPtr>>& binders,
+                             const Ident& v) {
+    for (auto& [id, acc] : binders)
+      if (id.stamp == v.stamp) return true;
+    return false;
   }
   std::set<int> lazy_force_binders_;  // binder stamps holding a lazy force
   // An IMMUTABLE field read -- the alias (`=a`) class.  A mutable read
