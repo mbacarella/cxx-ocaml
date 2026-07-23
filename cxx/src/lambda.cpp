@@ -12297,9 +12297,19 @@ struct Translator {
       type = *common;
       any_ci = &type_ctor_info_.at(type).at(col_cns[0]);
     }
-    auto tcit = type_ctors_.find(type);
-    if (tcit == type_ctors_.end() || !any_ci) return GB("no-type_ctors", type);
-    int NC = tcit->second.first, NB = tcit->second.second;
+    if (!any_ci) return GB("no-type_ctors", type);
+    // The flat type_ctors_ table is keyed by BARE type names and only carries the
+    // types force-registered along a top-level scrutinee's inferred path.  A ctor
+    // column that surfaces only through DEEP decomposition (typedecl_immediacy's
+    // `cd_args` of type `Types.constructor_arguments`, reached inside a list inside
+    // a record inside a `Type_variant` arg) never passes that cascade, so the bare
+    // type is absent here even though every row's ctor resolved.  Leave NC/NB
+    // unresolved (-1) and let the qualified-module walk below fill them from the
+    // owner's cmi; only bail if no owner is found (so we never allocate the whole
+    // tuple scrutinee just because a nested column's type went unregistered).
+    int NC = -1, NB = -1;
+    if (auto tcit = type_ctors_.find(type); tcit != type_ctors_.end())
+      { NC = tcit->second.first; NB = tcit->second.second; }
     // `type` is a BARE name shared across modules (`t`, `expression_desc`):
     // the flat type_ctors_ counts can belong to a same-named squatter, and a
     // wrong universe here silently drops arms / emits off-table switches
@@ -12348,6 +12358,7 @@ struct Translator {
       }
       break;
     }
+    if (NC < 0) return GB("no-type_ctors", type);   // no flat entry and no cmi owner
     if (cppcaml::dbg_env("TMDBG"))
       fprintf(stderr, "[TM] gmatch col type=%s NC=%d NB=%d\n", type.c_str(), NC, NB);
     // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
