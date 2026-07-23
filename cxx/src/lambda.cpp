@@ -17899,8 +17899,13 @@ struct Translator {
       std::vector<Row> vrows, erows;
       std::vector<std::pair<const Ppat_effect*, const Expression*>> frows;
       // (exit id, shared rhs) for each mixed value/exception or-pattern whose
-      // body is shared behind an outer catch (see shared_action_exit_).
-      std::vector<std::pair<int, const Expression*>> shared_wrap;
+      // body is shared behind a catch (see shared_action_exit_).  all_exn marks
+      // an or-pattern whose leaves are ALL exceptions: ocamlc keeps its shared
+      // body LOCAL to the trywith handler ((try .. with exn (catch <dispatch>
+      // with (eid) <body>))) rather than at the outer level -- a value leaf
+      // would force the outer placement since it runs outside the try.
+      struct SharedWrap { int eid; const Expression* rhs; bool all_exn; };
+      std::vector<SharedWrap> shared_wrap;
       bool eff_guard = false;
       for (auto& c : m->cases) {
         const Expression* g = c.guard ? c.guard->get() : nullptr;
@@ -17930,9 +17935,12 @@ struct Translator {
               if (pattern_binds(bp)) { any_bind = true; break; }
             }
             if (!any_bind) {
+              bool all_exn = true;
+              for (auto* l : leaves)
+                if (!std::holds_alternative<Ppat_exception>(l->desc)) { all_exn = false; break; }
               int eid = ++next_exit_;
               shared_action_exit_[c.rhs.get()] = eid;
-              shared_wrap.push_back({eid, c.rhs.get()});
+              shared_wrap.push_back({eid, c.rhs.get(), all_exn});
             }
             for (auto* l : leaves) {
               if (auto* pe2 = std::get_if<Ppat_exception>(&l->desc))
@@ -17992,6 +18000,16 @@ struct Translator {
         tr->then_ = exn_dispatch(tr->var, erows, 0);
         caught_exn_.pop_back();
         scope.pop_back();
+        // All-exception shared or-patterns: wrap the exn dispatch itself in the
+        // shared catch, keeping the body inside the trywith handler (ocamlc).
+        for (auto& sw : shared_wrap) if (sw.all_exn) shared_action_exit_.erase(sw.rhs);
+        for (auto it = shared_wrap.rbegin(); it != shared_wrap.rend(); ++it) {
+          if (!it->all_exn) continue;
+          auto sc2 = mk(Lam::K::Catch);
+          sc2->cond = tr->then_; sc2->prim_arg = it->eid;
+          sc2->then_ = expr(*it->rhs);
+          tr->then_ = sc2;
+        }
         // the catch var takes the first var/alias value row's name, else ocamlc's
         // default "val" (Matching.name_pattern); it carries the scrutinee's kind.
         std::string vn;
@@ -18011,11 +18029,12 @@ struct Translator {
         // already (exit N)ed to it via shared_action_exit_.  Erase the registry
         // entries first so the handler bodies compile as themselves.
         LamPtr res = cat;
-        for (auto& sw : shared_wrap) shared_action_exit_.erase(sw.second);
+        for (auto& sw : shared_wrap) if (!sw.all_exn) shared_action_exit_.erase(sw.rhs);
         for (auto it = shared_wrap.rbegin(); it != shared_wrap.rend(); ++it) {
+          if (it->all_exn) continue;
           auto sc2 = mk(Lam::K::Catch);
-          sc2->cond = res; sc2->prim_arg = it->first;
-          sc2->then_ = expr(*it->second);
+          sc2->cond = res; sc2->prim_arg = it->eid;
+          sc2->then_ = expr(*it->rhs);
           res = sc2;
         }
         return res;
