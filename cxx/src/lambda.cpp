@@ -11328,6 +11328,12 @@ struct Translator {
       // placed with the arm exits opaque, and let the post-wire alias pass
       // apply the real count.
       bool exit_arg = n == 1 && var_in_garm_exit_arg(r, v);
+      if (cppcaml::dbg_env("GMFA")) {
+        fprintf(stderr, "[GMFA] v=%s/%d n=%d exit_arg=%d pre-lower tree:\n",
+                v.name.c_str(), v.stamp, n, (int)exit_arg);
+        print_dlambda(r, std::cerr);
+        fprintf(stderr, "\n");
+      }
       if (n == 1 && !exit_arg) { subst_alias(r, v, clone_facc(proto)); return r; }
       lb_opaque_garm_exits_ = exit_arg;
       LamPtr out = lower_bind(v, proto->gm_facc_kind, clone_facc(proto), r);
@@ -11348,7 +11354,20 @@ struct Translator {
         };
         Lam* lt = find_let_of(out, v);
         Lam* dst = lt ? lt->body.get() : nullptr;
-        while (dst && dst->k == Lam::K::Let) dst = dst->body.get();
+        // Descend past sibling lets AND this match's own catch splits: upstream's
+        // lower_bind has no Lstaticcatch case, so a bind above such a catch is
+        // exactly where upstream leaves it too -- the carrying if inside the
+        // protected body is still this column's own dispatch.
+        while (dst && (dst->k == Lam::K::Let || dst->k == Lam::K::Catch))
+          dst = (dst->k == Lam::K::Let ? dst->body : dst->cond).get();
+        if (cppcaml::dbg_env("GMFA")) {
+          fprintf(stderr, "[GMFA] v=%s/%d landing dst=%d gate=%d post-lower:\n",
+                  v.name.c_str(), v.stamp, dst ? (int)dst->k : -1,
+                  (int)(dst && dst->k == Lam::K::IfThenElse &&
+                        (carrying(dst->then_) || carrying(dst->else_))));
+          print_dlambda(out, std::cerr);
+          fprintf(stderr, "\n");
+        }
         if (!dst || dst->k != Lam::K::IfThenElse ||
             !(carrying(dst->then_) || carrying(dst->else_))) {
           strip_let_of(out, v);           // unwind: substitute like before
