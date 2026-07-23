@@ -10852,9 +10852,89 @@ struct Translator {
     for (auto& a : c->args) a = clone_facc(a);
     return c;
   }
+  // Estimate whether an arm rhs COMPILES to a term matching.ml's approx_present
+  // walks through (consts / vars / prim chains -> "absent"): constants, ident
+  // paths, constructor/tuple/field shapes of such.  Anything else (apply,
+  // function, let, match, sequence, ...) compiles to a shape approx_present
+  // conservatively calls present.  Used for the opacity of a sibling arm's
+  // placeholder exit, standing for the rhs upstream had compiled inline there.
+  static bool rhs_transparent(const Expression* e) {
+    if (!e) return false;
+    if (std::holds_alternative<Pexp_constant>(e->desc)) return true;
+    if (std::holds_alternative<Pexp_ident>(e->desc)) return true;
+    if (auto* k = std::get_if<Pexp_construct>(&e->desc))
+      return !k->arg || rhs_transparent(k->arg->get());
+    if (auto* t = std::get_if<Pexp_tuple>(&e->desc)) {
+      for (auto& el : t->elems) if (!rhs_transparent(el.get())) return false;
+      return true;
+    }
+    if (auto* f = std::get_if<Pexp_field>(&e->desc)) return rhs_transparent(f->e.get());
+    return false;
+  }
+  // Compiled-handler opacity for an arm's placeholder exit, by exit id.
+  std::unordered_map<int, bool> gm_exit_opaque_;
+  // Find the single-binding `let v = ..` node anywhere in the tree.
+  static Lam* find_let_of(const LamPtr& l, const Ident& v) {
+    if (!l) return nullptr;
+    if (l->k == Lam::K::Let && l->bindings.size() == 1 &&
+        l->bindings[0].id.stamp == v.stamp)
+      return l.get();
+    if (l->k == Lam::K::Function) return nullptr;
+    if (Lam* r = find_let_of(l->fn, v)) return r;
+    if (Lam* r = find_let_of(l->body, v)) return r;
+    if (Lam* r = find_let_of(l->cond, v)) return r;
+    if (Lam* r = find_let_of(l->then_, v)) return r;
+    if (Lam* r = find_let_of(l->else_, v)) return r;
+    if (Lam* r = find_let_of(l->sw_default, v)) return r;
+    for (auto& a : l->args) if (Lam* r = find_let_of(a, v)) return r;
+    for (auto& b : l->bindings) if (Lam* r = find_let_of(b.val, v)) return r;
+    for (auto& sc : l->sw_consts) if (Lam* r = find_let_of(sc.body, v)) return r;
+    for (auto& sc : l->sw_blocks) if (Lam* r = find_let_of(sc.body, v)) return r;
+    return nullptr;
+  }
+  // Remove the single-binding `let v = ..` node from the tree (splicing in its
+  // body), for unwinding a placement attempt.  Returns true when found.
+  static bool strip_let_of(LamPtr& l, const Ident& v) {
+    if (!l) return false;
+    if (l->k == Lam::K::Let && l->bindings.size() == 1 &&
+        l->bindings[0].id.stamp == v.stamp) {
+      LamPtr b = l->body; l = b; return true;
+    }
+    if (l->k == Lam::K::Function) return false;
+    if (strip_let_of(l->fn, v) || strip_let_of(l->body, v) ||
+        strip_let_of(l->cond, v) || strip_let_of(l->then_, v) ||
+        strip_let_of(l->else_, v) || strip_let_of(l->sw_default, v))
+      return true;
+    for (auto& a : l->args) if (strip_let_of(a, v)) return true;
+    for (auto& b : l->bindings) if (strip_let_of(b.val, v)) return true;
+    for (auto& sc : l->sw_consts) if (strip_let_of(sc.body, v)) return true;
+    for (auto& sc : l->sw_blocks) if (strip_let_of(sc.body, v)) return true;
+    return false;
+  }
+  // Whether v occurs as an ARG of an arm's placeholder exit (gm_garm).
+  static bool var_in_garm_exit_arg(const LamPtr& l, const Ident& v) {
+    if (!l) return false;
+    if (l->k == Lam::K::Staticraise && l->gm_garm)
+      for (auto& a : l->args)
+        if (a && a->k == Lam::K::Var && a->var.stamp == v.stamp) return true;
+    if (l->k == Lam::K::Function) return false;
+    if (var_in_garm_exit_arg(l->fn, v) || var_in_garm_exit_arg(l->body, v) ||
+        var_in_garm_exit_arg(l->cond, v) || var_in_garm_exit_arg(l->then_, v) ||
+        var_in_garm_exit_arg(l->else_, v) || var_in_garm_exit_arg(l->sw_default, v))
+      return true;
+    for (auto& a : l->args) if (var_in_garm_exit_arg(a, v)) return true;
+    for (auto& b : l->bindings) if (var_in_garm_exit_arg(b.val, v)) return true;
+    for (auto& sc : l->sw_consts) if (var_in_garm_exit_arg(sc.body, v)) return true;
+    for (auto& sc : l->sw_blocks) if (var_in_garm_exit_arg(sc.body, v)) return true;
+    return false;
+  }
   // matching.ml's approx_present: is v (approximately) present in lam?
   // Anything outside the listed shapes conservatively counts as present.
-  static bool approx_present(const Ident& v, const LamPtr& l) {
+  // With lb_opaque_garm_exits_ set, an arm's placeholder exit (gm_garm) also
+  // counts as present: it stands for the handler upstream had already compiled
+  // inline at that spot when its lower_bind ran.
+  bool lb_opaque_garm_exits_ = false;
+  bool approx_present(const Ident& v, const LamPtr& l) {
     if (!l) return false;
     switch (l->k) {
       case Lam::K::ConstInt: case Lam::K::ConstChar: case Lam::K::ConstFloat:
@@ -10863,6 +10943,18 @@ struct Translator {
       case Lam::K::Var:
         return l->var.stamp == v.stamp;
       case Lam::K::Staticraise:
+        if (lb_opaque_garm_exits_ && l->gm_garm) {
+          // Carrying v: upstream's leaf held `let bound =a v in rhs` here --
+          // v is present no matter what the rhs looks like.
+          for (auto& a : l->args)
+            if (a && a->k == Lam::K::Var && a->var.stamp == v.stamp) return true;
+          // Sibling arm: present iff the handler upstream compiled inline
+          // here is an opaque shape (unknown -> conservative).
+          auto oit = gm_exit_opaque_.find(l->prim_arg);
+          if (oit == gm_exit_opaque_.end() || oit->second) return true;
+        }
+        for (auto& a : l->args) if (approx_present(v, a)) return true;
+        return false;
       case Lam::K::Prim:
         for (auto& a : l->args) if (approx_present(v, a)) return true;
         return false;
@@ -11222,13 +11314,48 @@ struct Translator {
                 v.name.c_str(), v.stamp, rows.size(),
                 rows.empty() || rows[0].cols.empty() ? -1 : (int)rows[0].cols[0]->desc.index());
       gm_facc_proto_[v.stamp] = proto;   // for wire_garms' exit-arg minimization
+      for (auto& rw : rows)              // handler opacity, for sibling-exit approx
+        if (rw.aid >= 0 && !gm_exit_opaque_.count(rw.aid))
+          gm_exit_opaque_[rw.aid] = rw.guard || !rhs_transparent(rw.rhs);
       comps[0] = varof(v);
       LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(denv));
       if (!r) return nullptr;
       int n = count_var(r, v);
       if (n == 0) return r;
-      if (n == 1) { subst_alias(r, v, clone_facc(proto)); return r; }
-      return lower_bind(v, proto->gm_facc_kind, clone_facc(proto), r);
+      // A single use that is an arm exit's ARG is not upstream's count-1 case:
+      // the handler behind the exit may use the param many times (Simplif then
+      // keeps the Alias let where lower_bind put it) -- so keep the let,
+      // placed with the arm exits opaque, and let the post-wire alias pass
+      // apply the real count.
+      bool exit_arg = n == 1 && var_in_garm_exit_arg(r, v);
+      if (n == 1 && !exit_arg) { subst_alias(r, v, clone_facc(proto)); return r; }
+      lb_opaque_garm_exits_ = exit_arg;
+      LamPtr out = lower_bind(v, proto->gm_facc_kind, clone_facc(proto), r);
+      lb_opaque_garm_exits_ = false;
+      if (exit_arg) {
+        // Keep the let ONLY for the shape that exactly models upstream's leaf:
+        // it landed (past sibling lets) on an `if` one of whose branches IS
+        // the arm exit carrying v -- upstream compiled that arm's rhs inline
+        // right there, saw the multi-use var, and kept the Alias bind above
+        // the test.  Any other landing means OUR materialization level is
+        // shallower than upstream's sub-pm bind point (per-sub-pm binding we
+        // do not replicate), so keep the old at-the-use substitution.
+        auto carrying = [&](const LamPtr& s) {
+          if (!s || s->k != Lam::K::Staticraise || !s->gm_garm) return false;
+          for (auto& a : s->args)
+            if (a && a->k == Lam::K::Var && a->var.stamp == v.stamp) return true;
+          return false;
+        };
+        Lam* lt = find_let_of(out, v);
+        Lam* dst = lt ? lt->body.get() : nullptr;
+        while (dst && dst->k == Lam::K::Let) dst = dst->body.get();
+        if (!dst || dst->k != Lam::K::IfThenElse ||
+            !(carrying(dst->then_) || carrying(dst->else_))) {
+          strip_let_of(out, v);           // unwind: substitute like before
+          subst_alias(out, v, clone_facc(proto));
+        }
+      }
+      return out;
     }
     // A leading UNGUARDED all-wildcard row matches every value, so the rows after
     // it are dead.  ocamlc drops them and emits that row's action with no column
@@ -11309,6 +11436,7 @@ struct Translator {
       auto row_action = [&](MRow& r) -> LamPtr {
         if (r.aid >= 0) {                // action-sharing: exit to the shared handler
           auto ex = mk(Lam::K::Staticraise); ex->prim_arg = r.aid;
+          ex->gm_garm = true;
           for (auto& nm : *r.vnames) {
             Ident id{}; bool found = false;
             for (auto it = r.binds.rbegin(); it != r.binds.rend(); ++it)

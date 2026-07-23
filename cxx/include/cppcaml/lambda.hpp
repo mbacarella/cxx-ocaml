@@ -230,6 +230,14 @@ struct Lam {
   // the arm turns out single-use wire_garms rebinds the exit args above this
   // node instead of inline_exit's at-site rebind (`if g (let binds rhs) next`).
   int gm_guard_aid = -1;
+  // gm_garm: a gmatch arm's leaf exit `(exit aid vars..)`, standing for the
+  // arm's not-yet-wired handler.  Upstream compiles a single-use row's rhs
+  // INLINE before the column binds are lowered around it, so lower_bind's
+  // approx_present sees the real handler body (usually opaque); our exit
+  // placeholder is transparent (args only) and would let a bind sink past the
+  // point upstream stops at.  Materialization treats a flagged exit as opaque
+  // when the bound var's only use is one of its args.
+  bool gm_garm = false;
 };
 
 // Alpha-normalized structural key of a Lambda term (the analog of
