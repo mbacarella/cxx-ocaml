@@ -11620,6 +11620,65 @@ struct Translator {
         }
         return sub;
       }
+    // Column selection (matching.ml precompile_var / what_is_first_case = Any):
+    // when the FIRST row's column 0 is a wildcard, ocamlc does not dispatch
+    // column 0 -- it defers to the leftmost column whose first-row cell
+    // discriminates.  We realize that by rotating that column to the front and
+    // recursing on the FULL matrix (no default-env split), so the dispatch stays
+    // naturally total whenever the pivot column is covered (`match cd_args, rep
+    // with _,Variant_unboxed->.. | Cstr_tuple[],Variant_regular->.. |
+    // _,Variant_regular->..` -> `if rep (..)(switch cd_args)`, datarepr).  Only
+    // the multi-column, fully aid-shared, empty-default-env case (a
+    // gmatch_tuple_top scrutinee) so the trial compile emits no expr() side
+    // effects and a rejected rotation is invisible to the normal path below.
+    // Reject when it routes a miss to a fake deid (a spurious Match_failure the
+    // split-free rotation cannot model) or bails.
+    if (denv.empty() && comps.size() >= 2 &&
+        gmdef_omega(gmdef_peel(rows[0].cols[0]))) {
+      size_t piv = 0;
+      for (size_t j = 1; j < comps.size(); ++j)
+        if (!gmdef_omega(gmdef_peel(rows[0].cols[j]))) { piv = j; break; }
+      bool shared = true;
+      for (auto& r : rows) if (r.aid < 0 || r.guard) { shared = false; break; }
+      // Rotation reproduces ocamlc's precompile_var (split col0's leading wild
+      // run: yes-submatrix on the remaining columns, discriminating rows as the
+      // default) only when the pivot column is FULLY discriminating -- no var
+      // row spreads across its cases.  With a var row in the pivot, ocamlc's
+      // split and this split-free rotation diverge, so decline.
+      bool pivsolid = piv >= 1;
+      for (auto& r : rows)
+        if (piv >= 1 && gmdef_omega(gmdef_peel(r.cols[piv]))) { pivsolid = false; break; }
+      // Fire only for the cleanest precompile_var: EXACTLY column 0 is deferred
+      // (piv == 1) and column 0 actually discriminates below its leading wild
+      // run (leadwild < rows).  A fully-wild column 0 (leadwild == rows) is a
+      // pure binding column the drop-column path already handles faithfully
+      // (value_rec_compiler); piv >= 2 defers several columns whose split-free
+      // rotation diverges from ocamlc's left-to-right deferral (parmatch).
+      size_t leadwild = 0;
+      while (leadwild < rows.size() &&
+             gmdef_omega(gmdef_peel(rows[leadwild].cols[0]))) ++leadwild;
+      if (piv == 1 && leadwild < rows.size() && pivsolid && shared &&
+          comps[piv]->k == Lam::K::Var) {
+        if (cppcaml::dbg_env("GMROT"))
+          fprintf(stderr, "[GMROT] rows=%zu cols=%zu piv=%zu leadwild=%zu\n",
+                  rows.size(), comps.size(), piv, leadwild);
+        int exit_save = next_exit_, stamp_save = stamp;
+        std::set<int> orw_save = gm_orw_, dirty_save = gm_ctx_dirty_eids_;
+        auto facc_save = gm_facc_proto_;
+        std::vector<LamPtr> rc = comps;
+        std::swap(rc[0], rc[piv]);
+        std::vector<MRow> rr = rows;
+        for (auto& r : rr) std::swap(r.cols[0], r.cols[piv]);
+        LamPtr res = gmatch(std::move(rc), std::move(rr), mloc, deid, {});
+        int fbad = 0;
+        bool spurious = res && deid == gm_fake_deid_ &&
+                        count_exit(res, deid, false, fbad) > 0;
+        if (res && !spurious) return res;
+        next_exit_ = exit_save; stamp = stamp_save;
+        gm_orw_ = std::move(orw_save); gm_ctx_dirty_eids_ = std::move(dirty_save);
+        gm_facc_proto_ = std::move(facc_save);
+      }
+    }
     // Nested tuple column: a tuple type is monomorphic, so every value is a k-block
     // and we destructure unconditionally (no tag test) into k leading columns.  Only
     // under g_gm_tuples_ (gmatch_top's second pass) and budgeted, since parallel
