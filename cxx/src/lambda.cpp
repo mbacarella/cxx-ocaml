@@ -10446,8 +10446,10 @@ struct Translator {
       std::string k0;
       for (auto& b : blocks) {
         if (b.body == b0) continue;         // same term (e.g. the shared default exit)
-        if (k0.empty()) k0 = make_lam_key(b0);
-        std::string k = make_lam_key(b.body);
+        // scoped key: free exit targets stay literal, so bodies dispatching to
+        // DISTINCT handlers never collapse into one action (see same_action_lam)
+        if (k0.empty()) k0 = make_lam_key_scoped(b0);
+        std::string k = make_lam_key_scoped(b.body);
         if (k.empty() || k != k0) { share = false; break; }
       }
       if (share) {
@@ -10476,22 +10478,18 @@ struct Translator {
   }
   // Dispatch over a variant's constant constructors (values 0..nc-1, sorted):
   // 1 -> the arm; 2 -> `(if scrut <v1> <v0>)`; >=3 -> `(switch* scrut case int V:)`.
-  // Two lambda leaves are the "same action" when pointer-equal, both argument-less
-  // exits to the same handler (make_lam_key can't tell exit targets apart), or
-  // otherwise structurally equal.  (Member twin of gmatch's local `same_action`.)
+  // Two lambda leaves are the "same action" when pointer-equal or structurally
+  // equal under make_lam_key_scoped -- internal catch ids canonical (recompiled
+  // copies of one source action share), FREE exit targets literal (two leaves
+  // dispatching to distinct arm/default handlers never merge; exit-blind keying
+  // here dropped the `W [Tb]` arm of a nested const-ctor column, misrouting it
+  // to the `W [Ta]` action).  (Member twin of gmatch's local `same_action`.)
   bool same_action_lam(const LamPtr& a, const LamPtr& b) {
     if (a == b) return true;
-    if (a->k == Lam::K::Staticraise && b->k == Lam::K::Staticraise) {
-      // make_lam_key ignores the exit target, so two exits are the same action
-      // only when they name the SAME handler (prim_arg) AND pass structurally
-      // identical arguments.
-      if (a->prim_arg != b->prim_arg) return false;
-      if (a->args.empty() && b->args.empty()) return true;
-      std::string ka = make_lam_key(a);
-      return !ka.empty() && ka == make_lam_key(b);
-    }
-    std::string ka = make_lam_key(a);
-    return !ka.empty() && ka == make_lam_key(b);
+    if (a->k == Lam::K::Staticraise && b->k == Lam::K::Staticraise &&
+        a->prim_arg != b->prim_arg) return false;
+    std::string ka = make_lam_key_scoped(a);
+    return !ka.empty() && ka == make_lam_key_scoped(b);
   }
   // An exhaustive constant dispatch (tags 0..N-1, each with a body) whose tags
   // collapse into exactly TWO contiguous runs of a shared action (`0|1|2 -> A |
@@ -12495,14 +12493,15 @@ struct Translator {
     // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
     LamPtr result;
     // Two block bodies are the same action when pointer-equal, both argument-less
-    // exits to the same handler (the shared default -- make_lam_key can't tell exit
-    // targets apart), or otherwise structurally equal.
+    // exits to the same handler, or structurally equal with internal catch ids
+    // canonical and FREE exit targets literal (see same_action_lam: exit-blind
+    // keys merge leaves dispatching to distinct arm handlers -- a miscompile).
     auto same_action = [&](const LamPtr& a, const LamPtr& b) -> bool {
       if (a == b) return true;
       if (a->k == Lam::K::Staticraise && b->k == Lam::K::Staticraise)
         return a->prim_arg == b->prim_arg && a->args.empty() && b->args.empty();
-      std::string ka = make_lam_key(a);
-      return !ka.empty() && ka == make_lam_key(b);
+      std::string ka = make_lam_key_scoped(a);
+      return !ka.empty() && ka == make_lam_key_scoped(b);
     };
     // The const side of a match WITH a fail action goes through call_switcher
     // canfail.  The fail is whatever common argless exit the gap tags route to:

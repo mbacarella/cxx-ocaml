@@ -8,6 +8,7 @@
 // (setglobal L<name>! (let (...) (makeblock 0 ...))) form.
 #pragma once
 
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -283,6 +284,60 @@ inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
   for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
   if (r.empty()) return "";
   return r + ")";
+}
+
+// make_lam_key with SCOPED static-exit ids.  An exit whose target Catch lies
+// INSIDE the keyed term is canonicalized to that catch's binding order -- two
+// separate compiles of one source action differ only in such fresh internal
+// ids and must still key alike.  A FREE exit (an enclosing matcher's arm or
+// default placeholder) keeps its literal id: keying those blind merges
+// dispatches to DISTINCT handlers -- a real miscompile (a `W [Ta]` and a
+// `W [Tb]` leaf differing only in their arm exits collapse to one action and
+// the second arm vanishes).
+inline std::string make_lam_key_scoped_rec(const LamPtr& l,
+                                           std::map<int, int>& bound, int& next) {
+  if (!l) return "_";
+  using K = Lam::K;
+  switch (l->k) {
+    case K::Function: case K::Letrec: case K::For: case K::While: return "";
+    case K::Var: return "v" + l->var.name + "#" + std::to_string(l->var.stamp);
+    case K::Mutvar: return "m" + l->var.name + "#" + std::to_string(l->var.stamp);
+    case K::ConstInt: return "i" + std::to_string(l->int_val);
+    case K::ConstChar: return "c" + std::to_string(l->int_val);
+    case K::ConstFloat: return "f" + l->str_val;
+    case K::ConstString: return "s" + l->str_val;
+    default: break;
+  }
+  std::string r = "(" + std::to_string((int)l->k);
+  if (l->k == K::Prim) r += ":" + std::to_string((int)l->prim) + ":" + l->prim_id + ":" + std::to_string(l->prim_arg);
+  if (l->k == K::ConstBlock) r += ":" + std::to_string(l->prim_arg);
+  if (l->k == K::Staticraise) {
+    auto it = bound.find(l->prim_arg);
+    r += it != bound.end() ? ":B" + std::to_string(it->second)
+                           : ":X" + std::to_string(l->prim_arg);
+  }
+  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key_scoped_rec(c, bound, next); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+  if (l->k == K::Catch) {
+    // the id is in scope in the protected body (`cond`) only, not the handler
+    auto prev = bound.find(l->prim_arg);
+    int saved = prev != bound.end() ? prev->second : -1;
+    bound[l->prim_arg] = next++;
+    add(l->cond);
+    if (saved >= 0) bound[l->prim_arg] = saved; else bound.erase(l->prim_arg);
+    add(l->fn); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
+  } else {
+    add(l->fn); add(l->cond); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
+  }
+  for (auto& a : l->args) add(a);
+  for (auto& b : l->bindings) { if (!r.empty()) r += " b" + std::to_string(b.id.stamp); add(b.val); }
+  for (auto& sc : l->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
+  for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
+  if (r.empty()) return "";
+  return r + ")";
+}
+inline std::string make_lam_key_scoped(const LamPtr& l) {
+  std::map<int, int> bound; int next = 0;
+  return make_lam_key_scoped_rec(l, bound, next);
 }
 
 // Translate a structure into the module's Lambda term (the setglobal form).
