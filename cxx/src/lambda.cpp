@@ -8297,6 +8297,49 @@ struct Translator {
     if (keep.empty()) { l = l->body; return; }
     l->bindings = std::move(keep);
   }
+  // A materialized column temp (the `*match*` for a nested non-var sub-pattern)
+  // ends up ABOVE the arm's wired binds: materialization's lower_bind stops at
+  // the arm exit, and inline_exit then wraps the exit-arg binds inside it.
+  // ocamlc's leaf emission instead interleaves the temp at its reversed field
+  // position -- directly above the first bind reading it (an irrefutable level
+  // binds right-to-left with a sub-scrutinee temp just before its own
+  // sub-fields).  Sink such a temp past following alias binds that don't read
+  // it, landing above the first one that does.  A temp whose readers are only
+  // in the deeper body stays put: the binds below it then belong to OTHER
+  // fields of the same upstream level and the temp's slot among them is not
+  // recoverable here.
+  void sink_facc_temp_lets(LamPtr& l) {
+    if (!l) return;
+    sink_facc_temp_lets(l->fn);
+    sink_facc_temp_lets(l->body);
+    sink_facc_temp_lets(l->cond);
+    sink_facc_temp_lets(l->then_);
+    sink_facc_temp_lets(l->else_);
+    sink_facc_temp_lets(l->sw_default);
+    for (auto& a : l->args) sink_facc_temp_lets(a);
+    for (auto& b : l->bindings) sink_facc_temp_lets(b.val);
+    for (auto& sc : l->sw_consts) sink_facc_temp_lets(sc.body);
+    for (auto& sc : l->sw_blocks) sink_facc_temp_lets(sc.body);
+    if (l->k != Lam::K::Let || l->bindings.size() != 1) return;
+    auto& b = l->bindings[0];
+    if (!b.id.temp || !b.alias || !b.val || !is_alias_dup(b.val)) return;
+    Lam* p = l->body.get();
+    int depth = 0, target = -1;
+    while (p && p->k == Lam::K::Let && p->bindings.size() == 1 &&
+           p->bindings[0].alias && p->bindings[0].val &&
+           is_alias_dup(p->bindings[0].val)) {
+      if (count_var(p->bindings[0].val, b.id) > 0) { target = depth; break; }
+      ++depth;
+      p = p->body.get();
+    }
+    if (target <= 0) return;  // none below, or already directly above its reader
+    LamPtr a = l;
+    l = a->body;
+    LamPtr* slot = &l;
+    for (int i = 0; i < target; ++i) slot = &(*slot)->body;
+    a->body = *slot;
+    *slot = a;
+  }
   // Collapse an exhaustive switch (no failaction) over a plain variable whose
   // arms are ALL structurally identical: the tag is then irrelevant, so replace
   // the switch with the single arm body.  ocamlc does this in Matching --
@@ -25083,6 +25126,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.simplify_static_catches(root);
   t.beta_reduce_applied(root);
   t.inline_var_aliases(root);
+  t.sink_facc_temp_lets(root);
   t.collapse_equal_switches(root);
   t.two_const_switch_to_if(root);
   lap("simplify");
