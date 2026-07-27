@@ -8688,6 +8688,12 @@ struct Translator {
     // grouping a genuine sibling with a spread copy of a top-chunk row made a
     // deep-match handler re-test what every arrival had decided).
     bool spread = false;
+    // This row came from a ROW-LEVEL or-alternation (`(P1,P2)|(P3,P4) ->`,
+    // split by gmatch_tuple_top into one column-vector per alternative).
+    // Upstream's precompile_or consumes that or with an EMPTY remaining
+    // pattern list, so its handler catch ends up OUTSIDE the shared-default
+    // catch (parmatch's compat) -- unlike a col-0 or inside a wider row.
+    bool row_or = false;
   };
   // Guard mm_cols' preconditions: it assumes every column is a var/any, or a
   // constructor of a 1-const/1-block or all-constant type whose argument (if any)
@@ -11576,6 +11582,57 @@ struct Translator {
             exhaustive_irref_col(r.cols[0], /*need_cover=*/true))
           r.cols[0] = &gm_any_pat;
     }
+    // A BINDING or-row whose remaining columns still discriminate exits each
+    // alternative to a fresh handler that matches the rest ONCE: matching.ml's
+    // precompile_or turns `(s|s') p2..pn -> act` into `s _.._ -> exit K vars |
+    // s' _.._ -> exit K vars` with `with (K vars) (match arg2..argn with
+    // p2..pn -> act)`.  The plain expansion below would instead duplicate the
+    // suffix tests per alternative (typedecl_immediacy's `Cstr_tuple [arg] |
+    // Cstr_record [{ld_type=arg}]` re-testing the singleton-list and
+    // Variant_unboxed columns in both arms).  Restricted to a single-row
+    // matrix so none of precompile_or's disjointness bookkeeping with later
+    // rows (Or_matrix) is in play; the handler keeps this level's default env
+    // (pop_compat only trims matrices incompatible with the or, and with one
+    // row there is no split to trim against).
+    if (rows.size() == 1 && comps.size() >= 2 && rows[0].aid >= 0 &&
+        rows[0].vnames && !rows[0].guard &&
+        std::get_if<Ppat_or>(&rows[0].cols[0]->desc)) {
+      MRow& r = rows[0];
+      bool rest_disc = false;
+      for (size_t j = 1; j < r.cols.size(); ++j)
+        if (!gmdef_omega(gmdef_peel(r.cols[j]))) { rest_disc = true; break; }
+      std::vector<std::string> orvars;
+      collect_gvars(r.cols[0], orvars);
+      std::vector<const Pattern*> alts;
+      flatten_or(r.cols[0], alts);
+      if (rest_disc && !orvars.empty() && alts.size() > 1) {
+        static const Pattern gm_omega_pat =
+            [] { Pattern p; p.desc = Ppat_any{}; return p; }();
+        int orn = ++next_exit_;
+        std::vector<MRow> ex;
+        for (auto* a : alts) {
+          MRow nr = r; nr.cols[0] = effective_pat(a);
+          for (size_t j = 1; j < nr.cols.size(); ++j) nr.cols[j] = &gm_omega_pat;
+          nr.aid = orn; nr.vnames = &orvars;
+          ex.push_back(std::move(nr));
+        }
+        LamPtr sub = gmatch(comps, std::move(ex), mloc, deid, denv);
+        if (!sub) return nullptr;
+        std::vector<LamPtr> rcomps(comps.begin() + 1, comps.end());
+        MRow hr = r; hr.cols.erase(hr.cols.begin());
+        auto c = mk(Lam::K::Catch); c->prim_arg = orn; c->cond = sub;
+        for (auto& nm : orvars) {
+          Ident id = fresh(nm, false);
+          hr.binds.push_back({nm, id});
+          c->catch_vars.push_back(id);
+          c->catch_var_kinds.push_back(ValueKind::Gen);
+        }
+        LamPtr hb = gmatch(std::move(rcomps), {hr}, mloc, deid, std::move(denv));
+        if (!hb) return nullptr;
+        c->then_ = hb;
+        return c;
+      }
+    }
     // Expand an or-pattern in column 0 into separate rows (order preserved).
     // A binding or-row also gets a PENDING handler catch wrapped around this
     // level's result: matching.ml's precompile_or scopes the or-handler at the
@@ -11587,19 +11644,20 @@ struct Translator {
     for (auto& r : rows)
       if (std::get_if<Ppat_or>(&r.cols[0]->desc)) {
         std::vector<MRow> ex;
-        std::vector<int> wrapped;
+        std::vector<std::pair<int, bool>> wrapped;   // (aid, gm_orp_rest)
         for (auto& rr : rows) {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
           if (alts.size() > 1 && rr.aid >= 0 && rr.vnames &&
               gm_orw_.insert(rr.aid).second)
-            wrapped.push_back(rr.aid);
+            wrapped.push_back({rr.aid, comps.size() >= 2 && !rr.row_or &&
+                               pattern_binds(rr.cols[0])});
           for (auto* a : alts) { MRow nr = rr; nr.cols[0] = effective_pat(a); ex.push_back(std::move(nr)); }
         }
         std::string c0key = wrapped.empty()
             ? std::string() : cppcaml::lambda::make_lam_key(comps[0]);
         LamPtr sub = gmatch(std::move(comps), std::move(ex), mloc, deid, std::move(denv));
         if (!sub) return nullptr;
-        for (int aid : wrapped) {
+        for (auto [aid, orest] : wrapped) {
           // Upstream binds the or-column's OWN scrutinee before splitting, so
           // the catch sits inside that one materialized binding (typedecl's
           // `*match* = field_imm 2 val`) but outside everything else -- a
@@ -11613,7 +11671,7 @@ struct Translator {
               cppcaml::lambda::make_lam_key(l->bindings[0].val) == c0key)
             slot = &l->body;
           auto c = mk(Lam::K::Catch); c->prim_arg = aid; c->cond = *slot;
-          c->gm_orp = true;
+          c->gm_orp = true; c->gm_orp_rest = orest;
           *slot = c;
         }
         return sub;
@@ -12821,10 +12879,22 @@ struct Translator {
           if (count_exit((*pend)->cond, a.aid, false, b2) != uses) keep = false;
         }
         if (keep) {
+          // Splice when the pending catch sits in the wire-time root chain
+          // (root placement is already upstream's) -- EXCEPT a BINDING multi-col
+          // or-handler under the shared-default catch: with columns left of
+          // the or-row, upstream keeps the trailing catch-all in do_split's
+          // `no` cluster, so its idef catch wraps OUTSIDE the or-handler
+          // (typedecl_immediacy's `with (5 arg) .. with (4) 0`); re-wrapping
+          // at root would invert that nesting.  A single-column or-row
+          // instead absorbs the catch-all into the or-matrix and its
+          // or-catch IS outermost (printpat's pretty_arg, cmt2annot's
+          // Tpat_var|Tpat_alias) -- keep splicing those.
           for (LamPtr* p = &body;;) {
             if (p == pend) { keep = false; break; }
             Lam* l = p->get();
-            if (l && l->k == Lam::K::Catch) p = &l->cond; else break;
+            if (!l || l->k != Lam::K::Catch) break;
+            if (l->gm_deidc && (*pend)->gm_orp_rest) break;
+            p = &l->cond;
           }
         }
         if (!keep) { LamPtr t = (*pend)->cond; *pend = t; pend = nullptr; }
@@ -13097,6 +13167,7 @@ struct Translator {
     LamPtr dcatch;
     if (uses > 0 && !(uses == 1 && bad == 0)) {
       dcatch = mk(Lam::K::Catch); dcatch->cond = body; dcatch->prim_arg = deid;
+      dcatch->gm_deidc = true;
       body = dcatch;
     }
     wire_garms(body, arms);
@@ -14969,6 +15040,7 @@ struct Translator {
       for (auto& cols : srcs[i].second) {
         MRow mr; mr.rhs = srcs[i].first->rhs; mr.cols = cols;
         mr.aid = arms[i].aid; mr.vnames = &arms[i].vnames;
+        mr.row_or = srcs[i].second.size() > 1;
         mrows.push_back(std::move(mr));
       }
     int deid = ++next_exit_;
@@ -14991,6 +15063,7 @@ struct Translator {
     LamPtr dcatch;
     if (uses > 0 && !(uses == 1 && bad == 0)) {
       dcatch = mk(Lam::K::Catch); dcatch->cond = body; dcatch->prim_arg = deid;
+      dcatch->gm_deidc = true;
       body = dcatch;
     }
     wire_garms(body, arms);

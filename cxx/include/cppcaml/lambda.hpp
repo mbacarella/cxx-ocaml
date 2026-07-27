@@ -207,6 +207,26 @@ struct Lam {
   // out single-use/unreachable (or the node sits at the body root, where the
   // wire-time root placement is already upstream's), the node is spliced out.
   bool gm_orp = false;
+  // gm_orp_rest: the pending catch is for a BINDING col-0 or-row that still
+  // had remaining columns when consumed (and is not a row-level alternation).
+  // Upstream then keeps the trailing catch-all in do_split's `no` cluster, so
+  // the idef catch wraps OUTSIDE the or-handler (`catch (catch sw with (5
+  // arg) act) with (4) 0`, typedecl_immediacy).  A single-column or-row
+  // (printpat's pretty_arg, cmt2annot's Tpat_var|Tpat_alias) and a row-level
+  // `(P1,P2)|(P3,P4)` alternation (parmatch's compat: upstream's rest is
+  // empty) instead absorb the catch-all into the or-matrix, ending with the
+  // or-catch OUTERMOST; a var-free multi-column or can go either way
+  // (parmatch's le_pat vs a plain 2-col probe), so only the binding case --
+  // where every observed placement is inner -- sets this.  wire_garms uses it
+  // to decide whether the pending catch may stay under the shared-default
+  // catch.
+  bool gm_orp_rest = false;
+  // gm_deidc: the top-level shared-default catch (gmatch_top's deid).  Upstream
+  // creates this catch at do_split's cons_next, OUTSIDE the whole or-pm compile
+  // for a binding multi-column or-row -- a pending or-handler catch
+  // (gm_orp_rest) found directly under it is at upstream's placement already
+  // and must NOT be spliced out to re-wrap above it.
+  bool gm_deidc = false;
   // from_alias: this node was substituted in place of a single-use pattern
   // binder (wrap_binders' inline of an alias let).  At the corresponding point
   // in ocamlc's pipeline (Matching/for_let, BEFORE Simplif) this position held
