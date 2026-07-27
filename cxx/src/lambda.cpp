@@ -22534,6 +22534,59 @@ struct Translator {
     } catch (...) {}
     return false;
   }
+  // As load_functor_param_sig, but the functor is named by a DEEP dotted path
+  // (`Ephemeron.K1.Make`): navigate the head unit's cmi through submodules, then
+  // resolve the parameter modtype -- possibly QUALIFIED into another cmi
+  // (`Stdlib__Hashtbl.HashedType`).  Without it a struct-literal argument passes
+  // in DECLARATION order, and a decl order differing from the signature order
+  // swaps the argument block's fields (typing_recovery_state's K1.Make argument
+  // declares hash before equal; HashedType is {equal; hash}).
+  bool load_functor_param_sig_dotted(const std::string& dotted, cmi::Signature& out) {
+    size_t lastd = dotted.rfind('.');
+    if (lastd == std::string::npos) return false;
+    std::string container = dotted.substr(0, lastd), name = dotted.substr(lastd + 1);
+    size_t headd = container.find('.');
+    std::string head = headd == std::string::npos ? container : container.substr(0, headd);
+    if (module_base(head) || fields_of(head).empty()) return false;
+    try {
+      const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = headd; pos != std::string::npos;) {
+        size_t nd = container.find('.', pos + 1);
+        std::string comp = container.substr(
+            pos + 1, nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return false;
+        sig = next; pos = nd;
+      }
+      for (auto& md : sig->modules) {
+        if (md.name != name || !md.type ||
+            md.type->kind != cmi::ModuleType::Functor || !md.type->functor_param_type)
+          continue;
+        if (const cmi::Signature* ps = mt_sig(cmi, md.type->functor_param_type)) {
+          out = *ps; return true;
+        }
+        const cmi::ModuleTypePtr& mt = md.type->functor_param_type;
+        if (mt->kind == cmi::ModuleType::Ident && mt->path &&
+            mt->path->kind == cmi::Path::Pdot && mt->path->a) {
+          std::string mod = mt->path->a->kind == cmi::Path::Pident
+                                ? mt->path->a->id.name : mt->path->a->s;
+          if (mod.rfind("Stdlib__", 0) == 0) mod = mod.substr(8);
+          if (module_base(mod)) return false;
+          const auto& sub = cmi::CmiFile::load(resolve_cmi(mod));
+          for (auto& mtd : sub.sig().modtypes)
+            if (mtd.name == mt->path->s)
+              if (const cmi::Signature* ps2 = mt_sig(sub, mtd.type)) {
+                out = *ps2; return true;
+              }
+        }
+        return false;
+      }
+    } catch (...) {}
+    return false;
+  }
   // Coerce a struct-literal argument of a CROSS-MODULE functor to its cmi
   // parameter signature, reordering the top level AND recursing into nested
   // submodules (Arg_helper.Make's argument `module Key = struct include
@@ -22775,14 +22828,22 @@ struct Translator {
     if (!param_mt)
       if (auto* aps = std::get_if<Pmod_structure>(&pa.arg->desc))
         if (auto* pi = std::get_if<Pmod_ident>(&pa.f->desc))
-          if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
+          if (auto* d = std::get_if<Ldot>(&pi->id.txt.v)) {
             if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
               cmi::Signature psig;
               if (load_functor_param_sig(pl->name, d->name, psig))
                 if (LamPtr c = coerce_struct_arg_cmi(*aps, psig)) {
                   auto a = mk(Lam::K::Apply); a->fn = fval; a->args = {c}; return a;
                 }
+            } else {  // deep path (Ephemeron.K1.Make): same coercion via cmi walk
+              std::string dotted; cmi::Signature psig;
+              if (lid_to_dotted(pi->id.txt, dotted) &&
+                  load_functor_param_sig_dotted(dotted, psig))
+                if (LamPtr c = coerce_struct_arg_cmi(*aps, psig)) {
+                  auto a = mk(Lam::K::Apply); a->fn = fval; a->args = {c}; return a;
+                }
             }
+          }
     LamPtr aval = compile_module_expr(*pa.arg);
     LamPtr acoerced = aval;
     auto alay = arg_layout(*pa.arg);
