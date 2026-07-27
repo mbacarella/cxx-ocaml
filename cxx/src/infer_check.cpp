@@ -4111,6 +4111,32 @@ struct Checker {
     return it == ctors.end() ? nullptr : &it->second;
   }
 
+  // Scheme of a ctor QUALIFIED by a FILE-LOCAL module (`Datatype_kind.Record`):
+  // resolve through the module's own registered per-type schemes
+  // (type_ctor_schemes_ keys are "<ModPath>.<type>").  The bare last-in-scope
+  // hit can be an UNRELATED type's same-named ctor (typecore's
+  // wrong_kind_sort.Record, tag 1, squats "Record" over Datatype_kind's tag 0),
+  // and qualified_ctor_scheme only knows cmi-loadable modules.  Null when the
+  // qualifier isn't a local module or the ctor isn't declared there.
+  TypePtr* local_module_ctor_scheme(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return nullptr;
+    auto comps = mod_components(*d->prefix);
+    if (comps.empty()) return nullptr;
+    if (auto f = local_module_paths_.find(comps[0]);
+        f != local_module_paths_.end() && !f->second.empty())
+      comps[0] = f->second;  // `module DK = Datatype_kind` alias head
+    std::string pref;
+    for (auto& c : comps) { pref += c; pref += '.'; }
+    for (auto& [key, lst] : type_ctor_schemes_) {
+      if (key.compare(0, pref.size(), pref) != 0) continue;
+      if (key.find('.', pref.size()) != std::string::npos) continue;  // deeper module
+      for (auto& [cn2, sc] : lst)
+        if (cn2 == d->name) return &sc;
+    }
+    return nullptr;
+  }
+
   // A constructor's argument that is ITSELF a construct/pattern whose name is
   // shared across types (`ambiguous_ctors_`): record the enclosing ctor's
   // DECLARED argument type (`dom`) at the inner node, so the back end
@@ -5588,12 +5614,222 @@ struct Checker {
   // miscompile the effid/DDC gates don't catch -- only a construct+match exec).
   void disambig_pat_by_scrut(const Pattern& lhs, const TypePtr& scrut) {
     if (!record_kinds_) return;
+    // DEFERRED to resolve_pending_disambig (after the inference fixpoint): the
+    // column type is often pinned only by a LATER use -- includemod's `match
+    // (arg:Error.functor_arg_descr), param with ..` types `param` (unannotated)
+    // only when an arm body reaches `Incompatible_params(arg,param)`, so an
+    // inline walk here sees a free var where the disambiguating variant is.
+    pending_pat_disambig_.emplace_back(&lhs, scrut);
+  }
+  std::vector<std::pair<const Pattern*, TypePtr>> pending_pat_disambig_;
+  std::vector<std::pair<const Expression*, TypePtr>> pending_expr_disambig_;
+  // Functor-argument structs whose bindings were already inferred (the kinds
+  // pass descends them for their records; module_exports can re-visit a node).
+  std::unordered_set<const void*> inferred_arg_structs_;
+  // Does the (possibly qualified) type at `path` DECLARE constructor `cn`?
+  // Local per-type tables first (mod_prefix-qualified and bare), then the
+  // owning unit's cmi (same submodule walk as cmi_type_is_immediate).  An
+  // ALIAS/abstract/unknown type answers false -- the disambiguation walks use
+  // this to reject abbreviation paths (Misc.Stdlib.Result.t == result) whose
+  // last component would otherwise read as a bogus type mismatch.
+  std::unordered_map<std::string, std::set<std::string>> cmi_ctors_memo_;
+  bool scrut_owns_ctor(const std::string& path, const std::string& cn) {
+    if (auto ts = type_ctor_schemes_.find(path); ts != type_ctor_schemes_.end()) {
+      for (auto& [n, s] : ts->second)
+        if (n == cn) return true;
+      return false;
+    }
+    if (path.find('.') == std::string::npos) {
+      auto tc = type_ctors.find(path);
+      if (tc == type_ctors.end()) return false;
+      for (auto& n : tc->second)
+        if (n == cn) return true;
+      return false;
+    }
+    auto it = cmi_ctors_memo_.find(path);
+    if (it == cmi_ctors_memo_.end()) {
+      std::set<std::string> cs;
+      std::vector<std::string> comps = mod_components_str(path);
+      if (comps.size() >= 2) try {
+        std::deque<const cmi::CmiFile*> loaded;
+        loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+        const cmi::Signature* sig = &loaded.back()->sig();
+        for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+          std::string name = comps[i];
+          int applications = 0;
+          if (auto par = name.find('('); par != std::string::npos) {
+            for (char c : name) applications += c == '(';
+            name = name.substr(0, par);
+          }
+          const cmi::ModuleDecl* md = nullptr;
+          for (auto& mm : sig->modules) if (mm.name == name) { md = &mm; break; }
+          if (!md) { sig = nullptr; break; }
+          cmi::ModuleTypePtr mt = md->type;
+          for (int a = 0; a < applications && mt; ++a)
+            mt = mt->kind == cmi::ModuleType::Functor ? mt->functor_body : nullptr;
+          sig = module_sig(mt, loaded);
+        }
+        if (sig)
+          for (auto& td : sig->types)
+            if (td.name == comps.back()) {
+              if (td.kind == cmi::TypeDecl::Variant)
+                for (auto& c : td.ctors) cs.insert(c.name);
+              break;
+            }
+      } catch (...) {}
+      it = cmi_ctors_memo_.emplace(path, std::move(cs)).first;
+    }
+    return it->second.count(cn) > 0;
+  }
+  void resolve_pending_disambig() {
+    for (auto& [p, t] : pending_pat_disambig_) disambig_pat_now(*p, t);
+    for (auto& [e, t] : pending_expr_disambig_)
+      disambig_expr_now(*e, t, /*allow_defer=*/false, /*deferred=*/true);
+  }
+  // Type-directed bare-constructor resolution in EXPRESSION position: an
+  // unqualified constructor we couldn't resolve (typed Any) whose EXPECTED type
+  // is a module-qualified variant is recorded so infer_value_kinds exposes it
+  // via expr_constr (predef's `decl0 ~immediate:Always`).  With allow_defer, an
+  // expected type still a VAR is queued and re-checked after the fixpoint (the
+  // expectation is often pinned only by a later constraint).
+  void disambig_expr_now(const Expression& e, const TypePtr& expected,
+                         bool allow_defer, bool deferred = false) {
+    auto* k = std::get_if<Pexp_construct>(&e.desc);
+    if (!k) return;
+    std::string cn = lid_last(k->id.txt);
+    TypePtr er = I::Engine::repr(expected);
+    if (allow_defer && er->kind == I::Type::Kind::Var &&
+        std::holds_alternative<Lident>(k->id.txt.v)) {
+      pending_expr_disambig_.emplace_back(&e, expected);
+      return;
+    }
+    bool er_variant = er->kind == I::Type::Kind::Constr &&
+                      er->path.find('.') != std::string::npos &&
+                      // A DEFERRED expectation (a var when seen inline, pinned
+                      // only at the fixpoint) is a NEW path: require the
+                      // expected type to provably declare the ctor, rejecting
+                      // abbreviation paths whose last component would read as
+                      // a bogus mismatch.  The inline dotted path keeps its
+                      // established behavior.
+                      (!deferred || scrut_owns_ctor(er->path, cn));
+    // A DOTLESS expected type disambiguates a ctor name the file declares
+    // AMBIGUOUSLY (two local types sharing it -- u.ml's `test Unit Unit`
+    // where arg1 : descr, arg2 : parameter): the lexical last-in-scope
+    // resolution picks the wrong tag there.  exn/predef names keep their
+    // own machinery (pattern-side twin: disambig_pat_by_scrut).
+    bool er_local_amb = er->kind == I::Type::Kind::Constr &&
+                        !er->path.empty() &&
+                        er->path.find('.') == std::string::npos &&
+                        std::holds_alternative<Lident>(k->id.txt.v) &&
+                        ambiguous_ctors_.count(cn) &&
+                        !exn_ctors_.count(cn) && !predef_ctors_.count(cn) &&
+                        scrut_owns_ctor(er->path, cn);
+    TypePtr* sch = find_ctor(cn);
+    if ((er_variant || er_local_amb) && !sch) {
+      rec_expr_[&e] = expected;
+      if (er_local_amb) ctor_arg_type_[&e] = er;
+    } else if ((er_variant || er_local_amb) && sch &&
+               std::holds_alternative<Lident>(k->id.txt.v)) {
+      // Type-directed disambiguation of a SHADOWED constructor: a bare ctor
+      // resolves by its EXPECTED type, not by lexical scope.  find_ctor
+      // returns the LAST-in-scope scheme, so when that scheme's owning type
+      // differs from the expected variant, record the expected type instead
+      // -- the back end then reads the right tag/constant-ness.  cmt_format's
+      // `f ~namespace:Type` (expected Shape.Sig_component_kind.t) otherwise
+      // resolved to the shadowing `open Typedtree` item_declaration.Type, a
+      // tag-3 BLOCK, where the constant tag-1 was meant (a mis-tagged atom,
+      // not an immediate).  Cross-unit shadows aren't in ambiguous_ctors_,
+      // so key on the type mismatch directly; a genuinely-correct resolution
+      // has found == expected (same last component) and is left untouched.
+      TypePtr res;
+      ctor_params(eng.instantiate(*sch), res);
+      TypePtr rr = I::Engine::repr(res);
+      auto lastc = [](const std::string& s) {
+        auto d = s.rfind('.');
+        return d == std::string::npos ? s : s.substr(d + 1);
+      };
+      // Same LAST component does not mean same type across modules
+      // (Parsetree and Typedtree both declare `functor_parameter`;
+      // untypeast's `Named (name, mt)` found Typedtree's arity-3 ctor
+      // where the annotated Parsetree arity-2 one was meant, boxing the
+      // written pair into one field).  When BOTH paths are dotted,
+      // compare them fully, resolving each head through file-local
+      // module aliases so `T.x` vs `Typedtree.x` stays a match.
+      auto alias_norm = [&](const std::string& s) {
+        auto d = s.find('.');
+        if (d == std::string::npos) return s;
+        auto f = local_module_paths_.find(s.substr(0, d));
+        if (f != local_module_paths_.end() && !f->second.empty())
+          return f->second + s.substr(d);
+        return s;
+      };
+      std::string found = rr->kind == I::Type::Kind::Constr ? rr->path : "";
+      bool diff;
+      if (!found.empty() && found.find('.') != std::string::npos)
+        diff = alias_norm(found) != alias_norm(er->path);
+      else
+        diff = !found.empty() && lastc(found) != lastc(er->path);
+      if (getenv("CTDBG"))
+        fprintf(stderr, "[CTDBG-I] shadow-gate ctor %s found=%s expected=%s diff=%d\n",
+                cn.c_str(), found.c_str(), er->path.c_str(), (int)diff);
+      if (diff) {
+        rec_expr_[&e] = expected;
+        // Authoritative even DOTLESS for a locally-ambiguous name: route
+        // through the ctor-arg map so vk.expr_constr records it (the
+        // general rec_expr_ harvest gates dotless paths on stamp
+        // identity, which an annotation-built Constr may not carry).
+        if (er_local_amb) ctor_arg_type_[&e] = er;
+      }
+    }
+  }
+  void disambig_pat_now(const Pattern& lhs, const TypePtr& scrut, int depth = 0) {
+    // Recurse through the shapes whose sub-patterns keep a known COLUMN type
+    // (tuple columns, or-alternatives, aliases), so a NESTED ambiguous ctor is
+    // re-resolved by its column too -- u.ml's `match arg, param with
+    // (Unit|Empty_struct), Unit -> ..` has both same-named `Unit`s under a
+    // tuple; ctor ARGS are covered separately by record_pat_ctor_arg_type.
+    if (auto* al = std::get_if<ast::Ppat_alias>(&lhs.desc))
+      return disambig_pat_now(*al->p, scrut, depth + 1);
+    if (auto* ct = std::get_if<ast::Ppat_constraint>(&lhs.desc))
+      return disambig_pat_now(*ct->p, scrut, depth + 1);
+    if (auto* op = std::get_if<ast::Ppat_open>(&lhs.desc))
+      return disambig_pat_now(*op->p, scrut, depth + 1);
+    if (auto* o = std::get_if<ast::Ppat_or>(&lhs.desc)) {
+      disambig_pat_now(*o->l, scrut, depth + 1);
+      disambig_pat_now(*o->r, scrut, depth + 1);
+      return;
+    }
+    if (auto* tu = std::get_if<ast::Ppat_tuple>(&lhs.desc)) {
+      TypePtr sr = I::Engine::repr(scrut);
+      if (sr->kind == I::Type::Kind::Tuple &&
+          sr->args.size() == tu->elems.size())
+        for (size_t i = 0; i < tu->elems.size(); ++i)
+          disambig_pat_now(*tu->elems[i], sr->args[i], depth + 1);
+      return;
+    }
     auto* k = std::get_if<ast::Ppat_construct>(&lhs.desc);
     if (!k || !std::holds_alternative<Lident>(k->id.txt.v)) return;
     TypePtr sr = I::Engine::repr(scrut);
-    if (sr->kind != I::Type::Kind::Constr ||
-        sr->path.find('.') == std::string::npos)
+    if (sr->kind != I::Type::Kind::Constr || sr->path.empty()) return;
+    std::string cn = lid_last(k->id.txt);
+    bool dotted = sr->path.find('.') != std::string::npos;
+    // A ctor name the file declares AMBIGUOUSLY (two local types sharing it):
+    // the scrutinee type is authoritative, even DOTLESS.  exn/predef names
+    // keep their own machinery.
+    bool local_amb = ambiguous_ctors_.count(cn) && !exn_ctors_.count(cn) &&
+                     !predef_ctors_.count(cn) &&
+                     scrut_owns_ctor(sr->path, cn);
+    // A NESTED leaf (this walk is new there; the top-level dotted case keeps
+    // its established behavior) acts only when the scrutinee type PROVABLY
+    // declares the ctor: the last-component comparison below cannot see
+    // through abbreviations, so a column typed by an ALIAS path
+    // (Misc.Stdlib.Result.t == result) would false-positive on every
+    // `Ok x | Error x` and knock the builtin-result dispatch off course.
+    if (depth > 0) {
+      if (!local_amb && !(dotted && scrut_owns_ctor(sr->path, cn))) return;
+    } else if (!dotted && !local_amb) {
       return;
+    }
     auto rp = rec_pat_.find(&lhs);
     if (rp == rec_pat_.end()) return;
     TypePtr pr = I::Engine::repr(rp->second);
@@ -5602,8 +5838,15 @@ struct Checker {
       auto d = s.rfind('.');
       return d == std::string::npos ? s : s.substr(d + 1);
     };
-    if (!found.empty() && lastc(found) != lastc(sr->path))
+    if (getenv("CTDBG"))
+      fprintf(stderr, "[CTDBG-P] pat-disambig %s found=%s scrut=%s amb=%d d=%d\n",
+              cn.c_str(), found.c_str(), sr->path.c_str(), (int)local_amb, depth);
+    if (!found.empty() && lastc(found) != lastc(sr->path)) {
       rec_pat_[&lhs] = scrut;
+      // Route through the ctor-arg map so vk.pat_constr records it even
+      // DOTLESS (the general rec_pat_ harvest only records qualified paths).
+      if (local_amb) pat_ctor_arg_type_[&lhs] = sr;
+    }
   }
 
   // A `#t` pattern's row: t must be an abbreviation of a poly-variant row
@@ -6352,62 +6595,7 @@ struct Checker {
     // variant -- record that type at the node so infer_value_kinds exposes it via
     // expr_constr and the back end registers the type's ctors, resolving the bare
     // ctor (predef's `decl0 ~immediate:Always`, with immediate : Type_immediacy.t).
-    if (record_kinds_)
-      if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
-        std::string cn = lid_last(k->id.txt);
-        TypePtr er = I::Engine::repr(expected);
-        bool er_variant = er->kind == I::Type::Kind::Constr &&
-                          er->path.find('.') != std::string::npos;
-        TypePtr* sch = find_ctor(cn);
-        if (er_variant && !sch) {
-          rec_expr_[&e] = expected;
-        } else if (er_variant && sch &&
-                   std::holds_alternative<Lident>(k->id.txt.v)) {
-            // Type-directed disambiguation of a SHADOWED constructor: a bare ctor
-            // resolves by its EXPECTED type, not by lexical scope.  find_ctor
-            // returns the LAST-in-scope scheme, so when that scheme's owning type
-            // differs from the expected variant, record the expected type instead
-            // -- the back end then reads the right tag/constant-ness.  cmt_format's
-            // `f ~namespace:Type` (expected Shape.Sig_component_kind.t) otherwise
-            // resolved to the shadowing `open Typedtree` item_declaration.Type, a
-            // tag-3 BLOCK, where the constant tag-1 was meant (a mis-tagged atom,
-            // not an immediate).  Cross-unit shadows aren't in ambiguous_ctors_,
-            // so key on the type mismatch directly; a genuinely-correct resolution
-            // has found == expected (same last component) and is left untouched.
-            TypePtr res;
-            ctor_params(eng.instantiate(*sch), res);
-            TypePtr rr = I::Engine::repr(res);
-            auto lastc = [](const std::string& s) {
-              auto d = s.rfind('.');
-              return d == std::string::npos ? s : s.substr(d + 1);
-            };
-            // Same LAST component does not mean same type across modules
-            // (Parsetree and Typedtree both declare `functor_parameter`;
-            // untypeast's `Named (name, mt)` found Typedtree's arity-3 ctor
-            // where the annotated Parsetree arity-2 one was meant, boxing the
-            // written pair into one field).  When BOTH paths are dotted,
-            // compare them fully, resolving each head through file-local
-            // module aliases so `T.x` vs `Typedtree.x` stays a match.
-            auto alias_norm = [&](const std::string& s) {
-              auto d = s.find('.');
-              if (d == std::string::npos) return s;
-              auto f = local_module_paths_.find(s.substr(0, d));
-              if (f != local_module_paths_.end() && !f->second.empty())
-                return f->second + s.substr(d);
-              return s;
-            };
-            std::string found = rr->kind == I::Type::Kind::Constr ? rr->path : "";
-            bool diff;
-            if (!found.empty() && found.find('.') != std::string::npos)
-              diff = alias_norm(found) != alias_norm(er->path);
-            else
-              diff = !found.empty() && lastc(found) != lastc(er->path);
-            if (getenv("CTDBG"))
-              fprintf(stderr, "[CTDBG-I] shadow-gate ctor %s found=%s expected=%s diff=%d\n",
-                      cn.c_str(), found.c_str(), er->path.c_str(), (int)diff);
-            if (diff) rec_expr_[&e] = expected;
-          }
-      }
+    if (record_kinds_) disambig_expr_now(e, expected, /*allow_defer=*/true);
     // Optional-argument erasure (ocaml's type_argument): a value of type
     // `?l:.. -> ..` used where a non-optional arrow is expected is eta-expanded
     // with None for the omitted optional(s).  Recorded for the Lambda back end;
@@ -6542,13 +6730,20 @@ struct Checker {
         }
       }
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
+      // A ctor qualified by a FILE-LOCAL module outranks the bare hit (which
+      // can be an unrelated same-named ctor squatting the scope) -- the cmi
+      // arbitration below cannot see local modules.
+      TypePtr* lsch = std::holds_alternative<Ldot>(k->id.txt.v)
+                          ? local_module_ctor_scheme(k->id.txt)
+                          : nullptr;
+      if (lsch) sch = lsch;
       // A QUALIFIED `M.C` (`Result.Ok`) keeps M's own type path (`Result.t`),
       // not the re-exported base (`result`) its bare name resolves to -- ocamlc
       // follows the access path.  When M's cmi yields the ctor, prefer that
       // scheme by falling through to the qualified branch below.  All passes:
       // the bare-name hit can be an UNRELATED type's ctor (Dynlink.Error vs
       // result's Error), which false-rejects in strict.
-      if (sch && std::holds_alternative<Ldot>(k->id.txt.v) &&
+      if (sch && !lsch && std::holds_alternative<Ldot>(k->id.txt.v) &&
           qualified_ctor_scheme(k->id.txt))
         sch = nullptr;
       if (!sch) {
@@ -8978,6 +9173,36 @@ struct Checker {
       return {};
     }
     if (std::get_if<Pmod_apply>(&me.desc) || std::get_if<Pmod_apply_unit>(&me.desc)) {
+      // KINDS pass: infer the value bindings of a literal STRUCT argument.
+      // The functor-result harvest below never descends the argument, so a
+      // `let module Compute = Diff.Right_variadic(struct .. let test .. end)`
+      // body got NO inference records at all -- its matches then compiled
+      // against the wrong ctor universe (includemod's functor-diff `test`
+      // resolved the param column's bare `Unit`/`Named` as functor_arg_descr,
+      // raising Match_failure on any Unit parameter).  Side-effect only (the
+      // recorded kinds/disambiguations); the returned exports are unchanged.
+      if (record_kinds_) {
+        const ModuleExpr* h2 = &me;
+        while (true) {
+          const ModuleExpr* arg = nullptr;
+          if (auto* a = std::get_if<Pmod_apply>(&h2->desc)) {
+            arg = a->arg.get(); h2 = a->f.get();
+          } else if (auto* au = std::get_if<Pmod_apply_unit>(&h2->desc)) {
+            h2 = au->f.get();
+          } else break;
+          const ast::Pmod_structure* as2 =
+              arg ? std::get_if<Pmod_structure>(&arg->desc) : nullptr;
+          if (as2 && inferred_arg_structs_.insert(arg).second) {
+            venv.emplace_back();
+            tenv.emplace_back();
+            cenv.emplace_back();
+            process_items(as2->items);
+            cenv.pop_back();
+            tenv.pop_back();
+            venv.pop_back();
+          }
+        }
+      }
       // possibly-curried functor application F(A)(B)...: count the applications
       // and find the head functor ident.
       int napp = 0;
@@ -9826,6 +10051,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   ck.collect_type_kinds(s);  // file-wide concrete/abstract type-decl kinds (array_kind_str)
   run_checker(ck, s);
   ck.resolve_pending_fields();  // re-resolve ambiguous field reads with final types
+  ck.resolve_pending_disambig();  // ctor disambiguation with post-fixpoint types
   ValueKinds vk;
   for (auto& [p, t] : ck.rec_pat_) {
     vk.pat[p] = kind_str(t, ck);
