@@ -20254,6 +20254,45 @@ struct Translator {
           scope.back()[pv->name.txt] = id;
         } else {  // `let (a,b) = e` / `let {a;b} = e`: the irrefutable sub-vars read
           LamPtr val = expr(*b.expr);  // fields of e -- directly when e is a var, else
+          // `let (a,b) = (let X = E in (e0, e1))`: ocamlc's Matching floats the
+          // inner let out and explodes the tuple, binding each component directly
+          // -- NO intermediate pair allocated and re-projected.  Peek through any
+          // leading non-recursive lets: if the innermost body is a tuple literal
+          // (makeblock tag 0) matching the pattern's arity, float those lets into
+          // this let-group (their temps are fresh and don't escape, so hoisting
+          // them ahead is evaluation-order preserving) and bind the components.
+          const Pattern* tpat = effective_pat(&b.pat);
+          auto* tup = std::get_if<Ppat_tuple>(&tpat->desc);
+          const Lam* inner = val.get();
+          while (inner->k == Lam::K::Let) inner = inner->body.get();
+          if (tup && !tup->elems.empty() && inner->k == Lam::K::Prim &&
+              inner->prim == Prim::Makeblock && inner->prim_arg == 0 &&
+              inner->args.size() == tup->elems.size()) {
+            while (val->k == Lam::K::Let) {
+              for (auto& fb : val->bindings) l->bindings.push_back(std::move(fb));
+              val = val->body;
+            }
+            // Bind right-to-left, matching ocamlc's reverse tuple-element order.
+            // A component whose value is a plain variable or an immutable field
+            // read is an alias (routed through the binder list so simplif inlines
+            // a single use / keeps a shared one as `=a`); anything else (an
+            // application, another block, ...) stays a kept Strict binding, as
+            // for the direct `let (a,b) = (e0, e1)` tuple-literal path above.
+            for (int i = (int)tup->elems.size() - 1; i >= 0; --i) {
+              const Pattern* ep = effective_pat(tup->elems[i].get());
+              LamPtr av = val->args[i];
+              auto* pv = std::get_if<Ppat_var>(&ep->desc);
+              if (pv && av->k != Lam::K::Var && !is_field_access(av)) {
+                Ident id = fresh(pv->name.txt);
+                l->bindings.push_back({id, pat_kind(ep), av});
+                scope.back()[pv->name.txt] = id;
+              } else {
+                collect_binders(*ep, av, binders);
+              }
+            }
+            record_tuple_sigs(b.pat, *b.expr);
+            continue;
+          }
           if (val->k == Lam::K::Var) {  // via a *match* temp bound to e
             collect_binders(b.pat, val, binders);
           } else {
