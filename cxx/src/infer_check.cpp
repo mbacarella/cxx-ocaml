@@ -511,6 +511,13 @@ struct Checker {
   // locally-abstract types `(type a)`: bound to a fresh (flexible) var so that
   // annotations mentioning `a` unify rather than clashing as an opaque constr.
   std::unordered_map<std::string, TypePtr> newtype_vars;
+  // Depth of enclosing locally-abstract-type scopes (`fun (type a) -> ..`,
+  // `let f : type a. ..`).  Inside one, an unpinned GADT match scrutinee may
+  // secretly BE the abstract type (our kinds pass ties a binding's annotation
+  // to its body only after inferring it, so the scrutinee just looks like a
+  // fresh var) -- rigid in ocamlc, where nothing is refutable -- so
+  // gadt_match_partial must not pin it from the covered arms' indices.
+  int la_scope_ = 0;
   // The binding for one locally-abstract type.  The DISPLAY pass binds a RIGID
   // node (ocamlc's newtype model): a GADT arm's equation `a = int` is then a
   // lenient constr mismatch that never LEAKS into the signature, while the
@@ -543,6 +550,11 @@ struct Checker {
   std::set<std::string> expanding_;  // guard against cyclic abbreviations
   // match-expression node -> is-partial (the result we route back to the dump)
   std::unordered_map<const Expression*, bool> match_partial;
+  // match / function-cases nodes whose TOTAL verdict came from a COMPLETED
+  // GADT refutation of every uncovered ctor -- as opposed to the conservative
+  // "unknown -> Total" defaults above.  Only these may drop the Match_failure
+  // default in the back end (see gadt_function_partial's `proven`).
+  std::set<const void*> total_proven;
   // Pfunction_cases node -> is-partial (bare `function ..`; for the dump)
   std::unordered_map<const void*, bool> function_cases_partial;
   // Param-pattern node -> is-partial (Param_pat (Partial)); against the type
@@ -4922,7 +4934,13 @@ struct Checker {
   // scrutinee type (pr7284_bad's `V2 : int -> X.v2 wit` cannot be ruled out from
   // `X.v1 wit` because X is an abstract functor parameter).  Provably-distinct
   // indices (`int` vs `string`, switch_opts) make the ctor refutable -> Total.
-  bool gadt_function_partial(const TypePtr& scrut, const std::vector<Case>& cases) {
+  // `proven` (optional out): set only when the Total verdict comes from a
+  // COMPLETED refutation of every uncovered ctor -- never from the "unknown ->
+  // keep Total" defaults.  The back end may drop a Match_failure default (and
+  // route the refuted tags through switch holes, as ocamlc's Total lowering
+  // does) only on a proven verdict.
+  bool gadt_function_partial(const TypePtr& scrut, const std::vector<Case>& cases,
+                             bool* proven = nullptr) {
     TypePtr s = I::Engine::repr(scrut);
     if (s->kind != I::Type::Kind::Constr) return false;  // unknown -> keep Total
     auto tc = type_ctors.find(s->path);
@@ -4947,7 +4965,65 @@ struct Checker {
         if (!index_could_be_equal(s->args[i], r->args[i])) { refutable = true; break; }
       if (!refutable) return true;  // this ctor can't be ruled out -> Partial
     }
+    if (proven) *proven = true;
     return false;  // every uncovered ctor is refutable -> Total
+  }
+
+  // A GADT `match`'s exhaustiveness.  ocamlc types a GADT ctor pattern against
+  // a FLEXIBLE scrutinee index by UNIFYING (pinning) it -- refinement equations
+  // are reserved for rigid (locally-abstract) indices -- and the delayed
+  // check_partial then refutes each uncovered ctor whose result index cannot
+  // equal the pinned one (typedtree's split_pattern: matching Tpat_value pins
+  // the index to `computation`, refuting the ten `value` ctors -> Total, no
+  // Match_failure).  Our engine skips the pattern/scrutinee unify for GADT
+  // matches entirely (branch refinement is unmodeled), so the scrutinee is
+  // often still an unpinned var here: pin it the way ocamlc would -- softly
+  // unify each covered ctor's result scheme against it inside a trail window --
+  // run gadt_function_partial's refutation against the pinned type, then roll
+  // the window back.  A scrutinee that IS a locally-abstract var stays unpinned
+  // (rigid in ocamlc: nothing refutable), falling back to the coverage check;
+  // an annotated rigid index (`k pd` scrutinee) arrives as a Constr whose var
+  // argument index_could_be_equal never refutes.
+  bool gadt_match_partial(const TypePtr& scrut, const std::vector<Case>& cases,
+                          bool* proven = nullptr) {
+    TypePtr s = I::Engine::repr(scrut);
+    if (s->kind == I::Type::Kind::Constr && gadt_types.count(s->path))
+      return gadt_function_partial(scrut, cases, proven);
+    if (s->kind != I::Type::Kind::Var) return compute_partial(scrut, cases);
+    if (la_scope_ > 0) return compute_partial(scrut, cases);
+    for (auto& [n, v] : newtype_vars)
+      if (I::Engine::repr(v).get() == s.get()) return compute_partial(scrut, cases);
+    std::set<std::string> covered;
+    for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
+    // The owning type, through the first covered ctor with a known scheme.
+    std::string path;
+    for (auto& cn : covered) {
+      auto it = ctors.find(cn);
+      if (it == ctors.end()) continue;
+      TypePtr result;
+      ctor_params(eng.instantiate(it->second), result);
+      TypePtr r = I::Engine::repr(result);
+      if (r->kind == I::Type::Kind::Constr) { path = r->path; break; }
+    }
+    if (path.empty() || !gadt_types.count(path))
+      return compute_partial(scrut, cases);
+    auto sc = type_ctor_schemes_.find(path);
+    if (sc == type_ctor_schemes_.end()) return compute_partial(scrut, cases);
+    size_t wm = eng.mark();
+    for (auto& cn : covered)
+      for (auto& [n, sch] : sc->second)
+        if (n == cn) {
+          TypePtr result;
+          ctor_params(eng.instantiate(sch), result);
+          try_unify(result, scrut);  // instantiation vars + the scrutinee var
+          break;
+        }
+    TypePtr sp = I::Engine::repr(scrut);
+    bool partial = (sp->kind == I::Type::Kind::Constr && gadt_types.count(sp->path))
+                       ? gadt_function_partial(scrut, cases, proven)
+                       : compute_partial(scrut, cases);
+    eng.undo_to(wm);
+    return partial;
   }
 
   // ---- Tuple-scrutinee GADT exhaustiveness (robustmatch) -----------------
@@ -6680,7 +6756,10 @@ struct Checker {
     if (auto* f = std::get_if<Pexp_function>(&e.desc)) return infer_function(*f);
     if (auto* nt = std::get_if<Pexp_newtype>(&e.desc)) {  // fun (type a) -> e
       newtype_vars[nt->name.txt] = newtype_binding(nt->name.txt);
-      return infer_expr(*nt->body);
+      ++la_scope_;
+      TypePtr t = infer_expr(*nt->body);
+      --la_scope_;
+      return t;
     }
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
       venv.emplace_back();
@@ -6919,7 +6998,10 @@ struct Checker {
         venv.pop_back();
       }
       if (window && all_ground && !ground_clash && gacc) soft_unify(rt, gacc);
-      match_partial[&e] = compute_partial(se, m->cases);  // for the dump (Slice 3)
+      bool tproven = false;                                         // for the
+      match_partial[&e] = gadt ? gadt_match_partial(se, m->cases, &tproven)
+                               : compute_partial(se, m->cases);     // dump (Slice 3)
+      if (tproven && !match_partial[&e]) total_proven.insert(&e);
       return rt;
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
@@ -8056,6 +8138,7 @@ struct Checker {
             it != newtype_vars.end() ? std::optional<TypePtr>(it->second) : std::nullopt});
         newtype_vars[nt->name.txt] = newtype_binding(nt->name.txt);
       }
+    la_scope_ += (int)saved_newtypes.size();
     struct Param { TypePtr ty; int lk; std::string nm; };
     std::vector<Param> params;
     std::vector<std::pair<const Pattern*, TypePtr>> ppat_types;  // param partiality
@@ -8195,9 +8278,14 @@ struct Checker {
       // A GADT scrutinee is Total by branch refinement UNLESS an omitted ctor's
       // index can't be proven distinct from the scrutinee's (pr7284_bad); a
       // non-GADT uses the ordinary coverage check.
+      bool fproven = false;
+      bool cases_gadt = arg_gadt;  // an unpinned param can still be a GADT
+      for (auto& c : fc.cases)     // match: detect through the case patterns,
+        if (pat_has_gadt_ctor(c.lhs)) cases_gadt = true;  // like a Pexp_match
       function_cases_partial[&fc] =
-          arg_gadt ? gadt_function_partial(sarg, fc.cases)
-                   : compute_partial(arg, fc.cases);
+          cases_gadt ? gadt_match_partial(arg, fc.cases, &fproven)
+                     : compute_partial(arg, fc.cases);
+      if (fproven && !function_cases_partial[&fc]) total_proven.insert(&fc);
       params.push_back({arg, 0, ""});
       body = rt;
       constrained = eng.arrow(arg, rt);  // the constraint annotates arg -> rt
@@ -8246,6 +8334,7 @@ struct Checker {
       t = eng.arrow(it->ty, t, it->lk, it->nm);
     cenv.pop_back();
     venv.pop_back();
+    la_scope_ -= (int)saved_newtypes.size();
     for (auto& [nm, prior] : saved_newtypes) {
       if (prior) newtype_vars[nm] = *prior;
       else newtype_vars.erase(nm);
@@ -8481,9 +8570,14 @@ struct Checker {
         annot_vars_ = &avmaps[i];
         // check body (best-effort); a format-annotated rec binding pushes the
         // declared format type into the body (string literals lower as formats)
+        const Pvc_constraint* upc =
+            bs[i].constraint_ ? std::get_if<Pvc_constraint>(&*bs[i].constraint_)
+                              : nullptr;
+        if (upc && !upc->univars.empty()) ++la_scope_;
         TypePtr te = (bound[i] && is_format_constr(bound[i]))
                          ? infer_expr_expected(*bs[i].expr, bound[i])
                          : infer_expr(*bs[i].expr);
+        if (upc && !upc->univars.empty()) --la_scope_;
         annot_vars_ = saved_av;
         // Pin a plain annotation's flexible holes from the body (display/kind
         // passes): `let rec eval : lexpr -> _ = ..` fills the `_` even when no
@@ -8556,8 +8650,12 @@ struct Checker {
         if (auto* pc = std::get_if<Pvc_constraint>(&*b.constraint_))
           if (pc->univars.empty() && coretype_is_format(*pc->typ))
             fmt_annot = from_coretype(*pc->typ, avars);
+      const Pvc_constraint* upc =
+          b.constraint_ ? std::get_if<Pvc_constraint>(&*b.constraint_) : nullptr;
+      if (upc && !upc->univars.empty()) ++la_scope_;
       TypePtr te = fmt_annot ? infer_expr_expected(*b.expr, fmt_annot)
                              : infer_expr(*b.expr);
+      if (upc && !upc->univars.empty()) --la_scope_;
       TypePtr annot = nullptr;
       // A declared type `let f : T = e`: check the inferred type's identities
       // against T (a distinct local type used where another is declared is an
@@ -10149,6 +10247,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
   vk.optional_erasures = std::move(ck.erasures_);
   vk.match_partial = std::move(ck.match_partial);
   vk.function_cases_partial = std::move(ck.function_cases_partial);
+  vk.total_proven = std::move(ck.total_proven);
   return vk;
 }
 

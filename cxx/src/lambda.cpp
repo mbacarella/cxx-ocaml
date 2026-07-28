@@ -10331,7 +10331,8 @@ struct Translator {
            is_predef_exn_name(cn);
   }
   LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc,
-                    const LamPtr& dflt = nullptr, bool total = false) {
+                    const LamPtr& dflt = nullptr, bool total = false,
+                    bool proven = false) {
     if (rows.empty()) return nullptr;
     // Peel top-level `pat as x` aliases: x binds to the scrutinee value over its
     // own row (the scrutinee must be a named var; simplif inlines the alias).
@@ -10417,7 +10418,7 @@ struct Translator {
     // (const or block) simply routes to that default through the Switch*'s gap
     // slots, so the isint split is unnecessary.  (Pure-block types -- NC==0, e.g.
     // result -- just fill missing tags with Match_failure.)
-    if (!exhaustive && NB >= 2 && NC >= 1 && !dflt) return nullptr;
+    if (!exhaustive && NB >= 2 && NC >= 1 && !dflt && !(total && proven)) return nullptr;
     // Eligible: compile covered arms, then fill missing ctors with Match_failure
     // (a missing constructor's slot raises, exactly as ocamlc fills partial matches).
     std::map<int, LamPtr> cmap, bmap;
@@ -10440,6 +10441,20 @@ struct Translator {
       });
       if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
       bmap[tag] = body;
+    }
+    // A TOTAL match that does not cover every constructor: a GADT whose
+    // uncovered ctors the typer refuted (typedtree's split_pattern matching
+    // only the `computation`-indexed ctors).  ocamlc emits the SPARSE Lswitch
+    // -- full sw_numconsts/sw_numblocks, actions only for covered tags, no
+    // failaction -- and bytegen routes every hole to action index 0 (the first
+    // stored action: the first covered const, else the first covered block),
+    // which comp_switch's gap rule reproduces.  No Match_failure exists at all.
+    if (!exhaustive && total && proven && !dflt) {
+      auto sw = mk(Lam::K::Switch); sw->cond = scrut;
+      for (auto& [v, b] : cmap) sw->sw_consts.push_back({v, b});
+      for (auto& [t, b] : bmap) sw->sw_blocks.push_back({t, b});
+      sw->sw_numconsts = NC; sw->sw_numblocks = NB;
+      return sw;
     }
     // A missing constructor's slot raises Match_failure, or jumps to the shared
     // default (exit) when one was supplied (a catch context).
@@ -15256,6 +15271,11 @@ struct Translator {
     auto it = vk.match_partial.find(e);
     return it == vk.match_partial.end() || !it->second;
   }
+  // A PROVEN Total (completed GADT refutation of every uncovered ctor), the
+  // only kind licensed to route uncovered tags through switch holes; the plain
+  // match_is_total default ("absent => Total") must not (an unknown-scrutinee
+  // partial match would silently lose its Match_failure).
+  bool total_is_proven(const void* n) const { return vk.total_proven.count(n) > 0; }
   // Same for a bare `function` node (keyed by its Pfunction_cases address).
   bool function_is_total(const void* fc) const {
     auto it = vk.function_cases_partial.find(fc);
@@ -15375,9 +15395,10 @@ struct Translator {
     return body;
   }
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Case>& cases,
-                       const Location& mloc, bool total = false) {
+                       const Location& mloc, bool total = false,
+                       bool proven = false) {
     auto wraps = register_value_or_shares(cases);
-    LamPtr body = compile_match(scrut, rows_of(cases), mloc, total);
+    LamPtr body = compile_match(scrut, rows_of(cases), mloc, total, proven);
     return apply_value_or_shares(body, wraps);
   }
   // `total` (from the typer's exhaustiveness): when set, the naive last-resort
@@ -15385,7 +15406,8 @@ struct Translator {
   // exactly as ocamlc does when Translcore lowers a Total match.  Only the outer
   // match propagates it; nested field sub-matches default to false (irrefutable).
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Row>& rows,
-                       const Location& mloc, bool total = false) {
+                       const Location& mloc, bool total = false,
+                       bool proven = false) {
     // If the scrutinee is a var of a known imported type, force-register that type's
     // constructors (correct arity/tag) for THIS match, so an ambiguous ctor name
     // (`Named`, shared by 6 types at arities 1/2/3) resolves through the scrutinee's
@@ -15704,7 +15726,7 @@ struct Translator {
     if (auto sw = const_switch(scrut, rows)) return sw;
     if (auto ds = switcher_match(scrut, rows)) return ds;
     if (auto cs = const_ctor_switcher(scrut, rows)) return cs;
-    if (auto cm = ctor_match(scrut, rows, mloc, nullptr, total)) return cm;
+    if (auto cm = ctor_match(scrut, rows, mloc, nullptr, total, proven)) return cm;
     if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
@@ -18198,7 +18220,8 @@ struct Translator {
         cat->cond = tr; cat->prim_arg = eid; cat->catch_vars = {v};
         cat->catch_var_kinds = {expr_kind(m->e.get())};
         scope.emplace_back();
-        cat->then_ = compile_match(varof(v), vrows, e.loc, match_is_total(&e));
+        cat->then_ = compile_match(varof(v), vrows, e.loc, match_is_total(&e),
+                                   total_is_proven(&e));
         scope.pop_back();
         // Wrap the value/exn dispatch in each shared-body catch: both sides
         // already (exit N)ed to it via shared_action_exit_.  Erase the registry
@@ -18224,13 +18247,15 @@ struct Translator {
       LamPtr sc = expr(*m->e);
       if (sc->k != Lam::K::Var && sc->k != Lam::K::ConstBlock) {
         Ident mv = fresh("", true);
-        LamPtr inner = compile_match(varof(mv), m->cases, e.loc, match_is_total(&e));
+        LamPtr inner = compile_match(varof(mv), m->cases, e.loc,
+                                     match_is_total(&e), total_is_proven(&e));
         auto l = mk(Lam::K::Let);
         l->bindings = {{mv, expr_kind(m->e.get()), sc, false}};   // Strict
         l->body = inner;
         return l;
       }
-      return compile_match(sc, m->cases, e.loc, match_is_total(&e));
+      return compile_match(sc, m->cases, e.loc, match_is_total(&e),
+                           total_is_proven(&e));
     }
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
@@ -21321,7 +21346,8 @@ struct Translator {
       l->params.push_back({pid, pat_kind(&fc->cases[0].lhs)});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
       l->body = wrap_optdefs(wrap_binders(
-          compile_match(scrut, fc->cases, floc, function_is_total(fc)), binders));
+          compile_match(scrut, fc->cases, floc, function_is_total(fc),
+                        total_is_proven(fc)), binders));
     } else {
       l->body = mk(Lam::K::ConstInt);
     }

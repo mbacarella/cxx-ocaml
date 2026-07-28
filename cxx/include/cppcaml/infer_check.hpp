@@ -149,6 +149,12 @@ struct ValueKinds {
   std::unordered_map<const ast::Expression*, bool> match_partial;
   // Same, for a bare `function ..` (Pfunction_cases), keyed by the node address.
   std::unordered_map<const void*, bool> function_cases_partial;
+  // match / function-cases nodes whose Total verdict came from a COMPLETED GADT
+  // refutation of every uncovered constructor.  A Total that is merely the
+  // conservative default (absent / unknown-scrutinee) is NOT here, and the back
+  // end must not route uncovered constructor tags through switch holes on its
+  // strength -- only a proven Total carries that license.
+  std::set<const void*> total_proven;
 };
 ValueKinds infer_value_kinds(const ast::Structure& s);
 
