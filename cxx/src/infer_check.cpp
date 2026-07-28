@@ -4889,14 +4889,20 @@ struct Checker {
   // infinite builtin type or a finite variant missing a top-level constructor,
   // with no unguarded catch-all.  Unknown / fully-covered => Total (never a
   // false-positive Partial, so no regressions even if inference is imperfect).
-  bool compute_partial(const TypePtr& scrut, const std::vector<Case>& cases) {
+  // `proven` (optional out, see gadt_function_partial): set only when a Total
+  // verdict comes from tuple_gadt_partial's COMPLETED usefulness analysis --
+  // never from the conservative defaults, which carry no license to drop a
+  // Match_failure the back end would otherwise emit.
+  bool compute_partial(const TypePtr& scrut, const std::vector<Case>& cases,
+                       bool* proven = nullptr) {
     for (auto& c : cases)
       if (!c.guard && is_catchall(c.lhs)) return false;  // unguarded catch-all
     bool any_unguarded = false;  // every case guarded -> a value can fall through
     for (auto& c : cases) if (!c.guard) any_unguarded = true;
     if (!any_unguarded) return true;
     TypePtr s = I::Engine::repr(scrut);
-    if (s->kind == I::Type::Kind::Tuple) return tuple_gadt_partial(s, cases);
+    if (s->kind == I::Type::Kind::Tuple)
+      return tuple_gadt_partial(s, cases, proven);
     if (s->kind != I::Type::Kind::Constr) return false;  // unknown type
     static const std::set<std::string> inf = {
         "int", "char", "string", "float", "int32", "int64", "nativeint", "bytes"};
@@ -5092,10 +5098,15 @@ struct Checker {
     if (s->kind == I::Type::Kind::Constr &&
         (gadt_types.count(s->path) || imported_gadt(s->path)))
       return gadt_function_partial(scrut, cases, proven);
-    if (s->kind != I::Type::Kind::Var) return compute_partial(scrut, cases);
-    if (la_scope_ > 0) return compute_partial(scrut, cases);
+    // The compute_partial fallbacks all thread `proven` through: a TUPLE
+    // scrutinee lands here when its ctor patterns are GADT (pat_has_gadt_ctor
+    // descends tuples), and tuple_gadt_partial's completed usefulness proof
+    // (classify_pattern_desc's pair) is as licensing as the direct refutation.
+    if (s->kind != I::Type::Kind::Var) return compute_partial(scrut, cases, proven);
+    if (la_scope_ > 0) return compute_partial(scrut, cases, proven);
     for (auto& [n, v] : newtype_vars)
-      if (I::Engine::repr(v).get() == s.get()) return compute_partial(scrut, cases);
+      if (I::Engine::repr(v).get() == s.get())
+        return compute_partial(scrut, cases, proven);
     std::set<std::string> covered;
     for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
     // The owning type, through the first covered ctor with a known scheme.
@@ -5109,9 +5120,10 @@ struct Checker {
       if (r->kind == I::Type::Kind::Constr) { path = r->path; break; }
     }
     if (path.empty() || !gadt_types.count(path))
-      return compute_partial(scrut, cases);
+      return compute_partial(scrut, cases, proven);
     auto sc = type_ctor_schemes_.find(path);
-    if (sc == type_ctor_schemes_.end()) return compute_partial(scrut, cases);
+    if (sc == type_ctor_schemes_.end())
+      return compute_partial(scrut, cases, proven);
     size_t wm = eng.mark();
     for (auto& cn : covered)
       for (auto& [n, sch] : sc->second)
@@ -5124,7 +5136,7 @@ struct Checker {
     TypePtr sp = I::Engine::repr(scrut);
     bool partial = (sp->kind == I::Type::Kind::Constr && gadt_types.count(sp->path))
                        ? gadt_function_partial(scrut, cases, proven)
-                       : compute_partial(scrut, cases);
+                       : compute_partial(scrut, cases, proven);
     eng.undo_to(wm);
     return partial;
   }
@@ -5220,7 +5232,11 @@ struct Checker {
 
   TypePtr mx_resolve(TypePtr t, const MxSubst& su) {
     t = I::Engine::repr(t);
-    for (int i = 0; t->kind == I::Type::Kind::Var && i < 64; ++i) {
+    // Vars and RIGID newtype constrs (`(type k)`: display-pass rigid nodes)
+    // both carry branch-local equations in su.
+    for (int i = 0;
+         (t->kind == I::Type::Kind::Var ||
+          (t->kind == I::Type::Kind::Constr && t->rigid)) && i < 64; ++i) {
       auto it = su.find(t.get());
       if (it == su.end()) break;
       t = I::Engine::repr(it->second);
@@ -5273,6 +5289,13 @@ struct Checker {
       if (predefv.count(b)) { r.k = MxClass::PredefVariant; r.name = b; return r; }
       if (type_ctor_schemes_.count(c->path)) {
         r.k = MxClass::Variant; r.key = c->path;
+        // A bare stamp-0 node (an arm-pinned scrutinee index in the flexible
+        // passes): attach the decl when the name resolves uniquely, so the
+        // mcomp variant comparison has its description (else desc-unknown
+        // over-approximates compatible and the pair refutation never fires).
+        if (int st = mx_resolve_bare_stamp(c->path, ""))
+          if (auto sd = stamp_type_decl_.find(st); sd != stamp_type_decl_.end())
+            r.decl = sd->second;
         return r;
       }
       if (type_ctors.count(c->path)) {  // names known, schemes via the flat map
@@ -5340,6 +5363,12 @@ struct Checker {
     using K = I::Type::Kind;
     if (a->kind == K::Var) { su[a.get()] = b; return true; }
     if (b->kind == K::Var) { su[b.get()] = a; return true; }
+    // A rigid newtype constr is a locally-abstract `(type k)`: compatible with
+    // anything, but matching a GADT ctor against it RECORDS the equation
+    // branch-locally (ocamlc's refinement) -- so the classify_pattern_desc
+    // pair's second column sees k=value and refutes Computation there.
+    if (a->kind == K::Constr && a->rigid) { su[a.get()] = b; return true; }
+    if (b->kind == K::Constr && b->rigid) { su[b.get()] = a; return true; }
     if (a->kind == K::Tuple && b->kind == K::Tuple) {
       if (a->args.size() != b->args.size()) return false;
       for (size_t i = 0; i < a->args.size(); ++i)
@@ -5690,7 +5719,8 @@ struct Checker {
     throw MxBail{};  // abstract/unknown column with real patterns
   }
 
-  bool tuple_gadt_partial(const TypePtr& s, const std::vector<Case>& cases) {
+  bool tuple_gadt_partial(const TypePtr& s, const std::vector<Case>& cases,
+                          bool* proven = nullptr) {
     if (strict) return false;  // the reject pass discards partiality anyway
     bool gadt = false;  // gate: only GADT-involving tuple matches
     for (auto& el0 : s->args) {
@@ -5727,7 +5757,12 @@ struct Checker {
       for (auto& c : cases)
         if (!c.guard) add(&c.lhs);
       mx_fuel_ = 20000;
-      return mx_useful(std::move(rows), s->args, MxSubst{});
+      bool useful = mx_useful(std::move(rows), s->args, MxSubst{});
+      // A COMPLETED not-useful analysis is a real Total proof (typedtree's
+      // classify_pattern_desc pair: (Value,Computation) jointly contradictory
+      // through the shared rigid `k`) -- license dropping the Match_failure.
+      if (!useful && proven) *proven = true;
+      return useful;
     } catch (const MxBail&) {
       return false;  // unanalyzable -> Total (the pre-existing default)
     } catch (const I::TypeError&) {
@@ -7181,7 +7216,7 @@ struct Checker {
       if (!pgadt) proj = record_field_gadt_partial(se, m->cases, &tproven);
       match_partial[&e] = pgadt ? gadt_match_partial(se, m->cases, &tproven)
                         : proj  ? *proj
-                                : compute_partial(se, m->cases);    // dump (Slice 3)
+                                : compute_partial(se, m->cases, &tproven);  // dump
       if (tproven && !match_partial[&e]) total_proven.insert(&e);
       return rt;
     }
@@ -8471,7 +8506,7 @@ struct Checker {
       function_cases_partial[&fc] =
           cases_gadt ? gadt_match_partial(arg, fc.cases, &fproven)
           : fproj    ? *fproj
-                     : compute_partial(arg, fc.cases);
+                     : compute_partial(arg, fc.cases, &fproven);
       if (fproven && !function_cases_partial[&fc]) total_proven.insert(&fc);
       params.push_back({arg, 0, ""});
       body = rt;

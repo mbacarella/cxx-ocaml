@@ -14715,7 +14715,8 @@ struct Translator {
   }
   // ---- entry: gate, compile pieces, run the port, local simplify ----
   LamPtr oc_tuple_match(const Pexp_tuple* tu, const std::vector<Row>& vrows,
-                        const Location& mloc) {
+                        const Location& mloc, bool total = false,
+                        bool proven = false) {
     size_t k = tu->elems.size();
     if (k < 2 || k > 6 || vrows.empty() || vrows.size() > 32) return nullptr;
     for (auto& lbl : tu->labels) if (lbl) return nullptr;
@@ -15027,7 +15028,13 @@ struct Translator {
       }
       top.push_back(std::move(tr));
     }
-    bool total_match = oc_covers(all_alt_rows, 0);
+    // ocamlc's matching gets its partial from the TYPE-CHECKER, not from
+    // syntactic coverage: a checker-PROVEN Total (a completed GADT usefulness
+    // proof, e.g. typedtree's classify_pattern_desc pair whose (Value,
+    // Computation) combos are jointly contradictory) licenses Total even when
+    // the tag-cartesian oc_covers misses combos -- no failure default, and the
+    // refuted branches' column tests collapse like upstream's.
+    bool total_match = oc_covers(all_alt_rows, 0) || (total && proven);
     int final_exit = oc_alloc_exit();
     // 3) split / flatten / compile
     OcTopSplitRes ts = oc_top_split_or(std::move(top), {});
@@ -18227,7 +18234,8 @@ struct Translator {
           // Variant-ctor columns first: the faithful matching.ml port emits
           // ocamlc's exact or-pattern context-splitting shape for this domain.
           if (erows.empty())
-            if (LamPtr r = oc_tuple_match(tu, vrows, e.loc))
+            if (LamPtr r = oc_tuple_match(tu, vrows, e.loc, match_is_total(&e),
+                                          total_is_proven(&e)))
               return r;
           if (LamPtr r = multi_match(tu, vrows, erows, e.loc))
             return r;
