@@ -5027,6 +5027,20 @@ struct Checker {
                              bool* proven = nullptr) {
     TypePtr s = I::Engine::repr(scrut);
     if (s->kind != I::Type::Kind::Constr) return false;  // unknown -> keep Total
+    for (auto& c : cases)
+      if (!c.guard && is_catchall(c.lhs)) return false;  // catch-all covers all
+    std::set<std::string> covered;
+    for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
+    auto v = gadt_refute_uncovered(s, covered, proven);
+    return v ? *v : false;  // unknown type -> keep Total
+  }
+
+  // The refutation core, shared with the record-field projection: refute every
+  // uncovered ctor of the (repr'd Constr) GADT column type `s` against the
+  // covered-name set.  nullopt when s isn't a known (local or cmi) variant.
+  std::optional<bool> gadt_refute_uncovered(const TypePtr& s,
+                                            const std::set<std::string>& covered,
+                                            bool* proven) {
     auto tc = type_ctors.find(s->path);
     auto sc = type_ctor_schemes_.find(s->path);
     const std::vector<std::pair<std::string, TypePtr>>* schemes = nullptr;
@@ -5037,11 +5051,7 @@ struct Checker {
     } else if (auto* imp = imported_gadt(s->path)) {  // cmi-declared GADT
       schemes = imp;
       for (auto& [n, sch] : *imp) universe.push_back(n);
-    } else return false;
-    for (auto& c : cases)
-      if (!c.guard && is_catchall(c.lhs)) return false;  // catch-all covers all
-    std::set<std::string> covered;
-    for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
+    } else return std::nullopt;
     for (auto& cname : universe) {
       if (covered.count(cname)) continue;
       const TypePtr* schp = nullptr;
@@ -5117,6 +5127,73 @@ struct Checker {
                        : compute_partial(scrut, cases);
     eng.undo_to(wm);
     return partial;
+  }
+
+  // ---- Record-field GADT projection (parmatch's set_args) -----------------
+  // `match q with {pat_desc = Tpat_tuple ..} | {pat_desc = ..} | ..`: the GADT
+  // column sits BEHIND a record field, so the scrutinee reprs as the record
+  // Constr and the direct GADT detection misses (compute_partial's
+  // unknown-type default then keeps an unproven Total -- no license to drop
+  // the Match_failure).  When every unguarded arm is a record pattern whose
+  // only refutable sub-pattern sits on ONE common field, project: resolve the
+  // field's type through the record's accessor scheme (unified against the
+  // pinned scrutinee inside a rolled-back trail window) and run the
+  // uncovered-ctor refutation on the projected column.  nullopt = projection
+  // not applicable -> the caller falls back to compute_partial.
+  std::optional<bool> record_field_gadt_partial(const TypePtr& scrut,
+                                                const std::vector<Case>& cases,
+                                                bool* proven) {
+    TypePtr s = I::Engine::repr(scrut);
+    if (s->kind != I::Type::Kind::Constr) return std::nullopt;
+    std::string field;
+    std::vector<const Pattern*> col;
+    for (auto& c : cases) {
+      if (c.guard) continue;  // a guarded arm covers nothing
+      auto* r = std::get_if<Ppat_record>(&c.lhs.desc);
+      if (!r) return std::nullopt;  // incl. catch-all arms: not this shape
+      const Pattern* sub = nullptr;
+      for (auto& [lid, sp] : r->fields) {
+        if (is_catchall(*sp)) continue;  // irrefutable sub-pattern: any field
+        if (sub) return std::nullopt;    // two refutable columns: out of scope
+        if (!field.empty() && lid_last(lid.txt) != field) return std::nullopt;
+        field = lid_last(lid.txt);
+        sub = &*sp;
+      }
+      if (!sub) return std::nullopt;  // an all-wild record arm = catch-all row
+      col.push_back(sub);
+    }
+    if (field.empty() || col.empty()) return std::nullopt;
+    // Candidate accessors (`recTy -> fieldTy` arrows): the local field first,
+    // then the unambiguous external one -- first whose domain unifies with the
+    // pinned scrutinee wins (a same-named local label must not hijack an
+    // external record's projection, so a failed unify just tries the next).
+    std::vector<TypePtr> accs;
+    if (auto fit = fields_.find(field); fit != fields_.end())
+      accs.push_back(fit->second);
+    if (auto eit = ext_fields_.find(field);
+        eit != ext_fields_.end() && eit->second.size() == 1)
+      accs.push_back(eit->second[0]);
+    std::optional<bool> verdict;
+    for (auto& acc : accs) {
+      size_t wm = eng.mark();
+      TypePtr a = I::Engine::repr(eng.instantiate(acc));
+      bool ok = false;
+      if (a->kind == I::Type::Kind::Arrow) {
+        // Not try_unify: a clash here is "wrong candidate", never a user error.
+        try { eng.unify(a->dom, s); ok = true; } catch (const I::TypeError&) {}
+      }
+      if (ok) {
+        TypePtr ft = I::Engine::repr(a->cod);
+        if (ft->kind == I::Type::Kind::Constr) {
+          std::set<std::string> covered;
+          for (auto* p : col) collect_ctors(*p, covered);
+          verdict = gadt_refute_uncovered(ft, covered, proven);
+        }
+      }
+      eng.undo_to(wm);
+      if (ok) break;  // right record found: its verdict (or nullopt) is final
+    }
+    return verdict;
   }
 
   // ---- Tuple-scrutinee GADT exhaustiveness (robustmatch) -----------------
@@ -7100,7 +7177,10 @@ struct Checker {
         TypePtr spp = I::Engine::repr(se);
         pgadt = spp->kind == I::Type::Kind::Constr && imported_gadt(spp->path);
       }
+      std::optional<bool> proj;  // GADT column behind a record field
+      if (!pgadt) proj = record_field_gadt_partial(se, m->cases, &tproven);
       match_partial[&e] = pgadt ? gadt_match_partial(se, m->cases, &tproven)
+                        : proj  ? *proj
                                 : compute_partial(se, m->cases);    // dump (Slice 3)
       if (tproven && !match_partial[&e]) total_proven.insert(&e);
       return rt;
@@ -8386,8 +8466,11 @@ struct Checker {
       if (!cases_gadt)             // imported GADT: partiality-only, as at match
         cases_gadt =
             sarg->kind == I::Type::Kind::Constr && imported_gadt(sarg->path);
+      std::optional<bool> fproj;   // GADT column behind a record field
+      if (!cases_gadt) fproj = record_field_gadt_partial(arg, fc.cases, &fproven);
       function_cases_partial[&fc] =
           cases_gadt ? gadt_match_partial(arg, fc.cases, &fproven)
+          : fproj    ? *fproj
                      : compute_partial(arg, fc.cases);
       if (fproven && !function_cases_partial[&fc]) total_proven.insert(&fc);
       params.push_back({arg, 0, ""});
