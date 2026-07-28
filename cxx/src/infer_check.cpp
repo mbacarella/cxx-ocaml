@@ -3824,8 +3824,15 @@ struct Checker {
     }
     // An all-constant variant is immediate (its constructors are ints) -- this
     // holds for an all-constant GADT too (`Int : _ typ | Ptr : _ typ`), so the
-    // immediacy does not depend on is_gadt.
-    if (all_const) immediate_types_.insert(d.name.txt);
+    // immediacy does not depend on is_gadt.  Record BOTH the bare name and the
+    // module-qualified path: a use INSIDE the defining module infers the
+    // qualified type path (`Separability.t`, from mod_prefix_), which kind_str
+    // looks up verbatim -- without the qualified entry an in-module comparison
+    // on the enum stayed the polymorphic caml_equal instead of the int `==`.
+    if (all_const) {
+      immediate_types_.insert(d.name.txt);
+      if (!mod_prefix_.empty()) immediate_types_.insert(mod_prefix_ + d.name.txt);
+    }
     // `[@@unboxed]` of a single immediate field shares its int representation, so
     // a value of the type gets the [int] value kind too.
     bool unboxed = false;
