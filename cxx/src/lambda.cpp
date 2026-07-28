@@ -2160,6 +2160,11 @@ struct Translator {
               }
               type_ctors_[tkey] = std::make_pair(nc, nb);
               if (all_const && !gadt) immediate_local_.insert(tkey);
+              if (!modpath.empty()) {
+                LocalVariant lv; lv.nc = nc; lv.nb = nb;
+                for (auto& c : v->ctors) lv.ctors.push_back(c.name.txt);
+                local_mod_variants_[modpath + "." + d.name.txt] = std::move(lv);
+              }
             }
           }
         if (auto* pm = std::get_if<Pstr_module>(&item.desc))
@@ -3509,6 +3514,15 @@ struct Translator {
   // scope even when they are ambiguous overall (Ident.t's inline records also
   // have name/stamp).
   std::unordered_map<std::string, std::vector<std::string>> mod_record_types_;
+  // A LOCAL submodule's VARIANT universe, keyed by its qualified type name
+  // ("Compiler_ir.t" -> ctor counts + names), recorded at declaration time.
+  // The flat type_ctors_ bare key can be clobbered by a same-named sibling's
+  // force-register cascade (clflags: matches on Compiler_pass.t overwrite "t"
+  // with (2,0) while Compiler_ir.t is (1,0)), so gmatch's universe walk needs
+  // an immutable qualified source for FILE-LOCAL owners -- the analogue of the
+  // cmi walk it already does for imported modules.
+  struct LocalVariant { int nc = 0, nb = 0; std::vector<std::string> ctors; };
+  std::unordered_map<std::string, LocalVariant> local_mod_variants_;
   // Bring a LOCAL module's record-type labels into the scoped resolution, so the
   // inner bare labels of `M.{ .. }` resolve to that record's offsets.  A later
   // top-level `type` decl re-scopes any shared label (build_module's per-decl
@@ -12380,10 +12394,28 @@ struct Translator {
     for (auto& r : rows) {
       auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
       if (!k) continue;
+      // FILE-LOCAL owner: read the immutable per-qualified-name universe made
+      // at registration (the flat bare key may hold a same-named sibling's
+      // counts -- see local_mod_variants_).
+      auto local_universe = [&](const std::string& qty) {
+        auto lv = local_mod_variants_.find(qty);
+        if (lv == local_mod_variants_.end()) return false;
+        std::string cn = ctor_of(*r.cols[0]);
+        bool owns = false;
+        for (auto& nm : lv->second.ctors) if (nm == cn) { owns = true; break; }
+        if (!owns) return false;
+        if (cppcaml::dbg_env("TMDBG"))
+          fprintf(stderr, "[TM] gmatch col %s local universe %s (%d,%d) -> (%d,%d)\n",
+                  type.c_str(), qty.c_str(), NC, NB, lv->second.nc, lv->second.nb);
+        NC = lv->second.nc; NB = lv->second.nb;
+        return true;
+      };
       std::string qmod;
       if (auto* dq = std::get_if<Ldot>(&k->id.txt.v)) {
-        if (auto* pl = std::get_if<Lident>(&dq->prefix->v))
+        if (auto* pl = std::get_if<Lident>(&dq->prefix->v)) {
           if (!module_base(pl->name)) qmod = pl->name;
+          else if (local_universe(pl->name + "." + type)) break;
+        }
       }
       if (qmod.empty()) {
         auto pc = vk.pat_constr.find(r.cols[0]);
@@ -12392,6 +12424,7 @@ struct Translator {
           if (pd != std::string::npos && pc->second.substr(pd + 1) == type) {
             std::string m2 = pc->second.substr(0, pd);
             if (!module_base(m2.substr(0, m2.find('.')))) qmod = m2;
+            else if (local_universe(pc->second)) break;
           }
         }
       }
