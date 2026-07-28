@@ -19194,6 +19194,28 @@ struct Translator {
                 cip = fits[0];
               }
             }
+            // The DOTLESS (file-local) twin: a no-arg construct whose hinted
+            // entry is a block ctor must be a same-named CONSTANT ctor of
+            // another LOCAL type -- typedtree's `Value : _ pattern_category`
+            // constant vs the later `Value of value_description` block, both
+            // file-local, so the module scan above (dotted emod only) misses
+            // it and the engine's by-scope resolution kept the block, emitting
+            // an empty [0] atom where the immediate 0 was meant.  Scan the
+            // local per-type ctor map; a UNIQUE constant fit wins (a no-arg
+            // construct can never be a block ctor, so this is shape-sound).
+            if (cip->is_block && !k->arg.has_value() && emod.empty()) {
+              const CtorInfo* fit = nullptr; int nfit = 0;
+              for (auto& [tyname, tl] : type_ctor_info_)
+                if (auto f2 = tl.find(n); f2 != tl.end() && !f2->second.is_block) {
+                  fit = &f2->second; ++nfit;
+                }
+              if (nfit == 1) {
+                if (cppcaml::dbg_env("CTDBG"))
+                  fprintf(stderr, "[CTDBG] bare-ctor %s -> local const tag=%d\n",
+                          n.c_str(), fit->tag);
+                cip = fit;
+              }
+            }
           }
         }
       }
