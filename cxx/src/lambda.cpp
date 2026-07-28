@@ -898,6 +898,14 @@ struct Translator {
   // exists.  The ctor-chunk driver refuses to route misses at such a deid --
   // upstream's exhaustiveness/ctx knowledge would prune the dead arm.
   int gm_fake_deid_ = -1;
+  // The current top entry's deid when the match is a PROVEN Total (completed
+  // GADT refutation, see ValueKinds.total_proven); -1 otherwise.  Licenses the
+  // ctor split to DROP an uncovered tag's `(exit deid)` hole entry, as
+  // upstream's glob_total mk_failaction_pos adds no final-exit fails for a
+  // Total match -- the switch stays sparse and bytegen's hole rule routes the
+  // refuted tags.  Set/restored unconditionally by every gmatch_top entry, so
+  // a nested match compiled mid-construction can never see a stale license.
+  int gm_tp_deid_ = -1;
   // Entry eids to which mkexit routed a DEEP fully-matched miss (see
   // GmDef::head_dropped).  The ctor-chunk driver rejects a SPREAD-containing
   // attempt whose own entries (eids allocated during the attempt) got such a
@@ -8144,7 +8152,11 @@ struct Translator {
   // share_switches_rec on the gmatch pipeline's switches after wire_garms;
   // returns the switch wrapped in the shared-action catches.
   LamPtr share_actions_and_refail(LamPtr sw) {
-    int NC = (int)sw->sw_consts.size(), NB = (int)sw->sw_blocks.size();
+    // A switch arriving SPARSE (a proven-total ctor split dropped its refuted
+    // tags) already carries the type's universe in sw_num*; a dense one gets
+    // it from the stored sizes, as before.
+    int NC = sw->sw_numconsts >= 0 ? sw->sw_numconsts : (int)sw->sw_consts.size();
+    int NB = sw->sw_numblocks >= 0 ? sw->sw_numblocks : (int)sw->sw_blocks.size();
     // --- same_actions guard (matching.ml:3284 `None, Some act -> act`): every
     // action alpha-equal -> the first action directly, no switch at all.  When
     // the type is NOT fully covered by real clauses, gap tags hold shared-
@@ -12596,6 +12608,29 @@ struct Translator {
     std::vector<Lam::SwitchCase> consts, blocks;
     for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b}); }
     for (int t = 0; t < NB; ++t) { LamPtr b = block_body(t); if (!b) return nullptr; blocks.push_back({t, b}); }
+    // PROVEN-total match (completed GADT refutation): upstream's glob_total
+    // mk_failaction_pos adds no final-exit fails, so an uncovered tag has no
+    // cell at all -- the switch stays SPARSE and bytegen's hole rule (plus a
+    // possible reintroduce_fail promotion) routes the refuted tags.  Drop the
+    // argless `(exit deid)` bodies the empty sub-matrices produced and choose
+    // the shape from the STORED cells, like upstream's combine.  A CONST hole
+    // would change the const switcher's canfail shape -- keep the status quo
+    // there (conservative: the dead raise stays).
+    bool tp_holes = false;
+    if (deid == gm_tp_deid_ && !share_dflt) {
+      auto is_hole = [&](const LamPtr& b) {
+        return b->k == Lam::K::Staticraise && b->prim_arg == deid && b->args.empty();
+      };
+      bool const_hole = false;
+      for (auto& c : consts) if (is_hole(c.body)) { const_hole = true; break; }
+      if (!const_hole) {
+        size_t nb0 = blocks.size();
+        blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
+                       [&](const Lam::SwitchCase& c) { return is_hole(c.body); }),
+                     blocks.end());
+        tp_holes = blocks.size() != nb0;
+      }
+    }
     // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
     LamPtr result;
     // Two block bodies are the same action when pointer-equal, both argument-less
@@ -12626,7 +12661,27 @@ struct Translator {
         if (LamPtr t = canfail_const_dispatch(comps[0], consts, fexit)) return t;
       return const_dispatch(comps[0], consts, /*has_block=*/NB > 0);
     };
-    if (NC == 1 && NB == 1) {
+    if (tp_holes) {
+      // Shape choice over the STORED cells (upstream's combine sees only the
+      // sparse cell list): all stored blocks one action -> isint split (act0 =
+      // same_actions nonconsts, a singleton included); otherwise the sparse
+      // switch, universe-sized so comp_switch's gap rule fills the holes.
+      bool all_same = !blocks.empty();
+      for (auto& b : blocks)
+        if (!same_action(b.body, blocks[0].body)) { all_same = false; break; }
+      if (all_same && !consts.empty()) {
+        auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
+        isint->prim_id = "isint"; isint->args = {comps[0]};
+        auto i = mk(Lam::K::IfThenElse);
+        i->cond = isint; i->then_ = const_side(); i->else_ = blocks[0].body;
+        result = i;
+      } else {
+        auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
+        sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks);
+        sw->sw_numconsts = NC; sw->sw_numblocks = NB;
+        result = sw;
+      }
+    } else if (NC == 1 && NB == 1) {
       auto i = mk(Lam::K::IfThenElse);
       i->cond = comps[0]; i->then_ = blocks[0].body; i->else_ = consts[0].body; result = i;
     } else if (NB >= 2 && NC >= 1 &&
@@ -13158,7 +13213,7 @@ struct Translator {
   // catch-all as the shared default (else Match_failure), run gmatch, and wrap the
   // fallback in a shared static-catch (inlined when used at most once).
   LamPtr gmatch_top(const LamPtr& scrut, const std::vector<Row>& rows,
-                    const Location& mloc) {
+                    const Location& mloc, bool total = false, bool proven = false) {
     const Row* catchall = nullptr;
     std::vector<MRow> mrows;
     std::vector<const Pattern*> apats;
@@ -13189,6 +13244,8 @@ struct Translator {
     // to int_cases = the pre-existing path, so this can only add captures).
     int fd_save = gm_fake_deid_;
     gm_fake_deid_ = catchall ? -1 : deid;
+    int tp_save = gm_tp_deid_;
+    gm_tp_deid_ = (total && proven && !catchall) ? deid : -1;
     gm_orw_.clear();
     LamPtr body = gmatch({sv}, mrows, mloc, deid);
     if (!body) {
@@ -13197,6 +13254,7 @@ struct Translator {
       body = gmatch({sv}, mrows, mloc, deid);
       g_gm_tuples_ = false; g_gm_budget_ = -1;
     }
+    gm_tp_deid_ = tp_save;
     gm_fake_deid_ = fd_save;
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
     // Resolve deferred chunk catches FIRST (Simplif's single-use exit inline):
@@ -15730,7 +15788,7 @@ struct Translator {
     if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
-    if (auto gm = gmatch_top(scrut, rows, mloc)) return gm;
+    if (auto gm = gmatch_top(scrut, rows, mloc, total, proven)) return gm;
     if (cppcaml::dbg_env("BAILDBG")) {
       int nguard = 0, nctor = 0, nor = 0, nother = 0;
       std::string ctors;

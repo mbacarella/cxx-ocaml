@@ -237,6 +237,15 @@ struct Checker {
   // refines types per branch, so branch results must not be cross-unified.
   std::set<std::string> gadt_types;
   std::set<std::string> gadt_ctors;  // constructor names belonging to a GADT
+  // Imported (cmi) GADT variants, resolved lazily by DOTTED type path
+  // ("Typedtree.pattern_desc"): ctor (name, scheme) pairs in decl order with
+  // cd_res-refined results, for the PARTIALITY machinery only.  Deliberately
+  // NOT fed into gadt_types/gadt_ctors: those drive match windowing, and
+  // re-windowing every match on imported GADT ctors would change inference
+  // far beyond exhaustiveness.  nullopt = memoized "not a GADT variant".
+  std::unordered_map<std::string,
+                     std::optional<std::vector<std::pair<std::string, TypePtr>>>>
+      imported_gadt_memo_;
   // GADT constructors that introduce an existential (a type var in the args that
   // is absent from the result).  A structure-level `let A x = ..` binding such a
   // constructor lets the existential escape, which OCaml rejects ("Existential
@@ -4589,6 +4598,81 @@ struct Checker {
     } catch (...) {}
   }
 
+  // Resolve a dotted type path to an imported GADT variant's ctor schemes (see
+  // imported_gadt_memo_).  Scheme building mirrors open_module_ctors: results
+  // come from cd_res via from_cmi (so an uncovered ctor's concrete index is
+  // visible to the refutation), constructors without one get the generic
+  // `(params) path`.  An inline-record ctor keeps a result-only scheme -- the
+  // partiality check reads nothing but the result index.
+  const std::vector<std::pair<std::string, TypePtr>>*
+  imported_gadt(const std::string& path) {
+    if (path.find('.') == std::string::npos) return nullptr;
+    auto mit = imported_gadt_memo_.find(path);
+    if (mit != imported_gadt_memo_.end())
+      return mit->second ? &*mit->second : nullptr;
+    auto& slot = imported_gadt_memo_[path];  // any bail memoizes the negative
+    size_t dot = path.rfind('.');
+    std::string tyname = path.substr(dot + 1), modpath = path.substr(0, dot);
+    std::vector<std::string> comps;
+    for (size_t i = 0;;) {
+      size_t d = modpath.find('.', i);
+      if (d == std::string::npos) { comps.push_back(modpath.substr(i)); break; }
+      comps.push_back(modpath.substr(i, d - i)); i = d + 1;
+    }
+    // A functor-param/bound-module projection has no cmi on disk (and its
+    // types are abstract here anyway -- nothing refutable).
+    if (bound_module_names_.count(comps[0])) return nullptr;
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* msig = &loaded.back()->sig();
+      for (size_t i = 1; i < comps.size() && msig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : msig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        msig = md ? module_sig(md->type, loaded) : nullptr;
+      }
+      if (!msig) return nullptr;
+      const cmi::TypeDecl* td = nullptr;
+      for (auto& t : msig->types)
+        if (t.name == tyname) { td = &t; break; }
+      if (!td || td->kind != cmi::TypeDecl::Variant || td->ctors.empty())
+        return nullptr;
+      bool is_gadt = false;
+      for (auto& c : td->ctors) if (c.res) is_gadt = true;
+      if (!is_gadt) return nullptr;
+      auto* saved_ctx = cmi_types_ctx_;
+      std::string saved_pfx = cmi_mod_prefix_;
+      bool saved_fold = fold_abbrevs_;
+      cmi_types_ctx_ = &msig->types;
+      cmi_mod_prefix_ = modpath;
+      fold_abbrevs_ = true;
+      std::vector<std::pair<std::string, TypePtr>> out;
+      for (auto& c : td->ctors) {
+        std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+        std::vector<TypePtr> params;
+        for (auto& p : td->params) {
+          TypePtr v = eng.fresh_var();
+          if (p) memo[p.get()] = v;
+          params.push_back(v);
+        }
+        TypePtr result = c.res ? from_cmi(c.res, memo) : eng.constr(path, params);
+        TypePtr scheme = result;
+        if (!c.is_inline_record)
+          for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
+            scheme = eng.arrow(from_cmi(*it, memo), scheme);
+        eng.generalize(scheme);
+        out.emplace_back(c.name, std::move(scheme));
+      }
+      cmi_types_ctx_ = saved_ctx;
+      cmi_mod_prefix_ = saved_pfx;
+      fold_abbrevs_ = saved_fold;
+      slot = std::move(out);
+      return &*slot;
+    } catch (...) {}
+    return nullptr;
+  }
+
   // Split a (instantiated) constructor scheme into its argument types and result.
   static std::vector<TypePtr> ctor_params(const TypePtr& sch, TypePtr& result) {
     std::vector<TypePtr> ps;
@@ -4945,15 +5029,23 @@ struct Checker {
     if (s->kind != I::Type::Kind::Constr) return false;  // unknown -> keep Total
     auto tc = type_ctors.find(s->path);
     auto sc = type_ctor_schemes_.find(s->path);
-    if (tc == type_ctors.end() || sc == type_ctor_schemes_.end()) return false;
+    const std::vector<std::pair<std::string, TypePtr>>* schemes = nullptr;
+    std::vector<std::string> universe;
+    if (tc != type_ctors.end() && sc != type_ctor_schemes_.end()) {
+      schemes = &sc->second;
+      universe = tc->second;
+    } else if (auto* imp = imported_gadt(s->path)) {  // cmi-declared GADT
+      schemes = imp;
+      for (auto& [n, sch] : *imp) universe.push_back(n);
+    } else return false;
     for (auto& c : cases)
       if (!c.guard && is_catchall(c.lhs)) return false;  // catch-all covers all
     std::set<std::string> covered;
     for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
-    for (auto& cname : tc->second) {
+    for (auto& cname : universe) {
       if (covered.count(cname)) continue;
       const TypePtr* schp = nullptr;
-      for (auto& [n, sch] : sc->second) if (n == cname) { schp = &sch; break; }
+      for (auto& [n, sch] : *schemes) if (n == cname) { schp = &sch; break; }
       if (!schp) return false;  // unknown scheme -> can't prove non-refutable
       TypePtr result;
       ctor_params(eng.instantiate(*schp), result);
@@ -4987,7 +5079,8 @@ struct Checker {
   bool gadt_match_partial(const TypePtr& scrut, const std::vector<Case>& cases,
                           bool* proven = nullptr) {
     TypePtr s = I::Engine::repr(scrut);
-    if (s->kind == I::Type::Kind::Constr && gadt_types.count(s->path))
+    if (s->kind == I::Type::Kind::Constr &&
+        (gadt_types.count(s->path) || imported_gadt(s->path)))
       return gadt_function_partial(scrut, cases, proven);
     if (s->kind != I::Type::Kind::Var) return compute_partial(scrut, cases);
     if (la_scope_ > 0) return compute_partial(scrut, cases);
@@ -6999,8 +7092,16 @@ struct Checker {
       }
       if (window && all_ground && !ground_clash && gacc) soft_unify(rt, gacc);
       bool tproven = false;                                         // for the
-      match_partial[&e] = gadt ? gadt_match_partial(se, m->cases, &tproven)
-                               : compute_partial(se, m->cases);     // dump (Slice 3)
+      // An imported GADT (its ctors live only in the cmi, so gadt/gadt_ctors
+      // never fire) is detectable HERE: the arms' full unify has pinned the
+      // scrutinee to the concrete dotted type by now.  Partiality-only.
+      bool pgadt = gadt;
+      if (!pgadt) {
+        TypePtr spp = I::Engine::repr(se);
+        pgadt = spp->kind == I::Type::Kind::Constr && imported_gadt(spp->path);
+      }
+      match_partial[&e] = pgadt ? gadt_match_partial(se, m->cases, &tproven)
+                                : compute_partial(se, m->cases);    // dump (Slice 3)
       if (tproven && !match_partial[&e]) total_proven.insert(&e);
       return rt;
     }
@@ -8282,6 +8383,9 @@ struct Checker {
       bool cases_gadt = arg_gadt;  // an unpinned param can still be a GADT
       for (auto& c : fc.cases)     // match: detect through the case patterns,
         if (pat_has_gadt_ctor(c.lhs)) cases_gadt = true;  // like a Pexp_match
+      if (!cases_gadt)             // imported GADT: partiality-only, as at match
+        cases_gadt =
+            sarg->kind == I::Type::Kind::Constr && imported_gadt(sarg->path);
       function_cases_partial[&fc] =
           cases_gadt ? gadt_match_partial(arg, fc.cases, &fproven)
                      : compute_partial(arg, fc.cases);
