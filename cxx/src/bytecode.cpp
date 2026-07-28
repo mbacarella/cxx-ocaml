@@ -801,11 +801,33 @@ struct Bytegen {
     // ---- Storer: assign each action an index, sharing structurally-equal ones.
     std::vector<LamPtr> acts;
     std::unordered_map<std::string, int> keymap;
+    // A 2-column match `match (col0, col1) with ...` that Matching split on
+    // col0 gives EACH col0 constructor its own recursively-compiled sub-switch
+    // on col1 (combine_constructor).  When several constructors reduce to an
+    // identical little `switch col1`, ocamlc still emits one copy PER
+    // constructor: Lambda.make_key keeps an Lswitch's location (lambda.ml:480),
+    // and the per-constructor sub-switches carry distinct arm locations, so the
+    // Storer never merges them (typedecl_separability's `match (get_desc ty, m)`
+    // -> a `switch m` per type constructor).  Our structural key lacks that
+    // location, so it wrongly collapses the copies to one shared label.  Detect
+    // exactly this shape -- an action that IS a switch dispatching on a DISTINCT
+    // scrutinee from the outer one -- and key it by node identity instead, so
+    // genuinely-separate per-constructor sub-switches stay separate.  (Nested or
+    // same-scrutinee switches keep the structural key, so an action a later pass
+    // duplicated from ONE source term still shares as before.)
+    auto outer_scrut = [&]() -> const Lam* {
+      const Lam* c = exp->cond.get();
+      return (c && c->k == Lam::K::Var) ? c : nullptr;
+    }();
     auto store = [&](const LamPtr& act) -> int {
       // exit_aware: actions may be (or contain) distinct static raises, which
       // must NOT merge to one label -- bytegen's real key (Lambda.make_key)
       // keeps the static-exception id.
       std::string key = lambda::make_lam_key(act, /*exit_aware=*/true);
+      if (!key.empty() && act && act->k == Lam::K::Switch && act->cond &&
+          act->cond->k == Lam::K::Var &&
+          !(outer_scrut && act->cond->var.stamp == outer_scrut->var.stamp))
+        key += ":@" + std::to_string(reinterpret_cast<uintptr_t>(act.get()));
       if (!key.empty()) { auto it = keymap.find(key); if (it != keymap.end()) return it->second; }
       int idx = (int)acts.size(); acts.push_back(act);
       if (!key.empty()) keymap.emplace(std::move(key), idx);
