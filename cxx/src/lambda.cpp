@@ -6721,10 +6721,16 @@ struct Translator {
       free_vars(v, bound, fv);
       bool refs_rec = false;
       for (int s : rec_ids) if (fv.count(s)) { refs_rec = true; break; }
-      if (!refs_rec) { cls[i] = Dyn; continue; }
       std::map<int, RSize> env;
       RSize sz = static_size(v, env);
+      // A statically-sized heap block takes the dummy/backpatch scheme whether
+      // or not it references a rec id: value_rec_compiler classifies every Static
+      // (Block) binding this way, allocating a dummy up front and updating it in
+      // place after the letrec.  A block that references nothing recursive (e.g.
+      // translcore's module-level `and prim_alloc_stack = Pccall (...)`) is still
+      // dummied by ocamlc rather than built as an ordinary binding.
       if (sz.k == RSize::Block) { cls[i] = Block; bsize[i] = sz; continue; }
+      if (!refs_rec) { cls[i] = Dyn; continue; }
       if (sz.k == RSize::Func) {
         std::map<int, Ident> locals; LamPtr lf; int bs = 0;
         LamPtr probe = v;
