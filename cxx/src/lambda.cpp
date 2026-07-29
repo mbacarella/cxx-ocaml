@@ -7738,8 +7738,19 @@ struct Translator {
                 sok = false;
             }
             if (sok) {
-              tests->push_back({j + 1, cint(ci->second.tag), false,
-                                /*tag_test=*/true});
+              // A single-constructor variant payload (`Not_compatible_32 info`
+              // where `type error = Not_compatible_32 of ..`) is irrefutable:
+              // the field always carries that sole tag, so ocamlc omits the
+              // discrimination test and decomposes directly.  Emit the tag_test
+              // only when the type has other constructors the value could be.
+              bool sole = false;
+              if (auto tcx = type_ctors_.find(ci->second.type);
+                  tcx != type_ctors_.end() &&
+                  tcx->second.first == 0 && tcx->second.second == 1)
+                sole = true;
+              if (!sole)
+                tests->push_back({j + 1, cint(ci->second.tag), false,
+                                  /*tag_test=*/true});
               temps.push_back({tv, acc});
               sub_binders.push_back(std::move(sb));
               ok = true;
