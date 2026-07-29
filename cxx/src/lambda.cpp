@@ -11629,21 +11629,33 @@ struct Translator {
             exhaustive_irref_col(r.cols[0], /*need_cover=*/true))
           r.cols[0] = &gm_any_pat;
     }
-    // A BINDING or-row whose remaining columns still discriminate exits each
+    // An or-row whose remaining columns still discriminate exits each
     // alternative to a fresh handler that matches the rest ONCE: matching.ml's
     // precompile_or turns `(s|s') p2..pn -> act` into `s _.._ -> exit K vars |
     // s' _.._ -> exit K vars` with `with (K vars) (match arg2..argn with
-    // p2..pn -> act)`.  The plain expansion below would instead duplicate the
-    // suffix tests per alternative (typedecl_immediacy's `Cstr_tuple [arg] |
-    // Cstr_record [{ld_type=arg}]` re-testing the singleton-list and
-    // Variant_unboxed columns in both arms).  Restricted to a single-row
-    // matrix so none of precompile_or's disjointness bookkeeping with later
-    // rows (Or_matrix) is in play; the handler keeps this level's default env
-    // (pop_compat only trims matrices incompatible with the or, and with one
-    // row there is no split to trim against).
-    if (rows.size() == 1 && comps.size() >= 2 && rows[0].aid >= 0 &&
-        rows[0].vnames && !rows[0].guard &&
-        std::get_if<Ppat_or>(&rows[0].cols[0]->desc)) {
+    // p2..pn -> act)`.  ocamlc does this for EVERY or-row regardless of whether
+    // it binds (patbound_action_vars may be empty -- a non-binding string/const
+    // or like depend's `("ocaml.extension_constructor"|"extension_constructor")`
+    // still shares its suffix).  The plain expansion below would instead
+    // duplicate the suffix tests per alternative (typedecl_immediacy's
+    // `Cstr_tuple [arg] | Cstr_record [{ld_type=arg}]` re-testing the columns in
+    // both arms; depend re-testing the `PStr [item]` continuation in both).
+    //   Fires when row 0 is the or-row and every trailing row has a pure
+    // WILDCARD column 0: those rows match column 0 unconditionally, so they
+    // belong to both the body's column-0 dispatch (as its default arm, intact)
+    // and the handler's fall-through (column 0 popped) WITHOUT any column-0
+    // re-test -- keeping precompile_or's Or_matrix disjointness bookkeeping
+    // (pop_compat, which keeps exactly the or-compatible rows) trivial.  A
+    // trailing row that itself discriminates column 0 would need that
+    // re-dispatch and is left to the duplicating expansion below.  Trailing rows
+    // must carry a shared action id so the handler's fall-through only re-raises
+    // it (no re-compiled action body).
+    if (comps.size() >= 2 && rows[0].aid >= 0 && rows[0].vnames &&
+        !rows[0].guard && std::get_if<Ppat_or>(&rows[0].cols[0]->desc)) {
+      bool trailing_ok = true;
+      for (size_t i = 1; i < rows.size(); ++i)
+        if (!std::holds_alternative<Ppat_any>(rows[i].cols[0]->desc) ||
+            rows[i].aid < 0) { trailing_ok = false; break; }
       MRow& r = rows[0];
       bool rest_disc = false;
       for (size_t j = 1; j < r.cols.size(); ++j)
@@ -11652,10 +11664,21 @@ struct Translator {
       collect_gvars(r.cols[0], orvars);
       std::vector<const Pattern*> alts;
       flatten_or(r.cols[0], alts);
-      if (rest_disc && !orvars.empty() && alts.size() > 1) {
+      if (trailing_ok && rest_disc && alts.size() > 1) {
         static const Pattern gm_omega_pat =
             [] { Pattern p; p.desc = Ppat_any{}; return p; }();
         int orn = ++next_exit_;
+        // Claim orn as an already-wrapped or-handler exit: the exploded
+        // alternatives carry aid=orn, and if a remaining column decomposes into a
+        // NESTED or whose rows inherit that aid, the general or-expansion below
+        // must NOT wrap a second (gm_orp) catch for orn -- it is already wired by
+        // the manual catch here.  (typecore's `[{pexp_desc = Pexp_ident _ |
+        // Pexp_record (_, (Some .. | None))}]`: the outer or's Pexp_record arm
+        // decomposes to the inner `Some .. | None` or, whose rows raise orn.)
+        gm_orw_.insert(orn);
+        // Body: dispatch column 0 over the exploded alternatives (each raising
+        // orn with omega remaining columns) plus the trailing wildcard-col0 rows
+        // intact (they form the column-0 dispatch default).
         std::vector<MRow> ex;
         for (auto* a : alts) {
           MRow nr = r; nr.cols[0] = effective_pat(a);
@@ -11663,18 +11686,29 @@ struct Translator {
           nr.aid = orn; nr.vnames = &orvars;
           ex.push_back(std::move(nr));
         }
+        for (size_t i = 1; i < rows.size(); ++i) ex.push_back(rows[i]);
         LamPtr sub = gmatch(comps, std::move(ex), mloc, deid, denv);
         if (!sub) return nullptr;
+        // Handler (exit orn): the or-row's remaining columns compiled once, with
+        // the trailing rows' remaining columns (column 0 popped) as the
+        // fall-through -- exactly precompile_or's orpm default = pop_compat.
         std::vector<LamPtr> rcomps(comps.begin() + 1, comps.end());
-        MRow hr = r; hr.cols.erase(hr.cols.begin());
         auto c = mk(Lam::K::Catch); c->prim_arg = orn; c->cond = sub;
+        MRow hr = r; hr.cols.erase(hr.cols.begin());
         for (auto& nm : orvars) {
           Ident id = fresh(nm, false);
           hr.binds.push_back({nm, id});
           c->catch_vars.push_back(id);
           c->catch_var_kinds.push_back(ValueKind::Gen);
         }
-        LamPtr hb = gmatch(std::move(rcomps), {hr}, mloc, deid, std::move(denv));
+        std::vector<MRow> hrows;
+        hrows.push_back(std::move(hr));
+        for (size_t i = 1; i < rows.size(); ++i) {
+          MRow tr = rows[i]; tr.cols.erase(tr.cols.begin());
+          hrows.push_back(std::move(tr));
+        }
+        LamPtr hb = gmatch(std::move(rcomps), std::move(hrows), mloc, deid,
+                           std::move(denv));
         if (!hb) return nullptr;
         c->then_ = hb;
         return c;
