@@ -9905,6 +9905,63 @@ struct Translator {
     auto wraplet = [&](const Lam::Binding& b, LamPtr inner) {
       auto l = mk(Lam::K::Let); l->bindings = {b}; l->body = inner; return l;
     };
+    // Group sink: when a destructure's sibling projections (`a,b,c` of
+    // `(a,b,c as acc)`) are ALL used only inside one branch of a leading `if`
+    // and the other branch returns the bare aggregate, ocamlc sinks the whole
+    // group into that branch, in collect (reverse-field) order -- e.g.
+    // translcore's `rewrite_case (val_cases,exn_cases,static_handlers as acc)
+    // case = if <unreachable c_rhs> then acc else ..`.  Placing them one at a
+    // time via lower_bind can't reproduce that order reliably (its per-binder
+    // descend lands them forward), so handle the whole same-root group here:
+    // wrap them (kept, multi-use) around the used branch in their binder-vector
+    // order, then drop them so the main fold below skips them.  Narrow guards:
+    // >=2 peers, each a multi-use immutable field read off a root that is NOT a
+    // sibling binder, and every same-root peer present must qualify for the
+    // SAME single branch (so the group is complete and unambiguous).
+    if (body->k == Lam::K::IfThenElse && body->then_ && body->else_) {
+      std::map<int, std::vector<size_t>> byroot;  // root stamp -> binder indices
+      std::set<int> binder_stamps;
+      for (auto& [id, acc] : binders) binder_stamps.insert(id.stamp);
+      for (size_t i = 0; i < binders.size(); ++i) {
+        auto& acc = binders[i].second;
+        if (!is_field_access(acc) || is_mut_field_access(acc)) continue;
+        if (lazy_force_binders_.count(binders[i].first.stamp)) continue;
+        int r = field_root_stamp(acc);
+        if (r < 0 || binder_stamps.count(r)) continue;  // root must be outer
+        byroot[r].push_back(i);
+      }
+      std::set<size_t> sunk;
+      for (auto& [r, idxs] : byroot) {
+        if (idxs.size() < 2) continue;
+        // Every peer must be multi-use and confined to exactly one branch (the
+        // same one for the whole group); cond must not mention any of them.
+        int branch = -1;  // 0 = then, 1 = else
+        bool ok = true;
+        for (size_t i : idxs) {
+          const Ident& id = binders[i].first;
+          if (count_var(body, id) <= 1) { ok = false; break; }
+          if (approx_present(id, body->cond)) { ok = false; break; }
+          bool pt = approx_present(id, body->then_);
+          bool pe = approx_present(id, body->else_);
+          int b = (pt && !pe) ? 0 : (pe && !pt) ? 1 : -1;
+          if (b < 0 || (branch >= 0 && b != branch)) { ok = false; break; }
+          branch = b;
+        }
+        if (!ok || branch < 0) continue;
+        LamPtr& arm = branch == 0 ? body->then_ : body->else_;
+        for (auto it = idxs.rbegin(); it != idxs.rend(); ++it) {
+          auto& [id, acc] = binders[*it];
+          arm = wraplet({id, ValueKind::Gen, acc, true}, arm);
+          sunk.insert(*it);
+        }
+      }
+      if (!sunk.empty()) {
+        std::vector<std::pair<Ident, LamPtr>> rest;
+        for (size_t i = 0; i < binders.size(); ++i)
+          if (!sunk.count(i)) rest.push_back(std::move(binders[i]));
+        binders.swap(rest);
+      }
+    }
     for (auto it = binders.rbegin(); it != binders.rend(); ++it) {
       auto& id = it->first; auto& acc = it->second;
       // A lazy-force binder is an effectful computation: always kept, strict,
@@ -9957,6 +10014,16 @@ struct Translator {
   static bool is_field_access(const LamPtr& l) {
     return l->k == Lam::K::Prim &&
            (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt);
+  }
+  // The stamp of the base variable of an immutable field read (`field_imm i v`),
+  // or -1 if it isn't a field read off a bare variable.  Used to group the
+  // sibling projections of one aggregate for the group sink in wrap_binders.
+  static int field_root_stamp(const LamPtr& l) {
+    if (l->k == Lam::K::Prim &&
+        (l->prim == Prim::FieldImm || l->prim == Prim::FieldInt) &&
+        !l->args.empty() && l->args[0]->k == Lam::K::Var)
+      return l->args[0]->var.stamp;
+    return -1;
   }
   // A read of a mutable field (field_mut, or a field_int off a mutable immediate
   // field): bound StrictOpt rather than Alias.
