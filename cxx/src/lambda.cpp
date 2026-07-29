@@ -20279,6 +20279,9 @@ struct Translator {
       }
       auto l = mk(Lam::K::Let);
       std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured pats
+      // A sequence-preserving tuple-let float keeps the RHS let/seq tree intact and
+      // splices the component bindings at the tail tuple leaf (below); stash it here.
+      LamPtr float_seq_val, float_seq_inner;
       for (auto& b : le->bindings) {
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
           // pass b.attrs so a local `let[@inline never] f = ..` carries its
@@ -20314,11 +20317,53 @@ struct Translator {
           // them ahead is evaluation-order preserving) and bind the components.
           const Pattern* tpat = effective_pat(&b.pat);
           auto* tup = std::get_if<Ppat_tuple>(&tpat->desc);
+          // Peek through leading non-recursive lets AND sequences to the tail: a
+          // side-effect before the tuple (`let p = pos_out c in output c v; (p, ..)`)
+          // is a Sequence whose `else_` is the tuple.  Track whether a Sequence was
+          // crossed; if so we cannot flatten the RHS into this let-group (the side
+          // effect would need a stack slot it does not have in ocamlc's Lsequence),
+          // so we keep the whole let/seq tree and splice at the leaf instead.
           const Lam* inner = val.get();
-          while (inner->k == Lam::K::Let) inner = inner->body.get();
-          if (tup && !tup->elems.empty() && inner->k == Lam::K::Prim &&
+          bool saw_seq = false;
+          while (inner->k == Lam::K::Let ||
+                 (inner->k == Lam::K::Sequence && inner->else_)) {
+            if (inner->k == Lam::K::Sequence) saw_seq = true;
+            inner = (inner->k == Lam::K::Let) ? inner->body.get() : inner->else_.get();
+          }
+          bool is_tuple_leaf =
+              tup && !tup->elems.empty() && inner->k == Lam::K::Prim &&
               inner->prim == Prim::Makeblock && inner->prim_arg == 0 &&
-              inner->args.size() == tup->elems.size()) {
+              inner->args.size() == tup->elems.size();
+          if (is_tuple_leaf && saw_seq && le->bindings.size() == 1) {
+            // Sequence-preserving float: keep val's let/seq spine and replace the
+            // tail tuple with an inner let binding each component directly (Strict
+            // element -> inner let binding; var/immutable-field element -> alias via
+            // wrap_binders).  Order is preserved because the components stay at the
+            // tuple's original position, after the spine's lets and side effects.
+            LamPtr* slot = &val;
+            while ((*slot)->k == Lam::K::Let ||
+                   ((*slot)->k == Lam::K::Sequence && (*slot)->else_))
+              slot = ((*slot)->k == Lam::K::Let) ? &(*slot)->body : &(*slot)->else_;
+            LamPtr mkb = *slot;
+            auto inner_let = mk(Lam::K::Let);
+            for (int i = (int)tup->elems.size() - 1; i >= 0; --i) {
+              const Pattern* ep = effective_pat(tup->elems[i].get());
+              LamPtr av = mkb->args[i];
+              auto* pv = std::get_if<Ppat_var>(&ep->desc);
+              if (pv && av->k != Lam::K::Var && !is_field_access(av)) {
+                Ident id = fresh(pv->name.txt);
+                inner_let->bindings.push_back({id, pat_kind(ep), av});
+                scope.back()[pv->name.txt] = id;
+              } else {
+                collect_binders(*ep, av, binders);
+              }
+            }
+            record_tuple_sigs(b.pat, *b.expr);
+            float_seq_val = val;
+            float_seq_inner = inner_let;
+            continue;
+          }
+          if (is_tuple_leaf && !saw_seq) {
             while (val->k == Lam::K::Let) {
               for (auto& fb : val->bindings) l->bindings.push_back(std::move(fb));
               val = val->body;
@@ -20361,6 +20406,17 @@ struct Translator {
       rec_spine_ = rec_spine;
       LamPtr body = wrap_binders(expr(*le->body), binders);
       scope.pop_back();
+      if (float_seq_val) {
+        // Splice the component-binding inner let (its body is the fully-bound body)
+        // in at the tail tuple leaf of the preserved let/seq spine.
+        float_seq_inner->body = body;
+        LamPtr* slot = &float_seq_val;
+        while ((*slot)->k == Lam::K::Let ||
+               ((*slot)->k == Lam::K::Sequence && (*slot)->else_))
+          slot = ((*slot)->k == Lam::K::Let) ? &(*slot)->body : &(*slot)->else_;
+        *slot = float_seq_inner;
+        return float_seq_val;
+      }
       if (l->bindings.empty()) return body;  // all bindings were field reads of a var
       l->body = body;
       return l;
