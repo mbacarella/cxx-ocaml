@@ -20516,10 +20516,19 @@ struct Translator {
       }
       auto l = mk(Lam::K::Let);
       std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured pats
+      // Per-source-binding boundaries into (l->bindings, binders).  A parallel
+      // `let p1 = e1 and p2 = e2` whose EARLIER binding destructures otherwise
+      // emits `*match* ; <p2 scrutinee> ; <p1 field reads>`: the deferred field
+      // reads (wrapped once at the end via `binders`) land after every later
+      // scrutinee.  ocamlc's transl_let folds `for_let p1 e1 (for_let p2 e2 body)`,
+      // so p1's field reads come right after its own scrutinee, before p2.  When we
+      // detect that shape (below) we reassemble fold-right using these boundaries.
+      std::vector<std::pair<size_t, size_t>> src_bounds;
       // A sequence-preserving tuple-let float keeps the RHS let/seq tree intact and
       // splices the component bindings at the tail tuple leaf (below); stash it here.
       LamPtr float_seq_val, float_seq_inner;
       for (auto& b : le->bindings) {
+        src_bounds.push_back({l->bindings.size(), binders.size()});
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
           // pass b.attrs so a local `let[@inline never] f = ..` carries its
           // never_inline attribute onto the function (as the top-level path does).
@@ -20640,7 +20649,40 @@ struct Translator {
           record_tuple_sigs(b.pat, *b.expr);
         }
       }
+      src_bounds.push_back({l->bindings.size(), binders.size()});  // sentinel
       rec_spine_ = rec_spine;
+      // Reorder to fold-right ONLY when an earlier binding's field reads would land
+      // after a later binding's scrutinee (an early destructure with a later
+      // flat binding).  Every other shape keeps the existing single-let assembly
+      // bit-for-bit.  float_seq_val is single-binding, so it never reaches here.
+      bool need_fold = false;
+      if (!float_seq_val && le->bindings.size() > 1) {
+        size_t n = le->bindings.size();
+        for (size_t s = 0; s < n && !need_fold; ++s)
+          if (src_bounds[s].second != src_bounds[s + 1].second)  // group s has binders
+            for (size_t t = s + 1; t < n; ++t)
+              if (src_bounds[t].first != src_bounds[t + 1].first) {  // later flats
+                need_fold = true; break;
+              }
+      }
+      if (need_fold) {
+        LamPtr body = expr(*le->body);
+        scope.pop_back();
+        for (size_t s = le->bindings.size(); s-- > 0; ) {
+          std::vector<std::pair<Ident, LamPtr>> bs(
+              binders.begin() + src_bounds[s].second,
+              binders.begin() + src_bounds[s + 1].second);
+          body = wrap_binders(body, bs);
+          if (src_bounds[s].first != src_bounds[s + 1].first) {
+            auto ll = mk(Lam::K::Let);
+            ll->bindings.assign(
+                std::make_move_iterator(l->bindings.begin() + src_bounds[s].first),
+                std::make_move_iterator(l->bindings.begin() + src_bounds[s + 1].first));
+            ll->body = body; body = ll;
+          }
+        }
+        return body;
+      }
       LamPtr body = wrap_binders(expr(*le->body), binders);
       scope.pop_back();
       if (float_seq_val) {
