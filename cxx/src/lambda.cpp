@@ -1066,6 +1066,13 @@ struct Translator {
     // record (`Pattern {penv : Pattern_env.t}` -> "Pattern_env.t"), else "".  Lets a
     // var bound to such a field resolve its own AMBIGUOUS labels by that type.
     std::vector<std::string> rftypes;
+    // Parallel to rlabels: whether each inline-record field's declared type is the
+    // predefined `string`.  The inferencer leaves an inline-record ctor arg
+    // untyped (the ctor scheme carries no argument type), so `x.name` where x was
+    // bound by `Local x` has no `string` value-kind; this lets the back end still
+    // specialize `compare x.name y.name` / `x.name = y.name` to the string C
+    // primitives instead of the polymorphic caml_compare (ident.ml's compare).
+    std::vector<bool> rfstr;
     // Each tuple ARG's type name (last path component) when it is a Tconstr,
     // else "" (`Pextra_ty of t * extra_ty` -> {"t","extra_ty"}).  Lets
     // register_ctors_of_type pull in a SIBLING variant the ctor destructures
@@ -1214,6 +1221,13 @@ struct Translator {
     std::string dotted;
     if (!lid_to_dotted(c->id.txt, dotted)) return "";
     return dotted;
+  }
+  // A local field type that is the predefined `string` (unqualified constr, no
+  // args) -- drives compare/=/<> specialization for inline-record whole binds.
+  static bool coretype_is_string(const CoreType& t) {
+    auto* c = std::get_if<Ptyp_constr>(&t.desc);
+    return c && c->args.empty() && std::holds_alternative<Lident>(c->id.txt.v) &&
+           lid_last(c->id.txt) == "string";
   }
   // The value kind of a field/element from its syntactic core type (builtins and
   // immediate local variants; everything else is generic/boxed).
@@ -1390,6 +1404,7 @@ struct Translator {
                 ci.rshape.push_back(cmi_field_kind(l.type));
                 ci.rfmut.push_back(l.mutable_);
                 ci.rftypes.push_back(cmi_label_record_path(l.type, mod));
+                ci.rfstr.push_back(cmi_type_is_string(l.type));
               }
             else
               for (auto& a : c.args) {
@@ -1922,6 +1937,7 @@ struct Translator {
               ci.rshape.push_back(fk);
               ci.rfmut.push_back(fm);
               ci.rftypes.push_back(coretype_record_path(*f.type));
+              ci.rfstr.push_back(coretype_is_string(*f.type));
               // the labels resolve like record labels (`r.cnt` on a bound
               // inline-record value reads the block field)
               if (field_info_.count(f.name.txt)) ambiguous_fields_.insert(f.name.txt);
@@ -2137,6 +2153,7 @@ struct Translator {
                     ci.rshape.push_back(fk);
                     ci.rfmut.push_back(fm);
                     ci.rftypes.push_back(coretype_record_path(*f.type));
+                    ci.rfstr.push_back(coretype_is_string(*f.type));
                     if (do_ctor && !field_info_.count(f.name.txt))
                       field_info_[f.name.txt] = {d.name.txt, ridx, fm, fk};
                     ++ridx;
@@ -3468,6 +3485,7 @@ struct Translator {
                   ci.rshape.push_back(cmi_field_kind(l.type));
                   ci.rfmut.push_back(l.mutable_);
                   ci.rftypes.push_back(cmi_label_record_path(l.type, dotted));
+                  ci.rfstr.push_back(cmi_type_is_string(l.type));
                 }
               ctor_info_[c.name] = ci;
               type_ctor_info_[td.name][c.name] = std::move(ci);
@@ -4761,6 +4779,13 @@ struct Translator {
   // (Texp_letop's `body : value case` -> "Typedtree.case"; without it a later
   // `body.c_lhs` has no owning record and falls to whatever foreign unit
   // uniquely claims the label -> a wrong or const-0 read).
+  // cmi analog of coretype_is_string for an IMPORTED inline-record field.
+  static bool cmi_type_is_string(const cmi::TypePtr& t0) {
+    cmi::TypePtr t = t0;
+    while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst)) t = t->link;
+    return t && t->kind == cmi::TypeExpr::Tconstr && t->path &&
+           cmi_path_dotted(*t->path) == "string";
+  }
   static std::string cmi_label_record_path(const cmi::TypePtr& t0, const std::string& mod) {
     cmi::TypePtr t = t0;
     while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst)) t = t->link;
@@ -5528,9 +5553,33 @@ struct Translator {
       default: return false;
     }
   }
+  // `x.label` where x was bound to a whole inline record by `Ctor x`: is that
+  // field's declared type the predefined `string`?  (Companion to
+  // inline_rec_field, which resolves the offset/kind but not string-ness.)
+  bool inline_rec_field_is_string(const Expression* base, const std::string& label) {
+    auto* id = std::get_if<Pexp_ident>(&base->desc);
+    if (!id) return false;
+    auto* l = std::get_if<Lident>(&id->id.txt.v);
+    if (!l) return false;
+    const Ident* b = lookup(l->name);
+    if (!b) return false;
+    auto it = inline_rec_var_.find(b->stamp);
+    if (it == inline_rec_var_.end()) return false;
+    const CtorInfo& ci = *it->second;
+    for (int i = 0; i < (int)ci.rlabels.size(); ++i)
+      if (ci.rlabels[i] == label)
+        return i < (int)ci.rfstr.size() && ci.rfstr[i];
+    return false;
+  }
   bool expr_is_string(const Expression* e) {  // string isn't a value kind; drives string compares
     auto it = vk.expr.find(e);
-    return it != vk.expr.end() && it->second == "string";
+    if (it != vk.expr.end() && it->second == "string") return true;
+    // The inferencer leaves an inline-record ctor arg untyped (its recorded kind,
+    // if any, is a fresh var), so `x.name` where x was bound by `Local x` never
+    // gets a "string" value-kind; consult the ctor's per-field marker instead.
+    if (auto* fld = std::get_if<Pexp_field>(&e->desc))
+      return inline_rec_field_is_string(fld->e.get(), lid_last(fld->field.txt));
+    return false;
   }
   const Ident* lookup(const std::string& n) {
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
