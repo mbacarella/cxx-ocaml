@@ -14840,7 +14840,9 @@ struct Translator {
     for (auto& lbl : tu->labels) if (lbl) return nullptr;
     // 1) validate shapes; collect column ctor patterns (no side effects yet)
     struct AltVar { std::string name; int col; int field; const Pattern* node;
-                    int alt; int nalts; };  // leaf index / count in the column's or
+                    int alt; int nalts;      // leaf index / count in the column's or
+                    const CtorInfo* ci = nullptr; };  // set: whole inline-record bind
+                                                      // (`Local x`, field==-1), for inline_rec_var_
     struct SrcAlt { std::vector<const Pattern*> cols; bool is_any;
                     std::vector<AltVar> vars; };   // bare-var columns, col order
     struct SrcRow { std::vector<SrcAlt> alts; const Expression* rhs; };
@@ -14874,6 +14876,7 @@ struct Translator {
     // carrying only var/wildcard arguments (binds under a column-level or are
     // fine for single-alternative rows: they become handler exit args)
     std::vector<int> col_nc(k, 0), col_ncc(k, 0);
+    bool saw_inline_rec = false;  // an inline-record ctor column was accepted
     std::vector<std::map<int, int>> col_arity(k);  // unified tag -> block arity
     std::vector<std::vector<std::vector<std::vector<int>>>> tags(srcs.size());
     // tags[row][alt][col] = leaf unified-tag list ({} = omega)
@@ -14904,11 +14907,51 @@ struct Translator {
             const CtorInfo* ci = pat_ctor_resolve(eq, cn);
             if (!ci || ci->unboxed) return nullptr;
             bool ocdbg = cppcaml::dbg_env("OCDBG");
-            if (ci->is_block) {
-              if (!ci->rlabels.empty()) {
-                if (ocdbg) fprintf(stderr, "[OCgate] %s: rlabels\n", cn.c_str());
-                return nullptr;  // inline record: bail
+            if (ci->is_block && !ci->rlabels.empty()) {
+              saw_inline_rec = true;
+              // Inline-record ctor (`Local of {name;stamp}`).  Two shapes handled:
+              //   `Local _`            -- discriminate on the tag, bind nothing;
+              //   `Local x`            -- whole-record bind (x aliases the block,
+              //                           field -1; `x.name` resolves later via
+              //                           inline_rec_var_) -- single-alt rows only;
+              //   `Local {stamp=s1;_}` -- label destructure: each read label maps
+              //                           to its inline-record index (a field var).
+              // Anything else (nested tests, float fields read via GETFLOATFIELD)
+              // bails -- this matcher reads inline fields with field_imm.
+              const Pattern* iarg =
+                  pc->arg ? effective_pat(pc->arg->get()) : nullptr;
+              if (!iarg || std::holds_alternative<Ppat_any>(iarg->desc)) {
+                // tag test only
+              } else if (auto* iv = std::get_if<Ppat_var>(&iarg->desc)) {
+                if (sr.alts.size() > 1 || cl.size() > 1) {
+                  if (ocdbg) fprintf(stderr, "[OCgate] %s: inline whole-bind in or-row\n", cn.c_str());
+                  return nullptr;  // conflicting ci across alts: bail
+                }
+                a.vars.push_back({iv->name.txt, (int)c, -1, iarg,
+                                  (int)qi, (int)cl.size(), ci});
+              } else if (auto* pr = std::get_if<Ppat_record>(&iarg->desc)) {
+                for (auto& [lbl, sub] : pr->fields) {
+                  int ix = -1;
+                  for (size_t li = 0; li < ci->rlabels.size(); ++li)
+                    if (ci->rlabels[li] == lid_last(lbl.txt)) { ix = (int)li; break; }
+                  if (ix < 0) return nullptr;
+                  const Pattern* fp = effective_pat(sub.get());
+                  if (std::holds_alternative<Ppat_any>(fp->desc)) continue;
+                  auto* fv = std::get_if<Ppat_var>(&fp->desc);
+                  if (!fv || (cl.size() > 1 && sr.alts.size() > 1)) {
+                    if (ocdbg) fprintf(stderr, "[OCgate] %s: inline field %s not var/any\n", cn.c_str(), lid_last(lbl.txt).c_str());
+                    return nullptr;
+                  }
+                  if (ix >= (int)ci->rshape.size() ||
+                      ci->rshape[ix] == ValueKind::Float) return nullptr;  // GETFLOATFIELD
+                  a.vars.push_back({fv->name.txt, (int)c, ix, fp,
+                                    (int)qi, (int)cl.size(), nullptr});
+                }
+              } else {
+                if (ocdbg) fprintf(stderr, "[OCgate] %s: inline arg shape\n", cn.c_str());
+                return nullptr;
               }
+            } else if (ci->is_block) {
               auto fps = ctor_field_pats(pc, ci->arity);
               if ((int)fps.size() != ci->arity) {
                 if (ocdbg) fprintf(stderr, "[OCgate] %s: fps %zu != arity %d\n", cn.c_str(), fps.size(), ci->arity);
@@ -14986,6 +15029,13 @@ struct Translator {
       col_nc[c] = NC + NB;
       col_ncc[c] = NC;
     }
+    // Inline-record columns route through this matcher only when NO column has
+    // constant constructors.  A const/block-mixed column emits an ISINT split +
+    // linear tag tests here, where ocamlc uses a dichotomic integer switcher;
+    // that divergence was masked while inline-record columns bailed outright, so
+    // keep it masked (ident.ml's `compare` -- the target -- is pure-block).
+    if (saw_inline_rec)
+      for (int nc : col_ncc) if (nc > 0) return nullptr;
     // resolve tags per row/alt/col
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
       auto& sr = srcs[ri];
@@ -15025,7 +15075,8 @@ struct Translator {
     // (is_alias_dup) and keeps otherwise, exactly upstream's bind_alias residue.
     struct RowVar { std::string name; const Pattern* node;
                     std::vector<std::pair<int, int>> occ; Ident id;
-                    int nalts = 1; };  // >1: a COLUMN-level or's var, occ per leaf
+                    int nalts = 1;      // >1: a COLUMN-level or's var, occ per leaf
+                    const CtorInfo* ci = nullptr; };  // whole inline-record bind
     std::vector<std::vector<RowVar>> rowvars(srcs.size());
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
       auto& sr = srcs[ri];
@@ -15040,12 +15091,12 @@ struct Translator {
             ex->occ.push_back({av.col, av.field});
           } else {
             if (av.alt != 0) return nullptr;       // leaf 0 must bind it first
-            rv.push_back({av.name, av.node, {{av.col, av.field}}, {}, av.nalts});
+            rv.push_back({av.name, av.node, {{av.col, av.field}}, {}, av.nalts, av.ci});
           }
           continue;
         }
         if (ex) return nullptr;                    // dup in one alt
-        rv.push_back({av.name, av.node, {{av.col, av.field}}, {}, 1});
+        rv.push_back({av.name, av.node, {{av.col, av.field}}, {}, 1, av.ci});
       }
       for (auto& q : rv)                           // every leaf binds every name
         if ((int)q.occ.size() != q.nalts) return nullptr;
@@ -15096,6 +15147,13 @@ struct Translator {
       if (rv.empty()) { acts.push_back(expr(*srcs[ri].rhs)); continue; }
       bool multi = srcs[ri].alts.size() > 1;
       scope.emplace_back();
+      // Whole inline-record binds (`Local x`): x is a fresh id aliased to the
+      // column value, registered in inline_rec_var_ so `x.name` in the body
+      // resolves its (ambiguous) label via the ctor's rlabels.  Simplif then
+      // substitutes the var-to-var alias away -- matching ocamlc, which reads
+      // the field straight off the scrutinee column.  Restricted to single-alt
+      // rows (see shape validation), so this only fires in the else-branch.
+      std::vector<Lam::Binding> row_alias;
       for (auto& v : rv) {
         if (multi || v.nalts > 1) {                // routed through a handler exit
           // handler exit args reference the field arg vars: make sure they exist
@@ -15103,11 +15161,23 @@ struct Translator {
           for (auto& [oc, of] : v.occ) if (of >= 0) getfid(oc, of, v.name);
         } else if (v.occ[0].second >= 0) {
           scope.back()[v.name] = getfid(v.occ[0].first, v.occ[0].second, v.name);
+        } else if (v.ci) {                          // whole inline-record bind
+          Ident xid = fresh(v.name);
+          inline_rec_var_[xid.stamp] = v.ci;
+          scope.back()[v.name] = xid;
+          Lam::Binding b; b.id = xid; b.kind = ValueKind::Gen;
+          b.val = varof(comps[v.occ[0].first]->var); b.alias = true;
+          row_alias.push_back(std::move(b));
         } else {
           scope.back()[v.name] = comps[v.occ[0].first]->var;
         }
       }
-      acts.push_back(expr(*srcs[ri].rhs));
+      LamPtr act = expr(*srcs[ri].rhs);
+      if (!row_alias.empty()) {
+        auto l = mk(Lam::K::Let); l->bindings = std::move(row_alias);
+        l->body = act; act = l;
+      }
+      acts.push_back(act);
       scope.pop_back();
     }
     oc_nc_ = col_nc;
