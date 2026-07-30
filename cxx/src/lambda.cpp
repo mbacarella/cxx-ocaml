@@ -15190,8 +15190,13 @@ struct Translator {
     std::vector<const Pattern*> ca_cols;   // catch-all's k column patterns (tuple form)
     std::vector<std::pair<const Row*, std::vector<std::vector<const Pattern*>>>> srcs;
     for (size_t i = 0; i < vrows.size(); ++i) {
-      if (vrows[i].guard) return nullptr;
-      if (i + 1 == vrows.size() && is_catchall(*vrows[i].lhs)) {
+      // A `when` guard stays a normal (guarded) row -- threaded into MRow.guard
+      // below and tested at the matrix leaf, falling through on guard-fail --
+      // rather than blocking multi-column matching (mirrors gmatch_top, which
+      // treats only an UNGUARDED trailing catch-all as the unconditional
+      // default).  This keeps `match e1, e2 with .. when g -> ..` from
+      // allocating the scrutinee tuple just because an arm carries a guard.
+      if (i + 1 == vrows.size() && !vrows[i].guard && is_catchall(*vrows[i].lhs)) {
         if (!std::holds_alternative<Ppat_any>(vrows[i].lhs->desc)) return nullptr;
         catchall = &vrows[i]; break;
       }
@@ -15199,7 +15204,7 @@ struct Translator {
       // unconditionally -- ocamlc peels it as the ONE shared default (all leaf
       // failures exit to it) rather than a normal arm; recognizing only a bare `_`
       // here would instead route each column's gap tags to its own per-branch catch.
-      if (i + 1 == vrows.size()) {
+      if (i + 1 == vrows.size() && !vrows[i].guard) {
         const Pattern* ep = effective_pat(vrows[i].lhs);
         if (auto* tp = std::get_if<Ppat_tuple>(&ep->desc);
             tp && tp->elems.size() == k) {
@@ -15226,6 +15231,33 @@ struct Translator {
       srcs.push_back({&vrows[i], std::move(altcols)});
     }
     if (srcs.empty()) return nullptr;
+    // Guarded rows with a nested RECORD column bail to the allocating fallback.
+    // A guard forces a sibling field of that record to be materialized before the
+    // matrix dispatch, which shifts a nested record sub-pattern's field read in
+    // the tuple/record column decomposition (typecore's `%revapply`/`%apply`
+    // prim match -- `Texp_ident(_,_,{val_kind=Val_prim{prim_name=".."}; val_type})`
+    // with `val_type` used in the guard -- read prim_arity instead of prim_name,
+    // segfaulting a downstream string compare).  Guarded tuple/cons/shallow-ctor
+    // columns (the common guarded tuple match -- typetexp, unify_vars) have no
+    // record sub-pattern and stay on this no-alloc path.
+    std::function<bool(const Pattern*)> has_record = [&](const Pattern* p) -> bool {
+      const Pattern* ep = effective_pat(p);
+      if (std::holds_alternative<Ppat_record>(ep->desc)) return true;
+      if (auto* o = std::get_if<Ppat_or>(&ep->desc))
+        return has_record(o->l.get()) || has_record(o->r.get());
+      if (auto* tp = std::get_if<Ppat_tuple>(&ep->desc)) {
+        for (auto& e : tp->elems) if (has_record(e.get())) return true;
+        return false;
+      }
+      if (auto* k = std::get_if<Ppat_construct>(&ep->desc))
+        return k->arg && has_record(k->arg->get());
+      return false;
+    };
+    for (auto& [row, ac] : srcs)
+      if (row->guard)
+        for (auto& cols : ac)
+          for (auto* cp : cols)
+            if (has_record(cp)) return nullptr;
     // The ambient flat ctor tables are keyed by BARE type names; a local type
     // sharing a column type's short name (typecore's Datatype_kind.t squatting
     // Longident.t -- both `t`) makes gmatch read the wrong (n_const, n_block):
@@ -15271,6 +15303,7 @@ struct Translator {
       for (auto& cols : srcs[i].second) {
         MRow mr; mr.rhs = srcs[i].first->rhs; mr.cols = cols;
         mr.aid = arms[i].aid; mr.vnames = &arms[i].vnames;
+        mr.guard = srcs[i].first->guard;
         mr.row_or = srcs[i].second.size() > 1;
         mrows.push_back(std::move(mr));
       }
