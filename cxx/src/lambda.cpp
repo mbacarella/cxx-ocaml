@@ -15231,33 +15231,6 @@ struct Translator {
       srcs.push_back({&vrows[i], std::move(altcols)});
     }
     if (srcs.empty()) return nullptr;
-    // Guarded rows with a nested RECORD column bail to the allocating fallback.
-    // A guard forces a sibling field of that record to be materialized before the
-    // matrix dispatch, which shifts a nested record sub-pattern's field read in
-    // the tuple/record column decomposition (typecore's `%revapply`/`%apply`
-    // prim match -- `Texp_ident(_,_,{val_kind=Val_prim{prim_name=".."}; val_type})`
-    // with `val_type` used in the guard -- read prim_arity instead of prim_name,
-    // segfaulting a downstream string compare).  Guarded tuple/cons/shallow-ctor
-    // columns (the common guarded tuple match -- typetexp, unify_vars) have no
-    // record sub-pattern and stay on this no-alloc path.
-    std::function<bool(const Pattern*)> has_record = [&](const Pattern* p) -> bool {
-      const Pattern* ep = effective_pat(p);
-      if (std::holds_alternative<Ppat_record>(ep->desc)) return true;
-      if (auto* o = std::get_if<Ppat_or>(&ep->desc))
-        return has_record(o->l.get()) || has_record(o->r.get());
-      if (auto* tp = std::get_if<Ppat_tuple>(&ep->desc)) {
-        for (auto& e : tp->elems) if (has_record(e.get())) return true;
-        return false;
-      }
-      if (auto* k = std::get_if<Ppat_construct>(&ep->desc))
-        return k->arg && has_record(k->arg->get());
-      return false;
-    };
-    for (auto& [row, ac] : srcs)
-      if (row->guard)
-        for (auto& cols : ac)
-          for (auto* cp : cols)
-            if (has_record(cp)) return nullptr;
     // The ambient flat ctor tables are keyed by BARE type names; a local type
     // sharing a column type's short name (typecore's Datatype_kind.t squatting
     // Longident.t -- both `t`) makes gmatch read the wrong (n_const, n_block):

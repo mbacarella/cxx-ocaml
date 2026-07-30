@@ -388,6 +388,7 @@ struct Checker {
   // producer/consumer miscompile).
   std::unordered_map<const void*, TypePtr> ctor_arg_type_;      // expression args
   std::unordered_map<const void*, TypePtr> pat_ctor_arg_type_;  // pattern args
+  std::unordered_map<const void*, TypePtr> pat_record_arg_type_;  // record-pattern ctor args
   // Record decl by identity stamp, for resolving an AMBIGUOUS field projection
   // through the base's inferred type identity (Sign_diff.t.untypables@4).
   std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
@@ -4190,6 +4191,23 @@ struct Checker {
     if (d->kind == I::Type::Kind::Constr && !d->path.empty())
       pat_ctor_arg_type_[arg] = d;
   }
+  // A RECORD pattern used as a constructor's argument (`Val_prim {prim_name=..}`):
+  // pin its record type to the enclosing ctor's DECLARED argument type, so an
+  // ambiguous field label (`prim_name`, in both Primitive.description@0 and
+  // Typedtree.primitive_description@1) resolves by the EXPECTED type rather than
+  // by field-set guessing -- infer_pat on a bare record arg carries no expected
+  // type and can pick the wrong same-labelled record (OCaml's type-directed
+  // record disambiguation).  Producer/consumer parity is not at stake here (a
+  // record arg has one representation), but the FIELD INDEX is: reading
+  // prim_arity (@1) where prim_name (@0) is meant crashes a downstream string
+  // compare.
+  void record_pat_record_arg_type(const Pattern* arg, TypePtr dom) {
+    if (!record_kinds_) return;
+    if (!std::holds_alternative<Ppat_record>(arg->desc)) return;
+    TypePtr d = I::Engine::repr(dom);
+    if (d->kind == I::Type::Kind::Constr && !d->path.empty())
+      pat_record_arg_type_[arg] = d;
+  }
 
   // Resolve a QUALIFIED constructor `M.C` (M a single, non-opened module) to its
   // owning variant type `M.tname`, read from M's cmi.  `M.C` otherwise types as
@@ -6417,9 +6435,14 @@ struct Checker {
           if (k->arg) {
             auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
             if (ps.size() > 1 && tup && tup->elems.size() == ps.size())
-              for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_pat(*tup->elems[i]));
-            else if (!ps.empty()) try_unify(ps[0], infer_pat(**k->arg));
-            else infer_pat(**k->arg);
+              for (size_t i = 0; i < ps.size(); ++i) {
+                try_unify(ps[i], infer_pat(*tup->elems[i]));
+                record_pat_record_arg_type(tup->elems[i].get(), ps[i]);
+              }
+            else if (!ps.empty()) {
+              try_unify(ps[0], infer_pat(**k->arg));
+              record_pat_record_arg_type(k->arg->get(), ps[0]);
+            } else infer_pat(**k->arg);
           }
           return result;
         }
@@ -6443,6 +6466,7 @@ struct Checker {
           for (size_t i = 0; i < ps.size(); ++i) {
             try_unify(ps[i], infer_pat(*tup->elems[i]));
             record_pat_ctor_arg_type(tup->elems[i].get(), ps[i]);
+            record_pat_record_arg_type(tup->elems[i].get(), ps[i]);
           }
         } else if (!ps.empty()) {
           // `C _`: the lone `_` fills every arity slot in the dump (the local
@@ -6452,6 +6476,7 @@ struct Checker {
             construct_any_arity[&p] = (int)ps.size();
           try_unify(ps[0], infer_pat(**k->arg));
           record_pat_ctor_arg_type(k->arg->get(), ps[0]);
+          record_pat_record_arg_type(k->arg->get(), ps[0]);
         } else {
           infer_pat(**k->arg);
         }
@@ -10404,10 +10429,24 @@ ValueKinds infer_value_kinds(const ast::Structure& s) {
     }
     // A record pattern's matched-value type (resolved by unify with the
     // scrutinee): lets the back end disambiguate an ambiguous field by type.
+    // A record pattern that is a constructor's argument gets its type from the
+    // enclosing ctor's DECLARED arg type (authoritative, pinned above) in
+    // preference to the unify-inferred `t` -- infer_pat on a bare record arg
+    // can pick a wrong same-labelled record when a failed unify leaves `t`
+    // pointing at it (Val_prim {prim_name} -> Primitive.description@0, not the
+    // guessed Typedtree.primitive_description@1).
     if (std::holds_alternative<ast::Ppat_record>(p->desc)) {
-      TypePtr r = I::Engine::repr(t);
-      if (r->kind == I::Type::Kind::Constr && !r->path.empty())
-        vk.pat_record_type[p] = r->path;
+      if (auto ra = ck.pat_record_arg_type_.find(p);
+          ra != ck.pat_record_arg_type_.end()) {
+        TypePtr r = I::Engine::repr(ra->second);
+        if (r->kind == I::Type::Kind::Constr && !r->path.empty())
+          vk.pat_record_type[p] = r->path;
+      }
+      if (!vk.pat_record_type.count(p)) {
+        TypePtr r = I::Engine::repr(t);
+        if (r->kind == I::Type::Kind::Constr && !r->path.empty())
+          vk.pat_record_type[p] = r->path;
+      }
     }
   }
   // CONSUMER half of the type-directed ctor-arg disambiguation (mirrors the
