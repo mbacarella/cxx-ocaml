@@ -7155,6 +7155,9 @@ struct Translator {
   // exception `exn` against each case, falling through to (reraise exn).
   LamPtr exn_dispatch(const Ident& exn, const std::vector<Row>& rows, size_t i) {
     if (i >= rows.size()) {
+      if (exn_dispatch_fall_) {  // dispatching a guarded or-pattern's alternatives
+        auto x = mk(Lam::K::Staticraise); x->prim_arg = *exn_dispatch_fall_; return x;
+      }
       auto rr = mk(Lam::K::Prim); rr->prim = Prim::Reraise;
       auto v = mk(Lam::K::Var); v->var = exn; rr->args = {v}; return rr;
     }
@@ -7183,6 +7186,34 @@ struct Translator {
         cat->cond = disp; cat->prim_arg = eid;
         cat->then_ = expr(*c.rhs);
         return cat;
+      }
+      // `with A | B | .. when g -> body`: ocamlc factors the guard into ONE
+      // shared handler -- every alternative's identity test exits to it, the
+      // guard is tested once, and guard-fail / no-match falls to the dispatch
+      // remainder.  Without this each alternative duplicated the guard test and
+      // body (typemod's `Typetexp.Error.In_context | Cmi_format.Error |
+      // Env.Error.In_context | Persistent_env.Error when !typing_recovery`).
+      if (!pattern_binds(lhsp)) {
+        int rest_eid = ++next_exit_;   // no alternative matched / guard failed
+        int act_eid = ++next_exit_;    // an alternative matched: run the guard
+        std::vector<Row> alt_rows;     // the alternatives only, guard stripped
+        for (auto* a : alts) alt_rows.push_back({a, c.rhs, nullptr});
+        exn_shared_exit_[c.rhs] = act_eid;  // each matched alternative -> (exit act)
+        std::optional<int> saved_fall = exn_dispatch_fall_;
+        exn_dispatch_fall_ = rest_eid;      // exhausted alternatives -> (exit rest)
+        LamPtr alts_disp = exn_dispatch(exn, alt_rows, 0);
+        exn_dispatch_fall_ = saved_fall;
+        exn_shared_exit_.erase(c.rhs);
+        auto guarded = mk(Lam::K::IfThenElse);  // the shared handler
+        guarded->cond = expr(*c.guard); guarded->then_ = expr(*c.rhs);
+        auto gfail = mk(Lam::K::Staticraise); gfail->prim_arg = rest_eid;
+        guarded->else_ = gfail;
+        auto inner = mk(Lam::K::Catch);
+        inner->cond = alts_disp; inner->prim_arg = act_eid; inner->then_ = guarded;
+        auto outer = mk(Lam::K::Catch);
+        outer->cond = inner; outer->prim_arg = rest_eid;
+        outer->then_ = exn_dispatch(exn, rows, i + 1);  // subsequent rows / reraise
+        return outer;
       }
       return exn_dispatch(exn, expanded, 0);
     }
@@ -7249,6 +7280,15 @@ struct Translator {
                 }
               }
             }
+        // A NESTED-import exn ctor (`Env.Error.In_context`): its identity is a
+        // field of the submodule's block, read from the head unit's cmi.  Must
+        // run before the bare-name fallback -- else a same-named LOCAL exn
+        // (typetexp's own `Error.In_context`) is picked for BOTH arms of
+        // `with Error.In_context _ | Env.Error.In_context _ ->`, silently
+        // dropping the imported arm.  nested_exn_identity confirms the name is a
+        // typext of that submodule, so it never mis-reads a variant ctor.
+        if (!id0 && std::holds_alternative<Ldot>(k->id.txt.v))
+          id0 = nested_exn_identity(k->id.txt, nullptr);
         if (!id0) id0 = exn_value(lid_last(k->id.txt));
         if (LamPtr id = id0) {
           auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
@@ -7641,6 +7681,11 @@ struct Translator {
   // rhs of a non-binding or-alternation being shared behind a static catch:
   // rows citing it compile to (exit N) instead of duplicating the action.
   std::map<const Expression*, int> exn_shared_exit_;
+  // When set, exn_dispatch's exhausted-rows tail exits here instead of
+  // reraising.  Used to dispatch JUST the alternatives of a guarded or-pattern:
+  // a no-alternative-matched fall-through jumps past the shared guarded handler
+  // (see the guarded shared-exit path in the Ppat_or branch).
+  std::optional<int> exn_dispatch_fall_;
   // rhs shared between a value arm and an exception arm of one mixed
   // value/exception or-pattern (`| exception E | () -> body`): ocamlc emits the
   // body ONCE behind an outer catch and both the value-match arm and the exn
