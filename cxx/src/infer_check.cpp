@@ -3626,6 +3626,63 @@ struct Checker {
     cmi_immediate_memo_[path] = r;
     return r;
   }
+  // Does the cross-module type ABBREVIATION `path` resolve (through its cmi
+  // manifest chain) to the predefined `string`?  `Asttypes.label = string` in
+  // Btype.hash_variant's signature is why a plain `l <> l'` on variant tags must
+  // still specialize to caml_string_notequal.  kind_str's literal `b=="string"`
+  // and is_unboxed_string (unboxed wrappers) both miss a bare abbreviation, so
+  // walk the manifest here -- like cmi_type_is_immediate, but chasing the
+  // manifest to `string` rather than reading td.immediate.  "string" only enables
+  // the string-compare specialization (it is not a value_kind), and a genuine
+  // abbreviation of string has string's runtime representation, so this cannot
+  // mis-specialize.  Memoized; depth-bounded and cycle-guarded.
+  std::unordered_map<std::string, bool> cmi_string_memo_;
+  bool cmi_type_resolves_to_string(const std::string& path, int depth = 0) {
+    if (depth > 8) return false;
+    if (auto it = cmi_string_memo_.find(path); it != cmi_string_memo_.end())
+      return it->second;
+    cmi_string_memo_[path] = false;  // guard a cyclic abbreviation
+    bool r = false;
+    std::vector<std::string> comps = mod_components_str(path);
+    if (comps.size() >= 2) try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+        std::string name = comps[i];
+        int applications = 0;
+        if (auto par = name.find('('); par != std::string::npos) {
+          for (char c : name) applications += c == '(';
+          name = name.substr(0, par);
+        }
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == name) { md = &mm; break; }
+        if (!md) { sig = nullptr; break; }
+        cmi::ModuleTypePtr mt = md->type;
+        for (int a = 0; a < applications && mt; ++a)
+          mt = mt->kind == cmi::ModuleType::Functor ? mt->functor_body : nullptr;
+        sig = module_sig(mt, loaded);
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == comps.back()) {
+            cmi::TypePtr m = td.manifest;
+            while (m && (m->kind == cmi::TypeExpr::Tlink ||
+                         m->kind == cmi::TypeExpr::Tsubst)) m = m->link;
+            if (m && m->kind == cmi::TypeExpr::Tconstr && m->path) {
+              std::string mp = cmi_path_str(*m->path);
+              auto dd = mp.rfind('.');
+              std::string mb = dd == std::string::npos ? mp : mp.substr(dd + 1);
+              if (mb == "string") r = true;
+              else if (dd != std::string::npos)  // a further named abbreviation
+                r = cmi_type_resolves_to_string(mp, depth + 1);
+            }
+            break;
+          }
+    } catch (...) {}
+    cmi_string_memo_[path] = r;
+    return r;
+  }
   // The abstract-without-manifest type names of a CROSS-MODULE named module
   // type ("Identifiable.S", "Map.S"), read from the owning unit's cmi -- the
   // cross-module analog of mty_top_abstract, for a functor param typed by a
@@ -10342,6 +10399,13 @@ static std::string kind_str(const TypePtr& t0, Checker& ck) {
   // "string" is not a value kind either -- it only differs from "addr" in
   // enabling that specialization -- so this cannot change any value_kind.
   if (ck.is_unboxed_string(t->path)) return "string";
+  // A cross-module type abbreviation resolving to string (`Asttypes.label`):
+  // guard against a locally bound module shadowing the head name, as the
+  // immediate case above does.
+  if (d != std::string::npos &&
+      !ck.bound_module_names_.count(t->path.substr(0, t->path.find('.'))) &&
+      ck.cmi_type_resolves_to_string(t->path))
+    return "string";
   // A known boxed type (record/block-variant/string/...): not a value kind, but
   // an `addr` array element (vs a type variable, which is `gen`).
   return "addr";
