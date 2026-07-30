@@ -23983,7 +23983,46 @@ struct Translator {
         // (overwriting an earlier same-named one), so subsequent code resolves
         // them to THIS type
         for (auto& d : td->decls) {
-          if (auto tci = type_ctor_info_.find(d.name.txt); tci != type_ctor_info_.end())
+          // register_types' nested harvest stores a variant under a
+          // DISAMBIGUATED key "t#N" when a same-named sibling type took the bare
+          // "t" slot with a different ctor count (~line 2108).  Keying this
+          // scoped re-registration by the bare name then re-installs the SIBLING's
+          // tags for a shared ctor name -- clflags' `Dump_option.t` `Lambda` /
+          // `Scheduling` (7 ctors) resolved to `Compiler_pass.t`'s (5 ctors) tags
+          // (Lambda 6->2, Scheduling 22->3), silently mis-tagging both the
+          // construct and the match.  Find the harvested key whose recorded tags
+          // match THIS decl's own ctor layout (the harvest only stores the shared
+          // ambiguous ctors, so match on tag, not on the full set).
+          std::string tk = d.name.txt;
+          if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+            std::unordered_map<std::string, std::pair<bool, int>> dtags;
+            int dnc = 0, dnb = 0;
+            for (auto& c : v->ctors) {
+              bool block = true;
+              if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) block = !t->elems.empty();
+              dtags[c.name.txt] = {block, block ? dnb : dnc};
+              if (block) ++dnb; else ++dnc;
+            }
+            auto entry_fits = [&](const std::string& key) {
+              auto f = type_ctor_info_.find(key);
+              if (f == type_ctor_info_.end() || f->second.empty()) return false;
+              for (auto& [cn, ci] : f->second) {
+                auto dt = dtags.find(cn);
+                if (dt == dtags.end() ||
+                    ci.is_block != dt->second.first || ci.tag != dt->second.second)
+                  return false;
+              }
+              return true;
+            };
+            if (!entry_fits(tk))
+              for (auto& [key, lst] : type_ctor_info_) {
+                if (key.compare(0, d.name.txt.size(), d.name.txt) != 0) continue;
+                if (key.size() > d.name.txt.size() &&
+                    key[d.name.txt.size()] != '#') continue;
+                if (entry_fits(key)) { tk = key; break; }
+              }
+          }
+          if (auto tci = type_ctor_info_.find(tk); tci != type_ctor_info_.end())
             for (auto& [cn, ci] : tci->second)
               if (ambiguous_ctors_.count(cn)) ctor_info_[cn] = ci;
           if (auto tfi = type_field_info_.find(d.name.txt); tfi != type_field_info_.end())
