@@ -21481,7 +21481,18 @@ struct Translator {
     // An `?(x=default)` parameter becomes a `*opt*` param plus a body let binding
     // `x = (if *opt* (field_imm 0 *opt*) default)` -- unwrap the option or use the
     // default.  (A `?x` without a default keeps the option itself as the param.)
-    struct OptDef { Ident xid, optid; LamPtr def; ValueKind k; bool discard = false; };
+    struct OptDef {
+      Ident xid, optid; LamPtr def; ValueKind k; bool discard = false;
+      // A tuple-patterned `?((a,b)=default)` routes through the static-catch-
+      // with-values form (like Matching.for_let on a tuple): `tcond` holds the
+      // tail_tuple_exit-transformed `if *opt* .. else default` (each arm exits
+      // texit with the components), and wrap_optdefs binds tvars via the catch.
+      bool tuple_catch = false;
+      int texit = 0;
+      LamPtr tcond;
+      std::vector<Ident> tvars;
+      std::vector<ValueKind> tkinds;
+    };
     std::vector<OptDef> optdefs;
     const Pattern* refut = nullptr; Ident refut_pid; Location refut_loc; int nrefut = 0;
     // A `(module M : S)` parameter shadows S's variant / extension constructors to
@@ -21513,6 +21524,64 @@ struct Translator {
         if (std::holds_alternative<Optional>(pv->label) && pv->default_) {
           const Ppat_var* var = std::get_if<Ppat_var>(&pat->desc);
           bool any = std::holds_alternative<Ppat_any>(pat->desc);
+          // `?((a, b) = default)`: a tuple-patterned optional whose elements are
+          // all plain var/`_`.  ocamlc's Matching.for_let on the unwrapped
+          // `if *opt* then *opt*.0 else default` pushes the tuple deconstruction
+          // into each arm and shares the body through a static catch that RECEIVES
+          // the components (no pair materialized, no re-projection).  Route it
+          // through tail_tuple_exit like the `let (a,b) = match ..` path; fall
+          // back to the *match*-temp form below if a tail is not decomposable
+          // (predef's `?separability:((sep1,sep2) = (Ind, Ind))`).
+          if (!var && !any) {
+            if (auto* tp = std::get_if<Ppat_tuple>(&pat->desc)) {
+              bool eltok = !tp->elems.empty();
+              for (auto& el : tp->elems) {
+                const Pattern* ep = effective_pat(el.get());
+                if (!std::get_if<Ppat_var>(&ep->desc) &&
+                    !std::holds_alternative<Ppat_any>(ep->desc)) { eltok = false; break; }
+              }
+              if (eltok) {
+                Ident optid = fresh("opt", true);
+                l->params.push_back({optid, ValueKind::Gen});
+                LamPtr dlam = expr(*pv->default_->get());  // before binding elems
+                auto optv = varof(optid);
+                auto iff = mk(Lam::K::IfThenElse);   // test on a copy of the default
+                iff->cond = varof(optid);
+                iff->then_ = fieldimm(0, optv);
+                iff->else_ = lam_alloc_copy(*dlam);
+                int n = ++next_exit_;
+                bool save_btc = bind_tuple_cols_, save_opt = tuple_cols_opt_;
+                bind_tuple_cols_ = true; tuple_cols_opt_ = false;
+                bool tte = tail_tuple_exit(iff, n, tp->elems.size());
+                tte = tte && tuple_cols_opt_;
+                bind_tuple_cols_ = save_btc; tuple_cols_opt_ = save_opt;
+                if (tte) {
+                  OptDef od; od.optid = optid; od.tuple_catch = true;
+                  od.texit = n; od.tcond = std::move(iff);
+                  for (auto& el : tp->elems) {
+                    const Pattern* ep = effective_pat(el.get());
+                    Ident id;
+                    if (auto* pvv = std::get_if<Ppat_var>(&ep->desc)) {
+                      id = fresh(pvv->name.txt); scope.back()[pvv->name.txt] = id;
+                    } else id = fresh("", true);
+                    od.tvars.push_back(id); od.tkinds.push_back(pat_kind(ep));
+                  }
+                  optdefs.push_back(std::move(od));
+                  continue;
+                }
+                // Not decomposable (no syntactic-tuple tail): the *match*-temp
+                // form, matching ocamlc's allocating path.  optid is already a
+                // param; bind a temp and its field projections off the untouched
+                // default.
+                Ident xid = fresh("", true);
+                add_param_binders(*pat, varof(xid));
+                OptDef od; od.xid = xid; od.optid = optid;
+                od.def = std::move(dlam); od.k = ValueKind::Gen;
+                optdefs.push_back(std::move(od));
+                continue;
+              }
+            }
+          }
           if (var || any || is_irrefutable(*pat)) {
             Ident optid = fresh("opt", true);  // the `*opt*` parameter
             l->params.push_back({optid, ValueKind::Gen});
@@ -21584,6 +21653,15 @@ struct Translator {
     // Wrap the body with each `?(x=default)` binding (outermost first).
     auto wrap_optdefs = [&](LamPtr body) -> LamPtr {
       for (auto it = optdefs.rbegin(); it != optdefs.rend(); ++it) {
+        if (it->tuple_catch) {  // `?((a,b)=d)`: static-catch-with-values
+          auto cat = mk(Lam::K::Catch);
+          cat->cond = std::move(it->tcond);
+          cat->prim_arg = it->texit;
+          cat->catch_vars = std::move(it->tvars);
+          cat->catch_var_kinds = std::move(it->tkinds);
+          cat->then_ = body; body = cat;
+          continue;
+        }
         auto cond = mk(Lam::K::Var); cond->var = it->optid;
         auto optv = mk(Lam::K::Var); optv->var = it->optid;
         auto iff = mk(Lam::K::IfThenElse);
