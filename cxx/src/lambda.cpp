@@ -25009,16 +25009,17 @@ struct Translator {
             const cmi::Signature* mli_result_sig = pending_functor_coerce_sig_;
             // Eta-placement gate (functor_export_eta_): ocamlc coerces a
             // restricted functor at the unit's EXPORT slot, keeping the body
-            // raw.  Only for a shape we can prove safe: a TOP-LEVEL functor
-            // that is the unit's LAST item (so nothing in the unit can apply
-            // it or read its members against the coerced layout), ONE named
-            // param whose .ml layout equals the .cmi's (no argument coercion
-            // in the wrapper), a plain structure body with no `external`s
-            // (their slots would need eta-stubs, not field reads), and a
-            // result signature of plain values/exceptions (no submodule whose
-            // own layout could need a nested coercion).
+            // raw.  Only for a shape we can prove safe: a TOP-LEVEL functor,
+            // ONE named param whose .ml layout equals the .cmi's (no argument
+            // coercion in the wrapper), a plain structure body with no
+            // `external`s (their slots would need eta-stubs, not field reads),
+            // and a result signature of plain values/exceptions (no submodule
+            // whose own layout could need a nested coercion).  An intra-unit
+            // application (`Local_reduce = Make(..)`) is fine: eta_fired below
+            // keeps functor_result_ / the marker Sig on the RAW body layout so
+            // member reads index the raw block, matching ocamlc.
             if (!pending_functor_coerce_.empty() && mli_result_sig &&
-                saved_mp.find('.') == std::string::npos && &it == &s.back() &&
+                saved_mp.find('.') == std::string::npos &&
                 mli_result_sig->modules.empty()) {
               auto* pf1 = std::get_if<Pmod_functor>(&mb.expr.desc);
               auto* np = pf1 ? std::get_if<Functor_named>(&pf1->param) : nullptr;
@@ -25063,10 +25064,12 @@ struct Translator {
             pending_functor_coerce_sig_ = nullptr;
             mod_path_ = saved_mp;
             exn_path_ = saved_ep;
+            bool eta_fired = false;
             if (!pending_functor_eta_result_.empty()) {
               functor_export_eta_[*mb.name.txt] =
                   std::move(pending_functor_eta_result_);
               pending_functor_eta_result_.clear();
+              eta_fired = true;
             }
             cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
@@ -25076,9 +25079,14 @@ struct Translator {
             // block is coerced to the .mli layout -- so an APPLICATION's member
             // (`SyntacticCompat.compats`) must index into THAT layout, not the
             // raw body's.  Use the .mli result layout for functor_result_.
+            // EXCEPTION: when eta placement kept the body RAW (the coercion is
+            // deferred to the export slot's stub wrapper), an intra-unit
+            // application (`Local_reduce = Make(..)`) reads members against the
+            // RAW body layout -- ocamlc's Tcoerce_functor placement.
             functor_result_[*mb.name.txt] =
-                mli_result_layout.empty() ? module_result_layout(mb.expr)  // for Make(..)
-                                          : mli_result_layout;
+                (mli_result_layout.empty() || eta_fired)
+                    ? module_result_layout(mb.expr)  // for Make(..) / eta raw body
+                    : mli_result_layout;
             functor_param_[*mb.name.txt] = functor_param_layout(mb.expr);   // for arg coercion
             if (auto* pt = functor_param_type(mb.expr)) functor_param_sig_[*mb.name.txt] = pt;
             functor_param_types_[*mb.name.txt] = functor_param_types(mb.expr);  // all params
@@ -25092,7 +25100,9 @@ struct Translator {
             // body was coerced to the .mli layout above -- the marker's result
             // must be the COERCED Sig, not the raw body walk.  Rebuild the
             // marker chain fresh (subtrees may be shared; never mutate).
-            if (mli_result_sig && !mli_result_layout.empty()) {
+            // (Skip under eta placement: the body stays raw, so intra-unit
+            // member resolution must see the RAW result Sig.)
+            if (mli_result_sig && !mli_result_layout.empty() && !eta_fired) {
               modsig::SigPtr res = msig_of_cmi_signature(*mli_result_sig);
               if (res && !res->items.empty()) {
                 std::vector<modsig::Item> chain;
