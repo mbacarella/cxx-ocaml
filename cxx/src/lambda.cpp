@@ -23149,6 +23149,14 @@ struct Translator {
   bool pending_functor_eta_request_ = false;
   std::vector<int> pending_functor_eta_result_;
   std::unordered_map<std::string, std::vector<int>> functor_export_eta_;
+  // When the .mli result has SUBMODULES the flat index map above cannot carry
+  // their nested sub-coercions, so the eta path instead hands back the full
+  // Includemod coercion (the SAME `cc` the fused-body path would apply, just
+  // relocated to the export stub) and the export site replays it on the applied
+  // functor result via apply_msig_coercion.
+  bool pending_functor_eta_coerce_set_ = false;
+  modsig::Coercion pending_functor_eta_coerce_;
+  std::unordered_map<std::string, modsig::Coercion> functor_export_eta_coerce_;
   // Coerce a stdlib/local module VALUE to a target signature layout, eta-stubbing
   // members that are EXTERNALS of the source module (`Int32.neg` = %int32_neg,
   // not a field) and field-reading the rest.  This is how a functor argument's
@@ -23727,26 +23735,53 @@ struct Translator {
         // member, or an identity mapping (no wrapper needed then).
         if (pending_functor_eta_request_) {
           pending_functor_eta_request_ = false;
-          std::vector<int> map2;
-          std::set<std::string> dup;
-          bool ok = sub.size() >= pending.size();
-          if (ok)
-            for (auto& n2 : sub)
-              if (!dup.insert(n2).second) { ok = false; break; }
-          if (ok)
-            for (auto& n2 : pending) {
-              auto p2 = std::find(sub.begin(), sub.end(), n2);
-              if (p2 == sub.end()) { ok = false; break; }
-              map2.push_back((int)(p2 - sub.begin()));
+          // Submodule-bearing result: the flat index map cannot carry the
+          // submodules' own nested sub-coercions, so hand back the full
+          // computed coercion for the export stub to replay on the applied
+          // result (identifiable's `Make` result `S` has Set/Map/Tbl).  This
+          // is the SAME cc the fused-body path (below) would apply to `inner`;
+          // relocating it to the export slot matches ocamlc's Tcoerce_functor.
+          bool has_submods = pending_sig && !pending_sig->modules.empty();
+          if (has_submods && src_msig && modsig::trusted(*src_msig)) {
+            modsig::SigPtr tgt = msig_of_cmi_signature(*pending_sig);
+            if (tgt && !tgt->items.empty() && modsig::trusted(*tgt)) {
+              modsig::Coercion cc = compute_coercion(*src_msig, *tgt);
+              // require it to actually replay on a bare var (else fall through
+              // to the in-place fused coercion, which is always correct).
+              Ident probe = fresh("let");
+              if (cc.ok && !cc.identity && apply_msig_coercion(varof(probe), cc)) {
+                pending_functor_eta_coerce_ = cc;
+                pending_functor_eta_coerce_set_ = true;
+                fn->body = inner;
+                goto functor_body_done;
+              }
             }
-          bool ident2 = ok && sub.size() == pending.size();
-          if (ident2)
-            for (size_t i2 = 0; i2 < map2.size(); ++i2)
-              if (map2[i2] != (int)i2) { ident2 = false; break; }
-          if (ok && !ident2) {
-            pending_functor_eta_result_ = std::move(map2);
-            fn->body = inner;
-            goto functor_body_done;
+          }
+          // The flat index map cannot carry submodule sub-coercions, so it is
+          // only sound when the result has NO submodules; otherwise fall through
+          // to the in-place fused coercion below.
+          if (!has_submods) {
+            std::vector<int> map2;
+            std::set<std::string> dup;
+            bool ok = sub.size() >= pending.size();
+            if (ok)
+              for (auto& n2 : sub)
+                if (!dup.insert(n2).second) { ok = false; break; }
+            if (ok)
+              for (auto& n2 : pending) {
+                auto p2 = std::find(sub.begin(), sub.end(), n2);
+                if (p2 == sub.end()) { ok = false; break; }
+                map2.push_back((int)(p2 - sub.begin()));
+              }
+            bool ident2 = ok && sub.size() == pending.size();
+            if (ident2)
+              for (size_t i2 = 0; i2 < map2.size(); ++i2)
+                if (map2[i2] != (int)i2) { ident2 = false; break; }
+            if (ok && !ident2) {
+              pending_functor_eta_result_ = std::move(map2);
+              fn->body = inner;
+              goto functor_body_done;
+            }
           }
         }
         {
@@ -25011,16 +25046,17 @@ struct Translator {
             // restricted functor at the unit's EXPORT slot, keeping the body
             // raw.  Only for a shape we can prove safe: a TOP-LEVEL functor,
             // ONE named param whose .ml layout equals the .cmi's (no argument
-            // coercion in the wrapper), a plain structure body with no
-            // `external`s (their slots would need eta-stubs, not field reads),
-            // and a result signature of plain values/exceptions (no submodule
-            // whose own layout could need a nested coercion).  An intra-unit
-            // application (`Local_reduce = Make(..)`) is fine: eta_fired below
-            // keeps functor_result_ / the marker Sig on the RAW body layout so
-            // member reads index the raw block, matching ocamlc.
+            // coercion in the wrapper) and a plain structure body with no
+            // `external`s (their slots would need eta-stubs, not field reads).
+            // A submodule-bearing result is allowed too: the eta path hands
+            // back the full Includemod coercion instead of the flat index map,
+            // and the export stub replays its nested sub-coercions (it probes
+            // replayability first, else falls back to the fused body).  An
+            // intra-unit application (`Local_reduce = Make(..)`) is fine:
+            // eta_fired below keeps functor_result_ / the marker Sig on the RAW
+            // body layout so member reads index the raw block, matching ocamlc.
             if (!pending_functor_coerce_.empty() && mli_result_sig &&
-                saved_mp.find('.') == std::string::npos &&
-                mli_result_sig->modules.empty()) {
+                saved_mp.find('.') == std::string::npos) {
               auto* pf1 = std::get_if<Pmod_functor>(&mb.expr.desc);
               auto* np = pf1 ? std::get_if<Functor_named>(&pf1->param) : nullptr;
               bool clean_body = false;
@@ -25069,6 +25105,12 @@ struct Translator {
               functor_export_eta_[*mb.name.txt] =
                   std::move(pending_functor_eta_result_);
               pending_functor_eta_result_.clear();
+              eta_fired = true;
+            }
+            if (pending_functor_eta_coerce_set_) {
+              functor_export_eta_coerce_[*mb.name.txt] =
+                  std::move(pending_functor_eta_coerce_);
+              pending_functor_eta_coerce_set_ = false;
               eta_fired = true;
             }
             cur.push_back({mid, ValueKind::Gen, fv});
@@ -25967,6 +26009,25 @@ struct Translator {
         wf->body = lt;
         exports[wi] = wf;
         functor_export_eta_.erase(fe);
+      }
+    // Same Tcoerce_functor placement for a SUBMODULE-bearing result: the stub
+    // replays the full Includemod coercion (nested sub-coercions and all) on the
+    // applied raw functor result -- `apply_msig_coercion` on the Apply node takes
+    // its general "bind + project" path, producing ocamlc's exact stub shape.
+    if (!functor_export_eta_coerce_.empty())
+      for (size_t wi = 0; wi < exports.size() && wi < export_names.size(); ++wi) {
+        auto fe = functor_export_eta_coerce_.find(export_names[wi]);
+        if (fe == functor_export_eta_coerce_.end()) continue;
+        auto wf = mk(Lam::K::Function); wf->inline_attr = "is_a_functor";
+        Ident pa = fresh("funarg");
+        wf->params.push_back({pa, ValueKind::Gen});
+        auto pav = mk(Lam::K::Var); pav->var = pa;
+        auto ap2 = mk(Lam::K::Apply); ap2->fn = exports[wi]; ap2->args = {pav};
+        if (LamPtr body = apply_msig_coercion(ap2, fe->second)) {
+          wf->body = body;
+          exports[wi] = wf;
+        }
+        functor_export_eta_coerce_.erase(fe);
       }
     if (names) *names = export_names;  // the (deduplicated) export layout, in order
     if (msig_out) {  // modsig P1: the structure's (possibly ascribed) Sig
