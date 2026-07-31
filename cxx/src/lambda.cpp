@@ -26200,7 +26200,22 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.no_pervasives_ = g_nopervasives;
   t.file_name_ = file_name;
   set_infer_stdlib_dir(stdlib_dir);  // the inferencer reads .cmi files too
-  t.vk = infer_value_kinds(s);
+  // This unit's own compiled interface (.mli -> .cmi), when present: lets the
+  // inferencer pin value-restriction weak vars against the declared signature
+  // (Includemod's moregeneral) before value-kind classification.
+  std::string iface_cmi_path;
+  {
+    namespace fs = std::filesystem;
+    fs::path mli = fs::path(file_name); mli.replace_extension(".mli");
+    fs::path cmi = fs::path(file_name); cmi.replace_extension(".cmi");
+    if (fs::exists(mli) && fs::exists(cmi)) {
+      try {
+        if (cmi::CmiFile::load(cmi.string()).module_name() == module_name)
+          iface_cmi_path = cmi.string();
+      } catch (...) {}
+    }
+  }
+  t.vk = infer_value_kinds(s, iface_cmi_path);
   lap("infer_value_kinds");
   t.register_predef_ctor_info();
   t.register_stdlib_ctors();

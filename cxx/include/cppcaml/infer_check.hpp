@@ -156,7 +156,11 @@ struct ValueKinds {
   // strength -- only a proven Total carries that license.
   std::set<const void*> total_proven;
 };
-ValueKinds infer_value_kinds(const ast::Structure& s);
+// `iface_cmi_path`, when non-empty, names this unit's own compiled interface
+// (.mli -> .cmi): value-restriction weak vars in exported bindings are pinned
+// against it (Includemod's moregeneral), so comparisons over them specialize.
+ValueKinds infer_value_kinds(const ast::Structure& s,
+                             const std::string& iface_cmi_path = "");
 
 // Directory holding the compiled stdlib .cmi files the inferencer consults
 // (default "stdlib", relative to the CWD -- callers that run from elsewhere,

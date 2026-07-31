@@ -10461,11 +10461,56 @@ static bool array_elem_str(const TypePtr& t0, Checker& ck, std::string& out) {
   return true;
 }
 
-ValueKinds infer_value_kinds(const ast::Structure& s) {
+// Any reachable non-generalized (value-restriction "weak") type variable: the
+// signature of an exported binding whose type still carries such a var can pin it
+// against the unit's interface below.
+static bool type_has_weak_var(const TypePtr& t0, std::set<I::Type*>& seen) {
+  TypePtr t = I::Engine::repr(t0);
+  if (!seen.insert(t.get()).second) return false;
+  using K = I::Type::Kind;
+  switch (t->kind) {
+    case K::Var: return t->level != I::GENERIC_LEVEL;
+    case K::Arrow:
+      return type_has_weak_var(t->dom, seen) || type_has_weak_var(t->cod, seen);
+    default:
+      for (auto& a : t->args)
+        if (type_has_weak_var(a, seen)) return true;
+      return false;
+  }
+}
+
+ValueKinds infer_value_kinds(const ast::Structure& s,
+                             const std::string& iface_cmi_path) {
   Checker ck;
   ck.record_kinds_ = true;
   ck.collect_type_kinds(s);  // file-wide concrete/abstract type-decl kinds (array_kind_str)
   run_checker(ck, s);
+  // Pin value-restriction weak vars in exported bindings against this unit's own
+  // interface, mirroring Includemod's moregeneral: `all_passes = ref []` is
+  // `'_weak list ref` in the .ml but the .mli declares `string list ref`; ocamlc
+  // unifies the two during signature matching, pinning `'_weak := string` BEFORE
+  // translation, so an eta-expanded comparison over it (`List.filter ((<>) s)`)
+  // specializes to caml_string_notequal.  Only weak (non-generalized) vars are
+  // touched: instantiate() shares them while refreshing generic vars, so a
+  // polymorphic `let f x = x : 'a -> 'a` matched against a monomorphic .mli
+  // signature is unaffected.  Guarded throughout -- a genuine mismatch (or a
+  // missing/foreign cmi) is diagnosed by the real signature check, not here.
+  if (!iface_cmi_path.empty()) {
+    try {
+      const auto& c = cmi::CmiFile::load(iface_cmi_path);
+      for (auto& v : c.values()) {
+        if (!v.prim.empty() || !v.type) continue;  // externals: no runtime binding
+        auto f = ck.venv.back().find(v.name);
+        if (f == ck.venv.back().end()) continue;
+        std::set<I::Type*> seen;
+        if (!type_has_weak_var(f->second, seen)) continue;
+        std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+        TypePtr mli_ty = ck.from_cmi(v.type, memo);
+        try { ck.eng.unify(ck.eng.instantiate(f->second), mli_ty); }
+        catch (...) {}
+      }
+    } catch (...) {}
+  }
   ck.resolve_pending_fields();  // re-resolve ambiguous field reads with final types
   ck.resolve_pending_disambig();  // ctor disambiguation with post-fixpoint types
   ValueKinds vk;
