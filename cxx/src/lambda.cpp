@@ -6964,6 +6964,54 @@ struct Translator {
       }
     }
   }
+  // Parse a scanf `%[...]` character set: `i` points just past the '[' (at the
+  // first char inside the brackets).  Mirrors CamlinternalFormat.parse_char_set
+  // exactly (leading '^' negates; the first char -- even ']' -- is a literal;
+  // 'a-z' is a range; '%%'/'%@' escape inside the set), freezing the result to a
+  // 32-byte bitmap (bit `c land 7` of byte `c lsr 3`).  On success sets `i` to
+  // the index just past the closing ']' and fills `bitmap`; false on a malformed
+  // set, so the caller falls back to the plain string.
+  static bool fmt_char_set(const std::string& s, size_t& i, size_t end,
+                           std::string& bitmap) {
+    unsigned char bm[32] = {0};
+    auto add = [&](unsigned char c) { bm[c >> 3] |= (unsigned char)(1u << (c & 7)); };
+    auto add_range = [&](unsigned char a, unsigned char b) {
+      for (int k = a; k <= (int)b; ++k) add((unsigned char)k);
+    };
+    if (i >= end) return false;
+    bool reverse = false;
+    if (s[i] == '^') { reverse = true; ++i; }
+    if (i >= end) return false;
+    unsigned char c = (unsigned char)s[i]; ++i;  // first char is always a literal
+    int state = 1;  // 0 = content, 1 = after_char(c), 2 = after_minus(c)
+    while (true) {
+      if (i >= end) return false;
+      char ch = s[i];
+      if (state == 0) {                              // parse_char_set_content
+        if (ch == ']') { ++i; break; }
+        if (ch == '-') { add('-'); ++i; continue; }
+        c = (unsigned char)ch; ++i; state = 1; continue;
+      } else if (state == 1) {                       // parse_char_set_after_char
+        if (ch == ']') { add(c); ++i; break; }
+        if (ch == '-') { ++i; state = 2; continue; }
+        if ((ch == '%' || ch == '@') && c == '%') { add((unsigned char)ch); ++i; state = 0; continue; }
+        if (c == '%') return false;                  // '%' alone rejected in a set
+        add(c); c = (unsigned char)ch; ++i; state = 1; continue;
+      } else {                                        // parse_char_set_after_minus
+        if (ch == ']') { add(c); add('-'); ++i; break; }
+        if (ch == '%') {
+          if (i + 1 >= end) return false;
+          char c2 = s[i + 1];
+          if (c2 == '%' || c2 == '@') { add_range(c, (unsigned char)c2); i += 2; state = 0; continue; }
+          return false;
+        }
+        add_range(c, (unsigned char)ch); ++i; state = 0; continue;
+      }
+    }
+    if (reverse) for (int k = 0; k < 32; ++k) bm[k] ^= 0xFF;  // rev_char_set
+    bitmap.assign((const char*)bm, 32);
+    return true;
+  }
   // After '%': flags, padding, precision, length modifier, conversion.
   LamPtr fmt_parse_pct(const std::string& s, size_t i, size_t end) {
     if (i >= end) return nullptr;
@@ -7018,6 +7066,28 @@ struct Translator {
     if ((s[i] == 'l' || s[i] == 'n' || s[i] == 'L') && i + 1 < end &&
         std::string_view("dixXou").find(s[i + 1]) != std::string_view::npos) { len = s[i]; ++i; }
     char conv = s[i]; ++i;
+    // `%[...]` scanf char set -> Scan_char_set(20) of (width_opt, bitmap, rest).
+    // The bracketed set parses exactly as CamlinternalFormat.parse_char_set and
+    // freezes to a 32-byte bitmap; width_opt is get_pad_opt of the padding
+    // (No_padding -> None, Lit_padding(Right,w) -> Some w).  A precision, length
+    // modifier, or other padding (Left/Zeros/`*`) falls back to the plain string.
+    if (conv == '[') {
+      if (len != 0) return nullptr;
+      if (!(prec->k == Lam::K::ConstInt && prec->int_val == 0)) return nullptr;
+      LamPtr width_opt;
+      if (pad->k == Lam::K::ConstInt && pad->int_val == 0) width_opt = cint(0);  // None
+      else if (pad->k == Lam::K::ConstBlock && pad->prim_arg == 0 &&
+               pad->args.size() == 2 && pad->args[0]->k == Lam::K::ConstInt &&
+               pad->args[0]->int_val == 1)  // Lit_padding(Right, w) -> Some w
+        width_opt = cblock(0, {pad->args[1]});
+      else return nullptr;
+      std::string bitmap;
+      size_t k = i;
+      if (!fmt_char_set(s, k, end, bitmap)) return nullptr;
+      LamPtr r = fmt_parse(s, k, end);
+      if (!r) return nullptr;
+      return cblock(20, {width_opt, cstr(bitmap), r});
+    }
     // `%(...%)` format substitution -> Format_subst(14) of (pad_option, fmtty,
     // continuation).  Only the empty inner form `%(%)` is lowered: its fmtty is
     // End_of_fmtty (the sole constant fmtty_rel ctor = int 0), and a width-less
