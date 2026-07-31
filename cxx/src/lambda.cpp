@@ -10104,9 +10104,11 @@ struct Translator {
       }
       Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = acc;
       if (is_mut_field_access(acc)) { b.strict_opt = true; body = wraplet(b, body); }
-      else if (is_field_access(acc) && body->k == Lam::K::IfThenElse &&
-               body->cond && body->cond->k == Lam::K::Var &&
-               sibling_binder(binders, body->cond->var)) {
+      else if (is_field_access(acc) && body->k == Lam::K::IfThenElse && body->cond &&
+               ((body->cond->k == Lam::K::Var &&
+                 sibling_binder(binders, body->cond->var)) ||
+                (field_root_stamp(body->cond) >= 0 &&
+                 field_root_stamp(body->cond) == field_root_stamp(acc)))) {
         // ocamlc bind_checks every pattern bind at match time, so an Alias
         // field read sinks (lower_bind) into the single branch using it when
         // the test and other branches are transparent.  On our fully-compiled
@@ -10114,7 +10116,13 @@ struct Translator {
         // tree), so sink ONLY through the destructure's own column dispatch:
         // an if testing a SIBLING binder's var -- `fun (name, crco) -> match
         // crco with None -> .. | Some c -> ..name..` reads field 0 only
-        // inside the Some branch.
+        // inside the Some branch -- OR testing another FIELD of the same
+        // aggregate (`fun (b, i) -> if b then ..i.. else 0`, switch.ml): when
+        // the sibling field-0 binder is single-use it is inlined into the cond
+        // first, leaving `if (field_imm 0 aggr)` in place of the Var, so match
+        // on the same root.  lower_bind still sinks only past a transparent
+        // test into the lone using branch, else wraps at top (identical to the
+        // else path below) -- so broadening the trigger cannot mis-sink.
         body = lower_bind(id, ValueKind::Gen, acc, body);
       } else {
         b.alias = is_field_access(acc);
