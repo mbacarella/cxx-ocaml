@@ -23657,21 +23657,36 @@ struct Translator {
       // the body (the SCOPED answer to `X.foo` path resolution; popped below).
       menv_.push_frame();
       const ModuleExpr* cur = &me;
+      // Collect the nested functor params outer-to-inner (`Pair(A)(B)` ->
+      // [A;B]).  ocamlc's Translmod.compile_functor renames each parameter
+      // (`param' = Ident.rename param`) AFTER translating the body, and folds
+      // over the REVERSED param list, so the INNER param is renamed first and
+      // gets the SMALLER stamp -- a closure capturing several params then lists
+      // them inner-first (`Pair(A)(B)`'s member closures ENVACC B before A).
+      // Ident.rename ALWAYS yields a Local ident stamped after every body ident,
+      // so a param sorts LAST among a closure's Local free vars (not first like
+      // a Scoped binder): model it as Local + late, not Scoped.
+      std::vector<std::pair<std::string, const Pmod_functor*>> plist;
       while (auto* pf = std::get_if<Pmod_functor>(&cur->desc)) {
         std::string nm = "*";
         const Functor_named* fp = std::get_if<Functor_named>(&pf->param);
         if (fp) nm = fp->name.txt ? *fp->name.txt : "_";  // anonymous param prints `_`
-        // ocamlc's Translmod.compile_functor renames each functor parameter
-        // (`param' = Ident.rename param`) AFTER translating the body, and
-        // Ident.rename ALWAYS yields a Local ident with a fresh stamp -- even for
-        // a Scoped typedtree param.  Simplif then inlines the `Llet Alias param =
-        // param'`, so the ident captured by the body's inner closures is that
-        // renamed param': Local, and stamped after every body ident.  So a
-        // functor param sorts LAST among a closure's Local free vars (not first
-        // like a Scoped module binder).  Model it as Local + late, not Scoped.
-        Ident pid = fresh(nm); pid.late = true;
-        // Bind the parameter X (with its signature's value layout) so `X.foo`
-        // inside the body resolves to `(field_imm i X)`.  Save/restore for nesting.
+        plist.push_back({nm, pf});
+        cur = pf->body.get();
+      }
+      // Allocate the (late) param idents inner-to-outer, matching the reverse
+      // rename fold above; single-param functors are unaffected.
+      std::vector<Ident> pids(plist.size());
+      for (int i = (int)plist.size() - 1; i >= 0; --i) {
+        pids[i] = fresh(plist[i].first); pids[i].late = true;
+      }
+      // Bind each param in declaration (outer-to-inner) order so an inner param
+      // correctly shadows an outer one for `X.foo` path resolution.
+      for (size_t i = 0; i < plist.size(); ++i) {
+        const std::string& nm = plist[i].first;
+        const Functor_named* fp = std::get_if<Functor_named>(&plist[i].second->param);
+        Ident pid = pids[i];
+        // Save/restore for nesting.
         saves.push_back({nm, module_ident_.count(nm) != 0,
                          module_ident_.count(nm) ? module_ident_[nm] : Ident{},
                          module_layout_[nm]});
@@ -23694,7 +23709,6 @@ struct Translator {
           register_param_value_sigs(nm, *fp->type);
         }
         fn->params.push_back({pid, ValueKind::Gen});
-        cur = pf->body.get();
       }
       // If the enclosing binding requested a result coercion (.mli `module Make
       // (..) : S`, the .ml has no `: S`), lay the body struct out per S's field
