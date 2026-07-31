@@ -8527,6 +8527,48 @@ struct Translator {
     if (partial) return;
     l = common;
   }
+  // A cond whose evaluation has no observable effect, so an `if` testing it can
+  // be dropped when both arms are identical: a Var/const, or an immutable field
+  // read off such (matcher discriminators are exactly these).  Reading a field
+  // never has a side effect, so dropping the read is sound.
+  static bool is_pure_disc(const LamPtr& c) {
+    if (!c) return false;
+    switch (c->k) {
+      case Lam::K::Var: case Lam::K::ConstInt: case Lam::K::ConstChar:
+      case Lam::K::ConstFloat: case Lam::K::ConstString: case Lam::K::ConstBlock:
+        return true;
+      case Lam::K::Prim:
+        return (c->prim == Prim::FieldImm || c->prim == Prim::FieldInt) &&
+               !c->args.empty() && is_pure_disc(c->args[0]);
+      default:
+        return false;
+    }
+  }
+  // Drop an invariant discriminator: `if <pure read> then e else e'` whose arms
+  // are byte-identical (same make_lam_key, exit ids and binder stamps included)
+  // collapses to the arm.  ocamlc's matcher only tests columns that discriminate
+  // between distinct actions, so it never emits such a test; where our decision
+  // tree over-tests an invariant column (mtype's `if f3 (if f4 A B) (if f4 B B)`
+  // -- the f3=false arm tests f4 though both outcomes are B) this brings us back
+  // in line.  Runs BEFORE simplify_static_catches so exit counts match ocamlc's.
+  void collapse_equal_if(LamPtr& l) {
+    if (!l) return;
+    collapse_equal_if(l->fn);
+    collapse_equal_if(l->body);
+    collapse_equal_if(l->cond);
+    collapse_equal_if(l->then_);
+    collapse_equal_if(l->else_);
+    collapse_equal_if(l->sw_default);
+    for (auto& a : l->args) collapse_equal_if(a);
+    for (auto& b : l->bindings) collapse_equal_if(b.val);
+    for (auto& sc : l->sw_consts) collapse_equal_if(sc.body);
+    for (auto& sc : l->sw_blocks) collapse_equal_if(sc.body);
+    if (l->k == Lam::K::IfThenElse && l->then_ && l->else_ && is_pure_disc(l->cond)) {
+      std::string k = cppcaml::lambda::make_lam_key(l->then_, /*exit_aware=*/true);
+      if (!k.empty() && k == cppcaml::lambda::make_lam_key(l->else_, /*exit_aware=*/true))
+        l = l->then_;
+    }
+  }
   // Lower an exhaustive two-constant switch (tags 0 and 1, no blocks, no default)
   // to a truthy `if`.  ocamlc's Switcher always emits a single test (BRANCHIFNOT),
   // never a jump table, for two dense constants -- the same rule const_switch
@@ -26089,6 +26131,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   lap("build_module");
   LamPtr root = sg;
   t.simplify_local_functions(root);
+  t.collapse_equal_if(root);
   t.simplify_static_catches(root);
   t.beta_reduce_applied(root);
   t.inline_var_aliases(root);
