@@ -10027,25 +10027,52 @@ struct Translator {
       std::set<size_t> sunk;
       for (auto& [r, idxs] : byroot) {
         if (idxs.size() < 2) continue;
-        // Every peer must be multi-use and confined to exactly one branch (the
-        // same one for the whole group); cond must not mention any of them.
+        // Keep the peers that are multi-use and confined to exactly one branch;
+        // a peer used in cond -- a sibling field read that is the leading
+        // match's scrutinee (`match fv2` of `fun (index,fv1,fv2) -> ..`) -- or
+        // spanning both branches stays at the top for the main fold.  Group-sink
+        // the survivors (>=2, sharing ONE branch) in reverse binder order so
+        // their field reads keep ocamlc's descending order: the one-at-a-time
+        // lower_bind path below would instead nest each fresh sink BELOW the
+        // previous one, inverting `fv1;index` (field 1 then 0) to `index;fv1`.
+        // A peer in two branches makes the destination ambiguous -- sink none.
         int branch = -1;  // 0 = then, 1 = else
-        bool ok = true;
+        std::vector<size_t> keep;
+        bool ambiguous = false;
         for (size_t i : idxs) {
           const Ident& id = binders[i].first;
-          if (count_var(body, id) <= 1) { ok = false; break; }
-          if (approx_present(id, body->cond)) { ok = false; break; }
+          if (count_var(body, id) <= 1) continue;
+          if (approx_present(id, body->cond)) continue;
           bool pt = approx_present(id, body->then_);
           bool pe = approx_present(id, body->else_);
           int b = (pt && !pe) ? 0 : (pe && !pt) ? 1 : -1;
-          if (b < 0 || (branch >= 0 && b != branch)) { ok = false; break; }
-          branch = b;
+          if (b < 0) { ambiguous = true; break; }
+          if (branch >= 0 && b != branch) { ambiguous = true; break; }
+          branch = b; keep.push_back(i);
         }
-        if (!ok || branch < 0) continue;
-        LamPtr& arm = branch == 0 ? body->then_ : body->else_;
-        for (auto it = idxs.rbegin(); it != idxs.rend(); ++it) {
+        if (ambiguous || keep.size() < 2 || branch < 0) continue;
+        // The branch may begin with the scrutinee's OWN decomposition binders
+        // (`fv::fv2` binds the cons head/tail as field reads off cond), which
+        // ocamlc emits BEFORE the sunk outer fields.  Descend past leading
+        // alias-lets whose bindings are all field reads of the cond var, then
+        // insert the group there -- wrapping at the arm top instead would put
+        // the outer fields ahead of the match's own binders (typedecl_variance's
+        // `fv2;fv1;index` became `fv1;index;fv2`).
+        int cond_stamp = (body->cond && body->cond->k == Lam::K::Var)
+                             ? body->cond->var.stamp : -1;
+        LamPtr* slot = branch == 0 ? &body->then_ : &body->else_;
+        if (cond_stamp >= 0)
+          while ((*slot)->k == Lam::K::Let) {
+            bool from_cond = !(*slot)->bindings.empty();
+            for (auto& b : (*slot)->bindings)
+              if (!b.alias || !is_field_access(b.val) ||
+                  field_root_stamp(b.val) != cond_stamp) { from_cond = false; break; }
+            if (!from_cond) break;
+            slot = &(*slot)->body;
+          }
+        for (auto it = keep.rbegin(); it != keep.rend(); ++it) {
           auto& [id, acc] = binders[*it];
-          arm = wraplet({id, ValueKind::Gen, acc, true}, arm);
+          *slot = wraplet({id, ValueKind::Gen, acc, true}, *slot);
           sunk.insert(*it);
         }
       }
