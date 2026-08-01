@@ -2976,9 +2976,32 @@ struct Checker {
   // is marked immediate -> the [int] value kind).  Skips names already known
   // (predef wins) or ambiguous across stdlib types; constant ctors only (block
   // ctors need parameter handling and are left to Any).
+  // Bind a cmi record decl's OWN parameters to the base expression's type
+  // arguments, so a polymorphic field reads at the instance type: `txt` of
+  // `string Asttypes.loc` is `string`, not a fresh var (which would leave
+  // typedecl's `name = pld.pld_name.txt` a polymorphic caml_equal).  A no-op
+  // unless the arities line up.  from_cmi memoizes on the LINK-FOLLOWED node,
+  // so follow links here too.
+  static void seed_decl_params(std::unordered_map<cmi::TypeExpr*, TypePtr>& memo,
+                               const cmi::TypeDecl& td,
+                               const std::vector<TypePtr>& args) {
+    if (args.size() != td.params.size()) return;
+    for (size_t i = 0; i < td.params.size(); ++i) {
+      const cmi::TypeExpr* n = td.params[i].get();
+      while (n && (n->kind == cmi::TypeExpr::Tlink || n->kind == cmi::TypeExpr::Tsubst))
+        n = n->link.get();
+      if (n && (n->kind == cmi::TypeExpr::Tvar || n->kind == cmi::TypeExpr::Tunivar))
+        memo[const_cast<cmi::TypeExpr*>(n)] = args[i];
+    }
+  }
   // The declared type of a stdlib (sub)module's record field (e.g. Gc.control's
   // `minor_heap_size`), instantiated into our type universe; null if not found.
-  TypePtr stdlib_field_type(const std::string& mod, const std::string& label) {
+  // The lookup is by LABEL alone, so `inst` (the base's type arguments) is
+  // applied only when the record we land on is the base's own -- `tyname` names
+  // it; empty leaves the field's declared type unsubstituted, as before.
+  TypePtr stdlib_field_type(const std::string& mod, const std::string& label,
+                            const std::string& tyname = "",
+                            const std::vector<TypePtr>* inst = nullptr) {
     try {
       const auto& cmi = cmi::CmiFile::load(head_cmi(mod));
       for (auto& td : cmi.types()) {
@@ -2986,6 +3009,8 @@ struct Checker {
         for (auto& l : td.labels)
           if (l.name == label) {
             std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            if (inst && !tyname.empty() && td.name == tyname)
+              seed_decl_params(memo, td, *inst);
             return from_cmi(l.type, memo);
           }
       }
@@ -3000,7 +3025,8 @@ struct Checker {
   // comparison/kind specialization).  Handles the wrapped-stdlib multi-component
   // path (`Stdlib.Lexing.position`) that stdlib_field_type's single-module lookup
   // cannot -- otherwise `loc.loc_start.pos_lnum` chains leak a fresh var.
-  TypePtr typepath_field_type(const std::string& typepath, const std::string& label) {
+  TypePtr typepath_field_type(const std::string& typepath, const std::string& label,
+                              const std::vector<TypePtr>* inst = nullptr) {
     auto tpos = typepath.rfind('.');
     if (tpos == std::string::npos) return nullptr;
     std::string tyname = typepath.substr(tpos + 1);
@@ -3015,6 +3041,7 @@ struct Checker {
         for (auto& l : td.labels)
           if (l.name == label) {
             std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            if (inst) seed_decl_params(memo, td, *inst);
             return from_cmi(l.type, memo);
           }
       }
@@ -7646,14 +7673,16 @@ struct Checker {
           if (dpos != std::string::npos &&
               rb->path.find('.') == dpos)  // single-module prefix
             if (TypePtr ft = stdlib_field_type(rb->path.substr(0, dpos),
-                                               lid_last(fld->field.txt)))
+                                               lid_last(fld->field.txt),
+                                               rb->path.substr(dpos + 1), &rb->args))
               return ft;
           // A wrapped-stdlib / nested type path (`Stdlib.Lexing.position`): resolve
           // through the leaf module, verifying the record's type name -- so a
           // chained `loc.loc_start.pos_lnum` gets `int`, not a fresh var (which
           // would leave `startline = endline` a polymorphic caml_equal).
           if (rb->path.find('.') != dpos)
-            if (TypePtr ft = typepath_field_type(rb->path, lid_last(fld->field.txt)))
+            if (TypePtr ft = typepath_field_type(rb->path, lid_last(fld->field.txt),
+                                                 &rb->args))
               return ft;
         }
       }
