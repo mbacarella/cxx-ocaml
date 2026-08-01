@@ -12712,6 +12712,29 @@ static cmi::cmiw::Loc rloc_to_loc(const cmi::RLoc& r) {
   return l;
 }
 static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td);
+// A Sig_typext decoded from a cmi -> the writer's item.  An inline-record
+// payload (`exception Inconsistency of { unit_name : ..; .. }`) must survive
+// the round trip: a spliced signature that drops it re-exports the exception as
+// NULLARY, so a consumer matching `M.E { .. }` reads fields off a payload-less
+// block (persistent_env's Consistbl -> segfault in the bootstrapped compiler).
+static cmi::cmiw::SigItem cmi_typext_to_item(const cmi::ExtConstructor& x) {
+  std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
+  if (x.is_inline_record) {
+    // ONE sharing map across the payload, like cmi_type_to_item's record path.
+    std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
+    std::vector<cmi::cmiw::Label> ls;
+    for (auto& l : x.inline_record) {
+      cmi::cmiw::Label lw{l.name, l.mutable_, false,
+                          conv_cmi_ty(l.type, vars, nv, &nodes)};
+      lw.loc = rloc_to_loc(l.loc);
+      ls.push_back(std::move(lw));
+    }
+    return cmi::cmiw::sig_exception_record(x.name, std::move(ls));
+  }
+  std::vector<cmi::cmiw::TyPtr> args;
+  for (auto& a : x.args) args.push_back(conv_cmi_ty(a, vars, nv));
+  return cmi::cmiw::sig_exception(x.name, std::move(args));
+}
 static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
                                              const cmi::ModuleDecl& md,
                                              const std::string& origin,
@@ -12778,14 +12801,9 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
           out.push_back(std::move(mit));
           break;
         }
-        case cmi::Signature::OrderEnt::Typext: {
-          auto& x = sig.typexts.at(oe.idx);
-          std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
-          std::vector<cmi::cmiw::TyPtr> args;
-          for (auto& a : x.args) args.push_back(conv_cmi_ty(a, vars, nv));
-          out.push_back(cmi::cmiw::sig_exception(x.name, std::move(args)));
+        case cmi::Signature::OrderEnt::Typext:
+          out.push_back(cmi_typext_to_item(sig.typexts.at(oe.idx)));
           break;
-        }
       }
     }
     return out;
@@ -12829,10 +12847,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
       mit.loc = rloc_to_loc(it->second->loc);
       out.push_back(std::move(mit));
     } else if (auto it = xmap.find(fn); it != xmap.end()) {
-      std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
-      std::vector<cmi::cmiw::TyPtr> args;
-      for (auto& a : it->second->args) args.push_back(conv_cmi_ty(a, vars, nv));
-      out.push_back(cmi::cmiw::sig_exception(fn, std::move(args)));
+      out.push_back(cmi_typext_to_item(*it->second));
     }
   }
   return out;
@@ -13217,6 +13232,9 @@ static std::vector<cmi::cmiw::SigItem> cmi_modtype_items(
 static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
                                 const std::string& app,
                                 bool aliasable = false);
+static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
+    const std::string& name, const ast::ModuleExpr& me,
+    const std::vector<cmi::cmiw::SigItem>* prior, Checker* ckp);
 // depth_bias: how many scope levels the `items` vector itself sits BELOW the
 // scope where the constraint was written -- 1 when they become a module's sub
 // (`module Map : Map.S with type ..`), 0 when spliced flat by an include.
@@ -14122,6 +14140,29 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
                       break;
                     }
               }
+            // `module Consistbl : module type of struct include Consistbl.Make
+            // (Misc.Stdlib.String) end` (persistent_env.mli): the signature is
+            // the functor APPLICATION's, which module_binding_sigitem already
+            // builds for the `.ml` binding form (result items from the
+            // functor's cmi, parameter substitution, path strengthening).
+            // Without it the submodule stayed an EMPTY sig, so the .cmo's
+            // coercion built an empty block for it and a consumer reading
+            // `Persistent_env.Consistbl.Inconsistency` (topeval) read past its
+            // end.
+            if (mitem.sub.empty()) {
+              const ast::ModuleExpr* app = pto->me.get();
+              if (auto* ms2 = std::get_if<Pmod_structure>(&app->desc);
+                  ms2 && ms2->items.size() == 1)
+                if (auto* inc2 = std::get_if<Pstr_include>(&ms2->items[0].desc))
+                  app = &inc2->expr;
+              if (std::holds_alternative<Pmod_apply>(app->desc) ||
+                  std::holds_alternative<Pmod_apply_unit>(app->desc))
+                if (auto r = module_binding_sigitem(*pm->md.name.txt, *app,
+                                                    g_enclosing_struct_items,
+                                                    &ck);
+                    r && !r->is_functor)
+                  mitem.sub = std::move(r->sub);
+            }
           }
           // `module X : T` where T is a local ABSTRACT modtype (no items to
           // resolve): the Mty_ident reference is still kept (pr6651).
