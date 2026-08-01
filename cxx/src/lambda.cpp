@@ -13277,6 +13277,15 @@ struct Translator {
     for (auto& sc : l->sw_blocks) if (LamPtr* r = find_guard_slot(sc.body, aid)) return r;
     return nullptr;
   }
+  // Depth of the ROOT-CHAIN `let` binding `stamp` (0 = outermost), or -1.  Only
+  // the leading run of lets counts: those dominate every exit site, so a shared
+  // handler nested inside them may reference the binding.
+  static int root_let_depth(const LamPtr& body, int stamp) {
+    int d = 0;
+    for (const Lam* l = body.get(); l && l->k == Lam::K::Let; l = l->body.get(), ++d)
+      for (auto& b : l->bindings) if (b.id.stamp == stamp) return d;
+    return -1;
+  }
   // The slot at which to scope a shared static-catch for exit `aid`, tighter
   // than the body root.  matching.ml scopes a shared catch around exactly the
   // sub-matrix that references it, NOT the whole match; a matcher's exits are in
@@ -13381,6 +13390,10 @@ struct Translator {
       //   already-available value (`current` bound to the tuple temp `*match*`).
       std::vector<LamPtr> reread(a.vnames.size());
       std::vector<std::optional<Ident>> alias(a.vnames.size());
+      // Deepest root-chain `let` whose binding a dropped param now references
+      // (see root_let_depth); -1 = none, so the catch keeps its root placement.
+      int let_ref_depth = -1;
+      std::vector<char> letref(a.vnames.size(), 0);   // alias[k] is such a binding
       auto dropped = [&](size_t k) {
         return (k < reread.size() && reread[k]) || (k < alias.size() && alias[k]);
       };
@@ -13396,6 +13409,18 @@ struct Translator {
             else if (same->stamp != id.stamp || same->name != id.name) { ok = false; break; }
           }
           if (!ok) continue;
+          // A materialized field var bound by a root-chain let is upstream's
+          // bind_check of that column, emitted BEFORE the shared action's
+          // make_catch -- so the handler references the BINDING and the catch
+          // nests inside the let, rather than re-reading the field chain
+          // (shape_reduce's `{ uid; approximated = true } -> Approximated uid`).
+          if (int d = gm_facc_proto_.count(same->stamp)
+                          ? root_let_depth(body, same->stamp) : -1;
+              d >= 0) {
+            alias[k] = *same; letref[k] = 1;
+            if (d > let_ref_depth) let_ref_depth = d;
+            continue;
+          }
           reread[k] = expand_facc_var(*same);        // materialized field chain
           // Else an alias to a plain variable: only reference it directly in the
           // handler when it is AMBIENT (free in the whole match body, hence bound
@@ -13485,7 +13510,7 @@ struct Translator {
         // `if`).  For a plain shared arm keep the body-root placement.
         bool has_alias = false; bool ident_arm = false;
         for (size_t k = 0; k < alias.size(); ++k)
-          if (alias[k]) { has_alias = true;
+          if (alias[k] && !letref[k]) { has_alias = true;
             if (rhs_is_bare_ident(a.rhs, a.vnames[k])) ident_arm = true; }
         if (pend && !has_alias) {   // fill the split-point catch in place
           (*pend)->catch_vars = std::move(cvs);
@@ -13496,6 +13521,9 @@ struct Translator {
         if (pend) { LamPtr t = (*pend)->cond; *pend = t; }  // alias arms keep the
                                                             // calibrated lca path
         LamPtr* slot = has_alias ? lca_exit_slot(&body, a.aid, ident_arm) : &body;
+        // Nest inside the root-chain lets the handler now reads through.
+        for (int d = 0; d <= let_ref_depth && (*slot)->k == Lam::K::Let; ++d)
+          slot = &(*slot)->body;
         auto c = mk(Lam::K::Catch); c->cond = *slot; c->prim_arg = a.aid;
         c->catch_vars = std::move(cvs); c->catch_var_kinds = std::move(cks); c->then_ = handler;
         *slot = c;
@@ -19541,6 +19569,29 @@ struct Translator {
                       forced_ctor_depth_.count(n))
                     cip = &ci2->second;
           }
+        }
+      }
+      // `open M` shadows a same-named PERVASIVE ctor with M's own -- which the
+      // flat name-keyed map cannot express, since the predef entry is never
+      // overwritten.  Fire only when the node's INFERRED type is a type of a
+      // currently-opened module, so a type-directed `(Error x : _ result)` under
+      // the same open still resolves to result's Error.  shape_reduce.ml's
+      // `open Shape` + `NError s -> Error s`: the shape is Shape.desc (tag 8),
+      // but result's Error (tag 1) owned the flat entry, so read_back_desc built
+      // a one-field `Abs` block for every erroneous shape.
+      if (cip && !qci && builtin_ctors_.count(n) &&
+          std::holds_alternative<Lident>(k->id.txt.v)) {
+        if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end()) {
+          std::string ety = ec->second, emod;
+          if (auto d = ety.rfind('.'); d != std::string::npos) {
+            emod = ety.substr(0, d); ety = ety.substr(d + 1);
+          }
+          if (!emod.empty() && ety != cip->type &&
+              std::find(opened_.begin(), opened_.end(), emod) != opened_.end())
+            for (auto& [nm2, info2] : module_type_ctors(emod, ety))
+              if (nm2 == n && info2.is_block == k->arg.has_value()) {
+                cip = &info2; break;
+              }
         }
       }
       // The flat entry's ARITY can belong to another type sharing the ctor
