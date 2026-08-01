@@ -9637,15 +9637,23 @@ struct Translator {
   // path over the same pattern reuses the same ident, as ocamlc's typing-time
   // assignment does.  Matching-time temps (*match*) stay fresh()-at-bind.
   std::map<const Pattern*, Ident> pat_pre_ids_;
+  // Set while pre-assigning the binders of a DECOMPOSED tuple-let: Matching's
+  // assign_pat refreshes them (Ident.rename) at Translcore time, so ocamlc's
+  // surviving idents are stamped after every source ident of the unit.  See
+  // Ident::late -- it only moves them in a closure's free-var sort.
+  bool pat_ids_late_ = false;
+  Ident fresh_pat_id(const std::string& name) {
+    Ident i = fresh(name); i.late = pat_ids_late_; return i;
+  }
   void preassign_pat_vars(const Pattern& p0) {
     const Pattern* p = effective_pat(&p0);
     if (pat_pre_ids_.count(p)) return;  // node (and thus subtree) already walked
     if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
-      pat_pre_ids_.emplace(p, fresh(pv->name.txt)); return;
+      pat_pre_ids_.emplace(p, fresh_pat_id(pv->name.txt)); return;
     }
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
       preassign_pat_vars(*pa->p);
-      pat_pre_ids_.emplace(p, fresh(pa->name.txt)); return;
+      pat_pre_ids_.emplace(p, fresh_pat_id(pa->name.txt)); return;
     }
     if (auto* up = std::get_if<Ppat_unpack>(&p->desc)) {
       if (up->name.txt) pat_pre_ids_.emplace(p, fresh_scoped(*up->name.txt));
@@ -25974,6 +25982,20 @@ struct Translator {
           // *match* temp.  ocamlc emits the component bindings in reverse field order
           // but exports them in source order; a refutable pattern stays a bare temp.
           LamPtr val = expr(*b.expr);
+          // A tuple pattern over a tuple-construction rhs is the one form
+          // Matching.assign_pat decomposes, refreshing the binders as it goes
+          // (`opt := true`); every other pattern takes simple_for_let and keeps
+          // its typing-time idents.  Pre-assign the refreshed ones here so they
+          // carry `late` (makedepend's `let (depends_on, escaped_eol) = ..`,
+          // captured by print_dependencies' inner closures).
+          if (auto* tp = std::get_if<Ppat_tuple>(&effective_pat(&b.pat)->desc);
+              tp && val->prim_arg == 0 && val->args.size() == tp->elems.size() &&
+              (val->k == Lam::K::ConstBlock ||
+               (val->k == Lam::K::Prim && val->prim == Prim::Makeblock))) {
+            pat_ids_late_ = true;
+            preassign_pat_vars(b.pat);
+            pat_ids_late_ = false;
+          }
           bool direct = val->k == Lam::K::Var || val->k == Lam::K::ConstBlock;
           LamPtr scrut; Ident tmp;
           if (direct) scrut = val;
