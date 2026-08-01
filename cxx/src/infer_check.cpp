@@ -4635,7 +4635,6 @@ struct Checker {
   // fresh).  Non-strict only -- a wrong pick can't reach the strict reject pass.
   void open_module_ctors(const Longident& modid) {
     auto* pl = std::get_if<Lident>(&modid.v);
-    if (!pl) return;  // single-name modules only (matches qualified_ctor_scheme)
     // `open M` where M is a local ALIAS of a unit SUBMODULE (typemod's `module
     // Sig_component_kind = Shape.Sig_component_kind` then `let open
     // Sig_component_kind in match ..`): open the TARGET's ctors, result-typed
@@ -4643,11 +4642,17 @@ struct Checker {
     // and the back end force-registers the right type -- otherwise the bare
     // constant ctors resolved to Typedtree.item_declaration's same-named BLOCK
     // ctors and the match tag-tested immediates (bootstrap bug#13).
-    std::string path = pl->name;
-    if (auto f = local_module_paths_.find(pl->name);
-        f != local_module_paths_.end() && !f->second.empty() &&
-        f->second.find('.') != std::string::npos)
-      path = f->second;
+    // A DIRECTLY dotted open (`let open Patterns.Head in match ..`, parmatch)
+    // walks the same component path; a local/unbound head just fails head_cmi
+    // and falls out through the catch, as before.  Functor applications stay
+    // out (lid_full renders them with parens).
+    std::string path = pl ? pl->name : lid_full(modid);
+    if (path.find('(') != std::string::npos) return;
+    if (pl)
+      if (auto f = local_module_paths_.find(pl->name);
+          f != local_module_paths_.end() && !f->second.empty() &&
+          f->second.find('.') != std::string::npos)
+        path = f->second;
     std::vector<std::string> comps;
     for (size_t p0 = 0;;) {
       size_t q = path.find('.', p0);
