@@ -505,6 +505,30 @@ struct Checker {
     return nullptr;
   }
   std::unordered_map<std::string, std::vector<TypePtr>> field_candidates_;
+  // The single predefined ground type EVERY candidate record gives an
+  // AMBIGUOUS label, else "".  Agreement makes the field's type independent
+  // of which record ocamlc's type-directed disambiguation picks, so using it
+  // is sound under every resolution.  Predefined ground bases only: a
+  // same-NAMED nominal/abbreviated path in two records could denote
+  // different types, so those stay unresolved.
+  std::string ambiguous_field_ground(const std::string& label) {
+    auto ci = field_candidates_.find(label);
+    if (ci == field_candidates_.end() || ci->second.size() < 2) return "";
+    static const std::set<std::string> ground = {
+        "string", "int", "char", "bool", "unit", "float",
+        "int32", "int64", "nativeint"};
+    std::string agreed;
+    for (auto& cand : ci->second) {
+      TypePtr a = I::Engine::repr(eng.instantiate(cand));
+      if (a->kind != I::Type::Kind::Arrow) return "";
+      TypePtr cod = I::Engine::repr(a->cod);
+      if (cod->kind != I::Type::Kind::Constr || !cod->args.empty() ||
+          cod->stamp != 0 || !ground.count(cod->path)) return "";
+      if (agreed.empty()) agreed = cod->path;
+      else if (agreed != cod->path) return "";
+    }
+    return agreed;
+  }
   // A polymorphic field (`{ pf : 'a. .. }`) gets no monomorphic value scheme (it
   // would clash across uses), so it never lands in `fields_`.  But a record
   // PATTERN `{pf}` still identifies its record TYPE by that label -- so record the
@@ -6664,33 +6688,13 @@ struct Checker {
           // both `section` and `symbol`): the binder has that type under EVERY
           // possible disambiguation, so binding it is sound whichever record
           // ocamlc's type-directed pass picks -- and `name = sectname`
-          // specializes (caml_string_equal) exactly as ocamlc.  Predefined
-          // ground bases only: a same-NAMED nominal/abbreviated path in two
-          // records could denote different types, so those stay unresolved.
+          // specializes (caml_string_equal) exactly as ocamlc.
           // recTy is left alone -- the record identity itself stays ambiguous.
           if (!strict) {
-            auto ci = field_candidates_.find(lid_last(lid.txt));
-            if (ci != field_candidates_.end() && ci->second.size() > 1) {
-              static const std::set<std::string> ground = {
-                  "string", "int", "char", "bool", "unit", "float",
-                  "int32", "int64", "nativeint"};
-              std::string agreed;
-              bool ok = true;
-              for (auto& cand : ci->second) {
-                TypePtr a = I::Engine::repr(eng.instantiate(cand));
-                if (a->kind != I::Type::Kind::Arrow) { ok = false; break; }
-                TypePtr cod = I::Engine::repr(a->cod);
-                if (cod->kind != I::Type::Kind::Constr || !cod->args.empty() ||
-                    cod->stamp != 0 || !ground.count(cod->path)) {
-                  ok = false; break;
-                }
-                if (agreed.empty()) agreed = cod->path;
-                else if (agreed != cod->path) { ok = false; break; }
-              }
-              if (ok && !agreed.empty()) {
-                try_unify(infer_pat(*sub), eng.constr(agreed));
-                continue;
-              }
+            std::string agreed = ambiguous_field_ground(lid_last(lid.txt));
+            if (!agreed.empty()) {
+              try_unify(infer_pat(*sub), eng.constr(agreed));
+              continue;
             }
           }
           bind_pat_any(*sub); continue;
@@ -7647,6 +7651,17 @@ struct Checker {
             if (TypePtr ft = typepath_field_type(rb->path, lid_last(fld->field.txt)))
               return ft;
         }
+      }
+      // An AMBIGUOUS label whose candidate records ALL agree on a predefined
+      // ground field type: the ACCESS's type is that type under every
+      // possible disambiguation (same rule as the record-pattern path), even
+      // though the record identity stays unresolved.  ident's
+      // `(get_desc us).stamp` -- `stamp : int` in Unscoped.desc AND every
+      // inline record -- makes `stamp : t -> int`, so `stamp us1 = stamp us2`
+      // specializes to `==` exactly as ocamlc.
+      if (!strict) {
+        std::string agreed = ambiguous_field_ground(lid_last(fld->field.txt));
+        if (!agreed.empty()) return eng.constr(agreed);
       }
       return eng.fresh_var();  // P4-B: unresolved field access -> fresh var (was Any)
     }
