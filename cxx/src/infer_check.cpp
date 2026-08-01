@@ -2968,6 +2968,35 @@ struct Checker {
     } catch (...) {}
     return nullptr;
   }
+  // Resolve `<typepath>.<label>` where typepath is a base expression's full
+  // inferred type path (e.g. "Stdlib.Lexing.position" or "Gc.stat").  The record
+  // lives in the LEAF module (the component just before the type name); we verify
+  // the record decl's own name matches the type name, so a same-labelled field in
+  // an unrelated record can't mis-resolve the field's type (which would mis-drive
+  // comparison/kind specialization).  Handles the wrapped-stdlib multi-component
+  // path (`Stdlib.Lexing.position`) that stdlib_field_type's single-module lookup
+  // cannot -- otherwise `loc.loc_start.pos_lnum` chains leak a fresh var.
+  TypePtr typepath_field_type(const std::string& typepath, const std::string& label) {
+    auto tpos = typepath.rfind('.');
+    if (tpos == std::string::npos) return nullptr;
+    std::string tyname = typepath.substr(tpos + 1);
+    std::string modpath = typepath.substr(0, tpos);
+    auto mpos = modpath.rfind('.');
+    std::string leaf_mod = (mpos == std::string::npos) ? modpath
+                                                       : modpath.substr(mpos + 1);
+    try {
+      const auto& cmi = cmi::CmiFile::load(head_cmi(leaf_mod));
+      for (auto& td : cmi.types()) {
+        if (td.kind != cmi::TypeDecl::Record || td.name != tyname) continue;
+        for (auto& l : td.labels)
+          if (l.name == label) {
+            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            return from_cmi(l.type, memo);
+          }
+      }
+    } catch (...) {}
+    return nullptr;
+  }
   void register_stdlib_ctors() {
     try {
       const auto& cmi = cmi::CmiFile::load(stdpath("stdlib.cmi"));
@@ -7575,6 +7604,13 @@ struct Checker {
               rb->path.find('.') == dpos)  // single-module prefix
             if (TypePtr ft = stdlib_field_type(rb->path.substr(0, dpos),
                                                lid_last(fld->field.txt)))
+              return ft;
+          // A wrapped-stdlib / nested type path (`Stdlib.Lexing.position`): resolve
+          // through the leaf module, verifying the record's type name -- so a
+          // chained `loc.loc_start.pos_lnum` gets `int`, not a fresh var (which
+          // would leave `startline = endline` a polymorphic caml_equal).
+          if (rb->path.find('.') != dpos)
+            if (TypePtr ft = typepath_field_type(rb->path, lid_last(fld->field.txt)))
               return ft;
         }
       }
