@@ -6659,6 +6659,40 @@ struct Checker {
               }
             }
           }
+          // An AMBIGUOUS label whose candidate records ALL give the field the
+          // SAME predefined ground type (binutils FlexDLL: `name : string` in
+          // both `section` and `symbol`): the binder has that type under EVERY
+          // possible disambiguation, so binding it is sound whichever record
+          // ocamlc's type-directed pass picks -- and `name = sectname`
+          // specializes (caml_string_equal) exactly as ocamlc.  Predefined
+          // ground bases only: a same-NAMED nominal/abbreviated path in two
+          // records could denote different types, so those stay unresolved.
+          // recTy is left alone -- the record identity itself stays ambiguous.
+          if (!strict) {
+            auto ci = field_candidates_.find(lid_last(lid.txt));
+            if (ci != field_candidates_.end() && ci->second.size() > 1) {
+              static const std::set<std::string> ground = {
+                  "string", "int", "char", "bool", "unit", "float",
+                  "int32", "int64", "nativeint"};
+              std::string agreed;
+              bool ok = true;
+              for (auto& cand : ci->second) {
+                TypePtr a = I::Engine::repr(eng.instantiate(cand));
+                if (a->kind != I::Type::Kind::Arrow) { ok = false; break; }
+                TypePtr cod = I::Engine::repr(a->cod);
+                if (cod->kind != I::Type::Kind::Constr || !cod->args.empty() ||
+                    cod->stamp != 0 || !ground.count(cod->path)) {
+                  ok = false; break;
+                }
+                if (agreed.empty()) agreed = cod->path;
+                else if (agreed != cod->path) { ok = false; break; }
+              }
+              if (ok && !agreed.empty()) {
+                try_unify(infer_pat(*sub), eng.constr(agreed));
+                continue;
+              }
+            }
+          }
           bind_pat_any(*sub); continue;
         }
         TypePtr s = I::Engine::repr(eng.instantiate(it->second));
