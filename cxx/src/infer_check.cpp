@@ -12218,6 +12218,52 @@ static std::vector<int> compute_decl_variance(
 static cmi::cmiw::Loc conv_loc(const ast::Location& l);  // defined below
 
 static void rewrite_eff_back(const cmi::cmiw::TyPtr& t);  // defined below
+
+// Typedecl_immediacy.compute_decl's abstract-with-manifest arm: the manifest's
+// HEAD constructor decl's type_immediate, verbatim and WITHOUT expansion
+// (Ctype.immediacy), so `type label = int` is Always -- consumers reading the
+// written flag back (kind_str's cmi_type_is_immediate) then specialize `=` on
+// it to `==` exactly as ocamlc.  A closed all-constant polymorphic-variant
+// manifest is Always too.  Resolution is name-based and conservative: a
+// same-signature decl shadows a predef (searched newest-first), a dotted path
+// reads the owning cmi (Always only), and anything unresolved -- an OPENED
+// module's abbreviation, a same-rec-group forward reference -- stays Unknown,
+// which can only under-specialize, never miscompile.
+static int manifest_immediacy(Checker& ck, const ast::CoreType& m,
+                              const std::vector<cmi::cmiw::SigItem>& out) {
+  if (auto* pv = std::get_if<Ptyp_variant>(&m.desc)) {
+    if (pv->closed != ClosedFlag::Closed) return 0;
+    for (auto& r : pv->rows) {
+      if (auto* tag = std::get_if<Rtag>(&r)) {
+        if (!tag->types.empty()) return 0;
+        continue;
+      }
+      // An INHERITED row (`[ abstract_type_constr | .. ]`, predef.mli): the
+      // cited type must itself be a polyvariant, and a polyvariant is Always
+      // exactly when closed and all-constant -- so its flag answers for its
+      // rows, and recursing treats the citation like a manifest head.
+      if (manifest_immediacy(ck, *std::get<Rinherit>(r).ct, out) != 1) return 0;
+    }
+    return 1;
+  }
+  auto* c = std::get_if<Ptyp_constr>(&m.desc);
+  if (!c) return 0;  // args are irrelevant: the HEAD decl's flag decides
+  if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
+    for (auto it = out.rbegin(); it != out.rend(); ++it)
+      if (it->k == cmi::cmiw::SigItem::Type && it->name == l->name)
+        return it->type_immediate == 1 ? 1 : 0;
+    if (l->name == "int" || l->name == "char" || l->name == "bool" ||
+        l->name == "unit")
+      return 1;
+    return ck.immediate_types_.count(l->name) ? 1 : 0;
+  }
+  if (!std::holds_alternative<Ldot>(c->id.txt.v)) return 0;
+  std::string dotted = lid_full(c->id.txt);
+  if (ck.bound_module_names_.count(dotted.substr(0, dotted.find('.'))))
+    return 0;
+  return ck.cmi_type_is_immediate(dotted) ? 1 : 0;
+}
+
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
@@ -12239,9 +12285,9 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     int immed_attr = immed;
     // Typedecl_immediacy.compute_decl: a non-unboxed variant whose ctors ALL
     // have empty Cstr_tuple args is Always -- no-arg GADT ctors and the empty
-    // variant included, an inline-record ctor excluded.  (The unboxed and
-    // abstract-with-manifest derivations are not modelled; they stay at the
-    // attribute value, i.e. possibly Unknown where ocamlc computes Always.)
+    // variant included, an inline-record ctor excluded.  (The unboxed
+    // derivation is not modelled; it stays at the attribute value, i.e.
+    // possibly Unknown where ocamlc computes Always.)
     if (auto* var = std::get_if<Ptype_variant>(&d.kind); var && !unboxed) {
       bool all_const = true;
       for (auto& c : var->ctors) {
@@ -12250,6 +12296,10 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       }
       if (all_const) immed = 1;
     }
+    // Abstract-with-manifest (`type label = int`): the manifest head's flag.
+    if (immed == 0 && d.manifest &&
+        std::holds_alternative<Ptype_abstract>(d.kind))
+      immed = manifest_immediacy(ck, **d.manifest, out);
     std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
     BridgeCtx dctx;  // ONE bridge context per decl: a non-var node cited from
