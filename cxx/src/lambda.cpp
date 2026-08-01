@@ -3823,7 +3823,11 @@ struct Translator {
   // The parameter-signature field layout of a stdlib functor named by a (possibly
   // deep) dotted path -- `Weak.Make`, `Ephemeron.K1.Make` -- navigating submodules
   // and resolving a cross-module parameter modtype.  Empty if not found.
-  std::vector<std::string> stdlib_functor_param(const std::string& dotted) {
+  // `aidx` selects a LATER parameter of a multi-parameter functor: `Pair : functor
+  // (A : Thing) (B : Thing) -> ..` decodes as Functor(A) -> Functor(B) -> sig, so
+  // step through `functor_body` that many times first.
+  std::vector<std::string> stdlib_functor_param(const std::string& dotted,
+                                                int aidx = 0) {
     size_t lastd = dotted.rfind('.');
     if (lastd == std::string::npos) return {};
     std::string container = dotted.substr(0, lastd), name = dotted.substr(lastd + 1);
@@ -3843,8 +3847,14 @@ struct Translator {
       }
       for (auto& md : sig->modules) {
         if (md.name != name || !md.type || md.type->kind != cmi::ModuleType::Functor) continue;
-        auto p = mt_fields(cmi, md.type->functor_param_type);
-        return p.empty() ? qualified_modtype_fields(md.type->functor_param_type) : p;
+        const cmi::ModuleTypePtr* ft = &md.type;
+        for (int i = 0; i < aidx; ++i) {
+          if (!(*ft)->functor_body ||
+              (*ft)->functor_body->kind != cmi::ModuleType::Functor) return {};
+          ft = &(*ft)->functor_body;
+        }
+        auto p = mt_fields(cmi, (*ft)->functor_param_type);
+        return p.empty() ? qualified_modtype_fields((*ft)->functor_param_type) : p;
       }
     } catch (...) {}
     return {};
@@ -23490,9 +23500,10 @@ struct Translator {
     module_layout_[nm] = oldlay;
     return fn;
   }
-  // The head functor's binding name and the 0-based index of THIS application's
-  // argument (counting nested applies in `f`), for looking up the formal param.
-  std::pair<std::string, int> functor_head_arg_index(const ModuleExpr& f) {
+  // The applied head module expression of a (possibly nested) functor application
+  // and the 0-based index of THIS application's argument (the number of applies
+  // above the head), for looking up the formal parameter.
+  static std::pair<const ModuleExpr*, int> functor_apply_head(const ModuleExpr& f) {
     int depth = 0;
     const ModuleExpr* m = &f;
     for (;;) {
@@ -23500,6 +23511,11 @@ struct Translator {
       if (auto* pu = std::get_if<Pmod_apply_unit>(&m->desc)) { ++depth; m = pu->f.get(); continue; }
       break;
     }
+    return {m, depth};
+  }
+  // The head functor's binding name and the argument index, as above.
+  std::pair<std::string, int> functor_head_arg_index(const ModuleExpr& f) {
+    auto [m, depth] = functor_apply_head(f);
     std::string nm;
     if (auto* pi = std::get_if<Pmod_ident>(&m->desc))
       if (auto* l = std::get_if<Lident>(&pi->id.txt.v)) nm = l->name;
@@ -23578,6 +23594,27 @@ struct Translator {
         if (lid_to_dotted(pi->id.txt, dotted)) param = stdlib_functor_param(dotted);
       }
     }
+    // A LATER argument of a MULTI-parameter functor (`Identifiable.Pair(Ident)(Uid)`
+    // in shape_reduce, `F(A)(B)`): `pa.f` is itself a Pmod_apply, so the Pmod_ident
+    // lookups above see nothing and the argument used to be passed UNCOERCED -- the
+    // functor body then reads the parameter's fields off the raw argument block,
+    // which is wrong the moment the argument has extra or reordered fields.
+    if (param.empty())
+      if (auto [head, aidx] = functor_apply_head(*pa.f); aidx > 0)
+        if (auto* pi = std::get_if<Pmod_ident>(&head->desc)) {
+          if (auto* l = std::get_if<Lident>(&pi->id.txt.v))  // local functor
+            if (auto it = functor_param_types_.find(l->name);
+                it != functor_param_types_.end() && aidx < (int)it->second.size() &&
+                it->second[aidx]) {
+              param = sig_layout(*it->second[aidx]);
+              if (!param.empty()) param_mt = it->second[aidx];
+            }
+          if (param.empty()) {  // cross-module: walk the cmi's functor chain
+            std::string dotted;
+            if (lid_to_dotted(pi->id.txt, dotted))
+              param = stdlib_functor_param(dotted, aidx);
+          }
+        }
     if (!fval) fval = compile_module_expr(*pa.f);
     // ocamlc wraps a module path that resolves THROUGH a module alias in
     // `(let (let/N = <path>) <path>)`: typemod turns a Pmod_ident whose
