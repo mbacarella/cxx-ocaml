@@ -10467,12 +10467,26 @@ static std::string kind_str(const TypePtr& t0, Checker& ck) {
   if (b == "int" || b == "char" || b == "bool" || b == "unit")
     return "int";  // immediates (unit is the immediate 0)
   if (imm.count(t->path)) return "int";  // all-constant local variant
+  // A BARE name brought into scope by `open M` (`label` after `open Asttypes`):
+  // the registration pre-pass converts a record field's declared type before
+  // any opens are replayed, so the field's scheme cites the unqualified name
+  // and the dotted cmi consults below never fire -- `tag = tag'` over
+  // row_fields stayed the polymorphic caml_equal (types.ml get_row_field).
+  // Requalify through the opened qual exactly as from_coretype's annotation
+  // path does: a local decl (tenv stamp) takes precedence, and the qualified
+  // head still passes through the bound_module_names_ guards below.
+  std::string path = t->path;
+  if (d == std::string::npos && !ck.tenv_lookup(b))
+    if (auto q = ck.opened_type_quals_.find(b); q != ck.opened_type_quals_.end()) {
+      path = q->second;
+      d = path.rfind('.');
+    }
   // A CROSS-MODULE type whose cmi decl is Type_immediacy.Always (see
   // cmi_type_is_immediate).  A locally bound module shadowing the unit name is
   // excluded (bound_module_names_, as in array_kind_str below).
   if (d != std::string::npos &&
-      !ck.bound_module_names_.count(t->path.substr(0, t->path.find('.'))) &&
-      ck.cmi_type_is_immediate(t->path))
+      !ck.bound_module_names_.count(path.substr(0, path.find('.'))) &&
+      ck.cmi_type_is_immediate(path))
     return "int";
   if (b == "float") return "float";
   if (b == "int32") return "int32";
@@ -10488,8 +10502,8 @@ static std::string kind_str(const TypePtr& t0, Checker& ck) {
   // guard against a locally bound module shadowing the head name, as the
   // immediate case above does.
   if (d != std::string::npos &&
-      !ck.bound_module_names_.count(t->path.substr(0, t->path.find('.'))) &&
-      ck.cmi_type_resolves_to_string(t->path))
+      !ck.bound_module_names_.count(path.substr(0, path.find('.'))) &&
+      ck.cmi_type_resolves_to_string(path))
     return "string";
   // A known boxed type (record/block-variant/string/...): not a value kind, but
   // an `addr` array element (vs a type variable, which is `gen`).
