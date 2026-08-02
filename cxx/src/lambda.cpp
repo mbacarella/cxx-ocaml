@@ -8271,12 +8271,43 @@ struct Translator {
   // letrec, for or while -- is Not_simple ("" = never shared).  Try's exn var,
   // Assign's target and catch vars stay literal (upstream does not rename
   // them), so those only share between textually-identical stamps.
-  static std::string oc_make_key(const LamPtr& top) {
+  //
+  // `arity`/`scrut_stamp` correct the node count for a constructor cell whose
+  // argument binds we have already substituted.  Upstream keys the PRE-Simplif
+  // body, where EVERY one of the ctor's `arity` arguments is an Alias let
+  // (`v =a (field_imm i scrut)`: 3 nodes) and each use of an argument is a
+  // one-node Lvar; our arm inlines the single-use ones, so the very same term
+  // counts fewer nodes and clears max_raw where upstream's does not.  Count an
+  // inlined `field_imm i scrut` read as the one Lvar it stands for, then add 3
+  // per argument the arm does not bind.  Omit them (the default) to key a term
+  // that is already in upstream's shape.
+  static std::string oc_make_key(const LamPtr& top, int arity = -1, int scrut_stamp = -1) {
     int count = 0, nk = 0;
+    const bool adj = arity >= 0 && scrut_stamp >= 0;
+    std::vector<char> bound(adj ? arity : 0, 0);   // args the arm binds itself
+    bool alias_val = false;   // the node being keyed is an Alias let's value
+    // A structured constant is ONE node upstream (`Lconst _ -> e`) however deep
+    // it is -- its elements are keyed, but never counted.
+    bool in_const = false;
+    // The field index of a `field_imm i scrut` read, or -1.
+    auto scrut_field = [&](const LamPtr& n) -> int {
+      if (!adj || n->k != Lam::K::Prim || n->prim != Prim::FieldImm || n->args.size() != 1)
+        return -1;
+      const LamPtr& b = n->args[0];
+      if (!b || b->k != Lam::K::Var || b->var.stamp != scrut_stamp) return -1;
+      return n->prim_arg < arity ? n->prim_arg : -1;
+    };
     std::map<int, std::string> env;  // binder stamp -> replacement key text
     std::function<std::string(const LamPtr&)> tr = [&](const LamPtr& n) -> std::string {
       if (!n) return "_";
-      if (++count > 32) return "";  // max_raw: too big to be worth sharing
+      const bool av = alias_val; alias_val = false;   // consumed by this node
+      if (!in_const) {
+        // An inlined arg read is upstream's Lvar: its own node is free, the
+        // scrutinee Var below it supplies the single count.  In an Alias let's
+        // value it IS upstream's shape already, so it counts in full.
+        if (!av && scrut_field(n) >= 0) --count;
+        if (++count > 32) return "";  // max_raw: too big to be worth sharing
+      }
       using K = Lam::K;
       switch (n->k) {
         case K::Function: case K::Letrec: case K::For: case K::While: return "";
@@ -8298,6 +8329,11 @@ struct Translator {
         for (size_t i = 0; i < n->bindings.size(); ++i) {
           auto& b = n->bindings[i];
           if (i > 0 && ++count > 32) return "";
+          if (b.alias && !b.mut && b.val) {
+            int sf = scrut_field(b.val);
+            if (sf >= 0) bound[sf] = 1;   // this arg is bound here, as upstream binds it
+            alias_val = true;
+          }
           std::string vk = tr(b.val);
           if (vk.empty()) return "";
           if (b.alias && !b.mut) { env[b.id.stamp] = vk; continue; }  // substitute
@@ -8330,8 +8366,11 @@ struct Translator {
         std::string k2 = tr(c);
         if (k2.empty()) r = ""; else r += " " + k2;
       };
+      const bool was_const = in_const;
+      if (n->k == K::ConstBlock) in_const = true;
       add(n->fn); add(n->cond); add(n->then_); add(n->else_); add(n->body); add(n->sw_default);
       for (auto& a : n->args) add(a);
+      in_const = was_const;
       for (auto& sc : n->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
       for (auto& sc : n->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
       if (n->k == K::Switch && !r.empty())
@@ -8345,7 +8384,11 @@ struct Translator {
       if (r.empty()) return "";
       return r + ")";
     };
-    return tr(top);
+    std::string k = tr(top);
+    if (k.empty() || !adj) return k;
+    int extra = 0;                       // the Alias lets upstream's cell still has
+    for (int i = 0; i < arity; ++i) if (!bound[i]) extra += 3;
+    return count + extra > 32 ? std::string() : k;
   }
   // Matching.as_simple_exit: a bare argument-less (exit i), looking through
   // Alias lets (whose bindings an exit with no args cannot use).
@@ -8401,8 +8444,14 @@ struct Translator {
     std::vector<Slot> acts;
     std::map<std::string, int> keyed;
     std::vector<int> cidx, bidx;
-    auto store_act = [&](const LamPtr& a) -> int {
-      std::string k = oc_make_key(a);
+    // Keyed at upstream's cell size: our arms have already substituted the
+    // constructor's argument binds, which still count against make_key's
+    // max_raw there (see oc_make_key).  Only a Var scrutinee is corrected --
+    // that is the shape arg_to_var always leaves upstream.
+    int ss = sw->cond && sw->cond->k == Lam::K::Var ? sw->cond->var.stamp : -1;
+    auto store_act = [&](const Lam::SwitchCase& c) -> int {
+      const LamPtr& a = c.body;
+      std::string k = oc_make_key(a, ss >= 0 ? c.arity : -1, ss);
       if (!k.empty()) {
         auto it = keyed.find(k);
         if (it != keyed.end()) { acts[it->second].shared = true; return it->second; }
@@ -8411,8 +8460,8 @@ struct Translator {
       if (!k.empty()) keyed.emplace(std::move(k), (int)acts.size() - 1);
       return (int)acts.size() - 1;
     };
-    for (auto& c : sw->sw_consts) cidx.push_back(store_act(c.body));
-    for (auto& c : sw->sw_blocks) bidx.push_back(store_act(c.body));
+    for (auto& c : sw->sw_consts) cidx.push_back(store_act(c));
+    for (auto& c : sw->sw_blocks) bidx.push_back(store_act(c));
     std::vector<LamPtr> resolved(acts.size());
     std::vector<std::pair<int, LamPtr>> catches;  // (exit id, handler), slot order
     for (size_t j = 0; j < acts.size(); ++j) {
@@ -10806,10 +10855,12 @@ struct Translator {
     // Eligible: compile covered arms, then fill missing ctors with Match_failure
     // (a missing constructor's slot raises, exactly as ocamlc fills partial matches).
     std::map<int, LamPtr> cmap, bmap;
+    std::map<int, int> barity;                      // tag -> upstream's Alias-bind count
     for (auto& [v, r] : crow)
       cmap[v] = with_alias(r, [&] { return expr(*r->rhs); });
     for (auto& [tag, rs] : brows) {
       auto& ci = *resolve_row(rs[0]->lhs, ctor_of(*rs[0]->lhs));
+      barity[tag] = ci.rlabels.empty() ? ci.arity : (int)ci.rlabels.size();
       // an aliased row in a multi-row group would need per-sub-row scoping: bail
       if (rs.size() > 1)
         for (auto* r : rs)
@@ -10835,8 +10886,8 @@ struct Translator {
     // which comp_switch's gap rule reproduces.  No Match_failure exists at all.
     if (!exhaustive && total && proven && !dflt) {
       auto sw = mk(Lam::K::Switch); sw->cond = scrut;
-      for (auto& [v, b] : cmap) sw->sw_consts.push_back({v, b});
-      for (auto& [t, b] : bmap) sw->sw_blocks.push_back({t, b});
+      for (auto& [v, b] : cmap) sw->sw_consts.push_back({v, b, 0});
+      for (auto& [t, b] : bmap) sw->sw_blocks.push_back({t, b, barity[t]});
       sw->sw_numconsts = NC; sw->sw_numblocks = NB;
       return sw;
     }
@@ -10845,9 +10896,10 @@ struct Translator {
     auto miss = [&] { return dflt ? dflt : raise_predef("Match_failure", mloc, "ctor_miss"); };
     std::vector<Lam::SwitchCase> consts, blocks;
     for (int v = 0; v < NC; ++v)
-      consts.push_back({v, cmap.count(v) ? cmap[v] : miss()});
+      consts.push_back({v, cmap.count(v) ? cmap[v] : miss(), 0});
     for (int t = 0; t < NB; ++t)
-      blocks.push_back({t, bmap.count(t) ? bmap[t] : miss()});
+      // an uncovered tag is upstream's failaction, which binds nothing
+      blocks.push_back({t, bmap.count(t) ? bmap[t] : miss(), bmap.count(t) ? barity[t] : 0});
     // nb==1, nc==1 -> truthy `(if scrut <block> <const>)` (option/list).
     if (consts.size() == 1 && blocks.size() == 1) {
       auto i = mk(Lam::K::IfThenElse);
@@ -13024,9 +13076,19 @@ struct Translator {
         return nullptr;
       return gmatch(std::move(ncomps), std::move(sub), mloc, deid, std::move(de));
     };
+    // The argument binds upstream's cell for a tag carries: none for a constant
+    // ctor, and none for a GAP tag (reached only by the var rows, so upstream
+    // routes it to the failaction instead of specializing).  Recorded on the
+    // case for share_actions_sw's max_raw budget.
+    auto blk_arity = [&](int t) -> int {
+      auto bi = block_ci.find(t);
+      if (bi == block_ci.end()) return 0;
+      const auto& rlab = bi->second->rlabels;
+      return rlab.empty() ? bi->second->arity : (int)rlab.size();
+    };
     std::vector<Lam::SwitchCase> consts, blocks;
-    for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b}); }
-    for (int t = 0; t < NB; ++t) { LamPtr b = block_body(t); if (!b) return nullptr; blocks.push_back({t, b}); }
+    for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b, 0}); }
+    for (int t = 0; t < NB; ++t) { LamPtr b = block_body(t); if (!b) return nullptr; blocks.push_back({t, b, blk_arity(t)}); }
     // PROVEN-total match (completed GADT refutation): upstream's glob_total
     // mk_failaction_pos adds no final-exit fails, so an uncovered tag has no
     // cell at all -- the switch stays SPARSE and bytegen's hole rule (plus a

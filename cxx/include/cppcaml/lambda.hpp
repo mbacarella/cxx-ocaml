@@ -163,7 +163,11 @@ struct Lam {
   // by these, with tags absent from the case lists jumping to the failaction.
   // -1 (the default) = dense: every tag 0..len-1 is present in the list, so the
   // list length is the table size (all pre-existing producers).
-  struct SwitchCase { int tag; LamPtr body; };
+  // arity: how many constructor arguments upstream's cell for this tag binds
+  // (one Alias let each, before Simplif substitutes them away).  Only the
+  // max_raw budget of Lambda.make_key needs it -- see oc_make_key.  -1 = the
+  // producer did not record it, 0 = a constant ctor or a failaction slot.
+  struct SwitchCase { int tag; LamPtr body; int arity = -1; };
   std::vector<SwitchCase> sw_consts, sw_blocks;
   LamPtr sw_default;
   int sw_numconsts = -1, sw_numblocks = -1;
