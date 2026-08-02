@@ -20682,82 +20682,97 @@ struct Translator {
             return l;
           }
         }
+      // The AST-only half of the tuple-catch test below: does this binding have
+      // the shape (all-variable tuple pattern, arm-structured rhs) that could
+      // take it?  Kept separate so a binding that cannot possibly take the form
+      // is never speculatively translated.
+      auto tuple_catch_shape = [&](const ValueBinding& b) -> bool {
+        auto* tp = std::get_if<Ppat_tuple>(&effective_pat(&b.pat)->desc);
+        if (!tp) return false;
+        bool allvars = !tp->elems.empty();
+        for (auto& el : tp->elems) {
+          const Pattern* ep = effective_pat(el.get());
+          if (!std::get_if<Ppat_var>(&ep->desc) &&
+              !std::holds_alternative<Ppat_any>(ep->desc)) {
+            allvars = false;
+            break;
+          }
+        }
+        const Expression* rhs = b.expr.get();
+        while (auto* ct = std::get_if<Pexp_constraint>(&rhs->desc)) rhs = ct->e.get();
+        // ocamlc decides this form on the LAMBDA, where a plain-path local
+        // open has already vanished (scoping only) -- peel `let open M in`
+        // for the shape test but translate the full rhs so the open's
+        // scoping still applies (shape.ml's mk: `let comp_unit, from =
+        // let open Unit_info in match ..`).
+        const Expression* shp = rhs;
+        for (;;) {
+          if (auto* c2 = std::get_if<Pexp_constraint>(&shp->desc)) {
+            shp = c2->e.get();
+            continue;
+          }
+          if (auto* s2 = std::get_if<Pexp_struct_item>(&shp->desc))
+            if (auto* op = std::get_if<Pstr_open>(&s2->item->desc))
+              if (std::get_if<Pmod_ident>(&op->expr.desc)) {
+                shp = s2->body.get();
+                continue;
+              }
+          break;
+        }
+        return allvars && (std::get_if<Pexp_match>(&shp->desc) ||
+                           std::get_if<Pexp_try>(&shp->desc) ||
+                           std::get_if<Pexp_ifthenelse>(&shp->desc));
+      };
       // `let (a, b) = match .. in body`: when every match arm RESULT is a
       // syntactic tuple, pass the components through a static catch instead of
       // building the pair (Matching's exit-with-args form; basic/tuple_match).
+      // Returns the catch with its `then_` still unset -- the caller supplies
+      // the rest of the let group and the body -- or null when no arm decomposed
+      // (ocamlc's `opt` stays false), in which case the partially-rewritten
+      // translation is discarded and the caller falls back to the allocating
+      // path, re-translating the binding from the AST.
+      auto tuple_catch = [&](const ValueBinding& b) -> LamPtr {
+        if (!tuple_catch_shape(b)) return nullptr;
+        auto* tp = std::get_if<Ppat_tuple>(&effective_pat(&b.pat)->desc);
+        const Expression* rhs = b.expr.get();
+        while (auto* ct = std::get_if<Pexp_constraint>(&rhs->desc)) rhs = ct->e.get();
+        LamPtr mm = expr(*rhs);
+        int n = ++next_exit_;
+        // ocamlc's map_return/assign_pat binds non-var tuple columns in
+        // every tail context it traverses -- if arms, switch arms, and both
+        // sides of a try (Matching.for_let).
+        bool save_btc = bind_tuple_cols_;
+        bool save_opt = tuple_cols_opt_;
+        bind_tuple_cols_ = true;
+        tuple_cols_opt_ = false;
+        bool tte = tail_tuple_exit(mm, n, tp->elems.size());
+        tte = tte && tuple_cols_opt_;
+        bind_tuple_cols_ = save_btc;
+        tuple_cols_opt_ = save_opt;
+        if (!tte) return nullptr;
+        auto cat = mk(Lam::K::Catch);
+        cat->cond = mm;
+        cat->prim_arg = n;
+        for (auto& el : tp->elems) {
+          const Pattern* ep = effective_pat(el.get());
+          Ident id;
+          if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) {
+            id = fresh(pv->name.txt);
+            scope.back()[pv->name.txt] = id;
+          } else {
+            id = fresh("", true);
+          }
+          cat->catch_vars.push_back(id);
+          cat->catch_var_kinds.push_back(pat_kind(ep));
+        }
+        return cat;
+      };
       if (le->bindings.size() == 1)
-        if (auto* tp = std::get_if<Ppat_tuple>(
-                &effective_pat(&le->bindings[0].pat)->desc)) {
-          bool allvars = !tp->elems.empty();
-          for (auto& el : tp->elems) {
-            const Pattern* ep = effective_pat(el.get());
-            if (!std::get_if<Ppat_var>(&ep->desc) &&
-                !std::holds_alternative<Ppat_any>(ep->desc)) {
-              allvars = false;
-              break;
-            }
-          }
-          const Expression* rhs = le->bindings[0].expr.get();
-          while (auto* ct = std::get_if<Pexp_constraint>(&rhs->desc)) rhs = ct->e.get();
-          // ocamlc decides this form on the LAMBDA, where a plain-path local
-          // open has already vanished (scoping only) -- peel `let open M in`
-          // for the shape test but translate the full rhs so the open's
-          // scoping still applies (shape.ml's mk: `let comp_unit, from =
-          // let open Unit_info in match ..`).
-          const Expression* shp = rhs;
-          for (;;) {
-            if (auto* c2 = std::get_if<Pexp_constraint>(&shp->desc)) {
-              shp = c2->e.get();
-              continue;
-            }
-            if (auto* s2 = std::get_if<Pexp_struct_item>(&shp->desc))
-              if (auto* op = std::get_if<Pstr_open>(&s2->item->desc))
-                if (std::get_if<Pmod_ident>(&op->expr.desc)) {
-                  shp = s2->body.get();
-                  continue;
-                }
-            break;
-          }
-          if (allvars && (std::get_if<Pexp_match>(&shp->desc) ||
-                          std::get_if<Pexp_try>(&shp->desc) ||
-                          std::get_if<Pexp_ifthenelse>(&shp->desc))) {
-            LamPtr mm = expr(*rhs);
-            int n = ++next_exit_;
-            // ocamlc's map_return/assign_pat binds non-var tuple columns in
-            // every tail context it traverses -- if arms, switch arms, and both
-            // sides of a try (Matching.for_let).
-            bool save_btc = bind_tuple_cols_;
-            bool save_opt = tuple_cols_opt_;
-            bind_tuple_cols_ = true;
-            tuple_cols_opt_ = false;
-            bool tte = tail_tuple_exit(mm, n, tp->elems.size());
-            tte = tte && tuple_cols_opt_;
-            bind_tuple_cols_ = save_btc;
-            tuple_cols_opt_ = save_opt;
-            if (tte) {
-              auto cat = mk(Lam::K::Catch);
-              cat->cond = mm;
-              cat->prim_arg = n;
-              for (auto& el : tp->elems) {
-                const Pattern* ep = effective_pat(el.get());
-                Ident id;
-                if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) {
-                  id = fresh(pv->name.txt);
-                  scope.back()[pv->name.txt] = id;
-                } else {
-                  id = fresh("", true);
-                }
-                cat->catch_vars.push_back(id);
-                cat->catch_var_kinds.push_back(pat_kind(ep));
-              }
-              rec_spine_ = rec_spine;
-              cat->then_ = expr(*le->body);
-              scope.pop_back();
-              return cat;
-            }
-            // partially-rewritten translation discarded; fall through to the
-            // allocating path, which re-translates from the AST
-          }
+        if (LamPtr cat = tuple_catch(le->bindings[0])) {
+          rec_spine_ = rec_spine;
+          cat->then_ = expr(*le->body);
+          scope.pop_back();
+          return cat;
         }
       // `let <refutable> = e in body`: a partial pattern match over e raising
       // Match_failure on the missing cases (located at the let expression).  e is
@@ -20820,31 +20835,57 @@ struct Translator {
       // A sequence-preserving tuple-let float keeps the RHS let/seq tree intact and
       // splices the component bindings at the tail tuple leaf (below); stash it here.
       LamPtr float_seq_val, float_seq_inner;
-      for (auto& b : le->bindings) {
-        src_bounds.push_back({l->bindings.size(), binders.size()});
-        if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
-          // pass b.attrs so a local `let[@inline never] f = ..` carries its
-          // never_inline attribute onto the function (as the top-level path does).
-          LamPtr rhs = fn_binding_rhs(pv->name.txt, *b.expr, b.attrs);
-          // simplif drops `let x = (var w)` unconditionally (any let-kind),
-          // substituting x by w -- so alias the name to w rather than binding it.
-          // Not on a recursive binding's spine, though: the rec-value compiler
-          // chooses its strategy (dummy-context vs direct letrec) from the RHS's
-          // SYNTACTIC shape, before simplif inlines -- inlining here would flip it.
-          if (rhs->k == Lam::K::Var && !rec_spine) {
-            scope.back()[pv->name.txt] = rhs->var;
-            record_fn_sig(rhs->var, b.expr.get(), binding_annot(b));
-            continue;
+      // Emitting a plain `let x = e` binding into `out`; shared with the tail of
+      // a `let .. and ..` group that a tuple catch (below) swallowed.
+      auto emit_var_binding = [&](const ValueBinding& b, const Ppat_var* pv,
+                                  std::vector<Lam::Binding>& out) {
+        // pass b.attrs so a local `let[@inline never] f = ..` carries its
+        // never_inline attribute onto the function (as the top-level path does).
+        LamPtr rhs = fn_binding_rhs(pv->name.txt, *b.expr, b.attrs);
+        // simplif drops `let x = (var w)` unconditionally (any let-kind),
+        // substituting x by w -- so alias the name to w rather than binding it.
+        // Not on a recursive binding's spine, though: the rec-value compiler
+        // chooses its strategy (dummy-context vs direct letrec) from the RHS's
+        // SYNTACTIC shape, before simplif inlines -- inlining here would flip it.
+        if (rhs->k == Lam::K::Var && !rec_spine) {
+          scope.back()[pv->name.txt] = rhs->var;
+          record_fn_sig(rhs->var, b.expr.get(), binding_annot(b));
+          return;
+        }
+        Ident id = fresh(pv->name.txt);
+        out.push_back({id, pat_kind(&b.pat), std::move(rhs)});
+        // record BEFORE binding the name: in this non-recursive let, the RHS's
+        // own references resolve to the OUTER binding (`let f .. = f ..` wrapping
+        // an outer f), which is what the residual-signature analysis must see.
+        record_fn_sig(id, b.expr.get(), binding_annot(b));
+        record_record_lit(id, b.expr.get());
+        scope.back()[pv->name.txt] = id;
+      };
+      // In a `let p1 = e1 and p2 = e2 in body` group, ocamlc's transl_let folds
+      // `for_let p1 e1 (for_let p2 e2 body)`, so a binding that takes the
+      // immediate-tuple catch swallows every LATER binding into its handler.
+      // We take that path when those later bindings are plain variable ones
+      // (typedecl_variance's `let (p, n) = if .. and i = concr`, switch's
+      // `let sep, csep = divide cases and inter, cinter = if ..`).
+      size_t catch_bi = le->bindings.size();
+      if (le->bindings.size() > 1)
+        for (size_t i = 0; i < le->bindings.size(); ++i)
+          if (tuple_catch_shape(le->bindings[i])) {
+            catch_bi = i;
+            for (size_t j = i + 1; j < le->bindings.size(); ++j)
+              if (!std::get_if<Ppat_var>(&le->bindings[j].pat.desc))
+                catch_bi = le->bindings.size();
+            break;
           }
-          Ident id = fresh(pv->name.txt);
-          Lam::Binding bd{id, pat_kind(&b.pat), std::move(rhs)};
-          l->bindings.push_back(std::move(bd));
-          // record BEFORE binding the name: in this non-recursive let, the RHS's
-          // own references resolve to the OUTER binding (`let f .. = f ..` wrapping
-          // an outer f), which is what the residual-signature analysis must see.
-          record_fn_sig(id, b.expr.get(), binding_annot(b));
-          record_record_lit(id, b.expr.get());
-          scope.back()[pv->name.txt] = id;
+      LamPtr pending_catch;
+      size_t nproc = 0;  // bindings folded into l/binders before the catch
+      for (size_t bi = 0; bi < le->bindings.size(); ++bi) {
+        auto& b = le->bindings[bi];
+        if (bi == catch_bi && (pending_catch = tuple_catch(b))) break;
+        src_bounds.push_back({l->bindings.size(), binders.size()});
+        ++nproc;
+        if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
+          emit_var_binding(b, pv, l->bindings);
         } else {  // `let (a,b) = e` / `let {a;b} = e`: the irrefutable sub-vars read
           LamPtr val = expr(*b.expr);  // fields of e -- directly when e is a var, else
           // `let (a,b) = (let X = E in (e0, e1))`: ocamlc's Matching floats the
@@ -20944,24 +20985,39 @@ struct Translator {
       }
       src_bounds.push_back({l->bindings.size(), binders.size()});  // sentinel
       rec_spine_ = rec_spine;
+      // The whole group's inner term: the body, wrapped in the swallowed catch
+      // (and the plain bindings that followed it) when one fired.
+      auto make_body = [&]() -> LamPtr {
+        if (!pending_catch) return expr(*le->body);
+        auto sl = mk(Lam::K::Let);
+        rec_spine_ = false;  // as in the binding loop; only the body is on the spine
+        for (size_t bi = catch_bi + 1; bi < le->bindings.size(); ++bi)
+          emit_var_binding(le->bindings[bi],
+                           std::get_if<Ppat_var>(&le->bindings[bi].pat.desc),
+                           sl->bindings);
+        rec_spine_ = rec_spine;
+        LamPtr inner = expr(*le->body);
+        if (!sl->bindings.empty()) { sl->body = inner; inner = sl; }
+        pending_catch->then_ = inner;
+        return pending_catch;
+      };
       // Reorder to fold-right ONLY when an earlier binding's field reads would land
       // after a later binding's scrutinee (an early destructure with a later
       // flat binding).  Every other shape keeps the existing single-let assembly
       // bit-for-bit.  float_seq_val is single-binding, so it never reaches here.
       bool need_fold = false;
-      if (!float_seq_val && le->bindings.size() > 1) {
-        size_t n = le->bindings.size();
-        for (size_t s = 0; s < n && !need_fold; ++s)
+      if (!float_seq_val && nproc > 1) {
+        for (size_t s = 0; s < nproc && !need_fold; ++s)
           if (src_bounds[s].second != src_bounds[s + 1].second)  // group s has binders
-            for (size_t t = s + 1; t < n; ++t)
+            for (size_t t = s + 1; t < nproc; ++t)
               if (src_bounds[t].first != src_bounds[t + 1].first) {  // later flats
                 need_fold = true; break;
               }
       }
       if (need_fold) {
-        LamPtr body = expr(*le->body);
+        LamPtr body = make_body();
         scope.pop_back();
-        for (size_t s = le->bindings.size(); s-- > 0; ) {
+        for (size_t s = nproc; s-- > 0; ) {
           std::vector<std::pair<Ident, LamPtr>> bs(
               binders.begin() + src_bounds[s].second,
               binders.begin() + src_bounds[s + 1].second);
@@ -20976,7 +21032,7 @@ struct Translator {
         }
         return body;
       }
-      LamPtr body = wrap_binders(expr(*le->body), binders);
+      LamPtr body = wrap_binders(make_body(), binders);
       scope.pop_back();
       if (float_seq_val) {
         // Splice the component-binding inner let (its body is the fully-bound body)
