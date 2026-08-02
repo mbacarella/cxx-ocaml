@@ -11298,6 +11298,81 @@ struct Translator {
     rewrite_default_leaves(tree, fail_exit, nullptr);
     return tree;
   }
+  // combine_array's `call_switcher loc fail (Lvar len) ~low:0 len_lambda_list`:
+  // as_interval_canfail over the matched array LENGTHS with the default `high`
+  // (max_int), so the domain is closed above by a trailing fail interval.  That
+  // closure is the point -- a lone length 1 gives [(0,0,fail); (1,1,act);
+  // (2,max_int,fail)], which the Switcher collapses to ONE `(!= len 1)` test,
+  // where a domain treated as bounded would emit a truthy test on the length
+  // and take the length-1 arm for every non-empty array.
+  LamPtr len_switcher(const LamPtr& scrut, const std::vector<std::pair<int, LamPtr>>& cells,
+                      int fail_exit) {
+    if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
+    const long long low = 0, high = (1LL << 62) - 1;   // ~low:0, OCaml's max_int
+    auto fail = mk(Lam::K::Staticraise); fail->prim_arg = fail_exit;
+    std::vector<LamPtr> actions{fail};             // index 0 = fail (canfail invariant)
+    std::vector<std::pair<long long, int>> l;      // (length, action index), ascending
+    for (auto& [L, b] : cells) l.push_back({L, 0});
+    std::sort(l.begin(), l.end());
+    for (auto& [L, ai] : l) {
+      LamPtr b;
+      for (auto& [L2, b2] : cells) if (L2 == L) { b = b2; break; }
+      int found = -1;   // a cell that IS the fail action folds onto index 0
+      for (int a = 0; a < (int)actions.size(); ++a)
+        if (same_action_lam(b, actions[a])) { found = a; break; }
+      if (found < 0) { actions.push_back(b); found = (int)actions.size() - 1; }
+      ai = found;
+    }
+    std::vector<SwCase> cases;
+    std::function<void(long long, long long, int, size_t)> nofail_rec;
+    std::function<void(long long, long long, size_t)> fail_rec =
+        [&](long long cur_low, long long cur_high, size_t i) {
+          if (i == l.size()) { cases.push_back({cur_low, cur_high, 0}); return; }
+          if (l[i].second == 0) { fail_rec(cur_low, l[i].first, i + 1); return; }
+          cases.push_back({cur_low, l[i].first - 1, 0});
+          nofail_rec(l[i].first, l[i].first, l[i].second, i + 1);
+        };
+    nofail_rec = [&](long long cur_low, long long cur_high, int cur_act, size_t i) {
+      if (i == l.size()) {
+        cases.push_back({cur_low, cur_high, cur_act});
+        if (cur_high != high) cases.push_back({cur_high + 1, high, 0});
+        return;
+      }
+      long long ki = l[i].first;
+      int ai = l[i].second;
+      if (cur_high + 1 == ki) {
+        if (ai == cur_act) { nofail_rec(cur_low, ki, cur_act, i + 1); return; }
+        cases.push_back({cur_low, ki - 1, cur_act});
+        if (ai == 0) fail_rec(ki, ki, i + 1);
+        else nofail_rec(ki, ki, ai, i + 1);
+        return;
+      }
+      cases.push_back({cur_low, cur_high, cur_act});
+      if (ai == 0) { fail_rec(cur_high + 1, cur_high + 1, i); return; }
+      cases.push_back({cur_high + 1, ki - 1, 0});
+      nofail_rec(ki, ki, ai, i + 1);
+    };
+    if (l.empty()) return nullptr;
+    if (l[0].second == 0) fail_rec(low, l[0].first, 1);
+    else if (low < l[0].first) {
+      cases.push_back({low, l[0].first - 1, 0});
+      nofail_rec(l[0].first, l[0].first, l[0].second, 1);
+    } else nofail_rec(l[0].first, l[0].first, l[0].second, 1);
+    if (cases.size() < 2) return nullptr;
+    // get_edges: the first and last KEY bound the interval tests, so ordinary
+    // (small) lengths keep them enabled even though `high` is max_int.
+    long long e_lo = l.front().first, e_hi = l.back().first;
+    long long lim = 1LL << 16;
+    sw_ok_inter_ = std::llabs(e_lo) <= lim && std::llabs(e_hi) <= lim;
+    sw_memo_.clear();
+    std::vector<int> k; comp_clusters(cases, k);
+    std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
+    make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
+    if (made_switch) return nullptr;   // a jump table over lengths: not modelled
+    LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
+    rewrite_default_leaves(tree, fail_exit, nullptr);
+    return tree;
+  }
   // ctor_match's twin of gmatch's const_side: when the uncovered constant slots
   // (`covered` = explicitly matched values) were filled with a common argless
   // exit -- the shared default in a catch context -- upstream's constant side
@@ -11565,8 +11640,13 @@ struct Translator {
       for (auto& [lbl, sub] : r->fields) collect_gvars(sub.get(), out);
       return;
     }
-    // any/constant/interval/array/variant/lazy: gmatch bails on these as columns,
-    // so no leaf ever binds through them -- nothing to collect here.
+    // Likewise the array column, decomposed into one element column per length.
+    if (auto* a = std::get_if<Ppat_array>(&p->desc)) {
+      for (auto& e : a->elems) collect_gvars(e.get(), out);
+      return;
+    }
+    // any/constant/interval/variant/lazy: gmatch bails on these as columns, so
+    // no leaf ever binds through them -- nothing to collect here.
   }
   // Names bound by an actual `as`-pattern (Ppat_alias) within `p`.  Only such a
   // binding is a candidate for ocamlc's alias elision (an `as x` of an
@@ -12637,6 +12717,119 @@ struct Translator {
           else { auto l = mk(Lam::K::Let); l->bindings = {{fids[j], ofi[j].kind, fread, true}}; l->body = cb; cb = l; }
         }
         return cb;
+      }
+    }
+    // Nested ARRAY column (matching.ml's divide_array/combine_array): bind the
+    // length and call_switcher ~low:0 over it, each length's cell decomposing
+    // into that many element columns read with Parrayrefu -- StrictOpt, since an
+    // array is mutable and Simplif never inlines such a read past a possible
+    // mutation.  Without this ONE array sub-pattern bails the whole match to the
+    // caml_obj_tag if-chain: value_rec_check's classify_expression lost its
+    // 32-way switch over Texp_* to a single `[| _, Overridden (_,e) |]`.
+    // Second-pass + budgeted like the tuple/record columns above.
+    if (g_gm_tuples_) {
+      bool anyarr = false;
+      for (auto& r : rows)
+        if (std::get_if<Ppat_array>(&r.cols[0]->desc)) { anyarr = true; break; }
+      if (anyarr) {
+        if (!denv.empty()) return nullptr;   // array specialization of the def env: TODO
+        if (comps[0]->k != Lam::K::Var) return nullptr;  // need a Var for the reads
+        std::vector<int> lens;               // distinct lengths, in row order
+        bool havedflt = false;
+        std::string kind = "gen";
+        for (auto& r : rows) {
+          auto& d = r.cols[0]->desc;
+          if (auto* ar = std::get_if<Ppat_array>(&d)) {
+            // A var/any row BEFORE an array row would have to be tried first,
+            // which the per-length cells cannot do -- leave that to the caller.
+            if (havedflt) return nullptr;
+            int n = (int)ar->elems.size();
+            if (std::find(lens.begin(), lens.end(), n) == lens.end()) lens.push_back(n);
+            for (auto& e : ar->elems)
+              if (kind == "gen") kind = array_elem_kind(e.get());
+          } else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d))
+            return nullptr;
+          else havedflt = true;
+        }
+        if (g_gm_budget_ == 0) return nullptr;
+        if (g_gm_budget_ > 0) --g_gm_budget_;
+        int cdflt = havedflt ? ++next_exit_ : deid;
+        std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
+        // Per-length cells, in first-occurrence row order (stamp-stable); each
+        // binds its elements before the sub-match, as get_expr_args_array does.
+        std::vector<std::pair<int, LamPtr>> cells;
+        for (int L : lens) {
+          std::vector<MRow> sub;
+          for (auto& r : rows) {
+            auto* ar = std::get_if<Ppat_array>(&r.cols[0]->desc);
+            if (!ar || (int)ar->elems.size() != L) continue;
+            MRow nr = r; nr.cols.clear();
+            for (auto& e : ar->elems) nr.cols.push_back(effective_pat(e.get()));
+            nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
+            sub.push_back(std::move(nr));
+          }
+          // arg_to_var/name_pattern: an element bound by some row to a plain
+          // variable keeps THAT name (the first such row wins), so the arm reads
+          // its own binder rather than an anonymous `*match*`.
+          std::vector<Ident> eids((size_t)L);
+          std::vector<LamPtr> ncomps;
+          for (int j = 0; j < L; ++j) {
+            const std::string* nm = nullptr;
+            for (auto& r : sub) {
+              const Pattern* p = effective_pat(r.cols[j]);
+              if (auto* pv = std::get_if<Ppat_var>(&p->desc)) { nm = &pv->name.txt; break; }
+              if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { nm = &pa->name.txt; break; }
+            }
+            eids[j] = nm ? fresh(*nm) : fresh("match", true);
+            ncomps.push_back(varof(eids[j]));
+          }
+          ncomps.insert(ncomps.end(), rest.begin(), rest.end());
+          LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, cdflt);
+          if (!cb) return nullptr;
+          for (int j = L - 1; j >= 0; --j) {
+            auto get = mk(Lam::K::Prim); get->prim = Prim::IntCmp;
+            get->prim_id = "array.unsafe_get[" + kind + "]";
+            get->args = {comps[0], cint(j)};
+            auto bl = mk(Lam::K::Let);
+            bl->bindings = {{eids[j], ValueKind::Gen, get, false, false, /*strict_opt=*/true}};
+            bl->body = cb; cb = bl;
+          }
+          cells.push_back({L, cb});
+        }
+        // combine_array allocates `len` only after the cells are compiled.
+        Ident lv = fresh("len");
+        LamPtr lvar = varof(lv);
+        LamPtr chain = len_switcher(lvar, cells, cdflt);
+        if (!chain) return nullptr;
+        auto alen = mk(Lam::K::Prim); alen->prim = Prim::IntCmp;
+        alen->prim_id = "array.length[" + kind + "]"; alen->args = {comps[0]};
+        if (count_var(chain, lv) <= 1) subst_alias(chain, lv, alen);
+        else {
+          auto bl = mk(Lam::K::Let);
+          bl->bindings = {{lv, ValueKind::Gen, alen, /*alias=*/true}};
+          bl->body = chain; chain = bl;
+        }
+        if (havedflt) {   // the var/any default sub-matrix, compiled once behind cdflt
+          std::vector<MRow> dsub;
+          for (auto& r : rows) {
+            auto& d = r.cols[0]->desc;
+            if (std::get_if<Ppat_array>(&d)) continue;
+            MRow nr = r;
+            if (auto* pv = std::get_if<Ppat_var>(&d))
+              nr.binds.push_back({pv->name.txt, comps[0]->var});
+            nr.cols.erase(nr.cols.begin()); dsub.push_back(std::move(nr));
+          }
+          std::vector<LamPtr> cc = rest;
+          LamPtr dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid);
+          if (!dbody) return nullptr;
+          int bad = 0; int uses = count_exit(chain, cdflt, false, bad);
+          if (uses == 1 && bad == 0) inline_exit(chain, cdflt, {}, {}, dbody);
+          else if (uses > 0) {
+            auto c = mk(Lam::K::Catch);
+            c->cond = chain; c->prim_arg = cdflt; c->then_ = dbody; chain = c;
+          }
+        }
+        return chain;
       }
     }
     // Nested INT-constant column: a column whose rows are integer literals (`Pfield
@@ -18259,6 +18452,33 @@ struct Translator {
     out = {Choices{}};
     return true;
   }
+  // ocamlc's Typeopt.array_pattern_kind: the element pattern's inferred type
+  // picks the Parrayref/Parraylength specialization -- an addr/int element is a
+  // GETVECTITEM, a float element a flat-float read, and only an unknown one
+  // (type variable or abstract, which could be a flat float array) the generic
+  // C call.  Shared by pat_test's array test and gmatch's array column.
+  std::string array_elem_kind(const Pattern* ep) {
+    if (vk.abstract_elem.count(ep)) return "gen";
+    auto it = vk.pat.find(ep);
+    std::string s = it == vk.pat.end() ? "" : it->second;
+    if (s == "int") return "int";
+    if (s == "float") return "float";
+    if (s == "addr" || s == "string") return "addr";
+    if (!s.empty()) return "gen";
+    // Inference didn't record this sub-pattern: fall back to the pattern's own
+    // SHAPE, which pins the classification structurally (a tuple/record pattern
+    // is a boxed non-float; a constant pins its base type).
+    const Pattern* sp = effective_pat(ep);
+    if (std::holds_alternative<Ppat_tuple>(sp->desc) ||
+        std::holds_alternative<Ppat_record>(sp->desc)) return "addr";
+    if (auto* pc = std::get_if<Ppat_constant>(&sp->desc)) {
+      if (std::holds_alternative<Pconst_integer>(pc->c.desc) ||
+          std::holds_alternative<Pconst_char>(pc->c.desc)) return "int";
+      if (std::holds_alternative<Pconst_string>(pc->c.desc)) return "addr";
+      if (std::holds_alternative<Pconst_float>(pc->c.desc)) return "float";
+    }
+    return "gen";
+  }
   bool pat_test(const Pattern* p0, const LamPtr& acc, LamPtr& test,
                 std::vector<std::pair<Ident, LamPtr>>& binds) {
     const Pattern* p = effective_pat(p0);
@@ -18564,33 +18784,7 @@ struct Translator {
       test = if_and(test, lt);  // length first: short-circuits the element gets
       for (int i = 0; i < n; ++i) {
         const Pattern* ep = arr->elems[i].get();
-        std::string k = "gen";
-        if (!vk.abstract_elem.count(ep)) {
-          auto it = vk.pat.find(ep);
-          std::string s = it == vk.pat.end() ? "" : it->second;
-          if (s == "int") k = "int";
-          else if (s == "float") k = "float";
-          else if (s == "addr" || s == "string") k = "addr";
-          else if (s.empty()) {
-            // Inference didn't record this sub-pattern: fall back to the
-            // pattern's own SHAPE, which pins the classification structurally
-            // (a tuple/record pattern is a boxed non-float; a constant pins
-            // its base type).  Anything else stays gen (safe).
-            const Pattern* sp = effective_pat(ep);
-            if (std::holds_alternative<Ppat_tuple>(sp->desc) ||
-                std::holds_alternative<Ppat_record>(sp->desc))
-              k = "addr";
-            else if (auto* pc = std::get_if<Ppat_constant>(&sp->desc)) {
-              if (std::holds_alternative<Pconst_integer>(pc->c.desc) ||
-                  std::holds_alternative<Pconst_char>(pc->c.desc))
-                k = "int";
-              else if (std::holds_alternative<Pconst_string>(pc->c.desc))
-                k = "addr";
-              else if (std::holds_alternative<Pconst_float>(pc->c.desc))
-                k = "float";
-            }
-          }
-        }
+        std::string k = array_elem_kind(ep);
         auto get = mk(Lam::K::Prim); get->prim = Prim::IntCmp;
         get->prim_id = "array.unsafe_get[" + k + "]"; get->args = {acc, cint(i)};
         if (!pat_test(ep, get, test, binds)) return false;
