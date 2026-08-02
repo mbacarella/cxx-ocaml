@@ -7244,6 +7244,28 @@ struct Translator {
     }
     return -1;
   }
+  // The arity of a MODULE-QUALIFIED extension/exception ctor (`Lexer.Error of
+  // error * position` -> 2), read from that module's cmi typexts.
+  // opened_exn_arity only fires on a name an `open` brought into scope; a
+  // qualified pattern measures arity 1 without this, so `Lexer.Error
+  // (Unterminated_string, _)` sees ONE refutable tuple field instead of two
+  // fields and the whole arm is dropped -- parse.ml's skip_phrase reraised
+  // instead of skipping the phrase.  Returns -1 when unresolvable.
+  int qualified_exn_arity(const Longident& id) {
+    int a = -1;
+    if (unit_exn_identity(id, &a) && a >= 0) return a;
+    a = -1;
+    if (nested_exn_identity(id, &a) && a >= 0) return a;
+    return -1;
+  }
+  // The payload arity the pattern `k` destructures: the registered bare-name
+  // arity when the ctor is local or opened, else the qualified module's cmi.
+  int exn_pat_arity(const Ppat_construct* k) {
+    if (auto a = exn_arity_.find(lid_last(k->id.txt)); a != exn_arity_.end())
+      return a->second;
+    if (int a = qualified_exn_arity(k->id.txt); a > 0) return a;
+    return 1;
+  }
   // Register a bare constructor (`EINTR`) brought into scope by `open M` of a
   // separately-compiled module, by finding which opened module's cmi declares it
   // and registering its whole variant type's ctors.  Lets an exn payload pattern
@@ -7289,8 +7311,12 @@ struct Translator {
       if (!c.guard && !pattern_binds(lhsp)) {
         int eid = ++next_exit_;
         exn_shared_exit_[c.rhs] = eid;
+        exn_shared_plain_.insert(c.rhs);   // the handler IS the rhs (no guard)
         LamPtr disp = exn_dispatch(exn, expanded, 0);
         exn_shared_exit_.erase(c.rhs);
+        exn_shared_plain_.erase(c.rhs);
+        // the payload switch already placed the shared handler around itself
+        if (exn_shared_wrapped_.erase(c.rhs)) return disp;
         auto cat = mk(Lam::K::Catch);
         cat->cond = disp; cat->prim_arg = eid;
         cat->then_ = expr(*c.rhs);
@@ -7421,40 +7447,76 @@ struct Translator {
           // (Unterminated_comment _ | ..)` clause was dropped and error-recovery
           // re-raised instead of skipping.
           if (k->arg) {
-            std::string cn = lid_last(k->id.txt);
-            int arity = exn_arity_.count(cn) ? exn_arity_[cn] : 1;
-            auto fps = ctor_field_pats(k, arity);
+            int arity = exn_pat_arity(k);
             int cidx = -1;
-            bool viable = !fps.empty();
             struct SubTag { int tag; bool block; };
             std::vector<SubTag> tags;
             std::string vty_of_tags;  // the payload variant's type name
             std::vector<std::pair<std::string, int>> var_fields;  // name, field idx
-            for (size_t fi = 0; fi < fps.size() && viable; ++fi) {
-              const Pattern* f = effective_pat(fps[fi]);
-              if (std::holds_alternative<Ppat_any>(f->desc)) continue;
-              if (auto* pv2 = std::get_if<Ppat_var>(&f->desc)) {
-                var_fields.push_back({pv2->name.txt, (int)fi});
-                continue;
-              }
-              bool ctorish = std::holds_alternative<Ppat_or>(f->desc) ||
-                             std::holds_alternative<Ppat_construct>(f->desc);
-              if (!ctorish || cidx >= 0 || pattern_binds(f)) { viable = false; break; }
-              std::vector<const Pattern*> alts;
-              flatten_or(f, alts);
-              for (auto* a : alts) {
-                auto* ak = std::get_if<Ppat_construct>(&a->desc);
-                const CtorInfo* ci = ak ? pat_ctor_resolve(a, ctor_of(*a)) : nullptr;
-                if (!ci) { viable = false; break; }
-                if (vty_of_tags.empty()) vty_of_tags = ci->type;
-                else if (vty_of_tags != ci->type) { viable = false; break; }
-                // an argumented alternative must not test its own payload
-                if (ak->arg && !is_irrefutable(*effective_pat(ak->arg->get()))) {
-                  viable = false; break;
+            // Scan one `E (..)` payload for the switchable shape: at most one
+            // field is a (possibly or-) ctor pattern binding nothing, the rest
+            // are wildcards or (only for the leading row) plain vars.  Appends
+            // the alternatives' tags; false = some other shape.
+            auto scan_payload = [&](const Ppat_construct* kk, bool allow_vars,
+                                    int* out_cidx, std::vector<SubTag>* out_tags) {
+              auto fps = ctor_field_pats(kk, arity);
+              if (fps.empty()) return false;
+              *out_cidx = -1;
+              for (size_t fi = 0; fi < fps.size(); ++fi) {
+                const Pattern* f = effective_pat(fps[fi]);
+                if (std::holds_alternative<Ppat_any>(f->desc)) continue;
+                if (auto* pv2 = std::get_if<Ppat_var>(&f->desc)) {
+                  if (!allow_vars) return false;
+                  var_fields.push_back({pv2->name.txt, (int)fi});
+                  continue;
                 }
-                tags.push_back({ci->tag, ci->is_block});
+                bool ctorish = std::holds_alternative<Ppat_or>(f->desc) ||
+                               std::holds_alternative<Ppat_construct>(f->desc);
+                if (!ctorish || *out_cidx >= 0 || pattern_binds(f)) return false;
+                std::vector<const Pattern*> alts;
+                flatten_or(f, alts);
+                for (auto* a : alts) {
+                  auto* ak = std::get_if<Ppat_construct>(&a->desc);
+                  const CtorInfo* ci = ak ? pat_ctor_resolve(a, ctor_of(*a)) : nullptr;
+                  if (!ci) return false;
+                  if (vty_of_tags.empty()) vty_of_tags = ci->type;
+                  else if (vty_of_tags != ci->type) return false;
+                  // an argumented alternative must not test its own payload
+                  if (ak->arg && !is_irrefutable(*effective_pat(ak->arg->get())))
+                    return false;
+                  out_tags->push_back({ci->tag, ci->is_block});
+                }
+                *out_cidx = (int)fi;
               }
-              if (viable) cidx = (int)fi;
+              return true;
+            };
+            bool viable = scan_payload(k, true, &cidx, &tags);
+            // `| E (A _, _) | E (B, _) -> body`: ocamlc's matcher splits on the
+            // payload COLUMN, so every alternative of ONE identity lands in a
+            // single switch.  The or-expansion above made them consecutive rows
+            // sharing one body; absorb the siblings that test the same field of
+            // the same ctor and bind nothing, else each emits its own identity
+            // test and switch.
+            size_t consumed = 1;
+            if (viable && cidx >= 0 && !tags.empty() && var_fields.empty() &&
+                !c.guard && row_aliases.empty()) {
+              std::string ktxt;
+              if (lid_to_dotted(k->id.txt, ktxt))
+                while (i + consumed < rows.size()) {
+                  const Row& r2 = rows[i + consumed];
+                  if (r2.rhs != c.rhs || r2.guard) break;
+                  auto* k2 = std::get_if<Ppat_construct>(&effective_pat(r2.lhs)->desc);
+                  std::string k2txt;
+                  if (!k2 || !k2->arg || !lid_to_dotted(k2->id.txt, k2txt) ||
+                      k2txt != ktxt)
+                    break;
+                  int cidx2 = -1;
+                  std::vector<SubTag> tags2;
+                  if (!scan_payload(k2, false, &cidx2, &tags2)) break;
+                  if (cidx2 != cidx || tags2.empty()) break;
+                  tags.insert(tags.end(), tags2.begin(), tags2.end());
+                  ++consumed;
+                }
             }
             // de-duplicate repeated alternatives (same tag+shape)
             if (viable) {
@@ -7475,9 +7537,11 @@ struct Translator {
               // payload fields aliased to their field reads, a guard tested
               // with guard-fail exiting to the remainder)
               LamPtr body = nullptr;
+              int shared_eid = -1;
               if (!c.guard)
                 if (auto sh = exn_shared_exit_.find(c.rhs); sh != exn_shared_exit_.end()) {
                   body = mk(Lam::K::Staticraise); body->prim_arg = sh->second;
+                  shared_eid = sh->second;
                 }
               if (!body) {
                 scope.emplace_back();
@@ -7614,9 +7678,31 @@ struct Translator {
               test->args = {lhs, id};
               auto iff = mk(Lam::K::IfThenElse);
               iff->cond = test; iff->then_ = then_part; iff->else_ = restL();
+              // With every alternative of the alternation folded into this one
+              // switch, ocamlc's shared-action catch sits AROUND the switch and
+              // the failure handler outside it (share_actions_sw wraps the
+              // switch; the fail action is reintroduced outermost) -- so the
+              // body is emitted before the reraise, not after.  Place it here
+              // and tell the or-expansion above not to wrap again.
+              // `i == 0` plus the rhs check means rows [0, consumed) are ALL the
+              // rows citing the shared exit, so every (exit shared) really is
+              // inside the catch placed here; a mixed-identity alternation
+              // (`Simple A | Error (A, _)`) folds only its first identity and
+              // must leave the wrap to the caller.
+              LamPtr inner = iff;
+              if (shared_eid >= 0 && i == 0 && exn_shared_plain_.count(c.rhs) &&
+                  (consumed >= rows.size() || rows[consumed].rhs != c.rhs)) {
+                auto bc = mk(Lam::K::Catch);
+                bc->cond = inner; bc->prim_arg = shared_eid;
+                exn_shared_exit_.erase(c.rhs);   // compile the body as itself
+                bc->then_ = expr(*c.rhs);
+                exn_shared_exit_[c.rhs] = shared_eid;
+                exn_shared_wrapped_.insert(c.rhs);
+                inner = bc;
+              }
               auto rc = mk(Lam::K::Catch);
-              rc->cond = iff; rc->prim_arg = rest_eid;
-              rc->then_ = exn_dispatch(exn, rows, i + 1);
+              rc->cond = inner; rc->prim_arg = rest_eid;
+              rc->then_ = exn_dispatch(exn, rows, i + consumed);
               return rc;
             }
           }
@@ -7790,6 +7876,13 @@ struct Translator {
   // rhs of a non-binding or-alternation being shared behind a static catch:
   // rows citing it compile to (exit N) instead of duplicating the action.
   std::map<const Expression*, int> exn_shared_exit_;
+  // Alternations whose shared handler the payload switch already placed around
+  // itself (ocamlc's nesting: body catch inside, failure catch outside), so the
+  // or-expansion that opened the exit must not wrap a second one.
+  std::set<const Expression*> exn_shared_wrapped_;
+  // Alternations whose shared exit's handler is the rhs itself -- the guarded
+  // variant's handler is the GUARD test, so its exit must not be re-placed.
+  std::set<const Expression*> exn_shared_plain_;
   // When set, exn_dispatch's exhausted-rows tail exits here instead of
   // reraising.  Used to dispatch JUST the alternatives of a guarded or-pattern:
   // a no-alternative-matched fall-through jumps past the shared guarded handler
@@ -7871,8 +7964,7 @@ struct Translator {
         return body;
       }
     }
-    int arity = 1;
-    if (auto a = exn_arity_.find(name); a != exn_arity_.end()) arity = a->second;
+    int arity = exn_pat_arity(k);
     auto fps = ctor_field_pats(k, arity);
     if ((int)fps.size() != arity) return nullptr;
     auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
@@ -16917,7 +17009,7 @@ struct Translator {
           }
           continue;
         }
-        int arity = exn_arity_.count(n) ? exn_arity_[n] : 1;
+        int arity = exn_pat_arity(k);
         for (auto* fp : ctor_field_pats(k, arity)) {
           const Pattern* e = effective_pat(fp);
           if (auto* pc = std::get_if<Ppat_constant>(&e->desc)) {
@@ -18966,6 +19058,12 @@ struct Translator {
           if (auto* pa = std::get_if<Ppat_alias>(&ep->desc)) { en = pa->name.txt; break; }
         }
         tr->var = fresh(en.empty() ? "exn" : en);
+        // Register the constructors named in the exception patterns, as the
+        // value path does in compile_match and try/with does at Pexp_try: a
+        // payload ctor (`Lexer.Error (Unterminated_comment _, _)`) is otherwise
+        // unresolved, so its variant type's ctor counts are unknown and the
+        // payload dispatch degrades from ocamlc's switch to a tag chain.
+        for (auto& r : erows) scan_pat_ctors(*r.lhs);
         scope.emplace_back();
         caught_exn_.push_back(tr->var);
         tr->then_ = exn_dispatch(tr->var, erows, 0);
