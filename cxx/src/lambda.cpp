@@ -13454,15 +13454,22 @@ struct Translator {
           const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
           if (!ci->is_block || ci->tag != t) continue;
           std::vector<const Pattern*> fps;
+          const std::string* whole = nullptr;   // `K x`: x names the block itself
           if (inl) {
             const Pattern* ap = k->arg ? effective_pat(k->arg->get()) : nullptr;
             auto* pr = ap ? std::get_if<Ppat_record>(&ap->desc) : nullptr;
             if (!pr) {
               // `K _` (or no arg): every inline-record field is a wildcard -- span
               // them all, like ctor_field_pats does for a plain `C _` on a multi-arg
-              // ctor.  A whole inline-record value bind (`K x`) is not expressible in
-              // OCaml, so a non-record, non-wildcard arg is genuinely unsupported.
-              if (ap && !std::holds_alternative<Ppat_any>(ap->desc)) return nullptr;
+              // ctor.  `K x` binds x to the WHOLE inline record: get_expr_args_constr's
+              // `cstr_inlined <> None` branch (matching.ml:2053) hands the sub-match
+              // the block ITSELF, Alias-bound, rather than field reads -- so x is the
+              // column scrutinee and every field column is a wildcard just the same.
+              if (ap && !std::holds_alternative<Ppat_any>(ap->desc)) {
+                auto* pv = std::get_if<Ppat_var>(&ap->desc);
+                if (!pv || comps[0]->k != Lam::K::Var) return nullptr;
+                whole = &pv->name.txt;
+              }
               for (size_t j = 0; j < rlab.size(); ++j) fps.push_back(&any_pat);
             } else
               for (size_t j2 = 0; j2 < rlab.size(); ++j2) {
@@ -13484,6 +13491,13 @@ struct Translator {
           }
           MRow nr; nr.rhs = r.rhs; nr.binds = r.binds; nr.guard = r.guard;
           nr.aid = r.aid; nr.vnames = r.vnames;   // keep action-sharing through the split
+          if (whole) {
+            nr.binds.push_back({*whole, comps[0]->var});
+            // remember the ctor so `x.label` in the arm resolves through rlabels
+            // (an ambiguous label find_field would bail on), as the fallback
+            // constructor path does for the same shape
+            inline_rec_var_[comps[0]->var.stamp] = ci;
+          }
           for (auto* fp : fps) nr.cols.push_back(fp);
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
@@ -13710,6 +13724,48 @@ struct Translator {
       collect_inline_fvar_paths(k->arg->get(), out);
     }
   }
+  // Companion to collect_inline_fvar_paths for a WHOLE inline record: `K x` binds
+  // x to the constructor block itself, and `x.label` then resolves through the
+  // ctor's rlabels (inline_rec_field).  A shared arm's handler binds its own catch
+  // param for x, so the ctor has to be re-registered against THAT stamp or the
+  // projection falls back to a foreign same-named record -- or to nothing.
+  void collect_inline_whole_vars(const Pattern* p0,
+                                 std::map<std::string, const CtorInfo*>& out) {
+    const Pattern* p = effective_pat(p0);
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+      collect_inline_whole_vars(pa->p.get(), out); return;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+      collect_inline_whole_vars(o->l.get(), out);
+      collect_inline_whole_vars(o->r.get(), out); return;
+    }
+    if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (auto& e : tu->elems) collect_inline_whole_vars(e.get(), out); return;
+    }
+    if (auto* ar = std::get_if<Ppat_array>(&p->desc)) {
+      for (auto& e : ar->elems) collect_inline_whole_vars(e.get(), out); return;
+    }
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [l, s] : pr->fields) collect_inline_whole_vars(s.get(), out); return;
+    }
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
+      if (!k->arg) return;
+      const Pattern* ap = effective_pat(k->arg->get());
+      if (auto* pv = std::get_if<Ppat_var>(&ap->desc)) {
+        const CtorInfo* cinfo = nullptr;
+        if (std::holds_alternative<Ldot>(k->id.txt.v))
+          if (const CtorInfo* qc = qualified_ctor_info(k->id.txt); qc && !qc->rlabels.empty())
+            cinfo = qc;
+        if (!cinfo) {
+          auto ci = ctor_info_.find(lid_last(k->id.txt));
+          if (ci != ctor_info_.end() && !ci->second.rlabels.empty()) cinfo = &ci->second;
+        }
+        if (cinfo) out.emplace(pv->name.txt, cinfo);
+        return;
+      }
+      collect_inline_whole_vars(k->arg->get(), out);
+    }
+  }
   // Set up an arm from its full pattern (var collection) and body.  Allocates the
   // exit id + fresh catch-vars; the caller points its MRow(s) at &a.vnames/a.aid.
   GArm setup_garm(const Pattern* full, const Expression* rhs) {
@@ -13719,12 +13775,16 @@ struct Translator {
     a.aid = ++next_exit_;
     std::map<std::string, std::string> fvp;
     collect_inline_fvar_paths(full, fvp);
+    std::map<std::string, const CtorInfo*> iwv;
+    collect_inline_whole_vars(full, iwv);
     for (size_t k = 0; k < a.vnames.size(); ++k) {
       // Catch params carry the arm's user names (upstream's or-pattern handler
       // vars ARE the bound idents) -- cosmetic, but keeps -dlambda comparable.
       a.cvars.push_back(fresh(a.vnames[k], false)); a.kinds.push_back(ValueKind::Gen);
       if (auto pit = fvp.find(a.vnames[k]); pit != fvp.end())
         var_record_path_[a.cvars.back().stamp] = pit->second;
+      if (auto wit = iwv.find(a.vnames[k]); wit != iwv.end())
+        inline_rec_var_[a.cvars.back().stamp] = wit->second;
     }
     return a;
   }
@@ -14072,6 +14132,11 @@ struct Translator {
           scope.back()[a.vnames[k]] = *alias[k];       // reference the ambient var
         } else
           scope.back()[a.vnames[k]] = a.cvars[k];
+        // A `K x` whole-inline-record binder resolves `x.label` through the ctor
+        // (setup_garm registered it against the catch param) -- carry that to
+        // whichever ident the handler actually reads x through.
+        if (auto ir = inline_rec_var_.find(a.cvars[k].stamp); ir != inline_rec_var_.end())
+          inline_rec_var_[scope.back()[a.vnames[k]].stamp] = ir->second;
       }
       LamPtr handler = expr(*a.rhs);
       scope.pop_back();
