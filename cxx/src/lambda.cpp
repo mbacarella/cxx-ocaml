@@ -7282,12 +7282,111 @@ struct Translator {
   // translation), so sub-matches can be built from inner sub-patterns without
   // copying the move-only Case.  guard==nullptr means no `when`.
   struct Row { const Pattern* lhs; const Expression* rhs; const Expression* guard; };
+  // Matching.toplevel_handler: the failure action is ONE static handler, its
+  // exit allocated before the match is compiled and the catch placed outermost
+  // -- so the reraise is emitted after every arm body and each failure edge
+  // branches to it.  simplify_static_catches folds it back to the old inline
+  // shape whenever a single edge cites it, which is the common case.
+  LamPtr exn_dispatch_top(const Ident& exn, const std::vector<Row>& rows) {
+    int fail_eid = ++next_exit_;
+    std::optional<int> saved = exn_fail_exit_;
+    exn_fail_exit_ = fail_eid;
+    LamPtr body = exn_dispatch(exn, rows, 0);
+    exn_fail_exit_ = saved;
+    auto rr = mk(Lam::K::Prim); rr->prim = Prim::Reraise;
+    auto v = mk(Lam::K::Var); v->var = exn; rr->args = {v};
+    auto cat = mk(Lam::K::Catch);
+    cat->cond = body; cat->prim_arg = fail_eid; cat->then_ = rr;
+    return cat;
+  }
+  // The runtime identity of an exception/extension constructor pattern: a
+  // module-qualified one resolves to that module's own field first (so `M1.E`
+  // and `M2.E` stay apart), then the stdlib/local module export field, then a
+  // nested submodule's typext, and only then the bare binder.  The QUALIFIED
+  // resolutions must precede the bare-name fallback: a local `exception Error`
+  // does not shadow a qualified `Cmi_format.Error` arm (persistent_env matches
+  // both -- resolving the qualified arm to the local binder made the local
+  // raise take the Cmi_format arm and left the real Cmi_format.Error
+  // uncaught), and a same-named LOCAL exn (typetexp's own `Error.In_context`)
+  // must not be picked for BOTH arms of `with Error.In_context _ |
+  // Env.Error.In_context _ ->`.  nested_exn_identity confirms the name is a
+  // typext of that submodule, so it never mis-reads a variant ctor.
+  LamPtr exn_ctor_identity(const Longident& lid) {
+    LamPtr id0 = module_ctor_identity(lid);
+    if (!id0)
+      if (auto* d = std::get_if<Ldot>(&lid.v))
+        if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+          if (LamPtr base = module_base(pl->name)) {
+            if (auto f = local_member_index(pl->name, d->name))
+              id0 = fieldimm(*f, base);
+          }
+          if (!id0) {
+            auto& fm = fields_of(pl->name);
+            if (auto f = fm.find(d->name); f != fm.end()) {
+              // The module's runtime global: a stdlib submodule is
+              // `Stdlib__M`, but a separately-compiled unit (e.g. the
+              // compiler's own `Syntaxerr`) is just `M`.
+              id0 = field_of(global_of(pl->name), f->second);
+            }
+          }
+        }
+    if (!id0 && std::holds_alternative<Ldot>(lid.v))
+      id0 = nested_exn_identity(lid, nullptr);
+    if (!id0) id0 = exn_value(lid_last(lid));
+    return id0;
+  }
+  // A comparable text for such an identity, or "" when the shape is not one of
+  // the pure reads exn_ctor_identity builds (then nothing is concluded).
+  static std::string exn_id_key(const LamPtr& l) {
+    if (!l) return "";
+    if (l->k == Lam::K::Var) return "v" + std::to_string(l->var.stamp);
+    if (l->k != Lam::K::Prim) return "";
+    std::string a;
+    for (auto& x : l->args) {
+      std::string s = exn_id_key(x);
+      if (s.empty()) return "";
+      a += s + ",";
+    }
+    return "p" + std::to_string((int)l->prim) + ":" + std::to_string(l->prim_arg) +
+           ":" + l->prim_id + "(" + a + ")";
+  }
+  // Whether the head constructor's specialization keeps NO later row -- i.e. a
+  // failure inside row `from - 1`'s arm (its guard, its payload tests) can only
+  // be the match's own failure (Matching.patch_guarded compiles a guarded row's
+  // else against the rows the specialization keeps, and Parmatch.compat keeps a
+  // row only when its head may be the same constructor).  Two constructors with
+  // different last names are always distinct; same-named ones are compared by
+  // resolved identity.  Anything else -- a wildcard, a var, an or-pattern with
+  // one, an identity we cannot read -- keeps the fall-to-the-remainder shape.
+  bool exn_rest_distinct(const std::vector<Row>& rows, size_t from,
+                         const std::string& cn, const LamPtr& id) {
+    std::string k0;
+    for (size_t j = from; j < rows.size(); ++j) {
+      std::vector<const Pattern*> alts;
+      const Pattern* p = effective_pat(rows[j].lhs);
+      while (auto* pa = std::get_if<Ppat_alias>(&p->desc)) p = effective_pat(pa->p.get());
+      flatten_or(p, alts);
+      for (auto* a : alts) {
+        while (auto* pa = std::get_if<Ppat_alias>(&a->desc)) a = effective_pat(pa->p.get());
+        auto* kk = std::get_if<Ppat_construct>(&a->desc);
+        if (!kk) return false;
+        if (lid_last(kk->id.txt) != cn) continue;
+        if (k0.empty() && (k0 = exn_id_key(id)).empty()) return false;
+        std::string k1 = exn_id_key(exn_ctor_identity(kk->id.txt));
+        if (k1.empty() || k1 == k0) return false;
+      }
+    }
+    return true;
+  }
   // Compile a `try ... with` handler body: an if-chain testing the caught
-  // exception `exn` against each case, falling through to (reraise exn).
+  // exception `exn` against each case, falling through to the failure action.
   LamPtr exn_dispatch(const Ident& exn, const std::vector<Row>& rows, size_t i) {
     if (i >= rows.size()) {
       if (exn_dispatch_fall_) {  // dispatching a guarded or-pattern's alternatives
         auto x = mk(Lam::K::Staticraise); x->prim_arg = *exn_dispatch_fall_; return x;
+      }
+      if (exn_fail_exit_) {
+        auto x = mk(Lam::K::Staticraise); x->prim_arg = *exn_fail_exit_; return x;
       }
       auto rr = mk(Lam::K::Prim); rr->prim = Prim::Reraise;
       auto v = mk(Lam::K::Var); v->var = exn; rr->args = {v}; return rr;
@@ -7387,44 +7486,7 @@ struct Translator {
           if (!exn_arity_.count(cn))
             if (int a = opened_exn_arity(cn); a > 0) exn_arity_[cn] = a;
         }
-        // a module-qualified exception/extension ctor resolves to that module's
-        // own field first (distinguishes `M1.E` from `M2.E`); else the binder.
-        LamPtr id0 = module_ctor_identity(k->id.txt);
-        // A stdlib module's exception (`Lazy.Undefined`): its identity is the
-        // module's runtime export field.  A LOCAL module's (incl. one spliced
-        // in by `include Stack` -- `with S.Empty ->`): its layout field.
-        // This QUALIFIED resolution must run BEFORE the bare-name fallback:
-        // a local `exception Error` does not shadow a qualified
-        // `Cmi_format.Error` arm (persistent_env matches both -- resolving
-        // the qualified arm to the local binder made the local raise take
-        // the Cmi_format arm and left the real Cmi_format.Error uncaught).
-        if (!id0)
-          if (auto* d = std::get_if<Ldot>(&k->id.txt.v))
-            if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
-              if (LamPtr base = module_base(pl->name)) {
-                if (auto f = local_member_index(pl->name, d->name))
-                  id0 = fieldimm(*f, base);
-              }
-              if (!id0) {
-                auto& fm = fields_of(pl->name);
-                if (auto f = fm.find(d->name); f != fm.end()) {
-                  // The module's runtime global: a stdlib submodule is
-                  // `Stdlib__M`, but a separately-compiled unit (e.g. the
-                  // compiler's own `Syntaxerr`) is just `M`.
-                  id0 = field_of(global_of(pl->name), f->second);
-                }
-              }
-            }
-        // A NESTED-import exn ctor (`Env.Error.In_context`): its identity is a
-        // field of the submodule's block, read from the head unit's cmi.  Must
-        // run before the bare-name fallback -- else a same-named LOCAL exn
-        // (typetexp's own `Error.In_context`) is picked for BOTH arms of
-        // `with Error.In_context _ | Env.Error.In_context _ ->`, silently
-        // dropping the imported arm.  nested_exn_identity confirms the name is a
-        // typext of that submodule, so it never mis-reads a variant ctor.
-        if (!id0 && std::holds_alternative<Ldot>(k->id.txt.v))
-          id0 = nested_exn_identity(k->id.txt, nullptr);
-        if (!id0) id0 = exn_value(lid_last(k->id.txt));
+        LamPtr id0 = exn_ctor_identity(k->id.txt);
         if (LamPtr id = id0) {
           auto exv = [&] { auto v = mk(Lam::K::Var); v->var = exn; return v; };
           LamPtr lhs;
@@ -7532,6 +7594,17 @@ struct Translator {
               auto restL = [&] {
                 auto x = mk(Lam::K::Staticraise); x->prim_arg = rest_eid; return x;
               };
+              // The identity test's own failure falls to the next row, but a
+              // failure INSIDE the arm (the guard, an unmatched payload tag)
+              // falls to what the head ctor's specialization keeps -- the
+              // match's failure action when it keeps nothing at all.
+              int fail_tgt = rest_eid;
+              if (exn_fail_exit_ && !exn_dispatch_fall_ &&
+                  exn_rest_distinct(rows, i + consumed, lid_last(k->id.txt), id))
+                fail_tgt = *exn_fail_exit_;
+              auto failL = [&] {
+                auto x = mk(Lam::K::Staticraise); x->prim_arg = fail_tgt; return x;
+              };
               // the arm body: the or-alternation's shared exit if one is open,
               // else the compiled rhs (row aliases bound to the exn value, var
               // payload fields aliased to their field reads, a guard tested
@@ -7556,7 +7629,7 @@ struct Translator {
                 body = expr(*c.rhs);
                 if (c.guard) {  // `when g`: guard-fail falls to the remainder
                   auto gi = mk(Lam::K::IfThenElse);
-                  gi->cond = expr(*c.guard); gi->then_ = body; gi->else_ = restL();
+                  gi->cond = expr(*c.guard); gi->then_ = body; gi->else_ = failL();
                   body = gi;
                 }
                 if (!field_binds.empty()) {
@@ -7618,19 +7691,19 @@ struct Translator {
                     c_max = cnt; def_target = id;
                   }
                 };
-                if (missing > 0) consider(rest_eid, missing);
+                if (missing > 0) consider(fail_tgt, missing);
                 if (body_target >= 0) consider(body_target, (int)tags.size());
                 if (c_max < 3) def_target = -1;
                 for (int t2 = 0; t2 < nc; ++t2) {
-                  LamPtr act = cset[t2] ? case_body() : restL();
-                  int tgt = cset[t2] ? body_target : rest_eid;
+                  LamPtr act = cset[t2] ? case_body() : failL();
+                  int tgt = cset[t2] ? body_target : fail_tgt;
                   if (def_target >= 0 && tgt == def_target &&
                       act->k == Lam::K::Staticraise) continue;
                   sw->sw_consts.push_back({t2, act});
                 }
                 for (int t2 = 0; t2 < nb; ++t2) {
-                  LamPtr act = bset[t2] ? case_body() : restL();
-                  int tgt = bset[t2] ? body_target : rest_eid;
+                  LamPtr act = bset[t2] ? case_body() : failL();
+                  int tgt = bset[t2] ? body_target : fail_tgt;
                   if (def_target >= 0 && tgt == def_target &&
                       act->k == Lam::K::Staticraise) continue;
                   sw->sw_blocks.push_back({t2, act});
@@ -7651,7 +7724,7 @@ struct Translator {
                 // ctor by physical equality (a block never equals an
                 // immediate), a block ctor by caml_obj_tag (an immediate tags
                 // as 1000, never a variant tag).
-                LamPtr chain = restL();
+                LamPtr chain = failL();
                 for (auto it = tags.rbegin(); it != tags.rend(); ++it) {
                   LamPtr lhsf = fieldimm(cidx + 1, exv());
                   if (it->block) {
@@ -7714,13 +7787,24 @@ struct Translator {
           auto exitL = [&] {
             auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x;
           };
+          // ... but only the identity test's failure really falls to the next
+          // row; a guard or payload test failing means no later row the head
+          // ctor's specialization keeps can match either (exn_rest_distinct).
+          int arm_fail = -1;
+          if (exn_fail_exit_ && !exn_dispatch_fall_ &&
+              exn_rest_distinct(rows, i + 1, lid_last(k->id.txt), id))
+            arm_fail = *exn_fail_exit_;
+          auto failL = [&] {
+            auto x = mk(Lam::K::Staticraise);
+            x->prim_arg = arm_fail >= 0 ? arm_fail : eid; return x;
+          };
           LamPtr shared_body = nullptr;  // shared or-alternation action: (exit N)
           if (auto sh = exn_shared_exit_.find(c.rhs); sh != exn_shared_exit_.end()) {
             shared_body = mk(Lam::K::Staticraise); shared_body->prim_arg = sh->second;
           }
           LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs, &ptests,
                                       &row_aliases, c.guard,
-                                      c.guard ? exitL() : nullptr, shared_body);
+                                      c.guard ? failL() : nullptr, shared_body);
           if (!then) return exn_dispatch(exn, rows, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
           test->args = {lhs, id};
@@ -7740,7 +7824,7 @@ struct Translator {
               }
               t->args = {lhsf, it->rhs};
               auto pf = mk(Lam::K::IfThenElse);
-              pf->cond = t; pf->then_ = then; pf->else_ = exitL();
+              pf->cond = t; pf->then_ = then; pf->else_ = failL();
               then = pf;
             }
             auto iff = mk(Lam::K::IfThenElse);
@@ -7888,6 +7972,11 @@ struct Translator {
   // a no-alternative-matched fall-through jumps past the shared guarded handler
   // (see the guarded shared-exit path in the Ppat_or branch).
   std::optional<int> exn_dispatch_fall_;
+  // Matching.toplevel_handler's `final_exit`: the whole dispatch's failure
+  // action (the reraise), allocated BEFORE the rows are compiled and wrapped
+  // outermost, so a row's internal failure that no later row can catch exits
+  // here rather than re-running the remaining identity tests.
+  std::optional<int> exn_fail_exit_;
   // rhs shared between a value arm and an exception arm of one mixed
   // value/exception or-pattern (`| exception E | () -> body`): ocamlc emits the
   // body ONCE behind an outer catch and both the value-match arm and the exn
@@ -8156,7 +8245,7 @@ struct Translator {
       auto rr = mk(Lam::K::Prim); rr->prim = Prim::Reraise; rr->args = {varof(exn)};
       efn->body = rr;
     } else {
-      efn->body = exn_dispatch(exn, erows, 0);
+      efn->body = exn_dispatch_top(exn, erows);
     }
     caught_exn_.pop_back();
     scope.pop_back();
@@ -9259,7 +9348,7 @@ struct Translator {
       tr->var = fresh("exn");
       scope.emplace_back();
       caught_exn_.push_back(tr->var);
-      tr->then_ = exn_dispatch(tr->var, erows, 0);
+      tr->then_ = exn_dispatch_top(tr->var, erows);
       caught_exn_.pop_back();
       scope.pop_back();
       auto cat = mk(Lam::K::Catch);
@@ -19066,7 +19155,7 @@ struct Translator {
         for (auto& r : erows) scan_pat_ctors(*r.lhs);
         scope.emplace_back();
         caught_exn_.push_back(tr->var);
-        tr->then_ = exn_dispatch(tr->var, erows, 0);
+        tr->then_ = exn_dispatch_top(tr->var, erows);
         caught_exn_.pop_back();
         scope.pop_back();
         // All-exception shared or-patterns: wrap the exn dispatch itself in the
@@ -21353,7 +21442,7 @@ struct Translator {
       } else {
         l->var = fresh("exn");
         caught_exn_.push_back(l->var);
-        l->then_ = exn_dispatch(l->var, rows_of(tr->cases), 0);
+        l->then_ = exn_dispatch_top(l->var, rows_of(tr->cases));
       }
       caught_exn_.pop_back();
       scope.pop_back();
