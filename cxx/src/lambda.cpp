@@ -12649,19 +12649,32 @@ struct Translator {
       // already produces -- while a default-matrix recompile would re-dispatch
       // a column the specialized side has fully determined, leaving a dead
       // Match_failure arm no ctx model prunes (build_path_prefix_map's
-      // decode_pair, signature_group's `None,_ | _,Some _`).
+      // decode_pair, signature_group's `None,_ | _,Some _`).  Those all put the
+      // ctor alternative FIRST, so the specialized side runs before the shared
+      // var row; an or-alternative that LEADS the column (mtype's
+      // `{type_manifest = None} | {type_kind = Type_abstract _; ..}`) is the
+      // plain split instead -- upstream's leading var run is its own
+      // half-match and the ctor run its default.  So decline the shared arm
+      // only once a ctor row has already been seen, and only in a matrix that
+      // HAS an upstream counterpart: a spread matrix (var rows copied into a
+      // specialization) is ours alone, so its row order carries no upstream
+      // split to model and the leading-var allowance would just re-dispatch a
+      // column the copy already fixed (translprim's has_constant_constructor).
       std::set<int> ctor_aids;
-      for (auto& r : rows)
+      bool spread_any = false;
+      for (auto& r : rows) {
+        if (r.spread) spread_any = true;
         if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) ctor_aids.insert(r.aid);
-      bool anyv = false, nontriv = false, ok = true, has_spread = false;
+      }
+      bool anyv = false, nontriv = false, ok = true, has_spread = false, seen_ctor = false;
       for (auto& r : rows) {
         // Every row aid-shared: leaves emit `(exit aid)` only, so a rejected
         // attempt never runs expr() (whose side effects the state restore
         // below could not undo).
         if (r.guard || r.aid < 0) { ok = false; break; }
         if (r.spread) has_spread = true;
-        if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) continue;
-        if (ctor_aids.count(r.aid)) { ok = false; break; }
+        if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) { seen_ctor = true; continue; }
+        if ((seen_ctor || spread_any) && ctor_aids.count(r.aid)) { ok = false; break; }
         anyv = true;
         for (size_t j = 1; j < r.cols.size() && !nontriv; ++j)
           if (!gmdef_omega(gmdef_peel(r.cols[j]))) nontriv = true;
