@@ -16364,17 +16364,42 @@ struct Translator {
         if (&r == dflt) continue;
         if (!body_of.count(r.rhs)) body_of[r.rhs] = expr(*r.rhs);
       }
+      // A row spanning several tags is an OR-pattern row: upstream's split_or
+      // gives it a PmOr handler, so its action is already a bare (exit i) by
+      // the time the Switcher stores actions, and compile_orhandlers wraps the
+      // catch OUTSIDE the finished match, in ROW order (first row innermost).
+      // Only the single-tag rows can still reach the Switcher's own action
+      // sharing, whose handlers therefore nest inside all of these.
+      std::map<const Expression*, int> ntags;
+      for (auto& kv : kvs) ntags[kv.rhs]++;
+      std::vector<std::pair<int, LamPtr>> orcatches;  // (exit, handler), row order
+      for (auto& r : rows) {                          // source order
+        if (&r == dflt || ntags[r.rhs] < 2) continue;
+        auto it = body_of.find(r.rhs);
+        if (it == body_of.end() || oc_is_exit(it->second)) continue;
+        int e = ++next_exit_;
+        orcatches.push_back({e, it->second});
+        it->second = oc_exit(e);
+      }
       std::vector<std::pair<int, LamPtr>> cases;
       for (auto& kv : kvs) cases.push_back({(int)kv.h, body_of[kv.rhs]});
-      if (!dflt) return oc_call_switcher(scrut, cases, /*fail=*/nullptr, /*test_seq=*/true);
-      int eid = ++next_exit_;
-      LamPtr tree = oc_call_switcher(scrut, cases, oc_exit(eid), /*test_seq=*/true);
-      auto isi = mk(Lam::K::Prim); isi->prim = Prim::IntCmp;
-      isi->prim_id = "isint"; isi->args = {scrut};
-      auto c = mk(Lam::K::Catch);
-      c->cond = iff(isi, tree, oc_exit(eid));
-      c->prim_arg = eid; c->then_ = bind_dflt();
-      return c;
+      LamPtr res;
+      if (!dflt) res = oc_call_switcher(scrut, cases, /*fail=*/nullptr, /*test_seq=*/true);
+      else {
+        int eid = ++next_exit_;
+        LamPtr tree = oc_call_switcher(scrut, cases, oc_exit(eid), /*test_seq=*/true);
+        auto isi = mk(Lam::K::Prim); isi->prim = Prim::IntCmp;
+        isi->prim_id = "isint"; isi->args = {scrut};
+        auto c = mk(Lam::K::Catch);
+        c->cond = iff(isi, tree, oc_exit(eid));
+        c->prim_arg = eid; c->then_ = bind_dflt();
+        res = c;
+      }
+      for (auto& [e, h] : orcatches) {
+        auto c = mk(Lam::K::Catch); c->cond = res; c->prim_arg = e; c->then_ = h;
+        res = c;
+      }
+      return res;
     }
     if (!dflt) {
       std::function<LamPtr(int, int)> tree = [&](int lo, int hi) -> LamPtr {
