@@ -8428,12 +8428,20 @@ struct Translator {
     // that already HAS a failaction (an earlier pass promoted one) must keep
     // it reachable: no collapse, and refail below is skipped (upstream's
     // `Some _ -> sw`).
+    // Keyed at upstream's cell size: our arms have already substituted the
+    // constructor's argument binds, which still count against make_key's
+    // max_raw there (see oc_make_key).  Only a Var scrutinee is corrected --
+    // that is the shape arg_to_var always leaves upstream.
+    int ss = sw->cond && sw->cond->k == Lam::K::Var ? sw->cond->var.stamp : -1;
+    auto cell_key = [&](const Lam::SwitchCase& c) {
+      return oc_make_key(c.body, ss >= 0 ? c.arity : -1, ss);
+    };
     if (!sw->sw_default) {
       std::string k0; bool all = true; const LamPtr* first = nullptr;
       for (auto* v : {&sw->sw_consts, &sw->sw_blocks}) {
         for (auto& c : *v) {
-          if (!first) { first = &c.body; k0 = oc_make_key(c.body); if (k0.empty()) { all = false; break; } }
-          else if (oc_make_key(c.body) != k0) { all = false; break; }
+          if (!first) { first = &c.body; k0 = cell_key(c); if (k0.empty()) { all = false; break; } }
+          else if (cell_key(c) != k0) { all = false; break; }
         }
         if (!all) break;
       }
@@ -8444,14 +8452,9 @@ struct Translator {
     std::vector<Slot> acts;
     std::map<std::string, int> keyed;
     std::vector<int> cidx, bidx;
-    // Keyed at upstream's cell size: our arms have already substituted the
-    // constructor's argument binds, which still count against make_key's
-    // max_raw there (see oc_make_key).  Only a Var scrutinee is corrected --
-    // that is the shape arg_to_var always leaves upstream.
-    int ss = sw->cond && sw->cond->k == Lam::K::Var ? sw->cond->var.stamp : -1;
     auto store_act = [&](const Lam::SwitchCase& c) -> int {
       const LamPtr& a = c.body;
-      std::string k = oc_make_key(a, ss >= 0 ? c.arity : -1, ss);
+      std::string k = cell_key(c);
       if (!k.empty()) {
         auto it = keyed.find(k);
         if (it != keyed.end()) { acts[it->second].shared = true; return it->second; }
