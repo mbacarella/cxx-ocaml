@@ -2456,14 +2456,43 @@ struct Translator {
   // earlier same-level binding `lookup` would find first.  No-op for stdlib /
   // imported modules (those have no runtime base to field-read).  See
   // local_open_shadow_.
-  void register_local_open_shadows(const std::string& key, const modsig::SigPtr& s) {
+  // A local `let open M in e` / `M.(e)` shadows only over e, so it records the
+  // entries it displaces here and restores them on the way out.
+  using ShadowSave = std::vector<std::pair<std::string, std::optional<OpenShadow>>>;
+  void register_local_open_shadows(const std::string& key, const modsig::SigPtr& s,
+                                   ShadowSave* save = nullptr) {
     if (!s || msig_is_functor(*s)) return;
     if (!module_base(key)) return;               // only local modules
     for (auto& it : s->items) {
       if (it.ns == modsig::NS::Value && it.runtime)
-        if (local_member_index(key, it.name))
+        if (local_member_index(key, it.name)) {
+          if (save) {
+            auto p = local_open_shadow_.find(it.name);
+            save->emplace_back(it.name, p == local_open_shadow_.end()
+                                            ? std::optional<OpenShadow>()
+                                            : std::optional<OpenShadow>(p->second));
+          }
           local_open_shadow_[it.name] = {key, scope.size()};
+        }
     }
+  }
+  void restore_local_open_shadows(const ShadowSave& save) {
+    for (auto it = save.rbegin(); it != save.rend(); ++it) {
+      if (it->second) local_open_shadow_[it->first] = *it->second;
+      else local_open_shadow_.erase(it->first);
+    }
+  }
+  // Would a bare reference to `name` here resolve through a shadowing `open M`
+  // rather than through `lookup`?  Mirrors the local_open_shadow_ branch of the
+  // Pexp_ident translation: the open wins unless a binding at a frame DEEPER
+  // than the open (a param / let-in entered after it) is in scope.
+  bool open_shadows_lookup(const std::string& name) {
+    if (local_open_shadow_.empty()) return false;
+    auto os = local_open_shadow_.find(name);
+    if (os == local_open_shadow_.end()) return false;
+    for (size_t d = os->second.depth; d < scope.size(); ++d)
+      if (scope[d].count(name)) return false;
+    return local_member_index(os->second.key, name) && module_base(os->second.key);
   }
   void bind_opened_members(const modsig::SigPtr& s) {
     if (!s || msig_is_functor(*s)) return;
@@ -18488,9 +18517,16 @@ struct Translator {
           CtorSave ctor_save = open_shadow_ctors(dotted);  // ctors shadow in body
           opened_.push_back(dotted);
           menv_.push_frame();  // modsig P3 S5: opened members, scoped to body
-          bind_opened_members(msig_of_module_path(dotted));
+          modsig::SigPtr osig = msig_of_module_path(dotted);
+          bind_opened_members(osig);
+          // values too: `Lazy.(sg |> of_signature |> force_signature)` reads
+          // force_signature off Lazy, not the outer same-named function that
+          // `lookup` finds first (subst.ml).
+          ShadowSave shadow_save;
+          register_local_open_shadows(dotted, osig, &shadow_save);
           rec_spine_ = rec_spine;
           LamPtr b = expr(*si->body);
+          restore_local_open_shadows(shadow_save);
           menv_.pop_frame();
           opened_.pop_back();
           restore_ctors(ctor_save);
@@ -18516,8 +18552,11 @@ struct Translator {
         modsig::SigPtr osig = msig_result_of_module_expr(op->expr);
         menv_.bind_module(nm, osig);
         bind_opened_members(osig);
+        ShadowSave shadow_save;
+        register_local_open_shadows(nm, osig, &shadow_save);
         rec_spine_ = rec_spine;
         LamPtr b = expr(*si->body);
+        restore_local_open_shadows(shadow_save);
         menv_.pop_frame();
         opened_.pop_back();
         module_ident_.erase(nm);
@@ -25959,8 +25998,11 @@ struct Translator {
         }
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
           // alias elimination: `let x = <var v>` binds nothing; x exports as v.
+          // Only when the rhs really is a bare var: a name an `open M` shadows
+          // reads M's field instead, which is a binding upstream keeps.
           if (auto* rid = std::get_if<Pexp_ident>(&b.expr->desc))
-            if (auto* rl = std::get_if<Lident>(&rid->id.txt.v))
+            if (auto* rl = std::get_if<Lident>(&rid->id.txt.v);
+                rl && !open_shadows_lookup(rl->name))
               if (auto* tgt = lookup(rl->name)) {
                 add_export(pv->name.txt, *tgt);
                 scope.back()[pv->name.txt] = *tgt;
