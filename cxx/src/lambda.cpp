@@ -13240,6 +13240,24 @@ struct Translator {
     }
     return a;
   }
+  // An immutable field-read chain over a single root variable, as an exit
+  // argument: `(field_imm k (field_int j v))`.  The root ident, or nullptr when
+  // the term is not such a chain.
+  static const Ident* facc_chain_root(const LamPtr& e) {
+    if (!e) return nullptr;
+    if (e->k == Lam::K::Var) return &e->var;
+    if (e->k == Lam::K::Prim && e->args.size() == 1 &&
+        (e->prim == Prim::FieldImm || e->prim == Prim::FieldInt))
+      return facc_chain_root(e->args[0]);
+    return nullptr;
+  }
+  // Structural equality of two such chains (same root binding, same fields).
+  static bool facc_chain_eq(const LamPtr& a, const LamPtr& b) {
+    if (a->k != b->k) return false;
+    if (a->k == Lam::K::Var) return a->var.stamp == b->var.stamp;
+    return a->prim == b->prim && a->prim_arg == b->prim_arg &&
+           facc_chain_eq(a->args[0], b->args[0]);
+  }
   // Expand a materialized field var into its full access chain rooted at vars
   // that are in scope at a garm catch (the match scrutinee / outer bindings).
   // nullptr when the var has no recorded prototype.
@@ -13458,7 +13476,33 @@ struct Translator {
             if (!same) same = &id;
             else if (same->stamp != id.stamp || same->name != id.name) { ok = false; break; }
           }
-          if (!ok) continue;
+          if (!ok) {
+            // Not a var at every site, but possibly the same field chain read
+            // inline.  precompile_or's handler matches the columns the or-row
+            // has left against their ARGUMENT expressions, so such a column is
+            // re-read there instead of travelling through the exit -- upstream
+            // passes only patbound_action_vars, the vars the OR-pattern itself
+            // binds (builtin_attributes' `{txt = ("ocaml.error"|"error"); loc},
+            // p`, whose loc and p are bound by later columns).  Restricted to a
+            // pending or-handler catch, the one placement where what is in
+            // scope in the handler is known: the chain must read nothing bound
+            // inside the catch.  A bare Lvar site is left to the branch above
+            // (it reaches here only when two sites pass the same stamp under
+            // different names, where dropping the param is not this rule).
+            if (!pend || sites.empty()) continue;
+            LamPtr chain;
+            for (Lam* s : sites) {
+              if (k >= s->args.size()) { chain = nullptr; break; }
+              const LamPtr& e = s->args[k];
+              const Ident* root = facc_chain_root(e);
+              if (!root || e->k == Lam::K::Var ||
+                  stamp_bound_in((*pend)->cond, root->stamp)) { chain = nullptr; break; }
+              if (!chain) chain = e;
+              else if (!facc_chain_eq(chain, e)) { chain = nullptr; break; }
+            }
+            if (chain) reread[k] = clone_facc(chain);
+            continue;
+          }
           // A materialized field var bound by a root-chain let is upstream's
           // bind_check of that column, emitted BEFORE the shared action's
           // make_catch -- so the handler references the BINDING and the catch
@@ -13505,9 +13549,12 @@ struct Translator {
       }
       LamPtr handler = expr(*a.rhs);
       scope.pop_back();
-      // First dropped param outermost, like the handler pm's left-to-right
-      // argument binding; single uses substitute (Simplif's Alias rule).
-      for (size_t i = rebinds.size(); i-- > 0; ) {
+      // LAST dropped param outermost: half_simplify binds a variable column
+      // by wrapping the ACTION when that column becomes the head, and the
+      // handler pm consumes its columns left to right -- so the leftmost
+      // column's bind is applied first and ends up innermost.  Single uses
+      // substitute (Simplif's Alias rule).
+      for (size_t i = 0; i < rebinds.size(); ++i) {
         auto& [hv, chain] = rebinds[i];
         int n = count_var(handler, hv);
         if (n == 0) continue;
