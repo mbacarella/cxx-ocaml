@@ -7679,44 +7679,93 @@ struct Translator {
               if (complete) {
                 then_part = body_is_exit ? case_body() : body;
               } else if (refine) {
-                auto sw = mk(Lam::K::Switch);
-                sw->cond = fieldimm(cidx + 1, exv());
-                sw->sw_numconsts = nc; sw->sw_numblocks = nb;
-                int missing = nc + nb - (int)tags.size();
-                // reintroduce_fail: default = the bare exit with the most
-                // citations when that count >= 3 (tie -> smaller exit id)
-                int def_target = -1, c_max = -1;
-                auto consider = [&](int id, int cnt) {
-                  if (cnt > c_max || (cnt == c_max && id < def_target)) {
-                    c_max = cnt; def_target = id;
+                // ocamlc reaches the payload sub-match through an Alias-bound
+                // `*match*` (get_expr_args_constr's argument access) and
+                // dispatches on that VARIABLE; Simplif.simplify_lets drops the
+                // binding again when the shape reads it only once.  Dispatching
+                // on a variable is also what lets the constant side go through
+                // the Switcher (which re-tests its argument).
+                Ident mv = fresh("*match*", true);
+                LamPtr scr = varof(mv);
+                // Every non-matched constructor is an explicit failure case
+                // (mk_failaction_pos), so the payload is a COMPLETE regular
+                // ctor match -- and combine_regular_constructor picks its
+                // shape before ever reaching the switch (matching.ml:3288):
+                // the option test for one const + one block, then `act0` --
+                // when every NON-CONSTANT ctor routes to a single action it
+                // splits on isint rather than widening the switch over the
+                // block tags.
+                bool blocks_same = nb >= 1;
+                for (int t2 = 1; t2 < nb; ++t2)
+                  if (bset[t2] != bset[0]) { blocks_same = false; break; }
+                if (nc >= 1 && blocks_same) {
+                  std::vector<Lam::SwitchCase> cs;
+                  std::set<int> cseen;
+                  for (int t2 = 0; t2 < nc; ++t2) {
+                    cs.push_back({t2, cset[t2] ? case_body() : failL()});
+                    if (cset[t2]) cseen.insert(t2);
                   }
-                };
-                if (missing > 0) consider(fail_tgt, missing);
-                if (body_target >= 0) consider(body_target, (int)tags.size());
-                if (c_max < 3) def_target = -1;
-                for (int t2 = 0; t2 < nc; ++t2) {
-                  LamPtr act = cset[t2] ? case_body() : failL();
-                  int tgt = cset[t2] ? body_target : fail_tgt;
-                  if (def_target >= 0 && tgt == def_target &&
-                      act->k == Lam::K::Staticraise) continue;
-                  sw->sw_consts.push_back({t2, act});
+                  LamPtr blk = bset[0] ? case_body() : failL();
+                  auto i = mk(Lam::K::IfThenElse);
+                  if (nc == 1 && nb == 1) {  // transl_match_on_option, bytecode
+                    i->cond = scr; i->then_ = blk; i->else_ = cs[0].body;
+                  } else {
+                    auto isi = mk(Lam::K::Prim); isi->prim = Prim::IntCmp;
+                    isi->prim_id = "isint"; isi->args = {scr};
+                    i->cond = isi;
+                    i->then_ = const_dispatch_gaps(scr, cs, cseen);
+                    i->else_ = blk;
+                  }
+                  then_part = i;
+                } else {
+                  auto sw = mk(Lam::K::Switch);
+                  sw->cond = scr;
+                  sw->sw_numconsts = nc; sw->sw_numblocks = nb;
+                  int missing = nc + nb - (int)tags.size();
+                  // reintroduce_fail: default = the bare exit with the most
+                  // citations when that count >= 3 (tie -> smaller exit id)
+                  int def_target = -1, c_max = -1;
+                  auto consider = [&](int id, int cnt) {
+                    if (cnt > c_max || (cnt == c_max && id < def_target)) {
+                      c_max = cnt; def_target = id;
+                    }
+                  };
+                  if (missing > 0) consider(fail_tgt, missing);
+                  if (body_target >= 0) consider(body_target, (int)tags.size());
+                  if (c_max < 3) def_target = -1;
+                  for (int t2 = 0; t2 < nc; ++t2) {
+                    LamPtr act = cset[t2] ? case_body() : failL();
+                    int tgt = cset[t2] ? body_target : fail_tgt;
+                    if (def_target >= 0 && tgt == def_target &&
+                        act->k == Lam::K::Staticraise) continue;
+                    sw->sw_consts.push_back({t2, act});
+                  }
+                  for (int t2 = 0; t2 < nb; ++t2) {
+                    LamPtr act = bset[t2] ? case_body() : failL();
+                    int tgt = bset[t2] ? body_target : fail_tgt;
+                    if (def_target >= 0 && tgt == def_target &&
+                        act->k == Lam::K::Staticraise) continue;
+                    sw->sw_blocks.push_back({t2, act});
+                  }
+                  if (def_target >= 0) {
+                    auto x = mk(Lam::K::Staticraise); x->prim_arg = def_target;
+                    sw->sw_default = x;
+                  }  // else exhaustive switch*
+                  then_part = sw;
                 }
-                for (int t2 = 0; t2 < nb; ++t2) {
-                  LamPtr act = bset[t2] ? case_body() : failL();
-                  int tgt = bset[t2] ? body_target : fail_tgt;
-                  if (def_target >= 0 && tgt == def_target &&
-                      act->k == Lam::K::Staticraise) continue;
-                  sw->sw_blocks.push_back({t2, act});
-                }
-                if (def_target >= 0) {
-                  auto x = mk(Lam::K::Staticraise); x->prim_arg = def_target;
-                  sw->sw_default = x;
-                }  // else exhaustive switch*
-                then_part = sw;
-                if (body_eid) {  // body shared behind a catch around the switch
+                if (body_eid) {  // body shared behind a catch around the shape
                   auto bc = mk(Lam::K::Catch);
                   bc->cond = then_part; bc->prim_arg = body_eid; bc->then_ = body;
                   then_part = bc;
+                }
+                LamPtr fld = fieldimm(cidx + 1, exv());
+                if (count_var(then_part, mv) <= 1) {
+                  subst_alias(then_part, mv, fld);
+                } else {
+                  auto bl = mk(Lam::K::Let);
+                  bl->bindings = {{mv, ValueKind::Gen, fld, /*alias=*/true}};
+                  bl->body = then_part;
+                  then_part = bl;
                 }
               } else {
                 // Unknown ctor counts: a switch's jump tables need the type's
