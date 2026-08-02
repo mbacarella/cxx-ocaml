@@ -13328,6 +13328,31 @@ struct Translator {
     for (auto& sc : l->sw_blocks) if (LamPtr* r = find_orp_slot(sc.body, aid)) return r;
     return nullptr;
   }
+  // Whether the Let binding `stamp` is in scope at the node `at`: 1 when some
+  // Let on the path from `l` down to `at` binds it, 0 when `at` was found with
+  // no such Let, -1 when `at` is not under `l`.  Static exits never cross a
+  // function boundary, so nested Lfunctions are not searched.
+  static int let_scope_at(const LamPtr& l, const Lam* at, int stamp) {
+    if (!l) return -1;
+    if (l.get() == at) return 0;
+    if (l->k == Lam::K::Function) return -1;
+    bool binds = false;
+    if (l->k == Lam::K::Let)
+      for (auto& b : l->bindings) if (b.id.stamp == stamp) binds = true;
+    int r;
+    if ((r = let_scope_at(l->fn, at, stamp)) >= 0) return r;
+    if ((r = let_scope_at(l->cond, at, stamp)) >= 0) return r;
+    if ((r = let_scope_at(l->then_, at, stamp)) >= 0) return r;
+    if ((r = let_scope_at(l->else_, at, stamp)) >= 0) return r;
+    if ((r = let_scope_at(l->body, at, stamp)) >= 0)
+      return binds ? 1 : r;                          // a Let scopes over its body
+    if ((r = let_scope_at(l->sw_default, at, stamp)) >= 0) return r;
+    for (auto& a : l->args) if ((r = let_scope_at(a, at, stamp)) >= 0) return r;
+    for (auto& b : l->bindings) if ((r = let_scope_at(b.val, at, stamp)) >= 0) return r;
+    for (auto& sc : l->sw_consts) if ((r = let_scope_at(sc.body, at, stamp)) >= 0) return r;
+    for (auto& sc : l->sw_blocks) if ((r = let_scope_at(sc.body, at, stamp)) >= 0) return r;
+    return -1;
+  }
   // The slot holding the leaf-built guard test (gm_guard_aid) for `aid`, if any.
   static LamPtr* find_guard_slot(LamPtr& l, int aid) {
     if (!l) return nullptr;
@@ -13513,6 +13538,19 @@ struct Translator {
               d >= 0) {
             alias[k] = *same; letref[k] = 1;
             if (d > let_ref_depth) let_ref_depth = d;
+            continue;
+          }
+          // A materialized var whose (non-root) let ENCLOSES the pending
+          // or-handler catch is likewise upstream's earlier bind of that
+          // column -- the or-column's own bind_check scrutinee (pprintast's
+          // `("get"|"set" as func)`, whose stringswitch and handler both use
+          // func) or an earlier column's as-alias (emitcode's `Kevent (.. as
+          // ev)` left of the instr or-column).  The handler references the
+          // binding; re-reading the chain would diverge from ocamlc, which
+          // substitutes the alias to the bound column var.
+          if (pend && gm_facc_proto_.count(same->stamp) &&
+              let_scope_at(body, pend->get(), same->stamp) == 1) {
+            alias[k] = *same; letref[k] = 1;         // letref: keep pend placement
             continue;
           }
           reread[k] = expand_facc_var(*same);        // materialized field chain
