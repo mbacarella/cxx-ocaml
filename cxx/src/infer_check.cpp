@@ -394,8 +394,18 @@ struct Checker {
   std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
   std::unordered_map<std::string, const TypeDeclaration*> name_record_decl_;
   std::set<std::string> ambiguous_record_names_;  // a record name declared by >1 decl
-  // Field projections so resolved: node -> (index, mut, kind_str).
-  std::unordered_map<const Expression*, std::tuple<int, bool, std::string>> field_resolved_;
+  // Field projections so resolved: node -> (index, mut, kind_str, unboxed).
+  std::unordered_map<const Expression*, std::tuple<int, bool, std::string, bool>> field_resolved_;
+  // The record decl is `[@@unboxed]` (Types.Record_unboxed): its value IS the
+  // single field, so the back end must not emit a field read.  check_unboxed
+  // rejects any other shape, so the arity/mutability tests here also keep an
+  // ill-formed declaration from changing the layout.
+  static bool unboxed_record_decl(const TypeDeclaration& d, const Ptype_record& rec) {
+    if (rec.fields.size() != 1 || rec.fields[0].mut == MutableFlag::Mutable) return false;
+    for (auto& a : d.attrs)
+      if (a.name == "unboxed" || a.name == "ocaml.unboxed") return true;
+    return false;
+  }
   // Ambiguous field accesses (base expr type + label), resolved AFTER inference
   // reaches a fixpoint: an unannotated record param's type is often pinned only by a
   // LATER field read (`pool.level` typed before `pool.next` proves `pool` is the pool
@@ -427,7 +437,8 @@ struct Checker {
       for (int i = 0; i < (int)rec->fields.size(); ++i)
         if (rec->fields[i].name.txt == lbl) {
           field_resolved_[e] = {i, rec->fields[i].mut == MutableFlag::Mutable,
-                                ct_kind(*rec->fields[i].type)};
+                                ct_kind(*rec->fields[i].type),
+                                unboxed_record_decl(*decl, *rec)};
           break;
         }
     }
@@ -7636,7 +7647,8 @@ struct Checker {
                 for (int i = 0; i < (int)rec->fields.size(); ++i)
                   if (rec->fields[i].name.txt == lbl) {
                     field_resolved_[&e] = {i, rec->fields[i].mut == MutableFlag::Mutable,
-                                           ct_kind(*rec->fields[i].type)};
+                                           ct_kind(*rec->fields[i].type),
+                                           unboxed_record_decl(*dit->second, *rec)};
                     break;
                   }
             }
@@ -10752,7 +10764,8 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
       vk.expr_constr[e] = r->path;
   }
   for (auto& [e, fr] : ck.field_resolved_)
-    vk.field_resolved[e] = {std::get<0>(fr), std::get<1>(fr), std::get<2>(fr)};
+    vk.field_resolved[e] = {std::get<0>(fr), std::get<1>(fr), std::get<2>(fr),
+                            std::get<3>(fr)};
   vk.format_lits = std::move(ck.fmt_lits_);
   vk.optional_erasures = std::move(ck.erasures_);
   vk.match_partial = std::move(ck.match_partial);

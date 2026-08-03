@@ -1181,7 +1181,12 @@ struct Translator {
   // Locally-declared record fields: label -> {owning type, index, mutable, kind}.
   // Only UNAMBIGUOUS labels are usable (a label reused across records can't be
   // resolved without type direction, so it falls back to a generic translation).
-  struct FieldInfo { std::string type; int index; bool mut; ValueKind kind; };
+  // `unboxed`: the owning record is `[@@unboxed]` (Types.Record_unboxed), so the
+  // projection is the identity and there is no block to read from.  Carried on
+  // the FieldInfo itself rather than looked up through `type`, because a layout
+  // resolved from a cmi by dotted path names a type that is not a rec_types_ key.
+  struct FieldInfo { std::string type; int index; bool mut; ValueKind kind;
+                     bool unboxed = false; };
   std::unordered_map<std::string, FieldInfo> field_info_;
   std::set<std::string> ambiguous_fields_;
   // A record label -> the module-qualified ("Module.type") variant type of its VALUE,
@@ -1204,8 +1209,21 @@ struct Translator {
   std::set<std::string> scoped_unambig_fields_;
   struct RecType { std::vector<std::string> labels; bool mut; std::vector<ValueKind> shape;
                    std::vector<bool> fmut;  // per-field mutability, parallel to labels
-                   bool flat = false; };  // all-float: a flat float block, not a record
+                   bool flat = false;    // all-float: a flat float block, not a record
+                   // `[@@unboxed]` (Types.Record_unboxed): a single immutable field
+                   // whose value IS the record.  No makeblock, no field read -- the
+                   // record analogue of CtorInfo::unboxed.
+                   bool unboxed = false; };
   std::unordered_map<std::string, RecType> rec_types_;  // type name -> record layout
+  // A source record declaration carrying `[@@unboxed]`.  Typedecl accepts the
+  // attribute only on exactly one immutable field, so those checks also keep a
+  // rejected declaration from changing the layout we compile against.
+  static bool decl_unboxed_record(const TypeDeclaration& d, const Ptype_record& rec) {
+    if (rec.fields.size() != 1 || rec.fields[0].mut == MutableFlag::Mutable) return false;
+    for (auto& a : d.attrs)
+      if (a.name == "unboxed" || a.name == "ocaml.unboxed") return true;
+    return false;
+  }
 
   // The dotted type path of a core type that is a named-record constructor
   // (`Pattern_env.t`, `foo`), for type-directed field resolution of a var bound to
@@ -2018,6 +2036,7 @@ struct Translator {
         RecType rt;
         rt.mut = false;
         rt.flat = !rec->fields.empty();
+        rt.unboxed = decl_unboxed_record(d, *rec);
         int idx = 0;
         for (auto& f : rec->fields) {
           ValueKind k = coretype_kind(*f.type);
@@ -2029,7 +2048,7 @@ struct Translator {
           rt.shape.push_back(k);
           if (field_info_.count(f.name.txt) && field_info_[f.name.txt].type != d.name.txt)
             ambiguous_fields_.insert(f.name.txt);
-          FieldInfo finfo{d.name.txt, idx++, m, k};
+          FieldInfo finfo{d.name.txt, idx++, m, k, rt.unboxed};
           type_field_info_[d.name.txt][f.name.txt] = finfo;
           field_info_[f.name.txt] = finfo;
           // A field whose value is a labelled function: record its label sig so a
@@ -2077,6 +2096,7 @@ struct Translator {
               RecType rt;
               rt.mut = false;
               rt.flat = !rec->fields.empty();
+              rt.unboxed = decl_unboxed_record(d, *rec);
               int idx = 0;
               for (auto& f : rec->fields) {
                 ValueKind k = coretype_kind(*f.type);
@@ -2086,12 +2106,12 @@ struct Translator {
                 rt.flat = rt.flat && is_float_core(*f.type);
                 rt.labels.push_back(f.name.txt);
                 rt.shape.push_back(k);
-                type_field_info_[key][f.name.txt] = {key, idx, m, k};
+                type_field_info_[key][f.name.txt] = {key, idx, m, k, rt.unboxed};
                 if (field_info_.count(f.name.txt) &&
                     field_info_[f.name.txt].type != key)
                   ambiguous_fields_.insert(f.name.txt);  // shared label: unusable bare
                 else
-                  field_info_[f.name.txt] = {key, idx, m, k};
+                  field_info_[f.name.txt] = {key, idx, m, k, rt.unboxed};
                 // A labelled-function field in a NESTED module's record needs its
                 // label sig too (mirrors the top-level pass): tmc.ml's Dps.t
                 // `code : delayed:.. -> 'a dps` called `d.code ~tail ~dst
@@ -2283,12 +2303,12 @@ struct Translator {
       if (auto sr = stdlib_record_layout_named(mod, ty)) {
         for (int i = 0; i < (int)sr->labels.size(); ++i)
           if (sr->labels[i] == label)
-            return FieldInfo{ty, i, sr->mut[i], sr->shape[i]};
+            return FieldInfo{ty, i, sr->mut[i], sr->shape[i], sr->unboxed};
       }
     } else if (auto sf = nested_typed_record_field(mod, ty, label)) {
       // a DEEP nested-module path ("Signature_matching.Suggestion.report"):
       // navigate the head unit's cmi through the submodules
-      return FieldInfo{ty, sf->index, sf->mut, sf->kind};
+      return FieldInfo{ty, sf->index, sf->mut, sf->kind, sf->unboxed};
     }
     return std::nullopt;
   }
@@ -3470,6 +3490,7 @@ struct Translator {
         for (auto& td : sig->types) {
           if (td.kind != cmi::TypeDecl::Record) continue;
           RecType rt; rt.mut = false;
+          rt.unboxed = td.unboxed && td.labels.size() == 1;
           bool fresh_type = !rec_types_.count(td.name);
           for (int j = 0; j < (int)td.labels.size(); ++j) {
             ValueKind k = cmi_field_kind(td.labels[j].type);
@@ -3480,7 +3501,7 @@ struct Translator {
             rt.shape.push_back(k);
             if (fresh_type && !field_info_.count(td.labels[j].name) &&
                 !ambiguous_fields_.count(td.labels[j].name))
-              field_info_[td.labels[j].name] = {td.name, j, m, k};
+              field_info_[td.labels[j].name] = {td.name, j, m, k, rt.unboxed};
           }
           // On a short type-NAME collision (the bare `t` of countless submodules,
           // e.g. Persistent_env.Persistent_signature.t {filename;cmi;visibility})
@@ -3622,6 +3643,7 @@ struct Translator {
             if (cmi_field_kind(l.type) != ValueKind::Float) { all_float = false; break; }
           if (all_float) continue;
           RecType rt; rt.mut = false;
+          rt.unboxed = td.unboxed && td.labels.size() == 1;
           bool fresh_type = !rec_types_.count(td.name);
           for (int j = 0; j < (int)td.labels.size(); ++j) {
             ValueKind k = cmi_field_kind(td.labels[j].type);
@@ -3646,7 +3668,7 @@ struct Translator {
             // do NOT flag ambiguous (find_field returns null for ambiguous
             // labels, which would drop the field read to 0).
             if (!ambiguous_fields_.count(td.labels[j].name))
-              field_info_[td.labels[j].name] = {td.name, j, m, k};
+              field_info_[td.labels[j].name] = {td.name, j, m, k, rt.unboxed};
             // Capture the field's value type when it is a constructor of a single-
             // component-qualified module (`vb_rec_kind : Value_rec_types.recursive_
             // binding_kind`), so a bare ctor written for it resolves by type direction.
@@ -4840,7 +4862,8 @@ struct Translator {
   }
   // A record field of a stdlib (sub)module's record type, e.g. `Gc.minor_heap_size`
   // -> {field index, kind, mutable}; nullopt if not found.
-  struct StdField { int index; ValueKind kind; bool mut; bool flat = false; };
+  struct StdField { int index; ValueKind kind; bool mut; bool flat = false;
+                    bool unboxed = false; };  // `[@@unboxed]` owner: read is the identity
   // True when every label of `td` is float-kind (a flat float record, read/written
   // with floatfield rather than the boxed field ops).
   static bool record_all_float(const cmi::TypeDecl& td) {
@@ -4855,7 +4878,7 @@ struct Translator {
         for (int i = 0; i < (int)td.labels.size(); ++i)
           if (td.labels[i].name == label)
             return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_,
-                            record_all_float(td)};
+                            record_all_float(td), td.unboxed && td.labels.size() == 1};
       }
     } catch (...) {}
     return std::nullopt;
@@ -4903,7 +4926,8 @@ struct Translator {
       if (f != tfi->second.end()) {
         auto rt = rec_types_.find(key);
         bool flat = rt != rec_types_.end() && rt->second.flat;
-        return StdField{f->second.index, f->second.kind, f->second.mut, flat};
+        return StdField{f->second.index, f->second.kind, f->second.mut, flat,
+                        rt != rec_types_.end() && rt->second.unboxed};
       }
     }
     return std::nullopt;
@@ -4934,7 +4958,7 @@ struct Translator {
         for (int i = 0; i < (int)td.labels.size(); ++i)
           if (td.labels[i].name == label)
             return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_,
-                            record_all_float(td)};
+                            record_all_float(td), td.unboxed && td.labels.size() == 1};
       }
     } catch (...) {}
     return std::nullopt;
@@ -4978,7 +5002,7 @@ struct Translator {
         for (int i = 0; i < (int)td.labels.size(); ++i)
           if (td.labels[i].name == label)
             return StdField{i, cmi_field_kind(td.labels[i].type), td.labels[i].mutable_,
-                            record_all_float(td)};
+                            record_all_float(td), td.unboxed && td.labels.size() == 1};
       }
     } catch (...) {}
     return std::nullopt;
@@ -5017,7 +5041,8 @@ struct Translator {
   // (`{ (Gc.get ()) with allocation_policy = 2 }`). All-float (flat) records
   // have a different representation and are not handled.
   struct StdRec { std::vector<std::string> labels; std::vector<ValueKind> shape; std::vector<bool> mut;
-                  bool flat = false; };  // all-float -> a flat float block (Complex.t)
+                  bool flat = false;     // all-float -> a flat float block (Complex.t)
+                  bool unboxed = false; };  // `[@@unboxed]`: the field IS the value
   std::optional<StdRec> stdlib_record_layout(const std::string& mod, const std::string& label) {
     try {
       const auto& cmi = cmi::CmiFile::load(resolve_cmi(mod));
@@ -5035,6 +5060,7 @@ struct Translator {
           if (r.shape.back() != ValueKind::Float) all_float = false;
         }
         r.flat = all_float;  // Complex.t etc.: a flat float block
+        r.unboxed = td.unboxed && td.labels.size() == 1;
         return r;
       }
     } catch (...) {}
@@ -5057,6 +5083,7 @@ struct Translator {
           if (r.shape.back() != ValueKind::Float) all_float = false;
         }
         r.flat = all_float;  // Complex.t etc.: a flat float block
+        r.unboxed = td.unboxed && td.labels.size() == 1;
         return r;
       }
     } catch (...) {}
@@ -5201,6 +5228,7 @@ struct Translator {
                 ftypes[l.name] = fp;
             }
             r.flat = all_float;
+            r.unboxed = td.unboxed && td.labels.size() == 1;
             // Index by NAME (for resolving through a field's value type).
             if (!record_by_name_ambig_.count(td.name)) {
               auto ni = record_by_name_.find(td.name);
@@ -5266,13 +5294,13 @@ struct Translator {
     if (it == record_by_name_.end() || it->second.flat) return nullptr;
     if (!rec_types_.count(ty)) {  // make it visible to from()/find paths
       RecType rt; rt.labels = it->second.labels; rt.shape = it->second.shape;
-      rt.flat = it->second.flat; rt.mut = false;
+      rt.flat = it->second.flat; rt.mut = false; rt.unboxed = it->second.unboxed;
       for (bool m : it->second.mut) { rt.mut = rt.mut || m; rt.fmut.push_back(m); }
       rec_types_[ty] = std::move(rt);
     }
     for (int i = 0; i < (int)it->second.labels.size(); ++i)
       if (it->second.labels[i] == label) {
-        store = FieldInfo{ty, i, it->second.mut[i], it->second.shape[i]};
+        store = FieldInfo{ty, i, it->second.mut[i], it->second.shape[i], it->second.unboxed};
         return &store;
       }
     return nullptr;
@@ -5344,7 +5372,9 @@ struct Translator {
           r.mut.push_back(l.mutable_);
           if (r.shape.back() != ValueKind::Float) all_float = false;
         }
-        r.flat = all_float; return r;
+        r.flat = all_float;
+        r.unboxed = td.unboxed && td.labels.size() == 1;
+        return r;
       }
     } catch (...) {}
     return std::nullopt;
@@ -5356,7 +5386,7 @@ struct Translator {
     // authoritative qualifier FIRST -- a bare find_field could pick a different
     // record sharing the ambiguous label (load_path's `Dir.hidden` vs paths.hidden).
     if (auto rf = qualified_field(lid)) {
-      store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
+      store = FieldInfo{"", rf->index, rf->mut, rf->kind, rf->unboxed}; return &store;
     }
     if (const FieldInfo* fi = find_field(lid_last(lid))) return fi;
     // `{contents = ..}` is the ref cell (`'a ref = {mutable contents}`): field 0,
@@ -5413,7 +5443,9 @@ struct Translator {
     if (auto* d = std::get_if<Ldot>(&lid.v))
       if (auto* pl = std::get_if<Lident>(&d->prefix->v))
         register_module_records(pl->name);
-    if (auto rf = qualified_field(lid)) { store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store; }
+    if (auto rf = qualified_field(lid)) {
+      store = FieldInfo{"", rf->index, rf->mut, rf->kind, rf->unboxed}; return &store;
+    }
     std::string n = lid_last(lid);
     // A NESTED record pattern tagged with its record type by the enclosing field's
     // value type (`{ def = {params;body} }` -> {params;body} : lfunction): resolve
@@ -5453,10 +5485,10 @@ struct Translator {
     if (!qual_mod.empty()) {
       register_module_records(qual_mod);
       if (auto rf = local_module_field(qual_mod, n)) {
-        store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
+        store = FieldInfo{"", rf->index, rf->mut, rf->kind, rf->unboxed}; return &store;
       }
       if (auto rf = stdlib_record_field(qual_mod, n)) {
-        store = FieldInfo{"", rf->index, rf->mut, rf->kind}; return &store;
+        store = FieldInfo{"", rf->index, rf->mut, rf->kind, rf->unboxed}; return &store;
       }
     }
     // The record the WHOLE field set pins down is authoritative for a multi-field
@@ -5468,7 +5500,7 @@ struct Translator {
           if (kv->second.labels[i] == n) {
             bool fm = i < (int)kv->second.fmut.size() ? (bool)kv->second.fmut[i]
                                                       : kv->second.mut;
-            store = FieldInfo{kv->first, i, fm, kv->second.shape[i]};
+            store = FieldInfo{kv->first, i, fm, kv->second.shape[i], kv->second.unboxed};
             return &store;
           }
     // An AMBIGUOUS field (`args` in both `pattern_matching`@1 and `division`@0)
@@ -5485,7 +5517,7 @@ struct Translator {
           if (rt->second.labels[i] == n) {
             bool fm = i < (int)rt->second.fmut.size() ? (bool)rt->second.fmut[i]
                                                       : rt->second.mut;
-            store = FieldInfo{ty, i, fm, rt->second.shape[i]};
+            store = FieldInfo{ty, i, fm, rt->second.shape[i], rt->second.unboxed};
             return &store;
           }
         return nullptr;
@@ -5515,7 +5547,7 @@ struct Translator {
     if (auto sr = nested_record_layout(dotted, label))
       for (int i = 0; i < (int)sr->labels.size(); ++i)
         if (sr->labels[i] == label)
-          return StdField{i, sr->shape[i], sr->mut[i], sr->flat};
+          return StdField{i, sr->shape[i], sr->mut[i], sr->flat, sr->unboxed};
     return std::nullopt;
   }
   // The stdlib-module prefix governing a record label: an explicit `M.label`
@@ -10262,6 +10294,16 @@ struct Translator {
         if (auto* l = std::get_if<Lident>(&po->mod_.txt.v)) register_module_records(l->name);
         p = po->p.get();
       }
+      // An `[@@unboxed]` RECORD pattern is the same no-op wrapper as an unboxed
+      // constructor: `{ l = q }` matches the value itself, since the value IS
+      // the field (Types.Record_unboxed).  Peeling here is what keeps every
+      // matcher path -- pat_test, gmatch's columns, or_accesses -- from
+      // emitting a field read against a value that is not a block.
+      if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+        if (!unboxed_record_pat(*pr, p)) return p;
+        p = pr->fields[0].second.get();
+        continue;
+      }
       auto* k = std::get_if<Ppat_construct>(&p->desc);
       if (!k) return p;
       auto ci = ctor_info_.find(ctor_of(*p));
@@ -10269,6 +10311,31 @@ struct Translator {
       auto fps = ctor_field_pats(k, ci->second.arity);
       if (fps.size() != 1) return p;
       p = fps[0];
+    }
+  }
+  // A record PATTERN whose record is `[@@unboxed]`.  Resolved through the same
+  // label lookup the matcher would use for the field index, so a mis-resolved
+  // label can never make a boxed record look unboxed (or the reverse).
+  // `{ _ }` (no listed field) reads nothing, so it needs no peel and is left as
+  // an ordinary record pattern.
+  bool unboxed_record_pat(const Ppat_record& pr, const Pattern* pat_key) {
+    if (pr.fields.size() != 1) return false;
+    FieldInfo store;
+    std::vector<std::string> flds{lid_last(pr.fields[0].first.txt)};
+    const FieldInfo* fi = resolve_record_pat_field(flds, pr.fields[0].first.txt, store,
+                                                   pat_key, pat_record_qual_mod(pr));
+    return fi && fi->unboxed;
+  }
+  // The pattern as the TYPEDTREE has it: constraints and `M.(p)` opens are
+  // erased by the type checker, but an unboxed constructor/record wrapper is
+  // NOT -- it stays a Tpat_construct/Tpat_record.  Matching.name_pattern reads
+  // pat_desc directly, so it must see the wrapper (`function U s -> ..` names
+  // its parameter `param`, not `s`) even though the matcher peels it.
+  const Pattern* typedtree_pat(const Pattern* p) {
+    while (true) {
+      if (auto* c = std::get_if<Ppat_constraint>(&p->desc)) { p = c->p.get(); continue; }
+      if (auto* po = std::get_if<Ppat_open>(&p->desc)) { p = po->p.get(); continue; }
+      return p;
     }
   }
   // Flatten a (possibly nested) or-pattern into its leaf alternatives.
@@ -19575,6 +19642,7 @@ struct Translator {
               std_rt.mut = false;
               for (bool m : sr->mut) if (m) std_rt.mut = true;
               std_rt.flat = sr->flat;
+              std_rt.unboxed = sr->unboxed;
               fmut = std::move(sr->mut);
               rt = &std_rt;
             }
@@ -19598,6 +19666,7 @@ struct Translator {
               std_rt.mut = false;
               for (bool m : sr->mut) if (m) std_rt.mut = true;
               std_rt.flat = sr->flat;  // Complex.t etc.: a flat float block
+              std_rt.unboxed = sr->unboxed;
               fmut = std::move(sr->mut);
               rt = &std_rt;
             }
@@ -19613,6 +19682,7 @@ struct Translator {
                   std_rt.mut = false;
                   for (bool m : sr->mut) if (m) std_rt.mut = true;
                   std_rt.flat = sr->flat;
+                  std_rt.unboxed = sr->unboxed;
                   fmut = std::move(sr->mut);
                   rt = &std_rt;
                 }
@@ -19632,6 +19702,7 @@ struct Translator {
                 std_rt.mut = false;
                 for (bool m : sr->mut) if (m) std_rt.mut = true;
                 std_rt.flat = sr->flat;
+                std_rt.unboxed = sr->unboxed;
                 fmut = std::move(sr->mut);
                 rt = &std_rt;
               }
@@ -19681,7 +19752,12 @@ struct Translator {
               vals[i] = fr;
             }
             LamPtr blk;
-            if (rt->flat) {  // flat float record: a float block, not a record
+            // `[@@unboxed]`: the record IS its one field, so the update yields
+            // the new field value.  The base is still evaluated (typecore only
+            // warns 23 about the useless `with`), which the `temp` let below
+            // preserves.
+            if (rt->unboxed && vals.size() == 1) blk = vals[0];
+            else if (rt->flat) {  // flat float record: a float block, not a record
               auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
               m->prim_id = rt->mut ? "makearray[float]" : "makearray_imm[float]";
               m->args = std::move(vals);
@@ -19745,6 +19821,7 @@ struct Translator {
             std_rt.mut = false;
             for (bool m : sr->mut) if (m) std_rt.mut = true;
             std_rt.flat = sr->flat;  // Complex.t etc.: build a flat float block
+            std_rt.unboxed = sr->unboxed;
             rt = &std_rt;
             return true;
           };
@@ -19806,6 +19883,8 @@ struct Translator {
             vals[ix] = expr(*ve);
           }
           if (ok) {
+            // `[@@unboxed]`: no block at all -- the literal IS its one field.
+            if (rt->unboxed && vals.size() == 1) return vals[0];
             if (rt->flat) {  // flat float record: a float block, not a record
               auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
               m->prim_id = rt->mut ? "makearray[float]" : "makearray_imm[float]";
@@ -19878,6 +19957,7 @@ struct Translator {
       // the qualifier is authoritative, so resolve it BEFORE the bare find_field
       // (which could pick a different record sharing an ambiguous label).
       if (auto rf = qualified_field(fe->field.txt)) {
+        if (rf->unboxed) return expr(*fe->e);
         auto l = mk(Lam::K::Prim);
         l->prim = rf->flat                     ? Prim::Floatfield
                   : rf->kind == ValueKind::Int ? Prim::FieldInt
@@ -19900,6 +19980,7 @@ struct Translator {
                         l->name.c_str(), vp->second.c_str(),
                         lid_last(fe->field.txt).c_str());
               if (auto rf = resolve_field_in_record_path(vp->second, lid_last(fe->field.txt))) {
+                if (rf->unboxed) return expr(*fe->e);
                 auto lp = mk(Lam::K::Prim);
                 auto rt = rec_types_.find(rf->type);
                 lp->prim = (rt != rec_types_.end() && rt->second.flat) ? Prim::Floatfield
@@ -19917,6 +19998,7 @@ struct Translator {
         if (cppcaml::dbg_env("RMRDBG"))
           fprintf(stderr, "[RMRDBG] field %s: vk.field_resolved idx=%d\n",
                   lid_last(fe->field.txt).c_str(), it->second.index);
+        if (it->second.unboxed) return expr(*fe->e);
         auto l = mk(Lam::K::Prim);
         l->prim = it->second.kind == "int" ? Prim::FieldInt
                   : it->second.mut         ? Prim::FieldMut
@@ -19949,6 +20031,7 @@ struct Translator {
                    key[ty.size()] == '#'))
                 if (auto tf = type_field_info_.find(key); tf != type_field_info_.end())
                   if (auto fi = tf->second.find(lbl); fi != tf->second.end()) {
+                    if (fi->second.unboxed) return expr(*fe->e);
                     auto l = mk(Lam::K::Prim);
                     auto rt = rec_types_.find(key);
                     l->prim = (rt != rec_types_.end() && rt->second.flat) ? Prim::Floatfield
@@ -19961,6 +20044,7 @@ struct Translator {
           if (auto sr = stdlib_record_layout_named(mod, ty))
             for (size_t i = 0; i < sr->labels.size(); ++i)
               if (sr->labels[i] == lbl) {
+                if (sr->unboxed) return expr(*fe->e);
                 auto l = mk(Lam::K::Prim);
                 l->prim = sr->flat                         ? Prim::Floatfield
                           : sr->shape[i] == ValueKind::Int ? Prim::FieldInt
@@ -19975,6 +20059,7 @@ struct Translator {
           // find_field below, which takes the last-registered same-named record
           // (Ast_mapper.mapper's `structure`@38, not iterator's @37).
           if (auto rf = toplevel_typed_record_field(mod, ty, lbl)) {
+            if (rf->unboxed) return expr(*fe->e);
             auto l = mk(Lam::K::Prim);
             l->prim = rf->flat                     ? Prim::Floatfield
                       : rf->kind == ValueKind::Int ? Prim::FieldInt
@@ -19994,6 +20079,7 @@ struct Translator {
           // mismatch report of the bootstrapped compiler).
           std::string mod = p.substr(0, dpos), ty = p.substr(dpos + 1);
           if (auto rf = nested_typed_record_field(mod, ty, lbl)) {
+            if (rf->unboxed) return expr(*fe->e);
             auto l = mk(Lam::K::Prim);
             l->prim = rf->flat                     ? Prim::Floatfield
                       : rf->kind == ValueKind::Int ? Prim::FieldInt
@@ -20015,6 +20101,7 @@ struct Translator {
               std::string lbl = lid_last(fe->field.txt);
               for (int i = 0; i < (int)sr.labels.size(); ++i)
                 if (sr.labels[i] == lbl) {
+                  if (sr.unboxed) return expr(*fe->e);
                   auto lp = mk(Lam::K::Prim);
                   lp->prim = sr.flat ? Prim::Floatfield
                              : sr.shape[i] == ValueKind::Int ? Prim::FieldInt
@@ -20034,6 +20121,7 @@ struct Translator {
             if (auto vp = var_record_path_.find(b->stamp); vp != var_record_path_.end())
               if (auto rf = resolve_field_in_record_path(vp->second,
                                                          lid_last(fe->field.txt))) {
+                if (rf->unboxed) return expr(*fe->e);
                 auto lp = mk(Lam::K::Prim);
                 auto rt = rec_types_.find(rf->type);
                 lp->prim = (rt != rec_types_.end() && rt->second.flat) ? Prim::Floatfield
@@ -20044,6 +20132,7 @@ struct Translator {
                 return lp;
               }
       if (auto* fi = find_field(lid_last(fe->field.txt))) {
+        if (fi->unboxed) return expr(*fe->e);
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);
         if (rt != rec_types_.end() && rt->second.flat)
@@ -20073,6 +20162,7 @@ struct Translator {
           if (lid_to_dotted(*d->prefix, dotted)) rf = nested_record_field(dotted, d->name);
         }
         if (rf) {
+          if (rf->unboxed) return expr(*fe->e);
           auto l = mk(Lam::K::Prim);
           l->prim = rf->flat                 ? Prim::Floatfield  // Complex.t etc.
                     : rf->kind == ValueKind::Int ? Prim::FieldInt
@@ -20084,6 +20174,7 @@ struct Translator {
       }
       // An unqualified stdlib-record label via the base's inferred type.
       if (auto rf = inferred_record_field(fe->e.get(), lid_last(fe->field.txt))) {
+        if (rf->unboxed) return expr(*fe->e);
         auto l = mk(Lam::K::Prim);
         l->prim = rf->flat                 ? Prim::Floatfield  // Complex.t etc.
                   : rf->kind == ValueKind::Int ? Prim::FieldInt
@@ -22899,7 +22990,11 @@ struct Translator {
       // `function x -> e` names the parameter x.
       if (fc->cases.size() == 1 && !fc->cases[0].guard) {
         const Pattern* pat = effective_pat(&fc->cases[0].lhs);
-        if (auto* var = std::get_if<Ppat_var>(&pat->desc)) {
+        // The NAME comes from the typedtree shape: an unboxed wrapper survives
+        // type checking, so `function U s -> ..` / `function {rev=l} -> ..`
+        // still take the default "param" (Matching.name_pattern), even though
+        // the matcher peels the wrapper for the binders below.
+        if (auto* var = std::get_if<Ppat_var>(&typedtree_pat(&fc->cases[0].lhs)->desc)) {
           Ident id = fresh(var->name.txt);
           l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
@@ -22922,7 +23017,7 @@ struct Translator {
       // Matching.name_pattern: the parameter takes the first var/alias row's name.
       std::string pname = "param";
       for (auto& c : fc->cases) {
-        const Pattern* ep = effective_pat(&c.lhs);
+        const Pattern* ep = typedtree_pat(&c.lhs);
         if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) { pname = pv->name.txt; break; }
         if (auto* pa = std::get_if<Ppat_alias>(&ep->desc)) { pname = pa->name.txt; break; }
       }

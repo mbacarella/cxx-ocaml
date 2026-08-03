@@ -133,7 +133,9 @@ struct ValueKinds {
   // across record types, the field resolved through the base's inferred type
   // IDENTITY (its decl stamp) -- which the back end's by-name `find_field`
   // cannot disambiguate (Sign_diff.t.untypables@4 vs signature_symptom.untypables@8).
-  struct FieldResolved { int index; bool mut; std::string kind; };
+  // `unboxed`: the owning record is `[@@unboxed]`, so the projection is the
+  // identity -- there is no block to read a field from.
+  struct FieldResolved { int index; bool mut; std::string kind; bool unboxed = false; };
   std::unordered_map<const ast::Expression*, FieldResolved> field_resolved;
   // For a comparison primitive used as a first-class VALUE (`let (=) : int -> int
   // -> bool = Stdlib.(=)`), the kind_str of the instantiated FIRST-parameter type
