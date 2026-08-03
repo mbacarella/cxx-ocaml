@@ -357,6 +357,13 @@ struct Checker {
     }
     return "";
   }
+  // A module bound to a FUNCTOR APPLICATION (`module Diff =
+  // Diffing.Define(Defs)`): the name -> (the functor's dotted path, how many
+  // times it is applied).  Kept apart from local_module_paths_, which
+  // deliberately records only plain module-path aliases -- putting a functor
+  // binding there poisons `open F(X)`.  "" as the path = conflictingly
+  // rebound, so no expansion is attempted.
+  std::unordered_map<std::string, std::pair<std::string, int>> functor_module_apps_;
   // names that are also predefined or exception constructors: when one of these
   // is reused by a variant, OCaml disambiguates by expected type (which we lack),
   // so we keep them unknown rather than resolve to the wrong kind.
@@ -6140,6 +6147,59 @@ struct Checker {
     }
     return it->second.count(cn) > 0;
   }
+  // The type path the BACK END must be handed for a constructor the checker
+  // recorded at `path`.  A functor-application module names no compilation
+  // unit, so `Diff.change` (from `module Diff = Diffing.Define(Defs)`) is a
+  // path nothing downstream can load: the matcher finds no constructor, and
+  // one such row bails the WHOLE match to the caml_obj_tag if-chain.  But the
+  // functor's result type is only an abbreviation -- `type nonrec change =
+  // (..) change` -- of a type its own unit declares, and THAT path resolves
+  // like any import.  Walk the functor's cmi to the manifest and hand it
+  // back; "" when the path needs no rewrite or no expansion can be proven.
+  std::string ctor_owner_expansion(const std::string& path, const std::string& cn) {
+    auto d = path.rfind('.');
+    if (d == std::string::npos) return "";
+    auto fm = functor_module_apps_.find(path.substr(0, d));
+    if (fm == functor_module_apps_.end() || fm->second.first.empty()) return "";
+    if (scrut_owns_ctor(path, cn)) return "";  // already resolvable as written
+    std::vector<std::string> comps = mod_components_str(fm->second.first);
+    if (comps.size() < 2) return "";
+    const std::string tyname = path.substr(d + 1);
+    std::string cand;
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        if (!md) return "";
+        cmi::ModuleTypePtr mt = md->type;
+        // The LAST component is the functor itself: step through one body per
+        // application written at the binding.
+        if (i + 1 == comps.size())
+          for (int a = 0; a < fm->second.second && mt; ++a)
+            mt = mt->kind == cmi::ModuleType::Functor ? mt->functor_body
+                                                      : nullptr;
+        sig = module_sig(mt, loaded);
+      }
+      if (!sig) return "";
+      for (auto& td : sig->types)
+        if (td.name == tyname) {
+          if (!td.manifest || !td.manifest->path) return "";
+          cand = cmi_path_str(*td.manifest->path);
+          // A Pident manifest names a type of the functor's OWN unit
+          // (Diffing.Define's `change`); a Pdot one already names its owner
+          // (Diffing_with_keys.Define's `= (..) Diffing.change`).
+          if (td.manifest->path->kind == cmi::Path::Pident)
+            cand = comps[0] + "." + cand;
+          break;
+        }
+    } catch (...) { return ""; }
+    // Only ever hand back a path that PROVABLY declares this constructor.
+    return scrut_owns_ctor(cand, cn) ? cand : "";
+  }
   // The DECLARED argument types of constructor `cn` of the variant named by
   // `typath` -- the file-local per-type schemes first, then the owning unit's
   // cmi through the same qualified lookup a written `M.C` pattern takes.  Empty
@@ -10305,6 +10365,29 @@ struct Checker {
                 if (!ins && f->second != p) f->second = "";  // conflicting rebind
               }
             }
+            // A functor APPLICATION: remember the functor and how many times
+            // it is applied, so a type of the RESULT can later be expanded to
+            // the type the functor's own unit declares (ctor_owner_expansion).
+            if (!strict) {
+              const ModuleExpr* fx = &mb->binding.expr;
+              int napp = 0;
+              for (;;) {
+                while (auto* mc = std::get_if<Pmod_constraint>(&fx->desc))
+                  fx = mc->me.get();
+                if (auto* a = std::get_if<Pmod_apply>(&fx->desc)) {
+                  ++napp; fx = a->f.get();
+                } else if (auto* au = std::get_if<Pmod_apply_unit>(&fx->desc)) {
+                  ++napp; fx = au->f.get();
+                } else break;
+              }
+              if (napp > 0)
+                if (auto* fi = std::get_if<Pmod_ident>(&fx->desc)) {
+                  std::pair<std::string, int> app{lid_full(fi->id.txt), napp};
+                  auto [f, ins] =
+                      functor_module_apps_.emplace(*mb->binding.name.txt, app);
+                  if (!ins && f->second != app) f->second.first.clear();
+                }
+            }
             // A functor: record its body's exports as the application result.
             const ModuleExpr* me = &mb->binding.expr;
             // `module M : sig .. end = ..`: keep the ascription signature so a
@@ -10771,6 +10854,16 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
   ck.resolve_pending_fields();  // re-resolve ambiguous field reads with final types
   ck.resolve_pending_disambig();  // ctor disambiguation with post-fixpoint types
   ValueKinds vk;
+  // The type path handed to the back end for a constructor node.  A
+  // functor-application result type names nothing loadable there, so swap in
+  // the unit type that really owns the ctor.  Producer AND consumer route
+  // through this: a construct/match pair resolving the same name at different
+  // types would read it at different tags -- a miscompile, not a fidelity
+  // difference.
+  auto owner_path = [&ck](const std::string& path, const ast::Longident& id) {
+    std::string ex = ck.ctor_owner_expansion(path, lid_last(id));
+    return ex.empty() ? path : ex;
+  };
   for (auto& [p, t] : ck.rec_pat_) {
     vk.pat[p] = kind_str(t, ck);
     // An abstract-ctor-typed PATTERN (an array pattern's element): a generic
@@ -10778,7 +10871,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
     if (vk.pat[p] == "addr" && array_kind_str(t, ck).empty()) vk.abstract_elem.insert(p);
     // A constructor pattern whose type resolved to a module-qualified variant:
     // record the path so the back end can register that type's constructors.
-    if (std::holds_alternative<ast::Ppat_construct>(p->desc)) {
+    if (auto* pk = std::get_if<ast::Ppat_construct>(&p->desc)) {
       TypePtr r = I::Engine::repr(t);
       if (getenv("CTDBG"))
         fprintf(stderr, "[CTDBG] rec_pat construct kind=%d path=%s\n",
@@ -10791,7 +10884,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
       // exceptions and crashed every error report).
       if (r->kind == I::Type::Kind::Constr &&
           (r->path.find('.') != std::string::npos || r->path == "exn"))
-        vk.pat_constr[p] = r->path;
+        vk.pat_constr[p] = owner_path(r->path, pk->id.txt);
     }
     // A record pattern's matched-value type (resolved by unify with the
     // scrutinee): lets the back end disambiguate an ambiguous field by type.
@@ -10844,9 +10937,13 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
         vk.cmp_operand[e] = dk;
     }
     TypePtr r = I::Engine::repr(t);
-    if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos)
-      vk.expr_constr[e] = r->path;  // module-qualified type, e.g. "Gc.stat"
-    else if (r->kind == I::Type::Kind::Constr && !r->path.empty() &&
+    if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos) {
+      // module-qualified type, e.g. "Gc.stat" -- expanded for a CONSTRUCT at a
+      // functor-application result type, which the back end cannot load.
+      auto* ek = std::get_if<ast::Pexp_construct>(
+          &static_cast<const ast::Expression*>(e)->desc);
+      vk.expr_constr[e] = ek ? owner_path(r->path, ek->id.txt) : r->path;
+    } else if (r->kind == I::Type::Kind::Constr && !r->path.empty() &&
              std::holds_alternative<ast::Pexp_construct>(
                  static_cast<const ast::Expression*>(e)->desc)) {
       // A CONSTRUCT node's inferred type is recorded even when FILE-LOCAL

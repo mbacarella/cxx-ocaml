@@ -1057,6 +1057,11 @@ struct Translator {
   // separately from 0 in declaration order, matching the runtime representation.
   struct CtorInfo {
     std::string type; int tag; bool is_block; int arity; bool unboxed = false;
+    // The imported module this entry was read from, when it came from a cmi
+    // ("Diffing").  `type` is only the BARE type name, so two units' same-named
+    // types compare equal there; this is what tells them apart.  Empty for an
+    // entry built from the file's own AST (no unit to name).
+    std::string unit;
     // inline record (`T of { pos : int }`): fields live directly in the
     // constructor block, in label order
     std::vector<std::string> rlabels;
@@ -1410,7 +1415,7 @@ struct Translator {
           int arity = c.is_inline_record ? 1 : (int)c.args.size();
           if (!out.count(c.name)) {
             CtorInfo ci{td.name, block ? nb : nc, block, arity,
-                        td.unboxed && arity == 1};
+                        td.unboxed && arity == 1, mod};
             // An INLINE-RECORD ctor of an imported module (Typedtree's
             // `Texp_record of {fields; representation; extended_expression}`):
             // carry its label order so `open Typedtree; match e with Texp_record
@@ -1440,7 +1445,7 @@ struct Translator {
             // flat-map slot already claimed (a same-named ctor of an earlier
             // type): the per-type list still needs this one.
             CtorInfo ci2{td.name, block ? nb : nc, block, arity,
-                         td.unboxed && arity == 1};
+                         td.unboxed && arity == 1, mod};
             mod_type_ctors_[mod][td.name].emplace_back(c.name, std::move(ci2));
           }
           if (block) ++nb; else ++nc;
@@ -11041,6 +11046,18 @@ struct Translator {
       return amb;
     }
     std::string mod = pc->second.substr(0, dot), ty = pc->second.substr(dot + 1);
+    // The ambient entry agrees on the bare type NAME, but that is not identity:
+    // Diffing.change and Diffing_with_keys.change both answer to "change", and
+    // includecore's `Change` pattern at the former (block tag 3) silently took
+    // the latter's (block tag 0).  When the ambient entry names a DIFFERENT
+    // unit and the cited one really declares this ctor at this type, the cited
+    // one wins -- the consumer twin of the construct site's dotted-foreign arm,
+    // which already re-reads from the unit the path names.  An unresolvable
+    // head (a local module, an alias) leaves the ambient entry alone.
+    if (amb && amb->type == ty && !amb->unit.empty() && amb->unit != mod &&
+        !module_base(mod))
+      for (auto& [nm, info] : module_type_ctors(mod, ty))
+        if (nm == cn) return &info;
     if (amb && amb->type == ty) return amb;                 // ambient already correct
     if (auto ti = type_ctor_info_.find(ty); ti != type_ctor_info_.end())  // a local type
       if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
