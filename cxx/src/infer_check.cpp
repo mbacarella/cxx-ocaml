@@ -6140,6 +6140,39 @@ struct Checker {
     }
     return it->second.count(cn) > 0;
   }
+  // The DECLARED argument types of constructor `cn` of the variant named by
+  // `typath` -- the file-local per-type schemes first, then the owning unit's
+  // cmi through the same qualified lookup a written `M.C` pattern takes.  Empty
+  // when the type isn't a variant, doesn't declare `cn`, or (cmi side) when the
+  // ctor found there belongs to a different type of the same module: callers
+  // read empty as "cannot descend" and leave the sub-patterns alone.
+  std::vector<TypePtr> ctor_decl_arg_types(const std::string& typath,
+                                           const std::string& cn) {
+    TypePtr res;
+    if (auto ts = type_ctor_schemes_.find(typath); ts != type_ctor_schemes_.end()) {
+      for (auto& [n, s] : ts->second)
+        if (n == cn) return ctor_params(eng.instantiate(s), res);
+      return {};
+    }
+    auto d = typath.rfind('.');
+    if (d == std::string::npos) return {};
+    std::vector<std::string> comps = mod_components_str(typath.substr(0, d));
+    if (comps.empty()) return {};
+    Longident id; id.v = Lident{comps[0]};
+    for (size_t i = 1; i < comps.size(); ++i) {
+      Longident nxt; nxt.v = Ldot{std::make_shared<Longident>(std::move(id)), comps[i]};
+      id = std::move(nxt);
+    }
+    Longident full; full.v = Ldot{std::make_shared<Longident>(std::move(id)), cn};
+    TypePtr scheme = qualified_ctor_scheme(full);
+    if (!scheme) return {};
+    auto ps = ctor_params(scheme, res);
+    TypePtr rr = I::Engine::repr(res);
+    // qualified_ctor_scheme takes the FIRST variant in the module declaring the
+    // name; make sure that is the type we asked about.
+    if (rr->kind != I::Type::Kind::Constr || rr->path != typath) return {};
+    return ps;
+  }
   void resolve_pending_disambig() {
     for (auto& [p, t] : pending_pat_disambig_) disambig_pat_now(*p, t);
     for (auto& [e, t] : pending_expr_disambig_)
@@ -6241,21 +6274,22 @@ struct Checker {
       }
     }
   }
-  void disambig_pat_now(const Pattern& lhs, const TypePtr& scrut, int depth = 0) {
+  void disambig_pat_now(const Pattern& lhs, const TypePtr& scrut, int depth = 0,
+                        bool in_ctor_arg = false) {
     // Recurse through the shapes whose sub-patterns keep a known COLUMN type
     // (tuple columns, or-alternatives, aliases), so a NESTED ambiguous ctor is
     // re-resolved by its column too -- u.ml's `match arg, param with
     // (Unit|Empty_struct), Unit -> ..` has both same-named `Unit`s under a
     // tuple; ctor ARGS are covered separately by record_pat_ctor_arg_type.
     if (auto* al = std::get_if<ast::Ppat_alias>(&lhs.desc))
-      return disambig_pat_now(*al->p, scrut, depth + 1);
+      return disambig_pat_now(*al->p, scrut, depth + 1, in_ctor_arg);
     if (auto* ct = std::get_if<ast::Ppat_constraint>(&lhs.desc))
-      return disambig_pat_now(*ct->p, scrut, depth + 1);
+      return disambig_pat_now(*ct->p, scrut, depth + 1, in_ctor_arg);
     if (auto* op = std::get_if<ast::Ppat_open>(&lhs.desc))
-      return disambig_pat_now(*op->p, scrut, depth + 1);
+      return disambig_pat_now(*op->p, scrut, depth + 1, in_ctor_arg);
     if (auto* o = std::get_if<ast::Ppat_or>(&lhs.desc)) {
-      disambig_pat_now(*o->l, scrut, depth + 1);
-      disambig_pat_now(*o->r, scrut, depth + 1);
+      disambig_pat_now(*o->l, scrut, depth + 1, in_ctor_arg);
+      disambig_pat_now(*o->r, scrut, depth + 1, in_ctor_arg);
       return;
     }
     if (auto* tu = std::get_if<ast::Ppat_tuple>(&lhs.desc)) {
@@ -6263,7 +6297,7 @@ struct Checker {
       if (sr->kind == I::Type::Kind::Tuple &&
           sr->args.size() == tu->elems.size())
         for (size_t i = 0; i < tu->elems.size(); ++i)
-          disambig_pat_now(*tu->elems[i], sr->args[i], depth + 1);
+          disambig_pat_now(*tu->elems[i], sr->args[i], depth + 1, in_ctor_arg);
       return;
     }
     auto* k = std::get_if<ast::Ppat_construct>(&lhs.desc);
@@ -6289,23 +6323,57 @@ struct Checker {
     } else if (!dotted && !local_amb) {
       return;
     }
-    auto rp = rec_pat_.find(&lhs);
-    if (rp == rec_pat_.end()) return;
-    TypePtr pr = I::Engine::repr(rp->second);
-    std::string found = pr->kind == I::Type::Kind::Constr ? pr->path : "";
-    auto lastc = [](const std::string& s) {
-      auto d = s.rfind('.');
-      return d == std::string::npos ? s : s.substr(d + 1);
-    };
-    if (getenv("CTDBG"))
-      fprintf(stderr, "[CTDBG-P] pat-disambig %s found=%s scrut=%s amb=%d d=%d\n",
-              cn.c_str(), found.c_str(), sr->path.c_str(), (int)local_amb, depth);
-    if (!found.empty() && lastc(found) != lastc(sr->path)) {
-      rec_pat_[&lhs] = scrut;
-      // Route through the ctor-arg map so vk.pat_constr records it even
-      // DOTLESS (the general rec_pat_ harvest only records qualified paths).
-      if (local_amb) pat_ctor_arg_type_[&lhs] = sr;
+    if (auto rp = rec_pat_.find(&lhs); rp != rec_pat_.end()) {
+      TypePtr pr = I::Engine::repr(rp->second);
+      std::string found = pr->kind == I::Type::Kind::Constr ? pr->path : "";
+      auto lastc = [](const std::string& s) {
+        auto d = s.rfind('.');
+        return d == std::string::npos ? s : s.substr(d + 1);
+      };
+      if (getenv("CTDBG"))
+        fprintf(stderr, "[CTDBG-P] pat-disambig %s found=%s scrut=%s amb=%d d=%d\n",
+                cn.c_str(), found.c_str(), sr->path.c_str(), (int)local_amb, depth);
+      // A ctor-ARGUMENT column deliberately does NOT re-pin a ctor that DID
+      // resolve, only one that resolved to nothing.  The producer half has no
+      // twin for a DOTTED foreign type -- lambda.cpp's construct-site override
+      // trusts a dotted expr_constr only under a forced rebinding, and looks
+      // only in the file's own types -- so re-pinning a lexically-SHADOWED
+      // nested ctor here (a local `Lsize of int` over a foreign `Lsize of
+      // string * int`) would make the match read at an arity the construct
+      // never wrote.  That shadow stays mis-resolved on BOTH sides, which is
+      // wrong but consistent; fixing it needs the producer override first.
+      if (!found.empty() && lastc(found) != lastc(sr->path) && !in_ctor_arg) {
+        rec_pat_[&lhs] = scrut;
+        // Route through the ctor-arg map so vk.pat_constr records it even
+        // DOTLESS (the general rec_pat_ harvest only records qualified paths).
+        if (local_amb) pat_ctor_arg_type_[&lhs] = sr;
+      } else if (found.empty() && depth > 0) {
+        // The ctor resolved to NOTHING: it is not in lexical scope and
+        // infer_pat is bottom-up, so a nested one never saw an expected type
+        // (`Magic_size` inside `Acc_string_literal (Acc_formatting_lit (p,
+        // Magic_size (_, size)), s)` with neither module opened).  The guard
+        // above already proved this column's type declares it, so pin it
+        // there.  pat_ctor_arg_type_ feeds only vk.pat_constr, which is
+        // exactly the back end's disambiguation hook -- the pattern's
+        // recorded value kind stays whatever inference made of it.
+        pat_ctor_arg_type_[&lhs] = sr;
+      }
     }
+    // Descend into the constructor's ARGUMENTS with their DECLARED types, the
+    // pattern twin of typecore's expected-type propagation.  Without it a
+    // sub-column whose type is named only by the enclosing ctor's declaration
+    // stays unresolved, and the back end's matcher bails that whole match to
+    // the caml_obj_tag if-chain rather than a switch.
+    if (!k->arg) return;
+    std::vector<TypePtr> ps = ctor_decl_arg_types(sr->path, cn);
+    if (ps.empty()) return;
+    auto* tup = std::get_if<ast::Ppat_tuple>(&(*k->arg)->desc);
+    if (ps.size() > 1) {
+      if (tup && tup->elems.size() == ps.size())
+        for (size_t i = 0; i < ps.size(); ++i)
+          disambig_pat_now(*tup->elems[i], ps[i], depth + 1, /*in_ctor_arg=*/true);
+    } else
+      disambig_pat_now(**k->arg, ps[0], depth + 1, /*in_ctor_arg=*/true);
   }
 
   // A `#t` pattern's row: t must be an abbreviation of a poly-variant row
