@@ -6173,6 +6173,33 @@ struct Checker {
     if (rr->kind != I::Type::Kind::Constr || rr->path != typath) return {};
     return ps;
   }
+  // Does the type `found` (as inference resolved a constructor) name a
+  // DIFFERENT variant from `want` (the expected / scrutinee type)?  A shared
+  // LAST component is not identity across modules -- Parsetree and Typedtree
+  // both declare `functor_parameter`, and two opened units can both declare
+  // `kind` -- so compare dotted paths in FULL, resolving each head through the
+  // file's module aliases so `T.x` and `Typedtree.x` stay a match.  A DOTLESS
+  // `found` is a file-local decl with no path to compare against, so it keeps
+  // the last-component test.
+  bool ctor_type_differs(const std::string& found, const std::string& want) {
+    if (found.empty()) return false;
+    if (found.find('.') != std::string::npos) {
+      auto alias_norm = [&](const std::string& s) {
+        auto d = s.find('.');
+        if (d == std::string::npos) return s;
+        auto f = local_module_paths_.find(s.substr(0, d));
+        if (f != local_module_paths_.end() && !f->second.empty())
+          return f->second + s.substr(d);
+        return s;
+      };
+      return alias_norm(found) != alias_norm(want);
+    }
+    auto lastc = [](const std::string& s) {
+      auto d = s.rfind('.');
+      return d == std::string::npos ? s : s.substr(d + 1);
+    };
+    return lastc(found) != lastc(want);
+  }
   void resolve_pending_disambig() {
     for (auto& [p, t] : pending_pat_disambig_) disambig_pat_now(*p, t);
     for (auto& [e, t] : pending_expr_disambig_)
@@ -6236,31 +6263,14 @@ struct Checker {
       TypePtr res;
       ctor_params(eng.instantiate(*sch), res);
       TypePtr rr = I::Engine::repr(res);
-      auto lastc = [](const std::string& s) {
-        auto d = s.rfind('.');
-        return d == std::string::npos ? s : s.substr(d + 1);
-      };
       // Same LAST component does not mean same type across modules
       // (Parsetree and Typedtree both declare `functor_parameter`;
       // untypeast's `Named (name, mt)` found Typedtree's arity-3 ctor
       // where the annotated Parsetree arity-2 one was meant, boxing the
-      // written pair into one field).  When BOTH paths are dotted,
-      // compare them fully, resolving each head through file-local
-      // module aliases so `T.x` vs `Typedtree.x` stays a match.
-      auto alias_norm = [&](const std::string& s) {
-        auto d = s.find('.');
-        if (d == std::string::npos) return s;
-        auto f = local_module_paths_.find(s.substr(0, d));
-        if (f != local_module_paths_.end() && !f->second.empty())
-          return f->second + s.substr(d);
-        return s;
-      };
+      // written pair into one field) -- ctor_type_differs compares dotted
+      // paths in full.
       std::string found = rr->kind == I::Type::Kind::Constr ? rr->path : "";
-      bool diff;
-      if (!found.empty() && found.find('.') != std::string::npos)
-        diff = alias_norm(found) != alias_norm(er->path);
-      else
-        diff = !found.empty() && lastc(found) != lastc(er->path);
+      bool diff = ctor_type_differs(found, er->path);
       if (getenv("CTDBG"))
         fprintf(stderr, "[CTDBG-I] shadow-gate ctor %s found=%s expected=%s diff=%d\n",
                 cn.c_str(), found.c_str(), er->path.c_str(), (int)diff);
@@ -6273,23 +6283,40 @@ struct Checker {
         if (er_local_amb) ctor_arg_type_[&e] = er;
       }
     }
+    // Descend into the constructor's ARGUMENTS with their DECLARED types --
+    // the producer twin of disambig_pat_now's descent.  infer_expr propagates
+    // an expectation into a ctor's argument only when it already resolved the
+    // ctor, so a nested one written under a LOCAL shadow (`Olit (Onone, Lsize
+    // (s, n))` at Ia.outer, with a file-local `Lsize of int` last in scope)
+    // never sees the foreign argument type it is really at.  Recording it in
+    // expr_constr lets the back end re-resolve, which is what keeps the
+    // producer in step with the consumer half below.
+    if (!k->arg || er->kind != I::Type::Kind::Constr) return;
+    std::vector<TypePtr> ps = ctor_decl_arg_types(er->path, cn);
+    if (ps.empty()) return;
+    auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
+    if (ps.size() > 1) {
+      if (tup && tup->elems.size() == ps.size())
+        for (size_t i = 0; i < ps.size(); ++i)
+          disambig_expr_now(*tup->elems[i], ps[i], allow_defer, deferred);
+    } else
+      disambig_expr_now(**k->arg, ps[0], allow_defer, deferred);
   }
-  void disambig_pat_now(const Pattern& lhs, const TypePtr& scrut, int depth = 0,
-                        bool in_ctor_arg = false) {
+  void disambig_pat_now(const Pattern& lhs, const TypePtr& scrut, int depth = 0) {
     // Recurse through the shapes whose sub-patterns keep a known COLUMN type
     // (tuple columns, or-alternatives, aliases), so a NESTED ambiguous ctor is
     // re-resolved by its column too -- u.ml's `match arg, param with
     // (Unit|Empty_struct), Unit -> ..` has both same-named `Unit`s under a
     // tuple; ctor ARGS are covered separately by record_pat_ctor_arg_type.
     if (auto* al = std::get_if<ast::Ppat_alias>(&lhs.desc))
-      return disambig_pat_now(*al->p, scrut, depth + 1, in_ctor_arg);
+      return disambig_pat_now(*al->p, scrut, depth + 1);
     if (auto* ct = std::get_if<ast::Ppat_constraint>(&lhs.desc))
-      return disambig_pat_now(*ct->p, scrut, depth + 1, in_ctor_arg);
+      return disambig_pat_now(*ct->p, scrut, depth + 1);
     if (auto* op = std::get_if<ast::Ppat_open>(&lhs.desc))
-      return disambig_pat_now(*op->p, scrut, depth + 1, in_ctor_arg);
+      return disambig_pat_now(*op->p, scrut, depth + 1);
     if (auto* o = std::get_if<ast::Ppat_or>(&lhs.desc)) {
-      disambig_pat_now(*o->l, scrut, depth + 1, in_ctor_arg);
-      disambig_pat_now(*o->r, scrut, depth + 1, in_ctor_arg);
+      disambig_pat_now(*o->l, scrut, depth + 1);
+      disambig_pat_now(*o->r, scrut, depth + 1);
       return;
     }
     if (auto* tu = std::get_if<ast::Ppat_tuple>(&lhs.desc)) {
@@ -6297,7 +6324,7 @@ struct Checker {
       if (sr->kind == I::Type::Kind::Tuple &&
           sr->args.size() == tu->elems.size())
         for (size_t i = 0; i < tu->elems.size(); ++i)
-          disambig_pat_now(*tu->elems[i], sr->args[i], depth + 1, in_ctor_arg);
+          disambig_pat_now(*tu->elems[i], sr->args[i], depth + 1);
       return;
     }
     auto* k = std::get_if<ast::Ppat_construct>(&lhs.desc);
@@ -6326,23 +6353,13 @@ struct Checker {
     if (auto rp = rec_pat_.find(&lhs); rp != rec_pat_.end()) {
       TypePtr pr = I::Engine::repr(rp->second);
       std::string found = pr->kind == I::Type::Kind::Constr ? pr->path : "";
-      auto lastc = [](const std::string& s) {
-        auto d = s.rfind('.');
-        return d == std::string::npos ? s : s.substr(d + 1);
-      };
       if (getenv("CTDBG"))
         fprintf(stderr, "[CTDBG-P] pat-disambig %s found=%s scrut=%s amb=%d d=%d\n",
                 cn.c_str(), found.c_str(), sr->path.c_str(), (int)local_amb, depth);
-      // A ctor-ARGUMENT column deliberately does NOT re-pin a ctor that DID
-      // resolve, only one that resolved to nothing.  The producer half has no
-      // twin for a DOTTED foreign type -- lambda.cpp's construct-site override
-      // trusts a dotted expr_constr only under a forced rebinding, and looks
-      // only in the file's own types -- so re-pinning a lexically-SHADOWED
-      // nested ctor here (a local `Lsize of int` over a foreign `Lsize of
-      // string * int`) would make the match read at an arity the construct
-      // never wrote.  That shadow stays mis-resolved on BOTH sides, which is
-      // wrong but consistent; fixing it needs the producer override first.
-      if (!found.empty() && lastc(found) != lastc(sr->path) && !in_ctor_arg) {
+      // Shares the producer's comparison: two OPENED units can each declare a
+      // `kind`, and the last component alone then reads as a match, leaving
+      // the match arms on the shadowing unit's tags.
+      if (ctor_type_differs(found, sr->path)) {
         rec_pat_[&lhs] = scrut;
         // Route through the ctor-arg map so vk.pat_constr records it even
         // DOTLESS (the general rec_pat_ harvest only records qualified paths).
@@ -6371,9 +6388,9 @@ struct Checker {
     if (ps.size() > 1) {
       if (tup && tup->elems.size() == ps.size())
         for (size_t i = 0; i < ps.size(); ++i)
-          disambig_pat_now(*tup->elems[i], ps[i], depth + 1, /*in_ctor_arg=*/true);
+          disambig_pat_now(*tup->elems[i], ps[i], depth + 1);
     } else
-      disambig_pat_now(**k->arg, ps[0], depth + 1, /*in_ctor_arg=*/true);
+      disambig_pat_now(**k->arg, ps[0], depth + 1);
   }
 
   // A `#t` pattern's row: t must be an abbreviation of a poly-variant row
@@ -7508,6 +7525,17 @@ struct Checker {
       // reject pass, where an incomplete unify can propagate a spurious clash and
       // cost a false-rejection.  Soft (try_unify) so a stray clash can't abort.
       if (!strict) try_unify(et, at);
+      // The annotation is an EXPECTED type for the inner expression, which the
+      // plain infer_expr above never sees -- so run the constructor
+      // disambiguation hook on it explicitly, as an argument position would.
+      // `let f x : t = e` carries its return annotation as exactly this node,
+      // so without it a constructor written there resolves by lexical scope
+      // alone: `let mk s n : Ia.outer = Olit (Onone, Lsize (s, n))` picked a
+      // file-local `Lsize of int` over the foreign arity-2 one it is at.  The
+      // format branch already routed through infer_expr_expected, which runs
+      // the hook itself.
+      if (record_kinds_ && !coretype_is_format(*ct->t))
+        disambig_expr_now(*ct->e, at, /*allow_defer=*/true);
       return at;
     }
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) {
@@ -8813,6 +8841,16 @@ struct Checker {
         std::unordered_map<std::string, TypePtr> local;
         TypePtr at = from_coretype(*pc->type, annot_vars_ ? *annot_vars_ : local);
         soft_unify(constrained ? constrained : body, at);
+        // A RETURN annotation is an expected type for the body, which the
+        // infer_expr above never saw -- run the constructor disambiguation
+        // hook on it, as an argument position would.  `let mk s n : Ia.outer =
+        // Olit (Onone, Lsize (s, n))` otherwise resolves the nested Lsize by
+        // lexical scope alone.  Only for a Pfunction_body: `constrained` means
+        // the annotation covers an arrow (the `function` cases form), whose
+        // result is not this node.
+        if (record_kinds_ && !constrained)
+          if (auto* fb = std::get_if<Pfunction_body>(&f.body->v))
+            disambig_expr_now(*fb->e, at, /*allow_defer=*/true);
         // A PACKAGE-typed return annotation is the result (ocamlc's ascription
         // display): a lenient path mismatch (`(module X.S)` body vs
         // `(module Y.S)` annotation, distinct spellings of one modtype) must
@@ -9185,6 +9223,12 @@ struct Checker {
           // type so an incomplete-inference clash can't false-reject); soft so a
           // stray clash can't abort the pass.
           if (!strict) soft_unify(te, annot);
+          // Same as the `(e : t)` and return-annotation hooks: the declared
+          // type is an expected type for the RHS, which the infer_expr above
+          // never saw (`let a : Ia.lit = Lsize ("a", 1)` under a file-local
+          // `Lsize of int`).  A function RHS is a no-op here -- its own return
+          // annotation is handled in infer_function.
+          if (record_kinds_) disambig_expr_now(*b.expr, annot, /*allow_defer=*/true);
         } else if (auto* co = std::get_if<Pvc_coercion>(&*b.constraint_)) {
           // `let x : T1 :> T2 = e` (a binding-level coercion) binds x to the
           // TARGET T2, exactly like a `(e : T1 :> T2)` expression coercion.  The

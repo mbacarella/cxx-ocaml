@@ -20389,6 +20389,31 @@ struct Translator {
                   if (ci2->second.is_block == k->arg.has_value() ||
                       forced_ctor_depth_.count(n))
                     cip = &ci2->second;
+          } else {
+            // A DOTTED path naming a SEPARATELY-COMPILED unit's type is
+            // resolved through that unit, where no bare-name collision is
+            // possible -- the objection above is to the BARE last component
+            // being looked up in type_ctor_info_, not to the path itself.
+            // The flat entry is first-registration-wins across every type
+            // sharing the ctor name, so without this a bare `Type` inferred
+            // at Out_type.type_or_scheme (tag 0) kept whichever same-named
+            // ctor a foreign type registered first -- typecore's
+            // Shape.Sig_component_kind.t Type, tag 1.  Shape-guarded: never
+            // install a candidate the WRITTEN construct cannot be.
+            // No `tn != cip->type` pre-filter: CtorInfo::type is the BARE type
+            // name, so two units' same-named types (Ib.kind / Ic.kind) compare
+            // equal there -- which is the very confusion this arm exists to
+            // settle.  Re-reading the ctor from the cited unit is idempotent
+            // when the flat entry was already the right one.
+            auto d = ety.rfind('.');
+            std::string emod = ety.substr(0, d), tn = ety.substr(d + 1);
+            if (!exn_ident_.count(n) && !exn_field_.count(n) &&
+                !module_base(emod.substr(0, emod.find('.'))))
+              for (auto& [nm2, info2] : module_type_ctors(emod, tn))
+                if (nm2 == n && info2.is_block == k->arg.has_value()) {
+                  cip = &info2;
+                  break;
+                }
           }
         }
       }
