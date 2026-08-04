@@ -8769,15 +8769,21 @@ struct Translator {
     }
     return result;
   }
-  // A pure, freely-duplicable term: an immutable field read (Pfield, our FieldImm)
-  // of a duplicable base, or a bare Var.  These are exactly the shapes ocamlc's
-  // Matching/Simplif bind with the Alias let-kind, so substituting one into its
-  // single use (or dropping a dead one) reorders no effects.  FieldInt/FieldMut
-  // (ref derefs) are mutable and NOT duplicable, so they are excluded.
-  static bool is_alias_dup(const LamPtr& v) {
+  // A pure, freely-duplicable term: an immutable field read of a duplicable
+  // base, or a bare Var.  These are exactly the shapes ocamlc's Matching and
+  // Simplif bind with the Alias let-kind, so substituting one into its single
+  // use (or dropping a dead one) reorders no effects.  FieldMut is a mutable
+  // read and excluded.  FieldInt is only a SPELLING (printlambda prints every
+  // immediate-contents field that way, mutable or not), so it is duplicable
+  // exactly when the read is not one field_read recorded as mutable -- the
+  // same discriminator is_mut_field_access uses for the let-kind.
+  bool is_alias_dup(const LamPtr& v) const {
     if (!v) return false;
     if (v->k == Lam::K::Var) return true;
     if (v->k == Lam::K::Prim && v->prim == Prim::FieldImm && v->args.size() == 1)
+      return is_alias_dup(v->args[0]);
+    if (v->k == Lam::K::Prim && v->prim == Prim::FieldInt &&
+        v->args.size() == 1 && !mutfield_reads_.count(v.get()))
       return is_alias_dup(v->args[0]);
     // `x + n` (the Switcher's shifted `switcher` alias): pure and cheap, so
     // Simplif substitutes its single use just like a Var alias (count==1 case).
@@ -8792,7 +8798,7 @@ struct Translator {
   // module field is immutable once the module is built.  Unlike is_alias_dup
   // (free DUPLICATION of a pure term), this only sanctions the count<=1 case, so
   // a multi-use module field stays bound once (matching ocamlc's Simplif).
-  static bool is_incl_field_alias(const LamPtr& v) {
+  bool is_incl_field_alias(const LamPtr& v) const {
     if (!v) return false;
     if (v->k == Lam::K::Prim && v->prim == Prim::FieldMut && v->args.size() == 1)
       return v->args[0] &&
@@ -11807,10 +11813,13 @@ struct Translator {
   // Deep-copy a deferred field-access prototype (a small Prim-over-Var tree) so
   // every materialized read is a fresh node -- in-place passes must never see
   // structure sharing across match arms.
-  static LamPtr clone_facc(const LamPtr& l) {
+  LamPtr clone_facc(const LamPtr& l) {
     LamPtr c = lam_alloc_copy(*l);
     c->gm_facc = false;
     c->from_alias = false;
+    // The mutable-read mark is keyed by NODE, so a copy has to inherit it or
+    // the clone reads as a duplicable immutable field (field_int spells both).
+    if (mutfield_reads_.count(l.get())) mutfield_reads_.insert(c.get());
     for (auto& a : c->args) a = clone_facc(a);
     return c;
   }
