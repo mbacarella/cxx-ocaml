@@ -12560,8 +12560,50 @@ struct Translator {
             { lead_ok = false; break; }
         }
       }
+      // do_split also hoists a row that FOLLOWS the or-row into the group
+      // compiled before the alternatives, whenever safe_before holds -- that
+      // is, whenever the two whole rows are incompatible, so no scrutinee can
+      // reach both and the swap is invisible.  One column naming disjoint
+      // constructors on the two sides proves it; anything less certain leaves
+      // the row where it is.  pop_compat then drops the hoisted row from the
+      // handler, so it appears in the body only, exactly where the leading
+      // simple rows sit.  ast_invariants' `Ppat_tuple (([] | [_]), Closed)`
+      // ahead of `Ppat_tuple ([], Open)` is the shape: column 0 shares `[]`,
+      // column 1 is Closed against Open.
+      auto col_disjoint = [&](const Pattern* p, const Pattern* q) {
+        std::vector<const Pattern*> pa, qa;
+        flatten_or(p, pa);
+        flatten_or(q, qa);
+        if (pa.empty() || qa.empty()) return false;
+        for (auto* x : pa) {
+          auto* kx = std::get_if<Ppat_construct>(&effective_pat(x)->desc);
+          if (!kx) return false;
+          for (auto* y : qa) {
+            auto* ky = std::get_if<Ppat_construct>(&effective_pat(y)->desc);
+            if (!ky || lid_last(kx->id.txt) == lid_last(ky->id.txt)) return false;
+          }
+        }
+        return true;
+      };
+      size_t tstart = oi + 1;
+      while (tstart < rows.size() && !rows[tstart].guard &&
+             !std::get_if<Ppat_or>(&rows[tstart].cols[0]->desc)) {  // #Simple.view
+        bool disj = false;
+        for (size_t j = 0; j < r.cols.size() && !disj; ++j)
+          disj = col_disjoint(r.cols[j], rows[tstart].cols[j]);
+        if (!disj) break;
+        ++tstart;
+      }
+      // Only when the fall-through is a REAL default, though.  Upstream compiles
+      // the handler pm under the whole match's partiality, so in a total match a
+      // lone remaining column collapses to its action with no test at all; our
+      // handler is compiled against the default exit, and where that exit is
+      // just the exhaustive match's Match_failure fill it would invent a test
+      // and a raise upstream never emits (typedecl_variance's `{type_kind = _;
+      // type_manifest = Some _}` ahead of an exhaustive three-arm match).
+      if (tstart > oi + 1 && deid == gm_fake_deid_) tstart = oi + 1;
       bool trailing_ok = lead_ok;
-      for (size_t i = oi + 1; trailing_ok && i < rows.size(); ++i)
+      for (size_t i = tstart; trailing_ok && i < rows.size(); ++i)
         if (!std::holds_alternative<Ppat_any>(rows[i].cols[0]->desc) ||
             rows[i].aid < 0) trailing_ok = false;
       bool rest_disc = false;
@@ -12588,18 +12630,20 @@ struct Translator {
         // Pexp_record (_, (Some .. | None))}]`: the outer or's Pexp_record arm
         // decomposes to the inner `Some .. | None` or, whose rows raise orn.)
         gm_orw_.insert(orn);
-        // Body: the leading simple rows, then the exploded alternatives (each
-        // raising orn with omega remaining columns), then the trailing
-        // wildcard-col0 rows intact (they form the column-0 dispatch default).
+        // Body: the leading simple rows and the hoisted ones, then the exploded
+        // alternatives (each raising orn with omega remaining columns), then the
+        // trailing wildcard-col0 rows intact (they form the column-0 dispatch
+        // default).
         std::vector<MRow> ex;
         for (size_t i = 0; i < oi; ++i) ex.push_back(rows[i]);
+        for (size_t i = oi + 1; i < tstart; ++i) ex.push_back(rows[i]);
         for (auto* a : alts) {
           MRow nr = r; nr.cols[0] = effective_pat(a);
           for (size_t j = 1; j < nr.cols.size(); ++j) nr.cols[j] = &gm_omega_pat;
           nr.aid = orn; nr.vnames = &orvars;
           ex.push_back(std::move(nr));
         }
-        for (size_t i = oi + 1; i < rows.size(); ++i) ex.push_back(rows[i]);
+        for (size_t i = tstart; i < rows.size(); ++i) ex.push_back(rows[i]);
         LamPtr sub = gmatch(comps, std::move(ex), mloc, deid, denv);
         if (!sub) return nullptr;
         // Handler (exit orn): the or-row's remaining columns compiled once, with
@@ -12616,7 +12660,7 @@ struct Translator {
         }
         std::vector<MRow> hrows;
         hrows.push_back(std::move(hr));
-        for (size_t i = oi + 1; i < rows.size(); ++i) {
+        for (size_t i = tstart; i < rows.size(); ++i) {
           MRow tr = rows[i]; tr.cols.erase(tr.cols.begin());
           hrows.push_back(std::move(tr));
         }
