@@ -9926,32 +9926,39 @@ struct Translator {
       }
     }
   }
-  // After local functions became static catches, a heap ref whose only closure
-  // uses were the converted functions no longer escapes: demote it to a mutable
-  // local (`=mut` + assign/*r) -- ocamlc's ref elimination also runs after
-  // simplify_local_functions, which is exactly why its tail-scope refs are flat.
-  void demote_refs(LamPtr& l) {
-    if (!l) return;
-    if (l->k == Lam::K::Let) {
-      for (size_t i = 0; i < l->bindings.size(); ++i) {
-        auto& b = l->bindings[i];
-        if (b.val && b.val->k == Lam::K::Prim && b.val->prim == Prim::Makemutable &&
-            b.val->prim_arg == 0 && b.val->args.size() == 1 && !b.mut && !b.alias) {
-          bool esc = ref_escapes(l->body, b.id);
-          for (size_t j = i + 1; j < l->bindings.size() && !esc; ++j)
-            esc = ref_escapes(l->bindings[j].val, b.id);
-          if (!esc) {
-            ValueKind k = b.val->blk_shape.empty() ? ValueKind::Gen : b.val->blk_shape[0];
-            b.kind = k;
-            b.mut = true;
-            b.val = b.val->args[0];
-            for (size_t j = i + 1; j < l->bindings.size(); ++j)
-              ref_rewrite(l->bindings[j].val, b.id);
-            ref_rewrite(l->body, b.id);
-          }
+  // The per-node half of the ref demotion (simplif.ml:552): every binding of
+  // THIS let that holds a `ref` -- a one-field mutable block -- and does not
+  // escape becomes a mutable local (`=mut` + assign/*r).  ocamlc nests its
+  // Llets where our Let holds a whole `let .. and ..` group, so a later
+  // binding's rhs is part of an earlier binding's body: scan and rewrite it
+  // along with the body.
+  void demote_refs_node(LamPtr& l) {
+    for (size_t i = 0; i < l->bindings.size(); ++i) {
+      auto& b = l->bindings[i];
+      if (b.val && b.val->k == Lam::K::Prim && b.val->prim == Prim::Makemutable &&
+          b.val->prim_arg == 0 && b.val->args.size() == 1 && !b.mut && !b.alias) {
+        bool esc = ref_escapes(l->body, b.id);
+        for (size_t j = i + 1; j < l->bindings.size() && !esc; ++j)
+          esc = ref_escapes(l->bindings[j].val, b.id);
+        if (!esc) {
+          ValueKind k = b.val->blk_shape.empty() ? ValueKind::Gen : b.val->blk_shape[0];
+          b.kind = k;
+          b.mut = true;
+          b.val = b.val->args[0];
+          for (size_t j = i + 1; j < l->bindings.size(); ++j)
+            ref_rewrite(l->bindings[j].val, b.id);
+          ref_rewrite(l->body, b.id);
         }
       }
     }
+  }
+  // After local functions became static catches, a heap ref whose only closure
+  // uses were the converted functions no longer escapes: demote it to a mutable
+  // local -- ocamlc's ref elimination also runs after simplify_local_functions,
+  // which is exactly why its tail-scope refs are flat.
+  void demote_refs(LamPtr& l) {
+    if (!l) return;
+    if (l->k == Lam::K::Let) demote_refs_node(l);
     demote_refs(l->fn);
     demote_refs(l->body);
     demote_refs(l->cond);
@@ -18316,12 +18323,28 @@ struct Translator {
     }
     return false;  // string/float/binder
   }
+  // A final `c1 | .. | cn | _` row.  split_no_or peels the closing `_` into its
+  // own pm (matching.ml:1622), so the constants keep the or-row's own exit while
+  // the switch's fail is a raise to that peeled pm -- two store entries, hence
+  // two interval actions, that Simplif then collapses onto one exit.  Only `_`
+  // can close such a row: a binder would have to appear in every alternative,
+  // which a constant one cannot provide.
+  bool catchall_or_consts(const Pattern* p, bool& is_int, bool& is_char,
+                          std::vector<std::pair<long long, long long>>& out) {
+    p = effective_pat(p);
+    auto* po = std::get_if<Ppat_or>(&p->desc);
+    if (!po) return false;
+    if (!switch_const_ranges(po->l.get(), is_int, is_char, out)) return false;
+    const Pattern* r = effective_pat(po->r.get());
+    if (std::holds_alternative<Ppat_any>(r->desc)) return true;
+    return catchall_or_consts(r, is_int, is_char, out);
+  }
   LamPtr switcher_match(const LamPtr& scrut, const std::vector<Row>& rows) {
     if (scrut->k != Lam::K::Var) return nullptr;
     struct KV { long long lo, hi; const Expression* rhs; };
     std::vector<KV> kvs;
     const Row* dflt = nullptr;
-    bool is_int = false, is_char = false, has_interval = false;
+    bool is_int = false, is_char = false, has_interval = false, has_tail = false;
     // bodies must be translated in source order for stable stamp normalization
     std::vector<const Expression*> by_src;
     // `('=' | ':') as c` rows: c binds to the scrutinee over that row's body
@@ -18346,6 +18369,14 @@ struct Translator {
         if (!aliases.empty()) row_aliases[r.rhs] = std::move(aliases);
       } else if (aliases.empty() && is_catchall(*p) && !dflt && &r == &rows.back()) {
         dflt = &r;
+      } else if (std::vector<std::pair<long long, long long>> tail;
+                 aliases.empty() && !dflt && &r == &rows.back() &&
+                 catchall_or_consts(p, is_int, is_char, tail)) {
+        for (auto& v : tail) {
+          kvs.push_back({v.first, v.second, nullptr});  // null rhs = the closing row
+          if (v.second > v.first) has_interval = true;
+        }
+        dflt = &r; has_tail = true;
       } else return nullptr;
     }
     // A single discrete value goes through the simpler const path; but a lone
@@ -18363,10 +18394,15 @@ struct Translator {
     std::vector<std::string> body_keys;
     actions.resize(kvs.size() + 1);
     std::vector<int> act_of(kvs.size());
+    // The closing row's constants get one action of their own, past the per-row
+    // ones; it lands on the default like the fail action does, but as a separate
+    // interval entry -- which is what leaves the array a tail region and so the
+    // clustering a fail cluster on each side (the `isout` two-sided test).
+    const int tail_act = has_tail ? (int)by_src.size() + 1 : 0;
     for (size_t i = 0; i < kvs.size(); ++i) {
       // find this kv's source position -> action index (1-based, source order)
       int pos = 0; for (size_t s = 0; s < by_src.size(); ++s) if (by_src[s] == kvs[i].rhs) { pos = (int)s; break; }
-      act_of[i] = pos + 1;
+      act_of[i] = kvs[i].rhs ? pos + 1 : tail_act;
     }
     for (size_t s = 0; s < by_src.size(); ++s) {
       auto ita = row_aliases.find(by_src[s]);
@@ -18390,6 +18426,8 @@ struct Translator {
       std::string dk = make_lam_key(default_body);
       if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) return nullptr;
     }
+    // the closing row's own action reaches the same body as the default does
+    if (tail_act) actions[tail_act] = clone_or_leaf(0, actions);
 
     // Build the interval cover (matching.ml as_interval_canfail, distinct values).
     // Adjacent values of the same action (or-flattened `1|2 -> e`) merge into one
@@ -18440,7 +18478,10 @@ struct Translator {
     struct ShWrap { int eid; LamPtr body; };
     std::vector<ShWrap> shs;
     for (size_t s = 1; s < actions.size(); ++s)
-      if (occ[s] >= 2 && actions[s]) {
+      // The closing row's action is Shared upstream too, but its handler body is
+      // a bare exit onto the peeled catch-all's, which Simplif folds away again
+      // -- so its leaves just stay default leaves here.
+      if (occ[s] >= 2 && actions[s] && (int)s != tail_act) {
         int e = ++next_exit_;
         shs.push_back({e, actions[s]});
         auto ex = mk(Lam::K::Staticraise); ex->prim_arg = e;
@@ -22130,6 +22171,11 @@ struct Translator {
       }
       if (l->bindings.empty()) return body;  // all bindings were field reads of a var
       l->body = body;
+      // A non-escaping `ref` binding becomes a mutable local.  The single-binding
+      // shape is taken above, straight off the AST; this catches the rest of the
+      // group in `let r = ref e and .. in ..`, which ocamlc sees as plain nested
+      // Llets and demotes one by one.
+      demote_refs_node(l);
       return l;
     }
     if (auto* it = std::get_if<Pexp_ifthenelse>(&e.desc)) {
