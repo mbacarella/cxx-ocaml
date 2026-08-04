@@ -21721,6 +21721,20 @@ struct Translator {
                 shp = s2->body.get();
                 continue;
               }
+          // map_return walks THROUGH Llet/Lletrec and Lsequence to the tails
+          // beyond them, so an arm-structured rhs buried under a local binding
+          // or a leading effect is just as decomposable (compenv's
+          // `let value, key = let tail () = .. in if .. then .. else ..`).
+          // Only the shape test descends; tail_tuple_exit rewrites the tails of
+          // the WHOLE translated rhs, Let/Sequence spine included.
+          if (auto* pl = std::get_if<Pexp_let>(&shp->desc)) {
+            shp = pl->body.get();
+            continue;
+          }
+          if (auto* ps = std::get_if<Pexp_sequence>(&shp->desc)) {
+            shp = ps->e2.get();
+            continue;
+          }
           break;
         }
         return allvars && (std::get_if<Pexp_match>(&shp->desc) ||
