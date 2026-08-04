@@ -518,6 +518,13 @@ struct Checker {
   TypePtr field_scheme(const std::string& label) {
     auto it = fields_.find(label);
     if (it != fields_.end()) return it->second;
+    // A label some LOCAL record declares stays unresolved when it is ambiguous
+    // (fields_ keeps only the unique ones): the external fallback below is for
+    // labels this unit does not declare at all.  Letting it answer here hands a
+    // locally-declared label a foreign record's field INDEX -- `{id = 1; l1x =
+    // "x"}` typed as Types.transient_expr, whose `id` is @3, so reading it off
+    // a two-field block returned garbage.
+    if (field_candidates_.count(label)) return nullptr;
     auto e = ext_fields_.find(label);
     if (e != ext_fields_.end() && e->second.size() == 1) return e->second[0];
     return nullptr;
@@ -6815,9 +6822,17 @@ struct Checker {
       // same-named label (a red herring from another unit's record) hijack
       // recTy.  Only a PURELY-external pattern (`{rf_loc; rf_desc; ..}` under
       // `module T = Typedtree`) falls back to ext_fields_ (below).
+      // The test is against field_candidates_, i.e. EVERY local declaration of
+      // the label, not just the ones finalize_fields kept as unambiguous: a
+      // label two local records share is still anchored locally, and giving it
+      // an unrelated unit's record is worse than leaving it to Any (gprinttyp's
+      // `id` is declared by Index.desc and by Named_subnode's inline record,
+      // and used to resolve to Types.transient_expr, whose own `id` sits at a
+      // different index -- the `{desc with id}` update then rebuilt the wrong
+      // four fields).
       bool any_local = false;
       for (auto& [lid, sub] : r->fields)
-        if (fields_.count(lid_last(lid.txt))) { any_local = true; break; }
+        if (field_candidates_.count(lid_last(lid.txt))) { any_local = true; break; }
       for (auto& [lid, sub] : r->fields) {
         auto it = fields_.find(lid_last(lid.txt));
         // A format-poly field is in BOTH maps (kind pass); the pattern binds
