@@ -10025,6 +10025,131 @@ struct Translator {
     auto it = pat_pre_ids_.find(p);
     return it != pat_pre_ids_.end() ? it->second : fresh(name);
   }
+  // The order in which ocamlc's matcher reads the MENTIONED columns of a
+  // record-shaped pattern level, as positions into `idx` (each mentioned field's
+  // declaration index); `fmut` is the type's per-field mutability, indexed by
+  // declaration position, or empty when the type couldn't be identified.
+  // The bindings come from matching.ml expanding the row to EVERY field in
+  // declaration order (all_record_args), then consuming columns left to right: an
+  // immutable field's binding is deferred onto the row and flushed in reverse
+  // accumulation order, while a MUTABLE column -- even an unmentioned one -- is a
+  // StrictOpt barrier that flushes the pending immutables (reversed) before
+  // binding in place.  So an all-immutable record reads by DESCENDING declaration
+  // index, but any mutable field in the type interleaves ascending around the
+  // barriers (`{za; zd}` of `{za; zb; mutable zc; zd}` reads za then zd).
+  std::vector<size_t> record_read_order(const std::vector<int>& idx,
+                                        const std::vector<bool>& fmut) {
+    std::vector<size_t> pos(idx.size());
+    for (size_t i = 0; i < pos.size(); ++i) pos[i] = i;
+    bool any_mut = false;
+    for (bool m : fmut) any_mut = any_mut || m;
+    if (!any_mut) {
+      std::stable_sort(pos.begin(), pos.end(),
+                       [&](size_t a, size_t b) { return idx[a] > idx[b]; });
+      return pos;
+    }
+    std::stable_sort(pos.begin(), pos.end(),
+                     [&](size_t a, size_t b) { return idx[a] < idx[b]; });
+    std::vector<size_t> out, pending;
+    size_t k = 0;
+    for (int col = 0; col < (int)fmut.size(); ++col) {
+      bool mentioned = k < pos.size() && idx[pos[k]] == col;
+      if (fmut[col]) {
+        out.insert(out.end(), pending.rbegin(), pending.rend()); pending.clear();
+        if (mentioned) out.push_back(pos[k++]);
+      } else if (mentioned) pending.push_back(pos[k++]);
+    }
+    out.insert(out.end(), pending.rbegin(), pending.rend());
+    // A column outside the declared range (or a repeated one) would be dropped
+    // by the walk above -- fall back to the all-immutable order rather than
+    // silently losing a binding.
+    if (out.size() != pos.size()) {
+      std::stable_sort(pos.begin(), pos.end(),
+                       [&](size_t a, size_t b) { return idx[a] > idx[b]; });
+      return pos;
+    }
+    return out;
+  }
+  // The read order of an INLINE-RECORD constructor pattern (`Node {up; left}`),
+  // whose labels are the block's own flat fields: ci.rlabels is the declaration
+  // order and ci.rfmut the barriers.  Yields (sub-pattern, field index) in read
+  // order; false if a mentioned label isn't one of the constructor's.
+  bool inline_rec_pat_reads(const Ppat_record* pr, const CtorInfo& ci,
+                            std::vector<std::pair<const Pattern*, int>>& out) {
+    std::vector<int> ixs; std::vector<const Pattern*> subs;
+    for (auto& [lbl, sub] : pr->fields) {
+      int ix = -1;
+      for (size_t i = 0; i < ci.rlabels.size(); ++i)
+        if (ci.rlabels[i] == lid_last(lbl.txt)) { ix = (int)i; break; }
+      if (ix < 0) return false;
+      ixs.push_back(ix); subs.push_back(sub.get());
+    }
+    bool sized = ci.rfmut.size() == ci.rlabels.size();
+    for (size_t k : record_read_order(ixs, sized ? ci.rfmut : std::vector<bool>{}))
+      out.push_back({subs[k], ixs[k]});
+    return true;
+  }
+  // The reads of a record pattern's fields off the (already materialized)
+  // sub-scrutinee `sv`, as (sub-pattern, field access) pairs to bind
+  // outermost-first, in record_read_order.  Keep the reverse-MENTION path for
+  // the `ref`/{contents} mutable-field case (field unresolved by
+  // resolve_record_pat_field).  False on a mentioned label that doesn't resolve
+  // at all -- the caller bails.
+  bool record_pat_reads(const Ppat_record* pr, const Pattern* p, const LamPtr& sv,
+                        std::vector<std::pair<const Pattern*, LamPtr>>& out) {
+    std::vector<std::string> flds;
+    for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
+    struct RF { int index; const Pattern* sub; FieldInfo fi; std::string lbl; };
+    std::vector<RF> rfs; bool all_ok = true;
+    for (auto& [lbl, sub] : pr->fields) {
+      FieldInfo nfi;
+      const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
+      tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
+      if (!fi) { all_ok = false; break; }
+      rfs.push_back({fi->index, sub.get(), *fi, lid_last(lbl.txt)});
+    }
+    if (all_ok) {
+      const RecType* rty = nullptr;
+      for (auto& rf : rfs)
+        if (!rf.fi.type.empty())
+          if (auto it = rec_types_.find(rf.fi.type); it != rec_types_.end()) {
+            rty = &it->second; break;
+          }
+      if (!rty)
+        if (auto* kv = record_for_fields(flds)) rty = &kv->second;
+      if (rty && rty->fmut.size() == rty->labels.size()) {
+        for (auto& rf : rfs)
+          if (rf.index < 0 || rf.index >= (int)rty->labels.size() ||
+              rty->labels[rf.index] != rf.lbl) { rty = nullptr; break; }
+      } else rty = nullptr;
+      std::vector<int> ixs;
+      for (auto& rf : rfs) ixs.push_back(rf.index);
+      for (size_t k : record_read_order(ixs, rty ? rty->fmut : std::vector<bool>{}))
+        out.push_back({rfs[k].sub, field_read(&rfs[k].fi, sv)});
+      return true;
+    }
+    for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
+      auto& [lbl, sub] = *rit;
+      FieldInfo nfi;
+      const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
+      tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
+      if (!fi) {
+        // The predefined `'a ref = { mutable contents }` cell: a `{contents=p}`
+        // pattern reads the mutable field 0 (deferred to the function body, so
+        // it isn't read until full saturation -- syntactic_arity).
+        if (lid_last(lbl.txt) == "contents" && pr->fields.size() == 1) {
+          auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut;
+          fm->prim_arg = 0; fm->args = {sv};
+          mutfield_reads_.insert(fm.get());
+          out.push_back({sub.get(), fm});
+          continue;
+        }
+        return false;
+      }
+      out.push_back({sub.get(), field_read(fi, sv)});
+    }
+    return true;
+  }
   bool collect_binders(const Pattern& p0, const LamPtr& scrut,
                        std::vector<std::pair<Ident, LamPtr>>& out) {
     preassign_pat_vars(p0);
@@ -10108,94 +10233,10 @@ struct Translator {
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
       LamPtr sv = materialize(scrut);
-      std::vector<std::string> flds;
-      for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
-      // ocamlc's record-pattern bindings come from matching.ml expanding the row
-      // to EVERY field in declaration order (all_record_args), then consuming
-      // columns left to right: an immutable field's binding is deferred onto the
-      // row and flushed in reverse accumulation order, while a MUTABLE column --
-      // even an unmentioned one -- is a StrictOpt barrier that flushes the
-      // pending immutables (reversed) before binding in place.  So an
-      // all-immutable record reads by DESCENDING declaration index, but any
-      // mutable field in the type interleaves ascending around the barriers
-      // (`{za; zd}` of `{za; zb; mutable zc; zd}` reads za then zd).  Keep the
-      // reverse-mention path for the `ref`/{contents} mutable-field case (field
-      // unresolved by resolve_record_pat_field).
-      struct RF { int index; const Pattern* sub; FieldInfo fi; std::string lbl; };
-      std::vector<RF> rfs; bool all_ok = true;
-      for (auto& [lbl, sub] : pr->fields) {
-        FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
-        tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
-        if (!fi) { all_ok = false; break; }
-        rfs.push_back({fi->index, sub.get(), *fi, lid_last(lbl.txt)});
-      }
-      if (all_ok) {
-        const RecType* rty = nullptr;
-        for (auto& rf : rfs)
-          if (!rf.fi.type.empty())
-            if (auto it = rec_types_.find(rf.fi.type); it != rec_types_.end()) {
-              rty = &it->second; break;
-            }
-        if (!rty)
-          if (auto* kv = record_for_fields(flds)) rty = &kv->second;
-        bool any_mut = false;
-        if (rty && rty->fmut.size() == rty->labels.size()) {
-          for (auto& rf : rfs)
-            if (rf.index < 0 || rf.index >= (int)rty->labels.size() ||
-                rty->labels[rf.index] != rf.lbl) { rty = nullptr; break; }
-          if (rty) for (bool m : rty->fmut) any_mut = any_mut || m;
-        } else rty = nullptr;
-        if (rty && any_mut) {
-          std::sort(rfs.begin(), rfs.end(),
-                    [](const RF& a, const RF& b) { return a.index < b.index; });
-          std::vector<RF*> pending;
-          auto flush = [&]() -> bool {
-            for (auto pit = pending.rbegin(); pit != pending.rend(); ++pit)
-              if (!collect_binders(*(*pit)->sub, field_read(&(*pit)->fi, sv), out))
-                return false;
-            pending.clear();
-            return true;
-          };
-          size_t k = 0;
-          for (int col = 0; col < (int)rty->fmut.size(); ++col) {
-            bool mentioned = k < rfs.size() && rfs[k].index == col;
-            if (rty->fmut[col]) {
-              if (!flush()) return false;
-              if (mentioned) {
-                if (!collect_binders(*rfs[k].sub, field_read(&rfs[k].fi, sv), out))
-                  return false;
-                ++k;
-              }
-            } else if (mentioned) pending.push_back(&rfs[k++]);
-          }
-          return flush();
-        }
-        std::sort(rfs.begin(), rfs.end(), [](const RF& a, const RF& b) { return a.index > b.index; });
-        for (auto& rf : rfs)
-          if (!collect_binders(*rf.sub, field_read(&rf.fi, sv), out)) return false;
-        return true;
-      }
-      for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
-        auto& [lbl, sub] = *rit;
-        FieldInfo nfi;
-        const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
-        tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
-        if (!fi) {
-          // The predefined `'a ref = { mutable contents }` cell: a `{contents=p}`
-          // pattern reads the mutable field 0 (deferred to here, the function
-          // body, so it isn't read until full saturation -- syntactic_arity).
-          if (lid_last(lbl.txt) == "contents" && pr->fields.size() == 1) {
-            auto fm = mk(Lam::K::Prim); fm->prim = Prim::FieldMut;
-            fm->prim_arg = 0; fm->args = {sv};
-            mutfield_reads_.insert(fm.get());
-            if (!collect_binders(*sub, fm, out)) return false;
-            continue;
-          }
-          return false;
-        }
-        if (!collect_binders(*sub, field_read(fi, sv), out)) return false;
-      }
+      std::vector<std::pair<const Pattern*, LamPtr>> reads;
+      if (!record_pat_reads(pr, p, sv, reads)) return false;
+      for (auto& [sub, acc] : reads)
+        if (!collect_binders(*sub, acc, out)) return false;
       return true;
     }
     if (auto* pk = std::get_if<Ppat_construct>(&p->desc)) {
@@ -10215,16 +10256,12 @@ struct Translator {
                            : nullptr;
         if (!pr) return false;
         LamPtr sv = materialize(scrut);
-        auto& L = ci->second.rlabels;
-        for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
-          auto& [lbl, sub] = *rit;
-          int ix = -1;
-          for (size_t i2 = 0; i2 < L.size(); ++i2)
-            if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
-          if (ix < 0) return false;
+        std::vector<std::pair<const Pattern*, int>> reads;
+        if (!inline_rec_pat_reads(pr, ci->second, reads)) return false;
+        for (auto& [sub, ix] : reads) {
           FieldInfo fi{ci->second.type, ix, ci->second.rfmut[ix], ci->second.rshape[ix]};
           if (!collect_binders(*sub, field_read(&fi, sv), out)) return false;
-          tag_inline_field_var(sub.get(), ci->second, ix);
+          tag_inline_field_var(sub, ci->second, ix);
         }
         return true;
       }
@@ -10748,17 +10785,15 @@ struct Translator {
         return;
       }
       if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+        // Same read order as the irrefutable path: by DESCENDING declaration
+        // index, not reverse MENTION order.  `Kind {actual; expected}` of
+        // `{expected; actual}` reads actual (field 1) before expected (field 0)
+        // either way round, because ocamlc's row carries every field of the type
+        // in declaration order and never sees how the pattern was written.
         LamPtr sv = materialize(acc);
-        std::vector<std::string> flds;
-        for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
-        for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
-          auto& [lbl, sub] = *rit;
-          FieldInfo nfi;
-          const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p, pat_record_qual_mod(*pr));
-          tag_nested_record_subpat(fi, lid_last(lbl.txt), sub.get());
-          if (!fi) { ok = false; return; }
-          destruct(*sub, field_read(fi, sv));
-        }
+        std::vector<std::pair<const Pattern*, LamPtr>> reads;
+        if (!record_pat_reads(pr, p, sv, reads)) { ok = false; return; }
+        for (auto& [sub, a] : reads) destruct(*sub, a);
         return;
       }
       ok = false;  // a nested constructor / constant / refutable sub-pattern
@@ -10776,16 +10811,14 @@ struct Translator {
         // find_field picks an arbitrary index and reads the wrong block field.
         const Pattern* ap = effective_pat(&arg);
         if (auto* pr = std::get_if<Ppat_record>(&ap->desc)) {
-          auto& L = ci.rlabels;
-          for (auto rit = pr->fields.rbegin(); rit != pr->fields.rend(); ++rit) {
-            auto& [lbl, sub] = *rit;
-            int ix = -1;
-            for (size_t i2 = 0; i2 < L.size(); ++i2)
-              if (L[i2] == lid_last(lbl.txt)) { ix = (int)i2; break; }
-            if (ix < 0) { ok = false; break; }
+          std::vector<std::pair<const Pattern*, int>> reads;
+          // On failure `reads` is empty, so the loop is a no-op and the
+          // !ok check below unwinds the scope (a bare return here would not).
+          if (!inline_rec_pat_reads(pr, ci, reads)) ok = false;
+          for (auto& [sub, ix] : reads) {
             FieldInfo fi{ci.type, ix, ci.rfmut[ix], ci.rshape[ix]};
             destruct(*sub, field_read(&fi, scrut));
-            tag_inline_field_var(sub.get(), ci, ix);
+            tag_inline_field_var(sub, ci, ix);
           }
         } else {
           destruct(arg, scrut);
