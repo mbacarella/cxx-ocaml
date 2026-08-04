@@ -21928,9 +21928,17 @@ struct Translator {
             if (inner->k == Lam::K::Sequence) saw_seq = true;
             inner = (inner->k == Lam::K::Let) ? inner->body.get() : inner->else_.get();
           }
+          // A tuple whose elements are all constants translates to a struct-const
+          // rather than a makeblock; ocamlc's assign_pat decomposes
+          // `Lconst (Const_block ..)` exactly as it does `Lprim (Pmakeblock ..)`
+          // (`let a, b = (print_string "z"; (1, 2))` -- with a COMPUTED element
+          // the leaf is a makeblock and already floats), and a ConstBlock keeps
+          // its components in `args` just as a makeblock does.
+          bool tuple_blk =
+              (inner->k == Lam::K::Prim && inner->prim == Prim::Makeblock) ||
+              inner->k == Lam::K::ConstBlock;
           bool is_tuple_leaf =
-              tup && !tup->elems.empty() && inner->k == Lam::K::Prim &&
-              inner->prim == Prim::Makeblock && inner->prim_arg == 0 &&
+              tup && !tup->elems.empty() && tuple_blk && inner->prim_arg == 0 &&
               inner->args.size() == tup->elems.size();
           if (is_tuple_leaf && saw_seq && le->bindings.size() == 1) {
             // Sequence-preserving float: keep val's let/seq spine and replace the
