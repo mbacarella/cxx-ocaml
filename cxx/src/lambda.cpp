@@ -13684,15 +13684,30 @@ struct Translator {
       }
       // Inline-record ctor (`K of { l1; l2 }`): the labels are the block's FLAT
       // fields at label (rlabels) order, so a `K { l1 = p1; .. }` pattern splits
-      // into rlabels.size() positional columns read via fieldimm -- mirroring the
-      // fallback build_block_arm.  We handle only record-destructuring rows here;
+      // into rlabels.size() positional columns -- mirroring the fallback
+      // build_block_arm.  We handle only record-destructuring rows here;
       // a whole-block bind (`K x`, arg is a var) is rarer and still bails.
       const auto& rlab = bi->second->rlabels;
       bool inl = !rlab.empty();
       int a = inl ? (int)rlab.size() : bi->second->arity;
       std::vector<LamPtr> ncomps;                        // deferred field reads
       for (int j = 0; j < a; ++j) {
-        LamPtr f = fieldimm(j, comps[0]);
+        // An inline-record field is read as a RECORD field, at the label's own
+        // value kind and mutability (matching.ml's get_expr_args_record,
+        // `Pfield (lbl_pos, ptr, lbl_mut)`), not as a constructor argument
+        // (`Pfield (pos, Pointer, Immutable)`).  For an int label that is
+        // `field_int`, not `field_imm` -- and an or-pattern mixing `C x` with
+        // `K {l = x}` then has two DIFFERENT arm bodies, which is why upstream
+        // keeps the tag switch that our all-arms-identical collapse dropped.
+        LamPtr f;
+        if (inl && j < (int)bi->second->rfmut.size() &&
+            j < (int)bi->second->rshape.size()) {
+          FieldInfo fi{bi->second->type, j, bi->second->rfmut[j],
+                       bi->second->rshape[j]};
+          f = field_read(&fi, comps[0]);
+        } else {
+          f = fieldimm(j, comps[0]);
+        }
         f->gm_facc = true;
         ncomps.push_back(f);
       }
