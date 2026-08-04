@@ -2202,6 +2202,21 @@ struct Translator {
                   type_ctor_info_[tkey][c.name.txt] = ci;
                   ambiguous_ctors_.insert(c.name.txt);
                 }
+                // Also record it under the QUALIFIED type key
+                // ("Dump_option.t") -- exactly what the typer writes into
+                // vk.pat_constr.  The bare key above cannot be filled
+                // unconditionally (see the format_doc note), so a submodule
+                // ctor whose bare name a LATER sibling type steals from the
+                // flat ctor_info_ (`Dump_option.t`'s Flambda, then
+                // `middle_end`'s) had no per-type table to fall back on and
+                // resolved at the wrong type: clflags' `classify` read
+                // `Flambda` as tag 0, which `Source` already matched, so the
+                // arm was dead and every Flambda dump option came out
+                // Backend.  The qualified key is invisible to every bare-name
+                // lookup, so it adds a candidate only where the path already
+                // names the type.
+                if (!modpath.empty())
+                  type_ctor_info_[modpath + "." + d.name.txt][c.name.txt] = ci;
                 if (do_ctor) {
                   builtin_ctors_.erase(c.name.txt);
                   ctor_info_[c.name.txt] = std::move(ci);
@@ -11098,6 +11113,13 @@ struct Translator {
       for (auto& [nm, info] : module_type_ctors(mod, ty))
         if (nm == cn) return &info;
     if (amb && amb->type == ty) return amb;                 // ambient already correct
+    // A type declared in a LOCAL submodule: the flat ctor_info_ is first-wins
+    // inside a module body, so a ctor name a later sibling type re-declares
+    // keeps the sibling's entry, and the bare per-type table is not filled for
+    // it either.  The registration records the qualified key the typer already
+    // put in pat_constr, so consult it here before the bare-name fallbacks.
+    if (auto ti = type_ctor_info_.find(pc->second); ti != type_ctor_info_.end())
+      if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
     if (auto ti = type_ctor_info_.find(ty); ti != type_ctor_info_.end())  // a local type
       if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
     if (auto md = mod.rfind('.'); md != std::string::npos) mod = mod.substr(md + 1);
@@ -13453,6 +13475,12 @@ struct Translator {
     if (tydisagree) {
       const std::string* common = nullptr;
       for (auto& [tn, cm] : type_ctor_info_) {
+        // Skip the QUALIFIED submodule keys: `type` is used below as a BARE
+        // name (type_ctors_, denv_spec_ctor, the owner walk's last-component
+        // test), and their bare twin -- when there is one -- is already in
+        // this scan.  Adopting one can only turn a working bare candidate
+        // into an ambiguity, never resolve a column.
+        if (tn.find('.') != std::string::npos) continue;
         bool all = true;
         for (auto& cn : col_cns) if (!cm.count(cn)) { all = false; break; }
         if (!all) continue;
@@ -20605,7 +20633,24 @@ struct Translator {
             // when the flat entry was already the right one.
             auto d = ety.rfind('.');
             std::string emod = ety.substr(0, d), tn = ety.substr(d + 1);
-            if (!exn_ident_.count(n) && !exn_field_.count(n) &&
+            bool local_sub = false;
+            // A LOCAL submodule's type ("Dump_option.t"): module_type_ctors
+            // can never load it (there is no such unit), and the flat entry
+            // inside a module body is first-wins, so a name a later sibling
+            // type steals built the wrong tag.  The registration records the
+            // qualified key, which is exactly what the checker put here -- so
+            // read it back.  Consumer twin: pat_ctor_resolve's identical
+            // lookup; the two must move together or a construct/match pair
+            // splits on the tag.
+            if (!exn_ident_.count(n) && !exn_field_.count(n))
+              if (auto ti = type_ctor_info_.find(ety);
+                  ti != type_ctor_info_.end())
+                if (auto c2 = ti->second.find(n); c2 != ti->second.end())
+                  if (c2->second.is_block == k->arg.has_value()) {
+                    cip = &c2->second;
+                    local_sub = true;
+                  }
+            if (!local_sub && !exn_ident_.count(n) && !exn_field_.count(n) &&
                 !module_base(emod.substr(0, emod.find('.'))))
               for (auto& [nm2, info2] : module_type_ctors(emod, tn))
                 if (nm2 == n && info2.is_block == k->arg.has_value()) {
