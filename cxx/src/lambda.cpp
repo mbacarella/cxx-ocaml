@@ -26673,6 +26673,20 @@ struct Translator {
         }
         auto rl = module_result_layout(pin->expr);
         if (rl.empty()) rl = arg_layout(pin->expr);  // a module path: its own fields
+        // `include <submodule path>` (`include Numbers.Int`): translmod binds
+        // the included module to `include/N` with the Alias let-kind whatever
+        // it is, and Simplif substitutes an Alias only at count <= 1 -- so the
+        // binding survives as soon as the splice reads more than one field,
+        // and each field is read off it rather than off a re-walked path.  A
+        // bare Var base still needs no binding (Simplif drops a Var alias at
+        // any count) and a whole-unit global took the branch above.
+        if (base == mv && mv && mv->k == Lam::K::Prim &&
+            mv->prim != Prim::Global && rl.size() > 1) {
+          Ident iid = fresh("include");
+          cur.push_back({iid, ValueKind::Gen, mv, /*alias=*/true});
+          auto v = mk(Lam::K::Var); v->var = iid; base = v;
+          bound = true;
+        }
         // modsig P3 stage 2: splice NAMESPACED items when the derived Sig
         // agrees with the flat layout (same runtime names, same order) -- the
         // cursig stays trusted, so a later `: S` ascription takes the computed
