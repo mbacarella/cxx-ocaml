@@ -12521,7 +12521,14 @@ struct Translator {
       collect_gvars(r.cols[0], orvars);
       std::vector<const Pattern*> alts;
       flatten_or(r.cols[0], alts);
-      if (trailing_ok && rest_disc && alts.size() > 1) {
+      // precompile_or allocates the or-row's exit REGARDLESS of whether the
+      // remaining columns discriminate: with all-omega remaining columns the
+      // handler is just the row's action, and when that action is a shared-arm
+      // exit the catch survives upstream's Simplif as a trampoline (the
+      // handler pm's dead column binds keep it from the alias-catch rule).
+      // Non-binding or-rows take that path here too; binding ones keep the
+      // pending gm_orp treatment below.
+      if (trailing_ok && alts.size() > 1 && (rest_disc || orvars.empty())) {
         static const Pattern gm_omega_pat =
             [] { Pattern p; p.desc = Ppat_any{}; return p; }();
         int orn = ++next_exit_;
