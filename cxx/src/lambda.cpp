@@ -13190,16 +13190,28 @@ struct Translator {
         } else {
           dbody = mkexit();  // no var/any rows: fail to the enclosing default
         }
-        auto cat = mk(Lam::K::Catch);
-        cat->cond = tree; cat->prim_arg = fid; cat->then_ = dbody;
-        cat->keep_catch = true; cat->gm_str_dflt = true;
+        // Where the default's handler catch sits relative to bind_sw's let is
+        // decided by Simplif's exit count (simplif.ml:146): a stringswitch
+        // with TWO OR MORE arms counts its default TWICE ("default will get
+        // replicated"), so the single `(exit fid)` in the fail slot is never
+        // single-use, the handler is not inlined into the node, and what
+        // survives to Bytegen is the MATCH's own catch -- outside the whole
+        // expansion, hence outside the bind.  With one arm (or none) the
+        // default is counted once and inlined, so the catch reaching the code
+        // generator is Bytegen's own make_catch, INSIDE bind_sw.
         auto bl = mk(Lam::K::Let);
         bl->bindings = {{swv, ValueKind::Gen, comps[0], false}};
-        bl->body = cat; bl->gm_str_bind = true;
+        bl->gm_str_bind = true;
+        auto cat = mk(Lam::K::Catch);
+        cat->prim_arg = fid; cat->then_ = dbody;
+        cat->keep_catch = true; cat->gm_str_dflt = true;
+        LamPtr top;
+        if (sw.size() >= 2) { bl->body = tree; cat->cond = bl; top = cat; }
+        else { cat->cond = tree; bl->body = cat; top = bl; }
         if (cppcaml::dbg_env("STRDBG"))
           fprintf(stderr, "[STRDBG] string col fid=%d havedflt=%d nstr=%zu\n",
                   fid, (int)havedflt, sw.size());
-        return bl;
+        return top;
       }
     }
     // matching.ml's split_and_precompile: a LEADING GUARDED catch-all row in column
@@ -14401,6 +14413,93 @@ struct Translator {
     if (l->k == Lam::K::Switch && l->sw_blocks.size() >= 2)
       l = share_actions_and_refail(l);
   }
+  // Walk an expanded string-test tree back to its action slots, in `sw` order:
+  // a gm_str_arm node holds sw[i] in `else_` and the rest of the tree in
+  // `then_`, a plain gm_str_node holds a lower subtree on each side (the
+  // dichotomic `r < 0` split, whose lt half precedes the pivot), and the
+  // dichotomic `switch` bind just wraps its body.  The recursion stops at the
+  // first unmarked node, so it never descends into an action.
+  static void str_arm_slots(LamPtr& n, std::vector<LamPtr*>& out) {
+    if (!n) return;
+    if (n->k == Lam::K::Let && (n->gm_str_node || n->gm_str_bind)) {
+      str_arm_slots(n->body, out); return;      // bind_sw / pivot let
+    }
+    if (!n->gm_str_node) return;
+    if (n->gm_str_arm) { out.push_back(&n->else_); str_arm_slots(n->then_, out); }
+    else { str_arm_slots(n->then_, out); str_arm_slots(n->else_, out); }
+  }
+  // Matching.share_actions_tree (matching.ml:2532), the string-constant
+  // analogue of share_actions_sw: combine_constant stores the default action
+  // as SHARED and every arm action under its Lambda.make_key, so arms with
+  // alpha-equal bodies all dispatch through ONE fresh exit whose handler catch
+  // wraps outside the switch (later-stored outermost).  Upstream does this on
+  // the Lstringswitch node, before Bytegen's expand_stringswitch; gmatch's
+  // string column expands the tree at assembly time and its leaves are still
+  // `(exit aid)` arm placeholders until wire_garms, so we walk the marked
+  // skeleton back to the action slots here instead -- the same post-wire
+  // reason share_switches_rec exists.  The default is a bare `(exit fid)` at
+  // this point, so its forced-shared slot reuses that id (make_catch_delayed's
+  // `Some i`, no handler) and only seeds the key map: an arm equal to the
+  // default resolves to the very same exit.
+  //
+  // The handlers go around the Lstringswitch node -- i.e. around the tree AND
+  // bind_sw's let, since Bytegen only later replaces that node with
+  // `bind_sw arg (fun arg -> make_catch d (fun d -> <tree>))`.  For the
+  // two-or-more-arm shape the column already nests its bind under the default
+  // catch, so wrapping the catch's scrutinee puts the shared handlers exactly
+  // there: outside the bind (an arm's exit to one pops the bound slot) and
+  // inside the default's catch (whose handler is emitted last, as upstream's
+  // `hs` composition leaves it).
+  void share_string_trees(LamPtr& l) {
+    if (!l) return;
+    share_string_trees(l->fn); share_string_trees(l->cond); share_string_trees(l->then_);
+    share_string_trees(l->else_); share_string_trees(l->body); share_string_trees(l->sw_default);
+    for (auto& a : l->args) share_string_trees(a);
+    for (auto& b : l->bindings) share_string_trees(b.val);
+    for (auto& sc : l->sw_consts) share_string_trees(sc.body);
+    for (auto& sc : l->sw_blocks) share_string_trees(sc.body);
+    if (l->k != Lam::K::Catch || !l->gm_str_dflt) return;
+    std::vector<LamPtr*> slots;
+    str_arm_slots(l->cond, slots);
+    if (slots.empty()) return;
+    struct Slot { bool shared; LamPtr act; };
+    std::vector<Slot> acts;
+    std::map<std::string, int> keyed;
+    auto store = [&](const LamPtr& a, bool must) -> int {
+      std::string k = oc_make_key(a);
+      if (!k.empty()) {
+        auto it = keyed.find(k);
+        if (it != keyed.end()) { acts[it->second].shared = true; return it->second; }
+      }
+      acts.push_back({must, a});
+      if (!k.empty()) keyed.emplace(std::move(k), (int)acts.size() - 1);
+      return (int)acts.size() - 1;
+    };
+    auto dflt = mk(Lam::K::Staticraise); dflt->prim_arg = l->prim_arg;
+    store(dflt, true);
+    std::vector<int> idx;
+    for (auto* s : slots) idx.push_back(store(*s, false));
+    std::vector<LamPtr> resolved(acts.size());
+    std::vector<std::pair<int, LamPtr>> catches;  // (exit id, handler), slot order
+    for (size_t j = 0; j < acts.size(); ++j) {
+      if (!acts[j].shared) { resolved[j] = acts[j].act; continue; }
+      int se = as_bare_exit_thru_alias(acts[j].act);
+      auto x = mk(Lam::K::Staticraise);
+      if (se >= 0) x->prim_arg = se;   // make_catch_delayed's `Some i`: reuse, no handler
+      else { x->prim_arg = ++next_exit_; catches.emplace_back(x->prim_arg, acts[j].act); }
+      resolved[j] = x;
+    }
+    if (catches.empty()) return;
+    for (size_t j = 0; j < slots.size(); ++j) *slots[j] = resolved[idx[j]];
+    LamPtr result = l->cond;
+    for (auto& [xid, h] : catches) {
+      auto c = mk(Lam::K::Catch);
+      c->cond = result; c->then_ = h; c->prim_arg = xid;
+      c->gm_str_share = true;
+      result = c;
+    }
+    l->cond = result;
+  }
   // Second half of expand_stringswitch's make_catch: gmatch's string column
   // always wraps its tree default in a fresh gm_str_dflt catch because the
   // real default is still an `(exit aid)` arm placeholder at assembly.  When
@@ -14526,6 +14625,7 @@ struct Translator {
       fprintf(stderr, "[STRDBG] post-wire:\n"); print_dlambda(body, std::cerr);
     }
     share_switches_rec(body);
+    share_string_trees(body);
     LamPtr dbody;
     if (catchall) {
       scope.emplace_back(); bind_catchall(*catchall->lhs, sv);
@@ -16502,6 +16602,7 @@ struct Translator {
     }
     wire_garms(body, arms);
     share_switches_rec(body);
+    share_string_trees(body);
     LamPtr dbody;
     if (catchall) {
       // Bind any named columns of a `x, y -> ..` tuple catch-all to their components.
@@ -19039,6 +19140,7 @@ struct Translator {
       ne->prim_id = "caml_string_notequal"; ne->args = {arg, sv};
       auto iff = mk(Lam::K::IfThenElse);
       iff->cond = ne; iff->then_ = k; iff->else_ = it->second;
+      iff->gm_str_node = iff->gm_str_arm = true;   // else_ is sw[i]'s action
       k = iff;
     }
     return k;
@@ -19067,11 +19169,14 @@ struct Translator {
     gtc->args = {cint(0), r};                       // 0 < r
     auto inner = mk(Lam::K::IfThenElse); inner->cond = gtc;
     inner->then_ = string_test_tree(arg, gt, delta, d); inner->else_ = piv.second;
+    inner->gm_str_node = inner->gm_str_arm = true;   // else_ = pivot action
     auto outer = mk(Lam::K::IfThenElse); outer->cond = ltc;
     outer->then_ = string_test_tree(arg, lt, delta, d); outer->else_ = inner;
+    outer->gm_str_node = true;
     auto let = mk(Lam::K::Let);
     let->bindings = {{rid, ValueKind::Gen, cmp, false}};  // Strict `switch`
     let->body = outer;
+    let->gm_str_node = true;
     return let;
   }
   LamPtr string_switch(const LamPtr& scrut, const std::vector<Row>& rows,

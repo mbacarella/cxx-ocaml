@@ -198,6 +198,20 @@ struct Lam {
   // resolves it after all substitutions: value still a Var -> strip the let
   // (bind_sw's Lvar no-op); value a field read -> a real Strict `switch` let.
   bool gm_str_bind = false;
+  // gm_str_node / gm_str_arm: skeleton of an expanded string-test tree
+  // (Matching.do_make_string_test_tree).  gm_str_node marks every node the
+  // expansion itself built; gm_str_arm additionally marks the nodes whose
+  // `else_` is one of the switch's ACTIONS, in `sw` order.  The pair lets
+  // share_string_trees walk an already-expanded tree back to its action slots
+  // and apply Matching.share_actions_tree there -- upstream shares those
+  // actions before Bytegen expands the node, but our leaves are still
+  // `(exit aid)` arm placeholders at expansion time.
+  bool gm_str_node = false;
+  bool gm_str_arm = false;
+  // gm_str_share: one of share_actions_tree's shared-action handler catches.
+  // Like the gm_str_dflt catch it is built by a pass that upstream runs
+  // OUTSIDE Bytegen's expansion, so a materialized bind_sw let sinks under it.
+  bool gm_str_share = false;
   // gm_chunk: a half-match chunk catch (comp_match_handlers).  Upstream inlines
   // a single-use chunk exit only in Simplif -- AFTER Matching's bind_check/
   // lower_bind ran against the catch node (so column binds do NOT sink past the
