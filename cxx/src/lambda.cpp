@@ -20511,6 +20511,19 @@ struct Translator {
       }
     }
     if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
+      // `x.label <- v` on a whole-inline-record-bound var (`Ctor x` then
+      // `x.label <- ..`): resolve via the ctor's rlabels first, exactly as the
+      // read path above does.  An AMBIGUOUS inline-record label reaches none of
+      // the resolvers below -- find_field bails on it -- and the whole
+      // assignment then fell out of this branch to the unhandled-expression
+      // `0`, so the mutation silently vanished (`match x with A r -> r.n <- 1 |
+      // B r -> r.n <- 2` compiled to a bare `0`).
+      if (auto irf = inline_rec_field(sf->obj.get(), lid_last(sf->field.txt))) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = irf->kind == ValueKind::Int ? Prim::SetfieldImm : Prim::SetfieldPtr;
+        l->prim_arg = irf->index; l->args = {expr(*sf->obj), expr(*sf->value)};
+        return l;
+      }
       // A qualified field `e.M.label <- v` (M local or stdlib) / deep one:
       // resolve via the authoritative qualifier BEFORE the bare find_field.
       if (auto rf = qualified_field(sf->field.txt)) {
