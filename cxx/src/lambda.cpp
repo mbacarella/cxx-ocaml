@@ -21986,10 +21986,12 @@ struct Translator {
               inner->args.size() == tup->elems.size();
           if (is_tuple_leaf && saw_seq && le->bindings.size() == 1) {
             // Sequence-preserving float: keep val's let/seq spine and replace the
-            // tail tuple with an inner let binding each component directly (Strict
-            // element -> inner let binding; var/immutable-field element -> alias via
-            // wrap_binders).  Order is preserved because the components stay at the
-            // tuple's original position, after the spine's lets and side effects.
+            // tail tuple with an inner let binding each component directly (the
+            // same rule as the no-sequence path below -- everything ocamlc does
+            // not still see as an Lvar gets its binding; the rest goes through
+            // wrap_binders).  Order is preserved because the components stay
+            // at the tuple's original position, after the spine's lets and
+            // side effects.
             LamPtr* slot = &val;
             while ((*slot)->k == Lam::K::Let ||
                    ((*slot)->k == Lam::K::Sequence && (*slot)->else_))
@@ -22000,10 +22002,11 @@ struct Translator {
               const Pattern* ep = effective_pat(tup->elems[i].get());
               LamPtr av = mkb->args[i];
               auto* pv = std::get_if<Ppat_var>(&ep->desc);
-              if (pv && av->k != Lam::K::Var && !is_field_access(av)) {
-                Ident id = fresh(pv->name.txt);
+              bool anyp = std::holds_alternative<Ppat_any>(ep->desc);
+              if ((pv || anyp) && av->k != Lam::K::Var && !av->from_alias) {
+                Ident id = pv ? fresh(pv->name.txt) : fresh("", true);
                 inner_let->bindings.push_back({id, pat_kind(ep), av});
-                scope.back()[pv->name.txt] = id;
+                if (pv) scope.back()[pv->name.txt] = id;
               } else {
                 collect_binders(*ep, av, binders);
               }
@@ -22019,19 +22022,29 @@ struct Translator {
               val = val->body;
             }
             // Bind right-to-left, matching ocamlc's reverse tuple-element order.
-            // A component whose value is a plain variable or an immutable field
-            // read is an alias (routed through the binder list so simplif inlines
-            // a single use / keeps a shared one as `=a`); anything else (an
-            // application, another block, ...) stays a kept Strict binding, as
-            // for the direct `let (a,b) = (e0, e1)` tuple-literal path above.
+            // Which components stay bound is tail_tuple_exit's `is_bindable`
+            // rule -- assign_pat hands every one to simple_for_let, and the
+            // exit's single use splices the handler back in as one
+            // `Llet (Strict, ..)` per component (simplif.ml:300), so only a
+            // component ocamlc still sees as an Lvar drops out.  That is a
+            // plain variable, or a from_alias node standing where the
+            // pre-Simplif lambda had a pattern binder's Lvar; a field read
+            // written in the source is untagged and keeps its `let`, even at
+            // one use (switch's `let lim, with_sep = .. !best, !best_cost`,
+            // which reads both refs ahead of the body).  A `_` column is bound
+            // too, to a dead anonymous temp: assign_pat sublets it through
+            // simple_for_let just the same, and compile_matching binds a
+            // non-variable scrutinee to `*match*` before dropping the
+            // wildcard row.
             for (int i = (int)tup->elems.size() - 1; i >= 0; --i) {
               const Pattern* ep = effective_pat(tup->elems[i].get());
               LamPtr av = val->args[i];
               auto* pv = std::get_if<Ppat_var>(&ep->desc);
-              if (pv && av->k != Lam::K::Var && !is_field_access(av)) {
-                Ident id = fresh(pv->name.txt);
+              bool anyp = std::holds_alternative<Ppat_any>(ep->desc);
+              if ((pv || anyp) && av->k != Lam::K::Var && !av->from_alias) {
+                Ident id = pv ? fresh(pv->name.txt) : fresh("", true);
                 l->bindings.push_back({id, pat_kind(ep), av});
-                scope.back()[pv->name.txt] = id;
+                if (pv) scope.back()[pv->name.txt] = id;
               } else {
                 collect_binders(*ep, av, binders);
               }
