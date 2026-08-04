@@ -12497,30 +12497,56 @@ struct Translator {
     // duplicate the suffix tests per alternative (typedecl_immediacy's
     // `Cstr_tuple [arg] | Cstr_record [{ld_type=arg}]` re-testing the columns in
     // both arms; depend re-testing the `PStr [item]` continuation in both).
-    //   Fires when row 0 is the or-row and every trailing row has a pure
-    // WILDCARD column 0: those rows match column 0 unconditionally, so they
-    // belong to both the body's column-0 dispatch (as its default arm, intact)
-    // and the handler's fall-through (column 0 popped) WITHOUT any column-0
-    // re-test -- keeping precompile_or's Or_matrix disjointness bookkeeping
-    // (pop_compat, which keeps exactly the or-compatible rows) trivial.  A
-    // trailing row that itself discriminates column 0 would need that
-    // re-dispatch and is left to the duplicating expansion below.  Trailing rows
-    // must carry a shared action id so the handler's fall-through only re-raises
-    // it (no re-compiled action body).
-    if (comps.size() >= 2 && rows[0].aid >= 0 && rows[0].vnames &&
-        !rows[0].guard && std::get_if<Ppat_or>(&rows[0].cols[0]->desc)) {
-      bool trailing_ok = true;
-      for (size_t i = 1; i < rows.size(); ++i)
+    //   Fires when every trailing row has a pure WILDCARD column 0: those rows
+    // match column 0 unconditionally, so they belong to both the body's
+    // column-0 dispatch (as its default arm, intact) and the handler's
+    // fall-through (column 0 popped) WITHOUT any column-0 re-test -- keeping
+    // precompile_or's Or_matrix disjointness bookkeeping (pop_compat, which
+    // keeps exactly the or-compatible rows) trivial.  A trailing row that
+    // itself discriminates column 0 would need that re-dispatch and is left to
+    // the duplicating expansion below.  Trailing rows must carry a shared
+    // action id so the handler's fall-through only re-raises it (no
+    // re-compiled action body).
+    //   The or-row need not be row 0: split_or hands precompile_or the SIMPLE
+    // rows that precede it (`precompile_or cls ors`, body = cls @ exploded
+    // alternatives), so they stay in the body ahead of the alternatives and
+    // out of the handler (pop_compat drops them).  What that needs is
+    // safe_before -- each leading row swappable past the or-row -- and a
+    // column-0 constructor DISJOINT from every alternative already makes the
+    // whole rows incompatible: exactly safe_before's `not (may_compats ..)`.
+    // errortrace's map_elt is the shape: `Escape {kind = Equation x; context}`
+    // sits ahead of `Escape {kind = (Univ _ | Self | Constructor _ | ..); _}`.
+    size_t oi = 0;
+    while (oi < rows.size() && !std::get_if<Ppat_or>(&rows[oi].cols[0]->desc))
+      ++oi;
+    if (oi < rows.size() && comps.size() >= 2 && rows[oi].aid >= 0 &&
+        rows[oi].vnames && !rows[oi].guard) {
+      MRow& r = rows[oi];
+      std::vector<const Pattern*> alts;
+      flatten_or(r.cols[0], alts);
+      bool lead_ok = true;
+      if (oi > 0) {
+        std::set<std::string> altnames;
+        for (auto* a : alts) {
+          auto* k = std::get_if<Ppat_construct>(&effective_pat(a)->desc);
+          if (!k) { lead_ok = false; break; }
+          altnames.insert(lid_last(k->id.txt));
+        }
+        for (size_t i = 0; lead_ok && i < oi; ++i) {
+          auto* k = std::get_if<Ppat_construct>(&rows[i].cols[0]->desc);
+          if (!k || altnames.count(lid_last(k->id.txt)) || rows[i].guard)
+            { lead_ok = false; break; }
+        }
+      }
+      bool trailing_ok = lead_ok;
+      for (size_t i = oi + 1; trailing_ok && i < rows.size(); ++i)
         if (!std::holds_alternative<Ppat_any>(rows[i].cols[0]->desc) ||
-            rows[i].aid < 0) { trailing_ok = false; break; }
-      MRow& r = rows[0];
+            rows[i].aid < 0) trailing_ok = false;
       bool rest_disc = false;
       for (size_t j = 1; j < r.cols.size(); ++j)
         if (!gmdef_omega(gmdef_peel(r.cols[j]))) { rest_disc = true; break; }
       std::vector<std::string> orvars;
       collect_gvars(r.cols[0], orvars);
-      std::vector<const Pattern*> alts;
-      flatten_or(r.cols[0], alts);
       // precompile_or allocates the or-row's exit REGARDLESS of whether the
       // remaining columns discriminate: with all-omega remaining columns the
       // handler is just the row's action, and when that action is a shared-arm
@@ -12540,17 +12566,18 @@ struct Translator {
         // Pexp_record (_, (Some .. | None))}]`: the outer or's Pexp_record arm
         // decomposes to the inner `Some .. | None` or, whose rows raise orn.)
         gm_orw_.insert(orn);
-        // Body: dispatch column 0 over the exploded alternatives (each raising
-        // orn with omega remaining columns) plus the trailing wildcard-col0 rows
-        // intact (they form the column-0 dispatch default).
+        // Body: the leading simple rows, then the exploded alternatives (each
+        // raising orn with omega remaining columns), then the trailing
+        // wildcard-col0 rows intact (they form the column-0 dispatch default).
         std::vector<MRow> ex;
+        for (size_t i = 0; i < oi; ++i) ex.push_back(rows[i]);
         for (auto* a : alts) {
           MRow nr = r; nr.cols[0] = effective_pat(a);
           for (size_t j = 1; j < nr.cols.size(); ++j) nr.cols[j] = &gm_omega_pat;
           nr.aid = orn; nr.vnames = &orvars;
           ex.push_back(std::move(nr));
         }
-        for (size_t i = 1; i < rows.size(); ++i) ex.push_back(rows[i]);
+        for (size_t i = oi + 1; i < rows.size(); ++i) ex.push_back(rows[i]);
         LamPtr sub = gmatch(comps, std::move(ex), mloc, deid, denv);
         if (!sub) return nullptr;
         // Handler (exit orn): the or-row's remaining columns compiled once, with
@@ -12567,7 +12594,7 @@ struct Translator {
         }
         std::vector<MRow> hrows;
         hrows.push_back(std::move(hr));
-        for (size_t i = 1; i < rows.size(); ++i) {
+        for (size_t i = oi + 1; i < rows.size(); ++i) {
           MRow tr = rows[i]; tr.cols.erase(tr.cols.begin());
           hrows.push_back(std::move(tr));
         }
