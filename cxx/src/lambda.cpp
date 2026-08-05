@@ -18770,9 +18770,36 @@ struct Translator {
       if (p->else_) { out += ","; src_ident_sig(**p->else_, out); } out += ")";
     } else if (auto* p = std::get_if<Pexp_constraint>(&d)) {
       src_ident_sig(*p->e, out);
+    } else if (const Pmod_ident* mi = open_of_struct_item(d)) {
+      // `M.(e)` / `let open M in e` contributes nothing to the value, so key the
+      // module path and descend.  Without this the fallback below stamps a
+      // POINTER, and two identical arms (diffing.ml's `Misc.Style.[FG Red;
+      // Bold]` on both `Deletion` and `Insertion`) can never compare equal --
+      // so const_switch never sees the shared action it defers on and emits a
+      // flat 4-case Lswitch where ocamlc's call_switcher merges tags 0|1 and
+      // builds a test tree.  ocamlc's StoreExp keys on the COMPILED lambda
+      // alone; the path stays in the key only because this signature is our
+      // guard against alias inlining collapsing two source terms ocamlc keeps
+      // apart, and two different opens can resolve one name to different
+      // values.  Other struct items (`let module`, `let exception`) bind names
+      // and keep the conservative fallback.
+      std::string dotted;
+      if (!lid_to_dotted(mi->id.txt, dotted)) dotted = lid_last(mi->id.txt);
+      out += "O" + dotted + "(";
+      src_ident_sig(*std::get<Pexp_struct_item>(d).body, out);
+      out += ")";
     } else {
       out += "?"; out += std::to_string(reinterpret_cast<uintptr_t>(&e));
     }
+  }
+  // The opened module path of a `M.(e)` / `let open M in e` expression, or null
+  // for any other structure-item scope (or an open of a non-path module expr).
+  static const Pmod_ident* open_of_struct_item(const decltype(Expression::desc)& d) {
+    auto* si = std::get_if<Pexp_struct_item>(&d);
+    if (!si) return nullptr;
+    auto* op = std::get_if<Pstr_open>(&si->item->desc);
+    if (!op) return nullptr;
+    return std::get_if<Pmod_ident>(&op->expr.desc);
   }
   // The dedup key ocamlc's StoreExp would assign a match action: its lambda shape
   // plus the source-identifier fingerprint that survives our earlier alias inlining.
@@ -18835,9 +18862,11 @@ struct Translator {
     actions.resize(kvs.size() + 1);
     std::vector<int> act_of(kvs.size());
     std::vector<const Expression*> by_src;
+    std::vector<bool> or_row;                // covers >=2 tags: an OR row
     for (auto& r : rows) if (!r.guard) {
       std::string ty2; std::vector<int> vs2;
-      if (ctor_switch_vals(effective_pat(r.lhs), ty2, vs2)) by_src.push_back(r.rhs); }
+      if (ctor_switch_vals(effective_pat(r.lhs), ty2, vs2)) {
+        by_src.push_back(r.rhs); or_row.push_back(vs2.size() > 1); } }
     for (size_t i = 0; i < kvs.size(); ++i) {
       int pos = 0; for (size_t s = 0; s < by_src.size(); ++s) if (by_src[s] == kvs[i].rhs) { pos = (int)s; break; }
       act_of[i] = pos + 1;
@@ -18846,7 +18875,14 @@ struct Translator {
     std::vector<int> canon(by_src.size());   // identical bodies -> earliest action index
     for (size_t s = 0; s < by_src.size(); ++s) {
       LamPtr b = expr(*by_src[s]);
-      std::string key = action_dedup_key(b, *by_src[s]);
+      // split_or peels an or-row into its own PmOr, so by the time upstream's
+      // StoreExp runs, that row's action is already a bare `(exit i)` and can
+      // never be keyed equal to another row's body.  Leave an or-row's key
+      // EMPTY so it neither joins nor anchors a canon class -- and so the
+      // default-shared bail below ignores it too, for the same reason.
+      // (`| A|C -> f 0 | B|E -> f 0 | D -> .. | _ -> ..` keeps two handlers
+      // upstream; merging them collapsed the whole switch to one if-tree.)
+      std::string key = or_row[s] ? std::string() : action_dedup_key(b, *by_src[s]);
       int c = (int)s;
       if (!key.empty())
         for (size_t t = 0; t < s; ++t) if (body_keys[t] == key) { c = (int)t; break; }
