@@ -18581,6 +18581,7 @@ struct Translator {
     bool is_int = false, is_char = false, has_interval = false, has_tail = false;
     // bodies must be translated in source order for stable stamp normalization
     std::vector<const Expression*> by_src;
+    std::vector<bool> or_row;  // >1 ranges: an OR row (peeled upstream, see below)
     // `('=' | ':') as c` rows: c binds to the scrutinee over that row's body
     // (matching.ml expands the alias before the constant switch).
     std::unordered_map<const Expression*, std::vector<std::string>> row_aliases;
@@ -18602,6 +18603,7 @@ struct Translator {
           if (v.second > v.first) has_interval = true;
         }
         by_src.push_back(r.rhs);
+        or_row.push_back(vals.size() > 1);
         if (!aliases.empty()) row_aliases[r.rhs] = std::move(aliases);
       } else if (aliases.empty() && is_catchall(*p) && !has_tail &&
                  (dflt.empty() || dflt.back()->guard)) {
@@ -18657,7 +18659,11 @@ struct Translator {
       }
       LamPtr b = expr(*by_src[s]);
       if (framed) scope.pop_back();
-      std::string key = make_lam_key(b);
+      // precompile_or peels an OR row before upstream's StoreExp runs, so its
+      // action is already a bare `(exit i)` there and can never key equal to
+      // another row's body: an empty key keeps it out of the dedup and out of
+      // the default-shared bail below, exactly as const_ctor_switcher does.
+      std::string key = or_row[s] ? std::string() : make_lam_key(b);
       int at = (int)s;
       if (!key.empty())
         for (size_t t = 0; t < body_keys.size(); ++t)
@@ -18736,10 +18742,12 @@ struct Translator {
     // Multi-occurrence actions are Shared upstream (StoreExp key-hit):
     // abstract_shared pre-abstracts each to a bare exit; after the tree is
     // built, a single surviving leaf inlines (Simplif) and multiple leaves keep
-    // the catch, wrapped outside the default's (fail is store index 0, so its
-    // catch is innermost).  Installed after make_clusters: the ActFns read
-    // `actions` lazily, so the sentinels reach every leaf and table slot.
-    struct ShWrap { int eid; LamPtr body; };
+    // the catch, wrapping only zyva's own result -- the fail reaches zyva as a
+    // bare Lstaticraise (make_catch_delayed returns it unwrapped), and its real
+    // catch is the enclosing comp_match_handlers', OUTSIDE the shared ones.
+    // Installed after make_clusters: the ActFns read `actions` lazily, so the
+    // sentinels reach every leaf and table slot.
+    struct ShWrap { int eid; LamPtr body; bool is_or; };
     std::vector<ShWrap> shs;
     for (size_t s = 1; s < actions.size(); ++s)
       // The closing row's action is Shared upstream too, but its handler body is
@@ -18747,26 +18755,37 @@ struct Translator {
       // -- so its leaves just stay default leaves here.
       if (occ[s] >= 2 && actions[s] && (int)s != tail_act) {
         int e = ++next_exit_;
-        shs.push_back({e, actions[s]});
+        shs.push_back({e, actions[s], or_row[s - 1]});
         auto ex = mk(Lam::K::Staticraise); ex->prim_arg = e;
         actions[s] = ex;
       }
 
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     int nd = count_default_leaves(tree);
+    int dflt_eid = 0;
     if (nd == 1) rewrite_default_leaves(tree, 0, default_body);
     else if (nd > 1) {
-      int eid = ++next_exit_;
-      rewrite_default_leaves(tree, eid, nullptr);
-      auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid; cat->then_ = default_body;
-      tree = cat;
+      dflt_eid = ++next_exit_;
+      rewrite_default_leaves(tree, dflt_eid, nullptr);
     }
-    for (auto& sh : shs) {
-      int uses = count_exit_leaves(tree, sh.eid);
-      if (uses <= 1) inline_exit_leaves(tree, sh.eid, sh.body);
-      else {
-        auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = sh.eid; cat->then_ = sh.body;
+    // Nesting, inside out: StoreExp-shared catches wrap only zyva's own result
+    // (abstract_shared); the default pm's catch is the enclosing
+    // comp_match_handlers', outside them; an OR row's handler was peeled by
+    // precompile_or before either ran, so it wraps outside the default's.
+    for (int pass = 0; pass < 2; ++pass) {
+      bool want_or = pass == 1;
+      if (want_or && dflt_eid) {
+        auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = dflt_eid; cat->then_ = default_body;
         tree = cat;
+      }
+      for (auto& sh : shs) {
+        if (sh.is_or != want_or) continue;
+        int uses = count_exit_leaves(tree, sh.eid);
+        if (uses <= 1) inline_exit_leaves(tree, sh.eid, sh.body);
+        else {
+          auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = sh.eid; cat->then_ = sh.body;
+          tree = cat;
+        }
       }
     }
     return tree;
@@ -18993,12 +19012,12 @@ struct Translator {
     // sentinel exit per multi-occurrence action, counted after the tree is built.
     std::vector<int> occ(actions.size(), 0);
     for (int a : act_of) occ[a]++;
-    struct ShWrap { int eid; LamPtr body; };
+    struct ShWrap { int eid; LamPtr body; bool is_or; };
     std::vector<ShWrap> shs;  // action-index order: later wrap = outer (abstract_shared)
     for (size_t s = 1; s < actions.size(); ++s)
       if (occ[s] >= 2 && actions[s]) {
         int e = ++next_exit_;
-        shs.push_back({e, actions[s]});
+        shs.push_back({e, actions[s], or_row[s - 1]});
         auto ex = mk(Lam::K::Staticraise); ex->prim_arg = e;
         actions[s] = ex;
       }
@@ -19032,19 +19051,30 @@ struct Translator {
 
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     int nd = count_default_leaves(tree);
+    int dflt_eid = 0;
     if (nd == 1) rewrite_default_leaves(tree, 0, default_body);
     else if (nd > 1) {
-      int eid = ++next_exit_;
-      rewrite_default_leaves(tree, eid, nullptr);
-      auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = eid; cat->then_ = default_body;
-      tree = cat;
+      dflt_eid = ++next_exit_;
+      rewrite_default_leaves(tree, dflt_eid, nullptr);
     }
-    for (auto& sh : shs) {
-      int uses = count_exit_leaves(tree, sh.eid);
-      if (uses <= 1) inline_exit_leaves(tree, sh.eid, sh.body);
-      else {
-        auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = sh.eid; cat->then_ = sh.body;
+    // Nesting, inside out: StoreExp-shared catches wrap only zyva's own result
+    // (abstract_shared); the default pm's catch is the enclosing
+    // comp_match_handlers', outside them; an OR row's handler was peeled by
+    // precompile_or before either ran, so it wraps outside the default's.
+    for (int pass = 0; pass < 2; ++pass) {
+      bool want_or = pass == 1;
+      if (want_or && dflt_eid) {
+        auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = dflt_eid; cat->then_ = default_body;
         tree = cat;
+      }
+      for (auto& sh : shs) {
+        if (sh.is_or != want_or) continue;
+        int uses = count_exit_leaves(tree, sh.eid);
+        if (uses <= 1) inline_exit_leaves(tree, sh.eid, sh.body);
+        else {
+          auto cat = mk(Lam::K::Catch); cat->cond = tree; cat->prim_arg = sh.eid; cat->then_ = sh.body;
+          tree = cat;
+        }
       }
     }
     return tree;
