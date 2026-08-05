@@ -190,6 +190,9 @@ struct Coercion {
     std::string prim;          // PrimStub: primitive descriptor
     int prim_arity = 0;        // PrimStub: eta-stub arity
     CoercionPtr sub;           // recursive coercion for a submodule (else null)
+    bool functor_eta = false;  // Tcoerce_functor: `sub` coerces the applied
+                               // RESULT; replay eta-expands instead of
+                               // projecting fields off the (closure) value
   };
   std::vector<Field> fields;
   bool identity = false;  // src == tgt field-for-field AND same runtime length
@@ -218,6 +221,24 @@ inline const Item* coercion_find_src(const Sig& src, const Item& t,
   return best;
 }
 
+inline bool trusted(const Sig& s, int depth);
+
+// A Sig is layout-complete when neither it nor any nested module/functor Sig
+// is marked incomplete.  An incomplete Sig may be MISSING members entirely
+// (an unresolved modtype degrades to an empty flat, which is also vacuously
+// trusted), so a coercion computed against it could silently drop fields.
+inline bool layout_complete(const Sig& s, int depth = 0) {
+  if (s.incomplete || depth > 24) return false;
+  for (auto& it : s.items) {
+    if (it.sub && !layout_complete(*it.sub, depth + 1)) return false;
+    if (it.functor_param && !layout_complete(*it.functor_param, depth + 1))
+      return false;
+    if (it.functor_result && !layout_complete(*it.functor_result, depth + 1))
+      return false;
+  }
+  return true;
+}
+
 // Compute the coercion that builds `tgt`'s runtime block from `src`'s, matching
 // includemod.signatures.  Non-runtime target items (types, modtypes, class
 // types, primitives, absent aliases) take no field and are skipped WITHOUT a
@@ -241,6 +262,37 @@ inline Coercion compute_coercion(const Sig& src, const Sig& tgt, int depth = 0) 
         if (!sub.ok) { c.ok = false; c.error = t.name + "." + sub.error; return c; }
         c.unknown_pairings += sub.unknown_pairings;
         if (!sub.identity) f.sub = std::make_shared<Coercion>(std::move(sub));
+      } else if (s->ns == NS::Module && t.ns == NS::Module &&
+                 s->functor_result && t.functor_result &&
+                 layout_complete(*s->functor_result) &&
+                 layout_complete(*t.functor_result)) {
+        // Tcoerce_functor (translmod.apply_coercion): the eta wrapper passes
+        // the parameter through unchanged and coerces the applied RESULT.
+        // Passing a restricted functor through raw would let a cmi-driven
+        // consumer read the raw result at the restricted layout's offsets.
+        // Layout-incomplete result Sigs (an unresolved local modtype) fall
+        // through to the raw pass-through instead of a wrong projection.
+        if (s->functor_param && t.functor_param) {
+          Coercion pc = compute_coercion(*t.functor_param, *s->functor_param,
+                                         depth + 1);
+          if (!pc.ok || !pc.identity) {
+            c.ok = false; c.error = t.name + "(param)"; return c;
+          }
+        }
+        Coercion rc = compute_coercion(*s->functor_result, *t.functor_result,
+                                       depth + 1);
+        if (!rc.ok) {
+          c.ok = false; c.error = t.name + "()." + rc.error; return c;
+        }
+        c.unknown_pairings += rc.unknown_pairings;
+        if (!rc.identity) {
+          if (!trusted(*s->functor_result, depth + 1) ||
+              !trusted(*t.functor_result, depth + 1)) {
+            c.ok = false; c.error = t.name + "(untrusted)"; return c;
+          }
+          f.functor_eta = true;
+          f.sub = std::make_shared<Coercion>(std::move(rc));
+        }
       }
     } else if (s->is_prim) {  // external (no slot) exposed as a val: eta-stub it
       f.from = Coercion::Field::From::PrimStub;

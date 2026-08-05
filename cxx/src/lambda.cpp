@@ -24315,8 +24315,21 @@ struct Translator {
         case OE::Module: {
           auto& md = sig.modules[oe.idx];
           item.ns = modsig::NS::Module; item.name = md.name;
-          if (const cmi::Signature* msig = resolve_cmi_module_sig(md.type, scope))
+          if (md.type && md.type->kind == cmi::ModuleType::Functor) {
+            // a FUNCTOR member: carry its param/result Sigs (resolved through
+            // the enclosing modtype scope -- `module Simple: .. -> S` names an
+            // S declared in this very sig) so compute_coercion can build the
+            // Tcoerce_functor field instead of passing the closure through raw
+            if (const cmi::Signature* ps =
+                    resolve_cmi_module_sig(md.type->functor_param_type, scope))
+              item.functor_param = msig_of_cmi_signature(*ps, depth + 1, scope);
+            if (const cmi::Signature* rs =
+                    resolve_cmi_module_sig(md.type->functor_body, scope))
+              item.functor_result = msig_of_cmi_signature(*rs, depth + 1, scope);
+          } else if (const cmi::Signature* msig =
+                         resolve_cmi_module_sig(md.type, scope)) {
             item.sub = msig_of_cmi_signature(*msig, depth + 1, scope);
+          }
           break;
         }
         case OE::Modtype:
@@ -24691,6 +24704,31 @@ struct Translator {
     lt->body = blk;
     return lt;
   }
+  // Tcoerce_functor replay (translmod.ml apply_coercion): eta-expand the raw
+  // functor value -- `(function funarg is_a_functor <result coercion replayed
+  // on (apply f funarg)>)`, name-binding f as an ALIAS when it is not already
+  // a variable.  ocamlc creates the param ident before that binder; the
+  // stamp-sensitive effid diff observes the order.
+  LamPtr functor_eta_wrap(const LamPtr& fval, const modsig::Coercion& res) {
+    Ident pa = fresh("funarg");
+    bool direct = fval->k == Lam::K::Var;
+    Ident fid;
+    if (!direct) fid = fresh("let");
+    auto ap = mk(Lam::K::Apply);
+    ap->fn = direct ? fval : varof(fid);
+    ap->args = {varof(pa)};
+    LamPtr body = apply_msig_coercion(ap, res);
+    if (!body) return nullptr;
+    auto wf = mk(Lam::K::Function);
+    wf->inline_attr = "is_a_functor stub";
+    wf->params.push_back({pa, ValueKind::Gen});
+    wf->body = body;
+    if (direct) return wf;
+    auto lt = mk(Lam::K::Let);
+    lt->bindings.push_back({fid, ValueKind::Gen, fval, /*alias=*/true});
+    lt->body = wf;
+    return lt;
+  }
   // One coerced field value, reading the source block through `block_var` (a Var
   // bound to the source module value): SrcField -> `field_mut pos block_var`
   // (recursing for a submodule sub-coercion); PrimStub -> eta-stub; AliasValue ->
@@ -24704,6 +24742,7 @@ struct Translator {
     }
     auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
     fr->prim_arg = f.src_pos; fr->args = {block_var};
+    if (f.functor_eta && f.sub) return functor_eta_wrap(fr, *f.sub);
     if (f.sub) return apply_msig_coercion(fr, *f.sub);
     return fr;
   }
@@ -24721,6 +24760,7 @@ struct Translator {
     }
     if (f.src_pos < 0 || f.src_pos >= (int)src_fields.size()) return nullptr;
     LamPtr v = src_fields[f.src_pos];
+    if (f.functor_eta && f.sub) return functor_eta_wrap(v, *f.sub);
     if (f.sub) return apply_msig_coercion(v, *f.sub);
     return v;
   }
@@ -25500,6 +25540,12 @@ struct Translator {
       auto pending = std::move(pending_functor_coerce_); pending_functor_coerce_.clear();
       const cmi::Signature* pending_sig = pending_functor_coerce_sig_;
       pending_functor_coerce_sig_ = nullptr;
+      // Consume the eta request NOW, not at the post-body check: the body's own
+      // nested functor bindings (Define's Generic/Simple/..) run through the
+      // same Pstr_module tail that clears the member flag, so a request left
+      // pending across the body build was clobbered by any nested functor.
+      bool eta_req = pending_functor_eta_request_;
+      pending_functor_eta_request_ = false;
       // A functor's body may define internal submodules
       // (`module Make (X) = struct module Map = ... end`).  Those are scoped to
       // the body -- a functor is a closure, its internals are not fields of the
@@ -25524,8 +25570,7 @@ struct Translator {
         // hand the export site the .mli->raw index mapping instead.  Bail to
         // the normal in-place coercion on a duplicate raw name, a missing
         // member, or an identity mapping (no wrapper needed then).
-        if (pending_functor_eta_request_) {
-          pending_functor_eta_request_ = false;
+        if (eta_req) {
           // Submodule-bearing result: the flat index map cannot carry the
           // submodules' own nested sub-coercions, so hand back the full
           // computed coercion for the export stub to replay on the applied
@@ -25613,7 +25658,6 @@ struct Translator {
         }
         functor_body_done:;
       } else {
-        pending_functor_eta_request_ = false;  // non-struct body: unmet
         fn->body = compile_module_expr(*cur);
       }
       // Drop the body's internal module registrations (see snapshot above);
@@ -26886,7 +26930,6 @@ struct Translator {
               if (param_same) pending_functor_eta_request_ = true;
             }
             LamPtr fv = compile_module_expr(mb.expr);
-            pending_functor_eta_request_ = false;  // consumed or unmet
             pending_functor_coerce_.clear();
             pending_functor_coerce_sig_ = nullptr;
             mod_path_ = saved_mp;
@@ -27724,6 +27767,14 @@ struct Translator {
             if (all) {
               ce = std::move(tmp); cn = std::move(tn);
               used_computed = true; ++coerce_computed_used_;
+              // A Tcoerce_functor field just wrapped its export here; the
+              // relocated per-functor coercion (functor_export_eta_*) is the
+              // SAME coercion and must not wrap the wrapper again.
+              for (auto& f : cc.fields)
+                if (f.functor_eta) {
+                  functor_export_eta_coerce_.erase(f.name);
+                  functor_export_eta_.erase(f.name);
+                }
             }
           }
         }
