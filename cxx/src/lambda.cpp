@@ -14433,6 +14433,10 @@ struct Translator {
       // (see root_let_depth); -1 = none, so the catch keeps its root placement.
       int let_ref_depth = -1;
       std::vector<char> letref(a.vnames.size(), 0);   // alias[k] is such a binding
+      // alias[k] was justified only by the PEND placement (the let encloses the
+      // or-handler catch, not the catch's eventual home) -- see the fixup below.
+      std::vector<char> pendref(a.vnames.size(), 0);
+      bool pend_forced = false;    // that fixup ran: hold the catch at pend
       auto dropped = [&](size_t k) {
         return (k < reread.size() && reread[k]) || (k < alias.size() && alias[k]);
       };
@@ -14497,6 +14501,7 @@ struct Translator {
           if (pend && gm_facc_proto_.count(same->stamp) &&
               let_scope_at(body, pend->get(), same->stamp) == 1) {
             alias[k] = *same; letref[k] = 1;         // letref: keep pend placement
+            pendref[k] = 1;
             continue;
           }
           reread[k] = expand_facc_var(*same);        // materialized field chain
@@ -14510,6 +14515,30 @@ struct Translator {
               !stamp_bound_in(body, same->stamp))
             alias[k] = *same;
         }
+        // A pendref alias is in scope only where let_scope_at checked it: at the
+        // PENDING or-handler catch.  Another param's AMBIENT alias below splices
+        // that catch out and re-places the handler at the lca slot, where the
+        // binding need not be live at all -- for `MD s, ((Delay|Return) as x) ->
+        // s ^ name x`, s is bound inside the `MD` switch arm and x aliases the
+        // ambient scrutinee, so the handler landed at the body root and read a
+        // dangling stamp (whatever the stack slot happened to hold: a wrong
+        // answer, then a segfault).  ocamlc keeps that handler in the arm and
+        // re-reads the field there, so do both: swap the alias for the field
+        // chain, which roots at scrutinee vars in scope at any garm catch, and
+        // hold the catch at pend -- an ambient alias is by definition not bound
+        // inside the body, hence equally in scope there.  If even the chain's
+        // root is bound inside the body, keep the exit arg.
+        bool relocates = false;
+        for (size_t k = 0; k < alias.size(); ++k)
+          if (alias[k] && !letref[k]) { relocates = true; break; }
+        if (relocates)
+          for (size_t k = 0; k < alias.size(); ++k)
+            if (pendref[k]) {
+              LamPtr ch = expand_facc_var(*alias[k]);
+              const Ident* root = ch ? facc_chain_root(ch) : nullptr;
+              if (root && !stamp_bound_in(body, root->stamp)) reread[k] = std::move(ch);
+              alias[k].reset(); letref[k] = 0; pend_forced = true;
+            }
         if ([&] { for (size_t k = 0; k < a.vnames.size(); ++k) if (dropped(k)) return true; return false; }()) {
           for (Lam* s : sites) {
             std::vector<LamPtr> na;
@@ -14598,7 +14627,7 @@ struct Translator {
         for (size_t k = 0; k < alias.size(); ++k)
           if (alias[k] && !letref[k]) { has_alias = true;
             if (rhs_is_bare_ident(a.rhs, a.vnames[k])) ident_arm = true; }
-        if (pend && !has_alias) {   // fill the split-point catch in place
+        if (pend && (!has_alias || pend_forced)) {  // fill the split catch in place
           (*pend)->catch_vars = std::move(cvs);
           (*pend)->catch_var_kinds = std::move(cks);
           (*pend)->then_ = handler; (*pend)->gm_orp = false;
