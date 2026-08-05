@@ -3213,9 +3213,17 @@ struct Translator {
   // Make): register F's RESULT nested submodule layouts under M so `M.Set.x` (and
   // `Set.x` after `include M`) field-resolve.
   void register_functor_result_layouts(const std::string& prefix, const ModuleExpr& me) {
-    auto* pa = std::get_if<Pmod_apply>(&me.desc);
-    if (!pa) return;
-    auto* fi = std::get_if<Pmod_ident>(&pa->f->desc);
+    // Unwrap a curried application `F(A)(B)` to the base functor path, then
+    // peel one cmi Functor level per application to reach the final result.
+    const ModuleExpr* base = &me;
+    int napps = 0;
+    for (;;) {
+      if (auto* pa2 = std::get_if<Pmod_apply>(&base->desc)) { base = pa2->f.get(); ++napps; continue; }
+      if (auto* pu2 = std::get_if<Pmod_apply_unit>(&base->desc)) { base = pu2->f.get(); ++napps; continue; }
+      break;
+    }
+    if (napps == 0) return;
+    auto* fi = std::get_if<Pmod_ident>(&base->desc);
     if (!fi) return;
     auto* d = std::get_if<Ldot>(&fi->id.txt.v);
     if (!d) return;
@@ -3224,14 +3232,19 @@ struct Translator {
     try {
       const auto& cmi = cmi::CmiFile::load(resolve_cmi(pl->name));
       for (auto& md : cmi.sig().modules)
-        if (md.name == d->name && md.type && md.type->kind == cmi::ModuleType::Functor)
-          if (const cmi::Signature* rs = mt_sig(cmi, md.type->functor_body))
+        if (md.name == d->name && md.type && md.type->kind == cmi::ModuleType::Functor) {
+          cmi::ModuleTypePtr mt = md.type;
+          for (int i = 0; i < napps && mt; ++i)
+            mt = mt->kind == cmi::ModuleType::Functor ? mt->functor_body
+                                                      : nullptr;
+          if (const cmi::Signature* rs = mt ? mt_sig(cmi, mt) : nullptr)
             // only the NESTED submodules -- the top-level prefix layout is already
             // set from module_result_layout and must not be clobbered (it drives
             // the field count of a downstream `include M`).
             for (auto& sm : rs->modules)
               if (const cmi::Signature* sub = mt_sig(cmi, sm.type))
                 register_cmi_nested_layouts(cmi, prefix + "." + sm.name, *sub);
+        }
     } catch (...) {}
   }
   // Register the variant constructors declared in a functor parameter's signature
@@ -24322,6 +24335,33 @@ struct Translator {
     }
     return nullptr;
   }
+  // The marker-chain Sig of a MULTI-parameter cmi functor body: one nested
+  // kFunctorMarker level per remaining parameter, ending at the final result
+  // signature -- the cmi-side mirror of msig_of_module_expr's functor markers,
+  // so compute_coercion's Tcoerce_functor case recurses level by level.  Null
+  // when a level's result cannot be resolved (a named-modtype result): the
+  // member's functor_result then stays null and it passes through raw.
+  modsig::SigPtr msig_of_cmi_functor_chain(
+      const cmi::ModuleTypePtr& mt, int depth,
+      const std::vector<const cmi::Signature*>& scope) {
+    if (!mt || depth > 24) return nullptr;
+    if (mt->kind != cmi::ModuleType::Functor) {
+      const cmi::Signature* rs = resolve_cmi_module_sig(mt, scope);
+      return rs ? msig_of_cmi_signature(*rs, depth, scope) : nullptr;
+    }
+    modsig::SigPtr res =
+        msig_of_cmi_functor_chain(mt->functor_body, depth + 1, scope);
+    if (!res) return nullptr;
+    auto out = std::make_shared<modsig::Sig>();
+    modsig::Item m{.ns = modsig::NS::Module, .name = kFunctorMarker};
+    if (const cmi::Signature* ps =
+            resolve_cmi_module_sig(mt->functor_param_type, scope))
+      m.functor_param = msig_of_cmi_signature(*ps, depth + 1, scope);
+    m.functor_result = res;
+    out->push(std::move(m));
+    out->number();
+    return out;
+  }
   modsig::SigPtr msig_of_cmi_signature(const cmi::Signature& sig, int depth = 0,
                                        std::vector<const cmi::Signature*> scope = {}) {
     auto out = std::make_shared<modsig::Sig>();
@@ -24356,6 +24396,12 @@ struct Translator {
             if (const cmi::Signature* rs =
                     resolve_cmi_module_sig(md.type->functor_body, scope))
               item.functor_result = msig_of_cmi_signature(*rs, depth + 1, scope);
+            else if (md.type->functor_body &&
+                     md.type->functor_body->kind == cmi::ModuleType::Functor)
+              // a MULTI-parameter functor member: its one-step body is another
+              // Functor -- carry the nested marker chain instead of nothing
+              item.functor_result = msig_of_cmi_functor_chain(
+                  md.type->functor_body, depth + 1, scope);
           } else if (const cmi::Signature* msig =
                          resolve_cmi_module_sig(md.type, scope)) {
             item.sub = msig_of_cmi_signature(*msig, depth + 1, scope);
@@ -24740,18 +24786,29 @@ struct Translator {
   // a variable.  ocamlc creates the param ident before that binder; the
   // stamp-sensitive effid diff observes the order.
   LamPtr functor_eta_wrap(const LamPtr& fval, const modsig::Coercion& res) {
-    Ident pa = fresh("funarg");
+    // A MULTI-parameter functor's coercion arrives as a marker chain (one
+    // single-field kFunctorMarker level per remaining parameter).  ocamlc's
+    // apply_coercion_result accumulates the params and emits ONE flattened
+    // n-ary wrapper -- all funargs created (outer first) before the binder.
+    std::vector<Ident> pas;
+    pas.push_back(fresh("funarg"));
+    const modsig::Coercion* r = &res;
+    while (r->fields.size() == 1 && r->fields[0].functor_eta &&
+           r->fields[0].sub && r->fields[0].name == kFunctorMarker) {
+      pas.push_back(fresh("funarg"));
+      r = r->fields[0].sub.get();
+    }
     bool direct = fval->k == Lam::K::Var;
     Ident fid;
     if (!direct) fid = fresh("let");
     auto ap = mk(Lam::K::Apply);
     ap->fn = direct ? fval : varof(fid);
-    ap->args = {varof(pa)};
-    LamPtr body = apply_msig_coercion(ap, res);
+    for (auto& pa : pas) ap->args.push_back(varof(pa));
+    LamPtr body = apply_msig_coercion(ap, *r);
     if (!body) return nullptr;
     auto wf = mk(Lam::K::Function);
     wf->inline_attr = "is_a_functor stub";
-    wf->params.push_back({pa, ValueKind::Gen});
+    for (auto& pa : pas) wf->params.push_back({pa, ValueKind::Gen});
     wf->body = body;
     if (direct) return wf;
     auto lt = mk(Lam::K::Let);
@@ -24969,6 +25026,16 @@ struct Translator {
   bool pending_functor_eta_request_ = false;
   std::vector<int> pending_functor_eta_result_;
   std::unordered_map<std::string, std::vector<int>> functor_export_eta_;
+  // A multi-parameter functor flattens to ONE n-ary function (ocamlc's
+  // compile_functor), so its export wrapper needs n `funarg`s and an n-ary
+  // apply (translmod's apply_coercion_result accumulates the params the same
+  // way).  Recorded at gate time from the declaration's parameter count.
+  int pending_functor_eta_arity_ = 1;
+  std::unordered_map<std::string, int> functor_export_eta_arity_;
+  int functor_export_eta_arity(const std::string& nm) {
+    auto it = functor_export_eta_arity_.find(nm);
+    return it != functor_export_eta_arity_.end() ? it->second : 1;
+  }
   // When the .mli result has SUBMODULES the flat index map above cannot carry
   // their nested sub-coercions, so the eta path instead hands back the full
   // Includemod coercion (the SAME `cc` the fused-body path would apply, just
@@ -26024,7 +26091,10 @@ struct Translator {
           if (auto* pl = std::get_if<Lident>(&d->prefix->v))
             if (!module_base(pl->name) && !fields_of(pl->name).empty()) {
               auto fs = stdlib_functor(pl->name, d->name);
-              if (fs.ok) return fs.result;
+              // A MULTI-parameter functor's one-step body is another Functor
+              // (no fields): fall through to the napps-aware resolver below,
+              // which peels one level per application.
+              if (fs.ok && !fs.result.empty()) return fs.result;
             }
           // `Diff.Simple(Impl)` where local `Diff = Diffing.Define(..)` is bound
           // to an EXTERNAL functor's result: `Simple` is a functor MEMBER of
@@ -26922,11 +26992,20 @@ struct Translator {
             // body layout so member reads index the raw block, matching ocamlc.
             if (!pending_functor_coerce_.empty() && mli_result_sig &&
                 saved_mp.find('.') == std::string::npos) {
-              auto* pf1 = std::get_if<Pmod_functor>(&mb.expr.desc);
-              auto* np = pf1 ? std::get_if<Functor_named>(&pf1->param) : nullptr;
+              // Walk the (possibly multi-parameter) chain to the innermost
+              // body; every level must carry a NAMED, typed param for the
+              // per-level layout comparison against the .cmi's functor chain.
+              std::vector<const Functor_named*> nps;
+              const ModuleExpr* fbody = &mb.expr;
+              while (auto* pfw = std::get_if<Pmod_functor>(&fbody->desc)) {
+                auto* npw = std::get_if<Functor_named>(&pfw->param);
+                if (!npw || !npw->type) { nps.clear(); break; }
+                nps.push_back(npw);
+                fbody = pfw->body.get();
+              }
               bool clean_body = false;
-              if (np && np->type)
-                if (auto* bs = std::get_if<Pmod_structure>(&pf1->body->desc)) {
+              if (!nps.empty())
+                if (auto* bs = std::get_if<Pmod_structure>(&fbody->desc)) {
                   clean_body = true;
                   for (auto& bi : bs->items)
                     if (std::holds_alternative<Pstr_primitive>(bi.desc)) {
@@ -26937,27 +27016,44 @@ struct Translator {
               if (clean_body && has_mli_cmi_)
                 for (auto& md2 : mli_cmi_sig_.modules)
                   if (md2.name == *mb.name.txt) {
-                    const cmi::ModuleType* pt =
-                        md2.type && md2.type->kind == cmi::ModuleType::Functor
-                            ? md2.type->functor_param_type.get()
-                            : nullptr;
-                    if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
-                      param_same =
-                          pt->sig->fields == functor_param_layout(mb.expr);
-                    else if (pt && pt->kind == cmi::ModuleType::Ident &&
-                             pt->path) {
-                      // a NAMED modtype param (`Id : Identifiable.S`): both
-                      // sides citing the same dotted path resolve to the same
-                      // signature -- no argument coercion.
-                      if (auto* pi = std::get_if<Pmty_ident>(&np->type->desc)) {
-                        std::string mlp;
-                        param_same = lid_to_dotted(pi->id.txt, mlp) &&
-                                     mlp == cmi_path_dotted(*pt->path);
+                    // lockstep: each declared param layout must equal the
+                    // .cmi's at the same level (no argument coercion in the
+                    // wrapper), and the arities must agree exactly.
+                    const cmi::ModuleType* mt2 = md2.type.get();
+                    param_same = mt2 && mt2->kind == cmi::ModuleType::Functor;
+                    for (size_t pi2 = 0; param_same && pi2 < nps.size(); ++pi2) {
+                      if (!mt2 || mt2->kind != cmi::ModuleType::Functor) {
+                        param_same = false; break;
                       }
+                      const cmi::ModuleType* pt = mt2->functor_param_type.get();
+                      if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
+                        param_same =
+                            pt->sig->fields == sig_layout(*nps[pi2]->type);
+                      else if (pt && pt->kind == cmi::ModuleType::Ident &&
+                               pt->path) {
+                        // a NAMED modtype param (`Id : Identifiable.S`): both
+                        // sides citing the same dotted path resolve to the same
+                        // signature -- no argument coercion.
+                        param_same = false;
+                        if (auto* pi = std::get_if<Pmty_ident>(
+                                &nps[pi2]->type->desc)) {
+                          std::string mlp;
+                          param_same = lid_to_dotted(pi->id.txt, mlp) &&
+                                       mlp == cmi_path_dotted(*pt->path);
+                        }
+                      } else
+                        param_same = false;
+                      mt2 = mt2->functor_body.get();
                     }
+                    if (param_same && mt2 &&
+                        mt2->kind == cmi::ModuleType::Functor)
+                      param_same = false;  // .cmi has MORE params than the .ml
                     break;
                   }
-              if (param_same) pending_functor_eta_request_ = true;
+              if (param_same) {
+                pending_functor_eta_request_ = true;
+                pending_functor_eta_arity_ = (int)nps.size();
+              }
             }
             LamPtr fv = compile_module_expr(mb.expr);
             pending_functor_coerce_.clear();
@@ -26977,6 +27073,10 @@ struct Translator {
               pending_functor_eta_coerce_set_ = false;
               eta_fired = true;
             }
+            if (eta_fired)
+              functor_export_eta_arity_[*mb.name.txt] =
+                  pending_functor_eta_arity_;
+            pending_functor_eta_arity_ = 1;
             cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
             // When the .mli RESTRICTS this functor's result (the body has more
@@ -27804,6 +27904,7 @@ struct Translator {
                 if (f.functor_eta) {
                   functor_export_eta_coerce_.erase(f.name);
                   functor_export_eta_.erase(f.name);
+                  functor_export_eta_arity_.erase(f.name);
                 }
             }
           }
@@ -27893,10 +27994,12 @@ struct Translator {
         auto fe = functor_export_eta_.find(export_names[wi]);
         if (fe == functor_export_eta_.end()) continue;
         auto wf = mk(Lam::K::Function); wf->inline_attr = "is_a_functor";
-        Ident pa = fresh("funarg");
-        wf->params.push_back({pa, ValueKind::Gen});
-        auto pav = mk(Lam::K::Var); pav->var = pa;
-        auto ap2 = mk(Lam::K::Apply); ap2->fn = exports[wi]; ap2->args = {pav};
+        auto ap2 = mk(Lam::K::Apply); ap2->fn = exports[wi];
+        for (int pk = functor_export_eta_arity(export_names[wi]); pk > 0; --pk) {
+          Ident pa = fresh("funarg");
+          wf->params.push_back({pa, ValueKind::Gen});
+          ap2->args.push_back(varof(pa));
+        }
         Ident rr = fresh("let");
         std::vector<LamPtr> flds;
         for (int ix : fe->second) {
@@ -27922,10 +28025,12 @@ struct Translator {
         auto fe = functor_export_eta_coerce_.find(export_names[wi]);
         if (fe == functor_export_eta_coerce_.end()) continue;
         auto wf = mk(Lam::K::Function); wf->inline_attr = "is_a_functor";
-        Ident pa = fresh("funarg");
-        wf->params.push_back({pa, ValueKind::Gen});
-        auto pav = mk(Lam::K::Var); pav->var = pa;
-        auto ap2 = mk(Lam::K::Apply); ap2->fn = exports[wi]; ap2->args = {pav};
+        auto ap2 = mk(Lam::K::Apply); ap2->fn = exports[wi];
+        for (int pk = functor_export_eta_arity(export_names[wi]); pk > 0; --pk) {
+          Ident pa = fresh("funarg");
+          wf->params.push_back({pa, ValueKind::Gen});
+          ap2->args.push_back(varof(pa));
+        }
         if (LamPtr body = apply_msig_coercion(ap2, fe->second)) {
           wf->body = body;
           exports[wi] = wf;
@@ -28073,6 +28178,21 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
           // ENGINE) gets its result recorded under the dotted key "Engine.Make" --
           // without it the .ml body (`include T; .. let entry ..`) stays in raw
           // order and `MenhirInterpreter.entry` reads the wrong field at runtime.
+          // A multi-parameter functor nests Functor bodies (`Make(A)(B):
+          // sig..end` -> Functor(Functor(Sig))); descend to the final RESULT
+          // signature so its body struct is coerced like a single-param one's.
+          auto functor_final_sig = [](const cmi::ModuleType& mt)
+              -> const cmi::Signature* {
+            const cmi::ModuleType* b = mt.functor_body.get();
+            for (int g = 0; b && b->kind == cmi::ModuleType::Functor && g < 16;
+                 ++g)
+              b = b->functor_body.get();
+            return b ? b->sig.get() : nullptr;
+          };
+          // NOTE: nested keys record only SINGLE-parameter functors (the one-
+          // step functor_body->sig).  A nested MULTI-parameter functor stays
+          // raw here and is coerced by the unit computed coercion's marker-
+          // chain Tcoerce_functor instead, which is where ocamlc places it.
           std::function<void(const cmi::Signature&, const std::string&)> rec_funct =
               [&](const cmi::Signature& sig, const std::string& prefix) {
             for (auto& sm : sig.modules) {
@@ -28090,10 +28210,12 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
             if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
               rec_funct(*md.type->sig, md.name);
           for (auto& md : c.modules()) {
-            if (md.type && md.type->kind == cmi::ModuleType::Functor &&
-                md.type->functor_body && md.type->functor_body->sig) {
-              t.mli_functor_results_[md.name] = md.type->functor_body->sig->fields;
-              t.mli_functor_result_sigs_[md.name] = *md.type->functor_body->sig;
+            const cmi::Signature* fres =
+                md.type && md.type->kind == cmi::ModuleType::Functor
+                    ? functor_final_sig(*md.type) : nullptr;
+            if (fres) {
+              t.mli_functor_results_[md.name] = fres->fields;
+              t.mli_functor_result_sigs_[md.name] = *fres;
             }
             // a plain submodule (Domain.DLS): record its values' label sigs so a
             // same-unit `DLS.new_key (fun..)` fills the omitted optional, and its
