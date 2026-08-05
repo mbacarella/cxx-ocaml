@@ -606,6 +606,11 @@ struct Checker {
   // Ppat_constraint / the function return-type / the binding constraint all route
   // their from_coretype through it.
   std::unordered_map<std::string, TypePtr>* annot_vars_ = nullptr;
+  // A value binding's declared type, handed to a `function` RHS as its expected
+  // type (ocamlc's type_expect).  Set by infer_bindings immediately before it
+  // infers that RHS and CONSUMED -- cleared -- by the infer_function it is meant
+  // for, so nothing deeper ever sees it.
+  TypePtr pending_binding_annot_ = nullptr;
   std::set<std::string> expanding_;  // guard against cyclic abbreviations
   // match-expression node -> is-partial (the result we route back to the dump)
   std::unordered_map<const Expression*, bool> match_partial;
@@ -8730,6 +8735,11 @@ struct Checker {
   }
 
   TypePtr infer_function(const Pexp_function& f) {
+    // The enclosing binding's declared type is this function's expected type.
+    // Take it before anything else runs, so a function nested in a parameter
+    // default or an arm body never sees it.
+    TypePtr bannot = pending_binding_annot_;
+    pending_binding_annot_ = nullptr;
     venv.emplace_back();
     cenv.emplace_back();  // scope for module-param ctor bindings (see below)
     // Bind all (type a) params to flexible vars first, so value-param
@@ -8797,6 +8807,21 @@ struct Checker {
         }
       }
     }
+    // Peel the binding's declared type over the value parameters ahead of the
+    // body: `let g : int -> u -> int = fun k -> function Dup -> ..` annotates
+    // `k` and leaves `u -> int` for the cases.  Any shape the peel cannot
+    // follow one-for-one (a label on either side, fewer arrows than
+    // parameters) drops the annotation rather than guess at the split.
+    for (auto& p : params) {
+      if (!bannot) break;
+      TypePtr r = I::Engine::repr(bannot);
+      if (r->kind != I::Type::Kind::Arrow || r->arrow_label != 0 || p.lk != 0) {
+        bannot = nullptr;
+        break;
+      }
+      soft_unify(p.ty, r->dom);
+      bannot = r->cod;
+    }
     TypePtr body;
     TypePtr constrained = nullptr;  // what f.constraint_ annotates, when not `body`
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
@@ -8826,6 +8851,13 @@ struct Checker {
       bool res_all_ground = window, res_clash = false;
       TypePtr pacc = nullptr, racc = nullptr;
       mark_open_row_pats(fc.cases);
+      // `let g : u -> int = function ..`: the binding's declared type is the
+      // cases' expected type, so the patterns meet the scrutinee ALREADY at
+      // `u`.  Without it the first row's bare ctor picks its type by lexical
+      // scope -- a LATER declaration of the same ctor name wins -- and pins the
+      // scrutinee there, which then overrides the correct answer the remaining
+      // rows found.  (`bannot` is what the parameter peel above left over.)
+      if (bannot) soft_unify(eng.arrow(arg, rt), bannot);
       // Display pass: flow the return annotation DOWN before the cases, like
       // ocamlc's expected-type propagation.  A `: _ lambda -> _` row
       // annotation then meets the patterns as the scrutinee, so a pattern var
@@ -9276,8 +9308,16 @@ struct Checker {
       const Pvc_constraint* upc =
           b.constraint_ ? std::get_if<Pvc_constraint>(&*b.constraint_) : nullptr;
       if (upc && !upc->univars.empty()) ++la_scope_;
+      // A `function` RHS meets its patterns against the declared type (see
+      // infer_function).  Built here rather than reusing the copy the check
+      // below makes, which is deliberately unified with nothing until then --
+      // the strict pass compares it against the inferred type to find clashes.
+      if (!strict && !fmt_annot && upc && upc->univars.empty() &&
+          std::holds_alternative<Pexp_function>(b.expr->desc))
+        pending_binding_annot_ = from_coretype(*upc->typ, avars);
       TypePtr te = fmt_annot ? infer_expr_expected(*b.expr, fmt_annot)
                              : infer_expr(*b.expr);
+      pending_binding_annot_ = nullptr;
       if (upc && !upc->univars.empty()) --la_scope_;
       TypePtr annot = nullptr;
       // A declared type `let f : T = e`: check the inferred type's identities
