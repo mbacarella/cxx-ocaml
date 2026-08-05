@@ -6099,6 +6099,115 @@ struct Checker {
     // inline walk here sees a free var where the disambiguating variant is.
     pending_pat_disambig_.emplace_back(&lhs, scrut);
   }
+  // Rebind a row's payload binders at the SCRUTINEE constructor's DECLARED
+  // argument types.  infer_pat resolves a bare ctor bottom-up by lexical scope,
+  // so with `type u = Dup of int | E` shadowed by a later `type t = A | Dup of
+  // string` a `match (x : u) with Dup n when n > 3 -> ..` binds n : string and
+  // the guard lowers as caml_string_greaterthan -- a segfault, not a fidelity
+  // diff.  disambig_pat_by_scrut corrects the ctor the BACK END reads, but only
+  // at the fixpoint, long after the guard and the arm body were inferred against
+  // the binding.  This runs INLINE, while the venv frame the caller pushed for
+  // this case still holds the binders; it only ever moves a binder to the type
+  // the scrutinee itself declares for that slot.
+  void retype_pat_binders(const Pattern& lhs, const TypePtr& scrut) {
+    if (!record_kinds_) return;
+    if (auto* al = std::get_if<ast::Ppat_alias>(&lhs.desc))
+      return retype_pat_binders(*al->p, scrut);
+    if (auto* op = std::get_if<ast::Ppat_open>(&lhs.desc))
+      return retype_pat_binders(*op->p, scrut);
+    if (auto* o = std::get_if<ast::Ppat_or>(&lhs.desc)) {
+      retype_pat_binders(*o->l, scrut);
+      retype_pat_binders(*o->r, scrut);
+      return;
+    }
+    // A written annotation is the user's answer for this column; leave it, and
+    // with it everything under it (Ppat_constraint is deliberately not walked).
+    auto* k = std::get_if<ast::Ppat_construct>(&lhs.desc);
+    if (!k || !k->arg || !std::holds_alternative<Lident>(k->id.txt.v)) return;
+    TypePtr sr = I::Engine::repr(scrut);
+    if (sr->kind != I::Type::Kind::Constr || sr->path.empty()) return;
+    std::string cn = lid_last(k->id.txt);
+    // A NESTED column's type carries the enclosing declaration's own spelling,
+    // which is bare (`type w = Wrap of u` inside module M), while the per-type
+    // tables are keyed by the qualified name.  Lift it -- but only when exactly
+    // one qualified type of that name declares the ctor, since nothing here can
+    // tell two modules' `u` apart.  At top level the keys are bare already and
+    // this finds nothing, which is right.
+    std::string tp = sr->path;
+    if (tp.find('.') == std::string::npos) {
+      std::string cand;
+      int nc = 0;
+      for (auto& [key, lst] : type_ctor_schemes_) {
+        auto d = key.rfind('.');
+        if (d == std::string::npos ||
+            key.compare(d + 1, std::string::npos, tp) != 0)
+          continue;
+        for (auto& [n, s] : lst)
+          if (n == cn) { ++nc; cand = key; break; }
+      }
+      if (nc == 1) tp = cand;
+    }
+    // The scrutinee must PROVABLY declare the ctor: an abbreviation path whose
+    // last component merely matches would send the binders to another type's
+    // slots.
+    if (!scrut_owns_ctor(tp, cn)) return;
+    TypePtr* sch = find_ctor(cn);
+    if (!sch) return;
+    TypePtr found_res;
+    ctor_params(eng.instantiate(*sch), found_res);
+    TypePtr fr = I::Engine::repr(found_res);
+    bool differs =
+        ctor_type_differs(fr->kind == I::Type::Kind::Constr ? fr->path : "", tp);
+    if (getenv("CTDBG"))
+      fprintf(stderr, "[CTDBG-R] pat-rebind %s found=%s scrut=%s differs=%d\n",
+              cn.c_str(), fr->kind == I::Type::Kind::Constr ? fr->path.c_str() : "",
+              tp.c_str(), (int)differs);
+    std::vector<TypePtr> ps = ctor_decl_arg_types(tp, cn);
+    if (ps.empty()) return;
+    // Descend even when this ctor resolved CORRECTLY: the shadowed one can sit
+    // in a nested column whose type only the enclosing declaration names
+    // (`Wrap (Dup n)` at `type w = Wrap of u`), and the sub-walk re-decides for
+    // itself.  Rebinding, though, happens only where the lexical pick really
+    // named another type -- ctor_decl_arg_types hands back a FRESH
+    // instantiation, which would cut a correctly-resolved polymorphic ctor's
+    // binder loose from the scrutinee's own.
+    auto* tup = std::get_if<ast::Ppat_tuple>(&(*k->arg)->desc);
+    if (ps.size() > 1) {
+      if (tup && tup->elems.size() == ps.size())
+        for (size_t i = 0; i < ps.size(); ++i)
+          rebind_pat_at(*tup->elems[i], ps[i], differs);
+    } else {
+      rebind_pat_at(**k->arg, ps[0], differs);
+    }
+  }
+  // Put sub-pattern `p` (a constructor argument slot) at type `ty`, and follow
+  // the structural shapes whose sub-columns `ty` names.  With `rebind` the
+  // binders it introduces move to `ty`; without it the walk only travels, to
+  // reach a nested ctor that may need moving.  A binder's recorded kind moves
+  // with it -- nothing else revisits a Ppat_var -- so the guard, the arm body
+  // and the value-kind pass all read one type for it.
+  void rebind_pat_at(const Pattern& p, const TypePtr& ty, bool rebind) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
+      if (rebind) { venv.back()[v->name.txt] = ty; rec_pat_[&p] = ty; }
+      return;
+    }
+    if (auto* al = std::get_if<ast::Ppat_alias>(&p.desc)) {
+      if (rebind) { venv.back()[al->name.txt] = ty; rec_pat_[&p] = ty; }
+      rebind_pat_at(*al->p, ty, rebind);
+      return;
+    }
+    if (auto* tu = std::get_if<ast::Ppat_tuple>(&p.desc)) {
+      TypePtr tr = I::Engine::repr(ty);
+      if (tr->kind == I::Type::Kind::Tuple && tr->args.size() == tu->elems.size())
+        for (size_t i = 0; i < tu->elems.size(); ++i)
+          rebind_pat_at(*tu->elems[i], tr->args[i], rebind);
+      return;
+    }
+    // A nested ctor slot is the same problem one level down.
+    if (std::holds_alternative<ast::Ppat_construct>(p.desc) ||
+        std::holds_alternative<ast::Ppat_or>(p.desc))
+      retype_pat_binders(p, ty);
+  }
   std::vector<std::pair<const Pattern*, TypePtr>> pending_pat_disambig_;
   std::vector<std::pair<const Expression*, TypePtr>> pending_expr_disambig_;
   // Functor-argument structs whose bindings were already inferred (the kinds
@@ -7542,6 +7651,7 @@ struct Checker {
         if (window) soft_unify(pt, se);
         else if (!gadt) try_unify(pt, se);
         disambig_pat_by_scrut(c.lhs, se);
+        retype_pat_binders(c.lhs, se);
         if (c.guard) infer_expr(**c.guard);
         TypePtr br = infer_expr(*c.rhs);
         if (window) soft_unify(br, rt);
@@ -8898,6 +9008,7 @@ struct Checker {
         } else {
           try_unify(infer_pat(c.lhs), arg);
           disambig_pat_by_scrut(c.lhs, arg);
+          retype_pat_binders(c.lhs, arg);
           if (c.guard) infer_expr(**c.guard);  // flows operand kinds; not bool-constrained
           try_unify(infer_expr(*c.rhs), rt);
         }
