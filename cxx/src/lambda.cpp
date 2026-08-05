@@ -15433,7 +15433,11 @@ struct Translator {
         // field arg var of the (column, field) the name occupies in leaf li
         // (the specialized cell binds it; Simplif substitutes single uses)
         for (auto& hv : cur)
-          if (hv.used) e->args.push_back(varof(oc_fid(argpos, hv.occ[li].second)));
+          if (hv.used) {
+            int hf = hv.occ[li].second;   // -1: an `as` bind of the whole column
+            e->args.push_back(hf < 0 ? varof(oc_comps_[argpos]->var)
+                                     : varof(oc_fid(argpos, hf)));
+          }
         n.act = e;
         body_cases.push_back(std::move(n));
       }
@@ -16339,11 +16343,22 @@ struct Translator {
       for (auto& sr : srcs)
         for (auto& a : sr.alts) {
           if (a.is_any) continue;
-          const Pattern* p = effective_pat(a.cols[c]);
+          // `(Dereference | Guard | Delay) as m` in a column: peel the alias and
+          // give every leaf a whole-column bind (field -1), which is exactly the
+          // per-leaf occurrence the or-handler's exit args already carry for
+          // `(A x | B x)`.  Without this the alias failed the construct test and
+          // the whole tuple match fell out of the ocamlc replay.
+          std::vector<const std::string*> cas;
+          const Pattern* p = strip_pat_aliases(a.cols[c], cas);
           std::vector<const Pattern*> cl;
           flatten_or(p, cl);
           for (size_t qi = 0; qi < cl.size(); ++qi) {
             const Pattern* eq = effective_pat(cl[qi]);
+            if (!cas.empty() && (std::holds_alternative<Ppat_any>(eq->desc) ||
+                                 std::get_if<Ppat_var>(&eq->desc)))
+              return nullptr;   // `(_ as x)`: the bind below would shadow the column
+            for (auto* nm : cas)
+              a.vars.push_back({*nm, (int)c, -1, eq, (int)qi, (int)cl.size()});
             if (std::holds_alternative<Ppat_any>(eq->desc)) {
               if (cl.size() > 1) return nullptr;   // `_` under an or: bail
               continue;
@@ -16497,7 +16512,8 @@ struct Translator {
         tags[ri][ai].resize(k);
         if (sr.alts[ai].is_any) continue;          // all omega
         for (size_t c = 0; c < k; ++c) {
-          const Pattern* p = effective_pat(sr.alts[ai].cols[c]);
+          std::vector<const std::string*> cas;      // peeled above; tags ignore them
+          const Pattern* p = strip_pat_aliases(sr.alts[ai].cols[c], cas);
           std::vector<const Pattern*> cl;
           flatten_or(p, cl);
           bool any = false;
@@ -18716,6 +18732,16 @@ struct Translator {
     }
     return tree;
   }
+  // Peel a chain of `<pat> as x` aliases, collecting the names bound along it.
+  const Pattern* strip_pat_aliases(const Pattern* p,
+                                   std::vector<const std::string*>& names) {
+    p = effective_pat(p);
+    while (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+      names.push_back(&pa->name.txt);
+      p = effective_pat(pa->p.get());
+    }
+    return p;
+  }
   // Collect the constant-constructor tags a pattern matches, flattening
   // or-patterns (`Red | Green`), of a single uniform type.  Returns false on any
   // block ctor, argument-bearing ctor, mixed type, or non-constructor leaf.
@@ -18824,13 +18850,30 @@ struct Translator {
     std::vector<KV> kvs;
     const Row* dflt = nullptr;
     std::string type;
+    std::vector<const Expression*> by_src;
+    std::vector<bool> or_row;                // covers >=2 tags: an OR row
+    std::vector<std::vector<const std::string*>> aliases;  // this row's `as` names
     for (auto& r : rows) {
       if (r.guard) CCS_BAIL("guard");
       const Pattern* p = effective_pat(r.lhs);
+      // `(B | C | E) as x -> x` is still a constant-constructor row: peel the
+      // alias so the tag set underneath is visible, and remember the name so the
+      // body compiles with it bound.  Without this the row failed the shape test
+      // and the whole match fell through to ctor_match's flat Lswitch, where
+      // ocamlc's call_switcher merges the three tags into one interval -- leaving
+      // the or-handler single-use, so Simplif inlines it (`(if (!= m 3) (if m m
+      // 0) 3)` vs our `(catch (switch* ..three exits..) with (2) m)`).  The
+      // catch-all test stays on the UNPEELED pattern: `_ as x` has no tag set,
+      // and bind_catchall handles only a bare variable.
+      std::vector<const std::string*> as;
+      const Pattern* q = strip_pat_aliases(p, as);
       std::vector<int> vals;
-      if (ctor_switch_vals(p, type, vals)) {
+      if (ctor_switch_vals(q, type, vals)) {
         if (dflt) CCS_BAIL("case-after-catchall");  // a case after the catch-all
         for (int v : vals) kvs.push_back({v, r.rhs});
+        by_src.push_back(r.rhs);
+        or_row.push_back(vals.size() > 1);
+        aliases.push_back(std::move(as));
       } else if (is_catchall(*p) && !dflt && &r == &rows.back()) {
         dflt = &r;
       } else CCS_BAIL("row-shape");
@@ -18861,12 +18904,6 @@ struct Translator {
     std::vector<LamPtr> actions(1);
     actions.resize(kvs.size() + 1);
     std::vector<int> act_of(kvs.size());
-    std::vector<const Expression*> by_src;
-    std::vector<bool> or_row;                // covers >=2 tags: an OR row
-    for (auto& r : rows) if (!r.guard) {
-      std::string ty2; std::vector<int> vs2;
-      if (ctor_switch_vals(effective_pat(r.lhs), ty2, vs2)) {
-        by_src.push_back(r.rhs); or_row.push_back(vs2.size() > 1); } }
     for (size_t i = 0; i < kvs.size(); ++i) {
       int pos = 0; for (size_t s = 0; s < by_src.size(); ++s) if (by_src[s] == kvs[i].rhs) { pos = (int)s; break; }
       act_of[i] = pos + 1;
@@ -18874,7 +18911,16 @@ struct Translator {
     std::vector<std::string> body_keys;
     std::vector<int> canon(by_src.size());   // identical bodies -> earliest action index
     for (size_t s = 0; s < by_src.size(); ++s) {
+      // An `as` name aliases the scrutinee over this row's body -- for a variable
+      // scrutinee that is a plain rename, which is what ocamlc's Alias bind and
+      // Simplif leave behind.
+      bool bound = !aliases[s].empty();
+      if (bound) {
+        scope.emplace_back();
+        for (auto* n : aliases[s]) scope.back()[*n] = scrut->var;
+      }
       LamPtr b = expr(*by_src[s]);
+      if (bound) scope.pop_back();
       // split_or peels an or-row into its own PmOr, so by the time upstream's
       // StoreExp runs, that row's action is already a bare `(exit i)` and can
       // never be keyed equal to another row's body.  Leave an or-row's key
