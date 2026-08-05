@@ -12553,7 +12553,7 @@ struct Translator {
       MRow& r = rows[oi];
       std::vector<const Pattern*> alts;
       flatten_or(r.cols[0], alts);
-      bool lead_ok = true;
+      bool lead_ok = true, lead_ok_rx = true;
       if (oi > 0) {
         std::set<std::string> altnames;
         for (auto* a : alts) {
@@ -12561,10 +12561,19 @@ struct Translator {
           if (!k) { lead_ok = false; break; }
           altnames.insert(lid_last(k->id.txt));
         }
-        for (size_t i = 0; lead_ok && i < oi; ++i) {
+        lead_ok_rx = lead_ok;
+        for (size_t i = 0; (lead_ok || lead_ok_rx) && i < oi; ++i) {
+          if (rows[i].guard) { lead_ok = lead_ok_rx = false; break; }
           auto* k = std::get_if<Ppat_construct>(&rows[i].cols[0]->desc);
-          if (!k || altnames.count(lid_last(k->id.txt)) || rows[i].guard)
-            { lead_ok = false; break; }
+          if (k && !altnames.count(lid_last(k->id.txt))) continue;
+          lead_ok = false;
+          // safe_before's other half: `same_actions act_p act_q`.  Two rows
+          // raising the SAME arm exit are swappable whatever they match, so a
+          // leading row sharing the or-row's action needs no disjointness.  It
+          // is how a first or-alternative reaches the body ahead of the second
+          // (typedecl_variance's `{type_kind = _; type_manifest = Some _}`
+          // before `{type_kind = Type_record _ | Type_variant _; _}`).
+          if (rows[i].aid < 0 || rows[i].aid != r.aid) { lead_ok_rx = false; break; }
         }
       }
       // do_split also hoists a row that FOLLOWS the or-row into the group
@@ -12601,21 +12610,28 @@ struct Translator {
         if (!disj) break;
         ++tstart;
       }
-      // Only when the fall-through is a REAL default, though.  Upstream compiles
-      // the handler pm under the whole match's partiality, so in a total match a
-      // lone remaining column collapses to its action with no test at all; our
-      // handler is compiled against the default exit, and where that exit is
-      // just the exhaustive match's Match_failure fill it would invent a test
-      // and a raise upstream never emits (typedecl_variance's `{type_kind = _;
-      // type_manifest = Some _}` ahead of an exhaustive three-arm match).
-      if (tstart > oi + 1 && deid == gm_fake_deid_) tstart = oi + 1;
-      bool trailing_ok = lead_ok;
-      for (size_t i = tstart; trailing_ok && i < rows.size(); ++i)
-        if (!std::holds_alternative<Ppat_any>(rows[i].cols[0]->desc) ||
-            rows[i].aid < 0) trailing_ok = false;
-      bool rest_disc = false;
-      for (size_t j = 1; j < r.cols.size(); ++j)
-        if (!gmdef_omega(gmdef_peel(r.cols[j]))) { rest_disc = true; break; }
+      // The hoist and the incompatible-trailing-row rule below are only
+      // upstream-faithful together with upstream's PARTIALITY: the handler pm is
+      // compiled under the whole match's, so in an exhaustive match a residual
+      // column collapses to its action with no test at all.  Ours is compiled
+      // against the default exit, and where that exit is the exhaustive match's
+      // Match_failure fill it would invent a test and a raise upstream never
+      // emits -- which is why the hoist used to be declined there outright.
+      //   But under a hoist that fall-through is provably dead: a value reaching
+      // the handler failed every leading and hoisted row, and cannot match an
+      // incompatible trailing row, so by exhaustiveness it matches the or-row or
+      // a COMPATIBLE trailing row -- and the handler holds exactly those.  So
+      // this relaxed reading licenses the handler's ctor split to drop such a
+      // miss, the same hole rule a proven-total match uses.  The license covers
+      // only block holes, so shapes it cannot prune would still leave the raise:
+      // the attempt is RETRACTED whenever a miss escapes to the fake default,
+      // falling back to the strict reading below unchanged.  A guard breaks the
+      // totality argument outright (a failing guard does fall through to a
+      // Match_failure), and a row without a shared arm id could not be retracted
+      // once its body was compiled -- either takes the strict path directly.
+      bool guardfree = true;
+      for (auto& rr : rows) if (rr.guard || rr.aid < 0) { guardfree = false; break; }
+      bool relaxed = deid == gm_fake_deid_ && guardfree;
       std::vector<std::string> orvars;
       collect_gvars(r.cols[0], orvars);
       // precompile_or allocates the or-row's exit REGARDLESS of whether the
@@ -12625,7 +12641,29 @@ struct Translator {
       // handler pm's dead column binds keep it from the alias-catch rule).
       // Non-binding or-rows take that path here too; binding ones keep the
       // pending gm_orp treatment below.
-      if (trailing_ok && alts.size() > 1 && (rest_disc || orvars.empty())) {
+      bool bailed = false;
+      auto attempt = [&](size_t tstart, bool rx) -> LamPtr {
+        // A trailing row is either COMPATIBLE with the or-head -- a pure
+        // wildcard column 0, which belongs to both the body's dispatch default
+        // and the handler's fall-through -- or INCOMPATIBLE, its column 0 naming
+        // constructors disjoint from every alternative.  pop_compat keeps only
+        // the former, so an incompatible trailing row stays in the body alone
+        // and never reaches the handler: no value that matched an alternative
+        // can match it.  That is what lets a SECOND or-row follow
+        // (typedecl_variance's `{type_kind = Type_record _ | Type_variant _; _}`
+        // behind the abstract one); the recursion gives it its own handler.
+        std::vector<bool> tr_compat(rows.size(), false);
+        bool trailing_ok = rx ? lead_ok_rx : lead_ok;
+        for (size_t i = tstart; trailing_ok && i < rows.size(); ++i) {
+          if (rows[i].aid < 0) { trailing_ok = false; break; }
+          if (std::holds_alternative<Ppat_any>(rows[i].cols[0]->desc)) tr_compat[i] = true;
+          else if (!rx || !col_disjoint(r.cols[0], rows[i].cols[0])) trailing_ok = false;
+        }
+        bool rest_disc = false;
+        for (size_t j = 1; j < r.cols.size(); ++j)
+          if (!gmdef_omega(gmdef_peel(r.cols[j]))) { rest_disc = true; break; }
+        if (!(trailing_ok && alts.size() > 1 && (rest_disc || orvars.empty())))
+          return nullptr;
         static const Pattern gm_omega_pat =
             [] { Pattern p; p.desc = Ppat_any{}; return p; }();
         int orn = ++next_exit_;
@@ -12652,7 +12690,7 @@ struct Translator {
         }
         for (size_t i = tstart; i < rows.size(); ++i) ex.push_back(rows[i]);
         LamPtr sub = gmatch(comps, std::move(ex), mloc, deid, denv);
-        if (!sub) return nullptr;
+        if (!sub) { bailed = true; return nullptr; }
         // Handler (exit orn): the or-row's remaining columns compiled once, with
         // the trailing rows' remaining columns (column 0 popped) as the
         // fall-through -- exactly precompile_or's orpm default = pop_compat.
@@ -12668,15 +12706,37 @@ struct Translator {
         std::vector<MRow> hrows;
         hrows.push_back(std::move(hr));
         for (size_t i = tstart; i < rows.size(); ++i) {
+          if (!tr_compat[i]) continue;                       // pop_compat drops it
           MRow tr = rows[i]; tr.cols.erase(tr.cols.begin());
           hrows.push_back(std::move(tr));
         }
-        LamPtr hb = gmatch(std::move(rcomps), std::move(hrows), mloc, deid,
-                           std::move(denv));
-        if (!hb) return nullptr;
+        int tp_save = gm_tp_deid_;
+        if (rx) gm_tp_deid_ = deid;      // the handler is total (see above)
+        LamPtr hb = gmatch(std::move(rcomps), std::move(hrows), mloc, deid, denv);
+        gm_tp_deid_ = tp_save;
+        if (!hb) { bailed = true; return nullptr; }
         c->then_ = hb;
         return c;
+      };
+      if (relaxed) {
+        int exit_save = next_exit_, stamp_save = stamp;
+        std::set<int> orw_save = gm_orw_, dirty_save = gm_ctx_dirty_eids_;
+        auto facc_save = gm_facc_proto_;
+        LamPtr res = attempt(tstart, true);
+        int fbad = 0;
+        if (res && count_exit(res, deid, false, fbad) == 0) return res;
+        // Retract: every row is aid-shared here (guardfree), so the rejected
+        // attempt emitted no arm body and leaves nothing but counter state.
+        next_exit_ = exit_save; stamp = stamp_save;
+        gm_orw_ = std::move(orw_save); gm_ctx_dirty_eids_ = std::move(dirty_save);
+        gm_facc_proto_ = std::move(facc_save);
+        bailed = false;
       }
+      // The strict reading: no hoist past the or-row under the fake default (its
+      // handler has no totality budget), and only wildcard trailing rows.
+      if (LamPtr res = attempt(deid == gm_fake_deid_ ? oi + 1 : tstart, false))
+        return res;
+      if (bailed) return nullptr;
     }
     // Expand an or-pattern in column 0 into separate rows (order preserved).
     // A binding or-row also gets a PENDING handler catch wrapped around this
@@ -13856,7 +13916,18 @@ struct Translator {
       bool all_same = !blocks.empty();
       for (auto& b : blocks)
         if (!same_action(b.body, blocks[0].body)) { all_same = false; break; }
-      if (all_same && !consts.empty()) {
+      // combine_constructor's FIRST case (`None, Some act`): with no failaction
+      // and every stored cell carrying one action, the test disappears entirely.
+      LamPtr only;
+      bool one_action = !consts.empty() || !blocks.empty();
+      for (auto* v : {&consts, &blocks})
+        for (auto& c : *v) {
+          if (!only) only = c.body;
+          else if (!same_action(c.body, only)) one_action = false;
+        }
+      if (one_action) {
+        result = only;
+      } else if (all_same && !consts.empty()) {
         auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
         isint->prim_id = "isint"; isint->args = {comps[0]};
         auto i = mk(Lam::K::IfThenElse);
