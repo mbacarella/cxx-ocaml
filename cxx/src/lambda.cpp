@@ -18488,10 +18488,9 @@ struct Translator {
     for (auto& sc : l->sw_consts) inline_exit_leaves(sc.body, id, body);
     for (auto& sc : l->sw_blocks) inline_exit_leaves(sc.body, id, body);
   }
-  // A conservative structural key for an action body, used only to detect when
-  // ocamlc would *share* two equal bodies in a switch (which we don't model) so
-  // we can bail to int_cases.  Returns "" for terms ocamlc's make_key rejects
-  // (functions/letrec/loops) -- those are never shared, so never trigger a bail.
+  // A conservative structural key for an action body, used to detect when
+  // ocamlc would *share* two equal bodies in a switch.  Returns "" for terms
+  // ocamlc's make_key rejects (functions/letrec/loops) -- those are never shared.
   static std::string make_lam_key(const LamPtr& l) { return cppcaml::lambda::make_lam_key(l); }
   // Entry point: an int/char-constant match with a trailing catch-all.  Returns
   // null (deferring to int_cases) unless at least one jump table is generated --
@@ -18627,11 +18626,16 @@ struct Translator {
     for (size_t i = 1; i < kvs.size(); ++i)
       if (kvs[i].lo <= kvs[i - 1].hi) return nullptr;  // overlapping ranges: bail
 
-    // Translate the case bodies (source order) and the default body once.  If
-    // any two bodies are structurally identical, ocamlc would *share* them in
-    // the switch (which we don't model); bail so int_cases stays exact.
+    // Translate the case bodies (source order) and the default body once.  Two
+    // structurally identical bodies are ONE action upstream: StoreExp keys each
+    // action with Lambda.make_key and act_store returns the existing index on a
+    // hit, so both rows land on the same store slot -- and, being multi-use,
+    // that slot is Shared, i.e. a bare exit onto one handler (the ShWrap pass
+    // below).  Merge them onto the first occurrence's index; the later slots
+    // stay null and no cluster ever names them.
     std::vector<LamPtr> actions(1);  // index 0 = default (emitted via sentinel)
     std::vector<std::string> body_keys;
+    std::vector<int> dup_of;         // source row -> the row whose action it reuses
     actions.resize(kvs.size() + 1);
     std::vector<int> act_of(kvs.size());
     // The closing row's constants get one action of their own, past the per-row
@@ -18654,10 +18658,16 @@ struct Translator {
       LamPtr b = expr(*by_src[s]);
       if (framed) scope.pop_back();
       std::string key = make_lam_key(b);
-      for (auto& bk : body_keys) if (bk == key && !key.empty()) return nullptr;  // shared body
+      int at = (int)s;
+      if (!key.empty())
+        for (size_t t = 0; t < body_keys.size(); ++t)
+          if (body_keys[t] == key) { at = dup_of[t]; break; }
       body_keys.push_back(key);
-      actions[s + 1] = b;
+      dup_of.push_back(at);
+      if (at == (int)s) actions[s + 1] = b;
     }
+    for (size_t i = 0; i < kvs.size(); ++i)
+      if (kvs[i].rhs) act_of[i] = dup_of[act_of[i] - 1] + 1;
     // transl_case translates the arm body BEFORE its guard (transl_guard wraps
     // the already-built body in the Lifthenelse), so keep that order per row.
     struct DRow { LamPtr guard, body; };

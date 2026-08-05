@@ -282,10 +282,12 @@ struct Lam {
 // Alpha-normalized structural key of a Lambda term (the analog of
 // Lambda.make_key): two terms with the same key are shared as one switch action
 // by the bytecode emitter, matching ocamlc's Bytegen.Storer.  Returns "" for
-// terms that ocamlc treats as Not_simple (closures / letrec / for / while), so
-// those are never shared.  Bound-var stamps are used literally (so distinct-var
-// arms are conservatively NOT merged), which under-shares relative to ocamlc but
-// never over-shares.
+// terms that ocamlc treats as Not_simple (closures / letrec / for / while, or
+// more than max_raw nodes), so those are never shared.  Bound-var stamps are
+// used literally (so distinct-var arms are conservatively NOT merged), which
+// under-shares relative to ocamlc but never over-shares.  The node bound is the
+// looser of the two: upstream re-counts an Alias-substituted body at each use
+// where we count each node once.
 //
 // `exit_aware` controls whether static exits are distinguished by target.  The
 // default (false) deliberately ignores Lstaticraise targets -- two exits "look
@@ -294,9 +296,13 @@ struct Lam {
 // switch/collapse dedups arbitrary action bodies that may BE or CONTAIN static
 // raises: there, exit-blind keying would wrongly merge dispatches to DISTINCT
 // handlers (a real miscompile -- ocamlc's Lambda.make_key keeps the exit id).
-inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
+inline std::string make_lam_key_rec(const LamPtr& l, bool exit_aware, int& budget) {
   if (!l) return "_";
   using K = Lam::K;
+  // make_key counts every node it walks and gives up past `max_raw`
+  // (lambda.ml:441,450), so an oversized action is never shared -- upstream
+  // stores it under a fresh index and duplicates it.
+  if (--budget < 0) return "";
   switch (l->k) {
     case K::Function: case K::Letrec: case K::For: case K::While: return "";
     case K::Var: return "v" + l->var.name + "#" + std::to_string(l->var.stamp);
@@ -314,7 +320,7 @@ inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
   // merges their arms -- a miscompile (Ok () vs Error 0 collapsing to one).
   if (l->k == K::ConstBlock) r += ":" + std::to_string(l->prim_arg);
   if (exit_aware && l->k == K::Staticraise) r += ":X" + std::to_string(l->prim_arg);
-  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key(c, exit_aware); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key_rec(c, exit_aware, budget); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
   add(l->fn); add(l->cond); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
   for (auto& a : l->args) add(a);
   for (auto& b : l->bindings) { if (!r.empty()) r += " b" + std::to_string(b.id.stamp); add(b.val); }
@@ -322,6 +328,10 @@ inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
   for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
   if (r.empty()) return "";
   return r + ")";
+}
+inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
+  int budget = 32;  // lambda.ml:441 `let max_raw = 32`
+  return make_lam_key_rec(l, exit_aware, budget);
 }
 
 // make_lam_key with SCOPED static-exit ids.  An exit whose target Catch lies
