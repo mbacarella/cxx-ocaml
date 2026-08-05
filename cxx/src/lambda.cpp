@@ -1777,12 +1777,20 @@ struct Translator {
     std::vector<std::pair<std::string, std::optional<CtorInfo>>> ci;
     std::vector<std::pair<std::string, std::optional<std::pair<int, int>>>> tc;
     std::vector<std::string> forced;  // ctor names whose ambient resolution is overridden
+    std::vector<std::string> shadowed;  // ... of those, the ones that displaced a LOCAL entry
     bool empty() const { return ci.empty() && tc.empty() && forced.empty(); }
   };
   // Ctor names currently force-registered for a PATTERN scope (scrutinee-type override).
   // A same-named EXPRESSION construction in an arm body must re-resolve via its own
   // inferred type instead of the temporarily-rebound ctor_info_ (see Pexp_construct).
   std::unordered_map<std::string, int> forced_ctor_depth_;
+  // The FILE'S OWN entry a force-register displaced, per name (a stack: matches
+  // nest).  A ctor the file itself declares can never be meant BARE at another
+  // unit's type -- the local declaration shadows the `open` -- so a bare
+  // occurrence, in a nested match inside an arm body, reads this instead of the
+  // rebound one.  Only the qualified `M.C` rows the force-register exists for
+  // keep it.
+  std::unordered_map<std::string, std::vector<CtorInfo>> forced_local_prev_;
   // FORCE-register an imported type's constructors with their cmi tag/arity,
   // OVERRIDING a wrong global resolution, scoped to one match.  `Named` is shared
   // by 6 types at arities 1/2/3; a `match (arg_opt : Parsetree.functor_parameter)
@@ -1819,6 +1827,16 @@ struct Translator {
           it->second.arity != info.arity || it->second.tag != info.tag) {
         saved.ci.emplace_back(nm, it == ctor_info_.end() ? std::optional<CtorInfo>()
                                                           : std::optional<CtorInfo>(it->second));
+        // The displaced entry is the file's OWN declaration of a type with the
+        // SAME BARE NAME: that is exactly the collision CtorInfo::type cannot
+        // see (it holds only the last component), so remember it for the bare
+        // occurrences the local declaration shadows.  Any other displacement
+        // the existing `type` comparisons already tell apart.
+        if (it != ctor_info_.end() && it->second.unit.empty() &&
+            it->second.type == ty) {
+          forced_local_prev_[nm].push_back(it->second);
+          saved.shadowed.push_back(nm);
+        }
         ctor_info_[nm] = info;
         saved.forced.push_back(nm);       // arm bodies re-resolve this name via expr type
         forced_ctor_depth_[nm]++;
@@ -4099,6 +4117,11 @@ struct Translator {
     for (auto& nm : saved.forced)
       if (auto f = forced_ctor_depth_.find(nm); f != forced_ctor_depth_.end() && --f->second <= 0)
         forced_ctor_depth_.erase(f);
+    for (auto it = saved.shadowed.rbegin(); it != saved.shadowed.rend(); ++it)
+      if (auto f = forced_local_prev_.find(*it); f != forced_local_prev_.end()) {
+        f->second.pop_back();
+        if (f->second.empty()) forced_local_prev_.erase(f);
+      }
   }
   // The runtime fields of a (possibly nested) stdlib functor's result after
   // `napps` applications -- "Sys.Immediate64.Make" applied twice yields its
@@ -9138,6 +9161,44 @@ struct Translator {
   }
   // Read record field `fi` of `s` with the spelling its kind implies (an int field
   // is field_int, a mutable boxed field field_mut, otherwise field_imm).
+  // Does `l` never produce a value -- is every one of its tails a static exit?
+  // A tuple-let catch's BODY is exactly that (each arm exits with the
+  // components), so the value of `(catch <body> with (i ..) H)` comes from H
+  // alone and a spine walk may treat H as the continuation.
+  static bool tails_all_exit(const Lam* l) {
+    if (!l) return false;
+    switch (l->k) {
+      case Lam::K::Staticraise: return true;
+      case Lam::K::Prim:
+        return l->prim == Prim::Raise || l->prim == Prim::Reraise;
+      case Lam::K::Let:
+      case Lam::K::Letrec: return tails_all_exit(l->body.get());
+      case Lam::K::Sequence: return tails_all_exit(l->else_.get());
+      case Lam::K::IfThenElse:
+        return tails_all_exit(l->then_.get()) && tails_all_exit(l->else_.get());
+      case Lam::K::Catch:
+      case Lam::K::Try:
+        return tails_all_exit(l->cond ? l->cond.get() : l->body.get()) &&
+               tails_all_exit(l->then_.get());
+      default: return false;
+    }
+  }
+  // The slot a floated tuple-let's leaf tuple occupies: walk the let /
+  // sequence / value-less-catch spine of `v` to its tail.  `crossed_frame`
+  // reports a step the caller cannot hoist bindings out of (a sequence's
+  // effect, a catch's handler), which forces the splice-at-the-leaf form.
+  static LamPtr* tuple_spine_tail(LamPtr& v, bool* crossed_frame = nullptr) {
+    LamPtr* slot = &v;
+    for (;;) {
+      Lam* n = slot->get();
+      if (n->k == Lam::K::Let) { slot = &n->body; continue; }
+      bool seq = n->k == Lam::K::Sequence && n->else_;
+      bool cat = n->k == Lam::K::Catch && n->then_ && tails_all_exit(n->cond.get());
+      if (!seq && !cat) return slot;
+      if (crossed_frame) *crossed_frame = true;
+      slot = seq ? &n->else_ : &n->then_;
+    }
+  }
   // Rewrite every TAIL value of `l` that is a k-tuple construction into
   // (exit N <components>); bottoms (raise / existing exits) stay; any other
   // tail gets the whole-pattern leaf sublet.  The caller uses the result only
@@ -9748,6 +9809,16 @@ struct Translator {
   std::unordered_map<Lam*, std::vector<std::pair<int, LamPtr>>> lf_static_;
   Lam* lf_scope_ = nullptr;
   Lam* lf_fnscope_ = nullptr;
+  // Binders the floated tuple-let erased a use of.  assign_pat puts EVERY
+  // component into the `Lstaticraise (i, ..)` upstream still holds when
+  // simplify_local_functions runs, so a component that is a local function's
+  // variable is seen there as a value (`Lvar id -> remove`) and never becomes
+  // a static handler.  Our float aliases that variable away at translation
+  // time, so record the disqualification instead of leaving the node to find.
+  std::unordered_set<int> lf_no_static_;
+  void note_tuple_component_use(const LamPtr& av) {
+    if (av && av->k == Lam::K::Var) lf_no_static_.insert(av->var.stamp);
+  }
   static bool lf_enabled(const Lam* f) {
     const std::string& a = f->inline_attr;
     if (a.find("never_local") != std::string::npos) return false;
@@ -9775,7 +9846,7 @@ struct Translator {
         for (size_t i = 0; i < l->bindings.size(); ++i) {
           auto& b = l->bindings[i];
           if (b.val && b.val->k == Lam::K::Function && lf_enabled(b.val.get()) &&
-              !b.alias && !b.mut) {
+              !b.alias && !b.mut && !lf_no_static_.count(b.id.stamp)) {
             lf_slots_[b.id.stamp] = {b.val, lf_fnscope_, nullptr};
             fnb.push_back(i);
           } else if (b.val) {
@@ -17219,6 +17290,44 @@ struct Translator {
         if (!s.empty()) arg_saves.push_back(std::move(s));
       }
     }
+    // A nested match inside an arm BODY, over a type an OUTER match's
+    // force-register displaced: the file's own declaration shadows whatever
+    // the `open` brought in, so a column written BARE means the LOCAL type.
+    // Put the displaced entries -- and the local type's own (n_const,n_block),
+    // which the force overwrote under the shared bare type name -- back for
+    // the duration of this match.  The qualified `M.C` rows the force-register
+    // exists for are Ldot and untouched.  Consumer twin of the Pexp_construct
+    // override, which reaches the same conclusion through vk.expr_constr.
+    // ... but only for a match that did not itself ask for one: the force
+    // exists to correct exactly this match's own bare column.
+    if (!forced_local_prev_.empty() && ctor_save.empty() && arg_saves.empty()) {
+      CtorSave un;
+      std::set<std::string> ltypes;
+      for (auto& r : rows) {
+        auto* k = std::get_if<Ppat_construct>(&effective_pat(r.lhs)->desc);
+        if (!k || !std::holds_alternative<Lident>(k->id.txt.v)) continue;
+        const std::string nm = lid_last(k->id.txt);
+        auto lp = forced_local_prev_.find(nm);
+        if (lp == forced_local_prev_.end()) continue;
+        auto it = ctor_info_.find(nm);
+        un.ci.emplace_back(nm, it == ctor_info_.end()
+                                   ? std::optional<CtorInfo>()
+                                   : std::optional<CtorInfo>(it->second));
+        ctor_info_[nm] = lp->second.back();
+        ltypes.insert(lp->second.back().type);
+      }
+      for (auto& ty : ltypes)
+        if (auto ti = type_ctor_info_.find(ty); ti != type_ctor_info_.end()) {
+          int nc = 0, nb = 0;
+          for (auto& [nm2, ci2] : ti->second) (ci2.is_block ? nb : nc)++;
+          auto tc = type_ctors_.find(ty);
+          un.tc.emplace_back(ty, tc == type_ctors_.end()
+                                     ? std::optional<std::pair<int, int>>()
+                                     : std::optional<std::pair<int, int>>(tc->second));
+          type_ctors_[ty] = std::make_pair(nc, nb);
+        }
+      if (!un.empty()) arg_saves.push_back(std::move(un));
+    }
     struct CtorGuard { Translator* self; CtorSave sv; std::vector<CtorSave> args;
                        ~CtorGuard() {
                          for (auto it = args.rbegin(); it != args.rend(); ++it)
@@ -18429,7 +18538,12 @@ struct Translator {
     if (scrut->k != Lam::K::Var) return nullptr;
     struct KV { long long lo, hi; const Expression* rhs; };
     std::vector<KV> kvs;
-    const Row* dflt = nullptr;
+    // The trailing rows the switch's fail action reaches: GUARDED catch-alls, in
+    // source order, closed by one unguarded catch-all.  split_no_or's can_group
+    // breaks the constant group at the first variable row, so those rows are the
+    // group's default pm (matching.ml's Default_environment) -- compiled as the
+    // guard chain compile_no_test emits and entered through the switch's fail.
+    std::vector<const Row*> dflt;
     bool is_int = false, is_char = false, has_interval = false, has_tail = false;
     // bodies must be translated in source order for stable stamp normalization
     std::vector<const Expression*> by_src;
@@ -18437,7 +18551,6 @@ struct Translator {
     // (matching.ml expands the alias before the constant switch).
     std::unordered_map<const Expression*, std::vector<std::string>> row_aliases;
     for (auto& r : rows) {
-      if (r.guard) return nullptr;
       const Pattern* p = effective_pat(r.lhs);
       std::vector<std::string> aliases;
       while (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
@@ -18445,29 +18558,35 @@ struct Translator {
         p = effective_pat(pa->p.get());
       }
       std::vector<std::pair<long long, long long>> vals;
-      if (switch_const_ranges(p, is_int, is_char, vals)) {
-        if (dflt) return nullptr;  // a case after the catch-all
+      // A GUARDED constant row stays out: its guard lives inside the switch arm
+      // (the action falls to the fail on failure), which this builder cannot
+      // express -- it only reaches the fail from a table slot.
+      if (!r.guard && switch_const_ranges(p, is_int, is_char, vals)) {
+        if (!dflt.empty()) return nullptr;  // a case after the catch-all
         for (auto& v : vals) {
           kvs.push_back({v.first, v.second, r.rhs});
           if (v.second > v.first) has_interval = true;
         }
         by_src.push_back(r.rhs);
         if (!aliases.empty()) row_aliases[r.rhs] = std::move(aliases);
-      } else if (aliases.empty() && is_catchall(*p) && !dflt && &r == &rows.back()) {
-        dflt = &r;
+      } else if (aliases.empty() && is_catchall(*p) && !has_tail &&
+                 (dflt.empty() || dflt.back()->guard)) {
+        dflt.push_back(&r);
       } else if (std::vector<std::pair<long long, long long>> tail;
-                 aliases.empty() && !dflt && &r == &rows.back() &&
+                 aliases.empty() && !r.guard && dflt.empty() && &r == &rows.back() &&
                  catchall_or_consts(p, is_int, is_char, tail)) {
         for (auto& v : tail) {
           kvs.push_back({v.first, v.second, nullptr});  // null rhs = the closing row
           if (v.second > v.first) has_interval = true;
         }
-        dflt = &r; has_tail = true;
+        dflt.push_back(&r); has_tail = true;
       } else return nullptr;
     }
     // A single discrete value goes through the simpler const path; but a lone
     // interval arm still needs the Switcher to get `isout` instead of two-sided.
-    if ((is_int && is_char) || !dflt || kvs.empty() ||
+    // A guard chain with no unguarded closer leaves the fail partial (a
+    // Match_failure the default pm would have to raise); not modelled here.
+    if ((is_int && is_char) || dflt.empty() || dflt.back()->guard || kvs.empty() ||
         (kvs.size() < 2 && !has_interval)) return nullptr;
     std::sort(kvs.begin(), kvs.end(), [](auto& a, auto& b) { return a.lo < b.lo; });
     for (size_t i = 1; i < kvs.size(); ++i)
@@ -18504,10 +18623,24 @@ struct Translator {
       body_keys.push_back(key);
       actions[s + 1] = b;
     }
-    scope.emplace_back();
-    bind_catchall(*dflt->lhs, scrut);
-    LamPtr default_body = expr(*dflt->rhs);
-    scope.pop_back();
+    // transl_case translates the arm body BEFORE its guard (transl_guard wraps
+    // the already-built body in the Lifthenelse), so keep that order per row.
+    struct DRow { LamPtr guard, body; };
+    std::vector<DRow> drows;
+    for (auto* dr : dflt) {
+      scope.emplace_back();
+      bind_catchall(*dr->lhs, scrut);
+      LamPtr b = expr(*dr->rhs);
+      LamPtr g = dr->guard ? expr(*dr->guard) : nullptr;
+      scope.pop_back();
+      drows.push_back({g, b});
+    }
+    LamPtr default_body = drows.back().body;
+    for (size_t i = drows.size() - 1; i-- > 0;) {
+      auto iff = mk(Lam::K::IfThenElse);
+      iff->cond = drows[i].guard; iff->then_ = drows[i].body; iff->else_ = default_body;
+      default_body = iff;
+    }
     {  // a case body equal to the default is folded into the default by ocamlc
       std::string dk = make_lam_key(default_body);
       if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) return nullptr;
@@ -20780,7 +20913,16 @@ struct Translator {
           if (dotless || forced_ctor_depth_.count(n)) {
             if (auto d = ety.rfind('.'); d != std::string::npos)
               ety = ety.substr(d + 1);
-            if (ety != cip->type &&
+            // A force-register rebound this name for the duration of the
+            // enclosing match, so the arm body must go back to its own
+            // inferred type even when the two agree on the BARE type name:
+            // CtorInfo::type holds only the last component, so an `open`ed
+            // unit's type and the file's own SHADOWING declaration of the
+            // same name compare equal here.  bytelink `open Config`s a
+            // `launch_method` and then declares its own; `| Config.Executable
+            // -> Executable` built the opened one's tag 0 (Shebang_runtime's
+            // value) for its own tag-1 Executable.
+            if ((ety != cip->type || forced_ctor_depth_.count(n)) &&
                 (forced_ctor_depth_.count(n) ||
                  (!ambiguous_type_names_.count(ety) &&
                   // an EXTENSION constructor's identity never comes from a
@@ -22105,13 +22247,8 @@ struct Translator {
           // crossed; if so we cannot flatten the RHS into this let-group (the side
           // effect would need a stack slot it does not have in ocamlc's Lsequence),
           // so we keep the whole let/seq tree and splice at the leaf instead.
-          const Lam* inner = val.get();
           bool saw_seq = false;
-          while (inner->k == Lam::K::Let ||
-                 (inner->k == Lam::K::Sequence && inner->else_)) {
-            if (inner->k == Lam::K::Sequence) saw_seq = true;
-            inner = (inner->k == Lam::K::Let) ? inner->body.get() : inner->else_.get();
-          }
+          const Lam* inner = tuple_spine_tail(val, &saw_seq)->get();
           // A tuple whose elements are all constants translates to a struct-const
           // rather than a makeblock; ocamlc's assign_pat decomposes
           // `Lconst (Const_block ..)` exactly as it does `Lprim (Pmakeblock ..)`
@@ -22132,15 +22269,13 @@ struct Translator {
             // wrap_binders).  Order is preserved because the components stay
             // at the tuple's original position, after the spine's lets and
             // side effects.
-            LamPtr* slot = &val;
-            while ((*slot)->k == Lam::K::Let ||
-                   ((*slot)->k == Lam::K::Sequence && (*slot)->else_))
-              slot = ((*slot)->k == Lam::K::Let) ? &(*slot)->body : &(*slot)->else_;
+            LamPtr* slot = tuple_spine_tail(val);
             LamPtr mkb = *slot;
             auto inner_let = mk(Lam::K::Let);
             for (int i = (int)tup->elems.size() - 1; i >= 0; --i) {
               const Pattern* ep = effective_pat(tup->elems[i].get());
               LamPtr av = mkb->args[i];
+              note_tuple_component_use(av);
               auto* pv = std::get_if<Ppat_var>(&ep->desc);
               bool anyp = std::holds_alternative<Ppat_any>(ep->desc);
               if ((pv || anyp) && av->k != Lam::K::Var && !av->from_alias) {
@@ -22179,6 +22314,7 @@ struct Translator {
             for (int i = (int)tup->elems.size() - 1; i >= 0; --i) {
               const Pattern* ep = effective_pat(tup->elems[i].get());
               LamPtr av = val->args[i];
+              note_tuple_component_use(av);
               auto* pv = std::get_if<Ppat_var>(&ep->desc);
               bool anyp = std::holds_alternative<Ppat_any>(ep->desc);
               if ((pv || anyp) && av->k != Lam::K::Var && !av->from_alias) {
@@ -22261,11 +22397,10 @@ struct Translator {
         // Splice the component-binding inner let (its body is the fully-bound body)
         // in at the tail tuple leaf of the preserved let/seq spine.
         float_seq_inner->body = body;
-        LamPtr* slot = &float_seq_val;
-        while ((*slot)->k == Lam::K::Let ||
-               ((*slot)->k == Lam::K::Sequence && (*slot)->else_))
-          slot = ((*slot)->k == Lam::K::Let) ? &(*slot)->body : &(*slot)->else_;
-        *slot = float_seq_inner;
+        LamPtr* slot = tuple_spine_tail(float_seq_val);
+        // Every component aliased (all of them were already Lvars): there is
+        // nothing left to bind, so the body takes the tuple's place directly.
+        *slot = float_seq_inner->bindings.empty() ? body : float_seq_inner;
         return float_seq_val;
       }
       if (l->bindings.empty()) return body;  // all bindings were field reads of a var
