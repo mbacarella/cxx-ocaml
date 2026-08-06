@@ -28074,6 +28074,13 @@ struct Translator {
                   export_names);
     // A signature ascription `(struct .. : S)` coerces the export block to S's
     // fields (selected and reordered by name); the structure's bindings stay.
+    // A submodule the ascription RESTRICTS holds the coerced value from here on,
+    // so the Sig we hand back must describe the TARGET's members, not the
+    // implementation's -- otherwise an enclosing coercion (the unit's own
+    // .ml-vs-.mli one) recomputes the same restriction against the already
+    // restricted value and reads past its end.  Same hazard the functor_eta
+    // erase below closes, for a plain submodule field.
+    std::unordered_map<std::string, modsig::SigPtr> coerced_sub;
     if (coerce) {
       std::vector<LamPtr> ce; std::vector<std::string> cn;
       bool used_computed = false;
@@ -28113,6 +28120,11 @@ struct Translator {
               // A Tcoerce_functor field just wrapped its export here; the
               // relocated per-functor coercion (functor_export_eta_*) is the
               // SAME coercion and must not wrap the wrapper again.
+              for (auto& f : cc.fields)
+                if (f.sub && !f.functor_eta) {
+                  const modsig::Item* ti = tgt->find(modsig::NS::Module, f.name);
+                  if (ti && ti->sub) coerced_sub[f.name] = ti->sub;
+                }
               for (auto& f : cc.fields)
                 if (f.functor_eta) {
                   functor_export_eta_coerce_.erase(f.name);
@@ -28282,6 +28294,8 @@ struct Translator {
           if (found) {
             modsig::Item c = *found;
             c.runtime = true;  // a materialized alias/eta-stub takes a slot
+            if (auto cs = coerced_sub.find(nm); cs != coerced_sub.end())
+              c.sub = cs->second;  // the ascription already restricted it
             out_sig->push(std::move(c));
           } else {
             // not in cursig (a materialized alias / eta-stub / exn slot): the
