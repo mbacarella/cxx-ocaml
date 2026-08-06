@@ -12194,6 +12194,20 @@ struct Translator {
     for (auto* c : r.cols) if (!pat_omega_like(c)) return false;
     return true;
   }
+  // matching.ml can_group (:1391): a Record or Tuple head GROUPS with the
+  // omega rows below it (`Record _, (Record _ | Any) -> true`), so split_no_or
+  // peels only the ONE trailing all-variable row its singleton rule takes
+  // (collect, :1635) and leaves the rest in the pm -- divide_record /
+  // divide_tuple then decomposes them together, and the decomposed column's
+  // arg_to_var + bind_check binds OUTSIDE the split those rows go on to make.
+  // A Construct or Constant head groups with nothing, so there every trailing
+  // omega row splits off at this level, which is what the repeated peel does.
+  bool gm_head_groups_omega(const std::vector<MRow>& rows) {
+    if (rows.empty() || rows[0].cols.empty()) return false;
+    const Pattern* p = pat_deep(rows[0].cols[0]);
+    return std::holds_alternative<Ppat_record>(p->desc) ||
+           std::holds_alternative<Ppat_tuple>(p->desc);
+  }
   // Upstream Matching's Default_environment: the stack of pending half-match
   // chunks (split_no_or splits a column's rows into maximal groupable runs;
   // each later run is entered through a static exit).  An entry is (exit id,
@@ -12403,8 +12417,12 @@ struct Translator {
   //    deferred columns -- so its handler re-reads later fields fresh while
   //    reusing vars this level already materialized, exactly upstream's
   //    default-matrix argument capture.
+  //  - `no_peel` suppresses exactly one further trailing-row peel: the caller
+  //    already took the last row and this level's head groups with omega, so
+  //    upstream's next division is the column dispatch, not another split.
   LamPtr gmatch(std::vector<LamPtr> comps, std::vector<MRow> rows,
-                const Location& mloc, int deid, std::vector<GmDef> denv = {}) {
+                const Location& mloc, int deid, std::vector<GmDef> denv = {},
+                bool no_peel = false) {
     // matching.ml's split_and_precompile guard barrier, in the specific shape that
     // must run BEFORE the gm_facc field-column materialization below.  After a
     // cons/Some dispatch decomposes the scrutinee into head/tail field columns, a
@@ -12485,7 +12503,8 @@ struct Translator {
         if (rw.aid >= 0 && !gm_exit_opaque_.count(rw.aid))
           gm_exit_opaque_[rw.aid] = rw.guard || !rhs_transparent(rw.rhs);
       comps[0] = varof(v);
-      LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(denv));
+      LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(denv),
+                        no_peel);
       if (!r) return nullptr;
       int n = count_var(r, v);
       if (n == 0) return r;
@@ -12559,22 +12578,23 @@ struct Translator {
           if (i + 1 < rows.size()) rows.resize(i + 1);
           break;
         }
-    if (rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
+    if (!no_peel && rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
       int e = ++next_exit_;
       size_t W = comps.size();
+      bool groups = gm_head_groups_omega(rows);
       MRow last = std::move(rows.back());
       rows.pop_back();
       std::vector<LamPtr> hcomps = comps;
       LamPtr main;
       if (denv.empty()) {
-        main = gmatch(std::move(comps), std::move(rows), mloc, e);
+        main = gmatch(std::move(comps), std::move(rows), mloc, e, {}, groups);
       } else {
         // The popped row is a pending chunk NEARER than the existing entries:
         // cons its (all-omega) matrix on top so misses in `main` still reach
         // it first; `deid` stays the final exit underneath.
         std::vector<GmDef> me = denv;
         me.insert(me.begin(), {e, {std::vector<const Pattern*>(W, nullptr)}});
-        main = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(me));
+        main = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(me), groups);
       }
       if (!main) return nullptr;
       LamPtr hb = gmatch(std::move(hcomps), {std::move(last)}, mloc, deid, std::move(denv));
