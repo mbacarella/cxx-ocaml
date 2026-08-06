@@ -11698,7 +11698,12 @@ struct Translator {
     std::vector<int> k; comp_clusters(cases, k);
     std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
     make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
-    if (made_switch) return nullptr;   // a jump table over lengths: not modelled
+    // Unlike the two constant/tag switchers above, a dense run of lengths DOES
+    // become make_switch's jump table here: combine_array's caller has no flat
+    // Lswitch to fall back on, so declining one bails the WHOLE match to the
+    // and-chain (`(if (== (array.length ..) 1) .. )`) instead of `catch` +
+    // `switch*` over the length.
+    (void)made_switch;
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     rewrite_default_leaves(tree, fail_exit, nullptr);
     return tree;
@@ -13292,6 +13297,7 @@ struct Translator {
         // Per-length cells, in first-occurrence row order (stamp-stable); each
         // binds its elements before the sub-match, as get_expr_args_array does.
         std::vector<std::pair<int, LamPtr>> cells;
+        std::set<int> elem_ids;              // every element binder, for the dead-let pass
         for (int L : lens) {
           std::vector<MRow> sub;
           for (auto& r : rows) {
@@ -13327,6 +13333,7 @@ struct Translator {
             auto bl = mk(Lam::K::Let);
             bl->bindings = {{eids[j], ValueKind::Gen, get, false, false, /*strict_opt=*/true}};
             bl->body = cb; cb = bl;
+            elem_ids.insert(eids[j].stamp);
           }
           cells.push_back({L, cb});
         }
@@ -13363,6 +13370,7 @@ struct Translator {
             c->cond = chain; c->prim_arg = cdflt; c->then_ = dbody; chain = c;
           }
         }
+        drop_dead_elem_lets(chain, elem_ids);
         return chain;
       }
     }
@@ -14489,6 +14497,30 @@ struct Translator {
     for (auto& b : l->bindings) renum_exit(b.val, from, to);
     for (auto& sc : l->sw_consts) renum_exit(sc.body, from, to);
     for (auto& sc : l->sw_blocks) renum_exit(sc.body, from, to);
+  }
+  // simplify_lets drops a StrictOpt binder read zero times (simplif.ml:573), so
+  // an array element no cell body reads leaves no `array.unsafe_get` behind.
+  // This runs AFTER the length Switcher, not before: the store that dedups two
+  // lengths' actions (as_interval_canfail's `act_store`) sees the RAW cells, and
+  // `[|_|] | [|_;_|]` reaches it as one-let and two-let bodies, i.e. two distinct
+  // actions -- dropping first would merge them and cost the jump table.
+  static void drop_dead_elem_lets(LamPtr& l, const std::set<int>& ids) {
+    if (!l) return;
+    while (l->k == Lam::K::Let && l->bindings.size() == 1 &&
+           ids.count(l->bindings[0].id.stamp) &&
+           count_var(l->body, l->bindings[0].id) == 0)
+      l = l->body;
+    if (!l || l->k == Lam::K::Function) return;
+    drop_dead_elem_lets(l->fn, ids);
+    drop_dead_elem_lets(l->cond, ids);
+    drop_dead_elem_lets(l->then_, ids);
+    drop_dead_elem_lets(l->else_, ids);
+    drop_dead_elem_lets(l->body, ids);
+    drop_dead_elem_lets(l->sw_default, ids);
+    for (auto& a : l->args) drop_dead_elem_lets(a, ids);
+    for (auto& b : l->bindings) drop_dead_elem_lets(b.val, ids);
+    for (auto& sc : l->sw_consts) drop_dead_elem_lets(sc.body, ids);
+    for (auto& sc : l->sw_blocks) drop_dead_elem_lets(sc.body, ids);
   }
   // Whether every `(exit id ..)` bound at THIS level is argument-free, i.e. the
   // exit can be re-raised by a handler that binds nothing.
