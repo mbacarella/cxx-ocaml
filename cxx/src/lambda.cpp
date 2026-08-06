@@ -12534,6 +12534,23 @@ struct Translator {
       if (!r) return nullptr;
       int n = count_var(r, v);
       if (n == 0) return r;
+      // A MUTABLE field column is bound RIGHT HERE, StrictOpt, and is never
+      // substituted or lowered: get_expr_args_record maps Immutable -> Alias but
+      // Mutable -> StrictOpt, and bind_check sends StrictOpt straight to `bind`
+      // (only Alias, an immutable read, goes through lower_bind).  Simplif never
+      // inlines a mutable read either, so the binding stands even at ONE use and
+      // even when it feeds a direct `if`.  Binding at THIS level -- the level
+      // where the column reached the head, i.e. upstream's own arg_to_var point
+      // -- is what puts the let inside the branch that dispatches it, and what
+      // makes two sibling sub-matches each re-read the field rather than share
+      // one hoisted binding.
+      if (mutfield_reads_.count(proto.get())) {
+        auto l = mk(Lam::K::Let);
+        l->bindings = {{v, ValueKind::Gen, clone_facc(proto), false, false,
+                        /*strict_opt=*/true}};
+        l->body = r;
+        return l;
+      }
       // A single use that is an arm exit's ARG is not upstream's count-1 case:
       // the handler behind the exit may use the param many times (Simplif then
       // keeps the Alias let where lower_bind put it) -- so keep the let,
@@ -12650,39 +12667,6 @@ struct Translator {
     auto c = mk(Lam::K::Catch);
     c->cond = main; c->prim_arg = e; c->then_ = hb; c->gm_chunk = true;
     return c;
-  }
-  // A MUTABLE record-field column was materialized as `id` (a pre-bound read
-  // can't be re-materialized per half-match without changing which value is
-  // seen); `cb` is the compiled sub-match.  Decide how ocamlc binds it.
-  //
-  // A mutable read that serves as a DISCRIMINANT (tested against a
-  // constant/constructor in some row) is bound StrictOpt (`=o`, Gen kind) and kept
-  // even when used ONCE: ocamlc reads the discriminant before an arm can setfield
-  // it and never inlines a mutable read past that mutation (mirrors wrap_binders'
-  // mutable-binder rule).  Without this get_docstring's discriminant
-  // `field_int 2 ds` (mutable ds_attached, tested `= Info`) inlined into its lone
-  // `!=` test.  When the column is only ever bound to a plain variable
-  // (`{ty = ty}`) it is NOT a discriminant -- ocamlc binds the user name directly
-  // (`ty = field_mut`), so keep the alias/inline path there (else typecore's `ty`
-  // binding churns to an anon `*match*`).
-  LamPtr gm_bind_mut_col(LamPtr cb, const FieldInfo& fi, const Ident& id,
-                         const LamPtr& scrut, bool discriminated) {
-    LamPtr fread = field_read(&fi, scrut);
-    // No exception for a field feeding a DIRECT `if`/`switch` condition: upstream's
-    // bind_check sends StrictOpt straight to `bind` (only Alias -- an immutable
-    // read -- goes through lower_bind), and Simplif never inlines a mutable read,
-    // so `(if (field_mut 0 m) ..)` is `(let (v =o (field_mut 0 m)) (if v ..))` all
-    // the same.  We used to carve one out; it cost ctype/matching raw lines.
-    int uses = max_path_count_var(cb, id);
-    if (discriminated && uses >= 1) {
-      auto l = mk(Lam::K::Let);
-      l->bindings = {{id, ValueKind::Gen, fread, false, false, /*strict_opt=*/true}};
-      l->body = cb; return l;
-    }
-    if (uses <= 1) { subst_alias(cb, id, fread); return cb; }
-    auto l = mk(Lam::K::Let);
-    l->bindings = {{id, fi.kind, fread, true}};
-    l->body = cb; return l;
   }
   LamPtr gmatch_inner(std::vector<LamPtr> comps, std::vector<MRow> rows,
                       const Location& mloc, int deid, std::vector<GmDef> denv = {}) {
@@ -13179,21 +13163,16 @@ struct Translator {
         for (auto& [ix, fi] : cols_fi) { order.push_back(ix); ofi.push_back(fi); }
         size_t nc = order.size();
         std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
-        // Immutable fields defer their read (gm_facc); MUTABLE fields keep the
-        // pre-bound var + max-path decision below (a mutable read can't be
-        // re-materialized per half-match without changing which value is seen).
-        std::vector<Ident> fids(nc);
-        std::vector<char> col_mut(nc, 0);
+        // EVERY field column defers its read (gm_facc), mutable ones included:
+        // upstream's compile_match_nonempty binds only its FIRST arg (arg_to_var
+        // + bind_match_arg) and leaves the rest raw, so each column materializes
+        // at the level where it becomes the head.  field_read marks a mutable
+        // read, which turns that materialization into a StrictOpt `bind`.
         std::vector<LamPtr> ncomps;
         for (size_t j = 0; j < nc; ++j) {
-          if (ofi[j].mut) {
-            col_mut[j] = 1; fids[j] = fresh("", true);
-            ncomps.push_back(varof(fids[j]));
-          } else {
-            LamPtr f = field_read(&ofi[j], comps[0]);
-            f->gm_facc = true; f->gm_facc_kind = ofi[j].kind;
-            ncomps.push_back(f);
-          }
+          LamPtr f = field_read(&ofi[j], comps[0]);
+          f->gm_facc = true; f->gm_facc_kind = ofi[j].kind;
+          ncomps.push_back(f);
         }
         ncomps.insert(ncomps.end(), rest.begin(), rest.end());
         static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
@@ -13213,21 +13192,7 @@ struct Translator {
           nr.cols.insert(nr.cols.end(), rows[ri].cols.begin() + 1, rows[ri].cols.end());
           sub.push_back(std::move(nr));
         }
-        LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, deid);
-        if (!cb) return nullptr;
-        for (int j = (int)nc - 1; j >= 0; --j) {
-          if (!col_mut[j]) continue;
-          bool discriminated = false;
-          for (size_t ri = 0; ri < rows.size() && !discriminated; ++ri) {
-            auto it = rowmap[ri].find(order[j]);
-            if (it != rowmap[ri].end() &&
-                !std::get_if<Ppat_var>(&it->second->desc) &&
-                !std::holds_alternative<Ppat_any>(it->second->desc))
-              discriminated = true;
-          }
-          cb = gm_bind_mut_col(cb, ofi[j], fids[j], comps[0], discriminated);
-        }
-        return cb;
+        return gmatch(std::move(ncomps), std::move(sub), mloc, deid);
       }
     }
     // Nested ARRAY column (matching.ml's divide_array/combine_array): bind the
@@ -13968,43 +13933,6 @@ struct Translator {
       const auto& rlab = bi->second->rlabels;
       bool inl = !rlab.empty();
       int a = inl ? (int)rlab.size() : bi->second->arity;
-      // A MUTABLE label column that is a DISCRIMINANT (tested against a
-      // constant/constructor in some row, not merely bound) is materialized
-      // instead of deferred, exactly as the nested-record column above does: an
-      // inline record's sub-match IS a divide_record (get_expr_args_constr's
-      // `cstr_inlined <> None` branch hands it the block itself), so
-      // get_expr_args_record's StrictOpt binding rule applies here too.  But a
-      // label some row names -- a var or an ALIAS (`FKvar {field_kind =
-      // FKvar _ | FKpublic | FKabsent as fk}`) -- stays DEFERRED: upstream's
-      // arg_to_var calls name_pattern, which reuses the pattern's own identifier
-      // rather than minting `*match*`, and our deferred path already yields that
-      // (`fk =a (field_mut 0 kind)`).  Materializing it there instead produces an
-      // anon binder plus an exit argument.
-      std::vector<Ident> mfids(a);
-      std::vector<char> mcol(a, 0);
-      std::vector<FieldInfo> mfi(a);
-      std::vector<char> mdisc(a, 0), mnamed(a, 0);
-      if (inl) {
-        for (auto& r : rows) {
-          auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
-          if (!k) continue;
-          const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
-          if (!ci->is_block || ci->tag != t) continue;
-          const Pattern* ap = k->arg ? effective_pat(k->arg->get()) : nullptr;
-          auto* pr = ap ? std::get_if<Ppat_record>(&ap->desc) : nullptr;
-          if (!pr) continue;
-          for (size_t j2 = 0; j2 < rlab.size(); ++j2)
-            for (auto& [l, s2] : pr->fields)
-              if (lid_last(l.txt) == rlab[j2]) {
-                const Pattern* fp = effective_pat(s2.get());
-                if (std::get_if<Ppat_var>(&fp->desc) || std::get_if<Ppat_alias>(&fp->desc))
-                  mnamed[j2] = 1;
-                else if (!std::holds_alternative<Ppat_any>(fp->desc))
-                  mdisc[j2] = 1;
-                break;
-              }
-        }
-      }
       std::vector<LamPtr> ncomps;                        // deferred field reads
       for (int j = 0; j < a; ++j) {
         // An inline-record field is read as a RECORD field, at the label's own
@@ -14019,11 +13947,10 @@ struct Translator {
             j < (int)bi->second->rshape.size()) {
           FieldInfo fi{bi->second->type, j, bi->second->rfmut[j],
                        bi->second->rshape[j]};
-          if (fi.mut && mdisc[j] && !mnamed[j] && comps[0]->k == Lam::K::Var) {
-            mcol[j] = 1; mfi[j] = fi; mfids[j] = fresh("", true);
-            ncomps.push_back(varof(mfids[j]));
-            continue;
-          }
+          // An inline record's sub-match IS a divide_record (get_expr_args_constr's
+          // `cstr_inlined <> None` branch hands it the block itself), so a MUTABLE
+          // label carries get_expr_args_record's StrictOpt rule -- field_read marks
+          // the node and the gm_facc materialization binds it where it dispatches.
           f = field_read(&fi, comps[0]);
         } else {
           f = fieldimm(j, comps[0]);
@@ -14111,12 +14038,8 @@ struct Translator {
       // `inl`: the label columns above replace TWO upstream pm levels (the
       // block-itself sub-match and the divide_record under it).  The outer one
       // binds nothing and splits -- see gmatch's peel_first.
-      LamPtr cb = gmatch(std::move(ncomps), std::move(sub), mloc, deid, std::move(de),
-                         /*no_peel=*/false, /*peel_first=*/inl && last_payload_omega);
-      if (!cb) return nullptr;
-      for (int j = a - 1; j >= 0; --j)
-        if (mcol[j]) cb = gm_bind_mut_col(cb, mfi[j], mfids[j], comps[0], /*discriminated=*/true);
-      return cb;
+      return gmatch(std::move(ncomps), std::move(sub), mloc, deid, std::move(de),
+                    /*no_peel=*/false, /*peel_first=*/inl && last_payload_omega);
     };
     // The argument binds upstream's cell for a tag carries: none for a constant
     // ctor, and none for a GAP tag (reached only by the var rows, so upstream
@@ -14425,6 +14348,11 @@ struct Translator {
   LamPtr expand_facc_var(const Ident& v) {
     auto it = gm_facc_proto_.find(v.stamp);
     if (it == gm_facc_proto_.end()) return nullptr;
+    // Never re-read a MUTABLE field at a handler: the arm that exits there may
+    // have set it, so the second read need not see the value the dispatch did.
+    // Such a column is always bound (the StrictOpt bind above), so the handler
+    // takes the binding as an exit argument instead.
+    if (mutfield_reads_.count(it->second.get())) return nullptr;
     LamPtr c = clone_facc(it->second);
     expand_faccs_in(c);
     return c;
