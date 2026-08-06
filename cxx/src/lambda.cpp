@@ -13973,9 +13973,21 @@ struct Translator {
           if (!ci->is_block || ci->tag != t) continue;
           std::vector<const Pattern*> fps;
           const std::string* whole = nullptr;   // `K x`: x names the block itself
+          std::vector<const std::string*> als;  // `K (P as r)`: r names it too
           last_payload_omega = false;
           if (inl) {
             const Pattern* ap = k->arg ? effective_pat(k->arg->get()) : nullptr;
+            // `K (P as r)`: upstream's half-simplification strips the alias and
+            // Alias-binds r to the arg (bind_alias, matching.ml:159) -- for an
+            // inline record, the block ITSELF.  Peel it here the same way so the
+            // record split below sees P; Simplif drops the bind when r is unused.
+            while (ap) {
+              auto* pa = std::get_if<Ppat_alias>(&ap->desc);
+              if (!pa) break;
+              als.push_back(&pa->name.txt);
+              ap = effective_pat(pa->p.get());
+            }
+            if (!als.empty() && comps[0]->k != Lam::K::Var) return nullptr;
             auto* pr = ap ? std::get_if<Ppat_record>(&ap->desc) : nullptr;
             if (!pr) {
               // `K _` (or no arg): every inline-record field is a wildcard -- span
@@ -14016,6 +14028,10 @@ struct Translator {
             // remember the ctor so `x.label` in the arm resolves through rlabels
             // (an ambiguous label find_field would bail on), as the fallback
             // constructor path does for the same shape
+            inline_rec_var_[comps[0]->var.stamp] = ci;
+          }
+          for (auto* an : als) {
+            nr.binds.push_back({*an, comps[0]->var});
             inline_rec_var_[comps[0]->var.stamp] = ci;
           }
           for (auto* fp : fps) nr.cols.push_back(fp);
