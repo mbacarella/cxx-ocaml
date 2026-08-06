@@ -12420,9 +12420,35 @@ struct Translator {
   //  - `no_peel` suppresses exactly one further trailing-row peel: the caller
   //    already took the last row and this level's head groups with omega, so
   //    upstream's next division is the column dispatch, not another split.
+  //  - `peel_first` runs one trailing-row peel BEFORE this level's column bind:
+  //    the caller collapsed two upstream pm levels into one and the outer of the
+  //    two binds nothing, so its split belongs outside the bind (see below).
   LamPtr gmatch(std::vector<LamPtr> comps, std::vector<MRow> rows,
                 const Location& mloc, int deid, std::vector<GmDef> denv = {},
-                bool no_peel = false) {
+                bool no_peel = false, bool peel_first = false) {
+    // An INLINE-RECORD constructor arm has an extra upstream pm level between the
+    // constructor dispatch and the record decomposition: get_expr_args_constr's
+    // `cstr_inlined <> None` branch (matching.ml:2053) hands the sub-match the
+    // block ITSELF, so compile_match_nonempty's arg_to_var finds an Lvar and
+    // returns it -- that level binds NOTHING, runs split_and_precompile, and only
+    // the divide_record under it mints a `*match*`.  block_body splits the labels
+    // into columns in one step, so unless that split runs here, before this
+    // level's own column bind, the bind wraps the catch where ocamlc puts it
+    // inside (`(catch (let *match* = field 0 .. ) with (n) ..)`).  The remaining
+    // rows then enter the decomposed level normally -- its own bind, its own
+    // split -- which is why `no_peel_main` is false.
+    //   Skipped when the leading row is guarded (the guard-barrier division just
+    // below owns that shape) or when an earlier row is already an unguarded
+    // catch-all (the rows after it are dead; the truncation below drops them).
+    if (peel_first && rows.size() >= 2 && !comps.empty() && !rows[0].guard &&
+        row_all_var(rows.back())) {
+      bool dead_tail = false;
+      for (size_t i = 0; i + 1 < rows.size(); ++i)
+        if (!rows[i].guard && row_all_var(rows[i])) { dead_tail = true; break; }
+      if (!dead_tail)
+        return gm_peel_last(std::move(comps), std::move(rows), mloc, deid,
+                            std::move(denv), false);
+    }
     // matching.ml's split_and_precompile guard barrier, in the specific shape that
     // must run BEFORE the gm_facc field-column materialization below.  After a
     // cons/Some dispatch decomposes the scrutinee into head/tail field columns, a
@@ -12579,42 +12605,51 @@ struct Translator {
           break;
         }
     if (!no_peel && rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
-      int e = ++next_exit_;
-      size_t W = comps.size();
-      bool groups = gm_head_groups_omega(rows);
-      MRow last = std::move(rows.back());
-      rows.pop_back();
-      std::vector<LamPtr> hcomps = comps;
-      LamPtr main;
-      if (denv.empty()) {
-        main = gmatch(std::move(comps), std::move(rows), mloc, e, {}, groups);
-      } else {
-        // The popped row is a pending chunk NEARER than the existing entries:
-        // cons its (all-omega) matrix on top so misses in `main` still reach
-        // it first; `deid` stays the final exit underneath.
-        std::vector<GmDef> me = denv;
-        me.insert(me.begin(), {e, {std::vector<const Pattern*>(W, nullptr)}});
-        main = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(me), groups);
-      }
-      if (!main) return nullptr;
-      LamPtr hb = gmatch(std::move(hcomps), {std::move(last)}, mloc, deid, std::move(denv));
-      if (!hb) return nullptr;
-      if (cppcaml::dbg_env("EAGERCHUNK")) {
-        int bad = 0; int uses = count_exit(main, e, false, bad);
-        if (uses == 0) return main;
-        if (uses == 1 && bad == 0) { inline_exit(main, e, {}, {}, hb); return main; }
-        auto c0 = mk(Lam::K::Catch);
-        c0->cond = main; c0->prim_arg = e; c0->then_ = hb;
-        return c0;
-      }
-      // Keep the chunk catch through construction (single-use inlining is
-      // deferred to inline_chunk_catches): upstream's lower_bind runs against
-      // the Lstaticcatch, so enclosing column binds must not sink past it.
-      auto c = mk(Lam::K::Catch);
-      c->cond = main; c->prim_arg = e; c->then_ = hb; c->gm_chunk = true;
-      return c;
+      bool groups = gm_head_groups_omega(rows);   // before the move: arg order is unspecified
+      return gm_peel_last(std::move(comps), std::move(rows), mloc, deid, std::move(denv),
+                          groups);
     }
     return gmatch_inner(std::move(comps), std::move(rows), mloc, deid, std::move(denv));
+  }
+  // split_no_or's singleton-row division on its own: take the trailing
+  // all-variable row as this pm's shared default and compile the rest against
+  // its exit.  `no_peel_main` is the flag the remaining rows are compiled with.
+  LamPtr gm_peel_last(std::vector<LamPtr> comps, std::vector<MRow> rows,
+                      const Location& mloc, int deid, std::vector<GmDef> denv,
+                      bool no_peel_main) {
+    int e = ++next_exit_;
+    size_t W = comps.size();
+    MRow last = std::move(rows.back());
+    rows.pop_back();
+    std::vector<LamPtr> hcomps = comps;
+    LamPtr main;
+    if (denv.empty()) {
+      main = gmatch(std::move(comps), std::move(rows), mloc, e, {}, no_peel_main);
+    } else {
+      // The popped row is a pending chunk NEARER than the existing entries:
+      // cons its (all-omega) matrix on top so misses in `main` still reach
+      // it first; `deid` stays the final exit underneath.
+      std::vector<GmDef> me = denv;
+      me.insert(me.begin(), {e, {std::vector<const Pattern*>(W, nullptr)}});
+      main = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(me), no_peel_main);
+    }
+    if (!main) return nullptr;
+    LamPtr hb = gmatch(std::move(hcomps), {std::move(last)}, mloc, deid, std::move(denv));
+    if (!hb) return nullptr;
+    if (cppcaml::dbg_env("EAGERCHUNK")) {
+      int bad = 0; int uses = count_exit(main, e, false, bad);
+      if (uses == 0) return main;
+      if (uses == 1 && bad == 0) { inline_exit(main, e, {}, {}, hb); return main; }
+      auto c0 = mk(Lam::K::Catch);
+      c0->cond = main; c0->prim_arg = e; c0->then_ = hb;
+      return c0;
+    }
+    // Keep the chunk catch through construction (single-use inlining is
+    // deferred to inline_chunk_catches): upstream's lower_bind runs against
+    // the Lstaticcatch, so enclosing column binds must not sink past it.
+    auto c = mk(Lam::K::Catch);
+    c->cond = main; c->prim_arg = e; c->then_ = hb; c->gm_chunk = true;
+    return c;
   }
   LamPtr gmatch_inner(std::vector<LamPtr> comps, std::vector<MRow> rows,
                       const Location& mloc, int deid, std::vector<GmDef> denv = {}) {
@@ -13961,6 +13996,11 @@ struct Translator {
       ncomps.insert(ncomps.end(), rest.begin(), rest.end());
       static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
       std::vector<MRow> sub;
+      // Whether the LAST row we appended was omega at the still-UNDECOMPOSED
+      // payload column (`K _`/`K x`, or a var row spread in) -- split_no_or's
+      // singleton rule reads that column, not the label columns we split it
+      // into, so `K {l = p}` with every `p` a variable is NOT a peelable row.
+      bool last_payload_omega = false;
       for (auto& r : rows) {
         auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
         if (k) {
@@ -13968,6 +14008,7 @@ struct Translator {
           if (!ci->is_block || ci->tag != t) continue;
           std::vector<const Pattern*> fps;
           const std::string* whole = nullptr;   // `K x`: x names the block itself
+          last_payload_omega = false;
           if (inl) {
             const Pattern* ap = k->arg ? effective_pat(k->arg->get()) : nullptr;
             auto* pr = ap ? std::get_if<Ppat_record>(&ap->desc) : nullptr;
@@ -13984,6 +14025,7 @@ struct Translator {
                 whole = &pv->name.txt;
               }
               for (size_t j = 0; j < rlab.size(); ++j) fps.push_back(&any_pat);
+              last_payload_omega = true;
             } else
               for (size_t j2 = 0; j2 < rlab.size(); ++j2) {
                 const std::string& lbl = rlab[j2];
@@ -14022,12 +14064,17 @@ struct Translator {
           for (int j = 0; j < a; ++j) nr.cols.push_back(&any_pat);
           nr.cols.insert(nr.cols.end(), r.cols.begin() + 1, r.cols.end());
           sub.push_back(std::move(nr));
+          last_payload_omega = true;
         }
       }
       std::vector<GmDef> de = denv;
       if (!denv_spec_ctor(de, type, /*is_block=*/true, t, a, inl ? &rlab : nullptr))
         return nullptr;
-      return gmatch(std::move(ncomps), std::move(sub), mloc, deid, std::move(de));
+      // `inl`: the label columns above replace TWO upstream pm levels (the
+      // block-itself sub-match and the divide_record under it).  The outer one
+      // binds nothing and splits -- see gmatch's peel_first.
+      return gmatch(std::move(ncomps), std::move(sub), mloc, deid, std::move(de),
+                    /*no_peel=*/false, /*peel_first=*/inl && last_payload_omega);
     };
     // The argument binds upstream's cell for a tag carries: none for a constant
     // ctor, and none for a GAP tag (reached only by the var rows, so upstream
