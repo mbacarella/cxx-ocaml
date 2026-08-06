@@ -24824,7 +24824,24 @@ struct Translator {
   // and the same Lambda shapes as coerce_block, so lambda-parity does not churn).
   // Returns nullptr when a field cannot be replayed here (a required prim stub or
   // module alias is unavailable) so the caller falls back to the legacy path.
-  LamPtr apply_msig_coercion(const LamPtr& mv, const modsig::Coercion& c) {
+  // A pure projection -- a var or a chain of field reads rooted at one.  Only
+  // such a value may be moved into the single field that reads it (below).
+  static bool pure_field_projection(const LamPtr& l, int depth = 0) {
+    if (!l || depth > 16) return false;
+    if (l->k == Lam::K::Var) return true;
+    if (l->k == Lam::K::Prim && l->args.size() == 1 &&
+        (l->prim == Prim::FieldMut || l->prim == Prim::FieldImm ||
+         l->prim == Prim::FieldInt))
+      return pure_field_projection(l->args[0], depth + 1);
+    return false;
+  }
+  // `alias`: upstream's apply_coercion_field applies a SUB-coercion with ALIAS
+  // strictness (translmod.ml:110), and Simplif's Alias rule drops the binder
+  // when the target reads it zero times and SUBSTITUTES it when exactly one
+  // field reads it -- so a one-field submodule coercion prints as nested field
+  // reads, not as a let.  Our general path binds Strict, which never inlines.
+  LamPtr apply_msig_coercion(const LamPtr& mv, const modsig::Coercion& c,
+                             bool alias = false) {
     if (!c.ok) return nullptr;
     if (c.identity) return mv;
     // FUSION: mv is `(let <binds> (makeblock 0 v0 v1 ..))` with pure fields ->
@@ -24856,6 +24873,27 @@ struct Translator {
             return lt;
           }
         }
+      }
+    }
+    // Alias sub-coercion read at most once: Simplif substitutes/drops the let.
+    if (alias && pure_field_projection(mv)) {
+      int reads = 0;
+      for (auto& f : c.fields)
+        if (f.from == modsig::Coercion::Field::From::SrcField) ++reads;
+      if (reads <= 1) {
+        std::vector<LamPtr> fs;
+        bool all = true;
+        for (auto& f : c.fields) {
+          LamPtr fr = coerce_field_value(f, mv);
+          if (!fr) { all = false; break; }
+          fs.push_back(fr);
+        }
+        if (all) {
+          auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock;
+          blk->prim_arg = 0; blk->args = std::move(fs);
+          return blk;
+        }
+        return nullptr;
       }
     }
     // General case: bind mv, project each target field by field_mut read.
@@ -24948,7 +24986,7 @@ struct Translator {
     fr->prim_arg = f.src_pos; fr->args = {block_var};
     if (f.functor_eta && f.sub)
       return functor_eta_wrap(fr, *f.sub, f.functor_arg);
-    if (f.sub) return apply_msig_coercion(fr, *f.sub);
+    if (f.sub) return apply_msig_coercion(fr, *f.sub, /*alias=*/true);
     return fr;
   }
   // Overload: read the source field directly from an already-materialised vector
@@ -24967,7 +25005,7 @@ struct Translator {
     LamPtr v = src_fields[f.src_pos];
     if (f.functor_eta && f.sub)
       return functor_eta_wrap(v, *f.sub, f.functor_arg);
-    if (f.sub) return apply_msig_coercion(v, *f.sub);
+    if (f.sub) return apply_msig_coercion(v, *f.sub, /*alias=*/true);
     return v;
   }
   // A module-constraint `(me : S)` coercion via the computed path: src Sig from
