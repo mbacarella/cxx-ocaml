@@ -193,6 +193,9 @@ struct Coercion {
     bool functor_eta = false;  // Tcoerce_functor: `sub` coerces the applied
                                // RESULT; replay eta-expands instead of
                                // projecting fields off the (closure) value
+    CoercionPtr functor_arg;   // Tcoerce_functor cc_arg: coerces the wrapper's
+                               // funarg (declared param layout) down to the
+                               // implementation's parameter layout (else null)
   };
   std::vector<Field> fields;
   bool identity = false;  // src == tgt field-for-field AND same runtime length
@@ -239,6 +242,21 @@ inline bool layout_complete(const Sig& s, int depth = 0) {
   return true;
 }
 
+// A coercion replayable as pure field selection: every field reads a source
+// field, recursing into submodule sub-coercions.  Prim stubs, alias
+// materialization and nested functor etas need translator state at the replay
+// site, so an ARGUMENT coercion (replayed on a bare funarg) is only carried
+// when it avoids them.
+inline bool pure_projection(const Coercion& c, int depth = 0) {
+  if (depth > 24) return false;
+  for (auto& f : c.fields) {
+    if (f.from != Coercion::Field::From::SrcField || f.functor_eta)
+      return false;
+    if (f.sub && !pure_projection(*f.sub, depth + 1)) return false;
+  }
+  return true;
+}
+
 // Compute the coercion that builds `tgt`'s runtime block from `src`'s, matching
 // includemod.signatures.  Non-runtime target items (types, modtypes, class
 // types, primitives, absent aliases) take no field and are skipped WITHOUT a
@@ -272,11 +290,26 @@ inline Coercion compute_coercion(const Sig& src, const Sig& tgt, int depth = 0) 
         // consumer read the raw result at the restricted layout's offsets.
         // Layout-incomplete result Sigs (an unresolved local modtype) fall
         // through to the raw pass-through instead of a wrong projection.
+        CoercionPtr ac;
         if (s->functor_param && t.functor_param) {
+          // contravariant: the wrapper's funarg arrives at the DECLARED param
+          // layout and the raw functor reads the implementation's -- cc_arg
+          // builds the impl-layout block from the declared-layout funarg.
           Coercion pc = compute_coercion(*t.functor_param, *s->functor_param,
                                          depth + 1);
-          if (!pc.ok || !pc.identity) {
-            c.ok = false; c.error = t.name + "(param)"; return c;
+          if (!pc.ok) { c.ok = false; c.error = t.name + "(param)"; return c; }
+          if (!pc.identity) {
+            // carried only as a pure projection over complete, trusted param
+            // Sigs; anything else keeps the previous decline (legacy path)
+            if (!layout_complete(*s->functor_param) ||
+                !layout_complete(*t.functor_param) ||
+                !trusted(*s->functor_param, depth + 1) ||
+                !trusted(*t.functor_param, depth + 1) ||
+                !pure_projection(pc)) {
+              c.ok = false; c.error = t.name + "(param)"; return c;
+            }
+            c.unknown_pairings += pc.unknown_pairings;
+            ac = std::make_shared<Coercion>(std::move(pc));
           }
         }
         Coercion rc = compute_coercion(*s->functor_result, *t.functor_result,
@@ -285,13 +318,15 @@ inline Coercion compute_coercion(const Sig& src, const Sig& tgt, int depth = 0) 
           c.ok = false; c.error = t.name + "()." + rc.error; return c;
         }
         c.unknown_pairings += rc.unknown_pairings;
-        if (!rc.identity) {
-          if (!trusted(*s->functor_result, depth + 1) ||
-              !trusted(*t.functor_result, depth + 1)) {
+        if (!rc.identity || ac) {
+          if (!rc.identity &&
+              (!trusted(*s->functor_result, depth + 1) ||
+               !trusted(*t.functor_result, depth + 1))) {
             c.ok = false; c.error = t.name + "(untrusted)"; return c;
           }
           f.functor_eta = true;
           f.sub = std::make_shared<Coercion>(std::move(rc));
+          f.functor_arg = std::move(ac);
         }
       }
     } else if (s->is_prim) {  // external (no slot) exposed as a val: eta-stub it

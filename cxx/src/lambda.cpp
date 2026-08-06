@@ -24873,22 +24873,42 @@ struct Translator {
     lt->body = blk;
     return lt;
   }
+  // Tcoerce_functor cc_arg replay: the wrapper's funarg is a bare var, so
+  // upstream's apply_coercion (Tcoerce_structure through name_lambda) projects
+  // it with NO binder -- `(makeblock 0 (field_mut i funarg) ..)`.
+  LamPtr coerce_funarg(const Ident& pa, const modsig::Coercion& cc) {
+    std::vector<LamPtr> fs;
+    for (auto& f : cc.fields) {
+      LamPtr fv = coerce_field_value(f, varof(pa));
+      if (!fv) return nullptr;
+      fs.push_back(fv);
+    }
+    auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
+    blk->args = std::move(fs);
+    return blk;
+  }
   // Tcoerce_functor replay (translmod.ml apply_coercion): eta-expand the raw
   // functor value -- `(function funarg is_a_functor <result coercion replayed
   // on (apply f funarg)>)`, name-binding f as an ALIAS when it is not already
   // a variable.  ocamlc creates the param ident before that binder; the
   // stamp-sensitive effid diff observes the order.
-  LamPtr functor_eta_wrap(const LamPtr& fval, const modsig::Coercion& res) {
+  LamPtr functor_eta_wrap(const LamPtr& fval, const modsig::Coercion& res,
+                          const modsig::CoercionPtr& arg0 = nullptr) {
     // A MULTI-parameter functor's coercion arrives as a marker chain (one
     // single-field kFunctorMarker level per remaining parameter).  ocamlc's
     // apply_coercion_result accumulates the params and emits ONE flattened
     // n-ary wrapper -- all funargs created (outer first) before the binder.
+    // Each level may carry a cc_arg coercing that level's funarg.
     std::vector<Ident> pas;
+    std::vector<const modsig::Coercion*> acs;
     pas.push_back(fresh("funarg"));
+    acs.push_back(arg0 && !arg0->identity ? arg0.get() : nullptr);
     const modsig::Coercion* r = &res;
     while (r->fields.size() == 1 && r->fields[0].functor_eta &&
            r->fields[0].sub && r->fields[0].name == kFunctorMarker) {
       pas.push_back(fresh("funarg"));
+      const modsig::CoercionPtr& la = r->fields[0].functor_arg;
+      acs.push_back(la && !la->identity ? la.get() : nullptr);
       r = r->fields[0].sub.get();
     }
     bool direct = fval->k == Lam::K::Var;
@@ -24896,7 +24916,11 @@ struct Translator {
     if (!direct) fid = fresh("let");
     auto ap = mk(Lam::K::Apply);
     ap->fn = direct ? fval : varof(fid);
-    for (auto& pa : pas) ap->args.push_back(varof(pa));
+    for (size_t ai = 0; ai < pas.size(); ++ai) {
+      LamPtr av = acs[ai] ? coerce_funarg(pas[ai], *acs[ai]) : varof(pas[ai]);
+      if (!av) return nullptr;
+      ap->args.push_back(av);
+    }
     LamPtr body = apply_msig_coercion(ap, *r);
     if (!body) return nullptr;
     auto wf = mk(Lam::K::Function);
@@ -24922,7 +24946,8 @@ struct Translator {
     }
     auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
     fr->prim_arg = f.src_pos; fr->args = {block_var};
-    if (f.functor_eta && f.sub) return functor_eta_wrap(fr, *f.sub);
+    if (f.functor_eta && f.sub)
+      return functor_eta_wrap(fr, *f.sub, f.functor_arg);
     if (f.sub) return apply_msig_coercion(fr, *f.sub);
     return fr;
   }
@@ -24940,7 +24965,8 @@ struct Translator {
     }
     if (f.src_pos < 0 || f.src_pos >= (int)src_fields.size()) return nullptr;
     LamPtr v = src_fields[f.src_pos];
-    if (f.functor_eta && f.sub) return functor_eta_wrap(v, *f.sub);
+    if (f.functor_eta && f.sub)
+      return functor_eta_wrap(v, *f.sub, f.functor_arg);
     if (f.sub) return apply_msig_coercion(v, *f.sub);
     return v;
   }
@@ -25123,12 +25149,18 @@ struct Translator {
   // compile_functor), so its export wrapper needs n `funarg`s and an n-ary
   // apply (translmod's apply_coercion_result accumulates the params the same
   // way).  Recorded at gate time from the declaration's parameter count.
-  int pending_functor_eta_arity_ = 1;
   std::unordered_map<std::string, int> functor_export_eta_arity_;
   int functor_export_eta_arity(const std::string& nm) {
     auto it = functor_export_eta_arity_.find(nm);
     return it != functor_export_eta_arity_.end() ? it->second : 1;
   }
+  // Per-level ARGUMENT coercions for the export wrapper (Tcoerce_functor's
+  // cc_arg): outer-first, one slot per parameter, null = identity (funarg
+  // passed raw).  Recorded at gate time when a level's declared (.cmi) param
+  // layout differs from the .ml's but the contravariant projection is
+  // computable.
+  std::unordered_map<std::string, std::vector<modsig::CoercionPtr>>
+      functor_export_eta_argcc_;
   // When the .mli result has SUBMODULES the flat index map above cannot carry
   // their nested sub-coercions, so the eta path instead hands back the full
   // Includemod coercion (the SAME `cc` the fused-body path would apply, just
@@ -27074,11 +27106,18 @@ struct Translator {
               }
             }
             const cmi::Signature* mli_result_sig = pending_functor_coerce_sig_;
+            // Gate outputs consumed at the binding TAIL below.  LOCALS, not
+            // members: a nested functor binding inside the body runs this same
+            // tail and would clobber member state before the outer tail reads
+            // it (the S196 request-flag lesson).
+            int eta_arity = 1;
+            std::vector<modsig::CoercionPtr> eta_argcc;
             // Eta-placement gate (functor_export_eta_): ocamlc coerces a
             // restricted functor at the unit's EXPORT slot, keeping the body
             // raw.  Only for a shape we can prove safe: a TOP-LEVEL functor,
-            // ONE named param whose .ml layout equals the .cmi's (no argument
-            // coercion in the wrapper) and a plain structure body with no
+            // named params whose .ml layout equals the .cmi's (or differs by a
+            // computable argument projection the wrapper replays on the
+            // funarg) and a plain structure body with no
             // `external`s (their slots would need eta-stubs, not field reads).
             // A submodule-bearing result is allowed too: the eta path hands
             // back the full Includemod coercion instead of the flat index map,
@@ -27110,23 +27149,49 @@ struct Translator {
                     }
                 }
               bool param_same = false;
+              std::vector<modsig::CoercionPtr> arg_ccs;
               if (clean_body && has_mli_cmi_)
                 for (auto& md2 : mli_cmi_sig_.modules)
                   if (md2.name == *mb.name.txt) {
                     // lockstep: each declared param layout must equal the
-                    // .cmi's at the same level (no argument coercion in the
-                    // wrapper), and the arities must agree exactly.
+                    // .cmi's at the same level -- OR carry a computable
+                    // contravariant ARGUMENT projection (Tcoerce_functor's
+                    // cc_arg; the wrapper coerces that level's funarg down to
+                    // the .ml layout) -- and the arities must agree exactly.
                     const cmi::ModuleType* mt2 = md2.type.get();
                     param_same = mt2 && mt2->kind == cmi::ModuleType::Functor;
                     for (size_t pi2 = 0; param_same && pi2 < nps.size(); ++pi2) {
                       if (!mt2 || mt2->kind != cmi::ModuleType::Functor) {
                         param_same = false; break;
                       }
+                      arg_ccs.push_back(nullptr);
                       const cmi::ModuleType* pt = mt2->functor_param_type.get();
-                      if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
+                      if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig) {
                         param_same =
                             pt->sig->fields == sig_layout(*nps[pi2]->type);
-                      else if (pt && pt->kind == cmi::ModuleType::Ident &&
+                        if (!param_same) {
+                          // acceptance mirrors compute_coercion's functor
+                          // case exactly (complete + trusted param Sigs, pure
+                          // projection), keeping the computed unit coercion
+                          // in lockstep with the raw-body placement decided
+                          // here.
+                          modsig::SigPtr im = msig_of_modtype(*nps[pi2]->type);
+                          modsig::SigPtr dm = msig_of_cmi_signature(*pt->sig);
+                          if (im && dm && modsig::layout_complete(*im) &&
+                              modsig::layout_complete(*dm) &&
+                              modsig::trusted(*im) && modsig::trusted(*dm)) {
+                            modsig::Coercion pc2 =
+                                modsig::compute_coercion(*dm, *im);
+                            if (pc2.ok && !pc2.identity &&
+                                modsig::pure_projection(pc2)) {
+                              arg_ccs.back() =
+                                  std::make_shared<modsig::Coercion>(
+                                      std::move(pc2));
+                              param_same = true;
+                            }
+                          }
+                        }
+                      } else if (pt && pt->kind == cmi::ModuleType::Ident &&
                                pt->path) {
                         // a NAMED modtype param (`Id : Identifiable.S`): both
                         // sides citing the same dotted path resolve to the same
@@ -27149,7 +27214,8 @@ struct Translator {
                   }
               if (param_same) {
                 pending_functor_eta_request_ = true;
-                pending_functor_eta_arity_ = (int)nps.size();
+                eta_arity = (int)nps.size();
+                eta_argcc = std::move(arg_ccs);
               }
             }
             LamPtr fv = compile_module_expr(mb.expr);
@@ -27170,10 +27236,14 @@ struct Translator {
               pending_functor_eta_coerce_set_ = false;
               eta_fired = true;
             }
-            if (eta_fired)
-              functor_export_eta_arity_[*mb.name.txt] =
-                  pending_functor_eta_arity_;
-            pending_functor_eta_arity_ = 1;
+            if (eta_fired) {
+              functor_export_eta_arity_[*mb.name.txt] = eta_arity;
+              bool any_arg = false;
+              for (auto& a2 : eta_argcc)
+                if (a2) { any_arg = true; break; }
+              if (any_arg)
+                functor_export_eta_argcc_[*mb.name.txt] = std::move(eta_argcc);
+            }
             cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
             // When the .mli RESTRICTS this functor's result (the body has more
@@ -28010,6 +28080,7 @@ struct Translator {
                   functor_export_eta_coerce_.erase(f.name);
                   functor_export_eta_.erase(f.name);
                   functor_export_eta_arity_.erase(f.name);
+                  functor_export_eta_argcc_.erase(f.name);
                 }
             }
           }
@@ -28100,11 +28171,20 @@ struct Translator {
         if (fe == functor_export_eta_.end()) continue;
         auto wf = mk(Lam::K::Function); wf->inline_attr = "is_a_functor";
         auto ap2 = mk(Lam::K::Apply); ap2->fn = exports[wi];
-        for (int pk = functor_export_eta_arity(export_names[wi]); pk > 0; --pk) {
+        auto ac3 = functor_export_eta_argcc_.find(export_names[wi]);
+        int na = functor_export_eta_arity(export_names[wi]);
+        for (int pk = 0; pk < na; ++pk) {
           Ident pa = fresh("funarg");
           wf->params.push_back({pa, ValueKind::Gen});
-          ap2->args.push_back(varof(pa));
+          LamPtr av = nullptr;
+          if (ac3 != functor_export_eta_argcc_.end() &&
+              pk < (int)ac3->second.size() && ac3->second[pk] &&
+              !ac3->second[pk]->identity)
+            av = coerce_funarg(pa, *ac3->second[pk]);
+          ap2->args.push_back(av ? av : varof(pa));
         }
+        if (ac3 != functor_export_eta_argcc_.end())
+          functor_export_eta_argcc_.erase(ac3);
         Ident rr = fresh("let");
         std::vector<LamPtr> flds;
         for (int ix : fe->second) {
@@ -28131,11 +28211,20 @@ struct Translator {
         if (fe == functor_export_eta_coerce_.end()) continue;
         auto wf = mk(Lam::K::Function); wf->inline_attr = "is_a_functor";
         auto ap2 = mk(Lam::K::Apply); ap2->fn = exports[wi];
-        for (int pk = functor_export_eta_arity(export_names[wi]); pk > 0; --pk) {
+        auto ac3 = functor_export_eta_argcc_.find(export_names[wi]);
+        int na = functor_export_eta_arity(export_names[wi]);
+        for (int pk = 0; pk < na; ++pk) {
           Ident pa = fresh("funarg");
           wf->params.push_back({pa, ValueKind::Gen});
-          ap2->args.push_back(varof(pa));
+          LamPtr av = nullptr;
+          if (ac3 != functor_export_eta_argcc_.end() &&
+              pk < (int)ac3->second.size() && ac3->second[pk] &&
+              !ac3->second[pk]->identity)
+            av = coerce_funarg(pa, *ac3->second[pk]);
+          ap2->args.push_back(av ? av : varof(pa));
         }
+        if (ac3 != functor_export_eta_argcc_.end())
+          functor_export_eta_argcc_.erase(ac3);
         if (LamPtr body = apply_msig_coercion(ap2, fe->second)) {
           wf->body = body;
           exports[wi] = wf;
