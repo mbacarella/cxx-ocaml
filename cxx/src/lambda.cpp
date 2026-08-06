@@ -4301,6 +4301,47 @@ struct Translator {
       }
     }
   }
+  // A LOCAL functor's functor MEMBERS' first-parameter layouts (`module Define
+  // (D:..) = struct module type P = ..  module Simple (X : P) = .. end`), keyed
+  // by the functor's name then the member's.  `module Diff = Define(..)` copies
+  // them under "Diff.Simple" so the apply-site argument coercion sees the
+  // parameter layout -- the intra-unit analog of applied_result_functor_param.
+  std::unordered_map<std::string,
+                     std::unordered_map<std::string, std::vector<std::string>>>
+      functor_member_param_;
+  void record_local_functor_member_params(const std::string& fname,
+                                          const ModuleExpr* body) {
+    while (body) {
+      if (auto* pf = std::get_if<Pmod_functor>(&body->desc)) { body = pf->body.get(); continue; }
+      if (auto* pc = std::get_if<Pmod_constraint>(&body->desc)) { body = pc->me.get(); continue; }
+      break;
+    }
+    if (!body) return;
+    auto* ps = std::get_if<Pmod_structure>(&body->desc);
+    if (!ps) return;
+    // body-local `module type` decls, for resolving a member's named param sig
+    std::unordered_map<std::string, const ModuleType*> local_mt;
+    for (auto& it : ps->items)
+      if (auto* mtd = std::get_if<Pstr_modtype>(&it.desc))
+        if (mtd->type) local_mt[mtd->name.txt] = &*mtd->type;
+    for (auto& it : ps->items) {
+      auto* pm = std::get_if<Pstr_module>(&it.desc);
+      if (!pm || !pm->binding.name.txt) continue;
+      const ModuleExpr* me = &pm->binding.expr;
+      while (auto* pc2 = std::get_if<Pmod_constraint>(&me->desc)) me = pc2->me.get();
+      auto* mf = std::get_if<Pmod_functor>(&me->desc);
+      if (!mf) continue;
+      auto* fp = std::get_if<Functor_named>(&mf->param);
+      if (!fp || !fp->type) continue;
+      const ModuleType* pt = fp->type.get();
+      if (auto* pi = std::get_if<Pmty_ident>(&pt->desc))
+        if (auto* l = std::get_if<Lident>(&pi->id.txt.v))
+          if (auto lm = local_mt.find(l->name); lm != local_mt.end()) pt = lm->second;
+      auto lay = sig_layout(*pt);
+      if (!lay.empty())
+        functor_member_param_[fname][*pm->binding.name.txt] = std::move(lay);
+    }
+  }
   // A local `module M = struct .. end` (ascribed or not): record each
   // let-bound function with labelled params so a qualified call `M.f
   // ~lbl:.. x` reorders to the declared parameter order / None-fills
@@ -8060,6 +8101,58 @@ struct Translator {
                 std::vector<std::string> r;
                 for (auto& l : tx.inline_record) r.push_back(l.name);
                 return r;
+              }
+    } catch (...) {}
+    return {};
+  }
+  // The parameter field layout of a functor MEMBER of a local applied-functor
+  // result (`module Diff = Diffing.Define(..)`, then `Diff.Simple(Impl)`):
+  // Diff has no cmi of its own; Simple's parameter signature lives one level
+  // down in Define's functor-BODY signature, reached through
+  // module_functor_src_.  Without it the argument passes UNCOERCED and the
+  // body reads the parameter's fields at the wrong indices the moment the
+  // argument reorders or prepends fields.  Empty when unknown.
+  std::vector<std::string> applied_result_functor_param(const std::string& modname,
+                                                        const std::string& member) {
+    auto fs = module_functor_src_.find(modname);
+    if (fs == module_functor_src_.end()) return {};
+    const std::string& funit = fs->second.first;
+    const std::string& fname = fs->second.second;
+    try {
+      size_t dot = funit.find('.');
+      const auto& cmi = cmi::CmiFile::load(
+          resolve_cmi(dot == std::string::npos ? funit : funit.substr(0, dot)));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = funit.find('.', pos + 1);
+        std::string comp = funit.substr(pos + 1,
+            nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return {};
+        sig = next; pos = nd;
+      }
+      for (auto& md : sig->modules)
+        if (md.name == fname && md.type && md.type->kind == cmi::ModuleType::Functor)
+          if (const cmi::Signature* body = mt_sig(cmi, md.type->functor_body))
+            for (auto& sm : body->modules)
+              if (sm.name == member && sm.type &&
+                  sm.type->kind == cmi::ModuleType::Functor) {
+                auto p = mt_fields(cmi, sm.type->functor_param_type);
+                if (p.empty()) {
+                  // the param names a modtype declared in the body sig itself
+                  // (`module type P = ..  module Simple (X : P)`) -- a local
+                  // path mt_fields' top-level modtype lookup can't see
+                  const auto& pt = sm.type->functor_param_type;
+                  if (pt && pt->kind == cmi::ModuleType::Ident && pt->path) {
+                    const std::string& nm = pt->path->kind == cmi::Path::Pident
+                        ? pt->path->id.name : pt->path->s;
+                    for (auto& mtd : body->modtypes)
+                      if (mtd.name == nm) { p = mt_fields(cmi, mtd.type); break; }
+                  }
+                }
+                return p;
               }
     } catch (...) {}
     return {};
@@ -25400,6 +25493,10 @@ struct Translator {
         std::string dotted;  // Ephemeron.K1.Make) whose param sig is in another cmi
         if (lid_to_dotted(pi->id.txt, dotted)) param = stdlib_functor_param(dotted);
       }
+      if (param.empty())  // a functor member of a LOCAL applied-functor result
+        if (auto* d = std::get_if<Ldot>(&pi->id.txt.v))
+          if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+            param = applied_result_functor_param(pl->name, d->name);
     }
     // A LATER argument of a MULTI-parameter functor (`Identifiable.Pair(Ident)(Uid)`
     // in shape_reduce, `F(A)(B)`): `pa.f` is itself a Pmod_apply, so the Pmod_ident
@@ -27097,6 +27194,7 @@ struct Translator {
             if (auto* pt = functor_param_type(mb.expr)) functor_param_sig_[*mb.name.txt] = pt;
             functor_param_types_[*mb.name.txt] = functor_param_types(mb.expr);  // all params
             record_local_functor_result_sigs(*mb.name.txt, &mb.expr);  // result value optionals
+            record_local_functor_member_params(*mb.name.txt, &mb.expr);
             add_export(*mb.name.txt, mid, modsig::NS::Module);
             // modsig P3: bind the functor's marker Sig (param/result Sigs) in
             // the Env and carry the slots on the cursig item, so `F(A)` /
@@ -27202,10 +27300,17 @@ struct Translator {
             // f's omitted optionals.
             if (auto* pa = std::get_if<Pmod_apply>(&mb.expr.desc))
               if (auto* fi = std::get_if<Pmod_ident>(&pa->f->desc))
-                if (auto* l = std::get_if<Lident>(&fi->id.txt.v))
+                if (auto* l = std::get_if<Lident>(&fi->id.txt.v)) {
                   if (auto it = local_functor_member_sig_.find(l->name);
                       it != local_functor_member_sig_.end())
                     local_member_sig_[nm] = it->second;
+                  // the functor MEMBERS' param layouts, under "M.Member", for
+                  // the apply-site argument coercion (`Diff.Simple(Impl)`)
+                  if (auto mp = functor_member_param_.find(l->name);
+                      mp != functor_member_param_.end())
+                    for (auto& [mn, lay] : mp->second)
+                      functor_param_[nm + "." + mn] = lay;
+                }
             if (auto* pa = std::get_if<Pmod_apply>(&mb.expr.desc))
               if (auto* fi = std::get_if<Pmod_ident>(&pa->f->desc))
                 if (auto* d = std::get_if<Ldot>(&fi->id.txt.v))
