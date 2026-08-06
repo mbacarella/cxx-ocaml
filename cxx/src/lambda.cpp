@@ -892,7 +892,18 @@ struct Translator {
   // stays unwrapped and wire_garms falls back to root placement.  Cleared by
   // the top entries before each build attempt (a bailed pass-1 build would
   // otherwise suppress the wrap on pass 2).
-  std::set<int> gm_orw_;
+  //   Keyed by (arm, or-node): `(aid, nullptr)` is the arm's PENDING handler
+  // catch, at most one per arm; `(aid, p)` records the or-node `p` so a
+  // genuinely NESTED or-row under an already-wrapped arm still gets its own
+  // (trampoline) catch, while a DUPLICATED row -- the same node reached in two
+  // subtrees -- stays suppressed.
+  std::set<std::pair<int, const Pattern*>> gm_orw_;
+  // Sentinel or-node key: blocks every nested trampoline for an arm, used where
+  // the manual precompile_or path already wires that arm's catch itself.
+  static const Pattern* gm_orw_all() {
+    static const Pattern p = [] { Pattern q; q.desc = Ppat_any{}; return q; }();
+    return &p;
+  }
   // The current top entry's deid when it is NOT backed by a user catch-all row
   // (an exhaustive match's Match_failure default); -1 when a real catch-all
   // exists.  The ctor-chunk driver refuses to route misses at such a deid --
@@ -12913,7 +12924,8 @@ struct Translator {
         // the manual catch here.  (typecore's `[{pexp_desc = Pexp_ident _ |
         // Pexp_record (_, (Some .. | None))}]`: the outer or's Pexp_record arm
         // decomposes to the inner `Some .. | None` or, whose rows raise orn.)
-        gm_orw_.insert(orn);
+        gm_orw_.insert({orn, nullptr});
+        gm_orw_.insert({orn, gm_orw_all()});
         // Body: the leading simple rows and the hoisted ones, then the exploded
         // alternatives (each raising orn with omega remaining columns), then the
         // trailing wildcard-col0 rows intact (they form the column-0 dispatch
@@ -12959,7 +12971,8 @@ struct Translator {
       };
       if (relaxed) {
         int exit_save = next_exit_, stamp_save = stamp;
-        std::set<int> orw_save = gm_orw_, dirty_save = gm_ctx_dirty_eids_;
+        auto orw_save = gm_orw_;
+        auto dirty_save = gm_ctx_dirty_eids_;
         auto facc_save = gm_facc_proto_;
         LamPtr res = attempt(tstart, true);
         int fbad = 0;
@@ -12988,20 +13001,50 @@ struct Translator {
     for (auto& r : rows)
       if (std::get_if<Ppat_or>(&r.cols[0]->desc)) {
         std::vector<MRow> ex;
-        std::vector<std::pair<int, bool>> wrapped;   // (aid, gm_orp_rest)
+        // (aid, gm_orp_rest, trampoline)
+        std::vector<std::tuple<int, bool, bool>> wrapped;
         for (auto& rr : rows) {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
-          if (alts.size() > 1 && rr.aid >= 0 && rr.vnames &&
-              gm_orw_.insert(rr.aid).second)
-            wrapped.push_back({rr.aid, comps.size() >= 2 && !rr.row_or &&
-                               pattern_binds(rr.cols[0])});
+          if (alts.size() > 1 && rr.aid >= 0 && rr.vnames) {
+            if (gm_orw_.insert({rr.aid, nullptr}).second)
+              wrapped.push_back({rr.aid, comps.size() >= 2 && !rr.row_or &&
+                                 pattern_binds(rr.cols[0]), false});
+            // A NESTED or-row under an arm already wrapped: precompile_or runs
+            // once per matrix, so an or-column exposed only after the outer
+            // alternatives were exploded is a fresh or-row and takes its OWN
+            // exit, whose handler just re-raises the arm's -- compile_orhandlers
+            // (matching.ml:3534) keeps that catch even when the handler is a
+            // bare exit.  `Second _ | First {front = ([] | [_]); _}` is the
+            // shape (stable_matching): the outer or's First alternative
+            // decomposes to the inner list or.
+            //   The catch only SURVIVES upstream when a remaining column gives
+            // the handler pm a bind: `Lstaticcatch (l1,(i,[]),Lstaticraise _)`
+            // is dropped outright by simplify_exits (simplif.ml:306), and with
+            // no remaining column the handler is exactly that bare re-raise
+            // (diffing_with_keys' `None | Some (Left _ | Right _)`).  With one
+            // -- the `second_round` field beside the `front` or -- the handler
+            // is `let *match* = field_imm 1 cl in exit 2`, a Llet the rule does
+            // not match, so the catch reaches the bytecode.
+            //   Only when this row is the arm's SOLE row here, so every
+            // `exit aid` under the wrap is one of these alternatives' and the
+            // renumbering below cannot divert an unrelated row's raise.
+            //   A GUARDED row is declined outright: its handler pm carries the
+            // guard, so the catch is not the bare re-raise modelled here.
+            else if (comps.size() >= 2 && !rr.guard &&
+                     !gm_orw_.count({rr.aid, gm_orw_all()}) &&
+                     gm_orw_.insert({rr.aid, rr.cols[0]}).second) {
+              size_t naid = 0;
+              for (auto& r2 : rows) if (r2.aid == rr.aid) ++naid;
+              if (naid == 1) wrapped.push_back({rr.aid, false, true});
+            }
+          }
           for (auto* a : alts) { MRow nr = rr; nr.cols[0] = effective_pat(a); ex.push_back(std::move(nr)); }
         }
         std::string c0key = wrapped.empty()
             ? std::string() : cppcaml::lambda::make_lam_key(comps[0]);
         LamPtr sub = gmatch(std::move(comps), std::move(ex), mloc, deid, std::move(denv));
         if (!sub) return nullptr;
-        for (auto [aid, orest] : wrapped) {
+        for (auto [aid, orest, tramp] : wrapped) {
           // Upstream binds the or-column's OWN scrutinee before splitting, so
           // the catch sits inside that one materialized binding (typedecl's
           // `*match* = field_imm 2 val`) but outside everything else -- a
@@ -13014,6 +13057,20 @@ struct Translator {
               !c0key.empty() && l->bindings[0].val &&
               cppcaml::lambda::make_lam_key(l->bindings[0].val) == c0key)
             slot = &l->body;
+          if (tramp) {
+            // The trampoline handler binds nothing, so it can only re-raise an
+            // ARGUMENT-FREE arm exit; an arm carrying pattern variables would
+            // need upstream's `vars` on the fresh handler and is left alone.
+            int bad = 0;
+            if (count_exit(*slot, aid, false, bad) == 0 ||
+                !exits_argless(*slot, aid)) continue;
+            int n = ++next_exit_;
+            renum_exit(*slot, aid, n);
+            auto x = mk(Lam::K::Staticraise); x->prim_arg = aid;
+            auto c = mk(Lam::K::Catch); c->prim_arg = n; c->cond = *slot; c->then_ = x;
+            *slot = c;
+            continue;
+          }
           auto c = mk(Lam::K::Catch); c->prim_arg = aid; c->cond = *slot;
           c->gm_orp = true; c->gm_orp_rest = orest;
           *slot = c;
@@ -13063,7 +13120,8 @@ struct Translator {
           fprintf(stderr, "[GMROT] rows=%zu cols=%zu piv=%zu leadwild=%zu\n",
                   rows.size(), comps.size(), piv, leadwild);
         int exit_save = next_exit_, stamp_save = stamp;
-        std::set<int> orw_save = gm_orw_, dirty_save = gm_ctx_dirty_eids_;
+        auto orw_save = gm_orw_;
+        auto dirty_save = gm_ctx_dirty_eids_;
         auto facc_save = gm_facc_proto_;
         std::vector<LamPtr> rc = comps;
         std::swap(rc[0], rc[piv]);
@@ -13651,7 +13709,7 @@ struct Translator {
         // attempt is invisible to the spread path (a leaked gm_orw_ aid
         // suppresses that arm's or-wrap; a leaked exit id shifts wire-time
         // id comparisons).
-        std::set<int> orw_save = gm_orw_;
+        auto orw_save = gm_orw_;
         auto facc_save = gm_facc_proto_;
         int exit_save = next_exit_;
         int stamp_save = stamp;
@@ -14413,6 +14471,40 @@ struct Translator {
     for (auto& sc : l->sw_consts) if (stamp_bound_in(sc.body, stamp)) return true;
     for (auto& sc : l->sw_blocks) if (stamp_bound_in(sc.body, stamp)) return true;
     return false;
+  }
+  // Renumber every `(exit from)` bound at THIS level to `to`.  A nested catch
+  // of `from` rebinds it, so only that catch's handler is still ours; static
+  // exits never cross a function boundary, so nested Lfunctions are skipped.
+  static void renum_exit(LamPtr& l, int from, int to) {
+    if (!l || l->k == Lam::K::Function) return;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == from) { l->prim_arg = to; return; }
+    if (l->k == Lam::K::Catch && l->prim_arg == from) { renum_exit(l->then_, from, to); return; }
+    renum_exit(l->fn, from, to);
+    renum_exit(l->cond, from, to);
+    renum_exit(l->then_, from, to);
+    renum_exit(l->else_, from, to);
+    renum_exit(l->body, from, to);
+    renum_exit(l->sw_default, from, to);
+    for (auto& a : l->args) renum_exit(a, from, to);
+    for (auto& b : l->bindings) renum_exit(b.val, from, to);
+    for (auto& sc : l->sw_consts) renum_exit(sc.body, from, to);
+    for (auto& sc : l->sw_blocks) renum_exit(sc.body, from, to);
+  }
+  // Whether every `(exit id ..)` bound at THIS level is argument-free, i.e. the
+  // exit can be re-raised by a handler that binds nothing.
+  static bool exits_argless(const LamPtr& l, int id) {
+    if (!l || l->k == Lam::K::Function) return true;
+    if (l->k == Lam::K::Staticraise && l->prim_arg == id) return l->args.empty();
+    if (l->k == Lam::K::Catch && l->prim_arg == id) return exits_argless(l->then_, id);
+    if (!exits_argless(l->fn, id) || !exits_argless(l->cond, id) ||
+        !exits_argless(l->then_, id) || !exits_argless(l->else_, id) ||
+        !exits_argless(l->body, id) || !exits_argless(l->sw_default, id))
+      return false;
+    for (auto& a : l->args) if (!exits_argless(a, id)) return false;
+    for (auto& b : l->bindings) if (!exits_argless(b.val, id)) return false;
+    for (auto& sc : l->sw_consts) if (!exits_argless(sc.body, id)) return false;
+    for (auto& sc : l->sw_blocks) if (!exits_argless(sc.body, id)) return false;
+    return true;
   }
   // The slot holding the pending or-handler catch (gm_orp) for `aid`, if any.
   // Static exits never cross a function boundary, so nested Lfunctions are
