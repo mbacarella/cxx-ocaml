@@ -12384,6 +12384,66 @@ struct Translator {
       return 1;
     });
   }
+  static bool gm_const_eq(const Constant& a, const Constant& b) {
+    if (a.desc.index() != b.desc.index()) return false;
+    if (auto* x = std::get_if<Pconst_integer>(&a.desc)) {
+      auto& y = std::get<Pconst_integer>(b.desc);
+      return x->value == y.value && x->suffix == y.suffix;
+    }
+    if (auto* x = std::get_if<Pconst_char>(&a.desc))
+      return x->code == std::get<Pconst_char>(b.desc).code;
+    if (auto* x = std::get_if<Pconst_string>(&a.desc))
+      return x->s == std::get<Pconst_string>(b.desc).s;
+    auto& x = std::get<Pconst_float>(a.desc);
+    auto& y = std::get<Pconst_float>(b.desc);
+    return x.value == y.value && x.suffix == y.suffix;
+  }
+  // One column of Parmatch's may_compats, in the only direction that is safe to
+  // act on: PROVEN disjoint (a constant or a constructor naming a different
+  // head on both sides).  Anything less certain answers false, which keeps the
+  // caller's row where the source put it.
+  bool gm_cols_disjoint(const Pattern* p, const Pattern* q) {
+    std::vector<const Pattern*> pa, qa;
+    flatten_or(p, pa);
+    flatten_or(q, qa);
+    if (pa.empty() || qa.empty()) return false;
+    for (auto* x : pa)
+      for (auto* y : qa) {
+        const Pattern* ex = effective_pat(x);
+        const Pattern* ey = effective_pat(y);
+        auto* cx = std::get_if<Ppat_constant>(&ex->desc);
+        auto* cy = std::get_if<Ppat_constant>(&ey->desc);
+        if (cx && cy) { if (gm_const_eq(cx->c, cy->c)) return false; continue; }
+        auto* kx = std::get_if<Ppat_construct>(&ex->desc);
+        auto* ky = std::get_if<Ppat_construct>(&ey->desc);
+        if (kx && ky) {
+          if (lid_last(kx->id.txt) == lid_last(ky->id.txt)) return false;
+          continue;
+        }
+        return false;
+      }
+    return true;
+  }
+  // safe_before (matching.ml:1341) between two whole rows of the CURRENT column
+  // vector: `same_actions act_p act_q || not (may_compats p q)`.  One column
+  // proving the rows disjoint is enough -- no scrutinee reaches both, so the
+  // swap is invisible.
+  bool gm_rows_disjoint(const MRow& a, const MRow& b) {
+    if (a.cols.size() != b.cols.size()) return false;
+    for (size_t i = 0; i < a.cols.size(); ++i)
+      if (gm_cols_disjoint(a.cols[i], b.cols[i])) return true;
+    return false;
+  }
+  // safe_before's other half.  Rows of the same arm share an exit; and two
+  // unguarded rows whose action is the same literal have the same
+  // Lambda.make_key, which is what upstream compares.
+  bool gm_same_action(const MRow& a, const MRow& b) {
+    if (a.aid >= 0 && a.aid == b.aid) return true;
+    if (a.guard || b.guard || !a.rhs || !b.rhs) return false;
+    auto* ea = std::get_if<Pexp_constant>(&a.rhs->desc);
+    auto* eb = std::get_if<Pexp_constant>(&b.rhs->desc);
+    return ea && eb && gm_const_eq(ea->c, eb->c);
+  }
   // Chunk driver for a specializable column with interspersed var rows:
   // split at the can_group boundaries (maximal specialized runs / var runs),
   // compile the first run with the later runs consed onto the default
@@ -13406,6 +13466,38 @@ struct Translator {
       }
       if (anyconst && purecol) {
         if (comps[0]->k != Lam::K::Var) return nullptr;
+        // Const rows INTERSPERSED with var rows.  The chain/default split below
+        // assumes upstream's group is "every const row" and its default is
+        // "every var row"; matching.ml's collect (:1640) only produces that
+        // when the FIRST row is a const one (the group discriminant), a var row
+        // always defers (can_group Constant Any = false, :1391), and every
+        // later const row is safe_before (:1341) all the deferred rows.
+        // Hoisting a const row past a var row that shadows it makes it fire
+        // first -- `(1,1) -> 11 | (_,3) -> 33 | (9,_) -> 90` answered 90 on
+        // `(9,3)`.  Any other layout goes to the chunk driver, which compiles
+        // each maximal run as its own half-match chained through the default
+        // environment (what the string column already does); the grouped shape
+        // below is NOT a sound fallback there, so an unsupported chunked
+        // compile declines the column instead.
+        {
+          bool grouped = std::get_if<Ppat_constant>(&rows[0].cols[0]->desc) != nullptr;
+          std::vector<const MRow*> deferred;
+          for (auto& r : rows) {
+            if (!grouped) break;
+            bool c = std::get_if<Ppat_constant>(&r.cols[0]->desc) != nullptr;
+            bool safe = true;
+            for (auto* q : deferred)
+              if (!gm_same_action(r, *q) && !gm_rows_disjoint(r, *q)) { safe = false; break; }
+            if (c && safe) continue;           // stays in the value chain
+            if (c) grouped = false;            // a const row deferred: not our shape
+            else deferred.push_back(&r);
+          }
+          if (!grouped)
+            return gmatch_run_chunks(comps, rows, mloc, deid, denv,
+                    [](const Pattern* p) {
+                      return std::get_if<Ppat_constant>(&p->desc) != nullptr;
+                    });
+        }
         if (g_gm_budget_ == 0) return nullptr;
         if (g_gm_budget_ > 0) --g_gm_budget_;
         auto colval = [&](const Pattern* p) -> long long {
@@ -13523,9 +13615,11 @@ struct Translator {
         // Const rows interspersed with var rows: upstream's split_no_or groups
         // only maximal runs (can_group stops the group at a var row, and
         // safe_before keeps any later const row out of it), so each run is its
-        // own half-match chained through the default environment.  Try that
-        // chunked compile; unsupported material bails back to the single-group
-        // shape below (correct, but grouped across the var rows).
+        // own half-match chained through the default environment.  The
+        // single-group shape below is NOT a sound fallback for that layout --
+        // it would let a trailing const row fire ahead of the var row that
+        // shadows it -- so an unsupported chunked compile declines the column
+        // and the match falls back to the and-chain.
         {
           bool seen_var = false, inter = false;
           for (auto& r : rows) {
@@ -13534,11 +13628,10 @@ struct Translator {
             } else seen_var = true;
           }
           if (inter && !cppcaml::dbg_env("NOCHUNK"))
-            if (LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
+            return gmatch_run_chunks(comps, rows, mloc, deid, denv,
                     [](const Pattern* p) {
                       return std::get_if<Ppat_constant>(&p->desc) != nullptr;
-                    }))
-              return r;
+                    });
         }
         if (g_gm_budget_ == 0) return nullptr;
         if (g_gm_budget_ > 0) --g_gm_budget_;
