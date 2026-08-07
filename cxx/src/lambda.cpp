@@ -909,18 +909,30 @@ struct Translator {
   // exists.  The ctor-chunk driver refuses to route misses at such a deid --
   // upstream's exhaustiveness/ctx knowledge would prune the dead arm.
   int gm_fake_deid_ = -1;
-  // The current top entry's deid when the match is Total and has no catch-all
-  // row; -1 otherwise.  Licenses the ctor split to DROP an uncovered tag's
-  // `(exit deid)` hole entry: mk_failaction_pos (matching.ml:2997) walks the
-  // default environment first and only then consults the partiality, and the
-  // bit it consults there is `global`, not `current` -- "if the pattern-matching
-  // is globally Total, all missing values are either ill-typed or handled by a
-  // matrix of the default environment", so it adds NO final-exit fails.  A hole
-  // whose body is the bare `(exit deid)` is exactly a failure pattern no default
-  // entry claimed, so it is one of those; the switch stays sparse and bytegen's
-  // hole rule (plus a possible reintroduce_fail promotion) routes it.  Set and
-  // restored unconditionally by every gmatch_top entry, so a nested match
-  // compiled mid-construction can never see a stale license.
+  // The current top entry's deid when the match is a PROVEN Total (completed
+  // GADT refutation, see ValueKinds.total_proven) and has no catch-all row; -1
+  // otherwise.  Licenses the ctor split to DROP an uncovered tag's `(exit deid)`
+  // hole entry: mk_failaction_pos (matching.ml:2997) walks the default
+  // environment first and only then consults the partiality, and the bit it
+  // consults there is `global`, not `current` -- "if the pattern-matching is
+  // globally Total, all missing values are either ill-typed or handled by a
+  // matrix of the default environment", so it adds NO final-exit fails and the
+  // switch stays sparse, bytegen's hole rule routing the missing tags.
+  //   Upstream's `global` is Parmatch's EXACT verdict, so upstream can drop the
+  // cell knowing no value reaches it.  Our `total` (match_is_total ->
+  // ValueKinds.match_partial -> infer_check's compute_partial) is a deliberately
+  // CONSERVATIVE approximation pointing the other way: it answers Total whenever
+  // every top-level constructor of the scrutinee type is named, with no analysis
+  // of nested arguments (and Total outright for an unknown type or an unknown
+  // variant).  `match r with {u = Ok N; v = Ok _} | {u = Ok _; v = Ok _} |
+  // {u = _; v = Error (P k)} | {u = Error _; v = _}` is Partial -- ocamlc warns
+  // 8 and emits the Match_failure -- yet compute_partial answers Total, so
+  // gating the hole drop on that bit DELETES a live Match_failure (measured:
+  // 5664aa0933 miscompiled exactly this shape).  Only `proven` -- a completed
+  // GADT refutation of every uncovered tag -- is exact enough to license it.
+  // Widening this to plain Total needs a real matrix-exhaustiveness check first.
+  //   Set and restored unconditionally by every gmatch_top entry, so a nested
+  // match compiled mid-construction can never see a stale license.
   int gm_tp_deid_ = -1;
   // Entry eids to which mkexit routed a DEEP fully-matched miss (see
   // GmDef::head_dropped).  The ctor-chunk driver rejects a SPREAD-containing
@@ -15306,7 +15318,7 @@ struct Translator {
   // catch-all as the shared default (else Match_failure), run gmatch, and wrap the
   // fallback in a shared static-catch (inlined when used at most once).
   LamPtr gmatch_top(const LamPtr& scrut, const std::vector<Row>& rows,
-                    const Location& mloc, bool total = false) {
+                    const Location& mloc, bool total = false, bool proven = false) {
     const Row* catchall = nullptr;
     std::vector<MRow> mrows;
     std::vector<const Pattern*> apats;
@@ -15338,7 +15350,7 @@ struct Translator {
     int fd_save = gm_fake_deid_;
     gm_fake_deid_ = catchall ? -1 : deid;
     int tp_save = gm_tp_deid_;
-    gm_tp_deid_ = (total && !catchall) ? deid : -1;
+    gm_tp_deid_ = (total && proven && !catchall) ? deid : -1;
     gm_orw_.clear();
     LamPtr body = gmatch({sv}, mrows, mloc, deid);
     if (!body) {
@@ -18020,7 +18032,7 @@ struct Translator {
     if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
-    if (auto gm = gmatch_top(scrut, rows, mloc, total)) return gm;
+    if (auto gm = gmatch_top(scrut, rows, mloc, total, proven)) return gm;
     if (cppcaml::dbg_env("BAILDBG")) {
       int nguard = 0, nctor = 0, nor = 0, nother = 0;
       std::string ctors;
