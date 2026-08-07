@@ -17257,7 +17257,7 @@ struct Translator {
     return lam;
   }
   LamPtr gmatch_tuple_top(const Pexp_tuple* tu, const std::vector<Row>& vrows,
-                          const Location& mloc) {
+                          const Location& mloc, bool proven_total = false) {
     size_t k = tu->elems.size();
     if (k < 2) return nullptr;
     const Row* catchall = nullptr;
@@ -17362,8 +17362,16 @@ struct Translator {
     g_gm_tuples_ = true; g_gm_budget_ = gm_budget();
     int fd_save = gm_fake_deid_;
     gm_fake_deid_ = catchall ? -1 : deid;
+    // Same hole license as gmatch_top, and on the same terms: a multi-column
+    // match whose exhaustiveness is PROVEN (not merely compute_partial's
+    // approximation -- see gm_tp_deid_) may leave an uncovered tag out of a
+    // column's switch, since mk_failaction_pos adds no final-exit fail for a
+    // globally-Total match and bytegen's hole rule routes the missing tags.
+    int tp_save = gm_tp_deid_;
+    gm_tp_deid_ = (proven_total && !catchall) ? deid : -1;
     gm_orw_.clear();
     LamPtr body = gmatch(comps, mrows, mloc, deid);
+    gm_tp_deid_ = tp_save;
     gm_fake_deid_ = fd_save;
     g_gm_tuples_ = false; g_gm_budget_ = -1;
     if (!body) return nullptr;
@@ -20701,7 +20709,8 @@ struct Translator {
           if (LamPtr r = multi_match(tu, vrows, erows, e.loc))
             return r;
           if (erows.empty())
-            if (LamPtr r = gmatch_tuple_top(tu, vrows, e.loc))
+            if (LamPtr r = gmatch_tuple_top(tu, vrows, e.loc,
+                                            match_is_total(&e) && total_is_proven(&e)))
               return r;
         }
       if (!erows.empty() && !vrows.empty() && frows.empty()) {

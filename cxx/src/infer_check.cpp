@@ -242,10 +242,19 @@ struct Checker {
   // cd_res-refined results, for the PARTIALITY machinery only.  Deliberately
   // NOT fed into gadt_types/gadt_ctors: those drive match windowing, and
   // re-windowing every match on imported GADT ctors would change inference
-  // far beyond exhaustiveness.  nullopt = memoized "not a GADT variant".
+  // far beyond exhaustiveness.  nullopt = memoized "not a cmi variant".
   std::unordered_map<std::string,
                      std::optional<std::vector<std::pair<std::string, TypePtr>>>>
       imported_gadt_memo_;
+  // Parallel to imported_gadt_memo_: did the resolved variant carry a `cd_res`?
+  // imported_gadt filters on this; mx_classify wants EVERY imported variant's
+  // constructor list, GADT or not, so it reads the memo directly.
+  std::unordered_map<std::string, bool> imported_variant_gadt_;
+  // Field names + one-constructor scheme of a cmi-imported record; see
+  // imported_record.  nullopt = memoized "not a cmi-resolvable record".
+  std::unordered_map<std::string,
+                     std::optional<std::pair<std::vector<std::string>, TypePtr>>>
+      imported_record_memo_;
   // GADT constructors that introduce an existential (a type var in the args that
   // is absent from the result).  A structure-level `let A x = ..` binding such a
   // constructor lets the existential escape, which OCaml rejects ("Existential
@@ -4795,14 +4804,107 @@ struct Checker {
     } catch (...) {}
   }
 
-  // Resolve a dotted type path to an imported GADT variant's ctor schemes (see
+  // The GADT-only view: an imported variant at least one of whose constructors
+  // has a `cd_res`.  (The refutation machinery wants exactly these.)
+  const std::vector<std::pair<std::string, TypePtr>>*
+  imported_gadt(const std::string& path) {
+    auto* v = imported_variant(path);
+    return v && imported_variant_gadt_[path] ? v : nullptr;
+  }
+
+  // Navigate a dotted type path to its cmi declaration ("Parsetree.label_
+  // declaration" -> parsetree.cmi's `label_declaration`), keeping the loaded
+  // files alive in `loaded` and handing back the owning signature.  Null for a
+  // functor-parameter projection, an unreadable cmi, or an absent name.
+  const cmi::TypeDecl* mx_cmi_type_decl(const std::string& path,
+                                        std::deque<const cmi::CmiFile*>& loaded,
+                                        const cmi::Signature** out_sig,
+                                        std::string* out_modpath) {
+    size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return nullptr;
+    std::string tyname = path.substr(dot + 1), modpath = path.substr(0, dot);
+    std::vector<std::string> comps;
+    for (size_t i = 0;;) {
+      size_t d = modpath.find('.', i);
+      if (d == std::string::npos) { comps.push_back(modpath.substr(i)); break; }
+      comps.push_back(modpath.substr(i, d - i)); i = d + 1;
+    }
+    if (bound_module_names_.count(comps[0])) return nullptr;
+    loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+    const cmi::Signature* msig = &loaded.back()->sig();
+    for (size_t i = 1; i < comps.size() && msig; ++i) {
+      const cmi::ModuleDecl* md = nullptr;
+      for (auto& mm : msig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+      msig = md ? module_sig(md->type, loaded) : nullptr;
+    }
+    if (!msig) return nullptr;
+    for (auto& t : msig->types)
+      if (t.name == tyname) {
+        *out_sig = msig;
+        *out_modpath = modpath;
+        return &t;
+      }
+    return nullptr;
+  }
+
+  // A cmi-imported record, encoded the way mx_useful already consumes a
+  // constructor: field names in declaration order plus a scheme
+  // `f1 -> .. -> fn -> (params) path`, so the record column instantiates and
+  // substitutes through exactly the same code as a one-constructor variant.
+  // Null = not a cmi-resolvable record (abstract in the signature, a local
+  // submodule with no cmi on disk, a functor parameter).
+  const std::pair<std::vector<std::string>, TypePtr>*
+  imported_record(const std::string& path) {
+    if (path.find('.') == std::string::npos) return nullptr;
+    auto mit = imported_record_memo_.find(path);
+    if (mit != imported_record_memo_.end())
+      return mit->second ? &*mit->second : nullptr;
+    auto& slot = imported_record_memo_[path];  // any bail memoizes the negative
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      const cmi::Signature* msig = nullptr;
+      std::string modpath;
+      const cmi::TypeDecl* td = mx_cmi_type_decl(path, loaded, &msig, &modpath);
+      if (!td || td->kind != cmi::TypeDecl::Record || td->labels.empty())
+        return nullptr;
+      auto* saved_ctx = cmi_types_ctx_;
+      std::string saved_pfx = cmi_mod_prefix_;
+      bool saved_fold = fold_abbrevs_;
+      cmi_types_ctx_ = &msig->types;
+      cmi_mod_prefix_ = modpath;
+      fold_abbrevs_ = true;
+      std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+      std::vector<TypePtr> params;
+      for (auto& p : td->params) {
+        TypePtr v = eng.fresh_var();
+        if (p) memo[p.get()] = v;
+        params.push_back(v);
+      }
+      TypePtr scheme = eng.constr(path, params);
+      std::vector<std::string> names;
+      for (auto& l : td->labels) names.push_back(l.name);
+      for (auto it = td->labels.rbegin(); it != td->labels.rend(); ++it)
+        scheme = eng.arrow(from_cmi(it->type, memo), scheme);
+      eng.generalize(scheme);
+      cmi_types_ctx_ = saved_ctx;
+      cmi_mod_prefix_ = saved_pfx;
+      fold_abbrevs_ = saved_fold;
+      slot = std::make_pair(std::move(names), std::move(scheme));
+      return &*slot;
+    } catch (...) {}
+    return nullptr;
+  }
+
+  // Resolve a dotted type path to an imported variant's ctor schemes (see
   // imported_gadt_memo_).  Scheme building mirrors open_module_ctors: results
   // come from cd_res via from_cmi (so an uncovered ctor's concrete index is
   // visible to the refutation), constructors without one get the generic
   // `(params) path`.  An inline-record ctor keeps a result-only scheme -- the
-  // partiality check reads nothing but the result index.
+  // partiality check reads nothing but the result index, and mx_useful drops
+  // such a row rather than mis-specializing it (safe: a smaller matrix only
+  // ever withholds a proof).
   const std::vector<std::pair<std::string, TypePtr>>*
-  imported_gadt(const std::string& path) {
+  imported_variant(const std::string& path) {
     if (path.find('.') == std::string::npos) return nullptr;
     auto mit = imported_gadt_memo_.find(path);
     if (mit != imported_gadt_memo_.end())
@@ -4837,7 +4939,7 @@ struct Checker {
         return nullptr;
       bool is_gadt = false;
       for (auto& c : td->ctors) if (c.res) is_gadt = true;
-      if (!is_gadt) return nullptr;
+      imported_variant_gadt_[path] = is_gadt;
       auto* saved_ctx = cmi_types_ctx_;
       std::string saved_pfx = cmi_mod_prefix_;
       bool saved_fold = fold_abbrevs_;
@@ -5452,6 +5554,7 @@ struct Checker {
     const TypeDeclaration* decl = nullptr;  // Variant/Record when locally declared
     std::string key;   // Variant: type_ctor_schemes_ key ("" = flat fallback)
     std::string name;  // External: builtin base; PredefVariant/flat Variant: type name
+    std::string imported;  // Variant: dotted path whose ctors come from a cmi
   };
 
   MxClass mx_classify(const TypePtr& c) {
@@ -5481,9 +5584,17 @@ struct Checker {
       r.k = MxClass::External; r.name = b;
       return r;
     }
+    // `Stdlib.result` is the predefined `result`, reached through the wrapper --
+    // same constructors, so classify it alongside the bare spelling instead of
+    // falling through to Unknown.
+    bool stdlib_q = c->path.rfind("Stdlib.", 0) == 0 &&
+                    c->path.find('.', 7) == std::string::npos;
+    if (predefv.count(b) && (bare || stdlib_q)) {
+      r.k = MxClass::PredefVariant; r.name = b;
+      return r;
+    }
     if (bare) {
       if (b == "exn" || b == "eff") { r.k = MxClass::Open; return r; }
-      if (predefv.count(b)) { r.k = MxClass::PredefVariant; r.name = b; return r; }
       if (type_ctor_schemes_.count(c->path)) {
         r.k = MxClass::Variant; r.key = c->path;
         // A bare stamp-0 node (an arm-pinned scrutinee index in the flexible
@@ -5508,6 +5619,20 @@ struct Checker {
     }
     if (type_ctor_schemes_.count(c->path)) {  // module-qualified local variant
       r.k = MxClass::Variant; r.key = c->path;
+      return r;
+    }
+    // A cmi-imported variant (`Types.type_desc`, `Asttypes.mutable_flag`): the
+    // constructor list is right there in the signature, so the column IS
+    // enumerable.  Its description stays empty, so mx_compat keeps treating it
+    // as compatible with everything -- refutation is unaffected, only the
+    // exhaustiveness enumeration gains.  A type the signature makes abstract
+    // has no ctors in the cmi and stays Unknown, as it must.
+    if (imported_variant(c->path)) {
+      r.k = MxClass::Variant; r.imported = c->path;
+      return r;
+    }
+    if (imported_record(c->path)) {
+      r.k = MxClass::Record; r.imported = c->path;
       return r;
     }
     return r;  // dotted cmi/abstract type -> Unknown (compatible with all)
@@ -5625,6 +5750,10 @@ struct Checker {
   // from the flat ctor map, sanity-checked to build the column's type.
   std::vector<std::pair<std::string, TypePtr>> mx_ctor_schemes(const MxClass& c,
                                                                const TypePtr& col) {
+    if (!c.imported.empty()) {
+      if (auto* v = imported_variant(c.imported)) return *v;
+      throw MxBail{};
+    }
     if (c.k == MxClass::Variant && !c.key.empty()) {
       auto it = type_ctor_schemes_.find(c.key);
       if (it == type_ctor_schemes_.end()) throw MxBail{};
@@ -5827,27 +5956,50 @@ struct Checker {
       return mx_useful(default_matrix(), std::move(rest), std::move(su));
     }
     if (tc.k == MxClass::Record) {
-      if (!tc.decl) throw MxBail{};
-      auto& fields = std::get<Ptype_record>(tc.decl->kind).fields;
-      if (tc.decl->params.size() != t->args.size()) throw MxBail{};
-      std::unordered_map<std::string, TypePtr> vars;
-      for (size_t i = 0; i < t->args.size(); ++i)
-        if (auto* pv = std::get_if<Ptyp_var>(&tc.decl->params[i]->desc))
-          vars[pv->name] = t->args[i];
+      // Field names in declaration order, and the field types with the record's
+      // parameters already substituted -- from the local declaration, or (when
+      // the type came in through a cmi) from its one-constructor encoding.
+      std::vector<std::string> fnames;
       std::vector<TypePtr> cols2;
-      for (auto& f : fields) cols2.push_back(from_coretype(*f.type, vars));
+      if (tc.decl) {
+        auto& fields = std::get<Ptype_record>(tc.decl->kind).fields;
+        if (tc.decl->params.size() != t->args.size()) throw MxBail{};
+        std::unordered_map<std::string, TypePtr> vars;
+        for (size_t i = 0; i < t->args.size(); ++i)
+          if (auto* pv = std::get_if<Ptyp_var>(&tc.decl->params[i]->desc))
+            vars[pv->name] = t->args[i];
+        for (auto& f : fields) {
+          fnames.push_back(f.name.txt);
+          cols2.push_back(from_coretype(*f.type, vars));
+        }
+      } else if (!tc.imported.empty()) {
+        auto* ir = imported_record(tc.imported);
+        if (!ir) throw MxBail{};
+        std::unordered_map<const I::Type*, TypePtr> memo;
+        TypePtr result;
+        auto ps = ctor_params(mx_qualify(eng.instantiate(ir->second), "", memo),
+                              result);
+        TypePtr rr = I::Engine::repr(result);
+        if (rr->kind != K::Constr || rr->args.size() != t->args.size() ||
+            ps.size() != ir->first.size())
+          throw MxBail{};
+        for (size_t i = 0; i < rr->args.size(); ++i)
+          if (!mx_compat(rr->args[i], t->args[i], su)) throw MxBail{};
+        fnames = ir->first;
+        cols2 = std::move(ps);
+      } else throw MxBail{};
       cols2.insert(cols2.end(), rest.begin(), rest.end());
       std::vector<MxRow> m2;
       for (auto& r : rows) {
         MxRow r2;
-        if (mx_wild(r[0])) r2.assign(fields.size(), nullptr);
+        if (mx_wild(r[0])) r2.assign(fnames.size(), nullptr);
         else if (auto* rp = std::get_if<Ppat_record>(&r[0]->desc)) {
-          r2.assign(fields.size(), nullptr);
+          r2.assign(fnames.size(), nullptr);
           for (auto& [lid, pb] : rp->fields) {
             std::string fn = lid_last(lid.txt);
             size_t k = 0;
-            for (; k < fields.size(); ++k) if (fields[k].name.txt == fn) break;
-            if (k == fields.size()) throw MxBail{};  // foreign label
+            for (; k < fnames.size(); ++k) if (fnames[k] == fn) break;
+            if (k == fnames.size()) throw MxBail{};  // foreign label
             r2[k] = pb.get();
           }
         } else continue;  // dead row
@@ -5962,6 +6114,43 @@ struct Checker {
       return useful;
     } catch (const MxBail&) {
       return false;  // unanalyzable -> Total (the pre-existing default)
+    } catch (const I::TypeError&) {
+      return false;
+    }
+  }
+
+  // A GENERAL exact-exhaustiveness proof, for a scrutinee of ANY type: run the
+  // same usefulness analysis tuple_gadt_partial uses, over the one-column matrix
+  // of the match's unguarded value rows.  A COMPLETED `not useful` verdict is
+  // upstream's `Total` exactly -- Parmatch's own answer over Parmatch's own
+  // matrix (parmatch.ml's initial_matrix likewise drops the guarded rows, since
+  // a guard can fail) -- so unlike compute_partial's approximation it carries a
+  // codegen license: the back end may drop an uncovered constructor's switch
+  // cell knowing no value reaches it (see lambda.cpp's gm_tp_deid_).
+  //   compute_partial stays the partiality oracle.  This only ever UPGRADES a
+  // Total verdict to a proven one: anything unmodeled throws MxBail and yields
+  // no proof, so the analysis can withhold the license but never grant it
+  // wrongly.  Ordinary (non-GADT) columns take mx_compat's Var branch for every
+  // constructor index, so no constructor is refuted and the run is a plain
+  // Maranget exhaustiveness check.
+  bool mx_total_proof(const TypePtr& scrut, const std::vector<Case>& cases) {
+    if (strict) return false;  // the reject pass discards partiality anyway
+    try {
+      std::vector<MxRow> rows;
+      for (auto& c : cases) {
+        if (c.guard) continue;
+        const Pattern* p = mx_peel(&c.lhs);
+        if (!p) continue;
+        if (std::holds_alternative<Ppat_exception>(p->desc) ||
+            std::holds_alternative<Ppat_effect>(p->desc))
+          continue;  // no value coverage
+        rows.push_back(MxRow{p});
+      }
+      if (rows.empty()) return false;
+      mx_fuel_ = 20000;
+      return !mx_useful(std::move(rows), {I::Engine::repr(scrut)}, MxSubst{});
+    } catch (const MxBail&) {
+      return false;  // unanalyzable -> no proof
     } catch (const I::TypeError&) {
       return false;
     }
@@ -7691,7 +7880,8 @@ struct Checker {
       match_partial[&e] = pgadt ? gadt_match_partial(se, m->cases, &tproven)
                         : proj  ? *proj
                                 : compute_partial(se, m->cases, &tproven);  // dump
-      if (tproven && !match_partial[&e]) total_proven.insert(&e);
+      if (!match_partial[&e] && (tproven || mx_total_proof(se, m->cases)))
+        total_proven.insert(&e);
       return rt;
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
@@ -9041,7 +9231,8 @@ struct Checker {
           cases_gadt ? gadt_match_partial(arg, fc.cases, &fproven)
           : fproj    ? *fproj
                      : compute_partial(arg, fc.cases, &fproven);
-      if (fproven && !function_cases_partial[&fc]) total_proven.insert(&fc);
+      if (!function_cases_partial[&fc] && (fproven || mx_total_proof(arg, fc.cases)))
+        total_proven.insert(&fc);
       params.push_back({arg, 0, ""});
       body = rt;
       constrained = eng.arrow(arg, rt);  // the constraint annotates arg -> rt
