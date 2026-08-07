@@ -377,6 +377,12 @@ struct Checker {
   // is reused by a variant, OCaml disambiguates by expected type (which we lack),
   // so we keep them unknown rather than resolve to the wrong kind.
   std::set<std::string> predef_ctors_;
+  // The predefined constructors' schemes, captured at registration time.  The
+  // flat `ctors` map is keyed by bare name only, so a source-level
+  // `exception Error of ...` -- which four compiler modules declare -- OVERWRITES
+  // the predefined `Error`.  Enumerating `result` off the flat map then yields a
+  // constructor whose result type is `exn`; this map is the shadow-proof source.
+  std::unordered_map<std::string, TypePtr> predef_ctor_schemes_;
   std::set<std::string> exn_ctors_;
   std::set<const void*> ext_rebind_registered_;  // resolved Pext_rebind ctors
   // Exception/typext AST nodes already registered, so the flat `ctors` map isn't
@@ -2987,6 +2993,7 @@ struct Checker {
     ctors["Ok"] = eng.arrow(rok, eng.constr("result", {rok, rerr}));
     ctors["Error"] = eng.arrow(rerr, eng.constr("result", {rok, rerr}));
     predef_ctors_ = {"[]", "::", "None", "Some", "true", "false", "()", "Ok", "Error"};
+    for (auto& n : predef_ctors_) predef_ctor_schemes_[n] = ctors[n];
     type_ctors["bool"] = {"false", "true"};
     type_ctors["option"] = {"None", "Some"};
     type_ctors["list"] = {"[]", "::"};
@@ -5615,6 +5622,15 @@ struct Checker {
         r.k = MxClass::Record; r.decl = rd->second;
         return r;
       }
+      // `ref` is the one predefined type that is a RECORD (`{mutable contents}`),
+      // so unlike the variants above it has no entry in type_ctors and no local
+      // declaration to find.  Take its shape from stdlib.cmi like any other
+      // import; a source-level `type ref` would carry a stamp and never reach
+      // here, and with no stdlib on the path this just stays Unknown.
+      if (b == "ref" && imported_record("Stdlib.ref")) {
+        r.k = MxClass::Record; r.imported = "Stdlib.ref";
+        return r;
+      }
       return r;  // Unknown
     }
     if (type_ctor_schemes_.count(c->path)) {  // module-qualified local variant
@@ -5761,6 +5777,18 @@ struct Checker {
     }
     auto names = type_ctors.find(c.name);
     if (names == type_ctors.end()) throw MxBail{};
+    // A predefined column is never the flat map's to answer: see
+    // predef_ctor_schemes_.  mx_classify only says PredefVariant for a spelling
+    // that no local declaration shadows, so this list is exact.
+    if (c.k == MxClass::PredefVariant) {
+      std::vector<std::pair<std::string, TypePtr>> pout;
+      for (auto& n : names->second) {
+        auto pi = predef_ctor_schemes_.find(n);
+        if (pi == predef_ctor_schemes_.end()) throw MxBail{};
+        pout.emplace_back(n, pi->second);
+      }
+      return pout;
+    }
     std::string colb = mx_base(col->path);
     std::vector<std::pair<std::string, TypePtr>> out;
     for (auto& n : names->second) {
