@@ -12445,44 +12445,64 @@ struct Translator {
     return ea && eb && gm_const_eq(ea->c, eb->c);
   }
   // Chunk driver for a specializable column with interspersed var rows:
-  // split at the can_group boundaries (maximal specialized runs / var runs),
-  // compile the first run with the later runs consed onto the default
-  // environment, then attach each later run's handler in order -- inlined
-  // when its entry exit is used once, a catch otherwise (comp_match_handlers
-  // followed by Simplif's single-use exit inlining).  `spec` classifies a
-  // (peeled) column-0 pattern as a specialized-run member; everything else
-  // counts as a var row.
+  // split into collect's groups (matching.ml:1640), compile the first group
+  // with the later groups consed onto the default environment, then attach
+  // each later group's handler in order -- inlined when its entry exit is used
+  // once, a catch otherwise (comp_match_handlers followed by Simplif's
+  // single-use exit inlining).  `spec` classifies a (peeled) column-0 pattern
+  // as a specialized-group member; everything else counts as a var row.
+  //   A group is NOT a maximal run: collect seeds the discriminant from the
+  // first pending row's head, a row whose head cannot group with it defers,
+  // and a LATER groupable row rejoins the group whenever safe_before (:1341)
+  // holds against every deferred row -- swapping it above rows it can never
+  // race with is invisible.  So `| (1,1) | (_,3) | (9,9) | (_,4) | (7,_) | _`
+  // groups {1,3} first (row 3 is disjoint from row 2 in the second column),
+  // then {2,4}, then {5}, then {6}.  The deferred rows are split the same way,
+  // each group becoming its own half-match.
   LamPtr gmatch_run_chunks(const std::vector<LamPtr>& comps, const std::vector<MRow>& rows,
                            const Location& mloc, int deid, const std::vector<GmDef>& denv,
                            bool (*spec)(const Pattern*)) {
-    std::vector<std::pair<size_t, size_t>> runs;     // [begin, end) maximal runs
-    for (size_t i = 0; i < rows.size(); ) {
-      bool c = spec(rows[i].cols[0]);
-      size_t j = i + 1;
-      while (j < rows.size() && spec(rows[j].cols[0]) == c) ++j;
-      runs.push_back({i, j});
-      i = j;
+    std::vector<std::vector<size_t>> groups;         // row indices, source order
+    {
+      std::vector<size_t> pending(rows.size());
+      for (size_t i = 0; i < rows.size(); ++i) pending[i] = i;
+      while (!pending.empty()) {
+        bool discr = spec(rows[pending[0]].cols[0]);  // can_group's discriminant
+        std::vector<size_t> yes, no;
+        for (size_t i : pending) {
+          bool safe = spec(rows[i].cols[0]) == discr;
+          if (safe)
+            for (size_t q : no)
+              if (!gm_same_action(rows[i], rows[q]) && !gm_rows_disjoint(rows[i], rows[q]))
+                { safe = false; break; }
+          (safe ? yes : no).push_back(i);
+        }
+        groups.push_back(std::move(yes));            // never empty: pending[0] joins
+        pending = std::move(no);
+      }
     }
-    if (runs.size() < 2) return nullptr;
-    std::vector<int> eids(runs.size(), -1);          // entry exits for runs 1..n-1
-    for (size_t k = 1; k < runs.size(); ++k) eids[k] = ++next_exit_;
+    if (groups.size() < 2) return nullptr;
+    std::vector<int> eids(groups.size(), -1);        // entry exits for groups 1..n-1
+    for (size_t k = 1; k < groups.size(); ++k) eids[k] = ++next_exit_;
     auto env_from = [&](size_t k) {
       std::vector<GmDef> env;
-      for (size_t m = k; m < runs.size(); ++m) {
+      for (size_t m = k; m < groups.size(); ++m) {
         GmDef e{eids[m], {}};
-        for (size_t r = runs[m].first; r < runs[m].second; ++r) e.mat.push_back(rows[r].cols);
+        for (size_t r : groups[m]) e.mat.push_back(rows[r].cols);
         env.push_back(std::move(e));
       }
       env.insert(env.end(), denv.begin(), denv.end());
       return env;
     };
     auto chunk_rows = [&](size_t k) {
-      return std::vector<MRow>(rows.begin() + runs[k].first, rows.begin() + runs[k].second);
+      std::vector<MRow> out;
+      for (size_t r : groups[k]) out.push_back(rows[r]);
+      return out;
     };
     std::vector<LamPtr> cc = comps;
     LamPtr res = gmatch(std::move(cc), chunk_rows(0), mloc, deid, env_from(1));
     if (!res) return nullptr;
-    for (size_t k = 1; k < runs.size(); ++k) {
+    for (size_t k = 1; k < groups.size(); ++k) {
       std::vector<LamPtr> ck = comps;
       LamPtr hb = gmatch(std::move(ck), chunk_rows(k), mloc, deid, env_from(k + 1));
       if (!hb) return nullptr;
