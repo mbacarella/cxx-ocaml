@@ -11628,20 +11628,23 @@ struct Translator {
     rewrite_default_leaves(tree, fail_exit, nullptr);
     return tree;
   }
-  // combine_array's `call_switcher loc fail (Lvar len) ~low:0 len_lambda_list`:
-  // as_interval_canfail over the matched array LENGTHS with the default `high`
-  // (max_int), so the domain is closed above by a trailing fail interval.  That
-  // closure is the point -- a lone length 1 gives [(0,0,fail); (1,1,act);
-  // (2,max_int,fail)], which the Switcher collapses to ONE `(!= len 1)` test,
-  // where a domain treated as bounded would emit a truthy test on the length
-  // and take the length-1 arm for every non-empty array.
-  LamPtr len_switcher(const LamPtr& scrut, const std::vector<std::pair<int, LamPtr>>& cells,
-                      int fail_exit) {
+  // `call_switcher loc (Some fail) arg ?low int_lambda_list` = as_interval_canfail
+  // (matching.ml:2798) + Switcher.zyva over an arbitrary integer key set.  `low`
+  // is the domain's lower edge (0 for array lengths, OCaml's min_int for an
+  // unconstrained int); `high` is always max_int, so the domain is closed above
+  // by a trailing fail interval.  That closure is the point -- a lone key 1 gives
+  // [(low,0,fail); (1,1,act); (2,max_int,fail)], which the Switcher collapses to
+  // ONE `(!= k 1)` test, where a domain treated as bounded would emit a truthy
+  // test on the key and take that arm for every other value.  `cells` need not be
+  // sorted: as_interval sorts by key before building the intervals.
+  LamPtr interval_switcher(const LamPtr& scrut,
+                           const std::vector<std::pair<long long, LamPtr>>& cells,
+                           int fail_exit, long long low) {
     if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
-    const long long low = 0, high = (1LL << 62) - 1;   // ~low:0, OCaml's max_int
+    const long long high = (1LL << 62) - 1;        // OCaml's max_int
     auto fail = mk(Lam::K::Staticraise); fail->prim_arg = fail_exit;
     std::vector<LamPtr> actions{fail};             // index 0 = fail (canfail invariant)
-    std::vector<std::pair<long long, int>> l;      // (length, action index), ascending
+    std::vector<std::pair<long long, int>> l;      // (key, action index), ascending
     for (auto& [L, b] : cells) l.push_back({L, 0});
     std::sort(l.begin(), l.end());
     for (auto& [L, ai] : l) {
@@ -11689,6 +11692,22 @@ struct Translator {
       nofail_rec(l[0].first, l[0].first, l[0].second, 1);
     } else nofail_rec(l[0].first, l[0].first, l[0].second, 1);
     if (cases.size() < 2) return nullptr;
+    // zyva's abstract_shared wraps an action the store saw twice in a
+    // make_catch_delayed, which is a no-op only when that action is already a
+    // bare argless exit (as_simple_exit, matching.ml:1299).  We do not model the
+    // catch, so decline whenever one would be built: an action reached from two
+    // intervals, or -- below, once the clustering is known -- a multi-slot
+    // interval inside a jump table, whose slots make_switch shares the same way
+    // (its own act_uses pass, matching.ml:2669).
+    auto simple_exit = [](const LamPtr& b) {
+      return b && b->k == Lam::K::Staticraise && b->args.empty();
+    };
+    {
+      std::vector<int> use(actions.size(), 0);
+      for (auto& c : cases) if (c.act > 0) ++use[c.act];
+      for (size_t a = 1; a < actions.size(); ++a)
+        if (use[a] > 1 && !simple_exit(actions[a])) return nullptr;
+    }
     // get_edges: the first and last KEY bound the interval tests, so ordinary
     // (small) lengths keep them enabled even though `high` is max_int.
     long long e_lo = l.front().first, e_hi = l.back().first;
@@ -11698,15 +11717,24 @@ struct Translator {
     std::vector<int> k; comp_clusters(cases, k);
     std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
     make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
-    // Unlike the two constant/tag switchers above, a dense run of lengths DOES
-    // become make_switch's jump table here: combine_array's caller has no flat
-    // Lswitch to fall back on, so declining one bails the WHOLE match to the
-    // and-chain (`(if (== (array.length ..) 1) .. )`) instead of `catch` +
-    // `switch*` over the length.
-    (void)made_switch;
+    // Unlike the two tag switchers above, a dense run DOES become make_switch's
+    // jump table here: neither caller has a flat Lswitch to fall back on, so
+    // declining one bails the WHOLE match to the and-chain (`(if (== (array.length
+    // ..) 1) .. )`) instead of `catch` + `switch*`.  Only the sharing case above
+    // is out of scope.
+    if (made_switch)
+      for (auto& c : cases)
+        if (c.act > 0 && c.lo != c.hi && !simple_exit(actions[c.act])) return nullptr;
     LamPtr tree = c_test({0, scrut}, cl_cases, cl_acts);
     rewrite_default_leaves(tree, fail_exit, nullptr);
     return tree;
+  }
+  // combine_array's `call_switcher loc fail (Lvar len) ~low:0 len_lambda_list`.
+  LamPtr len_switcher(const LamPtr& scrut, const std::vector<std::pair<int, LamPtr>>& cells,
+                      int fail_exit) {
+    std::vector<std::pair<long long, LamPtr>> c;
+    for (auto& [L, b] : cells) c.emplace_back((long long)L, b);
+    return interval_switcher(scrut, c, fail_exit, /*low=*/0);
   }
   // ctor_match's twin of gmatch's const_side: when the uncovered constant slots
   // (`covered` = explicitly matched values) were filled with a common argless
@@ -13561,16 +13589,39 @@ struct Translator {
             return gmatch(std::move(cc), std::move(sub), mloc, cdflt);
           return gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(se));
         };
-        // Chain: if col0 <> v0 then (.. else cdflt) else S(v0).  The last value's
-        // else is the shared default -- so S(vLast) stays inline and the default
-        // rides a `branchif`, matching ocamlc's do_tests_fail layout.
-        LamPtr chain = mkcd();
+        // Compile each value's sub-matrix once, last value first (the chain below
+        // is built inside-out and the Switcher does not care about the order).
+        std::vector<LamPtr> vbody(vals.size());
         for (int idx = (int)vals.size() - 1; idx >= 0; --idx) {
-          LamPtr sv = sub_for(vals[idx]);
-          if (!sv) return nullptr;
-          auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt; ne->args = {comps[0], cint(vals[idx])};
-          auto iff = mk(Lam::K::IfThenElse); iff->cond = ne; iff->then_ = chain; iff->else_ = sv;
-          chain = iff;
+          vbody[idx] = sub_for(vals[idx]);
+          if (!vbody[idx]) return nullptr;
+        }
+        // combine_constant's `Const_int` arm (matching.ml:3117) is `call_switcher
+        // loc fail arg int_lambda_list` with the DEFAULT edges -- never a
+        // hand-rolled test chain.  as_interval_canfail closes the domain with a
+        // fail interval at each end and zyva's comp_clusters folds any dense run
+        // of values into make_switch's JUMP TABLE under one `isout` test, which
+        // is what `| 1 -> .. | 2 -> .. | 3 -> ..` compiles to (particular_case,
+        // switch.ml:818) and what a spread-out set like 1/7/12 still reaches
+        // through the theta density test.
+        LamPtr chain;
+        {
+          std::vector<std::pair<long long, LamPtr>> cells;
+          for (size_t i = 0; i < vals.size(); ++i) cells.emplace_back(vals[i], vbody[i]);
+          chain = interval_switcher(comps[0], cells, cdflt, /*low=*/-(1LL << 62));
+        }
+        // Fallback chain: if col0 <> v0 then (.. else cdflt) else S(v0).  The last
+        // value's else is the shared default -- so S(vLast) stays inline and the
+        // default rides a `branchif`, matching ocamlc's do_tests_fail layout.
+        if (!chain) {
+          chain = mkcd();
+          for (int idx = (int)vals.size() - 1; idx >= 0; --idx) {
+            auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
+            ne->args = {comps[0], cint(vals[idx])};
+            auto iff = mk(Lam::K::IfThenElse);
+            iff->cond = ne; iff->then_ = chain; iff->else_ = vbody[idx];
+            chain = iff;
+          }
         }
         // The var/any default sub-matrix, compiled once behind cdflt.
         std::vector<MRow> dsub;
