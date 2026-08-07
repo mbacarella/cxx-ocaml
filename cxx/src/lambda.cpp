@@ -12322,6 +12322,19 @@ struct Translator {
       return 1;
     });
   }
+  bool denv_spec_int(std::vector<GmDef>& env, long long v) {
+    return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
+                             std::vector<std::vector<const Pattern*>>& out) -> int {
+      if (!gmdef_omega(p0)) {
+        auto* pc = std::get_if<Ppat_constant>(&p0->desc);
+        auto* pi = pc ? std::get_if<Pconst_integer>(&pc->c.desc) : nullptr;
+        if (!pi) return -1;
+        if (parse_ocaml_int(pi->value) != v) return 0;
+      }
+      out.emplace_back(row.begin() + 1, row.end());
+      return 1;
+    });
+  }
   bool denv_spec_ctor(std::vector<GmDef>& env, const std::string& type,
                       bool is_block, int tag, int a,
                       const std::vector<std::string>* rlab) {
@@ -13408,6 +13421,17 @@ struct Translator {
         std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
         int cdflt = ++next_exit_;                // shared default (var/any rows)
         auto mkcd = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = cdflt; return e; };
+        // The shared default's own matrix, over the CURRENT columns: upstream's
+        // insert_split conses it onto the DEFAULT ENVIRONMENT (matching.ml:1666),
+        // so each const sub-matrix carries it as a pending entry rather than an
+        // opaque exit.  Default_environment then drops the entry in any branch
+        // whose context makes it unmatchable, and the miss continues to the entry
+        // BELOW it.  Modelling that is what puts a guard failure under `a=1;b=1`
+        // on the outer catch-all instead of on a `{b=3}` row that cannot fire.
+        std::vector<std::vector<const Pattern*>> dmat;
+        for (auto& r : rows)
+          if (!std::get_if<Ppat_constant>(&r.cols[0]->desc))
+            dmat.emplace_back(r.cols.begin(), r.cols.end());
         // S(v): the const rows with value v (col0 dropped); a miss exits to cdflt.
         auto sub_for = [&](long long v) -> LamPtr {
           std::vector<MRow> sub;
@@ -13416,7 +13440,14 @@ struct Translator {
               MRow nr = r; nr.cols.erase(nr.cols.begin()); sub.push_back(std::move(nr));
             }
           std::vector<LamPtr> cc = rest;
-          return gmatch(std::move(cc), std::move(sub), mloc, cdflt);
+          std::vector<GmDef> se = denv;
+          if (!dmat.empty()) se.insert(se.begin(), {cdflt, dmat});
+          // An unsupported column shape in some entry: fall back to funnelling
+          // every miss through cdflt unconditionally (always sound, just less
+          // precise than upstream).
+          if (!denv_spec_int(se, v))
+            return gmatch(std::move(cc), std::move(sub), mloc, cdflt);
+          return gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(se));
         };
         // Chain: if col0 <> v0 then (.. else cdflt) else S(v0).  The last value's
         // else is the shared default -- so S(vLast) stays inline and the default
