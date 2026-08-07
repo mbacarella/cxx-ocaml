@@ -21532,13 +21532,28 @@ struct Translator {
       // an `[@@unboxed]` constructor is a no-op wrapper: its value is its argument
       if (auto ci = ctor_info_.find(n); ci != ctor_info_.end() && ci->second.unboxed && k->arg)
         return expr(**k->arg);
-      if (n == "[]" || n == "None" || n == "false" || n == "()") { auto z = mk(Lam::K::ConstInt); z->int_val = 0; return z; }
-      if (n == "true") { auto z = mk(Lam::K::ConstInt); z->int_val = 1; return z; }
-      if (n == "::" && k->arg) {  // a :: b : block tag 0 of (head, tail)
-        if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc); at && at->elems.size() == 2)
-          return block_of(0, {at->elems[0].get(), at->elems[1].get()});
+      // The predefined constructors answer themselves by name -- but only while
+      // the name still MEANS them, which these bare returns could not see.  A
+      // local `exception Some of int` leaves the builtin mark in place and adds
+      // an identity, so `raise (Some 3)` built the OPTION block and no
+      // `with Some n` arm could catch it; a local `type v = X | None | Y` or
+      // `type u = B of int | Some of int` un-marks the builtin instead, and its
+      // None/Some sit at index 1, not 0.  Everything below already decides all
+      // three correctly -- exn_shadows for the exception, the flat entry for a
+      // local variant, and predef_typed to pull the predefined one back when
+      // the inferred type asks for it -- and only these early returns beat it
+      // to the answer.  Unsquatted, which is every other use in the corpus,
+      // nothing reaches past this gate and nothing changes.
+      if (builtin_ctors_.count(n) && !exn_ident_.count(n) &&
+          !exn_field_.count(n)) {
+        if (n == "[]" || n == "None" || n == "false" || n == "()") { auto z = mk(Lam::K::ConstInt); z->int_val = 0; return z; }
+        if (n == "true") { auto z = mk(Lam::K::ConstInt); z->int_val = 1; return z; }
+        if (n == "::" && k->arg) {  // a :: b : block tag 0 of (head, tail)
+          if (auto* at = std::get_if<Pexp_tuple>(&(*k->arg)->desc); at && at->elems.size() == 2)
+            return block_of(0, {at->elems[0].get(), at->elems[1].get()});
+        }
+        if (n == "Some" && k->arg) return block_of(0, {k->arg->get()});
       }
-      if (n == "Some" && k->arg) return block_of(0, {k->arg->get()});
       // a LOCAL exception/extension ctor shadows a same-named builtin ctor
       // (`exception Ok` vs result's Ok); in raise position the argument is
       // exn-typed, so a registered exception wins over a same-named variant
