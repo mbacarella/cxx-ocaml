@@ -19092,7 +19092,11 @@ struct Translator {
           if (v.second > v.first) has_interval = true;
         }
         by_src.push_back(r.rhs);
-        or_row.push_back(vals.size() > 1);
+        // An INTERVAL pattern is an or-pattern too: type_pat expands `'0' .. '9'`
+        // into a Tpat_or chain of ten constants, so precompile_or peels it just
+        // like `'a' | 'x'` and the row's action is a bare exit before StoreExp
+        // ever sees it.  Judge by the values covered, not by the range count.
+        or_row.push_back(vals.size() > 1 || vals[0].second > vals[0].first);
         if (!aliases.empty()) row_aliases[r.rhs] = std::move(aliases);
       } else if (aliases.empty() && is_catchall(*p) && !has_tail &&
                  (dflt.empty() || dflt.back()->guard)) {
@@ -19146,13 +19150,23 @@ struct Translator {
         scope.emplace_back();
         for (auto& nm : ita->second) scope.back()[nm] = scrut->var;
       }
+      int e0 = next_exit_;
       LamPtr b = expr(*by_src[s]);
       if (framed) scope.pop_back();
       // precompile_or peels an OR row before upstream's StoreExp runs, so its
       // action is already a bare `(exit i)` there and can never key equal to
-      // another row's body: an empty key keeps it out of the dedup and out of
-      // the default-shared bail below, exactly as const_ctor_switcher does.
-      std::string key = or_row[s] ? std::string() : make_lam_key(b);
+      // another row's body: an empty key keeps it out of the dedup, exactly as
+      // const_ctor_switcher does.
+      //
+      // Nor can a body whose own compilation MINTED a static handler.  StoreExp
+      // keys the pre-Simplif action and make_key copies Lstaticraise's index and
+      // Lstaticcatch's handler id verbatim (lambda.ml:487), so two arms that each
+      // compiled a nested match get different ids and never share -- even when
+      // Simplif later inlines both single-use handlers back to the same term.  An
+      // exit to an ENCLOSING handler is the same id in both bodies and does not
+      // trip this: only ids minted while translating THIS body count.
+      std::string key =
+          (or_row[s] || next_exit_ != e0) ? std::string() : make_lam_key(b);
       int at = (int)s;
       if (!key.empty())
         for (size_t t = 0; t < body_keys.size(); ++t)
@@ -19181,10 +19195,12 @@ struct Translator {
       iff->cond = drows[i].guard; iff->then_ = drows[i].body; iff->else_ = default_body;
       default_body = iff;
     }
-    {  // a case body equal to the default is folded into the default by ocamlc
-      std::string dk = make_lam_key(default_body);
-      if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) return nullptr;
-    }
+    // A case body equal to the DEFAULT body does not fold into the fail action:
+    // combine_constant's `fail` is the default pm's `Lstaticraise (d, [])`, not
+    // its body (the body is comp_match_handlers' handler, outside the switch),
+    // so it can never key equal a real arm body.  Such arms still key equal each
+    // OTHER, which the dedup above already handles -- and being multi-use they
+    // are Shared, i.e. one exit whose single surviving leaf Simplif inlines.
     // the closing row's own action reaches the same body as the default does
     if (tail_act) actions[tail_act] = clone_or_leaf(0, actions);
 
@@ -19222,8 +19238,15 @@ struct Translator {
     // exactly what c_test builds below.  Route multi-char discrete matches here.
     // An or-flattened multi-value action (occ >= 2) also stays here: int_cases
     // cannot reproduce the shared test tree for those.
+    //
+    // Shared-ness is decided per KEY, not per interval: as_interval_canfail calls
+    // do_store once for every constant in the sorted list and only then merges a
+    // run of equal indices, so an arm covering a RANGE is stored range-width
+    // times and comes back Shared even though it occupies one interval.  Count
+    // values (capped at 2 -- only ">= 2" is ever asked).
     std::vector<int> occ(actions.size(), 0);
-    for (int a : act_of) occ[a]++;
+    for (size_t i = 0; i < kvs.size(); ++i)
+      occ[act_of[i]] += (int)std::min<long long>(kvs[i].hi - kvs[i].lo + 1, 2);
     bool has_multi = false;
     for (size_t s = 1; s < occ.size(); ++s) if (occ[s] >= 2) has_multi = true;
     if (!made_switch && !has_interval && !is_char && !has_multi) return nullptr;
@@ -19471,8 +19494,7 @@ struct Translator {
       // split_or peels an or-row into its own PmOr, so by the time upstream's
       // StoreExp runs, that row's action is already a bare `(exit i)` and can
       // never be keyed equal to another row's body.  Leave an or-row's key
-      // EMPTY so it neither joins nor anchors a canon class -- and so the
-      // default-shared bail below ignores it too, for the same reason.
+      // EMPTY so it neither joins nor anchors a canon class.
       // (`| A|C -> f 0 | B|E -> f 0 | D -> .. | _ -> ..` keeps two handlers
       // upstream; merging them collapsed the whole switch to one if-tree.)
       std::string key = or_row[s] ? std::string() : action_dedup_key(b, *by_src[s]);
@@ -19490,8 +19512,6 @@ struct Translator {
       bind_catchall(*dflt->lhs, scrut);
       default_body = expr(*dflt->rhs);
       scope.pop_back();
-      std::string dk = action_dedup_key(default_body, *dflt->rhs);
-      if (!dk.empty()) for (auto& bk : body_keys) if (bk == dk) CCS_BAIL("default-shared");
     }
 
     // A multi-value action (or-flattened `A | B -> e`) is stored more than once,
