@@ -21544,13 +21544,43 @@ struct Translator {
       // exn-typed, so a registered exception wins over a same-named variant
       bool raise_pos = raise_arg_;
       raise_arg_ = false;  // consumed by the head constructor only
-      bool exn_shadows = (exn_ident_.count(n) || exn_field_.count(n)) &&
-                         (raise_pos || !ctor_info_.count(n) || builtin_ctors_.count(n));
+      // The node's INFERRED type is a PREDEFINED variant that declares this
+      // constructor, so that is the one meant however the flat name-keyed map
+      // has been squatted -- by a local `exception Error of string`, or by a
+      // local `type u = Error of int` whose declaration is simply later in
+      // scope.  This is the CONSTRUCT-side twin of the column pivot the
+      // matcher already uses (predef_ctor_lookup at the two pattern pivots),
+      // and the two must agree: `exception Error of string` + `f (Error 2)` at
+      // `(int,int) result` built the EXCEPTION block, whose identity word `f`
+      // then read as an int -- a producer/consumer miscompile, not a fidelity
+      // diff.  Never in RAISE position, where the head is exn-typed by
+      // construction, and never when a local type of that name exists
+      // (`type result = ..` of one's own).
+      const CtorInfo* predef_typed = nullptr;
+      if (!raise_pos && std::holds_alternative<Lident>(k->id.txt.v))
+        if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end()) {
+          std::string ety = ec->second;
+          if (ety.rfind("Stdlib.", 0) == 0) ety = ety.substr(7);  // the wrapper
+          if (ety.find('.') == std::string::npos && !type_ctor_info_.count(ety))
+            if (auto* pc = predef_ctor_lookup(ety, n);
+                pc && pc->is_block == k->arg.has_value())  // shape guard
+              predef_typed = pc;
+        }
       // A QUALIFIED `M.C` resolves via M's own type, OUTRANKING a same-named
       // local/bare ctor (typecore's `Env.Pattern` vs its local `Pattern`).
       const CtorInfo* qci = std::holds_alternative<Ldot>(k->id.txt.v)
                             ? qualified_ctor_info(k->id.txt) : nullptr;
-      const CtorInfo* cip = qci;
+      // ...and that outranking must beat the local-exception shadow too, which
+      // is why this is computed BEFORE it: a path that names its module cannot
+      // be captured by an unqualified `exception Error of string`, so
+      // `Stdlib.Error 6` at `(int,int) result` built the EXCEPTION for exactly
+      // the same reason the bare spelling did.  When M really does export the
+      // exception, qci is that exception's own entry, so this stays right.
+      bool exn_shadows = (exn_ident_.count(n) || exn_field_.count(n)) &&
+                         !predef_typed && !qci &&
+                         (raise_pos || !ctor_info_.count(n) ||
+                          builtin_ctors_.count(n));
+      const CtorInfo* cip = qci ? qci : predef_typed;
       if (!cip) { auto ci = ctor_info_.find(n); if (ci != ctor_info_.end()) cip = &ci->second; }
       // `open M` (M separately compiled) exporting an exception E shadows a same-
       // named PERVASIVE variant ctor (Stdlib's result.Ok / .Error).  In RAISE

@@ -6598,6 +6598,19 @@ struct Checker {
     };
     return lastc(found) != lastc(want);
   }
+  // The predefined type that declares `cn` -- "result" for Ok/Error, "option"
+  // for None/Some, and so on -- or "" when the name is not predefined.  Read
+  // off the scheme captured at registration, since a local `exception Error`
+  // overwrites the flat `ctors` entry and a local `type result` overwrites the
+  // `type_ctors` one.
+  std::string predef_ctor_owner(const std::string& cn) {
+    auto it = predef_ctor_schemes_.find(cn);
+    if (it == predef_ctor_schemes_.end()) return "";
+    TypePtr res;
+    ctor_params(eng.instantiate(it->second), res);
+    TypePtr r = I::Engine::repr(res);
+    return r->kind == I::Type::Kind::Constr ? r->path : "";
+  }
   void resolve_pending_disambig() {
     for (auto& [p, t] : pending_pat_disambig_) disambig_pat_now(*p, t);
     for (auto& [e, t] : pending_expr_disambig_)
@@ -6641,11 +6654,32 @@ struct Checker {
                         ambiguous_ctors_.count(cn) &&
                         !exn_ctors_.count(cn) && !predef_ctors_.count(cn) &&
                         scrut_owns_ctor(er->path, cn);
+    // The expected type is the PREDEFINED variant that declares `cn`.  Neither
+    // gate above reaches this: a predef type is spelled DOTLESS (or through the
+    // Stdlib wrapper) and predef names are excluded from er_local_amb, which is
+    // why the comment above sends them to "their own machinery" -- and that
+    // machinery is find_ctor, which by design answers a shadowing local
+    // `exception Error of string` or a later `type u = Error of int` for an
+    // unqualified `Error` even where the expectation says otherwise.  Recording
+    // the expectation lets the back end recover the predef constructor the way
+    // the matcher's column pivot already does; without it, `f (Error 2)` at
+    // `(int,int) result` built the EXCEPTION and `f` read its identity as an
+    // int.  Owner comes off the captured predef scheme, not `type_ctors`, whose
+    // entry a same-named local declaration overwrites; and a local declaration
+    // of the type itself disables this outright.
+    std::string bare_er = er->path.rfind("Stdlib.", 0) == 0 ? er->path.substr(7)
+                                                            : er->path;
+    bool er_predef = er->kind == I::Type::Kind::Constr &&
+                     bare_er.find('.') == std::string::npos &&
+                     std::holds_alternative<Lident>(k->id.txt.v) &&
+                     predef_ctors_.count(cn) &&
+                     !type_ctor_schemes_.count(bare_er) &&
+                     predef_ctor_owner(cn) == bare_er;
     TypePtr* sch = find_ctor(cn);
     if ((er_variant || er_local_amb) && !sch) {
       rec_expr_[&e] = expected;
       if (er_local_amb) ctor_arg_type_[&e] = er;
-    } else if ((er_variant || er_local_amb) && sch &&
+    } else if ((er_variant || er_local_amb || er_predef) && sch &&
                std::holds_alternative<Lident>(k->id.txt.v)) {
       // Type-directed disambiguation of a SHADOWED constructor: a bare ctor
       // resolves by its EXPECTED type, not by lexical scope.  find_ctor
@@ -6678,7 +6712,8 @@ struct Checker {
         // through the ctor-arg map so vk.expr_constr records it (the
         // general rec_expr_ harvest gates dotless paths on stamp
         // identity, which an annotation-built Constr may not carry).
-        if (er_local_amb) ctor_arg_type_[&e] = er;
+        // A predef type is dotless for the same reason and needs it too.
+        if (er_local_amb || er_predef) ctor_arg_type_[&e] = er;
       }
     }
     // Descend into the constructor's ARGUMENTS with their DECLARED types --
@@ -6691,6 +6726,24 @@ struct Checker {
     // producer in step with the consumer half below.
     if (!k->arg || er->kind != I::Type::Kind::Constr) return;
     std::vector<TypePtr> ps = ctor_decl_arg_types(er->path, cn);
+    // A PREDEFINED constructor is in none of the declaration tables, so the
+    // walk stopped dead at the outer `::`/`Some` of `[Ok 1; Error 2]` or
+    // `Some (Error 2)` at `(int,int) result list`/`option` and never reached
+    // the shadowed element.  Instantiate the captured scheme and pin its
+    // result to the expectation -- only that makes the element type concrete
+    // for the sub-walk.  The instantiation is fresh, so the unification binds
+    // its own variables and cannot leak into the predefined scheme.
+    if (ps.empty() && predef_ctor_owner(cn) == bare_er &&
+        !type_ctor_schemes_.count(bare_er)) {
+      auto pit = predef_ctor_schemes_.find(cn);
+      if (pit != predef_ctor_schemes_.end()) {
+        TypePtr pres;
+        std::vector<TypePtr> pp =
+            ctor_params(eng.instantiate(pit->second), pres);
+        soft_unify(pres, er);
+        ps = std::move(pp);
+      }
+    }
     if (ps.empty()) return;
     auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
     if (ps.size() > 1) {
