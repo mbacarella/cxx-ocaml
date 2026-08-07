@@ -13446,7 +13446,18 @@ struct Translator {
         LamPtr dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid, std::move(de));
         if (!dbody) return nullptr;
         int bad = 0; int uses = count_exit(chain, cdflt, false, bad);
-        if (uses == 1 && bad == 0) inline_exit(chain, cdflt, {}, {}, dbody);
+        // simplify_exits' bare-re-raise rule (simplif.ml:306): `Lstaticcatch
+        // (l1,(i,[]),Lstaticraise (j,[]))` is dropped OUTRIGHT and `exit i`
+        // retargeted at j -- unconditionally, whatever the use count.  With no
+        // var/any row in this column the shared default IS such a re-raise
+        // (the miss continues to the env / deid), so upstream has no catch
+        // here at all.  Keeping ours costs the exit it re-raises a use, which
+        // is what let a trailing peeled row's catch be inlined INTO this
+        // handler instead of staying outside it (`(catch (catch .. with (i)
+        // <row>) with (j) <last row>)`, n8).
+        if (dbody->k == Lam::K::Staticraise && dbody->args.empty())
+          inline_exit(chain, cdflt, {}, {}, dbody);
+        else if (uses == 1 && bad == 0) inline_exit(chain, cdflt, {}, {}, dbody);
         else if (uses > 0) {
           auto c = mk(Lam::K::Catch); c->cond = chain; c->prim_arg = cdflt; c->then_ = dbody; chain = c;
         }
