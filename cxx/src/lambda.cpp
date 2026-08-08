@@ -11669,9 +11669,13 @@ struct Translator {
   // sorted: as_interval sorts by key before building the intervals.
   LamPtr interval_switcher(const LamPtr& scrut,
                            const std::vector<std::pair<long long, LamPtr>>& cells,
-                           int fail_exit, long long low) {
+                           int fail_exit, long long low,
+                           long long high = (1LL << 62) - 1) {
     if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
-    const long long high = (1LL << 62) - 1;        // OCaml's max_int
+    // `high` closes the domain above; OCaml's max_int by default, but a
+    // CHARACTER column is 0..255 (combine_constant's Const_char arm passes
+    // exactly those edges to call_switcher), and the tighter edge is what
+    // lets the top interval be dropped instead of tested.
     auto fail = mk(Lam::K::Staticraise); fail->prim_arg = fail_exit;
     std::vector<LamPtr> actions{fail};             // index 0 = fail (canfail invariant)
     std::vector<std::pair<long long, int>> l;      // (key, action index), ascending
@@ -12385,9 +12389,16 @@ struct Translator {
                              std::vector<std::vector<const Pattern*>>& out) -> int {
       if (!gmdef_omega(p0)) {
         auto* pc = std::get_if<Ppat_constant>(&p0->desc);
-        auto* pi = pc ? std::get_if<Pconst_integer>(&pc->c.desc) : nullptr;
-        if (!pi) return -1;
-        if (parse_ocaml_int(pi->value) != v) return 0;
+        if (!pc) return -1;
+        // Chars share the int domain (see the column above), so a default
+        // entry whose head is a char literal is specializable too -- leaving
+        // it unsupported would funnel every miss straight to the shared
+        // default and lose upstream's Default_environment precision.
+        if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc)) {
+          if ((long long)(unsigned char)ch->code != v) return 0;
+        } else if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
+          if (parse_ocaml_int(pi->value) != v) return 0;
+        } else return -1;
       }
       out.emplace_back(row.begin() + 1, row.end());
       return 1;
@@ -13532,11 +13543,23 @@ struct Translator {
     // bails the WHOLE wide match to the caml_obj_tag if-chain (simplif/bytegen's
     // `lambda`-type matches).  Second-pass + budgeted like the tuple/record columns.
     if (g_gm_tuples_) {
-      bool anyconst = false, purecol = true;
+      bool anyconst = false, purecol = true, charcol = false;
       for (auto& r : rows) {
         auto& d = r.cols[0]->desc;
         if (auto* pc = std::get_if<Ppat_constant>(&d)) {
-          if (!std::get_if<Pconst_integer>(&pc->c.desc)) { purecol = false; break; }
+          // A CHARACTER column belongs to this domain too: matching.ml's
+          // combine_constant sends Const_char through the same call_switcher,
+          // only with the 0..255 edges instead of min_int..max_int.  Without
+          // it, one char column bailed the whole tuple match to the allocating
+          // path -- binutils' `match magic.[0], .., magic.[3] with '\x7F','E',
+          // 'L','F' -> ..` built a 4-block and read it back field by field
+          // where ocamlc dispatches the four stack slots directly.
+          bool isch = std::holds_alternative<Pconst_char>(pc->c.desc);
+          if (!isch && !std::get_if<Pconst_integer>(&pc->c.desc)) { purecol = false; break; }
+          // Typing keeps a column to one domain; be defensive anyway, since
+          // the two use different edges and a mixed list would pick one.
+          if (anyconst && isch != charcol) { purecol = false; break; }
+          charcol = isch;
           anyconst = true;
         } else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d)) {
           purecol = false; break;
@@ -13580,6 +13603,8 @@ struct Translator {
         if (g_gm_budget_ > 0) --g_gm_budget_;
         auto colval = [&](const Pattern* p) -> long long {
           auto* pc = std::get_if<Ppat_constant>(&p->desc);
+          if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc))
+            return (unsigned char)ch->code;
           return parse_ocaml_int(std::get_if<Pconst_integer>(&pc->c.desc)->value);
         };
         std::vector<long long> vals;   // distinct values, in row order
@@ -13638,7 +13663,9 @@ struct Translator {
         {
           std::vector<std::pair<long long, LamPtr>> cells;
           for (size_t i = 0; i < vals.size(); ++i) cells.emplace_back(vals[i], vbody[i]);
-          chain = interval_switcher(comps[0], cells, cdflt, /*low=*/-(1LL << 62));
+          chain = interval_switcher(comps[0], cells, cdflt,
+                                    /*low=*/charcol ? 0 : -(1LL << 62),
+                                    /*high=*/charcol ? 255 : (1LL << 62) - 1);
         }
         // Fallback chain: if col0 <> v0 then (.. else cdflt) else S(v0).  The last
         // value's else is the shared default -- so S(vLast) stays inline and the
@@ -17384,6 +17411,9 @@ struct Translator {
     gm_tp_deid_ = (proven_total && !catchall) ? deid : -1;
     gm_orw_.clear();
     LamPtr body = gmatch(comps, mrows, mloc, deid);
+    if (cppcaml::dbg_env("MTDBG"))
+      fprintf(stderr, "[MTDBG] gmatch_tuple_top gmatch=%s line=%d\n",
+              body ? "OK" : "NULL", mloc.start.lnum);
     gm_tp_deid_ = tp_save;
     gm_fake_deid_ = fd_save;
     g_gm_tuples_ = false; g_gm_budget_ = -1;
@@ -20725,6 +20755,9 @@ struct Translator {
             if (LamPtr r = gmatch_tuple_top(tu, vrows, e.loc,
                                             match_is_total(&e) && total_is_proven(&e)))
               return r;
+          if (cppcaml::dbg_env("MTDBG"))
+            fprintf(stderr, "[MTDBG] tuple-match BAIL k=%zu rows=%zu erows=%zu line=%d\n",
+                    tu->elems.size(), vrows.size(), erows.size(), e.loc.start.lnum);
         }
       if (!erows.empty() && !vrows.empty() && frows.empty()) {
         int eid = ++next_exit_;
