@@ -12816,6 +12816,63 @@ struct Translator {
       }
       return out;
     }
+    // matching.ml's leading all-VARIABLE guarded row: half_simplify rewrites a
+    // row of variables into an all-omega row with its binds attached, and
+    // split_and_precompile gives that row its own group -- the guard tests
+    // FIRST, in row order, with the rest of the matrix as the guard-failure
+    // continuation behind one exit.  const_body/block_body's spread would
+    // instead dispatch a later row's column first and re-test this row's guard
+    // in every cell (update_level's `Tconstr (p, _tl, _abbrev) when level <
+    // Path.scope p` before `Tconstr (p, _::_, _)`: the guard ran on both sides
+    // of the cons test and its arm became a shared catch upstream inlines).
+    //   Runs AFTER the gm_facc materialization above: upstream binds column
+    // 0's arg at compile_match_nonempty entry, BEFORE splitting, so a guard
+    // reading column 0 sees the shared binding (count-substituted like
+    // upstream's Alias bind).  Later columns stay raw expressions in upstream
+    // too, so groups A and B re-reading them independently is faithful.
+    //   Multi-column only -- a single column takes gmatch_inner's own guarded
+    // catch-all split (same shape).  Requires a real VARIABLE column: an
+    // all-wildcard row is the pre-materialization barrier's shape (its field
+    // reads belong inside group B), and the top-level `_ when g` rows the
+    // tuple expansion mints stay with the chunk machinery that already
+    // matches upstream.  Group A does no dispatch at all (every column just
+    // binds), so group B repeats no test -- unlike the `(_, X) when g` mixed
+    // row that made the multi-column form of the single-column split blow up.
+    //   And only when SOME row tests column 0: a column that is var/omega in
+    // EVERY row is popped first with ONE shared bind (gmatch_inner's !anyctor
+    // pop, upstream's variable rule + arg_to_var) -- splitting before the pop
+    // would compile that bind per group, re-reading a field upstream binds
+    // once (persistent_env's `filename, visibility when allow_hidden` before
+    // `filename, Visible`: visibility is one shared alias).  The pop re-enters
+    // gmatch, so the split still fires at the first column some row dispatches.
+    if (denv.empty() && rows.size() >= 2 && comps.size() >= 2 &&
+        rows[0].guard && comps[0] && row_all_var(rows[0])) {
+      bool has_var = false;
+      for (auto* c : rows[0].cols) {
+        const Pattern* ep = effective_pat(c);
+        if (std::get_if<Ppat_var>(&ep->desc) ||
+            std::get_if<Ppat_alias>(&ep->desc)) { has_var = true; break; }
+      }
+      bool col0_tested = false;
+      for (auto& r : rows)
+        if (!pat_omega_like(r.cols[0])) { col0_tested = true; break; }
+      if (has_var && col0_tested) {
+        int e = ++next_exit_;
+        std::vector<MRow> A(rows.begin(), rows.begin() + 1);
+        std::vector<MRow> B(rows.begin() + 1, rows.end());
+        std::vector<LamPtr> ca = comps, cb = comps;
+        LamPtr bodyA = gmatch(std::move(ca), std::move(A), mloc, e);
+        LamPtr bodyB = bodyA ? gmatch(std::move(cb), std::move(B), mloc, deid) : nullptr;
+        if (bodyA && bodyB) {
+          int bad = 0; int uses = count_exit(bodyA, e, false, bad);
+          if (uses == 0) { --next_exit_; return bodyA; }
+          if (uses == 1 && bad == 0) { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          auto c = mk(Lam::K::Catch); c->cond = bodyA; c->prim_arg = e; c->then_ = bodyB;
+          return c;
+        }
+        --next_exit_;                     // fall through to the spread path
+      }
+    }
     // A leading UNGUARDED all-wildcard row matches every value, so the rows after
     // it are dead.  ocamlc drops them and emits that row's action with no column
     // test.  Our column dispatch (const_body/block_body) would instead spread the
