@@ -373,6 +373,24 @@ struct Checker {
   // binding there poisons `open F(X)`.  "" as the path = conflictingly
   // rebound, so no expansion is attempted.
   std::unordered_map<std::string, std::pair<std::string, int>> functor_module_apps_;
+  // The same bindings keyed by their QUALIFIED name ("Functor_app_diff.Diff"),
+  // with the functor's dotted path and, per application, the ARGUMENT module's
+  // registration path ("Functor_app_diff.Defs"; "" = not a named module).
+  // functor_module_apps_ stays the bare-keyed owner-expansion map; this one
+  // exists because includemod binds TWO `Diff = Diffing.Define(Defs)`, one per
+  // nested module, and a type-directed walk of one match must not read the
+  // other application's argument.  "" as the functor path = conflicting rebind.
+  std::unordered_map<std::string,
+                     std::pair<std::string, std::vector<std::string>>>
+      functor_app_args_;
+  // Every "<Enclosing.>Name." prefix register_types_rec walked -- the oracle
+  // for resolving a WRITTEN module name to its registration prefix,
+  // innermost-outward from the use site's own nesting.
+  std::set<std::string> local_module_prefixes_;
+  // The module-body nesting process_item is currently inside ("A.B." form).
+  // Pending disambig records capture it, because the deferred walk runs at the
+  // fixpoint, long after the item's scope is gone.
+  std::string proc_mod_prefix_;
   // names that are also predefined or exception constructors: when one of these
   // is reused by a variant, OCaml disambiguates by expected type (which we lack),
   // so we keep them unknown rather than resolve to the wrong kind.
@@ -4702,6 +4720,42 @@ struct Checker {
     return nullptr;
   }
 
+  // The registration path of a module name WRITTEN at some nesting depth: a
+  // `Defs` cited inside module M means M.Defs when register_types_rec walked
+  // such a module, the shallowest enclosing spelling otherwise, the written
+  // name itself (a unit, an alias) when no local module matches.
+  std::string resolve_written_module(const std::string& n) {
+    for (std::string pfx = proc_mod_prefix_;;) {
+      if (local_module_prefixes_.count(pfx + n + ".")) return pfx + n;
+      if (pfx.empty()) break;
+      auto p2 = pfx.rfind('.', pfx.size() - 2);
+      pfx = p2 == std::string::npos ? "" : pfx.substr(0, p2 + 1);
+    }
+    return n;
+  }
+  // `let open Error in ..` where Error is a module THIS FILE declares: there
+  // is no cmi to walk, so open_module_ctors registered nothing and the OUTER
+  // scope's same-named ctors stayed standing -- includemod's `Keep
+  // ((Unit,_),_,_)` under `let open Error in` read `Unit` at the file-level
+  // `open Types`'s functor_parameter, whose Unit is a DIFFERENT constant
+  // index.  register_type_decl already keyed this module's own ctor schemes by
+  // "<ModPath>.<type>"; hand them to the same scoped cenv.  Only names exactly
+  // ONE of the module's types declares: the per-type tables are name-keyed, so
+  // intra-module shadowing order is unrecoverable, and skipping ties keeps
+  // today's behavior.
+  bool open_local_module_ctors(const std::string& written) {
+    const std::string pfx = resolve_written_module(written) + ".";
+    std::unordered_map<std::string, std::pair<int, TypePtr>> own;
+    for (auto& [k, cs] : type_ctor_schemes_) {
+      if (k.compare(0, pfx.size(), pfx) != 0) continue;
+      if (k.find('.', pfx.size()) != std::string::npos) continue;
+      for (auto& [cn, s] : cs) { auto& e = own[cn]; ++e.first; e.second = s; }
+    }
+    if (own.empty()) return false;
+    for (auto& [cn, e] : own)
+      if (e.first == 1) cenv.back()[cn] = e.second;
+    return true;
+  }
   // `open M` (or a local `M.(..)` open) brings M's variant constructors into bare
   // scope, so `open Arg in [ Unit f; Set r ]` resolves `Unit`/`Set` to `Arg.spec`.
   // We register each into the scoped `cenv` (generalised, so each use instantiates
@@ -4726,6 +4780,8 @@ struct Checker {
           f != local_module_paths_.end() && !f->second.empty() &&
           f->second.find('.') != std::string::npos)
         path = f->second;
+    // A module this file declares has no cmi; its open resolves locally.
+    if (open_local_module_ctors(path)) return;
     std::vector<std::string> comps;
     for (size_t p0 = 0;;) {
       size_t q = path.find('.', p0);
@@ -6314,7 +6370,7 @@ struct Checker {
     // (arg:Error.functor_arg_descr), param with ..` types `param` (unannotated)
     // only when an arm body reaches `Incompatible_params(arg,param)`, so an
     // inline walk here sees a free var where the disambiguating variant is.
-    pending_pat_disambig_.emplace_back(&lhs, scrut);
+    pending_pat_disambig_.push_back({&lhs, scrut, proc_mod_prefix_});
   }
   // Rebind a row's payload binders at the SCRUTINEE constructor's DECLARED
   // argument types.  infer_pat resolves a bare ctor bottom-up by lexical scope,
@@ -6425,8 +6481,13 @@ struct Checker {
         std::holds_alternative<ast::Ppat_or>(p.desc))
       retype_pat_binders(p, ty);
   }
-  std::vector<std::pair<const Pattern*, TypePtr>> pending_pat_disambig_;
-  std::vector<std::pair<const Expression*, TypePtr>> pending_expr_disambig_;
+  // Each deferred walk replays under the module prefix it was recorded in --
+  // ctor_decl_arg_types' functor-application branch resolves the bare bound
+  // name ("Diff") against it.
+  struct PendingPat { const Pattern* p; TypePtr t; std::string pfx; };
+  struct PendingExpr { const Expression* e; TypePtr t; std::string pfx; };
+  std::vector<PendingPat> pending_pat_disambig_;
+  std::vector<PendingExpr> pending_expr_disambig_;
   // Functor-argument structs whose bindings were already inferred (the kinds
   // pass descends them for their records; module_exports can re-visit a node).
   std::unordered_set<const void*> inferred_arg_structs_;
@@ -6538,6 +6599,154 @@ struct Checker {
     // Only ever hand back a path that PROVABLY declares this constructor.
     return scrut_owns_ctor(cand, cn) ? cand : "";
   }
+  // A fully-qualified path to a type THIS FILE declares, resolved to the type
+  // it denotes: an abbreviation's manifest expanded at its decl scope, a
+  // variant/record/opaque decl as its registered Constr.  Null when the path
+  // names nothing unambiguous -- the flat alias map keeps ONE entry per bare
+  // name, so only an exact display_path match may answer, never a same-named
+  // alias of another module.
+  TypePtr local_alias_type(const std::string& full) {
+    auto d = full.rfind('.');
+    std::string nm = d == std::string::npos ? full : full.substr(d + 1);
+    if (type_ctor_schemes_.count(full) || qual_type_stamp_.count(full))
+      return eng.constr(full);
+    auto ai = type_aliases.find(nm);
+    if (ai == type_aliases.end() || !ai->second.manifest ||
+        !ai->second.params.empty() || expanding_.count(nm))
+      return nullptr;
+    if (d == std::string::npos ? !ai->second.display_path.empty()
+                               : ai->second.display_path != full)
+      return nullptr;
+    expanding_.insert(nm);
+    TypePtr r;
+    {  // decl-position name resolution for the manifest's bare cites
+      DeclQualOverlay dq(*this, ai->second.manifest);
+      std::unordered_map<std::string, TypePtr> vars;
+      r = from_coretype(*ai->second.manifest, vars);
+    }
+    expanding_.erase(nm);
+    return r;
+  }
+  // The declared argument types of `cn` at a type of a FUNCTOR-APPLICATION
+  // module (`Diff.change`, from `module Diff = Diffing.Define(Defs)`).  The
+  // functor's result manifest names both the OWNER of the constructors
+  // (`(left,..) change`, a type the functor's own unit declares, resolvable
+  // like any import) and, in its manifest ARGS, the parameter's projections
+  // (`D.left`).  Substituting the parameter with the argument module written
+  // at the binding and pinning the owner scheme's params to the projections'
+  // expansions makes the ctor's argument types CONCRETE -- which is what the
+  // disambiguation walks need: ocamlc reads includemod's Functor_app_diff
+  // .update type-directedly, `Keep ((Unit,_),_,_)` at functor_arg_descr and
+  // `Keep (_,(Unit|..),_)` at functor_parameter, out of ONE match whose two
+  // column types share both ctor names.  Empty on any doubt.
+  std::vector<TypePtr> functor_app_ctor_arg_types(const std::string& typath,
+                                                  const std::string& cn) {
+    auto d = typath.rfind('.');
+    if (d == std::string::npos || functor_app_args_.empty()) return {};
+    // The bound name resolves innermost-outward against the prefix the walk
+    // was recorded under (includemod binds one `Diff` per nested module).
+    const std::pair<std::string, std::vector<std::string>>* app = nullptr;
+    for (std::string pfx = proc_mod_prefix_;;) {
+      if (auto it = functor_app_args_.find(pfx + typath.substr(0, d));
+          it != functor_app_args_.end()) { app = &it->second; break; }
+      if (pfx.empty()) break;
+      auto p2 = pfx.rfind('.', pfx.size() - 2);
+      pfx = p2 == std::string::npos ? "" : pfx.substr(0, p2 + 1);
+    }
+    if (!app || app->first.empty()) return {};
+    std::vector<std::string> comps = mod_components_str(app->first);
+    if (comps.size() < 2) return {};
+    const std::string tyname = typath.substr(d + 1);
+    try {
+      // The functor's result signature, collecting each application step's
+      // parameter name (`D`) on the way through the bodies.
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      std::vector<std::string> pnames;
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        if (!md) return {};
+        cmi::ModuleTypePtr mt = md->type;
+        if (i + 1 == comps.size())
+          for (size_t a = 0; a < app->second.size() && mt; ++a) {
+            if (mt->kind != cmi::ModuleType::Functor) return {};
+            pnames.push_back(mt->functor_param ? *mt->functor_param : "");
+            mt = mt->functor_body;
+          }
+        sig = module_sig(mt, loaded);
+      }
+      if (!sig || pnames.size() != app->second.size()) return {};
+      const cmi::TypeDecl* td = nullptr;
+      for (auto& t : sig->types)
+        if (t.name == tyname) { td = &t; break; }
+      if (!td || !td->manifest || !td->manifest->path || !td->params.empty())
+        return {};
+      // Owner path, as in ctor_owner_expansion: a Pident manifest names a
+      // type of the functor's own unit.
+      std::string owner = cmi_path_str(*td->manifest->path);
+      if (td->manifest->path->kind == cmi::Path::Pident)
+        owner = comps[0] + "." + owner;
+      // Every manifest arg must be a parameter projection (`D.left`) whose
+      // projection resolves through the ARGUMENT module, or the pin could
+      // mislead.
+      std::vector<TypePtr> args;
+      for (auto& a : td->manifest->args) {
+        const cmi::TypeExpr* ax = a.get();
+        if (!ax || ax->kind != cmi::TypeExpr::Tconstr || !ax->path ||
+            !ax->args.empty() || ax->path->kind != cmi::Path::Pdot ||
+            !ax->path->a || ax->path->a->kind != cmi::Path::Pident)
+          return {};
+        size_t pi = pnames.size();
+        for (size_t i2 = 0; i2 < pnames.size(); ++i2)
+          if (pnames[i2] == ax->path->a->id.name) { pi = i2; break; }
+        if (pi == pnames.size() || app->second[pi].empty()) return {};
+        TypePtr r = local_alias_type(app->second[pi] + "." + ax->path->s);
+        if (!r) return {};
+        args.push_back(r);
+      }
+      // The owner's EXACT declaration -- not the first variant declaring the
+      // name, which is wrong here: diffing.mli declares change_kind's constant
+      // `Keep` before change's.
+      std::deque<const cmi::CmiFile*> loaded2;
+      const cmi::Signature* osig = nullptr;
+      std::string omod;
+      const cmi::TypeDecl* otd = mx_cmi_type_decl(owner, loaded2, &osig, &omod);
+      if (!otd || otd->kind != cmi::TypeDecl::Variant ||
+          otd->params.size() != args.size())
+        return {};
+      const cmi::ConstructorDecl* cd = nullptr;
+      for (auto& c : otd->ctors)
+        if (c.name == cn) { cd = &c; break; }
+      if (!cd || cd->is_inline_record || cd->res) return {};
+      std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+      for (size_t i = 0; i < otd->params.size(); ++i) {
+        TypePtr v = eng.fresh_var();
+        if (otd->params[i]) memo[otd->params[i].get()] = v;
+        soft_unify(v, args[i]);
+      }
+      auto* saved_ctx = cmi_types_ctx_;
+      std::string saved_pfx = cmi_mod_prefix_;
+      bool saved_fold = fold_abbrevs_;
+      cmi_types_ctx_ = &osig->types;
+      cmi_mod_prefix_ = omod;
+      fold_abbrevs_ = true;
+      std::vector<TypePtr> ps;
+      for (auto& a : cd->args) ps.push_back(from_cmi(a, memo));
+      cmi_types_ctx_ = saved_ctx;
+      cmi_mod_prefix_ = saved_pfx;
+      fold_abbrevs_ = saved_fold;
+      if (getenv("CTDBG"))
+        fprintf(stderr,
+                "[CTDBG-F] functor-app %s.%s owner=%s nargs=%zu pfx=%s arg0=%s\n",
+                typath.c_str(), cn.c_str(), owner.c_str(), ps.size(),
+                proc_mod_prefix_.c_str(),
+                app->second.empty() ? "" : app->second[0].c_str());
+      return ps;
+    } catch (...) { return {}; }
+  }
   // The DECLARED argument types of constructor `cn` of the variant named by
   // `typath` -- the file-local per-type schemes first, then the owning unit's
   // cmi through the same qualified lookup a written `M.C` pattern takes.  Empty
@@ -6554,6 +6763,10 @@ struct Checker {
     }
     auto d = typath.rfind('.');
     if (d == std::string::npos) return {};
+    // A functor-application module names no loadable cmi; its result manifest
+    // does.
+    if (auto fp = functor_app_ctor_arg_types(typath, cn); !fp.empty())
+      return fp;
     std::vector<std::string> comps = mod_components_str(typath.substr(0, d));
     if (comps.empty()) return {};
     Longident id; id.v = Lident{comps[0]};
@@ -6612,9 +6825,16 @@ struct Checker {
     return r->kind == I::Type::Kind::Constr ? r->path : "";
   }
   void resolve_pending_disambig() {
-    for (auto& [p, t] : pending_pat_disambig_) disambig_pat_now(*p, t);
-    for (auto& [e, t] : pending_expr_disambig_)
-      disambig_expr_now(*e, t, /*allow_defer=*/false, /*deferred=*/true);
+    std::string saved = proc_mod_prefix_;
+    for (auto& pd : pending_pat_disambig_) {
+      proc_mod_prefix_ = pd.pfx;
+      disambig_pat_now(*pd.p, pd.t);
+    }
+    for (auto& pd : pending_expr_disambig_) {
+      proc_mod_prefix_ = pd.pfx;
+      disambig_expr_now(*pd.e, pd.t, /*allow_defer=*/false, /*deferred=*/true);
+    }
+    proc_mod_prefix_ = saved;
   }
   // Type-directed bare-constructor resolution in EXPRESSION position: an
   // unqualified constructor we couldn't resolve (typed Any) whose EXPECTED type
@@ -6630,7 +6850,7 @@ struct Checker {
     TypePtr er = I::Engine::repr(expected);
     if (allow_defer && er->kind == I::Type::Kind::Var &&
         std::holds_alternative<Lident>(k->id.txt.v)) {
-      pending_expr_disambig_.emplace_back(&e, expected);
+      pending_expr_disambig_.push_back({&e, expected, proc_mod_prefix_});
       return;
     }
     bool er_variant = er->kind == I::Type::Kind::Constr &&
@@ -6796,8 +7016,14 @@ struct Checker {
     // through abbreviations, so a column typed by an ALIAS path
     // (Misc.Stdlib.Result.t == result) would false-positive on every
     // `Ok x | Error x` and knock the builtin-result dispatch off course.
+    // A functor-application path ("Diff.change") owns nothing scrut_owns_ctor
+    // can see -- its or-nested alternatives (`Insert (Unit|..) | Keep (..)`
+    // sit at depth>0) must pass through the same owner expansion the matcher
+    // uses, or their arguments are never walked at all.
     if (depth > 0) {
-      if (!local_amb && !(dotted && scrut_owns_ctor(sr->path, cn))) return;
+      if (!local_amb && !(dotted && (scrut_owns_ctor(sr->path, cn) ||
+                                     !ctor_owner_expansion(sr->path, cn).empty())))
+        return;
     } else if (!dotted && !local_amb) {
       return;
     }
@@ -10809,13 +11035,21 @@ struct Checker {
             if (!strict) {
               const ModuleExpr* fx = &mb->binding.expr;
               int napp = 0;
+              std::vector<std::string> fargs;  // application order after reverse
+              auto arg_path = [&](const ModuleExpr& ae) -> std::string {
+                const ModuleExpr* m = &ae;
+                while (auto* mc = std::get_if<Pmod_constraint>(&m->desc))
+                  m = mc->me.get();
+                auto* mi = std::get_if<Pmod_ident>(&m->desc);
+                return mi ? resolve_written_module(lid_full(mi->id.txt)) : "";
+              };
               for (;;) {
                 while (auto* mc = std::get_if<Pmod_constraint>(&fx->desc))
                   fx = mc->me.get();
                 if (auto* a = std::get_if<Pmod_apply>(&fx->desc)) {
-                  ++napp; fx = a->f.get();
+                  ++napp; fargs.push_back(arg_path(*a->arg)); fx = a->f.get();
                 } else if (auto* au = std::get_if<Pmod_apply_unit>(&fx->desc)) {
-                  ++napp; fx = au->f.get();
+                  ++napp; fargs.push_back(""); fx = au->f.get();
                 } else break;
               }
               if (napp > 0)
@@ -10824,6 +11058,12 @@ struct Checker {
                   auto [f, ins] =
                       functor_module_apps_.emplace(*mb->binding.name.txt, app);
                   if (!ins && f->second != app) f->second.first.clear();
+                  std::reverse(fargs.begin(), fargs.end());
+                  std::pair<std::string, std::vector<std::string>> qa{
+                      app.first, std::move(fargs)};
+                  auto [g, gins] = functor_app_args_.emplace(
+                      proc_mod_prefix_ + *mb->binding.name.txt, qa);
+                  if (!gins && g->second != qa) g->second.first.clear();
                 }
             }
             // A functor: record its body's exports as the application result.
@@ -10929,7 +11169,10 @@ struct Checker {
                 }
               }
               func_bind_name_ = *mb->binding.name.txt;
+              proc_mod_prefix_ += *mb->binding.name.txt + ".";
               modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
+              proc_mod_prefix_.resize(proc_mod_prefix_.size() -
+                                      mb->binding.name.txt->size() - 1);
               func_bind_name_.clear();
             }
           }
@@ -11039,6 +11282,7 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
         std::string saved = ck.mod_prefix_;
         if (mb->binding.name.txt) {
           ck.mod_prefix_ += *mb->binding.name.txt + ".";
+          ck.local_module_prefixes_.insert(ck.mod_prefix_);
           auto& names = ck.module_direct_types_[*mb->binding.name.txt];
           for (auto& sit : ms->items)
             if (auto* ty2 = std::get_if<Pstr_type>(&sit.desc))
@@ -11068,7 +11312,10 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
         while (auto* mc = std::get_if<Pmod_constraint>(&me2->desc)) me2 = mc->me.get();
         if (auto* ms2 = std::get_if<Pmod_structure>(&me2->desc)) {
           std::string saved = ck.mod_prefix_;
-          if (b.name.txt) ck.mod_prefix_ += *b.name.txt + ".";
+          if (b.name.txt) {
+            ck.mod_prefix_ += *b.name.txt + ".";
+            ck.local_module_prefixes_.insert(ck.mod_prefix_);
+          }
           register_types_rec(ck, ms2->items);
           ck.mod_prefix_ = saved;
         }
