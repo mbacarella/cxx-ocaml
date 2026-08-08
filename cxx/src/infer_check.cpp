@@ -11605,6 +11605,17 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
           (r->path.find('.') != std::string::npos || r->path == "exn"))
         vk.pat_constr[p] = owner_path(r->path, pk->id.txt);
     }
+    // A polymorphic-variant pattern's unified row, when CLOSED: record the
+    // tag-universe size for the back end's sig_complete decision (see the
+    // ValueKinds field).  variant_kind 0 is the open `[>` row -- never
+    // complete; a row still carrying unexpanded inherits has tags beyond
+    // `labels`, so it is skipped rather than under-counted.
+    if (std::holds_alternative<ast::Ppat_variant>(p->desc)) {
+      TypePtr r = I::Engine::repr(t);
+      if (r->kind == I::Type::Kind::Variant && r->variant_kind != 0 &&
+          r->inherited.empty() && !r->labels.empty())
+        vk.pat_pvuniv[p] = (int)r->labels.size();
+    }
     // A record pattern's matched-value type (resolved by unify with the
     // scrutinee): lets the back end disambiguate an ambiguous field by type.
     // A record pattern that is a constructor's argument gets its type from the

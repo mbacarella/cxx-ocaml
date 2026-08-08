@@ -12023,6 +12023,12 @@ struct Translator {
     if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
       if (k->arg) collect_gvars(k->arg->get(), out); return;
     }
+    // The poly-variant column decomposes its payload into a field-1 column
+    // whose leaf binds the sub-pattern var -- same vnames requirement as the
+    // record/array columns below.
+    if (auto* pvr = std::get_if<Ppat_variant>(&p->desc)) {
+      if (pvr->arg) collect_gvars(pvr->arg->get(), out); return;
+    }
     if (auto* t = std::get_if<Ppat_tuple>(&p->desc)) {
       for (auto& e : t->elems) collect_gvars(e.get(), out); return;
     }
@@ -12438,6 +12444,23 @@ struct Translator {
       return 1;
     });
   }
+  bool denv_spec_variant(std::vector<GmDef>& env, const std::string& label,
+                         bool is_block) {
+    return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
+                             std::vector<std::vector<const Pattern*>>& out) -> int {
+      std::vector<const Pattern*> nr;
+      if (gmdef_omega(p0)) {
+        if (is_block) nr.push_back(nullptr);      // payload column: omega
+      } else if (auto* pv = std::get_if<Ppat_variant>(&p0->desc)) {
+        if (pv->label != label) return 0;
+        if ((bool)pv->arg != is_block) return -1; // const/block clash: ill-typed
+        if (is_block) nr.push_back(effective_pat(pv->arg->get()));
+      } else return -1;
+      nr.insert(nr.end(), row.begin() + 1, row.end());
+      out.push_back(std::move(nr));
+      return 1;
+    });
+  }
   bool denv_spec_tuple(std::vector<GmDef>& env, size_t tk) {
     return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
                              std::vector<std::vector<const Pattern*>>& out) -> int {
@@ -12487,6 +12510,16 @@ struct Translator {
         auto* ky = std::get_if<Ppat_construct>(&ey->desc);
         if (kx && ky) {
           if (lid_last(kx->id.txt) == lid_last(ky->id.txt)) return false;
+          continue;
+        }
+        // Two poly-variant heads with different tags can never share a value
+        // (same closed row, distinct hashes) -- the disjointness that lets a
+        // later variant row rejoin collect's group past a deferred var row
+        // (typemod's `Ok,`Ok behind `_,`Contains_apply).
+        auto* vx = std::get_if<Ppat_variant>(&ex->desc);
+        auto* vy = std::get_if<Ppat_variant>(&ey->desc);
+        if (vx && vy) {
+          if (vx->label == vy->label) return false;
           continue;
         }
         return false;
@@ -13711,6 +13744,205 @@ struct Translator {
         else if (uses == 1 && bad == 0) inline_exit(chain, cdflt, {}, {}, dbody);
         else if (uses > 0) {
           auto c = mk(Lam::K::Catch); c->cond = chain; c->prim_arg = cdflt; c->then_ = dbody; chain = c;
+        }
+        return chain;
+      }
+    }
+    // Nested POLYMORPHIC-VARIANT column (matching.ml's divide_variant /
+    // combine_variant): a constant tag is its hash immediate, a block tag a
+    // 2-block [hash; payload] whose payload becomes a deferred field-1 column.
+    // Cells never absorb var/any rows -- upstream's divide sends those to the
+    // DEFAULT matrix only, threaded here as the nearest default-env entry like
+    // the INT column's.  The fail action drops (combine_variant's fail=None)
+    // when the listed tags cover the row universe (vk.pat_pvuniv -- typemod's
+    // `Ok/`Contains_apply columns stay bare even with a var row pending) or
+    // when nothing is pending in a Total match (location's `S/`E column is a
+    // bare >= dichotomy, its `Outside/`Inside column a pure isint split).
+    // Second-pass + budgeted like the other nested columns.
+    if (g_gm_tuples_) {
+      bool anyv = false, purev = true;
+      for (auto& r : rows) {
+        auto& d = r.cols[0]->desc;
+        if (std::get_if<Ppat_variant>(&d)) anyv = true;
+        else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d)) {
+          purev = false; break;
+        }
+      }
+      if (anyv && purev) {
+        if (comps[0]->k != Lam::K::Var) return nullptr;
+        // Interspersed var rows: the grouped shape below only models
+        // upstream's collect when the first row discriminates and every later
+        // variant row is safe_before the deferred var rows (see the INT
+        // column); anything else compiles as its own half-match chain.
+        {
+          bool grouped = std::get_if<Ppat_variant>(&rows[0].cols[0]->desc) != nullptr;
+          std::vector<const MRow*> deferred;
+          for (auto& r : rows) {
+            if (!grouped) break;
+            bool c = std::get_if<Ppat_variant>(&r.cols[0]->desc) != nullptr;
+            bool safe = true;
+            for (auto* q : deferred)
+              if (!gm_same_action(r, *q) && !gm_rows_disjoint(r, *q)) { safe = false; break; }
+            if (c && safe) continue;
+            if (c) grouped = false;
+            else deferred.push_back(&r);
+          }
+          if (!grouped)
+            return gmatch_run_chunks(comps, rows, mloc, deid, denv,
+                    [](const Pattern* p) {
+                      return std::get_if<Ppat_variant>(&p->desc) != nullptr;
+                    });
+        }
+        if (g_gm_budget_ == 0) return nullptr;
+        if (g_gm_budget_ > 0) --g_gm_budget_;
+        struct VCell { std::string label; long long h; bool blk; };
+        std::vector<VCell> cells;                    // distinct tags, row order
+        int universe = 0;
+        for (auto& r : rows)
+          if (auto* pv = std::get_if<Ppat_variant>(&r.cols[0]->desc)) {
+            bool blk = (bool)pv->arg;
+            bool seen = false;
+            for (auto& c : cells)
+              if (c.label == pv->label) {
+                if (c.blk != blk) return nullptr;    // const/block clash: ill-typed
+                seen = true; break;
+              }
+            if (!seen) cells.push_back({pv->label, hash_variant(pv->label), blk});
+            if (auto it = vk.pat_pvuniv.find(r.cols[0]); it != vk.pat_pvuniv.end())
+              universe = std::max(universe, it->second);
+          }
+        std::vector<LamPtr> rest(comps.begin() + 1, comps.end());
+        std::vector<std::vector<const Pattern*>> dmat;  // upstream's default matrix
+        for (auto& r : rows)
+          if (!std::get_if<Ppat_variant>(&r.cols[0]->desc))
+            dmat.emplace_back(r.cols.begin(), r.cols.end());
+        bool sig_complete = universe > 0 && (int)cells.size() == universe;
+        bool total_ctx = denv.empty() && dmat.empty() &&
+                         (deid == gm_tp_deid_ || deid == gm_fake_deid_);
+        bool nofail = sig_complete || total_ctx;
+        int cdflt = dmat.empty() ? -1 : ++next_exit_;
+        int fexit = nofail ? -1
+                    : (cdflt >= 0 ? cdflt
+                                  : (denv.empty() ? deid : denv.front().eid));
+        // S(tag): the tag's rows -- col0 popped for a constant tag, replaced by
+        // the field-1 payload column for a block tag; the default matrix rides
+        // the env as the nearest entry so misses keep upstream's precision.
+        auto sub_for = [&](const VCell& c) -> LamPtr {
+          std::vector<MRow> sub;
+          for (auto& r : rows) {
+            auto* pv = std::get_if<Ppat_variant>(&r.cols[0]->desc);
+            if (!pv || pv->label != c.label) continue;
+            MRow nr = r;
+            if (c.blk) nr.cols[0] = effective_pat(pv->arg->get());
+            else nr.cols.erase(nr.cols.begin());
+            sub.push_back(std::move(nr));
+          }
+          std::vector<LamPtr> cc;
+          if (c.blk) {
+            LamPtr f = fieldimm(1, comps[0]);
+            f->gm_facc = true;
+            cc.push_back(f);
+          }
+          cc.insert(cc.end(), rest.begin(), rest.end());
+          std::vector<GmDef> se = denv;
+          if (!dmat.empty()) se.insert(se.begin(), {cdflt, dmat});
+          // Unsupported entry shape: funnel every miss to the nearest pending
+          // target unconditionally (sound, just less precise).
+          if (!denv_spec_variant(se, c.label, c.blk))
+            return gmatch(std::move(cc), std::move(sub), mloc,
+                          cdflt >= 0 ? cdflt
+                                     : (denv.empty() ? deid : denv.front().eid));
+          return gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(se));
+        };
+        // Compile each tag's sub-matrix once, last tag first (the INT column's
+        // discipline; the switcher below does not care about the order).
+        std::vector<LamPtr> cbody(cells.size());
+        for (int i = (int)cells.size() - 1; i >= 0; --i) {
+          cbody[i] = sub_for(cells[i]);
+          if (!cbody[i]) return nullptr;
+        }
+        std::vector<std::pair<int, LamPtr>> consts, blocks;
+        for (size_t i = 0; i < cells.size(); ++i)
+          (cells[i].blk ? blocks : consts).push_back({(int)cells[i].h, cbody[i]});
+        auto byk = [](const std::pair<int, LamPtr>& a,
+                      const std::pair<int, LamPtr>& b) { return a.first < b.first; };
+        std::sort(consts.begin(), consts.end(), byk);
+        std::sort(blocks.begin(), blocks.end(), byk);
+        auto mkfail = [&]() -> LamPtr {
+          auto e = mk(Lam::K::Staticraise); e->prim_arg = fexit; return e;
+        };
+        auto isint_of = [&] {
+          auto p = mk(Lam::K::Prim); p->prim = Prim::IntCmp;
+          p->prim_id = "isint"; p->args = {comps[0]}; return p;
+        };
+        auto iff2 = [&](LamPtr c, LamPtr a, LamPtr b) {
+          auto i = mk(Lam::K::IfThenElse);
+          i->cond = c; i->then_ = a; i->else_ = b; return i;
+        };
+        // call_switcher_variant_constr: the tag hash of a block is field 0,
+        // bound `variant` =a once (Simplif substitutes the single use).
+        auto blocks_tree = [&]() -> LamPtr {
+          Ident v = fresh("variant");
+          LamPtr tree = oc_call_switcher(varof(v), blocks,
+                                         fexit >= 0 ? mkfail() : nullptr,
+                                         /*test_seq=*/true);
+          if (!tree) return nullptr;
+          LamPtr f0 = fieldimm(0, comps[0]);
+          if (count_var(tree, v) <= 1) subst_alias(tree, v, f0);
+          else {
+            auto l = mk(Lam::K::Let);
+            l->bindings = {{v, ValueKind::Gen, f0, /*alias=*/true}};
+            l->body = tree; tree = l;
+          }
+          return tree;
+        };
+        LamPtr chain;
+        if (!consts.empty() && !blocks.empty()) {
+          if (fexit < 0 && consts.size() == 1 && blocks.size() == 1)
+            chain = iff2(isint_of(), consts[0].second, blocks[0].second);
+          else {
+            LamPtr ct = oc_call_switcher(comps[0], consts,
+                                         fexit >= 0 ? mkfail() : nullptr, true);
+            LamPtr bt = blocks_tree();
+            if (!ct || !bt) return nullptr;
+            chain = iff2(isint_of(), ct, bt);
+          }
+        } else if (!consts.empty()) {
+          chain = oc_call_switcher(comps[0], consts,
+                                   fexit >= 0 ? mkfail() : nullptr, true);
+          // PR#11587: test_sequence expects an integer -- filter blocks away.
+          if (chain && fexit >= 0) chain = iff2(isint_of(), chain, mkfail());
+        } else {
+          chain = blocks_tree();
+          if (chain && fexit >= 0) chain = iff2(isint_of(), mkfail(), chain);
+        }
+        if (!chain) return nullptr;
+        // The var/any default sub-matrix, compiled once behind cdflt (same
+        // wiring as the INT column, bare-re-raise rule included).
+        if (cdflt >= 0) {
+          std::vector<MRow> dsub;
+          for (auto& r : rows) {
+            auto& d = r.cols[0]->desc;
+            if (std::get_if<Ppat_variant>(&d)) continue;
+            MRow nr = r;
+            if (auto* pv = std::get_if<Ppat_var>(&d))
+              nr.binds.push_back({pv->name.txt, comps[0]->var});
+            nr.cols.erase(nr.cols.begin()); dsub.push_back(std::move(nr));
+          }
+          std::vector<LamPtr> cc = rest;
+          std::vector<GmDef> de = denv;
+          if (!denv_pop_col(de)) return nullptr;
+          LamPtr dbody = gmatch(std::move(cc), std::move(dsub), mloc, deid,
+                                std::move(de));
+          if (!dbody) return nullptr;
+          int bad = 0; int uses = count_exit(chain, cdflt, false, bad);
+          if (dbody->k == Lam::K::Staticraise && dbody->args.empty())
+            inline_exit(chain, cdflt, {}, {}, dbody);
+          else if (uses == 1 && bad == 0) inline_exit(chain, cdflt, {}, {}, dbody);
+          else if (uses > 0) {
+            auto c = mk(Lam::K::Catch);
+            c->cond = chain; c->prim_arg = cdflt; c->then_ = dbody; chain = c;
+          }
         }
         return chain;
       }
@@ -17335,7 +17567,24 @@ struct Translator {
       std::vector<const Pattern*> alts; flatten_or(vrows[i].lhs, alts);
       std::vector<std::vector<const Pattern*>> altcols;
       for (auto* a : alts) {
-        auto* tp = std::get_if<Ppat_tuple>(&effective_pat(a)->desc);
+        const Pattern* ea = effective_pat(a);
+        // A `_` row that is not the trailing unconditional default -- a leading
+        // `| _ when g -> ..` barrier (diffing's compute_cell) or a guarded
+        // catch-all run before the real default (ctype's moregen_row) -- is a
+        // row of k wildcard COLUMNS, not a tuple pattern; bailing here was what
+        // sent all three shapes to the allocating caml_obj_tag path.  Expanded,
+        // the guard threads through MRow.guard and the existing trailing-peel /
+        // chunk machinery compiles the run as upstream's own var-row chunk.  A
+        // VAR row still bails: it binds the tuple itself, which only the
+        // allocated form can supply.
+        if (std::holds_alternative<Ppat_any>(ea->desc)) {
+          static const Pattern gm_mt_any = [] {
+            Pattern p; p.desc = Ppat_any{}; return p;
+          }();
+          altcols.push_back(std::vector<const Pattern*>(k, &gm_mt_any));
+          continue;
+        }
+        auto* tp = std::get_if<Ppat_tuple>(&ea->desc);
         if (!tp || tp->elems.size() != k) return nullptr;
         for (auto& lbl : tp->labels) if (lbl) return nullptr;   // labeled tuple: bail
         std::vector<const Pattern*> cols;

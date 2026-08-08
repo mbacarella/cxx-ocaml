@@ -124,6 +124,13 @@ struct ValueKinds {
   // (`{ args = .. }` on a `pattern_matching` -- args@1 -- vs `division` -- args@0)
   // by the matched value's type instead of a single-label guess.
   std::unordered_map<const void*, std::string> pat_record_type;
+  // For a polymorphic-variant PATTERN whose unified row type is CLOSED (`[<`
+  // upper bound or exact `[ .. ]`): the row's tag-universe size.  The back
+  // end's combine_variant port needs it for sig_complete -- a column listing
+  // every tag of its row drops the fail action even with default rows pending
+  // (typemod's `Ok/`Contains_apply columns).  An open `[>` row can never be
+  // complete, so no entry is recorded for it.
+  std::unordered_map<const void*, int> pat_pvuniv;
   // Expressions of type `?l:.. -> ..` used where a non-optional arrow is expected:
   // the back end eta-expands them, inserting None for each erased optional.  The
   // bool vector is the resulting application's argument slots (true = None for an
