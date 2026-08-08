@@ -6844,6 +6844,24 @@ struct Checker {
   // expectation is often pinned only by a later constraint).
   void disambig_expr_now(const Expression& e, const TypePtr& expected,
                          bool allow_defer, bool deferred = false) {
+    // Forms whose VALUE is the expectation's: an `if`'s two branches, the
+    // second half of a sequence.  The hook is installed where an annotation
+    // is written, and `let usage : Env.label_usage = if .. then Env.Exported
+    // else Env.Exported_private` puts the constructors one node BELOW it --
+    // so the walk stopped dead and left them to lexical scope, which for a
+    // QUALIFIED ctor means the first of M's types declaring the name.
+    // env.mli declares `Exported` in constructor_usage before label_usage, so
+    // includecore marked every record label with the CONSTRUCTOR usage code.
+    // Only forms that pass their type through unchanged AND bind nothing, so
+    // the scope this runs in stays the scope the node is really in.
+    if (auto* it = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      disambig_expr_now(*it->then_, expected, allow_defer, deferred);
+      if (it->else_)
+        disambig_expr_now(**it->else_, expected, allow_defer, deferred);
+      return;
+    }
+    if (auto* sq = std::get_if<Pexp_sequence>(&e.desc))
+      return disambig_expr_now(*sq->e2, expected, allow_defer, deferred);
     auto* k = std::get_if<Pexp_construct>(&e.desc);
     if (!k) return;
     std::string cn = lid_last(k->id.txt);
@@ -6935,6 +6953,22 @@ struct Checker {
         // A predef type is dotless for the same reason and needs it too.
         if (er_local_amb || er_predef) ctor_arg_type_[&e] = er;
       }
+    } else if (er_variant && sch && std::holds_alternative<Ldot>(k->id.txt.v) &&
+               scrut_owns_ctor(er->path, cn)) {
+      // A QUALIFIED ctor whose bare name ALSO happens to be in scope: the
+      // branch above declines it (rightly -- a written path outranks a bare
+      // scope hit), and the branch before it only fires when the bare lookup
+      // MISSES.  But a path names the MODULE, not the type, and one module
+      // may declare a ctor name in two of its types -- env.mli's `Exported`
+      // is constructor_usage tag 3 AND label_usage tag 4 -- so the expected
+      // type has to settle it here too.  Without this, includecore's
+      // `let usage : Env.label_usage = .. Env.Exported` recorded
+      // constructor_usage and marked record labels with its code, while the
+      // adjacent `Env.Exported_private` (no bare hit) resolved correctly:
+      // one annotation, two answers.  Gated on the expected type PROVABLY
+      // declaring the name, so an abbreviation or an unrelated expectation
+      // records nothing.
+      rec_expr_[&e] = expected;
     }
     // Descend into the constructor's ARGUMENTS with their DECLARED types --
     // the producer twin of disambig_pat_now's descent.  infer_expr propagates

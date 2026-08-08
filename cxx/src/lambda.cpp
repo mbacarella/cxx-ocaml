@@ -1630,6 +1630,19 @@ struct Translator {
     }
     return nullptr;
   }
+  // The ctor `n` as declared by the EXACT imported type an inferred path names
+  // ("Env.label_usage"), or null when the path names no loadable unit / the
+  // type is not a variant / it does not declare the name.  module_ctors' flat
+  // per-module map is first-DECLARATION-wins, so it cannot answer this: it is
+  // the per-type list that keeps a name a module declares twice.
+  const CtorInfo* module_typed_ctor(const std::string& ety,
+                                    const std::string& n) {
+    auto d = ety.rfind('.');
+    if (d == std::string::npos) return nullptr;
+    for (auto& [nm, ci] : module_type_ctors(ety.substr(0, d), ety.substr(d + 1)))
+      if (nm == n) return &ci;
+    return nullptr;
+  }
   // The full "module.type" path of a qualified ctor's OWNING type (empty if
   // unresolved), so compile_match can force-register that type when the flat
   // ctor_info_ slot is SQUATTED by a same-named ctor of a different type
@@ -21585,6 +21598,23 @@ struct Translator {
       // local/bare ctor (typecore's `Env.Pattern` vs its local `Pattern`).
       const CtorInfo* qci = std::holds_alternative<Ldot>(k->id.txt.v)
                             ? qualified_ctor_info(k->id.txt) : nullptr;
+      // ...but naming the MODULE does not name the TYPE, and a module may
+      // declare one ctor name in TWO of its types -- env.mli's `Exported` is
+      // constructor_usage's tag 3 AND label_usage's tag 4.  qualified_ctor_info
+      // reads the flat per-module map, which is first-declaration-wins, so it
+      // answered `Env.Exported` with constructor_usage whatever was meant:
+      // includecore's `let usage : Env.label_usage = .. Env.Exported` marked
+      // every record label with the CONSTRUCTOR usage code.  The node's
+      // inferred type names the type meant, and the PATTERN side already
+      // resolves it that way -- so this is also what keeps a construct/match
+      // pair from splitting on the tag.  Shape-guarded, and a no-op unless the
+      // cited type really declares the name (an unloadable or local path, or
+      // an unambiguous ctor, re-reads the entry qci already had).
+      if (qci)
+        if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end())
+          if (const CtorInfo* tci = module_typed_ctor(ec->second, n);
+              tci && tci->is_block == k->arg.has_value())
+            qci = tci;
       // ...and that outranking must beat the local-exception shadow too, which
       // is why this is computed BEFORE it: a path that names its module cannot
       // be captured by an unqualified `exception Error of string`, so
