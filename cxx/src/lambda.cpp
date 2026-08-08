@@ -12873,6 +12873,73 @@ struct Translator {
         --next_exit_;                     // fall through to the spread path
       }
     }
+    // The MIDDLE form of the same division: split_and_precompile also ends a
+    // constructor chunk at a guarded all-omega row, so `[ctor rows] [x,y when g]
+    // [rest]` compiles the ctor rows with one no-arg exit as their failure
+    // continuation and the handler tests the guard ONCE before the rest-matrix
+    // re-dispatches from scratch (unify3's reify/record_equation arms after the
+    // `Tvar` rows).  The spread would re-test g in every cell of the ctor rows'
+    // dispatch.  Cutting the matrix at the guarded row and recursing lets the
+    // leading-row split above own group B, so the two stay one mechanism.
+    //   The cut only exists when the rows above CANNOT absorb the omega row
+    // into their column-0 division: can_group (matching.ml:1391) groups `Any`
+    // under a Record or Tuple head (one irrefutable cell -- the omega rows ride
+    // into it and the cut happens a level DEEPER, after the decomposition,
+    // which the recursion reaches on its own: value_rec_check's `Texp_apply
+    // ({exp_desc = Texp_ident ..}, _) when is_ref` -- splitting at the record
+    // level buried the exp_desc read inside group A where upstream binds it
+    // above the catch).  So EVERY row in group A must dispatch column 0 with a
+    // non-absorbing head -- constructor, constant, poly variant, interval,
+    // array, lazy -- which also covers the block above's col0-tested gate.  An
+    // omega col0 above the cut row would itself have ended upstream's chunk
+    // (can_group Construct/Any -> false), so it declines too.
+    //   The cut row must not be LAST -- a trailing all-var row (guarded or not)
+    // is gm_peel_last's division, whose chunk-catch wiring lower_bind depends
+    // on.  Scanning stops at the FIRST all-omega row: an unguarded one makes
+    // everything after it dead (the truncation below), and a guarded
+    // all-wildcard one stays with the spread/chunk path as before.  The
+    // real-variable gate is the block above's, verbatim.
+    if (denv.empty() && comps.size() >= 2 && rows.size() >= 3 && comps[0]) {
+      size_t k = 0;
+      for (size_t i = 1; i + 1 < rows.size(); ++i)
+        if (row_all_var(rows[i])) { if (rows[i].guard) k = i; break; }
+      bool a_cuts = k > 0;                // group A's heads refuse omega rows
+      bool a_tests_col0 = false;
+      for (size_t i = 0; a_cuts && i < k; ++i) {
+        const Pattern* p = pat_deep(rows[i].cols[0]);
+        if (pat_omega_like(rows[i].cols[0])) continue;
+        a_tests_col0 = true;
+        a_cuts = std::holds_alternative<Ppat_construct>(p->desc) ||
+                 std::holds_alternative<Ppat_constant>(p->desc) ||
+                 std::holds_alternative<Ppat_variant>(p->desc) ||
+                 std::holds_alternative<Ppat_interval>(p->desc) ||
+                 std::holds_alternative<Ppat_array>(p->desc) ||
+                 std::holds_alternative<Ppat_lazy>(p->desc);
+      }
+      a_cuts = a_cuts && a_tests_col0;
+      bool has_var = false;
+      if (a_cuts) for (auto* c : rows[k].cols) {
+        const Pattern* ep = effective_pat(c);
+        if (std::get_if<Ppat_var>(&ep->desc) ||
+            std::get_if<Ppat_alias>(&ep->desc)) { has_var = true; break; }
+      }
+      if (a_cuts && has_var) {
+        int e = ++next_exit_;
+        std::vector<MRow> A(rows.begin(), rows.begin() + k);
+        std::vector<MRow> B(rows.begin() + k, rows.end());
+        std::vector<LamPtr> ca = comps, cb = comps;
+        LamPtr bodyA = gmatch(std::move(ca), std::move(A), mloc, e);
+        LamPtr bodyB = bodyA ? gmatch(std::move(cb), std::move(B), mloc, deid) : nullptr;
+        if (bodyA && bodyB) {
+          int bad = 0; int uses = count_exit(bodyA, e, false, bad);
+          if (uses == 0) { --next_exit_; return bodyA; }
+          if (uses == 1 && bad == 0) { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          auto c = mk(Lam::K::Catch); c->cond = bodyA; c->prim_arg = e; c->then_ = bodyB;
+          return c;
+        }
+        --next_exit_;                     // fall through to the spread path
+      }
+    }
     // A leading UNGUARDED all-wildcard row matches every value, so the rows after
     // it are dead.  ocamlc drops them and emits that row's action with no column
     // test.  Our column dispatch (const_body/block_body) would instead spread the
