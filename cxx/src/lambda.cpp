@@ -12904,10 +12904,10 @@ struct Translator {
       for (size_t i = 1; i + 1 < rows.size(); ++i)
         if (row_all_var(rows[i])) { if (rows[i].guard) k = i; break; }
       bool a_cuts = k > 0;                // group A's heads refuse omega rows
-      bool a_tests_col0 = false;
+      bool a_tests_col0 = false, a_has_omega = false;
       for (size_t i = 0; a_cuts && i < k; ++i) {
         const Pattern* p = pat_deep(rows[i].cols[0]);
-        if (pat_omega_like(rows[i].cols[0])) continue;
+        if (pat_omega_like(rows[i].cols[0])) { a_has_omega = true; continue; }
         a_tests_col0 = true;
         a_cuts = std::holds_alternative<Ppat_construct>(p->desc) ||
                  std::holds_alternative<Ppat_constant>(p->desc) ||
@@ -12922,6 +12922,84 @@ struct Translator {
         const Pattern* ep = effective_pat(c);
         if (std::get_if<Ppat_var>(&ep->desc) ||
             std::get_if<Ppat_alias>(&ep->desc)) { has_var = true; break; }
+      }
+      // An omega row in group A tests a LATER column, and can_group ends
+      // upstream's chunk right there (Construct/Any -> false): collect sends it
+      // to rev_no and the next chunk re-dispatches from scratch, so the true
+      // division is FINER than the k-cut -- `[L n,_ when g][_,R s when g'][x,y
+      // when g''][rest]` is four chunks, the omega row columnized on its own
+      // (precompile_var pops column 0).  gmatch_run_chunks's grouping loop IS
+      // collect, so try it first and keep the k-cut as the fallback when it
+      // declines.  Uniform single-kind column only (construct, constant, or
+      // poly variant -- a Record/Tuple head under an Any discr still ends a
+      // chunk, but our spec can't voice three-way divisions), every arm
+      // exit-shared, and no var row sharing a ctor row's arm after one fired
+      // (the or-ALTERNATIVE decline below, verbatim).  The attempt compiles
+      // guards, so a rejection must restore everything the retry reads --
+      // the snapshot discipline is the chunk site's below, verbatim.
+      if (a_cuts && has_var && a_has_omega && !cppcaml::dbg_env("NOFINER")) {
+        bool (*spec)(const Pattern*) = nullptr;
+        bool uniform = true;
+        for (auto& r : rows) {
+          if (pat_omega_like(r.cols[0])) continue;
+          auto& d = r.cols[0]->desc;
+          bool (*s)(const Pattern*) =
+              std::get_if<Ppat_construct>(&d)
+                ? static_cast<bool (*)(const Pattern*)>([](const Pattern* p) {
+                    return std::get_if<Ppat_construct>(&p->desc) != nullptr; })
+            : std::holds_alternative<Ppat_constant>(d)
+                ? static_cast<bool (*)(const Pattern*)>([](const Pattern* p) {
+                    return std::holds_alternative<Ppat_constant>(p->desc); })
+            : std::holds_alternative<Ppat_variant>(d)
+                ? static_cast<bool (*)(const Pattern*)>([](const Pattern* p) {
+                    return std::holds_alternative<Ppat_variant>(p->desc); })
+                : nullptr;
+          if (!s) { uniform = false; break; }
+          if (!spec) spec = s;
+          else if (spec != s) { uniform = false; break; }
+        }
+        bool okf = spec && uniform;
+        if (okf) {
+          std::set<int> ctor_aids;
+          bool spread_any = false;
+          for (auto& r : rows) {
+            if (r.spread) spread_any = true;
+            if (spec(r.cols[0])) ctor_aids.insert(r.aid);
+          }
+          bool seen_ctor = false;
+          for (auto& r : rows) {
+            if (r.aid < 0) { okf = false; break; }
+            if (spec(r.cols[0])) { seen_ctor = true; continue; }
+            if ((seen_ctor || spread_any) && ctor_aids.count(r.aid))
+              { okf = false; break; }
+          }
+          if (okf) {
+            auto orw_save = gm_orw_;
+            auto facc_save = gm_facc_proto_;
+            int exit_save = next_exit_;
+            int stamp_save = stamp;
+            std::set<int> dirty_save = gm_ctx_dirty_eids_;
+            gm_ctx_dirty_eids_.clear();
+            LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv, spec);
+            bool own_dirty = false;
+            if (spread_any)
+              for (int d : gm_ctx_dirty_eids_)
+                if (d > exit_save) { own_dirty = true; break; }
+            if (r && !own_dirty) {
+              int fbad = 0;
+              if (deid != gm_fake_deid_ ||
+                  count_exit(r, deid, false, fbad) == 0) {
+                gm_ctx_dirty_eids_.insert(dirty_save.begin(), dirty_save.end());
+                return r;
+              }
+            }
+            gm_ctx_dirty_eids_ = std::move(dirty_save);
+            gm_orw_ = std::move(orw_save);
+            gm_facc_proto_ = std::move(facc_save);
+            next_exit_ = exit_save;
+            stamp = stamp_save;
+          }
+        }
       }
       if (a_cuts && has_var) {
         int e = ++next_exit_;
@@ -14290,8 +14368,10 @@ struct Translator {
     // turning their single-use arms multi-use (root catches upstream never
     // makes).  A var row whose rest is all-omega adds no dispatch, so the
     // spread compiles identically there and stays (trailing all-var rows were
-    // already peeled by the caller's chunk split).  Guarded rows fall through
-    // to the spread path: upstream's up-to-guard division cuts differently.
+    // already peeled by the caller's chunk split).  Guarded rows chunk too:
+    // collect never reads guards, so a guarded row divides exactly like its
+    // unguarded twin, its guard-failure miss riding the same default exit --
+    // only the arm-shape gates below still apply.
     if (anyctor) {
       // A var row that shares its arm with a ctor row is an or-ALTERNATIVE
       // (`(Error _ as e, _) | (_, Error _ as e)` after this level's col-0 or
@@ -14319,10 +14399,11 @@ struct Translator {
       }
       bool anyv = false, nontriv = false, ok = true, has_spread = false, seen_ctor = false;
       for (auto& r : rows) {
-        // Every row aid-shared: leaves emit `(exit aid)` only, so a rejected
-        // attempt never runs expr() (whose side effects the state restore
-        // below could not undo).
-        if (r.guard || r.aid < 0) { ok = false; break; }
+        // Every row aid-shared: leaves emit `(exit aid)` only.  A guard DOES
+        // run expr() in a rejectable attempt, but everything the retry reads
+        // is in the state snapshot below (stamps included), so the spread
+        // path's own guard compile lands on the same numbers.
+        if (r.aid < 0) { ok = false; break; }
         if (r.spread) has_spread = true;
         if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) { seen_ctor = true; continue; }
         if ((seen_ctor || spread_any) && ctor_aids.count(r.aid)) { ok = false; break; }
