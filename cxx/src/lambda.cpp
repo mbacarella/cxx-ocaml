@@ -950,6 +950,20 @@ struct Translator {
   // both anyway so the retry's codegen is history-independent.
   std::map<int, int> gm_eid_full_;
   std::set<int> gm_eid_part_;
+  // Per-COLUMN jump context (upstream's ctx through Default_environment):
+  // a fact "the value at the handler's original column `col` IS constructor
+  // (blk, tag) of `type`", accumulated on a pending entry as specialization
+  // consumes its columns and intersected over every arrival at the entry's
+  // eid.  The chunk handler re-dispatches those columns from scratch, and
+  // when every tracked arrival carries the same fact, upstream's ctx prunes
+  // the other groups -- no test, no failaction (associate_fields' cons/cons
+  // branch reads `field 0 l'` with no `if l'`).
+  struct GmProof { int col; std::string type; bool blk; int tag; };
+  std::map<int, int> gm_eid_arr_;                     // eid -> tracked arrivals
+  std::map<int, std::vector<GmProof>> gm_eid_proofs_;   // eid -> intersection
+  // Column cell -> proven head, registered only around a chunk handler's
+  // compile (and transferred across the gm_facc materialization's cell swap).
+  std::map<const Lam*, GmProof> gm_proven_comp_;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -12398,7 +12412,16 @@ struct Translator {
                  // real coverage, so a later full consumption routes soundly
                  // but proves nothing (mkexit must not count it as a
                  // full-context jump).
-                 bool widened = false; };
+                 bool widened = false;
+                 // colmap[i]: which of the entry's ORIGINAL columns current
+                 // column i is (-1 for a payload sub-column) -- the frame the
+                 // entry's handler recompiles in.  proofs: column facts every
+                 // arrival through this env state has established (a ctor
+                 // consumption is true for both a matched tag's sub-compile
+                 // and a gap tag's fail routing).  Widening does not taint
+                 // them: a pop drops a TEST, not an established fact.
+                 std::vector<int> colmap;
+                 std::vector<GmProof> proofs; };
   const Pattern* gmdef_peel(const Pattern* p) {
     if (!p) return nullptr;
     for (;;) {
@@ -12418,15 +12441,29 @@ struct Translator {
   // (return -1 unsupported / 0 row dropped / 1 row(s) appended), then the
   // drop-empty-entry and truncate-below-full-match rules.
   template <class F>
-  bool denv_map(std::vector<GmDef>& env, F spec) {
+  bool denv_map(std::vector<GmDef>& env, F spec, int payload = 0,
+                const GmProof* rec = nullptr) {
+    // Consuming column 0 rewrites the entry's column-identity vector
+    // (payload sub-columns are anonymous), and a ctor consumption of a
+    // still-identified column records a proof for the entry's handler.
+    auto consume_col0 = [&](GmDef& ne) {
+      if (ne.colmap.empty()) return;
+      int oc = ne.colmap[0];
+      std::vector<int> nc((size_t)payload, -1);
+      nc.insert(nc.end(), ne.colmap.begin() + 1, ne.colmap.end());
+      ne.colmap = std::move(nc);
+      if (rec && oc >= 0)
+        ne.proofs.push_back({oc, rec->type, rec->blk, rec->tag});
+    };
     std::vector<GmDef> out;
     for (auto& en : env) {
       if (!en.mat.empty() && en.mat[0].empty()) {   // already fully matched
-        out.push_back({en.eid, {{}}, en.head_dropped, en.widened});
+        out.push_back(
+            {en.eid, {{}}, en.head_dropped, en.widened, {}, en.proofs});
         env = std::move(out);
         return true;
       }
-      GmDef ne{en.eid, {}, en.head_dropped, en.widened};
+      GmDef ne{en.eid, {}, en.head_dropped, en.widened, en.colmap, en.proofs};
       // Work items carry their ORIGINAL row index so we can tell whether the
       // entry's head row survives this specialization (or-alternatives of
       // the head all count as head material).
@@ -12449,8 +12486,10 @@ struct Translator {
       }
       if (ne.mat.empty()) continue;                 // entry unreachable: drop
       if (!head_alive) ne.head_dropped = true;
+      consume_col0(ne);
       if (ne.mat[0].empty()) {                      // fully matched: truncate
-        out.push_back({ne.eid, {{}}, ne.head_dropped, ne.widened});
+        out.push_back(
+            {ne.eid, {{}}, ne.head_dropped, ne.widened, {}, ne.proofs});
         env = std::move(out);
         return true;
       }
@@ -12506,6 +12545,8 @@ struct Translator {
   bool denv_spec_ctor(std::vector<GmDef>& env, const std::string& type,
                       bool is_block, int tag, int a,
                       const std::vector<std::string>* rlab) {
+    int payload = (rlab && !rlab->empty()) ? (int)rlab->size() : a;
+    GmProof rec{-1, type, is_block, tag};
     return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
                              GmDef& ne) -> int {
       std::vector<const Pattern*> fps(a, nullptr);
@@ -12535,7 +12576,7 @@ struct Translator {
       fps.insert(fps.end(), row.begin() + 1, row.end());
       ne.mat.push_back(std::move(fps));
       return 1;
-    });
+    }, payload, &rec);
   }
   bool denv_spec_variant(std::vector<GmDef>& env, const std::string& label,
                          bool is_block) {
@@ -12552,7 +12593,7 @@ struct Translator {
       nr.insert(nr.end(), row.begin() + 1, row.end());
       ne.mat.push_back(std::move(nr));
       return 1;
-    });
+    }, is_block ? 1 : 0);
   }
   bool denv_spec_tuple(std::vector<GmDef>& env, size_t tk) {
     return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
@@ -12567,7 +12608,7 @@ struct Translator {
       nr.insert(nr.end(), row.begin() + 1, row.end());
       ne.mat.push_back(std::move(nr));
       return 1;
-    });
+    }, (int)tk);
   }
   static bool gm_const_eq(const Constant& a, const Constant& b) {
     if (a.desc.index() != b.desc.index()) return false;
@@ -12684,6 +12725,9 @@ struct Translator {
       for (size_t m = k; m < groups.size(); ++m) {
         GmDef e{eids[m], {}};
         for (size_t r : groups[m]) e.mat.push_back(rows[r].cols);
+        if (!e.mat.empty())              // column identity: this frame's own
+          for (size_t j = 0; j < e.mat[0].size(); ++j)
+            e.colmap.push_back((int)j);
         env.push_back(std::move(e));
       }
       env.insert(env.end(), denv.begin(), denv.end());
@@ -12727,9 +12771,72 @@ struct Translator {
           }
         }
       }
+      // Per-COLUMN jump context: when every tracked arrival at this handler
+      // established the same column fact (and the tracked count matches the
+      // exits actually in the tree, so no untracked path reaches it), the
+      // handler's re-dispatch of that column keeps only the proven group --
+      // upstream's ctx pruning.  Registered on the column CELLS for the
+      // handler compile only; a rejected enclosing attempt restores the map.
+      auto proven_save = gm_proven_comp_;
+      bool pf_here = false;
+      {
+        auto pit = gm_eid_proofs_.find(eids[k]);
+        auto ait = gm_eid_arr_.find(eids[k]);
+        int pbad = 0;
+        if (cppcaml::dbg_env("GMPFDBG"))
+          fprintf(stderr, "[GMPF] eid=%d proofs=%zd arr=%d exits=%d\n", eids[k],
+                  pit == gm_eid_proofs_.end() ? -1 : (long)pit->second.size(),
+                  ait == gm_eid_arr_.end() ? -1 : ait->second,
+                  count_exit(res, eids[k], false, pbad));
+        if (pit != gm_eid_proofs_.end() && !pit->second.empty() &&
+            ait != gm_eid_arr_.end() && ait->second > 0 &&
+            count_exit(res, eids[k], false, pbad) == ait->second &&
+            !cppcaml::dbg_env("GMNOPROOF")) {
+          if (cppcaml::dbg_env("GMPFDBG")) {
+            std::string ck2;
+            for (auto& c : comps)
+              ck2 += !c ? '0' : c->k == Lam::K::Var ? 'v' : 'x';
+            fprintf(stderr, "[GMPFAPP] eid=%d loc=%d comps=%s\n", eids[k],
+                    mloc.start.lnum, ck2.c_str());
+          }
+          for (auto& pf : pit->second)
+            if (pf.col >= 0 && pf.col < (int)comps.size()) {
+              gm_proven_comp_.insert_or_assign(comps[pf.col].get(), pf);
+              pf_here = true;
+            }
+        }
+      }
       LamPtr hb = gmatch(std::move(ck), std::move(cr), mloc, deid,
                          env_from(k + 1));
+      gm_proven_comp_ = std::move(proven_save);
       if (!hb) return nullptr;
+      // A proof-pruned handler can collapse to a bare argless re-raise; the
+      // catch is then an exit ALIAS upstream's simplify_exits (simplif.ml:306,
+      // `Lstaticcatch (l1, (i, []), Lstaticraise _)`) erases -- substitute
+      // the arm exit at every entry site and drop the catch.  Scoped to
+      // proof-pruned handlers (that is when upstream's ctx produced the same
+      // bare handler), and only when every column the handler pops is already
+      // a variable: a non-var column gets arg_to_var's dead Alias bind in
+      // upstream's handler pm, simplify_exits runs BEFORE simplify_lets, and
+      // the let-wrapped re-raise does not match the alias rule -- the catch
+      // survives to the bytecode there.
+      if (pf_here && hb->k == Lam::K::Staticraise && hb->args.empty()) {
+        // ... except when the handler pm re-reads TWO or more raw (non-var)
+        // columns: upstream binds each at its own compile entry, the dead
+        // Alias lets stack up in the handler, and the let-wrapped re-raise
+        // does not match the alias rule -- there the kept catch is where
+        // wire-time arm inlining then rebuilds upstream's arm handler
+        // (translmod's bind_strict `with (118)` around the switch).  One raw
+        // column's bind lands with the sharing parent instead (matching's
+        // filter_rec_or tuple sites, both list components already vars).
+        int rawcols = 0;
+        for (auto& c : comps)
+          if (!c || c->k != Lam::K::Var) ++rawcols;
+        if (rawcols < 2) {
+          inline_exit(res, eids[k], {}, {}, hb);
+          continue;
+        }
+      }
       // Single-use inlining deferred to inline_chunk_catches (see the
       // trailing-row split above).
       auto c = mk(Lam::K::Catch);
@@ -12862,6 +12969,11 @@ struct Translator {
         if (rw.aid >= 0 && !gm_exit_opaque_.count(rw.aid))
           gm_exit_opaque_[rw.aid] = rw.guard || !rhs_transparent(rw.rhs);
       comps[0] = varof(v);
+      // A proven column keeps its fact across the cell swap (the divide below
+      // pointer-matches the NEW cell).
+      if (auto pvt = gm_proven_comp_.find(proto.get());
+          pvt != gm_proven_comp_.end())
+        gm_proven_comp_.insert_or_assign(comps[0].get(), pvt->second);
       LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(denv),
                         no_peel);
       if (!r) return nullptr;
@@ -13104,6 +13216,9 @@ struct Translator {
             gm_ctx_dirty_eids_.clear();
             auto full_save = gm_eid_full_;
             auto part_save = gm_eid_part_;
+            auto arr_save = gm_eid_arr_;
+            auto proofs_save = gm_eid_proofs_;
+            auto proven_save2 = gm_proven_comp_;
             LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv, spec);
             bool own_dirty = false;
             if (spread_any)
@@ -13120,6 +13235,9 @@ struct Translator {
             gm_ctx_dirty_eids_ = std::move(dirty_save);
             gm_eid_full_ = std::move(full_save);
             gm_eid_part_ = std::move(part_save);
+            gm_eid_arr_ = std::move(arr_save);
+            gm_eid_proofs_ = std::move(proofs_save);
+            gm_proven_comp_ = std::move(proven_save2);
             gm_orw_ = std::move(orw_save);
             gm_facc_proto_ = std::move(facc_save);
             next_exit_ = exit_save;
@@ -13186,7 +13304,9 @@ struct Translator {
       // cons its (all-omega) matrix on top so misses in `main` still reach
       // it first; `deid` stays the final exit underneath.
       std::vector<GmDef> me = denv;
-      me.insert(me.begin(), {e, {std::vector<const Pattern*>(W, nullptr)}});
+      GmDef pe{e, {std::vector<const Pattern*>(W, nullptr)}};
+      for (size_t j = 0; j < W; ++j) pe.colmap.push_back((int)j);
+      me.insert(me.begin(), std::move(pe));
       main = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(me), no_peel_main);
     }
     if (!main) return nullptr;
@@ -13230,6 +13350,24 @@ struct Translator {
         // reduce_aliases_for_uid: tag-4/approx=true prunes the spread
         // `{uid=Some;approx=false}` copy and deep-matches `{approx=true}`).
         if (full && f.head_dropped) gm_ctx_dirty_eids_.insert(f.eid);
+        // Column facts: count the arrival and intersect its established
+        // proofs into the entry's summary (first arrival seeds it).
+        ++gm_eid_arr_[f.eid];
+        auto pit = gm_eid_proofs_.find(f.eid);
+        if (pit == gm_eid_proofs_.end()) {
+          gm_eid_proofs_.emplace(f.eid, f.proofs);
+        } else {
+          auto& cur = pit->second;
+          cur.erase(std::remove_if(cur.begin(), cur.end(),
+                      [&](const GmProof& p) {
+                        for (auto& q : f.proofs)
+                          if (q.col == p.col && q.blk == p.blk &&
+                              q.tag == p.tag && q.type == p.type)
+                            return false;
+                        return true;
+                      }),
+                    cur.end());
+        }
       }
       return e;
     };
@@ -13517,6 +13655,9 @@ struct Translator {
         auto facc_save = gm_facc_proto_;
         auto full_save = gm_eid_full_;
         auto part_save = gm_eid_part_;
+        auto arr_save = gm_eid_arr_;
+        auto proofs_save = gm_eid_proofs_;
+        auto proven_save2 = gm_proven_comp_;
         LamPtr res = attempt(tstart, true);
         int fbad = 0;
         if (res && count_exit(res, deid, false, fbad) == 0) return res;
@@ -13527,6 +13668,9 @@ struct Translator {
         gm_facc_proto_ = std::move(facc_save);
         gm_eid_full_ = std::move(full_save);
         gm_eid_part_ = std::move(part_save);
+        gm_eid_arr_ = std::move(arr_save);
+        gm_eid_proofs_ = std::move(proofs_save);
+        gm_proven_comp_ = std::move(proven_save2);
         bailed = false;
       }
       // The strict reading: no hoist past the or-row under the fake default (its
@@ -13607,6 +13751,10 @@ struct Translator {
             // ARGUMENT-FREE arm exit; an arm carrying pattern variables would
             // need upstream's `vars` on the fresh handler and is left alone.
             int bad = 0;
+            if (cppcaml::dbg_env("GMTRDBG"))
+              fprintf(stderr, "[GMTR] aid=%d cnt=%d argless=%d\n", aid,
+                      count_exit(*slot, aid, false, bad),
+                      (int)exits_argless(*slot, aid));
             if (count_exit(*slot, aid, false, bad) == 0 ||
                 !exits_argless(*slot, aid)) continue;
             int n = ++next_exit_;
@@ -13670,6 +13818,9 @@ struct Translator {
         auto facc_save = gm_facc_proto_;
         auto full_save = gm_eid_full_;
         auto part_save = gm_eid_part_;
+        auto arr_save = gm_eid_arr_;
+        auto proofs_save = gm_eid_proofs_;
+        auto proven_save2 = gm_proven_comp_;
         std::vector<LamPtr> rc = comps;
         std::swap(rc[0], rc[piv]);
         std::vector<MRow> rr = rows;
@@ -13684,6 +13835,9 @@ struct Translator {
         gm_facc_proto_ = std::move(facc_save);
         gm_eid_full_ = std::move(full_save);
         gm_eid_part_ = std::move(part_save);
+        gm_eid_arr_ = std::move(arr_save);
+        gm_eid_proofs_ = std::move(proofs_save);
+        gm_proven_comp_ = std::move(proven_save2);
       }
     }
     // Nested tuple column: a tuple type is monomorphic, so every value is a k-block
@@ -14612,6 +14766,9 @@ struct Translator {
         gm_ctx_dirty_eids_.clear();
         auto full_save = gm_eid_full_;
         auto part_save = gm_eid_part_;
+        auto arr_save = gm_eid_arr_;
+        auto proofs_save = gm_eid_proofs_;
+        auto proven_save2 = gm_proven_comp_;
         LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
                 [](const Pattern* p) {
                   return std::get_if<Ppat_construct>(&p->desc) != nullptr;
@@ -14645,6 +14802,9 @@ struct Translator {
         gm_ctx_dirty_eids_ = std::move(dirty_save);
         gm_eid_full_ = std::move(full_save);
         gm_eid_part_ = std::move(part_save);
+        gm_eid_arr_ = std::move(arr_save);
+        gm_eid_proofs_ = std::move(proofs_save);
+        gm_proven_comp_ = std::move(proven_save2);
         gm_orw_ = std::move(orw_save);
         gm_facc_proto_ = std::move(facc_save);
         next_exit_ = exit_save;
@@ -14840,9 +15000,14 @@ struct Translator {
         return nullptr;
       }
       auto ti = type_ctor_info_.find(univ_qual.empty() ? type : univ_qual);
-      if (ti == type_ctor_info_.end()) return nullptr;
-      for (auto& [nm, info] : ti->second)
-        if (info.is_block && info.tag == t && info.type == type) return &info;
+      if (ti != type_ctor_info_.end())
+        for (auto& [nm, info] : ti->second)
+          if (info.is_block && info.tag == t && info.type == type) return &info;
+      // Predef variants (list/option/result) have no type_ctor_info_ entry;
+      // without this their gap misses route unspecialized (a bare pop) and
+      // carry no column facts.
+      for (auto& [nm, info] : predef_ctor_info_)
+        if (info.type == type && info.is_block && info.tag == t) return &info;
       return nullptr;
     };
     // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
@@ -14853,6 +15018,17 @@ struct Translator {
         const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
         (ci->is_block ? block_ci : const_ci)[ci->tag] = ci;
       } else has_var = true;
+    // Upstream's jump-context pruning: every arrival at this chunk handler
+    // PROVED this column is one specific constructor, so the divide keeps
+    // only that group -- no test, no failaction, and the other tags' bodies
+    // are never built (their mkexits would corrupt arrival accounting and
+    // their empty sub-matrices would raise exits upstream never emits).
+    const GmProof* pv = nullptr;
+    if (auto pvit = gm_proven_comp_.find(comps[0].get());
+        pvit != gm_proven_comp_.end() && pvit->second.type == type &&
+        (pvit->second.blk ? block_ci.count(pvit->second.tag)
+                          : const_ci.count(pvit->second.tag)))
+      pv = &pvit->second;
     // Default-sub-matrix sharing (matching.ml's D(P)): every GAP tag (no explicit
     // ctor row) is reached only by the var/any rows, which are identical for all
     // gaps.  Rather than recompile that sub-matrix once per gap tag -- which burns
@@ -14862,7 +15038,7 @@ struct Translator {
     bool has_gap = false;
     for (int t = 0; t < NC && !has_gap; ++t) if (!const_ci.count(t)) has_gap = true;
     for (int t = 0; t < NB && !has_gap; ++t) if (!block_ci.count(t)) has_gap = true;
-    bool share_dflt = has_var && has_gap;
+    bool share_dflt = has_var && has_gap && !pv;  // proven: no gaps fire
     int dflt_exit = share_dflt ? ++next_exit_ : -1;
     auto mkdflt = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = dflt_exit; return e; };
     // Build the body for one constant tag t: matching-t const rows + all var rows.
@@ -15056,6 +15232,7 @@ struct Translator {
       const auto& rlab = bi->second->rlabels;
       return rlab.empty() ? bi->second->arity : (int)rlab.size();
     };
+    if (pv) return pv->blk ? block_body(pv->tag) : const_body(pv->tag);
     std::vector<Lam::SwitchCase> consts, blocks;
     for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b, 0}); }
     for (int t = 0; t < NB; ++t) { LamPtr b = block_body(t); if (!b) return nullptr; blocks.push_back({t, b, blk_arity(t)}); }
