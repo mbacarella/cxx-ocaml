@@ -14707,9 +14707,9 @@ struct Translator {
     // re-emitting their own dispatch once per tag (untypeast's `pattern`: the
     // three pat_extra-only rows re-dispatched under every pat_desc case) and
     // turning their single-use arms multi-use (root catches upstream never
-    // makes).  A var row whose rest is all-omega adds no dispatch, so the
-    // spread compiles identically there and stays (trailing all-var rows were
-    // already peeled by the caller's chunk split).  Guarded rows chunk too:
+    // makes).  A var row whose rest is all-omega adds no dispatch of its own,
+    // but the division is still observable in the exit structure -- see the
+    // arity note at the gate below.  Guarded rows chunk too:
     // collect never reads guards, so a guarded row divides exactly like its
     // unguarded twin, its guard-failure miss riding the same default exit --
     // only the arm-shape gates below still apply.
@@ -14740,6 +14740,7 @@ struct Translator {
         if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) ctor_aids.insert(r.aid);
       }
       bool anyv = false, nontriv = false, ok = true, has_spread = false, seen_ctor = false;
+      bool wide_ctor = false;
       for (auto& r : rows) {
         // Every row aid-shared: leaves emit `(exit aid)` only.  A guard DOES
         // run expr() in a rejectable attempt, but everything the retry reads
@@ -14747,7 +14748,13 @@ struct Translator {
         // path's own guard compile lands on the same numbers.
         if (r.aid < 0) { ok = false; break; }
         if (r.spread) has_spread = true;
-        if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) { seen_ctor = true; continue; }
+        if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
+          seen_ctor = true;
+          std::string cn = ctor_of(*r.cols[0]);
+          const CtorInfo* ci = pat_ctor_resolve(r.cols[0], cn);
+          if (!ci || ci->arity > 1) wide_ctor = true;
+          continue;
+        }
         if (ctor_aids.count(r.aid) &&
             (spread_any || (seen_ctor && cppcaml::dbg_env("GMNOORALT"))))
           { ok = false; break; }
@@ -14755,7 +14762,21 @@ struct Translator {
         for (size_t j = 1; j < r.cols.size() && !nontriv; ++j)
           if (!gmdef_omega(gmdef_peel(r.cols[j]))) nontriv = true;
       }
-      if (ok && anyv && nontriv && !cppcaml::dbg_env("NOCTORCHUNK")) {
+      // A var row whose rest is all-omega adds no dispatch of its own, so the
+      // chunk split is visible only in the exit STRUCTURE: upstream still
+      // divides (precompile_var falls to do_not_precompile with no second
+      // column, but split_no_or has already made the var group its own entry).
+      // We follow it, except when some ctor row has arity >= 2.  There the
+      // single column specializes to several sub-columns, the sub-default pops
+      // one and still holds a raw one, and arg_to_var's dead Alias bind wraps
+      // upstream's handler; since simplify_exits runs BEFORE simplify_lets, the
+      // let-wrapped re-raise misses the alias rule (simplif.ml:306) and that
+      // catch reaches the bytecode (oprint's uncollect_anonymous_suffix, whose
+      // `::` handler binds `field_imm 1 acc` and is dropped again by
+      // simplify_lets -- too late).  Our bare handler would alias it away.
+      bool triv_ok = !wide_ctor && !cppcaml::dbg_env("GMNOTRIV");
+      if (ok && anyv && (nontriv || triv_ok) &&
+          !cppcaml::dbg_env("NOCTORCHUNK")) {
         // The attempt below can be rejected, and its sub-compiles advance
         // shared gmatch state; snapshot what the retry reads so a rejected
         // attempt is invisible to the spread path (a leaked gm_orw_ aid
