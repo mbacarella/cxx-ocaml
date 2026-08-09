@@ -25297,10 +25297,27 @@ struct Translator {
             }
           }
         } else if (is_irrefutable(*pat)) {
-          Ident pid = fresh("param");
+          // `(<sub> as s)`: Typecore.name_pattern REUSES the alias's ident as
+          // the parameter, and typing stamps it AFTER <sub>'s own variables.
+          // Minting a separate "param" here instead gave the parameter an
+          // EARLIER stamp than them, so a closure capturing both permuted its
+          // free-var order (Ident.Set.elements -> the ENVACC layout).  So
+          // preassign the pattern's idents source-first, take the alias's as
+          // the parameter, and bind only <sub> off it, as ocamlc does.
+          const Pattern* epat = effective_pat(pat);
+          auto* pa = std::get_if<Ppat_alias>(&epat->desc);
+          if (pa && cppcaml::dbg_env("NOALIASPARAM")) pa = nullptr;
+          Ident pid;
+          if (pa) {
+            preassign_pat_vars(*epat);
+            pid = pre_or_fresh(epat, pa->name.txt);
+            scope.back()[pa->name.txt] = pid;
+          } else {
+            pid = fresh("param");
+          }
           l->params.push_back({pid, pat_kind(pat)});
           auto pvar = mk(Lam::K::Var); pvar->var = pid;
-          add_param_binders(*pat, pvar);
+          add_param_binders(pa ? *pa->p : *pat, pvar);
         } else {
           Ident pid = fresh("param");
           l->params.push_back({pid, pat_kind(pat)});
@@ -25366,10 +25383,21 @@ struct Translator {
           return l;
         }
         if (is_irrefutable(*pat)) {
-          Ident pid = fresh("param");
+          // Same alias reuse as an ordinary parameter above: name_cases returns
+          // the `as` ident, which typing stamped after its sub-pattern's vars.
+          auto* pa = std::get_if<Ppat_alias>(&pat->desc);
+          if (pa && cppcaml::dbg_env("NOALIASPARAM")) pa = nullptr;
+          Ident pid;
+          if (pa) {
+            preassign_pat_vars(*pat);
+            pid = pre_or_fresh(pat, pa->name.txt);
+            scope.back()[pa->name.txt] = pid;
+          } else {
+            pid = fresh("param");
+          }
           l->params.push_back({pid, pat_kind(pat)});
           auto pvar = mk(Lam::K::Var); pvar->var = pid;
-          add_param_binders(*pat, pvar);
+          add_param_binders(pa ? *pa->p : *pat, pvar);
           l->body = wrap_optdefs(wrap_binders(expr(*fc->cases[0].rhs), binders));
           restore_fcm();
           scope.pop_back();
