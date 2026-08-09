@@ -8645,9 +8645,17 @@ struct Translator {
     if (!l) return 0;
     if (l->k == Lam::K::Var)
       return (l->var.stamp == id.stamp && l->var.name == id.name) ? w : 0;
-    int wb = l->k == Lam::K::Function ? 2 : w;
+    // simplif's `count` empties `bv` when it crosses a lambda AND when it
+    // crosses a LOOP (simplif.ml:458-460: `Lwhile` counts both parts, `Lfor`
+    // its body, with `Ident.Map.empty`), so a use inside a loop weighs 2 too:
+    // substituting a single-use binding there would re-evaluate it on every
+    // iteration.  For a `for`, only the body repeats -- the bounds run once.
+    bool loop = (l->k == Lam::K::While || l->k == Lam::K::For) &&
+                !cppcaml::dbg_env("NOLOOPW");
+    int wb = (l->k == Lam::K::Function || loop) ? 2 : w;
+    int wc = (l->k == Lam::K::While && loop) ? 2 : w;
     int c = count_var(l->fn, id, w) + count_var(l->body, id, wb) +
-            count_var(l->cond, id, w) + count_var(l->then_, id, w) +
+            count_var(l->cond, id, wc) + count_var(l->then_, id, w) +
             count_var(l->else_, id, w) + count_var(l->sw_default, id, w);
     for (auto& a : l->args) c += count_var(a, id, w);
     for (auto& b : l->bindings) c += count_var(b.val, id, w);
