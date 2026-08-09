@@ -16472,7 +16472,9 @@ struct Translator {
   // Domain: `match e1, .., ek with ..` where every column is a variant whose
   // ctor patterns carry only var/wildcard arguments (so fields are bindings,
   // never sub-tests, and dispatch stays pure tag arithmetic; tags are unified
-  // as const-tag | NC + block-tag) or a bare var, no guards.  Reproduces
+  // as const-tag | NC + block-tag) or a bare var.  A `when` guard is fine: it
+  // rides in the action as Translcore builds it (`if g then body else exit 0`)
+  // and compile_match patches the else with the rows below.  Reproduces
   // ocamlc's exact or-pattern
   // machinery -- split_or / Or_matrix / precompile_or (each or-row's body
   // compiled ONCE behind an exit, alternatives explode to `(exit n)` rows),
@@ -16769,6 +16771,26 @@ struct Translator {
   static bool oc_is_exit(const LamPtr& l) {
     return l && l->k == Lam::K::Staticraise && l->args.empty();
   }
+  // Lambda.is_guarded / Lambda.patch_guarded (lambda.ml:702-715).  A `when` arm
+  // is translated ONCE, up front, as `if guard then body else (exit 0)` --
+  // Lambda.staticfail, the "anticipated staticraise" placeholder; exit 0 is
+  // never allocated (oc_alloc_exit pre-increments from 0).  compile_match then
+  // patches that else-branch with the compilation of the rows BELOW this one,
+  // which is what makes a failing guard fall through.  Both peel Llet, so a
+  // row-alias binding may sit outside the test.
+  static bool oc_is_guarded(const LamPtr& l) {
+    if (!l) return false;
+    if (l->k == Lam::K::Let) return oc_is_guarded(l->body);
+    return l->k == Lam::K::IfThenElse && l->else_ &&
+           l->else_->k == Lam::K::Staticraise && l->else_->prim_arg == 0 &&
+           l->else_->args.empty();
+  }
+  static LamPtr oc_patch_guarded(const LamPtr& l, const LamPtr& patch) {
+    LamPtr n = lam_alloc_copy(*l);            // functional: the act is shared
+    if (l->k == Lam::K::Let) n->body = oc_patch_guarded(l->body, patch);
+    else n->else_ = patch;
+    return n;
+  }
   static OcMatrix oc_as_matrix(const std::vector<OcClause>& cls) {
     OcMatrix m; for (auto& c : cls) m.push_back(c.cols);
     return m;
@@ -16799,9 +16821,11 @@ struct Translator {
                                             const OcDefEnv& def) {
     std::vector<OcClause> before, ors, no;
     auto rest_of = [](const OcClause& c) { return OcRow(c.cols.begin() + 1, c.cols.end()); };
-    // Or_matrix.safe_below: unguarded && le_pats(rest_q, rest_p).
+    // Or_matrix.safe_below: unguarded && le_pats(rest_q, rest_p).  The guard
+    // test is load-bearing: the ordering condition licenses skipping q::qs once
+    // p's or-pattern matched, and a guard that fails must still reach q::qs.
     auto safe_below = [&](const OcClause& q, const OcClause& p) {
-      return oc_les(rest_of(q), rest_of(p));
+      return !oc_is_guarded(q.act) && oc_les(rest_of(q), rest_of(p));
     };
     // does the clause's or-head (current column) bind variables?  Upstream's
     // insert condition requires `pat_bound_idents p = []` -- NOT use-filtered.
@@ -17067,9 +17091,19 @@ struct Translator {
                                         const OcPm& pm) {
     if (!pm.cases.empty() && pm.cases[0].cols.empty()) {
       LamPtr a = pm.cases[0].act;                  // leaf: rows below are dead
+      OcJumps j;                                   // .. unless it is GUARDED
+      if (oc_is_guarded(a)) {                      // matching.ml:3672-3679
+        OcPm rest = pm;
+        rest.cases.erase(rest.cases.begin());
+        rest.pending.clear();                      // bound once, outside
+        auto r = oc_compile_match(partial, ctx, rest);
+        if (!r) return std::nullopt;               // upstream fatal-errors here
+        a = oc_patch_guarded(a, r->lam);
+        j = r->jumps;
+      }
       for (auto it = pm.pending.rbegin(); it != pm.pending.rend(); ++it)
         a = oc_bind_field(it->first, it->second, a);
-      return OcRes{a, {}};
+      return OcRes{a, std::move(j)};
     }
     if (pm.cases.empty()) return oc_comp_exit(partial, ctx, pm.def);  // binds dead: skip
     auto [first, nexts] = oc_split_or(pm.cases, pm.argpos, pm.def);
@@ -17674,8 +17708,9 @@ struct Translator {
       if (!oc_top_safe_before(cl, no)) { no.push_back(cl); continue; }
       if (cl.alts.size() == 1 && oc_top_safe_before(cl, ors)) { before.push_back(cl); continue; }
       // Or_matrix.insert_or_append, walking most-recent-first.  The rests are
-      // empty at this stage, so safe_below always holds -- only the
-      // disjointness / equivalence conditions matter.
+      // empty at this stage, so le_pats always holds and safe_below reduces to
+      // its guard test -- only that and the disjointness / equivalence
+      // conditions matter.
       bool placed = false, to_no = false;
       for (int idx = (int)ors.size() - 1; idx >= 0; --idx) {
         const OcTopRow& q = ors[idx];
@@ -17689,7 +17724,9 @@ struct Translator {
           else to_no = true;
           break;
         }
-        // else: ordering condition (safe_below) holds trivially -> keep walking
+        // else: the ordering condition, i.e. safe_below q -- le_pats on empty
+        // rests is trivially true, so only q's guardedness can refuse it
+        if (oc_is_guarded(q.act)) { to_no = true; break; }
       }
       if (to_no) no.push_back(cl);
       else if (!placed) ors.push_back(cl);
@@ -17814,7 +17851,20 @@ struct Translator {
       }
       nh.pm.argpos = (int)oc_comps_.size();        // zero remaining columns
       for (auto& a : h.acts) nh.pm.cases.push_back({OcRow{}, a});
-      nh.pm.def.final_exit = final_exit;           // width-0 env, unused at leaves
+      // Default_environment.pop_compat orp def (precompile_or's orpm.default).
+      // An UNGUARDED handler never reads this -- its single row is the leaf --
+      // but a guarded one falls through to it, so the env has to be real.  The
+      // top matrices are one column wide, so every surviving row pops to width
+      // 0 and specialize_ truncates the env to that first entry.
+      nh.pm.def.final_exit = final_exit;
+      for (auto& [i, tm] : t->body.env) {
+        bool any = false;
+        for (auto& row : tm)
+          if (oc_top_compat(h.orp_alts, row)) { any = true; break; }
+        if (!any) continue;
+        nh.pm.def.env.push_back({i, {OcRow{}}});
+        break;
+      }
       r->handlers.push_back(std::move(nh));
     }
     return r;
@@ -17845,14 +17895,15 @@ struct Translator {
                                                       // (`Local x`, field==-1), for inline_rec_var_
     struct SrcAlt { std::vector<const Pattern*> cols; bool is_any;
                     std::vector<AltVar> vars; };   // bare-var columns, col order
-    struct SrcRow { std::vector<SrcAlt> alts; const Expression* rhs; };
+    struct SrcRow { std::vector<SrcAlt> alts; const Expression* rhs;
+                    const Expression* guard; };
     std::vector<SrcRow> srcs;
     size_t total_alts = 0;
     for (auto& r : vrows) {
-      if (r.guard) return nullptr;
+      if (r.guard && cppcaml::dbg_env("NOOCGUARD")) return nullptr;
       std::vector<const Pattern*> leaves;
       flatten_or(r.lhs, leaves);
-      SrcRow sr; sr.rhs = r.rhs;
+      SrcRow sr; sr.rhs = r.rhs; sr.guard = r.guard;
       for (auto* l : leaves) {
         const Pattern* ep = effective_pat(l);
         if (std::holds_alternative<Ppat_any>(ep->desc)) {
@@ -18154,9 +18205,21 @@ struct Translator {
       return it->second;
     };
     std::vector<LamPtr> acts;
+    // Translcore.transl_guard (translcore.ml:585) builds a `when` arm as
+    // `if guard then body else (exit 0)` -- and translates the BODY first, so
+    // the two subterms' fresh idents are stamped in that order.
+    auto add_guard = [&](const SrcRow& sr, LamPtr body) -> LamPtr {
+      if (!sr.guard) return body;
+      auto ite = mk(Lam::K::IfThenElse);
+      ite->cond = expr(*sr.guard); ite->then_ = body; ite->else_ = oc_exit(0);
+      return ite;
+    };
     for (size_t ri = 0; ri < srcs.size(); ++ri) {
       auto& rv = rowvars[ri];
-      if (rv.empty()) { acts.push_back(expr(*srcs[ri].rhs)); continue; }
+      if (rv.empty()) {
+        acts.push_back(add_guard(srcs[ri], expr(*srcs[ri].rhs)));
+        continue;
+      }
       bool multi = srcs[ri].alts.size() > 1;
       scope.emplace_back();
       // Whole inline-record binds (`Local x`): x is a fresh id aliased to the
@@ -18184,8 +18247,8 @@ struct Translator {
           scope.back()[v.name] = comps[v.occ[0].first]->var;
         }
       }
-      LamPtr act = expr(*srcs[ri].rhs);
-      if (!row_alias.empty()) {
+      LamPtr act = add_guard(srcs[ri], expr(*srcs[ri].rhs));
+      if (!row_alias.empty()) {   // outside: the guard may read the alias
         auto l = mk(Lam::K::Let); l->bindings = std::move(row_alias);
         l->body = act; act = l;
       }
@@ -18223,7 +18286,10 @@ struct Translator {
       for (size_t ai = 0; ai < srcs[ri].alts.size(); ++ai) {
         OcRow row;
         for (size_t c = 0; c < k; ++c) row.push_back(mk_pat(tags[ri][ai][c]));
-        all_alt_rows.push_back(row);
+        // Parmatch does not let a guarded row establish exhaustiveness ("some
+        // guarded clause may match this value"), and `partial` comes from
+        // Parmatch -- so a guarded row contributes nothing to oc_covers.
+        if (!srcs[ri].guard) all_alt_rows.push_back(row);
         tr.alts.push_back(std::move(row));
       }
       top.push_back(std::move(tr));
