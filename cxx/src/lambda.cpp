@@ -2981,6 +2981,18 @@ struct Translator {
   const Pmty_signature* sig_items_of(const ModuleType& mt0) {
     const ModuleType* m = &mt0;
     for (int g = 0; g < 8; ++g) {
+      // `S with type t = ..` keeps S's runtime layout, so peel the constraint
+      // exactly as sig_layout_impl does -- otherwise a functor parameter
+      // written `(X : S with type u := int)` yields NO signature,
+      // coerce_struct_arg bails, and a struct argument whose declaration order
+      // differs from S's is passed UNREORDERED (diffing.ml's
+      // `Generic(struct let test = .. let weight = .. end)`).
+      if (auto* pw = std::get_if<Pmty_with>(&m->desc)) {
+        if (!with_keeps_layout(*pw) || cppcaml::dbg_env("NOWITHSIG"))
+          return nullptr;
+        m = pw->mt.get();
+        continue;
+      }
       if (auto* ps = std::get_if<Pmty_signature>(&m->desc)) return ps;
       auto* pi = std::get_if<Pmty_ident>(&m->desc);
       if (!pi) return nullptr;
