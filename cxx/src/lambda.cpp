@@ -15381,14 +15381,25 @@ struct Translator {
     }
     // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
     LamPtr result;
-    // Two block bodies are the same action when pointer-equal, both argument-less
-    // exits to the same handler, or structurally equal with internal catch ids
-    // canonical and FREE exit targets literal (see same_action_lam: exit-blind
-    // keys merge leaves dispatching to distinct arm handlers -- a miscompile).
+    // Two block bodies are the same action when pointer-equal, or structurally
+    // equal with internal catch ids canonical and FREE exit targets literal
+    // (see same_action_lam: exit-blind keys merge leaves dispatching to
+    // distinct arm handlers -- a miscompile).
+    //   matching.ml's same_actions is `make_key act = make_key act0`, and
+    // Lambda.make_key keys an exit's ARGUMENTS too, so two `(exit K x)` leaves
+    // are ONE action.  Demanding argument-less exits here hid every such leaf
+    // from combine_constructor's act0 isint split -- and an or-row that BINDS
+    // (`(A _ | B _ | C as y)`, precompile_or passing the binding through the
+    // handler's exit) reaches its shared arm through exactly that shape.
+    // Keeping the literal-target check ahead of the key keeps the merge-blind
+    // hazard closed.
     auto same_action = [&](const LamPtr& a, const LamPtr& b) -> bool {
       if (a == b) return true;
-      if (a->k == Lam::K::Staticraise && b->k == Lam::K::Staticraise)
-        return a->prim_arg == b->prim_arg && a->args.empty() && b->args.empty();
+      if (a->k == Lam::K::Staticraise && b->k == Lam::K::Staticraise) {
+        if (a->prim_arg != b->prim_arg) return false;
+        if (a->args.empty() && b->args.empty()) return true;
+        if (cppcaml::dbg_env("NOEXITARGS")) return false;
+      }
       std::string ka = make_lam_key_scoped(a);
       return !ka.empty() && ka == make_lam_key_scoped(b);
     };
