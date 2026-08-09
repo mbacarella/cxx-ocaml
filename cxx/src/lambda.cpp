@@ -6712,6 +6712,26 @@ struct Translator {
   }
 
   LamPtr cint(long long n) { auto z = mk(Lam::K::ConstInt); z->int_val = n; return z; }
+  // Boxed-int (l/L/n) literal patterns compile through matching.ml's
+  // make_test_sequence with Pbintcomp -- a structural compare against the boxed
+  // constant -- never through the integer switcher: an unboxed != on a custom
+  // block is a physical compare against a fresh box and can never be true.
+  static long long bint_norm(char suf, long long v) {
+    return suf == 'l' ? (long long)(std::int32_t)v : v;  // int32 wraps
+  }
+  LamPtr bint_const(char suf, long long v) {
+    auto z = mk(Lam::K::ConstInt);
+    z->int_val = v; z->str_val = std::string(1, suf);
+    return z;
+  }
+  LamPtr bint_cmp(char suf, const char* op, const LamPtr& a, const LamPtr& b) {
+    auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp;
+    pr->prim_id = std::string(suf == 'l'   ? "Int32."
+                              : suf == 'L' ? "Int64."
+                                           : "Nativeint.") + op;
+    pr->args = {a, b};
+    return pr;
+  }
   LamPtr varof(const Ident& id) { auto v = mk(Lam::K::Var); v->var = id; return v; }
 
   // Wrap the module body in the `=a` bindings for the shared method/variable-name
@@ -11959,8 +11979,16 @@ struct Translator {
     if (auto* pc = std::get_if<Ppat_constant>(&p->desc)) {
       auto* pi = std::get_if<Pconst_integer>(&pc->c.desc);
       if (!pi) return nullptr;
-      auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
-      ne->args = {scrut, cint(parse_ocaml_int(pi->value))};
+      LamPtr ne;
+      if (pi->suffix) {
+        char suf = *pi->suffix;
+        ne = bint_cmp(suf, "!=", scrut,
+                      bint_const(suf,
+                                 bint_norm(suf, parse_ocaml_int(pi->value))));
+      } else {
+        ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt;
+        ne->args = {scrut, cint(parse_ocaml_int(pi->value))};
+      }
       auto iff = mk(Lam::K::IfThenElse);
       iff->cond = ne; iff->then_ = dflt; iff->else_ = k();
       return iff;
@@ -12465,7 +12493,10 @@ struct Translator {
         if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc)) {
           if ((long long)(unsigned char)ch->code != v) return 0;
         } else if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
-          if (parse_ocaml_int(pi->value) != v) return 0;
+          // Normalize like the column's colval so a boxed (l/L/n) entry keys
+          // on the same value ('l' wraps to 32-bit).
+          char suf = pi->suffix ? *pi->suffix : 0;
+          if (bint_norm(suf, parse_ocaml_int(pi->value)) != v) return 0;
         } else return -1;
       }
       ne.mat.emplace_back(row.begin() + 1, row.end());
@@ -13895,6 +13926,7 @@ struct Translator {
     // `lambda`-type matches).  Second-pass + budgeted like the tuple/record columns.
     if (g_gm_tuples_) {
       bool anyconst = false, purecol = true, charcol = false;
+      char boxsuf = 0;  // 'l'/'L'/'n': a BOXED column (int32/int64/nativeint)
       for (auto& r : rows) {
         auto& d = r.cols[0]->desc;
         if (auto* pc = std::get_if<Ppat_constant>(&d)) {
@@ -13906,11 +13938,17 @@ struct Translator {
           // 'L','F' -> ..` built a 4-block and read it back field by field
           // where ocamlc dispatches the four stack slots directly.
           bool isch = std::holds_alternative<Pconst_char>(pc->c.desc);
-          if (!isch && !std::get_if<Pconst_integer>(&pc->c.desc)) { purecol = false; break; }
+          auto* pin = std::get_if<Pconst_integer>(&pc->c.desc);
+          if (!isch && !pin) { purecol = false; break; }
           // Typing keeps a column to one domain; be defensive anyway, since
-          // the two use different edges and a mixed list would pick one.
-          if (anyconst && isch != charcol) { purecol = false; break; }
-          charcol = isch;
+          // the domains use different edges/compares and a mixed list would
+          // pick one.  A suffix is part of the domain: int/int32/int64/
+          // nativeint columns must not mix.
+          char suf = pin && pin->suffix ? *pin->suffix : 0;
+          if (anyconst && (isch != charcol || suf != boxsuf)) {
+            purecol = false; break;
+          }
+          charcol = isch; boxsuf = suf;
           anyconst = true;
         } else if (!std::get_if<Ppat_var>(&d) && !std::holds_alternative<Ppat_any>(d)) {
           purecol = false; break;
@@ -13956,7 +13994,8 @@ struct Translator {
           auto* pc = std::get_if<Ppat_constant>(&p->desc);
           if (auto* ch = std::get_if<Pconst_char>(&pc->c.desc))
             return (unsigned char)ch->code;
-          return parse_ocaml_int(std::get_if<Pconst_integer>(&pc->c.desc)->value);
+          return bint_norm(boxsuf,
+              parse_ocaml_int(std::get_if<Pconst_integer>(&pc->c.desc)->value));
         };
         std::vector<long long> vals;   // distinct values, in row order
         for (auto& r : rows)
@@ -14011,7 +14050,39 @@ struct Translator {
         // switch.ml:818) and what a spread-out set like 1/7/12 still reaches
         // through the theta density test.
         LamPtr chain;
-        {
+        if (boxsuf) {
+          // combine_constant's Const_int32/int64/nativeint arms are
+          // make_test_sequence with Pbintcomp (Cne/Clt) over the constants
+          // SORTED by their boxed value -- never call_switcher: a boxed
+          // column dispatches by structural compare, and >= 4 values get the
+          // Clt dichotomy (split at len/2, pivot = head of the upper half).
+          std::vector<std::pair<long long, LamPtr>> cells;
+          for (size_t i = 0; i < vals.size(); ++i)
+            cells.emplace_back(vals[i], vbody[i]);
+          std::sort(cells.begin(), cells.end(),
+                    [](auto& a, auto& b) { return a.first < b.first; });
+          std::function<LamPtr(size_t, size_t)> seq =
+              [&](size_t lo, size_t hi) {
+            if (hi - lo >= 4) {
+              size_t mid = lo + (hi - lo) / 2;
+              auto iff = mk(Lam::K::IfThenElse);
+              iff->cond = bint_cmp(boxsuf, "<", comps[0],
+                                   bint_const(boxsuf, cells[mid].first));
+              iff->then_ = seq(lo, mid); iff->else_ = seq(mid, hi);
+              return iff;
+            }
+            LamPtr acc = mkcd();  // do_tests_fail: smallest value outermost
+            for (size_t i = hi; i-- > lo;) {
+              auto iff = mk(Lam::K::IfThenElse);
+              iff->cond = bint_cmp(boxsuf, "!=", comps[0],
+                                   bint_const(boxsuf, cells[i].first));
+              iff->then_ = acc; iff->else_ = cells[i].second;
+              acc = iff;
+            }
+            return acc;
+          };
+          chain = seq(0, cells.size());
+        } else {
           std::vector<std::pair<long long, LamPtr>> cells;
           for (size_t i = 0; i < vals.size(); ++i) cells.emplace_back(vals[i], vbody[i]);
           chain = interval_switcher(comps[0], cells, cdflt,
@@ -20307,9 +20378,13 @@ struct Translator {
     // An integer literal, or a constant constructor (matched by its integer tag),
     // tested against the scrutinee with the rest of the rows as the fall-through.
     if (!r.guard) {
-      bool isint = false, ctor = false; long long val = 0;
+      bool isint = false, ctor = false; long long val = 0; char bsuf = 0;
       if (auto* pc = std::get_if<Ppat_constant>(&lhs->desc)) {
-        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) { isint = true; val = parse_ocaml_int(pi->value); }
+        if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
+          isint = true;
+          if (pi->suffix) bsuf = *pi->suffix;  // boxed: structural compare
+          val = bint_norm(bsuf, parse_ocaml_int(pi->value));
+        }
         // A LONE char literal immediately before the catch-all is matched by its
         // integer code, exactly like an int: ocamlc's call_switcher emits
         // `(if (!= c code) <default> <act>)`, but without this we fell through to
@@ -20333,6 +20408,8 @@ struct Translator {
         auto iff = mk(Lam::K::IfThenElse);
         if (ctor && val == 0) {
           iff->cond = scrut;  // constant ctor of tag 0: a truthy test (`!= 0` is identity)
+        } else if (bsuf) {
+          iff->cond = bint_cmp(bsuf, "!=", scrut, bint_const(bsuf, val));
         } else {
           auto ne = mk(Lam::K::Prim); ne->prim = Prim::NotEqInt; ne->args = {scrut, cint(val)};
           iff->cond = ne;
@@ -23153,13 +23230,29 @@ struct Translator {
               ValueKind k = ValueKind::Gen;
               for (ValueKind kk : {expr_kind(as[0].second.get()), expr_kind(as[1].second.get())})
                 if (kk != ValueKind::Gen) k = kk;
+              // A boxed-int literal operand names the domain even when kind
+              // inference gave up (a local function's Gen param compared
+              // against `0l`): typing guarantees the other side is the same
+              // boxed type, so the compare keeps its `Int32.==` spelling --
+              // never the physical `==` immediates take, which on a custom
+              // block compares addresses and is always false (lib-int32's
+              // `if y = 0l` sent y=0 into a live division by zero).
+              auto bsuf_of = [](const LamPtr& l) -> char {
+                return l->k == Lam::K::ConstInt && !l->str_val.empty()
+                           ? l->str_val[0] : 0;
+              };
+              if (k == ValueKind::Gen)
+                if (char s = bsuf_of(e0) ? bsuf_of(e0) : bsuf_of(e1))
+                  k = s == 'l'   ? ValueKind::Boxedint32
+                    : s == 'L' ? ValueKind::Boxedint64 : ValueKind::Nativeint;
               // Equality with an immediate constant of a generic type (`x = None`,
               // `x = []`) is physical -- comparing any value with an immediate is the
               // `==`/`!=` int test.  Only when the kind is generic: a boxed-int
-              // literal (`0n`/`0l`/`0L`) is ConstInt too but keeps its `Int64.==`
-              // spelling, which the kind path below provides.
+              // literal (`0n`/`0l`/`0L`) is ConstInt too but takes the kind
+              // path above via its suffix.
               auto is_imm = [](const LamPtr& l) {
-                return l->k == Lam::K::ConstInt || l->k == Lam::K::ConstChar;
+                return (l->k == Lam::K::ConstInt && l->str_val.empty()) ||
+                       l->k == Lam::K::ConstChar;
               };
               if (k == ValueKind::Gen && (n == "=" || n == "<>") && (is_imm(e0) || is_imm(e1))) {
                 auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = c.first;
