@@ -14716,22 +14716,23 @@ struct Translator {
     if (anyctor) {
       // A var row that shares its arm with a ctor row is an or-ALTERNATIVE
       // (`(Error _ as e, _) | (_, Error _ as e)` after this level's col-0 or
-      // expansion): upstream's precompile_or + jump contexts resolve those to
-      // direct arm exits at each miss point -- which is what the spread path
-      // already produces -- while a default-matrix recompile would re-dispatch
-      // a column the specialized side has fully determined, leaving a dead
-      // Match_failure arm no ctx model prunes (build_path_prefix_map's
-      // decode_pair, signature_group's `None,_ | _,Some _`).  Those all put the
-      // ctor alternative FIRST, so the specialized side runs before the shared
-      // var row; an or-alternative that LEADS the column (mtype's
-      // `{type_manifest = None} | {type_kind = Type_abstract _; ..}`) is the
-      // plain split instead -- upstream's leading var run is its own
-      // half-match and the ctor run its default.  So decline the shared arm
-      // only once a ctor row has already been seen, and only in a matrix that
-      // HAS an upstream counterpart: a spread matrix (var rows copied into a
-      // specialization) is ours alone, so its row order carries no upstream
-      // split to model and the leading-var allowance would just re-dispatch a
-      // column the copy already fixed (translprim's has_constant_constructor).
+      // expansion).  Such a row used to decline the whole attempt once a ctor
+      // row had been seen: the default matrix re-dispatches a column the
+      // specialized side has already fixed, and the dead Match_failure arm
+      // that leaves had no ctx model to prune it.  Per-column jump-context
+      // proofs prune that re-test now, and the acceptance guard below rejects
+      // whatever still escapes to a fake deid -- of the fourteen matrices the
+      // allowance reaches, nine come back byte-identical, so the guard, not
+      // this pre-filter, is what keeps them honest.  A spread-FREE matrix
+      // therefore chunks like any other, which is how ctype's mcomp ladder
+      // (`(Tvar _, _) | (_, Tvar _)` leading twenty rows) gets upstream's
+      // shared default matrices instead of the tail recopied under every tag.
+      // A spread matrix (var rows copied into a specialization by const_body/
+      // block_body) stays declined: its row order is ours alone, carries no
+      // upstream split to model, and a default-matrix recompile would just
+      // re-dispatch a column the copy already fixed (matching's filter_rec_or,
+      // translprim's has_constant_constructor).  GMNOORALT restores the old
+      // seen_ctor decline for bisection.
       std::set<int> ctor_aids;
       bool spread_any = false;
       for (auto& r : rows) {
@@ -14747,7 +14748,9 @@ struct Translator {
         if (r.aid < 0) { ok = false; break; }
         if (r.spread) has_spread = true;
         if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) { seen_ctor = true; continue; }
-        if ((seen_ctor || spread_any) && ctor_aids.count(r.aid)) { ok = false; break; }
+        if (ctor_aids.count(r.aid) &&
+            (spread_any || (seen_ctor && cppcaml::dbg_env("GMNOORALT"))))
+          { ok = false; break; }
         anyv = true;
         for (size_t j = 1; j < r.cols.size() && !nontriv; ++j)
           if (!gmdef_omega(gmdef_peel(r.cols[j]))) nontriv = true;
