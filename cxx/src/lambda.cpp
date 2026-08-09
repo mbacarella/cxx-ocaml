@@ -9349,6 +9349,51 @@ struct Translator {
       l = body;
     }
   }
+  // Undo our EAGER single-use inlining where upstream's ordering would have
+  // deferred it.  simplify_exits runs BEFORE simplify_lets, so when it inlines
+  // a once-used handler whose exit argument is still a plain variable it emits
+  // `Llet(Alias, param, Lvar w, handler)`, and simplif's count then charges w
+  // with the PARAMETER's use count (simplif.ml:422) before substituting param
+  // away by w (simplif.ml:549).  A twice-used parameter therefore leaves w's
+  // own binding alive OUTSIDE the handler.  We instead substitute a once-used
+  // binder into the exit argument while building the match, so the argument
+  // reaches inline_exit as the expression w stood for and the binding lands
+  // INSIDE the enclosing binding's right-hand side -- one extra live slot, and
+  // every later stack index shifted (switch.ml's `let idx = get_index act`).
+  // Put it back: a binding whose value is an alias-let over a from_alias term
+  // (the tag subst_alias leaves where a variable used to be) with two or more
+  // uses becomes a sibling binding just ahead of it.  The value is dup-able by
+  // construction, and it was already evaluated at the top of that right-hand
+  // side, so hoisting it one step changes neither order nor effects.
+  void hoist_realiased_args(LamPtr& l) {
+    if (!l) return;
+    hoist_realiased_args(l->fn);
+    hoist_realiased_args(l->body);
+    hoist_realiased_args(l->cond);
+    hoist_realiased_args(l->then_);
+    hoist_realiased_args(l->else_);
+    hoist_realiased_args(l->sw_default);
+    for (auto& a : l->args) hoist_realiased_args(a);
+    for (auto& b : l->bindings) hoist_realiased_args(b.val);
+    for (auto& sc : l->sw_consts) hoist_realiased_args(sc.body);
+    for (auto& sc : l->sw_blocks) hoist_realiased_args(sc.body);
+    if (l->k != Lam::K::Let || cppcaml::dbg_env("NOREALIAS")) return;
+    std::vector<Lam::Binding> out;
+    for (auto& b : l->bindings) {
+      LamPtr v = b.val;
+      while (v && v->k == Lam::K::Let && v->bindings.size() == 1) {
+        auto& ib = v->bindings[0];
+        if (!ib.alias || ib.mut || !ib.val || !ib.val->from_alias) break;
+        if (!is_alias_dup(ib.val)) break;
+        if (count_var(v->body, ib.id) < 2) break;
+        out.push_back(ib);
+        v = v->body;
+      }
+      b.val = v;
+      out.push_back(std::move(b));
+    }
+    l->bindings = std::move(out);
+  }
   // ----- mutable-local `ref` optimization ------------------------------------
   // Whether `rid` (a `ref`'s binder) is used anywhere but as `!r` / `r := e` /
   // `incr r` / `decr r` in an already-translated body -- i.e. it ESCAPES (is taken
@@ -30006,6 +30051,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.simplify_local_functions(root);
   t.collapse_equal_if(root);
   t.simplify_static_catches(root);
+  t.hoist_realiased_args(root);
   t.beta_reduce_applied(root);
   t.inline_var_aliases(root);
   t.sink_facc_temp_lets(root);
