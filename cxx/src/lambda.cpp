@@ -1674,7 +1674,17 @@ struct Translator {
   // the top-level row scans only see a directly-Ppat_construct row.  Restricted to
   // the genuine-squat case so a nested qualified ctor whose flat slot already
   // agrees is left untouched (force-registering its whole type perturbs siblings).
-  std::string nested_qualified_ctor_type(const ast::Pattern& p0) {
+  // A hit whose type shares its BARE NAME with an ENCLOSING construct's own
+  // type is ineligible: force-registering it would overwrite the very
+  // bare-keyed tag universe that enclosing column dispatches over (typedecl's
+  // local `error` vs the `Typedecl_variance.error` inside
+  // `Variance (Bad_variance ..)`: the outer switch compiled over (0,2) and
+  // silently dropped 36 of 38 arms).  Distinct names stay eligible -- the
+  // `Errortrace.Diff` buried under a list cons still needs the force to beat
+  // the file's own squatting `Diff` (errortrace_report's filter_trace).
+  std::string nested_qualified_ctor_type(
+      const ast::Pattern& p0,
+      std::vector<std::string> enclosing = {}) {
     const ast::Pattern* p = effective_pat(&p0);
     if (auto* k = std::get_if<ast::Ppat_construct>(&p->desc)) {
       if (std::holds_alternative<ast::Ldot>(k->id.txt.v)) {
@@ -1682,17 +1692,26 @@ struct Translator {
         if (cppcaml::dbg_env("CTDBG"))
           fprintf(stderr, "[CTDBG] nqct construct %s tp=%s\n",
                   lid_last(k->id.txt).c_str(), tp.empty() ? "<none>" : tp.c_str());
+        bool shadows_enclosing = false;
         if (!tp.empty()) {
           std::string ty = tp.substr(tp.rfind('.') + 1);
+          shadows_enclosing =
+              std::find(enclosing.begin(), enclosing.end(), ty) !=
+              enclosing.end();
           auto ci = ctor_info_.find(lid_last(k->id.txt));
-          if (ci != ctor_info_.end() && ci->second.type != ty) return tp;
+          if (shadows_enclosing) {
+            if (cppcaml::dbg_env("CTDBG"))
+              fprintf(stderr,
+                      "[CTDBG] nqct %s shadows enclosing type %s: skip\n",
+                      tp.c_str(), ty.c_str());
+          } else if (ci != ctor_info_.end() && ci->second.type != ty) return tp;
           // The ctor's flat slot can AGREE while the TYPE-level tag universe
           // (type_ctors_[ty], bare-keyed) is squatted by a same-named local
           // type with different constructors (typecore's Datatype_kind.t over
           // Longident.t): the matrix matcher then dispatches this column over
           // the wrong (n_const, n_block) and silently drops its rows.  Compare
           // against the owning module's real counts.
-          {
+          if (!shadows_enclosing) {
             auto tc = type_ctors_.find(ty);
             auto& tl = module_type_ctors(tp.substr(0, tp.rfind('.')), ty);
             int nc = 0, nb = 0;
@@ -1709,18 +1728,44 @@ struct Translator {
           }
         }
       }
-      return k->arg ? nested_qualified_ctor_type(**k->arg) : std::string();
+      if (!k->arg) return "";
+      // Descend with this construct's own type added to the enclosure: its
+      // resolved bare name comes from the qualified path when there is one,
+      // else the flat slot (which the file's local declaration squats -- the
+      // name the poisoning would clobber).
+      {
+        std::string own;
+        if (auto* dq = std::get_if<ast::Ldot>(&k->id.txt.v)) {
+          (void)dq;
+          std::string tp2 = qualified_ctor_type_path(k->id.txt);
+          if (!tp2.empty()) own = tp2.substr(tp2.rfind('.') + 1);
+        }
+        if (own.empty())
+          if (auto ci2 = ctor_info_.find(lid_last(k->id.txt));
+              ci2 != ctor_info_.end())
+            own = ci2->second.type;
+        if (!own.empty()) enclosing.push_back(own);
+      }
+      return nested_qualified_ctor_type(**k->arg, enclosing);
     }
     if (auto* t = std::get_if<ast::Ppat_tuple>(&p->desc)) {
-      for (auto& e : t->elems) if (std::string r = nested_qualified_ctor_type(*e); !r.empty()) return r;
+      for (auto& e : t->elems)
+        if (std::string r = nested_qualified_ctor_type(*e, enclosing);
+            !r.empty())
+          return r;
       return "";
     }
     if (auto* r = std::get_if<ast::Ppat_record>(&p->desc)) {
-      for (auto& [l, sub] : r->fields) if (std::string x = nested_qualified_ctor_type(*sub); !x.empty()) return x;
+      for (auto& [l, sub] : r->fields)
+        if (std::string x = nested_qualified_ctor_type(*sub, enclosing);
+            !x.empty())
+          return x;
       return "";
     }
-    if (auto* a = std::get_if<ast::Ppat_alias>(&p->desc)) return nested_qualified_ctor_type(*a->p);
-    if (auto* lz = std::get_if<ast::Ppat_lazy>(&p->desc)) return nested_qualified_ctor_type(*lz->p);
+    if (auto* a = std::get_if<ast::Ppat_alias>(&p->desc))
+      return nested_qualified_ctor_type(*a->p, enclosing);
+    if (auto* lz = std::get_if<ast::Ppat_lazy>(&p->desc))
+      return nested_qualified_ctor_type(*lz->p, enclosing);
     return "";
   }
   // Register ALL constructors of a module-qualified variant type ("Vmod.vis")
