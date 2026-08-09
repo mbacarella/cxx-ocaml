@@ -12806,6 +12806,14 @@ struct Translator {
             }
         }
       }
+      // Which columns the handler pm descends past WITHOUT testing: those are
+      // the ones upstream binds to a dead `*match*` alias (see the alias rule
+      // below).  A column some row still tests is read by the handler's own
+      // dispatch, so its bind is live.
+      std::vector<char> untested(comps.size(), 1);
+      for (auto& r : cr)
+        for (size_t i = 0; i < r.cols.size() && i < untested.size(); ++i)
+          if (!pat_omega_like(r.cols[i])) untested[i] = 0;
       LamPtr hb = gmatch(std::move(ck), std::move(cr), mloc, deid,
                          env_from(k + 1));
       gm_proven_comp_ = std::move(proven_save);
@@ -12815,24 +12823,47 @@ struct Translator {
       // `Lstaticcatch (l1, (i, []), Lstaticraise _)`) erases -- substitute
       // the arm exit at every entry site and drop the catch.  Scoped to
       // proof-pruned handlers (that is when upstream's ctx produced the same
-      // bare handler), and only when every column the handler pops is already
-      // a variable: a non-var column gets arg_to_var's dead Alias bind in
-      // upstream's handler pm, simplify_exits runs BEFORE simplify_lets, and
-      // the let-wrapped re-raise does not match the alias rule -- the catch
-      // survives to the bytecode there.
+      // bare handler), and only when no column the handler pops carries a
+      // DEAD arg_to_var bind in upstream's handler pm: simplify_exits runs
+      // BEFORE simplify_lets, so a let-wrapped re-raise does not match the
+      // alias rule and the catch survives to the bytecode there.
       if (pf_here && hb->k == Lam::K::Staticraise && hb->args.empty()) {
-        // ... except when the handler pm re-reads TWO or more raw (non-var)
-        // columns: upstream binds each at its own compile entry, the dead
-        // Alias lets stack up in the handler, and the let-wrapped re-raise
-        // does not match the alias rule -- there the kept catch is where
-        // wire-time arm inlining then rebuilds upstream's arm handler
-        // (translmod's bind_strict `with (118)` around the switch).  One raw
-        // column's bind lands with the sharing parent instead (matching's
-        // filter_rec_or tuple sites, both list components already vars).
+        // ... except when the handler pm descends past a raw (non-var) column
+        // without testing it.  Upstream binds that column at its own compile
+        // entry INSIDE the handler and nothing reads the binding, so the bare
+        // re-raise is let-wrapped, does not match the alias rule, and the
+        // catch reaches the bytecode -- which is where wire-time arm inlining
+        // rebuilds upstream's arm handler (translmod's bind_strict
+        // `with (118)` around the switch).  Two kinds of column never count.
+        // The HEAD, however raw, is bound by compile_match_nonempty's
+        // arg_to_var + bind_match_arg, which wrap the whole combine_handlers
+        // result: that let lands OUTSIDE the catch and leaves the re-raise
+        // exposed.  And a column some row still tests is read by the
+        // handler's own dispatch, so its bind is live and upstream's handler
+        // is not a bare re-raise there at all (matching's filter_rec_or keeps
+        // a re-testing handler).  A row that BINDS the column counts as
+        // untested here, which can only keep a catch, never drop one.
         int rawcols = 0;
-        for (auto& c : comps)
-          if (!c || c->k != Lam::K::Var) ++rawcols;
-        if (rawcols < 2) {
+        for (size_t i = 1; i < comps.size(); ++i)
+          if (untested[i] && (!comps[i] || comps[i]->k != Lam::K::Var))
+            ++rawcols;
+        if (cppcaml::dbg_env("GMRCDBG")) {
+          std::string ks;
+          for (size_t i = 0; i < comps.size(); ++i)
+            ks += !comps[i] ? '0'
+                  : comps[i]->k == Lam::K::Var ? 'v'
+                  : untested[i]                ? 'x'
+                                               : 'p';
+          fprintf(stderr, "[GMRC] line=%d eid=%d cols=%s raw=%d\n",
+                  mloc.start.lnum, eids[k], ks.c_str(), rawcols);
+        }
+        if (cppcaml::dbg_env("GMRCOLD")) {
+          rawcols = 0;
+          for (auto& c : comps)
+            if (!c || c->k != Lam::K::Var) ++rawcols;
+          --rawcols;
+        }
+        if (rawcols < 1) {
           inline_exit(res, eids[k], {}, {}, hb);
           continue;
         }
