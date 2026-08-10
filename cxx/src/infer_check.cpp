@@ -290,6 +290,10 @@ struct Checker {
   // bare names inside ctor SCHEMES, which are built before tenv exists), and
   // bare name -> stamp when the bare name is declared exactly once (-1 = dup).
   std::unordered_map<std::string, int> qual_type_stamp_;
+  // Qualified names two DISTINCT decls both claimed (same-named submodules
+  // declaring a same-named type): the flat map would hand back whichever
+  // registered last, so a qualified mx_classify lookup must decline instead.
+  std::set<std::string> qual_stamp_ambig_;
   std::unordered_map<std::string, int> bare_unique_stamp_;
   std::vector<std::unordered_map<std::string, int>> tenv{{}};
   // The path prefix of the submodule currently being type-registered (e.g.
@@ -894,6 +898,16 @@ struct Checker {
         // functor argument's type during param-signature value loading.
         if (!cmi_abstract_subst_.empty() && n->path && n->path->kind == cmi::Path::Pident)
           if (auto s = cmi_abstract_subst_.find(n->path->id.name); s != cmi_abstract_subst_.end())
+            return s->second;
+        // A functor PARAMETER's projected type (`D.left` in Define(D:Defs)'s
+        // result signature), substituted with the applied argument's manifest.
+        // Only register_functor_app_types stores dotted keys, so this lookup
+        // cannot collide with the bare-name substitutions above.
+        if (!cmi_abstract_subst_.empty() && n->path &&
+            n->path->kind == cmi::Path::Pdot && n->path->a &&
+            n->path->a->kind == cmi::Path::Pident)
+          if (auto s = cmi_abstract_subst_.find(n->path->a->id.name + "." + n->path->s);
+              s != cmi_abstract_subst_.end())
             return s->second;
         if (is_format_base(p)) { std::vector<TypePtr> fa; for (auto& a : n->args) fa.push_back(from_cmi(a, memo)); return eng.constr("format6", std::move(fa)); }
         // expand a same-module type abbreviation (Float.t = float, Int.t = int) --
@@ -3963,7 +3977,16 @@ struct Checker {
         stamp_path_[type_stamp_[&d]] = mod_prefix_ + d.name.txt;
       stamp_type_decl_[type_stamp_[&d]] = &d;  // decl AST by identity (mcomp-lite)
       stamp_ctor_key_[type_stamp_[&d]] = mod_prefix_ + d.name.txt;
-      qual_type_stamp_[mod_prefix_ + d.name.txt] = type_stamp_[&d];
+      {
+        std::string qual = mod_prefix_ + d.name.txt;
+        auto [qi, qins] = qual_type_stamp_.emplace(qual, type_stamp_[&d]);
+        if (!qins) {
+          auto prev = stamp_type_decl_.find(qi->second);
+          if (prev != stamp_type_decl_.end() && prev->second != &d)
+            qual_stamp_ambig_.insert(qual);
+          qi->second = type_stamp_[&d];
+        }
+      }
       auto [bu, ins] = bare_unique_stamp_.emplace(d.name.txt, type_stamp_[&d]);
       if (!ins) bu->second = -1;  // bare name declared twice -> ambiguous
     }
@@ -5590,6 +5613,97 @@ struct Checker {
   struct MxBail { int line = 0; };
   using MxSubst = std::map<const I::Type*, TypePtr>;
   using MxRow = std::vector<const Pattern*>;  // null cell = wildcard
+  // `module M = F(Defs)` binding a CMI functor application (includemod's
+  // `module Diff = Diffing.Define(Defs)`): M's 0-param result-signature
+  // abbreviations resolved to GROUND types, the functor parameter's projected
+  // types (`D.left`) substituted with the local argument struct's manifests.
+  // Consulted by mx_resolve so an exhaustiveness column typed `Diff.change`
+  // classifies as the underlying `(functor_parameter, ..) Diffing.change`.
+  // Flat with processing-order overwrite: the second same-named binding
+  // shadows the first exactly when the source's second module does.
+  std::unordered_map<std::string, TypePtr> mx_functor_app_manifests_;
+  // Top-level-processed module name -> its struct body, in processing order,
+  // for the registration below ONLY.  Deliberately separate from
+  // local_module_structs_ (the `let module` map): widening that one's domain
+  // would also widen its `#M.t` / first-class-module-packing consumers.
+  std::unordered_map<std::string, const ast::Structure*> mx_module_structs_;
+  // See mx_functor_app_manifests_.  Best-effort: any unresolved corner leaves
+  // the map unpopulated and the total proof declines exactly as before.
+  void register_functor_app_types(const std::string& bind, const ModuleExpr& me0) {
+    static const bool off = std::getenv("NOMXFAPP") != nullptr;
+    if (off) return;
+    const ModuleExpr* me = &me0;
+    while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
+    auto* ap = std::get_if<Pmod_apply>(&me->desc);
+    if (!ap) return;
+    auto* fi = std::get_if<Pmod_ident>(&ap->f->desc);
+    if (!fi) return;
+    const ModuleExpr* am = ap->arg.get();
+    while (auto* mc = std::get_if<Pmod_constraint>(&am->desc)) am = mc->me.get();
+    auto* ai = std::get_if<Pmod_ident>(&am->desc);
+    if (!ai) return;
+    auto fcomps = mod_components(fi->id.txt);
+    auto acomps = mod_components(ai->id.txt);
+    if (fcomps.size() < 2 || acomps.size() != 1) return;
+    if (bound_module_names_.count(fcomps[0])) return;  // shadowed head: no cmi
+    auto as = mx_module_structs_.find(acomps[0]);
+    if (as == mx_module_structs_.end()) return;
+    auto saved_subst = cmi_abstract_subst_;
+    auto* saved_ctx = cmi_types_ctx_;
+    std::string saved_pfx = cmi_mod_prefix_;
+    bool saved_fold = fold_abbrevs_;
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(fcomps[0])));
+      const cmi::Signature* top = &loaded.back()->sig();
+      const cmi::Signature* sig = top;
+      const cmi::ModuleType* mt = nullptr;
+      for (size_t i = 1; i < fcomps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == fcomps[i]) { md = &mm; break; }
+        if (!md || !md->type) return;
+        mt = md->type.get();
+        sig = mt->kind == cmi::ModuleType::Sig ? mt->sig.get() : nullptr;
+      }
+      if (!mt || mt->kind != cmi::ModuleType::Functor || !mt->functor_param ||
+          !mt->functor_body || mt->functor_body->kind != cmi::ModuleType::Sig ||
+          !mt->functor_body->sig)
+        return;
+      // The argument struct's ground manifests, keyed `D.left` for the result
+      // signature's parameter projections.  A same-struct HEAD-level reference
+      // (`type right = left`) resolves through the already-translated ones;
+      // deeper ones keep a bare local path that classification then declines.
+      std::unordered_map<std::string, TypePtr> subst, own;
+      for (auto& sit : *as->second)
+        if (auto* ty = std::get_if<Pstr_type>(&sit.desc))
+          for (auto& d : ty->decls) {
+            if (!d.manifest || !d.params.empty()) continue;
+            std::unordered_map<std::string, TypePtr> vars;
+            TypePtr t = from_coretype(**d.manifest, vars);
+            TypePtr rt = I::Engine::repr(t);
+            if (rt->kind == I::Type::Kind::Constr && rt->args.empty())
+              if (auto f = own.find(rt->path); f != own.end()) t = f->second;
+            own[d.name.txt] = t;
+            subst[*mt->functor_param + "." + d.name.txt] = t;
+          }
+      if (subst.empty()) return;
+      cmi_abstract_subst_ = std::move(subst);
+      cmi_types_ctx_ = &top->types;
+      cmi_mod_prefix_ = fcomps[0];
+      fold_abbrevs_ = true;
+      for (auto& td : mt->functor_body->sig->types) {
+        if (!td.manifest || !td.params.empty()) continue;
+        std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+        mx_functor_app_manifests_[bind + "." + td.name] =
+            from_cmi(td.manifest, memo);
+      }
+    } catch (...) {}
+    cmi_abstract_subst_ = std::move(saved_subst);
+    cmi_types_ctx_ = saved_ctx;
+    cmi_mod_prefix_ = std::move(saved_pfx);
+    fold_abbrevs_ = saved_fold;
+  }
+
   int mx_fuel_ = 0;
 
   TypePtr mx_resolve(TypePtr t, const MxSubst& su) {
@@ -5601,6 +5715,16 @@ struct Checker {
           (t->kind == I::Type::Kind::Constr && t->rigid)) && i < 64; ++i) {
       auto it = su.find(t.get());
       if (it == su.end()) break;
+      t = I::Engine::repr(it->second);
+    }
+    // A local cmi-functor-application abbreviation (`Diff.change`): expand to
+    // its ground manifest so the column classifies as the underlying variant.
+    for (int i = 0;
+         t->kind == I::Type::Kind::Constr && t->args.empty() &&
+         !mx_functor_app_manifests_.empty() && i < 8;
+         ++i) {
+      auto it = mx_functor_app_manifests_.find(t->path);
+      if (it == mx_functor_app_manifests_.end()) break;
       t = I::Engine::repr(it->second);
     }
     return t;
@@ -5687,12 +5811,53 @@ struct Checker {
         r.k = MxClass::Record; r.imported = "Stdlib.ref";
         return r;
       }
+      // A bare cmi variant/record an enclosing `open` brought into scope
+      // (`functor_parameter`/`module_type` via `open Types`): qualify through
+      // the recorded open and take the cmi's ctor/field list, exactly as the
+      // dotted citation would.  The local tables above still win, matching
+      // the flat maps' shadowing discipline.
+      static const bool no_openq = std::getenv("NOMXOPENQ") != nullptr;
+      if (!no_openq)
+        if (auto q = opened_type_quals_.find(c->path);
+            q != opened_type_quals_.end()) {
+          if (imported_variant(q->second)) {
+            r.k = MxClass::Variant; r.imported = q->second;
+            return r;
+          }
+          if (imported_record(q->second)) {
+            r.k = MxClass::Record; r.imported = q->second;
+            return r;
+          }
+        }
       return r;  // Unknown
     }
     if (type_ctor_schemes_.count(c->path)) {  // module-qualified local variant
       r.k = MxClass::Variant; r.key = c->path;
       return r;
     }
+    // A module-qualified LOCAL opaque type (`Directionality.t`): the
+    // registration pre-pass stamped it under exactly this qualified path.
+    // Declined when two distinct decls collided on the path -- the flat map
+    // could then hand back the wrong declaration.
+    static const bool no_qual = std::getenv("NOMXQUAL") != nullptr;
+    if (!no_qual && !qual_stamp_ambig_.count(c->path))
+      if (auto qs = qual_type_stamp_.find(c->path); qs != qual_type_stamp_.end())
+        if (auto sd = stamp_type_decl_.find(qs->second);
+            sd != stamp_type_decl_.end()) {
+          const TypeDeclaration* d = sd->second;
+          if (std::holds_alternative<Ptype_variant>(d->kind)) {
+            r.k = MxClass::Variant; r.decl = d; r.key = stamp_ctor_key_[qs->second];
+            return r;
+          }
+          if (std::holds_alternative<Ptype_record>(d->kind)) {
+            r.k = MxClass::Record; r.decl = d;
+            return r;
+          }
+          if (std::holds_alternative<Ptype_open>(d->kind)) {
+            r.k = MxClass::Open;
+            return r;
+          }
+        }
     // A cmi-imported variant (`Types.type_desc`, `Asttypes.mutable_flag`): the
     // constructor list is right there in the signature, so the column IS
     // enumerable.  Its description stays empty, so mx_compat keeps treating it
@@ -11120,6 +11285,13 @@ struct Checker {
               if (auto* sg0 = std::get_if<Pmty_signature>(&mc0->mt->desc))
                 module_sig_asts_[*mb->binding.name.txt] = &sg0->items;
             while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
+            // The exhaustiveness checker's local-module bookkeeping: struct
+            // bodies by name, and a cmi-functor application's result-signature
+            // abbreviations resolved against its argument (`Diff.change`).
+            if (auto* ms2 = std::get_if<Pmod_structure>(&me->desc))
+              mx_module_structs_[*mb->binding.name.txt] = &ms2->items;
+            else if (std::holds_alternative<Pmod_apply>(me->desc))
+              register_functor_app_types(*mb->binding.name.txt, *me);
             if (std::holds_alternative<Pmod_functor>(me->desc)) {
               // Record a single-parameter functor with an explicit result
               // signature so `F(Arg)` can be instantiated (param types substituted)
