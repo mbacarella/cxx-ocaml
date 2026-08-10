@@ -13030,10 +13030,14 @@ struct Translator {
         LamPtr bodyA = gmatch(std::move(ca), std::move(A), mloc, e);
         LamPtr bodyB = bodyA ? gmatch(std::move(cb), std::move(B), mloc, deid) : nullptr;
         if (bodyA && bodyB) {
-          int bad = 0; int uses = count_exit(bodyA, e, false, bad);
-          if (uses == 0) { --next_exit_; return bodyA; }
-          if (uses == 1 && bad == 0) { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          if (cppcaml::dbg_env("NOGSCATCH")) {      // the old eager inlining
+            int bad = 0; int uses = count_exit(bodyA, e, false, bad);
+            if (uses == 0) { --next_exit_; return bodyA; }
+            if (uses == 1 && bad == 0)
+              { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          }
           auto c = mk(Lam::K::Catch); c->cond = bodyA; c->prim_arg = e; c->then_ = bodyB;
+          c->gm_chunk = true;                       // see gm_peel_last's catch
           return c;
         }
         --next_exit_;                     // fall through to the spread path
@@ -13186,6 +13190,14 @@ struct Translator {
       bool col0_tested = false;
       for (auto& r : rows)
         if (!pat_omega_like(r.cols[0])) { col0_tested = true; break; }
+      //   The division's catch survives construction (gm_chunk), like every
+      // other one: the column ABOVE this split is bound AFTER the split
+      // compiles, by compile_match_nonempty's bind_check -> lower_bind, whose
+      // `| _ -> bind` arm stops dead at an Lstaticcatch.  Inlining group B here
+      // instead leaves an if/alias-let chain for the sink to walk into, and the
+      // bind lands under group A's own column lets -- ident.ml's `balance` got
+      // `let rr = f2 r in let rl = f0 r in ..` where ocamlc emits
+      // `let rl = f0 r in catch (let rr = f2 r in ..) with (k) ..`.
       if (has_var && col0_tested) {
         int e = ++next_exit_;
         std::vector<MRow> A(rows.begin(), rows.begin() + 1);
@@ -13194,10 +13206,14 @@ struct Translator {
         LamPtr bodyA = gmatch(std::move(ca), std::move(A), mloc, e);
         LamPtr bodyB = bodyA ? gmatch(std::move(cb), std::move(B), mloc, deid) : nullptr;
         if (bodyA && bodyB) {
-          int bad = 0; int uses = count_exit(bodyA, e, false, bad);
-          if (uses == 0) { --next_exit_; return bodyA; }
-          if (uses == 1 && bad == 0) { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          if (cppcaml::dbg_env("NOGSCATCH")) {      // the old eager inlining
+            int bad = 0; int uses = count_exit(bodyA, e, false, bad);
+            if (uses == 0) { --next_exit_; return bodyA; }
+            if (uses == 1 && bad == 0)
+              { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          }
           auto c = mk(Lam::K::Catch); c->cond = bodyA; c->prim_arg = e; c->then_ = bodyB;
+          c->gm_chunk = true;                       // see gm_peel_last's catch
           return c;
         }
         --next_exit_;                     // fall through to the spread path
@@ -13349,10 +13365,14 @@ struct Translator {
         LamPtr bodyA = gmatch(std::move(ca), std::move(A), mloc, e);
         LamPtr bodyB = bodyA ? gmatch(std::move(cb), std::move(B), mloc, deid) : nullptr;
         if (bodyA && bodyB) {
-          int bad = 0; int uses = count_exit(bodyA, e, false, bad);
-          if (uses == 0) { --next_exit_; return bodyA; }
-          if (uses == 1 && bad == 0) { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          if (cppcaml::dbg_env("NOGSCATCH")) {      // the old eager inlining
+            int bad = 0; int uses = count_exit(bodyA, e, false, bad);
+            if (uses == 0) { --next_exit_; return bodyA; }
+            if (uses == 1 && bad == 0)
+              { inline_exit(bodyA, e, {}, {}, bodyB); return bodyA; }
+          }
           auto c = mk(Lam::K::Catch); c->cond = bodyA; c->prim_arg = e; c->then_ = bodyB;
+          c->gm_chunk = true;                       // see gm_peel_last's catch
           return c;
         }
         --next_exit_;                     // fall through to the spread path
@@ -26482,16 +26502,25 @@ struct Translator {
                              bool alias = false) {
     if (!c.ok) return nullptr;
     if (c.identity) return mv;
-    // FUSION: mv is `(let <binds> (makeblock 0 v0 v1 ..))` with pure fields ->
-    // rebuild the block in target order instead of allocating a second block.
-    if (mv->k == Lam::K::Let && mv->body && mv->body->k == Lam::K::Prim &&
-        mv->body->prim == Prim::Makeblock && mv->body->prim_arg == 0) {
+    // FUSION: mv is `(makeblock 0 v0 v1 ..)`, bare or under `let <binds>`, with
+    // pure fields -> rebuild the block in target order instead of allocating a
+    // second block.  Translmod does the same by handing the coercion to
+    // transl_structure, which lays the ONE block out in the target's order; a
+    // struct argument all of whose items are already-bound outer values leaves
+    // no `let` at all (ident.ml's `Identifiable.Make (struct .. end)`), so the
+    // bare shape has to be recognised too.
+    const bool fuse_under_let = mv->k == Lam::K::Let;
+    LamPtr mb = fuse_under_let                              ? mv->body
+                : cppcaml::dbg_env("NOBAREFUSE")            ? nullptr
+                                                            : mv;
+    if (mb && mb->k == Lam::K::Prim && mb->prim == Prim::Makeblock &&
+        mb->prim_arg == 0) {
       bool simple = true;
-      for (auto& a : mv->body->args)
+      for (auto& a : mb->args)
         if (!(a->k == Lam::K::Var || a->k == Lam::K::ConstInt ||
               a->k == Lam::K::ConstChar || a->k == Lam::K::ConstString ||
               a->k == Lam::K::ConstFloat)) { simple = false; break; }
-      int srclen = (int)mv->body->args.size();
+      int srclen = (int)mb->args.size();
       if (simple) {
         bool in_range = true;
         for (auto& f : c.fields)
@@ -26500,13 +26529,14 @@ struct Translator {
         if (in_range) {
           std::vector<LamPtr> fs;
           for (auto& f : c.fields) {
-            LamPtr fr = coerce_field_value(f, mv->body->args);
+            LamPtr fr = coerce_field_value(f, mb->args);
             if (!fr) { fs.clear(); break; }
             fs.push_back(fr);
           }
           if (!fs.empty() || c.fields.empty()) {
             auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
             blk->args = std::move(fs);
+            if (!fuse_under_let) return blk;
             auto lt = mk(Lam::K::Let); lt->bindings = mv->bindings; lt->body = blk;
             return lt;
           }
