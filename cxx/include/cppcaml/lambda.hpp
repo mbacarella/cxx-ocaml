@@ -485,7 +485,8 @@ inline std::string make_lam_key_scoped(const LamPtr& l) {
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
                                 const std::string& stdlib_dir = "stdlib",
                                 const std::string& file_name = "",
-                                std::vector<std::string>* required_globals = nullptr);
+                                std::vector<std::string>* required_globals = nullptr,
+                                const std::vector<std::string>* directive_files = nullptr);
 
 // Print in -dlambda format (stamps normalized by first appearance).
 void print_dlambda(const LamPtr& code, std::ostream& out);

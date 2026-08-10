@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
     auto code = cppcaml::lambda::translate_implementation(structure, module_name(file),
-                                                          stdlib_dir, file);
+                                                          stdlib_dir, file, nullptr, &dirfiles);
     cppcaml::lambda::print_dlambda(code, std::cout);
   } catch (const cppcaml::ParseError& e) {
     std::cout << "TYPE_ERROR\tparse\t" << e.pos << '\t' << e.what() << '\n';

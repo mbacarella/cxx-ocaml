@@ -211,7 +211,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
     std::vector<std::string> required_globals;
     auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, in_path,
-                                                          &required_globals);
+                                                          &required_globals, &dirfiles);
     lap("translate (infer+lambda)", tp);
     if (g_dump.lambda) cppcaml::lambda::print_dlambda(code, std::cout);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);

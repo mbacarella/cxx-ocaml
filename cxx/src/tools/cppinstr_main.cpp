@@ -59,7 +59,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(ss.str(), dirfiles);
     std::string mod = module_name(file);
-    auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, file);
+    auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, file,
+                                                          nullptr, &dirfiles);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
     cppcaml::bytecode::print_dinstr(instrs, std::cout);
   } catch (const cppcaml::ParseError& e) {

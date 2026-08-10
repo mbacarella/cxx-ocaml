@@ -853,6 +853,17 @@ struct Translator {
     return s;
   }
   std::string file_name_;  // source path, for Match_failure/Assert_failure locations
+  // `# N "file"` directive names, file_id k>0 -> directive_files_[k-1] (the
+  // parser renumbers lnum; the FILENAME must follow too, like upstream's
+  // update_loc setting pos_fname -- a generated lexer.ml attributes its
+  // actions to "parsing/lexer.mll").  NOLINEDIRFNAME reverts.
+  std::vector<std::string> directive_files_;
+  const std::string& pos_fname(const ast::Position& p) const {
+    if (p.file_id > 0 && p.file_id <= (int)directive_files_.size() &&
+        !cppcaml::dbg_env("NOLINEDIRFNAME"))
+      return directive_files_[p.file_id - 1];
+    return file_name_;
+  }
   std::string unit_name_;  // the compilation unit (top module) name, for __MODULE__
   std::vector<std::string> func_path_;  // enclosing function-binding names, for __FUNCTION__
   std::set<const ast::Pexp_function*> named_funcs_;  // functions already named by a let binding
@@ -1032,13 +1043,13 @@ struct Translator {
   }
   // The `[0: "file" line char]` location block of a Match_failure/Assert_failure.
   LamPtr loc_block(const Location& loc) {
-    return cblock(0, {cstr(file_name_), cint(loc.start.lnum),
+    return cblock(0, {cstr(pos_fname(loc.start)), cint(loc.start.lnum),
                       cint(loc.start.cnum - loc.start.bol)});
   }
   std::string loc_string(const Location& l) {
     char buf[600];
     snprintf(buf, sizeof buf, "File \"%s\", line %d, characters %d-%d",
-             file_name_.c_str(), l.start.lnum, l.start.cnum - l.start.bol,
+             pos_fname(l.start).c_str(), l.start.lnum, l.start.cnum - l.start.bol,
              l.end.cnum - l.end.bol);
     return buf;
   }
@@ -1046,12 +1057,12 @@ struct Translator {
   // constants.  `__FUNCTION__` is the module path plus the enclosing function
   // bindings.  Returns null if `name` is not one of them.
   LamPtr loc_primitive(const std::string& name, const Location& loc) {
-    if (name == "__FILE__") return cstr(file_name_);
+    if (name == "__FILE__") return cstr(pos_fname(loc.start));
     if (name == "__LINE__") return cint(loc.start.lnum);
     if (name == "__LOC__") return cstr(loc_string(loc));
     if (name == "__MODULE__") return cstr(unit_name_);
     if (name == "__POS__")
-      return cblock(0, {cstr(file_name_), cint(loc.start.lnum),
+      return cblock(0, {cstr(pos_fname(loc.start)), cint(loc.start.lnum),
                         cint(loc.start.cnum - loc.start.bol),
                         cint(loc.end.cnum - loc.end.bol)});
     if (name == "__FUNCTION__") {
@@ -30429,7 +30440,8 @@ void set_nopervasives(bool b) { g_nopervasives = b; }
 
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
                                 const std::string& stdlib_dir, const std::string& file_name,
-                                std::vector<std::string>* required_globals) {
+                                std::vector<std::string>* required_globals,
+                                const std::vector<std::string>* directive_files) {
   bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
   using clk = std::chrono::steady_clock;
   auto tp = clk::now();
@@ -30445,6 +30457,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.module_dirs_ = g_module_dirs;
   t.no_pervasives_ = g_nopervasives;
   t.file_name_ = file_name;
+  if (directive_files) t.directive_files_ = *directive_files;
   set_infer_stdlib_dir(stdlib_dir);  // the inferencer reads .cmi files too
   // This unit's own compiled interface (.mli -> .cmi), when present: lets the
   // inferencer pin value-restriction weak vars against the declared signature
