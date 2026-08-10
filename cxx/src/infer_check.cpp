@@ -5587,7 +5587,7 @@ struct Checker {
   // Anything unmodeled throws MxBail -> Total (the pre-existing default), so
   // the analysis only adds Partial verdicts it can prove: a value shape that
   // avoids every row and is well-typed under the accumulated equations.
-  struct MxBail {};
+  struct MxBail { int line = 0; };
   using MxSubst = std::map<const I::Type*, TypePtr>;
   using MxRow = std::vector<const Pattern*>;  // null cell = wildcard
   int mx_fuel_ = 0;
@@ -5750,7 +5750,7 @@ struct Checker {
   // Could `a` and `b` be equal under some implementation, given (and
   // extending) the equations in `su`?  False only when provably distinct.
   bool mx_compat(TypePtr a, TypePtr b, MxSubst& su) {
-    if (--mx_fuel_ <= 0) throw MxBail{};
+    if (--mx_fuel_ <= 0) throw MxBail{__LINE__};
     a = mx_resolve(a, su);
     b = mx_resolve(b, su);
     if (a.get() == b.get()) return true;
@@ -5824,15 +5824,15 @@ struct Checker {
                                                                const TypePtr& col) {
     if (!c.imported.empty()) {
       if (auto* v = imported_variant(c.imported)) return *v;
-      throw MxBail{};
+      throw MxBail{__LINE__};
     }
     if (c.k == MxClass::Variant && !c.key.empty()) {
       auto it = type_ctor_schemes_.find(c.key);
-      if (it == type_ctor_schemes_.end()) throw MxBail{};
+      if (it == type_ctor_schemes_.end()) throw MxBail{__LINE__};
       return it->second;
     }
     auto names = type_ctors.find(c.name);
-    if (names == type_ctors.end()) throw MxBail{};
+    if (names == type_ctors.end()) throw MxBail{__LINE__};
     // A predefined column is never the flat map's to answer: see
     // predef_ctor_schemes_.  mx_classify only says PredefVariant for a spelling
     // that no local declaration shadows, so this list is exact.
@@ -5840,7 +5840,7 @@ struct Checker {
       std::vector<std::pair<std::string, TypePtr>> pout;
       for (auto& n : names->second) {
         auto pi = predef_ctor_schemes_.find(n);
-        if (pi == predef_ctor_schemes_.end()) throw MxBail{};
+        if (pi == predef_ctor_schemes_.end()) throw MxBail{__LINE__};
         pout.emplace_back(n, pi->second);
       }
       return pout;
@@ -5849,12 +5849,12 @@ struct Checker {
     std::vector<std::pair<std::string, TypePtr>> out;
     for (auto& n : names->second) {
       auto ci = ctors.find(n);
-      if (ci == ctors.end()) throw MxBail{};
+      if (ci == ctors.end()) throw MxBail{__LINE__};
       TypePtr result;
       ctor_params(ci->second, result);
       TypePtr r = I::Engine::repr(result);
       if (r->kind != I::Type::Kind::Constr || mx_base(r->path) != colb)
-        throw MxBail{};  // flat entry shadowed by another type's ctor
+        throw MxBail{__LINE__};  // flat entry shadowed by another type's ctor
       out.emplace_back(n, ci->second);
     }
     return out;
@@ -5881,7 +5881,7 @@ struct Checker {
   // constr nodes resolved under `prefix`.  Vars/Any/rows are shared as-is.
   TypePtr mx_qualify(const TypePtr& t0, const std::string& prefix,
                      std::unordered_map<const I::Type*, TypePtr>& memo) {
-    if (--mx_fuel_ <= 0) throw MxBail{};
+    if (--mx_fuel_ <= 0) throw MxBail{__LINE__};
     TypePtr t = I::Engine::repr(t0);
     if (auto m = memo.find(t.get()); m != memo.end()) return m->second;
     using K = I::Type::Kind;
@@ -5929,7 +5929,7 @@ struct Checker {
   // under the equations in `su`?  True = some well-typed value avoids every
   // row = the match is Partial.
   bool mx_useful(std::vector<MxRow> rows, std::vector<TypePtr> cols, MxSubst su) {
-    if (--mx_fuel_ <= 0) throw MxBail{};
+    if (--mx_fuel_ <= 0) throw MxBail{__LINE__};
     if (rows.empty()) return true;
     if (cols.empty()) return false;
     // Normalize column 0: peel wrappers, split or-patterns into extra rows.
@@ -5971,8 +5971,8 @@ struct Checker {
         MxRow r2;
         if (mx_wild(r[0])) r2.assign(n, nullptr);
         else if (auto* tp = std::get_if<Ppat_tuple>(&r[0]->desc)) {
-          if (tp->elems.size() != n || tp->closed != ClosedFlag::Closed) throw MxBail{};
-          for (auto& l : tp->labels) if (l) throw MxBail{};
+          if (tp->elems.size() != n || tp->closed != ClosedFlag::Closed) throw MxBail{__LINE__};
+          for (auto& l : tp->labels) if (l) throw MxBail{__LINE__};
           for (auto& e : tp->elems) r2.push_back(e.get());
         } else continue;  // non-tuple head at tuple type: GADT-dead row
         r2.insert(r2.end(), r.begin() + 1, r.end());
@@ -5984,7 +5984,7 @@ struct Checker {
     }
     if (t->kind == K::Variant) {  // exact closed polyvariant row [ `A | `B ]
       if (t->labels.empty() || !t->inherited.empty() || t->variant_kind != 2)
-        throw MxBail{};
+        throw MxBail{__LINE__};
       for (size_t ti = 0; ti < t->labels.size(); ++ti) {
         bool has_arg = t->tag_has_arg[ti];
         MxSubst su2 = su;
@@ -5997,10 +5997,10 @@ struct Checker {
           } else if (auto* v = std::get_if<Ppat_variant>(&r[0]->desc)) {
             if (v->label != t->labels[ti]) continue;
             in_sigma = true;
-            if ((bool)v->arg != has_arg) throw MxBail{};
+            if ((bool)v->arg != has_arg) throw MxBail{__LINE__};
             if (has_arg) r2.push_back(v->arg->get());
           } else if (std::holds_alternative<Ppat_type>(r[0]->desc)) {
-            throw MxBail{};  // #t covers a whole type's tags: unmodeled
+            throw MxBail{__LINE__};  // #t covers a whole type's tags: unmodeled
           } else continue;  // dead row
           r2.insert(r2.end(), r.begin() + 1, r.end());
           s.push_back(std::move(r2));
@@ -6014,7 +6014,7 @@ struct Checker {
       }
       return false;
     }
-    if (t->kind != K::Constr) throw MxBail{};  // Var/Arrow/Object column w/ patterns
+    if (t->kind != K::Constr) throw MxBail{__LINE__};  // Var/Arrow/Object column w/ patterns
     MxClass tc = mx_classify(t);
     if (tc.k == MxClass::External && tc.name == "lazy_t" && t->args.size() == 1) {
       std::vector<MxRow> m2;  // lazy: a single transparent constructor
@@ -6036,7 +6036,7 @@ struct Checker {
       // Intervals cover ranges we don't model -- a covering interval set
       // would make this a false Partial, so bail instead.
       for (auto& r : rows)
-        if (r[0] && std::holds_alternative<Ppat_interval>(r[0]->desc)) throw MxBail{};
+        if (r[0] && std::holds_alternative<Ppat_interval>(r[0]->desc)) throw MxBail{__LINE__};
       return mx_useful(default_matrix(), std::move(rest), std::move(su));
     }
     if (tc.k == MxClass::Record) {
@@ -6047,7 +6047,7 @@ struct Checker {
       std::vector<TypePtr> cols2;
       if (tc.decl) {
         auto& fields = std::get<Ptype_record>(tc.decl->kind).fields;
-        if (tc.decl->params.size() != t->args.size()) throw MxBail{};
+        if (tc.decl->params.size() != t->args.size()) throw MxBail{__LINE__};
         std::unordered_map<std::string, TypePtr> vars;
         for (size_t i = 0; i < t->args.size(); ++i)
           if (auto* pv = std::get_if<Ptyp_var>(&tc.decl->params[i]->desc))
@@ -6058,7 +6058,7 @@ struct Checker {
         }
       } else if (!tc.imported.empty()) {
         auto* ir = imported_record(tc.imported);
-        if (!ir) throw MxBail{};
+        if (!ir) throw MxBail{__LINE__};
         std::unordered_map<const I::Type*, TypePtr> memo;
         TypePtr result;
         auto ps = ctor_params(mx_qualify(eng.instantiate(ir->second), "", memo),
@@ -6066,12 +6066,12 @@ struct Checker {
         TypePtr rr = I::Engine::repr(result);
         if (rr->kind != K::Constr || rr->args.size() != t->args.size() ||
             ps.size() != ir->first.size())
-          throw MxBail{};
+          throw MxBail{__LINE__};
         for (size_t i = 0; i < rr->args.size(); ++i)
-          if (!mx_compat(rr->args[i], t->args[i], su)) throw MxBail{};
+          if (!mx_compat(rr->args[i], t->args[i], su)) throw MxBail{__LINE__};
         fnames = ir->first;
         cols2 = std::move(ps);
-      } else throw MxBail{};
+      } else throw MxBail{__LINE__};
       cols2.insert(cols2.end(), rest.begin(), rest.end());
       std::vector<MxRow> m2;
       for (auto& r : rows) {
@@ -6083,7 +6083,7 @@ struct Checker {
             std::string fn = lid_last(lid.txt);
             size_t k = 0;
             for (; k < fnames.size(); ++k) if (fnames[k] == fn) break;
-            if (k == fnames.size()) throw MxBail{};  // foreign label
+            if (k == fnames.size()) throw MxBail{__LINE__};  // foreign label
             r2[k] = pb.get();
           }
         } else continue;  // dead row
@@ -6106,7 +6106,7 @@ struct Checker {
         auto params =
             ctor_params(mx_qualify(eng.instantiate(scheme), prefix, memo), result);
         TypePtr r = I::Engine::repr(result);
-        if (r->kind != K::Constr || r->args.size() != t->args.size()) throw MxBail{};
+        if (r->kind != K::Constr || r->args.size() != t->args.size()) throw MxBail{__LINE__};
         bool inhabited = true;  // index equations flow into su2 here
         for (size_t i = 0; inhabited && i < r->args.size(); ++i)
           inhabited = mx_compat(r->args[i], t->args[i], su2);
@@ -6118,7 +6118,7 @@ struct Checker {
           if (mx_wild(row[0])) r2.assign(params.size(), nullptr);
           else if (auto* k = std::get_if<Ppat_construct>(&row[0]->desc)) {
             if (lid_last(k->id.txt) != cname) continue;  // other head / dead
-            if (!k->vars.empty()) throw MxBail{};  // `C (type a) p`: unmodeled
+            if (!k->vars.empty()) throw MxBail{__LINE__};  // `C (type a) p`: unmodeled
             if (!k->arg) {
               if (!params.empty()) continue;  // arity mismatch: foreign dead ctor
             } else {
@@ -6128,12 +6128,12 @@ struct Checker {
               else if (mx_wild(ap)) r2.assign(params.size(), nullptr);
               else if (auto* tp = std::get_if<Ppat_tuple>(&ap->desc)) {
                 if (tp->elems.size() != params.size()) continue;  // foreign arity
-                for (auto& l : tp->labels) if (l) throw MxBail{};
+                for (auto& l : tp->labels) if (l) throw MxBail{__LINE__};
                 for (auto& e : tp->elems) r2.push_back(e.get());
               } else if (std::holds_alternative<Ppat_record>(ap->desc)) {
-                throw MxBail{};  // inline-record argument: unmodeled
+                throw MxBail{__LINE__};  // inline-record argument: unmodeled
               } else if (std::holds_alternative<Ppat_or>(ap->desc)) {
-                throw MxBail{};  // or at a multi-slot argument: unmodeled
+                throw MxBail{__LINE__};  // or at a multi-slot argument: unmodeled
               } else continue;  // foreign shape
             }
             in_sigma = true;
@@ -6149,7 +6149,16 @@ struct Checker {
       }
       return false;
     }
-    throw MxBail{};  // abstract/unknown column with real patterns
+    if (std::getenv("MXDBG")) {
+      auto ai = type_aliases.find(t->path);
+      fprintf(stderr, "[MXDBG] unclassified column type %s (class %d key %s "
+              "alias=%d nparams=%zd args=%zu)\n",
+              t->path.c_str(), (int)tc.k, tc.key.c_str(),
+              ai != type_aliases.end(),
+              ai == type_aliases.end() ? -1 : (long)ai->second.params.size(),
+              t->args.size());
+    }
+    throw MxBail{__LINE__};  // abstract/unknown column with real patterns
   }
 
   bool tuple_gadt_partial(const TypePtr& s, const std::vector<Case>& cases,
@@ -6181,10 +6190,10 @@ struct Checker {
         MxRow r;
         if (mx_wild(p)) r.assign(n, nullptr);
         else if (auto* tp = std::get_if<Ppat_tuple>(&p->desc)) {
-          if (tp->elems.size() != n || tp->closed != ClosedFlag::Closed) throw MxBail{};
-          for (auto& l : tp->labels) if (l) throw MxBail{};
+          if (tp->elems.size() != n || tp->closed != ClosedFlag::Closed) throw MxBail{__LINE__};
+          for (auto& l : tp->labels) if (l) throw MxBail{__LINE__};
           for (auto& e : tp->elems) r.push_back(e.get());
-        } else throw MxBail{};
+        } else throw MxBail{__LINE__};
         rows.push_back(std::move(r));
       };
       for (auto& c : cases)
@@ -6217,7 +6226,7 @@ struct Checker {
   // wrongly.  Ordinary (non-GADT) columns take mx_compat's Var branch for every
   // constructor index, so no constructor is refuted and the run is a plain
   // Maranget exhaustiveness check.
-  bool mx_total_proof(const TypePtr& scrut, const std::vector<Case>& cases) {
+  bool mx_total_proof(const TypePtr& scrut, const std::vector<Case>& cases, int dbgline = 0) {
     if (strict) return false;  // the reject pass discards partiality anyway
     try {
       std::vector<MxRow> rows;
@@ -6233,7 +6242,10 @@ struct Checker {
       if (rows.empty()) return false;
       mx_fuel_ = 20000;
       return !mx_useful(std::move(rows), {I::Engine::repr(scrut)}, MxSubst{});
-    } catch (const MxBail&) {
+    } catch (const MxBail& b) {
+      if (std::getenv("MXDBG"))
+        fprintf(stderr, "[MXDBG] total-proof bail at infer_check.cpp:%d "
+                "(match at line %d)\n", b.line, dbgline);
       return false;  // unanalyzable -> no proof
     } catch (const I::TypeError&) {
       return false;
@@ -8221,7 +8233,7 @@ struct Checker {
       match_partial[&e] = pgadt ? gadt_match_partial(se, m->cases, &tproven)
                         : proj  ? *proj
                                 : compute_partial(se, m->cases, &tproven);  // dump
-      if (!match_partial[&e] && (tproven || mx_total_proof(se, m->cases)))
+      if (!match_partial[&e] && (tproven || mx_total_proof(se, m->cases, e.loc.start.lnum)))
         total_proven.insert(&e);
       return rt;
     }

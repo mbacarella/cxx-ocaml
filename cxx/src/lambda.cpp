@@ -926,6 +926,14 @@ struct Translator {
   // exists.  The ctor-chunk driver refuses to route misses at such a deid --
   // upstream's exhaustiveness/ctx knowledge would prune the dead arm.
   int gm_fake_deid_ = -1;
+  // The whole match's default exit when its exhaustiveness is PROVEN (the
+  // gmatch_top gm_tp_deid_ condition), and NEVER temporarily re-pointed at a
+  // sub-compile the way gm_tp_deid_ is.  The leading-var or-path keys on it:
+  // its handler-chain routing is sound only by whole-match exhaustiveness,
+  // and `deid == gm_fake_deid_` alone also holds for PARTIAL no-catchall
+  // matches (a Un value slid past a `(An|Em)` or-handler into its action
+  // where upstream raises Match_failure).
+  int gm_ptot_deid_ = -1;
   // The current top entry's deid when the match is a PROVEN Total (completed
   // GADT refutation, see ValueKinds.total_proven) and has no catch-all row; -1
   // otherwise.  Licenses the ctor split to DROP an uncovered tag's `(exit deid)`
@@ -12785,41 +12793,85 @@ struct Translator {
     auto& y = std::get<Pconst_float>(b.desc);
     return x.value == y.value && x.suffix == y.suffix;
   }
-  // One column of Parmatch's may_compats, in the only direction that is safe to
-  // act on: PROVEN disjoint (a constant or a constructor naming a different
-  // head on both sides).  Anything less certain answers false, which keeps the
-  // caller's row where the source put it.
-  bool gm_cols_disjoint(const Pattern* p, const Pattern* q) {
+  // One pattern pair of Parmatch's may_compat, in the only direction that is
+  // safe to act on: PROVEN disjoint.  With `rec`, this is the shape of
+  // upstream's MayCompat.compat: two same-head constructors are still
+  // disjoint when some argument position is (`PN (Some _, _)` against
+  // `PN (None, _)`) -- the depth safe_before needs to move includemod's
+  // `Named (Some ..)` row past the or-compatible var row.  The pre-existing
+  // call sites stay HEAD-ONLY (rec=false): their groupings are tuned against
+  // the whole corpus, and strengthening them regressed diffing_with_keys'
+  // merge_edge (a row-level-or matrix where our division and upstream's
+  // explode+alpha-shared-action machinery align only at head depth).
+  // Anything less certain answers false, which keeps the caller's row where
+  // the source put it.
+  bool gm_pair_disjoint(const Pattern* x, const Pattern* y, bool rec) {
     std::vector<const Pattern*> pa, qa;
-    flatten_or(p, pa);
-    flatten_or(q, qa);
+    flatten_or(x, pa);
+    flatten_or(y, qa);
     if (pa.empty() || qa.empty()) return false;
-    for (auto* x : pa)
-      for (auto* y : qa) {
-        const Pattern* ex = effective_pat(x);
-        const Pattern* ey = effective_pat(y);
-        auto* cx = std::get_if<Ppat_constant>(&ex->desc);
-        auto* cy = std::get_if<Ppat_constant>(&ey->desc);
-        if (cx && cy) { if (gm_const_eq(cx->c, cy->c)) return false; continue; }
-        auto* kx = std::get_if<Ppat_construct>(&ex->desc);
-        auto* ky = std::get_if<Ppat_construct>(&ey->desc);
-        if (kx && ky) {
-          if (lid_last(kx->id.txt) == lid_last(ky->id.txt)) return false;
-          continue;
-        }
-        // Two poly-variant heads with different tags can never share a value
-        // (same closed row, distinct hashes) -- the disjointness that lets a
-        // later variant row rejoin collect's group past a deferred var row
-        // (typemod's `Ok,`Ok behind `_,`Contains_apply).
-        auto* vx = std::get_if<Ppat_variant>(&ex->desc);
-        auto* vy = std::get_if<Ppat_variant>(&ey->desc);
-        if (vx && vy) {
-          if (vx->label == vy->label) return false;
-          continue;
-        }
-        return false;
-      }
-    return true;
+    if (pa.size() > 1 || qa.size() > 1) {
+      for (auto* a : pa)
+        for (auto* b : qa)
+          if (!gm_pair_disjoint(a, b, rec)) return false;
+      return true;
+    }
+    const Pattern* ex = effective_pat(pa[0]);
+    const Pattern* ey = effective_pat(qa[0]);
+    if (rec) {
+      // may_compat looks through aliases (parmatch.ml's Tpat_alias arm).
+      if (auto* ax = std::get_if<Ppat_alias>(&ex->desc))
+        return gm_pair_disjoint(ax->p.get(), ey, rec);
+      if (auto* ay = std::get_if<Ppat_alias>(&ey->desc))
+        return gm_pair_disjoint(ex, ay->p.get(), rec);
+    }
+    auto* cx = std::get_if<Ppat_constant>(&ex->desc);
+    auto* cy = std::get_if<Ppat_constant>(&ey->desc);
+    if (cx && cy) return !gm_const_eq(cx->c, cy->c);
+    auto* kx = std::get_if<Ppat_construct>(&ex->desc);
+    auto* ky = std::get_if<Ppat_construct>(&ey->desc);
+    if (kx && ky) {
+      if (lid_last(kx->id.txt) != lid_last(ky->id.txt)) return true;
+      return rec && kx->arg && ky->arg &&
+             gm_pair_disjoint(kx->arg->get(), ky->arg->get(), rec);
+    }
+    // Two poly-variant heads with different tags can never share a value
+    // (same closed row, distinct hashes) -- the disjointness that lets a
+    // later variant row rejoin collect's group past a deferred var row
+    // (typemod's `Ok,`Ok behind `_,`Contains_apply).
+    auto* vx = std::get_if<Ppat_variant>(&ex->desc);
+    auto* vy = std::get_if<Ppat_variant>(&ey->desc);
+    if (vx && vy) {
+      if (vx->label != vy->label) return true;
+      return rec && vx->arg && vy->arg &&
+             gm_pair_disjoint(vx->arg->get(), vy->arg->get(), rec);
+    }
+    if (!rec) return false;
+    auto* tx = std::get_if<Ppat_tuple>(&ex->desc);
+    auto* ty = std::get_if<Ppat_tuple>(&ey->desc);
+    if (tx && ty && tx->elems.size() == ty->elems.size() &&
+        tx->labels == ty->labels) {
+      for (size_t i = 0; i < tx->elems.size(); ++i)
+        if (gm_pair_disjoint(tx->elems[i].get(), ty->elems[i].get(), rec))
+          return true;
+      return false;
+    }
+    auto* rx = std::get_if<Ppat_record>(&ex->desc);
+    auto* ry = std::get_if<Ppat_record>(&ey->desc);
+    if (rx && ry) {
+      for (auto& fx : rx->fields)
+        for (auto& fy : ry->fields)
+          if (lid_last(fx.first.txt) == lid_last(fy.first.txt) &&
+              gm_pair_disjoint(fx.second.get(), fy.second.get(), rec))
+            return true;
+      return false;
+    }
+    return false;
+  }
+  // One column of may_compats, over the ors on both sides.  Head-only: the
+  // historical predicate every pre-S249 caller is tuned against.
+  bool gm_cols_disjoint(const Pattern* p, const Pattern* q) {
+    return gm_pair_disjoint(p, q, false);
   }
   // safe_before (matching.ml:1341) between two whole rows of the CURRENT column
   // vector: `same_actions act_p act_q || not (may_compats p q)`.  One column
@@ -12829,6 +12881,15 @@ struct Translator {
     if (a.cols.size() != b.cols.size()) return false;
     for (size_t i = 0; i < a.cols.size(); ++i)
       if (gm_cols_disjoint(a.cols[i], b.cols[i])) return true;
+    return false;
+  }
+  // safe_before at may_compat's REAL depth, for the leading-var or-path only
+  // (see gm_pair_disjoint).  NOMAYCOMPATREC reverts it to head-only.
+  bool gm_rows_disjoint_rec(const MRow& a, const MRow& b) {
+    if (a.cols.size() != b.cols.size()) return false;
+    bool rec = !cppcaml::dbg_env("NOMAYCOMPATREC");
+    for (size_t i = 0; i < a.cols.size(); ++i)
+      if (gm_pair_disjoint(a.cols[i], b.cols[i], rec)) return true;
     return false;
   }
   // safe_before's other half.  Rows of the same arm share an exit; and two
@@ -13781,7 +13842,9 @@ struct Translator {
       MRow& r = rows[oi];
       std::vector<const Pattern*> alts;
       flatten_or(r.cols[0], alts);
-      bool lead_ok = true, lead_ok_rx = true;
+      bool lead_ok = true, lead_ok_rx = true, lead_ok_var = true;
+      bool any_lead_var = false;
+      std::vector<size_t> varlead;     // leading var rows, in source order
       if (oi > 0) {
         std::set<std::string> altnames;
         for (auto* a : alts) {
@@ -13789,12 +13852,41 @@ struct Translator {
           if (!k) { lead_ok = false; break; }
           altnames.insert(lid_last(k->id.txt));
         }
-        lead_ok_rx = lead_ok;
-        for (size_t i = 0; (lead_ok || lead_ok_rx) && i < oi; ++i) {
-          if (rows[i].guard) { lead_ok = lead_ok_rx = false; break; }
+        lead_ok_rx = lead_ok_var = lead_ok;
+        for (size_t i = 0; (lead_ok || lead_ok_rx || lead_ok_var) && i < oi; ++i) {
+          if (rows[i].guard) { lead_ok = lead_ok_rx = lead_ok_var = false; break; }
           auto* k = std::get_if<Ppat_construct>(&rows[i].cols[0]->desc);
-          if (k && !altnames.count(lid_last(k->id.txt))) continue;
+          if (k && !altnames.count(lid_last(k->id.txt))) {
+            // split_no_or groups a discriminating row past every var row above
+            // it only under safe_before (matching.ml:1341) -- the whole rows
+            // proven incompatible or the actions equal.
+            for (size_t vj : varlead)
+              if (!gm_same_action(rows[i], rows[vj]) &&
+                  !gm_rows_disjoint_rec(rows[i], rows[vj])) { lead_ok_var = false; break; }
+            continue;
+          }
           lead_ok = false;
+          // A leading row whose column 0 matches the or unconditionally is
+          // upstream's OWN body shape: split_or keeps it in cls ahead of the
+          // exploded alternatives, and the chunk driver in the sub-compile
+          // sinks the alternatives below it (they are compatible with it and
+          // raise a different action, so collect defers them) -- the An/Em
+          // rows of includemod's Keep sub-matrix land in their own trailing
+          // half-match.  Column 0 must bind nothing (half-simplification
+          // would move a binding into the action).  NOORLEADVAR reverts.
+          if (gmdef_omega(gmdef_peel(rows[i].cols[0])) &&
+              gm_ptot_deid_ == deid) {
+            std::vector<std::string> cv;
+            collect_gvars(rows[i].cols[0], cv);
+            if (cv.empty() && !cppcaml::dbg_env("NOORLEADVAR")) {
+              varlead.push_back(i);
+              any_lead_var = true;
+              if (rows[i].aid < 0 || rows[i].aid == r.aid) lead_ok_var = false;
+              if (rows[i].aid < 0 || rows[i].aid != r.aid) lead_ok_rx = false;
+              continue;
+            }
+          }
+          lead_ok_var = false;
           // safe_before's other half: `same_actions act_p act_q`.  Two rows
           // raising the SAME arm exit are swappable whatever they match, so a
           // leading row sharing the or-row's action needs no disjointness.  It
@@ -13804,6 +13896,7 @@ struct Translator {
           if (rows[i].aid < 0 || rows[i].aid != r.aid) { lead_ok_rx = false; break; }
         }
       }
+      lead_ok_var = lead_ok_var && any_lead_var;
       // do_split also hoists a row that FOLLOWS the or-row into the group
       // compiled before the alternatives, whenever safe_before holds -- that
       // is, whenever the two whole rows are incompatible, so no scrutinee can
@@ -13870,7 +13963,7 @@ struct Translator {
       // Non-binding or-rows take that path here too; binding ones keep the
       // pending gm_orp treatment below.
       bool bailed = false;
-      auto attempt = [&](size_t tstart, bool rx) -> LamPtr {
+      auto attempt = [&](size_t tstart, bool rx, bool lead) -> LamPtr {
         // A trailing row is either COMPATIBLE with the or-head -- a pure
         // wildcard column 0, which belongs to both the body's dispatch default
         // and the handler's fall-through -- or INCOMPATIBLE, its column 0 naming
@@ -13881,7 +13974,7 @@ struct Translator {
         // (typedecl_variance's `{type_kind = Type_record _ | Type_variant _; _}`
         // behind the abstract one); the recursion gives it its own handler.
         std::vector<bool> tr_compat(rows.size(), false);
-        bool trailing_ok = rx ? lead_ok_rx : lead_ok;
+        bool trailing_ok = lead;
         for (size_t i = tstart; trailing_ok && i < rows.size(); ++i) {
           if (rows[i].aid < 0) { trailing_ok = false; break; }
           if (std::holds_alternative<Ppat_any>(rows[i].cols[0]->desc)) tr_compat[i] = true;
@@ -13947,6 +14040,173 @@ struct Translator {
         c->then_ = hb;
         return c;
       };
+      // A leading var row -- upstream's own body shape, built directly.
+      // split_no_or's collect defers the var row AND the exploded alternatives
+      // below the discriminating group (they are compatible with it and raise
+      // a different action); the alternatives' half-match then collapses to a
+      // bare re-raise under the jump context (its arrivals all proved the or's
+      // constructors), simplify_exits erases the alias catch, and the now
+      // single-use 0-param or-handler is inlined into the var chunk's miss
+      // slot.  The net effect, constructed here without the context model:
+      //   catch(BODY[misses -> V], V: VARCHAIN[misses -> O <- ORPATL inline])
+      // with the same partiality upstream records: BODY and VARCHAIN Partial,
+      // ORPATL ctx-Total (the tp license).  Sound only by the whole match's
+      // exhaustiveness -- a value reaching O failed every leading and var row
+      // and cannot match an incompatible hoisted row, so it matches the
+      // or-row or a compatible trailing row; the relaxed retract re-verifies.
+      // includemod's Keep sub-matrix `((Anonymous|Empty_struct), mty)` behind
+      // `_, (Unit | Named (None, _))` is the shape.  NOORLEADVAR reverts.
+      auto attempt_var = [&](size_t tstart) -> LamPtr {
+        if (!orvars.empty() || alts.size() < 2) return nullptr;
+        std::vector<MRow> bodyrows;
+        for (size_t i = 0; i < oi; ++i) {
+          if (std::find(varlead.begin(), varlead.end(), i) == varlead.end())
+            bodyrows.push_back(rows[i]);
+        }
+        // A hoisted trailing row jumps above the var rows too (they are tried
+        // in the handler chain, after every body row) -- it needs safe_before
+        // against them as well as against the or-row.
+        for (size_t i = oi + 1; i < tstart; ++i) {
+          for (size_t vj : varlead)
+            if (!gm_same_action(rows[i], rows[vj]) &&
+                !gm_rows_disjoint_rec(rows[i], rows[vj])) return nullptr;
+          bodyrows.push_back(rows[i]);
+        }
+        if (bodyrows.empty()) return nullptr;
+        std::vector<bool> trc(rows.size(), false);
+        for (size_t i = tstart; i < rows.size(); ++i) {
+          if (rows[i].aid < 0) return nullptr;
+          if (std::holds_alternative<Ppat_any>(rows[i].cols[0]->desc)) trc[i] = true;
+          else return nullptr;
+        }
+        int vexit = ++next_exit_;
+        int oexit = ++next_exit_;
+        // The default environment upstream conses: the var rows' matrix on
+        // top, the or matrix (with the compatible trailing rows) below it.
+        auto frame = [&](int eid, const std::vector<std::vector<const Pattern*>>& mat,
+                         size_t width) {
+          GmDef e{eid, mat};
+          for (size_t j = 0; j < width; ++j) e.colmap.push_back((int)j);
+          return e;
+        };
+        std::vector<std::vector<const Pattern*>> varmat, ormat, ormat1;
+        for (size_t vj : varlead) varmat.push_back(rows[vj].cols);
+        ormat.push_back(r.cols);
+        ormat1.push_back({r.cols.begin() + 1, r.cols.end()});
+        for (size_t i = tstart; i < rows.size(); ++i)
+          if (trc[i]) {
+            ormat.push_back(rows[i].cols);
+            ormat1.push_back({rows[i].cols.begin() + 1, rows[i].cols.end()});
+          }
+        std::vector<GmDef> env1;
+        env1.push_back(frame(vexit, varmat, comps.size()));
+        env1.push_back(frame(oexit, ormat, comps.size()));
+        env1.insert(env1.end(), denv.begin(), denv.end());
+        std::vector<LamPtr> bc = comps;
+        LamPtr body = gmatch(std::move(bc), std::move(bodyrows), mloc, deid,
+                             std::move(env1));
+        if (!body) { bailed = true; return nullptr; }
+        if (cppcaml::dbg_env("ORLVDBG")) {
+          int b1 = 0, b2 = 0, b3 = 0;
+          fprintf(stderr, "[ORLV] body deid=%d v=%d o=%d\n",
+                  count_exit(body, deid, false, b1),
+                  count_exit(body, vexit, false, b2),
+                  count_exit(body, oexit, false, b3));
+        }
+        std::vector<MRow> varrems;
+        for (size_t vj : varlead) {
+          MRow vr = rows[vj]; vr.cols.erase(vr.cols.begin());
+          varrems.push_back(std::move(vr));
+        }
+        std::vector<GmDef> env2;
+        env2.push_back(frame(oexit, ormat1, comps.size() - 1));
+        env2.insert(env2.end(), denv.begin(), denv.end());
+        std::vector<LamPtr> rcomps(comps.begin() + 1, comps.end());
+        std::vector<LamPtr> rc1 = rcomps;
+        LamPtr varchain = gmatch(std::move(rc1), std::move(varrems), mloc, deid,
+                                 std::move(env2));
+        if (!varchain) { bailed = true; return nullptr; }
+        if (cppcaml::dbg_env("ORLVDBG")) {
+          int b1 = 0, b2 = 0;
+          fprintf(stderr, "[ORLV] varchain deid=%d o=%d\n",
+                  count_exit(varchain, deid, false, b1),
+                  count_exit(varchain, oexit, false, b2));
+        }
+        std::vector<MRow> hrows;
+        MRow hr = r; hr.cols.erase(hr.cols.begin());
+        hrows.push_back(std::move(hr));
+        for (size_t i = tstart; i < rows.size(); ++i) {
+          if (!trc[i]) continue;
+          MRow tr = rows[i]; tr.cols.erase(tr.cols.begin());
+          hrows.push_back(std::move(tr));
+        }
+        LamPtr orpatl;
+        if (hrows.size() == 1) {
+          // No compatible trailing row: upstream's or-handler pm holds the one
+          // (patl, action) row over an EMPTY default env and compiles at
+          // current=Total -- mk_failaction_pos yields no fail action, every
+          // test collapses, and only the binds remain, read straight off
+          // args.rest (`p` as the raw chain, not the var chunk's later
+          // materialization).
+          std::vector<std::pair<std::string, LamPtr>> accs;
+          bool ok = true;
+          for (size_t j = 0; ok && j < hrows[0].cols.size(); ++j)
+            ok = or_accesses(*hrows[0].cols[j], rcomps[j], accs);
+          if (ok) {
+            auto ex = mk(Lam::K::Staticraise);
+            ex->prim_arg = hrows[0].aid;
+            ex->gm_garm = true;
+            for (auto& nm : *hrows[0].vnames) {
+              LamPtr v;
+              for (auto it = accs.rbegin(); it != accs.rend(); ++it)
+                if (it->first == nm) { v = it->second; break; }
+              if (!v)
+                for (auto it = hrows[0].binds.rbegin();
+                     it != hrows[0].binds.rend(); ++it)
+                  if (it->first == nm) { v = varof(it->second); break; }
+              if (!v) { ok = false; break; }
+              ex->args.push_back(v);
+            }
+            if (ok) orpatl = ex;
+          }
+        }
+        if (!orpatl) {
+          int tp_save = gm_tp_deid_;
+          gm_tp_deid_ = deid;            // ctx-Total, like upstream's or-handler
+          orpatl = gmatch(std::move(rcomps), std::move(hrows), mloc, deid, denv);
+          gm_tp_deid_ = tp_save;
+          if (!orpatl) { bailed = true; return nullptr; }
+        }
+        if (cppcaml::dbg_env("ORLVDBG")) {
+          int b1 = 0;
+          fprintf(stderr, "[ORLV] orpatl deid=%d\n",
+                  count_exit(orpatl, deid, false, b1));
+        }
+        // simplify_exits: a single-use argless handler is inlined, a multi-use
+        // one stays a catch.
+        int obad = 0;
+        int ouses = count_exit(varchain, oexit, false, obad);
+        LamPtr handler;
+        if (ouses == 1 && obad == 0) {
+          inline_exit(varchain, oexit, {}, {}, orpatl);
+          handler = varchain;
+        } else if (ouses > 0) {
+          auto c2 = mk(Lam::K::Catch);
+          c2->prim_arg = oexit; c2->cond = varchain; c2->then_ = orpatl;
+          handler = c2;
+        } else return nullptr;           // or-row unreachable: not this shape
+        int vbad = 0;
+        int vuses = count_exit(body, vexit, false, vbad);
+        if (vuses == 0) return nullptr;
+        if (vuses == 1 && vbad == 0) {
+          inline_exit(body, vexit, {}, {}, handler);
+          return body;
+        }
+        auto c = mk(Lam::K::Catch);
+        c->prim_arg = vexit; c->cond = body; c->then_ = handler;
+        c->gm_chunk = true;              // a split_no_or division catch
+        return c;
+      };
       if (relaxed) {
         int exit_save = next_exit_, stamp_save = stamp;
         auto orw_save = gm_orw_;
@@ -13957,8 +14217,20 @@ struct Translator {
         auto arr_save = gm_eid_arr_;
         auto proofs_save = gm_eid_proofs_;
         auto proven_save2 = gm_proven_comp_;
-        LamPtr res = attempt(tstart, true);
+        if (cppcaml::dbg_env("ORLVDBG"))
+          fprintf(stderr, "[ORLV] oi=%zu rows=%zu alts=%zu var=%d anyv=%d rx=%d "
+                  "tstart=%zu loc=%d deid=%d ptot=%d\n", oi, rows.size(),
+                  alts.size(), (int)lead_ok_var, (int)any_lead_var,
+                  (int)lead_ok_rx, tstart, mloc.start.lnum, deid, gm_ptot_deid_);
+        LamPtr res = lead_ok_var ? attempt_var(tstart)
+                                 : attempt(tstart, true, lead_ok_rx);
         int fbad = 0;
+        if (cppcaml::dbg_env("ORLVDBG") && lead_ok_var) {
+          int fb2 = 0;
+          fprintf(stderr, "[ORLV] attempt_var %s deid-exits=%d\n",
+                  res ? "BUILT" : "NULL",
+                  res ? count_exit(res, deid, false, fb2) : -1);
+        }
         if (res && count_exit(res, deid, false, fbad) == 0) return res;
         // Retract: every row is aid-shared here (guardfree), so the rejected
         // attempt emitted no arm body and leaves nothing but counter state.
@@ -13974,7 +14246,8 @@ struct Translator {
       }
       // The strict reading: no hoist past the or-row under the fake default (its
       // handler has no totality budget), and only wildcard trailing rows.
-      if (LamPtr res = attempt(deid == gm_fake_deid_ ? oi + 1 : tstart, false))
+      if (LamPtr res = attempt(deid == gm_fake_deid_ ? oi + 1 : tstart, false,
+                               lead_ok))
         return res;
       if (bailed) return nullptr;
     }
@@ -16708,6 +16981,8 @@ struct Translator {
     gm_fake_deid_ = catchall ? -1 : deid;
     int tp_save = gm_tp_deid_;
     gm_tp_deid_ = (total && proven && !catchall) ? deid : -1;
+    int pt_save = gm_ptot_deid_;
+    gm_ptot_deid_ = gm_tp_deid_;
     gm_orw_.clear();
     LamPtr body = gmatch({sv}, mrows, mloc, deid);
     if (!body) {
@@ -16718,6 +16993,7 @@ struct Translator {
     }
     gm_tp_deid_ = tp_save;
     gm_fake_deid_ = fd_save;
+    gm_ptot_deid_ = pt_save;
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
     // Resolve deferred chunk catches FIRST (Simplif's single-use exit inline):
     // construction-time lower_bind has run, and everything downstream (the
@@ -18809,6 +19085,8 @@ struct Translator {
     // globally-Total match and bytegen's hole rule routes the missing tags.
     int tp_save = gm_tp_deid_;
     gm_tp_deid_ = (proven_total && !catchall) ? deid : -1;
+    int pt_save = gm_ptot_deid_;
+    gm_ptot_deid_ = gm_tp_deid_;
     gm_orw_.clear();
     LamPtr body = gmatch(comps, mrows, mloc, deid);
     if (cppcaml::dbg_env("MTDBG"))
@@ -18816,6 +19094,7 @@ struct Translator {
               body ? "OK" : "NULL", mloc.start.lnum);
     gm_tp_deid_ = tp_save;
     gm_fake_deid_ = fd_save;
+    gm_ptot_deid_ = pt_save;
     g_gm_tuples_ = false; g_gm_budget_ = -1;
     if (!body) return nullptr;
     // Resolve deferred chunk catches first (see gmatch_top).
