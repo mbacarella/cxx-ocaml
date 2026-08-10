@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "cppcaml/ast.hpp"
+#include "cppcaml/dbgenv.hpp"
 
 namespace cppcaml::lambda {
 
@@ -300,7 +301,11 @@ struct Lam {
 // switch/collapse dedups arbitrary action bodies that may BE or CONTAIN static
 // raises: there, exit-blind keying would wrongly merge dispatches to DISTINCT
 // handlers (a real miscompile -- ocamlc's Lambda.make_key keeps the exit id).
-inline std::string make_lam_key_rec(const LamPtr& l, bool exit_aware, int& budget) {
+// Resolved once: both gates are read per Let / per Switch node.
+inline const bool kNoKeyAlpha = cppcaml::dbg_env("NOKEYALPHA") != nullptr;
+inline const bool kNoKeySwId = cppcaml::dbg_env("NOKEYSWID") != nullptr;
+inline std::string make_lam_key_rec(const LamPtr& l, bool exit_aware, int& budget,
+                                    std::map<int, int>& vmap, int& nv) {
   if (!l) return "_";
   using K = Lam::K;
   // make_key counts every node it walks and gives up past `max_raw`
@@ -309,8 +314,14 @@ inline std::string make_lam_key_rec(const LamPtr& l, bool exit_aware, int& budge
   if (--budget < 0) return "";
   switch (l->k) {
     case K::Function: case K::Letrec: case K::For: case K::While: return "";
-    case K::Var: return "v" + l->var.name + "#" + std::to_string(l->var.stamp);
-    case K::Mutvar: return "m" + l->var.name + "#" + std::to_string(l->var.stamp);
+    case K::Var: case K::Mutvar: {
+      auto it = vmap.find(l->var.stamp);
+      if (it != vmap.end())
+        return std::string(l->k == K::Var ? "v$" : "m$") +
+               std::to_string(it->second);
+      return (l->k == K::Var ? "v" : "m") + l->var.name + "#" +
+             std::to_string(l->var.stamp);
+    }
     case K::ConstInt: return "i" + std::to_string(l->int_val);
     case K::ConstChar: return "c" + std::to_string(l->int_val);
     case K::ConstFloat: return "f" + l->str_val;
@@ -324,18 +335,52 @@ inline std::string make_lam_key_rec(const LamPtr& l, bool exit_aware, int& budge
   // merges their arms -- a miscompile (Ok () vs Error 0 collapsing to one).
   if (l->k == K::ConstBlock) r += ":" + std::to_string(l->prim_arg);
   if (exit_aware && l->k == K::Staticraise) r += ":X" + std::to_string(l->prim_arg);
-  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key_rec(c, exit_aware, budget); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key_rec(c, exit_aware, budget, vmap, nv); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+  // Lambda.make_key (lambda.ml:469) renames every let binder, so two arms that
+  // differ only in their binder STAMPS key alike.  Value first (outer scope),
+  // then the binder, then the body.
+  if (l->k == K::Let && !kNoKeyAlpha) {
+    // (stamp, shadowed index) -- -1 when the stamp was not already bound.
+    std::vector<std::pair<int, int>> saved;
+    bool bad = false;
+    for (auto& b : l->bindings) {
+      std::string vk = make_lam_key_rec(b.val, exit_aware, budget, vmap, nv);
+      if (vk.empty()) { bad = true; break; }
+      int y = nv++;
+      r += " b" + std::to_string(y) + " " + vk;
+      auto it = vmap.find(b.id.stamp);
+      saved.push_back({b.id.stamp, it != vmap.end() ? it->second : -1});
+      vmap[b.id.stamp] = y;
+    }
+    std::string bk;
+    if (!bad) {
+      bk = make_lam_key_rec(l->body, exit_aware, budget, vmap, nv);
+      if (bk.empty()) bad = true;
+    }
+    for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+      if (it->second < 0) vmap.erase(it->first);
+      else vmap[it->first] = it->second;
+    }
+    return bad ? std::string() : r + " " + bk + ")";
+  }
   add(l->fn); add(l->cond); add(l->then_); add(l->else_); add(l->body); add(l->sw_default);
   for (auto& a : l->args) add(a);
   for (auto& b : l->bindings) { if (!r.empty()) r += " b" + std::to_string(b.id.stamp); add(b.val); }
   for (auto& sc : l->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
   for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
   if (r.empty()) return "";
+  // make_key normalizes every location EXCEPT Lswitch's (lambda.ml:480), so two
+  // switches built from different source terms never key equal however alike
+  // they look.  Node identity is this port's analog -- and it is what still
+  // separates two arms once the binder stamps above stop separating them.
+  if (l->k == K::Switch && !kNoKeySwId)
+    r += ":@" + std::to_string(reinterpret_cast<uintptr_t>(l.get()));
   return r + ")";
 }
 inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
   int budget = 32;  // lambda.ml:441 `let max_raw = 32`
-  return make_lam_key_rec(l, exit_aware, budget);
+  std::map<int, int> vmap; int nv = 0;
+  return make_lam_key_rec(l, exit_aware, budget, vmap, nv);
 }
 
 // make_lam_key with SCOPED static-exit ids.  An exit whose target Catch lies
@@ -347,13 +392,22 @@ inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
 // `W [Tb]` leaf differing only in their arm exits collapse to one action and
 // the second arm vanishes).
 inline std::string make_lam_key_scoped_rec(const LamPtr& l,
-                                           std::map<int, int>& bound, int& next) {
+                                           std::map<int, int>& bound, int& next,
+                                           std::map<int, int>& vmap, int& nv) {
   if (!l) return "_";
   using K = Lam::K;
   switch (l->k) {
     case K::Function: case K::Letrec: case K::For: case K::While: return "";
-    case K::Var: return "v" + l->var.name + "#" + std::to_string(l->var.stamp);
-    case K::Mutvar: return "m" + l->var.name + "#" + std::to_string(l->var.stamp);
+    case K::Var: case K::Mutvar: {
+      // A binder normalized below (Lambda.make_key's make_key_generator);
+      // anything else is free and keeps its literal ident.
+      auto it = vmap.find(l->var.stamp);
+      if (it != vmap.end())
+        return std::string(l->k == K::Var ? "v$" : "m$") +
+               std::to_string(it->second);
+      return (l->k == K::Var ? "v" : "m") + l->var.name + "#" +
+             std::to_string(l->var.stamp);
+    }
     case K::ConstInt: return "i" + std::to_string(l->int_val);
     case K::ConstChar: return "c" + std::to_string(l->int_val);
     case K::ConstFloat: return "f" + l->str_val;
@@ -368,7 +422,36 @@ inline std::string make_lam_key_scoped_rec(const LamPtr& l,
     r += it != bound.end() ? ":B" + std::to_string(it->second)
                            : ":X" + std::to_string(l->prim_arg);
   }
-  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key_scoped_rec(c, bound, next); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+  auto add = [&](const LamPtr& c) { if (c) { std::string k = make_lam_key_scoped_rec(c, bound, next, vmap, nv); if (k.empty()) { r = ""; } else if (!r.empty()) r += " " + k; } };
+  if (l->k == K::Let && !kNoKeyAlpha) {
+    // Lambda.make_key (lambda.ml:469) renames every let binder to a generated
+    // ident and keys the body under it, so two arms that differ only in their
+    // binder STAMPS key alike -- which is how ocamlc shares the two textually
+    // identical `let op = sub_lexeme .. in PREFIXOP op` arms of lexer.ml.
+    // Value first (outer scope), then the binder, then the body.
+    // (stamp, shadowed index) -- -1 when the stamp was not already bound.
+    std::vector<std::pair<int, int>> saved;
+    bool bad = false;
+    for (auto& b : l->bindings) {
+      std::string vk = make_lam_key_scoped_rec(b.val, bound, next, vmap, nv);
+      if (vk.empty()) { bad = true; break; }
+      int y = nv++;
+      r += " b" + std::to_string(y) + " " + vk;
+      auto it = vmap.find(b.id.stamp);
+      saved.push_back({b.id.stamp, it != vmap.end() ? it->second : -1});
+      vmap[b.id.stamp] = y;
+    }
+    std::string bk;
+    if (!bad) {
+      bk = make_lam_key_scoped_rec(l->body, bound, next, vmap, nv);
+      if (bk.empty()) bad = true;
+    }
+    for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+      if (it->second < 0) vmap.erase(it->first);
+      else vmap[it->first] = it->second;
+    }
+    return bad ? std::string() : r + " " + bk + ")";
+  }
   if (l->k == K::Catch) {
     // the id is in scope in the protected body (`cond`) only, not the handler
     auto prev = bound.find(l->prim_arg);
@@ -385,11 +468,14 @@ inline std::string make_lam_key_scoped_rec(const LamPtr& l,
   for (auto& sc : l->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
   for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
   if (r.empty()) return "";
+  if (l->k == K::Switch && !kNoKeySwId)   // see make_lam_key_rec
+    r += ":@" + std::to_string(reinterpret_cast<uintptr_t>(l.get()));
   return r + ")";
 }
 inline std::string make_lam_key_scoped(const LamPtr& l) {
   std::map<int, int> bound; int next = 0;
-  return make_lam_key_scoped_rec(l, bound, next);
+  std::map<int, int> vmap; int nv = 0;
+  return make_lam_key_scoped_rec(l, bound, next, vmap, nv);
 }
 
 // Translate a structure into the module's Lambda term (the setglobal form).
