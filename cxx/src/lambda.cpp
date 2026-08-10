@@ -1171,6 +1171,63 @@ struct Translator {
   // tag-hash set (with inheritance, resolved lazily by collect_pv_tags).
   std::unordered_map<std::string, std::vector<std::string>> pv_raw_tags_;
   std::unordered_map<std::string, std::vector<std::string>> pv_inherits_;
+  // The same abbreviations in DECLARATION order and with each tag's arity,
+  // which is what Typecore.build_or_pat needs to turn `#T` into the or-pattern
+  // of T's tags (`Rpresent None` -> a bare tag, `Rpresent (Some _)` -> `` `L _
+  // ``).  Kept beside the hash-set tables rather than replacing them: only the
+  // pattern expansion reads it, so an unresolved entry declines the rewrite.
+  struct PvRowItem { std::string name; int kind; };  // 0 const 1 arg 2 inherit
+  std::unordered_map<std::string, std::vector<PvRowItem>> pv_rows_;
+  // Flatten one abbreviation's rows to (tag, has_arg) in row order, splicing
+  // an inherited row in place; false if any name on the way is unknown, so a
+  // partial tag list can never masquerade as a complete signature.
+  bool pv_flatten(const std::string& ty,
+                  std::vector<std::pair<std::string, bool>>& out,
+                  std::set<std::string>& seen) {
+    if (!seen.insert(ty).second) return true;   // diamond inherit: spliced
+    auto it = pv_rows_.find(ty);
+    if (it == pv_rows_.end()) return false;
+    for (auto& e : it->second) {
+      if (e.kind == 3) return false;              // a shape build_or_pat drops
+      if (e.kind == 2) {
+        auto hit = pv_rows_.find(e.name);
+        std::string key = hit != pv_rows_.end() ? e.name : lid_last_str(e.name);
+        if (!pv_flatten(key, out, seen)) return false;
+        continue;
+      }
+      bool dup = false;
+      for (auto& o : out)
+        if (o.first == e.name) { dup = true; break; }
+      if (!dup) out.push_back({e.name, e.kind == 1});
+    }
+    return true;
+  }
+  static std::string lid_last_str(const std::string& dotted) {
+    size_t d = dotted.rfind('.');
+    return d == std::string::npos ? dotted : dotted.substr(d + 1);
+  }
+  // One AST `[ .. ]` manifest as ordered row items.  A conjunctive tag
+  // (`` `A of & t ``, row_field_repr Reither) is recorded as kind 3, which
+  // pv_flatten's callers reject: build_or_pat drops it from the or-pattern but
+  // combine_variant still counts it, so a rewrite there would be unsound.
+  std::vector<PvRowItem> pv_row_items(const Ptyp_variant& pv) {
+    std::vector<PvRowItem> items;
+    for (auto& rf : pv.rows) {
+      if (auto* rt = std::get_if<Rtag>(&rf)) {
+        int k = rt->constant ? (rt->types.empty() ? 0 : 3) : 1;
+        items.push_back({rt->name, k});
+      } else if (auto* ri = std::get_if<Rinherit>(&rf)) {
+        auto* c = std::get_if<Ptyp_constr>(&ri->ct->desc);
+        std::string dotted;
+        if (!c || !lid_to_dotted(c->id.txt, dotted))
+          { items.push_back({"", 3}); continue; }
+        items.push_back({dotted, 2});
+      } else {
+        items.push_back({"", 3});
+      }
+    }
+    return items;
+  }
   void collect_pv_tags(const std::string& ty, std::set<long long>& out,
                        std::set<std::string>& seen) {
     if (!seen.insert(ty).second) return;
@@ -1230,6 +1287,15 @@ struct Translator {
         if (m && m->kind == cmi::TypeExpr::Tvariant && !m->pv_tags.empty()) {
           std::string key = key_prefix.empty() ? td.name : key_prefix + "." + td.name;
           if (!pv_raw_tags_.count(key)) pv_raw_tags_[key] = m->pv_tags;
+          // A cmi row is already FLATTENED (row_fields of the expanded head),
+          // so the ordered form needs no inherit splicing -- but only when the
+          // arg side-vector decoded (empty = the tags-only fallback).
+          if (m->pv_args.size() == m->pv_tags.size() && !pv_rows_.count(key)) {
+            std::vector<PvRowItem> items;
+            for (size_t i = 0; i < m->pv_tags.size(); ++i)
+              items.push_back({m->pv_tags[i], m->pv_args[i] ? 1 : 0});
+            pv_rows_[key] = std::move(items);
+          }
         }
       }
     } catch (...) {}
@@ -2143,6 +2209,7 @@ struct Translator {
       }
       pv_raw_tags_[d.name.txt] = std::move(tags);
       pv_inherits_[d.name.txt] = std::move(inh);
+      pv_rows_[d.name.txt] = pv_row_items(*pv);
     });
     // A top-level submodule that `include`s an imported module (matching's
     // `module Simple = struct include Patterns.Simple end`): register the
@@ -2208,6 +2275,17 @@ struct Translator {
             if (d.manifest && !std::get_if<Ptype_variant>(&d.kind) &&
                 !std::get_if<Ptype_record>(&d.kind))
               local_alias_.emplace(d.name.txt, d.manifest->get());
+            // A submodule's `[ .. ]` abbreviation under its QUALIFIED name,
+            // which is how `#Half_simple.view` names it; the bare name is
+            // fill-absent because three sibling modules call their view `view`.
+            if (d.manifest)
+              if (auto* pv =
+                      std::get_if<Ptyp_variant>(&d.manifest->get()->desc)) {
+                auto items = pv_row_items(*pv);
+                if (!modpath.empty())
+                  pv_rows_[modpath + "." + d.name.txt] = items;
+                pv_rows_.emplace(d.name.txt, std::move(items));
+              }
             if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
               // Register the record type's layout so its literals/projections
               // resolve.  A label already claimed by another type is left
@@ -14520,6 +14598,17 @@ struct Translator {
           cbody[i] = sub_for(cells[i]);
           if (!cbody[i]) return nullptr;
         }
+        // combine_variant's `None, Some act -> act` (matching.ml:3410): with no
+        // fail action and every tag running the same one, there is no test at
+        // all.  `| #t as v -> v` over t's whole row reaches this once `#t` is
+        // expanded, and would otherwise emit `if (isint v) (exit 1) (exit 1)`.
+        LamPtr one_act;
+        if (fexit < 0) {
+          bool one = true;
+          for (size_t i = 1; i < cbody.size() && one; ++i)
+            one = same_action_lam(cbody[0], cbody[i]);
+          if (one) one_act = cbody[0];
+        }
         std::vector<std::pair<int, LamPtr>> consts, blocks;
         for (size_t i = 0; i < cells.size(); ++i)
           (cells[i].blk ? blocks : consts).push_back({(int)cells[i].h, cbody[i]});
@@ -14556,7 +14645,9 @@ struct Translator {
           return tree;
         };
         LamPtr chain;
-        if (!consts.empty() && !blocks.empty()) {
+        if (one_act) {
+          chain = one_act;
+        } else if (!consts.empty() && !blocks.empty()) {
           if (fexit < 0 && consts.size() == 1 && blocks.size() == 1)
             chain = iff2(isint_of(), consts[0].second, blocks[0].second);
           else {
@@ -18787,6 +18878,85 @@ struct Translator {
     LamPtr body = compile_match(scrut, rows_of(cases), mloc, total, proven);
     return apply_value_or_shares(body, wraps);
   }
+  // Synthesised `#T` expansions, kept alive for the whole unit; the memo maps
+  // a source row pattern to its rewrite (nullptr = declined: try only once).
+  std::vector<PatBox> pv_syn_;
+  std::unordered_map<const void*, const Pattern*> pv_expand_memo_;
+  // Typecore.build_or_pat: a `#T` pattern reaches Matching as the OR-PATTERN
+  // of T's tags -- constant tags bare, the rest with an omega argument -- and
+  // never as a node of its own.  That is what makes `| #Simple.view as view ->`
+  // complete the column's signature, so combine_variant drops the fail action
+  // and its switcher builds an interval test (`>= h`) rather than an equality
+  // one.  The leaves get NO pat_pvuniv entry: T can be narrower than the
+  // scrutinee's row (`#t1 as v -> .. | _ -> ..` over `[ `A | `B | `C ]`), so
+  // T's tag count is not the column's universe -- the sig_complete decision
+  // stays on the typer's entries, recorded against the match's real row.
+  PatBox pv_type_or_box(const Pattern* p) {
+    auto* pt = std::get_if<Ppat_type>(&p->desc);
+    if (!pt) return nullptr;
+    std::string dotted;
+    std::vector<std::pair<std::string, bool>> tags;
+    std::set<std::string> seen;
+    bool ok = false;
+    if (lid_to_dotted(pt->id.txt, dotted) &&
+        dotted.find('.') != std::string::npos) {
+      if (!pv_rows_.count(dotted)) {
+        std::string mod = dotted.substr(0, dotted.rfind('.'));
+        register_pv_types_from(mod, mod);         // a separately-compiled unit
+      }
+      if (pv_rows_.count(dotted)) ok = pv_flatten(dotted, tags, seen);
+    }
+    if (!ok) {
+      tags.clear(); seen.clear();
+      ok = pv_flatten(lid_last(pt->id.txt), tags, seen);
+    }
+    if (!ok || tags.empty()) return nullptr;
+    std::vector<PatBox> leaves;
+    for (auto& [name, hasarg] : tags) {
+      auto leaf = std::make_unique<Pattern>();
+      Ppat_variant v;
+      v.label = name;
+      if (hasarg) {
+        auto a = std::make_unique<Pattern>();
+        a->desc = Ppat_any{}; a->loc = p->loc;
+        v.arg = std::move(a);
+      }
+      leaf->desc = std::move(v); leaf->loc = p->loc;
+      leaves.push_back(std::move(leaf));
+    }
+    PatBox acc = std::move(leaves.back());
+    for (int i = (int)leaves.size() - 2; i >= 0; --i) {
+      auto o = std::make_unique<Pattern>();
+      Ppat_or po; po.l = std::move(leaves[i]); po.r = std::move(acc);
+      o->desc = std::move(po); o->loc = p->loc;
+      acc = std::move(o);
+    }
+    return acc;
+  }
+  // The same, through the wrappers a `#T` row is written with (`#T as v`); a
+  // constraint or a nested position declines, since rebuilding those would mean
+  // cloning core types we don't own.
+  PatBox pv_expand_build(const Pattern* p) {
+    if (std::holds_alternative<Ppat_type>(p->desc)) return pv_type_or_box(p);
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {
+      PatBox inner = pv_expand_build(pa->p.get());
+      if (!inner) return nullptr;
+      auto np = std::make_unique<Pattern>();
+      Ppat_alias na; na.p = std::move(inner); na.name = pa->name;
+      np->desc = std::move(na); np->loc = p->loc;
+      return np;
+    }
+    return nullptr;
+  }
+  const Pattern* pv_expand_row(const Pattern* p) {
+    auto it = pv_expand_memo_.find(p);
+    if (it != pv_expand_memo_.end()) return it->second ? it->second : p;
+    PatBox b = pv_expand_build(p);
+    const Pattern* r = b.get();
+    if (b) pv_syn_.push_back(std::move(b));
+    pv_expand_memo_[p] = r;
+    return r ? r : p;
+  }
   // `total` (from the typer's exhaustiveness): when set, the naive last-resort
   // matcher omits the impossible `raise Match_failure` default and its final test,
   // exactly as ocamlc does when Translcore lowers a Total match.  Only the outer
@@ -18794,6 +18964,17 @@ struct Translator {
   LamPtr compile_match(const LamPtr& scrut, const std::vector<Row>& rows,
                        const Location& mloc, bool total = false,
                        bool proven = false) {
+    // Rewrite `#T` rows before any matcher sees them (see pv_type_or_box).
+    if (!cppcaml::dbg_env("NOPVEXPAND")) {
+      std::vector<Row> er;
+      bool any = false;
+      for (auto& r : rows) {
+        const Pattern* np = pv_expand_row(r.lhs);
+        if (np != r.lhs) any = true;
+        er.push_back({np, r.rhs, r.guard});
+      }
+      if (any) return compile_match(scrut, er, mloc, total, proven);
+    }
     // If the scrutinee is a var of a known imported type, force-register that type's
     // constructors (correct arity/tag) for THIS match, so an ambiguous ctor name
     // (`Named`, shared by 6 types at arities 1/2/3) resolves through the scrutinee's
