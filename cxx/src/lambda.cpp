@@ -13300,22 +13300,21 @@ struct Translator {
                       carrying(c.body) ? "*" : "");
           fprintf(stderr, "\n");
         }
-        //   A catch on the way down waives the fold: upstream's lower_bind has
-        // no Lstaticcatch case, so it stopped at the catch and never reached
-        // the switch whose case count the fold is correcting.  That separates
-        // two landings the fold cannot tell apart -- one carrying case, the
-        // other tags all falling through to one exit.  With the fall-through
-        // arm SHARED, upstream wraps the sub-match in a catch and keeps the
-        // bind above it; with the tags exiting straight to an enclosing
-        // default there is no catch, upstream reads a one-case switch and
-        // descends to the arm (translmod's `Tstr_include`).
-        //   Waiving only the fold, not the whole test: accepting on the catch
-        // alone is measurably too broad -- it wins bytegen and translprim but
-        // makes includemod's `Functor_app_diff` keep an `mty` bind upstream
-        // substitutes, turning it into a catch parameter.
+        //   A catch on the way down licenses the kept bind by itself: upstream's
+        // lower_bind has no Lstaticcatch case, so it stopped there and BOUND --
+        // it never substitutes; keep-vs-substitute is Simplif's decision later,
+        // by true count (bytegen's `Pduparray (kind, _)` beside two more
+        // Pduparray rows: upstream leaves `kind =a (field 0 p)` above the
+        // whole row-split catch, and its two uses in the inlined arm keep it).
+        // The unfolded carrying test stays for documentation of the shape it
+        // proved, but the catch subsumes it (NOSWLCATCHALONE reverts to
+        // requiring it).  The includemod regression that used to make this
+        // look too broad was wire_garms' literal chain compare tripping over
+        // the kept var -- see the Simplif canonicalization at the reread rule.
         bool keep = carrying_test(dst) ||
                     (crossed_catch > 0 && !cppcaml::dbg_env("SWLNOCATCH") &&
-                     carrying_test(dst, false));
+                     (carrying_test(dst, false) ||
+                      !cppcaml::dbg_env("NOSWLCATCHALONE")));
         if (!keep) {
           strip_let_of(out, v);           // unwind: substitute like before
           subst_alias(out, v, clone_facc(proto));
@@ -16191,6 +16190,21 @@ struct Translator {
       if (shared) {
         std::vector<Lam*> sites;
         collect_exit_sites(body, a.aid, sites);
+        if (cppcaml::dbg_env("WGDBG")) {
+          fprintf(stderr, "[WGDBG] aid=%d uses=%d bad=%d pend=%d sites=%zu vnames:",
+                  a.aid, uses, bad, (int)(bool)pend, sites.size());
+          for (auto& vn : a.vnames) fprintf(stderr, " %s", vn.c_str());
+          fprintf(stderr, "\n");
+          for (Lam* s : sites) {
+            fprintf(stderr, "[WGDBG]   site:");
+            for (auto& ar : s->args)
+              fprintf(stderr, " (k=%d%s)", (int)ar->k,
+                      ar->k == Lam::K::Var
+                          ? (" " + ar->var.name + "/" + std::to_string(ar->var.stamp)).c_str()
+                          : "");
+            fprintf(stderr, "\n");
+          }
+        }
         for (size_t k = 0; k < a.vnames.size(); ++k) {
           const Ident* same = nullptr; bool ok = !sites.empty();
           for (Lam* s : sites) {
@@ -16216,7 +16230,25 @@ struct Translator {
             LamPtr chain;
             for (Lam* s : sites) {
               if (k >= s->args.size()) { chain = nullptr; break; }
-              const LamPtr& e = s->args[k];
+              LamPtr e = s->args[k];
+              // Simplif's Alias rule, applied before comparing: a site that
+              // spells the column as a kept SINGLE-USE materialized var (the
+              // swl gate keeps the bind above a crossed catch; upstream's
+              // Simplif then substitutes it right back) is post-Simplif the
+              // same field read another site spells inline -- swap in its
+              // prototype chain, ONE level, so the compare and the emitted
+              // reread stay in the spelling the inline sites use.  A
+              // multi-use var stays: upstream keeps that let and really does
+              // pass the var (includemod's `Functor_app_diff`, where one
+              // or-alternative's descent crosses a catch and the other's
+              // does not).
+              if (e->k == Lam::K::Var && !cppcaml::dbg_env("NOWGCANON") &&
+                  count_var(body, e->var) == 1) {
+                auto pit = gm_facc_proto_.find(e->var.stamp);
+                if (pit != gm_facc_proto_.end() &&
+                    !mutfield_reads_.count(pit->second.get()))
+                  e = clone_facc(pit->second);
+              }
               const Ident* root = facc_chain_root(e);
               if (!root || e->k == Lam::K::Var ||
                   stamp_bound_in((*pend)->cond, root->stamp)) { chain = nullptr; break; }
