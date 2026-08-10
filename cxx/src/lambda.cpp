@@ -1168,6 +1168,11 @@ struct Translator {
   // penv : Pattern_env.t): its stamp -> that record's dotted type path, so a later
   // `penv.env` (env AMBIGUOUS) resolves through Pattern_env.t instead of find_field.
   std::unordered_map<int, std::string> var_record_path_;
+  // Companion to var_record_path_ for the STRING case (`Variant {tag = t1}`,
+  // tag : Asttypes.label): the inferencer leaves an imported inline-record field
+  // untyped, so a bare `t1` has no "string" value kind and `t1 = t2` fell to
+  // caml_equal where Translprim's typed compare emits caml_string_equal.
+  std::unordered_set<int> var_string_;
   // A variable bound to a WHOLE inline record by `Ctor x` (ident.ml's `Local x`):
   // its var stamp -> that ctor's CtorInfo, so a later `x.field` reads the inline
   // record's field even when the label is AMBIGUOUS across constructors (Local/
@@ -1570,7 +1575,7 @@ struct Translator {
                 ci.rshape.push_back(cmi_field_kind(l.type));
                 ci.rfmut.push_back(l.mutable_);
                 ci.rftypes.push_back(cmi_label_record_path(l.type, mod));
-                ci.rfstr.push_back(cmi_type_is_string(l.type));
+                ci.rfstr.push_back(cmi_type_is_string(l.type, mod));
               }
             else
               for (auto& a : c.args) {
@@ -2566,18 +2571,29 @@ struct Translator {
   // Tag a var bound by an inline-record-ctor field pattern (`Pattern {penv}`) with
   // its field's record type, so a later `penv.env` resolves the ambiguous label.
   void tag_inline_field_var(const Pattern* sub, const CtorInfo& ci, int ix) {
-    if (ix < 0 || ix >= (int)ci.rftypes.size() || ci.rftypes[ix].empty()) return;
+    if (ix < 0) return;
+    bool str = ix < (int)ci.rfstr.size() && ci.rfstr[ix];
+    bool rec = ix < (int)ci.rftypes.size() && !ci.rftypes[ix].empty();
+    if (!str && !rec) return;
     auto* pv = std::get_if<Ppat_var>(&effective_pat(sub)->desc);
     if (!pv) return;
-    if (auto* b = lookup(pv->name.txt)) var_record_path_[b->stamp] = ci.rftypes[ix];
+    const Ident* b = lookup(pv->name.txt);
+    if (!b) return;
+    if (rec) var_record_path_[b->stamp] = ci.rftypes[ix];
+    if (str && !no_inline_str_) var_string_.insert(b->stamp);
   }
+  // NOINLSTREQ reverts every inline-record string-field tag (fact (a) of S252).
+  const bool no_inline_str_ = std::getenv("NOINLSTREQ") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
   std::unordered_map<const void*, std::string> var_node_path_;
+  // Its string companion (see var_string_).
+  std::unordered_set<const void*> var_node_string_;
   void apply_var_node_path(const Pattern* p, const Ident& id) {
     if (auto it = var_node_path_.find((const void*)p); it != var_node_path_.end())
       var_record_path_[id.stamp] = it->second;
+    if (var_node_string_.count((const void*)p)) var_string_.insert(id.stamp);
   }
   // `x.label` where x was bound to a whole inline record by `Ctor x` -- resolve
   // the field via that ctor's rlabels, so an AMBIGUOUS label (ident.ml's `stamp`,
@@ -3811,7 +3827,7 @@ struct Translator {
                   ci.rshape.push_back(cmi_field_kind(l.type));
                   ci.rfmut.push_back(l.mutable_);
                   ci.rftypes.push_back(cmi_label_record_path(l.type, dotted));
-                  ci.rfstr.push_back(cmi_type_is_string(l.type));
+                  ci.rfstr.push_back(cmi_type_is_string(l.type, dotted));
                 }
               ctor_info_[c.name] = ci;
               type_ctor_info_[td.name][c.name] = std::move(ci);
@@ -5163,11 +5179,51 @@ struct Translator {
   // `body.c_lhs` has no owning record and falls to whatever foreign unit
   // uniquely claims the label -> a wrong or const-0 read).
   // cmi analog of coretype_is_string for an IMPORTED inline-record field.
-  static bool cmi_type_is_string(const cmi::TypePtr& t0) {
+  // A cmi records the field's DECLARED path, not its expansion, so an
+  // abbreviation (patterns.ml's `tag : label`, i.e. Asttypes.label = string)
+  // has to be followed through the declaring unit's own signature -- `mod` is
+  // where an unqualified path resolves.  Fuel-bounded, and only for 0-argument
+  // abbreviations (a parameterized one can't be `string` anyway).
+  bool cmi_type_is_string(const cmi::TypePtr& t0, const std::string& mod,
+                          int fuel = 4) {
     cmi::TypePtr t = t0;
     while (t && (t->kind == cmi::TypeExpr::Tlink || t->kind == cmi::TypeExpr::Tsubst)) t = t->link;
-    return t && t->kind == cmi::TypeExpr::Tconstr && t->path &&
-           cmi_path_dotted(*t->path) == "string";
+    if (!t || t->kind != cmi::TypeExpr::Tconstr || !t->path) return false;
+    std::string dotted = cmi_path_dotted(*t->path);
+    if (dotted == "string") return true;
+    if (fuel <= 0 || !t->args.empty() || dotted.empty()) return false;
+    std::string owner = mod, name = dotted;
+    if (auto d = dotted.rfind('.'); d != std::string::npos) {
+      owner = dotted.substr(0, d);
+      name = dotted.substr(d + 1);
+    }
+    if (owner.empty()) return false;
+    // An UNQUALIFIED path is scoped like OCaml's: the enclosing submodule
+    // first, then each outer prefix out to the unit itself (`mylab` inside
+    // `X0.Head` may well be declared at X0's top level).  A qualified one is
+    // absolute and gets its single lookup.
+    bool unqualified = dotted.find('.') == std::string::npos;
+    for (std::string scope = owner;;) {
+      try {
+        size_t hd = scope.find('.');
+        const auto& cmi = cmi::CmiFile::load(
+            resolve_cmi(hd == std::string::npos ? scope : scope.substr(0, hd)));
+        const cmi::Signature* sig = &cmi.sig();
+        for (size_t pos = hd; sig && pos != std::string::npos;) {
+          size_t nd = scope.find('.', pos + 1);
+          sig = nested_cmi_sig(*sig, scope.substr(pos + 1,
+                  nd == std::string::npos ? std::string::npos : nd - pos - 1));
+          pos = nd;
+        }
+        if (sig)
+          for (auto& td : sig->types)
+            if (td.name == name && td.params.empty() && td.manifest)
+              return cmi_type_is_string(td.manifest, scope, fuel - 1);
+      } catch (...) {}
+      auto d = scope.rfind('.');
+      if (!unqualified || d == std::string::npos) return false;
+      scope.resize(d);
+    }
   }
   static std::string cmi_label_record_path(const cmi::TypePtr& t0, const std::string& mod) {
     cmi::TypePtr t = t0;
@@ -5972,6 +6028,12 @@ struct Translator {
     // gets a "string" value-kind; consult the ctor's per-field marker instead.
     if (auto* fld = std::get_if<Pexp_field>(&e->desc))
       return inline_rec_field_is_string(fld->e.get(), lid_last(fld->field.txt));
+    // Same gap one step earlier: `Variant {tag = t1}` binds t1 to the field
+    // DIRECTLY, so there is no projection to consult -- the binder itself
+    // carries the flag (var_string_).
+    if (auto* id = std::get_if<Pexp_ident>(&e->desc))
+      if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+        if (const Ident* b = lookup(l->name)) return var_string_.count(b->stamp) != 0;
     return false;
   }
   const Ident* lookup(const std::string& n) {
@@ -13289,7 +13351,21 @@ struct Translator {
         // arg is bound at compile_match_nonempty ENTRY, named after the first
         // row variable, and bind_check's lower_bind then walks it down past
         // the sibling alias lets to just above the switch.
-        auto carrying = [&](const LamPtr& s) {
+        //   A branch's OWN leading alias lets are peeled first: they are the
+        // sub-match's destructure (`*match* =a (field_imm 0 l2)`), and upstream
+        // compiled the arm INLINE underneath them -- the exit standing for that
+        // body is still what the branch does with v.  Without the peel,
+        // parmatch's `records_args` combine declined the gate and re-read
+        // `lbl1` inside the l2 arm.  NOCARRYLET reverts.
+        static const bool no_carry_let = std::getenv("NOCARRYLET") != nullptr;
+        auto carrying = [&](const LamPtr& s0) {
+          const Lam* s = s0.get();
+          while (!no_carry_let && s && s->k == Lam::K::Let) {
+            bool allalias = !s->bindings.empty();
+            for (auto& b : s->bindings) if (!b.alias) { allalias = false; break; }
+            if (!allalias) break;
+            s = s->body.get();
+          }
           if (!s || s->k != Lam::K::Staticraise || !s->gm_garm) return false;
           for (auto& a : s->args)
             if (a && a->k == Lam::K::Var && a->var.stamp == v.stamp) return true;
@@ -15789,9 +15865,12 @@ struct Translator {
                 // NODE with the field's declared record path so bind0's arm
                 // binding resolves later `.label` projections through it
                 // (Texp_letop's `body : value case` -> "Typedtree.case").
-                if (std::get_if<Ppat_var>(&fp->desc) &&
-                    j2 < ci->rftypes.size() && !ci->rftypes[j2].empty())
-                  var_node_path_[(const void*)fp] = ci->rftypes[j2];
+                if (std::get_if<Ppat_var>(&fp->desc)) {
+                  if (j2 < ci->rftypes.size() && !ci->rftypes[j2].empty())
+                    var_node_path_[(const void*)fp] = ci->rftypes[j2];
+                  if (!no_inline_str_ && j2 < ci->rfstr.size() && ci->rfstr[j2])
+                    var_node_string_.insert((const void*)fp);
+                }
                 fps.push_back(fp);
               }
           } else {
@@ -16029,18 +16108,19 @@ struct Translator {
   // without it the label falls to whatever foreign unit uniquely claims it --
   // untypeast's `body.c_lhs` read Parsetree's letop and lowered to a const 0).
   void collect_inline_fvar_paths(const Pattern* p0,
-                                 std::map<std::string, std::string>& out) {
+                                 std::map<std::string, std::string>& out,
+                                 std::set<std::string>* strs = nullptr) {
     const Pattern* p = effective_pat(p0);
-    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { collect_inline_fvar_paths(pa->p.get(), out); return; }
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { collect_inline_fvar_paths(pa->p.get(), out, strs); return; }
     if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
-      collect_inline_fvar_paths(o->l.get(), out);
-      collect_inline_fvar_paths(o->r.get(), out); return;
+      collect_inline_fvar_paths(o->l.get(), out, strs);
+      collect_inline_fvar_paths(o->r.get(), out, strs); return;
     }
     if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
-      for (auto& e : tu->elems) collect_inline_fvar_paths(e.get(), out); return;
+      for (auto& e : tu->elems) collect_inline_fvar_paths(e.get(), out, strs); return;
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
-      for (auto& [l, s] : pr->fields) collect_inline_fvar_paths(s.get(), out); return;
+      for (auto& [l, s] : pr->fields) collect_inline_fvar_paths(s.get(), out, strs); return;
     }
     if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
       if (!k->arg) return;
@@ -16058,11 +16138,13 @@ struct Translator {
             if (auto* pv = std::get_if<Ppat_var>(&fp->desc)) {
               if (ix >= 0 && ix < (int)C.rftypes.size() && !C.rftypes[ix].empty())
                 out.emplace(pv->name.txt, C.rftypes[ix]);
-            } else collect_inline_fvar_paths(fp, out);
+              if (strs && ix >= 0 && ix < (int)C.rfstr.size() && C.rfstr[ix])
+                strs->insert(pv->name.txt);
+            } else collect_inline_fvar_paths(fp, out, strs);
           }
           return;
         }
-      collect_inline_fvar_paths(k->arg->get(), out);
+      collect_inline_fvar_paths(k->arg->get(), out, strs);
     }
   }
   // Companion to collect_inline_fvar_paths for a WHOLE inline record: `K x` binds
@@ -16115,7 +16197,8 @@ struct Translator {
     collect_alias_names(full, a.alias_names);
     a.aid = ++next_exit_;
     std::map<std::string, std::string> fvp;
-    collect_inline_fvar_paths(full, fvp);
+    std::set<std::string> fvs;
+    collect_inline_fvar_paths(full, fvp, no_inline_str_ ? nullptr : &fvs);
     std::map<std::string, const CtorInfo*> iwv;
     collect_inline_whole_vars(full, iwv);
     for (size_t k = 0; k < a.vnames.size(); ++k) {
@@ -16124,6 +16207,7 @@ struct Translator {
       a.cvars.push_back(fresh(a.vnames[k], false)); a.kinds.push_back(ValueKind::Gen);
       if (auto pit = fvp.find(a.vnames[k]); pit != fvp.end())
         var_record_path_[a.cvars.back().stamp] = pit->second;
+      if (fvs.count(a.vnames[k])) var_string_.insert(a.cvars.back().stamp);
       if (auto wit = iwv.find(a.vnames[k]); wit != iwv.end())
         inline_rec_var_[a.cvars.back().stamp] = wit->second;
     }
