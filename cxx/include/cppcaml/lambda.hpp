@@ -195,9 +195,11 @@ struct Lam {
   bool gm_str_dflt = false;
   // gm_str_bind: gmatch's string-column arg binding (Bytegen bind_sw).  The
   // tree is built against an internal `switch` var so the enclosing split sees
-  // exactly ONE nominal use (the stringswitch node's arg slot).  Collapse
-  // resolves it after all substitutions: value still a Var -> strip the let
-  // (bind_sw's Lvar no-op); value a field read -> a real Strict `switch` let.
+  // exactly ONE nominal use (the stringswitch node's arg slot).
+  // resolve_str_binds settles it where Bytegen would, at the very end of the
+  // pipeline and so after every Simplif-level substitution: value still a Var
+  // -> strip the let (bind_sw's Lvar no-op); otherwise a real Strict `switch`
+  // let.  Until then inline_var_aliases must step over the node.
   bool gm_str_bind = false;
   // gm_str_node / gm_str_arm: skeleton of an expanded string-test tree
   // (Matching.do_make_string_test_tree).  gm_str_node marks every node the

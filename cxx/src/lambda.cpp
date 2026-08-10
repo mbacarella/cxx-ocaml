@@ -9203,7 +9203,8 @@ struct Translator {
     for (auto& b : l->bindings) inline_var_aliases(b.val);
     for (auto& sc : l->sw_consts) inline_var_aliases(sc.body);
     for (auto& sc : l->sw_blocks) inline_var_aliases(sc.body);
-    if (l->k != Lam::K::Let) return;
+    // A pending bind_sw let is Bytegen's, not Simplif's -- see resolve_str_binds.
+    if (l->k != Lam::K::Let || l->gm_str_bind) return;
     std::vector<Lam::Binding> keep;
     for (size_t i = 0; i < l->bindings.size(); ++i) {
       auto& b = l->bindings[i];
@@ -16566,6 +16567,35 @@ struct Translator {
       inline_exit(l->cond, l->prim_arg, {}, {}, l->then_);
       l = l->cond;
     }
+    if (l->k == Lam::K::Let && l->gm_str_bind &&
+        cppcaml::dbg_env("NOLATESTRBIND")) {
+      auto& b = l->bindings[0];
+      if (b.val->k == Lam::K::Var) {              // bind_sw's Lvar no-op
+        subst_var(l->body, b.id, b.val);
+        l = l->body;
+      } else l->gm_str_bind = false;              // real Strict `switch` bind
+    }
+  }
+  // Bytegen's bind_sw, run where Bytegen runs it: AFTER Simplif.  An
+  // Lstringswitch presents its scrutinee to Simplif as a single occurrence in
+  // the node's arg slot, so an Alias let feeding it (`let s = (field 0 t)` from
+  // a tuple-pattern let, say) is single-use and gets substituted; only then
+  // does expand_stringswitch fan the arg out over the compare tree and bind it
+  // afresh.  Resolving the bind during gmatch instead exposes one use per
+  // compare, which keeps the caller's Alias let alive -- an extra stack slot
+  // live across the whole tree, so every exit's Kpop and every access below it
+  // shifts by one.  So gmatch leaves the `switch` let standing (and
+  // inline_var_aliases steps over it, or it would eat the Lvar case early) and
+  // this runs at the end of the pipeline.
+  void resolve_str_binds(LamPtr& l) {
+    if (!l) return;
+    resolve_str_binds(l->fn); resolve_str_binds(l->cond);
+    resolve_str_binds(l->then_); resolve_str_binds(l->else_);
+    resolve_str_binds(l->body); resolve_str_binds(l->sw_default);
+    for (auto& a : l->args) resolve_str_binds(a);
+    for (auto& b : l->bindings) resolve_str_binds(b.val);
+    for (auto& sc : l->sw_consts) resolve_str_binds(sc.body);
+    for (auto& sc : l->sw_blocks) resolve_str_binds(sc.body);
     if (l->k == Lam::K::Let && l->gm_str_bind) {
       auto& b = l->bindings[0];
       if (b.val->k == Lam::K::Var) {              // bind_sw's Lvar no-op
@@ -30510,6 +30540,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.sink_facc_temp_lets(root);
   t.collapse_equal_switches(root);
   t.two_const_switch_to_if(root);
+  t.resolve_str_binds(root);
   lap("simplify");
   if (required_globals) {
     std::set<std::string> rg;
