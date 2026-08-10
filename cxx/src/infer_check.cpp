@@ -4691,7 +4691,14 @@ struct Checker {
       // (iterators.ml's `fun () -> Seq.Cons(..)` vs `int Seq.t`).  Expand there.
       fold_abbrevs_ = !strict;
       TypePtr scheme = nullptr;
+      // The LAST variant in the module declaring the name wins -- ctors share
+      // one namespace and a later declaration shadows an earlier one, exactly
+      // as in ocamlc (includecore.mli declares `Arity` in primitive_mismatch,
+      // constructor_mismatch AND type_mismatch; `Includecore.Arity` is
+      // type_mismatch's).  NOQCSFIRST reverts to the historical first-hit.
+      static const bool qcs_first = std::getenv("NOQCSFIRST") != nullptr;
       for (auto& td : sig->types) {
+        bool found = false;
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors) {
           if (c.name != d->name || c.is_inline_record) continue;
@@ -4707,9 +4714,10 @@ struct Checker {
           scheme = result;
           for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
             scheme = eng.arrow(from_cmi(*it, memo), scheme);
+          found = true;
           break;
         }
-        if (scheme) break;
+        if (found && qcs_first) break;
       }
       // A module-level EXTENSION constructor -- usually `exception Error of ..`
       // (Dynlink.Error, whose bare name would otherwise hit result's Error):
@@ -4735,8 +4743,13 @@ struct Checker {
       cmi_scopes_ = std::move(saved_scopes);
       cmi_mod_scopes_ = std::move(saved_mscopes);
       fold_abbrevs_ = saved_fold;
+      if (!scheme && std::getenv("CTDBG"))
+        fprintf(stderr, "[CTDBG-A] qcs %s: not in sig (types=%zu)\n",
+                lid_full(id).c_str(), sig->types.size());
       return scheme;
     } catch (...) {
+      if (std::getenv("CTDBG"))
+        fprintf(stderr, "[CTDBG-A] qcs %s: threw\n", lid_full(id).c_str());
       cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
       cmi_scopes_.clear(); cmi_mod_scopes_.clear();
     }
@@ -6930,13 +6943,53 @@ struct Checker {
   // when the type isn't a variant, doesn't declare `cn`, or (cmi side) when the
   // ctor found there belongs to a different type of the same module: callers
   // read empty as "cannot descend" and leave the sub-patterns alone.
+  // With `tie` (the scrutinee/expected instance of `typath`), the fresh
+  // instantiation's RESULT is unified onto it, so a parametric ctor's declared
+  // arg slots carry the instance's actual type arguments (`Error 'b` at
+  // `(_, Subst.Unsafe.error) result` hands back Subst.Unsafe.error, not a bare
+  // fresh 'b the nested walk can do nothing with).  Soft: a mismatch is
+  // swallowed and the slots stay fresh.
   std::vector<TypePtr> ctor_decl_arg_types(const std::string& typath,
-                                           const std::string& cn) {
+                                           const std::string& cn,
+                                           const TypePtr& tie = nullptr) {
     TypePtr res;
+    auto tied = [&](std::vector<TypePtr> ps) {
+      if (tie && res) {
+        TypePtr rr = I::Engine::repr(res), tr = I::Engine::repr(tie);
+        // Arguments unify PAIRWISE: the two spellings of one type ("result"
+        // from the predef scheme vs "Stdlib.result" off a cmi) would make a
+        // whole-type unify a swallowed clash that binds nothing.
+        if (rr->kind == I::Type::Kind::Constr &&
+            (rr->path == typath || "Stdlib." + rr->path == typath) &&
+            tr->kind == I::Type::Kind::Constr &&
+            tr->args.size() == rr->args.size())
+          for (size_t i = 0; i < rr->args.size(); ++i)
+            soft_unify(rr->args[i], tr->args[i]);
+      }
+      return ps;
+    };
+    static const bool cdbg = std::getenv("CTDBG") != nullptr;
     if (auto ts = type_ctor_schemes_.find(typath); ts != type_ctor_schemes_.end()) {
       for (auto& [n, s] : ts->second)
-        if (n == cn) return ctor_params(eng.instantiate(s), res);
+        if (n == cn) return tied(ctor_params(eng.instantiate(s), res));
+      if (cdbg) fprintf(stderr, "[CTDBG-A] %s.%s: local-table miss\n", typath.c_str(), cn.c_str());
       return {};
+    }
+    // The engine's own predef spelling ("Stdlib.result") must not resolve
+    // through an OPENED SUBMODULE that happens to be named Stdlib
+    // (Misc.Stdlib under `open Misc`, whose sig has no `result` at all):
+    // when the asked type is the predef scheme's own, that scheme answers.
+    // Tied calls only -- the tie-less callers (retype_pat_binders) keep
+    // their historical empty answer, so NODISAMBTIE reverts the whole path.
+    if (auto pi = predef_ctor_schemes_.find(cn);
+        tie && pi != predef_ctor_schemes_.end()) {
+      auto ps = ctor_params(eng.instantiate(pi->second), res);
+      TypePtr rr = I::Engine::repr(res);
+      // The predef scheme spells its type BARE ("result"); a cmi-imported
+      // occurrence spells it through the wrapper ("Stdlib.result").
+      if (rr->kind == I::Type::Kind::Constr &&
+          (rr->path == typath || "Stdlib." + rr->path == typath))
+        return tied(std::move(ps));
     }
     auto d = typath.rfind('.');
     if (d == std::string::npos) return {};
@@ -6953,13 +7006,20 @@ struct Checker {
     }
     Longident full; full.v = Ldot{std::make_shared<Longident>(std::move(id)), cn};
     TypePtr scheme = qualified_ctor_scheme(full);
-    if (!scheme) return {};
+    if (!scheme) {
+      if (cdbg) fprintf(stderr, "[CTDBG-A] %s.%s: no qualified scheme\n", typath.c_str(), cn.c_str());
+      return {};
+    }
     auto ps = ctor_params(scheme, res);
     TypePtr rr = I::Engine::repr(res);
-    // qualified_ctor_scheme takes the FIRST variant in the module declaring the
-    // name; make sure that is the type we asked about.
-    if (rr->kind != I::Type::Kind::Constr || rr->path != typath) return {};
-    return ps;
+    // qualified_ctor_scheme answers for the LAST variant in the module
+    // declaring the name; make sure that is the type we asked about.
+    if (rr->kind != I::Type::Kind::Constr || rr->path != typath) {
+      if (cdbg) fprintf(stderr, "[CTDBG-A] %s.%s: result path %s != asked\n", typath.c_str(), cn.c_str(),
+                        rr->kind == I::Type::Kind::Constr ? rr->path.c_str() : "<novar>");
+      return {};
+    }
+    return tied(std::move(ps));
   }
   // Does the type `found` (as inference resolved a constructor) name a
   // DIFFERENT variant from `want` (the expected / scrutinee type)?  A shared
@@ -7270,8 +7330,24 @@ struct Checker {
     // stays unresolved, and the back end's matcher bails that whole match to
     // the caml_obj_tag if-chain rather than a switch.
     if (!k->arg) return;
-    std::vector<TypePtr> ps = ctor_decl_arg_types(sr->path, cn);
+    // Tied to the scrutinee instance (NODISAMBTIE reverts): a parametric
+    // ctor's slot type is the scrutinee's OWN argument (`Error 'b` at
+    // `(_, Subst.Unsafe.error) result` descends with Subst.Unsafe.error), so
+    // a nested cmi-only ctor (`Fcm_type_substituted_away`) resolves against
+    // the payload's real type instead of dying on a fresh var -- the lexical
+    // pick (a shadowing `exception Error`) had unified it with an unrelated
+    // slot, and the back end then switched over the wrong ctor universe.
+    static const bool no_tie = std::getenv("NODISAMBTIE") != nullptr;
+    std::vector<TypePtr> ps =
+        ctor_decl_arg_types(sr->path, cn, no_tie ? nullptr : sr);
     if (ps.empty()) return;
+    if (getenv("CTDBG"))
+      for (size_t i = 0; i < ps.size(); ++i) {
+        TypePtr pr = I::Engine::repr(ps[i]);
+        fprintf(stderr, "[CTDBG-P] descend %s slot%zu kind=%d path=%s\n",
+                cn.c_str(), i, (int)pr->kind,
+                pr->kind == I::Type::Kind::Constr ? pr->path.c_str() : "");
+      }
     auto* tup = std::get_if<ast::Ppat_tuple>(&(*k->arg)->desc);
     if (ps.size() > 1) {
       if (tup && tup->elems.size() == ps.size())
