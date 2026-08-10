@@ -898,6 +898,12 @@ struct Translator {
   // (trampoline) catch, while a DUPLICATED row -- the same node reached in two
   // subtrees -- stays suppressed.
   std::set<std::pair<int, const Pattern*>> gm_orw_;
+  // Per pending or-handler catch, the names the OR-PATTERN itself binds --
+  // precompile_or's patbound_action_vars (matching.ml:1821).  Those and only
+  // those travel through the handler's exit; wire_garms may not re-read them
+  // from the scrutinee.  Rewritten at every wrap (exit ids are reused across a
+  // bailed build attempt).
+  std::map<int, std::vector<std::string>> gm_orp_pv_;
   // Sentinel or-node key: blocks every nested trampoline for an arm, used where
   // the manual precompile_or path already wires that arm's catch itself.
   static const Pattern* gm_orw_all() {
@@ -13889,9 +13895,12 @@ struct Translator {
         for (auto& rr : rows) {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
           if (alts.size() > 1 && rr.aid >= 0 && rr.vnames) {
-            if (gm_orw_.insert({rr.aid, nullptr}).second)
+            if (gm_orw_.insert({rr.aid, nullptr}).second) {
               wrapped.push_back({rr.aid, comps.size() >= 2 && !rr.row_or &&
                                  pattern_binds(rr.cols[0]), false});
+              auto& pv = gm_orp_pv_[rr.aid];
+              pv.clear(); collect_gvars(rr.cols[0], pv);
+            }
             // A NESTED or-row under an arm already wrapped: precompile_or runs
             // once per matrix, so an or-column exposed only after the outer
             // alternatives were exploded is a fresh or-row and takes its OWN
@@ -16034,11 +16043,20 @@ struct Translator {
           // instead absorbs the catch-all into the or-matrix and its
           // or-catch IS outermost (printpat's pretty_arg, cmt2annot's
           // Tpat_var|Tpat_alias) -- keep splicing those.
+          //   A CHUNK catch stops the walk for the same reason but always:
+          // it is a FOLLOWING pm (split_no_or's singleton-last-row division,
+          // or a guard cut), and comp_match_handlers wraps every following pm
+          // OUTSIDE whatever the first one compiled to -- or-handlers included
+          // (translmod's `_, (Tcoerce_primitive _ | Tcoerce_alias _)`, where
+          // the trailing all-var row is peeled before the or-column is
+          // precompiled).  Splicing to the root would hoist the or-handler
+          // past that catch and swap the two handler bodies.
           for (LamPtr* p = &body;;) {
             if (p == pend) { keep = false; break; }
             Lam* l = p->get();
             if (!l || l->k != Lam::K::Catch) break;
             if (l->gm_deidc && (*pend)->gm_orp_rest) break;
+            if (l->gm_chunkc && !cppcaml::dbg_env("NOCHUNKORP")) break;
             p = &l->cond;
           }
         }
@@ -16062,8 +16080,24 @@ struct Translator {
       // or-handler catch, not the catch's eventual home) -- see the fixup below.
       std::vector<char> pendref(a.vnames.size(), 0);
       bool pend_forced = false;    // that fixup ran: hold the catch at pend
+      // unused_p[k]: the compiled handler never reads the param, so
+      // patbound_action_vars' pm_fv filter drops it (see below).
+      std::vector<char> unused_p(a.vnames.size(), 0);
       auto dropped = [&](size_t k) {
-        return (k < reread.size() && reread[k]) || (k < alias.size() && alias[k]);
+        return (k < reread.size() && reread[k]) ||
+               (k < alias.size() && alias[k]) ||
+               (k < unused_p.size() && unused_p[k]);
+      };
+      // Does the pending or-handler's OWN or-pattern bind vnames[k]?  Those are
+      // precompile_or's patbound_action_vars: they travel through the exit even
+      // when every site spells them as the same field chain, so neither re-read
+      // rule below may claim them.
+      auto orp_bound = [&](size_t k) {
+        if (cppcaml::dbg_env("NOORPBOUND")) return false;
+        auto pit = gm_orp_pv_.find(a.aid);
+        return pit != gm_orp_pv_.end() &&
+               std::find(pit->second.begin(), pit->second.end(),
+                         a.vnames[k]) != pit->second.end();
       };
       if (shared) {
         std::vector<Lam*> sites;
@@ -16089,7 +16123,7 @@ struct Translator {
             // inside the catch.  A bare Lvar site is left to the branch above
             // (it reaches here only when two sites pass the same stamp under
             // different names, where dropping the param is not this rule).
-            if (!pend || sites.empty()) continue;
+            if (!pend || sites.empty() || orp_bound(k)) continue;
             LamPtr chain;
             for (Lam* s : sites) {
               if (k >= s->args.size()) { chain = nullptr; break; }
@@ -16129,6 +16163,11 @@ struct Translator {
             pendref[k] = 1;
             continue;
           }
+          // patbound_action_vars again (translmod's `all_idents`: both
+          // `Tstr_module` alternatives read `mb_id` at the same offset, so the
+          // sites agree on one materialized var -- but the or-pattern binds it,
+          // and upstream's handler takes it as a catch parameter).
+          if (orp_bound(k)) continue;
           reread[k] = expand_facc_var(*same);        // materialized field chain
           // Else an alias to a plain variable: only reference it directly in the
           // handler when it is AMBIENT (free in the whole match body, hence bound
@@ -16206,6 +16245,44 @@ struct Translator {
         lt->bindings = {{hv, ValueKind::Gen, chain, true}};
         lt->body = handler;
         handler = lt;
+      }
+      // patbound_action_vars keeps only the or-bound vars that occur free in
+      // the handler pm (matching.ml:1821's pm_fv filter).  translmod's
+      // `patch_forwards` alternates `(Ignore_loc _, _, _rhs) :: rem` with
+      // `(_, None, _rhs) :: rem`: both bind `_rhs`, no action reads it, and
+      // upstream's catch takes `rem` alone.  Only when every site spells the
+      // param with a pure read (a var or a field chain), so dropping the
+      // argument drops no effect.
+      if (shared && !cppcaml::dbg_env("NOORPUNUSED")) {
+        std::vector<size_t> surv;
+        for (size_t k = 0; k < a.vnames.size(); ++k)
+          if (!dropped(k)) surv.push_back(k);
+        std::vector<char> kill(surv.size(), 0);
+        bool any = false;
+        for (size_t i = 0; i < surv.size(); ++i)
+          if (count_var(handler, a.cvars[surv[i]]) == 0)
+            { kill[i] = 1; any = true; }
+        if (any) {
+          std::vector<Lam*> sites2;
+          collect_exit_sites(body, a.aid, sites2);
+          bool ok = !sites2.empty();
+          for (Lam* s : sites2) {
+            if (s->args.size() != surv.size()) { ok = false; break; }
+            for (size_t i = 0; i < kill.size() && ok; ++i)
+              if (kill[i] && s->args[i]->k != Lam::K::Var &&
+                  !facc_chain_root(s->args[i])) ok = false;
+          }
+          if (ok) {
+            for (Lam* s : sites2) {
+              std::vector<LamPtr> na;
+              for (size_t i = 0; i < s->args.size(); ++i)
+                if (!kill[i]) na.push_back(s->args[i]);
+              s->args = std::move(na);
+            }
+            for (size_t i = 0; i < surv.size(); ++i)
+              if (kill[i]) unused_p[surv[i]] = 1;
+          }
+        }
       }
       if (!shared) {
         // A single-use GUARDED arm: its one exit is the then-branch of the
@@ -16430,7 +16507,7 @@ struct Translator {
         l = l->cond;
         return;
       }
-      l->gm_chunk = false;                           // multi-use: real catch
+      l->gm_chunk = false; l->gm_chunkc = true;      // multi-use: real catch
     }
   }
   // Entry for the general matrix matcher on a single scrutinee: peel a trailing

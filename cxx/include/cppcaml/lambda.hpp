@@ -218,6 +218,10 @@ struct Lam {
   // chunk boundary).  We keep the catch through construction for the same
   // reason and inline single-use handlers in a late pass (inline_chunk_catches).
   bool gm_chunk = false;
+  // gm_chunkc: a chunk catch that SURVIVED inline_chunk_catches (which clears
+  // gm_chunk on the way).  wire_garms needs the provenance afterwards: a
+  // following pm's catch wraps OUTSIDE the first pm's or-handlers.
+  bool gm_chunkc = false;
   // gm_orp: a PENDING or-handler catch created at the or-alternation expansion
   // point in gmatch (matching.ml's precompile_or wraps the handler catch around
   // the compile of the pm at the depth where the or-column is consumed).  The
