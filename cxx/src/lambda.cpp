@@ -13198,16 +13198,74 @@ struct Translator {
       lb_opaque_garm_exits_ = false;
       if (exit_arg) {
         // Keep the let ONLY for the shape that exactly models upstream's leaf:
-        // it landed (past sibling lets) on an `if` one of whose branches IS
+        // it landed (past sibling lets) on a TEST one of whose branches IS
         // the arm exit carrying v -- upstream compiled that arm's rhs inline
         // right there, saw the multi-use var, and kept the Alias bind above
         // the test.  Any other landing means OUR materialization level is
         // shallower than upstream's sub-pm bind point (per-sub-pm binding we
         // do not replicate), so keep the old at-the-use substitution.
+        //   A multi-case Lswitch is a test just as much as an `if` is: it is
+        // the same `| _ -> bind` arm of lower_bind that stops on both (the
+        // one-case forms descend, and lower_bind already took those).  This
+        // is how a constructor's OTHER arguments end up bound beside the
+        // discriminator rather than inside the arm that reads them --
+        // translclass's `Tcf_method (name, _, Tcfk_concrete _)` beside
+        // `Tcf_method (_, _, Tcfk_virtual _)`, where upstream emits
+        // `let *match* = f2 and name = f0 in switch* *match*`.  Upstream
+        // reaches that placement through arg_to_var/name_pattern: column 0's
+        // arg is bound at compile_match_nonempty ENTRY, named after the first
+        // row variable, and bind_check's lower_bind then walks it down past
+        // the sibling alias lets to just above the switch.
         auto carrying = [&](const LamPtr& s) {
           if (!s || s->k != Lam::K::Staticraise || !s->gm_garm) return false;
           for (auto& a : s->args)
             if (a && a->k == Lam::K::Var && a->var.stamp == v.stamp) return true;
+          return false;
+        };
+        //   A landing switch counts only when its CASES really are the several
+        // upstream's own switch had.  combine_constructor emits the uncovered
+        // tags as ONE sw_failaction; we enumerate every tag and only fold them
+        // into a default later, so the raw case count overstates.  Count a case
+        // only when its action differs from the switch's default -- the actual
+        // default when there is one, else the action a fold would elect (the
+        // one repeated across cases).  translmod's
+        // `(Tcoerce_structure _ | Tcoerce_none)` lands on five cases of which
+        // four share the fall-through exit, i.e. upstream's `case tag 0 ..
+        // default:` -- a SINGLE case, which upstream's lower_bind descends into,
+        // binding at the arm.  parmatch's `compat` lands on `case int 0: (exit
+        // 22) | case tag 0: .. | default: (exit 23)`, where the const case is
+        // NOT the default and upstream really does hold two cases.
+        auto act_id = [&](const LamPtr& s, int i) {
+          return (s && s->k == Lam::K::Staticraise && s->args.empty())
+                     ? s->prim_arg : -2 - i;
+        };
+        auto carrying_test = [&](Lam* d, bool fold = true) {
+          if (!d) return false;
+          if (d->k == Lam::K::IfThenElse)
+            return carrying(d->then_) || carrying(d->else_);
+          if (d->k == Lam::K::Switch && !cppcaml::dbg_env("NOSWLAND")) {
+            std::vector<std::pair<int, const LamPtr*>> cases;
+            int i = 0;
+            for (auto* cs : {&d->sw_consts, &d->sw_blocks})
+              for (auto& c : *cs) cases.push_back({act_id(c.body, i++), &c.body});
+            int dflt = act_id(d->sw_default, -1);
+            if (!d->sw_default) {                 // elect the folded default
+              std::map<int, int> freq;
+              for (auto& [id, _] : cases) if (id >= 0) freq[id]++;
+              int best = 0;
+              for (auto& [id, n] : freq) if (n > best) { best = n; dflt = id; }
+              if (best < 2) dflt = -1;
+            }
+            if (!fold || cppcaml::dbg_env("SWLNOFOLD")) dflt = -1;  // count every case
+            std::set<int> arms;
+            bool hit = false;
+            for (auto& [id, b] : cases) {
+              if (id >= 0 && id == dflt) continue;
+              arms.insert(id);
+              if (carrying(*b)) hit = true;
+            }
+            return hit && arms.size() >= 2;
+          }
           return false;
         };
         Lam* lt = find_let_of(out, v);
@@ -13216,18 +13274,48 @@ struct Translator {
         // lower_bind has no Lstaticcatch case, so a bind above such a catch is
         // exactly where upstream leaves it too -- the carrying if inside the
         // protected body is still this column's own dispatch.
-        while (dst && (dst->k == Lam::K::Let || dst->k == Lam::K::Catch))
+        int crossed_catch = 0;
+        while (dst && (dst->k == Lam::K::Let || dst->k == Lam::K::Catch)) {
+          if (dst->k == Lam::K::Catch) ++crossed_catch;
           dst = (dst->k == Lam::K::Let ? dst->body : dst->cond).get();
+        }
         if (cppcaml::dbg_env("GMFA")) {
           fprintf(stderr, "[GMFA] v=%s/%d landing dst=%d gate=%d post-lower:\n",
                   v.name.c_str(), v.stamp, dst ? (int)dst->k : -1,
-                  (int)(dst && dst->k == Lam::K::IfThenElse &&
-                        (carrying(dst->then_) || carrying(dst->else_))));
+                  (int)carrying_test(dst));
           print_dlambda(out, std::cerr);
           fprintf(stderr, "\n");
         }
-        if (!dst || dst->k != Lam::K::IfThenElse ||
-            !(carrying(dst->then_) || carrying(dst->else_))) {
+        if (cppcaml::dbg_env("SWLDBG") && dst && dst->k == Lam::K::Switch) {
+          fprintf(stderr,
+                  "[SWLDBG] v=%s/%d consts=%zu blocks=%zu dflt=%d catch=%d gate=%d acts:",
+                  v.name.c_str(), v.stamp, dst->sw_consts.size(),
+                  dst->sw_blocks.size(), (int)(bool)dst->sw_default, crossed_catch,
+                  (int)carrying_test(dst));
+          int i = 0;
+          for (auto* cs : {&dst->sw_consts, &dst->sw_blocks})
+            for (auto& c : *cs)
+              fprintf(stderr, " [%d%s]", act_id(c.body, i++),
+                      carrying(c.body) ? "*" : "");
+          fprintf(stderr, "\n");
+        }
+        //   A catch on the way down waives the fold: upstream's lower_bind has
+        // no Lstaticcatch case, so it stopped at the catch and never reached
+        // the switch whose case count the fold is correcting.  That separates
+        // two landings the fold cannot tell apart -- one carrying case, the
+        // other tags all falling through to one exit.  With the fall-through
+        // arm SHARED, upstream wraps the sub-match in a catch and keeps the
+        // bind above it; with the tags exiting straight to an enclosing
+        // default there is no catch, upstream reads a one-case switch and
+        // descends to the arm (translmod's `Tstr_include`).
+        //   Waiving only the fold, not the whole test: accepting on the catch
+        // alone is measurably too broad -- it wins bytegen and translprim but
+        // makes includemod's `Functor_app_diff` keep an `mty` bind upstream
+        // substitutes, turning it into a catch parameter.
+        bool keep = carrying_test(dst) ||
+                    (crossed_catch > 0 && !cppcaml::dbg_env("SWLNOCATCH") &&
+                     carrying_test(dst, false));
+        if (!keep) {
           strip_let_of(out, v);           // unwind: substitute like before
           subst_alias(out, v, clone_facc(proto));
         }
