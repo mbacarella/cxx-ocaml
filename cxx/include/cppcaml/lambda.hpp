@@ -284,6 +284,12 @@ struct Lam {
   // point upstream stops at.  Materialization treats a flagged exit as opaque
   // when the bound var's only use is one of its args.
   bool gm_garm = false;
+  // gm_dgrp_test: a call_switcher test that separates the FAIL interval (the
+  // default chunk's own exit, mk_failaction_pos) from a case interval.
+  // simplify_exits may later merge those two exits into one, and Simplif never
+  // collapses an `if` with equal arms -- so collapse_equal_if must leave this
+  // test alone however alike its arms end up looking (see mark_fail_tests).
+  bool gm_dgrp_test = false;
 };
 
 // Alpha-normalized structural key of a Lambda term (the analog of

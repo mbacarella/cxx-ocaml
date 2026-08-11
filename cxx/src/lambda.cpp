@@ -2584,6 +2584,9 @@ struct Translator {
   }
   // NOINLSTREQ reverts every inline-record string-field tag (fact (a) of S252).
   const bool no_inline_str_ = std::getenv("NOINLSTREQ") != nullptr;
+  // NOIFFREEZE reverts mark_fail_tests (the equal-arm judgement is then taken
+  // on the post-inlining tree, as it was before).
+  const bool no_if_freeze_ = std::getenv("NOIFFREEZE") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -9438,6 +9441,35 @@ struct Translator {
         return false;
     }
   }
+  // Upstream's Simplif has no rule that collapses `if c then a else a`, so a
+  // test call_switcher built between the FAIL interval and a case interval
+  // stands even once simplify_exits has merged their two exits into one.
+  // parmatch's `coherent_heads` is the shape: hp1 = Lazy leaves the hp2 column
+  // with one real row (Lazy -> the or-row's arm) while Any is reached only
+  // through the default chunk's OWN exit (mk_failaction_pos's per-constructor
+  // partition), so combine emits `(if hp2 (exit 12) (exit 14))` and
+  // simplify_exits -- which runs after -- rewrites 14 to 12, leaving a test
+  // with two identical arms in the final lambda.
+  //   Only FAIL-vs-case tests are frozen.  A test between two CASE actions is
+  // not: our case bodies are still per-arm exit placeholders here, so two rows
+  // carrying the same action look distinct where upstream's same_actions (which
+  // keys the compiled bodies) sees one -- and collapsing those after the arms
+  // are wired is exactly what collapse_equal_if is for (battery x2).
+  //   The stamp has to happen where the test is made, not in a later walk: the
+  // chunk drivers substitute an alias catch (a handler that is a bare exit)
+  // while the decision tree is still being assembled.
+  static bool is_argless_exit(const LamPtr& l, int id) {
+    return l && l->k == Lam::K::Staticraise && l->prim_arg == id && l->args.empty();
+  }
+  void mark_fail_tests(const LamPtr& l, int fail_exit) {
+    if (!l || no_if_freeze_) return;
+    mark_fail_tests(l->cond, fail_exit);
+    mark_fail_tests(l->then_, fail_exit);
+    mark_fail_tests(l->else_, fail_exit);
+    if (l->k == Lam::K::IfThenElse && l->then_ && l->else_ &&
+        is_argless_exit(l->then_, fail_exit) != is_argless_exit(l->else_, fail_exit))
+      l->gm_dgrp_test = true;
+  }
   // Drop an invariant discriminator: `if <pure read> then e else e'` whose arms
   // are byte-identical (same make_lam_key, exit ids and binder stamps included)
   // collapses to the arm.  ocamlc's matcher only tests columns that discriminate
@@ -9445,6 +9477,7 @@ struct Translator {
   // tree over-tests an invariant column (mtype's `if f3 (if f4 A B) (if f4 B B)`
   // -- the f3=false arm tests f4 though both outcomes are B) this brings us back
   // in line.  Runs BEFORE simplify_static_catches so exit counts match ocamlc's.
+  // A test stamped gm_dgrp_test was NOT over-built -- see above.
   void collapse_equal_if(LamPtr& l) {
     if (!l) return;
     collapse_equal_if(l->fn);
@@ -9457,7 +9490,8 @@ struct Translator {
     for (auto& b : l->bindings) collapse_equal_if(b.val);
     for (auto& sc : l->sw_consts) collapse_equal_if(sc.body);
     for (auto& sc : l->sw_blocks) collapse_equal_if(sc.body);
-    if (l->k == Lam::K::IfThenElse && l->then_ && l->else_ && is_pure_disc(l->cond)) {
+    if (l->k == Lam::K::IfThenElse && l->then_ && l->else_ && !l->gm_dgrp_test &&
+        is_pure_disc(l->cond)) {
       std::string k = cppcaml::lambda::make_lam_key(l->then_, /*exit_aware=*/true);
       if (!k.empty() && k == cppcaml::lambda::make_lam_key(l->else_, /*exit_aware=*/true))
         l = l->then_;
@@ -11976,6 +12010,7 @@ struct Translator {
     // Fail leaves come out as default sentinels; each becomes its own fresh
     // `(exit fail_exit)` -- the handler is the caller's shared-default catch.
     rewrite_default_leaves(tree, fail_exit, nullptr);
+    mark_fail_tests(tree, fail_exit);   // see mark_fail_tests
     return tree;
   }
   // `call_switcher loc (Some fail) arg ?low int_lambda_list` = as_interval_canfail
