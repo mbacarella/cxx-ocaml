@@ -11918,15 +11918,16 @@ struct Translator {
     std::string ka = make_lam_key_scoped(a);
     return !ka.empty() && ka == make_lam_key_scoped(b);
   }
-  // NOPURE3 keeps a block-free three-run dispatch a flat switch (see below).
+  // NOPURE3 keeps a block-free three-run dispatch a flat switch, NOPURE4 a
+  // dispatch of more than three runs (see below).
   const bool no_pure3_ = std::getenv("NOPURE3") != nullptr;
+  const bool no_pure4_ = std::getenv("NOPURE4") != nullptr;
   // An exhaustive constant dispatch (tags 0..N-1, each with a body) whose tags
-  // collapse into exactly TWO contiguous runs of a shared action (`0|1|2 -> A |
-  // 3|4 -> B`) is lowered by ocamlc's call_switcher to a SINGLE range test
-  // (BGTINT/BLTINT), not a flat Lswitch.  Emit that via the ported Switcher
-  // machinery.  Three runs (`a|b|a`) collapse the same way, to a single `!= v`;
-  // every other multi-cluster shape is left to the flat switch (ocamlc's shape
-  // there differs subtly and churns -- see const_ctor_switcher).
+  // collapse into contiguous runs of shared actions (`0|1|2 -> A | 3|4 -> B`)
+  // is lowered by ocamlc's call_switcher through the Switcher, which for a
+  // handful of runs emits TESTS (BGTINT/BLTINT/BEQ) rather than a flat
+  // Lswitch.  Emit that via the ported Switcher machinery; make_clusters
+  // still hands a genuine jump table back to the flat switch.
   LamPtr two_run_switcher(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts,
                           bool has_block) {
     if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
@@ -11956,10 +11957,13 @@ struct Translator {
     // sends the rest to one shared residual.  That was declined for the
     // block-free case while our two copies of the shared residual still keyed
     // apart (see Lam::sw_srcid) -- with them keying alike the shape is reached.
-    // A four-run [X,Y,X,Y] still sits in a nested sub-match whose column
-    // nesting diverges from ocamlc's, so reshaping it churns: keep it flat.
-    // NOPURE3 restores the block-free decline.
-    if (cases.size() > 3) return nullptr;
+    // A four-run [X,Y,X,Y] is the same story one step further: two tests
+    // (`== v` then `>= v`), which is what an or-column pattern over an
+    // interleaved tag set produces (simplif's `enabled`, whose two rows read
+    // `inline = (Never_inline | Default_inline)` and `(Always_inline | Unroll
+    // _ | Hint_inline)`).  NOPURE3 restores the block-free three-run decline,
+    // NOPURE4 the four-and-more decline.
+    if (cases.size() > 3 && no_pure4_) return nullptr;
     if (cases.size() == 3 && !has_block && no_pure3_) return nullptr;
     sw_ok_inter_ = true;                            // tags are small (0..n-1)
     sw_memo_.clear();
@@ -13779,7 +13783,27 @@ struct Translator {
           if (i + 1 < rows.size()) rows.resize(i + 1);
           break;
         }
-    if (!no_peel && rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
+    // Or_matrix's APPEND rule (matching.ml:1524): a trailing row that is
+    // safe_below the or-row above it -- that row unguarded, and the trailing
+    // row's remaining columns at least as general -- is appended to the OR
+    // matrix rather than left in split_or's `no` cluster.  It is then
+    // split_no_or's singleton-last-row division INSIDE the or-body, so its
+    // catch nests UNDER the or-handler; peeling it here builds that nesting
+    // the other way round and swaps the two handler bodies (bytegen's
+    // discard_dead_code).  An all-variable trailing row makes le_pats hold
+    // outright, so only the guards are left to check -- but only the ADJACENT
+    // or-row is read: with a simple row in between, whether the append walk
+    // reaches the or-matrix at all depends on disjointness bookkeeping this
+    // does not model (simplif's emit_tail_infos).  NOORLASTIN restores the
+    // unconditional peel.
+    bool or_absorbs_last = false;
+    if (rows.size() >= 2 && !cppcaml::dbg_env("NOORLASTIN")) {
+      const MRow& above = rows[rows.size() - 2];
+      or_absorbs_last = !rows.back().guard && !above.guard &&
+                        std::get_if<Ppat_or>(&above.cols[0]->desc) != nullptr;
+    }
+    if (!no_peel && !or_absorbs_last &&
+        rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
       bool groups = gm_head_groups_omega(rows);   // before the move: arg order is unspecified
       return gm_peel_last(std::move(comps), std::move(rows), mloc, deid, std::move(denv),
                           groups);
