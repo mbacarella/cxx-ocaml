@@ -11472,6 +11472,48 @@ struct Translator {
       body = i;
     }
     scope.pop_back();
+    // bind_check (matching.ml:3591) sends an Alias bind of a non-var argument
+    // to lower_bind, which sinks it into the single branch that reads it --
+    // here through a guard's `if`, whose else is the shared default exit
+    // (`| X lf when !opt -> ..` keeps `lf =a field` inside the then).  The
+    // sinking walk runs FORWARD: ocamlc groups the sunk aliases first-collected
+    // outermost (`b =a field 1; a =a field 0`), and each later sink descends
+    // past the lets already placed.  Only with a bind that actually sinks, and
+    // only when no binder's RHS reads a sibling: a materialized sub-scrutinee's
+    // uses live in RHSs the forward walk has not folded into the body yet, so
+    // count_var would drop its own bind and dangle theirs.
+    bool sink = false;
+    if (!cppcaml::dbg_env("NOLOWERARM")) {
+      bool deps = false;
+      for (auto& bo : binders) {
+        for (auto& bi : binders)
+          if (count_var(bi.second, bo.first)) { deps = true; break; }
+        if (deps) break;
+      }
+      if (!deps)
+        for (auto& bp : binders)
+          if (!is_mut_field_access(bp.second) &&
+              count_var(body, bp.first) >= 2 &&
+              lower_bind_descends(bp.first, body)) { sink = true; break; }
+    }
+    if (sink) {
+      for (auto& bp : binders) {
+        auto& id = bp.first; auto& fa = bp.second;
+        int n = count_var(body, id);
+        if (n == 0 || (n <= 1 && !is_mut_field_access(fa))) {
+          subst_alias(body, id, fa); continue;
+        }
+        if (!is_mut_field_access(fa)) {
+          body = lower_bind(id, ValueKind::Gen, fa, body); continue;
+        }
+        auto l = mk(Lam::K::Let);
+        Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = fa;
+        b.strict_opt = true;
+        l->bindings = {b};
+        l->body = body; body = l;
+      }
+      return body;
+    }
     // Reverse-fold into nested lets so a materialized sub-scrutinee whose uses are
     // only inside kept sibling bindings is still counted (count_var descends into
     // let-RHS); emits identically to a flat let.  Same kept-mutable-read rule as
@@ -12626,6 +12668,21 @@ struct Translator {
       default:
         return true;
     }
+  }
+  // Whether lower_bind's first step would DESCEND (an if arm one-sidedly
+  // holding v, or a one-case switch) rather than wrap at the top -- i.e.
+  // whether the bind lands somewhere a plain wrap would not put it.
+  bool lower_bind_descends(const Ident& v, const LamPtr& lam) {
+    if (lam->k == Lam::K::IfThenElse) {
+      bool pc = approx_present(v, lam->cond);
+      bool ps = approx_present(v, lam->then_);
+      bool pn = approx_present(v, lam->else_);
+      return !pc && ps != pn;
+    }
+    if (lam->k == Lam::K::Switch && !approx_present(v, lam->cond))
+      return (lam->sw_consts.size() == 1 && lam->sw_blocks.empty()) ||
+             (lam->sw_consts.empty() && lam->sw_blocks.size() == 1);
+    return false;
   }
   // matching.ml's lower_bind: sink an Alias bind toward its single branch of
   // use -- past other alias lets, into the used arm of an if, into a
