@@ -222,6 +222,9 @@ struct Bytegen {
     std::stable_sort(r.begin(), r.end(), [](const Ident& a, const Ident& b) {
       if (a.scoped != b.scoped) return a.scoped;  // Scoped first
       if (a.late != b.late) return !a.late;       // source locals before late temps
+      int ao = a.fv_order ? a.fv_order : a.stamp;  // an adopted slot, or ours
+      int bo = b.fv_order ? b.fv_order : b.stamp;
+      if (ao != bo) return ao < bo;
       return a.stamp < b.stamp;
     });
   }

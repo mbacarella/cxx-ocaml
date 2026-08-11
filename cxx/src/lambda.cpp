@@ -896,6 +896,10 @@ struct Translator {
   // handlers re-read their argument expressions; only or-bound vars ride the
   // exit).
   std::unordered_map<int, LamPtr> gm_facc_proto_;
+  // Every arm's bound variables as (name, binder), keyed by the arm's exit id.
+  // Filled by setup_garm; read by arm_cvar for upstream's name_pattern.
+  std::unordered_map<int, std::vector<std::pair<std::string, Ident>>>
+      gm_arm_cvars_;
   // Arm exit-ids already wrapped in a pending or-handler catch (gm_orp) during
   // the CURRENT body build.  Guards against wrapping the same arm twice when a
   // duplicated row's or-column expands in two subtrees (we duplicate var-spread
@@ -2589,6 +2593,9 @@ struct Translator {
   const bool no_if_freeze_ = std::getenv("NOIFFREEZE") != nullptr;
   // NOOCGADT restores the oc port's blanket bail on a GADT tuple column.
   const bool no_oc_gadt_ = std::getenv("NOOCGADT") != nullptr;
+  // NONAMEPAT mints a fresh binder for a materialized column even when the
+  // first row heads it with a var/alias (the pre-name_pattern behaviour).
+  const bool no_name_pat_ = std::getenv("NONAMEPAT") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -13301,9 +13308,22 @@ struct Translator {
     }
     if (!comps.empty() && comps[0] && comps[0]->gm_facc) {
       LamPtr proto = comps[0];
-      // Upstream's name_pattern: the binding takes the first var/alias row's
-      // name (purely cosmetic -- stamps are normalized everywhere it matters).
+      // Upstream's name_pattern (matching.ml) does NOT create an ident when the
+      // first row's head is a var or alias -- it RETURNS that row's own binder,
+      // and only falls back to Ident.create_local for a headless column.  The
+      // difference is not cosmetic: a closure's free variables are laid out by
+      // Ident.compare, i.e. by STAMP, so a freshly minted binder sorts after
+      // every source binder of the match and swaps the closure's env slots.
+      // parmatch's `specialize_and_exhaust` captures both `default` (the shared
+      // column, materialized here) and `constrs` in try_omega; minting
+      // `default` fresh put it last, where upstream, holding row 0's binder,
+      // has it first.  We keep our own ident -- it also carries this level's
+      // exit wiring, and adopting the arm binder outright makes wire_garms drop
+      // the exit argument (typedecl's `loc` handler param) -- and record only
+      // the layout position.
+      // NONAMEPAT reverts to the plain fresh ident.
       std::string nm;
+      const Ident* named = nullptr;
       for (auto& r : rows) {
         if (r.cols.empty()) break;
         const Pattern* p = r.cols[0];
@@ -13312,10 +13332,14 @@ struct Translator {
           if (ep != p) { p = ep; continue; }
           break;
         }
-        if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) { nm = pa->name.txt; break; }
-        if (auto* pv = std::get_if<Ppat_var>(&p->desc)) { nm = pv->name.txt; break; }
+        if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) nm = pa->name.txt;
+        else if (auto* pv = std::get_if<Ppat_var>(&p->desc)) nm = pv->name.txt;
+        else continue;
+        named = arm_cvar(r.aid, nm);
+        break;
       }
       Ident v = fresh(nm, nm.empty());
+      if (named && !no_name_pat_) v.fv_order = named->stamp;
       if (cppcaml::dbg_env("GMFA"))
         fprintf(stderr, "[GMFA] materialize v=%s/%d rows=%zu col0=%d\n",
                 v.name.c_str(), v.stamp, rows.size(),
@@ -16248,7 +16272,20 @@ struct Translator {
       if (auto wit = iwv.find(a.vnames[k]); wit != iwv.end())
         inline_rec_var_[a.cvars.back().stamp] = wit->second;
     }
+    // Keep the arm's binders reachable by (aid, name) so a column
+    // materialization can adopt the one upstream's name_pattern would have
+    // taken -- see the fresh() call in gmatch.  Copied, not pointed at: the
+    // GArm vector is a local of the driver and dies before the next match.
+    for (size_t k = 0; k < a.vnames.size(); ++k)
+      gm_arm_cvars_[a.aid].emplace_back(a.vnames[k], a.cvars[k]);
     return a;
+  }
+  // The arm binder named `nm` in the arm whose exit id is `aid`, or nullptr.
+  const Ident* arm_cvar(int aid, const std::string& nm) const {
+    auto it = gm_arm_cvars_.find(aid);
+    if (it == gm_arm_cvars_.end()) return nullptr;
+    for (auto& [n, id] : it->second) if (n == nm) return &id;
+    return nullptr;
   }
   // An immutable field-read chain over a single root variable, as an exit
   // argument: `(field_imm k (field_int j v))`.  The root ident, or nullptr when

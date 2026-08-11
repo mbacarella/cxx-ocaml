@@ -86,6 +86,13 @@ struct Ident {
   // captured one sorts after the source locals in a closure's free-var layout,
   // matching ocamlc's source-before-translation-temp stamp order.
   bool late = false;
+  // Where this binder sits in a closure's free-var layout, when that is NOT its
+  // own stamp.  ocamlc's matcher does not always mint the binder it uses for a
+  // materialized match column: name_pattern hands back the first row's own
+  // variable, whose stamp was allocated with the source binders.  We keep a
+  // distinct ident (ours also carries the arm's exit wiring) and record only
+  // the layout position here.  0 = sort by stamp, as everything else does.
+  int fv_order = 0;
 };
 
 // Lambda primitives we emit so far (printlambda spelling in the comment).
