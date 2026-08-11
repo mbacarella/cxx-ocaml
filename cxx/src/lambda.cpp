@@ -2587,6 +2587,8 @@ struct Translator {
   // NOIFFREEZE reverts mark_fail_tests (the equal-arm judgement is then taken
   // on the post-inlining tree, as it was before).
   const bool no_if_freeze_ = std::getenv("NOIFFREEZE") != nullptr;
+  // NOOCGADT restores the oc port's blanket bail on a GADT tuple column.
+  const bool no_oc_gadt_ = std::getenv("NOOCGADT") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -18803,7 +18805,21 @@ struct Translator {
             for (auto& [nm, info] : module_type_ctors(mod, type))
               (info.is_block ? nb2 : nc2)++;
             if (nc2 + nb2 > 0) {
-              if (mod_gadt_types_[mod].count(type)) return nullptr;  // GADT: bail
+              // A GADT column is fine here: the counts feed the tag universe,
+              // and a cmi declares every constructor of the type whatever its
+              // result index -- so the worst an index refinement can do is
+              // leave us counting a tag no value can carry, which costs a
+              // default arm, never a wrong one.  (An UNDER-count would be the
+              // dangerous direction and cannot happen.)  The tag consistency
+              // loop below still re-resolves each ctor and bails on a tag out
+              // of range.  Typedtree's `'k pattern_desc` is the shape --
+              // parmatch's `compat` matches `p.pat_desc, q.pat_desc` and was
+              // falling out of this port onto gmatch, whose grouping pulled
+              // `Tpat_any`/`Tpat_var` out of the row-level or and into the
+              // Tpat_construct-pair switch that upstream builds without them.
+              // NOOCGADT reverts.
+              if (no_oc_gadt_ && mod_gadt_types_[mod].count(type))
+                return nullptr;
               NC = nc2; NB = nb2;
             }
           }
