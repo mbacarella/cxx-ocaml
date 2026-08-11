@@ -11918,14 +11918,15 @@ struct Translator {
     std::string ka = make_lam_key_scoped(a);
     return !ka.empty() && ka == make_lam_key_scoped(b);
   }
+  // NOPURE3 keeps a block-free three-run dispatch a flat switch (see below).
+  const bool no_pure3_ = std::getenv("NOPURE3") != nullptr;
   // An exhaustive constant dispatch (tags 0..N-1, each with a body) whose tags
   // collapse into exactly TWO contiguous runs of a shared action (`0|1|2 -> A |
   // 3|4 -> B`) is lowered by ocamlc's call_switcher to a SINGLE range test
   // (BGTINT/BLTINT), not a flat Lswitch.  Emit that via the ported Switcher
-  // machinery.  A three-run `a|b|a` (lone middle value) on an isint-split const
-  // side (`has_block`) is the one further shape ocamlc collapses that we track
-  // without churn; every other multi-cluster shape is left to the flat switch
-  // (ocamlc's shape there differs subtly and churns -- see const_ctor_switcher).
+  // machinery.  Three runs (`a|b|a`) collapse the same way, to a single `!= v`;
+  // every other multi-cluster shape is left to the flat switch (ocamlc's shape
+  // there differs subtly and churns -- see const_ctor_switcher).
   LamPtr two_run_switcher(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts,
                           bool has_block) {
     if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
@@ -11947,16 +11948,19 @@ struct Translator {
       i = j + 1;
     }
     if (cases.size() < 2) return nullptr;
-    // Two runs (`A|A -> a | B -> b`) is the proven-safe shape.  The only >2-run
-    // case ocamlc collapses that we can reproduce without churn is is_unboxed's
-    // exact `a|b|a` (three runs, two distinct actions, lone middle -> a single
-    // `!= v` test), and only as the const side of an isint SPLIT (the variant has
-    // a block constructor too), where our matcher's decision agrees with ocamlc's.
-    // A four-run [X,Y,X,Y] or a pure-constant (block-free) `a|b|a` sits in a nested
-    // sub-match whose column nesting already diverges from ocamlc's (simplif), so
-    // reshaping it only churns -- keep those a flat switch.
+    // Two runs (`A|A -> a | B -> b`) is the proven-safe shape.  A three-run
+    // `a|b|a` (lone middle -> a single `!= v` test) is ocamlc's shape too,
+    // whether or not the variant also has block constructors: it is what a row
+    // whose column carries an or-pattern (`(Strict | StrictOpt)`) plus a later
+    // catch-all row produces, since upstream tests only the ODD tag out and
+    // sends the rest to one shared residual.  That was declined for the
+    // block-free case while our two copies of the shared residual still keyed
+    // apart (see Lam::sw_srcid) -- with them keying alike the shape is reached.
+    // A four-run [X,Y,X,Y] still sits in a nested sub-match whose column
+    // nesting diverges from ocamlc's, so reshaping it churns: keep it flat.
+    // NOPURE3 restores the block-free decline.
     if (cases.size() > 3) return nullptr;
-    if (cases.size() == 3 && !has_block) return nullptr;
+    if (cases.size() == 3 && !has_block && no_pure3_) return nullptr;
     sw_ok_inter_ = true;                            // tags are small (0..n-1)
     sw_memo_.clear();
     std::vector<int> k; comp_clusters(cases, k);
@@ -16013,6 +16017,12 @@ struct Translator {
     }
     // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
     LamPtr result;
+    // upstream's `ploc = head_loc ph` (matching.ml:3921) -- the switch is keyed
+    // by the head pattern it discriminates, not by node identity, so the copies
+    // our matcher makes of one sub-matrix key alike (see Lam::sw_srcid).
+    uintptr_t srcid = 0;
+    if (!rows.empty() && !rows[0].cols.empty())
+      srcid = reinterpret_cast<uintptr_t>(effective_pat(rows[0].cols[0]));
     // Two block bodies are the same action when pointer-equal, or structurally
     // equal with internal catch ids canonical and FREE exit targets literal
     // (see same_action_lam: exit-blind keys merge leaves dispatching to
@@ -16078,7 +16088,7 @@ struct Translator {
         i->cond = isint; i->then_ = const_side(); i->else_ = blocks[0].body;
         result = i;
       } else {
-        auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
+        auto sw = mk(Lam::K::Switch); sw->cond = comps[0]; sw->sw_srcid = srcid;
         sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks);
         sw->sw_numconsts = NC; sw->sw_numblocks = NB;
         result = sw;
@@ -16102,7 +16112,7 @@ struct Translator {
       // bodies are still `(exit aid)` arm placeholders, so keying them here
       // could never share alpha-equal arms the way upstream's combine (which
       // sees compiled bodies) does.
-      auto sw = mk(Lam::K::Switch); sw->cond = comps[0];
+      auto sw = mk(Lam::K::Switch); sw->cond = comps[0]; sw->sw_srcid = srcid;
       sw->sw_consts = std::move(consts); sw->sw_blocks = std::move(blocks);
       result = sw;
     } else if (NB == 1 && NC == 0) {

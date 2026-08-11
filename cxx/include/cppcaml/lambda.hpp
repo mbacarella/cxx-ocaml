@@ -179,6 +179,13 @@ struct Lam {
   std::vector<SwitchCase> sw_consts, sw_blocks;
   LamPtr sw_default;
   int sw_numconsts = -1, sw_numblocks = -1;
+  // The source term this switch was built from -- Lambda.make_key keeps an
+  // Lswitch's loc (see make_lam_key_rec), so switch identity is SOURCE
+  // identity, not node identity.  Our matcher can compile one sub-matrix more
+  // than once (upstream compiles it once and shares), and those copies must
+  // key alike.  Set from the head pattern the switch discriminates; 0 = unset,
+  // and then the node address stands in, as before.
+  uintptr_t sw_srcid = 0;
 
   // Catch (Lstaticcatch): protected body in `cond`, handler in `then_`, static
   // exception id in `prim_arg`, handler-bound vars in `catch_vars` (with their
@@ -319,6 +326,8 @@ struct Lam {
 // Resolved once: both gates are read per Let / per Switch node.
 inline const bool kNoKeyAlpha = cppcaml::dbg_env("NOKEYALPHA") != nullptr;
 inline const bool kNoKeySwId = cppcaml::dbg_env("NOKEYSWID") != nullptr;
+// NOSWSRCID keys a switch by node identity even when its source term is known.
+inline const bool kNoSwSrcId = cppcaml::dbg_env("NOSWSRCID") != nullptr;
 inline std::string make_lam_key_rec(const LamPtr& l, bool exit_aware, int& budget,
                                     std::map<int, int>& vmap, int& nv) {
   if (!l) return "_";
@@ -386,10 +395,14 @@ inline std::string make_lam_key_rec(const LamPtr& l, bool exit_aware, int& budge
   if (r.empty()) return "";
   // make_key normalizes every location EXCEPT Lswitch's (lambda.ml:480), so two
   // switches built from different source terms never key equal however alike
-  // they look.  Node identity is this port's analog -- and it is what still
-  // separates two arms once the binder stamps above stop separating them.
-  if (l->k == K::Switch && !kNoKeySwId)
-    r += ":@" + std::to_string(reinterpret_cast<uintptr_t>(l.get()));
+  // they look.  The source term (sw_srcid) is this port's analog of that loc;
+  // where the producer did not record one, node identity stands in -- and it is
+  // what still separates two arms once the binder stamps stop separating them.
+  if (l->k == K::Switch && !kNoKeySwId) {
+    uintptr_t sid = l->sw_srcid && !kNoSwSrcId
+                      ? l->sw_srcid : reinterpret_cast<uintptr_t>(l.get());
+    r += ":@" + std::to_string(sid);
+  }
   return r + ")";
 }
 inline std::string make_lam_key(const LamPtr& l, bool exit_aware = false) {
@@ -483,8 +496,11 @@ inline std::string make_lam_key_scoped_rec(const LamPtr& l,
   for (auto& sc : l->sw_consts) { if (!r.empty()) r += " C" + std::to_string(sc.tag); add(sc.body); }
   for (auto& sc : l->sw_blocks) { if (!r.empty()) r += " B" + std::to_string(sc.tag); add(sc.body); }
   if (r.empty()) return "";
-  if (l->k == K::Switch && !kNoKeySwId)   // see make_lam_key_rec
-    r += ":@" + std::to_string(reinterpret_cast<uintptr_t>(l.get()));
+  if (l->k == K::Switch && !kNoKeySwId) {  // see make_lam_key_rec
+    uintptr_t sid = l->sw_srcid && !kNoSwSrcId
+                      ? l->sw_srcid : reinterpret_cast<uintptr_t>(l.get());
+    r += ":@" + std::to_string(sid);
+  }
   return r + ")";
 }
 inline std::string make_lam_key_scoped(const LamPtr& l) {
