@@ -8942,6 +8942,35 @@ struct Translator {
     if (!l) return;
     if (l->k == Lam::K::Staticraise && l->prim_arg == id) {
       LamPtr res = handler;
+      // bind_check (matching.ml:3591) sends an Alias bind of a NON-VAR argument
+      // to lower_bind, which lowers it into the one branch that reads it -- so
+      // a pattern var whose arm opens with a test transparent to it is bound
+      // inside that arm, not above the test (`| X lf -> if !opt then <lf..>`).
+      // Wrapped DESCENDING, as in the guarded single-use path below: each sink
+      // walks past the alias lets already placed, so the first var still ends
+      // up innermost, the order the ascending plain wrap gives.
+      //   Only with a sinkable arg present.  With none the descending walk is a
+      // pure order flip -- every arg takes the plain branch and the first ends
+      // up OUTERMOST -- which reverses a group of constant optional-defaults
+      // (predef's `*opt*;*opt*;param`) and a diffing.cmo exit-arg trio.
+      bool sink = false;
+      if (!cppcaml::dbg_env("NOLOWEREXIT") && l->args.size() == vars.size())
+        for (auto& a : l->args)
+          if (a->k != Lam::K::Var && is_alias_dup(a)) { sink = true; break; }
+      if (sink) {
+        for (size_t i = vars.size(); i-- > 0; ) {
+          ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
+          bool dup = is_alias_dup(l->args[i]);
+          if (dup && l->args[i]->k != Lam::K::Var) {
+            res = lower_bind(vars[i], k, l->args[i], res);
+            continue;
+          }
+          auto let = mk(Lam::K::Let);
+          let->bindings = {{vars[i], k, l->args[i], dup}};
+          let->body = res; res = let;
+        }
+        l = res; return;
+      }
       if (l->args.size() == vars.size())
         for (size_t i = 0; i < vars.size(); ++i) {
           auto let = mk(Lam::K::Let);
