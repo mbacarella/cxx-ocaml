@@ -391,6 +391,12 @@ struct Checker {
   // for resolving a WRITTEN module name to its registration prefix,
   // innermost-outward from the use site's own nesting.
   std::set<std::string> local_module_prefixes_;
+  // The variant ctors a FUNCTOR body declares, by the functor's registration
+  // path ("<Enclosing.>F").  Its types are registered unprefixed, so this is
+  // the only handle on them for a `module I = F(X)` result; see
+  // applied_functor_ctor_scheme.  Non-strict passes only, like the registration.
+  std::unordered_map<std::string, std::vector<std::pair<std::string, TypePtr>>>
+      functor_body_ctors_;
   // The module-body nesting process_item is currently inside ("A.B." form).
   // Pending disambig records capture it, because the deferred walk runs at the
   // fixpoint, long after the item's scope is gone.
@@ -4631,10 +4637,10 @@ struct Checker {
   // exactly ONE of the module's own types declares is answered -- the per-type
   // tables are name-keyed, so intra-module shadowing order is unrecoverable,
   // and a tie keeps today's behavior, as open_local_module_ctors does.
-  // Answers for a module whose own STRUCTURE was registered under a path.  A
-  // plain-module alias (`module I = M`) and a functor-application result
-  // (`module I = F(X)`) are not registered that way and still take the flat
-  // hit -- the same live bug, left open (battery s263 x5).
+  // The qualifier may also be a plain-module ALIAS of a local module (`module
+  // I = M`), which local_module_paths_ records -- the expression side already
+  // chases it in local_module_ctor_scheme, and the pattern side must agree or
+  // the two ends of the same ctor disagree on its tag.
   TypePtr local_qualified_ctor_scheme(const Longident& id) {
     static const bool off = std::getenv("NOLOCALQCTOR") != nullptr;
     if (off) return nullptr;
@@ -4642,12 +4648,19 @@ struct Checker {
     if (!d) return nullptr;
     std::vector<std::string> comps = mod_components(*d->prefix);
     if (comps.empty()) return nullptr;
+    static const bool no_alias = std::getenv("NOALIASQCTOR") != nullptr;
+    if (!no_alias)
+      if (auto f = local_module_paths_.find(comps[0]);
+          f != local_module_paths_.end() && !f->second.empty() &&
+          f->second.find('(') == std::string::npos)  // not a functor app
+        comps[0] = f->second;
     // The written qualifier resolves against the module being processed, so a
     // `Defs.C` cited inside module M means M.Defs when M declares one.
     std::string pfx = resolve_written_module(comps[0]);
     for (size_t i = 1; i < comps.size(); ++i) pfx += "." + comps[i];
     pfx += ".";
-    if (!local_module_prefixes_.count(pfx)) return nullptr;
+    if (!local_module_prefixes_.count(pfx))
+      return applied_functor_ctor_scheme(comps, d->name);
     TypePtr found = nullptr;
     int hits = 0;
     for (auto& [k, cs] : type_ctor_schemes_) {
@@ -4658,6 +4671,60 @@ struct Checker {
     }
     return hits == 1 ? eng.instantiate(found) : nullptr;
   }
+
+  // `I.C` where `module I = F(X)` applies a functor THIS FILE declares: F's
+  // body types are registered with NO prefix (the body names them unqualified),
+  // so there is no path to scan and the cmi walk has nothing to load --
+  // functor_body_ctors_ keeps the body's own ctors under F's registration path.
+  // Null unless the qualifier is exactly such a binding and exactly ONE of the
+  // body's types declares the name; an application of a CMI functor
+  // (`Diffing.Define(Defs)`) is not registered here and falls through as before.
+  TypePtr applied_functor_ctor_scheme(const std::vector<std::string>& comps,
+                                      const std::string& cn) {
+    static const bool off = std::getenv("NOAPPQCTOR") != nullptr;
+    if (off || comps.empty() || functor_body_ctors_.empty()) return nullptr;
+    std::string written;
+    for (auto& c : comps) { if (!written.empty()) written += '.'; written += c; }
+    // Both the binding (`module Ha = F(..)` inside Host) and the functor are
+    // written from the use site's nesting, like any module name -- hence the
+    // two innermost-outward walks.  functor_app_args_ is the QUALIFIED-keyed
+    // application map ("Host.Ha"); its bare twin cannot tell two same-named
+    // bindings in different modules apart.
+    const std::string* fpath = nullptr;
+    for (std::string sc = proc_mod_prefix_;;) {
+      auto f = functor_app_args_.find(sc + written);
+      if (f != functor_app_args_.end()) { fpath = &f->second.first; break; }
+      if (sc.empty()) break;
+      auto p2 = sc.rfind('.', sc.size() - 2);
+      sc = p2 == std::string::npos ? "" : sc.substr(0, p2 + 1);
+    }
+    if (!fpath || fpath->empty()) return nullptr;
+    const std::vector<std::pair<std::string, TypePtr>>* body = nullptr;
+    for (std::string sc = proc_mod_prefix_; !body;) {
+      auto f = functor_body_ctors_.find(sc + *fpath);
+      if (f != functor_body_ctors_.end()) { body = &f->second; break; }
+      if (sc.empty()) return nullptr;
+      auto p2 = sc.rfind('.', sc.size() - 2);
+      sc = p2 == std::string::npos ? "" : sc.substr(0, p2 + 1);
+    }
+    TypePtr found = nullptr;
+    int hits = 0;
+    for (auto& [n, s] : *body)
+      if (n == cn) { found = s; ++hits; }
+    return hits == 1 ? eng.instantiate(found) : nullptr;
+  }
+
+  // The same test, for the pattern recorder that must mark such a cite so its
+  // DOTLESS type path still reaches the back end (see vk.pat_constr).  One
+  // predicate, so recorder and resolver cannot disagree.
+  bool is_applied_functor_ctor(const Longident& id) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return false;
+    return applied_functor_ctor_scheme(mod_components(*d->prefix), d->name) !=
+           nullptr;
+  }
+  // Constructor PATTERNS resolved that way (see is_applied_functor_ctor).
+  std::set<const Pattern*> functor_app_qualified_pat_;
 
   // Full scheme of a qualified constructor `M.C` (arg1->..->result), so an
   // application `Either.Left "s"` pins the parameter (`(string, 'b) Either.t`),
@@ -7738,6 +7805,8 @@ struct Checker {
         // The qualified ctor's scheme pins the pattern: `Either.Left s` binds
         // s:'a and types the scrutinee `('a, 'b) Either.t`.
         if (TypePtr scheme = qualified_ctor_scheme(k->id.txt)) {
+          if (is_applied_functor_ctor(k->id.txt))
+            functor_app_qualified_pat_.insert(&p);
           TypePtr result;
           auto ps = ctor_params(scheme, result);
           if (k->arg) {
@@ -11650,10 +11719,31 @@ struct Checker {
 // non-strict pass, shadow the correct through-the-application resolution
 // (msg.ml's `C : D.t tag` must stay abstract in the body but resolve to
 // `string tag` through `Define(struct type t = string ..)`).
-static void register_functor_body_types(Checker& ck, const ast::Structure& s) {
+// `out`, when given, also collects the ctors the body's OWN types declare (the
+// body is registered unprefixed, so a `module I = F(X)` result has no path to
+// scan; see Checker::applied_functor_ctor_scheme).  Ctors of a module nested in
+// the body are left out -- `I.C` names the body's own, and `I.Sub.C` would need
+// the nesting the flat registration threw away.
+static void register_functor_body_types(
+    Checker& ck, const ast::Structure& s,
+    std::vector<std::pair<std::string, I::TypePtr>>* out = nullptr) {
   for (auto& it : s) {
     if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
-      for (auto& d : ty->decls) ck.register_type_decl(d);
+      for (auto& d : ty->decls) {
+        // find, never operator[]: an empty entry for a non-variant type would
+        // be visible to every `type_ctor_schemes_.count(..)` test elsewhere.
+        const std::string key = out ? ck.mod_prefix_ + d.name.txt : std::string();
+        size_t before = 0;
+        if (out)
+          if (auto f = ck.type_ctor_schemes_.find(key);
+              f != ck.type_ctor_schemes_.end())
+            before = f->second.size();
+        ck.register_type_decl(d);
+        if (out)
+          if (auto f = ck.type_ctor_schemes_.find(key);
+              f != ck.type_ctor_schemes_.end())
+            out->insert(out->end(), f->second.begin() + before, f->second.end());
+      }
       for (auto& d : ty->decls) ck.register_record_decl(d);
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       const ModuleExpr* me = &mb->binding.expr;
@@ -11716,8 +11806,17 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
         const ModuleExpr* b = me;
         while (auto* mf = std::get_if<Pmod_functor>(&b->desc)) b = mf->body.get();
         while (auto* mc = std::get_if<Pmod_constraint>(&b->desc)) b = mc->me.get();
-        if (auto* fs = std::get_if<Pmod_structure>(&b->desc))
-          register_functor_body_types(ck, fs->items);
+        if (auto* fs = std::get_if<Pmod_structure>(&b->desc)) {
+          // Also keep the body's own ctors under this functor's path, so a
+          // `module I = F(X)` result can answer `I.C` (which the unprefixed
+          // registration alone leaves to the flat -- possibly wrong -- hit).
+          std::vector<std::pair<std::string, I::TypePtr>> own;
+          register_functor_body_types(ck, fs->items,
+                                      mb->binding.name.txt ? &own : nullptr);
+          if (mb->binding.name.txt && !own.empty())
+            ck.functor_body_ctors_[ck.mod_prefix_ + *mb->binding.name.txt] =
+                std::move(own);
+        }
       }
     } else if (auto* rm = std::get_if<Pstr_recmodule>(&it.desc)) {
       // `module rec Typ : sig .. end = struct type 'a typ = Int of .. end`:
@@ -11983,8 +12082,27 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
       // squats the flat map (tmc.ml's error handler `function Error (..) ->`
       // vs result's builtin Error -- matching by variant TAG misread foreign
       // exceptions and crashed every error report).
+      // A QUALIFIED cite whose type resolved to a DOTLESS path: `module I =
+      // F(X)` with F a local functor, whose body registers its types with NO
+      // prefix, so `I.One` is typed at a bare `t`.  Recording it lets the back
+      // end's dotless branch read that type's own table instead of the flat
+      // map, where a same-named top-level ctor squats the name.  Guarded by the
+      // SAME bare-name uniqueness test the construct side uses below: when two
+      // local types share the bare name the back end cannot tell them apart, and
+      // a pattern that took this route while its construct did not would read
+      // the value at a DIFFERENT tag -- a segfault, worse than the shared wrong
+      // tag.  Both ends decline together and keep the old flat behavior.
+      static const bool no_qlocal = std::getenv("NOQLOCALPATH") != nullptr;
+      auto bu = ck.bare_unique_stamp_.find(r->path);
+      bool qualified_local = !no_qlocal && r->kind == I::Type::Kind::Constr &&
+                             r->path.find('.') == std::string::npos &&
+                             std::holds_alternative<ast::Ldot>(pk->id.txt.v) &&
+                             ck.functor_app_qualified_pat_.count(p) &&
+                             bu != ck.bare_unique_stamp_.end() &&
+                             bu->second > 0 && bu->second == r->stamp;
       if (r->kind == I::Type::Kind::Constr &&
-          (r->path.find('.') != std::string::npos || r->path == "exn"))
+          (r->path.find('.') != std::string::npos || r->path == "exn" ||
+           qualified_local))
         vk.pat_constr[p] = owner_path(r->path, pk->id.txt);
     }
     // A polymorphic-variant pattern's unified row, when CLOSED: record the
