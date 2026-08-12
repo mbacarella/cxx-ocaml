@@ -7046,7 +7046,71 @@ struct Checker {
       auto d = s.rfind('.');
       return d == std::string::npos ? s : s.substr(d + 1);
     };
-    return lastc(found) != lastc(want);
+    if (lastc(found) != lastc(want)) return true;
+    // A DOTLESS `found` is a type this unit declares, and the last component
+    // alone does not make it `want`: diffing_with_keys declares its own
+    // `change` and matches a `Diffing.change` (spelled `type nonrec change =
+    // (..) Diffing.change`), so `two_cycles`' `Change|Insert|Delete` arms --
+    // all three names live in BOTH types -- kept the LOCAL tags 0/3/4 where
+    // Diffing's 3/1/0 were meant.  A live miscompile, not a fidelity gap.
+    // Only a PROVEN disagreement counts: both constructor lists must be
+    // known and differ, so an abbreviation or a second spelling of one type
+    // (the reason this comparison is lenient at all) still reads as equal.
+    static const bool no_ctor_list = std::getenv("NOCTORLIST") != nullptr;
+    if (no_ctor_list) return false;
+    std::vector<std::string> fc = type_ctor_names(found);
+    std::vector<std::string> wc = type_ctor_names(want);
+    return !fc.empty() && !wc.empty() && fc != wc;
+  }
+  // A type's constructor names in declaration order: this unit's own tables
+  // first (path-keyed, then bare), else the owning unit's cmi.  Empty when the
+  // path names no variant we can enumerate -- callers must treat that as
+  // "unknown", never as "no constructors".
+  std::vector<std::string> type_ctor_names(const std::string& path) {
+    std::vector<std::string> out;
+    auto ts = type_ctor_schemes_.find(path);
+    if (ts != type_ctor_schemes_.end()) {
+      for (auto& [n, s] : ts->second) out.push_back(n);
+      return out;
+    }
+    if (path.find('.') == std::string::npos) {
+      auto tc = type_ctors.find(path);
+      if (tc != type_ctors.end()) return tc->second;
+      return out;
+    }
+    // scrut_owns_ctor memoizes the cmi walk as a SET; the order matters here,
+    // so re-walk and keep the declared sequence.
+    std::vector<std::string> comps = mod_components_str(path);
+    if (comps.size() < 2) return out;
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+        std::string name = comps[i];
+        int applications = 0;
+        if (auto par = name.find('('); par != std::string::npos) {
+          for (char c : name) applications += c == '(';
+          name = name.substr(0, par);
+        }
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == name) { md = &mm; break; }
+        if (!md) return out;
+        cmi::ModuleTypePtr mt = md->type;
+        for (int a = 0; a < applications && mt; ++a)
+          mt = mt->kind == cmi::ModuleType::Functor ? mt->functor_body
+                                                    : nullptr;
+        sig = module_sig(mt, loaded);
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == comps.back()) {
+            if (td.kind == cmi::TypeDecl::Variant)
+              for (auto& c : td.ctors) out.push_back(c.name);
+            break;
+          }
+    } catch (...) { out.clear(); }
+    return out;
   }
   // The predefined type that declares `cn` -- "result" for Ok/Error, "option"
   // for None/Some, and so on -- or "" when the name is not predefined.  Read

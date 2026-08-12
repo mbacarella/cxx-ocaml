@@ -24719,6 +24719,21 @@ struct Translator {
                 auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = c.first;
                 pr->args = {e0, e1}; return pr;
               }
+              // An operand read as `field_int` IS the Immediate classification
+              // translprim asks for: specialize_primitive takes Compare_ints on
+              // `maybe_pointer_type env p1 = Immediate`, not just on `int`
+              // (translprim.ml:530).  The record label's declared kind resolves
+              // the field spelling even where the checker's per-expression kind
+              // gave up, so consult the lowered read (diffing_with_keys' `if
+              // x.pos = pos1`, on a `D.left with_pos` inside two functors, was
+              // still a polymorphic caml_equal).
+              static const bool no_imm_cmp = std::getenv("NOIMMCMP") != nullptr;
+              auto is_imm_read = [](const LamPtr& l) {
+                return l->k == Lam::K::Prim && l->prim == Prim::FieldInt;
+              };
+              if (!no_imm_cmp && k == ValueKind::Gen &&
+                  (is_imm_read(e0) || is_imm_read(e1)))
+                k = ValueKind::Int;
               auto pr = mk(Lam::K::Prim);
               if (k == ValueKind::Gen) { pr->prim = Prim::Ccall; pr->prim_id = c.second; }
               else {
