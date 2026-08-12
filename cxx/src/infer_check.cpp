@@ -4620,6 +4620,45 @@ struct Checker {
     return nullptr;
   }
 
+  // The scheme of `M.C` where M is a module THIS FILE declares.  There is no
+  // cmi to walk, so qualified_ctor_scheme's lookup throws and every caller
+  // keeps the FLAT bare-name hit -- which a same-named ctor elsewhere in the
+  // file can own.  `type top = One of int | Two of string` beside `module M =
+  // struct type t = Str of string | One of int end` made the pattern `M.One n`
+  // read top's One at tag 0: a live miscompile (Match_failure here, a wrong
+  // field read when the arities agree).  register_type_decl already keyed this
+  // module's ctor schemes by "<ModPath>.<type>"; consult those.  Only a name
+  // exactly ONE of the module's own types declares is answered -- the per-type
+  // tables are name-keyed, so intra-module shadowing order is unrecoverable,
+  // and a tie keeps today's behavior, as open_local_module_ctors does.
+  // Answers for a module whose own STRUCTURE was registered under a path.  A
+  // plain-module alias (`module I = M`) and a functor-application result
+  // (`module I = F(X)`) are not registered that way and still take the flat
+  // hit -- the same live bug, left open (battery s263 x5).
+  TypePtr local_qualified_ctor_scheme(const Longident& id) {
+    static const bool off = std::getenv("NOLOCALQCTOR") != nullptr;
+    if (off) return nullptr;
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return nullptr;
+    std::vector<std::string> comps = mod_components(*d->prefix);
+    if (comps.empty()) return nullptr;
+    // The written qualifier resolves against the module being processed, so a
+    // `Defs.C` cited inside module M means M.Defs when M declares one.
+    std::string pfx = resolve_written_module(comps[0]);
+    for (size_t i = 1; i < comps.size(); ++i) pfx += "." + comps[i];
+    pfx += ".";
+    if (!local_module_prefixes_.count(pfx)) return nullptr;
+    TypePtr found = nullptr;
+    int hits = 0;
+    for (auto& [k, cs] : type_ctor_schemes_) {
+      if (k.compare(0, pfx.size(), pfx) != 0) continue;
+      if (k.find('.', pfx.size()) != std::string::npos) continue;  // deeper module
+      for (auto& [cn, s] : cs)
+        if (cn == d->name) { found = s; ++hits; break; }
+    }
+    return hits == 1 ? eng.instantiate(found) : nullptr;
+  }
+
   // Full scheme of a qualified constructor `M.C` (arg1->..->result), so an
   // application `Either.Left "s"` pins the parameter (`(string, 'b) Either.t`),
   // not just the bare variant type.  Null when M.C isn't a loadable variant ctor.
@@ -4631,6 +4670,9 @@ struct Checker {
     if (auto pc = param_ctor_schemes_.find(lid_full(id));
         pc != param_ctor_schemes_.end())
       return pc->second;
+    // A module this file declares shadows any unit of the same name, so its
+    // own tables answer before the cmi walk below (which would throw anyway).
+    if (TypePtr lq = local_qualified_ctor_scheme(id)) return lq;
     auto comps = mod_components(*d->prefix);
     if (comps.empty()) return nullptr;
     // The head may be an OPENED submodule (`open Runtime_events` then
@@ -11618,6 +11660,22 @@ static void register_functor_body_types(Checker& ck, const ast::Structure& s) {
       while (auto* mc = std::get_if<Pmod_constraint>(&me->desc)) me = mc->me.get();
       if (auto* ms = std::get_if<Pmod_structure>(&me->desc))
         register_functor_body_types(ck, ms->items);
+      // A FUNCTOR nested inside this body -- reached both directly and through
+      // intervening plain modules.  Only the caller in register_types_rec
+      // stripped functor parameters, so a `module Outer(A) = struct module
+      // Inner(B) = struct type t = L of int .. end end` left the inner body's
+      // types unregistered: `L p` bound p at a fresh variable, kind_str read
+      // gen, and `p < q` stayed a polymorphic caml_lessthan where ocamlc has
+      // `<`.  Nothing here is new in kind -- a singly-nested functor's types
+      // are already registered, in the same non-strict passes only.
+      static const bool no_nest_fun = std::getenv("NONESTFUN") != nullptr;
+      if (!no_nest_fun && std::holds_alternative<Pmod_functor>(me->desc)) {
+        const ModuleExpr* b = me;
+        while (auto* mf = std::get_if<Pmod_functor>(&b->desc)) b = mf->body.get();
+        while (auto* mc = std::get_if<Pmod_constraint>(&b->desc)) b = mc->me.get();
+        if (auto* fs = std::get_if<Pmod_structure>(&b->desc))
+          register_functor_body_types(ck, fs->items);
+      }
     }
   }
 }
