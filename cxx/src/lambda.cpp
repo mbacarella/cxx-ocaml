@@ -14513,14 +14513,15 @@ struct Translator {
     for (auto& r : rows)
       if (std::get_if<Ppat_or>(&r.cols[0]->desc)) {
         std::vector<MRow> ex;
-        // (aid, gm_orp_rest, trampoline)
-        std::vector<std::tuple<int, bool, bool>> wrapped;
+        // (aid, gm_orp_rest, trampoline, pre-assigned forwarding exit or -1)
+        std::vector<std::tuple<int, bool, bool, int>> wrapped;
         for (auto& rr : rows) {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
+          int fwd = -1;
           if (alts.size() > 1 && rr.aid >= 0 && rr.vnames) {
             if (gm_orw_.insert({rr.aid, nullptr}).second) {
               wrapped.push_back({rr.aid, comps.size() >= 2 && !rr.row_or &&
-                                 pattern_binds(rr.cols[0]), false});
+                                 pattern_binds(rr.cols[0]), false, -1});
               auto& pv = gm_orp_pv_[rr.aid];
               pv.clear(); collect_gvars(rr.cols[0], pv);
             }
@@ -14550,16 +14551,54 @@ struct Translator {
                      gm_orw_.insert({rr.aid, rr.cols[0]}).second) {
               size_t naid = 0;
               for (auto& r2 : rows) if (r2.aid == rr.aid) ++naid;
-              if (naid == 1) wrapped.push_back({rr.aid, false, true});
+              if (naid == 1) wrapped.push_back({rr.aid, false, true, -1});
+              // The sole-row restriction exists only because the trampoline
+              // RENUMBERS every `exit aid` under the wrap.  With sibling rows
+              // sharing the arm (simplif's `enabled`: each arm is a top-level
+              // or whose second alternative carries this nested or in one
+              // record field), pre-assign the forwarding exit instead and
+              // point the exploded alternatives at it -- the siblings' direct
+              // raises never enter the catch.  Only for an argless arm
+              // (upstream's fresh handler would need `vars` on the catch) and
+              // a fully or-free remainder -- alternatives AND the row's other
+              // columns: a deeper or-row under the remapped aid would take the
+              // pending-wrap branch for an arm that does not exist (ctype's
+              // unify_row_field arity-mismatch arm), and an or in the rest
+              // belongs to upstream's handler pm, not the raising body.
+              // And only when some remaining column's scrutinee is a NON-VAR:
+              // the catch survives simplify_exits through the alias bind that
+              // scrutinee puts in the handler (`let *match* =a field ..` around
+              // the re-raise); an all-var rest gives the bare
+              // `Lstaticcatch (l1,(i,[]),Lstaticraise _)` that simplif.ml:306
+              // drops (ctype's mcomp, a tuple of let-bound application
+              // results).
+              else if (rr.vnames->empty() && !cppcaml::dbg_env("NOORFWD")) {
+                bool nested = false;
+                for (auto* a : alts)
+                  if (pattern_has_or(a)) { nested = true; break; }
+                for (size_t j = 1; !nested && j < rr.cols.size(); ++j)
+                  if (pattern_has_or(rr.cols[j])) nested = true;
+                bool bindrest = false;
+                for (size_t j = 1; !bindrest && j < comps.size(); ++j)
+                  if (comps[j]->k != Lam::K::Var) bindrest = true;
+                if (!nested && bindrest) {
+                  fwd = ++next_exit_;
+                  wrapped.push_back({rr.aid, false, true, fwd});
+                }
+              }
             }
           }
-          for (auto* a : alts) { MRow nr = rr; nr.cols[0] = effective_pat(a); ex.push_back(std::move(nr)); }
+          for (auto* a : alts) {
+            MRow nr = rr; nr.cols[0] = effective_pat(a);
+            if (fwd >= 0) nr.aid = fwd;
+            ex.push_back(std::move(nr));
+          }
         }
         std::string c0key = wrapped.empty()
             ? std::string() : cppcaml::lambda::make_lam_key(comps[0]);
         LamPtr sub = gmatch(std::move(comps), std::move(ex), mloc, deid, std::move(denv));
         if (!sub) return nullptr;
-        for (auto [aid, orest, tramp] : wrapped) {
+        for (auto [aid, orest, tramp, fwd] : wrapped) {
           // Upstream binds the or-column's OWN scrutinee before splitting, so
           // the catch sits inside that one materialized binding (typedecl's
           // `*match* = field_imm 2 val`) but outside everything else -- a
@@ -14573,6 +14612,18 @@ struct Translator {
               cppcaml::lambda::make_lam_key(l->bindings[0].val) == c0key)
             slot = &l->body;
           if (tramp) {
+            if (fwd >= 0) {
+              // Pre-assigned before the alternatives were exploded: the rows
+              // already raise `fwd`, so no renumbering -- sibling rows keep
+              // their direct arm raises.  All alternatives pruned -> no catch.
+              int bad = 0;
+              if (count_exit(*slot, fwd, false, bad) == 0) continue;
+              auto x = mk(Lam::K::Staticraise); x->prim_arg = aid;
+              auto c = mk(Lam::K::Catch);
+              c->prim_arg = fwd; c->cond = *slot; c->then_ = x;
+              *slot = c;
+              continue;
+            }
             // The trampoline handler binds nothing, so it can only re-raise an
             // ARGUMENT-FREE arm exit; an arm carrying pattern variables would
             // need upstream's `vars` on the fresh handler and is left alone.
@@ -21837,6 +21888,32 @@ struct Translator {
       for (auto& e : arr->elems) if (pattern_binds(e.get())) return true; return false;
     }
     if (auto* pz = std::get_if<Ppat_lazy>(&p->desc)) return pattern_binds(pz->p.get());
+    return false;
+  }
+  // Any or-node anywhere under the pattern.
+  bool pattern_has_or(const Pattern* p0) {
+    const Pattern* p = effective_pat(p0);
+    if (std::holds_alternative<Ppat_or>(p->desc)) return true;
+    if (auto* al = std::get_if<Ppat_alias>(&p->desc))
+      return pattern_has_or(al->p.get());
+    if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
+      for (auto& e : tu->elems) if (pattern_has_or(e.get())) return true;
+      return false;
+    }
+    if (auto* k = std::get_if<Ppat_construct>(&p->desc))
+      return k->arg && pattern_has_or(k->arg->get());
+    if (auto* pv = std::get_if<Ppat_variant>(&p->desc))
+      return pv->arg && pattern_has_or(pv->arg->get());
+    if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      for (auto& [l, s] : pr->fields) if (pattern_has_or(s.get())) return true;
+      return false;
+    }
+    if (auto* arr = std::get_if<Ppat_array>(&p->desc)) {
+      for (auto& e : arr->elems) if (pattern_has_or(e.get())) return true;
+      return false;
+    }
+    if (auto* pz = std::get_if<Ppat_lazy>(&p->desc))
+      return pattern_has_or(pz->p.get());
     return false;
   }
   // A choice of one child at each BINDING or-node, so a row with binding
