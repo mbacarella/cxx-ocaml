@@ -7709,6 +7709,15 @@ struct Translator {
   // The payload arity the pattern `k` destructures: the registered bare-name
   // arity when the ctor is local or opened, else the qualified module's cmi.
   int exn_pat_arity(const Ppat_construct* k) {
+    // A QUALIFIED cite asks the named module first: exn_arity_ is keyed by BARE
+    // name, and half the typing units declare an `Error.In_context` of their
+    // own, so typeclass.ml -- whose own is `of Location.t * Env.t * error` --
+    // measured `Env.Error.In_context` (arity 1) at THREE and destructured two
+    // fields past the end of the payload.  Same precedence as
+    // exn_ctor_identity, and for the same reason.
+    static const bool no_q = cppcaml::dbg_env("NOQEXNARITY");
+    if (!no_q && std::holds_alternative<Ldot>(k->id.txt.v))
+      if (int a = qualified_exn_arity(k->id.txt); a > 0) return a;
     if (auto a = exn_arity_.find(lid_last(k->id.txt)); a != exn_arity_.end())
       return a->second;
     if (int a = qualified_exn_arity(k->id.txt); a > 0) return a;
@@ -8302,10 +8311,31 @@ struct Translator {
           LamPtr then = exn_case_body(exn, k, lid_last(k->id.txt), *c.rhs, &ptests,
                                       &row_aliases, c.guard,
                                       c.guard ? failL() : nullptr, shared_body);
+          // A payload exn_case_body's field chain cannot destructure: hand it
+          // to the value matcher rather than dropping the row (see
+          // exn_payload_match).  Its failure joins the row's other failure
+          // points, so it needs the same shared exit a guard would.
+          bool pay_match = false;
+          if (!then && !c.guard && !shared_body && exn_payload_match_ok(k)) {
+            int fe = arm_fail, fresh_eid = 0;
+            if (fe < 0) { if (!eid) eid = fresh_eid = ++next_exit_; fe = eid; }
+            then = exn_payload_match(exn, k, *c.rhs, fe, &row_aliases, c.lhs->loc);
+            pay_match = then != nullptr;
+            // Give the exit id back if the match declined: an id burned here
+            // renumbers every later exit in the unit.
+            if (!then && fresh_eid && next_exit_ == fresh_eid) {
+              --next_exit_; eid = 0;
+            }
+          }
+          if (cppcaml::dbg_env("CTDBG"))
+            fprintf(stderr, "[CTDBG] exn-row %s then=%d guard=%d shared=%d pay=%d\n",
+                    lid_last(k->id.txt).c_str(), (int)(then != nullptr),
+                    (int)(c.guard != nullptr), (int)(shared_body != nullptr),
+                    (int)pay_match);
           if (!then) return exn_dispatch(exn, rows, i + 1);  // unsupported binder shape
           auto test = mk(Lam::K::Prim); test->prim = Prim::IntCmp; test->prim_id = "==";
           test->args = {lhs, id};
-          if (!ptests.empty() || c.guard) {
+          if (!ptests.empty() || c.guard || (pay_match && arm_fail < 0)) {
             // payload identity tests / a guard: the rest of the dispatch is
             // needed at each failure point, so share it behind a catch/exit
             if (!eid) eid = ++next_exit_;
@@ -8534,6 +8564,95 @@ struct Translator {
   // through, so both the value matcher and exn_case_body redirect to the exit
   // without threading a map through every value-dispatch path.
   std::map<const Expression*, int> shared_action_exit_;
+  // Synthesised rows for exn_payload_match, kept alive for the whole unit.
+  std::vector<PatBox> exn_syn_pats_;
+  std::vector<ExprBox> exn_syn_exprs_;
+  // Whether exn_payload_match can take this row -- checked BEFORE an exit id is
+  // allocated, since burning one would renumber every later exit in the unit.
+  bool exn_payload_match_ok(const Ppat_construct* k) {
+    static const bool off = cppcaml::dbg_env("NOEXNPMATCH");
+    if (off || !k->arg || exn_pat_arity(k) != 1) return false;
+    auto fps = ctor_field_pats(k, 1);
+    return fps.size() == 1 && fps[0] && !is_irrefutable(*effective_pat(fps[0]));
+  }
+  // An exception handler's payload compiled as a REAL value match.
+  // exn_case_body destructures the payload with an ad-hoc chain of field tests
+  // and knows only two constructor levels of it; anything deeper made it return
+  // null and the caller SKIP THE WHOLE ROW -- typeclass.ml's
+  //   Env.Error.In_context
+  //     (Lookup_error (_, _, Illegal_reference_to_recursive_module {..}))
+  // never ran, so a recursive-module class-type error escaped as an uncaught
+  // exception instead of being reported.  A live miscompile, not a fidelity
+  // gap, and the 46-instruction hole it left is most of typeclass.cmo's diff.
+  // ocamlc has no such limit: past the identity test the payload is an ordinary
+  // scrutinee handed to Matching, which is what this does -- a two-row match
+  // (the payload, then a catch-all exiting to the row's failure action), so the
+  // nested columns lower to the same `switch*`es upstream emits.  The catch-all's
+  // rhs is a synthetic node registered in shared_action_exit_, the documented
+  // choke through which an arm body becomes an (exit N).
+  LamPtr exn_payload_match(const Ident& exn, const Ppat_construct* k,
+                           const Expression& rhs, int fail_exit,
+                           const std::vector<std::string>* aliases,
+                           const Location& mloc) {
+    if (!exn_payload_match_ok(k) || fail_exit < 0) return nullptr;
+    const Pattern* pay = ctor_field_pats(k, 1)[0];
+    auto anyp = std::make_unique<Pattern>();
+    anyp->desc = Ppat_any{};
+    anyp->loc = pay->loc;
+    auto fake = std::make_unique<Expression>();
+    fake->desc = Pexp_unreachable{};
+    fake->loc = mloc;
+    const Pattern* anyptr = anyp.get();
+    const Expression* fakeptr = fake.get();
+    exn_syn_pats_.push_back(std::move(anyp));
+    exn_syn_exprs_.push_back(std::move(fake));
+    std::vector<Row> prows = {{pay, &rhs, nullptr}, {anyptr, fakeptr, nullptr}};
+    // The payload read is bound here, not left to the matcher: ocamlc's
+    // toplevel_handler hands Matching an already-bound argument, so the field
+    // read is an ALIAS binding (a pure read the arms may duplicate), where a
+    // matcher-materialised scrutinee is Strict.
+    Ident pv = fresh("", true);
+    scope.emplace_back();
+    if (aliases) for (auto& nm : *aliases) scope.back()[nm] = exn;
+    shared_action_exit_[fakeptr] = fail_exit;
+    LamPtr body = compile_match(varof(pv), prows, mloc);
+    shared_action_exit_.erase(fakeptr);
+    scope.pop_back();
+    if (!body) return nullptr;
+    // simplif.ml:306's alias rule: a catch whose handler is itself a bare exit
+    // is never emitted -- its uses simply become the target's.  compile_match
+    // parks the catch-all action behind exactly such a catch (both switch
+    // defaults reach it), and the whole-unit Simplif that would collapse it
+    // upstream has already run by the time this subtree is built.
+    while (body->k == Lam::K::Catch && body->catch_vars.empty() && body->then_ &&
+           body->then_->k == Lam::K::Staticraise && body->then_->args.empty()) {
+      int from = body->prim_arg, to = body->then_->prim_arg;
+      LamPtr inner = body->cond;
+      retarget_exit(inner, from, to);
+      body = inner;
+    }
+    auto let = mk(Lam::K::Let);
+    let->bindings = {{pv, ValueKind::Gen, fieldimm(1, varof(exn)), /*alias=*/true}};
+    let->body = body;
+    return let;
+  }
+  // Re-point every argless `(exit from)` in `l` at `to` (simplif's alias rule).
+  void retarget_exit(LamPtr& l, int from, int to) {
+    if (!l) return;
+    if (l->k == Lam::K::Staticraise && l->args.empty() && l->prim_arg == from) {
+      // A fresh node per site: these are shared pointers, and the same exit
+      // term can be cited from more than one place.
+      auto x = mk(Lam::K::Staticraise); x->prim_arg = to; l = x;
+      return;
+    }
+    retarget_exit(l->fn, from, to); retarget_exit(l->body, from, to);
+    retarget_exit(l->cond, from, to); retarget_exit(l->then_, from, to);
+    retarget_exit(l->else_, from, to); retarget_exit(l->sw_default, from, to);
+    for (auto& a : l->args) retarget_exit(a, from, to);
+    for (auto& b : l->bindings) retarget_exit(b.val, from, to);
+    for (auto& sc : l->sw_consts) retarget_exit(sc.body, from, to);
+    for (auto& sc : l->sw_blocks) retarget_exit(sc.body, from, to);
+  }
   LamPtr exn_case_body(const Ident& exn, const Ppat_construct* k, const std::string& name,
                        const Expression& rhs,
                        std::vector<PayloadTest>* tests = nullptr,
@@ -8676,11 +8795,27 @@ struct Translator {
               // the field always carries that sole tag, so ocamlc omits the
               // discrimination test and decomposes directly.  Emit the tag_test
               // only when the type has other constructors the value could be.
+              // Ask the ctor's OWN unit for the count when it has one:
+              // type_ctors_ is keyed by the bare type name, so a local
+              // single-ctor `type error` squats an imported `error` of three
+              // and the test is dropped -- then a CONSTANT ctor of the real
+              // type reaches the field read and dereferences an immediate.
+              static const bool no_us = cppcaml::dbg_env("NOUNITSOLE");
               bool sole = false;
-              if (auto tcx = type_ctors_.find(ci->second.type);
-                  tcx != type_ctors_.end() &&
-                  tcx->second.first == 0 && tcx->second.second == 1)
-                sole = true;
+              int nc = -1, nb = -1;
+              if (!no_us && !ci->second.unit.empty()) {
+                auto& tl = module_type_ctors(ci->second.unit, ci->second.type);
+                if (!tl.empty()) {
+                  nc = 0; nb = 0;
+                  for (auto& [nm, inf] : tl) (inf.is_block ? nb : nc)++;
+                }
+              }
+              if (nc < 0)
+                if (auto tcx = type_ctors_.find(ci->second.type);
+                    tcx != type_ctors_.end()) {
+                  nc = tcx->second.first; nb = tcx->second.second;
+                }
+              if (nc == 0 && nb == 1) sole = true;
               if (!sole)
                 tests->push_back({j + 1, cint(ci->second.tag), false,
                                   /*tag_test=*/true});
