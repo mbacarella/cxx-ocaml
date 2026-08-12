@@ -39,7 +39,6 @@ struct Result {
 inline Result match(const std::vector<Param>& params, const std::vector<Arg>& args) {
   Result r;
   std::vector<bool> used(args.size(), false);
-  int last_arg = -1;
   // OCaml fills a required labelled parameter POSITIONALLY (label omitted at the
   // call) only in a TOTAL application -- one supplying enough arguments to cover
   // every non-optional parameter.  In a PARTIAL application the positional args
@@ -101,10 +100,22 @@ inline Result match(const std::vector<Param>& params, const std::vector<Arg>& ar
     s.arg_index = found;
     s.some_wrap = p.label == 2 && fk == 1;
     r.slots.push_back(std::move(s));
-    last_arg = (int)r.slots.size() - 1;
   }
-  if (last_arg < 0) return r;          // nothing matched -> verbatim apply (ok=false)
-  r.slots.resize(last_arg + 1);        // drop trailing omitted (params beyond the call)
+  // Params beyond the call are dropped -- but a trailing NONE-FILLED optional
+  // is not "beyond the call": none_fill means a positional argument is still
+  // unplaced, and that argument forces the default even when the known param
+  // list stops here and it becomes an over-application of the result arrow.
+  // `let f ?(a=1) ?(b=2) ?(c=3) = g a b c in f ~a:9 "hi"` has the three
+  // optionals as the whole known param list, and ocamlc emits
+  // `apply f (Some 9) 0 0 "hi"`; dropping the fills applied "hi" as ?b
+  // (Location.errorf's Sys_error printer -- a live miscompile, not just a
+  // fidelity gap).  Keeping only matched slots would also bail the
+  // no-labelled-arg form (`f2 "ho"` on `?a ?b`) to a verbatim apply.
+  int last_keep = -1;
+  for (size_t i = 0; i < r.slots.size(); ++i)
+    if (!r.slots[i].omitted || r.slots[i].none_fill) last_keep = (int)i;
+  if (last_keep < 0) return r;         // nothing placed -> verbatim (ok=false)
+  r.slots.resize(last_keep + 1);
   bool has_omitted = false;
   for (const Slot& s : r.slots) if (s.omitted) has_omitted = true;
   size_t stray_labelled = 0;
