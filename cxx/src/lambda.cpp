@@ -10456,10 +10456,24 @@ struct Translator {
             r.binds.push_back({pv->name.txt, fid});
       }
       LamPtr inner = mm_cols(comps, std::move(brows), i + 1, mloc);
-      auto l = mk(Lam::K::Let);
-      l->bindings = {{fid, ValueKind::Gen, fieldimm(0, comps[i]), true}};
-      l->body = inner;
-      bbranch = l;
+      if (!inner) return nullptr;
+      // The payload is a COLUMN, not a wrapper: upstream prepends it to the arg
+      // list at this level, so arg_to_var binds it here and bind_check's
+      // lower_bind then walks the Alias let down past the lets the LATER
+      // columns already emitted -- which is what puts a constructor's own
+      // payload BELOW its siblings' reads.  Wrapping `inner` outright hoisted
+      // it above them (`let d, b, s, l` where ocamlc has `let b, s, d, l`).
+      // NOPAYLOWER reverts.
+      static const bool no_pay_lower = cppcaml::dbg_env("NOPAYLOWER");
+      LamPtr fa = fieldimm(0, comps[i]);
+      if (no_pay_lower) {
+        auto l = mk(Lam::K::Let);
+        l->bindings = {{fid, ValueKind::Gen, fa, true}};
+        l->body = inner;
+        bbranch = l;
+      } else {
+        bbranch = lower_bind(fid, ValueKind::Gen, fa, inner);
+      }
     } else {
       bbranch = mm_cols(comps, std::move(brows), i + 1, mloc);
     }
