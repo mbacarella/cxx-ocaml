@@ -24590,26 +24590,85 @@ struct Translator {
         return expr(ide);
       };
       // and-combined operand value (all operands evaluated in the outer scope).
-      LamPtr acc = expr(*lo->let_.exp);
-      for (auto& an : lo->ands) {
+      // Upstream's transl_letop binds every operand as a Strict `left`/`right`
+      // let (the left one wrapping the REST of the chain, so it stays live
+      // across the later and-applies); Simplif then substitutes only the lets
+      // whose RHS is syntactically an Lvar -- i.e. a bare-identifier operand
+      // inlines, an apply/constant/qualified operand keeps its let.
+      const bool no_lr = cppcaml::dbg_env("NOLETOPLR");
+      // Upstream criterion is syntactic: Simplif substitutes a let whose RHS
+      // is an Lvar.  A local value (param / let / match binder) is still a
+      // bare Var here (wrap_binders inlines binder accesses later); an
+      // open-resolved or qualified name is already a field read -- kept.
+      auto is_bare = [no_lr](const LamPtr& val) {
+        if (no_lr) return true;  // hook: revert to inlining every operand
+        return val->k == Lam::K::Var;
+      };
+      auto strict_let = [&](Ident id, LamPtr val, LamPtr body) {
+        auto lt = mk(Lam::K::Let);
+        lt->bindings = {{id, ValueKind::Gen, std::move(val)}};
+        lt->body = std::move(body);
+        return lt;
+      };
+      std::function<LamPtr(LamPtr, bool, size_t)> chain =
+          [&](LamPtr prev, bool prev_inline, size_t i) -> LamPtr {
+        if (i == lo->ands.size()) return prev;
+        auto& an = lo->ands[i];
+        Ident lid = fresh("left"), rid = fresh("right");
+        LamPtr rhs = expr(*an.exp);
+        bool rhs_inline = is_bare(rhs);
         auto ap = mk(Lam::K::Apply);
         ap->fn = resolve_op(an.op);
-        ap->args = {acc, expr(*an.exp)};
-        acc = ap;
-      }
+        LamPtr larg = prev_inline ? prev : varof(lid);
+        LamPtr rarg = rhs_inline ? rhs : varof(rid);
+        ap->args = {std::move(larg), std::move(rarg)};
+        LamPtr lam = rhs_inline ? std::move(ap)
+                                : strict_let(rid, std::move(rhs), std::move(ap));
+        LamPtr rest = chain(std::move(lam), no_lr, i + 1);
+        return prev_inline ? rest
+                           : strict_let(lid, std::move(prev), std::move(rest));
+      };
+      LamPtr acc0 = expr(*lo->let_.exp);
+      bool acc0_bare = is_bare(acc0);
+      LamPtr acc = chain(std::move(acc0), acc0_bare, 0);
       // fun <left-nested tuple pattern> -> body
       auto fn = mk(Lam::K::Function);
       Ident pid = fresh("param");
       fn->params.push_back({pid, ValueKind::Gen});
       scope.emplace_back();
       std::vector<std::pair<Ident, LamPtr>> binders;
+      // Upstream's Matching gives each nested pair of the left-nested tuple
+      // its own alias binding (`*match*`); Simplif keeps it only when >=2
+      // components read through it -- i.e. the next level's pattern binds AND
+      // something deeper binds too.  Single-read spines stay a field chain.
+      std::vector<std::pair<Ident, LamPtr>> spine;
       LamPtr cur = mk(Lam::K::Var); cur->var = pid;
       for (int i = (int)lo->ands.size() - 1; i >= 0; --i) {
         collect_binders(lo->ands[i].pat, fieldimm(1, cur), binders);
-        cur = fieldimm(0, cur);
+        LamPtr down = fieldimm(0, cur);
+        if (!no_lr && i > 0 && pattern_binds(&lo->ands[i - 1].pat)) {
+          bool deeper = pattern_binds(&lo->let_.pat);
+          for (int j = 0; j < i - 1 && !deeper; ++j)
+            deeper = pattern_binds(&lo->ands[j].pat);
+          if (deeper) {
+            Ident m = fresh("*match*");
+            spine.push_back({m, std::move(down)});
+            down = mk(Lam::K::Var);
+            down->var = m;
+          }
+        }
+        cur = std::move(down);
       }
       collect_binders(lo->let_.pat, cur, binders);
-      fn->body = wrap_binders(expr(*lo->body), binders);
+      LamPtr fbody = wrap_binders(expr(*lo->body), binders);
+      for (auto it = spine.rbegin(); it != spine.rend(); ++it) {
+        auto lt = mk(Lam::K::Let);
+        lt->bindings = {{it->first, ValueKind::Gen, std::move(it->second),
+                         /*alias=*/true}};
+        lt->body = std::move(fbody);
+        fbody = std::move(lt);
+      }
+      fn->body = std::move(fbody);
       scope.pop_back();
       auto call = mk(Lam::K::Apply);
       call->fn = resolve_op(lo->let_.op);
