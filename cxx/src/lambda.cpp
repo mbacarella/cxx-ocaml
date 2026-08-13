@@ -987,12 +987,17 @@ struct Translator {
   // when every tracked arrival carries the same fact, upstream's ctx prunes
   // the other groups -- no test, no failaction (associate_fields' cons/cons
   // branch reads `field 0 l'` with no `if l'`).
-  struct GmProof { int col; std::string type; bool blk; int tag; };
+  // sub: -1 = a fact about column `col` itself; j >= 0 = about FIELD j of that
+  // column's (separately proven) constructor payload -- one nesting level, the
+  // depth upstream's ctx keeps for the whole matched prefix.
+  struct GmProof { int col; std::string type; bool blk; int tag; int sub = -1; };
   std::map<int, int> gm_eid_arr_;                     // eid -> tracked arrivals
   std::map<int, std::vector<GmProof>> gm_eid_proofs_;   // eid -> intersection
   // Column cell -> proven head, registered only around a chunk handler's
   // compile (and transferred across the gm_facc materialization's cell swap).
-  std::map<const Lam*, GmProof> gm_proven_comp_;
+  // subs: payload-field facts, applied when the proven ctor is decomposed.
+  struct GmProven { GmProof self; std::vector<GmProof> subs; };
+  std::map<const Lam*, GmProven> gm_proven_comp_;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -13044,6 +13049,16 @@ struct Translator {
     return std::holds_alternative<Ppat_any>(p->desc) ||
            std::get_if<Ppat_var>(&p->desc) != nullptr;
   }
+  // A colmap value: >= 0 is one of the entry's original columns, -1 is
+  // anonymous, and <= -2 packs (original column, payload field index) for the
+  // one identified sub-level GmProof::sub can express.
+  static int enc_sub(int col, int j) {
+    return (col >= 1 << 24 || j >= 32) ? -1 : -2 - (col * 32 + j);
+  }
+  static bool dec_sub(int v, int& col, int& j) {
+    if (v > -2) return false;
+    int k = -2 - v; col = k / 32; j = k % 32; return true;
+  }
   // Per-entry row transform frame (specialize_matrix): peels aliases, expands
   // an or-pattern in column 0 into one row per alternative, applies `spec`
   // (return -1 unsupported / 0 row dropped / 1 row(s) appended), then the
@@ -13051,17 +13066,25 @@ struct Translator {
   template <class F>
   bool denv_map(std::vector<GmDef>& env, F spec, int payload = 0,
                 const GmProof* rec = nullptr) {
-    // Consuming column 0 rewrites the entry's column-identity vector
-    // (payload sub-columns are anonymous), and a ctor consumption of a
-    // still-identified column records a proof for the entry's handler.
+    // Consuming column 0 rewrites the entry's column-identity vector (a ctor
+    // consumption gives its payload sub-columns ONE level of identity via
+    // enc_sub; anything deeper is anonymous), and a ctor consumption of a
+    // still-identified column records a proof for the entry's handler -- for
+    // a payload sub-column, a `sub` fact against the original column.
     auto consume_col0 = [&](GmDef& ne) {
       if (ne.colmap.empty()) return;
       int oc = ne.colmap[0];
       std::vector<int> nc((size_t)payload, -1);
+      if (rec && oc >= 0 && !cppcaml::dbg_env("NOSUBPROOF"))
+        for (int j = 0; j < payload; ++j) nc[j] = enc_sub(oc, j);
       nc.insert(nc.end(), ne.colmap.begin() + 1, ne.colmap.end());
       ne.colmap = std::move(nc);
-      if (rec && oc >= 0)
-        ne.proofs.push_back({oc, rec->type, rec->blk, rec->tag});
+      if (rec) {
+        if (oc >= 0)
+          ne.proofs.push_back({oc, rec->type, rec->blk, rec->tag});
+        else if (int c = 0, j = 0; dec_sub(oc, c, j))
+          ne.proofs.push_back({c, rec->type, rec->blk, rec->tag, j});
+      }
     };
     std::vector<GmDef> out;
     for (auto& en : env) {
@@ -13460,11 +13483,25 @@ struct Translator {
             fprintf(stderr, "[GMPFAPP] eid=%d loc=%d comps=%s\n", eids[k],
                     mloc.start.lnum, ck2.c_str());
           }
+          std::set<int> selfed;
           for (auto& pf : pit->second)
-            if (pf.col >= 0 && pf.col < (int)comps.size()) {
-              gm_proven_comp_.insert_or_assign(comps[pf.col].get(), pf);
+            if (pf.sub < 0 && pf.col >= 0 && pf.col < (int)comps.size()) {
+              gm_proven_comp_.insert_or_assign(comps[pf.col].get(),
+                                               GmProven{pf, {}});
+              selfed.insert(pf.col);
               pf_here = true;
             }
+          // A payload-field fact is only usable under its column's own proof
+          // (without it, "field j" is not even a fixed offset), and only one
+          // registered THIS round -- an enclosing frame's entry for the same
+          // cell was proven by different arrivals.  SINGLE-row handlers only:
+          // with sibling rows the arrival crossed upstream's or-row pm
+          // boundary, whose ctx shifts lose the nested depth and keep the
+          // payload re-tests (s250's `_, (PU | PN (None, _))` battery pins).
+          if (cr.size() == 1)
+            for (auto& pf : pit->second)
+              if (pf.sub >= 0 && selfed.count(pf.col))
+                gm_proven_comp_[comps[pf.col].get()].subs.push_back(pf);
         }
       }
       // Which columns the handler pm descends past WITHOUT testing: those are
@@ -14211,8 +14248,9 @@ struct Translator {
           cur.erase(std::remove_if(cur.begin(), cur.end(),
                       [&](const GmProof& p) {
                         for (auto& q : f.proofs)
-                          if (q.col == p.col && q.blk == p.blk &&
-                              q.tag == p.tag && q.type == p.type)
+                          if (q.col == p.col && q.sub == p.sub &&
+                              q.blk == p.blk && q.tag == p.tag &&
+                              q.type == p.type)
                             return false;
                         return true;
                       }),
@@ -16144,6 +16182,16 @@ struct Translator {
     if (NC < 0) return GB("no-type_ctors", type);   // no flat entry and no cmi owner
     if (cppcaml::dbg_env("TMDBG"))
       fprintf(stderr, "[TM] gmatch col type=%s NC=%d NB=%d\n", type.c_str(), NC, NB);
+    // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
+    std::map<int, const CtorInfo*> const_ci, block_ci;   // tag -> a resolved ctor
+    bool has_var = false;
+    std::vector<std::pair<std::string, const CtorInfo*>> row_ci;  // name -> info
+    for (auto& r : rows)
+      if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
+        const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
+        (ci->is_block ? block_ci : const_ci)[ci->tag] = ci;
+        row_ci.push_back({ctor_of(*r.cols[0]), ci});
+      } else has_var = true;
     // The declared ctor at block tag `t`, read from the same universe that
     // named NC/NB (a gap tag has no row to resolve it from).
     auto gap_block_ci = [&](int t) -> const CtorInfo* {
@@ -16161,27 +16209,58 @@ struct Translator {
       // carry no column facts.
       for (auto& [nm, info] : predef_ctor_info_)
         if (info.type == type && info.is_block && info.tag == t) return &info;
-      return nullptr;
+      // A functor-/submodule-body type deliberately leaves the BARE key
+      // unfilled (the format_doc collision note at registration) and fills
+      // only "Mod.type", which nothing here can name with the row ctors bare
+      // and pat_constr absent (diffing_with_keys' partial_cycle).  Find the
+      // qualified table by content instead: same ctor census, and it must
+      // carry EVERY row ctor at the row's own resolution -- and only one
+      // table may, else the name is genuinely ambiguous and the bare pop
+      // stays.  NOGAPUNIV reverts to the bare pop.
+      if (row_ci.empty() || cppcaml::dbg_env("NOGAPUNIV")) return nullptr;
+      const CtorInfo* found = nullptr;
+      std::string dotty = "." + type;
+      for (auto& [key, tbl] : type_ctor_info_) {
+        if (key.size() <= dotty.size() ||
+            key.compare(key.size() - dotty.size(), dotty.size(), dotty) != 0)
+          continue;
+        int nc2 = 0, nb2 = 0;
+        for (auto& [nm, info] : tbl) (info.is_block ? nb2 : nc2)++;
+        if (nc2 != NC || nb2 != NB) continue;
+        bool all = true;
+        for (auto& [nm, rci] : row_ci) {
+          auto e = tbl.find(nm);
+          if (e == tbl.end() || e->second.is_block != rci->is_block ||
+              e->second.tag != rci->tag || e->second.arity != rci->arity) {
+            all = false; break;
+          }
+        }
+        if (!all) continue;
+        const CtorInfo* cand = nullptr;
+        for (auto& [nm, info] : tbl)
+          if (info.is_block && info.tag == t && info.type == type) {
+            cand = &info; break;
+          }
+        if (!cand) continue;
+        if (found) return nullptr;                    // two candidates: decline
+        found = cand;
+      }
+      return found;
     };
-    // Per-tag resolution + arity, plus the var/any rows (which spread to every arm).
-    std::map<int, const CtorInfo*> const_ci, block_ci;   // tag -> a resolved ctor
-    bool has_var = false;
-    for (auto& r : rows)
-      if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
-        const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
-        (ci->is_block ? block_ci : const_ci)[ci->tag] = ci;
-      } else has_var = true;
     // Upstream's jump-context pruning: every arrival at this chunk handler
     // PROVED this column is one specific constructor, so the divide keeps
     // only that group -- no test, no failaction, and the other tags' bodies
     // are never built (their mkexits would corrupt arrival accounting and
     // their empty sub-matrices would raise exits upstream never emits).
+    const GmProven* pvn = nullptr;
     const GmProof* pv = nullptr;
     if (auto pvit = gm_proven_comp_.find(comps[0].get());
-        pvit != gm_proven_comp_.end() && pvit->second.type == type &&
-        (pvit->second.blk ? block_ci.count(pvit->second.tag)
-                          : const_ci.count(pvit->second.tag)))
-      pv = &pvit->second;
+        pvit != gm_proven_comp_.end() && pvit->second.self.type == type &&
+        (pvit->second.self.blk ? block_ci.count(pvit->second.self.tag)
+                               : const_ci.count(pvit->second.self.tag))) {
+      pvn = &pvit->second;
+      pv = &pvn->self;
+    }
     // Default-sub-matrix sharing (matching.ml's D(P)): every GAP tag (no explicit
     // ctor row) is reached only by the var/any rows, which are identical for all
     // gaps.  Rather than recompile that sub-matrix once per gap tag -- which burns
@@ -16240,6 +16319,10 @@ struct Translator {
             de = std::move(d2); precise = true;
           }
         }
+        if (cppcaml::dbg_env("GAPDBG"))
+          fprintf(stderr, "[GAP] type=%s t=%d gci=%d precise=%d denv=%zu\n",
+                  type.c_str(), t, (int)(bool)gap_block_ci(t), (int)precise,
+                  denv.size());
         if (!precise && !denv_pop_col(de)) return nullptr;
         return gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(de));
       }
@@ -16277,6 +16360,16 @@ struct Translator {
         ncomps.push_back(f);
       }
       ncomps.insert(ncomps.end(), rest.begin(), rest.end());
+      // Jump-context, one level down: every arrival also proved these payload
+      // fields' heads, so the freshly minted field cells carry the facts and
+      // their re-dispatch prunes the same way (upstream's ctx keeps the whole
+      // matched prefix; diffing_with_keys' `_, Some (Both _ as b)` handler is
+      // the bare `exit` and not a re-switch).
+      if (pvn && pv->blk && t == pv->tag)
+        for (auto& sp : pvn->subs)
+          if (sp.sub >= 0 && sp.sub < a)
+            gm_proven_comp_.insert_or_assign(ncomps[sp.sub].get(),
+                                             GmProven{sp, {}});
       static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
       std::vector<MRow> sub;
       // Whether the LAST row we appended was omega at the still-UNDECOMPOSED
