@@ -11667,6 +11667,10 @@ struct Translator {
     // only inside kept sibling bindings is still counted (count_var descends into
     // let-RHS); emits identically to a flat let.  Same kept-mutable-read rule as
     // wrap_binders: a field_mut binding is StrictOpt, kept even single-use.
+    // ...then sink, as a group, the ones the arm's own `if` reads in only one
+    // branch: see sink_arm_binders.  NOARMLETS reverts to the plain fold.
+    static const bool no_arm_lets = cppcaml::dbg_env("NOARMLETS");
+    std::set<int> placed;
     for (auto it = binders.rbegin(); it != binders.rend(); ++it) {
       auto& id = it->first; auto& fa = it->second;
       int n = count_var(body, id);
@@ -11679,8 +11683,94 @@ struct Translator {
       else b.alias = true;
       l->bindings = {b};
       l->body = body; body = l;
+      if (b.alias) placed.insert(id.stamp);
     }
+    if (!no_arm_lets) body = sink_arm_binders(body, placed);
     return body;
+  }
+
+  // bind_check sends every pattern bind to lower_bind, so a destructured
+  // component the arm reads in only ONE branch of a leading `if` ends up inside
+  // that branch, not above the test.  Upstream reaches that one binding at a
+  // time, but it can afford to: each of its binds is created at its own pm
+  // level, deepest first, so a sinking bind never has to step over a sibling.
+  // Ours are a flat list folded in one go, and stepping over the siblings
+  // already placed is what inverts them (`x, dist` for `dist, x`).  So move the
+  // qualifying ones together, keeping the order the fold gave them.
+  //
+  // A binder qualifies when the test cannot read it and its uses -- including
+  // the uses inside a sibling binder's RHS -- all land in the same branch.  A
+  // sibling that stays therefore pins its own sources at the top, which is what
+  // keeps an aggregate whose field the test reads (and the aggregate that one
+  // was read from) out of the group.
+  LamPtr sink_arm_binders(LamPtr body, const std::set<int>& placed) {
+    std::vector<Lam*> chain;
+    Lam* cur = body.get();
+    while (cur->k == Lam::K::Let && cur->bindings.size() == 1 &&
+           cur->bindings[0].alias && placed.count(cur->bindings[0].id.stamp)) {
+      chain.push_back(cur);
+      cur = cur->body.get();
+    }
+    if (chain.empty() || cur->k != Lam::K::IfThenElse || !cur->cond ||
+        !cur->then_ || !cur->else_)
+      return body;
+    // -1 = stays, 0 = then, 1 = else.  Seed from the `if` itself, then let a
+    // binder that a staying sibling reads stay too, to a fixed point.
+    std::vector<int> dest(chain.size(), -1);
+    for (size_t i = 0; i < chain.size(); ++i) {
+      const Ident& v = chain[i]->bindings[0].id;
+      if (approx_present(v, cur->cond)) continue;
+      bool pt = approx_present(v, cur->then_), pe = approx_present(v, cur->else_);
+      if (pt && pe) continue;
+      // Neither branch: read only through siblings -- the propagation decides.
+      dest[i] = pt ? 0 : pe ? 1 : -2;
+    }
+    auto propagate = [&] {
+      for (bool again = true; again;) {
+        again = false;
+        for (size_t i = 0; i < chain.size(); ++i) {
+          if (dest[i] == -1) continue;
+          const Ident& v = chain[i]->bindings[0].id;
+          for (size_t j = i + 1; j < chain.size(); ++j) {
+            if (!approx_present(v, chain[j]->bindings[0].val)) continue;
+            if (dest[j] == -1 || (dest[i] >= 0 && dest[j] >= 0 && dest[i] != dest[j])) {
+              dest[i] = -1; again = true; break;
+            }
+            if (dest[i] == -2 && dest[j] >= 0) { dest[i] = dest[j]; again = true; }
+          }
+        }
+      }
+    };
+    propagate();
+    // A binder still unplaced is read by nothing that moves: it stays, and so
+    // must anything only it reads -- propagate once more to carry that.
+    bool demoted = false;
+    for (auto& d : dest) if (d == -2) { d = -1; demoted = true; }
+    if (demoted) propagate();
+    bool any = false;
+    for (auto d : dest) if (d >= 0) { any = true; break; }
+    if (!any) return body;
+    // Rebuild: the stayers keep their order above the `if`, the movers keep
+    // theirs at the top of their branch.
+    LamPtr kept = chain.back()->body;  // the `if`, still owning both branches
+    for (int b = 0; b < 2; ++b) {
+      LamPtr& slot = b == 0 ? cur->then_ : cur->else_;
+      for (size_t i = chain.size(); i-- > 0;)
+        if (dest[i] == b) {
+          auto l = mk(Lam::K::Let);
+          l->bindings = chain[i]->bindings;
+          l->body = slot;
+          slot = l;
+        }
+    }
+    for (size_t i = chain.size(); i-- > 0;)
+      if (dest[i] < 0) {
+        auto l = mk(Lam::K::Let);
+        l->bindings = chain[i]->bindings;
+        l->body = kept;
+        kept = l;
+      }
+    return kept;
   }
 
   // Match over constructor patterns of one variant type.  Two exact shapes:
