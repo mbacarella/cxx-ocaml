@@ -11425,6 +11425,8 @@ struct Translator {
         binders.swap(rest);
       }
     }
+    static const bool no_wrap_sink = cppcaml::dbg_env("NOWRAPSINK");
+    std::set<int> placed;
     for (auto it = binders.rbegin(); it != binders.rend(); ++it) {
       auto& id = it->first; auto& acc = it->second;
       // A lazy-force binder is an effectful computation: always kept, strict,
@@ -11462,11 +11464,23 @@ struct Translator {
         // entering through them overshoots badly: measured, 60 modules regress
         // and |raw| goes 39441 -> 47527.
         body = lower_bind(id, ValueKind::Gen, acc, body);
+        placed.insert(id.stamp);  // lower_bind's top wrap is an alias let
       } else {
         b.alias = is_field_access(acc);
         body = wraplet(b, body);
+        if (b.alias) placed.insert(id.stamp);
       }
     }
+    // A nested destructure's outer temp is read only through its sibling
+    // binders' RHSs, so the per-binder paths above see it in NO branch and
+    // stack it at the top; upstream's bind_check sinks the whole group into
+    // the branch that reads it (`fun ((a,x),(b,y)) -> if ..x.. else ..y..`
+    // keeps the (b,y) reads inside the else).  The arm sink already handles
+    // exactly this -- uses inside a sibling's RHS, stayers pinning their
+    // sources -- so run it over the alias lets this fold placed.  need_temp
+    // because this body is fully compiled: see the note in sink_arm_binders.
+    if (!no_wrap_sink && !placed.empty())
+      body = sink_arm_binders(body, placed, /*need_temp=*/true);
     return body;
   }
   std::set<int> lazy_force_binders_;  // binder stamps holding a lazy force
@@ -11708,7 +11722,8 @@ struct Translator {
   // sibling that stays therefore pins its own sources at the top, which is what
   // keeps an aggregate whose field the test reads (and the aggregate that one
   // was read from) out of the group.
-  LamPtr sink_arm_binders(LamPtr body, const std::set<int>& placed) {
+  LamPtr sink_arm_binders(LamPtr body, const std::set<int>& placed,
+                          bool need_temp = false) {
     std::vector<Lam*> chain;
     Lam* cur = body.get();
     while (cur->k == Lam::K::Let && cur->bindings.size() == 1 &&
@@ -11730,6 +11745,18 @@ struct Translator {
       // Neither branch: read only through siblings -- the propagation decides.
       dest[i] = pt ? 0 : pe ? 1 : -2;
     }
+    // A destructure temp: a binder some sibling's RHS reads (`y = field 1 m`
+    // reads m).  Used by the need_temp gate below.
+    std::vector<char> feeds_sibling(chain.size(), 0);
+    if (need_temp)
+      for (size_t i = 0; i < chain.size(); ++i) {
+        const Ident& v = chain[i]->bindings[0].id;
+        for (size_t j = 0; j < chain.size(); ++j)
+          if (j != i && approx_present(v, chain[j]->bindings[0].val)) {
+            feeds_sibling[i] = 1;
+            break;
+          }
+      }
     auto propagate = [&] {
       for (bool again = true; again;) {
         again = false;
@@ -11752,6 +11779,23 @@ struct Translator {
     bool demoted = false;
     for (auto& d : dest) if (d == -2) { d = -1; demoted = true; }
     if (demoted) propagate();
+    // The wrap_binders caller seeds from a FULLY COMPILED body, where a branch
+    // upstream saw as opaque (a strict let, later fused away) can look like a
+    // pure prim tree, so a lone direct field read would sink where upstream's
+    // approx_present kept it at the top (misc's check_current).  A nested
+    // destructure's temp -- one a sibling binder's RHS reads -- has no such
+    // false transparency: its placement is forced by the group itself.  So
+    // under need_temp, a branch may only receive a group that contains one.
+    if (need_temp)
+      for (int b = 0; b < 2; ++b) {
+        bool has_any = false, has_temp = false;
+        for (size_t i = 0; i < chain.size(); ++i)
+          if (dest[i] == b) {
+            has_any = true;
+            if (feeds_sibling[i]) has_temp = true;
+          }
+        if (has_any && !has_temp) return body;
+      }
     bool any = false;
     for (auto d : dest) if (d >= 0) { any = true; break; }
     if (!any) return body;
