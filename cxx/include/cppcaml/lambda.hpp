@@ -273,6 +273,12 @@ struct Lam {
   // assign_pat's non-var tuple-column binding in tail_tuple_exit) must treat a
   // tagged node as the variable it stood for.
   bool from_alias = false;
+  // fused_strict: our translation elided a construct here that upstream's RAW
+  // lambda still holds as an OPAQUE node when Matching's lower_bind runs (a
+  // tuple-pattern let compiles through assign_pat/for_let into a staticcatch,
+  // `_ -> true` to approx_present; only Simplif collapses it away).  Consumers
+  // replaying pre-Simplif presence decisions treat a tagged node as present.
+  bool fused_strict = false;
   // gm_facc: a pattern-matrix column whose lambda is a DEFERRED field access
   // (matching.ml passes get_expr_args' field-read expressions down unevaluated;
   // each compile entry then binds its first arg via arg_to_var/bind_match_arg).

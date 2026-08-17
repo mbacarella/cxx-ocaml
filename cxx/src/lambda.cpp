@@ -11734,9 +11734,18 @@ struct Translator {
     if (chain.empty() || cur->k != Lam::K::IfThenElse || !cur->cond ||
         !cur->then_ || !cur->else_)
       return body;
+    // The wrap_binders caller (need_temp) seeds from a FULLY COMPILED body,
+    // where a branch upstream saw as opaque can look like a pure prim tree --
+    // upstream's approx_present runs pre-Simplif, and a fused-away strict
+    // tuple-let (misc's check_current) made the branch "present" for every
+    // binder, keeping the group at the top.  Seed under ap_opaque_fused_ so
+    // the fused_strict tag restores exactly that opacity.  NOFUSEOPAQ falls
+    // back to the earlier feeds_sibling gate below.
+    static const bool no_fuse_opaq = cppcaml::dbg_env("NOFUSEOPAQ");
     // -1 = stays, 0 = then, 1 = else.  Seed from the `if` itself, then let a
     // binder that a staying sibling reads stay too, to a fixed point.
     std::vector<int> dest(chain.size(), -1);
+    ap_opaque_fused_ = need_temp && !no_fuse_opaq;
     for (size_t i = 0; i < chain.size(); ++i) {
       const Ident& v = chain[i]->bindings[0].id;
       if (approx_present(v, cur->cond)) continue;
@@ -11745,10 +11754,11 @@ struct Translator {
       // Neither branch: read only through siblings -- the propagation decides.
       dest[i] = pt ? 0 : pe ? 1 : -2;
     }
+    ap_opaque_fused_ = false;
     // A destructure temp: a binder some sibling's RHS reads (`y = field 1 m`
-    // reads m).  Used by the need_temp gate below.
+    // reads m).  Used by the NOFUSEOPAQ fallback gate below.
     std::vector<char> feeds_sibling(chain.size(), 0);
-    if (need_temp)
+    if (need_temp && no_fuse_opaq)
       for (size_t i = 0; i < chain.size(); ++i) {
         const Ident& v = chain[i]->bindings[0].id;
         for (size_t j = 0; j < chain.size(); ++j)
@@ -11779,14 +11789,10 @@ struct Translator {
     bool demoted = false;
     for (auto& d : dest) if (d == -2) { d = -1; demoted = true; }
     if (demoted) propagate();
-    // The wrap_binders caller seeds from a FULLY COMPILED body, where a branch
-    // upstream saw as opaque (a strict let, later fused away) can look like a
-    // pure prim tree, so a lone direct field read would sink where upstream's
-    // approx_present kept it at the top (misc's check_current).  A nested
-    // destructure's temp -- one a sibling binder's RHS reads -- has no such
-    // false transparency: its placement is forced by the group itself.  So
-    // under need_temp, a branch may only receive a group that contains one.
-    if (need_temp)
+    // NOFUSEOPAQ fallback (the S270 gate the opacity seeding replaced): a
+    // branch may only receive a group containing a nested destructure's temp,
+    // whose placement is forced by the group itself.
+    if (need_temp && no_fuse_opaq)
       for (int b = 0; b < 2; ++b) {
         bool has_any = false, has_temp = false;
         for (size_t i = 0; i < chain.size(); ++i)
@@ -12924,8 +12930,13 @@ struct Translator {
   // counts as present: it stands for the handler upstream had already compiled
   // inline at that spot when its lower_bind ran.
   bool lb_opaque_garm_exits_ = false;
+  // With ap_opaque_fused_ set, a fused_strict node counts as present too: our
+  // translation elided a construct there that upstream's pre-Simplif lambda
+  // still holds as an opaque node (see the tag's note in lambda.hpp).
+  bool ap_opaque_fused_ = false;
   bool approx_present(const Ident& v, const LamPtr& l) {
     if (!l) return false;
+    if (ap_opaque_fused_ && l->fused_strict) return true;
     switch (l->k) {
       case Lam::K::ConstInt: case Lam::K::ConstChar: case Lam::K::ConstFloat:
       case Lam::K::ConstString: case Lam::K::ConstBlock:
@@ -25401,7 +25412,10 @@ struct Translator {
             rec_spine_ = rec_spine;
             LamPtr body = expr(*le->body);
             scope.pop_back();
-            if (l->bindings.empty()) return body;
+            // Every element aliased away: upstream still holds the exploded
+            // tuple-let (a staticcatch pre-Simplif) HERE -- opaque to its
+            // lower_bind where our bare body may read as a pure prim tree.
+            if (l->bindings.empty()) { body->fused_strict = true; return body; }
             l->body = body;
             return l;
           }
