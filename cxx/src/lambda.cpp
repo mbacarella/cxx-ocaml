@@ -20598,6 +20598,7 @@ struct Translator {
     if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
     if (auto em = ext_match(scrut, rows)) return em;
+    if (auto eg = ext_group_match(scrut, rows, mloc)) return eg;
     if (auto gm = gmatch_top(scrut, rows, mloc, total, proven)) return gm;
     if (cppcaml::dbg_env("BAILDBG")) {
       int nguard = 0, nctor = 0, nor = 0, nother = 0;
@@ -21129,6 +21130,171 @@ struct Translator {
     auto iff = mk(Lam::K::IfThenElse);
     iff->cond = test; iff->then_ = body; iff->else_ = rest;
     return iff;
+  }
+
+  // A RUN of ext-chain rows sharing one head constructor whose payloads differ
+  // (`Error (loc, Amb {explicit = false; _}) | Error (loc, Amb {explicit =
+  // true; _}) | _ ->`): upstream divides on the head identity ONCE and hands
+  // the payload matrix to Matching, so the group compiles as a single
+  // `(== (field_imm 0 v) Error)` test around an ordinary sub-match.  The
+  // per-row chain this replaces re-tested the identity for every row and
+  // compared the payload against literals, where upstream binds the tested
+  // field to `*match*` and switches on it (tmc's Ambiguous report).
+  //   Scope kept narrow: every group row unguarded and alias-free with the
+  // same constructor text; exactly ONE payload column tested, all its patterns
+  // constructors (a constant column is ext_match's ptests shape -- leave it);
+  // every other column the same var name in every row, or `_` in every row,
+  // and declared BEFORE the tested one (the binding order past it is unproven);
+  // the group is the whole chain (rows = group + the trailing catch-all).
+  //   The tested column goes through compile_match with exn_payload_match's
+  // synthetic exit row, so an uncovered payload falls to the catch-all -- no
+  // totality proof needed; when the sub-match is total the exit is never cited
+  // and the catch-all inlines as the identity test's else.  The tested field's
+  // read is an ALIAS binding kept only when read twice (simplif's rule; the
+  // single-ctor level of tmc's payload substitutes away), and a var column
+  // lower_binds under it like any destructure binder.  NOEXTGROUP reverts to
+  // the per-row chain.
+  LamPtr ext_group_match(const LamPtr& scrut, const std::vector<Row>& rows,
+                         const Location& mloc) {
+    static const bool off = cppcaml::dbg_env("NOEXTGROUP");
+    if (off) return nullptr;
+    if (scrut->k != Lam::K::Var || rows.size() < 3) return nullptr;
+    size_t n = rows.size() - 1;  // group rows; the last row is the catch-all
+    if (rows.back().guard || !is_catchall(*rows.back().lhs)) return nullptr;
+    const Ppat_construct* k0 = nullptr;
+    std::string ctext;
+    std::vector<std::vector<const Pattern*>> fps(n);
+    int ar = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (rows[i].guard) return nullptr;
+      const Pattern* lp = effective_pat(rows[i].lhs);
+      auto* k = std::get_if<Ppat_construct>(&lp->desc);
+      if (!k || !k->arg) return nullptr;
+      if (i == 0) {
+        k0 = k; ctext = lid_full(k->id.txt);
+        ar = exn_pat_arity(k);
+        if (ar < 1) return nullptr;
+      } else if (lid_full(k->id.txt) != ctext || exn_pat_arity(k) != ar)
+        return nullptr;
+      fps[i] = ctor_field_pats(k, ar);
+      if ((int)fps[i].size() != ar) return nullptr;
+      for (auto* fp : fps[i]) if (!fp) return nullptr;
+    }
+    // eligibility: the head really is an exception/extension ctor (ext_match's
+    // test verbatim; a same-named variant ctor blocks the exn reading)
+    std::string nm = lid_last(k0->id.txt);
+    bool qualified_exn = std::holds_alternative<Ldot>(k0->id.txt.v) &&
+                         qualified_exn_identity(k0->id.txt) != nullptr;
+    if (!qualified_exn &&
+        ((!exn_ident_.count(nm) && !exn_field_.count(nm) && !is_predef_exn_name(nm)) ||
+         (ctor_info_.count(nm) && !builtin_ctors_.count(nm))))
+      return nullptr;
+    LamPtr idv = qualified_exn_identity(k0->id.txt);
+    if (!idv) idv = exn_value(nm);
+    if (!idv) return nullptr;
+    // classify the payload columns: 0 = all `_`, 1 = all the same var, 2 = tested
+    enum { CANY, CVAR, CTESTED };
+    std::vector<int> ckind(ar, CANY);
+    std::vector<std::string> cvname(ar);
+    int tc = -1;
+    for (int c = 0; c < ar; ++c) {
+      bool allvar = true, allany = true;
+      std::string nv;
+      for (size_t i = 0; i < n; ++i) {
+        const Pattern* p = effective_pat(fps[i][c]);
+        if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
+          allany = false;
+          if (nv.empty()) nv = pv->name.txt;
+          else if (nv != pv->name.txt) allvar = false;
+        } else if (std::holds_alternative<Ppat_any>(p->desc)) {
+          allvar = false;
+        } else {
+          allvar = allany = false;
+        }
+      }
+      if (allany) continue;
+      if (allvar) { ckind[c] = CVAR; cvname[c] = nv; continue; }
+      if (tc >= 0) return nullptr;  // a second tested column: not this shape
+      for (size_t i = 0; i < n; ++i)
+        if (!std::holds_alternative<Ppat_construct>(effective_pat(fps[i][c])->desc))
+          return nullptr;
+      ckind[c] = CTESTED; tc = c;
+    }
+    if (tc < 0) return nullptr;
+    for (int c = tc + 1; c < ar; ++c) if (ckind[c] == CVAR) return nullptr;
+    const Ident sid = scrut->var;
+    auto sv = [&] { auto v = mk(Lam::K::Var); v->var = sid; return v; };
+    // the synthetic catch-all row compiles to (exit eid) via shared_action_exit_
+    auto anyp = std::make_unique<Pattern>();
+    anyp->desc = Ppat_any{}; anyp->loc = rows.back().lhs->loc;
+    auto fake = std::make_unique<Expression>();
+    fake->desc = Pexp_unreachable{}; fake->loc = mloc;
+    const Pattern* anyptr = anyp.get();
+    const Expression* fakeptr = fake.get();
+    exn_syn_pats_.push_back(std::move(anyp));
+    exn_syn_exprs_.push_back(std::move(fake));
+    std::vector<Row> sub;
+    for (size_t i = 0; i < n; ++i) sub.push_back({fps[i][tc], rows[i].rhs, nullptr});
+    sub.push_back({anyptr, fakeptr, nullptr});
+    int eid = ++next_exit_;
+    Ident mv = fresh("", true);  // prints as `*match*`
+    std::vector<std::pair<int, Ident>> vcols;
+    scope.emplace_back();
+    for (int c = 0; c < ar; ++c)
+      if (ckind[c] == CVAR) {
+        Ident vc = fresh(cvname[c]);
+        scope.back()[cvname[c]] = vc;
+        vcols.push_back({c, vc});
+      }
+    shared_action_exit_[fakeptr] = eid;
+    LamPtr body = compile_match(varof(mv), sub, mloc);
+    shared_action_exit_.erase(fakeptr);
+    scope.pop_back();
+    if (!body) return nullptr;
+    // collapse a catch whose handler is a bare exit (simplif.ml:306's alias
+    // rule, same as exn_payload_match): compile_match parks the catch-all
+    // action behind one, and the whole-unit Simplif has already run.
+    while (body->k == Lam::K::Catch && body->catch_vars.empty() && body->then_ &&
+           body->then_->k == Lam::K::Staticraise && body->then_->args.empty()) {
+      int from = body->prim_arg, to = body->then_->prim_arg;
+      LamPtr inner = body->cond;
+      retarget_exit(inner, from, to);
+      body = inner;
+    }
+    // the tested field's read: simplif's Alias count rule
+    int nmv = count_var(body, mv);
+    if (nmv == 1) subst_alias(body, mv, fieldimm(tc + 1, sv()));
+    else if (nmv >= 2) {
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{mv, ValueKind::Gen, fieldimm(tc + 1, sv()), /*alias=*/true}};
+      l->body = body;
+      body = l;
+    }
+    // var columns bind like destructure binders: lower_bind descends past the
+    // `*match*` alias let and wraps at the branch both arms read them from
+    for (auto& [c, vc] : vcols) {
+      int nv = count_var(body, vc);
+      if (nv == 0) continue;
+      if (nv == 1) { subst_alias(body, vc, fieldimm(c + 1, sv())); continue; }
+      body = lower_bind(vc, ValueKind::Gen, fieldimm(c + 1, sv()), body);
+    }
+    LamPtr rest = ext_match_arm(sid, rows, rows.size() - 1);  // the catch-all leaf
+    if (!rest) return nullptr;
+    auto test = mk(Lam::K::Prim);
+    test->prim = Prim::IntCmp; test->prim_id = "==";
+    test->args = {fieldimm(0, sv()), idv};
+    auto iff = mk(Lam::K::IfThenElse);
+    iff->cond = test; iff->then_ = body;
+    int bad = 0;
+    if (count_exit(body, eid, false, bad) == 0) {  // sub-match total: no exit
+      iff->else_ = rest;
+      return iff;
+    }
+    auto x = mk(Lam::K::Staticraise); x->prim_arg = eid;
+    iff->else_ = x;  // identity-fail and payload-fail share the catch-all
+    auto cat = mk(Lam::K::Catch);
+    cat->cond = iff; cat->prim_arg = eid; cat->then_ = rest;
+    return cat;
   }
 
   // Exhaustive match over a purely-constant variant type -> (switch* ...).
