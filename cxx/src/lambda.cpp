@@ -11463,7 +11463,7 @@ struct Translator {
         // FULLY COMPILED body where upstream's read the pre-Simplif tree, and
         // entering through them overshoots badly: measured, 60 modules regress
         // and |raw| goes 39441 -> 47527.
-        body = lower_bind(id, ValueKind::Gen, acc, body);
+        body = lower_bind(id, ValueKind::Gen, acc, body, &placed);
         placed.insert(id.stamp);  // lower_bind's top wrap is an alias let
       } else {
         b.alias = is_field_access(acc);
@@ -12987,7 +12987,19 @@ struct Translator {
   // use -- past other alias lets, into the used arm of an if, into a
   // single-case switch -- so a tested column's let ends up OUTSIDE an earlier
   // var column's (the discriminating field reads first).
-  LamPtr lower_bind(const Ident& v, ValueKind vk_, const LamPtr& arg, LamPtr lam) {
+  //   fold_placed/in_arm: when wrap_binders sinks SEVERAL of one fold's
+  // binders into the same branch, each successive sibling must wrap ABOVE the
+  // ones already sunk there, keeping the fold's relative order -- upstream's
+  // group keeps one order whether it stays flat or lands in a branch
+  // (`{a; p={u;v}; c}` read in one branch: `*match*, v, u` both ways).
+  // Descending past a sunk sibling's alias let (the plain Let rule below)
+  // instead nests each newcomer BELOW the previous one, inverting the group.
+  // So once the walk has entered a branch arm, an alias let this same fold
+  // placed stops it.  Top-chain lets (before any arm) still descend: that is
+  // what lets a later binder sink under the already-wrapped top stack at all.
+  // NOSINKORD reverts to the always-descend rule.
+  LamPtr lower_bind(const Ident& v, ValueKind vk_, const LamPtr& arg, LamPtr lam,
+                    const std::set<int>* fold_placed = nullptr, bool in_arm = false) {
     auto wrap = [&](LamPtr b) -> LamPtr {
       auto l = mk(Lam::K::Let);
       l->bindings = {{v, vk_, arg, true}};
@@ -12999,17 +13011,17 @@ struct Translator {
       bool ps = approx_present(v, lam->then_);
       bool pn = approx_present(v, lam->else_);
       if (!pc && !ps && !pn) return lam;
-      if (!pc && ps && !pn) { lam->then_ = lower_bind(v, vk_, arg, lam->then_); return lam; }
-      if (!pc && !ps && pn) { lam->else_ = lower_bind(v, vk_, arg, lam->else_); return lam; }
+      if (!pc && ps && !pn) { lam->then_ = lower_bind(v, vk_, arg, lam->then_, fold_placed, true); return lam; }
+      if (!pc && !ps && pn) { lam->else_ = lower_bind(v, vk_, arg, lam->else_, fold_placed, true); return lam; }
       return wrap(lam);
     }
     if (lam->k == Lam::K::Switch && !approx_present(v, lam->cond)) {
       if (lam->sw_consts.size() == 1 && lam->sw_blocks.empty()) {
-        lam->sw_consts[0].body = lower_bind(v, vk_, arg, lam->sw_consts[0].body);
+        lam->sw_consts[0].body = lower_bind(v, vk_, arg, lam->sw_consts[0].body, fold_placed, true);
         return lam;
       }
       if (lam->sw_consts.empty() && lam->sw_blocks.size() == 1) {
-        lam->sw_blocks[0].body = lower_bind(v, vk_, arg, lam->sw_blocks[0].body);
+        lam->sw_blocks[0].body = lower_bind(v, vk_, arg, lam->sw_blocks[0].body, fold_placed, true);
         return lam;
       }
     }
@@ -13017,9 +13029,13 @@ struct Translator {
       bool allalias = true;
       for (auto& b : lam->bindings) if (!b.alias) { allalias = false; break; }
       if (allalias) {
+        static const bool no_sink_ord = cppcaml::dbg_env("NOSINKORD");
+        if (in_arm && fold_placed && !no_sink_ord)
+          for (auto& b : lam->bindings)
+            if (fold_placed->count(b.id.stamp)) return wrap(lam);
         for (auto& b : lam->bindings)
           if (approx_present(v, b.val)) return wrap(lam);
-        lam->body = lower_bind(v, vk_, arg, lam->body);
+        lam->body = lower_bind(v, vk_, arg, lam->body, fold_placed, in_arm);
         return lam;
       }
     }
