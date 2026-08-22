@@ -580,6 +580,7 @@ struct Translator {
   mutable std::unordered_map<std::string, std::string> local_unit_memo_;
   std::vector<std::unordered_map<std::string, Ident>> scope{{}};
   std::unordered_map<std::string, int> stdlib_fields;  // Stdlib value -> field index
+  std::set<std::string> stdlib_exns_;  // Stdlib's own exception names (cmi typexts)
   struct StdPrim { std::string name; int arity; };  // an external's prim_name + arity
   std::unordered_map<std::string, StdPrim> stdlib_prims;  // Stdlib value -> prim
   // A labeled/optional function's parameter signature: (label kind 0/1/2, name)
@@ -1042,6 +1043,19 @@ struct Translator {
         "Division_by_zero", "Not_found", "Match_failure", "Stack_overflow",
         "Sys_blocked_io", "Assert_failure", "Undefined_recursive_module", "Todo"};
     return s.count(n) != 0;
+  }
+  // A pervasive exception that is NOT a runtime predef: Stdlib declares exactly
+  // one (`Exit`), so the bare-name exn gates -- which know locals (exn_ident_),
+  // submodule exns (exn_field_) and the predefs -- were blind to it, and
+  // `match e with Exit -> .. | _ -> ..` fell to the variant path, whose
+  // unknown-sole-ctor reading COLLAPSES the match to its first arm.  The set is
+  // stdlib.cmi's typexts, so exn_value's stdlib_fields fallback is guaranteed
+  // to resolve the identity.  A local `exception Exit` still wins (exn_ident_
+  // is consulted first) and a local variant ctor still blocks (ctor_info_).
+  bool is_stdlib_exn_name(const std::string& n) {
+    static const bool off = cppcaml::dbg_env("NOSTDEXN");
+    if (off || no_pervasives_) return false;
+    return stdlib_exns_.count(n) && stdlib_fields.count(n);
   }
   // `(global Name/stamp!)` for a predefined exception used by the compiler.  The
   // stamps are OCaml's fixed Predef ident stamps (the lambda dump normalizes them,
@@ -12082,7 +12096,7 @@ struct Translator {
     auto it = vk.pat_constr.find(p);
     if (it == vk.pat_constr.end() || it->second != "exn") return false;
     return exn_ident_.count(cn) || exn_field_.count(cn) ||
-           is_predef_exn_name(cn);
+           is_predef_exn_name(cn) || is_stdlib_exn_name(cn);
   }
   LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc,
                     const LamPtr& dflt = nullptr, bool total = false,
@@ -21026,12 +21040,14 @@ struct Translator {
       if (cppcaml::dbg_env("CTDBG"))
         fprintf(stderr,
                 "[CTDBG] exn-pat %s qual=%d exn_i=%d exn_f=%d predef=%d "
-                "ctor=%d builtin=%d\n",
+                "stdex=%d ctor=%d builtin=%d\n",
                 n.c_str(), (int)qualified_exn, (int)exn_ident_.count(n),
                 (int)exn_field_.count(n), (int)is_predef_exn_name(n),
-                (int)ctor_info_.count(n), (int)builtin_ctors_.count(n));
+                (int)is_stdlib_exn_name(n), (int)ctor_info_.count(n),
+                (int)builtin_ctors_.count(n));
       if (!qualified_exn &&
-          ((!exn_ident_.count(n) && !exn_field_.count(n) && !is_predef_exn_name(n)) ||
+          ((!exn_ident_.count(n) && !exn_field_.count(n) && !is_predef_exn_name(n) &&
+            !is_stdlib_exn_name(n)) ||
            (ctor_info_.count(n) && !builtin_ctors_.count(n))))
         return nullptr;
       if (k->arg) {  // binder shapes exn_case_body supports only
@@ -21186,7 +21202,8 @@ struct Translator {
     bool qualified_exn = std::holds_alternative<Ldot>(k0->id.txt.v) &&
                          qualified_exn_identity(k0->id.txt) != nullptr;
     if (!qualified_exn &&
-        ((!exn_ident_.count(nm) && !exn_field_.count(nm) && !is_predef_exn_name(nm)) ||
+        ((!exn_ident_.count(nm) && !exn_field_.count(nm) && !is_predef_exn_name(nm) &&
+          !is_stdlib_exn_name(nm)) ||
          (ctor_info_.count(nm) && !builtin_ctors_.count(nm))))
       return nullptr;
     LamPtr idv = qualified_exn_identity(k0->id.txt);
@@ -31777,6 +31794,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     const auto& cmi = cmi::CmiFile::load(stdlib_dir + "/stdlib.cmi");
     int i = 0;
     for (auto& f : cmi.sig().fields) t.stdlib_fields[f] = i++;
+    for (auto& tx : cmi.sig().typexts) t.stdlib_exns_.insert(tx.name);
     for (auto& v : cmi.values())
       if (!v.prim.empty()) t.stdlib_prims[v.name] = {v.prim, v.prim_arity};
   } catch (...) {}
