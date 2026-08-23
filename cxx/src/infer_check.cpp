@@ -12187,6 +12187,9 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck);
   for (auto& [e, t] : ck.rec_expr_) {
     vk.expr[e] = kind_str(t, ck);
+    if (TypePtr r = I::Engine::repr(t);
+        r->kind == I::Type::Kind::Constr && r->path == "exn")
+      vk.expr_exn.insert(e);
     // An abstract-ctor-typed expr (`a.(i) : Id.t`) is a GENERIC array element
     // even though it is boxed ("addr"): array_kind_str downgrades it to gen.
     if (vk.expr[e] == "addr" && array_kind_str(t, ck).empty()) vk.abstract_elem.insert(e);

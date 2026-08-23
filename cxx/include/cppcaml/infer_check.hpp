@@ -113,6 +113,14 @@ struct ValueKinds {
   // full path -- the back end resolves unqualified record labels through the
   // base expression's inferred type (heap_stats.major_collections).
   std::unordered_map<const void*, std::string> expr_constr;
+  // Expression nodes the checker typed CONCRETELY as exn.  A match scrutinee in
+  // here licenses the back end's nearest-exception reading of a bare ctor name
+  // a variant also declares (lambda.cpp's exn_decl_nearest); an annotated or
+  // otherwise variant-typed scrutinee never enters, so type-directed
+  // disambiguation keeps outranking declaration order.  (The per-PATTERN
+  // pat_constr also says "exn" for those -- the pattern's own best-effort
+  // resolution -- which is why the scrutinee's type is recorded instead.)
+  std::set<const void*> expr_exn;
   // For a constructor PATTERN whose constructor name is unqualified/unknown but
   // whose inferred (scrutinee-column) type is a module-qualified variant
   // ("Load_path.visibility"): the full path.  The back end registers that type's

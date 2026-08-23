@@ -819,6 +819,17 @@ struct Translator {
   std::unordered_map<std::string, std::pair<std::string, int>> local_prims_;
   // Locally-declared exceptions: name -> its binder (the makeblock-248 value).
   std::unordered_map<std::string, Ident> exn_ident_;
+  // Names whose most recent declaration in the CURRENT structure walk is an
+  // exception: a unit-level `type t = Exit | Go` squats the flat ctor_info_
+  // slot (register_types is a PRE-pass), and the match gates' variant-ctor
+  // blocker then outranked a submodule's own NEARER `exception Exit` -- the
+  // match compiled as an int test over t, the exn block read as truthy, wrong
+  // arm.  The item walk keeps this in textual order (insert at Pstr_exception,
+  // erase at a Pstr_type declaring the ctor), and the module-close restore
+  // rewinds it with exn_ident_; consulted only via exn_decl_nearest, which
+  // also requires a LIVE exn_ident_ entry, so the set alone never resurrects
+  // an out-of-scope exception (exn_field_ deliberately keeps leaking names).
+  std::set<std::string> exn_nearest_;
   // A submodule's exported exception/extension ctor: (module binder, field
   // index) -- the inner binder is out of scope outside the module.
   std::unordered_map<std::string, std::pair<Ident, int>> exn_field_;
@@ -973,6 +984,14 @@ struct Translator {
   // gm_fake_deid_ no-fail license), so conservative-Total behavior is
   // untouched.  Set/restored at the Pexp_match and function-cases entries.
   bool cur_match_partial_ = false;
+  // The enclosing Pexp_match's scrutinee was checker-typed CONCRETELY as exn
+  // (vk.expr_exn) -- the license exn_decl_nearest needs before the nearest
+  // `exception` declaration may waive the variant-ctor blocker: an annotated
+  // variant scrutinee (`(x : t)`) keeps type-directed disambiguation in charge
+  // even when a same-named exception is declared nearer.  Set/restored beside
+  // cur_match_partial_ at the Pexp_match entry; function-cases have no
+  // scrutinee expression node, so they conservatively compile with false.
+  bool cur_scrut_exn_ = false;
   // Entry eids to which mkexit routed a DEEP fully-matched miss (see
   // GmDef::head_dropped).  The ctor-chunk driver rejects a SPREAD-containing
   // attempt whose own entries (eids allocated during the attempt) got such a
@@ -1077,6 +1096,25 @@ struct Translator {
     static const bool off = cppcaml::dbg_env("NOOPENEXN");
     if (off) return false;
     return opened_module_exn_value(n) != nullptr;
+  }
+  // Is the NEAREST declaration of `n` an in-scope exception, matched against a
+  // scrutinee the checker typed exn?  Waives the match gates' variant-ctor
+  // blocker for exactly the shape upstream scoping demands (see exn_nearest_'s
+  // comment).  All three legs are load-bearing: cur_scrut_exn_ keeps an
+  // annotated variant scrutinee's type-directed disambiguation in charge, the
+  // live exn_ident_ requirement makes the module-close restore end the exn's
+  // authority with its scope, and exn_nearest_ carries the textual order.
+  bool exn_decl_nearest(const std::string& n) {
+    return cur_scrut_exn_ && exn_decl_nearest_raw(n);
+  }
+  // The nearest+live half alone: the construct site pairs it with the
+  // checker's own exn EXPECTATION (exn_typed_expr) instead of the match
+  // license -- cur_scrut_exn_ is an enclosing-match property and would leak
+  // into arm bodies that construct the variant.
+  bool exn_decl_nearest_raw(const std::string& n) {
+    static const bool off = cppcaml::dbg_env("NONEAREXN");
+    if (off) return false;
+    return exn_nearest_.count(n) && exn_ident_.count(n);
   }
   // `(global Name/stamp!)` for a predefined exception used by the compiler.  The
   // stamps are OCaml's fixed Predef ident stamps (the lambda dump normalizes them,
@@ -10342,7 +10380,7 @@ struct Translator {
       for (auto& r : rows)
         if (is_ctor(r, i)) {
           std::string n = ctor_of(*r.cols[i]);
-          if (ctor_info_.count(n)) { extensible = false; break; }
+          if (ctor_info_.count(n) && !exn_decl_nearest(n)) { extensible = false; break; }
           if ((exn_ident_.count(n) || exn_field_.count(n)) &&
               !std::get_if<Ppat_construct>(&r.cols[i]->desc)->arg) extensible = true;
           else { extensible = false; break; }
@@ -21095,15 +21133,17 @@ struct Translator {
       if (cppcaml::dbg_env("CTDBG"))
         fprintf(stderr,
                 "[CTDBG] exn-pat %s qual=%d exn_i=%d exn_f=%d predef=%d "
-                "stdex=%d openex=%d ctor=%d builtin=%d\n",
+                "stdex=%d openex=%d ctor=%d builtin=%d near=%d\n",
                 n.c_str(), (int)qualified_exn, (int)exn_ident_.count(n),
                 (int)exn_field_.count(n), (int)is_predef_exn_name(n),
                 (int)is_stdlib_exn_name(n), (int)is_opened_exn_name(n),
-                (int)ctor_info_.count(n), (int)builtin_ctors_.count(n));
+                (int)ctor_info_.count(n), (int)builtin_ctors_.count(n),
+                (int)exn_decl_nearest(n));
       if (!qualified_exn &&
           ((!exn_ident_.count(n) && !exn_field_.count(n) && !is_predef_exn_name(n) &&
             !is_stdlib_exn_name(n) && !is_opened_exn_name(n)) ||
-           (ctor_info_.count(n) && !builtin_ctors_.count(n))))
+           (ctor_info_.count(n) && !builtin_ctors_.count(n) &&
+            !exn_decl_nearest(n))))
         return nullptr;
       if (k->arg) {  // binder shapes exn_case_body supports only
         // Inline-record exn payload `{l; ..}`: exn_case_body binds via label
@@ -21259,7 +21299,8 @@ struct Translator {
     if (!qualified_exn &&
         ((!exn_ident_.count(nm) && !exn_field_.count(nm) && !is_predef_exn_name(nm) &&
           !is_stdlib_exn_name(nm) && !is_opened_exn_name(nm)) ||
-         (ctor_info_.count(nm) && !builtin_ctors_.count(nm))))
+         (ctor_info_.count(nm) && !builtin_ctors_.count(nm) &&
+          !exn_decl_nearest(nm))))
       return nullptr;
     LamPtr idv = qualified_exn_identity(k0->id.txt);
     if (!idv) idv = exn_value(nm);
@@ -23512,10 +23553,14 @@ struct Translator {
       // Record the checker's POSITIVE partiality verdict for every sub-compile
       // of this match (see cur_match_partial_); restored on every return path.
       struct PartialGuard {
-        Translator* t; bool save;
-        ~PartialGuard() { t->cur_match_partial_ = save; }
-      } pguard{this, cur_match_partial_};
+        Translator* t; bool save; bool save_se;
+        ~PartialGuard() {
+          t->cur_match_partial_ = save;
+          t->cur_scrut_exn_ = save_se;
+        }
+      } pguard{this, cur_match_partial_, cur_scrut_exn_};
       cur_match_partial_ = !match_is_total(&e);
+      cur_scrut_exn_ = vk.expr_exn.count(m->e.get()) != 0;
       // Mixed value/exception arms: the scrutinee is evaluated under a try whose
       // body exits with the value -- value arms run OUTSIDE the try, exception
       // arms dispatch in its handler:
@@ -24505,10 +24550,20 @@ struct Translator {
       // `Stdlib.Error 6` at `(int,int) result` built the EXCEPTION for exactly
       // the same reason the bare spelling did.  When M really does export the
       // exception, qci is that exception's own entry, so this stays right.
+      // The checker POSITIVELY typed this construct `exn` (the disambig pass's
+      // concrete expectation; a result-typed `Error x` infers `result`, never
+      // `exn`) -- used by the opened-builtin escape below and, paired with the
+      // nearest-declaration verdict, by the local-exception shadow: `type t =
+      // Exit | Go` at the unit level must not capture `m Exit` after a nearer
+      // same-level `exception Exit` re-declared the name (m : exn -> string).
+      bool exn_typed_expr = false;
+      if (auto ecx = vk.expr_constr.find(&e); ecx != vk.expr_constr.end())
+        exn_typed_expr = ecx->second == "exn";
       bool exn_shadows = (exn_ident_.count(n) || exn_field_.count(n)) &&
                          !predef_typed && !qci &&
                          (raise_pos || !ctor_info_.count(n) ||
-                          builtin_ctors_.count(n));
+                          builtin_ctors_.count(n) ||
+                          (exn_typed_expr && exn_decl_nearest_raw(n)));
       const CtorInfo* cip = qci ? qci : predef_typed;
       if (!cip) { auto ci = ctor_info_.find(n); if (ci != ctor_info_.end()) cip = &ci->second; }
       // `open M` (M separately compiled) exporting an exception E shadows a same-
@@ -24526,9 +24581,6 @@ struct Translator {
       // f : exn -> _): the open's exception shadows the builtin, and a
       // result-typed `Error x` infers `result`, never `exn`, so it keeps the
       // variant reading.
-      bool exn_typed_expr = false;
-      if (auto ecx = vk.expr_constr.find(&e); ecx != vk.expr_constr.end())
-        exn_typed_expr = ecx->second == "exn";
       LamPtr opened_raise_exn = nullptr;
       if ((raise_pos || exn_typed_expr) && std::holds_alternative<Lident>(k->id.txt.v) &&
           !exn_ident_.count(n) && !exn_field_.count(n) && builtin_ctors_.count(n))
@@ -27421,12 +27473,13 @@ struct Translator {
       // the param's kind is the scrutinee type = any case pattern's (unified)
       l->params.push_back({pid, pat_kind(&fc->cases[0].lhs)});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
-      bool ps_save = cur_match_partial_;
+      bool ps_save = cur_match_partial_, se_save = cur_scrut_exn_;
       cur_match_partial_ = !function_is_total(fc);
+      cur_scrut_exn_ = false;  // no scrutinee expression node (see the member)
       l->body = wrap_optdefs(wrap_binders(
           compile_match(scrut, fc->cases, floc, function_is_total(fc),
                         total_is_proven(fc)), binders));
-      cur_match_partial_ = ps_save;
+      cur_match_partial_ = ps_save; cur_scrut_exn_ = se_save;
     } else {
       l->body = mk(Lam::K::ConstInt);
     }
@@ -29940,6 +29993,9 @@ struct Translator {
       if (auto* td = std::get_if<Pstr_type>(&it.desc)) {
         for (auto& d : td->decls)  // modsig P1: types are no-slot items
           cursig.push({.ns = modsig::NS::Type, .name = d.name.txt, .runtime = false});
+        for (auto& d : td->decls)  // this variant decl is now the nearest owner
+          if (auto* v = std::get_if<Ptype_variant>(&d.kind))
+            for (auto& c : v->ctors) exn_nearest_.erase(c.name.txt);
         // bring this type's ambiguous constructors / record fields into scope
         // (overwriting an earlier same-named one), so subsequent code resolves
         // them to THIS type
@@ -30133,6 +30189,7 @@ struct Translator {
       }
       if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {  // exception E [of ...]
         const std::string& nm = pe->exn.ctor.name.txt;
+        exn_nearest_.insert(nm);
         // `exception F = E` rebinds: F's identity IS E's value (no fresh block)
         if (auto* rb = std::get_if<Pext_rebind>(&pe->exn.ctor.kind)) {
           if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
@@ -30543,6 +30600,7 @@ struct Translator {
             mod_path_ += "." + *mb.name.txt;  // nested exceptions are "Outer.M.E"
             exn_path_ += "." + *mb.name.txt;
             auto exn_before = exn_ident_;
+            auto exn_nearest_before = exn_nearest_;
             auto mod_before = module_ident_;
             auto alias_before = module_alias_;
             // A submodule's external must not SHADOW a same-named parent one
@@ -30584,6 +30642,7 @@ struct Translator {
               if (bi != exn_before.end()) { it2->second = bi->second; ++it2; }
               else it2 = exn_ident_.erase(it2);
             }
+            exn_nearest_ = std::move(exn_nearest_before);
             std::vector<std::string> inner_mods;
             for (auto& [nm, iid] : module_ident_) {
               auto bi = mod_before.find(nm);
