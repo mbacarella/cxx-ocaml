@@ -2984,6 +2984,24 @@ struct Translator {
     if (!mp.base) return nullptr;
     std::optional<int> ix = local_member_index(mp.key, dq->name);
     if (!ix) return nullptr;
+    // A SUBMODULE named like a ctor is a runtime field too, but it is not a
+    // constructor: under `module Foo = ..` + `type u = Foo | Bar` in M, the
+    // construct `M.Foo` must stay the variant, not read the submodule's block.
+    // Only a namespaced scoped answer can tell the two fields apart; when the
+    // module exports BOTH (`exception Foo` + `module Foo`), the exception's
+    // own Typext field wins whatever the flat last-name position says.
+    static const bool no_ns = cppcaml::dbg_env("NOSUBMODCTOR");
+    if (!no_ns && mp.sig) {
+      const modsig::Item* hit = nullptr;
+      const modsig::Item* ext = nullptr;
+      for (auto& it : mp.sig->items)
+        if (it.runtime && it.name == dq->name) {
+          hit = &it;
+          if (it.ns == modsig::NS::Typext) ext = &it;
+        }
+      if (hit && hit->ns == modsig::NS::Module)
+        return ext ? fieldimm(ext->pos, mp.base) : nullptr;
+    }
     return fieldimm(*ix, mp.base);
   }
   // The identity value of a QUALIFIED exn/extension ctor `M.E` (M local OR
