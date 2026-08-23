@@ -2955,13 +2955,22 @@ struct Translator {
       // an ABSENT signature alias member (`R : sig module M = P end`): R's
       // block has no M field -- substitute the target path, like upstream's
       // Mp_absent handling (R.M.f reads P.f)
+      std::optional<int> ix;
+      static const bool no_ns = cppcaml::dbg_env("NOSUBMODPATH");
       if (modsig::SigPtr es = env_scoped_sig(key))
-        if (const modsig::Item* al = es->find(modsig::NS::Module, comp);
-            al && !al->runtime && !al->alias_of.empty()) {
-          std::string rest = q == std::string::npos ? "" : dotted.substr(q);
-          return resolve_module_path(al->alias_of + rest, depth + 1);
+        if (const modsig::Item* al = es->find(modsig::NS::Module, comp)) {
+          if (!al->runtime && !al->alias_of.empty()) {
+            std::string rest = q == std::string::npos ? "" : dotted.substr(q);
+            return resolve_module_path(al->alias_of + rest, depth + 1);
+          }
+          // A path component names a MODULE, so the scoped Module item's own
+          // position wins over the flat last-name lookup, which a later
+          // same-named exception (`module Foo = ..` then `exception Foo`)
+          // would otherwise clobber: the value read M.Foo.x must read the
+          // submodule's field, not the exception's.
+          if (!no_ns && al->runtime && al->pos >= 0) ix = al->pos;
         }
-      std::optional<int> ix = local_member_index(key, comp);
+      if (!ix) ix = local_member_index(key, comp);
       if (!ix) return {};
       base = fieldimm(*ix, base);
       key += '.'; key += comp;
