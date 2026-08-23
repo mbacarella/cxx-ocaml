@@ -335,6 +335,15 @@ struct Checker {
   // module matches on it (patmatch's MPR7761 -- else `B` resolved to the file's
   // top-level `type t = B of int | ..` and cited the wrong `t`).
   std::unordered_map<const void*, TypePtr> ext_ctor_scheme_;
+  // And for `exception E` declarations (keyed by the exn ctor AST node):
+  // process_item overlays the scheme into the CURRENT module's cenv so a bare
+  // exn name resolves by scope like any ctor.  The flat `ctors` map is
+  // last-wins in REGISTRATION order (register_types_rec descends modules), so
+  // without this a submodule's variant `Foo` squats the bare name at OUTER
+  // scope over a nearer top-level `exception Foo` -- the outer match's fn then
+  // types M.u -> string where ocamlc says exn -> string (a live miscompile:
+  // the back end trusts the checker's kinds).
+  std::unordered_map<const void*, TypePtr> exn_decl_scheme_;
   std::vector<std::unordered_map<std::string, TypePtr>> cenv{{}};
   // Module aliases `module MP = Gc.Memprof`: (target-path, alias-name).  ocamlc
   // keeps the alias in displayed type paths (`MP.t`, not `Gc.Memprof.t`), so the
@@ -4270,6 +4279,7 @@ struct Checker {
     if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
     ctors[ec.name.txt] = scheme;
     exn_ctors_.insert(ec.name.txt);
+    exn_decl_scheme_[&ec] = scheme;  // for process_item's scoped cenv overlay
   }
 
   // A type extension `type ('a..) path += C [of args] [: res]` (extensible
@@ -4284,7 +4294,7 @@ struct Checker {
     // only resolve in the in-order pass (e.g. a functor instance's cenv binding
     // made after the up-front registration already visited this node).  Into
     // the scoped cenv (the flat map would just mark the name ambiguous).  Exn
-    // rebinds stay unknown as before (find_ctor skips cenv for exn names).
+    // rebinds stay unknown as before (they are never overlaid into cenv).
     // Non-strict only: the strict pass would resolve the target to a functor
     // BODY's unsubstituted scheme (D.t) and false-reject its uses.
     if (!is_exn && !strict)
@@ -4346,13 +4356,16 @@ struct Checker {
   TypePtr* find_ctor(const std::string& name) {
     // A variant constructor reusing a predef/exception name needs type-directed
     // disambiguation we don't have -> leave unknown rather than pick wrong.
-    // Exception: in the NON-STRICT (dump/cmi) pass a predef name IS consulted in
-    // the scoped cenv, so a value INSIDE the module that redefined `::`/`[]`
-    // (GPR#234's `type hlist = [] | (::)`) resolves to the local ctor by lexical
-    // scoping -- cenv only holds `::` where an enclosing decl bound it, so outer
-    // uses still fall through to the predef.  Strict stays conservative (a
-    // type-directed re-pick we can't do could otherwise false-reject).
-    if (!exn_ctors_.count(name) && (!predef_ctors_.count(name) || !strict))
+    // Exception: in the NON-STRICT (dump/cmi) pass a predef or file-declared
+    // exn name IS consulted in the scoped cenv, so a value INSIDE the module
+    // that redefined `::`/`[]` (GPR#234's `type hlist = [] | (::)`) resolves to
+    // the local ctor by lexical scoping, and a bare exn-colliding name resolves
+    // to the NEAREST declaration (Pstr_exception/Pstr_type both overlay their
+    // frame) instead of the flat map's registration-order winner.  Strict stays
+    // conservative (a type-directed re-pick we can't do could false-reject).
+    static const bool no_exn_cenv = std::getenv("NOEXNCENV") != nullptr;
+    if ((!exn_ctors_.count(name) || (!strict && !no_exn_cenv)) &&
+        (!predef_ctors_.count(name) || !strict))
       for (auto it = cenv.rbegin(); it != cenv.rend(); ++it) {
         auto f = it->find(name);
         if (f != it->end()) return &f->second;
@@ -11244,6 +11257,11 @@ struct Checker {
           // expression's `let module`.  Register its ctor so `E x` inside pins x's
           // type (idempotent: top-level ones are already registered).
           register_exception(ex->exn.ctor);
+          // Overlay into the current module's cenv so the bare name resolves
+          // by scope, not by flat registration order (see exn_decl_scheme_).
+          if (auto s = exn_decl_scheme_.find(&ex->exn.ctor);
+              s != exn_decl_scheme_.end())
+            cenv.back()[ex->exn.ctor.name.txt] = s->second;
         } else if (auto* tx = std::get_if<Pstr_typext>(&it.desc)) {
           register_typext(tx->ext);
           // Overlay this module's extension ctors so they shadow an outer
