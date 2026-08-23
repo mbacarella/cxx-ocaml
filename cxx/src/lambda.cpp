@@ -11305,14 +11305,19 @@ struct Translator {
   // Whether a pattern is irrefutable (always matches): exactly the shapes
   // collect_binders destructures.  Used to decide between field extraction and a
   // partial match (which raises Match_failure on the missing cases).
-  bool is_irrefutable(const Pattern& p0) {
+  // strict_pv: judge "matches EVERY value" (exhaustive_irref_col's coverage
+  // question) rather than "exhaustive by typing".  A poly-variant leaf is only
+  // the latter -- `` `A `` names one tag of a multi-tag row -- so under
+  // strict_pv it is refutable; the lax default is what the single-row
+  // exhaustive-by-typing payload paths rely on.
+  bool is_irrefutable(const Pattern& p0, bool strict_pv = false) {
     const Pattern* p = effective_pat(&p0);
     if (std::holds_alternative<Ppat_any>(p->desc) ||
         std::holds_alternative<Ppat_var>(p->desc) ||
         std::holds_alternative<Ppat_unpack>(p->desc)) return true;  // `(module M)` always matches
-    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) return is_irrefutable(*pa->p);
+    if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) return is_irrefutable(*pa->p, strict_pv);
     if (auto* pt = std::get_if<Ppat_tuple>(&p->desc)) {
-      for (auto& e : pt->elems) if (!is_irrefutable(*e)) return false;
+      for (auto& e : pt->elems) if (!is_irrefutable(*e, strict_pv)) return false;
       return true;
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
@@ -11331,7 +11336,7 @@ struct Translator {
         if (!find_field(lid_last(lbl.txt)) && !ext_resolved &&
             !(lid_last(lbl.txt) == "contents" && pr->fields.size() == 1))
           return false;
-        if (!is_irrefutable(*sub)) return false;
+        if (!is_irrefutable(*sub, strict_pv)) return false;
       }
       return true;
     }
@@ -11346,17 +11351,20 @@ struct Translator {
         auto* pr = pk->arg ? std::get_if<Ppat_record>(&effective_pat(pk->arg->get())->desc)
                            : nullptr;
         if (!pr) return false;
-        for (auto& [lbl, sub] : pr->fields) if (!is_irrefutable(*sub)) return false;
+        for (auto& [lbl, sub] : pr->fields) if (!is_irrefutable(*sub, strict_pv)) return false;
         return true;
       }
       for (auto* fp : ctor_field_pats(pk, ci->second.arity))
-        if (!is_irrefutable(*fp)) return false;
+        if (!is_irrefutable(*fp, strict_pv)) return false;
       return true;
     }
-    if (auto* pvr = std::get_if<Ppat_variant>(&p->desc))
-      return !pvr->arg || is_irrefutable(**pvr->arg);
+    if (auto* pvr = std::get_if<Ppat_variant>(&p->desc)) {
+      static const bool lax = cppcaml::dbg_env("NOPVOMEGA");
+      if (strict_pv && !lax) return false;
+      return !pvr->arg || is_irrefutable(**pvr->arg, strict_pv);
+    }
     if (auto* pz = std::get_if<Ppat_lazy>(&p->desc))  // always matches; forces
-      return is_irrefutable(*pz->p);
+      return is_irrefutable(*pz->p, strict_pv);
     return false;
   }
   // Wrap `body` (already compiled with `binders` in scope) so each binder's
@@ -17849,9 +17857,12 @@ struct Translator {
       if (!ci->rlabels.empty()) {                 // inline record: check label pats
         auto* pr = pk->arg ? std::get_if<Ppat_record>(&effective_pat(pk->arg->get())->desc) : nullptr;
         if (!pr) return false;
-        for (auto& [l, s] : pr->fields) if (!is_irrefutable(*s)) return false;
+        // strict_pv: this is a COVERAGE question -- `Error `Not_found` must
+        // not read as `Error _` (it silently dropped the sibling arm).
+        for (auto& [l, s] : pr->fields) if (!is_irrefutable(*s, /*strict_pv=*/true)) return false;
       } else
-        for (auto* fp : ctor_field_pats(pk, ci->arity)) if (!is_irrefutable(*fp)) return false;
+        for (auto* fp : ctor_field_pats(pk, ci->arity))
+          if (!is_irrefutable(*fp, /*strict_pv=*/true)) return false;
       names.insert(cn);
     }
     if (type.empty()) return false;
