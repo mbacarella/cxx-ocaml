@@ -411,6 +411,10 @@ struct Checker {
   // the predefined `Error`.  Enumerating `result` off the flat map then yields a
   // constructor whose result type is `exn`; this map is the shadow-proof source.
   std::unordered_map<std::string, TypePtr> predef_ctor_schemes_;
+  // Per-TYPE view of the above for poly_arg_partial (result/option/list),
+  // built on first use: the predefined types have no type_ctor_schemes_ entry.
+  std::unordered_map<std::string, std::vector<std::pair<std::string, TypePtr>>>
+      predef_type_schemes_;
   std::set<std::string> exn_ctors_;
   std::set<const void*> ext_rebind_registered_;  // resolved Pext_rebind ctors
   // Exception/typext AST nodes already registered, so the flat `ctors` map isn't
@@ -5474,11 +5478,34 @@ struct Checker {
                                // discarded there anyway)
     TypePtr s = I::Engine::repr(scrut);
     if (s->kind != I::Type::Kind::Constr) return false;
+    const std::vector<std::pair<std::string, TypePtr>>* slist = nullptr;
     auto schemes = type_ctor_schemes_.find(s->path);
-    if (schemes == type_ctor_schemes_.end()) return false;
+    if (schemes != type_ctor_schemes_.end()) slist = &schemes->second;
+    else if (!getenv("NOPVPART")) {
+      // The PREDEFINED variants are registered straight into the flat `ctors`
+      // map and have no type_ctor_schemes_ entry, so an annotated
+      // `(int, [`A | `B]) result` scrutinee fell out of this analysis entirely
+      // and `Error `A` read as covering `Error _` (the match kept its Total
+      // verdict and the back end dropped the payload test).  A source-level
+      // re-declaration of the name owns a real entry and never reaches here;
+      // predef_ctor_schemes_ is the shadow-proof source for the rest.
+      static const std::unordered_map<std::string, std::vector<std::string>>
+          predef_variant_ctors = {{"result", {"Ok", "Error"}},
+                                  {"option", {"Some", "None"}},
+                                  {"list", {"::", "[]"}}};
+      auto pv = predef_variant_ctors.find(s->path);
+      if (pv == predef_variant_ctors.end()) return false;
+      auto& cache = predef_type_schemes_[s->path];
+      if (cache.empty())
+        for (auto& n : pv->second)
+          if (auto ps = predef_ctor_schemes_.find(n); ps != predef_ctor_schemes_.end())
+            cache.emplace_back(n, ps->second);
+      slist = &cache;
+    }
+    if (!slist) return false;
     std::multimap<std::string, const Pattern*> args;
     for (auto& c : cases) if (!c.guard) collect_ctor_args(c.lhs, args);
-    for (auto& [cname, sch] : schemes->second) {
+    for (auto& [cname, sch] : *slist) {
       auto range = args.equal_range(cname);
       if (range.first == range.second) continue;  // ctor not matched here
       TypePtr result;

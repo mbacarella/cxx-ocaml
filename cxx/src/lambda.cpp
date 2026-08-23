@@ -964,6 +964,15 @@ struct Translator {
   //   Set and restored unconditionally by every gmatch_top entry, so a nested
   // match compiled mid-construction can never see a stale license.
   int gm_tp_deid_ = -1;
+  // The enclosing match/function compile's checker verdict was POSITIVELY
+  // Partial (ValueKinds.match_partial set and true -- compute_partial answers
+  // true only when CERTAIN, e.g. a refutable poly-variant payload under a
+  // covered ctor).  Distinct from a threaded `total=false`, which nested
+  // sub-compiles pass for "unknown": only the positive verdict withdraws the
+  // lax pv readings (the single-irrefutable-row site and the variant column's
+  // gm_fake_deid_ no-fail license), so conservative-Total behavior is
+  // untouched.  Set/restored at the Pexp_match and function-cases entries.
+  bool cur_match_partial_ = false;
   // Entry eids to which mkexit routed a DEEP fully-matched miss (see
   // GmDef::head_dropped).  The ctor-chunk driver rejects a SPREAD-containing
   // attempt whose own entries (eids allocated during the attempt) got such a
@@ -15628,8 +15637,16 @@ struct Translator {
           if (!std::get_if<Ppat_variant>(&r.cols[0]->desc))
             dmat.emplace_back(r.cols.begin(), r.cols.end());
         bool sig_complete = universe > 0 && (int)cells.size() == universe;
+        // The gm_fake_deid_ leg of the no-fail license assumes "no catch-all =>
+        // exhaustive by typing"; a POSITIVE Partial verdict (a refutable pv
+        // payload, e.g. `Error `Not_found` over `[`Not_found|`Functor]`) says
+        // otherwise, so the miss must keep its route to the entry's
+        // Match_failure default instead of the tag's action absorbing it.
+        static const bool lax_pv_col = cppcaml::dbg_env("NOPVPART");
         bool total_ctx = denv.empty() && dmat.empty() &&
-                         (deid == gm_tp_deid_ || deid == gm_fake_deid_);
+                         (deid == gm_tp_deid_ ||
+                          (deid == gm_fake_deid_ &&
+                           (!cur_match_partial_ || lax_pv_col)));
         bool nofail = sig_complete || total_ctx;
         int cdflt = dmat.empty() ? -1 : ++next_exit_;
         int fexit = nofail ? -1
@@ -20627,9 +20644,15 @@ struct Translator {
       }
     }
     // A single irrefutable non-catchall row (e.g. a polyvariant payload
-    // `` `A g -> .. ``): destructure directly, no test.
+    // `` `A g -> .. ``): destructure directly, no test.  The lax pv reading
+    // ("exhaustive by typing") is only licensed when the enclosing match IS
+    // total: a checker-proven Partial means some pv leaf here is genuinely
+    // refutable (`Error `Not_found` over a `[`Not_found|`Functor]` payload),
+    // so fall through to a tested path that keeps the Match_failure.
+    static const bool lax_pv_partial = cppcaml::dbg_env("NOPVPART");
     if (rows.size() == 1 && !rows[0].guard && !is_catchall(*rows[0].lhs) &&
-        is_irrefutable(*rows[0].lhs)) {
+        is_irrefutable(*rows[0].lhs,
+                       /*strict_pv=*/cur_match_partial_ && !lax_pv_partial)) {
       std::vector<std::pair<Ident, LamPtr>> binders;
       scope.emplace_back();
       bool ok = collect_binders(*rows[0].lhs, scrut, binders);
@@ -23486,6 +23509,13 @@ struct Translator {
     }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) return lazy_expr(*lz->e);
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      // Record the checker's POSITIVE partiality verdict for every sub-compile
+      // of this match (see cur_match_partial_); restored on every return path.
+      struct PartialGuard {
+        Translator* t; bool save;
+        ~PartialGuard() { t->cur_match_partial_ = save; }
+      } pguard{this, cur_match_partial_};
+      cur_match_partial_ = !match_is_total(&e);
       // Mixed value/exception arms: the scrutinee is evaluated under a try whose
       // body exits with the value -- value arms run OUTSIDE the try, exception
       // arms dispatch in its handler:
@@ -27391,9 +27421,12 @@ struct Translator {
       // the param's kind is the scrutinee type = any case pattern's (unified)
       l->params.push_back({pid, pat_kind(&fc->cases[0].lhs)});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
+      bool ps_save = cur_match_partial_;
+      cur_match_partial_ = !function_is_total(fc);
       l->body = wrap_optdefs(wrap_binders(
           compile_match(scrut, fc->cases, floc, function_is_total(fc),
                         total_is_proven(fc)), binders));
+      cur_match_partial_ = ps_save;
     } else {
       l->body = mk(Lam::K::ConstInt);
     }
