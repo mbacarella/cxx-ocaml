@@ -12168,6 +12168,20 @@ struct Translator {
   // vs result's builtin Error compiled to a variant TAG test, misreading every
   // foreign exception during error reporting (bootstrap bug #13).
   bool exn_typed_pat(const Pattern* p, const std::string& cn) {
+    // A ctor QUALIFIED by a module path that exports the name as a runtime
+    // FIELD (`M.Foo` under `module M = struct exception Foo end`) is an
+    // extension ctor regardless of the flat tables: a variant ctor is never a
+    // module field, so the resolved identity is proof.  Without this, a LATER
+    // top-level `type t = Foo | Bar` squats ctor_info_ and the const stages
+    // compile `match (M.Foo : exn) with M.Foo ->` as an int test over t --
+    // the qualified pattern never reaches ext_match's own qualified_exn
+    // override because ctor_switch_vals resolves the bare name first.
+    static const bool no_qual = cppcaml::dbg_env("NOQEXNPAT");
+    if (!no_qual)
+      if (auto* k = std::get_if<Ppat_construct>(&p->desc))
+        if (std::holds_alternative<Ldot>(k->id.txt.v) &&
+            qualified_exn_identity(k->id.txt) != nullptr)
+          return true;
     auto it = vk.pat_constr.find(p);
     if (it == vk.pat_constr.end() || it->second != "exn") return false;
     return exn_ident_.count(cn) || exn_field_.count(cn) ||
@@ -12691,6 +12705,12 @@ struct Translator {
       return std::holds_alternative<Pconst_integer>(pc->c.desc) ? 1 : 999;
     auto* k = std::get_if<Ppat_construct>(&p->desc);
     if (!k) return 999;
+    // An exn/extension-typed ctor is identity-tested (ext_match's path), never
+    // a variant tag test: without this a 1-const-1-block variant squatting the
+    // bare name (`type t = E of int | X` vs an exn `E of int`) slips through
+    // the ctor_info_ lookup below and nested_match reads the exn block as t.
+    static const bool no_qual = cppcaml::dbg_env("NOQEXNPAT");
+    if (!no_qual && exn_typed_pat(p, ctor_of(*p))) return 999;
     auto cit = ctor_info_.find(ctor_of(*p));
     if (cit == ctor_info_.end()) return 999;
     auto& ci = cit->second;
