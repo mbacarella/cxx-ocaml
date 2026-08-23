@@ -31957,6 +31957,22 @@ struct Translator {
         for (auto& it2 : cursig.items)  // no-slot items survive for lookup
           if (!it2.runtime && !out_sig->find(it2.ns, it2.name))
             out_sig->push(it2);
+        // The TARGET sig's ABSENT alias members (`R : sig module M = P end`):
+        // the coercion rightly drops M's slot, but R's signature still names
+        // M as an alias of P -- keep the item so resolve_module_path's
+        // substitution serves the member read (R.M.f reads P.f).  Without it
+        // the ascribed Sig has no M at all and the read is unresolvable.
+        static const bool no_asc = cppcaml::dbg_env("NOASCALIAS");
+        if (!no_asc && coerce_msig)
+          for (auto& it2 : coerce_msig->items)
+            if (it2.ns == modsig::NS::Module && !it2.runtime &&
+                !it2.alias_of.empty()) {
+              // replace the struct's own elided-alias item (it records no
+              // target path) -- but never a runtime item's slot
+              const modsig::Item* ex = out_sig->find(it2.ns, it2.name);
+              if (!ex || (!ex->runtime && ex->alias_of.empty()))
+                out_sig->push(it2);
+            }
       } else {
         *out_sig = cursig;
       }
