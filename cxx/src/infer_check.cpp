@@ -6787,6 +6787,12 @@ struct Checker {
   struct PendingExpr { const Expression* e; TypePtr t; std::string pfx; };
   std::vector<PendingPat> pending_pat_disambig_;
   std::vector<PendingExpr> pending_expr_disambig_;
+  // Bare constructs whose EXPECTED type was a concrete `exn` when the
+  // disambig pass saw them (`open E; f (Error 7)` with f : exn -> _): the
+  // only exn typings the back end may trust for ctor resolution -- a
+  // last-wins scheme hit with an unresolved expectation types `exn` too,
+  // but says nothing (env.ml's result-typed `Error` rows under a var).
+  std::unordered_set<const void*> exn_expected_constructs_;
   // Functor-argument structs whose bindings were already inferred (the kinds
   // pass descends them for their records; module_exports can re-visit a node).
   std::unordered_set<const void*> inferred_arg_structs_;
@@ -7281,6 +7287,9 @@ struct Checker {
       pending_expr_disambig_.push_back({&e, expected, proc_mod_prefix_});
       return;
     }
+    if (er->kind == I::Type::Kind::Constr && er->path == "exn" &&
+        std::holds_alternative<Lident>(k->id.txt.v))
+      exn_expected_constructs_.insert(&e);
     bool er_variant = er->kind == I::Type::Kind::Constr &&
                       er->path.find('.') != std::string::npos &&
                       // A DEFERRED expectation (a var when seen inline, pinned
@@ -12190,6 +12199,16 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
       if (bu != ck.bare_unique_stamp_.end() && bu->second > 0 &&
           bu->second == r->stamp)
         vk.expr_constr[e] = r->path;
+      // A construct whose EXPECTED type was a concrete `exn` is recorded too:
+      // it is how the back end knows `open E; f (Error 7)` means the opened
+      // exception and not the builtin result ctor squatting the flat entry
+      // (the construct twin of pat_constr's "exn" mark).  The gate is the
+      // recorded EXPECTATION, not the harvested type -- a last-wins scheme
+      // hit under an unresolved expectation also types `exn` but proves
+      // nothing (env.ml's result-typed `Error` rows).
+      else if (r->path == "exn" && ck.exn_expected_constructs_.count(e) &&
+               !std::getenv("NOOPENEXN"))
+        vk.expr_constr[e] = "exn";
     }
   }
   // PRODUCER half: an ambiguous ctor CONSTRUCT used as another ctor's argument

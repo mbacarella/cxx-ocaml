@@ -1057,6 +1057,18 @@ struct Translator {
     if (off || no_pervasives_) return false;
     return stdlib_exns_.count(n) && stdlib_fields.count(n);
   }
+  // An exception an `open M` of a separately-compiled unit brought into scope
+  // (M's export field carries the identity): the FIFTH positive table of the
+  // bare-name exn gates.  Without it `open E; match e with Error .. ->` fell to
+  // the variant path, where the builtin result ctor grabbed the name (a result
+  // SWITCH over an exn block -- segfault) and an unshadowed name collapsed the
+  // match via the unknown-sole-ctor reading.  exn_value's opened-module branch
+  // already resolves the identity; only the gates were blind.
+  bool is_opened_exn_name(const std::string& n) {
+    static const bool off = cppcaml::dbg_env("NOOPENEXN");
+    if (off) return false;
+    return opened_module_exn_value(n) != nullptr;
+  }
   // `(global Name/stamp!)` for a predefined exception used by the compiler.  The
   // stamps are OCaml's fixed Predef ident stamps (the lambda dump normalizes them,
   // but -dinstr does not, so the bytecode getglobal needs the exact value).
@@ -7740,6 +7752,14 @@ struct Translator {
     if (auto a = exn_arity_.find(lid_last(k->id.txt)); a != exn_arity_.end())
       return a->second;
     if (int a = qualified_exn_arity(k->id.txt); a > 0) return a;
+    // An opened unit's exn cited in a plain MATCH: the try-with dispatch
+    // registers opened arities into exn_arity_ eagerly (above), but the ext
+    // gates reach here first when no try-with saw the name yet -- read the
+    // opened cmi directly so `open E; match e with Error (loc, k) ->` measures
+    // 2, not the 1-tuple-field default that drops the arm.
+    static const bool no_open = cppcaml::dbg_env("NOOPENEXN");
+    if (!no_open)
+      if (int a = opened_exn_arity(lid_last(k->id.txt)); a > 0) return a;
     return 1;
   }
   // Register a bare constructor (`EINTR`) brought into scope by `open M` of a
@@ -12096,7 +12116,8 @@ struct Translator {
     auto it = vk.pat_constr.find(p);
     if (it == vk.pat_constr.end() || it->second != "exn") return false;
     return exn_ident_.count(cn) || exn_field_.count(cn) ||
-           is_predef_exn_name(cn) || is_stdlib_exn_name(cn);
+           is_predef_exn_name(cn) || is_stdlib_exn_name(cn) ||
+           is_opened_exn_name(cn);
   }
   LamPtr ctor_match(const LamPtr& scrut, const std::vector<Row>& rows, const Location& mloc,
                     const LamPtr& dflt = nullptr, bool total = false,
@@ -21040,14 +21061,14 @@ struct Translator {
       if (cppcaml::dbg_env("CTDBG"))
         fprintf(stderr,
                 "[CTDBG] exn-pat %s qual=%d exn_i=%d exn_f=%d predef=%d "
-                "stdex=%d ctor=%d builtin=%d\n",
+                "stdex=%d openex=%d ctor=%d builtin=%d\n",
                 n.c_str(), (int)qualified_exn, (int)exn_ident_.count(n),
                 (int)exn_field_.count(n), (int)is_predef_exn_name(n),
-                (int)is_stdlib_exn_name(n), (int)ctor_info_.count(n),
-                (int)builtin_ctors_.count(n));
+                (int)is_stdlib_exn_name(n), (int)is_opened_exn_name(n),
+                (int)ctor_info_.count(n), (int)builtin_ctors_.count(n));
       if (!qualified_exn &&
           ((!exn_ident_.count(n) && !exn_field_.count(n) && !is_predef_exn_name(n) &&
-            !is_stdlib_exn_name(n)) ||
+            !is_stdlib_exn_name(n) && !is_opened_exn_name(n)) ||
            (ctor_info_.count(n) && !builtin_ctors_.count(n))))
         return nullptr;
       if (k->arg) {  // binder shapes exn_case_body supports only
@@ -21203,7 +21224,7 @@ struct Translator {
                          qualified_exn_identity(k0->id.txt) != nullptr;
     if (!qualified_exn &&
         ((!exn_ident_.count(nm) && !exn_field_.count(nm) && !is_predef_exn_name(nm) &&
-          !is_stdlib_exn_name(nm)) ||
+          !is_stdlib_exn_name(nm) && !is_opened_exn_name(nm)) ||
          (ctor_info_.count(nm) && !builtin_ctors_.count(nm))))
       return nullptr;
     LamPtr idv = qualified_exn_identity(k0->id.txt);
@@ -22508,6 +22529,12 @@ struct Translator {
   // are left to pat_test's OR, preserving their existing codegen.
   using Choices = std::unordered_map<const Pattern*, const Pattern*>;
   const Choices* cur_choices_ = nullptr;
+  // naive_match's column pivot (ctor_match/gmatch's exn-shadow correction, for
+  // the naive tier): when the TOP column's non-exn rows pin one concrete
+  // variant type that owns every exn-typed ctor name, pat_test resolves those
+  // names against it (`Ok _ | Error `Not_found` under `open Cmi_format`)
+  // instead of emitting an extension-identity test against the wrong exn.
+  std::string naive_pivot_;
   static constexpr size_t kOrExpandCap = 64;
   // Enumerate the or-free instantiations of a pattern's BINDING or-nodes.
   bool expand_pattern(const Pattern* p0, std::vector<Choices>& out) {
@@ -22646,14 +22673,24 @@ struct Translator {
     if (auto* k = std::get_if<Ppat_construct>(&p->desc)) {
       std::string cn = ctor_of(*p);
       auto ci = ctor_info_.find(cn);
-      if (ci == ctor_info_.end() || exn_typed_pat(p, cn)) {
+      // the naive column pivot: an exn-typed name the pivot variant owns is
+      // that variant's ctor here (type-directed disambiguation, see naive_match)
+      const CtorInfo* pivC = nullptr;
+      if (!naive_pivot_.empty() && exn_typed_pat(p, cn))
+        pivC = predef_ctor_lookup(naive_pivot_, cn);
+      if (!pivC && (ci == ctor_info_.end() || exn_typed_pat(p, cn))) {
         // an EXTENSION constructor (exn_ident_/exn_field_): test the identity
         // (the value itself when nullary, else field 0), like ext_match -- so a
         // pattern containing one (`Some B`, `(Some A|Some B), A`) matches in the
         // multi-column naive matcher instead of bailing.
         if (exn_ident_.count(cn) || exn_field_.count(cn) ||
-            is_predef_exn_name(cn) || module_ctor_identity(k->id.txt)) {
+            is_predef_exn_name(cn) || is_opened_exn_name(cn) ||
+            module_ctor_identity(k->id.txt)) {
           int arity = exn_arity_.count(cn) ? exn_arity_[cn] : (k->arg ? 1 : 0);
+          // an opened unit's exn: the true arity is in its cmi, not exn_arity_
+          static const bool no_open = cppcaml::dbg_env("NOOPENEXN");
+          if (!no_open && k->arg && !exn_arity_.count(cn))
+            if (int a = opened_exn_arity(cn); a > 0) arity = a;
           // a module-qualified extension constructor (`M1.E`) compares against
           // that module's own field, not the last same-named binder
           LamPtr ident = module_ctor_identity(k->id.txt);
@@ -22674,7 +22711,7 @@ struct Translator {
       }
       // Resolve the pattern ctor through its inferred type (non-mutating), so a same-named
       // ctor of another type that squatted ctor_info_ doesn't give the wrong tag/type here.
-      const CtorInfo& C = *pat_ctor_resolve(p, cn);
+      const CtorInfo& C = pivC ? *pivC : *pat_ctor_resolve(p, cn);
       auto tc = type_ctors_.find(C.type);
       int nc = tc != type_ctors_.end() ? tc->second.first : -1;
       int nb = tc != type_ctors_.end() ? tc->second.second : -1;
@@ -23074,13 +23111,56 @@ struct Translator {
         for (auto& ch : choices) rows.push_back({a, r.rhs, r.guard, als, std::move(ch)});
       }
     }
+    // The exn-shadow column pivot (ctor_match/gmatch's correction, naive tier):
+    // scan the top column's ctor leaves (through or-trees); if the non-exn ones
+    // pin ONE variant type that owns every exn-typed name, pat_test resolves
+    // those names as that variant's ctors instead of by extension identity.
+    std::string pivot; {
+      static const bool no_open = cppcaml::dbg_env("NOOPENEXN");
+      bool bad = false, has_exn = false; std::string piv;
+      std::function<void(const Pattern*)> scan = [&](const Pattern* p) {
+        p = effective_pat(p);
+        while (auto* pa = std::get_if<Ppat_alias>(&p->desc)) p = effective_pat(pa->p.get());
+        if (auto* po = std::get_if<Ppat_or>(&p->desc)) {
+          scan(po->l.get()); scan(po->r.get()); return;
+        }
+        auto* k = std::get_if<Ppat_construct>(&p->desc);
+        if (!k) return;
+        std::string cn = ctor_of(*p);
+        if (exn_typed_pat(p, cn)) { has_exn = true; return; }
+        const CtorInfo* ci = pat_ctor_resolve(p, cn);
+        if (!ci) { bad = true; return; }
+        if (piv.empty()) piv = ci->type;
+        else if (piv != ci->type) bad = true;
+      };
+      if (!no_open) {
+        for (auto& r : rows) { if (!r.tcatch) scan(r.lhs); if (bad) break; }
+        if (!bad && has_exn && !piv.empty()) {
+          bool all = true;
+          std::function<void(const Pattern*)> chk = [&](const Pattern* p) {
+            p = effective_pat(p);
+            while (auto* pa = std::get_if<Ppat_alias>(&p->desc)) p = effective_pat(pa->p.get());
+            if (auto* po = std::get_if<Ppat_or>(&p->desc)) {
+              chk(po->l.get()); chk(po->r.get()); return;
+            }
+            if (!std::get_if<Ppat_construct>(&p->desc)) return;
+            std::string cn = ctor_of(*p);
+            if (exn_typed_pat(p, cn) && !predef_ctor_lookup(piv, cn)) all = false;
+          };
+          for (auto& r : rows) if (!r.tcatch) chk(r.lhs);
+          if (all) pivot = piv;
+        }
+      }
+    }
     LamPtr chain = raise_predef("Match_failure", mloc, "naive_chain");
     for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
       LamPtr test;
       std::vector<std::pair<Ident, LamPtr>> binds;
       if (!it->tcatch) {
         cur_choices_ = it->choices.empty() ? nullptr : &it->choices;
+        naive_pivot_ = pivot;
         bool ok = pat_test(it->lhs, scrut, test, binds);
+        naive_pivot_.clear();
         cur_choices_ = nullptr;
         if (!ok) return nullptr;
       }  // tcatch: test stays null (irrefutable residual), only aliases bind
@@ -24400,8 +24480,16 @@ struct Translator {
       // raise_pos so a type-directed `(Error x : _ result)` under the same open is
       // untouched.  A LOCAL exception (exn_ident_/exn_field_) has its own shadow
       // path below, so exclude those here.
+      // ... and the same holds OUTSIDE raise position when the checker
+      // POSITIVELY typed the construct `exn` (`open E; f (Error 7)` with
+      // f : exn -> _): the open's exception shadows the builtin, and a
+      // result-typed `Error x` infers `result`, never `exn`, so it keeps the
+      // variant reading.
+      bool exn_typed_expr = false;
+      if (auto ecx = vk.expr_constr.find(&e); ecx != vk.expr_constr.end())
+        exn_typed_expr = ecx->second == "exn";
       LamPtr opened_raise_exn = nullptr;
-      if (raise_pos && std::holds_alternative<Lident>(k->id.txt.v) &&
+      if ((raise_pos || exn_typed_expr) && std::holds_alternative<Lident>(k->id.txt.v) &&
           !exn_ident_.count(n) && !exn_field_.count(n) && builtin_ctors_.count(n))
         opened_raise_exn = opened_module_exn_value(n);
       // The node's INFERRED constructed type outranks the flat entry when they
@@ -24753,6 +24841,11 @@ struct Translator {
         // when the constructor was declared with several fields.
         int arity = 1;
         if (auto a = exn_arity_.find(n); a != exn_arity_.end()) arity = a->second;
+        else {  // an opened unit's exn: its cmi carries the true arity
+          static const bool no_open = cppcaml::dbg_env("NOOPENEXN");
+          if (!no_open)
+            if (int oa = opened_exn_arity(n); oa > 0) arity = oa;
+        }
         std::vector<const Expression*> fs;
         // an inline-record exception (`E of { a; b }`) flattens its record
         // fields directly into the block, in declaration order
