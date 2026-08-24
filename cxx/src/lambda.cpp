@@ -23642,6 +23642,16 @@ struct Translator {
       struct SharedWrap { int eid; const Expression* rhs; bool all_exn; };
       std::vector<SharedWrap> shared_wrap;
       bool eff_guard = false;
+      // An effect-syntax match compiles its value and exception rows into
+      // SEPARATE closures (the retc/exnc of caml_alloc_stack), which a static
+      // exit cannot cross -- the catch wrapping the shared body is only ever
+      // emitted on the frows-empty path below, so a shared exit would dangle.
+      // ocamlc duplicates a mixed or-pattern's body into each closure there;
+      // duplicating (the any_bind path) matches it.
+      static const bool no_effshared = cppcaml::dbg_env("NOEFFSHARED") != nullptr;
+      bool has_eff_arm = false;
+      for (auto& c : m->cases)
+        if (std::holds_alternative<Ppat_effect>(c.lhs.desc)) { has_eff_arm = true; break; }
       for (auto& c : m->cases) {
         const Expression* g = c.guard ? c.guard->get() : nullptr;
         // A value-or-exception or-pattern (`| P as x | exception (Q as x) ->`)
@@ -23669,7 +23679,7 @@ struct Translator {
               if (auto* pe2 = std::get_if<Ppat_exception>(&l->desc)) bp = pe2->p.get();
               if (pattern_binds(bp)) { any_bind = true; break; }
             }
-            if (!any_bind) {
+            if (!any_bind && (!has_eff_arm || no_effshared)) {
               bool all_exn = true;
               for (auto* l : leaves)
                 if (!std::holds_alternative<Ppat_exception>(l->desc)) { all_exn = false; break; }
