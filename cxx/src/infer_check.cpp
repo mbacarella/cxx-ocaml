@@ -931,26 +931,49 @@ struct Checker {
         if (is_format_base(p)) { std::vector<TypePtr> fa; for (auto& a : n->args) fa.push_back(from_cmi(a, memo)); return eng.constr("format6", std::move(fa)); }
         // expand a same-module type abbreviation (Float.t = float, Int.t = int) --
         // but NOT in a functor result, where `elt = Ord.t` stays the abstract,
-        // binding-qualified name (`IntSet.elt`), not its expansion.
+        // binding-qualified name (`IntSet.elt`), not its expansion.  Search the
+        // enclosing cmi scopes innermost->outermost, stopping at the FIRST level
+        // that declares the name (shadowing): an abbreviation declared in an
+        // ANCESTOR of the accessed module still expands (Doc.Sub's `tag :
+        // ('a,'b) fmt -> ..` with fmt declared in Doc) -- searching only the
+        // deepest level shipped `M.Doc.Sub.tag "n=%d"`'s literal as a plain
+        // string (the format-block miscompile class).  NOALIASNEST restores
+        // the deepest-only search.
         if (!fold_abbrevs_ &&
             !func_result_mode_ && cmi_types_ctx_ && n->path && n->path->kind == cmi::Path::Pident &&
-            !cmi_expanding_.count(n->path->id.name))
-          for (auto& td : *cmi_types_ctx_)
-            if (td.name == n->path->id.name && td.manifest &&
-                // Keep an EXTENSIBLE abbreviation as its own name, not its
-                // manifest: `Effect.t = 'a eff = ..` prints `Effect.t`, not the
-                // builtin `eff` (and `eff` would not unify with a typext's bare
-                // `t`, leaving `perform (Set x)` polymorphic instead of unit).
-                td.kind != cmi::TypeDecl::Open &&
-                td.params.size() == n->args.size()) {
-              std::unordered_map<cmi::TypeExpr*, TypePtr> m2;
-              for (size_t i = 0; i < td.params.size(); ++i)
-                m2[td.params[i].get()] = from_cmi(n->args[i], memo);
-              cmi_expanding_.insert(td.name);
-              TypePtr r = from_cmi(td.manifest, m2);
-              cmi_expanding_.erase(td.name);
-              return r;
-            }
+            !cmi_expanding_.count(n->path->id.name)) {
+          static const bool no_aliasnest = std::getenv("NOALIASNEST") != nullptr;
+          std::vector<const std::vector<cmi::TypeDecl>*> lvls;
+          if (!no_aliasnest && !cmi_scopes_.empty())
+            for (auto it = cmi_scopes_.rbegin(); it != cmi_scopes_.rend(); ++it)
+              lvls.push_back(it->first);
+          else
+            lvls.push_back(cmi_types_ctx_);
+          for (auto* lvl : lvls) {
+            bool found_name = false;
+            for (auto& td : *lvl)
+              if (td.name == n->path->id.name) {
+                found_name = true;
+                if (td.manifest &&
+                    // Keep an EXTENSIBLE abbreviation as its own name, not its
+                    // manifest: `Effect.t = 'a eff = ..` prints `Effect.t`, not the
+                    // builtin `eff` (and `eff` would not unify with a typext's bare
+                    // `t`, leaving `perform (Set x)` polymorphic instead of unit).
+                    td.kind != cmi::TypeDecl::Open &&
+                    td.params.size() == n->args.size()) {
+                  std::unordered_map<cmi::TypeExpr*, TypePtr> m2;
+                  for (size_t i = 0; i < td.params.size(); ++i)
+                    m2[td.params[i].get()] = from_cmi(n->args[i], memo);
+                  cmi_expanding_.insert(td.name);
+                  TypePtr r = from_cmi(td.manifest, m2);
+                  cmi_expanding_.erase(td.name);
+                  return r;
+                }
+                break;
+              }
+            if (found_name) break;  // shadowed: outer same-named decls invisible
+          }
+        }
         // qualify a same-unit (Pident) type with its owning module.  Search the
         // enclosing scopes innermost->outermost so a parent-module type resolves
         // to its OWN module (`kind` in `Array1.create` -> `Bigarray.kind`).
@@ -2054,6 +2077,14 @@ struct Checker {
   // target, so the LABELLED map applies (`List.map xs ~f`).  bare name ->
   // target path components.
   std::unordered_map<std::string, std::vector<std::string>> opened_module_aliases_;
+  // Top-level module ALIASES of an EXTERNAL target (`module Fmt = Format_doc`,
+  // `module MP = A.B`): alias name -> target path, so a NESTED member access
+  // through the alias (`Fmt.Doc.msg`) walks the TARGET's cmi.  The lookup
+  // otherwise fell to a fresh var, so a format literal there typed as a plain
+  // string -- includecore's `Fmt.Doc.msg "The type"` shipped a raw string
+  // where Doc.msg field-accesses a format block (a live miscompile).
+  // NOALIASNEST restores the old skip.
+  std::unordered_map<std::string, std::string> alias_module_targets_;
   void load_open_module_aliases(const Longident& m) {
     auto comps = mod_components(m);
     if (comps.empty()) return;
@@ -2646,9 +2677,24 @@ struct Checker {
       auto it = modenv.find(comps.back());
       if (it != modenv.end()) return it->second;
     }
+    // A top-level ALIAS of an external target (`module Fmt = Format_doc`):
+    // reroute the head to the target so the nested member decodes from its
+    // cmi.  An explicit module binding shadows opened names, so this branch
+    // comes first.  Display keeps the ACCESS route (ocamlc strengthens a
+    // cmi-loaded value's types at the path it was reached by).
+    static const bool no_aliasnest = std::getenv("NOALIASNEST") != nullptr;
+    std::string access_route;
+    if (auto ua = alias_module_targets_.find(comps[0]);
+        !no_aliasnest && ua != alias_module_targets_.end()) {
+      access_route = comps[0];
+      for (size_t i = 1; i < comps.size(); ++i) access_route += "." + comps[i];
+      std::vector<std::string> t = mod_components_str(ua->second);
+      t.insert(t.end(), comps.begin() + 1, comps.end());
+      comps = std::move(t);
+    }
     // An opened module's ALIAS member (`open StdLabels` -> List = ListLabels):
     // reroute the head through the alias target.
-    if (auto al = opened_module_aliases_.find(comps[0]);
+    else if (auto al = opened_module_aliases_.find(comps[0]);
         al != opened_module_aliases_.end()) {
       std::vector<std::string> t = al->second;
       t.insert(t.end(), comps.begin() + 1, comps.end());
@@ -2701,6 +2747,7 @@ struct Checker {
         }
       }
       // The accessed module (deepest scope) and its own members use the alias route.
+      if (!access_route.empty()) alias_pfx = access_route;
       if (sig && !scopes.empty()) {
         scopes.back().second = alias_pfx;
         mscopes.back().second = alias_pfx;
@@ -11746,6 +11793,7 @@ struct Checker {
                 if (tgt.find('.') != std::string::npos && tgt != *mb->binding.name.txt &&
                     !bound_module_names_.count(head)) {
                   module_aliases_.emplace_back(tgt, *mb->binding.name.txt);
+                  alias_module_targets_[*mb->binding.name.txt] = tgt;
                   // Load the aliased module's record fields (like `open`/`include`),
                   // so a functional update `{ M.rec with field }` can recover the
                   // overridden field's type.  The alias display rewrite (above) maps
@@ -11762,6 +11810,7 @@ struct Checker {
                   // types still needs its records + ctors loaded -- otherwise a
                   // whole `match exp.exp_desc with ..` degenerates to arm 0 with
                   // unresolved `?`-vars (untypeast's mapper).  No-op if T has no cmi.
+                  alias_module_targets_[*mb->binding.name.txt] = tgt;
                   load_module_record_fields(pi->id.txt);
                   if (!strict) open_module_ctors(pi->id.txt);
                 }
