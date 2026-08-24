@@ -5480,41 +5480,112 @@ struct Checker {
       return i < t->elems.size() ? t->elems[i].get() : nullptr;
     return nullptr;  // a var/`_` covering the whole tuple -> caller sees no tuple
   }
+  // The constructor-scheme list for a variant type path: a source declaration's
+  // type_ctor_schemes_ entry, else the PREDEFINED variants, which are
+  // registered straight into the flat `ctors` map and have no
+  // type_ctor_schemes_ entry -- without this leg an annotated
+  // `(int, [`A | `B]) result` scrutinee fell out of the analysis entirely and
+  // `Error `A` read as covering `Error _` (the match kept its Total verdict
+  // and the back end dropped the payload test).  A source-level re-declaration
+  // of the name owns a real entry and never reaches the predef leg;
+  // predef_ctor_schemes_ is the shadow-proof source for the rest.
+  const std::vector<std::pair<std::string, TypePtr>>*
+  ctor_scheme_list(const std::string& path) {
+    auto schemes = type_ctor_schemes_.find(path);
+    if (schemes != type_ctor_schemes_.end()) return &schemes->second;
+    if (getenv("NOPVPART")) return nullptr;
+    static const std::unordered_map<std::string, std::vector<std::string>>
+        predef_variant_ctors = {{"result", {"Ok", "Error"}},
+                                {"option", {"Some", "None"}},
+                                {"list", {"::", "[]"}}};
+    auto pv = predef_variant_ctors.find(path);
+    if (pv == predef_variant_ctors.end()) return nullptr;
+    auto& cache = predef_type_schemes_[path];
+    if (cache.empty())
+      for (auto& n : pv->second)
+        if (auto ps = predef_ctor_schemes_.find(n); ps != predef_ctor_schemes_.end())
+          cache.emplace_back(n, ps->second);
+    return &cache;
+  }
+  // Like collect_ctor_args, but STRICT: false on any leaf that is not a
+  // constructor pattern, so a nested position's coverage is only trusted when
+  // every pattern reaching it was decomposed.  (The lenient collector is fine
+  // at the match's top level, where a non-ctor row -- e.g. an `exception E`
+  // arm -- covers no values; at a nested position nothing but ctor patterns
+  // and wildcards can appear, and the caller has already peeled wildcards.)
+  static bool ctor_args_strict(const Pattern& p,
+                               std::multimap<std::string, const Pattern*>& out) {
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
+      out.emplace(lid_last(k->id.txt), k->arg ? &**k->arg : nullptr);
+      return true;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return ctor_args_strict(*o->l, out) && ctor_args_strict(*o->r, out);
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return ctor_args_strict(*c->p, out);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return ctor_args_strict(*a->p, out);
+    return false;
+  }
+  // One nested argument position: is some value of type `pt0` provably
+  // unmatched by every pattern in `pats`?  A closed polyvariant position runs
+  // the tag-coverage check; a variant-typed Constr position DESCENDS through
+  // the ctor payloads (hook NOPVDEEP reverts to skipping, the pre-S289
+  // behavior), so an under-covered pv row ANY number of ctors deep is seen --
+  // `Some (Error `Functor)` under `Some (Ok _) | Some (Error `Not_found)` is
+  // unmatched two ctors down.  A ctor `pats` never mentions is skipped: that
+  // hole is the back end's ordinary switch default, not a folded payload
+  // test.  Conservative everywhere else (wildcard / unanalyzable / open row
+  // => not flagged).  Terminates structurally: recursion strictly descends
+  // into sub-patterns of `pats`.
+  bool pv_pos_partial(const TypePtr& pt0, const std::vector<const Pattern*>& pats) {
+    TypePtr pt = I::Engine::repr(pt0);
+    if (pt->kind == I::Type::Kind::Variant && !pt->labels.empty()) {
+      std::set<std::string> covered;
+      for (auto* p : pats)
+        if (!pure_variant_tags(*p, covered)) return false;  // unanalyzable
+      for (auto& tag : pt->labels)
+        if (!covered.count(tag)) return true;  // uncovered row tag -> Partial
+      return false;
+    }
+    if (pt->kind != I::Type::Kind::Constr) return false;
+    if (getenv("NOPVDEEP")) return false;
+    auto* slist = ctor_scheme_list(pt->path);
+    if (!slist) return false;
+    std::multimap<std::string, const Pattern*> args;
+    for (auto* p : pats)
+      if (!ctor_args_strict(*p, args)) return false;  // unanalyzable
+    for (auto& [cname, sch] : *slist) {
+      auto range = args.equal_range(cname);
+      if (range.first == range.second) continue;  // ctor not matched here
+      TypePtr result;
+      auto ps = ctor_params(eng.instantiate(sch), result);
+      if (ps.empty()) continue;  // constant ctor
+      try_unify(result, pt);     // fresh instantiation vars only -> safe
+      for (size_t i = 0; i < ps.size(); ++i) {
+        std::vector<const Pattern*> sub;
+        bool wildcard = false;
+        for (auto it = range.first; it != range.second; ++it) {
+          const Pattern* pos = arg_position(it->second, i, ps.size());
+          if (!pos || is_catchall(*pos)) { wildcard = true; break; }
+          sub.push_back(pos);
+        }
+        if (!wildcard && pv_pos_partial(ps[i], sub)) return true;
+      }
+    }
+    return false;
+  }
   // Non-exhaustiveness via an under-covered polyvariant constructor ARGUMENT.
-  // Only fires when a ctor's argument position has a CLOSED polyvariant type
-  // (non-empty row) with a tag that no branch matches and none wildcards --
-  // sound: such a value is unmatched by every branch.  Conservative elsewhere
-  // (unanalyzable position / open row / non-variant arg => not flagged).
+  // Only fires when some (possibly nested, see pv_pos_partial) ctor argument
+  // position has a CLOSED polyvariant type (non-empty row) with a tag that no
+  // branch matches and none wildcards -- sound: such a value is unmatched by
+  // every branch.  Conservative elsewhere (unanalyzable position / open row /
+  // non-variant arg => not flagged).
   bool poly_arg_partial(const TypePtr& scrut, const std::vector<Case>& cases) {
     if (strict) return false;  // dump-only; its try_unify must not touch the
                                // reject pass's inference (match_partial is
                                // discarded there anyway)
     TypePtr s = I::Engine::repr(scrut);
     if (s->kind != I::Type::Kind::Constr) return false;
-    const std::vector<std::pair<std::string, TypePtr>>* slist = nullptr;
-    auto schemes = type_ctor_schemes_.find(s->path);
-    if (schemes != type_ctor_schemes_.end()) slist = &schemes->second;
-    else if (!getenv("NOPVPART")) {
-      // The PREDEFINED variants are registered straight into the flat `ctors`
-      // map and have no type_ctor_schemes_ entry, so an annotated
-      // `(int, [`A | `B]) result` scrutinee fell out of this analysis entirely
-      // and `Error `A` read as covering `Error _` (the match kept its Total
-      // verdict and the back end dropped the payload test).  A source-level
-      // re-declaration of the name owns a real entry and never reaches here;
-      // predef_ctor_schemes_ is the shadow-proof source for the rest.
-      static const std::unordered_map<std::string, std::vector<std::string>>
-          predef_variant_ctors = {{"result", {"Ok", "Error"}},
-                                  {"option", {"Some", "None"}},
-                                  {"list", {"::", "[]"}}};
-      auto pv = predef_variant_ctors.find(s->path);
-      if (pv == predef_variant_ctors.end()) return false;
-      auto& cache = predef_type_schemes_[s->path];
-      if (cache.empty())
-        for (auto& n : pv->second)
-          if (auto ps = predef_ctor_schemes_.find(n); ps != predef_ctor_schemes_.end())
-            cache.emplace_back(n, ps->second);
-      slist = &cache;
-    }
+    auto* slist = ctor_scheme_list(s->path);
     if (!slist) return false;
     std::multimap<std::string, const Pattern*> args;
     for (auto& c : cases) if (!c.guard) collect_ctor_args(c.lhs, args);
@@ -5526,18 +5597,14 @@ struct Checker {
       if (ps.empty()) continue;  // constant ctor
       try_unify(result, s);      // fresh instantiation vars only -> safe
       for (size_t i = 0; i < ps.size(); ++i) {
-        TypePtr pt = I::Engine::repr(ps[i]);
-        if (pt->kind != I::Type::Kind::Variant || pt->labels.empty()) continue;
-        std::set<std::string> covered;
-        bool wildcard = false, analyzable = true;
+        std::vector<const Pattern*> sub;
+        bool wildcard = false;
         for (auto it = range.first; it != range.second; ++it) {
           const Pattern* pos = arg_position(it->second, i, ps.size());
           if (!pos || is_catchall(*pos)) { wildcard = true; break; }
-          if (!pure_variant_tags(*pos, covered)) { analyzable = false; break; }
+          sub.push_back(pos);
         }
-        if (wildcard || !analyzable) continue;
-        for (auto& tag : pt->labels)
-          if (!covered.count(tag)) return true;  // uncovered row tag -> Partial
+        if (!wildcard && pv_pos_partial(ps[i], sub)) return true;
       }
     }
     return false;
