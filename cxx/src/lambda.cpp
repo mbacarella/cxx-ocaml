@@ -992,6 +992,16 @@ struct Translator {
   // cur_match_partial_ at the Pexp_match entry; function-cases have no
   // scrutinee expression node, so they conservatively compile with false.
   bool cur_scrut_exn_ = false;
+  // Upstream's per-match raise_num (matching.ml compile_matching): a
+  // positively-Partial match allocates ONE fail exit before compiling, every
+  // no-catchall default routes its misses there, and check_total wraps the
+  // Match_failure catch OUTSIDE the whole compiled match (or Simplif inlines
+  // the raise when the exit fires once).  Valid only within the CURRENT
+  // match's pattern machinery: expr() resets it on entry, so an arm body, a
+  // guard, or any other sub-expression can never route a nested compile to
+  // the enclosing match's exit.  -1 = no exit (conservative-Total match, or
+  // a caller that raises locally).
+  int cur_match_fail_eid_ = -1;
   // Entry eids to which mkexit routed a DEEP fully-matched miss (see
   // GmDef::head_dropped).  The ctor-chunk driver rejects a SPREAD-containing
   // attempt whose own entries (eids allocated during the attempt) got such a
@@ -17865,7 +17875,16 @@ struct Translator {
       arms[i] = setup_garm(apats[i], mrows[i].rhs);
       mrows[i].aid = arms[i].aid; mrows[i].vnames = &arms[i].vnames;
     }
-    int deid = ++next_exit_;
+    // A positively-Partial match with no catch-all routes its misses straight
+    // to the match-level fail exit (upstream's raise_num, see
+    // cur_match_fail_eid_): no default catch or single-use inline here --
+    // wrap_match_fail owns the exit at the match root, outside the arm
+    // catches, which is where compile_matching leaves the Match_failure
+    // catch.  This holds for a NESTED gmatch_top too (a ctor arm's payload
+    // sub-match): its misses share the same match-level exit instead of
+    // raising behind a catch local to the arm.
+    bool defer_fail = !catchall && cur_match_fail_eid_ >= 0;
+    int deid = defer_fail ? cur_match_fail_eid_ : ++next_exit_;
     // Pass 1: no tuple destructuring, no budget -- the committed single-scrutinee
     // ctor path (never explodes: col 0 is the sole column, split into bounded
     // fields).  Pass 2 (only if pass 1 bails): allow nested tuple columns under a
@@ -17904,7 +17923,7 @@ struct Translator {
     // stamp order is preserved).
     int bad = 0; int uses = count_exit(body, deid, false, bad);
     LamPtr dcatch;
-    if (uses > 0 && !(uses == 1 && bad == 0)) {
+    if (!defer_fail && uses > 0 && !(uses == 1 && bad == 0)) {
       dcatch = mk(Lam::K::Catch); dcatch->cond = body; dcatch->prim_arg = deid;
       dcatch->gm_deidc = true;
       body = dcatch;
@@ -17919,10 +17938,12 @@ struct Translator {
     if (catchall) {
       scope.emplace_back(); bind_catchall(*catchall->lhs, sv);
       dbody = expr(*catchall->rhs); scope.pop_back();
-    } else dbody = raise_predef("Match_failure", mloc, "gmatch_dft");
+    } else if (!defer_fail)
+      dbody = raise_predef("Match_failure", mloc, "gmatch_dft");
     LamPtr res = body;
     if (dcatch) dcatch->then_ = dbody;
-    else if (uses == 1 && bad == 0) inline_exit(res, deid, {}, {}, dbody);
+    else if (!defer_fail && uses == 1 && bad == 0)
+      inline_exit(res, deid, {}, {}, dbody);
     // AFTER the catchall inline: the string-column make_catch decision (below)
     // must see the FINAL default content, exactly as Bytegen runs after Simplif.
     collapse_str_dflt_catches(res);
@@ -23375,7 +23396,35 @@ struct Translator {
     return let;
   }
 
+  // Upstream's check_total: wrap the compiled match in the Match_failure
+  // catch when its fail exit (cur_match_fail_eid_) was used -- OUTSIDE the
+  // arm catches and the scrutinee bind, as compile_matching leaves it.  A
+  // single un-tried use inlines the raise in place instead (Simplif's
+  // single-use exit rule, same terms as gmatch_top's own default inline).
+  LamPtr wrap_match_fail(LamPtr body, const Location& mloc) {
+    if (cur_match_fail_eid_ < 0 || !body) return body;
+    int bad = 0; int uses = count_exit(body, cur_match_fail_eid_, false, bad);
+    if (uses == 0) return body;
+    LamPtr rb = raise_predef("Match_failure", mloc, "match_fail_top");
+    if (uses == 1 && bad == 0) {
+      inline_exit(body, cur_match_fail_eid_, {}, {}, rb);
+      return body;
+    }
+    auto c = mk(Lam::K::Catch);
+    c->cond = body; c->prim_arg = cur_match_fail_eid_; c->then_ = rb;
+    return c;
+  }
   LamPtr expr(const Expression& e) {
+    // The match-level fail exit is scoped to the pattern machinery of the
+    // match that allocated it (see cur_match_fail_eid_): any sub-EXPRESSION
+    // (arm body, guard, scrutinee) compiles with no exit in reach, so a
+    // nested partial compile raises locally instead of routing to an
+    // enclosing match's handler.
+    struct FailEidGuard {
+      Translator* t; int save;
+      ~FailEidGuard() { t->cur_match_fail_eid_ = save; }
+    } feguard{this, cur_match_fail_eid_};
+    cur_match_fail_eid_ = -1;
     // A body shared between the value and exception arm of a mixed or-pattern
     // is emitted once behind an outer catch; every citation compiles to its
     // (exit N).  Registered only while that arm's two sides are being built and
@@ -23804,6 +23853,13 @@ struct Translator {
       // dispatchers (which only bind a non-var scrutinee themselves) see the var
       // and don't double-bind.
       LamPtr sc = expr(*m->e);
+      // The fail exit is allocated AFTER the scrutinee compiles (upstream
+      // translates the arg first, then compile_matching takes raise_num) and
+      // only for the plain value-match paths below, which wrap it; the
+      // effect/tuple/mixed-exception paths above raise locally.
+      static const bool no_mfshare = cppcaml::dbg_env("NOMFSHARE") != nullptr;
+      cur_match_fail_eid_ =
+          (cur_match_partial_ && !no_mfshare) ? ++next_exit_ : -1;
       if (sc->k != Lam::K::Var && sc->k != Lam::K::ConstBlock) {
         Ident mv = fresh("", true);
         LamPtr inner = compile_match(varof(mv), m->cases, e.loc,
@@ -23811,10 +23867,12 @@ struct Translator {
         auto l = mk(Lam::K::Let);
         l->bindings = {{mv, expr_kind(m->e.get()), sc, false}};   // Strict
         l->body = inner;
-        return l;
+        return wrap_match_fail(l, e.loc);
       }
-      return compile_match(sc, m->cases, e.loc, match_is_total(&e),
-                           total_is_proven(&e));
+      return wrap_match_fail(compile_match(sc, m->cases, e.loc,
+                                           match_is_total(&e),
+                                           total_is_proven(&e)),
+                             e.loc);
     }
     if (auto* tu = std::get_if<Pexp_tuple>(&e.desc)) {
       std::vector<LamPtr> es;
@@ -27574,12 +27632,19 @@ struct Translator {
       l->params.push_back({pid, pat_kind(&fc->cases[0].lhs)});
       auto scrut = mk(Lam::K::Var); scrut->var = pid;
       bool ps_save = cur_match_partial_, se_save = cur_scrut_exn_;
+      int fe_save = cur_match_fail_eid_;
       cur_match_partial_ = !function_is_total(fc);
       cur_scrut_exn_ = false;  // no scrutinee expression node (see the member)
+      static const bool no_mfshare = cppcaml::dbg_env("NOMFSHARE") != nullptr;
+      cur_match_fail_eid_ =
+          (cur_match_partial_ && !no_mfshare) ? ++next_exit_ : -1;
       l->body = wrap_optdefs(wrap_binders(
-          compile_match(scrut, fc->cases, floc, function_is_total(fc),
-                        total_is_proven(fc)), binders));
+          wrap_match_fail(compile_match(scrut, fc->cases, floc,
+                                        function_is_total(fc),
+                                        total_is_proven(fc)),
+                          floc), binders));
       cur_match_partial_ = ps_save; cur_scrut_exn_ = se_save;
+      cur_match_fail_eid_ = fe_save;
     } else {
       l->body = mk(Lam::K::ConstInt);
     }
