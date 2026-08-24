@@ -2961,7 +2961,13 @@ struct Translator {
         if (const modsig::Item* al = es->find(modsig::NS::Module, comp)) {
           if (!al->runtime && !al->alias_of.empty()) {
             std::string rest = q == std::string::npos ? "" : dotted.substr(q);
-            return resolve_module_path(al->alias_of + rest, depth + 1);
+            std::string tgt = al->alias_of;
+            // A SELF-ROOTED target (leading dot, recorded at the elide push):
+            // the alias names a preceding member of its own struct, so the
+            // read re-roots through the container (`module M = Local` makes
+            // R.M.f read R.Local.f, upstream's strengthened path).
+            if (tgt[0] == '.') tgt = key + tgt;
+            return resolve_module_path(tgt + rest, depth + 1);
           }
           // A path component names a MODULE, so the scoped Module item's own
           // position wins over the flat last-name lookup, which a later
@@ -27973,6 +27979,14 @@ struct Translator {
               std::string tgt;
               if (lid_to_dotted(pa->id.txt, tgt)) {
                 mi.alias_of = tgt;
+                // a target naming a PRECEDING member of this same signature
+                // (`sig module A : .. module M = A end`) is SELF-ROOTED
+                // (leading dot): the read must go through the bound module
+                // (R.M.f reads R.A.f), never an outer same-named decoy
+                static const bool no_ea = cppcaml::dbg_env("NOELIDEALIAS");
+                if (!no_ea && out->find(modsig::NS::Module,
+                                        tgt.substr(0, tgt.find('.'))))
+                  mi.alias_of.insert(mi.alias_of.begin(), '.');
                 mi.sub = msig_of_module_path(tgt, depth + 1);
               }
               out->push(std::move(mi));
@@ -30709,7 +30723,13 @@ struct Translator {
                 continue;
               }
               if (auto f = lay.find(nm); f != lay.end()) {
-                module_alias_[nm] = fieldimm(f->second, varof(mid));
+                // an OUTER binding of the same name scopes over the closed
+                // struct's inner member: the postlude convenience alias must
+                // not shadow it (after `module R = struct module P = .. end`,
+                // a bare P.f reads the OUTER P, like upstream)
+                static const bool no_ea = cppcaml::dbg_env("NOELIDEALIAS");
+                if (no_ea || bi == mod_before.end())
+                  module_alias_[nm] = fieldimm(f->second, varof(mid));
                 inner_mods.push_back(nm);
               }
             }
@@ -31122,11 +31142,30 @@ struct Translator {
                   std::find(force_export->begin(), force_export->end(), nm) != force_export->end();
               if (std::holds_alternative<Pmod_constraint>(mb.expr.desc) || unpack || forced)
                 add_export_val(nm, mv, modsig::NS::Module, msub);
-              else
+              else {
                 // the elided alias still exists in the signature -- as a
-                // no-slot module item (upstream's Mp_absent)
+                // no-slot module item (upstream's Mp_absent) that REMEMBERS
+                // its target, so a member read THROUGH the enclosing module
+                // substitutes it (R.M.f reads P.f) exactly like the
+                // signature spelling `sig module M = P end` already does.
+                // A target that is itself a PRECEDING member of this struct
+                // (`module M = Local`) is recorded SELF-ROOTED (a leading
+                // dot): the outer read must go through the container
+                // (R.M.f reads R.Local.f), and only members already pushed
+                // can have captured the name -- the Env-bound sig cannot
+                // answer that order question later.
+                static const bool no_ea = cppcaml::dbg_env("NOELIDEALIAS");
+                std::string apath;
+                if (auto* pid = std::get_if<Pmod_ident>(&mex->desc))
+                  lid_to_dotted(pid->id.txt, apath);
+                if (!no_ea && !apath.empty() &&
+                    cursig.find(modsig::NS::Module,
+                                apath.substr(0, apath.find('.'))))
+                  apath.insert(apath.begin(), '.');
                 cursig.push({.ns = modsig::NS::Module, .name = nm,
-                             .runtime = false, .sub = msub});
+                             .runtime = false, .sub = msub,
+                             .alias_of = no_ea ? std::string() : apath});
+              }
             } else {
               Ident mid = fresh_scoped(nm);
               cur.push_back({mid, ValueKind::Gen, mv});
@@ -31967,10 +32006,14 @@ struct Translator {
           for (auto& it2 : coerce_msig->items)
             if (it2.ns == modsig::NS::Module && !it2.runtime &&
                 !it2.alias_of.empty()) {
-              // replace the struct's own elided-alias item (it records no
-              // target path) -- but never a runtime item's slot
+              // replace the struct's own elided-alias item -- under an
+              // ascription the SIG's target spelling is the one consumers
+              // see (`sig module M = P end = struct module M = Q end` must
+              // read P, Q being invisible outside) -- but never a runtime
+              // item's slot
+              static const bool no_ea = cppcaml::dbg_env("NOELIDEALIAS");
               const modsig::Item* ex = out_sig->find(it2.ns, it2.name);
-              if (!ex || (!ex->runtime && ex->alias_of.empty()))
+              if (!ex || (!ex->runtime && (no_ea ? ex->alias_of.empty() : true)))
                 out_sig->push(it2);
             }
       } else {
