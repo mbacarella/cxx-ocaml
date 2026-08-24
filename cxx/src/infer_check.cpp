@@ -4259,6 +4259,15 @@ struct Checker {
     type_ctors[d.name.txt] = std::move(names);
     for (auto& c : v->ctors) {
       std::unordered_map<std::string, TypePtr> vars;
+      // Build the scheme at a RAISED level so generalize (below) lifts its ROW
+      // nodes to GENERIC -- instantiate() then fresh-copies them per use.  A
+      // shared (ambient-level) row node gets destructively LINKED by a
+      // use-site merge (types.ml's internal_repr recursion unions `[> `var]`
+      // with the closed `any` row), poisoning every later instantiation: the
+      // GADT refutation then sees `none` in FKprivate's result and cannot
+      // refute it.
+      static const bool no_gadtrow_gen = std::getenv("NOGADTROW") != nullptr;
+      if (!no_gadtrow_gen) eng.enter_level();
       std::vector<TypePtr> params;
       for (auto& p : d.params) params.push_back(from_coretype(*p, vars));
       // A GADT constructor's explicit result (`Float : float -> float dyn`)
@@ -4273,12 +4282,14 @@ struct Checker {
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
       }
       register_inline_record(c.args, result, vars);  // `C of { f : t }`
+      if (!no_gadtrow_gen) eng.leave_level();
       bool nested_predef = !mod_prefix_.empty() && predef_ctors_.count(c.name.txt);
       if (ctors.count(c.name.txt)) {
         ambiguous_ctors_.insert(c.name.txt);
         if (predef_ctors_.count(c.name.txt) && mod_prefix_.empty())
           predef_toplevel_redef_.insert(c.name.txt);
       }
+      if (!no_gadtrow_gen) eng.generalize(scheme);
       if (!nested_predef) ctors[c.name.txt] = scheme;
       ctor_scheme_[&c] = scheme;  // for scoped (in-order) resolution via cenv
       type_ctor_schemes_[mod_prefix_ + d.name.txt].emplace_back(c.name.txt, scheme);
@@ -5763,6 +5774,28 @@ struct Checker {
     if (d == std::string::npos) return false;
     return bound_module_names_.count(t->path.substr(0, d)) != 0;
   }
+  // Could two polymorphic-variant ROWS have a common instance?  False only when
+  // provably distinct -- the row-parameterized GADT refutation (`FKprivate :
+  // [> `none] field_kind_gen` cannot inhabit `[`some|`var] field_kind_gen`,
+  // types.ml's link_kind family).  Model: an instance of a row must contain its
+  // REQUIRED tags (open `[>`: labels; `[<`: present) and may only carry its
+  // ALLOWED tags (`[<`/exact: labels; open: anything) -- two rows can coincide
+  // iff each side's required set fits the other's allowance.  An
+  // inherited-row bound is unexpanded here -> conservative true.
+  static bool pv_rows_could_equal(const TypePtr& a, const TypePtr& b) {
+    if (!a->inherited.empty() || !b->inherited.empty()) return true;
+    auto required = [](const TypePtr& t) -> const std::vector<std::string>& {
+      return t->variant_kind == 1 ? t->present : t->labels;
+    };
+    auto allows = [](const TypePtr& t, const std::vector<std::string>& req) {
+      if (t->variant_kind == 0) return true;  // open: any tag set fits
+      for (auto& r : req)
+        if (std::find(t->labels.begin(), t->labels.end(), r) == t->labels.end())
+          return false;
+      return true;
+    };
+    return allows(b, required(a)) && allows(a, required(b));
+  }
   // Could two GADT type indices coincide (so an omitted constructor at one index
   // cannot be refuted at the other)?  Biased toward "provably distinct" (the
   // GADT-Total default): returns true only with genuine reason to coincide -- a
@@ -5774,6 +5807,13 @@ struct Checker {
     if (is_param_projection(a) || is_param_projection(b)) return true;
     if (a->kind == I::Type::Kind::Constr && b->kind == I::Type::Kind::Constr)
       return a->path == b->path;
+    // Two pv rows previously fell through to "provably distinct" -- correct row
+    // logic (an over-eager refutation would license dropping a LIVE
+    // Match_failure, e.g. `[> `none]` at an index that includes `none`).
+    static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
+    if (!no_gadtrow && a->kind == I::Type::Kind::Variant &&
+        b->kind == I::Type::Kind::Variant)
+      return pv_rows_could_equal(a, b);
     return false;  // distinct shapes / concrete heads -> provably distinct
   }
   // A GADT `function`'s exhaustiveness, for the dump's Tfunction_cases (Partial)
@@ -5850,12 +5890,46 @@ struct Checker {
   // (rigid in ocamlc: nothing refutable), falling back to the coverage check;
   // an annotated rigid index (`k pd` scrutinee) arrives as a Constr whose var
   // argument index_could_be_equal never refutes.
+  // A scrutinee typed by a nullary local ABBREVIATION of a GADT application
+  // (`field_kind = [`some|`var] field_kind_gen`) reprs as the folded Constr, so
+  // the gadt_types test misses and the refutation never runs.  Expand such an
+  // alias chain (memoized on the manifest node -- exact under mid-file
+  // shadowing) so the scrutinee reaches its GADT head.
+  std::unordered_map<const CoreType*, TypePtr> gadt_alias_memo_;
+  TypePtr gadt_alias_expanded(TypePtr s) {
+    static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
+    if (no_gadtrow) return s;
+    for (int d = 0; d < 4; ++d) {
+      if (s->kind != I::Type::Kind::Constr || !s->args.empty() ||
+          gadt_types.count(s->path) || imported_gadt(s->path))
+        break;
+      auto ai = type_aliases.find(s->path);
+      if (ai == type_aliases.end() || !ai->second.params.empty() ||
+          !ai->second.manifest)
+        break;
+      TypePtr ex;
+      if (auto m = gadt_alias_memo_.find(ai->second.manifest);
+          m != gadt_alias_memo_.end())
+        ex = m->second;
+      else {
+        std::unordered_map<std::string, TypePtr> vars;
+        try { ex = from_coretype(*ai->second.manifest, vars); }
+        catch (const I::TypeError&) {}
+        gadt_alias_memo_[ai->second.manifest] = ex;
+      }
+      if (!ex) break;
+      TypePtr er = I::Engine::repr(ex);
+      if (er.get() == s.get()) break;
+      s = er;
+    }
+    return s;
+  }
   bool gadt_match_partial(const TypePtr& scrut, const std::vector<Case>& cases,
                           bool* proven = nullptr) {
-    TypePtr s = I::Engine::repr(scrut);
+    TypePtr s = gadt_alias_expanded(I::Engine::repr(scrut));
     if (s->kind == I::Type::Kind::Constr &&
         (gadt_types.count(s->path) || imported_gadt(s->path)))
-      return gadt_function_partial(scrut, cases, proven);
+      return gadt_function_partial(s, cases, proven);
     // The compute_partial fallbacks all thread `proven` through: a TUPLE
     // scrutinee lands here when its ctor patterns are GADT (pat_has_gadt_ctor
     // descends tuples), and tuple_gadt_partial's completed usefulness proof
@@ -6327,7 +6401,15 @@ struct Checker {
     }
     if (a->kind == K::Arrow && b->kind == K::Arrow)
       return mx_compat(a->dom, b->dom, su) && mx_compat(a->cod, b->cod, su);
-    if (a->kind == K::Variant && b->kind == K::Variant) return true;  // rows: over-approx
+    if (a->kind == K::Variant && b->kind == K::Variant) {
+      // Real row logic (was a blanket over-approx): a GADT ctor whose result
+      // row cannot fit the column's row is refuted, which is what proves
+      // `Ckind (FKvar r)`-style nested payload columns total (types.ml's
+      // undo_change).  Provably-distinct only; anything unresolved stays true.
+      static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
+      bool ce = no_gadtrow ? true : pv_rows_could_equal(a, b);
+      return ce;
+    }
     if (a->kind == K::Object && b->kind == K::Object) return true;
     if (a->kind == K::Constr && b->kind == K::Constr) {
       MxClass ca = mx_classify(a), cb = mx_classify(b);
@@ -6679,8 +6761,18 @@ struct Checker {
               if (!params.empty()) continue;  // arity mismatch: foreign dead ctor
             } else {
               const Pattern* ap = mx_peel(k->arg->get());
-              if (params.empty()) continue;  // arity mismatch: foreign dead ctor
-              if (params.size() == 1) r2.push_back(ap);
+              if (params.empty()) {
+                // An INLINE-RECORD ctor's scheme is result-only (no params
+                // modeled, see qualified_ctor_scheme): a WILD argument row
+                // (`FKvar r`) still covers the whole constructor, payload and
+                // all -- without this the row dropped as foreign arity and an
+                // empty default made the wildcard useful (types.ml's
+                // undo_change `Ckind (FKvar r)`).  A structured argument stays
+                // conservative (dropped -> no totality proof).
+                static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
+                if (!no_gadtrow && mx_wild(ap)) { /* covers, no payload cols */ }
+                else continue;  // arity mismatch: foreign dead ctor
+              } else if (params.size() == 1) r2.push_back(ap);
               else if (mx_wild(ap)) r2.assign(params.size(), nullptr);
               else if (auto* tp = std::get_if<Ppat_tuple>(&ap->desc)) {
                 if (tp->elems.size() != params.size()) continue;  // foreign arity
@@ -6797,7 +6889,8 @@ struct Checker {
       }
       if (rows.empty()) return false;
       mx_fuel_ = 20000;
-      return !mx_useful(std::move(rows), {I::Engine::repr(scrut)}, MxSubst{});
+      bool u = mx_useful(std::move(rows), {I::Engine::repr(scrut)}, MxSubst{});
+      return !u;
     } catch (const MxBail& b) {
       if (std::getenv("MXDBG"))
         fprintf(stderr, "[MXDBG] total-proof bail at infer_check.cpp:%d "
@@ -6829,6 +6922,55 @@ struct Checker {
     if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pat_is_hash_type(*a->p);
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pat_is_hash_type(*c->p);
     return false;
+  }
+  // Every or-alternative of a let pattern is a constructor with irrefutable
+  // arguments (so the alternatives' own coverage is exact -- a nested
+  // refutable sub-pattern would invalidate the totality proof below).
+  static bool ctor_alts_irrefutable(const Pattern& p0) {
+    const Pattern* p = &p0;
+    for (;;) {
+      if (auto* a = std::get_if<Ppat_alias>(&p->desc)) { p = a->p.get(); continue; }
+      if (auto* c = std::get_if<Ppat_constraint>(&p->desc)) { p = c->p.get(); continue; }
+      break;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p->desc))
+      return ctor_alts_irrefutable(*o->l) && ctor_alts_irrefutable(*o->r);
+    auto* k = std::get_if<Ppat_construct>(&p->desc);
+    if (!k) return false;
+    if (!k->arg) return true;
+    const Pattern* ap = &**k->arg;
+    while (auto* c = std::get_if<Ppat_constraint>(&ap->desc)) ap = c->p.get();
+    if (is_catchall(*ap)) return true;
+    if (auto* t = std::get_if<Ppat_tuple>(&ap->desc)) {
+      for (auto& e : t->elems) if (!is_catchall(*e)) return false;
+      return true;
+    }
+    if (auto* r = std::get_if<Ppat_record>(&ap->desc)) {
+      for (auto& [_, sp] : r->fields) if (!is_catchall(*sp)) return false;
+      return true;
+    }
+    return false;
+  }
+  // A refutable LET pattern (`let FKvar _ | FKpublic | FKabsent as k = ..`,
+  // types.ml's link_kind family) whose uncovered constructors are ALL
+  // GADT-refutable at the bound type is TOTAL -- upstream's Parmatch proves it
+  // and emits no Match_failure.  Record the proven verdict (keyed by the
+  // pattern node) into total_proven so the back end's single-row compile may
+  // drop its default, on exactly the license total_proven already carries.
+  void record_let_pat_totality(const Pattern& pat, const TypePtr& ty) {
+    static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
+    if (strict || no_gadtrow) return;
+    if (is_catchall(pat) || !ctor_alts_irrefutable(pat)) return;
+    std::set<std::string> covered;
+    collect_ctors(pat, covered);
+    if (covered.empty()) return;
+    TypePtr s = gadt_alias_expanded(I::Engine::repr(ty));
+    if (s->kind != I::Type::Kind::Constr ||
+        (!gadt_types.count(s->path) && !imported_gadt(s->path)))
+      return;
+    bool proven = false;
+    auto v = gadt_refute_uncovered(s, covered, &proven);
+    if (v && !*v && proven) total_proven.insert(&pat);
   }
   bool param_pattern_partial(const TypePtr& scrut, const Pattern& pat) {
     if (is_catchall(pat)) return false;
@@ -8216,8 +8358,16 @@ struct Checker {
       as_map_ = &tys;
       TypePtr t = infer_pat(*al->p);
       as_map_ = saved;
+      // A GADT sub-pattern REBUILDS too (upstream does: `FKvar _ | FKpublic |
+      // FKabsent as fk` binds fk at the alternatives' JOIN `[> `some|`var]
+      // fk_gen`, NOT the scrutinee's `any fk_gen` -- binding the scrutinee
+      // type let internal_repr's recursion destructively widen the closed
+      // `field_kind` row with `none`, poisoning every later GADT refutation
+      // over it).  NOGADTROW restores the old scrutinee-typed binding.
+      static const bool no_gadtrow_as = std::getenv("NOGADTROW") != nullptr;
       venv.back()[al->name.txt] =
-          pat_has_gadt_ctor(*al->p) ? t : build_as_type(*al->p, tys);
+          (no_gadtrow_as && pat_has_gadt_ctor(*al->p)) ? t
+                                                       : build_as_type(*al->p, tys);
       return t;
     }
     if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
@@ -10295,7 +10445,17 @@ struct Checker {
       // (`Names.remove s`) can no longer rename a decl arg in place (mixin's
       // free_lambda keeps `Abs of string).  The post-loop constraint
       // processing still runs (idempotent for what's already unified).
-      if (fold_abbrevs_ && !strict && f.constraint_)
+      // The kind pass takes this flow-down too, for GADT-armed cases only: the
+      // GADT refutation needs the annotation's CLOSED row as the scrutinee
+      // (`aux tl : rf -> rf = function ..` -- without it the cases pin an open
+      // construction row and FKprivate/RFnone can't be refuted, types.ml's
+      // row_field_repr_aux).  Non-GADT functions keep the old no-flow: the kind
+      // pass resolves a bare annotation name through the FLAT scope, and an
+      // ambiguous name (untypeast's two `functor_parameter`s) would pin the
+      // scrutinee to the wrong type and break the arm binders.
+      static const bool no_gadtrow_fc = std::getenv("NOGADTROW") != nullptr;
+      if ((fold_abbrevs_ || (record_kinds_ && gadt && !no_gadtrow_fc)) &&
+          !strict && f.constraint_)
         if (auto* pc0 = std::get_if<Pconstraint>(&*f.constraint_)) {
           std::unordered_map<std::string, TypePtr> local0;
           bool saved_ad = adoptable_annot_;
@@ -10661,9 +10821,29 @@ struct Checker {
             bs[i].constraint_ ? std::get_if<Pvc_constraint>(&*bs[i].constraint_)
                               : nullptr;
         if (upc && !upc->univars.empty()) ++la_scope_;
+        // A `function` RHS with GADT-ctor cases meets its patterns against the
+        // declared type, as the non-recursive branch already does -- without it
+        // a `let rec internal_repr : fk -> fk = function ..` types its cases
+        // against a FRESH param, the scrutinee row stays an open construction
+        // and the GADT refutation (which needs the annotation's closed row)
+        // cannot prove the cases total (types.ml's field_kind_internal_repr).
+        // GADT-armed only, mirroring the infer_function flow-down's gate.
+        static const bool no_gadtrow_pba = std::getenv("NOGADTROW") != nullptr;
+        auto rhs_gadt_cases = [&](const Expression& ex) -> bool {
+          auto* fe = std::get_if<Pexp_function>(&ex.desc);
+          if (!fe) return false;
+          auto* fcs = std::get_if<Pfunction_cases>(&fe->body->v);
+          if (!fcs) return false;
+          for (auto& c : fcs->cases) if (pat_has_gadt_ctor(c.lhs)) return true;
+          return false;
+        };
+        if (!no_gadtrow_pba && !strict && plain_annot[i] && bound[i] &&
+            !is_format_constr(bound[i]) && rhs_gadt_cases(*bs[i].expr))
+          pending_binding_annot_ = bound[i];
         TypePtr te = (bound[i] && is_format_constr(bound[i]))
                          ? infer_expr_expected(*bs[i].expr, bound[i])
                          : infer_expr(*bs[i].expr);
+        pending_binding_annot_ = nullptr;
         if (upc && !upc->univars.empty()) --la_scope_;
         annot_vars_ = saved_av;
         // Pin a plain annotation's flexible holes from the body (display/kind
@@ -10800,6 +10980,7 @@ struct Checker {
       if (toplevel && !strict) eng.finalize_family_heads(bound, /*scheme=*/true);
       else if (!strict) eng.finalize_owned_family_heads(bound);
       bind_pattern_scheme(b.pat, bound);
+      record_let_pat_totality(b.pat, bound);
       annot_vars_ = saved_av;
     }
   }

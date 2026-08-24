@@ -975,6 +975,13 @@ struct Translator {
   //   Set and restored unconditionally by every gmatch_top entry, so a nested
   // match compiled mid-construction can never see a stale license.
   int gm_tp_deid_ = -1;
+  // The proven-total match's ROOT scrutinee var stamp (-1 = none): the
+  // licensed CONST-hole drop below fires only on the switch over this var --
+  // an INNER or-split switcher's deid cells are live routing fails upstream
+  // keeps (simplif.ml's `enabled`), only the root switch's holes are the
+  // refuted-constructor cells upstream's sparse Lswitch stores no cell for.
+  // Saved/restored beside gm_tp_deid_.
+  int gm_tp_root_ = -1;
   // The enclosing match/function compile's checker verdict was POSITIVELY
   // Partial (ValueKinds.match_partial set and true -- compute_partial answers
   // true only when CERTAIN, e.g. a refutable poly-variant payload under a
@@ -9738,6 +9745,32 @@ struct Translator {
     if (partial) return;
     l = common;
   }
+  // A gmatch default catch whose exit count fell to ONE after the global
+  // collapses (collapse_equal_switches merges a licensed sparse const side's
+  // hole cells into a single `(exit deid)` -- link_kind's `_ -> fatal_error`
+  // arm): upstream's Matching merges those cells during construction, so its
+  // Simplif counts one use and inlines the handler in place of the exit.
+  // Demote such catches the same way -- gm_deidc-marked (gmatch's own default
+  // catches, argless, per-match-unique ids) only.
+  void demote_single_use_deid_catches(LamPtr& l) {
+    if (!l) return;
+    demote_single_use_deid_catches(l->fn);
+    demote_single_use_deid_catches(l->body);
+    demote_single_use_deid_catches(l->cond);
+    demote_single_use_deid_catches(l->then_);
+    demote_single_use_deid_catches(l->else_);
+    demote_single_use_deid_catches(l->sw_default);
+    for (auto& a : l->args) demote_single_use_deid_catches(a);
+    for (auto& b : l->bindings) demote_single_use_deid_catches(b.val);
+    for (auto& sc : l->sw_consts) demote_single_use_deid_catches(sc.body);
+    for (auto& sc : l->sw_blocks) demote_single_use_deid_catches(sc.body);
+    if (l->k != Lam::K::Catch || !l->gm_deidc || !l->then_) return;
+    int bad = 0;
+    int uses = count_exit(l->cond, l->prim_arg, false, bad);
+    if (uses != 1 || bad != 0) return;
+    inline_exit(l->cond, l->prim_arg, {}, {}, l->then_);
+    l = l->cond;
+  }
   // A cond whose evaluation has no observable effect, so an `if` testing it can
   // be dropped when both arms are identical: a Var/const, or an immutable field
   // read off such (matcher discriminators are exactly these).  Reading a field
@@ -11180,6 +11213,24 @@ struct Translator {
         return false;
       // inline record (`T {pos}`): each named label reads its block field
       if (!ci->second.rlabels.empty()) {
+        // A catchall argument (`FKvar r` / `FKvar _`) binds or ignores the
+        // whole inline record, which IS the constructor block -- r aliases the
+        // scrutinee itself, no field reads (types.ml's undo_change).  The
+        // bound var is registered whole-inline-record (inline_rec_var_) so a
+        // later `r.label` resolves through THIS ctor's rlabels, not the flat
+        // registry (local_store's `(Slot s) -> .. !(s.ref)` beside
+        // ref_and_reset's same-named `ref` field).
+        static const bool no_gadtrow_ir = std::getenv("NOGADTROW") != nullptr;
+        if (const Pattern* ap = pk->arg ? effective_pat(pk->arg->get()) : nullptr;
+            !no_gadtrow_ir && ap &&
+            (std::holds_alternative<Ppat_any>(ap->desc) ||
+             std::holds_alternative<Ppat_var>(ap->desc))) {
+          if (!collect_binders(*pk->arg->get(), scrut, out)) return false;
+          if (auto* pv = std::get_if<Ppat_var>(&ap->desc))
+            if (auto* b = lookup(pv->name.txt))
+              inline_rec_var_[b->stamp] = &ci->second;
+          return true;
+        }
         auto* pr = pk->arg ? std::get_if<Ppat_record>(&effective_pat(pk->arg->get())->desc)
                            : nullptr;
         if (!pr) return false;
@@ -11450,6 +11501,14 @@ struct Translator {
       if (tc->second.first + tc->second.second != 1 && !gadt_types_.count(ci->second.type))
         return false;
       if (!ci->second.rlabels.empty()) {  // inline record: check the label pats
+        // A catchall argument binds/ignores the whole inline record (see
+        // collect_binders' matching leg).
+        static const bool no_gadtrow_ir = std::getenv("NOGADTROW") != nullptr;
+        if (const Pattern* ap = pk->arg ? effective_pat(pk->arg->get()) : nullptr;
+            !no_gadtrow_ir && ap &&
+            (std::holds_alternative<Ppat_any>(ap->desc) ||
+             std::holds_alternative<Ppat_var>(ap->desc)))
+          return true;
         auto* pr = pk->arg ? std::get_if<Ppat_record>(&effective_pat(pk->arg->get())->desc)
                            : nullptr;
         if (!pr) return false;
@@ -12052,7 +12111,7 @@ struct Translator {
   }
   LamPtr build_ctor_group_arm(const LamPtr& scrut, const CtorInfo& ci,
                               const std::vector<const Row*>& rs, const Location& mloc,
-                              const LamPtr& dflt, bool arg_total = false) {
+                              const LamPtr& dflt, bool arg_total = false, bool arg_proven = false) {
     if (rs.size() == 1) {
       auto* k = std::get_if<Ppat_construct>(&rs[0]->lhs->desc);
       const Expression* g = rs[0]->guard;  // a `when` on this single row -> if/dflt
@@ -12092,7 +12151,7 @@ struct Translator {
       // Some-case raised instead of taking the `_ -> d` arm).
       if (dflt && !sub_rows_total(sub)) return nullptr;
       FieldInfo fi{ci.type, col, ci.rfmut[col], ci.rshape[col]};
-      return compile_match(field_read(&fi, scrut), sub, mloc, arg_total);
+      return compile_match(field_read(&fi, scrut), sub, mloc, arg_total, arg_proven);
     }
     // Multi-field group (arity >= 2) with several rows: rather than bail to the
     // caml_obj_tag if-chain, decompose the constructor's fields into a column
@@ -12140,7 +12199,7 @@ struct Translator {
       sub.push_back({ip, r->rhs, r->guard});
     }
     // With a variable sub-pattern, compile_match binds the field to that user name.
-    if (has_var) return compile_match(field0, sub, mloc, arg_total);
+    if (has_var) return compile_match(field0, sub, mloc, arg_total, arg_proven);
     // Same shared-default rule as the paths above: compile_match would fill a
     // failing sub-match with Match_failure, not the active catch-all default.
     if (dflt && !sub_rows_total(sub)) return nullptr;
@@ -12148,7 +12207,7 @@ struct Translator {
     // used more than once, inlined if not (as ocamlc's matcher does).
     Ident tv = fresh("", true);
     auto tvar = mk(Lam::K::Var); tvar->var = tv;
-    LamPtr body = compile_match(tvar, sub, mloc, arg_total);
+    LamPtr body = compile_match(tvar, sub, mloc, arg_total, arg_proven);
     if (count_var(body, tv) <= 1) { subst_alias(body, tv, field0); return body; }
     auto l = mk(Lam::K::Let); l->bindings = {{tv, ValueKind::Gen, field0, true}}; l->body = body;
     return l;
@@ -12351,8 +12410,15 @@ struct Translator {
       // specialization preserves totality): thread that down so a nested
       // poly-variant sub-match can use the pure isint split instead of hash tests.
       bool arg_total = total && exhaustive && !dflt;
+      // The proven license specializes with the matrix, exactly like totality
+      // (upstream's verdict is GLOBAL: a nested `FKvar r` payload sub-match of
+      // a proven-total match compiles with no Match_failure, types.ml's
+      // undo_change).  Hook NOGADTROW withholds it, restoring the old unproven
+      // nested compile.
+      static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
+      bool arg_proven = arg_total && proven && !no_gadtrow;
       LamPtr body = with_alias(rs[0], [&] {
-        return build_ctor_group_arm(scrut, ci, rs, mloc, dflt, arg_total);
+        return build_ctor_group_arm(scrut, ci, rs, mloc, dflt, arg_total, arg_proven);
       });
       if (!body) return nullptr;  // (rare: complex sub-pattern; arms already compiled)
       bmap[tag] = body;
@@ -12365,6 +12431,33 @@ struct Translator {
     // stored action: the first covered const, else the first covered block),
     // which comp_switch's gap rule reproduces.  No Match_failure exists at all.
     if (!exhaustive && total && proven && !dflt) {
+      // Shape from the STORED cells, like upstream's combine: every stored
+      // block one action + stored consts -> the isint split with a no-fail
+      // switcher over the sparse constant cells (view's `(if (isint p)
+      // (if (>= p 2) 2 1) 0)`); otherwise the universe-sized sparse switch.
+      static const bool no_gadtrow_sp = std::getenv("NOGADTROW") != nullptr;
+      if (!no_gadtrow_sp && !bmap.empty() && !cmap.empty()) {
+        LamPtr b0; bool bsame = true;
+        for (auto& [t, b] : bmap) {
+          if (!b0) b0 = b;
+          else if (!same_action_lam(b, b0)) { bsame = false; break; }
+        }
+        if (bsame) {
+          std::vector<Lam::SwitchCase> cc;
+          for (auto& [v, b] : cmap) cc.push_back({v, b, 0});
+          LamPtr cs = cc.size() == 1 ? cc[0].body
+                      : (int)cc.size() == NC
+                          ? const_dispatch(scrut, cc, /*has_block=*/true)
+                          : total_const_dispatch(scrut, cc, 0, NC - 1);
+          if (cs) {
+            auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
+            isint->prim_id = "isint"; isint->args = {scrut};
+            auto i = mk(Lam::K::IfThenElse);
+            i->cond = isint; i->then_ = cs; i->else_ = b0;
+            return i;
+          }
+        }
+      }
       auto sw = mk(Lam::K::Switch); sw->cond = scrut;
       for (auto& [v, b] : cmap) sw->sw_consts.push_back({v, b, 0});
       for (auto& [t, b] : bmap) sw->sw_blocks.push_back({t, b, barity[t]});
@@ -12508,6 +12601,58 @@ struct Translator {
     if (auto rt = two_run_switcher(scrut, consts, has_block)) return rt;
     auto sw = mk(Lam::K::Switch); sw->cond = scrut; sw->sw_consts = consts;
     return sw;
+  }
+  // as_interval over a TOTAL (fail=None) SPARSE constant side: the licensed
+  // hole-drop leaves cells for the covered values only, the holes are refuted
+  // values free to fold into a neighboring run -- so the first cell's interval
+  // extends down to `low`, each later cell starts at its own key, the last
+  // runs to `high` (upstream's as_interval_nofail; view's `[0..1 -> 1]
+  // [2..2 -> 2]` comes out `(if (>= p 2) 2 1)`).  Then the Switcher
+  // clustering, pure-tests outcome only (same terms as the canfail twin).
+  LamPtr total_const_dispatch(const LamPtr& scrut,
+                              const std::vector<Lam::SwitchCase>& consts,
+                              long long low, long long high) {
+    if (scrut->k != Lam::K::Var) return nullptr;   // c_test re-tests arg
+    if (consts.size() < 2) return nullptr;
+    std::vector<std::pair<long long, LamPtr>> cells;
+    for (auto& c : consts) cells.push_back({c.tag, c.body});
+    std::sort(cells.begin(), cells.end(),
+              [](auto& a, auto& b) { return a.first < b.first; });
+    std::vector<LamPtr> actions(1);                 // index 0 = default (unused)
+    std::vector<int> act_of(cells.size());
+    for (size_t i = 0; i < cells.size(); ++i) {
+      int found = 0;
+      for (int a = 1; a < (int)actions.size(); ++a)
+        if (same_action_lam(cells[i].second, actions[a])) { found = a; break; }
+      if (!found) { actions.push_back(cells[i].second); found = (int)actions.size() - 1; }
+      act_of[i] = found;
+    }
+    std::vector<SwCase> cases;
+    for (size_t i = 0; i < cells.size(); ) {
+      size_t j = i;
+      while (j + 1 < cells.size() && act_of[j + 1] == act_of[i]) j++;
+      long long lo = i == 0 ? low : cells[i].first;
+      long long hi = j + 1 == cells.size() ? high : cells[j + 1].first - 1;
+      cases.push_back({lo, hi, act_of[i]});
+      i = j + 1;
+    }
+    if (cases.size() < 2) return nullptr;
+    {  // zyva's abstract_shared: decline a store-shared action (see the twin)
+      std::vector<int> use(actions.size(), 0);
+      for (auto& c : cases) ++use[c.act];
+      auto simple_exit = [](const LamPtr& b) {
+        return b && b->k == Lam::K::Staticraise && b->args.empty();
+      };
+      for (size_t a = 1; a < actions.size(); ++a)
+        if (use[a] > 1 && !simple_exit(actions[a])) return nullptr;
+    }
+    sw_ok_inter_ = true;                            // variant tags are small
+    sw_memo_.clear();
+    std::vector<int> k; comp_clusters(cases, k);
+    std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
+    make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
+    if (made_switch) return nullptr;
+    return c_test({0, scrut}, cl_cases, cl_acts);
   }
   // as_interval_canfail (matching.ml:2798) + Switcher clustering for gmatch's
   // constant side when a fail action exists (call_switcher ~low:0 ~high:(n-1)
@@ -16742,14 +16887,29 @@ struct Translator {
       auto is_hole = [&](const LamPtr& b) {
         return b->k == Lam::K::Staticraise && b->prim_arg == deid && b->args.empty();
       };
+      auto drop_holes = [&](std::vector<Lam::SwitchCase>& v) {
+        v.erase(std::remove_if(v.begin(), v.end(),
+                  [&](const Lam::SwitchCase& c) { return is_hole(c.body); }),
+                v.end());
+      };
       bool const_hole = false;
       for (auto& c : consts) if (is_hole(c.body)) { const_hole = true; break; }
+      static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
       if (!const_hole) {
         size_t nb0 = blocks.size();
-        blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
-                       [&](const Lam::SwitchCase& c) { return is_hole(c.body); }),
-                     blocks.end());
+        drop_holes(blocks);
         tp_holes = blocks.size() != nb0;
+      } else if (!no_gadtrow && comps[0]->k == Lam::K::Var &&
+                 comps[0]->var.stamp == gm_tp_root_) {
+        // A refuted CONSTANT ctor's hole drops too (upstream's sparse Lswitch
+        // stores no cell for it: types.ml's row_field_repr_aux with RFnone
+        // refuted) -- but only on the switch over the match's ROOT scrutinee
+        // (gm_tp_root_): an inner or-split switcher's deid cells are live
+        // routing fails upstream keeps (simplif.ml's `enabled`).
+        size_t nc0 = consts.size(), nb0 = blocks.size();
+        drop_holes(consts);
+        drop_holes(blocks);
+        tp_holes = consts.size() != nc0 || blocks.size() != nb0;
       }
     }
     // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
@@ -16788,6 +16948,16 @@ struct Translator {
     // sub-matrix otherwise -- both are upstream's mk_failaction_neg exit.  With
     // no gaps (or an unrecognized gap body), const_dispatch's nofail shapes stand.
     auto const_side = [&]() -> LamPtr {
+      // A licensed hole-drop (tp_holes) leaves consts SPARSE: the gaps are
+      // refuted values with no cell (and no fail action), so the canfail scan
+      // (which indexes consts positionally, dense-only) is skipped -- the
+      // no-fail interval switcher over the stored cells is upstream's shape,
+      // and an undispatchable sparse set declines (NULL -> the caller keeps
+      // its universe-sized sparse switch).
+      if ((int)consts.size() != NC) {
+        if (consts.size() == 1) return consts[0].body;
+        return total_const_dispatch(comps[0], consts, 0, NC - 1);
+      }
       int fexit = -1;
       for (int t = 0; t < NC; ++t) if (!const_ci.count(t)) {
         const LamPtr& b = consts[t].body;
@@ -16818,11 +16988,12 @@ struct Translator {
         }
       if (one_action) {
         result = only;
-      } else if (all_same && !consts.empty()) {
+      } else if (LamPtr cs;
+                 all_same && !consts.empty() && (cs = const_side())) {
         auto isint = mk(Lam::K::Prim); isint->prim = Prim::IntCmp;
         isint->prim_id = "isint"; isint->args = {comps[0]};
         auto i = mk(Lam::K::IfThenElse);
-        i->cond = isint; i->then_ = const_side(); i->else_ = blocks[0].body;
+        i->cond = isint; i->then_ = cs; i->else_ = blocks[0].body;
         result = i;
       } else {
         auto sw = mk(Lam::K::Switch); sw->cond = comps[0]; sw->sw_srcid = srcid;
@@ -17895,6 +18066,8 @@ struct Translator {
     gm_fake_deid_ = catchall ? -1 : deid;
     int tp_save = gm_tp_deid_;
     gm_tp_deid_ = (total && proven && !catchall) ? deid : -1;
+    int rt_save = gm_tp_root_;
+    gm_tp_root_ = (gm_tp_deid_ >= 0 && sv->k == Lam::K::Var) ? sv->var.stamp : -1;
     int pt_save = gm_ptot_deid_;
     gm_ptot_deid_ = gm_tp_deid_;
     gm_orw_.clear();
@@ -17906,6 +18079,7 @@ struct Translator {
       g_gm_tuples_ = false; g_gm_budget_ = -1;
     }
     gm_tp_deid_ = tp_save;
+    gm_tp_root_ = rt_save;
     gm_fake_deid_ = fd_save;
     gm_ptot_deid_ = pt_save;
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
@@ -26115,8 +26289,50 @@ struct Translator {
             wrap->bindings.push_back({tmp, ValueKind::Gen, val});
             auto tv = mk(Lam::K::Var); tv->var = tmp; scrut = tv;
           }
+          // The checker's GADT-refutation proof for this let pattern (keyed by
+          // the pattern node): a proven-total single row compiles with no
+          // Match_failure default, as upstream's Parmatch verdict does.
+          bool ptot = total_is_proven(&b.pat);
+          // A proven-total `(C1 _ | C2 | C3) as k = e`: the alternatives bind
+          // nothing, so the whole match reduces to binding the alias names to
+          // the value (upstream's simple_for_let -- link_kind's `let FKvar _ |
+          // FKpublic | FKabsent as k = internal_repr k` is just `let k = ..`).
+          if (ptot) {
+            const Pattern* q = &b.pat;
+            std::vector<const std::string*> names;
+            while (auto* pa = std::get_if<Ppat_alias>(&q->desc)) {
+              names.push_back(&pa->name.txt);
+              q = pa->p.get();
+            }
+            std::function<bool(const Pattern&)> binderless =
+                [&](const Pattern& p0) -> bool {
+              const Pattern* p = &p0;
+              while (auto* c = std::get_if<Ppat_constraint>(&p->desc)) p = c->p.get();
+              if (std::holds_alternative<Ppat_any>(p->desc)) return true;
+              if (auto* o = std::get_if<Ppat_or>(&p->desc))
+                return binderless(*o->l) && binderless(*o->r);
+              if (auto* k = std::get_if<Ppat_construct>(&p->desc))
+                return !k->arg || binderless(**k->arg);
+              if (auto* t = std::get_if<Ppat_tuple>(&p->desc)) {
+                for (auto& el : t->elems) if (!binderless(*el)) return false;
+                return true;
+              }
+              if (std::holds_alternative<Ppat_constant>(p->desc)) return true;
+              return false;
+            };
+            if (!names.empty() && std::holds_alternative<Ppat_or>(q->desc) &&
+                binderless(*q)) {
+              auto l = mk(Lam::K::Let);
+              Ident id = fresh(*names.back());
+              l->bindings.push_back({id, pat_kind(&b.pat), val});
+              for (auto* nm : names) scope.back()[*nm] = id;
+              l->body = expr(*le->body);
+              scope.pop_back();
+              return l;
+            }
+          }
           std::vector<Row> rows = {{&b.pat, le->body.get(), nullptr}};
-          LamPtr m = compile_match(scrut, rows, e.loc);
+          LamPtr m = compile_match(scrut, rows, e.loc, ptot, ptot);
           scope.pop_back();
           if (wrap->bindings.empty()) return m;
           wrap->body = m; return wrap;
@@ -32402,6 +32618,10 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.inline_var_aliases(root);
   t.sink_facc_temp_lets(root);
   t.collapse_equal_switches(root);
+  {
+    static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
+    if (!no_gadtrow) t.demote_single_use_deid_catches(root);
+  }
   t.two_const_switch_to_if(root);
   t.resolve_str_binds(root);
   lap("simplify");
