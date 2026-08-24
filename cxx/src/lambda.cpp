@@ -21355,7 +21355,12 @@ struct Translator {
                          const Location& mloc) {
     static const bool off = cppcaml::dbg_env("NOEXTGROUP");
     if (off) return nullptr;
-    if (scrut->k != Lam::K::Var || rows.size() < 3) return nullptr;
+    // A SINGLE group row takes the same shape upstream (`Error (l, Amb
+    // {explicit = false; _}) | _`: one identity test, the payload sub-match
+    // exits to the catch-all); NOEXTSINGLE restores the n>=2 gate.
+    static const bool single_off = cppcaml::dbg_env("NOEXTSINGLE");
+    if (scrut->k != Lam::K::Var || rows.size() < (single_off ? 3u : 2u))
+      return nullptr;
     size_t n = rows.size() - 1;  // group rows; the last row is the catch-all
     if (rows.back().guard || !is_catchall(*rows.back().lhs)) return nullptr;
     const Ppat_construct* k0 = nullptr;
