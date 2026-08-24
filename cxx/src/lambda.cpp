@@ -29138,6 +29138,66 @@ struct Translator {
     } catch (...) {}
     return false;
   }
+  // As load_functor_param_sig, but the functor is a MEMBER of a local module
+  // bound to a cmi-functor APPLICATION (`Diff.Simple(struct..)` under `module
+  // Diff = Diffing_with_keys.Define(Defs)`): navigate via module_functor_src_
+  // into the outer functor's BODY signature, resolving a parameter modtype
+  // declared in that same body (`module type Parameters  module Simple:
+  // Parameters -> ..`), which mt_sig's top-level modtype lookup can't see.
+  // Without this the struct-literal argument passed in DECLARATION order while
+  // Simple reads its parameter in SIGNATURE order (weight..key_right), so every
+  // field read landed on the wrong function.  NOFAPP restores the old skip.
+  bool load_functor_param_sig_applied(const std::string& modname,
+                                      const std::string& member,
+                                      cmi::Signature& out) {
+    static const bool no_fapp = std::getenv("NOFAPP") != nullptr;
+    if (no_fapp) return false;
+    auto fs = module_functor_src_.find(modname);
+    if (fs == module_functor_src_.end()) return false;
+    const std::string& funit = fs->second.first;
+    const std::string& fname = fs->second.second;
+    try {
+      size_t dot = funit.find('.');
+      const auto& cmi = cmi::CmiFile::load(
+          resolve_cmi(dot == std::string::npos ? funit : funit.substr(0, dot)));
+      const cmi::Signature* sig = &cmi.sig();
+      for (size_t pos = dot; pos != std::string::npos;) {
+        size_t nd = funit.find('.', pos + 1);
+        std::string comp = funit.substr(pos + 1,
+            nd == std::string::npos ? std::string::npos : nd - pos - 1);
+        const cmi::Signature* next = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        if (!next) return false;
+        sig = next; pos = nd;
+      }
+      for (auto& md : sig->modules)
+        if (md.name == fname && md.type && md.type->kind == cmi::ModuleType::Functor)
+          if (const cmi::Signature* body = mt_sig(cmi, md.type->functor_body))
+            for (auto& sm : body->modules)
+              if (sm.name == member && sm.type &&
+                  sm.type->kind == cmi::ModuleType::Functor) {
+                if (const cmi::Signature* ps =
+                        mt_sig(cmi, sm.type->functor_param_type)) {
+                  out = *ps; return true;  // copy (shares kept-alive nodes)
+                }
+                const cmi::ModuleTypePtr& pt = sm.type->functor_param_type;
+                if (pt && pt->kind == cmi::ModuleType::Ident && pt->path) {
+                  const std::string& nm = pt->path->kind == cmi::Path::Pident
+                      ? pt->path->id.name : pt->path->s;
+                  for (auto& mtd : body->modtypes)
+                    if (mtd.name == nm) {
+                      if (const cmi::Signature* ps2 = mt_sig(cmi, mtd.type)) {
+                        out = *ps2; return true;
+                      }
+                      return false;
+                    }
+                }
+                return false;
+              }
+    } catch (...) {}
+    return false;
+  }
   // Coerce a struct-literal argument of a CROSS-MODULE functor to its cmi
   // parameter signature, reordering the top level AND recursing into nested
   // submodules (Arg_helper.Make's argument `module Key = struct include
@@ -29413,7 +29473,8 @@ struct Translator {
           if (auto* d = std::get_if<Ldot>(&pi->id.txt.v)) {
             if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
               cmi::Signature psig;
-              if (load_functor_param_sig(pl->name, d->name, psig))
+              if (load_functor_param_sig(pl->name, d->name, psig) ||
+                  load_functor_param_sig_applied(pl->name, d->name, psig))
                 if (LamPtr c = coerce_struct_arg_cmi(*aps, psig)) {
                   auto a = mk(Lam::K::Apply); a->fn = fval; a->args = {c}; return a;
                 }
@@ -30879,6 +30940,13 @@ struct Translator {
             for (auto& nm : inner_mods)
               copy_layout_subtree(nm, *mb.name.txt + "." + nm);
             module_ident_[*mb.name.txt] = mid;
+            // A fresh binding shadows a closed SIBLING's postlude convenience
+            // alias of the same name (module_base consults module_alias_
+            // first): Variant_diffing's `Define(Defs)` read Record_diffing's
+            // Defs field, not its own.  Live aliases erase the ident (below),
+            // so ident+alias together always means the alias is stale.
+            static const bool no_fapp_sh = std::getenv("NOFAPP") != nullptr;
+            if (!no_fapp_sh) module_alias_.erase(*mb.name.txt);
             // modsig P1: the submodule's Sig enters the Env and nests in the
             // enclosing signature.  Check that navigating it reproduces the
             // dotted-key layouts registered above.
@@ -31068,6 +31136,10 @@ struct Translator {
             }
             cur.push_back({mid, ValueKind::Gen, fv});
             module_ident_[*mb.name.txt] = mid;
+            // Same sibling-postlude-alias shadowing as the struct-bound path
+            // above; a pure-path alias re-points module_alias_ itself below.
+            static const bool no_fapp_sh2 = std::getenv("NOFAPP") != nullptr;
+            if (!no_fapp_sh2) module_alias_.erase(*mb.name.txt);
             // When the .mli RESTRICTS this functor's result (the body has more
             // members than the declared result sig, e.g. parmatch.ml's `Compat`
             // exposes only [compat;compats] of its 4-member body), the result

@@ -452,6 +452,12 @@ struct Checker {
   std::unordered_map<const void*, TypePtr> ctor_arg_type_;      // expression args
   std::unordered_map<const void*, TypePtr> pat_ctor_arg_type_;  // pattern args
   std::unordered_map<const void*, TypePtr> pat_record_arg_type_;  // record-pattern ctor args
+  // A record PATTERN whose annotation named a local cmi-functor-application
+  // abbreviation (`{pos; data=cd1} : Diff.left` under `module Diff =
+  // Diffing_with_keys.Define(Defs)`): the EXPANDED manifest, so the fields bind
+  // type-directed like ocamlc -- the labels need not be in scope at all, and a
+  // same-named label of an unrelated record must not supply the indices.
+  std::unordered_map<const Pattern*, TypePtr> pat_expected_record_;
   // Record decl by identity stamp, for resolving an AMBIGUOUS field projection
   // through the base's inferred type identity (Sign_diff.t.untypables@4).
   std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
@@ -793,6 +799,13 @@ struct Checker {
   // to `'a X.op` instead of degrading to a fresh var (shallow2deep).
   std::unordered_map<std::string, std::vector<std::string>> param_sig_type_names_;
   std::unordered_map<std::string, TypePtr> cmi_abstract_subst_;       // a cmi modtype's "t" -> arg type
+  // While translating a functor-application RESULT signature: each already-
+  // translated zero-param sibling abbreviation by its bare result-sig name, so
+  // a LATER sibling's manifest resolves it (`type change = (left,right,..)
+  // Diffing.change` references `left`, a body-local Pident no ctx can see).
+  // Consulted only for ARGUMENT-LESS constrs -- a same-named parameterized
+  // top-level type (Diffing_with_keys' own `change`) must not be swallowed.
+  std::unordered_map<std::string, TypePtr> cmi_sibling_abbrevs_;
   // A parameterless class's object type, so `new c` yields it (non-strict only).
   std::unordered_map<std::string, TypePtr> class_types_;
   // Class CONSTRUCTOR schemes (`new c` for a class with params): the arrow
@@ -927,6 +940,14 @@ struct Checker {
             n->path->a->kind == cmi::Path::Pident)
           if (auto s = cmi_abstract_subst_.find(n->path->a->id.name + "." + n->path->s);
               s != cmi_abstract_subst_.end())
+            return s->second;
+        // A functor-application result signature's OWN earlier abbreviation,
+        // referenced by a later sibling's manifest as a body-local bare Pident
+        // (see cmi_sibling_abbrevs_).  Argument-less only.
+        if (!cmi_sibling_abbrevs_.empty() && n->args.empty() && n->path &&
+            n->path->kind == cmi::Path::Pident)
+          if (auto s = cmi_sibling_abbrevs_.find(n->path->id.name);
+              s != cmi_sibling_abbrevs_.end())
             return s->second;
         if (is_format_base(p)) { std::vector<TypePtr> fa; for (auto& a : n->args) fa.push_back(from_cmi(a, memo)); return eng.constr("format6", std::move(fa)); }
         // expand a same-module type abbreviation (Float.t = float, Int.t = int) --
@@ -2887,6 +2908,75 @@ struct Checker {
             scheme = eng.arrow(recTy, from_cmi(l.type, memo));
             break;
           }
+      }
+      cmi_types_ctx_ = saved_ctx;
+      cmi_mod_prefix_ = saved_pfx;
+      cmi_scopes_ = std::move(saved_scopes);
+      cmi_mod_scopes_ = std::move(saved_mscopes);
+      fold_abbrevs_ = saved_fold;
+      return scheme;
+    } catch (...) {
+      cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
+      cmi_scopes_.clear(); cmi_mod_scopes_.clear();
+    }
+    return nullptr;
+  }
+
+  // The `recTy -> fieldTy` accessor arrow of one label of the record NAMED by a
+  // dotted cmi path (`Diffing_with_keys.with_pos`), generalized like
+  // qualified_field_scheme -- but here the record TYPE is given (resolved from
+  // a functor-application abbreviation), not guessed from the label.
+  TypePtr named_record_field_arrow(const std::string& recPath,
+                                   const std::string& label) {
+    size_t dot = recPath.rfind('.');
+    if (dot == std::string::npos) return nullptr;
+    std::string tyname = recPath.substr(dot + 1);
+    auto comps = mod_components_str(recPath.substr(0, dot));
+    if (comps.empty()) return nullptr;
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      std::vector<std::pair<const std::vector<cmi::TypeDecl>*, std::string>> scopes;
+      std::vector<std::pair<const std::vector<cmi::ModuleDecl>*, std::string>> mscopes;
+      scopes.push_back({&sig->types, comps[0]});
+      mscopes.push_back({&sig->modules, comps[0]});
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == comps[i]) { md = &mm; break; }
+        sig = md ? module_sig(md->type, loaded) : nullptr;
+        if (sig) {
+          scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
+          mscopes.push_back({&sig->modules, mscopes.back().second + "." + comps[i]});
+        }
+      }
+      if (!sig) return nullptr;
+      std::string pfx;
+      for (auto& cmp : comps) { if (!pfx.empty()) pfx += '.'; pfx += cmp; }
+      auto* saved_ctx = cmi_types_ctx_;
+      std::string saved_pfx = cmi_mod_prefix_;
+      bool saved_fold = fold_abbrevs_;
+      auto saved_scopes = cmi_scopes_;
+      auto saved_mscopes = cmi_mod_scopes_;
+      cmi_types_ctx_ = &sig->types;
+      cmi_mod_prefix_ = pfx;
+      cmi_scopes_ = scopes;
+      cmi_mod_scopes_ = mscopes;
+      fold_abbrevs_ = !strict;
+      TypePtr scheme = nullptr;
+      for (auto& td : sig->types) {
+        if (td.name != tyname || td.kind != cmi::TypeDecl::Record) continue;
+        for (auto& l : td.labels)
+          if (l.name == label) {
+            std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
+            std::vector<TypePtr> params;
+            for (auto& pp : td.params) params.push_back(from_cmi(pp, memo));
+            TypePtr recTy = eng.constr(pfx + "." + td.name, params);
+            scheme = eng.arrow(recTy, from_cmi(l.type, memo));
+            break;
+          }
+        break;
       }
       cmi_types_ctx_ = saved_ctx;
       cmi_mod_prefix_ = saved_pfx;
@@ -5961,11 +6051,26 @@ struct Checker {
         if (auto* ty = std::get_if<Pstr_type>(&sit.desc))
           for (auto& d : ty->decls) {
             if (!d.manifest || !d.params.empty()) continue;
-            std::unordered_map<std::string, TypePtr> vars;
-            TypePtr t = from_coretype(**d.manifest, vars);
-            TypePtr rt = I::Engine::repr(t);
-            if (rt->kind == I::Type::Kind::Constr && rt->args.empty())
-              if (auto f = own.find(rt->path); f != own.end()) t = f->second;
+            TypePtr t;
+            // A bare same-struct reference (`type right = left`) resolves to
+            // the struct's OWN earlier decl FIRST: from_coretype would send it
+            // through the flat alias tables, whose bare last-wins entry can
+            // belong to a LATER same-named struct (a re-walk carries the prior
+            // pass's full-file state, so VD.Defs's `left` hijacked RD.Defs's
+            // `right` -- includecore's update then read Typedtree's index).
+            static const bool no_fapp_own = std::getenv("NOFAPP") != nullptr;
+            if (!no_fapp_own)
+              if (auto* tc0 = std::get_if<Ptyp_constr>(&(*d.manifest)->desc))
+                if (tc0->args.empty())
+                  if (auto* l0 = std::get_if<Lident>(&tc0->id.txt.v))
+                    if (auto f = own.find(l0->name); f != own.end()) t = f->second;
+            if (!t) {
+              std::unordered_map<std::string, TypePtr> vars;
+              t = from_coretype(**d.manifest, vars);
+              TypePtr rt = I::Engine::repr(t);
+              if (rt->kind == I::Type::Kind::Constr && rt->args.empty())
+                if (auto f = own.find(rt->path); f != own.end()) t = f->second;
+            }
             own[d.name.txt] = t;
             subst[*mt->functor_param + "." + d.name.txt] = t;
           }
@@ -5974,13 +6079,16 @@ struct Checker {
       cmi_types_ctx_ = &top->types;
       cmi_mod_prefix_ = fcomps[0];
       fold_abbrevs_ = true;
+      static const bool no_fapp = std::getenv("NOFAPP") != nullptr;
       for (auto& td : mt->functor_body->sig->types) {
         if (!td.manifest || !td.params.empty()) continue;
         std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
-        mx_functor_app_manifests_[bind + "." + td.name] =
-            from_cmi(td.manifest, memo);
+        TypePtr t = from_cmi(td.manifest, memo);
+        mx_functor_app_manifests_[bind + "." + td.name] = t;
+        if (!no_fapp) cmi_sibling_abbrevs_[td.name] = t;
       }
     } catch (...) {}
+    cmi_sibling_abbrevs_.clear();
     cmi_abstract_subst_ = std::move(saved_subst);
     cmi_types_ctx_ = saved_ctx;
     cmi_mod_prefix_ = std::move(saved_pfx);
@@ -6885,17 +6993,30 @@ struct Checker {
     // slots.
     if (!scrut_owns_ctor(tp, cn)) return;
     TypePtr* sch = find_ctor(cn);
-    if (!sch) return;
-    TypePtr found_res;
-    ctor_params(eng.instantiate(*sch), found_res);
-    TypePtr fr = I::Engine::repr(found_res);
-    bool differs =
-        ctor_type_differs(fr->kind == I::Type::Kind::Constr ? fr->path : "", tp);
-    if (getenv("CTDBG"))
-      fprintf(stderr, "[CTDBG-R] pat-rebind %s found=%s scrut=%s differs=%d\n",
-              cn.c_str(), fr->kind == I::Type::Kind::Constr ? fr->path.c_str() : "",
-              tp.c_str(), (int)differs);
-    std::vector<TypePtr> ps = ctor_decl_arg_types(tp, cn);
+    bool differs;
+    if (!sch) {
+      // Not in lexical scope AT ALL: a type-directed-only constructor
+      // (ocamlc's warning-40 case -- includecore's update matches `Keep
+      // (x,y,_)` on a `Diffing.change` scrutinee with no `open Diffing`).
+      // infer_pat bound the payloads to inert fresh vars; rebind them at the
+      // scrutinee's declared slots, TIED to the scrutinee's own arguments so
+      // `x.data.ld_type` reads Types' index, not a bare-name guess.  NOFAPP
+      // restores the old bail.
+      static const bool no_fapp = std::getenv("NOFAPP") != nullptr;
+      if (no_fapp) return;
+      differs = true;
+    } else {
+      TypePtr found_res;
+      ctor_params(eng.instantiate(*sch), found_res);
+      TypePtr fr = I::Engine::repr(found_res);
+      differs =
+          ctor_type_differs(fr->kind == I::Type::Kind::Constr ? fr->path : "", tp);
+      if (getenv("CTDBG"))
+        fprintf(stderr, "[CTDBG-R] pat-rebind %s found=%s scrut=%s differs=%d\n",
+                cn.c_str(), fr->kind == I::Type::Kind::Constr ? fr->path.c_str() : "",
+                tp.c_str(), (int)differs);
+    }
+    std::vector<TypePtr> ps = ctor_decl_arg_types(tp, cn, sch ? nullptr : scrut);
     if (ps.empty()) return;
     // Descend even when this ctor resolved CORRECTLY: the shadowed one can sit
     // in a nested column whose type only the enclosing declaration names
@@ -8032,6 +8153,50 @@ struct Checker {
       return result;
     }
     if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
+      // An annotation naming a local cmi-functor-application ABBREVIATION
+      // (`Diff.left` under `module Diff = Diffing_with_keys.Define(Defs)`) is
+      // opaque to every registry: a record pattern under it used to bind its
+      // fields by bare name (a same-named label of an UNRELATED record supplied
+      // the indices -- includecore's cd_args/cd_res read Typedtree's 4/5 off a
+      // Types.constructor_declaration), and a var got an inert constr no match
+      // arm could decompose.  Bind the pattern against the recorded EXPANSION;
+      // the annotation stays the displayed face.  NOFAPP restores the old skip.
+      static const bool no_fapp = std::getenv("NOFAPP") != nullptr;
+      if (!no_fapp && !mx_functor_app_manifests_.empty())
+        if (auto* tc = std::get_if<Ptyp_constr>(&ct->t->desc))
+          if (tc->args.empty()) {
+            auto comps = mod_components(tc->id.txt);
+            std::string dotted;
+            for (auto& c : comps) { if (!dotted.empty()) dotted += '.'; dotted += c; }
+            if (auto mit = mx_functor_app_manifests_.find(dotted);
+                mit != mx_functor_app_manifests_.end()) {
+              TypePtr exp = I::Engine::repr(mit->second);
+              if (exp->kind == I::Type::Kind::Constr &&
+                  exp->path.find('.') != std::string::npos) {
+                const Pattern* inner = ct->p.get();
+                if (std::holds_alternative<Ppat_record>(inner->desc)) {
+                  pat_expected_record_[inner] = exp;
+                  TypePtr pt = infer_pat(*ct->p);
+                  pat_expected_record_.erase(inner);
+                  std::unordered_map<std::string, TypePtr> local;
+                  TypePtr at =
+                      from_coretype(*ct->t, annot_vars_ ? *annot_vars_ : local);
+                  // pt == exp when the type-directed path fired; a registry
+                  // fallback keeps the old tie to the face.
+                  if (I::Engine::repr(pt) != exp) try_unify(pt, at);
+                  return at;
+                }
+                if (auto* pv = std::get_if<Ppat_var>(&inner->desc)) {
+                  std::unordered_map<std::string, TypePtr> local;
+                  TypePtr at =
+                      from_coretype(*ct->t, annot_vars_ ? *annot_vars_ : local);
+                  if (record_kinds_) rec_pat_[inner] = exp;
+                  venv.back()[pv->name.txt] = exp;
+                  return at;
+                }
+              }
+            }
+          }
       TypePtr pt = infer_pat(*ct->p);
       std::unordered_map<std::string, TypePtr> local;
       TypePtr at = from_coretype(*ct->t, annot_vars_ ? *annot_vars_ : local);
@@ -8056,6 +8221,31 @@ struct Checker {
       return t;
     }
     if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      // Expected type from a functor-application abbreviation annotation: bind
+      // every field from the EXPANDED record's cmi decl (type-directed, like
+      // ocamlc -- the labels need not be in scope), pinning the record's type
+      // parameters by unifying each accessor's domain with the expansion.
+      // All-or-nothing: an unresolved label falls back to the registry path.
+      if (auto xp = pat_expected_record_.find(&p); xp != pat_expected_record_.end()) {
+        TypePtr exp = xp->second;
+        std::vector<TypePtr> arrows;
+        bool all = !r->fields.empty();
+        for (auto& [lid, sub] : r->fields) {
+          TypePtr a = named_record_field_arrow(exp->path, lid_last(lid.txt));
+          if (!a) { all = false; break; }
+          arrows.push_back(a);
+        }
+        if (all) {
+          size_t ai = 0;
+          for (auto& [lid, sub] : r->fields) {
+            TypePtr s = I::Engine::repr(eng.instantiate(arrows[ai++]));
+            if (s->kind != I::Type::Kind::Arrow) { bind_pat_any(*sub); continue; }
+            try_unify(s->dom, exp);
+            try_unify(infer_pat(*sub), s->cod);
+          }
+          return exp;
+        }
+      }
       // Type fields via the unique-label registry; an ambiguous/unknown label's
       // sub-pattern vars bind to Any (a polymorphic field used at several types
       // must not clash through one monomorphic var).
