@@ -4746,7 +4746,13 @@ struct Checker {
   // Full scheme of a qualified constructor `M.C` (arg1->..->result), so an
   // application `Either.Left "s"` pins the parameter (`(string, 'b) Either.t`),
   // not just the bare variant type.  Null when M.C isn't a loadable variant ctor.
-  TypePtr qualified_ctor_scheme(const Longident& id) {
+  // With `inline_ok`, an INLINE-RECORD ctor answers with its result-only
+  // scheme (fields resolve through the field registry), mirroring the ambient
+  // registration -- the PATTERN sites pass it, so a qualified `M.Name c` is
+  // not silently retyped at a same-named local ctor squatting the bare scope
+  // (includecore's `Diffing_with_keys.Name c` vs primitive_mismatch's
+  // constant Name, a live miscompile).  NOQINLINEPAT restores the old skip.
+  TypePtr qualified_ctor_scheme(const Longident& id, bool inline_ok = false) {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return nullptr;
     // A functor PARAMETER's ctor (`X.A` under `(X : T)` -- registered from
@@ -4827,7 +4833,7 @@ struct Checker {
         bool found = false;
         if (td.kind != cmi::TypeDecl::Variant) continue;
         for (auto& c : td.ctors) {
-          if (c.name != d->name || c.is_inline_record) continue;
+          if (c.name != d->name || (c.is_inline_record && !inline_ok)) continue;
           std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
           std::vector<TypePtr> params;
           for (auto& p : td.params) {
@@ -4838,8 +4844,9 @@ struct Checker {
           TypePtr result = c.res ? from_cmi(c.res, memo)
                                  : eng.constr(pfx + "." + td.name, params);
           scheme = result;
-          for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
-            scheme = eng.arrow(from_cmi(*it, memo), scheme);
+          if (!c.is_inline_record)
+            for (auto it = c.args.rbegin(); it != c.args.rend(); ++it)
+              scheme = eng.arrow(from_cmi(*it, memo), scheme);
           found = true;
           break;
         }
@@ -7905,8 +7912,9 @@ struct Checker {
       // yields the ctor (falls through to the qualified branch).  All passes:
       // the bare-name hit can be an UNRELATED type's ctor (Dynlink.Error vs
       // result's Error), which false-rejects in strict.
+      static const bool no_qinline = std::getenv("NOQINLINEPAT") != nullptr;
       if (sch && std::holds_alternative<Ldot>(k->id.txt.v) &&
-          qualified_ctor_scheme(k->id.txt))
+          qualified_ctor_scheme(k->id.txt, !no_qinline))
         sch = nullptr;
       if (!sch) {
         // A qualified `M.C` not in scope: flatten its tuple by the cmi arity.
@@ -7920,7 +7928,7 @@ struct Checker {
         }
         // The qualified ctor's scheme pins the pattern: `Either.Left s` binds
         // s:'a and types the scrutinee `('a, 'b) Either.t`.
-        if (TypePtr scheme = qualified_ctor_scheme(k->id.txt)) {
+        if (TypePtr scheme = qualified_ctor_scheme(k->id.txt, !no_qinline)) {
           if (is_applied_functor_ctor(k->id.txt))
             functor_app_qualified_pat_.insert(&p);
           TypePtr result;
