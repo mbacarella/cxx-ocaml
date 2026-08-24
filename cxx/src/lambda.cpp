@@ -2940,7 +2940,8 @@ struct Translator {
   // Resolve a (possibly dotted) local module path to its base expression plus
   // the layout key/scoped Sig for its field layout; base is null when the
   // head isn't a local module or a step's layout is unknown.
-  struct ModPath { LamPtr base; std::string key; modsig::SigPtr sig; };
+  struct ModPath { LamPtr base; std::string key; modsig::SigPtr sig;
+                   std::string gsubst; };
   ModPath resolve_module_path(const std::string& dotted, int depth = 0) {
     if (depth > 8) return {};
     size_t p = dotted.find('.');
@@ -2967,7 +2968,18 @@ struct Translator {
             // read re-roots through the container (`module M = Local` makes
             // R.M.f read R.Local.f, upstream's strengthened path).
             if (tgt[0] == '.') tgt = key + tgt;
-            return resolve_module_path(tgt + rest, depth + 1);
+            ModPath r = resolve_module_path(tgt + rest, depth + 1);
+            // A GLOBAL target (`module M = List`): the substituted head is
+            // not a local module, so the alias denotes the separate unit
+            // itself (upstream's Mp_absent strengthening) -- hand the
+            // substituted path back for the consumers' stdlib machinery.
+            static const bool no_ga = cppcaml::dbg_env("NOALIASGLOBAL");
+            if (!no_ga && !r.base && r.gsubst.empty()) {
+              std::string full = tgt + rest;
+              std::string h = full.substr(0, full.find('.'));
+              if (!module_base(h) && !fields_of(h).empty()) r.gsubst = full;
+            }
+            return r;
           }
           // A path component names a MODULE, so the scoped Module item's own
           // position wins over the flat last-name lookup, which a later
@@ -25326,10 +25338,23 @@ struct Translator {
       // first-class-module members): resolve the prefix, field-read the member.
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v)) {
         std::string pdotted;
-        if (lid_to_dotted(*d->prefix, pdotted) && pdotted.find('.') != std::string::npos)
-          if (auto mp = resolve_module_path(pdotted); mp.base)
+        if (lid_to_dotted(*d->prefix, pdotted) && pdotted.find('.') != std::string::npos) {
+          ModPath mp = resolve_module_path(pdotted);
+          if (mp.base) {
             if (auto f = local_member_index(mp.key, d->name))
               return fieldimm(*f, mp.base);
+          } else if (!mp.gsubst.empty()) {
+            // `module M = List` inside R: the alias substitutes to a GLOBAL
+            // module, so R.M.length reads the target unit's field directly
+            // ((field_imm i (global Stdlib__List!))); an external member in
+            // value position eta-expands like the direct spelling.
+            std::string g = canon_stdlib_path(mp.gsubst);
+            if (LamPtr v = stdlib_module_path(g + "." + d->name)) return v;
+            StdPrim sp = g.find('.') == std::string::npos
+                             ? value_prim(g, d->name) : submodule_prim(g, d->name);
+            if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) return s;
+          }
+        }
       }
       // Qualified M.S.x through a stdlib submodule path (Effect.Deep.continue),
       // including an opened head (`Array1.x` under `open Bigarray`) and the
@@ -25494,6 +25519,18 @@ struct Translator {
               for (auto& cand : cands)
                 if (StdPrim sp = submodule_prim(cand, nm); !sp.name.empty())
                   if (auto r = prim_apply(sp.name, sp.arity, *ap, e)) return r;
+            } else if (!lookup(head) && pre.find('.') != std::string::npos) {
+              // the prefix goes THROUGH a local module whose alias substitutes
+              // to a global (`module A = Array` inside R): R.A.length applied
+              // is the target's external, like the direct spelling.
+              ModPath mp = resolve_module_path(pre);
+              if (!mp.base && !mp.gsubst.empty()) {
+                std::string g = canon_stdlib_path(mp.gsubst);
+                StdPrim sp = g.find('.') == std::string::npos
+                                 ? value_prim(g, nm) : submodule_prim(g, nm);
+                if (!sp.name.empty())
+                  if (auto r = prim_apply(sp.name, sp.arity, *ap, e)) return r;
+              }
             }
           }
         }
@@ -29651,7 +29688,13 @@ struct Translator {
       {  // a (possibly deep) path through local modules: chain of field reads
         std::string dotted;
         if (lid_to_dotted(pi->id.txt, dotted)) {
-          if (auto mp = resolve_module_path(dotted); mp.base) return mp.base;
+          ModPath mp = resolve_module_path(dotted);
+          if (mp.base) return mp.base;
+          // an elided alias member whose target is a GLOBAL module
+          // (`module X = R.M` with M = List): the value is the unit itself
+          if (!mp.gsubst.empty())
+            if (LamPtr v = stdlib_module_path(canon_stdlib_path(mp.gsubst)))
+              return v;
           // `Stdlib.Array` / `Stdlib.Float.Array` are the units `Array` /
           // `Float.Array` (Stdlib re-exports them as aliases); strip the explicit
           // prefix so the path resolves against the real unit, not Stdlib's block.
@@ -31100,6 +31143,15 @@ struct Translator {
               std::string dotted;
               if (lid_to_dotted(pi2->id.txt, dotted)) {
                 dotted = expand_alias_head(dotted);  // `module NameMap = S.Map`
+                // `module X = R.M` where M is an elided alias to a GLOBAL
+                // module: X aliases the substituted unit itself, so record
+                // it exactly like the direct spelling `module X = List`.
+                if (dotted.find('.') != std::string::npos &&
+                    module_base(dotted.substr(0, dotted.find('.')))) {
+                  ModPath amp = resolve_module_path(dotted);
+                  if (!amp.base && !amp.gsubst.empty())
+                    dotted = canon_stdlib_path(amp.gsubst);
+                }
                 if (dotted.find('.') != std::string::npos &&
                     !module_base(dotted.substr(0, dotted.find('.')))) {
                   auto& sm = submodule_of(dotted);
