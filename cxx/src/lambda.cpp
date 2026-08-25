@@ -2484,6 +2484,37 @@ struct Translator {
               if (auto ex = type_ctors_.find(d.name.txt);
                   ex != type_ctors_.end() && ex->second != std::make_pair(pc, pb))
                 tkey = d.name.txt + "#" + std::to_string(type_ctors_.size());
+              // A same-named twin with the SAME ctor counts still isn't the
+              // same type: `module T = struct type fp = Unit | Named of int
+              // option * string * int end` beside a top-level `type fp = Unit
+              // | Named of string * int` ties at (1 const, 1 block), and the
+              // bare-key write below then CLOBBERED the top-level type's
+              // per-type entry with the nested arity-3 Named -- which the
+              // scoped re-registration later installed into the flat
+              // ctor_info_ file-wide (every bare `Named` read/built the wrong
+              // layout, garbage fields).  Disambiguate on a same-named stored
+              // ctor whose SHAPE (blockness/tag/arity) differs.
+              static const bool no_ctor_arity_l = cppcaml::dbg_env("NOCTORARITY");
+              if (!no_ctor_arity_l && tkey == d.name.txt)
+                if (auto ti = type_ctor_info_.find(d.name.txt);
+                    ti != type_ctor_info_.end()) {
+                  int qc = 0, qb = 0;
+                  for (auto& c : v->ctors) {
+                    int car = 0; bool cblk = true;
+                    auto* rr2 = std::get_if<Pcstr_record>(&c.args);
+                    if (auto* tt2 = std::get_if<Pcstr_tuple>(&c.args)) {
+                      car = (int)tt2->elems.size(); cblk = car > 0;
+                    } else if (rr2) car = (int)rr2->fields.size();
+                    int ctag = cblk ? qb++ : qc++;
+                    auto st = ti->second.find(c.name.txt);
+                    if (st != ti->second.end() &&
+                        (st->second.is_block != cblk || st->second.tag != ctag ||
+                         st->second.arity != car)) {
+                      tkey = d.name.txt + "#" + std::to_string(type_ctors_.size());
+                      break;
+                    }
+                  }
+                }
               for (auto& c : v->ctors) {
                 int arity = 0; bool block = true;
                 auto* r = std::get_if<Pcstr_record>(&c.args);
@@ -12258,6 +12289,23 @@ struct Translator {
         !module_base(mod))
       for (auto& [nm, info] : module_type_ctors(mod, ty))
         if (nm == cn) return &info;
+    // A LOCAL module's type is the same story with no `unit` to tell it by:
+    // `module T = struct type fp = Unit | Named of int option * string * int
+    // end` beside a top-level `type fp = Unit | Named of string * int` -- both
+    // answer to "fp", and the flat map holds only the top-level one, so a
+    // `T.fp` pattern read `Named` through the two-field layout and bound
+    // nothing.  When the CITED qualified type has its own table and its entry
+    // for this ctor differs in SHAPE (blockness/tag/arity), the cited one wins;
+    // an entry that agrees changes nothing, so the established bare-name
+    // behavior stands everywhere else.
+    static const bool no_ctor_arity_r = cppcaml::dbg_env("NOCTORARITY");
+    if (!no_ctor_arity_r && amb && amb->type == ty)
+      if (auto ti = type_ctor_info_.find(pc->second); ti != type_ctor_info_.end())
+        if (auto ci = ti->second.find(cn);
+            ci != ti->second.end() &&
+            (ci->second.is_block != amb->is_block || ci->second.tag != amb->tag ||
+             ci->second.arity != amb->arity))
+          return &ci->second;
     if (amb && amb->type == ty) return amb;                 // ambient already correct
     // A type declared in a LOCAL submodule: the flat ctor_info_ is first-wins
     // inside a module body, so a ctor name a later sibling type re-declares
@@ -30473,21 +30521,33 @@ struct Translator {
           // ambiguous ctors, so match on tag, not on the full set).
           std::string tk = d.name.txt;
           if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
-            std::unordered_map<std::string, std::pair<bool, int>> dtags;
+            struct DTag { bool block; int tag; int arity; };
+            std::unordered_map<std::string, DTag> dtags;
             int dnc = 0, dnb = 0;
             for (auto& c : v->ctors) {
               bool block = true;
-              if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) block = !t->elems.empty();
-              dtags[c.name.txt] = {block, block ? dnb : dnc};
+              int car = 0;
+              auto* r2 = std::get_if<Pcstr_record>(&c.args);
+              if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) {
+                car = (int)t->elems.size(); block = car > 0;
+              } else if (r2) car = (int)r2->fields.size();
+              dtags[c.name.txt] = {block, block ? dnb : dnc, car};
               if (block) ++dnb; else ++dnc;
             }
+            // Arity distinguishes the same-named same-counts twin (see the
+            // nested harvest's shape-disambiguated tkey): without it, the
+            // re-registration matched a nested `Named of int option * string
+            // * int` against the top-level `Named of string * int` and
+            // installed the wrong layout into the flat map file-wide.
+            static const bool no_ctor_arity_f = cppcaml::dbg_env("NOCTORARITY");
             auto entry_fits = [&](const std::string& key) {
               auto f = type_ctor_info_.find(key);
               if (f == type_ctor_info_.end() || f->second.empty()) return false;
               for (auto& [cn, ci] : f->second) {
                 auto dt = dtags.find(cn);
                 if (dt == dtags.end() ||
-                    ci.is_block != dt->second.first || ci.tag != dt->second.second)
+                    ci.is_block != dt->second.block || ci.tag != dt->second.tag ||
+                    (!no_ctor_arity_f && ci.arity != dt->second.arity))
                   return false;
               }
               return true;

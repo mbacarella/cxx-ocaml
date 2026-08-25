@@ -452,6 +452,11 @@ struct Checker {
   std::unordered_map<const void*, TypePtr> ctor_arg_type_;      // expression args
   std::unordered_map<const void*, TypePtr> pat_ctor_arg_type_;  // pattern args
   std::unordered_map<const void*, TypePtr> pat_record_arg_type_;  // record-pattern ctor args
+  // The owning type PATH retype_pat_binders proved for a ctor pattern whose
+  // lexical pick named another type.  A path, not a TypePtr, because the
+  // scrutinee node often carries the nested declaration's own BARE spelling
+  // while the owner is the qualified one the back end's tables are keyed by.
+  std::unordered_map<const void*, std::string> pat_retype_owner_;
   // A record PATTERN whose annotation named a local cmi-functor-application
   // abbreviation (`{pos; data=cd1} : Diff.left` under `module Diff =
   // Diffing_with_keys.Define(Defs)`): the EXPANDED manifest, so the fields bind
@@ -7117,7 +7122,16 @@ struct Checker {
     // tell two modules' `u` apart.  At top level the keys are bare already and
     // this finds nothing, which is right.
     std::string tp = sr->path;
-    if (tp.find('.') == std::string::npos) {
+    // ... and NOT when the bare key is a real type of its own that declares the
+    // ctor: a top-level `type fp = Unit | Named of string * int` beside
+    // `module T = struct type fp = .. Named of int option * string * int end`
+    // would otherwise be lifted to the submodule's `T.fp` -- the unique DOTTED
+    // key of that name -- and every bare `Named` rebound at the wrong arity.
+    bool bare_own = false;
+    if (auto bo = type_ctor_schemes_.find(tp); bo != type_ctor_schemes_.end())
+      for (auto& [n, s] : bo->second)
+        if (n == cn) { bare_own = true; break; }
+    if (tp.find('.') == std::string::npos && !bare_own) {
       std::string cand;
       int nc = 0;
       for (auto& [key, lst] : type_ctor_schemes_) {
@@ -7157,6 +7171,20 @@ struct Checker {
         fprintf(stderr, "[CTDBG-R] pat-rebind %s found=%s scrut=%s differs=%d\n",
                 cn.c_str(), fr->kind == I::Type::Kind::Constr ? fr->path.c_str() : "",
                 tp.c_str(), (int)differs);
+    }
+    // The binders move, but the back end still resolves the ctor NAME through
+    // the flat map, which the lexical pick already owns -- so `Named (_, n, m)`
+    // at a `T.fp` scrutinee read the top-level `fp`'s two-field layout and
+    // bound nothing.  Pin the proven owner where the rebind proved it: the
+    // same hook disambig_pat_by_scrut feeds (vk.pat_constr), but recorded
+    // INLINE, while the scrutinee still reads its annotated type -- the
+    // deferred walk sees `arg` already relinked to the lexical pick's type and
+    // no longer disagrees, so it never fires for an annotated `function`.
+    static const bool no_ctor_arity_p = std::getenv("NOCTORARITY") != nullptr;
+    if (differs && !no_ctor_arity_p) {
+      pat_retype_owner_[&lhs] = tp;
+      if (getenv("CTDBG"))
+        fprintf(stderr, "[CTDBG-R] pin %s -> %s\n", cn.c_str(), tp.c_str());
     }
     std::vector<TypePtr> ps = ctor_decl_arg_types(tp, cn, sch ? nullptr : scrut);
     if (ps.empty()) return;
@@ -7599,7 +7627,34 @@ struct Checker {
     if (no_ctor_list) return false;
     std::vector<std::string> fc = type_ctor_names(found);
     std::vector<std::string> wc = type_ctor_names(want);
-    return !fc.empty() && !wc.empty() && fc != wc;
+    if (fc.empty() || wc.empty()) return false;
+    if (fc != wc) return true;
+    // Equal NAME lists still don't make one type: two same-named twins can
+    // declare identical ctor names at different ARITIES (`type fp = Unit |
+    // Named of string * int` beside `T.fp`'s `Named of int option * string *
+    // int` -- the arm read the arity-3 block through the arity-2 layout,
+    // garbage fields; untypeast's two `functor_parameter`s are the cmi shape
+    // of the same twin).  Compare declared arities where BOTH sides' scheme
+    // tables answer; a side with no scheme entry stays "unknown" = equal, so
+    // abbreviations and second spellings keep today's leniency.
+    static const bool no_ctor_arity = std::getenv("NOCTORARITY") != nullptr;
+    if (no_ctor_arity) return false;
+    auto fa = type_ctor_arities(found), wa = type_ctor_arities(want);
+    return fa && wa && *fa != *wa;
+  }
+  // Per-ctor declared argument counts, in declaration order, from the local
+  // per-type scheme table only -- nullopt (unknown) for any path the table
+  // doesn't key, cmi-resident types included.  ctor_type_differs treats
+  // unknown as "cannot prove different".
+  std::optional<std::vector<int>> type_ctor_arities(const std::string& path) {
+    auto ts = type_ctor_schemes_.find(path);
+    if (ts == type_ctor_schemes_.end()) return std::nullopt;
+    std::vector<int> out;
+    for (auto& [n, s] : ts->second) {
+      TypePtr res;
+      out.push_back((int)ctor_params(eng.instantiate(s), res).size());
+    }
+    return out;
   }
   // A type's constructor names in declaration order: this unit's own tables
   // first (path-keyed, then bare), else the owning unit's cmi.  Empty when the
@@ -10453,8 +10508,22 @@ struct Checker {
       // pass resolves a bare annotation name through the FLAT scope, and an
       // ambiguous name (untypeast's two `functor_parameter`s) would pin the
       // scrutinee to the wrong type and break the arm binders.
+      // A QUALIFIED domain (`: T.fp -> fp`) takes the flow-down too: the
+      // ambiguity the gate guards against is a BARE annotation name resolved
+      // through the flat scope, and a path that names its module outright
+      // cannot be that.  Without it `let conv sub : T.fp -> fp = function ..`
+      // left the cases at the lexically-picked top-level `fp` and read T.fp's
+      // three-field block through the two-field layout.  Purely syntactic --
+      // no type is built for the test, so a declined flow-down costs nothing.
+      static const bool no_ctor_arity_fc = std::getenv("NOCTORARITY") != nullptr;
+      bool qual_dom = false;
+      if (!no_ctor_arity_fc && record_kinds_ && f.constraint_)
+        if (auto* pcq = std::get_if<Pconstraint>(&*f.constraint_))
+          if (auto* ar = std::get_if<ast::Ptyp_arrow>(&pcq->type->desc))
+            if (auto* dc = std::get_if<ast::Ptyp_constr>(&ar->dom->desc))
+              qual_dom = std::holds_alternative<ast::Ldot>(dc->id.txt.v);
       static const bool no_gadtrow_fc = std::getenv("NOGADTROW") != nullptr;
-      if ((fold_abbrevs_ || (record_kinds_ && gadt && !no_gadtrow_fc)) &&
+      if ((fold_abbrevs_ || qual_dom || (record_kinds_ && gadt && !no_gadtrow_fc)) &&
           !strict && f.constraint_)
         if (auto* pc0 = std::get_if<Pconstraint>(&*f.constraint_)) {
           std::unordered_map<std::string, TypePtr> local0;
@@ -12697,6 +12766,10 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
     if (r->kind == I::Type::Kind::Constr && !r->path.empty())
       vk.pat_constr[p] = r->path;
   }
+  // The owner retype_pat_binders proved (scrut_owns_ctor over the scrutinee's
+  // own declaration) outranks both: it is the only evidence taken while the
+  // scrutinee still read its ANNOTATED type.
+  for (auto& [p, path] : ck.pat_retype_owner_) vk.pat_constr[p] = path;
   for (auto& [f, t] : ck.rec_ret_) vk.fn_ret[f] = kind_str(t, ck);
   for (auto& [e, t] : ck.rec_expr_) {
     vk.expr[e] = kind_str(t, ck);
