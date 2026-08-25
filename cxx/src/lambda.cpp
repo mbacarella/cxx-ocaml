@@ -2738,6 +2738,10 @@ struct Translator {
   // test at all, so every matcher path bailed and the match silently collapsed
   // to an arm that had not been tested (a wrong-answer miscompile).
   const bool no_float_pat_ = std::getenv("NOFLOATPAT") != nullptr;
+  // NOEXTREBIND restores the pre-slice handling of `type t += C = <path>`: only
+  // a bare in-scope name was resolved, so a QUALIFIED rebind bound nothing and
+  // took no export slot -- C then lowered to an unresolved `?C`.
+  const bool no_ext_rebind_ = std::getenv("NOEXTREBIND") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -30661,6 +30665,78 @@ struct Translator {
       auto v = mk(Lam::K::Var); v->var = id;
       add_export_val(nm, v, ns, std::move(sub));
     };
+    // A rebound name is constructed and destructured with the TARGET's payload
+    // shape, so it inherits the target's arity and inline-record labels:
+    // without them a rebound `C of int * int` took one tuple field where the
+    // target itself took two, and the two spellings stopped agreeing.
+    auto copy_ext_shape = [&](const std::string& nm, const std::string& tgt) {
+      if (auto a = exn_arity_.find(tgt); a != exn_arity_.end())
+        exn_arity_[nm] = a->second;
+      if (no_ext_rebind_) return;  // arity alone is the pre-slice behaviour
+      if (auto r = exn_rlabels_.find(tgt); r != exn_rlabels_.end())
+        exn_rlabels_[nm] = r->second;
+    };
+    // `exception F = E` / `type t += F = E` rebind F's identity to E's value
+    // (no fresh block).  A QUALIFIED target (`= Parsing.Parse_error`, `= M.C`)
+    // resolves to a field of the named module.  Resolving it is essential --
+    // the .mli still exposes F, so F TAKES a field, and dropping the binding
+    // shifts every following export by one (parser.mli: Error is field 0
+    // before use_file.., so the whole Parser block was misread).
+    auto bind_ext_rebind = [&](const std::string& nm, const Pext_rebind& rb,
+                               bool qualified) {
+      if (auto* l = std::get_if<Lident>(&rb.id.txt.v))
+        if (auto e2 = exn_ident_.find(l->name); e2 != exn_ident_.end()) {
+          exn_ident_[nm] = e2->second;
+          add_export(nm, e2->second, modsig::NS::Typext);
+          copy_ext_shape(nm, l->name);
+          return;
+        }
+      if (!qualified) return;
+      if (std::holds_alternative<Ldot>(rb.id.txt.v)) {
+        std::string dotted;
+        if (lid_to_dotted(rb.id.txt, dotted)) {
+          size_t ld = dotted.rfind('.');
+          std::string modp = dotted.substr(0, ld), en = dotted.substr(ld + 1);
+          LamPtr v;
+          // Ask the same resolver a qualified CONSTRUCT of the target uses, so
+          // the two agree on which value the name denotes and a nested prefix
+          // walks field by field from the outermost binding.  module_ident_
+          // maps "M.N" to the ident of N's OWN binding, which lives inside M's
+          // initialiser and is out of scope here: reading it took a stale
+          // stack slot, so the rebound name never matched the target's value.
+          if (!no_ext_rebind_) v = module_ctor_identity(rb.id.txt);
+          // A LOCAL module / functor parameter (`exception Error = T.Error`
+          // where T : TableFormat.TABLES exposes `exception Error`): read its
+          // field from the in-scope module value.
+          if (!v)
+            if (auto mi = module_ident_.find(modp); mi != module_ident_.end())
+              if (auto f = local_member_index(modp, en))
+                v = fieldimm(*f, varof(mi->second));
+          if (!v && modp.find('.') != std::string::npos)
+            v = submodule_value(modp, en);
+          else if (!v && !module_base(modp) && !fields_of(modp).empty()) {
+            auto& fm = fields_of(modp);
+            if (auto f = fm.find(en); f != fm.end())
+              v = field_of(global_of(modp), f->second);
+          }
+          if (v) {
+            Ident id = fresh_scoped(nm);  // extension ctors are Scoped
+            cur.push_back({id, ValueKind::Gen, v});
+            exn_ident_[nm] = id; add_export(nm, id, modsig::NS::Typext);
+            if (!no_ext_rebind_) copy_ext_shape(nm, en);
+            return;
+          }
+        }
+      }
+      // non-local target (stdlib/qualified): bind a let to its value
+      if (LamPtr v = exn_value(lid_last(rb.id.txt))) {
+        Ident id = fresh_scoped(nm);  // extension ctors are Scoped
+        cur.push_back({id, ValueKind::Gen, v});
+        exn_ident_[nm] = id;
+        add_export(nm, id, modsig::NS::Typext);
+        if (!no_ext_rebind_) copy_ext_shape(nm, lid_last(rb.id.txt));
+      }
+    };
     int n_opens = 0;  // top-level `open M` opened for the rest of the structure
     for (auto& it : s) {
       if (auto* td = std::get_if<Pstr_type>(&it.desc)) {
@@ -30875,54 +30951,8 @@ struct Translator {
       if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {  // exception E [of ...]
         const std::string& nm = pe->exn.ctor.name.txt;
         exn_nearest_.insert(nm);
-        // `exception F = E` rebinds: F's identity IS E's value (no fresh block)
         if (auto* rb = std::get_if<Pext_rebind>(&pe->exn.ctor.kind)) {
-          if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
-            if (auto e2 = exn_ident_.find(l->name); e2 != exn_ident_.end()) {
-              exn_ident_[nm] = e2->second;
-              add_export(nm, e2->second, modsig::NS::Typext);
-              if (auto a = exn_arity_.find(l->name); a != exn_arity_.end())
-                exn_arity_[nm] = a->second;
-              continue;
-            }
-          // A QUALIFIED target (`exception Error = Parsing.Parse_error`): its value
-          // is a field of the named module's global.  Resolving it is essential --
-          // the .mli still exposes `exception Error` (it TAKES a field), so dropping
-          // the binding shifts every following export by one (parser.mli: Error is
-          // field 0 before use_file.., so the whole Parser block was misread).
-          if (auto* d = std::get_if<Ldot>(&rb->id.txt.v)) {
-            std::string dotted;
-            if (lid_to_dotted(rb->id.txt, dotted)) {
-              size_t ld = dotted.rfind('.');
-              std::string modp = dotted.substr(0, ld), en = dotted.substr(ld + 1);
-              LamPtr v;
-              // A LOCAL module / functor parameter (`exception Error = T.Error`
-              // where T : TableFormat.TABLES exposes `exception Error`): read its
-              // field from the in-scope module value.
-              if (auto mi = module_ident_.find(modp); mi != module_ident_.end())
-                if (auto f = local_member_index(modp, en))
-                  v = fieldimm(*f, varof(mi->second));
-              if (!v && modp.find('.') != std::string::npos) v = submodule_value(modp, en);
-              else if (!v && !module_base(modp) && !fields_of(modp).empty()) {
-                auto& fm = fields_of(modp);
-                if (auto f = fm.find(en); f != fm.end()) v = field_of(global_of(modp), f->second);
-              }
-              if (v) {
-                Ident id = fresh_scoped(nm);  // extension ctors are Scoped
-                cur.push_back({id, ValueKind::Gen, v});
-                exn_ident_[nm] = id; add_export(nm, id, modsig::NS::Typext);
-                continue;
-              }
-            }
-            (void)d;
-          }
-          // non-local target (stdlib/qualified): bind a let to its value
-          if (LamPtr v = exn_value(lid_last(rb->id.txt))) {
-            Ident id = fresh_scoped(nm);  // extension ctors are Scoped
-            cur.push_back({id, ValueKind::Gen, v});
-            exn_ident_[nm] = id;
-            add_export(nm, id, modsig::NS::Typext);
-          }
+          bind_ext_rebind(nm, *rb, true);
           continue;
         }
         auto str = mk(Lam::K::ConstString); str->str_val = exn_path_.empty() ? nm : exn_path_ + "." + nm;
@@ -30954,13 +30984,11 @@ struct Translator {
           // match in its scope compares identity, not the variant's tag.
           ctor_info_.erase(nm); builtin_ctors_.erase(nm);
           if (auto* rb = std::get_if<Pext_rebind>(&c.kind)) {  // `E = D`: alias to D
-            if (auto* l = std::get_if<Lident>(&rb->id.txt.v))
-              if (auto e = exn_ident_.find(l->name); e != exn_ident_.end()) {
-                exn_ident_[nm] = e->second;
-                add_export(nm, e->second, modsig::NS::Typext);
-                if (auto a = exn_arity_.find(l->name); a != exn_arity_.end())
-                  exn_arity_[nm] = a->second;
-              }
+            // A qualified target (`type t += C = M.C`) resolves exactly as a
+            // rebinding `exception` does; before, only a bare Lident already in
+            // scope was handled and anything else left C unbound -- with no
+            // export slot, so the whole structure's field layout shifted too.
+            bind_ext_rebind(nm, *rb, !no_ext_rebind_);
             continue;
           }
           auto str = mk(Lam::K::ConstString); str->str_val = exn_path_.empty() ? nm : exn_path_ + "." + nm;
