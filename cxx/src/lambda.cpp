@@ -2746,6 +2746,11 @@ struct Translator {
   // package type sits on an ENCLOSING constraint: X got no signature, so a
   // member read `X.v` lowered to an unresolved `?v` and segfaulted.
   const bool no_pkg_pat_ = std::getenv("NOPKGPAT") != nullptr;
+  // NOLSTRUCT restores the pre-slice handling of a structure written inside an
+  // EXPRESSION (`let open struct .. end in`, `let module M = struct .. end`):
+  // its own type declarations were registered only after it had been compiled,
+  // so a constructor used by the struct's own items lowered to `?C`.
+  const bool no_local_struct_ = std::getenv("NOLSTRUCT") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -23829,14 +23834,18 @@ struct Translator {
           restore_ctors(ctor_save);
           return b;
         }
-        // `let open F(X) / struct..end / (M:S) in body`: bind open/N over body
-        LamPtr mv = compile_module_expr(op->expr);
+        // `let open F(X) / struct..end / (M:S) in body`: bind open/N over body.
         // An inline `let open struct type tag = A | B end in ..`: build_module
-        // registers the struct's variant/record types only within its own scope,
-        // so the body's bare `A`/`B` (opened) would be left unresolved (`?A`).
-        // Re-register the struct's own type declarations so they persist over body.
-        if (const Pmod_structure* ps = peel_to_structure(op->expr))
-          register_types(ps->items);
+        // only re-registers the names an earlier harvest already marked
+        // AMBIGUOUS, and that harvest walks Pstr_module items -- never a
+        // structure that sits inside an expression.  So the struct's own type
+        // declarations are registered here, and BEFORE it is compiled: the
+        // body's bare `A`/`B` (opened) need them, and so do the struct's own
+        // items, whose `A` used to be left unresolved (`?A`).
+        const Pmod_structure* ops = peel_to_structure(op->expr);
+        if (ops && !no_local_struct_) register_types(ops->items);
+        LamPtr mv = compile_module_expr(op->expr);
+        if (ops && no_local_struct_) register_types(ops->items);
         auto rl = module_result_layout(op->expr);
         if (rl.empty()) rl = arg_layout(op->expr);
         std::string nm = "open#" + std::to_string(++open_gen_count_);
@@ -23878,6 +23887,13 @@ struct Translator {
           mod_path_ = cur_path + (cur_path.empty() ? "" : ".") + nm;
           exn_path_ = cur_ep + (cur_ep.empty() ? "" : ".") + nm;
           func_path_.clear();
+          // `let module M = struct type t = A | B .. end in ..`: the same
+          // harvest gap as the local open above -- M's own items referred to
+          // their own `A` as `?A`.  The body reaches them qualified (`M.A`),
+          // which resolves through M's layout, not through these tables.
+          if (!no_local_struct_)
+            if (const Pmod_structure* ms = peel_to_structure(mb.expr))
+              register_types(ms->items);
           LamPtr modval = compile_module_expr(mb.expr);
           mod_path_ = saved_mp; func_path_ = saved_fp; exn_path_ = saved_ep;
           auto rl = module_result_layout(mb.expr);
