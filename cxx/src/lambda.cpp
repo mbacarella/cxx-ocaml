@@ -2742,6 +2742,10 @@ struct Translator {
   // a bare in-scope name was resolved, so a QUALIFIED rebind bound nothing and
   // took no export slot -- C then lowered to an unresolved `?C`.
   const bool no_ext_rebind_ = std::getenv("NOEXTREBIND") != nullptr;
+  // NOPKGPAT restores the pre-slice handling of a `(module X)` binder whose
+  // package type sits on an ENCLOSING constraint: X got no signature, so a
+  // member read `X.v` lowered to an unresolved `?v` and segfaulted.
+  const bool no_pkg_pat_ = std::getenv("NOPKGPAT") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -5889,6 +5893,9 @@ struct Translator {
   // A nested record pattern -> its record type, set from the enclosing field's
   // declared value type while compiling the outer record pattern.
   std::unordered_map<const void*, std::string> pat_type_hint_;
+  // A `(module X)` pattern node -> the module type named by the package type on
+  // an enclosing constraint (see note_pat_constraint_hint / unpack_pkg_path).
+  std::unordered_map<const void*, std::string> pat_pkg_hint_;
   // While compiling a record pattern's field `label` (resolved to `fi`) whose
   // sub-pattern is itself a record pattern, tag that sub-pattern with the field's
   // declared value type, so its (ambiguous) labels resolve through it.
@@ -11206,7 +11213,7 @@ struct Translator {
         scope.back()[*up->name.txt] = id; out.push_back({id, scrut});
         module_ident_[*up->name.txt] = id;
         std::string mt;
-        if (up->pkg && lid_to_dotted(up->pkg->path.txt, mt)) {
+        if (unpack_pkg_path(p, *up, mt)) {
           register_pack_layouts(*up->name.txt, mt);  // so `M.x` in a guard/body resolves
           menv_.bind_module(*up->name.txt, msig_of_modtype_path(mt));
         } else {
@@ -11353,17 +11360,40 @@ struct Translator {
   // through that record, not a same-labelled local one (typecore's
   // copy_expanded_type left ?ty/?expanded unresolved; bootstrap bug#13).
   void note_pat_constraint_hint(const Ppat_constraint& c) {
+    const Pattern* inner0 = c.p.get();
+    while (auto* c2 = std::get_if<Ppat_constraint>(&inner0->desc))
+      inner0 = c2->p.get();
+    // `((module X) : (module S with type a = a))`: the module type of a
+    // first-class-module binder can only be written on an enclosing constraint
+    // once it needs a `with type` constraint -- the unpack's own `: S` slot
+    // takes no constraints.  Record it against the unpack node so the binder
+    // sites below give X a signature; without one, `X.v` had no field index
+    // and lowered to the unresolved `?v` marker (a segfaulting read).
+    if (!no_pkg_pat_)
+      if (auto* pk = std::get_if<Ptyp_package>(&c.t->desc))
+        if (std::holds_alternative<Ppat_unpack>(inner0->desc)) {
+          std::string mt;
+          if (lid_to_dotted(pk->path.txt, mt) && !mt.empty())
+            pat_pkg_hint_.emplace((const void*)inner0, mt);
+        }
     auto* tc = std::get_if<Ptyp_constr>(&c.t->desc);
     if (!tc) return;
     std::string dotted;
     if (!lid_to_dotted(tc->id.txt, dotted) ||
         dotted.find('.') == std::string::npos)
       return;
-    const Pattern* inner = c.p.get();
-    while (auto* c2 = std::get_if<Ppat_constraint>(&inner->desc))
-      inner = c2->p.get();
-    if (std::get_if<Ppat_record>(&inner->desc))
-      pat_type_hint_.emplace((const void*)inner, dotted);
+    if (std::get_if<Ppat_record>(&inner0->desc))
+      pat_type_hint_.emplace((const void*)inner0, dotted);
+  }
+  // The module type of a `(module X)` binder: written on the unpack itself, or
+  // (see note_pat_constraint_hint) on an enclosing constraint.
+  bool unpack_pkg_path(const Pattern* p, const Ppat_unpack& up,
+                       std::string& mt) {
+    if (up.pkg) return lid_to_dotted(up.pkg->path.txt, mt);
+    auto it = pat_pkg_hint_.find((const void*)p);
+    if (it == pat_pkg_hint_.end()) return false;
+    mt = it->second;
+    return true;
   }
   const Pattern* effective_pat(const Pattern* p) {
     while (true) {
@@ -23085,7 +23115,7 @@ struct Translator {
         binds.push_back({id, acc});
         module_ident_[*up->name.txt] = id;  // so `M.x` in a `when` guard / body resolves
         std::string mt;
-        if (up->pkg && lid_to_dotted(up->pkg->path.txt, mt)) {
+        if (unpack_pkg_path(p, *up, mt)) {
           register_pack_layouts(*up->name.txt, mt);
           menv_.bind_module(*up->name.txt, msig_of_modtype_path(mt));
         } else {
@@ -27893,9 +27923,9 @@ struct Translator {
           }
           module_ident_[*up->name.txt] = id;
           menv_.bind_module(*up->name.txt, nullptr);  // modsig P3: refined below
-          if (up->pkg) {  // `(module X : S)`: members resolve via S's layout
+          {  // `(module X : S)`: members resolve via S's layout
             std::string mt;
-            if (lid_to_dotted(up->pkg->path.txt, mt)) {
+            if (unpack_pkg_path(pat, *up, mt)) {
               register_pack_layouts(*up->name.txt, mt);
               menv_.bind_module(*up->name.txt, msig_of_modtype_path(mt));
               // S's own variant / extension constructors resolve to this param's
