@@ -2734,6 +2734,10 @@ struct Translator {
   // same name), and no canonicalisation of a `Stdlib.`-prefixed path, whose
   // externals then lower to an unresolved `?name`.
   const bool no_std_alias_ = std::getenv("NOSTDALIAS") != nullptr;
+  // NOFLOATPAT restores the pre-slice handling of a FLOAT LITERAL PATTERN: no
+  // test at all, so every matcher path bailed and the match silently collapsed
+  // to an arm that had not been tested (a wrong-answer miscompile).
+  const bool no_float_pat_ = std::getenv("NOFLOATPAT") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -7115,6 +7119,18 @@ struct Translator {
     pr->prim_id = std::string(suf == 'l'   ? "Int32."
                               : suf == 'L' ? "Int64."
                                            : "Nativeint.") + op;
+    pr->args = {a, b};
+    return pr;
+  }
+  // A float literal PATTERN compiles through matching.ml's make_test_sequence
+  // with Pfloatcomp -- the `.`-suffixed comparison opcodes, the same ones
+  // specialize_comparison picks for a float `=`/`<>` in expression position.
+  LamPtr fconst(const std::string& v) {
+    auto z = mk(Lam::K::ConstFloat); z->str_val = v; return z;
+  }
+  LamPtr fcmp(const char* op, const LamPtr& a, const LamPtr& b) {
+    auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp;
+    pr->prim_id = std::string(op) + ".";
     pr->args = {a, b};
     return pr;
   }
@@ -22793,6 +22809,15 @@ struct Translator {
     if (auto* pv = std::get_if<Ppat_var>(&p.desc))
       if (scrut->k == Lam::K::Var) scope.back()[pv->name.txt] = scrut->var;
   }
+  // Does some row from `i` on match unconditionally?  int_cases' chain falls
+  // off its end into `0` rather than a Match_failure raise, so a leg that would
+  // be wrong without a real default consults this first.
+  bool rows_end_in_catchall(const std::vector<Row>& rows, size_t i) {
+    for (; i < rows.size(); ++i)
+      if (!rows[i].guard && is_catchall(*effective_pat(rows[i].lhs)))
+        return true;
+    return false;
+  }
   LamPtr int_cases(const LamPtr& scrut, const std::vector<Row>& rows, size_t i,
                    bool strict = false) {
     if (i >= rows.size()) return cint(0);
@@ -22832,7 +22857,18 @@ struct Translator {
     // tested against the scrutinee with the rest of the rows as the fall-through.
     if (!r.guard) {
       bool isint = false, ctor = false; long long val = 0; char bsuf = 0;
+      const Pconst_float* flt = nullptr;
       if (auto* pc = std::get_if<Ppat_constant>(&lhs->desc)) {
+        // A float literal takes the same `(if (<>. x c) <rest> <act>)` shape
+        // the integer switcher gives, with the float comparison opcode.  Only
+        // when a later unguarded catch-all supplies the fall-through: this
+        // chain ends in `0`, not in the Match_failure a partial float match
+        // owes, and naive_match (whose chain starts from that raise) is the
+        // correct route without one.
+        if (auto* pf = std::get_if<Pconst_float>(&pc->c.desc);
+            pf && !no_float_pat_ && !pf->suffix &&
+            rows_end_in_catchall(rows, i + 1))
+          flt = pf;
         if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) {
           isint = true;
           if (pi->suffix) bsuf = *pi->suffix;  // boxed: structural compare
@@ -22855,11 +22891,13 @@ struct Translator {
         auto it = ctor_info_.find(ctor_of(*lhs));
         if (it != ctor_info_.end() && !it->second.is_block) { isint = true; val = it->second.tag; ctor = true; }
       }
-      if (isint) {
+      if (isint || flt) {
         LamPtr rest = int_cases(scrut, rows, i + 1, strict);
         if (!rest) return nullptr;
         auto iff = mk(Lam::K::IfThenElse);
-        if (ctor && val == 0) {
+        if (flt) {
+          iff->cond = fcmp("!=", scrut, fconst(flt->value));
+        } else if (ctor && val == 0) {
           iff->cond = scrut;  // constant ctor of tag 0: a truthy test (`!= 0` is identity)
         } else if (bsuf) {
           iff->cond = bint_cmp(bsuf, "!=", scrut, bint_const(bsuf, val));
@@ -23073,7 +23111,16 @@ struct Translator {
         test = if_and(test, t);
         return true;
       }
-      return false;  // float literals: NaN semantics, skip
+      // A float literal is tested with the float `=` opcode, exactly as
+      // make_test_sequence's Pfloatcomp does -- NaN never equals it, which is
+      // the semantics a float pattern is supposed to have.  Without this the
+      // row carried NO test and the match collapsed to an untested arm.
+      if (auto* pf = std::get_if<Pconst_float>(&pc->c.desc);
+          pf && !no_float_pat_ && !pf->suffix) {
+        test = if_and(test, fcmp("==", acc, fconst(pf->value)));
+        return true;
+      }
+      return false;  // a suffixed float literal is a user-defined one: skip
     }
     if (auto* tu = std::get_if<Ppat_tuple>(&p->desc)) {
       for (size_t i = 0; i < tu->elems.size(); ++i)
