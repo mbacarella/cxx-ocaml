@@ -2722,6 +2722,13 @@ struct Translator {
   // NONAMEPAT mints a fresh binder for a materialized column even when the
   // first row heads it with a var/alias (the pre-name_pattern behaviour).
   const bool no_name_pat_ = std::getenv("NONAMEPAT") != nullptr;
+  // NOIMPLBIND restores the two binders we used to get wrong against ocamlc's:
+  // the discarded `let/N = 0` a Tcoerce_alias field is wrapped in
+  // (alias_coerce_wrap), and name_pattern's adoption of the first case's own
+  // ident as the match SCRUTINEE binder (the Pexp_match arm below, with
+  // build_block_arm's prewalk honouring the pre-assignment).  Both are pure
+  // binder identity/order -- setting it restores the old code byte for byte.
+  const bool no_impl_bind_ = std::getenv("NOIMPLBIND") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -11765,8 +11772,19 @@ struct Translator {
     std::map<const Pattern*, Ident> pre;
     std::function<void(const Pattern&)> prewalk = [&](const Pattern& q0) {
       const Pattern* q = effective_pat(&q0);
-      if (auto* pv = std::get_if<Ppat_var>(&q->desc)) { pre.emplace(q, fresh(pv->name.txt)); return; }
-      if (auto* pa = std::get_if<Ppat_alias>(&q->desc)) { prewalk(*pa->p); pre.emplace(q, fresh(pa->name.txt)); return; }
+      // A node the caller already pre-assigned (name_pattern's row-0 pattern
+      // at the match scrutinee) keeps that ident: minting a second one here
+      // would put the sub-binders back AFTER the scrutinee binder, which is
+      // the whole point of pre-assigning them.
+      auto pid = [&](const Pattern* q2, const std::string& nm) {
+        return no_impl_bind_ ? fresh(nm) : pre_or_fresh(q2, nm);
+      };
+      if (auto* pv = std::get_if<Ppat_var>(&q->desc)) {
+        pre.emplace(q, pid(q, pv->name.txt)); return;
+      }
+      if (auto* pa = std::get_if<Ppat_alias>(&q->desc)) {
+        prewalk(*pa->p); pre.emplace(q, pid(q, pa->name.txt)); return;
+      }
       if (auto* pt = std::get_if<Ppat_tuple>(&q->desc)) { for (auto& el : pt->elems) prewalk(*el); return; }
       if (auto* pr = std::get_if<Ppat_record>(&q->desc)) { for (auto& [l, s] : pr->fields) prewalk(*s); return; }
       // anything else (nested ctor/constant/or) makes destruct bail -- skip
@@ -24088,7 +24106,27 @@ struct Translator {
       cur_match_fail_eid_ =
           (cur_match_partial_ && !no_mfshare) ? ++next_exit_ : -1;
       if (sc->k != Lam::K::Var && sc->k != Lam::K::ConstBlock) {
-        Ident mv = fresh("", true);
+        // Matching.name_pattern: when the first case's head is an ALIAS, ocamlc
+        // mints no `*match*` at all -- the scrutinee binder IS that row's own
+        // ident, created at TYPING time and so AFTER its own sub-pattern's
+        // variables.  Minting a temp first gives it the EARLIER stamp, and a
+        // closure capturing the scrutinee together with a sub-binder then
+        // permutes its env slots (free variables are laid out by Ident.compare,
+        // i.e. by stamp): types.ml's `with_type_mark` matches `mark :: rem as
+        // old` and its ~always closure reads both, which put `old` in ENVACC3
+        // and `mark` in ENVACC4 where upstream has the reverse.  So pre-assign
+        // the row's binders source-first (build_block_arm's prewalk reuses them
+        // through pre_or_fresh) and take the alias's own ident as the binder.
+        std::optional<Ident> nmv;
+        if (!no_impl_bind_ && !m->cases.empty()) {
+          const Pattern* p0 = effective_pat(&m->cases[0].lhs);
+          if (std::holds_alternative<Ppat_alias>(p0->desc)) {
+            preassign_pat_vars(*p0);
+            if (auto pit = pat_pre_ids_.find(p0); pit != pat_pre_ids_.end())
+              nmv = pit->second;
+          }
+        }
+        Ident mv = nmv ? *nmv : fresh("", true);
         LamPtr inner = compile_match(varof(mv), m->cases, e.loc,
                                      match_is_total(&e), total_is_proven(&e));
         auto l = mk(Lam::K::Let);
@@ -29001,6 +29039,22 @@ struct Translator {
     lt->body = wf;
     return lt;
   }
+  // translmod's apply_coercion for Tcoerce_alias: the field re-reads the
+  // aliased PATH, but the ABSENT source field still goes to name_lambda --
+  // `get_field pos` answers `lambda_unit` for the alias's pos = -1, and
+  // name_lambda binds any non-variable argument.  The binder is Strict (the
+  // structure coercion applies its fields with `Strict`), so Simplif keeps it
+  // and the block field reads `(let (let/N = 0) <path>)`, not the bare path --
+  // types.ml's four `module Meths = Misc.Stdlib.String.Map` aliases each cost a
+  // PUSHCONST0/POP 1 pair.  The ident is created only once the alias's value is
+  // in hand, so a field that cannot replay leaves the stamp counter alone.
+  LamPtr alias_coerce_wrap(const LamPtr& v) {
+    if (!v || no_impl_bind_) return v;
+    auto lt = mk(Lam::K::Let);
+    lt->bindings.push_back({fresh("let"), ValueKind::Gen, cint(0)});
+    lt->body = v;
+    return lt;
+  }
   // One coerced field value, reading the source block through `block_var` (a Var
   // bound to the source module value): SrcField -> `field_mut pos block_var`
   // (recursing for a submodule sub-coercion); PrimStub -> eta-stub; AliasValue ->
@@ -29010,7 +29064,7 @@ struct Translator {
     if (f.from == From::PrimStub) return prim_stub({f.prim, f.prim_arity});
     if (f.from == From::AliasValue) {
       auto a = module_alias_.find(f.name);
-      return a != module_alias_.end() ? a->second : nullptr;
+      return a != module_alias_.end() ? alias_coerce_wrap(a->second) : nullptr;
     }
     auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
     fr->prim_arg = f.src_pos; fr->args = {block_var};
@@ -29029,7 +29083,7 @@ struct Translator {
     if (f.from == From::PrimStub) return prim_stub({f.prim, f.prim_arity});
     if (f.from == From::AliasValue) {
       auto a = module_alias_.find(f.name);
-      return a != module_alias_.end() ? a->second : nullptr;
+      return a != module_alias_.end() ? alias_coerce_wrap(a->second) : nullptr;
     }
     if (f.src_pos < 0 || f.src_pos >= (int)src_fields.size()) return nullptr;
     LamPtr v = src_fields[f.src_pos];
@@ -32334,8 +32388,10 @@ struct Translator {
           ce.push_back(val); cn.push_back(nm);
         } else if (auto a = module_alias_.find(nm); a != module_alias_.end()) {
           // a module the struct ELIDED as an alias (`module Elem = E`) but the
-          // ascribed sig exposes -> materialise the alias value at this slot.
-          ce.push_back(a->second); cn.push_back(nm);
+          // ascribed sig exposes -> materialise the alias value at this slot,
+          // under the same discarded name_lambda binder the computed path uses
+          // (see alias_coerce_wrap).
+          ce.push_back(alias_coerce_wrap(a->second)); cn.push_back(nm);
         } else if (auto ex = externals_.find(nm);
                    ex != externals_.end() && prim_stub(ex->second)) {
           // The impl declares this as an `external` (inlined, no field) but the
