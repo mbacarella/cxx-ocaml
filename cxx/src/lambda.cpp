@@ -2617,6 +2617,85 @@ struct Translator {
             nested(ps->items, sub_modpath("", b.name.txt));
     }
   }
+  // The tables register_types writes are keyed by SHORT names and are
+  // file-wide, which is right for a structure ITEM (a top-level `module M =
+  // struct ..` is in scope for the rest of the file) but wrong for a structure
+  // written inside an EXPRESSION: `let open struct type t = C | B | A end in
+  // ..` re-tagged an outer `type t = A | B | C`'s constructors for every LATER
+  // use in the file.  Record an undo entry for exactly the names such a
+  // structure declares, and replay it when the structure's scope ends.
+  // Registration under a DISAMBIGUATED key ("t#N", picked by table size for a
+  // nested twin) is left alone: no bare-name lookup reaches those keys.
+  using TypeUndo = std::vector<std::function<void()>>;
+  TypeUndo save_local_types(const Structure& items) {
+    TypeUndo undo;
+    if (no_local_scope_) return undo;
+    auto key = [&undo](auto& map, const std::string& k) {
+      auto it = map.find(k);
+      if (it == map.end()) {
+        undo.push_back([&map, k] { map.erase(k); });
+        return;
+      }
+      auto v = it->second;
+      undo.push_back([&map, k, v] { map[k] = v; });
+    };
+    auto memb = [&undo](auto& set, const std::string& k) {
+      bool had = set.count(k) != 0;
+      undo.push_back([&set, k, had] {
+        if (had) set.insert(k); else set.erase(k);
+      });
+    };
+    auto type_name = [&](const std::string& n) {
+      key(type_ctors_, n); key(type_ctor_info_, n); key(type_field_info_, n);
+      key(rec_types_, n); key(local_alias_, n); key(pv_raw_tags_, n);
+      key(pv_inherits_, n); key(pv_rows_, n); key(type_name_owner_, n);
+      key(local_mod_variants_, n);
+      memb(immediate_local_, n); memb(gadt_types_, n);
+      memb(ambiguous_type_names_, n);
+    };
+    auto ctor_name = [&](const std::string& n) {
+      key(ctor_info_, n); memb(ambiguous_ctors_, n); memb(builtin_ctors_, n);
+    };
+    auto field_name = [&](const std::string& n) {
+      key(field_info_, n); key(field_fn_sig_, n); memb(ambiguous_fields_, n);
+    };
+    std::function<void(const Structure&, const std::string&)> walk =
+        [&](const Structure& s, const std::string& modpath) {
+      if (!modpath.empty()) {
+        key(mod_record_types_, modpath); key(local_include_units_, modpath);
+      }
+      for (auto& item : s) {
+        if (auto* td = std::get_if<Pstr_type>(&item.desc))
+          for (auto& d : td->decls) {
+            type_name(d.name.txt);
+            if (!modpath.empty()) type_name(modpath + "." + d.name.txt);
+            if (auto* v = std::get_if<Ptype_variant>(&d.kind))
+              for (auto& c : v->ctors) {
+                ctor_name(c.name.txt);
+                if (auto* r = std::get_if<Pcstr_record>(&c.args))
+                  for (auto& f : r->fields) field_name(f.name.txt);
+              }
+            if (auto* rec = std::get_if<Ptype_record>(&d.kind))
+              for (auto& f : rec->fields) field_name(f.name.txt);
+          }
+        if (auto* pm = std::get_if<Pstr_module>(&item.desc))
+          if (auto* ps = peel_to_structure(pm->binding.expr))
+            walk(ps->items, sub_modpath(modpath, pm->binding.name.txt));
+        if (auto* prm = std::get_if<Pstr_recmodule>(&item.desc))
+          for (auto& b : prm->bindings)
+            if (auto* ps = peel_to_structure(b.expr))
+              walk(ps->items, sub_modpath(modpath, b.name.txt));
+      }
+    };
+    walk(items, "");
+    return undo;
+  }
+  // Replay an undo log in reverse, so a name saved twice comes back as it was
+  // before the FIRST save.
+  static void restore_local_types(TypeUndo& undo) {
+    for (auto it = undo.rbegin(); it != undo.rend(); ++it) (*it)();
+    undo.clear();
+  }
   // Build a dotted submodule path, or "" for an anonymous module (whose records
   // can't be named-qualified anyway).
   static std::string sub_modpath(const std::string& parent,
@@ -2751,6 +2830,11 @@ struct Translator {
   // its own type declarations were registered only after it had been compiled,
   // so a constructor used by the struct's own items lowered to `?C`.
   const bool no_local_struct_ = std::getenv("NOLSTRUCT") != nullptr;
+  // NOLSCOPE restores the pre-slice UNSCOPED registration of a structure
+  // written inside an expression: its type declarations stayed in the
+  // short-name-keyed tables for the rest of the file, so a re-declared type
+  // re-tagged an outer same-named constructor past the end of its scope.
+  const bool no_local_scope_ = std::getenv("NOLSCOPE") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -23843,7 +23927,13 @@ struct Translator {
         // body's bare `A`/`B` (opened) need them, and so do the struct's own
         // items, whose `A` used to be left unresolved (`?A`).
         const Pmod_structure* ops = peel_to_structure(op->expr);
-        if (ops && !no_local_struct_) register_types(ops->items);
+        // ... and undone at the END of the body, which is where the opened
+        // names go out of scope (see save_local_types).
+        TypeUndo tundo;
+        if (ops && !no_local_struct_) {
+          tundo = save_local_types(ops->items);
+          register_types(ops->items);
+        }
         LamPtr mv = compile_module_expr(op->expr);
         if (ops && no_local_struct_) register_types(ops->items);
         auto rl = module_result_layout(op->expr);
@@ -23862,6 +23952,7 @@ struct Translator {
         register_local_open_shadows(nm, osig, &shadow_save);
         rec_spine_ = rec_spine;
         LamPtr b = expr(*si->body);
+        restore_local_types(tundo);
         restore_local_open_shadows(shadow_save);
         menv_.pop_frame();
         opened_.pop_back();
@@ -23891,9 +23982,15 @@ struct Translator {
           // harvest gap as the local open above -- M's own items referred to
           // their own `A` as `?A`.  The body reaches them qualified (`M.A`),
           // which resolves through M's layout, not through these tables.
+          // ... and undone at the end of the BODY: `M.Yes` there still reads
+          // these tables, so an earlier undo left the body's own qualified
+          // patterns resolving at the OUTER same-named type.
+          TypeUndo tundo;
           if (!no_local_struct_)
-            if (const Pmod_structure* ms = peel_to_structure(mb.expr))
+            if (const Pmod_structure* ms = peel_to_structure(mb.expr)) {
+              tundo = save_local_types(ms->items);
               register_types(ms->items);
+            }
           LamPtr modval = compile_module_expr(mb.expr);
           mod_path_ = saved_mp; func_path_ = saved_fp; exn_path_ = saved_ep;
           auto rl = module_result_layout(mb.expr);
@@ -23943,6 +24040,7 @@ struct Translator {
             l->bindings = {{mid, ValueKind::Gen, modval}}; l->body = expr(*si->body);
             result = l;
           }
+          restore_local_types(tundo);
           if (had_i) module_ident_[nm] = sav_i; else module_ident_.erase(nm);
           if (had_a) module_alias_[nm] = sav_a; else module_alias_.erase(nm);
           unsnap(module_layout_, sav_l);
