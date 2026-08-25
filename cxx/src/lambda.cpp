@@ -2729,6 +2729,11 @@ struct Translator {
   // build_block_arm's prewalk honouring the pre-assignment).  Both are pure
   // binder identity/order -- setting it restores the old code byte for byte.
   const bool no_impl_bind_ = std::getenv("NOIMPLBIND") != nullptr;
+  // NOSTDALIAS restores the pre-slice handling of an alias to a stdlib module:
+  // no sub-coercion when the target RESTRICTS the alias (modsig.hpp reads the
+  // same name), and no canonicalisation of a `Stdlib.`-prefixed path, whose
+  // externals then lower to an unresolved `?name`.
+  const bool no_std_alias_ = std::getenv("NOSTDALIAS") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -25717,6 +25722,23 @@ struct Translator {
             if (StdPrim sp = submodule_prim(cand, d->name); !sp.name.empty())
               if (LamPtr s = prim_stub(sp)) return s;
           }
+          // `Stdlib.String.length` IS `String.length`: stdlib.ml re-exports the
+          // unit, so the leading Stdlib is not a submodule step, and the
+          // submodule walk carries no prims table for such a re-export -- an
+          // EXTERNAL member lowered to an unresolved `?length` and segfaulted
+          // at run time.  Reached only once the walk above has failed, so a
+          // path that already resolves keeps resolving exactly as it did.
+          if (std::string c = no_std_alias_ ? dotted
+                                            : canon_stdlib_path(dotted);
+              c != dotted && c.find('.') == std::string::npos) {
+            auto& fm = fields_of(c);
+            if (auto f = fm.find(d->name); f != fm.end())
+              return field_of(global_of(c), f->second);
+            StdPrim sp = value_prim(c, d->name);
+            if (auto pv = prim_value(sp.name)) return pv;
+            if (!sp.name.empty())
+              if (LamPtr s = prim_stub(sp, cmp_operand_of(&e))) return s;
+          }
         }
       }
       // A QUALIFIED value whose head module isn't bound anywhere is unbound, not a
@@ -25801,10 +25823,26 @@ struct Translator {
       // Qualified module primitives: Array.get/set (kind-annotated), String/Bytes
       // length/get/set.  `x.(i)` / `s.[i]` desugar to these.
       if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
-        if (auto* d = std::get_if<Ldot>(&fid->id.txt.v))
-          if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
+        if (auto* d = std::get_if<Ldot>(&fid->id.txt.v)) {
+          // `Stdlib.Array.get a i` IS `Array.get a i`: stdlib.ml re-exports the
+          // unit, so the leading Stdlib is not a module step.  Canonicalise the
+          // prefix before matching the table below -- the fully-qualified
+          // spelling used to miss it, and an external member has no field to
+          // fall back on, so it lowered to an unresolved `?get`.  A local alias
+          // to such a module (`module S = Stdlib.String`) reaches it the same
+          // way, so the expanded head is tried as a SECOND candidate -- after
+          // the literal one, which keeps every prefix that already resolves
+          // resolving exactly as it did.
+          std::vector<std::string> mods;
+          if (auto* pl = std::get_if<Lident>(&d->prefix->v))
+            mods.push_back(pl->name);
+          if (std::string pd; !no_std_alias_ && lid_to_dotted(*d->prefix, pd))
+            if (std::string c = canon_stdlib_path(expand_alias_head(pd));
+                c.find('.') == std::string::npos &&
+                (mods.empty() || c != mods[0]))
+              mods.push_back(c);
+          for (const std::string& m : mods) {
             auto& as = ap->args;
-            const std::string& m = pl->name;
             const std::string& f = d->name;
             std::string op;
             if (m == "Array" && f == "length" && as.size() == 1)
@@ -25834,6 +25872,7 @@ struct Translator {
             if (auto prim = value_prim(m, f); !prim.name.empty())
               if (auto r = prim_apply(prim.name, prim.arity, *ap, e)) return r;
           }
+        }
       // Nested-prefix qualified externals (`Bigarray.Array1.get a i`, or
       // `Array1.get` under `open Bigarray`): the submodule's prim via the cmi
       // signature chain.
@@ -28882,11 +28921,18 @@ struct Translator {
   // and the same Lambda shapes as coerce_block, so lambda-parity does not churn).
   // Returns nullptr when a field cannot be replayed here (a required prim stub or
   // module alias is unavailable) so the caller falls back to the legacy path.
-  // A pure projection -- a var or a chain of field reads rooted at one.  Only
-  // such a value may be moved into the single field that reads it (below).
+  // A pure projection -- a var or a global, or a chain of field reads rooted at
+  // one.  Only such a value may be moved into the single field that reads it
+  // (below).  A global root counts: Simplif substitutes an Alias binder read
+  // once whatever the (pure) right-hand side is, and an aliased module path
+  // bottoms out in a global rather than in a variable.
   static bool pure_field_projection(const LamPtr& l, int depth = 0) {
     if (!l || depth > 16) return false;
+    static const bool no_std_alias = std::getenv("NOSTDALIAS") != nullptr;
     if (l->k == Lam::K::Var) return true;
+    if (!no_std_alias && l->k == Lam::K::Prim && l->prim == Prim::Global &&
+        l->args.empty())
+      return true;
     if (l->k == Lam::K::Prim && l->args.size() == 1 &&
         (l->prim == Prim::FieldMut || l->prim == Prim::FieldImm ||
          l->prim == Prim::FieldInt))
@@ -29055,6 +29101,29 @@ struct Translator {
     lt->body = v;
     return lt;
   }
+  // One Tcoerce_alias field in full: `name_lambda strict arg (fun _ ->
+  // apply_coercion loc Alias cc lam)`.  When the target RESTRICTS the alias,
+  // `cc` is a real coercion of the aliased module's signature and has to be
+  // replayed on the re-read path -- handing the whole aliased module over
+  // instead makes every member read land on the wrong field.  name_lambda mints
+  // its discarded binder BEFORE running `cc`, so mint ours first as well; a
+  // sub-coercion that cannot be replayed here rolls the stamp back so the
+  // caller's legacy fallback numbers its idents exactly as before.
+  LamPtr alias_coerce_field(const modsig::Coercion::Field& f) {
+    auto a = module_alias_.find(f.name);
+    if (a == module_alias_.end()) return nullptr;
+    if (!f.sub) return alias_coerce_wrap(a->second);
+    int stamp_save = stamp;
+    std::optional<Ident> id;
+    if (!no_impl_bind_) id = fresh("let");
+    LamPtr v = apply_msig_coercion(a->second, *f.sub, /*alias=*/true);
+    if (!v) { stamp = stamp_save; return nullptr; }
+    if (!id) return v;
+    auto lt = mk(Lam::K::Let);
+    lt->bindings.push_back({*id, ValueKind::Gen, cint(0)});
+    lt->body = v;
+    return lt;
+  }
   // One coerced field value, reading the source block through `block_var` (a Var
   // bound to the source module value): SrcField -> `field_mut pos block_var`
   // (recursing for a submodule sub-coercion); PrimStub -> eta-stub; AliasValue ->
@@ -29062,10 +29131,7 @@ struct Translator {
   LamPtr coerce_field_value(const modsig::Coercion::Field& f, const LamPtr& block_var) {
     using From = modsig::Coercion::Field::From;
     if (f.from == From::PrimStub) return prim_stub({f.prim, f.prim_arity});
-    if (f.from == From::AliasValue) {
-      auto a = module_alias_.find(f.name);
-      return a != module_alias_.end() ? alias_coerce_wrap(a->second) : nullptr;
-    }
+    if (f.from == From::AliasValue) return alias_coerce_field(f);
     auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
     fr->prim_arg = f.src_pos; fr->args = {block_var};
     if (f.functor_eta && f.sub)
@@ -29081,10 +29147,7 @@ struct Translator {
                             const std::vector<LamPtr>& src_fields) {
     using From = modsig::Coercion::Field::From;
     if (f.from == From::PrimStub) return prim_stub({f.prim, f.prim_arity});
-    if (f.from == From::AliasValue) {
-      auto a = module_alias_.find(f.name);
-      return a != module_alias_.end() ? alias_coerce_wrap(a->second) : nullptr;
-    }
+    if (f.from == From::AliasValue) return alias_coerce_field(f);
     if (f.src_pos < 0 || f.src_pos >= (int)src_fields.size()) return nullptr;
     LamPtr v = src_fields[f.src_pos];
     if (f.functor_eta && f.sub)
@@ -31625,6 +31688,12 @@ struct Translator {
               std::string dotted;
               if (lid_to_dotted(pi2->id.txt, dotted)) {
                 dotted = expand_alias_head(dotted);  // `module NameMap = S.Map`
+                // `module S = Stdlib.String` IS `module S = String`: stdlib.ml
+                // re-exports the unit, so canonicalise before classifying.  The
+                // Stdlib-prefixed spelling used to fall through to a bare
+                // layout copy, which leaves S's EXTERNAL members (S.length --
+                // no runtime field) unresolvable, hence an unbound `?length`.
+                if (!no_std_alias_) dotted = canon_stdlib_path(dotted);
                 // `module X = R.M` where M is an elided alias to a GLOBAL
                 // module: X aliases the substituted unit itself, so record
                 // it exactly like the direct spelling `module X = List`.

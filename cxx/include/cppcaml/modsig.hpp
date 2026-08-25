@@ -18,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+#include "cppcaml/dbgenv.hpp"
+
 namespace cppcaml::modsig {
 
 // Signature-item namespace, as in includemod's FieldMap keys.  Unknown marks
@@ -335,6 +337,21 @@ inline Coercion compute_coercion(const Sig& src, const Sig& tgt, int depth = 0) 
       f.prim_arity = s->prim_arity;
     } else if (s->ns == NS::Module) {  // elided alias exposed: materialize it
       f.from = Coercion::Field::From::AliasValue;
+      // Tcoerce_alias carries a coercion of its OWN: includemod pairs the
+      // aliased module's signature against the target's, and translmod replays
+      // it on the re-read path (`apply_coercion loc Alias cc lam`).  Without it
+      // a target that RESTRICTS the alias gets the whole aliased module handed
+      // over at the target's offsets, and a member read off it lands on the
+      // wrong field.
+      static const bool no_std_alias = dbg_env("NOSTDALIAS") != nullptr;
+      if (!no_std_alias && t.ns == NS::Module && s->sub && t.sub) {
+        Coercion sub = compute_coercion(*s->sub, *t.sub, depth + 1);
+        if (!sub.ok) {
+          c.ok = false; c.error = t.name + "." + sub.error; return c;
+        }
+        c.unknown_pairings += sub.unknown_pairings;
+        if (!sub.identity) f.sub = std::make_shared<Coercion>(std::move(sub));
+      }
     } else {  // a no-slot src member that is neither prim nor alias: unmatchable
       c.ok = false; c.error = t.name; return c;
     }
