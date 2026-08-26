@@ -1459,6 +1459,18 @@ struct Translator {
   // scoping (morematch: `x` in `type eber={x;y;z}` vs a later `type tg={v;x}`).
   std::unordered_map<std::string, std::unordered_map<std::string, FieldInfo>> type_field_info_;
   std::set<std::string> scoped_unambig_fields_;
+  // ... and the CONSTRUCTOR analogue: the ambiguous names the enclosing
+  // structure's own source-order `type` scoping has resolved at this point.
+  // The nearest enclosing declaration owns such a name, so the construct
+  // site's inferred-type override must not displace it -- inside `module N =
+  // struct type t = B | A .. end` the checker still infers a bare `A` at an
+  // OUTER `type u = A | B`, and the override then rebuilt the outer tag on top
+  // of the scoping that had just got it right.
+  std::set<std::string> scoped_ctors_;
+  // The type names each structure under construction declares itself, innermost
+  // last -- how the construct site tells "the checker named one of my own
+  // types" from "the checker named a type outside this module".
+  std::vector<std::set<std::string>> struct_types_;
   struct RecType { std::vector<std::string> labels; bool mut; std::vector<ValueKind> shape;
                    std::vector<bool> fmut;  // per-field mutability, parallel to labels
                    bool flat = false;    // all-float: a flat float block, not a record
@@ -1849,6 +1861,52 @@ struct Translator {
     }
     return nullptr;
   }
+  // The CtorInfo of a ctor qualified by a LOCAL module -- the case
+  // qualified_ctor_info declines, since there is no unit to read it from.
+  // register_types' submodule walk fills the flat ctor_info_ only when the bare
+  // name is FREE, so a nested `module N = struct type t = B | A end` under an
+  // outer `A` leaves the flat entry naming the OUTER constructor and records
+  // its own under the qualified key ("N.t") -- which is exactly what the
+  // written path names, so read it back.  The path is tried whole first and
+  // then with leading components dropped, because register_types is rooted at
+  // the structure it was handed: `let module M = struct module N = .. end in
+  // M.N.A` registers "N.t", not "M.N.t".  Constructor and pattern BOTH consult
+  // this, or a construct/match pair splits on the tag.
+  std::string local_module_ctor_type_key(const Longident& id, bool has_arg) {
+    if (no_local_qual_ctor_) return "";
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return "";
+    // an extension constructor's identity never comes from a variant tag map
+    if (exn_ident_.count(d->name) || exn_field_.count(d->name)) return "";
+    std::string dotted;
+    if (!lid_to_dotted(*d->prefix, dotted)) return "";
+    if (!module_base(dotted.substr(0, dotted.find('.'))))
+      return "";  // an imported unit: qualified_ctor_info's business
+    for (;;) {
+      std::string pref = dotted + ".", bestkey;
+      for (auto& [key, tbl] : type_ctor_info_) {
+        if (key.size() <= pref.size() ||
+            key.compare(0, pref.size(), pref) != 0) continue;
+        if (key.find('.', pref.size()) != std::string::npos) continue;
+        auto ci = tbl.find(d->name);
+        // never name a type the WRITTEN form cannot belong to
+        if (ci == tbl.end() || ci->second.is_block != has_arg) continue;
+        if (bestkey.empty() || key < bestkey) bestkey = key;
+      }
+      if (!bestkey.empty()) return bestkey;
+      auto dot = dotted.find('.');
+      if (dot == std::string::npos) return "";
+      dotted = dotted.substr(dot + 1);
+    }
+  }
+  const CtorInfo* local_module_ctor_info(const Longident& id, bool has_arg) {
+    std::string key = local_module_ctor_type_key(id, has_arg);
+    if (key.empty()) return nullptr;
+    auto tbl = type_ctor_info_.find(key);      // find, not [] -- a lookup here
+    if (tbl == type_ctor_info_.end()) return nullptr;   // must not rehash the
+    auto ci = tbl->second.find(lid_last(id));  // table it hands pointers into
+    return ci == tbl->second.end() ? nullptr : &ci->second;
+  }
   // The ctor `n` as declared by the EXACT imported type an inferred path names
   // ("Env.label_usage"), or null when the path names no loadable unit / the
   // type is not a variant / it does not declare the name.  module_ctors' flat
@@ -2126,6 +2184,46 @@ struct Translator {
       for (auto& [nm, info] : tl)
         fprintf(stderr, "[CTDBG] force-register %s ctor %s arity=%d tag=%d block=%d\n",
                 path.c_str(), nm.c_str(), info.arity, info.tag, (int)info.is_block);
+    saved = install_forced_ctors(tl, ty, nc, nb);
+    // Sibling arg-type ctors register PERMANENTLY (fallback-only), matching
+    // register_ctors_of_type -- the destructured-arg inner match compiles
+    // while this force-register is active.
+    register_sibling_arg_ctors(mod, ty);
+    return saved;
+  }
+  // FORCE-register a LOCAL module's own type, which has no cmi to read:
+  // register_types recorded it under exactly this qualified key when the flat
+  // ctor_info_ slot was already held by an OUTER same-named constructor, so
+  // read the AST harvest back.  Everything the match then resolves by BARE
+  // name -- pat_test, ctor_switch_vals, the naive rows, the arm bodies --
+  // agrees with the path its rows wrote, which is the only way the pair does
+  // not split on the tag.  The full type's counts come from
+  // local_mod_variants_; the harvest table holds only the ctors it could not
+  // place flat.  Called for a row that WROTE the path, never for an inferred
+  // one: a bare row at a local type already resolves through pat_ctor_resolve,
+  // and force-registering there displaced the file's own same-named ctor.
+  CtorSave force_register_local_ctors(const std::string& path) {
+    CtorSave saved;
+    auto d = path.rfind('.');
+    if (d == std::string::npos) return saved;
+    auto lt = type_ctor_info_.find(path);
+    auto lv = local_mod_variants_.find(path);
+    if (lt == type_ctor_info_.end() || lv == local_mod_variants_.end())
+      return saved;
+    std::vector<std::pair<std::string, CtorInfo>> tl(lt->second.begin(),
+                                                     lt->second.end());
+    std::sort(tl.begin(), tl.end(),
+              [](auto& a, auto& b) { return a.first < b.first; });
+    return install_forced_ctors(tl, path.substr(d + 1), lv->second.nc,
+                                lv->second.nb);
+  }
+  // Install `tl`'s constructors into the flat ctor_info_, overriding an ambient
+  // entry that disagrees on type/tag/arity, and set the type's
+  // (n_const, n_block) -- returning what it takes to put both back.
+  CtorSave install_forced_ctors(
+      const std::vector<std::pair<std::string, CtorInfo>>& tl,
+      const std::string& ty, int nc, int nb) {
+    CtorSave saved;
     for (auto& [nm, info] : tl) {
       auto it = ctor_info_.find(nm);
       if (it == ctor_info_.end() || it->second.type != ty ||
@@ -2152,10 +2250,6 @@ struct Translator {
                                   ? std::optional<std::pair<int, int>>()
                                   : std::optional<std::pair<int, int>>(tcit->second));
     type_ctors_[ty] = std::make_pair(nc, nb);
-    // Sibling arg-type ctors register PERMANENTLY (fallback-only), matching
-    // register_ctors_of_type -- the destructured-arg inner match compiles
-    // while this force-register is active.
-    register_sibling_arg_ctors(mod, ty);
     return saved;
   }
   // Register the type owning constructor `ctorname` from module `mod` (an imported
@@ -2841,6 +2935,13 @@ struct Translator {
   // resolving to the ident the structure's own compilation had left behind --
   // out of scope in the body, so the read segfaulted.
   const bool no_open_alias_ = std::getenv("NOOPENALIAS") != nullptr;
+  // NOLOCALQUALCTOR restores the pre-slice reading of `N.C` where N is a LOCAL
+  // module: the name was resolved through the flat ctor_info_, which holds an
+  // OUTER same-named constructor whenever the nested registration found the
+  // bare name taken -- so the construct built one type's tag and the match
+  // tested another's.
+  const bool no_local_qual_ctor_ =
+      std::getenv("NOLOCALQUALCTOR") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -12453,6 +12554,13 @@ struct Translator {
     if (!want_type.empty())
       if (auto ti = type_ctor_info_.find(want_type); ti != type_ctor_info_.end())
         if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
+    // A ctor qualified by a LOCAL module names ITS type, whatever the flat
+    // entry says -- the CONSUMER twin of the construct site's identical
+    // lookup, and the two must move together or the pair splits on the tag.
+    if (auto* pk = std::get_if<Ppat_construct>(&p->desc))
+      if (const CtorInfo* lci =
+              local_module_ctor_info(pk->id.txt, pk->arg.has_value()))
+        return lci;
     auto base = ctor_info_.find(cn);
     const CtorInfo* amb = base != ctor_info_.end() ? &base->second : nullptr;
     auto pc = vk.pat_constr.find(p);
@@ -20865,6 +20973,19 @@ struct Translator {
         if (!k) continue;
         auto* d = std::get_if<Ldot>(&k->id.txt.v);
         if (!d) continue;
+        // ... and a LOCAL module's own type answers the same way, from the AST
+        // harvest instead of a cmi: `let open struct module N = struct type t =
+        // B | A .. end end in match .. with N.A ->` read the OUTER `A`'s tag,
+        // because register_types leaves a nested ctor out of the flat map when
+        // the bare name is taken.  Force-registering here is what makes every
+        // bare-name lookup this match performs agree with the written path.
+        if (std::string lk =
+                local_module_ctor_type_key(k->id.txt, k->arg.has_value());
+            !lk.empty()) {
+          ctor_save = force_register_local_ctors(lk);
+          if (!ctor_save.empty()) forced_type_path = lk;
+          break;
+        }
         auto* pl = std::get_if<Lident>(&d->prefix->v);
         if (!pl || module_base(pl->name)) continue;
         auto& mc = module_ctors(pl->name);
@@ -25209,6 +25330,9 @@ struct Translator {
       // local/bare ctor (typecore's `Env.Pattern` vs its local `Pattern`).
       const CtorInfo* qci = std::holds_alternative<Ldot>(k->id.txt.v)
                             ? qualified_ctor_info(k->id.txt) : nullptr;
+      // ...and a LOCAL module's own type answers the same way, which is the one
+      // qualifier qualified_ctor_info cannot resolve (pat_ctor_resolve's twin).
+      if (!qci) qci = local_module_ctor_info(k->id.txt, k->arg.has_value());
       // ...but naming the MODULE does not name the TYPE, and a module may
       // declare one ctor name in TWO of its types -- env.mli's `Exported` is
       // constructor_usage's tag 3 AND label_usage's tag 4.  qualified_ctor_info
@@ -25299,7 +25423,29 @@ struct Translator {
             // `launch_method` and then declares its own; `| Config.Executable
             // -> Executable` built the opened one's tag 0 (Shebang_runtime's
             // value) for its own tag-1 Executable.
-            if ((ety != cip->type || forced_ctor_depth_.count(n)) &&
+            // ...and never over THIS structure's own source-order scoping when
+            // the inferred type belongs to an ENCLOSING structure instead: the
+            // checker is then looking outward past a declaration that is
+            // nearer, which is exactly what it does for a bare ctor inside
+            // `module N = struct type t = B | A .. end` nested in an
+            // expression-position structure -- it types `A` at the outer `type
+            // u = A | B`, and the override put the outer tag back over the
+            // scoping that had just got it right.  Every conjunct earns its
+            // place: includecore's file-level mismatch types are all the
+            // structure's OWN, and includemod's `core_module_type_symptom`
+            // lives in a NESTED `module Error`, so neither is an enclosing
+            // frame's and both keep the override.  A force-register is exempt,
+            // as below.
+            bool ety_outer = false;
+            for (size_t fi = 0; fi + 1 < struct_types_.size(); ++fi)
+              if (struct_types_[fi].count(ety)) { ety_outer = true; break; }
+            bool nearest_owns =
+                ety_outer && !forced_ctor_depth_.count(n) &&
+                scoped_ctors_.count(n) && !struct_types_.empty() &&
+                struct_types_.back().count(cip->type) &&
+                !struct_types_.back().count(ety);
+            if (!nearest_owns &&
+                (ety != cip->type || forced_ctor_depth_.count(n)) &&
                 (forced_ctor_depth_.count(n) ||
                  (!ambiguous_type_names_.count(ety) &&
                   // an EXTENSION constructor's identity never comes from a
@@ -30809,6 +30955,15 @@ struct Translator {
       if (auto it = field_info_.find(n); it != field_info_.end())
         saved_fields.emplace_back(n, it->second);
     std::set<std::string> saved_scoped = scoped_unambig_fields_;
+    std::set<std::string> saved_sctors = scoped_ctors_;
+    // the type names THIS structure declares (see struct_types_)
+    struct_types_.emplace_back();
+    for (auto& item : s)
+      if (auto* td0 = std::get_if<Pstr_type>(&item.desc))
+        for (auto& d0 : td0->decls) struct_types_.back().insert(d0.name.txt);
+    struct StructTypesPop {
+      Translator* t; ~StructTypesPop() { t->struct_types_.pop_back(); }
+    } struct_types_pop{this};
     // The variant CONSTRUCTOR-COUNT (type_ctors_) is scoped too: two sibling types
     // sharing a name (A's `t = Leaf|Node`, Expr's `t = Var|Const|Add|Binding`) must
     // each see THEIR own count at a match site, else the matcher truncates the
@@ -30833,14 +30988,17 @@ struct Translator {
     struct AmbigRestore {
       Translator* t; std::vector<std::pair<std::string, CtorInfo>>* s;
       std::vector<std::pair<std::string, FieldInfo>>* sf; std::set<std::string>* ss;
+      std::set<std::string>* sc;
       std::vector<std::pair<std::string, std::optional<std::pair<int,int>>>>* st;
       ~AmbigRestore() {
         for (auto& [n, ci] : *s) t->ctor_info_[n] = ci;
         for (auto& [n, fi] : *sf) t->field_info_[n] = fi;
         t->scoped_unambig_fields_ = std::move(*ss);
+        t->scoped_ctors_ = std::move(*sc);
         for (auto& [n, v] : *st) { if (v) t->type_ctors_[n] = *v; else t->type_ctors_.erase(n); }
       }
-    } ambig_restore{this, &saved_ambig, &saved_fields, &saved_scoped, &saved_tctors};
+    } ambig_restore{this, &saved_ambig, &saved_fields, &saved_scoped,
+                    &saved_sctors, &saved_tctors};
     // updates non-empty => a recursive-data group: `(let <binds=dummies>
     // (seq <updates> body))` (caml_alloc_dummy + caml_update_dummy).
     struct Seg { bool seq; bool rec_; std::vector<Lam::Binding> binds; LamPtr e;
@@ -31030,7 +31188,10 @@ struct Translator {
           }
           if (auto tci = type_ctor_info_.find(tk); tci != type_ctor_info_.end())
             for (auto& [cn, ci] : tci->second)
-              if (ambiguous_ctors_.count(cn)) ctor_info_[cn] = ci;
+              if (ambiguous_ctors_.count(cn)) {
+                ctor_info_[cn] = ci;
+                if (!no_local_qual_ctor_) scoped_ctors_.insert(cn);
+              }
           if (auto tfi = type_field_info_.find(d.name.txt); tfi != type_field_info_.end())
             for (auto& [fn, fi] : tfi->second)
               if (ambiguous_fields_.count(fn)) { field_info_[fn] = fi; scoped_unambig_fields_.insert(fn); }
