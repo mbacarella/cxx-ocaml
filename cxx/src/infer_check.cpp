@@ -439,6 +439,8 @@ struct Checker {
   // additive -- gated separately from record_kinds_ so the dump pass can collect
   // formats without also flipping on the heavier kind-recording behaviour.
   bool record_fmt_lits_ = false;
+  // revert hook for register_local_struct_records
+  const bool no_local_rec_decl_ = std::getenv("NOLOCALRECDECL") != nullptr;
   std::unordered_map<const Pattern*, TypePtr> rec_pat_;
   std::unordered_map<const void*, TypePtr> rec_ret_;
   std::unordered_map<const void*, TypePtr> rec_expr_;  // every expression's type
@@ -4319,6 +4321,56 @@ struct Checker {
               for (auto& c : v->ctors) gadt_ctors.insert(c.name.txt);
             }
           }
+  }
+
+  // A record declared by an EXPRESSION-level local structure (`let open struct
+  // type r = { b : int; a : int } .. end in ..`) is never seen by the top-level
+  // register_types_rec pass, so a projection written inside it resolved through
+  // the enclosing same-named record's layout -- `v.a` read field 0 where the
+  // local `r` puts `a` at 1.  That is a wrong answer, not a fidelity gap.
+  //
+  // Register the decl here instead, with its own identity stamp, and SHADOW the
+  // enclosing binding of every label it re-declares for as long as the
+  // structure is in scope.  A base whose type is pinned (by an annotation on
+  // either side of the shadow) resolves through the stamp and stays exact; an
+  // unannotated one resolves to nothing, leaving the back end's source-order
+  // label scoping -- already correct for these -- undisturbed.
+  struct LocalRecScope {
+    std::vector<std::pair<std::string, TypePtr>> shadowed;
+    bool pushed_tenv = false;
+  };
+  // `scope_names`: also bind the structure's type names, which only a `let open
+  // struct` brings into scope unqualified (a `let module M = struct` names them
+  // `M.r`, and binding them bare would mis-scope the body).
+  LocalRecScope register_local_struct_records(const ast::Structure& items,
+                                              bool scope_names) {
+    LocalRecScope sc;
+    if (no_local_rec_decl_) return sc;
+    std::vector<const TypeDeclaration*> recs;
+    for (auto& it : items)
+      if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+        for (auto& d : ty->decls)
+          if (std::holds_alternative<Ptype_record>(d.kind) &&
+              !type_stamp_.count(&d))
+            recs.push_back(&d);
+    if (recs.empty()) return sc;
+    for (auto* d : recs) { register_type_decl(*d); register_record_decl(*d); }
+    if (scope_names) { tenv.emplace_back(); sc.pushed_tenv = true; }
+    for (auto* d : recs) {
+      if (scope_names && type_stamp_.count(d))
+        tenv.back()[d->name.txt] = type_stamp_[d];
+      for (auto& f : std::get<Ptype_record>(d->kind).fields) {
+        auto fi = fields_.find(f.name.txt);
+        if (fi == fields_.end()) continue;
+        sc.shadowed.emplace_back(f.name.txt, fi->second);
+        fields_.erase(fi);
+      }
+    }
+    return sc;
+  }
+  void restore_local_struct_records(LocalRecScope& sc) {
+    for (auto& [k, v] : sc.shadowed) fields_[k] = v;
+    if (sc.pushed_tenv) tenv.pop_back();
   }
 
   // Collect a record type's field schemes: label -> arrow((params) t, field),
@@ -9715,12 +9767,20 @@ struct Checker {
         register_exception(ex->exn.ctor);
       else if (auto* tx = std::get_if<Pstr_typext>(&sti->item->desc))
         register_typext(tx->ext);
-      else if (auto* op = std::get_if<Pstr_open>(&sti->item->desc)) {
+      LocalRecScope rec_scope;
+      if (auto* op = std::get_if<Pstr_open>(&sti->item->desc)) {
         // `let open struct type _ t = C : .. t .. end in ..`: register the local
         // struct's GADT markers so a match on its ctors is windowed.
-        if (auto* ms = std::get_if<Pmod_structure>(&op->expr.desc))
+        if (auto* ms = std::get_if<Pmod_structure>(&op->expr.desc)) {
           register_local_gadt_markers(ms->items);
+          rec_scope = register_local_struct_records(ms->items, true);
+        }
       } else if (auto* lm = std::get_if<Pstr_module>(&sti->item->desc)) {
+        const ModuleExpr* lme0 = &lm->binding.expr;
+        while (auto* mc0 = std::get_if<Pmod_constraint>(&lme0->desc))
+          lme0 = mc0->me.get();
+        if (auto* ms = std::get_if<Pmod_structure>(&lme0->desc))
+          rec_scope = register_local_struct_records(ms->items, false);
         if (lm->binding.name.txt && !strict) {
           std::string p = resolve_local_module_path(lm->binding.expr);
           auto [f, inserted] = local_module_paths_.emplace(*lm->binding.name.txt, p);
@@ -9745,6 +9805,7 @@ struct Checker {
         opened_type_quals_ = std::move(saved_type_quals);
         opened_submod_quals_ = std::move(saved_submod_quals);
       }
+      restore_local_struct_records(rec_scope);
       cenv.pop_back();
       venv.pop_back();
       return bt;
