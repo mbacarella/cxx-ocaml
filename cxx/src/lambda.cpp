@@ -2835,6 +2835,12 @@ struct Translator {
   // short-name-keyed tables for the rest of the file, so a re-declared type
   // re-tagged an outer same-named constructor past the end of its scope.
   const bool no_local_scope_ = std::getenv("NOLSCOPE") != nullptr;
+  // NOOPENALIAS restores the pre-slice reading of a local open's members: each
+  // use read the block again (`field_imm i open`) instead of going through the
+  // identifier upstream binds for the member, and a SUBMODULE member kept
+  // resolving to the ident the structure's own compilation had left behind --
+  // out of scope in the body, so the read segfaulted.
+  const bool no_open_alias_ = std::getenv("NOOPENALIAS") != nullptr;
   // A var/record-pattern NODE tagged (at pattern-scan time) with the record type its
   // enclosing constructor argument declares -- applied to var_record_path_ when the
   // var is bound, so a later `md.md_type` resolves the ambiguous label correctly.
@@ -9341,6 +9347,34 @@ struct Translator {
   }
   LamPtr fieldimm(int i, const LamPtr& s) {
     auto f = mk(Lam::K::Prim); f->prim = Prim::FieldImm; f->prim_arg = i; f->args = {s}; return f;
+  }
+  // Replace every read of field i of a local open's block `oid` with the
+  // identifier upstream binds for that member (`aids[i]`), so the block is read
+  // once per member instead of once per use.  Walks exactly the slots count_var
+  // walks, since the two answers must agree.
+  void rewrite_open_fields(LamPtr& l, const Ident& oid,
+                           const std::vector<Ident>& aids) {
+    if (!l) return;
+    if (l->k == Lam::K::Prim && l->args.size() == 1 &&
+        (l->prim == Prim::FieldImm || l->prim == Prim::FieldMut ||
+         l->prim == Prim::FieldInt || l->prim == Prim::Field) &&
+        l->prim_arg >= 0 && l->prim_arg < (int)aids.size() &&
+        l->args[0]->k == Lam::K::Var &&
+        l->args[0]->var.stamp == oid.stamp &&
+        l->args[0]->var.name == oid.name) {
+      auto v = mk(Lam::K::Var); v->var = aids[l->prim_arg]; l = v;
+      return;
+    }
+    rewrite_open_fields(l->fn, oid, aids);
+    rewrite_open_fields(l->body, oid, aids);
+    rewrite_open_fields(l->cond, oid, aids);
+    rewrite_open_fields(l->then_, oid, aids);
+    rewrite_open_fields(l->else_, oid, aids);
+    rewrite_open_fields(l->sw_default, oid, aids);
+    for (auto& a : l->args) rewrite_open_fields(a, oid, aids);
+    for (auto& b : l->bindings) rewrite_open_fields(b.val, oid, aids);
+    for (auto& sc : l->sw_consts) rewrite_open_fields(sc.body, oid, aids);
+    for (auto& sc : l->sw_blocks) rewrite_open_fields(sc.body, oid, aids);
   }
 
   // ===== Simplif.simplify_exits (lambda/simplif.ml) port =====
@@ -23950,8 +23984,43 @@ struct Translator {
         bind_opened_members(osig);
         ShadowSave shadow_save;
         register_local_open_shadows(nm, osig, &shadow_save);
+        // Upstream gives every item the open makes visible its own identifier,
+        // `id =a (field_mut pos open)` (Translcore's Texp_open), and leaves it
+        // to Simplif to drop an unused one and inline a single use.  A member
+        // read twice is then read ONCE, and -- the reason this is a correctness
+        // fix and not only a fidelity one -- a SUBMODULE member gets a binder
+        // the body can reach: `N` used to resolve to the ident the structure's
+        // own compilation left behind, which names a stack slot the block no
+        // longer occupies once the structure is built, so `let open struct
+        // module N = struct .. end end in N.f ..` segfaulted.
+        struct MSave { std::string nm; bool had_i; Ident i0;
+                       bool had_a; LamPtr a0; };
+        std::vector<MSave> msave;
+        std::vector<Ident> aids;
+        for (int i = 0; !no_open_alias_ && i < (int)rl.size(); ++i) {
+          const modsig::Item* mm =
+              osig ? osig->find(modsig::NS::Module, rl[i]) : nullptr;
+          bool ismod = mm && mm->runtime;
+          // a module binder is Ident.create_scoped upstream, a value one is not
+          aids.push_back(ismod ? fresh_scoped(rl[i]) : fresh(rl[i]));
+          if (!ismod) continue;
+          auto ii = module_ident_.find(rl[i]);
+          auto ai = module_alias_.find(rl[i]);
+          msave.push_back({rl[i], ii != module_ident_.end(),
+                           ii != module_ident_.end() ? ii->second : Ident{},
+                           ai != module_alias_.end(),
+                           ai != module_alias_.end() ? ai->second : LamPtr()});
+          module_ident_[rl[i]] = aids.back();
+          module_alias_.erase(rl[i]);
+        }
         rec_spine_ = rec_spine;
         LamPtr b = expr(*si->body);
+        for (auto it2 = msave.rbegin(); it2 != msave.rend(); ++it2) {
+          if (it2->had_i) module_ident_[it2->nm] = it2->i0;
+          else module_ident_.erase(it2->nm);
+          if (it2->had_a) module_alias_[it2->nm] = it2->a0;
+          else module_alias_.erase(it2->nm);
+        }
         restore_local_types(tundo);
         restore_local_open_shadows(shadow_save);
         menv_.pop_frame();
@@ -23960,6 +24029,21 @@ struct Translator {
         module_layout_.erase(nm);
         auto l = mk(Lam::K::Let);
         l->bindings = {{oid, ValueKind::Gen, mv}};
+        if (!no_open_alias_) {
+          rewrite_open_fields(b, oid, aids);
+          // Simplif's Alias rule, applied where upstream would: unused entries
+          // vanish, a single use takes the read itself, the rest stay bound --
+          // in field order, position 0 outermost.
+          for (int i = 0; i < (int)aids.size(); ++i) {
+            int uses = count_var(b, aids[i]);
+            if (!uses) continue;
+            auto ov = mk(Lam::K::Var); ov->var = oid;
+            auto fm = mk(Lam::K::Prim);
+            fm->prim = Prim::FieldMut; fm->prim_arg = i; fm->args = {ov};
+            if (uses == 1) subst_alias(b, aids[i], fm);
+            else l->bindings.push_back({aids[i], ValueKind::Gen, fm, true});
+          }
+        }
         l->body = b;
         return l;
       }
