@@ -24738,6 +24738,17 @@ struct Translator {
         std::set<std::string> labs;
         for (auto& [lid, ve] : rc->fields) labs.insert(lid_last(lid.txt));
         const RecType* rt = nullptr;
+        // The CHECKER's answer first, and only where the labels alone cannot
+        // identify the record: it names the EXPECTED record by its fields in
+        // DECLARATION order, which is the layout to build at.  The by-name legs
+        // below all start from `find_field`, i.e. the LAST record in scope
+        // declaring the label -- with `type p = {a;b}` and `type q = {b;a}`
+        // that is q for both, so `rp { a = 1; b = 2 }` built q's block.  The
+        // registered key may be disambiguated ("t#N"), so match the label list.
+        if (auto lit = vk.expr_record_labels.find(&e);
+            lit != vk.expr_record_labels.end())
+          for (auto& [name, cand] : rec_types_)
+            if (cand.labels == lit->second) { rt = &cand; break; }
         // The first label's registered type -- but only when it actually HAS the
         // whole literal label set.  A same-SHORT-NAMED record from another opened
         // module (`open Parsetree; open Typedtree` -> two `value_binding`s, both 5
@@ -24745,6 +24756,7 @@ struct Translator {
         // we locked onto it here, index_of below would fail (-1) and the literal
         // collapse to 0.  Requiring the labels to match lets the exact-set loop
         // below find the right (collision-disambiguated) record instead.
+        if (!rt)
         if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
           if (auto it = rec_types_.find(f0->type);
               it != rec_types_.end() && it->second.labels.size() == labs.size()) {
@@ -25157,6 +25169,18 @@ struct Translator {
                   : rf->kind == ValueKind::Int ? Prim::SetfieldImm
                                                : Prim::SetfieldPtr;
         l->prim_arg = rf->index; l->args = {expr(*sf->obj), expr(*sf->value)};
+        return l;
+      }
+      // The checker's answer, resolved through the base's type identity -- the
+      // WRITE twin of the read path's vk.field_resolved leg, ranked the same
+      // way: after a written qualification, before the bare find_field.
+      if (auto it = vk.field_resolved.find(&e);
+          it != vk.field_resolved.end() && !it->second.unboxed) {
+        auto l = mk(Lam::K::Prim);
+        l->prim = it->second.kind == "int" ? Prim::SetfieldImm
+                                          : Prim::SetfieldPtr;
+        l->prim_arg = it->second.index;
+        l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }
       if (auto* fi = find_field(lid_last(sf->field.txt))) {

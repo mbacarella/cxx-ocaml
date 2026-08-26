@@ -132,6 +132,14 @@ struct ValueKinds {
   // (`{ args = .. }` on a `pattern_matching` -- args@1 -- vs `division` -- args@0)
   // by the matched value's type instead of a single-label guess.
   std::unordered_map<const void*, std::string> pat_record_type;
+  // A record LITERAL (no `with` base) whose EXPECTED type names a record the
+  // literal's label set fills exactly but which is NOT the record its labels
+  // resolve to by scope: the expected record's fields in DECLARATION order.
+  // Two records sharing a label set (`type p = {a;b}` / `type q = {b;a}`) leave
+  // the back end's by-name lookup on the last-declared one, so
+  // `rp { a = 1; b = 2 }` built at q's layout.  The ordered labels, not
+  // the type name, identify the layout the back end must build at.
+  std::unordered_map<const void*, std::vector<std::string>> expr_record_labels;
   // For a polymorphic-variant PATTERN whose unified row type is CLOSED (`[<`
   // upper bound or exact `[ .. ]`): the row's tag-universe size.  The back
   // end's combine_variant port needs it for sig_complete -- a column listing

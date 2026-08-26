@@ -470,6 +470,12 @@ struct Checker {
   std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
   std::unordered_map<std::string, const TypeDeclaration*> name_record_decl_;
   std::set<std::string> ambiguous_record_names_;  // a record name declared by >1 decl
+  // A record LITERAL resolved by its EXPECTED type rather than by label scope:
+  // the expected record's fields in declaration order.
+  std::unordered_map<const Expression*, std::vector<std::string>>
+      record_expected_;
+  // revert hook for disambig_record_now
+  const bool no_rec_lit_expected_ = std::getenv("NORECLITEXP") != nullptr;
   // Field projections so resolved: node -> (index, mut, kind_str, unboxed).
   std::unordered_map<const Expression*, std::tuple<int, bool, std::string, bool>> field_resolved_;
   // The record decl is `[@@unboxed]` (Types.Record_unboxed): its value IS the
@@ -4629,6 +4635,12 @@ struct Checker {
   // (expr) and consumer (pat) forms MUST stay in lockstep.
   void record_ctor_arg_type(const Expression* arg, TypePtr dom) {
     if (!record_kinds_) return;
+    // The EXPRESSION twin of record_pat_ctor_arg_type below: a record LITERAL
+    // as a constructor's argument is at the ctor's DECLARED argument type,
+    // which no expectation reaches when the construct is itself in a bare
+    // position (`match W { a = 1; b = 2 } with ..`).
+    if (auto* rc = std::get_if<Pexp_record>(&arg->desc))
+      disambig_record_now(*arg, *rc, dom);
     auto* k = std::get_if<Pexp_construct>(&arg->desc);
     if (!k || !ambiguous_ctors_.count(lid_last(k->id.txt))) return;
     TypePtr d = I::Engine::repr(dom);
@@ -7783,6 +7795,54 @@ struct Checker {
     }
     proc_mod_prefix_ = saved;
   }
+  // Type-directed record-LITERAL resolution, the record twin of the bare-ctor
+  // one below.  A literal's record is picked from its labels, and a label that
+  // two records declare resolves to the last one in scope -- so with
+  // `type p = { a : int; b : int }` and `type q = { b : int; a : int }`,
+  // `rp { a = 1; b = 2 }` (rp : p -> int) built the block at q's layout while
+  // `rp` read it at p's: 21 for 12.  Record the EXPECTED record's fields in
+  // declaration order when it is not the one the labels resolve to; the back
+  // end builds at that layout instead.  A `{ e with .. }` update takes its
+  // layout from the BASE and is left alone.
+  void disambig_record_now(const Expression& e, const Pexp_record& rc,
+                           const TypePtr& expected) {
+    if (no_rec_lit_expected_ || rc.base || rc.fields.empty()) return;
+    TypePtr er = I::Engine::repr(expected);
+    if (er->kind != I::Type::Kind::Constr || er->path.empty()) return;
+    // The decl the expectation names, by stamp (exact) or by a unique name.
+    const TypeDeclaration* want = nullptr;
+    if (er->stamp) {
+      auto it = stamp_record_decl_.find(er->stamp);
+      if (it != stamp_record_decl_.end()) want = it->second;
+    }
+    if (!want && !ambiguous_record_names_.count(er->path)) {
+      auto it = name_record_decl_.find(er->path);
+      if (it != name_record_decl_.end()) want = it->second;
+    }
+    auto* wrec = want ? std::get_if<Ptype_record>(&want->kind) : nullptr;
+    if (!wrec || wrec->fields.size() != rc.fields.size()) return;
+    // The literal must fill the expected record EXACTLY: a mismatch means the
+    // expectation is not this literal's record and proves nothing.  A written
+    // qualification (`{ M.a = 1; .. }`) names the record itself, so leave it.
+    std::set<std::string> labs;
+    for (auto& [lbl, val] : rc.fields) {
+      if (!std::holds_alternative<Lident>(lbl.txt.v)) return;
+      labs.insert(lid_last(lbl.txt));
+    }
+    if (labs.size() != rc.fields.size()) return;
+    for (auto& f : wrec->fields)
+      if (!labs.count(f.name.txt)) return;
+    // Already right: the first label resolves, by scope, to the expected
+    // record.
+    if (TypePtr fsch = field_scheme(lid_last(rc.fields[0].first.txt))) {
+      TypePtr s = I::Engine::repr(eng.instantiate(fsch));
+      TypePtr sd = I::Engine::repr(s->dom);
+      if (sd->kind == I::Type::Kind::Constr && sd->path == er->path) return;
+    }
+    std::vector<std::string> ordered;
+    for (auto& f : wrec->fields) ordered.push_back(f.name.txt);
+    record_expected_[&e] = std::move(ordered);
+  }
   // Type-directed bare-constructor resolution in EXPRESSION position: an
   // unqualified constructor we couldn't resolve (typed Any) whose EXPECTED type
   // is a module-qualified variant is recorded so infer_value_kinds exposes it
@@ -7809,6 +7869,8 @@ struct Checker {
     }
     if (auto* sq = std::get_if<Pexp_sequence>(&e.desc))
       return disambig_expr_now(*sq->e2, expected, allow_defer, deferred);
+    if (auto* rc = std::get_if<Pexp_record>(&e.desc))
+      return disambig_record_now(e, *rc, expected);
     auto* k = std::get_if<Pexp_construct>(&e.desc);
     if (!k) return;
     std::string cn = lid_last(k->id.txt);
@@ -9686,6 +9748,11 @@ struct Checker {
         }
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));
         try_unify(vt, s->cod);
+        // A record LITERAL as a field's value: the field's DECLARED type is its
+        // expectation, and nothing else pushes one down here.
+        if (record_kinds_)
+          if (auto* nrc = std::get_if<Pexp_record>(&val->desc))
+            disambig_record_now(*val, *nrc, s->cod);
         if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
       }
       // Completeness: a plain record construction must define every field of its
@@ -9742,11 +9809,20 @@ struct Checker {
                      (it != private_field_type_.end() ? it->second : fn));
         }
       }
+      TypePtr sbt;
       if (TypePtr fsch = field_scheme(lid_last(sf->field.txt))) {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));
-        try_unify(infer_expr(*sf->obj), s->dom);
+        sbt = infer_expr(*sf->obj);
+        try_unify(sbt, s->dom);
         try_unify(infer_expr(*sf->value), s->cod);
-      } else { infer_expr(*sf->obj); infer_expr(*sf->value); }
+      } else { sbt = infer_expr(*sf->obj); infer_expr(*sf->value); }
+      // The WRITE twin of the ambiguous-field READ resolution above: queue the
+      // base's type so the assigned label's index comes from the record the
+      // base is really at.  Without it a write took the last-in-scope record's
+      // index while the reads around it took the base's -- `{ mutable a; b }`
+      // and `{ b; mutable a }` made `x.a <- x.a + 5` read a and write b.
+      if (record_kinds_ && !no_rec_lit_expected_)
+        pending_field_.push_back({&e, sbt, lid_last(sf->field.txt)});
       return eng.constr("unit");
     }
     if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
@@ -12898,6 +12974,7 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
     if (r->kind == I::Type::Kind::Constr && !r->path.empty())
       vk.expr_constr[e] = r->path;
   }
+  for (auto& [e, ls] : ck.record_expected_) vk.expr_record_labels[e] = ls;
   for (auto& [e, fr] : ck.field_resolved_)
     vk.field_resolved[e] = {std::get<0>(fr), std::get<1>(fr), std::get<2>(fr),
                             std::get<3>(fr)};
