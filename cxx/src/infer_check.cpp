@@ -5656,7 +5656,32 @@ struct Checker {
         "int", "char", "string", "float", "int32", "int64", "nativeint", "bytes"};
     if (inf.count(s->path)) return true;  // infinite type, no catch-all
     auto it = type_ctors.find(s->path);
-    if (it == type_ctors.end()) return false;  // unknown variant
+    if (it == type_ctors.end()) {
+      // Not a variant.  A RECORD has no type_ctors entry, so this exit used to
+      // answer Total unconditionally -- and naive_match's `total && last row`
+      // then dropped the row's test, deleting the Match_failure the oracle
+      // raises for `match x with { foo = 3.5 } -> ..`.  The exact usefulness
+      // analysis already decomposes record columns, so ask it: a COMPLETED
+      // `useful` is Parmatch's own "some well-typed value escapes every row".
+      // An abstract or otherwise unmodeled column bails and keeps the old
+      // conservative Total, so nothing outside the analyzable set moves.
+      //   Only for a RECORD scrutinee, and only when the run dropped no row.
+      // Both guards are about the SCRUTINEE TYPE being trustworthy, not the
+      // analysis: this exit is also where a variant whose path the flat
+      // type_ctors map does not carry lands, and there our inferred path can
+      // be the wrong one -- measured, `match origin with Equation (t1, t2) |
+      // ...` in out_type.ml resolves to the OTHER `Equation` in scope (an
+      // inline-record ctor), whose rows then drop as foreign-arity and make a
+      // wildcard look useful; env.ml's `match open_signature .. with` arrives
+      // typed `exn`, whose open row is Partial by construction.  A record top
+      // with every row consumed is the shape the field types come from the
+      // DECLARATION for, which is what makes the verdict worth trusting.
+      static const bool no_rec_partial = std::getenv("NORECPART") != nullptr;
+      if (no_rec_partial || mx_classify(s).k != MxClass::Record) return false;
+      bool dropped = false;
+      auto u = mx_exact(scrut, cases, 0, &dropped);
+      return u && *u && !dropped;
+    }
     std::set<std::string> covered;
     for (auto& c : cases) if (!c.guard) collect_ctors(c.lhs, covered);
     for (auto& ctor : it->second) if (!covered.count(ctor)) return true;  // missing
@@ -6239,6 +6264,13 @@ struct Checker {
   }
 
   int mx_fuel_ = 0;
+  // Set whenever a row is DROPPED because its head is incompatible with the
+  // column's type (a foreign arity, a non-record head at a record column, ...).
+  // Such a drop makes the matrix understate the match's coverage, so a `useful`
+  // verdict is no longer a sound Partial claim -- compute_partial's leg refuses
+  // it.  mx_total_proof is unaffected: dropping rows only makes `useful` more
+  // likely, i.e. withholds a totality proof it would otherwise have granted.
+  bool mx_dropped_ = false;
 
   TypePtr mx_resolve(TypePtr t, const MxSubst& su) {
     t = I::Engine::repr(t);
@@ -6681,7 +6713,7 @@ struct Checker {
           if (tp->elems.size() != n || tp->closed != ClosedFlag::Closed) throw MxBail{__LINE__};
           for (auto& l : tp->labels) if (l) throw MxBail{__LINE__};
           for (auto& e : tp->elems) r2.push_back(e.get());
-        } else continue;  // non-tuple head at tuple type: GADT-dead row
+        } else { mx_dropped_ = true; continue; }  // dead row (non-tuple head)
         r2.insert(r2.end(), r.begin() + 1, r.end());
         m2.push_back(std::move(r2));
       }
@@ -6708,7 +6740,7 @@ struct Checker {
             if (has_arg) r2.push_back(v->arg->get());
           } else if (std::holds_alternative<Ppat_type>(r[0]->desc)) {
             throw MxBail{__LINE__};  // #t covers a whole type's tags: unmodeled
-          } else continue;  // dead row
+          } else { mx_dropped_ = true; continue; }  // dead row
           r2.insert(r2.end(), r.begin() + 1, r.end());
           s.push_back(std::move(r2));
         }
@@ -6729,7 +6761,7 @@ struct Checker {
         MxRow r2;
         if (mx_wild(r[0])) r2.push_back(nullptr);
         else if (auto* lz = std::get_if<Ppat_lazy>(&r[0]->desc)) r2.push_back(lz->p.get());
-        else continue;  // dead row
+        else { mx_dropped_ = true; continue; }  // dead row
         r2.insert(r2.end(), r.begin() + 1, r.end());
         m2.push_back(std::move(r2));
       }
@@ -6793,7 +6825,7 @@ struct Checker {
             if (k == fnames.size()) throw MxBail{__LINE__};  // foreign label
             r2[k] = pb.get();
           }
-        } else continue;  // dead row
+        } else { mx_dropped_ = true; continue; }  // dead row
         r2.insert(r2.end(), r.begin() + 1, r.end());
         m2.push_back(std::move(r2));
       }
@@ -6827,7 +6859,8 @@ struct Checker {
             if (lid_last(k->id.txt) != cname) continue;  // other head / dead
             if (!k->vars.empty()) throw MxBail{__LINE__};  // `C (type a) p`: unmodeled
             if (!k->arg) {
-              if (!params.empty()) continue;  // arity mismatch: foreign dead ctor
+              // a no-argument row at an n-ary ctor: foreign, dead
+              if (!params.empty()) { mx_dropped_ = true; continue; }
             } else {
               const Pattern* ap = mx_peel(k->arg->get());
               if (params.empty()) {
@@ -6840,21 +6873,22 @@ struct Checker {
                 // conservative (dropped -> no totality proof).
                 static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
                 if (!no_gadtrow && mx_wild(ap)) { /* covers, no payload cols */ }
-                else continue;  // arity mismatch: foreign dead ctor
+                else { mx_dropped_ = true; continue; }  // foreign arity: dead
               } else if (params.size() == 1) r2.push_back(ap);
               else if (mx_wild(ap)) r2.assign(params.size(), nullptr);
               else if (auto* tp = std::get_if<Ppat_tuple>(&ap->desc)) {
-                if (tp->elems.size() != params.size()) continue;  // foreign arity
+                if (tp->elems.size() != params.size())  // foreign arity
+                  { mx_dropped_ = true; continue; }
                 for (auto& l : tp->labels) if (l) throw MxBail{__LINE__};
                 for (auto& e : tp->elems) r2.push_back(e.get());
               } else if (std::holds_alternative<Ppat_record>(ap->desc)) {
                 throw MxBail{__LINE__};  // inline-record argument: unmodeled
               } else if (std::holds_alternative<Ppat_or>(ap->desc)) {
                 throw MxBail{__LINE__};  // or at a multi-slot argument: unmodeled
-              } else continue;  // foreign shape
+              } else { mx_dropped_ = true; continue; }  // foreign shape
             }
             in_sigma = true;
-          } else continue;  // constant/tuple/... at variant type: dead row
+          } else { mx_dropped_ = true; continue; }  // constant at variant: dead
           r2.insert(r2.end(), row.begin() + 1, row.end());
           s.push_back(std::move(r2));
         }
@@ -6929,22 +6963,32 @@ struct Checker {
     }
   }
 
-  // A GENERAL exact-exhaustiveness proof, for a scrutinee of ANY type: run the
-  // same usefulness analysis tuple_gadt_partial uses, over the one-column matrix
-  // of the match's unguarded value rows.  A COMPLETED `not useful` verdict is
-  // upstream's `Total` exactly -- Parmatch's own answer over Parmatch's own
-  // matrix (parmatch.ml's initial_matrix likewise drops the guarded rows, since
-  // a guard can fail) -- so unlike compute_partial's approximation it carries a
-  // codegen license: the back end may drop an uncovered constructor's switch
-  // cell knowing no value reaches it (see lambda.cpp's gm_tp_deid_).
-  //   compute_partial stays the partiality oracle.  This only ever UPGRADES a
-  // Total verdict to a proven one: anything unmodeled throws MxBail and yields
-  // no proof, so the analysis can withhold the license but never grant it
-  // wrongly.  Ordinary (non-GADT) columns take mx_compat's Var branch for every
+  // A GENERAL exact-exhaustiveness run, for a scrutinee of ANY type: the same
+  // usefulness analysis tuple_gadt_partial uses, over the one-column matrix of
+  // the match's unguarded value rows.  nullopt when anything is unmodeled
+  // (MxBail); otherwise a COMPLETED verdict, which is exact in both directions
+  // -- Parmatch's own answer over Parmatch's own matrix (parmatch.ml's
+  // initial_matrix likewise drops the guarded rows, since a guard can fail).
+  //   `not useful` is upstream's `Total`, and unlike compute_partial's
+  // approximation it carries a codegen license: the back end may drop an
+  // uncovered constructor's switch cell knowing no value reaches it (see
+  // lambda.cpp's gm_tp_deid_).  Anything unmodeled yields no verdict at all,
+  // so mx_total_proof can withhold that license but never grant it wrongly.
+  //   `useful` is "some well-typed value escapes every row", i.e. Partial --
+  // read by compute_partial's non-variant leg, under the two guards documented
+  // there.  Ordinary (non-GADT) columns take mx_compat's Var branch for every
   // constructor index, so no constructor is refuted and the run is a plain
   // Maranget exhaustiveness check.
-  bool mx_total_proof(const TypePtr& scrut, const std::vector<Case>& cases, int dbgline = 0) {
-    if (strict) return false;  // the reject pass discards partiality anyway
+  std::optional<bool> mx_exact(const TypePtr& scrut,
+                               const std::vector<Case>& cases,
+                               int dbgline = 0, bool* dropped = nullptr) {
+    // the reject pass discards partiality anyway
+    if (strict) return std::nullopt;
+    mx_dropped_ = false;
+    struct Report {
+      bool* out; const bool* src;
+      ~Report() { if (out) *out = *src; }
+    } rep{dropped, &mx_dropped_};
     try {
       std::vector<MxRow> rows;
       for (auto& c : cases) {
@@ -6956,18 +7000,23 @@ struct Checker {
           continue;  // no value coverage
         rows.push_back(MxRow{p});
       }
-      if (rows.empty()) return false;
+      if (rows.empty()) return std::nullopt;
       mx_fuel_ = 20000;
-      bool u = mx_useful(std::move(rows), {I::Engine::repr(scrut)}, MxSubst{});
-      return !u;
+      return mx_useful(std::move(rows), {I::Engine::repr(scrut)}, MxSubst{});
     } catch (const MxBail& b) {
       if (std::getenv("MXDBG"))
-        fprintf(stderr, "[MXDBG] total-proof bail at infer_check.cpp:%d "
+        fprintf(stderr, "[MXDBG] exact-run bail at infer_check.cpp:%d "
                 "(match at line %d)\n", b.line, dbgline);
-      return false;  // unanalyzable -> no proof
+      return std::nullopt;  // unanalyzable
     } catch (const I::TypeError&) {
-      return false;
+      return std::nullopt;
     }
+  }
+  bool mx_total_proof(const TypePtr& scrut, const std::vector<Case>& cases,
+                      int dbgline = 0) {
+    auto u = mx_exact(scrut, cases, dbgline);
+    // no proof unless the run COMPLETED and found nothing useful
+    return u && !*u;
   }
 
   // Collect the polyvariant tags a pattern matches (through alias/or/constraint).
