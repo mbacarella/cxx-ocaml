@@ -21329,6 +21329,7 @@ struct Translator {
     if (auto cm = ctor_match(scrut, rows, mloc, nullptr, total, proven)) return cm;
     if (auto cc = ctor_match_catchall(scrut, rows, mloc)) return cc;
     if (auto nm = nested_match(scrut, rows, mloc)) return nm;
+    if (auto ec = ext_const_group(scrut, rows, mloc)) return ec;
     if (auto em = ext_match(scrut, rows)) return em;
     if (auto eg = ext_group_match(scrut, rows, mloc)) return eg;
     if (auto gm = gmatch_top(scrut, rows, mloc, total, proven)) return gm;
@@ -21734,14 +21735,21 @@ struct Translator {
   // its fields like a try-handler case.  Requires a variable scrutinee and a
   // trailing catch-all; anything else keeps the existing paths.
   LamPtr ext_match(const LamPtr& scrut, const std::vector<Row>& rows) {
-    if (scrut->k != Lam::K::Var || rows.size() < 2) return nullptr;
-    if (rows.back().guard || !is_catchall(*rows.back().lhs)) return nullptr;
+    if (scrut->k != Lam::K::Var || !ext_chain_ok(rows)) return nullptr;
+    return ext_match_arm(scrut->var, rows, 0);
+  }
+  // ext_match's eligibility WITHOUT its codegen, so ext_const_group can demand
+  // "ext_match would have taken this whole chain" before re-spelling it: that
+  // leg then only ever changes the shape of a chain this path already owned.
+  bool ext_chain_ok(const std::vector<Row>& rows) {
+    if (rows.size() < 2) return false;
+    if (rows.back().guard || !is_catchall(*rows.back().lhs)) return false;
     for (size_t i = 0; i + 1 < rows.size(); ++i) {
-      if (rows[i].guard) return nullptr;
+      if (rows[i].guard) return false;
       const Pattern* lp = effective_pat(rows[i].lhs);  // `E .. as x`: x = scrutinee
       while (auto* pa = std::get_if<Ppat_alias>(&lp->desc)) lp = effective_pat(pa->p.get());
       auto* k = std::get_if<Ppat_construct>(&lp->desc);
-      if (!k) return nullptr;
+      if (!k) return false;
       std::string n = lid_last(k->id.txt);
       // A QUALIFIED exn/extension ctor (`Includemod.Error`, `Includemod.
       // Apply_error`) is identity-matched via module_ctor_identity; it resolves
@@ -21769,18 +21777,18 @@ struct Translator {
             !is_stdlib_exn_name(n) && !is_opened_exn_name(n)) ||
            (ctor_info_.count(n) && !builtin_ctors_.count(n) &&
             !exn_decl_nearest(n))))
-        return nullptr;
+        return false;
       if (k->arg) {  // binder shapes exn_case_body supports only
         // Inline-record exn payload `{l; ..}`: exn_case_body binds via label
         // index when the labels are known; require simple field sub-patterns.
         if (auto* pr = std::get_if<Ppat_record>(&effective_pat(k->arg->get())->desc)) {
-          if (exn_inline_labels(n, &k->id.txt).empty()) return nullptr;
+          if (exn_inline_labels(n, &k->id.txt).empty()) return false;
           for (auto& [lbl, sub] : pr->fields) {
             const Pattern* e = effective_pat(sub.get());
             if (!std::holds_alternative<Ppat_any>(e->desc) &&
                 !std::holds_alternative<Ppat_var>(e->desc) &&
                 !std::holds_alternative<Ppat_alias>(e->desc) && !is_irrefutable(*e))
-              return nullptr;
+              return false;
           }
           continue;
         }
@@ -21793,16 +21801,40 @@ struct Translator {
             if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc); pi && !pi->suffix)
               continue;
             if (std::holds_alternative<Pconst_char>(pc->c.desc)) continue;
-            return nullptr;
+            return false;
           }
           if (!std::holds_alternative<Ppat_any>(e->desc) &&
               !std::holds_alternative<Ppat_var>(e->desc) &&
               !std::holds_alternative<Ppat_alias>(e->desc) && !is_irrefutable(*e))
-            return nullptr;
+            return false;
         }
       }
     }
-    return ext_match_arm(scrut->var, rows, 0);
+    return true;
+  }
+  // The constant payloads ext_chain_ok admits above -- the ones compile_match
+  // has a column switcher for (stringswitch / the int Switcher).
+  bool switchable_const_pat(const Pattern* p) {
+    auto* pc = std::get_if<Ppat_constant>(&p->desc);
+    if (!pc) return false;
+    if (std::holds_alternative<Pconst_string>(pc->c.desc)) return true;
+    if (auto* pi = std::get_if<Pconst_integer>(&pc->c.desc)) return !pi->suffix;
+    return std::holds_alternative<Pconst_char>(pc->c.desc);
+  }
+  // Length of the LEADING run of unguarded rows sharing one head ctor and one
+  // arity, capped at the group rows before the trailing catch-all.
+  size_t ext_lead_run(const std::vector<Row>& rows, size_t cap) {
+    std::string ctext; int ar = 0; size_t i = 0;
+    for (; i < cap; ++i) {
+      if (rows[i].guard) break;
+      auto* k = std::get_if<Ppat_construct>(&effective_pat(rows[i].lhs)->desc);
+      if (!k || !k->arg) break;
+      if (i == 0) {
+        ctext = lid_full(k->id.txt); ar = exn_pat_arity(k);
+        if (ar < 1) break;
+      } else if (lid_full(k->id.txt) != ctext || exn_pat_arity(k) != ar) break;
+    }
+    return i;
   }
   LamPtr ext_match_arm(const Ident& sid, const std::vector<Row>& rows, size_t i) {
     auto sv = [&] { auto v = mk(Lam::K::Var); v->var = sid; return v; };
@@ -21891,7 +21923,7 @@ struct Translator {
   // lower_binds under it like any destructure binder.  NOEXTGROUP reverts to
   // the per-row chain.
   LamPtr ext_group_match(const LamPtr& scrut, const std::vector<Row>& rows,
-                         const Location& mloc) {
+                         const Location& mloc, bool const_col = false) {
     static const bool off = cppcaml::dbg_env("NOEXTGROUP");
     if (off) return nullptr;
     // A SINGLE group row takes the same shape upstream (`Error (l, Amb
@@ -21902,6 +21934,16 @@ struct Translator {
       return nullptr;
     size_t n = rows.size() - 1;  // group rows; the last row is the catch-all
     if (rows.back().guard || !is_catchall(*rows.back().lhs)) return nullptr;
+    // A CONSTANT tested column groups a LEADING RUN and leaves the rest of the
+    // chain to ext_match_arm, which is what misc.ml's style_of_tag needs: six
+    // `String_tag "..."` rows, then a `Style s` row, then the catch-all.  The
+    // whole chain has to be one ext_match would have taken, so this leg only
+    // ever re-spells a chain that path already owned.
+    if (const_col) {
+      if (!ext_chain_ok(rows)) return nullptr;
+      n = ext_lead_run(rows, n);
+      if (n == 0) return nullptr;
+    }
     const Ppat_construct* k0 = nullptr;
     std::string ctext;
     std::vector<std::vector<const Pattern*>> fps(n);
@@ -21958,9 +22000,12 @@ struct Translator {
       if (allany) continue;
       if (allvar) { ckind[c] = CVAR; cvname[c] = nv; continue; }
       if (tc >= 0) return nullptr;  // a second tested column: not this shape
-      for (size_t i = 0; i < n; ++i)
-        if (!std::holds_alternative<Ppat_construct>(effective_pat(fps[i][c])->desc))
+      for (size_t i = 0; i < n; ++i) {
+        const Pattern* q = effective_pat(fps[i][c]);
+        if (const_col ? !switchable_const_pat(q)
+                      : !std::holds_alternative<Ppat_construct>(q->desc))
           return nullptr;
+      }
       ckind[c] = CTESTED; tc = c;
     }
     if (tc < 0) return nullptr;
@@ -22021,7 +22066,15 @@ struct Translator {
       if (nv == 1) { subst_alias(body, vc, fieldimm(c + 1, sv())); continue; }
       body = lower_bind(vc, ValueKind::Gen, fieldimm(c + 1, sv()), body);
     }
-    LamPtr rest = ext_match_arm(sid, rows, rows.size() - 1);  // the catch-all leaf
+    // the catch-all leaf -- or, for a leading-run group, the rest of the chain.
+    // Upstream divides EVERY run, not just the first, so the tail is offered
+    // the same treatment before falling back to ext_match's per-row chain.
+    LamPtr rest;
+    if (const_col && n + 1 < rows.size()) {
+      std::vector<Row> tail(rows.begin() + n, rows.end());
+      rest = ext_const_group(varof(sid), tail, mloc);
+    }
+    if (!rest) rest = ext_match_arm(sid, rows, n);
     if (!rest) return nullptr;
     auto test = mk(Lam::K::Prim);
     test->prim = Prim::IntCmp; test->prim_id = "==";
@@ -22038,6 +22091,25 @@ struct Translator {
     auto cat = mk(Lam::K::Catch);
     cat->cond = iff; cat->prim_arg = eid; cat->then_ = rest;
     return cat;
+  }
+
+  // The same division, for a leading run whose single tested column is a
+  // CONSTANT.  ext_match spelled that chain row by row -- re-reading the
+  // identity and comparing the payload for every row -- where upstream divides
+  // on the identity ONCE and hands the constant column to Matching, so the
+  // group becomes a stringswitch (or the int Switcher) under a single
+  // `(== (field_imm 0 v) C)` test.  This runs BEFORE ext_match and takes only
+  // chains ext_match itself accepts, so nothing else changes route; a failed
+  // attempt must not shift the exit numbering ext_match then uses, hence the
+  // restore.  NOEXTCONSTGRP reverts to the per-row chain.
+  LamPtr ext_const_group(const LamPtr& scrut, const std::vector<Row>& rows,
+                         const Location& mloc) {
+    static const bool off = cppcaml::dbg_env("NOEXTCONSTGRP");
+    if (off) return nullptr;
+    int save = next_exit_;
+    LamPtr r = ext_group_match(scrut, rows, mloc, /*const_col=*/true);
+    if (!r) next_exit_ = save;
+    return r;
   }
 
   // Exhaustive match over a purely-constant variant type -> (switch* ...).
