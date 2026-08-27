@@ -2276,6 +2276,40 @@ struct Translator {
       for (auto& el : t->elems) scan_expr_ctors_from(*el, mod, depth + 1);
     }
   }
+  // The pattern analogue of scan_expr_ctors_from: walk a pattern for BARE
+  // unresolved constructors and register each from `mod` (used under a
+  // `M.(p)` / `M.{ .. }` pattern-open, which scopes M over the WHOLE
+  // sub-pattern).  register_module_ctor no-ops on a local module.
+  void scan_pat_ctors_from(const Pattern& p, const std::string& mod,
+                           int depth = 0) {
+    if (depth > 8) return;
+    auto sub = [&](const Pattern& q) {
+      scan_pat_ctors_from(q, mod, depth + 1);
+    };
+    if (auto* k = std::get_if<Ppat_construct>(&p.desc)) {
+      if (auto* l = std::get_if<Lident>(&k->id.txt.v))
+        register_module_ctor(mod, l->name);
+      if (k->arg) sub(**k->arg);
+    } else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems) sub(*e);
+    } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& [lbl, sp] : r->fields) { (void)lbl; sub(*sp); }
+    } else if (auto* ar = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : ar->elems) sub(*e);
+    } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      sub(*o->l); sub(*o->r);
+    } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
+      sub(*a->p);
+    } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
+      sub(*c->p);
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      if (v->arg) sub(**v->arg);
+    } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
+      sub(*lz->p);
+    } else if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
+      sub(*op->p);
+    }
+  }
   // Recursively register the qualified stdlib constructors named in a pattern,
   // so the match compiler resolves them like local/predef ones.
   void scan_pat_ctors(const Pattern& p) {
@@ -2343,6 +2377,19 @@ struct Translator {
       scan_pat_ctors(*lz->p);
     } else if (auto* ex = std::get_if<Ppat_exception>(&p.desc)) {
       scan_pat_ctors(*ex->p);
+    } else if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
+      // `M.{ .. }` / `M.(p)`: the chain above never descended through a
+      // pattern-open, so a bare ctor under one stayed unresolved -- and an
+      // unresolved ctor column compiles as irrefutable, which silently turned
+      // out_type.ml's `List.exists (function Parsetree.{attr_name =
+      // {txt="..."}; attr_payload = PStr []} -> true | _ -> false)` into the
+      // constant `true`.  M is opened for the whole sub-pattern, so resolve
+      // its bare ctors from M first, then scan normally.  NOPATOPENCTOR
+      // reverts to the old (no-descent) behaviour.
+      if (cppcaml::dbg_env("NOPATOPENCTOR")) return;
+      if (auto* l = std::get_if<Lident>(&op->mod_.txt.v))
+        scan_pat_ctors_from(*op->p, l->name);
+      scan_pat_ctors(*op->p);
     }
   }
 
