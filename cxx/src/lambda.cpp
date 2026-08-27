@@ -9882,6 +9882,26 @@ struct Translator {
              (v->args[0]->k == Lam::K::Var || is_alias_dup(v->args[0]));
     return false;
   }
+  // An Alias binding whose value is a pure let chain: `let w = <dup> in <dup>`.
+  // Our `include <whole-unit>` leg builds exactly that shape -- the included
+  // module is read as `(let (w = (global M)) (global M))` -- and
+  // upstream's Simplif substitutes an Alias binder read once whatever its
+  // right-hand side is -- simplif.ml's Alias case tests the use count, not the
+  // shape, because Alias is only ever assigned to a term it is safe to drop or
+  // move.  Ours tests the shape, so the binding stayed alive and the module's
+  // field read went through it.  Every binding and the body must be duplicable
+  // for the count-0 (dropped) case to reorder no effects.  NOINCLRESID reverts.
+  bool is_alias_let_chain(const LamPtr& v, int depth = 0) const {
+    static const bool off = cppcaml::dbg_env("NOINCLRESID");
+    if (!v || off || depth > 16 || v->k != Lam::K::Let) return false;
+    auto dup = [&](const LamPtr& x) {
+      return is_alias_dup(x) || pure_field_projection(x) ||
+             is_alias_let_chain(x, depth + 1);
+    };
+    for (auto& b : v->bindings)
+      if (b.mut || !dup(b.val)) return false;
+    return dup(v->body);
+  }
   // Simplif drops `let v = (Lvar w)` for ANY let-kind, substituting v by w, and
   // (for an Alias binding = a pure duplicable term) substitutes v into its one use
   // or drops it when dead -- Simplif.simplify_lets's Alias case (simplif.ml:569).
@@ -9911,7 +9931,9 @@ struct Translator {
       if (b.val && !b.mut) {
         if (b.val->k == Lam::K::Var) {
           subst = true;                 // a Var alias is substituted regardless of count
-        } else if (b.alias && (is_alias_dup(b.val) || is_incl_field_alias(b.val))) {
+        } else if (b.alias &&
+                   (is_alias_dup(b.val) || is_incl_field_alias(b.val) ||
+                    is_alias_let_chain(b.val))) {
           // count_var weights a use under a lambda as 2 (ocamlc never substitutes
           // into a closure), so <=1 means "used at most once, not captured".
           int n = count_var(l->body, b.id);
@@ -29460,6 +29482,39 @@ struct Translator {
       return pure_field_projection(l->args[0], depth + 1);
     return false;
   }
+  // The value a Let/Sequence spine ends in.  A structure's makeblock is not
+  // always the immediate body of the structure's `let`: an item evaluated for
+  // effect (`let _ = ..`) puts it at the end of a `(seq item (makeblock ..))`,
+  // and a nested `let` group can stand between the two.  Upstream hands the
+  // coercion to transl_structure, which lays the ONE block out in the target's
+  // order wherever in the structure's body that block ends up, so the fusion
+  // below has to look past the spine too.  NOINCLRESID stops at the first node.
+  static LamPtr spine_end(const LamPtr& l) {
+    static const bool off = cppcaml::dbg_env("NOINCLRESID");
+    if (!l || off) return l;
+    if (l->k == Lam::K::Let) return spine_end(l->body);
+    if (l->k == Lam::K::Sequence) return spine_end(l->else_);
+    return l;
+  }
+  // Rebuild that spine with `blk` in place of the value it ended in.  The
+  // spine's own bindings and effects are carried over verbatim and in order,
+  // so an item beside the components the coercion drops still runs.
+  LamPtr rebuild_spine(const LamPtr& l, const LamPtr& blk) {
+    if (!l) return blk;
+    if (l->k == Lam::K::Let) {
+      auto lt = mk(Lam::K::Let);
+      lt->bindings = l->bindings;
+      lt->body = rebuild_spine(l->body, blk);
+      return lt;
+    }
+    if (l->k == Lam::K::Sequence) {
+      auto sq = mk(Lam::K::Sequence);
+      sq->cond = l->cond;
+      sq->else_ = rebuild_spine(l->else_, blk);
+      return sq;
+    }
+    return blk;
+  }
   // `alias`: upstream's apply_coercion_field applies a SUB-coercion with ALIAS
   // strictness (translmod.ml:110), and Simplif's Alias rule drops the binder
   // when the target reads it zero times and SUBSTITUTES it when exactly one
@@ -29477,9 +29532,9 @@ struct Translator {
     // no `let` at all (ident.ml's `Identifiable.Make (struct .. end)`), so the
     // bare shape has to be recognised too.
     const bool fuse_under_let = mv->k == Lam::K::Let;
-    LamPtr mb = fuse_under_let                              ? mv->body
-                : cppcaml::dbg_env("NOBAREFUSE")            ? nullptr
-                                                            : mv;
+    LamPtr mb = fuse_under_let                   ? spine_end(mv->body)
+                : cppcaml::dbg_env("NOBAREFUSE") ? nullptr
+                                                 : mv;
     if (mb && mb->k == Lam::K::Prim && mb->prim == Prim::Makeblock &&
         mb->prim_arg == 0) {
       // A source field may be a pure PROJECTION as well as a var or a
@@ -29519,8 +29574,7 @@ struct Translator {
             auto blk = mk(Lam::K::Prim); blk->prim = Prim::Makeblock; blk->prim_arg = 0;
             blk->args = std::move(fs);
             if (!fuse_under_let) return blk;
-            auto lt = mk(Lam::K::Let); lt->bindings = mv->bindings; lt->body = blk;
-            return lt;
+            return rebuild_spine(mv, blk);
           }
         }
       }
