@@ -9525,6 +9525,8 @@ struct Translator {
     for (auto& sc : l->sw_blocks) c += count_exit(sc.body, id, under_try, bad);
     return c;
   }
+  std::vector<Lam*> exit_spine_;  // the Let nodes above the exit being inlined
+  size_t exit_floor_ = 0;         // spine entries below this are past a test
   // Replace the single `(exit id args)` with `let vars = args in handler` (Strict
   // lets, last var outermost -- matching simplif's fold_left2).
   void inline_exit(LamPtr& l, int id, const std::vector<Ident>& vars,
@@ -9532,6 +9534,36 @@ struct Translator {
     if (!l) return;
     if (l->k == Lam::K::Staticraise && l->prim_arg == id) {
       LamPtr res = handler;
+      // An argument our wrap_binders already substituted for a once-used
+      // destructure binder (the from_alias tag) is a binding upstream still
+      // HELD at the destructure: simplify_exits runs first, so its exit
+      // argument was a plain variable, the parameter was substituted away by
+      // it, and the destructure binder simply gained the parameter's uses.
+      // Bind it back where it came from -- immediately after its own source in
+      // that let group -- rather than at the exit, whenever the parameter is
+      // read more than once (with one read the two orders agree, since simplif
+      // would have inlined the binder into that read anyway).  The value is a
+      // pure immutable field read off a variable the group binds, so it cannot
+      // change between the two spots.  NOEXITHOIST reverts.
+      std::vector<char> hoisted(vars.size(), 0);
+      if (!cppcaml::dbg_env("NOEXITHOIST") && l->args.size() == vars.size())
+        for (size_t i = 0; i < vars.size(); ++i) {
+          auto& a = l->args[i];
+          int base = field_root_stamp(a);
+          if (!a->from_alias || base < 0 || is_mut_field_access(a)) continue;
+          if (count_var(handler, vars[i]) < 2) continue;
+          for (size_t si = exit_spine_.size(); si-- > exit_floor_; ) {
+            auto& bs = exit_spine_[si]->bindings;
+            size_t at = bs.size();
+            for (size_t bi = 0; bi < bs.size(); ++bi)
+              if (bs[bi].id.stamp == base && !bs[bi].alias) { at = bi; break; }
+            if (at == bs.size()) continue;
+            ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
+            bs.insert(bs.begin() + at + 1, {vars[i], k, a, true});
+            hoisted[i] = 1;
+            break;
+          }
+        }
       // bind_check (matching.ml:3591) sends an Alias bind of a NON-VAR argument
       // to lower_bind, which lowers it into the one branch that reads it -- so
       // a pattern var whose arm opens with a test transparent to it is bound
@@ -9545,10 +9577,12 @@ struct Translator {
       // (predef's `*opt*;*opt*;param`) and a diffing.cmo exit-arg trio.
       bool sink = false;
       if (!cppcaml::dbg_env("NOLOWEREXIT") && l->args.size() == vars.size())
-        for (auto& a : l->args)
-          if (a->k != Lam::K::Var && is_alias_dup(a)) { sink = true; break; }
+        for (size_t i = 0; i < l->args.size(); ++i)
+          if (!hoisted[i] && l->args[i]->k != Lam::K::Var &&
+              is_alias_dup(l->args[i])) { sink = true; break; }
       if (sink) {
         for (size_t i = vars.size(); i-- > 0; ) {
+          if (hoisted[i]) continue;
           ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
           bool dup = is_alias_dup(l->args[i]);
           if (dup && l->args[i]->k != Lam::K::Var) {
@@ -9563,6 +9597,7 @@ struct Translator {
       }
       if (l->args.size() == vars.size())
         for (size_t i = 0; i < vars.size(); ++i) {
+          if (hoisted[i]) continue;
           auto let = mk(Lam::K::Let);
           ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
           // A dup-able arg (var / field_imm chain) is the pattern-var Alias
@@ -9573,16 +9608,50 @@ struct Translator {
       l = res; return;
     }
     if (l->k == Lam::K::Function) return;  // exits don't cross functions
-    inline_exit(l->fn, id, vars, kinds, handler);
-    inline_exit(l->body, id, vars, kinds, handler);
-    inline_exit(l->cond, id, vars, kinds, handler);
-    inline_exit(l->then_, id, vars, kinds, handler);
-    inline_exit(l->else_, id, vars, kinds, handler);
-    inline_exit(l->sw_default, id, vars, kinds, handler);
-    for (auto& a : l->args) inline_exit(a, id, vars, kinds, handler);
-    for (auto& b : l->bindings) inline_exit(b.val, id, vars, kinds, handler);
-    for (auto& sc : l->sw_consts) inline_exit(sc.body, id, vars, kinds, handler);
-    for (auto& sc : l->sw_blocks) inline_exit(sc.body, id, vars, kinds, handler);
+    if (l->k == Lam::K::Let) {
+      exit_spine_.push_back(l.get());
+      for (auto& b : l->bindings) inline_exit(b.val, id, vars, kinds, handler);
+      inline_exit(l->body, id, vars, kinds, handler);
+      exit_spine_.pop_back();
+      return;
+    }
+    // The hoist above may only reach a let group the exit runs under
+    // UNCONDITIONALLY: past a test, upstream reads the field inside the branch
+    // (simplif's own `Lstaticraise` arm), so raise the floor on every arm.
+    size_t saved = exit_floor_;
+    auto arm = [&](LamPtr& c) {
+      exit_floor_ = exit_spine_.size();
+      inline_exit(c, id, vars, kinds, handler);
+      exit_floor_ = saved;
+    };
+    switch (l->k) {
+      case Lam::K::Sequence:
+        inline_exit(l->cond, id, vars, kinds, handler);
+        inline_exit(l->else_, id, vars, kinds, handler);
+        for (auto& a : l->args) inline_exit(a, id, vars, kinds, handler);
+        return;
+      case Lam::K::IfThenElse:
+        inline_exit(l->cond, id, vars, kinds, handler);
+        arm(l->then_); arm(l->else_);
+        return;
+      case Lam::K::Switch:
+        inline_exit(l->cond, id, vars, kinds, handler);
+        arm(l->sw_default);
+        for (auto& sc : l->sw_consts) arm(sc.body);
+        for (auto& sc : l->sw_blocks) arm(sc.body);
+        return;
+      case Lam::K::Catch:
+        inline_exit(l->cond, id, vars, kinds, handler);
+        arm(l->then_);
+        return;
+      default: break;
+    }
+    arm(l->fn); arm(l->body); arm(l->cond); arm(l->then_);
+    arm(l->else_); arm(l->sw_default);
+    for (auto& a : l->args) arm(a);
+    for (auto& b : l->bindings) arm(b.val);
+    for (auto& sc : l->sw_consts) arm(sc.body);
+    for (auto& sc : l->sw_blocks) arm(sc.body);
   }
   // Compile-time beta-reduction of an immediately-applied function literal
   // (Simplif.simplify_lets, lambda/simplif.ml:518-531 via beta_reduce):
@@ -10221,6 +10290,7 @@ struct Translator {
     if (n == 0) { l = l->cond; return; }  // exit never raised -> drop handler
     if (n == 1 && bad == 0) {
       LamPtr body = l->cond;
+      exit_spine_.clear(); exit_floor_ = 0;
       inline_exit(body, l->prim_arg, l->catch_vars, l->catch_var_kinds, l->then_);
       l = body;
     }
@@ -12028,6 +12098,34 @@ struct Translator {
         if (b.alias) placed.insert(id.stamp);
       }
     }
+    // Upstream creates a column's bind AT ITS LEVEL and bind_checks it there,
+    // so the binder of a field further right is already in place when the one
+    // to its left is lowered: each sinks past every alias let below it, the
+    // body's own leading ones included.  The fold above wraps in the opposite
+    // direction and never descends, which reproduces that reverse field order
+    // only when the body opens with no alias let -- typeclass's
+    // `fun ppf {free_variable; meth; meth_ty} -> let (ty0, _) = free_variable
+    // in ..` opens with one, and ocamlc reads meth_ty BELOW it.  So re-lower
+    // the run this fold placed, OUTERMOST FIRST -- that order IS upstream's
+    // creation order -- and every binder the leading lets do not read lands
+    // under them, in the same relative order.  Only lower_bind's ALIAS-LET
+    // rule is replayed here, never its if/switch descent: those read our
+    // fully compiled body, where a branch upstream still saw as an opaque
+    // Strict let (`let actual, expected = kind, expected_kind in ..`, both
+    // arms of misc's `check_current`) has become transparent, so a binder
+    // upstream left on top would sink into one arm.  NOBODYSINK reverts.
+    static const bool no_body_sink = cppcaml::dbg_env("NOBODYSINK");
+    if (!no_body_sink && !placed.empty()) {
+      std::vector<Lam::Binding> top;
+      LamPtr rest = body;
+      while (rest->k == Lam::K::Let && rest->bindings.size() == 1 &&
+             placed.count(rest->bindings[0].id.stamp)) {
+        top.push_back(rest->bindings[0]);
+        rest = rest->body;
+      }
+      for (auto& b : top) rest = sink_past_alias_lets(b, rest);
+      body = rest;
+    }
     // A nested destructure's outer temp is read only through its sibling
     // binders' RHSs, so the per-binder paths above see it in NO branch and
     // stack it at the top; upstream's bind_check sinks the whole group into
@@ -13752,6 +13850,18 @@ struct Translator {
       }
     }
     return wrap(lam);
+  }
+  // lower_bind's Llet(Alias) rule ALONE: walk past a run of alias lets none of
+  // whose right-hand sides can read the binder, then wrap.  Used by
+  // wrap_binders' replay, where the if/switch descents would overshoot.
+  LamPtr sink_past_alias_lets(const Lam::Binding& b, LamPtr lam) {
+    if (lam->k == Lam::K::Let && !lam->bindings.empty()) {
+      bool ok = true;
+      for (auto& bb : lam->bindings)
+        if (!bb.alias || approx_present(b.id, bb.val)) { ok = false; break; }
+      if (ok) { lam->body = sink_past_alias_lets(b, lam->body); return lam; }
+    }
+    auto l = mk(Lam::K::Let); l->bindings = {b}; l->body = lam; return l;
   }
   // A pattern that matches anything and at most binds: upstream's omega_like
   // (vars, wildcards, aliases of such).
