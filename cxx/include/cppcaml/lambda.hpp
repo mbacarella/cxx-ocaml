@@ -118,6 +118,7 @@ enum class Prim {
   IntCmp,      // integer comparison; spelling (< > <= >= == !=) in prim_id
   Raise,       // (raise e)
   Reraise,     // (reraise e)  (exception handler fall-through)
+  RaiseNotrace,// (raise_notrace e)  (%raise_notrace: no backtrace recorded)
   Makelazyblock, // makelazyblock (Lazy_tag 246) / makeforwardblock (Forward_tag 250)
   Send,            // (send obj tag)        -- method dispatch (args: [obj, tag])
   FieldComputed,   // (field_computed o id) -- read an instance var by id (args: [obj, id])

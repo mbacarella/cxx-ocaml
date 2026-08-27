@@ -578,6 +578,10 @@ struct Bytegen {
             return comp_expr(env, exp->args[0], sz, cons(I(Op::Raise), discard_dead_code(cont)));
           case Prim::Reraise:
             return comp_expr(env, exp->args[0], sz, cons(I(Op::Reraise), discard_dead_code(cont)));
+          case Prim::RaiseNotrace:
+            return comp_expr(env, exp->args[0], sz,
+                             cons(I(Op::RaiseNotrace),
+                                  discard_dead_code(cont)));
           case Prim::Addint:
             if (exp->args.size() == 2 && exp->args[1]->k == K::ConstInt && is_immed(exp->args[1]->int_val))
               return comp_expr(env, exp->args[0], sz, cons(Iop(Op::Offsetint, (int)exp->args[1]->int_val), cont));

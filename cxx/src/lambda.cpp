@@ -369,6 +369,7 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
         case Prim::IntCmp: head = "(" + l->prim_id; break;
         case Prim::Raise: head = "(raise"; break;
         case Prim::Reraise: head = "(reraise"; break;
+        case Prim::RaiseNotrace: head = "(raise_notrace"; break;
         case Prim::Makelazyblock:
           head = l->prim_arg == 250 ? "(makeforwardblock" : "(makelazyblock"; break;
         case Prim::Send: head = "(" + (l->prim_id.empty() ? "send" : l->prim_id); break;
@@ -6722,7 +6723,10 @@ struct Translator {
     if (prim == "%obj_is_int" && n == 1) return ic("isint");
     if ((prim == "%raise" || prim == "%reraise" || prim == "%raise_notrace") && n == 1) {
       auto pr = mk(Lam::K::Prim);  // raise / raise_notrace as a value
-      pr->prim = prim == "%reraise" ? Prim::Reraise : Prim::Raise;
+      pr->prim = prim == "%reraise"       ? Prim::Reraise
+               : prim == "%raise_notrace" && !raise_notrace_off()
+                                           ? Prim::RaiseNotrace
+                                           : Prim::Raise;
       pr->args = argv;
       return pr;
     }
@@ -6844,9 +6848,16 @@ struct Translator {
     // Structural (kind-independent) prims.
     if ((prim == "%raise" || prim == "%raise_notrace") && as.size() == 1) {
       raise_arg_ = true; LamPtr arg = expr(*as[0].second); raise_arg_ = false;
-      bool reraise = !caught_exn_.empty() && arg->k == Lam::K::Var &&
+      // translprim.ml upgrades a raise of a caught exception to a reraise for
+      // Raise_regular ONLY -- `raise_notrace e` keeps its kind whatever `e` is.
+      bool notrace = prim == "%raise_notrace" && !raise_notrace_off();
+      bool reraise = !notrace && !caught_exn_.empty() &&
+                     arg->k == Lam::K::Var &&
                      arg->var.stamp == caught_exn_.back().stamp;
-      auto pr = mk(Lam::K::Prim); pr->prim = reraise ? Prim::Reraise : Prim::Raise;
+      auto pr = mk(Lam::K::Prim);
+      pr->prim = reraise ? Prim::Reraise
+               : notrace ? Prim::RaiseNotrace
+                         : Prim::Raise;
       pr->args = {arg}; return pr;
     }
     if (prim == "%opaque" && as.size() == 1) return op("opaque");
@@ -7432,7 +7443,8 @@ struct Translator {
       }
       case Lam::K::Staticraise: return {RSize::Unreach, 0};
       case Lam::K::Prim:
-        if (l->prim == Prim::Raise || l->prim == Prim::Reraise) return {RSize::Unreach, 0};
+        if (l->prim == Prim::Raise || l->prim == Prim::Reraise ||
+            l->prim == Prim::RaiseNotrace) return {RSize::Unreach, 0};
         if (l->prim == Prim::Makeblock || l->prim == Prim::Makemutable)
           return {RSize::Block, (int)l->args.size()};
         if (l->prim == Prim::Makelazyblock)  // lazy/forward blocks share the lazy dummy
@@ -7596,7 +7608,8 @@ struct Translator {
       }
       case Lam::K::Staticraise: return SplitR::Unreach;
       case Lam::K::Prim:
-        return (l->prim == Prim::Raise || l->prim == Prim::Reraise)
+        return (l->prim == Prim::Raise || l->prim == Prim::Reraise ||
+                l->prim == Prim::RaiseNotrace)
                    ? SplitR::Unreach : SplitR::Fail;
       default: return SplitR::Fail;
     }
@@ -10334,7 +10347,8 @@ struct Translator {
     switch (l->k) {
       case Lam::K::Staticraise: return true;
       case Lam::K::Prim:
-        return l->prim == Prim::Raise || l->prim == Prim::Reraise;
+        return l->prim == Prim::Raise || l->prim == Prim::Reraise ||
+               l->prim == Prim::RaiseNotrace;
       case Lam::K::Let:
       case Lam::K::Letrec: return tails_all_exit(l->body.get());
       case Lam::K::Sequence: return tails_all_exit(l->else_.get());
@@ -10441,7 +10455,8 @@ struct Translator {
           }
           return true;
         }
-        if (l->prim == Prim::Raise || l->prim == Prim::Reraise) return true;
+        if (l->prim == Prim::Raise || l->prim == Prim::Reraise ||
+            l->prim == Prim::RaiseNotrace) return true;
         return leaf();
       case Lam::K::ConstBlock:
         if (l->prim_arg == 0 && l->args.size() == k) {
@@ -13665,7 +13680,20 @@ struct Translator {
     if (lam->k == Lam::K::Switch && !approx_present(v, lam->cond))
       return (lam->sw_consts.size() == 1 && lam->sw_blocks.empty()) ||
              (lam->sw_consts.empty() && lam->sw_blocks.size() == 1);
+    // The walk also steps past an alias let group no right-hand side of which
+    // can read v (matching.ml:3584), so a payload binder lands BELOW the lets
+    // the arm body opens with -- `| Some d -> let (_, b) = acc in ..` binds b
+    // first and d second, the reverse of the source order.  NOLETSINK reverts.
+    if (lam->k == Lam::K::Let && !let_sink_off()) {
+      for (auto& b : lam->bindings)
+        if (!b.alias || approx_present(v, b.val)) return false;
+      return true;
+    }
     return false;
+  }
+  static bool let_sink_off() {
+    static const bool off = cppcaml::dbg_env("NOLETSINK");
+    return off;
   }
   // matching.ml's lower_bind: sink an Alias bind toward its single branch of
   // use -- past other alias lets, into the used arm of an if, into a
@@ -28661,6 +28689,12 @@ struct Translator {
   }
   static bool tmc_off() {
     static const bool off = cppcaml::dbg_env("NOTMC");
+    return off;
+  }
+  // `%raise_notrace` is its own raise kind (lambda.ml's Raise_notrace) and
+  // emits the RAISE_NOTRACE opcode.  NORAISENT reverts to a plain raise.
+  static bool raise_notrace_off() {
+    static const bool off = cppcaml::dbg_env("NORAISENT");
     return off;
   }
 
