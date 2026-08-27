@@ -29482,11 +29482,26 @@ struct Translator {
                                                             : mv;
     if (mb && mb->k == Lam::K::Prim && mb->prim == Prim::Makeblock &&
         mb->prim_arg == 0) {
+      // A source field may be a pure PROJECTION as well as a var or a
+      // constant.  `include M` inside a struct binds every included
+      // component to `field_mut i include/N`, and those one-use aliases are
+      // substituted into the block before the coercion runs -- so requiring
+      // vars sent a coerced `struct include String let hash = .. end` down
+      // the general path, which materialises all 96 fields and reprojects
+      // the parameter's two.  Translmod never builds that block: it hands
+      // the coercion to transl_structure, whose unread components stay
+      // Alias lets and are dropped by Simplif.  Reordering and dropping
+      // these reads is safe (they have no effects), and it is the only way
+      // to allocate just the narrowed block.  NOPUREFUSE reverts to
+      // var/constant fields.
+      static const bool no_pure_fuse = cppcaml::dbg_env("NOPUREFUSE");
       bool simple = true;
       for (auto& a : mb->args)
         if (!(a->k == Lam::K::Var || a->k == Lam::K::ConstInt ||
               a->k == Lam::K::ConstChar || a->k == Lam::K::ConstString ||
-              a->k == Lam::K::ConstFloat)) { simple = false; break; }
+              a->k == Lam::K::ConstFloat ||
+              (!no_pure_fuse && pure_field_projection(a))))
+          { simple = false; break; }
       int srclen = (int)mb->args.size();
       if (simple) {
         bool in_range = true;
