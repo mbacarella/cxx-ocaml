@@ -12676,6 +12676,22 @@ struct Translator {
     return l;
   }
 
+  // One constructor of a type named by a DOTTED path: a file-local submodule's
+  // type registers under that key, an imported unit's type only in the unit's
+  // own per-type list, so consult both.
+  const CtorInfo* qual_type_ctor(const std::string& path,
+                                 const std::string& cn) {
+    if (auto ti = type_ctor_info_.find(path); ti != type_ctor_info_.end())
+      if (auto ci = ti->second.find(cn); ci != ti->second.end())
+        return &ci->second;
+    auto d = path.rfind('.');
+    if (d == std::string::npos) return nullptr;
+    for (auto& [nm, info] :
+         module_type_ctors(path.substr(0, d), path.substr(d + 1)))
+      if (nm == cn) return &info;
+    return nullptr;
+  }
+
   // Resolve a constructor PATTERN through its inferred type (vk.pat_constr) when the
   // ambient flat ctor_info_ resolved it to a DIFFERENT type -- a same-named ctor of
   // another (often same-file) type squatted the slot: `lambda_of_const`'s `Const_float`
@@ -12686,9 +12702,19 @@ struct Translator {
                                    const std::string& want_type = {}) {
     // Caller already knows the authoritative variant type (e.g. gmatch recovered
     // it for a same-unit ambiguous ctor): resolve straight against that local type.
-    if (!want_type.empty())
+    if (!want_type.empty()) {
       if (auto ti = type_ctor_info_.find(want_type); ti != type_ctor_info_.end())
         if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
+      // An IMPORTED unit's type has no type_ctor_info_ entry at all -- its
+      // ctors live in the unit's own per-type list -- so a caller that
+      // recovered the column type as "Types.type_origin" must be answered
+      // from there too.
+      if (auto d = want_type.rfind('.');
+          d != std::string::npos && !cppcaml::dbg_env("NOQUALCOL"))
+        for (auto& [nm, info] :
+             module_type_ctors(want_type.substr(0, d), want_type.substr(d + 1)))
+          if (nm == cn) return &info;
+    }
     // A ctor qualified by a LOCAL module names ITS type, whatever the flat
     // entry says -- the CONSUMER twin of the construct site's identical
     // lookup, and the two must move together or the pair splits on the tag.
@@ -16955,6 +16981,7 @@ struct Translator {
     };
     std::vector<std::string> col_cns;  // constructor names in this column, in row order
     bool tydisagree = false;
+    std::string type_key;  // the type_ctor_info_ key `type` was adopted from
     // Exn-SHADOWED predef variant column (see ctor_match's pivot).  Our typer can
     // type a pattern ctor as a local `exception E` that shadows a same-named predef
     // variant ctor (unit_info's `Ok x | Error x` under `exception Error`: the `Error`
@@ -17026,10 +17053,51 @@ struct Translator {
         if (common) { common = nullptr; break; }   // >1 candidate covers all: ambiguous
         common = &tn;
       }
-      if (!common) return GB("typemismatch", col_cns.empty() ? "" : col_cns[0]);
-      type = *common;
-      any_ci = &type_ctor_info_.at(type).at(col_cns[0]);
+      // The scan above sees only the BARE keys, and a type declared inside a
+      // module -- a file-local submodule (key "B.o") or an imported unit (no
+      // type_ctor_info_ entry at all, only the unit's per-type list) -- has
+      // none that covers the column: the bare key, when there is one, holds
+      // just the names a same-named squatter shares.  The rows' own
+      // `pat_constr` name the paths inference considered, so ask those: the
+      // squatted row cites the squatter's own module (`Internal_names.
+      // explanation`, which covers only the two re-declared names) and its
+      // siblings cite the real one (`Types.type_origin`, which covers all
+      // five).  Exactly one covering candidate is the same discipline the
+      // bare scan uses.  `type` stays the BARE name every use below wants;
+      // `type_key` carries the path for the per-tag hint.  NOQUALCOL reverts.
+      const CtorInfo* qual_ci = nullptr;
+      if (!common && !cppcaml::dbg_env("NOQUALCOL")) {
+        std::vector<std::string> paths;
+        for (auto& r : rows) {
+          if (!std::get_if<Ppat_construct>(&r.cols[0]->desc)) continue;
+          auto pc = vk.pat_constr.find(r.cols[0]);
+          if (pc == vk.pat_constr.end() ||
+              pc->second.find('.') == std::string::npos)
+            continue;
+          if (std::find(paths.begin(), paths.end(), pc->second) == paths.end())
+            paths.push_back(pc->second);
+        }
+        for (auto& path : paths) {
+          const CtorInfo* head = qual_type_ctor(path, col_cns[0]);
+          bool all = head != nullptr;
+          for (auto& cn : col_cns)
+            if (all && !qual_type_ctor(path, cn)) all = false;
+          if (!all) continue;
+          if (qual_ci) { qual_ci = nullptr; break; }   // ambiguous: decline
+          type_key = path; qual_ci = head;
+        }
+      }
+      if (!common && !qual_ci)
+        return GB("typemismatch", col_cns.empty() ? "" : col_cns[0]);
+      if (common) {
+        type = *common;
+        any_ci = &type_ctor_info_.at(type).at(col_cns[0]);
+      } else {
+        any_ci = qual_ci;
+        type = qual_ci->type;
+      }
     }
+    if (type_key.empty()) type_key = type;
     if (!any_ci) return GB("no-type_ctors", type);
     // The flat type_ctors_ table is keyed by BARE type names and only carries the
     // types force-registered along a top-level scrutinee's inferred path.  A ctor
@@ -17125,7 +17193,7 @@ struct Translator {
     std::vector<std::pair<std::string, const CtorInfo*>> row_ci;  // name -> info
     for (auto& r : rows)
       if (std::get_if<Ppat_construct>(&r.cols[0]->desc)) {
-        const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type);
+        const CtorInfo* ci = rr(r.cols[0], ctor_of(*r.cols[0]), type_key);
         (ci->is_block ? block_ci : const_ci)[ci->tag] = ci;
         row_ci.push_back({ctor_of(*r.cols[0]), ci});
       } else has_var = true;
