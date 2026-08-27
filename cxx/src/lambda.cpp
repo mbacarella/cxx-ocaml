@@ -16629,7 +16629,33 @@ struct Translator {
         // exit serves both the tree's default AND the per-string sub-matrix
         // misses (upstream: both land in the string split's fail).
         bool envmode = !denv.empty() && !havedflt;
+        // With var rows present, they are upstream's next half-match chunk
+        // (split_no_or stops the const group at the var row) and everything
+        // below -- the `denv` stack, and under it `deid` -- sits BELOW that
+        // chunk.  So a per-string sub-matrix's miss lands on the var chunk
+        // only while the var rows can still match, and falls through past it
+        // otherwise.  Handing the subs `fid` as their whole default flattens
+        // the two, which makes the miss re-test the var rows' own columns:
+        // location's `[] | [("",_,_)] / [(l,n,c)] / _`, where the "" arm's
+        // failed tail test rules out `[(l,n,c)]` too and ocamlc jumps
+        // straight to the `_` arm.  So push the var chunk as a stack entry
+        // over the env the subs already get.  NOSTRDENV reverts.
+        //
+        // A GUARDED row declines: its failure re-enters the chain at run time,
+        // which upstream models by chunking around the guard, and our entries
+        // carry patterns only -- there the flattened `fid` routing is what we
+        // already agree with (pprintast's `("get"|"set" as func)` site).
+        bool pushmode = havedflt && !cppcaml::dbg_env("NOSTRDENV");
+        for (auto& r : rows) if (r.guard) { pushmode = false; break; }
         int fid = ++next_exit_;
+        // The var chunk's matrix over the columns left after the string one is
+        // consumed.  The var rows match every string, so only the entries
+        // BELOW it are string-specialized.
+        std::vector<std::vector<const Pattern*>> vmat;
+        if (pushmode)
+          for (auto& r : rows)
+            if (!std::get_if<Ppat_constant>(&r.cols[0]->desc))
+              vmat.emplace_back(r.cols.begin() + 1, r.cols.end());
         // Per-string sub-matrices, compiled in first-occurrence row order
         // (stamp-stable), THEN sorted by the string; vals are distinct so
         // sort_lambda_list's uniq is a no-op.
@@ -16642,9 +16668,16 @@ struct Translator {
             }
           std::vector<LamPtr> cc = rest;
           LamPtr sb;
-          if (envmode) {
+          if (envmode || pushmode) {
             std::vector<GmDef> de = denv;
             if (!denv_spec_string(de, s)) return nullptr;
+            if (pushmode) {
+              GmDef e{fid, vmat};
+              if (!vmat.empty())
+                for (size_t j = 0; j < vmat[0].size(); ++j)
+                  e.colmap.push_back((int)j);
+              de.insert(de.begin(), std::move(e));
+            }
             sb = gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(de));
           } else
             sb = gmatch(std::move(cc), std::move(sub), mloc, fid);
@@ -16697,8 +16730,11 @@ struct Translator {
         if (sw.size() >= 2) { bl->body = tree; cat->cond = bl; top = cat; }
         else { cat->cond = tree; bl->body = cat; top = bl; }
         if (cppcaml::dbg_env("STRDBG"))
-          fprintf(stderr, "[STRDBG] string col fid=%d havedflt=%d nstr=%zu\n",
-                  fid, (int)havedflt, sw.size());
+          fprintf(stderr,
+                  "[STRDBG] string col fid=%d havedflt=%d push=%d nstr=%zu"
+                  " denv=%zu deid=%d line=%d\n",
+                  fid, (int)havedflt, (int)pushmode, sw.size(), denv.size(),
+                  deid, mloc.start.lnum);
         return top;
       }
     }
