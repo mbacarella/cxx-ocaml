@@ -26715,6 +26715,7 @@ struct Translator {
           kinds.push_back(pat_kind(&b->pat));
           rec_spine_ = true;
           vals.push_back(expr(*b->expr));
+          mark_tmc(vals.back(), b->attrs);
         }
         RecParts rp;
         if (!recs.empty() && partition_rec(ids, kinds, vals, rp)) {
@@ -28646,9 +28647,322 @@ struct Translator {
     if (v && v->k == Lam::K::Function)
       if (auto ia = fn_attrs(attrs); !ia.empty()) {
         v->inline_attr = ia;
-        if (has_attr(attrs, "tail_mod_cons")) v->body = tmc_head_first(v->body);
+        mark_tmc(v, attrs);
       }
     return v;
+  }
+  // Flag a `[@tail_mod_cons]` function for the late tmc_rewrite pass.  Under
+  // NOTMC we keep the old approximation instead: no dps twin, just the
+  // head-before-tail evaluation order at the constructor.
+  void mark_tmc(const LamPtr& v, const Attributes& attrs) {
+    if (!v || v->k != Lam::K::Function) return;
+    if (!has_attr(attrs, "tail_mod_cons")) return;
+    if (tmc_off()) v->body = tmc_head_first(v->body); else v->tmc = true;
+  }
+  static bool tmc_off() {
+    static const bool off = cppcaml::dbg_env("NOTMC");
+    return off;
+  }
+
+  // ===== Tmc.rewrite (lambda/tmc.ml) =====
+  // `let[@tail_mod_cons] rec f ..` asks for the tail-modulo-constructor
+  // transform.  ocamlc emits TWO functions: the direct `f`, and a
+  // destination-passing twin `f_dps dst offset ..` whose contract is
+  // `f_dps dst off args` == `dst.(off) <- f args`.  A tail `K (a, f xs)` then
+  // allocates `K (a, <placeholder>)`, hands the placeholder's slot to the twin
+  // and returns the block, so the recursion inside the twin is a real tail
+  // call.  The pass runs last, after every simplification, exactly where
+  // simplif.ml puts `Tmc.rewrite`.
+  //
+  // We port the shape tmc.ml reaches for the common case: ONE block
+  // constructor exactly one of whose arguments is a call to a function of the
+  // same binding group at its exact arity.  Any other tail term is not a TMC
+  // call and simply writes itself to the destination, which is correct
+  // whatever the term is, so the twin is always a faithful implementation of
+  // its contract.  Not ported: the nested-constructor optimisation
+  // (`x :: y :: f xs`), tupled functions, and the ambiguity diagnostics --
+  // those functions keep an unrewritten body and get a twin that never
+  // self-calls, which is different from ocamlc's code but emits the same two
+  // closures.  NOTMC reverts to the old approximation.
+  struct TmcCand { Ident dps; size_t arity; };
+  using TmcGroup = std::map<int, TmcCand>;   // direct binder stamp -> twin
+
+  // A fresh copy of `l` with every binder renamed -- Lambda.duplicate_function,
+  // which ocamlc applies to the twin so the two bodies share no stamps.  Stamps
+  // are globally unique, so one flat map serves as the renaming.
+  LamPtr tmc_clone(const LamPtr& l, std::unordered_map<int, Ident>& ren) {
+    if (!l) return l;
+    auto rn = [&](const Ident& id) {
+      Ident f = id; f.stamp = stamp++; ren[id.stamp] = f; return f;
+    };
+    auto use = [&](const Ident& id) {
+      auto it = ren.find(id.stamp); return it == ren.end() ? id : it->second;
+    };
+    LamPtr n = lam_alloc_copy(*l);
+    switch (l->k) {
+      case Lam::K::Var: case Lam::K::Mutvar: n->var = use(l->var); return n;
+      case Lam::K::Assign:
+        n->var = use(l->var); n->cond = tmc_clone(l->cond, ren); return n;
+      case Lam::K::Function:
+        for (auto& p : n->params) p.first = rn(p.first);
+        n->body = tmc_clone(l->body, ren);
+        return n;
+      case Lam::K::Let:
+        for (size_t i = 0; i < n->bindings.size(); ++i) {
+          n->bindings[i].val = tmc_clone(l->bindings[i].val, ren);
+          n->bindings[i].id = rn(l->bindings[i].id);
+        }
+        n->body = tmc_clone(l->body, ren);
+        return n;
+      case Lam::K::Letrec:
+        for (auto& b : n->bindings) b.id = rn(b.id);
+        for (size_t i = 0; i < n->bindings.size(); ++i)
+          n->bindings[i].val = tmc_clone(l->bindings[i].val, ren);
+        n->body = tmc_clone(l->body, ren);
+        return n;
+      case Lam::K::Try:
+        n->body = tmc_clone(l->body, ren);
+        n->var = rn(l->var);
+        n->then_ = tmc_clone(l->then_, ren);
+        return n;
+      case Lam::K::Catch:
+        n->cond = tmc_clone(l->cond, ren);
+        for (auto& v : n->catch_vars) v = rn(v);
+        n->then_ = tmc_clone(l->then_, ren);
+        return n;
+      case Lam::K::For:
+        n->then_ = tmc_clone(l->then_, ren);
+        n->else_ = tmc_clone(l->else_, ren);
+        n->var = rn(l->var);
+        n->body = tmc_clone(l->body, ren);
+        return n;
+      default:
+        n->fn = tmc_clone(l->fn, ren);
+        n->body = tmc_clone(l->body, ren);
+        n->cond = tmc_clone(l->cond, ren);
+        n->then_ = tmc_clone(l->then_, ren);
+        n->else_ = tmc_clone(l->else_, ren);
+        n->sw_default = tmc_clone(l->sw_default, ren);
+        for (auto& a : n->args) a = tmc_clone(a, ren);
+        for (auto& b : n->bindings) b.val = tmc_clone(b.val, ren);
+        for (auto& sc : n->sw_consts) sc.body = tmc_clone(sc.body, ren);
+        for (auto& sc : n->sw_blocks) sc.body = tmc_clone(sc.body, ren);
+        return n;
+    }
+  }
+  // The group member `l` calls at its exact arity, or null.
+  static const TmcCand* tmc_call(const LamPtr& l, const TmcGroup& g) {
+    if (!l || l->k != Lam::K::Apply) return nullptr;
+    if (!l->fn || l->fn->k != Lam::K::Var) return nullptr;
+    auto it = g.find(l->fn->var.stamp);
+    if (it == g.end() || it->second.arity != l->args.size()) return nullptr;
+    return &it->second;
+  }
+  // The one argument of a block constructor that is a TMC call, or -1.  Two of
+  // them is what tmc.ml reports as Ambiguous_constructor_arguments; we leave
+  // such a block alone rather than pick a side.
+  static int tmc_hole(const LamPtr& l, const TmcGroup& g) {
+    if (!l || l->k != Lam::K::Prim || l->prim != Prim::Makeblock) return -1;
+    int hole = -1;
+    for (size_t i = 0; i < l->args.size(); ++i)
+      if (tmc_call(l->args[i], g)) {
+        if (hole >= 0) return -1;
+        hole = (int)i;
+      }
+    return hole;
+  }
+  // `dst.(off) <- v`, the write every non-TMC tail term of the twin ends in.
+  LamPtr tmc_assign(const Ident& dst, const Ident& off, const LamPtr& v) {
+    auto sf = mk(Lam::K::Prim);
+    sf->prim = Prim::SetfieldComputed;
+    sf->prim_id = "setfield_ptr(heap-init)_computed";
+    sf->args = {varof(dst), varof(off), v};
+    return sf;
+  }
+  // Constr.delay_impure: in the twin, every constructor argument that is not
+  // obviously pure is bound first, left to right, so the delayed constructor
+  // application cannot move an effect past another one.  Rewrites those
+  // arguments of `blk` in place and returns the Let chain to wrap the block in
+  // (null when every argument was already a variable or a constant).
+  LamPtr tmc_delay_impure(const LamPtr& blk, int hole) {
+    std::vector<Lam::Binding> bs;
+    for (size_t i = 0; i < blk->args.size(); ++i) {
+      const LamPtr& a = blk->args[i];
+      if ((int)i == hole || !a || a->k == Lam::K::Var || is_const(a)) continue;
+      Ident v = fresh("block0_arg" + std::to_string(i));
+      bs.push_back({v, ValueKind::Gen, a});
+      blk->args[i] = varof(v);
+    }
+    if (bs.empty()) return nullptr;
+    auto let = mk(Lam::K::Let);
+    let->bindings = std::move(bs);
+    return let;
+  }
+  // `let block = makemutable tag (.. dummy at hole ..)`, the placeholder cell
+  // both versions build (Constr.with_placeholder).  Returns the Let, with the
+  // binder in `block`; the caller supplies the body.
+  LamPtr tmc_block(const LamPtr& blk, int hole, Ident& block) {
+    auto mm = mk(Lam::K::Prim);
+    mm->prim = Prim::Makemutable;
+    mm->prim_arg = blk->prim_arg;
+    mm->blk_shape = blk->blk_shape;
+    mm->args = blk->args;
+    mm->args[hole] = cint(0xBBBB / 2);   // Lambda.dummy_constant
+    block = fresh("block");
+    auto let = mk(Lam::K::Let);
+    let->bindings = {{block, ValueKind::Gen, mm}};
+    return let;
+  }
+  // `f_dps <dst> <off> args`, from the direct call `f args`.
+  LamPtr tmc_dps_call(const LamPtr& call, const TmcCand& c,
+                      const LamPtr& dst, const LamPtr& off) {
+    auto ap = lam_alloc_copy(*call);
+    ap->fn = varof(c.dps);
+    ap->args.clear();
+    ap->args.push_back(dst);
+    ap->args.push_back(off);
+    for (auto& a : call->args) ap->args.push_back(a);
+    return ap;
+  }
+  // The direct version: only a TMC constructor in tail position changes, into
+  // `let block = K (.., dummy, ..) in (f_dps block hole args; block)`.
+  LamPtr tmc_direct(LamPtr l, const TmcGroup& g) {
+    if (!l) return l;
+    switch (l->k) {
+      case Lam::K::Let: case Lam::K::Letrec:
+        l->body = tmc_direct(l->body, g); return l;
+      case Lam::K::Sequence: l->else_ = tmc_direct(l->else_, g); return l;
+      case Lam::K::IfThenElse:
+        l->then_ = tmc_direct(l->then_, g);
+        l->else_ = tmc_direct(l->else_, g);
+        return l;
+      case Lam::K::Catch:  // a static catch's body IS in tail position
+        l->cond = tmc_direct(l->cond, g);
+        l->then_ = tmc_direct(l->then_, g);
+        return l;
+      case Lam::K::Switch:
+        for (auto& c : l->sw_consts) c.body = tmc_direct(c.body, g);
+        for (auto& c : l->sw_blocks) c.body = tmc_direct(c.body, g);
+        l->sw_default = tmc_direct(l->sw_default, g);
+        return l;
+      case Lam::K::Prim: {
+        int hole = tmc_hole(l, g);
+        if (hole < 0) return l;
+        Ident block;
+        LamPtr let = tmc_block(l, hole, block);
+        auto sq = mk(Lam::K::Sequence);
+        sq->cond = tmc_dps_call(l->args[hole], *tmc_call(l->args[hole], g),
+                                varof(block), cint(hole));
+        sq->else_ = varof(block);
+        let->body = sq;
+        return let;
+      }
+      default: return l;
+    }
+  }
+  // The twin: every tail term writes itself to `dst.(off)`, except a TMC
+  // constructor (which passes the placeholder's slot on) and a bare group call
+  // (which forwards the destination straight through).
+  LamPtr tmc_twin(LamPtr l, const TmcGroup& g,
+                  const Ident& dst, const Ident& off) {
+    if (!l) return l;
+    switch (l->k) {
+      case Lam::K::Let: case Lam::K::Letrec:
+        l->body = tmc_twin(l->body, g, dst, off); return l;
+      case Lam::K::Sequence:
+        l->else_ = tmc_twin(l->else_, g, dst, off); return l;
+      case Lam::K::IfThenElse:
+        // The `then_` slot of a string-test tree holds the switch's shared
+        // default.  ocamlc hoists a default that is not already a jump into a
+        // fresh catch (Matching.make_catch), so that slot is a bare exit by the
+        // time Bytegen sees it, and Bytegen turns the test into a single
+        // `branchif <handler>`.  We expand the tree during translation, with
+        // the exit inlined in the slot, so wrapping it in the destination write
+        // here would cost exactly the word that hoist saves.
+        if (!(l->gm_str_node && l->then_ && l->then_->k == Lam::K::Staticraise))
+          l->then_ = tmc_twin(l->then_, g, dst, off);
+        l->else_ = tmc_twin(l->else_, g, dst, off);
+        return l;
+      case Lam::K::Catch:
+        l->cond = tmc_twin(l->cond, g, dst, off);
+        l->then_ = tmc_twin(l->then_, g, dst, off);
+        return l;
+      case Lam::K::Switch:
+        for (auto& c : l->sw_consts) c.body = tmc_twin(c.body, g, dst, off);
+        for (auto& c : l->sw_blocks) c.body = tmc_twin(c.body, g, dst, off);
+        if (l->sw_default) l->sw_default = tmc_twin(l->sw_default, g, dst, off);
+        return l;
+      case Lam::K::Apply:
+        if (auto* c = tmc_call(l, g))
+          return tmc_dps_call(l, *c, varof(dst), varof(off));
+        break;
+      case Lam::K::Prim: {
+        int hole = tmc_hole(l, g);
+        if (hole < 0) break;
+        LamPtr call = l->args[hole];
+        LamPtr binds = tmc_delay_impure(l, hole);
+        Ident block;
+        LamPtr let = tmc_block(l, hole, block);
+        auto sq = mk(Lam::K::Sequence);
+        sq->cond = tmc_assign(dst, off, varof(block));
+        sq->else_ =
+            tmc_dps_call(call, *tmc_call(call, g), varof(block), cint(hole));
+        let->body = sq;
+        if (!binds) return let;
+        binds->body = let;
+        return binds;
+      }
+      default: break;
+    }
+    return tmc_assign(dst, off, l);
+  }
+  // Give every `[@tail_mod_cons]` function of this binding group its twin,
+  // right after the direct version (tmc.ml's traverse_letrec_binding).
+  void tmc_group(const LamPtr& l) {
+    TmcGroup g;
+    for (auto& b : l->bindings)
+      if (b.val && b.val->k == Lam::K::Function && b.val->tmc)
+        g[b.id.stamp] = {fresh(b.id.name + "_dps"), b.val->params.size()};
+    if (g.empty()) return;
+    std::vector<Lam::Binding> out;
+    for (auto& b : l->bindings) {
+      out.push_back(b);
+      auto it = g.find(b.id.stamp);
+      if (it == g.end()) continue;
+      const LamPtr fn = b.val;
+      fn->tmc = false;
+      auto twin = mk(Lam::K::Function);
+      Ident dst = fresh("dst"), off = fresh("offset");
+      twin->params.push_back({dst, ValueKind::Gen});
+      twin->params.push_back({off, ValueKind::Int});
+      // The parameters are binders too: rename them first, so the duplicated
+      // body reads the twin's own copies and not the direct version's.
+      std::unordered_map<int, Ident> ren;
+      for (auto& p : fn->params) {
+        Ident f = p.first; f.stamp = stamp++;
+        ren[p.first.stamp] = f;
+        twin->params.push_back({f, p.second});
+      }
+      LamPtr copy = tmc_clone(fn->body, ren);
+      twin->ret_kind = fn->ret_kind;
+      twin->inline_attr = fn->inline_attr;
+      twin->body = tmc_twin(copy, g, dst, off);
+      fn->body = tmc_head_first(tmc_direct(fn->body, g));
+      out.push_back({it->second.dps, ValueKind::Gen, twin});
+    }
+    l->bindings = std::move(out);
+  }
+  // Walk the unit, innermost groups first so a nested candidate is already
+  // rewritten by the time an enclosing body is duplicated.
+  void tmc_rewrite(const LamPtr& l) {
+    if (!l) return;
+    tmc_rewrite(l->fn); tmc_rewrite(l->body); tmc_rewrite(l->cond);
+    tmc_rewrite(l->then_); tmc_rewrite(l->else_); tmc_rewrite(l->sw_default);
+    for (auto& a : l->args) tmc_rewrite(a);
+    for (auto& b : l->bindings) tmc_rewrite(b.val);
+    for (auto& sc : l->sw_consts) tmc_rewrite(sc.body);
+    for (auto& sc : l->sw_blocks) tmc_rewrite(sc.body);
+    if (l->k == Lam::K::Let || l->k == Lam::K::Letrec) tmc_group(l);
   }
 
   // The runtime field layout (value/module names, in order) of a module-type
@@ -33438,6 +33752,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   }
   t.two_const_switch_to_if(root);
   t.resolve_str_binds(root);
+  t.tmc_rewrite(root);   // simplif.ml runs Tmc.rewrite last, after every pass
   lap("simplify");
   if (required_globals) {
     std::set<std::string> rg;

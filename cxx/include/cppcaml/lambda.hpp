@@ -144,6 +144,9 @@ struct Lam {
   ValueKind ret_kind = ValueKind::Gen;
   LamPtr body;
   std::string inline_attr;  // "never_inline"/"always_inline" from [@inline ...], or ""
+  // The binding carried [@tail_mod_cons]: this function is a TMC candidate and
+  // the late Tmc.rewrite pass gives it a destination-passing twin.
+  bool tmc = false;
 
   // Let: a group of bindings (kind shown as =[kind]) then a body
   // alias: the Llet Alias kind (printed `=a`), used for pattern-variable bindings
