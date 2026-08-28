@@ -16877,14 +16877,21 @@ struct Translator {
           dbody = mkexit();  // no var/any rows: fail to the enclosing default
         }
         // Where the default's handler catch sits relative to bind_sw's let is
-        // decided by Simplif's exit count (simplif.ml:146): a stringswitch
-        // with TWO OR MORE arms counts its default TWICE ("default will get
-        // replicated"), so the single `(exit fid)` in the fail slot is never
-        // single-use, the handler is not inlined into the node, and what
-        // survives to Bytegen is the MATCH's own catch -- outside the whole
-        // expansion, hence outside the bind.  With one arm (or none) the
-        // default is counted once and inlined, so the catch reaching the code
-        // generator is Bytegen's own make_catch, INSIDE bind_sw.
+        // decided by Simplif's exit count (simplif.ml:146) for the UNEXPANDED
+        // stringswitch: `count l; iter count sw; count d` -- twice for d with
+        // two or more arms ("default will get replicated").  Counted ONCE the
+        // handler is inlined into the node's fail slot, no catch survives, and
+        // Bytegen's own make_catch builds one INSIDE bind_sw's let.  Counted
+        // twice or more the MATCH's catch survives to Bytegen, which registers
+        // the handler before expanding the node -- so the bind lands INSIDE
+        // the catch.  Two or more arms always reach 2; with ONE arm the arm
+        // BODY's own `(exit fid)` still can (out_type's `{attr_name =
+        // {txt="..."}}` row exits on the payload sub-match).
+        int nex = sw.size() >= 2 ? 2 : 1;  // the fail slot's own (exit fid)
+        if (nex < 2 && !cppcaml::dbg_env("NOSTRARMEXIT")) {
+          int bad = 0;
+          for (auto& [ss, sb2] : sw) nex += count_exit(sb2, fid, false, bad);
+        }
         auto bl = mk(Lam::K::Let);
         bl->bindings = {{swv, ValueKind::Gen, comps[0], false}};
         bl->gm_str_bind = true;
@@ -16892,7 +16899,7 @@ struct Translator {
         cat->prim_arg = fid; cat->then_ = dbody;
         cat->keep_catch = true; cat->gm_str_dflt = true;
         LamPtr top;
-        if (sw.size() >= 2) { bl->body = tree; cat->cond = bl; top = cat; }
+        if (nex >= 2) { bl->body = tree; cat->cond = bl; top = cat; }
         else { cat->cond = tree; bl->body = cat; top = bl; }
         if (cppcaml::dbg_env("STRDBG"))
           fprintf(stderr,
