@@ -8814,6 +8814,11 @@ struct Translator {
             // needed at each failure point, so share it behind a catch/exit
             if (!eid) eid = ++next_exit_;
             for (auto it = ptests.rbegin(); it != ptests.rend(); ++it) {
+              if (payload_tag_switch_ok(*it)) {
+                then = payload_tag_switch(*it, fieldimm(it->idx, exv()), then,
+                                          arm_fail >= 0 ? arm_fail : eid);
+                continue;
+              }
               auto t = mk(Lam::K::Prim);
               if (it->string_eq) { t->prim = Prim::Ccall; t->prim_id = "caml_string_equal"; }
               else { t->prim = Prim::IntCmp; t->prim_id = "=="; }
@@ -9009,7 +9014,57 @@ struct Translator {
                        // tag_test: compare caml_obj_tag(field idx) against rhs
                        // (a block variant-ctor payload; an immediate's tag is
                        // out of range so no separate isint guard is needed)
-                       bool tag_test = false; };
+                       bool tag_test = false;
+                       // ... but ocamlc does not test a tag at all: it compiles
+                       // the payload as a regular constructor SUB-MATCH.  `tv`
+                       // is the `*match*` the field is Alias-bound to (bound by
+                       // the CONSUMER, around the switch), `tag` the matched
+                       // block tag, nc/nb the payload type's ctor counts.
+                       Ident tv; int tag = -1; int nc = -1, nb = -1; };
+  // A tag test we can give ocamlc's shape (payload_tag_switch): the payload
+  // variant's ctor counts must be known, and the shape must not be the one
+  // combine_regular_constructor splits on `isint` instead of widening the
+  // switch -- a lone block ctor beside constant ones (transl_match_on_option).
+  static bool payload_tag_switch_ok(const PayloadTest& pt) {
+    static const bool off = std::getenv("NOPAYTAGSW") != nullptr;
+    if (off || !pt.tag_test) return false;
+    if (pt.nc < 0 || pt.nb < 1 || pt.tag < 0 || pt.tag >= pt.nb) return false;
+    return !(pt.nb == 1 && pt.nc >= 1);
+  }
+  // `with Error (Lookup_error (loc, env, err))`: ocamlc reaches the payload
+  // sub-pattern through get_expr_args_constr's Alias-bound `*match*` and
+  // compiles a regular constructor match on it -- a SWITCH over the variant's
+  // tags, with every non-matched ctor an explicit failure case
+  // (mk_failaction_pos) until reintroduce_fail collapses them into the default
+  // (from 3 citations up).  There is no caml_obj_tag anywhere in it.
+  LamPtr payload_tag_switch(const PayloadTest& pt, LamPtr acc, LamPtr body,
+                            int fail_tgt) {
+    auto failL = [&] {
+      auto x = mk(Lam::K::Staticraise); x->prim_arg = fail_tgt; return x;
+    };
+    auto sw = mk(Lam::K::Switch);
+    sw->cond = varof(pt.tv);
+    sw->sw_numconsts = pt.nc; sw->sw_numblocks = pt.nb;
+    // the arm's body is cited once; every other ctor exits to fail_tgt
+    const bool def = pt.nc + pt.nb - 1 >= 3;
+    if (!def)
+      for (int t = 0; t < pt.nc; ++t) sw->sw_consts.push_back({t, failL()});
+    for (int t = 0; t < pt.nb; ++t) {
+      if (t == pt.tag) sw->sw_blocks.push_back({t, body});
+      else if (!def) sw->sw_blocks.push_back({t, failL()});
+    }
+    if (def) sw->sw_default = failL();
+    LamPtr out = sw;
+    if (count_var(out, pt.tv) <= 1) {
+      subst_alias(out, pt.tv, acc);
+    } else {
+      auto bl = mk(Lam::K::Let);
+      bl->bindings = {{pt.tv, ValueKind::Gen, acc, /*alias=*/true}};
+      bl->body = out;
+      out = bl;
+    }
+    return out;
+  }
   // rhs of a non-binding or-alternation being shared behind a static catch:
   // rows citing it compile to (exit N) instead of duplicating the action.
   std::map<const Expression*, int> exn_shared_exit_;
@@ -9290,10 +9345,16 @@ struct Translator {
                   nc = tcx->second.first; nb = tcx->second.second;
                 }
               if (nc == 0 && nb == 1) sole = true;
-              if (!sole)
-                tests->push_back({j + 1, cint(ci->second.tag), false,
-                                  /*tag_test=*/true});
-              temps.push_back({tv, acc});
+              bool sw_pay = false;
+              if (!sole) {
+                PayloadTest pt{j + 1, cint(ci->second.tag), false,
+                               /*tag_test=*/true};
+                pt.tv = tv; pt.tag = ci->second.tag; pt.nc = nc; pt.nb = nb;
+                sw_pay = payload_tag_switch_ok(pt);
+                tests->push_back(std::move(pt));
+              }
+              // the switch shape Alias-binds `tv` itself, around the switch
+              if (!sw_pay) temps.push_back({tv, acc});
               sub_binders.push_back(std::move(sb));
               ok = true;
               continue;
@@ -22186,6 +22247,10 @@ struct Translator {
         auto x = mk(Lam::K::Staticraise); x->prim_arg = eid; return x;
       };
       for (auto it = ptests.rbegin(); it != ptests.rend(); ++it) {
+        if (payload_tag_switch_ok(*it)) {
+          body = payload_tag_switch(*it, fieldimm(it->idx, sv()), body, eid);
+          continue;
+        }
         auto t = mk(Lam::K::Prim);
         if (it->string_eq) { t->prim = Prim::Ccall; t->prim_id = "caml_string_equal"; }
         else { t->prim = Prim::IntCmp; t->prim_id = "=="; }
