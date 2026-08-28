@@ -28702,8 +28702,10 @@ struct Translator {
     for (auto& fp : f.params)
       if (auto* pv = std::get_if<Pparam_val>(&fp.desc)) {
         const Pattern* pat = &pv->pat;
+        const CoreType* pann = nullptr;  // `(f : int -> ?w:int -> unit -> int)`
         while (auto* pc = std::get_if<Ppat_constraint>(&pat->desc)) {
           note_pat_constraint_hint(*pc);  // ({l; ..} : M.t) param: labels via M.t
+          if (!pann) pann = pc->t.get();
           pat = pc->p.get();
         }
         if (std::holds_alternative<Optional>(pv->label) && pv->default_) {
@@ -28795,6 +28797,16 @@ struct Translator {
           Ident id = fresh(var->name.txt);
           l->params.push_back({id, pat_kind(pat)});
           scope.back()[var->name.txt] = id;
+          // An ANNOTATED parameter of function type is the only place a
+          // callee's labels are stated: `let s (f : int -> ?w:int -> unit ->
+          // int) = f 5 ()` has no definition to harvest, so callee_sig found
+          // nothing and the call applied VERBATIM -- the omitted `?w` got no
+          // None (the unit landed in its slot) and a supplied `~w:1` went raw
+          // instead of `Some 1`, which the callee dereferenced as a pointer.
+          // Record the arrow's label sig as record_fn_sig does for a let.
+          if (pann && !dbg_env("NOPARAMANNSIG"))
+            if (FnSig fs = coretype_label_sig(pann); !fs.empty())
+              fn_sig_[id.stamp] = std::move(fs);
         } else if (auto* up = std::get_if<Ppat_unpack>(&pat->desc); up && up->name.txt) {
           Ident id = fresh_scoped(*up->name.txt);  // `(module X)`: a first-class-module param
           l->params.push_back({id, ValueKind::Gen});
