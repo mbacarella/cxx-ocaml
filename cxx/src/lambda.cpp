@@ -26801,15 +26801,48 @@ struct Translator {
             // Polymorphic comparison ops: specialize to an integer comparison
             // when an operand is an immediate, else a caml_* C compare.
             if (auto c = poly_cmp(n); !c.first.empty() && as.size() == 2) {
+              LamPtr e0 = expr(*as[0].second), e1 = expr(*as[1].second);
+              // A constant is an immediate: a constant constructor / constant
+              // polymorphic variant, or an int/char literal.  A boxed-int
+              // literal (`0n`/`0l`/`0L`) is a ConstInt too but carries its
+              // suffix, and takes the kind path below instead.
+              auto is_imm = [](const LamPtr& l) {
+                return (l->k == Lam::K::ConstInt && l->str_val.empty()) ||
+                       l->k == Lam::K::ConstChar;
+              };
+              // translprim's has_constant_constructor (translprim.ml:1004) is
+              // tested FIRST, ahead of every base-type test (line 528): the
+              // compare `x = None` / `x = []` / ``x = `A`` is an int compare
+              // whatever the operand type says.  We only reached the immediate
+              // case far below, and only for a Gen kind, so out_type's `if
+              // name = None` -- whose binder our inferencer marks `string` --
+              // came out as `caml_string_equal <name> 0`, dereferencing the
+              // integer 0 as a string as soon as name is `Some _`.  An
+              // EXTENSION ctor is NOT constant (Cstr_extension, and its value
+              // is a block), hence the lowered-immediate half of the test.
+              auto const_ctor = [&](const Expression& x, const LamPtr& l) {
+                if (!is_imm(l)) return false;
+                if (auto* k = std::get_if<Pexp_construct>(&x.desc))
+                  return !k->arg;
+                if (auto* v = std::get_if<Pexp_variant>(&x.desc))
+                  return !v->arg;
+                return false;
+              };
+              if (!cppcaml::dbg_env("NOCONSTCTORCMP") &&
+                  (n == "=" || n == "<>") &&
+                  (const_ctor(*as[0].second, e0) ||
+                   const_ctor(*as[1].second, e1))) {
+                auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp;
+                pr->prim_id = c.first; pr->args = {e0, e1}; return pr;
+              }
               // A string operand selects the string compare (caml_string_lessthan,
               // ...): the polymorphic caml_* name with the `string` infix.
               if (expr_is_string(as[0].second.get()) || expr_is_string(as[1].second.get())) {
                 auto pr = mk(Lam::K::Prim); pr->prim = Prim::Ccall;
                 pr->prim_id = "caml_string_" + c.second.substr(5);  // drop "caml_"
-                pr->args = {expr(*as[0].second), expr(*as[1].second)};
+                pr->args = {e0, e1};
                 return pr;
               }
-              LamPtr e0 = expr(*as[0].second), e1 = expr(*as[1].second);
               // The operand kind drives the spelling: int -> `==`, float -> `==.`,
               // int64/int32/nativeint -> `Int64.==` etc.; two generics fall back to
               // the polymorphic caml_* compare.
@@ -26831,15 +26864,10 @@ struct Translator {
                 if (char s = bsuf_of(e0) ? bsuf_of(e0) : bsuf_of(e1))
                   k = s == 'l'   ? ValueKind::Boxedint32
                     : s == 'L' ? ValueKind::Boxedint64 : ValueKind::Nativeint;
-              // Equality with an immediate constant of a generic type (`x = None`,
-              // `x = []`) is physical -- comparing any value with an immediate is the
-              // `==`/`!=` int test.  Only when the kind is generic: a boxed-int
-              // literal (`0n`/`0l`/`0L`) is ConstInt too but takes the kind
-              // path above via its suffix.
-              auto is_imm = [](const LamPtr& l) {
-                return (l->k == Lam::K::ConstInt && l->str_val.empty()) ||
-                       l->k == Lam::K::ConstChar;
-              };
+              // Equality with an immediate constant of a generic type (`x = 0`,
+              // `x = 'a'`) is physical -- comparing any value with an
+              // immediate is the `==`/`!=` int test.  Only when the kind is
+              // generic; the constant-constructor half is handled above.
               if (k == ValueKind::Gen && (n == "=" || n == "<>") && (is_imm(e0) || is_imm(e1))) {
                 auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp; pr->prim_id = c.first;
                 pr->args = {e0, e1}; return pr;
