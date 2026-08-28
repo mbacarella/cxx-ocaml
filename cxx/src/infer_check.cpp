@@ -465,6 +465,24 @@ struct Checker {
   // type-directed like ocamlc -- the labels need not be in scope at all, and a
   // same-named label of an unrelated record must not supply the indices.
   std::unordered_map<const Pattern*, TypePtr> pat_expected_record_;
+  // An INLINE-RECORD constructor's own fields, keyed by constructor name: one
+  // entry per declaration, each a list of (label, `result -> field type`).  A
+  // pattern `C { f; g }` names its record type EXACTLY -- it is the ctor's own
+  // inline record -- so the fields must NOT be looked up in the global label
+  // registry, where a same-named label of an unrelated record can hijack them
+  // (out_type's `Types.Row { name }` picked up `Ident_conflicts.explanation`'s
+  // `name : string` and lowered the compare to caml_string_equal against 0).
+  std::unordered_map<std::string,
+                     std::vector<std::vector<std::pair<std::string, TypePtr>>>>
+      inline_ctor_fields_;
+  // The record sub-pattern of such a constructor, and the ctor name it came
+  // from -- read at the top of the Ppat_record branch.  The producer twin
+  // (`C { f = e }`) was written and MEASURED INERT -- no corpus module and no
+  // probe moved -- so it is deliberately not taken here.
+  std::unordered_map<const Pattern*, std::string> pat_inline_ctor_;
+  // `open M` runs once per occurrence, so the same cmi ctor can be walked
+  // repeatedly; a second entry would make the name look ambiguous.
+  std::set<std::string> inline_ctor_seen_;
   // Record decl by identity stamp, for resolving an AMBIGUOUS field projection
   // through the base's inferred type identity (Sign_diff.t.untypables@4).
   std::unordered_map<int, const TypeDeclaration*> stamp_record_decl_;
@@ -4294,7 +4312,8 @@ struct Checker {
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
       }
-      register_inline_record(c.args, result, vars);  // `C of { f : t }`
+      // `C of { f : t }`
+      register_inline_record(c.args, result, vars, c.name.txt);
       if (!no_gadtrow_gen) eng.leave_level();
       bool nested_predef = !mod_prefix_.empty() && predef_ctors_.count(c.name.txt);
       if (ctors.count(c.name.txt)) {
@@ -4462,16 +4481,44 @@ struct Checker {
   // pass); `result` is the constructor's result type, used as the field's
   // record-type domain.
   void register_inline_record(const ConstructorArguments& args, const TypePtr& result,
-                              std::unordered_map<std::string, TypePtr>& vars) {
+                              std::unordered_map<std::string, TypePtr>& vars,
+                              const std::string& cname = "") {
     auto* r = std::get_if<Pcstr_record>(&args);
     if (!r) return;
+    std::vector<std::pair<std::string, TypePtr>> own;
     for (auto& f : r->fields) {
       if (std::holds_alternative<Ptyp_poly>(f.type->desc) &&
           !(record_kinds_ && mentions_format(*f.type)))
         continue;
-      field_candidates_[f.name.txt].push_back(
-          eng.arrow(result, from_coretype(*f.type, vars)));
+      TypePtr a = eng.arrow(result, from_coretype(*f.type, vars));
+      field_candidates_[f.name.txt].push_back(a);
+      own.emplace_back(f.name.txt, a);
     }
+    if (!cname.empty() && own.size() == r->fields.size())
+      inline_ctor_fields_[cname].push_back(std::move(own));
+  }
+
+  // The one inline record declared for constructor `cname`, or null when the
+  // name is unknown or declared more than once (then the pattern's record type
+  // really is ambiguous and the registry path stays in charge).
+  const std::vector<std::pair<std::string, TypePtr>>* inline_ctor_record(
+      const std::string& cname) const {
+    auto it = inline_ctor_fields_.find(cname);
+    if (it == inline_ctor_fields_.end() || it->second.size() != 1)
+      return nullptr;
+    return &it->second.front();
+  }
+
+  // Mark a constructor's record sub-pattern so the Ppat_record branch binds its
+  // fields from the ctor's OWN inline record.  Returns false (leaving the arg
+  // to the plain path) unless the ctor names exactly one inline record.
+  bool mark_inline_ctor_pat(const Longident& id, const Pattern& arg) {
+    static const bool off = std::getenv("NOINLCTORPAT") != nullptr;
+    if (off || !std::holds_alternative<Ppat_record>(arg.desc)) return false;
+    std::string cn = lid_last(id);
+    if (!inline_ctor_record(cn)) return false;
+    pat_inline_ctor_[&arg] = std::move(cn);
+    return true;
   }
 
   // Register an exception/extension constructor: A of t1*..*tn => t1->..->tn->exn.
@@ -4485,7 +4532,8 @@ struct Checker {
       if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
-      register_inline_record(d->args, eng.constr("exn"), vars);  // `exception E of { f }`
+      // `exception E of { f }`
+      register_inline_record(d->args, eng.constr("exn"), vars, ec.name.txt);
     }
     if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
     ctors[ec.name.txt] = scheme;
@@ -4552,7 +4600,8 @@ struct Checker {
       if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
         for (auto it = tup->elems.rbegin(); it != tup->elems.rend(); ++it)
           scheme = eng.arrow(from_coretype(**it, vars), scheme);
-      register_inline_record(d->args, result, vars);  // `type t += C of { f }`
+      // `type t += C of { f }`
+      register_inline_record(d->args, result, vars, ec.name.txt);
       if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
       ctors[ec.name.txt] = scheme;
       if (!is_exn) ext_ctor_scheme_[&ec] = scheme;  // for in-scope cenv overlay
@@ -5212,11 +5261,16 @@ struct Checker {
           // registration: scheme = result only, fields via field_candidates_
           // (a pattern `C { f }` resolves f through the field registry).
           if (c.is_inline_record) {
+            std::vector<std::pair<std::string, TypePtr>> own;
             for (auto& l : c.inline_record) {
               TypePtr fa = eng.arrow(result, from_cmi(l.type, memo));
               eng.generalize(fa);
+              own.emplace_back(l.name, fa);
               field_candidates_[l.name].push_back(std::move(fa));
             }
+            std::string key = path + "." + td.name + "." + c.name;
+            if (inline_ctor_seen_.insert(key).second)
+              inline_ctor_fields_[c.name].push_back(std::move(own));
             eng.generalize(result);
             cenv.back()[c.name] = result;
             continue;
@@ -8471,7 +8525,14 @@ struct Checker {
             else if (!ps.empty()) {
               try_unify(ps[0], infer_pat(**k->arg));
               record_pat_record_arg_type(k->arg->get(), ps[0]);
-            } else infer_pat(**k->arg);
+            } else {
+              bool inl = mark_inline_ctor_pat(k->id.txt, **k->arg);
+              TypePtr at = infer_pat(**k->arg);
+              if (inl) {
+                pat_inline_ctor_.erase(k->arg->get());
+                try_unify(result, at);
+              }
+            }
           }
           return result;
         }
@@ -8507,7 +8568,12 @@ struct Checker {
           record_pat_ctor_arg_type(k->arg->get(), ps[0]);
           record_pat_record_arg_type(k->arg->get(), ps[0]);
         } else {
-          infer_pat(**k->arg);
+          bool inl = mark_inline_ctor_pat(k->id.txt, **k->arg);
+          TypePtr at = infer_pat(**k->arg);
+          if (inl) {
+            pat_inline_ctor_.erase(k->arg->get());
+            try_unify(result, at);
+          }
         }
       }
       return result;
@@ -8589,6 +8655,36 @@ struct Checker {
       return t;
     }
     if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      // The argument of an INLINE-RECORD constructor: the record type is the
+      // ctor's own, so bind every label from its declaration.  All-or-nothing
+      // -- a label the ctor does not declare means we mis-identified the ctor,
+      // and the registry path below is the safer answer.
+      if (auto ic = pat_inline_ctor_.find(&p); ic != pat_inline_ctor_.end()) {
+        const auto* own = inline_ctor_record(ic->second);
+        std::vector<TypePtr> arrows;
+        bool all = own && !r->fields.empty();
+        for (auto& [lid, sub] : r->fields) {
+          if (!all) break;
+          std::string ln = lid_last(lid.txt);
+          TypePtr a = nullptr;
+          for (auto& [fn, fa] : *own) if (fn == ln) { a = fa; break; }
+          if (!a) { all = false; break; }
+          arrows.push_back(a);
+        }
+        if (all) {
+          TypePtr dom = nullptr;
+          size_t ai = 0;
+          for (auto& [lid, sub] : r->fields) {
+            TypePtr s = I::Engine::repr(eng.instantiate(arrows[ai++]));
+            if (s->kind != I::Type::Kind::Arrow) {
+              bind_pat_any(*sub); continue;
+            }
+            if (dom) try_unify(dom, s->dom); else dom = s->dom;
+            try_unify(infer_pat(*sub), s->cod);
+          }
+          return dom ? dom : eng.fresh_var();
+        }
+      }
       // Expected type from a functor-application abbreviation annotation: bind
       // every field from the EXPANDED record's cmi decl (type-directed, like
       // ocamlc -- the labels need not be in scope), pinning the record's type
