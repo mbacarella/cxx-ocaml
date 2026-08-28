@@ -514,6 +514,26 @@ struct Checker {
   std::vector<std::tuple<const Expression*, TypePtr, std::string>> pending_field_;
   void resolve_pending_fields() {
     for (auto& [e, bt, lbl] : pending_field_) {
+      TypePtr rb0 = I::Engine::repr(bt);
+      // The same fixpoint serves the field READ's own TYPE.  A label the
+      // registry finds AMBIGUOUS gets a fresh var at the read site, and when
+      // the base is still a var there is nothing else to go on -- but once the
+      // base resolves, it NAMES its record, so the accessor declared on
+      // exactly that record types the read.  typecore's `l.txt = lab.txt`
+      // (base `Asttypes.label Asttypes.loc`, `txt` declared by BOTH
+      // Asttypes.loc and Location.loc, which the former re-exports) kept a
+      // fresh var and stayed on the generic caml_equal where ocamlc emits
+      // caml_string_equal.  Only a STILL-FREE recorded var is filled in.
+      if (!base_field_off() && rb0->kind == I::Type::Kind::Constr)
+        if (auto rit = rec_expr_.find(e); rit != rec_expr_.end())
+          if (I::Engine::repr(rit->second)->kind == I::Type::Kind::Var)
+            if (TypePtr fa = ext_field_arrow_at(rb0->path, lbl)) {
+              TypePtr s = I::Engine::repr(eng.instantiate(fa));
+              if (s->kind == I::Type::Kind::Arrow) {
+                try_unify(bt, s->dom);
+                try_unify(rit->second, s->cod);
+              }
+            }
       if (field_resolved_.count(e)) continue;
       TypePtr rb = I::Engine::repr(bt);
       if (rb->kind != I::Type::Kind::Constr) continue;
@@ -7243,6 +7263,36 @@ struct Checker {
       // The record must live in M itself, not in a submodule of it.
       if (d->path.rfind(pfx, 0) != 0) continue;
       if (d->path.find('.', pfx.size()) != std::string::npos) continue;
+      if (found) return nullptr;
+      found = a;
+    }
+    return found;
+  }
+
+  // Revert hook for the base-typed field resolution below.
+  static bool base_field_off() {
+    static const bool off = std::getenv("NOBASEFIELD") != nullptr;
+    return off;
+  }
+
+  // The accessor arrow of `label` on the record type named EXACTLY by `path`.
+  // A field READ whose base type is already known needs no registry vote --
+  // the base names its record -- so a same-named label of some other unit's
+  // record must not make it ambiguous: typecore's `lab.txt` has a base of
+  // `Asttypes.label Asttypes.loc`, yet `txt` is declared by BOTH Asttypes.loc
+  // and Location.loc (the former re-exports the latter), and the bare-name
+  // registry saw only the clash.  Null when no loaded record at that path
+  // declares the label, or more than one does.
+  TypePtr ext_field_arrow_at(const std::string& path,
+                             const std::string& label) {
+    auto it = ext_fields_.find(label);
+    if (it == ext_fields_.end()) return nullptr;
+    TypePtr found = nullptr;
+    for (auto& a : it->second) {
+      TypePtr s = I::Engine::repr(a);
+      if (s->kind != I::Type::Kind::Arrow) continue;
+      TypePtr d = I::Engine::repr(s->dom);
+      if (d->kind != I::Type::Kind::Constr || d->path != path) continue;
       if (found) return nullptr;
       found = a;
     }
