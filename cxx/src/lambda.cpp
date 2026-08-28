@@ -5053,6 +5053,9 @@ struct Translator {
     if (!me) return;
     auto* ps = std::get_if<Pmod_structure>(&me->desc);
     if (!ps) return;
+    // This struct's own bindings in declaration order, so a member that TAIL-
+    // APPLIES an earlier sibling inherits that sibling's residual parameters.
+    std::unordered_map<std::string, FnSig> sibling;
     for (auto& it : ps->items) {
       auto* pv = std::get_if<Pstr_value>(&it.desc);
       if (!pv) continue;
@@ -5062,6 +5065,29 @@ struct Translator {
         auto* fn = std::get_if<Pexp_function>(&b.expr->desc);
         if (!fn) continue;
         FnSig fs = fn_param_labels(*fn);
+        // A member whose body TAIL-APPLIES a labelled function leaves that
+        // callee's unsupplied parameters in ITS OWN type -- out_type's
+        // `let add_printed ty = add_printed_proxy (proxy ty)` is
+        // `ty -> non_gen:bool -> unit` -- so `Aliases.add_printed
+        // ~non_gen:false` is an OUT-OF-ORDER partial application and must
+        // eta-expand (translcore's build_apply).  With no recorded sig it
+        // applied VERBATIM, feeding `false` as the FIRST argument.  Mirrors
+        // record_fn_sig's residual append for a local let.
+        if (!mod_resid_sig_off())
+          if (const Expression* tl = fn_tail_expr(*fn))
+            if (auto* ap = std::get_if<Pexp_apply>(&tl->desc)) {
+              FnSig callee;
+              if (auto* fid = std::get_if<Pexp_ident>(&ap->fn->desc))
+                if (auto* fl = std::get_if<Lident>(&fid->id.txt.v))
+                  if (auto sit = sibling.find(fl->name); sit != sibling.end())
+                    callee = sit->second;
+              if (callee.empty()) callee = callee_sig(ap->fn.get());
+              if (!callee.empty()) {
+                FnSig resid = residual_after_apply(callee, ap->args);
+                fs.insert(fs.end(), resid.begin(), resid.end());
+              }
+            }
+        sibling[nmp->name.txt] = fs;
         for (auto& [k, n] : fs)
           if (k != 0) {
             local_member_sig_[nm].emplace(nmp->name.txt, fs);
@@ -5069,6 +5095,11 @@ struct Translator {
           }
       }
     }
+  }
+  // Revert hook for the tail-apply residual half of the harvest above.
+  static bool mod_resid_sig_off() {
+    static const bool off = std::getenv("NOMODRESIDSIG") != nullptr;
+    return off;
   }
   static FnSig fn_param_labels(const Pexp_function& f) {
     FnSig v;
