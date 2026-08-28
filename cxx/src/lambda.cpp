@@ -2159,8 +2159,16 @@ struct Translator {
   // OVERRIDING a wrong global resolution, scoped to one match.  `Named` is shared
   // by 6 types at arities 1/2/3; a `match (arg_opt : Parsetree.functor_parameter)
   // with Named (param, smty)` must use arity 2, not the last-registered arity 1.
-  CtorSave force_register_type_ctors(const std::string& path) {
+  CtorSave force_register_type_ctors(const std::string& path0) {
     CtorSave saved;
+    // The typer records the path AS WRITTEN, so a type reached through a
+    // module alias arrives spelled at the alias (`module Err =
+    // Includemod.Error` makes it `Err.functor_arg_descr`).  The head is then a
+    // local module and every lookup below declines, leaving a bare pattern ctor
+    // to the flat map -- where a same-struct `type fp = Unit | ..` squats the
+    // name and the row takes ITS tag.  Expand the alias head first.
+    const std::string path =
+        cppcaml::dbg_env("NOALIASTYPE") ? path0 : expand_alias_head(path0);
     auto d = path.rfind('.');
     if (d == std::string::npos) return saved;
     std::string mod = path.substr(0, d), ty = path.substr(d + 1);
@@ -4146,6 +4154,9 @@ struct Translator {
   std::unordered_map<std::string, SubMod> submod_cache_;
   // local alias name -> stdlib submodule dotted path (`module MP = Gc.Memprof`)
   std::unordered_map<std::string, std::string> submod_alias_;
+  // ... and the same for an alias whose target is a module of THIS unit
+  // (`module Err = Error`), which submod_alias_ deliberately does not hold.
+  std::unordered_map<std::string, std::string> local_mod_alias_;
   // Expand a leading submodule-alias component to its target path: with
   // `module S = Misc.Stdlib.String`, `S.Map` -> `Misc.Stdlib.String.Map` (so the
   // env.ml chain `module NameMap = S.Map` and `S.Map.empty` resolve).
@@ -4154,7 +4165,13 @@ struct Translator {
       size_t d = dotted.find('.');
       std::string head = d == std::string::npos ? dotted : dotted.substr(0, d);
       auto it = submod_alias_.find(head);
-      if (it == submod_alias_.end()) break;
+      if (it == submod_alias_.end()) {
+        auto lo = local_mod_alias_.find(head);
+        if (lo == local_mod_alias_.end() ||
+            cppcaml::dbg_env("NOALIASTYPE"))
+          break;
+        it = lo;
+      }
       dotted = it->second + (d == std::string::npos ? "" : dotted.substr(d));
     }
     return dotted;
@@ -12865,7 +12882,11 @@ struct Translator {
     const CtorInfo* amb = base != ctor_info_.end() ? &base->second : nullptr;
     auto pc = vk.pat_constr.find(p);
     if (pc == vk.pat_constr.end()) return amb;
-    auto dot = pc->second.rfind('.');
+    // Spelled at the alias (`Err.d` for `module Err = Error`): every per-type
+    // table below is keyed by the DECLARED path, so expand before looking.
+    const std::string pcty = cppcaml::dbg_env("NOALIASTYPE")
+                                 ? pc->second : expand_alias_head(pc->second);
+    auto dot = pcty.rfind('.');
     if (dot == std::string::npos) {
       // A DOTLESS pat_constr names a FILE-LOCAL type: the ctor-arg
       // disambiguation records the enclosing ctor's declared arg type by its
@@ -12875,12 +12896,12 @@ struct Translator {
       // its construction (else producer/consumer tags diverge -> miscompile).
       // "exn" (and any bare name with no per-type table) falls through to amb
       // unchanged.
-      if (amb && amb->type == pc->second) return amb;
-      if (auto ti = type_ctor_info_.find(pc->second); ti != type_ctor_info_.end())
+      if (amb && amb->type == pcty) return amb;
+      if (auto ti = type_ctor_info_.find(pcty); ti != type_ctor_info_.end())
         if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
       return amb;
     }
-    std::string mod = pc->second.substr(0, dot), ty = pc->second.substr(dot + 1);
+    std::string mod = pcty.substr(0, dot), ty = pcty.substr(dot + 1);
     // The ambient entry agrees on the bare type NAME, but that is not identity:
     // Diffing.change and Diffing_with_keys.change both answer to "change", and
     // includecore's `Change` pattern at the former (block tag 3) silently took
@@ -12904,7 +12925,7 @@ struct Translator {
     // behavior stands everywhere else.
     static const bool no_ctor_arity_r = cppcaml::dbg_env("NOCTORARITY");
     if (!no_ctor_arity_r && amb && amb->type == ty)
-      if (auto ti = type_ctor_info_.find(pc->second); ti != type_ctor_info_.end())
+      if (auto ti = type_ctor_info_.find(pcty); ti != type_ctor_info_.end())
         if (auto ci = ti->second.find(cn);
             ci != ti->second.end() &&
             (ci->second.is_block != amb->is_block || ci->second.tag != amb->tag ||
@@ -12916,7 +12937,7 @@ struct Translator {
     // keeps the sibling's entry, and the bare per-type table is not filled for
     // it either.  The registration records the qualified key the typer already
     // put in pat_constr, so consult it here before the bare-name fallbacks.
-    if (auto ti = type_ctor_info_.find(pc->second); ti != type_ctor_info_.end())
+    if (auto ti = type_ctor_info_.find(pcty); ti != type_ctor_info_.end())
       if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
     if (auto ti = type_ctor_info_.find(ty); ti != type_ctor_info_.end())  // a local type
       if (auto ci = ti->second.find(cn); ci != ti->second.end()) return &ci->second;
@@ -33103,6 +33124,7 @@ struct Translator {
                 } else {
                   // a local-path alias adopts the source's layout subtree
                   // (module D = B / module Y = X.M), nested keys included
+                  local_mod_alias_[nm] = dotted;
                   copy_layout_subtree(dotted, nm);
                 }
               }
