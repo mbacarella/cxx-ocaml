@@ -7214,6 +7214,59 @@ struct Checker {
     // any/constant/etc: nothing to bind
   }
 
+  // Revert hook for the qualified-label resolution below (load + lookup).
+  static bool qual_label_preload_off() {
+    static const bool off = std::getenv("NOQUALLBLLOAD") != nullptr;
+    return off;
+  }
+
+  // The accessor arrow of a MODULE-QUALIFIED label `M.lbl`, taken from a record
+  // declared directly in M.  The qualification names the module exactly, so a
+  // same-named label of some other unit's record must NOT make it ambiguous:
+  // typecore's `{Primitive.prim_name; _}` is `string`, while Typedtree (also
+  // opened there) declares `prim_name : string loc` on primitive_coercion, and
+  // the bare-name registry saw only the clash.  Null when M declares no such
+  // label, or more than one of its records does.
+  TypePtr qualified_ext_field_arrow(const Longident& m,
+                                    const std::string& label) {
+    auto it = ext_fields_.find(label);
+    if (it == ext_fields_.end()) return nullptr;
+    std::string pfx = lid_full(m) + ".";
+    // A locally bound module shadowing the unit name owns the qualification.
+    if (bound_module_names_.count(pfx.substr(0, pfx.find('.')))) return nullptr;
+    TypePtr found = nullptr;
+    for (auto& a : it->second) {
+      TypePtr s = I::Engine::repr(a);
+      if (s->kind != I::Type::Kind::Arrow) continue;
+      TypePtr d = I::Engine::repr(s->dom);
+      if (d->kind != I::Type::Kind::Constr) continue;
+      // The record must live in M itself, not in a submodule of it.
+      if (d->path.rfind(pfx, 0) != 0) continue;
+      if (d->path.find('.', pfx.size()) != std::string::npos) continue;
+      if (found) return nullptr;
+      found = a;
+    }
+    return found;
+  }
+
+  // Whether a pattern's own head fixes its type with no expected type from the
+  // context: a constructor, polymorphic variant, constant or annotated
+  // pattern, possibly under an alias.  A bare binder/wildcard is NOT
+  // self-typing -- it takes whatever the context gives -- and a tuple/record
+  // only pushes the question down to its components.
+  static bool self_typing_pat(const Pattern& p) {
+    static const bool off = std::getenv("NOAMBFIELDPAT") != nullptr;
+    if (off) return false;
+    if (std::holds_alternative<Ppat_construct>(p.desc) ||
+        std::holds_alternative<Ppat_variant>(p.desc) ||
+        std::holds_alternative<Ppat_constant>(p.desc) ||
+        std::holds_alternative<Ppat_constraint>(p.desc))
+      return true;
+    if (auto* al = std::get_if<Ppat_alias>(&p.desc))
+      return self_typing_pat(*al->p);
+    return false;
+  }
+
   // Bind a polymorphic record field's sub-pattern to the field's generic scheme
   // `fldTy` (venv holds schemes; lookup instantiates -> per-use polymorphism).
   // Only a plain binder (`{pf}` / `{pf = q}` / `pf as x`) is supported; anything
@@ -8710,6 +8763,18 @@ struct Checker {
           return exp;
         }
       }
+      // A MODULE-QUALIFIED label names its record's module exactly, so load
+      // that module's fields first: nothing else in typecore mentions
+      // `Primitive`, so `{val_kind = Val_prim {Primitive.prim_name; _}}` found
+      // an empty registry and bound prim_name to Any -- and `prim_name = name`
+      // stayed on caml_equal where ocamlc emits caml_string_equal.  Same
+      // codegen-pass-only gating as the annotation preload: loading a module
+      // can make a label AMBIGUOUS, which is the correct answer but must not
+      // perturb the strict pass.
+      if (record_kinds_ && !qual_label_preload_off())
+        for (auto& [lid, sub] : r->fields)
+          if (auto* d = std::get_if<Ldot>(&lid.txt.v))
+            load_module_record_fields(*d->prefix);
       // Type fields via the unique-label registry; an ambiguous/unknown label's
       // sub-pattern vars bind to Any (a polymorphic field used at several types
       // must not clash through one monomorphic var).
@@ -8731,6 +8796,17 @@ struct Checker {
       for (auto& [lid, sub] : r->fields)
         if (field_candidates_.count(lid_last(lid.txt))) { any_local = true; break; }
       for (auto& [lid, sub] : r->fields) {
+        // `M.lbl` resolves in M, ahead of the bare-name registry.
+        if (record_kinds_ && !qual_label_preload_off())
+          if (auto* d = std::get_if<Ldot>(&lid.txt.v))
+            if (TypePtr qa = qualified_ext_field_arrow(*d->prefix, d->name)) {
+              TypePtr s = I::Engine::repr(eng.instantiate(qa));
+              if (s->kind == I::Type::Kind::Arrow) {
+                try_unify(infer_pat(*sub), s->cod);
+                if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
+                continue;
+              }
+            }
         auto it = fields_.find(lid_last(lid.txt));
         // A format-poly field is in BOTH maps (kind pass); the pattern binds
         // the GENERALIZED poly scheme so each body use instantiates fresh.
@@ -8797,6 +8873,16 @@ struct Checker {
               continue;
             }
           }
+          // A sub-pattern whose OWN head fixes its type needs no expected type
+          // at all: `{txt = Lident s}` binds s : string from Lident's payload
+          // however the record is disambiguated.  bind_pat_any drops that (it
+          // walks a ctor's argument without ever consulting the ctor), which
+          // is what left pprintast's record-pun guard `s = txt` on the generic
+          // caml_equal where ocamlc emits caml_string_equal.  Only the SUB-
+          // pattern is typed -- recTy stays ambiguous -- and a bare binder
+          // keeps its fresh-var binding, so a polymorphic field used at
+          // several types still cannot clash through one monomorphic var.
+          if (!strict && self_typing_pat(*sub)) { infer_pat(*sub); continue; }
           bind_pat_any(*sub); continue;
         }
         TypePtr s = I::Engine::repr(eng.instantiate(it->second));
