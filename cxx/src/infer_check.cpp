@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "cppcaml/cmi.hpp"
+#include "cppcaml/dbgenv.hpp"
 
 namespace cppcaml {
 
@@ -9294,6 +9295,15 @@ struct Checker {
         eslots.push_back({false, a->arrow_label, a->arrow_lbl});
         a = I::Engine::repr(a->cod);
         ex = I::Engine::repr(ex->cod);
+        // ocamlc's make_args (typecore.ml:6645) collects ONLY the leading run
+        // of OPTIONAL arrows and STOPS at the first Nolabel one; `func` then
+        // eta-expands with exactly ONE parameter (`var_pair "eta" ty_arg`,
+        // typecore.ml:6695) and leaves the rest of the arrow CURRIED.  Taking
+        // every kept parameter builds a wider closure than ocamlc's -- env's
+        // `Predef.build_initial_env (add_type ~check:false) ..` came out
+        // `(function eta eta eta (apply arg 0 eta eta eta))` against ocamlc's
+        // `(function eta (apply arg 0 eta))`, an extra RESTART/GRAB pair.
+        if (!dbg_env("NOETA1")) break;
       }
       // Need at least one erased optional and at least one kept (eta) parameter:
       // a trailing-only optional with nothing after it isn't eta-expandable here.
