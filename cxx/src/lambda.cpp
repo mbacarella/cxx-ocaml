@@ -10261,7 +10261,7 @@ struct Translator {
       auto& b = l->bindings[i];
       bool subst = false;
       if (b.val && !b.mut) {
-        if (b.val->k == Lam::K::Var) {
+        if (b.val->k == Lam::K::Var && !b.no_var_subst) {
           subst = true;                 // a Var alias is substituted regardless of count
         } else if (b.alias &&
                    (is_alias_dup(b.val) || is_incl_field_alias(b.val) ||
@@ -27607,13 +27607,25 @@ struct Translator {
         // Not on a recursive binding's spine, though: the rec-value compiler
         // chooses its strategy (dummy-context vs direct letrec) from the RHS's
         // SYNTACTIC shape, before simplif inlines -- inlining here would flip it.
-        if (rhs->k == Lam::K::Var && !rec_spine) {
+        // And not when the source RHS is itself a `let`: simplif matches that
+        // rule on the UN-simplified lambda, so `let x = (let y = w in y)` keeps
+        // x bound to whatever the inner chain reduces to.  menhir writes every
+        // semantic value that way (`let attrs2 = let _1 = _1_inlined2 in _1`),
+        // which is most of parser.cmo's residual diff.  NOSRCLETSTRICT reverts.
+        static const bool srclet_off = cppcaml::dbg_env("NOSRCLETSTRICT");
+        const Expression* rsrc = b.expr.get();
+        while (auto* ct = std::get_if<Pexp_constraint>(&rsrc->desc))
+          rsrc = ct->e.get();
+        bool src_let =
+            !srclet_off && std::holds_alternative<Pexp_let>(rsrc->desc);
+        if (rhs->k == Lam::K::Var && !rec_spine && !src_let) {
           scope.back()[pv->name.txt] = rhs->var;
           record_fn_sig(rhs->var, b.expr.get(), binding_annot(b));
           return;
         }
         Ident id = fresh(pv->name.txt);
-        out.push_back({id, pat_kind(&b.pat), std::move(rhs)});
+        out.push_back({id, pat_kind(&b.pat), std::move(rhs), false, false,
+                       false, src_let});
         // record BEFORE binding the name: in this non-recursive let, the RHS's
         // own references resolve to the OUTER binding (`let f .. = f ..` wrapping
         // an outer f), which is what the residual-signature analysis must see.

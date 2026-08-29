@@ -154,8 +154,13 @@ struct Lam {
   // to a sub-term of the scrutinee (e.g. `Some y` where y is used more than once).
   // mut: the Llet Mutable kind (printed `=mut`), a mutable local variable (an
   // un-escaping `ref`); read via Mutvar (`*x`) and written via Assign.
+  // no_var_subst: Simplif's `Llet(_, _, v, Lvar w, body)` rule (simplif.ml:549)
+  // matches the UN-simplified right-hand side, so a source `let x = (let y = w
+  // in y)` keeps x bound however far its value collapses.  We collapse while
+  // translating, so the binding carries the verdict instead.
   struct Binding { Ident id; ValueKind kind; LamPtr val; bool alias = false; bool mut = false;
-                   bool strict_opt = false; };  // strict_opt: the StrictOpt kind, printed `=o`
+                   bool strict_opt = false;  // the StrictOpt kind, `=o`
+                   bool no_var_subst = false; };
   std::vector<Binding> bindings;
 
   // Prim
