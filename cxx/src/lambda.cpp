@@ -767,6 +767,16 @@ struct Translator {
   // corrupting every compiled object.)
   struct OpenShadow { std::string key; size_t depth; };  // module key + scope depth at the open
   std::unordered_map<std::string, OpenShadow> local_open_shadow_;
+  // The same rule in the TYPEXT namespace, and for an IMPORTED module too:
+  // `open M` shadows an earlier same-level `exception E` -- or one an earlier
+  // `include` brought in -- that M also exports.  exn_ident_ / exn_field_ are
+  // flat and position-blind and are consulted first, so without this an
+  // include-bound exception outranked every later open: parser.ml's `include
+  // MenhirBasics` (exception Error) made `raise Syntaxerr.(Error ..)` in
+  // `expecting` / `not_expecting` raise Parser.Error, so the syntax error for
+  // `M.(_)` escaped as a Parse_error instead of being reported.  Set at the
+  // open, ERASED when the name is re-bound at module level afterwards.
+  std::unordered_map<std::string, OpenShadow> local_open_exn_;
   // Object-method translation state.  Inside a method body `cur_self_` is the
   // method's self parameter and `inst_vars_` maps each instance-variable name to
   // its var-id binder (so `n` -> (field_computed self n) and `n<-e` ->
@@ -3161,8 +3171,22 @@ struct Translator {
   // entries it displaces here and restores them on the way out.
   using ShadowSave = std::vector<std::pair<std::string, std::optional<OpenShadow>>>;
   void register_local_open_shadows(const std::string& key, const modsig::SigPtr& s,
-                                   ShadowSave* save = nullptr) {
+                                   ShadowSave* save = nullptr,
+                                   ShadowSave* exn_save = nullptr) {
     if (!s || msig_is_functor(*s)) return;
+    // the TYPEXT rule applies to imported modules as well, so it runs before
+    // the local-module guard below
+    for (auto& it : s->items) {
+      if (it.ns != modsig::NS::Typext || !it.runtime) continue;
+      if (!open_exn_index(key, it.name)) continue;
+      if (exn_save) {
+        auto p = local_open_exn_.find(it.name);
+        std::optional<OpenShadow> prev;
+        if (p != local_open_exn_.end()) prev = p->second;
+        exn_save->emplace_back(it.name, prev);
+      }
+      local_open_exn_[it.name] = {key, scope.size()};
+    }
     if (!module_base(key)) return;               // only local modules
     for (auto& it : s->items) {
       if (it.ns == modsig::NS::Value && it.runtime)
@@ -3176,6 +3200,40 @@ struct Translator {
           local_open_shadow_[it.name] = {key, scope.size()};
         }
     }
+  }
+  void restore_local_open_exn(const ShadowSave& save) {
+    for (auto it = save.rbegin(); it != save.rend(); ++it) {
+      if (it->second) local_open_exn_[it->first] = *it->second;
+      else local_open_exn_.erase(it->first);
+    }
+  }
+  // The export slot of exception `name` in the opened module `key` -- a local
+  // module's own layout, or an imported unit's cmi fields.  Mirrors the two
+  // readers in local_open_exn_value / opened_module_exn_value.
+  std::optional<int> open_exn_index(const std::string& key,
+                                    const std::string& name) {
+    if (module_base(key)) return local_member_index(key, name);
+    if (key.find('.') != std::string::npos) return std::nullopt;  // submodule
+    auto& fm = fields_of(key);
+    if (auto f = fm.find(name); f != fm.end()) return f->second;
+    return std::nullopt;
+  }
+  // The identity of a bare exception the innermost enclosing `open` exports,
+  // or null when no open shadows it.
+  LamPtr local_open_exn_value(const std::string& name) {
+    static const bool off = cppcaml::dbg_env("NOOPENEXNSHADOW");
+    if (off || local_open_exn_.empty()) return nullptr;
+    auto os = local_open_exn_.find(name);
+    if (os == local_open_exn_.end()) return nullptr;
+    const std::string& key = os->second.key;
+    auto ix = open_exn_index(key, name);
+    if (!ix) return nullptr;
+    if (LamPtr base = module_base(key)) {
+      auto fi = mk(Lam::K::Prim); fi->prim = Prim::FieldImm;
+      fi->prim_arg = *ix; fi->args = {base};
+      return fi;
+    }
+    return field_of(global_of(key), *ix);
   }
   void restore_local_open_shadows(const ShadowSave& save) {
     for (auto it = save.rbegin(); it != save.rend(); ++it) {
@@ -8150,6 +8208,9 @@ struct Translator {
   // The identity value of an exception constructor: a local exception's binder, a
   // predefined exception's Stdlib field, else null (unresolved).
   LamPtr exn_value(const std::string& name) {
+    // a later `open M` shadows both flat maps (see local_open_exn_) -- checked
+    // first, since they carry no position
+    if (LamPtr ov = local_open_exn_value(name)) return ov;
     if (auto ei = exn_ident_.find(name); ei != exn_ident_.end()) {
       auto v = mk(Lam::K::Var); v->var = ei->second; return v;
     }
@@ -24616,10 +24677,11 @@ struct Translator {
           // values too: `Lazy.(sg |> of_signature |> force_signature)` reads
           // force_signature off Lazy, not the outer same-named function that
           // `lookup` finds first (subst.ml).
-          ShadowSave shadow_save;
-          register_local_open_shadows(dotted, osig, &shadow_save);
+          ShadowSave shadow_save, exn_save;
+          register_local_open_shadows(dotted, osig, &shadow_save, &exn_save);
           rec_spine_ = rec_spine;
           LamPtr b = expr(*si->body);
+          restore_local_open_exn(exn_save);
           restore_local_open_shadows(shadow_save);
           menv_.pop_frame();
           opened_.pop_back();
@@ -24656,8 +24718,8 @@ struct Translator {
         modsig::SigPtr osig = msig_result_of_module_expr(op->expr);
         menv_.bind_module(nm, osig);
         bind_opened_members(osig);
-        ShadowSave shadow_save;
-        register_local_open_shadows(nm, osig, &shadow_save);
+        ShadowSave shadow_save, exn_save;
+        register_local_open_shadows(nm, osig, &shadow_save, &exn_save);
         // Upstream gives every item the open makes visible its own identifier,
         // `id =a (field_mut pos open)` (Translcore's Texp_open), and leaves it
         // to Simplif to drop an unused one and inline a single use.  A member
@@ -24696,6 +24758,7 @@ struct Translator {
           else module_alias_.erase(it2->nm);
         }
         restore_local_types(tundo);
+        restore_local_open_exn(exn_save);
         restore_local_open_shadows(shadow_save);
         menv_.pop_frame();
         opened_.pop_back();
@@ -24822,6 +24885,13 @@ struct Translator {
         // save what this local exception shadows, restore after the body
         bool had_i = exn_ident_.count(nm), had_a = exn_arity_.count(nm);
         Ident sav_i = had_i ? exn_ident_[nm] : Ident{};
+        // ... including a shadowing `open M` recorded in local_open_exn_: this
+        // declaration is NEARER than the open, so it wins over the body
+        ShadowSave exn_open_save;
+        if (auto os = local_open_exn_.find(nm); os != local_open_exn_.end()) {
+          exn_open_save.emplace_back(nm, os->second);
+          local_open_exn_.erase(os);
+        }
         int sav_a = had_a ? exn_arity_[nm] : 0;
         bool had_r = exn_rlabels_.count(nm);
         std::vector<std::string> sav_r = had_r ? exn_rlabels_[nm] : std::vector<std::string>{};
@@ -24838,6 +24908,7 @@ struct Translator {
         }
         rec_spine_ = rec_spine;
         LamPtr body = expr(*si->body);
+        restore_local_open_exn(exn_open_save);
         if (had_i) exn_ident_[nm] = sav_i; else exn_ident_.erase(nm);
         if (had_a) exn_arity_[nm] = sav_a; else exn_arity_.erase(nm);
         if (had_r) exn_rlabels_[nm] = std::move(sav_r); else exn_rlabels_.erase(nm);
@@ -32022,6 +32093,10 @@ struct Translator {
     // stdlib (sub)modules `include`d here (canonical dotted/bare names): a `: S`
     // coercion eta-stubs S members that are PRIMITIVES of these (no runtime field).
     std::vector<std::string> inc_stdlib_mods;
+    // ... and the exn shadows those opens installed, undone with them: unlike
+    // local_open_shadow_ (whose local-module guards go stale on their own), an
+    // IMPORTED module's global stays readable outside the structure.
+    ShadowSave struct_exn_save;
     auto flush = [&] { if (!cur.empty()) segs.push_back({false, false, std::move(cur), nullptr}), cur.clear(); };
     auto add_export_val = [&](const std::string& nm, LamPtr v,
                               modsig::NS ns = modsig::NS::Value,
@@ -32029,6 +32104,14 @@ struct Translator {
       // A module-level value binding of `nm` after a shadowing `open M`
       // re-shadows M (declaration order): drop any recorded open-shadow.
       if (ns == modsig::NS::Value) local_open_shadow_.erase(nm);
+      // ... and the same for an exception, undoably: the erase lasts to the
+      // END OF THIS STRUCTURE, so a nested `module A = struct exception E end`
+      // does not cancel an enclosing open's shadow for good.
+      if (ns == modsig::NS::Typext)
+        if (auto os = local_open_exn_.find(nm); os != local_open_exn_.end()) {
+          struct_exn_save.emplace_back(nm, os->second);
+          local_open_exn_.erase(os);
+        }
       // a redefinition (shadow) moves the name to its last definition's
       // position -- but only within the SAME namespace (or across an Unknown
       // flat-splice), mirroring cursig.push exactly so the two stay aligned.
@@ -32256,7 +32339,7 @@ struct Translator {
           opened_.push_back(dotted); ++n_opens;
           modsig::SigPtr osig = msig_of_module_path(dotted);
           bind_opened_members(osig);
-          register_local_open_shadows(dotted, osig);
+          register_local_open_shadows(dotted, osig, nullptr, &struct_exn_save);
         } else {
           // a generalized open (`open F(X)` / `open struct..end` / `open (M:S)`)
           // binds the module value like ocamlc's open/N and opens it under a
@@ -32274,7 +32357,7 @@ struct Translator {
           modsig::SigPtr osig = msig_result_of_module_expr(op->expr);
           menv_.bind_module(nm, osig);
           bind_opened_members(osig);
-          register_local_open_shadows(nm, osig);
+          register_local_open_shadows(nm, osig, nullptr, &struct_exn_save);
         }
         continue;
       }
@@ -34118,6 +34201,7 @@ struct Translator {
       }
     }
     for (int i = 0; i < n_opens; ++i) opened_.pop_back();
+    restore_local_open_exn(struct_exn_save);
     menv_.pop_frame();
     scope.pop_back();
     last_inc_stdlib_ = std::move(inc_stdlib_mods);
