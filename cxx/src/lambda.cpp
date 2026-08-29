@@ -9270,26 +9270,59 @@ struct Translator {
         std::vector<std::pair<Ident, LamPtr>> temps;
         std::vector<std::vector<std::pair<Ident, LamPtr>>> sub_binders;
         bool ok = true;
+        // ocamlc stamps a record pattern's binders while TYPING it, and
+        // typecore sorts the label list by declaration index first, so the
+        // stamps run in ASCENDING declaration order however the labels were
+        // written.  matching.ml then READS an all-immutable record's fields by
+        // DESCENDING declaration index.  The closure-env layout follows the
+        // STAMPS and the let nesting follows the READS, so the two orders must
+        // be kept apart: collect ascending, emit in record_read_order.  (An exn
+        // inline record carries no recorded mutability -- exn_inline_labels
+        // yields labels only -- so the all-immutable order is what applies.)
+        struct FldBind {
+          std::vector<std::pair<Ident, LamPtr>> binders, sb;
+          std::pair<Ident, LamPtr> temp;
+          bool has_temp = false;
+        };
+        std::vector<int> ixs;
         for (auto& [lbl, sub] : pr->fields) {
           int idx = -1;
           for (int i = 0; i < (int)labels.size(); ++i)
             if (labels[i] == lid_last(lbl.txt)) { idx = i; break; }
           if (idx < 0) { ok = false; break; }
-          const Pattern* fp = effective_pat(sub.get());
-          LamPtr acc = fieldimm(idx + 1, exv());
+          ixs.push_back(idx);
+        }
+        if (!ok) { scope.pop_back(); return nullptr; }
+        bool src_order = cppcaml::dbg_env("NOEXNRECORDER");
+        std::vector<size_t> asc(ixs.size());
+        for (size_t i = 0; i < asc.size(); ++i) asc[i] = i;
+        if (!src_order)
+          std::stable_sort(asc.begin(), asc.end(),
+                           [&](size_t a, size_t b) { return ixs[a] < ixs[b]; });
+        std::vector<FldBind> fbs(ixs.size());
+        for (size_t o : asc) {
+          const Pattern* fp = effective_pat(pr->fields[o].second.get());
+          LamPtr acc = fieldimm(ixs[o] + 1, exv());
           if (std::holds_alternative<Ppat_any>(fp->desc)) continue;
+          FldBind& fb = fbs[o];
           if (std::holds_alternative<Ppat_var>(fp->desc) ||
               std::holds_alternative<Ppat_alias>(fp->desc))
-            ok = collect_binders(*fp, acc, binders);
+            ok = collect_binders(*fp, acc, fb.binders);
           else if (is_irrefutable(*fp)) {
             Ident tv = fresh("", true); auto tvv = mk(Lam::K::Var); tvv->var = tv;
-            std::vector<std::pair<Ident, LamPtr>> sb;
-            ok = collect_binders(*fp, tvv, sb);
-            temps.push_back({tv, acc}); sub_binders.push_back(std::move(sb));
+            ok = collect_binders(*fp, tvv, fb.sb);
+            fb.temp = {tv, acc}; fb.has_temp = true;
           } else ok = false;
           if (!ok) break;
         }
         if (!ok) { scope.pop_back(); return nullptr; }
+        for (size_t o : src_order ? asc : record_read_order(ixs, {})) {
+          FldBind& fb = fbs[o];
+          for (auto& b : fb.binders) binders.push_back(b);
+          if (fb.has_temp) {
+            temps.push_back(fb.temp); sub_binders.push_back(std::move(fb.sb));
+          }
+        }
         LamPtr body = with_guard();
         scope.pop_back();
         for (auto& sb : sub_binders) body = wrap_binders(body, sb);
