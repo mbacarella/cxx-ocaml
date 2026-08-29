@@ -21155,8 +21155,19 @@ struct Translator {
       comps.push_back(v);
     }
     std::vector<GArm> arms(srcs.size());
-    for (size_t i = 0; i < srcs.size(); ++i)
+    for (size_t i = 0; i < srcs.size(); ++i) {
       arms[i] = setup_garm(srcs[i].first->lhs, srcs[i].first->rhs);
+      // precompile_or runs on the UNFLATTENED matrix, so an arm whose whole
+      // pattern is a root or IS the or-row there: pat_bound_idents_full of that
+      // or (matching.ml:1821) is every ident the arm binds, and they travel
+      // through the arm's exit as the handler's catch PARAMETERS.  The tuple
+      // flattening happens AFTER explode_or_pat, so by the time these columns
+      // exist the or is gone and the column-0 rule never sees it -- without
+      // this the alias/re-read rules below drop the parameter and the handler
+      // reads the scrutinee component directly.  NOROOTORPV reverts.
+      if (srcs[i].second.size() > 1 && !cppcaml::dbg_env("NOROOTORPV"))
+        gm_orp_pv_[arms[i].aid] = arms[i].vnames;
+    }
     std::vector<MRow> mrows;
     for (size_t i = 0; i < srcs.size(); ++i)
       for (auto& cols : srcs[i].second) {
