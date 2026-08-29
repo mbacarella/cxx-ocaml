@@ -5408,15 +5408,38 @@ struct Translator {
   // (qualified, or a bare name under the wrapping local open) gets its source's
   // parameter signature, so call sites still reorder/fill labelled args
   // (Format.(pp_print_custom_break) was applied with verbatim arg order).
-  void record_tuple_sigs(const Pattern& pat0, const Expression& ex) {
+  // Walk a tuple binding's rhs to the tuple itself, the same spine
+  // tuple_spine_tail walks on the lambda: a local open, a constraint, and any
+  // leading binding or side effect all sit between the binding and its
+  // components (`let f, g = (init (); (mk ~loc, mk ~loc))`).  The last local
+  // open crossed, if any, is reported in *open_mod.
+  const Expression* tuple_rhs_spine(const Expression& ex,
+                                    std::string* open_mod = nullptr) {
     const Expression* e = &ex;
-    std::string open_mod;
-    while (auto* sti = std::get_if<Pexp_struct_item>(&e->desc)) {
-      if (auto* po = std::get_if<Pstr_open>(&sti->item->desc))
-        if (auto* mi = std::get_if<Pmod_ident>(&po->expr.desc))
-          lid_to_dotted(mi->id.txt, open_mod);
-      e = sti->body.get();
+    for (;;) {
+      if (auto* sti = std::get_if<Pexp_struct_item>(&e->desc)) {
+        if (open_mod)
+          if (auto* po = std::get_if<Pstr_open>(&sti->item->desc))
+            if (auto* mi = std::get_if<Pmod_ident>(&po->expr.desc))
+              lid_to_dotted(mi->id.txt, *open_mod);
+        e = sti->body.get(); continue;
+      }
+      if (auto* ct = std::get_if<Pexp_constraint>(&e->desc)) {
+        e = ct->e.get(); continue;
+      }
+      if (auto* pl = std::get_if<Pexp_let>(&e->desc)) {
+        e = pl->body.get(); continue;
+      }
+      if (auto* ps = std::get_if<Pexp_sequence>(&e->desc)) {
+        e = ps->e2.get(); continue;
+      }
+      return e;
     }
+  }
+  void record_tuple_sigs(const Pattern& pat0, const Expression& ex,
+                         const std::vector<FnSig>& pre = {}) {
+    std::string open_mod;
+    const Expression* e = tuple_rhs_spine(ex, &open_mod);
     const Pattern* pat = effective_pat(&pat0);
     auto* tp = std::get_if<Ppat_tuple>(&pat->desc);
     auto* te = std::get_if<Pexp_tuple>(&e->desc);
@@ -5438,9 +5461,45 @@ struct Translator {
                 s = f->second;
             }
           }
+      bool set = false;
       for (auto& [k, n2] : s)
-        if (k != 0) { fn_sig_[bid->stamp] = s; break; }
+        if (k != 0) { fn_sig_[bid->stamp] = s; set = true; break; }
+      // A component that is not a bare alias -- a literal function, or a
+      // PARTIAL APPLICATION of a labelled one -- takes its signature the way a
+      // plain `let` binding does, resolved by tuple_component_sigs BEFORE the
+      // components were bound.  parser.mly's wrap_type_annotation writes
+      // `let mkexp, ghtyp = mkexp ~loc, ghtyp ~loc`; without this `mkexp e`
+      // applied verbatim, so the omitted `?attrs` was never None-filled and
+      // the call returned a PARTIAL CLOSURE where the expression was expected
+      // -- the bootstrapped compiler segfaulted on `method m : type a. ..`.
+      if (!set && i < pre.size() && !pre[i].empty())
+        fn_sig_[bid->stamp] = pre[i];
     }
+  }
+  // Phase 1 of record_tuple_sigs: each component's own signature, resolved in
+  // the OUTER scope.  It has to run BEFORE the components are bound -- the
+  // shape above rebinds the very names it applies, so a lookup afterwards
+  // finds the new, still sig-less idents.  NOTUPFNSIG reverts.
+  std::vector<FnSig> tuple_component_sigs(const Pattern& pat0,
+                                          const Expression& ex) {
+    static const bool off = cppcaml::dbg_env("NOTUPFNSIG");
+    std::vector<FnSig> out;
+    if (off) return out;
+    const Expression* e = tuple_rhs_spine(ex);
+    const Pattern* pat = effective_pat(&pat0);
+    auto* tp = std::get_if<Ppat_tuple>(&pat->desc);
+    auto* te = std::get_if<Pexp_tuple>(&e->desc);
+    if (!tp || !te || tp->elems.size() != te->elems.size()) return out;
+    Ident scratch;      // a stamp no real binder holds, so record_fn_sig's
+    scratch.stamp = -1; // stores land in a slot we read back and drop
+    for (auto& el : te->elems) {
+      fn_sig_.erase(-1);
+      record_fn_sig(scratch, el.get());
+      auto it = fn_sig_.find(-1);
+      out.push_back(it == fn_sig_.end() ? FnSig{} : it->second);
+    }
+    fn_sig_.erase(-1); ref_fn_sig_.erase(-1); fn_pack_params_.erase(-1);
+    return out;
   }
   // The callee's parameter signature for an application: a local function (by its
   // recorded sig) or a qualified stdlib value (from its cmi arrow type).  Empty if
@@ -27363,6 +27422,8 @@ struct Translator {
             // bind, so the pattern names never shadow the element expressions.
             std::vector<LamPtr> vals;
             for (auto& ee : et->elems) vals.push_back(expr(*ee));
+            std::vector<FnSig> tsig =
+                tuple_component_sigs(le->bindings[0].pat, *rhs);
             auto l = mk(Lam::K::Let);
             for (int i = (int)tp->elems.size() - 1; i >= 0; --i) {
               const Pattern* ep = effective_pat(tp->elems[i].get());
@@ -27374,6 +27435,8 @@ struct Translator {
               Ident id = fresh(pv->name.txt);
               l->bindings.push_back({id, pat_kind(ep), vals[i]});
               scope.back()[pv->name.txt] = id;
+              if (i < (int)tsig.size() && !tsig[i].empty())
+                fn_sig_[id.stamp] = tsig[i];
             }
             rec_spine_ = rec_spine;
             LamPtr body = expr(*le->body);
@@ -27669,6 +27732,8 @@ struct Translator {
           // them ahead is evaluation-order preserving) and bind the components.
           const Pattern* tpat = effective_pat(&b.pat);
           auto* tup = std::get_if<Ppat_tuple>(&tpat->desc);
+          // Resolved here, before any component is bound (see below).
+          std::vector<FnSig> tup_pre = tuple_component_sigs(b.pat, *b.expr);
           // Peek through leading non-recursive lets AND sequences to the tail: a
           // side-effect before the tuple (`let p = pos_out c in output c v; (p, ..)`)
           // is a Sequence whose `else_` is the tuple.  Track whether a Sequence was
@@ -27714,7 +27779,7 @@ struct Translator {
                 collect_binders(*ep, av, binders);
               }
             }
-            record_tuple_sigs(b.pat, *b.expr);
+            record_tuple_sigs(b.pat, *b.expr, tup_pre);
             float_seq_val = val;
             float_seq_inner = inner_let;
             continue;
@@ -27753,7 +27818,7 @@ struct Translator {
                 collect_binders(*ep, av, binders);
               }
             }
-            record_tuple_sigs(b.pat, *b.expr);
+            record_tuple_sigs(b.pat, *b.expr, tup_pre);
             continue;
           }
           if (val->k == Lam::K::Var) {  // via a *match* temp bound to e
@@ -27767,7 +27832,7 @@ struct Translator {
             auto tv = mk(Lam::K::Var); tv->var = tmp;
             collect_binders(b.pat, tv, binders);
           }
-          record_tuple_sigs(b.pat, *b.expr);
+          record_tuple_sigs(b.pat, *b.expr, tup_pre);
         }
       }
       src_bounds.push_back({l->bindings.size(), binders.size()});  // sentinel
@@ -33850,6 +33915,7 @@ struct Translator {
           // *match* temp.  ocamlc emits the component bindings in reverse field order
           // but exports them in source order; a refutable pattern stays a bare temp.
           LamPtr val = expr(*b.expr);
+          std::vector<FnSig> tup_pre = tuple_component_sigs(b.pat, *b.expr);
           // A tuple pattern over a tuple-construction rhs is the one form
           // Matching.assign_pat decomposes, refreshing the binders as it goes
           // (`opt := true`); every other pattern takes simple_for_let and keeps
@@ -33870,7 +33936,7 @@ struct Translator {
           else { tmp = fresh("", true); auto tv = mk(Lam::K::Var); tv->var = tmp; scrut = tv; }
           std::vector<std::pair<Ident, LamPtr>> binders;
           if (collect_binders(b.pat, scrut, binders) && !binders.empty()) {
-            record_tuple_sigs(b.pat, *b.expr);
+            record_tuple_sigs(b.pat, *b.expr, tup_pre);
             // `let r : (<arrow>) ref = ..` / `let f : <arrow> = ..` (a
             // CONSTRAINED single-var binding lands here, not in the Ppat_var
             // branch): record its signature so call sites label-commute --
