@@ -33567,7 +33567,17 @@ struct Translator {
             // when the submodule is only re-exported.  (Distinct from the
             // shadow case: no enclosing same-name binding is required.)
             bool incl_submod = local_include && ns == modsig::NS::Module && sub;
-            if ((local_include && lookup(nm)) || incl_submod) {
+            // ocamlc's translmod rebinds EVERY included identifier as
+            // `Llet(Alias, id, field_mut i base)` (rebind_idents) and leaves it
+            // to Simplif to drop the dead ones and substitute the single-use
+            // ones.  A use under a lambda weighs 2 there, so a name captured by
+            // a closure KEEPS its binding and the closure captures the
+            // projected value; splicing the projection at each use instead put
+            // the `field_mut` inside the closure and captured the module block.
+            // Rebinding unconditionally also allocates a stamp per included
+            // field, as ocamlc does.  NOINCLREBIND reverts to shadowed-only.
+            static const bool no_rebind = cppcaml::dbg_env("NOINCLREBIND");
+            if ((local_include && (!no_rebind || lookup(nm))) || incl_submod) {
               Ident id = fresh(nm);
               cur.push_back({id, ValueKind::Gen, fi, true});  // =a alias
               scope.back()[nm] = id;
