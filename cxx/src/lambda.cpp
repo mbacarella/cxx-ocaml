@@ -15741,6 +15741,16 @@ struct Translator {
       bool guardfree = true;
       for (auto& rr : rows) if (rr.guard || rr.aid < 0) { guardfree = false; break; }
       bool relaxed = deid == gm_fake_deid_ && guardfree;
+      // precompile_or hands orpm the WHOLE match's partiality, so the handler
+      // is ctx-Total under either reading, not just the hoisting one: a value
+      // reaching it failed every body row and, by exhaustiveness, matches the
+      // or-row or a compatible trailing row -- exactly what the handler holds.
+      // The bit that argument needs is PROVEN exhaustiveness (gm_ptot_deid_),
+      // never `deid == gm_fake_deid_`, which also holds for a partial match
+      // with no catch-all and would delete a live Match_failure; a guard breaks
+      // it outright.  NOORHDLRTOTAL reverts, and with it the licence below.
+      bool tpx = deid == gm_ptot_deid_ && guardfree &&
+                 !cppcaml::dbg_env("NOORHDLRTOTAL");
       std::vector<std::string> orvars;
       collect_gvars(r.cols[0], orvars);
       // precompile_or allocates the or-row's exit REGARDLESS of whether the
@@ -15821,9 +15831,18 @@ struct Translator {
           hrows.push_back(std::move(tr));
         }
         int tp_save = gm_tp_deid_;
-        if (rx) gm_tp_deid_ = deid;      // the handler is total (see above)
+        int rt_save = gm_tp_root_;
+        if (rx || tpx) gm_tp_deid_ = deid;  // the handler is total (see above)
+        // Under a PROVEN-total match the handler's own column 0 is the root of
+        // that total pm, so a refuted CONSTANT drops with the blocks -- which
+        // is gm_tp_root_'s rule, that only the OUTERMOST switch of a total
+        // matrix may lose a const cell.
+        if (tpx)
+          gm_tp_root_ = (!rcomps.empty() && rcomps[0]->k == Lam::K::Var)
+                            ? rcomps[0]->var.stamp : -1;
         LamPtr hb = gmatch(std::move(rcomps), std::move(hrows), mloc, deid, denv);
         gm_tp_deid_ = tp_save;
+        gm_tp_root_ = rt_save;
         if (!hb) { bailed = true; return nullptr; }
         c->then_ = hb;
         return c;
@@ -16032,18 +16051,16 @@ struct Translator {
         gm_proven_comp_ = std::move(proven_save2);
         bailed = false;
       }
-      // The strict reading: no hoist past the or-row under the fake default (its
-      // handler has no totality budget), and only wildcard trailing rows.
-      // Under the fake default the new licence stands down, exactly as the
-      // hoist does: the strict reading gives the handler no totality budget, so
-      // a residual column there invents the Match_failure raise upstream's
-      // ctx-Total compilation never emits.  bytecomp/dll.ml's `open_dll` is the
-      // shape -- four rows exhaustive without a wildcard, its `(None | Some
-      // (Checking _) as current), For_execution` or-row behind three rows that
-      // column 1 alone proves disjoint -- and it raised a Match_failure at
-      // dll.ml:81 that upstream does not.
+      // The strict reading: no hoist past the or-row under the fake default,
+      // and only wildcard trailing rows.  The safe_before licence is taken
+      // there exactly when `tpx` holds -- what made it invent a Match_failure
+      // was the handler's missing totality budget, not the licence itself:
+      // bytecomp/dll.ml's `open_dll` (four rows exhaustive with no wildcard)
+      // kept a residual `For_execution` test and raised at dll.ml:81, where
+      // upstream's ctx-Total orpm emits neither.
       if (LamPtr res = attempt(deid == gm_fake_deid_ ? oi + 1 : tstart, false,
-                               lead_ok || (lead_sb && deid != gm_fake_deid_)))
+                               lead_ok ||
+                               (lead_sb && (tpx || deid != gm_fake_deid_))))
         return res;
       if (bailed) return nullptr;
     }
