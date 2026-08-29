@@ -13266,6 +13266,19 @@ struct Translator {
   LamPtr const_dispatch(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts,
                         bool has_block = false) {
     if (consts.size() == 1) return consts[0].body;
+    // as_interval merges ADJACENT EQUAL actions into one interval, so a dense
+    // range whose cells all carry the same action reaches zyva as a SINGLE
+    // cluster and c_test (switch.ml:735) returns that action with no test at
+    // all.  Building the switch instead leaves the action cited once per cell,
+    // which keeps a shared arm's handler behind a catch that simplify_exits
+    // would otherwise have inlined (`A | B | C | D -> None | E n -> Some n`).
+    if (!cppcaml::dbg_env("NOSAMECONST")) {
+      bool same = true;
+      for (size_t i = 1; i < consts.size(); ++i)
+        if (!same_action_lam(consts[i].body, consts[0].body))
+          { same = false; break; }
+      if (same) return consts[0].body;
+    }
     if (consts.size() == 2) {
       auto i = mk(Lam::K::IfThenElse);
       i->cond = scrut; i->then_ = consts[1].body; i->else_ = consts[0].body;
