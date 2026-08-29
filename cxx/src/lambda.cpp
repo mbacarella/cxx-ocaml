@@ -15695,6 +15695,21 @@ struct Translator {
         }
         return true;
       };
+      // safe_before (matching.ml:1341) proper, for the leading rows: a row is
+      // swappable past the or-row when it raises the SAME action or when the
+      // WHOLE rows are incompatible -- not merely when column 0 names a
+      // constructor disjoint from every alternative.  parser.mly's mkuminus
+      // needs both halves at once: `"-", K {kd = I ..}, []` sits ahead of
+      // `("-" | "-."), K {kd = F ..}, []`, so it is COLUMN 1 (I against F)
+      // that proves the rows disjoint while the string column 0 is shared and
+      // names no constructor at all.  mkuplus spells the same match as ONE
+      // or-arm, where the leading row shares the alternatives' action instead.
+      // NOORSAFEBEFORE reverts.
+      bool lead_sb = !cppcaml::dbg_env("NOORSAFEBEFORE");
+      for (size_t i = 0; lead_sb && i < oi; ++i)
+        if (rows[i].guard || !(gm_same_action(rows[i], r) ||
+                               gm_rows_disjoint_rec(rows[i], r)))
+          lead_sb = false;
       size_t tstart = oi + 1;
       while (tstart < rows.size() && !rows[tstart].guard &&
              !std::get_if<Ppat_or>(&rows[tstart].cols[0]->desc)) {  // #Simple.view
@@ -16019,8 +16034,16 @@ struct Translator {
       }
       // The strict reading: no hoist past the or-row under the fake default (its
       // handler has no totality budget), and only wildcard trailing rows.
+      // Under the fake default the new licence stands down, exactly as the
+      // hoist does: the strict reading gives the handler no totality budget, so
+      // a residual column there invents the Match_failure raise upstream's
+      // ctx-Total compilation never emits.  bytecomp/dll.ml's `open_dll` is the
+      // shape -- four rows exhaustive without a wildcard, its `(None | Some
+      // (Checking _) as current), For_execution` or-row behind three rows that
+      // column 1 alone proves disjoint -- and it raised a Match_failure at
+      // dll.ml:81 that upstream does not.
       if (LamPtr res = attempt(deid == gm_fake_deid_ ? oi + 1 : tstart, false,
-                               lead_ok))
+                               lead_ok || (lead_sb && deid != gm_fake_deid_)))
         return res;
       if (bailed) return nullptr;
     }
