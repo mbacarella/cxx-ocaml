@@ -26008,6 +26008,23 @@ struct Translator {
                   if (ci2->second.is_block == k->arg.has_value() ||
                       forced_ctor_depth_.count(n))
                     cip = &ci2->second;
+            // The DOTLESS branch also runs for a FORCE-REGISTERED name, and
+            // then trimming a dotted path ("With_shorthand.functor_param" to
+            // "functor_param") looks up a key a LOCAL submodule's type never
+            // has, so the flat entry the force-register just squatted stays.
+            // Read the full path back: includemod_errorprinter's `Named (from,
+            // modtype ..)` is With_shorthand's arity-1 TUPLE ctor, but the
+            // match's own `Types.Named` rows had force-registered an arity-2
+            // `Named`, so the construct built a 2-field block while the
+            // consuming match -- which resolves through the full key -- read
+            // field 1 of `from`: a segfaulting producer/consumer split.
+            if (!dotless && !cppcaml::dbg_env("NOFORCEDFULLTY") &&
+                !exn_ident_.count(n) && !exn_field_.count(n))
+              if (auto ti = type_ctor_info_.find(ec->second);
+                  ti != type_ctor_info_.end())
+                if (auto c2 = ti->second.find(n); c2 != ti->second.end())
+                  if (c2->second.is_block == k->arg.has_value())
+                    cip = &c2->second;
           } else {
             // A DOTTED path naming a SEPARATELY-COMPILED unit's type is
             // resolved through that unit, where no bare-name collision is
