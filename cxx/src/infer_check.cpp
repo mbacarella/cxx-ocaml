@@ -516,6 +516,25 @@ struct Checker {
   void resolve_pending_fields() {
     for (auto& [e, bt, lbl] : pending_field_) {
       TypePtr rb0 = I::Engine::repr(bt);
+      // The base's type is still a VAR after the fixpoint, so nothing named the
+      // record and the back end would read field 0.  OCaml resolves a bare
+      // label by SCOPE, so when the unit declares no such label in scope at the
+      // use, the only candidate left is the record an OPENED module declares.
+      // typemod.ml's `Env.lookup_module_path ~loc:lid.loc` (line 137) was
+      // handed a constant 0 this way: `loc` is Asttypes.loc's field, but
+      // `shadowable`
+      // (1305) and `application_summary` (2410) declare one further down and
+      // Typedtree's `Tfunction_cases` has one inline, so the label read as
+      // locally ambiguous and `lid` stayed unpinned.  NOFIELDSCOPE reverts.
+      if (!no_field_scope_ && rb0->kind == I::Type::Kind::Var &&
+          no_local_field_in_scope(lbl, e->loc.start.lnum))
+        if (TypePtr fa = unique_opened_ext_field(lbl)) {
+          TypePtr fs = I::Engine::repr(eng.instantiate(fa));
+          if (fs->kind == I::Type::Kind::Arrow) {
+            try_unify(bt, fs->dom);
+            rb0 = I::Engine::repr(bt);
+          }
+        }
       // The same fixpoint serves the field READ's own TYPE.  A label the
       // registry finds AMBIGUOUS gets a fresh var at the read site, and when
       // the base is still a var there is nothing else to go on -- but once the
@@ -627,10 +646,23 @@ struct Checker {
   // FALLBACK consulted only when fields_ misses, so it can't disturb local
   // record uniqueness; used (uniquely) per label.  label -> candidate schemes.
   std::unordered_map<std::string, std::vector<TypePtr>> ext_fields_;
+  // The module path behind each ext_fields_ entry, in the same order, and the
+  // paths this unit actually OPENED.  ext_fields_ also holds records loaded
+  // because a module was merely referenced, annotated or aliased (`module
+  // Style = Misc.Style`), and those bring no BARE label into scope -- only an
+  // `open`/`include` does.
+  std::unordered_map<std::string, std::vector<std::string>> ext_field_mod_;
+  std::set<std::string> opened_field_mods_;
   // The scheme for a record field: a local unique field, else a unique external
   // (opened-module) field; null if unknown/ambiguous.
-  TypePtr field_scheme(const std::string& label) {
-    auto it = fields_.find(label);
+  TypePtr field_scheme(const std::string& label, int at_line = -1) {
+    // A local record declared FURTHER DOWN the unit is not in scope at the use,
+    // so its label must not pin the base here; leave the read to unification
+    // and to resolve_pending_fields' scope rule.  Callers with no position pass
+    // -1 and keep the whole-unit reading.
+    bool oos = at_line >= 0 && !no_field_scope_ &&
+               no_local_field_in_scope(label, at_line);
+    auto it = oos ? fields_.end() : fields_.find(label);
     if (it != fields_.end()) return it->second;
     // A label some LOCAL record declares stays unresolved when it is ambiguous
     // (fields_ keeps only the unique ones): the external fallback below is for
@@ -644,6 +676,39 @@ struct Checker {
     return nullptr;
   }
   std::unordered_map<std::string, std::vector<TypePtr>> field_candidates_;
+  // Where each field_candidates_ entry was declared, in the same order: the
+  // declaration's source line, or -1 for an INLINE-RECORD constructor field.
+  // An inline record's labels are not in the bare-label namespace at all --
+  // `type t = A of {loc:int} let f r = r.loc` is "Unbound record field loc" --
+  // so they never take part in a bare `e.label` read, only in `A {loc}`.
+  std::unordered_map<std::string, std::vector<int>> field_cand_line_;
+  const bool no_field_scope_ = std::getenv("NOFIELDSCOPE") != nullptr;
+  // No LOCAL record declaration of `label` is in scope at `at_line`: the unit
+  // declares none, or every one of them is an inline-record field or sits
+  // further down the file.
+  bool no_local_field_in_scope(const std::string& label, int at_line) {
+    auto ci = field_candidates_.find(label);
+    if (ci == field_candidates_.end()) return true;
+    auto li = field_cand_line_.find(label);
+    if (li == field_cand_line_.end() || li->second.size() != ci->second.size())
+      return false;
+    for (int l : li->second) if (l >= 0 && l <= at_line) return false;
+    return true;
+  }
+  // The single record an OPENED module declares `label` in, if there is one.
+  TypePtr unique_opened_ext_field(const std::string& label) {
+    auto e = ext_fields_.find(label);
+    auto mi = ext_field_mod_.find(label);
+    if (e == ext_fields_.end() || mi == ext_field_mod_.end()) return nullptr;
+    if (mi->second.size() != e->second.size()) return nullptr;
+    TypePtr found = nullptr;
+    for (size_t i = 0; i < e->second.size(); ++i)
+      if (opened_field_mods_.count(mi->second[i])) {
+        if (found) return nullptr;
+        found = e->second[i];
+      }
+    return found;
+  }
   // The single predefined ground type EVERY candidate record gives an
   // AMBIGUOUS label, else "".  Agreement makes the field's type independent
   // of which record ocamlc's type-directed disambiguation picks, so using it
@@ -2848,9 +2913,16 @@ struct Checker {
   // through the cmis) into ext_fields_, qualified (`Effect.Deep.handler`).  So a
   // construction `{ retc; exnc; effc }` after `open Effect.Deep` resolves to the
   // handler record and its result type flows (match_with's `'c` -> unit).
-  void load_module_record_fields(const Longident& m) {
+  void load_module_record_fields(const Longident& m, bool via_open = false) {
     auto comps = mod_components(m);
     if (comps.empty()) return;
+    if (via_open) {
+      std::string p;
+      for (auto& c : comps) { if (!p.empty()) p += '.'; p += c; }
+      // before the re-load guard: a module can be referenced first, then
+      // opened
+      opened_field_mods_.insert(p);
+    }
     // Guard against double-loading (a module both opened/referenced and aliased):
     // re-loading would push each label twice and make it spuriously ambiguous.
     if (!loaded_field_mods_.insert(lid_full(m)).second) return;
@@ -2874,8 +2946,10 @@ struct Checker {
         std::vector<TypePtr> params;
         for (auto& p : td.params) params.push_back(from_cmi(p, memo));
         TypePtr recTy = eng.constr(pfx + "." + td.name, params);
-        for (auto& l : td.labels)
+        for (auto& l : td.labels) {
           ext_fields_[l.name].push_back(eng.arrow(recTy, from_cmi(l.type, memo)));
+          ext_field_mod_[l.name].push_back(pfx);
+        }
       }
       cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear();
     } catch (...) { cmi_types_ctx_ = nullptr; cmi_mod_prefix_.clear(); }
@@ -3052,7 +3126,7 @@ struct Checker {
       else if (auto* in = std::get_if<Pstr_include>(&it.desc)) me = &in->expr;
       if (me)
         if (auto* pi = std::get_if<Pmod_ident>(&me->desc))
-          load_module_record_fields(pi->id.txt);
+          load_module_record_fields(pi->id.txt, /*via_open=*/true);
     }
   }
 
@@ -4459,10 +4533,12 @@ struct Checker {
           poly_format_labels_.insert(f.name.txt);
           field_candidates_[f.name.txt].push_back(
               eng.arrow(recTy, from_coretype(*f.type, vars)));
+          field_cand_line_[f.name.txt].push_back(d.loc.start.lnum);
         }
         continue;
       }
       field_candidates_[f.name.txt].push_back(eng.arrow(recTy, from_coretype(*f.type, vars)));
+      field_cand_line_[f.name.txt].push_back(d.loc.start.lnum);
     }
   }
   static bool mentions_format(const CoreType& t) {
@@ -4513,6 +4589,7 @@ struct Checker {
         continue;
       TypePtr a = eng.arrow(result, from_coretype(*f.type, vars));
       field_candidates_[f.name.txt].push_back(a);
+      field_cand_line_[f.name.txt].push_back(-1);  // inline: not a bare label
       own.emplace_back(f.name.txt, a);
     }
     if (!cname.empty() && own.size() == r->fields.size())
@@ -5288,6 +5365,7 @@ struct Checker {
               eng.generalize(fa);
               own.emplace_back(l.name, fa);
               field_candidates_[l.name].push_back(std::move(fa));
+              field_cand_line_[l.name].push_back(-1);  // idem, through a cmi
             }
             std::string key = path + "." + td.name + "." + c.name;
             if (inline_ctor_seen_.insert(key).second)
@@ -9808,7 +9886,8 @@ struct Checker {
         std::unordered_map<std::string, TypePtr> fv;
         return from_coretype(*pit->second.ftype, fv);
       }
-      if (TypePtr fsch = field_scheme(lid_last(fld->field.txt))) {
+      if (TypePtr fsch =
+              field_scheme(lid_last(fld->field.txt), e.loc.start.lnum)) {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));  // recTy -> fldTy
         TypePtr bt = infer_expr(*fld->e);
         try_unify(bt, s->dom);
@@ -10101,7 +10180,8 @@ struct Checker {
         }
       }
       TypePtr sbt;
-      if (TypePtr fsch = field_scheme(lid_last(sf->field.txt))) {
+      if (TypePtr fsch =
+              field_scheme(lid_last(sf->field.txt), e.loc.start.lnum)) {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));
         sbt = infer_expr(*sf->obj);
         try_unify(sbt, s->dom);
@@ -11910,7 +11990,7 @@ struct Checker {
   void replay_open_module(const Longident& m) {
     for (auto& [k, v] : resolve_module_values(m)) venv.back()[k] = v;
     for (auto& s : module_submodule_names(m)) opened_submodules_.insert(s);
-    load_module_record_fields(m);
+    load_module_record_fields(m, /*via_open=*/true);
     load_open_submod_quals(m);
     if (!strict) {
       load_open_type_quals(m);
@@ -12508,7 +12588,7 @@ struct Checker {
             // `st_size` spuriously UNIQUE at the parent's `Unix.stats : int`
             // (the submodule's int64 field never registered, so the ambiguity
             // that forces type-directed resolution never arose).
-            load_module_record_fields(pi->id.txt);
+            load_module_record_fields(pi->id.txt, /*via_open=*/true);
             load_open_submod_quals(pi->id.txt);  // bare Sub -> M.Sub (every pass)
             if (!strict) {
               load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
