@@ -11224,9 +11224,15 @@ struct Translator {
     // translate components; non-var ones bind to *match* temps
     std::vector<LamPtr> comps;
     std::vector<Lam::Binding> temps;
+    // With an `exception` row the components ARE the (exit N ..) arguments and
+    // so are evaluated INSIDE the try; binding them to temps first hoists them
+    // out of it, past the very handler the row asks for (translcore evaluates
+    // the scrutinee under the trywith).  Take them raw, with no temps at all.
+    static const char* no_exn_try = cppcaml::dbg_env("NOEXNSCRUTTRY");
+    const bool in_try = !erows.empty() && !no_exn_try;
     for (auto& el : tu->elems) {
       LamPtr v = expr(*el);
-      if (v->k != Lam::K::Var) {
+      if (!in_try && v->k != Lam::K::Var) {
         Ident t = fresh("", true);
         temps.push_back({t, expr_kind(el.get()), v});
         v = varof(t);
