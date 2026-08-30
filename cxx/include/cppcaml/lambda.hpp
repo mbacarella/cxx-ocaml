@@ -248,6 +248,13 @@ struct Lam {
   // gm_chunk on the way).  wire_garms needs the provenance afterwards: a
   // following pm's catch wraps OUTSIDE the first pm's or-handlers.
   bool gm_chunkc = false;
+  // gm_peelc: a split_no_or SINGLETON-division catch (matching.ml:1635) whose
+  // handler came out a bare argless re-raise.  Upstream's simplify_exits erases
+  // exactly that shape (simplif.ml:306) -- but it is part of SIMPLIF, so it
+  // runs after Matching has placed every arm handler; erasing at construction
+  // moves the arm catches our wire_garms places by LCA.  So the node is marked
+  // here and dropped by erase_peel_catches, after the wiring.
+  bool gm_peelc = false;
   // gm_orp: a PENDING or-handler catch created at the or-alternation expansion
   // point in gmatch (matching.ml's precompile_or wraps the handler catch around
   // the compile of the pm at the depth where the or-column is consumed).  The

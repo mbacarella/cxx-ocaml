@@ -15773,6 +15773,13 @@ struct Translator {
     MRow last = std::move(rows.back());
     rows.pop_back();
     std::vector<LamPtr> hcomps = comps;
+    // Which of the handler's columns arrive as a RAW expression.  The peeled
+    // row is all-variable, so it TESTS none of them, and upstream's own compile
+    // entry for the handler pm binds every column it descends past to a dead
+    // `*match*` alias (see the re-raise rule below).  Taken before the move.
+    std::vector<char> hraw(W, 0);
+    for (size_t i = 0; i < W; ++i)
+      hraw[i] = !hcomps[i] || hcomps[i]->k != Lam::K::Var;
     LamPtr main;
     if (denv.empty()) {
       main = gmatch(std::move(comps), std::move(rows), mloc, e, {}, no_peel_main);
@@ -15802,6 +15809,29 @@ struct Translator {
     // the Lstaticcatch, so enclosing column binds must not sink past it.
     auto c = mk(Lam::K::Catch);
     c->cond = main; c->prim_arg = e; c->then_ = hb; c->gm_chunk = true;
+    // A handler that came out a bare argless re-raise makes this catch an exit
+    // ALIAS, the shape upstream's simplify_exits erases (simplif.ml:306,
+    // `Lstaticcatch (l1, (i, []), Lstaticraise _)`).  gmatch_run_chunks has
+    // modelled that for its own handlers since it was written; the split_no_or
+    // SINGLETON division (matching.ml:1635) is the other place upstream builds
+    // such a catch, and it had no rule at all.
+    //   Same exception, for the same reason: a column the handler pops without
+    // testing but which arrives RAW is bound by upstream's own arg_to_var
+    // INSIDE the handler pm, so the re-raise is let-wrapped there.  Since
+    // simplify_exits runs BEFORE simplify_lets the alias rule does not match
+    // it, and that catch reaches the bytecode.  The HEAD is exempt --
+    // compile_match_nonempty binds it around the whole combine_handlers
+    // result, outside the catch.
+    //   The erasure itself is DEFERRED to erase_peel_catches, after wire_garms:
+    // upstream's 306 is a Simplif rule and so runs once Matching has placed
+    // every arm handler, while ours are placed by LCA over the exit sites --
+    // substituting here would move them (translmod's `more_idents`, 12 sites).
+    if (hb->k == Lam::K::Staticraise && hb->args.empty() &&
+        !cppcaml::dbg_env("NOPEELALIAS")) {
+      int rawcols = 0;
+      for (size_t i = 1; i < W; ++i) if (hraw[i]) ++rawcols;
+      if (rawcols < 1) c->gm_peelc = true;
+    }
     return c;
   }
   LamPtr gmatch_inner(std::vector<LamPtr> comps, std::vector<MRow> rows,
@@ -19420,6 +19450,25 @@ struct Translator {
       l->gm_chunk = false; l->gm_chunkc = true;      // multi-use: real catch
     }
   }
+  // simplif.ml:306's exit-alias rule, applied to the singleton-division catches
+  // gm_peel_last marked (gm_peelc): a catch whose handler is a bare argless
+  // re-raise is erased and its exit substituted at every entry site.  Runs
+  // after the arm wiring for the reason recorded at the mark.
+  void erase_peel_catches(LamPtr& l) {
+    if (!l) return;
+    erase_peel_catches(l->fn); erase_peel_catches(l->cond);
+    erase_peel_catches(l->then_); erase_peel_catches(l->else_);
+    erase_peel_catches(l->body); erase_peel_catches(l->sw_default);
+    for (auto& a : l->args) erase_peel_catches(a);
+    for (auto& b : l->bindings) erase_peel_catches(b.val);
+    for (auto& sc : l->sw_consts) erase_peel_catches(sc.body);
+    for (auto& sc : l->sw_blocks) erase_peel_catches(sc.body);
+    if (l->k == Lam::K::Catch && l->gm_peelc && l->then_ &&
+        l->then_->k == Lam::K::Staticraise && l->then_->args.empty()) {
+      inline_exit(l->cond, l->prim_arg, {}, {}, l->then_);
+      l = l->cond;
+    }
+  }
   // Entry for the general matrix matcher on a single scrutinee: peel a trailing
   // catch-all as the shared default (else Match_failure), run gmatch, and wrap the
   // fallback in a shared static-catch (inlined when used at most once).
@@ -19521,6 +19570,7 @@ struct Translator {
     // AFTER the catchall inline: the string-column make_catch decision (below)
     // must see the FINAL default content, exactly as Bytegen runs after Simplif.
     collapse_str_dflt_catches(res);
+    erase_peel_catches(res);
     if (cppcaml::dbg_env("STRDBG")) {
       fprintf(stderr, "[STRDBG] post-collapse:\n"); print_dlambda(res, std::cerr);
     }
@@ -21643,6 +21693,7 @@ struct Translator {
     else if (uses == 1 && bad == 0) inline_exit(res, deid, {}, {}, dbody);
     // AFTER the catchall inline, like Bytegen after Simplif (see gmatch_top).
     collapse_str_dflt_catches(res);
+    erase_peel_catches(res);
     if (!temps.empty()) { auto l = mk(Lam::K::Let); l->bindings = std::move(temps); l->body = res; res = l; }
     return res;
   }
