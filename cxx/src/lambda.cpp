@@ -14793,6 +14793,39 @@ struct Translator {
       return 1;
     }, (int)tk);
   }
+  // The same for a RECORD column.  Upstream normalizes every record pattern to
+  // all_record_args (matching.ml:248) and divide_record splits on lbl_all, so
+  // the default matrix decomposes into exactly the columns the main matrix
+  // does; we keep only the fields some row MENTIONS, so an entry row that tests
+  // a field outside that set has nowhere to put it and the level declines.
+  bool denv_spec_record(std::vector<GmDef>& env,
+                        const std::vector<int>& order) {
+    size_t nc = order.size();
+    return denv_map(env, [&](const Pattern* p0,
+                             std::vector<const Pattern*>& row,
+                             GmDef& ne) -> int {
+      std::vector<const Pattern*> nr(nc, nullptr);
+      if (!gmdef_omega(p0)) {
+        auto* pr = std::get_if<Ppat_record>(&p0->desc);
+        if (!pr) return -1;
+        std::vector<std::string> flds;
+        for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
+        for (auto& [lbl, sub] : pr->fields) {
+          FieldInfo nfi;
+          const FieldInfo* fi = resolve_record_pat_field(
+              flds, lbl.txt, nfi, p0, pat_record_qual_mod(*pr));
+          if (!fi) return -1;
+          size_t j = 0;
+          while (j < nc && order[j] != fi->index) ++j;
+          if (j == nc) return -1;
+          nr[j] = effective_pat(sub.get());
+        }
+      }
+      nr.insert(nr.end(), row.begin() + 1, row.end());
+      ne.mat.push_back(std::move(nr));
+      return 1;
+    }, (int)nc);
+  }
   static bool gm_const_eq(const Constant& a, const Constant& b) {
     if (a.desc.index() != b.desc.index()) return false;
     if (auto* x = std::get_if<Pconst_integer>(&a.desc)) {
@@ -16643,7 +16676,8 @@ struct Translator {
       for (auto& r : rows)
         if (std::get_if<Ppat_record>(&r.cols[0]->desc)) { anyrec = true; break; }
       if (anyrec) {
-        if (!denv.empty()) return nullptr;   // record specialization of the def env: TODO
+        // NORECDENV restores the old bail on a non-empty default environment.
+        if (!denv.empty() && cppcaml::dbg_env("NORECDENV")) return nullptr;
         if (comps[0]->k != Lam::K::Var) return nullptr;
         std::map<int, FieldInfo> cols_fi;                     // block index -> field
         std::vector<std::map<int, const Pattern*>> rowmap(rows.size());  // row -> idx -> subpat
@@ -16699,7 +16733,9 @@ struct Translator {
           nr.cols.insert(nr.cols.end(), rows[ri].cols.begin() + 1, rows[ri].cols.end());
           sub.push_back(std::move(nr));
         }
-        return gmatch(std::move(ncomps), std::move(sub), mloc, deid);
+        if (!denv_spec_record(denv, order)) return nullptr;
+        return gmatch(std::move(ncomps), std::move(sub), mloc, deid,
+                      std::move(denv));
       }
     }
     // Nested ARRAY column (matching.ml's divide_array/combine_array): bind the
