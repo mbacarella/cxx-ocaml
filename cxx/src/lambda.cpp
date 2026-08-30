@@ -13054,14 +13054,38 @@ struct Translator {
     // Rebuild: the stayers keep their order above the `if`, the movers keep
     // theirs at the top of their branch.
     LamPtr kept = chain.back()->body;  // the `if`, still owning both branches
+    // lower_bind walks an Alias bind DOWN past the alias lets a branch opens
+    // with (matching.ml:3584), so the arm's OWN decomposition binders -- the
+    // field reads off the tested variable -- are created first and the sunk
+    // group lands under them: `fun env (ids, mty_actual, _) -> match ids with
+    // | Some (id, id') -> ..` binds `*match* = ids.0` before `mty_actual`.
+    // A let whose RHS reads a mover stops the walk, as approx_present does
+    // there; a non-alias let stops it too, so an opaque branch head still
+    // takes the group at its top.  NOARMDESC reverts.
+    static const bool no_arm_desc = cppcaml::dbg_env("NOARMDESC");
     for (int b = 0; b < 2; ++b) {
-      LamPtr& slot = b == 0 ? cur->then_ : cur->else_;
+      LamPtr* slot = b == 0 ? &cur->then_ : &cur->else_;
+      if (!no_arm_desc)
+        while ((*slot)->k == Lam::K::Let) {
+          bool step = !(*slot)->bindings.empty();
+          for (auto& bb : (*slot)->bindings) {
+            if (!bb.alias) { step = false; break; }
+            for (size_t i = 0; i < chain.size(); ++i)
+              if (dest[i] == b &&
+                  approx_present(chain[i]->bindings[0].id, bb.val)) {
+                step = false; break;
+              }
+            if (!step) break;
+          }
+          if (!step) break;
+          slot = &(*slot)->body;
+        }
       for (size_t i = chain.size(); i-- > 0;)
         if (dest[i] == b) {
           auto l = mk(Lam::K::Let);
           l->bindings = chain[i]->bindings;
-          l->body = slot;
-          slot = l;
+          l->body = *slot;
+          *slot = l;
         }
     }
     for (size_t i = chain.size(); i-- > 0;)
