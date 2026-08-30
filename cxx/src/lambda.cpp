@@ -10756,14 +10756,97 @@ struct Translator {
       slot = seq ? &n->else_ : &n->then_;
     }
   }
-  // Rewrite every TAIL value of `l` that is a k-tuple construction into
-  // (exit N <components>); bottoms (raise / existing exits) stay; any other
-  // tail gets the whole-pattern leaf sublet.  The caller uses the result only
-  // when tuple_cols_opt_ reports that at least one tail really decomposed --
-  // otherwise it keeps the allocating form.  This is how
+  // The catch parameters of a tuple-let: the pattern's BOUND leaves, left to
+  // right (ocamlc's `pat_bound_idents_full`).  A `_` column binds nothing and
+  // so takes NO parameter, and a nested tuple contributes its own leaves --
+  // typemod's `let constr, (path, lid, sg) = match ..` carries FOUR.  False
+  // for any column assign_pat cannot decompose.
+  // NOTUPLELEAVES reverts to the pre-slice reading: one catch parameter per
+  // COLUMN, `_` columns included, and no nesting.
+  bool tuple_let_leaves(const Pattern* p, std::vector<const Pattern*>& out,
+                        bool top = true) {
+    const Pattern* ep = effective_pat(p);
+    bool old = cppcaml::dbg_env("NOTUPLELEAVES");
+    if (std::holds_alternative<Ppat_any>(ep->desc)) {
+      if (old && !top) out.push_back(ep);
+      return true;
+    }
+    if (std::get_if<Ppat_var>(&ep->desc)) { out.push_back(ep); return true; }
+    if (auto* tp = std::get_if<Ppat_tuple>(&ep->desc)) {
+      if (tp->elems.empty() || (old && !top)) return false;
+      for (auto& el : tp->elems)
+        if (!tuple_let_leaves(el.get(), out, false)) return false;
+      return true;
+    }
+    return false;
+  }
+  // What one assign_pat SUBLET leaves in the exit once simplif has substituted
+  // its alias lets: every bound leaf of `p` read out of `base` by its path.
+  void tuple_let_projections(const Pattern* p, const LamPtr& base,
+                             std::vector<LamPtr>& out) {
+    const Pattern* ep = effective_pat(p);
+    if (std::holds_alternative<Ppat_any>(ep->desc)) {
+      if (cppcaml::dbg_env("NOTUPLELEAVES")) out.push_back(base);
+      return;
+    }
+    if (std::get_if<Ppat_var>(&ep->desc)) { out.push_back(base); return; }
+    if (auto* tp = std::get_if<Ppat_tuple>(&ep->desc))
+      for (size_t i = 0; i < tp->elems.size(); ++i)
+        tuple_let_projections(tp->elems[i].get(), fieldimm((int)i, base), out);
+  }
+  // Is `v` a tuple construction of exactly `p`'s arity -- the one shape
+  // assign_pat's `collect` decomposes instead of emitting a sublet?
+  bool tuple_col_decomposes(const Pattern* p, const LamPtr& v) {
+    auto* tp = std::get_if<Ppat_tuple>(&effective_pat(p)->desc);
+    return tp && v->prim_arg == 0 && v->args.size() == tp->elems.size() &&
+           (v->k == Lam::K::ConstBlock ||
+            (v->k == Lam::K::Prim && v->prim == Prim::Makeblock));
+  }
+  // ocamlc's assign_pat over one column of a tuple TAIL: a column that is
+  // itself a matching tuple construction recurses (nothing is allocated at any
+  // depth), and every other column becomes one sublet -- so a `_` column still
+  // EVALUATES and binds its value while contributing no exit argument.
+  // Columns are walked right to left, which is what makes the LAST column's
+  // binding outermost, so `binds` comes out outermost-first and `rargs`
+  // reversed.
+  void assign_tuple_col(const Pattern* p, const LamPtr& val, ValueKind vk,
+                        std::vector<Lam::Binding>& binds,
+                        std::vector<LamPtr>& rargs) {
+    const Pattern* ep = effective_pat(p);
+    if (tuple_col_decomposes(ep, val)) {
+      auto* tp = std::get_if<Ppat_tuple>(&ep->desc);
+      tuple_cols_opt_ = true;
+      for (size_t i = val->args.size(); i-- > 0; ) {
+        ValueKind sk = (val->blk_shape.size() == val->args.size())
+                           ? val->blk_shape[i] : ValueKind::Gen;
+        assign_tuple_col(tp->elems[i].get(), val->args[i], sk, binds, rargs);
+      }
+      return;
+    }
+    // A column that is a variable -- or a from_alias node standing where
+    // ocamlc's pre-Simplif lambda had a pattern binder's Lvar (profile's
+    // rebuilt `(n, t)` pair) -- passes through unbound; the inline field read
+    // is exactly what ocamlc's later alias substitution leaves in the exit
+    // args.  A literal source field access (`state.events`, bytepackager) is
+    // untagged and gets its `let`.
+    LamPtr base = val;
+    if (bind_tuple_cols_ && val->k != Lam::K::Var && !val->from_alias) {
+      Ident t = fresh("", true);
+      binds.push_back({t, vk, val});
+      base = varof(t);
+    }
+    std::vector<LamPtr> proj;
+    tuple_let_projections(ep, base, proj);
+    for (size_t i = proj.size(); i-- > 0; ) rargs.push_back(proj[i]);
+  }
+  // Rewrite every TAIL value of `l` that is a tuple construction matching
+  // `pat` into (exit N <bound leaves>); bottoms (raise / existing exits) stay;
+  // any other tail gets the whole-pattern leaf sublet.  The caller uses the
+  // result only when tuple_cols_opt_ reports that at least one tail really
+  // decomposed -- otherwise it keeps the allocating form.  This is how
   // `let (a, b) = match .. with .. -> e1, e2` avoids building the pair
   // (Matching's exit-with-args form).
-  bool tail_tuple_exit(LamPtr& l, int n, size_t k) {
+  bool tail_tuple_exit(LamPtr& l, int n, const Pattern* pat) {
     if (!l) return false;
     // Any tail that is not a decomposable tuple construction gets ocamlc's
     // assign_pat LEAF treatment: the whole pattern becomes one sublet,
@@ -10776,12 +10859,11 @@ struct Translator {
       ex->prim_arg = n;
       if (l->k == Lam::K::Var) {
         LamPtr v = lam_alloc_copy(*l);
-        for (size_t i = 0; i < k; ++i) ex->args.push_back(fieldimm((int)i, v));
+        tuple_let_projections(pat, v, ex->args);
         *l = *ex;
       } else {
         Ident t = fresh("", true);
-        LamPtr tv = varof(t);
-        for (size_t i = 0; i < k; ++i) ex->args.push_back(fieldimm((int)i, tv));
+        tuple_let_projections(pat, varof(t), ex->args);
         auto lt = mk(Lam::K::Let);
         lt->bindings.push_back({t, ValueKind::Gen, lam_alloc_copy(*l)});
         lt->body = ex;
@@ -10789,86 +10871,48 @@ struct Translator {
       }
       return true;
     };
+    // The tuple tail itself: assign_pat decomposes it column by column,
+    // recursing into a nested tuple column that is again a tuple construction
+    // and turning every other column into one sublet.  The exit carries the
+    // pattern's bound LEAVES, so a `_` column adds no argument.
+    auto decompose = [&]() {
+      std::vector<Lam::Binding> binds;  // outermost first
+      std::vector<LamPtr> rargs;        // right-to-left
+      assign_tuple_col(pat, l, ValueKind::Gen, binds, rargs);
+      std::vector<LamPtr> args;
+      for (size_t i = rargs.size(); i-- > 0; ) args.push_back(rargs[i]);
+      l->k = Lam::K::Staticraise;
+      l->prim_arg = n;
+      l->blk_shape.clear();
+      l->args = std::move(args);
+      if (!binds.empty()) {
+        auto ex = lam_alloc_copy(*l);
+        auto lt = mk(Lam::K::Let);
+        lt->bindings = std::move(binds);
+        lt->body = ex;
+        *l = *lt;
+      }
+      return true;
+    };
     switch (l->k) {
       case Lam::K::Prim:
-        if (l->prim == Prim::Makeblock && l->prim_arg == 0 && l->args.size() == k) {
-          // ocamlc binds each non-variable tuple column to a fresh var before
-          // the static exit (Matching.assign_pat's per-component sublets:
-          // a Lvar column simplif-substitutes away, anything else -- constant,
-          // apply, field read, even a makeblock -- keeps its Strict `let`),
-          // right-to-left so the last column's binding is outermost.  We
-          // inlined the columns directly into the exit; matching the binding
-          // keeps the .cmo's push-all-then-assign shape (bytepackager's
-          // `state.events, state.debug_dirs` else-arm; ccomp's
-          // `(sprintf " > %s" .., t)` try-arm and `("", "")` tails).
-          // A column that is a variable -- or a from_alias node standing where
-          // ocamlc's pre-Simplif lambda had a pattern binder's Lvar (profile's
-          // rebuilt `(n, t)` pair) -- passes through unbound; the inline field
-          // read is exactly what ocamlc's later alias substitution leaves in
-          // the exit args.  A literal source field access (`state.events`,
-          // bytepackager) is untagged and gets its `let`.
-          auto is_bindable = [](const LamPtr& a) {
-            return a->k != Lam::K::Var && !a->from_alias;
-          };
-          tuple_cols_opt_ = true;
-          bool do_bind = bind_tuple_cols_;
-          std::vector<Lam::Binding> binds;  // outermost first
-          for (size_t i = l->args.size(); do_bind && i-- > 0; ) {
-            LamPtr& a = l->args[i];
-            if (!is_bindable(a)) continue;
-            Ident t = fresh("", true);
-            ValueKind vk = (l->blk_shape.size() == l->args.size())
-                               ? l->blk_shape[i] : ValueKind::Gen;
-            binds.push_back({t, vk, a});
-            a = varof(t);
-          }
-          l->k = Lam::K::Staticraise;
-          l->prim_arg = n;
-          l->blk_shape.clear();
-          if (!binds.empty()) {
-            auto ex = lam_alloc_copy(*l);
-            auto lt = mk(Lam::K::Let);
-            lt->bindings = std::move(binds);
-            lt->body = ex;
-            *l = *lt;
-          }
-          return true;
-        }
+        if (tuple_col_decomposes(pat, l)) return decompose();
         if (l->prim == Prim::Raise || l->prim == Prim::Reraise ||
             l->prim == Prim::RaiseNotrace) return true;
         return leaf();
       case Lam::K::ConstBlock:
-        if (l->prim_arg == 0 && l->args.size() == k) {
-          // ocamlc's assign_pat Lconst(Const_block) case decomposes a constant
-          // tuple tail too, binding each component (`let (b = [0:..] a = 24)
-          // (exit N a b)` -- ccomp's `("", "")` arms).
-          tuple_cols_opt_ = true;
-          std::vector<Lam::Binding> binds;  // outermost first
-          for (size_t i = l->args.size(); bind_tuple_cols_ && i-- > 0; ) {
-            LamPtr& a = l->args[i];
-            if (a->k == Lam::K::Var) continue;
-            Ident t = fresh("", true);
-            binds.push_back({t, ValueKind::Gen, a});
-            a = varof(t);
-          }
-          l->k = Lam::K::Staticraise;
-          l->prim_arg = n;
-          if (!binds.empty()) {
-            auto ex = lam_alloc_copy(*l);
-            auto lt = mk(Lam::K::Let);
-            lt->bindings = std::move(binds);
-            lt->body = ex;
-            *l = *lt;
-          }
-          return true;
-        }
+        // ocamlc's assign_pat Lconst(Const_block) case decomposes a constant
+        // tuple tail too, binding each component (`let (b = [0:..] a = 24)
+        // (exit N a b)` -- ccomp's `("", "")` arms).
+        if (tuple_col_decomposes(pat, l)) return decompose();
         return leaf();
       case Lam::K::Staticraise: return true;  // bottom w.r.t. the value
       case Lam::K::Let:
-      case Lam::K::Letrec: return tail_tuple_exit(l->body, n, k);
-      case Lam::K::Sequence: return tail_tuple_exit(l->else_, n, k);
+      case Lam::K::Letrec: return tail_tuple_exit(l->body, n, pat);
+      case Lam::K::Sequence: return tail_tuple_exit(l->else_, n, pat);
       case Lam::K::IfThenElse:
-        return tail_tuple_exit(l->then_, n, k) && tail_tuple_exit(l->else_, n, k);
+        return tail_tuple_exit(l->then_, n, pat) &&
+               tail_tuple_exit(l->else_, n, pat);
       case Lam::K::Switch: {
         // An arm whose action structurally DUPLICATES another arm's is our
         // expansion of a single or-pattern row; ocamlc folds those copies into
@@ -10884,20 +10928,22 @@ struct Translator {
           bool dup = !ky.empty() && keyn[ky] > 1;
           bool save = bind_tuple_cols_;
           if (dup) bind_tuple_cols_ = false;
-          bool ok = tail_tuple_exit(b, n, k);
+          bool ok = tail_tuple_exit(b, n, pat);
           bind_tuple_cols_ = save;
           return ok;
         };
         bool ok = true;
         for (auto& c : l->sw_consts) if (!arm(c.body)) { ok = false; break; }
         if (ok) for (auto& c : l->sw_blocks) if (!arm(c.body)) { ok = false; break; }
-        if (ok && l->sw_default) ok = tail_tuple_exit(l->sw_default, n, k);
+        if (ok && l->sw_default) ok = tail_tuple_exit(l->sw_default, n, pat);
         return ok;
       }
       case Lam::K::Catch:
-        return tail_tuple_exit(l->cond, n, k) && tail_tuple_exit(l->then_, n, k);
+        return tail_tuple_exit(l->cond, n, pat) &&
+               tail_tuple_exit(l->then_, n, pat);
       case Lam::K::Try:
-        return tail_tuple_exit(l->body, n, k) && tail_tuple_exit(l->then_, n, k);
+        return tail_tuple_exit(l->body, n, pat) &&
+               tail_tuple_exit(l->then_, n, pat);
       default:
         // Var, Apply, Send, While/For (unit -- unreachable for a tuple type),
         // and anything else map_return treats as a hole.
@@ -27507,15 +27553,13 @@ struct Translator {
       auto tuple_catch_shape = [&](const ValueBinding& b) -> bool {
         auto* tp = std::get_if<Ppat_tuple>(&effective_pat(&b.pat)->desc);
         if (!tp) return false;
-        bool allvars = !tp->elems.empty();
-        for (auto& el : tp->elems) {
-          const Pattern* ep = effective_pat(el.get());
-          if (!std::get_if<Ppat_var>(&ep->desc) &&
-              !std::holds_alternative<Ppat_any>(ep->desc)) {
-            allvars = false;
-            break;
-          }
-        }
+        // A column may itself be a tuple: assign_pat's `collect` recurses, and
+        // the catch takes the pattern's bound leaves (typemod's
+        // `let constr, (path, lid, sg) = match ..`).
+        std::vector<const Pattern*> leaves;
+        bool allvars = !tp->elems.empty() &&
+                       tuple_let_leaves(effective_pat(&b.pat), leaves) &&
+                       !leaves.empty();
         const Expression* rhs = b.expr.get();
         while (auto* ct = std::get_if<Pexp_constraint>(&rhs->desc)) rhs = ct->e.get();
         // ocamlc decides this form on the LAMBDA, where a plain-path local
@@ -27577,7 +27621,8 @@ struct Translator {
         bool save_opt = tuple_cols_opt_;
         bind_tuple_cols_ = true;
         tuple_cols_opt_ = false;
-        bool tte = tail_tuple_exit(mm, n, tp->elems.size());
+        const Pattern* tpat = effective_pat(&b.pat);
+        bool tte = tail_tuple_exit(mm, n, tpat);
         tte = tte && tuple_cols_opt_;
         bind_tuple_cols_ = save_btc;
         tuple_cols_opt_ = save_opt;
@@ -27585,8 +27630,9 @@ struct Translator {
         auto cat = mk(Lam::K::Catch);
         cat->cond = mm;
         cat->prim_arg = n;
-        for (auto& el : tp->elems) {
-          const Pattern* ep = effective_pat(el.get());
+        std::vector<const Pattern*> leaves;
+        tuple_let_leaves(tpat, leaves);
+        for (const Pattern* ep : leaves) {
           Ident id;
           if (auto* pv = std::get_if<Ppat_var>(&ep->desc)) {
             id = fresh(pv->name.txt);
@@ -29004,12 +29050,9 @@ struct Translator {
           // (predef's `?separability:((sep1,sep2) = (Ind, Ind))`).
           if (!var && !any) {
             if (auto* tp = std::get_if<Ppat_tuple>(&pat->desc)) {
-              bool eltok = !tp->elems.empty();
-              for (auto& el : tp->elems) {
-                const Pattern* ep = effective_pat(el.get());
-                if (!std::get_if<Ppat_var>(&ep->desc) &&
-                    !std::holds_alternative<Ppat_any>(ep->desc)) { eltok = false; break; }
-              }
+              std::vector<const Pattern*> oleaves;
+              bool eltok = !tp->elems.empty() &&
+                           tuple_let_leaves(pat, oleaves) && !oleaves.empty();
               if (eltok) {
                 Ident optid = fresh("opt", true);
                 l->params.push_back({optid, ValueKind::Gen});
@@ -29022,17 +29065,17 @@ struct Translator {
                 int n = ++next_exit_;
                 bool save_btc = bind_tuple_cols_, save_opt = tuple_cols_opt_;
                 bind_tuple_cols_ = true; tuple_cols_opt_ = false;
-                bool tte = tail_tuple_exit(iff, n, tp->elems.size());
+                bool tte = tail_tuple_exit(iff, n, pat);
                 tte = tte && tuple_cols_opt_;
                 bind_tuple_cols_ = save_btc; tuple_cols_opt_ = save_opt;
                 if (tte) {
                   OptDef od; od.optid = optid; od.tuple_catch = true;
                   od.texit = n; od.tcond = std::move(iff);
-                  for (auto& el : tp->elems) {
-                    const Pattern* ep = effective_pat(el.get());
+                  for (const Pattern* ep : oleaves) {
                     Ident id;
                     if (auto* pvv = std::get_if<Ppat_var>(&ep->desc)) {
-                      id = fresh(pvv->name.txt); scope.back()[pvv->name.txt] = id;
+                      id = fresh(pvv->name.txt);
+                      scope.back()[pvv->name.txt] = id;
                     } else id = fresh("", true);
                     od.tvars.push_back(id); od.tkinds.push_back(pat_kind(ep));
                   }
