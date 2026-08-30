@@ -14966,7 +14966,7 @@ struct Translator {
   // each group becoming its own half-match.
   LamPtr gmatch_run_chunks(const std::vector<LamPtr>& comps, const std::vector<MRow>& rows,
                            const Location& mloc, int deid, const std::vector<GmDef>& denv,
-                           bool (*spec)(const Pattern*)) {
+                           bool (*spec)(const Pattern*), bool absorb = false) {
     std::vector<std::vector<size_t>> groups;         // row indices, source order
     {
       std::vector<size_t> pending(rows.size());
@@ -14975,7 +14975,12 @@ struct Translator {
         bool discr = spec(rows[pending[0]].cols[0]);  // can_group's discriminant
         std::vector<size_t> yes, no;
         for (size_t i : pending) {
-          bool safe = spec(rows[i].cols[0]) == discr;
+          // can_group is ASYMMETRIC for the shapes that carry `| Any`:
+          // `Record _, (Record _ | Any) -> true` but `Any, Record _ -> false`,
+          // so once the discriminant is a record every later omega row joins
+          // ITS group instead of opening one of its own.  `absorb` voices that
+          // half; a bare bool spec would split `[Rec; Any]` in two.
+          bool safe = spec(rows[i].cols[0]) == discr || (discr && absorb);
           if (safe)
             for (size_t q : no)
               if (!gm_same_action(rows[i], rows[q]) && !gm_rows_disjoint(rows[i], rows[q]))
@@ -16679,6 +16684,68 @@ struct Translator {
         // NORECDENV restores the old bail on a non-empty default environment.
         if (!denv.empty() && cppcaml::dbg_env("NORECDENV")) return nullptr;
         if (comps[0]->k != Lam::K::Var) return nullptr;
+        // Upstream SPLITS this column before it divides it:
+        // split_and_precompile
+        // runs on the whole matrix, and only the group whose rows carry record
+        // heads reaches divide_record -- so that group's arg_to_var binds the
+        // field column INSIDE the handler.  Decomposing first, as we did, makes
+        // the field column the shared head of both groups, and its
+        // materialization then wraps the whole Lstaticcatch (lower_bind
+        // does not
+        // descend into a handler, matching.ml:3566).  Try the split first and
+        // keep the decomposition as the fallback -- it is what a UNIFORM column
+        // (one group) falls back to anyway.  NORECCHUNK reverts.
+        {
+          bool anyvar = false;
+          for (auto& r : rows)
+            if (!std::get_if<Ppat_record>(&r.cols[0]->desc))
+              { anyvar = true; break; }
+          bool has_spread_r = false;
+          for (auto& r : rows) if (r.spread) has_spread_r = true;
+          if (anyvar && !cppcaml::dbg_env("NORECCHUNK")) {
+            // Snapshot discipline, verbatim from the ctor chunk site below: the
+            // attempt's sub-compiles advance shared gmatch state and a
+            // rejection
+            // must be invisible to the decomposition that follows.
+            auto orw_save = gm_orw_;
+            auto facc_save = gm_facc_proto_;
+            int exit_save = next_exit_;
+            int stamp_save = stamp;
+            std::set<int> dirty_save = gm_ctx_dirty_eids_;
+            gm_ctx_dirty_eids_.clear();
+            auto full_save = gm_eid_full_;
+            auto part_save = gm_eid_part_;
+            auto arr_save = gm_eid_arr_;
+            auto proofs_save = gm_eid_proofs_;
+            auto proven_save2 = gm_proven_comp_;
+            LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
+                    [](const Pattern* p) {
+                      return std::get_if<Ppat_record>(&p->desc) != nullptr;
+                    }, /*absorb=*/true);
+            bool own_dirty = false;
+            if (has_spread_r)
+              for (int d : gm_ctx_dirty_eids_)
+                if (d > exit_save) { own_dirty = true; break; }
+            if (r && !own_dirty) {
+              int fbad = 0;
+              if (deid != gm_fake_deid_ ||
+                  count_exit(r, deid, false, fbad) == 0) {
+                gm_ctx_dirty_eids_.insert(dirty_save.begin(), dirty_save.end());
+                return r;
+              }
+            }
+            gm_ctx_dirty_eids_ = std::move(dirty_save);
+            gm_eid_full_ = std::move(full_save);
+            gm_eid_part_ = std::move(part_save);
+            gm_eid_arr_ = std::move(arr_save);
+            gm_eid_proofs_ = std::move(proofs_save);
+            gm_proven_comp_ = std::move(proven_save2);
+            gm_orw_ = std::move(orw_save);
+            gm_facc_proto_ = std::move(facc_save);
+            next_exit_ = exit_save;
+            stamp = stamp_save;
+          }
+        }
         std::map<int, FieldInfo> cols_fi;                     // block index -> field
         std::vector<std::map<int, const Pattern*>> rowmap(rows.size());  // row -> idx -> subpat
         for (size_t ri = 0; ri < rows.size(); ++ri) {
