@@ -5628,7 +5628,20 @@ struct Translator {
       // `Profile.(record transl)` fills record's omitted optional `?accumulate`).
       if (!opened_has(l->name)) return {};
       for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
-        if (module_base(*it)) continue;
+        if (module_base(*it)) {
+          // `Signature_names.(check_type names loc id)`: a value opened from a
+          // LOCAL module keeps its ascribed labels/optionals, as `M.f` does.
+          // Without this the erased `?info` was never None-filled and the
+          // call silently PARTIALLY applied (typemod.ml:2905 and :3030).
+          if (!no_open_local_sig_)
+            if (auto lm = local_member_sig_.find(*it);
+                lm != local_member_sig_.end())
+              if (auto vt = lm->second.find(l->name); vt != lm->second.end())
+                return vt->second;
+          // a known value of this local module shadows any outer open
+          if (module_layout_[*it].count(l->name)) return {};
+          continue;
+        }
         if (it->find('.') != std::string::npos) {  // an opened submodule path
           auto& sm = submodule_of(*it);
           if (!sm.ok) continue;
@@ -31181,6 +31194,9 @@ struct Translator {
   // submodule member (`DLS.new_key (fun..)`) fill the omitted optional, just as
   // submodule_of does for a cross-module call.
   std::unordered_map<std::string, std::unordered_map<std::string, FnSig>> local_member_sig_;
+  // NOOPENLOCALSIG reverts this slice: a value reached through `open M` /
+  // `M.(..)` for a LOCAL module M carries no label signature again.
+  const char* no_open_local_sig_ = cppcaml::dbg_env("NOOPENLOCALSIG");
   // A LOCAL functor's result-struct value label-sigs (functor name -> value ->
   // FnSig), recorded at the functor's definition.  On `module M = F(arg)` for a
   // local F, copied to local_member_sig_[M] so `M.f` fills f's omitted optionals
