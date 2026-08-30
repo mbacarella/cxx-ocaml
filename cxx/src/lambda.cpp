@@ -21675,6 +21675,27 @@ struct Translator {
       dcatch->gm_deidc = true;
       body = dcatch;
     }
+    // Upstream's precompile_or runs on the UNFLATTENED tuple matrix, so a
+    // ROOT-OR arm (one whose whole pattern is an or over the tuple) is an
+    // or-row THERE, and its handler is placed by the tuple level's own
+    // compile_orhandlers (matching.ml:3512) -- which wraps the compiled body
+    // at the root, strictly OUTSIDE everything the FLATTENED matrix produced,
+    // column-level or-handlers included.  We wire every arm in one pass, in
+    // source order, so a root-or written before a later column-or ended up
+    // nested INSIDE it (translprim's `Apply, [func; arg] | Revapply, [arg;
+    // func]` against the trailing `(Raise _ | ..), _`).  Wire the root-or arms
+    // last, stably, so compile_orhandlers' own first-innermost order survives
+    // among them -- and so their bodies compile after the flattened matrix's,
+    // as upstream's `compile_match_simplified body` then `compile_orhandlers`
+    // does.
+    if (!cppcaml::dbg_env("NOROOTORLAST")) {
+      std::vector<GArm> warms;
+      for (size_t i = 0; i < arms.size(); ++i)
+        if (srcs[i].second.size() <= 1) warms.push_back(std::move(arms[i]));
+      for (size_t i = 0; i < arms.size(); ++i)
+        if (srcs[i].second.size() > 1) warms.push_back(std::move(arms[i]));
+      arms = std::move(warms);
+    }
     wire_garms(body, arms);
     share_switches_rec(body);
     share_string_trees(body);
