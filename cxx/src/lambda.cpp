@@ -12057,6 +12057,39 @@ struct Translator {
     }
     return true;
   }
+  // The positions into `pr->fields` in the order ocamlc's matcher READS that
+  // level's columns -- record_read_order over the resolved declaration indices,
+  // with the type's mutability barriers when the type can be pinned down.
+  // False when a mentioned label does not resolve; the caller keeps its own
+  // order.
+  bool record_pat_order(const Ppat_record* pr, const Pattern* p,
+                        std::vector<size_t>& out) {
+    std::vector<std::string> flds;
+    for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
+    std::vector<int> ixs; std::vector<std::string> tys;
+    for (auto& [lbl, sub] : pr->fields) {
+      FieldInfo nfi;
+      const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p,
+                                                    pat_record_qual_mod(*pr));
+      if (!fi) return false;
+      ixs.push_back(fi->index); tys.push_back(fi->type);
+    }
+    const RecType* rty = nullptr;
+    for (auto& t : tys)
+      if (!t.empty())
+        if (auto it = rec_types_.find(t); it != rec_types_.end()) {
+          rty = &it->second; break;
+        }
+    if (!rty)
+      if (auto* kv = record_for_fields(flds)) rty = &kv->second;
+    if (rty && rty->fmut.size() == rty->labels.size()) {
+      for (size_t i = 0; i < ixs.size(); ++i)
+        if (ixs[i] < 0 || ixs[i] >= (int)rty->labels.size() ||
+            rty->labels[ixs[i]] != flds[i]) { rty = nullptr; break; }
+    } else rty = nullptr;
+    out = record_read_order(ixs, rty ? rty->fmut : std::vector<bool>{});
+    return true;
+  }
   bool collect_binders(const Pattern& p0, const LamPtr& scrut,
                        std::vector<std::pair<Ident, LamPtr>>& out) {
     preassign_pat_vars(p0);
@@ -14132,6 +14165,9 @@ struct Translator {
     return c;
   }
 
+  // NOGVARFLDORDER reverts this slice: an arm's record-pattern fields are
+  // visited in MENTION order again.
+  const bool no_gvar_fldorder_ = cppcaml::dbg_env("NOGVARFLDORDER") != nullptr;
   // Collect an arm pattern's bound-variable names in the same left-to-right order
   // gmatch descends (constraint/open stripped without side effects; construct-arg,
   // tuple, or-branches recursed; or-branches bind the same names -> dedup).  This
@@ -14171,8 +14207,17 @@ struct Translator {
     // leaf binds each field's sub-pattern var -- so those names MUST appear in the
     // arm's vnames, else action-sharing's shared handler has no parameter for them
     // and the arm body reads them unbound (`?default`/`?constrs`).
+    // Upstream's vnames are pat_bound_idents of a label list typecore already
+    // sorted, and the arm's binds are wrapped LAST-first, so the names must
+    // arrive in the REVERSE of the matcher's read order -- mention order made
+    // `Some {shape; path; arg}` read its fields forwards (typemod.ml:2686).
     if (auto* r = std::get_if<Ppat_record>(&p->desc)) {
-      for (auto& [lbl, sub] : r->fields) collect_gvars(sub.get(), out);
+      std::vector<size_t> pos(r->fields.size());
+      for (size_t i = 0; i < pos.size(); ++i) pos[i] = i;
+      std::vector<size_t> rd;
+      if (!no_gvar_fldorder_ && record_pat_order(r, p, rd))
+        pos.assign(rd.rbegin(), rd.rend());
+      for (size_t i : pos) collect_gvars(r->fields[i].second.get(), out);
       return;
     }
     // Likewise the array column, decomposed into one element column per length.
