@@ -905,6 +905,11 @@ struct Translator {
   // gets its whole-pattern sublet but does NOT activate the optimization; the
   // caller keeps the allocating form unless some tail was a real tuple.
   bool tuple_cols_opt_ = false;
+  // The tuple-let pattern whose rhs is being translated, or null.  ocamlc runs
+  // Matching BEFORE Simplif, so an alias binding whose only use is a TAIL
+  // column of that pattern is counted after assign_pat has already expanded
+  // the column into the sub-pattern's leaf reads, and stays bound.
+  const Pattern* tuple_pend_pat_ = nullptr;
   // Decision-node budget for the general matrix matcher (gmatch): each gmatch call
   // is one decision-tree node, so this caps the tree size.  A combinatorial matrix
   // (a var row spreading across many tag x tag combinations, which we -- unlike
@@ -10780,19 +10785,46 @@ struct Translator {
     }
     return false;
   }
+  // How many exit arguments `p` contributes -- its bound leaf count.
+  int tuple_proj_count(const Pattern* p) {
+    const Pattern* ep = effective_pat(p);
+    if (std::holds_alternative<Ppat_any>(ep->desc))
+      return cppcaml::dbg_env("NOTUPLELEAVES") ? 1 : 0;
+    if (std::get_if<Ppat_var>(&ep->desc)) return 1;
+    int c = 0;
+    if (auto* tp = std::get_if<Ppat_tuple>(&ep->desc))
+      for (auto& el : tp->elems) c += tuple_proj_count(el.get());
+    return c;
+  }
   // What one assign_pat SUBLET leaves in the exit once simplif has substituted
-  // its alias lets: every bound leaf of `p` read out of `base` by its path.
+  // its alias lets.  A sublet is a whole sub-MATCH (simple_for_let), not a bare
+  // field path: matching binds every sub-scrutinee it descends through, so a
+  // nested tuple column gets `*match* =a (field_imm i <base>)` of its own and
+  // simplif keeps that alias as soon as two or more leaves read it.  Only the
+  // one-leaf bases (and the top, whose scrutinee the caller already bound)
+  // substitute away into the direct field path.
   void tuple_let_projections(const Pattern* p, const LamPtr& base,
-                             std::vector<LamPtr>& out) {
+                             std::vector<LamPtr>& out,
+                             std::vector<Lam::Binding>* binds = nullptr,
+                             bool top = true) {
     const Pattern* ep = effective_pat(p);
     if (std::holds_alternative<Ppat_any>(ep->desc)) {
       if (cppcaml::dbg_env("NOTUPLELEAVES")) out.push_back(base);
       return;
     }
     if (std::get_if<Ppat_var>(&ep->desc)) { out.push_back(base); return; }
-    if (auto* tp = std::get_if<Ppat_tuple>(&ep->desc))
-      for (size_t i = 0; i < tp->elems.size(); ++i)
-        tuple_let_projections(tp->elems[i].get(), fieldimm((int)i, base), out);
+    auto* tp = std::get_if<Ppat_tuple>(&ep->desc);
+    if (!tp) return;
+    LamPtr b = base;
+    if (binds && !top && !cppcaml::dbg_env("NOSUBBASE") &&
+        tuple_proj_count(ep) > 1) {
+      Ident t = fresh("", true);
+      binds->push_back({t, ValueKind::Gen, base, true});
+      b = varof(t);
+    }
+    for (size_t i = 0; i < tp->elems.size(); ++i)
+      tuple_let_projections(tp->elems[i].get(), fieldimm((int)i, b), out, binds,
+                            false);
   }
   // Is `v` a tuple construction of exactly `p`'s arity -- the one shape
   // assign_pat's `collect` decomposes instead of emitting a sublet?
@@ -10836,8 +10868,54 @@ struct Translator {
       base = varof(t);
     }
     std::vector<LamPtr> proj;
-    tuple_let_projections(ep, base, proj);
+    tuple_let_projections(ep, base, proj, bind_tuple_cols_ ? &binds : nullptr,
+                          true);
     for (size_t i = proj.size(); i-- > 0; ) rargs.push_back(proj[i]);
+  }
+  // Extra exit arguments one occurrence of `id` in a tail COLUMN becomes.
+  int tuple_col_extra(const Pattern* p, const LamPtr& val, const Ident& id) {
+    const Pattern* ep = effective_pat(p);
+    if (tuple_col_decomposes(ep, val)) {
+      auto* tp = std::get_if<Ppat_tuple>(&ep->desc);
+      int e = 0;
+      for (size_t i = 0; i < val->args.size(); ++i)
+        e += tuple_col_extra(tp->elems[i].get(), val->args[i], id);
+      return e;
+    }
+    if (!val || val->k != Lam::K::Var || val->var.stamp != id.stamp) return 0;
+    int c = tuple_proj_count(ep);
+    return c > 1 ? c - 1 : 0;
+  }
+  // The same walk tail_tuple_exit makes, counting only what the expansion adds:
+  // a binder whose single use is a tail column of `pat` really has as many uses
+  // as that column has leaves, which is what ocamlc's simplif sees.
+  int tuple_tail_extra(const LamPtr& l, const Ident& id, const Pattern* pat) {
+    if (!l) return 0;
+    switch (l->k) {
+      case Lam::K::Prim:
+      case Lam::K::ConstBlock:
+        return tuple_col_decomposes(pat, l) ? tuple_col_extra(pat, l, id) : 0;
+      case Lam::K::Let:
+      case Lam::K::Letrec: return tuple_tail_extra(l->body, id, pat);
+      case Lam::K::Sequence: return tuple_tail_extra(l->else_, id, pat);
+      case Lam::K::IfThenElse:
+        return tuple_tail_extra(l->then_, id, pat) +
+               tuple_tail_extra(l->else_, id, pat);
+      case Lam::K::Switch: {
+        int e = 0;
+        for (auto& c : l->sw_consts) e += tuple_tail_extra(c.body, id, pat);
+        for (auto& c : l->sw_blocks) e += tuple_tail_extra(c.body, id, pat);
+        if (l->sw_default) e += tuple_tail_extra(l->sw_default, id, pat);
+        return e;
+      }
+      case Lam::K::Catch:
+        return tuple_tail_extra(l->cond, id, pat) +
+               tuple_tail_extra(l->then_, id, pat);
+      case Lam::K::Try:
+        return tuple_tail_extra(l->body, id, pat) +
+               tuple_tail_extra(l->then_, id, pat);
+      default: return 0;
+    }
   }
   // Rewrite every TAIL value of `l` that is a tuple construction matching
   // `pat` into (exit N <bound leaves>); bottoms (raise / existing exits) stay;
@@ -10857,18 +10935,21 @@ struct Translator {
     auto leaf = [&]() {
       auto ex = mk(Lam::K::Staticraise);
       ex->prim_arg = n;
+      std::vector<Lam::Binding> bs;  // the sublet's own scrutinee binds
+      LamPtr base;
       if (l->k == Lam::K::Var) {
-        LamPtr v = lam_alloc_copy(*l);
-        tuple_let_projections(pat, v, ex->args);
-        *l = *ex;
+        base = lam_alloc_copy(*l);
       } else {
         Ident t = fresh("", true);
-        tuple_let_projections(pat, varof(t), ex->args);
-        auto lt = mk(Lam::K::Let);
-        lt->bindings.push_back({t, ValueKind::Gen, lam_alloc_copy(*l)});
-        lt->body = ex;
-        *l = *lt;
+        bs.push_back({t, ValueKind::Gen, lam_alloc_copy(*l)});
+        base = varof(t);
       }
+      tuple_let_projections(pat, base, ex->args, &bs);
+      if (bs.empty()) { *l = *ex; return true; }
+      auto lt = mk(Lam::K::Let);
+      lt->bindings = std::move(bs);
+      lt->body = ex;
+      *l = *lt;
       return true;
     };
     // The tuple tail itself: assign_pat decomposes it column by column,
@@ -12421,6 +12502,8 @@ struct Translator {
       // even at one use (local_store's `Ref {r; snapshot} -> r := snapshot`).
       // Zero uses still drop it (StrictOpt: evaluate only if used).
       int n = count_var(body, id);
+      if (n > 0 && tuple_pend_pat_ && !cppcaml::dbg_env("NOTUPLECNT"))
+        n += tuple_tail_extra(body, id, tuple_pend_pat_);
       if (n == 0 || (n <= 1 && !is_mut_field_access(acc))) {
         // In ocamlc this position held the binder's Lvar until Simplif inlined
         // the alias let; tag the substituted node so pre-Simplif-order
@@ -27612,7 +27695,10 @@ struct Translator {
         auto* tp = std::get_if<Ppat_tuple>(&effective_pat(&b.pat)->desc);
         const Expression* rhs = b.expr.get();
         while (auto* ct = std::get_if<Pexp_constraint>(&rhs->desc)) rhs = ct->e.get();
+        const Pattern* save_pend = tuple_pend_pat_;
+        tuple_pend_pat_ = effective_pat(&b.pat);
         LamPtr mm = expr(*rhs);
+        tuple_pend_pat_ = save_pend;
         int n = ++next_exit_;
         // ocamlc's map_return/assign_pat binds non-var tuple columns in
         // every tail context it traverses -- if arms, switch arms, and both
@@ -28978,7 +29064,15 @@ struct Translator {
     return top;
   }
 
+  struct RestorePend {
+    const Pattern** slot; const Pattern* old;
+    ~RestorePend() { *slot = old; }
+  };
   LamPtr function(const Pexp_function& f, const Location& floc) {
+    // map_return stops at an Lfunction, so nothing inside one is a tail of an
+    // enclosing tuple-let rhs.
+    RestorePend restore_pend{&tuple_pend_pat_, tuple_pend_pat_};
+    tuple_pend_pat_ = nullptr;
     scope.emplace_back();
     auto l = mk(Lam::K::Function);
     std::vector<std::pair<Ident, LamPtr>> binders;  // sub-vars of destructured params
@@ -29056,7 +29150,11 @@ struct Translator {
               if (eltok) {
                 Ident optid = fresh("opt", true);
                 l->params.push_back({optid, ValueKind::Gen});
-                LamPtr dlam = expr(*pv->default_->get());  // before binding elems
+                const Pattern* save_pend = tuple_pend_pat_;
+                tuple_pend_pat_ = pat;
+                // before binding elems
+                LamPtr dlam = expr(*pv->default_->get());
+                tuple_pend_pat_ = save_pend;
                 auto optv = varof(optid);
                 auto iff = mk(Lam::K::IfThenElse);   // test on a copy of the default
                 iff->cond = varof(optid);
