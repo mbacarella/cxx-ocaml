@@ -106,9 +106,14 @@ struct ValueKinds {
   // kind_str spells them "addr", yet Typeopt.classify treats them as `Any`, a
   // GENERIC array element.  When such an expression is the RESULT of `a.(i)` (or
   // the value stored by `a.(i) <- v`), the back end must emit `array.get[gen]`,
-  // not `[addr]`.  Consumed ONLY by array_elem_kind, so it cannot perturb any
-  // other value_kind (e.g. the lazy-forward classification).
+  // not `[addr]`.  Consumed by array_elem_kind and by the lazy-forward
+  // classification, which is Typeopt.classify's `Any` in both places.
   std::set<const void*> abstract_elem;
+  // Expressions whose type is `lazy_t` (`'a Lazy.t`).  Typeopt.classify
+  // calls that class `Lazy`, and it takes the Forward block: shortcutting a
+  // `lazy e` whose `e` is itself a lazy value would make Lazy.force return
+  // the INNER lazy's contents instead of that value.
+  std::set<const void*> lazy_typed;
   // For an expression whose type is a module-qualified constr ("Gc.stat"), the
   // full path -- the back end resolves unqualified record labels through the
   // base expression's inferred type (heap_stats.major_collections).

@@ -7450,7 +7450,8 @@ struct Translator {
   // `lazy e`.  A non-commutative body becomes a thunk in a Lazy_tag block; a
   // small commutative body is evaluated eagerly and either shortcut to the value
   // itself (immediate/known-boxed: forcing returns it) or wrapped in a Forward_tag
-  // block (float, or a body of polymorphic/lazy type, where the shortcut is unsafe).
+  // block (float, or a body of polymorphic, ABSTRACT or lazy type, where the
+  // shortcut is unsafe).
   LamPtr lazy_expr(const Expression& e) {
     int size = 0;
     if (!lazy_commutative(&e, size)) {  // Lazy_thunk: (makelazyblock (function param e))
@@ -7468,9 +7469,19 @@ struct Translator {
              std::get_if<Pexp_array>(&e.desc) || std::get_if<Pexp_tuple>(&e.desc) ||
              std::get_if<Pexp_record>(&e.desc) || std::get_if<Pexp_function>(&e.desc))
       forward = false;  // always a (boxed or immediate) non-lazy value -> Shortcut
-    else {  // ident / field: by runtime class (addr & int shortcut, float/'a forward)
+    else {  // ident / lazy / extension: exactly Typeopt.classify's five classes
+      // Any (a type VARIABLE, or an ABSTRACT type constructor -- boxed, so
+      // kind_str spells it "addr", but Env.find_type gives classify a
+      // Type_abstract decl), Float and Lazy take the Forward block.  Every
+      // other class is shortcut to the value itself: Int, and the whole of
+      // Addr -- which includes string, int32/int64/nativeint, arrows, tuples
+      // and any CONCRETE record/variant/open.
       std::string k = vk_str(&e);
-      forward = (k == "float" || (k != "int" && k != "addr" && k != "string"));
+      forward = k.empty() || k == "float" ||
+                vk.abstract_elem.count(&e) || vk.lazy_typed.count(&e);
+      if (cppcaml::dbg_env("NOLAZYCLASS"))
+        forward = (k == "float" ||
+                   (k != "int" && k != "addr" && k != "string"));
     }
     if (!forward) return expr(e);  // Shortcut
     auto b = mk(Lam::K::Prim); b->prim = Prim::Makelazyblock; b->prim_arg = 250;  // Forward

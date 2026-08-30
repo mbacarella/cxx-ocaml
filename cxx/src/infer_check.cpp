@@ -4076,12 +4076,14 @@ struct Checker {
   // the string-compare specialization (it is not a value_kind), and a genuine
   // abbreviation of string has string's runtime representation, so this cannot
   // mis-specialize.  Memoized; depth-bounded and cycle-guarded.
-  std::unordered_map<std::string, bool> cmi_string_memo_;
-  bool cmi_type_resolves_to_string(const std::string& path, int depth = 0) {
+  std::unordered_map<std::string, bool> cmi_abbrev_memo_;
+  bool cmi_type_resolves_to(const std::string& path, const std::string& target,
+                            int depth = 0) {
     if (depth > 8) return false;
-    if (auto it = cmi_string_memo_.find(path); it != cmi_string_memo_.end())
+    std::string key = target + "|" + path;
+    if (auto it = cmi_abbrev_memo_.find(key); it != cmi_abbrev_memo_.end())
       return it->second;
-    cmi_string_memo_[path] = false;  // guard a cyclic abbreviation
+    cmi_abbrev_memo_[key] = false;  // guard a cyclic abbreviation
     bool r = false;
     std::vector<std::string> comps = mod_components_str(path);
     if (comps.size() >= 2) try {
@@ -4113,15 +4115,18 @@ struct Checker {
               std::string mp = cmi_path_str(*m->path);
               auto dd = mp.rfind('.');
               std::string mb = dd == std::string::npos ? mp : mp.substr(dd + 1);
-              if (mb == "string") r = true;
+              if (mb == target) r = true;
               else if (dd != std::string::npos)  // a further named abbreviation
-                r = cmi_type_resolves_to_string(mp, depth + 1);
+                r = cmi_type_resolves_to(mp, target, depth + 1);
             }
             break;
           }
     } catch (...) {}
-    cmi_string_memo_[path] = r;
+    cmi_abbrev_memo_[key] = r;
     return r;
+  }
+  bool cmi_type_resolves_to_string(const std::string& path) {
+    return cmi_type_resolves_to(path, "string");
   }
   // The abstract-without-manifest type names of a CROSS-MODULE named module
   // type ("Identifiable.S", "Map.S"), read from the owning unit's cmi -- the
@@ -13023,6 +13028,20 @@ DumpAux infer_dump_aux(const ast::Structure& s) {
 }
 
 // The Lambda value_kind of an inferred type, as -dlambda spells it.
+// Typeopt.classify's `Lazy` class: the predefined `'a lazy_t`, which scrape_ty
+// reaches through any manifest chain -- `Lazy.t` is `CamlinternalLazy.t` is
+// `lazy_t`, and our repr stops at the first unfold, so chase the cmi manifests
+// exactly as the string-abbreviation walk does.  A locally bound module
+// shadowing the head unit name is excluded, as in kind_str.
+static bool type_is_lazy_t(const TypePtr& t0, Checker& ck) {
+  TypePtr t = I::Engine::repr(t0);
+  if (t->kind != I::Type::Kind::Constr) return false;
+  const std::string& p = t->path;
+  if (p == "lazy_t") return true;
+  return p.find('.') != std::string::npos &&
+         !ck.bound_module_names_.count(p.substr(0, p.find('.'))) &&
+         ck.cmi_type_resolves_to(p, "lazy_t");
+}
 static std::string kind_str(const TypePtr& t0, Checker& ck) {
   const std::set<std::string>& imm = ck.immediate_types_;
   TypePtr t = I::Engine::repr(t0);
@@ -13287,6 +13306,9 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
     // An abstract-ctor-typed expr (`a.(i) : Id.t`) is a GENERIC array element
     // even though it is boxed ("addr"): array_kind_str downgrades it to gen.
     if (vk.expr[e] == "addr" && array_kind_str(t, ck).empty()) vk.abstract_elem.insert(e);
+    // A lazy type is boxed, so kind_str always spells it "addr"; gating on that
+    // keeps the manifest chase off every other expression.
+    if (vk.expr[e] == "addr" && type_is_lazy_t(t, ck)) vk.lazy_typed.insert(e);
     std::string ek;
     if (array_elem_str(t, ck, ek)) vk.array_elem[e] = ek;  // "" = gen element
     // A function-typed reference whose first parameter is a specializable base
