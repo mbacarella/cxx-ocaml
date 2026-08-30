@@ -1263,6 +1263,11 @@ struct Translator {
     // record (`Pattern {penv : Pattern_env.t}` -> "Pattern_env.t"), else "".  Lets a
     // var bound to such a field resolve its own AMBIGUOUS labels by that type.
     std::vector<std::string> rftypes;
+    // The SOURCE LINE each rftypes entry was declared on.  A bare (unqualified)
+    // spelling names whichever opened module was in scope THERE, which is not
+    // the last-registered one: typemod's `item : value_description` is declared
+    // above its `open Typedtree`, so it means Types'.  See qualify_bare_record.
+    std::vector<int> rflines;
     // Parallel to rlabels: whether each inline-record field's declared type is the
     // predefined `string`.  The inferencer leaves an inline-record ctor arg
     // untyped (the ctor scheme carries no argument type), so `x.name` where x was
@@ -2448,6 +2453,7 @@ struct Translator {
               ci.rshape.push_back(fk);
               ci.rfmut.push_back(fm);
               ci.rftypes.push_back(coretype_record_path(*f.type));
+              ci.rflines.push_back(f.loc.start.lnum);
               ci.rfstr.push_back(coretype_is_string(*f.type));
               // the labels resolve like record labels (`r.cnt` on a bound
               // inline-record value reads the block field)
@@ -2709,6 +2715,7 @@ struct Translator {
                     ci.rshape.push_back(fk);
                     ci.rfmut.push_back(fm);
                     ci.rftypes.push_back(coretype_record_path(*f.type));
+                    ci.rflines.push_back(f.loc.start.lnum);
                     ci.rfstr.push_back(coretype_is_string(*f.type));
                     if (do_ctor && !field_info_.count(f.name.txt))
                       field_info_[f.name.txt] = {d.name.txt, ridx, fm, fk};
@@ -2953,7 +2960,12 @@ struct Translator {
     if (!pv) return;
     const Ident* b = lookup(pv->name.txt);
     if (!b) return;
-    if (rec) var_record_path_[b->stamp] = ci.rftypes[ix];
+    if (rec) {
+      // A bare spelling is resolved against the opens above its DECLARATION,
+      // not the last registered record of that name (Types.value_description's
+      // val_loc@2 against Typedtree's @4).
+      var_record_path_[b->stamp] = qualified_rftype(ci, ix);
+    }
     if (str && !no_inline_str_) var_string_.insert(b->stamp);
   }
   // NOINLSTREQ reverts every inline-record string-field tag (fact (a) of S252).
@@ -4449,6 +4461,38 @@ struct Translator {
       }
     }
   }
+  // The line of the `open M` whose registration is running, or -1 when the
+  // module's records are being pulled in for some other reason.
+  int cur_open_line_ = -1;
+  // Bare record type NAME -> the (open line, module) of every opened module
+  // declaring a record of that name, in registration order.
+  std::unordered_map<std::string, std::vector<std::pair<int, std::string>>>
+      open_record_type_;
+  // NOOPENQUAL reverts this slice: a bare declared record path is resolved by
+  // name alone again, and the setfield leg below it does not run.
+  const char* no_open_qual_ = cppcaml::dbg_env("NOOPENQUAL");
+  // Qualify a BARE record type name written at `at_line`: the last module
+  // OPENED above that line declaring a record so named.  Only when two or more
+  // opens collide on the name -- with one candidate there is nothing to pick,
+  // and the bare reading already agrees.  Empty when it cannot be decided.
+  std::string qualify_bare_record(const std::string& name, int at_line) {
+    if (no_open_qual_ || at_line <= 0) return "";
+    auto it = open_record_type_.find(name);
+    if (it == open_record_type_.end() || it->second.size() < 2) return "";
+    const std::string* best = nullptr;
+    for (auto& [line, mod] : it->second)
+      if (line > 0 && line < at_line) best = &mod;
+    return best ? *best + "." + name : std::string();
+  }
+  // A CtorInfo inline-record field's declared type path, with a BARE spelling
+  // resolved against the opens above its own declaration line.
+  std::string qualified_rftype(const CtorInfo& ci, int ix) {
+    std::string path = ci.rftypes[ix];
+    if (path.find('.') == std::string::npos && ix < (int)ci.rflines.size())
+      if (std::string q = qualify_bare_record(path, ci.rflines[ix]); !q.empty())
+        path = std::move(q);
+    return path;
+  }
   void register_module_records(const std::string& mod) {
     if (cppcaml::dbg_env("RMRDBG"))
       fprintf(stderr, "[RMRDBG] register_module_records(%s)\n", mod.c_str());
@@ -4475,6 +4519,8 @@ struct Translator {
           for (auto& l : td.labels)
             if (cmi_field_kind(l.type) != ValueKind::Float) { all_float = false; break; }
           if (all_float) continue;
+          if (cur_open_line_ > 0)
+            open_record_type_[td.name].push_back({cur_open_line_, mod});
           RecType rt; rt.mut = false;
           rt.unboxed = td.unboxed && td.labels.size() == 1;
           bool fresh_type = !rec_types_.count(td.name);
@@ -17982,7 +18028,8 @@ struct Translator {
                 // (Texp_letop's `body : value case` -> "Typedtree.case").
                 if (std::get_if<Ppat_var>(&fp->desc)) {
                   if (j2 < ci->rftypes.size() && !ci->rftypes[j2].empty())
-                    var_node_path_[(const void*)fp] = ci->rftypes[j2];
+                    var_node_path_[(const void*)fp] =
+                        qualified_rftype(*ci, (int)j2);
                   if (!no_inline_str_ && j2 < ci->rfstr.size() && ci->rfstr[j2])
                     var_node_string_.insert((const void*)fp);
                 }
@@ -18284,7 +18331,7 @@ struct Translator {
               if (C.rlabels[i] == lbl) { ix = (int)i; break; }
             if (auto* pv = std::get_if<Ppat_var>(&fp->desc)) {
               if (ix >= 0 && ix < (int)C.rftypes.size() && !C.rftypes[ix].empty())
-                out.emplace(pv->name.txt, C.rftypes[ix]);
+                out.emplace(pv->name.txt, qualified_rftype(C, ix));
               if (strs && ix >= 0 && ix < (int)C.rfstr.size() && C.rfstr[ix])
                 strs->insert(pv->name.txt);
             } else collect_inline_fvar_paths(fp, out, strs);
@@ -26084,6 +26131,31 @@ struct Translator {
         l->prim_arg = rf->index; l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }
+      // A var bound to an inline-record field of a KNOWN record type -- the
+      // WRITE twin of the read path's var_record_path_ leg, ranked alike.
+      // Without it the read of an ambiguous label resolved through the declared
+      // record while the WRITE fell through to the bare find_field's last-
+      // registered offset, so `it.vloc <- it.vloc + 1` read one field and wrote
+      // another (and, past the block's end, corrupted the heap).
+      const Expression* sfb = no_open_qual_ ? nullptr : sf->obj.get();
+      if (auto* id = sfb ? std::get_if<Pexp_ident>(&sfb->desc) : nullptr)
+        if (auto* l = std::get_if<Lident>(&id->id.txt.v))
+          if (auto* b = lookup(l->name))
+            if (auto vp = var_record_path_.find(b->stamp);
+                vp != var_record_path_.end())
+              if (auto rf = resolve_field_in_record_path(
+                      vp->second, lid_last(sf->field.txt));
+                  rf && !rf->unboxed) {
+                auto lp = mk(Lam::K::Prim);
+                auto rt = rec_types_.find(rf->type);
+                lp->prim = (rt != rec_types_.end() && rt->second.flat)
+                               ? Prim::SetFloatfield
+                           : rf->kind == ValueKind::Int ? Prim::SetfieldImm
+                                                        : Prim::SetfieldPtr;
+                lp->prim_arg = rf->index;
+                lp->args = {expr(*sf->obj), expr(*sf->value)};
+                return lp;
+              }
       // The checker's answer, resolved through the base's type identity -- the
       // WRITE twin of the read path's vk.field_resolved leg, ranked the same
       // way: after a written qualification, before the bare find_field.
@@ -32654,7 +32726,11 @@ struct Translator {
           if (dotted.find('.') != std::string::npos)
             submodule_of(dotted);  // eager: registers its record-type labels
           else
+          {
+            cur_open_line_ = op->expr.loc.start.lnum;
             register_module_records(dotted);  // bare `open M`: M's record labels
+            cur_open_line_ = -1;
+          }
           opened_.push_back(dotted); ++n_opens;
           modsig::SigPtr osig = msig_of_module_path(dotted);
           bind_opened_members(osig);
