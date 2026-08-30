@@ -3437,11 +3437,19 @@ struct Translator {
       return field_of(global_of(prefix), f->second);
     return nullptr;
   }
+  // The payload arity of an imported extension/exception constructor.  An
+  // INLINE RECORD (`exception E of { a; b }`) is Cstr_record, whose fields
+  // ocamlc lays out flattened into the exception block, so the arity is the
+  // FIELD count, not `args` (which is empty for one).
+  static int exn_tx_arity(const cmi::ExtConstructor& tx) {
+    return tx.is_inline_record ? (int)tx.inline_record.size()
+                               : (int)tx.args.size();
+  }
   // A ctor qualified by a separately-compiled UNIT whose cmi declares it as an
   // EXCEPTION / extension constructor (`Syntaxerr.Error e`): its identity is
   // the unit's runtime field; the arity comes from the cmi typext.  Null for
-  // local modules, nested paths, inline-record payloads (layout differs), or
-  // when the name is not a typext of that unit (a variant ctor has no field).
+  // local modules, nested paths, or when the name is not a typext of that
+  // unit (a variant ctor has no field).
   LamPtr unit_exn_identity(const Longident& id, int* arity) {
     auto* dq = std::get_if<Ldot>(&id.v);
     if (!dq) return nullptr;
@@ -3453,8 +3461,9 @@ struct Translator {
       const auto& cmi = cmi::CmiFile::load(resolve_cmi(prefix));
       for (auto& tx : cmi.sig().typexts)
         if (tx.name == dq->name) {
-          if (tx.is_inline_record) return nullptr;
-          if (arity) *arity = (int)tx.args.size();
+          if (tx.is_inline_record && cppcaml::dbg_env("NOEXNINLREC"))
+            return nullptr;
+          if (arity) *arity = exn_tx_arity(tx);
           auto& fm = fields_of(prefix);
           if (auto f = fm.find(dq->name); f != fm.end())
             return field_of(global_of(prefix), f->second);
@@ -3491,8 +3500,9 @@ struct Translator {
       }
       for (auto& tx : sig->typexts)
         if (tx.name == dq->name) {
-          if (tx.is_inline_record) return nullptr;
-          if (arity) *arity = (int)tx.args.size();
+          if (tx.is_inline_record && cppcaml::dbg_env("NOEXNINLREC"))
+            return nullptr;
+          if (arity) *arity = exn_tx_arity(tx);
           return submodule_value(prefix, dq->name);
         }
     } catch (...) {}
@@ -9068,6 +9078,29 @@ struct Translator {
           return r;
       }
     }
+    // The same exception cited BARE because `open M` brought it into scope:
+    // read its labels from the opened unit's cmi, the way
+    // opened_module_exn_value reads the identity.  Without this the `open`
+    // spelling of an imported inline-record exception dropped its whole
+    // payload -- the record literal's labels are no named record type, so it
+    // resolved to nothing and the block carried a constant 0.  The nearest
+    // open that declares the name decides, inline record or not.
+    if (!cppcaml::dbg_env("NOEXNINLREC") &&
+        (!lid || std::holds_alternative<Lident>(lid->v)))
+      for (auto it = opened_.rbegin(); it != opened_.rend(); ++it) {
+        if (it->find('.') != std::string::npos) continue;  // submodule opens
+        if (module_base(*it)) continue;  // local module -> exn_rlabels_
+        try {
+          const auto& cmi = cmi::CmiFile::load(resolve_cmi(*it));
+          for (auto& tx : cmi.sig().typexts)
+            if (tx.name == name) {
+              if (!tx.is_inline_record) return {};
+              std::vector<std::string> r;
+              for (auto& l : tx.inline_record) r.push_back(l.name);
+              return r;
+            }
+        } catch (...) {}
+      }
     return {};
   }
   // Inline-record labels of an exception declared in a local functor
