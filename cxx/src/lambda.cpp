@@ -16138,8 +16138,22 @@ struct Translator {
     size_t oi = 0;
     while (oi < rows.size() && !std::get_if<Ppat_or>(&rows[oi].cols[0]->desc))
       ++oi;
-    if (oi < rows.size() && comps.size() >= 2 && rows[oi].aid >= 0 &&
-        rows[oi].vnames && !rows[oi].guard) {
+    //   A GUARDED or-row takes this path too.  translcore folds the guard into
+    // the row's ACTION (`if g then rhs else <fail>`, translcore.ml:585), so
+    // upstream's orpm carries it and the handler holds it ONCE, over the
+    // or-bound variables it receives as arguments -- ctype's
+    // type_subexpressions_with_free_occurrences emits `with (463 p) (if
+    // Path.exists_free ids p then .. else exit 462)` for `Tconstr (p,_,_) |
+    // Tobject (_,{contents = Some (p,_)}) | Tfunctor (_,_,{pack_path = p},_) |
+    // Tpackage {pack_path = p} when Path.exists_free ids p`.  We left the guard
+    // on every exploded alternative and re-tested it per constructor.  A guard
+    // also makes the handler non-degenerate with NO remaining column (it is not
+    // the bare re-raise simplify_exits erases), which is the only reason the
+    // single-column matrix is admitted here.  NOORGUARDH reverts.
+    bool org = oi < rows.size() && rows[oi].guard &&
+               !cppcaml::dbg_env("NOORGUARDH");
+    if (oi < rows.size() && (comps.size() >= 2 || org) && rows[oi].aid >= 0 &&
+        rows[oi].vnames && (!rows[oi].guard || org)) {
       MRow& r = rows[oi];
       std::vector<const Pattern*> alts;
       flatten_or(r.cols[0], alts);
@@ -16309,7 +16323,8 @@ struct Translator {
         bool rest_disc = false;
         for (size_t j = 1; j < r.cols.size(); ++j)
           if (!gmdef_omega(gmdef_peel(r.cols[j]))) { rest_disc = true; break; }
-        if (!(trailing_ok && alts.size() > 1 && (rest_disc || orvars.empty())))
+        if (!(trailing_ok && alts.size() > 1 &&
+              (rest_disc || orvars.empty() || r.guard)))
           return nullptr;
         static const Pattern gm_omega_pat =
             [] { Pattern p; p.desc = Ppat_any{}; return p; }();
@@ -16334,6 +16349,10 @@ struct Translator {
           MRow nr = r; nr.cols[0] = effective_pat(a);
           for (size_t j = 1; j < nr.cols.size(); ++j) nr.cols[j] = &gm_omega_pat;
           nr.aid = orn; nr.vnames = &orvars;
+          // The alternatives raise the handler UNCONDITIONALLY: upstream's
+          // mk_new_action is a bare `Lstaticraise (or_num, vars)`, the guard
+          // having travelled into the handler with the rest of the action.
+          nr.guard = nullptr;
           ex.push_back(std::move(nr));
         }
         for (size_t i = tstart; i < rows.size(); ++i) ex.push_back(rows[i]);
