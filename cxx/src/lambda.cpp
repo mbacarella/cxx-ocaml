@@ -34468,24 +34468,38 @@ struct Translator {
           tsig = sig_items_of(*pcst->mt);
         LamPtr base = mv;
         bool bound = !is_pure_path(mv);
+        bool incl_global_bound = false;  // whole-unit global bound to include/N
         if (bound) {
           Ident iid = fresh("include");
           cur.push_back({iid, ValueKind::Gen, mv});
           auto v = mk(Lam::K::Var); v->var = iid; base = v;
         } else if (mv && mv->k == Lam::K::Prim && mv->prim == Prim::Global) {
-          // `include <stdlib unit>`: ocamlc names the module once --
-          // `include/N =a (let (let/M = (global G!)) (global G!))`, the dead
-          // inner let being wrap_id_pos_list's -- and splices `field_mut i`
-          // off the binding, instead of re-reading the global per field.  A
-          // local-path include (`include Loc`) stays unbound: ocamlc splices
-          // its fields off the Var directly.
-          auto g2 = mk(Lam::K::Prim); g2->prim = Prim::Global; g2->prim_id = mv->prim_id;
-          auto dead = mk(Lam::K::Let);
-          dead->bindings = {{fresh("let"), ValueKind::Gen, mv}};
-          dead->body = g2;
+          // `include <unit>`: ocamlc binds the module once and splices
+          // `field_mut i` off the binding, instead of re-reading the global per
+          // field.  A STDLIB-ALIAS unit -- written `List`, resolving to the
+          // namespaced global `Stdlib__List` -- carries wrap_id_pos_list's dead
+          // inner let `(let (let/M = (global G!)) (global G!))`; a DIRECT unit
+          // (`Path`, whose global name EQUALS the written name) binds the bare
+          // global (ctype.ml:27 `module Path = struct include Path .. end` ->
+          // `include/N =a (global Path!)`, no dead let).  NOINCBARE reverts.
+          std::string written;
+          if (auto* mip = std::get_if<Pmod_ident>(&pin->expr.desc))
+            written = lid_last(mip->id.txt);
+          bool direct_unit = !written.empty() && written == mv->prim_id;
+          bool use_bare = direct_unit && !cppcaml::dbg_env("NOINCBARE");
+          LamPtr bindexpr = mv;                    // direct unit: bare global
+          if (!use_bare) {                         // stdlib alias (or reverted)
+            auto g2 = mk(Lam::K::Prim); g2->prim = Prim::Global;
+            g2->prim_id = mv->prim_id;
+            auto dead = mk(Lam::K::Let);
+            dead->bindings = {{fresh("let"), ValueKind::Gen, mv}};
+            dead->body = g2;
+            bindexpr = dead;
+          }
           Ident iid = fresh("include");
-          cur.push_back({iid, ValueKind::Gen, dead, /*alias=*/true});
+          cur.push_back({iid, ValueKind::Gen, bindexpr, /*alias=*/true});
           auto v = mk(Lam::K::Var); v->var = iid; base = v;
+          incl_global_bound = use_bare;
         }
         // `include M` where M is a LOCAL module: its fields shadow enclosing
         // bindings (e.g. a function parameter), so they must enter scope as
@@ -34622,7 +34636,8 @@ struct Translator {
             // Rebinding unconditionally also allocates a stamp per included
             // field, as ocamlc does.  NOINCLREBIND reverts to shadowed-only.
             static const bool no_rebind = cppcaml::dbg_env("NOINCLREBIND");
-            if ((local_include && (!no_rebind || lookup(nm))) || incl_submod) {
+            if ((local_include && (!no_rebind || lookup(nm))) || incl_submod ||
+                incl_global_bound) {
               Ident id = fresh(nm);
               cur.push_back({id, ValueKind::Gen, fi, true});  // =a alias
               scope.back()[nm] = id;
