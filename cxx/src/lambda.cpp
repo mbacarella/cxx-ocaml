@@ -1060,6 +1060,20 @@ struct Translator {
   // subs: payload-field facts, applied when the proven ctor is decomposed.
   struct GmProven { GmProof self; std::vector<GmProof> subs; };
   std::map<const Lam*, GmProven> gm_proven_comp_;
+  // NEGATIVE jump context (upstream's Context, read by mk_failaction_pos at
+  // matching.ml:3020: a missing constructor whose `Context.lub` with the
+  // current ctx is EMPTY gets no failure clause at all, so combine chooses its
+  // shape over a SMALLER cell list).  A value reaching chunk division k failed
+  // every row of the earlier groups, so an unguarded earlier row whose ONLY
+  // live column is a constructor decided by its TAG refutes that constructor
+  // at that column for every later division.  `fld >= 0` lifts the fact one
+  // level down -- the row is `K C` with a single argument, so what is refuted
+  // is C at FIELD fld of that column's payload under the outer ctor `outer`,
+  // the same one nesting depth GmProof::sub keeps.  Both constructors stay
+  // PATTERNS and are resolved by the dispatch's own `rr`, so a same-named ctor
+  // of another type can never be mistaken for this column's.
+  struct GmNeg { int col; int fld; const Pattern* outer; const Pattern* pat; };
+  std::map<const Lam*, std::vector<GmNeg>> gm_neg_comp_;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -14986,6 +15000,47 @@ struct Translator {
   // groups {1,3} first (row 3 is disjoint from row 2 in the second column),
   // then {2,4}, then {5}, then {6}.  The deferred rows are split the same way,
   // each group becoming its own half-match.
+  // A head constructor decided by its TAG alone: no argument, or an argument
+  // list that is entirely omega.  Matching it is settled by the tag, which is
+  // what makes an earlier row a NEGATIVE fact for the later divisions.
+  const Pattern* gm_bare_ctor(const Pattern* p) {
+    p = pat_deep(p);
+    auto* k = std::get_if<Ppat_construct>(&p->desc);
+    if (!k) return nullptr;
+    if (!k->arg) return p;
+    const Pattern* a = effective_pat(k->arg->get());
+    if (pat_omega_like(a)) return p;
+    if (auto* tu = std::get_if<Ppat_tuple>(&a->desc)) {
+      for (auto& e : tu->elems)
+        if (!pat_omega_like(e.get())) return nullptr;
+      return p;
+    }
+    return nullptr;
+  }
+  // The GmNeg facts an EARLIER chunk row contributes (see GmNeg).  A guarded
+  // row proves nothing -- a failing guard falls through -- and a row with two
+  // live columns refutes neither of them on its own.  The nested form takes
+  // only a NON-tuple argument: just there is the field index certainly 0 (an
+  // arity-n ctor spells its arguments as a tuple, and so does `K of (a * b)`
+  // its single one), and an inline record is not positional at all.
+  void gm_row_negs(const MRow& r, size_t ncols, std::vector<GmNeg>& out) {
+    if (r.guard || r.cols.size() != ncols) return;
+    int c = -1;
+    for (size_t j = 0; j < r.cols.size(); ++j)
+      if (!pat_omega_like(r.cols[j])) { if (c >= 0) return; c = (int)j; }
+    if (c < 0) return;
+    const Pattern* p = pat_deep(r.cols[c]);
+    if (const Pattern* b = gm_bare_ctor(p)) {
+      out.push_back({c, -1, nullptr, b});
+      return;
+    }
+    auto* k = std::get_if<Ppat_construct>(&p->desc);
+    if (!k || !k->arg) return;
+    const Pattern* a = effective_pat(k->arg->get());
+    if (std::get_if<Ppat_tuple>(&a->desc) ||
+        std::get_if<Ppat_record>(&a->desc)) return;
+    if (const Pattern* ib = gm_bare_ctor(a)) out.push_back({c, 0, p, ib});
+  }
   LamPtr gmatch_run_chunks(const std::vector<LamPtr>& comps, const std::vector<MRow>& rows,
                            const Location& mloc, int deid, const std::vector<GmDef>& denv,
                            bool (*spec)(const Pattern*), bool absorb = false) {
@@ -15133,6 +15188,18 @@ struct Translator {
       // upstream's ctx pruning.  Registered on the column CELLS for the
       // handler compile only; a rejected enclosing attempt restores the map.
       auto proven_save = gm_proven_comp_;
+      auto neg_save = gm_neg_comp_;
+      // Every row of groups 0..k-1 has failed by the time this handler runs (a
+      // miss routes to the first SURVIVING later entry, so a group the chain
+      // skipped was refuted outright) -- upstream's ctx at this exit.
+      if (!cppcaml::dbg_env("NOCTXNEG")) {
+        std::vector<GmNeg> ns;
+        for (size_t m = 0; m < k; ++m)
+          for (size_t ri : groups[m]) gm_row_negs(rows[ri], comps.size(), ns);
+        for (auto& n : ns)
+          if (n.col < (int)comps.size() && comps[n.col])
+            gm_neg_comp_[comps[n.col].get()].push_back(n);
+      }
       bool pf_here = false;
       {
         auto pit = gm_eid_proofs_.find(eids[k]);
@@ -15186,6 +15253,7 @@ struct Translator {
       LamPtr hb = gmatch(std::move(ck), std::move(cr), mloc, deid,
                          env_from(k + 1));
       gm_proven_comp_ = std::move(proven_save);
+      gm_neg_comp_ = std::move(neg_save);
       if (!hb) return nullptr;
       // A proof-pruned handler can collapse to a bare argless re-raise; the
       // catch is then an exit ALIAS upstream's simplify_exits (simplif.ml:306,
@@ -15395,6 +15463,8 @@ struct Translator {
       if (auto pvt = gm_proven_comp_.find(proto.get());
           pvt != gm_proven_comp_.end())
         gm_proven_comp_.insert_or_assign(comps[0].get(), pvt->second);
+      if (auto nvt = gm_neg_comp_.find(proto.get()); nvt != gm_neg_comp_.end())
+        gm_neg_comp_.insert_or_assign(comps[0].get(), nvt->second);
       LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(denv),
                         no_peel);
       if (!r) return nullptr;
@@ -15753,6 +15823,7 @@ struct Translator {
             auto arr_save = gm_eid_arr_;
             auto proofs_save = gm_eid_proofs_;
             auto proven_save2 = gm_proven_comp_;
+            auto neg_save2 = gm_neg_comp_;
             LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv, spec);
             bool own_dirty = false;
             if (spread_any)
@@ -15772,6 +15843,7 @@ struct Translator {
             gm_eid_arr_ = std::move(arr_save);
             gm_eid_proofs_ = std::move(proofs_save);
             gm_proven_comp_ = std::move(proven_save2);
+            gm_neg_comp_ = std::move(neg_save2);
             gm_orw_ = std::move(orw_save);
             gm_facc_proto_ = std::move(facc_save);
             next_exit_ = exit_save;
@@ -16480,6 +16552,7 @@ struct Translator {
         auto arr_save = gm_eid_arr_;
         auto proofs_save = gm_eid_proofs_;
         auto proven_save2 = gm_proven_comp_;
+        auto neg_save2 = gm_neg_comp_;
         if (cppcaml::dbg_env("ORLVDBG"))
           fprintf(stderr, "[ORLV] oi=%zu rows=%zu alts=%zu var=%d anyv=%d rx=%d "
                   "tstart=%zu loc=%d deid=%d ptot=%d\n", oi, rows.size(),
@@ -16505,6 +16578,7 @@ struct Translator {
         gm_eid_arr_ = std::move(arr_save);
         gm_eid_proofs_ = std::move(proofs_save);
         gm_proven_comp_ = std::move(proven_save2);
+        gm_neg_comp_ = std::move(neg_save2);
         bailed = false;
       }
       // The strict reading: no hoist past the or-row under the fake default,
@@ -16716,6 +16790,7 @@ struct Translator {
         auto arr_save = gm_eid_arr_;
         auto proofs_save = gm_eid_proofs_;
         auto proven_save2 = gm_proven_comp_;
+        auto neg_save2 = gm_neg_comp_;
         std::vector<LamPtr> rc = comps;
         std::swap(rc[0], rc[piv]);
         std::vector<MRow> rr = rows;
@@ -16733,6 +16808,7 @@ struct Translator {
         gm_eid_arr_ = std::move(arr_save);
         gm_eid_proofs_ = std::move(proofs_save);
         gm_proven_comp_ = std::move(proven_save2);
+        gm_neg_comp_ = std::move(neg_save2);
       }
     }
     // Nested tuple column: a tuple type is monomorphic, so every value is a k-block
@@ -16829,6 +16905,7 @@ struct Translator {
             auto arr_save = gm_eid_arr_;
             auto proofs_save = gm_eid_proofs_;
             auto proven_save2 = gm_proven_comp_;
+            auto neg_save2 = gm_neg_comp_;
             LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
                     [](const Pattern* p) {
                       return std::get_if<Ppat_record>(&p->desc) != nullptr;
@@ -16851,6 +16928,7 @@ struct Translator {
             gm_eid_arr_ = std::move(arr_save);
             gm_eid_proofs_ = std::move(proofs_save);
             gm_proven_comp_ = std::move(proven_save2);
+            gm_neg_comp_ = std::move(neg_save2);
             gm_orw_ = std::move(orw_save);
             gm_facc_proto_ = std::move(facc_save);
             next_exit_ = exit_save;
@@ -17817,6 +17895,7 @@ struct Translator {
         auto arr_save = gm_eid_arr_;
         auto proofs_save = gm_eid_proofs_;
         auto proven_save2 = gm_proven_comp_;
+        auto neg_save2 = gm_neg_comp_;
         LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
                 [](const Pattern* p) {
                   return std::get_if<Ppat_construct>(&p->desc) != nullptr;
@@ -17853,6 +17932,7 @@ struct Translator {
         gm_eid_arr_ = std::move(arr_save);
         gm_eid_proofs_ = std::move(proofs_save);
         gm_proven_comp_ = std::move(proven_save2);
+        gm_neg_comp_ = std::move(neg_save2);
         gm_orw_ = std::move(orw_save);
         gm_facc_proto_ = std::move(facc_save);
         next_exit_ = exit_save;
@@ -18166,9 +18246,35 @@ struct Translator {
     // the decision-node budget N_gap times and blows up wide sparse matches (ctype/
     // typecore) so they fall back to the caml_obj_tag if-chain -- compile it ONCE
     // behind a fresh static exit and have each gap tag emit `(exit dflt_exit)`.
+    // Constructors this column's NEGATIVE context refutes (see GmNeg): a value
+    // reaching here carries a context in which they cannot occur, so upstream
+    // emits no clause for them at all -- they are not "missing constructors"
+    // needing a failaction, and combine reads its shape off what is LEFT.  A
+    // tag some row matches is never refutable (it would say the row is dead);
+    // resolution goes through this dispatch's own `rr` + type, so a fact about
+    // a same-named ctor of a different type simply does not apply.
+    std::set<int> negc, negb;
+    if (!pv && !cppcaml::dbg_env("NOCTXNEG"))
+      if (auto nit = gm_neg_comp_.find(comps[0].get());
+          nit != gm_neg_comp_.end())
+        for (auto& n : nit->second) {
+          if (n.fld >= 0) continue;
+          const CtorInfo* ci = rr(n.pat, ctor_of(*n.pat), type_key);
+          if (!ci || ci->type != type) continue;
+          if (ci->is_block) {
+            if (!block_ci.count(ci->tag)) negb.insert(ci->tag);
+          } else if (!const_ci.count(ci->tag)) negc.insert(ci->tag);
+        }
+    bool ctx_holes = !negc.empty() || !negb.empty();
+    if (ctx_holes && cppcaml::dbg_env("CTXNEGDBG"))
+      fprintf(stderr, "[CTXNEG] line=%d type=%s NC=%d NB=%d nc=%zu nb=%zu"
+                      " var=%d rows=%zu\n", mloc.start.lnum, type.c_str(), NC,
+              NB, negc.size(), negb.size(), (int)has_var, rows.size());
     bool has_gap = false;
-    for (int t = 0; t < NC && !has_gap; ++t) if (!const_ci.count(t)) has_gap = true;
-    for (int t = 0; t < NB && !has_gap; ++t) if (!block_ci.count(t)) has_gap = true;
+    for (int t = 0; t < NC && !has_gap; ++t)
+      if (!const_ci.count(t) && !negc.count(t)) has_gap = true;
+    for (int t = 0; t < NB && !has_gap; ++t)
+      if (!block_ci.count(t) && !negb.count(t)) has_gap = true;
     bool share_dflt = has_var && has_gap && !pv;  // proven: no gaps fire
     int dflt_exit = share_dflt ? ++next_exit_ : -1;
     auto mkdflt = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = dflt_exit; return e; };
@@ -18269,6 +18375,18 @@ struct Translator {
           if (sp.sub >= 0 && sp.sub < a)
             gm_proven_comp_.insert_or_assign(ncomps[sp.sub].get(),
                                              GmProven{sp, {}});
+      // The NEGATIVE facts one level down, likewise: an earlier row `K C`
+      // refutes C at K's field, and that field cell exists only under K.
+      if (!cppcaml::dbg_env("NOCTXNEG"))
+        if (auto nit = gm_neg_comp_.find(comps[0].get());
+            nit != gm_neg_comp_.end())
+          for (auto& n : nit->second) {
+            if (n.fld < 0 || n.fld >= a) continue;
+            const CtorInfo* oci = rr(n.outer, ctor_of(*n.outer), type_key);
+            if (oci && oci->type == type && oci->is_block && oci->tag == t)
+              gm_neg_comp_[ncomps[n.fld].get()].push_back(
+                  {n.col, -1, nullptr, n.pat});
+          }
       static const Pattern any_pat = [] { Pattern p; p.desc = Ppat_any{}; return p; }();
       std::vector<MRow> sub;
       // Whether the LAST row we appended was omega at the still-UNDECOMPOSED
@@ -18383,8 +18501,21 @@ struct Translator {
     };
     if (pv) return pv->blk ? block_body(pv->tag) : const_body(pv->tag);
     std::vector<Lam::SwitchCase> consts, blocks;
-    for (int t = 0; t < NC; ++t) { LamPtr b = const_body(t); if (!b) return nullptr; consts.push_back({t, b, 0}); }
-    for (int t = 0; t < NB; ++t) { LamPtr b = block_body(t); if (!b) return nullptr; blocks.push_back({t, b, blk_arity(t)}); }
+    // A refuted tag gets no cell -- and no BODY either: building one would run
+    // its mkexit and count an arrival the tree never makes, which is exactly
+    // what the proof machinery's exact-count check is there to notice.
+    for (int t = 0; t < NC; ++t) {
+      if (negc.count(t)) continue;
+      LamPtr b = const_body(t);
+      if (!b) return nullptr;
+      consts.push_back({t, b, 0});
+    }
+    for (int t = 0; t < NB; ++t) {
+      if (negb.count(t)) continue;
+      LamPtr b = block_body(t);
+      if (!b) return nullptr;
+      blocks.push_back({t, b, blk_arity(t)});
+    }
     // PROVEN-total match (completed GADT refutation): upstream's glob_total
     // mk_failaction_pos adds no final-exit fails, so an uncovered tag has no
     // cell at all -- the switch stays SPARSE and bytegen's hole rule (plus a
@@ -18480,7 +18611,7 @@ struct Translator {
         if (LamPtr t = canfail_const_dispatch(comps[0], consts, fexit)) return t;
       return const_dispatch(comps[0], consts, /*has_block=*/NB > 0);
     };
-    if (tp_holes) {
+    if (tp_holes || ctx_holes) {
       // Shape choice over the STORED cells (upstream's combine sees only the
       // sparse cell list): all stored blocks one action -> isint split (act0 =
       // same_actions nonconsts, a singleton included); otherwise the sparse
@@ -18515,6 +18646,16 @@ struct Translator {
     } else if (NC == 1 && NB == 1) {
       auto i = mk(Lam::K::IfThenElse);
       i->cond = comps[0]; i->then_ = blocks[0].body; i->else_ = consts[0].body; result = i;
+      // One of the two cells is a GAP, i.e. upstream's combine has a
+      // FAILACTION here -- and `combine_constructor`'s collapse-to-one-action
+      // case is `None, Some act` (matching.ml:3284): with a failaction the
+      // test is emitted even when both cells carry the same action.  Stamp the
+      // test so collapse_equal_if leaves it alone if a later single-use
+      // inlining happens to make the two arms identical (`(if (field 0 x)
+      // (exit 8) (exit 8))` in matching's own filter_rec).  NODGRPGAP reverts.
+      if ((const_ci.empty() || block_ci.empty()) &&
+          !cppcaml::dbg_env("NODGRPGAP"))
+        i->gm_dgrp_test = true;
     } else if (NB >= 2 && NC >= 1 &&
                [&]{ for (auto& b : blocks) if (!same_action(b.body, blocks[0].body)) return false;
                     return true; }()) {
