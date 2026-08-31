@@ -1761,6 +1761,24 @@ struct Translator {
   // include Path .. end` shadows the unit; `Path.Pident id` must still build
   // the unit's ctor).  Maps the local module name -> the included unit.
   std::unordered_map<std::string, std::string> local_include_units_;
+  // A BARE `#t` written INSIDE such a module names the INCLUDED unit's
+  // abbreviation, which neither a local decl nor the qualified `M.t` key can
+  // reach: matching.ml's `module Simple = struct include Patterns.Simple ..
+  // end` writes `| #view as view ->` for `Patterns.Simple.view`, and its
+  // sibling wrappers General/Half_simple each re-export a DIFFERENT `view`, so
+  // a file-wide bare registration would pick whichever came last.  Record each
+  // wrapper's source span instead and let the lookup take the innermost one
+  // containing the pattern.
+  struct PvIncScope { int lo; int hi; std::string mod_; };
+  std::vector<PvIncScope> pv_include_scopes_;
+  std::string pv_include_scope_at(int cnum) const {
+    const PvIncScope* best = nullptr;
+    for (auto& s : pv_include_scopes_)
+      if (cnum >= s.lo && cnum < s.hi &&
+          (!best || s.hi - s.lo < best->hi - best->lo))
+        best = &s;
+    return best ? best->mod_ : std::string();
+  }
   // The module whose cmi declares the ctors reachable as `name.Ctor`: the
   // name itself when it is an imported unit, the included unit for a local
   // include-wrapper module, empty when unresolvable (a plain local module).
@@ -2543,6 +2561,9 @@ struct Translator {
                     // a qualified `Path.Pident` must resolve through the
                     // INCLUDED unit's ctors (see ctor_module_of).
                     local_include_units_[*pm->binding.name.txt] = dotted;
+                    pv_include_scopes_.push_back({item.loc.start.cnum,
+                                                  item.loc.end.cnum,
+                                                  *pm->binding.name.txt});
                   }
                 }
     each_decl([&](const TypeDeclaration& d) {  // then records
@@ -22257,6 +22278,20 @@ struct Translator {
     if (!ok) {
       tags.clear(); seen.clear();
       ok = pv_flatten(lid_last(pt->id.txt), tags, seen);
+    }
+    // Last: the enclosing include-wrapper module's re-export
+    // (pv_include_scopes_).  Without it `#view` is UNRESOLVABLE, gmatch's
+    // poly-variant column declines the row (neither a variant nor a var) and
+    // the whole match falls back to the naive per-row test chain -- three
+    // `(if (isint v) 0 (== (field_imm 0 v) h))` probes in SOURCE order, where
+    // upstream binds the hash ONCE and runs a sorted `!=` sequence into a
+    // shared handler (Matching.explode_or_pat).
+    if (!ok && !cppcaml::dbg_env("NOPVINCSCOPE")) {
+      std::string m = pv_include_scope_at(p->loc.start.cnum);
+      if (!m.empty()) {
+        tags.clear(); seen.clear();
+        ok = pv_flatten(m + "." + lid_last(pt->id.txt), tags, seen);
+      }
     }
     if (!ok || tags.empty()) return nullptr;
     std::vector<PatBox> leaves;
