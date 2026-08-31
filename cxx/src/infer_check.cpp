@@ -1804,6 +1804,50 @@ struct Checker {
           return s->second;
       if (!fold_abbrevs_ && std::holds_alternative<Ldot>(c->id.txt.v))
         if (TypePtr r = expand_qualified_abbrev(c->id.txt, as)) return r;
+      // ...and a BARE name that `open M` brought into scope expands exactly as
+      // its qualified spelling would.  Only the Ldot branch above expanded, so
+      // `open Errortrace` + `(tr : 'variant trace)` left the annotation an
+      // OPAQUE constr where the declaration says `(type_expr,'variant) elt
+      // list`.  With the element type unknown, the expected type of `raise_for
+      // tr_exn (Escape e)`'s argument was whatever the bare ctor inferred
+      // bottom-up -- ctype's own `exception Escape` -- so type-directed
+      // disambiguation had nothing to read and the construct built the
+      // EXCEPTION where the trace ELEMENT belongs, while every consumer of the
+      // trace resolves `Escape` with no shadow in scope and reads the variant.
+      // Only where nothing NEARER owns the name: a local alias takes the
+      // branch above, and a local opaque declaration (tenv stamp) shadows the
+      // open outright.  NOOPENABBREV reverts.
+      static const bool no_open_abbrev = std::getenv("NOOPENABBREV") != nullptr;
+      if (!fold_abbrevs_ && !keep_local_abbrevs_ &&
+          std::holds_alternative<Lident>(c->id.txt.v) &&
+          ai == type_aliases.end() && !tenv_lookup(nm) &&
+          !no_open_abbrev)
+        if (auto q = opened_type_quals_.find(nm); q != opened_type_quals_.end())
+          if (auto dot = q->second.rfind('.'); dot != std::string::npos) {
+            std::vector<std::string> comps;
+            for (size_t i = 0, j; i <= dot; i = j + 1) {
+              j = q->second.find('.', i);
+              if (j > dot) j = dot;
+              comps.push_back(q->second.substr(i, j - i));
+            }
+            // ...and only down to a PREDEFINED head (`elt list`, an arrow, a
+            // tuple).  Those are the heads an expectation has to see through
+            // to reach an element/argument type, and no unit's nominal type
+            // can be confused with them.  An expansion that merely renames one
+            // of the SAME unit's nominal types buys nothing here and costs:
+            // `Typedtree.pattern = value general_pattern` let matching.ml's
+            // `pattern` meet `Half_simple.pattern = view pattern_data` through
+            // the shared `pattern_data`, and our row unification -- weaker
+            // than ocamlc's, which never brings those two together -- opened
+            // the closed `view` row, so an exhaustive polyvariant dispatch
+            // grew an escape (matching.cmo 131/725 -> 198/826, measured).
+            if (TypePtr r = expand_abbrev_comps(comps, nm, as)) {
+              TypePtr rr = I::Engine::repr(r);
+              if (rr->kind != I::Type::Kind::Constr ||
+                  rr->path.find('.') == std::string::npos)
+                return r;
+            }
+          }
       // Inside a functor-result-signature instantiation: a bare name that is one
       // of RS's own abstract types resolves to the per-instantiation fresh var.
       if (!functor_result_abstract_.empty())
@@ -1942,9 +1986,16 @@ struct Checker {
   // or datatype decls stay constrs).
   TypePtr expand_qualified_abbrev(const Longident& id, const std::vector<TypePtr>& as) {
     auto* d = std::get_if<Ldot>(&id.v);
-    if (!d || cmi_expanding_.count(d->name)) return nullptr;
-    auto comps = mod_components(*d->prefix);
-    if (comps.empty()) return nullptr;
+    if (!d) return nullptr;
+    return expand_abbrev_comps(mod_components(*d->prefix), d->name, as);
+  }
+  // The same, addressed by the module path's COMPONENTS and the bare type name
+  // instead of a written Longident -- which is what a name brought into scope
+  // by `open M` needs, there being no `Ldot` node to read the module off.
+  TypePtr expand_abbrev_comps(const std::vector<std::string>& comps,
+                              const std::string& tname,
+                              const std::vector<TypePtr>& as) {
+    if (comps.empty() || cmi_expanding_.count(tname)) return nullptr;
     auto* saved = cmi_types_ctx_;
     try {
       std::deque<const cmi::CmiFile*> loaded;
@@ -1958,7 +2009,7 @@ struct Checker {
       }
       if (sig)
         for (auto& td : sig->types)
-          if (td.name == d->name && td.manifest &&
+          if (td.name == tname && td.manifest &&
               td.kind != cmi::TypeDecl::Open &&  // keep `Effect.t = 'a eff = ..` as Effect.t
               td.params.size() == as.size()) {
             std::unordered_map<cmi::TypeExpr*, TypePtr> m2;

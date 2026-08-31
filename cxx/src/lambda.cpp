@@ -26853,12 +26853,43 @@ struct Translator {
       bool exn_typed_expr = false;
       if (auto ecx = vk.expr_constr.find(&e); ecx != vk.expr_constr.end())
         exn_typed_expr = ecx->second == "exn";
+      // ...and a MODULE's variant answers the same way.  `builtin_ctors_`
+      // marks a ctor an `open`ed unit registered, and a local `exception E`
+      // does NOT un-mark it (only a local `type` declaration does), so the
+      // shadow rule below hands every such name to the exception -- rightly,
+      // absent other evidence.  Here there IS evidence: the checker typed this
+      // construct at a unit's variant that declares the name, which is what
+      // ocaml's type-directed disambiguation reads.  ctype `open Errortrace`s
+      // an `elt` with an `Escape` ctor and then declares `exception Escape of
+      // type_expr escape`; its `with Escape e -> raise_for tr_exn (Escape e)`
+      // means the trace ELEMENT (tag 3), and we built the exception -- while
+      // every consumer of that trace resolves `Escape` with no shadow in scope
+      // and reads tag 3.  A producer/consumer split, not a fidelity diff, and
+      // one no exec test reaches: it needs the shadowing module to build the
+      // value and another to take it apart.  Never in RAISE position, where
+      // the head is exn-typed by construction, and only when the cited type
+      // provably declares the name at the WRITTEN shape.  NOVARSHADOW reverts.
+      const CtorInfo* variant_typed = nullptr;
+      if (!raise_pos && !cppcaml::dbg_env("NOVARSHADOW") &&
+          std::holds_alternative<Lident>(k->id.txt.v) &&
+          (exn_ident_.count(n) || exn_field_.count(n)))
+        if (auto ec = vk.expr_constr.find(&e); ec != vk.expr_constr.end())
+          if (ec->second != "exn")
+            if (const CtorInfo* tci = module_typed_ctor(ec->second, n);
+                tci && tci->is_block == k->arg.has_value()) {
+              variant_typed = tci;
+              if (cppcaml::dbg_env("CTDBG"))
+                fprintf(stderr, "[CTDBG] variant-shadow ctor %s -> %s tag=%d\n",
+                        n.c_str(), ec->second.c_str(), tci->tag);
+            }
       bool exn_shadows = (exn_ident_.count(n) || exn_field_.count(n)) &&
-                         !predef_typed && !qci &&
+                         !predef_typed && !qci && !variant_typed &&
                          (raise_pos || !ctor_info_.count(n) ||
                           builtin_ctors_.count(n) ||
                           (exn_typed_expr && exn_decl_nearest_raw(n)));
-      const CtorInfo* cip = qci ? qci : predef_typed;
+      const CtorInfo* cip = qci        ? qci
+                            : predef_typed ? predef_typed
+                                           : variant_typed;
       if (!cip) { auto ci = ctor_info_.find(n); if (ci != ctor_info_.end()) cip = &ci->second; }
       // `open M` (M separately compiled) exporting an exception E shadows a same-
       // named PERVASIVE variant ctor (Stdlib's result.Ok / .Error).  In RAISE
