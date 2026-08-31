@@ -15067,6 +15067,65 @@ struct Translator {
           }
         }
       }
+      // The LAST division of a chain that partitions a PROVEN-exhaustive
+      // match is ctx-Total: a value reaching it failed every earlier group's
+      // rows and, the groups partitioning the match, must match this one --
+      // its misses would go STRAIGHT to the match's Match_failure (denv is
+      // empty), which proven exhaustiveness says never fires.  precompile_or
+      // hands every division the WHOLE match's partiality, so upstream
+      // compiles the final pm with its tests established (btype's
+      // merge_fixed_explanation chain ends in a bare `exit 5 fixed2`).
+      // Tests drop but binds stay: a top-level alias peels onto the column
+      // var -- the pm entry's own alias-peel rule -- and a payload bind or a
+      // non-var aliased column declines.  A guard anywhere in the matrix
+      // withdraws the licence (a failing guard DOES fall through), as does a
+      // row outside an arm.  Only gm_ptot_deid_ licenses this: gm_fake_deid_
+      // also holds for a PARTIAL no-catchall match, whose final misses are a
+      // live Match_failure.  Row-level or-alternatives (row_or) only -- the
+      // or-handler totality licence's chunk-driver face (an orpm compiles
+      // under the WHOLE match's partiality, matching.ml:1760): for a PLAIN
+      // last row the same argument holds semantically, but accepting it
+      // launders a grouping upstream never made (ctype's unify_row_field:
+      // 3 groups where upstream's division is 1, |norm| 474 -> 482).
+      // NOCHUNKTOTAL reverts.
+      if (cr.size() == 1 && cr[0].row_or && k + 1 == groups.size() &&
+          denv.empty() && deid == gm_ptot_deid_ &&
+          !cppcaml::dbg_env("NOCHUNKTOTAL")) {
+        bool guardfree = true;
+        for (auto& rr : rows)
+          if (rr.guard || rr.aid < 0) { guardfree = false; break; }
+        if (guardfree) {
+          static const Pattern gm_total_any =
+              [] { Pattern p; p.desc = Ppat_any{}; return p; }();
+          std::vector<const Pattern*> nc = cr[0].cols;
+          std::vector<std::pair<std::string, Ident>> nb;
+          bool okx = true;
+          for (size_t j = 0; j < nc.size() && okx; ++j) {
+            const Pattern* c = nc[j];
+            for (;;) {
+              if (auto* pa = std::get_if<Ppat_alias>(&c->desc)) {
+                if (j >= comps.size() || !comps[j] ||
+                    comps[j]->k != Lam::K::Var) { okx = false; break; }
+                nb.push_back({pa->name.txt, comps[j]->var});
+                c = pa->p.get(); continue;
+              }
+              const Pattern* e = effective_pat(c);
+              if (e != c) { c = e; continue; }
+              break;
+            }
+            if (!okx) break;
+            if (pat_omega_like(c)) { nc[j] = c; continue; }
+            std::vector<std::string> vs;
+            collect_gvars(c, vs);
+            if (!vs.empty()) { okx = false; break; }
+            nc[j] = &gm_total_any;
+          }
+          if (okx) {
+            cr[0].cols = std::move(nc);
+            for (auto& b : nb) cr[0].binds.push_back(b);
+          }
+        }
+      }
       // Per-COLUMN jump context: when every tracked arrival at this handler
       // established the same column fact (and the tracked count matches the
       // exits actually in the tree, so no untracked path reaches it), the
