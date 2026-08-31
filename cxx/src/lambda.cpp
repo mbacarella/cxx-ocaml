@@ -13769,6 +13769,7 @@ struct Translator {
     }
     if (auto rt = two_run_switcher(scrut, consts, has_block)) return rt;
     auto sw = mk(Lam::K::Switch); sw->cond = scrut; sw->sw_consts = consts;
+    sw->gm_cdflat = true;   // revisit after wire_garms (reswitch_flat_consts)
     return sw;
   }
   // as_interval over a TOTAL (fail=None) SPARSE constant side: the licensed
@@ -19543,6 +19544,38 @@ struct Translator {
     if (l->k == Lam::K::Switch && l->sw_blocks.size() >= 2)
       l = share_actions_and_refail(l);
   }
+  // The const-only twin of share_switches_rec, for the same post-wire reason.
+  // A dense constant dispatch reaches call_switcher's as_interval_nofail
+  // (matching.ml:2855), which merges ADJACENT cells whose actions are EQUAL
+  // under the store into one interval, and the Switcher then emits tests
+  // rather than a jump table for a handful of intervals.  Upstream keys the
+  // COMPILED arm bodies there; gmatch's cells are still `(exit aid)` arm
+  // placeholders when const_dispatch runs (arms are wired afterward, single-use
+  // handlers inlined), so two source arms with alpha-equal bodies key apart and
+  // every cell looks distinct -- a 3-cell `A | B | B` stayed a flat switch
+  // where upstream had already collapsed it to `(if x B A)` (env.ml:3402
+  // `Val_unbound_self` / `Val_unbound_ancestor`, both `Not_an_instance_variable
+  // name`).  Only the node const_dispatch itself marked is revisited: every
+  // other constant dispatch (canfail_const_dispatch, total_const_dispatch,
+  // interval_switcher) already ran the interval decision on cells that were
+  // never arm placeholders.  Post-order, matching the twin.
+  void reswitch_flat_consts(LamPtr& l) {
+    if (!l) return;
+    reswitch_flat_consts(l->fn); reswitch_flat_consts(l->cond);
+    reswitch_flat_consts(l->then_); reswitch_flat_consts(l->else_);
+    reswitch_flat_consts(l->body); reswitch_flat_consts(l->sw_default);
+    for (auto& a : l->args) reswitch_flat_consts(a);
+    for (auto& b : l->bindings) reswitch_flat_consts(b.val);
+    for (auto& sc : l->sw_consts) reswitch_flat_consts(sc.body);
+    for (auto& sc : l->sw_blocks) reswitch_flat_consts(sc.body);
+    if (l->k != Lam::K::Switch || !l->gm_cdflat) return;
+    l->gm_cdflat = false;                       // decided; never revisit twice
+    if (!l->sw_blocks.empty() || l->sw_default) return;
+    if (cppcaml::dbg_env("NORESWCONST")) return;
+    LamPtr rt =
+      two_run_switcher(l->cond, l->sw_consts, /*has_block=*/false);
+    if (rt) l = rt;
+  }
   // Walk an expanded string-test tree back to its action slots, in `sw` order:
   // a gm_str_arm node holds sw[i] in `else_` and the rest of the tree in
   // `then_`, a plain gm_str_node holds a lower subtree on each side (the
@@ -19818,6 +19851,7 @@ struct Translator {
       fprintf(stderr, "[STRDBG] post-wire:\n"); print_dlambda(body, std::cerr);
     }
     share_switches_rec(body);
+    reswitch_flat_consts(body);
     share_string_trees(body);
     LamPtr dbody;
     if (catchall) {
@@ -21960,6 +21994,7 @@ struct Translator {
     }
     wire_garms(body, arms);
     share_switches_rec(body);
+    reswitch_flat_consts(body);
     share_string_trees(body);
     LamPtr dbody;
     if (catchall) {

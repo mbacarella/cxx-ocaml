@@ -234,6 +234,14 @@ struct Lam {
   // `(exit aid)` arm placeholders at expansion time.
   bool gm_str_node = false;
   bool gm_str_arm = false;
+  // gm_cdflat: the FLAT const-only switch const_dispatch falls back to when its
+  // cells carry no two equal actions.  gmatch assembles that dispatch while its
+  // leaves are still `(exit aid)` arm placeholders, so two source arms with
+  // alpha-equal bodies key apart there and every cell looks distinct; upstream
+  // keys the COMPILED bodies inside call_switcher.  reswitch_flat_consts
+  // revisits the marked node after wire_garms and re-runs the interval decision
+  // on the wired bodies -- the const-only twin of share_switches_rec.
+  bool gm_cdflat = false;
   // gm_str_share: one of share_actions_tree's shared-action handler catches.
   // Like the gm_str_dflt catch it is built by a pass that upstream runs
   // OUTSIDE Bytegen's expansion, so a materialized bind_sw let sinks under it.
