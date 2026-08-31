@@ -14865,8 +14865,16 @@ struct Translator {
     }
     const Pattern* ex = effective_pat(pa[0]);
     const Pattern* ey = effective_pat(qa[0]);
-    if (rec) {
-      // may_compat looks through aliases (parmatch.ml's Tpat_alias arm).
+    // may_compat looks through aliases (parmatch.ml's Tpat_alias arm), and it
+    // does so at EVERY depth: `rec` is about descending into a constructor's
+    // ARGUMENTS, which is where our head-only reading stops, and an alias is
+    // not a depth at all -- `Some Univar _ as x` heads the same constructor
+    // `Some Univar _` does.  Reading it as opaque made every column an arm
+    // binds through look compatible with everything, so safe_before failed and
+    // collect's group split where upstream's does not (btype's
+    // merge_fixed_explanation: `None, None` is disjoint from all eight
+    // `as x` rows and belongs in the FIRST group).  NOALIASCOMPAT reverts.
+    if (!cppcaml::dbg_env("NOALIASCOMPAT")) {
       if (auto* ax = std::get_if<Ppat_alias>(&ex->desc))
         return gm_pair_disjoint(ax->p.get(), ey, rec);
       if (auto* ay = std::get_if<Ppat_alias>(&ey->desc))
@@ -14943,7 +14951,21 @@ struct Translator {
   // unguarded rows whose action is the same literal have the same
   // Lambda.make_key, which is what upstream compares.
   bool gm_same_action(const MRow& a, const MRow& b) {
-    if (a.aid >= 0 && a.aid == b.aid) return true;
+    if (a.aid >= 0 && a.aid == b.aid) {
+      // ... but two ALTERNATIVES of one or-arm are not the same action when
+      // the or binds anything: explode_or_pat FRESHENS each alternative's
+      // binders ("to avoid reusing the same identifier in distinct exploded
+      // branches", matching.ml:345), so the alternatives raise the arm's
+      // exit with DIFFERENT idents and make_key separates them.  Binding
+      // nothing, both raise a bare `exit aid` and the actions are equal.
+      // A row-level or (gmatch_tuple_top's altcols) is the case where the
+      // arm's WHOLE binder list sits inside the or, so vnames decides it.
+      // NOORALTACT reverts.
+      if (a.row_or && b.row_or && &a != &b && a.vnames && !a.vnames->empty() &&
+          !cppcaml::dbg_env("NOORALTACT"))
+        return false;
+      return true;
+    }
     if (a.guard || b.guard || !a.rhs || !b.rhs) return false;
     auto* ea = std::get_if<Pexp_constant>(&a.rhs->desc);
     auto* eb = std::get_if<Pexp_constant>(&b.rhs->desc);
