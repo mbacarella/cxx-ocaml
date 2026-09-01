@@ -280,6 +280,16 @@ struct Lam {
   // out single-use/unreachable (or the node sits at the body root, where the
   // wire-time root placement is already upstream's), the node is spliced out.
   bool gm_orp = false;
+  // gm_phantom_or: the id of an or-handler catch upstream's precompile_or
+  // allocates here (do_cases, matching.ml:1830: `or_num = next_raise_count ()`
+  // for EVERY or-headed row of EVERY pm) and we correctly do NOT emit, because
+  // simplify_exits erases it -- `Lstaticcatch (l1,(i,[]),Lstaticraise _)`,
+  // simplif.ml:306.  It is still there when share_actions_sw runs (matching.ml
+  // :3345, well before Simplif), and Lambda.make_key keeps a catch's exit id
+  // verbatim, so two otherwise alpha-equal switch arms each carrying one of
+  // these do NOT share upstream.  oc_make_key reads this to say the same.
+  // 0 = none; ids are unique per allocation.
+  int gm_phantom_or = 0;
   // gm_orp_rest: the pending catch is for a BINDING col-0 or-row that still
   // had remaining columns when consumed (and is not a row-level alternation).
   // Upstream then keeps the trailing catch-all in do_split's `no` cluster, so

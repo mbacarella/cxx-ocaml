@@ -947,6 +947,10 @@ struct Translator {
   // from the scrutinee.  Rewritten at every wrap (exit ids are reused across a
   // bailed build attempt).
   std::map<int, std::vector<std::string>> gm_orp_pv_;
+  // Ids for the precompile_or handler catches we elide (Lam::gm_phantom_or):
+  // a private counter, NOT next_exit_ -- the catch never reaches the tree, and
+  // an exit id consumed here would shift every wire-time id comparison.
+  int gm_phantom_ctr_ = 0;
   // Sentinel or-node key: blocks every nested trampoline for an arm, used where
   // the manual precompile_or path already wires that arm's catch itself.
   static const Pattern* gm_orw_all() {
@@ -10204,7 +10208,18 @@ struct Translator {
       return n->prim_arg < arity ? n->prim_arg : -1;
     };
     std::map<int, std::string> env;  // binder stamp -> replacement key text
+    std::function<std::string(const LamPtr&)> tr_body;
+    //   An elided precompile_or handler catch (see Lam::gm_phantom_or) is two
+    // upstream nodes -- the Lstaticcatch and the bare re-raise that is its
+    // handler -- and its exit id is part of the key.
     std::function<std::string(const LamPtr&)> tr = [&](const LamPtr& n) -> std::string {
+      if (!n || !n->gm_phantom_or) return tr_body(n);
+      if (!in_const && (count += 2) > 32) return "";
+      std::string k = tr_body(n);
+      if (k.empty()) return "";
+      return "(PH" + std::to_string(n->gm_phantom_or) + " " + k + ")";
+    };
+    tr_body = [&](const LamPtr& n) -> std::string {
       if (!n) return "_";
       const bool av = alias_val; alias_val = false;   // consumed by this node
       if (!in_const) {
@@ -16759,6 +16774,8 @@ struct Translator {
         std::vector<MRow> ex;
         // (aid, gm_orp_rest, trampoline, pre-assigned forwarding exit or -1)
         std::vector<std::tuple<int, bool, bool, int>> wrapped;
+        // an elided precompile_or catch (see Lam::gm_phantom_or)
+        bool phantom = false;
         for (auto& rr : rows) {
           std::vector<const Pattern*> alts; flatten_or(rr.cols[0], alts);
           int fwd = -1;
@@ -16831,6 +16848,25 @@ struct Translator {
                 }
               }
             }
+            //   With NO remaining column the trampoline above is declined,
+            // because simplify_exits erases that catch (`Lstaticcatch
+            // (l1,(i,[]),Lstaticraise _)`, simplif.ml:306) and it must not
+            // reach the bytecode.  Upstream still ALLOCATES it -- do_cases
+            // gives every or-headed row of every pm its own `or_num`
+            // (matching.ml:1830) and compile_orhandlers wraps the catch
+            // (:3534) -- and share_actions_sw runs long before Simplif, over
+            // Lambda.make_key, which keeps a catch's exit id verbatim.  So the
+            // catch is invisible in the emitted lambda yet decisive for
+            // SHARING: `Insert (Unit | Named (None,_)) | Delete (Unit | Named
+            // (None,_))` (includemod's `update`) gives the Insert and Delete
+            // arms one such catch EACH, with different ids, and upstream
+            // therefore leaves the two alpha-equal arms unshared.  Record the
+            // allocation so oc_make_key can say the same.
+            else if (comps.size() < 2 && !rr.guard &&
+                     !cppcaml::dbg_env("NOPHANTOMOR") &&
+                     !gm_orw_.count({rr.aid, gm_orw_all()}) &&
+                     gm_orw_.insert({rr.aid, rr.cols[0]}).second)
+              phantom = true;
           }
           for (auto* a : alts) {
             MRow nr = rr; nr.cols[0] = effective_pat(a);
@@ -16838,10 +16874,25 @@ struct Translator {
             ex.push_back(std::move(nr));
           }
         }
-        std::string c0key = wrapped.empty()
+        std::string c0key = wrapped.empty() && !phantom
             ? std::string() : cppcaml::lambda::make_lam_key(comps[0]);
         LamPtr sub = gmatch(std::move(comps), std::move(ex), mloc, deid, std::move(denv));
         if (!sub) return nullptr;
+        if (phantom) {
+          // Same placement as a real or-handler catch: inside the single
+          // leading let that binds the or-column's own scrutinee, outside
+          // everything else.  compile_orhandlers emits NO catch when the
+          // compiled body is already a raise (`raw_action r`, matching.ml
+          // :3524), so neither do we.
+          LamPtr* slot = &sub;
+          Lam* l = slot->get();
+          if (l && l->k == Lam::K::Let && l->body && l->bindings.size() == 1 &&
+              !c0key.empty() && l->bindings[0].val &&
+              cppcaml::lambda::make_lam_key(l->bindings[0].val) == c0key)
+            slot = &l->body;
+          if (*slot && (*slot)->k != Lam::K::Staticraise)
+            (*slot)->gm_phantom_or = ++gm_phantom_ctr_;
+        }
         for (auto [aid, orest, tramp, fwd] : wrapped) {
           // Upstream binds the or-column's OWN scrutinee before splitting, so
           // the catch sits inside that one materialized binding (typedecl's
