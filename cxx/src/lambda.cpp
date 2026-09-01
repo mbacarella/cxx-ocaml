@@ -4526,7 +4526,31 @@ struct Translator {
   // scoping), so this only governs until the next such decl -- enough for the
   // `M.{ .. }` pattern itself.
   void register_local_module_records(const std::string& mod) {
-    auto it = mod_record_types_.find(mod);
+    // `open Defs` inside `module Functor_inclusion_diff = struct module Defs =
+    // struct type state = {res;env;subst} end  open Defs .. end` names the
+    // module RELATIVE to the enclosing structure, but mod_record_types_ is
+    // keyed by the unit-relative FULL dotted path
+    // ("Functor_inclusion_diff.Defs"), so the bare lookup missed and the open
+    // brought NOTHING into scope: every `state.env` below it then took the
+    // last-registered record declaring an `env` label (includemod's
+    // Error.signature_symptom, env@0 of nine fields, where Defs.state has
+    // env@1 of three).  Search the enclosing module path outwards -- innermost
+    // first, as scoping demands -- before the unit-wide bare key.
+    // NOOPENREL reverts.
+    auto it = mod_record_types_.end();
+    if (!cppcaml::dbg_env("NOOPENREL")) {
+      std::string rel = mod_path_;             // "Includemod.Functor_..."
+      size_t fd = rel.find('.');               // drop the unit component
+      rel = fd == std::string::npos ? std::string() : rel.substr(fd + 1);
+      while (!rel.empty()) {
+        auto ri = mod_record_types_.find(rel + "." + mod);
+        if (ri != mod_record_types_.end()) { it = ri; break; }
+        size_t ld = rel.rfind('.');
+        if (ld == std::string::npos) break;
+        rel.erase(ld);
+      }
+    }
+    if (it == mod_record_types_.end()) it = mod_record_types_.find(mod);
     if (it == mod_record_types_.end()) return;
     for (auto& key : it->second) {
       auto tfi = type_field_info_.find(key);
