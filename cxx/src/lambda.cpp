@@ -15021,6 +15021,29 @@ struct Translator {
       return true;
     }
     if (a.guard || b.guard || !a.rhs || !b.rhs) return false;
+    // safe_before's `same_actions` is make_key equality on the ACTION LAMBDAS,
+    // and `make_key (Lvar x)` is the ident itself: two rows whose body is a
+    // bare variable are ONE action when it is the same variable and neither
+    // row's own pattern binds it (a row-bound `x` is a different ident, and
+    // explode_or_pat even freshens one per alternative).  matching.ml:211
+    // simpl_under_orpat is the shape -- `Tpat_any | Tpat_var _ -> p` and the
+    // closing `_ -> p` both return the function's own parameter.
+    // NOSAMEACTVAR reverts.
+    if (!cppcaml::dbg_env("NOSAMEACTVAR")) {
+      auto* ia = std::get_if<Pexp_ident>(&a.rhs->desc);
+      auto* ib = std::get_if<Pexp_ident>(&b.rhs->desc);
+      if (ia && ib && std::get_if<Lident>(&ia->id.txt.v) &&
+          std::get_if<Lident>(&ib->id.txt.v) &&
+          lid_last(ia->id.txt) == lid_last(ib->id.txt)) {
+        const std::string& nm = lid_last(ia->id.txt);
+        auto binds_nm = [&](const MRow& r) {
+          std::vector<std::string> vs;
+          for (auto* c : r.cols) collect_gvars(c, vs);
+          return std::find(vs.begin(), vs.end(), nm) != vs.end();
+        };
+        if (!binds_nm(a) && !binds_nm(b)) return true;
+      }
+    }
     auto* ea = std::get_if<Pexp_constant>(&a.rhs->desc);
     auto* eb = std::get_if<Pexp_constant>(&b.rhs->desc);
     return ea && eb && gm_const_eq(ea->c, eb->c);
@@ -19801,6 +19824,39 @@ struct Translator {
       apats.push_back(rows[i].lhs);
     }
     if (mrows.empty()) return nullptr;
+    // do_split (matching.ml:1583) scans the rows in order and puts a SIMPLE
+    // row into `rev_before` -- AHEAD of the or-rows collected so far --
+    // whenever safe_before (:1341) holds: the two whole rows incompatible, or
+    // carrying the SAME ACTION.  precompile_or then lays the body out as
+    // `cls @ exploded alternatives`, so an or-row that every following row
+    // may pass -- the closing catch-all included, when it shares the or-row's
+    // action -- ends up BELOW that catch-all with DEAD alternatives.  Their
+    // constructors become missing ones and reintroduce_fail folds them into
+    // the switch default.  We park the catch-all as `deid` instead of keeping
+    // it in the matrix, so the demotion has to be spelled here, as a DELETION
+    // of the subsumed or-row: matching.ml:211 simpl_under_orpat is the shape
+    // (`Tpat_any | Tpat_var _ -> p` ahead of `_ -> p`), where upstream emits
+    // neither a `case int 0` nor a `case tag 0` and we emitted both plus a
+    // duplicated default body.  Sound on its own terms: a value that matched
+    // the or-row now meets only rows disjoint from it or answering the same,
+    // then the catch-all's identical action.  NOORDEMOTE reverts.
+    if (catchall && !cppcaml::dbg_env("NOORDEMOTE")) {
+      MRow ca; ca.rhs = catchall->rhs; ca.cols.push_back(catchall->lhs);
+      for (size_t i = 0; i < mrows.size(); ++i) {
+        if (mrows[i].guard || !std::get_if<Ppat_or>(&mrows[i].cols[0]->desc))
+          continue;
+        if (!gm_same_action(ca, mrows[i])) continue;
+        bool pass = true;
+        for (size_t j = i + 1; pass && j < mrows.size(); ++j)
+          pass = !mrows[j].guard && (gm_same_action(mrows[j], mrows[i]) ||
+                                     gm_rows_disjoint_rec(mrows[j], mrows[i]));
+        if (!pass) continue;
+        mrows.erase(mrows.begin() + i);
+        apats.erase(apats.begin() + i);
+        --i;
+      }
+      if (mrows.empty()) return nullptr;
+    }
     LamPtr sv = scrut; Ident tv; bool need_temp = scrut->k != Lam::K::Var;
     if (need_temp) { tv = fresh("", true); sv = varof(tv); }
     std::vector<GArm> arms(mrows.size());
