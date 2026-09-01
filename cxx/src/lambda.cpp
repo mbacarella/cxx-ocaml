@@ -1074,6 +1074,19 @@ struct Translator {
   // of another type can never be mistaken for this column's.
   struct GmNeg { int col; int fld; const Pattern* outer; const Pattern* pat; };
   std::map<const Lam*, std::vector<GmNeg>> gm_neg_comp_;
+  //   The CONJUNCTIVE form.  A failed row with ONE live column refutes that
+  // column's head outright (GmNeg above); a failed row with TWO live columns
+  // refutes neither on its own -- but it does refute the two heads TOGETHER,
+  // provided the row is irrefutable once they hold (both cells bare heads over
+  // omega arguments, no guard).  Descending into one of the two discharges
+  // half the conjunction and the other half becomes an ordinary per-column
+  // refutation, for that arm only.  Keyed by scrutinee NODE, like gm_neg_comp_,
+  // so a column drop between the producer and the consumer cannot misalign it.
+  struct GmNeg2 {
+    const Lam* a; const Pattern* pa;
+    const Lam* b; const Pattern* pb;
+  };
+  std::vector<GmNeg2> gm_neg2_;
   // When set, gmatch destructures a nested tuple/record column into its element
   // columns (no tag test -- every value of the type is a k-block).  Off by default:
   // it is a second-attempt escalation in gmatch_top, guarded by g_gm_budget_ so the
@@ -15263,6 +15276,30 @@ struct Translator {
           if (n.col < (int)comps.size() && comps[n.col])
             gm_neg_comp_[comps[n.col].get()].push_back(n);
       }
+      // The same rows' CONJUNCTIVE facts (see GmNeg2): a two-column row that is
+      // irrefutable once both its heads hold has already taken every value that
+      // carries them, so no later group can see that pair.
+      auto neg2_save = gm_neg2_;
+      if (!cppcaml::dbg_env("NOCTXNEG2"))
+        for (size_t m = 0; m < k; ++m)
+          for (size_t ri : groups[m]) {
+            const MRow& rw = rows[ri];
+            if (rw.guard || rw.spread ||
+                rw.cols.size() != comps.size()) continue;
+            int c1 = -1, c2 = -1;
+            bool wide = false;
+            for (size_t j = 0; j < rw.cols.size(); ++j) {
+              if (pat_omega_like(rw.cols[j])) continue;
+              if (c1 < 0) c1 = (int)j;
+              else if (c2 < 0) c2 = (int)j;
+              else { wide = true; break; }
+            }
+            if (wide || c2 < 0 || !comps[c1] || !comps[c2]) continue;
+            const Pattern* p1 = gm_bare_ctor(rw.cols[c1]);
+            const Pattern* p2 = gm_bare_ctor(rw.cols[c2]);
+            if (!p1 || !p2) continue;
+            gm_neg2_.push_back({comps[c1].get(), p1, comps[c2].get(), p2});
+          }
       bool pf_here = false;
       {
         auto pit = gm_eid_proofs_.find(eids[k]);
@@ -15317,6 +15354,7 @@ struct Translator {
                          env_from(k + 1));
       gm_proven_comp_ = std::move(proven_save);
       gm_neg_comp_ = std::move(neg_save);
+      gm_neg2_ = std::move(neg2_save);
       if (!hb) return nullptr;
       // A proof-pruned handler can collapse to a bare argless re-raise; the
       // catch is then an exit ALIAS upstream's simplify_exits (simplif.ml:306,
@@ -18392,9 +18430,52 @@ struct Translator {
     bool share_dflt = has_var && has_gap && !pv;  // proven: no gaps fire
     int dflt_exit = share_dflt ? ++next_exit_ : -1;
     auto mkdflt = [&] { auto e = mk(Lam::K::Staticraise); e->prim_arg = dflt_exit; return e; };
+    //   Discharging half a CONJUNCTIVE fact (GmNeg2): inside this tag's arm the
+    // fact's own head holds, so its partner head is refuted for the arm and
+    // becomes an ordinary GmNeg on the partner column -- which is how the
+    // `(Ok _, Ok (_,_))` row of an earlier chunk tells includemod's last
+    // division that `cc_res` cannot be `Ok` under `cc_arg = Ok`, exactly the
+    // dead cell upstream's `partial = Total` drops (mk_failaction_neg,
+    // matching.ml:2966 -- comp_match_handlers hands every division the WHOLE
+    // match's partiality).  Scoped to the arm: the entries are popped again on
+    // the way out.  NOCTXNEG2 reverts.
+    std::vector<std::pair<const Lam*, size_t>> neg2_tch;   // key, size BEFORE
+    auto neg2_arm = [&](int t, bool is_block) {
+      neg2_tch.clear();
+      if (gm_neg2_.empty() || pv || cppcaml::dbg_env("NOCTXNEG2")) return;
+      const Lam* self = comps[0].get();
+      for (auto& fct : gm_neg2_) {
+        const Pattern* mine; const Lam* other; const Pattern* opat;
+        if (fct.a == self)      { mine = fct.pa; other = fct.b; opat = fct.pb; }
+        else if (fct.b == self) { mine = fct.pb; other = fct.a; opat = fct.pa; }
+        else continue;
+        if (!other || other == self) continue;
+        const CtorInfo* ci = rr(mine, ctor_of(*mine), type_key);
+        if (!ci || ci->type != type || ci->is_block != is_block || ci->tag != t)
+          continue;
+        auto& v = gm_neg_comp_[other];
+        neg2_tch.push_back({other, v.size()});
+        v.push_back({-1, -1, nullptr, opat});
+      }
+    };
+    struct Neg2Pop {
+      std::map<const Lam*, std::vector<GmNeg>>* m;
+      std::vector<std::pair<const Lam*, size_t>>* v;
+      ~Neg2Pop() {
+        for (auto it = v->rbegin(); it != v->rend(); ++it) {
+          auto e = m->find(it->first);
+          if (e == m->end() || e->second.size() <= it->second) continue;
+          e->second.resize(it->second);
+          if (e->second.empty()) m->erase(e);
+        }
+        v->clear();
+      }
+    };
     // Build the body for one constant tag t: matching-t const rows + all var rows.
     auto const_body = [&](int t) -> LamPtr {
       if (share_dflt && !const_ci.count(t)) return mkdflt();   // gap: shared default
+      neg2_arm(t, /*is_block=*/false);
+      Neg2Pop neg2_pop{&gm_neg_comp_, &neg2_tch};
       std::vector<MRow> sub;
       for (auto& r : rows) {
         auto* k = std::get_if<Ppat_construct>(&r.cols[0]->desc);
@@ -18412,6 +18493,8 @@ struct Translator {
     };
     // Build the body for one block tag t, expanding its `arity` fields as columns.
     auto block_body = [&](int t) -> LamPtr {
+      neg2_arm(t, /*is_block=*/true);
+      Neg2Pop neg2_pop{&gm_neg_comp_, &neg2_tch};
       auto bi = block_ci.find(t);
       if (bi == block_ci.end()) {         // gap tag: only var rows reach it (no field probe)
         if (share_dflt) return mkdflt();                      // shared default
