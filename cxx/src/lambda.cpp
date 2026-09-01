@@ -24166,6 +24166,35 @@ struct Translator {
     // Match_failure the default pm would have to raise); not modelled here.
     if ((is_int && is_char) || dflt.empty() || dflt.back()->guard || kvs.empty() ||
         (kvs.size() < 2 && !has_interval)) return nullptr;
+    // Overlapping ranges are resolved FIRST-MATCH-WINS rather than bailed on.
+    // type_pat expands a char range into a Tpat_or chain of its constants
+    // (typecore.ml:2176), so when divide_constant groups the rows by constant
+    // key each value belongs to the FIRST row that names it -- an earlier
+    // newline arm keeps 10 out of a later C0 range arm (oprint.ml:88,
+    // escape_string).  Subtracting the already-claimed values in source order
+    // splits such a range into several disjoint pieces, which is what the
+    // interval cover below wants: as_interval re-merges any run that ends up
+    // adjacent under an equal action.  NORANGEOVERLAP reverts to the bail.
+    if (!cppcaml::dbg_env("NORANGEOVERLAP")) {
+      std::vector<KV> keep;                      // disjoint, still source order
+      for (auto& kv : kvs) {
+        std::vector<std::pair<long long, long long>> parts{{kv.lo, kv.hi}};
+        for (auto& k : keep) {
+          std::vector<std::pair<long long, long long>> nxt;
+          for (auto& pc : parts) {
+            if (k.hi < pc.first || k.lo > pc.second) {
+              nxt.push_back(pc); continue;
+            }
+            if (pc.first < k.lo) nxt.push_back({pc.first, k.lo - 1});
+            if (k.hi < pc.second) nxt.push_back({k.hi + 1, pc.second});
+          }
+          parts.swap(nxt);
+        }
+        for (auto& pc : parts) keep.push_back({pc.first, pc.second, kv.rhs});
+      }
+      kvs.swap(keep);
+      if (kvs.empty()) return nullptr;           // every row fully shadowed
+    }
     std::sort(kvs.begin(), kvs.end(), [](auto& a, auto& b) { return a.lo < b.lo; });
     for (size_t i = 1; i < kvs.size(); ++i)
       if (kvs[i].lo <= kvs[i - 1].hi) return nullptr;  // overlapping ranges: bail
