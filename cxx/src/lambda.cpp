@@ -16215,7 +16215,34 @@ struct Translator {
     // single-column matrix is admitted here.  NOORGUARDH reverts.
     bool org = oi < rows.size() && rows[oi].guard &&
                !cppcaml::dbg_env("NOORGUARDH");
-    if (oi < rows.size() && (comps.size() >= 2 || org) && rows[oi].aid >= 0 &&
+    //   A SINGLE-COLUMN or-row takes precompile_or's route as well, and there
+    // what matters is not the handler but the exit ARGUMENTS: upstream's
+    // or_num carries only patbound_action_vars -- what the OR-PATTERN itself
+    // binds -- so an `as x` peeled off the row travels as an Alias let in the
+    // action and every exploded alternative raises a BARE `(exit or_num)`.
+    // abstract_shared (switch.ml:982) then REUSES that exit for the shared
+    // cells (as_simple_exit) instead of allocating a catch of its own, which
+    // is how upstream's handler comes to sit outside the tag let and the isint
+    // split: matching.ml:211 of_clause, `( `Constant _ | `Tuple _ | .. ) as
+    // view -> stop p view` over General.view's eleven tags.  We kept the ARM's
+    // vnames on each alternative, so the leaves read `(exit aid view)` -- not
+    // a simple exit -- and oc_call_switcher's abstract_shared wrapped a catch
+    // INSIDE call_switcher_variant_constr's `variant` let, one stack slot
+    // deeper than upstream's: each raise to it then wanted the `POP 1`
+    // upstream emits ahead of its branch, and every ACC/ASSIGN of the shared
+    // exit block shifted by one.
+    //   Only where the row is genuinely last AND the default is the fake one.
+    // gmatch_top parks a trailing catch-all as deid and wires its catch at the
+    // ROOT, where upstream's default-environment catch is INSIDE the
+    // or-handler (types.ml:872 link_type, `Tlink _ | Texpand _ as d` ahead of
+    // `_`) -- with a real deid the two would nest the wrong way round.
+    // NOORSINGLE reverts.
+    bool ors1 = oi + 1 == rows.size() && comps.size() == 1 &&
+                !rows[oi].guard && rows[oi].vnames &&
+                !rows[oi].vnames->empty() && deid == gm_fake_deid_ &&
+                !cppcaml::dbg_env("NOORSINGLE");
+    if (oi < rows.size() && (comps.size() >= 2 || org || ors1) &&
+        rows[oi].aid >= 0 &&
         rows[oi].vnames && (!rows[oi].guard || org)) {
       MRow& r = rows[oi];
       std::vector<const Pattern*> alts;
@@ -16670,9 +16697,14 @@ struct Translator {
       // bytecomp/dll.ml's `open_dll` (four rows exhaustive with no wildcard)
       // kept a residual `For_execution` test and raised at dll.ml:81, where
       // upstream's ctx-Total orpm emits neither.
+      //   For the single-column row above, `lead` is safe_before and nothing
+      // else: with no column left the handler pm collapses to the row's own
+      // action, so it can invent neither a test nor a Match_failure and needs
+      // no totality budget of its own.
       if (LamPtr res = attempt(deid == gm_fake_deid_ ? oi + 1 : tstart, false,
                                lead_ok ||
-                               (lead_sb && (tpx || deid != gm_fake_deid_))))
+                               (lead_sb &&
+                                (tpx || deid != gm_fake_deid_ || ors1))))
         return res;
       if (bailed) return nullptr;
     }
