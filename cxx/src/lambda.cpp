@@ -9979,6 +9979,11 @@ struct Translator {
   }
   std::vector<Lam*> exit_spine_;  // the Let nodes above the exit being inlined
   size_t exit_floor_ = 0;         // spine entries below this are past a test
+  // The catch being inlined came from simplify_local_functions (gm_lfcatch):
+  // its exit arguments are a local function's ARGUMENTS, which upstream binds
+  // Strict and simplify_lets then keeps.  NOLFSTRICT reverts to the Alias
+  // treatment every other catch gets.
+  bool exit_lf_ = false;
   // Replace the single `(exit id args)` with `let vars = args in handler` (Strict
   // lets, last var outermost -- matching simplif's fold_left2).
   void inline_exit(LamPtr& l, int id, const std::vector<Ident>& vars,
@@ -10027,16 +10032,26 @@ struct Translator {
       // pure order flip -- every arg takes the plain branch and the first ends
       // up OUTERMOST -- which reverses a group of constant optional-defaults
       // (predef's `*opt*;*opt*;param`) and a diffing.cmo exit-arg trio.
+      // A local function's argument (exit_lf_) is an ordinary expression that
+      // upstream binds Strict and simplify_lets then KEEPS -- unless it is the
+      // from_alias tag, where the argument stood for a variable simplify_exits
+      // still had, so upstream's own binding was `Llet(Strict, p, Lvar w, ..)`
+      // and got substituted after all.  Every other catch keeps the blanket
+      // Alias reading: its args stand in for the matcher's leaf binds.
+      auto arg_alias = [&](size_t i) {
+        return is_alias_dup(l->args[i]) &&
+               (!exit_lf_ || l->args[i]->from_alias);
+      };
       bool sink = false;
       if (!cppcaml::dbg_env("NOLOWEREXIT") && l->args.size() == vars.size())
         for (size_t i = 0; i < l->args.size(); ++i)
           if (!hoisted[i] && l->args[i]->k != Lam::K::Var &&
-              is_alias_dup(l->args[i])) { sink = true; break; }
+              arg_alias(i)) { sink = true; break; }
       if (sink) {
         for (size_t i = vars.size(); i-- > 0; ) {
           if (hoisted[i]) continue;
           ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
-          bool dup = is_alias_dup(l->args[i]);
+          bool dup = arg_alias(i);
           if (dup && l->args[i]->k != Lam::K::Var) {
             res = lower_bind(vars[i], k, l->args[i], res);
             continue;
@@ -10054,7 +10069,7 @@ struct Translator {
           ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
           // A dup-able arg (var / field_imm chain) is the pattern-var Alias
           // binding ocamlc's leaf would have made -- simplif substitutes it.
-          let->bindings = {{vars[i], k, l->args[i], is_alias_dup(l->args[i])}};
+          let->bindings = {{vars[i], k, l->args[i], arg_alias(i)}};
           let->body = res; res = let;
         }
       l = res; return;
@@ -10743,7 +10758,9 @@ struct Translator {
     if (n == 1 && bad == 0) {
       LamPtr body = l->cond;
       exit_spine_.clear(); exit_floor_ = 0;
+      exit_lf_ = l->gm_lfcatch && !cppcaml::dbg_env("NOLFSTRICT");
       inline_exit(body, l->prim_arg, l->catch_vars, l->catch_var_kinds, l->then_);
+      exit_lf_ = false;
       l = body;
     }
   }
@@ -11831,6 +11848,7 @@ struct Translator {
         auto cat = mk(Lam::K::Catch);
         cat->cond = inner;
         cat->prim_arg = st;
+        cat->gm_lfcatch = true;   // its exit args bind Strict (inline_exit)
         cat->then_ = hb;
         for (auto& p : fnp->params) {
           cat->catch_vars.push_back(p.first);

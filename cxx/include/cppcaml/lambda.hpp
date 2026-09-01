@@ -209,6 +209,16 @@ struct Lam {
   // string_switch builds the same structure during lambda generation, so this
   // flag exempts it from simplify_static_catches to match that layout.
   bool keep_catch = false;
+  // gm_lfcatch: the static catch simplify_local_functions made out of a LOCAL
+  // FUNCTION (simplif.ml:821), not one of gmatch's arm catches.  Upstream's
+  // simplify_exits binds every inlined exit argument with `Llet(Strict, ..)`
+  // (simplif.ml:290), and simplify_lets keeps a Strict binding whatever its use
+  // count -- only a `Lvar` initializer is substituted.  Our exit args stand in
+  // for the ALIAS pattern binds ocamlc's matcher leaves behind, so inline_exit
+  // marks a dup-able arg Alias; a local function's arguments are ordinary
+  // expressions and must stay Strict, so the beta-reduced parameter keeps its
+  // own stack slot.
+  bool gm_lfcatch = false;
   // gm_str_dflt: gmatch's string-column default catch (the fresh exit
   // expand_stringswitch's make_catch would create in Bytegen).  If arm wiring
   // leaves its handler a BARE `(exit j)` (the default arm was multi-use, so
