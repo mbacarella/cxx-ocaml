@@ -19878,7 +19878,28 @@ struct Translator {
     } else if (!defer_fail)
       dbody = raise_predef("Match_failure", mloc, "gmatch_dft");
     LamPtr res = body;
-    if (dcatch) dcatch->then_ = dbody;
+    // simplif.ml:305's ALIAS rule: a catch whose handler is a bare argless
+    // `(exit j)` is never emitted -- every `(exit deid)` simply becomes
+    // `(exit j)`, however many times it is raised.  The catch-all row's action
+    // is exactly that when it is SHARED with another row -- `| _ | exception
+    // Not_found -> path` (env.ml:1441) compiles the `_` arm to the exception
+    // side's exit -- and the whole-unit Simplif that would collapse the level
+    // upstream has already run by the time this subtree is built.  Left
+    // standing, the extra level costs a stack adjustment: the switch default
+    // emitted `POP 1; BRANCH` into the shared `POP 1` where upstream's add_pop
+    // had already merged the two into `POP 2; BRANCH` past it.  exn_case_body
+    // applies the same rule to its own compile_match; this is gmatch's default
+    // park.  Only THIS catch: a blanket pass over every argless catch with a
+    // bare-exit handler is MEASURED WRONG -- it reorders switch arms and costs
+    // byte-identity in errortrace, mtype, simplif, stable_matching and
+    // typedecl_separability, whose bare-exit handlers are ours, not
+    // upstream's.  NOCATCHALIAS reverts.
+    if (dcatch && dbody && dcatch->cond && !cppcaml::dbg_env("NOCATCHALIAS") &&
+        dbody->k == Lam::K::Staticraise && dbody->args.empty()) {
+      LamPtr inner = dcatch->cond;
+      retarget_exit(inner, deid, dbody->prim_arg);
+      *dcatch = *inner;                 // in place: arm catches wrap dcatch
+    } else if (dcatch) dcatch->then_ = dbody;
     else if (!defer_fail && uses == 1 && bad == 0)
       inline_exit(res, deid, {}, {}, dbody);
     // AFTER the catchall inline: the string-column make_catch decision (below)
