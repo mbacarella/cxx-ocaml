@@ -3001,6 +3001,30 @@ struct Translator {
     }
     return std::nullopt;
   }
+  // The rec_types_ key of a DEEP dotted type path naming a record of THIS
+  // unit's own nested modules (`I.Defs.state`, with `module I =
+  // Functor_inclusion_diff`): expand a local alias head, then look the type up
+  // under its full module path.  nested_typed_record_field cannot see it --
+  // there is no `I.cmi` -- so an ambiguous label on such a base fell through to
+  // the bare find_field, which takes the last-registered same-named record
+  // (includemod's `Error.signature_symptom` has env@0/subst@1, `Defs.state`
+  // env@1/subst@2, and the update built a 9-field block for a 3-field record).
+  // NOLOCALDEEP reverts.
+  std::string local_record_key(const std::string& p) {
+    if (cppcaml::dbg_env("NOLOCALDEEP")) return {};
+    std::string q = expand_alias_head(p);
+    auto dpos = q.rfind('.');
+    if (dpos == std::string::npos) return {};
+    std::string mod = q.substr(0, dpos), ty = q.substr(dpos + 1);
+    auto mr = mod_record_types_.find(mod);
+    if (mr == mod_record_types_.end()) return {};
+    for (auto& key : mr->second)
+      if (key == ty || (key.size() > ty.size() + 1 &&
+                        key.compare(0, ty.size(), ty) == 0 &&
+                        key[ty.size()] == '#'))
+        if (rec_types_.count(key)) return key;
+    return {};
+  }
   // Tag a var bound by an inline-record-ctor field pattern (`Pattern {penv}`) with
   // its field's record type, so a later `penv.env` resolves the ambiguous label.
   void tag_inline_field_var(const Pattern* sub, const CtorInfo& ci, int ix) {
@@ -26415,6 +26439,17 @@ struct Translator {
               fmut = std::move(sr->mut);
               rt = &std_rt;
             }
+          // A DEEP path naming a record of THIS unit (`I.Defs.state`): its
+          // layout is in rec_types_, not in any cmi.  Same rank as the stdlib
+          // leg above -- the inferred path is authoritative, so it must beat
+          // the find_field-by-name hit below (see local_record_key).
+          if (!rt)
+            if (std::string lk = local_record_key(p); !lk.empty())
+              if (auto it = rec_types_.find(lk);
+                  it != rec_types_.end() && has_all_labels(&it->second)) {
+                rt = &it->second;
+                fmut = it->second.fmut;
+              }
         }
         if (!rt)
         if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
@@ -26859,6 +26894,22 @@ struct Translator {
           // where a Subst.t was expected and segfaulted every interface-
           // mismatch report of the bootstrapped compiler).
           std::string mod = p.substr(0, dpos), ty = p.substr(dpos + 1);
+          // ... unless the path names a record of THIS unit, which has no cmi.
+          if (std::string lk = local_record_key(p); !lk.empty())
+            if (auto tf = type_field_info_.find(lk);
+                tf != type_field_info_.end())
+              if (auto fi = tf->second.find(lbl); fi != tf->second.end()) {
+                if (fi->second.unboxed) return expr(*fe->e);
+                auto l = mk(Lam::K::Prim);
+                auto lrt = rec_types_.find(lk);
+                l->prim = (lrt != rec_types_.end() && lrt->second.flat)
+                              ? Prim::Floatfield
+                          : fi->second.kind == ValueKind::Int ? Prim::FieldInt
+                          : fi->second.mut                   ? Prim::FieldMut
+                                                             : Prim::FieldImm;
+                l->prim_arg = fi->second.index; l->args = {expr(*fe->e)};
+                return l;
+              }
           if (auto rf = nested_typed_record_field(mod, ty, lbl)) {
             if (rf->unboxed) return expr(*fe->e);
             auto l = mk(Lam::K::Prim);
@@ -27026,6 +27077,27 @@ struct Translator {
         l->args = {expr(*sf->obj), expr(*sf->value)};
         return l;
       }
+      // The WRITE twin of the read path's deep-local-path leg (see
+      // local_record_key), ranked the same way.  Without it the READ of an
+      // ambiguous label resolved through the inferred path while the write
+      // kept the bare find_field offset -- read one field, write another.
+      if (auto it = vk.expr_constr.find(sf->obj.get());
+          it != vk.expr_constr.end())
+        if (std::string lk = local_record_key(it->second); !lk.empty())
+          if (auto tf = type_field_info_.find(lk);
+              tf != type_field_info_.end())
+            if (auto fi = tf->second.find(lid_last(sf->field.txt));
+                fi != tf->second.end() && !fi->second.unboxed) {
+              auto l = mk(Lam::K::Prim);
+              auto lrt = rec_types_.find(lk);
+              l->prim = (lrt != rec_types_.end() && lrt->second.flat)
+                            ? Prim::SetFloatfield
+                        : fi->second.kind == ValueKind::Int ? Prim::SetfieldImm
+                                                            : Prim::SetfieldPtr;
+              l->prim_arg = fi->second.index;
+              l->args = {expr(*sf->obj), expr(*sf->value)};
+              return l;
+            }
       if (auto* fi = find_field(lid_last(sf->field.txt))) {
         auto l = mk(Lam::K::Prim);
         auto rt = rec_types_.find(fi->type);
