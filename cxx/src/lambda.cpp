@@ -34705,6 +34705,16 @@ struct Translator {
               Ident mid = fresh_scoped(nm);
               cur.push_back({mid, ValueKind::Gen, mv});
               module_ident_[nm] = mid;
+              // The THIRD site of the sibling-postlude-alias rule (see NOFAPP
+              // above): a module bound by anything other than a bare struct or
+              // a functor body -- `module Diff = Diffing.Define(Defs)` -- got
+              // here without erasing the bare-name alias a closed SIBLING's
+              // inner module left behind, and module_base consults
+              // module_alias_ FIRST, so Functor_app_diff's
+              // `Diff.Right_variadic` read Functor_inclusion_diff.Diff's field
+              // instead of its own binding.  NOFAPP3 reverts.
+              static const bool no_fapp_sh3 = std::getenv("NOFAPP3") != nullptr;
+              if (!no_fapp_sh3) module_alias_.erase(nm);
               add_export(nm, mid, modsig::NS::Module, msub);
             }
           }
