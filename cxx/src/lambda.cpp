@@ -6578,8 +6578,27 @@ struct Translator {
       for (size_t pos = dot; pos != std::string::npos;) {
         size_t nd = dotted.find('.', pos + 1);
         std::string comp = dotted.substr(pos + 1, nd == std::string::npos ? std::string::npos : nd - pos - 1);
-        const cmi::Signature* next = nullptr;
-        for (auto& md : sig->modules) if (md.name == comp) { next = mt_sig(cmi, md.type); break; }
+        const cmi::ModuleDecl* found = nullptr;
+        for (auto& md : sig->modules)
+          if (md.name == comp) { found = &md; break; }
+        if (!found) return std::nullopt;
+        // A submodule ALIAS (Stdlib's `module Lexing = Stdlib__Lexing`) carries
+        // no inline signature, so mt_sig answers null and the walk stopped dead
+        // here: `{ Stdlib.Lexing.pos_fname = .. }` found no layout at all, fell
+        // through to the caller's bare label legs, and was built in a
+        // same-labelled DECOY's field order.  Resolve at the alias target plus
+        // the remaining components, exactly as the `_named` twin
+        // nested_typed_record_field already does.  NOALIASNESTLAY reverts.
+        if (!cppcaml::dbg_env("NOALIASNESTLAY") && found->type &&
+            found->type->kind == cmi::ModuleType::Alias && found->type->path) {
+          std::string tgt = cmi_path_dotted(*found->type->path);
+          if (!tgt.empty()) {
+            std::string rest =
+                (nd == std::string::npos) ? "" : dotted.substr(nd);
+            return nested_record_layout(tgt + rest, label, ty);
+          }
+        }
+        const cmi::Signature* next = mt_sig(cmi, found->type);
         if (!next) return std::nullopt;
         sig = next; pos = nd;
       }
