@@ -6194,18 +6194,25 @@ struct Translator {
           std::string tgt = cmi_path_dotted(*found->type->path);
           if (!tgt.empty()) {
             std::string rest = (nd == std::string::npos) ? "" : dotted.substr(nd);
-            if (auto r = nested_typed_record_field(tgt + rest, ty, label))
-              return r;
             // ... and a target that names a SIBLING of this same signature is
-            // stored RELATIVE to it, so that recursion re-entered at a bare
-            // name that resolve_cmi cannot find: retry re-rooted at the prefix
-            // already walked.  See nested_record_layout's by-label twin for the
-            // full rationale.  NOSIBALIASROOT reverts.
+            // stored RELATIVE to it, so a plain recursion re-enters at a bare
+            // name that resolve_cmi cannot find, while a sibling of that name
+            // SHADOWS any unit of it: re-root at the prefix already walked and
+            // try that first.  See nested_record_layout's by-label twin for
+            // the full rationale.  NOSIBALIASROOT / NOSIBALIASFIRST revert.
+            std::string rr;
             if (!cppcaml::dbg_env("NOSIBALIASROOT") &&
                 tgt.find('.') == std::string::npos)
-              if (std::string rr = dotted.substr(0, pos) + "." + tgt + rest;
-                  rr != dotted)
-                return nested_typed_record_field(rr, ty, label);
+              if (std::string c = dotted.substr(0, pos) + "." + tgt + rest;
+                  c != dotted)
+                rr = c;
+            bool late = cppcaml::dbg_env("NOSIBALIASFIRST");
+            if (!rr.empty() && !late)
+              if (auto r = nested_typed_record_field(rr, ty, label)) return r;
+            if (auto r = nested_typed_record_field(tgt + rest, ty, label))
+              return r;
+            if (!rr.empty() && late)
+              return nested_typed_record_field(rr, ty, label);
             return std::nullopt;
           }
         }
@@ -6623,23 +6630,34 @@ struct Translator {
           if (!tgt.empty()) {
             std::string rest =
                 (nd == std::string::npos) ? "" : dotted.substr(nd);
-            if (auto r = nested_record_layout(tgt + rest, label, ty)) return r;
             // `module A2 = A1` names a SIBLING of the enclosing signature, so
-            // the cmi stores that target RELATIVE to it: the recursion above
-            // re-entered at a bare "A1", which names no unit, so the walk died
-            // and the literal fell through to the caller's bare label legs --
-            // built in a same-labelled DECOY's field order.  Retry once with
-            // the target re-rooted at the prefix already walked (`S457m.A1`).
-            // Strictly a second chance: a target that IS a unit (Stdlib's
-            // `module Lexing = Stdlib__Lexing`) has already returned above.
-            // A signature's alias may only cite a PRECEDING sibling, so this
-            // cannot cycle; the `rr != dotted` guard covers the one shape that
-            // could, an alias shadowing the outer name it aliases.
+            // the cmi stores that target RELATIVE to it -- a bare "A1", which
+            // names no unit, so a plain recursion died there and the literal
+            // fell through to the caller's bare label legs, built in a
+            // same-labelled DECOY's field order.  Re-root it at the prefix
+            // already walked (`S457m.A1`) and try THAT FIRST: OCaml resolves
+            // an alias in its own signature's scope, where a sibling SHADOWS a
+            // compilation unit of the same name (probe s459), so the unit is
+            // only the fallback -- `module Lexing = Stdlib__Lexing` has no
+            // sibling of that name, the re-root finds nothing and the unit
+            // still wins (probe s464).  A signature's alias may only cite a
+            // PRECEDING sibling, so this cannot cycle; the `rr != dotted`
+            // guard covers the one shape that could, an alias shadowing the
+            // outer name it aliases.  NOSIBALIASROOT drops the re-root
+            // entirely; NOSIBALIASFIRST keeps it at its old position, behind
+            // the unit leg.
+            std::string rr;
             if (!cppcaml::dbg_env("NOSIBALIASROOT") &&
                 tgt.find('.') == std::string::npos)
-              if (std::string rr = dotted.substr(0, pos) + "." + tgt + rest;
-                  rr != dotted)
-                return nested_record_layout(rr, label, ty);
+              if (std::string c = dotted.substr(0, pos) + "." + tgt + rest;
+                  c != dotted)
+                rr = c;
+            bool late = cppcaml::dbg_env("NOSIBALIASFIRST");
+            if (!rr.empty() && !late)
+              if (auto r = nested_record_layout(rr, label, ty)) return r;
+            if (auto r = nested_record_layout(tgt + rest, label, ty)) return r;
+            if (!rr.empty() && late)
+              return nested_record_layout(rr, label, ty);
             return std::nullopt;
           }
         }

@@ -2367,8 +2367,9 @@ struct Checker {
   // to the bare-name registry, which answers with whatever same-labelled record
   // was registered last.  Resolve the target among `encl`'s own modules
   // instead, hopping while one sibling alias cites another (`A3 = A2 = A1`).
-  // Called only where module_sig has already returned null, so it can only add
-  // an answer where there was none.  NOSIBALIASSIG reverts.
+  // Answers only for a bare, single-component target, which is exactly the
+  // shape a sibling has; a dotted or unit-named target falls through to
+  // module_sig.  NOSIBALIASSIG reverts.
   const cmi::Signature* sibling_alias_sig(
       const cmi::Signature* encl, const cmi::ModuleDecl* md,
       std::deque<const cmi::CmiFile*>& loaded) {
@@ -2392,6 +2393,24 @@ struct Checker {
       want = next;
     }
     return nullptr;
+  }
+
+  // A bare alias target is resolved in the enclosing SIGNATURE's own scope,
+  // where a sibling module SHADOWS a compilation unit of the same name, so
+  // the sibling has to be tried BEFORE module_sig -- which knows only the
+  // stdlib name and then a unit of that name, and would answer with the
+  // shadowed unit's field order (probe s459).  A target with no sibling of
+  // its name (`module Lexing = Stdlib__Lexing`) still resolves to the unit,
+  // since sibling_alias_sig declines it.  NOSIBALIASFIRST restores S380's
+  // order, the sibling only as a fallback; NOSIBALIASSIG drops it entirely.
+  const cmi::Signature* next_module_sig(
+      const cmi::Signature* encl, const cmi::ModuleDecl* md,
+      std::deque<const cmi::CmiFile*>& loaded) {
+    static const bool late = std::getenv("NOSIBALIASFIRST") != nullptr;
+    if (!late)
+      if (auto* s = sibling_alias_sig(encl, md, loaded)) return s;
+    if (auto* s = md ? module_sig(md->type, loaded) : nullptr) return s;
+    return late ? sibling_alias_sig(encl, md, loaded) : nullptr;
   }
   // The signature of a module-decl type, following an alias (e.g. stdlib's
   // `module Array = Stdlib__Array`) by loading the aliased cmi into `loaded`.
@@ -3022,8 +3041,7 @@ struct Checker {
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
-        const cmi::Signature* nxt = md ? module_sig(md->type, loaded) : nullptr;
-        if (!nxt) nxt = sibling_alias_sig(sig, md, loaded);
+        const cmi::Signature* nxt = next_module_sig(sig, md, loaded);
         sig = nxt;
       }
       if (!sig) return;
@@ -3094,8 +3112,7 @@ struct Checker {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
           if (mm.name == comps[i]) { md = &mm; break; }
-        const cmi::Signature* nxt = md ? module_sig(md->type, loaded) : nullptr;
-        if (!nxt) nxt = sibling_alias_sig(sig, md, loaded);
+        const cmi::Signature* nxt = next_module_sig(sig, md, loaded);
         sig = nxt;
         if (sig) {
           scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
