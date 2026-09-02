@@ -2472,9 +2472,10 @@ struct Translator {
 
   void register_types(const Structure& s) {
     auto each_decl = [&](auto fn) {
-      for (auto& item : s)
+      each_spliced_item(s, [&](const StructureItem& item) {
         if (auto* td = std::get_if<Pstr_type>(&item.desc))
           for (auto& d : td->decls) fn(d);
+      });
     };
     each_decl([&](const TypeDeclaration& d) {  // variants first (records may cite them)
       if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
@@ -2829,9 +2830,15 @@ struct Translator {
           for (auto& b : prm->bindings)
             if (auto* ps = peel_to_structure(b.expr))
               nested(ps->items, sub_modpath(modpath, b.name.txt));
+        // An include inside a submodule splices at THAT module's path, so its
+        // items are registered under `modpath` -- not under a sub-path of it.
+        if (!cppcaml::dbg_env("NOINCSPLICE"))
+          if (auto* inc = std::get_if<Pstr_include>(&item.desc))
+            if (auto* ps = peel_to_structure(inc->expr))
+              nested(ps->items, modpath);
       }
     };
-    for (auto& item : s) {
+    each_spliced_item(s, [&](const StructureItem& item) {
       if (auto* pm = std::get_if<Pstr_module>(&item.desc))
         if (auto* ps = peel_to_structure(pm->binding.expr))
           nested(ps->items, sub_modpath("", pm->binding.name.txt));
@@ -2839,7 +2846,7 @@ struct Translator {
         for (auto& b : prm->bindings)
           if (auto* ps = peel_to_structure(b.expr))
             nested(ps->items, sub_modpath("", b.name.txt));
-    }
+    });
   }
   // The tables register_types writes are keyed by SHORT names and are
   // file-wide, which is right for a structure ITEM (a top-level `module M =
@@ -2935,6 +2942,25 @@ struct Translator {
       if (auto* pc = std::get_if<Pmod_constraint>(&me->desc)) { me = pc->me.get(); continue; }
       if (auto* pf = std::get_if<Pmod_functor>(&me->desc)) { me = pf->body.get(); continue; }
       return std::get_if<Pmod_structure>(&me->desc);
+    }
+  }
+  // `include struct .. end` -- with or without an `: sig .. end` ascription --
+  // SPLICES its items into the ENCLOSING structure: a type declared inside one
+  // is a type of the enclosing module, and its labels/constructors are in scope
+  // exactly as if the declaration had been written directly.  The registration
+  // passes only ever walked `Pstr_type` items at the level they were handed, so
+  // such a type was registered NOWHERE: its record built a constant 0 and every
+  // field read returned 0 (probe s264 segfaults).  Walk the included items at
+  // the SAME level, recursively -- an include may contain another one.
+  template <class F>
+  static void each_spliced_item(const Structure& items, F fn) {
+    bool splice = !cppcaml::dbg_env("NOINCSPLICE");
+    for (auto& item : items) {
+      fn(item);
+      if (!splice) continue;
+      if (auto* inc = std::get_if<Pstr_include>(&item.desc))
+        if (auto* ps = peel_to_structure(inc->expr))
+          each_spliced_item(ps->items, fn);
     }
   }
   // Scope a record type declaration's labels (so an ambiguous label resolves to
