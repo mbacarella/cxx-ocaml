@@ -6194,7 +6194,19 @@ struct Translator {
           std::string tgt = cmi_path_dotted(*found->type->path);
           if (!tgt.empty()) {
             std::string rest = (nd == std::string::npos) ? "" : dotted.substr(nd);
-            return nested_typed_record_field(tgt + rest, ty, label);
+            if (auto r = nested_typed_record_field(tgt + rest, ty, label))
+              return r;
+            // ... and a target that names a SIBLING of this same signature is
+            // stored RELATIVE to it, so that recursion re-entered at a bare
+            // name that resolve_cmi cannot find: retry re-rooted at the prefix
+            // already walked.  See nested_record_layout's by-label twin for the
+            // full rationale.  NOSIBALIASROOT reverts.
+            if (!cppcaml::dbg_env("NOSIBALIASROOT") &&
+                tgt.find('.') == std::string::npos)
+              if (std::string rr = dotted.substr(0, pos) + "." + tgt + rest;
+                  rr != dotted)
+                return nested_typed_record_field(rr, ty, label);
+            return std::nullopt;
           }
         }
         const cmi::Signature* next = mt_sig(cmi, found->type);
@@ -6611,7 +6623,24 @@ struct Translator {
           if (!tgt.empty()) {
             std::string rest =
                 (nd == std::string::npos) ? "" : dotted.substr(nd);
-            return nested_record_layout(tgt + rest, label, ty);
+            if (auto r = nested_record_layout(tgt + rest, label, ty)) return r;
+            // `module A2 = A1` names a SIBLING of the enclosing signature, so
+            // the cmi stores that target RELATIVE to it: the recursion above
+            // re-entered at a bare "A1", which names no unit, so the walk died
+            // and the literal fell through to the caller's bare label legs --
+            // built in a same-labelled DECOY's field order.  Retry once with
+            // the target re-rooted at the prefix already walked (`S457m.A1`).
+            // Strictly a second chance: a target that IS a unit (Stdlib's
+            // `module Lexing = Stdlib__Lexing`) has already returned above.
+            // A signature's alias may only cite a PRECEDING sibling, so this
+            // cannot cycle; the `rr != dotted` guard covers the one shape that
+            // could, an alias shadowing the outer name it aliases.
+            if (!cppcaml::dbg_env("NOSIBALIASROOT") &&
+                tgt.find('.') == std::string::npos)
+              if (std::string rr = dotted.substr(0, pos) + "." + tgt + rest;
+                  rr != dotted)
+                return nested_record_layout(rr, label, ty);
+            return std::nullopt;
           }
         }
         const cmi::Signature* next = mt_sig(cmi, found->type);

@@ -2361,6 +2361,38 @@ struct Checker {
     return out;
   }
 
+  // `module A2 = A1` names a SIBLING of the signature that declares A2, so the
+  // cmi stores that target RELATIVE to that signature and every unit lookup in
+  // module_sig misses: the walk died there, and the qualified label fell back
+  // to the bare-name registry, which answers with whatever same-labelled record
+  // was registered last.  Resolve the target among `encl`'s own modules
+  // instead, hopping while one sibling alias cites another (`A3 = A2 = A1`).
+  // Called only where module_sig has already returned null, so it can only add
+  // an answer where there was none.  NOSIBALIASSIG reverts.
+  const cmi::Signature* sibling_alias_sig(
+      const cmi::Signature* encl, const cmi::ModuleDecl* md,
+      std::deque<const cmi::CmiFile*>& loaded) {
+    static const bool off = std::getenv("NOSIBALIASSIG") != nullptr;
+    if (off || !encl || !md || !md->type ||
+        md->type->kind != cmi::ModuleType::Alias || !md->type->path)
+      return nullptr;
+    auto sib = [&](const std::string& n) -> const cmi::ModuleDecl* {
+      for (auto& mm : encl->modules) if (mm.name == n) return &mm;
+      return nullptr;
+    };
+    std::string want = cmi_path_str(*md->type->path);
+    for (int hop = 0; hop < 8; ++hop) {
+      if (want.empty() || want.find('.') != std::string::npos) return nullptr;
+      const cmi::ModuleDecl* t = sib(want);
+      if (!t || !t->type) return nullptr;
+      if (t->type->kind != cmi::ModuleType::Alias || !t->type->path)
+        return module_sig(t->type, loaded);
+      std::string next = cmi_path_str(*t->type->path);
+      if (!sib(next)) return module_sig(t->type, loaded);  // an alias to a UNIT
+      want = next;
+    }
+    return nullptr;
+  }
   // The signature of a module-decl type, following an alias (e.g. stdlib's
   // `module Array = Stdlib__Array`) by loading the aliased cmi into `loaded`.
   const cmi::Signature* module_sig(const cmi::ModuleTypePtr& mt,
@@ -2990,7 +3022,9 @@ struct Checker {
       for (size_t i = 1; i < comps.size() && sig; ++i) {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
-        sig = md ? module_sig(md->type, loaded) : nullptr;
+        const cmi::Signature* nxt = md ? module_sig(md->type, loaded) : nullptr;
+        if (!nxt) nxt = sibling_alias_sig(sig, md, loaded);
+        sig = nxt;
       }
       if (!sig) return;
       std::string pfx;
@@ -3060,7 +3094,9 @@ struct Checker {
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules)
           if (mm.name == comps[i]) { md = &mm; break; }
-        sig = md ? module_sig(md->type, loaded) : nullptr;
+        const cmi::Signature* nxt = md ? module_sig(md->type, loaded) : nullptr;
+        if (!nxt) nxt = sibling_alias_sig(sig, md, loaded);
+        sig = nxt;
         if (sig) {
           scopes.push_back({&sig->types, scopes.back().second + "." + comps[i]});
           mscopes.push_back({&sig->modules, mscopes.back().second + "." + comps[i]});
