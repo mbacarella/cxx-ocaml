@@ -12525,10 +12525,26 @@ struct Translator {
       return true;
     }
     if (auto* pk = std::get_if<Ppat_construct>(&p->desc)) {
-      auto ci = ctor_info_.find(ctor_of(*p));
-      if (ci == ctor_info_.end()) return false;
-      auto fps = ctor_field_pats(pk, ci->second.arity);
-      if ((int)fps.size() != ci->second.arity) return false;
+      // Resolve the ctor the way every other matcher path does -- type-directed
+      // (pat_ctor_resolve), not through the flat bare-name slot.  `Named` is
+      // both `Error.Named of Path.t` (arity 1, and the NEARER binding under
+      // includemod's `let open Error in`) and `Types.Named of Ident.t option *
+      // module_type` (arity 2, what the column's type says); the flat slot
+      // answered arity 1, so `Named (Some param, _param)` decomposed as ONE
+      // field holding a TUPLE and `param` came out one `field_imm 0` too deep.
+      // Only the ACCESSES were wrong -- the tests already resolved correctly,
+      // which is why an or-handler compiled by this path read a live binder
+      // off the wrong offset with no diagnostic.  NOORACCRES reverts.
+      static const bool no_oracc_res = std::getenv("NOORACCRES") != nullptr;
+      const CtorInfo* ci =
+          no_oracc_res ? nullptr : pat_ctor_resolve(p, ctor_of(*p));
+      if (!ci) {
+        auto cb = ctor_info_.find(ctor_of(*p));
+        if (cb == ctor_info_.end()) return false;
+        ci = &cb->second;
+      }
+      auto fps = ctor_field_pats(pk, ci->arity);
+      if ((int)fps.size() != ci->arity) return false;
       for (size_t i = 0; i < fps.size(); ++i)
         if (!or_accesses(*fps[i], fieldimm((int)i, scrut), out)) return false;
       return true;
