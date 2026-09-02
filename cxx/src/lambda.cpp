@@ -6560,6 +6560,22 @@ struct Translator {
         var_node_path_[(const void*)s] = paths[i];
     }
   }
+  // Is `head` an imported unit whose .cmi the deep walk below may navigate?
+  // `!fields_of(head).empty()` is the usual proxy, but it is a FALSE NEGATIVE
+  // for a unit whose cmi has no RUNTIME fields at all: a `.ml` holding only
+  // `module Ali = X` declares an Mp_absent alias, and Mp_absent takes no field,
+  // so `{ U.Ali.Deep.lbl = .. }` never even started the walk and fell through
+  // to the caller's bare label legs -- built in a same-labelled decoy's field
+  // order.  Accept a head whose .cmi merely EXISTS as well; a head with no cmi
+  // still throws inside the walk and is caught there, exactly as before.
+  // register_module_records already refuses this same gate, for the same
+  // reason, for TYPES-ONLY modules.  NOEMPTYHEADLAY reverts.
+  bool cmi_head_for_layout(const std::string& head) {
+    if (module_base(head)) return false;
+    if (!fields_of(head).empty()) return true;
+    return !cppcaml::dbg_env("NOEMPTYHEADLAY") &&
+           std::filesystem::exists(resolve_cmi(head));
+  }
   // type that has `label`.  Used for an explicitly deep-qualified record literal
   // (`{ CamlinternalMenhirLib.EngineTypes.state = .. }` in menhir's actions).
   // A non-empty `ty` selects the record by TYPE NAME instead of by a label it
@@ -6572,7 +6588,7 @@ struct Translator {
     if (dot == std::string::npos) {
       if (auto r = stdlib_record_layout(dotted, label)) return r;
     } else if (std::string head = dotted.substr(0, dot);
-               !module_base(head) && !fields_of(head).empty()) try {
+               cmi_head_for_layout(head)) try {
       const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t pos = dot; pos != std::string::npos;) {
