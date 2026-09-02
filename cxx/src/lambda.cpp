@@ -26670,13 +26670,71 @@ struct Translator {
         std::set<std::string> labs;
         for (auto& [lid, ve] : rc->fields) labs.insert(lid_last(lid.txt));
         const RecType* rt = nullptr;
-        // The CHECKER's answer first, and only where the labels alone cannot
+        RecType std_rt;  // a stdlib record: by the literal's inferred type path,
+                         // else an opened module's label set (`open Gc; {..}`)
+        auto try_std = [&](std::optional<StdRec> sr) {
+          if (!sr || sr->labels.size() != labs.size()) return false;
+          for (auto& l : sr->labels) if (!labs.count(l)) return false;
+          std_rt.labels = std::move(sr->labels);
+          std_rt.shape = std::move(sr->shape);
+          std_rt.mut = false;
+          for (bool m : sr->mut) if (m) std_rt.mut = true;
+          std_rt.flat = sr->flat;  // Complex.t etc.: build a flat float block
+          std_rt.unboxed = sr->unboxed;
+          rt = &std_rt;
+          return true;
+        };
+        // A record literal is built at the layout its written-out qualifier
+        // NAMES, and the qualifier need not sit on the FIRST label -- ocamlc
+        // resolves the whole literal from whichever label carries one.  So
+        // this runs BEFORE the label-set legs below, which start from
+        // `find_field` / an exact-set match over `rec_types_` and therefore
+        // handed the literal to a local record with the SAME label set
+        // (`open D`), building it in the DECOY's field order.  The field-READ
+        // path already lets a written-out qualifier decide; the literal now
+        // agrees.  Each leg re-checks the label set, so a qualifier that
+        // resolves to some other record leaves `rt` null and the legs below
+        // run exactly as before.
+        // `wide` is what this slice added; NOQUALLIT passes false, which
+        // together with the late call site below restores the old leg exactly.
+        auto try_qual = [&](bool wide) {
+          const Ldot* d0 = nullptr;
+          if (!wide) d0 = std::get_if<Ldot>(&rc->fields[0].first.txt.v);
+          else
+            for (auto& [lid, ve] : rc->fields)
+              if (auto* d = std::get_if<Ldot>(&lid.txt.v)) { d0 = d; break; }
+          std::string dotted;
+          if (!d0 || !lid_to_dotted(*d0->prefix, dotted)) return;
+          // A LOCAL module (`module E = struct type t = {a;b;c} end`) has no
+          // cmi for the two cmi legs below, so try this unit's own records
+          // registered under that module path first.
+          if (auto mr = wide ? mod_record_types_.find(dotted)
+                             : mod_record_types_.end();
+              mr != mod_record_types_.end())
+            for (auto& key : mr->second) {
+              auto it = rec_types_.find(key);
+              if (it == rec_types_.end() ||
+                  it->second.labels.size() != labs.size()) continue;
+              bool all = true;
+              for (auto& l : it->second.labels)
+                if (!labs.count(l)) { all = false; break; }
+              if (all) { rt = &it->second; return; }
+            }
+          if (dotted.find('.') == std::string::npos)
+            try_std(stdlib_record_layout(dotted, d0->name));
+          else  // a NESTED prefix (`CamlinternalMenhirLib.EngineTypes`)
+            try_std(nested_record_layout(dotted, d0->name));
+        };
+        bool late_qual = cppcaml::dbg_env("NOQUALLIT");
+        if (!late_qual) try_qual(true);
+        // The CHECKER's answer next, and only where the labels alone cannot
         // identify the record: it names the EXPECTED record by its fields in
         // DECLARATION order, which is the layout to build at.  The by-name legs
         // below all start from `find_field`, i.e. the LAST record in scope
         // declaring the label -- with `type p = {a;b}` and `type q = {b;a}`
         // that is q for both, so `rp { a = 1; b = 2 }` built q's block.  The
         // registered key may be disambiguated ("t#N"), so match the label list.
+        if (!rt)
         if (auto lit = vk.expr_record_labels.find(&e);
             lit != vk.expr_record_labels.end())
           for (auto& [name, cand] : rec_types_)
@@ -26705,39 +26763,16 @@ struct Translator {
             for (auto& l : cand.labels) if (!labs.count(l)) { all = false; break; }
             if (all) { rt = &cand; break; }
           }
-        RecType std_rt;  // a stdlib record: by the literal's inferred type path,
-                         // else an opened module's label set (`open Gc; {..}`)
         if (!rt) {
-          auto try_std = [&](std::optional<StdRec> sr) {
-            if (!sr || sr->labels.size() != labs.size()) return false;
-            for (auto& l : sr->labels) if (!labs.count(l)) return false;
-            std_rt.labels = std::move(sr->labels);
-            std_rt.shape = std::move(sr->shape);
-            std_rt.mut = false;
-            for (bool m : sr->mut) if (m) std_rt.mut = true;
-            std_rt.flat = sr->flat;  // Complex.t etc.: build a flat float block
-            std_rt.unboxed = sr->unboxed;
-            rt = &std_rt;
-            return true;
-          };
-          // an explicit module qualification on the first label (`{Complex.im=..}`)
-          if (auto* d0 = std::get_if<Ldot>(&rc->fields[0].first.txt.v)) {
-            if (auto* pl0 = std::get_if<Lident>(&d0->prefix->v))
-              try_std(stdlib_record_layout(pl0->name, d0->name));
-            else {  // a NESTED module prefix (`CamlinternalMenhirLib.EngineTypes.state`)
-              std::string dotted;
-              if (lid_to_dotted(*d0->prefix, dotted))
-                try_std(nested_record_layout(dotted, d0->name));
-            }
-          }
+          if (late_qual) try_qual(false);
           if (!rt)
-            if (auto itc = vk.expr_constr.find(&e); itc != vk.expr_constr.end()) {
-              const std::string& p = itc->second;
-              auto dpos = p.rfind('.');
-              std::string mod = p.substr(0, dpos);
-              if (mod.find('.') == std::string::npos)
-                try_std(stdlib_record_layout_named(mod, p.substr(dpos + 1)));
-            }
+          if (auto itc = vk.expr_constr.find(&e); itc != vk.expr_constr.end()) {
+            const std::string& p = itc->second;
+            auto dpos = p.rfind('.');
+            std::string mod = p.substr(0, dpos);
+            if (mod.find('.') == std::string::npos)
+              try_std(stdlib_record_layout_named(mod, p.substr(dpos + 1)));
+          }
           if (!rt)
             for (auto it2 = opened_.rbegin(); it2 != opened_.rend(); ++it2) {
               if (it2->find('.') != std::string::npos || module_base(*it2)) continue;
