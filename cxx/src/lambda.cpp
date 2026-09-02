@@ -6173,6 +6173,16 @@ struct Translator {
                             record_all_float(td), td.unboxed && td.labels.size() == 1};
       }
     } catch (...) {}
+    // The head may be a LOCAL alias of the unit that really declares the
+    // record (`module I = Includemod` then `(st : I.Error.symptom)`): there
+    // is no `I.cmi`, so resolve_cmi threw above and the caller fell through
+    // to the bare find_field, which takes the last-registered same-named
+    // record.  Retry once under the expanded head -- a pure fallback, run
+    // only after the cited spelling failed, and expand_alias_head is the
+    // identity when the head is not an alias.  NOALIASNESTREC reverts.
+    if (!cppcaml::dbg_env("NOALIASNESTREC"))
+      if (std::string q = expand_alias_head(dotted); q != dotted)
+        return nested_typed_record_field(q, ty, label);
     return std::nullopt;
   }
   // The inferred module-qualified type path of a record expression: the
@@ -6516,7 +6526,12 @@ struct Translator {
   }
   // type that has `label`.  Used for an explicitly deep-qualified record literal
   // (`{ CamlinternalMenhirLib.EngineTypes.state = .. }` in menhir's actions).
-  std::optional<StdRec> nested_record_layout(const std::string& dotted, const std::string& label) {
+  // A non-empty `ty` selects the record by TYPE NAME instead of by a label it
+  // declares -- the `_named` mode, for a base whose deep type path the checker
+  // already inferred.
+  std::optional<StdRec> nested_record_layout(const std::string& dotted,
+                                             const std::string& label,
+                                             const std::string& ty = "") {
     size_t dot = dotted.find('.');
     if (dot == std::string::npos) return stdlib_record_layout(dotted, label);
     std::string head = dotted.substr(0, dot);
@@ -6534,8 +6549,9 @@ struct Translator {
       }
       for (auto& td : sig->types) {
         if (td.kind != cmi::TypeDecl::Record) continue;
-        bool has = false;
-        for (auto& l : td.labels) if (l.name == label) { has = true; break; }
+        bool has = !ty.empty() && td.name == ty;
+        if (ty.empty())
+          for (auto& l : td.labels) if (l.name == label) { has = true; break; }
         if (!has) continue;
         StdRec r; bool all_float = true;
         for (auto& l : td.labels) {
@@ -26490,6 +26506,29 @@ struct Translator {
                 rt = &it->second;
                 fmut = it->second.fmut;
               }
+          // ... and a DEEP path into an IMPORTED unit, possibly reached
+          // through a local alias (`module I = Includemod` then `(st :
+          // I.Error.symptom)`): navigate that unit's cmi under the
+          // expanded head.  Same rank and same reason as the two legs
+          // above -- the inferred path is authoritative -- and without it
+          // the update fell through to find_field and built a block in the
+          // layout of whatever same-labelled record was registered last.
+          if (!rt && dpos != std::string::npos && p.find('.') != dpos &&
+              !cppcaml::dbg_env("NOALIASNESTREC"))
+            if (auto sr =
+                    nested_record_layout(expand_alias_head(p.substr(0, dpos)),
+                                         "", p.substr(dpos + 1));
+                sr && [&] { std_rt.labels = sr->labels;
+                            return has_all_labels(&std_rt); }()) {
+              std_rt.labels = std::move(sr->labels);
+              std_rt.shape = std::move(sr->shape);
+              std_rt.mut = false;
+              for (bool m : sr->mut) if (m) std_rt.mut = true;
+              std_rt.flat = sr->flat;
+              std_rt.unboxed = sr->unboxed;
+              fmut = std::move(sr->mut);
+              rt = &std_rt;
+            }
         }
         if (!rt)
         if (auto* f0 = find_field(lid_last(rc->fields[0].first.txt)))
