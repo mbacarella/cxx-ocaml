@@ -454,6 +454,10 @@ struct Checker {
   // producer/consumer miscompile).
   std::unordered_map<const void*, TypePtr> ctor_arg_type_;      // expression args
   std::unordered_map<const void*, TypePtr> pat_ctor_arg_type_;  // pattern args
+  // The OPEN-QUALIFIED spelling of one of the two maps above, recorded
+  // only where the bare name the checker cited cannot itself explain the
+  // constructor (see ctor_arg_owner_path).
+  std::unordered_map<const void*, std::string> ctor_arg_open_path_;
   std::unordered_map<const void*, TypePtr> pat_record_arg_type_;  // record-pattern ctor args
   // The owning type PATH retype_pat_binders proved for a ctor pattern whose
   // lexical pick named another type.  A path, not a TypePtr, because the
@@ -4827,6 +4831,44 @@ struct Checker {
     return nullptr;
   }
 
+  // The path to record as a ctor argument's owning type, or "" for "record
+  // nothing".  `ambiguous_ctors_` is built from this file's OWN declarations,
+  // so a name a bare `open <Unit>` brings in is never in it: `open S419n`
+  // (whose `inner` has `Nm of .. option * int`) beside a local `module E =
+  // struct type e = Nm of string end` leaves `Nm` unambiguous by that census,
+  // the enclosing ctor's declared argument type is never recorded, and both
+  // the construct and the pattern resolve by SCOPE to the arity-1 ctor --
+  // building a one-field block and reading it back one level too deep.  The
+  // expression side already keys such cross-unit shadows on the type MISMATCH
+  // directly (infer_expr's shadow-gate arm); this is the same test, applied
+  // where the expectation comes from the enclosing constructor's declaration.
+  // NOOPENAMB reverts to the census-only behavior.
+  std::string ctor_arg_owner_path(const Longident& id, const std::string& cn,
+                                  const TypePtr& d) {
+    static const bool no_open_amb = std::getenv("NOOPENAMB") != nullptr;
+    std::string path = d->path;
+    // A type reached through a bare `open <Unit>` keeps its BARE name here,
+    // which no table on either side of the back end can answer for.  Rewrite
+    // to the qualified spelling -- but only when the bare one cannot itself
+    // explain the constructor and the qualified one can, so a file-local type
+    // that merely shares the name is left exactly as cited.
+    if (!no_open_amb && path.find('.') == std::string::npos &&
+        !scrut_owns_ctor(path, cn))
+      if (auto q = opened_type_quals_.find(path); q != opened_type_quals_.end())
+        if (scrut_owns_ctor(q->second, cn)) path = q->second;
+    if (ambiguous_ctors_.count(cn)) return path;
+    if (no_open_amb || !std::holds_alternative<Lident>(id.v)) return "";
+    if (exn_ctors_.count(cn) || predef_ctors_.count(cn)) return "";
+    TypePtr* sch = find_ctor(cn);
+    if (!sch) return "";
+    TypePtr res;
+    ctor_params(eng.instantiate(*sch), res);
+    TypePtr rr = I::Engine::repr(res);
+    if (!ctor_type_differs(rr->kind == I::Type::Kind::Constr ? rr->path : "",
+                           d->path))
+      return "";                        // scope already answers the cited type
+    return scrut_owns_ctor(path, cn) ? path : "";
+  }
   // A constructor's argument that is ITSELF a construct/pattern whose name is
   // shared across types (`ambiguous_ctors_`): record the enclosing ctor's
   // DECLARED argument type (`dom`) at the inner node, so the back end
@@ -4845,18 +4887,24 @@ struct Checker {
     if (auto* rc = std::get_if<Pexp_record>(&arg->desc))
       disambig_record_now(*arg, *rc, dom);
     auto* k = std::get_if<Pexp_construct>(&arg->desc);
-    if (!k || !ambiguous_ctors_.count(lid_last(k->id.txt))) return;
+    if (!k) return;
     TypePtr d = I::Engine::repr(dom);
-    if (d->kind == I::Type::Kind::Constr && !d->path.empty())
-      ctor_arg_type_[arg] = d;
+    if (d->kind != I::Type::Kind::Constr || d->path.empty()) return;
+    std::string owner = ctor_arg_owner_path(k->id.txt, lid_last(k->id.txt), d);
+    if (owner.empty()) return;
+    ctor_arg_type_[arg] = d;
+    if (owner != d->path) ctor_arg_open_path_[arg] = owner;
   }
   void record_pat_ctor_arg_type(const Pattern* arg, TypePtr dom) {
     if (!record_kinds_) return;
     auto* k = std::get_if<Ppat_construct>(&arg->desc);
-    if (!k || !ambiguous_ctors_.count(lid_last(k->id.txt))) return;
+    if (!k) return;
     TypePtr d = I::Engine::repr(dom);
-    if (d->kind == I::Type::Kind::Constr && !d->path.empty())
-      pat_ctor_arg_type_[arg] = d;
+    if (d->kind != I::Type::Kind::Constr || d->path.empty()) return;
+    std::string owner = ctor_arg_owner_path(k->id.txt, lid_last(k->id.txt), d);
+    if (owner.empty()) return;
+    pat_ctor_arg_type_[arg] = d;
+    if (owner != d->path) ctor_arg_open_path_[arg] = owner;
   }
   // A RECORD pattern used as a constructor's argument (`Val_prim {prim_name=..}`):
   // pin its record type to the enclosing ctor's DECLARED argument type, so an
@@ -13342,7 +13390,8 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
   for (auto& [p, d] : ck.pat_ctor_arg_type_) {
     TypePtr r = I::Engine::repr(d);
     if (r->kind == I::Type::Kind::Constr && !r->path.empty())
-      vk.pat_constr[p] = r->path;
+      vk.pat_constr[p] = ck.ctor_arg_open_path_.count(p)
+                             ? ck.ctor_arg_open_path_[p] : r->path;
   }
   // The owner retype_pat_binders proved (scrut_owns_ctor over the scrutinee's
   // own declaration) outranks both: it is the only evidence taken while the
@@ -13416,7 +13465,8 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
   for (auto& [e, d] : ck.ctor_arg_type_) {
     TypePtr r = I::Engine::repr(d);
     if (r->kind == I::Type::Kind::Constr && !r->path.empty())
-      vk.expr_constr[e] = r->path;
+      vk.expr_constr[e] = ck.ctor_arg_open_path_.count(e)
+                              ? ck.ctor_arg_open_path_[e] : r->path;
   }
   for (auto& [e, ls] : ck.record_expected_) vk.expr_record_labels[e] = ls;
   for (auto& [e, fr] : ck.field_resolved_)
