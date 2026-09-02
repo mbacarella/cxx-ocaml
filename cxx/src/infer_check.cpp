@@ -687,6 +687,8 @@ struct Checker {
   // so they never take part in a bare `e.label` read, only in `A {loc}`.
   std::unordered_map<std::string, std::vector<int>> field_cand_line_;
   const bool no_field_scope_ = std::getenv("NOFIELDSCOPE") != nullptr;
+  // NOQUALRECLIT reverts the record-LITERAL path-directed leg (Pexp_record).
+  const bool no_qual_rec_lit_ = std::getenv("NOQUALRECLIT") != nullptr;
   // No LOCAL record declaration of `label` is in scope at `at_line`: the unit
   // declares none, or every one of them is an inline-record field or sits
   // further down the file.
@@ -10203,6 +10205,7 @@ struct Checker {
         return resTy;
       }
       TypePtr recTy = nullptr;
+      bool qual_rec = false;  // a label was written `M.lab`: M names the record
       for (auto& [lbl, val] : rc->fields) {
         // Infer the field value for its type, but suppress errors from inside its
         // body: traversing field values exposes unrelated inference incompleteness
@@ -10211,7 +10214,31 @@ struct Checker {
         bool sv = strict; strict = false;
         TypePtr vt = infer_expr(*val);
         strict = sv;
-        TypePtr fsch = field_scheme(lid_last(lbl.txt));
+        // The LITERAL twin of the field-READ's path-directed leg above: a label
+        // written `{ Lexing.pos_fname = ..; .. }` names its record's MODULE,
+        // and that path is authoritative.  lid_last dropped it, so the literal
+        // was typed by the bare-name registry -- a same-labelled LOCAL record
+        // (`module D = struct type t = {pos_cnum; pos_bol; pos_lnum; pos_fname}
+        // end`) took it, and the result was typed D.t.  The back end still
+        // BUILT the block at Lexing.position's layout (the qualifier reaches it
+        // another way), so the literal looked right and every later bare read
+        // `p.pos_fname` took D.t's offset instead -- a string read as an int.
+        // Once a label has pinned the record, the REMAINING bare labels resolve
+        // inside it too, which is ocamlc's first-label rule.  NOQUALRECLIT
+        // reverts.
+        TypePtr fsch = nullptr;
+        if (!no_qual_rec_lit_) {
+          if (std::holds_alternative<Ldot>(lbl.txt.v)) {
+            fsch = qualified_field_scheme(lbl.txt);
+            if (fsch) qual_rec = true;
+          } else if (qual_rec && recTy) {
+            TypePtr rr = I::Engine::repr(recTy);
+            if (rr->kind == I::Type::Kind::Constr &&
+                rr->path.find('.') != std::string::npos)
+              fsch = named_record_field_arrow(rr->path, lid_last(lbl.txt));
+          }
+        }
+        if (!fsch) fsch = field_scheme(lid_last(lbl.txt));
         if (!fsch) {
           // `{contents = e}` builds the predefined `'a ref` (non-strict only).
           if (!strict && lid_last(lbl.txt) == "contents") {
