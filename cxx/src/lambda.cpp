@@ -6132,7 +6132,17 @@ struct Translator {
     if (!d) return std::nullopt;
     if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
       if (auto rf = local_module_field(pl->name, d->name)) return rf;
-      return stdlib_record_field(pl->name, d->name);
+      if (auto rf = stdlib_record_field(pl->name, d->name)) return rf;
+      // `module I = S` then `x.I.a`: I names no local struct and has no cmi,
+      // so neither leg above sees it and the read fell through to the bare
+      // find_field -- the last-registered same-named record.  Retry under the
+      // expanded head, the same retry the LITERAL side now makes, so the two
+      // agree (fixing only one of them turns a cancelling pair of wrong
+      // layouts into a visibly wrong answer).
+      if (!cppcaml::dbg_env("NOALIASQUALREC"))
+        if (std::string q = expand_alias_head(pl->name); q != pl->name)
+          return nested_record_field(q, d->name);
+      return std::nullopt;
     }
     std::string dotted;
     if (lid_to_dotted(*d->prefix, dotted)) return nested_record_field(dotted, d->name);
@@ -6559,10 +6569,10 @@ struct Translator {
                                              const std::string& label,
                                              const std::string& ty = "") {
     size_t dot = dotted.find('.');
-    if (dot == std::string::npos) return stdlib_record_layout(dotted, label);
-    std::string head = dotted.substr(0, dot);
-    if (module_base(head) || fields_of(head).empty()) return std::nullopt;
-    try {
+    if (dot == std::string::npos) {
+      if (auto r = stdlib_record_layout(dotted, label)) return r;
+    } else if (std::string head = dotted.substr(0, dot);
+               !module_base(head) && !fields_of(head).empty()) try {
       const auto& cmi = cmi::CmiFile::load(resolve_cmi(head));
       const cmi::Signature* sig = &cmi.sig();
       for (size_t pos = dot; pos != std::string::npos;) {
@@ -6590,6 +6600,18 @@ struct Translator {
         return r;
       }
     } catch (...) {}
+    // The head may be a LOCAL ALIAS of the unit that really declares the
+    // record (`module I = M` then `{I.a = ..}` or `{I.Deep.a = ..}`):
+    // there is no `I.cmi`, so the navigation above never started and the
+    // caller fell through to the bare find_field, which takes the last
+    // registered same-named record -- so the literal was built in a DECOY's
+    // field order.  Retry once under the expanded head, exactly as
+    // nested_typed_record_field already does on the inferred-path side.
+    // expand_alias_head is the identity when the head is not an alias, so a
+    // plain path reaches here and returns nullopt as before.
+    if (!cppcaml::dbg_env("NOALIASQUALREC"))
+      if (std::string q = expand_alias_head(dotted); q != dotted)
+        return nested_record_layout(q, label, ty);
     return std::nullopt;
   }
   // Resolve a record-pattern/expression label to its field info: the in-scope
@@ -26746,10 +26768,11 @@ struct Translator {
                 if (!labs.count(l)) { all = false; break; }
               if (all) { rt = &it->second; return; }
             }
-          if (dotted.find('.') == std::string::npos)
-            try_std(stdlib_record_layout(dotted, d0->name));
-          else  // a NESTED prefix (`CamlinternalMenhirLib.EngineTypes`)
-            try_std(nested_record_layout(dotted, d0->name));
+          // A NESTED prefix (`CamlinternalMenhirLib.EngineTypes`) or a
+          // one-component one -- nested_record_layout delegates to
+          // stdlib_record_layout for the latter, and unlike a direct call it
+          // carries the local-alias-head retry (`module I = S; {I.a = ..}`).
+          try_std(nested_record_layout(dotted, d0->name));
         };
         bool late_qual = cppcaml::dbg_env("NOQUALLIT");
         if (!late_qual) try_qual(true);
