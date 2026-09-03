@@ -6605,6 +6605,19 @@ struct Translator {
                                              const std::string& ty = "") {
     size_t dot = dotted.find('.');
     if (dot == std::string::npos) {
+      // The `_named` mode has to answer here too.  The alias hop below
+      // re-enters this function at a BARE unit name (`Stdlib.Lexing` ->
+      // `Stdlib__Lexing`), and looking a record up by an EMPTY label finds
+      // nothing, so a base whose inferred type path is deep
+      // (`{ p with Stdlib.Lexing.pos_lnum = 12 }`) got no layout at all and
+      // the update fell through to the caller's bare-label legs -- built in a
+      // same-labelled DECOY's field order.  The twin
+      // nested_typed_record_field has always handed its no-dot case to
+      // toplevel_typed_record_field, which does select by type name; this one
+      // simply never got the mode.  Additive: `ty` and `label` are never both
+      // non-empty at any call site.  NONAMEDNODOT reverts.
+      if (!ty.empty() && !cppcaml::dbg_env("NONAMEDNODOT"))
+        if (auto r = stdlib_record_layout_named(dotted, ty)) return r;
       if (auto r = stdlib_record_layout(dotted, label)) return r;
     } else if (std::string head = dotted.substr(0, dot);
                cmi_head_for_layout(head)) try {
