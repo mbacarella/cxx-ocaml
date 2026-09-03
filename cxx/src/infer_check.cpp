@@ -657,12 +657,32 @@ struct Checker {
   // `open`/`include` does.
   std::unordered_map<std::string, std::vector<std::string>> ext_field_mod_;
   std::set<std::string> opened_field_mods_;
-  // The line of the top-level `open M` that brought each module's labels into
-  // the BARE-label namespace (the last such open).  Only the file's own
-  // top-level opens are recorded -- load_open_record_fields is the one caller
-  // that passes a line -- so an open nested in a submodule, replayed through
-  // process_item, never shadows a declaration outside it.
-  std::unordered_map<std::string, int> opened_field_mod_line_;
+  // Every `open M` that brought a module's labels into the BARE-label
+  // namespace, as {line, scope end, is a top-level open of the file}.  The
+  // scope end is the last line of the structure the open is written in, so an
+  // open inside `module M = struct .. end` shadows only between the two.
+  std::unordered_map<std::string, std::vector<std::tuple<int, int, bool>>>
+      opened_field_mod_spans_;
+  // The last line of the structure whose items are being processed, so the
+  // Pstr_open handler can record its own scope end (-1: not in a structure).
+  int cur_struct_end_ = -1;
+  // NOOPENSCOPEFIELD reverts to the S385 reading: only the file's own
+  // top-level opens shadow anything, and they shadow with no scope end.
+  const bool no_open_scope_field_ =
+      std::getenv("NOOPENSCOPEFIELD") != nullptr;
+  // The line of the LAST `open` of `mod` whose scope covers `at_line`, or -1.
+  int opened_field_mod_start(const std::string& mod, int at_line) {
+    auto it = opened_field_mod_spans_.find(mod);
+    if (it == opened_field_mod_spans_.end()) return -1;
+    int best = -1;
+    for (auto& [st, en, top] : it->second) {
+      if (st <= 0 || st <= best) continue;
+      // S385 read only the file's own top-level opens, and ignored the end.
+      if (no_open_scope_field_) { if (top) best = st; continue; }
+      if (st <= at_line && (en <= 0 || at_line <= en)) best = st;
+    }
+    return best;
+  }
   // The scheme for a record field: a local unique field, else a unique external
   // (opened-module) field; null if unknown/ambiguous.
   TypePtr field_scheme(const std::string& label, int at_line = -1) {
@@ -738,14 +758,43 @@ struct Checker {
     TypePtr found = nullptr;
     int best = -1, nbest = 0;
     for (size_t i = 0; i < e->second.size(); ++i) {
-      auto oi = opened_field_mod_line_.find(mi->second[i]);
-      if (oi == opened_field_mod_line_.end()) continue;
-      int ol = oi->second;
+      int ol = opened_field_mod_start(mi->second[i], at_line);
       if (ol <= local || ol > at_line) continue;
       if (ol > best) { best = ol; found = e->second[i]; nbest = 1; }
       else if (ol == best) ++nbest;
     }
     return nbest == 1 ? found : nullptr;
+  }
+  // The declared field order of a LOCAL record type (empty when the type is not
+  // one, or when its declaration cannot be pinned down).  cmi_record_fields
+  // answers for IMPORTED records only, and the back end needs the order for a
+  // local record just as much.
+  std::vector<std::string> local_record_field_order(const TypePtr& rb) {
+    if (rb->kind != I::Type::Kind::Constr) return {};
+    const TypeDeclaration* decl = nullptr;
+    if (rb->stamp) {
+      auto it = stamp_record_decl_.find(rb->stamp);
+      if (it != stamp_record_decl_.end()) decl = it->second;
+    }
+    if (!decl && !ambiguous_record_names_.count(rb->path)) {
+      auto it = name_record_decl_.find(rb->path);
+      if (it != name_record_decl_.end()) decl = it->second;
+    }
+    if (!decl) return {};
+    auto* rec = std::get_if<Ptype_record>(&decl->kind);
+    if (!rec) return {};
+    std::vector<std::string> fs;
+    for (auto& f : rec->fields) fs.push_back(f.name.txt);
+    return fs;
+  }
+  // Some OPENED module declares `label` as well, so the back end's own registry
+  // -- last-REGISTERED-wins, with no notion of an open's scope -- may disagree
+  // with this pass about which record a bare label names.
+  bool opened_module_declares_field(const std::string& label) {
+    auto mi = ext_field_mod_.find(label);
+    if (mi == ext_field_mod_.end()) return false;
+    for (auto& m : mi->second) if (opened_field_mods_.count(m)) return true;
+    return false;
   }
   // The single record an OPENED module declares `label` in, if there is one.
   TypePtr unique_opened_ext_field(const std::string& label) {
@@ -3068,7 +3117,8 @@ struct Checker {
   // construction `{ retc; exnc; effc }` after `open Effect.Deep` resolves to the
   // handler record and its result type flows (match_with's `'c` -> unit).
   void load_module_record_fields(const Longident& m, bool via_open = false,
-                                 int open_line = -1) {
+                                 int open_line = -1, int open_end = -1,
+                                 bool open_top = false) {
     auto comps = mod_components(m);
     if (comps.empty()) return;
     if (via_open) {
@@ -3077,9 +3127,12 @@ struct Checker {
       // before the re-load guard: a module can be referenced first, then
       // opened
       opened_field_mods_.insert(p);
-      // and re-opened: the LAST open is the one that shadows
-      if (open_line > 0 && open_line > opened_field_mod_line_[p])
-        opened_field_mod_line_[p] = open_line;
+      // and re-opened: the LAST open in scope is the one that shadows
+      if (open_line > 0) {
+        auto& v = opened_field_mod_spans_[p];
+        auto sp = std::make_tuple(open_line, open_end, open_top);
+        if (std::find(v.begin(), v.end(), sp) == v.end()) v.push_back(sp);
+      }
     }
     // Guard against double-loading (a module both opened/referenced and aliased):
     // re-loading would push each label twice and make it spuriously ambiguous.
@@ -3286,8 +3339,10 @@ struct Checker {
       else if (auto* in = std::get_if<Pstr_include>(&it.desc)) me = &in->expr;
       if (me)
         if (auto* pi = std::get_if<Pmod_ident>(&me->desc))
-          load_module_record_fields(pi->id.txt, /*via_open=*/true,
-                                    me->loc.start.lnum);
+          load_module_record_fields(
+              pi->id.txt, /*via_open=*/true, me->loc.start.lnum,
+              items.empty() ? -1 : items.back().loc.end.lnum,
+              /*open_top=*/true);
     }
   }
 
@@ -10432,6 +10487,27 @@ struct Checker {
               shadowing_opened_field(lid_last(rc->fields[0].first.txt),
                                      e.loc.start.lnum))
             record_expected_[&e] = fs;
+          // Its LOCAL twin: an `open` nested in a submodule registers its
+          // labels in that registry for the whole file, so a literal written
+          // OUTSIDE the module can still be built at the opened record's
+          // layout while this pass reads it at the local one.  Where an opened
+          // module declares the same bare label, hand over the order.
+          if (record_kinds_ && !no_open_scope_field_ && fs.empty() &&
+              std::holds_alternative<Lident>(rc->fields[0].first.txt.v) &&
+              opened_module_declares_field(lid_last(rc->fields[0].first.txt))) {
+            auto lf = local_record_field_order(rb);
+            // and only when it really is THIS literal's record: a same-named
+            // label can pin recTy to a local record of the same WIDTH that
+            // declares none of the other labels (bytegen's function_to_compile
+            // for a 5-field `{params; return; ..}`), and handing that order
+            // over makes the back end fail every index and emit a 0.
+            for (auto& [lbl, val] : rc->fields) {
+              auto l = lid_last(lbl.txt);
+              if (std::find(lf.begin(), lf.end(), l) == lf.end())
+                { lf.clear(); break; }
+            }
+            if (lf.size() == rc->fields.size()) record_expected_[&e] = lf;
+          }
           if (!fs.empty()) record_fields[&e] = std::move(fs);
           if (!repr.empty()) record_reprs[&e] = std::move(repr);
         }
@@ -10514,11 +10590,16 @@ struct Checker {
       bool scoped_open = std::holds_alternative<Pstr_open>(sti->item->desc);
       auto saved_type_quals = opened_type_quals_;
       auto saved_submod_quals = opened_submod_quals_;
+      // The bare-label shadowing spans are file-wide in the same way, and a
+      // scoped open's span carries the ENCLOSING structure's end, so leaving it
+      // behind lets `let open Types in ..` shadow every later line of the file.
+      auto saved_field_spans = opened_field_mod_spans_;
       process_item(*sti->item);
       TypePtr bt = infer_expr(*sti->body);
       if (scoped_open) {
         opened_type_quals_ = std::move(saved_type_quals);
         opened_submod_quals_ = std::move(saved_submod_quals);
+        opened_field_mod_spans_ = std::move(saved_field_spans);
       }
       restore_local_struct_records(rec_scope);
       cenv.pop_back();
@@ -12511,7 +12592,12 @@ struct Checker {
   // Process structure items into the current scope, populating modenv for
   // submodules.  Per-item best-effort (a bad item doesn't abort the rest).
   void process_items(const ast::Structure& items) {
+    // An `open` written in THIS structure is in scope only down to its last
+    // line; save and restore so a nested module's opens do not escape it.
+    int saved_end = cur_struct_end_;
+    cur_struct_end_ = items.empty() ? -1 : items.back().loc.end.lnum;
     for (auto& it : items) process_item(it);
+    cur_struct_end_ = saved_end;
   }
 
   // Pre-pass: collect every module name bound in the file (modules, recursive
@@ -12856,7 +12942,8 @@ struct Checker {
             // `st_size` spuriously UNIQUE at the parent's `Unix.stats : int`
             // (the submodule's int64 field never registered, so the ambiguity
             // that forces type-directed resolution never arose).
-            load_module_record_fields(pi->id.txt, /*via_open=*/true);
+            load_module_record_fields(pi->id.txt, /*via_open=*/true,
+                                      op->expr.loc.start.lnum, cur_struct_end_);
             load_open_submod_quals(pi->id.txt);  // bare Sub -> M.Sub (every pass)
             if (!strict) {
               load_open_type_quals(pi->id.txt);  // bare type -> M.t (display)
