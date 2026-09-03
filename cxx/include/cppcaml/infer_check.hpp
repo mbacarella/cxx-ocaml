@@ -171,6 +171,13 @@ struct ValueKinds {
   // lowers the generic caml_compare/caml_equal/... to the type-specialized
   // opcode (Translprim.specialize_comparison), matching official ocamlc's .cmo.
   std::unordered_map<const void*, std::string> cmp_operand;
+  // For an ARRAY primitive used as a first-class VALUE (`Array.get entry`, a
+  // partial application), the kind_str of the instantiated FIRST-parameter's
+  // ELEMENT type ("int"/"float"/"addr"/"string"/"" = generic).  The eta-stub
+  // then annotates array.get/set/length with that kind instead of the blanket
+  // [gen], matching Translprim.transl_primitive, which specializes on the
+  // primitive occurrence's own instantiated type.
+  std::unordered_map<const void*, std::string> prim_arr_elem;
   // Match expressions the typer proved NON-exhaustive (Partial).  A match ABSENT
   // from this map (and present in the program) is Total -- the back end may then
   // omit the impossible `raise Match_failure` default (and its final test), exactly

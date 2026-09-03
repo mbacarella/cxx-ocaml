@@ -13842,6 +13842,13 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
       if (dk == "int" || dk == "float" || dk == "string" || dk == "int32" ||
           dk == "int64" || dk == "nativeint")
         vk.cmp_operand[e] = dk;
+      // Same idea for an ARRAY primitive taken as a value (`Array.get entry`):
+      // record the domain's ELEMENT kind so the eta-stub can annotate
+      // array.get/set/length instead of falling back to [gen].  ocamlc's
+      // Translprim.transl_primitive specializes on the occurrence's own
+      // instantiated type, which is exactly this arrow's domain.
+      if (std::string aek; array_elem_str(rt->dom, ck, aek))
+        vk.prim_arr_elem[e] = aek;
     }
     TypePtr r = I::Engine::repr(t);
     if (r->kind == I::Type::Kind::Constr && r->path.find('.') != std::string::npos) {

@@ -7150,7 +7150,8 @@ struct Translator {
     return m == mem.end() ? nullptr : &m->second;
   }
   LamPtr prim_stub_body(const std::string& prim, const std::vector<LamPtr>& argv,
-                        const std::string& operand = "") {
+                        const std::string& operand = "",
+                        const std::string& arrk = "") {
     int n = (int)argv.size();
     if (const std::string* sp = mem_access_spelling(prim)) {
       auto pr = mk(Lam::K::Prim); pr->prim = Prim::IntCmp;
@@ -7223,15 +7224,24 @@ struct Translator {
       if (auto it = sysconst.find(prim); it != sysconst.end() && n == 1) return cc(it->second);
     }
     if (prim == "%identity" && n == 1) return argv[0];
-    // Array/string/bytes element access as a value (eta-stub): the operand type
-    // is unknown here, so the generic spelling (a runtime-tag-checked access).
+    // Array element access as a value (eta-stub).  ocamlc's
+    // Translprim.transl_primitive specializes on the OCCURRENCE's instantiated
+    // type, so `Array.get entry` with `entry : int array` gets [int], not the
+    // blanket generic spelling; `arrk` carries that element kind when the
+    // inferencer recorded one (empty = unknown -> the tag-checked generic).
+    const std::string ak = arrk.empty() ? "gen" : arrk;
     if ((prim == "%array_unsafe_get" || prim == "%array_safe_get" ||
          prim == "%array_get") && n == 2)
-      return ic(prim == "%array_unsafe_get" ? "array.unsafe_get[gen]" : "array.get[gen]");
+      return ic(std::string(prim == "%array_unsafe_get"
+                                ? "array.unsafe_get[" : "array.get[") +
+                ak + "]");
     if ((prim == "%array_unsafe_set" || prim == "%array_safe_set" ||
          prim == "%array_set") && n == 3)
-      return ic(prim == "%array_unsafe_set" ? "array.unsafe_set[gen]" : "array.set[gen]");
-    if (prim == "%array_length" && n == 1) return ic("array.length[gen]");
+      return ic(std::string(prim == "%array_unsafe_set"
+                                ? "array.unsafe_set[" : "array.set[") +
+                ak + "]");
+    if (prim == "%array_length" && n == 1)
+      return ic("array.length[" + ak + "]");
     // Obj.size/field/set_field as values: generic-array ops (Obj.t is opaque).
     if (prim == "%obj_size" && n == 1) return ic("array.length[gen]");
     if (prim == "%obj_field" && n == 2) return ic("array.unsafe_get[gen]");
@@ -7375,7 +7385,23 @@ struct Translator {
     auto it = vk.cmp_operand.find(e);
     return it == vk.cmp_operand.end() ? std::string() : it->second;
   }
-  LamPtr prim_stub(const StdPrim& p, const std::string& operand = "") {
+  // The array-element kind for an ARRAY primitive used as a value (`Array.get
+  // entry`), from the inferencer's prim_arr_elem side-table -- the same
+  // int/float/addr/gen mapping array_arg_kind applies to an array-typed
+  // expression.  "" when nothing was recorded (the stub then stays generic).
+  // NOPRIMARRKIND reverts to the blanket [gen] spelling.
+  std::string arr_kind_of(const Expression* e) {
+    static const bool off = std::getenv("NOPRIMARRKIND") != nullptr;
+    if (off || !e) return "";
+    auto it = vk.prim_arr_elem.find(e);
+    if (it == vk.prim_arr_elem.end()) return "";
+    if (it->second == "int") return "int";
+    if (it->second == "float") return "float";
+    if (it->second == "addr" || it->second == "string") return "addr";
+    return "gen";
+  }
+  LamPtr prim_stub(const StdPrim& p, const std::string& operand = "",
+                   const std::string& arrk = "") {
     bool poly = p.name == "%compare" || p.name == "%equal" || p.name == "%notequal" ||
                 p.name == "%lessthan" || p.name == "%lessequal" ||
                 p.name == "%greaterthan" || p.name == "%greaterequal";
@@ -7387,7 +7413,7 @@ struct Translator {
       fn->params.push_back({pp, ValueKind::Gen});
       auto v = mk(Lam::K::Var); v->var = pp; argv.push_back(v);
     }
-    LamPtr body = prim_stub_body(p.name, argv, operand);
+    LamPtr body = prim_stub_body(p.name, argv, operand, arrk);
     if (!body) return nullptr;
     fn->body = body;
     return fn;
@@ -28444,7 +28470,9 @@ struct Translator {
         auto sf = stdlib_fields.find(l->name);  // unqualified pervasive
         if (sf != stdlib_fields.end()) return field_of("Stdlib", sf->second);
         if (auto pi = stdlib_prims.find(l->name); pi != stdlib_prims.end())  // prim as value
-          if (LamPtr s = prim_stub(pi->second, cmp_operand_of(&e))) return s;
+          if (LamPtr s = prim_stub(pi->second, cmp_operand_of(&e),
+                                   arr_kind_of(&e)))
+            return s;
       }
       if (auto* d = std::get_if<Ldot>(&id->id.txt.v))
         if (auto* pl = std::get_if<Lident>(&d->prefix->v)) {
@@ -28472,7 +28500,9 @@ struct Translator {
                                  ? submodule_prim(im, d->name)
                                  : value_prim(im, d->name);
                 if (sp.name.empty()) continue;
-                if (LamPtr s = prim_stub(sp, cmp_operand_of(&e))) return s;
+                if (LamPtr s =
+                        prim_stub(sp, cmp_operand_of(&e), arr_kind_of(&e)))
+                  return s;
               }
           }
           // `open StdLabels` brings `List` into scope as an alias to ListLabels;
@@ -28516,7 +28546,9 @@ struct Translator {
           if (auto pv = prim_value(sp.name)) return pv;
           // Otherwise a primitive in value position eta-expands to a stub
           // (`Int64.add` -> `(function p p stub (Int64.add p p))`).
-          if (!sp.name.empty()) if (LamPtr s = prim_stub(sp, cmp_operand_of(&e))) return s;
+          if (!sp.name.empty())
+            if (LamPtr s = prim_stub(sp, cmp_operand_of(&e), arr_kind_of(&e)))
+              return s;
         }
       // Qualified M.S.x through a *local* deep module path (alias chains,
       // first-class-module members): resolve the prefix, field-read the member.
@@ -28583,7 +28615,9 @@ struct Translator {
             StdPrim sp = value_prim(c, d->name);
             if (auto pv = prim_value(sp.name)) return pv;
             if (!sp.name.empty())
-              if (LamPtr s = prim_stub(sp, cmp_operand_of(&e))) return s;
+              if (LamPtr s =
+                      prim_stub(sp, cmp_operand_of(&e), arr_kind_of(&e)))
+                return s;
           }
         }
       }
