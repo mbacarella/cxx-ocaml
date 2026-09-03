@@ -657,6 +657,12 @@ struct Checker {
   // `open`/`include` does.
   std::unordered_map<std::string, std::vector<std::string>> ext_field_mod_;
   std::set<std::string> opened_field_mods_;
+  // The line of the top-level `open M` that brought each module's labels into
+  // the BARE-label namespace (the last such open).  Only the file's own
+  // top-level opens are recorded -- load_open_record_fields is the one caller
+  // that passes a line -- so an open nested in a submodule, replayed through
+  // process_item, never shadows a declaration outside it.
+  std::unordered_map<std::string, int> opened_field_mod_line_;
   // The scheme for a record field: a local unique field, else a unique external
   // (opened-module) field; null if unknown/ambiguous.
   TypePtr field_scheme(const std::string& label, int at_line = -1) {
@@ -667,7 +673,10 @@ struct Checker {
     bool oos = at_line >= 0 && !no_field_scope_ &&
                no_local_field_in_scope(label, at_line);
     auto it = oos ? fields_.end() : fields_.find(label);
-    if (it != fields_.end()) return it->second;
+    if (it != fields_.end()) {
+      if (TypePtr sh = shadowing_opened_field(label, at_line)) return sh;
+      return it->second;
+    }
     // A label some LOCAL record declares stays unresolved when it is ambiguous
     // (fields_ keeps only the unique ones): the external fallback below is for
     // labels this unit does not declare at all.  Letting it answer here hands a
@@ -700,6 +709,43 @@ struct Checker {
       return false;
     for (int l : li->second) if (l >= 0 && l <= at_line) return false;
     return true;
+  }
+  // NOOPENSHADOWFIELD reverts the leg below.
+  const bool no_open_shadow_field_ =
+      std::getenv("NOOPENSHADOWFIELD") != nullptr;
+  // OCaml resolves a BARE label to the LAST binding in scope, so an `open M`
+  // written BELOW a local record declaring that label -- and ABOVE the use --
+  // SHADOWS it: with `module D = struct type t = {pos_cnum; ..} end  open D
+  // open Lexing`, `{pos_cnum = 4; ..}` is a Lexing.position.  The back end
+  // already reads it that way (its own label registry is last-open-wins), so
+  // typing the base as the LOCAL record only made resolve_pending_fields stamp
+  // that record's field INDEX over the right one -- pos_fname@3 off a block
+  // whose @0 holds it, a string read as an int.  The scheme of the record the
+  // LAST such open declares the label in, or null when nothing shadows (and
+  // when the shadowing open declares it in two records, which is ambiguous).
+  TypePtr shadowing_opened_field(const std::string& label, int at_line) {
+    if (no_open_shadow_field_ || at_line < 0) return nullptr;
+    auto e = ext_fields_.find(label);
+    auto mi = ext_field_mod_.find(label);
+    if (e == ext_fields_.end() || mi == ext_field_mod_.end()) return nullptr;
+    if (mi->second.size() != e->second.size()) return nullptr;
+    auto li = field_cand_line_.find(label);
+    if (li == field_cand_line_.end()) return nullptr;
+    int local = -1;  // the LAST local declaration at or above the use
+    for (int l : li->second)
+      if (l >= 0 && l <= at_line && l > local) local = l;
+    if (local < 0) return nullptr;  // nothing local in scope: not this case
+    TypePtr found = nullptr;
+    int best = -1, nbest = 0;
+    for (size_t i = 0; i < e->second.size(); ++i) {
+      auto oi = opened_field_mod_line_.find(mi->second[i]);
+      if (oi == opened_field_mod_line_.end()) continue;
+      int ol = oi->second;
+      if (ol <= local || ol > at_line) continue;
+      if (ol > best) { best = ol; found = e->second[i]; nbest = 1; }
+      else if (ol == best) ++nbest;
+    }
+    return nbest == 1 ? found : nullptr;
   }
   // The single record an OPENED module declares `label` in, if there is one.
   TypePtr unique_opened_ext_field(const std::string& label) {
@@ -3021,7 +3067,8 @@ struct Checker {
   // through the cmis) into ext_fields_, qualified (`Effect.Deep.handler`).  So a
   // construction `{ retc; exnc; effc }` after `open Effect.Deep` resolves to the
   // handler record and its result type flows (match_with's `'c` -> unit).
-  void load_module_record_fields(const Longident& m, bool via_open = false) {
+  void load_module_record_fields(const Longident& m, bool via_open = false,
+                                 int open_line = -1) {
     auto comps = mod_components(m);
     if (comps.empty()) return;
     if (via_open) {
@@ -3030,6 +3077,9 @@ struct Checker {
       // before the re-load guard: a module can be referenced first, then
       // opened
       opened_field_mods_.insert(p);
+      // and re-opened: the LAST open is the one that shadows
+      if (open_line > 0 && open_line > opened_field_mod_line_[p])
+        opened_field_mod_line_[p] = open_line;
     }
     // Guard against double-loading (a module both opened/referenced and aliased):
     // re-loading would push each label twice and make it spuriously ambiguous.
@@ -3236,7 +3286,8 @@ struct Checker {
       else if (auto* in = std::get_if<Pstr_include>(&it.desc)) me = &in->expr;
       if (me)
         if (auto* pi = std::get_if<Pmod_ident>(&me->desc))
-          load_module_record_fields(pi->id.txt, /*via_open=*/true);
+          load_module_record_fields(pi->id.txt, /*via_open=*/true,
+                                    me->loc.start.lnum);
     }
   }
 
@@ -9096,6 +9147,20 @@ struct Checker {
               }
             }
         auto it = fields_.find(lid_last(lid.txt));
+        // The PATTERN twin of field_scheme's shadowing leg: an `open` written
+        // below the local declaration and above this pattern rebinds the label,
+        // and pinning recTy to the local record here made the arm read at the
+        // wrong offsets (the block itself is built at the opened record's).
+        if (it != fields_.end())
+          if (TypePtr sh = shadowing_opened_field(lid_last(lid.txt),
+                                                  p.loc.start.lnum)) {
+            TypePtr s = I::Engine::repr(eng.instantiate(sh));
+            if (s->kind == I::Type::Kind::Arrow) {
+              try_unify(infer_pat(*sub), s->cod);
+              if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
+              continue;
+            }
+          }
         // A format-poly field is in BOTH maps (kind pass); the pattern binds
         // the GENERALIZED poly scheme so each body use instantiates fresh.
         if (it != fields_.end() && poly_format_labels_.count(lid_last(lid.txt)) &&
@@ -10291,6 +10356,12 @@ struct Checker {
               fsch = named_record_field_arrow(rr->path, lid_last(lbl.txt));
           }
         }
+        // The LITERAL twin of field_scheme's shadowing leg.  Called here rather
+        // than through field_scheme's at_line, because that line ALSO drives
+        // its out-of-scope test (no_local_field_in_scope), which this site has
+        // never applied -- turning it on here costs two cmi-parity files.
+        if (!fsch)
+          fsch = shadowing_opened_field(lid_last(lbl.txt), e.loc.start.lnum);
         if (!fsch) fsch = field_scheme(lid_last(lbl.txt));
         if (!fsch) {
           // `{contents = e}` builds the predefined `'a ref` (non-strict only).
@@ -10348,6 +10419,19 @@ struct Checker {
         if (rb->kind == I::Type::Kind::Constr) {
           std::string repr;
           auto fs = cmi_record_fields(rb->path, &repr);
+          // The back end picks a bare literal's record from its OWN registry,
+          // which is last-REGISTERED-wins and models no open POSITION, so where
+          // shadowing_opened_field decided this literal the two can disagree:
+          // the block gets built at the shadowed LOCAL record's layout while
+          // the reads this pass stamps address the opened one.  Hand the back
+          // end the record's field order explicitly, through the same channel
+          // disambig_record_now uses -- it is checked before every by-name leg.
+          if (record_kinds_ && !no_open_shadow_field_ &&
+              fs.size() == rc->fields.size() &&
+              std::holds_alternative<Lident>(rc->fields[0].first.txt.v) &&
+              shadowing_opened_field(lid_last(rc->fields[0].first.txt),
+                                     e.loc.start.lnum))
+            record_expected_[&e] = fs;
           if (!fs.empty()) record_fields[&e] = std::move(fs);
           if (!repr.empty()) record_reprs[&e] = std::move(repr);
         }
