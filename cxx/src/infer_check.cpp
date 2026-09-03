@@ -703,6 +703,7 @@ struct Checker {
     // locally-declared label a foreign record's field INDEX -- `{id = 1; l1x =
     // "x"}` typed as Types.transient_expr, whose `id` is @3, so reading it off
     // a two-field block returned garbage.
+    if (TypePtr ld = last_declared_field(label, at_line)) return ld;
     if (field_candidates_.count(label)) return nullptr;
     auto e = ext_fields_.find(label);
     if (e != ext_fields_.end() && e->second.size() == 1) return e->second[0];
@@ -715,7 +716,46 @@ struct Checker {
   // `type t = A of {loc:int} let f r = r.loc` is "Unbound record field loc" --
   // so they never take part in a bare `e.label` read, only in `A {loc}`.
   std::unordered_map<std::string, std::vector<int>> field_cand_line_;
+  // ... and, in the same order, the last line of the structure each was
+  // declared in -- its bare-label scope END (-1: none recorded).  A record
+  // declared inside `module M = struct .. end` puts no bare label in scope
+  // outside M, so the "last declaration wins" rule below must skip it there.
+  std::unordered_map<std::string, std::vector<int>> field_cand_end_;
+  // The last line of the structure register_types_rec is walking.
+  int cur_decl_end_ = -1;
   const bool no_field_scope_ = std::getenv("NOFIELDSCOPE") != nullptr;
+  // NOLASTFIELDDECL reverts the leg below.
+  const bool no_last_field_decl_ =
+      std::getenv("NOLASTFIELDDECL") != nullptr;
+  // An AMBIGUOUS bare label -- two LOCAL records declare it, so fields_ keeps
+  // neither -- still resolves in real OCaml: the LAST declaration in scope
+  // wins.  `module De = struct type t = {env; d} .. end` then `module Ju =
+  // struct type t = {env; p} .. let .. jumps.env .. end` leaves `env`
+  // ambiguous file-wide, but inside Ju only Ju.t declares it.  Take the
+  // candidate declared LAST at or above the use, or null when the last two
+  // share a line (a single `type a = {x} and b = {x}` is genuinely ambiguous)
+  // or none is above.
+  TypePtr last_declared_field(const std::string& label, int at_line) {
+    if (no_last_field_decl_ || at_line < 0) return nullptr;
+    auto ci = field_candidates_.find(label);
+    auto li = field_cand_line_.find(label);
+    if (ci == field_candidates_.end() || li == field_cand_line_.end())
+      return nullptr;
+    auto ei = field_cand_end_.find(label);
+    if (ci->second.size() < 2 || li->second.size() != ci->second.size() ||
+        ei == field_cand_end_.end() || ei->second.size() != ci->second.size())
+      return nullptr;
+    int best = -1, nbest = 0;
+    size_t ix = 0;
+    for (size_t i = 0; i < li->second.size(); ++i) {
+      int l = li->second[i], en = ei->second[i];
+      if (l < 0 || l > at_line) continue;  // inline-record field, or below
+      if (en > 0 && at_line > en) continue;  // declared in a CLOSED submodule
+      if (l > best) { best = l; ix = i; nbest = 1; }
+      else if (l == best) ++nbest;
+    }
+    return nbest == 1 ? ci->second[ix] : nullptr;
+  }
   // NOQUALRECLIT reverts the record-LITERAL path-directed leg (Pexp_record).
   const bool no_qual_rec_lit_ = std::getenv("NOQUALRECLIT") != nullptr;
   // No LOCAL record declaration of `label` is in scope at `at_line`: the unit
@@ -4755,11 +4795,13 @@ struct Checker {
           field_candidates_[f.name.txt].push_back(
               eng.arrow(recTy, from_coretype(*f.type, vars)));
           field_cand_line_[f.name.txt].push_back(d.loc.start.lnum);
+          field_cand_end_[f.name.txt].push_back(cur_decl_end_);
         }
         continue;
       }
       field_candidates_[f.name.txt].push_back(eng.arrow(recTy, from_coretype(*f.type, vars)));
       field_cand_line_[f.name.txt].push_back(d.loc.start.lnum);
+      field_cand_end_[f.name.txt].push_back(cur_decl_end_);
     }
   }
   static bool mentions_format(const CoreType& t) {
@@ -4811,6 +4853,7 @@ struct Checker {
       TypePtr a = eng.arrow(result, from_coretype(*f.type, vars));
       field_candidates_[f.name.txt].push_back(a);
       field_cand_line_[f.name.txt].push_back(-1);  // inline: not a bare label
+      field_cand_end_[f.name.txt].push_back(-1);
       own.emplace_back(f.name.txt, a);
     }
     if (!cname.empty() && own.size() == r->fields.size())
@@ -5631,6 +5674,7 @@ struct Checker {
               own.emplace_back(l.name, fa);
               field_candidates_[l.name].push_back(std::move(fa));
               field_cand_line_[l.name].push_back(-1);  // idem, through a cmi
+              field_cand_end_[l.name].push_back(-1);
             }
             std::string key = path + "." + td.name + "." + c.name;
             if (inline_ctor_seen_.insert(key).second)
@@ -13270,6 +13314,11 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
   static const bool no_decl_open_quals =
       std::getenv("NODECLOPENQUALS") != nullptr;
   auto saved_open_quals = ck.opened_type_quals_;
+  // and the structure's last line, so a record declared here knows where its
+  // bare labels stop being in scope (save/restore: a nested module's own end
+  // must not outlive it).
+  int saved_decl_end = ck.cur_decl_end_;
+  ck.cur_decl_end_ = s.empty() ? -1 : s.back().loc.end.lnum;
   for (auto& it : s) {
     if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
       if (!ck.strict && !no_decl_open_quals)
@@ -13342,6 +13391,7 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
       }
     }
   }
+  ck.cur_decl_end_ = saved_decl_end;
   ck.opened_type_quals_ = std::move(saved_open_quals);
 }
 
