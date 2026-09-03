@@ -32738,9 +32738,22 @@ struct Translator {
     static const bool off = std::getenv("NODEFERNESTETA") != nullptr;
     return off;
   }
+  // S397 (hook NODEFERETACOERCE=1 restores S396): the same root placement for
+  // a nested functor whose RESULT CARRIES SUBMODULES.  Such a result has no
+  // flat index map -- the export stub replays the full Includemod coercion --
+  // but ocamlc's Tcoerce_functor sits in the UNIT's coercion either way
+  // (menhirLib's TableInterpreter.MakeEngineTable, whose result signature
+  // EngineTypes.TABLE declares a `Log` submodule).
+  static bool defer_eta_coerce_off() {
+    static const bool off = std::getenv("NODEFERETACOERCE") != nullptr;
+    return off;
+  }
   struct DeferredEta {
     std::vector<int> fields;                 // .mli-result raw field indices
     std::vector<modsig::CoercionPtr> argcc;  // per-param funarg coercions
+    // S397: a result carrying SUBMODULES has no flat index map -- the record
+    // then holds the full Includemod coercion the root stub replays instead.
+    modsig::CoercionPtr cc;
   };
   std::unordered_map<std::string, DeferredEta> deferred_eta_root_;
   // The wrapper the root's legacy fallback builds for a deferred record:
@@ -32759,6 +32772,16 @@ struct Translator {
     if (!de.argcc.empty() && de.argcc[0] && !de.argcc[0]->identity)
       av = coerce_funarg(pa, *de.argcc[0]);
     ap2->args.push_back(av ? av : varof(pa));
+    if (de.cc) {
+      LamPtr cb = apply_msig_coercion(ap2, *de.cc);
+      if (!cb) return nullptr;  // caller keeps the submodule-slot placement
+      wf->body = cb;
+      if (direct) return wf;
+      auto lt4 = mk(Lam::K::Let);
+      lt4->bindings.push_back({fid, ValueKind::Gen, raw, /*alias=*/true});
+      lt4->body = wf;
+      return lt4;
+    }
     Ident rr = fresh("let");
     std::vector<LamPtr> flds;
     for (int ix : de.fields) {
@@ -32808,7 +32831,9 @@ struct Translator {
         for (size_t k2 = 0; k2 < nsig.fields.size(); ++k2)
           if (nsig.fields[k2] == name2) { ix = (int)k2; break; }
         if (ix < 0 || ix >= (int)blk->args.size()) { patched = false; break; }
-        blk->args[ix] = deferred_eta_wrapper(blk->args[ix], *de);
+        LamPtr w2 = deferred_eta_wrapper(blk->args[ix], *de);
+        if (!w2) { patched = false; break; }
+        blk->args[ix] = w2;
       }
     }
     if (!patched && rawval) {
@@ -32824,7 +32849,12 @@ struct Translator {
         fr3->args = {rawval};
         LamPtr fv2 = fr3;
         for (auto& [name2, de] : inner)
-          if (name2 == fn2) { fv2 = deferred_eta_wrapper(fv2, *de); break; }
+          if (name2 == fn2) {
+            LamPtr w3 = deferred_eta_wrapper(fv2, *de);
+            if (!w3) return;  // unreplayable: leave val as it was
+            fv2 = w3;
+            break;
+          }
         fs2.push_back(fv2);
       }
       auto nb = mk(Lam::K::Prim);
@@ -35168,8 +35198,16 @@ struct Translator {
                 std::count(mli_result_key.begin(), mli_result_key.end(),
                            '.') == 1) {
               auto fe0 = functor_export_eta_.find(*mb.name.txt);
-              if (fe0 != functor_export_eta_.end() &&
-                  !functor_export_eta_coerce_.count(*mb.name.txt) &&
+              auto fc0 = functor_export_eta_coerce_.find(*mb.name.txt);
+              bool flat_form = fe0 != functor_export_eta_.end() &&
+                               fc0 == functor_export_eta_coerce_.end();
+              // The coerce form is the same relocation with the full coercion
+              // in place of the flat map; it was already proved replayable on
+              // a bare var where it was recorded, so no second probe here.
+              bool coerce_form = !flat_form && !defer_eta_coerce_off() &&
+                                 fe0 == functor_export_eta_.end() &&
+                                 fc0 != functor_export_eta_coerce_.end();
+              if ((flat_form || coerce_form) &&
                   functor_export_eta_arity(*mb.name.txt) == 1) {
                 modsig::SigPtr rawres =
                     fsig && msig_is_functor(*fsig)
@@ -35181,13 +35219,17 @@ struct Translator {
                     modsig::trusted(*rawres) && modsig::trusted(*tgtres) &&
                     modsig::compute_coercion(*rawres, *tgtres).ok) {
                   DeferredEta de;
-                  de.fields = std::move(fe0->second);
+                  if (coerce_form)
+                    de.cc = std::make_shared<modsig::Coercion>(fc0->second);
+                  else
+                    de.fields = std::move(fe0->second);
                   if (auto a4 = functor_export_eta_argcc_.find(*mb.name.txt);
                       a4 != functor_export_eta_argcc_.end()) {
                     de.argcc = std::move(a4->second);
                     functor_export_eta_argcc_.erase(a4);
                   }
-                  functor_export_eta_.erase(fe0);
+                  if (coerce_form) functor_export_eta_coerce_.erase(fc0);
+                  else functor_export_eta_.erase(fe0);
                   functor_export_eta_arity_.erase(*mb.name.txt);
                   functor_export_eta_mlinames_.erase(*mb.name.txt);
                   deferred_eta_root_[mli_result_key] = std::move(de);
