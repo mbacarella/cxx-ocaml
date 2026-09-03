@@ -13081,8 +13081,32 @@ static void register_functor_body_types(
 }
 
 static void register_types_rec(Checker& ck, const ast::Structure& s) {
+  // `open M` seeds a bare type name -> `M.t` (opened_type_quals_), but this
+  // registration pass runs BEFORE process_items replays any open, so a
+  // declaration was always converted with an EMPTY map: `type e = E of {it:vd}`
+  // under `open S275n` kept a DOTLESS `vd`, the checker never learned the
+  // field's record TYPE, and the back end fell back to its bare-label registry
+  // -- which is last-registered-wins, so a LATER `open S275m` declaring the
+  // same label supplied the offset.  kind_str already patches this up at the
+  // leaf (see its "BARE name brought into scope by `open M`" note), but it
+  // requalifies through the WHOLE-FILE map, which is exactly the wrong answer
+  // when the shadowing open sits BELOW the declaration.  Apply each open as
+  // the walk passes it, so a declaration sees precisely the opens ABOVE it.
+  // The map is saved and restored around every structure, so a nested module's
+  // opens do not escape and process_items still starts from the same map it
+  // always did.  Non-strict only, matching process_items' own gate on these
+  // loaders -- the reject pass must not gain them.  NODECLOPENQUALS reverts.
+  static const bool no_decl_open_quals =
+      std::getenv("NODECLOPENQUALS") != nullptr;
+  auto saved_open_quals = ck.opened_type_quals_;
   for (auto& it : s) {
-    if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+    if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
+      if (!ck.strict && !no_decl_open_quals)
+        if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc)) {
+          ck.load_open_type_quals(pi->id.txt);
+          ck.load_open_local_type_quals(pi->id.txt);
+        }
+    } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
       // two passes so a mutually-recursive group's aliases are all registered
       // before any record fields/ctors that reference them are built.
       for (auto& d : ty->decls) ck.register_type_decl(d);
@@ -13147,6 +13171,7 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
       }
     }
   }
+  ck.opened_type_quals_ = std::move(saved_open_quals);
 }
 
 // Shared setup: register constructors, then run best-effort inference over the
