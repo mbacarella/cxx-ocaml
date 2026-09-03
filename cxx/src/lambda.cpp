@@ -3373,6 +3373,12 @@ struct Translator {
       else local_open_shadow_.erase(it->first);
     }
   }
+  // Revert hook NOOPENSHADOWEXP=1: keep the old file-wide lifetime for a
+  // structure-level open's value shadows.
+  static bool open_shadow_leak() {
+    static const bool on = std::getenv("NOOPENSHADOWEXP") != nullptr;
+    return on;
+  }
   // Would a bare reference to `name` here resolve through a shadowing `open M`
   // rather than through `lookup`?  Mirrors the local_open_shadow_ branch of the
   // Pexp_ident translation: the open wins unless a binding at a frame DEEPER
@@ -33876,17 +33882,29 @@ struct Translator {
     // stdlib (sub)modules `include`d here (canonical dotted/bare names): a `: S`
     // coercion eta-stubs S members that are PRIMITIVES of these (no runtime field).
     std::vector<std::string> inc_stdlib_mods;
-    // ... and the exn shadows those opens installed, undone with them: unlike
-    // local_open_shadow_ (whose local-module guards go stale on their own), an
+    // ... and the exn shadows those opens installed, undone with them: an
     // IMPORTED module's global stays readable outside the structure.
     ShadowSave struct_exn_save;
+    // The VALUE shadows too: a TOP-LEVEL module's base var never goes stale,
+    // so a shadow left by an open nested in a submodule would outlive it and
+    // capture a later module's params (menhirLib: InfiniteArray.new_length
+    // read General.length for its own `length` parameter).
+    ShadowSave struct_shadow_save;
     auto flush = [&] { if (!cur.empty()) segs.push_back({false, false, std::move(cur), nullptr}), cur.clear(); };
     auto add_export_val = [&](const std::string& nm, LamPtr v,
                               modsig::NS ns = modsig::NS::Value,
                               modsig::SigPtr sub = nullptr) {
       // A module-level value binding of `nm` after a shadowing `open M`
-      // re-shadows M (declaration order): drop any recorded open-shadow.
-      if (ns == modsig::NS::Value) local_open_shadow_.erase(nm);
+      // re-shadows M (declaration order): drop any recorded open-shadow --
+      // undoably, like the exn erase below, so a nested module's own binding
+      // does not cancel an enclosing open's shadow for good.
+      if (ns == modsig::NS::Value)
+        if (auto os = local_open_shadow_.find(nm);
+            os != local_open_shadow_.end()) {
+          if (!open_shadow_leak())
+            struct_shadow_save.emplace_back(nm, os->second);
+          local_open_shadow_.erase(os);
+        }
       // ... and the same for an exception, undoably: the erase lasts to the
       // END OF THIS STRUCTURE, so a nested `module A = struct exception E end`
       // does not cancel an enclosing open's shadow for good.
@@ -34129,7 +34147,9 @@ struct Translator {
           opened_.push_back(dotted); ++n_opens;
           modsig::SigPtr osig = msig_of_module_path(dotted);
           bind_opened_members(osig);
-          register_local_open_shadows(dotted, osig, nullptr, &struct_exn_save);
+          register_local_open_shadows(
+              dotted, osig, open_shadow_leak() ? nullptr : &struct_shadow_save,
+              &struct_exn_save);
         } else {
           // a generalized open (`open F(X)` / `open struct..end` / `open (M:S)`)
           // binds the module value like ocamlc's open/N and opens it under a
@@ -34147,7 +34167,9 @@ struct Translator {
           modsig::SigPtr osig = msig_result_of_module_expr(op->expr);
           menv_.bind_module(nm, osig);
           bind_opened_members(osig);
-          register_local_open_shadows(nm, osig, nullptr, &struct_exn_save);
+          register_local_open_shadows(
+              nm, osig, open_shadow_leak() ? nullptr : &struct_shadow_save,
+              &struct_exn_save);
         }
         continue;
       }
@@ -36018,6 +36040,7 @@ struct Translator {
     }
     for (int i = 0; i < n_opens; ++i) opened_.pop_back();
     restore_local_open_exn(struct_exn_save);
+    restore_local_open_shadows(struct_shadow_save);
     menv_.pop_frame();
     scope.pop_back();
     last_inc_stdlib_ = std::move(inc_stdlib_mods);
