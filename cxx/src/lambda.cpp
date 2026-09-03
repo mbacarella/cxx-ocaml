@@ -31849,6 +31849,15 @@ struct Translator {
   // kFunctorMarker carrying functor_param/functor_result), so binding sites and
   // application descent treat Sigs uniformly; msig_is_functor tests for it.
   static constexpr const char* kFunctorMarker = "*functor*";
+  // Revert hook NOMSIGFPARAM=1: the static Sig walk stops binding functor
+  // parameters (a body's `include IT` then splices Unknown items again).
+  static bool msig_fparam_off() {
+    static const bool off = std::getenv("NOMSIGFPARAM") != nullptr;
+    return off;
+  }
+  // Functor parameters bound by the static walk while it descends a functor
+  // BODY (msig_of_module_expr's Pmod_functor case), innermost last.
+  std::vector<std::pair<std::string, modsig::SigPtr>> msig_static_params_;
   static bool msig_is_functor(const modsig::Sig& s) {
     return s.items.size() == 1 && s.items[0].name == kFunctorMarker &&
            s.items[0].functor_result != nullptr;
@@ -31861,6 +31870,24 @@ struct Translator {
   modsig::SigPtr msig_of_module_path(const std::string& dotted0, int depth = 0) {
     if (depth > 24) return nullptr;
     std::string head0 = dotted0.substr(0, dotted0.find('.'));
+    // S392: a functor parameter bound by the static walk shadows everything
+    // else for the extent of that functor's body.
+    for (auto it = msig_static_params_.rbegin();
+         it != msig_static_params_.rend(); ++it)
+      if (it->first == head0) {
+        modsig::SigPtr cur = it->second;
+        std::size_t d = dotted0.find('.');
+        while (cur && d != std::string::npos) {
+          std::size_t e = dotted0.find('.', d + 1);
+          std::size_t len =
+              e == std::string::npos ? std::string::npos : e - d - 1;
+          const modsig::Item* m =
+              cur->find(modsig::NS::Module, dotted0.substr(d + 1, len));
+          cur = m ? m->sub : nullptr;
+          d = e;
+        }
+        return cur;
+      }
     if (auto bound = menv_.find_module(head0)) {
       // The head is Env-bound: the SCOPED answer is authoritative.  A null
       // binding is a tombstone (local module, Sig unknown) -- do NOT fall
@@ -32095,9 +32122,21 @@ struct Translator {
     }
     if (auto* pf = std::get_if<Pmod_functor>(&me.desc)) {
       modsig::Item f{.ns = modsig::NS::Module, .name = kFunctorMarker};
-      if (auto* fp = std::get_if<Functor_named>(&pf->param); fp && fp->type)
+      auto* fp = std::get_if<Functor_named>(&pf->param);
+      if (fp && fp->type)
         f.functor_param = msig_of_modtype(*fp->type, depth + 1);
+      // S392 (hook NOMSIGFPARAM=1 reverts): the body walk must see the
+      // parameter -- menhirLib's InspectionTableInterpreter.Make body says
+      // `include IT`, and without the binding that include splices Unknown
+      // items, so the unit computed coercion reads the functor as untrusted
+      // and the whole unit falls back to the legacy (wrapperless) path.
+      bool bound_param = false;
+      if (!msig_fparam_off() && fp && fp->name.txt && f.functor_param) {
+        msig_static_params_.emplace_back(*fp->name.txt, f.functor_param);
+        bound_param = true;
+      }
       f.functor_result = msig_of_module_expr(*pf->body, depth + 1);
+      if (bound_param) msig_static_params_.pop_back();
       if (!f.functor_result) return nullptr;
       auto out = std::make_shared<modsig::Sig>();
       out->push(std::move(f));
@@ -32621,6 +32660,13 @@ struct Translator {
   // apply (translmod's apply_coercion_result accumulates the params the same
   // way).  Recorded at gate time from the declaration's parameter count.
   std::unordered_map<std::string, int> functor_export_eta_arity_;
+  // For a NESTED eta functor: the .mli result NAMES.  Consumed when the
+  // wrapper is placed at the enclosing structure's export slot -- from then
+  // on the name visible OUTSIDE the structure is the WRAPPER, so a later
+  // intra-unit application must read the coerced (.mli) layout, not the raw
+  // body's (the raw entry stays right only WHILE the structure is open).
+  std::unordered_map<std::string, std::vector<std::string>>
+      functor_export_eta_mlinames_;
   int functor_export_eta_arity(const std::string& nm) {
     auto it = functor_export_eta_arity_.find(nm);
     return it != functor_export_eta_arity_.end() ? it->second : 1;
@@ -32640,6 +32686,36 @@ struct Translator {
   bool pending_functor_eta_coerce_set_ = false;
   modsig::Coercion pending_functor_eta_coerce_;
   std::unordered_map<std::string, modsig::Coercion> functor_export_eta_coerce_;
+  // Revert hook NONESTFUNETA=1: keep the eta placement TOP-LEVEL-only (a
+  // nested restricted functor's coercion fuses into its body as before S392).
+  static bool nested_fun_eta_off() {
+    static const bool off = std::getenv("NONESTFUNETA") != nullptr;
+    return off;
+  }
+  // The .cmi signature DECLARING the functor named by a unit-relative dotted
+  // key: walk each prefix component through plain-Sig submodules of the
+  // unit's own .cmi (null when a hop is missing or not a literal Sig).  A
+  // dotless key answers the unit signature itself.
+  const cmi::Signature* cmi_enclosing_sig_of_key(const std::string& key) {
+    if (!has_mli_cmi_) return nullptr;
+    const cmi::Signature* s = &mli_cmi_sig_;
+    std::size_t start = 0;
+    for (std::size_t d = key.find('.'); d != std::string::npos;
+         d = key.find('.', start)) {
+      std::string comp = key.substr(start, d - start);
+      const cmi::Signature* next = nullptr;
+      for (auto& md : s->modules)
+        if (md.name == comp) {
+          if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+            next = md.type->sig.get();
+          break;
+        }
+      if (!next) return nullptr;
+      s = next;
+      start = d + 1;
+    }
+    return s;
+  }
   // Coerce a stdlib/local module VALUE to a target signature layout, eta-stubbing
   // members that are EXTERNALS of the source module (`Int32.neg` = %int32_neg,
   // not a field) and field-reading the rest.  This is how a functor argument's
@@ -34732,12 +34808,18 @@ struct Translator {
             // try its progressively-stripped suffixes (dropping the unit name) down to
             // the bare functor name.
             std::vector<std::string> mli_result_layout;
+            std::string mli_result_key;
+            bool mli_key_unit_relative = false;
             {
               std::string full = saved_mp.empty() ? *mb.name.txt
                                                   : saved_mp + "." + *mb.name.txt;
               for (std::string cand = full; ; ) {
                 if (auto fr = mli_functor_results_.find(cand); fr != mli_functor_results_.end()) {
                   pending_functor_coerce_ = fr->second; mli_result_layout = fr->second;
+                  mli_result_key = cand;
+                  mli_key_unit_relative =
+                      full.find('.') != std::string::npos &&
+                      full.substr(full.find('.') + 1) == cand;
                   if (auto fs2 = mli_functor_result_sigs_.find(cand);
                       fs2 != mli_functor_result_sigs_.end())
                     pending_functor_coerce_sig_ = &fs2->second;
@@ -34757,7 +34839,9 @@ struct Translator {
             std::vector<modsig::CoercionPtr> eta_argcc;
             // Eta-placement gate (functor_export_eta_): ocamlc coerces a
             // restricted functor at the unit's EXPORT slot, keeping the body
-            // raw.  Only for a shape we can prove safe: a TOP-LEVEL functor,
+            // raw.  Only for a shape we can prove safe: a functor whose .cmi
+            // decl the unit-relative key reaches (top-level, or nested under
+            // plain-Sig submodules; hook NONESTFUNETA=1 restores top-only),
             // named params whose .ml layout equals the .cmi's (or differs by a
             // computable argument projection the wrapper replays on the
             // funarg) and a plain structure body with no
@@ -34769,8 +34853,16 @@ struct Translator {
             // intra-unit application (`Local_reduce = Make(..)`) is fine:
             // eta_fired below keeps functor_result_ / the marker Sig on the RAW
             // body layout so member reads index the raw block, matching ocamlc.
+            // S392: a NESTED functor (menhirLib's Engine.Make) qualifies too
+            // when its unit-relative key walks plain-Sig submodules of the
+            // .cmi; the wrapper then lands at the ENCLOSING submodule's own
+            // export slot and the functor body stays raw, like ocamlc's.
+            const cmi::Signature* eta_decl_sig =
+                cmi_enclosing_sig_of_key(mli_result_key);
             if (!pending_functor_coerce_.empty() && mli_result_sig &&
-                saved_mp.find('.') == std::string::npos) {
+                (saved_mp.find('.') == std::string::npos ||
+                 (!nested_fun_eta_off() && eta_decl_sig &&
+                  mli_key_unit_relative))) {
               // Walk the (possibly multi-parameter) chain to the innermost
               // body; every level must carry a NAMED, typed param for the
               // per-level layout comparison against the .cmi's functor chain.
@@ -34793,8 +34885,8 @@ struct Translator {
                 }
               bool param_same = false;
               std::vector<modsig::CoercionPtr> arg_ccs;
-              if (clean_body && has_mli_cmi_)
-                for (auto& md2 : mli_cmi_sig_.modules)
+              if (clean_body && has_mli_cmi_ && eta_decl_sig)
+                for (auto& md2 : eta_decl_sig->modules)
                   if (md2.name == *mb.name.txt) {
                     // lockstep: each declared param layout must equal the
                     // .cmi's at the same level -- OR carry a computable
@@ -34881,6 +34973,9 @@ struct Translator {
             }
             if (eta_fired) {
               functor_export_eta_arity_[*mb.name.txt] = eta_arity;
+              if (!mli_result_layout.empty() &&
+                  saved_mp.find('.') != std::string::npos)
+                functor_export_eta_mlinames_[*mb.name.txt] = mli_result_layout;
               bool any_arg = false;
               for (auto& a2 : eta_argcc)
                 if (a2) { any_arg = true; break; }
@@ -34923,7 +35018,15 @@ struct Translator {
             // marker chain fresh (subtrees may be shared; never mutate).
             // (Skip under eta placement: the body stays raw, so intra-unit
             // member resolution must see the RAW result Sig.)
-            if (mli_result_sig && !mli_result_layout.empty() && !eta_fired) {
+            // S392: a NESTED eta functor's export slot holds the WRAPPED
+            // functor, so the cursig marker (what the enclosing structure's
+            // coercions and outer readers see) takes the COERCED result; the
+            // menv_ binding keeps the RAW marker for intra-structure reads.
+            bool nested_eta = eta_fired && !nested_fun_eta_off() &&
+                              saved_mp.find('.') != std::string::npos;
+            modsig::SigPtr fsig_slot = fsig;
+            if (mli_result_sig && !mli_result_layout.empty() &&
+                (!eta_fired || nested_eta)) {
               modsig::SigPtr res = msig_of_cmi_signature(*mli_result_sig);
               if (res && !res->items.empty()) {
                 std::vector<modsig::Item> chain;
@@ -34941,13 +35044,16 @@ struct Translator {
                   ns2->number();
                   acc = ns2;
                 }
-                fsig = acc;
+                if (nested_eta) fsig_slot = acc;
+                else fsig = fsig_slot = acc;
               }
             }
             if (fsig && msig_is_functor(*fsig)) {
               menv_.bind_module(*mb.name.txt, fsig);
-              cursig.items.back().functor_param = fsig->items[0].functor_param;
-              cursig.items.back().functor_result = fsig->items[0].functor_result;
+              cursig.items.back().functor_param =
+                  fsig_slot->items[0].functor_param;
+              cursig.items.back().functor_result =
+                  fsig_slot->items[0].functor_result;
             } else {
               menv_.bind_module(*mb.name.txt, nullptr);  // tombstone: shadow, don't guess
             }
@@ -35811,6 +35917,11 @@ struct Translator {
                   functor_export_eta_.erase(f.name);
                   functor_export_eta_arity_.erase(f.name);
                   functor_export_eta_argcc_.erase(f.name);
+                  if (auto mn = functor_export_eta_mlinames_.find(f.name);
+                      mn != functor_export_eta_mlinames_.end()) {
+                    functor_result_[f.name] = std::move(mn->second);
+                    functor_export_eta_mlinames_.erase(mn);
+                  }
                 }
             }
           }
@@ -35931,6 +36042,11 @@ struct Translator {
         lt->body = blk;
         wf->body = lt;
         exports[wi] = wf;
+        if (auto mn = functor_export_eta_mlinames_.find(export_names[wi]);
+            mn != functor_export_eta_mlinames_.end()) {
+          functor_result_[export_names[wi]] = std::move(mn->second);
+          functor_export_eta_mlinames_.erase(mn);
+        }
         functor_export_eta_.erase(fe);
       }
     // Same Tcoerce_functor placement for a SUBMODULE-bearing result: the stub
@@ -35960,7 +36076,11 @@ struct Translator {
         if (LamPtr body = apply_msig_coercion(ap2, fe->second)) {
           wf->body = body;
           exports[wi] = wf;
+          if (auto mn = functor_export_eta_mlinames_.find(export_names[wi]);
+              mn != functor_export_eta_mlinames_.end())
+            functor_result_[export_names[wi]] = std::move(mn->second);
         }
+        functor_export_eta_mlinames_.erase(export_names[wi]);
         functor_export_eta_coerce_.erase(fe);
       }
     if (names) *names = export_names;  // the (deduplicated) export layout, in order
