@@ -4587,27 +4587,39 @@ struct Translator {
       }
     }
   }
-  // The line of the `open M` whose registration is running, or -1 when the
-  // module's records are being pulled in for some other reason.
+  // The line of the `open M` being registered, and the last line of the
+  // STRUCTURE that open sits in -- its scope END.  Both -1 when the module's
+  // records are being pulled in for some other reason.
   int cur_open_line_ = -1;
-  // Bare record type NAME -> the (open line, module) of every opened module
-  // declaring a record of that name, in registration order.
-  std::unordered_map<std::string, std::vector<std::pair<int, std::string>>>
+  int cur_open_end_ = -1;
+  // Bare record type NAME -> the (open line, scope end, module) of every
+  // opened module declaring a record of that name, in registration order.
+  std::unordered_map<std::string,
+                     std::vector<std::tuple<int, int, std::string>>>
       open_record_type_;
   // NOOPENQUAL reverts this slice: a bare declared record path is resolved by
   // name alone again, and the setfield leg below it does not run.
   const char* no_open_qual_ = cppcaml::dbg_env("NOOPENQUAL");
+  // NOOPENSCOPE reverts the scope-end test below: the pick goes back to being
+  // by START LINE alone.
+  const char* no_open_scope_ = cppcaml::dbg_env("NOOPENSCOPE");
   // Qualify a BARE record type name written at `at_line`: the last module
   // OPENED above that line declaring a record so named.  Only when two or more
   // opens collide on the name -- with one candidate there is nothing to pick,
   // and the bare reading already agrees.  Empty when it cannot be decided.
+  // An `open` nested in a submodule does NOT reach a declaration that FOLLOWS
+  // the module, so the start line alone is not enough to order the candidates:
+  // skip any whose enclosing structure ENDS above the use.  A -1 end means the
+  // registration site recorded none, and the old start-line reading stands.
   std::string qualify_bare_record(const std::string& name, int at_line) {
     if (no_open_qual_ || at_line <= 0) return "";
     auto it = open_record_type_.find(name);
     if (it == open_record_type_.end() || it->second.size() < 2) return "";
     const std::string* best = nullptr;
-    for (auto& [line, mod] : it->second)
-      if (line > 0 && line < at_line) best = &mod;
+    for (auto& [line, end, mod] : it->second)
+      if (line > 0 && line < at_line &&
+          (no_open_scope_ || end <= 0 || at_line <= end))
+        best = &mod;
     return best ? *best + "." + name : std::string();
   }
   // A CtorInfo inline-record field's declared type path, with a BARE spelling
@@ -4646,7 +4658,8 @@ struct Translator {
             if (cmi_field_kind(l.type) != ValueKind::Float) { all_float = false; break; }
           if (all_float) continue;
           if (cur_open_line_ > 0)
-            open_record_type_[td.name].push_back({cur_open_line_, mod});
+            open_record_type_[td.name].push_back(
+                {cur_open_line_, cur_open_end_, mod});
           RecType rt; rt.mut = false;
           rt.unboxed = td.unboxed && td.labels.size() == 1;
           bool fresh_type = !rec_types_.count(td.name);
@@ -33950,8 +33963,11 @@ struct Translator {
           else
           {
             cur_open_line_ = op->expr.loc.start.lnum;
+            // the open's scope ends with the structure it is written in
+            cur_open_end_ = s.empty() ? -1 : s.back().loc.end.lnum;
             register_module_records(dotted);  // bare `open M`: M's record labels
             cur_open_line_ = -1;
+            cur_open_end_ = -1;
           }
           opened_.push_back(dotted); ++n_opens;
           modsig::SigPtr osig = msig_of_module_path(dotted);
