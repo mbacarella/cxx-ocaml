@@ -2458,6 +2458,25 @@ struct Checker {
     if (it != modvals_cache_.end()) return it->second;
     return modvals_cache_.emplace(key, resolve_module_values_comps(comps)).first->second;
   }
+  // A (re)bound functor parameter shadows any cached module-value resolution
+  // of its name: modvals_cache_ is keyed by the textual prefix, so a first
+  // `Make (T : TABLE)` would otherwise keep answering a LATER functor's
+  // param (`T.start` in camlinternalMenhirLib's MakeEngineTable read the
+  // TABLE cache entry, which has no `start`, and every member degraded to a
+  // fresh var).  The param's own submodule paths ("T.M") go with it.  Called
+  // at the harvest's bind AND restore, so the file-level meaning of the name
+  // comes back after the body.  NOPARAMVALCACHE reverts.
+  void invalidate_param_modvals(const std::string& pn) {
+    static const bool off = std::getenv("NOPARAMVALCACHE") != nullptr;
+    if (off) return;
+    for (auto it = modvals_cache_.begin(); it != modvals_cache_.end();)
+      if (it->first == pn ||
+          (it->first.size() > pn.size() && it->first[pn.size()] == '.' &&
+           it->first.compare(0, pn.size(), pn) == 0))
+        it = modvals_cache_.erase(it);
+      else
+        ++it;
+  }
   static std::vector<std::string> mod_components_str(const std::string& path) {
     std::vector<std::string> out;
     size_t i = 0;
@@ -2770,6 +2789,50 @@ struct Checker {
     return arr;
   }
 
+  // The signature AST of a `module type` named by a DOTTED path whose head is
+  // a LOCAL structure (`TableFormat.TABLES` in camlinternalMenhirLib): walk
+  // the recorded struct bodies component by component to the owning structure,
+  // then take the named `module type` item (a bare alias resolves through the
+  // file-level map).  Null when any hop is not a recorded local structure --
+  // the cmi lookup keeps those.  NODOTMTPARAM reverts.
+  const ast::Signature* local_dotted_modtype_sig(const Longident& id) {
+    static const bool off = std::getenv("NODOTMTPARAM") != nullptr;
+    if (off) return nullptr;
+    auto* ld = std::get_if<Ldot>(&id.v);
+    if (!ld) return nullptr;
+    auto comps = mod_components(*ld->prefix);
+    if (comps.empty()) return nullptr;
+    auto st = mx_module_structs_.find(comps[0]);
+    if (st == mx_module_structs_.end()) return nullptr;
+    const ast::Structure* items = st->second;
+    for (size_t i = 1; i < comps.size() && items; ++i) {
+      const ast::Structure* next = nullptr;
+      for (auto& it : *items)
+        if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+          if (mb->binding.name.txt && *mb->binding.name.txt == comps[i]) {
+            const ModuleExpr* me = &mb->binding.expr;
+            while (auto* mc = std::get_if<Pmod_constraint>(&me->desc))
+              me = mc->me.get();
+            if (auto* ms = std::get_if<Pmod_structure>(&me->desc))
+              next = &ms->items;
+          }
+      items = next;
+    }
+    if (!items) return nullptr;
+    for (auto& it : *items)
+      if (auto* mt = std::get_if<Pstr_modtype>(&it.desc))
+        if (mt->name.txt == ld->name && mt->type) {
+          if (auto* sg = std::get_if<Pmty_signature>(&mt->type->desc))
+            return &sg->items;
+          if (auto* al = std::get_if<Pmty_ident>(&mt->type->desc))
+            if (auto* l = std::get_if<Lident>(&al->id.txt.v))
+              if (auto f = modtype_sig_asts_.find(l->name);
+                  f != modtype_sig_asts_.end())
+                return f->second;
+          return nullptr;
+        }
+    return nullptr;
+  }
   std::unordered_map<std::string, TypePtr> param_sig_value_schemes(
       const ModuleType& ps, const std::unordered_map<std::string, TypePtr>& argtypes,
       const std::string& qual = "") {
@@ -2784,6 +2847,9 @@ struct Checker {
         if (it != modtype_sig_asts_.end())
           return sig_items_value_schemes(*it->second, argtypes, qual);
       }
+      // A DOTTED name whose head is a local structure (`TableFormat.TABLES`).
+      if (auto* dsig = local_dotted_modtype_sig(mi->id.txt))
+        return sig_items_value_schemes(*dsig, argtypes, qual);
       out = cmi_modtype_value_schemes(mi->id.txt, argtypes, qual);
     } else if (auto* mw = std::get_if<Pmty_with>(&ps.desc)) {
       return param_sig_value_schemes(*mw->mt, argtypes, qual);
@@ -2834,6 +2900,7 @@ struct Checker {
         if (auto it = modtype_sig_asts_.find(l->name);
             it != modtype_sig_asts_.end())
           items = it->second;
+      if (!items) items = local_dotted_modtype_sig(mi->id.txt);
     } else if (auto* mw = std::get_if<Pmty_with>(&ps.desc)) {
       return register_param_sig_members(pn, *mw->mt);
     }
@@ -13111,6 +13178,7 @@ struct Checker {
                 saved_penv.emplace_back(
                     pn, prev != modenv.end() ? std::optional(prev->second) : std::nullopt);
                 modenv[pn] = param_sig_value_schemes(*psig, {});
+                invalidate_param_modvals(pn);
               }
               // Keep only the result's value *names* (fresh polymorphic types):
               // the body's concrete types depend on the (unsubstituted) argument,
@@ -13124,6 +13192,7 @@ struct Checker {
               strict = saved;
               for (auto& [pn, prev] : saved_penv) {
                 if (prev) modenv[pn] = std::move(*prev); else modenv.erase(pn);
+                invalidate_param_modvals(pn);
               }
               for (auto& [k, v] : ex) v = generic_var();
               functor_env[*mb->binding.name.txt] = std::move(ex);
