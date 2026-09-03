@@ -35766,12 +35766,26 @@ struct Translator {
           menv_.bind_module(nm, sub);
           incl_reg_submods_.insert(nm);
         };
+        // A MODULE member's rebound ident is `Ident.create_scoped` upstream
+        // (Typemod gives a module component a scope, a value component none),
+        // and Ident.compare orders EVERY Scoped ident before EVERY Local one --
+        // so a closure capturing both an included module and an included value
+        // lists the module first in its environment whatever the stamps say
+        // (menhirLib's Engine.Make `include T` captures `Log` and `log`).  The
+        // `let open` splice already drew this distinction; the include splice
+        // did not.  NOINCLMODSCOPED=1 reverts.
+        auto fresh_member = [&](const std::string& n, modsig::NS ns2) {
+          static const bool off = cppcaml::dbg_env("NOINCLMODSCOPED");
+          bool ismod = ns2 == modsig::NS::Module ||
+                       (tsig && sig_member_modtype(*tsig, n) != nullptr);
+          return (ismod && !off) ? fresh_scoped(n) : fresh(n);
+        };
         auto emit_field = [&](int i, const std::string& nm, modsig::NS ns,
                               const modsig::SigPtr& sub) {
           if (bound) {
             // a computed include (e.g. a coerced one) has no module name for
             // bare resolution: rebind each field like ocamlc (`f =a field_mut`)
-            Ident id = fresh(nm);
+            Ident id = fresh_member(nm, ns);
             auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut;
             fr->prim_arg = i; fr->args = {base};
             cur.push_back({id, ValueKind::Gen, fr, true});
@@ -35830,7 +35844,7 @@ struct Translator {
             static const bool no_rebind = cppcaml::dbg_env("NOINCLREBIND");
             if ((local_include && (!no_rebind || lookup(nm))) || incl_submod ||
                 incl_global_bound) {
-              Ident id = fresh(nm);
+              Ident id = fresh_member(nm, ns);
               cur.push_back({id, ValueKind::Gen, fi, true});  // =a alias
               scope.back()[nm] = id;
               add_export(nm, id, ns, sub);
