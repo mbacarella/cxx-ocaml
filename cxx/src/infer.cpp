@@ -392,6 +392,76 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       }
     }
     if (last(a->path) != last(b->path) || a->args.size() != b->args.size()) {
+      // STRICT pass only: one side may be a FOLDED cmi abbreviation of the
+      // other's constructor (`Typedtree.pattern` = `value general_pattern` =
+      // `value pattern_desc pattern_data`).  An Arrow unify runs dom before
+      // cod, so throwing here also discards every link BEHIND the clash --
+      // divide_array's `( = )` key var never pinned to int because its
+      // `get_key` neighbour died on exactly this pair, and the eta-stub then
+      // emitted caml_equal for ocamlc's EQ.  Expand one side until its head
+      // AGREES with the other (same last component and arity) and only then
+      // unify -- a chain that never agrees falls through to the throw, so a
+      // merely same-shaped stranger is never adopted.  The attempt is a pure
+      // COMPATIBILITY PROOF: it runs in a trail window and always rolls back,
+      // and only a success that bound no variable counts -- the links this
+      // clash was blocking are then made by the enclosing unification itself.
+      // Depth-capped against mutually-recursive manifests (Shape.Map.t /
+      // Item.Map.t); a self-manifest (no path progress) stops the chain.  The
+      // lenient (display) pass keeps its silent return -- its folded
+      // spellings are the point.  NOABBREVUNIFY reverts.
+      static const bool no_abbrev_unify =
+          std::getenv("NOABBREVUNIFY") != nullptr;
+      static thread_local int abbrev_retry_depth = 0;
+      struct Bump {
+        int& d;
+        explicit Bump(int& d) : d(d) { ++d; }
+        ~Bump() { --d; }
+      };
+      if (!lenient && abbrev_resolver && !no_abbrev_unify &&
+          abbrev_retry_depth < 8) {
+        Bump bump(abbrev_retry_depth);
+        auto seek = [&](const TypePtr& from, const TypePtr& tgt) -> TypePtr {
+          TypePtr cur = from;
+          for (int d = 0; d < 8; ++d) {
+            TypePtr e = abbrev_resolver(cur->path, cur->args);
+            if (!e) return nullptr;
+            TypePtr r = repr(e);
+            if (r->kind != Type::Kind::Constr || r->path == cur->path)
+              return nullptr;
+            if (last(r->path) == last(tgt->path) &&
+                r->args.size() == tgt->args.size())
+              return r;
+            cur = r;
+          }
+          return nullptr;
+        };
+        auto attempt = [&](const TypePtr& x, const TypePtr& y) {
+          size_t m = mark();
+          bool ok;
+          try {
+            unify(x, y);
+            ok = true;
+          } catch (TypeError&) {
+            ok = false;
+          } catch (...) {
+            undo_to(m);
+            throw;
+          }
+          // Keep only a BINDING-FREE success: the retry's job is proving the
+          // two constructors compatible so the ENCLOSING unification reaches
+          // its siblings; a success that had to bind a variable may be
+          // pinning a var ocamlc keeps separate (a `'k pattern_data` met
+          // through an approximated row), so it reads as the old mismatch.
+          // Trail entries recording a Link kind are repr path compressions,
+          // not bindings.
+          for (size_t i = m; ok && i < trail_.size(); ++i)
+            if (trail_[i].kind != Type::Kind::Link) ok = false;
+          undo_to(m);  // a clean success made no bindings to keep
+          return ok;
+        };
+        if (TypePtr e = seek(a, b); e && attempt(e, b)) return;
+        if (TypePtr e = seek(b, a); e && attempt(a, e)) return;
+      }
       if (lenient) return;
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     }
