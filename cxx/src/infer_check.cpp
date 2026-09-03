@@ -1761,6 +1761,21 @@ struct Checker {
           expanding_.erase(nm);
           return r;
         }
+      // Inside a sig conversion the sig's OWN type names shadow any
+      // file-level abbreviation: a bare abstract `terminal` under
+      // `(T : TABLE)` is the opaque `T.terminal`, never the flat
+      // `terminal = int` a LATER module put in type_aliases through
+      // register_types_rec's file-wide pre-pass (menhirLib's Engine.Make
+      // compared T.error_terminal as an int; the same check further down
+      // sits AFTER the fold branches, which won).  NOPARAMSIGQUAL reverts.
+      {
+        static const bool noq = std::getenv("NOPARAMSIGQUAL") != nullptr;
+        if (!noq && !functor_result_abstract_.empty())
+          if (auto* l0 = std::get_if<Lident>(&c->id.txt.v))
+            if (auto s0 = functor_result_abstract_.find(l0->name);
+                s0 != functor_result_abstract_.end())
+              return s0->second;
+      }
       auto ai = type_aliases.find(nm);
       // DISPLAY pass, variant abbreviation (`type 'a lambda = [ `Var .. ]` used
       // as `_ lambda`): expand to the ROW so it unifies with the body's rows
@@ -13177,7 +13192,19 @@ struct Checker {
                 auto prev = modenv.find(pn);
                 saved_penv.emplace_back(
                     pn, prev != modenv.end() ? std::optional(prev->second) : std::nullopt);
-                modenv[pn] = param_sig_value_schemes(*psig, {});
+                // The param's members load QUALIFIED: a bare abstract
+                // `terminal` in the sig must stay the opaque `T.terminal`,
+                // not fall through the flat alias tables, which
+                // register_types_rec's file-wide pre-pass already holds a
+                // LATER module's `type terminal = int` in (menhirLib's
+                // Engine.Make compared T.error_terminal as an int where
+                // ocamlc keeps caml_equal).  The nested-body path (the
+                // g_outer fparams seeding) always passed the qual; this
+                // aligns the main harvest.  NOPARAMSIGQUAL reverts.
+                static const bool noq =
+                    std::getenv("NOPARAMSIGQUAL") != nullptr;
+                modenv[pn] =
+                    param_sig_value_schemes(*psig, {}, noq ? "" : pn);
                 invalidate_param_modvals(pn);
               }
               // Keep only the result's value *names* (fresh polymorphic types):
