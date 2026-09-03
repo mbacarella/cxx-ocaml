@@ -924,6 +924,9 @@ struct Translator {
   // handlers re-read their argument expressions; only or-bound vars ride the
   // exit).
   std::unordered_map<int, LamPtr> gm_facc_proto_;
+  // Exit-arg alias lets inline_exit created (the arm cvar stamps): the
+  // matcher-leaf bindings reorder_gm_alias_runs may re-order.
+  std::set<int> gm_leaf_ord_;
   // Every arm's bound variables as (name, binder), keyed by the arm's exit id.
   // Filled by setup_garm; read by arm_cvar for upstream's name_pattern.
   std::unordered_map<int, std::vector<std::pair<std::string, Ident>>>
@@ -10289,6 +10292,7 @@ struct Translator {
           if (hoisted[i]) continue;
           ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
           bool dup = arg_alias(i);
+          if (dup) gm_leaf_ord_.insert(vars[i].stamp);
           if (dup && l->args[i]->k != Lam::K::Var) {
             res = lower_bind(vars[i], k, l->args[i], res);
             continue;
@@ -10306,6 +10310,7 @@ struct Translator {
           ValueKind k = i < kinds.size() ? kinds[i] : ValueKind::Gen;
           // A dup-able arg (var / field_imm chain) is the pattern-var Alias
           // binding ocamlc's leaf would have made -- simplif substitutes it.
+          if (arg_alias(i)) gm_leaf_ord_.insert(vars[i].stamp);
           let->bindings = {{vars[i], k, l->args[i], arg_alias(i)}};
           let->body = res; res = let;
         }
@@ -11056,6 +11061,127 @@ struct Translator {
       out.push_back(std::move(b));
     }
     l->bindings = std::move(out);
+  }
+  // ocamlc's matcher wraps ALL of an arm's leaf binds -- the pattern vars AND
+  // the materialized `as`-alias columns name_pattern reuses row binders for --
+  // around the action in one flat group, ordered by REVERSE ident creation
+  // (typing-time source order: an alias var right after its sub-pattern's
+  // vars).  Our exit-arg lets already come out in that order (setup_garm mints
+  // cvars in source order and inline_exit wraps them descending), but a
+  // MULTI-USE alias column binds at its own materialization level, ABOVE the
+  // wired group -- Jumps.union's `((i2, pss2) as x2) :: rem2` emitted
+  // `x2, x1, rem2, i2, rem1, i1` where upstream has `rem2, x2, i2, rem1, x1,
+  // i1`.  The layout position is already recorded (Ident::fv_order = the
+  // adopted row binder's stamp), so re-sort each contiguous run of
+  // matcher-origin alias lets by DESCENDING effective stamp (fv_order, else
+  // the cvar's own stamp).  Every such binding is a pure immutable read
+  // (is_alias_dup), so the order is behavior-free; still, an order that would
+  // read a run-mate before its bind (a chain rooted at a sibling, `i2` off
+  // `x2`) is kept only when the sort leaves the def above the use -- else the
+  // run stays as it was.  Only bindings this matcher created move: exit-arg
+  // lets (gm_leaf_ord_) and adopted materializations (fv_order != 0).
+  // NOGMLETORD reverts.
+  static void collect_var_stamps(const LamPtr& l, std::set<int>& out) {
+    if (!l) return;
+    if (l->k == Lam::K::Var) { out.insert(l->var.stamp); return; }
+    collect_var_stamps(l->fn, out); collect_var_stamps(l->body, out);
+    collect_var_stamps(l->cond, out); collect_var_stamps(l->then_, out);
+    collect_var_stamps(l->else_, out); collect_var_stamps(l->sw_default, out);
+    for (auto& a : l->args) collect_var_stamps(a, out);
+    for (auto& b : l->bindings) collect_var_stamps(b.val, out);
+    for (auto& sc : l->sw_consts) collect_var_stamps(sc.body, out);
+    for (auto& sc : l->sw_blocks) collect_var_stamps(sc.body, out);
+  }
+  void reorder_gm_alias_runs(LamPtr& l) {
+    static const bool off = std::getenv("NOGMLETORD") != nullptr;
+    if (!off) reorder_gm_runs_rec(l);
+  }
+  void reorder_gm_runs_rec(LamPtr& l) {
+    if (!l) return;
+    if (l->k == Lam::K::Let) {
+      std::vector<Lam*> spine;
+      for (Lam* cur = l.get();;) {
+        spine.push_back(cur);
+        if (cur->body && cur->body->k == Lam::K::Let) cur = cur->body.get();
+        else break;
+      }
+      std::vector<Lam::Binding*> flat;
+      for (Lam* n : spine)
+        for (auto& b : n->bindings) flat.push_back(&b);
+      auto elig = [&](const Lam::Binding& b) {
+        return b.alias && !b.mut && !b.strict_opt && b.val &&
+               is_alias_dup(b.val) &&
+               (b.id.fv_order != 0 || gm_leaf_ord_.count(b.id.stamp));
+      };
+      auto eff = [](const Lam::Binding& b) {
+        return b.id.fv_order ? b.id.fv_order : b.id.stamp;
+      };
+      for (size_t i = 0; i < flat.size();) {
+        if (!elig(*flat[i])) { ++i; continue; }
+        size_t j = i;
+        while (j < flat.size() && elig(*flat[j])) ++j;
+        // Only a run that CONTAINS the wired leaf group moves: the pass's one
+        // job is interleaving a stray adopted-alias let into the exit-arg
+        // group beneath it.  A run of sibling materializations alone (ident's
+        // guarded `Node (rl, rd, rr, _)`, translcore's `(arg, lbl)` columns)
+        // is already placed by the positional walk, and its fv_orders can
+        // come from DIFFERENT arms (parmatch's records_args names one column
+        // from row 2 and the next from row 3), so they are not comparable.
+        bool has_leaf = false;
+        for (size_t k = i; k < j; ++k)
+          if (gm_leaf_ord_.count(flat[k]->id.stamp)) { has_leaf = true; break; }
+        if (has_leaf && j - i >= 2) {
+          std::vector<Lam::Binding> run;
+          for (size_t k = i; k < j; ++k) run.push_back(*flat[k]);
+          std::vector<Lam::Binding> sorted = run;
+          std::stable_sort(sorted.begin(), sorted.end(),
+                           [&](const Lam::Binding& a, const Lam::Binding& b) {
+                             return eff(a) > eff(b);
+                           });
+          bool changed = false;
+          for (size_t k = 0; k < run.size(); ++k)
+            if (sorted[k].id.stamp != run[k].id.stamp) {
+              changed = true;
+              break;
+            }
+          if (changed) {
+            std::set<int> members, seen;
+            for (auto& b : run) members.insert(b.id.stamp);
+            bool ok = true;
+            for (auto& b : sorted) {
+              std::set<int> used;
+              collect_var_stamps(b.val, used);
+              for (int s : used)
+                if (members.count(s) && !seen.count(s)) { ok = false; break; }
+              if (!ok) break;
+              seen.insert(b.id.stamp);
+            }
+            if (ok)
+              for (size_t k = 0; k < run.size(); ++k) *flat[i + k] = sorted[k];
+            if (cppcaml::dbg_env("GMLORD")) {
+              fprintf(stderr, "[GMLORD] ok=%d run:", (int)ok);
+              for (auto& b : run)
+                fprintf(stderr, " %s/%d(fv=%d,leaf=%d)", b.id.name.c_str(),
+                        b.id.stamp, b.id.fv_order,
+                        (int)gm_leaf_ord_.count(b.id.stamp));
+              fprintf(stderr, "\n");
+            }
+          }
+        }
+        i = j;
+      }
+      for (Lam* n : spine)
+        for (auto& b : n->bindings) reorder_gm_runs_rec(b.val);
+      reorder_gm_runs_rec(spine.back()->body);
+      return;
+    }
+    reorder_gm_runs_rec(l->fn); reorder_gm_runs_rec(l->body);
+    reorder_gm_runs_rec(l->cond); reorder_gm_runs_rec(l->then_);
+    reorder_gm_runs_rec(l->else_); reorder_gm_runs_rec(l->sw_default);
+    for (auto& a : l->args) reorder_gm_runs_rec(a);
+    for (auto& b : l->bindings) reorder_gm_runs_rec(b.val);
+    for (auto& sc : l->sw_consts) reorder_gm_runs_rec(sc.body);
+    for (auto& sc : l->sw_blocks) reorder_gm_runs_rec(sc.body);
   }
   // ----- mutable-local `ref` optimization ------------------------------------
   // Whether `rid` (a `ref`'s binder) is used anywhere but as `!r` / `r := e` /
@@ -36021,6 +36147,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   t.beta_reduce_applied(root);
   t.inline_var_aliases(root);
   t.sink_facc_temp_lets(root);
+  t.reorder_gm_alias_runs(root);
   t.collapse_equal_switches(root);
   {
     static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
