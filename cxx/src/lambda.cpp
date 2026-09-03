@@ -330,6 +330,16 @@ DocP to_doc(const LamPtr& l, Pr& pr) {
     case Lam::K::ConstFloat: return text(l->str_val);
     case Lam::K::ConstString: return text("\"" + ocaml_escape(l->str_val) + "\"");
     case Lam::K::ConstBlock: {  // struct_const: [tag] or [tag: f1 f2 ...]
+      if (l->prim_arg == 254 && !l->args.empty()) {  // Const_float_block
+        std::vector<DocP> fs;
+        for (size_t i = 0; i < l->args.size(); ++i) {
+          if (i) fs.push_back(brk());
+          fs.push_back(to_doc(l->args[i], pr));
+        }
+        return box(BoxT::Box, 1, {text("[|"),
+                                  box(BoxT::Box, 0, std::move(fs)),
+                                  text("|]")});
+      }
       std::string tag = std::to_string(l->prim_arg);
       if (l->args.empty()) return text("[" + tag + "]");
       std::vector<DocP> fs;
@@ -7888,6 +7898,21 @@ struct Translator {
     for (auto* ex : exprs) { fields.push_back(expr(*ex)); shape.push_back(expr_kind(ex)); }
     auto b = block(tag, std::move(fields));
     if (b->k == Lam::K::Prim) b->blk_shape = std::move(shape);
+    return b;
+  }
+
+  // translcore.ml transl_record: an IMMUTABLE flat float record whose
+  // fields are all float literals lifts to a Const_float_block structured
+  // constant (a tag-254 ConstBlock here); a record with a mutable field
+  // keeps the runtime float-block build.
+  static LamPtr float_block_const(const std::vector<LamPtr>& vals) {
+    static const bool off = std::getenv("NOFLTCONST") != nullptr;
+    if (off || vals.empty()) return nullptr;
+    for (auto& v : vals)
+      if (!v || v->k != Lam::K::ConstFloat) return nullptr;
+    auto b = mk(Lam::K::ConstBlock);
+    b->prim_arg = 254;  // Double_array_tag
+    b->args = vals;
     return b;
   }
 
@@ -26923,10 +26948,14 @@ struct Translator {
             // preserves.
             if (rt->unboxed && vals.size() == 1) blk = vals[0];
             else if (rt->flat) {  // flat float record: a float block, not a record
-              auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
-              m->prim_id = rt->mut ? "makearray[float]" : "makearray_imm[float]";
-              m->args = std::move(vals);
-              blk = m;
+              if (!rt->mut) blk = float_block_const(vals);
+              if (!blk) {
+                auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
+                m->prim_id =
+                    rt->mut ? "makearray[float]" : "makearray_imm[float]";
+                m->args = std::move(vals);
+                blk = m;
+              }
             } else if (!rt->mut) {
               blk = block(0, std::move(vals));
               if (blk->k == Lam::K::Prim) blk->blk_shape = rt->shape;
@@ -27099,6 +27128,8 @@ struct Translator {
             // `[@@unboxed]`: no block at all -- the literal IS its one field.
             if (rt->unboxed && vals.size() == 1) return vals[0];
             if (rt->flat) {  // flat float record: a float block, not a record
+              if (!rt->mut)
+                if (auto fb = float_block_const(vals)) return fb;
               auto m = mk(Lam::K::Prim); m->prim = Prim::IntCmp;
               m->prim_id = rt->mut ? "makearray[float]" : "makearray_imm[float]";
               m->args = std::move(vals);

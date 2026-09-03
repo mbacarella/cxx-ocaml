@@ -121,6 +121,11 @@ ValPtr const_value(const LamPtr& c) {
     case Lam::K::ConstString: return vstr(c->str_val);
     case Lam::K::ConstFloat: return omarshal::vdbl(float_of_lit(c->str_val));
     case Lam::K::ConstBlock: {
+      if (c->prim_arg == 254) {  // Const_float_block -> a flat double array
+        std::vector<double> ds;
+        for (auto& a : c->args) ds.push_back(float_of_lit(a->str_val));
+        return omarshal::vdblarr(std::move(ds));
+      }
       std::vector<ValPtr> fs;
       for (auto& a : c->args) fs.push_back(const_value(a));
       return vblock(c->prim_arg, std::move(fs));
