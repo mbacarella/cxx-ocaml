@@ -17150,6 +17150,134 @@ struct Translator {
         c->gm_chunk = true;              // a split_no_or division catch
         return c;
       };
+      // The three-list do_split of the note at the call site below.
+      static const std::vector<std::string> gm_split_novars;
+      auto attempt_split = [&]() -> LamPtr {
+        if (comps.size() != 1 || cppcaml::dbg_env("NOORDOSPLIT"))
+          return nullptr;
+        auto is_or = [&](size_t i) {
+          return std::get_if<Ppat_or>(&rows[i].cols[0]->desc) != nullptr;
+        };
+        // Parmatch.may_compat, which looks THROUGH the head constructor: the
+        // arguments settle it whenever the heads agree (`Insert (Named (Some
+        // _, _))` and `Insert (Unit | Named (None, _))` name one constructor
+        // and are still incompatible, so Or_matrix appends the second or-row
+        // beside the first instead of deferring it).  `col_disjoint`, the
+        // head-name test the hoist above uses, would call them compatible.
+        auto compat = [&](size_t i, size_t j) {
+          return !gm_pair_disjoint(rows[i].cols[0], rows[j].cols[0], true);
+        };
+        auto safe_bef = [&](size_t i, const std::vector<size_t>& l) {
+          for (size_t j : l)
+            if (compat(i, j) && !gm_same_action(rows[i], rows[j])) return false;
+          return true;
+        };
+        // Or_matrix.equiv_pat, approximated by the alternatives' constructor
+        // NAMES.  It guards insert_or_append's INSERT branch, which is not
+        // modelled here, so a hit declines the whole shape.
+        auto alt_names = [&](size_t i) {
+          std::set<std::string> s;
+          std::vector<const Pattern*> a; flatten_or(rows[i].cols[0], a);
+          for (auto* p : a) {
+            auto* k = std::get_if<Ppat_construct>(&effective_pat(p)->desc);
+            if (!k) return std::set<std::string>{};
+            s.insert(lid_last(k->id.txt));
+          }
+          return s;
+        };
+        std::vector<size_t> sb, so, sn;
+        for (size_t i = 0; i < rows.size(); ++i) {
+          if (!safe_bef(i, sn)) { sn.push_back(i); continue; }
+          if (!is_or(i) && safe_bef(i, so)) { sb.push_back(i); continue; }
+          bool app = true;                                 // insert_or_append
+          for (size_t j : so) {
+            if (!is_or(j) || !compat(i, j)) continue;
+            if (is_or(i) && !pattern_binds(rows[i].cols[0]) &&
+                !pattern_binds(rows[j].cols[0])) {
+              auto ai = alt_names(i);
+              if (!ai.empty() && ai == alt_names(j)) return nullptr;
+            }
+            // safe_below: a guarded or-row above cannot be fallen past
+            if (rows[j].guard) { app = false; break; }
+          }
+          if (app) so.push_back(i); else sn.push_back(i);
+        }
+        if (sn.empty()) return nullptr;
+        bool anyor = false;
+        for (size_t j : so) {
+          if (!is_or(j)) continue;
+          anyor = true;
+          if (rows[j].aid < 0 || !rows[j].vnames) return nullptr;
+          // a binding or-row would need exit ARGUMENTS: not modelled here
+          if (pattern_binds(rows[j].cols[0])) return nullptr;
+        }
+        if (!anyor) return nullptr;
+        // cons_next compiles the NO sub-matrix first, then takes the default
+        // entry's exit, then precompile_or takes the handlers'.
+        std::vector<MRow> norows;
+        for (size_t i : sn) norows.push_back(rows[i]);
+        std::vector<LamPtr> ncomps = comps;
+        LamPtr sub =
+            gmatch(std::move(ncomps), std::move(norows), mloc, deid, denv);
+        if (!sub) { bailed = true; return nullptr; }
+        int idef = ++next_exit_;
+        std::vector<int> ks;
+        for (size_t j : so) ks.push_back(is_or(j) ? ++next_exit_ : -1);
+        std::vector<MRow> body;
+        for (size_t i : sb) body.push_back(rows[i]);
+        for (size_t t = 0; t < so.size(); ++t) {
+          if (ks[t] < 0) { body.push_back(rows[so[t]]); continue; }
+          gm_orw_.insert({ks[t], nullptr});
+          gm_orw_.insert({ks[t], gm_orw_all()});
+          std::vector<const Pattern*> alts;
+          flatten_or(rows[so[t]].cols[0], alts);
+          for (auto* a : alts) {
+            MRow nr = rows[so[t]];
+            nr.cols[0] = effective_pat(a);
+            nr.aid = ks[t]; nr.vnames = &gm_split_novars; nr.guard = nullptr;
+            body.push_back(std::move(nr));
+          }
+        }
+        auto def_frame = [&](bool popped) {
+          GmDef e; e.eid = idef;
+          if (popped) e.mat.push_back({});
+          else { for (size_t i : sn) e.mat.push_back(rows[i].cols);
+                 e.colmap.push_back(0); }
+          return e;
+        };
+        std::vector<GmDef> env1; env1.push_back(def_frame(false));
+        env1.insert(env1.end(), denv.begin(), denv.end());
+        std::vector<LamPtr> bc = comps;
+        LamPtr res = gmatch(std::move(bc), std::move(body), mloc, deid, env1);
+        if (!res) { bailed = true; return nullptr; }
+        for (size_t t = 0; t < so.size(); ++t) {
+          if (ks[t] < 0) continue;
+          // Default_environment.pop_compat: the handler falls into the default
+          // entry only where the sub-matrix holds a row the or-pattern can
+          // reach.
+          bool pc = false;
+          for (size_t i : sn) if (compat(i, so[t])) { pc = true; break; }
+          std::vector<GmDef> env2;
+          if (pc) env2.push_back(def_frame(true));
+          env2.insert(env2.end(), denv.begin(), denv.end());
+          MRow hr = rows[so[t]]; hr.cols.clear();
+          LamPtr hb = gmatch({}, {hr}, mloc, deid, env2);
+          if (!hb) { bailed = true; return nullptr; }
+          auto c = mk(Lam::K::Catch);
+          c->prim_arg = ks[t]; c->cond = res; c->then_ = hb;
+          res = c;
+        }
+        int bad = 0;
+        int uses = count_exit(res, idef, false, bad);
+        if (uses == 0) return res;
+        if (uses == 1 && bad == 0) {
+          inline_exit(res, idef, {}, {}, sub);
+          return res;
+        }
+        auto ci = mk(Lam::K::Catch);
+        ci->prim_arg = idef; ci->cond = res; ci->then_ = sub;
+        return ci;
+      };
       if (relaxed) {
         int exit_save = next_exit_, stamp_save = stamp;
         auto orw_save = gm_orw_;
@@ -17205,6 +17333,34 @@ struct Translator {
                                (lead_sb &&
                                 (tpx || deid != gm_fake_deid_ || ors1))))
         return res;
+      if (bailed) return nullptr;
+      //   matching.ml:1583's do_split PROPER, for a SINGLE-column matrix.  With
+      // no remaining columns `ps`/`qs` are empty, `le_pats` is trivially true
+      // and `may_compats` is column-0 compatibility alone, and the partition
+      // reduces to three lists: BEFORE, a row swappable past everything already
+      // deferred AND past the or-rows collected so far, which keeps its own
+      // dispatch cell in the body; ORS, the or-rows Or_matrix accepts, each
+      // exploded into one alternative row per constructor raising its own
+      // handler exit (a SIMPLE row can land here too: precompile_or's do_cases
+      // leaves it in the body, after the earlier BEFORE rows); and NO, which
+      // is everything else, compiled as ONE sub-matrix behind a fresh default
+      // entry that the body and every or-handler fall into.  Nesting is
+      // `catch (catch .. with (K0) H0 .. with (Kn) Hn) with (idef) SUB` --
+      // handler 0 innermost (compile_orhandlers folds left), the default
+      // entry outermost (cons_next wraps it), which is also the emission order
+      // of the four blocks.
+      //   pprintast's `expression` is the shape: three GUARDED or-rows head the
+      // match (`Pexp_function _ | Pexp_match _ | Pexp_try _ | Pexp_sequence _ |
+      // Pexp_newtype _ when ctxt.pipe || ctxt.semi` and two more) and the arms
+      // below split by compatibility -- a tag no or-row names (Pexp_apply,
+      // Pexp_construct, ..) keeps its cell in the first switch while a
+      // compatible one (Pexp_let, Pexp_function, ..) moves into the sub-matrix.
+      // `attempt` demanded every trailing row be a wildcard, so the whole match
+      // fell to the duplicating expansion below: each guard re-tested in its
+      // cell, and the arm bodies -- with every closure they allocate -- emitted
+      // in the wrong order.  Runs only where `attempt` already declined, so it
+      // can add a shape but never change one.  NOORDOSPLIT reverts.
+      if (LamPtr res = attempt_split()) return res;
       if (bailed) return nullptr;
     }
     // Expand an or-pattern in column 0 into separate rows (order preserved).
