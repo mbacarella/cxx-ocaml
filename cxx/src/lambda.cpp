@@ -19714,7 +19714,11 @@ struct Translator {
                 // each exploded alternative: precompile_or compiles the row
                 // ONCE, in the handler, and translcore.ml:589 sends a failed
                 // guard to `staticfail` -- the pm's default entry (hfail).
-                const Expression* hguard = nullptr; int hfail = -1; };
+                const Expression* hguard = nullptr; int hfail = -1;
+                // The arm's own column-0 pattern (through the top-level
+                // tuple flattening) IS an or-pattern, so do_split sees the
+                // or at the TOP level.  See wire_garms' splice walk.
+                bool top_or = false; };
   // The gmatch decision-node budget (env-overridable for calibration).
   int gm_budget() {
     static int b = [] {
@@ -19819,10 +19823,21 @@ struct Translator {
       collect_inline_whole_vars(k->arg->get(), out);
     }
   }
+  // Is the or-pattern of this arm in COLUMN 0 of the match's FIRST matrix?
+  // The top matrix is the arm patterns, tuple-flattened, so a component of a
+  // tuple arm counts; anything under a constructor, record or array is reached
+  // only after that column is consumed and belongs to a deeper pm.
+  bool top_level_or(const Pattern* p0) {
+    const Pattern* p = effective_pat(p0);
+    if (std::holds_alternative<Ppat_or>(p->desc)) return true;
+    if (auto* tu = std::get_if<Ppat_tuple>(&p->desc))
+      for (auto& e : tu->elems) if (top_level_or(e.get())) return true;
+    return false;
+  }
   // Set up an arm from its full pattern (var collection) and body.  Allocates the
   // exit id + fresh catch-vars; the caller points its MRow(s) at &a.vnames/a.aid.
   GArm setup_garm(const Pattern* full, const Expression* rhs) {
-    GArm a; a.rhs = rhs;
+    GArm a; a.rhs = rhs; a.top_or = top_level_or(full);
     collect_gvars(full, a.vnames);
     collect_alias_names(full, a.alias_names);
     a.aid = ++next_exit_;
@@ -20116,7 +20131,8 @@ struct Translator {
   // compiled against the argument expressions themselves, so context fields
   // are re-read inside the handler (per its own use count) and only or-bound
   // vars are passed through the exit.
-  void wire_garms(LamPtr& body, std::vector<GArm>& arms) {
+  void wire_garms(LamPtr& body, std::vector<GArm>& arms,
+                  bool deid_div = false) {
     for (auto& a : arms) {
       int bad = 0; int uses = count_exit(body, a.aid, false, bad);
       // A pending or-handler catch (created at the or-split point) is KEPT only
@@ -20155,6 +20171,24 @@ struct Translator {
             Lam* l = p->get();
             if (!l || l->k != Lam::K::Catch) break;
             if (l->gm_deidc && (*pend)->gm_orp_rest) break;
+            //   And the shared-default catch stops it whenever it stands in for
+            // upstream's split_no_or LAST-ROW DIVISION.  With no or-pattern in
+            // column 0 of the top matrix, do_split hands every row to
+            // split_no_or, whose `collect` peels a trailing all-variable row
+            // into its own pm (matching.ml:1524) and comp_match_handlers wraps
+            // that catch around the first one -- the or-handler of a DEEPER
+            // column is then compiled inside it.  We peel the same row at
+            // gmatch_top and park it at `deid`, so our catch IS that division;
+            // splicing to the root hoists the or-handler past it and swaps the
+            // two handler bodies (typecore's `contains_polymorphic_variant`:
+            // ref emits `CONST1; RETURN 1` before `CONST0; RETURN 1`).  When
+            // the or IS in column 0 the division never happens -- do_split
+            // reaches precompile_or and Or_matrix appends the catch-all to the
+            // or-matrix itself (safe_below holds with no columns left), which
+            // leaves the or-catch outermost, so keep splicing those.
+            // NOORPDIV reverts.
+            if (l->gm_deidc && deid_div && !a.top_or &&
+                !cppcaml::dbg_env("NOORPDIV")) break;
             if (l->gm_chunkc && !cppcaml::dbg_env("NOCHUNKORP")) break;
             p = &l->cond;
           }
@@ -20848,7 +20882,7 @@ struct Translator {
       dcatch->gm_deidc = true;
       body = dcatch;
     }
-    wire_garms(body, arms);
+    wire_garms(body, arms, catchall != nullptr);
     if (cppcaml::dbg_env("STRDBG")) {
       fprintf(stderr, "[STRDBG] post-wire:\n"); print_dlambda(body, std::cerr);
     }
