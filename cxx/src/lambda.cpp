@@ -9380,10 +9380,16 @@ struct Translator {
           // exn_payload_match).  Its failure joins the row's other failure
           // points, so it needs the same shared exit a guard would.
           bool pay_match = false;
-          if (!then && !c.guard && !shared_body && exn_payload_match_ok(k)) {
+          // A GUARD is no reason to drop the row either: the matcher takes
+          // it on the payload row, the way translcore hands Matching a
+          // guarded case.
+          static const bool nopmg = cppcaml::dbg_env("NOEXNPMATCHN");
+          if (!then && (!c.guard || !nopmg) && !shared_body &&
+              exn_payload_match_ok(k)) {
             int fe = arm_fail, fresh_eid = 0;
             if (fe < 0) { if (!eid) eid = fresh_eid = ++next_exit_; fe = eid; }
-            then = exn_payload_match(exn, k, *c.rhs, fe, &row_aliases, c.lhs->loc);
+            then = exn_payload_match(exn, k, *c.rhs, fe, &row_aliases,
+                                     c.lhs->loc, c.guard);
             pay_match = then != nullptr;
             // Give the exit id back if the match declined: an id burned here
             // renumbers every later exit in the unit.
@@ -9709,13 +9715,46 @@ struct Translator {
   // Synthesised rows for exn_payload_match, kept alive for the whole unit.
   std::vector<PatBox> exn_syn_pats_;
   std::vector<ExprBox> exn_syn_exprs_;
+  // The one column of an n-ary exception payload that needs a TEST, or -1 when
+  // the shape is not one exn_payload_match can take.  Only one column can
+  // become the value matcher's scrutinee, so every other must be a plain binder
+  // -- exn_case_body's own simple-field path, which is what wraps them here.
+  int exn_payload_test_col(const Ppat_construct* k) {
+    static const bool off = cppcaml::dbg_env("NOEXNPMATCH");
+    static const bool nogen = cppcaml::dbg_env("NOEXNPMATCHN");
+    if (off || !k->arg) return -1;
+    int ar = exn_pat_arity(k);
+    if (ar < 1 || (nogen && ar != 1)) return -1;
+    if (ar > 1) {
+      // an inline-record payload lies FLAT in the exn block, so there is no
+      // single field to hand the matcher: exn_case_body owns that shape.
+      const Pattern* a0 = effective_pat(k->arg->get());
+      if (std::holds_alternative<Ppat_record>(a0->desc) &&
+          !exn_inline_labels(lid_last(k->id.txt), &k->id.txt).empty())
+        return -1;
+    }
+    auto fps = ctor_field_pats(k, ar);
+    if ((int)fps.size() != ar) return -1;
+    int r = -1;
+    for (int j = 0; j < ar; ++j) {
+      if (!fps[j]) return -1;
+      const Pattern* e = effective_pat(fps[j]);
+      if (!is_irrefutable(*e)) {
+        if (r >= 0) return -1;
+        r = j;
+        continue;
+      }
+      if (ar > 1 && !std::holds_alternative<Ppat_any>(e->desc) &&
+          !std::holds_alternative<Ppat_var>(e->desc) &&
+          !std::holds_alternative<Ppat_alias>(e->desc))
+        return -1;
+    }
+    return r;
+  }
   // Whether exn_payload_match can take this row -- checked BEFORE an exit id is
   // allocated, since burning one would renumber every later exit in the unit.
   bool exn_payload_match_ok(const Ppat_construct* k) {
-    static const bool off = cppcaml::dbg_env("NOEXNPMATCH");
-    if (off || !k->arg || exn_pat_arity(k) != 1) return false;
-    auto fps = ctor_field_pats(k, 1);
-    return fps.size() == 1 && fps[0] && !is_irrefutable(*effective_pat(fps[0]));
+    return exn_payload_test_col(k) >= 0;
   }
   // An exception handler's payload compiled as a REAL value match.
   // exn_case_body destructures the payload with an ad-hoc chain of field tests
@@ -9735,9 +9774,13 @@ struct Translator {
   LamPtr exn_payload_match(const Ident& exn, const Ppat_construct* k,
                            const Expression& rhs, int fail_exit,
                            const std::vector<std::string>* aliases,
-                           const Location& mloc) {
-    if (!exn_payload_match_ok(k) || fail_exit < 0) return nullptr;
-    const Pattern* pay = ctor_field_pats(k, 1)[0];
+                           const Location& mloc,
+                           const Expression* guard = nullptr) {
+    int tcol = exn_payload_test_col(k);
+    if (tcol < 0 || fail_exit < 0) return nullptr;
+    int ar = exn_pat_arity(k);
+    auto fps = ctor_field_pats(k, ar);
+    const Pattern* pay = fps[tcol];
     auto anyp = std::make_unique<Pattern>();
     anyp->desc = Ppat_any{};
     anyp->loc = pay->loc;
@@ -9748,14 +9791,30 @@ struct Translator {
     const Expression* fakeptr = fake.get();
     exn_syn_pats_.push_back(std::move(anyp));
     exn_syn_exprs_.push_back(std::move(fake));
-    std::vector<Row> prows = {{pay, &rhs, nullptr}, {anyptr, fakeptr, nullptr}};
+    // The guard rides on the payload ROW: translcore folds it into that row's
+    // action, so a failed guard falls through to the catch-all row and out to
+    // fail_exit -- the same edge the payload test takes.
+    std::vector<Row> prows = {{pay, &rhs, guard}, {anyptr, fakeptr, nullptr}};
     // The payload read is bound here, not left to the matcher: ocamlc's
     // toplevel_handler hands Matching an already-bound argument, so the field
     // read is an ALIAS binding (a pure read the arms may duplicate), where a
     // matcher-materialised scrutinee is Strict.
-    Ident pv = fresh("", true);
     scope.emplace_back();
     if (aliases) for (auto& nm : *aliases) scope.back()[nm] = exn;
+    // The plain columns bind BEFORE the temp is created, so their stamps
+    // precede it the way a source variable precedes matching.ml's own
+    // `*match*`, and their lets sit INSIDE it -- upstream reads the tested
+    // column first (the discriminator) and the binders under it.
+    std::vector<std::pair<Ident, LamPtr>> binders;
+    bool bok = true;
+    for (int j = 0; bok && j < ar; ++j) {
+      if (j == tcol) continue;
+      const Pattern* fp = effective_pat(fps[j]);
+      if (std::holds_alternative<Ppat_any>(fp->desc)) continue;
+      bok = collect_binders(*fp, fieldimm(j + 1, varof(exn)), binders);
+    }
+    if (!bok) { scope.pop_back(); return nullptr; }
+    Ident pv = fresh("", true);
     shared_action_exit_[fakeptr] = fail_exit;
     LamPtr body = compile_match(varof(pv), prows, mloc);
     shared_action_exit_.erase(fakeptr);
@@ -9773,8 +9832,10 @@ struct Translator {
       retarget_exit(inner, from, to);
       body = inner;
     }
+    body = wrap_binders(body, binders);
     auto let = mk(Lam::K::Let);
-    let->bindings = {{pv, ValueKind::Gen, fieldimm(1, varof(exn)), /*alias=*/true}};
+    let->bindings = {{pv, ValueKind::Gen, fieldimm(tcol + 1, varof(exn)),
+                      /*alias=*/true}};
     let->body = body;
     return let;
   }
