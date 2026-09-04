@@ -12684,7 +12684,19 @@ struct Translator {
     if (auto* pa = std::get_if<Ppat_alias>(&p->desc)) {  // `pat as x`: bind x and recurse
       Ident id = pre_or_fresh(p, pa->name.txt);
       scope.back()[pa->name.txt] = id; out.push_back({id, scrut});
-      return collect_binders(*pa->p, scrut, out);
+      // The alias IS the sub-pattern's scrutinee variable: Matching's
+      // `arg_to_var` names a column's argument after the first row's var or
+      // alias, `bind_match_arg` binds it once, and every deeper projection
+      // then reads THAT variable -- typecore's `({ Parmatch.pattern; _ } as
+      // untyped_case, case_data)` gives `pattern =a (field_imm 0
+      // untyped_case)` where we re-derived `(field_imm 0 (field_imm 0
+      // param))`.  arg_to_var keeps an argument that is ALREADY an `Lvar` as
+      // the base instead, but guarding on that was measured to change nothing
+      // (corpus and probes alike): an alias whose access is a variable emits
+      // the same code either way, so the plain form ships.  NOALIASBASE keeps
+      // re-deriving from the root.
+      static const bool no_alias_base = cppcaml::dbg_env("NOALIASBASE");
+      return collect_binders(*pa->p, no_alias_base ? scrut : varof(id), out);
     }
     // Field iteration below is RIGHT-TO-LEFT at every level: ocamlc's matcher
     // binds an irrefutable destructure's components in reverse field order
