@@ -25980,17 +25980,32 @@ struct Translator {
         // (the value itself when nullary, else field 0), like ext_match -- so a
         // pattern containing one (`Some B`, `(Some A|Some B), A`) matches in the
         // multi-column naive matcher instead of bailing.
+        // A NESTED-qualified extension ctor (`Env.Error.In_context`) is in none
+        // of the bare-name registries and module_ctor_identity does not reach
+        // it, so without this the pattern was not recognised as a constructor
+        // at all and its row compiled as if it always matched.
+        static const bool noqual = cppcaml::dbg_env("NOEXNQUALID");
+        int narity = -1;
+        LamPtr nid = noqual ? nullptr : nested_exn_identity(k->id.txt, &narity);
         if (exn_ident_.count(cn) || exn_field_.count(cn) ||
             is_predef_exn_name(cn) || is_opened_exn_name(cn) ||
-            module_ctor_identity(k->id.txt)) {
+            module_ctor_identity(k->id.txt) || nid) {
           int arity = exn_arity_.count(cn) ? exn_arity_[cn] : (k->arg ? 1 : 0);
           // an opened unit's exn: the true arity is in its cmi, not exn_arity_
           static const bool no_open = cppcaml::dbg_env("NOOPENEXN");
           if (!no_open && k->arg && !exn_arity_.count(cn))
             if (int a = opened_exn_arity(cn); a > 0) arity = a;
+          // a nested path names ITS typext, whose arity a same-named local
+          // binder's entry would otherwise override
+          if (nid && narity >= 0) arity = narity;
           // a module-qualified extension constructor (`M1.E`) compares against
-          // that module's own field, not the last same-named binder
-          LamPtr ident = module_ctor_identity(k->id.txt);
+          // that module's own field, not the last same-named binder -- and a
+          // NESTED path (`Env.Error.In_context`) needs the full resolver, else
+          // both alternatives of `Error.In_context _ | Env.Error.In_context _`
+          // collapse onto the local binder and the qualified one never matches.
+          static const bool noqual = cppcaml::dbg_env("NOEXNQUALID");
+          LamPtr ident = noqual ? module_ctor_identity(k->id.txt)
+                                : exn_ctor_identity(k->id.txt);
           if (!ident) ident = exn_value(cn);
           auto t = mk(Lam::K::Prim); t->prim = Prim::IntCmp; t->prim_id = "==";
           t->args = {k->arg ? fieldimm(0, acc) : acc, ident};
