@@ -26548,6 +26548,40 @@ struct Translator {
         }
       }
     }
+    // Upstream's OR-HANDLER (matching.ml's precompile_or / explode_or_pat): a
+    // non-binding or-row's alternatives all `(exit k)` to ONE copy of the arm
+    // body rather than each carrying a duplicate of it.  The expansion above
+    // turned such a row into one Row per alternative, all sharing the SAME rhs
+    // pointer, so a RUN of >= 2 consecutive rows with that pointer IS one
+    // or-row (distinct source cases hold distinct Expression nodes).  Kept to
+    // the shape upstream shares: unguarded, binder-free, alias-free, no nested
+    // or-choices, and with a row after it so the handler is not the whole
+    // chain (typecore's `is_recoverable`, whose three identity tests branch to
+    // a single `CONST1; RETURN 1`).  NOORSHARE reverts to the duplicating
+    // chain.
+    static const bool no_orshare = cppcaml::dbg_env("NOORSHARE");
+    std::vector<int> share_eid(rows.size(), -1);   // row body is `(exit id)`
+    std::vector<int> share_wrap(rows.size(), -1);  // wrap a catch here
+    if (!no_orshare) {
+      size_t i = 0;
+      while (i < rows.size()) {
+        size_t j = i;
+        while (j + 1 < rows.size() && rows[j + 1].rhs == rows[i].rhs) ++j;
+        bool ok = j > i && j + 1 < rows.size();
+        for (size_t t = i; ok && t <= j; ++t) {
+          const auto& r = rows[t];
+          if (r.guard || r.tcatch || !r.aliases.empty() || !r.choices.empty() ||
+              pattern_binds(r.lhs))
+            ok = false;
+        }
+        if (ok) {
+          int eid = ++next_exit_;
+          for (size_t t = i; t <= j; ++t) share_eid[t] = eid;
+          share_wrap[i] = eid;
+        }
+        i = j + 1;
+      }
+    }
     LamPtr chain = raise_predef("Match_failure", mloc, "naive_chain");
     for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
       LamPtr test;
@@ -26582,7 +26616,13 @@ struct Translator {
         cat->cond = body; cat->prim_arg = n; cat->then_ = chain;
         chain = cat;
       } else {
-        LamPtr body = wrap_binders(expr(*it->rhs), binds);
+        size_t ri = rows.size() - 1 - (size_t)(it - rows.rbegin());
+        LamPtr body;
+        if (share_eid[ri] >= 0) {  // an or-alternative: raise the handler
+          body = mk(Lam::K::Staticraise); body->prim_arg = share_eid[ri];
+        } else {
+          body = wrap_binders(expr(*it->rhs), binds);
+        }
         // An irrefutable row, OR -- for a Total match (typer-proven exhaustive) --
         // the LAST row, whose test is redundant: if no earlier row matched, this
         // one must, so ocamlc emits it unconditionally and drops the impossible
@@ -26597,6 +26637,13 @@ struct Translator {
         }
       }
       scope.pop_back();
+      if (size_t ri = rows.size() - 1 - (size_t)(it - rows.rbegin());
+          share_wrap[ri] >= 0) {
+        auto cat = mk(Lam::K::Catch);
+        cat->cond = chain; cat->prim_arg = share_wrap[ri];
+        cat->then_ = expr(*rows[ri].rhs);
+        chain = cat;
+      }
     }
     if (tempd) {
       auto l = mk(Lam::K::Let);
