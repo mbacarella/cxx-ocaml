@@ -1008,6 +1008,11 @@ struct Translator {
   //   Set and restored unconditionally by every gmatch_top entry, so a nested
   // match compiled mid-construction can never see a stale license.
   int gm_tp_deid_ = -1;
+  // Set while attempt_split's NO sub-matrix is compiled: inside it the arriving
+  // tags are exactly the ones its default entry's matrix names (specialization
+  // drops the entry for any other), so a nested split's body may lose a cell no
+  // row of it names.  Saved and restored by gmatch_top like the licenses above.
+  bool gm_split_sub_ = false;
   // The proven-total match's ROOT scrutinee var stamp (-1 = none): the
   // licensed CONST-hole drop below fires only on the switch over this var --
   // an INNER or-split switcher's deid cells are live routing fails upstream
@@ -14160,6 +14165,7 @@ struct Translator {
   // dispatch of more than three runs (see below).
   const bool no_pure3_ = std::getenv("NOPURE3") != nullptr;
   const bool no_pure4_ = std::getenv("NOPURE4") != nullptr;
+  const bool no_mixcluster_ = std::getenv("NOMIXCLUSTER") != nullptr;
   // An exhaustive constant dispatch (tags 0..N-1, each with a body) whose tags
   // collapse into contiguous runs of shared actions (`0|1|2 -> A | 3|4 -> B`)
   // is lowered by ocamlc's call_switcher through the Switcher, which for a
@@ -14208,7 +14214,18 @@ struct Translator {
     std::vector<int> k; comp_clusters(cases, k);
     std::vector<SwCase> cl_cases; std::vector<ActFn> cl_acts; bool made_switch = false;
     make_clusters(cases, k, actions, cl_cases, cl_acts, made_switch);
-    if (made_switch) return nullptr;                // a jump table: keep the flat switch
+    // make_clusters can hand back a MIXED clustering -- some clusters a jump
+    // table (switch.ml's make_switch), the rest single-case tests -- and c_test
+    // renders it as the interval tests AROUND the table, which is upstream's
+    // shape.  pprintast's `ident_of_name` dispatches `Value | Type | Constr |
+    // Other` with Type and Other sharing an action; particular_case
+    // (switch.ml:818, the literal "0, 1, 2" rule) makes [0..2] one dense
+    // cluster and leaves 3 a test, so ocamlc emits `BLEINT 3` ahead of a
+    // THREE-arm switch where we emitted a flat four-arm one.  Only a
+    // clustering that is ONE jump table spanning everything is still declined:
+    // that is byte-identical to the caller's flat switch.  NOMIXCLUSTER
+    // reverts.
+    if (made_switch && (cl_cases.size() < 2 || no_mixcluster_)) return nullptr;
     return c_test({0, scrut}, cl_cases, cl_acts);
   }
   LamPtr const_dispatch(const LamPtr& scrut, std::vector<Lam::SwitchCase>& consts,
@@ -17217,8 +17234,11 @@ struct Translator {
         std::vector<MRow> norows;
         for (size_t i : sn) norows.push_back(rows[i]);
         std::vector<LamPtr> ncomps = comps;
+        bool ss_save = gm_split_sub_;
+        gm_split_sub_ = true;
         LamPtr sub =
             gmatch(std::move(ncomps), std::move(norows), mloc, deid, denv);
+        gm_split_sub_ = ss_save;
         if (!sub) { bailed = true; return nullptr; }
         int idef = ++next_exit_;
         std::vector<int> ks;
@@ -17248,7 +17268,20 @@ struct Translator {
         std::vector<GmDef> env1; env1.push_back(def_frame(false));
         env1.insert(env1.end(), denv.begin(), denv.end());
         std::vector<LamPtr> bc = comps;
+        // A cell no row of this level names is DEAD inside a sub-matrix: an
+        // arrival got here through the enclosing default entry, whose frame
+        // specialization already refuted every tag its matrix does not name.
+        // Upstream's combine emits no cell for it (`switch*` in -dlambda);
+        // ours emitted one routing to the catch-all.  The OUTERMOST body keeps
+        // that route -- there every constructor of the type really can arrive.
+        // NOSPLITSUBTOT reverts.
+        int tp_save2 = gm_tp_deid_, rt_save2 = gm_tp_root_;
+        if (gm_split_sub_ && !cppcaml::dbg_env("NOSPLITSUBTOT")) {
+          gm_tp_deid_ = deid;
+          gm_tp_root_ = comps[0]->k == Lam::K::Var ? comps[0]->var.stamp : -1;
+        }
         LamPtr res = gmatch(std::move(bc), std::move(body), mloc, deid, env1);
+        gm_tp_deid_ = tp_save2; gm_tp_root_ = rt_save2;
         if (!res) { bailed = true; return nullptr; }
         for (size_t t = 0; t < so.size(); ++t) {
           if (ks[t] < 0) continue;
@@ -20656,6 +20689,8 @@ struct Translator {
     gm_tp_root_ = (gm_tp_deid_ >= 0 && sv->k == Lam::K::Var) ? sv->var.stamp : -1;
     int pt_save = gm_ptot_deid_;
     gm_ptot_deid_ = gm_tp_deid_;
+    bool ss_top = gm_split_sub_;
+    gm_split_sub_ = false;
     gm_orw_.clear();
     LamPtr body = gmatch({sv}, mrows, mloc, deid);
     if (!body) {
@@ -20668,6 +20703,7 @@ struct Translator {
     gm_tp_root_ = rt_save;
     gm_fake_deid_ = fd_save;
     gm_ptot_deid_ = pt_save;
+    gm_split_sub_ = ss_top;
     if (!body) return nullptr;   // ids left advanced (harmless -- must stay unique)
     // Resolve deferred chunk catches FIRST (Simplif's single-use exit inline):
     // construction-time lower_bind has run, and everything downstream (the
