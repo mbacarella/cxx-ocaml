@@ -13221,7 +13221,9 @@ struct Translator {
       }
       Lam::Binding b; b.id = id; b.kind = ValueKind::Gen; b.val = acc;
       if (is_mut_field_access(acc)) { b.strict_opt = true; body = wraplet(b, body); }
-      else if (is_field_access(acc) && body->k == Lam::K::IfThenElse && body->cond) {
+      else if (is_field_access(acc) &&
+               ((body->k == Lam::K::IfThenElse && body->cond) ||
+                one_case_switch_sink(id, body))) {
         // ocamlc bind_checks every pattern bind at match time, so an Alias
         // field read sinks (lower_bind) into the single branch using it when
         // the test and the other branch are transparent -- switch.ml's
@@ -15046,6 +15048,48 @@ struct Translator {
   // placed stops it.  Top-chain lets (before any arm) still descend: that is
   // what lets a later binder sink under the already-wrapped top stack at all.
   // NOSINKORD reverts to the always-descend rule.
+  // The one case a DENSE switch would still hold after reintroduce_fail
+  // (matching.ml:2741): the most-cited bare exit (>= 3 citations, minimal id on
+  // ties) becomes the failaction and its cases go away.  We build the dense
+  // switch first and only sparsify it in share_switches_rec, long after the
+  // column binds are placed, where upstream's combine_constructor hands
+  // bind_check a switch that is ALREADY sparse -- so model the sparse shape
+  // here rather than reorder the pipeline.  Returns null unless exactly one
+  // case survives, which is lower_bind's own condition.
+  Lam::SwitchCase* refail_single_case(const LamPtr& lam) {
+    if (lam->sw_default) return nullptr;
+    std::map<int, int> cnt;   // ascending id, so `>` keeps the minimal on ties
+    for (auto* vv : {&lam->sw_consts, &lam->sw_blocks})
+      for (auto& c : *vv)
+        if (int i = as_bare_exit_thru_alias(c.body); i >= 0) cnt[i]++;
+    int best = -1, bc = -1;
+    for (auto& [i, c] : cnt) if (c > bc) { bc = c; best = i; }
+    if (bc < 3) return nullptr;
+    Lam::SwitchCase* keep = nullptr;
+    for (auto* vv : {&lam->sw_consts, &lam->sw_blocks})
+      for (auto& c : *vv) {
+        if (as_bare_exit_thru_alias(c.body) == best) continue;
+        if (keep) return nullptr;
+        keep = &c;
+      }
+    return keep;
+  }
+  // lower_bind's ONE-CASE-SWITCH descent, as an ENTRY condition: an Alias
+  // field read of the column to the switch's left sinks into that one arm --
+  // ctype's `((path, r) :: _, Tconstr (path', _, _))` reads the cons cell only
+  // under `case tag Tconstr`, so the `*match*` and `path` binds land there and
+  // the miss path carries no extra stack slot.  Only a SWITCH may join the `if`
+  // as a starting point; lower_bind's third descent, past a run of alias lets,
+  // reads our fully compiled body where upstream's read the pre-Simplif tree
+  // and was measured to regress 60 modules.  NOSWSINK reverts.
+  bool one_case_switch_sink(const Ident& v, const LamPtr& lam) {
+    static const bool off = cppcaml::dbg_env("NOSWSINK");
+    if (off) return false;
+    if (!lam || lam->k != Lam::K::Switch || !lam->cond) return false;
+    if (lam->sw_consts.size() + lam->sw_blocks.size() != 1 &&
+        !refail_single_case(lam)) return false;
+    return !approx_present(v, lam->cond);
+  }
   LamPtr lower_bind(const Ident& v, ValueKind vk_, const LamPtr& arg, LamPtr lam,
                     const std::set<int>* fold_placed = nullptr, bool in_arm = false) {
     auto wrap = [&](LamPtr b) -> LamPtr {
@@ -15072,6 +15116,12 @@ struct Translator {
         lam->sw_blocks[0].body = lower_bind(v, vk_, arg, lam->sw_blocks[0].body, fold_placed, true);
         return lam;
       }
+      static const bool no_sw_sink = cppcaml::dbg_env("NOSWSINK");
+      if (!no_sw_sink)
+        if (Lam::SwitchCase* c = refail_single_case(lam)) {
+          c->body = lower_bind(v, vk_, arg, c->body, fold_placed, true);
+          return lam;
+        }
     }
     if (lam->k == Lam::K::Let) {
       bool allalias = true;
