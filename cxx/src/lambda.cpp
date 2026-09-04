@@ -19598,7 +19598,12 @@ struct Translator {
   // parameters that a leaf's `(exit aid <values>)` supplies in that same order.
   struct GArm { int aid; const Expression* rhs; std::vector<std::string> vnames;
                 std::vector<Ident> cvars; std::vector<ValueKind> kinds;
-                std::set<std::string> alias_names; };
+                std::set<std::string> alias_names;
+                // A GUARDED root-or arm carries its guard HERE rather than on
+                // each exploded alternative: precompile_or compiles the row
+                // ONCE, in the handler, and translcore.ml:589 sends a failed
+                // guard to `staticfail` -- the pm's default entry (hfail).
+                const Expression* hguard = nullptr; int hfail = -1; };
   // The gmatch decision-node budget (env-overridable for calibration).
   int gm_budget() {
     static int b = [] {
@@ -20246,6 +20251,14 @@ struct Translator {
           inline_rec_var_[scope.back()[a.vnames[k]].stamp] = ir->second;
       }
       LamPtr handler = expr(*a.rhs);
+      if (a.hguard) {          // transl_guard: the action first, then the cond
+        LamPtr g = expr(*a.hguard);
+        auto iff = mk(Lam::K::IfThenElse);
+        iff->cond = g; iff->then_ = handler;
+        auto ex = mk(Lam::K::Staticraise); ex->prim_arg = a.hfail;
+        iff->else_ = ex;
+        handler = iff;
+      }
       scope.pop_back();
       // LAST dropped param outermost: half_simplify binds a variable column
       // by wrapping the ACTION when that column becomes the head, and the
@@ -22824,16 +22837,49 @@ struct Translator {
       if (srcs[i].second.size() > 1 && !cppcaml::dbg_env("NOROOTORPV"))
         gm_orp_pv_[arms[i].aid] = arms[i].vnames;
     }
+    //   precompile_or runs on the UNFLATTENED matrix, so a GUARDED root-or arm
+    // is an or-row there: matching.ml:1821 keeps that row WHOLE in the handler
+    // pm, where transl_guard has already folded the guard into the action (`if
+    // g then rhs else staticfail`), and every exploded alternative raises the
+    // handler's exit unconditionally.  We copied the guard onto each
+    // alternative and re-tested it per constructor -- typecore's
+    // vb_pat_constraint (`None, _, Pexp_coerce (_, _, sty) | None, _,
+    // Pexp_constraint (_, sty) when !Clflags.principal`) read Clflags.principal
+    // in BOTH the Pexp_coerce and the Pexp_constraint cell.
+    //   That failed guard raises upstream's staticfail -- the default entry
+    // the handler pm inherits (`pop_compat orp def`) -- so the handler catch
+    // has to sit INSIDE that entry's catch, where compile_orhandlers puts it,
+    // and the exit is the pm's own default ONLY when no row survives beneath
+    // the or-row.  Hence the LAST-row test: morematch's flatguard
+    // (`(1,2)|(2,3) when y=2` ahead of `(1,_)|(_,3)`) proves it is needed --
+    // (2,3) must fail the guard INTO the second or-row.  Admitting a later
+    // or-row whose successors are merely all DISJOINT from it moves nothing
+    // (measured: identical bytes), so the test stays the positional one.
+    //   Both legs fire only where such an arm exists, so every other tuple
+    // match keeps its wiring.  NOORGUARDTUP reverts.
+    bool orguard = false;
+    if (!cppcaml::dbg_env("NOORGUARDTUP")) {
+      size_t ng = 0;
+      for (auto& sr : srcs)
+        if (sr.second.size() > 1 && sr.first->guard) ++ng;
+      const auto& lst = srcs.back();
+      orguard = ng == 1 && lst.second.size() > 1 && lst.first->guard;
+    }
     std::vector<MRow> mrows;
     for (size_t i = 0; i < srcs.size(); ++i)
       for (auto& cols : srcs[i].second) {
         MRow mr; mr.rhs = srcs[i].first->rhs; mr.cols = cols;
         mr.aid = arms[i].aid; mr.vnames = &arms[i].vnames;
-        mr.guard = srcs[i].first->guard;
         mr.row_or = srcs[i].second.size() > 1;
+        mr.guard = (orguard && mr.row_or) ? nullptr : srcs[i].first->guard;
         mrows.push_back(std::move(mr));
       }
     int deid = ++next_exit_;
+    if (orguard)
+      for (size_t i = 0; i < srcs.size(); ++i)
+        if (srcs[i].second.size() > 1 && srcs[i].first->guard) {
+          arms[i].hguard = srcs[i].first->guard; arms[i].hfail = deid;
+        }
     // Enable nested tuple/record column decomposition (budget-guarded) so a record
     // sub-column -- `match a, b with Ldot ({txt;_}, _), .. ` -- is split into field
     // reads instead of bailing (which would force the whole tuple scrutinee to be
@@ -22862,14 +22908,6 @@ struct Translator {
     if (!body) return nullptr;
     // Resolve deferred chunk catches first (see gmatch_top).
     inline_chunk_catches(body);
-    // Multi-use default catch nests INSIDE the arm catches (see gmatch_top).
-    int bad = 0; int uses = count_exit(body, deid, false, bad);
-    LamPtr dcatch;
-    if (uses > 0 && !(uses == 1 && bad == 0)) {
-      dcatch = mk(Lam::K::Catch); dcatch->cond = body; dcatch->prim_arg = deid;
-      dcatch->gm_deidc = true;
-      body = dcatch;
-    }
     // Upstream's precompile_or runs on the UNFLATTENED tuple matrix, so a
     // ROOT-OR arm (one whose whole pattern is an or over the tuple) is an
     // or-row THERE, and its handler is placed by the tuple level's own
@@ -22891,7 +22929,23 @@ struct Translator {
         if (srcs[i].second.size() > 1) warms.push_back(std::move(arms[i]));
       arms = std::move(warms);
     }
-    wire_garms(body, arms);
+    // Multi-use default catch nests INSIDE the arm catches (see gmatch_top) --
+    // and OUTSIDE them all when a guarded root-or arm is present.  That arm's
+    // handler exits to deid, and wire_garms is what emits the exit, so the
+    // count has to run after the wiring rather than before it.
+    int bad = 0, uses = 0;
+    LamPtr dcatch;
+    auto wrap_default = [&]() {
+      uses = count_exit(body, deid, false, bad);
+      if (uses > 0 && !(uses == 1 && bad == 0)) {
+        dcatch = mk(Lam::K::Catch);
+        dcatch->cond = body; dcatch->prim_arg = deid;
+        dcatch->gm_deidc = true;
+        body = dcatch;
+      }
+    };
+    if (orguard) { wire_garms(body, arms); wrap_default(); }
+    else { wrap_default(); wire_garms(body, arms); }
     share_switches_rec(body);
     reswitch_flat_consts(body);
     share_string_trees(body);
