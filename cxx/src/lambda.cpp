@@ -16814,6 +16814,33 @@ struct Translator {
         if (rows[i].guard || !(gm_same_action(rows[i], r) ||
                                gm_rows_disjoint_rec(rows[i], r)))
           lead_sb = false;
+      // matching.ml:1583's do_split tests safe_before against rev_ors and
+      // rev_no, and BOTH are still empty while the rows AHEAD of the first
+      // or-row are consumed -- so every one of them lands in `cls` with no
+      // test at all.  safe_before only ever licenses a row that would MOVE,
+      // i.e. one that FOLLOWS an or-row (the hoist below); the leading rows
+      // keep their places, since precompile_or's body is `cls @ exploded`.  We
+      // demanded it of them too and declined the whole precompile_or shape
+      // whenever a leading row was merely compatible with an alternative --
+      // pprintast's `Lident "!", [e]` and `Ldot (_, {txt = ("get" | "set");
+      // _}), a :: other_args` ahead of `(Lident s | Ldot (_, {txt = s; _})),
+      // a :: i :: rest when first_is '.' s`.
+      //   A leading GUARDED row is refused, all of them: when such a guard
+      // fails, control falls THROUGH to the or-row, and upstream's per-cell
+      // default sends it straight at the or-handler where ours re-dispatches
+      // through the level's one shared miss exit -- ctype's moregen `Reither
+      // (_, _, _), Rabsent when may_inst` ahead of `(Rpresent _ | Reither _),
+      // Rabsent` gets a miss handler that re-tests `isint f2` while upstream
+      // jumps at the handler directly.  A guarded row PROVEN incompatible with
+      // the or-row cannot fall through to it and would be licensable, but
+      // admitting that sub-case moves ctype's eqtype twin onto the same shape,
+      // where two OTHER open gaps show (a shared arm's catch sits at our root
+      // instead of around the cell that shares it, and the miss handler's
+      // matrix is not narrowed to the constructors that actually raise it), so
+      // the test stays the blunt one.  NOORLEADFREE reverts.
+      bool lead_free = !cppcaml::dbg_env("NOORLEADFREE");
+      for (size_t i = 0; lead_free && i < oi; ++i)
+        if (rows[i].guard) lead_free = false;
       size_t tstart = oi + 1;
       while (tstart < rows.size() && !rows[tstart].guard &&
              !std::get_if<Ppat_or>(&rows[tstart].cols[0]->desc)) {  // #Simple.view
@@ -17174,7 +17201,7 @@ struct Translator {
       // action, so it can invent neither a test nor a Match_failure and needs
       // no totality budget of its own.
       if (LamPtr res = attempt(deid == gm_fake_deid_ ? oi + 1 : tstart, false,
-                               lead_ok ||
+                               lead_ok || lead_free ||
                                (lead_sb &&
                                 (tpx || deid != gm_fake_deid_ || ors1))))
         return res;
