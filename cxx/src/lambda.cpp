@@ -12579,6 +12579,19 @@ struct Translator {
       for (auto& el : pt->elems) preassign_pat_vars(*el); return;
     }
     if (auto* pr = std::get_if<Ppat_record>(&p->desc)) {
+      // type_label_a_list SORTS a record pattern's fields by lbl_pos before it
+      // types the sub-patterns ("Invariant: records are sorted in the typed
+      // tree", typecore.ml:1852), so the field variables are stamped in
+      // DECLARATION order however the source mentions them.  Stamp order is a
+      // closure's free-var layout (Ident.Set.elements -> ENVACC indices), so a
+      // pattern that lists its labels out of declaration order laid its
+      // captured fields out wrongly.  NORECPATDECLORD reverts.
+      std::vector<size_t> ord;
+      if (!cppcaml::dbg_env("NORECPATDECLORD") &&
+          record_pat_decl_order(pr, p, ord)) {
+        for (size_t k : ord) preassign_pat_vars(*pr->fields[k].second);
+        return;
+      }
       for (auto& [l, s] : pr->fields) preassign_pat_vars(*s); return;
     }
     if (auto* pk = std::get_if<Ppat_construct>(&p->desc)) {
@@ -12716,6 +12729,28 @@ struct Translator {
       }
       out.push_back({sub.get(), field_read(fi, sv)});
     }
+    return true;
+  }
+  // The positions into `pr->fields` sorted by DECLARATION index -- the order
+  // type_label_a_list (typecore.ml:1852) puts the mentioned fields in before it
+  // types them, and so the order their pattern variables are stamped.  False
+  // when a mentioned label does not resolve; the caller keeps the source order.
+  bool record_pat_decl_order(const Ppat_record* pr, const Pattern* p,
+                             std::vector<size_t>& out) {
+    std::vector<std::string> flds;
+    for (auto& [lbl, sub] : pr->fields) flds.push_back(lid_last(lbl.txt));
+    std::vector<int> ixs;
+    for (auto& [lbl, sub] : pr->fields) {
+      FieldInfo nfi;
+      const FieldInfo* fi = resolve_record_pat_field(flds, lbl.txt, nfi, p,
+                                                     pat_record_qual_mod(*pr));
+      if (!fi) return false;
+      ixs.push_back(fi->index);
+    }
+    out.resize(ixs.size());
+    for (size_t i = 0; i < out.size(); ++i) out[i] = i;
+    std::stable_sort(out.begin(), out.end(),
+                     [&](size_t a, size_t b) { return ixs[a] < ixs[b]; });
     return true;
   }
   // The positions into `pr->fields` in the order ocamlc's matcher READS that
