@@ -15148,6 +15148,10 @@ struct Translator {
   }
   // Compiled-handler opacity for an arm's placeholder exit, by exit id.
   std::unordered_map<int, bool> gm_exit_opaque_;
+  // The arm exits that stand for an UPSTREAM or-handler raise: a row-level
+  // or-pattern's alternatives all raise precompile_or's handler, so upstream
+  // has a real Lstaticraise there and approx_present reads only its args.
+  std::set<int> gm_or_exit_;
   // Find the single-binding `let v = ..` node anywhere in the tree.
   static Lam* find_let_of(const LamPtr& l, const Ident& v) {
     if (!l) return nullptr;
@@ -15230,8 +15234,19 @@ struct Translator {
             if (a && a->k == Lam::K::Var && a->var.stamp == v.stamp) return true;
           // Sibling arm: present iff the handler upstream compiled inline
           // here is an opaque shape (unknown -> conservative).
-          auto oit = gm_exit_opaque_.find(l->prim_arg);
-          if (oit == gm_exit_opaque_.end() || oit->second) return true;
+          //   Not so for a ROW-LEVEL or-pattern's alternatives: precompile_or
+          // gives that arm a handler of its own, so upstream holds a real
+          // `Lstaticraise (or_num, vars)` at this very spot and its
+          // approx_present (matching.ml:3559) is the plain args scan just
+          // done above -- the arm's whole binder list travels in those args.
+          // `{pv_id;_}::_, [] | [], {pv_id;_}::_` is the nil arm of typecore's
+          // unify_vars, and reading it as opaque stopped every carried column
+          // bind above the second column's test.  NOORARMTRANS reverts.
+          static const bool no_or_trans = cppcaml::dbg_env("NOORARMTRANS");
+          if (no_or_trans || !gm_or_exit_.count(l->prim_arg)) {
+            auto oit = gm_exit_opaque_.find(l->prim_arg);
+            if (oit == gm_exit_opaque_.end() || oit->second) return true;
+          }
         }
         for (auto& a : l->args) if (approx_present(v, a)) return true;
         return false;
@@ -23261,6 +23276,12 @@ struct Translator {
       // reads the scrutinee component directly.  NOROOTORPV reverts.
       if (srcs[i].second.size() > 1 && !cppcaml::dbg_env("NOROOTORPV"))
         gm_orp_pv_[arms[i].aid] = arms[i].vnames;
+      // A BINDING root-or arm is an or-row for precompile_or, which gives it a
+      // handler: upstream's alternatives raise it, so approx_present meets a
+      // real Lstaticraise there (see its or-arm rule).  row_or does not survive
+      // the ctor split, so the arm is claimed here, where the or is still whole.
+      if (srcs[i].second.size() > 1 && !arms[i].vnames.empty())
+        gm_or_exit_.insert(arms[i].aid);
     }
     //   precompile_or runs on the UNFLATTENED matrix, so a GUARDED root-or arm
     // is an or-row there: matching.ml:1821 keeps that row WHOLE in the handler
