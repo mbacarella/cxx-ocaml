@@ -11213,6 +11213,76 @@ struct Translator {
       out.push_back(std::move(b));
     }
     l->bindings = std::move(out);
+    hoist_deep_realias(l.get());
+  }
+  // The exit-argument hoist inline_exit does can only reach a let group it
+  // finds on its own spine, and simplify_local_functions parks a local
+  // function's handler AT the application node (simplif.ml's `if scope ==
+  // curr_scope then cont else scope`), so a call sitting in a makeblock
+  // argument leaves it with no spine at all: `let p, v = e in (p.a, func v)`
+  // re-bound the field read at that argument, where ocamlc keeps `v` beside
+  // its own source (typecore's `let let_pat, let_var = var_pair "arg" ..` fed
+  // to a once-used `func`).  Sweep for those here.  From a let group, walk
+  // down through UNCONDITIONAL positions only -- prim and apply arguments,
+  // sequences, nested let bindings and bodies -- and move a single-binding
+  // alias let whose value is a from_alias field read off one of the group's
+  // own non-alias binders back beside that binder.  Only with two or more
+  // reads: with one, simplif would have inlined the binder into that read
+  // anyway and the two orders agree.  The value is a pure immutable field read
+  // of a variable already bound at that point, so the move changes neither
+  // evaluation order nor effects.  NODEEPREALIAS reverts.
+  LamPtr* deep_realias_find(LamPtr& l, const std::set<int>& roots) {
+    if (!l) return nullptr;
+    switch (l->k) {
+      case Lam::K::Let: {
+        if (l->bindings.size() == 1) {
+          auto& ib = l->bindings[0];
+          if (ib.alias && !ib.mut && ib.val && ib.val->from_alias &&
+              is_alias_dup(ib.val) && !is_mut_field_access(ib.val) &&
+              roots.count(field_root_stamp(ib.val)) &&
+              count_var(l->body, ib.id) >= 2)
+            return &l;
+        }
+        for (auto& b : l->bindings)
+          if (LamPtr* r = deep_realias_find(b.val, roots)) return r;
+        return deep_realias_find(l->body, roots);
+      }
+      case Lam::K::Prim:
+      case Lam::K::Apply: {
+        if (LamPtr* r = deep_realias_find(l->fn, roots)) return r;
+        for (auto& a : l->args)
+          if (LamPtr* r = deep_realias_find(a, roots)) return r;
+        return nullptr;
+      }
+      case Lam::K::Sequence: {
+        if (LamPtr* r = deep_realias_find(l->cond, roots)) return r;
+        if (LamPtr* r = deep_realias_find(l->else_, roots)) return r;
+        for (auto& a : l->args)
+          if (LamPtr* r = deep_realias_find(a, roots)) return r;
+        return nullptr;
+      }
+      default: return nullptr;
+    }
+  }
+  void hoist_deep_realias(Lam* grp) {
+    if (cppcaml::dbg_env("NODEEPREALIAS")) return;
+    for (;;) {
+      std::set<int> roots;
+      for (auto& b : grp->bindings)
+        if (!b.alias && !b.mut) roots.insert(b.id.stamp);
+      if (roots.empty()) return;
+      LamPtr* slot = deep_realias_find(grp->body, roots);
+      if (!slot) return;
+      Lam::Binding got = (*slot)->bindings[0];
+      LamPtr rest = (*slot)->body;
+      *slot = rest;  // detach BEFORE the insert: it may reallocate `bindings`
+      int base = field_root_stamp(got.val);
+      auto& bs = grp->bindings;
+      size_t at = bs.size();
+      for (size_t bi = 0; bi < bs.size(); ++bi)
+        if (bs[bi].id.stamp == base && !bs[bi].alias) { at = bi; break; }
+      bs.insert(bs.begin() + at + 1, got);
+    }
   }
   // ocamlc's matcher wraps ALL of an arm's leaf binds -- the pattern vars AND
   // the materialized `as`-alias columns name_pattern reuses row binders for --
