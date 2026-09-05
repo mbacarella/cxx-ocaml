@@ -21909,6 +21909,54 @@ struct Translator {
       LamPtr a = pm.cases[0].act;                  // leaf: rows below are dead
       OcJumps j;                                   // .. unless it is GUARDED
       if (oc_is_guarded(a)) {                      // matching.ml:3672-3679
+        // split_no_or's trailing all-omega division (matching.ml:1607) is still
+        // live down here.  This pm's args are the block cell's FIELDS, which we
+        // carry as `pending` rather than as columns, and every row is omega in
+        // them -- so upstream peels the LAST row into its own default matrix and
+        // wraps the rest in an `Lstaticcatch`.  That catch lands BETWEEN the
+        // first field's bind (made at this compile entry, outside it) and the
+        // rest (made at the entries below, inside it), and an enclosing column's
+        // bind stops on it because lower_bind has no Lstaticcatch case.  Binding
+        // every field here instead let them re-sort past one another and let the
+        // outer bind sink below them all.  NOOCLEAFSPLIT reverts.
+        static const bool no_leaf_split = cppcaml::dbg_env("NOOCLEAFSPLIT");
+        bool split = !no_leaf_split && pm.pending.size() >= 2 && pm.cases.size() >= 2;
+        // The fall-through has to REACH the division's exit, so every row above
+        // the peeled one must be guarded; and the peeled row is compiled by its
+        // own pm, which would bind any field it reads at its own entry -- a
+        // shape we do not model, so leave it to the flat path.
+        for (size_t i = 0; split && i + 1 < pm.cases.size(); ++i)
+          if (!oc_is_guarded(pm.cases[i].act)) split = false;
+        for (size_t i = 1; split && i < pm.pending.size(); ++i) {
+          auto it = oc_fids_.find(pm.pending[i]);
+          if (it != oc_fids_.end() && count_var(pm.cases.back().act, it->second))
+            split = false;
+        }
+        while (split) {                            // once; `break` = fall back
+          int idef = oc_alloc_exit();
+          OcPm body = pm;
+          body.cases.pop_back();
+          body.pending.clear();                    // bound around the catch below
+          body.def = oc_def_cons(oc_as_matrix({pm.cases.back()}), idef, pm.def);
+          OcPm hnd = pm;
+          hnd.cases.assign(pm.cases.end() - 1, pm.cases.end());
+          hnd.pending.clear();
+          auto rb = oc_compile_match(partial, ctx, body);
+          int bad = 0;
+          auto rh = rb && count_exit(rb->lam, idef, false, bad) > 0
+                        ? oc_compile_match(partial, ctx, hnd)
+                        : std::nullopt;
+          if (rh) {
+            LamPtr b = rb->lam;
+            for (size_t i = pm.pending.size(); i-- > 1;)
+              b = oc_bind_field(pm.pending[i].first, pm.pending[i].second, b);
+            auto c = mk(Lam::K::Catch);
+            c->cond = b; c->prim_arg = idef; c->then_ = rh->lam;
+            b = oc_bind_field(pm.pending[0].first, pm.pending[0].second, c);
+            return OcRes{b, oc_jumps_union(rb->jumps, rh->jumps)};
+          }
+          break;             // the division declined: the flat path stands
+        }
         OcPm rest = pm;
         rest.cases.erase(rest.cases.begin());
         rest.pending.clear();                      // bound once, outside
