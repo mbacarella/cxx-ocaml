@@ -8545,6 +8545,34 @@ struct Checker {
     }
     if (auto* sq = std::get_if<Pexp_sequence>(&e.desc))
       return disambig_expr_now(*sq->e2, expected, allow_defer, deferred);
+    // ...and a `match`/`try`'s ARM BODIES, which is the same rule one node
+    // further down: every arm's value IS the expectation's, and an arm pattern
+    // binds VALUES only -- no constructor comes into or leaves scope across
+    // one -- so the scope this walk runs in is still the arm's own.  ctype's
+    // `let origin : type_origin = match eqn with Some (lhs, rhs) -> Equation
+    // (lhs, rhs) | None -> Definition` put the ctor exactly there: the walk
+    // stopped at the `match` and left `Equation` to lexical scope, which under
+    // `open Types` then `open Errortrace` is Errortrace's arity-1 `Equation`
+    // (escape_kind tag 4), not Types.type_origin's arity-2 one (tag 1).  We
+    // built `Tag4 (Tag0 (lhs, rhs))` where every consumer -- out_type.ml's
+    // `| Equation (t1, t2)`, compiled with no shadow in scope -- reads a
+    // 2-field tag-1 block: a producer/consumer split that SEGFAULTS, not a
+    // fidelity diff.  NOMATCHARMDIS reverts.
+    static const bool no_match_arm_dis =
+        std::getenv("NOMATCHARMDIS") != nullptr;
+    if (!no_match_arm_dis)
+      if (auto* mt = std::get_if<Pexp_match>(&e.desc)) {
+        for (auto& c : mt->cases)
+          disambig_expr_now(*c.rhs, expected, allow_defer, deferred);
+        return;
+      }
+    if (!no_match_arm_dis)
+      if (auto* tr = std::get_if<Pexp_try>(&e.desc)) {
+        disambig_expr_now(*tr->e, expected, allow_defer, deferred);
+        for (auto& c : tr->cases)
+          disambig_expr_now(*c.rhs, expected, allow_defer, deferred);
+        return;
+      }
     if (auto* rc = std::get_if<Pexp_record>(&e.desc))
       return disambig_record_now(e, *rc, expected);
     auto* k = std::get_if<Pexp_construct>(&e.desc);
