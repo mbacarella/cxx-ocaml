@@ -10326,7 +10326,8 @@ struct Translator {
   // Count Lstaticraise of exit `id`; `bad` accumulates those nested under an
   // inner try..with (which can't be safely inlined).  Static exits never cross a
   // function boundary, so a nested Lfunction contributes nothing.
-  static int count_exit(const LamPtr& l, int id, bool under_try, int& bad) {
+  static int count_exit(const LamPtr& l, int id, bool under_try, int& bad,
+                        bool str_dup = false) {
     if (!l) return 0;
     if (l->k == Lam::K::Staticraise && l->prim_arg == id) {
       if (under_try) ++bad;
@@ -10334,8 +10335,8 @@ struct Translator {
     }
     if (l->k == Lam::K::Function) return 0;
     if (l->k == Lam::K::Try)  // protected body is under_try; handler is not
-      return count_exit(l->body, id, true, bad) +
-             count_exit(l->then_, id, under_try, bad);
+      return count_exit(l->body, id, true, bad, str_dup) +
+             count_exit(l->then_, id, under_try, bad, str_dup);
     // simplif.ml's count_default: a sparse switch's failaction counts TWICE
     // when both the const and block spaces have gap tags (it "will occur
     // twice"), keeping its single-syntactic-use handler shared, not inlined.
@@ -10344,16 +10345,28 @@ struct Translator {
         l->sw_numconsts >= 0 && (int)l->sw_consts.size() < l->sw_numconsts &&
         l->sw_numblocks >= 0 && (int)l->sw_blocks.size() < l->sw_numblocks)
       dmul = 2;
-    int c = count_exit(l->fn, id, under_try, bad) +
-            count_exit(l->body, id, under_try, bad) +
-            count_exit(l->cond, id, under_try, bad) +
-            count_exit(l->then_, id, under_try, bad) +
-            count_exit(l->else_, id, under_try, bad) +
-            dmul * count_exit(l->sw_default, id, under_try, bad);
-    for (auto& a : l->args) c += count_exit(a, id, under_try, bad);
-    for (auto& b : l->bindings) c += count_exit(b.val, id, under_try, bad);
-    for (auto& sc : l->sw_consts) c += count_exit(sc.body, id, under_try, bad);
-    for (auto& sc : l->sw_blocks) c += count_exit(sc.body, id, under_try, bad);
+    // Its Lstringswitch twin (simplif.ml:146-155): with two or more arms the
+    // default "will get replicated", so it is counted twice.  Our string
+    // column has already expanded the tree, and the node standing for the
+    // switch's `Some d` is the gm_str_dflt catch's handler.
+    // NOSTRDFLTOUT reverts.
+    int hmul = 1;
+    if (str_dup && l->k == Lam::K::Catch && l->gm_str_dup &&
+        !cppcaml::dbg_env("NOSTRDFLTOUT"))
+      hmul = 2;
+    int c = count_exit(l->fn, id, under_try, bad, str_dup) +
+            count_exit(l->body, id, under_try, bad, str_dup) +
+            count_exit(l->cond, id, under_try, bad, str_dup) +
+            hmul * count_exit(l->then_, id, under_try, bad, str_dup) +
+            count_exit(l->else_, id, under_try, bad, str_dup) +
+            dmul * count_exit(l->sw_default, id, under_try, bad, str_dup);
+    for (auto& a : l->args) c += count_exit(a, id, under_try, bad, str_dup);
+    for (auto& b : l->bindings)
+      c += count_exit(b.val, id, under_try, bad, str_dup);
+    for (auto& sc : l->sw_consts)
+      c += count_exit(sc.body, id, under_try, bad, str_dup);
+    for (auto& sc : l->sw_blocks)
+      c += count_exit(sc.body, id, under_try, bad, str_dup);
     return c;
   }
   std::vector<Lam*> exit_spine_;  // the Let nodes above the exit being inlined
@@ -16679,8 +16692,14 @@ struct Translator {
     bool or_absorbs_last = false;
     if (rows.size() >= 2 && !cppcaml::dbg_env("NOORLASTIN")) {
       const MRow& above = rows[rows.size() - 2];
+      // Through the alias: half_simplify peels `(A|B) as x` into the action's
+      // bindings, so upstream's Or_matrix sees the or head either way
+      // (builtin_attributes' `{txt = ("ocaml.error"|"error") as txt; loc}`).
       or_absorbs_last = !rows.back().guard && !above.guard &&
-                        std::get_if<Ppat_or>(&above.cols[0]->desc) != nullptr;
+                        std::holds_alternative<Ppat_or>(
+                            cppcaml::dbg_env("NOSTRDFLTOUT")
+                                ? above.cols[0]->desc
+                                : pat_deep(above.cols[0])->desc);
     }
     if (!no_peel && !or_absorbs_last &&
         rows.size() >= 2 && !comps.empty() && row_all_var(rows.back())) {
@@ -18785,6 +18804,7 @@ struct Translator {
         auto cat = mk(Lam::K::Catch);
         cat->prim_arg = fid; cat->then_ = dbody;
         cat->keep_catch = true; cat->gm_str_dflt = true;
+        cat->gm_str_dup = sw.size() >= 2;
         LamPtr top;
         if (nex >= 2) { bl->body = tree; cat->cond = bl; top = cat; }
         else { cat->cond = tree; bl->body = cat; top = bl; }
@@ -20847,7 +20867,9 @@ struct Translator {
     for (auto& sc : l->sw_consts) inline_chunk_catches(sc.body);
     for (auto& sc : l->sw_blocks) inline_chunk_catches(sc.body);
     if (l->k == Lam::K::Catch && l->gm_chunk) {
-      int bad = 0; int uses = count_exit(l->cond, l->prim_arg, false, bad);
+      int bad = 0;
+      int uses = count_exit(l->cond, l->prim_arg, false, bad,
+                            !cppcaml::dbg_env("NOSTRDFLTOUT"));
       if (uses == 0) { l = l->cond; return; }        // unreachable chunk
       if (uses == 1 && bad == 0) {
         inline_exit(l->cond, l->prim_arg, {}, {}, l->then_);
@@ -20855,6 +20877,15 @@ struct Translator {
         return;
       }
       l->gm_chunk = false; l->gm_chunkc = true;      // multi-use: real catch
+      // Survived ONLY because the string default is counted twice: upstream's
+      // Simplif made that decision on the UNEXPANDED Lstringswitch, once, and
+      // Bytegen's make_catch then reuses this very exit.  Our expansion has
+      // already happened, so collapse_str_dflt_catches will leave a single
+      // syntactic raise behind and simplify_static_catches would inline it
+      // back.  Pin the decision the way upstream's ordering does.
+      int b2 = 0;
+      if (count_exit(l->cond, l->prim_arg, false, b2, false) <= 1)
+        l->keep_catch = true;
     }
   }
   // simplif.ml:306's exit-alias rule, applied to the singleton-division catches

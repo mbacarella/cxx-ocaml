@@ -226,6 +226,12 @@ struct Lam {
   // slot and make_catch would have reused the bare exit directly),
   // collapse_str_dflt_catches retargets the tree at j and drops the catch.
   bool gm_str_dflt = false;
+  // gm_str_dup: this string-column default catch stands for an Lstringswitch
+  // whose `sw` holds TWO OR MORE arms, so simplif.ml:153 counts the default
+  // TWICE ("default will get replicated" -- Bytegen's expand_stringswitch
+  // copies it into every miss slot).  count_exit doubles the handler's exits
+  // for it, the string-switch twin of the sparse-switch failaction rule.
+  bool gm_str_dup = false;
   // gm_str_bind: gmatch's string-column arg binding (Bytegen bind_sw).  The
   // tree is built against an internal `switch` var so the enclosing split sees
   // exactly ONE nominal use (the stringswitch node's arg slot).
