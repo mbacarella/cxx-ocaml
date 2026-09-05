@@ -1001,6 +1001,18 @@ struct Translator {
   // matches (a Un value slid past a `(An|Em)` or-handler into its action
   // where upstream raises Match_failure).
   int gm_ptot_deid_ = -1;
+  // comp_match_handlers' partiality split (matching.ml:3617): a chain of
+  // divisions compiles every sub-matrix but the LAST with `current = Partial`,
+  // and the last one keeps the partiality it was handed.  At the top of an
+  // exhaustive match that is Total, and `mk_failaction_neg (Arg {current =
+  // Total})` answers None BEFORE it ever consults the default environment
+  // (matching.ml:2960) -- so the last division's own tests carry no fail, and
+  // combine_regular_constructor's `None, Some act` (matching.ml:3284) drops a
+  // test whose stored cells hold one action.  True only while the LAST group's
+  // handler of a chunk chain is compiled, and only when that chain runs
+  // directly under the whole match's proven-total default (an enclosing
+  // division would have forced Partial); every other group clears it.
+  bool gm_div_total_ = false;
   // The current top entry's deid when the match is a PROVEN Total (completed
   // GADT refutation, see ValueKinds.total_proven) and has no catch-all row; -1
   // otherwise.  Licenses the ctor split to DROP an uncovered tag's `(exit deid)`
@@ -15923,8 +15935,15 @@ struct Translator {
       return out;
     };
     std::vector<LamPtr> cc = comps;
+    // Every sub-matrix of the chain but the last is Partial (gm_div_total_);
+    // the last one is Total exactly when this chain runs directly under the
+    // whole match's proven-total default.  NODIVTOTAL reverts.
+    const bool dt_save = gm_div_total_;
+    const bool dt_last = denv.empty() && deid == gm_ptot_deid_ &&
+                         !cppcaml::dbg_env("NODIVTOTAL");
+    gm_div_total_ = false;
     LamPtr res = gmatch(std::move(cc), chunk_rows(0), mloc, deid, env_from(1));
-    if (!res) return nullptr;
+    if (!res) { gm_div_total_ = dt_save; return nullptr; }
     for (size_t k = 1; k < groups.size(); ++k) {
       std::vector<LamPtr> ck = comps;
       std::vector<MRow> cr = chunk_rows(k);
@@ -16107,12 +16126,14 @@ struct Translator {
       for (auto& r : cr)
         for (size_t i = 0; i < r.cols.size() && i < untested.size(); ++i)
           if (!pat_omega_like(r.cols[i])) untested[i] = 0;
+      gm_div_total_ = dt_last && k + 1 == groups.size();
       LamPtr hb = gmatch(std::move(ck), std::move(cr), mloc, deid,
                          env_from(k + 1));
+      gm_div_total_ = false;
       gm_proven_comp_ = std::move(proven_save);
       gm_neg_comp_ = std::move(neg_save);
       gm_neg2_ = std::move(neg2_save);
-      if (!hb) return nullptr;
+      if (!hb) { gm_div_total_ = dt_save; return nullptr; }
       // A proof-pruned handler can collapse to a bare argless re-raise; the
       // catch is then an exit ALIAS upstream's simplify_exits (simplif.ml:306,
       // `Lstaticcatch (l1, (i, []), Lstaticraise _)`) erases -- substitute
@@ -16169,6 +16190,7 @@ struct Translator {
       c->cond = res; c->prim_arg = eids[k]; c->then_ = hb; c->gm_chunk = true;
       res = c;
     }
+    gm_div_total_ = dt_save;
     return res;
   }
   // Per-level wrapper replicating matching.ml's compile-entry plumbing:
@@ -19738,12 +19760,22 @@ struct Translator {
         drop_holes(blocks);
         tp_holes = blocks.size() != nb0;
       } else if (!no_gadtrow && comps[0]->k == Lam::K::Var &&
-                 comps[0]->var.stamp == gm_tp_root_) {
+                 (comps[0]->var.stamp == gm_tp_root_ ||
+                  (gm_div_total_ && NB == 0))) {
         // A refuted CONSTANT ctor's hole drops too (upstream's sparse Lswitch
         // stores no cell for it: types.ml's row_field_repr_aux with RFnone
         // refuted) -- but only on the switch over the match's ROOT scrutinee
         // (gm_tp_root_): an inner or-split switcher's deid cells are live
         // routing fails upstream keeps (simplif.ml's `enabled`).
+        //   A Total last division (gm_div_total_) drops one off-root too, but
+        // only on an ALL-CONSTANT column.  There combine_regular_constructor
+        // takes its `n, 0, _, []` branch straight to call_switcher over the
+        // stored cells (matching.ml:3294), so with no failaction a lone cell
+        // collapses to its action and the shape is exactly what dropping the
+        // hole gives us.  With block constructors in the type the same drop
+        // instead re-decides the isint/Lswitch split and reintroduce_fail's
+        // canfail shape -- ctype's unify_row_field keeps the fail branch its
+        // `Reither(true, [], _)` test falls through to.
         size_t nc0 = consts.size(), nb0 = blocks.size();
         drop_holes(consts);
         drop_holes(blocks);
