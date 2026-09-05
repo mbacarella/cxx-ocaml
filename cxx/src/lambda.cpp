@@ -13770,12 +13770,39 @@ struct Translator {
     // states: a descent through our fully compiled body overshoots upstream's
     // pre-Simplif view.  NOGUARDLOWER reverts.
     static const bool no_guard_lower = cppcaml::dbg_env("NOGUARDLOWER");
-    auto bind_col = [&](const Ident& id, int j, LamPtr b) -> LamPtr {
+    // A column's bind is placed in the sub-pm that owns it, and that sub-pm's
+    // FALL-THROUGH IS STILL A BARE `exit` when bind_check runs: the rows below
+    // are a separate pm that comp_match_handlers only splices back in, and
+    // Simplif only inlines, afterwards.  So lower_bind sees `exit k` where we
+    // hand it the tail already compiled, and approx_present's conservative
+    // default (an `apply` in the tail reads as present) stops the walk at the
+    // top -- ctype's `Tfield (lab,kind,_,_) when lab = ..` beside
+    // `Tfield (_,kind,_,ty')` keeps its shared `kind` INSIDE the guard's then
+    // upstream and above the whole `if` for us.  Show the walk that exit, but
+    // only when the tail carries no use of the ident, which is exactly when
+    // upstream's exit carries it as no argument.  `gif` is the guard `if` this
+    // fold built, the one node whose else really is a fall-through; a row body
+    // that happens to be an `if` is a genuine tail and keeps its else.
+    // NOGUARDTAIL reverts.
+    static const bool no_guard_tail = cppcaml::dbg_env("NOGUARDTAIL");
+    auto bind_col = [&](const Ident& id, int j, LamPtr b, bool descend,
+                        const LamPtr& gif) -> LamPtr {
       LamPtr fread = fieldimm(j, scrut);
       if (count_var(b, id) <= 1) { subst_alias(b, id, fread); return b; }
-      if (!no_guard_lower && scrut->k == Lam::K::Var &&
-          b->k == Lam::K::IfThenElse && b->cond)
-        return lower_bind(id, ValueKind::Gen, fread, b);
+      if (!no_guard_lower && descend && scrut->k == Lam::K::Var &&
+          b->k == Lam::K::IfThenElse && b->cond) {
+        LamPtr saved;
+        if (!no_guard_tail && gif == b && b->else_ &&
+            count_var(b->else_, id) == 0) {
+          saved = b->else_;
+          auto ex = mk(Lam::K::Staticraise);
+          ex->prim_arg = -1;
+          b->else_ = ex;
+        }
+        LamPtr r = lower_bind(id, ValueKind::Gen, fread, b);
+        if (saved) b->else_ = saved;
+        return r;
+      }
       auto l = mk(Lam::K::Let);
       l->bindings = {{id, ValueKind::Gen, fread, true}};
       l->body = b;
@@ -13783,6 +13810,7 @@ struct Translator {
     };
     // Build the guard chain last-to-first; the innermost fall-through is dflt.
     LamPtr chain = dflt;
+    std::vector<LamPtr> gifs(ng);
     for (int i = (int)ng - 1; i >= 0; --i) {
       scope.emplace_back();
       for (int j = 0; j < ar; ++j) {
@@ -13798,21 +13826,27 @@ struct Translator {
       if (rs[i]->guard) {
         auto iff = mk(Lam::K::IfThenElse);
         iff->cond = expr(*rs[i]->guard); iff->then_ = body; iff->else_ = chain;
-        body = iff;
+        body = iff; gifs[i] = iff;
       }
       scope.pop_back();
       // A peeled row's own re-reads wrap its own `if`, lowest column outermost:
       // they are that sub-pm's column binds, and the rows below it end up
       // inside them once Simplif inlines the single-use handler they exit to.
       for (int j = ar - 1; j >= 0; --j)
-        if (phas[i][j]) body = bind_col(pids[i][j], j, body);
+        if (phas[i][j]) body = bind_col(pids[i][j], j, body, true, gifs[i]);
       chain = body;  // an unguarded row discards the (dead) accumulated chain
     }
     // The shared reads sit outside all of it, column 0 outermost: the reverse
     // fold IS upstream's creation order, since compile_match_nonempty binds a
-    // level's column around the compilation of the levels to its right.
+    // level's column around the compilation of the levels to its right.  A
+    // level that still holds TWO OR MORE rows hands bind_check the `catch` its
+    // own split just made, and lower_bind wraps anything that is not an `if`,
+    // a switch or an alias let -- so only a level down to its last row (the
+    // clamped `ng - j <= 1`) can sink its column into a branch.
     for (int j = ar - 1; j >= 0; --j)
-      if (fused[j]) chain = bind_col(fids[j], j, chain);
+      if (fused[j])
+        chain = bind_col(fids[j], j, chain,
+                         no_guard_tail || (int)ng - j <= 1, gifs[0]);
     return chain;
   }
   // Whether a sub-row set is trivially TOTAL: some unguarded row is a
