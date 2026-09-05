@@ -13734,6 +13734,53 @@ struct Translator {
     std::vector<Ident> fids(ar);
     for (int j = 0; j < ar; ++j) fids[j] = fresh("", true);
     std::vector<bool> fused(ar, false);
+    // Upstream peels ONE row per column level, so a column is shared only by a
+    // PREFIX of the rows.  split_no_or's `collect` (matching.ml:1607) divides
+    // off the trailing all-omega row of the level it is looking at, and the
+    // peeled row's sub-pm re-binds every column still to its RIGHT for itself;
+    // the columns to its left are already `Var`s by then and stay shared.  The
+    // peel can happen at levels 0..ng-2, so column j is bound over rows
+    // 0..ng-1-j and every row past that reads it again.  Measured on four
+    // probes: 4 rows sharing column 0 keep ONE read (typeopt's four
+    // `Tconstr(p,_,_) when Path.same p ..` guards), 3 rows sharing column 1
+    // keep one read for the first two and a second for the third, and 3 rows
+    // over column 2 read it three times.  NOGUARDSPLIT reverts.
+    static const bool no_guard_split = cppcaml::dbg_env("NOGUARDSPLIT");
+    std::vector<std::vector<Ident>> pids(ng, std::vector<Ident>(ar));
+    std::vector<std::vector<bool>> phas(ng, std::vector<bool>(ar, false));
+    if (!no_guard_split)
+      for (size_t i = 0; i < ng; ++i)
+        for (int j = 0; j < ar; ++j) {
+          int b = (int)ng - j;  // rows 0..b-1 share column j; row 0 always does
+          if (b < 1) b = 1;
+          if ((int)i < b) continue;
+          const Pattern* cp = effective_pat(rowfps[i][j]);
+          if (!std::holds_alternative<Ppat_var>(cp->desc))
+            continue;
+          pids[i][j] = fresh("", true); phas[i][j] = true;
+        }
+    // One column's read, placed the way bind_check places it: a single use is
+    // substituted, and an immutable field read is Alias, so lower_bind walks it
+    // into the ONE branch that reads it -- in ctype, the guarded row
+    // `Tfield(lab,_,_,_) when lab = dummy_method -> false` beside
+    // `Tfield(_,kind,_,ty') -> ..kind..kind..` keeps `kind` UNDER the
+    // guard test, where hoisting it paid a stack slot
+    // through the guard arm (ref RETURN 4, ours RETURN 5).  Only an `if` may
+    // start the walk, and only off a bare variable, for the reason wrap_binders
+    // states: a descent through our fully compiled body overshoots upstream's
+    // pre-Simplif view.  NOGUARDLOWER reverts.
+    static const bool no_guard_lower = cppcaml::dbg_env("NOGUARDLOWER");
+    auto bind_col = [&](const Ident& id, int j, LamPtr b) -> LamPtr {
+      LamPtr fread = fieldimm(j, scrut);
+      if (count_var(b, id) <= 1) { subst_alias(b, id, fread); return b; }
+      if (!no_guard_lower && scrut->k == Lam::K::Var &&
+          b->k == Lam::K::IfThenElse && b->cond)
+        return lower_bind(id, ValueKind::Gen, fread, b);
+      auto l = mk(Lam::K::Let);
+      l->bindings = {{id, ValueKind::Gen, fread, true}};
+      l->body = b;
+      return l;
+    };
     // Build the guard chain last-to-first; the innermost fall-through is dflt.
     LamPtr chain = dflt;
     for (int i = (int)ng - 1; i >= 0; --i) {
@@ -13741,8 +13788,10 @@ struct Translator {
       for (int j = 0; j < ar; ++j) {
         const Pattern* p = effective_pat(rowfps[i][j]);
         if (auto* pv = std::get_if<Ppat_var>(&p->desc)) {
-          scope.back()[pv->name.txt] = fids[j];
-          apply_var_node_path(p, fids[j]); fused[j] = true;
+          const Ident& id = phas[i][j] ? pids[i][j] : fids[j];
+          scope.back()[pv->name.txt] = id;
+          apply_var_node_path(p, id);
+          if (!phas[i][j]) fused[j] = true;
         }
       }
       LamPtr body = expr(*rs[i]->rhs);
@@ -13752,44 +13801,18 @@ struct Translator {
         body = iff;
       }
       scope.pop_back();
+      // A peeled row's own re-reads wrap its own `if`, lowest column outermost:
+      // they are that sub-pm's column binds, and the rows below it end up
+      // inside them once Simplif inlines the single-use handler they exit to.
+      for (int j = ar - 1; j >= 0; --j)
+        if (phas[i][j]) body = bind_col(pids[i][j], j, body);
       chain = body;  // an unguarded row discards the (dead) accumulated chain
     }
-    // Bind each used field once (`=a`), reverse-folded, single-use inlined.
-    // The reverse fold IS upstream's creation order: compile_match_nonempty
-    // binds column 0 around the compilation of the rest, so the LAST column is
-    // created first and column 0 ends up outermost.  Each of those binds goes
-    // through bind_check, and an immutable field read is Alias, so lower_bind
-    // walks it into the ONE branch of the guard chain that reads it -- ctype's
-    // `Tfield(lab,_,_,_) when lab = dummy_method -> false` beside
-    // `Tfield(_,kind,_,ty') -> ..kind..kind..` keeps `kind` UNDER the guard
-    // test, where we hoisted it above and paid a stack slot through the guard
-    // arm (ref RETURN 4, ours RETURN 5).
-    //   Upstream reaches that placement by a different route -- split_no_or's
-    // last-row division (matching.ml:1607) peels the final all-omega row into
-    // its own sub-pm, which binds the columns still to its right FOR ITSELF --
-    // and the two agree exactly when one row reads the column, which is the
-    // case here and the only one this rule moves.  They part when SEVERAL rows
-    // read it: upstream then duplicates the read into each sub-pm where we
-    // keep one shared binding (probes s600, s601).  Column 0 is bound before
-    // any division, so it stays shared for every row either way -- typeopt's
-    // four `Tconstr(p,_,_) when Path.same p ..` guards read one `p`.
-    //   Only an `if` may start the walk, and only off a bare variable, for the
-    // reason wrap_binders states: a descent through our fully compiled body
-    // overshoots upstream's pre-Simplif view.  NOGUARDLOWER reverts.
-    static const bool no_guard_lower = cppcaml::dbg_env("NOGUARDLOWER");
-    for (int j = ar - 1; j >= 0; --j) {
-      if (!fused[j]) continue;
-      LamPtr fread = fieldimm(j, scrut);
-      if (count_var(chain, fids[j]) <= 1) { subst_alias(chain, fids[j], fread); continue; }
-      if (!no_guard_lower && scrut->k == Lam::K::Var &&
-          chain->k == Lam::K::IfThenElse && chain->cond) {
-        chain = lower_bind(fids[j], ValueKind::Gen, fread, chain);
-        continue;
-      }
-      auto l = mk(Lam::K::Let);
-      l->bindings = {{fids[j], ValueKind::Gen, fread, true}};
-      l->body = chain; chain = l;
-    }
+    // The shared reads sit outside all of it, column 0 outermost: the reverse
+    // fold IS upstream's creation order, since compile_match_nonempty binds a
+    // level's column around the compilation of the levels to its right.
+    for (int j = ar - 1; j >= 0; --j)
+      if (fused[j]) chain = bind_col(fids[j], j, chain);
     return chain;
   }
   // Whether a sub-row set is trivially TOTAL: some unguarded row is a
