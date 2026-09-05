@@ -23352,27 +23352,77 @@ struct Translator {
     //   Both legs fire only where such an arm exists, so every other tuple
     // match keeps its wiring.  NOORGUARDTUP reverts.
     bool orguard = false;
+    size_t orsuf = srcs.size();   // first row of the FOLLOWING sub-matrix
     if (!cppcaml::dbg_env("NOORGUARDTUP")) {
       size_t ng = 0;
       for (auto& sr : srcs)
         if (sr.second.size() > 1 && sr.first->guard) ++ng;
       const auto& lst = srcs.back();
       orguard = ng == 1 && lst.second.size() > 1 && lst.first->guard;
+      //   The positional test above is a stand-in for the real one.  A failing
+      // guard raises the handler pm's own default entry, and that entry is
+      // `pop_compat orp def` (matching.ml:1799): precompile_or pops every
+      // default matrix INCOMPATIBLE with the or-pattern, so the fall-out lands
+      // on the first later entry a value covered by the or could still reach.
+      // When the guarded or-row is LAST that is trivially the match default;
+      // when later rows exist it still is, PROVIDED every one of them is
+      // disjoint from every alternative -- ctype's unify3 `(Tconstr (_,_,_), _)
+      // | (_, Tconstr (_,_,_)) when in_pattern_mode uenv` is followed only by
+      // Tobject/Tvariant/Tfield/Tpoly/Tpackage rows, so its guard-fail really
+      // does go straight to the match's own default matrix.
+      //   Overlap is what the positional test was guarding against, and it is a
+      // MISCOMPILE, not a byte difference: morematch's flatguard
+      // (`(1,2)|(2,3) when y=2` ahead of `(1,_)|(_,3)`) sends (2,3) to the
+      // second or-row, and routing its guard-fail to deid answers 3 for 2.
+      // NOORGUARDLATE reverts to the positional test.
+      if (!orguard && ng == 1 && !cppcaml::dbg_env("NOORGUARDLATE")) {
+        size_t gi = srcs.size();
+        for (size_t i = 0; i < srcs.size(); ++i)
+          if (srcs[i].second.size() > 1 && srcs[i].first->guard) gi = i;
+        if (gi < srcs.size()) {
+          orguard = true;
+          for (size_t j = gi + 1; j < srcs.size() && orsuf == srcs.size(); ++j)
+            for (auto& aj : srcs[j].second) {
+              bool comp = false;
+              for (auto& ai : srcs[gi].second) {
+                bool dis = false;
+                for (size_t c = 0; c < k && !dis; ++c)
+                  dis = gm_cols_disjoint(ai[c], aj[c]);
+                if (!dis) { comp = true; break; }
+              }
+              if (comp) { orsuf = j; break; }
+            }
+        }
+        // The rows from `orsuf` on are exactly Or_matrix's No matrix: a row
+        // COMPATIBLE with a guarded or-row already in the or-matrix cannot be
+        // appended to it (insert_or_append's `safe_below (qs, act_q) ps` is
+        // `not (is_guarded act_q)` once the tuple is the single column), and
+        // `safe_before cl rev_no` then drags every row below it along.  They
+        // become a following sub-matrix behind its own entry, and THAT entry --
+        // not the match default -- is what the or-handler's guard-fail raises.
+        // Modelled below by compiling the suffix as its own matrix behind
+        // `sufe`.  NOORGUARDSPLIT declines the split (and with it the licence).
+        if (orsuf < srcs.size() && cppcaml::dbg_env("NOORGUARDSPLIT")) {
+          orguard = false; orsuf = srcs.size();
+        }
+      }
     }
-    std::vector<MRow> mrows;
+    std::vector<MRow> mrows, sufrows;
     for (size_t i = 0; i < srcs.size(); ++i)
       for (auto& cols : srcs[i].second) {
         MRow mr; mr.rhs = srcs[i].first->rhs; mr.cols = cols;
         mr.aid = arms[i].aid; mr.vnames = &arms[i].vnames;
         mr.row_or = srcs[i].second.size() > 1;
         mr.guard = (orguard && mr.row_or) ? nullptr : srcs[i].first->guard;
-        mrows.push_back(std::move(mr));
+        (i < orsuf ? mrows : sufrows).push_back(std::move(mr));
       }
     int deid = ++next_exit_;
+    int sufe = sufrows.empty() ? -1 : ++next_exit_;
     if (orguard)
       for (size_t i = 0; i < srcs.size(); ++i)
         if (srcs[i].second.size() > 1 && srcs[i].first->guard) {
-          arms[i].hguard = srcs[i].first->guard; arms[i].hfail = deid;
+          arms[i].hguard = srcs[i].first->guard;
+          arms[i].hfail = sufe >= 0 ? sufe : deid;
         }
     // Enable nested tuple/record column decomposition (budget-guarded) so a record
     // sub-column -- `match a, b with Ldot ({txt;_}, _), .. ` -- is split into field
@@ -23391,7 +23441,12 @@ struct Translator {
     int pt_save = gm_ptot_deid_;
     gm_ptot_deid_ = gm_tp_deid_;
     gm_orw_.clear();
-    LamPtr body = gmatch(comps, mrows, mloc, deid);
+    LamPtr body = gmatch(comps, mrows, mloc, sufe >= 0 ? sufe : deid);
+    LamPtr sufbody;
+    if (body && sufe >= 0) {
+      sufbody = gmatch(comps, sufrows, mloc, deid);
+      if (!sufbody) body = nullptr;
+    }
     if (cppcaml::dbg_env("MTDBG"))
       fprintf(stderr, "[MTDBG] gmatch_tuple_top gmatch=%s line=%d\n",
               body ? "OK" : "NULL", mloc.start.lnum);
@@ -23402,6 +23457,16 @@ struct Translator {
     if (!body) return nullptr;
     // Resolve deferred chunk catches first (see gmatch_top).
     inline_chunk_catches(body);
+    // cons_next's following sub-matrix (matching.ml:1604): `Lstaticcatch (first,
+    // (idef, []), next)`, wrapped by comp_match_handlers OUTSIDE everything the
+    // first matrix built -- its or-handlers included -- while the match's own
+    // default stays INSIDE the suffix, which is the only matrix that can reach
+    // it.  So the deid catch is spliced into the suffix handler, not the root.
+    std::set<int> sufaids;                 // arms that live in the suffix matrix
+    if (sufbody) {
+      inline_chunk_catches(sufbody);
+      for (size_t i = orsuf; i < srcs.size(); ++i) sufaids.insert(arms[i].aid);
+    }
     // Upstream's precompile_or runs on the UNFLATTENED tuple matrix, so a
     // ROOT-OR arm (one whose whole pattern is an or over the tuple) is an
     // or-row THERE, and its handler is placed by the tuple level's own
@@ -23429,16 +23494,33 @@ struct Translator {
     // count has to run after the wiring rather than before it.
     int bad = 0, uses = 0;
     LamPtr dcatch;
+    LamPtr* dslot = &body;
     auto wrap_default = [&]() {
-      uses = count_exit(body, deid, false, bad);
+      uses = count_exit(*dslot, deid, false, bad);
       if (uses > 0 && !(uses == 1 && bad == 0)) {
         dcatch = mk(Lam::K::Catch);
-        dcatch->cond = body; dcatch->prim_arg = deid;
+        dcatch->cond = *dslot; dcatch->prim_arg = deid;
         dcatch->gm_deidc = true;
-        body = dcatch;
+        *dslot = dcatch;
       }
     };
-    if (orguard) { wire_garms(body, arms); wrap_default(); }
+    if (sufbody) {
+      // Each matrix carries its OWN or-handlers -- do_compile_matching runs
+      // per sub-matrix, so compile_orhandlers never reaches across the
+      // division -- and comp_match_handlers' `Lstaticcatch (first, (idef, []),
+      // next)` then wraps the pair, outside both.  The match default stays
+      // inside the suffix, the only matrix that can still reach it.
+      std::vector<GArm> parms, sarms;
+      for (auto& a : arms)
+        (sufaids.count(a.aid) ? sarms : parms).push_back(std::move(a));
+      wire_garms(body, parms);
+      wire_garms(sufbody, sarms);
+      dslot = &sufbody;
+      wrap_default();
+      auto c = mk(Lam::K::Catch);
+      c->cond = body; c->prim_arg = sufe; c->then_ = sufbody;
+      body = c;
+    } else if (orguard) { wire_garms(body, arms); wrap_default(); }
     else { wrap_default(); wire_garms(body, arms); }
     share_switches_rec(body);
     reswitch_flat_consts(body);
