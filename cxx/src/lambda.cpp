@@ -823,9 +823,27 @@ struct Translator {
   // around the module body as `=a` bindings; single-use ones inline away (Simplif).
   std::vector<std::pair<std::string, Lam::Binding>> shared_consts_;
   std::unordered_map<std::string, Ident> shared_index_;
-  // The exception binders of the enclosing try/with handlers; `raise` of the
-  // innermost caught exception is a `reraise`.
+  // The exception binders of the enclosing try/with handlers; `raise` of ANY
+  // one of them is a `reraise`.
   std::vector<Ident> caught_exn_;
+  // translprim.ml's `try_ids` is a HASHTABLE, not a stack top: transl_case_try
+  // adds a handler arm's bound ids for the duration of that arm's body and
+  // removes them after, so every ENCLOSING handler's binder is live at once and
+  // `Raise_regular, Lvar argv when Hashtbl.mem try_ids argv` upgrades a raise
+  // of
+  // any of them.  We compared against the innermost only, so ctype's
+  // `with exn -> .. (try .. with Cannot_expand -> raise exn)` (nondep_type_rec,
+  // and the `| exception Cannot_expand -> raise err` twin in equal_private)
+  // emitted RAISE where ocamlc emits RERAISE -- a reset backtrace, not just a
+  // fidelity diff.  NOOUTERRERAISE keeps the innermost-only rule.
+  bool is_caught_exn(const LamPtr& arg) const {
+    if (!arg || arg->k != Lam::K::Var || caught_exn_.empty()) return false;
+    static const bool inner_only = cppcaml::dbg_env("NOOUTERRERAISE");
+    if (inner_only) return arg->var.stamp == caught_exn_.back().stamp;
+    for (auto& id : caught_exn_)
+      if (arg->var.stamp == id.stamp) return true;
+    return false;
+  }
   // User C externals: value name -> C primitive name (the `external f = "cname"`
   // string) + declared arity.  Applying one emits (cname args).
   std::unordered_map<std::string, StdPrim> externals_;
@@ -7459,9 +7477,7 @@ struct Translator {
       // translprim.ml upgrades a raise of a caught exception to a reraise for
       // Raise_regular ONLY -- `raise_notrace e` keeps its kind whatever `e` is.
       bool notrace = prim == "%raise_notrace" && !raise_notrace_off();
-      bool reraise = !notrace && !caught_exn_.empty() &&
-                     arg->k == Lam::K::Var &&
-                     arg->var.stamp == caught_exn_.back().stamp;
+      bool reraise = !notrace && is_caught_exn(arg);
       auto pr = mk(Lam::K::Prim);
       pr->prim = reraise ? Prim::Reraise
                : notrace ? Prim::RaiseNotrace
@@ -29321,8 +29337,7 @@ struct Translator {
               LamPtr arg = expr(*as[0].second);
               raise_arg_ = false;
               // raising the innermost caught exception re-raises (keeps backtrace).
-              bool reraise = !caught_exn_.empty() && arg->k == Lam::K::Var &&
-                             arg->var.stamp == caught_exn_.back().stamp;
+              bool reraise = is_caught_exn(arg);
               auto pr = mk(Lam::K::Prim);
               pr->prim = reraise ? Prim::Reraise : Prim::Raise;
               pr->args = {arg};
