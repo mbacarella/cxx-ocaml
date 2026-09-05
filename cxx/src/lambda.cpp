@@ -13755,10 +13755,37 @@ struct Translator {
       chain = body;  // an unguarded row discards the (dead) accumulated chain
     }
     // Bind each used field once (`=a`), reverse-folded, single-use inlined.
+    // The reverse fold IS upstream's creation order: compile_match_nonempty
+    // binds column 0 around the compilation of the rest, so the LAST column is
+    // created first and column 0 ends up outermost.  Each of those binds goes
+    // through bind_check, and an immutable field read is Alias, so lower_bind
+    // walks it into the ONE branch of the guard chain that reads it -- ctype's
+    // `Tfield(lab,_,_,_) when lab = dummy_method -> false` beside
+    // `Tfield(_,kind,_,ty') -> ..kind..kind..` keeps `kind` UNDER the guard
+    // test, where we hoisted it above and paid a stack slot through the guard
+    // arm (ref RETURN 4, ours RETURN 5).
+    //   Upstream reaches that placement by a different route -- split_no_or's
+    // last-row division (matching.ml:1607) peels the final all-omega row into
+    // its own sub-pm, which binds the columns still to its right FOR ITSELF --
+    // and the two agree exactly when one row reads the column, which is the
+    // case here and the only one this rule moves.  They part when SEVERAL rows
+    // read it: upstream then duplicates the read into each sub-pm where we
+    // keep one shared binding (probes s600, s601).  Column 0 is bound before
+    // any division, so it stays shared for every row either way -- typeopt's
+    // four `Tconstr(p,_,_) when Path.same p ..` guards read one `p`.
+    //   Only an `if` may start the walk, and only off a bare variable, for the
+    // reason wrap_binders states: a descent through our fully compiled body
+    // overshoots upstream's pre-Simplif view.  NOGUARDLOWER reverts.
+    static const bool no_guard_lower = cppcaml::dbg_env("NOGUARDLOWER");
     for (int j = ar - 1; j >= 0; --j) {
       if (!fused[j]) continue;
       LamPtr fread = fieldimm(j, scrut);
       if (count_var(chain, fids[j]) <= 1) { subst_alias(chain, fids[j], fread); continue; }
+      if (!no_guard_lower && scrut->k == Lam::K::Var &&
+          chain->k == Lam::K::IfThenElse && chain->cond) {
+        chain = lower_bind(fids[j], ValueKind::Gen, fread, chain);
+        continue;
+      }
       auto l = mk(Lam::K::Let);
       l->bindings = {{fids[j], ValueKind::Gen, fread, true}};
       l->body = chain; chain = l;
