@@ -81,7 +81,7 @@ static void print_help(std::ostream& os) {
       "  -nocwd          Do not implicitly search the current directory for\n"
       "                  compiled interfaces\n"
       "  -nostdlib       Do not add the stdlib directory to the include path,\n"
-      "                  and do not auto-link the standard library\n"
+      "                  (stdlib.cma is still linked unless -nopervasives)\n"
       "  -o <file>       Set the output file name\n"
       "  -pack           Package the given .cmo files into one unit (needs -o)\n"
       "  -runtime <file> Use <file> as the ocamlrun launched by the output exe\n"
@@ -133,7 +133,7 @@ static const std::set<std::string> kArgIgnore = {
     "-w", "-warn-error", "-alert", "-color", "-error-style", "-cclib", "-ccopt",
     "-dllib", "-dllpath", "-stop-after", "-intf-suffix", "-intf_suffix",
     "-cmi-file", "-dump-dir", "-inline", "-afl-inst-ratio", "-function-sections",
-    "-match-context-rows", "-runtime-variant", "-with-runtime"};
+    "-match-context-rows", "-runtime-variant"};
 // Boolean flags we accept and ignore (meaning-preserving for our bytecode output).
 static const std::set<std::string> kBoolIgnore = {
     "-safe-string", "-unsafe-string", "-strict-sequence", "-no-strict-sequence",
@@ -143,8 +143,10 @@ static const std::set<std::string> kBoolIgnore = {
     "-no-keep-docs", "-absname", "-no-absname", "-noassert", "-unsafe",
     "-no-alias-deps", "-alias-deps", "-app-funct", "-no-app-funct", "-compat-32",
     "-noautolink", "-linkall", "-custom", "-no-check-prims", "-bytecode",
-    "-make-runtime", "-make_runtime", "-use-runtime", "-use_runtime",
-    "-warn-help", "-warn-error-help"};
+    "-make-runtime", "-make_runtime", "-with-runtime", "-without-runtime",
+    "-warn-help", "-warn-error-help",
+    // typing/dump switches with no effect on our .cmo/.cmi output
+    "-typing-recovery", "-dno-unique-ids", "-dunique-ids", "-dno-locations", "-dlocations"};
 // Flags that would silently change the output if dropped -> reported unsupported.
 static const std::set<std::string> kUnsupportedArg = {"-pp", "-ppx", "-open",
                                                       "-for-pack"};
@@ -275,7 +277,7 @@ static int run_main(int argc, char** argv) {
   bool compile_only = false;             // -c : stop at the .cmo / .cmi
   bool make_lib = false;                 // -a : build a .cma archive
   std::string pack_name;                 // -pack : build a packed unit (name from -o)
-  bool nostdlib = false;                 // -nostdlib : do not auto-link stdlib
+  bool nostdlib = false;                 // -nostdlib : no default stdlib search dir
   bool nocwd = false;                    // -nocwd : no implicit cwd cmi search
   bool nopervasives = false;             // -nopervasives : Stdlib not implicitly opened
   bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
@@ -304,7 +306,13 @@ static int run_main(int argc, char** argv) {
     else if (a == "-strict-flags") { /* handled in the pre-scan above */ }
     else if (a == "-o") out_path = need_arg("-o");
     else if (a == "-I") incdirs_raw.push_back(need_arg("-I"));
+    // -H <dir>: APPROXIMATION -- searched like -I.  ocamlc lets a hidden dir
+    // satisfy dependencies only, never a direct reference; the hidden_includes
+    // tests that expect "Unbound module" therefore wrongly pass here.
+    else if (a == "-H") incdirs_raw.push_back(need_arg("-H"));
     else if (a == "-runtime") runtime = need_arg("-runtime");
+    else if (a == "-use-runtime" || a == "-use_runtime")  // ocamlc's spelling of -runtime
+      runtime = need_arg(a.c_str());
     else if (a == "-c") compile_only = true;
     else if (a == "-dparsetree") g_dump.parsetree = true;   // dump AST, keep going
     else if (a == "-dlambda") g_dump.lambda = true;         // dump Lambda IR
@@ -450,11 +458,14 @@ static int run_main(int argc, char** argv) {
   if (link_objs.empty()) return 0;  // only .mli inputs
 
   // Link: [stdlib.cma] + objects + [std_exit.cmo] -> runnable bytecode launcher.
+  // Like Bytelink.link, only -nopervasives drops the implicit stdlib.cma /
+  // std_exit.cmo; -nostdlib merely removes the default dir from the search
+  // path, and stdlib_dir above was already resolved from -I in that case.
   if (out_path.empty()) out_path = "a.out";
   std::vector<std::string> linkin;
-  if (!nostdlib) linkin.push_back(stdlib_dir + "/stdlib.cma");
+  if (!nopervasives) linkin.push_back(stdlib_dir + "/stdlib.cma");
   for (const std::string& o : link_objs) linkin.push_back(o);
-  if (!nostdlib) linkin.push_back(stdlib_dir + "/std_exit.cmo");
+  if (!nopervasives) linkin.push_back(stdlib_dir + "/std_exit.cmo");
   try {
     cppcaml::link::link_executable(linkin, out_path, runtime);
   } catch (const std::exception& e) {
