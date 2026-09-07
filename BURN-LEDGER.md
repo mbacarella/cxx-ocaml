@@ -136,6 +136,30 @@ pointers, max_arity 126).  Oracle: amd64, Closure mode (no flambda), `as`.
 Insulated alternative if wanted before that: compile bytecode-form Lambda
 natively and validate by native exec parity, dump parity later.
 
+### 3g. Toolchain-dependent output (found while sizing an opam package)
+c++caml builds cleanly with **system g++ 11.4 / cmake 3.22 / ninja, outside
+nix, no mimalloc** (2 min; the only edits needed are
+`cmake_minimum_required(VERSION 3.22)` and the mimalloc default) -- and the
+resulting compiler is deterministic run-to-run and Debug==Release, but
+**differs from the clang-20 build on 109/139 compiler .cmo and 75/146 .cmi**.
+Root: 12 .cmi differ in content (misc, identifiable, types, numbers, symtable,
+btype, shape, ident, includemod, consistbl, path, arg_helper; the other 63
+only inherit digests).  The content difference is that a FUNCTOR
+APPLICATION's result signature loses the functor body's written type-variable
+names under gcc: `module M = Map.Make(String)` writes
+`val fold : (key -> 'a -> 'b -> 'b) -> ..` where clang (and ocamlc) write
+`'acc`.  Own-.mli names and re-exports (`let g = List.fold_left`) survive on
+both; only the functor-instantiation path loses them, so the fault is where
+the instance copies the body's vars (infer.cpp:281 copies var_hint;
+infer_check.cpp bridge_ty_rec consults ctx.var_names / rigid_name /
+var_hint).  Same source, two toolchains, two outputs = unspecified behaviour
+(gcc evaluates call arguments right-to-left, clang left-to-right, is the
+classic).  gcc -Wall shows nothing relevant.  The clang build is the one the
+gates validate, so the gcc build is the wrong one.  Reproduce: build
+cxx/ with -DCMAKE_CXX_COMPILER=g++ -DCPPCAML_MIMALLOC=OFF, compile the
+one-liner above with both, `cmiprint` both .cmi.  Until fixed, any package
+must pin clang or gate the gcc build against the DDC corpus.
+
 ## 4. Items burn can take (driver / link / cmo -- files juice has not touched)
 - `.c` inputs (47 tests): ocamlc hands `.c` files to the C compiler.
 - `-i` (8), `-for-pack` (6), `-open` (3), `-pp`, `-depend`, `-thread`,
