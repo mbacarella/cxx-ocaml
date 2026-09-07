@@ -73,8 +73,19 @@ rejected by the checker c++ocamlc already links** -- a wiring gap in
 checker's 4 known false rejects (`basic/patmatch.ml`,
 `typing-extensions/cast.ml`, `typing-modules-bugs/pr7036_ok.ml`,
 `typing-modules/inclusion_errors_with_renamed_source_file/foo.ml`) become
-compile failures, and it is unmeasured whether the checker accepts all 139
-DDC modules.  Not done here for that reason.
+compile failures -- and, measured on 2026-09-07, **the checker rejects 76 of
+the 139 DDC compiler modules**, 64 of them one mechanism: an abbreviation is
+not expanded across cmis ("type constructor mismatch: Warnings.loc vs
+Location.t", "Misc.modname vs string", "list vs Parsetree.attributes", ...);
+the rest are unbound module (LargeFile), a value-restriction report
+(printtyp.ml) and "cannot unify" in camlinternalMenhirLib.  Also the checker
+exits 1 where ocamlc exits 2, and its messages lack the `File "..", line N`
+header and source excerpt, so the 96 tests would move from FALSE_ACCEPT to
+exit-status/text mismatches rather than pass.  Conclusion: `c++ocamlc -c`
+SHOULD run the strict check -- that is what ocamlc does -- but not until the
+checker is at 0 false rejects over the DDC corpus; wiring it in today breaks
+DDC.  The 76 are the work-list (`c++type --check` over the DDC staging dir with
+the sibling-cmi root pointed at it reproduces them).
 
 ### 3c. 31 genuine checker false accepts (24 already in accept_parity's 38)
 tests/generalized-open/funct_body.ml lib-fun/test_stdlib_todo_flag_error.ml
