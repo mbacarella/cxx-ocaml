@@ -136,7 +136,10 @@ pointers, max_arity 126).  Oracle: amd64, Closure mode (no flambda), `as`.
 Insulated alternative if wanted before that: compile bytecode-form Lambda
 natively and validate by native exec parity, dump parity later.
 
-### 3g. Toolchain-dependent output (found while sizing an opam package)
+### 3g. Toolchain-dependent output -- FIXED on branch `burn/toolchain-determinism`
+(two commits on top of burn/testsuite: the conv_cmi_ty fix, and the
+`cxx/harness/toolchain_determinism.sh` gate, clang vs gcc 285/285 identical.
+The record of the finding follows.)
 c++caml builds cleanly with **system g++ 11.4 / cmake 3.22 / ninja, outside
 nix, no mimalloc** (2 min; the only edits needed are
 `cmake_minimum_required(VERSION 3.22)` and the mimalloc default) -- and the
