@@ -14088,10 +14088,14 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       ctx.nodes[t.get()] = ty;
       return ty;
     }
-    case K::Arrow:
-      return cmi::cmiw::ty_arrow_lbl(bridge_ty(t->dom, vars, nextvar),
-                                     bridge_ty(t->cod, vars, nextvar),
+    case K::Arrow: {
+      // Explicitly sequenced: both calls advance `nextvar`, and argument
+      // evaluation order is unspecified (see conv_cmi_ty's Tarrow).
+      auto dom = bridge_ty(t->dom, vars, nextvar);
+      auto cod = bridge_ty(t->cod, vars, nextvar);
+      return cmi::cmiw::ty_arrow_lbl(std::move(dom), std::move(cod),
                                      t->arrow_label, t->arrow_lbl);
+    }
     case K::Tuple: {
       std::vector<cmi::cmiw::TyPtr> as;
       for (auto& a : t->args) as.push_back(bridge_ty(a, vars, nextvar));
@@ -14884,9 +14888,15 @@ static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
   if (!t) return cmi::cmiw::ty_var(nextvar++);
   if (t->kind == cmi::TypeExpr::Tvar || t->kind == cmi::TypeExpr::Tunivar) {
     auto it = vars.find(t.get());
-    if (it != vars.end()) return cmi::cmiw::ty_var(it->second);
-    int id = nextvar++; vars[t.get()] = id;
+    int id = (it != vars.end()) ? it->second : nextvar++;
+    if (it == vars.end()) vars[t.get()] = id;
     auto r = cmi::cmiw::ty_var(id);
+    // EVERY occurrence carries the name (as bridge_ty_rec does): TyEmit
+    // memoizes vars by id in MARSHAL order, so if only the first-CONVERTED
+    // occurrence were named and conversion order differed from marshal order,
+    // the name would be lost.  It did: gcc evaluates the Tarrow call's
+    // arguments right-to-left, converting the codomain before the domain, and
+    // Map.Make(String).fold came out as ('a -> 'b -> 'b) instead of 'acc.
     if (t->name) r->var_name = *t->name;  // keep Tvar(Some "acc") -> 'acc
     return r;
   }
@@ -14898,11 +14908,16 @@ static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
   }
   cmi::cmiw::TyPtr r;
   switch (t->kind) {
-    case cmi::TypeExpr::Tarrow:
-      r = cmi::cmiw::ty_arrow_lbl(conv_cmi_ty(t->dom, vars, nextvar, nodes),
-                                  conv_cmi_ty(t->cod, vars, nextvar, nodes),
-                                  t->label_kind, t->label);
+    case cmi::TypeExpr::Tarrow: {
+      // Sequence the two conversions explicitly: as call arguments their
+      // order is unspecified (clang left-to-right, gcc right-to-left), and
+      // they share `vars`/`nextvar`, so var ids must not depend on the
+      // C++ compiler that built us.
+      auto dom = conv_cmi_ty(t->dom, vars, nextvar, nodes);
+      auto cod = conv_cmi_ty(t->cod, vars, nextvar, nodes);
+      r = cmi::cmiw::ty_arrow_lbl(std::move(dom), std::move(cod), t->label_kind, t->label);
       break;
+    }
     case cmi::TypeExpr::Ttuple: {
       std::vector<cmi::cmiw::TyPtr> es;
       for (auto& e : t->elems) es.push_back(conv_cmi_ty(e.second, vars, nextvar, nodes));
