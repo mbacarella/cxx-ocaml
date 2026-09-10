@@ -17834,6 +17834,9 @@ static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
       // be aliased, so those callers recurse instead.
       if (aliasable) {
         si.alias = app + "." + si.name;
+        // strengthen_sig carries md_presence through: this member still takes
+        // a runtime field in the including structure (see SigItem::alias_present).
+        si.alias_present = true;
         si.sub.clear();
         si.modtype_ref.clear();
       } else {

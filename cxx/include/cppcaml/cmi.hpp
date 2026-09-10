@@ -465,6 +465,13 @@ struct SigItem {
   // alias is a compilation-unit global like "Stdlib__List"); emitted as
   // Mty_alias instead of Mty_signature.  `sub` is then ignored.
   std::string alias;
+  // Module: the alias above came from STRENGTHENING (`include M` re-exporting
+  // a submodule), not from a source `module X = P` binding.  Mtype.strengthen
+  // rewrites md_type to Mty_alias but carries md_presence through unchanged
+  // (mtype.ml's strengthen_sig `Sig_module(id, pres, md, rs, vis)`), and the
+  // included item was a real submodule -- the enclosing structure builds a
+  // field for it -- so it stays Mp_PRESENT.  Only a written alias is absent.
+  bool alias_present = false;
   // Module: if set, this is a FUNCTOR `module name (P : _) : <sub>`; emitted as
   // Mty_functor(Named(P, <opaque>), Mty_signature(sub)).  The param's own
   // signature is left opaque (consumers only need the result layout).

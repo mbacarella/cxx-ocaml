@@ -1,4 +1,5 @@
 #include "cppcaml/cmi.hpp"
+#include "cppcaml/dbgenv.hpp"
 #include "cppcaml/omarshal.hpp"
 #include "cppcaml/blake2.hpp"
 
@@ -2470,7 +2471,15 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           pos = nd;
         }
         mty = o::vblock(3, {path});  // Mty_alias
-        presence = 1;  // Mp_absent
+        // Mp_absent -- UNLESS the alias came from strengthening an `include`,
+        // where Mtype.strengthen keeps the member's own presence and the
+        // including structure really does build the field.  Writing it absent
+        // made our .cmi disagree with our own .cmo: a consumer's coercion for
+        // a functor argument skipped the field and read the submodule instead
+        // (testsuite/tests/basic-modules/main.ml printed a pointer for 1).
+        // NOINCALIASPRESENT reverts.
+        presence = (it.alias_present &&
+                    !cppcaml::dbg_env("NOINCALIASPRESENT")) ? 0 : 1;
       } else {
         // `module MD5 : S` (a NAMED modtype) emits Mty_ident(S) like ocamlc;
         // the inlined signature is the fallback.
