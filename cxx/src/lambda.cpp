@@ -15631,6 +15631,39 @@ struct Translator {
     env = std::move(out);
     return true;
   }
+  // mk_failaction_pos's ctx reading (matching.ml:3020): a missing constructor
+  // whose `Context.lub` with the current ctx is EMPTY gets no failure clause at
+  // all.  A default-environment row that TESTS a column the arrival context has
+  // already proven to hold some OTHER constructor is unreachable from this
+  // handler, and an entry all of whose rows go that way is skipped outright --
+  // the miss falls through to the next one.  The facts are the entry's own
+  // proof intersection, the same ones gm_proven_comp_ prunes the handler's
+  // re-dispatch with, so this is the other half of one rule and fires under the
+  // same guard (every tracked arrival agreed, and the tracked count matches the
+  // exits actually in the tree).  NOCTXDEF reverts.
+  void denv_ctx_prune(std::vector<GmDef>& env,
+                      const std::vector<GmProof>& proofs) {
+    if (proofs.empty() || cppcaml::dbg_env("NOCTXDEF")) return;
+    std::vector<GmDef> out;
+    for (auto& f : env) {
+      GmDef nf{f.eid, {}, f.head_dropped, f.widened, f.colmap, f.proofs};
+      for (auto& row : f.mat) {
+        bool dead = false;
+        for (auto& pf : proofs) {
+          if (pf.sub >= 0 || pf.col < 0 || pf.col >= (int)row.size()) continue;
+          const Pattern* p = gmdef_peel(row[pf.col]);
+          if (gmdef_omega(p)) continue;
+          if (!std::get_if<Ppat_construct>(&p->desc)) continue;
+          const CtorInfo* ci = pat_ctor_resolve(p, ctor_of(*p), pf.type);
+          if (!ci) continue;
+          if (ci->is_block != pf.blk || ci->tag != pf.tag) { dead = true; break; }
+        }
+        if (!dead) nf.mat.push_back(row);
+      }
+      if (!nf.mat.empty()) out.push_back(std::move(nf));
+    }
+    env = std::move(out);
+  }
   bool denv_pop_col(std::vector<GmDef>& env) {
     return denv_map(env, [&](const Pattern* p0,
                              std::vector<const Pattern*>& row, GmDef& ne) {
@@ -16320,8 +16353,13 @@ struct Translator {
         for (size_t i = 0; i < r.cols.size() && i < untested.size(); ++i)
           if (!pat_omega_like(r.cols[i])) untested[i] = 0;
       gm_div_total_ = dt_last && k + 1 == groups.size();
+      std::vector<GmDef> henv = env_from(k + 1);
+      if (pf_here) {
+        auto pit = gm_eid_proofs_.find(eids[k]);
+        if (pit != gm_eid_proofs_.end()) denv_ctx_prune(henv, pit->second);
+      }
       LamPtr hb = gmatch(std::move(ck), std::move(cr), mloc, deid,
-                         env_from(k + 1));
+                         std::move(henv));
       gm_div_total_ = false;
       gm_proven_comp_ = std::move(proven_save);
       gm_neg_comp_ = std::move(neg_save);
@@ -17822,18 +17860,16 @@ struct Translator {
           if (pattern_binds(rows[j].cols[0])) return spdbg("binds");
         }
         if (!anyor) return spdbg("no-or");
-        //   With several columns the shape is admitted only while the NO list
-        // does not SPLIT AGAIN -- one row, or none of them heading an
-        // or-pattern.  cons_next recurses on it, and a NO list that carries its
-        // own or-rows gets its own handlers and its own default entry, at which
-        // point the body ahead of it is a match whose cells share a miss: the
-        // two open gaps at the `lead_free` note above.  MEASURED on ctype: the
-        // wide reading takes unify_row_field (ctype.ml:3782, a NO list of four
-        // rows two of which are or-rows) as well as mcomp_row and costs |norm|
-        // 180 -> 316, raw 496 -> 602 -- our body abstracts the shared miss of
-        // two switch cells into a handler where upstream keeps the test in the
-        // cell.  Narrowed to mcomp_row alone it is 180 -> 140, 496 -> 446.
-        if (comps.size() > 1 && sn.size() > 1) {
+        //   The multi-column shape used to be admitted only while the NO list
+        // did not SPLIT AGAIN, because a NO list carrying its own or-rows
+        // leaves the body a match whose switch cells SHARE a miss -- and that
+        // miss went to the wrong default entry.  `denv_ctx_prune` closes it
+        // (mk_failaction_pos's ctx reading), so the narrowing survives only as
+        // the other half of that fix's revert: ctype's unify_row_field
+        // (ctype.ml:3782, a NO list of four rows two of which are or-rows)
+        // needs both to be a win.  MEASURED: with the ctx fix the wide reading
+        // is |norm| 140 -> 135 and raw 446 -> 403; without it, 140 -> 316.
+        if (comps.size() > 1 && sn.size() > 1 && cppcaml::dbg_env("NOCTXDEF")) {
           for (size_t i : sn) if (is_or(i)) return spdbg("mc-nosplit");
         }
         // cons_next compiles the NO sub-matrix first, then takes the default
