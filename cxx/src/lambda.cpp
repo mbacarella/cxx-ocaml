@@ -16719,7 +16719,19 @@ struct Translator {
         // parmatch's `records_args` combine declined the gate and re-read
         // `lbl1` inside the l2 arm.  NOCARRYLET reverts.
         static const bool no_carry_let = std::getenv("NOCARRYLET") != nullptr;
-        auto carrying = [&](const LamPtr& s0) {
+        //   And the branch's own later column tests too: after the peel the
+        // sub-match goes on dispatching its remaining columns (`if *match*`
+        // on a cons cell, then a guard), and the exit carrying v sits under
+        // those ifs -- still this branch's inline arm, still the very switch
+        // upstream's lower_bind stopped on.  ctype's eqtype_row
+        // `Reither (c1, t1 :: tl1, _), Reither (c2, t2 :: tl2, _) when c1 =
+        // c2` keeps t1/tl1 above the f2 switch upstream (the t1 :: tl1 cell
+        // binds at its level, three uses in the arm), where the exit lay two
+        // ifs down and the gate let the let unwind to the leaf.  Only `if`
+        // is walked: a nested switch is a landing of its own.  NOCARRYIF
+        // reverts.
+        static const bool no_carry_if = std::getenv("NOCARRYIF") != nullptr;
+        std::function<bool(const LamPtr&)> carrying = [&](const LamPtr& s0) {
           const Lam* s = s0.get();
           while (!no_carry_let && s && s->k == Lam::K::Let) {
             bool allalias = !s->bindings.empty();
@@ -16727,6 +16739,8 @@ struct Translator {
             if (!allalias) break;
             s = s->body.get();
           }
+          if (!no_carry_if && s && s->k == Lam::K::IfThenElse && s->cond)
+            return carrying(s->then_) || carrying(s->else_);
           if (!s || s->k != Lam::K::Staticraise || !s->gm_garm) return false;
           for (auto& a : s->args)
             if (a && a->k == Lam::K::Var && a->var.stamp == v.stamp) return true;
@@ -16759,12 +16773,21 @@ struct Translator {
             for (auto* cs : {&d->sw_consts, &d->sw_blocks})
               for (auto& c : *cs) cases.push_back({act_id(c.body, i++), &c.body});
             int dflt = act_id(d->sw_default, -1);
+            //   The fold that elects it is reintroduce_fail's: a bare exit
+            // cited by THREE or more cases becomes the default (the two
+            // fold sites above use that very threshold).  Two citations
+            // leave both cases explicit -- ctype's subtype_row `Rpresent
+            // (Some t1), Rpresent (Some t2)` lands on `case int 0: (exit k)
+            // | case tag 0: .. | case tag 1: (exit k)`, three cases upstream
+            // too, so t1 stays above the f2 switch.  SWLFOLD2 restores the
+            // old two-citation election.
+            static const bool fold2 = std::getenv("SWLFOLD2") != nullptr;
             if (!d->sw_default) {                 // elect the folded default
               std::map<int, int> freq;
               for (auto& [id, _] : cases) if (id >= 0) freq[id]++;
               int best = 0;
               for (auto& [id, n] : freq) if (n > best) { best = n; dflt = id; }
-              if (best < 2) dflt = -1;
+              if (best < (fold2 ? 2 : 3)) dflt = -1;
             }
             if (!fold || cppcaml::dbg_env("SWLNOFOLD")) dflt = -1;  // count every case
             std::set<int> arms;
