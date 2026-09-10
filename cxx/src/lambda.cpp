@@ -15696,6 +15696,23 @@ struct Translator {
       return 1;
     });
   }
+  // Default_environment.pop_compat (matching.ml:845), the entries an or-row's
+  // HANDLER sees: every row whose column 0 may_compat the or-pattern, column 0
+  // dropped, the others gone -- the handler is entered having matched the
+  // or-pattern and nothing else.  It is column 0 ALONE (a row this row's rest
+  // columns rule out is still reachable from the handler), which is
+  // gm_pair_disjoint at may_compat's depth, not the whole-row test.
+  bool denv_pop_compat(std::vector<GmDef>& env, const Pattern* orp) {
+    return denv_map(env, [&](const Pattern* p0,
+                             std::vector<const Pattern*>& row, GmDef& ne) {
+      if (!gmdef_omega(p0)) {
+        if (gm_pair_disjoint(p0, orp, true)) return 0;
+        ne.widened = true;   // a compatible but non-omega test is dropped
+      }
+      ne.mat.emplace_back(row.begin() + 1, row.end());
+      return 1;
+    });
+  }
   bool denv_spec_string(std::vector<GmDef>& env, const std::string& s) {
     return denv_map(env, [&](const Pattern* p0, std::vector<const Pattern*>& row,
                              GmDef& ne) -> int {
@@ -17940,7 +17957,42 @@ struct Translator {
           for (size_t i : sn) fprintf(stderr, "%zu ", i);
           fprintf(stderr, "]\n");
         }
-        if (sn.empty()) return spdbg("sn-empty");
+        //   An EMPTY NO list is not a bail: do_split's cons_next then hands
+        // precompile_or the incoming default environment as is, so the body's
+        // misses fall where this level's would, and each or-handler sees
+        // pop_compat of that environment.  Every row here was either safe
+        // before the or-rows or accepted beside them -- ctype's subtype_row
+        // fold (ctype.ml:6050) is one: its wildcard row is this match's own
+        // catch-all, so no row is left over, and the or-row's rest column
+        // (`Rpresent None`) still belongs in a handler of its own, not in
+        // every alternative's cell.  NOORSNEMPTY reverts to the bail.
+        bool no_sn = sn.empty();
+        if (no_sn && cppcaml::dbg_env("NOORSNEMPTY")) return spdbg("sn-empty");
+        if (no_sn) {
+          //   But not where upstream ABSORBED the catch-all: a wildcard row
+          // reaching Or_matrix.insert_or_append is appended beside the
+          // or-rows when each one's rest columns are all omega (safe_below's
+          // le_pats), and split_no_or then peels it inside the body, so its
+          // catch sits INSIDE the or-handler's (parmatch's le_pat, lub).  We
+          // peeled it to `deid` at the top, whose catch is the root's, and
+          // the reading below would nest the or-catch under it; the existing
+          // expansion already places the arm catch outermost there.
+          bool absorb = deid != gm_fake_deid_;
+          for (size_t j : so) {
+            if (!absorb) break;
+            if (!is_or(j)) continue;
+            if (rows[j].guard) { absorb = false; break; }   // not safe_below
+            for (auto* p : rest_of(j))
+              if (!gm_le_pat(p, &gm_split_omega)) { absorb = false; break; }
+          }
+          if (absorb) return spdbg("sn-empty-absorb");
+          //   And under the fake default the handlers are compiled the way
+          // `attempt` compiles an or-handler -- ctx-Total, so a miss with no
+          // clause drops -- and the reading is kept only if it invented no
+          // fail exit (the retract below); that needs every row aid-shared.
+          if (deid == gm_fake_deid_ && !guardfree)
+            return spdbg("sn-empty-guard");
+        }
         bool anyor = false;
         for (size_t j : so) {
           if (!is_or(j)) continue;
@@ -17964,16 +18016,42 @@ struct Translator {
         }
         // cons_next compiles the NO sub-matrix first, then takes the default
         // entry's exit, then precompile_or takes the handlers'.
-        std::vector<MRow> norows;
-        for (size_t i : sn) norows.push_back(rows[i]);
-        std::vector<LamPtr> ncomps = comps;
-        bool ss_save = gm_split_sub_;
-        gm_split_sub_ = true;
-        LamPtr sub =
-            gmatch(std::move(ncomps), std::move(norows), mloc, deid, denv);
-        gm_split_sub_ = ss_save;
-        if (!sub) { bailed = true; return nullptr; }
-        int idef = ++next_exit_;
+        // The retract's snapshot, the same state the relaxed `attempt` saves:
+        // every row is aid-shared (guardfree), so a rejected reading leaves
+        // nothing but counter state behind.
+        bool sn_retract = no_sn && deid == gm_fake_deid_;
+        int exit_save = next_exit_, stamp_save = stamp;
+        int drops_save = gm_tp_drops_;
+        decltype(gm_orw_) orw_save;
+        decltype(gm_ctx_dirty_eids_) dirty_save;
+        decltype(gm_facc_proto_) facc_save;
+        decltype(gm_eid_full_) full_save;
+        decltype(gm_eid_part_) part_save;
+        decltype(gm_eid_arr_) arr_save;
+        decltype(gm_eid_proofs_) proofs_save;
+        decltype(gm_eid_lub_) lub_save;
+        decltype(gm_proven_comp_) proven_save2;
+        decltype(gm_neg_comp_) neg_save2;
+        if (sn_retract) {
+          orw_save = gm_orw_; dirty_save = gm_ctx_dirty_eids_;
+          facc_save = gm_facc_proto_; full_save = gm_eid_full_;
+          part_save = gm_eid_part_; arr_save = gm_eid_arr_;
+          proofs_save = gm_eid_proofs_; lub_save = gm_eid_lub_;
+          proven_save2 = gm_proven_comp_; neg_save2 = gm_neg_comp_;
+        }
+        LamPtr sub;
+        int idef = -1;
+        if (!no_sn) {
+          std::vector<MRow> norows;
+          for (size_t i : sn) norows.push_back(rows[i]);
+          std::vector<LamPtr> ncomps = comps;
+          bool ss_save = gm_split_sub_;
+          gm_split_sub_ = true;
+          sub = gmatch(std::move(ncomps), std::move(norows), mloc, deid, denv);
+          gm_split_sub_ = ss_save;
+          if (!sub) { bailed = true; return nullptr; }
+          idef = ++next_exit_;
+        }
         std::vector<int> ks;
         for (size_t j : so) ks.push_back(is_or(j) ? ++next_exit_ : -1);
         std::vector<MRow> body;
@@ -18025,7 +18103,8 @@ struct Translator {
           for (size_t j = 0; j + 1 < comps.size(); ++j) e.colmap.push_back((int)j);
           return e;
         };
-        std::vector<GmDef> env1; env1.push_back(def_frame());
+        std::vector<GmDef> env1;
+        if (!no_sn) env1.push_back(def_frame());
         env1.insert(env1.end(), denv.begin(), denv.end());
         std::vector<LamPtr> bc = comps;
         // A cell no row of this level names is DEAD inside a sub-matrix: an
@@ -18048,10 +18127,16 @@ struct Translator {
           // Default_environment.pop_compat: the handler falls into the default
           // entry only where the sub-matrix holds a row the or-pattern can
           // reach.
-          GmDef pf = pop_frame(so[t]);
           std::vector<GmDef> env2;
-          if (!pf.mat.empty()) env2.push_back(std::move(pf));
-          env2.insert(env2.end(), denv.begin(), denv.end());
+          if (!no_sn) {
+            GmDef pf = pop_frame(so[t]);
+            if (!pf.mat.empty()) env2.push_back(std::move(pf));
+            env2.insert(env2.end(), denv.begin(), denv.end());
+          } else {
+            env2 = denv;
+            if (!denv_pop_compat(env2, rows[so[t]].cols[0]))
+              { bailed = true; return nullptr; }
+          }
           MRow hr = rows[so[t]]; hr.cols.erase(hr.cols.begin());
           std::vector<LamPtr> hcomps(comps.begin() + 1, comps.end());
           // precompile_or hands orpm the WHOLE match's partiality, so inside a
@@ -18062,12 +18147,37 @@ struct Translator {
           // per unrefuted tag and routes it at the default entry: s641's
           // `(Rpresent None | Reither (true, _, _))` handler grew a `case int
           // 0` for Rabsent where upstream's collapses to the bare action.
+          int tp_save3 = gm_tp_deid_, rt_save3 = gm_tp_root_;
+          if (sn_retract && (relaxed || tpx)) {
+            gm_tp_deid_ = deid;
+            if (tpx)
+              gm_tp_root_ = (!hcomps.empty() && hcomps[0]->k == Lam::K::Var)
+                                ? hcomps[0]->var.stamp : -1;
+          }
           LamPtr hb = gmatch(std::move(hcomps), {hr}, mloc, deid, env2);
+          gm_tp_deid_ = tp_save3; gm_tp_root_ = rt_save3;
           if (!hb) { bailed = true; return nullptr; }
           auto c = mk(Lam::K::Catch);
           c->prim_arg = ks[t]; c->cond = res; c->then_ = hb;
           res = c;
         }
+        if (sn_retract) {
+          int fbad = 0;
+          if (deid_fails(res, deid, fbad, drops_save) == 0) return res;
+          next_exit_ = exit_save; stamp = stamp_save;
+          gm_orw_ = std::move(orw_save);
+          gm_ctx_dirty_eids_ = std::move(dirty_save);
+          gm_facc_proto_ = std::move(facc_save);
+          gm_eid_full_ = std::move(full_save);
+          gm_eid_part_ = std::move(part_save);
+          gm_eid_arr_ = std::move(arr_save);
+          gm_eid_proofs_ = std::move(proofs_save);
+          gm_eid_lub_ = std::move(lub_save);
+          gm_proven_comp_ = std::move(proven_save2);
+          gm_neg_comp_ = std::move(neg_save2);
+          return spdbg("sn-empty-fails");
+        }
+        if (no_sn) return res;
         int bad = 0;
         int uses = count_exit(res, idef, false, bad);
         if (uses == 0) return res;
