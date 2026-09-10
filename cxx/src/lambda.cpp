@@ -15560,7 +15560,15 @@ struct Translator {
                  // and a gap tag's fail routing).  Widening does not taint
                  // them: a pop drops a TEST, not an established fact.
                  std::vector<int> colmap;
-                 std::vector<GmProof> proofs; };
+                 std::vector<GmProof> proofs;
+                 // The context this entry's arrivals STAND IN, over the same
+                 // original columns: what an enclosing handler's own arrivals
+                 // agreed on, and the column an or-handler entered having
+                 // matched.  Upstream threads one Context through the whole
+                 // compile (Context.specialize at every dispatch), so a
+                 // column this level never tests still carries its fact --
+                 // `proofs` are only what THIS frame's dispatches proved.
+                 std::map<int, GmLub> lubs; };
   const Pattern* gmdef_peel(const Pattern* p) {
     if (!p) return nullptr;
     for (;;) {
@@ -15616,11 +15624,13 @@ struct Translator {
     for (auto& en : env) {
       if (!en.mat.empty() && en.mat[0].empty()) {   // already fully matched
         out.push_back(
-            {en.eid, {{}}, en.head_dropped, en.widened, {}, en.proofs});
+            {en.eid, {{}}, en.head_dropped, en.widened, {}, en.proofs,
+             en.lubs});
         env = std::move(out);
         return true;
       }
-      GmDef ne{en.eid, {}, en.head_dropped, en.widened, en.colmap, en.proofs};
+      GmDef ne{en.eid, {}, en.head_dropped, en.widened, en.colmap,
+               en.proofs, en.lubs};
       // Work items carry their ORIGINAL row index so we can tell whether the
       // entry's head row survives this specialization (or-alternatives of
       // the head all count as head material).
@@ -15646,7 +15656,8 @@ struct Translator {
       consume_col0(ne);
       if (ne.mat[0].empty()) {                      // fully matched: truncate
         out.push_back(
-            {ne.eid, {{}}, ne.head_dropped, ne.widened, {}, ne.proofs});
+            {ne.eid, {{}}, ne.head_dropped, ne.widened, {}, ne.proofs,
+             ne.lubs});
         env = std::move(out);
         return true;
       }
@@ -15670,7 +15681,8 @@ struct Translator {
     if (proofs.empty() || cppcaml::dbg_env("NOCTXDEF")) return;
     std::vector<GmDef> out;
     for (auto& f : env) {
-      GmDef nf{f.eid, {}, f.head_dropped, f.widened, f.colmap, f.proofs};
+      GmDef nf{f.eid, {}, f.head_dropped, f.widened, f.colmap, f.proofs,
+               f.lubs};
       for (auto& row : f.mat) {
         bool dead = false;
         for (auto& pf : proofs) {
@@ -16112,6 +16124,27 @@ struct Translator {
   // groups {1,3} first (row 3 is disjoint from row 2 in the second column),
   // then {2,4}, then {5}, then {6}.  The deferred rows are split the same way,
   // each group becoming its own half-match.
+  //   The column fact an OR-HANDLER is entered under: it runs having matched
+  // the or-pattern on column 0 and nothing else, so that column holds one of
+  // the alternatives' constructors -- upstream's ctx there is the union of the
+  // jump contexts of the cells that raised it, which is exactly this set.
+  // Every alternative must be a constructor of one type, else there is no set
+  // to state (a constant, a record, a mixed row).
+  bool gm_or_lub(const Pattern* orp, GmLub& out) {
+    std::vector<const Pattern*> alts;
+    flatten_or(orp, alts);
+    if (alts.empty()) return false;
+    for (auto* a : alts) {
+      const Pattern* p = pat_deep(effective_pat(a));
+      if (!std::get_if<Ppat_construct>(&p->desc)) return false;
+      const CtorInfo* ci = pat_ctor_resolve(p, ctor_of(*p));
+      if (!ci || ci->unboxed) return false;
+      if (out.type.empty()) out.type = ci->type;
+      else if (out.type != ci->type) return false;
+      out.tags.insert({ci->is_block, ci->tag});
+    }
+    return !out.type.empty();
+  }
   // A head constructor decided by its TAG alone: no argument, or an argument
   // list that is entirely omega.  Matching it is settled by the tag, which is
   // what makes an earlier row a NEGATIVE fact for the later divisions.
@@ -16389,13 +16422,16 @@ struct Translator {
       // constructor, but every one proved SOME constructor at the column, so
       // the handler's dispatch of it drops every gap tag outside the union.
       auto lubc_save = gm_lub_comp_;
-      if (!cppcaml::dbg_env("NOCTXLUB")) {
-        auto lit = gm_eid_lub_.find(eids[k]);
+      bool ctx_ok = false;
+      {
         auto ait = gm_eid_arr_.find(eids[k]);
         int lbad = 0;
-        if (lit != gm_eid_lub_.end() && ait != gm_eid_arr_.end() &&
-            ait->second > 0 &&
-            count_exit(res, eids[k], false, lbad) == ait->second)
+        ctx_ok = ait != gm_eid_arr_.end() && ait->second > 0 &&
+                 count_exit(res, eids[k], false, lbad) == ait->second;
+      }
+      if (!cppcaml::dbg_env("NOCTXLUB")) {
+        auto lit = gm_eid_lub_.find(eids[k]);
+        if (lit != gm_eid_lub_.end() && ctx_ok)
           for (auto& [col, L] : lit->second)
             if (L.tags.size() >= 2 && col >= 0 && col < (int)comps.size() &&
                 comps[col]) {
@@ -16418,6 +16454,29 @@ struct Translator {
       if (pf_here) {
         auto pit = gm_eid_proofs_.find(eids[k]);
         if (pit != gm_eid_proofs_.end()) denv_ctx_prune(henv, pit->second);
+      }
+      //   This handler's OWN arrival context travels on to the entries it can
+      // still exit to: they are entries of this same frame (env_from's
+      // identity colmap), so the column indices carry over as they are.  The
+      // `denv` entries appended after them belong to an enclosing frame and
+      // are left alone.  Without this a division reached only through other
+      // divisions re-dispatches a column every arrival had already narrowed.
+      if (ctx_ok && !cppcaml::dbg_env("NOLUBPROP")) {
+        std::map<int, GmLub> ctx;
+        if (auto lit2 = gm_eid_lub_.find(eids[k]); lit2 != gm_eid_lub_.end())
+          ctx = lit2->second;
+        if (auto pit2 = gm_eid_proofs_.find(eids[k]);
+            pit2 != gm_eid_proofs_.end())
+          for (auto& pf : pit2->second)
+            if (pf.sub < 0) {
+              GmLub& L = ctx[pf.col];
+              L.type = pf.type;
+              L.tags.insert({pf.blk, pf.tag});
+            }
+        size_t own = groups.size() - (k + 1);
+        for (size_t q = 0; q < own && q < henv.size(); ++q)
+          for (auto& [col, L] : ctx)
+            if (!henv[q].lubs.count(col)) henv[q].lubs[col] = L;
       }
       LamPtr hb = gmatch(std::move(ck), std::move(cr), mloc, deid,
                          std::move(henv));
@@ -17250,25 +17309,41 @@ struct Translator {
                       }),
                     cur.end());
         }
+        //   The arrival's column facts are the WHOLE context it stands in, not
+        // only what THIS level's dispatch proved.  Upstream's ctx is threaded
+        // (Context.specialize at every dispatch, matching.ml:2113), so an exit
+        // raised INSIDE a handler that was itself compiled under a ctx carries
+        // that ctx too: a column this level never tested still holds whatever
+        // the enclosing handler's arrivals agreed on.  We recorded that on the
+        // column CELL (gm_lub_comp_ / gm_proven_comp_) for the handler compile
+        // -- read it back here for every column with no proof of its own.
+        // s640's `mc_row`: handler 8's arrivals are the top switch's `int 0`
+        // (Rabsent) and the tag-1 branch (Reither), so f1's union there is
+        // {int 0, tag 1}; the exit it raises to handler 7 joins the tag-1
+        // branch's own exit, and Rpresent is outside the union at handler 7
+        // too -- upstream's switch has no `tag 0` clause and collapses to
+        // `if (isint f1)`.  NOLUBPROP reverts.
+        std::map<int, GmLub> facts;
+        for (auto& p : f.proofs)
+          if (p.sub < 0) {
+            GmLub& L = facts[p.col];
+            L.type = p.type;
+            L.tags.insert({p.blk, p.tag});
+          }
+        if (!cppcaml::dbg_env("NOLUBPROP"))
+          for (auto& [col, L] : f.lubs)
+            if (!facts.count(col)) facts[col] = L;
         auto lit = gm_eid_lub_.find(f.eid);
         if (lit == gm_eid_lub_.end()) {
-          auto& m = gm_eid_lub_[f.eid];
-          for (auto& p : f.proofs)
-            if (p.sub < 0) {
-              GmLub& L = m[p.col];
-              L.type = p.type;
-              L.tags.insert({p.blk, p.tag});
-            }
+          gm_eid_lub_[f.eid] = facts;
         } else {
           auto& m = lit->second;
           for (auto it = m.begin(); it != m.end();) {
-            bool hit = false;
-            for (auto& p : f.proofs)
-              if (p.sub < 0 && p.col == it->first &&
-                  p.type == it->second.type) {
-                it->second.tags.insert({p.blk, p.tag});
-                hit = true;
-              }
+            auto ft = facts.find(it->first);
+            bool hit = ft != facts.end() && ft->second.type == it->second.type;
+            if (hit)
+              it->second.tags.insert(ft->second.tags.begin(),
+                                     ft->second.tags.end());
             it = hit ? std::next(it) : m.erase(it);
           }
         }
@@ -18064,15 +18139,24 @@ struct Translator {
         }
         LamPtr sub;
         int idef = -1;
+        //   The division's exit NUMBER is taken here, at precompile time, the
+        // way split_and_precompile takes it -- but the division itself is
+        // compiled LAST, after the body and the or-handlers, because that is
+        // where comp_match_handlers compiles it and where its context exists
+        // (see the build below).
+        const bool sn_late = !cppcaml::dbg_env("NOSNLAST");
         if (!no_sn) {
-          std::vector<MRow> norows;
-          for (size_t i : sn) norows.push_back(rows[i]);
-          std::vector<LamPtr> ncomps = comps;
-          bool ss_save = gm_split_sub_;
-          gm_split_sub_ = true;
-          sub = gmatch(std::move(ncomps), std::move(norows), mloc, deid, denv);
-          gm_split_sub_ = ss_save;
-          if (!sub) { bailed = true; return nullptr; }
+          if (!sn_late) {
+            std::vector<MRow> norows;
+            for (size_t i : sn) norows.push_back(rows[i]);
+            std::vector<LamPtr> ncomps = comps;
+            bool ss_save = gm_split_sub_;
+            gm_split_sub_ = true;
+            sub = gmatch(std::move(ncomps), std::move(norows), mloc, deid,
+                         denv);
+            gm_split_sub_ = ss_save;
+            if (!sub) { bailed = true; return nullptr; }
+          }
           idef = ++next_exit_;
         }
         std::vector<int> ks;
@@ -18123,7 +18207,17 @@ struct Translator {
             auto& c = rows[i].cols;
             e.mat.push_back({c.begin() + 1, c.end()});
           }
-          for (size_t j = 0; j + 1 < comps.size(); ++j) e.colmap.push_back((int)j);
+          //   Column IDENTITY, not position: the entry's frame is this whole
+          // level's column vector (def_frame's identity map), and the handler
+          // dropped column 0 -- what is left is originals 1..n-1.  Numbering
+          // them from 0 filed the handler's own dispatch facts against the
+          // WRONG columns, and an arrival's context is read back by original
+          // column (see mkexit).
+          for (size_t j = 1; j < comps.size(); ++j) e.colmap.push_back((int)j);
+          if (!cppcaml::dbg_env("NOLUBPROP")) {
+            GmLub L;
+            if (gm_or_lub(rows[oj].cols[0], L)) e.lubs[0] = std::move(L);
+          }
           return e;
         };
         std::vector<GmDef> env1;
@@ -18203,7 +18297,61 @@ struct Translator {
         if (no_sn) return res;
         int bad = 0;
         int uses = count_exit(res, idef, false, bad);
-        if (uses == 0) return res;
+        if (uses == 0) return res;   // `Context.is_empty ctx_i`: never compiled
+        //   comp_match_handlers (matching.ml:3611) compiles this division with
+        // `Jumps.extract idef` -- the union of the contexts of the arrivals
+        // recorded while the body and the or-handlers compiled.  Ours were all
+        // recorded by now, so the whole ctx machinery applies here exactly as
+        // it does to a chunk handler: a column every arrival narrowed is not
+        // re-dispatched over the tags none of them can carry.  s640's
+        // `mc_row`: the NO row `(Reither (true, _, _) | Rabsent), Rpresent
+        // (Some _)` is reached from the Reither cell and from the or-handler
+        // of `(Reither (_, _::_, _) | Rabsent), Rpresent None`, so f1's union
+        // is {Rabsent, Reither} -- upstream's switch has no `Rpresent` clause
+        // and, its one block case left alone, collapses to `if (isint f1)`.
+        // NOSNLAST reverts to building it before any arrival exists.
+        if (sn_late) {
+          auto proven_save3 = gm_proven_comp_;
+          auto lubc_save3 = gm_lub_comp_;
+          std::vector<GmDef> ndenv = denv;
+          auto ait = gm_eid_arr_.find(idef);
+          if (ait != gm_eid_arr_.end() && ait->second == uses &&
+              !cppcaml::dbg_env("NOLUBPROP")) {
+            if (auto pit = gm_eid_proofs_.find(idef);
+                pit != gm_eid_proofs_.end() && !pit->second.empty() &&
+                !cppcaml::dbg_env("GMNOPROOF")) {
+              for (auto& pf : pit->second)
+                if (pf.sub < 0 && pf.col >= 0 && pf.col < (int)comps.size())
+                  gm_proven_comp_.insert_or_assign(comps[pf.col].get(),
+                                                   GmProven{pf, {}});
+              denv_ctx_prune(ndenv, pit->second);
+            }
+            if (auto lit = gm_eid_lub_.find(idef);
+                lit != gm_eid_lub_.end() && !cppcaml::dbg_env("NOCTXLUB"))
+              for (auto& [col, L] : lit->second)
+                if (L.tags.size() >= 2 && col >= 0 &&
+                    col < (int)comps.size() && comps[col])
+                  gm_lub_comp_.insert_or_assign(comps[col].get(), L);
+          }
+          if (cppcaml::dbg_env("SNCTXDBG") && ait != gm_eid_arr_.end()) {
+            fprintf(stderr, "[SNCTX] line=%d idef=%d uses=%d arr=%d lub=",
+                    mloc.start.lnum, idef, uses, ait->second);
+            if (auto l3 = gm_eid_lub_.find(idef); l3 != gm_eid_lub_.end())
+              for (auto& [c3, L3] : l3->second)
+                fprintf(stderr, "%d/%zu,", c3, L3.tags.size());
+            fprintf(stderr, "\n");
+          }
+          std::vector<MRow> norows;
+          for (size_t i : sn) norows.push_back(rows[i]);
+          std::vector<LamPtr> ncomps = comps;
+          bool ss_save = gm_split_sub_;
+          gm_split_sub_ = true;
+          sub = gmatch(std::move(ncomps), std::move(norows), mloc, deid, ndenv);
+          gm_split_sub_ = ss_save;
+          gm_proven_comp_ = std::move(proven_save3);
+          gm_lub_comp_ = std::move(lubc_save3);
+          if (!sub) { bailed = true; return nullptr; }
+        }
         if (uses == 1 && bad == 0) {
           inline_exit(res, idef, {}, {}, sub);
           return res;
@@ -20036,6 +20184,19 @@ struct Translator {
           if (!block_ci.count(t) && !lit->second.tags.count({true, t}))
             negb.insert(t);
       }
+    //   mk_failaction_pos reads the context only while the number of MISSING
+    // constructors stays BELOW `Clflags.match_context_rows` (32): past that it
+    // drops to mk_failaction_neg (matching.ml:3001), which ignores the ctx
+    // outright and hands every gap the first default entry.  pprintast's
+    // `expression` lands exactly there -- 34 Pexp_ constructors, a division
+    // whose rows name two, so 32 fail patterns -- and keeps its `default`
+    // clause however narrow its ctx is.  NOFAILPOSCAP reverts.
+    if (!cppcaml::dbg_env("NOFAILPOSCAP")) {
+      int miss = 0;
+      for (int t = 0; t < NC; ++t) if (!const_ci.count(t)) ++miss;
+      for (int t = 0; t < NB; ++t) if (!block_ci.count(t)) ++miss;
+      if (miss >= 32) { negc.clear(); negb.clear(); }
+    }
     bool ctx_holes = !negc.empty() || !negb.empty();
     if (ctx_holes && cppcaml::dbg_env("CTXNEGDBG"))
       fprintf(stderr, "[CTXNEG] line=%d type=%s NC=%d NB=%d nc=%zu nb=%zu"
