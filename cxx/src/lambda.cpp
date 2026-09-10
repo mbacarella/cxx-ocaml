@@ -15897,6 +15897,85 @@ struct Translator {
       if (gm_pair_disjoint(a.cols[i], b.cols[i], rec)) return true;
     return false;
   }
+  // Set whenever gm_le_pat reached a shape it does not model and answered the
+  // conservative `false`.  safe_below wants exactly that answer; equiv_pat
+  // wants to know the difference, since there a false DECLINES a shape.
+  bool gm_le_undecided_ = false;
+  // Parmatch.le_pat (parmatch.ml:1704): `p` is MORE GENERAL than `q` -- every
+  // value `q` matches, `p` matches too.  Or_matrix.safe_below's ordering
+  // condition is le_patS over the REST columns, and it is what lets an or-row
+  // be APPENDED beside an earlier compatible one instead of starting the NO
+  // sub-matrix: once the earlier or-pattern matched, its handler never comes
+  // back, so this row is only skippable if that row's rest columns already
+  // cover it.  Anything this cannot decide answers false, which sends the row
+  // to the NO list -- the conservative direction.
+  bool gm_le_pat(const Pattern* p, const Pattern* q) {
+    p = effective_pat(p);
+    q = effective_pat(q);
+    if (auto* a = std::get_if<Ppat_alias>(&p->desc)) return gm_le_pat(a->p.get(), q);
+    if (auto* a = std::get_if<Ppat_alias>(&q->desc)) return gm_le_pat(p, a->p.get());
+    if (std::holds_alternative<Ppat_any>(p->desc) ||
+        std::holds_alternative<Ppat_var>(p->desc))
+      return true;
+    if (auto* o = std::get_if<Ppat_or>(&p->desc))
+      return gm_le_pat(o->l.get(), q) && gm_le_pat(o->r.get(), q);
+    if (auto* o = std::get_if<Ppat_or>(&q->desc))
+      return gm_le_pat(p, o->l.get()) || gm_le_pat(p, o->r.get());
+    if (auto* cp = std::get_if<Ppat_constant>(&p->desc)) {
+      auto* cq = std::get_if<Ppat_constant>(&q->desc);
+      return cq && gm_const_eq(cp->c, cq->c);
+    }
+    if (auto* kp = std::get_if<Ppat_construct>(&p->desc)) {
+      auto* kq = std::get_if<Ppat_construct>(&q->desc);
+      if (!kq || lid_last(kp->id.txt) != lid_last(kq->id.txt)) return false;
+      if (!kp->arg || !kq->arg) return !kp->arg && !kq->arg;
+      return gm_le_pat(kp->arg->get(), kq->arg->get());
+    }
+    if (auto* vp = std::get_if<Ppat_variant>(&p->desc)) {
+      auto* vq = std::get_if<Ppat_variant>(&q->desc);
+      if (!vq || vp->label != vq->label) return false;
+      if (!vp->arg || !vq->arg) return !vp->arg && !vq->arg;
+      return gm_le_pat(vp->arg->get(), vq->arg->get());
+    }
+    if (auto* tp = std::get_if<Ppat_tuple>(&p->desc)) {
+      auto* tq = std::get_if<Ppat_tuple>(&q->desc);
+      if (!tq || tp->elems.size() != tq->elems.size() || tp->labels != tq->labels)
+        return false;
+      for (size_t i = 0; i < tp->elems.size(); ++i)
+        if (!gm_le_pat(tp->elems[i].get(), tq->elems[i].get())) return false;
+      return true;
+    }
+    if (auto* rp = std::get_if<Ppat_record>(&p->desc)) {
+      auto* rq = std::get_if<Ppat_record>(&q->desc);
+      if (!rq) return false;
+      // A label q omits reads omega there, so p may only be more general at a
+      // label q names -- and must name no other.
+      for (auto& fp : rp->fields) {
+        const Pattern* sub = nullptr;
+        for (auto& fq : rq->fields)
+          if (lid_last(fp.first.txt) == lid_last(fq.first.txt))
+            { sub = fq.second.get(); break; }
+        if (!sub || !gm_le_pat(fp.second.get(), sub)) return false;
+      }
+      return true;
+    }
+    gm_le_undecided_ = true;
+    return false;
+  }
+  // Parmatch.equiv_pat: le both ways.  Answers false when it could not decide,
+  // and says so in `known`.
+  bool gm_equiv_pat(const Pattern* p, const Pattern* q, bool& known) {
+    gm_le_undecided_ = false;
+    bool e = gm_le_pat(p, q) && gm_le_pat(q, p);
+    known = !gm_le_undecided_;
+    return e;
+  }
+  bool gm_le_pats(const std::vector<const Pattern*>& a,
+                  const std::vector<const Pattern*>& b) {
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+      if (!gm_le_pat(a[i], b[i])) return false;
+    return true;
+  }
   // safe_before's other half.  Rows of the same arm share an exit; and two
   // unguarded rows whose action is the same literal have the same
   // Lambda.make_key, which is what upstream compares.
@@ -17617,9 +17696,33 @@ struct Translator {
       };
       // The three-list do_split of the note at the call site below.
       static const std::vector<std::string> gm_split_novars;
+      static const Pattern gm_split_omega =
+          [] { Pattern p; p.desc = Ppat_any{}; return p; }();
       auto attempt_split = [&]() -> LamPtr {
-        if (comps.size() != 1 || cppcaml::dbg_env("NOORDOSPLIT"))
+        //   do_split is not a SINGLE-column rule.  With several columns the one
+        // extra thing it does is precompile_or's `new_patl = omega_list patl`
+        // (matching.ml:1810): the or-row's REMAINING columns go omega in the
+        // body and their real test moves into the handler, over `args.rest`.
+        // ctype's mcomp_row (ctype.ml:3024), unify_row_field (:3790) and
+        // eqtype_row (:5170) are one shape between them -- a two-column match
+        // over `row_field` whose column-0 or-rows are pairwise COMPATIBLE (each
+        // names `Rabsent`), so Or_matrix cannot append the second beside the
+        // first: safe_below fails, the second or-row and everything below it
+        // become the NO list, and that list is a following sub-matrix behind
+        // its own default entry which the body AND every or-handler fall into.
+        // `attempt` above cannot build that -- it demands every trailing row be
+        // a wildcard or disjoint from the or-row -- so those matches fell to
+        // the duplicating expansion, which re-tests the remaining column in
+        // every switch cell.  NOORSPLITMC reverts the multi-column half alone.
+        if (comps.empty() || cppcaml::dbg_env("NOORDOSPLIT") ||
+            (comps.size() > 1 && cppcaml::dbg_env("NOORSPLITMC")))
           return nullptr;
+        auto spdbg = [&](const char* why) {
+          if (cppcaml::dbg_env("ORSPDBG"))
+            fprintf(stderr, "[ORSP] line=%d comps=%zu rows=%zu %s\n",
+                    mloc.start.lnum, comps.size(), rows.size(), why);
+          return nullptr;
+        };
         auto is_or = [&](size_t i) {
           return std::get_if<Ppat_or>(&rows[i].cols[0]->desc) != nullptr;
         };
@@ -17629,8 +17732,20 @@ struct Translator {
         // and are still incompatible, so Or_matrix appends the second or-row
         // beside the first instead of deferring it).  `col_disjoint`, the
         // head-name test the hoist above uses, would call them compatible.
-        auto compat = [&](size_t i, size_t j) {
+        // Or_matrix's `disjoint` is column 0 alone ...
+        auto compat0 = [&](size_t i, size_t j) {
           return !gm_pair_disjoint(rows[i].cols[0], rows[j].cols[0], true);
+        };
+        // ... while safe_before's is may_compatS over the WHOLE row: one column
+        // proving the two rows disjoint is enough.  The two coincide while
+        // there is only one column, which is why this was written once.
+        auto compat = [&](size_t i, size_t j) {
+          return comps.size() == 1 ? compat0(i, j)
+                                   : !gm_rows_disjoint_rec(rows[i], rows[j]);
+        };
+        auto rest_of = [&](size_t i) {
+          return std::vector<const Pattern*>(rows[i].cols.begin() + 1,
+                                             rows[i].cols.end());
         };
         auto safe_bef = [&](size_t i, const std::vector<size_t>& l) {
           for (size_t j : l)
@@ -17656,27 +17771,71 @@ struct Translator {
           if (!is_or(i) && safe_bef(i, so)) { sb.push_back(i); continue; }
           bool app = true;                                 // insert_or_append
           for (size_t j : so) {
-            if (!is_or(j) || !compat(i, j)) continue;
+            if (!is_or(j) || !compat0(i, j)) continue;
             if (is_or(i) && !pattern_binds(rows[i].cols[0]) &&
                 !pattern_binds(rows[j].cols[0])) {
               auto ai = alt_names(i);
-              if (!ai.empty() && ai == alt_names(j)) return nullptr;
+              bool known = false;
+              // Two or-patterns over the same constructor NAMES need not be
+              // equiv_pat -- ctype's `(Reither (_, _::_, _) | Rabsent)` and
+              // `(Reither (true, _, _) | Rabsent)` name {Reither, Rabsent}
+              // both and neither is more general than the other, so upstream
+              // never reaches insert_or_append's INSERT branch for them.  The
+              // name test alone declined the whole shape; le_pat decides it,
+              // and where le_pat cannot the name test still governs.
+              if (!ai.empty() && ai == alt_names(j) &&
+                  (gm_equiv_pat(rows[i].cols[0], rows[j].cols[0], known) ||
+                   !known))
+                return spdbg("equiv");
             }
-            // safe_below: a guarded or-row above cannot be fallen past
-            if (rows[j].guard) { app = false; break; }
+            // safe_below (matching.ml:1478) = `not (is_guarded act_q) &&
+            // le_pats qs ps`.  A guarded or-row above cannot be fallen past;
+            // and its REMAINING columns must be more general than this row's,
+            // or a value that matched its or-pattern and then failed its rest
+            // would leave for the handler and never be tried here.  With one
+            // column both lists are empty and le_pats holds trivially, which
+            // is why the guard used to be the whole test.  It is exactly this
+            // half that sends ctype's second `row_field` or-row -- `(Reither
+            // (true, _, _) | Rabsent), Rpresent (Some _)` behind `(Reither (_,
+            // _::_, _) | Rabsent), Rpresent None` -- into the NO list.
+            if (rows[j].guard || !gm_le_pats(rest_of(j), rest_of(i)))
+              { app = false; break; }
           }
           if (app) so.push_back(i); else sn.push_back(i);
         }
-        if (sn.empty()) return nullptr;
+        if (cppcaml::dbg_env("ORSPDBG")) {
+          fprintf(stderr, "[ORSP] line=%d comps=%zu sb=[", mloc.start.lnum, comps.size());
+          for (size_t i : sb) fprintf(stderr, "%zu ", i);
+          fprintf(stderr, "] so=[");
+          for (size_t i : so) fprintf(stderr, "%zu%s ", i, is_or(i) ? "*" : "");
+          fprintf(stderr, "] sn=[");
+          for (size_t i : sn) fprintf(stderr, "%zu ", i);
+          fprintf(stderr, "]\n");
+        }
+        if (sn.empty()) return spdbg("sn-empty");
         bool anyor = false;
         for (size_t j : so) {
           if (!is_or(j)) continue;
           anyor = true;
-          if (rows[j].aid < 0 || !rows[j].vnames) return nullptr;
+          if (rows[j].aid < 0 || !rows[j].vnames) return spdbg("no-aid");
           // a binding or-row would need exit ARGUMENTS: not modelled here
-          if (pattern_binds(rows[j].cols[0])) return nullptr;
+          if (pattern_binds(rows[j].cols[0])) return spdbg("binds");
         }
-        if (!anyor) return nullptr;
+        if (!anyor) return spdbg("no-or");
+        //   With several columns the shape is admitted only while the NO list
+        // does not SPLIT AGAIN -- one row, or none of them heading an
+        // or-pattern.  cons_next recurses on it, and a NO list that carries its
+        // own or-rows gets its own handlers and its own default entry, at which
+        // point the body ahead of it is a match whose cells share a miss: the
+        // two open gaps at the `lead_free` note above.  MEASURED on ctype: the
+        // wide reading takes unify_row_field (ctype.ml:3782, a NO list of four
+        // rows two of which are or-rows) as well as mcomp_row and costs |norm|
+        // 180 -> 316, raw 496 -> 602 -- our body abstracts the shared miss of
+        // two switch cells into a handler where upstream keeps the test in the
+        // cell.  Narrowed to mcomp_row alone it is 180 -> 140, 496 -> 446.
+        if (comps.size() > 1 && sn.size() > 1) {
+          for (size_t i : sn) if (is_or(i)) return spdbg("mc-nosplit");
+        }
         // cons_next compiles the NO sub-matrix first, then takes the default
         // entry's exit, then precompile_or takes the handlers'.
         std::vector<MRow> norows;
@@ -17702,18 +17861,45 @@ struct Translator {
           for (auto* a : alts) {
             MRow nr = rows[so[t]];
             nr.cols[0] = effective_pat(a);
+            // `new_patl = omega_list patl`: an alternative tests column 0 and
+            // nothing else, then raises its handler unconditionally.
+            for (size_t k = 1; k < nr.cols.size(); ++k)
+              nr.cols[k] = &gm_split_omega;
             nr.aid = ks[t]; nr.vnames = &gm_split_novars; nr.guard = nullptr;
             body.push_back(std::move(nr));
           }
         }
-        auto def_frame = [&](bool popped) {
+        auto def_frame = [&] {
           GmDef e; e.eid = idef;
-          if (popped) e.mat.push_back({});
-          else { for (size_t i : sn) e.mat.push_back(rows[i].cols);
-                 e.colmap.push_back(0); }
+          for (size_t i : sn) e.mat.push_back(rows[i].cols);
+          for (size_t j = 0; j < comps.size(); ++j) e.colmap.push_back((int)j);
           return e;
         };
-        std::vector<GmDef> env1; env1.push_back(def_frame(false));
+        // Default_environment.pop_compat, properly: the entry a HANDLER sees
+        // holds exactly the sub-matrix rows its or-pattern can still reach,
+        // each with column 0 dropped.  With one column that degenerates to a
+        // single empty row -- there is nothing left to specialize on -- which
+        // is what this built before.
+        //   And pop_compat's own filter is `may_compat p q` on column 0 --
+        // NOT the whole row (matching.ml:845).  It has to be: the handler is
+        // entered having matched the or-pattern and nothing else, so a
+        // sub-matrix row this row's REST columns rule out is still reachable
+        // from it.  ctype's `(Reither (true, _, _) | Rabsent), Rpresent (Some
+        // _)` is exactly that row -- whole-row-disjoint from the or-row above
+        // it, yet the value that misses that or-row's `Rpresent None` must
+        // land on it.
+        auto pop_frame = [&](size_t oj) {
+          GmDef e; e.eid = idef;
+          for (size_t i : sn) {
+            if (!compat0(i, oj)) continue;
+            if (comps.size() == 1) { e.mat.push_back({}); break; }
+            auto& c = rows[i].cols;
+            e.mat.push_back({c.begin() + 1, c.end()});
+          }
+          for (size_t j = 0; j + 1 < comps.size(); ++j) e.colmap.push_back((int)j);
+          return e;
+        };
+        std::vector<GmDef> env1; env1.push_back(def_frame());
         env1.insert(env1.end(), denv.begin(), denv.end());
         std::vector<LamPtr> bc = comps;
         // A cell no row of this level names is DEAD inside a sub-matrix: an
@@ -17736,13 +17922,21 @@ struct Translator {
           // Default_environment.pop_compat: the handler falls into the default
           // entry only where the sub-matrix holds a row the or-pattern can
           // reach.
-          bool pc = false;
-          for (size_t i : sn) if (compat(i, so[t])) { pc = true; break; }
+          GmDef pf = pop_frame(so[t]);
           std::vector<GmDef> env2;
-          if (pc) env2.push_back(def_frame(true));
+          if (!pf.mat.empty()) env2.push_back(std::move(pf));
           env2.insert(env2.end(), denv.begin(), denv.end());
-          MRow hr = rows[so[t]]; hr.cols.clear();
-          LamPtr hb = gmatch({}, {hr}, mloc, deid, env2);
+          MRow hr = rows[so[t]]; hr.cols.erase(hr.cols.begin());
+          std::vector<LamPtr> hcomps(comps.begin() + 1, comps.end());
+          // precompile_or hands orpm the WHOLE match's partiality, so inside a
+          // sub-matrix -- where every arrival came through the enclosing
+          // default entry, which already refuted what its matrix does not name
+          // -- the handler's own residual cells are dead, exactly as the body's
+          // are (NOSPLITSUBTOT above).  Without this the handler invents a cell
+          // per unrefuted tag and routes it at the default entry: s641's
+          // `(Rpresent None | Reither (true, _, _))` handler grew a `case int
+          // 0` for Rabsent where upstream's collapses to the bare action.
+          LamPtr hb = gmatch(std::move(hcomps), {hr}, mloc, deid, env2);
           if (!hb) { bailed = true; return nullptr; }
           auto c = mk(Lam::K::Catch);
           c->prim_arg = ks[t]; c->cond = res; c->then_ = hb;
@@ -17841,7 +18035,14 @@ struct Translator {
       // cell, and the arm bodies -- with every closure they allocate -- emitted
       // in the wrong order.  Runs only where `attempt` already declined, so it
       // can add a shape but never change one.  NOORDOSPLIT reverts.
-      if (LamPtr res = attempt_split()) return res;
+      if (cppcaml::dbg_env("ORSPDBG"))
+        fprintf(stderr, "[ORSP] TRY line=%d comps=%zu rows=%zu oi=%zu\n",
+                mloc.start.lnum, comps.size(), rows.size(), oi);
+      if (LamPtr res = attempt_split()) {
+        if (cppcaml::dbg_env("ORSPDBG"))
+          fprintf(stderr, "[ORSP] BUILT line=%d\n", mloc.start.lnum);
+        return res;
+      }
       if (bailed) return nullptr;
     }
     // Expand an or-pattern in column 0 into separate rows (order preserved).
