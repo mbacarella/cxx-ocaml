@@ -1112,6 +1112,17 @@ struct Translator {
   // subs: payload-field facts, applied when the proven ctor is decomposed.
   struct GmProven { GmProof self; std::vector<GmProof> subs; };
   std::map<const Lam*, GmProven> gm_proven_comp_;
+  // Context.lub over the same arrivals where they did NOT all agree: every
+  // arrival established SOME constructor at the column, and the union of
+  // those is all the handler can ever see there.  A gap tag outside the union
+  // has an empty `Context.lub` (matching.ml:3020, mk_failaction_pos) and gets
+  // no clause; `gm_proven_comp_` is the union's one-element case.
+  // `gm_eid_lub_` accumulates per entry (a column stays only while EVERY
+  // arrival proved it), `gm_lub_comp_` is the per-cell registration around a
+  // chunk handler's compile.  NOCTXLUB reverts.
+  struct GmLub { std::string type; std::set<std::pair<bool, int>> tags; };
+  std::map<int, std::map<int, GmLub>> gm_eid_lub_;
+  std::map<const Lam*, GmLub> gm_lub_comp_;
   // NEGATIVE jump context (upstream's Context, read by mk_failaction_pos at
   // matching.ml:3020: a missing constructor whose `Context.lub` with the
   // current ctx is EMPTY gets no failure clause at all, so combine chooses its
@@ -16344,6 +16355,26 @@ struct Translator {
                 gm_proven_comp_[comps[pf.col].get()].subs.push_back(pf);
         }
       }
+      // Context.lub (GmLub): the arrivals did not all prove the same
+      // constructor, but every one proved SOME constructor at the column, so
+      // the handler's dispatch of it drops every gap tag outside the union.
+      auto lubc_save = gm_lub_comp_;
+      if (!cppcaml::dbg_env("NOCTXLUB")) {
+        auto lit = gm_eid_lub_.find(eids[k]);
+        auto ait = gm_eid_arr_.find(eids[k]);
+        int lbad = 0;
+        if (lit != gm_eid_lub_.end() && ait != gm_eid_arr_.end() &&
+            ait->second > 0 &&
+            count_exit(res, eids[k], false, lbad) == ait->second)
+          for (auto& [col, L] : lit->second)
+            if (L.tags.size() >= 2 && col >= 0 && col < (int)comps.size() &&
+                comps[col]) {
+              if (cppcaml::dbg_env("GMPFDBG"))
+                fprintf(stderr, "[GMLUB] eid=%d col=%d tags=%zu\n", eids[k],
+                        col, L.tags.size());
+              gm_lub_comp_.insert_or_assign(comps[col].get(), L);
+            }
+      }
       // Which columns the handler pm descends past WITHOUT testing: those are
       // the ones upstream binds to a dead `*match*` alias (see the alias rule
       // below).  A column some row still tests is read by the handler's own
@@ -16364,6 +16395,7 @@ struct Translator {
       gm_proven_comp_ = std::move(proven_save);
       gm_neg_comp_ = std::move(neg_save);
       gm_neg2_ = std::move(neg2_save);
+      gm_lub_comp_ = std::move(lubc_save);
       if (!hb) { gm_div_total_ = dt_save; return nullptr; }
       // A proof-pruned handler can collapse to a bare argless re-raise; the
       // catch is then an exit ALIAS upstream's simplify_exits (simplif.ml:306,
@@ -16374,6 +16406,7 @@ struct Translator {
       // DEAD arg_to_var bind in upstream's handler pm: simplify_exits runs
       // BEFORE simplify_lets, so a let-wrapped re-raise does not match the
       // alias rule and the catch survives to the bytecode there.
+      bool peel_alias = false;
       if (pf_here && hb->k == Lam::K::Staticraise && hb->args.empty()) {
         // ... except when the handler pm descends past a raw (non-var) column
         // without testing it.  Upstream binds that column at its own compile
@@ -16410,15 +16443,28 @@ struct Translator {
             if (!c || c->k != Lam::K::Var) ++rawcols;
           --rawcols;
         }
-        if (rawcols < 1) {
+        // ... and not when the bare re-raise is an ARM exit.  Matching places
+        // a single-use action directly, so there upstream's handler is the
+        // arm body itself and the catch survives around the cell that shares
+        // it; only a MULTI-use arm leaves a bare `exit` for simplify_exits to
+        // alias -- and which of the two it is, nobody knows until wire_garms
+        // has counted the sites.  Substituting now hands the arm a second
+        // site in the cells and sends its catch to the match's root.  So the
+        // erasure is DEFERRED to erase_peel_catches, gm_peel_last's way: the
+        // catch is marked and goes only if its handler is still a bare
+        // re-raise once the arms are wired.  NOARMALIAS reverts.
+        if (rawcols < 1 &&
+            !(hb->gm_garm && !cppcaml::dbg_env("NOARMALIAS"))) {
           inline_exit(res, eids[k], {}, {}, hb);
           continue;
         }
+        peel_alias = rawcols < 1;
       }
       // Single-use inlining deferred to inline_chunk_catches (see the
       // trailing-row split above).
       auto c = mk(Lam::K::Catch);
       c->cond = res; c->prim_arg = eids[k]; c->then_ = hb; c->gm_chunk = true;
+      c->gm_peelc = peel_alias;
       res = c;
     }
     gm_div_total_ = dt_save;
@@ -16576,6 +16622,8 @@ struct Translator {
         gm_proven_comp_.insert_or_assign(comps[0].get(), pvt->second);
       if (auto nvt = gm_neg_comp_.find(proto.get()); nvt != gm_neg_comp_.end())
         gm_neg_comp_.insert_or_assign(comps[0].get(), nvt->second);
+      if (auto lvt = gm_lub_comp_.find(proto.get()); lvt != gm_lub_comp_.end())
+        gm_lub_comp_.insert_or_assign(comps[0].get(), lvt->second);
       LamPtr r = gmatch(std::move(comps), std::move(rows), mloc, deid, std::move(denv),
                         no_peel);
       if (!r) return nullptr;
@@ -16933,6 +16981,7 @@ struct Translator {
             auto part_save = gm_eid_part_;
             auto arr_save = gm_eid_arr_;
             auto proofs_save = gm_eid_proofs_;
+            auto lub_save = gm_eid_lub_;
             auto proven_save2 = gm_proven_comp_;
             auto neg_save2 = gm_neg_comp_;
             LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv, spec);
@@ -16953,6 +17002,7 @@ struct Translator {
             gm_eid_part_ = std::move(part_save);
             gm_eid_arr_ = std::move(arr_save);
             gm_eid_proofs_ = std::move(proofs_save);
+            gm_eid_lub_ = std::move(lub_save);
             gm_proven_comp_ = std::move(proven_save2);
             gm_neg_comp_ = std::move(neg_save2);
             gm_orw_ = std::move(orw_save);
@@ -17145,6 +17195,28 @@ struct Translator {
                         return true;
                       }),
                     cur.end());
+        }
+        auto lit = gm_eid_lub_.find(f.eid);
+        if (lit == gm_eid_lub_.end()) {
+          auto& m = gm_eid_lub_[f.eid];
+          for (auto& p : f.proofs)
+            if (p.sub < 0) {
+              GmLub& L = m[p.col];
+              L.type = p.type;
+              L.tags.insert({p.blk, p.tag});
+            }
+        } else {
+          auto& m = lit->second;
+          for (auto it = m.begin(); it != m.end();) {
+            bool hit = false;
+            for (auto& p : f.proofs)
+              if (p.sub < 0 && p.col == it->first &&
+                  p.type == it->second.type) {
+                it->second.tags.insert({p.blk, p.tag});
+                hit = true;
+              }
+            it = hit ? std::next(it) : m.erase(it);
+          }
         }
       }
       return e;
@@ -17407,22 +17479,26 @@ struct Translator {
       // pprintast's `Lident "!", [e]` and `Ldot (_, {txt = ("get" | "set");
       // _}), a :: other_args` ahead of `(Lident s | Ldot (_, {txt = s; _})),
       // a :: i :: rest when first_is '.' s`.
-      //   A leading GUARDED row is refused, all of them: when such a guard
-      // fails, control falls THROUGH to the or-row, and upstream's per-cell
-      // default sends it straight at the or-handler where ours re-dispatches
-      // through the level's one shared miss exit -- ctype's moregen `Reither
-      // (_, _, _), Rabsent when may_inst` ahead of `(Rpresent _ | Reither _),
-      // Rabsent` gets a miss handler that re-tests `isint f2` while upstream
-      // jumps at the handler directly.  A guarded row PROVEN incompatible with
-      // the or-row cannot fall through to it and would be licensable, but
-      // admitting that sub-case moves ctype's eqtype twin onto the same shape,
-      // where two OTHER open gaps show (a shared arm's catch sits at our root
-      // instead of around the cell that shares it, and the miss handler's
-      // matrix is not narrowed to the constructors that actually raise it), so
-      // the test stays the blunt one.  NOORLEADFREE reverts.
+      //   A leading GUARDED row used to be refused, all of them: a failing
+      // guard falls THROUGH to the or-row, and our miss routing sent it via
+      // the level's one shared exit where upstream's per-cell default jumps
+      // at the right handler directly -- ctype's moregen `Reither (_, _, _),
+      // Rabsent when may_inst` ahead of `(Rpresent _ | Reither _), Rabsent`
+      // got a miss handler that re-tested `isint f2`.  That was two gaps in
+      // gmatch_run_chunks, both closed there now: an arm exit's alias catch
+      // erased before the arm was wired, and a handler whose arrivals
+      // disagree getting no context at all (GmLub).  So the leading rows take
+      // their upstream reading: do_split tests safe_before against rev_ors
+      // and rev_no, both still empty while the rows AHEAD of the first or-row
+      // are consumed, and a guard there is no bar -- ctype's eqtype_row (two
+      // guarded rows ahead of `(Rpresent _ | Reither _), Rabsent`) is the
+      // shape.  MEASURED: with the two gaps open the wide reading is ctype
+      // |norm| 135 -> 152; with them closed, 119 -> 98.  NOORLEADGUARD
+      // restores the refusal, NOORLEADFREE withdraws the licence as a whole.
       bool lead_free = !cppcaml::dbg_env("NOORLEADFREE");
-      for (size_t i = 0; lead_free && i < oi; ++i)
-        if (rows[i].guard) lead_free = false;
+      if (cppcaml::dbg_env("NOORLEADGUARD"))
+        for (size_t i = 0; lead_free && i < oi; ++i)
+          if (rows[i].guard) lead_free = false;
       size_t tstart = oi + 1;
       while (tstart < rows.size() && !rows[tstart].guard &&
              !std::get_if<Ppat_or>(&rows[tstart].cols[0]->desc)) {  // #Simple.view
@@ -17998,6 +18074,7 @@ struct Translator {
         auto part_save = gm_eid_part_;
         auto arr_save = gm_eid_arr_;
         auto proofs_save = gm_eid_proofs_;
+        auto lub_save = gm_eid_lub_;
         auto proven_save2 = gm_proven_comp_;
         auto neg_save2 = gm_neg_comp_;
         if (cppcaml::dbg_env("ORLVDBG"))
@@ -18024,6 +18101,7 @@ struct Translator {
         gm_eid_part_ = std::move(part_save);
         gm_eid_arr_ = std::move(arr_save);
         gm_eid_proofs_ = std::move(proofs_save);
+        gm_eid_lub_ = std::move(lub_save);
         gm_proven_comp_ = std::move(proven_save2);
         gm_neg_comp_ = std::move(neg_save2);
         bailed = false;
@@ -18312,6 +18390,7 @@ struct Translator {
         auto part_save = gm_eid_part_;
         auto arr_save = gm_eid_arr_;
         auto proofs_save = gm_eid_proofs_;
+        auto lub_save = gm_eid_lub_;
         auto proven_save2 = gm_proven_comp_;
         auto neg_save2 = gm_neg_comp_;
         std::vector<LamPtr> rc = comps;
@@ -18330,6 +18409,7 @@ struct Translator {
         gm_eid_part_ = std::move(part_save);
         gm_eid_arr_ = std::move(arr_save);
         gm_eid_proofs_ = std::move(proofs_save);
+        gm_eid_lub_ = std::move(lub_save);
         gm_proven_comp_ = std::move(proven_save2);
         gm_neg_comp_ = std::move(neg_save2);
       }
@@ -18427,6 +18507,7 @@ struct Translator {
             auto part_save = gm_eid_part_;
             auto arr_save = gm_eid_arr_;
             auto proofs_save = gm_eid_proofs_;
+            auto lub_save = gm_eid_lub_;
             auto proven_save2 = gm_proven_comp_;
             auto neg_save2 = gm_neg_comp_;
             LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
@@ -18450,6 +18531,7 @@ struct Translator {
             gm_eid_part_ = std::move(part_save);
             gm_eid_arr_ = std::move(arr_save);
             gm_eid_proofs_ = std::move(proofs_save);
+            gm_eid_lub_ = std::move(lub_save);
             gm_proven_comp_ = std::move(proven_save2);
             gm_neg_comp_ = std::move(neg_save2);
             gm_orw_ = std::move(orw_save);
@@ -19418,6 +19500,7 @@ struct Translator {
         auto part_save = gm_eid_part_;
         auto arr_save = gm_eid_arr_;
         auto proofs_save = gm_eid_proofs_;
+        auto lub_save = gm_eid_lub_;
         auto proven_save2 = gm_proven_comp_;
         auto neg_save2 = gm_neg_comp_;
         LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
@@ -19455,6 +19538,7 @@ struct Translator {
         gm_eid_part_ = std::move(part_save);
         gm_eid_arr_ = std::move(arr_save);
         gm_eid_proofs_ = std::move(proofs_save);
+        gm_eid_lub_ = std::move(lub_save);
         gm_proven_comp_ = std::move(proven_save2);
         gm_neg_comp_ = std::move(neg_save2);
         gm_orw_ = std::move(orw_save);
@@ -19789,6 +19873,17 @@ struct Translator {
             if (!block_ci.count(ci->tag)) negb.insert(ci->tag);
           } else if (!const_ci.count(ci->tag)) negc.insert(ci->tag);
         }
+    // The lub form (GmLub): a gap tag no arrival can carry gets no clause.
+    if (!pv && !cppcaml::dbg_env("NOCTXLUB"))
+      if (auto lit = gm_lub_comp_.find(comps[0].get());
+          lit != gm_lub_comp_.end() && lit->second.type == type) {
+        for (int t = 0; t < NC; ++t)
+          if (!const_ci.count(t) && !lit->second.tags.count({false, t}))
+            negc.insert(t);
+        for (int t = 0; t < NB; ++t)
+          if (!block_ci.count(t) && !lit->second.tags.count({true, t}))
+            negb.insert(t);
+      }
     bool ctx_holes = !negc.empty() || !negb.empty();
     if (ctx_holes && cppcaml::dbg_env("CTXNEGDBG"))
       fprintf(stderr, "[CTXNEG] line=%d type=%s NC=%d NB=%d nc=%zu nb=%zu"
