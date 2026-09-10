@@ -190,3 +190,132 @@ must pin clang or gate the gcc build against the DDC corpus.
   error not skip, and a machine-readable report -- keeping the final byte
   comparison dumb and independent (`cmp`), since a trusting-trust argument
   should not rest on a comparator only the suspect toolchain can run.
+
+---
+
+# Juice side: the merge, and what it verified (2026-09-09/10)
+
+`burn/toolchain-determinism` (which contains `burn/testsuite`) merged into
+`cpp-rewrite` at `3bb5106d6c` -- 104 commits past the `5f4b62c7c2` these
+branches forked from, effid 138/139.  The merge is conflict-free; the only
+file both sides touched is `infer_check.cpp`, and only in line numbers.
+
+## 6. Verification of the merge
+
+**The two code changes are byte-neutral on the clang build.**  The 139-module
+DDC corpus compiled by the pre-merge and post-merge compilers is identical:
+**139/139 `.cmo` and 146/146 `.cmi` cmp-identical**.  So `4f33c8bb66`'s
+sequencing really does keep clang's order, as its message claimed, now measured
+against a compiler 104 commits further along.
+
+Every committed gate reproduces its `cpp-rewrite` value unchanged: effid
+138/139 (ctype the sole module, 496 diff lines), exec 722/722, DDC 139 .cmo +
+216 .cmi, stdlib-DDC 65+71, parse 1801/1801, typedtree 1014/1016, sig 688/692,
+cmi 1010/1034, lambda 502/744, false rejects 4, false accepts 38, sib_cmi 243,
+lint clean.
+
+Not run here: `testsuite_delta.sh` (see below) and `toolchain_determinism.sh`
+-- juice has **no system cmake/g++**; the gate stops with `env: 'cmake': No
+such file or directory / FATAL: cmake failed`, which is the honest answer, so
+it is left as written.  The nix `gcc-14.3.0` in the store is unwrapped and
+cannot link (`cannot find crt1.o`), so there is no second toolchain on this
+machine.  The gate remains burn's to run.
+
+## 7. `-nostdlib` now behaves like Bytelink -- one harness consequence
+
+`4e0b69014a` made `-nostdlib` stop suppressing the implicit `stdlib.cma` /
+`std_exit.cmo`.  The effid probe battery's own link line passed both
+explicitly, precisely because `-nostdlib` used to drop them:
+
+    c++ocamlc -nostdlib -I stdlib stdlib.cma <probe>.ml std_exit.cmo -o c.exe
+
+They are now linked twice.  It is harmless: `std_exit.cmo` is `let _ =
+do_at_exit ()`, and `at_exit` wraps every handler in an `f_yet_to_run` CAS
+(stdlib.ml:563-566), so the second pass re-runs the chain but fires nothing
+except an idempotent `flush_all`; the probes' `.cmo`, which is what the battery
+measures, is untouched.  The executable grows 32 bytes.  When the
+battery is rebuilt, drop the two explicit arguments: the oracle side of the
+same harness never passed them, so the two command lines finally match.
+
+No committed harness links with `c++ocamlc -nostdlib`; the bootstrap, DDC and
+stdlib-DDC link through `c++link`, which already had Bytelink's rule.
+
+## 8. Item 3a root-caused: an `include`d submodule alias is written absent
+
+`tests/basic-modules/main.ml` still prints a pointer-shaped integer where the
+reference says `1` (the value moves build to build).  Minimal reproducer, two
+files:
+
+    (* offset.ml *)
+    module M = struct type t = string module Set = Set.Make(String) end
+    include M
+
+    (* m2.ml *)
+    module F (M : sig type t module Set : Set.S with type elt = t end) =
+    struct let test set = Printf.printf "%d\n" (M.Set.cardinal set) end
+    module M = F (Offset)
+    let () = M.test (Offset.M.Set.singleton "42")
+
+The fault is **entirely in our `offset.cmi`**, and the cross-test says so:
+our `.cmi` + real `ocamlc` compiling `m2.ml` gives the wrong field, the
+oracle's `.cmi` + our compiler gives the right one.
+
+    ours:   module Set presence=ABSENT  type=alias M.Set
+    ocamlc: module Set presence=PRESENT type=alias M.Set
+
+`Printtyp.signature` prints the two signatures identically (57 lines, no diff)
+-- `md_presence` is invisible there, which is why cmi_parity's decoder never
+flagged it.  An `Mp_absent` module occupies no runtime field, so the consumer's
+coercion for `F (Offset)` skips it and selects field 0, the submodule `M`,
+instead of field 1, `Set`:
+
+    ours:   (makeblock 0 (field_mut 0 let/N))
+    ocamlc: (makeblock 0 (field_mut 1 let/N))
+
+`M.Set.cardinal` then reads a function out of the wrong block.  Note our own
+`offset.cmo` materializes the field correctly -- offset.ml's Lambda is
+identical to ocamlc's, `(makeblock 0 M (field_mut 0 M))` -- so **our .cmi and
+our .cmo disagree with each other**; the miscompile only appears in a consumer.
+
+The rule is narrower than "aliases": a *written* alias is absent on both sides
+and only `include` diverges.  Measured:
+
+| source | ours | ocamlc |
+|---|---|---|
+| `module Set = M.Set` (written) | ABSENT | ABSENT |
+| `module S = Stdlib.String` | ABSENT | ABSENT |
+| `module Alias = M.Inner` | ABSENT | ABSENT |
+| `include M` re-exporting `Set` | **ABSENT** | **PRESENT** |
+
+So the include path is copying the alias's presence instead of forcing
+`Mp_present`: `include` *copies* the item into the enclosing structure, which
+gives it a real field, whereas a written alias genuinely has none.  Fixing it
+is a one-rule change in the include path of the signature writer, and it wants
+a `md_presence` column in cmi_parity's decoder so the class stops being
+invisible.
+
+## 9. `/tmp` is volatile on juice -- confirmed twice
+
+Burn's warning is stronger here than written: `/tmp` was wiped **twice during
+this single session** (it is a per-`nix develop` tmpdir).  Everything cached
+there is gone each time: `/tmp/effid_ref`, `/tmp/sib_cmi`,
+`/tmp/ttp_oracle_cache`, `/tmp/exec_oracle_cache`, and the S420 effid probe
+battery (648 probes) with its pinned binary.  `cxx/build*` survive, being in
+the tree.
+
+Rebuild order after a wipe matters, and getting it wrong reports a fake
+regression rather than an error:
+
+1. `cxx/harness/sib_cmis.sh` **first** -- it builds `/tmp/sib_cmi`.
+2. `REBUILD_CACHE=1 cxx/harness/typedtree_parity.sh` -- the shared
+   `/tmp/ttp_oracle_cache`, which reject_parity and accept_parity also read.
+3. everything else.
+
+Run out of order, the oracle cache is built without the sibling cmis and the
+denominators silently collapse: typedtree 885/886 instead of 1014/1016, sig
+623/625, cmi 905/926, reject over 886 files instead of 1016, accept over 538
+instead of 408 with 168 "false accepts".  All five recovered exactly on a
+rebuild in the right order.
+
+This is the concrete argument for §5's last bullet: the probe batteries belong
+in the repo.
