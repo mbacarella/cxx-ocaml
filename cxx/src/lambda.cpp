@@ -15707,6 +15707,47 @@ struct Translator {
     }
     return eff;
   }
+  //   The conjunctive fact (GmNeg2) applied to the DEFAULT ENVIRONMENT, not
+  // just to the arm's own re-dispatch: inside this arm the fact's own head
+  // holds, so its partner head is refuted here, and an entry every row of
+  // which tests the partner column for that very constructor cannot be
+  // reached from this arm at all -- upstream's miss goes PAST it
+  // (`Context.matches p_ctx pss` against the entry's matrix,
+  // mk_failaction_pos).  ctype's `mcomp` (ctype.ml:2921): the `(Tconstr _,
+  // Tconstr _)` row above takes every value carrying both heads, so inside the
+  // `t1 = Tconstr` arm the `(_, Tconstr (_, [], _))` division below is dead,
+  // and the `tl1 <> []` miss of `(Tconstr (_, [], _), _)` lands on the row
+  // after it.  Columns are the ARM's (the caller shifts them past the payload
+  // it spread).  NONEG2DENV reverts this half alone; NOCTXNEG2 reverts the
+  // whole conjunctive rule with it.
+  using GmNegCols = std::vector<std::pair<int, const Pattern*>>;
+  void denv_neg2_prune(std::vector<GmDef>& env, const GmNegCols& negs) {
+    if (negs.empty() || cppcaml::dbg_env("NOCTXNEG2") ||
+        cppcaml::dbg_env("NONEG2DENV")) return;
+    std::vector<GmDef> out;
+    for (auto& f : env) {
+      GmDef nf{f.eid, {}, f.head_dropped, f.widened, f.colmap, f.proofs,
+               f.lubs};
+      for (auto& row : f.mat) {
+        bool dead = false;
+        for (auto& [col, opat] : negs) {
+          if (col < 0 || col >= (int)row.size()) continue;
+          const Pattern* p = gmdef_peel(row[col]);
+          if (gmdef_omega(p) ||
+              !std::get_if<Ppat_construct>(&p->desc)) continue;
+          const CtorInfo* oc = pat_ctor_resolve(opat, ctor_of(*opat));
+          if (!oc) continue;
+          const CtorInfo* ci = pat_ctor_resolve(p, ctor_of(*p), oc->type);
+          if (!ci || ci->type != oc->type) continue;
+          if (ci->is_block == oc->is_block && ci->tag == oc->tag)
+            { dead = true; break; }
+        }
+        if (!dead) nf.mat.push_back(row);
+      }
+      if (!nf.mat.empty()) out.push_back(std::move(nf));
+    }
+    env = std::move(out);
+  }
   void denv_ctx_prune(std::vector<GmDef>& env,
                       const std::vector<GmProof>& proofs) {
     if (proofs.empty() || cppcaml::dbg_env("NOCTXDEF")) return;
@@ -20266,6 +20307,26 @@ struct Translator {
         v.push_back({-1, -1, nullptr, opat});
       }
     };
+    //   The conjunctive facts LIVE here -- discharged by an enclosing arm, so
+    // they refute a partner head for everything under it (gm_neg_comp_ entries
+    // with col == -1 are the ones neg2_arm pushed).  A GAP tag's miss is
+    // routed by mk_failaction_pos, which reads the context, so its default
+    // environment drops the entries the facts make unreachable; a MATCHED
+    // tag's arm must keep them, because a guard failing under it falls through
+    // comp_exit, which pops the first entry without consulting any context.
+    // The arm frame drops column 0 and spreads `payload` columns in its place.
+    auto neg2_live = [&](int payload) {
+      GmNegCols v;
+      for (size_t j = 1; j < comps.size(); ++j) {
+        if (!comps[j]) continue;
+        auto it = gm_neg_comp_.find(comps[j].get());
+        if (it == gm_neg_comp_.end()) continue;
+        for (auto& n : it->second)
+          if (n.col == -1 && n.fld == -1 && !n.outer && n.pat)
+            v.push_back({(int)j - 1 + payload, n.pat});
+      }
+      return v;
+    };
     struct Neg2Pop {
       std::map<const Lam*, std::vector<GmNeg>>* m;
       std::vector<std::pair<const Lam*, size_t>>* v;
@@ -20297,6 +20358,7 @@ struct Translator {
       std::vector<LamPtr> cc = rest;
       std::vector<GmDef> de = denv;
       if (!denv_spec_ctor(de, type, /*is_block=*/false, t, 0, nullptr)) return nullptr;
+      if (!const_ci.count(t)) denv_neg2_prune(de, neg2_live(0));
       return gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(de));
     };
     // Build the body for one block tag t, expanding its `arity` fields as columns.
@@ -20320,13 +20382,14 @@ struct Translator {
         // or an env row's shape defeats the specialization.
         std::vector<GmDef> de = denv;
         bool precise = false;
+        int gshift = 0;
         if (const CtorInfo* gci = gap_block_ci(t)) {
           std::vector<GmDef> d2 = denv;
           const auto& rl = gci->rlabels;
           int ga = rl.empty() ? gci->arity : (int)rl.size();
           if (denv_spec_ctor(d2, type, /*is_block=*/true, t, ga,
                              rl.empty() ? nullptr : &rl)) {
-            de = std::move(d2); precise = true;
+            de = std::move(d2); precise = true; gshift = ga;
           }
         }
         if (cppcaml::dbg_env("GAPDBG"))
@@ -20334,6 +20397,7 @@ struct Translator {
                   type.c_str(), t, (int)(bool)gap_block_ci(t), (int)precise,
                   denv.size());
         if (!precise && !denv_pop_col(de)) return nullptr;
+        denv_neg2_prune(de, neg2_live(gshift));
         return gmatch(std::move(cc), std::move(sub), mloc, deid, std::move(de));
       }
       // Inline-record ctor (`K of { l1; l2 }`): the labels are the block's FLAT
