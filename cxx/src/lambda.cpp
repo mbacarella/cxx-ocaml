@@ -1038,6 +1038,19 @@ struct Translator {
   //   Set and restored unconditionally by every gmatch_top entry, so a nested
   // match compiled mid-construction can never see a stale license.
   int gm_tp_deid_ = -1;
+  // Holes the whole-match licence (`tp_all`, the ctor dispatch) dropped: each
+  // was an `(exit deid)` to the fake bottom before, and the attempt acceptance
+  // tests (`deid_fails`) still treat it as one -- a chunked, hoisted or
+  // pivoted reading is accepted for inventing no fail, and the drop must not
+  // launder one (simplif.ml's `enabled`: the relaxed or-reading's residual
+  // `local` re-test, which do_split proper avoids, came out fail-free).
+  int gm_tp_drops_ = 0;
+  // NOTPDROPS reverts the accounting alone (the licence stays).
+  int deid_fails(const LamPtr& r, int deid, int& bad, int drops_before) {
+    int n = count_exit(r, deid, false, bad);
+    if (!cppcaml::dbg_env("NOTPDROPS")) n += gm_tp_drops_ - drops_before;
+    return n;
+  }
   // Set while attempt_split's NO sub-matrix is compiled: inside it the arriving
   // tags are exactly the ones its default entry's matrix names (specialization
   // drops the entry for any other), so a nested split's body may lose a cell no
@@ -16984,6 +16997,7 @@ struct Translator {
             auto lub_save = gm_eid_lub_;
             auto proven_save2 = gm_proven_comp_;
             auto neg_save2 = gm_neg_comp_;
+            int drops_save = gm_tp_drops_;
             LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv, spec);
             bool own_dirty = false;
             if (spread_any)
@@ -16992,7 +17006,7 @@ struct Translator {
             if (r && !own_dirty) {
               int fbad = 0;
               if (deid != gm_fake_deid_ ||
-                  count_exit(r, deid, false, fbad) == 0) {
+                  deid_fails(r, deid, fbad, drops_save) == 0) {
                 gm_ctx_dirty_eids_.insert(dirty_save.begin(), dirty_save.end());
                 return r;
               }
@@ -18082,6 +18096,7 @@ struct Translator {
                   "tstart=%zu loc=%d deid=%d ptot=%d\n", oi, rows.size(),
                   alts.size(), (int)lead_ok_var, (int)any_lead_var,
                   (int)lead_ok_rx, tstart, mloc.start.lnum, deid, gm_ptot_deid_);
+        int drops_save = gm_tp_drops_;
         LamPtr res = lead_ok_var ? attempt_var(tstart)
                                  : attempt(tstart, true, lead_ok_rx);
         int fbad = 0;
@@ -18091,7 +18106,7 @@ struct Translator {
                   res ? "BUILT" : "NULL",
                   res ? count_exit(res, deid, false, fb2) : -1);
         }
-        if (res && count_exit(res, deid, false, fbad) == 0) return res;
+        if (res && deid_fails(res, deid, fbad, drops_save) == 0) return res;
         // Retract: every row is aid-shared here (guardfree), so the rejected
         // attempt emitted no arm body and leaves nothing but counter state.
         next_exit_ = exit_save; stamp = stamp_save;
@@ -18397,10 +18412,11 @@ struct Translator {
         std::swap(rc[0], rc[piv]);
         std::vector<MRow> rr = rows;
         for (auto& r : rr) std::swap(r.cols[0], r.cols[piv]);
+        int drops_save = gm_tp_drops_;
         LamPtr res = gmatch(std::move(rc), std::move(rr), mloc, deid, {});
         int fbad = 0;
         bool spurious = res && deid == gm_fake_deid_ &&
-                        count_exit(res, deid, false, fbad) > 0;
+                        deid_fails(res, deid, fbad, drops_save) > 0;
         if (res && !spurious) return res;
         next_exit_ = exit_save; stamp = stamp_save;
         gm_orw_ = std::move(orw_save); gm_ctx_dirty_eids_ = std::move(dirty_save);
@@ -18510,6 +18526,7 @@ struct Translator {
             auto lub_save = gm_eid_lub_;
             auto proven_save2 = gm_proven_comp_;
             auto neg_save2 = gm_neg_comp_;
+            int drops_save = gm_tp_drops_;
             LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
                     [](const Pattern* p) {
                       return std::get_if<Ppat_record>(&p->desc) != nullptr;
@@ -18521,7 +18538,7 @@ struct Translator {
             if (r && !own_dirty) {
               int fbad = 0;
               if (deid != gm_fake_deid_ ||
-                  count_exit(r, deid, false, fbad) == 0) {
+                  deid_fails(r, deid, fbad, drops_save) == 0) {
                 gm_ctx_dirty_eids_.insert(dirty_save.begin(), dirty_save.end());
                 return r;
               }
@@ -19503,6 +19520,7 @@ struct Translator {
         auto lub_save = gm_eid_lub_;
         auto proven_save2 = gm_proven_comp_;
         auto neg_save2 = gm_neg_comp_;
+        int drops_save = gm_tp_drops_;
         LamPtr r = gmatch_run_chunks(comps, rows, mloc, deid, denv,
                 [](const Pattern* p) {
                   return std::get_if<Ppat_construct>(&p->desc) != nullptr;
@@ -19528,7 +19546,8 @@ struct Translator {
           // back to the spread path, whose per-case row copies specialize
           // those misses away by construction.
           int fbad = 0;
-          if (deid != gm_fake_deid_ || count_exit(r, deid, false, fbad) == 0) {
+          if (deid != gm_fake_deid_ ||
+              deid_fails(r, deid, fbad, drops_save) == 0) {
             gm_ctx_dirty_eids_.insert(dirty_save.begin(), dirty_save.end());
             return r;
           }
@@ -20201,18 +20220,32 @@ struct Translator {
       bool const_hole = false;
       for (auto& c : consts) if (is_hole(c.body)) { const_hole = true; break; }
       static const bool no_gadtrow = std::getenv("NOGADTROW") != nullptr;
+      // A PROVEN-total match has no bottom default entry at all: upstream's
+      // Total compile_matching starts from Default_environment.empty, and
+      // mk_failaction_pos (matching.ml:2997) assigns a missing constructor a
+      // clause only from a compatible default entry -- so a gap whose miss
+      // has no surviving entry gets no clause at ANY dispatch of the match,
+      // const or block, root or nested (ctype's unify_row_field tail: the
+      // last division `Reither (true, _::_, _), Rpresent _ | Rpresent _,
+      // Reither (true, _::_, _)` collapses to its action).  The root-only and
+      // all-constant licences below remain the hoisting (gm_tp_deid_ without
+      // gm_ptot_deid_) reading's.  NOTPALL reverts.
+      bool tp_all = deid == gm_ptot_deid_ && !cppcaml::dbg_env("NOTPALL");
       if (!const_hole) {
         size_t nb0 = blocks.size();
         drop_holes(blocks);
         tp_holes = blocks.size() != nb0;
-      } else if (!no_gadtrow && comps[0]->k == Lam::K::Var &&
-                 (comps[0]->var.stamp == gm_tp_root_ ||
-                  (gm_div_total_ && NB == 0))) {
+      } else if (tp_all ||
+                 (!no_gadtrow && comps[0]->k == Lam::K::Var &&
+                  (comps[0]->var.stamp == gm_tp_root_ ||
+                   (gm_div_total_ && NB == 0)))) {
         // A refuted CONSTANT ctor's hole drops too (upstream's sparse Lswitch
         // stores no cell for it: types.ml's row_field_repr_aux with RFnone
-        // refuted) -- but only on the switch over the match's ROOT scrutinee
-        // (gm_tp_root_): an inner or-split switcher's deid cells are live
-        // routing fails upstream keeps (simplif.ml's `enabled`).
+        // refuted).  Without the whole-match proof only on the switch over
+        // the match's ROOT scrutinee (gm_tp_root_): an inner or-split
+        // switcher's deid cells are the fails the attempt acceptance tests
+        // read (simplif.ml's `enabled` -- now what gm_tp_drops_ keeps
+        // visible to them under tp_all).
         //   A Total last division (gm_div_total_) drops one off-root too, but
         // only on an ALL-CONSTANT column.  There combine_regular_constructor
         // takes its `n, 0, _, []` branch straight to call_switcher over the
@@ -20222,10 +20255,19 @@ struct Translator {
         // instead re-decides the isint/Lswitch split and reintroduce_fail's
         // canfail shape -- ctype's unify_row_field keeps the fail branch its
         // `Reither(true, [], _)` test falls through to.
+        bool old_lic = !no_gadtrow && comps[0]->k == Lam::K::Var &&
+                       (comps[0]->var.stamp == gm_tp_root_ ||
+                        (gm_div_total_ && NB == 0));
         size_t nc0 = consts.size(), nb0 = blocks.size();
         drop_holes(consts);
         drop_holes(blocks);
         tp_holes = consts.size() != nc0 || blocks.size() != nb0;
+        // Only the whole-match licence's own drops are counted (gm_tp_drops_):
+        // an attempt is accepted for having invented no fail, not for having
+        // had one erased, so the acceptance tests see these as the exits
+        // they replaced.
+        if (tp_holes && !old_lic)
+          gm_tp_drops_ += (int)(nc0 - consts.size()) + (int)(nb0 - blocks.size());
       }
     }
     // Assemble, mirroring ctor_match's shape choices (option/list stay an `if`).
