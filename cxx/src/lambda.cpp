@@ -4393,6 +4393,11 @@ struct Translator {
     return "";
   }
   std::unordered_map<std::string, SubMod> submod_cache_;
+  // Keys whose ALIAS re-root is in progress.  The self-rooted retries below
+  // keep the same head, so a cyclic alias (`include` chains that strengthen a
+  // member onto a path leading back through itself) would recurse forever --
+  // submod_cache_ is only written on RETURN, so it cannot break the cycle.
+  std::set<std::string> submod_reroot_;
   // local alias name -> stdlib submodule dotted path (`module MP = Gc.Memprof`)
   std::unordered_map<std::string, std::string> submod_alias_;
   // ... and the same for an alias whose target is a module of THIS unit
@@ -4441,18 +4446,47 @@ struct Translator {
           if (sig->fields[i] == comp) { ix = (int)i; break; }
         const cmi::ModuleDecl* md = nullptr;
         for (auto& mm : sig->modules) if (mm.name == comp) { md = &mm; break; }
-        // A submodule ALIAS (`module Uid = Shape.Uid`) takes no field (Mp_absent,
-        // ix < 0) and resolves to ITS target unit.  Expand the path to the alias
-        // target plus the remaining components and resolve THAT, recording the
-        // target's head as the base global so member reads start from it.
+        // A submodule ALIAS resolves to ITS target unit -- but ONLY when it is
+        // Mp_absent, which is exactly `ix < 0`: an absent module has no field
+        // in its container, so the read has to start from the target instead.
+        // An alias the typer STRENGTHENED (`include M` re-exporting a
+        // submodule, Mp_present -- see SigItem::alias_present) does occupy a
+        // field, and re-rooting it read the wrong block: `U.Set.cardinal`
+        // through such a member left unresolved binders and segfaulted.
+        // mt_sig_x follows the alias for that case.  NOALIASFIELD reverts.
+        static const bool no_alias_field = cppcaml::dbg_env("NOALIASFIELD");
         if (md && md->type && md->type->kind == cmi::ModuleType::Alias &&
-            md->type->path) {
+            md->type->path && (ix < 0 || no_alias_field)) {
           std::string tgt = cmi_path_dotted(*md->type->path);
+          std::string rest = (nd == std::string::npos) ? "" : dotted.substr(nd);
           if (!tgt.empty() && tgt.find('.') != std::string::npos) {
-            std::string rest = (nd == std::string::npos) ? "" : dotted.substr(nd);
             SubMod r = submodule_of(tgt + rest);  // resolve the real path
             if (r.ok && r.base.empty()) r.base = tgt.substr(0, tgt.find('.'));
+            // A dotted target whose HEAD is a sibling rather than a unit
+            // (`module Set = M.Set` beside `module M = struct .. end`) does
+            // not resolve as a global; re-root it in the container, as the
+            // typing env would.  Global first, so a real unit still wins.
+            std::string sib = dotted.substr(0, pos) + tgt + rest;
+            if (!r.ok && !no_alias_field && sib != dotted &&
+                submod_reroot_.insert(dotted).second) {
+              SubMod l = submodule_of(sib);
+              submod_reroot_.erase(dotted);
+              if (l.ok) return submod_cache_[dotted] = std::move(l);
+            }
             return submod_cache_[dotted] = std::move(r);
+          }
+          // A BARE target names a SIBLING of the alias in the same container
+          // (`module Ali = Inner` beside `module Inner = ..`), so the re-root
+          // is the container's own path plus the target -- not a unit global.
+          // `include M` carries such an alias out verbatim, and reading it as
+          // a global left `S.Ali.v` pointing at the field AFTER the one it
+          // names (7 9 9 where ocamlc says 7 7 9).
+          std::string sib0 = dotted.substr(0, pos) + tgt + rest;
+          if (!tgt.empty() && !no_alias_field && sib0 != dotted &&
+              submod_reroot_.insert(dotted).second) {
+            SubMod r = submodule_of(sib0);
+            submod_reroot_.erase(dotted);
+            if (r.ok) return submod_cache_[dotted] = std::move(r);
           }
         }
         // a submodule whose type is a NAMED module type (`Digest.MD5 : S`)
@@ -4864,6 +4898,36 @@ struct Translator {
                                  int depth = 0) {
     if (!mt || depth > 8) return nullptr;
     if (mt->kind == cmi::ModuleType::Sig) return mt->sig.get();
+    // Mty_alias: follow it.  An alias member that is Mp_PRESENT still occupies
+    // a field of its container (Mtype.strengthen keeps the presence -- see
+    // SigItem::alias_present), so the READ is `field ix`, and to navigate any
+    // further component we need the TARGET's signature here rather than a
+    // re-rooted path.  The target is either a unit global (`Stdlib__Set`) or a
+    // submodule of this same cmi (`M.Set`, what `include M` strengthens to).
+    if (mt->kind == cmi::ModuleType::Alias && mt->path) {
+      std::string tgt = cmi_path_dotted(*mt->path);
+      if (tgt.empty()) return nullptr;
+      size_t d = tgt.find('.');
+      std::string head = d == std::string::npos ? tgt : tgt.substr(0, d);
+      const cmi::Signature* sg = nullptr;
+      for (auto& mm : cmi.sig().modules)          // a submodule of THIS unit
+        if (mm.name == head) { sg = mt_sig_x(cmi, mm.type, keep, depth + 1); break; }
+      const cmi::CmiFile* owner = &cmi;
+      if (!sg) try {                              // else a separate unit
+        auto sub = std::make_shared<cmi::CmiFile>(cmi::CmiFile::load(resolve_cmi(head)));
+        keep.push_back(sub); owner = sub.get(); sg = &sub->sig();
+      } catch (...) { return nullptr; }
+      for (size_t p = d; sg && p != std::string::npos;) {
+        size_t nd = tgt.find('.', p + 1);
+        std::string comp = tgt.substr(p + 1, nd == std::string::npos ? std::string::npos
+                                                                     : nd - p - 1);
+        const cmi::Signature* nx = nullptr;
+        for (auto& mm : sg->modules)
+          if (mm.name == comp) { nx = mt_sig_x(*owner, mm.type, keep, depth + 1); break; }
+        sg = nx; p = nd;
+      }
+      return sg;
+    }
     if (mt->kind == cmi::ModuleType::Ident && mt->path) {
       if (mt->path->kind == cmi::Path::Pident) {
         for (auto& md : cmi.sig().modtypes)
@@ -34348,6 +34412,24 @@ struct Translator {
           // `(function prim stub (Mod.prim prim))`)
           StdPrim sp = value_prim(arg_mod, nm);
           if (!sp.name.empty()) if (LamPtr s = prim_stub(sp)) { fs.push_back(s); continue; }
+          // An ABSENT module member -- `module Set = M.Set` is Mp_absent and
+          // has no field of its own -- is what upstream's Tcoerce_alias
+          // re-reads through the alias TARGET, so the coercion's field is the
+          // target's own access path (`field_imm 0 (field_mut 0 S)`, not the
+          // field-0 last resort below, which handed the functor the wrong
+          // submodule).  NOALIASFIELD reverts.
+          if (!cppcaml::dbg_env("NOALIASFIELD")) {
+            const SubMod& am = submodule_of(arg_mod + "." + nm);
+            if (am.ok && !am.path.empty()) {
+              LamPtr acc = src;
+              for (size_t k = 0; k < am.path.size(); ++k) {
+                auto fr = mk(Lam::K::Prim);
+                fr->prim = k == 0 ? Prim::FieldMut : Prim::FieldImm;
+                fr->prim_arg = am.path[k]; fr->args = {acc}; acc = fr;
+              }
+              fs.push_back(acc); continue;
+            }
+          }
         }
         if (idx < 0) idx = 0;  // last-resort (unknown value): field 0 as before
         auto fr = mk(Lam::K::Prim); fr->prim = Prim::FieldMut; fr->prim_arg = idx; fr->args = {src};
