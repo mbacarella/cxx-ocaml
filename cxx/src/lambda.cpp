@@ -15676,6 +15676,37 @@ struct Translator {
   // re-dispatch with, so this is the other half of one rule and fires under the
   // same guard (every tracked arrival agreed, and the tracked count matches the
   // exits actually in the tree).  NOCTXDEF reverts.
+  //   The column facts a handler may compile under: the arrivals' proof
+  // INTERSECTION, plus every lub column whose union came out with exactly ONE
+  // constructor.  A one-element union IS a proof -- every arrival stands in a
+  // context where the column holds that constructor, which is all
+  // `gm_proven_comp_` ever states -- and the two only ever differ once a fact
+  // can be INHERITED rather than established here (S429's entry-carried ctx):
+  // an arrival that misses before ever testing the column proves nothing
+  // itself, yet the handler it sits in had the column proven for it.
+  // moregen_row's `Reither _, Rpresent _` division (ctype.ml:4831) is exactly
+  // that -- the `tl1 <> []` miss never reaches f2 -- and upstream's handler is
+  // the bare arm where ours re-tested `isint f2` to tell it from the `_,
+  // Rabsent` row below.  NOLUB1 reverts.
+  std::vector<GmProof> gm_ctx_proofs(int eid, bool ctx_ok) {
+    std::vector<GmProof> eff;
+    if (auto pit = gm_eid_proofs_.find(eid); pit != gm_eid_proofs_.end())
+      eff = pit->second;
+    if (!ctx_ok || cppcaml::dbg_env("NOLUB1") || cppcaml::dbg_env("NOCTXLUB"))
+      return eff;
+    auto lit = gm_eid_lub_.find(eid);
+    if (lit == gm_eid_lub_.end()) return eff;
+    for (auto& [col, L] : lit->second) {
+      if (L.tags.size() != 1) continue;
+      bool have = false;
+      for (auto& pf : eff)
+        if (pf.sub < 0 && pf.col == col) { have = true; break; }
+      if (!have)
+        eff.push_back({col, L.type, L.tags.begin()->first,
+                       L.tags.begin()->second});
+    }
+    return eff;
+  }
   void denv_ctx_prune(std::vector<GmDef>& env,
                       const std::vector<GmProof>& proofs) {
     if (proofs.empty() || cppcaml::dbg_env("NOCTXDEF")) return;
@@ -16376,20 +16407,27 @@ struct Translator {
             if (!p1 || !p2) continue;
             gm_neg2_.push_back({comps[c1].get(), p1, comps[c2].get(), p2});
           }
+      auto lubc_save = gm_lub_comp_;
+      bool ctx_ok = false;
+      {
+        auto ait = gm_eid_arr_.find(eids[k]);
+        int lbad = 0;
+        ctx_ok = ait != gm_eid_arr_.end() && ait->second > 0 &&
+                 count_exit(res, eids[k], false, lbad) == ait->second;
+      }
+      std::vector<GmProof> eff = gm_ctx_proofs(eids[k], ctx_ok);
       bool pf_here = false;
       {
         auto pit = gm_eid_proofs_.find(eids[k]);
         auto ait = gm_eid_arr_.find(eids[k]);
         int pbad = 0;
         if (cppcaml::dbg_env("GMPFDBG"))
-          fprintf(stderr, "[GMPF] eid=%d proofs=%zd arr=%d exits=%d\n", eids[k],
+          fprintf(stderr, "[GMPF] eid=%d proofs=%zd eff=%zu arr=%d exits=%d\n",
+                  eids[k],
                   pit == gm_eid_proofs_.end() ? -1 : (long)pit->second.size(),
-                  ait == gm_eid_arr_.end() ? -1 : ait->second,
+                  eff.size(), ait == gm_eid_arr_.end() ? -1 : ait->second,
                   count_exit(res, eids[k], false, pbad));
-        if (pit != gm_eid_proofs_.end() && !pit->second.empty() &&
-            ait != gm_eid_arr_.end() && ait->second > 0 &&
-            count_exit(res, eids[k], false, pbad) == ait->second &&
-            !cppcaml::dbg_env("GMNOPROOF")) {
+        if (!eff.empty() && ctx_ok && !cppcaml::dbg_env("GMNOPROOF")) {
           if (cppcaml::dbg_env("GMPFDBG")) {
             std::string ck2;
             for (auto& c : comps)
@@ -16398,7 +16436,7 @@ struct Translator {
                     mloc.start.lnum, ck2.c_str());
           }
           std::set<int> selfed;
-          for (auto& pf : pit->second)
+          for (auto& pf : eff)
             if (pf.sub < 0 && pf.col >= 0 && pf.col < (int)comps.size()) {
               gm_proven_comp_.insert_or_assign(comps[pf.col].get(),
                                                GmProven{pf, {}});
@@ -16420,15 +16458,8 @@ struct Translator {
       }
       // Context.lub (GmLub): the arrivals did not all prove the same
       // constructor, but every one proved SOME constructor at the column, so
-      // the handler's dispatch of it drops every gap tag outside the union.
-      auto lubc_save = gm_lub_comp_;
-      bool ctx_ok = false;
-      {
-        auto ait = gm_eid_arr_.find(eids[k]);
-        int lbad = 0;
-        ctx_ok = ait != gm_eid_arr_.end() && ait->second > 0 &&
-                 count_exit(res, eids[k], false, lbad) == ait->second;
-      }
+      // the handler's dispatch of it drops every gap tag outside the union
+      // (the ONE-tag case went to gm_proven_comp_ above).
       if (!cppcaml::dbg_env("NOCTXLUB")) {
         auto lit = gm_eid_lub_.find(eids[k]);
         if (lit != gm_eid_lub_.end() && ctx_ok)
@@ -16451,10 +16482,7 @@ struct Translator {
           if (!pat_omega_like(r.cols[i])) untested[i] = 0;
       gm_div_total_ = dt_last && k + 1 == groups.size();
       std::vector<GmDef> henv = env_from(k + 1);
-      if (pf_here) {
-        auto pit = gm_eid_proofs_.find(eids[k]);
-        if (pit != gm_eid_proofs_.end()) denv_ctx_prune(henv, pit->second);
-      }
+      if (pf_here) denv_ctx_prune(henv, eff);
       //   This handler's OWN arrival context travels on to the entries it can
       // still exit to: they are entries of this same frame (env_from's
       // identity colmap), so the column indices carry over as they are.  The
