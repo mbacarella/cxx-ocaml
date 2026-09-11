@@ -6,13 +6,16 @@
 // plus the TOC trailer the runtime reads.
 #include "cppcaml/link.hpp"
 #include "cppcaml/cmi.hpp"
+#include "cppcaml/builtin_prims.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -92,7 +95,7 @@ ValPtr conv(const m::Arena& a, std::size_t id) {
   switch (v.kind) {
     case m::Value::Kind::Int:
       if (!v.custom_raw().empty())  // a boxed int32/int64/nativeint literal
-        return omarshal::vcustom(v.custom_raw(), 1 + (v.custom_bsize() + 7) / 8);
+        return omarshal::vcustom(v.custom_raw(), v.custom_bsize());
       return omarshal::vint(v.i);
     case m::Value::Kind::String: return omarshal::vstr(v.str());
     case m::Value::Kind::Double: return omarshal::vdbl(v.d());
@@ -215,6 +218,19 @@ struct Symtable {
     int n = (int)prim_order.size(); prims[name] = n; prim_order.push_back(name); return n;
   }
 
+  //   Symtable.init enters the WHOLE runtime primitive table before any
+  // relocation is patched (symtable.ml:279, `Array.iter set_prim_table
+  // Runtimedef.builtin_primitives`), so a builtin's number is its index in
+  // that table and never depends on what the program uses; a primitive the
+  // runtime does not export -- a C stub -- is appended after them by of_prim,
+  // which is num_of_prim's fallthrough.  Numbering only the used ones instead
+  // gave every C_CALL a different operand AND a short PRIM section (55 names
+  // where upstream writes all 482), which is why no linked program ever
+  // matched byte-for-byte.  NOBUILTINPRIMS reverts to the old numbering.
+  void init_prims() {
+    if (std::getenv("NOBUILTINPRIMS")) return;
+    for (const char* name : kBuiltinPrimitives) of_prim(name);
+  }
   void init_predef() {
     int i = 0;
     for (const char* name : kBuiltinExceptions) {
@@ -240,6 +256,7 @@ void put_be32(std::vector<std::uint8_t>& v, std::uint32_t n) {
 void link_executable(const std::vector<std::string>& inputs,
                      const std::string& out_path, const std::string& runtime_path) {
   Symtable st;
+  st.init_prims();
   st.init_predef();
 
   // Read every input file (each is a .cmo or a .cma).
@@ -319,6 +336,121 @@ void link_executable(const std::vector<std::string>& inputs,
   for (auto& [slot, v] : st.literals) globals[slot] = v;
   std::vector<std::uint8_t> data = omarshal::marshal(omarshal::vblock(0, std::move(globals)));
 
+  //   SYMB: the global map, `output_value oc !global_table` (symtable.ml:321)
+  // -- a `{cnt : int; tbl : int Global.Map.t}` record.  `Global.Map` is
+  // `Map.Make`, so the value marshalled is the AVL TREE ITSELF (`Empty` = 0,
+  // `Node {l; v; d; r; h}` = a 5-field block), whose shape depends on the
+  // ORDER the keys were added in.  Slots are handed out by `enter` at insert
+  // time, so slot order IS insertion order and replaying it rebuilds
+  // upstream's exact tree -- which is also why this can only be written once
+  // the slot numbering already matches (it does: DATA, the array indexed by
+  // slot, is byte-identical).  A literal's slot comes from `incr`, which bumps
+  // the counter WITHOUT adding to the table, and is skipped here.
+  //   The key is `Glob_compunit of compunit | Glob_predef of predef` with both
+  // payloads `[@@unboxed]` (cmo_format.mli:22,26), so a key is a 1-field block
+  // holding the name string, tag 0 for a unit and tag 1 for a predef -- and
+  // the map's ordering is the POLYMORPHIC compare, which orders by tag first
+  // and then by the string.  NOSYMBSECT drops the section again.
+  std::vector<std::pair<std::string, int>> gslots;   // (key, slot), slot order
+  for (auto& [key, slot] : st.globals) gslots.push_back({key, slot});
+  std::sort(gslots.begin(), gslots.end(),
+            [](auto& a, auto& b) { return a.second < b.second; });
+  struct Node {                                 // stdlib/map.ml's 'a t
+    std::shared_ptr<Node> l, r;
+    bool predef; std::string name;              // the key
+    int d; int h;
+  };
+  using NPtr = std::shared_ptr<Node>;
+  auto height = [](const NPtr& n) { return n ? n->h : 0; };
+  // `compare` on Global.t: tag first (Glob_compunit = 0 before Glob_predef),
+  // then the payload string.
+  auto keycmp = [](bool ap, const std::string& an, bool bp,
+                   const std::string& bn) {
+    if (ap != bp) return ap ? 1 : -1;
+    return an.compare(bn) < 0 ? -1 : (an == bn ? 0 : 1);
+  };
+  std::function<NPtr(NPtr, bool, const std::string&, int, NPtr)> create =
+      [&](NPtr l, bool p, const std::string& v, int d, NPtr r) {
+        auto n = std::make_shared<Node>();
+        n->l = std::move(l); n->r = std::move(r);
+        n->predef = p; n->name = v; n->d = d;
+        n->h = (height(n->l) >= height(n->r) ? height(n->l) : height(n->r)) + 1;
+        return n;
+      };
+  // map.ml's `bal`, verbatim -- the rotations decide the tree's shape and so
+  // its marshalled bytes.
+  std::function<NPtr(NPtr, bool, const std::string&, int, NPtr)> bal =
+      [&](NPtr l, bool p, const std::string& v, int d, NPtr r) -> NPtr {
+        int hl = height(l), hr = height(r);
+        if (hl > hr + 2) {
+          if (height(l->l) >= height(l->r))
+            return create(l->l, l->predef, l->name, l->d,
+                          create(l->r, p, v, d, std::move(r)));
+          NPtr lr = l->r;
+          return create(create(l->l, l->predef, l->name, l->d, lr->l),
+                        lr->predef, lr->name, lr->d,
+                        create(lr->r, p, v, d, std::move(r)));
+        }
+        if (hr > hl + 2) {
+          if (height(r->r) >= height(r->l))
+            return create(create(std::move(l), p, v, d, r->l),
+                          r->predef, r->name, r->d, r->r);
+          NPtr rl = r->l;
+          return create(create(std::move(l), p, v, d, rl->l),
+                        rl->predef, rl->name, rl->d,
+                        create(rl->r, r->predef, r->name, r->d, r->r));
+        }
+        return create(std::move(l), p, v, d, std::move(r));
+      };
+  std::function<NPtr(NPtr, bool, const std::string&, int)> madd =
+      [&](NPtr t, bool p, const std::string& v, int d) -> NPtr {
+        if (!t) return create(nullptr, p, v, d, nullptr);
+        int c = keycmp(p, v, t->predef, t->name);
+        if (c == 0) return create(t->l, p, v, d, t->r);
+        if (c < 0) return bal(madd(t->l, p, v, d), t->predef, t->name, t->d, t->r);
+        return bal(t->l, t->predef, t->name, t->d, madd(t->r, p, v, d));
+      };
+  NPtr groot;
+  for (auto& [key, slot] : gslots)
+    groot = madd(groot, key.rfind("P:", 0) == 0, key.substr(2), slot);
+  std::function<ValPtr(const NPtr&)> tval = [&](const NPtr& n) -> ValPtr {
+    if (!n) return omarshal::vint(0);                       // Empty
+    return omarshal::vblock(0, {tval(n->l),
+                                omarshal::vblock(n->predef ? 1 : 0,
+                                                 {omarshal::vstr(n->name)}),
+                                omarshal::vint(n->d), tval(n->r),
+                                omarshal::vint(n->h)});
+  };
+  std::vector<std::uint8_t> symb;
+  if (!std::getenv("NOSYMBSECT"))
+    symb = omarshal::marshal(
+        omarshal::vblock(0, {omarshal::vint(st.cnt), tval(groot)}));
+
+  //   CRCS: `output_value outchan (extract_crc_interfaces())` (bytelink.ml:647)
+  // -- a `(modname * Digest.t option) list` over every interface any linked
+  // unit imported.  Consistbl.extract sort_uniq's the names and then folds
+  // with `::`, so the list comes out in DESCENDING name order (consistbl.ml:61).
+  // A name recorded with no digest stays `None`.  NOCRCSSECT drops it again.
+  std::map<std::string, std::string> crcs;   // name -> digest ("" = None)
+  for (const InputFile& fi : files)
+    for (const Unit& u : fi.units) {
+      if (!u.selected) continue;
+      for (auto& [nm, crc] : u.imports) {
+        auto it = crcs.find(nm);
+        if (it == crcs.end()) crcs.emplace(nm, crc);
+        else if (it->second.empty()) it->second = crc;
+      }
+    }
+  std::vector<ValPtr> crcl;                  // built in DESCENDING order
+  for (auto it = crcs.rbegin(); it != crcs.rend(); ++it)
+    crcl.push_back(omarshal::vblock(
+        0, {omarshal::vstr(it->first),
+            it->second.empty() ? omarshal::vint(0)
+                               : omarshal::vblock(0, {omarshal::vstr(it->second)})}));
+  std::vector<std::uint8_t> crcsec;
+  if (!std::getenv("NOCRCSSECT"))
+    crcsec = omarshal::marshal(omarshal::vlist(crcl));
+
   // PRIM: required C-primitive names, NUL-terminated, in numbering order.
   std::vector<std::uint8_t> prim;
   for (auto& name : st.prim_order) { prim.insert(prim.end(), name.begin(), name.end()); prim.push_back(0); }
@@ -344,7 +476,7 @@ void link_executable(const std::vector<std::string>& inputs,
       }
   }
 
-  // ---- assemble the executable: [shebang] CODE PRIM DATA + TOC + trailer ----
+  // ---- assemble: [shebang] CODE DLLS PRIM DATA SYMB CRCS + TOC + trailer ----
   std::vector<std::uint8_t> out;
   if (!runtime_path.empty()) {
     std::string sh = "#!" + runtime_path + "\n";
@@ -354,6 +486,8 @@ void link_executable(const std::vector<std::string>& inputs,
   if (!dlls.empty()) out.insert(out.end(), dlls.begin(), dlls.end());
   out.insert(out.end(), prim.begin(), prim.end());
   out.insert(out.end(), data.begin(), data.end());
+  out.insert(out.end(), symb.begin(), symb.end());
+  out.insert(out.end(), crcsec.begin(), crcsec.end());
   auto section = [&](const char* nm, std::size_t len) {
     out.insert(out.end(), nm, nm + 4); put_be32(out, (std::uint32_t)len);
   };
@@ -363,6 +497,8 @@ void link_executable(const std::vector<std::string>& inputs,
   if (!dlls.empty()) { section("DLLS", dlls.size()); ++nsec; }
   section("PRIM", prim.size());
   section("DATA", data.size());
+  if (!symb.empty()) { section("SYMB", symb.size()); ++nsec; }
+  if (!crcsec.empty()) { section("CRCS", crcsec.size()); ++nsec; }
   put_be32(out, nsec);  // number of sections
   const char* magic = "Caml1999X038";
   out.insert(out.end(), magic, magic + 12);

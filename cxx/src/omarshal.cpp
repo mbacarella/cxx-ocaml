@@ -1,9 +1,22 @@
+#include <cstdlib>
 #include "cppcaml/omarshal.hpp"
 
 #include <cstring>
 #include <unordered_map>
 
 namespace cppcaml::omarshal {
+
+//   A marshalled block header carries the source object's COLOUR bits as well
+// as its size and tag: extern.c builds it with `Make_header(sz, tag,
+// NOT_MARKABLE)` (extern.c:610), and NOT_MARKABLE is `3 << HEADER_COLOR_SHIFT`
+// = 0x300 (shared_heap.h:75).  Writing 0 there is read back identically -- the
+// intern side masks the colour off -- but it is not the same BYTES, which is
+// what a linked executable is compared on.
+// NOMARSHALHDR reverts both this and the custom-block word accounting below.
+inline std::uint32_t hdr_color() {
+  static const std::uint32_t c = std::getenv("NOMARSHALHDR") ? 0u : 3u << 8;
+  return c;
+}
 
 ValPtr vint(long long n) { auto v = std::make_shared<Value>(); v->k = Value::Int; v->i = n; return v; }
 ValPtr vstr(std::string s) { auto v = std::make_shared<Value>(); v->k = Value::Str; v->s = std::move(s); return v; }
@@ -14,8 +27,9 @@ ValPtr vblock(int tag, std::vector<ValPtr> f) {
 ValPtr vdblarr(std::vector<double> ds) {
   auto v = std::make_shared<Value>(); v->k = Value::DblArr; v->darr = std::move(ds); return v;
 }
-ValPtr vcustom(std::string raw, long long words) {
-  auto v = std::make_shared<Value>(); v->k = Value::Custom; v->s = std::move(raw); v->custom_words = words; return v;
+ValPtr vcustom(std::string raw, long long data_bytes) {
+  auto v = std::make_shared<Value>(); v->k = Value::Custom; v->s = std::move(raw);
+  v->custom_bytes = data_bytes; return v;
 }
 ValPtr vlist(const std::vector<ValPtr>& xs) {
   ValPtr acc = vint(0);  // []
@@ -64,7 +78,7 @@ struct Marshaler {
     // bits spill into the size nibble and the reader sees a non-empty block.
     if (v->k == Value::Block && v->fields.empty()) {
       if (v->tag < 16) byte(0x80 | v->tag);
-      else { byte(0x8); be32((std::uint32_t)v->tag); }  // CODE_BLOCK32, size 0
+      else { byte(0x8); be32(hdr_color() | (std::uint32_t)v->tag); }   // size 0
       return;
     }
     // a sharable object already serialized -> a back-reference (objs[nobjs-dist])
@@ -83,7 +97,9 @@ struct Marshaler {
       case Value::Block: {
         int size = (int)v->fields.size();
         if (v->tag < 16 && size < 8) byte(0x80 | v->tag | (size << 4));
-        else { byte(0x8); be32(((std::uint32_t)size << 10) | (std::uint32_t)v->tag); }
+        else { byte(0x8);
+               be32(((std::uint32_t)size << 10) | hdr_color() |
+                    (std::uint32_t)v->tag); }
         nobjs++; w64 += 1 + size; w32 += 1 + size;
         for (auto& f : v->fields) emit(f);
         return;
@@ -101,7 +117,14 @@ struct Marshaler {
       }
       case Value::Custom: {  // verbatim on-disk custom bytes (incl. its code byte)
         for (char c : v->s) byte((std::uint8_t)c);
-        nobjs++; w64 += 1 + v->custom_words; w32 += 1 + v->custom_words;
+        nobjs++;                                  // extern.c:858 (header + ops)
+        if (std::getenv("NOMARSHALHDR")) {
+          long long words = 1 + (v->custom_bytes + 7) / 8;
+          w32 += 1 + words; w64 += 1 + words;
+        } else {
+          w32 += 2 + ((v->custom_bytes + 3) >> 2);
+          w64 += 2 + ((v->custom_bytes + 7) >> 3);
+        }
         return;
       }
     }

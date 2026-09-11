@@ -20,7 +20,11 @@ struct Value {
   int tag = 0;
   std::vector<ValPtr> fields;
   std::vector<double> darr;
-  long long custom_words = 0;  // Custom: in-memory size in words (for the header)
+  // Custom: the DATA size in bytes, as the serializer wrote it.  extern.c sizes
+  // a custom block as `2 + ((sz + wordsize - 1) / wordsize)` -- header + ops +
+  // data -- and the 32- and 64-bit counts therefore differ for the same block,
+  // which a word count taken on one of them cannot express.
+  long long custom_bytes = 0;
 };
 
 ValPtr vint(long long n);
@@ -28,7 +32,7 @@ ValPtr vstr(std::string s);
 ValPtr vdbl(double d);
 ValPtr vblock(int tag, std::vector<ValPtr> f);
 ValPtr vdblarr(std::vector<double> ds);
-ValPtr vcustom(std::string raw, long long words);  // verbatim custom block bytes
+ValPtr vcustom(std::string raw, long long data_bytes);  // verbatim custom bytes
 ValPtr vlist(const std::vector<ValPtr>& xs);  // OCaml list (cons / [])
 
 // Serialize `root` to a complete marshaled blob (20-byte small header + body).
