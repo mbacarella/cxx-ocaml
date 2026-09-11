@@ -21078,6 +21078,25 @@ struct Count {
   void release(std::size_t m) {
     while (added.size() > m) { vals[added.back()]--; added.pop_back(); }
   }
+  // The MODULE bindings of this file that are in scope, so a functor
+  // application can find the functor it names.  Nothing outside the file can
+  // be read here -- a `Hashtbl.Make (String)` would need the unit's .cmi -- so
+  // a path that does not resolve is charged nothing at all.
+  std::unordered_map<std::string, std::vector<const ModuleExpr*>> mods;
+  std::vector<std::string> mnames;
+  std::size_t mmark() const { return mnames.size(); }
+  void mrelease(std::size_t m) {
+    while (mnames.size() > m) {
+      auto it = mods.find(mnames.back());
+      if (it != mods.end() && !it->second.empty()) it->second.pop_back();
+      mnames.pop_back();
+    }
+  }
+  void mbind(const ModuleBinding& b) {
+    if (!b.name.txt) return;
+    mods[*b.name.txt].push_back(&b.expr);
+    mnames.push_back(*b.name.txt);
+  }
 
   static const Pattern& strip(const Pattern& p) {
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return strip(*c->p);
@@ -21770,11 +21789,287 @@ struct Count {
       return 2 * (long long)c->decls.size();
     return 0;
   }
-  void mexpr(const ModuleExpr& m, Lvl l = Lvl{1, 1, 0, true}) {
+  // ---- functor APPLICATION -----------------------------------------------
+  // What an application leaves behind is the functor's RESULT, substituted:
+  // `type_one_application` (typemod.ml:2695) runs `Subst.modtype (Rescope ..)`
+  // over it, which names one ident per item of that result -- the NESTED ones
+  // included, since Subst recurses -- and the items are then renamed again by
+  // the cascade of whatever SAVES them, so the whole thing costs exactly what
+  // the same structure written out in place would have cost.  A CURRIED
+  // application substitutes once per argument, and every substitution but the
+  // last sees the functor that is still to be applied, so it names that
+  // functor's own parameters as well.
+  static bool app_off() {
+    static const bool off = dbg_env("NOMODAPP") != nullptr;
+    return off;
+  }
+  // What a signature costs where it stands: one ident per item Subst renames,
+  // at the weight the level gives it.  This is `ren_mty` with the cascade on
+  // top, and unlike `ren_mty` it does NOT walk a functor parameter's own
+  // signature -- only the parameter's name is renamed (S436).
+  static long long wt_mty(const ModuleType& mt, const Lvl& l) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += wt_sig_item(it, l);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = wt_mty(*f->body, l);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->name.txt) k += l.a;
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return wt_mty(*w->mt, l);
+    return 0;
+  }
+  static long long wt_sig_item(const SignatureItem& it, const Lvl& l) {
+    const long long per = l.a;
+    if (std::holds_alternative<Psig_value>(it.desc) ||
+        std::holds_alternative<Psig_primitive>(it.desc) ||
+        std::holds_alternative<Psig_modsubst>(it.desc) ||
+        std::holds_alternative<Psig_exception>(it.desc))
+      return per;
+    if (auto* t = std::get_if<Psig_type>(&it.desc))
+      return per * (long long)t->decls.size();
+    if (auto* t = std::get_if<Psig_typesubst>(&it.desc))
+      return per * (long long)t->decls.size();
+    if (auto* x = std::get_if<Psig_typext>(&it.desc))
+      return per * (long long)x->ext.ctors.size();
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return per + wt_mty(*m->md.type, sub(l));
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += per + wt_mty(*d.type, sub(l));
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return per + (m->type ? wt_mty(*m->type, mtd(l)) : 0);
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return per + wt_mty(m->type, mtd(l));
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) return wt_mty(i->mt, l);
+    if (cls_off()) return 0;
+    if (auto* c = std::get_if<Psig_class>(&it.desc))
+      return 3 * per * (long long)c->decls.size();
+    if (auto* c = std::get_if<Psig_class_type>(&it.desc))
+      return 2 * per * (long long)c->decls.size();
+    return 0;
+  }
+  static long long wt_mexpr(const ModuleExpr& m, const Lvl& l) {
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) k += wt_str_item(it, l);
+      return k;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return wt_mty(*c->mt, l);
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      long long k = wt_mexpr(*f->body, l);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->name.txt) k += l.a;
+      return k;
+    }
+    return 0;
+  }
+  static long long wt_str_item(const StructureItem& it, const Lvl& l) {
+    const long long per = l.a;
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      Count c;
+      for (auto& b : v->bindings) c.pat(b.pat);
+      return per * c.n;
+    }
+    if (auto* t = std::get_if<Pstr_type>(&it.desc))
+      return per * (long long)t->decls.size();
+    if (auto* x = std::get_if<Pstr_typext>(&it.desc))
+      return per * (long long)x->ext.ctors.size();
+    if (auto* i = std::get_if<Pstr_include>(&it.desc))
+      return wt_mexpr(i->expr, l);
+    if (auto* m = std::get_if<Pstr_module>(&it.desc))
+      return per + wt_mexpr(m->binding.expr, sub(l));
+    if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& b : m->bindings) k += per + wt_mexpr(b.expr, sub(l));
+      return k;
+    }
+    if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
+      return per + (m->type ? wt_mty(*m->type, mtd(l)) : 0);
+    if (std::holds_alternative<Pstr_primitive>(it.desc) ||
+        std::holds_alternative<Pstr_exception>(it.desc) ||
+        std::holds_alternative<Pstr_val>(it.desc))
+      return per;
+    if (cls_off()) return 0;
+    if (auto* c = std::get_if<Pstr_class>(&it.desc))
+      return 3 * per * (long long)c->decls.size();
+    if (auto* c = std::get_if<Pstr_class_type>(&it.desc))
+      return 2 * per * (long long)c->decls.size();
+    return 0;
+  }
+  // An argument with NO PATH (an anonymous `struct .. end`) is not
+  // substituted at all: `Mtype.nondep_supertype` REBUILDS the result without
+  // the parameter and `Includemod.modtypes` then re-checks the original
+  // against it (typemod.ml:2705-2734), and each of those walks one more level
+  // down than the last -- so an item nested `k` levels inside the result is
+  // renamed `2k - 1` times more, and a module TYPE declaration bends the step
+  // the way it bends the cascade's.
+  struct Ext {
+    long long e = 0;  // what one item at this level costs EXTRA
+    long long u = 1;  // what one more level of nesting adds to that
+  };
+  static Ext esub(const Ext& x) { return Ext{x.e + x.u, 2}; }
+  static Ext emtd(const Ext& x) { return Ext{x.e + x.u + 1, 1}; }
+  static long long ext_mty(const ModuleType& mt, const Ext& x) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += ext_sig_item(it, x);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = ext_mty(*f->body, x);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->name.txt) k += x.e;
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return ext_mty(*w->mt, x);
+    return 0;
+  }
+  static long long ext_sig_item(const SignatureItem& it, const Ext& x) {
+    const long long per = x.e;
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return per + ext_mty(*m->md.type, esub(x));
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += per + ext_mty(*d.type, esub(x));
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return per + (m->type ? ext_mty(*m->type, emtd(x)) : 0);
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return per + ext_mty(m->type, emtd(x));
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) return ext_mty(i->mt, x);
+    return per * ren_sig_item(it);
+  }
+  static long long ext_mexpr(const ModuleExpr& m, const Ext& x) {
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) k += ext_str_item(it, x);
+      return k;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return ext_mty(*c->mt, x);
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      long long k = ext_mexpr(*f->body, x);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->name.txt) k += x.e;
+      return k;
+    }
+    return 0;
+  }
+  static long long ext_str_item(const StructureItem& it, const Ext& x) {
+    const long long per = x.e;
+    if (auto* i = std::get_if<Pstr_include>(&it.desc))
+      return ext_mexpr(i->expr, x);
+    if (auto* m = std::get_if<Pstr_module>(&it.desc))
+      return per + ext_mexpr(m->binding.expr, esub(x));
+    if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& b : m->bindings) k += per + ext_mexpr(b.expr, esub(x));
+      return k;
+    }
+    if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
+      return per + (m->type ? ext_mty(*m->type, emtd(x)) : 0);
+    return per * ren_str_item(it, Sibs{});
+  }
+  // `Typedtree.path_of_module` (typedtree.ml:929): an identifier, an
+  // application of two of them, and an ascription of one.
+  static bool has_path(const ModuleExpr& m) {
+    if (std::holds_alternative<Pmod_ident>(m.desc)) return true;
+    if (auto* a = std::get_if<Pmod_apply>(&m.desc))
+      return has_path(*a->f) && has_path(*a->arg);
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return has_path(*c->me);
+    return false;
+  }
+  const ModuleExpr* mfind(const Longident& id) const {
+    auto* li = std::get_if<Lident>(&id.v);
+    if (!li) return nullptr;
+    auto it = mods.find(li->name);
+    if (it == mods.end() || it->second.empty()) return nullptr;
+    return it->second.back();
+  }
+  // An alias chain (`module F2 = F`) names the same functor.
+  const ModuleExpr* mderef(const ModuleExpr* m) const {
+    for (int i = 0; m && i < 8; ++i) {
+      auto* p = std::get_if<Pmod_ident>(&m->desc);
+      if (!p) return m;
+      m = mfind(p->id.txt);
+    }
+    return m;
+  }
+  // A level that renames every item once, however deep it is nested.
+  static Lvl flat() { return Lvl{1, 0, 0, true}; }
+  long long app_charge(const ModuleExpr& m, const Lvl& l,
+                       bool saved = true) const {
+    if (app_off()) return 0;
+    const ModuleExpr* head = &m;
+    int nargs = 0;
+    for (;;) {
+      if (auto* a = std::get_if<Pmod_apply>(&head->desc)) {
+        ++nargs;
+        head = a->f.get();
+      } else if (std::holds_alternative<Pmod_apply_unit>(head->desc)) {
+        // A GENERATIVE application substitutes NOTHING: `Mty_functor(Unit, r)`
+        // hands back `r` itself (typemod.ml:2660).
+        return 0;
+      } else {
+        break;
+      }
+    }
+    if (nargs == 0) return 0;
+    const ModuleExpr* me = mderef(head);
+    const ModuleType* mt = nullptr;
+    if (!me) return 0;
+    bool pathless = false;
+    for (const ModuleExpr* h = &m;;) {
+      auto* a = std::get_if<Pmod_apply>(&h->desc);
+      if (!a) break;
+      if (!has_path(*a->arg)) pathless = true;
+      h = a->f.get();
+    }
+    long long k = 0;
+    for (int i = 0; i < nargs; ++i) {
+      if (me)
+        if (auto* c = std::get_if<Pmod_constraint>(&me->desc)) {
+          mt = c->mt.get();
+          me = nullptr;
+        }
+      if (me) {
+        auto* f = std::get_if<Pmod_functor>(&me->desc);
+        if (!f) return 0;
+        me = mderef(f->body.get());
+        if (!me) return 0;
+      } else {
+        auto* f = std::get_if<Pmty_functor>(&mt->desc);
+        if (!f) return 0;
+        mt = f->body.get();
+      }
+      if (i + 1 < nargs)
+        k += me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
+    }
+    k += me ? wt_mexpr(*me, l) : wt_mty(*mt, l);
+    if (pathless && saved)
+      k += me ? ext_mexpr(*me, Ext{}) : ext_mty(*mt, Ext{});
+    return k;
+  }
+  // `saved` is false where the signature this expression has is DISCARDED --
+  // behind an ascription, as an argument, as the module an `open` names --
+  // and so is never renamed by anything below.
+  void mexpr(const ModuleExpr& m, Lvl l = Lvl{1, 1, 0, true},
+             bool saved = true) {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       auto k = mark();
+      auto mk = mmark();
       for (auto& it : st->items) item(it, l);
       release(k);
+      mrelease(mk);
     } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       // A functor's RESULT is never strengthened (`strengthen_lazy`,
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
@@ -21784,16 +22079,31 @@ struct Count {
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
       // What an ascribed module SAVES is the ascription, so that is what the
       // renames below it reach; the structure behind it is typed once.
-      mexpr(*c->me, Lvl{1, 1, 0, true});
+      mexpr(*c->me, Lvl{1, 1, 0, true}, false);
       mty(*c->mt, depth_off() ? Lvl{1, 1, 0, true} : l);
     // An APPLICATION's argument is a module of its own: what the
     // application leaves in the structure is the functor's RESULT, so the
     // argument is typed where it stands and none of the renames below the
-    // enclosing module reach it.
-    } else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) {
-      mexpr(*a->f, Lvl{1, 1, 0, true}); mexpr(*a->arg, Lvl{1, 1, 0, true});
-    } else if (auto* a = std::get_if<Pmod_apply_unit>(&m.desc)) {
-      mexpr(*a->f, Lvl{1, 1, 0, true});
+    // enclosing module reach it.  The RESULT is charged for the whole spine
+    // at once, so that a curried application is not counted twice over.
+    } else if (std::holds_alternative<Pmod_apply>(m.desc) ||
+               std::holds_alternative<Pmod_apply_unit>(m.desc)) {
+      const ModuleExpr* h = &m;
+      for (;;) {
+        if (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+          mexpr(*a->arg, Lvl{1, 1, 0, true}, false);
+          h = a->f.get();
+        } else if (auto* a = std::get_if<Pmod_apply_unit>(&h->desc)) {
+          h = a->f.get();
+        } else {
+          break;
+        }
+      }
+      mexpr(*h, Lvl{1, 1, 0, true}, false);
+      // A DISCARDED application is substituted all the same -- what it does
+      // not get is the cascade of a signature that is saved, so its items are
+      // renamed flat, once apiece.
+      n += app_charge(m, saved ? l : flat(), saved);
     } else if (auto* u = std::get_if<Pmod_unpack>(&m.desc)) {
       expr(*u->e);
     }
@@ -21891,9 +22201,14 @@ struct Count {
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
       mexpr(m->binding.expr, depth_off() ? Lvl{1, 1, 0, true} : sub(l));
       if (m->binding.name.txt) ++n;
+      mbind(m->binding);
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       const Lvl sl = depth_off() ? Lvl{1, 1, 0, true} : sub(l);
-      for (auto& b : m->bindings) { mexpr(b.expr, sl); if (b.name.txt) ++n; }
+      for (auto& b : m->bindings) {
+        mexpr(b.expr, sl);
+        if (b.name.txt) ++n;
+        mbind(b);
+      }
       n += recmodule_extra(*m);
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
       if (m->type) mty(*m->type, mtd(l));
@@ -21901,8 +22216,11 @@ struct Count {
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexpr(i->expr, l);
       n += depth_off() ? exports(i->expr) : ren_mexpr(i->expr, Sibs{});
+      // `ren_mexpr` cannot read an application; its result is re-bound the
+      // same way every other included signature is.
+      n += app_charge(i->expr, flat(), false);
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
-      mexpr(o->expr);
+      mexpr(o->expr, Lvl{1, 1, 0, true}, false);
       n += exports(o->expr);
     // A class costs three idents before anything of it is read:
     // `type_classes` (typeclass.ml:1897) creates the class, its class type
