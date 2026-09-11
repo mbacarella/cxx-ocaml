@@ -20059,6 +20059,501 @@ const std::set<std::string>& stdlib_value_names() {
   return names;
 }
 
+// --- WHICH COMPILATION UNITS DOES THIS FILE CITE? --------------------------
+// Loading one is the single largest contribution to the stamp base.
+// `Env.sign_of_cmi` hands the .cmi's signature to `Subst.Lazy.modtype`, and
+// forcing that runs `rename_bound_idents` (subst.ml:594) over EVERY top-level
+// item -- values, types, extension constructors, modules and module types
+// alike, one ident each.  Constructors and record labels are not bound idents,
+// nested signatures stay lazy, and the load is NOT transitive, so the cost is
+// exactly the unit's own top-level item count: `open List`, `let open List in
+// ..` and a bare `List.map` each cost 75.  `Stdlib` is loaded while the
+// initial environment is built, so it is already inside the 273.
+struct Cites {
+  std::set<std::string> units;  // heads that may name a persistent unit
+  // Module names the file binds itself, with how MANY times: a name bound
+  // twice (a functor parameter's member and a local structure's, say) is
+  // ambiguous, so its alias is not followed.
+  std::map<std::string, int> local;
+  std::map<std::string, std::string> alias;  // local name -> its target
+
+  void add(const std::string& m) {
+    if (m.empty() || m == "Stdlib") return;
+    if (!std::isupper((unsigned char)m[0])) return;
+    units.insert(m);
+  }
+  void bind_mod(const StrOptLoc& n) { if (n.txt) local[*n.txt]++; }
+  // `module L = List` is an ALIAS: binding it does not force List's
+  // signature -- only a later `L.map` does (env.ml's persistent module
+  // data is lazy).  Record the target so a use of L can charge it.
+  bool alias_to(const StrOptLoc& n, const Longident& id) {
+    if (!n.txt) return false;
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      alias.emplace(*n.txt, l->name);
+      return true;
+    }
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return false;
+    auto* l = std::get_if<Lident>(&d->prefix->v);
+    if (!l || l->name != "Stdlib") return false;
+    alias.emplace(*n.txt, d->name);
+    return true;
+  }
+  // `modpos` says the name stands in the module namespace (`open M`), where a
+  // bare ident is a module; anywhere else only a DOTTED path names one.
+  void cite(const Longident& id, bool modpos) {
+    if (auto* a = std::get_if<Lapply>(&id.v)) {
+      cite(*a->f, true);
+      cite(*a->x, true);
+    } else if (auto* d = std::get_if<Ldot>(&id.v)) {
+      cite(*d->prefix, true);
+      // `Stdlib.List.map` loads Stdlib__List even though Stdlib is free.
+      if (auto* l = std::get_if<Lident>(&d->prefix->v))
+        if (l->name == "Stdlib") add(d->name);
+    } else if (modpos) {
+      add(std::get<Lident>(id.v).name);
+    }
+  }
+  void cite(const LongidentLoc& id, bool modpos) { cite(id.txt, modpos); }
+
+  void pkg(const Ptyp_package& p) {
+    cite(p.path, false);
+    for (auto& c : p.constraints) { cite(c.first, false); ty(*c.second); }
+  }
+  void ty(const CoreType& t) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      cite(c->id, false);
+      for (auto& a : c->args) ty(*a);
+    } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      ty(*a->dom); ty(*a->cod);
+    } else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& x : u->elems) ty(*x);
+    } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
+      for (auto& r : v->rows) {
+        if (auto* g = std::get_if<Rtag>(&r)) {
+          for (auto& x : g->types) ty(*x);
+        }
+        else ty(*std::get<Rinherit>(r).ct);
+      }
+    } else if (auto* o = std::get_if<Ptyp_object>(&t.desc)) {
+      for (auto& f : o->fields) {
+        if (auto* g = std::get_if<Otag>(&f)) ty(*g->type);
+        else ty(*std::get<Oinherit>(f).type);
+      }
+    } else if (auto* p = std::get_if<Ptyp_package>(&t.desc)) {
+      pkg(*p);
+    } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
+      cite(c->id, false);
+      for (auto& a : c->args) ty(*a);
+    } else if (auto* a = std::get_if<Ptyp_alias>(&t.desc)) {
+      ty(*a->type);
+    } else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) {
+      ty(*p->type);
+    } else if (auto* o = std::get_if<Ptyp_open>(&t.desc)) {
+      cite(o->mod_, true);
+      ty(*o->type);
+    } else if (auto* f = std::get_if<Ptyp_functor>(&t.desc)) {
+      pkg(f->pkg);
+      ty(*f->body);
+    }
+  }
+  void pat(const Pattern& p) {
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      cite(c->id, false);
+      if (c->arg) pat(**c->arg);
+    } else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& x : t->elems) pat(*x);
+    } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      pat(*o->l); pat(*o->r);
+    } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
+      pat(*a->p);
+    } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
+      pat(*c->p); ty(*c->t);
+    } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) { cite(f.first, false); pat(*f.second); }
+    } else if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) {
+      pat(*l->p);
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      if (v->arg) pat(**v->arg);
+    } else if (auto* e = std::get_if<Ppat_exception>(&p.desc)) {
+      pat(*e->p);
+    } else if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& x : a->elems) pat(*x);
+    } else if (auto* t = std::get_if<Ppat_type>(&p.desc)) {
+      cite(t->id, false);
+    } else if (auto* u = std::get_if<Ppat_unpack>(&p.desc)) {
+      bind_mod(u->name);
+      if (u->pkg) pkg(*u->pkg);
+    } else if (auto* o = std::get_if<Ppat_open>(&p.desc)) {
+      cite(o->mod_, true);
+      pat(*o->p);
+    } else if (auto* f = std::get_if<Ppat_effect>(&p.desc)) {
+      pat(*f->eff); pat(*f->cont);
+    }
+  }
+  void cse(const Case& c) {
+    pat(c.lhs);
+    if (c.guard) ex(**c.guard);
+    ex(*c.rhs);
+  }
+  void vbind(const ValueBinding& b) {
+    pat(b.pat);
+    ex(*b.expr);
+    if (!b.constraint_) return;
+    if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_)) ty(*c->typ);
+    else {
+      auto& co = std::get<Pvc_coercion>(*b.constraint_);
+      if (co.ground) ty(**co.ground);
+      ty(*co.coercion);
+    }
+  }
+  void fn(const Pexp_function& f) {
+    for (auto& pm : f.params) {
+      auto* pv = std::get_if<Pparam_val>(&pm.desc);
+      if (!pv) continue;
+      pat(pv->pat);
+      if (pv->default_) ex(**pv->default_);
+    }
+    if (f.constraint_) {
+      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_)) ty(*c->type);
+      else {
+        auto& co = std::get<Pcoerce>(*f.constraint_);
+        if (co.from) ty(**co.from);
+        ty(*co.to_);
+      }
+    }
+    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) ex(*fb->e);
+    else for (auto& c : std::get<Pfunction_cases>(f.body->v).cases) cse(c);
+  }
+  void ex(const Expression& e) {
+    if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
+      cite(i->id, false);
+    } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      ex(*a->fn);
+      for (auto& x : a->args) ex(*x.second);
+    } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      for (auto& b : l->bindings) vbind(b);
+      ex(*l->body);
+    } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      fn(*f);
+    } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
+      for (auto& x : t->elems) ex(*x);
+    } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      ex(*i->cond); ex(*i->then_);
+      if (i->else_) ex(**i->else_);
+    } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      cite(c->id, false);
+      if (c->arg) ex(**c->arg);
+    } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      ex(*m->e);
+      for (auto& c : m->cases) cse(c);
+    } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
+      ex(*t->e);
+      for (auto& c : t->cases) cse(c);
+    } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
+      ex(*s->e1); ex(*s->e2);
+    } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
+      ex(*c->e); ty(*c->t);
+    } else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) {
+      ex(*c->e);
+      if (c->from) ty(**c->from);
+      ty(*c->to_);
+    } else if (auto* f = std::get_if<Pexp_field>(&e.desc)) {
+      ex(*f->e); cite(f->field, false);
+    } else if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
+      for (auto& f : r->fields) { cite(f.first, false); ex(*f.second); }
+      if (r->base) ex(**r->base);
+    } else if (auto* a = std::get_if<Pexp_assert>(&e.desc)) {
+      ex(*a->e);
+    } else if (auto* l = std::get_if<Pexp_lazy>(&e.desc)) {
+      ex(*l->e);
+    } else if (auto* w = std::get_if<Pexp_while>(&e.desc)) {
+      ex(*w->cond); ex(*w->body);
+    } else if (auto* f = std::get_if<Pexp_for>(&e.desc)) {
+      pat(f->var); ex(*f->lo); ex(*f->hi); ex(*f->body);
+    } else if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
+      for (auto& x : a->elems) ex(*x);
+    } else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) {
+      if (v->arg) ex(**v->arg);
+    } else if (auto* t = std::get_if<Pexp_newtype>(&e.desc)) {
+      ex(*t->body);
+    } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
+      item(*s->item); ex(*s->body);
+    } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
+      ex(*s->obj); cite(s->field, false); ex(*s->value);
+    } else if (auto* s = std::get_if<Pexp_setinstvar>(&e.desc)) {
+      ex(*s->value);
+    } else if (auto* s = std::get_if<Pexp_send>(&e.desc)) {
+      ex(*s->obj);
+    } else if (auto* p = std::get_if<Pexp_pack>(&e.desc)) {
+      mexp(*p->me);
+      if (p->pkg) pkg(*p->pkg);
+    } else if (auto* l = std::get_if<Pexp_letop>(&e.desc)) {
+      pat(l->let_.pat); ex(*l->let_.exp);
+      for (auto& a : l->ands) { pat(a.pat); ex(*a.exp); }
+      ex(*l->body);
+    } else if (auto* o = std::get_if<Pexp_object>(&e.desc)) {
+      cstruct(*o->cs);
+    } else if (auto* nw = std::get_if<Pexp_new>(&e.desc)) {
+      cite(nw->id, false);
+    } else if (auto* o = std::get_if<Pexp_override>(&e.desc)) {
+      for (auto& f : o->fields) ex(*f.second);
+    } else if (auto* p = std::get_if<Pexp_poly>(&e.desc)) {
+      ex(*p->e);
+      if (p->t) ty(**p->t);
+    }
+  }
+  void cstruct(const ClassStructure& cs) {
+    pat(cs.self);
+    for (auto& f : cs.fields) cfield(f);
+  }
+  void cfield(const ClassField& f) {
+    if (auto* i = std::get_if<Pcf_inherit>(&f.desc)) {
+      cexpr(*i->ce);
+    } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
+      ckind(v->kind);
+    } else if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+      ckind(m->kind);
+    } else if (auto* c = std::get_if<Pcf_constraint>(&f.desc)) {
+      ty(*c->t1); ty(*c->t2);
+    } else if (auto* i = std::get_if<Pcf_initializer>(&f.desc)) {
+      ex(*i->e);
+    }
+  }
+  void ckind(const ClassFieldKind& k) {
+    if (auto* v = std::get_if<Cfk_virtual>(&k)) ty(*v->type);
+    else ex(*std::get<Cfk_concrete>(k).e);
+  }
+  void cexpr(const ClassExpr& c) {
+    if (auto* k = std::get_if<Pcl_constr>(&c.desc)) {
+      cite(k->id, false);
+      for (auto& a : k->args) ty(*a);
+    } else if (auto* s = std::get_if<Pcl_structure>(&c.desc)) {
+      cstruct(s->cs);
+    } else if (auto* f = std::get_if<Pcl_fun>(&c.desc)) {
+      pat(f->pat);
+      if (f->default_) ex(**f->default_);
+      cexpr(*f->body);
+    } else if (auto* a = std::get_if<Pcl_apply>(&c.desc)) {
+      cexpr(*a->ce);
+      for (auto& x : a->args) ex(*x.second);
+    } else if (auto* l = std::get_if<Pcl_let>(&c.desc)) {
+      for (auto& b : l->bindings) vbind(b);
+      cexpr(*l->body);
+    } else if (auto* k = std::get_if<Pcl_constraint>(&c.desc)) {
+      cexpr(*k->ce); ctype(*k->ct);
+    } else if (auto* o = std::get_if<Pcl_open>(&c.desc)) {
+      cite(o->id, true);
+      cexpr(*o->body);
+    }
+  }
+  void ctype(const ClassType& c) {
+    if (auto* k = std::get_if<Pcty_constr>(&c.desc)) {
+      cite(k->id, false);
+      for (auto& a : k->args) ty(*a);
+    } else if (auto* s = std::get_if<Pcty_signature>(&c.desc)) {
+      ty(*s->cs.self);
+      for (auto& f : s->cs.fields) ctfield(f);
+    } else if (auto* a = std::get_if<Pcty_arrow>(&c.desc)) {
+      ty(*a->dom); ctype(*a->cod);
+    } else if (auto* o = std::get_if<Pcty_open>(&c.desc)) {
+      cite(o->id, true);
+      ctype(*o->body);
+    }
+  }
+  void ctfield(const ClassTypeField& f) {
+    if (auto* i = std::get_if<Pctf_inherit>(&f.desc)) ctype(*i->ct);
+    else if (auto* v = std::get_if<Pctf_val>(&f.desc)) ty(*v->type);
+    else if (auto* m = std::get_if<Pctf_method>(&f.desc)) ty(*m->type);
+    else if (auto* c = std::get_if<Pctf_constraint>(&f.desc)) {
+      ty(*c->t1); ty(*c->t2);
+    }
+  }
+  void cdecl(const ClassDeclaration& d) {
+    for (auto& p : d.params) ty(*p);
+    cexpr(d.expr);
+  }
+  void ctdecl(const ClassTypeDeclaration& d) {
+    for (auto& p : d.params) ty(*p);
+    ctype(d.expr);
+  }
+  void cargs(const ConstructorArguments& a) {
+    if (auto* t = std::get_if<Pcstr_tuple>(&a)) {
+      for (auto& x : t->elems) ty(*x);
+    }
+    else for (auto& f : std::get<Pcstr_record>(a).fields) ty(*f.type);
+  }
+  void tdecl(const TypeDeclaration& d) {
+    for (auto& p : d.params) ty(*p);
+    if (d.manifest) ty(**d.manifest);
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+      for (auto& c : v->ctors) { cargs(c.args); if (c.res) ty(**c.res); }
+    } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+      for (auto& f : r->fields) ty(*f.type);
+    }
+    for (auto& c : d.constraints) { ty(*c.t1); ty(*c.t2); }
+  }
+  void ext(const ExtensionConstructor& c) {
+    if (auto* d = std::get_if<Pext_decl>(&c.kind)) {
+      cargs(d->args);
+      if (d->res) ty(**d->res);
+    } else {
+      cite(std::get<Pext_rebind>(c.kind).id, false);
+    }
+  }
+  void typext(const TypeExtension& x) {
+    cite(x.path, false);
+    for (auto& p : x.params) ty(*p);
+    for (auto& c : x.ctors) ext(c);
+  }
+  void fparam(const FunctorParam& p) {
+    auto* nm = std::get_if<Functor_named>(&p);
+    if (!nm) return;
+    bind_mod(nm->name);
+    if (nm->type) mty(*nm->type);
+  }
+  void mty(const ModuleType& m) {
+    if (auto* i = std::get_if<Pmty_ident>(&m.desc)) {
+      cite(i->id, false);
+    } else if (auto* s = std::get_if<Pmty_signature>(&m.desc)) {
+      for (auto& it : s->items) sig_item(it);
+    } else if (auto* f = std::get_if<Pmty_functor>(&m.desc)) {
+      fparam(f->param);
+      mty(*f->body);
+    } else if (auto* w = std::get_if<Pmty_with>(&m.desc)) {
+      mty(*w->mt);
+      // A constraint's left-hand path is resolved INSIDE the constrained
+      // signature, so only the right-hand side names an outer module.
+      for (auto& c : w->constraints) {
+        if (auto* t = std::get_if<Pwith_type>(&c)) tdecl(*t->td);
+        else if (auto* t = std::get_if<Pwith_typesubst>(&c)) tdecl(*t->td);
+        else if (auto* d = std::get_if<Pwith_module>(&c)) cite(d->lid2, true);
+        else if (auto* d = std::get_if<Pwith_modsubst>(&c)) cite(d->lid2, true);
+        else if (auto* d = std::get_if<Pwith_modtype>(&c)) mty(*d->mty);
+        else mty(*std::get<Pwith_modtypesubst>(c).mty);
+      }
+    } else if (auto* t = std::get_if<Pmty_typeof>(&m.desc)) {
+      mexp(*t->me);
+    } else if (auto* a = std::get_if<Pmty_alias>(&m.desc)) {
+      cite(a->id, true);
+    }
+  }
+  void mexp(const ModuleExpr& m) {
+    if (auto* i = std::get_if<Pmod_ident>(&m.desc)) {
+      cite(i->id, true);
+    } else if (auto* s = std::get_if<Pmod_structure>(&m.desc)) {
+      for (auto& it : s->items) item(it);
+    } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      fparam(f->param);
+      mexp(*f->body);
+    } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
+      mexp(*c->me); mty(*c->mt);
+    } else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) {
+      mexp(*a->f); mexp(*a->arg);
+    } else if (auto* a = std::get_if<Pmod_apply_unit>(&m.desc)) {
+      mexp(*a->f);
+    } else if (auto* u = std::get_if<Pmod_unpack>(&m.desc)) {
+      ex(*u->e);
+    }
+  }
+  void mbind(const ModuleBinding& b) {
+    auto* i = std::get_if<Pmod_ident>(&b.expr.desc);
+    if (i && alias_to(b.name, i->id.txt)) return;
+    mexp(b.expr);
+  }
+  void sig_item(const SignatureItem& it) {
+    if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+      ty(*v->vd.type);
+    } else if (auto* p = std::get_if<Psig_primitive>(&it.desc)) {
+      if (p->pd.type) ty(*p->pd.type);
+    } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+      for (auto& d : t->decls) tdecl(d);
+    } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
+      for (auto& d : t->decls) tdecl(d);
+    } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+      typext(x->ext);
+    } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
+      ext(e->exn.ctor);
+    } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+      bind_mod(m->md.name);
+      auto* a = std::get_if<Pmty_alias>(&m->md.type->desc);
+      if (!a || !alias_to(m->md.name, a->id.txt)) mty(*m->md.type);
+    } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      for (auto& d : m->decls) { bind_mod(d.name); mty(*d.type); }
+    } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+      if (m->type) mty(*m->type);
+    } else if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc)) {
+      mty(m->type);
+    } else if (auto* m = std::get_if<Psig_modsubst>(&it.desc)) {
+      bind_mod(m->name);
+      cite(m->manifest, true);
+    } else if (auto* o = std::get_if<Psig_open>(&it.desc)) {
+      cite(o->id, true);
+    } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+      mty(i->mt);
+    } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
+      for (auto& d : c->decls) ctdecl(d);
+    } else if (auto* c = std::get_if<Psig_class_type>(&it.desc)) {
+      for (auto& d : c->decls) ctdecl(d);
+    }
+  }
+  void item(const StructureItem& it) {
+    if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
+      ex(*e->e);
+    } else if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      for (auto& b : v->bindings) vbind(b);
+    } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+      for (auto& d : t->decls) tdecl(d);
+    } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
+      typext(x->ext);
+    } else if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
+      ext(e->exn.ctor);
+    } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
+      if (p->prim.type) ty(*p->prim.type);
+    } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
+      ty(*v->vd.type);
+    } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+      bind_mod(m->binding.name);
+      mbind(m->binding);
+    } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      for (auto& b : m->bindings) { bind_mod(b.name); mbind(b); }
+    } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+      if (m->type) mty(*m->type);
+    } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+      mexp(i->expr);
+    } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
+      mexp(o->expr);
+    } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
+      for (auto& d : c->decls) cdecl(d);
+    } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
+      for (auto& d : c->decls) ctdecl(d);
+    }
+  }
+  // One ident per top-level item of every DISTINCT unit the file cites.  A
+  // head the file binds itself shadows the unit, and a head with no readable
+  // .cmi was never loaded.
+  long long cost() const {
+    long long k = 0;
+    std::set<std::string> done;  // two names can alias ONE unit
+    for (auto& m : units) {
+      std::string u = m;
+      for (int i = 0; i < 8 && local.count(u); ++i) {
+        auto lb = local.find(u);
+        auto it = lb->second == 1 ? alias.find(u) : alias.end();
+        u = it == alias.end() ? std::string() : it->second;
+      }
+      if (u.empty() || local.count(u) || !done.insert(u).second) continue;
+      std::string p = head_cmi(u);
+      if (!std::filesystem::exists(p)) continue;
+      try {
+        k += (long long)cmi::CmiFile::load(p).sig().order.size();
+      } catch (...) {
+      }
+    }
+    return k;
+  }
+};
+
 struct Count {
   long long n = 0;
   // Value names in scope, so the ghost bindings below can ask what
@@ -20461,13 +20956,25 @@ struct Count {
 int typing_ident_count(const ast::Structure& s) {
   stampcount::Count c;
   for (auto& it : s) c.item(it);
-  return (int)c.n;
+  long long k = c.n;
+  if (!dbg_env("NOUNITLOAD")) {
+    stampcount::Cites u;
+    for (auto& it : s) u.item(it);
+    k += u.cost();
+  }
+  return (int)k;
 }
 
 int typing_ident_count(const ast::Signature& s) {
   stampcount::Count c;
   c.sig_items(s, 1, 0);
-  return (int)c.n;
+  long long k = c.n;
+  if (!dbg_env("NOUNITLOAD")) {
+    stampcount::Cites u;
+    for (auto& it : s) u.sig_item(it);
+    k += u.cost();
+  }
+  return (int)k;
 }
 
 }  // namespace cppcaml
