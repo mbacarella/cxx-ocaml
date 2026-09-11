@@ -30,6 +30,7 @@
 #include "cppcaml/bytecode.hpp"
 #include "cppcaml/cmi.hpp"
 #include "cppcaml/cmo.hpp"
+#include "cppcaml/dbgenv.hpp"
 #include "cppcaml/infer_check.hpp"
 #include "cppcaml/lambda.hpp"
 #include "cppcaml/link.hpp"
@@ -227,8 +228,13 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       fs::path cmi_path = fs::path(cmo_out).replace_extension(".cmi");
       bool has_mli = fs::exists(fs::path(in_path).replace_extension(".mli"));
       if (!has_mli)  // inferred from the .ml -> Impl provenance in the uids
-        cppcaml::cmi::cmiw::write_cmi(cmi_path.string(), mod,
-                                      cppcaml::infer_signature(structure), {}, /*intf=*/false);
+        // The source path is the file_id-0 entry of the location table: without
+        // it every declaration's pos_fname came out "" (NOMLLOC reverts).
+        cppcaml::cmi::cmiw::write_cmi(
+            cmi_path.string(), mod, cppcaml::infer_signature(structure), {},
+            /*intf=*/false,
+            cppcaml::dbg_env("NOMLLOC") ? std::vector<std::string>{}
+                                        : std::vector<std::string>{in_path});
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
     }

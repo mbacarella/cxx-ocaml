@@ -16670,6 +16670,15 @@ static cmi::cmiw::Loc conv_loc(const ast::Location& l) {
   return r;
 }
 
+// A declaration's location for an INFERRED signature (a .ml with no .mli).
+// ocamlc saves the same Location.t it recorded while typing, so the .cmi of a
+// bare .ml carries real val_loc / type_loc / ext_loc spans; we emitted ghosts.
+// Hooked on NOMLLOC, which reverts to those ghosts.
+static cmi::cmiw::Loc ml_loc(const ast::Location& l) {
+  if (dbg_env("NOMLLOC")) return cmi::cmiw::Loc{};
+  return conv_loc(l);
+}
+
 // A `with` refinement that carries a DESTRUCTIVE substitution (`:=`) forces
 // OCaml's Subst.signature over the ascribed module type, which relocates every
 // resulting declaration to the ascription's location (printtyp.mli's
@@ -17630,28 +17639,40 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
 // All variable binders of a top-level let pattern, in source (left-to-right)
 // order -- `let (a, b) = ..` / `let {x; y} = ..` / `let (C v) = ..` export
 // every binder as a value, exactly like a plain `let a = ..` does.
-static void toplevel_pat_vars(const ast::Pattern& p, std::vector<std::string>& out) {
-  if (auto* v = std::get_if<Ppat_var>(&p.desc)) { out.push_back(v->name.txt); return; }
+// `locs`, when given, collects each binder's IDENTIFIER location alongside its
+// name -- Typedtree.pat_bound_idents_full carries the `Tpat_var` name's own
+// loc, and that is what lands in the saved Sig_value's val_loc (NOT the whole
+// binding's span).
+static void toplevel_pat_vars(const ast::Pattern& p,
+                              std::vector<std::string>& out,
+                              std::vector<ast::Location>* locs = nullptr) {
+  if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
+    out.push_back(v->name.txt);
+    if (locs) locs->push_back(v->name.loc);
+    return;
+  }
   if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
-    for (auto& e : t->elems) toplevel_pat_vars(*e, out);
+    for (auto& e : t->elems) toplevel_pat_vars(*e, out, locs);
   } else if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
-    if (c->arg) toplevel_pat_vars(**c->arg, out);
+    if (c->arg) toplevel_pat_vars(**c->arg, out, locs);
   } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
-    toplevel_pat_vars(*a->p, out); out.push_back(a->name.txt);
+    toplevel_pat_vars(*a->p, out, locs);
+    out.push_back(a->name.txt);
+    if (locs) locs->push_back(a->name.loc);
   } else if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
-    toplevel_pat_vars(*ct->p, out);
+    toplevel_pat_vars(*ct->p, out, locs);
   } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
-    for (auto& f : r->fields) toplevel_pat_vars(*f.second, out);
+    for (auto& f : r->fields) toplevel_pat_vars(*f.second, out, locs);
   } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
-    toplevel_pat_vars(*lz->p, out);
+    toplevel_pat_vars(*lz->p, out, locs);
   } else if (auto* vr = std::get_if<Ppat_variant>(&p.desc)) {
-    if (vr->arg) toplevel_pat_vars(**vr->arg, out);
+    if (vr->arg) toplevel_pat_vars(**vr->arg, out, locs);
   } else if (auto* ar = std::get_if<Ppat_array>(&p.desc)) {
-    for (auto& e : ar->elems) toplevel_pat_vars(*e, out);
+    for (auto& e : ar->elems) toplevel_pat_vars(*e, out, locs);
   } else if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
-    toplevel_pat_vars(*op->p, out);
+    toplevel_pat_vars(*op->p, out, locs);
   } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
-    toplevel_pat_vars(*o->l, out);  // both sides bind the same set
+    toplevel_pat_vars(*o->l, out, locs);  // both sides bind the same set
   }
 }
 
@@ -19172,6 +19193,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   std::vector<std::tuple<std::size_t, std::string, std::set<std::string>>>
       unit_includes;
   for (auto& it : s) {
+    std::size_t before_item = out.size();  // md_loc / mtd_loc stamping, below
     if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
       if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc);
           pi && !std::holds_alternative<Lapply>(pi->id.txt.v))
@@ -19180,8 +19202,11 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     if (auto* sv = std::get_if<Pstr_value>(&it.desc)) {
       for (auto& b : sv->bindings) {
         std::vector<std::string> names;
-        toplevel_pat_vars(b.pat, names);  // every binder, incl. destructuring lets
-        for (auto& nm : names) {
+        std::vector<ast::Location> nlocs;
+        // every binder, incl. destructuring lets
+        toplevel_pat_vars(b.pat, names, &nlocs);
+        for (std::size_t ni = 0; ni < names.size(); ++ni) {
+          const std::string& nm = names[ni];
           auto f = ck.venv.back().find(nm);
           if (f == ck.venv.back().end()) continue;
           std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
@@ -19199,6 +19224,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
                 n = q->second;
             });
           out.push_back(cmi::cmiw::sig_value(nm, std::move(ty)));
+          if (ni < nlocs.size()) out.back().loc = ml_loc(nlocs[ni]);
         }
       }
     } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
@@ -19211,11 +19237,21 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         auto item = cmi::cmiw::sig_external(pr->prim.name.txt, ty, pr->prim.prims[0], native);
         apply_prim_attrs(pr->prim, out, item);
         out.push_back(std::move(item));
+        // val_loc = the whole `external .. = "prim"` declaration
+        out.back().loc = ml_loc(pr->prim.loc);
       } else if (pr->prim.alias) {  // `external f [: t] = g`: copy g's primitive
-        if (auto item = emit_prim_alias(ck, pr->prim, out)) out.push_back(std::move(*item));
+        if (auto item = emit_prim_alias(ck, pr->prim, out)) {
+          out.push_back(std::move(*item));
+          out.back().loc = ml_loc(pr->prim.loc);
+        }
       }
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+      std::size_t before_ty = out.size();
       emit_type_decls(ck, ty->decls, out, ty->rf == RecFlag::Nonrecursive);
+      // emit_type_decls appends one Type SigItem per declaration, in order.
+      for (std::size_t j = 0;
+           before_ty + j < out.size() && j < ty->decls.size(); ++j)
+        out[before_ty + j].loc = ml_loc(ty->decls[j].loc);
     } else if (auto* pe = std::get_if<Pstr_exception>(&it.desc)) {
       // `exception E [of ..]` in a .ml without a .mli: emit the Sig_typext so
       // the inferred .cmi carries the exception (it takes a runtime field, and a
@@ -19912,6 +19948,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         for (auto& si : items) out.push_back(std::move(si));
       }
     }
+    // A module / module-type binding's own declaration span (md_loc, mtd_loc)
+    // is the whole structure item.  Only these kinds: a value's loc is its
+    // BINDER's, a type's its declaration's, an exception's is Location.none,
+    // and `include`d members keep the locations they came with.
+    if (std::holds_alternative<Pstr_module>(it.desc) ||
+        std::holds_alternative<Pstr_recmodule>(it.desc) ||
+        std::holds_alternative<Pstr_modtype>(it.desc))
+      for (std::size_t j = before_item; j < out.size(); ++j)
+        if (out[j].loc.ghost) out[j].loc = ml_loc(it.loc);
   }
   // Canonical shadowing dedup: a name bound twice at top level (e.g. ocamllex's
   // rule `token` then a hand-written wrapper `token` in lexer.ml's trailer) keeps

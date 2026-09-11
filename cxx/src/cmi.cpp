@@ -2074,11 +2074,17 @@ struct TyEmit {
   }
 };
 
-o::ValPtr dummy_pos() {  // Lexing.dummy_pos = {pos_fname=""; pos_lnum=0; pos_bol=0; pos_cnum=-1}
-  return o::vblock(0, {o::vstr(""), o::vint(0), o::vint(0), o::vint(-1)});
+// Location.none = Warnings.ghost_loc_in_file "_none_" = Lexing.dummy_pos with
+// pos_fname REPLACED (warnings.ml:716) -- not dummy_pos itself, whose pos_fname
+// is "".  Both ends are the same physical position, so the marshaller shares
+// the second.  NONONELOC restores the "" we wrote before.
+// {pos_fname="_none_"; pos_lnum=0; pos_bol=0; pos_cnum=-1}
+o::ValPtr none_pos() {
+  return o::vblock(0, {o::vstr(cppcaml::dbg_env("NONONELOC") ? "" : "_none_"),
+                       o::vint(0), o::vint(0), o::vint(-1)});
 }
 o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
-  auto p = dummy_pos();
+  auto p = none_pos();
   return o::vblock(0, {p, p, o::vint(1)});
 }
 // The source filenames for the cmi being written: [0] = the source path (file_id
