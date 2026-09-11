@@ -21711,50 +21711,118 @@ struct Count {
     return k;
   }
 
-  void mexpr(const ModuleExpr& m) {
+  // How many times is a signature renamed before the one that SAVES it?  The
+  // save is one, and `Includemod.compunit` (typemod.ml) checks the inferred
+  // signature against itself: every module item it pairs is STRENGTHENED
+  // (`strengthened_modtypes`, includemod.ml:697), which turns the submodules
+  // one level down into aliases, and scraping one of those builds its parent's
+  // components and renames that signature once more -- so each further level
+  // of nesting is renamed once more again.  A module TYPE declaration is
+  // substituted whole on top of that (`modtype_infos`, includemod.ml:989),
+  // which DOUBLES the step for everything it spans; a functor parameter's
+  // signature is bound into the environment, which adds one flat.
+  struct Lvl {
+    long long a = 1;   // what one item of this signature costs
+    long long u = 1;   // what one more level of nesting adds
+    int depth = 0;     // only for the NODEPTH fallback
+    bool root = true;  // nothing nested below the container that set `u` yet
+  };
+  static bool depth_off() {
+    static const bool off = dbg_env("NODEPTH") != nullptr;
+    return off;
+  }
+  // The level of a MODULE's own signature: the first one below a fresh context
+  // is renamed no more than its container, every one after that once more.
+  static Lvl sub(const Lvl& l) {
+    if (depth_off())
+      return Lvl{l.a > l.depth + 1 ? l.a : l.depth + 1, l.u, l.depth + 1,
+                 l.root};
+    return Lvl{l.a + (l.root ? 0 : l.u), l.u, l.depth + 1, false};
+  }
+  // The level of a module TYPE declaration's body.
+  static Lvl mtd(const Lvl& l) {
+    if (depth_off()) return Lvl{l.a + 1, l.u, l.depth + 1, l.root};
+    return Lvl{l.a + l.u * (l.root ? 1 : 2), 2, l.depth + 1, true};
+  }
+  // The items ONE structure item binds, for the levels that rename them more
+  // than once.
+  static long long str_items(const StructureItem& it) {
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      Count c;
+      for (auto& b : v->bindings) c.pat(b.pat);
+      return c.n;
+    }
+    if (auto* t = std::get_if<Pstr_type>(&it.desc))
+      return (long long)t->decls.size();
+    if (auto* x = std::get_if<Pstr_typext>(&it.desc))
+      return (long long)x->ext.ctors.size();
+    if (std::holds_alternative<Pstr_include>(it.desc)) return 0;  // recursed
+    if (std::holds_alternative<Pstr_module>(it.desc) ||
+        std::holds_alternative<Pstr_modtype>(it.desc) ||
+        std::holds_alternative<Pstr_primitive>(it.desc) ||
+        std::holds_alternative<Pstr_exception>(it.desc) ||
+        std::holds_alternative<Pstr_val>(it.desc))
+      return 1;
+    if (cls_off()) return 0;
+    if (auto* c = std::get_if<Pstr_class>(&it.desc))
+      return 3 * (long long)c->decls.size();
+    if (auto* c = std::get_if<Pstr_class_type>(&it.desc))
+      return 2 * (long long)c->decls.size();
+    return 0;
+  }
+  void mexpr(const ModuleExpr& m, Lvl l = Lvl{1, 1, 0, true}) {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       auto k = mark();
-      for (auto& it : st->items) item(it);
+      for (auto& it : st->items) item(it, l);
       release(k);
     } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
-      fparam(f->param, 1, 0);
-      mexpr(*f->body);
+      // A functor's RESULT is never strengthened (`strengthen_lazy`,
+      // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
+      // `aliasable:false`), so its body starts the cascade over.
+      fparam(f->param, l);
+      mexpr(*f->body, Lvl{1, 1, 0, true});
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
-      mexpr(*c->me);
-      mty(*c->mt, 1, 0);
+      // What an ascribed module SAVES is the ascription, so that is what the
+      // renames below it reach; the structure behind it is typed once.
+      mexpr(*c->me, Lvl{1, 1, 0, true});
+      mty(*c->mt, depth_off() ? Lvl{1, 1, 0, true} : l);
+    // An APPLICATION's argument is a module of its own: what the
+    // application leaves in the structure is the functor's RESULT, so the
+    // argument is typed where it stands and none of the renames below the
+    // enclosing module reach it.
     } else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) {
-      mexpr(*a->f); mexpr(*a->arg);
+      mexpr(*a->f, Lvl{1, 1, 0, true}); mexpr(*a->arg, Lvl{1, 1, 0, true});
     } else if (auto* a = std::get_if<Pmod_apply_unit>(&m.desc)) {
-      mexpr(*a->f);
+      mexpr(*a->f, Lvl{1, 1, 0, true});
     } else if (auto* u = std::get_if<Pmod_unpack>(&m.desc)) {
       expr(*u->e);
     }
   }
   // A functor parameter's signature is BOUND into the environment, so each of
-  // its items is allocated twice over (`per + 1`).
-  void fparam(const FunctorParam& p, int per, int depth) {
+  // its items is allocated twice over (`a + 1`).
+  void fparam(const FunctorParam& p, const Lvl& l) {
     auto* nm = std::get_if<Functor_named>(&p);
     if (!nm) return;
-    mty(*nm->type, per + 1, depth + 1);
+    mty(*nm->type, Lvl{l.a + 1, l.u, l.depth + 1, true});
     if (nm->name.txt) ++n;
   }
-  void mty(const ModuleType& mt, int per, int depth) {
+  void mty(const ModuleType& mt, const Lvl& l) {
     if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
-      sig_items(s->items, per, depth);
+      sig_items(s->items, l);
     } else if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
-      fparam(f->param, per, depth);
-      mty(*f->body, per, depth);
+      fparam(f->param, l);
+      mty(*f->body, l);
     } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
-      mty(*w->mt, per, depth);
+      mty(*w->mt, l);
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
       mexpr(*t->me);
     }
   }
-  void sig_items(const Signature& s, int per, int depth) {
-    for (auto& it : s) sig_item(it, per, depth);
+  void sig_items(const Signature& s, const Lvl& l) {
+    for (auto& it : s) sig_item(it, l);
   }
-  void sig_item(const SignatureItem& it, int per, int depth) {
-    const int sub = per > depth + 1 ? per : depth + 1;  // a module's own sig
+  void sig_item(const SignatureItem& it, const Lvl& l) {
+    const int per = (int)l.a;
     if (std::holds_alternative<Psig_value>(it.desc) ||
         std::holds_alternative<Psig_primitive>(it.desc) ||
         std::holds_alternative<Psig_modsubst>(it.desc)) {
@@ -21769,19 +21837,27 @@ struct Count {
       ext_ctor(e->exn.ctor);
     } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
       n += per;
-      mty(*m->md.type, sub, depth + 1);
+      mty(*m->md.type, sub(l));
     } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
-      for (auto& d : m->decls) { n += per; mty(*d.type, sub, depth + 1); }
+      for (auto& d : m->decls) { n += per; mty(*d.type, sub(l)); }
       n += recmodule_sig_extra(*m);
     } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
       n += per;
-      if (m->type) mty(*m->type, per + 1, depth + 1);
+      if (m->type) mty(*m->type, mtd(l));
     } else if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc)) {
       n += per;
-      mty(m->type, per + 1, depth + 1);
+      mty(m->type, mtd(l));
+    // An `include` binds the whole signature it names a second time, the
+    // NESTED items of it included (`Subst` recurses), on top of what the
+    // signature costs where it stands.
     } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
-      mty(i->mt, 1, depth + 1);
-      n += per * sig_exports(i->mt);
+      if (depth_off()) {
+        mty(i->mt, Lvl{1, l.u, l.depth + 1, l.root});
+        n += per * sig_exports(i->mt);
+      } else {
+        mty(i->mt, l);
+        n += ren_mty(i->mt);
+      }
     // A DESCRIBED class is those same three idents, and binding it into an
     // environment renames the items it saves -- three of them, where a class
     // type saves two.
@@ -21794,7 +21870,8 @@ struct Count {
     }
   }
 
-  void item(const StructureItem& it) {
+  void item(const StructureItem& it, Lvl l = Lvl{1, 1, 0, true}) {
+    if (!depth_off() && l.a > 1) n += (l.a - 1) * str_items(it);
     if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
       expr(*e->e);
     } else if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
@@ -21812,17 +21889,18 @@ struct Count {
       ++n;
       bind(v->vd.name.txt);
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
-      mexpr(m->binding.expr);
+      mexpr(m->binding.expr, depth_off() ? Lvl{1, 1, 0, true} : sub(l));
       if (m->binding.name.txt) ++n;
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
-      for (auto& b : m->bindings) { mexpr(b.expr); if (b.name.txt) ++n; }
+      const Lvl sl = depth_off() ? Lvl{1, 1, 0, true} : sub(l);
+      for (auto& b : m->bindings) { mexpr(b.expr, sl); if (b.name.txt) ++n; }
       n += recmodule_extra(*m);
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
-      if (m->type) mty(*m->type, 2, 1);
+      if (m->type) mty(*m->type, mtd(l));
       ++n;
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
-      mexpr(i->expr);
-      n += exports(i->expr);
+      mexpr(i->expr, l);
+      n += depth_off() ? exports(i->expr) : ren_mexpr(i->expr, Sibs{});
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
       mexpr(o->expr);
       n += exports(o->expr);
@@ -21858,7 +21936,7 @@ int typing_ident_count(const ast::Structure& s) {
 
 int typing_ident_count(const ast::Signature& s) {
   stampcount::Count c;
-  c.sig_items(s, 1, 0);
+  c.sig_items(s, stampcount::Count::Lvl{1, 1, 0, true});
   long long k = c.n;
   if (!dbg_env("NOUNITLOAD")) {
     stampcount::Cites u;
