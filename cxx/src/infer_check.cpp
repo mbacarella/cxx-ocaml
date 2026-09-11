@@ -20163,7 +20163,8 @@ void applied_walk(const cmi::TypePtr& t, const cmi::Signature& sg,
 // `Seq.is_empty` costs 65 + 65 because unfolding `t` reaches Seq's own
 // `node`, and `Lazy.force` costs 10 + 5 for the CamlinternalLazy behind it.
 void applied_head(const cmi::Path* p, const cmi::Signature& sg,
-                  std::set<const cmi::TypeExpr*>& seen, Applied& out) {
+                  std::set<const cmi::TypeExpr*>& seen, Applied& out,
+                  int cross = 2) {
   if (!p) return;
   if (p->kind == cmi::Path::Pident) {
     for (auto& d : sg.types) {
@@ -20176,8 +20177,30 @@ void applied_head(const cmi::Path* p, const cmi::Signature& sg,
   }
   bool al = false;
   std::string u = path_unit(p, &al);
-  int n = al ? 2 : 1;
-  if (!u.empty() && out.units[u] < n) out.units[u] = n;
+  // An APPLIED constructor of another unit is looked up twice; the RESULT of
+  // an application only once (`Random.bits32 ()`, whose `Int32.t` is spelled
+  // through Stdlib, is 22 + 51 and not 22 + 51 + 51), and an argument's
+  // DOMAIN, where only the declaring signature's own force is measured, not
+  // at all (`cross == 0`).
+  if (u.empty() || cross == 0) return;
+  int n = al ? cross : 1;
+  if (out.units[u] < n) out.units[u] = n;
+}
+// A Tpoly wraps a member's type and hangs its body off `link` (cmi.cpp case
+// 8), so a walk down the arrow spine has to step through it wherever it
+// stands -- `val length : t -> int` reads as Tpoly(Tarrow(Tpoly(t), int)).
+const cmi::TypeExpr* spine(const cmi::TypePtr& t) {
+  const cmi::TypeExpr* p = strip(t);
+  for (int i = 0; i < 64 && p && p->kind == cmi::TypeExpr::Tpoly; ++i)
+    p = strip(p->link);
+  return p;
+}
+// Look up one head, the way a unification or an instantiation of it does.
+void head_load(const cmi::TypeExpr* t, const cmi::Signature& sg,
+               Applied& out, int cross) {
+  if (!t || t->kind != cmi::TypeExpr::Tconstr) return;
+  std::set<const cmi::TypeExpr*> seen;
+  applied_head(t->path.get(), sg, seen, out, cross);
 }
 void applied_walk(const cmi::TypePtr& t, const cmi::Signature& sg,
                   std::set<const cmi::TypeExpr*>& seen, Applied& out) {
@@ -20244,11 +20267,21 @@ struct Cites {
   // `open Printf` alone reads none of them.
   std::map<std::string, std::set<std::string>> members;
   std::set<std::string> opens;
+  // The modules an `open` has brought into scope where the walk has reached,
+  // innermost last: a BARE module head is resolved against these.  A
+  // file-level `open` stands for the rest of the unit; every other one is
+  // truncated back by the walker that owns its scope.
+  std::vector<std::string> open_stack_;
+  bool bare_ = true;  // resolve bare heads at all (NOBAREHEAD reverts)
   std::set<std::string> bares;
   // The same two, one level down: `Effect.Deep.try_with` and `open
   // Effect.Deep` read a member of the SUBMODULE, keyed "Effect.Deep".
   std::map<std::string, std::set<std::string>> submembers;
   std::set<std::string> subopens;
+  // Which members the file APPLIES, keyed like `members` above ("U" or
+  // "U.S"), and the bare names it applies after an `open`.
+  std::map<std::string, std::map<std::string, int>> applied;
+  std::map<std::string, int> applied_bares;
   // `module MP = Gc.Memprof` binds a SUBMODULE: resolving the path forces Gc
   // but not Memprof, which is forced only once MP is actually used.
   std::map<std::string, std::string> subalias;
@@ -20266,7 +20299,11 @@ struct Cites {
   bool alias_to(const StrOptLoc& n, const Longident& id) {
     if (!n.txt) return false;
     if (auto* l = std::get_if<Lident>(&id.v)) {
-      alias.emplace(*n.txt, l->name);
+      std::string ow = opened_owner(l->name);
+      // `open Effect  module D = Deep` aliases the SUBMODULE, and waits for a
+      // use of D exactly as `module D = Effect.Deep` does.
+      if (ow.empty()) alias.emplace(*n.txt, l->name);
+      else { add(ow); subalias.emplace(*n.txt, ow + "." + l->name); }
       return true;
     }
     auto* d = std::get_if<Ldot>(&id.v);
@@ -20281,6 +20318,43 @@ struct Cites {
     add(l->name);
     subalias.emplace(*n.txt, l->name + "." + d->name);
     return true;
+  }
+  // Which unit does the source name `m` stand for, once the local aliases are
+  // followed?  Empty when a local binding shadows it or the chain leads
+  // nowhere.
+  std::string unit_of(const std::string& m) const {
+    std::string u = m;
+    for (int i = 0; i < 8 && local.count(u); ++i) {
+      auto lb = local.find(u);
+      auto it = lb->second == 1 ? alias.find(u) : alias.end();
+      u = it == alias.end() ? std::string() : it->second;
+    }
+    return local.count(u) ? std::string() : u;
+  }
+  static bool has_sub(const cmi::Signature& sg, const std::string& n) {
+    for (auto& m : sg.modules)
+      if (m.name == n) return true;
+    return false;
+  }
+  // `open Effect` puts `Deep` in scope as a BARE MODULE HEAD, and the
+  // `Deep.get_callstack` after it costs exactly what `Effect.Deep` does.  The
+  // opened submodule SHADOWS a unit of the same name -- after `open Float`,
+  // `Array.length` is Float.Array's 82 + 82 + 48 and not Array's 55 -- so the
+  // answer is the INNERMOST open in scope that declares `h`, or "" for none.
+  std::string opened_owner(const std::string& h) const {
+    if (!bare_ || local.count(h)) return {};
+    for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o) {
+      if (*o == h) continue;
+      std::string ou = unit_of(*o);
+      if (ou.empty() || ou == h) continue;
+      std::string p = head_cmi(ou);
+      if (!std::filesystem::exists(p)) continue;
+      try {
+        if (has_sub(cmi::CmiFile::load(p).sig(), h)) return *o;
+      } catch (...) {
+      }
+    }
+    return {};
   }
   // Charge what the used submodule aliases stand for, now that the whole file
   // has been walked and it is known which of them were named at all.
@@ -20304,8 +20378,19 @@ struct Cites {
       cite(*a->f, true);
       cite(*a->x, true);
     } else if (auto* d = std::get_if<Ldot>(&id.v)) {
+      auto* hd = std::get_if<Lident>(&d->prefix->v);
+      std::string ow = hd && hd->name != "Stdlib" ? opened_owner(hd->name)
+                                                 : std::string();
+      if (!ow.empty()) {
+        // The head is a submodule an `open` put in scope, so the path reads
+        // the same as the dotted spelling: `Effect.Deep.get_callstack`.
+        add(ow);
+        members[ow].insert(hd->name);
+        submembers[ow + "." + hd->name].insert(d->name);
+        return;
+      }
       cite(*d->prefix, true);
-      if (auto* l = std::get_if<Lident>(&d->prefix->v)) {
+      if (auto* l = hd) {
         // `Stdlib.List.map` loads Stdlib__List though Stdlib is free.
         if (l->name == "Stdlib") add(d->name);
         else members[l->name].insert(d->name);
@@ -20322,19 +20407,60 @@ struct Cites {
     }
   }
   void cite(const LongidentLoc& id, bool modpos) { cite(id.txt, modpos); }
+  // A member that is APPLIED forces the signature declaring its RESULT type a
+  // second time: `Buffer.create 1` is 41 + 41 where `Buffer.create` alone is
+  // 41, `Gc.stat ()` 29 + 29 and `Format.formatter_of_out_channel stdout`
+  // 173 + 173.  The application is the trigger, not the result's arity --
+  // `Mutex.create ()` charges the `t` that takes no argument at all.
+  void applied_fn(const Expression& f, int nargs) {
+    auto* i = std::get_if<Pexp_ident>(&f.desc);
+    if (!i) return;
+    auto note = [&](std::map<std::string, int>& t, const std::string& n) {
+      if (t[n] < nargs) t[n] = nargs;
+    };
+    const Longident& id = i->id.txt;
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      if (!l->name.empty() && !std::isupper((unsigned char)l->name[0]))
+        note(applied_bares, l->name);
+      return;
+    }
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return;
+    if (auto* l = std::get_if<Lident>(&d->prefix->v)) {
+      if (l->name == "Stdlib") return;  // Stdlib's own members are free
+      std::string ow = opened_owner(l->name);
+      note(applied[ow.empty() ? l->name : ow + "." + l->name], d->name);
+    } else if (auto* q = std::get_if<Ldot>(&d->prefix->v)) {
+      auto* hd = std::get_if<Lident>(&q->prefix->v);
+      if (!hd) return;
+      if (hd->name == "Stdlib") note(applied[q->name], d->name);
+      else note(applied[hd->name + "." + q->name], d->name);
+    }
+  }
   // `open Printf` brings its members into scope under their BARE names,
   // so a later `printf "%d"` names one without writing the module.
-  void opened(const Longident& id) {
+  bool opened(const Longident& id) {
     if (auto* l = std::get_if<Lident>(&id.v)) {
-      opens.insert(l->name);
-    } else if (auto* d = std::get_if<Ldot>(&id.v)) {
+      std::string ow = opened_owner(l->name);
+      if (ow.empty()) {
+        opens.insert(l->name);
+        open_stack_.push_back(l->name);
+        return false;
+      }
+      add(ow);
+      members[ow].insert(l->name);
+      subopens.insert(ow + "." + l->name);
+      return true;
+    }
+    if (auto* d = std::get_if<Ldot>(&id.v)) {
       auto* l = std::get_if<Lident>(&d->prefix->v);
-      if (!l) return;
+      if (!l) return false;
       if (l->name == "Stdlib") opens.insert(d->name);
       else subopens.insert(l->name + "." + d->name);
     }
+    return false;
   }
-  void opened(const LongidentLoc& id) { opened(id.txt); }
+  bool opened(const LongidentLoc& id) { return opened(id.txt); }
 
   void pkg(const Ptyp_package& p) {
     cite(p.path, false);
@@ -20373,9 +20499,10 @@ struct Cites {
     } else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) {
       ty(*p->type);
     } else if (auto* o = std::get_if<Ptyp_open>(&t.desc)) {
-      cite(o->mod_, true);
-      opened(o->mod_);
+      size_t d = open_stack_.size();
+      if (!opened(o->mod_)) cite(o->mod_, true);
       ty(*o->type);
+      open_stack_.resize(d);
     } else if (auto* f = std::get_if<Ptyp_functor>(&t.desc)) {
       pkg(f->pkg);
       ty(*f->body);
@@ -20409,9 +20536,10 @@ struct Cites {
       bind_mod(u->name);
       if (u->pkg) pkg(*u->pkg);
     } else if (auto* o = std::get_if<Ppat_open>(&p.desc)) {
-      cite(o->mod_, true);
-      opened(o->mod_);
+      size_t d = open_stack_.size();
+      if (!opened(o->mod_)) cite(o->mod_, true);
       pat(*o->p);
+      open_stack_.resize(d);
     } else if (auto* f = std::get_if<Ppat_effect>(&p.desc)) {
       pat(*f->eff); pat(*f->cont);
     }
@@ -20454,6 +20582,7 @@ struct Cites {
     if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
       cite(i->id, false);
     } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      applied_fn(*a->fn, (int)a->args.size());
       ex(*a->fn);
       for (auto& x : a->args) ex(*x.second);
     } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
@@ -20503,7 +20632,11 @@ struct Cites {
     } else if (auto* t = std::get_if<Pexp_newtype>(&e.desc)) {
       ex(*t->body);
     } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
+      // `let open M in e` and `let module M = .. in e`: M is in scope over
+      // the body alone.
+      size_t d = open_stack_.size();
       item(*s->item); ex(*s->body);
+      open_stack_.resize(d);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
       ex(*s->obj); cite(s->field, false); ex(*s->value);
     } else if (auto* s = std::get_if<Pexp_setinstvar>(&e.desc)) {
@@ -20568,9 +20701,10 @@ struct Cites {
     } else if (auto* k = std::get_if<Pcl_constraint>(&c.desc)) {
       cexpr(*k->ce); ctype(*k->ct);
     } else if (auto* o = std::get_if<Pcl_open>(&c.desc)) {
-      cite(o->id, true);
-      opened(o->id);
+      size_t d = open_stack_.size();
+      if (!opened(o->id)) cite(o->id, true);
       cexpr(*o->body);
+      open_stack_.resize(d);
     }
   }
   void ctype(const ClassType& c) {
@@ -20583,9 +20717,10 @@ struct Cites {
     } else if (auto* a = std::get_if<Pcty_arrow>(&c.desc)) {
       ty(*a->dom); ctype(*a->cod);
     } else if (auto* o = std::get_if<Pcty_open>(&c.desc)) {
-      cite(o->id, true);
-      opened(o->id);
+      size_t d = open_stack_.size();
+      if (!opened(o->id)) cite(o->id, true);
       ctype(*o->body);
+      open_stack_.resize(d);
     }
   }
   void ctfield(const ClassTypeField& f) {
@@ -20643,7 +20778,9 @@ struct Cites {
     if (auto* i = std::get_if<Pmty_ident>(&m.desc)) {
       cite(i->id, false);
     } else if (auto* s = std::get_if<Pmty_signature>(&m.desc)) {
+      size_t d = open_stack_.size();
       for (auto& it : s->items) sig_item(it);
+      open_stack_.resize(d);
     } else if (auto* f = std::get_if<Pmty_functor>(&m.desc)) {
       fparam(f->param);
       mty(*f->body);
@@ -20669,7 +20806,9 @@ struct Cites {
     if (auto* i = std::get_if<Pmod_ident>(&m.desc)) {
       cite(i->id, true);
     } else if (auto* s = std::get_if<Pmod_structure>(&m.desc)) {
+      size_t d = open_stack_.size();
       for (auto& it : s->items) item(it);
+      open_stack_.resize(d);
     } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       fparam(f->param);
       mexp(*f->body);
@@ -20715,8 +20854,7 @@ struct Cites {
       bind_mod(m->name);
       cite(m->manifest, true);
     } else if (auto* o = std::get_if<Psig_open>(&it.desc)) {
-      cite(o->id, true);
-      opened(o->id);
+      if (!opened(o->id)) cite(o->id, true);
     } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
       mty(i->mt);
     } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
@@ -20750,7 +20888,8 @@ struct Cites {
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexp(i->expr);
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
-      if (auto* i = std::get_if<Pmod_ident>(&o->expr.desc)) opened(i->id);
+      auto* mi = std::get_if<Pmod_ident>(&o->expr.desc);
+      if (mi && opened(mi->id)) return;
       mexp(o->expr);
     } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
       for (auto& d : c->decls) cdecl(d);
@@ -20809,38 +20948,64 @@ struct Cites {
   // The members of `sg` the file reads, whether written out (`members`) or
   // brought into scope by an `open` of it and then named bare.
   void scan_applied(const std::string& key, bool nested,
-                    const cmi::Signature& sg, Applied& out) const {
+                    const cmi::Signature& sg, Applied& out, bool app) const {
     auto one = [&](const std::string& n) {
       if (auto* v = find_val(sg, n)) {
         std::set<const cmi::TypeExpr*> seen;
         applied_walk(v->type, sg, seen, out);
       }
     };
+    // APPLYING a member looks its RESULT type up: `Buffer.create 1` is 41 + 41
+    // where the bare `Buffer.create` is 41, `Gc.stat ()` 29 + 29, and
+    // `Random.bits32 ()`, whose `Int32.t` belongs to another unit, 22 + 51.
+    // The application is the trigger, not the result's arity -- `Mutex.create
+    // ()` charges the `t` that takes no argument at all -- and the result is
+    // the one the ARGUMENTS SUPPLIED leave: `Buffer.add_utf_8_uchar b` is an
+    // arrow still, and charges nothing of its own.
+    auto one_app = [&](const std::string& n, int nargs) {
+      auto* v = find_val(sg, n);
+      if (!v) return;
+      const cmi::TypeExpr* p = spine(v->type);
+      for (int i = 0; i < nargs && p; ++i) {
+        // An optional argument the call leaves out consumes no argument.
+        while (p && p->kind == cmi::TypeExpr::Tarrow && p->label_kind == 2)
+          p = spine(p->cod);
+        if (!p || p->kind != cmi::TypeExpr::Tarrow) break;
+        // Unifying an argument with the domain it meets forces the signature
+        // that DECLARES that domain a second time: `Buffer.length b` is
+        // 41 + 41 and `Format.pp_print_string Format.std_formatter "x"`
+        // 173 + 173, where the same members read cost one load.
+        head_load(spine(p->dom), sg, out, 0);
+        p = spine(p->cod);
+      }
+      head_load(p, sg, out, 1);
+    };
     const auto& tbl = nested ? submembers : members;
     auto it = tbl.find(key);
     if (it != tbl.end())
       for (auto& n : it->second) one(n);
-    if (nested ? subopens.count(key) : opens.count(key))
+    auto ap = applied.find(key);
+    if (app && ap != applied.end())
+      for (auto& n : ap->second) one_app(n.first, n.second);
+    if (nested ? subopens.count(key) : opens.count(key)) {
       for (auto& n : bares) one(n);
+      if (app)
+        for (auto& n : applied_bares) one_app(n.first, n.second);
+    }
   }
   // One ident per top-level item (and per functor parameter) of every DISTINCT
   // unit the file cites, plus CamlinternalFormatBasics when a format type is
   // read.  A head the file binds itself shadows the unit, and a head with no
   // readable .cmi was never loaded.
-  long long cost(bool extra, bool sub) {
+  long long cost(bool extra, bool sub, bool app) {
     if (sub) resolve_subaliases();
     long long k = 0;
     bool fmt = extra && fmt_ann;
     std::set<std::string> done;  // two names can alias ONE unit
     std::map<std::string, int> more;  // unit -> loads a READ TYPE asks for
     for (auto& m : units) {
-      std::string u = m;
-      for (int i = 0; i < 8 && local.count(u); ++i) {
-        auto lb = local.find(u);
-        auto it = lb->second == 1 ? alias.find(u) : alias.end();
-        u = it == alias.end() ? std::string() : it->second;
-      }
-      if (u.empty() || local.count(u) || !done.insert(u).second) continue;
+      std::string u = unit_of(m);
+      if (u.empty() || !done.insert(u).second) continue;
       std::string p = head_cmi(u);
       if (!std::filesystem::exists(p)) continue;
       try {
@@ -20854,14 +21019,14 @@ struct Cites {
         // `Stdlib__Atomic.get` costs 13 where `Atomic.get` costs 13 + 13.
         bool aliased = u != c.module_name();
         Applied a;
-        scan_applied(m, false, c.sig(), a);
+        scan_applied(m, false, c.sig(), a, app);
         auto subs = named_subs(m, c.sig());
         for (auto& au : alias_subs(m, c.sig()))
           if (more[au] < 1) more[au] = 1;
         for (auto& s : subs) {
           k += load_cost(*s.second, extra);
           Applied b;
-          scan_applied(m + "." + s.first, true, *s.second, b);
+          scan_applied(m + "." + s.first, true, *s.second, b, app);
           if (b.self && aliased) k += load_cost(*s.second, extra, 2);
           for (auto& e : b.units)
             if (more[e.first] < e.second) more[e.first] = e.second;
@@ -20989,6 +21154,18 @@ struct Count {
     expr(*c.rhs);
     release(m);
   }
+  // A `match`/`try` with an `effect` row is typed by `type_effect_cases`
+  // (typecore.ml:7377), which names ONE locally abstract type for the effect
+  // whatever the rows number: `match 10 with x -> x | effect E, k -> 11` is
+  // one ident more than the same match without the row, and a second
+  // `effect` row adds nothing.  Only a row's OWN head counts -- `split_cases`
+  // tests `pc_lhs` itself.
+  static bool eff_row(const std::vector<Case>& cs) {
+    if (dbg_env("NOEFFROW")) return false;
+    for (auto& c : cs)
+      if (std::get_if<Ppat_effect>(&c.lhs.desc)) return true;
+    return false;
+  }
   // GHOST BINDINGS (typecore.ml:7695): so that a missing `rec` can be
   // diagnosed, a non-recursive `let` whose bindings are ALL syntactically
   // functions enters one unbound-value ident per bound variable -- but only
@@ -21066,9 +21243,11 @@ struct Count {
       if (c->arg) expr(**c->arg);
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       expr(*m->e);
+      n += eff_row(m->cases);
       for (auto& c : m->cases) cse(c);
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
       expr(*t->e);
+      n += eff_row(t->cases);
       for (auto& c : t->cases) cse(c);
     } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
       expr(*s->e1); expr(*s->e2);
@@ -21302,8 +21481,10 @@ int typing_ident_count(const ast::Structure& s) {
   long long k = c.n;
   if (!dbg_env("NOUNITLOAD")) {
     stampcount::Cites u;
+    u.bare_ = !dbg_env("NOBAREHEAD");
     for (auto& it : s) u.item(it);
-    k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"));
+    k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
+                !dbg_env("NOAPPRES"));
   }
   return (int)k;
 }
@@ -21314,8 +21495,10 @@ int typing_ident_count(const ast::Signature& s) {
   long long k = c.n;
   if (!dbg_env("NOUNITLOAD")) {
     stampcount::Cites u;
+    u.bare_ = !dbg_env("NOBAREHEAD");
     for (auto& it : s) u.sig_item(it);
-    k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"));
+    k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
+                !dbg_env("NOAPPRES"));
   }
   return (int)k;
 }
