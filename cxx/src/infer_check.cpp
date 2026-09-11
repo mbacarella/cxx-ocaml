@@ -20059,6 +20059,53 @@ const std::set<std::string>& stdlib_value_names() {
   return names;
 }
 
+// How many idents does FORCING a loaded unit's signature cost?  One per
+// top-level item (`rename_bound_idents`, subst.ml:594) plus one per NAMED
+// functor parameter of a top-level module or module type: substituting an
+// `Mty_functor(Named(id, _), _)` renames that parameter as well.  So `open
+// Hashtbl` costs 41, not its 39 items -- Make and MakeSeeded add one each --
+// Map and Set cost 4 for 3 items, Pqueue 14 for 10.
+int functor_params(const cmi::ModuleTypePtr& m) {
+  int k = 0;
+  for (const cmi::ModuleType* t = m.get();
+       t && t->kind == cmi::ModuleType::Functor; t = t->functor_body.get())
+    if (t->functor_param) ++k;
+  return k;
+}
+long long load_cost(const cmi::Signature& sg, bool fparams) {
+  long long k = (long long)sg.order.size();
+  if (fparams) {
+    for (auto& m : sg.modules) k += functor_params(m.type);
+    for (auto& m : sg.modtypes) k += functor_params(m.type);
+  }
+  return k;
+}
+// Is this path one of the printf-family format types?  A string literal at
+// such a type is typed by Typecore.type_format, which names the
+// CamlinternalFormatBasics constructors and so LOADS that unit: `Printf.printf
+// "hi"` costs 19 + 25 where a bare `open Printf` costs 19.
+bool fmt_name(const std::string& n) {
+  return n == "format" || n == "format4" || n == "format6";
+}
+bool fmt_path(const cmi::Path* p) {
+  return p && fmt_name(p->kind == cmi::Path::Pdot ? p->s : p->id.name);
+}
+bool type_has_format(const cmi::TypePtr& t,
+                     std::set<const cmi::TypeExpr*>& seen) {
+  if (!t || !seen.insert(t.get()).second) return false;
+  if (fmt_path(t->path.get())) return true;
+  if (type_has_format(t->dom, seen) || type_has_format(t->cod, seen) ||
+      type_has_format(t->link, seen))
+    return true;
+  for (auto& e : t->elems)
+    if (type_has_format(e.second, seen)) return true;
+  for (auto& a : t->args)
+    if (type_has_format(a, seen)) return true;
+  for (auto& a : t->pv_args)
+    if (type_has_format(a, seen)) return true;
+  return false;
+}
+
 // --- WHICH COMPILATION UNITS DOES THIS FILE CITE? --------------------------
 // Loading one is the single largest contribution to the stamp base.
 // `Env.sign_of_cmi` hands the .cmi's signature to `Subst.Lazy.modtype`, and
@@ -20076,6 +20123,14 @@ struct Cites {
   // ambiguous, so its alias is not followed.
   std::map<std::string, int> local;
   std::map<std::string, std::string> alias;  // local name -> its target
+  // Which members of a cited unit the file NAMES, and which units it
+  // opens together with every bare value name it uses: reading a
+  // member's type is what resolves the paths that type mentions, and
+  // `open Printf` alone reads none of them.
+  std::map<std::string, std::set<std::string>> members;
+  std::set<std::string> opens;
+  std::set<std::string> bares;
+  bool fmt_ann = false;  // a written `.. format` / format4 / format6
 
   void add(const std::string& m) {
     if (m.empty() || m == "Stdlib") return;
@@ -20107,14 +20162,33 @@ struct Cites {
       cite(*a->x, true);
     } else if (auto* d = std::get_if<Ldot>(&id.v)) {
       cite(*d->prefix, true);
-      // `Stdlib.List.map` loads Stdlib__List even though Stdlib is free.
-      if (auto* l = std::get_if<Lident>(&d->prefix->v))
+      if (auto* l = std::get_if<Lident>(&d->prefix->v)) {
+        // `Stdlib.List.map` loads Stdlib__List though Stdlib is free.
         if (l->name == "Stdlib") add(d->name);
+        else members[l->name].insert(d->name);
+      } else if (auto* q = std::get_if<Ldot>(&d->prefix->v)) {
+        auto* h = std::get_if<Lident>(&q->prefix->v);
+        if (h && h->name == "Stdlib") members[q->name].insert(d->name);
+      }
     } else if (modpos) {
       add(std::get<Lident>(id.v).name);
+    } else {
+      const std::string& n = std::get<Lident>(id.v).name;
+      if (!n.empty() && !std::isupper((unsigned char)n[0])) bares.insert(n);
     }
   }
   void cite(const LongidentLoc& id, bool modpos) { cite(id.txt, modpos); }
+  // `open Printf` brings its members into scope under their BARE names,
+  // so a later `printf "%d"` names one without writing the module.
+  void opened(const Longident& id) {
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      opens.insert(l->name);
+    } else if (auto* d = std::get_if<Ldot>(&id.v)) {
+      auto* l = std::get_if<Lident>(&d->prefix->v);
+      if (l && l->name == "Stdlib") opens.insert(d->name);
+    }
+  }
+  void opened(const LongidentLoc& id) { opened(id.txt); }
 
   void pkg(const Ptyp_package& p) {
     cite(p.path, false);
@@ -20123,6 +20197,9 @@ struct Cites {
   void ty(const CoreType& t) {
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
       cite(c->id, false);
+      // A written `(_, _, _) format` annotation types its string literal
+      // the same way a printf argument does.
+      if (fmt_name(lid_last(c->id.txt))) fmt_ann = true;
       for (auto& a : c->args) ty(*a);
     } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
       ty(*a->dom); ty(*a->cod);
@@ -20151,6 +20228,7 @@ struct Cites {
       ty(*p->type);
     } else if (auto* o = std::get_if<Ptyp_open>(&t.desc)) {
       cite(o->mod_, true);
+      opened(o->mod_);
       ty(*o->type);
     } else if (auto* f = std::get_if<Ptyp_functor>(&t.desc)) {
       pkg(f->pkg);
@@ -20186,6 +20264,7 @@ struct Cites {
       if (u->pkg) pkg(*u->pkg);
     } else if (auto* o = std::get_if<Ppat_open>(&p.desc)) {
       cite(o->mod_, true);
+      opened(o->mod_);
       pat(*o->p);
     } else if (auto* f = std::get_if<Ppat_effect>(&p.desc)) {
       pat(*f->eff); pat(*f->cont);
@@ -20344,6 +20423,7 @@ struct Cites {
       cexpr(*k->ce); ctype(*k->ct);
     } else if (auto* o = std::get_if<Pcl_open>(&c.desc)) {
       cite(o->id, true);
+      opened(o->id);
       cexpr(*o->body);
     }
   }
@@ -20358,6 +20438,7 @@ struct Cites {
       ty(*a->dom); ctype(*a->cod);
     } else if (auto* o = std::get_if<Pcty_open>(&c.desc)) {
       cite(o->id, true);
+      opened(o->id);
       ctype(*o->body);
     }
   }
@@ -20489,6 +20570,7 @@ struct Cites {
       cite(m->manifest, true);
     } else if (auto* o = std::get_if<Psig_open>(&it.desc)) {
       cite(o->id, true);
+      opened(o->id);
     } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
       mty(i->mt);
     } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
@@ -20522,6 +20604,7 @@ struct Cites {
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexp(i->expr);
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
+      if (auto* i = std::get_if<Pmod_ident>(&o->expr.desc)) opened(i->id);
       mexp(o->expr);
     } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
       for (auto& d : c->decls) cdecl(d);
@@ -20529,11 +20612,33 @@ struct Cites {
       for (auto& d : c->decls) ctdecl(d);
     }
   }
-  // One ident per top-level item of every DISTINCT unit the file cites.  A
-  // head the file binds itself shadows the unit, and a head with no readable
-  // .cmi was never loaded.
-  long long cost() const {
+  // Does the file read a member of `c` -- named `src` in the source -- whose
+  // type mentions a format?  Typing an argument at that type is what runs
+  // type_format; `ignore Printf.printf` reads printf's type too, so this is
+  // an over-approximation of the literal.
+  bool reads_format(const std::string& src, const cmi::CmiFile& c) const {
+    auto has = [&c](const std::string& name) {
+      auto* v = c.find_value(name);
+      if (!v) return false;
+      std::set<const cmi::TypeExpr*> seen;
+      return type_has_format(v->type, seen);
+    };
+    auto it = members.find(src);
+    if (it != members.end())
+      for (auto& name : it->second)
+        if (has(name)) return true;
+    if (opens.count(src))
+      for (auto& name : bares)
+        if (has(name)) return true;
+    return false;
+  }
+  // One ident per top-level item (and per functor parameter) of every DISTINCT
+  // unit the file cites, plus CamlinternalFormatBasics when a format type is
+  // read.  A head the file binds itself shadows the unit, and a head with no
+  // readable .cmi was never loaded.
+  long long cost(bool extra) const {
     long long k = 0;
+    bool fmt = extra && fmt_ann;
     std::set<std::string> done;  // two names can alias ONE unit
     for (auto& m : units) {
       std::string u = m;
@@ -20546,9 +20651,18 @@ struct Cites {
       std::string p = head_cmi(u);
       if (!std::filesystem::exists(p)) continue;
       try {
-        k += (long long)cmi::CmiFile::load(p).sig().order.size();
+        const cmi::CmiFile& c = cmi::CmiFile::load(p);
+        k += load_cost(c.sig(), extra);
+        if (extra && !fmt) fmt = reads_format(m, c);
       } catch (...) {
       }
+    }
+    if (fmt && done.insert("CamlinternalFormatBasics").second) {
+      std::string p = head_cmi("CamlinternalFormatBasics");
+      if (std::filesystem::exists(p)) try {
+          k += load_cost(cmi::CmiFile::load(p).sig(), extra);
+        } catch (...) {
+        }
     }
     return k;
   }
@@ -20960,7 +21074,7 @@ int typing_ident_count(const ast::Structure& s) {
   if (!dbg_env("NOUNITLOAD")) {
     stampcount::Cites u;
     for (auto& it : s) u.item(it);
-    k += u.cost();
+    k += u.cost(!dbg_env("NOEXTRALOAD"));
   }
   return (int)k;
 }
@@ -20972,7 +21086,7 @@ int typing_ident_count(const ast::Signature& s) {
   if (!dbg_env("NOUNITLOAD")) {
     stampcount::Cites u;
     for (auto& it : s) u.sig_item(it);
-    k += u.cost();
+    k += u.cost(!dbg_env("NOEXTRALOAD"));
   }
   return (int)k;
 }
