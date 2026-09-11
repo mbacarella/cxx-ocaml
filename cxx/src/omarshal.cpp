@@ -83,7 +83,11 @@ struct Marshaler {
     }
     // a sharable object already serialized -> a back-reference (objs[nobjs-dist])
     if (auto it = seen.find(v.get()); it != seen.end()) { emit_shared(nobjs - it->second); return; }
-    seen[v.get()] = nobjs;  // index assigned before this object's own nobjs++
+    // An Int is an IMMEDIATE: it takes no object slot, so registering it would
+    // file the NEXT object's index under it and a second use of the same
+    // ValPtr would emit a back-reference to the wrong object.
+    if (v->k != Value::Int)
+      seen[v.get()] = nobjs;  // index assigned before this object's own nobjs++
     switch (v->k) {
       case Value::Int: emit_int(v->i); return;
       case Value::Str: emit_str(v->s); return;

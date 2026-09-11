@@ -18,6 +18,13 @@ CPP=${CPP:-$ROOT/cxx/build-release/c++ocamlc}
 JOBS="${JOBS:-8}"
 TIMEOUT="${CPP_TIMEOUT:-20}"
 
+# Marshalled SIGNATURE length (the `data_len` word of the intext header at
+# offset 16): the part of a .cmi the exe`s CRCS digest is taken over, and the
+# only part physical sharing can shrink.  The file size would also count the
+# import list, where the .ml path is short by design.
+hdrlen() { perl -e 'open my $h,"<:raw",$ARGV[0] or exit; read $h,my $b,20;
+                     print 20 + unpack("N", substr($b,16,4))' "$1"; }
+
 if [ "${1:-}" = "--worker" ]; then
   f="$2"
   td=$(mktemp -d) || exit 0
@@ -33,13 +40,16 @@ if [ "${1:-}" = "--worker" ]; then
   oc=$(ls "$td"/o/*.cmi 2>/dev/null | wc -l)
   if [ "$oc" -ne 1 ]; then rm -rf "$td"; echo "CPPERR $f"; exit 0; fi
   R=$(ls "$td"/r/*.cmi); O=$(ls "$td"/o/*.cmi)
-  if cmp -s "$O" "$R"; then rm -rf "$td"; echo "SAME $f"; exit 0; fi
+  if cmp -s "$O" "$R"; then
+    s=$(hdrlen "$R"); rm -rf "$td"; echo "SAME $f 0 $s $s"; exit 0
+  fi
   M="$ROOT/cxx/harness/mdump.pl"
   d=$(diff <(timeout 60 perl "$M" "$O" --expand --norm-ids 2>/dev/null) \
            <(timeout 60 perl "$M" "$R" --expand --norm-ids 2>/dev/null) \
        | grep -cE '^[<>]')
+  os=$(hdrlen "$O"); rs=$(hdrlen "$R")
   rm -rf "$td"
-  echo "DIFF $f $d"
+  echo "DIFF $f $d $os $rs"
   exit 0
 fi
 
@@ -52,6 +62,11 @@ printf '%s\n' "$res" | sort > /tmp/.cmi_bytes_results
 [ "${V:-0}" = 1 ] &&
   awk '$1=="DIFF"{print $3"\t"$2}' /tmp/.cmi_bytes_results | sort -n
 awk '$1=="SAME"{s++} $1=="DIFF"{d++; t+=$3} $1=="CPPERR"{e++} $1=="SKIP"{k++}
+  $1=="SAME"||$1=="DIFF"{ob+=$4; rb+=$5; ad+=($4>$5?$4-$5:$5-$4)}
   END{printf "cmi judged: %d   BYTE-IDENTICAL: %d   DIFF: %d" \
              "   value-tree diff lines: %d   (cpp-fail %d, skip %d)\n",
-             s+d, s, d, t, e, k}' /tmp/.cmi_bytes_results
+             s+d, s, d, t, e, k;
+      printf "cmi SIGNATURE BYTES: ours %d   ref %d   excess %+d (%+.1f%%)" \
+             "   |per-file gap| %d\n",
+             ob, rb, ob-rb, rb ? (ob-rb)*100.0/rb : 0, ad}' \
+    /tmp/.cmi_bytes_results

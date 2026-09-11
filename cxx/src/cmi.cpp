@@ -1443,6 +1443,71 @@ int predef_stamp(const std::string& n) {
   return it == s.end() ? 0 : it->second;
 }
 
+// --- physical sharing: one Value per object ocamlc's heap holds once --------
+// The marshaller emits a two-byte CODE_SHARED back-reference for a value it has
+// already written, and several of the values a signature cites over and over
+// are ONE object up there: every Lexing.position in a file points at the same
+// pos_fname string, `Location.none` is a single record built at module init
+// (warnings.ml:716), each `Predef.path_*` is a single Path.t, and
+// rename_bound_idents stores one `Pident id'` per bound ident which
+// Subst.type_path then hands to every citation (subst.ml:594).  We built a
+// fresh Value per citation, so patmatch.cmi carried 977 copies of
+// "patmatch.ml" and 511 of "Patmatch" -- 1652 back-references in ocamlc's .cmi
+// against our 24.  The tables are per-cmi (cleared by the writers).
+// NOCMISHARE=1 reverts to a copy per citation.
+struct CmiShare {
+  std::map<std::string, o::ValPtr> strs;            // pos_fname / unit name
+  std::map<std::string, o::ValPtr> poss;   // Lexing.position, by content
+  std::map<std::string, o::ValPtr> ids;    // "tag:stamp:name" -> Ident.t
+  std::map<const o::Value*, o::ValPtr> pidents;     // Ident.t -> Path.Pident
+  o::ValPtr none;                                   // Location.none
+  o::ValPtr tvar_none, tunivar_none;                // the two shared descs
+  void clear() {
+    strs.clear(); poss.clear(); ids.clear(); pidents.clear(); none = nullptr;
+    tvar_none = tunivar_none = nullptr;
+  }
+};
+CmiShare g_share;
+bool no_share() {
+  static const bool off = cppcaml::dbg_env("NOCMISHARE") != nullptr;
+  return off;
+}
+o::ValPtr shared_str(const std::string& s) {
+  if (no_share()) return o::vstr(s);
+  auto& v = g_share.strs[s];
+  if (!v) v = o::vstr(s);
+  return v;
+}
+// Ident.t: Local{name;stamp} is tag 0, Predef{name;stamp} tag 3.
+o::ValPtr ident_val(int tag, const std::string& name, int stamp) {
+  if (no_share()) return o::vblock(tag, {o::vstr(name), o::vint(stamp)});
+  auto& v = g_share.ids[std::to_string(tag) + ":" + std::to_string(stamp) +
+                        ":" + name];
+  if (!v) v = o::vblock(tag, {o::vstr(name), o::vint(stamp)});
+  return v;
+}
+o::ValPtr pident(const o::ValPtr& id) {  // Path.Pident
+  if (no_share()) return o::vblock(0, {id});
+  auto& v = g_share.pidents[id.get()];
+  if (!v) v = o::vblock(0, {id});
+  return v;
+}
+o::ValPtr pident_local(const std::string& name, int stamp) {
+  return pident(ident_val(0, name, stamp));
+}
+o::ValPtr pident_predef(const std::string& name, int stamp) {
+  return pident(ident_val(3, name, stamp));
+}
+// subst.ml's `norm` (:157-162) exists for exactly this: it rewrites every
+// anonymous `Tvar None` / `Tunivar None` desc to one shared value, so a saved
+// signature holds ONE of each however many variables it has.
+o::ValPtr var_none_desc(bool univar) {
+  if (no_share()) return o::vblock(univar ? 7 : 0, {o::vint(0)});
+  auto& v = univar ? g_share.tunivar_none : g_share.tvar_none;
+  if (!v) v = o::vblock(univar ? 7 : 0, {o::vint(0)});
+  return v;
+}
+
 // --- module resolution (for qualified `M.t` Tconstr paths + import CRCs) -----
 std::string g_stdlib_dir = "stdlib";
 std::vector<std::string> g_module_dirs;
@@ -1611,7 +1676,7 @@ struct TyEmit {
     }
     if (local_modtypes)
       if (auto it = local_modtypes->find(ref); it != local_modtypes->end())
-        return o::vblock(0, {o::vblock(0, {o::vstr(ref), o::vint(it->second)})});  // Pident(Local)
+        return pident_local(ref, it->second);  // Pident(Local)
     return nullptr;
   }
   // The Path.t of a path CONTAINING FUNCTOR APPLICATIONS (`Set.Make(String).t`,
@@ -1676,8 +1741,7 @@ struct TyEmit {
                 }
         }
         if (local_ok) {
-          path = o::vblock(0, {o::vblock(0, {o::vstr(id),
-                                             o::vint(head_stamp)})});  // Pident(Local)
+          path = pident_local(id, head_stamp);  // Pident(Local)
         } else {
           std::string g = global_of(id);
           if (referenced) (*referenced)[g] = true;
@@ -1769,8 +1833,7 @@ struct TyEmit {
               for (auto s = bn->second.rbegin(); s != bn->second.rend(); ++s)
                 if (*s != self_stamp) { mstamp = *s; break; }
           if (mstamp != self_stamp) {
-            o::ValPtr path = o::vblock(0, {o::vblock(0, {o::vstr(comps[0]),
-                                                         o::vint(mstamp)})});
+            o::ValPtr path = pident_local(comps[0], mstamp);
             for (std::size_t i = 1; i < comps.size(); ++i)
               path = o::vblock(1, {path, o::vstr(comps[i])});  // Pdot
             return path;
@@ -1803,10 +1866,10 @@ struct TyEmit {
     // identity, so consumers (Tast_iterator) read garbage (bootstrap #13).
     if (local_types && local_types->count(name)) {
       int st = local_types->at(name);
-      return o::vblock(0, {o::vblock(0, {o::vstr(name), o::vint(st)})});  // Pident(Local)
+      return pident_local(name, st);  // Pident(Local)
     }
     if (int st = predef_stamp(name))
-      return o::vblock(0, {o::vblock(3, {o::vstr(name), o::vint(st)})});  // Pident(Predef)
+      return pident_predef(name, st);  // Pident(Predef)
     if (stdlib_toplevel_type(name)) {
       if (referenced) (*referenced)["Stdlib"] = true;
       return o::vblock(1, {o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})}),
@@ -1880,11 +1943,12 @@ struct TyEmit {
     switch (t->k) {
       case Ty::Var: {
         if (auto it = vars.find(t->var); it != vars.end()) return it->second;
-        o::ValPtr nm = t->var_name.empty()
-                           ? o::vint(0)                                // None
-                           : o::vblock(0, {o::vstr(t->var_name)});     // Some name
         // Tunivar for a poly field's `'a.` binder, Tvar otherwise
-        o::ValPtr te = texpr(o::vblock(t->univar ? 7 : 0, {nm}));
+        o::ValPtr te = texpr(
+            t->var_name.empty()
+                ? var_none_desc(t->univar)
+                : o::vblock(t->univar ? 7 : 0,
+                            {o::vblock(0, {o::vstr(t->var_name)})}));  // Some
         vars[t->var] = te;
         return te;
       }
@@ -1910,10 +1974,9 @@ struct TyEmit {
             t->name.find('.') == std::string::npos)
           if (auto es = engine_types->find(t->engine_stamp);
               es != engine_types->end())
-            path = o::vblock(0, {o::vblock(0, {o::vstr(t->name),
-                                               o::vint(es->second)})});  // Pident(Local)
+            path = pident_local(t->name, es->second);  // Pident(Local)
         if (!path) path = type_path(t->name);
-        if (!path) return texpr(o::vblock(0, {o::vint(0)}));  // unknown -> Tvar None
+        if (!path) return texpr(var_none_desc(false));  // unknown -> Tvar None
         std::vector<o::ValPtr> as;
         for (auto& a : t->args) as.push_back(emit(a));
         auto abbrev = o::vblock(0, {o::vint(0)});  // ref Mnil
@@ -2019,7 +2082,7 @@ struct TyEmit {
         }
         o::ValPtr more = t->row_kind == 2
                              ? texpr(o::vint(0))                    // Tnil (exact)
-                             : texpr(o::vblock(0, {o::vint(0)}));   // Tvar None
+                             : texpr(var_none_desc(false));         // Tvar None
         // A named row bound (`[< int u]`): row_name = Some(path, args) -- the
         // printer shows `[< int u > `A ]` from the name instead of the raw tags.
         o::ValPtr rname = o::vint(0);
@@ -2044,7 +2107,7 @@ struct TyEmit {
         // The printer sorts fields by name, so emission order is source order.
         o::ValPtr tailvar;  // the OPEN row's terminating Tvar (shared with nm)
         o::ValPtr row = t->row_kind == 0
-                            ? (tailvar = texpr(o::vblock(0, {o::vint(0)})))  // Tvar None (open)
+                            ? (tailvar = texpr(var_none_desc(false)))
                             : texpr(o::vint(0));                 // Tnil (a full type_expr node)
         for (std::size_t i = t->pv_tags.size(); i-- > 0;) {
           o::ValPtr mty = texpr(o::vblock(8, {emit(t->args[i]), o::vint(0)}));  // Tpoly(ty,[])
@@ -2067,7 +2130,7 @@ struct TyEmit {
       case Ty::Package: {
         if (o::ValPtr package = pack_payload(*t))
           return texpr(o::vblock(9, {package}));  // Tpackage
-        return texpr(o::vblock(0, {o::vint(0)}));  // unplaceable -> Tvar None
+        return texpr(var_none_desc(false));  // unplaceable -> Tvar None
       }
     }
     return o::vint(0);
@@ -2084,8 +2147,11 @@ o::ValPtr none_pos() {
                        o::vint(0), o::vint(0), o::vint(-1)});
 }
 o::ValPtr loc_none() {  // Location.none = {loc_start; loc_end; loc_ghost=true}
+  if (!no_share() && g_share.none) return g_share.none;
   auto p = none_pos();
-  return o::vblock(0, {p, p, o::vint(1)});
+  auto l = o::vblock(0, {p, p, o::vint(1)});
+  if (!no_share()) g_share.none = l;
+  return l;
 }
 // The source filenames for the cmi being written: [0] = the source path (file_id
 // 0), [k] = the k-th `# N "file"` directive.  Set by write_cmi; read by emit_loc
@@ -2097,7 +2163,19 @@ o::ValPtr emit_pos(const cmiw::WPos& p) {  // Lexing.position
   const std::string& fn = !p.fname.empty() ? p.fname
       : (p.file_id >= 0 && (std::size_t)p.file_id < g_cmi_src_files.size())
                               ? g_cmi_src_files[p.file_id] : g_cmi_src_files.empty() ? "" : g_cmi_src_files[0];
-  return o::vblock(0, {o::vstr(fn), o::vint(p.lnum), o::vint(p.bol), o::vint(p.cnum)});
+  // A position is the lexer's own record for a token boundary, so every
+  // location that starts or ends there cites the SAME one: `type t = A` ends
+  // at char 10 and so does its constructor, and ocamlc's .cmi writes the
+  // second as a back-reference.
+  if (no_share())
+    return o::vblock(0, {shared_str(fn), o::vint(p.lnum), o::vint(p.bol),
+                         o::vint(p.cnum)});
+  auto& v = g_share.poss[fn + ":" + std::to_string(p.lnum) + ":" +
+                         std::to_string(p.bol) + ":" + std::to_string(p.cnum)];
+  if (!v)
+    v = o::vblock(0, {shared_str(fn), o::vint(p.lnum), o::vint(p.bol),
+                      o::vint(p.cnum)});
+  return v;
 }
 o::ValPtr emit_loc(const cmiw::Loc& l) {  // Location.t
   if (l.ghost) return loc_none();
@@ -2109,9 +2187,10 @@ o::ValPtr emit_loc(const cmiw::Loc& l) {  // Location.t
 o::ValPtr emit_uid(const cmiw::Uid& u) {
   switch (u.k) {
     case cmiw::Uid::Item:
-      return o::vblock(1, {o::vstr(u.unit), o::vint(u.id), o::vint(u.intf ? 0 : 1)});
-    case cmiw::Uid::CompUnit: return o::vblock(0, {o::vstr(u.unit)});
-    case cmiw::Uid::Predef:   return o::vblock(3, {o::vstr(u.unit)});
+      return o::vblock(1, {shared_str(u.unit), o::vint(u.id),
+                           o::vint(u.intf ? 0 : 1)});
+    case cmiw::Uid::CompUnit: return o::vblock(0, {shared_str(u.unit)});
+    case cmiw::Uid::Predef:   return o::vblock(3, {shared_str(u.unit)});
     case cmiw::Uid::Internal: break;
   }
   return o::vint(0);  // Internal
@@ -2288,8 +2367,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       for (auto* m : {extra_mods, (const std::unordered_map<std::string, int>*)&visible_mod})
         if (m)
           if (auto f = m->find(h); f != m->end()) {
-            o::ValPtr path = o::vblock(0,
-                {o::vblock(0, {o::vstr(h), o::vint(f->second)})});  // Pident(Local)
+            o::ValPtr path = pident_local(h, f->second);  // Pident(Local)
             for (std::size_t pos = dot; pos != std::string::npos;) {
               std::size_t nd = ref.find('.', pos + 1);
               path = o::vblock(1, {path, o::vstr(ref.substr(pos + 1,
@@ -2319,7 +2397,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       return path;
     }
     if (auto it = visible_mt.find(ref); it != visible_mt.end())
-      return o::vblock(0, {o::vblock(0, {o::vstr(ref), o::vint(it->second)})});  // Pident(Local)
+      return pident_local(ref, it->second);  // Pident(Local)
     return nullptr;
   };
   // Build the Mty_functor value for a functor SigItem (is_functor): the curried
@@ -2352,7 +2430,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         name_opt = o::vint(0);  // None
       } else {
         int pstamp = stamp++;
-        auto pident = o::vblock(0, {o::vstr(pname), o::vint(pstamp)});  // Ident.Local
+        auto pident = ident_val(0, pname, pstamp);  // Ident.Local
         visible_mod_body[pname] = pstamp;
         modscope_body.by_name[pname].push_back(pstamp);
         modscope_body.members[pstamp] = module_member_names(psig_items);
@@ -2408,7 +2486,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     te.local_modtypes = &visible_mt; te.local_mods = &visible_mod;
     te.engine_types = &visible_eng;
     te.mods_by_name = &modscope.by_name; te.mod_members = &modscope.members;
-    auto ident = o::vblock(0, {o::vstr(it.name), o::vint(item_stamp[i])});  // Ident.Local{name;stamp}
+    auto ident = ident_val(0, it.name, item_stamp[i]);  // Ident.Local
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
       if (it.prim.empty() && it.prim_native.empty() && !it.prim_external) {
@@ -2464,7 +2542,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (auto lm = visible_mod.find(head); lm != visible_mod.end()) {
           // A LOCAL sibling head (`include M` strengthened `module Set =
           // M.Set`): Pident(Local{M, stamp}), not a unit global.
-          path = o::vblock(0, {o::vblock(0, {o::vstr(head), o::vint(lm->second)})});
+          path = pident_local(head, lm->second);
         } else {
           referenced.emplace(head, false);
           path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global head)
@@ -2605,7 +2683,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // a self-returning method (`method m = {< >}`, f.self_ref) can cite the
       // SAME node -- Printtyp then aliases the self-row proxy and prints
       // `object ('a) .. method m : 'a end`.
-      o::ValPtr row_var = te.texpr(o::vblock(0, {o::vint(0)}));  // Tvar None
+      o::ValPtr row_var = te.texpr(var_none_desc(false));  // Tvar None
       o::ValPtr self = te.texpr(o::vint(0));  // Tobject desc patched below
       // The bridged self node (one shared Ty across the class fields) maps to
       // csig_self, so a method type citing `'self` (`unit -> 'self`) emits a
@@ -2648,8 +2726,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (it.class_constr_ref.find('.') == std::string::npos) {
           if (auto lc = local_classes.find(it.class_constr_ref);
               lc != local_classes.end())
-            cp = o::vblock(0, {o::vblock(0,
-                {o::vstr(it.class_constr_ref), o::vint(lc->second)})});  // Pident(Local)
+            cp = pident_local(it.class_constr_ref, lc->second);
         } else {
           cp = te.type_path(it.class_constr_ref);  // local-mod / global Pdot chain
         }
@@ -2683,7 +2760,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                             p < it.class_arrow_lbls.size() ? it.class_arrow_lbls[p] : "");
         cnew = o::vblock(0, {te.emit(nt)});
       }
-      auto cpath = o::vblock(0, {o::vblock(0, {o::vstr(it.name), o::vint(s_ty)})});
+      auto cpath = pident_local(it.name, s_ty);
       // cty_params : the `['a, _] c` type params, and one Variance per param
       // (Variance.unknown = 7 -- Printtyp shows nothing, as the oracle does).
       auto cty_params = [&] {
@@ -2722,10 +2799,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       auto clty = o::vblock(0, {cty_params(), cty, cpath,
                                 mk_tdecl(o::vint(0)), cty_variance(),
                                 loc_none(), o::vint(0), o::vint(0)});
-      auto clty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_clty)});
+      auto clty_ident = ident_val(0, it.name, s_clty);
       sig.push_back(o::vblock(6, {clty_ident, clty, o::vint(rs), o::vint(0)}));  // Sig_class_type
       // ghost Sig_type c = <closed public object> (what `val o : c` cites)
-      auto ty_ident = o::vblock(0, {o::vstr(it.name), o::vint(s_ty)});
+      auto ty_ident = ident_val(0, it.name, s_ty);
       auto g_tdecl = mk_tdecl(o::vblock(0, {te.emit(ty_object(mnames, mtys))}));
       sig.push_back(o::vblock(1, {ty_ident, g_tdecl, o::vint(rs), o::vint(0)}));  // Sig_type
     } else {
@@ -2952,13 +3029,15 @@ std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items_in,
                       const std::vector<Import>& imports, bool intf,
                       const std::vector<std::string>& src_files) {
+  g_share.clear();              // the shared-value tables are per-cmi
   g_cmi_src_files = src_files;  // resolve position file_ids to pos_fname (emit_loc)
   std::vector<SigItem> items = items_in;  // mutable copy: uids assigned in place
   int uid_counter = 0;
   assign_uids(items, modname, intf, uid_counter);
   std::map<std::string, bool> referenced;  // cited global unit -> needs real CRC
   int stamp = 300;
-  auto header = o::vblock(0, {o::vstr(modname), o::vlist(emit_sig_items(items, referenced, stamp))});
+  auto sig = emit_sig_items(items, referenced, stamp);
+  auto header = o::vblock(0, {shared_str(modname), o::vlist(sig)});
   std::vector<std::uint8_t> hbytes = o::marshal(header);
 
   const std::string MAGIC = "Caml1999I038";
@@ -3064,13 +3143,14 @@ o::ValPtr read_cmi_sign(const std::string& path, std::string* out_name) {
 
 std::string write_packed_cmi(const std::string& path, const std::string& pack_name,
                              const std::vector<std::string>& member_cmis) {
+  g_share.clear();              // the shared-value tables are per-cmi
   int stamp = 200;
   std::vector<o::ValPtr> sig_items;
   for (const auto& mc : member_cmis) {
     std::string mname;
     o::ValPtr member_sign = read_cmi_sign(mc, &mname);
     // module <Member> : sig <member_sign> end
-    auto ident = o::vblock(0, {o::vstr(mname), o::vint(stamp++)});       // Ident.Local
+    auto ident = ident_val(0, mname, stamp++);              // Ident.Local
     auto mty = o::vblock(1, {member_sign});                             // Mty_signature
     auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, loc_none(),
                             o::vint(0) /*md_uid*/});                    // module_declaration

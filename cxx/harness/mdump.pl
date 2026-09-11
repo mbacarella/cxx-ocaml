@@ -12,7 +12,7 @@
 # --expand    follow CODE_SHARED back-references instead of printing #n
 # --norm-ids  print every integer < -1 as `id` (Subst.newpersty counts down
 #             from -1, so type_expr ids are exactly the negative ints)
-use strict; use warnings;
+use strict; use warnings; no warnings "recursion";
 
 my ($path, $skip, $count, $expand, $normids) = (undef, 12, 1, 0, 0);
 my @a = @ARGV;
