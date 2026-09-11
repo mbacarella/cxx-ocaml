@@ -21365,6 +21365,240 @@ struct Count {
     return s ? (long long)s->items.size() : 0;
   }
 
+  // `Subst.modtype` renames one ident per item of every signature a module type
+  // spans -- the nested ones included, since it recurses through them -- plus
+  // one for each NAMED functor parameter (S436).  An `Mty_ident` renames
+  // nothing at all: only its path is substituted.
+  static long long ren_mty(const ModuleType& mt) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += ren_sig_item(it);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = ren_mty(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+        if (nm->name.txt) ++k;
+        k += ren_mty(*nm->type);
+      }
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return ren_mty(*w->mt);
+    return 0;
+  }
+  static long long ren_sig_item(const SignatureItem& it) {
+    if (std::holds_alternative<Psig_value>(it.desc) ||
+        std::holds_alternative<Psig_primitive>(it.desc) ||
+        std::holds_alternative<Psig_modsubst>(it.desc))
+      return 1;
+    if (auto* t = std::get_if<Psig_type>(&it.desc))
+      return (long long)t->decls.size();
+    if (auto* t = std::get_if<Psig_typesubst>(&it.desc))
+      return (long long)t->decls.size();
+    if (auto* x = std::get_if<Psig_typext>(&it.desc))
+      return (long long)x->ext.ctors.size();
+    if (std::holds_alternative<Psig_exception>(it.desc)) return 1;
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return 1 + ren_mty(*m->md.type);
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += 1 + ren_mty(*d.type);
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return 1 + (m->type ? ren_mty(*m->type) : 0);
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return 1 + ren_mty(m->type);
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) return ren_mty(i->mt);
+    return 0;
+  }
+
+  // A CONSTRUCTOR and a record LABEL carry an ident of their own
+  // (`cd_id`/`ld_id`, built by `Typedecl.transl_declaration`), so the pass that
+  // reads a declaration a second time names them again -- but nothing
+  // afterwards does: `Subst.type_declaration` keeps them, and the
+  // approximation does not build them at all.
+  static long long ctl_mty(const ModuleType& mt) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += ctl_sig_item(it);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = ctl_mty(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        k += ctl_mty(*nm->type);
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return ctl_mty(*w->mt);
+    return 0;
+  }
+  static long long ctl_sig_item(const SignatureItem& it) {
+    const std::vector<TypeDeclaration>* ds = nullptr;
+    if (auto* t = std::get_if<Psig_type>(&it.desc)) ds = &t->decls;
+    if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) ds = &t->decls;
+    if (ds) {
+      long long k = 0;
+      for (auto& d : *ds) {
+        if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+          for (auto& c : v->ctors) {
+            ++k;
+            if (auto* r = std::get_if<Pcstr_record>(&c.args))
+              k += (long long)r->fields.size();
+          }
+        } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+          k += (long long)r->fields.size();
+        }
+      }
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return ctl_mty(*m->md.type);
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += ctl_mty(*d.type);
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return m->type ? ctl_mty(*m->type) : 0;
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return ctl_mty(m->type);
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) return ctl_mty(i->mt);
+    return 0;
+  }
+
+  // What `approx_modtype` (typemod.ml:1120) names of a module type: the
+  // DECLARATIONS -- types, modules, module types, and the signatures they
+  // nest -- but never a value, an external or an exception, which it drops.
+  static long long dec_mty(const ModuleType& mt) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += dec_sig_item(it);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = dec_mty(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+        if (nm->name.txt) ++k;
+        k += dec_mty(*nm->type);
+      }
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return dec_mty(*w->mt);
+    return 0;
+  }
+  static long long dec_sig_item(const SignatureItem& it) {
+    if (auto* t = std::get_if<Psig_type>(&it.desc))
+      return (long long)t->decls.size();
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return 1 + dec_mty(*m->md.type);
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += 1 + dec_mty(*d.type);
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return 1 + (m->type ? dec_mty(*m->type) : 0);
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return 1 + dec_mty(m->type);
+    // `Env.enter_signature` renames ALL of an included signature, declaration
+    // or not.
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) return ren_mty(i->mt);
+    return 0;
+  }
+
+  // The same count over a module EXPRESSION's inferred signature, which is what
+  // `check_recmodule_inclusion` substitutes and strengthens each round.  A
+  // constraint answers with the signature it ascribes, and a bare path with the
+  // declaration of the sibling it names -- there is nothing else in scope a
+  // recursive group can be defined by that we can read.
+  using Sibs = std::map<std::string, const ModuleType*>;
+  static long long ren_mexpr(const ModuleExpr& m, const Sibs& sib) {
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) k += ren_str_item(it, sib);
+      return k;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return ren_mty(*c->mt);
+    if (auto* i = std::get_if<Pmod_ident>(&m.desc)) {
+      if (auto* l = std::get_if<Lident>(&i->id.txt.v)) {
+        auto s = sib.find(l->name);
+        if (s != sib.end() && s->second) return ren_mty(*s->second);
+      }
+    }
+    return 0;
+  }
+  static long long ren_str_item(const StructureItem& it, const Sibs& sib) {
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      Count c;
+      for (auto& b : v->bindings) c.pat(b.pat);
+      return c.n;
+    }
+    if (auto* t = std::get_if<Pstr_type>(&it.desc))
+      return (long long)t->decls.size();
+    if (auto* x = std::get_if<Pstr_typext>(&it.desc))
+      return (long long)x->ext.ctors.size();
+    if (auto* i = std::get_if<Pstr_include>(&it.desc))
+      return ren_mexpr(i->expr, sib);
+    if (auto* m = std::get_if<Pstr_module>(&it.desc))
+      return 1 + ren_mexpr(m->binding.expr, sib);
+    if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
+      return 1 + (m->type ? ren_mty(*m->type) : 0);
+    if (std::holds_alternative<Pstr_primitive>(it.desc) ||
+        std::holds_alternative<Pstr_exception>(it.desc) ||
+        std::holds_alternative<Pstr_val>(it.desc))
+      return 1;
+    return 0;
+  }
+
+  // `module rec` unrolls its own inclusion check, and the unrolling is
+  // QUADRATIC: `check_recmodule_inclusion` (typemod.ml:2182) runs one round per
+  // binding and each round names a fresh Y_i for EVERY binding, while
+  // `transl_recmodule_modtypes` approximates every binding in an environment
+  // that has entered an unbound module for every one of them (typemod.ml:2044)
+  // -- 2n^2 idents before a single signature is read.  On top of that each
+  // binding's DECLARED signature is walked three times over (`approx_modtype`,
+  // which reaches only the declarations, the second `transl_modtype` pass, and
+  // the base case's `Subst.modtype`) and its ACTUAL one once per round.
+  static long long recmodule_extra(const Pstr_recmodule& rm) {
+    if (dbg_env("NORECMOD")) return 0;
+    long long nb = (long long)rm.bindings.size(), named = 0;
+    Sibs sib;
+    for (auto& b : rm.bindings)
+      if (b.name.txt) {
+        ++named;
+        if (auto* c = std::get_if<Pmod_constraint>(&b.expr.desc))
+          sib.emplace(*b.name.txt, c->mt.get());
+      }
+    // An `_` binding is named nowhere -- neither `ids` nor the fresh Y_i nor
+    // the unbound modules the approximation enters have an ident for it, and
+    // its own actual signature is substituted only by the base case, since the
+    // rounds walk the named bindings alone.
+    long long k = 2 * nb * named;
+    for (auto& b : rm.bindings) {
+      auto* c = std::get_if<Pmod_constraint>(&b.expr.desc);
+      if (!c) continue;
+      long long rounds = b.name.txt ? nb : 1;
+      k += 2 * ren_mty(*c->mt) + ctl_mty(*c->mt) + dec_mty(*c->mt) +
+           rounds * ren_mexpr(*c->me, sib);
+    }
+    return k;
+  }
+
+  // A `module rec` in a SIGNATURE never reaches the inclusion check, so it pays
+  // only what `transl_recmodule_modtypes` costs: the n^2 unbound modules, the
+  // approximation of each declaration, and the one extra `transl_modtype` pass.
+  static long long recmodule_sig_extra(const Psig_recmodule& rm) {
+    if (dbg_env("NORECMOD")) return 0;
+    long long nb = (long long)rm.decls.size(), named = 0;
+    for (auto& d : rm.decls)
+      if (d.name.txt) ++named;
+    long long k = nb * named;
+    for (auto& d : rm.decls)
+      k += ren_mty(*d.type) + ctl_mty(*d.type) + dec_mty(*d.type);
+    return k;
+  }
+
   void mexpr(const ModuleExpr& m) {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       auto k = mark();
@@ -21426,6 +21660,7 @@ struct Count {
       mty(*m->md.type, sub, depth + 1);
     } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
       for (auto& d : m->decls) { n += per; mty(*d.type, sub, depth + 1); }
+      n += recmodule_sig_extra(*m);
     } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
       n += per;
       if (m->type) mty(*m->type, per + 1, depth + 1);
@@ -21460,6 +21695,7 @@ struct Count {
       if (m->binding.name.txt) ++n;
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       for (auto& b : m->bindings) { mexpr(b.expr); if (b.name.txt) ++n; }
+      n += recmodule_extra(*m);
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
       if (m->type) mty(*m->type, 2, 1);
       ++n;
