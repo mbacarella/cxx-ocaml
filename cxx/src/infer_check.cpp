@@ -20072,13 +20072,125 @@ int functor_params(const cmi::ModuleTypePtr& m) {
     if (t->functor_param) ++k;
   return k;
 }
-long long load_cost(const cmi::Signature& sg, bool fparams) {
+long long load_cost(const cmi::Signature& sg, bool fparams, int fmul = 1) {
   long long k = (long long)sg.order.size();
   if (fparams) {
-    for (auto& m : sg.modules) k += functor_params(m.type);
-    for (auto& m : sg.modtypes) k += functor_params(m.type);
+    for (auto& m : sg.modules) k += fmul * functor_params(m.type);
+    for (auto& m : sg.modtypes) k += fmul * functor_params(m.type);
   }
   return k;
+}
+// The signature of a submodule NAMED in a path -- `Effect.Deep` -- or null
+// when the name is not a submodule (a value, a type) or is a functor.
+const cmi::Signature* submodule(const cmi::Signature& sg,
+                                const std::string& n) {
+  for (auto& m : sg.modules)
+    if (m.name == n && m.type && m.type->kind == cmi::ModuleType::Sig)
+      return m.type->sig.get();
+  return nullptr;
+}
+// The unit a submodule ALIAS points at -- `StdLabels.List` is ListLabels --
+// under either spelling of the path.  Naming one loads THAT unit and leaves
+// the parent forced just once: `StdLabels.List.length` costs 4 + 75.
+std::string alias_unit(const cmi::Path* p) {
+  if (!p) return {};
+  if (p->kind == cmi::Path::Pident) {
+    std::string n = p->id.name;
+    if (n.rfind("Stdlib__", 0) == 0) n = n.substr(8);
+    return n;
+  }
+  if (p->kind != cmi::Path::Pdot || !p->a || p->a->kind != cmi::Path::Pident)
+    return {};
+  return p->a->id.name == "Stdlib" ? p->s : std::string();
+}
+const cmi::SigValue* find_val(const cmi::Signature& sg, const std::string& n) {
+  for (auto& v : sg.values)
+    if (v.name == n) return &v;
+  return nullptr;
+}
+const cmi::TypeExpr* strip(const cmi::TypePtr& t) {
+  const cmi::TypeExpr* p = t.get();
+  for (int i = 0; i < 64 && p && (p->kind == cmi::TypeExpr::Tlink ||
+                                  p->kind == cmi::TypeExpr::Tsubst);
+       ++i)
+    p = p->link.get();
+  return p;
+}
+// Which compilation unit does a type path name?  `Stdlib.Seq.t` is Seq --
+// `Stdlib.result`, a type of Stdlib itself, is no unit at all -- and
+// `CamlinternalLazy.t` is that unit under its own name.  `aliased` says the
+// path went through one of Stdlib's aliases, which is what the second force
+// below turns on: `List.to_seq` names `Stdlib.Seq.t` and costs 65 + 65 where
+// the `CamlinternalLazy.t` behind `Lazy.t` costs 5 once.
+std::string path_unit(const cmi::Path* p, bool* aliased) {
+  *aliased = false;
+  std::vector<std::string> comps;
+  const cmi::Path* q = p;
+  for (int i = 0; q && q->kind == cmi::Path::Pdot && i < 16; ++i) {
+    comps.push_back(q->s);
+    q = q->a.get();
+  }
+  if (!q || q->kind != cmi::Path::Pident || comps.empty()) return {};
+  std::string root = q->id.name;
+  if (root == "Stdlib") {
+    *aliased = true;
+    return comps.size() == 2 ? comps[1] : std::string();
+  }
+  return comps.size() == 1 ? root : std::string();
+}
+// What a READ member's type asks to be loaded.  Resolving the type paths a
+// member mentions is one thing; a type constructor APPLIED to at least one
+// argument is looked up a SECOND time by `needs_expand` (ctype.ml:901,
+// reached only from update_level's `Tconstr(p, _ :: _, _)` arm), so the
+// signature that declares it is forced twice: `Atomic.get` costs 13 + 13
+// where `Mutex.lock`, whose `t` takes no argument, costs 6, and `List.to_seq`
+// costs 75 + 65 + 65 -- the Seq its type names is forced both times.  An
+// abbreviation is EXPANDED instead of looked up again, so it charges only
+// what its MANIFEST names: `Lazy.force` is 10 + 5 for the CamlinternalLazy
+// behind `Lazy.t`, and `Effect.perform` is 6 alone because `'a t = 'a eff`
+// expands to a predefined type.
+struct Applied {
+  bool self = false;                // this signature is forced a second time
+  // unit -> 1 load (a manifest names it) or 2 (an applied type does)
+  std::map<std::string, int> units;
+};
+void applied_walk(const cmi::TypePtr& t, const cmi::Signature& sg,
+                  std::set<const cmi::TypeExpr*>& seen, Applied& out);
+// An ABBREVIATION is expanded rather than looked up again, so it charges what
+// its MANIFEST names and not its own signature: `Scanf.sscanf`, whose
+// `scanner` unfolds to arrows and a Stdlib `format4`, costs 16 once, and
+// `Effect.perform`, whose `t` unfolds to a predefined `eff`, costs 6 -- while
+// `Seq.is_empty` costs 65 + 65 because unfolding `t` reaches Seq's own
+// `node`, and `Lazy.force` costs 10 + 5 for the CamlinternalLazy behind it.
+void applied_head(const cmi::Path* p, const cmi::Signature& sg,
+                  std::set<const cmi::TypeExpr*>& seen, Applied& out) {
+  if (!p) return;
+  if (p->kind == cmi::Path::Pident) {
+    for (auto& d : sg.types) {
+      if (d.name != p->id.name) continue;
+      if (!d.manifest) { out.self = true; return; }
+      applied_walk(d.manifest, sg, seen, out);
+      return;
+    }
+    return;
+  }
+  bool al = false;
+  std::string u = path_unit(p, &al);
+  int n = al ? 2 : 1;
+  if (!u.empty() && out.units[u] < n) out.units[u] = n;
+}
+void applied_walk(const cmi::TypePtr& t, const cmi::Signature& sg,
+                  std::set<const cmi::TypeExpr*>& seen, Applied& out) {
+  const cmi::TypeExpr* p = strip(t);
+  if (!p || !seen.insert(p).second) return;
+  if (p->kind == cmi::TypeExpr::Tconstr && !p->args.empty())
+    applied_head(p->path.get(), sg, seen, out);
+  applied_walk(p->dom, sg, seen, out);
+  applied_walk(p->cod, sg, seen, out);
+  applied_walk(p->link, sg, seen, out);
+  for (auto& e : p->elems) applied_walk(e.second, sg, seen, out);
+  for (auto& a : p->args) applied_walk(a, sg, seen, out);
+  for (auto& a : p->pv_args) applied_walk(a, sg, seen, out);
 }
 // Is this path one of the printf-family format types?  A string literal at
 // such a type is typed by Typecore.type_format, which names the
@@ -20111,11 +20223,14 @@ bool type_has_format(const cmi::TypePtr& t,
 // `Env.sign_of_cmi` hands the .cmi's signature to `Subst.Lazy.modtype`, and
 // forcing that runs `rename_bound_idents` (subst.ml:594) over EVERY top-level
 // item -- values, types, extension constructors, modules and module types
-// alike, one ident each.  Constructors and record labels are not bound idents,
-// nested signatures stay lazy, and the load is NOT transitive, so the cost is
-// exactly the unit's own top-level item count: `open List`, `let open List in
-// ..` and a bare `List.map` each cost 75.  `Stdlib` is loaded while the
-// initial environment is built, so it is already inside the 273.
+// alike, one ident each.  Constructors and record labels are not bound idents
+// and the load is NOT transitive, so the cost is exactly the unit's own
+// top-level item count: `open List`, `let open List in ..` and a bare
+// `List.map` each cost 75.  `Stdlib` is loaded while the initial environment
+// is built, so it is already inside the 273.  A nested signature stays lazy
+// until the file NAMES it, and a signature reached through one of Stdlib's
+// aliases is forced a second time as soon as a submodule of it or an applied
+// type of it is read -- see `named_subs` and `Applied` below.
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
   // Module names the file binds itself, with how MANY times: a name bound
@@ -20130,6 +20245,13 @@ struct Cites {
   std::map<std::string, std::set<std::string>> members;
   std::set<std::string> opens;
   std::set<std::string> bares;
+  // The same two, one level down: `Effect.Deep.try_with` and `open
+  // Effect.Deep` read a member of the SUBMODULE, keyed "Effect.Deep".
+  std::map<std::string, std::set<std::string>> submembers;
+  std::set<std::string> subopens;
+  // `module MP = Gc.Memprof` binds a SUBMODULE: resolving the path forces Gc
+  // but not Memprof, which is forced only once MP is actually used.
+  std::map<std::string, std::string> subalias;
   bool fmt_ann = false;  // a written `.. format` / format4 / format6
 
   void add(const std::string& m) {
@@ -20150,9 +20272,30 @@ struct Cites {
     auto* d = std::get_if<Ldot>(&id.v);
     if (!d) return false;
     auto* l = std::get_if<Lident>(&d->prefix->v);
-    if (!l || l->name != "Stdlib") return false;
-    alias.emplace(*n.txt, d->name);
+    if (!l) return false;
+    if (l->name == "Stdlib") {
+      alias.emplace(*n.txt, d->name);
+      return true;
+    }
+    // The head is resolved either way; the submodule waits for a use.
+    add(l->name);
+    subalias.emplace(*n.txt, l->name + "." + d->name);
     return true;
+  }
+  // Charge what the used submodule aliases stand for, now that the whole file
+  // has been walked and it is known which of them were named at all.
+  void resolve_subaliases() {
+    for (auto& e : subalias) {
+      auto lb = local.find(e.first);
+      if (!units.count(e.first) || lb == local.end() || lb->second != 1)
+        continue;
+      auto dot = e.second.find('.');
+      members[e.second.substr(0, dot)].insert(e.second.substr(dot + 1));
+      auto it = members.find(e.first);
+      if (it != members.end())
+        submembers[e.second].insert(it->second.begin(), it->second.end());
+      if (opens.count(e.first)) subopens.insert(e.second);
+    }
   }
   // `modpos` says the name stands in the module namespace (`open M`), where a
   // bare ident is a module; anywhere else only a DOTTED path names one.
@@ -20169,6 +20312,7 @@ struct Cites {
       } else if (auto* q = std::get_if<Ldot>(&d->prefix->v)) {
         auto* h = std::get_if<Lident>(&q->prefix->v);
         if (h && h->name == "Stdlib") members[q->name].insert(d->name);
+        else if (h) submembers[h->name + "." + q->name].insert(d->name);
       }
     } else if (modpos) {
       add(std::get<Lident>(id.v).name);
@@ -20185,7 +20329,9 @@ struct Cites {
       opens.insert(l->name);
     } else if (auto* d = std::get_if<Ldot>(&id.v)) {
       auto* l = std::get_if<Lident>(&d->prefix->v);
-      if (l && l->name == "Stdlib") opens.insert(d->name);
+      if (!l) return;
+      if (l->name == "Stdlib") opens.insert(d->name);
+      else subopens.insert(l->name + "." + d->name);
     }
   }
   void opened(const LongidentLoc& id) { opened(id.txt); }
@@ -20632,14 +20778,61 @@ struct Cites {
         if (has(name)) return true;
     return false;
   }
+  // Which submodules of `c` does the file NAME -- the `Deep` of
+  // `Effect.Deep.try_with` or of `open Effect.Deep`?  Naming one forces its
+  // own signature in turn AND forces the parent's a second time: `open
+  // Effect.Deep` costs 6 + 6 + 9 where `open Effect` costs 6, and
+  // `open Bigarray.Genarray` 52 + 52 + 18.
+  std::vector<std::pair<std::string, const cmi::Signature*>> named_subs(
+      const std::string& src, const cmi::Signature& sg) const {
+    std::vector<std::pair<std::string, const cmi::Signature*>> v;
+    auto it = members.find(src);
+    if (it == members.end()) return v;
+    for (auto& n : it->second)
+      if (auto* s = submodule(sg, n)) v.emplace_back(n, s);
+    return v;
+  }
+  // The units the file reaches through a submodule that is only an ALIAS.
+  std::vector<std::string> alias_subs(const std::string& src,
+                                      const cmi::Signature& sg) const {
+    std::vector<std::string> v;
+    auto it = members.find(src);
+    if (it == members.end()) return v;
+    for (auto& n : it->second)
+      for (auto& m : sg.modules)
+        if (m.name == n && m.type && m.type->kind == cmi::ModuleType::Alias) {
+          std::string u = alias_unit(m.type->path.get());
+          if (!u.empty()) v.push_back(u);
+        }
+    return v;
+  }
+  // The members of `sg` the file reads, whether written out (`members`) or
+  // brought into scope by an `open` of it and then named bare.
+  void scan_applied(const std::string& key, bool nested,
+                    const cmi::Signature& sg, Applied& out) const {
+    auto one = [&](const std::string& n) {
+      if (auto* v = find_val(sg, n)) {
+        std::set<const cmi::TypeExpr*> seen;
+        applied_walk(v->type, sg, seen, out);
+      }
+    };
+    const auto& tbl = nested ? submembers : members;
+    auto it = tbl.find(key);
+    if (it != tbl.end())
+      for (auto& n : it->second) one(n);
+    if (nested ? subopens.count(key) : opens.count(key))
+      for (auto& n : bares) one(n);
+  }
   // One ident per top-level item (and per functor parameter) of every DISTINCT
   // unit the file cites, plus CamlinternalFormatBasics when a format type is
   // read.  A head the file binds itself shadows the unit, and a head with no
   // readable .cmi was never loaded.
-  long long cost(bool extra) const {
+  long long cost(bool extra, bool sub) {
+    if (sub) resolve_subaliases();
     long long k = 0;
     bool fmt = extra && fmt_ann;
     std::set<std::string> done;  // two names can alias ONE unit
+    std::map<std::string, int> more;  // unit -> loads a READ TYPE asks for
     for (auto& m : units) {
       std::string u = m;
       for (int i = 0; i < 8 && local.count(u); ++i) {
@@ -20654,6 +20847,42 @@ struct Cites {
         const cmi::CmiFile& c = cmi::CmiFile::load(p);
         k += load_cost(c.sig(), extra);
         if (extra && !fmt) fmt = reads_format(m, c);
+        if (!sub) continue;
+        // Only a reference through one of Stdlib's ALIASES is forced twice:
+        // `open Float.Array` costs 82 + 82 + 48 where the same signature
+        // spelled `open Stdlib__Float.Array` costs 82 + 48, and
+        // `Stdlib__Atomic.get` costs 13 where `Atomic.get` costs 13 + 13.
+        bool aliased = u != c.module_name();
+        Applied a;
+        scan_applied(m, false, c.sig(), a);
+        auto subs = named_subs(m, c.sig());
+        for (auto& au : alias_subs(m, c.sig()))
+          if (more[au] < 1) more[au] = 1;
+        for (auto& s : subs) {
+          k += load_cost(*s.second, extra);
+          Applied b;
+          scan_applied(m + "." + s.first, true, *s.second, b);
+          if (b.self && aliased) k += load_cost(*s.second, extra, 2);
+          for (auto& e : b.units)
+            if (more[e.first] < e.second) more[e.first] = e.second;
+        }
+        // A submodule of the unit was named, or a type of the unit was read
+        // applied: either way its signature is forced a second time.
+        if (aliased && (!subs.empty() || a.self)) more[u] = 2;
+        for (auto& e : a.units)
+          if (more[e.first] < e.second) more[e.first] = e.second;
+      } catch (...) {
+      }
+    }
+    for (auto& e : more) {
+      bool cited = !done.insert(e.first).second;
+      if (cited && e.second < 2) continue;
+      std::string p = head_cmi(e.first);
+      if (!std::filesystem::exists(p)) continue;
+      try {
+        const cmi::Signature& sg = cmi::CmiFile::load(p).sig();
+        if (!cited) k += load_cost(sg, extra);
+        if (e.second >= 2) k += load_cost(sg, extra, 2);
       } catch (...) {
       }
     }
@@ -21074,7 +21303,7 @@ int typing_ident_count(const ast::Structure& s) {
   if (!dbg_env("NOUNITLOAD")) {
     stampcount::Cites u;
     for (auto& it : s) u.item(it);
-    k += u.cost(!dbg_env("NOEXTRALOAD"));
+    k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"));
   }
   return (int)k;
 }
@@ -21086,7 +21315,7 @@ int typing_ident_count(const ast::Signature& s) {
   if (!dbg_env("NOUNITLOAD")) {
     stampcount::Cites u;
     for (auto& it : s) u.sig_item(it);
-    k += u.cost(!dbg_env("NOEXTRALOAD"));
+    k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"));
   }
   return (int)k;
 }
