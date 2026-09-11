@@ -21384,6 +21384,10 @@ struct Count {
     static const bool off = dbg_env("NOUNIVAR") != nullptr;
     return off;
   }
+  static bool sigext_off() {
+    static const bool off = dbg_env("NOSIGEXT") != nullptr;
+    return off;
+  }
   void bindings(RecFlag rf, const std::vector<ValueBinding>& bs) {
     // `let f : type a. t = e` names the locally abstract variable TWICE:
     // the sugar leaves it BOTH in the binding's own constraint (the
@@ -22553,9 +22557,17 @@ struct Count {
       type_decls(t->decls, per);
     } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
       type_decls(t->decls, per);
+    // An EXTENSION CONSTRUCTOR is a signature item of its own -- `Sig_typext`
+    // carries one ident per constructor, and an `exception` is one of them --
+    // so the cascade renames it at the level's weight exactly as it renames a
+    // value or a type: `sig exception E end` inside a module type is 2, and
+    // `sig type t = .. type t += B | C end` is 2 + 2 + 2.  Only the TYPING
+    // ident was charged here, which is the whole of it at weight 1.
     } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+      if (!sigext_off()) n += (per - 1) * (long long)x->ext.ctors.size();
       for (auto& c : x->ext.ctors) ext_ctor(c);
     } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
+      if (!sigext_off()) n += per - 1;
       ext_ctor(e->exn.ctor);
     } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
       n += per;
