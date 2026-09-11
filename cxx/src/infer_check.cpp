@@ -21380,7 +21380,22 @@ struct Count {
   // for a name the environment does not already hold, so `let compare x = ..`
   // (shadowing Stdlib's) allocates nothing.  The idents are thrown away; only
   // the stamps they consume survive, in the .cmi's base.
+  static bool univ_off() {
+    static const bool off = dbg_env("NOUNIVAR") != nullptr;
+    return off;
+  }
   void bindings(RecFlag rf, const std::vector<ValueBinding>& bs) {
+    // `let f : type a. t = e` names the locally abstract variable TWICE:
+    // the sugar leaves it BOTH in the binding's own constraint (the
+    // `Pvc_constraint` univars, which `type_let` enters as locally
+    // abstract types before the body is typed) and in the `Pexp_newtype`
+    // it wraps the body in, which is the one already counted.  A
+    // polymorphic `let f : 'a. 'a -> 'a = ..` carries no univars at all.
+    if (!univ_off())
+      for (auto& b : bs)
+        if (b.constraint_)
+          if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
+            n += (long long)c->univars.size();
     std::vector<std::string> nm;
     bool all_fun = true;
     for (auto& b : bs)
