@@ -20254,6 +20254,93 @@ bool type_has_format(const cmi::TypePtr& t,
 // until the file NAMES it, and a signature reached through one of Stdlib's
 // aliases is forced a second time as soon as a submodule of it or an applied
 // type of it is read -- see `named_subs` and `Applied` below.
+// The components of a module path, outermost first.
+// `Typedtree.path_of_module` (typedtree.ml:929): an identifier, an
+// application of two of them, and an ascription of one.
+bool has_path(const ModuleExpr& m) {
+  if (std::holds_alternative<Pmod_ident>(m.desc)) return true;
+  if (auto* a = std::get_if<Pmod_apply>(&m.desc))
+    return has_path(*a->f) && has_path(*a->arg);
+  if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+    return has_path(*c->me);
+  return false;
+}
+bool lid_comps(const Longident& id, std::vector<std::string>& out) {
+  const Longident* p = &id;
+  for (int i = 0; i < 16; ++i) {
+    if (auto* d = std::get_if<Ldot>(&p->v)) {
+      out.push_back(d->name);
+      p = d->prefix.get();
+    } else if (auto* li = std::get_if<Lident>(&p->v)) {
+      out.push_back(li->name);
+      std::reverse(out.begin(), out.end());
+      return true;
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+bool cpath_comps(const cmi::Path* q, std::vector<std::string>& out) {
+  for (int i = 0; q && i < 16; ++i) {
+    if (q->kind == cmi::Path::Pdot) {
+      out.push_back(q->s);
+      q = q->a.get();
+    } else if (q->kind == cmi::Path::Pident) {
+      out.push_back(q->id.name);
+      std::reverse(out.begin(), out.end());
+      return true;
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+// The signature of the unit a path's HEAD names, with the head's own
+// components stripped: `Stdlib__Hashtbl.HashedType` reads Hashtbl's.
+const cmi::Signature* unit_of_path(std::vector<std::string>& c) {
+  if (c.size() < 2) return nullptr;
+  if (c[0] == "Stdlib") c.erase(c.begin());
+  if (c.size() < 2) return nullptr;
+  if (c[0].rfind("Stdlib__", 0) == 0) c[0] = c[0].substr(8);
+  std::string p = head_cmi(c[0]);
+  if (p.empty() || !std::filesystem::exists(p)) return nullptr;
+  try {
+    return &cmi::CmiFile::load(p).sig();
+  } catch (...) {
+  }
+  return nullptr;
+}
+// A module type NAMED by a path: `Mty_ident` is followed to the declaration
+// that holds it, whether that is in `root` (the unit the functor came from)
+// or in another unit altogether.
+const cmi::ModuleType* named_cmty(const cmi::Path* q,
+                                         const cmi::Signature* root) {
+  std::vector<std::string> c;
+  if (!cpath_comps(q, c) || c.empty()) return nullptr;
+  const cmi::Signature* sg = nullptr;
+  if (c.size() == 1) {
+    sg = root;
+  } else {
+    sg = unit_of_path(c);
+    for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
+      sg = submodule(*sg, c[i]);
+  }
+  if (!sg) return nullptr;
+  for (auto& md : sg->modtypes)
+    if (md.name == c.back()) return md.type.get();
+  return nullptr;
+}
+// Scrape an `Mty_ident` down to the signature it stands for.
+const cmi::ModuleType* scrape_cmty(const cmi::ModuleType* m,
+                                          const cmi::Signature* root) {
+  for (int i = 0; m && m->kind == cmi::ModuleType::Ident && i < 8; ++i) {
+    const cmi::ModuleType* n = named_cmty(m->path.get(), root);
+    if (!n || n == m) return m;
+    m = n;
+  }
+  return m;
+}
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
   // Module names the file binds itself, with how MANY times: a name bound
@@ -20286,6 +20373,11 @@ struct Cites {
   // but not Memprof, which is forced only once MP is actually used.
   std::map<std::string, std::string> subalias;
   bool fmt_ann = false;  // a written `.. format` / format4 / format6
+  // The functor PATHS this file applies, as written; resolved in `cost`.
+  std::vector<std::pair<std::vector<std::string>, bool>> fapps;
+  // `let module M = F (A) in ..`: the result is bound over the body
+  // alone and none of the types it names is ever looked up.
+  bool inexpr_ = false;
 
   void add(const std::string& m) {
     if (m.empty() || m == "Stdlib") return;
@@ -20635,7 +20727,11 @@ struct Cites {
       // `let open M in e` and `let module M = .. in e`: M is in scope over
       // the body alone.
       size_t d = open_stack_.size();
-      item(*s->item); ex(*s->body);
+      bool ie = inexpr_;
+      inexpr_ = true;
+      item(*s->item);
+      inexpr_ = ie;
+      ex(*s->body);
       open_stack_.resize(d);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
       ex(*s->obj); cite(s->field, false); ex(*s->value);
@@ -20815,6 +20911,17 @@ struct Cites {
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
       mexp(*c->me); mty(*c->mt);
     } else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) {
+      const ModuleExpr* fh = &m;
+      bool pathed = true;
+      while (auto* q = std::get_if<Pmod_apply>(&fh->desc)) {
+        if (!has_path(*q->arg)) pathed = false;
+        fh = q->f.get();
+      }
+      if (auto* fi = std::get_if<Pmod_ident>(&fh->desc)) {
+        std::vector<std::string> c;
+        if (lid_comps(fi->id.txt, c) && c.size() >= 2)
+          fapps.emplace_back(c, inexpr_ && pathed);
+      }
       mexp(*a->f); mexp(*a->arg);
     } else if (auto* a = std::get_if<Pmod_apply_unit>(&m.desc)) {
       mexp(*a->f);
@@ -20997,8 +21104,72 @@ struct Cites {
   // unit the file cites, plus CamlinternalFormatBasics when a format type is
   // read.  A head the file binds itself shadows the unit, and a head with no
   // readable .cmi was never loaded.
+  // Applying a functor of another unit reads the RESULT signature its .cmi
+  // carries: a type constructor APPLIED in that signature forces the unit it
+  // belongs to exactly as a read member's type would (`Hashtbl.Make (String)`
+  // pays Seq's 65 twice for the `Seq.t` its `to_seq` names), the module type
+  // the PARAMETER is named by is forced in turn (`Weak.Make`'s parameter is
+  // `Hashtbl.HashedType`, which costs Hashtbl's 43), and the unit the functor
+  // itself belongs to is forced a second time where the path went through one
+  // of Stdlib's aliases.
+  static void sig_applied(const cmi::Signature& sg, Applied& out) {
+    std::set<const cmi::TypeExpr*> seen;
+    for (auto& v : sg.values) applied_walk(v.type, sg, seen, out);
+    for (auto& d : sg.types) applied_walk(d.manifest, sg, seen, out);
+    for (auto& md : sg.modules)
+      if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+        sig_applied(*md.type->sig, out);
+  }
+  void functor_loads(std::map<std::string, int>& more,
+                     std::set<std::string>& noload) const {
+    for (auto& fa : fapps) {
+      std::vector<std::string> c = fa.first;
+      if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
+      std::string h = unit_of(c[0]);
+      if (h.empty()) continue;
+      c[0] = h;
+      const cmi::Signature* rt = unit_of_path(c);
+      if (!rt || c.size() < 2) continue;
+      const cmi::Signature* sg = rt;
+      for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
+        sg = submodule(*sg, c[i]);
+      if (!sg) continue;
+      const cmi::ModuleType* mt = nullptr;
+      for (auto& md : sg->modules)
+        if (md.name == c.back()) mt = md.type.get();
+      mt = scrape_cmty(mt, rt);
+      if (!mt || mt->kind != cmi::ModuleType::Functor) continue;
+      std::string p = head_cmi(h);
+      if (!p.empty() && std::filesystem::exists(p)) try {
+          if (h != cmi::CmiFile::load(p).module_name()) more[h] = 2;
+        } catch (...) {
+        }
+      for (const cmi::ModuleType* f = mt; f;
+           f = scrape_cmty(f->functor_body.get(), rt)) {
+        if (f->kind != cmi::ModuleType::Functor) {
+          if (f->kind == cmi::ModuleType::Sig && f->sig && !fa.second) {
+            Applied a;
+            sig_applied(*f->sig, a);
+            for (auto& e : a.units)
+              if (more[e.first] < e.second) more[e.first] = e.second;
+          }
+          break;
+        }
+        const cmi::ModuleType* pt = f->functor_param_type.get();
+        if (pt && pt->kind == cmi::ModuleType::Ident) {
+          bool al = false;
+          std::string pu = path_unit(pt->path.get(), &al);
+          if (!pu.empty()) {
+            more[pu] = 2;
+            noload.insert(pu);
+          }
+        }
+      }
+    }
+  }
   long long cost(bool extra, bool sub, bool app) {
     if (sub) resolve_subaliases();
+    const bool xoff = dbg_env("NOXMODAPP") != nullptr;
     long long k = 0;
     bool fmt = extra && fmt_ann;
     std::set<std::string> done;  // two names can alias ONE unit
@@ -21010,14 +21181,17 @@ struct Cites {
       if (!std::filesystem::exists(p)) continue;
       try {
         const cmi::CmiFile& c = cmi::CmiFile::load(p);
-        k += load_cost(c.sig(), extra);
+        // Only a reference through one of Stdlib's ALIASES is forced
+        // twice, one functor parameter apiece; a DIRECT force renames
+        // the parameter TWICE in the one go (S437).
+        bool aliased = u != c.module_name();
+        k += load_cost(c.sig(), extra, aliased || xoff ? 1 : 2);
         if (extra && !fmt) fmt = reads_format(m, c);
         if (!sub) continue;
         // Only a reference through one of Stdlib's ALIASES is forced twice:
         // `open Float.Array` costs 82 + 82 + 48 where the same signature
         // spelled `open Stdlib__Float.Array` costs 82 + 48, and
         // `Stdlib__Atomic.get` costs 13 where `Atomic.get` costs 13 + 13.
-        bool aliased = u != c.module_name();
         Applied a;
         scan_applied(m, false, c.sig(), a, app);
         auto subs = named_subs(m, c.sig());
@@ -21039,14 +21213,21 @@ struct Cites {
       } catch (...) {
       }
     }
+    // A unit reached only through a .cmi's own path is forced ONCE,
+    // directly; the ordinary first load is what a SOURCE citation pays.
+    std::set<std::string> noload;
+    if (sub && !xoff) functor_loads(more, noload);
     for (auto& e : more) {
       bool cited = !done.insert(e.first).second;
       if (cited && e.second < 2) continue;
       std::string p = head_cmi(e.first);
       if (!std::filesystem::exists(p)) continue;
       try {
-        const cmi::Signature& sg = cmi::CmiFile::load(p).sig();
-        if (!cited) k += load_cost(sg, extra);
+        const cmi::CmiFile& cf = cmi::CmiFile::load(p);
+        const cmi::Signature& sg = cf.sig();
+        if (!cited && !noload.count(e.first))
+          k += load_cost(sg, extra,
+                         !xoff && e.first == cf.module_name() ? 2 : 1);
         if (e.second >= 2) k += load_cost(sg, extra, 2);
       } catch (...) {
       }
@@ -21097,6 +21278,14 @@ struct Count {
     mods[*b.name.txt].push_back(&b.expr);
     mnames.push_back(*b.name.txt);
   }
+  // Which CROSS-UNIT functors this file has applied already.  Forcing the
+  // result signature the .cmi carries is paid once per (functor, argument);
+  // the parameter and the strengthening are paid once per functor.
+  std::set<std::string> fpar, farg, fstr, fseen;
+  std::map<std::string, std::set<std::string>> fargp;
+  // Inside `let module M = .. in ..`, where the result is bound over the
+  // body alone and is never saved.
+  bool inexpr_ = false;
 
   static const Pattern& strip(const Pattern& p) {
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return strip(*c->p);
@@ -21382,7 +21571,10 @@ struct Count {
       expr(*t->body);
     } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
       auto m = mark();
+      bool ie = inexpr_;
+      inexpr_ = true;
       item(*s->item);
+      inexpr_ = ie;
       expr(*s->body);
       release(m);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
@@ -21978,16 +22170,6 @@ struct Count {
       return per + (m->type ? ext_mty(*m->type, emtd(x)) : 0);
     return per * ren_str_item(it, Sibs{});
   }
-  // `Typedtree.path_of_module` (typedtree.ml:929): an identifier, an
-  // application of two of them, and an ascription of one.
-  static bool has_path(const ModuleExpr& m) {
-    if (std::holds_alternative<Pmod_ident>(m.desc)) return true;
-    if (auto* a = std::get_if<Pmod_apply>(&m.desc))
-      return has_path(*a->f) && has_path(*a->arg);
-    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
-      return has_path(*c->me);
-    return false;
-  }
   const ModuleExpr* mfind(const Longident& id) const {
     auto* li = std::get_if<Lident>(&id.v);
     if (!li) return nullptr;
@@ -22006,8 +22188,217 @@ struct Count {
   }
   // A level that renames every item once, however deep it is nested.
   static Lvl flat() { return Lvl{1, 0, 0, true}; }
+  // --- A FUNCTOR OF ANOTHER UNIT --------------------------------------
+  // Its result is not in this parsetree at all: it is the signature the
+  // unit's .cmi carries, and applying it FORCES that signature (one ident
+  // per item, at every depth) before the substitution the cascade weighs.
+  static bool xapp_off() {
+    static const bool off = dbg_env("NOXMODAPP") != nullptr;
+    return off;
+  }
+  // The flat force: one ident per item, nested ones included.  Constructors
+  // and record labels are not bound idents and are not renamed here.
+  static long long flat_cmty(const cmi::ModuleType* m) {
+    if (!m) return 0;
+    if (m->kind == cmi::ModuleType::Sig && m->sig) return flat_csig(*m->sig);
+    if (m->kind == cmi::ModuleType::Functor)
+      return (m->functor_param ? 1 : 0) + flat_cmty(m->functor_body.get());
+    return 0;
+  }
+  static long long flat_csig(const cmi::Signature& sg) {
+    long long k = (long long)sg.order.size();
+    for (auto& md : sg.modules) k += flat_cmty(md.type.get());
+    for (auto& md : sg.modtypes) k += flat_cmty(md.type.get());
+    return k;
+  }
+  // The same signature under the S441 cascade, which is what the
+  // substitution at the application site costs.
+  static long long wt_cmty(const cmi::ModuleType* m, const Lvl& l) {
+    if (!m) return 0;
+    if (m->kind == cmi::ModuleType::Sig && m->sig) return wt_csig(*m->sig, l);
+    if (m->kind == cmi::ModuleType::Functor)
+      return (m->functor_param ? l.a : 0) + wt_cmty(m->functor_body.get(), l);
+    return 0;
+  }
+  static long long wt_csig(const cmi::Signature& sg, const Lvl& l) {
+    long long k = l.a * (long long)sg.order.size();
+    for (auto& md : sg.modules) k += wt_cmty(md.type.get(), sub(l));
+    for (auto& md : sg.modtypes) k += wt_cmty(md.type.get(), mtd(l));
+    return k;
+  }
+  // `Mtype.strengthen_decl` (mtype.ml:80) leaves a type declaration alone only
+  // where it already carries a PUBLIC manifest -- or a private one over a
+  // record or a variant.  Everything else, an abstract type and a variant or
+  // record of its own included, is REBUILT, and a saved result that carries
+  // one is substituted twice more.
+  static bool rebuilt_decl(const cmi::TypeDecl& d) {
+    if (!d.manifest) return true;
+    return d.priv && d.kind != cmi::TypeDecl::Record &&
+           d.kind != cmi::TypeDecl::Variant;
+  }
+  static bool str_csig(const cmi::Signature& sg) {
+    for (auto& d : sg.types)
+      if (rebuilt_decl(d)) return true;
+    for (auto& md : sg.modules)
+      if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig &&
+          str_csig(*md.type->sig))
+        return true;
+    return false;
+  }
+  // The parsetree answer to the same question, for a functor of THIS file.
+  static bool rebuilt_pdecl(const TypeDeclaration& d) {
+    if (!d.manifest) return true;
+    return d.priv == PrivateFlag::Private &&
+           !std::holds_alternative<Ptype_record>(d.kind) &&
+           !std::holds_alternative<Ptype_variant>(d.kind);
+  }
+  static bool str_mexpr(const ModuleExpr& m) {
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      for (auto& it : st->items) {
+        if (auto* t = std::get_if<Pstr_type>(&it.desc))
+          for (auto& d : t->decls)
+            if (rebuilt_pdecl(d)) return true;
+        if (auto* md = std::get_if<Pstr_module>(&it.desc))
+          if (str_mexpr(md->binding.expr)) return true;
+      }
+      return false;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return str_mty(*c->mt);
+    return false;
+  }
+  static bool str_mty(const ModuleType& mt) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      for (auto& it : s->items) {
+        if (auto* t = std::get_if<Psig_type>(&it.desc))
+          for (auto& d : t->decls)
+            if (rebuilt_pdecl(d)) return true;
+        if (auto* md = std::get_if<Psig_module>(&it.desc))
+          if (str_mty(*md->md.type)) return true;
+      }
+      return false;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return str_mty(*w->mt);
+    return false;
+  }
+  // Follow this file's `module F2 = F` aliases to the path the head finally
+  // names; null where the head is not an identifier at all.
+  const Longident* mpath(const ModuleExpr* m) const {
+    const Longident* last = nullptr;
+    for (int i = 0; m && i < 8; ++i) {
+      auto* p = std::get_if<Pmod_ident>(&m->desc);
+      if (!p) return nullptr;
+      last = &p->id.txt;
+      auto* li = std::get_if<Lident>(&last->v);
+      if (!li) return last;
+      auto it = mods.find(li->name);
+      if (it == mods.end() || it->second.empty()) return last;
+      m = it->second.back();
+    }
+    return last;
+  }
+  // The module type a path of another unit names, or null where the head is
+  // not a readable unit, is shadowed by this file, or the path leads nowhere.
+  const cmi::ModuleType* cmi_module(const Longident& id,
+                                    const cmi::Signature** root) const {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.size() < 2 || mods.count(c[0])) return nullptr;
+    const cmi::Signature* sg = unit_of_path(c);
+    if (!sg) return nullptr;
+    *root = sg;
+    for (std::size_t i = 1; i + 1 < c.size(); ++i) {
+      sg = submodule(*sg, c[i]);
+      if (!sg) return nullptr;
+    }
+    for (auto& md : sg->modules)
+      if (md.name == c.back()) return md.type.get();
+    return nullptr;
+  }
+  // `Hashtbl.Make (String)`: the result is Hashtbl's, and applying it costs
+  // the PARAMETER's signature once (it is bound while the argument is checked
+  // against it), the result's own items once (the .cmi's lazy signature is
+  // forced), the result's items again at the cascade's weight (the
+  // substitution the application itself runs) and -- where the result is SAVED
+  // and carries a type `Mtype.strengthen` must rebuild -- its items twice more.
+  long long cross_charge(const ModuleExpr& m, const ModuleExpr& head,
+                         int nargs, const Lvl& l, bool saved) {
+    if (xapp_off()) return 0;
+    const Longident* id = mpath(&head);
+    if (!id) return 0;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = cmi_module(*id, &root);
+    if (!mt) return 0;
+    std::vector<std::string> c;
+    lid_comps(*id, c);
+    std::string key;
+    for (auto& s : c) key += s + ".";
+    long long k = 0;
+    for (int i = 0; i < nargs; ++i) {
+      mt = scrape_cmty(mt, root);
+      if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+      if (mt->functor_param && fpar.insert(key + std::to_string(i)).second) {
+        const cmi::ModuleType* pt =
+            scrape_cmty(mt->functor_param_type.get(), root);
+        if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
+          k += wt_csig(*pt->sig, Lvl{1, 1, 0, false});
+      }
+      mt = mt->functor_body.get();
+      // Every substitution but the last sees the functor still to be applied
+      // and names its parameters (S442).
+      if (i + 1 < nargs)
+        for (const cmi::ModuleType* f = scrape_cmty(mt, root);
+             f && f->kind == cmi::ModuleType::Functor;
+             f = f->functor_body.get())
+          if (f->functor_param) ++k;
+    }
+    mt = scrape_cmty(mt, root);
+    if (!mt) return 0;
+    // A distinct argument builds its own result; the same one is cached.
+    std::string ak = key;
+    int unit_arg = 0;
+    bool xpathless = false;
+    for (const ModuleExpr* h = &m;;) {
+      auto* a = std::get_if<Pmod_apply>(&h->desc);
+      if (!a) break;
+      std::vector<std::string> ac;
+      auto* pi = std::get_if<Pmod_ident>(&a->arg->desc);
+      if (pi) lid_comps(pi->id.txt, ac);
+      // An argument that names ANOTHER UNIT builds the result a second
+      // time: `Hashtbl.Make (String)` pays its 26 items twice where
+      // `Hashtbl.Make (A)` over a local A pays them once.
+      if (!has_path(*a->arg)) xpathless = true;
+      if (!ac.empty() && !mods.count(ac[0])) {
+        std::string ap = head_cmi(ac[0]);
+        if (!ap.empty() && std::filesystem::exists(ap) && saved && !inexpr_)
+          unit_arg = 1;
+      }
+      // Two arguments with no path at all share the one entry: a second
+      // `Map.Make (struct .. end)` pays the cascade and nothing more.
+      ak += "(";
+      for (auto& s : ac) ak += s + ".";
+      ak += ")";
+      h = a->f.get();
+    }
+    // The .cmi's lazy signature is forced ONCE for the functor, and once
+    // more for every argument PATH after the first: a pathless argument
+    // asks for no build of its own.
+    bool firstapp = fseen.insert(key).second;
+    std::set<std::string>& ps = fargp[key];
+    std::size_t had = ps.size();
+    bool newpath = !xpathless && ps.insert(ak).second;
+    bool newarg = farg.insert(ak).second;
+    long long nf = (firstapp || (newpath && had >= 1)) ? 1 : 0;
+    if (unit_arg && newarg) ++nf;
+    k += nf * flat_cmty(mt);
+    k += wt_cmty(mt, l);
+    // An argument with NO PATH leaves the result unstrengthened: it is
+    // rebuilt by `nondep_supertype` instead, and never aliased.
+    if (saved && !inexpr_ && !xpathless && mt->kind == cmi::ModuleType::Sig &&
+        mt->sig && str_csig(*mt->sig) && fstr.insert(key).second)
+      k += 2 * flat_cmty(mt);
+    return k;
+  }
   long long app_charge(const ModuleExpr& m, const Lvl& l,
-                       bool saved = true) const {
+                       bool saved = true) {
     if (app_off()) return 0;
     const ModuleExpr* head = &m;
     int nargs = 0;
@@ -22026,7 +22417,7 @@ struct Count {
     if (nargs == 0) return 0;
     const ModuleExpr* me = mderef(head);
     const ModuleType* mt = nullptr;
-    if (!me) return 0;
+    if (!me) return cross_charge(m, *head, nargs, l, saved);
     bool pathless = false;
     for (const ModuleExpr* h = &m;;) {
       auto* a = std::get_if<Pmod_apply>(&h->desc);
@@ -22057,6 +22448,12 @@ struct Count {
     k += me ? wt_mexpr(*me, l) : wt_mty(*mt, l);
     if (pathless && saved)
       k += me ? ext_mexpr(*me, Ext{}) : ext_mty(*mt, Ext{});
+    // A result whose type declarations `Mtype.strengthen` must REBUILD is
+    // substituted twice more where it is saved -- a functor of this file's
+    // as much as another unit's.
+    if (saved && !inexpr_ && !pathless && !xapp_off() &&
+        (me ? str_mexpr(*me) : str_mty(*mt)))
+      k += 2 * (me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat()));
     return k;
   }
   // `saved` is false where the signature this expression has is DISCARDED --
