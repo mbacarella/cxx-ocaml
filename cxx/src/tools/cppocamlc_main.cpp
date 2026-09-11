@@ -230,11 +230,17 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       if (!has_mli)  // inferred from the .ml -> Impl provenance in the uids
         // The source path is the file_id-0 entry of the location table: without
         // it every declaration's pos_fname came out "" (NOMLLOC reverts).
+        // The saved stamps continue ocamlc's global ident counter: 273 after
+        // the initial environment, plus what typing allocated (NOSTAMPBASE
+        // reverts to the flat 300).
         cppcaml::cmi::cmiw::write_cmi(
             cmi_path.string(), mod, cppcaml::infer_signature(structure), {},
             /*intf=*/false,
             cppcaml::dbg_env("NOMLLOC") ? std::vector<std::string>{}
-                                        : std::vector<std::string>{in_path});
+                                        : std::vector<std::string>{in_path},
+            cppcaml::dbg_env("NOSTAMPBASE")
+                ? 300
+                : 274 + cppcaml::typing_ident_count(structure));
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
     }
@@ -265,7 +271,10 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   try {
     auto sig = cppcaml::parse_signature(ss.str());
     cppcaml::cmi::cmiw::write_cmi(cmi_out, module_name(in_path), cppcaml::signature_to_cmi(sig),
-                                  {}, /*intf=*/true, /*src_files=*/{in_path});
+                                  {}, /*intf=*/true, /*src_files=*/{in_path},
+                                  cppcaml::dbg_env("NOSTAMPBASE")
+                                      ? 300
+                                      : 274 + cppcaml::typing_ident_count(sig));
   } catch (const cppcaml::ParseError& e) {
     std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
     return 1;

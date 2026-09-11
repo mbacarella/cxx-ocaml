@@ -688,10 +688,14 @@ void set_module_dirs(const std::string& stdlib_dir,
 // Write magic + marshal(name,sign) + BLAKE128 self-CRC + marshal(crcs) +
 // marshal(flags) to `path`.  `imports` are the non-self interfaces (self is
 // prepended automatically with the computed CRC).  Returns the self-CRC.
+// `stamp_base` is where the signature's fresh Ident stamps start: ocamlc's
+// `rename_bound_idents` continues its global counter, so the base is
+// `274 + <idents typing allocated>` (cppcaml::typing_ident_count).
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
                       const std::vector<Import>& imports = {}, bool intf = true,
-                      const std::vector<std::string>& src_files = {});
+                      const std::vector<std::string>& src_files = {},
+                      int stamp_base = 300);
 // Convenience: a values-only signature.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<std::pair<std::string, TyPtr>>& values,

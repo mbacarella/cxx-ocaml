@@ -20009,4 +20009,465 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   return out;
 }
 
+
+// ---------------------------------------------------------------------------
+// How many `Ident.t` does ocamlc ALLOCATE while typing this unit?
+//
+// A saved signature's stamps are FRESH: `Env.save_signature` runs
+// `Subst.reset_for_saving ()` and `rename_bound_idents` then gives every bound
+// ident a new stamp in signature order (subst.ml:594), so a `.cmi`'s stamps
+// are contiguous and the only thing to get right is their BASE -- which is
+// `274 + N`, where 273 is `currentstamp` once the initial environment is built
+// and N counts the `Ident.create_local`/`create_scoped` calls TYPING made.
+// Measured against ocamlc, one allocation apiece for:
+//   * every variable a pattern binds -- an or-pattern binds ONE set, so only
+//     its left branch counts -- plus every `(type a)` binder;
+//   * a function parameter whose pattern is not a plain variable, for which
+//     `name_pattern` invents `param`; and an optional parameter WITH a
+//     default, desugared through an `*opt*` binder (a bare `?x` has none);
+//   * ONE DISCARDED ident per non-`rec` binding whose right-hand side is
+//     syntactically a function -- `let rec` does not have it, and a `fun` in
+//     argument position does not either;
+//   * a type declaration, each of its constructors and each of its labels; an
+//     exception or extension constructor; an `external`; a module, module type
+//     or functor-parameter binding; each item an `include` re-binds;
+//   * each item of a signature, ONCE where the signature is only translated
+//     (a `.mli`, a `module M : sig .. end` ascription) and TWICE where it is
+//     also BOUND -- a `module type S = sig .. end` body, a functor parameter
+//     -- which is what `per` carries down; a signature nested two modules deep
+//     pays again per level (`max(per, depth + 1)`).
+// NOT modelled yet, and what `cmi_stamps.sh` scores: LOADING a persistent unit
+// allocates one ident per item of its signature, so the first mention of
+// `List` costs 75 and any file citing an outside module is short by that much;
+// and the class/object language.  `NOSTAMPBASE=1` reverts the writer to the
+// flat base 300.
+namespace stampcount {
+
+using namespace ast;
+
+// The value names the initial environment already holds: `Stdlib` is opened
+// before any unit is typed, so `let compare x = ..` SHADOWS one.
+const std::set<std::string>& stdlib_value_names() {
+  static std::set<std::string> names = [] {
+    std::set<std::string> s;
+    try {
+      const auto& c = cmi::CmiFile::load(stdpath("stdlib.cmi"));
+      for (auto& v : c.values()) s.insert(v.name);
+    } catch (...) {}
+    return s;
+  }();
+  return names;
+}
+
+struct Count {
+  long long n = 0;
+  // Value names in scope, so the ghost bindings below can ask what
+  // `Env.bound_value` would.  `mark`/`release` bracket a scope.
+  std::unordered_map<std::string, int> vals;
+  std::vector<std::string> added;
+  bool bound(const std::string& s) const {
+    auto it = vals.find(s);
+    if (it != vals.end() && it->second > 0) return true;
+    return stdlib_value_names().count(s) != 0;
+  }
+  void bind(const std::string& s) { vals[s]++; added.push_back(s); }
+  std::size_t mark() const { return added.size(); }
+  void release(std::size_t m) {
+    while (added.size() > m) { vals[added.back()]--; added.pop_back(); }
+  }
+
+  static const Pattern& strip(const Pattern& p) {
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return strip(*c->p);
+    return p;
+  }
+  // `out`, when given, collects the names bound -- the caller puts them in
+  // scope for the body, and `bindings` asks whether each was bound BEFORE.
+  void pat(const Pattern& p, std::vector<std::string>* out = nullptr) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
+      ++n;
+      if (out) out->push_back(v->name.txt);
+      return;
+    }
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
+      pat(*a->p, out);
+      ++n;
+      if (out) out->push_back(a->name.txt);
+      return;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      // `enter_variable` runs on BOTH branches -- the two idents for the
+      // same name are unified afterwards, but both were allocated -- while
+      // the pattern binds ONE set of names.
+      pat(*o->l, out);
+      pat(*o->r);
+      return;
+    }
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
+      pat(*c->p, out);
+      return;
+    }
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems) pat(*e, out);
+      return;
+    }
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      n += (long long)c->vars.size();       // `Constr (type a) p`
+      if (c->arg) pat(**c->arg, out);
+      return;
+    }
+    if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) pat(*f.second, out);
+      return;
+    }
+    if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : a->elems) pat(*e, out);
+      return;
+    }
+    if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) { pat(*l->p, out); return; }
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      if (v->arg) pat(**v->arg, out);
+      return;
+    }
+    if (auto* e = std::get_if<Ppat_exception>(&p.desc)) {
+      pat(*e->p, out);
+      return;
+    }
+    if (auto* o = std::get_if<Ppat_open>(&p.desc)) { pat(*o->p, out); return; }
+    if (auto* u = std::get_if<Ppat_unpack>(&p.desc)) {
+      if (u->name.txt) { ++n; if (out) out->push_back(*u->name.txt); }
+      return;
+    }
+    if (auto* f = std::get_if<Ppat_effect>(&p.desc)) {
+      pat(*f->eff, out); pat(*f->cont, out);
+      return;
+    }
+  }
+  void cse(const Case& c) {
+    auto m = mark();
+    std::vector<std::string> nm;
+    pat(c.lhs, &nm);
+    for (auto& s : nm) bind(s);
+    if (c.guard) expr(**c.guard);
+    expr(*c.rhs);
+    release(m);
+  }
+  // GHOST BINDINGS (typecore.ml:7695): so that a missing `rec` can be
+  // diagnosed, a non-recursive `let` whose bindings are ALL syntactically
+  // functions enters one unbound-value ident per bound variable -- but only
+  // for a name the environment does not already hold, so `let compare x = ..`
+  // (shadowing Stdlib's) allocates nothing.  The idents are thrown away; only
+  // the stamps they consume survive, in the .cmi's base.
+  void bindings(RecFlag rf, const std::vector<ValueBinding>& bs) {
+    std::vector<std::string> nm;
+    bool all_fun = true;
+    for (auto& b : bs)
+      if (!std::holds_alternative<Pexp_function>(b.expr->desc)) all_fun = false;
+    for (auto& b : bs) pat(b.pat, &nm);
+    if (rf == RecFlag::Nonrecursive && all_fun)
+      for (auto& s : nm) if (!bound(s)) ++n;
+    if (rf == RecFlag::Recursive) for (auto& s : nm) bind(s);
+    for (auto& b : bs) expr(*b.expr);
+    if (rf == RecFlag::Nonrecursive) for (auto& s : nm) bind(s);
+  }
+  // `name_pattern` (typecore.ml:4202) walks the patterns for the FIRST one
+  // that is already a variable or an alias and REUSES its ident; only if none
+  // is it creates `param`.  So `function 0 -> .. | n -> ..` costs nothing
+  // extra, while `function 0 -> .. | _ -> ..` costs one.
+  static bool is_named(const Pattern& p) {
+    const Pattern& q = strip(p);
+    return std::holds_alternative<Ppat_var>(q.desc) ||
+           std::holds_alternative<Ppat_alias>(q.desc);
+  }
+  void fn(const Pexp_function& f) {
+    auto m = mark();
+    std::vector<std::string> nm;
+    for (auto& pm : f.params) {
+      auto* pv = std::get_if<Pparam_val>(&pm.desc);
+      if (!pv) { ++n; continue; }  // (type a)
+      if (pv->default_) {
+        // A defaulted optional parameter binds `*opt*` INSTEAD of running
+        // name_pattern (typecore.ml:6083).
+        ++n;
+        expr(**pv->default_);
+        pat(pv->pat, &nm);
+        continue;
+      }
+      pat(pv->pat, &nm);
+      if (!is_named(pv->pat)) ++n;  // name_pattern "param" [pat]
+    }
+    for (auto& s : nm) bind(s);
+    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
+      expr(*fb->e);
+      release(m);
+      return;
+    }
+    const auto& cs = std::get<Pfunction_cases>(f.body->v).cases;
+    bool named = false;
+    for (auto& c : cs) if (is_named(c.lhs)) { named = true; break; }
+    if (!named) ++n;  // name_cases "param" cases
+    for (auto& c : cs) cse(c);
+    release(m);
+  }
+  void expr(const Expression& e) {
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      expr(*a->fn);
+      for (auto& ar : a->args) expr(*ar.second);
+    } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
+      for (auto& x : t->elems) expr(*x);
+    } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      auto m = mark();
+      bindings(l->rf, l->bindings);
+      expr(*l->body);
+      release(m);
+    } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      fn(*f);
+    } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      expr(*i->cond); expr(*i->then_);
+      if (i->else_) expr(**i->else_);
+    } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      if (c->arg) expr(**c->arg);
+    } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      expr(*m->e);
+      for (auto& c : m->cases) cse(c);
+    } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
+      expr(*t->e);
+      for (auto& c : t->cases) cse(c);
+    } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
+      expr(*s->e1); expr(*s->e2);
+    } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
+      expr(*c->e);
+    } else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) {
+      expr(*c->e);
+    } else if (auto* f = std::get_if<Pexp_field>(&e.desc)) {
+      expr(*f->e);
+    } else if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
+      for (auto& f : r->fields) expr(*f.second);
+      if (r->base) expr(**r->base);
+    } else if (auto* a = std::get_if<Pexp_assert>(&e.desc)) {
+      expr(*a->e);
+    } else if (auto* l = std::get_if<Pexp_lazy>(&e.desc)) {
+      expr(*l->e);
+    } else if (auto* w = std::get_if<Pexp_while>(&e.desc)) {
+      expr(*w->cond); expr(*w->body);
+    } else if (auto* f = std::get_if<Pexp_for>(&e.desc)) {
+      auto m = mark();
+      std::vector<std::string> nm;
+      pat(f->var, &nm);
+      expr(*f->lo); expr(*f->hi);
+      for (auto& s : nm) bind(s);
+      expr(*f->body);
+      release(m);
+    } else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) {
+      if (v->arg) expr(**v->arg);
+    } else if (auto* t = std::get_if<Pexp_newtype>(&e.desc)) {
+      ++n;
+      expr(*t->body);
+    } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
+      auto m = mark();
+      item(*s->item);
+      expr(*s->body);
+      release(m);
+    } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
+      expr(*s->obj); expr(*s->value);
+    } else if (auto* s = std::get_if<Pexp_setinstvar>(&e.desc)) {
+      expr(*s->value);
+    } else if (auto* s = std::get_if<Pexp_send>(&e.desc)) {
+      expr(*s->obj);
+    } else if (auto* p = std::get_if<Pexp_pack>(&e.desc)) {
+      mexpr(*p->me);
+    } else if (auto* l = std::get_if<Pexp_letop>(&e.desc)) {
+      auto m = mark();
+      std::vector<std::string> nm;
+      pat(l->let_.pat, &nm); expr(*l->let_.exp);
+      for (auto& a : l->ands) { pat(a.pat, &nm); expr(*a.exp); }
+      // Texp_letop carries a `param` named the same way (typecore.ml:5503);
+      // with `and`s the case pattern is a tuple, so never a bare variable.
+      if (!l->ands.empty() || !is_named(l->let_.pat)) ++n;
+      for (auto& s : nm) bind(s);
+      expr(*l->body);
+      release(m);
+    } else if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
+      for (auto& x : a->elems) expr(*x);
+    } else if (auto* o = std::get_if<Pexp_override>(&e.desc)) {
+      for (auto& f : o->fields) expr(*f.second);
+    } else if (auto* p = std::get_if<Pexp_poly>(&e.desc)) {
+      expr(*p->e);
+    }
+  }
+
+  // A type declaration's own name is a signature item, so it costs `per`; its
+  // constructors and labels are typing-time idents no rename touches.
+  void type_decls(const std::vector<TypeDeclaration>& ds, int per) {
+    for (auto& d : ds) {
+      n += per;
+      if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+        for (auto& c : v->ctors) { ++n; ctor_args(c.args); }
+      } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+        n += (long long)r->fields.size();
+      }
+    }
+  }
+  void ctor_args(const ConstructorArguments& a) {
+    if (auto* r = std::get_if<Pcstr_record>(&a))
+      n += (long long)r->fields.size();
+  }
+  void ext_ctor(const ExtensionConstructor& c) {
+    ++n;
+    if (auto* d = std::get_if<Pext_decl>(&c.kind)) ctor_args(d->args);
+  }
+
+  // How many items does this module expression export?  An `include` (and an
+  // `open struct .. end`) re-binds each of them.
+  static long long exports(const ModuleExpr& m) {
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st) return 0;  // a named module: we would have to read its signature
+    long long k = 0;
+    for (auto& it : st->items) {
+      if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+        Count c;
+        for (auto& b : v->bindings) c.pat(b.pat);
+        k += c.n;
+      } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+        k += (long long)t->decls.size();
+      } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
+        k += (long long)x->ext.ctors.size();
+      } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        k += exports(i->expr);
+      } else if (std::holds_alternative<Pstr_module>(it.desc) ||
+                 std::holds_alternative<Pstr_modtype>(it.desc) ||
+                 std::holds_alternative<Pstr_primitive>(it.desc) ||
+                 std::holds_alternative<Pstr_exception>(it.desc) ||
+                 std::holds_alternative<Pstr_val>(it.desc)) {
+        ++k;
+      }
+    }
+    return k;
+  }
+  static long long sig_exports(const ModuleType& mt) {
+    auto* s = std::get_if<Pmty_signature>(&mt.desc);
+    return s ? (long long)s->items.size() : 0;
+  }
+
+  void mexpr(const ModuleExpr& m) {
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      auto k = mark();
+      for (auto& it : st->items) item(it);
+      release(k);
+    } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      fparam(f->param, 1, 0);
+      mexpr(*f->body);
+    } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
+      mexpr(*c->me);
+      mty(*c->mt, 1, 0);
+    } else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) {
+      mexpr(*a->f); mexpr(*a->arg);
+    } else if (auto* a = std::get_if<Pmod_apply_unit>(&m.desc)) {
+      mexpr(*a->f);
+    } else if (auto* u = std::get_if<Pmod_unpack>(&m.desc)) {
+      expr(*u->e);
+    }
+  }
+  // A functor parameter's signature is BOUND into the environment, so each of
+  // its items is allocated twice over (`per + 1`).
+  void fparam(const FunctorParam& p, int per, int depth) {
+    auto* nm = std::get_if<Functor_named>(&p);
+    if (!nm) return;
+    mty(*nm->type, per + 1, depth + 1);
+    if (nm->name.txt) ++n;
+  }
+  void mty(const ModuleType& mt, int per, int depth) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      sig_items(s->items, per, depth);
+    } else if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      fparam(f->param, per, depth);
+      mty(*f->body, per, depth);
+    } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
+      mty(*w->mt, per, depth);
+    } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
+      mexpr(*t->me);
+    }
+  }
+  void sig_items(const Signature& s, int per, int depth) {
+    for (auto& it : s) sig_item(it, per, depth);
+  }
+  void sig_item(const SignatureItem& it, int per, int depth) {
+    const int sub = per > depth + 1 ? per : depth + 1;  // a module's own sig
+    if (std::holds_alternative<Psig_value>(it.desc) ||
+        std::holds_alternative<Psig_primitive>(it.desc) ||
+        std::holds_alternative<Psig_modsubst>(it.desc)) {
+      n += per;
+    } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+      type_decls(t->decls, per);
+    } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
+      type_decls(t->decls, per);
+    } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+      for (auto& c : x->ext.ctors) ext_ctor(c);
+    } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
+      ext_ctor(e->exn.ctor);
+    } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+      n += per;
+      mty(*m->md.type, sub, depth + 1);
+    } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      for (auto& d : m->decls) { n += per; mty(*d.type, sub, depth + 1); }
+    } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+      n += per;
+      if (m->type) mty(*m->type, per + 1, depth + 1);
+    } else if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc)) {
+      n += per;
+      mty(m->type, per + 1, depth + 1);
+    } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+      mty(i->mt, 1, depth + 1);
+      n += per * sig_exports(i->mt);
+    }
+  }
+
+  void item(const StructureItem& it) {
+    if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
+      expr(*e->e);
+    } else if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      bindings(v->rf, v->bindings);
+    } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+      type_decls(t->decls, 1);
+    } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
+      for (auto& c : x->ext.ctors) ext_ctor(c);
+    } else if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
+      ext_ctor(e->exn.ctor);
+    } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
+      ++n;
+      bind(p->prim.name.txt);
+    } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
+      ++n;
+      bind(v->vd.name.txt);
+    } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+      mexpr(m->binding.expr);
+      if (m->binding.name.txt) ++n;
+    } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      for (auto& b : m->bindings) { mexpr(b.expr); if (b.name.txt) ++n; }
+    } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+      if (m->type) mty(*m->type, 2, 1);
+      ++n;
+    } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+      mexpr(i->expr);
+      n += exports(i->expr);
+    } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
+      mexpr(o->expr);
+      n += exports(o->expr);
+    }
+  }
+};
+
+}  // namespace stampcount
+
+int typing_ident_count(const ast::Structure& s) {
+  stampcount::Count c;
+  for (auto& it : s) c.item(it);
+  return (int)c.n;
+}
+
+int typing_ident_count(const ast::Signature& s) {
+  stampcount::Count c;
+  c.sig_items(s, 1, 0);
+  return (int)c.n;
+}
+
 }  // namespace cppcaml

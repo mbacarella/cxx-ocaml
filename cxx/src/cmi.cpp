@@ -3028,14 +3028,15 @@ static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items_in,
                       const std::vector<Import>& imports, bool intf,
-                      const std::vector<std::string>& src_files) {
+                      const std::vector<std::string>& src_files,
+                      int stamp_base) {
   g_share.clear();              // the shared-value tables are per-cmi
   g_cmi_src_files = src_files;  // resolve position file_ids to pos_fname (emit_loc)
   std::vector<SigItem> items = items_in;  // mutable copy: uids assigned in place
   int uid_counter = 0;
   assign_uids(items, modname, intf, uid_counter);
   std::map<std::string, bool> referenced;  // cited global unit -> needs real CRC
-  int stamp = 300;
+  int stamp = stamp_base;
   auto sig = emit_sig_items(items, referenced, stamp);
   auto header = o::vblock(0, {shared_str(modname), o::vlist(sig)});
   std::vector<std::uint8_t> hbytes = o::marshal(header);

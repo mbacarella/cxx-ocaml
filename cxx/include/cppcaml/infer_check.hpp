@@ -226,6 +226,14 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     const ast::Structure& s,
     const std::vector<std::pair<std::string, const ast::ModuleType*>>* fparams = nullptr);
 
+// How many `Ident.t` does ocamlc allocate while TYPING this unit?  A saved
+// signature's stamps are fresh and contiguous (`rename_bound_idents` renames
+// every bound ident at save time), so the only thing a .cmi writer has to get
+// right is their BASE, which is `274 + <this count>`.  See the definition in
+// infer_check.cpp for the rules and for what is not modelled yet.
+int typing_ident_count(const ast::Structure& s);
+int typing_ident_count(const ast::Signature& s);
+
 // Build the .cmi signature from a hand-written interface (.mli).  Unlike
 // infer_signature this reads types verbatim from the declarations (no
 // inference); it is the path used when an interface file exists.
