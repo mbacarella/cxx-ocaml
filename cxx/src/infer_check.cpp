@@ -21223,6 +21223,88 @@ struct Count {
     for (auto& c : cs) cse(c);
     release(m);
   }
+  static bool cls_off() {
+    static const bool off = dbg_env("NOCLASS") != nullptr;
+    return off;
+  }
+  // `type_self_pattern` (typecore.ml:2631) aliases the self pattern to
+  // `selfpat-*`, so an object has a self variable however it is written, and
+  // each one costs three: the pattern's own ident and the `Val_unbound_self`
+  // entered in the value AND the parent environment (typeclass.ml:1008).
+  // `class_structure` then names every method of the finished signature once
+  // more (typeclass.ml:1038), a virtual one included.
+  void cstruct(const ClassStructure& cs) {
+    auto m = mark();
+    std::vector<std::string> nm;
+    pat(cs.self, &nm);
+    n += 1 + 2 * (long long)(nm.size() + 1);
+    for (auto& s : nm) bind(s);
+    std::set<std::string> meths, vals;
+    for (auto& f : cs.fields) cfield(f, meths, vals);
+    n += (long long)meths.size();
+    release(m);
+  }
+  // An instance variable is entered in the value and the parent environment
+  // and given an ident of its own -- but only the FIRST time its name is seen,
+  // since a redeclaration reuses the one `vars` already holds.  A method body
+  // and an initializer are wrapped in `fun (self-* as self-N) -> ..`
+  // (`make_method`, typeclass.ml), which binds two.  Inheriting under a name
+  // enters that name twice as an ancestor value and once as a method.
+  void cfield(const ClassField& f, std::set<std::string>& meths,
+              std::set<std::string>& vals) {
+    if (auto* i = std::get_if<Pcf_inherit>(&f.desc)) {
+      cexpr(*i->ce);
+      if (i->as_) n += 3;
+    } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
+      if (vals.insert(v->name.txt).second) { n += 3; bind(v->name.txt); }
+      if (auto* c = std::get_if<Cfk_concrete>(&v->kind)) expr(*c->e);
+    } else if (auto* d = std::get_if<Pcf_method>(&f.desc)) {
+      meths.insert(d->name.txt);
+      if (auto* c = std::get_if<Cfk_concrete>(&d->kind)) {
+        n += 2;
+        expr(*c->e);
+      }
+    } else if (auto* i = std::get_if<Pcf_initializer>(&f.desc)) {
+      n += 2;
+      expr(*i->e);
+    }
+  }
+  // A class parameter is a pattern typed by `type_class_arg_pattern`
+  // (typecore.ml), which renames every variable it binds -- two idents apiece
+  // -- and a class-level `let` does the same (typeclass.ml:1372).  A DEFAULTED
+  // parameter is not typed as one at all: it desugars (typeclass.ml) to an
+  // `*opt*` parameter, a `let` of the pattern to a match on it, and the body,
+  // so its own variables are let-bound and the match arm binds `*sth*`.
+  void cexpr(const ClassExpr& c) {
+    if (auto* s = std::get_if<Pcl_structure>(&c.desc)) {
+      cstruct(s->cs);
+    } else if (auto* f = std::get_if<Pcl_fun>(&c.desc)) {
+      auto m = mark();
+      std::vector<std::string> nm;
+      if (f->default_) {
+        n += 3;  // `*opt*` and its rename, and the `*sth*` of the match
+        expr(**f->default_);
+      }
+      pat(f->pat, &nm);
+      n += (long long)nm.size();
+      for (auto& s : nm) bind(s);
+      cexpr(*f->body);
+      release(m);
+    } else if (auto* a = std::get_if<Pcl_apply>(&c.desc)) {
+      cexpr(*a->ce);
+      for (auto& ar : a->args) expr(*ar.second);
+    } else if (auto* l = std::get_if<Pcl_let>(&c.desc)) {
+      auto m = mark();
+      { Count t; for (auto& b : l->bindings) t.pat(b.pat); n += t.n; }
+      bindings(l->rf, l->bindings);
+      cexpr(*l->body);
+      release(m);
+    } else if (auto* k = std::get_if<Pcl_constraint>(&c.desc)) {
+      cexpr(*k->ce);
+    } else if (auto* o = std::get_if<Pcl_open>(&c.desc)) {
+      cexpr(*o->body);
+    }
+  }
   void expr(const Expression& e) {
     if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       expr(*a->fn);
@@ -21309,6 +21391,8 @@ struct Count {
       for (auto& f : o->fields) expr(*f.second);
     } else if (auto* p = std::get_if<Pexp_poly>(&e.desc)) {
       expr(*p->e);
+    } else if (auto* o = std::get_if<Pexp_object>(&e.desc)) {
+      if (!cls_off()) cstruct(*o->cs);
     }
   }
 
@@ -21350,6 +21434,10 @@ struct Count {
         k += (long long)x->ext.ctors.size();
       } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
         k += exports(i->expr);
+      } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
+        if (!cls_off()) k += 3 * (long long)c->decls.size();
+      } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
+        if (!cls_off()) k += 2 * (long long)c->decls.size();
       } else if (std::holds_alternative<Pstr_module>(it.desc) ||
                  std::holds_alternative<Pstr_modtype>(it.desc) ||
                  std::holds_alternative<Pstr_primitive>(it.desc) ||
@@ -21362,7 +21450,20 @@ struct Count {
   }
   static long long sig_exports(const ModuleType& mt) {
     auto* s = std::get_if<Pmty_signature>(&mt.desc);
-    return s ? (long long)s->items.size() : 0;
+    if (!s) return 0;
+    if (cls_off()) return (long long)s->items.size();
+    long long k = 0;
+    for (auto& it : s->items) k += cls_items(it, 1);
+    return k;
+  }
+  // A class declaration is THREE items of the signature it is saved in and a
+  // class type two; every other item is the one it looks.
+  static long long cls_items(const SignatureItem& it, long long other) {
+    if (auto* c = std::get_if<Psig_class>(&it.desc))
+      return 3 * (long long)c->decls.size();
+    if (auto* c = std::get_if<Psig_class_type>(&it.desc))
+      return 2 * (long long)c->decls.size();
+    return other;
   }
 
   // `Subst.modtype` renames one ident per item of every signature a module type
@@ -21410,6 +21511,7 @@ struct Count {
     if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
       return 1 + ren_mty(m->type);
     if (auto* i = std::get_if<Psig_include>(&it.desc)) return ren_mty(i->mt);
+    if (!cls_off()) return cls_items(it, 0);
     return 0;
   }
 
@@ -21504,6 +21606,11 @@ struct Count {
     // `Env.enter_signature` renames ALL of an included signature, declaration
     // or not.
     if (auto* i = std::get_if<Psig_include>(&it.desc)) return ren_mty(i->mt);
+    if (cls_off()) return 0;
+    if (auto* c = std::get_if<Psig_class>(&it.desc))
+      return 3 * (long long)c->decls.size();
+    if (auto* c = std::get_if<Psig_class_type>(&it.desc))
+      return 3 * (long long)c->decls.size();
     return 0;
   }
 
@@ -21548,6 +21655,11 @@ struct Count {
         std::holds_alternative<Pstr_exception>(it.desc) ||
         std::holds_alternative<Pstr_val>(it.desc))
       return 1;
+    if (cls_off()) return 0;
+    if (auto* c = std::get_if<Pstr_class>(&it.desc))
+      return 3 * (long long)c->decls.size();
+    if (auto* c = std::get_if<Pstr_class_type>(&it.desc))
+      return 2 * (long long)c->decls.size();
     return 0;
   }
 
@@ -21670,6 +21782,15 @@ struct Count {
     } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
       mty(i->mt, 1, depth + 1);
       n += per * sig_exports(i->mt);
+    // A DESCRIBED class is those same three idents, and binding it into an
+    // environment renames the items it saves -- three of them, where a class
+    // type saves two.
+    } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
+      if (!cls_off())
+        n += (3 + 3 * (per - 1)) * (long long)c->decls.size();
+    } else if (auto* c = std::get_if<Psig_class_type>(&it.desc)) {
+      if (!cls_off())
+        n += (3 + 2 * (per - 1)) * (long long)c->decls.size();
     }
   }
 
@@ -21705,6 +21826,16 @@ struct Count {
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
       mexpr(o->expr);
       n += exports(o->expr);
+    // A class costs three idents before anything of it is read:
+    // `type_classes` (typeclass.ml:1897) creates the class, its class type
+    // and its object type in one go, for a declaration and a description
+    // alike; the class EXPRESSION then pays for its own binders on top.
+    } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
+      if (cls_off()) return;
+      for (auto& d : c->decls) { n += 3; cexpr(d.expr); }
+    } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
+      if (cls_off()) return;
+      n += 3 * (long long)c->decls.size();
     }
   }
 };
