@@ -21525,6 +21525,34 @@ struct Count {
     static const bool off = dbg_env("NOSIGEXT") != nullptr;
     return off;
   }
+  static bool forany_off() {
+    static const bool off = dbg_env("NOFORANY") != nullptr;
+    return off;
+  }
+  static bool privrow_off() {
+    static const bool off = dbg_env("NOPRIVROW") != nullptr;
+    return off;
+  }
+  // `type t = private [> `A]` is a FIXED ROW: `transl_type_decl`
+  // (typedecl.ml) prepends a dummy `t#row` declaration for it, so the group
+  // carries one signature item more than it spells.  `is_fixed_type` asks for
+  // a private manifest with no kind of its own whose head still has a row
+  // variable -- an open variant, a `[< .. ]`, an open object or a class type.
+  static bool row_var(const CoreType& t) {
+    if (auto* a = std::get_if<Ptyp_alias>(&t.desc)) return row_var(*a->type);
+    if (std::holds_alternative<Ptyp_class>(t.desc)) return true;
+    if (auto* o = std::get_if<Ptyp_object>(&t.desc))
+      return o->closed == ClosedFlag::Open;
+    if (auto* v = std::get_if<Ptyp_variant>(&t.desc))
+      return v->closed == ClosedFlag::Open || v->labels.has_value();
+    return false;
+  }
+  static bool fixed_row(const TypeDeclaration& d) {
+    return !privrow_off() && d.manifest &&
+           d.priv == PrivateFlag::Private &&
+           std::holds_alternative<Ptype_abstract>(d.kind) &&
+           row_var(**d.manifest);
+  }
   void bindings(RecFlag rf, const std::vector<ValueBinding>& bs) {
     // `let f : type a. t = e` names the locally abstract variable TWICE:
     // the sugar leaves it BOTH in the binding's own constraint (the
@@ -21715,6 +21743,9 @@ struct Count {
     } else if (auto* f = std::get_if<Pexp_for>(&e.desc)) {
       auto m = mark();
       std::vector<std::string> nm;
+      // `for _ = a to b` still binds: typecore's `Pexp_for` arm makes an
+      // `Ident.create_local "_for"` where the pattern names nothing.
+      if (!forany_off() && std::holds_alternative<Ppat_any>(f->var.desc)) ++n;
       pat(f->var, &nm);
       expr(*f->lo); expr(*f->hi);
       for (auto& s : nm) bind(s);
@@ -21768,6 +21799,7 @@ struct Count {
   void type_decls(const std::vector<TypeDeclaration>& ds, int per) {
     for (auto& d : ds) {
       n += per;
+      if (fixed_row(d)) n += per;
       if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
         for (auto& c : v->ctors) { ++n; ctor_args(c.args); }
       } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
@@ -22008,8 +22040,11 @@ struct Count {
       for (auto& b : v->bindings) c.pat(b.pat);
       return c.n;
     }
-    if (auto* t = std::get_if<Pstr_type>(&it.desc))
-      return (long long)t->decls.size();
+    if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+      long long k = (long long)t->decls.size();
+      for (auto& d : t->decls) if (fixed_row(d)) ++k;
+      return k;
+    }
     if (auto* x = std::get_if<Pstr_typext>(&it.desc))
       return (long long)x->ext.ctors.size();
     if (auto* i = std::get_if<Pstr_include>(&it.desc))
