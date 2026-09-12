@@ -23588,6 +23588,30 @@ struct Count {
     static const bool off = dbg_env("NOLAPP") != nullptr;
     return off;
   }
+  static bool pbody_off() {
+    static const bool off = dbg_env("NOPBODY") != nullptr;
+    return off;
+  }
+  // `module F (X : S) = X` hands its own PARAMETER back, so `mderef` finds no
+  // module of this file to weigh: the application substitutes S all the same,
+  // and what it leaves is an ALIAS, which `Mtype.strengthen` walks without
+  // rebuilding anything.  A body naming any OTHER module is not the
+  // parameter and is substituted by nobody.
+  const ModuleType* param_body(const Pmod_functor& f) const {
+    auto* nm = std::get_if<Functor_named>(&f.param);
+    if (!nm || !nm->name.txt) return nullptr;
+    auto* pi = std::get_if<Pmod_ident>(&f.body->desc);
+    if (!pi) return nullptr;
+    auto* li = std::get_if<Lident>(&pi->id.txt.v);
+    if (!li || li->name != *nm->name.txt) return nullptr;
+    const ModuleType* mt = &*nm->type;
+    for (int i = 0; mt && i < 8; ++i) {
+      auto* id = std::get_if<Pmty_ident>(&mt->desc);
+      if (!id) break;
+      mt = named_mty(id->id.txt, 8);
+    }
+    return mt;
+  }
   static bool xapp_off() {
     static const bool off = dbg_env("NOXMODAPP") != nullptr;
     return off;
@@ -23863,6 +23887,7 @@ struct Count {
       h = a->f.get();
     }
     long long k = 0;
+    bool pbody = false;  // the result is the PARAMETER, and so an alias
     for (int i = 0; i < nargs; ++i) {
       if (me)
         if (auto* c = std::get_if<Pmod_constraint>(&me->desc)) {
@@ -23872,8 +23897,18 @@ struct Count {
       if (me) {
         auto* f = std::get_if<Pmod_functor>(&me->desc);
         if (!f) return 0;
-        me = mderef(f->body.get());
-        if (!me) return 0;
+        const ModuleExpr* b = mderef(f->body.get());
+        if (b) {
+          me = b;
+        } else {
+          const ModuleType* pt = pbody_off() ? nullptr : param_body(*f);
+          if (!pt) return 0;
+          mt = pt;
+          me = nullptr;
+          pbody = true;
+        }
+      } else if (pbody) {
+        return 0;  // a curried application THROUGH the parameter
       } else {
         auto* f = std::get_if<Pmty_functor>(&mt->desc);
         if (!f) return 0;
@@ -23883,14 +23918,14 @@ struct Count {
         k += me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
     }
     k += me ? wt_mexpr(*me, l) : wt_mty(*mt, l);
-    if (pathless && saved)
+    if (pathless && saved && !pbody)
       k += me ? ext_mexpr(*me, Ext{}) : ext_mty(*mt, Ext{});
     // A result whose type declarations `Mtype.strengthen` must REBUILD is
     // substituted again where it is saved -- but ONCE PER ARGUMENT, not once
     // per application, and once more (one ident over) for the FIRST
     // application of the functor: over a base of `items + 1` apiece,
     // `M (A) M (B) M (A)` is 3R+2, 2R+1, R+1.
-    if (saved && !inexpr_ && !pathless && !xapp_off() &&
+    if (saved && !inexpr_ && !pathless && !pbody && !xapp_off() &&
         (me ? str_mexpr(*me) : str_mty(*mt))) {
       long long fl = me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
       // An argument that is itself an APPLICATION is not a path the result
