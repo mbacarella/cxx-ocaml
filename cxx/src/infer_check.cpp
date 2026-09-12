@@ -21558,17 +21558,25 @@ struct Count {
   // a path that does not resolve is charged nothing at all.
   std::unordered_map<std::string, std::vector<const ModuleExpr*>> mods;
   std::vector<std::string> mnames;
+  // How deep in the file's own structures each of them was bound: an
+  // argument bound BELOW the top level is not a module the enclosing
+  // signature already names, and the application rebuilds for it.
+  std::unordered_map<std::string, std::vector<int>> mdepth;
+  int sdepth_ = 0;
   std::size_t mmark() const { return mnames.size(); }
   void mrelease(std::size_t m) {
     while (mnames.size() > m) {
       auto it = mods.find(mnames.back());
       if (it != mods.end() && !it->second.empty()) it->second.pop_back();
+      auto dt = mdepth.find(mnames.back());
+      if (dt != mdepth.end() && !dt->second.empty()) dt->second.pop_back();
       mnames.pop_back();
     }
   }
   void mbind(const ModuleBinding& b) {
     if (!b.name.txt) return;
     mods[*b.name.txt].push_back(&b.expr);
+    mdepth[*b.name.txt].push_back(sdepth_);
     mnames.push_back(*b.name.txt);
   }
   // The VALUE names an `include <PATH>` brings into scope, collected by the
@@ -21598,6 +21606,10 @@ struct Count {
   // result signature the .cmi carries is paid once per (functor, argument);
   // the parameter and the strengthening are paid once per functor.
   std::set<std::string> fpar, farg, fstr, fseen;
+  // Which LOCAL functors this file has applied already: the strengthening
+  // of a result is paid once per (functor, argument), and once more --
+  // and one ident over -- for the FIRST application of the functor.
+  std::set<std::string> larg, lseen;
   std::map<std::string, std::set<std::string>> fargp;
   // Inside `let module M = .. in ..`, where the result is bound over the
   // body alone and is never saved.
@@ -23572,6 +23584,10 @@ struct Count {
   // Its result is not in this parsetree at all: it is the signature the
   // unit's .cmi carries, and applying it FORCES that signature (one ident
   // per item, at every depth) before the substitution the cascade weighs.
+  static bool lapp_off() {
+    static const bool off = dbg_env("NOLAPP") != nullptr;
+    return off;
+  }
   static bool xapp_off() {
     static const bool off = dbg_env("NOXMODAPP") != nullptr;
     return off;
@@ -23773,6 +23789,50 @@ struct Count {
       k += 2 * flat_cmty(mt);
     return k;
   }
+  // A parameter given as a NAMED module type is not a signature the
+  // application has to write out again: `F (X : T)` costs one ident less
+  // than `F (X : sig .. end)` the first time it is applied.
+  static bool named_param(const ModuleExpr* fd) {
+    auto* f = fd ? std::get_if<Pmod_functor>(&fd->desc) : nullptr;
+    if (!f) return false;
+    auto* nm = std::get_if<Functor_named>(&f->param);
+    return nm && nm->type &&
+           std::holds_alternative<Pmty_ident>(nm->type->desc);
+  }
+  // What the ARGUMENT of a local application adds the first time it is
+  // applied: a module the enclosing signature does not already name -- one
+  // of ANOTHER UNIT, or one bound below this file's top level -- has the
+  // result rebuilt for it a second time, and a DOTTED path of this file
+  // costs the one ident that reading the component through its parent does.
+  long long arg_extra(const ModuleExpr& m, long long fl) const {
+    long long k = 0;
+    for (const ModuleExpr* h = &m;;) {
+      auto* a = std::get_if<Pmod_apply>(&h->desc);
+      if (!a) break;
+      h = a->f.get();
+      auto* pi = std::get_if<Pmod_ident>(&a->arg->desc);
+      if (!pi) continue;
+      std::vector<std::string> c;
+      if (!lid_comps(pi->id.txt, c) || c.empty()) continue;
+      auto fp = fmods.find(c[0]);
+      if (fp != fmods.end() && !fp->second.empty()) continue;
+      auto it = mods.find(c[0]);
+      if (it != mods.end() && !it->second.empty()) {
+        auto dt = mdepth.find(c[0]);
+        if (dt != mdepth.end() && !dt->second.empty() && dt->second.back() > 0)
+          k += fl;
+        if (c.size() > 1) ++k;
+        continue;
+      }
+      std::string un = c[0];
+      if (un == "Stdlib" && c.size() > 1) un = c[1];
+      if (un.rfind("Stdlib__", 0) == 0) un = un.substr(8);
+      std::string p = head_cmi(un);
+      if (!p.empty() && std::filesystem::exists(p)) k += fl;
+      else ++k;  // a submodule an `open` put in scope reads as a dotted path
+    }
+    return k;
+  }
   long long app_charge(const ModuleExpr& m, const Lvl& l,
                        bool saved = true) {
     if (app_off()) return 0;
@@ -23794,6 +23854,7 @@ struct Count {
     const ModuleExpr* me = mderef(head);
     const ModuleType* mt = nullptr;
     if (!me) return cross_charge(m, *head, nargs, l, saved);
+    const ModuleExpr* fdef = me;
     bool pathless = false;
     for (const ModuleExpr* h = &m;;) {
       auto* a = std::get_if<Pmod_apply>(&h->desc);
@@ -23825,11 +23886,44 @@ struct Count {
     if (pathless && saved)
       k += me ? ext_mexpr(*me, Ext{}) : ext_mty(*mt, Ext{});
     // A result whose type declarations `Mtype.strengthen` must REBUILD is
-    // substituted twice more where it is saved -- a functor of this file's
-    // as much as another unit's.
+    // substituted again where it is saved -- but ONCE PER ARGUMENT, not once
+    // per application, and once more (one ident over) for the FIRST
+    // application of the functor: over a base of `items + 1` apiece,
+    // `M (A) M (B) M (A)` is 3R+2, 2R+1, R+1.
     if (saved && !inexpr_ && !pathless && !xapp_off() &&
-        (me ? str_mexpr(*me) : str_mty(*mt)))
-      k += 2 * (me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat()));
+        (me ? str_mexpr(*me) : str_mty(*mt))) {
+      long long fl = me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
+      // An argument that is itself an APPLICATION is not a path the result
+      // is shared under: only a NAMED argument is cached below.
+      bool named_args = true;
+      for (const ModuleExpr* h = &m;;) {
+        auto* a = std::get_if<Pmod_apply>(&h->desc);
+        if (!a) break;
+        if (!std::holds_alternative<Pmod_ident>(a->arg->desc))
+          named_args = false;
+        h = a->f.get();
+      }
+      if (nargs > 1 || !named_args || lapp_off()) {
+        k += 2 * fl;
+      } else {
+        std::string key = std::to_string((std::uintptr_t)fdef);
+        std::string ak = key;
+        for (const ModuleExpr* h = &m;;) {
+          auto* a = std::get_if<Pmod_apply>(&h->desc);
+          if (!a) break;
+          if (auto* pi = std::get_if<Pmod_ident>(&a->arg->desc))
+            ak += "(" + lid_full(pi->id.txt) + ")";
+          else
+            ak += "(" + std::to_string((std::uintptr_t)a->arg.get()) + ")";
+          h = a->f.get();
+        }
+        if (larg.insert(ak).second) {
+          k += fl;
+          k += arg_extra(m, fl);
+        }
+        if (lseen.insert(key).second) k += fl + (named_param(fdef) ? 0 : 1);
+      }
+    }
     return k;
   }
   // `saved` is false where the signature this expression has is DISCARDED --
@@ -23842,7 +23936,9 @@ struct Count {
       auto mk = mmark();
       auto ek = emark();
       auto tk = tmark();
+      ++sdepth_;
       for (auto& it : st->items) item(it, l);
+      --sdepth_;
       release(k);
       mrelease(mk);
       erelease(ek);
