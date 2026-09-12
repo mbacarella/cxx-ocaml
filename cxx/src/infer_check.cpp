@@ -21460,6 +21460,10 @@ struct Count {
     }
     if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
       n += (long long)c->vars.size();       // `Constr (type a) p`
+      // `type_pat`'s `Ppat_construct` arm runs `Ctype.instance_constructor
+      // Make_existentials_abstract`, which `Env.enter_type`s one abstract
+      // type per existential the constructor opens.
+      n += ctor_exist(c->id.txt);
       if (c->arg) pat(**c->arg, out);
       return;
     }
@@ -21553,6 +21557,384 @@ struct Count {
            std::holds_alternative<Ptype_abstract>(d.kind) &&
            row_var(**d.manifest);
   }
+  static bool exist_off() {
+    static const bool off = dbg_env("NOEXIST") != nullptr;
+    return off;
+  }
+  // How many EXISTENTIALS does a constructor open?  `Datarepr.constructor_args`
+  // keeps the variables of the ARGUMENTS that the GADT return type does not
+  // mention -- and a constructor with no return type of its own has none at
+  // all, so only a `C : .. -> t` can pay.  An anonymous `_` is a variable the
+  // result can never name, so every one of them is existential.
+  static void ty_vars(const CoreType& t, std::set<std::string>& v, int& anon) {
+    if (std::holds_alternative<Ptyp_any>(t.desc)) { ++anon; return; }
+    if (auto* x = std::get_if<Ptyp_var>(&t.desc)) { v.insert(x->name); return; }
+    if (auto* x = std::get_if<Ptyp_arrow>(&t.desc)) {
+      ty_vars(*x->dom, v, anon); ty_vars(*x->cod, v, anon); return;
+    }
+    if (auto* x = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : x->elems) ty_vars(*e, v, anon);
+      return;
+    }
+    if (auto* x = std::get_if<Ptyp_constr>(&t.desc)) {
+      for (auto& a : x->args) ty_vars(*a, v, anon);
+      return;
+    }
+    if (auto* x = std::get_if<Ptyp_class>(&t.desc)) {
+      for (auto& a : x->args) ty_vars(*a, v, anon);
+      return;
+    }
+    if (auto* x = std::get_if<Ptyp_variant>(&t.desc)) {
+      for (auto& r : x->rows) {
+        if (auto* g = std::get_if<Rtag>(&r))
+          for (auto& a : g->types) ty_vars(*a, v, anon);
+        else if (auto* h = std::get_if<Rinherit>(&r))
+          ty_vars(*h->ct, v, anon);
+      }
+      return;
+    }
+    if (auto* x = std::get_if<Ptyp_object>(&t.desc)) {
+      for (auto& o : x->fields) {
+        if (auto* g = std::get_if<Otag>(&o)) ty_vars(*g->type, v, anon);
+        else if (auto* h = std::get_if<Oinherit>(&o))
+          ty_vars(*h->type, v, anon);
+      }
+      return;
+    }
+    if (auto* x = std::get_if<Ptyp_alias>(&t.desc)) {
+      ty_vars(*x->type, v, anon); v.insert(x->name); return;
+    }
+    if (auto* x = std::get_if<Ptyp_poly>(&t.desc)) {
+      ty_vars(*x->type, v, anon); return;
+    }
+    if (auto* x = std::get_if<Ptyp_open>(&t.desc)) {
+      ty_vars(*x->type, v, anon); return;
+    }
+    if (auto* x = std::get_if<Ptyp_functor>(&t.desc)) {
+      ty_vars(*x->body, v, anon); return;
+    }
+    if (auto* x = std::get_if<Ptyp_package>(&t.desc)) {
+      for (auto& c : x->constraints) ty_vars(*c.second, v, anon);
+      return;
+    }
+  }
+  static int exist_of(const ConstructorArguments& a,
+                      const std::optional<CoreTypeBox>& res) {
+    if (!res) return 0;
+    std::set<std::string> av, rv;
+    int an = 0, rn = 0;
+    if (auto* t = std::get_if<Pcstr_tuple>(&a))
+      for (auto& e : t->elems) ty_vars(*e, av, an);
+    else if (auto* r = std::get_if<Pcstr_record>(&a))
+      for (auto& l : r->fields) ty_vars(*l.type, av, an);
+    ty_vars(**res, rv, rn);
+    int k = an;
+    for (auto& x : av)
+      if (!rv.count(x)) ++k;
+    return k;
+  }
+  // The same off a .cmi, where the variables are graph NODES: `Effect`'s
+  // `exception Unhandled : 'a t -> exn` opens one.
+  static void cmi_vars(const cmi::TypePtr& t,
+                       std::set<const cmi::TypeExpr*>& v,
+                       std::set<const cmi::TypeExpr*>& seen) {
+    const cmi::TypeExpr* p = t.get();
+    if (!p || !seen.insert(p).second) return;
+    if (p->kind == cmi::TypeExpr::Tvar) { v.insert(p); return; }
+    cmi_vars(p->dom, v, seen);
+    cmi_vars(p->cod, v, seen);
+    cmi_vars(p->link, v, seen);
+    for (auto& e : p->elems) cmi_vars(e.second, v, seen);
+    for (auto& a : p->args) cmi_vars(a, v, seen);
+    for (auto& a : p->pv_args) cmi_vars(a, v, seen);
+  }
+  static int cmi_exist(const std::vector<cmi::TypePtr>& args,
+                       const std::vector<cmi::LabelDecl>& rec,
+                       const cmi::TypePtr& res) {
+    if (!res) return 0;
+    std::set<const cmi::TypeExpr*> av, rv, seen;
+    for (auto& a : args) cmi_vars(a, av, seen);
+    for (auto& l : rec) cmi_vars(l.type, av, seen);
+    seen.clear();
+    cmi_vars(res, rv, seen);
+    int k = 0;
+    for (auto* p : av)
+      if (!rv.count(p)) ++k;
+    return k;
+  }
+  // Which constructors are in scope, and how many existentials each opens:
+  // the file's own declarations and those of the units it opens, scoped the
+  // way the value names are.  A DOTTED `Effect.Unhandled` is read off the
+  // unit itself.
+  // `ty` indexes `ctys`, the constructors of the variant type this one belongs
+  // to in DECLARATION order; -1 where the type is not one this file declares
+  // (a unit's, or an extensible one), and so has no witness to build.
+  struct Cd { int ex = 0; int ty = -1; };
+  std::unordered_map<std::string, Cd> exi;
+  std::vector<std::pair<std::string, std::optional<Cd>>> eadded;
+  std::vector<std::vector<std::pair<std::string, int>>> ctys;
+  std::map<std::string, std::unordered_map<std::string, int>> uexi;
+  std::size_t emark() const { return eadded.size(); }
+  void erelease(std::size_t m) {
+    while (eadded.size() > m) {
+      auto& e = eadded.back();
+      if (e.second) exi[e.first] = *e.second;
+      else exi.erase(e.first);
+      eadded.pop_back();
+    }
+  }
+  void ebind(const std::string& nm, Cd c) {
+    auto it = exi.find(nm);
+    eadded.emplace_back(nm, it == exi.end() ? std::optional<Cd>{}
+                                           : std::optional<Cd>{it->second});
+    exi[nm] = c;
+  }
+  const std::unordered_map<std::string, int>& unit_ctors(const std::string& u) {
+    auto it = uexi.find(u);
+    if (it != uexi.end()) return it->second;
+    auto& m = uexi[u];
+    std::string p = head_cmi(u);
+    if (!p.empty() && std::filesystem::exists(p)) {
+      try {
+        const cmi::Signature& sg = cmi::CmiFile::load(p).sig();
+        for (auto& x : sg.typexts) {
+          int k = cmi_exist(x.args, x.inline_record, x.res);
+          if (k) m[x.name] = k;
+        }
+        for (auto& d : sg.types)
+          for (auto& c : d.ctors) {
+            int k = cmi_exist(c.args, c.inline_record, c.res);
+            if (k) m[c.name] = k;
+          }
+      } catch (...) {
+      }
+    }
+    return m;
+  }
+  // The compilation unit a module path names, `Stdlib` dropped: anything
+  // deeper than one component is not one.
+  static std::string mod_unit(const Longident& id) {
+    std::vector<std::string> c;
+    const Longident* q = &id;
+    for (int i = 0; i < 8; ++i) {
+      if (auto* d = std::get_if<Ldot>(&q->v)) {
+        c.push_back(d->name); q = d->prefix.get(); continue;
+      }
+      if (auto* l = std::get_if<Lident>(&q->v)) { c.push_back(l->name); break; }
+      return {};
+    }
+    std::reverse(c.begin(), c.end());
+    if (!c.empty() && c[0] == "Stdlib") c.erase(c.begin());
+    return c.size() == 1 ? c[0] : std::string();
+  }
+  long long ctor_exist(const Longident& id) {
+    if (exist_off()) return 0;
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      auto it = exi.find(l->name);
+      return it == exi.end() ? 0 : it->second.ex;
+    }
+    if (auto* d = std::get_if<Ldot>(&id.v)) {
+      std::string u = mod_unit(*d->prefix);
+      if (u.empty()) return 0;
+      const auto& m = unit_ctors(u);
+      auto it = m.find(d->name);
+      return it == m.end() ? 0 : it->second;
+    }
+    return 0;
+  }
+  void reg_ctors(const std::vector<TypeDeclaration>& ds) {
+    if (exist_off()) return;
+    for (auto& d : ds) {
+      auto* v = std::get_if<Ptype_variant>(&d.kind);
+      if (!v) continue;
+      int id = (int)ctys.size();
+      ctys.emplace_back();
+      for (auto& c : v->ctors) {
+        int k = exist_of(c.args, c.res);
+        ctys[id].emplace_back(c.name.txt, k);
+        ebind(c.name.txt, Cd{k, id});
+      }
+    }
+  }
+  void reg_ext(const ExtensionConstructor& c) {
+    if (exist_off()) return;
+    if (auto* d = std::get_if<Pext_decl>(&c.kind))
+      ebind(c.name.txt, Cd{exist_of(d->args, d->res), -1});
+  }
+  void reg_open(const ModuleExpr& m) {
+    if (exist_off()) return;
+    auto* i = std::get_if<Pmod_ident>(&m.desc);
+    if (!i) return;
+    std::string u = mod_unit(i->id.txt);
+    if (u.empty()) return;
+    for (auto& e : unit_ctors(u)) ebind(e.first, Cd{e.second, -1});
+  }
+  // `Parmatch.check_unused` (parmatch.ml:2015) hands typecore ONE pattern back
+  // for every clause that is neither the first nor already redundant -- the
+  // clause's own satisfying vectors -- and typecore re-types it in
+  // `Counter_example` mode, where `solve_Ppat_construct` opens the
+  // existentials a SECOND time.  A clause an earlier one SUBSUMES is Unused
+  // and never reaches the check; a GUARDED clause is not added to the prefix
+  // (parmatch.ml:2076), so it neither suppresses a later clause nor gives the
+  // next one a prefix to have.  Value, exception and `effect` rows are three
+  // separate lists (`split_cases`, checked at typecore.ml:7271).
+  static int row_group(const Pattern& p0) {
+    const Pattern& p = strip(p0);
+    if (std::holds_alternative<Ppat_effect>(p.desc)) return 2;
+    if (std::holds_alternative<Ppat_exception>(p.desc)) return 1;
+    return 0;
+  }
+  static bool covers(const Pattern& q0, const Pattern& p0) {
+    const Pattern& q = strip(q0);
+    const Pattern& p = strip(p0);
+    if (auto* a = std::get_if<Ppat_alias>(&q.desc)) return covers(*a->p, p);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return covers(q, *a->p);
+    if (std::holds_alternative<Ppat_any>(q.desc) ||
+        std::holds_alternative<Ppat_var>(q.desc))
+      return true;
+    if (auto* o = std::get_if<Ppat_or>(&q.desc))
+      return covers(*o->l, p) || covers(*o->r, p);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return covers(q, *o->l) && covers(q, *o->r);
+    if (auto* qc = std::get_if<Ppat_construct>(&q.desc)) {
+      auto* pc = std::get_if<Ppat_construct>(&p.desc);
+      if (!pc || lid_last(qc->id.txt) != lid_last(pc->id.txt)) return false;
+      if (!qc->arg) return !pc->arg;
+      return pc->arg && covers(**qc->arg, **pc->arg);
+    }
+    if (auto* qt = std::get_if<Ppat_tuple>(&q.desc)) {
+      auto* pt = std::get_if<Ppat_tuple>(&p.desc);
+      if (!pt || pt->elems.size() != qt->elems.size()) return false;
+      for (std::size_t i = 0; i < qt->elems.size(); ++i)
+        if (!covers(*qt->elems[i], *pt->elems[i])) return false;
+      return true;
+    }
+    if (auto* qe = std::get_if<Ppat_exception>(&q.desc)) {
+      auto* pe = std::get_if<Ppat_exception>(&p.desc);
+      return pe && covers(*qe->p, *pe->p);
+    }
+    if (auto* qf = std::get_if<Ppat_effect>(&q.desc)) {
+      auto* pf = std::get_if<Ppat_effect>(&p.desc);
+      return pf && covers(*qf->eff, *pf->eff);
+    }
+    return false;
+  }
+  // What the checker's pattern costs: `Backtrack_or` splitting
+  // (typecore.ml:3008) types the alternatives until ONE of them stands, so an
+  // or-pattern is charged its first branch alone.
+  long long pat_exist(const Pattern& p0) {
+    const Pattern& p = strip(p0);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pat_exist(*a->p);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) return pat_exist(*o->l);
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc))
+      return ctor_exist(c->id.txt) + (c->arg ? pat_exist(**c->arg) : 0);
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      long long k = 0;
+      for (auto& e : t->elems) k += pat_exist(*e);
+      return k;
+    }
+    if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      long long k = 0;
+      for (auto& e : r->fields) k += pat_exist(*e.second);
+      return k;
+    }
+    if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      long long k = 0;
+      for (auto& e : a->elems) k += pat_exist(*e);
+      return k;
+    }
+    if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) return pat_exist(*l->p);
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc))
+      return v->arg ? pat_exist(**v->arg) : 0;
+    if (auto* e = std::get_if<Ppat_exception>(&p.desc)) return pat_exist(*e->p);
+    if (auto* o = std::get_if<Ppat_open>(&p.desc)) return pat_exist(*o->p);
+    if (auto* f = std::get_if<Ppat_effect>(&p.desc))
+      return pat_exist(*f->eff) + pat_exist(*f->cont);
+    return 0;
+  }
+  // A clause that matches whatever is left, and one whose arguments refuse
+  // nothing -- `C _` covers its constructor where `C (_, 0)` does not.
+  static bool irref(const Pattern& p0) {
+    const Pattern& p = strip(p0);
+    if (std::holds_alternative<Ppat_any>(p.desc) ||
+        std::holds_alternative<Ppat_var>(p.desc))
+      return true;
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return irref(*a->p);
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems)
+        if (!irref(*e)) return false;
+      return true;
+    }
+    return false;
+  }
+  // The constructors an unguarded clause takes out of play.
+  void heads(const Pattern& p0, std::set<std::string>& cov) {
+    const Pattern& p = strip(p0);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
+      heads(*a->p, cov); return;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      heads(*o->l, cov); heads(*o->r, cov); return;
+    }
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc))
+      if (!c->arg || irref(**c->arg)) cov.insert(lid_last(c->id.txt));
+  }
+  int head_ty(const Pattern& p0) {
+    const Pattern& p = strip(p0);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return head_ty(*a->p);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) return head_ty(*o->l);
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      if (!std::holds_alternative<Lident>(c->id.txt.v)) return -1;
+      auto it = exi.find(std::get<Lident>(c->id.txt.v).name);
+      return it == exi.end() ? -1 : it->second.ty;
+    }
+    return -1;
+  }
+  long long witness(int ty, const std::set<std::string>& cov) const {
+    if (ty < 0) return 0;
+    for (auto& c : ctys[ty])
+      if (!cov.count(c.first)) return c.second;
+    return 0;
+  }
+  long long unused_extra(const std::vector<Case>& cs) {
+    if (exist_off()) return 0;
+    long long k = 0;
+    for (int g = 0; g < 3; ++g) {
+      // The witness `exhaust` builds for a clause that refuses nothing, and
+      // for the whole match when no clause does, is the first constructor of
+      // the scrutinee's type still uncovered -- `do_check_partial` consumes
+      // exactly the one the pred accepts (parmatch.ml:1911).  Only a type
+      // this file declares can be walked, and an exception or `effect` row's
+      // is extensible, so neither has one.
+      int ty = -1;
+      if (g == 0)
+        for (auto& c : cs) {
+          if (row_group(c.lhs) != 0) continue;
+          int t = head_ty(c.lhs);
+          if (t >= 0) { ty = t; break; }
+        }
+      std::vector<const Pattern*> pref;
+      std::set<std::string> cov;
+      bool total = false;
+      for (auto& c : cs) {
+        if (row_group(c.lhs) != g) continue;
+        bool dead = false;
+        for (auto* q : pref)
+          if (covers(*q, c.lhs)) { dead = true; break; }
+        bool any = irref(c.lhs);
+        if (!pref.empty() && !dead)
+          k += any ? witness(ty, cov) : pat_exist(c.lhs);
+        if (!c.guard) {
+          pref.push_back(&c.lhs);
+          if (any) total = true;
+          heads(c.lhs, cov);
+        }
+      }
+      // All clauses guarded: the matrix is empty and no witness is built.
+      if (!total && !pref.empty()) k += witness(ty, cov);
+    }
+    return k;
+  }
   void bindings(RecFlag rf, const std::vector<ValueBinding>& bs) {
     // `let f : type a. t = e` names the locally abstract variable TWICE:
     // the sugar leaves it BOTH in the binding's own constraint (the
@@ -21612,6 +21994,7 @@ struct Count {
     bool named = false;
     for (auto& c : cs) if (is_named(c.lhs)) { named = true; break; }
     if (!named) ++n;  // name_cases "param" cases
+    n += unused_extra(cs);
     for (auto& c : cs) cse(c);
     release(m);
   }
@@ -21718,10 +22101,12 @@ struct Count {
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       expr(*m->e);
       n += eff_row(m->cases);
+      n += unused_extra(m->cases);
       for (auto& c : m->cases) cse(c);
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
       expr(*t->e);
       n += eff_row(t->cases);
+      n += unused_extra(t->cases);
       for (auto& c : t->cases) cse(c);
     } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
       expr(*s->e1); expr(*s->e2);
@@ -21758,12 +22143,14 @@ struct Count {
       expr(*t->body);
     } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
       auto m = mark();
+      auto ek = emark();
       bool ie = inexpr_;
       inexpr_ = true;
       item(*s->item);
       inexpr_ = ie;
       expr(*s->body);
       release(m);
+      erelease(ek);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
       expr(*s->obj); expr(*s->value);
     } else if (auto* s = std::get_if<Pexp_setinstvar>(&e.desc)) {
@@ -22655,9 +23042,11 @@ struct Count {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       auto k = mark();
       auto mk = mmark();
+      auto ek = emark();
       for (auto& it : st->items) item(it, l);
       release(k);
       mrelease(mk);
+      erelease(ek);
     } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       // A functor's RESULT is never strengthened (`strengthen_lazy`,
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
@@ -22783,10 +23172,12 @@ struct Count {
     } else if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
       bindings(v->rf, v->bindings);
     } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+      reg_ctors(t->decls);
       type_decls(t->decls, 1);
     } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
-      for (auto& c : x->ext.ctors) ext_ctor(c);
+      for (auto& c : x->ext.ctors) { reg_ext(c); ext_ctor(c); }
     } else if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
+      reg_ext(e->exn.ctor);
       ext_ctor(e->exn.ctor);
     } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
       ++n;
@@ -22817,6 +23208,7 @@ struct Count {
       n += app_charge(i->expr, flat(), false);
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
       mexpr(o->expr, Lvl{1, 1, 0, true}, false);
+      reg_open(o->expr);
       n += exports(o->expr);
     // A class costs three idents before anything of it is read:
     // `type_classes` (typeclass.ml:1897) creates the class, its class type
