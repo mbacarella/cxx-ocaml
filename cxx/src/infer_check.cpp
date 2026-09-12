@@ -21003,20 +21003,26 @@ struct Cites {
     auto* nm = std::get_if<Functor_named>(&p);
     if (!nm) return;
     bind_mod(nm->name);
-    if (nm->type) mty(*nm->type);
+    if (nm->type) mty(*nm->type, true);
   }
-  void mty(const ModuleType& m) {
+  std::set<std::string> mtf;  // heads whose module type was READ
+  void mty(const ModuleType& m, bool force = false) {
     if (auto* i = std::get_if<Pmty_ident>(&m.desc)) {
       cite(i->id, false);
+      if (force && !std::holds_alternative<Lapply>(i->id.txt.v)) {
+        std::vector<std::string> c = split_dotted(lid_full(i->id.txt));
+        if (c.size() >= 2 && !local.count(c[0])) mtf.insert(c[0]);
+      }
     } else if (auto* s = std::get_if<Pmty_signature>(&m.desc)) {
       size_t d = open_stack_.size();
       for (auto& it : s->items) sig_item(it);
       open_stack_.resize(d);
     } else if (auto* f = std::get_if<Pmty_functor>(&m.desc)) {
       fparam(f->param);
-      mty(*f->body);
+      mty(*f->body, force);
     } else if (auto* w = std::get_if<Pmty_with>(&m.desc)) {
-      mty(*w->mt);
+      mty(*w->mt, true);
+      with_base(m);
       // A constraint's left-hand path is resolved INSIDE the constrained
       // signature, so only the right-hand side names an outer module.
       for (auto& c : w->constraints) {
@@ -21044,7 +21050,7 @@ struct Cites {
       fparam(f->param);
       mexp(*f->body);
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
-      mexp(*c->me); mty(*c->mt);
+      mexp(*c->me); mty(*c->mt, true);
     } else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) {
       const ModuleExpr* fh = &m;
       bool pathed = true;
@@ -21089,7 +21095,7 @@ struct Cites {
     } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
       for (auto& d : m->decls) { bind_mod(d.name); mty(*d.type); }
     } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
-      if (m->type) mty(*m->type);
+      if (m->type) mty(*m->type, true);
     } else if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc)) {
       mty(m->type);
     } else if (auto* m = std::get_if<Psig_modsubst>(&it.desc)) {
@@ -21126,7 +21132,7 @@ struct Cites {
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       for (auto& b : m->bindings) { bind_mod(b.name); mbind(b); }
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
-      if (m->type) mty(*m->type);
+      if (m->type) mty(*m->type, true);
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexp(i->expr);
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
@@ -21255,6 +21261,50 @@ struct Cites {
       if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
         sig_applied(*md.type->sig, out);
   }
+  // A `with` over ANOTHER UNIT's module type SCRAPES it, and scraping reads
+  // its declarations: a type constructor APPLIED in the signature forces the
+  // unit it belongs to, exactly as a functor's result signature does
+  // (`Map.S with type key = int` pays Seq's 65 twice, for the `Seq.t` its
+  // `to_seq` names).  A module type merely NAMED -- an alias, a description,
+  // a functor parameter -- is never scraped and reads nothing of the kind.
+  std::set<std::vector<std::string>> wscr;
+  void with_base(const ModuleType& m) {
+    const ModuleType* b = &m;
+    for (int i = 0; i < 8; ++i) {
+      auto* w = std::get_if<Pmty_with>(&b->desc);
+      if (!w) break;
+      b = w->mt.get();
+    }
+    auto* id = std::get_if<Pmty_ident>(&b->desc);
+    if (!id || std::holds_alternative<Lapply>(id->id.txt.v)) return;
+    std::vector<std::string> c = split_dotted(lid_full(id->id.txt));
+    if (c.size() < 2 || local.count(c[0])) return;
+    wscr.insert(std::move(c));
+  }
+  void with_loads(std::map<std::string, int>& more) const {
+    for (auto& p : wscr) {
+      std::vector<std::string> c = p;
+      if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
+      std::string h = unit_of(c[0]);
+      if (h.empty()) continue;
+      c[0] = h;
+      const cmi::Signature* rt = unit_of_path(c);
+      if (!rt || c.size() < 2) continue;
+      const cmi::Signature* sg = rt;
+      for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
+        sg = submodule(*sg, c[i]);
+      if (!sg) continue;
+      const cmi::ModuleType* mt = nullptr;
+      for (auto& md : sg->modtypes)
+        if (md.name == c.back()) mt = md.type.get();
+      mt = scrape_cmty(mt, rt);
+      if (!mt || mt->kind != cmi::ModuleType::Sig || !mt->sig) continue;
+      Applied a;
+      sig_applied(*mt->sig, a);
+      for (auto& e : a.units)
+        if (more[e.first] < e.second) more[e.first] = e.second;
+    }
+  }
   void functor_loads(std::map<std::string, int>& more,
                      std::set<std::string>& noload) const {
     for (auto& fa : fapps) {
@@ -21305,6 +21355,7 @@ struct Cites {
   long long cost(bool extra, bool sub, bool app) {
     if (sub) resolve_subaliases();
     const bool xoff = dbg_env("NOXMODAPP") != nullptr;
+    const bool mtoff = dbg_env("NOMTYREAD") != nullptr;
     long long k = 0;
     bool fmt = extra && fmt_ann;
     std::set<std::string> done;  // two names can alias ONE unit
@@ -21343,7 +21394,8 @@ struct Cites {
         // A submodule of the unit was named, a type of the unit was read
         // applied, or a type of the unit met one that was already fixed:
         // either way its signature is forced a second time.
-        if (aliased && (!subs.empty() || a.self || xforce.count(m)))
+        if (aliased && (!subs.empty() || a.self || xforce.count(m) ||
+                        (mtoff ? false : mtf.count(m) != 0)))
           more[u] = 2;
         for (auto& e : a.units)
           if (more[e.first] < e.second) more[e.first] = e.second;
@@ -21354,6 +21406,7 @@ struct Cites {
     // directly; the ordinary first load is what a SOURCE citation pays.
     std::set<std::string> noload;
     if (sub && !xoff) functor_loads(more, noload);
+    if (sub && dbg_env("NOXWITHC") == nullptr) with_loads(more);
     for (auto& e : more) {
       bool cited = !done.insert(e.first).second;
       if (cited && e.second < 2) continue;
@@ -21980,6 +22033,195 @@ struct Count {
       }
     }
     return k + (lit ? w_ren(*sg, g) + rows : w_wt(*sg, l, g) + roww);
+  }
+  // --- A `with` OVER ANOTHER UNIT'S MODULE TYPE ------------------------
+  // `Map.S with type key = int` resolves to no module type of this file, so
+  // the rule above charged it nothing.  What the constraint is merged into is
+  // the signature map.cmi carries, and READING it costs: a persistent module
+  // type reaches `Env.find_modtype_expansion` only when something scrapes it,
+  // and forcing the declaration out of the unit's lazy signature substitutes
+  // it whole -- one ident per item, at every depth.  A bare
+  // `module type T = Map.S` never scrapes (it stores the `Mty_ident`), an
+  // ascription and a functor parameter do, and the expansion is then CACHED,
+  // so the force is charged ONCE per module type however often the file names
+  // it.  On top of that force the merged result costs exactly what the
+  // same-shaped module type of this file costs -- `Mtype.freshen` plus the
+  // S441 cascade, the per-constraint `Ident.rename` and the `Subst Keep` of
+  // the signature the constrained item lives in.
+  static bool xwith_off() {
+    static const bool off = dbg_env("NOXWITHC") != nullptr;
+    return off;
+  }
+  mutable std::set<std::string> wscraped;  // module types already forced
+  // The name an order entry carries.
+  static const std::string& c_ename(const cmi::Signature& s,
+                                    const cmi::Signature::OrderEnt& e) {
+    static const std::string none;
+    using K = cmi::Signature::OrderEnt;
+    std::size_t i = (std::size_t)e.idx;
+    switch (e.kind) {
+      case K::Value: return i < s.values.size() ? s.values[i].name : none;
+      case K::Type: return i < s.types.size() ? s.types[i].name : none;
+      case K::Typext: return i < s.typexts.size() ? s.typexts[i].name : none;
+      case K::Module: return i < s.modules.size() ? s.modules[i].name : none;
+      case K::Modtype: return i < s.modtypes.size() ? s.modtypes[i].name : none;
+    }
+    return none;
+  }
+  static const cmi::ModuleType* c_ebody(const cmi::Signature& s,
+                                        const cmi::Signature::OrderEnt& e) {
+    if (e.kind == cmi::Signature::OrderEnt::Module &&
+        (std::size_t)e.idx < s.modules.size())
+      return s.modules[e.idx].type.get();
+    if (e.kind == cmi::Signature::OrderEnt::Modtype &&
+        (std::size_t)e.idx < s.modtypes.size())
+      return s.modtypes[e.idx].type.get();
+    return nullptr;
+  }
+  // `w_ren` over a .cmi signature.
+  static long long c_ren(const cmi::Signature& s, const Gone& g) {
+    long long k = 0;
+    for (auto& e : s.order) {
+      bool drop = false;
+      Gone d = wgo(g, c_ename(s, e), drop);
+      if (drop) continue;
+      ++k;
+      const cmi::ModuleType* b = c_ebody(s, e);
+      if (!b) continue;
+      if (b->kind == cmi::ModuleType::Sig && b->sig) k += c_ren(*b->sig, d);
+      else k += flat_cmty(b);
+    }
+    return k;
+  }
+  // `w_wt` over a .cmi signature.
+  static long long c_wt(const cmi::Signature& s, const Lvl& l, const Gone& g) {
+    long long k = 0;
+    for (auto& e : s.order) {
+      bool drop = false;
+      Gone d = wgo(g, c_ename(s, e), drop);
+      if (drop) continue;
+      k += l.a;
+      const cmi::ModuleType* b = c_ebody(s, e);
+      if (!b) continue;
+      Lvl il = e.kind == cmi::Signature::OrderEnt::Modtype ? mtd(l) : sub(l);
+      if (b->kind == cmi::ModuleType::Sig && b->sig) k += c_wt(*b->sig, il, d);
+      else k += wt_cmty(b, il);
+    }
+    return k;
+  }
+  // `w_nested` over a .cmi signature: the top idents are KEPT, everything a
+  // submodule or a module type of it spans is renamed.
+  static long long c_nested(const cmi::Signature& s, const Gone& g) {
+    long long k = 0;
+    for (auto& e : s.order) {
+      const cmi::ModuleType* b = c_ebody(s, e);
+      if (!b) continue;
+      bool drop = false;
+      Gone d = wgo(g, c_ename(s, e), drop);
+      if (drop) continue;
+      if (b->kind == cmi::ModuleType::Sig && b->sig) k += c_ren(*b->sig, d);
+      else k += flat_cmty(b);
+    }
+    return k;
+  }
+  // `w_target` / `w_has` over a .cmi signature.
+  static const cmi::Signature* c_target(const cmi::Signature& s,
+                                        const std::vector<std::string>& p,
+                                        const Lvl& l, Lvl& out) {
+    if (p.size() <= 1) { out = l; return &s; }
+    for (auto& md : s.modules) {
+      if (md.name != p[0]) continue;
+      if (!md.type || md.type->kind != cmi::ModuleType::Sig || !md.type->sig)
+        return nullptr;
+      return c_target(*md.type->sig,
+                      std::vector<std::string>(p.begin() + 1, p.end()), sub(l),
+                      out);
+    }
+    return nullptr;
+  }
+  static bool c_has(const cmi::Signature& s, const std::string& nm) {
+    for (auto& d : s.types) if (d.name == nm) return true;
+    for (auto& m : s.modules) if (m.name == nm) return true;
+    for (auto& m : s.modtypes) if (m.name == nm) return true;
+    return false;
+  }
+  // The signature ANOTHER UNIT's module type carries, with the key the force
+  // is memoised under.  A head this file binds itself is never looked up.
+  const cmi::Signature* xmty_sig(const ModuleType* mt, std::string& key) const {
+    for (int i = 0; mt && i < 8; ++i) {
+      auto* w = std::get_if<Pmty_with>(&mt->desc);
+      if (!w) break;
+      mt = w->mt.get();
+    }
+    auto* id = mt ? std::get_if<Pmty_ident>(&mt->desc) : nullptr;
+    if (!id) return nullptr;
+    std::vector<std::string> c;
+    if (!lid_path(id->id.txt, c) || c.size() < 2) return nullptr;
+    if (auto f = mods.find(c[0]); f != mods.end() && !f->second.empty())
+      return nullptr;
+    const cmi::Signature* sg = unit_of_path(c);  // normalises c in place
+    for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
+      sg = submodule(*sg, c[i]);
+    if (!sg) return nullptr;
+    for (auto& md : sg->modtypes) {
+      if (md.name != c.back()) continue;
+      const cmi::ModuleType* m = scrape_cmty(md.type.get(), sg);
+      if (!m || m->kind != cmi::ModuleType::Sig || !m->sig) return nullptr;
+      key.clear();
+      for (auto& s : c) key += s + ".";
+      return m->sig.get();
+    }
+    return nullptr;
+  }
+  // The force itself, where a module type of another unit is BOUND rather
+  // than merely named: an ascription and a functor parameter both scrape it,
+  // a `module type T = U.S` alias and a `sig module M : U.S end` description
+  // do not.  Shares `wscraped` with the `with` above, since one cached
+  // expansion serves both.
+  long long xforce(const ModuleType& mt) const {
+    std::string key;
+    const cmi::Signature* sg = xmty_sig(&mt, key);
+    if (!sg || !wscraped.insert(key).second) return 0;
+    return flat_csig(*sg);
+  }
+  // What ONE `with`-node over another unit's module type costs.
+  long long xwith_node(const Pmty_with& w, const Lvl& l) const {
+    if (mty_sig(w.mt.get())) return 0;  // a module type of THIS file
+    std::string key;
+    const cmi::Signature* sg = xmty_sig(w.mt.get(), key);
+    if (!sg) return 0;
+    Gone g;
+    for (const ModuleType* p = w.mt.get();;) {
+      auto* q = std::get_if<Pmty_with>(&p->desc);
+      if (!q) break;
+      for (auto& c : q->constraints) {
+        Wc x;
+        if (!wc_parts(c, x)) return 0;
+        if (x.destr) g.push_back(x.path);
+      }
+      p = q->mt.get();
+    }
+    long long k = 0, rows = 0, roww = 0;
+    for (auto& c : w.constraints) {
+      Wc x;
+      if (!wc_parts(c, x) || x.path.empty()) return 0;
+      Lvl tl;
+      const cmi::Signature* tg = c_target(*sg, x.path, l, tl);
+      if (!tg || !c_has(*tg, x.path.back())) return 0;
+      if (x.td) {
+        ++k;
+        if (is_fixed(*x.td)) { ++k; ++rows; roww += tl.a; }
+        k += c_nested(*tg, wunder(g, x.path));
+      }
+      if (x.destr) {
+        g.push_back(x.path);
+        k += c_ren(*sg, g) + rows;
+      }
+    }
+    k += c_wt(*sg, l, g) + roww;
+    // The expansion is cached, so the force is charged once per module type.
+    if (wscraped.insert(key).second) k += flat_csig(*sg);
+    return k;
   }
   const std::unordered_map<std::string, int>& unit_ctors(const std::string& u) {
     auto it = uexi.find(u);
@@ -23353,7 +23595,7 @@ struct Count {
       // What an ascribed module SAVES is the ascription, so that is what the
       // renames below it reach; the structure behind it is typed once.
       mexpr(*c->me, Lvl{1, 1, 0, true}, false);
-      mty(*c->mt, depth_off() ? Lvl{1, 1, 0, true} : l);
+      mty(*c->mt, depth_off() ? Lvl{1, 1, 0, true} : l, true);
     // An APPLICATION's argument is a module of its own: what the
     // application leaves in the structure is the functor's RESULT, so the
     // argument is typed where it stands and none of the renames below the
@@ -23386,10 +23628,11 @@ struct Count {
   void fparam(const FunctorParam& p, const Lvl& l) {
     auto* nm = std::get_if<Functor_named>(&p);
     if (!nm) return;
-    mty(*nm->type, Lvl{l.a + 1, l.u, l.depth + 1, true});
+    mty(*nm->type, Lvl{l.a + 1, l.u, l.depth + 1, true}, true);
     if (nm->name.txt) ++n;
   }
-  void mty(const ModuleType& mt, const Lvl& l) {
+  void mty(const ModuleType& mt, const Lvl& l, bool bind = false) {
+    if (bind && !xwith_off()) n += xforce(mt);
     if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
       sig_items(s->items, l);
     } else if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
@@ -23398,11 +23641,12 @@ struct Count {
     } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
       // A with-node BELOW this one leaves a signature nothing saves, so the
       // cascade stops there: only the outermost result is renamed by it.
-      mty(*w->mt, !with_off() &&
+      mty(*w->mt, !(with_off() && xwith_off()) &&
                           std::holds_alternative<Pmty_with>(w->mt->desc)
                       ? flat()
                       : l);
       if (!with_off()) n += with_node(*w, l);
+      if (!xwith_off()) n += xwith_node(*w, l);
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
       mexpr(*t->me);
     }
