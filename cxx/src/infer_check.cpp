@@ -20378,6 +20378,13 @@ struct Cites {
   // `let module M = F (A) in ..`: the result is bound over the body
   // alone and none of the types it names is ever looked up.
   bool inexpr_ = false;
+  // Units a type of theirs met an ALREADY-FIXED type of, so the .cmi's
+  // signature is forced a second time (see `denotes` below).
+  std::set<std::string> xforce;
+  static bool xuni_off() {
+    static const bool off = dbg_env("NOXUNIFY") != nullptr;
+    return off;
+  }
 
   void add(const std::string& m) {
     if (m.empty() || m == "Stdlib") return;
@@ -20670,11 +20677,128 @@ struct Cites {
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) ex(*fb->e);
     else for (auto& c : std::get<Pfunction_cases>(f.body->v).cases) cse(c);
   }
+  // ---- a type that meets a type ------------------------------------------
+  // `Ctype.unify` links a VARIABLE to whatever it meets without looking it up,
+  // but where the expected type is already fixed it has to `expand_head` both
+  // sides, and expanding another unit's type constructor reaches
+  // `Env.find_type` and FORCES that unit's signature a second time.  So
+  // `Sys.backend_type = Sys.Native` is 83 + 83 where either operand alone is
+  // 83, `[Arg.Unit f; Arg.Unit g]` is 21 + 21 where `[Arg.Unit f]` is 21, and
+  // `match Sys.backend_type with _ -> 1` is 83 + 83 because `type_cases`
+  // expands the scrutinee whatever the patterns are -- while a bare read, a
+  // tuple of two of them, a PATTERN over a variable scrutinee and an argument
+  // whose expected type is a variable (`ref y`, `[y]`, a local `'a -> unit`)
+  // all leave the unit forced just once.
+  static bool sig_own_ctor(const cmi::Signature& sg, const std::string& c) {
+    for (auto& d : sg.types)
+      if (!d.manifest)
+        for (auto& k : d.ctors)
+          if (k.name == c) return true;
+    return false;
+  }
+  static bool sig_own_val(const cmi::Signature& sg, const std::string& v) {
+    auto* sv = find_val(sg, v);
+    if (!sv) return false;
+    const cmi::TypeExpr* t = spine(sv->type);
+    if (!t || t->kind != cmi::TypeExpr::Tconstr || !t->path ||
+        t->path->kind != cmi::Path::Pident)
+      return false;
+    for (auto& d : sg.types)
+      if (d.name == t->path->id.name) return !d.manifest;
+    return false;
+  }
+  bool unit_owns(const std::string& head, const std::string& n,
+                 bool ctor) const {
+    std::string u = unit_of(head);
+    if (u.empty()) return false;
+    std::string p = head_cmi(u);
+    if (p.empty() || !std::filesystem::exists(p)) return false;
+    try {
+      const cmi::Signature& sg = cmi::CmiFile::load(p).sig();
+      return ctor ? sig_own_ctor(sg, n) : sig_own_val(sg, n);
+    } catch (...) {
+    }
+    return false;
+  }
+  // A bare name an `open` put in scope: `Sys.(backend_type == Bytecode)` reads
+  // exactly as the dotted spelling does.  Innermost open wins.
+  std::string bare_owner(const std::string& n, bool ctor) const {
+    if (!bare_) return {};
+    for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+      if (unit_owns(*o, n, ctor)) return *o;
+    return {};
+  }
+  // Which cited unit's own type does this expression's type name, as far as
+  // the source can say?  Empty when it cannot be read off the syntax.
+  std::string denotes(const Expression& e) const {
+    if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
+      if (auto* l = std::get_if<Lident>(&i->id.txt.v))
+        return bare_owner(l->name, false);
+      auto* d = std::get_if<Ldot>(&i->id.txt.v);
+      if (!d) return {};
+      auto* h = std::get_if<Lident>(&d->prefix->v);
+      if (!h || h->name == "Stdlib") return {};
+      return unit_owns(h->name, d->name, false) ? h->name : std::string();
+    }
+    if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+        return bare_owner(l->name, true);
+      auto* d = std::get_if<Ldot>(&c->id.txt.v);
+      if (!d) return {};
+      auto* h = std::get_if<Lident>(&d->prefix->v);
+      if (!h || h->name == "Stdlib") return {};
+      return unit_owns(h->name, d->name, true) ? h->name : std::string();
+    }
+    if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) return denotes(*c->e);
+    return {};
+  }
+  void xmeet(const std::string& u) {
+    if (!u.empty() && !xuni_off()) xforce.insert(u);
+  }
+  // The same, through the literal structure the two share: the elements of
+  // `["-v", Set verbose, "be verbose"; "-q", Clear verbose, "be silent"]` meet
+  // component by component, so Arg's `spec` is expanded even though neither
+  // element's own type can be read off the syntax.
+  void denotes_all(const Expression& e, std::set<std::string>& out) const {
+    std::string u = denotes(e);
+    if (!u.empty()) { out.insert(u); return; }
+    if (auto* t = std::get_if<Pexp_tuple>(&e.desc))
+      for (auto& x : t->elems) denotes_all(*x, out);
+  }
+  // Two expressions that must have ONE type: the second meets what the first
+  // left behind.
+  void xsame(const std::vector<const Expression*>& es) {
+    std::map<std::string, int> seen;
+    for (auto* p : es) {
+      std::set<std::string> us;
+      denotes_all(*p, us);
+      for (auto& u : us)
+        if (++seen[u] == 2) xmeet(u);
+    }
+  }
+  // `[a; b]` is a `::` chain in the parsetree; its elements share one type.
+  static void list_elems(const Expression& e,
+                         std::vector<const Expression*>& out) {
+    const Expression* p = &e;
+    for (int i = 0; i < 4096; ++i) {
+      auto* c = std::get_if<Pexp_construct>(&p->desc);
+      if (!c || !c->arg) return;
+      auto* l = std::get_if<Lident>(&c->id.txt.v);
+      if (!l || l->name != "::") return;
+      auto* t = std::get_if<Pexp_tuple>(&(*c->arg)->desc);
+      if (!t || t->elems.size() != 2) return;
+      out.push_back(t->elems[0].get());
+      p = t->elems[1].get();
+    }
+  }
   void ex(const Expression& e) {
     if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
       cite(i->id, false);
     } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       applied_fn(*a->fn, (int)a->args.size());
+      std::vector<const Expression*> as;
+      for (auto& x : a->args) as.push_back(x.second.get());
+      xsame(as);
       ex(*a->fn);
       for (auto& x : a->args) ex(*x.second);
     } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
@@ -20685,12 +20809,18 @@ struct Cites {
     } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
       for (auto& x : t->elems) ex(*x);
     } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      if (i->else_) xsame({i->then_.get(), (*i->else_).get()});
       ex(*i->cond); ex(*i->then_);
       if (i->else_) ex(**i->else_);
     } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      std::vector<const Expression*> es;
+      list_elems(e, es);
+      xsame(es);
       cite(c->id, false);
       if (c->arg) ex(**c->arg);
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      // `type_cases` expands the scrutinee's type whatever the patterns are.
+      xmeet(denotes(*m->e));
       ex(*m->e);
       for (auto& c : m->cases) cse(c);
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
@@ -20699,6 +20829,8 @@ struct Cites {
     } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
       ex(*s->e1); ex(*s->e2);
     } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
+      // An annotation fixes the expected type before the expression is typed.
+      xmeet(denotes(*c->e));
       ex(*c->e); ty(*c->t);
     } else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) {
       ex(*c->e);
@@ -20718,6 +20850,9 @@ struct Cites {
     } else if (auto* f = std::get_if<Pexp_for>(&e.desc)) {
       pat(f->var); ex(*f->lo); ex(*f->hi); ex(*f->body);
     } else if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
+      std::vector<const Expression*> es;
+      for (auto& x : a->elems) es.push_back(x.get());
+      xsame(es);
       for (auto& x : a->elems) ex(*x);
     } else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) {
       if (v->arg) ex(**v->arg);
@@ -21205,9 +21340,11 @@ struct Cites {
           for (auto& e : b.units)
             if (more[e.first] < e.second) more[e.first] = e.second;
         }
-        // A submodule of the unit was named, or a type of the unit was read
-        // applied: either way its signature is forced a second time.
-        if (aliased && (!subs.empty() || a.self)) more[u] = 2;
+        // A submodule of the unit was named, a type of the unit was read
+        // applied, or a type of the unit met one that was already fixed:
+        // either way its signature is forced a second time.
+        if (aliased && (!subs.empty() || a.self || xforce.count(m)))
+          more[u] = 2;
         for (auto& e : a.units)
           if (more[e.first] < e.second) more[e.first] = e.second;
       } catch (...) {
