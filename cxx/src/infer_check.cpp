@@ -20341,6 +20341,61 @@ const cmi::ModuleType* scrape_cmty(const cmi::ModuleType* m,
   }
   return m;
 }
+// `Mtype.strengthen_decl` (mtype.ml:80) leaves a type declaration alone only
+// where it already carries a PUBLIC manifest -- or a private one over a
+// record or a variant.  Everything else is REBUILT with a manifest of the
+// path, and that manifest is expanded again later.
+bool rebuilt_tdecl(const cmi::TypeDecl& d) {
+  if (!d.manifest) return true;
+  return d.priv && d.kind != cmi::TypeDecl::Record &&
+         d.kind != cmi::TypeDecl::Variant;
+}
+// Does `Mtype.strengthen` rebuild anything at the TOP of this signature?  A
+// module TYPE always is (`strengthen_lazy_sig'` rewrites it to an `Mty_ident`
+// of the path wherever the path is aliasable); a submodule never is -- it is
+// only aliased -- so nothing below the top level is looked at.
+bool strengthen_rebuilds(const cmi::Signature& sg) {
+  if (!sg.modtypes.empty()) return true;
+  for (auto& d : sg.types)
+    if (rebuilt_tdecl(d)) return true;
+  return false;
+}
+// Walk a dotted path down from a unit's signature, following a submodule
+// ALIAS to the unit it stands for (`StdLabels.List` is ListLabels).  `unit`
+// ends at the unit the path finally lands in, and `dotted` says whether it
+// stopped INSIDE one.
+const cmi::Signature* walk_path(const cmi::Signature* sg,
+                                const std::vector<std::string>& c,
+                                std::string& unit, bool& dotted) {
+  unit = c.empty() ? std::string() : c[0];
+  dotted = false;
+  for (std::size_t i = 1; sg && i < c.size(); ++i) {
+    if (const cmi::Signature* nx = submodule(*sg, c[i])) {
+      sg = nx;
+      dotted = true;
+      continue;
+    }
+    std::string au;
+    for (auto& md : sg->modules)
+      if (md.name == c[i] && md.type && md.type->kind == cmi::ModuleType::Alias)
+        au = alias_unit(md.type->path.get());
+    std::string p = au.empty() ? std::string() : head_cmi(au);
+    if (p.empty() || !std::filesystem::exists(p)) return nullptr;
+    try {
+      sg = &cmi::CmiFile::load(p).sig();
+    } catch (...) {
+      return nullptr;
+    }
+    unit = au;
+    dotted = false;
+  }
+  return sg;
+}
+bool incpath_off() {
+  static const bool off = dbg_env("NOINCPATH") != nullptr;
+  return off;
+}
+
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
   // Module names the file binds itself, with how MANY times: a name bound
@@ -21135,6 +21190,7 @@ struct Cites {
       if (m->type) mty(*m->type, true);
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexp(i->expr);
+      if (!incpath_off()) inc_cite(i->expr);
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
       auto* mi = std::get_if<Pmod_ident>(&o->expr.desc);
       if (mi && opened(mi->id)) return;
@@ -21305,6 +21361,52 @@ struct Cites {
         if (more[e.first] < e.second) more[e.first] = e.second;
     }
   }
+  // `include <a module PATH>`: `type_module ~strengthen:true` reads the
+  // path's declaration, and where `Mtype.strengthen` must REBUILD something
+  // of it the manifests it writes are expanded later and force that
+  // signature a SECOND time -- `include Complex` is Complex's 19 twice,
+  // where `include Int64`, whose every type is a public manifest, is Int64's
+  // 55 once.  Reading the signature also forces whatever its members name
+  // APPLIED, exactly as a `with`-base does: `include Queue` pays Seq's 65
+  // twice for the `to_seq` it carries.
+  std::set<std::vector<std::string>> incp;
+  void inc_cite(const ModuleExpr& m) {
+    auto* p = std::get_if<Pmod_ident>(&m.desc);
+    if (!p || std::holds_alternative<Lapply>(p->id.txt.v)) return;
+    incp.insert(split_dotted(lid_full(p->id.txt)));
+  }
+  long long inc_loads(std::map<std::string, int>& more, bool extra) const {
+    long long k = 0;
+    for (auto& ip : incp) {
+      std::vector<std::string> c = ip;
+      if (c.size() == 1) {
+        auto sa = subalias.find(c[0]);
+        if (sa != subalias.end()) c = split_dotted(sa->second);
+      }
+      if (c[0] == "Stdlib" && c.size() > 1) c.erase(c.begin());
+      std::string h = unit_of(c[0]);
+      if (h.empty()) continue;  // a module of this file: nothing to force
+      c[0] = h;
+      std::string p = head_cmi(c[0]);
+      if (!std::filesystem::exists(p)) continue;
+      try {
+        std::string u;
+        bool dotted = false;
+        const cmi::Signature* sg =
+            walk_path(&cmi::CmiFile::load(p).sig(), c, u, dotted);
+        if (!sg) continue;
+        Applied a;
+        sig_applied(*sg, a);
+        for (auto& e : a.units)
+          if (more[e.first] < e.second) more[e.first] = e.second;
+        if (!strengthen_rebuilds(*sg)) continue;
+        if (dotted) k += load_cost(*sg, extra, 2);
+        else more[u] = 2;
+      } catch (...) {
+      }
+    }
+    return k;
+  }
   void functor_loads(std::map<std::string, int>& more,
                      std::set<std::string>& noload) const {
     for (auto& fa : fapps) {
@@ -21407,6 +21509,7 @@ struct Cites {
     std::set<std::string> noload;
     if (sub && !xoff) functor_loads(more, noload);
     if (sub && dbg_env("NOXWITHC") == nullptr) with_loads(more);
+    if (sub && !incpath_off()) k += inc_loads(more, extra);
     for (auto& e : more) {
       bool cited = !done.insert(e.first).second;
       if (cited && e.second < 2) continue;
@@ -21467,6 +21570,29 @@ struct Count {
     if (!b.name.txt) return;
     mods[*b.name.txt].push_back(&b.expr);
     mnames.push_back(*b.name.txt);
+  }
+  // The VALUE names an `include <PATH>` brings into scope, collected by the
+  // same walk that counts its items: a `let f = fun ..` that SHADOWS one of
+  // them is not a fresh name, so `maybe_add_pattern_variables_ghost` adds no
+  // ghost for it.
+  mutable std::vector<std::string>* inm_ = nullptr;
+  // A functor PARAMETER's signature, bound over the body alone, so that an
+  // `include X` inside it can be weighed.
+  std::unordered_map<std::string, std::vector<const ModuleType*>> fmods;
+  std::vector<std::string> fpnames;
+  std::size_t fmark() const { return fpnames.size(); }
+  void frelease(std::size_t m) {
+    while (fpnames.size() > m) {
+      auto it = fmods.find(fpnames.back());
+      if (it != fmods.end() && !it->second.empty()) it->second.pop_back();
+      fpnames.pop_back();
+    }
+  }
+  void fbind(const FunctorParam& p) {
+    auto* nm = std::get_if<Functor_named>(&p);
+    if (!nm || !nm->name.txt) return;
+    fmods[*nm->name.txt].push_back(&*nm->type);
+    fpnames.push_back(*nm->name.txt);
   }
   // Which CROSS-UNIT functors this file has applied already.  Forcing the
   // result signature the .cmi carries is paid once per (functor, argument);
@@ -23302,6 +23428,146 @@ struct Count {
   }
   // A level that renames every item once, however deep it is nested.
   static Lvl flat() { return Lvl{1, 0, 0, true}; }
+  // ---- `include <a module PATH>` -----------------------------------------
+  // `Env.enter_signature` (typemod.ml's `Pstr_include`) renames what the path
+  // carries -- the TOP items of its signature, one apiece, since `Subst`
+  // leaves the nested ones lazy -- and the cascade renames them again where
+  // the include stands, so the charge is `l.a * <top items>`: `include A` at
+  // the top of a file is A's items and one level further in twice that.
+  // Reading a component through its PARENT substitutes that component's
+  // declaration once more (`include A.N` is 2x N's items where `include A`
+  // is 1x A's); for another unit's path that substitution is the submodule
+  // force S437 already charges.
+  const ModuleExpr* msub(const ModuleExpr& m, const std::string& nm) const {
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st) return nullptr;
+    const ModuleExpr* r = nullptr;
+    for (auto& it : st->items)
+      if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+        if (mb->binding.name.txt && *mb->binding.name.txt == nm)
+          r = &mb->binding.expr;
+    return r;
+  }
+  long long sig_top(const Signature& s, int d) const {
+    long long k = 0;
+    for (auto& it : s) {
+      if (inm_) {
+        if (auto* v = std::get_if<Psig_value>(&it.desc))
+          inm_->push_back(v->vd.name.txt);
+        else if (auto* p = std::get_if<Psig_primitive>(&it.desc))
+          inm_->push_back(p->pd.name.txt);
+      }
+      if (auto* t = std::get_if<Psig_type>(&it.desc))
+        k += (long long)t->decls.size();
+      else if (auto* t = std::get_if<Psig_typesubst>(&it.desc))
+        k += (long long)t->decls.size();
+      else if (auto* x = std::get_if<Psig_typext>(&it.desc))
+        k += (long long)x->ext.ctors.size();
+      else if (auto* r = std::get_if<Psig_recmodule>(&it.desc))
+        k += (long long)r->decls.size();
+      else if (auto* c = std::get_if<Psig_class>(&it.desc))
+        k += cls_off() ? 0 : 3 * (long long)c->decls.size();
+      else if (auto* c = std::get_if<Psig_class_type>(&it.desc))
+        k += cls_off() ? 0 : 2 * (long long)c->decls.size();
+      else if (auto* i = std::get_if<Psig_include>(&it.desc))
+        k += mt_top(i->mt, d + 1);
+      else if (!std::holds_alternative<Psig_open>(it.desc) &&
+               !std::holds_alternative<Psig_attribute>(it.desc) &&
+               !std::holds_alternative<Psig_extension>(it.desc))
+        ++k;
+    }
+    return k;
+  }
+  long long mt_top(const ModuleType& mt, int d = 0) const {
+    if (d > 8) return 0;
+    long long k = 0;
+    const ModuleType* b = &mt;
+    for (int i = 0; i < 8; ++i) {
+      auto* w = std::get_if<Pmty_with>(&b->desc);
+      if (!w) break;
+      for (auto& cn : w->constraints) {
+        Wc x;
+        if (wc_parts(cn, x) && x.destr && x.path.size() == 1) --k;
+      }
+      b = w->mt.get();
+    }
+    const Signature* s = mty_sig(b);
+    return s ? k + sig_top(*s, d) : 0;
+  }
+  long long me_top(const ModuleExpr& m, int d = 0) const {
+    if (d > 8) return 0;
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) {
+        k += str_items(it);
+        if (inm_) {
+          if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+            Count c;
+            for (auto& b : v->bindings) c.pat(b.pat, inm_);
+          } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
+            inm_->push_back(p->prim.name.txt);
+          } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
+            inm_->push_back(v->vd.name.txt);
+          }
+        }
+        if (auto* i = std::get_if<Pstr_include>(&it.desc))
+          k += me_top(i->expr, d + 1);
+      }
+      return k;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return mt_top(*c->mt, d);
+    bool dt = false;
+    return std::holds_alternative<Pmod_ident>(m.desc) ? inc_top(m, dt, d + 1)
+                                                      : 0;
+  }
+  long long inc_top(const ModuleExpr& m, bool& dotted, int d = 0) const {
+    auto* p0 = std::get_if<Pmod_ident>(&m.desc);
+    if (!p0 || d > 8) return 0;
+    const Longident* id = &p0->id.txt;
+    for (int i = 0; i < 8; ++i) {
+      std::vector<std::string> c;
+      if (!lid_path(*id, c) || c.empty()) return 0;
+      auto it = mods.find(c[0]);
+      if (it == mods.end() || it->second.empty()) break;
+      const ModuleExpr* me = it->second.back();
+      for (std::size_t j = 1; me && j < c.size(); ++j) me = msub(*me, c[j]);
+      if (!me) return 0;
+      dotted = c.size() > 1;
+      auto* q = std::get_if<Pmod_ident>(&me->desc);
+      if (!q) return me_top(*me, d + 1);
+      id = &q->id.txt;
+    }
+    dotted = false;
+    if (auto* li = std::get_if<Lident>(&id->v)) {
+      auto f = fmods.find(li->name);
+      if (f != fmods.end() && !f->second.empty())
+        return mt_top(*f->second.back(), d);
+    }
+    std::vector<std::string> c;
+    if (!lid_path(*id, c) || c.empty() || mods.count(c[0])) return 0;
+    if (c[0] == "Stdlib" && c.size() > 1) c.erase(c.begin());
+    if (c[0].rfind("Stdlib__", 0) == 0) c[0] = c[0].substr(8);
+    std::string p = head_cmi(c[0]);
+    if (p.empty() || !std::filesystem::exists(p)) return 0;
+    try {
+      std::string u;
+      bool dt = false;
+      const cmi::Signature* sg =
+          walk_path(&cmi::CmiFile::load(p).sig(), c, u, dt);
+      if (!sg) return 0;
+      if (inm_)
+        for (auto& v : sg->values) inm_->push_back(v.name);
+      return (long long)sg->order.size();
+    } catch (...) {
+    }
+    return 0;
+  }
+  long long inc_items(const ModuleExpr& m, const Lvl& l) const {
+    bool dotted = false;
+    long long t = inc_top(m, dotted);
+    return l.a * t + (dotted ? t : 0);
+  }
   // --- A FUNCTOR OF ANOTHER UNIT --------------------------------------
   // Its result is not in this parsetree at all: it is the signature the
   // unit's .cmi carries, and applying it FORCES that signature (one ident
@@ -23345,11 +23611,7 @@ struct Count {
   // record or a variant.  Everything else, an abstract type and a variant or
   // record of its own included, is REBUILT, and a saved result that carries
   // one is substituted twice more.
-  static bool rebuilt_decl(const cmi::TypeDecl& d) {
-    if (!d.manifest) return true;
-    return d.priv && d.kind != cmi::TypeDecl::Record &&
-           d.kind != cmi::TypeDecl::Variant;
-  }
+  static bool rebuilt_decl(const cmi::TypeDecl& d) { return rebuilt_tdecl(d); }
   static bool str_csig(const cmi::Signature& sg) {
     for (auto& d : sg.types)
       if (rebuilt_decl(d)) return true;
@@ -23590,7 +23852,10 @@ struct Count {
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
       // `aliasable:false`), so its body starts the cascade over.
       fparam(f->param, l);
+      auto fk = fmark();
+      fbind(f->param);
       mexpr(*f->body, Lvl{1, 1, 0, true});
+      frelease(fk);
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
       // What an ascribed module SAVES is the ascription, so that is what the
       // renames below it reach; the structure behind it is typed once.
@@ -23756,6 +24021,13 @@ struct Count {
       // `ren_mexpr` cannot read an application; its result is re-bound the
       // same way every other included signature is.
       n += app_charge(i->expr, flat(), false);
+      if (!incpath_off()) {
+        std::vector<std::string> nm;
+        inm_ = &nm;
+        n += inc_items(i->expr, l);
+        inm_ = nullptr;
+        for (auto& s : nm) bind(s);
+      }
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
       mexpr(o->expr, Lvl{1, 1, 0, true}, false);
       reg_open(o->expr);
