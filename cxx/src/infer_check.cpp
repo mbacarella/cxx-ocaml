@@ -20810,6 +20810,113 @@ struct Cites {
   void xmeet(const std::string& u) {
     if (!u.empty() && !xuni_off()) xforce.insert(u);
   }
+  static bool tdecl_off() {
+    static const bool off = dbg_env("NOTDECLF") != nullptr;
+    return off;
+  }
+  static const cmi::TypeDecl* sig_tdecl(const cmi::Signature& sg,
+                                        const std::string& n) {
+    for (auto& td : sg.types)
+      if (td.name == n) return &td;
+    return nullptr;
+  }
+  // A type DECLARATION looks its components up a SECOND time, and each such
+  // lookup forces the unit that declares them again.  Three walks, `mode`
+  // apart: 0 a VARIANT ARGUMENT or RECORD FIELD, where only a type that
+  // carries PARAMETERS is asked for; 1 a node of the MANIFEST, where an
+  // ABSTRACT type is asked for as well; 2 the manifest's own HEAD and 3 the
+  // head the float-record scan reads, where anything at all is.  A PUBLIC
+  // MANIFEST is followed into its own body first -- `Digest.t` is `string`
+  // and `Bool.t` is `bool`, and neither asks for anything -- and the answer
+  // is the name the walk lands on, so the scan can tell `float` from the rest.
+  std::string tf_decl(const cmi::TypeDecl* td, const cmi::Signature* sg,
+                      const std::string& unit, int mode, int depth) {
+    if (!td || depth > 6) return {};
+    if (td->manifest && !td->priv)
+      return tf_cmi(td->manifest.get(), sg, unit, mode, depth + 1);
+    if (mode >= 2 || !td->params.empty() ||
+        (mode == 1 && td->kind == cmi::TypeDecl::Abstract))
+      xmeet(unit);
+    return {};
+  }
+  std::string tf_path(std::vector<std::string> c, int mode, int depth) {
+    if (c.size() < 2 || local.count(c[0])) return {};
+    const cmi::Signature* rt = unit_of_path(c);  // normalises c in place
+    if (!rt || c.size() < 2) return {};
+    std::string unit = c[0];
+    const cmi::Signature* sg = rt;
+    for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
+      sg = submodule(*sg, c[i]);
+    if (!sg) return {};
+    return tf_decl(sig_tdecl(*sg, c.back()), sg, unit, mode, depth);
+  }
+  // The body of an abbreviation, as the .cmi carries it: a bare `Pident` there
+  // names a type of the very signature it was read from.
+  std::string tf_cmi(const cmi::TypeExpr* e, const cmi::Signature* sg,
+                     const std::string& unit, int mode, int depth) {
+    for (int i = 0; e && e->kind == cmi::TypeExpr::Tlink && i < 8; ++i)
+      e = e->link.get();
+    if (!e || depth > 6) return {};
+    const int am = mode == 0 ? 0 : 1;
+    if (e->kind == cmi::TypeExpr::Tconstr) {
+      if (mode != 3)
+        for (auto& a : e->args) tf_cmi(a.get(), sg, unit, am, depth + 1);
+      std::vector<std::string> c;
+      if (!cpath_comps(e->path.get(), c) || c.empty()) return {};
+      if (c.size() > 1) return tf_path(c, mode, depth);
+      const cmi::TypeDecl* td = sg ? sig_tdecl(*sg, c[0]) : nullptr;
+      if (!td) return c[0];  // a predefined type
+      return tf_decl(td, sg, unit, mode, depth);
+    }
+    if (mode == 3) return {};
+    if (e->dom) tf_cmi(e->dom.get(), sg, unit, am, depth + 1);
+    if (e->cod) tf_cmi(e->cod.get(), sg, unit, am, depth + 1);
+    for (auto& x : e->elems) tf_cmi(x.second.get(), sg, unit, am, depth + 1);
+    return {};
+  }
+  std::string tf_ty(const CoreType& t, int mode, int depth) {
+    if (depth > 6) return {};
+    const int am = mode == 0 ? 0 : 1;
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      if (mode != 3)
+        for (auto& a : c->args) tf_ty(*a, am, depth + 1);
+      std::vector<std::string> p = split_dotted(lid_full(c->id.txt));
+      if (p.size() == 1) return p[0];
+      return tf_path(p, mode, depth);
+    }
+    if (mode == 3) return {};
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      tf_ty(*a->dom, am, depth + 1);
+      tf_ty(*a->cod, am, depth + 1);
+    } else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& x : u->elems) tf_ty(*x, am, depth + 1);
+    } else if (auto* a = std::get_if<Ptyp_alias>(&t.desc)) {
+      tf_ty(*a->type, am, depth + 1);
+    } else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) {
+      tf_ty(*p->type, am, depth + 1);
+    }
+    return {};
+  }
+  void tf_args(const ConstructorArguments& a) {
+    if (auto* t = std::get_if<Pcstr_tuple>(&a)) {
+      for (auto& x : t->elems) tf_ty(*x, 0, 0);
+    } else {
+      for (auto& f : std::get<Pcstr_record>(a).fields) tf_ty(*f.type, 0, 0);
+    }
+  }
+  // The float-record scan reads the fields in order and stops at the first
+  // that is not a float, so `{ b : int; c : Buffer.t }` never looks at
+  // Buffer at all where `{ b : Buffer.t }` does.
+  void tf_tdecl(const TypeDeclaration& d) {
+    if (d.manifest) tf_ty(**d.manifest, 2, 0);
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+      for (auto& c : v->ctors) tf_args(c.args);
+    } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+      for (auto& f : r->fields)
+        if (tf_ty(*f.type, 3, 0) != "float") break;
+      for (auto& f : r->fields) tf_ty(*f.type, 0, 0);
+    }
+  }
   // The same, through the literal structure the two share: the elements of
   // `["-v", Set verbose, "be verbose"; "-q", Clear verbose, "be silent"]` meet
   // component by component, so Arg's `spec` is expanded even though neither
@@ -21040,10 +21147,12 @@ struct Cites {
       for (auto& f : r->fields) ty(*f.type);
     }
     for (auto& c : d.constraints) { ty(*c.t1); ty(*c.t2); }
+    if (!tdecl_off()) tf_tdecl(d);
   }
   void ext(const ExtensionConstructor& c) {
     if (auto* d = std::get_if<Pext_decl>(&c.kind)) {
       cargs(d->args);
+      if (!tdecl_off()) tf_args(d->args);
       if (d->res) ty(**d->res);
     } else {
       cite(std::get<Pext_rebind>(c.kind).id, false);
