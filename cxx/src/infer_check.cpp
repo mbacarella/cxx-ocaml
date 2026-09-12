@@ -21551,11 +21551,13 @@ struct Count {
       return v->closed == ClosedFlag::Open || v->labels.has_value();
     return false;
   }
-  static bool fixed_row(const TypeDeclaration& d) {
-    return !privrow_off() && d.manifest &&
-           d.priv == PrivateFlag::Private &&
+  static bool is_fixed(const TypeDeclaration& d) {
+    return d.manifest && d.priv == PrivateFlag::Private &&
            std::holds_alternative<Ptype_abstract>(d.kind) &&
            row_var(**d.manifest);
+  }
+  static bool fixed_row(const TypeDeclaration& d) {
+    return !privrow_off() && is_fixed(d);
   }
   static bool exist_off() {
     static const bool off = dbg_env("NOEXIST") != nullptr;
@@ -21688,6 +21690,296 @@ struct Count {
     eadded.emplace_back(nm, it == exi.end() ? std::optional<Cd>{}
                                            : std::optional<Cd>{it->second});
     exi[nm] = c;
+  }
+  struct Lvl;  // defined with the nesting cascade below
+  // ---- `with`-CONSTRAINTS -------------------------------------------------
+  // `module type T = S with type t = int` leaves an `Mty_signature` where the
+  // named base left an `Mty_ident`: `transl_modtype` (typemod.ml:1617) runs
+  // `Mtype.freshen` over the merged signature -- one ident per item at every
+  // depth -- and the S441 cascade then renames it where it lands, which
+  // together is exactly what a LITERAL signature of that shape costs in that
+  // position.  A literal base already pays all of that through the recursion,
+  // so it adds only the freshen.  On top of that:
+  //   * a `with type` constraint costs `check_type_decl`'s `Ident.rename id`
+  //     (typemod.ml:279), and one more where the constrained declaration is a
+  //     FIXED ROW -- the `row_id`, which also leaves a `t#row` item behind;
+  //   * that same `check_type_decl` runs `Subst.signature_item Keep` over the
+  //     signature the constrained item LIVES IN, which keeps the top-level
+  //     idents and renames everything nested inside a submodule;
+  //   * a DESTRUCTIVE constraint drops its item, and `post_process` then
+  //     substitutes the whole remaining signature (`Subst.Unsafe.signature
+  //     Make_local`), one ident per item at every depth.
+  // `with module` and `with module type` rename nothing of their own.
+  static bool with_off() {
+    static const bool off = dbg_env("NOWITHC") != nullptr;
+    return off;
+  }
+  // The module TYPES this file declares, scoped the way the values are.
+  std::unordered_map<std::string, std::vector<const ModuleType*>> mtys;
+  std::vector<std::string> mtnames;
+  std::size_t tmark() const { return mtnames.size(); }
+  void trelease(std::size_t m) {
+    while (mtnames.size() > m) {
+      auto it = mtys.find(mtnames.back());
+      if (it != mtys.end() && !it->second.empty()) it->second.pop_back();
+      mtnames.pop_back();
+    }
+  }
+  void tbind(const std::string& nm, const ModuleType* mt) {
+    mtys[nm].push_back(mt);
+    mtnames.push_back(nm);
+  }
+  // The signature a module type NAMES, through `module type T = S` chains and
+  // the `with`-constraints on the way.  Only module types of THIS file can be
+  // read; a base that does not resolve is charged nothing at all.
+  const ModuleType* named_mty(const Longident& id, int fuel) const {
+    auto* b = std::get_if<Lident>(&id.v);
+    if (!b || fuel <= 0) return nullptr;
+    auto it = mtys.find(b->name);
+    if (it == mtys.end() || it->second.empty()) return nullptr;
+    return it->second.back();
+  }
+  const Signature* mty_sig(const ModuleType* mt, int fuel = 8) const {
+    if (!mt || fuel <= 0) return nullptr;
+    if (auto* s = std::get_if<Pmty_signature>(&mt->desc)) return &s->items;
+    if (auto* w = std::get_if<Pmty_with>(&mt->desc))
+      return mty_sig(w->mt.get(), fuel - 1);
+    if (auto* id = std::get_if<Pmty_ident>(&mt->desc))
+      return mty_sig(named_mty(id->id.txt, fuel), fuel - 1);
+    return nullptr;
+  }
+  // The pieces of ONE constraint: the path it names, whether it removes the
+  // item, and the declaration a `with type` gives.
+  struct Wc {
+    std::vector<std::string> path;
+    bool destr = false;
+    const TypeDeclaration* td = nullptr;  // a `with type` only
+  };
+  static bool lid_path(const Longident& id, std::vector<std::string>& out) {
+    const Longident* q = &id;
+    for (int i = 0; i < 16 && q; ++i) {
+      if (auto* d = std::get_if<Ldot>(&q->v)) {
+        out.push_back(d->name);
+        q = d->prefix.get();
+        continue;
+      }
+      if (auto* l = std::get_if<Lident>(&q->v)) {
+        out.push_back(l->name);
+        std::reverse(out.begin(), out.end());
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+  static bool wc_parts(const WithConstraint& c, Wc& w) {
+    if (auto* t = std::get_if<Pwith_type>(&c)) {
+      w.td = t->td.get();
+      return lid_path(t->lid.txt, w.path);
+    }
+    if (auto* t = std::get_if<Pwith_typesubst>(&c)) {
+      w.td = t->td.get();
+      w.destr = true;
+      return lid_path(t->lid.txt, w.path);
+    }
+    if (auto* m = std::get_if<Pwith_module>(&c))
+      return lid_path(m->lid1.txt, w.path);
+    if (auto* m = std::get_if<Pwith_modsubst>(&c)) {
+      w.destr = true;
+      return lid_path(m->lid1.txt, w.path);
+    }
+    if (auto* m = std::get_if<Pwith_modtype>(&c))
+      return lid_path(m->lid.txt, w.path);
+    if (auto* m = std::get_if<Pwith_modtypesubst>(&c)) {
+      w.destr = true;
+      return lid_path(m->lid.txt, w.path);
+    }
+    return false;
+  }
+  // What the destructive constraints took out, one path apiece, matched
+  // against a signature one name at a time.
+  using Gone = std::vector<std::vector<std::string>>;
+  static Gone wgo(const Gone& g, const std::string& nm, bool& drop) {
+    Gone d;
+    for (auto& p : g)
+      if (!p.empty() && p[0] == nm) {
+        if (p.size() == 1) drop = true;
+        else d.emplace_back(p.begin() + 1, p.end());
+      }
+    return d;
+  }
+  static Gone wunder(const Gone& g, const std::vector<std::string>& p) {
+    Gone d = g;
+    for (std::size_t i = 0; i + 1 < p.size(); ++i) {
+      Gone e;
+      for (auto& q : d)
+        if (q.size() > 1 && q[0] == p[i])
+          e.emplace_back(q.begin() + 1, q.end());
+      d.swap(e);
+    }
+    return d;
+  }
+  // `Subst.signature`: one ident per item at every depth, minus what a
+  // destructive constraint took out.
+  long long w_ren(const Signature& s, const Gone& g) const {
+    long long k = 0;
+    for (auto& it : s) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls) {
+          bool drop = false;
+          wgo(g, d.name.txt, drop);
+          if (!drop) ++k;
+        }
+        continue;
+      }
+      if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (!m->md.name.txt) { k += ren_sig_item(it); continue; }
+        bool drop = false;
+        Gone d = wgo(g, *m->md.name.txt, drop);
+        if (drop) continue;
+        const Signature* in = d.empty() ? nullptr : mty_sig(m->md.type.get());
+        k += in ? 1 + w_ren(*in, d) : ren_sig_item(it);
+        continue;
+      }
+      if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+        bool drop = false;
+        wgo(g, m->name.txt, drop);
+        if (!drop) k += ren_sig_item(it);
+        continue;
+      }
+      k += ren_sig_item(it);
+    }
+    return k;
+  }
+  // The same, at the weight the level gives each item.
+  long long w_wt(const Signature& s, const Lvl& l, const Gone& g) const {
+    long long k = 0;
+    for (auto& it : s) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls) {
+          bool drop = false;
+          wgo(g, d.name.txt, drop);
+          if (!drop) k += l.a;
+        }
+        continue;
+      }
+      if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (!m->md.name.txt) { k += wt_sig_item(it, l); continue; }
+        bool drop = false;
+        Gone d = wgo(g, *m->md.name.txt, drop);
+        if (drop) continue;
+        const Signature* in = d.empty() ? nullptr : mty_sig(m->md.type.get());
+        k += in ? l.a + w_wt(*in, sub(l), d) : wt_sig_item(it, l);
+        continue;
+      }
+      if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+        bool drop = false;
+        wgo(g, m->name.txt, drop);
+        if (!drop) k += wt_sig_item(it, l);
+        continue;
+      }
+      k += wt_sig_item(it, l);
+    }
+    return k;
+  }
+  // `Subst.signature_item Keep`: the item's own ident is KEPT and everything
+  // a submodule or a module type of it spans is renamed.
+  long long w_nested(const Signature& s, const Gone& g) const {
+    long long k = 0;
+    for (auto& it : s) {
+      if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        bool drop = false;
+        Gone d = m->md.name.txt ? wgo(g, *m->md.name.txt, drop) : Gone{};
+        if (drop) continue;
+        const Signature* in = mty_sig(m->md.type.get());
+        k += in ? w_ren(*in, d) : ren_mty(*m->md.type);
+        continue;
+      }
+      if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+        for (auto& d : m->decls) k += ren_mty(*d.type);
+        continue;
+      }
+      if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+        bool drop = false;
+        wgo(g, m->name.txt, drop);
+        if (!drop && m->type) k += ren_mty(*m->type);
+        continue;
+      }
+      if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc)) {
+        k += ren_mty(m->type);
+        continue;
+      }
+      if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+        if (const Signature* in = mty_sig(&i->mt)) k += w_nested(*in, g);
+        continue;
+      }
+    }
+    return k;
+  }
+  // The signature a constraint's item lives in, and the level it sits at.
+  const Signature* w_target(const Signature& s,
+                            const std::vector<std::string>& p, const Lvl& l,
+                            Lvl& out) const {
+    if (p.size() <= 1) { out = l; return &s; }
+    for (auto& it : s) {
+      auto* m = std::get_if<Psig_module>(&it.desc);
+      if (!m || !m->md.name.txt || *m->md.name.txt != p[0]) continue;
+      const Signature* in = mty_sig(m->md.type.get());
+      if (!in) return nullptr;
+      return w_target(*in, std::vector<std::string>(p.begin() + 1, p.end()),
+                      sub(l), out);
+    }
+    return nullptr;
+  }
+  static bool w_has(const Signature& s, const std::string& nm) {
+    for (auto& it : s) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls)
+          if (d.name.txt == nm) return true;
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (m->md.name.txt && *m->md.name.txt == nm) return true;
+      } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+        if (m->name.txt == nm) return true;
+      }
+    }
+    return false;
+  }
+  // What ONE `with`-node costs.  Anything that does not resolve -- a base of
+  // another unit, a constraint naming an item we cannot find -- is charged
+  // nothing, which is what the checker did before this rule.
+  long long with_node(const Pmty_with& w, const Lvl& l) const {
+    const Signature* sg = mty_sig(w.mt.get());
+    if (!sg) return 0;
+    Gone g;
+    for (const ModuleType* p = w.mt.get();;) {
+      auto* q = std::get_if<Pmty_with>(&p->desc);
+      if (!q) break;
+      for (auto& c : q->constraints) {
+        Wc x;
+        if (!wc_parts(c, x)) return 0;
+        if (x.destr) g.push_back(x.path);
+      }
+      p = q->mt.get();
+    }
+    const bool lit = std::holds_alternative<Pmty_signature>(w.mt->desc);
+    long long k = 0, rows = 0, roww = 0;
+    for (auto& c : w.constraints) {
+      Wc x;
+      if (!wc_parts(c, x) || x.path.empty()) return 0;
+      Lvl tl;
+      const Signature* tg = w_target(*sg, x.path, l, tl);
+      if (!tg || !w_has(*tg, x.path.back())) return 0;
+      if (x.td) {
+        ++k;
+        if (is_fixed(*x.td)) { ++k; ++rows; roww += tl.a; }
+        k += w_nested(*tg, wunder(g, x.path));
+      }
+      if (x.destr) {
+        g.push_back(x.path);
+        k += w_ren(*sg, g) + rows;
+      }
+    }
+    return k + (lit ? w_ren(*sg, g) + rows : w_wt(*sg, l, g) + roww);
   }
   const std::unordered_map<std::string, int>& unit_ctors(const std::string& u) {
     auto it = uexi.find(u);
@@ -22144,6 +22436,7 @@ struct Count {
     } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
       auto m = mark();
       auto ek = emark();
+      auto tk = tmark();
       bool ie = inexpr_;
       inexpr_ = true;
       item(*s->item);
@@ -22151,6 +22444,7 @@ struct Count {
       expr(*s->body);
       release(m);
       erelease(ek);
+      trelease(tk);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
       expr(*s->obj); expr(*s->value);
     } else if (auto* s = std::get_if<Pexp_setinstvar>(&e.desc)) {
@@ -23043,10 +23337,12 @@ struct Count {
       auto k = mark();
       auto mk = mmark();
       auto ek = emark();
+      auto tk = tmark();
       for (auto& it : st->items) item(it, l);
       release(k);
       mrelease(mk);
       erelease(ek);
+      trelease(tk);
     } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       // A functor's RESULT is never strengthened (`strengthen_lazy`,
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
@@ -23100,13 +23396,21 @@ struct Count {
       fparam(f->param, l);
       mty(*f->body, l);
     } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
-      mty(*w->mt, l);
+      // A with-node BELOW this one leaves a signature nothing saves, so the
+      // cascade stops there: only the outermost result is renamed by it.
+      mty(*w->mt, !with_off() &&
+                          std::holds_alternative<Pmty_with>(w->mt->desc)
+                      ? flat()
+                      : l);
+      if (!with_off()) n += with_node(*w, l);
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
       mexpr(*t->me);
     }
   }
   void sig_items(const Signature& s, const Lvl& l) {
+    auto tk = tmark();
     for (auto& it : s) sig_item(it, l);
+    trelease(tk);
   }
   void sig_item(const SignatureItem& it, const Lvl& l) {
     const int per = (int)l.a;
@@ -23139,6 +23443,7 @@ struct Count {
     } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
       n += per;
       if (m->type) mty(*m->type, mtd(l));
+      tbind(m->name.txt, m->type ? &*m->type : nullptr);
     } else if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc)) {
       n += per;
       mty(m->type, mtd(l));
@@ -23200,6 +23505,7 @@ struct Count {
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
       if (m->type) mty(*m->type, mtd(l));
       ++n;
+      tbind(m->name.txt, m->type ? &*m->type : nullptr);
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexpr(i->expr, l);
       n += depth_off() ? exports(i->expr) : ren_mexpr(i->expr, Sibs{});
