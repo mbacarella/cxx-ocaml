@@ -21903,6 +21903,45 @@ struct Count {
     }
     return k;
   }
+  // ---- PACKING A MODULE ---------------------------------------------------
+  // A pack expression CHECKS the module against the package type, and the
+  // check substitutes the module's own signature whole
+  // (`wrap_constraint_package`, typemod.ml:2368: `Subst.modtype Keep identity
+  // arg.mod_type`), which names one ident per item of it -- the nested ones
+  // included, at the weight the cascade gives them.  It is the MODULE's
+  // signature, not the package type's: a module with more items than the
+  // package type asks for pays for all of them.
+  static bool pkwrap_off() {
+    static const bool off = dbg_env("NOPKWRAP") != nullptr;
+    return off;
+  }
+  // A module type NAMED here answers with the signature it was declared by;
+  // one written `S with ..` is left alone, since what a destructive
+  // constraint takes out is not ours to work out from a name.
+  long long pk_wmty(const ModuleType& mt, int fuel) const {
+    if (auto* id = std::get_if<Pmty_ident>(&mt.desc)) {
+      const ModuleType* t = fuel > 0 ? named_mty(id->id.txt, fuel) : nullptr;
+      return t ? pk_wmty(*t, fuel - 1) : 0;
+    }
+    return wt_mty(mt, Lvl{1, 1, 0, true});
+  }
+  long long pk_wrap(const ModuleExpr& m, int fuel = 8) const {
+    if (fuel <= 0 || pkwrap_off()) return 0;
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return pk_wmty(*c->mt, fuel);
+    if (auto* i = std::get_if<Pmod_ident>(&m.desc)) {
+      auto* l = std::get_if<Lident>(&i->id.txt.v);
+      if (!l) return 0;
+      auto it = mods.find(l->name);
+      if (it != mods.end() && !it->second.empty())
+        return pk_wrap(*it->second.back(), fuel - 1);
+      auto ft = fmods.find(l->name);
+      if (ft != fmods.end() && !ft->second.empty() && ft->second.back())
+        return pk_wmty(*ft->second.back(), fuel - 1);
+      return 0;
+    }
+    return wt_mexpr(m, Lvl{1, 1, 0, true});
+  }
   // ---- what an `inherit` BRINGS IN ---------------------------------------
   // `class_field`'s `Pcf_inherit` arm walks the parent's class signature:
   // every instance VARIABLE of it goes through `enter_val`, exactly as a `val`
@@ -23331,6 +23370,7 @@ struct Count {
     } else if (auto* p = std::get_if<Pexp_pack>(&e.desc)) {
       mexpr(*p->me);
       if (p->pkg && !packty_off()) n += pack_pkg(*p->pkg);
+      n += pk_wrap(*p->me);
     } else if (auto* l = std::get_if<Pexp_letop>(&e.desc)) {
       auto m = mark();
       std::vector<std::string> nm;
