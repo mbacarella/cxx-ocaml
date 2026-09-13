@@ -20424,6 +20424,21 @@ bool packty_off() {
   return off;
 }
 
+bool subfct_off() {
+  static const bool off = dbg_env("NOSUBFCT") != nullptr;
+  return off;
+}
+
+bool idres_off() {
+  static const bool off = dbg_env("NOIDRES") != nullptr;
+  return off;
+}
+
+bool incwt_off() {
+  static const bool off = dbg_env("NOINCWT") != nullptr;
+  return off;
+}
+
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
   // Module names the file binds itself, with how MANY times: a name bound
@@ -21505,6 +21520,9 @@ struct Cites {
       for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
         sg = submodule(*sg, c[i]);
       if (!sg) continue;
+      // A module type reached through a submodule path is a name of THAT
+      // submodule's scope, not of the unit's top level.
+      if (!subfct_off()) rt = sg;
       const cmi::ModuleType* mt = nullptr;
       for (auto& md : sg->modtypes)
         if (md.name == c.back()) mt = md.type.get();
@@ -21595,6 +21613,8 @@ struct Cites {
       for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
         sg = submodule(*sg, c[i]);
       if (!sg) continue;
+      // The functor's result is named in the scope it was DECLARED in.
+      if (!subfct_off()) rt = sg;
       const cmi::ModuleType* mt = nullptr;
       for (auto& md : sg->modules)
         if (md.name == c.back()) mt = md.type.get();
@@ -24488,6 +24508,9 @@ struct Count {
     for (std::size_t i = 1; i + 1 < c.size(); ++i) {
       sg = submodule(*sg, c[i]);
       if (!sg) return nullptr;
+      // A module type the functor's own type names is a name of the
+      // SUBMODULE it is declared in, not of the unit's top level.
+      if (!subfct_off()) *root = sg;
     }
     for (auto& md : sg->modules)
       if (md.name == c.back()) return md.type.get();
@@ -24530,8 +24553,16 @@ struct Count {
              f = f->functor_body.get())
           if (f->functor_param) ++k;
     }
+    // A functor whose RESULT is written as a module type NAME hands back
+    // that name; scraping it is what the application's own substitution
+    // and `Mtype.strengthen` then walk, and between them they name the
+    // signature TWICE LESS OFTEN than a result written out in full.
+    const cmi::ModuleType* idres = mt;
     mt = scrape_cmty(mt, root);
     if (!mt) return 0;
+    if (!idres_off() && idres && idres != mt &&
+        idres->kind == cmi::ModuleType::Ident)
+      k -= 2 * flat_cmty(mt);
     // A distinct argument builds its own result; the same one is cached.
     std::string ak = key;
     int unit_arg = 0;
@@ -24621,6 +24652,33 @@ struct Count {
     }
     return k;
   }
+  // What an `include <a module PATH>` in a functor's BODY leaves behind: the
+  // items the path's module exports, renamed once by every application.  All
+  // `wt_mexpr` sees there is a `Pmod_ident`, and it answers 0 for one.
+  long long inc_wt(const ModuleExpr& b, const Lvl& l,
+                   const std::vector<std::pair<std::string,
+                                               const ModuleType*>>& ps,
+                   int d = 0) const {
+    auto* st = std::get_if<Pmod_structure>(&b.desc);
+    if (!st || d > 4) return 0;
+    long long k = 0;
+    for (auto& it : st->items) {
+      if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        auto* pi = std::get_if<Pmod_ident>(&i->expr.desc);
+        if (!pi) { k += inc_wt(i->expr, l, ps, d + 1); continue; }
+        const ModuleType* pt = nullptr;
+        if (auto* li = std::get_if<Lident>(&pi->id.txt.v))
+          for (auto& p : ps)
+            if (p.first == li->name) { pt = p.second; break; }
+        if (pt) { k += l.a * mt_top(*pt); continue; }
+        bool dotted = false;
+        k += l.a * inc_top(i->expr, dotted, d + 1);
+      } else if (auto* md = std::get_if<Pstr_module>(&it.desc)) {
+        k += inc_wt(md->binding.expr, sub(l), ps, d + 1);
+      }
+    }
+    return k;
+  }
   long long app_charge(const ModuleExpr& m, const Lvl& l,
                        bool saved = true) {
     if (app_off()) return 0;
@@ -24651,6 +24709,7 @@ struct Count {
       h = a->f.get();
     }
     long long k = 0;
+    std::vector<std::pair<std::string, const ModuleType*>> fps;
     bool pbody = false;  // the result is the PARAMETER, and so an alias
     for (int i = 0; i < nargs; ++i) {
       if (me)
@@ -24661,6 +24720,9 @@ struct Count {
       if (me) {
         auto* f = std::get_if<Pmod_functor>(&me->desc);
         if (!f) return 0;
+        if (auto* nm = std::get_if<Functor_named>(&f->param))
+          if (nm->name.txt && nm->type)
+            fps.emplace_back(*nm->name.txt, &*nm->type);
         const ModuleExpr* b = mderef(f->body.get());
         if (b) {
           me = b;
@@ -24682,6 +24744,7 @@ struct Count {
         k += me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
     }
     k += me ? wt_mexpr(*me, l) : wt_mty(*mt, l);
+    if (me && !incwt_off()) k += inc_wt(*me, l, fps);
     if (pathless && saved && !pbody)
       k += me ? ext_mexpr(*me, Ext{}) : ext_mty(*mt, Ext{});
     // A result whose type declarations `Mtype.strengthen` must REBUILD is
