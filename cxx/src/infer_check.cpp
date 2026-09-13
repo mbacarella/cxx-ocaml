@@ -22074,6 +22074,10 @@ struct Count {
   // of a result is paid once per (functor, argument), and once more --
   // and one ident over -- for the FIRST application of the functor.
   std::set<std::string> larg, lseen;
+  // Which (functor, argument) pairs an ALIAS result has been strengthened
+  // for: `Env.components_of_functor_appl` answers a repeat from
+  // `fcomp_cache`, so the same pair is written out once.
+  std::set<std::string> aarg;
   std::map<std::string, std::set<std::string>> fargp;
   // Inside `let module M = .. in ..`, where the result is bound over the
   // body alone and is never saved.
@@ -23355,16 +23359,22 @@ struct Count {
     for (auto& d : ds) {
       n += per;
       if (fixed_row(d)) n += per;
+      if (d.manifest) ty_app(**d.manifest);
       if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
         for (auto& c : v->ctors) { ++n; ctor_args(c.args); }
       } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
         n += (long long)r->fields.size();
+        for (auto& f : r->fields) ty_app(*f.type);
       }
     }
   }
   void ctor_args(const ConstructorArguments& a) {
-    if (auto* r = std::get_if<Pcstr_record>(&a))
+    if (auto* t = std::get_if<Pcstr_tuple>(&a))
+      for (auto& e : t->elems) ty_app(*e);
+    if (auto* r = std::get_if<Pcstr_record>(&a)) {
       n += (long long)r->fields.size();
+      for (auto& f : r->fields) ty_app(*f.type);
+    }
   }
   void ext_ctor(const ExtensionConstructor& c) {
     ++n;
@@ -24744,6 +24754,143 @@ struct Count {
           if (p.first == li->name) return wt_mty(*p.second, l);
     return tof_wt(m, l);
   }
+  static bool aliasapp_off() {
+    static const bool off = dbg_env("NOALIASAPP") != nullptr;
+    return off;
+  }
+  // The module type a signature declares for its member `nm`.
+  static const ModuleType* sig_member(const Signature& s,
+                                      const std::string& nm) {
+    const ModuleType* r = nullptr;
+    for (auto& it : s)
+      if (auto* md = std::get_if<Psig_module>(&it.desc))
+        if (md->md.name.txt && *md->md.name.txt == nm) r = &*md->md.type;
+    return r;
+  }
+  // A module type a signature leaves ABSTRACT has whatever body the ARGUMENT
+  // declares under that name and none this file can see on its own.
+  static bool abstract_mty(const Signature& s, const std::string& nm) {
+    for (auto& it : s)
+      if (auto* mt = std::get_if<Psig_modtype>(&it.desc))
+        if (mt->name.txt == nm) return !mt->type.has_value();
+    return false;
+  }
+  static const ModuleType* str_modtype(const ModuleExpr& m,
+                                       const std::string& nm) {
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st) return nullptr;
+    const ModuleType* r = nullptr;
+    for (auto& it : st->items)
+      if (auto* mt = std::get_if<Pstr_modtype>(&it.desc))
+        if (mt->name.txt == nm && mt->type) r = &*mt->type;
+    return r;
+  }
+  // What ONE application of a functor whose body is a PATH INTO ITS OWN
+  // PARAMETER leaves behind: `Subst` puts the argument where the parameter
+  // stood and `Mtype.strengthen` then rebuilds what the alias points at, so
+  // the member is written out TWICE -- once at the signature the PARAMETER
+  // declares for it, and once at the one the ARGUMENT actually has there.
+  // The two are not the same size: a parameter may ask for less than the
+  // argument brings, and a member declared at a module type the parameter
+  // leaves ABSTRACT is only as big as the argument's own declaration of it.
+  long long alias_wt(const ModuleType& pt, const ModuleExpr& arg,
+                     const std::string& nm) const {
+    const Lvl al{1, 1, 0, false};
+    const Signature* sg = mty_sig(&pt);
+    if (!sg) return 0;
+    const ModuleType* mm = sig_member(*sg, nm);
+    const ModuleExpr* am = msub(arg, nm);
+    if (!mm || !am) return 0;
+    const Signature* ms = nullptr;
+    bool abst = false;
+    if (auto* id = std::get_if<Pmty_ident>(&mm->desc))
+      if (auto* li = std::get_if<Lident>(&id->id.txt.v))
+        if (abstract_mty(*sg, li->name)) {
+          abst = true;
+          ms = mty_sig(str_modtype(arg, li->name));
+        }
+    if (!abst) ms = mty_sig(mm);
+    if (!ms) return 0;
+    long long k = wt_mexpr(*am, al);
+    for (auto& it : *ms) k += wt_sig_item(it, al);
+    return k;
+  }
+  // An argument with no PATH of its own is not substituted in at all, and a
+  // body that names anything but a member of the parameter just applied is a
+  // bigger substitution than this models -- both are left alone.
+  long long alias_charge(const Pmod_functor& f, const ModuleExpr* arg,
+                         bool pathless) {
+    if (aliasapp_off() || pathless || !arg) return 0;
+    auto* nm = std::get_if<Functor_named>(&f.param);
+    if (!nm || !nm->name.txt || !nm->type) return 0;
+    auto* pi = std::get_if<Pmod_ident>(&f.body->desc);
+    if (!pi) return 0;
+    auto* dd = std::get_if<Ldot>(&pi->id.txt.v);
+    if (!dd) return 0;
+    auto* root = std::get_if<Lident>(&dd->prefix->v);
+    if (!root || root->name != *nm->name.txt) return 0;
+    const ModuleExpr* am = mderef(arg);
+    if (!am) return 0;
+    std::string key = std::to_string((std::uintptr_t)&f) + "(" +
+                      std::to_string((std::uintptr_t)am) + ")";
+    if (!aarg.insert(key).second) return 0;
+    return alias_wt(*nm->type, *am, dd->name);
+  }
+  // The same application written as a PATH -- `F (M).t` in a type -- looks
+  // the functor up through `Env.components_of_functor_appl`, which builds the
+  // applied signature and strengthens an alias result exactly as the module
+  // binding does.  `Mtype.strengthen` is all this charges: what the lookup
+  // costs for a result that is a SIGNATURE is left alone.
+  long long lapp_charge(const Longident& id) {
+    if (aliasapp_off()) return 0;
+    auto* a = std::get_if<Lapply>(&id.v);
+    if (!a) return 0;
+    bool s1 = false, s2 = false;
+    const ModuleExpr* fe = lal_res(*a->f, s1);
+    const ModuleExpr* ae = lal_res(*a->x, s2);
+    if (!fe || !ae) return 0;
+    auto* fn = std::get_if<Pmod_functor>(&fe->desc);
+    if (!fn) return 0;
+    return alias_charge(*fn, ae, false);
+  }
+  long long lapp_path(const Longident& id) {
+    if (auto* d = std::get_if<Ldot>(&id.v)) return lapp_path(*d->prefix);
+    return lapp_charge(id);
+  }
+  // Every functor application a written type names.
+  void ty_app(const CoreType& t, int d = 0) {
+    if (aliasapp_off() || d > 24) return;
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      n += lapp_path(c->id.txt);
+      for (auto& a : c->args) ty_app(*a, d + 1);
+    } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
+      n += lapp_path(c->id.txt);
+      for (auto& a : c->args) ty_app(*a, d + 1);
+    } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      ty_app(*a->dom, d + 1);
+      ty_app(*a->cod, d + 1);
+    } else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : u->elems) ty_app(*e, d + 1);
+    } else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) {
+      ty_app(*p->type, d + 1);
+    } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+      ty_app(*al->type, d + 1);
+    } else if (auto* op = std::get_if<Ptyp_open>(&t.desc)) {
+      ty_app(*op->type, d + 1);
+    } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
+      for (auto& r : v->rows) {
+        if (auto* g = std::get_if<Rtag>(&r))
+          for (auto& a : g->types) ty_app(*a, d + 1);
+        else if (auto* i = std::get_if<Rinherit>(&r))
+          ty_app(*i->ct, d + 1);
+      }
+    } else if (auto* o = std::get_if<Ptyp_object>(&t.desc)) {
+      for (auto& f : o->fields) {
+        if (auto* g = std::get_if<Otag>(&f)) ty_app(*g->type, d + 1);
+        else if (auto* i = std::get_if<Oinherit>(&f)) ty_app(*i->type, d + 1);
+      }
+    }
+  }
   // `rebind` is the second pass an INCLUDE makes over an application: the
   // walk that precedes it has already charged every substitution but the
   // last, and only the result is bound a second time.
@@ -24772,10 +24919,14 @@ struct Count {
     if (!me) return cross_charge(m, *head, nargs, l, saved, rebind);
     const ModuleExpr* fdef = me;
     bool pathless = false;
+    // The arguments, innermost application first, so that the one the i-th
+    // parameter is given is `args[nargs - 1 - i]`.
+    std::vector<const ModuleExpr*> args;
     for (const ModuleExpr* h = &m;;) {
       auto* a = std::get_if<Pmod_apply>(&h->desc);
       if (!a) break;
       if (!has_path(*a->arg)) pathless = true;
+      args.push_back(a->arg.get());
       h = a->f.get();
     }
     long long k = 0;
@@ -24800,7 +24951,8 @@ struct Count {
           me = b;
         } else {
           const ModuleType* pt = pbody_off() ? nullptr : param_body(*f);
-          if (!pt) return 0;
+          if (!pt)
+            return k + alias_charge(*f, args[nargs - 1 - i], pathless);
           mt = pt;
           me = nullptr;
           pbody = true;
@@ -24996,6 +25148,9 @@ struct Count {
         std::holds_alternative<Psig_primitive>(it.desc) ||
         std::holds_alternative<Psig_modsubst>(it.desc)) {
       n += per;
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) ty_app(*v->vd.type);
+      else if (auto* p = std::get_if<Psig_primitive>(&it.desc))
+        if (p->pd.type) ty_app(*p->pd.type);
       if (saved_ && !packty_off()) {
         if (auto* v = std::get_if<Psig_value>(&it.desc))
           n += pack_ty(*v->vd.type);
