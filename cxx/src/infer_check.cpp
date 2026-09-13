@@ -23711,6 +23711,36 @@ struct Count {
     return 0;
   }
 
+  // ---- A FUNCTOR BINDING IS RENAMED BY THE CASCADE AROUND IT --------------
+  // The type of a module whose expression is a FUNCTOR is a functor, and
+  // `Subst.modtype` (subst.ml:695) renames one ident for each NAMED arrow and
+  // then goes on into the RESULT.  So a functor binding written inside another
+  // module is worth, at every level of the cascade its container is renamed
+  // by, its arrows plus everything its result signature BINDS -- flat, one
+  // apiece, since a functor's result is never strengthened and the cascade
+  // below the arrow starts over.  A `()` arrow binds nothing to rename, and an
+  // ANONYMOUS one is skipped (`Named(None, _)`, subst.ml:692); a body the
+  // parsetree cannot read -- a path, an application -- is worth nothing here.
+  static bool fcas_off() {
+    static const bool off = dbg_env("NOFUNDEPTH") != nullptr;
+    return off;
+  }
+  static long long fcas(const ModuleExpr& m) {
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      long long k = fcas(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->name.txt) ++k;
+      return k;
+    }
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) k += ren_str_item(it, Sibs{});
+      return k;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return ren_mty(*c->mt);
+    return 0;
+  }
+
   // ---- WHAT A GENERALIZED OPEN LEAVES BEHIND ------------------------------
   // `open struct .. end` HIDES what it binds, so nothing the structure keeps
   // may name it: `Signature_names.simplify` (typemod.ml:1465) runs
@@ -25633,8 +25663,21 @@ struct Count {
   // are left with is the one rename `Env.enter_signature` made of them.
   const std::set<std::string>* tof_sh_ = nullptr;
   bool tof_all_ = false;
+  // A signature may DECLARE ONE VALUE NAME TWICE, and the second declaration
+  // shadows the first: `Signature_names.simplify` (typemod.ml:1465) drops the
+  // one it replaces, so only the survivor is left to be renamed when the
+  // signature is BOUND.  The repeat is therefore worth its translation alone,
+  // one ident, whatever weight the level gives a fresh name.
+  static bool vdup_off() {
+    static const bool off = dbg_env("NOSIGDUP") != nullptr;
+    return off;
+  }
+  std::set<std::string>* vseen_ = nullptr;
   void sig_items(const Signature& s, const Lvl& l) {
     auto tk = tmark();
+    std::set<std::string> vs;
+    std::set<std::string>* vsv = vseen_;
+    vseen_ = &vs;
     for (std::size_t i = 0; i < s.size(); ++i) {
       std::set<std::string> sh;
       bool all = false;
@@ -25654,6 +25697,7 @@ struct Count {
       tof_sh_ = sv;
       tof_all_ = sa;
     }
+    vseen_ = vsv;
     trelease(tk);
   }
   void sig_item(const SignatureItem& it, const Lvl& l) {
@@ -25661,7 +25705,12 @@ struct Count {
     if (std::holds_alternative<Psig_value>(it.desc) ||
         std::holds_alternative<Psig_primitive>(it.desc) ||
         std::holds_alternative<Psig_modsubst>(it.desc)) {
-      n += per;
+      const std::string* vn = nullptr;
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) vn = &v->vd.name.txt;
+      else if (auto* p = std::get_if<Psig_primitive>(&it.desc))
+        vn = &p->pd.name.txt;
+      bool vdup = !vdup_off() && vn && vseen_ && !vseen_->insert(*vn).second;
+      n += vdup ? 1 : per;
       if (auto* v = std::get_if<Psig_value>(&it.desc)) ty_app(*v->vd.type);
       else if (auto* p = std::get_if<Psig_primitive>(&it.desc))
         if (p->pd.type) ty_app(*p->pd.type);
@@ -25769,7 +25818,11 @@ struct Count {
       bind(v->vd.name.txt);
       if (saved_ && !packty_off()) n += pack_ty(*v->vd.type);
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
-      mexpr(m->binding.expr, depth_off() ? Lvl{1, 1, 0, true} : sub(l));
+      const Lvl ml = depth_off() ? Lvl{1, 1, 0, true} : sub(l);
+      if (!fcas_off() && ml.a > 1 &&
+          std::holds_alternative<Pmod_functor>(m->binding.expr.desc))
+        n += (ml.a - 1) * fcas(m->binding.expr);
+      mexpr(m->binding.expr, ml);
       if (m->binding.name.txt) ++n;
       mbind(m->binding);
       n += lal_bind(m->binding);
