@@ -20419,6 +20419,10 @@ bool inh_off() {
   static const bool off = dbg_env("NOINHERIT") != nullptr;
   return off;
 }
+bool packty_off() {
+  static const bool off = dbg_env("NOPACKTY") != nullptr;
+  return off;
+}
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
@@ -21722,6 +21726,158 @@ struct Count {
   void release(std::size_t m) {
     while (added.size() > m) { vals[added.back()]--; added.pop_back(); }
   }
+  // ---- PACKAGE TYPES ------------------------------------------------------
+  // `(module S)` is not a type the checker can leave alone: a package type
+  // costs TWO idents wherever it lands in a signature that is SAVED, and one
+  // more for each `with type` constraint on it.  A package type written in an
+  // EXPRESSION constraint -- `(e : (module S))`, and `(module M : S)`, which
+  // is one of those -- costs the same again, saved or not.  A PATTERN
+  // annotation, an unpack pattern's own `: S` included, costs nothing of its
+  // own: what it costs is what it puts in the binding's type.  And a binding
+  // the file goes on to SHADOW is in no signature at all and costs nothing,
+  // so the value half of this is held back to the end of the structure and
+  // keyed by name.
+  // NOTE: these are the parts of the law that are EXACT; several positions
+  // cost MORE (a `let x : t = e` annotation is three times over, a second
+  // package unified with a first one more), and those are deliberately left
+  // as under-counts.
+  bool saved_ = true;
+  std::vector<std::map<std::string, long long>> pkf_;
+  void pk_push() { pkf_.emplace_back(); }
+  void pk_pop() {
+    if (pkf_.empty()) return;
+    for (auto& e : pkf_.back()) n += e.second;
+    pkf_.pop_back();
+  }
+  // A LATER binding of the same name replaces this one in the signature.
+  void pk_bind(const std::string& nm, long long k) {
+    if (pkf_.empty()) pkf_.emplace_back();
+    pkf_.back()[nm] = k;
+  }
+  static const std::string* pk_name(const Pattern& p) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) return &v->name.txt;
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pk_name(*c->p);
+    return nullptr;
+  }
+  static long long pack_pkg(const Ptyp_package& p) {
+    long long k = 2 + (long long)p.constraints.size();
+    for (auto& c : p.constraints) k += pack_ty(*c.second);
+    return k;
+  }
+  static long long pack_ty(const CoreType& t) {
+    if (auto* p = std::get_if<Ptyp_package>(&t.desc)) return pack_pkg(*p);
+    long long k = 0;
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc))
+      k = pack_ty(*a->dom) + pack_ty(*a->cod);
+    else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc))
+      for (auto& e : u->elems) k += pack_ty(*e);
+    else if (auto* c = std::get_if<Ptyp_constr>(&t.desc))
+      for (auto& a : c->args) k += pack_ty(*a);
+    else if (auto* c = std::get_if<Ptyp_class>(&t.desc))
+      for (auto& a : c->args) k += pack_ty(*a);
+    else if (auto* v = std::get_if<Ptyp_variant>(&t.desc))
+      for (auto& r : v->rows) {
+        if (auto* g = std::get_if<Rtag>(&r))
+          for (auto& e : g->types) k += pack_ty(*e);
+        else if (auto* i = std::get_if<Rinherit>(&r))
+          k += pack_ty(*i->ct);
+      }
+    else if (auto* o = std::get_if<Ptyp_object>(&t.desc))
+      for (auto& f : o->fields) {
+        if (auto* g = std::get_if<Otag>(&f)) k += pack_ty(*g->type);
+        else if (auto* i = std::get_if<Oinherit>(&f)) k += pack_ty(*i->type);
+      }
+    else if (auto* a = std::get_if<Ptyp_alias>(&t.desc))
+      k = pack_ty(*a->type);
+    else if (auto* p = std::get_if<Ptyp_poly>(&t.desc))
+      k = pack_ty(*p->type);
+    else if (auto* p = std::get_if<Ptyp_open>(&t.desc))
+      k = pack_ty(*p->type);
+    // The PARAMETER of a `(module M : T) -> t` is left alone: it is a functor
+    // type, not a package one, and its law has not been measured.
+    else if (auto* f = std::get_if<Ptyp_functor>(&t.desc))
+      k = pack_ty(*f->body);
+    return k;
+  }
+  // How many package types a written type spans, ignoring their constraints.
+  static long long pack_nodes(const CoreType& t) {
+    if (std::holds_alternative<Ptyp_package>(t.desc)) return 1;
+    long long k = 0;
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc))
+      k = pack_nodes(*a->dom) + pack_nodes(*a->cod);
+    else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc))
+      for (auto& e : u->elems) k += pack_nodes(*e);
+    else if (auto* c = std::get_if<Ptyp_constr>(&t.desc))
+      for (auto& a : c->args) k += pack_nodes(*a);
+    else if (auto* a = std::get_if<Ptyp_alias>(&t.desc))
+      k = pack_nodes(*a->type);
+    else if (auto* p = std::get_if<Ptyp_open>(&t.desc))
+      k = pack_nodes(*p->type);
+    return k;
+  }
+  // `let x : t = e` -- a MONOMORPHIC binding annotation -- names every package
+  // type of `t` THREE times over, whether the binding is saved or not; a
+  // POLYMORPHIC one (`let x : 'a. t = e`) names it once and is left alone.
+  static long long pack_vc(const ValueBinding& b) {
+    if (!b.constraint_) return 0;
+    auto* c = std::get_if<Pvc_constraint>(&*b.constraint_);
+    if (!c || !c->univars.empty()) return 0;
+    if (auto* p = std::get_if<Ptyp_poly>(&c->typ->desc))
+      if (!p->vars.empty()) return 0;
+    return 6 * pack_nodes(*c->typ);
+  }
+  long long pack_decl(const TypeDeclaration& d) const {
+    long long k = d.manifest ? pack_ty(**d.manifest) : 0;
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind))
+      for (auto& c : v->ctors) k += pack_args(c.args, c.res);
+    else if (auto* r = std::get_if<Ptype_record>(&d.kind))
+      for (auto& f : r->fields) k += pack_ty(*f.type);
+    return k;
+  }
+  static long long pack_args(const ConstructorArguments& a,
+                             const std::optional<CoreTypeBox>& res) {
+    long long k = res ? pack_ty(**res) : 0;
+    if (auto* t = std::get_if<Pcstr_tuple>(&a))
+      for (auto& e : t->elems) k += pack_ty(*e);
+    else if (auto* r = std::get_if<Pcstr_record>(&a))
+      for (auto& f : r->fields) k += pack_ty(*f.type);
+    return k;
+  }
+  static long long pack_ext(const ExtensionConstructor& c) {
+    if (auto* d = std::get_if<Pext_decl>(&c.kind))
+      return pack_args(d->args, d->res);
+    return 0;
+  }
+  // What a value binding puts in the enclosing signature: the annotations on
+  // its own pattern and on the parameters and result of the function it binds.
+  static long long pack_pat_ann(const Pattern& p) {
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc))
+      return pack_ty(*c->t) + pack_pat_ann(*c->p);
+    if (auto* u = std::get_if<Ppat_unpack>(&p.desc))
+      return u->pkg ? pack_pkg(*u->pkg) : 0;
+    return 0;
+  }
+  static long long pack_vb(const ValueBinding& b) {
+    long long k = pack_pat_ann(b.pat);
+    if (b.constraint_)
+      if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
+        k += pack_ty(*c->typ);
+    const Expression* e = b.expr.get();
+    for (int d = 0; d < 64; ++d) {
+      auto* f = std::get_if<Pexp_function>(&e->desc);
+      if (!f) break;
+      for (auto& pm : f->params)
+        if (auto* v = std::get_if<Pparam_val>(&pm.desc))
+          k += pack_pat_ann(v->pat);
+      if (f->constraint_)
+        if (auto* c = std::get_if<Pconstraint>(&*f->constraint_))
+          k += pack_ty(*c->type);
+      auto* bd = std::get_if<Pfunction_body>(&f->body->v);
+      if (!bd) break;
+      e = bd->e.get();
+    }
+    return k;
+  }
   // ---- what an `inherit` BRINGS IN ---------------------------------------
   // `class_field`'s `Pcf_inherit` arm walks the parent's class signature:
   // every instance VARIABLE of it goes through `enter_val`, exactly as a `val`
@@ -22931,6 +23087,11 @@ struct Count {
   void fn(const Pexp_function& f) {
     auto m = mark();
     std::vector<std::string> nm;
+    // A function's RESULT constraint names every package type of it TWICE
+    // over, saved or not.  A PARAMETER's costs only what it puts in the type.
+    if (f.constraint_ && !packty_off())
+      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_))
+        n += 4 * pack_nodes(*c->type);
     for (auto& pm : f.params) {
       auto* pv = std::get_if<Pparam_val>(&pm.desc);
       if (!pv) { ++n; continue; }  // (type a)
@@ -23081,6 +23242,7 @@ struct Count {
       expr(*s->e1); expr(*s->e2);
     } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
       expr(*c->e);
+      if (!packty_off()) n += pack_ty(*c->t);
     } else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) {
       expr(*c->e);
     } else if (auto* f = std::get_if<Pexp_field>(&e.desc)) {
@@ -23118,8 +23280,11 @@ struct Count {
       auto ck = cmark();
       auto ctk = ctmark();
       bool ie = inexpr_;
+      bool sv = saved_;
       inexpr_ = true;
+      saved_ = false;
       item(*s->item);
+      saved_ = sv;
       inexpr_ = ie;
       expr(*s->body);
       release(m);
@@ -23136,6 +23301,7 @@ struct Count {
       expr(*s->obj);
     } else if (auto* p = std::get_if<Pexp_pack>(&e.desc)) {
       mexpr(*p->me);
+      if (p->pkg && !packty_off()) n += pack_pkg(*p->pkg);
     } else if (auto* l = std::get_if<Pexp_letop>(&e.desc)) {
       auto m = mark();
       std::vector<std::string> nm;
@@ -24572,9 +24738,14 @@ struct Count {
       auto ok = omark();
       auto ck = cmark();
       auto ctk = ctmark();
+      bool sv = saved_;
+      saved_ = saved;
+      pk_push();
       ++sdepth_;
       for (auto& it : st->items) item(it, l);
       --sdepth_;
+      pk_pop();
+      saved_ = sv;
       release(k);
       mrelease(mk);
       erelease(ek);
@@ -24688,10 +24859,20 @@ struct Count {
         std::holds_alternative<Psig_primitive>(it.desc) ||
         std::holds_alternative<Psig_modsubst>(it.desc)) {
       n += per;
+      if (saved_ && !packty_off()) {
+        if (auto* v = std::get_if<Psig_value>(&it.desc))
+          n += pack_ty(*v->vd.type);
+        else if (auto* p = std::get_if<Psig_primitive>(&it.desc))
+          if (p->pd.type) n += pack_ty(*p->pd.type);
+      }
     } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
       type_decls(t->decls, per);
+      if (saved_ && !packty_off())
+        for (auto& d : t->decls) n += pack_decl(d);
     } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
       type_decls(t->decls, per);
+      if (saved_ && !packty_off())
+        for (auto& d : t->decls) n += pack_decl(d);
     // An EXTENSION CONSTRUCTOR is a signature item of its own -- `Sig_typext`
     // carries one ident per constructor, and an `exception` is one of them --
     // so the cascade renames it at the level's weight exactly as it renames a
@@ -24701,9 +24882,12 @@ struct Count {
     } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
       if (!sigext_off()) n += (per - 1) * (long long)x->ext.ctors.size();
       for (auto& c : x->ext.ctors) ext_ctor(c);
+      if (saved_ && !packty_off())
+        for (auto& c : x->ext.ctors) n += pack_ext(c);
     } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
       if (!sigext_off()) n += per - 1;
       ext_ctor(e->exn.ctor);
+      if (saved_ && !packty_off()) n += pack_ext(e->exn.ctor);
     } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
       n += per;
       mty(*m->md.type, sub(l));
@@ -24750,20 +24934,34 @@ struct Count {
       expr(*e->e);
     } else if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
       bindings(v->rf, v->bindings);
+      if (!packty_off()) {
+        for (auto& b : v->bindings) n += pack_vc(b);
+        if (saved_)
+          for (auto& b : v->bindings)
+            if (const std::string* nm = pk_name(b.pat))
+              pk_bind(*nm, pack_vb(b));
+      }
     } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
       reg_ctors(t->decls);
       type_decls(t->decls, 1);
+      if (saved_ && !packty_off())
+        for (auto& d : t->decls) n += pack_decl(d);
     } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
       for (auto& c : x->ext.ctors) { reg_ext(c); ext_ctor(c); }
+      if (saved_ && !packty_off())
+        for (auto& c : x->ext.ctors) n += pack_ext(c);
     } else if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
       reg_ext(e->exn.ctor);
       ext_ctor(e->exn.ctor);
+      if (saved_ && !packty_off()) n += pack_ext(e->exn.ctor);
     } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
       ++n;
       bind(p->prim.name.txt);
+      if (saved_ && !packty_off() && p->prim.type) n += pack_ty(*p->prim.type);
     } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
       ++n;
       bind(v->vd.name.txt);
+      if (saved_ && !packty_off()) n += pack_ty(*v->vd.type);
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
       mexpr(m->binding.expr, depth_off() ? Lvl{1, 1, 0, true} : sub(l));
       if (m->binding.name.txt) ++n;
@@ -24852,7 +25050,9 @@ int typing_ident_count(const ast::Structure& s) {
   }
   stampcount::Count c;
   c.used_ = &used;
+  c.pk_push();
   for (auto& it : s) c.item(it);
+  c.pk_pop();
   long long k = c.n;
   if (!dbg_env("NOUNITLOAD"))
     k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
