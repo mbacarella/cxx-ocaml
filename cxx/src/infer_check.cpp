@@ -22652,27 +22652,37 @@ struct Count {
   // another unit, a constraint naming an item we cannot find -- is charged
   // nothing, which is what the checker did before this rule.
   long long with_node(const Pmty_with& w, const Lvl& l) const {
+    long long k = 0, land = 0;
+    if (!with_split(w, l, false, k, land)) return 0;
+    return k + land;
+  }
+  // The two halves of it: what the CONSTRAINTS cost, and what the merged
+  // signature costs where it LANDS.  `flat` asks for the landing a pass that
+  // saves nothing pays -- `Mtype.freshen` alone, one ident per item.
+  bool with_split(const Pmty_with& w, const Lvl& l, bool flat, long long& kout,
+                  long long& land) const {
+    kout = land = 0;
     const Signature* sg = mty_sig(w.mt.get());
-    if (!sg) return 0;
+    if (!sg) return false;
     Gone g;
     for (const ModuleType* p = w.mt.get();;) {
       auto* q = std::get_if<Pmty_with>(&p->desc);
       if (!q) break;
       for (auto& c : q->constraints) {
         Wc x;
-        if (!wc_parts(c, x)) return 0;
+        if (!wc_parts(c, x)) return false;
         if (x.destr) g.push_back(x.path);
       }
       p = q->mt.get();
     }
-    const bool lit = std::holds_alternative<Pmty_signature>(w.mt->desc);
+    const bool lit = flat || std::holds_alternative<Pmty_signature>(w.mt->desc);
     long long k = 0, rows = 0, roww = 0;
     for (auto& c : w.constraints) {
       Wc x;
-      if (!wc_parts(c, x) || x.path.empty()) return 0;
+      if (!wc_parts(c, x) || x.path.empty()) return false;
       Lvl tl;
       const Signature* tg = w_target(*sg, x.path, l, tl);
-      if (!tg || !w_has(*tg, x.path.back())) return 0;
+      if (!tg || !w_has(*tg, x.path.back())) return false;
       if (x.td) {
         ++k;
         if (is_fixed(*x.td)) { ++k; ++rows; roww += tl.a; }
@@ -22683,7 +22693,9 @@ struct Count {
         k += w_ren(*sg, g) + rows;
       }
     }
-    return k + (lit ? w_ren(*sg, g) + rows : w_wt(*sg, l, g) + roww);
+    kout = k;
+    land = lit ? w_ren(*sg, g) + rows : w_wt(*sg, l, g) + roww;
+    return true;
   }
   // --- A `with` OVER ANOTHER UNIT'S MODULE TYPE ------------------------
   // `Map.S with type key = int` resolves to no module type of this file, so
@@ -23845,7 +23857,92 @@ struct Count {
     return k;
   }
 
-  // `module rec` unrolls its own inclusion check, and the unrolling is
+  // ---- WHAT A `with` COSTS A SECOND TIME UNDER A `module rec` -------------
+  // `transl_recmodule_modtypes` (typemod.ml:2007) runs `transition` TWICE, so
+  // a declared module type is translated one more time than it is saved, and
+  // in a STRUCTURE the base case substitutes the result once more on top of
+  // that.  `ren_mty` walks a `with` to its BASE and so sees nothing of the
+  // merged signature in either walk: `wpass_mty` is what one more
+  // `transl_modtype` pass over it costs -- `Mtype.freshen` over the merged
+  // signature and the constraints' own renames, exactly the pair a LITERAL
+  // base pays -- and `wsub_mty` is `ren_mty` with that signature put back.
+  static bool recwith_off() {
+    static const bool off = dbg_env("NORECWITH") != nullptr;
+    return off;
+  }
+  long long wpass_mty(const ModuleType& mt) const {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += wpass_sig_item(it);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = wpass_mty(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        k += wpass_mty(*nm->type);
+      return k;
+    }
+    // Every node of a `with`-CHAIN is translated again, the inner ones with it.
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
+      long long k = 0, land = 0, base = wpass_mty(*w->mt);
+      if (!with_split(*w, Lvl{}, true, k, land)) return base;
+      return base + k + land;
+    }
+    return 0;
+  }
+  long long wpass_sig_item(const SignatureItem& it) const {
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return wpass_mty(*m->md.type);
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += wpass_mty(*d.type);
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return m->type ? wpass_mty(*m->type) : 0;
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return wpass_mty(m->type);
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) return wpass_mty(i->mt);
+    return 0;
+  }
+  long long wsub_mty(const ModuleType& mt) const {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += wsub_sig_item(it);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = wsub_mty(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+        if (nm->name.txt) ++k;
+        k += wsub_mty(*nm->type);
+      }
+      return k;
+    }
+    // However long the chain, what it leaves is the ONE merged signature.
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
+      long long k = 0, land = 0;
+      if (!with_split(*w, Lvl{}, true, k, land)) return wsub_mty(*w->mt);
+      return land;
+    }
+    return 0;
+  }
+  long long wsub_sig_item(const SignatureItem& it) const {
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return 1 + wsub_mty(*m->md.type);
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += 1 + wsub_mty(*d.type);
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return 1 + (m->type ? wsub_mty(*m->type) : 0);
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return 1 + wsub_mty(m->type);
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) return wsub_mty(i->mt);
+    return ren_sig_item(it);
+  }
+
   // QUADRATIC: `check_recmodule_inclusion` (typemod.ml:2182) runs one round per
   // binding and each round names a fresh Y_i for EVERY binding, while
   // `transl_recmodule_modtypes` approximates every binding in an environment
@@ -23854,7 +23951,7 @@ struct Count {
   // binding's DECLARED signature is walked three times over (`approx_modtype`,
   // which reaches only the declarations, the second `transl_modtype` pass, and
   // the base case's `Subst.modtype`) and its ACTUAL one once per round.
-  static long long recmodule_extra(const Pstr_recmodule& rm) {
+  long long recmodule_extra(const Pstr_recmodule& rm) const {
     if (dbg_env("NORECMOD")) return 0;
     long long nb = (long long)rm.bindings.size(), named = 0;
     Sibs sib;
@@ -23873,7 +23970,9 @@ struct Count {
       auto* c = std::get_if<Pmod_constraint>(&b.expr.desc);
       if (!c) continue;
       long long rounds = b.name.txt ? nb : 1;
-      k += 2 * ren_mty(*c->mt) + ctl_mty(*c->mt) + dec_mty(*c->mt) +
+      long long pass = ren_mty(*c->mt), sub = pass;
+      if (!recwith_off()) { pass += wpass_mty(*c->mt); sub = wsub_mty(*c->mt); }
+      k += pass + sub + ctl_mty(*c->mt) + dec_mty(*c->mt) +
            rounds * ren_mexpr(*c->me, sib);
     }
     return k;
@@ -23882,14 +23981,17 @@ struct Count {
   // A `module rec` in a SIGNATURE never reaches the inclusion check, so it pays
   // only what `transl_recmodule_modtypes` costs: the n^2 unbound modules, the
   // approximation of each declaration, and the one extra `transl_modtype` pass.
-  static long long recmodule_sig_extra(const Psig_recmodule& rm) {
+  long long recmodule_sig_extra(const Psig_recmodule& rm) const {
     if (dbg_env("NORECMOD")) return 0;
     long long nb = (long long)rm.decls.size(), named = 0;
     for (auto& d : rm.decls)
       if (d.name.txt) ++named;
     long long k = nb * named;
-    for (auto& d : rm.decls)
-      k += ren_mty(*d.type) + ctl_mty(*d.type) + dec_mty(*d.type);
+    for (auto& d : rm.decls) {
+      long long pass = ren_mty(*d.type);
+      if (!recwith_off()) pass += wpass_mty(*d.type);
+      k += pass + ctl_mty(*d.type) + dec_mty(*d.type);
+    }
     return k;
   }
 
