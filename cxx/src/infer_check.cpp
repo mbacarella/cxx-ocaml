@@ -25055,7 +25055,10 @@ struct Count {
       // What an ascribed module SAVES is the ascription, so that is what the
       // renames below it reach; the structure behind it is typed once.
       mexpr(*c->me, Lvl{1, 1, 0, true}, false);
+      MtCtx sv = mtctx_;
+      mtctx_ = MtCtx::Ascr;
       mty(*c->mt, depth_off() ? Lvl{1, 1, 0, true} : l, true);
+      mtctx_ = sv;
     // An APPLICATION's argument is a module of its own: what the
     // application leaves in the structure is the functor's RESULT, so the
     // argument is typed where it stands and none of the renames below the
@@ -25100,8 +25103,20 @@ struct Count {
     static const bool off = dbg_env("NOMTYFUN") != nullptr;
     return off;
   }
-  // Whether the module type being walked is one this file DECLARES.
-  bool mtdecl_ = false;
+  // An ASCRIPTION declares nothing, so `transl_modtype` never writes the
+  // parameter out a second time.  What the parameter does get is the cascade
+  // of renames the signature it stands in gets: a NAMED parameter is an ident
+  // bound there like any other, worth `l.a` where `fparam` charges one, and an
+  // ANONYMOUS one binds nothing to rename and is worth a flat one -- which is
+  // the one `fparam` does not charge, there being no name.
+  static bool ascrfun_off() {
+    static const bool off = dbg_env("NOASCRFUN") != nullptr;
+    return off;
+  }
+  // Which module type the walk is inside: one this file DECLARES, one a
+  // module is ASCRIBED, or neither.
+  enum class MtCtx { Other, Decl, Ascr };
+  MtCtx mtctx_ = MtCtx::Other;
   long long par_items(const ModuleType& pt) const {
     if (std::holds_alternative<Pmty_signature>(pt.desc)) return ren_mty(pt);
     if (!std::holds_alternative<Pmty_with>(pt.desc)) return 0;
@@ -25123,9 +25138,14 @@ struct Count {
     return w_ren(*sg, g);
   }
   long long mtfun_wt(const Pmty_functor& f, const Lvl& l) const {
-    if (!mtdecl_ || mtfun_off()) return 0;
+    if (mtctx_ == MtCtx::Other) return 0;
     auto* nm = std::get_if<Functor_named>(&f.param);
-    if (!nm || !nm->name.txt || !nm->type) return 0;
+    if (!nm || !nm->type) return 0;
+    // A `let module M : S = ..` inside an EXPRESSION is renamed by nothing at
+    // all, so there is no cascade for the parameter to be caught in.
+    if (mtctx_ == MtCtx::Ascr)
+      return ascrfun_off() || inexpr_ ? 0 : (nm->name.txt ? l.a - 1 : 1);
+    if (!nm->name.txt || mtfun_off()) return 0;
     return l.a + 1 + par_items(*nm->type);
   }
   // A functor parameter's signature is BOUND into the environment, so each of
@@ -25133,10 +25153,10 @@ struct Count {
   void fparam(const FunctorParam& p, const Lvl& l) {
     auto* nm = std::get_if<Functor_named>(&p);
     if (!nm) return;
-    bool sv = mtdecl_;
-    mtdecl_ = false;
+    MtCtx sv = mtctx_;
+    mtctx_ = MtCtx::Other;
     mty(*nm->type, Lvl{l.a + 1, l.u, l.depth + 1, true}, true);
-    mtdecl_ = sv;
+    mtctx_ = sv;
     if (nm->name.txt) ++n;
   }
   void mty(const ModuleType& mt, const Lvl& l, bool bind = false) {
@@ -25157,10 +25177,10 @@ struct Count {
       if (!with_off()) n += with_node(*w, l);
       if (!xwith_off()) n += xwith_node(*w, l);
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
-      bool sv = mtdecl_;
-      mtdecl_ = false;
+      MtCtx sv = mtctx_;
+      mtctx_ = MtCtx::Other;
       mexpr(*t->me);
-      mtdecl_ = sv;
+      mtctx_ = sv;
       if (!tof_off() && !tof_all_)
         n += tof_wt(*t->me, l, tof_sh_) -
              tof_wt(*t->me, flat(), tof_sh_);
@@ -25321,10 +25341,10 @@ struct Count {
       n += recmodule_extra(*m);
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
       if (m->type) {
-        bool sv = mtdecl_;
-        mtdecl_ = true;
+        MtCtx sv = mtctx_;
+        mtctx_ = MtCtx::Decl;
         mty(*m->type, mtd(l));
-        mtdecl_ = sv;
+        mtctx_ = sv;
       }
       ++n;
       tbind(m->name.txt, m->type ? &*m->type : nullptr);
