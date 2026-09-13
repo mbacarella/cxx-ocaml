@@ -20399,6 +20399,10 @@ bool tof_off() {
   static const bool off = dbg_env("NOTYPEOF") != nullptr;
   return off;
 }
+bool gopen_off() {
+  static const bool off = dbg_env("NOGOPEN") != nullptr;
+  return off;
+}
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
@@ -24548,9 +24552,18 @@ struct Count {
         for (auto& s : nm) bind(s);
       }
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
-      mexpr(o->expr, Lvl{1, 1, 0, true}, false);
+      // A GENERALIZED open -- one whose expression is not a PATH -- ends in
+      // `Env.enter_signature` (typemod.ml:2791), which SUBSTITUTES the whole
+      // signature it brings in: `Subst` recurses, so every item a submodule or
+      // a module type of it spans is renamed too, not just the top ones
+      // `exports` counts.  And what it opens is not SAVED, so the S441 cascade
+      // never reaches it: the items are typed FLAT, one apiece at every depth.
+      // `open M` of a path enters no signature and pays neither.
+      bool gen =
+          !gopen_off() && !std::holds_alternative<Pmod_ident>(o->expr.desc);
+      mexpr(o->expr, gen ? flat() : Lvl{1, 1, 0, true}, false);
       reg_open(o->expr);
-      n += exports(o->expr);
+      n += gen ? ren_mexpr(o->expr, Sibs{}) : exports(o->expr);
     // A class costs three idents before anything of it is read:
     // `type_classes` (typeclass.ml:1897) creates the class, its class type
     // and its object type in one go, for a declaration and a description
