@@ -23636,7 +23636,21 @@ struct Count {
   // declaration of the sibling it names -- there is nothing else in scope a
   // recursive group can be defined by that we can read.
   using Sibs = std::map<std::string, const ModuleType*>;
+  static bool recfun_off() {
+    static const bool off = dbg_env("NORECFUN") != nullptr;
+    return off;
+  }
   static long long ren_mexpr(const ModuleExpr& m, const Sibs& sib) {
+    // A FUNCTOR's own type is a functor: `Subst.modtype` renames its parameter
+    // and everything the parameter's and the body's signatures hold.  The
+    // parameter is renamed even when the source left it ANONYMOUS, since
+    // `Mtype.strengthen` (mtype.ml:54) names it `Arg` on the way past.
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc); f && !recfun_off()) {
+      long long k = rfun_body(*f->body, sib);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        k += 1 + ren_mty(*nm->type);
+      return k;
+    }
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       long long k = 0;
       for (auto& it : st->items) k += ren_str_item(it, sib);
@@ -23650,6 +23664,21 @@ struct Count {
       }
     }
     return 0;
+  }
+  // What one more pass renames of a functor's RESULT: the result signature is
+  // renamed one level deep, so a SUBMODULE of it is renamed itself while what
+  // the submodule holds is not.  A module TYPE declaration is not a module and
+  // is renamed whole, as everywhere else.
+  static long long rfun_body(const ModuleExpr& m, const Sibs& sib) {
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items)
+        k += std::holds_alternative<Pstr_module>(it.desc)
+                 ? 1
+                 : ren_str_item(it, sib);
+      return k;
+    }
+    return ren_mexpr(m, sib);
   }
   static long long ren_str_item(const StructureItem& it, const Sibs& sib) {
     if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
@@ -23943,6 +23972,99 @@ struct Count {
     return ren_sig_item(it);
   }
 
+  // ---- WHAT A FUNCTOR PARAMETER COSTS UNDER A `module rec` ----------------
+  // A binding whose DECLARED type is a functor pays one more walk over its
+  // PARAMETERS alone: `Includemod.functor_param` (includemod.ml:659)
+  // substitutes the declared parameter's signature (`Subst.modtype Keep
+  // subst arg2`) before it compares that signature with the actual one, and
+  // the arrow itself is named once over -- whether the source named the
+  // parameter, left it `_`, or wrote `()` for it.  The walk reaches the
+  // arrows a signature ITEM holds as well as the ones the type wears itself.
+  static long long rfun_sig_item(const SignatureItem& it) {
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return rfun_mty(*m->md.type);
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += rfun_mty(*d.type);
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return m->type ? rfun_mty(*m->type) : 0;
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return rfun_mty(m->type);
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) return rfun_mty(i->mt);
+    return 0;
+  }
+  static long long rfun_mty(const ModuleType& mt) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += rfun_sig_item(it);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = 1 + rfun_mty(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        k += ren_mty(*nm->type);
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return rfun_mty(*w->mt);
+    return 0;
+  }
+
+  // ---- WHAT APPLYING A SIBLING COSTS -------------------------------------
+  // `module M = R (..)` where R is another binding of the same `module rec`
+  // lands R's DECLARED result where M stands, and that signature is renamed
+  // with the binding's own -- once per round and once more for the base case.
+  // Only the result's own items are reached: what a submodule of it holds is
+  // renamed no further, exactly as for a functor's result read from a body.
+  static const ModuleType* sib_result(const ModuleExpr& m, const Sibs& sib) {
+    long long args = 0;
+    const ModuleExpr* h = &m;
+    for (;;) {
+      if (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+        ++args;
+        h = a->f.get();
+      } else if (auto* a = std::get_if<Pmod_apply_unit>(&h->desc)) {
+        ++args;
+        h = a->f.get();
+      } else {
+        break;
+      }
+    }
+    if (args == 0) return nullptr;
+    auto* i = std::get_if<Pmod_ident>(&h->desc);
+    if (!i) return nullptr;
+    auto* l = std::get_if<Lident>(&i->id.txt.v);
+    if (!l) return nullptr;
+    auto s = sib.find(l->name);
+    if (s == sib.end() || !s->second) return nullptr;
+    const ModuleType* mt = s->second;
+    for (long long k = 0; k < args; ++k) {
+      auto* fn = std::get_if<Pmty_functor>(&mt->desc);
+      if (!fn) return nullptr;
+      mt = fn->body.get();
+    }
+    return mt;
+  }
+  static long long sibapp(const ModuleExpr& m, const Sibs& sib) {
+    if (auto* fn = std::get_if<Pmod_functor>(&m.desc))
+      return sibapp(*fn->body, sib);
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st) return 0;
+    long long k = 0;
+    for (auto& it : st->items) {
+      auto* mb = std::get_if<Pstr_module>(&it.desc);
+      if (!mb) continue;
+      const ModuleType* r = sib_result(mb->binding.expr, sib);
+      if (!r) continue;
+      auto* sg = std::get_if<Pmty_signature>(&r->desc);
+      if (!sg) continue;
+      for (auto& x : sg->items)
+        k += std::holds_alternative<Psig_module>(x.desc) ? 1 : ren_sig_item(x);
+    }
+    return k;
+  }
+
   // QUADRATIC: `check_recmodule_inclusion` (typemod.ml:2182) runs one round per
   // binding and each round names a fresh Y_i for EVERY binding, while
   // `transl_recmodule_modtypes` approximates every binding in an environment
@@ -23973,6 +24095,8 @@ struct Count {
       long long pass = ren_mty(*c->mt), sub = pass;
       if (!recwith_off()) { pass += wpass_mty(*c->mt); sub = wsub_mty(*c->mt); }
       k += pass + sub + ctl_mty(*c->mt) + dec_mty(*c->mt) +
+           (recfun_off() ? 0 : rfun_mty(*c->mt)) +
+           (recfun_off() ? 0 : (rounds + 1) * sibapp(*c->me, sib)) +
            rounds * ren_mexpr(*c->me, sib);
     }
     return k;
