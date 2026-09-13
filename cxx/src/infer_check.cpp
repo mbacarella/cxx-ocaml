@@ -23670,6 +23670,181 @@ struct Count {
     return 0;
   }
 
+  // ---- WHAT A GENERALIZED OPEN LEAVES BEHIND ------------------------------
+  // `open struct .. end` HIDES what it binds, so nothing the structure keeps
+  // may name it: `Signature_names.simplify` (typemod.ml:1465) runs
+  // `Mtype.nondep_sig_item` over every item that survives.  Rebuilding a
+  // MODULE's or a module TYPE's signature that way ENTERS it (`nondep_sig`,
+  // mtype.ml:247), which renames one ident per item of it -- the nested ones
+  // included, since `Subst` recurses -- and then enters each signature nested
+  // inside it once more again.  A value, a type, an exception and a class are
+  // rebuilt where they stand and name nothing.  Only a hidden item whose kind
+  // CAN APPEAR IN TYPES sets any of this off (`can_appear_in_types`,
+  // shape.ml:130), so an open that binds nothing but values, externals and
+  // exceptions is free.
+  static bool ndopen_off() {
+    static const bool off = dbg_env("NONDEPOPEN") != nullptr;
+    return off;
+  }
+  static long long nd_mty(const ModuleType& mt) {
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += ren_sig_item(it) + nd_sig_item(it);
+      return k;
+    }
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = nd_mty(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        k += nd_mty(*nm->type);
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return nd_mty(*w->mt);
+    return 0;  // a NAMED module type is left exactly as it stands
+  }
+  static long long nd_sig_item(const SignatureItem& it) {
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return nd_mty(*m->md.type);
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& d : m->decls) k += nd_mty(*d.type);
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return m->type ? nd_mty(*m->type) : 0;
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return nd_mty(m->type);
+    // What an `include` brings in are items of the signature it stands in, so
+    // they are entered with it and only their own nesting is charged here.
+    if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+      auto* s = std::get_if<Pmty_signature>(&i->mt.desc);
+      if (!s) return 0;
+      long long k = 0;
+      for (auto& x : s->items) k += nd_sig_item(x);
+      return k;
+    }
+    return 0;
+  }
+  // What `Subst` renames of a module EXPRESSION's signature.  `ren_mexpr`
+  // answers a structure and an ascription; a FUNCTOR renames its parameter's
+  // name and both its parameter's and its body's signatures along with it.
+  static long long nd_ren(const ModuleExpr& m) {
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      long long k = nd_ren(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+        if (nm->name.txt) ++k;
+        k += ren_mty(*nm->type);
+      }
+      return k;
+    }
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) k += nd_ren_str_item(it);
+      return k;
+    }
+    Sibs none;
+    return ren_mexpr(m, none);
+  }
+  static long long nd_ren_str_item(const StructureItem& it) {
+    if (auto* m = std::get_if<Pstr_module>(&it.desc))
+      return 1 + nd_ren(m->binding.expr);
+    if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& b : m->bindings) k += 1 + nd_ren(b.expr);
+      return k;
+    }
+    if (auto* i = std::get_if<Pstr_include>(&it.desc)) return nd_ren(i->expr);
+    Sibs none;
+    return ren_str_item(it, none);
+  }
+  static long long nd_mexpr(const ModuleExpr& m) {
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) k += nd_ren_str_item(it) + nd_str_item(it);
+      return k;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return nd_mty(*c->mt);
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      long long k = nd_mexpr(*f->body);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        k += nd_mty(*nm->type);
+      return k;
+    }
+    return 0;  // an ALIAS and an application are not signatures of their own
+  }
+  static long long nd_str_item(const StructureItem& it) {
+    if (auto* m = std::get_if<Pstr_module>(&it.desc))
+      return nd_mexpr(m->binding.expr);
+    if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& b : m->bindings) k += nd_mexpr(b.expr);
+      return k;
+    }
+    if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
+      return m->type ? nd_mty(*m->type) : 0;
+    if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+      auto* st = std::get_if<Pmod_structure>(&i->expr.desc);
+      if (!st) return 0;
+      long long k = 0;
+      for (auto& x : st->items) k += nd_str_item(x);
+      return k;
+    }
+    return 0;
+  }
+  // Whether what this open binds can appear in a type.
+  bool nd_hides_mty(const ModuleType& mt, int fuel) const {
+    const Signature* sg = fuel > 0 ? mty_sig(&mt, fuel) : nullptr;
+    if (!sg) return false;
+    for (auto& it : *sg) {
+      if (std::holds_alternative<Psig_value>(it.desc) ||
+          std::holds_alternative<Psig_primitive>(it.desc) ||
+          std::holds_alternative<Psig_exception>(it.desc) ||
+          std::holds_alternative<Psig_typext>(it.desc) ||
+          std::holds_alternative<Psig_attribute>(it.desc))
+        continue;
+      if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+        if (nd_hides_mty(i->mt, fuel - 1)) return true;
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+  bool nd_hides(const ModuleExpr& m, int fuel = 8) const {
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return nd_hides_mty(*c->mt, fuel);
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st) return false;  // a path and an application are not ours to read
+    for (auto& it : st->items) {
+      if (std::holds_alternative<Pstr_value>(it.desc) ||
+          std::holds_alternative<Pstr_primitive>(it.desc) ||
+          std::holds_alternative<Pstr_exception>(it.desc) ||
+          std::holds_alternative<Pstr_typext>(it.desc) ||
+          std::holds_alternative<Pstr_eval>(it.desc) ||
+          std::holds_alternative<Pstr_open>(it.desc) ||
+          std::holds_alternative<Pstr_attribute>(it.desc))
+        continue;
+      if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        if (fuel > 0 && nd_hides(i->expr, fuel - 1)) return true;
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+  // The whole charge for one structure: nothing at all unless it holds a
+  // generalized open that hides a kind a type can name.
+  long long nd_open(const std::vector<StructureItem>& items) const {
+    if (ndopen_off()) return 0;
+    bool hides = false;
+    for (auto& it : items)
+      if (auto* o = std::get_if<Pstr_open>(&it.desc))
+        if (nd_hides(o->expr)) { hides = true; break; }
+    if (!hides) return 0;
+    long long k = 0;
+    for (auto& it : items) k += nd_str_item(it);
+    return k;
+  }
+
   // `module rec` unrolls its own inclusion check, and the unrolling is
   // QUADRATIC: `check_recmodule_inclusion` (typemod.ml:2182) runs one round per
   // binding and each round names a fresh Y_i for EVERY binding, while
@@ -25074,6 +25249,7 @@ struct Count {
       for (auto& it : st->items) item(it, l);
       --sdepth_;
       pk_pop();
+      n += nd_open(st->items);
       saved_ = sv;
       release(k);
       mrelease(mk);
@@ -25462,7 +25638,7 @@ int typing_ident_count(const ast::Structure& s) {
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
-  long long k = c.n;
+  long long k = c.n + c.nd_open(s);
   if (!dbg_env("NOUNITLOAD"))
     k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
                 !dbg_env("NOAPPRES"));
