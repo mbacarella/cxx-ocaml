@@ -20415,6 +20415,10 @@ bool patopen_off() {
   static const bool off = dbg_env("NOPATOPEN") != nullptr;
   return off;
 }
+bool inh_off() {
+  static const bool off = dbg_env("NOINHERIT") != nullptr;
+  return off;
+}
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
@@ -21718,6 +21722,119 @@ struct Count {
   void release(std::size_t m) {
     while (added.size() > m) { vals[added.back()]--; added.pop_back(); }
   }
+  // ---- what an `inherit` BRINGS IN ---------------------------------------
+  // `class_field`'s `Pcf_inherit` arm walks the parent's class signature:
+  // every instance VARIABLE of it goes through `enter_val`, exactly as a `val`
+  // written here does and with the same dedup by name, and every CONCRETE
+  // method gets an `Ident.create_local` of its own -- once per `inherit`,
+  // whether or not the class already has a method of that name.  The parent's
+  // methods, virtual ones included, are methods of this class too, so
+  // `class_structure` names them along with the rest.
+  struct Inh {
+    std::set<std::string> concr, meths, vars;
+    bool ok = true;
+  };
+  // The CLASS and CLASS TYPE declarations of this file that are in scope.
+  // Nothing outside it can be read here, and a parent the walk cannot resolve
+  // whole is charged nothing at all.
+  std::unordered_map<std::string, std::vector<const ClassExpr*>> clss;
+  std::vector<std::string> cnames;
+  std::unordered_map<std::string, std::vector<const ClassType*>> cltys;
+  std::vector<std::string> ctnames;
+  std::size_t cmark() const { return cnames.size(); }
+  std::size_t ctmark() const { return ctnames.size(); }
+  void crelease(std::size_t m) {
+    while (cnames.size() > m) {
+      auto it = clss.find(cnames.back());
+      if (it != clss.end() && !it->second.empty()) it->second.pop_back();
+      cnames.pop_back();
+    }
+  }
+  void ctrelease(std::size_t m) {
+    while (ctnames.size() > m) {
+      auto it = cltys.find(ctnames.back());
+      if (it != cltys.end() && !it->second.empty()) it->second.pop_back();
+      ctnames.pop_back();
+    }
+  }
+  void inh_of(const ClassExpr& c, Inh& o, int d = 0) const {
+    if (d > 8) { o.ok = false; return; }
+    if (auto* s = std::get_if<Pcl_structure>(&c.desc)) {
+      for (auto& f : s->cs.fields) {
+        if (auto* i = std::get_if<Pcf_inherit>(&f.desc))
+          inh_of(*i->ce, o, d + 1);
+        else if (auto* v = std::get_if<Pcf_val>(&f.desc))
+          o.vars.insert(v->name.txt);
+        else if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+          o.meths.insert(m->name.txt);
+          if (std::holds_alternative<Cfk_concrete>(m->kind))
+            o.concr.insert(m->name.txt);
+        }
+      }
+      return;
+    }
+    if (auto* f = std::get_if<Pcl_fun>(&c.desc))
+      { inh_of(*f->body, o, d + 1); return; }
+    if (auto* a = std::get_if<Pcl_apply>(&c.desc))
+      { inh_of(*a->ce, o, d + 1); return; }
+    if (auto* l = std::get_if<Pcl_let>(&c.desc))
+      { inh_of(*l->body, o, d + 1); return; }
+    if (auto* p = std::get_if<Pcl_open>(&c.desc))
+      { inh_of(*p->body, o, d + 1); return; }
+    // An ASCRIBED class has the ascription's signature, not the structure's.
+    if (auto* k = std::get_if<Pcl_constraint>(&c.desc))
+      { inh_ct(*k->ct, o, d + 1); return; }
+    if (auto* id = std::get_if<Pcl_constr>(&c.desc)) {
+      if (auto* li = std::get_if<Lident>(&id->id.txt.v)) {
+        auto it = clss.find(li->name);
+        if (it != clss.end() && !it->second.empty()) {
+          inh_of(*it->second.back(), o, d + 1);
+          return;
+        }
+        auto t = cltys.find(li->name);
+        if (t != cltys.end() && !t->second.empty()) {
+          inh_ct(*t->second.back(), o, d + 1);
+          return;
+        }
+      }
+    }
+    o.ok = false;
+  }
+  void inh_ct(const ClassType& t, Inh& o, int d = 0) const {
+    if (d > 8) { o.ok = false; return; }
+    if (auto* s = std::get_if<Pcty_signature>(&t.desc)) {
+      for (auto& f : s->cs.fields) {
+        if (auto* i = std::get_if<Pctf_inherit>(&f.desc))
+          inh_ct(*i->ct, o, d + 1);
+        else if (auto* v = std::get_if<Pctf_val>(&f.desc))
+          o.vars.insert(v->name.txt);
+        else if (auto* m = std::get_if<Pctf_method>(&f.desc)) {
+          o.meths.insert(m->name.txt);
+          if (m->virt == VirtualFlag::Concrete) o.concr.insert(m->name.txt);
+        }
+      }
+      return;
+    }
+    if (auto* a = std::get_if<Pcty_arrow>(&t.desc))
+      { inh_ct(*a->cod, o, d + 1); return; }
+    if (auto* p = std::get_if<Pcty_open>(&t.desc))
+      { inh_ct(*p->body, o, d + 1); return; }
+    if (auto* id = std::get_if<Pcty_constr>(&t.desc)) {
+      if (auto* li = std::get_if<Lident>(&id->id.txt.v)) {
+        auto t2 = cltys.find(li->name);
+        if (t2 != cltys.end() && !t2->second.empty()) {
+          inh_ct(*t2->second.back(), o, d + 1);
+          return;
+        }
+        auto c2 = clss.find(li->name);
+        if (c2 != clss.end() && !c2->second.empty()) {
+          inh_of(*c2->second.back(), o, d + 1);
+          return;
+        }
+      }
+    }
+    o.ok = false;
+  }
   // The MODULE bindings of this file that are in scope, so a functor
   // application can find the functor it names.  Nothing outside the file can
   // be read here -- a `Hashtbl.Make (String)` would need the unit's .cmi -- so
@@ -22873,6 +22990,14 @@ struct Count {
               std::set<std::string>& vals) {
     if (auto* i = std::get_if<Pcf_inherit>(&f.desc)) {
       cexpr(*i->ce);
+      Inh o;
+      if (!inh_off()) inh_of(*i->ce, o);
+      if (o.ok) {
+        for (auto& v : o.vars)
+          if (vals.insert(v).second) { n += 3; bind(v); }
+        for (auto& m : o.meths) meths.insert(m);
+        n += (long long)o.concr.size();
+      }
       if (i->as_) n += 3;
     } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
       if (vals.insert(v->name.txt).second) { n += 3; bind(v->name.txt); }
@@ -22990,6 +23115,8 @@ struct Count {
       auto ek = emark();
       auto tk = tmark();
       auto ok = omark();
+      auto ck = cmark();
+      auto ctk = ctmark();
       bool ie = inexpr_;
       inexpr_ = true;
       item(*s->item);
@@ -22999,6 +23126,8 @@ struct Count {
       erelease(ek);
       trelease(tk);
       orelease(ok);
+      crelease(ck);
+      ctrelease(ctk);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
       expr(*s->obj); expr(*s->value);
     } else if (auto* s = std::get_if<Pexp_setinstvar>(&e.desc)) {
@@ -24441,6 +24570,8 @@ struct Count {
       auto ek = emark();
       auto tk = tmark();
       auto ok = omark();
+      auto ck = cmark();
+      auto ctk = ctmark();
       ++sdepth_;
       for (auto& it : st->items) item(it, l);
       --sdepth_;
@@ -24449,6 +24580,8 @@ struct Count {
       erelease(ek);
       trelease(tk);
       orelease(ok);
+      crelease(ck);
+      ctrelease(ctk);
     } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       // A functor's RESULT is never strengthened (`strengthen_lazy`,
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
@@ -24687,9 +24820,17 @@ struct Count {
     // alike; the class EXPRESSION then pays for its own binders on top.
     } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
       if (cls_off()) return;
+      for (auto& d : c->decls) {
+        clss[d.name.txt].push_back(&d.expr);
+        cnames.push_back(d.name.txt);
+      }
       for (auto& d : c->decls) { n += 3; cexpr(d.expr); }
     } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
       if (cls_off()) return;
+      for (auto& d : c->decls) {
+        cltys[d.name.txt].push_back(&d.expr);
+        ctnames.push_back(d.name.txt);
+      }
       n += 3 * (long long)c->decls.size();
     }
   }
