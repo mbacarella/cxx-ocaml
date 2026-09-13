@@ -20495,6 +20495,16 @@ struct Cites {
     units.insert(m);
   }
   void bind_mod(const StrOptLoc& n) { if (n.txt) local[*n.txt]++; }
+  // Module PATHS the file reads INSIDE: every strict module prefix of a
+  // dotted path, and every module it opens.  Reading a member is what forces
+  // that module's components (see `modforce_cost` below).
+  std::set<std::string> forced;
+  void force_path(const Longident& id) {
+    if (auto* d = std::get_if<Ldot>(&id.v)) {
+      forced.insert(lid_full(*d->prefix));
+      force_path(*d->prefix);
+    }
+  }
   // `module L = List` is an ALIAS: binding it does not force List's
   // signature -- only a later `L.map` does (env.ml's persistent module
   // data is lazy).  Record the target so a use of L can charge it.
@@ -20576,6 +20586,7 @@ struct Cites {
   // `modpos` says the name stands in the module namespace (`open M`), where a
   // bare ident is a module; anywhere else only a DOTTED path names one.
   void cite(const Longident& id, bool modpos) {
+    force_path(id);
     if (auto* a = std::get_if<Lapply>(&id.v)) {
       cite(*a->f, true);
       cite(*a->x, true);
@@ -20642,9 +20653,11 @@ struct Cites {
   // `open Printf` brings its members into scope under their BARE names,
   // so a later `printf "%d"` names one without writing the module.
   bool opened(const Longident& id) {
+    force_path(id);
     if (auto* l = std::get_if<Lident>(&id.v)) {
       std::string ow = opened_owner(l->name);
       if (ow.empty()) {
+        forced.insert(l->name);
         opens.insert(l->name);
         open_stack_.push_back(l->name);
         return false;
@@ -21302,6 +21315,7 @@ struct Cites {
   }
   void mbind(const ModuleBinding& b) {
     auto* i = std::get_if<Pmod_ident>(&b.expr.desc);
+    if (i) force_path(i->id.txt);
     if (i && alias_to(b.name, i->id.txt)) return;
     mexp(b.expr);
   }
@@ -21734,6 +21748,126 @@ struct Cites {
     return k;
   }
 };
+
+// ---- READING INSIDE A MODULE FORCES ITS COMPONENTS -----------------------
+// `Env.components_of_module_maker` (env.ml:2060) substitutes every item of the
+// module a path reaches into, and `Subst.modtype` (subst.ml:695) renames one
+// ident for each NAMED functor ARROW the item's type wears.  The lazy
+// substitution defers a SIGNATURE body but walks an ARROW eagerly, into the
+// parameter as well as the result, so what a force costs is exactly the named
+// arrows of the module's own direct module and module-type items -- flat,
+// once, since the components are cached.  An item bound twice pays for the
+// SURVIVOR alone, an alias (`module G = P`, or anything an `include <path>`
+// brings in) wears no arrow at all, and `()` and anonymous parameters are
+// skipped exactly as `Subst` skips them.
+bool modforce_off() {
+  static const bool off = dbg_env("NOMODFORCE") != nullptr;
+  return off;
+}
+long long nar_mty(const ModuleType& mt, int d = 0) {
+  if (d > 16) return 0;
+  auto* f = std::get_if<Pmty_functor>(&mt.desc);
+  if (!f) return 0;
+  long long k = nar_mty(*f->body, d + 1);
+  if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+    if (nm->name.txt) ++k;
+    if (nm->type) k += nar_mty(*nm->type, d + 1);
+  }
+  return k;
+}
+long long nar_mexpr(const ModuleExpr& m, int d = 0) {
+  if (d > 16) return 0;
+  if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+    long long k = nar_mexpr(*f->body, d + 1);
+    if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+      if (nm->name.txt) ++k;
+      if (nm->type) k += nar_mty(*nm->type, d + 1);
+    }
+    return k;
+  }
+  if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return nar_mty(*c->mt);
+  return 0;
+}
+// Keyed by item NAME: a name bound twice leaves only its last binding in the
+// signature.  An `include` is not read at all -- what it brings in may be an
+// alias or a scraped signature -- and gives up on the module.
+void nar_sig(const Signature& s, std::map<std::string, long long>& out,
+             bool& ok) {
+  for (auto& it : s) {
+    if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+      if (m->md.name.txt && m->md.type)
+        out[*m->md.name.txt] = nar_mty(*m->md.type);
+    } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      for (auto& dc : m->decls)
+        if (dc.name.txt && dc.type) out[*dc.name.txt] = nar_mty(*dc.type);
+    } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+      if (m->type) out[m->name.txt] = nar_mty(*m->type);
+    } else if (std::holds_alternative<Psig_include>(it.desc)) {
+      ok = false;
+    }
+  }
+}
+void nar_str(const Structure& s, std::map<std::string, long long>& out,
+             bool& ok) {
+  for (auto& it : s) {
+    if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+      if (m->binding.name.txt)
+        out[*m->binding.name.txt] = nar_mexpr(m->binding.expr);
+    } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      for (auto& b : m->bindings)
+        if (b.name.txt) out[*b.name.txt] = nar_mexpr(b.expr);
+    } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+      if (m->type) out[m->name.txt] = nar_mty(*m->type);
+    } else if (std::holds_alternative<Pstr_include>(it.desc)) {
+      ok = false;
+    }
+  }
+}
+const ModuleExpr* nar_find(const Structure& s, const std::string& nm) {
+  const ModuleExpr* r = nullptr;
+  for (auto& it : s)
+    if (auto* m = std::get_if<Pstr_module>(&it.desc))
+      if (m->binding.name.txt && *m->binding.name.txt == nm)
+        r = &m->binding.expr;
+  return r;
+}
+long long modforce_cost(const Structure& s, const Cites& u) {
+  if (modforce_off()) return 0;
+  long long tot = 0;
+  std::set<const ModuleExpr*> done;
+  for (auto& p : u.forced) {
+    std::vector<std::string> c = split_dotted(p);
+    if (c.empty()) continue;
+    bool okp = true;
+    // A name the unit binds more than once may not be the one we resolve.
+    for (auto& x : c) {
+      auto lb = u.local.find(x);
+      if (lb == u.local.end() || lb->second != 1) { okp = false; break; }
+    }
+    if (!okp) continue;
+    const ModuleExpr* me = nar_find(s, c[0]);
+    for (std::size_t i = 1; me && i < c.size(); ++i) {
+      auto* st = std::get_if<Pmod_structure>(&me->desc);
+      me = st ? nar_find(st->items, c[i]) : nullptr;
+    }
+    if (!me || !done.insert(me).second) continue;
+    std::map<std::string, long long> per;
+    bool ok = true;
+    if (auto* st = std::get_if<Pmod_structure>(&me->desc)) {
+      nar_str(st->items, per, ok);
+    } else if (auto* cn = std::get_if<Pmod_constraint>(&me->desc)) {
+      if (auto* sg = std::get_if<Pmty_signature>(&cn->mt->desc))
+        nar_sig(sg->items, per, ok);
+      else
+        ok = false;
+    } else {
+      ok = false;
+    }
+    if (!ok) continue;
+    for (auto& kv : per) tot += kv.second;
+  }
+  return tot;
+}
 
 struct Count {
   long long n = 0;
@@ -23709,6 +23843,32 @@ struct Count {
     if (auto* c = std::get_if<Pstr_class_type>(&it.desc))
       return 2 * (long long)c->decls.size();
     return 0;
+  }
+
+  // ---- ASCRIBING A PATH AT A FUNCTOR TYPE ---------------------------------
+  // `module F : functor (X : ..) -> .. = <a path>` pays TWICE what the
+  // inclusion check alone would cost: `Includemod.functor_param`
+  // (includemod.ml:659) names the arrow and substitutes the declared
+  // parameter's signature -- that is `rfun_mty`, the same walk a `module rec`
+  // binding makes -- and the path costs one more ident per ARROW on top of
+  // it, whether the source named the parameter, left it `_` or wrote `()`.
+  // The same binding written as an inline functor costs neither, and the
+  // charge does not scale with the nesting around it.  A `module rec` binding
+  // and a `let module` are EXCLUDED: both are worth 1, and charging the pair
+  // would over-count.
+  static bool ascp_off() {
+    static const bool off = dbg_env("NOASCPATH") != nullptr;
+    return off;
+  }
+  static long long ascp_arrows(const ModuleType& mt) {
+    auto* f = std::get_if<Pmty_functor>(&mt.desc);
+    return f ? 1 + ascp_arrows(*f->body) : 0;
+  }
+  static long long ascp_charge(const ModuleExpr& m) {
+    auto* c = std::get_if<Pmod_constraint>(&m.desc);
+    if (!c || !std::holds_alternative<Pmod_ident>(c->me->desc)) return 0;
+    if (!std::holds_alternative<Pmty_functor>(c->mt->desc)) return 0;
+    return ascp_arrows(*c->mt) + rfun_mty(*c->mt);
   }
 
   // ---- A FUNCTOR BINDING IS RENAMED BY THE CASCADE AROUND IT --------------
@@ -25822,6 +25982,7 @@ struct Count {
       if (!fcas_off() && ml.a > 1 &&
           std::holds_alternative<Pmod_functor>(m->binding.expr.desc))
         n += (ml.a - 1) * fcas(m->binding.expr);
+      if (!ascp_off() && !inexpr_) n += ascp_charge(m->binding.expr);
       mexpr(m->binding.expr, ml);
       if (m->binding.name.txt) ++n;
       mbind(m->binding);
@@ -25917,7 +26078,7 @@ int typing_ident_count(const ast::Structure& s) {
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
-  long long k = c.n + c.nd_open(s);
+  long long k = c.n + c.nd_open(s) + stampcount::modforce_cost(s, u);
   if (!dbg_env("NOUNITLOAD"))
     k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
                 !dbg_env("NOAPPRES"));
