@@ -25083,12 +25083,60 @@ struct Count {
       expr(*u->e);
     }
   }
+  // A functor written as a MODULE TYPE costs more than the same functor
+  // written as a module EXPRESSION.  `transl_modtype` (typemod.ml:1578) enters
+  // the parameter as a module DECLARATION of its own, and the signature it is
+  // declared at is then written out once more on top of the two `fparam`
+  // already charges -- so a named parameter is one MORE than what one item of
+  // the signature the functor type lands in is worth, plus one per item the
+  // parameter's own signature spans.  A parameter NAMED by a module type stays
+  // an `Mty_ident` that is renamed nowhere, so it costs the same however big
+  // that module type is; one written out -- a literal `sig .. end`, or a
+  // `with` over a name, which leaves a signature behind -- pays for its items.
+  // Only a DECLARED module type pays this at all: an ASCRIPTION and a functor
+  // parameter's own signature are checked against a module that already
+  // exists, and cost less.
+  static bool mtfun_off() {
+    static const bool off = dbg_env("NOMTYFUN") != nullptr;
+    return off;
+  }
+  // Whether the module type being walked is one this file DECLARES.
+  bool mtdecl_ = false;
+  long long par_items(const ModuleType& pt) const {
+    if (std::holds_alternative<Pmty_signature>(pt.desc)) return ren_mty(pt);
+    if (!std::holds_alternative<Pmty_with>(pt.desc)) return 0;
+    const Signature* sg = mty_sig(&pt);
+    if (!sg) return 0;
+    // A DESTRUCTIVE constraint takes its item out of the signature the
+    // parameter is written at, and everything that item spans with it.
+    Gone g;
+    for (const ModuleType* p = &pt;;) {
+      auto* q = std::get_if<Pmty_with>(&p->desc);
+      if (!q) break;
+      for (auto& c : q->constraints) {
+        Wc x;
+        if (!wc_parts(c, x)) return 0;
+        if (x.destr) g.push_back(x.path);
+      }
+      p = q->mt.get();
+    }
+    return w_ren(*sg, g);
+  }
+  long long mtfun_wt(const Pmty_functor& f, const Lvl& l) const {
+    if (!mtdecl_ || mtfun_off()) return 0;
+    auto* nm = std::get_if<Functor_named>(&f.param);
+    if (!nm || !nm->name.txt || !nm->type) return 0;
+    return l.a + 1 + par_items(*nm->type);
+  }
   // A functor parameter's signature is BOUND into the environment, so each of
   // its items is allocated twice over (`a + 1`).
   void fparam(const FunctorParam& p, const Lvl& l) {
     auto* nm = std::get_if<Functor_named>(&p);
     if (!nm) return;
+    bool sv = mtdecl_;
+    mtdecl_ = false;
     mty(*nm->type, Lvl{l.a + 1, l.u, l.depth + 1, true}, true);
+    mtdecl_ = sv;
     if (nm->name.txt) ++n;
   }
   void mty(const ModuleType& mt, const Lvl& l, bool bind = false) {
@@ -25096,6 +25144,7 @@ struct Count {
     if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
       sig_items(s->items, l);
     } else if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      n += mtfun_wt(*f, l);
       fparam(f->param, l);
       mty(*f->body, l);
     } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
@@ -25108,7 +25157,10 @@ struct Count {
       if (!with_off()) n += with_node(*w, l);
       if (!xwith_off()) n += xwith_node(*w, l);
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
+      bool sv = mtdecl_;
+      mtdecl_ = false;
       mexpr(*t->me);
+      mtdecl_ = sv;
       if (!tof_off() && !tof_all_)
         n += tof_wt(*t->me, l, tof_sh_) -
              tof_wt(*t->me, flat(), tof_sh_);
@@ -25268,7 +25320,12 @@ struct Count {
       }
       n += recmodule_extra(*m);
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
-      if (m->type) mty(*m->type, mtd(l));
+      if (m->type) {
+        bool sv = mtdecl_;
+        mtdecl_ = true;
+        mty(*m->type, mtd(l));
+        mtdecl_ = sv;
+      }
       ++n;
       tbind(m->name.txt, m->type ? &*m->type : nullptr);
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
