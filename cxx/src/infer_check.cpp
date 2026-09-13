@@ -20395,6 +20395,10 @@ bool incpath_off() {
   static const bool off = dbg_env("NOINCPATH") != nullptr;
   return off;
 }
+bool tof_off() {
+  static const bool off = dbg_env("NOTYPEOF") != nullptr;
+  return off;
+}
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
@@ -21179,7 +21183,20 @@ struct Cites {
       }
     } else if (auto* s = std::get_if<Pmty_signature>(&m.desc)) {
       size_t d = open_stack_.size();
-      for (auto& it : s->items) sig_item(it);
+      for (std::size_t i = 0; i < s->items.size(); ++i) {
+        // What a later `include (module type of ..)` shadows is never
+        // expanded, so the rebuilt manifest that would force the signature a
+        // second time is not there to be expanded either.
+        bool sh = false;
+        if (std::holds_alternative<Psig_include>(s->items[i].desc))
+          for (std::size_t j = i + 1; j < s->items.size(); ++j)
+            if (auto* nj = std::get_if<Psig_include>(&s->items[j].desc))
+              if (std::holds_alternative<Pmty_typeof>(nj->mt.desc)) sh = true;
+        bool sv = tofsh_;
+        tofsh_ = sh;
+        sig_item(s->items[i]);
+        tofsh_ = sv;
+      }
       open_stack_.resize(d);
     } else if (auto* f = std::get_if<Pmty_functor>(&m.desc)) {
       fparam(f->param);
@@ -21199,6 +21216,11 @@ struct Cites {
       }
     } else if (auto* t = std::get_if<Pmty_typeof>(&m.desc)) {
       mexp(*t->me);
+      // Scraping the module READS its signature, exactly as an `include` of
+      // the same path does: what `Mtype.strengthen` must rebuild forces the
+      // signature a second time, and an APPLIED constructor in it forces the
+      // unit it belongs to twice over.
+      if (!incpath_off() && !tof_off() && !tofsh_) tof_cite(*t->me);
     } else if (auto* a = std::get_if<Pmty_alias>(&m.desc)) {
       cite(a->id, true);
     }
@@ -21479,6 +21501,18 @@ struct Cites {
   // APPLIED, exactly as a `with`-base does: `include Queue` pays Seq's 65
   // twice for the `to_seq` it carries.
   std::set<std::vector<std::string>> incp;
+  // Only a bare unit head is scraped again here: a SUBMODULE of another unit
+  // is a second force of its own (S437), and `Stdlib` is the root every unit
+  // hangs off -- forcing what it names would force the whole library.
+  bool tofsh_ = false;
+  void tof_cite(const ModuleExpr& m) {
+    auto* p = std::get_if<Pmod_ident>(&m.desc);
+    if (!p || std::holds_alternative<Lapply>(p->id.txt.v)) return;
+    std::vector<std::string> c = split_dotted(lid_full(p->id.txt));
+    if (c.size() > 1 && c[0] == "Stdlib") c.erase(c.begin());
+    if (c.size() != 1 || c[0] == "Stdlib") return;
+    incp.insert(c);
+  }
   void inc_cite(const ModuleExpr& m) {
     auto* p = std::get_if<Pmod_ident>(&m.desc);
     if (!p || std::holds_alternative<Lapply>(p->id.txt.v)) return;
@@ -23689,6 +23723,221 @@ struct Count {
     long long t = inc_top(m, dotted);
     return l.a * t + (dotted ? t : 0);
   }
+  // The names a `module type of` brings to the top of a signature.  `ok` is
+  // false where the walk cannot enumerate them, and the caller then treats
+  // everything an earlier include brought in as shadowed outright.  A name is
+  // taken without its namespace, so a value can stand for a type of the same
+  // spelling: over-shadowing only ever costs us a rename we do not charge.
+  static void str_item_names(const StructureItem& it,
+                             std::vector<std::string>& o) {
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      Count c;
+      for (auto& b : v->bindings) c.pat(b.pat, &o);
+    } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
+      o.push_back(p->prim.name.txt);
+    } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
+      o.push_back(v->vd.name.txt);
+    } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+      for (auto& d : t->decls) o.push_back(d.name.txt);
+    } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
+      for (auto& c : x->ext.ctors) o.push_back(c.name.txt);
+    } else if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
+      o.push_back(e->exn.ctor.name.txt);
+    } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+      if (m->binding.name.txt) o.push_back(*m->binding.name.txt);
+    } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      for (auto& b : m->bindings)
+        if (b.name.txt) o.push_back(*b.name.txt);
+    } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+      o.push_back(m->name.txt);
+    } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
+      for (auto& d : c->decls) o.push_back(d.name.txt);
+    } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
+      for (auto& d : c->decls) o.push_back(d.name.txt);
+    }
+  }
+  static void sig_item_names(const SignatureItem& it,
+                             std::vector<std::string>& o, bool& ok) {
+    if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+      o.push_back(v->vd.name.txt);
+    } else if (auto* p = std::get_if<Psig_primitive>(&it.desc)) {
+      o.push_back(p->pd.name.txt);
+    } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+      for (auto& d : t->decls) o.push_back(d.name.txt);
+    } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
+      for (auto& d : t->decls) o.push_back(d.name.txt);
+    } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+      for (auto& c : x->ext.ctors) o.push_back(c.name.txt);
+    } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
+      o.push_back(e->exn.ctor.name.txt);
+    } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+      if (m->md.name.txt) o.push_back(*m->md.name.txt);
+    } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      for (auto& d : m->decls)
+        if (d.name.txt) o.push_back(*d.name.txt);
+    } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+      o.push_back(m->name.txt);
+    } else if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc)) {
+      o.push_back(m->name.txt);
+    } else if (auto* m = std::get_if<Psig_modsubst>(&it.desc)) {
+      if (m->name.txt) o.push_back(*m->name.txt);
+    } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
+      for (auto& d : c->decls) o.push_back(d.name.txt);
+    } else if (auto* c = std::get_if<Psig_class_type>(&it.desc)) {
+      for (auto& d : c->decls) o.push_back(d.name.txt);
+    } else if (std::holds_alternative<Psig_include>(it.desc)) {
+      ok = false;
+    }
+  }
+  static bool all_shadowed(const std::vector<std::string>& nm,
+                           const std::set<std::string>* sh) {
+    if (!sh || nm.empty()) return false;
+    for (auto& n : nm)
+      if (!sh->count(n)) return false;
+    return true;
+  }
+  // --- `module type of M` ---------------------------------------------
+  // A literal `sig .. end` is TYPED where it stands and then renamed by the
+  // cascade, so it costs one pass over its items more than the level gives
+  // it.  `module type of M` is not typed at all -- `type_module_type_of`
+  // hands back a signature that already exists -- so what it pays is the
+  // cascade ALONE: exactly what a literal of that shape costs here, less one
+  // flat pass over it.  An ascription, whose level is 1, therefore pays
+  // NOTHING for the signature itself.
+  // Where `sh` is given, the items it names are brought in by a LATER include
+  // of the same signature and this one's are dropped before the cascade.
+  long long tof_wt(const ModuleExpr& m, const Lvl& l,
+                   const std::set<std::string>* sh = nullptr,
+                   int d = 0) const {
+    if (d > 8) return 0;
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) {
+        if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+          k += tof_wt(i->expr, l, sh, d + 1);
+          continue;
+        }
+        std::vector<std::string> nm;
+        str_item_names(it, nm);
+        if (!all_shadowed(nm, sh)) k += wt_str_item(it, l);
+      }
+      return k;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return tof_mty(*c->mt, l, sh);
+    if (std::holds_alternative<Pmod_functor>(m.desc)) return wt_mexpr(m, l);
+    auto* p0 = std::get_if<Pmod_ident>(&m.desc);
+    if (!p0) return 0;
+    const Longident* id = &p0->id.txt;
+    for (int i = 0; i < 8; ++i) {
+      std::vector<std::string> c;
+      if (!lid_path(*id, c) || c.empty()) return 0;
+      auto it = mods.find(c[0]);
+      if (it == mods.end() || it->second.empty()) break;
+      const ModuleExpr* me = it->second.back();
+      for (std::size_t j = 1; me && j < c.size(); ++j) me = msub(*me, c[j]);
+      if (!me) return 0;
+      auto* q = std::get_if<Pmod_ident>(&me->desc);
+      if (!q) return tof_wt(*me, l, sh, d + 1);
+      id = &q->id.txt;
+    }
+    if (auto* li = std::get_if<Lident>(&id->v)) {
+      auto f = fmods.find(li->name);
+      if (f != fmods.end() && !f->second.empty())
+        return tof_mty(*f->second.back(), l, sh);
+    }
+    const cmi::Signature* sg = tof_cmi(*id);
+    if (!sg) return 0;
+    Gone g;
+    if (sh)
+      for (auto& n : *sh) g.push_back({n});
+    return c_wt(*sg, l, g);
+  }
+  static long long tof_mty(const ModuleType& mt, const Lvl& l,
+                           const std::set<std::string>* sh) {
+    auto* s = std::get_if<Pmty_signature>(&mt.desc);
+    if (!s) return wt_mty(mt, l);
+    long long k = 0;
+    for (auto& it : s->items) {
+      std::vector<std::string> nm;
+      bool ok = true;
+      sig_item_names(it, nm, ok);
+      if (!all_shadowed(nm, sh)) k += wt_sig_item(it, l);
+    }
+    return k;
+  }
+  const cmi::Signature* tof_cmi(const Longident& id) const {
+    std::vector<std::string> c;
+    if (!lid_path(id, c) || c.empty() || mods.count(c[0])) return nullptr;
+    if (c[0] == "Stdlib" && c.size() > 1) c.erase(c.begin());
+    if (c[0].rfind("Stdlib__", 0) == 0) c[0] = c[0].substr(8);
+    std::string p = head_cmi(c[0]);
+    if (p.empty() || !std::filesystem::exists(p)) return nullptr;
+    try {
+      std::string u;
+      bool dt = false;
+      return walk_path(&cmi::CmiFile::load(p).sig(), c, u, dt);
+    } catch (...) {
+    }
+    return nullptr;
+  }
+  // The names the walk above would land on, for the shadow test.
+  void tof_names(const ModuleExpr& m, std::set<std::string>& out, bool& ok,
+                 int d = 0) const {
+    if (d > 8) { ok = false; return; }
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      for (auto& it : st->items) {
+        if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+          tof_names(i->expr, out, ok, d + 1);
+          continue;
+        }
+        std::vector<std::string> nm;
+        str_item_names(it, nm);
+        out.insert(nm.begin(), nm.end());
+      }
+      return;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
+      mty_names(*c->mt, out, ok);
+      return;
+    }
+    auto* p0 = std::get_if<Pmod_ident>(&m.desc);
+    if (!p0) { ok = false; return; }
+    const Longident* id = &p0->id.txt;
+    for (int i = 0; i < 8; ++i) {
+      std::vector<std::string> c;
+      if (!lid_path(*id, c) || c.empty()) { ok = false; return; }
+      auto it = mods.find(c[0]);
+      if (it == mods.end() || it->second.empty()) break;
+      const ModuleExpr* me = it->second.back();
+      for (std::size_t j = 1; me && j < c.size(); ++j) me = msub(*me, c[j]);
+      if (!me) { ok = false; return; }
+      auto* q = std::get_if<Pmod_ident>(&me->desc);
+      if (!q) { tof_names(*me, out, ok, d + 1); return; }
+      id = &q->id.txt;
+    }
+    if (auto* li = std::get_if<Lident>(&id->v)) {
+      auto f = fmods.find(li->name);
+      if (f != fmods.end() && !f->second.empty()) {
+        mty_names(*f->second.back(), out, ok);
+        return;
+      }
+    }
+    const cmi::Signature* sg = tof_cmi(*id);
+    if (!sg) { ok = false; return; }
+    for (auto& e : sg->order) out.insert(c_ename(*sg, e));
+  }
+  static void mty_names(const ModuleType& mt, std::set<std::string>& out,
+                        bool& ok) {
+    auto* s = std::get_if<Pmty_signature>(&mt.desc);
+    if (!s) { ok = false; return; }
+    for (auto& it : s->items) {
+      std::vector<std::string> nm;
+      sig_item_names(it, nm, ok);
+      out.insert(nm.begin(), nm.end());
+    }
+  }
+
   // --- A FUNCTOR OF ANOTHER UNIT --------------------------------------
   // Its result is not in this parsetree at all: it is the signature the
   // unit's .cmi carries, and applying it FORCES that signature (one ident
@@ -24154,11 +24403,37 @@ struct Count {
       if (!xwith_off()) n += xwith_node(*w, l);
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
       mexpr(*t->me);
+      if (!tof_off() && !tof_all_)
+        n += tof_wt(*t->me, l, tof_sh_) -
+             tof_wt(*t->me, flat(), tof_sh_);
     }
   }
+  // A later `include (module type of ..)` SHADOWS what an earlier one brought
+  // in, and the cascade then never reaches the items it replaced: all they
+  // are left with is the one rename `Env.enter_signature` made of them.
+  const std::set<std::string>* tof_sh_ = nullptr;
+  bool tof_all_ = false;
   void sig_items(const Signature& s, const Lvl& l) {
     auto tk = tmark();
-    for (auto& it : s) sig_item(it, l);
+    for (std::size_t i = 0; i < s.size(); ++i) {
+      std::set<std::string> sh;
+      bool all = false;
+      if (!tof_off() && std::holds_alternative<Psig_include>(s[i].desc))
+        for (std::size_t j = i + 1; j < s.size(); ++j)
+          if (auto* nj = std::get_if<Psig_include>(&s[j].desc))
+            if (auto* pj = std::get_if<Pmty_typeof>(&nj->mt.desc)) {
+              bool ok = true;
+              tof_names(*pj->me, sh, ok);
+              if (!ok) all = true;
+            }
+      const std::set<std::string>* sv = tof_sh_;
+      bool sa = tof_all_;
+      tof_sh_ = sh.empty() ? nullptr : &sh;
+      tof_all_ = all;
+      sig_item(s[i], l);
+      tof_sh_ = sv;
+      tof_all_ = sa;
+    }
     trelease(tk);
   }
   void sig_item(const SignatureItem& it, const Lvl& l) {
@@ -24206,6 +24481,10 @@ struct Count {
       } else {
         mty(i->mt, l);
         n += ren_mty(i->mt);
+        // `ren_mty` reads the parsetree, and a `module type of` node has no
+        // signature there: the items it brings in are renamed all the same.
+        if (auto* pt = std::get_if<Pmty_typeof>(&i->mt.desc))
+          if (!tof_off()) n += tof_wt(*pt->me, flat());
       }
     // A DESCRIBED class is those same three idents, and binding it into an
     // environment renames the items it saves -- three of them, where a class
