@@ -20407,6 +20407,14 @@ bool lal_off() {
   static const bool off = dbg_env("NOLALIAS") != nullptr;
   return off;
 }
+bool tofp_off() {
+  static const bool off = dbg_env("NOTOFPATH") != nullptr;
+  return off;
+}
+bool patopen_off() {
+  static const bool off = dbg_env("NOPATOPEN") != nullptr;
+  return off;
+}
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
@@ -21518,6 +21526,13 @@ struct Cites {
     if (!p || std::holds_alternative<Lapply>(p->id.txt.v)) return;
     std::vector<std::string> c = split_dotted(lid_full(p->id.txt));
     if (c.size() > 1 && c[0] == "Stdlib") c.erase(c.begin());
+    // `module type of Std.D`, where `Std` is a module of THIS file: the path
+    // still ends at whatever unit the component stands for, and the walk here
+    // is flat, so the component's own name is where to look for it.  A DOTTED
+    // path into another unit is a second force of its own (S437) and is left
+    // alone, as is a component this file binds twice.
+    if (c.size() > 1 && !tofp_off() && local.count(c[0]))
+      c = std::vector<std::string>{c.back()};
     if (c.size() != 1 || c[0] == "Stdlib") return;
     incp.insert(c);
   }
@@ -21766,8 +21781,14 @@ struct Count {
   // body alone and is never saved.
   bool inexpr_ = false;
 
+  // A `Ppat_open` leaves NO typedtree node of its own -- `type_pat` types the
+  // pattern under it in the extended environment and returns that pattern --
+  // so `name_pattern`, which walks TYPED patterns, sees the variable through
+  // it and reuses its ident: `let f M.(x) = x` costs what `let f x = x` does.
   static const Pattern& strip(const Pattern& p) {
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return strip(*c->p);
+    if (auto* o = std::get_if<Ppat_open>(&p.desc))
+      if (!patopen_off()) return strip(*o->p);
     return p;
   }
   // `out`, when given, collects the names bound -- the caller puts them in
@@ -23919,8 +23940,12 @@ struct Count {
       std::vector<std::string> c;
       if (!lid_path(*id, c) || c.empty()) return 0;
       auto it = mods.find(c[0]);
-      if (it == mods.end() || it->second.empty()) break;
-      const ModuleExpr* me = it->second.back();
+      const ModuleExpr* me = nullptr;
+      if (it != mods.end() && !it->second.empty()) me = it->second.back();
+      // A head an `open` of a local structure has put in scope names that
+      // structure's component exactly as a dotted path does (S457).
+      else if (!tofp_off()) me = open_head(c[0]);
+      if (!me) break;
       for (std::size_t j = 1; me && j < c.size(); ++j) me = msub(*me, c[j]);
       if (!me) return 0;
       auto* q = std::get_if<Pmod_ident>(&me->desc);
