@@ -20403,6 +20403,10 @@ bool gopen_off() {
   static const bool off = dbg_env("NOGOPEN") != nullptr;
   return off;
 }
+bool lal_off() {
+  static const bool off = dbg_env("NOLALIAS") != nullptr;
+  return off;
+}
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
@@ -22964,6 +22968,7 @@ struct Count {
       auto m = mark();
       auto ek = emark();
       auto tk = tmark();
+      auto ok = omark();
       bool ie = inexpr_;
       inexpr_ = true;
       item(*s->item);
@@ -22972,6 +22977,7 @@ struct Count {
       release(m);
       erelease(ek);
       trelease(tk);
+      orelease(ok);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
       expr(*s->obj); expr(*s->value);
     } else if (auto* s = std::get_if<Pexp_setinstvar>(&e.desc)) {
@@ -23680,7 +23686,8 @@ struct Count {
     return std::holds_alternative<Pmod_ident>(m.desc) ? inc_top(m, dt, d + 1)
                                                       : 0;
   }
-  long long inc_top(const ModuleExpr& m, bool& dotted, int d = 0) const {
+  long long inc_top(const ModuleExpr& m, bool& dotted, int d = 0,
+                    const ModuleExpr** at = nullptr) const {
     auto* p0 = std::get_if<Pmod_ident>(&m.desc);
     if (!p0 || d > 8) return 0;
     const Longident* id = &p0->id.txt;
@@ -23694,7 +23701,10 @@ struct Count {
       if (!me) return 0;
       dotted = c.size() > 1;
       auto* q = std::get_if<Pmod_ident>(&me->desc);
-      if (!q) return me_top(*me, d + 1);
+      if (!q) {
+        if (at) *at = me;
+        return me_top(*me, d + 1);
+      }
       id = &q->id.txt;
     }
     dotted = false;
@@ -23722,10 +23732,82 @@ struct Count {
     }
     return 0;
   }
-  long long inc_items(const ModuleExpr& m, const Lvl& l) const {
+  // --- a LOCAL SUBMODULE PATH is materialized once -------------------------
+  // `Env.find_module` must SUBSTITUTE a component's declaration out of its
+  // parent (S451 clause 2), and it memoizes the answer by PATH: the file pays
+  // one ident per top item of the submodule the FIRST time it names one that
+  // way and nothing for any later mention of the same path.  An `include A.N`
+  // already pays it -- that is the `dotted ? t : 0` term below -- but a second
+  // `include A.N` paid it again, and `module M = A.N` followed by a USE of M
+  // (where a DIRECT `A.N.g` reads a value straight out of the parent and needs
+  // no such substitution) paid nothing at all.
+  std::set<const ModuleExpr*> matz_;
+  const std::set<std::string>* used_ = nullptr;
+  // The local structures an `open` of a PATH has brought into scope, innermost
+  // last: a BARE module head is looked for in these when nothing binds it.
+  std::vector<const ModuleExpr*> opmods;
+  std::size_t omark() const { return opmods.size(); }
+  void orelease(std::size_t m) { opmods.resize(m); }
+  const ModuleExpr* open_head(const std::string& n) const {
+    for (auto o = opmods.rbegin(); o != opmods.rend(); ++o)
+      if (const ModuleExpr* s = msub(**o, n)) return s;
+    return nullptr;
+  }
+  // Resolve a module path to the STRUCTURE of this file it names, following a
+  // `module Z = A` alias chain at every step; `sub` says the walk went through
+  // a COMPONENT of some module, which is what makes the declaration one that
+  // has to be substituted out of its parent.
+  const ModuleExpr* lal_res(const Longident& id, bool& sub, int d = 0) const {
+    if (d > 8) return nullptr;
+    std::vector<std::string> c;
+    if (!lid_path(id, c) || c.empty()) return nullptr;
+    const ModuleExpr* me = nullptr;
+    auto it = mods.find(c[0]);
+    if (it != mods.end() && !it->second.empty()) me = it->second.back();
+    else if ((me = open_head(c[0]))) sub = true;
+    for (std::size_t j = 1; me && j < c.size(); ++j) {
+      me = lal_fix(me, sub, d);
+      if (!me) return nullptr;
+      me = msub(*me, c[j]);
+      sub = true;
+    }
+    return me ? lal_fix(me, sub, d) : nullptr;
+  }
+  const ModuleExpr* lal_fix(const ModuleExpr* me, bool& sub, int d) const {
+    auto* q = std::get_if<Pmod_ident>(&me->desc);
+    return q ? lal_res(q->id.txt, sub, d + 1) : me;
+  }
+  // What `module M = <path>` costs once M is READ -- a value, a type, an
+  // `open`, anything that makes the alias be resolved.  An UNUSED alias, and
+  // one bound under a name this file binds twice, are left alone.
+  long long lal_bind(const ModuleBinding& b) {
+    if (lal_off()) return 0;
+    const ModuleExpr* e = &b.expr;
+    bool asc = false;
+    for (int i = 0; i < 4; ++i) {
+      auto* c = std::get_if<Pmod_constraint>(&e->desc);
+      if (!c) break;
+      asc = true;
+      e = c->me.get();
+    }
+    // An ASCRIPTION builds the module's type where it stands, so it resolves
+    // the path at once; a bare alias waits for a read of the name it binds.
+    if (!asc && (!b.name.txt || !used_ || !used_->count(*b.name.txt)))
+      return 0;
+    auto* i = std::get_if<Pmod_ident>(&e->desc);
+    if (!i) return 0;
+    bool sub = false;
+    const ModuleExpr* t = lal_res(i->id.txt, sub);
+    if (!t || !sub || !matz_.insert(t).second) return 0;
+    return me_top(*t);
+  }
+  long long inc_items(const ModuleExpr& m, const Lvl& l) {
     bool dotted = false;
-    long long t = inc_top(m, dotted);
-    return l.a * t + (dotted ? t : 0);
+    const ModuleExpr* at = nullptr;
+    long long t = inc_top(m, dotted, 0, &at);
+    long long x = dotted ? t : 0;
+    if (!lal_off() && x && at && !matz_.insert(at).second) x = 0;
+    return l.a * t + x;
   }
   // The names a `module type of` brings to the top of a signature.  `ok` is
   // false where the walk cannot enumerate them, and the caller then treats
@@ -24333,6 +24415,7 @@ struct Count {
       auto mk = mmark();
       auto ek = emark();
       auto tk = tmark();
+      auto ok = omark();
       ++sdepth_;
       for (auto& it : st->items) item(it, l);
       --sdepth_;
@@ -24340,6 +24423,7 @@ struct Count {
       mrelease(mk);
       erelease(ek);
       trelease(tk);
+      orelease(ok);
     } else if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       // A functor's RESULT is never strengthened (`strengthen_lazy`,
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
@@ -24526,6 +24610,7 @@ struct Count {
       mexpr(m->binding.expr, depth_off() ? Lvl{1, 1, 0, true} : sub(l));
       if (m->binding.name.txt) ++n;
       mbind(m->binding);
+      n += lal_bind(m->binding);
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       const Lvl sl = depth_off() ? Lvl{1, 1, 0, true} : sub(l);
       for (auto& b : m->bindings) {
@@ -24563,6 +24648,13 @@ struct Count {
           !gopen_off() && !std::holds_alternative<Pmod_ident>(o->expr.desc);
       mexpr(o->expr, gen ? flat() : Lvl{1, 1, 0, true}, false);
       reg_open(o->expr);
+      if (!lal_off())
+        if (auto* oi = std::get_if<Pmod_ident>(&o->expr.desc)) {
+          bool os = false;
+          if (const ModuleExpr* ot = lal_res(oi->id.txt, os))
+            if (std::holds_alternative<Pmod_structure>(ot->desc))
+              opmods.push_back(ot);
+        }
       n += gen ? ren_mexpr(o->expr, Sibs{}) : exports(o->expr);
     // A class costs three idents before anything of it is read:
     // `type_classes` (typeclass.ml:1897) creates the class, its class type
@@ -24581,16 +24673,24 @@ struct Count {
 }  // namespace stampcount
 
 int typing_ident_count(const ast::Structure& s) {
+  // The citation walk runs FIRST: whether a `module M = A.N` alias is ever
+  // READ is what says the path has to be resolved, and only a name this file
+  // binds ONCE can be followed to the module it stands for.
+  stampcount::Cites u;
+  u.bare_ = !dbg_env("NOBAREHEAD");
+  for (auto& it : s) u.item(it);
+  std::set<std::string> used;
+  for (auto& nm : u.units) {
+    auto lb = u.local.find(nm);
+    if (lb != u.local.end() && lb->second == 1) used.insert(nm);
+  }
   stampcount::Count c;
+  c.used_ = &used;
   for (auto& it : s) c.item(it);
   long long k = c.n;
-  if (!dbg_env("NOUNITLOAD")) {
-    stampcount::Cites u;
-    u.bare_ = !dbg_env("NOBAREHEAD");
-    for (auto& it : s) u.item(it);
+  if (!dbg_env("NOUNITLOAD"))
     k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
                 !dbg_env("NOAPPRES"));
-  }
   return (int)k;
 }
 
