@@ -20439,6 +20439,11 @@ bool incwt_off() {
   return off;
 }
 
+bool curpar_off() {
+  static const bool off = dbg_env("NOCURPAR") != nullptr;
+  return off;
+}
+
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
   // Module names the file binds itself, with how MANY times: a name bound
@@ -24516,6 +24521,28 @@ struct Count {
       if (md.name == c.back()) return md.type.get();
     return nullptr;
   }
+  // What ONE substitution of a cross-unit functor that is still to be applied
+  // names: its own parameters, the items of the RESULT, and -- since the
+  // parameters are bound over all of it -- the items of the parameters'
+  // signatures as well.  A parameter written as a module type NAME has none
+  // of its own here.
+  static long long xrest_wt(const cmi::ModuleType* f, bool cpar) {
+    if (!cpar) {
+      long long k = 0;
+      for (; f && f->kind == cmi::ModuleType::Functor;
+           f = f->functor_body.get())
+        if (f->functor_param) ++k;
+      return k;
+    }
+    long long k = flat_cmty(f);
+    for (; f && f->kind == cmi::ModuleType::Functor;
+         f = f->functor_body.get()) {
+      const cmi::ModuleType* pt = f->functor_param_type.get();
+      if (f->functor_param && pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
+        k += flat_csig(*pt->sig);
+    }
+    return k;
+  }
   // `Hashtbl.Make (String)`: the result is Hashtbl's, and applying it costs
   // the PARAMETER's signature once (it is bound while the argument is checked
   // against it), the result's own items once (the .cmi's lazy signature is
@@ -24523,8 +24550,11 @@ struct Count {
   // substitution the application itself runs) and -- where the result is SAVED
   // and carries a type `Mtype.strengthen` must rebuild -- its items twice more.
   long long cross_charge(const ModuleExpr& m, const ModuleExpr& head,
-                         int nargs, const Lvl& l, bool saved) {
+                         int nargs, const Lvl& l, bool saved,
+                         bool rebind = false) {
     if (xapp_off()) return 0;
+    const bool cpar = !curpar_off() && !rebind;
+    const bool reb = !curpar_off() && rebind;
     const Longident* id = mpath(&head);
     if (!id) return 0;
     const cmi::Signature* root = nullptr;
@@ -24547,11 +24577,8 @@ struct Count {
       mt = mt->functor_body.get();
       // Every substitution but the last sees the functor still to be applied
       // and names its parameters (S442).
-      if (i + 1 < nargs)
-        for (const cmi::ModuleType* f = scrape_cmty(mt, root);
-             f && f->kind == cmi::ModuleType::Functor;
-             f = f->functor_body.get())
-          if (f->functor_param) ++k;
+      if (i + 1 < nargs && !reb)
+        k += xrest_wt(scrape_cmty(mt, root), cpar);
     }
     // A functor whose RESULT is written as a module type NAME hands back
     // that name; scraping it is what the application's own substitution
@@ -24679,9 +24706,52 @@ struct Count {
     }
     return k;
   }
+  // What a parameter STILL TO BE APPLIED costs at every substitution BEFORE
+  // it: `Subst` walks the functor type that is left over, and that names the
+  // items of the parameters' signatures as well as the parameters
+  // themselves.  A parameter written as a module type NAME has no items of
+  // its own here -- the name is all that is renamed.
+  long long par_wt(const ModuleType& mt,
+                   const std::vector<std::pair<std::string,
+                                               const ModuleType*>>& ps) const {
+    const Lvl pl{1, 1, 0, false};
+    if (std::holds_alternative<Pmty_ident>(mt.desc)) return 0;
+    if (auto* t = std::get_if<Pmty_typeof>(&mt.desc))
+      return par_tof(*t->me, ps, pl);
+    return wt_mty(mt, pl);
+  }
+  // `module type of struct include X end` over a PARAMETER of the same
+  // functor: that scope is closed by the time the application is walked, so
+  // `tof_wt`'s own `fmods` lookup answers nothing for the name.
+  long long par_tof(const ModuleExpr& m,
+                    const std::vector<std::pair<std::string,
+                                                const ModuleType*>>& ps,
+                    const Lvl& l, int d = 0) const {
+    if (d > 4) return 0;
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) {
+        if (auto* i = std::get_if<Pstr_include>(&it.desc))
+          k += par_tof(i->expr, ps, l, d + 1);
+        else
+          k += wt_str_item(it, l);
+      }
+      return k;
+    }
+    if (auto* pi = std::get_if<Pmod_ident>(&m.desc))
+      if (auto* li = std::get_if<Lident>(&pi->id.txt.v))
+        for (auto& p : ps)
+          if (p.first == li->name) return wt_mty(*p.second, l);
+    return tof_wt(m, l);
+  }
+  // `rebind` is the second pass an INCLUDE makes over an application: the
+  // walk that precedes it has already charged every substitution but the
+  // last, and only the result is bound a second time.
   long long app_charge(const ModuleExpr& m, const Lvl& l,
-                       bool saved = true) {
+                       bool saved = true, bool rebind = false) {
     if (app_off()) return 0;
+    const bool cpar = !curpar_off() && !rebind;
+    const bool reb = !curpar_off() && rebind;
     const ModuleExpr* head = &m;
     int nargs = 0;
     for (;;) {
@@ -24699,7 +24769,7 @@ struct Count {
     if (nargs == 0) return 0;
     const ModuleExpr* me = mderef(head);
     const ModuleType* mt = nullptr;
-    if (!me) return cross_charge(m, *head, nargs, l, saved);
+    if (!me) return cross_charge(m, *head, nargs, l, saved, rebind);
     const ModuleExpr* fdef = me;
     bool pathless = false;
     for (const ModuleExpr* h = &m;;) {
@@ -24720,9 +24790,11 @@ struct Count {
       if (me) {
         auto* f = std::get_if<Pmod_functor>(&me->desc);
         if (!f) return 0;
-        if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (auto* nm = std::get_if<Functor_named>(&f->param)) {
           if (nm->name.txt && nm->type)
             fps.emplace_back(*nm->name.txt, &*nm->type);
+          if (cpar && nm->type) k += i * par_wt(*nm->type, fps);
+        }
         const ModuleExpr* b = mderef(f->body.get());
         if (b) {
           me = b;
@@ -24738,9 +24810,11 @@ struct Count {
       } else {
         auto* f = std::get_if<Pmty_functor>(&mt->desc);
         if (!f) return 0;
+        if (auto* nm = std::get_if<Functor_named>(&f->param))
+          if (cpar && nm->type) k += i * par_wt(*nm->type, fps);
         mt = f->body.get();
       }
-      if (i + 1 < nargs)
+      if (i + 1 < nargs && !reb)
         k += me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
     }
     k += me ? wt_mexpr(*me, l) : wt_mty(*mt, l);
@@ -25047,7 +25121,7 @@ struct Count {
       n += depth_off() ? exports(i->expr) : ren_mexpr(i->expr, Sibs{});
       // `ren_mexpr` cannot read an application; its result is re-bound the
       // same way every other included signature is.
-      n += app_charge(i->expr, flat(), false);
+      n += app_charge(i->expr, flat(), false, true);
       if (!incpath_off()) {
         std::vector<std::string> nm;
         inm_ = &nm;
