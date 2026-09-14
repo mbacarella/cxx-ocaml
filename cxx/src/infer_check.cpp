@@ -25603,6 +25603,97 @@ struct Count {
     if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return str_mty(*w->mt);
     return false;
   }
+  // ---- A FUNCTOR RESULT ASCRIBED BY A MODULE TYPE NAME -------------------
+  // `wt_mty` reads a `Pmty_ident` as an item-less leaf.  That is RIGHT for a
+  // PARAMETER -- `par_wt` says so, the name is all that is renamed there --
+  // and WRONG for the RESULT, which `Subst` walks in full at every
+  // application: `module F (X:T) : R with type key = X.t = struct .. end` was
+  // charged NOTHING per application where a LITERAL `sig .. end` of the same
+  // shape is charged in full.  The name resolves against this file's own
+  // module types first and another unit's `.cmi` after, and a DESTRUCTIVE
+  // constraint takes its item out exactly as it does under `with_node`.
+  static bool resname_off() {
+    static const bool off = dbg_env("NORESNAME") != nullptr;
+    return off;
+  }
+  // The module type a functor result NAMES, through the `with`-nodes on it.
+  static const ModuleType* res_named(const ModuleExpr* me,
+                                     const ModuleType* mt) {
+    const ModuleType* r = mt;
+    if (me) {
+      auto* c = std::get_if<Pmod_constraint>(&me->desc);
+      r = c ? c->mt.get() : nullptr;
+    }
+    return mty_named(r) ? r : nullptr;
+  }
+  static Gone res_gone(const ModuleType& mt) {
+    Gone g;
+    for (const ModuleType* p = &mt;;) {
+      auto* q = std::get_if<Pmty_with>(&p->desc);
+      if (!q) break;
+      for (auto& c : q->constraints) {
+        Wc x;
+        if (wc_parts(c, x) && x.destr) g.push_back(x.path);
+      }
+      p = q->mt.get();
+    }
+    return g;
+  }
+  long long res_wt(const ModuleType& mt, const Lvl& l) const {
+    if (resname_off()) return 0;
+    if (const Signature* sg = mty_sig(&mt)) return w_wt(*sg, l, res_gone(mt));
+    std::string key;
+    if (const cmi::Signature* cs = xmty_sig(&mt, key))
+      return l.a * flat_csig(*cs);
+    return 0;
+  }
+  // The type names a NON-destructive `with type` hands a manifest to: those
+  // declarations are no longer ones `Mtype.strengthen` has to rebuild.
+  static void res_conc(const ModuleType& mt, std::set<std::string>& out) {
+    for (const ModuleType* p = &mt;;) {
+      auto* q = std::get_if<Pmty_with>(&p->desc);
+      if (!q) break;
+      for (auto& c : q->constraints) {
+        Wc x;
+        if (wc_parts(c, x) && x.td && !x.destr && x.path.size() == 1)
+          out.insert(x.path[0]);
+      }
+      p = q->mt.get();
+    }
+  }
+  static bool str_sigc(const Signature& s, const std::set<std::string>& conc) {
+    for (auto& it : s) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc))
+        for (auto& d : t->decls)
+          if (!conc.count(d.name.txt) && rebuilt_pdecl(d)) return true;
+      if (auto* md = std::get_if<Psig_module>(&it.desc))
+        if (str_mty(*md->md.type)) return true;
+    }
+    return false;
+  }
+  static bool str_csigc(const cmi::Signature& sg,
+                        const std::set<std::string>& conc) {
+    for (auto& d : sg.types)
+      if (!conc.count(d.name) && rebuilt_decl(d)) return true;
+    for (auto& md : sg.modules)
+      if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig &&
+          str_csig(*md.type->sig))
+        return true;
+    return false;
+  }
+  bool res_str(const ModuleType& mt) const {
+    // A BARE name is left a path: `Mtype.strengthen` has nothing to rebuild
+    // there, and only a `with` that writes the signature out earns the lump.
+    if (resname_off() || std::holds_alternative<Pmty_ident>(mt.desc))
+      return false;
+    std::set<std::string> conc;
+    res_conc(mt, conc);
+    if (const Signature* sg = mty_sig(&mt)) return str_sigc(*sg, conc);
+    std::string key;
+    if (const cmi::Signature* cs = xmty_sig(&mt, key))
+      return str_csigc(*cs, conc);
+    return false;
+  }
   // Follow this file's `module F2 = F` aliases to the path the head finally
   // names; null where the head is not an identifier at all.
   const Longident* mpath(const ModuleExpr* m) const {
@@ -25989,6 +26080,9 @@ struct Count {
     if (std::holds_alternative<Pmty_ident>(mt.desc)) return 0;
     if (auto* t = std::get_if<Pmty_typeof>(&mt.desc))
       return par_tof(*t->me, ps, pl);
+    // ... but a `with` over that name writes the signature OUT, and what is
+    // written out is renamed like any other parameter's.
+    if (mty_named(&mt)) return res_wt(mt, pl);
     return wt_mty(mt, pl);
   }
   // `module type of struct include X end` over a PARAMETER of the same
@@ -26269,10 +26363,20 @@ struct Count {
           if (cpar && nm->type) k += i * par_wt(*nm->type, fps);
         mt = f->body.get();
       }
-      if (i + 1 < nargs && !reb)
+      if (i + 1 < nargs && !reb) {
         k += me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
+        if (const ModuleType* r = res_named(me, mt)) k += res_wt(*r, flat());
+      }
     }
+    const ModuleType* rnm = res_named(me, mt);
+    // A BARE name is left a PATH, and `Mtype.nondep_supertype` -- what an
+    // argument with no path of its own asks for -- has no signature there to
+    // rebuild, so nothing is renamed at all.  A `with` writes the signature
+    // out and is owed the substitution either way.
+    if (rnm && pathless && std::holds_alternative<Pmty_ident>(rnm->desc))
+      rnm = nullptr;
     k += me ? wt_mexpr(*me, l) : wt_mty(*mt, l);
+    if (rnm) k += res_wt(*rnm, l);
     if (me && !incwt_off()) k += inc_wt(*me, l, fps);
     if (pathless && saved && !pbody)
       k += me ? ext_mexpr(*me, Ext{}) : ext_mty(*mt, Ext{});
@@ -26282,8 +26386,10 @@ struct Count {
     // application of the functor: over a base of `items + 1` apiece,
     // `M (A) M (B) M (A)` is 3R+2, 2R+1, R+1.
     if (saved && !inexpr_ && !pathless && !pbody && !xapp_off() &&
-        (me ? str_mexpr(*me) : str_mty(*mt))) {
+        ((me ? str_mexpr(*me) : str_mty(*mt)) ||
+         (rnm && res_str(*rnm)))) {
       long long fl = me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
+      if (rnm) fl += res_wt(*rnm, flat());
       // An argument that is itself an APPLICATION is not a path the result
       // is shared under: only a NAMED argument is cached below.
       bool named_args = true;
