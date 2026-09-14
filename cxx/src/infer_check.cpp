@@ -23095,6 +23095,169 @@ struct Count {
     if (wscraped.insert(key).second) k += flat_csig(*sg);
     return k;
   }
+  // --- A `with` OVER A `module type of` --------------------------------
+  // `(module type of Foo) with type u := float` merges into the signature
+  // Foo's STRUCTURE gives, and `mty_sig` -- which reads a written
+  // `sig .. end` and the module types this file names, nothing else --
+  // answered nothing for such a base, so the whole merge was charged 0.  It
+  // costs exactly what the same merge over a written signature of that shape
+  // costs, and the counting functions below are the structure twins of
+  // `w_ren`/`w_wt`/`w_nested`.  Only a module of THIS file can be read, so
+  // `module type of List` still resolves to nothing; and a constraint that
+  // reaches INSIDE the structure is left alone, since the target a deep path
+  // names has not been measured here.
+  static bool tofw_off() {
+    static const bool off = dbg_env("NOTOFWITH") != nullptr;
+    return off;
+  }
+  // The structure a module expression finally stands for, through this
+  // file's aliases and dotted paths.
+  const Pmod_structure* tof_me(const ModuleExpr& m, int d = 0) const {
+    if (d > 8) return nullptr;
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) return st;
+    auto* p = std::get_if<Pmod_ident>(&m.desc);
+    if (!p) return nullptr;
+    std::vector<std::string> c;
+    if (!lid_path(p->id.txt, c) || c.empty()) return nullptr;
+    auto it = mods.find(c[0]);
+    if (it == mods.end() || it->second.empty()) return nullptr;
+    const ModuleExpr* me = it->second.back();
+    for (std::size_t j = 1; me && j < c.size(); ++j) me = msub(*me, c[j]);
+    return me ? tof_me(*me, d + 1) : nullptr;
+  }
+  // The same, off the module type a `with` is written over: a bare
+  // `module type of Foo` and a `module type T = module type of Foo` this
+  // file names both answer Foo's structure.
+  const Pmod_structure* tof_base(const ModuleType* mt, int fuel = 8) const {
+    if (!mt || fuel <= 0) return nullptr;
+    if (auto* t = std::get_if<Pmty_typeof>(&mt->desc)) return tof_me(*t->me);
+    if (auto* w = std::get_if<Pmty_with>(&mt->desc))
+      return tof_base(w->mt.get(), fuel - 1);
+    if (auto* i = std::get_if<Pmty_ident>(&mt->desc))
+      return tof_base(named_mty(i->id.txt, fuel), fuel - 1);
+    return nullptr;
+  }
+  static bool t_has(const Pmod_structure& s, const std::string& nm) {
+    for (auto& it : s.items) {
+      if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+        for (auto& d : t->decls)
+          if (d.name.txt == nm) return true;
+      } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+        if (m->binding.name.txt && *m->binding.name.txt == nm) return true;
+      } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+        if (m->name.txt == nm) return true;
+      }
+    }
+    return false;
+  }
+  // The name a destructive constraint took out is gone from the merged
+  // signature; everything else is renamed once, at every depth.
+  static bool t_drop(const StructureItem& it, const Gone& g) {
+    bool drop = false;
+    if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+      if (m->binding.name.txt) wgo(g, *m->binding.name.txt, drop);
+    } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+      wgo(g, m->name.txt, drop);
+    }
+    return drop;
+  }
+  static long long t_ren(const Pmod_structure& s, const Gone& g) {
+    long long k = 0;
+    for (auto& it : s.items) {
+      if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+        for (auto& d : t->decls) {
+          bool drop = false;
+          wgo(g, d.name.txt, drop);
+          if (!drop) ++k;
+        }
+        continue;
+      }
+      if (!t_drop(it, g)) k += ren_str_item(it, Sibs{});
+    }
+    return k;
+  }
+  static long long t_wt(const Pmod_structure& s, const Lvl& l, const Gone& g) {
+    long long k = 0;
+    for (auto& it : s.items) {
+      if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+        for (auto& d : t->decls) {
+          bool drop = false;
+          wgo(g, d.name.txt, drop);
+          if (!drop) k += l.a;
+        }
+        continue;
+      }
+      if (!t_drop(it, g)) k += wt_str_item(it, l);
+    }
+    return k;
+  }
+  // `Subst.signature_item Keep`: the item's own ident is KEPT and everything
+  // a submodule or a module type of it spans is renamed.
+  static long long t_nested(const Pmod_structure& s, const Gone& g) {
+    long long k = 0;
+    for (auto& it : s.items) {
+      if (t_drop(it, g)) continue;
+      if (auto* m = std::get_if<Pstr_module>(&it.desc))
+        k += ren_mexpr(m->binding.expr, Sibs{});
+      else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+        for (auto& b : m->bindings) k += ren_mexpr(b.expr, Sibs{});
+      } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+        if (m->type) k += ren_mty(*m->type);
+      }
+    }
+    return k;
+  }
+  // What ONE `with`-node over a `module type of` costs.  NEVER in an
+  // ASCRIPTION: the merge is exact there too, but a structure an ascription
+  // DISCARDS is charged the BODY of every module type it declares, which is
+  // an over-count of its own (`module M : sig type u end = struct type u
+  // module type MT = sig type q type r end end` is +2 today), and the charge
+  // below would stop cancelling it.
+  long long twith_node(const Pmty_with& w, const Lvl& l) const {
+    if (tofw_off() || mtctx_ == MtCtx::Ascr || mty_sig(w.mt.get())) return 0;
+    const Pmod_structure* sg = tof_base(w.mt.get());
+    if (!sg) return 0;
+    Gone g;
+    for (const ModuleType* p = w.mt.get();;) {
+      auto* q = std::get_if<Pmty_with>(&p->desc);
+      if (!q) break;
+      for (auto& c : q->constraints) {
+        Wc x;
+        if (!wc_parts(c, x) || x.path.size() != 1) return 0;
+        if (x.destr) g.push_back(x.path);
+      }
+      p = q->mt.get();
+    }
+    // A `module type of` node of its own has already been weighed by the
+    // cascade where it stands (`Count::mty`'s `Pmty_typeof` arm charges what
+    // the level adds OVER a flat rename), so the merge owes the flat rename
+    // alone there; a module type NAME standing for one was weighed by
+    // nothing, and the merge owes the whole of it.
+    const bool lit = std::holds_alternative<Pmty_typeof>(w.mt->desc);
+    long long k = 0, rows = 0, roww = 0;
+    for (auto& c : w.constraints) {
+      Wc x;
+      if (!wc_parts(c, x) || x.path.size() != 1) return 0;
+      if (!t_has(*sg, x.path.back())) return 0;
+      if (x.td) {
+        ++k;
+        if (is_fixed(*x.td)) { ++k; ++rows; roww += l.a; }
+        k += t_nested(*sg, g);
+      }
+      if (x.destr) {
+        g.push_back(x.path);
+        k += t_ren(*sg, g) + rows;
+      }
+    }
+    k += lit ? t_ren(*sg, g) + rows : t_wt(*sg, l, g) + roww;
+    // A DESTRUCTIVE constraint leaves no item behind, and where the cascade
+    // has already weighed the `module type of` it weighed that item too: what
+    // it gave the item over the one rename it would have had is owed back.
+    if (lit && !g.empty())
+      k -= (t_wt(*sg, l, Gone{}) - t_wt(*sg, l, g)) -
+           (t_ren(*sg, Gone{}) - t_ren(*sg, g));
+    return k;
+  }
   const std::unordered_map<std::string, int>& unit_ctors(const std::string& u) {
     auto it = uexi.find(u);
     if (it != uexi.end()) return it->second;
@@ -26182,6 +26345,7 @@ struct Count {
                       : l);
       if (!with_off()) n += with_node(*w, l);
       if (!xwith_off()) n += xwith_node(*w, l);
+      n += twith_node(*w, l);
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
       MtCtx sv = mtctx_;
       mtctx_ = MtCtx::Other;
