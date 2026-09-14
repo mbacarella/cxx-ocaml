@@ -25624,7 +25624,12 @@ struct Count {
   const cmi::ModuleType* cmi_module(const Longident& id,
                                     const cmi::Signature** root) const {
     std::vector<std::string> c;
-    if (!lid_comps(id, c) || c.size() < 2 || mods.count(c[0])) return nullptr;
+    if (!lid_comps(id, c)) return nullptr;
+    return cmi_module_c(c, root);
+  }
+  const cmi::ModuleType* cmi_module_c(std::vector<std::string>& c,
+                                      const cmi::Signature** root) const {
+    if (c.size() < 2 || mods.count(c[0])) return nullptr;
     const cmi::Signature* sg = unit_of_path(c);
     if (!sg) return nullptr;
     *root = sg;
@@ -25638,6 +25643,149 @@ struct Count {
     for (auto& md : sg->modules)
       if (md.name == c.back()) return md.type.get();
     return nullptr;
+  }
+  // ---- A RESULT THAT NAMES A FUNCTOR APPLICATION RE-DOES IT -------------
+  // `MoreLabels.Map.Make` hands back `type 'a t = 'a Map.Make(Ord).t` -- a
+  // `Papply` in a type MANIFEST, and one of the only four in the whole
+  // stdlib (MoreLabels' `Map.Make`, `Set.Make`, `Hashtbl.Make` and
+  // `Hashtbl.MakeSeeded`).  Applying the OUTER functor substitutes the
+  // argument into that path and the typer then RESOLVES it, which we charged
+  // nothing at all: the unit the INNER functor lives in is forced once more
+  // -- items plus TWICE its named functor parameters, a DIRECT force -- and
+  // the inner result is substituted THREE times over, since `Env` keeps one
+  // cache for `components_of_functor_appl` and another for
+  // `modtype_of_functor_appl`.  One further substitution is due for every
+  // DISTINCT argument PATH after the first, and TWO more where the argument
+  // has no path of its own, `nondep_supertype` rebuilding the result instead
+  // of aliasing it.  The charge is FLAT: nesting the binding deeper does not
+  // move it.
+  static bool papp_off() {
+    static const bool off = dbg_env("NOPAPPRES") != nullptr;
+    return off;
+  }
+  // The units this file has opened, nearest LAST.  A bare module head an
+  // `open` provides is the dotted path and SHADOWS a unit of the same name
+  // (S438), which is the whole of why `Map.Make` under `open MoreLabels` is
+  // MoreLabels' functor and not Stdlib's.
+  std::vector<std::string> opened_units_;
+  void popen_reg(const ModuleExpr& e) {
+    if (papp_off()) return;
+    auto* pi = std::get_if<Pmod_ident>(&e.desc);
+    if (!pi) return;
+    auto* li = std::get_if<Lident>(&pi->id.txt.v);
+    if (!li || mods.count(li->name)) return;
+    std::string p = head_cmi(li->name);
+    if (!p.empty() && std::filesystem::exists(p))
+      opened_units_.push_back(li->name);
+  }
+  // The functor a path names, read through the opens first.
+  const cmi::ModuleType* papp_fct(const Longident& id,
+                                  const cmi::Signature** root) const {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.size() < 2 || mods.count(c[0])) return nullptr;
+    for (auto u = opened_units_.rbegin(); u != opened_units_.rend(); ++u) {
+      std::vector<std::string> p{*u};
+      p.insert(p.end(), c.begin(), c.end());
+      const cmi::Signature* r = nullptr;
+      if (const cmi::ModuleType* m = cmi_module_c(p, &r)) {
+        *root = r;
+        return m;
+      }
+    }
+    return cmi_module_c(c, root);
+  }
+  // `Count` has a `strip` of its own over patterns; this is the cmi one.
+  static const cmi::TypeExpr* cstrip(const cmi::TypePtr& t) {
+    const cmi::TypeExpr* p = t.get();
+    for (int i = 0; i < 64 && p && (p->kind == cmi::TypeExpr::Tlink ||
+                                    p->kind == cmi::TypeExpr::Tsubst);
+         ++i)
+      p = p->link.get();
+    return p;
+  }
+  // The functor half of every `Papply` a written type path of the signature
+  // names, at every depth.
+  static void papp_ty(const cmi::TypeExpr* t,
+                      std::vector<const cmi::Path*>& out,
+                      std::set<const cmi::TypeExpr*>& seen, int d) {
+    if (!t || d > 6 || !seen.insert(t).second) return;
+    const cmi::Path* p = t->path.get();
+    for (int i = 0; p && i < 8; ++i) {
+      if (p->kind == cmi::Path::Papply) {
+        if (p->a) out.push_back(p->a.get());
+        break;
+      }
+      if (p->kind != cmi::Path::Pdot && p->kind != cmi::Path::Pextra_ty) break;
+      p = p->a.get();
+    }
+    for (auto& a : t->args) papp_ty(cstrip(a), out, seen, d + 1);
+  }
+  static void papp_sig(const cmi::Signature& sg,
+                       std::vector<const cmi::Path*>& out, int d = 0) {
+    if (d > 4) return;
+    std::set<const cmi::TypeExpr*> seen;
+    for (auto& td : sg.types) papp_ty(cstrip(td.manifest), out, seen, 0);
+    for (auto& md : sg.modules)
+      if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+        papp_sig(*md.type->sig, out, d + 1);
+  }
+  // The inner functors this file APPLIES ITSELF.  `Env` caches the
+  // application by argument, so a file that writes `Map.Make (A)` out has
+  // already paid for what MoreLabels' functor would have re-done and is
+  // charged nothing here.
+  const std::set<std::string>* xk_ = nullptr;
+  std::set<std::string> dpu_, dpf_, dps_;
+  std::map<std::string, std::set<std::string>> dpp_;
+  long long papp_charge(const ModuleExpr& head, int nargs,
+                        const std::string& ak, bool pathless) {
+    if (papp_off()) return 0;
+    const Longident* id = mpath(&head);
+    if (!id) return 0;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = papp_fct(*id, &root);
+    for (int i = 0; i < nargs; ++i) {
+      mt = scrape_cmty(mt, root);
+      if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+      mt = mt->functor_body.get();
+    }
+    mt = scrape_cmty(mt, root);
+    if (!mt || mt->kind != cmi::ModuleType::Sig || !mt->sig) return 0;
+    std::vector<const cmi::Path*> ps;
+    papp_sig(*mt->sig, ps);
+    long long k = 0;
+    for (const cmi::Path* fp : ps) {
+      std::vector<std::string> c;
+      if (!cpath_comps(fp, c) || c.size() < 2) continue;
+      if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
+      if (c[0].rfind("Stdlib__", 0) == 0) c[0] = c[0].substr(8);
+      std::string fkey;
+      for (auto& s : c) fkey += s + ".";
+      if (xk_ && xk_->count(fkey)) continue;
+      std::string unit = c[0];
+      std::vector<std::string> uc = c;
+      const cmi::Signature* ur = nullptr;
+      const cmi::ModuleType* fm = cmi_module_c(uc, &ur);
+      fm = scrape_cmty(fm, ur);
+      if (!fm || fm->kind != cmi::ModuleType::Functor) continue;
+      long long fl = flat_cmty(scrape_cmty(fm->functor_body.get(), ur));
+      std::set<std::string>& seen = dpp_[fkey];
+      std::size_t had = seen.size();
+      bool newpath = !pathless && seen.insert(ak).second;
+      long long nf = 0;
+      if (dpf_.insert(fkey).second) nf = 3;
+      else if (newpath && had >= 1) nf = 1;
+      k += nf * fl;
+      if (pathless && dps_.insert(fkey).second) k += 2 * fl;
+      if (!dpu_.insert(unit).second) continue;
+      std::string up = head_cmi(unit);
+      if (up.empty() || !std::filesystem::exists(up)) continue;
+      try {
+        k += load_cost(cmi::CmiFile::load(up).sig(),
+                       dbg_env("NOEXTRALOAD") == nullptr, 2);
+      } catch (...) {
+      }
+    }
+    return k;
   }
   // What ONE substitution of a cross-unit functor that is still to be applied
   // names: its own parameters, the items of the RESULT, and -- since the
@@ -25751,6 +25899,11 @@ struct Count {
     if (saved && !inexpr_ && !xpathless && mt->kind == cmi::ModuleType::Sig &&
         mt->sig && str_csig(*mt->sig) && fstr.insert(key).second)
       k += 2 * flat_cmty(mt);
+    // A structure BEHIND an ascription is not saved, and a result the
+    // ascription does not name is never read at all: `module M : sig end =
+    // struct module Q = Map.Make (A) end` costs ref almost nothing.
+    if (saved && saved_ && !inexpr_ && !rebind)
+      k += papp_charge(head, nargs, ak, xpathless);
     return k;
   }
   // A parameter given as a NAMED module type is not a signature the
@@ -26645,6 +26798,7 @@ struct Count {
           !gopen_off() && !std::holds_alternative<Pmod_ident>(o->expr.desc);
       mexpr(o->expr, gen ? flat() : Lvl{1, 1, 0, true}, false);
       reg_open(o->expr);
+      popen_reg(o->expr);
       if (!lal_off())
         if (auto* oi = std::get_if<Pmod_ident>(&o->expr.desc)) {
           bool os = false;
@@ -26689,8 +26843,34 @@ int typing_ident_count(const ast::Structure& s) {
     auto lb = u.local.find(nm);
     if (lb != u.local.end() && lb->second == 1) used.insert(nm);
   }
+  // Which cross-unit functors does the file apply ITSELF?  A bare head one
+  // of its `open`s provides is that unit's submodule and names a DIFFERENT
+  // functor (S438), so `Map.Make` under `open MoreLabels` is not Stdlib's.
+  std::set<std::string> xkeys;
+  for (auto& fa : u.fapps) {
+    std::vector<std::string> c0 = fa.first;
+    if (c0.size() < 2) continue;
+    bool shadowed = false;
+    for (auto& o : u.opens) {
+      std::vector<std::string> p{o};
+      p.insert(p.end(), c0.begin(), c0.end());
+      const cmi::Signature* sg = stampcount::unit_of_path(p);
+      for (std::size_t i = 1; sg && i + 1 < p.size(); ++i)
+        sg = stampcount::submodule(*sg, p[i]);
+      if (!sg) continue;
+      for (auto& md : sg->modules)
+        if (md.name == p.back()) shadowed = true;
+    }
+    if (shadowed) continue;
+    if (c0[0] == "Stdlib" && c0.size() > 2) c0.erase(c0.begin());
+    if (c0[0].rfind("Stdlib__", 0) == 0) c0[0] = c0[0].substr(8);
+    std::string k;
+    for (auto& t : c0) k += t + ".";
+    xkeys.insert(k);
+  }
   stampcount::Count c;
   c.used_ = &used;
+  c.xk_ = &xkeys;
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
