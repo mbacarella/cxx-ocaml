@@ -24356,6 +24356,89 @@ struct Count {
     return k;
   }
 
+  // ---- A RECURSIVE BINDING DEFINED BY AN APPLICATION --------------------
+  // `check_recmodule_inclusion` substitutes each binding's ACTUAL signature
+  // once per round, and the actual signature of `module rec M : T = F (M)` is
+  // the functor's RESULT -- one ident per item of it, n times over for a
+  // group of n bindings.  `ren_mexpr` stops at the application and weighed
+  // that result at nothing.  A functor whose body is its own PARAMETER hands
+  // back the parameter's declared signature; a head this file cannot read --
+  // a functor of another unit, or one a parameter stands for -- answers
+  // nothing and the binding pays what it paid before.
+  static bool recapp_off() {
+    static const bool off = dbg_env("NORECAPP") != nullptr;
+    return off;
+  }
+  // A result that binds one value name twice is left alone: the signature
+  // keeps only the last binding, but the weight the APPLICATION itself is
+  // charged at counts both, so charging the rounds over the deduplicated
+  // count on top of that would over-count by one per repeat.
+  static bool dupval_free(const ModuleExpr& m, int d = 0) {
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st || d > 8) return true;
+    if (dup_vals(st->items)) return false;
+    for (auto& it : st->items) {
+      if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+        if (!dupval_free(mb->binding.expr, d + 1)) return false;
+      } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        if (!dupval_free(i->expr, d + 1)) return false;
+      }
+    }
+    return true;
+  }
+  // A declared signature that NAMES a module type -- `Set.S with type elt =
+  // M.t` -- is the only place the cross-unit charge below may be added to:
+  // where the declaration writes the signature out instead, the result it
+  // discards is one this file already over-charges the application for (the
+  // unit's own load, a law of its own and still open), and the rounds would
+  // only deepen that.
+  static bool mty_named(const ModuleType* mt) {
+    for (int i = 0; mt && i < 8; ++i) {
+      auto* w = std::get_if<Pmty_with>(&mt->desc);
+      if (!w) return std::holds_alternative<Pmty_ident>(mt->desc);
+      mt = w->mt.get();
+    }
+    return false;
+  }
+  // The functor of ANOTHER unit is read out of its `.cmi` the same way: one
+  // ident per item of the result, at every depth.
+  long long xrecapp(const ModuleExpr& head, int nargs) const {
+    const Longident* id = mpath(&head);
+    if (!id) return 0;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = cmi_module(*id, &root);
+    for (int i = 0; i < nargs; ++i) {
+      mt = scrape_cmty(mt, root);
+      if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+      mt = mt->functor_body.get();
+    }
+    return flat_cmty(scrape_cmty(mt, root));
+  }
+  long long recapp(const ModuleExpr& m, const ModuleType* decl) const {
+    if (recapp_off()) return 0;
+    int nargs = 0;
+    const ModuleExpr* h = &m;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+      ++nargs;
+      h = a->f.get();
+    }
+    if (!nargs) return 0;
+    const ModuleExpr* me = mderef(h);
+    if (!me) return mty_named(decl) ? xrecapp(*h, nargs) : 0;
+    for (int i = 0; i < nargs; ++i) {
+      if (!me) return 0;
+      auto* f = std::get_if<Pmod_functor>(&me->desc);
+      if (!f) return 0;
+      const ModuleExpr* b = mderef(f->body.get());
+      if (b && std::get_if<Pmod_apply>(&b->desc)) b = app_res(b);
+      if (!b) {
+        const ModuleType* pt = param_body(*f);
+        return pt && i + 1 == nargs ? ren_mty(*pt) : 0;
+      }
+      me = b;
+    }
+    return dupval_free(*me) ? ren_mexpr(*me, Sibs{}) : 0;
+  }
   // QUADRATIC: `check_recmodule_inclusion` (typemod.ml:2182) runs one round per
   // binding and each round names a fresh Y_i for EVERY binding, while
   // `transl_recmodule_modtypes` approximates every binding in an environment
@@ -24388,7 +24471,7 @@ struct Count {
       k += pass + sub + ctl_mty(*c->mt) + dec_mty(*c->mt) +
            (recfun_off() ? 0 : rfun_mty(*c->mt)) +
            (recfun_off() ? 0 : (rounds + 1) * sibapp(*c->me, sib)) +
-           rounds * ren_mexpr(*c->me, sib);
+           rounds * (ren_mexpr(*c->me, sib) + recapp(*c->me, c->mt.get()));
     }
     return k;
   }
