@@ -22646,8 +22646,9 @@ struct Count {
   // the `with`-constraints on the way.  Only module types of THIS file can be
   // read; a base that does not resolve is charged nothing at all.
   const ModuleType* named_mty(const Longident& id, int fuel) const {
+    if (fuel <= 0) return nullptr;
     auto* b = std::get_if<Lident>(&id.v);
-    if (!b || fuel <= 0) return nullptr;
+    if (!b) return dotted_mty(id, fuel);
     auto it = mtys.find(b->name);
     if (it == mtys.end() || it->second.empty()) return nullptr;
     return it->second.back();
@@ -22660,6 +22661,77 @@ struct Count {
     if (auto* id = std::get_if<Pmty_ident>(&mt->desc))
       return mty_sig(named_mty(id->id.txt, fuel), fuel - 1);
     return nullptr;
+  }
+  // --- A MODULE TYPE READ THROUGH A PARENT IS SUBSTITUTED ONCE MORE -----
+  // `named_mty` answered a bare name and nothing else, so `X.S` -- and
+  // `X.Y.S`, and an alias's `W.S` -- resolved to NOTHING and the whole
+  // `with` merge over such a base was charged 0.  Resolving them gives the
+  // S449 local law; on top of it, reading the declaration through its
+  // PARENT substitutes it once more, one ident per item at every depth,
+  // FLAT and once for the whole file however many times it is named.  This
+  // is the local twin of S450's `xforce` and it scrapes where that one
+  // does: a `with` over the path, an ascription and a functor parameter
+  // each read the declaration, while `module type T = X.S` and a bare
+  // `(module X.S)` leave the path alone and cost nothing.
+  static bool dmty_off() {
+    static const bool off = dbg_env("NODOTMTY") != nullptr;
+    return off;
+  }
+  const ModuleExpr* mod_named(const std::string& nm) const {
+    auto it = mods.find(nm);
+    if (it == mods.end() || it->second.empty()) return nullptr;
+    return it->second.back();
+  }
+  // The structure the first `n` names of a path finally stand for, through
+  // this file's aliases -- a dotted alias target included, which is why
+  // `tof_me` does the walking and `mderef` does not.
+  const Pmod_structure* dmod(const std::vector<std::string>& c,
+                             std::size_t n) const {
+    if (c.empty() || n == 0) return nullptr;
+    const ModuleExpr* me = mod_named(c[0]);
+    const Pmod_structure* st = me ? tof_me(*me) : nullptr;
+    for (std::size_t j = 1; st && j < n; ++j) {
+      const ModuleExpr* s = nullptr;
+      for (auto& it : st->items)
+        if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+          if (mb->binding.name.txt && *mb->binding.name.txt == c[j])
+            s = &mb->binding.expr;
+      st = s ? tof_me(*s) : nullptr;
+    }
+    return st;
+  }
+  // The module type a DOTTED path of THIS file names.  Another unit's path
+  // resolves to nothing here and stays S450's business.
+  const ModuleType* dotted_mty(const Longident& id, int fuel) const {
+    if (dmty_off() || fuel <= 0) return nullptr;
+    std::vector<std::string> c;
+    if (!lid_path(id, c) || c.size() < 2) return nullptr;
+    const Pmod_structure* st = dmod(c, c.size() - 1);
+    if (!st) return nullptr;
+    const ModuleType* r = nullptr;
+    for (auto& it : st->items)
+      if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
+        if (m->name.txt == c.back() && m->type) r = &*m->type;
+    return r;
+  }
+  // The declarations already read, so that `X.Y.S` and an alias's `W.S`
+  // share the one force, and a second use of either pays nothing.
+  mutable std::set<const ModuleType*> dscraped;
+  long long dforce(const ModuleType& mt, int fuel = 8) const {
+    if (dmty_off() || fuel <= 0) return 0;
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc))
+      return w->mt ? dforce(*w->mt, fuel - 1) : 0;
+    auto* id = std::get_if<Pmty_ident>(&mt.desc);
+    if (!id) return 0;
+    // A bare name is read where it stands and costs nothing of its own;
+    // what it was declared to be may still be a path.
+    if (std::holds_alternative<Lident>(id->id.txt.v)) {
+      const ModuleType* d = named_mty(id->id.txt, fuel);
+      return d ? dforce(*d, fuel - 1) : 0;
+    }
+    const ModuleType* d = dotted_mty(id->id.txt, fuel);
+    if (!d || !dscraped.insert(d).second) return 0;
+    return ren_mty(*d);
   }
   // The pieces of ONE constraint: the path it names, whether it removes the
   // item, and the declaration a `with type` gives.
@@ -26328,6 +26400,7 @@ struct Count {
   }
   void mty(const ModuleType& mt, const Lvl& l, bool bind = false) {
     if (bind && !xwith_off()) n += xforce(mt);
+    if (bind) n += dforce(mt);
     if (auto* i = std::get_if<Pmty_ident>(&mt.desc)) {
       n += mtapp_charge(i->id.txt);
     } else if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
@@ -26346,6 +26419,7 @@ struct Count {
       if (!with_off()) n += with_node(*w, l);
       if (!xwith_off()) n += xwith_node(*w, l);
       n += twith_node(*w, l);
+      n += dforce(mt);
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
       MtCtx sv = mtctx_;
       mtctx_ = MtCtx::Other;
