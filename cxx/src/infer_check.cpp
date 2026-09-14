@@ -24382,6 +24382,20 @@ struct Count {
     static const bool off = dbg_env("NOMODAPP") != nullptr;
     return off;
   }
+  // ---- A GENERATIVE STEP DOES NOT UNDO THE SUBSTITUTION BEFORE IT ---------
+  // `type_one_application` (typemod.ml:2660) hands back `r` itself for an
+  // `Mty_functor(Unit, r)`, so a generative application substitutes nothing.
+  // What it does NOT do is stop the NAMED application before it: `Subst`
+  // walks a functor type EAGERLY (subst.ml:695), parameter and result alike,
+  // so the named substitution already wrote the result out THROUGH the unit
+  // arrows still to be applied -- and `F (A) ()` costs exactly what `F (A)`
+  // over the same result costs.  The result stays a functor here on purpose:
+  // a generative application has no path, so `Mtype.strengthen` never reaches
+  // it and none of the rebuilding an applicative result pays for applies.
+  static bool gen_off() {
+    static const bool off = dbg_env("NOGENAPP") != nullptr;
+    return off;
+  }
   // What a signature costs where it stands: one ident per item Subst renames,
   // at the weight the level gives it.  This is `ren_mty` with the cascade on
   // top, and unlike `ren_mty` it does NOT walk a functor parameter's own
@@ -25532,14 +25546,17 @@ struct Count {
     const bool reb = !curpar_off() && rebind;
     const ModuleExpr* head = &m;
     int nargs = 0;
+    int ngen = 0;  // generative steps, every one of them AFTER the named ones
     for (;;) {
       if (auto* a = std::get_if<Pmod_apply>(&head->desc)) {
         ++nargs;
         head = a->f.get();
-      } else if (std::holds_alternative<Pmod_apply_unit>(head->desc)) {
-        // A GENERATIVE application substitutes NOTHING: `Mty_functor(Unit, r)`
-        // hands back `r` itself (typemod.ml:2660).
-        return 0;
+      } else if (auto* u = std::get_if<Pmod_apply_unit>(&head->desc)) {
+        // A generative step that comes BEFORE a named one hands its result
+        // on unsubstituted, and is not modelled.
+        if (nargs || gen_off()) return 0;
+        ++ngen;
+        head = u->f.get();
       } else {
         break;
       }
@@ -25547,7 +25564,7 @@ struct Count {
     if (nargs == 0) return 0;
     const ModuleExpr* me = mderef(head);
     const ModuleType* mt = nullptr;
-    if (!me) return cross_charge(m, *head, nargs, l, saved, rebind);
+    if (!me) return ngen ? 0 : cross_charge(m, *head, nargs, l, saved, rebind);
     const ModuleExpr* fdef = me;
     bool pathless = false;
     // The arguments, innermost application first, so that the one the i-th
@@ -25583,7 +25600,9 @@ struct Count {
         } else {
           const ModuleType* pt = pbody_off() ? nullptr : param_body(*f);
           if (!pt)
-            return k + alias_charge(*f, args[nargs - 1 - i], pathless);
+            return ngen ? 0 : k + alias_charge(*f, args[nargs - 1 - i],
+                                               pathless);
+          if (ngen) return 0;  // the result is the PARAMETER, not an arrow
           mt = pt;
           me = nullptr;
           pbody = true;
