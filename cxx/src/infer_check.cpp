@@ -22399,6 +22399,7 @@ struct Count {
     }
     if (auto* o = std::get_if<Ppat_open>(&p.desc)) { pat(*o->p, out); return; }
     if (auto* u = std::get_if<Ppat_unpack>(&p.desc)) {
+      if (u->pkg) n += pk_with(*u->pkg, 1);
       if (u->name.txt) { ++n; if (out) out->push_back(*u->name.txt); }
       return;
     }
@@ -23098,9 +23099,13 @@ struct Count {
       mt = w->mt.get();
     }
     auto* id = mt ? std::get_if<Pmty_ident>(&mt->desc) : nullptr;
-    if (!id) return nullptr;
+    return id ? xpath_sig(id->id.txt, key) : nullptr;
+  }
+  // The same, from the PATH alone: a package type writes one where a module
+  // type writes an `Mty_ident`.
+  const cmi::Signature* xpath_sig(const Longident& lid, std::string& key) const {
     std::vector<std::string> c;
-    if (!lid_path(id->id.txt, c) || c.size() < 2) return nullptr;
+    if (!lid_path(lid, c) || c.size() < 2) return nullptr;
     if (auto f = mods.find(c[0]); f != mods.end() && !f->second.empty())
       return nullptr;
     const cmi::Signature* sg = unit_of_path(c);  // normalises c in place
@@ -23798,6 +23803,12 @@ struct Count {
       expr(*t->body);
     } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
       auto m = mark();
+      // `let module M = .. in e` binds M in `e` ALONE.  Nothing popped it,
+      // so the name stayed in `mods` for the rest of the file and SHADOWED
+      // whatever else it stood for -- a unit of its own name included, which
+      // is what hid `Set.S` from `xpath_sig` for the whole of `fstclassmod`
+      // after its first `let module Set = (val set : Set.S with ..)`.
+      auto mk = mmark();
       auto ek = emark();
       auto tk = tmark();
       auto ok = omark();
@@ -23812,6 +23823,7 @@ struct Count {
       inexpr_ = ie;
       expr(*s->body);
       release(m);
+      if (!pkwith_off()) mrelease(mk);
       erelease(ek);
       trelease(tk);
       orelease(ok);
@@ -23826,6 +23838,7 @@ struct Count {
     } else if (auto* p = std::get_if<Pexp_pack>(&e.desc)) {
       mexpr(*p->me);
       if (p->pkg && !packty_off()) n += pack_pkg(*p->pkg);
+      if (p->pkg) n += pk_with(*p->pkg, 2);
       n += pk_wrap(*p->me);
     } else if (auto* l = std::get_if<Pexp_letop>(&e.desc)) {
       auto m = mark();
@@ -25694,6 +25707,63 @@ struct Count {
       return str_csigc(*cs, conc);
     return false;
   }
+  // ---- A `with` OVER A MODULE TYPE NAME IN A PACKAGE TYPE ----------------
+  // `pack_pkg` weighs a package type by its CONSTRAINTS alone, so a package
+  // whose base is a NAME was charged nothing for the signature that name
+  // stands for.  But `Typemod.package_constraints` builds the constrained
+  // module type outright -- the signature is written out and every item of
+  // it renamed -- so every position that BUILDS a module from a package type
+  // pays for it: `(val x : S with ..)` and a `(module M : S with ..)`
+  // PATTERN once apiece, a `(module M : S with ..)` EXPRESSION twice, since
+  // the pack checks the module against the type and then names the type
+  // again.  A BARE `(module S)` is left a path and costs nothing.  On top of
+  // that, reading the declaration through a PARENT or out of another unit
+  // forces it once for the whole file -- the very force `dforce`/`xforce`
+  // already charge elsewhere, and it shares their caches in either order.
+  // An UNPACK pays a FLAT 3 besides, whatever the module type holds.
+  // NOT here, and left an under-count: the two `Pkg` idents a SAVED value
+  // whose type carries a package the source did not WRITE is charged, which
+  // wants that type and so wants inference; `let g = (module Z : S)` is 2
+  // short for it but `let g = ignore (module Z : S)` and an annotated
+  // `let g : (module S) = ..` are not, so there is no parsetree rule here.
+  static bool pkwith_off() {
+    static const bool off = dbg_env("NOPKWITH") != nullptr;
+    return off;
+  }
+  // The signature a module type PATH names, weighed FLAT: this file's own
+  // module types first, a dotted one of this file next, another unit's last.
+  long long pk_pathwt(const Longident& id) const {
+    const ModuleType* d = std::holds_alternative<Lident>(id.v)
+                              ? named_mty(id, 8)
+                              : dotted_mty(id, 8);
+    if (const Signature* sg = d ? mty_sig(d) : nullptr)
+      return w_wt(*sg, flat(), Gone{});
+    std::string key;
+    if (const cmi::Signature* cs = xpath_sig(id, key)) return flat_csig(*cs);
+    return 0;
+  }
+  // The once-per-file scrape of a declaration read through a PARENT or out
+  // of another unit.  A BARE name is read where it stands and costs nothing
+  // of its own; what it was declared to be may still be a path.
+  long long pk_force(const Longident& id) const {
+    if (!dmty_off()) {
+      if (std::holds_alternative<Lident>(id.v)) {
+        if (const ModuleType* d = named_mty(id, 8)) return dforce(*d, 7);
+      } else if (const ModuleType* d = dotted_mty(id, 8)) {
+        return dscraped.insert(d).second ? ren_mty(*d) : 0;
+      }
+    }
+    std::string key;
+    if (const cmi::Signature* cs = xpath_sig(id, key))
+      return wscraped.insert(key).second ? flat_csig(*cs) : 0;
+    return 0;
+  }
+  long long pk_with(const Ptyp_package& p, long long mult) const {
+    if (pkwith_off()) return 0;
+    long long k = pk_force(p.path.txt);
+    if (!p.constraints.empty()) k += mult * pk_pathwt(p.path.txt);
+    return k;
+  }
   // Follow this file's `module F2 = F` aliases to the path the head finally
   // names; null where the head is not an identifier at all.
   const Longident* mpath(const ModuleExpr* m) const {
@@ -26505,6 +26575,9 @@ struct Count {
       n += app_charge(m, saved ? l : flat(), saved);
     } else if (auto* u = std::get_if<Pmod_unpack>(&m.desc)) {
       expr(*u->e);
+      if (auto* c = std::get_if<Pexp_constraint>(&u->e->desc))
+        if (auto* pk = std::get_if<Ptyp_package>(&c->t->desc))
+          n += pk_with(*pk, 1) + (pkwith_off() ? 0 : 3);
     }
   }
   // A functor written as a MODULE TYPE costs more than the same functor
