@@ -20156,6 +20156,38 @@ struct Applied {
 };
 void applied_walk(const cmi::TypePtr& t, const cmi::Signature& sg,
                   std::set<const cmi::TypeExpr*>& seen, Applied& out);
+// ---- A NULLARY HEAD MET AT A UNIFICATION IS LOOKED UP AGAIN --------------
+// Reading a member's type RESOLVES the paths it names, once.  Unifying AT one
+// of them -- an argument against the domain it meets, the application's result
+// against what is expected of it -- looks that head up a SECOND time, and
+// through one of Stdlib's aliases a second look-up is a second FORCE of the
+// whole signature.  An ABBREVIATION is expanded rather than looked up, so it
+// stays at one: `Random.bits32 ()`, whose `Int32.t` unfolds to a predefined
+// `int32`, is 22 + 51, where `Effect.Deep.get_callstack k n`, whose
+// `Printexc.raw_backtrace` is abstract, is 21 + 34 + 34, `Bytes.get_utf_8_uchar
+// b i` pays Uchar's 29 twice and `Parsing.symbol_start_pos ()` Lexing's 24
+// twice for a RECORD.  A path that is NOT one of Stdlib's aliases is forced
+// once either way.
+bool unif_off() {
+  static const bool off = dbg_env("NOUNIHEAD") != nullptr;
+  return off;
+}
+bool unidom_off() {
+  static const bool off = dbg_env("NOUNIDOM") != nullptr;
+  return off;
+}
+// Does unit `u` declare `n` as an ABBREVIATION?  Unknown is taken as one,
+// which charges nothing beyond the load the citation already pays for.
+bool unit_abbrev(const std::string& u, const std::string& n) {
+  std::string p = head_cmi(u);
+  if (p.empty() || !std::filesystem::exists(p)) return true;
+  try {
+    for (auto& d : cmi::CmiFile::load(p).sig().types)
+      if (d.name == n) return d.manifest != nullptr;
+  } catch (...) {
+  }
+  return true;
+}
 // An ABBREVIATION is expanded rather than looked up again, so it charges what
 // its MANIFEST names and not its own signature: `Scanf.sscanf`, whose
 // `scanner` unfolds to arrows and a Stdlib `format4`, costs 16 once, and
@@ -20177,13 +20209,12 @@ void applied_head(const cmi::Path* p, const cmi::Signature& sg,
   }
   bool al = false;
   std::string u = path_unit(p, &al);
-  // An APPLIED constructor of another unit is looked up twice; the RESULT of
-  // an application only once (`Random.bits32 ()`, whose `Int32.t` is spelled
-  // through Stdlib, is 22 + 51 and not 22 + 51 + 51), and an argument's
-  // DOMAIN, where only the declaring signature's own force is measured, not
-  // at all (`cross == 0`).
+  // An APPLIED constructor of another unit is looked up twice whatever it
+  // unfolds to (`cross == 2`); a head met at a UNIFICATION (`cross == 1`)
+  // only where it is not an abbreviation; `cross == 0` charges nothing.
   if (u.empty() || cross == 0) return;
   int n = al ? cross : 1;
+  if (al && cross == 1 && !unif_off() && !unit_abbrev(u, p->s)) n = 2;
   if (out.units[u] < n) out.units[u] = n;
 }
 // A Tpoly wraps a member's type and hangs its body off `link` (cmi.cpp case
@@ -21467,8 +21498,12 @@ struct Cites {
         // Unifying an argument with the domain it meets forces the signature
         // that DECLARES that domain a second time: `Buffer.length b` is
         // 41 + 41 and `Format.pp_print_string Format.std_formatter "x"`
-        // 173 + 173, where the same members read cost one load.
-        head_load(spine(p->dom), sg, out, 0);
+        // 173 + 173, where the same members read cost one load.  A domain
+        // belonging to ANOTHER unit is forced there and then, twice through
+        // an alias: `Printf.bprintf b` pays Buffer's 41 twice and
+        // `Condition.wait c m` Mutex's 6 twice.
+        head_load(spine(p->dom), sg, out,
+                  unif_off() || unidom_off() ? 0 : 1);
         p = spine(p->cod);
       }
       head_load(p, sg, out, 1);
