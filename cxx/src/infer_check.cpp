@@ -25157,6 +25157,50 @@ struct Count {
     }
     return mt;
   }
+  // ---- A FUNCTOR WHOSE BODY IS AN APPLICATION STILL HAS A RESULT ---------
+  // `module F10 (X : T) = F (F (.. (X)))` leaves exactly what the innermost
+  // functor's body leaves, and applying F10 substitutes THAT -- one ident per
+  // item, at every depth, just as applying F itself does.  `mderef` stops at
+  // the application and the result was weighed at nothing; walk the spine and
+  // consume one functor level per argument to reach the module it evaluates
+  // to.  A head this file cannot read answers nothing and the caller charges
+  // what it charged before.
+  static bool appbody_off() {
+    static const bool off = dbg_env("NOAPPBODY") != nullptr;
+    return off;
+  }
+  const ModuleExpr* app_res(const ModuleExpr* m, int d = 0) const {
+    if (!m || d > 8) return nullptr;
+    int n = 0;
+    const ModuleExpr* h = m;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++n; h = a->f.get(); }
+    if (!n) return nullptr;
+    const ModuleExpr* me = mderef(h);
+    for (int i = 0; i < n; ++i) {
+      if (!me) return nullptr;
+      auto* f = std::get_if<Pmod_functor>(&me->desc);
+      if (!f) return nullptr;
+      me = mderef(f->body.get());
+      if (me && std::get_if<Pmod_apply>(&me->desc)) me = app_res(me, d + 1);
+    }
+    return me;
+  }
+  // An ARGUMENT that is itself an application of a functor whose body this
+  // file can weigh has already substituted that result once, so a functor
+  // reached through an application has nothing left to pay for but the
+  // rebuild.
+  bool str_app_arg(const ModuleExpr& e) const {
+    int n = 0;
+    const ModuleExpr* h = &e;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++n; h = a->f.get(); }
+    if (!n) return false;
+    const ModuleExpr* me = mderef(h);
+    if (!me) return false;
+    auto* fn = std::get_if<Pmod_functor>(&me->desc);
+    if (!fn) return false;
+    const ModuleExpr* b = mderef(fn->body.get());
+    return b && std::holds_alternative<Pmod_structure>(b->desc);
+  }
   static bool xapp_off() {
     static const bool off = dbg_env("NOXMODAPP") != nullptr;
     return off;
@@ -25599,6 +25643,40 @@ struct Count {
     if (!fn) return 0;
     return alias_charge(*fn, ae, false);
   }
+  // ---- A MODULE TYPE READ THROUGH A FUNCTOR APPLICATION ------------------
+  // `F (M).S` is no name in scope: `Env.components_of_functor_appl` BUILDS
+  // the applied signature to find S in it -- one ident per item of the
+  // functor's result -- and what it builds is cached under the Papply PATH,
+  // so a SECOND SPELLING of the same argument builds it over again where a
+  // repeat of the same path does not.  Over the result's item count R the
+  // first path met is worth 4R, a later one naming a module not yet applied
+  // 2R, and one that merely re-spells a module already applied R.  A functor
+  // of another unit is not in this parsetree and is left alone.
+  static bool mtapp_off() {
+    static const bool off = dbg_env("NOMTAPP") != nullptr;
+    return off;
+  }
+  std::set<std::string> mtapath_;  // the applied paths already built
+  std::map<const ModuleExpr*, std::set<const ModuleExpr*>> mtamod_;
+  long long mtapp_charge(const Longident& id) {
+    if (mtapp_off()) return 0;
+    if (auto* d = std::get_if<Ldot>(&id.v)) return mtapp_charge(*d->prefix);
+    auto* a = std::get_if<Lapply>(&id.v);
+    if (!a) return 0;
+    bool s1 = false, s2 = false;
+    const ModuleExpr* fe = lal_res(*a->f, s1);
+    const ModuleExpr* ae = lal_res(*a->x, s2);
+    if (!fe || !ae) return 0;
+    auto* fn = std::get_if<Pmod_functor>(&fe->desc);
+    if (!fn) return 0;
+    const ModuleExpr* b = mderef(fn->body.get());
+    if (!b || !std::holds_alternative<Pmod_structure>(b->desc)) return 0;
+    if (!mtapath_.insert(lid_full(id)).second) return 0;
+    auto& seen = mtamod_[fe];
+    const bool first = seen.empty();
+    const bool fresh = seen.insert(ae).second;
+    return wt_mexpr(*b, flat()) * (first ? 4 : fresh ? 2 : 1);
+  }
   long long lapp_path(const Longident& id) {
     if (auto* d = std::get_if<Ldot>(&id.v)) return lapp_path(*d->prefix);
     return lapp_charge(id);
@@ -25681,6 +25759,7 @@ struct Count {
     long long k = 0;
     std::vector<std::pair<std::string, const ModuleType*>> fps;
     bool pbody = false;  // the result is the PARAMETER, and so an alias
+    bool thru = false;   // the result was reached THROUGH an application
     for (int i = 0; i < nargs; ++i) {
       if (me)
         if (auto* c = std::get_if<Pmod_constraint>(&me->desc)) {
@@ -25696,6 +25775,8 @@ struct Count {
           if (cpar && nm->type) k += i * par_wt(*nm->type, fps);
         }
         const ModuleExpr* b = mderef(f->body.get());
+        if (b && !appbody_off() && std::get_if<Pmod_apply>(&b->desc))
+          if (const ModuleExpr* r = app_res(b)) { b = r; thru = true; }
         if (b) {
           me = b;
         } else {
@@ -25742,9 +25823,20 @@ struct Count {
           named_args = false;
         h = a->f.get();
       }
+      // The lump below stands for the rebuild AND the functor's FIRST
+      // application; a result reached through an application whose argument
+      // this file has already applied is left owing only the rebuild.
+      bool spent = false;
+      if (thru)
+        for (const ModuleExpr* h = &m;;) {
+          auto* a = std::get_if<Pmod_apply>(&h->desc);
+          if (!a) break;
+          if (str_app_arg(*a->arg)) spent = true;
+          h = a->f.get();
+        }
       if (nargs > 1 || !named_args || lapp_off()) {
-        k += 2 * fl;
-      } else {
+        k += spent ? fl : 2 * fl;
+      } else if (!thru) {
         std::string key = std::to_string((std::uintptr_t)fdef);
         std::string ak = key;
         for (const ModuleExpr* h = &m;;) {
@@ -25990,7 +26082,9 @@ struct Count {
   }
   void mty(const ModuleType& mt, const Lvl& l, bool bind = false) {
     if (bind && !xwith_off()) n += xforce(mt);
-    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+    if (auto* i = std::get_if<Pmty_ident>(&mt.desc)) {
+      n += mtapp_charge(i->id.txt);
+    } else if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
       sig_items(s->items, l);
     } else if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
       n += mtfun_wt(*f, l);
