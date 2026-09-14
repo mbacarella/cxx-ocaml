@@ -20475,12 +20475,26 @@ bool curpar_off() {
   return off;
 }
 
+bool prebind_off() {
+  static const bool off = dbg_env("NOPREBIND") != nullptr;
+  return off;
+}
+
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
   // Module names the file binds itself, with how MANY times: a name bound
   // twice (a functor parameter's member and a local structure's, say) is
   // ambiguous, so its alias is not followed.
   std::map<std::string, int> local;
+  // ---- A LOCAL MODULE SHADOWS A UNIT ONLY FROM ITS BINDING ON --------------
+  // `module Int = struct let compare = Int.compare end` reads STDLIB's Int and
+  // pays its 41: the binding is not recursive, so it is not in scope inside its
+  // own body -- nor is it in scope for anything WRITTEN BEFORE it, which is why
+  // `let c = Int.compare  module Int = struct .. end` pays the 41 as well.  The
+  // names cited where nothing shadowed them yet:
+  std::set<std::string> pre;
+  // Module bindings whose own body the walk is inside, by nesting depth.
+  std::map<std::string, int> selfb_;
   std::map<std::string, std::string> alias;  // local name -> its target
   // Which members of a cited unit the file NAMES, and which units it
   // opens together with every bare value name it uses: reading a
@@ -20524,8 +20538,22 @@ struct Cites {
     if (m.empty() || m == "Stdlib") return;
     if (!std::isupper((unsigned char)m[0])) return;
     units.insert(m);
+    auto lb = local.find(m);
+    auto sb = selfb_.find(m);
+    int sh = (lb == local.end() ? 0 : lb->second) -
+             (sb == selfb_.end() ? 0 : sb->second);
+    if (sh <= 0) pre.insert(m);
   }
   void bind_mod(const StrOptLoc& n) { if (n.txt) local[*n.txt]++; }
+  // Is `m` shadowed WHERE THE WALK STANDS?  The bindings are recorded in
+  // source order, so the only one a name can carry too early is its own.
+  bool shadowed(const std::string& m) const {
+    auto lb = local.find(m);
+    if (lb == local.end()) return false;
+    if (prebind_off()) return true;
+    auto sb = selfb_.find(m);
+    return lb->second - (sb == selfb_.end() ? 0 : sb->second) > 0;
+  }
   // Module PATHS the file reads INSIDE: every strict module prefix of a
   // dotted path, and every module it opens.  Reading a member is what forces
   // that module's components (see `modforce_cost` below).
@@ -20543,9 +20571,12 @@ struct Cites {
     if (!n.txt) return false;
     if (auto* l = std::get_if<Lident>(&id.v)) {
       std::string ow = opened_owner(l->name);
-      // `open Effect  module D = Deep` aliases the SUBMODULE, and waits for a
-      // use of D exactly as `module D = Effect.Deep` does.
-      if (ow.empty()) alias.emplace(*n.txt, l->name);
+      // `module List = List` is no alias to itself -- the binding is not in
+      // scope in its own right-hand side, so the name there is the UNIT --
+      // where `open Effect  module D = Deep` aliases the SUBMODULE, and waits
+      // for a use of D exactly as `module D = Effect.Deep` does.
+      if (ow.empty() && *n.txt == l->name && !prebind_off()) add(l->name);
+      else if (ow.empty()) alias.emplace(*n.txt, l->name);
       else { add(ow); subalias.emplace(*n.txt, ow + "." + l->name); }
       return true;
     }
@@ -20573,6 +20604,13 @@ struct Cites {
       u = it == alias.end() ? std::string() : it->second;
     }
     return local.count(u) ? std::string() : u;
+  }
+  // The same question where the citation STANDS: a name cited before the
+  // local binding that shadows it -- or inside that binding's own body --
+  // still names the unit.
+  std::string unit_here(const std::string& m) const {
+    if (!prebind_off() && pre.count(m)) return m;
+    return unit_of(m);
   }
   static bool has_sub(const cmi::Signature& sg, const std::string& n) {
     for (auto& m : sg.modules)
@@ -21267,7 +21305,7 @@ struct Cites {
       cite(i->id, false);
       if (force && !std::holds_alternative<Lapply>(i->id.txt.v)) {
         std::vector<std::string> c = split_dotted(lid_full(i->id.txt));
-        if (c.size() >= 2 && !local.count(c[0])) mtf.insert(c[0]);
+        if (c.size() >= 2 && !shadowed(c[0])) mtf.insert(c[0]);
       }
     } else if (auto* s = std::get_if<Pmty_signature>(&m.desc)) {
       size_t d = open_stack_.size();
@@ -21403,7 +21441,9 @@ struct Cites {
       ty(*v->vd.type);
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
       bind_mod(m->binding.name);
+      if (m->binding.name.txt) selfb_[*m->binding.name.txt]++;
       mbind(m->binding);
+      if (m->binding.name.txt) selfb_[*m->binding.name.txt]--;
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       for (auto& b : m->bindings) { bind_mod(b.name); mbind(b); }
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
@@ -21558,14 +21598,14 @@ struct Cites {
     auto* id = std::get_if<Pmty_ident>(&b->desc);
     if (!id || std::holds_alternative<Lapply>(id->id.txt.v)) return;
     std::vector<std::string> c = split_dotted(lid_full(id->id.txt));
-    if (c.size() < 2 || local.count(c[0])) return;
+    if (c.size() < 2 || shadowed(c[0])) return;
     wscr.insert(std::move(c));
   }
   void with_loads(std::map<std::string, int>& more) const {
     for (auto& p : wscr) {
       std::vector<std::string> c = p;
       if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
-      std::string h = unit_of(c[0]);
+      std::string h = unit_here(c[0]);
       if (h.empty()) continue;
       c[0] = h;
       const cmi::Signature* rt = unit_of_path(c);
@@ -21630,7 +21670,7 @@ struct Cites {
         if (sa != subalias.end()) c = split_dotted(sa->second);
       }
       if (c[0] == "Stdlib" && c.size() > 1) c.erase(c.begin());
-      std::string h = unit_of(c[0]);
+      std::string h = unit_here(c[0]);
       if (h.empty()) continue;  // a module of this file: nothing to force
       c[0] = h;
       std::string p = head_cmi(c[0]);
@@ -21658,7 +21698,7 @@ struct Cites {
     for (auto& fa : fapps) {
       std::vector<std::string> c = fa.first;
       if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
-      std::string h = unit_of(c[0]);
+      std::string h = unit_here(c[0]);
       if (h.empty()) continue;
       c[0] = h;
       const cmi::Signature* rt = unit_of_path(c);
@@ -21711,7 +21751,7 @@ struct Cites {
     std::set<std::string> done;  // two names can alias ONE unit
     std::map<std::string, int> more;  // unit -> loads a READ TYPE asks for
     for (auto& m : units) {
-      std::string u = unit_of(m);
+      std::string u = unit_here(m);
       if (u.empty() || !done.insert(u).second) continue;
       std::string p = head_cmi(u);
       if (!std::filesystem::exists(p)) continue;
@@ -23602,6 +23642,32 @@ struct Count {
     if (auto* d = std::get_if<Pext_decl>(&c.kind)) ctor_args(d->args);
   }
 
+  static bool dupval_off() {
+    static const bool off = dbg_env("NODUPVAL") != nullptr;
+    return off;
+  }
+  // ---- AN INFERRED SIGNATURE KEEPS ONLY THE LAST BINDING OF A NAME --------
+  // `let x = 0  let x = 1` TYPES two idents, but the signature the structure
+  // is GIVEN holds one `val x` (typemod's simplify_signature drops what a
+  // later item shadows), so an `include` of it re-binds ONE name.  A type, a
+  // module and a module type cannot be rebound in a structure at all, which
+  // leaves the values.  How many of them a later binding shadows:
+  static long long dup_vals(const std::vector<StructureItem>& items) {
+    if (dupval_off()) return 0;
+    std::vector<std::string> nm;
+    for (auto& it : items) {
+      if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+        Count c;
+        for (auto& b : v->bindings) c.pat(b.pat, &nm);
+      } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
+        nm.push_back(p->prim.name.txt);
+      } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
+        nm.push_back(v->vd.name.txt);
+      }
+    }
+    std::set<std::string> u(nm.begin(), nm.end());
+    return (long long)(nm.size() - u.size());
+  }
   // How many items does this module expression export?  An `include` (and an
   // `open struct .. end`) re-binds each of them.
   static long long exports(const ModuleExpr& m) {
@@ -23631,7 +23697,7 @@ struct Count {
         ++k;
       }
     }
-    return k;
+    return k - dup_vals(st->items);
   }
   static long long sig_exports(const ModuleType& mt) {
     auto* s = std::get_if<Pmty_signature>(&mt.desc);
@@ -23823,7 +23889,7 @@ struct Count {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       long long k = 0;
       for (auto& it : st->items) k += ren_str_item(it, sib);
-      return k;
+      return k - dup_vals(st->items);
     }
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return ren_mty(*c->mt);
     if (auto* i = std::get_if<Pmod_ident>(&m.desc)) {
@@ -24709,7 +24775,7 @@ struct Count {
         if (auto* i = std::get_if<Pstr_include>(&it.desc))
           k += me_top(i->expr, d + 1);
       }
-      return k;
+      return k - dup_vals(st->items);
     }
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
       return mt_top(*c->mt, d);
