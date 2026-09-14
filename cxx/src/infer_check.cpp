@@ -25769,6 +25769,83 @@ struct Count {
     }
     return w_ren(*sg, g);
   }
+  // ---- AN ANONYMOUS FUNCTOR PARAMETER IS NAMED ANYWAY ---------------------
+  // `Includemod.modtypes` (includemod.ml:610) makes a FRESH SHAPE VARIABLE for
+  // every functor ARROW it compares whose shape is not already an abstraction,
+  // and `check_modtype_equiv` (includemod.ml:1003) checks a module type this
+  // file DECLARES in BOTH directions with `Shape.dummy_mod`, so every arrow of
+  // one is worth 2 -- a generative `()` included, which was charged nothing.
+  // An ANONYMOUS parameter is worth 2 more where the arrow is a MODULE
+  // declaration's, because `Mtype.strengthen` (mtype.ml:54) replaces
+  // `Named(None, arg)` with a fresh `Ident.create_scoped "Arg"` and each
+  // direction strengthens the module items it pairs; `-no-app-funct`, which
+  // guards that arm, takes exactly those two back.  A NAMED parameter already
+  // pays both through `mtfun_wt`, and the anonymous parameter's own signature
+  // is renamed once on top (`Subst.modtype Keep`, includemod.ml:661) -- the
+  // same `par_items` walk the named case makes.  All of it is FLAT: nothing
+  // here scales with the cascade around it.
+  static bool anonarg_off() {
+    static const bool off = dbg_env("NOANONARG") != nullptr;
+    return off;
+  }
+  // `spine` is true where this module type is a MODULE declaration's, the only
+  // place a strengthening reaches an anonymous parameter.
+  long long anon_mty(const ModuleType& mt, bool spine, int d = 0) const {
+    if (d > 24) return 0;
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = 0;
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+        if (!nm->name.txt) {
+          k += spine ? 4 : 2;
+          if (nm->type) k += par_items(*nm->type);
+        }
+        if (nm->type) k += anon_mty(*nm->type, false, d + 1);
+      } else {
+        k += 2;
+      }
+      return k + anon_mty(*f->body, spine, d + 1);
+    }
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      long long k = 0;
+      for (auto& it : s->items) k += anon_sig_item(it, d + 1);
+      return k;
+    }
+    return 0;
+  }
+  long long anon_sig_item(const SignatureItem& it, int d) const {
+    if (d > 24) return 0;
+    if (auto* m = std::get_if<Psig_module>(&it.desc))
+      return m->md.type ? anon_mty(*m->md.type, true, d) : 0;
+    if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      long long k = 0;
+      for (auto& dc : m->decls)
+        if (dc.type) k += anon_mty(*dc.type, true, d);
+      return k;
+    }
+    if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+      return m->type ? anon_mty(*m->type, false, d) : 0;
+    if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+      return anon_mty(m->type, false, d);
+    if (auto* i = std::get_if<Psig_include>(&it.desc))
+      return anon_mty(i->mt, false, d);
+    return 0;
+  }
+  // The same "Arg" ident, where the unit's OWN inclusion check strengthens a
+  // functor BINDING of a structure: one apiece, flat, at any depth.  A
+  // `module rec` binding and a structure an ascription HIDES pay nothing.
+  static bool anonfun_off() {
+    static const bool off = dbg_env("NOANONFUN") != nullptr;
+    return off;
+  }
+  static long long anon_mexpr(const ModuleExpr& m, int d = 0) {
+    if (d > 24) return 0;
+    auto* f = std::get_if<Pmod_functor>(&m.desc);
+    if (!f) return 0;
+    long long k = anon_mexpr(*f->body, d + 1);
+    if (auto* nm = std::get_if<Functor_named>(&f->param))
+      if (!nm->name.txt) ++k;
+    return k;
+  }
   long long mtfun_wt(const Pmty_functor& f, const Lvl& l) const {
     if (mtctx_ == MtCtx::Other) return 0;
     auto* nm = std::get_if<Functor_named>(&f.param);
@@ -25983,6 +26060,8 @@ struct Count {
           std::holds_alternative<Pmod_functor>(m->binding.expr.desc))
         n += (ml.a - 1) * fcas(m->binding.expr);
       if (!ascp_off() && !inexpr_) n += ascp_charge(m->binding.expr);
+      if (!anonfun_off() && saved_ && !inexpr_)
+        n += anon_mexpr(m->binding.expr);
       mexpr(m->binding.expr, ml);
       if (m->binding.name.txt) ++n;
       mbind(m->binding);
@@ -26001,6 +26080,8 @@ struct Count {
         mtctx_ = MtCtx::Decl;
         mty(*m->type, mtd(l));
         mtctx_ = sv;
+        if (!anonarg_off() && saved_ && !inexpr_)
+          n += anon_mty(*m->type, false);
       }
       ++n;
       tbind(m->name.txt, m->type ? &*m->type : nullptr);
