@@ -22322,6 +22322,8 @@ struct Count {
   // of a result is paid once per (functor, argument), and once more --
   // and one ident over -- for the FIRST application of the functor.
   std::set<std::string> larg, lseen;
+  // The same two, for the ASCRIBED applications of such a functor.
+  std::set<std::string> parg, pseen;
   // Which (functor, argument) pairs an ALIAS result has been strengthened
   // for: `Env.components_of_functor_appl` answers a repeat from
   // `fcomp_cache`, so the same pair is written out once.
@@ -25875,18 +25877,207 @@ struct Count {
         if (cty_names(cstrip(a), st, seen, 0)) return true;
     return false;
   }
-  static bool poly_used(const cmi::Signature& sg) {
+  static bool poly_usedc(const cmi::Signature& sg,
+                         const std::set<std::string>& conc) {
     for (auto& d : sg.types)
       if (d.arity > 0 && !d.manifest && d.kind == cmi::TypeDecl::Abstract &&
-          d.stamp && csig_names(sg, d.stamp))
+          d.stamp && !conc.count(d.name) && csig_names(sg, d.stamp))
         return true;
     return false;
+  }
+  static bool poly_used(const cmi::Signature& sg) {
+    return poly_usedc(sg, std::set<std::string>());
   }
   // The module type an ascription NAMES, where it is another unit's.
   const cmi::Signature* asc_csig() const {
     if (ascpoly_off() || !asc_mty_) return nullptr;
     std::string key;
     return xmty_sig(asc_mty_, key);
+  }
+  // ---- A FUNCTOR RESULT'S PARAMETERIZED ABSTRACT TYPE IS BUILT ONCE MORE -
+  // The LOCAL twin of the law above.  A functor of THIS FILE whose result
+  // signature is WRITTEN OUT -- a literal `sig .. end`, or a `with` over a
+  // name -- and that leaves a type ABSTRACT WITH PARAMETERS which another of
+  // its items NAMES has that signature built one more time than the model
+  // charged, and the once-per-functor lump `app_charge` hangs on the FIRST
+  // APPLICATION belongs to the DECLARATION instead.  A `Set`-shaped result
+  // (`type t`) is exact today and only a `Map`-shaped one (`type 'a t`) is
+  // not, exactly as across units.  So the declaration takes a flat pass AND
+  // that lump, the first UNASCRIBED application gives the lump back, and an
+  // ASCRIPTION -- which `saved` leaves paying nothing at all -- pays the lump
+  // and the per-argument one besides, once apiece like the applications they
+  // mirror, but only where the ascription names a parameterized abstract type
+  // of its own.  NOT here, and left UNDER-counts: a functor of TWO parameters
+  // writes its result out once per parameter and over the parameter's own
+  // items; a result that is a bare module type NAME is left a path; an
+  // application inside an EXPRESSION.
+  static bool locpoly_off() {
+    static const bool off = dbg_env("NOLOCPOLY") != nullptr;
+    return off;
+  }
+  static bool pty_names(const CoreType& t, const std::string& nm, int d) {
+    if (d > 8) return false;
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      if (auto* b = std::get_if<Lident>(&c->id.txt.v))
+        if (b->name == nm) return true;
+      for (auto& a : c->args)
+        if (pty_names(*a, nm, d + 1)) return true;
+      return false;
+    }
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc))
+      return pty_names(*a->dom, nm, d + 1) || pty_names(*a->cod, nm, d + 1);
+    if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : tu->elems)
+        if (pty_names(*e, nm, d + 1)) return true;
+      return false;
+    }
+    if (auto* al = std::get_if<Ptyp_alias>(&t.desc))
+      return pty_names(*al->type, nm, d + 1);
+    if (auto* po = std::get_if<Ptyp_poly>(&t.desc))
+      return pty_names(*po->type, nm, d + 1);
+    if (auto* pv = std::get_if<Ptyp_variant>(&t.desc)) {
+      for (auto& r : pv->rows) {
+        if (auto* rt = std::get_if<Rtag>(&r)) {
+          for (auto& ty : rt->types)
+            if (pty_names(*ty, nm, d + 1)) return true;
+        } else if (auto* ri = std::get_if<Rinherit>(&r)) {
+          if (pty_names(*ri->ct, nm, d + 1)) return true;
+        }
+      }
+    }
+    return false;
+  }
+  static bool plbl_names(const std::vector<LabelDecl>& fs,
+                         const std::string& nm) {
+    for (auto& f : fs)
+      if (pty_names(*f.type, nm, 0)) return true;
+    return false;
+  }
+  static bool pargs_names(const ConstructorArguments& a,
+                          const std::string& nm) {
+    if (auto* tu = std::get_if<Pcstr_tuple>(&a)) {
+      for (auto& e : tu->elems)
+        if (pty_names(*e, nm, 0)) return true;
+      return false;
+    }
+    auto* rc = std::get_if<Pcstr_record>(&a);
+    return rc && plbl_names(rc->fields, nm);
+  }
+  static bool pdecl_names(const TypeDeclaration& d, const std::string& nm) {
+    if (d.manifest && pty_names(**d.manifest, nm, 0)) return true;
+    if (auto* r = std::get_if<Ptype_record>(&d.kind))
+      return plbl_names(r->fields, nm);
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+      for (auto& c : v->ctors) {
+        if (pargs_names(c.args, nm)) return true;
+        if (c.res && pty_names(**c.res, nm, 0)) return true;
+      }
+    }
+    return false;
+  }
+  static bool pext_names(const ExtensionConstructor& c,
+                         const std::string& nm) {
+    auto* e = std::get_if<Pext_decl>(&c.kind);
+    if (!e) return false;
+    return pargs_names(e->args, nm) || (e->res && pty_names(**e->res, nm, 0));
+  }
+  // Does an item of this signature other than the declaration itself name it?
+  static bool psig_names(const Signature& sg, const std::string& nm,
+                         const TypeDeclaration* self) {
+    for (auto& it : sg) {
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+        if (pty_names(*v->vd.type, nm, 0)) return true;
+      } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls)
+          if (&d != self && pdecl_names(d, nm)) return true;
+      } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
+        for (auto& d : t->decls)
+          if (&d != self && pdecl_names(d, nm)) return true;
+      } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+        for (auto& c : x->ext.ctors)
+          if (pext_names(c, nm)) return true;
+      } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
+        if (pext_names(e->exn.ctor, nm)) return true;
+      }
+    }
+    return false;
+  }
+  static bool poly_psigc(const Signature& sg,
+                         const std::set<std::string>& conc) {
+    for (auto& it : sg) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls)
+          if (!d.params.empty() && !d.manifest &&
+              std::holds_alternative<Ptype_abstract>(d.kind) &&
+              !conc.count(d.name.txt) && psig_names(sg, d.name.txt, &d))
+            return true;
+      } else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
+        if (auto* ms = std::get_if<Pmty_signature>(&md->md.type->desc))
+          if (poly_psigc(ms->items, std::set<std::string>())) return true;
+      }
+    }
+    return false;
+  }
+  // The same question of a module type WRITTEN OUT: this file's signature
+  // first, another unit's next.  A bare NAME is left a path and answers no.
+  // A RESULT asks `xok` false where it may not be read out of a .cmi.
+  bool poly_mty(const ModuleType* mt, bool named_ok, bool xok) const {
+    if (locpoly_off() || !mt) return false;
+    if (!named_ok && std::holds_alternative<Pmty_ident>(mt->desc)) return false;
+    std::set<std::string> conc;
+    res_conc(*mt, conc);
+    if (const Signature* sg = mty_sig(mt)) return poly_psigc(*sg, conc);
+    if (!xok) return false;
+    std::string key;
+    if (const cmi::Signature* cs = xmty_sig(mt, key))
+      return poly_usedc(*cs, conc);
+    return false;
+  }
+  // The module type a functor's result is WRITTEN at, however it is reached.
+  static const ModuleType* res_mty(const ModuleExpr* me,
+                                   const ModuleType* mt) {
+    if (!me) return mt;
+    auto* c = std::get_if<Pmod_constraint>(&me->desc);
+    return c ? c->mt.get() : nullptr;
+  }
+  // The UNIT a module type path is named out of; empty for one of this file.
+  std::string mty_unit(const ModuleType* mt) const {
+    std::string key;
+    if (!mt || !xmty_sig(mt, key)) return std::string();
+    std::size_t dot = key.find('.');
+    return dot == std::string::npos ? key : key.substr(0, dot);
+  }
+  // Does this functor's RESULT leave a parameterized abstract type that
+  // another of its items names?  Where the result is ANOTHER UNIT's module
+  // type the answer holds only if the PARAMETER is not named out of that same
+  // unit: `module F (X : Map.OrderedType) : Map.S with .. = ..` is one ident
+  // per item of `Map.OrderedType` short of the 2R below, and the `Set`-typed
+  // parameter beside it is not, so the pair is left alone here.
+  bool poly_fres(const ModuleExpr* fdef, const ModuleType* rmt) const {
+    if (locpoly_off() || !rmt) return false;
+    const std::string u = mty_unit(rmt);
+    bool xok = true;
+    if (!u.empty()) {
+      auto* f = fdef ? std::get_if<Pmod_functor>(&fdef->desc) : nullptr;
+      auto* nm = f ? std::get_if<Functor_named>(&f->param) : nullptr;
+      xok = nm && nm->type && mty_unit(nm->type.get()) != u;
+    }
+    return poly_mty(rmt, false, xok);
+  }
+  static bool named_pty(const FunctorParam& p) {
+    auto* nm = std::get_if<Functor_named>(&p);
+    return nm && nm->type &&
+           std::holds_alternative<Pmty_ident>(nm->type->desc);
+  }
+  // What the DECLARATION of such a functor owes: a flat pass and the lump.
+  long long fdecl_poly(const ModuleExpr& m, const Pmod_functor& f) const {
+    auto* c = std::get_if<Pmod_constraint>(&f.body->desc);
+    // A GENERATIVE step hands its result on unsubstituted and owes nothing.
+    if (!c || !std::holds_alternative<Functor_named>(f.param)) return 0;
+    if (!poly_fres(&m, c->mt.get())) return 0;
+    const ModuleType* rnm = res_named(nullptr, c->mt.get());
+    long long fl = wt_mty(*c->mt, flat()) + (rnm ? res_wt(*rnm, flat()) : 0);
+    return 2 * fl + (named_pty(f.param) ? 0 : 1);
   }
   // ---- A `with` OVER A MODULE TYPE NAME IN A PACKAGE TYPE ----------------
   // `pack_pkg` weighs a package type by its CONSTRAINTS alone, so a package
@@ -26918,8 +27109,27 @@ struct Count {
           k += fl;
           k += arg_extra(m, fl);
         }
-        if (lseen.insert(key).second) k += fl + (named_param(fdef) ? 0 : 1);
+        // Where the result leaves a parameterized abstract type an item
+        // names, this lump is the DECLARATION's (`fdecl_poly`) and not the
+        // first application's.
+        if (lseen.insert(key).second && !poly_fres(fdef, res_mty(me, mt)))
+          k += fl + (named_param(fdef) ? 0 : 1);
       }
+    }
+    // An ASCRIPTION discards the signature and so pays neither lump above,
+    // but a result whose parameterized abstract type the ascription NAMES is
+    // built all the same, and owes both of them over again.
+    if (!saved && !inexpr_ && !pathless && !pbody && !reb && nargs == 1 &&
+        asc_mty_ && poly_fres(fdef, res_mty(me, mt)) &&
+        poly_mty(asc_mty_, true, true) &&
+        std::holds_alternative<Pmod_ident>(args[0]->desc)) {
+      long long fl = me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
+      if (rnm) fl += res_wt(*rnm, flat());
+      std::string key = std::to_string((std::uintptr_t)fdef);
+      auto* pi = std::get_if<Pmod_ident>(&args[0]->desc);
+      std::string ak = key + "(" + lid_full(pi->id.txt) + ")";
+      if (pseen.insert(key).second) k += fl + (named_param(fdef) ? 0 : 1);
+      if (parg.insert(ak).second) k += fl + arg_extra(m, fl);
     }
     return k;
   }
@@ -26994,6 +27204,7 @@ struct Count {
       // A functor's RESULT is never strengthened (`strengthen_lazy`,
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
       // `aliasable:false`), so its body starts the cascade over.
+      if (!locpoly_off()) n += fdecl_poly(m, *f);
       fparam(f->param, l);
       auto fk = fmark();
       fbind(f->param);
