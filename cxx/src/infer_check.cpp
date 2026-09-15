@@ -24463,6 +24463,86 @@ struct Count {
     static const bool off = dbg_env("NORECWITH") != nullptr;
     return off;
   }
+  // ---- AND OVER ANOTHER UNIT'S MODULE TYPE NAME --------------------------
+  // `with_split` answers only for a base this file can READ -- a written
+  // `sig .. end` or a module type of its own -- so `and ModSet : Set.S with
+  // type elt = Mod.t = Set.Make (Mod)`, which is what `t20ok` and `t21ok`
+  // write, was charged NOTHING for the extra pass and nothing for putting the
+  // merged signature back.  It is the cross-unit twin of `with_split` in flat
+  // mode, over `xwith_node`'s `c_*` readers of a `.cmi` signature, and the
+  // force is NOT repeated here: the ascription has already paid it through
+  // `xforce`/`xwith_node`, which share `wscraped`.
+  //   Measured over `Set.OrderedType` (2 items), `Hashtbl.HashedType` (3),
+  // `Hashtbl.S` (26) and `Set.S`/`Map.S` (47), with the base a bare name and
+  // a submodule path, one constraint and two, destructive and not, the
+  // binding first in its group and after an `and`, at top level and inside a
+  // functor: the first constraint is worth `2*flat + 1` and each further one
+  // `flat + 1`, and a `module rec` is the only place it is due -- the same
+  // `with` on a plain `module S : Set.S with type elt = M.t = Set.Make (M)`
+  // is EXACT today.  NOTE a `with` NESTED inside a written-out ascription is
+  // worth the PASS alone (3 where the root shape is 5), so only the root
+  // takes `xwsub_root`.
+  //   WHAT IS LEFT, measured.  Where the type the constraint points AT is
+  // ABSTRACT -- `and ModSet : Set.S with type elt = Mod.t` over a `Mod` whose
+  // `t` has no manifest -- the cost is 102 more again; `t20ok`/`t21ok`/`t22ok`
+  // write a concrete one, so the floor here is exact for them and short by
+  // that where it is not.  A base reached through a SUBMODULE
+  // (`MoreLabels.Set.OrderedType`) is short 5.
+  //   A file that spells the SAME stdlib unit both ways -- `X :
+  // Set.OrderedType` for a functor parameter and `Stdlib__Set.OrderedType`
+  // for the ascription -- is charged its unit load twice and is +5 over,
+  // BEFORE and AFTER this; `Cites` keys a unit by the head as written.  No
+  // corpus file mixes the spellings, and every probe here keeps to one.
+  static bool recxwith_off() {
+    static const bool off = dbg_env("NORECXWITH") != nullptr;
+    return off;
+  }
+  bool xwith_split(const Pmty_with& w, long long& kout, long long& land) const {
+    kout = land = 0;
+    if (recxwith_off() || xwith_off() || mty_sig(w.mt.get())) return false;
+    std::string key;
+    const cmi::Signature* sg = xmty_sig(w.mt.get(), key);
+    if (!sg) return false;
+    Gone g;
+    for (const ModuleType* p = w.mt.get();;) {
+      auto* q = std::get_if<Pmty_with>(&p->desc);
+      if (!q) break;
+      for (auto& c : q->constraints) {
+        Wc x;
+        if (!wc_parts(c, x)) return false;
+        if (x.destr) g.push_back(x.path);
+      }
+      p = q->mt.get();
+    }
+    long long k = 0, rows = 0;
+    for (auto& c : w.constraints) {
+      Wc x;
+      if (!wc_parts(c, x) || x.path.empty()) return false;
+      Lvl tl;
+      const cmi::Signature* tg = c_target(*sg, x.path, Lvl{}, tl);
+      if (!tg || !c_has(*tg, x.path.back())) return false;
+      if (x.td) {
+        ++k;
+        if (is_fixed(*x.td)) { ++k; ++rows; }
+        k += c_nested(*tg, wunder(g, x.path));
+      }
+      if (x.destr) {
+        g.push_back(x.path);
+        k += c_ren(*sg, g) + rows;
+      }
+    }
+    kout = k;
+    land = c_ren(*sg, g) + rows;
+    return true;
+  }
+  // What putting the merged signature back costs, for the ROOT of a
+  // recursive binding's ascription alone.
+  long long xwsub_root(const ModuleType& mt) const {
+    auto* w = std::get_if<Pmty_with>(&mt.desc);
+    if (!w) return 0;
+    long long k = 0, land = 0;
+    return xwith_split(*w, k, land) ? land : 0;
+  }
   long long wpass_mty(const ModuleType& mt) const {
     if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
       long long k = 0;
@@ -24478,7 +24558,8 @@ struct Count {
     // Every node of a `with`-CHAIN is translated again, the inner ones with it.
     if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
       long long k = 0, land = 0, base = wpass_mty(*w->mt);
-      if (!with_split(*w, Lvl{}, true, k, land)) return base;
+      if (!with_split(*w, Lvl{}, true, k, land) && !xwith_split(*w, k, land))
+        return base;
       return base + k + land;
     }
     return 0;
@@ -24740,7 +24821,10 @@ struct Count {
       if (!c) continue;
       long long rounds = b.name.txt ? nb : 1;
       long long pass = ren_mty(*c->mt), sub = pass;
-      if (!recwith_off()) { pass += wpass_mty(*c->mt); sub = wsub_mty(*c->mt); }
+      if (!recwith_off()) {
+        pass += wpass_mty(*c->mt);
+        sub = wsub_mty(*c->mt) + xwsub_root(*c->mt);
+      }
       k += pass + sub + ctl_mty(*c->mt) + dec_mty(*c->mt) +
            (recfun_off() ? 0 : rfun_mty(*c->mt)) +
            (recfun_off() ? 0 : (rounds + 1) * sibapp(*c->me, sib)) +
