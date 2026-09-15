@@ -20484,6 +20484,10 @@ bool discload_off() {
   static const bool off = dbg_env("NODISCLOAD") != nullptr;
   return off;
 }
+bool discread_off() {
+  static const bool off = dbg_env("NODISCREAD") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -20553,9 +20557,10 @@ struct Cites {
   bool fmt_ann = false;  // a written `.. format` / format4 / format6
   // The functor PATHS this file applies, as written; resolved in `cost`.
   std::vector<std::pair<std::vector<std::string>, bool>> fapps;
-  // For each of them, the name of the module an ascription DISCARDS it into,
-  // resolved against `heads_` once the whole file has been walked.
-  std::vector<std::string> fdisc;
+  // For each of them, the name of the module an ascription DISCARDS it into
+  // and the path from that module down to the binding, read out once the
+  // whole file has been walked.
+  std::vector<std::pair<std::string, std::string>> fdisc;
   // `let module M = F (A) in ..`: the result is bound over the body
   // alone and none of the types it names is ever looked up.
   bool inexpr_ = false;
@@ -20569,6 +20574,7 @@ struct Cites {
   // discarding ascription can be spelled as.
   const Signature* casc_ = nullptr;
   std::string cdname_;
+  std::string cdpre_;
   std::map<std::string, const ModuleType*> cmtys_;
   const Signature* casc_sig(const ModuleType* mt, int fuel = 8) const {
     if (!mt || fuel <= 0) return nullptr;
@@ -20709,19 +20715,55 @@ struct Cites {
       if (opens.count(e.first)) subopens.insert(e.second);
     }
   }
-  // Every path's HEAD, whatever position it stands in: `type u = S.t` and
-  // `let x = S.empty` both NAME S, and a module something names is built
-  // for it whether or not the ascription above declares it.
-  std::set<std::string> heads_;
+  // ---- THE READS THAT BUILD A MODULE THE ASCRIPTION ABOVE DISCARDS ------
+  // `module M : sig type u end = struct module S = Set.Make (X) .. end` builds
+  // S after all where a sibling item reads a type of it that has NO MANIFEST:
+  // `type v = S.t` costs ocamlc the result over again where `type v = S.elt`,
+  // which is `X.t` and expands away, costs NOTHING AT ALL.  The read has to
+  // stand in one of the positions the type is EXPANDED in -- a declaration's
+  // manifest or a record field of one, the type of an `external`, or a
+  // constraint written on a value binding or an expression.  A value
+  // (`let y = S.empty`), an `open`, an alias (`module T = S`), a
+  // constructor's or an exception's argument, a pattern's annotation and a
+  // `val` of a module type all read the same components and cost nothing.
+  // The whole DOTTED path is what is kept, since the module the ascription
+  // hides may be a parent: `module P = struct module S = F (X) end` is read
+  // by `type v = P.S.t`.
+  bool tpos_ = false;
+  std::set<std::string> treads_;
+  // Every path head read in any OTHER position, which is what S494 had: such
+  // a read builds the module too, but neither the count nor the law for it
+  // is this one's -- `let y = S.empty` costs NOTHING where the ascription
+  // drops y and the whole result over again where it does not -- so it keeps
+  // S494's coarse answer, and the two never fire for the same module.
+  std::set<std::string> oheads_;
+  // Walks `t` as a type that is EXPANDED where it stands.
+  void tyx(const CoreType& t) {
+    const bool sv = tpos_;
+    tpos_ = true;
+    ty(t);
+    tpos_ = sv;
+  }
   void note_head(const Longident& id) {
-    for (const Longident* p = &id;;) {
-      if (auto* d = std::get_if<Ldot>(&p->v)) { p = d->prefix.get(); continue; }
-      if (auto* a = std::get_if<Lapply>(&p->v)) {
+    // `cite` walks a path's own prefixes, so the bare head of `S.t` comes
+    // back through here a second time: under `tpos_` NEITHER spelling is a
+    // read of the coarse kind, and the dotted one alone says which type.
+    if (tpos_ && !discread_off()) {
+      std::vector<std::string> c;
+      if (!lid_comps(id, c) || c.size() < 2) return;
+      std::string s = c[0];
+      for (std::size_t i = 1; i < c.size(); ++i) s += "." + c[i];
+      treads_.insert(s);
+      return;
+    }
+    for (const Longident* q = &id;;) {
+      if (auto* d = std::get_if<Ldot>(&q->v)) { q = d->prefix.get(); continue; }
+      if (auto* a = std::get_if<Lapply>(&q->v)) {
         note_head(*a->f);
         note_head(*a->x);
         return;
       }
-      heads_.insert(std::get<Lident>(p->v).name);
+      oheads_.insert(std::get<Lident>(q->v).name);
       return;
     }
   }
@@ -20911,11 +20953,11 @@ struct Cites {
     pat(b.pat);
     ex(*b.expr);
     if (!b.constraint_) return;
-    if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_)) ty(*c->typ);
+    if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_)) tyx(*c->typ);
     else {
       auto& co = std::get<Pvc_coercion>(*b.constraint_);
-      if (co.ground) ty(**co.ground);
-      ty(*co.coercion);
+      if (co.ground) tyx(**co.ground);
+      tyx(*co.coercion);
     }
   }
   void fn(const Pexp_function& f) {
@@ -20926,11 +20968,11 @@ struct Cites {
       if (pv->default_) ex(**pv->default_);
     }
     if (f.constraint_) {
-      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_)) ty(*c->type);
+      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_)) tyx(*c->type);
       else {
         auto& co = std::get<Pcoerce>(*f.constraint_);
-        if (co.from) ty(**co.from);
-        ty(*co.to_);
+        if (co.from) tyx(**co.from);
+        tyx(*co.to_);
       }
     }
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) ex(*fb->e);
@@ -21197,11 +21239,11 @@ struct Cites {
     } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
       // An annotation fixes the expected type before the expression is typed.
       xmeet(denotes(*c->e));
-      ex(*c->e); ty(*c->t);
+      ex(*c->e); tyx(*c->t);
     } else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) {
       ex(*c->e);
-      if (c->from) ty(**c->from);
-      ty(*c->to_);
+      if (c->from) tyx(**c->from);
+      tyx(*c->to_);
     } else if (auto* f = std::get_if<Pexp_field>(&e.desc)) {
       ex(*f->e); cite(f->field, false);
     } else if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
@@ -21344,11 +21386,13 @@ struct Cites {
   }
   void tdecl(const TypeDeclaration& d) {
     for (auto& p : d.params) ty(*p);
-    if (d.manifest) ty(**d.manifest);
+    if (d.manifest) tyx(**d.manifest);
     if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
       for (auto& c : v->ctors) { cargs(c.args); if (c.res) ty(**c.res); }
     } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
-      for (auto& f : r->fields) ty(*f.type);
+      // A record's fields are expanded besides, to decide whether the whole
+      // of it is a float record; a VARIANT's arguments are not.
+      for (auto& f : r->fields) tyx(*f.type);
     }
     for (auto& c : d.constraints) { ty(*c.t1); ty(*c.t2); }
     if (!tdecl_off()) tf_tdecl(d);
@@ -21460,7 +21504,8 @@ struct Cites {
         std::vector<std::string> c;
         if (lid_comps(fi->id.txt, c) && c.size() >= 2) {
           fapps.emplace_back(c, inexpr_ && pathed);
-          fdisc.push_back(discload_off() ? std::string() : cdname_);
+          fdisc.emplace_back(discload_off() ? std::string() : cdname_,
+                             cdpre_);
         }
       }
       mexp(*a->f); mexp(*a->arg);
@@ -21524,21 +21569,27 @@ struct Cites {
     } else if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
       ext(e->exn.ctor);
     } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
-      if (p->prim.type) ty(*p->prim.type);
+      if (p->prim.type) tyx(*p->prim.type);
     } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
-      ty(*v->vd.type);
+      tyx(*v->vd.type);
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
       bind_mod(m->binding.name);
       if (m->binding.name.txt) selfb_[*m->binding.name.txt]++;
       const Signature* av = casc_;
       const std::string dv = cdname_;
+      const std::string pv = cdpre_;
       if (cdname_.empty() && casc_ && m->binding.name.txt &&
-          !sig_binds_mod(*casc_, *m->binding.name.txt))
+          !sig_binds_mod(*casc_, *m->binding.name.txt)) {
         cdname_ = *m->binding.name.txt;
+        cdpre_ = cdname_ + ".";
+      } else if (!cdname_.empty() && m->binding.name.txt) {
+        cdpre_ += *m->binding.name.txt + ".";
+      }
       casc_ = nullptr;
       mbind(m->binding);
       casc_ = av;
       cdname_ = dv;
+      cdpre_ = pv;
       if (m->binding.name.txt) selfb_[*m->binding.name.txt]--;
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       for (auto& b : m->bindings) { bind_mod(b.name); mbind(b); }
@@ -21790,14 +21841,26 @@ struct Cites {
     }
     return k;
   }
+  // Does a sibling item read a type of this result that has no manifest of
+  // its own, `S.t` where `S.elt` is the argument's and expands away?
+  bool tread_builds_sig(const cmi::Signature& sg,
+                        const std::string& pre) const {
+    for (auto& td : sg.types)
+      if (!td.manifest && treads_.count(pre + td.name)) return true;
+    return false;
+  }
   void functor_loads(std::map<std::string, int>& more,
                      std::set<std::string>& noload) const {
     for (std::size_t fi = 0; fi < fapps.size(); ++fi) {
       const auto& fa = fapps[fi];
       // The result is read by nobody: an ascription hides the module it was
-      // bound in, and no path of this file names it either.
-      const bool disc = fi < fdisc.size() && !fdisc[fi].empty() &&
-                        !heads_.count(fdisc[fi]);
+      // bound in, and no path of this file names it in a position this law
+      // does not cover.  A sibling that reads a TYPE of it BUILDS it, but
+      // loads none of this all the same, the build being the whole of what
+      // such a read asks for -- so a type read leaves the discard standing
+      // here and pays for itself in `cross_charge`.
+      const std::string dnm = fi < fdisc.size() ? fdisc[fi].first : "";
+      const std::string dpre = fi < fdisc.size() ? fdisc[fi].second : "";
       std::vector<std::string> c = fa.first;
       if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
       std::string h = unit_here(c[0]);
@@ -21824,12 +21887,16 @@ struct Cites {
       for (const cmi::ModuleType* f = mt; f;
            f = scrape_cmty(f->functor_body.get(), rt)) {
         if (f->kind != cmi::ModuleType::Functor) {
-          if (f->kind == cmi::ModuleType::Sig && f->sig && !fa.second &&
-              !disc) {
-            Applied a;
-            sig_applied(*f->sig, a);
-            for (auto& e : a.units)
-              if (more[e.first] < e.second) more[e.first] = e.second;
+          if (f->kind == cmi::ModuleType::Sig && f->sig && !fa.second) {
+            const bool disc =
+                !dnm.empty() && (tread_builds_sig(*f->sig, dpre) ||
+                                 !oheads_.count(dnm));
+            if (!disc) {
+              Applied a;
+              sig_applied(*f->sig, a);
+              for (auto& e : a.units)
+                if (more[e.first] < e.second) more[e.first] = e.second;
+            }
           }
           break;
         }
@@ -26602,6 +26669,46 @@ struct Count {
     }
     return k;
   }
+  // An argument path that names a module ALIAS: a local `module A = <path>`,
+  // a dotted path whose last step is one, or a bare name the auto-opened
+  // `Stdlib` provides -- which `head_cmi` resolves to a .cmi of ANOTHER name,
+  // `Stdlib__String` for `String`.
+  int arg_alias(const std::vector<std::string>& ac) const {
+    auto it = mods.find(ac[0]);
+    if (it != mods.end()) {
+      if (it->second.empty()) return 0;
+      return std::holds_alternative<Pmod_ident>(it->second.back()->desc);
+    }
+    std::string h = ac[0];
+    if (ac.size() > 1) {
+      std::vector<std::string> c = ac;
+      const cmi::Signature* root = nullptr;
+      const cmi::ModuleType* mt = cmi_module_c(c, &root);
+      if (mt) return mt->kind == cmi::ModuleType::Alias ? 1 : 0;
+      // `Stdlib.String` is the wrapper's own name for the unit, and reads
+      // exactly as the bare `String` that the auto-`open` puts in scope.
+      if (ac.size() != 2 || ac[0] != "Stdlib") return 0;
+      h = ac[1];
+    }
+    std::string ap = head_cmi(h);
+    if (ap.empty() || !std::filesystem::exists(ap)) return 0;
+    try {
+      return cmi::CmiFile::load(ap).module_name() != h ? 1 : 0;
+    } catch (...) {
+      return 0;
+    }
+  }
+  // Does a sibling item READ a type of the module being bound here that the
+  // ascription above discards?  Only a type with no manifest of its own
+  // counts: `S.elt` is the argument's and expands away where `S.t`, which is
+  // the result's alone, leaves the module itself standing in the type.
+  bool tread_builds(const cmi::ModuleType* mt) const {
+    if (!treads_ || !mt || mt->kind != cmi::ModuleType::Sig || !mt->sig)
+      return false;
+    for (auto& td : mt->sig->types)
+      if (!td.manifest && treads_->count(mdiscpre_ + td.name)) return true;
+    return false;
+  }
   // `Hashtbl.Make (String)`: the result is Hashtbl's, and applying it costs
   // the PARAMETER's signature once (it is bound while the argument is checked
   // against it), the result's own items once (the .cmi's lazy signature is
@@ -26663,6 +26770,11 @@ struct Count {
     // A distinct argument builds its own result; the same one is cached.
     std::string ak = key;
     int unit_arg = 0;
+    // Is the argument reached through an ALIAS?  `Stdlib` binds every name of
+    // the stdlib as one, so `Set.Make (String)` is an alias where
+    // `Set.Make (Wf)` over a unit of this project is not, and so is any
+    // `module A = <path>` of this file.
+    int xalias = 0;
     bool xpathless = false;
     for (const ModuleExpr* h = &m;;) {
       auto* a = std::get_if<Pmod_apply>(&h->desc);
@@ -26679,6 +26791,7 @@ struct Count {
         if (!ap.empty() && std::filesystem::exists(ap) && saved && !inexpr_)
           unit_arg = 1;
       }
+      if (!ac.empty() && !discread_off() && mdiscard_) xalias = arg_alias(ac);
       // Two arguments with no path at all share the one entry: a second
       // `Map.Make (struct .. end)` pays the cascade and nothing more.
       ak += "(";
@@ -26697,7 +26810,17 @@ struct Count {
     long long nf = (firstapp || (newpath && had >= 1)) ? 1 : 0;
     if (unit_arg && newarg) ++nf;
     const bool discarded = !ascrapp_off() && mdiscard_ && !inexpr_;
-    if (discarded) nf = !discload_off() && mdisctop_ && firstapp ? 1 : 0;
+    if (discarded) {
+      // A sibling reads a type of it that cannot expand away: the result is
+      // built after all, once for the whole functor and at the argument's
+      // weight, and that read answers for the module whatever else names it.
+      // It is BESIDES the force the discard keeps, which the first
+      // application of the functor pays whether that one is read or not.
+      const bool tb = !discread_off() && tread_builds(mt);
+      const bool coarse = mdisccoarse_ && !tb;
+      nf = !discload_off() && mdisctop_ && !coarse && firstapp ? 1 : 0;
+      if (tb && fdread_.insert(key).second) nf += 2 + xalias;
+    }
     k += nf * flat_cmty(mt);
     k += wt_cmty(mt, l);
     // An argument with NO PATH leaves the result unstrengthened: it is
@@ -27430,14 +27553,26 @@ struct Count {
   // application of the same functor beside it shares the one force, and an
   // argument of another unit, which doubles the force where the result is
   // saved, does not double this one.
+  //
+  // ---- AND BUILT WHERE A SIBLING READS A TYPE OF IT ---------------------
+  // A sibling item that reads a type of the module the ascription hides --
+  // `module S = Set.Make (X) type u = S.t` -- builds it after all, ONCE for
+  // the functor however many of its applications are read, and at the same
+  // weight the argument gives the force above: twice the result's items,
+  // three times where the argument is another unit.  Only a type with NO
+  // MANIFEST counts, `S.elt` being `X.t` and expanding away, and only where
+  // it is written in a position the type is EXPANDED in; `treads_` carries
+  // the paths the citation walk found in one, and `mdiscpre_` is the path
+  // from the hidden module down to the one being bound, so that the read
+  // `P.S.t` finds the application bound at S inside a hidden P.
   const Signature* ascr_sig_ = nullptr;
   bool mdiscard_ = false;
   bool mdisctop_ = false;
-  // Every path head the file writes, from the citation walk.  A module a
-  // SIBLING item names -- `module S = Set.Make (X) type u = S.t` -- is built
-  // for that item however little the ascription above wants of it, and only
-  // one NOTHING names is left the force below.
-  const std::set<std::string>* heads_ = nullptr;
+  bool mdisccoarse_ = false;
+  std::string mdiscpre_;
+  std::set<std::string> fdread_;
+  const std::set<std::string>* treads_ = nullptr;
+  const std::set<std::string>* oheads_ = nullptr;
   // The module type ascribing the application being walked, `Map.S` in
   // `module S : Map.S = Map.Make (M)` -- null everywhere else, the argument
   // and the head of that very application included.
@@ -27884,18 +28019,25 @@ struct Count {
       const Signature* asv = ascr_sig_;
       const bool dsv = mdiscard_;
       const bool dtv = mdisctop_;
+      const bool dsd = mdisccoarse_;
+      const std::string dpv = mdiscpre_;
       if (!mdiscard_ && ascr_sig_ && m->binding.name.txt &&
           !sig_binds_mod(*ascr_sig_, *m->binding.name.txt)) {
         mdiscard_ = true;
-        mdisctop_ = !heads_ || !heads_->count(*m->binding.name.txt);
+        mdisctop_ = true;
+        mdisccoarse_ = oheads_ && oheads_->count(*m->binding.name.txt);
+        mdiscpre_ = *m->binding.name.txt + ".";
       } else if (mdiscard_) {
         mdisctop_ = false;
+        if (m->binding.name.txt) mdiscpre_ += *m->binding.name.txt + ".";
       }
       ascr_sig_ = nullptr;
       mexpr(m->binding.expr, ml);
       ascr_sig_ = asv;
       mdiscard_ = dsv;
       mdisctop_ = dtv;
+      mdisccoarse_ = dsd;
+      mdiscpre_ = dpv;
       if (m->binding.name.txt) ++n;
       mbind(m->binding);
       n += lal_bind(m->binding);
@@ -28017,7 +28159,8 @@ int typing_ident_count(const ast::Structure& s) {
   stampcount::Count c;
   c.used_ = &used;
   c.xk_ = &xkeys;
-  c.heads_ = &u.heads_;
+  c.treads_ = &u.treads_;
+  c.oheads_ = &u.oheads_;
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
