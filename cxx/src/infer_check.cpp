@@ -26124,17 +26124,15 @@ struct Count {
   // type declaration by what they hold in turn.
   //
   // Deliberately NOT here, each measured on a private two-unit library and
-  // each wanting MORE than 2 per item, so each is left its own slice: an
-  // ascription at a module type of THIS FILE and a `with` over the name want
-  // the module type written out twice besides (2 per item of IT, on top of
-  // the body's, and 4 apiece where the two are combined); an ascription
-  // written out as a literal `sig .. end` wants 4 per item of it; `include
-  // (E : T)` and a functor that HAS a result signature each want their own
-  // amount again; so do a functor of TWO parameters and one nested in a
-  // SUBMODULE of the body rather than bound directly in it.  Costing NOTHING
-  // at all, and so excluded: a MONO ascription (`Set.S`, whose `t` takes no
-  // parameters), a GENERATIVE functor, and the same binding outside a
-  // functor, which S489's law already pays for.
+  // each wanting its own amount again, so each is left its own slice:
+  // `include (E : T)`, a functor that HAS a result signature, a functor of
+  // TWO parameters, and an ascription nested in a SUBMODULE of the body
+  // rather than bound directly in it.  The shapes that wanted MORE than 2
+  // per item -- a `with` over the name, a module type of THIS FILE, one
+  // written out as a literal `sig .. end` -- are the law under this one.
+  // Costing NOTHING at all, and so excluded: a MONO ascription (`Set.S`,
+  // whose `t` takes no parameters), a GENERATIVE functor, and the same
+  // binding outside a functor, which S489's law already pays for.
   static bool fascbody_off() {
     static const bool off = dbg_env("NOFASCBODY") != nullptr;
     return off;
@@ -26152,19 +26150,91 @@ struct Count {
     res_conc(*mt, conc);
     return poly_usedc(*cs, conc);
   }
+  // ---- A `with` OVER A NAME IN SUCH AN ASCRIPTION IS WRITTEN OUT TWICE ---
+  // Two corrections to the law above, both of them the same shape of thing:
+  // what the ascription's module type costs to WRITE OUT where it stands.
+  //
+  // (a) The trigger was too narrow.  `xpoly_named` asks for another unit's
+  // bare NAME, but the body is rebuilt for a module type of THIS FILE, for
+  // one written out as a literal `sig .. end`, and for a `with` over any of
+  // them, just as much -- what matters is that the ascription leaves a
+  // parameterized abstract type one of its own items names, not how it is
+  // spelled.  `apoly_mty` asks it of every spelling (`mty_sig` resolves this
+  // file's names and literals, `xmty_sig` another unit's), and the body's
+  // `2 * ren_mexpr` is exact for each: a LITERAL is bigger there than a name
+  // because `ren_mty` already writes a literal out and leaves a name a path.
+  //
+  // (b) And on top of that body charge, a `with` over a NAME is written out
+  // TWICE MORE, one ident per item of the signature the name stands for and
+  // a DESTRUCTIVE constraint's item taken out -- the merge has to build the
+  // signature where a bare name is left a path, and where a literal was
+  // written out already.  Unlike the body's charge this one is PER
+  // ASCRIPTION: two of them in a body cost it twice over, and a bare name
+  // beside them costs nothing besides.
+  //
+  // Left its own slice, and what made this look like ONE term until every
+  // probe here was measured a second time with a STRUCTURE for the body: a
+  // cross-unit APPLICATION ascribed at a module type of THIS FILE -- a bare
+  // name as much as a literal -- wants 2 per item AGAIN, once for the body
+  // however many such items it holds, while a structure, a path, or a LOCAL
+  // functor's application in the same place wants nothing of the sort.  That
+  // charge is the APPLICATION's, not the module type's.
+  static bool wascflat_off() {
+    static const bool off = dbg_env("NOWASCFLAT") != nullptr;
+    return off;
+  }
+  // However the ascription is spelled: does it leave a parameterized
+  // abstract type that another of its own items names?
+  bool apoly_mty(const ModuleType* mt) const {
+    if (!mt) return false;
+    std::set<std::string> conc;
+    res_conc(*mt, conc);
+    if (const Signature* sg = mty_sig(mt)) return poly_psigc(*sg, conc);
+    std::string key;
+    if (const cmi::Signature* cs = xmty_sig(mt, key))
+      return poly_usedc(*cs, conc);
+    return false;
+  }
+  // A `with` whose base, under all of them, is a NAME and not a literal.
+  static bool with_named(const ModuleType* mt) {
+    if (!mt || !std::holds_alternative<Pmty_with>(mt->desc)) return false;
+    for (int i = 0; mt && i < 8; ++i) {
+      auto* w = std::get_if<Pmty_with>(&mt->desc);
+      if (!w) break;
+      mt = w->mt.get();
+    }
+    return mt && std::holds_alternative<Pmty_ident>(mt->desc);
+  }
+  // One ident per item of it, at `res_wt`'s two sides.
+  long long asc_flat(const ModuleType& mt) const {
+    const Gone g = res_gone(mt);
+    if (const Signature* sg = mty_sig(&mt)) return w_wt(*sg, flat(), g);
+    std::string key;
+    if (const cmi::Signature* cs = xmty_sig(&mt, key))
+      return c_wt(*cs, flat(), g);
+    return 0;
+  }
   long long fbody_asc(const Pmod_functor& f) const {
     if (fascbody_off() || !std::holds_alternative<Functor_named>(f.param))
       return 0;
     auto* st = std::get_if<Pmod_structure>(&f.body->desc);
     if (!st) return 0;
+    bool hit = false;
+    long long w = 0;
     for (auto& it : st->items) {
       auto* md = std::get_if<Pstr_module>(&it.desc);
       if (!md) continue;
       auto* c = std::get_if<Pmod_constraint>(&md->binding.expr.desc);
-      if (c && xpoly_named(c->mt.get()))
-        return 2 * ren_mexpr(*f.body, Sibs{});
+      if (!c) continue;
+      if (wascflat_off()) {
+        if (xpoly_named(c->mt.get())) hit = true;
+        continue;
+      }
+      if (!apoly_mty(c->mt.get())) continue;
+      hit = true;
+      if (with_named(c->mt.get())) w += 2 * asc_flat(*c->mt);
     }
-    return 0;
+    return hit ? 2 * ren_mexpr(*f.body, Sibs{}) + w : 0;
   }
   // ---- A `with` OVER A MODULE TYPE NAME IN A PACKAGE TYPE ----------------
   // `pack_pkg` weighs a package type by its CONSTRAINTS alone, so a package
