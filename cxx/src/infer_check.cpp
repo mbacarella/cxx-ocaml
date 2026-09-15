@@ -20492,6 +20492,10 @@ bool vread_off() {
   static const bool off = dbg_env("NOVREAD") != nullptr;
   return off;
 }
+bool meet_off() {
+  static const bool off = dbg_env("NOTYMEET") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -20782,20 +20786,86 @@ struct Cites {
     std::string s;
     if (dotted_path(i->id.txt, s) && areads_[s] < nargs) areads_[s] = nargs;
   }
-  // `e` stands where ocamlc expands its type; only the expression ITSELF does,
-  // so `ignore (f S.empty)` expands what `f` returns and not `S.empty`.
-  void xval(const Expression& e) {
-    if (vread_off()) return;
+  // What `e` is under the annotations written on it.
+  static const Expression* bare_exp(const Expression& e) {
     const Expression* p = &e;
     for (int i = 0; i < 64; ++i) {
       auto* c = std::get_if<Pexp_constraint>(&p->desc);
       if (!c) break;
       p = c->e.get();
     }
-    auto* i = std::get_if<Pexp_ident>(&p->desc);
+    return p;
+  }
+  // `e` stands where ocamlc expands its type; only the expression ITSELF does,
+  // so `ignore (f S.empty)` expands what `f` returns and not `S.empty`.
+  void xval(const Expression& e) {
+    if (vread_off()) return;
+    auto* i = std::get_if<Pexp_ident>(&bare_exp(e)->desc);
     if (!i) return;
     std::string s;
     if (dotted_path(i->id.txt, s)) xreads_.insert(s);
+  }
+  // ---- a type that MEETS another ----------------------------------------
+  // Where two sibling expressions must carry ONE type -- the branches of an
+  // `if`, the arms of a `match` or a `function`, the body and the handlers of
+  // a `try`, the elements of an array or of a list -- `Ctype.unify` has to
+  // expand every constructor that carries ARGUMENTS on the way down, so a
+  // value whose type NAMES the result's parameterized abstract type ANYWHERE
+  // builds the module although a bare read of it costs nothing: `'a S.t list`
+  // and `'a S.t -> int` do, where `S.s list` and `S.s -> int` still do not.
+  // An array's elements and a `try`'s arms meet whatever stands beside them;
+  // an `if`'s, a `match`'s and a list's need TWO siblings that have a type of
+  // their own, which `raise e` and `assert false` do not.
+  // A list is a `::` APPLICATION besides, so `type_argument` walks its
+  // elements' whole arrow SPINE to collect the labels, expanding each head on
+  // the way (`lreads_`) -- and only there does a parameterless `S.s` at the
+  // end of it build the module too.  That walk wants an INFERRED element, so
+  // it takes two of them that are not `fun`, which is checked against the
+  // type it is handed rather than read off.
+  std::set<std::string> ureads_;
+  std::set<std::string> lreads_;
+  static std::string lid_tail(const Longident& id) {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.empty()) return {};
+    return c.back();
+  }
+  static bool no_type(const Expression& e) {
+    const Expression* p = bare_exp(e);
+    if (auto* a = std::get_if<Pexp_assert>(&p->desc)) {
+      auto* c = std::get_if<Pexp_construct>(&bare_exp(*a->e)->desc);
+      return c && lid_tail(c->id.txt) == "false";
+    }
+    auto* ap = std::get_if<Pexp_apply>(&p->desc);
+    if (!ap || ap->args.size() != 1) return false;
+    auto* i = std::get_if<Pexp_ident>(&ap->fn->desc);
+    if (!i) return false;
+    const std::string n = lid_tail(i->id.txt);
+    return n == "raise" || n == "raise_notrace";
+  }
+  static bool is_fn_exp(const Expression& e) {
+    return std::holds_alternative<Pexp_function>(bare_exp(e)->desc);
+  }
+  void uval(const Expression& e, std::set<std::string>& into) {
+    auto* i = std::get_if<Pexp_ident>(&bare_exp(e)->desc);
+    if (!i) return;
+    std::string s;
+    if (dotted_path(i->id.txt, s)) into.insert(s);
+  }
+  // `always` where the siblings meet however few of them have a type, `lst`
+  // where they are a constructor's arguments besides.
+  void umeet(const std::vector<const Expression*>& es, bool always, bool lst) {
+    if (vread_off() || meet_off()) return;
+    int nty = 0, ninf = 0;
+    for (auto* p : es)
+      if (!no_type(*p)) { ++nty; if (!is_fn_exp(*p)) ++ninf; }
+    if (always || nty >= 2)
+      for (auto* p : es) uval(*p, ureads_);
+    if (lst && ninf >= 2)
+      for (auto* p : es) uval(*p, lreads_);
+  }
+  static void case_exps(const std::vector<Case>& cs,
+                        std::vector<const Expression*>& out) {
+    for (auto& c : cs) out.push_back(c.rhs.get());
   }
   // Walks `t` as a type that is EXPANDED where it stands.
   void tyx(const CoreType& t) {
@@ -21050,8 +21120,12 @@ struct Cites {
         tyx(*co.to_);
       }
     }
-    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) ex(*fb->e);
-    else for (auto& c : std::get<Pfunction_cases>(f.body->v).cases) cse(c);
+    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) { ex(*fb->e); return; }
+    auto& cs = std::get<Pfunction_cases>(f.body->v).cases;
+    std::vector<const Expression*> bs;
+    case_exps(cs, bs);
+    umeet(bs, false, false);
+    for (auto& c : cs) cse(c);
   }
   // ---- a type that meets a type ------------------------------------------
   // `Ctype.unify` links a VARIABLE to whatever it meets without looking it up,
@@ -21300,13 +21374,17 @@ struct Cites {
     } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
       for (auto& x : t->elems) ex(*x);
     } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
-      if (i->else_) xsame({i->then_.get(), (*i->else_).get()});
+      if (i->else_) {
+        xsame({i->then_.get(), (*i->else_).get()});
+        umeet({i->then_.get(), (*i->else_).get()}, false, false);
+      }
       ex(*i->cond); ex(*i->then_);
       if (i->else_) ex(**i->else_);
     } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
       std::vector<const Expression*> es;
       list_elems(e, es);
       xsame(es);
+      if (es.size() >= 2) umeet(es, false, true);
       cite(c->id, false);
       if (c->arg) ex(**c->arg);
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
@@ -21314,8 +21392,14 @@ struct Cites {
       xmeet(denotes(*m->e));
       xval(*m->e);
       ex(*m->e);
+      std::vector<const Expression*> bs;
+      case_exps(m->cases, bs);
+      umeet(bs, false, false);
       for (auto& c : m->cases) cse(c);
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
+      std::vector<const Expression*> bs{t->e.get()};
+      case_exps(t->cases, bs);
+      umeet(bs, true, false);
       ex(*t->e);
       for (auto& c : t->cases) cse(c);
     } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
@@ -21346,6 +21430,7 @@ struct Cites {
       std::vector<const Expression*> es;
       for (auto& x : a->elems) es.push_back(x.get());
       xsame(es);
+      umeet(es, true, false);
       for (auto& x : a->elems) ex(*x);
     } else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) {
       if (v->arg) ex(**v->arg);
@@ -26839,18 +26924,52 @@ struct Count {
     }
     return t;
   }
-  // The declaration at the HEAD of `t`, where it is one of `sg`'s OWN and has
-  // no manifest of its own to expand away; null otherwise.  `'a S.t list` is
-  // headed by `list` and asks for nothing.
-  static const cmi::TypeDecl* head_abs(const cmi::TypeExpr* t,
+  // The declaration `t`'s own constructor names, where it is one of `sg`'s
+  // OWN and has no manifest of its own to expand away; null otherwise.
+  static const cmi::TypeDecl* ctor_abs(const cmi::TypeExpr* t,
                                        const cmi::Signature& sg) {
-    t = tskip(t);
     if (!t || t->kind != cmi::TypeExpr::Tconstr || !t->path) return nullptr;
     const cmi::Path* p = t->path.get();
     const std::string n = p->kind == cmi::Path::Pdot ? p->s : p->id.name;
     for (auto& td : sg.types)
       if (td.name == n && !td.manifest) return &td;
     return nullptr;
+  }
+  // The same at the HEAD of `t`.  `'a S.t list` is headed by `list` and asks
+  // for nothing.
+  static const cmi::TypeDecl* head_abs(const cmi::TypeExpr* t,
+                                       const cmi::Signature& sg) {
+    return ctor_abs(tskip(t), sg);
+  }
+  // The head of what `t` RETURNS: `type_argument` walks the expected type's
+  // whole arrow spine to collect its labels and expands each head on the way,
+  // so `int -> S.s` asks for the module where `S.s -> int` does not.
+  static const cmi::TypeDecl* spine_abs(const cmi::TypeExpr* t,
+                                        const cmi::Signature& sg) {
+    for (int i = 0; i < 64; ++i) {
+      t = tskip(t);
+      if (!t || t->kind != cmi::TypeExpr::Tarrow) return ctor_abs(t, sg);
+      t = t->cod.get();
+    }
+    return nullptr;
+  }
+  // Does `t` NAME one of `sg`'s manifest-less types that carries PARAMETERS,
+  // however deep it sits?  That is what a type meeting another copy of itself
+  // expands.  See `Cites::ureads_`.
+  static bool names_param_abs(const cmi::TypeExpr* t,
+                              const cmi::Signature& sg, int depth) {
+    if (!t || depth > 24) return false;
+    if (const cmi::TypeDecl* td = ctor_abs(t, sg))
+      if (td->arity > 0) return true;
+    if (names_param_abs(t->dom.get(), sg, depth + 1) ||
+        names_param_abs(t->cod.get(), sg, depth + 1) ||
+        names_param_abs(t->link.get(), sg, depth + 1))
+      return true;
+    for (auto& a : t->args)
+      if (names_param_abs(a.get(), sg, depth + 1)) return true;
+    for (auto& e : t->elems)
+      if (names_param_abs(e.second.get(), sg, depth + 1)) return true;
+    return false;
   }
   // Does a sibling item READ a VALUE of the module the ascription discards in
   // a way that expands the result's own type?  See `Cites::vreads_`.
@@ -26864,6 +26983,16 @@ struct Count {
       const cmi::TypeDecl* h = head_abs(sv.type.get(), *mt->sig);
       // A type that carries parameters is expanded wherever it is named.
       if (h && (h->arity > 0 || xreads_->count(key))) return true;
+      if (!meet_off()) {
+        // Where the type MEETS another copy of itself, a parameterized one is
+        // expanded however deep it sits, and a list's elements have their
+        // whole arrow spine walked besides.
+        if (ureads_->count(key) &&
+            names_param_abs(sv.type.get(), *mt->sig, 0))
+          return true;
+        if (lreads_->count(key) && spine_abs(sv.type.get(), *mt->sig))
+          return true;
+      }
       auto it = areads_->find(key);
       if (it == areads_->end()) continue;
       // Each argument the value is given expands the parameter it meets, and
@@ -27771,6 +27900,8 @@ struct Count {
   const std::set<std::string>* oheads_ = nullptr;
   const std::set<std::string>* vreads_ = nullptr;
   const std::set<std::string>* xreads_ = nullptr;
+  const std::set<std::string>* ureads_ = nullptr;
+  const std::set<std::string>* lreads_ = nullptr;
   const std::map<std::string, int>* areads_ = nullptr;
   // The module type ascribing the application being walked, `Map.S` in
   // `module S : Map.S = Map.Make (M)` -- null everywhere else, the argument
@@ -28363,6 +28494,8 @@ int typing_ident_count(const ast::Structure& s) {
   c.oheads_ = &u.oheads_;
   c.vreads_ = &u.vreads_;
   c.xreads_ = &u.xreads_;
+  c.ureads_ = &u.ureads_;
+  c.lreads_ = &u.lreads_;
   c.areads_ = &u.areads_;
   c.pk_push();
   for (auto& it : s) c.item(it);
