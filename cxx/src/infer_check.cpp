@@ -26312,18 +26312,60 @@ struct Count {
     const bool fresh = seen.insert(ae).second;
     return wt_mexpr(*b, flat()) * (first ? 4 : fresh ? 2 : 1);
   }
+  // ---- A CROSS-UNIT FUNCTOR APPLICATION WRITTEN IN A TYPE PATH -----------
+  // `Set.Make (X).t` is no name in scope either, and the unit's `.cmi` holds
+  // no parsetree for `lapp_charge` to walk, so it was charged NOTHING.
+  // `Env.find_type` on the `Papply` BUILDS the applied signature to find the
+  // type in it -- one ident per item of the functor's RESULT, at every depth
+  // -- and it builds it once per DISTINCT application, a second spelling of
+  // the same argument sharing the cache.  The FULL charge is more: measured
+  // over `Set.Make`, `Map.Make` and `Hashtbl.Make` against a local argument,
+  // a unit argument and an enclosing functor's PARAMETER, a file that does
+  // not also BIND the application as a module pays the unit's own force (Set
+  // and Map 101, Hashtbl 98) besides, a position that INSTANTIATES the
+  // declaration -- a type declaration's manifest or record field, or any
+  // path given type ARGUMENTS -- pays TWICE the result and one more R for
+  // the first of them, and a plain use position (a `val`, a constructor
+  // argument, an annotation) pays R apiece.  Only the flat R is taken here:
+  // it is the floor every one of those measures at or above, and it is EXACT
+  // where the file binds the same application as a MODULE too, which is what
+  // `t20ok`/`t21ok` write.  TWICE the result is NOT safe: applying a
+  // cross-unit functor to an enclosing functor's PARAMETER already
+  // OVER-counts by the items of the module type the two parameters name
+  // (`module F (X : Set.OrderedType) = struct module XS = Set.Make (X) end`
+  // is +2, Hashtbl +3), and twice the result turns that shape's -92 into +2.
+  // An ascription that DISCARDS such a binding is +226 over before this and
+  // still is after it; that is (a11)(i)'s bug, not this charge's.
+  static bool xtapp_off() {
+    static const bool off = dbg_env("NOXTAPP") != nullptr;
+    return off;
+  }
+  std::set<std::string> xtapp_;  // the applied paths already built
+  long long xtapp_charge(const Longident& id) {
+    if (xtapp_off()) return 0;
+    if (auto* d = std::get_if<Ldot>(&id.v)) return xtapp_charge(*d->prefix);
+    auto* a = std::get_if<Lapply>(&id.v);
+    if (!a) return 0;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = scrape_cmty(cmi_module(*a->f, &root), root);
+    if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+    const cmi::ModuleType* res = scrape_cmty(mt->functor_body.get(), root);
+    if (!res) return 0;
+    if (!xtapp_.insert(lid_full(id)).second) return 0;
+    return flat_cmty(res);
+  }
   long long lapp_path(const Longident& id) {
     if (auto* d = std::get_if<Ldot>(&id.v)) return lapp_path(*d->prefix);
     return lapp_charge(id);
   }
   // Every functor application a written type names.
   void ty_app(const CoreType& t, int d = 0) {
-    if (aliasapp_off() || d > 24) return;
+    if (d > 24) return;
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
-      n += lapp_path(c->id.txt);
+      n += lapp_path(c->id.txt) + xtapp_charge(c->id.txt);
       for (auto& a : c->args) ty_app(*a, d + 1);
     } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
-      n += lapp_path(c->id.txt);
+      n += lapp_path(c->id.txt) + xtapp_charge(c->id.txt);
       for (auto& a : c->args) ty_app(*a, d + 1);
     } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
       ty_app(*a->dom, d + 1);
