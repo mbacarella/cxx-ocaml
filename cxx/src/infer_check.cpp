@@ -20480,6 +20480,36 @@ bool prebind_off() {
   return off;
 }
 
+bool discload_off() {
+  static const bool off = dbg_env("NODISCLOAD") != nullptr;
+  return off;
+}
+
+// ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
+// `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
+// ascription that does not name it: nothing above M can ever reach S, and
+// `mdiscard_` below says so.  Does this signature bind a module of that name
+// at all?  An `include`, an `open` or an extension brings in what cannot be
+// read here, so a signature carrying one answers YES and nothing under it is
+// treated as discarded.
+bool sig_binds_mod(const Signature& sg, const std::string& nm) {
+  for (auto& it : sg) {
+    if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+      if (m->md.name.txt && *m->md.name.txt == nm) return true;
+    } else if (auto* r = std::get_if<Psig_recmodule>(&it.desc)) {
+      for (auto& d : r->decls)
+        if (d.name.txt && *d.name.txt == nm) return true;
+    } else if (auto* b = std::get_if<Psig_modsubst>(&it.desc)) {
+      if (b->name.txt && *b->name.txt == nm) return true;
+    } else if (std::holds_alternative<Psig_include>(it.desc) ||
+               std::holds_alternative<Psig_open>(it.desc) ||
+               std::holds_alternative<Psig_extension>(it.desc)) {
+      return true;  // what it brings in cannot be read here
+    }
+  }
+  return false;
+}
+
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
   // Module names the file binds itself, with how MANY times: a name bound
@@ -20523,9 +20553,36 @@ struct Cites {
   bool fmt_ann = false;  // a written `.. format` / format4 / format6
   // The functor PATHS this file applies, as written; resolved in `cost`.
   std::vector<std::pair<std::vector<std::string>, bool>> fapps;
+  // For each of them, the name of the module an ascription DISCARDS it into,
+  // resolved against `heads_` once the whole file has been walked.
+  std::vector<std::string> fdisc;
   // `let module M = F (A) in ..`: the result is bound over the body
   // alone and none of the types it names is ever looked up.
   bool inexpr_ = false;
+  // ---- AN ASCRIPTION THAT HIDES A MODULE LOADS NOTHING FOR IT -----------
+  // The same holds of a module an ascription DISCARDS: the result of
+  // `module M : sig end = struct module S = Wa.F (X) end` is never read, so
+  // the units its items' types name are never loaded either -- a result
+  // whose values are spelled `'a Wb.s` costs the whole of `Wb` where it is
+  // saved (one ident per item of it) and NOTHING where it is discarded.
+  // Only module types of THIS file are resolved here, which is all a
+  // discarding ascription can be spelled as.
+  const Signature* casc_ = nullptr;
+  std::string cdname_;
+  std::map<std::string, const ModuleType*> cmtys_;
+  const Signature* casc_sig(const ModuleType* mt, int fuel = 8) const {
+    if (!mt || fuel <= 0) return nullptr;
+    if (auto* s = std::get_if<Pmty_signature>(&mt->desc)) return &s->items;
+    if (auto* w = std::get_if<Pmty_with>(&mt->desc))
+      return casc_sig(w->mt.get(), fuel - 1);
+    if (auto* id = std::get_if<Pmty_ident>(&mt->desc)) {
+      auto* b = std::get_if<Lident>(&id->id.txt.v);
+      if (!b) return nullptr;
+      auto it = cmtys_.find(b->name);
+      return it == cmtys_.end() ? nullptr : casc_sig(it->second, fuel - 1);
+    }
+    return nullptr;
+  }
   // Units a type of theirs met an ALREADY-FIXED type of, so the .cmi's
   // signature is forced a second time (see `denotes` below).
   std::set<std::string> xforce;
@@ -20652,9 +20709,26 @@ struct Cites {
       if (opens.count(e.first)) subopens.insert(e.second);
     }
   }
+  // Every path's HEAD, whatever position it stands in: `type u = S.t` and
+  // `let x = S.empty` both NAME S, and a module something names is built
+  // for it whether or not the ascription above declares it.
+  std::set<std::string> heads_;
+  void note_head(const Longident& id) {
+    for (const Longident* p = &id;;) {
+      if (auto* d = std::get_if<Ldot>(&p->v)) { p = d->prefix.get(); continue; }
+      if (auto* a = std::get_if<Lapply>(&p->v)) {
+        note_head(*a->f);
+        note_head(*a->x);
+        return;
+      }
+      heads_.insert(std::get<Lident>(p->v).name);
+      return;
+    }
+  }
   // `modpos` says the name stands in the module namespace (`open M`), where a
   // bare ident is a module; anywhere else only a DOTTED path names one.
   void cite(const Longident& id, bool modpos) {
+    note_head(id);
     force_path(id);
     if (auto* a = std::get_if<Lapply>(&id.v)) {
       cite(*a->f, true);
@@ -21362,7 +21436,19 @@ struct Cites {
       fparam(f->param);
       mexp(*f->body);
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
-      mexp(*c->me); mty(*c->mt, true);
+      // A module that carries an ascription OF ITS OWN is built for it
+      // whether or not anything above names it, and the units the module
+      // type mentions are loaded to write it out: `module M : sig end =
+      // struct module S : Set.S = Set.Make (String) end` costs ocamlc
+      // exactly what the same structure SAVED costs.
+      const Signature* av = casc_;
+      const std::string dv = cdname_;
+      casc_ = discload_off() ? nullptr : casc_sig(c->mt.get());
+      cdname_.clear();
+      mexp(*c->me);
+      casc_ = av;
+      cdname_ = dv;
+      mty(*c->mt, true);
     } else if (auto* a = std::get_if<Pmod_apply>(&m.desc)) {
       const ModuleExpr* fh = &m;
       bool pathed = true;
@@ -21372,8 +21458,10 @@ struct Cites {
       }
       if (auto* fi = std::get_if<Pmod_ident>(&fh->desc)) {
         std::vector<std::string> c;
-        if (lid_comps(fi->id.txt, c) && c.size() >= 2)
+        if (lid_comps(fi->id.txt, c) && c.size() >= 2) {
           fapps.emplace_back(c, inexpr_ && pathed);
+          fdisc.push_back(discload_off() ? std::string() : cdname_);
+        }
       }
       mexp(*a->f); mexp(*a->arg);
     } else if (auto* a = std::get_if<Pmod_apply_unit>(&m.desc)) {
@@ -21442,11 +21530,20 @@ struct Cites {
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
       bind_mod(m->binding.name);
       if (m->binding.name.txt) selfb_[*m->binding.name.txt]++;
+      const Signature* av = casc_;
+      const std::string dv = cdname_;
+      if (cdname_.empty() && casc_ && m->binding.name.txt &&
+          !sig_binds_mod(*casc_, *m->binding.name.txt))
+        cdname_ = *m->binding.name.txt;
+      casc_ = nullptr;
       mbind(m->binding);
+      casc_ = av;
+      cdname_ = dv;
       if (m->binding.name.txt) selfb_[*m->binding.name.txt]--;
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       for (auto& b : m->bindings) { bind_mod(b.name); mbind(b); }
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+      if (m->type) cmtys_[m->name.txt] = &*m->type;
       if (m->type) mty(*m->type, true);
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexp(i->expr);
@@ -21695,7 +21792,12 @@ struct Cites {
   }
   void functor_loads(std::map<std::string, int>& more,
                      std::set<std::string>& noload) const {
-    for (auto& fa : fapps) {
+    for (std::size_t fi = 0; fi < fapps.size(); ++fi) {
+      const auto& fa = fapps[fi];
+      // The result is read by nobody: an ascription hides the module it was
+      // bound in, and no path of this file names it either.
+      const bool disc = fi < fdisc.size() && !fdisc[fi].empty() &&
+                        !heads_.count(fdisc[fi]);
       std::vector<std::string> c = fa.first;
       if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
       std::string h = unit_here(c[0]);
@@ -21722,7 +21824,8 @@ struct Cites {
       for (const cmi::ModuleType* f = mt; f;
            f = scrape_cmty(f->functor_body.get(), rt)) {
         if (f->kind != cmi::ModuleType::Functor) {
-          if (f->kind == cmi::ModuleType::Sig && f->sig && !fa.second) {
+          if (f->kind == cmi::ModuleType::Sig && f->sig && !fa.second &&
+              !disc) {
             Applied a;
             sig_applied(*f->sig, a);
             for (auto& e : a.units)
@@ -26594,7 +26697,7 @@ struct Count {
     long long nf = (firstapp || (newpath && had >= 1)) ? 1 : 0;
     if (unit_arg && newarg) ++nf;
     const bool discarded = !ascrapp_off() && mdiscard_ && !inexpr_;
-    if (discarded) nf = 0;
+    if (discarded) nf = !discload_off() && mdisctop_ && firstapp ? 1 : 0;
     k += nf * flat_cmty(mt);
     k += wt_cmty(mt, l);
     // An argument with NO PATH leaves the result unstrengthened: it is
@@ -27316,25 +27419,25 @@ struct Count {
   // `ascr_sig_` is the signature of the ascription this structure stands
   // directly behind, where it can be read at all; `mdiscard_` says that this
   // module -- and everything under it -- is one nothing above declares.
-  static bool sig_binds_mod(const Signature& sg, const std::string& nm) {
-    for (auto& it : sg) {
-      if (auto* m = std::get_if<Psig_module>(&it.desc)) {
-        if (m->md.name.txt && *m->md.name.txt == nm) return true;
-      } else if (auto* r = std::get_if<Psig_recmodule>(&it.desc)) {
-        for (auto& d : r->decls)
-          if (d.name.txt && *d.name.txt == nm) return true;
-      } else if (auto* b = std::get_if<Psig_modsubst>(&it.desc)) {
-        if (b->name.txt && *b->name.txt == nm) return true;
-      } else if (std::holds_alternative<Psig_include>(it.desc) ||
-                 std::holds_alternative<Psig_open>(it.desc) ||
-                 std::holds_alternative<Psig_extension>(it.desc)) {
-        return true;  // what it brings in cannot be read here
-      }
-    }
-    return false;
-  }
+  //
+  // ---- IT IS STILL FORCED ONCE WHERE THE ASCRIPTION IS ITS OWN ----------
+  // What the discard drops is the BUILD, not the force: the lazy signature
+  // is read out once all the same, one ident per item, for the module the
+  // ascription hides DIRECTLY.  A module bound one level further down --
+  // `module M : sig end = struct module P = struct module S = F (X) end end`
+  // -- is reached through P, which the discard already left unread, and is
+  // forced by nobody; `mdisctop_` is what tells the two apart.  A SECOND
+  // application of the same functor beside it shares the one force, and an
+  // argument of another unit, which doubles the force where the result is
+  // saved, does not double this one.
   const Signature* ascr_sig_ = nullptr;
   bool mdiscard_ = false;
+  bool mdisctop_ = false;
+  // Every path head the file writes, from the citation walk.  A module a
+  // SIBLING item names -- `module S = Set.Make (X) type u = S.t` -- is built
+  // for that item however little the ascription above wants of it, and only
+  // one NOTHING names is left the force below.
+  const std::set<std::string>* heads_ = nullptr;
   // The module type ascribing the application being walked, `Map.S` in
   // `module S : Map.S = Map.Make (M)` -- null everywhere else, the argument
   // and the head of that very application included.
@@ -27780,13 +27883,19 @@ struct Count {
         n += anon_mexpr(m->binding.expr);
       const Signature* asv = ascr_sig_;
       const bool dsv = mdiscard_;
+      const bool dtv = mdisctop_;
       if (!mdiscard_ && ascr_sig_ && m->binding.name.txt &&
-          !sig_binds_mod(*ascr_sig_, *m->binding.name.txt))
+          !sig_binds_mod(*ascr_sig_, *m->binding.name.txt)) {
         mdiscard_ = true;
+        mdisctop_ = !heads_ || !heads_->count(*m->binding.name.txt);
+      } else if (mdiscard_) {
+        mdisctop_ = false;
+      }
       ascr_sig_ = nullptr;
       mexpr(m->binding.expr, ml);
       ascr_sig_ = asv;
       mdiscard_ = dsv;
+      mdisctop_ = dtv;
       if (m->binding.name.txt) ++n;
       mbind(m->binding);
       n += lal_bind(m->binding);
@@ -27908,6 +28017,7 @@ int typing_ident_count(const ast::Structure& s) {
   stampcount::Count c;
   c.used_ = &used;
   c.xk_ = &xkeys;
+  c.heads_ = &u.heads_;
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
