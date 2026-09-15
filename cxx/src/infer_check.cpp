@@ -22365,6 +22365,7 @@ struct Count {
     }
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
       pat(*c->p, out);
+      ann_app(*c->t);
       return;
     }
     if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
@@ -23593,6 +23594,14 @@ struct Count {
         if (b.constraint_)
           if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
             n += (long long)c->univars.size();
+    for (auto& b : bs)
+      if (b.constraint_) {
+        if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_)) ann_app(*c->typ);
+        else if (auto* c = std::get_if<Pvc_coercion>(&*b.constraint_)) {
+          if (c->ground) ann_app(**c->ground);
+          ann_app(*c->coercion);
+        }
+      }
     std::vector<std::string> nm;
     bool all_fun = true;
     for (auto& b : bs)
@@ -23621,6 +23630,13 @@ struct Count {
     if (f.constraint_ && !packty_off())
       if (auto* c = std::get_if<Pconstraint>(&*f.constraint_))
         n += 4 * pack_nodes(*c->type);
+    if (f.constraint_) {
+      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_)) ann_app(*c->type);
+      else if (auto* c = std::get_if<Pcoerce>(&*f.constraint_)) {
+        if (c->from) ann_app(**c->from);
+        ann_app(*c->to_);
+      }
+    }
     for (auto& pm : f.params) {
       auto* pv = std::get_if<Pparam_val>(&pm.desc);
       if (!pv) { ++n; continue; }  // (type a)
@@ -23701,6 +23717,8 @@ struct Count {
     } else if (auto* i = std::get_if<Pcf_initializer>(&f.desc)) {
       n += 2;
       expr(*i->e);
+    } else if (auto* c = std::get_if<Pcf_constraint>(&f.desc)) {
+      ann_app(*c->t1); ann_app(*c->t2);
     }
   }
   // A class parameter is a pattern typed by `type_class_arg_pattern`
@@ -23735,8 +23753,11 @@ struct Count {
       release(m);
     } else if (auto* k = std::get_if<Pcl_constraint>(&c.desc)) {
       cexpr(*k->ce);
+      cty_app(*k->ct);
     } else if (auto* o = std::get_if<Pcl_open>(&c.desc)) {
       cexpr(*o->body);
+    } else if (auto* k = std::get_if<Pcl_constr>(&c.desc)) {
+      for (auto& a : k->args) ann_app(*a);
     }
   }
   void expr(const Expression& e) {
@@ -23772,8 +23793,11 @@ struct Count {
     } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
       expr(*c->e);
       if (!packty_off()) n += pack_ty(*c->t);
+      ann_app(*c->t);
     } else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) {
       expr(*c->e);
+      if (c->from) ann_app(**c->from);
+      ann_app(*c->to_);
     } else if (auto* f = std::get_if<Pexp_field>(&e.desc)) {
       expr(*f->e);
     } else if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
@@ -23857,6 +23881,7 @@ struct Count {
       for (auto& f : o->fields) expr(*f.second);
     } else if (auto* p = std::get_if<Pexp_poly>(&e.desc)) {
       expr(*p->e);
+      if (p->t) ann_app(**p->t);
     } else if (auto* o = std::get_if<Pexp_object>(&e.desc)) {
       if (!cls_off()) cstruct(*o->cs);
     }
@@ -26359,39 +26384,80 @@ struct Count {
     return lapp_charge(id);
   }
   // Every functor application a written type names.
-  void ty_app(const CoreType& t, int d = 0) {
+  // `xonly` takes the cross-unit charge alone: the local alias law was
+  // measured in declaration positions and costs half as much in a `let`.
+  void ty_app(const CoreType& t, int d = 0, bool xonly = false) {
     if (d > 24) return;
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
-      n += lapp_path(c->id.txt) + xtapp_charge(c->id.txt);
-      for (auto& a : c->args) ty_app(*a, d + 1);
+      n += (xonly ? 0 : lapp_path(c->id.txt)) + xtapp_charge(c->id.txt);
+      for (auto& a : c->args) ty_app(*a, d + 1, xonly);
     } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
-      n += lapp_path(c->id.txt) + xtapp_charge(c->id.txt);
-      for (auto& a : c->args) ty_app(*a, d + 1);
+      n += (xonly ? 0 : lapp_path(c->id.txt)) + xtapp_charge(c->id.txt);
+      for (auto& a : c->args) ty_app(*a, d + 1, xonly);
     } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
-      ty_app(*a->dom, d + 1);
-      ty_app(*a->cod, d + 1);
+      ty_app(*a->dom, d + 1, xonly);
+      ty_app(*a->cod, d + 1, xonly);
     } else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc)) {
-      for (auto& e : u->elems) ty_app(*e, d + 1);
+      for (auto& e : u->elems) ty_app(*e, d + 1, xonly);
     } else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) {
-      ty_app(*p->type, d + 1);
+      ty_app(*p->type, d + 1, xonly);
     } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
-      ty_app(*al->type, d + 1);
+      ty_app(*al->type, d + 1, xonly);
     } else if (auto* op = std::get_if<Ptyp_open>(&t.desc)) {
-      ty_app(*op->type, d + 1);
+      ty_app(*op->type, d + 1, xonly);
     } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
       for (auto& r : v->rows) {
         if (auto* g = std::get_if<Rtag>(&r))
-          for (auto& a : g->types) ty_app(*a, d + 1);
+          for (auto& a : g->types) ty_app(*a, d + 1, xonly);
         else if (auto* i = std::get_if<Rinherit>(&r))
-          ty_app(*i->ct, d + 1);
+          ty_app(*i->ct, d + 1, xonly);
       }
     } else if (auto* o = std::get_if<Ptyp_object>(&t.desc)) {
       for (auto& f : o->fields) {
-        if (auto* g = std::get_if<Otag>(&f)) ty_app(*g->type, d + 1);
-        else if (auto* i = std::get_if<Oinherit>(&f)) ty_app(*i->type, d + 1);
+        if (auto* g = std::get_if<Otag>(&f)) ty_app(*g->type, d + 1, xonly);
+        else if (auto* i = std::get_if<Oinherit>(&f)) ty_app(*i->type, d + 1, xonly);
       }
     }
+  }  // ---- THE SAME PATH WRITTEN IN AN ANNOTATION ----------------------------
+  // `ty_app` was called from type declarations and signature items alone, so
+  // a cross-unit application written in a `let` parameter, an expression
+  // constraint, a coercion, a function's result constraint, a `let x : t`,
+  // a method annotation or a class type was charged nothing.  `Env.find_type`
+  // builds the applied signature there exactly as in a manifest, and the
+  // build is cached under the path, so a path a declaration already paid for
+  // is free here and one met here first pays its flat R once for the file.
+  // Measured inside `F (X : Set.OrderedType)`, R = 47: an expression
+  // constraint, a result constraint, a `let x : ..` and an inner `let y : ..`
+  // are 5R short, a parameter annotation, a coercion, a `val`/method
+  // annotation and a class-type method 3R, a manifest and a parameter of the
+  // same path together 4R -- R is under every one of them.
+  static bool xtann_off() {
+    static const bool off = dbg_env("NOXTANN") != nullptr;
+    return off;
   }
+  void ann_app(const CoreType& t) {
+    if (!xtann_off()) ty_app(t, 0, true);
+  }
+  void cty_app(const ClassType& t, int d = 0) {
+    if (xtann_off() || d > 24) return;
+    if (auto* s = std::get_if<Pcty_signature>(&t.desc)) {
+      for (auto& f : s->cs.fields) {
+        if (auto* i = std::get_if<Pctf_inherit>(&f.desc)) cty_app(*i->ct, d + 1);
+        else if (auto* v = std::get_if<Pctf_val>(&f.desc)) ann_app(*v->type);
+        else if (auto* m = std::get_if<Pctf_method>(&f.desc)) ann_app(*m->type);
+        else if (auto* c = std::get_if<Pctf_constraint>(&f.desc)) {
+          ann_app(*c->t1); ann_app(*c->t2);
+        }
+      }
+    } else if (auto* a = std::get_if<Pcty_arrow>(&t.desc)) {
+      ann_app(*a->dom); cty_app(*a->cod, d + 1);
+    } else if (auto* o = std::get_if<Pcty_open>(&t.desc)) {
+      cty_app(*o->body, d + 1);
+    } else if (auto* c = std::get_if<Pcty_constr>(&t.desc)) {
+      for (auto& a : c->args) ann_app(*a);
+    }
+  }
+
   // `rebind` is the second pass an INCLUDE makes over an application: the
   // walk that precedes it has already charged every substitution but the
   // last, and only the result is bound a second time.
@@ -26923,9 +26989,11 @@ struct Count {
     } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
       if (!cls_off())
         n += (3 + 3 * (per - 1)) * (long long)c->decls.size();
+      for (auto& d : c->decls) cty_app(d.expr);
     } else if (auto* c = std::get_if<Psig_class_type>(&it.desc)) {
       if (!cls_off())
         n += (3 + 2 * (per - 1)) * (long long)c->decls.size();
+      for (auto& d : c->decls) cty_app(d.expr);
     }
   }
 
@@ -27046,6 +27114,7 @@ struct Count {
         ctnames.push_back(d.name.txt);
       }
       n += 3 * (long long)c->decls.size();
+      for (auto& d : c->decls) cty_app(d.expr);
     }
   }
 };
