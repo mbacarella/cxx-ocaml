@@ -26372,6 +26372,31 @@ struct Count {
     static const bool off = dbg_env("NOXTAPP") != nullptr;
     return off;
   }
+  // ---- AND IT IS BUILT TWICE --------------------------------------------
+  // `Env` keeps ONE cache for `components_of_functor_appl` and ANOTHER for
+  // `modtype_of_functor_appl` (S480 measured the same pair for a `Papply` in
+  // a MANIFEST of a functor result), and finding a type in an applied path
+  // fills them both: the result is renamed TWICE per distinct application,
+  // not once.  Measured against a functor of a unit of its own -- a result
+  // of 2, 4, 10 and 18 items, abstract and concrete, named and written out
+  // -- and against `Set.Make`, `Map.Make`, `Hashtbl.Make`, `Weak.Make` and
+  // `Ephemeron.K1.Make` with a unit, a local module and an enclosing
+  // functor's PARAMETER for an argument: where the file ALSO BINDS the same
+  // application as a module the charge is then EXACT to the ident, and where
+  // it does not it is still short by a per-functor constant the alias the
+  // path is spelled through decides (`Stdlib__Set.Make (String).t` is short
+  // 2, `Set.Make (String).t` 54), which is a slice of its own.
+  // NOTE it lands on a PRE-EXISTING over-count in one shape and only looks
+  // like a regression: an enclosing functor whose parameter is written as a
+  // NAMED module type is charged that module type's items once too many
+  // whatever else the file does -- `module F (X : Set.OrderedType) = struct
+  // module XS = Set.Make (X) end` is +2 with no type path in it at all, and
+  // +3 for `Hashtbl.HashedType` -- so the shapes that carry both land on +2
+  // instead of 0.  That is `par_wt`'s bug, not this charge's.
+  static bool xtapp2_off() {
+    static const bool off = dbg_env("NOXTAPP2") != nullptr;
+    return off;
+  }
   std::set<std::string> xtapp_;  // the applied paths already built
   long long xtapp_charge(const Longident& id) {
     if (xtapp_off()) return 0;
@@ -26384,7 +26409,7 @@ struct Count {
     const cmi::ModuleType* res = scrape_cmty(mt->functor_body.get(), root);
     if (!res) return 0;
     if (!xtapp_.insert(lid_full(id)).second) return 0;
-    return flat_cmty(res);
+    return flat_cmty(res) * (xtapp2_off() ? 1 : 2);
   }
   long long lapp_path(const Longident& id) {
     if (auto* d = std::get_if<Ldot>(&id.v)) return lapp_path(*d->prefix);
