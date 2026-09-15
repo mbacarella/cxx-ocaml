@@ -20488,6 +20488,10 @@ bool discread_off() {
   static const bool off = dbg_env("NODISCREAD") != nullptr;
   return off;
 }
+bool vread_off() {
+  static const bool off = dbg_env("NOVREAD") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -20732,11 +20736,67 @@ struct Cites {
   bool tpos_ = false;
   std::set<std::string> treads_;
   // Every path head read in any OTHER position, which is what S494 had: such
-  // a read builds the module too, but neither the count nor the law for it
-  // is this one's -- `let y = S.empty` costs NOTHING where the ascription
-  // drops y and the whole result over again where it does not -- so it keeps
-  // S494's coarse answer, and the two never fire for the same module.
+  // a read kept S494's COARSE answer, the result built once over and the
+  // units its types name loaded besides.  That answer is retired -- ocamlc
+  // charges NOTHING for an `open`, a constructor's argument or a pattern's
+  // annotation, and what a VALUE read costs is `vreads_` below -- so the set
+  // survives for the `NOVREAD` hook alone.
   std::set<std::string> oheads_;
+  // Which VALUES of such a module a sibling reads, and how.  A value read
+  // builds it exactly as a type read does, and -- like a type read -- only
+  // where the type at the HEAD of the value's OWN type is the result's and
+  // has no manifest to expand away: `S.elt`-headed and `int`-headed values
+  // cost nothing at all, and neither does one whose type merely CONTAINS the
+  // result's (`'a S.t list`, `S.t -> int`).  Given such a head,
+  //   * a type that carries PARAMETERS is expanded wherever the value is read
+  //     at all -- `Map.Make (X)`'s `empty : 'a t` builds the result where
+  //     `Set.Make (X)`'s `empty : t` does not;
+  //   * one that does not is expanded only where ocamlc asks for it: a
+  //     binding whose pattern is `_`, the argument of `ignore`, a statement,
+  //     a `match` scrutinee, and a CONSUMED parameter or the result of an
+  //     application of one of the module's own functions (`S.cardinal
+  //     S.empty` and `S.singleton "a"` both build it, `S.mem "a"`, whose
+  //     result is still an arrow, does not).
+  // `vreads_` is every dotted value path read, `xreads_` those standing in a
+  // position the type is expanded in, `areads_` the arguments each is APPLIED
+  // to.  The whole dotted path is kept, as for `treads_`.
+  std::set<std::string> vreads_;
+  std::set<std::string> xreads_;
+  std::map<std::string, int> areads_;
+  static bool dotted_path(const Longident& id, std::string& out) {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.size() < 2) return false;
+    out = c[0];
+    for (std::size_t i = 1; i < c.size(); ++i) out += "." + c[i];
+    return true;
+  }
+  void vread(const Longident& id) {
+    if (vread_off()) return;
+    std::string s;
+    if (dotted_path(id, s)) vreads_.insert(s);
+  }
+  void vapp(const Expression& f, int nargs) {
+    if (vread_off() || nargs <= 0) return;
+    auto* i = std::get_if<Pexp_ident>(&f.desc);
+    if (!i) return;
+    std::string s;
+    if (dotted_path(i->id.txt, s) && areads_[s] < nargs) areads_[s] = nargs;
+  }
+  // `e` stands where ocamlc expands its type; only the expression ITSELF does,
+  // so `ignore (f S.empty)` expands what `f` returns and not `S.empty`.
+  void xval(const Expression& e) {
+    if (vread_off()) return;
+    const Expression* p = &e;
+    for (int i = 0; i < 64; ++i) {
+      auto* c = std::get_if<Pexp_constraint>(&p->desc);
+      if (!c) break;
+      p = c->e.get();
+    }
+    auto* i = std::get_if<Pexp_ident>(&p->desc);
+    if (!i) return;
+    std::string s;
+    if (dotted_path(i->id.txt, s)) xreads_.insert(s);
+  }
   // Walks `t` as a type that is EXPANDED where it stands.
   void tyx(const CoreType& t) {
     const bool sv = tpos_;
@@ -20949,8 +21009,23 @@ struct Cites {
     if (c.guard) ex(**c.guard);
     ex(*c.rhs);
   }
+  // Does the ascription this structure carries give a `val` of this name a
+  // type of its own?  Then the coercion has the two types meet, and the body's
+  // is expanded to see it.
+  bool asc_val(const Pattern& p) const {
+    auto* v = std::get_if<Ppat_var>(&p.desc);
+    if (!casc_ || !v) return false;
+    for (auto& it : *casc_)
+      if (auto* sv = std::get_if<Psig_value>(&it.desc))
+        if (sv->vd.name.txt == v->name.txt) return true;
+    return false;
+  }
   void vbind(const ValueBinding& b) {
     pat(b.pat);
+    // `let _ = e` runs the same check a statement does; `let y = e` does not
+    // -- unless the ascription above writes y's type out itself.
+    if (std::holds_alternative<Ppat_any>(b.pat.desc) || asc_val(b.pat))
+      xval(*b.expr);
     ex(*b.expr);
     if (!b.constraint_) return;
     if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_)) tyx(*c->typ);
@@ -21202,8 +21277,16 @@ struct Cites {
   void ex(const Expression& e) {
     if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
       cite(i->id, false);
+      vread(i->id.txt);
     } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       applied_fn(*a->fn, (int)a->args.size());
+      vapp(*a->fn, (int)a->args.size());
+      // `ignore e` expands what it is given, to warn about a partial
+      // application; nothing else about the application does.
+      if (a->args.size() == 1)
+        if (auto* f = std::get_if<Pexp_ident>(&a->fn->desc))
+          if (auto* l = std::get_if<Lident>(&f->id.txt.v))
+            if (l->name == "ignore") xval(*a->args[0].second);
       std::vector<const Expression*> as;
       for (auto& x : a->args) as.push_back(x.second.get());
       xsame(as);
@@ -21229,12 +21312,14 @@ struct Cites {
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       // `type_cases` expands the scrutinee's type whatever the patterns are.
       xmeet(denotes(*m->e));
+      xval(*m->e);
       ex(*m->e);
       for (auto& c : m->cases) cse(c);
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
       ex(*t->e);
       for (auto& c : t->cases) cse(c);
     } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
+      xval(*s->e1);
       ex(*s->e1); ex(*s->e2);
     } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
       // An annotation fixes the expected type before the expression is typed.
@@ -21888,8 +21973,11 @@ struct Cites {
            f = scrape_cmty(f->functor_body.get(), rt)) {
         if (f->kind != cmi::ModuleType::Functor) {
           if (f->kind == cmi::ModuleType::Sig && f->sig && !fa.second) {
+            // A read of ANY kind asks for the build alone, so the units
+            // the result's own types name stay unloaded whatever names it.
             const bool disc =
-                !dnm.empty() && (tread_builds_sig(*f->sig, dpre) ||
+                !dnm.empty() && (!vread_off() ||
+                                 tread_builds_sig(*f->sig, dpre) ||
                                  !oheads_.count(dnm));
             if (!disc) {
               Applied a;
@@ -26740,6 +26828,57 @@ struct Count {
       if (!td.manifest && treads_->count(mdiscpre_ + td.name)) return true;
     return false;
   }
+  // Down to the node that carries the head: an indirection, and the `Tpoly`
+  // this trunk wraps every arrow DOMAIN in.
+  static const cmi::TypeExpr* tskip(const cmi::TypeExpr* t) {
+    for (int i = 0; t && i < 64; ++i) {
+      if (t->kind != cmi::TypeExpr::Tlink && t->kind != cmi::TypeExpr::Tsubst &&
+          t->kind != cmi::TypeExpr::Tpoly)
+        break;
+      t = t->link.get();
+    }
+    return t;
+  }
+  // The declaration at the HEAD of `t`, where it is one of `sg`'s OWN and has
+  // no manifest of its own to expand away; null otherwise.  `'a S.t list` is
+  // headed by `list` and asks for nothing.
+  static const cmi::TypeDecl* head_abs(const cmi::TypeExpr* t,
+                                       const cmi::Signature& sg) {
+    t = tskip(t);
+    if (!t || t->kind != cmi::TypeExpr::Tconstr || !t->path) return nullptr;
+    const cmi::Path* p = t->path.get();
+    const std::string n = p->kind == cmi::Path::Pdot ? p->s : p->id.name;
+    for (auto& td : sg.types)
+      if (td.name == n && !td.manifest) return &td;
+    return nullptr;
+  }
+  // Does a sibling item READ a VALUE of the module the ascription discards in
+  // a way that expands the result's own type?  See `Cites::vreads_`.
+  bool vread_builds(const cmi::ModuleType* mt) const {
+    if (vread_off() || !vreads_ || !mt || mt->kind != cmi::ModuleType::Sig ||
+        !mt->sig)
+      return false;
+    for (auto& sv : mt->sig->values) {
+      const std::string key = mdiscpre_ + sv.name;
+      if (!vreads_->count(key)) continue;
+      const cmi::TypeDecl* h = head_abs(sv.type.get(), *mt->sig);
+      // A type that carries parameters is expanded wherever it is named.
+      if (h && (h->arity > 0 || xreads_->count(key))) return true;
+      auto it = areads_->find(key);
+      if (it == areads_->end()) continue;
+      // Each argument the value is given expands the parameter it meets, and
+      // what is left over after the last one is expanded too.
+      const cmi::TypeExpr* t = sv.type.get();
+      for (int i = 0; i < it->second && t; ++i) {
+        t = tskip(t);
+        if (!t || t->kind != cmi::TypeExpr::Tarrow) { t = nullptr; break; }
+        if (head_abs(t->dom.get(), *mt->sig)) return true;
+        t = t->cod.get();
+      }
+      if (t && head_abs(t, *mt->sig)) return true;
+    }
+    return false;
+  }
   // `Hashtbl.Make (String)`: the result is Hashtbl's, and applying it costs
   // the PARAMETER's signature once (it is bound while the argument is checked
   // against it), the result's own items once (the .cmi's lazy signature is
@@ -26865,7 +27004,8 @@ struct Count {
       // weight, and that read answers for the module whatever else names it.
       // It is BESIDES the force the discard keeps, which the first
       // application of the functor pays whether that one is read or not.
-      const bool tb = !discread_off() && tread_builds(mt);
+      const bool tb =
+          (!discread_off() && tread_builds(mt)) || vread_builds(mt);
       const bool coarse = mdisccoarse_ && !tb;
       nf = !discload_off() && mdisctop_ && !coarse && firstapp ? 1 : 0;
       if (tb && fdread_.insert(key).second) nf += 2 + xalias;
@@ -27629,6 +27769,9 @@ struct Count {
   std::set<std::string> fdread_;
   const std::set<std::string>* treads_ = nullptr;
   const std::set<std::string>* oheads_ = nullptr;
+  const std::set<std::string>* vreads_ = nullptr;
+  const std::set<std::string>* xreads_ = nullptr;
+  const std::map<std::string, int>* areads_ = nullptr;
   // The module type ascribing the application being walked, `Map.S` in
   // `module S : Map.S = Map.Make (M)` -- null everywhere else, the argument
   // and the head of that very application included.
@@ -28081,7 +28224,8 @@ struct Count {
           !sig_binds_mod(*ascr_sig_, *m->binding.name.txt)) {
         mdiscard_ = true;
         mdisctop_ = true;
-        mdisccoarse_ = oheads_ && oheads_->count(*m->binding.name.txt);
+        mdisccoarse_ = vread_off() && oheads_ &&
+                       oheads_->count(*m->binding.name.txt);
         mdiscpre_ = *m->binding.name.txt + ".";
       } else if (mdiscard_) {
         mdisctop_ = false;
@@ -28217,6 +28361,9 @@ int typing_ident_count(const ast::Structure& s) {
   c.xk_ = &xkeys;
   c.treads_ = &u.treads_;
   c.oheads_ = &u.oheads_;
+  c.vreads_ = &u.vreads_;
+  c.xreads_ = &u.xreads_;
+  c.areads_ = &u.areads_;
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
