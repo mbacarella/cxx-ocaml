@@ -23125,6 +23125,32 @@ struct Count {
     }
     return nullptr;
   }
+  // ---- ONE FORCE PER SIGNATURE, HOWEVER IT IS REACHED --------------------
+  // `wscraped` memoises a force under the PATH the source spells, which is
+  // not how the cached expansion is shared: `Env.find_modtype` hands back the
+  // one declaration the .cmi was decoded into, so a module type forced
+  // through a source path and the same module type forced as the PARAMETER
+  // of a functor of that unit (`cross_charge`) are the same expansion and are
+  // built ONCE.  `module A = Map.Make (M)` beside a `module F (X :
+  // Map.OrderedType) ..` pays `Map.OrderedType` once between them, in EITHER
+  // order, where the model paid it twice, and so do two functors of that unit
+  // whose parameter is the same module type.  NOT shared: a parameter named
+  // at a DIFFERENT path of the same unit; a `module type Z = U.P` alias,
+  // which forces nothing at all; a package type (`pk_force`, which is over by
+  // the whole signature on its own); and a functor that reaches ACROSS a unit
+  // boundary for its parameter (`cross_charge`), which builds it afresh.  The
+  // key is the decoded signature ITSELF -- one `cmi::Signature` per module
+  // type, whatever spelling reaches it -- kept apart from the path keys by a
+  // leading `@`.
+  static std::string sig_key(const cmi::Signature* sg) {
+    char b[32];
+    std::snprintf(b, sizeof b, "@%p", (const void*)sg);
+    return std::string(b);
+  }
+  static bool xparshare_off() {
+    static const bool off = dbg_env("NOXPARSHARE") != nullptr;
+    return off;
+  }
   // The force itself, where a module type of another unit is BOUND rather
   // than merely named: an ascription and a functor parameter both scrape it,
   // a `module type T = U.S` alias and a `sig module M : U.S end` description
@@ -23134,6 +23160,7 @@ struct Count {
     std::string key;
     const cmi::Signature* sg = xmty_sig(&mt, key);
     if (!sg || !wscraped.insert(key).second) return 0;
+    if (!xparshare_off() && !wscraped.insert(sig_key(sg)).second) return 0;
     return flat_csig(*sg);
   }
   // What ONE `with`-node over another unit's module type costs.
@@ -26048,21 +26075,25 @@ struct Count {
     return dot == std::string::npos ? key : key.substr(0, dot);
   }
   // Does this functor's RESULT leave a parameterized abstract type that
-  // another of its items names?  Where the result is ANOTHER UNIT's module
-  // type the answer holds only if the PARAMETER is not named out of that same
-  // unit: `module F (X : Map.OrderedType) : Map.S with .. = ..` is one ident
-  // per item of `Map.OrderedType` short of the 2R below, and the `Set`-typed
-  // parameter beside it is not, so the pair is left alone here.
+  // another of its items names?  S490 answered NO where the result and the
+  // PARAMETER were named out of the SAME unit, because those pairs came out
+  // one ident per parameter item OVER: that was the shared force above
+  // (`module F (X : Map.OrderedType) : Map.S .. = struct include Map.Make (X)
+  // end` builds `Map.OrderedType` once for the parameter and the application
+  // between them), and nothing to do with where the result is named.
   bool poly_fres(const ModuleExpr* fdef, const ModuleType* rmt) const {
     if (locpoly_off() || !rmt) return false;
-    const std::string u = mty_unit(rmt);
-    bool xok = true;
-    if (!u.empty()) {
-      auto* f = fdef ? std::get_if<Pmod_functor>(&fdef->desc) : nullptr;
-      auto* nm = f ? std::get_if<Functor_named>(&f->param) : nullptr;
-      xok = nm && nm->type && mty_unit(nm->type.get()) != u;
+    if (xparshare_off()) {
+      const std::string u = mty_unit(rmt);
+      bool xok = true;
+      if (!u.empty()) {
+        auto* f = fdef ? std::get_if<Pmod_functor>(&fdef->desc) : nullptr;
+        auto* nm = f ? std::get_if<Functor_named>(&f->param) : nullptr;
+        xok = nm && nm->type && mty_unit(nm->type.get()) != u;
+      }
+      return poly_mty(rmt, false, xok);
     }
-    return poly_mty(rmt, false, xok);
+    return poly_mty(rmt, false, true);
   }
   static bool named_pty(const FunctorParam& p) {
     auto* nm = std::get_if<Functor_named>(&p);
@@ -26370,7 +26401,18 @@ struct Count {
       if (mt->functor_param && fpar.insert(key + std::to_string(i)).second) {
         const cmi::ModuleType* pt =
             scrape_cmty(mt->functor_param_type.get(), root);
-        if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
+        // The parameter's own signature is the expansion `xforce` caches,
+        // but only where the .cmi names it out of the functor's OWN unit:
+        // `Ephemeron.K1.MakeSeeded (H : Hashtbl.SeededHashedType)` builds it
+        // again for every functor that reaches ACROSS a unit boundary for
+        // it, where `Map.Make` and a `module F (X : Map.OrderedType)` beside
+        // it build `Map.OrderedType` once between them.
+        const cmi::ModuleType* praw = mt->functor_param_type.get();
+        const bool own = praw && praw->kind == cmi::ModuleType::Ident &&
+                         praw->path && praw->path->kind == cmi::Path::Pident;
+        if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig &&
+            (xparshare_off() || !own ||
+             wscraped.insert(sig_key(pt->sig.get())).second))
           k += wt_csig(*pt->sig, Lvl{1, 1, 0, false});
       }
       mt = mt->functor_body.get();
