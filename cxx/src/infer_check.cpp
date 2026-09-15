@@ -25820,6 +25820,74 @@ struct Count {
       return str_csigc(*cs, conc);
     return false;
   }
+  // ---- A PARAMETERIZED ABSTRACT TYPE THE ASCRIPTION STILL NAMES ----------
+  // `module S : Map.S = Map.Make (M)` costs 2R MORE than the unascribed
+  // binding where the `Set` twin costs R LESS.  An ascription hands the
+  // module the module type as a PATH, so the result's items are renamed
+  // nowhere and the flat force above is dropped -- which is right only where
+  // `Mtype.strengthen` has nothing left to rebuild.  A type the signature
+  // leaves ABSTRACT WITH PARAMETERS, and that another of its items NAMES, is
+  // rebuilt all the same, and the result is then written out TWICE: the very
+  // lump `fstr` carries for a SAVED application, due once per functor like
+  // it.  `Set.S`'s `t` takes no parameters and `Map.S`'s `!+'a t` takes one,
+  // which is the whole of the difference between them; `Hashtbl.S` and
+  // `Hashtbl.SeededS` take it too and `Weak.S` does not.  BOTH signatures
+  // have to answer -- a `with` on the functor's result that hands the type a
+  // manifest, or an ascription that names the type nowhere, costs nothing --
+  // and a result the functor declares as a module type NAME is left a path
+  // and takes HALF, exactly as `idres` halves the substitution above.
+  static bool ascpoly_off() {
+    static const bool off = dbg_env("NOASCPOLY") != nullptr;
+    return off;
+  }
+  // Does a type expression name the declaration bound at this stamp?
+  static bool cty_names(const cmi::TypeExpr* t, long long st,
+                        std::set<const cmi::TypeExpr*>& seen, int d) {
+    if (!t || d > 8 || !seen.insert(t).second) return false;
+    if (t->kind == cmi::TypeExpr::Tconstr && t->path &&
+        t->path->kind == cmi::Path::Pident && t->path->id.stamp == st)
+      return true;
+    for (auto& a : t->args)
+      if (cty_names(cstrip(a), st, seen, d + 1)) return true;
+    for (auto& e : t->elems)
+      if (cty_names(cstrip(e.second), st, seen, d + 1)) return true;
+    for (auto& a : t->pv_args)
+      if (cty_names(cstrip(a), st, seen, d + 1)) return true;
+    return cty_names(cstrip(t->dom), st, seen, d + 1) ||
+           cty_names(cstrip(t->cod), st, seen, d + 1) ||
+           cty_names(cstrip(t->link), st, seen, d + 1);
+  }
+  static bool csig_names(const cmi::Signature& sg, long long st) {
+    std::set<const cmi::TypeExpr*> seen;
+    for (auto& v : sg.values)
+      if (cty_names(cstrip(v.type), st, seen, 0)) return true;
+    for (auto& d : sg.types) {
+      if (d.stamp == st) continue;
+      if (cty_names(cstrip(d.manifest), st, seen, 0)) return true;
+      for (auto& l : d.labels)
+        if (cty_names(cstrip(l.type), st, seen, 0)) return true;
+      for (auto& c : d.ctors)
+        for (auto& a : c.args)
+          if (cty_names(cstrip(a), st, seen, 0)) return true;
+    }
+    for (auto& x : sg.typexts)
+      for (auto& a : x.args)
+        if (cty_names(cstrip(a), st, seen, 0)) return true;
+    return false;
+  }
+  static bool poly_used(const cmi::Signature& sg) {
+    for (auto& d : sg.types)
+      if (d.arity > 0 && !d.manifest && d.kind == cmi::TypeDecl::Abstract &&
+          d.stamp && csig_names(sg, d.stamp))
+        return true;
+    return false;
+  }
+  // The module type an ascription NAMES, where it is another unit's.
+  const cmi::Signature* asc_csig() const {
+    if (ascpoly_off() || !asc_mty_) return nullptr;
+    std::string key;
+    return xmty_sig(asc_mty_, key);
+  }
   // ---- A `with` OVER A MODULE TYPE NAME IN A PACKAGE TYPE ----------------
   // `pack_pkg` weighs a package type by its CONSTRAINTS alone, so a package
   // whose base is a NAME was charged nothing for the signature that name
@@ -26127,9 +26195,9 @@ struct Count {
     const cmi::ModuleType* idres = mt;
     mt = scrape_cmty(mt, root);
     if (!mt) return 0;
-    if (!idres_off() && idres && idres != mt &&
-        idres->kind == cmi::ModuleType::Ident)
-      k -= 2 * flat_cmty(mt);
+    const bool named_res =
+        idres && idres != mt && idres->kind == cmi::ModuleType::Ident;
+    if (!idres_off() && named_res) k -= 2 * flat_cmty(mt);
     // A distinct argument builds its own result; the same one is cached.
     std::string ak = key;
     int unit_arg = 0;
@@ -26176,6 +26244,13 @@ struct Count {
         mt->kind == cmi::ModuleType::Sig && mt->sig && str_csig(*mt->sig) &&
         fstr.insert(key).second)
       k += 2 * flat_cmty(mt);
+    // An ASCRIPTION drops the force above, but not the rebuild the module
+    // type it names still asks for (`ascpoly_off`).
+    if (!xpathless && mt->kind == cmi::ModuleType::Sig && mt->sig &&
+        poly_used(*mt->sig))
+      if (const cmi::Signature* as = asc_csig())
+        if (poly_used(*as) && fstr.insert(key).second)
+          k += (named_res ? 1 : 2) * flat_cmty(mt);
     // A structure BEHIND an ascription is not saved, and a result the
     // ascription does not name is never read at all: `module M : sig end =
     // struct module Q = Map.Make (A) end` costs ref almost nothing.
@@ -26882,6 +26957,10 @@ struct Count {
   }
   const Signature* ascr_sig_ = nullptr;
   bool mdiscard_ = false;
+  // The module type ascribing the application being walked, `Map.S` in
+  // `module S : Map.S = Map.Make (M)` -- null everywhere else, the argument
+  // and the head of that very application included.
+  const ModuleType* asc_mty_ = nullptr;
   // `saved` is false where the signature this expression has is DISCARDED --
   // behind an ascription, as an argument, as the module an `open` names --
   // and so is never renamed by anything below.
@@ -26924,8 +27003,12 @@ struct Count {
       // What an ascribed module SAVES is the ascription, so that is what the
       // renames below it reach; the structure behind it is typed once.
       const Signature* asv = ascr_sig_;
+      const ModuleType* amv = asc_mty_;
       ascr_sig_ = mty_sig(c->mt.get());
+      asc_mty_ = std::holds_alternative<Pmod_apply>(c->me->desc) ? c->mt.get()
+                                                                : nullptr;
       mexpr(*c->me, Lvl{1, 1, 0, true}, false);
+      asc_mty_ = amv;
       ascr_sig_ = asv;
       MtCtx sv = mtctx_;
       mtctx_ = MtCtx::Ascr;
@@ -26939,6 +27022,8 @@ struct Count {
     } else if (std::holds_alternative<Pmod_apply>(m.desc) ||
                std::holds_alternative<Pmod_apply_unit>(m.desc)) {
       const ModuleExpr* h = &m;
+      const ModuleType* amv = asc_mty_;
+      asc_mty_ = nullptr;
       for (;;) {
         if (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
           mexpr(*a->arg, Lvl{1, 1, 0, true}, false);
@@ -26950,6 +27035,7 @@ struct Count {
         }
       }
       mexpr(*h, Lvl{1, 1, 0, true}, false);
+      asc_mty_ = amv;
       // A DISCARDED application is substituted all the same -- what it does
       // not get is the cascade of a signature that is saved, so its items are
       // renamed flat, once apiece.
