@@ -22499,6 +22499,9 @@ struct Count {
   // `fcomp_cache`, so the same pair is written out once.
   std::set<std::string> aarg;
   std::map<std::string, std::set<std::string>> fargp;
+  // Which DIRECT unit arguments have had their own signature read out: one
+  // entry per argument PATH, shared by every functor that takes it.
+  std::set<std::string> fargu;
   // Inside `let module M = .. in ..`, where the result is bound over the
   // body alone and is never saved.
   bool inexpr_ = false;
@@ -25848,6 +25851,10 @@ struct Count {
     static const bool off = dbg_env("NOASCRAPP") != nullptr;
     return off;
   }
+  static bool argalias_off() {
+    static const bool off = dbg_env("NOARGALIAS") != nullptr;
+    return off;
+  }
   // The flat force: one ident per item, nested ones included.  Constructors
   // and record labels are not bound idents and are not renamed here.
   static long long flat_cmty(const cmi::ModuleType* m) {
@@ -26698,6 +26705,30 @@ struct Count {
       return 0;
     }
   }
+  // The signature the argument's own path names, one ident per item of it:
+  // the unit's where the path is a bare name, the submodule's where it is
+  // dotted.  SHALLOW, unlike `flat_csig` -- a submodule of it counts ONE,
+  // `Char`'s `Ascii` and `Float`'s `Array` included, since the signature is
+  // read out and not walked into.
+  static long long shal_csig(const cmi::Signature* sg) {
+    return sg ? (long long)sg->order.size() : 0;
+  }
+  long long arg_flat(const std::vector<std::string>& ac) const {
+    if (ac.size() > 1) {
+      std::vector<std::string> c = ac;
+      const cmi::Signature* root = nullptr;
+      const cmi::ModuleType* mt = cmi_module_c(c, &root);
+      return mt && mt->kind == cmi::ModuleType::Sig ? shal_csig(mt->sig.get())
+                                                    : 0;
+    }
+    const std::string ap = head_cmi(ac[0]);
+    if (ap.empty() || !std::filesystem::exists(ap)) return 0;
+    try {
+      return shal_csig(&cmi::CmiFile::load(ap).sig());
+    } catch (...) {
+      return 0;
+    }
+  }
   // Does a sibling item READ a type of the module being bound here that the
   // ascription above discards?  Only a type with no manifest of its own
   // counts: `S.elt` is the argument's and expands away where `S.t`, which is
@@ -26775,6 +26806,9 @@ struct Count {
     // `Set.Make (Wf)` over a unit of this project is not, and so is any
     // `module A = <path>` of this file.
     int xalias = 0;
+    // The argument path of a DIRECT unit, whose signature is read out once
+    // more where an alias would have the result built instead.
+    std::vector<std::string> uargc;
     bool xpathless = false;
     for (const ModuleExpr* h = &m;;) {
       auto* a = std::get_if<Pmod_apply>(&h->desc);
@@ -26790,6 +26824,21 @@ struct Count {
         std::string ap = head_cmi(ac[0]);
         if (!ap.empty() && std::filesystem::exists(ap) && saved && !inexpr_)
           unit_arg = 1;
+      }
+      // ---- WHICH ARGUMENTS BUILD THE RESULT OVER AGAIN -----------------
+      // The test above is really an ALIAS test.  `Set.Make (String)` builds
+      // the result twice because `stdlib.ml` says `module String = String`,
+      // and so does any `module A = <path>` of this file; a unit named
+      // DIRECTLY, `Set.Make (Wf)`, builds it ONCE and reads its OWN
+      // signature out a second time instead -- one ident per item of the
+      // ARGUMENT, and once for the argument however many functors take it.
+      // A local structure costs neither.
+      if (!argalias_off() && !ac.empty() && saved && !inexpr_) {
+        unit_arg = arg_alias(ac);
+        if (!unit_arg && !mods.count(ac[0])) {
+          const std::string ap = head_cmi(ac[0]);
+          if (!ap.empty() && std::filesystem::exists(ap)) uargc = ac;
+        }
       }
       if (!ac.empty() && !discread_off() && mdiscard_) xalias = arg_alias(ac);
       // Two arguments with no path at all share the one entry: a second
@@ -26822,6 +26871,13 @@ struct Count {
       if (tb && fdread_.insert(key).second) nf += 2 + xalias;
     }
     k += nf * flat_cmty(mt);
+    // .. and what a DIRECT unit argument reads out instead, once for the
+    // argument's own path however many functors this file gives it to.
+    if (!discarded && !uargc.empty()) {
+      std::string uk;
+      for (auto& s : uargc) uk += s + ".";
+      if (fargu.insert(uk).second) k += arg_flat(uargc);
+    }
     k += wt_cmty(mt, l);
     // An argument with NO PATH leaves the result unstrengthened: it is
     // rebuilt by `nondep_supertype` instead, and never aliased.
