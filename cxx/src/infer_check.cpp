@@ -26110,6 +26110,62 @@ struct Count {
     long long fl = wt_mty(*c->mt, flat()) + (rnm ? res_wt(*rnm, flat()) : 0);
     return 2 * fl + (named_pty(f.param) ? 0 : 1);
   }
+  // ---- AN ASCRIPTION INSIDE A FUNCTOR BODY REBUILDS THE WHOLE BODY -------
+  // `Mtype.strengthen` is not the only thing an ascription sets going.  A
+  // module BOUND INSIDE A FUNCTOR at another unit's module type that leaves a
+  // type ABSTRACT WITH PARAMETERS one of its own items names -- `module F (X
+  // : H) = struct module S : Map.S = Map.Make (X) .. end` -- makes the
+  // enclosing functor's INFERRED result signature be written out TWICE MORE
+  // than the model charged, one ident per item of it: the parameterized type
+  // cannot be shared through the arrow, so every item the body binds is named
+  // again on each pass.  The charge is the BODY's, not the ascription's -- a
+  // second such item in the same body costs nothing more -- and it scales
+  // with the body the way `ren_mexpr` counts it, a submodule and a module
+  // type declaration by what they hold in turn.
+  //
+  // Deliberately NOT here, each measured on a private two-unit library and
+  // each wanting MORE than 2 per item, so each is left its own slice: an
+  // ascription at a module type of THIS FILE and a `with` over the name want
+  // the module type written out twice besides (2 per item of IT, on top of
+  // the body's, and 4 apiece where the two are combined); an ascription
+  // written out as a literal `sig .. end` wants 4 per item of it; `include
+  // (E : T)` and a functor that HAS a result signature each want their own
+  // amount again; so do a functor of TWO parameters and one nested in a
+  // SUBMODULE of the body rather than bound directly in it.  Costing NOTHING
+  // at all, and so excluded: a MONO ascription (`Set.S`, whose `t` takes no
+  // parameters), a GENERATIVE functor, and the same binding outside a
+  // functor, which S489's law already pays for.
+  static bool fascbody_off() {
+    static const bool off = dbg_env("NOFASCBODY") != nullptr;
+    return off;
+  }
+  // A module type NAMED out of ANOTHER unit that leaves a parameterized
+  // abstract type one of its own items names.  `poly_mty` asks this of a
+  // written-out one and answers NO to a bare name on purpose (a result name
+  // is left a path); here the name is exactly what is wanted.
+  bool xpoly_named(const ModuleType* mt) const {
+    if (!mt || !std::holds_alternative<Pmty_ident>(mt->desc)) return false;
+    std::string key;
+    const cmi::Signature* cs = xmty_sig(mt, key);
+    if (!cs) return false;
+    std::set<std::string> conc;
+    res_conc(*mt, conc);
+    return poly_usedc(*cs, conc);
+  }
+  long long fbody_asc(const Pmod_functor& f) const {
+    if (fascbody_off() || !std::holds_alternative<Functor_named>(f.param))
+      return 0;
+    auto* st = std::get_if<Pmod_structure>(&f.body->desc);
+    if (!st) return 0;
+    for (auto& it : st->items) {
+      auto* md = std::get_if<Pstr_module>(&it.desc);
+      if (!md) continue;
+      auto* c = std::get_if<Pmod_constraint>(&md->binding.expr.desc);
+      if (c && xpoly_named(c->mt.get()))
+        return 2 * ren_mexpr(*f.body, Sibs{});
+    }
+    return 0;
+  }
   // ---- A `with` OVER A MODULE TYPE NAME IN A PACKAGE TYPE ----------------
   // `pack_pkg` weighs a package type by its CONSTRAINTS alone, so a package
   // whose base is a NAME was charged nothing for the signature that name
@@ -27247,6 +27303,7 @@ struct Count {
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
       // `aliasable:false`), so its body starts the cascade over.
       if (!locpoly_off()) n += fdecl_poly(m, *f);
+      n += fbody_asc(*f);
       fparam(f->param, l);
       auto fk = fmark();
       fbind(f->param);

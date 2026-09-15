@@ -1,0 +1,5 @@
+module F (X : Map.OrderedType) = struct
+  module S : Map.S = Map.Make (X)
+  let z = 0
+  type u = int
+end
