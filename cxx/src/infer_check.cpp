@@ -23893,12 +23893,12 @@ struct Count {
     for (auto& d : ds) {
       n += per;
       if (fixed_row(d)) n += per;
-      if (d.manifest) ty_app(**d.manifest);
+      if (d.manifest) ty_app(**d.manifest, 0, false, 2);
       if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
         for (auto& c : v->ctors) { ++n; ctor_args(c.args); }
       } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
         n += (long long)r->fields.size();
-        for (auto& f : r->fields) ty_app(*f.type);
+        for (auto& f : r->fields) ty_app(*f.type, 0, false, 1);
       }
     }
   }
@@ -26397,10 +26397,93 @@ struct Count {
     static const bool off = dbg_env("NOXTAPP2") != nullptr;
     return off;
   }
-  std::set<std::string> xtapp_;  // the applied paths already built
-  long long xtapp_charge(const Longident& id) {
+  // ---- AND THE ALIAS IT IS SPELLED THROUGH IS ANOTHER APPLICATION -------
+  // `Set` is not the unit.  It is a component of `Stdlib` bound to the unit
+  // `Stdlib__Set`, which `Stdlib__Set.Make (X)` names outright, so the typer
+  // NORMALISES `Set.Make (X)` to it -- and the normalised `Papply` is a
+  // different key from the written one, so the work is done a SECOND time.
+  // Measured against a functor of a unit of its own (a result of 2, 4 and 10
+  // items, reached directly and through a `module M = Ua` alias of another
+  // unit) and against `Set.Make`, `Map.Make`, `Hashtbl.Make`,
+  // `Hashtbl.MakeSeeded` and `Weak.Make` written both ways, each with a unit,
+  // a local module and an enclosing functor's parameter for an argument, one
+  // application and two, in a `val` and in a manifest and in both at once,
+  // what a file owes for a functor it does NOT also bind is
+  //     R                once for the functor PATH
+  //   + R                for every DISTINCT applied path
+  //   + R                once more for the path, the functor being an ALIAS
+  //   + R                once more again, some use of it INSTANTIATING
+  //   + R                for every distinct applied path so used
+  //   + R                for such a path whose ARGUMENT is an alias too
+  // -- which S486's flat 2R per applied path happens to equal for a single
+  // instantiating use of an unaliased functor and nowhere else.  A second
+  // application of the same functor is worth R, not 2R, so the two
+  // per-functor terms are what the alias is really worth: `type t =
+  // Set.Make(X).t  type u = Set.Make(Y).t` costs exactly what one of them
+  // does.  `Stdlib.Set.Make` and `MoreLabels.Set.Make` are the same alias.
+  //   A use INSTANTIATES when the named type is ABSTRACT in the result --
+  // `Map.Make (String).key` is `Ord.t` and pays nothing extra in any
+  // position -- and either the path is GIVEN TYPE ARGUMENTS (`int Map.Make
+  // (String).t` pays in a `val` as well) or it stands in a type declaration's
+  // MANIFEST (through an arrow, a tuple and a type constructor's arguments,
+  // but not into an object type or a polymorphic-variant row) or IS a record
+  // field's own type (`{ fld : P.t }` pays, `{ fld : P.t list }` does not).
+  // A constructor argument, an inline record's field, an exception argument,
+  // a `let` parameter annotation and a plain `val` do not.
+  //   WHAT IS LEFT, measured: the alias also FORCES the unit once -- 4 for
+  // Set and Map, 41 for Hashtbl, 12 for Weak, exactly `load_cost` -- but
+  // that force is SHARED with every other force of the unit and is NOT due
+  // where the file already has one, which an enclosing `F (X :
+  // Set.OrderedType)` always does; charging it unshared would turn that
+  // shape, the one `t20ok`/`t21ok` write, from EXACT into an over-count, so
+  // it is left out and the residual is a flat -2 (Set), -3 (Hashtbl) or -47
+  // (Weak) that the UNALIASED spelling carries too.  An alias of a unit of
+  // one's OWN (`module M = Ua` in another unit) is not charged at all:
+  // `cmi_module` cannot follow an `Mty_alias` through `submodule`.
+  static bool xtapp3_off() {
+    static const bool off = dbg_env("NOXTAPP3") != nullptr;
+    return off;
+  }
+  // A path head that stands for its unit through an alias rather than naming
+  // it: `Set` and `Stdlib.Set` are `Stdlib`'s components, `Stdlib__Set` is
+  // the unit.
+  bool std_alias(const Longident& id) const {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.empty() || mods.count(c[0])) return false;
+    const std::string& h = c[0];
+    if (h == "Stdlib") return true;
+    if (h.rfind("Stdlib__", 0) == 0) return false;
+    const std::string p = head_cmi(h);
+    // `head_cmi` falls back to the stdlib SPELLING for a head that is no unit
+    // at all -- an enclosing functor's parameter, say -- so the file has to
+    // be there.
+    return !p.empty() && std::filesystem::exists(p) &&
+           std::filesystem::path(p).filename().string() ==
+               "stdlib__" + h + ".cmi";
+  }
+  // Is the type a path names on an applied functor ABSTRACT in its result?
+  static bool res_abstract(const cmi::ModuleType* res, const std::string& n) {
+    if (n.empty() || !res || res->kind != cmi::ModuleType::Sig || !res->sig)
+      return false;
+    for (auto& t : res->sig->types)
+      if (t.name == n) return !t.manifest;
+    return false;
+  }
+  std::set<std::string> xtapp_;   // the applied paths already built
+  std::set<std::string> xtfct_;   // the functor paths already applied
+  std::set<std::string> xtali_;   // ... whose alias has been done
+  std::set<std::string> xtali2_;  // ... and done in an instantiating position
+  std::set<std::string> xtiapp_;  // applied paths built in one
+  std::set<std::string> xtiarg_;  // ... whose ARGUMENT is an alias as well
+  long long xtapp_charge(const Longident& id, bool inst = false) {
     if (xtapp_off()) return 0;
-    if (auto* d = std::get_if<Ldot>(&id.v)) return xtapp_charge(*d->prefix);
+    if (auto* d = std::get_if<Ldot>(&id.v))
+      return xtapp_at(*d->prefix, d->name, inst);
+    return xtapp_at(id, std::string(), inst);
+  }
+  long long xtapp_at(const Longident& id, const std::string& ty, bool inst) {
+    if (auto* d = std::get_if<Ldot>(&id.v))
+      return xtapp_at(*d->prefix, std::string(), false);
     auto* a = std::get_if<Lapply>(&id.v);
     if (!a) return 0;
     const cmi::Signature* root = nullptr;
@@ -26408,8 +26491,37 @@ struct Count {
     if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
     const cmi::ModuleType* res = scrape_cmty(mt->functor_body.get(), root);
     if (!res) return 0;
-    if (!xtapp_.insert(lid_full(id)).second) return 0;
-    return flat_cmty(res) * (xtapp2_off() ? 1 : 2);
+    const long long r = flat_cmty(res);
+    const std::string key = lid_full(id);
+    const std::string fk = xtapp_key(*a->f);
+    // A file that BINDS an application of the functor as a module has had
+    // `Env` do this work already, and what a type path of it then costs is
+    // S486's flat 2R whatever the spelling (`module S = Set.Make (X)` beside
+    // `type t = Set.Make (X).t` is EXACT, and so is the same pair written
+    // `Stdlib__Set`).  Only an UNBOUND functor takes the law below.
+    if (xtapp3_off() || fk.empty() || (xk_ && xk_->count(fk)))
+      return xtapp_.insert(key).second ? r * (xtapp2_off() ? 1 : 2) : 0;
+    const std::string f = lid_full(*a->f);
+    const bool ali = std_alias(*a->f);
+    const bool ins = inst && res_abstract(res, ty);
+    long long k = 0;
+    if (xtfct_.insert(f).second) k += r;
+    if (ali && xtali_.insert(f).second) k += r;
+    if (ali && ins && xtali2_.insert(f).second) k += r;
+    if (xtapp_.insert(key).second) k += r;
+    if (ali && ins && xtiapp_.insert(key).second) k += r;
+    if (ali && ins && std_alias(*a->x) && xtiarg_.insert(key).second) k += r;
+    return k;
+  }
+  // `papp_charge`'s spelling-insensitive functor key ("Set.Make.").
+  static std::string xtapp_key(const Longident& id) {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.size() < 2) return {};
+    if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
+    if (c[0].rfind("Stdlib__", 0) == 0) c[0] = c[0].substr(8);
+    std::string k;
+    for (auto& t : c) k += t + ".";
+    return k;
   }
   long long lapp_path(const Longident& id) {
     if (auto* d = std::get_if<Ldot>(&id.v)) return lapp_path(*d->prefix);
@@ -26418,25 +26530,33 @@ struct Count {
   // Every functor application a written type names.
   // `xonly` takes the cross-unit charge alone: the local alias law was
   // measured in declaration positions and costs half as much in a `let`.
-  void ty_app(const CoreType& t, int d = 0, bool xonly = false) {
+  // `inst` is the INSTANTIATING position of `xtapp3_off` above: 2 for a type
+  // declaration's manifest, which carries down an arrow, a tuple and a type
+  // constructor's arguments but not into an object type or a
+  // polymorphic-variant row, and 1 for a record field's own type, which does
+  // not carry down at all.
+  void ty_app(const CoreType& t, int d = 0, bool xonly = false, int inst = 0) {
     if (d > 24) return;
+    const int sub = inst == 2 ? 2 : 0;
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
-      n += (xonly ? 0 : lapp_path(c->id.txt)) + xtapp_charge(c->id.txt);
-      for (auto& a : c->args) ty_app(*a, d + 1, xonly);
+      n += (xonly ? 0 : lapp_path(c->id.txt)) +
+           xtapp_charge(c->id.txt, inst != 0 || !c->args.empty());
+      for (auto& a : c->args) ty_app(*a, d + 1, xonly, sub);
     } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
-      n += (xonly ? 0 : lapp_path(c->id.txt)) + xtapp_charge(c->id.txt);
-      for (auto& a : c->args) ty_app(*a, d + 1, xonly);
+      n += (xonly ? 0 : lapp_path(c->id.txt)) +
+           xtapp_charge(c->id.txt, inst != 0 || !c->args.empty());
+      for (auto& a : c->args) ty_app(*a, d + 1, xonly, sub);
     } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
-      ty_app(*a->dom, d + 1, xonly);
-      ty_app(*a->cod, d + 1, xonly);
+      ty_app(*a->dom, d + 1, xonly, sub);
+      ty_app(*a->cod, d + 1, xonly, sub);
     } else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc)) {
-      for (auto& e : u->elems) ty_app(*e, d + 1, xonly);
+      for (auto& e : u->elems) ty_app(*e, d + 1, xonly, sub);
     } else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) {
-      ty_app(*p->type, d + 1, xonly);
+      ty_app(*p->type, d + 1, xonly, sub);
     } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
-      ty_app(*al->type, d + 1, xonly);
+      ty_app(*al->type, d + 1, xonly, sub);
     } else if (auto* op = std::get_if<Ptyp_open>(&t.desc)) {
-      ty_app(*op->type, d + 1, xonly);
+      ty_app(*op->type, d + 1, xonly, sub);
     } else if (auto* v = std::get_if<Ptyp_variant>(&t.desc)) {
       for (auto& r : v->rows) {
         if (auto* g = std::get_if<Rtag>(&r))
