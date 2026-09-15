@@ -25561,6 +25561,10 @@ struct Count {
     static const bool off = dbg_env("NOXMODAPP") != nullptr;
     return off;
   }
+  static bool ascrapp_off() {
+    static const bool off = dbg_env("NOASCRAPP") != nullptr;
+    return off;
+  }
   // The flat force: one ident per item, nested ones included.  Constructors
   // and record labels are not bound idents and are not renamed here.
   static long long flat_cmty(const cmi::ModuleType* m) {
@@ -26078,12 +26082,15 @@ struct Count {
     bool newarg = farg.insert(ak).second;
     long long nf = (firstapp || (newpath && had >= 1)) ? 1 : 0;
     if (unit_arg && newarg) ++nf;
+    const bool discarded = !ascrapp_off() && mdiscard_ && !inexpr_;
+    if (discarded) nf = 0;
     k += nf * flat_cmty(mt);
     k += wt_cmty(mt, l);
     // An argument with NO PATH leaves the result unstrengthened: it is
     // rebuilt by `nondep_supertype` instead, and never aliased.
-    if (saved && !inexpr_ && !xpathless && mt->kind == cmi::ModuleType::Sig &&
-        mt->sig && str_csig(*mt->sig) && fstr.insert(key).second)
+    if (saved && !discarded && !inexpr_ && !xpathless &&
+        mt->kind == cmi::ModuleType::Sig && mt->sig && str_csig(*mt->sig) &&
+        fstr.insert(key).second)
       k += 2 * flat_cmty(mt);
     // A structure BEHIND an ascription is not saved, and a result the
     // ascription does not name is never read at all: `module M : sig end =
@@ -26612,6 +26619,40 @@ struct Count {
     }
     return k;
   }
+  // ---- AN ASCRIPTION THAT HIDES A MODULE HIDES WHAT IT WAS APPLIED FROM --
+  // An ascription discards the signature the structure behind it has, and a
+  // module the ascription does not DECLARE is never read again: `Includemod`
+  // has nothing to match it against, so the lazy substitution a cross-unit
+  // functor application left behind is never forced.  `module M : sig end =
+  // struct module S = Set.Make (String) end` charges ocamlc 47 for the
+  // application where the same structure SAVED is charged 284 -- it is
+  // renamed flat where it stands and neither BUILT nor strengthened.  The
+  // test has to be the NAME, not the ascription: `module rec Mod : sig
+  // module XSet : sig .. end .. end = struct module XSet = Set.Make (X) ..`
+  // (typing-recmod/t20ok) declares XSet and pays for it in full.
+  //
+  // `ascr_sig_` is the signature of the ascription this structure stands
+  // directly behind, where it can be read at all; `mdiscard_` says that this
+  // module -- and everything under it -- is one nothing above declares.
+  static bool sig_binds_mod(const Signature& sg, const std::string& nm) {
+    for (auto& it : sg) {
+      if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (m->md.name.txt && *m->md.name.txt == nm) return true;
+      } else if (auto* r = std::get_if<Psig_recmodule>(&it.desc)) {
+        for (auto& d : r->decls)
+          if (d.name.txt && *d.name.txt == nm) return true;
+      } else if (auto* b = std::get_if<Psig_modsubst>(&it.desc)) {
+        if (b->name.txt && *b->name.txt == nm) return true;
+      } else if (std::holds_alternative<Psig_include>(it.desc) ||
+                 std::holds_alternative<Psig_open>(it.desc) ||
+                 std::holds_alternative<Psig_extension>(it.desc)) {
+        return true;  // what it brings in cannot be read here
+      }
+    }
+    return false;
+  }
+  const Signature* ascr_sig_ = nullptr;
+  bool mdiscard_ = false;
   // `saved` is false where the signature this expression has is DISCARDED --
   // behind an ascription, as an argument, as the module an `open` names --
   // and so is never renamed by anything below.
@@ -26653,7 +26694,10 @@ struct Count {
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
       // What an ascribed module SAVES is the ascription, so that is what the
       // renames below it reach; the structure behind it is typed once.
+      const Signature* asv = ascr_sig_;
+      ascr_sig_ = mty_sig(c->mt.get());
       mexpr(*c->me, Lvl{1, 1, 0, true}, false);
+      ascr_sig_ = asv;
       MtCtx sv = mtctx_;
       mtctx_ = MtCtx::Ascr;
       mty(*c->mt, depth_off() ? Lvl{1, 1, 0, true} : l, true);
@@ -27039,7 +27083,15 @@ struct Count {
       if (!ascp_off() && !inexpr_) n += ascp_charge(m->binding.expr);
       if (!anonfun_off() && saved_ && !inexpr_)
         n += anon_mexpr(m->binding.expr);
+      const Signature* asv = ascr_sig_;
+      const bool dsv = mdiscard_;
+      if (!mdiscard_ && ascr_sig_ && m->binding.name.txt &&
+          !sig_binds_mod(*ascr_sig_, *m->binding.name.txt))
+        mdiscard_ = true;
+      ascr_sig_ = nullptr;
       mexpr(m->binding.expr, ml);
+      ascr_sig_ = asv;
+      mdiscard_ = dsv;
       if (m->binding.name.txt) ++n;
       mbind(m->binding);
       n += lal_bind(m->binding);
