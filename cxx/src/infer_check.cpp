@@ -23326,9 +23326,17 @@ struct Count {
   // `out`, when given, collects the names bound -- the caller puts them in
   // scope for the body, and `bindings` asks whether each was bound BEFORE.
   void pat(const Pattern& p, std::vector<std::string>* out = nullptr) {
+    struct Depth {
+      int& d;
+      explicit Depth(int& x) : d(x) { ++d; }
+      ~Depth() { --d; }
+    } depth{patd_};
+    if (patd_ == 1 && !exist_off() && !exhmat_off() && !cexty_off())
+      n += cx_row(p);
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
       ++n;
       if (out) out->push_back(v->name.txt);
+      vann_[v->name.txt] = nullptr;
       return;
     }
     if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
@@ -23348,6 +23356,8 @@ struct Count {
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
       pat(*c->p, out);
       ann_app(*c->t);
+      if (auto* v = std::get_if<Ppat_var>(&strip(*c->p).desc))
+        vann_[v->name.txt] = c->t.get();  // the scrutinee's type (S507)
       if (auto* v = std::get_if<Ppat_var>(&c->p->desc))
         if (const Ptyp_package* pk = pk_of_ty(*c->t)) pkpend_[v->name.txt] = Pk{1, pk, {}};
       // `((module M) : (module E))`: M's constructors are E's (S506).
@@ -23366,7 +23376,9 @@ struct Count {
       // `type_pat`'s `Ppat_construct` arm runs `Ctype.instance_constructor
       // Make_existentials_abstract`, which `Env.enter_type`s one abstract
       // type per existential the constructor opens.
-      n += ctor_exist(c->id.txt) + ctor_reify(c->id.txt);
+      n += ctor_exist(c->id.txt);
+      if (exhmat_off() || cexty_off())  // else `cx_row` reads the row (S507)
+        n += ctor_reify(c->id.txt);
       if (c->arg) pat(**c->arg, out);
       return;
     }
@@ -23409,14 +23421,18 @@ struct Count {
       return;
     }
   }
-  void cse(const Case& c) {
+  void cse(const Case& c, const Expression* scrut = nullptr) {
     auto m = mark();
     std::vector<std::string> nm;
+    cx_scrut_ = scrut;
     pat(c.lhs, &nm);
+    cx_scrut_ = nullptr;
+    cxenv_.push_back(cxlast_);
     for (auto& s : nm) bind(s);
     pkpend_.clear();
     if (c.guard) expr(**c.guard);
     expr(*c.rhs);
+    cxenv_.pop_back();
     release(m);
   }
   // A `match`/`try` with an `effect` row is typed by `type_effect_cases`
@@ -23491,8 +23507,19 @@ struct Count {
     static const bool off = dbg_env("NOROWEX") != nullptr;
     return off;
   }
-  static void ty_vars(const CoreType& t, std::set<std::string>& v, int& anon,
-                      bool aliased = false) {
+  // `_ t` at a type of arity k > 1 is `(_, .., _) t` (typetexp.ml:540): k
+  // anonymous variables, k existentials or reifications (S507).  Declared
+  // in this file, or read off the unit that declares it.
+  int any_arity(const Ptyp_constr& x) {
+    if (cexty_off() || x.args.size() != 1 ||
+        !std::holds_alternative<Ptyp_any>(x.args[0]->desc))
+      return 1;
+    auto it = tdecls_.find(lid_last(x.id.txt));
+    if (it == tdecls_.end()) return 1;
+    return std::max<int>(1, (int)it->second->params.size());
+  }
+  void ty_vars(const CoreType& t, std::set<std::string>& v, int& anon,
+               bool aliased = false) {
     if (std::holds_alternative<Ptyp_any>(t.desc)) { ++anon; return; }
     if (auto* x = std::get_if<Ptyp_var>(&t.desc)) { v.insert(x->name); return; }
     if (auto* x = std::get_if<Ptyp_arrow>(&t.desc)) {
@@ -23503,6 +23530,7 @@ struct Count {
       return;
     }
     if (auto* x = std::get_if<Ptyp_constr>(&t.desc)) {
+      anon += any_arity(*x) - 1;
       for (auto& a : x->args) ty_vars(*a, v, anon);
       return;
     }
@@ -23549,8 +23577,8 @@ struct Count {
       return;
     }
   }
-  static int exist_of(const ConstructorArguments& a,
-                      const std::optional<CoreTypeBox>& res) {
+  int exist_of(const ConstructorArguments& a,
+               const std::optional<CoreTypeBox>& res) {
     if (!res) return 0;
     std::set<std::string> av, rv;
     int an = 0, rn = 0;
@@ -23620,8 +23648,8 @@ struct Count {
       alias_names(*x->type, out); return;
     }
   }
-  static void reify_ty(const CoreType& t, std::set<std::string>& bound,
-                       std::set<std::string>& seen, int& k) {
+  void reify_ty(const CoreType& t, std::set<std::string>& bound,
+                std::set<std::string>& seen, int& k) {
     if (std::holds_alternative<Ptyp_any>(t.desc)) { ++k; return; }
     if (auto* x = std::get_if<Ptyp_var>(&t.desc)) {
       if (!bound.count(x->name) && seen.insert(x->name).second) ++k;
@@ -23636,6 +23664,7 @@ struct Count {
       return;
     }
     if (auto* x = std::get_if<Ptyp_constr>(&t.desc)) {
+      k += any_arity(*x) - 1;
       for (auto& a : x->args) reify_ty(*a, bound, seen, k);
       return;
     }
@@ -23673,8 +23702,8 @@ struct Count {
       return;
     }
   }
-  static int reify_of(const ConstructorArguments& args,
-                      const std::optional<CoreTypeBox>& res) {
+  int reify_of(const ConstructorArguments& args,
+               const std::optional<CoreTypeBox>& res) {
     if (!res) return 0;
     auto* c = std::get_if<Ptyp_constr>(&(*res)->desc);
     if (!c) return 0;
@@ -23776,10 +23805,23 @@ struct Count {
     int rf = 0;
     bool ext = false;
     const ConstructorArguments* args = nullptr;  // as declared, this file's
+    const CoreType* res = nullptr;               // its GADT result (S507)
+    const TypeDeclaration* decl = nullptr;       // the variant it is of
+    std::string tag;                             // `K<i>`/`B<i>` (S507)
   };
   std::unordered_map<std::string, Cd> exi;
   std::vector<std::pair<std::string, std::optional<Cd>>> eadded;
-  struct Ct { std::string name; int ex = 0; int rf = 0; bool nullary = true; };
+  struct Ct {
+    std::string name;
+    int ex = 0;
+    int rf = 0;
+    bool nullary = true;
+    const ConstructorArguments* args = nullptr;  // (S507) as Cd's
+    const CoreType* res = nullptr;
+    const TypeDeclaration* decl = nullptr;
+    int ty = -1;
+    std::string tag;
+  };
   std::vector<std::vector<Ct>> ctys;
   std::map<std::string, std::unordered_map<std::string, Cd>> uexi;
   std::size_t emark() const { return eadded.size(); }
@@ -24618,23 +24660,30 @@ struct Count {
     if (it != lctys_.end()) return it->second;
     int id = (int)ctys.size();
     ctys.emplace_back();
+    if (!tyids_.count(d.name.txt)) tyids_[d.name.txt] = id;
+    if (!tdecls_.count(d.name.txt)) tdecls_[d.name.txt] = &d;
+    int nk = 0, nb = 0;
     for (auto& c : v.ctors) {
       bool nullary = true;
       if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) nullary = t->elems.empty();
       else nullary = false;
+      std::string tag =
+          nullary ? "K" + std::to_string(nk++) : "B" + std::to_string(nb++);
       ctys[id].push_back(
-          Ct{c.name.txt, exist_of(c.args, c.res), reify_of(c.args, c.res), nullary});
+          Ct{c.name.txt, exist_of(c.args, c.res), reify_of(c.args, c.res),
+             nullary, &c.args, c.res ? c.res->get() : nullptr, &d, id, tag});
     }
     lctys_[&d] = id;
     return id;
   }
-  static Cd ext_cd(const ExtensionConstructor& c) {
+  Cd ext_cd(const ExtensionConstructor& c) {
     Cd k;
     k.ext = true;
     if (auto* d = std::get_if<Pext_decl>(&c.kind)) {
       k.ex = exist_of(d->args, d->res);
       k.rf = reify_of(d->args, d->res);
       k.args = &d->args;
+      k.res = d->res ? d->res->get() : nullptr;
     }
     return k;
   }
@@ -24651,6 +24700,9 @@ struct Count {
           k.rf = reify_of(c.args, c.res);
           k.ty = local_cty(d, *v);
           k.args = &c.args;
+          k.res = c.res ? c.res->get() : nullptr;
+          k.decl = &d;
+          for (auto& x : ctys[k.ty]) if (x.name == nm) k.tag = x.tag;
           out = k;
           hit = true;
         }
@@ -24759,6 +24811,7 @@ struct Count {
   }
   void reg_ctors(const std::vector<TypeDeclaration>& ds) {
     if (exist_off()) return;
+    for (auto& d : ds) tdecls_[d.name.txt] = &d;
     for (auto& d : ds) {
       if (auto* r = std::get_if<Ptype_record>(&d.kind))
         for (auto& f : r->fields)
@@ -24767,16 +24820,23 @@ struct Count {
       if (!v) continue;
       int id = (int)ctys.size();
       ctys.emplace_back();
+      tyids_[d.name.txt] = id;
+      int nk = 0, nb = 0;
       for (auto& c : v->ctors) {
         Cd k;
         k.ex = exist_of(c.args, c.res);
         k.rf = reify_of(c.args, c.res);
         k.ty = id;
         k.args = &c.args;
+        k.res = c.res ? c.res->get() : nullptr;
+        k.decl = &d;
         bool nullary = true;
         if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) nullary = t->elems.empty();
         else nullary = false;
-        ctys[id].push_back(Ct{c.name.txt, k.ex, k.rf, nullary});
+        k.tag = nullary ? "K" + std::to_string(nk++)
+                        : "B" + std::to_string(nb++);
+        ctys[id].push_back(Ct{c.name.txt, k.ex, k.rf, nullary, k.args, k.res,
+                              k.decl, id, k.tag});
         ebind(c.name.txt, k);
       }
     }
@@ -24789,11 +24849,25 @@ struct Count {
       k.rf = reify_of(d->args, d->res);
       k.ext = true;
       k.args = &d->args;
+      k.res = d->res ? d->res->get() : nullptr;
       ebind(c.name.txt, k);
     }
   }
   void reg_open(const ModuleExpr& m) {
     if (exist_off()) return;
+    // `open struct .. end` (S507): the structure's own constructors stay in
+    // scope, where `mexpr` released them with the structure.
+    if (!cexty_off())
+      if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+        for (auto& it : st->items) {
+          if (auto* t = std::get_if<Pstr_type>(&it.desc)) reg_ctors(t->decls);
+          else if (auto* x = std::get_if<Pstr_typext>(&it.desc))
+            for (auto& c : x->ext.ctors) reg_ext(c);
+          else if (auto* e = std::get_if<Pstr_exception>(&it.desc))
+            reg_ext(e->exn.ctor);
+        }
+        return;
+      }
     auto* i = std::get_if<Pmod_ident>(&m.desc);
     if (!i) return;
     std::string u = mod_unit(i->id.txt);
@@ -24815,40 +24889,64 @@ struct Count {
     if (std::holds_alternative<Ppat_exception>(p.desc)) return 1;
     return 0;
   }
-  static bool covers(const Pattern& q0, const Pattern& p0) {
+  // `bytag`: parmatch compares constructors by TAG (`Data_types.
+  // equal_constr`), so `A` of one variant and `X` of another, both the
+  // first constant, are one head (S507).
+  bool covers(const Pattern& q0, const Pattern& p0, bool bytag = false) {
     const Pattern& q = strip(q0);
     const Pattern& p = strip(p0);
-    if (auto* a = std::get_if<Ppat_alias>(&q.desc)) return covers(*a->p, p);
-    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return covers(q, *a->p);
+    if (auto* a = std::get_if<Ppat_alias>(&q.desc))
+      return covers(*a->p, p, bytag);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc))
+      return covers(q, *a->p, bytag);
     if (std::holds_alternative<Ppat_any>(q.desc) ||
         std::holds_alternative<Ppat_var>(q.desc))
       return true;
     if (auto* o = std::get_if<Ppat_or>(&q.desc))
-      return covers(*o->l, p) || covers(*o->r, p);
+      return covers(*o->l, p, bytag) || covers(*o->r, p, bytag);
     if (auto* o = std::get_if<Ppat_or>(&p.desc))
-      return covers(q, *o->l) && covers(q, *o->r);
+      return covers(q, *o->l, bytag) && covers(q, *o->r, bytag);
     if (auto* qc = std::get_if<Ppat_construct>(&q.desc)) {
       auto* pc = std::get_if<Ppat_construct>(&p.desc);
-      if (!pc || lid_last(qc->id.txt) != lid_last(pc->id.txt)) return false;
+      if (!pc) return false;
+      if (bytag ? ctor_tag(qc->id.txt) != ctor_tag(pc->id.txt)
+                : lid_last(qc->id.txt) != lid_last(pc->id.txt))
+        return false;
       if (!qc->arg) return !pc->arg;
-      return pc->arg && covers(**qc->arg, **pc->arg);
+      return pc->arg && covers(**qc->arg, **pc->arg, bytag);
     }
     if (auto* qt = std::get_if<Ppat_tuple>(&q.desc)) {
       auto* pt = std::get_if<Ppat_tuple>(&p.desc);
       if (!pt || pt->elems.size() != qt->elems.size()) return false;
       for (std::size_t i = 0; i < qt->elems.size(); ++i)
-        if (!covers(*qt->elems[i], *pt->elems[i])) return false;
+        if (!covers(*qt->elems[i], *pt->elems[i], bytag)) return false;
       return true;
     }
     if (auto* qe = std::get_if<Ppat_exception>(&q.desc)) {
       auto* pe = std::get_if<Ppat_exception>(&p.desc);
-      return pe && covers(*qe->p, *pe->p);
+      return pe && covers(*qe->p, *pe->p, bytag);
     }
     if (auto* qf = std::get_if<Ppat_effect>(&q.desc)) {
       auto* pf = std::get_if<Ppat_effect>(&p.desc);
-      return pf && covers(*qf->eff, *pf->eff);
+      return pf && covers(*qf->eff, *pf->eff, bytag);
     }
     return false;
+  }
+  // A constructor's tag: its index among the constant or the block
+  // constructors of a variant declared here, an extension constructor's
+  // name, a predefined one's place; a unit's, unread, is its name.
+  std::string ctor_tag(const Longident& id) {
+    std::string nm = lid_last(id);
+    auto cd = ctor_cd(id);
+    if (cd && cd->ext) return "E" + nm;
+    if (cd && cd->ty >= 0 && !cd->tag.empty()) return cd->tag;
+    if (!cd) {
+      if (nm == "None" || nm == "[]" || nm == "false" || nm == "()")
+        return "K0";
+      if (nm == "Some" || nm == "::") return "B0";
+      if (nm == "true") return "K1";
+    }
+    return "N" + nm;
   }
   // What the checker's pattern costs: `Backtrack_or` splitting
   // (typecore.ml:3008) types the alternatives until ONE of them stands, so an
@@ -25127,13 +25225,14 @@ struct Count {
   }
   // `get_mins le_pats`: two passes, each dropping a row that a LATER row
   // covers, the first reversing the list.
-  static std::vector<const Pattern*> mins(const std::vector<const Pattern*>& ps) {
-    auto select = [](const std::vector<const Pattern*>& in) {
+  std::vector<const Pattern*> mins(const std::vector<const Pattern*>& ps,
+                                   bool bytag = false) {
+    auto select = [&](const std::vector<const Pattern*>& in) {
       std::vector<const Pattern*> r;
       for (std::size_t i = 0; i < in.size(); ++i) {
         bool drop = false;
         for (std::size_t j = i + 1; j < in.size() && !drop; ++j)
-          if (covers(*in[j], *in[i])) drop = true;
+          if (covers(*in[j], *in[i], bytag)) drop = true;
         if (!drop) r.insert(r.begin(), in[i]);
       }
       return r;
@@ -25291,22 +25390,1276 @@ struct Count {
     }
     return acc;
   }
+  // ---- THE COUNTEREXAMPLE IS TYPED (S507) --------------------------------
+  // What a witness costs is not read off its constructors.  `partial_pred`
+  // (typecore.ml:2964) RE-TYPES every witness `exhaust` yields, in order,
+  // until one types -- and a witness the newtype equations refuse costs
+  // its reifications before it is refused: matching `R1 : 'a c1 repr` at
+  // `a repr` names `$` and adds `a = $ c1`, a second `R1` in the same
+  // witness meets `$ c1` and binds `'b` to `$` (nothing named), an `R2 :
+  // 'b c2 repr` there meets `c1` against `c2`, names `'b` (ctype.ml:3511
+  // reifies both sides before `mcomp` refuses them) and fails the witness
+  // -- and the search goes on to the next one.  Plain (non-generalized)
+  // constructors, constants, tuples and rows unify plainly: no equation,
+  // no reification.  Where a match has ONE row (a parameter, a `let`, a
+  // single-case match) the witness is typed with `explosion_fuel` 5: a
+  // wildcard at a variant whose constructors are ALL generalized (or at
+  // most one), a tuple or a record is REPLACED by every constructor
+  // (parmatch.ml:842) and the alternatives tried in turn.  The unused
+  // check (`check_unused`, parmatch.ml:2015) hands the pred the OR of
+  // every satisfying vector `list_satisfying_vectors` finds (the missing
+  // constructor's vector FIRST, then each present constructor's), typed
+  // `Backtrack_or` with fuel 5: alternatives -- and the exploded
+  // wildcards -- are tried until one stands, every failed try costing its
+  // reifications.  `Refine_or` (the partial check) types both alternatives
+  // of an or-pattern on copies of the equations, a type error in either
+  // refusing the witness, and only where every alternative is a
+  // generalized constructor (`Need_backtrack`) splits it and backtracks.
+  // The columns' types are the scrutinee's: an identifier's annotation
+  // (`(r1 : a repr)`), where `a` is a newtype in scope; a column that has
+  // none is typed at a variable, and a generalized constructor there
+  // meets newtypes at its index positions (what S504 charged).  A
+  // sub-matrix's rows are the constructor rows in source order followed
+  // by the wildcard rows (parmatch.ml:647), which is what decides the
+  // first witness: `hd`'s `R1, _, C | _, R2, Y` yields `(R1, R2, (X|Z))`
+  // -- refused, 2 -- then `(R1, R1, (A|B))`, 1.  `NOCEXTY=1` reverts to
+  // S506's reading.
+  static bool cexty_off() {
+    static const bool off = dbg_env("NOCEXTY") != nullptr;
+    return off;
+  }
+  // A symbolic type: a variable, an abstract type (a newtype or a reified
+  // `$`), or a constructor by its last name; `soft` ones (objects, rows,
+  // packages, univars) are never refused.
+  struct Sty {
+    enum K { Var, Nt, Con } k = Var;
+    std::string name;
+    std::vector<int> args;
+    int link = -1;
+    bool soft = false;
+    bool tc = false;  // a `Tconstr` (not a tuple, an arrow, a row)
+  };
+  struct Tst {
+    std::vector<Sty> a;
+    std::map<std::string, int> nts;
+    int mk(Sty::K k, std::string nm = {}, std::vector<int> args = {},
+           bool soft = false) {
+      Sty s;
+      s.k = k; s.name = std::move(nm); s.args = std::move(args); s.soft = soft;
+      s.tc = k == Sty::Con && !soft && s.name != "*" && s.name != "->";
+      a.push_back(std::move(s));
+      return (int)a.size() - 1;
+    }
+    int find(int i) {
+      while (a[i].link >= 0) i = a[i].link;
+      return i;
+    }
+    int nt(const std::string& nm) {
+      auto it = nts.find(nm);
+      if (it != nts.end()) return it->second;
+      int i = mk(Sty::Nt, nm);
+      nts[nm] = i;
+      return i;
+    }
+  };
+  long long cxk_ = 0;   // idents the counterexamples' typing named
+  bool cxbt_ = false;   // `Backtrack_or` (the unused check) or `Refine_or`
+  bool cxreal_ = false; // a ROW's own typing: both alternatives, no backtrack
+  bool cxlax_ = false;  // no newtype in scope: nothing is refused (as before)
+  int cxfuel_ = 0;      // the search's own fuel; exhausted, it stops as found
+  int patd_ = 0;        // `pat`'s depth: a row is typed at its top
+  const Expression* cx_scrut_ = nullptr;  // the scrutinee the rows are at
+  // The equations a row's constructors added hold in its BRANCH: a match
+  // nested in the arm of `H` (`a = $ list`) types its own `H` against that
+  // and names nothing.  The state a row's typing leaves, kept for its arm.
+  std::vector<Tst> cxenv_;
+  Tst cxlast_;
+  Tst cx_base() const { return cxenv_.empty() ? Tst{} : cxenv_.back(); }
+  const CoreType* fnann_ = nullptr;  // `let f : type a. t = fun x y -> ..`
+  std::vector<std::string> las_;  // the newtypes in scope, by name
+  std::unordered_map<std::string, const CoreType*> vann_;  // `(x : t)`
+  std::unordered_map<std::string, int> tyids_;  // a variant's `ctys` index
+  std::unordered_map<std::string, const TypeDeclaration*> tdecls_;
+  // `Ctype.reify`: every variable still free becomes a fresh abstract type.
+  void reify(Tst& st, int i, std::set<int>& seen) {
+    i = st.find(i);
+    if (!seen.insert(i).second) return;
+    if (st.a[i].k == Sty::Var) {
+      int f = st.mk(Sty::Nt, "$");
+      st.a[i].link = f;
+      ++cxk_;
+      return;
+    }
+    if (st.a[i].k == Sty::Con) {
+      std::vector<int> as = st.a[i].args;
+      for (int x : as) reify(st, x, seen);
+    }
+  }
+  // `gadt`: pattern-mode unification, where an abstract type takes an
+  // equation (its other side reified first) and two constructors that
+  // differ reify both sides before failing.
+  bool unify(Tst& st, int x, int y, bool gadt) {
+    if (cxlax_) return true;
+    x = st.find(x); y = st.find(y);
+    if (x == y) return true;
+    Sty::K kx = st.a[x].k, ky = st.a[y].k;
+    if (kx == Sty::Var) { st.a[x].link = y; return true; }
+    if (ky == Sty::Var) { st.a[y].link = x; return true; }
+    if (kx == Sty::Nt || ky == Sty::Nt) {
+      if (!gadt) return false;
+      if (kx == Sty::Nt && ky == Sty::Nt) { st.a[x].link = y; return true; }
+      int n = kx == Sty::Nt ? x : y, t = kx == Sty::Nt ? y : x;
+      std::set<int> seen;
+      reify(st, t, seen);
+      st.a[n].link = t;
+      return true;
+    }
+    auto opq = [&](int i) {
+      return st.a[i].soft &&
+             (st.a[i].name == "<opq>" || st.a[i].name == "<univar>");
+    };
+    if (opq(x) || opq(y)) return true;
+    if (st.a[x].soft && st.a[y].soft) {
+      if (st.a[x].name != st.a[y].name) return false;
+      std::vector<int> ax = st.a[x].args, ay = st.a[y].args;
+      for (std::size_t i = 0; i < ax.size() && i < ay.size(); ++i)
+        unify(st, ax[i], ay[i], gadt);
+      return true;
+    }
+    if (st.a[x].name == st.a[y].name &&
+        st.a[x].args.size() == st.a[y].args.size()) {
+      std::vector<int> ax = st.a[x].args, ay = st.a[y].args;
+      for (std::size_t i = 0; i < ax.size(); ++i)
+        if (!unify(st, ax[i], ay[i], gadt)) return false;
+      return true;
+    }
+    // ctype.ml:3511 reifies both sides before `mcomp` refuses them, but
+    // only where one of them is a type constructor: a tuple against an
+    // arrow is refused with nothing named.
+    if (gadt && (st.a[x].tc || st.a[y].tc)) {
+      std::set<int> seen;
+      reify(st, x, seen);
+      reify(st, y, seen);
+    }
+    return false;
+  }
+  // An instance of a written type; `ann` reads a bare name in scope as the
+  // newtype it is (an annotation), a declaration's types never do.
+  int inst(Tst& st, const CoreType& t, std::map<std::string, int>& vars,
+           bool ann, int depth = 0) {
+    if (depth > 40) return st.mk(Sty::Con, "<opq>", {}, true);
+    if (std::holds_alternative<Ptyp_any>(t.desc)) return st.mk(Sty::Var);
+    if (auto* v = std::get_if<Ptyp_var>(&t.desc)) {
+      auto it = vars.find(v->name);
+      if (it != vars.end()) return it->second;
+      int i = st.mk(Sty::Var);
+      vars[v->name] = i;
+      return i;
+    }
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      std::string nm = lid_last(c->id.txt);
+      if (ann && c->args.empty() &&
+          std::holds_alternative<Lident>(c->id.txt.v) &&
+          std::find(las_.begin(), las_.end(), nm) != las_.end())
+        return st.nt(nm);
+      std::vector<int> as;
+      for (auto& a : c->args) as.push_back(inst(st, *a, vars, ann, depth + 1));
+      for (int i = any_arity(*c); i > 1; --i) as.push_back(st.mk(Sty::Var));
+      return st.mk(Sty::Con, nm, as);
+    }
+    if (auto* x = std::get_if<Ptyp_tuple>(&t.desc)) {
+      std::vector<int> as;
+      for (auto& e : x->elems) as.push_back(inst(st, *e, vars, ann, depth + 1));
+      return st.mk(Sty::Con, "*", as);
+    }
+    if (auto* x = std::get_if<Ptyp_arrow>(&t.desc)) {
+      int d = inst(st, *x->dom, vars, ann, depth + 1);
+      int c = inst(st, *x->cod, vars, ann, depth + 1);
+      return st.mk(Sty::Con, "->", {d, c});
+    }
+    if (auto* x = std::get_if<Ptyp_alias>(&t.desc)) {
+      int i = inst(st, *x->type, vars, ann, depth + 1);
+      auto it = vars.find(x->name);
+      if (it != vars.end()) {
+        int v = st.find(it->second);
+        if (st.a[v].k == Sty::Var && v != st.find(i)) st.a[v].link = i;
+      }
+      vars[x->name] = i;
+      return i;
+    }
+    if (auto* x = std::get_if<Ptyp_poly>(&t.desc)) {
+      for (auto& v : x->vars) vars[v] = st.mk(Sty::Con, "<univar>", {}, true);
+      return inst(st, *x->type, vars, ann, depth + 1);
+    }
+    if (auto* x = std::get_if<Ptyp_class>(&t.desc)) {
+      std::vector<int> as{st.mk(Sty::Var)};
+      for (auto& a : x->args) as.push_back(inst(st, *a, vars, ann, depth + 1));
+      return st.mk(Sty::Con, "#" + lid_last(x->id.txt), as, true);
+    }
+    if (auto* x = std::get_if<Ptyp_variant>(&t.desc)) {
+      std::vector<int> as;
+      if (x->closed == ClosedFlag::Open || x->labels.has_value())
+        as.push_back(st.mk(Sty::Var));
+      for (auto& r : x->rows) {
+        if (auto* g = std::get_if<Rtag>(&r))
+          for (auto& a : g->types)
+            as.push_back(inst(st, *a, vars, ann, depth + 1));
+        else if (auto* h = std::get_if<Rinherit>(&r))
+          as.push_back(inst(st, *h->ct, vars, ann, depth + 1));
+      }
+      return st.mk(Sty::Con, "<pv>", as, true);
+    }
+    if (auto* x = std::get_if<Ptyp_object>(&t.desc)) {
+      std::vector<int> as;
+      if (x->closed == ClosedFlag::Open) as.push_back(st.mk(Sty::Var));
+      for (auto& o : x->fields) {
+        if (auto* g = std::get_if<Otag>(&o))
+          as.push_back(inst(st, *g->type, vars, ann, depth + 1));
+        else if (auto* h = std::get_if<Oinherit>(&o))
+          as.push_back(inst(st, *h->type, vars, ann, depth + 1));
+      }
+      return st.mk(Sty::Con, "<obj>", as, true);
+    }
+    return st.mk(Sty::Con, "<opq>", {}, true);
+  }
+  // A witness pattern: a source pattern, a wildcard, a head with its
+  // arguments (a row's head, or a missing constructor `build_other` names),
+  // an or-pattern, `*extension*`, or a column this reading cannot follow
+  // (accepted as found, as before).
+  struct WP {
+    enum K { Src, Omega, Head, Or, Ext, Unknown } k = Omega;
+    Hd hd = Hd::Wild;
+    const Pattern* src = nullptr;
+    const Ct* ct = nullptr;
+    std::string name;
+    std::vector<WP> args;
+    std::vector<std::string> labels;
+  };
+  static WP wp_src(const Pattern* p) {
+    WP w; w.k = WP::Src; w.src = p;
+    return w;
+  }
+  static WP wp_head(Hd h, const Pattern* src, std::vector<WP> args) {
+    WP w; w.k = WP::Head; w.hd = h; w.src = src; w.args = std::move(args);
+    return w;
+  }
+  static WP wp_or(std::vector<WP> alts) {
+    if (alts.size() == 1) return alts[0];
+    WP w; w.k = WP::Or; w.args = std::move(alts);
+    return w;
+  }
+  static std::vector<WP> omegas(std::size_t n) { return std::vector<WP>(n); }
+  // The declared arity of a constructor's head: its declaration's, `Some`'s
+  // one, else what the argument's shape says (S506's reading).
+  std::size_t ctor_arity(const Longident& id, const Pattern* arg) {
+    auto cd = ctor_cd(id);
+    if (cd && cd->args) {
+      if (auto* t = std::get_if<Pcstr_tuple>(cd->args)) return t->elems.size();
+      return 1;
+    }
+    std::string nm = lid_last(id);
+    if (nm == "Some") return 1;
+    if (nm == "::") return 2;
+    if (!arg) return 0;
+    const Pattern* a = peel(arg);
+    if (auto* t = std::get_if<Ppat_tuple>(&a->desc)) return t->elems.size();
+    return 1;
+  }
+  static std::size_t ct_arity(const Ct& c) {
+    if (!c.args) return c.nullary ? 0 : 1;
+    if (auto* t = std::get_if<Pcstr_tuple>(c.args)) return t->elems.size();
+    return 1;
+  }
+  // A source pattern as a witness node, its head deconstructed.
+  WP wpof(const Pattern* p0) {
+    const Pattern* p = peel(p0);
+    if (wild(p)) return WP{};
+    if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+      std::vector<WP> alts;
+      std::function<void(const Pattern*)> flat = [&](const Pattern* q) {
+        const Pattern* r = peel(q);
+        if (auto* oo = std::get_if<Ppat_or>(&r->desc)) {
+          flat(oo->l.get()); flat(oo->r.get());
+        } else {
+          alts.push_back(wpof(r));
+        }
+      };
+      flat(o->l.get()); flat(o->r.get());
+      return wp_or(std::move(alts));
+    }
+    if (auto* c = std::get_if<Ppat_construct>(&p->desc)) {
+      std::size_t ar = ctor_arity(c->id.txt, c->arg ? c->arg->get() : nullptr);
+      std::vector<WP> as;
+      if (c->arg) {
+        const Pattern* a = peel(c->arg->get());
+        auto* t = std::get_if<Ppat_tuple>(&a->desc);
+        if (ar > 1 && t && t->elems.size() == ar)
+          for (auto& e : t->elems) as.push_back(wpof(e.get()));
+        else if (ar > 1 && wild(a))
+          as = omegas(ar);
+        else
+          as.push_back(wpof(c->arg->get()));
+      }
+      while (as.size() < ar) as.push_back(WP{});
+      if (as.size() > ar) as.resize(ar);
+      return wp_head(Hd::Ctor, p, std::move(as));
+    }
+    if (auto* t = std::get_if<Ppat_tuple>(&p->desc)) {
+      std::vector<WP> as;
+      for (auto& e : t->elems) as.push_back(wpof(e.get()));
+      return wp_head(Hd::Tuple, p, std::move(as));
+    }
+    if (std::holds_alternative<Ppat_constant>(p->desc))
+      return wp_head(Hd::Const, p, {});
+    if (auto* r = std::get_if<Ppat_record>(&p->desc)) {
+      WP w = wp_head(Hd::Rec, p, {});
+      for (auto& f : r->fields) {
+        w.labels.push_back(lid_last(f.first.txt));
+        w.args.push_back(wpof(f.second.get()));
+      }
+      return w;
+    }
+    if (auto* l = std::get_if<Ppat_lazy>(&p->desc))
+      return wp_head(Hd::Lazy, p, {wpof(l->p.get())});
+    if (auto* a = std::get_if<Ppat_array>(&p->desc)) {
+      std::vector<WP> as;
+      for (auto& e : a->elems) as.push_back(wpof(e.get()));
+      return wp_head(Hd::Array, p, std::move(as));
+    }
+    if (auto* v = std::get_if<Ppat_variant>(&p->desc)) {
+      std::vector<WP> as;
+      if (v->arg) as.push_back(wpof(v->arg->get()));
+      WP w = wp_head(Hd::Variant, p, std::move(as));
+      w.name = v->label;
+      return w;
+    }
+    WP u;  // an interval, an exception, an effect: unread
+    u.k = WP::Unknown;
+    return u;
+  }
+  // A source head's grouping key, constructors by tag (`simple_match`).
+  std::string head_key2(const Pattern* p, Hd h) {
+    if (h == Hd::Ctor)
+      return "C" + ctor_tag(std::get<Ppat_construct>(p->desc).id.txt);
+    return head_key(p, h);
+  }
+  // The grouping key and arity of a witness head (`Patterns.Head`).
+  std::string wp_key(const WP& w) {
+    switch (w.hd) {
+      case Hd::Ctor:
+        if (w.ct) return "C" + w.ct->tag;
+        if (w.src) return head_key2(w.src, Hd::Ctor);
+        return "C" + ctor_tag(Longident{Lident{w.name}});
+      case Hd::Const: return w.src ? head_key(w.src, Hd::Const) : "K" + w.name;
+      case Hd::Variant: return "V" + w.name;
+      case Hd::Array: return "A" + std::to_string(w.args.size());
+      default: return head_key(w.src, w.hd);
+    }
+  }
+  // Whether a column's heads could be one type's (`all_coherent`): two
+  // constructors of variants declared here must agree in their constant
+  // and non-constant counts; a constructor nothing here declares agrees.
+  bool coherent(const std::vector<const Pattern*>& heads) {
+    const Pattern* d = nullptr;
+    for (auto* h : heads) if (!wild(h)) { d = h; break; }
+    if (!d) return true;
+    Hd hd = head_of(d);
+    auto shape = [&](const Pattern* p, int& k, int& nk) -> bool {
+      auto& c = std::get<Ppat_construct>(p->desc);
+      auto cd = ctor_cd(c.id.txt);
+      if (!cd || cd->ty < 0) return false;
+      k = nk = 0;
+      for (auto& x : ctys[cd->ty]) (x.nullary ? k : nk)++;
+      return true;
+    };
+    for (auto* h : heads) {
+      if (wild(h)) continue;
+      Hd hh = head_of(h);
+      if (hh != hd) return false;
+      switch (hd) {
+        case Hd::Ctor: {
+          int k1, n1, k2, n2;
+          if (shape(d, k1, n1) && shape(h, k2, n2) && (k1 != k2 || n1 != n2))
+            return false;
+          break;
+        }
+        case Hd::Const:
+          if (const_key(std::get<Ppat_constant>(d->desc).c)[0] !=
+              const_key(std::get<Ppat_constant>(h->desc).c)[0])
+            return false;
+          break;
+        case Hd::Tuple:
+          if (std::get<Ppat_tuple>(d->desc).elems.size() !=
+              std::get<Ppat_tuple>(h->desc).elems.size())
+            return false;
+          break;
+        default: break;
+      }
+    }
+    return true;
+  }
+  // The groups of a simplified column (`build_specialized_submatrices`):
+  // one per head in order of first appearance, each holding its
+  // constructor rows in source order and then every wildcard row.
+  struct Grp2 {
+    std::string key;
+    Hd hd;
+    const Pattern* first;
+    std::size_t arity;
+    std::vector<Row> ctor_rows, wild_rows;
+    std::vector<Row> rows() const {
+      std::vector<Row> r = ctor_rows;
+      r.insert(r.end(), wild_rows.begin(), wild_rows.end());
+      return r;
+    }
+  };
+  struct Split2 {
+    std::vector<Grp2> grps;
+    std::vector<Row> def;
+    std::vector<std::string> labels;
+    bool unread = false;
+    bool incoherent = false;
+  };
+  Split2 split_col(const std::vector<Row>& pss0) {
+    Split2 out;
+    std::vector<Row> pss;
+    for (auto& r : pss0) simp_rows(r, pss);
+    std::vector<const Pattern*> heads;
+    for (auto& r : pss) heads.push_back(r[0]);
+    for (auto* h : heads)
+      if (h && head_of(h) == Hd::Other) { out.unread = true; return out; }
+    if (!coherent(heads)) { out.incoherent = true; return out; }
+    for (auto& r : pss)
+      if (r[0])
+        if (auto* rc = std::get_if<Ppat_record>(&r[0]->desc))
+          for (auto& f : rc->fields) {
+            std::string l = lid_last(f.first.txt);
+            if (std::find(out.labels.begin(), out.labels.end(), l) ==
+                out.labels.end())
+              out.labels.push_back(l);
+          }
+    for (auto& r : pss) {
+      Hd h = head_of(r[0]);
+      if (h == Hd::Wild) continue;
+      std::string k = head_key2(r[0], h);
+      std::size_t a = head_arity(r[0], h, out.labels.size());
+      bool seen = false;
+      for (auto& g : out.grps)
+        if (g.key == k) { g.arity = std::max(g.arity, a); seen = true; break; }
+      if (!seen) out.grps.push_back(Grp2{k, h, r[0], a, {}, {}});
+    }
+    for (auto& r : pss) {
+      Row rest(r.begin() + 1, r.end());
+      Hd h = head_of(r[0]);
+      if (h == Hd::Wild) {
+        out.def.push_back(rest);
+        for (auto& g : out.grps) {
+          Row s(g.arity, nullptr);
+          s.insert(s.end(), rest.begin(), rest.end());
+          g.wild_rows.push_back(s);
+        }
+        continue;
+      }
+      std::string k = head_key2(r[0], h);
+      for (auto& g : out.grps)
+        if (g.key == k) {
+          Row s = head_args(r[0], h, g.arity, out.labels);
+          s.insert(s.end(), rest.begin(), rest.end());
+          g.ctor_rows.push_back(s);
+          break;
+        }
+    }
+    return out;
+  }
+  // `full_match` for a column's groups: -1 where this reading cannot say.
+  int full2(const Split2& sp) {
+    const Grp2& g0 = sp.grps[0];
+    switch (g0.hd) {
+      case Hd::Tuple: case Hd::Lazy: case Hd::Rec: return 1;
+      case Hd::Const: case Hd::Array: return 0;
+      case Hd::Variant: return -1;
+      default: break;
+    }
+    const Longident& id = std::get<Ppat_construct>(g0.first->desc).id.txt;
+    auto cd = ctor_cd(id);
+    if (cd && cd->ext) return 0;
+    if (cd && cd->ty >= 0) return sp.grps.size() >= ctys[cd->ty].size() ? 1 : 0;
+    std::set<std::string> present;
+    for (auto& g : sp.grps)
+      present.insert(lid_last(std::get<Ppat_construct>(g.first->desc).id.txt));
+    if (cd) return -1;
+    static const std::vector<std::vector<std::string>> predef = {
+        {"None", "Some"}, {"[]", "::"}, {"false", "true"}, {"()"}};
+    for (auto& v : predef)
+      if (std::find(v.begin(), v.end(), lid_last(id)) != v.end()) {
+        for (auto& c : v) if (!present.count(c)) return 0;
+        return 1;
+      }
+    return -1;
+  }
+  // `build_other`: what is missing from a column that is not full.  For
+  // an extensible type that is `*extension*`, an ident of its own in the
+  // partial check (`exh`) and parmatch's shared `extra_pat` in the unused
+  // one; for a variant declared here the or-pattern of the absent
+  // constructors, constants first; a constant or an array of a value not
+  // present.  `Unknown` where the column cannot be read.
+  WP other2(const Split2& sp, bool exh) {
+    const Grp2& g0 = sp.grps[0];
+    WP u; u.k = WP::Unknown;
+    switch (g0.hd) {
+      case Hd::Const: {
+        WP w = wp_head(Hd::Const, g0.first, {});
+        return w;
+      }
+      case Hd::Array: {
+        std::set<std::size_t> seen;
+        for (auto& g : sp.grps) seen.insert(g.arity);
+        std::size_t n = 0;
+        while (seen.count(n)) ++n;
+        return wp_head(Hd::Array, nullptr, omegas(n));
+      }
+      case Hd::Ctor: break;
+      default: return u;
+    }
+    const Longident& id = std::get<Ppat_construct>(g0.first->desc).id.txt;
+    auto cd = ctor_cd(id);
+    if (cd && cd->ext) {
+      if (exh && !extwit_off()) ++cxk_;  // `*extension*`
+      WP w; w.k = WP::Ext;
+      return w;
+    }
+    std::set<std::string> present;
+    for (auto& g : sp.grps)
+      present.insert(lid_last(std::get<Ppat_construct>(g.first->desc).id.txt));
+    std::vector<WP> alts;
+    if (cd && cd->ty >= 0) {
+      for (int pass = 0; pass < 2; ++pass)
+        for (auto& c : ctys[cd->ty]) {
+          if (present.count(c.name) || c.nullary != (pass == 0)) continue;
+          WP w = wp_head(Hd::Ctor, nullptr, omegas(ct_arity(c)));
+          w.ct = &c;
+          w.name = c.name;
+          alts.push_back(w);
+        }
+      return alts.empty() ? u : wp_or(std::move(alts));
+    }
+    if (cd) return u;
+    static const std::vector<std::vector<std::string>> predef = {
+        {"None", "Some"}, {"[]", "::"}, {"false", "true"}, {"()"}};
+    for (auto& v : predef)
+      if (std::find(v.begin(), v.end(), lid_last(id)) != v.end()) {
+        for (auto& c : v)
+          if (!present.count(c)) {
+            std::size_t ar = c == "Some" ? 1 : c == "::" ? 2 : 0;
+            WP w = wp_head(Hd::Ctor, nullptr, omegas(ar));
+            w.name = c;
+            alts.push_back(w);
+          }
+        return alts.empty() ? u : wp_or(std::move(alts));
+      }
+    return u;
+  }
+  // A group's head with the witness's arguments (`set_args`).
+  static WP set_args2(const Grp2& g, const std::vector<std::string>& labels,
+                      std::vector<WP>& w) {
+    std::vector<WP> as(w.begin(), w.begin() + (std::ptrdiff_t)g.arity);
+    WP h = wp_head(g.hd, g.first, std::move(as));
+    if (g.hd == Hd::Rec) h.labels = labels;
+    if (g.hd == Hd::Variant)
+      h.name = std::get<Ppat_variant>(g.first->desc).label;
+    return h;
+  }
+  // `exhaust` (parmatch.ml:1288) as a generator: `yield` takes each witness
+  // row in the checker's order and says whether to stop.
+  using Yield = std::function<bool(std::vector<WP>&)>;
+  static std::vector<WP> unk(std::size_t n) {
+    std::vector<WP> w(n ? n : 1);
+    for (auto& x : w) x.k = WP::Unknown;
+    return w;
+  }
+  bool xh(const std::vector<Row>& pss, std::size_t n, bool exh,
+          const Yield& yield) {
+    if (--cxfuel_ <= 0) { std::vector<WP> w = unk(n); return yield(w); }
+    if (pss.empty()) { std::vector<WP> w = omegas(n); return yield(w); }
+    if (pss[0].empty()) return false;
+    if (pss.size() == 1) {
+      const Row& r = pss[0];
+      Row ps(r.begin() + 1, r.end());
+      if (xh(std::vector<Row>{ps}, n - 1, exh, [&](std::vector<WP>& w) {
+            w.insert(w.begin(), wp_src(r[0]));
+            return yield(w);
+          }))
+        return true;
+      return xh_spec(std::vector<Row>{Row{r[0]}}, 1, exh,
+                     [&](std::vector<WP>& w) {
+                       w.resize(n);
+                       return yield(w);
+                     });
+    }
+    return xh_spec(pss, n, exh, yield);
+  }
+  bool xh_spec(const std::vector<Row>& pss, std::size_t n, bool exh,
+               const Yield& yield) {
+    Split2 sp = split_col(pss);
+    if (sp.unread) { std::vector<WP> w = unk(n); return yield(w); }
+    if (sp.incoherent) return false;
+    if (sp.grps.empty())
+      return xh(sp.def, n - 1, exh, [&](std::vector<WP>& w) {
+        w.insert(w.begin(), WP{});
+        return yield(w);
+      });
+    for (auto& g : sp.grps) {
+      if (xh(g.rows(), g.arity + n - 1, exh, [&](std::vector<WP>& w) {
+            WP h = set_args2(g, sp.labels, w);
+            w.erase(w.begin(), w.begin() + (std::ptrdiff_t)g.arity);
+            w.insert(w.begin(), std::move(h));
+            return yield(w);
+          }))
+        return true;
+    }
+    int full = full2(sp);
+    if (full == 1) return false;
+    if (full < 0) { std::vector<WP> w = unk(n); return yield(w); }
+    WP p = other2(sp, exh);
+    return xh(sp.def, n - 1, exh, [&](std::vector<WP>& w) {
+      w.insert(w.begin(), p);
+      return yield(w);
+    });
+  }
+  // `list_satisfying_vectors` (parmatch.ml:1156): the vectors that match
+  // `qs` and none of `pss`, the missing constructor's first.
+  void lsv(const std::vector<Row>& pss, const std::vector<WP>& qs,
+           std::vector<std::vector<WP>>& out, bool& unread) {
+    if (--cxfuel_ <= 0 || unread || out.size() > 64) { unread = true; return; }
+    if (pss.empty()) { out.push_back(qs); return; }
+    if (qs.empty()) return;
+    WP q = qs[0];
+    if (q.k == WP::Src) q = wpof(q.src);
+    std::vector<WP> rest(qs.begin() + 1, qs.end());
+    if (q.k == WP::Unknown) { unread = true; return; }
+    if (q.k == WP::Or) {
+      for (auto& a : q.args) {
+        std::vector<WP> qs2{a};
+        qs2.insert(qs2.end(), rest.begin(), rest.end());
+        lsv(pss, qs2, out, unread);
+      }
+      return;
+    }
+    if (q.k != WP::Head) {  // a wildcard
+      Split2 sp = split_col(pss);
+      if (sp.unread) { unread = true; return; }
+      if (sp.incoherent) return;
+      auto wild_ = [&](const std::vector<Row>& def, const WP& p) {
+        std::vector<std::vector<WP>> sub;
+        lsv(def, rest, sub, unread);
+        for (auto& v : sub) { v.insert(v.begin(), p); out.push_back(v); }
+      };
+      if (sp.grps.empty()) { wild_(sp.def, WP{}); return; }
+      auto for_constrs = [&]() {
+        for (auto& g : sp.grps) {
+          std::vector<WP> qs2 = omegas(g.arity);
+          qs2.insert(qs2.end(), rest.begin(), rest.end());
+          std::vector<std::vector<WP>> sub;
+          lsv(g.rows(), qs2, sub, unread);
+          for (auto& v : sub) {
+            WP h = set_args2(g, sp.labels, v);
+            v.erase(v.begin(), v.begin() + (std::ptrdiff_t)g.arity);
+            v.insert(v.begin(), std::move(h));
+            out.push_back(v);
+          }
+        }
+      };
+      int full = full2(sp);
+      if (full < 0) { unread = true; return; }
+      if (full == 1) { for_constrs(); return; }
+      if (sp.grps[0].hd == Hd::Ctor) {
+        WP p = other2(sp, false);
+        if (p.k == WP::Unknown) { unread = true; return; }
+        wild_(sp.def, p);
+      } else {
+        wild_(sp.def, WP{});
+      }
+      for_constrs();
+      return;
+    }
+    // a head: the sub-matrix of its rows
+    std::vector<Row> pss2;
+    for (auto& r : pss) simp_rows(r, pss2);
+    std::vector<const Pattern*> heads;
+    for (auto& r : pss2) heads.push_back(r[0]);
+    for (auto* h : heads)
+      if (h && head_of(h) == Hd::Other) { unread = true; return; }
+    if (!coherent(heads)) return;
+    std::string key = wp_key(q);
+    std::vector<std::string> labels = q.labels;
+    for (auto& r : pss2)
+      if (r[0])
+        if (auto* rc = std::get_if<Ppat_record>(&r[0]->desc))
+          for (auto& f : rc->fields) {
+            std::string l = lid_last(f.first.txt);
+            if (std::find(labels.begin(), labels.end(), l) == labels.end())
+              labels.push_back(l);
+          }
+    std::size_t arity = q.hd == Hd::Rec ? labels.size() : q.args.size();
+    for (auto& r : pss2) {
+      Hd h = head_of(r[0]);
+      if (h != Hd::Wild) {
+        if (head_key2(r[0], h) != key) continue;
+        arity = std::max(arity, head_arity(r[0], h, labels.size()));
+      }
+    }
+    std::vector<Row> sub;
+    for (auto& r : pss2) {
+      Hd h = head_of(r[0]);
+      Row rest_r(r.begin() + 1, r.end());
+      Row s;
+      if (h == Hd::Wild) s = Row(arity, nullptr);
+      else if (head_key2(r[0], h) == key) s = head_args(r[0], h, arity, labels);
+      else continue;
+      s.insert(s.end(), rest_r.begin(), rest_r.end());
+      sub.push_back(s);
+    }
+    std::vector<WP> qargs = q.args;
+    if (q.hd == Hd::Rec) {
+      std::vector<WP> byl;
+      for (auto& l : labels) {
+        WP f;
+        for (std::size_t i = 0; i < q.labels.size(); ++i)
+          if (q.labels[i] == l) { f = q.args[i]; break; }
+        byl.push_back(f);
+      }
+      qargs = byl;
+    }
+    while (qargs.size() < arity) qargs.push_back(WP{});
+    if (qargs.size() > arity) qargs.resize(arity);
+    std::vector<WP> qs2 = qargs;
+    qs2.insert(qs2.end(), rest.begin(), rest.end());
+    std::vector<std::vector<WP>> subv;
+    lsv(sub, qs2, subv, unread);
+    for (auto& v : subv) {
+      std::vector<WP> as(v.begin(), v.begin() + (std::ptrdiff_t)arity);
+      WP h = q;
+      h.args = std::move(as);
+      if (q.hd == Hd::Rec) h.labels = labels;
+      v.erase(v.begin(), v.begin() + (std::ptrdiff_t)arity);
+      v.insert(v.begin(), std::move(h));
+      out.push_back(v);
+    }
+  }
+  // `SyntacticCompat.compats`: whether some value could match both.
+  bool compat(const Pattern* p0, const Pattern* q0) {
+    const Pattern* p = peel(p0);
+    const Pattern* q = peel(q0);
+    if (wild(p) || wild(q)) return true;
+    if (auto* o = std::get_if<Ppat_or>(&p->desc))
+      return compat(o->l.get(), q) || compat(o->r.get(), q);
+    if (auto* o = std::get_if<Ppat_or>(&q->desc))
+      return compat(p, o->l.get()) || compat(p, o->r.get());
+    Hd hp = head_of(p), hq = head_of(q);
+    if (hp == Hd::Other || hq == Hd::Other) return true;
+    if (hp != hq) return false;
+    if (head_key2(p, hp) != head_key2(q, hq)) return false;
+    std::vector<std::string> labels;
+    if (hp == Hd::Rec)
+      for (auto* r : {p, q})
+        for (auto& f : std::get<Ppat_record>(r->desc).fields) {
+          std::string l = lid_last(f.first.txt);
+          if (std::find(labels.begin(), labels.end(), l) == labels.end())
+            labels.push_back(l);
+        }
+    std::size_t a = std::max(head_arity(p, hp, labels.size()),
+                             head_arity(q, hq, labels.size()));
+    Row ap = head_args(p, hp, a, labels), aq = head_args(q, hq, a, labels);
+    for (std::size_t i = 0; i < a; ++i)
+      if (!compat(ap[i], aq[i])) return false;
+    return true;
+  }
+  // ---- the pred: `check_counter_example_pat` (typecore.ml:2806) --------
+  enum class Cx { Ok, Fail, Adds };
+  using Cont = std::function<Cx(Tst&)>;
+  struct Ci {
+    std::vector<int> args;
+    int res = -1;
+    bool gen = false, known = false;
+    int ex = 0, rf = 0;
+  };
+  Ci ci_of_decl(Tst& st, const ConstructorArguments* args, const CoreType* res,
+                const TypeDeclaration* decl, int ex, int rf) {
+    Ci ci;
+    ci.known = true; ci.ex = ex; ci.rf = rf;
+    std::map<std::string, int> vars;
+    if (auto* t = std::get_if<Pcstr_tuple>(args)) {
+      for (auto& e : t->elems) ci.args.push_back(inst(st, *e, vars, false));
+    } else if (auto* r = std::get_if<Pcstr_record>(args)) {
+      std::vector<int> fs;
+      for (auto& l : r->fields) fs.push_back(inst(st, *l.type, vars, false));
+      ci.args.push_back(st.mk(Sty::Con, "<rec>", fs, true));
+    }
+    if (res) { ci.res = inst(st, *res, vars, false); ci.gen = true; }
+    else if (decl) {
+      std::vector<int> as;
+      for (auto& q : decl->params) as.push_back(inst(st, *q, vars, false));
+      ci.res = st.mk(Sty::Con, decl->name.txt, as);
+    }
+    return ci;
+  }
+  Ci ctor_ci(Tst& st, const WP& w) {
+    Ci ci;
+    if (w.ct) {
+      if (w.ct->args)
+        return ci_of_decl(st, w.ct->args, w.ct->res, w.ct->decl, w.ct->ex,
+                          w.ct->rf);
+      ci.ex = w.ct->ex; ci.rf = w.ct->rf;
+      return ci;
+    }
+    std::string nm = w.name;
+    std::optional<Cd> cd;
+    if (w.src) {
+      auto& c = std::get<Ppat_construct>(w.src->desc);
+      nm = lid_last(c.id.txt);
+      cd = ctor_cd(c.id.txt);
+    }
+    if (cd && cd->args)
+      return ci_of_decl(st, cd->args, cd->res, cd->decl, cd->ex, cd->rf);
+    if (cd) { ci.ex = cd->ex; ci.rf = cd->rf; return ci; }
+    ci.known = true;
+    if (nm == "None") {
+      ci.res = st.mk(Sty::Con, "option", {st.mk(Sty::Var)});
+      return ci;
+    }
+    if (nm == "Some") {
+      int v = st.mk(Sty::Var);
+      ci.args = {v}; ci.res = st.mk(Sty::Con, "option", {v});
+      return ci;
+    }
+    if (nm == "[]") {
+      ci.res = st.mk(Sty::Con, "list", {st.mk(Sty::Var)});
+      return ci;
+    }
+    if (nm == "::") {
+      int v = st.mk(Sty::Var);
+      int l = st.mk(Sty::Con, "list", {v});
+      ci.args = {v, l}; ci.res = l;
+      return ci;
+    }
+    if (nm == "true" || nm == "false") {
+      ci.res = st.mk(Sty::Con, "bool");
+      return ci;
+    }
+    if (nm == "()") { ci.res = st.mk(Sty::Con, "unit"); return ci; }
+    ci.known = false;
+    return ci;
+  }
+  // `pats_of_type`: what a wildcard explodes into at this type -- every
+  // constructor of a variant declared here whose constructors are all
+  // generalized (or at most one), the one record, the one tuple; nothing
+  // elsewhere.
+  std::vector<WP> pats_of_type(Tst& st, int e, int depth = 0) {
+    std::vector<WP> out;
+    e = st.find(e);
+    if (st.a[e].k != Sty::Con || st.a[e].soft || depth > 8) return out;
+    const std::string& nm = st.a[e].name;
+    if (nm == "*") {
+      out.push_back(wp_head(Hd::Tuple, nullptr, omegas(st.a[e].args.size())));
+      return out;
+    }
+    if (auto it = tyids_.find(nm); it != tyids_.end()) {
+      auto& cs = ctys[it->second];
+      bool all = true;
+      for (auto& c : cs) if (!c.res) all = false;
+      if (cs.size() > 1 && !all) return out;
+      for (auto& c : cs) {
+        WP w = wp_head(Hd::Ctor, nullptr, omegas(ct_arity(c)));
+        w.ct = &c;
+        w.name = c.name;
+        out.push_back(w);
+      }
+      return out;
+    }
+    if (auto it = tdecls_.find(nm); it != tdecls_.end()) {
+      const TypeDeclaration& d = *it->second;
+      if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+        WP w = wp_head(Hd::Rec, nullptr, omegas(r->fields.size()));
+        for (auto& f : r->fields) w.labels.push_back(f.name.txt);
+        out.push_back(w);
+        return out;
+      }
+      if (d.manifest && std::holds_alternative<Ptype_abstract>(d.kind)) {
+        std::map<std::string, int> vars;
+        std::vector<int> as = st.a[e].args;
+        for (std::size_t i = 0; i < d.params.size() && i < as.size(); ++i)
+          if (auto* v = std::get_if<Ptyp_var>(&d.params[i]->desc))
+            vars[v->name] = as[i];
+        int m = inst(st, **d.manifest, vars, false);
+        return pats_of_type(st, m, depth + 1);
+      }
+    }
+    return out;
+  }
+  // The fields' types of a record pattern at `e`, where the declaration is
+  // this file's; fresh variables elsewhere.
+  std::vector<int> rec_fields(Tst& st, int e,
+                              const std::vector<std::string>& labels) {
+    std::vector<int> out;
+    e = st.find(e);
+    const TypeDeclaration* d = nullptr;
+    if (st.a[e].k == Sty::Con)
+      if (auto it = tdecls_.find(st.a[e].name); it != tdecls_.end())
+        d = it->second;
+    const Ptype_record* r = d ? std::get_if<Ptype_record>(&d->kind) : nullptr;
+    std::map<std::string, int> vars;
+    if (r) {
+      std::vector<int> as = st.a[e].args;
+      for (std::size_t i = 0; i < d->params.size() && i < as.size(); ++i)
+        if (auto* v = std::get_if<Ptyp_var>(&d->params[i]->desc))
+          vars[v->name] = as[i];
+    } else if (st.a[e].k == Sty::Nt) {
+      return out;  // an abstract type takes no record plainly
+    }
+    for (auto& l : labels) {
+      const CoreType* t = nullptr;
+      if (r)
+        for (auto& f : r->fields) if (f.name.txt == l) t = f.type.get();
+      out.push_back(t ? inst(st, *t, vars, false) : st.mk(Sty::Var));
+    }
+    return out;
+  }
+  static int const_ty(Tst& st, const Pattern* p) {
+    const Constant* c = nullptr;
+    if (auto* k = std::get_if<Ppat_constant>(&p->desc)) c = &k->c;
+    else if (auto* iv = std::get_if<Ppat_interval>(&p->desc)) c = &iv->c1;
+    if (!c) return st.mk(Sty::Var);
+    if (auto* i = std::get_if<Pconst_integer>(&c->desc)) {
+      if (!i->suffix) return st.mk(Sty::Con, "int");
+      char sf = *i->suffix;
+      return st.mk(Sty::Con, sf == 'l' ? "int32" : sf == 'L' ? "int64"
+                                                              : "nativeint");
+    }
+    if (std::holds_alternative<Pconst_char>(c->desc))
+      return st.mk(Sty::Con, "char");
+    if (std::holds_alternative<Pconst_string>(c->desc))
+      return st.mk(Sty::Con, "string");
+    return st.mk(Sty::Con, "float");
+  }
+  Cx cx_seq(Tst& st, const std::vector<WP>& ps, const std::vector<int>& tys,
+            std::size_t i, int fuel, bool ns, const Cont& k) {
+    if (i >= ps.size()) return k(st);
+    int t = i < tys.size() ? tys[i] : st.mk(Sty::Var);
+    return cx_pat(st, ps[i], t, fuel, ns, [&](Tst& s) {
+      return cx_seq(s, ps, tys, i + 1, fuel, ns, k);
+    });
+  }
+  // `find_valid_alternative`: the alternatives, with the REST of the
+  // pattern, until one stands.
+  Cx cx_split(Tst& st, const std::vector<WP>& alts, int e, int fuel,
+              const Cont& k) {
+    for (auto& a : alts) {
+      Tst c = st;
+      if (cx_pat(c, a, e, fuel, false, k) == Cx::Ok) {
+        st = std::move(c);
+        return Cx::Ok;
+      }
+    }
+    return Cx::Fail;
+  }
+  Cx cx_pat(Tst& st, const WP& w0, int e, int fuel, bool ns, const Cont& k) {
+    if (cxfuel_-- <= 0) return Cx::Ok;
+    const WP* wp = &w0;
+    WP tmp;
+    if (wp->k == WP::Src) { tmp = wpof(wp->src); wp = &tmp; }
+    const WP& w = *wp;
+    switch (w.k) {
+      case WP::Unknown: return Cx::Ok;
+      case WP::Omega: case WP::Ext: {
+        if (fuel <= 0) return k(st);
+        std::vector<WP> ps = pats_of_type(st, e);
+        if (ps.empty()) return k(st);
+        if (ps.size() == 1) return cx_pat(st, ps[0], e, fuel - 1, ns, k);
+        if (ns) return Cx::Adds;
+        return cx_pat(st, wp_or(std::move(ps)), e, fuel - 5, ns, k);
+      }
+      case WP::Or: {
+        if (cxbt_) return cx_split(st, w.args, e, fuel, k);
+        if (cxreal_) {
+          for (auto& a : w.args) {
+            Tst c = st;
+            cx_pat(c, a, e, 0, false, [](Tst&) { return Cx::Ok; });
+          }
+          return k(st);
+        }
+        bool ok = false;
+        for (auto& a : w.args) {
+          Tst c = st;
+          Cx r = cx_pat(c, a, e, fuel, true, [](Tst&) { return Cx::Ok; });
+          if (r == Cx::Fail) return Cx::Fail;
+          if (r == Cx::Ok) ok = true;
+        }
+        if (ok) return k(st);
+        if (ns) return Cx::Adds;
+        return cx_split(st, w.args, e, fuel, k);
+      }
+      case WP::Head: break;
+      default: return k(st);
+    }
+    switch (w.hd) {
+      case Hd::Ctor: {
+        Ci ci = ctor_ci(st, w);
+        if (ci.gen && ns) return Cx::Adds;
+        if (!cxreal_) cxk_ += ci.ex;  // a row's are `pat`'s
+        if (!ci.known) {
+          int f = st.find(e);
+          bool nt = st.a[f].k == Sty::Nt || (st.a[f].k == Sty::Var && la_ > 0);
+          if (ci.rf && nt) cxk_ += ci.rf;
+          if (st.a[f].k != Sty::Con)
+            st.a[f].link = st.mk(Sty::Con, "<opq>", {}, true);
+          std::vector<int> tys;
+          for (std::size_t i = 0; i < w.args.size(); ++i)
+            tys.push_back(st.mk(Sty::Var));
+          return cx_seq(st, w.args, tys, 0, fuel, ns, k);
+        }
+        if (ci.res >= 0) {
+          if (ci.gen) {
+            int f = st.find(e);
+            int r = st.find(ci.res);
+            if (st.a[f].k == Sty::Var && la_ > 0 && st.a[r].k == Sty::Con) {
+              // the scrutinee's type unread: its index positions are
+              // newtypes, as S504 read every GADT match in a newtype scope
+              std::vector<int> as;
+              for (std::size_t i = 0; i < st.a[r].args.size(); ++i)
+                as.push_back(st.mk(Sty::Nt, "?"));
+              std::string nm = st.a[r].name;
+              int h = st.mk(Sty::Con, nm, as);
+              st.a[f].link = h;
+            }
+          }
+          if (!unify(st, e, ci.res, ci.gen)) return Cx::Fail;
+        }
+        std::vector<WP> as = w.args;
+        while (as.size() < ci.args.size()) as.push_back(WP{});
+        if (ci.args.size() == 1 && as.size() > 1) {
+          WP t = wp_head(Hd::Tuple, nullptr, std::move(as));
+          as = {t};
+        }
+        return cx_seq(st, as, ci.args, 0, fuel, ns, k);
+      }
+      case Hd::Tuple: {
+        std::vector<int> vs;
+        for (std::size_t i = 0; i < w.args.size(); ++i)
+          vs.push_back(st.mk(Sty::Var));
+        if (!unify(st, e, st.mk(Sty::Con, "*", vs), false)) return Cx::Fail;
+        return cx_seq(st, w.args, vs, 0, fuel, ns, k);
+      }
+      case Hd::Const: {
+        int t = w.src ? const_ty(st, w.src) : st.mk(Sty::Var);
+        if (!unify(st, e, t, false)) return Cx::Fail;
+        return k(st);
+      }
+      case Hd::Lazy: {
+        int v = st.mk(Sty::Var);
+        if (!unify(st, e, st.mk(Sty::Con, "lazy_t", {v}), false))
+          return Cx::Fail;
+        return cx_seq(st, w.args, {v}, 0, 0, ns, k);
+      }
+      case Hd::Array: {
+        int v = st.mk(Sty::Var);
+        if (!unify(st, e, st.mk(Sty::Con, "array", {v}), false))
+          return Cx::Fail;
+        std::vector<int> vs(w.args.size(), v);
+        return cx_seq(st, w.args, vs, 0, fuel, ns, k);
+      }
+      case Hd::Rec: {
+        std::vector<int> tys = rec_fields(st, e, w.labels);
+        if (tys.empty()) return Cx::Fail;
+        return cx_seq(st, w.args, tys, 0, fuel, ns, k);
+      }
+      case Hd::Variant: {
+        std::vector<int> as{st.mk(Sty::Var)};
+        if (!w.args.empty()) as.push_back(st.mk(Sty::Var));
+        if (!unify(st, e, st.mk(Sty::Con, "<pv>", as, true), false))
+          return Cx::Fail;
+        std::vector<int> tys;
+        if (!w.args.empty()) tys.push_back(as[1]);
+        return cx_seq(st, w.args, tys, 0, fuel, ns, k);
+      }
+      default: return k(st);
+    }
+  }
+  // The scrutinee's type: a tuple of its elements', each an annotated
+  // identifier's or a constrained expression's, a variable elsewhere.
+  int scrut_ty(Tst& st, const Expression* e, std::map<std::string, int>& vars) {
+    if (!e) return st.mk(Sty::Var);
+    if (auto* t = std::get_if<Pexp_tuple>(&e->desc)) {
+      std::vector<int> as;
+      for (auto& x : t->elems) as.push_back(scrut_ty(st, x.get(), vars));
+      return st.mk(Sty::Con, "*", as);
+    }
+    if (auto* c = std::get_if<Pexp_constraint>(&e->desc))
+      return inst(st, *c->t, vars, true);
+    if (auto* i = std::get_if<Pexp_ident>(&e->desc))
+      if (auto* l = std::get_if<Lident>(&i->id.txt.v))
+        if (auto it = vann_.find(l->name); it != vann_.end() && it->second)
+          return inst(st, *it->second, vars, true);
+    return st.mk(Sty::Var);
+  }
+  std::string wp_str(const WP& w0) {
+    WP tmp;
+    const WP* wp = &w0;
+    if (wp->k == WP::Src) { tmp = wpof(wp->src); wp = &tmp; }
+    const WP& w = *wp;
+    std::string s;
+    switch (w.k) {
+      case WP::Omega: return "_";
+      case WP::Ext: return "*extension*";
+      case WP::Unknown: return "?";
+      case WP::Or:
+        s = "(";
+        for (std::size_t i = 0; i < w.args.size(); ++i)
+          s += (i ? "|" : "") + wp_str(w.args[i]);
+        return s + ")";
+      default: break;
+    }
+    switch (w.hd) {
+      case Hd::Ctor:
+        if (w.ct) s = w.ct->name;
+        else if (w.src)
+          s = lid_last(std::get<Ppat_construct>(w.src->desc).id.txt);
+        else s = w.name;
+        break;
+      case Hd::Tuple: s = "tuple"; break;
+      case Hd::Const: s = "const"; break;
+      case Hd::Rec: s = "rec"; break;
+      case Hd::Lazy: s = "lazy"; break;
+      case Hd::Array: s = "array"; break;
+      case Hd::Variant: s = "`" + w.name; break;
+      default: s = "??"; break;
+    }
+    if (!w.args.empty()) {
+      s += "(";
+      for (std::size_t i = 0; i < w.args.size(); ++i)
+        s += (i ? ", " : "") + wp_str(w.args[i]);
+      s += ")";
+    }
+    return s;
+  }
+  // One run of the pred over a witness: a fresh environment each time.
+  // What a pattern is typed at: its own annotation where it has one, the
+  // scrutinee's type otherwise.
+  int pat_ty(Tst& st, const Pattern* ann, const Expression* scrut,
+             std::map<std::string, int>& vars) {
+    for (const Pattern* q = ann; q;) {
+      if (auto* c = std::get_if<Ppat_constraint>(&q->desc))
+        return inst(st, *c->t, vars, true);
+      if (auto* o = std::get_if<Ppat_open>(&q->desc)) q = o->p.get();
+      else if (auto* a = std::get_if<Ppat_alias>(&q->desc)) q = a->p.get();
+      else break;
+    }
+    return scrut_ty(st, scrut, vars);
+  }
+  // One run of the pred over a witness: a fresh environment each time
+  // (`CXDBG=1` prints every witness tried, its verdict and its cost).
+  bool cx_pred(const WP& w, const Expression* scrut, const Pattern* ann,
+               bool bt, int fuel) {
+    static const bool dbg = dbg_env("CXDBG") != nullptr;
+    long long k0 = cxk_;
+    bool r = cx_pred_(w, scrut, ann, bt, fuel);
+    if (dbg)
+      std::fprintf(stderr, "CXDBG %s %s -> %s +%lld\n",
+                   bt ? "unused" : "partial", wp_str(w).c_str(),
+                   r ? "ok" : "fail", cxk_ - k0);
+    return r;
+  }
+  bool cx_pred_(const WP& w, const Expression* scrut, const Pattern* ann,
+                bool bt, int fuel) {
+    Tst st = cx_base();
+    std::map<std::string, int> vars;
+    int e = pat_ty(st, ann, scrut, vars);
+    bool saved = cxbt_, lax = cxlax_;
+    cxbt_ = bt;
+    cxlax_ = la_ <= 0;
+    Cx r = cx_pat(st, w, e, fuel, false, [](Tst&) { return Cx::Ok; });
+    cxbt_ = saved;
+    cxlax_ = lax;
+    return r == Cx::Ok;
+  }
+  // A ROW's own typing (`type_pat`): what its constructors reify given the
+  // equations the row's earlier constructors added -- `R1, R1` names one,
+  // not two.  Or-patterns type both alternatives on copies of the
+  // equations (typecore.ml:2387).  Only under a newtype, as `ctor_reify`
+  // was.
+  long long cx_row(const Pattern& p) {
+    cxlast_ = cx_base();
+    if (la_ <= 0) return 0;
+    Tst st = cx_base();
+    std::map<std::string, int> vars;
+    int e = pat_ty(st, &p, cx_scrut_, vars);
+    long long k0 = cxk_;
+    bool real = cxreal_, bt = cxbt_;
+    cxreal_ = true; cxbt_ = false;
+    cxfuel_ = 20000;
+    cx_pat(st, wp_src(&p), e, 0, false, [&](Tst& s) {
+      cxlast_ = s;
+      return Cx::Ok;
+    });
+    cxreal_ = real; cxbt_ = bt;
+    return cxk_ - k0;
+  }
+  // The partial check: the witnesses in order until one types.
+  long long cx_partial(const std::vector<const Pattern*>& rows,
+                       const Expression* scrut, const Pattern* ann, int fuel) {
+    std::vector<Row> pss;
+    for (auto* r : mins(rows, true)) pss.push_back(Row{r});
+    cxk_ = 0;
+    cxfuel_ = 20000;
+    xh(pss, 1, true, [&](std::vector<WP>& w) {
+      return cx_pred(w[0], scrut, ann, false, fuel);
+    });
+    return cxk_;
+  }
+  // The unused check for one clause: the or of its satisfying vectors,
+  // typed with backtracking; -1 where the rows cannot be read.
+  long long cx_unused(const std::vector<const Pattern*>& pref,
+                      const Pattern& q, const Expression* scrut) {
+    std::vector<const Pattern*> ps;
+    for (auto* p : pref) if (compat(p, &q)) ps.push_back(p);
+    std::vector<Row> pss;
+    for (auto* r : mins(ps, true)) pss.push_back(Row{r});
+    std::vector<std::vector<WP>> sfs;
+    bool unread = false;
+    cxfuel_ = 20000;
+    lsv(pss, std::vector<WP>{wp_src(&q)}, sfs, unread);
+    if (unread) return -1;
+    if (sfs.empty()) return 0;
+    std::vector<WP> alts;
+    for (auto& v : sfs) alts.push_back(v[0]);
+    cxk_ = 0;
+    cx_pred(wp_or(std::move(alts)), scrut, nullptr, true, 5);
+    return cxk_;
+  }
   // A pattern typed on its own is checked on its own (`check_partial` over
   // the one row): a function's parameter (typecore.ml:5990), a `let`'s
   // pattern (typecore.ml:7586), a class's parameter (typeclass.ml:1210) and
-  // the `let*` row, a tuple of its patterns (typecore.ml:5449).
-  long long pat_check(const Row& row) {
+  // the `let*` row, a tuple of its patterns (typecore.ml:5449).  One row:
+  // its witness is typed with fuel 5 at the pattern's own annotation.
+  long long pat_check(const Row& row, const Expression* scrut = nullptr) {
     if (exist_off() || exhmat_off()) return 0;
+    if (!cexty_off() && row.size() == 1 && row[0])
+      return cx_partial(std::vector<const Pattern*>{row[0]}, scrut, row[0], 5);
     int fuel = 20000;
     return exhaust(std::vector<Row>{row}, true, fuel).cost;
   }
-  long long pat_check(const Pattern& p) { return pat_check(Row{&p}); }
+  long long pat_check(const Pattern& p, const Expression* scrut = nullptr) {
+    return pat_check(Row{&p}, scrut);
+  }
   // `partial`: the value rows of a `match`/`function` get `check_partial`'s
   // witness besides; a `try`'s handlers (typecore's `partial_flag:false`)
   // and the exception and `effect` rows do not.
-  long long unused_extra(const std::vector<Case>& cs, bool partial = true) {
+  long long unused_extra(const std::vector<Case>& cs, bool partial = true,
+                         const Expression* scrut = nullptr) {
     if (exist_off()) return 0;
     long long k = 0;
+    const bool cx = !cexty_off() && !exhmat_off();
+    int nval = 0;
+    for (auto& c : cs) if (row_group(c.lhs) == 0) ++nval;
     for (int g = 0; g < 3; ++g) {
       // The witness `exhaust` builds for a clause that refuses nothing is
       // the one the prefix leaves (`list_satisfying_vectors`), and for the
@@ -25320,8 +26673,15 @@ struct Count {
         for (auto* q : pref)
           if (covers(*q, c.lhs)) { dead = true; break; }
         bool any = irref(c.lhs);
-        if (!pref.empty() && !dead)
-          k += any ? wit_cost(pref, false) : pat_exist(c.lhs);
+        if (!pref.empty() && !dead) {
+          // Under no newtype nothing is refused and the first satisfying
+          // vector is the clause's own shape: S504's reading, at no cost
+          // (patmatch.ml's hundred-constructor matches took 16s typed).
+          long long u = cx && la_ > 0
+                            ? cx_unused(pref, c.lhs, g == 0 ? scrut : nullptr)
+                            : -1;
+          k += u >= 0 ? u : any ? wit_cost(pref, false) : pat_exist(c.lhs);
+        }
         if (!c.guard) {
           pref.push_back(&c.lhs);
           if (any) total = true;
@@ -25329,7 +26689,8 @@ struct Count {
       }
       // All clauses guarded: the matrix is empty and no witness is built.
       if (g == 0 && partial && !total && !pref.empty())
-        k += wit_cost(pref, true);
+        k += cx ? cx_partial(pref, scrut, nullptr, nval == 1 ? 5 : 0)
+                : wit_cost(pref, true);
     }
     return k;
   }
@@ -25357,8 +26718,12 @@ struct Count {
     bool all_fun = true;
     for (auto& b : bs)
       if (!std::holds_alternative<Pexp_function>(b.expr->desc)) all_fun = false;
-    for (auto& b : bs) pat(b.pat, &nm);
-    for (auto& b : bs) n += pat_check(b.pat);
+    for (auto& b : bs) {
+      cx_scrut_ = b.expr.get();
+      pat(b.pat, &nm);
+      cx_scrut_ = nullptr;
+    }
+    for (auto& b : bs) n += pat_check(b.pat, b.expr.get());
     // The ghosts are entered into `exp_env`, the environment the BODIES are
     // typed in, so they are held there like any binding: an inner
     // `let f i = ..` under `let f x = ..` finds `f` bound already and adds
@@ -25385,8 +26750,16 @@ struct Count {
         if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
           nla = (int)c->univars.size();
       la_ += nla;
+      if (nla)
+        for (auto& u : std::get<Pvc_constraint>(*b.constraint_).univars)
+          las_.push_back(u.txt);
+      if (b.constraint_ && std::holds_alternative<Pexp_function>(b.expr->desc))
+        if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
+          fnann_ = c->typ.get();
       expr(*b.expr);
+      fnann_ = nullptr;
       la_ -= nla;
+      las_.resize(las_.size() - nla);
     }
     if (rf == RecFlag::Nonrecursive && !early) {
       for (auto& p : pks) pkpend_[p.first] = p.second;
@@ -25410,6 +26783,14 @@ struct Count {
   void fn(const Pexp_function& f) {
     auto m = mark();
     std::vector<std::string> nm;
+    // The parameters' types off the binding's constraint, arrow by arrow
+    // (S507): `let f : type a. a g -> a g -> int = fun x y -> ..` matches
+    // `x, y` at `a g * a g`.
+    const CoreType* fa = fnann_;
+    fnann_ = nullptr;
+    while (fa)
+      if (auto* pl = std::get_if<Ptyp_poly>(&fa->desc)) fa = pl->type.get();
+      else break;
     // A function's RESULT constraint names every package type of it TWICE
     // over, saved or not.  A PARAMETER's costs only what it puts in the type.
     if (f.constraint_ && !packty_off())
@@ -25425,7 +26806,11 @@ struct Count {
     int nla = 0;
     for (auto& pm : f.params) {
       auto* pv = std::get_if<Pparam_val>(&pm.desc);
-      if (!pv) { ++n; ++la_; ++nla; continue; }  // (type a)
+      if (!pv) {  // (type a)
+        ++n; ++la_; ++nla;
+        las_.push_back(std::get<Pparam_newtype>(pm.desc).name.txt);
+        continue;
+      }
       n += pat_check(pv->pat);
       if (pv->default_) {
         // A defaulted optional parameter binds `*opt*` INSTEAD of running
@@ -25440,6 +26825,15 @@ struct Count {
       param_pat_ = unpack;
       pat(pv->pat, &nm);
       param_pat_ = false;
+      if (fa) {
+        auto* ar = std::get_if<Ptyp_arrow>(&fa->desc);
+        if (!ar || ar->label.index() != pv->label.index()) fa = nullptr;
+        else {
+          if (auto* v = std::get_if<Ppat_var>(&pv->pat.desc))
+            if (!cexty_off()) vann_[v->name.txt] = ar->dom.get();
+          fa = ar->cod.get();
+        }
+      }
       if (unpack) ++n;  // type_moddep_fun's unscoped X (typecore.ml:6232)
       else if (!is_named(pv->pat)) ++n;  // name_pattern "param" [pat]
     }
@@ -25454,9 +26848,13 @@ struct Count {
             n += pk_rue(*cs.rhs, *c->type);
       }
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
+      // `fun x -> fun y -> ..`: the rest of the arrows are the inner fun's.
+      if (fa && std::holds_alternative<Pexp_function>(fb->e->desc)) fnann_ = fa;
       expr(*fb->e);
+      fnann_ = nullptr;
       release(m);
       la_ -= nla;
+      las_.resize(las_.size() - nla);
       return;
     }
     const auto& cs = std::get<Pfunction_cases>(f.body->v).cases;
@@ -25467,6 +26865,7 @@ struct Count {
     for (auto& c : cs) cse(c);
     release(m);
     la_ -= nla;
+    las_.resize(las_.size() - nla);
   }
   static bool cls_off() {
     static const bool off = dbg_env("NOCLASS") != nullptr;
@@ -25591,8 +26990,8 @@ struct Count {
       if (!pkmeet_off() && !pkexp_.count(&e)) n += pk_arms(nullptr, m->cases);
       expr(*m->e);
       n += eff_row(m->cases);
-      n += unused_extra(m->cases);
-      for (auto& c : m->cases) cse(c);
+      n += unused_extra(m->cases, true, m->e.get());
+      for (auto& c : m->cases) cse(c, m->e.get());
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
       if (!pkmeet_off() && !pkexp_.count(&e)) n += pk_arms(t->e.get(), t->cases);
       expr(*t->e);
@@ -25640,8 +27039,10 @@ struct Count {
     } else if (auto* t = std::get_if<Pexp_newtype>(&e.desc)) {
       ++n;
       ++la_;
+      las_.push_back(t->name.txt);
       expr(*t->body);
       --la_;
+      las_.pop_back();
     } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
       auto m = mark();
       // `let module M = .. in e` binds M in `e` ALONE.  Nothing popped it,
