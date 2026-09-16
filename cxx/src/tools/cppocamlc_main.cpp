@@ -235,14 +235,19 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
         // The saved stamps continue ocamlc's global ident counter: 273 after
         // the initial environment, plus what typing allocated (NOSTAMPBASE
         // reverts to the flat 300).
+      {
+        auto sig = cppcaml::infer_signature(structure);
         cppcaml::cmi::cmiw::write_cmi(
-            cmi_path.string(), mod, cppcaml::infer_signature(structure), {},
+            cmi_path.string(), mod, sig, {},
             /*intf=*/false,
             cppcaml::dbg_env("NOMLLOC") ? std::vector<std::string>{}
                                         : std::vector<std::string>{in_path},
             cppcaml::dbg_env("NOSTAMPBASE")
                 ? 300
-                : 274 + cppcaml::typing_ident_count(structure, eta_sites));
+                : 274 + cppcaml::typing_ident_count(
+                            structure, eta_sites,
+                            cppcaml::package_sig_idents(sig)));
+      }
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
     }

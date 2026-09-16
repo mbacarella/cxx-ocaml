@@ -233,7 +233,12 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
 // infer_check.cpp for the rules and for what is not modelled yet.  `eta_sites`
 // is how many argument sites the value-kinds pass eta-expanded for an erased
 // optional argument (translate_implementation's out-parameter).
-int typing_ident_count(const ast::Structure& s, std::size_t eta_sites = 0);
+int typing_ident_count(const ast::Structure& s, std::size_t eta_sites = 0,
+                       long long pkg_sig = 0);
+// The idents the inferred-signature check allocates for the package types the
+// saved signature's values carry -- `pkg_sig` above, computed off the items
+// the .cmi writer is handed.
+long long package_sig_idents(const std::vector<cmi::cmiw::SigItem>& items);
 int typing_ident_count(const ast::Signature& s);
 
 // Build the .cmi signature from a hand-written interface (.mli).  Unlike
