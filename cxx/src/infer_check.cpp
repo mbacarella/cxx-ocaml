@@ -23350,6 +23350,11 @@ struct Count {
       ann_app(*c->t);
       if (auto* v = std::get_if<Ppat_var>(&c->p->desc))
         if (const Ptyp_package* pk = pk_of_ty(*c->t)) pkpend_[v->name.txt] = Pk{1, pk, {}};
+      // `((module M) : (module E))`: M's constructors are E's (S506).
+      if (!exhmat_off())
+        if (auto* u = std::get_if<Ppat_unpack>(&c->p->desc); u && u->name.txt)
+          if (const Ptyp_package* pk = pk_of_ty(*c->t))
+            pkpend_[*u->name.txt] = Pk{0, pk, {}};
       return;
     }
     if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
@@ -23395,6 +23400,8 @@ struct Count {
         if (!param_pat_) ++n;
       }
       if (u->name.txt) { ++n; if (out) out->push_back(*u->name.txt); }
+      if (!exhmat_off() && u->pkg && u->name.txt)
+        pkpend_[*u->name.txt] = Pk{0, &*u->pkg, {}};  // `(module M : E)`
       return;
     }
     if (auto* f = std::get_if<Ppat_effect>(&p.desc)) {
@@ -24600,14 +24607,126 @@ struct Count {
         "Undefined_recursive_module", "Continuation_already_taken", "Todo"};
     return ns.count(n) > 0;
   }
+  // A constructor read through a module of THIS file: a structure bound
+  // here (through its ascription where it has one), a functor parameter,
+  // or a first-class module unpacked at a package type this file declares
+  // -- `(module M : E)`, `M.Ex`.  A variant declared inside one gets a
+  // constructor table of its own the first time it is read.
+  std::unordered_map<const TypeDeclaration*, int> lctys_;
+  int local_cty(const TypeDeclaration& d, const Ptype_variant& v) {
+    auto it = lctys_.find(&d);
+    if (it != lctys_.end()) return it->second;
+    int id = (int)ctys.size();
+    ctys.emplace_back();
+    for (auto& c : v.ctors) {
+      bool nullary = true;
+      if (auto* t = std::get_if<Pcstr_tuple>(&c.args)) nullary = t->elems.empty();
+      else nullary = false;
+      ctys[id].push_back(
+          Ct{c.name.txt, exist_of(c.args, c.res), reify_of(c.args, c.res), nullary});
+    }
+    lctys_[&d] = id;
+    return id;
+  }
+  static Cd ext_cd(const ExtensionConstructor& c) {
+    Cd k;
+    k.ext = true;
+    if (auto* d = std::get_if<Pext_decl>(&c.kind)) {
+      k.ex = exist_of(d->args, d->res);
+      k.rf = reify_of(d->args, d->res);
+      k.args = &d->args;
+    }
+    return k;
+  }
+  bool decl_ctor(const std::vector<TypeDeclaration>& ds, const std::string& nm,
+                 std::optional<Cd>& out) {
+    bool hit = false;
+    for (auto& d : ds) {
+      auto* v = std::get_if<Ptype_variant>(&d.kind);
+      if (!v) continue;
+      for (auto& c : v->ctors)
+        if (c.name.txt == nm) {
+          Cd k;
+          k.ex = exist_of(c.args, c.res);
+          k.rf = reify_of(c.args, c.res);
+          k.ty = local_cty(d, *v);
+          k.args = &c.args;
+          out = k;
+          hit = true;
+        }
+    }
+    return hit;
+  }
+  std::optional<Cd> sig_ctor(const Signature& s, const std::string& nm) {
+    std::optional<Cd> out;
+    for (auto& it : s) {
+      if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
+        if (e->exn.ctor.name.txt == nm) out = ext_cd(e->exn.ctor);
+      } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+        for (auto& c : x->ext.ctors) if (c.name.txt == nm) out = ext_cd(c);
+      } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        decl_ctor(t->decls, nm, out);
+      }
+    }
+    return out;
+  }
+  std::optional<Cd> str_ctor(const Pmod_structure& s, const std::string& nm) {
+    std::optional<Cd> out;
+    for (auto& it : s.items) {
+      if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
+        if (e->exn.ctor.name.txt == nm) out = ext_cd(e->exn.ctor);
+      } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
+        for (auto& c : x->ext.ctors) if (c.name.txt == nm) out = ext_cd(c);
+      } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+        decl_ctor(t->decls, nm, out);
+      }
+    }
+    return out;
+  }
+  std::optional<Cd> local_ctor(const Longident& pre, const std::string& nm) {
+    bool sub = false;
+    if (const ModuleExpr* me = lal_res(pre, sub)) {
+      if (auto* c = std::get_if<Pmod_constraint>(&me->desc)) {
+        if (const Signature* s = mty_sig(c->mt.get())) return sig_ctor(*s, nm);
+        me = c->me.get();
+      }
+      if (auto* st = std::get_if<Pmod_structure>(&me->desc))
+        return str_ctor(*st, nm);
+      return std::nullopt;
+    }
+    auto* l = std::get_if<Lident>(&pre.v);
+    if (!l) return std::nullopt;
+    if (auto f = fmods.find(l->name); f != fmods.end() && !f->second.empty())
+      if (const Signature* s = mty_sig(f->second.back())) return sig_ctor(*s, nm);
+    // The parameters of one `fun` are bound after they are all checked,
+    // so an unpack still pending is in scope for the parameters after it.
+    const Ptyp_package* pk = nullptr;
+    if (auto pp = pkpend_.find(l->name); pp != pkpend_.end()) pk = pp->second.ty;
+    if (!pk) {
+      auto it = pkv_.find(l->name);
+      if (it != pkv_.end() && !it->second.empty()) pk = it->second.back().ty;
+    }
+    if (!pk) return std::nullopt;
+    if (const Signature* s = mty_sig(named_mty(pk->path.txt, 8)))
+      return sig_ctor(*s, nm);
+    return std::nullopt;
+  }
   std::optional<Cd> ctor_cd(const Longident& id) {
     if (auto* l = std::get_if<Lident>(&id.v)) {
       auto it = exi.find(l->name);
       if (it != exi.end()) return it->second;
       if (predef_exn(l->name)) { Cd c; c.ext = true; return c; }
+      // A bare name nothing binds is the initial `open Stdlib`'s: `Exit`.
+      if (!exhmat_off()) {
+        const auto& m = unit_ctors("Stdlib");
+        auto st = m.find(l->name);
+        if (st != m.end()) return st->second;
+      }
       return std::nullopt;
     }
     if (auto* d = std::get_if<Ldot>(&id.v)) {
+      if (!exhmat_off())
+        if (auto c = local_ctor(*d->prefix, d->name)) return c;
       std::string u = mod_unit(*d->prefix);
       if (u.empty()) return std::nullopt;
       const auto& m = unit_ctors(u);
@@ -24846,9 +24965,342 @@ struct Count {
     return -1;
   }
   long long wit_cost(const std::vector<const Pattern*>& rows, bool exh) {
-    long long k = wit(rows, 0, exh);
-    return k < 0 ? 0 : k;
+    if (exhmat_off()) {
+      long long k = wit(rows, 0, exh);
+      return k < 0 ? 0 : k;
+    }
+    std::vector<Row> pss;
+    for (auto* r : mins(rows)) pss.push_back(Row{r});
+    int fuel = 20000;
+    return exhaust(pss, exh, fuel).cost;
   }
+  // ---- THE SEARCH ITSELF (S506) ------------------------------------------
+  // `wit` above reads one column and stops at the first wildcard ROW; the
+  // checker does not.  `check_partial` first drops every row another row
+  // covers (`get_mins le_pats`, parmatch.ml:2138) and only then searches,
+  // and the search (`exhaust`, parmatch.ml:1284) splits an or-pattern
+  // COLUMN BY COLUMN (`simplify_first_col`), so the `_` of `M.Ex | _` is a
+  // wildcard row of the specialised sub-matrices, not a row that ends the
+  // search: every constructor's sub-matrix is total, and `try_omega` then
+  // runs `build_other` BEFORE it looks at the default matrix -- naming
+  // `*extension*` for an extensible column though no witness can come of
+  // it (`(M.Ex | _)` is 1 where `M.Ex -> .. | _ -> ..` is 0, get_mins
+  // having dropped the constructor row).  A single row takes a shortcut
+  // (`exhaust_single_row`): the rest of the row first, then the first
+  // column alone, so `((Not_found | _), (Exit | _))` names two.  Tuples,
+  // records, `lazy`, arrays and constants are columns and heads like any
+  // constructor (a tuple, a record and `lazy` are always full; an array
+  // or a constant never is, and their `build_other` names nothing); a
+  // polymorphic variant's row closedness cannot be read here, so its
+  // sub-matrices are searched and the rest given up as found; `None`/
+  // `Some`, `[]`/`::`, `true`/`false` and `()` are read as the full
+  // variants they are.  The witness found is re-typed as before (its
+  // constructors' existentials and reification, the first alternative of
+  // an or-pattern), and the idents named by sub-searches that found
+  // nothing stay named.  `NOEXHMAT=1` reverts to the column reading.
+  static bool exhmat_off() {
+    static const bool off = dbg_env("NOEXHMAT") != nullptr;
+    return off;
+  }
+  struct Wit { long long cost = 0; bool found = false; };
+  using Row = std::vector<const Pattern*>;  // nullptr is omega
+  // What the checker looks through: a constraint, a local open, an alias
+  // (its variable is kept beside the pattern, not in it).
+  static const Pattern* peel(const Pattern* p) {
+    if (!p) return nullptr;
+    const Pattern* q = &strip(*p);
+    while (auto* a = std::get_if<Ppat_alias>(&q->desc)) q = &strip(*a->p);
+    return q;
+  }
+  static bool wild(const Pattern* p) {
+    return !p || std::holds_alternative<Ppat_any>(p->desc) ||
+           std::holds_alternative<Ppat_var>(p->desc) ||
+           std::holds_alternative<Ppat_unpack>(p->desc);
+  }
+  enum class Hd { Wild, Ctor, Tuple, Lazy, Rec, Const, Variant, Array, Other };
+  static Hd head_of(const Pattern* p) {
+    if (wild(p)) return Hd::Wild;
+    if (std::holds_alternative<Ppat_construct>(p->desc)) return Hd::Ctor;
+    if (std::holds_alternative<Ppat_tuple>(p->desc)) return Hd::Tuple;
+    if (std::holds_alternative<Ppat_lazy>(p->desc)) return Hd::Lazy;
+    if (std::holds_alternative<Ppat_record>(p->desc)) return Hd::Rec;
+    if (std::holds_alternative<Ppat_constant>(p->desc)) return Hd::Const;
+    if (std::holds_alternative<Ppat_variant>(p->desc)) return Hd::Variant;
+    if (std::holds_alternative<Ppat_array>(p->desc)) return Hd::Array;
+    return Hd::Other;
+  }
+  static std::string const_key(const Constant& c) {
+    if (auto* i = std::get_if<Pconst_integer>(&c.desc))
+      return "i" + i->value + (i->suffix ? std::string(1, *i->suffix) : "");
+    if (auto* ch = std::get_if<Pconst_char>(&c.desc))
+      return "c" + std::to_string(ch->code);
+    if (auto* st = std::get_if<Pconst_string>(&c.desc)) return "s" + st->s;
+    return "f" + std::get<Pconst_float>(c.desc).value;
+  }
+  static std::string head_key(const Pattern* p, Hd h) {
+    switch (h) {
+      case Hd::Ctor:
+        return "C" + lid_last(std::get<Ppat_construct>(p->desc).id.txt);
+      case Hd::Tuple: return "T";
+      case Hd::Lazy: return "L";
+      case Hd::Rec: return "R";
+      case Hd::Const: return "K" + const_key(std::get<Ppat_constant>(p->desc).c);
+      case Hd::Variant: return "V" + std::get<Ppat_variant>(p->desc).label;
+      case Hd::Array:
+        return "A" + std::to_string(std::get<Ppat_array>(p->desc).elems.size());
+      default: return "?";
+    }
+  }
+  static std::size_t head_arity(const Pattern* p, Hd h, std::size_t labels) {
+    switch (h) {
+      case Hd::Ctor: {
+        auto& c = std::get<Ppat_construct>(p->desc);
+        if (!c.arg) return 0;
+        const Pattern* a = peel(c.arg->get());
+        if (auto* t = std::get_if<Ppat_tuple>(&a->desc)) return t->elems.size();
+        return 1;
+      }
+      case Hd::Tuple: return std::get<Ppat_tuple>(p->desc).elems.size();
+      case Hd::Lazy: return 1;
+      case Hd::Rec: return labels;
+      case Hd::Variant: return std::get<Ppat_variant>(p->desc).arg ? 1 : 0;
+      case Hd::Array: return std::get<Ppat_array>(p->desc).elems.size();
+      default: return 0;
+    }
+  }
+  // The row's arguments under its head, padded to the head's arity.
+  static Row head_args(const Pattern* p, Hd h, std::size_t arity,
+                       const std::vector<std::string>& labels) {
+    Row s;
+    switch (h) {
+      case Hd::Ctor: {
+        auto& c = std::get<Ppat_construct>(p->desc);
+        if (c.arg) {
+          const Pattern* a = peel(c.arg->get());
+          auto* t = std::get_if<Ppat_tuple>(&a->desc);
+          if (t && arity > 1)
+            for (auto& e : t->elems) s.push_back(e.get());
+          else
+            s.push_back(c.arg->get());
+        }
+        break;
+      }
+      case Hd::Tuple:
+        for (auto& e : std::get<Ppat_tuple>(p->desc).elems) s.push_back(e.get());
+        break;
+      case Hd::Lazy: s.push_back(std::get<Ppat_lazy>(p->desc).p.get()); break;
+      case Hd::Rec: {
+        auto& r = std::get<Ppat_record>(p->desc);
+        for (auto& l : labels) {
+          const Pattern* f = nullptr;
+          for (auto& e : r.fields)
+            if (lid_last(e.first.txt) == l) { f = e.second.get(); break; }
+          s.push_back(f);
+        }
+        break;
+      }
+      case Hd::Variant: {
+        auto& v = std::get<Ppat_variant>(p->desc);
+        if (v.arg) s.push_back(v.arg->get());
+        break;
+      }
+      case Hd::Array:
+        for (auto& e : std::get<Ppat_array>(p->desc).elems) s.push_back(e.get());
+        break;
+      default: break;
+    }
+    while (s.size() < arity) s.push_back(nullptr);
+    if (s.size() > arity) s.resize(arity);
+    return s;
+  }
+  // `simplify_first_col`: the first column's or-patterns become rows, left
+  // alternative first.
+  static void simp_rows(const Row& r, std::vector<Row>& out, int depth = 0) {
+    const Pattern* p = peel(r[0]);
+    if (p && depth < 64)
+      if (auto* o = std::get_if<Ppat_or>(&p->desc)) {
+        Row l = r; l[0] = o->l.get(); simp_rows(l, out, depth + 1);
+        Row rr = r; rr[0] = o->r.get(); simp_rows(rr, out, depth + 1);
+        return;
+      }
+    Row q = r; q[0] = p; out.push_back(q);
+  }
+  // `get_mins le_pats`: two passes, each dropping a row that a LATER row
+  // covers, the first reversing the list.
+  static std::vector<const Pattern*> mins(const std::vector<const Pattern*>& ps) {
+    auto select = [](const std::vector<const Pattern*>& in) {
+      std::vector<const Pattern*> r;
+      for (std::size_t i = 0; i < in.size(); ++i) {
+        bool drop = false;
+        for (std::size_t j = i + 1; j < in.size() && !drop; ++j)
+          if (covers(*in[j], *in[i])) drop = true;
+        if (!drop) r.insert(r.begin(), in[i]);
+      }
+      return r;
+    };
+    return select(select(ps));
+  }
+  Wit exhaust(const std::vector<Row>& pss, bool exh, int& fuel) {
+    if (--fuel <= 0) return Wit{0, true};
+    if (pss.empty()) return Wit{0, true};   // the omega witness
+    if (pss[0].empty()) return Wit{};        // no columns left: none
+    if (pss.size() == 1) {
+      // `exhaust_single_row`: the rest of the row under p, then p alone.
+      const Row& r = pss[0];
+      Row ps(r.begin() + 1, r.end());
+      Wit s = exhaust(std::vector<Row>{ps}, exh, fuel);
+      Wit acc;
+      acc.cost = s.cost;
+      if (s.found) {
+        if (r[0]) acc.cost += pat_exist(*r[0]);
+        acc.found = true;
+        return acc;
+      }
+      Wit t = specialize(std::vector<Row>{Row{r[0]}}, exh, fuel);
+      acc.cost += t.cost;
+      acc.found = t.found;
+      return acc;
+    }
+    return specialize(pss, exh, fuel);
+  }
+  Wit specialize(const std::vector<Row>& pss0, bool exh, int& fuel) {
+    std::vector<Row> pss;
+    for (auto& r : pss0) simp_rows(r, pss);
+    std::vector<std::string> labels;
+    for (auto& r : pss)
+      if (r[0])
+        if (auto* rc = std::get_if<Ppat_record>(&r[0]->desc))
+          for (auto& f : rc->fields) {
+            std::string l = lid_last(f.first.txt);
+            if (std::find(labels.begin(), labels.end(), l) == labels.end())
+              labels.push_back(l);
+          }
+    struct Grp {
+      std::string key;
+      Hd hd;
+      const Pattern* first;
+      std::size_t arity;
+      std::vector<Row> sub;
+    };
+    std::vector<Grp> grps;
+    std::vector<Row> def;
+    for (auto& r : pss) {
+      Hd h = head_of(r[0]);
+      if (h == Hd::Wild) continue;
+      if (h == Hd::Other) return Wit{0, true};  // unread: as found, as before
+      std::string k = head_key(r[0], h);
+      std::size_t a = head_arity(r[0], h, labels.size());
+      bool seen = false;
+      for (auto& g : grps)
+        if (g.key == k) { g.arity = std::max(g.arity, a); seen = true; break; }
+      if (!seen) grps.push_back(Grp{k, h, r[0], a, {}});
+    }
+    for (auto& r : pss) {
+      Row rest(r.begin() + 1, r.end());
+      Hd h = head_of(r[0]);
+      if (h == Hd::Wild) {
+        def.push_back(rest);
+        for (auto& g : grps) {
+          Row s(g.arity, nullptr);
+          s.insert(s.end(), rest.begin(), rest.end());
+          g.sub.push_back(s);
+        }
+        continue;
+      }
+      std::string k = head_key(r[0], h);
+      for (auto& g : grps)
+        if (g.key == k) {
+          Row s = head_args(r[0], h, g.arity, labels);
+          s.insert(s.end(), rest.begin(), rest.end());
+          g.sub.push_back(s);
+          break;
+        }
+    }
+    Wit acc;
+    if (grps.empty()) {
+      Wit s = exhaust(def, exh, fuel);
+      acc.cost = s.cost;
+      acc.found = s.found;
+      return acc;
+    }
+    // `try_non_omega`, in order of appearance; the witness pays its head.
+    for (auto& g : grps) {
+      Wit s = exhaust(g.sub, exh, fuel);
+      acc.cost += s.cost;
+      if (s.found) {
+        if (g.hd == Hd::Ctor)
+          acc.cost += ctor_cost(std::get<Ppat_construct>(g.first->desc).id.txt);
+        acc.found = true;
+        return acc;
+      }
+    }
+    // `try_omega`.
+    const Grp& g0 = grps[0];
+    switch (g0.hd) {
+      case Hd::Tuple: case Hd::Lazy: case Hd::Rec: return acc;  // full
+      case Hd::Variant: acc.found = true; return acc;          // unread row
+      case Hd::Const: case Hd::Array: {
+        Wit s = exhaust(def, exh, fuel);
+        acc.cost += s.cost;
+        acc.found = s.found;
+        return acc;
+      }
+      default: break;
+    }
+    const Longident& id = std::get<Ppat_construct>(g0.first->desc).id.txt;
+    auto cd = ctor_cd(id);
+    if (cd && cd->ext) {
+      if (exh && !extwit_off()) acc.cost += 1;  // `*extension*`, named first
+      Wit s = exhaust(def, exh, fuel);
+      acc.cost += s.cost;
+      acc.found = s.found;
+      return acc;
+    }
+    std::set<std::string> present;
+    for (auto& g : grps) present.insert(g.key.substr(1));
+    static const Ct none{};
+    const Ct* miss = nullptr;
+    if (cd && cd->ty >= 0) {
+      for (int pass = 0; pass < 2 && !miss; ++pass)
+        for (auto& c : ctys[cd->ty]) {
+          if (present.count(c.name) || c.nullary != (pass == 0)) continue;
+          miss = &c;
+          break;
+        }
+      if (!miss) return acc;  // full
+    } else if (!cd) {
+      static const std::vector<std::vector<std::string>> predef = {
+          {"None", "Some"}, {"[]", "::"}, {"false", "true"}, {"()"}};
+      const std::vector<std::string>* pv = nullptr;
+      for (auto& v : predef)
+        if (std::find(v.begin(), v.end(), lid_last(id)) != v.end()) pv = &v;
+      if (!pv) { acc.found = true; return acc; }  // a type this file cannot read
+      bool full = true;
+      for (auto& c : *pv) if (!present.count(c)) full = false;
+      if (full) return acc;
+      miss = &none;
+    } else {
+      acc.found = true;  // another unit's variant: as found, as before
+      return acc;
+    }
+    Wit s = exhaust(def, exh, fuel);
+    acc.cost += s.cost;
+    if (s.found) {
+      acc.cost += miss->ex + (reify_off() || la_ <= 0 ? 0 : miss->rf);
+      acc.found = true;
+    }
+    return acc;
+  }
+  // A pattern typed on its own is checked on its own (`check_partial` over
+  // the one row): a function's parameter (typecore.ml:5990), a `let`'s
+  // pattern (typecore.ml:7586), a class's parameter (typeclass.ml:1210) and
+  // the `let*` row, a tuple of its patterns (typecore.ml:5449).
+  long long pat_check(const Row& row) {
+    if (exist_off() || exhmat_off()) return 0;
+    int fuel = 20000;
+    return exhaust(std::vector<Row>{row}, true, fuel).cost;
+  }
+  long long pat_check(const Pattern& p) { return pat_check(Row{&p}); }
   // `partial`: the value rows of a `match`/`function` get `check_partial`'s
   // witness besides; a `try`'s handlers (typecore's `partial_flag:false`)
   // and the exception and `effect` rows do not.
@@ -24906,6 +25358,7 @@ struct Count {
     for (auto& b : bs)
       if (!std::holds_alternative<Pexp_function>(b.expr->desc)) all_fun = false;
     for (auto& b : bs) pat(b.pat, &nm);
+    for (auto& b : bs) n += pat_check(b.pat);
     // The ghosts are entered into `exp_env`, the environment the BODIES are
     // typed in, so they are held there like any binding: an inner
     // `let f i = ..` under `let f x = ..` finds `f` bound already and adds
@@ -24973,6 +25426,7 @@ struct Count {
     for (auto& pm : f.params) {
       auto* pv = std::get_if<Pparam_val>(&pm.desc);
       if (!pv) { ++n; ++la_; ++nla; continue; }  // (type a)
+      n += pat_check(pv->pat);
       if (pv->default_) {
         // A defaulted optional parameter binds `*opt*` INSTEAD of running
         // name_pattern (typecore.ml:6083).
@@ -25088,6 +25542,7 @@ struct Count {
       }
       pat(f->pat, &nm);
       n += (long long)nm.size();
+      n += pat_check(f->pat);
       for (auto& s : nm) bind(s);
       cexpr(*f->body);
       release(m);
@@ -25230,7 +25685,9 @@ struct Count {
       auto m = mark();
       std::vector<std::string> nm;
       pat(l->let_.pat, &nm); expr(*l->let_.exp);
-      for (auto& a : l->ands) { pat(a.pat, &nm); expr(*a.exp); }
+      Row lrow{&l->let_.pat};
+      for (auto& a : l->ands) { pat(a.pat, &nm); expr(*a.exp); lrow.push_back(&a.pat); }
+      n += pat_check(lrow);
       // Texp_letop carries a `param` named the same way (typecore.ml:5503);
       // with `and`s the case pattern is a tuple, so never a bare variable.
       if (!l->ands.empty() || !is_named(l->let_.pat)) ++n;
