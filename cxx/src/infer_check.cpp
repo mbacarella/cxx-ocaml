@@ -20508,6 +20508,10 @@ bool ghostscope_off() {
   static const bool off = dbg_env("NOGHOSTSCOPE") != nullptr;
   return off;
 }
+bool etastamp_off() {
+  static const bool off = dbg_env("NOETASTAMP") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -28599,7 +28603,7 @@ struct Count {
 
 }  // namespace stampcount
 
-int typing_ident_count(const ast::Structure& s) {
+int typing_ident_count(const ast::Structure& s, std::size_t eta_sites) {
   // The citation walk runs FIRST: whether a `module M = A.N` alias is ever
   // READ is what says the path has to be resolved, and only a name this file
   // binds ONCE can be followed to the module it stands for.
@@ -28653,6 +28657,18 @@ int typing_ident_count(const ast::Structure& s) {
   if (!dbg_env("NOUNITLOAD"))
     k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
                 !dbg_env("NOAPPRES"));
+  // An INFERRED argument whose type begins with optional arrows, used where
+  // a plain arrow is expected, is let-and-eta-expanded (typecore.ml's
+  // type_argument, `var_pair "eta"` and `var_pair "arg"`): TWO idents per
+  // site, however many optionals the site erases.  The value-kinds pass
+  // finds the sites for the Lambda back end, so the count is its (pr7657's
+  // `foo (raise Exit; f1)` and `foo r.contents`, -2 each before).  What the
+  // pass does not find yet it does not charge: a `(f : t)` constraint, a
+  // `let f : t = ..` and a record field are typed as arguments too, and
+  // ocamlc expands them where the pass records nothing and the Lambda has
+  // no expansion either (stamp_probes/xeta_a6, a9, a10, a13, -2 each).
+  // `NOETASTAMP=1` reverts.
+  if (!stampcount::etastamp_off()) k += 2 * (long long)eta_sites;
   return (int)k;
 }
 

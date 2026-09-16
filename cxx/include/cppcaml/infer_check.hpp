@@ -230,8 +230,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
 // signature's stamps are fresh and contiguous (`rename_bound_idents` renames
 // every bound ident at save time), so the only thing a .cmi writer has to get
 // right is their BASE, which is `274 + <this count>`.  See the definition in
-// infer_check.cpp for the rules and for what is not modelled yet.
-int typing_ident_count(const ast::Structure& s);
+// infer_check.cpp for the rules and for what is not modelled yet.  `eta_sites`
+// is how many argument sites the value-kinds pass eta-expanded for an erased
+// optional argument (translate_implementation's out-parameter).
+int typing_ident_count(const ast::Structure& s, std::size_t eta_sites = 0);
 int typing_ident_count(const ast::Signature& s);
 
 // Build the .cmi signature from a hand-written interface (.mli).  Unlike
