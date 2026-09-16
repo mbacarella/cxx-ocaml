@@ -20504,6 +20504,10 @@ bool open_off() {
   static const bool off = dbg_env("NOOPENKEY") != nullptr;
   return off;
 }
+bool ghostscope_off() {
+  static const bool off = dbg_env("NOGHOSTSCOPE") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -24120,11 +24124,18 @@ struct Count {
     for (auto& b : bs)
       if (!std::holds_alternative<Pexp_function>(b.expr->desc)) all_fun = false;
     for (auto& b : bs) pat(b.pat, &nm);
-    if (rf == RecFlag::Nonrecursive && all_fun)
+    // The ghosts are entered into `exp_env`, the environment the BODIES are
+    // typed in, so they are held there like any binding: an inner
+    // `let f i = ..` under `let f x = ..` finds `f` bound already and adds
+    // no ghost of its own (lib-buffer/test.ml's `let swap bytes = let swap
+    // i = ..`, +1 before).  `NOGHOSTSCOPE=1` reverts.
+    const bool ghosts = rf == RecFlag::Nonrecursive && all_fun;
+    const bool early = ghosts && !ghostscope_off();
+    if (ghosts)
       for (auto& s : nm) if (!bound(s)) ++n;
-    if (rf == RecFlag::Recursive) for (auto& s : nm) bind(s);
+    if (rf == RecFlag::Recursive || early) for (auto& s : nm) bind(s);
     for (auto& b : bs) expr(*b.expr);
-    if (rf == RecFlag::Nonrecursive) for (auto& s : nm) bind(s);
+    if (rf == RecFlag::Nonrecursive && !early) for (auto& s : nm) bind(s);
   }
   // `name_pattern` (typecore.ml:4202) walks the patterns for the FIRST one
   // that is already a variable or an alias and REUSES its ident; only if none
